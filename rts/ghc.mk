@@ -86,8 +86,7 @@ ifeq  "$(HOSTPLATFORM)" "i386-unknown-mingw32"
 ALL_RTS_DEF_LIBNAMES 	= base ghc-prim
 ALL_RTS_DEF_LIBS	= \
 	rts/dist/build/win32/libHSbase.dll.a \
-	rts/dist/build/win32/libHSghc-prim.dll.a \
-	libffi/build/inst/lib/libffi.dll.a
+	rts/dist/build/win32/libHSghc-prim.dll.a 
 
 # -- import libs for the regular Haskell libraries
 define make-importlib-def # args $1 = lib name
@@ -172,12 +171,12 @@ rts_dist_$1_CC_OPTS += -DRtsWay=\"rts_$1\"
 # Making a shared library for the RTS.
 ifneq "$$(findstring dyn, $1)" ""
 ifeq "$$(HOSTPLATFORM)" "i386-unknown-mingw32"
-$$(rts_$1_LIB) : $$(rts_$1_OBJS) $$(ALL_RTS_DEF_LIBS) rts/libs.depend rts/dist/build/libffi-5.dll
+$$(rts_$1_LIB) : $$(rts_$1_OBJS) $$(ALL_RTS_DEF_LIBS) rts/libs.depend
 	"$$(RM)" $$(RM_OPTS) $$@
 	"$$(rts_dist_HC)" -package-name rts -shared -dynamic -dynload deploy \
 	  -no-auto-link-packages -Lrts/dist/build -lffi-5 `cat rts/libs.depend` $$(rts_$1_OBJS) $$(ALL_RTS_DEF_LIBS) -o $$@
 else
-$$(rts_$1_LIB) : $$(rts_$1_OBJS) $$(rts_$1_DTRACE_OBJS) rts/libs.depend rts/dist/build/libffi$$(soext)
+$$(rts_$1_LIB) : $$(rts_$1_OBJS) $$(rts_$1_DTRACE_OBJS) rts/libs.depend
 	"$$(RM)" $$(RM_OPTS) $$@
 	"$$(rts_dist_HC)" -package-name rts -shared -dynamic -dynload deploy \
 	  -no-auto-link-packages -Lrts/dist/build -lffi `cat rts/libs.depend` $$(rts_$1_OBJS) \
@@ -188,9 +187,9 @@ ifeq "$$(darwin_HOST_OS)" "1"
 endif
 endif
 else
-$$(rts_$1_LIB) : $$(rts_$1_OBJS) $$(rts_$1_DTRACE_OBJS) $$(rts_ffi_objs_stamp)
+$$(rts_$1_LIB) : $$(rts_$1_OBJS) $$(rts_$1_DTRACE_OBJS)
 	"$$(RM)" $$(RM_OPTS) $$@
-	echo $$(rts_ffi_objs) $$(rts_$1_OBJS) $$(rts_$1_DTRACE_OBJS) | "$$(XARGS)" $$(XARGS_OPTS) "$$(AR_STAGE1)" \
+	echo $$(rts_$1_OBJS) $$(rts_$1_DTRACE_OBJS) | "$$(XARGS)" $$(XARGS_OPTS) "$$(AR_STAGE1)" \
 		$$(AR_OPTS_STAGE1) $$(EXTRA_AR_ARGS_STAGE1) $$@
 endif
 
@@ -504,10 +503,8 @@ endif
 # installing
 
 INSTALL_LIBS += $(ALL_RTS_LIBS)
-INSTALL_LIBS += $(wildcard rts/dist/build/libffi$(soext)*)
-INSTALL_LIBS += $(wildcard rts/dist/build/libffi-5.dll)
 
-install: install_libffi_headers
+install:
 
 .PHONY: install_libffi_headers
 install_libffi_headers :
