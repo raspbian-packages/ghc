@@ -1,0 +1,14 @@
+Index: ghc-7.4.1/utils/haddock/haddock.cabal
+===================================================================
+--- ghc-7.4.1.orig/utils/haddock/haddock.cabal	2012-02-03 16:26:39.000000000 +0100
++++ ghc-7.4.1/utils/haddock/haddock.cabal	2012-02-03 16:27:13.000000000 +0100
+@@ -196,8 +196,7 @@
+     Haddock.Convert
+     Paths_haddock
+   
+-  if flag(in-ghc-tree)
+-    buildable: False
++  buildable: False
+ 
+ test-suite html-tests
+   type:             exitcode-stdio-1.0
