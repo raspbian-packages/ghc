@@ -250,8 +250,8 @@ initSysTools mbMinusB
                 ld_args  = gcc_args
 
         -- We just assume on command line
-        ; let lc_prog = "llc"
-              lo_prog = "opt"
+        ; let lc_prog = "llc-3.0"
+              lo_prog = "opt-3.0"
 
         ; return $ Settings {
                         sTargetPlatform = Platform {
