@@ -78,10 +78,6 @@ flag test
 
 executable haddock
   default-language:     Haskell2010
-  -- In a GHC tree - in particular, in a source tarball - we don't
-  -- require alex or happy
-  if !flag(in-ghc-tree)
-    build-tools: alex >= 2.3, happy >= 1.18
   build-depends:
     base >= 4.3 && < 4.6,
     filepath,
@@ -95,8 +91,6 @@ executable haddock
 
   if flag(in-ghc-tree)
     cpp-options: -DIN_GHC_TREE
-  else
-    build-depends: ghc-paths
 
   if flag(test)
     cpp-options: -DTEST
@@ -157,8 +151,6 @@ library
 
   if flag(in-ghc-tree)
     cpp-options: -DIN_GHC_TREE
-  else
-    build-depends: ghc-paths
 
   if flag(test)
     cpp-options: -DTEST
