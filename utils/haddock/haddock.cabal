@@ -196,8 +196,7 @@ library
     Haddock.Convert
     Paths_haddock
   
-  if flag(in-ghc-tree)
-    buildable: False
+  buildable: False
 
 test-suite html-tests
   type:             exitcode-stdio-1.0
