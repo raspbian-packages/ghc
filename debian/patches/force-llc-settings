@@ -1,0 +1,29 @@
+Description: force llc settings to ones that are known to work
+Author: Peter Michael Green <plugwash@p10link.net>
+
+---
+The information above should follow the Patch Tagging Guidelines, please
+checkout http://dep.debian.net/deps/dep3/ to learn about the format. Here
+are templates for supplementary fields that you might want to add:
+
+Origin: <vendor|upstream|other>, <url of original patch>
+Bug: <url in upstream bugtracker>
+Bug-Debian: http://bugs.debian.org/<bugnumber>
+Bug-Ubuntu: https://launchpad.net/bugs/<bugnumber>
+Forwarded: <no|not-needed|url proving that it has been forwarded>
+Reviewed-By: <name and email of someone who approved the patch>
+Last-Update: <YYYY-MM-DD>
+
+Index: ghc-7.4.1.rpi/compiler/main/SysTools.lhs
+===================================================================
+--- ghc-7.4.1.rpi.orig/compiler/main/SysTools.lhs	2012-06-18 18:30:01.000000000 +0000
++++ ghc-7.4.1.rpi/compiler/main/SysTools.lhs	2012-06-19 01:26:34.000000000 +0000
+@@ -280,7 +280,7 @@
+                         sPgm_sysman = top_dir ++ "/ghc/rts/parallel/SysMan",
+                         sPgm_windres = windres_path,
+                         sPgm_lo  = (lo_prog,[]),
+-                        sPgm_lc  = (lc_prog,[]),
++                        sPgm_lc  = (lc_prog,[Option "-mcpu=arm1176jzf-s" , Option "-float-abi=hard"]),
+                         -- Hans: this isn't right in general, but you can
+                         -- elaborate it in the same way as the others
+                         sOpt_L       = [],
