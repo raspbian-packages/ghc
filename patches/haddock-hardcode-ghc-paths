@@ -1,0 +1,62 @@
+Index: ghc-7.4.1/utils/haddock/haddock.cabal
+===================================================================
+--- ghc-7.4.1.orig/utils/haddock/haddock.cabal	2012-02-01 19:10:43.000000000 +0100
++++ ghc-7.4.1/utils/haddock/haddock.cabal	2012-02-03 16:26:39.000000000 +0100
+@@ -78,10 +78,6 @@
+ 
+ executable haddock
+   default-language:     Haskell2010
+-  -- In a GHC tree - in particular, in a source tarball - we don't
+-  -- require alex or happy
+-  if !flag(in-ghc-tree)
+-    build-tools: alex >= 2.3, happy >= 1.18
+   build-depends:
+     base >= 4.3 && < 4.6,
+     filepath,
+@@ -95,8 +91,6 @@
+ 
+   if flag(in-ghc-tree)
+     cpp-options: -DIN_GHC_TREE
+-  else
+-    build-depends: ghc-paths
+ 
+   if flag(test)
+     cpp-options: -DTEST
+@@ -157,8 +151,6 @@
+ 
+   if flag(in-ghc-tree)
+     cpp-options: -DIN_GHC_TREE
+-  else
+-    build-depends: ghc-paths
+ 
+   if flag(test)
+     cpp-options: -DTEST
+Index: ghc-7.4.1/utils/haddock/src/Main.hs
+===================================================================
+--- ghc-7.4.1.orig/utils/haddock/src/Main.hs	2012-02-01 19:10:43.000000000 +0100
++++ ghc-7.4.1/utils/haddock/src/Main.hs	2012-02-03 16:26:39.000000000 +0100
+@@ -50,7 +50,6 @@
+ #ifdef IN_GHC_TREE
+ import System.FilePath
+ #else
+-import qualified GHC.Paths as GhcPaths
+ import Paths_haddock
+ #endif
+ 
+@@ -344,14 +343,14 @@
+       libDir <- getInTreeDir
+       return (ghcPath, libDir)
+ #else
+-      return (ghcPath, GhcPaths.libdir)
++      return (ghcPath, "/usr/lib/ghc")
+ #endif
+     xs -> return (ghcPath, last xs)
+   where
+ #ifdef IN_GHC_TREE
+     ghcPath = "not available"
+ #else
+-    ghcPath = GhcPaths.ghc
++    ghcPath = "/usr"
+ #endif
+ 
+ 
