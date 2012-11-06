@@ -1,5 +1,5 @@
 {-# OPTIONS -fno-cse #-}
-{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE NamedFieldPuns, CPP #-}
 -- -fno-cse is needed for GLOBAL_VAR's to behave properly
 
 -----------------------------------------------------------------------------
@@ -1379,6 +1379,9 @@ runPhase LlvmLlc input_fn dflags
                                       then ["-mattr=+v7,+vfp3"]
                                       else if (elem VFPv3D16 ext)
                                            then ["-mattr=+v7,+vfp3,+d16"]
+#ifdef __ARM_PCS_VFP
+                                                ++ ["-float-abi=hard"]
+#endif
                                            else []
                    _               -> []
 
