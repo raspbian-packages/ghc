@@ -24,8 +24,9 @@ library-dirs:		TOP"/rts/dist/build" PAPI_LIB_DIR
 hs-libraries:   "HSrts"
 
 extra-libraries:
+				"ffi"
 #ifdef HAVE_LIBM
-                		"m"		/* for ldexp() */
+			      , "m"		/* for ldexp() */
 #endif
 #ifdef HAVE_LIBRT
 			      , "rt"
