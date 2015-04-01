@@ -50,7 +50,6 @@ import Data.Int
 #ifdef IN_GHC_TREE
 import System.FilePath
 #else
-import qualified GHC.Paths as GhcPaths
 import Paths_haddock
 #endif
 
@@ -349,14 +348,14 @@ getGhcDirs flags = do
       libDir <- getInTreeDir
       return (ghcPath, libDir)
 #else
-      return (ghcPath, GhcPaths.libdir)
+      return (ghcPath, "/usr/lib/ghc")
 #endif
     xs -> return (ghcPath, last xs)
   where
 #ifdef IN_GHC_TREE
     ghcPath = "not available"
 #else
-    ghcPath = GhcPaths.ghc
+    ghcPath = "/usr/bin/ghc"
 #endif
 
 
