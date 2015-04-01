@@ -600,7 +600,6 @@ BUILD_DIRS += \
    $(MAYBE_GHCI) \
    driver/ghc \
    driver/haddock \
-   libffi \
    includes \
    rts
 
