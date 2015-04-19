@@ -701,7 +701,6 @@ $(foreach p,$(PACKAGES_STAGE0),$(eval libraries/$p_dist-boot_DO_HADDOCK = NO))
 # Build the Haddock contents and index
 ifeq "$(HADDOCK_DOCS)" "YES"
 libraries/dist-haddock/index.html: inplace/bin/haddock$(exeext) $(ALL_HADDOCK_FILES)
-	cd libraries && sh gen_contents_index --intree
 ifeq "$(phase)" "final"
 $(eval $(call all-target,library_doc_index,libraries/dist-haddock/index.html))
 endif
@@ -864,12 +863,8 @@ endif
 	$(call INSTALL_DIR,"$(DESTDIR)$(docdir)/html")
 	$(call INSTALL_DOC,$(INSTALL_OPTS),docs/index.html,"$(DESTDIR)$(docdir)/html")
 ifneq "$(INSTALL_LIBRARY_DOCS)" ""
-	$(call INSTALL_DIR,"$(DESTDIR)$(docdir)/html/libraries")
-	for i in $(INSTALL_LIBRARY_DOCS); do \
-		$(call INSTALL_DOC,$(INSTALL_OPTS),$$i,"$(DESTDIR)$(docdir)/html/libraries/"); \
-	done
+	mkdir -p $(DESTDIR)$(docdir)/html/libraries/
 	$(call INSTALL_DATA,$(INSTALL_OPTS),libraries/prologue.txt,"$(DESTDIR)$(docdir)/html/libraries/")
-	$(call INSTALL_SCRIPT,$(INSTALL_OPTS),libraries/gen_contents_index,"$(DESTDIR)$(docdir)/html/libraries/")
 endif
 ifneq "$(INSTALL_HTML_DOC_DIRS)" ""
 	for i in $(INSTALL_HTML_DOC_DIRS); do \
@@ -980,7 +975,6 @@ $(eval $(call bindist,.,\
     mk/project.mk \
     mk/install.mk.in \
     bindist.mk \
-    libraries/gen_contents_index \
     libraries/prologue.txt \
     $(wildcard libraries/dph/LICENSE \
                libraries/dph/ghc-packages \
