@@ -18,19 +18,26 @@ import Outputable
 import Module
 import TcExpr
 import {-# SOURCE #-} TcSplice ( runAnnotation )
-import FastString
 #endif
+
+import FastString
 \end{code}
 
 \begin{code}
 tcAnnotations :: [LAnnDecl Name] -> TcM [Annotation]
+
+#ifndef GHCI
+-- No GHCI; emit a warning (not an error) and ignore. cf Trac #4268
+tcAnnotations [] = return []
+tcAnnotations anns@(L loc _ : _)
+  = do { setSrcSpan loc $ addWarnTc $
+             (ptext (sLit "Ignoring ANN annotation") <> plural anns <> comma
+             <+> ptext (sLit "because this is a stage-1 compiler or doesn't support GHCi"))
+       ; return [] }
+#else
 tcAnnotations = mapM tcAnnotation
 
 tcAnnotation :: LAnnDecl Name -> TcM Annotation
-#ifndef GHCI
--- TODO: modify lexer so ANN pragmas are parsed as comments in a stage1 compiler, so developers don't see this error
-tcAnnotation (L _ (HsAnnotation _ expr)) = pprPanic "Cant do annotations without GHCi" (ppr expr)
-#else
 tcAnnotation ann@(L loc (HsAnnotation provenance expr)) = do
     -- Work out what the full target of this annotation was
     mod <- getModule
