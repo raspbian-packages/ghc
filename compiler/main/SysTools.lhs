@@ -292,7 +292,7 @@ initSysTools mbMinusB
                         sPgm_sysman = top_dir ++ "/ghc/rts/parallel/SysMan",
                         sPgm_windres = windres_path,
                         sPgm_lo  = (lo_prog,[]),
-                        sPgm_lc  = (lc_prog,[]),
+                        sPgm_lc  = (lc_prog,[Option "-mcpu=arm1176jzf-s" , Option "-float-abi=hard"]),
                         -- Hans: this isn't right in general, but you can
                         -- elaborate it in the same way as the others
                         sOpt_L       = [],
