@@ -1,0 +1,2 @@
+version=3
+http://downloads.haskell.org/~ghc/(\d[\d.]*)/ghc-(\d[\d.]*)-src.tar.bz2
