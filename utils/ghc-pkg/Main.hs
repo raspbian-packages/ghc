@@ -1362,8 +1362,10 @@ checkPackageConfig pkg verbosity db_stack auto_ghci_libs update = do
   mapM_ (checkDir True  "library-dirs") (libraryDirs pkg)
   mapM_ (checkDir True  "include-dirs") (includeDirs pkg)
   mapM_ (checkDir True  "framework-dirs") (frameworkDirs pkg)
-  mapM_ (checkFile   True "haddock-interfaces") (haddockInterfaces pkg)
-  mapM_ (checkDirURL True "haddock-html")       (haddockHTMLs pkg)
+  -- In Debian, it is quite normal that the package is installed without the
+  -- documentation. Do not print a warning there.
+  -- mapM_ (checkFile   True "haddock-interfaces") (haddockInterfaces pkg)
+  -- mapM_ (checkDirURL True "haddock-html")       (haddockHTMLs pkg)
   checkModules pkg
   mapM_ (checkHSLib verbosity (libraryDirs pkg) auto_ghci_libs) (hsLibraries pkg)
   -- ToDo: check these somehow?
