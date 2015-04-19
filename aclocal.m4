@@ -173,7 +173,7 @@ AC_DEFUN([FPTOOLS_SET_HASKELL_PLATFORM_VARS],
             GET_ARM_ISA()
             test -z "[$]2" || eval "[$]2=\"ArchARM {armISA = \$ARM_ISA, armISAExt = \$ARM_ISA_EXT, armABI = \$ARM_ABI}\""
             ;;
-        alpha|mips|mipseb|mipsel|hppa|hppa1_1|ia64|m68k|rs6000|s390|s390x|sparc64|vax)
+        aarch64|alpha|mips|mipseb|mipsel|hppa|hppa1_1|ia64|m68k|rs6000|s390|s390x|sparc64|vax)
             test -z "[$]2" || eval "[$]2=ArchUnknown"
             ;;
         *)
@@ -1835,6 +1835,9 @@ AC_MSG_CHECKING(for path to top of build tree)
 # converts cpu from gnu to ghc naming, and assigns the result to $target_var
 AC_DEFUN([GHC_CONVERT_CPU],[
 case "$1" in
+  aarch64*)
+    $2="aarch64"
+    ;;
   alpha*)
     $2="alpha"
     ;;
