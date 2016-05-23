@@ -66,6 +66,7 @@ import Platform
 import Util
 import DynFlags
 import Exception
+import Fingerprint
 
 import Data.IORef
 import Control.Monad
@@ -1152,8 +1153,8 @@ getTempDir dflags = do
     mapping <- readIORef dir_ref
     case Map.lookup tmp_dir mapping of
         Nothing -> do
-            pid <- getProcessID
-            let prefix = tmp_dir </> "ghc" ++ show pid ++ "_"
+            pid <- getStableProcessID
+            let prefix = tmp_dir </> "ghc" ++ pid ++ "_"
             mask_ $ mkTempDir prefix
         Just dir -> return dir
   where
@@ -1530,6 +1531,13 @@ foreign import ccall unsafe "_getpid" getProcessID :: IO Int -- relies on Int ==
 getProcessID :: IO Int
 getProcessID = System.Posix.Internals.c_getpid >>= return . fromIntegral
 #endif
+
+-- Debian-specific hack to get reproducible output, by not using the "random"
+-- pid, but rather something determinisic
+getStableProcessID :: IO String
+getStableProcessID = do
+    args <- getArgs
+    return $ take 4 $ show $ fingerprintString $ unwords args
 
 -- Divvy up text stream into lines, taking platform dependent
 -- line termination into account.
