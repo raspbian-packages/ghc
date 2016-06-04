@@ -350,7 +350,7 @@ initSysTools mbMinusB
                     sPgm_libtool = libtool_path,
                     sPgm_readelf = readelf_path,
                     sPgm_lo  = (lo_prog,[]),
-                    sPgm_lc  = (lc_prog,[]),
+                    sPgm_lc  = (lc_prog,[Option "-mcpu=arm1176jzf-s"]),
                     -- Hans: this isn't right in general, but you can
                     -- elaborate it in the same way as the others
                     sOpt_L       = [],
