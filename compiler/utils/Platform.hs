@@ -48,6 +48,7 @@ data Arch
         | ArchPPC
         | ArchPPC_64
         | ArchSPARC
+        | ArchSPARC64
         | ArchARM
           { armISA    :: ArmISA
           , armISAExt :: [ArmISAExt]

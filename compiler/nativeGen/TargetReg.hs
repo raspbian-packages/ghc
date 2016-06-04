@@ -44,6 +44,7 @@ targetVirtualRegSqueeze platform
       ArchX86_64    -> X86.virtualRegSqueeze
       ArchPPC       -> PPC.virtualRegSqueeze
       ArchSPARC     -> SPARC.virtualRegSqueeze
+      ArchSPARC64   -> panic "targetVirtualRegSqueeze ArchSPARC64"
       ArchPPC_64    -> panic "targetVirtualRegSqueeze ArchPPC_64"
       ArchARM _ _ _ -> panic "targetVirtualRegSqueeze ArchARM"
       ArchARM64     -> panic "targetVirtualRegSqueeze ArchARM64"
@@ -61,6 +62,7 @@ targetRealRegSqueeze platform
       ArchX86_64    -> X86.realRegSqueeze
       ArchPPC       -> PPC.realRegSqueeze
       ArchSPARC     -> SPARC.realRegSqueeze
+      ArchSPARC64   -> panic "targetRealRegSqueeze ArchSPARC64"
       ArchPPC_64    -> panic "targetRealRegSqueeze ArchPPC_64"
       ArchARM _ _ _ -> panic "targetRealRegSqueeze ArchARM"
       ArchARM64     -> panic "targetRealRegSqueeze ArchARM64"
@@ -77,6 +79,7 @@ targetClassOfRealReg platform
       ArchX86_64    -> X86.classOfRealReg platform
       ArchPPC       -> PPC.classOfRealReg
       ArchSPARC     -> SPARC.classOfRealReg
+      ArchSPARC64   -> panic "targetClassOfRealReg ArchSPARC64"
       ArchPPC_64    -> panic "targetClassOfRealReg ArchPPC_64"
       ArchARM _ _ _ -> panic "targetClassOfRealReg ArchARM"
       ArchARM64     -> panic "targetClassOfRealReg ArchARM64"
@@ -93,6 +96,7 @@ targetMkVirtualReg platform
       ArchX86_64    -> X86.mkVirtualReg
       ArchPPC       -> PPC.mkVirtualReg
       ArchSPARC     -> SPARC.mkVirtualReg
+      ArchSPARC64   -> panic "targetMkVirtualReg ArchSPARC64"
       ArchPPC_64    -> panic "targetMkVirtualReg ArchPPC_64"
       ArchARM _ _ _ -> panic "targetMkVirtualReg ArchARM"
       ArchARM64     -> panic "targetMkVirtualReg ArchARM64"
@@ -109,6 +113,7 @@ targetRegDotColor platform
       ArchX86_64    -> X86.regDotColor platform
       ArchPPC       -> PPC.regDotColor
       ArchSPARC     -> SPARC.regDotColor
+      ArchSPARC64   -> panic "targetRegDotColor ArchSPARC64"
       ArchPPC_64    -> panic "targetRegDotColor ArchPPC_64"
       ArchARM _ _ _ -> panic "targetRegDotColor ArchARM"
       ArchARM64     -> panic "targetRegDotColor ArchARM64"
