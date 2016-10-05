@@ -2208,6 +2208,7 @@ joinObjectFiles dflags o_files output_fn = do
                         -- -r and --relax are incompatible for ld, so
                         -- disable --relax explicitly.
                      ++ (if platformArch (targetPlatform dflags) == ArchSPARC
+                         || platformArch (targetPlatform dflags) == ArchSPARC64
                          && ldIsGnuLd
                             then [SysTools.Option "-Wl,-no-relax"]
                             else [])
