@@ -209,7 +209,7 @@ AC_DEFUN([FPTOOLS_SET_HASKELL_PLATFORM_VARS],
         mipsel)
             test -z "[$]2" || eval "[$]2=ArchMipsel"
             ;;
-        hppa|hppa1_1|ia64|m68k|powerpc64le|rs6000|s390|s390x|sparc64|vax)
+        hppa|hppa1_1|ia64|m68k|powerpc64le|rs6000|s390|s390x|sh4|sparc64|vax)
             test -z "[$]2" || eval "[$]2=ArchUnknown"
             ;;
         *)
@@ -1978,6 +1978,9 @@ case "$1" in
     ;;
   s390*)
     $2="s390"
+    ;;
+  sh4)
+    $2="sh4"
     ;;
   sparc64*)
     $2="sparc64"
