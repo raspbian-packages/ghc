@@ -410,8 +410,8 @@ AC_DEFUN([GET_ARM_ISA],
                         ]
                 )],
                 [changequote(, )dnl
-                 ARM_ISA=ARMv7
-                 ARM_ISA_EXT="[VFPv3,NEON]"
+                 ARM_ISA=ARMv6
+                 ARM_ISA_EXT="[VFPv2]"
                  changequote([, ])dnl
                 ])
         ])
