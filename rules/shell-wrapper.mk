@@ -36,7 +36,7 @@ $$(INPLACE_WRAPPER): $$($1_$2_SHELL_WRAPPER_NAME)
 endif
 $$(INPLACE_WRAPPER): $$($1_$2_INPLACE)
 	$$(call removeFiles,                                                    $$@)
-	echo '#!$$(SHELL)'                                                   >> $$@
+	echo '#!/bin/sh'                                                     >> $$@
 	echo 'executablename="$$(TOP)/$$<"'                                  >> $$@
 	echo 'datadir="$$(TOP)/$$(INPLACE_LIB)"'                             >> $$@
 	echo 'bindir="$$(TOP)/$$(INPLACE_BIN)"'                              >> $$@
@@ -74,7 +74,7 @@ install_$1_$2_wrapper:
 	$$(call INSTALL_DIR,"$$(DESTDIR)$$(bindir)")
 	$$(call removeFiles,                                        "$$(WRAPPER)")
 	$$(CREATE_SCRIPT)                                           "$$(WRAPPER)"
-	echo '#!$$(SHELL)'                                       >> "$$(WRAPPER)"
+	echo '#!/bin/sh'                                         >> "$$(WRAPPER)"
 	echo 'exedir="$$(ghclibexecdir)/bin"'                    >> "$$(WRAPPER)"
 	echo 'exeprog="$$($1_$2_PROG)"'                          >> "$$(WRAPPER)"
 	echo 'executablename="$$$$exedir/$$$$exeprog"'           >> "$$(WRAPPER)"
@@ -99,7 +99,7 @@ BINDIST_EXTRAS += $$($1_$2_BINDIST_WRAPPER)
 
 $$($1_$2_BINDIST_WRAPPER): $1/$2/build/tmp/$$($1_$2_PROG)
 	$$(call removeFiles,                                                  $$@)
-	echo '#!$$(SHELL)'                                                 >> $$@
+	echo '#!/bin/sh'                                                    >> $$@
 ifeq "$$(DYNAMIC_GHC_PROGRAMS)" "YES"
 	echo '$$(call prependLibraryPath,$$($1_$2_DEP_LIB_REL_DIRS_SEARCHPATH))' >> $$@
 endif
