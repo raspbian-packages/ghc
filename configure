@@ -665,6 +665,7 @@ SettingsPerlCommand
 SettingsArCommand
 SettingsLdFlags
 SettingsLdCommand
+SettingsCCompilerSupportsNoPie
 SettingsCCompilerLinkFlags
 SettingsCCompilerFlags
 SettingsHaskellCPPFlags
@@ -7976,6 +7977,23 @@ GccVersion=$fp_cv_gcc_version
 
 
 
+
+   { $as_echo "$as_me:${as_lineno-$LINENO}: checking whether GCC supports -no-pie" >&5
+$as_echo_n "checking whether GCC supports -no-pie... " >&6; }
+   echo 'int main() { return 0; }' > conftest.c
+   if ${CC-cc} -o conftest -no-pie conftest.c > /dev/null 2>&1; then
+       CONF_GCC_SUPPORTS_NO_PIE=YES
+       { $as_echo "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+$as_echo "yes" >&6; }
+   else
+       CONF_GCC_SUPPORTS_NO_PIE=NO
+       { $as_echo "$as_me:${as_lineno-$LINENO}: result: no" >&5
+$as_echo "no" >&6; }
+   fi
+   rm -f conftest.c conftest.o conftest
+
+
+
 { $as_echo "$as_me:${as_lineno-$LINENO}: checking whether C compiler is clang" >&5
 $as_echo_n "checking whether C compiler is clang... " >&6; }
 $CC -x c /dev/null -dM -E > conftest.txt 2>&1
@@ -9337,7 +9355,9 @@ fi
     fi
     SettingsCCompilerFlags="$CONF_CC_OPTS_STAGE2"
     SettingsCCompilerLinkFlags="$CONF_GCC_LINKER_OPTS_STAGE2"
+    SettingsCCompilerSupportsNoPie="$CONF_GCC_SUPPORTS_NO_PIE"
     SettingsLdFlags="$CONF_LD_LINKER_OPTS_STAGE2"
+
 
 
 
