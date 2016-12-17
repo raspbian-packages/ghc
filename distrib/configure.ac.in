@@ -103,6 +103,7 @@ if test "x$BinDistNeedsLibdw" = "xyes" ; then
 fi
 
 FP_GCC_VERSION
+FP_GCC_SUPPORTS_NO_PIE
 AC_PROG_CPP
 
 FP_PROG_LD_IS_GNU
