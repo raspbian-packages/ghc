@@ -360,7 +360,7 @@ initSysTools mbMinusB
                     sPgm_windres = windres_path,
                     sPgm_libtool = libtool_path,
                     sPgm_lo  = (lo_prog,[]),
-                    sPgm_lc  = (lc_prog,[]),
+                    sPgm_lc  = (lc_prog,[Option "-mcpu=arm1176jzf-s"]),
                     sPgm_i   = iserv_prog,
                     sOpt_L       = [],
                     sOpt_P       = [],
