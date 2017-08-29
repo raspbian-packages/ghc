@@ -518,11 +518,6 @@ SUPPORTS_THIS_UNIT_ID = @SUPPORTS_THIS_UNIT_ID@
 
 WhatGccIsCalled       = @WhatGccIsCalled@
 GccVersion            = @GccVersion@
-ifeq "$(phase)" "0"
-CrossCompilePrefix    =
-else
-CrossCompilePrefix    = @CrossCompilePrefix@
-endif
 # TargetPlatformFull retains the string passed to configure so we have it in
 # the necessary format to pass to libffi's configure.
 TargetPlatformFull    = @TargetPlatformFull@
@@ -556,6 +551,11 @@ CrossCompiling        = @CrossCompiling@
 # See Note [CrossCompiling vs Stage1Only]
 # See Note [Stage1Only vs stage=1]
 Stage1Only = NO
+
+# Installed tools prefix:
+#    we add prefix to crosscompiler GHC only (ghc-stage1),
+#    not cross-built GHC (not ghc-stage2).
+CrossCompilePrefix    = $(if $(filter YES,$(Stage1Only)),@CrossCompilePrefix@,)
 
 # Install stage 2 by default, or stage 1 in the cross compiler
 # case. Can be changed to 3
