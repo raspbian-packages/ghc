@@ -4,13 +4,16 @@ set -eu
 ghcflags="-rtsopts -threaded -Werror"
 testflags="CreateDirectoryIfMissing001.num-repeats=100000 +RTS -N2"
 
-post_configure() {
-    if [ "${DISABLE_UTIMENSAT+x}" ]; then
-        sed -i "s/#define HAVE_UTIMENSAT 1//" include/HsDirectoryConfig.h
+before_build() {
+    # workaround for https://github.com/haskell/cabal/issues/2375
+    if grep "^resolver: lts-2" stack.yaml >/dev/null 2>&1; then
+        sed -i.bak 's/WithHooks autoconfUserHooks//' Setup.hs
+        stack exec sh ./configure
     fi
 }
 
 prepare() {
+    eval "${PREBUILD-}"
     if [ "${STACK+x}" ]; then
 
         stack="$STACK --no-terminal"
@@ -28,8 +31,8 @@ prepare() {
                     mv */stack .;;
                 MSYS*)
                     url=https://www.stackage.org/stack/windows-x86_64
-                    curl --retry 3 -fsLSo stack.zip "$url"
-                    7z x stack.zip stack.exe;;
+                    curl --retry 3 -fsLS "$url" | tar xzf -
+                    mv */stack.exe .;;
                 *)
                     printf >&2 "unknown uname: %s\n" "`uname`"
                     return 1;;
@@ -39,9 +42,11 @@ prepare() {
         tools/retry $stack setup >/dev/null
         $stack ghc -- --version
         $stack --version
-        $stack init
-        sed "s/^\(extra-deps:\).*/\1 [${DEPS-}]/" stack.yaml >stack.yaml.tmp
-        mv stack.yaml.tmp stack.yaml
+        for dep in ${DEPS-}; do
+            url=https://hackage.haskell.org/package/${dep}/${dep}.tar.gz
+            curl --retry 3 -fsLS "$url" | tar xzf -
+        done
+        $stack init && :
         $stack test --install-ghc --only-dependencies
         $stack list-dependencies
 
@@ -59,6 +64,7 @@ prepare() {
 }
 
 build() {
+    before_build
     if [ "${STACK+x}" ]; then
 
         stack="$STACK --no-terminal"
@@ -103,12 +109,11 @@ build() {
 
         testflags=`printf " %s" "$testflags" | sed "s/ / --test-option=/g"`
         cabal configure -v2 --enable-tests --ghc-options="$ghcflags"
-        post_configure
         cabal build
+        cabal test --show-details="$streaming" $testflags
         cabal check
         cabal sdist
         cabal copy
-        cabal test --show-details="$streaming" $testflags
         cabal_install_run_tests dist/*-*.tar.gz --force-reinstalls
 
     fi

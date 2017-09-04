@@ -1,5 +1,15 @@
 # Changelog for [`process` package](http://hackage.haskell.org/package/process)
 
+## Unreleased changes
+
+* Bug fix: Don't close already closed pipes
+  [#81](https://github.com/haskell/process/pull/81)
+
+## 1.4.3.0 *December 2016*
+
+* New exposed `withCreateProcess`
+* Derive `Show` and `Eq` for `CreateProcess`, `CmdSpec`, and `StdStream`
+
 ## 1.4.2.0 *January 2016*
 
 * Added `createPipeFD` [#52](https://github.com/haskell/process/pull/52)

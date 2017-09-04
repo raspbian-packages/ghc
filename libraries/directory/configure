@@ -585,7 +585,7 @@ PACKAGE_STRING='Haskell directory package 1.0'
 PACKAGE_BUGREPORT='libraries@haskell.org'
 PACKAGE_URL=''
 
-ac_unique_file="include/HsDirectory.h"
+ac_unique_file="System/Directory.hs"
 # Factoring default headers for most tests.
 ac_includes_default="\
 #include <stdio.h>
@@ -2107,7 +2107,7 @@ ac_compiler_gnu=$ac_cv_c_compiler_gnu
 # Safety check: Ensure that we are in the correct source directory.
 
 
-ac_config_headers="$ac_config_headers include/HsDirectoryConfig.h"
+ac_config_headers="$ac_config_headers HsDirectoryConfig.h"
 
 
 # Autoconf chokes on spaces, but we may receive a path from Cabal containing
@@ -3351,6 +3351,17 @@ _ACEOF
 fi
 done
 
+for ac_func in GetFinalPathNameByHandleW
+do :
+  ac_fn_c_check_func "$LINENO" "GetFinalPathNameByHandleW" "ac_cv_func_GetFinalPathNameByHandleW"
+if test "x$ac_cv_func_GetFinalPathNameByHandleW" = xyes; then :
+  cat >>confdefs.h <<_ACEOF
+#define HAVE_GETFINALPATHNAMEBYHANDLEW 1
+_ACEOF
+
+fi
+done
+
 
 # EXTEXT is defined automatically by AC_PROG_CC;
 # we just need to capture it in the header file
@@ -4032,7 +4043,7 @@ cat >>$CONFIG_STATUS <<\_ACEOF || ac_write_fail=1
 for ac_config_target in $ac_config_targets
 do
   case $ac_config_target in
-    "include/HsDirectoryConfig.h") CONFIG_HEADERS="$CONFIG_HEADERS include/HsDirectoryConfig.h" ;;
+    "HsDirectoryConfig.h") CONFIG_HEADERS="$CONFIG_HEADERS HsDirectoryConfig.h" ;;
 
   *) as_fn_error $? "invalid argument: \`$ac_config_target'" "$LINENO" 5;;
   esac

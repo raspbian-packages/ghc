@@ -1,9 +1,9 @@
 AC_INIT([Haskell directory package], [1.0], [libraries@haskell.org], [directory])
 
 # Safety check: Ensure that we are in the correct source directory.
-AC_CONFIG_SRCDIR([include/HsDirectory.h])
+AC_CONFIG_SRCDIR([System/Directory.hs])
 
-AC_CONFIG_HEADERS([include/HsDirectoryConfig.h])
+AC_CONFIG_HEADERS([HsDirectoryConfig.h])
 
 # Autoconf chokes on spaces, but we may receive a path from Cabal containing
 # spaces.  In that case, we just ignore Cabal's suggestion.
@@ -31,6 +31,7 @@ AC_PROG_CC()
 AC_CHECK_HEADERS([fcntl.h limits.h sys/types.h sys/stat.h time.h])
 
 AC_CHECK_FUNCS([utimensat])
+AC_CHECK_FUNCS([GetFinalPathNameByHandleW])
 
 # EXTEXT is defined automatically by AC_PROG_CC;
 # we just need to capture it in the header file

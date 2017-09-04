@@ -6,8 +6,6 @@ module System.Console.Haskeline.Backend.Posix (
                         Handles(),
                         ehIn,
                         ehOut,
-                        Encoder,
-                        Decoder,
                         mapLines,
                         stdinTTYHandles,
                         ttyHandles,
@@ -35,7 +33,6 @@ import System.Console.Haskeline.Prefs
 
 import System.Console.Haskeline.Backend.Posix.Encoder
 
-#if __GLASGOW_HASKELL__ >= 611
 import GHC.IO.FD (fdFD)
 import Data.Dynamic (cast)
 import System.IO.Error
@@ -43,10 +40,6 @@ import GHC.IO.Exception
 import GHC.IO.Handle.Types hiding (getState)
 import GHC.IO.Handle.Internals
 import System.Posix.Internals (FD)
-#else
-import GHC.IOBase(haFD,FD)
-import GHC.Handle (withHandle_)
-#endif
 
 #if defined(USE_TERMIOS_H) || defined(__ANDROID__)
 #include <termios.h>
@@ -81,7 +74,6 @@ ioctlLayout h = allocaBytes (#size struct winsize) $ \ws -> do
                     else return Nothing
 
 unsafeHandleToFD :: Handle -> IO FD
-#if __GLASGOW_HASKELL__ >= 611
 unsafeHandleToFD h =
   withHandle_ "unsafeHandleToFd" h $ \Handle__{haDevice=dev} -> do
   case cast dev of
@@ -89,9 +81,6 @@ unsafeHandleToFD h =
                                            "unsafeHandleToFd" (Just h) Nothing)
                         "handle is not a file descriptor")
     Just fd -> return (fdFD fd)
-#else
-unsafeHandleToFD h = withHandle_ "unsafeHandleToFd" h (return . haFD)
-#endif
 
 envLayout :: IO (Maybe Layout)
 envLayout = handle (\(_::IOException) -> return Nothing) $ do
@@ -160,7 +149,7 @@ sttyKeys h = do
     attrs <- getTerminalAttributes (Fd fd)
     let getStty (k,c) = do {str <- controlChar attrs k; return ([str],c)}
     return $ catMaybes $ map getStty [(Erase,simpleKey Backspace),(Kill,simpleKey KillLine)]
-                        
+
 newtype TreeMap a b = TreeMap (Map.Map a (Maybe b, TreeMap a b))
                         deriving Show
 
@@ -211,22 +200,22 @@ lookupChars (TreeMap tm) (c:cs) = case Map.lookup c tm of
 
 -----------------------------
 
-withPosixGetEvent :: (MonadException m, MonadReader Prefs m) 
-        => Chan Event -> Handles -> Decoder -> [(String,Key)]
+withPosixGetEvent :: (MonadException m, MonadReader Prefs m)
+        => Chan Event -> Handles -> [(String,Key)]
                 -> (m Event -> m a) -> m a
-withPosixGetEvent eventChan h enc termKeys f = wrapTerminalOps h $ do
+withPosixGetEvent eventChan h termKeys f = wrapTerminalOps h $ do
     baseMap <- getKeySequences (ehIn h) termKeys
     withWindowHandler eventChan
-        $ f $ liftIO $ getEvent (ehIn h) enc baseMap eventChan
+        $ f $ liftIO $ getEvent (ehIn h) baseMap eventChan
 
 withWindowHandler :: MonadException m => Chan Event -> m a -> m a
-withWindowHandler eventChan = withHandler windowChange $ 
+withWindowHandler eventChan = withHandler windowChange $
     Catch $ writeChan eventChan WindowResize
 
 withSigIntHandler :: MonadException m => m a -> m a
 withSigIntHandler f = do
-    tid <- liftIO myThreadId 
-    withHandler keyboardSignal 
+    tid <- liftIO myThreadId
+    withHandler keyboardSignal
             (Catch (throwTo tid Interrupt))
             f
 
@@ -235,11 +224,27 @@ withHandler signal handler f = do
     old_handler <- liftIO $ installHandler signal handler Nothing
     f `finally` liftIO (installHandler signal old_handler Nothing)
 
-getEvent :: Handle -> Decoder -> TreeMap Char Key -> Chan Event -> IO Event
-getEvent h dec baseMap = keyEventLoop $ do
-        cs <- getBlockOfChars h dec
+getEvent :: Handle -> TreeMap Char Key -> Chan Event -> IO Event
+getEvent h baseMap = keyEventLoop $ do
+        cs <- getBlockOfChars h
         return [KeyInput $ lexKeys baseMap cs]
 
+-- Read at least one character of input, and more if immediately
+-- available.  In particular the characters making up a control sequence
+-- will all be available at once, so they can be processed together
+-- (with Posix.lexKeys).
+getBlockOfChars :: Handle -> IO String
+getBlockOfChars h = do
+    c <- hGetChar h
+    loop [c]
+  where
+    loop cs = do
+        isReady <- hReady h
+        if not isReady
+            then return $ reverse cs
+            else do
+                    c <- hGetChar h
+                    loop (c:cs)
 
 stdinTTYHandles, ttyHandles :: MaybeT IO Handles
 stdinTTYHandles = do
@@ -269,7 +274,7 @@ openTerm mode = handle (\(_::IOException) -> mzero)
             $ liftIO $ openInCodingMode "/dev/tty" mode
 
 
-posixRunTerm :: 
+posixRunTerm ::
     Handles
     -> [IO (Maybe Layout)]
     -> [(String,Key)]
@@ -279,26 +284,26 @@ posixRunTerm ::
 posixRunTerm hs layoutGetters keys wrapGetEvent evalBackend = do
     ch <- newChan
     fileRT <- posixFileRunTerm hs
-    (enc,dec) <- newEncoders
     return fileRT
-                { closeTerm = closeTerm fileRT
-                , termOps = Left TermOps
+                { termOps = Left TermOps
                             { getLayout = tryGetLayouts layoutGetters
-                            , withGetEvent = wrapGetEvent 
-                                            . withPosixGetEvent ch hs dec
+                            , withGetEvent = wrapGetEvent
+                                            . withPosixGetEvent ch hs
                                                 keys
                             , saveUnusedKeys = saveKeys ch
                             , evalTerm = mapEvalTerm
-                                            (runPosixT enc hs)
-                                                (lift . lift)
-                                            evalBackend
+                                            (runPosixT hs) lift evalBackend
+                            , externalPrint = writeChan ch . ExternalPrint
                             }
+                , closeTerm = do
+                    flushEventQueue (putStrOut fileRT) ch
+                    closeTerm fileRT
                 }
 
-type PosixT m = ReaderT Encoder (ReaderT Handles m)
+type PosixT m = ReaderT Handles m
 
-runPosixT :: Monad m => Encoder -> Handles -> PosixT m a -> m a
-runPosixT enc h = runReaderT' h . runReaderT' enc
+runPosixT :: Monad m => Handles -> PosixT m a -> m a
+runPosixT h = runReaderT' h
 
 fileRunTerm :: Handle -> IO RunTerm
 fileRunTerm h_in = posixFileRunTerm Handles
@@ -309,19 +314,18 @@ fileRunTerm h_in = posixFileRunTerm Handles
 
 posixFileRunTerm :: Handles -> IO RunTerm
 posixFileRunTerm hs = do
-    (enc,dec) <- newEncoders
     return RunTerm
                 { putStrOut = \str -> withCodingMode (hOut hs) $ do
-                                        putEncodedStr enc (ehOut hs) str
+                                        hPutStr (ehOut hs) str
                                         hFlush (ehOut hs)
                 , closeTerm = closeHandles hs
                 , wrapInterrupt = withSigIntHandler
                 , termOps = Right FileOps
                           { inputHandle = ehIn hs
                           , wrapFileInput = withCodingMode (hIn hs)
-                          , getLocaleChar = getDecodedChar (ehIn hs) dec
+                          , getLocaleChar = guardedEOF hGetChar (ehIn hs)
                           , maybeReadNewline = hMaybeReadNewline (ehIn hs)
-                          , getLocaleLine = getDecodedLine (ehIn hs) dec
+                          , getLocaleLine = guardedEOF hGetLine (ehIn hs)
                           }
                 }
 

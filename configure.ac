@@ -13,7 +13,7 @@ dnl
 # see what flags are available. (Better yet, read the documentation!)
 #
 
-AC_INIT([The Glorious Glasgow Haskell Compilation System], [8.0.1], [glasgow-haskell-bugs@haskell.org], [ghc-AC_PACKAGE_VERSION])
+AC_INIT([The Glorious Glasgow Haskell Compilation System], [8.0.2], [glasgow-haskell-bugs@haskell.org], [ghc-AC_PACKAGE_VERSION])
 
 # Set this to YES for a released version, otherwise NO
 : ${RELEASE=YES}
@@ -419,20 +419,20 @@ dnl ** Building a cross compiler?
 dnl --------------------------------------------------------------
 CrossCompiling=NO
 # If 'host' and 'target' differ, then this means we are building a cross-compiler.
-if test "$target" != "$host" ; then
+if test "$TargetPlatform" != "$HostPlatform" ; then
     CrossCompiling=YES
     cross_compiling=yes   # This tells configure that it can accept just 'target',
                           # otherwise you get
                           #   configure: error: cannot run C compiled programs.
                           #   If you meant to cross compile, use `--host'.
 fi
-if test "$build" != "$host" ; then
+if test "$BuildPlatform" != "$HostPlatform" ; then
    AC_MSG_ERROR([
 You've selected:
 
-  BUILD:  $build   (the architecture we're building on)
-  HOST:   $host    (the architecture the compiler we're building will execute on)
-  TARGET: $target  (the architecture the compiler we're building will produce code for)
+  BUILD:  $BuildPlatform   (the architecture we're building on)
+  HOST:   $HostPlatform    (the architecture the compiler we're building will execute on)
+  TARGET: $TargetPlatform  (the architecture the compiler we're building will produce code for)
 
 BUILD must equal HOST; that is, we do not support building GHC itself
 with a cross-compiler.  To cross-compile GHC itself, set TARGET: stage
@@ -446,7 +446,7 @@ then
 else
   CrossCompilePrefix=""
 fi
-TargetPlatformFull="${target}"
+TargetPlatformFull="${TargetPlatform}"
 AC_SUBST(CrossCompiling)
 AC_SUBST(CrossCompilePrefix)
 AC_SUBST(TargetPlatformFull)
@@ -668,18 +668,27 @@ FPTOOLS_SET_C_LD_FLAGS([target],[CONF_CC_OPTS_STAGE2],[CONF_GCC_LINKER_OPTS_STAG
 
 FP_GCC_EXTRA_FLAGS
 
+# See rules/distdir-way-opts.mk for details.
+# Flags passed to the C compiler
 AC_SUBST(CONF_CC_OPTS_STAGE0)
 AC_SUBST(CONF_CC_OPTS_STAGE1)
 AC_SUBST(CONF_CC_OPTS_STAGE2)
+# Flags passed to the C compiler when we ask it to link
 AC_SUBST(CONF_GCC_LINKER_OPTS_STAGE0)
 AC_SUBST(CONF_GCC_LINKER_OPTS_STAGE1)
 AC_SUBST(CONF_GCC_LINKER_OPTS_STAGE2)
+# Flags passed to the linker when we ask it to link
 AC_SUBST(CONF_LD_LINKER_OPTS_STAGE0)
 AC_SUBST(CONF_LD_LINKER_OPTS_STAGE1)
 AC_SUBST(CONF_LD_LINKER_OPTS_STAGE2)
+# Flags passed to the C preprocessor
 AC_SUBST(CONF_CPP_OPTS_STAGE0)
 AC_SUBST(CONF_CPP_OPTS_STAGE1)
 AC_SUBST(CONF_CPP_OPTS_STAGE2)
+# Flags passed to the Haskell compiler
+AC_SUBST(CONF_HC_OPTS_STAGE0)
+AC_SUBST(CONF_HC_OPTS_STAGE1)
+AC_SUBST(CONF_HC_OPTS_STAGE2)
 
 dnl ** Set up the variables for the platform in the settings file.
 dnl May need to use gcc to find platform details.

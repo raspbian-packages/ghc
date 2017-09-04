@@ -1180,7 +1180,8 @@ linkPackage hsc_env pkg
    = do
         let dflags    = hsc_dflags hsc_env
             platform  = targetPlatform dflags
-            dirs      = Packages.libraryDirs pkg
+            dirs | interpreterDynamic dflags = Packages.libraryDynDirs pkg
+                 | otherwise                 = Packages.libraryDirs pkg
 
         let hs_libs   =  Packages.hsLibraries pkg
             -- The FFI GHCi import lib isn't needed as
@@ -1227,9 +1228,6 @@ linkPackage hsc_env pkg
             mapM_ (load_dyn hsc_env)
               (known_dlls ++ map (mkSOName platform) dlls)
 
-        -- DLLs are loaded, reset the search paths
-        mapM_ (removeLibrarySearchPath hsc_env) $ reverse pathCache
-
         -- After loading all the DLLs, we can load the static objects.
         -- Ordering isn't important here, because we do one final link
         -- step to resolve everything.
@@ -1238,6 +1236,13 @@ linkPackage hsc_env pkg
 
         maybePutStr dflags "linking ... "
         ok <- resolveObjs hsc_env
+
+        -- DLLs are loaded, reset the search paths
+        -- Import libraries will be loaded via loadArchive so only
+        -- reset the DLL search path after all archives are loaded
+        -- as well.
+        mapM_ (removeLibrarySearchPath hsc_env) $ reverse pathCache
+
         if succeeded ok
            then maybePutStrLn dflags "done."
            else let errmsg = "unable to load package `"
@@ -1274,15 +1279,17 @@ loadFrameworks hsc_env platform pkg
 -- If it isn't present, we assume that addDLL in the RTS can find it,
 -- which generally means that it should be a dynamic library in the
 -- standard system search path.
-
+-- For GHCi we tend to prefer dynamic libraries over static ones as
+-- they are easier to load and manage, have less overhead.
 locateLib :: HscEnv -> Bool -> [FilePath] -> String -> IO LibrarySpec
 locateLib hsc_env is_hs dirs lib
   | not is_hs
     -- For non-Haskell libraries (e.g. gmp, iconv):
     --   first look in library-dirs for a dynamic library (libfoo.so)
     --   then  look in library-dirs for a static library (libfoo.a)
-    --   first look in library-dirs and inplace GCC for a dynamic library (libfoo.so)
+    --   then look in library-dirs and inplace GCC for a dynamic library (libfoo.so)
     --   then  check for system dynamic libraries (e.g. kernel32.dll on windows)
+    --   then  try looking for import libraries on Windows (.dll.a, .lib)
     --   then  try "gcc --print-file-name" to search gcc's search path
     --   then  look in library-dirs and inplace GCC for a static library (libfoo.a)
     --       for a dynamic library (#5289)
@@ -1290,6 +1297,7 @@ locateLib hsc_env is_hs dirs lib
     --
   = findDll     `orElse`
     findSysDll  `orElse`
+    tryImpLib   `orElse`
     tryGcc      `orElse`
     findArchive `orElse`
     assumeDll
@@ -1321,30 +1329,42 @@ locateLib hsc_env is_hs dirs lib
      loading_profiled_hs_libs = interpreterProfiled dflags
      loading_dynamic_hs_libs  = interpreterDynamic dflags
 
+     import_libs  = [lib <.> "lib", "lib" ++ lib <.> "lib", "lib" ++ lib <.> "dll.a"]
+
      hs_dyn_lib_name = lib ++ '-':programName dflags ++ projectVersion dflags
      hs_dyn_lib_file = mkHsSOName platform hs_dyn_lib_name
 
-     so_name = mkSOName platform lib
+     so_name     = mkSOName platform lib
      lib_so_name = "lib" ++ so_name
      dyn_lib_file = case (arch, os) of
                              (ArchX86_64, OSSolaris2) -> "64" </> so_name
                              _ -> so_name
 
-     findObject     = liftM (fmap Object)  $ findFile dirs obj_file
-     findDynObject  = liftM (fmap Object)  $ findFile dirs dyn_obj_file
-     findArchive    = let local  = liftM (fmap Archive) $ findFile dirs arch_file
-                          linked = liftM (fmap Archive) $ searchForLibUsingGcc dflags arch_file dirs
-                      in liftM2 (<|>) local linked
-     findHSDll      = liftM (fmap DLLPath) $ findFile dirs hs_dyn_lib_file
-     findDll        = liftM (fmap DLLPath) $ findFile dirs dyn_lib_file
-     findSysDll     = fmap (fmap $ DLL . takeFileName) $ findSystemLibrary hsc_env so_name
-     tryGcc         = let short = liftM (fmap DLLPath) $ searchForLibUsingGcc dflags so_name     dirs
-                          full  = liftM (fmap DLLPath) $ searchForLibUsingGcc dflags lib_so_name dirs
-                      in liftM2 (<|>) short full
+     findObject    = liftM (fmap Object)  $ findFile dirs obj_file
+     findDynObject = liftM (fmap Object)  $ findFile dirs dyn_obj_file
+     findArchive   = let local  = liftM (fmap Archive) $ findFile dirs arch_file
+                         linked = liftM (fmap Archive) $ searchForLibUsingGcc dflags arch_file dirs
+                     in liftM2 (<|>) local linked
+     findHSDll     = liftM (fmap DLLPath) $ findFile dirs hs_dyn_lib_file
+     findDll       = liftM (fmap DLLPath) $ findFile dirs dyn_lib_file
+     findSysDll    = fmap (fmap $ DLL . takeFileName) $ findSystemLibrary hsc_env so_name
+     tryGcc        = let short = liftM (fmap DLLPath) $ searchForLibUsingGcc dflags so_name     dirs
+                         full  = liftM (fmap DLLPath) $ searchForLibUsingGcc dflags lib_so_name dirs
+                     in liftM2 (<|>) short full
+     tryImpLib     = case os of
+                       OSMinGW32 -> let check name = liftM (fmap Archive) $ searchForLibUsingGcc dflags name dirs
+                                    in apply (map check import_libs)
+                       _         -> return Nothing
 
      assumeDll   = return (DLL lib)
      infixr `orElse`
      f `orElse` g = f >>= maybe g return
+
+     apply []     = return Nothing
+     apply (x:xs) = do x' <- x
+                       if isJust x'
+                          then return x'
+                          else apply xs
 
      platform = targetPlatform dflags
      arch = platformArch platform

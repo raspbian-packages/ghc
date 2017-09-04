@@ -46,6 +46,8 @@ import Util
 import Name
 import Outputable
 import BasicTypes ( isGenerated )
+import Unique
+import UniqDFM
 
 import Control.Monad( when, unless )
 import qualified Data.Map as Map
@@ -196,9 +198,9 @@ match vars@(v:_) ty eqns    -- Eqns *can* be empty
     match_group [] = panic "match_group"
     match_group eqns@((group,_) : _)
         = case group of
-            PgCon {}  -> matchConFamily  vars ty (subGroup [(c,e) | (PgCon c, e) <- eqns])
+            PgCon {}  -> matchConFamily  vars ty (subGroupUniq [(c,e) | (PgCon c, e) <- eqns])
             PgSyn {}  -> matchPatSyn     vars ty (dropGroup eqns)
-            PgLit {}  -> matchLiterals   vars ty (subGroup [(l,e) | (PgLit l, e) <- eqns])
+            PgLit {}  -> matchLiterals   vars ty (subGroupOrd [(l,e) | (PgLit l, e) <- eqns])
             PgAny     -> matchVariables  vars ty (dropGroup eqns)
             PgN {}    -> matchNPats      vars ty (dropGroup eqns)
             PgNpK {}  -> matchNPlusKPats vars ty (dropGroup eqns)
@@ -755,12 +757,27 @@ matchSimply scrut hs_ctx pat result_expr fail_expr = do
 
 matchSinglePat :: CoreExpr -> HsMatchContext Name -> LPat Id
                -> Type -> MatchResult -> DsM MatchResult
--- Do not warn about incomplete patterns
+-- matchSinglePat does not warn about incomplete patterns
 -- Used for things like [ e | pat <- stuff ], where
 -- incomplete patterns are just fine
+
 matchSinglePat (Var var) ctx pat ty match_result
+  | isLocalId var
+  = match_single_pat_var var ctx pat ty match_result
+
+matchSinglePat scrut hs_ctx pat ty match_result
+  = do { var           <- selectSimpleMatchVarL pat
+       ; match_result' <- match_single_pat_var var hs_ctx pat ty match_result
+       ; return (adjustMatchResult (bindNonRec var scrut) match_result') }
+
+match_single_pat_var :: Id -> HsMatchContext Name -> LPat Id
+                     -> Type -> MatchResult -> DsM MatchResult
+-- matchSinglePat ensures that the scrutinee is a variable
+-- and then calls match_single_pat_var
+match_single_pat_var var ctx pat ty match_result
   = do { dflags <- getDynFlags
        ; locn   <- getSrcSpanDs
+
                     -- Pattern match check warnings
        ; checkSingle dflags (DsMatchContext ctx locn) var (unLoc pat)
 
@@ -768,10 +785,6 @@ matchSinglePat (Var var) ctx pat ty match_result
                                 , eqn_rhs  = match_result }
        ; match [var] ty [eqn_info] }
 
-matchSinglePat scrut hs_ctx pat ty match_result
-  = do { var <- selectSimpleMatchVarL pat
-       ; match_result' <- matchSinglePat (Var var) hs_ctx pat ty match_result
-       ; return (adjustMatchResult (bindNonRec var scrut) match_result') }
 
 
 {-
@@ -809,21 +822,33 @@ groupEquations dflags eqns
     same_gp :: (PatGroup,EquationInfo) -> (PatGroup,EquationInfo) -> Bool
     (pg1,_) `same_gp` (pg2,_) = pg1 `sameGroup` pg2
 
-subGroup :: Ord a => [(a, EquationInfo)] -> [[EquationInfo]]
+subGroup :: (m -> [[EquationInfo]]) -- Map.elems
+         -> m -- Map.empty
+         -> (a -> m -> Maybe [EquationInfo]) -- Map.lookup
+         -> (a -> [EquationInfo] -> m -> m) -- Map.insert
+         -> [(a, EquationInfo)] -> [[EquationInfo]]
 -- Input is a particular group.  The result sub-groups the
 -- equations by with particular constructor, literal etc they match.
 -- Each sub-list in the result has the same PatGroup
 -- See Note [Take care with pattern order]
-subGroup group
-    = map reverse $ Map.elems $ foldl accumulate Map.empty group
+-- Parameterized by map operations to allow different implementations
+-- and constraints, eg. types without Ord instance.
+subGroup elems empty lookup insert group
+    = map reverse $ elems $ foldl accumulate empty group
   where
     accumulate pg_map (pg, eqn)
-      = case Map.lookup pg pg_map of
-          Just eqns -> Map.insert pg (eqn:eqns) pg_map
-          Nothing   -> Map.insert pg [eqn]      pg_map
-
+      = case lookup pg pg_map of
+          Just eqns -> insert pg (eqn:eqns) pg_map
+          Nothing   -> insert pg [eqn]      pg_map
     -- pg_map :: Map a [EquationInfo]
     -- Equations seen so far in reverse order of appearance
+
+subGroupOrd :: Ord a => [(a, EquationInfo)] -> [[EquationInfo]]
+subGroupOrd = subGroup Map.elems Map.empty Map.lookup Map.insert
+
+subGroupUniq :: Uniquable a => [(a, EquationInfo)] -> [[EquationInfo]]
+subGroupUniq =
+  subGroup eltsUDFM emptyUDFM (flip lookupUDFM) (\k v m -> addToUDFM m k v)
 
 {- Note [Pattern synonym groups]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

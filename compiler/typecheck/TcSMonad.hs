@@ -16,9 +16,9 @@ module TcSMonad (
     TcS, runTcS, runTcSDeriveds, runTcSWithEvBinds,
     failTcS, warnTcS, addErrTcS,
     runTcSEqualities,
-    nestTcS, nestImplicTcS,
+    nestTcS, nestImplicTcS, setEvBindsTcS,
 
-    runTcPluginTcS, addUsedDataCons, deferTcSForAllEq,
+    runTcPluginTcS, addUsedGREs, deferTcSForAllEq,
 
     -- Tracing etc
     panicTcS, traceTcS,
@@ -55,7 +55,7 @@ module TcSMonad (
     getUnsolvedInerts,
     removeInertCts, getPendingScDicts,
     addInertCan, addInertEq, insertFunEq,
-    emitInsoluble, emitWorkNC,
+    emitInsoluble, emitWorkNC, emitWork,
 
     -- The Model
     InertModel, kickOutAfterUnification,
@@ -93,6 +93,7 @@ module TcSMonad (
     TcLevel, isTouchableMetaTyVarTcS,
     isFilledMetaTyVar_maybe, isFilledMetaTyVar,
     zonkTyCoVarsAndFV, zonkTcType, zonkTcTypes, zonkTcTyVar, zonkCo,
+    zonkTyCoVarsAndFVList,
     zonkSimples, zonkWC,
 
     -- References
@@ -135,7 +136,7 @@ import TyCon
 import TcErrors   ( solverDepthErrorTcS )
 
 import Name
-import RdrName ( GlobalRdrEnv)
+import RdrName ( GlobalRdrEnv, GlobalRdrElt )
 import qualified RnEnv as TcM
 import Var
 import VarEnv
@@ -148,6 +149,7 @@ import TcRnTypes
 
 import Unique
 import UniqFM
+import UniqDFM
 import Maybes
 
 import TrieMap
@@ -367,13 +369,13 @@ instance Outputable InertSet where
 emptyInert :: InertSet
 emptyInert
   = IS { inert_cans = IC { inert_count    = 0
-                         , inert_eqs      = emptyVarEnv
+                         , inert_eqs      = emptyDVarEnv
                          , inert_dicts    = emptyDicts
                          , inert_safehask = emptyDicts
                          , inert_funeqs   = emptyFunEqs
                          , inert_irreds   = emptyCts
                          , inert_insols   = emptyCts
-                         , inert_model    = emptyVarEnv }
+                         , inert_model    = emptyDVarEnv }
        , inert_flat_cache    = emptyExactFunEqs
        , inert_solved_dicts  = emptyDictMap }
 
@@ -385,7 +387,7 @@ dictionary to the inert_solved_dicts.  In general, we use it to avoid
 creating a new EvVar when we have a new goal that we have solved in
 the past.
 
-But in particular, we can use it to create *recursive* dicationaries.
+But in particular, we can use it to create *recursive* dictionaries.
 The simplest, degnerate case is
     instance C [a] => C [a] where ...
 If we have
@@ -549,7 +551,7 @@ data InertCans   -- See Note [Detailed InertCans Invariants] for more
   = IC { inert_model :: InertModel
               -- See Note [inert_model: the inert model]
 
-       , inert_eqs :: TyVarEnv EqualCtList
+       , inert_eqs :: DTyVarEnv EqualCtList
               -- See Note [inert_eqs: the inert equalities]
               -- All Given/Wanted CTyEqCans; index is the LHS tyvar
 
@@ -589,7 +591,7 @@ data InertCans   -- See Note [Detailed InertCans Invariants] for more
               -- When non-zero, keep trying to solved
        }
 
-type InertModel  = TyVarEnv Ct
+type InertModel  = DTyVarEnv Ct
      -- If a -> ct, then ct is a
      --    nominal, Derived, canonical CTyEqCan for [D] (a ~N rhs)
      -- The index of the TyVarEnv is the 'a'
@@ -656,11 +658,12 @@ Note [inert_model: the inert model]
        decomposing injective arguments of type functions, and
        suchlike.
 
-     - A Derived "shadow copy" for every Given or Wanted (a ~N ty) in
-       inert_eqs.
+     - A Derived "shadow copy" for every Wanted (a ~N ty) in
+       inert_eqs.  (Originally included every Given too; but
+       see Note [Add derived shadows only for Wanteds])
 
    * The model is not subject to "kicking-out". Reason: we make a Derived
-     shadow copy of any Given/Wanted (a ~ ty), and that Derived copy will
+     shadow copy of any Wanted (a ~ ty), and that Derived copy will
      be fully rewritten by the model before it is added
 
    * The principal reason for maintaining the model is to generate
@@ -1064,9 +1067,9 @@ instance Outputable InertCans where
           , inert_safehask = safehask, inert_irreds = irreds
           , inert_insols = insols, inert_count = count })
     = braces $ vcat
-      [ ppUnless (isEmptyVarEnv eqs) $
+      [ ppUnless (isEmptyDVarEnv eqs) $
         text "Equalities:"
-          <+> pprCts (foldVarEnv (\eqs rest -> listToBag eqs `andCts` rest) emptyCts eqs)
+          <+> pprCts (foldDVarEnv (\eqs rest -> listToBag eqs `andCts` rest) emptyCts eqs)
       , ppUnless (isEmptyTcAppMap funeqs) $
         text "Type-function equalities =" <+> pprCts (funEqsToBag funeqs)
       , ppUnless (isEmptyTcAppMap dicts) $
@@ -1077,8 +1080,8 @@ instance Outputable InertCans where
         text "Irreds =" <+> pprCts irreds
       , ppUnless (isEmptyCts insols) $
         text "Insolubles =" <+> pprCts insols
-      , ppUnless (isEmptyVarEnv model) $
-        text "Model =" <+> pprCts (foldVarEnv consCts emptyCts model)
+      , ppUnless (isEmptyDVarEnv model) $
+        text "Model =" <+> pprCts (foldDVarEnv consCts emptyCts model)
       , text "Unsolved goals =" <+> int count
       ]
 
@@ -1114,26 +1117,22 @@ Note [Adding an inert canonical constraint the InertCans]
              NB: 'a' cannot be in fv(ty), because the constraint is canonical.
 
           2. (DShadow) Do emitDerivedShadows
-               For every inert G/W constraint c, st
+               For every inert [W] constraint c, st
                 (a) (a~ty) can rewrite c (see Note [Emitting shadow constraints]),
                     and
                 (b) the model cannot rewrite c
                kick out a Derived *copy*, leaving the original unchanged.
                Reason for (b) if the model can rewrite c, then we have already
                generated a shadow copy
+               See Note [Add derived shadows only for Wanteds]
 
        [Given/Wanted Nominal]  [G/W] a ~N ty:
           1. Add it to inert_eqs
-          2. Emit [D] a~ty
-          Step (2) is needed to allow the current model to fully
-          rewrite [D] a~ty before adding it using the [Derived Nominal]
-          steps above.
-
-          We must do this even for Givens, because
-             work-item [G] a ~ [b], model has [D] b ~ a.
-          We need a shadow [D] a ~ [b] in the work-list
-          When we process it, we'll rewrite to a ~ [a] and get an occurs check
-
+          2. For [W], Emit [D] a~ty
+             Step (2) is needed to allow the current model to fully
+             rewrite [D] a~ty before adding it using the [Derived Nominal]
+             steps above.
+             See Note [Add derived shadows only for Wanteds]
 
 * Unifying a:=ty, is like adding [G] a~ty, but we can't make a [D]
   a~ty, as in step (1) of the [G/W] case above.  So instead, do
@@ -1214,7 +1213,7 @@ add_inert_eq ics@(IC { inert_count = n
 
   | isDerived ev
   = do { emitDerivedShadows ics tv
-       ; return (ics { inert_model = extendVarEnv old_model tv ct }) }
+       ; return (ics { inert_model = extendDVarEnv old_model tv ct }) }
 
   | otherwise   -- Given/Wanted Nominal equality [W] tv ~N ty
   = do { emitNewDerived loc pred
@@ -1253,7 +1252,7 @@ emitDerivedShadows IC { inert_eqs      = tv_eqs
                   | otherwise      = cts
 
     want_shadow ct
-      =  not (isDerivedCt ct)              -- No need for a shadow of a Derived!
+      =  isWantedCt ct                     -- See Note [Add shadows only for Wanteds]
       && (new_tv `elemVarSet` rw_tvs)      -- New tv can rewrite ct, yielding a
                                            -- different ct
       && not (modelCanRewrite model rw_tvs)-- We have not already created a
@@ -1275,7 +1274,31 @@ mkShadowCt ct
     derived_ev = CtDerived { ctev_pred = ctEvPred ev
                            , ctev_loc  = ctEvLoc ev }
 
-{- Note [Keep CDictCan shadows as CDictCan]
+{- Note [Add derived shadows only for Wanteds]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We now only add shadows for Wanted constraints.  Why add derived
+shadows for Givens?  After all, Givens can rewrite Deriveds.  But
+Deriveds can't rewrite Givens.  So in principle, if we created a
+Derived shadow of a Given, it could be rewritten by other Deriveds,
+and that could, conceivably, lead to a useful unification.
+
+But (a) I have been unable to come up with an example of this
+happening and (b) see Trac #12660 for how adding the derived shadows
+of a Given led to an infinite loop.  For (b) there may be other
+ways to solve the loop, but simply reraining from adding
+derived shadows of Givens is particularly simple.  And it's more
+efficient too!
+
+Still, here's one possible reason for adding derived shadows
+for Givens.  Consider
+           work-item [G] a ~ [b], model has [D] b ~ a.
+If we added the derived shadow (into the work list)
+         [D] a ~ [b]
+When we process it, we'll rewrite to a ~ [a] and get an
+occurs check.  Without it we'll miss the occurs check (reporting
+inaccessible code); but that's probably OK.
+
+Note [Keep CDictCan shadows as CDictCan]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Suppose we have
   class C a => D a b
@@ -1302,7 +1325,7 @@ See Trac #11379 for a case of this.
 modelCanRewrite :: InertModel -> TcTyCoVarSet -> Bool
 -- See Note [Emitting shadow constraints]
 -- True if there is any intersection between dom(model) and tvs
-modelCanRewrite model tvs = not (disjointUFM model tvs)
+modelCanRewrite model tvs = not (disjointUdfmUfm model tvs)
      -- The low-level use of disjointUFM might e surprising.
      -- InertModel = TyVarEnv Ct, and we want to see if its domain
      -- is disjoint from that of a TcTyCoVarSet.  So we drop down
@@ -1325,7 +1348,8 @@ addInertCan ct
        -- Emit shadow derived if necessary
        -- See Note [Emitting shadow constraints]
        ; let rw_tvs = rewritableTyCoVars ct
-       ; when (not (isDerivedCt ct) && modelCanRewrite (inert_model ics) rw_tvs)
+       ; when (isWantedCt ct && modelCanRewrite (inert_model ics) rw_tvs)
+              -- See Note [Add shadows only for Wanteds]
               (emitWork [mkShadowCt ct])
 
        ; traceTcS "addInertCan }" $ empty }
@@ -1400,7 +1424,7 @@ kickOutRewritable new_fr new_tv ics@(IC { inert_eqs      = tv_eqs
                                              `andCts` insols_out)
                     , wl_implics = emptyBag }
 
-    (tv_eqs_out, tv_eqs_in) = foldVarEnv kick_out_eqs ([], emptyVarEnv) tv_eqs
+    (tv_eqs_out, tv_eqs_in) = foldDVarEnv kick_out_eqs ([], emptyDVarEnv) tv_eqs
     (feqs_out,   feqs_in)   = partitionFunEqs  kick_out_fe funeqmap
     (dicts_out,  dicts_in)  = partitionDicts   kick_out_ct dictmap
     (irs_out,    irs_in)    = partitionBag     kick_out_ct irreds
@@ -1427,12 +1451,12 @@ kickOutRewritable new_fr new_tv ics@(IC { inert_eqs      = tv_eqs
             && new_tv `elemVarSet` tyCoVarsOfTypes tys)
     kick_out_fe ct = pprPanic "kick_out_fe" (ppr ct)
 
-    kick_out_eqs :: EqualCtList -> ([Ct], TyVarEnv EqualCtList)
-                 -> ([Ct], TyVarEnv EqualCtList)
+    kick_out_eqs :: EqualCtList -> ([Ct], DTyVarEnv EqualCtList)
+                 -> ([Ct], DTyVarEnv EqualCtList)
     kick_out_eqs eqs (acc_out, acc_in)
       = (eqs_out ++ acc_out, case eqs_in of
                                []      -> acc_in
-                               (eq1:_) -> extendVarEnv acc_in (cc_tyvar eq1) eqs_in)
+                               (eq1:_) -> extendDVarEnv acc_in (cc_tyvar eq1) eqs_in)
       where
         (eqs_in, eqs_out) = partition keep_eq eqs
 
@@ -1484,9 +1508,9 @@ kickOutAfterUnification new_tv
 
 kickOutModel :: TcTyVar -> InertCans -> (WorkList, InertCans)
 kickOutModel new_tv ics@(IC { inert_model = model, inert_eqs = eqs })
-  = (foldVarEnv add emptyWorkList der_out, ics { inert_model = new_model })
+  = (foldDVarEnv add emptyWorkList der_out, ics { inert_model = new_model })
   where
-    (der_out, new_model) = partitionVarEnv kick_out_der model
+    (der_out, new_model) = partitionDVarEnv kick_out_der model
 
     kick_out_der :: Ct -> Bool
     kick_out_der (CTyEqCan { cc_tyvar = tv, cc_rhs = rhs })
@@ -1660,7 +1684,7 @@ updInertIrreds :: (Cts -> Cts) -> TcS ()
 updInertIrreds upd_fn
   = updInertCans $ \ ics -> ics { inert_irreds = upd_fn (inert_irreds ics) }
 
-getInertEqs :: TcS (TyVarEnv EqualCtList)
+getInertEqs :: TcS (DTyVarEnv EqualCtList)
 getInertEqs = do { inert <- getInertCans; return (inert_eqs inert) }
 
 getInertModel :: TcS InertModel
@@ -1673,7 +1697,7 @@ getInertGivens
   = do { inerts <- getInertCans
        ; let all_cts = foldDicts (:) (inert_dicts inerts)
                      $ foldFunEqs (:) (inert_funeqs inerts)
-                     $ concat (varEnvElts (inert_eqs inerts))
+                     $ concat (dVarEnvElts (inert_eqs inerts))
        ; return (filter isGivenCt all_cts) }
 
 getPendingScDicts :: TcS [Ct]
@@ -1719,7 +1743,7 @@ getUnsolvedInerts
            , inert_model  = model } <- getInertCans
       ; keep_derived <- keepSolvingDeriveds
 
-      ; let der_tv_eqs       = foldVarEnv (add_der_eq keep_derived tv_eqs)
+      ; let der_tv_eqs       = foldDVarEnv (add_der_eq keep_derived tv_eqs)
                                           emptyCts model
             unsolved_tv_eqs  = foldTyEqs add_if_unsolved tv_eqs der_tv_eqs
             unsolved_fun_eqs = foldFunEqs add_if_unsolved fun_eqs emptyCts
@@ -1752,10 +1776,10 @@ getUnsolvedInerts
 
     is_unsolved ct = not (isGivenCt ct)   -- Wanted or Derived
 
-isInInertEqs :: TyVarEnv EqualCtList -> TcTyVar -> TcType -> Bool
+isInInertEqs :: DTyVarEnv EqualCtList -> TcTyVar -> TcType -> Bool
 -- True if (a ~N ty) is in the inert set, in either Given or Wanted
 isInInertEqs eqs tv rhs
-  = case lookupVarEnv eqs tv of
+  = case lookupDVarEnv eqs tv of
       Nothing  -> False
       Just cts -> any (same_pred rhs) cts
   where
@@ -1765,19 +1789,23 @@ isInInertEqs eqs tv rhs
       , rhs `eqType` rhs2 = True
       | otherwise         = False
 
-getNoGivenEqs :: TcLevel     -- TcLevel of this implication
+getNoGivenEqs :: TcLevel          -- TcLevel of this implication
                -> [TcTyVar]       -- Skolems of this implication
+               -> Cts             -- Given insolubles from solveGivens
                -> TcS Bool        -- True <=> definitely no residual given equalities
 -- See Note [When does an implication have given equalities?]
-getNoGivenEqs tclvl skol_tvs
-  = do { inerts@(IC { inert_eqs = ieqs, inert_irreds = iirreds, inert_funeqs = funeqs })
+getNoGivenEqs tclvl skol_tvs given_insols
+  = do { inerts@(IC { inert_eqs = ieqs, inert_irreds = iirreds
+                    , inert_funeqs = funeqs })
              <- getInertCans
        ; let local_fsks = foldFunEqs add_fsk funeqs emptyVarSet
 
-             has_given_eqs = foldrBag ((||) . ev_given_here . ctEvidence)  False iirreds
-                          || foldVarEnv ((||) . eqs_given_here local_fsks) False ieqs
+             has_given_eqs = foldrBag ((||) . ev_given_here . ctEvidence) False
+                                      (iirreds `unionBags` given_insols)
+                          || anyDVarEnv (eqs_given_here local_fsks) ieqs
 
-       ; traceTcS "getNoGivenEqs" (vcat [ppr has_given_eqs, ppr inerts])
+       ; traceTcS "getNoGivenEqs" (vcat [ ppr has_given_eqs, ppr inerts
+                                        , ppr given_insols])
        ; return (not has_given_eqs) }
   where
     eqs_given_here :: VarSet -> EqualCtList -> Bool
@@ -2030,19 +2058,19 @@ type EqualCtList = [Ct]
    - Any number of Wanteds and/or Deriveds
 -}
 
-addTyEq :: TyVarEnv EqualCtList -> TcTyVar -> Ct -> TyVarEnv EqualCtList
-addTyEq old_list tv it = extendVarEnv_C (\old_eqs _new_eqs -> it : old_eqs)
+addTyEq :: DTyVarEnv EqualCtList -> TcTyVar -> Ct -> DTyVarEnv EqualCtList
+addTyEq old_list tv it = extendDVarEnv_C (\old_eqs _new_eqs -> it : old_eqs)
                                         old_list tv [it]
 
-foldTyEqs :: (Ct -> b -> b) -> TyVarEnv EqualCtList -> b -> b
+foldTyEqs :: (Ct -> b -> b) -> DTyVarEnv EqualCtList -> b -> b
 foldTyEqs k eqs z
-  = foldVarEnv (\cts z -> foldr k z cts) z eqs
+  = foldDVarEnv (\cts z -> foldr k z cts) z eqs
 
 findTyEqs :: InertCans -> TyVar -> EqualCtList
-findTyEqs icans tv = lookupVarEnv (inert_eqs icans) tv `orElse` []
+findTyEqs icans tv = lookupDVarEnv (inert_eqs icans) tv `orElse` []
 
-delTyEq :: TyVarEnv EqualCtList -> TcTyVar -> TcType -> TyVarEnv EqualCtList
-delTyEq m tv t = modifyVarEnv (filter (not . isThisOne)) m tv
+delTyEq :: DTyVarEnv EqualCtList -> TcTyVar -> TcType -> DTyVarEnv EqualCtList
+delTyEq m tv t = modifyDVarEnv (filter (not . isThisOne)) m tv
   where isThisOne (CTyEqCan { cc_rhs = t1 }) = eqType t t1
         isThisOne _                          = False
 
@@ -2063,37 +2091,38 @@ not match the requsted info exactly!
 
 -}
 
-type TcAppMap a = UniqFM (ListMap LooseTypeMap a)
+type TcAppMap a = UniqDFM (ListMap LooseTypeMap a)
     -- Indexed by tycon then the arg types, using "loose" matching, where
     -- we don't require kind equality. This allows, for example, (a |> co)
     -- to match (a).
     -- See Note [Use loose types in inert set]
-    -- Used for types and classes; hence UniqFM
+    -- Used for types and classes; hence UniqDFM
+    -- See Note [foldTM determinism] for why we use UniqDFM here
 
 isEmptyTcAppMap :: TcAppMap a -> Bool
-isEmptyTcAppMap m = isNullUFM m
+isEmptyTcAppMap m = isNullUDFM m
 
 emptyTcAppMap :: TcAppMap a
-emptyTcAppMap = emptyUFM
+emptyTcAppMap = emptyUDFM
 
 findTcApp :: TcAppMap a -> Unique -> [Type] -> Maybe a
-findTcApp m u tys = do { tys_map <- lookupUFM m u
+findTcApp m u tys = do { tys_map <- lookupUDFM m u
                        ; lookupTM tys tys_map }
 
 delTcApp :: TcAppMap a -> Unique -> [Type] -> TcAppMap a
-delTcApp m cls tys = adjustUFM (deleteTM tys) m cls
+delTcApp m cls tys = adjustUDFM (deleteTM tys) m cls
 
 insertTcApp :: TcAppMap a -> Unique -> [Type] -> a -> TcAppMap a
-insertTcApp m cls tys ct = alterUFM alter_tm m cls
+insertTcApp m cls tys ct = alterUDFM alter_tm m cls
   where
     alter_tm mb_tm = Just (insertTM tys ct (mb_tm `orElse` emptyTM))
 
 -- mapTcApp :: (a->b) -> TcAppMap a -> TcAppMap b
--- mapTcApp f = mapUFM (mapTM f)
+-- mapTcApp f = mapUDFM (mapTM f)
 
 filterTcAppMap :: (Ct -> Bool) -> TcAppMap Ct -> TcAppMap Ct
 filterTcAppMap f m
-  = mapUFM do_tm m
+  = mapUDFM do_tm m
   where
     do_tm tm = foldTM insert_mb tm emptyTM
     insert_mb ct tm
@@ -2109,7 +2138,7 @@ tcAppMapToBag :: TcAppMap a -> Bag a
 tcAppMapToBag m = foldTcAppMap consBag m emptyBag
 
 foldTcAppMap :: (a -> b -> b) -> TcAppMap a -> b -> b
-foldTcAppMap k m z = foldUFM (foldTM k) z m
+foldTcAppMap k m z = foldUDFM (foldTM k) z m
 
 
 {- *********************************************************************
@@ -2131,7 +2160,7 @@ findDict m cls tys = findTcApp m (getUnique cls) tys
 
 findDictsByClass :: DictMap a -> Class -> Bag a
 findDictsByClass m cls
-  | Just tm <- lookupUFM m cls = foldTM consBag tm emptyBag
+  | Just tm <- lookupUDFM m cls = foldTM consBag tm emptyBag
   | otherwise                  = emptyBag
 
 delDict :: DictMap a -> Class -> [Type] -> DictMap a
@@ -2142,7 +2171,7 @@ addDict m cls tys item = insertTcApp m (getUnique cls) tys item
 
 addDictsByClass :: DictMap Ct -> Class -> Bag Ct -> DictMap Ct
 addDictsByClass m cls items
-  = addToUFM m cls (foldrBag add emptyTM items)
+  = addToUDFM m cls (foldrBag add emptyTM items)
   where
     add ct@(CDictCan { cc_tyargs = tys }) tm = insertTM tys ct tm
     add ct _ = pprPanic "addDictsByClass" (ppr ct)
@@ -2195,7 +2224,7 @@ findFunEqsByTyCon :: FunEqMap a -> TyCon -> [a]
 -- We use this to check for derived interactions with built-in type-function
 -- constructors.
 findFunEqsByTyCon m tc
-  | Just tm <- lookupUFM m tc = foldTM (:) tm []
+  | Just tm <- lookupUDFM m tc = foldTM (:) tm []
   | otherwise                 = []
 
 foldFunEqs :: (a -> b -> b) -> FunEqMap a -> b -> b
@@ -2474,6 +2503,10 @@ checkForCyclicBinds ev_binds
             | bind@(EvBind { eb_lhs = bndr, eb_rhs = rhs}) <- bagToList ev_binds ]
 #endif
 
+setEvBindsTcS :: Maybe EvBindsVar -> TcS a -> TcS a
+setEvBindsTcS m_ref (TcS thing_inside)
+ = TcS $ \ env -> thing_inside (env { tcs_ev_binds = m_ref })
+
 nestImplicTcS :: Maybe EvBindsVar -> TyCoVarSet -- bound in this implication
               -> TcLevel -> TcS a
               -> TcS (a, TyCoVarSet)  -- also returns any vars used when filling
@@ -2538,7 +2571,7 @@ nestTcS ::  TcS a -> TcS a
 -- Use the current untouchables, augmenting the current
 -- evidence bindings, and solved dictionaries
 -- But have no effect on the InertCans, or on the inert_flat_cache
---  (the latter because the thing inside a nestTcS does unflattening)
+-- (we want to inherit the latter from processing the Givens)
 nestTcS (TcS thing_inside)
   = TcS $ \ env@(TcSEnv { tcs_inerts = inerts_var }) ->
     do { inerts <- TcM.readTcRef inerts_var
@@ -2717,8 +2750,8 @@ tcLookupClass c = wrapTcS $ TcM.tcLookupClass c
 -- Setting names as used (used in the deriving of Coercible evidence)
 -- Too hackish to expose it to TcS? In that case somehow extract the used
 -- constructors from the result of solveInteract
-addUsedDataCons :: GlobalRdrEnv -> TyCon -> TcS ()
-addUsedDataCons rdr_env tycon = wrapTcS  $ TcM.addUsedDataCons rdr_env tycon
+addUsedGREs :: [GlobalRdrElt] -> TcS ()
+addUsedGREs gres = wrapTcS  $ TcM.addUsedGREs gres
 
 -- Various smaller utilities [TODO, maybe will be absorbed in the instance matcher]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2755,6 +2788,9 @@ isFilledMetaTyVar tv = wrapTcS (TcM.isFilledMetaTyVar tv)
 
 zonkTyCoVarsAndFV :: TcTyCoVarSet -> TcS TcTyCoVarSet
 zonkTyCoVarsAndFV tvs = wrapTcS (TcM.zonkTyCoVarsAndFV tvs)
+
+zonkTyCoVarsAndFVList :: [TcTyCoVar] -> TcS [TcTyCoVar]
+zonkTyCoVarsAndFVList tvs = wrapTcS (TcM.zonkTyCoVarsAndFVList tvs)
 
 zonkCo :: Coercion -> TcS Coercion
 zonkCo = wrapTcS . TcM.zonkCo

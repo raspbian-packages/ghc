@@ -9,9 +9,125 @@ Functions for working with the typechecker environment (setters, getters...).
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
 module TcRnMonad(
-        module TcRnMonad,
-        module TcRnTypes,
-        module IOEnv
+  -- * Initalisation
+  initTc, initTcInteractive, initTcForLookup, initTcRnIf,
+
+  -- * Simple accessors
+  discardResult,
+  getTopEnv, updTopEnv, getGblEnv, updGblEnv,
+  setGblEnv, getLclEnv, updLclEnv, setLclEnv,
+  getEnvs, setEnvs,
+  xoptM, doptM, goptM, woptM,
+  setXOptM, unsetXOptM, unsetGOptM, unsetWOptM,
+  whenDOptM, whenGOptM, whenWOptM, whenXOptM,
+  getGhcMode,
+  withDoDynamicToo,
+  getEpsVar,
+  getEps,
+  updateEps, updateEps_,
+  getHpt, getEpsAndHpt,
+
+  -- * Arrow scopes
+  newArrowScope, escapeArrowScope,
+
+  -- * Unique supply
+  newUnique, newUniqueSupply, newLocalName, newName,
+  newSysName, newSysLocalId, newSysLocalIds,
+
+  -- * Accessing input/output
+  newTcRef, readTcRef, writeTcRef, updTcRef,
+
+  -- * Debugging
+  traceTc, traceRn, traceOptTcRn, traceTcRn,
+  getPrintUnqualified,
+  printForUserTcRn,
+  debugDumpTcRn,
+  traceIf, traceHiDiffs, traceOptIf,
+  debugTc,
+
+  -- * Typechecker global environment
+  setModule, getIsGHCi, getGHCiMonad, getInteractivePrintName,
+  tcIsHsBootOrSig, tcSelfBootInfo, getGlobalRdrEnv,
+  getRdrEnvs, getImports,
+  getFixityEnv, extendFixityEnv, getRecFieldEnv,
+  getDeclaredDefaultTys,
+  addDependentFiles,
+
+  -- * Error management
+  getSrcSpanM, setSrcSpan, addLocM,
+  wrapLocM, wrapLocFstM, wrapLocSndM,
+  getErrsVar, setErrsVar,
+  addErr,
+  failWith, failAt,
+  addErrAt, addErrs,
+  checkErr,
+  addMessages,
+  discardWarnings,
+
+  -- * Shared error message stuff: renamer and typechecker
+  mkLongErrAt, mkErrDocAt, addLongErrAt, reportErrors, reportError,
+  reportWarning, recoverM, mapAndRecoverM, mapAndReportM,
+  tryTc,
+  askNoErrs, discardErrs,
+  tryTcErrs, tryTcLIE_,
+  checkNoErrs, whenNoErrs,
+  ifErrsM, failIfErrsM,
+  checkTH, failTH,
+
+  -- * Context management for the type checker
+  getErrCtxt, setErrCtxt, addErrCtxt, addErrCtxtM, addLandmarkErrCtxt,
+  addLandmarkErrCtxtM, updCtxt, popErrCtxt, getCtLocM, setCtLocM,
+
+  -- * Error message generation (type checker)
+  addErrTc, addErrsTc,
+  addErrTcM, mkErrTcM,
+  failWithTc, failWithTcM,
+  checkTc, checkTcM,
+  failIfTc, failIfTcM,
+  warnIf, warnTc, warnTcM,
+  addWarnTc, addWarnTcM, addWarn, addWarnAt, add_warn,
+  tcInitTidyEnv, tcInitOpenTidyEnv, mkErrInfo,
+
+  -- * Type constraints
+  newTcEvBinds,
+  addTcEvBind,
+  getTcEvBinds, getTcEvBindsMap,
+  chooseUniqueOccTc,
+  getConstraintVar, setConstraintVar,
+  emitConstraints, emitSimple, emitSimples,
+  emitImplication, emitImplications, emitInsoluble,
+  discardConstraints, captureConstraints, captureTopConstraints,
+  pushLevelAndCaptureConstraints,
+  pushTcLevelM_, pushTcLevelM,
+  getTcLevel, setTcLevel, isTouchableTcM,
+  getLclTypeEnv, setLclTypeEnv,
+  traceTcConstraints, emitWildCardHoleConstraints,
+
+  -- * Template Haskell context
+  recordThUse, recordThSpliceUse, recordTopLevelSpliceLoc,
+  getTopLevelSpliceLocs, keepAlive, getStage, getStageAndBindLevel, setStage,
+  addModFinalizersWithLclEnv,
+
+  -- * Safe Haskell context
+  recordUnsafeInfer, finalSafeMode, fixSafeInstances,
+
+  -- * Stuff for the renamer's local env
+  getLocalRdrEnv, setLocalRdrEnv,
+
+  -- * Stuff for interface decls
+  mkIfLclEnv,
+  initIfaceTcRn,
+  initIfaceCheck,
+  initIfaceTc,
+  initIfaceLcl,
+  getIfModule,
+  failIfM,
+  forkM_maybe,
+  forkM,
+
+  -- * Types etc.
+  module TcRnTypes,
+  module IOEnv
   ) where
 
 #include "HsVersions.h"
@@ -42,7 +158,6 @@ import NameSet
 import Bag
 import Outputable
 import UniqSupply
-import UniqFM
 import DynFlags
 import StaticFlags
 import FastString
@@ -60,6 +175,7 @@ import Data.Set ( Set )
 import qualified Data.Set as Set
 
 #ifdef GHCI
+import {-# SOURCE #-} TcSplice ( runRemoteModFinalizers )
 import qualified Data.Map as Map
 #endif
 
@@ -331,6 +447,10 @@ setXOptM :: LangExt.Extension -> TcRnIf gbl lcl a -> TcRnIf gbl lcl a
 setXOptM flag =
   updTopEnv (\top -> top { hsc_dflags = xopt_set (hsc_dflags top) flag})
 
+unsetXOptM :: LangExt.Extension -> TcRnIf gbl lcl a -> TcRnIf gbl lcl a
+unsetXOptM flag =
+  updTopEnv (\top -> top { hsc_dflags = xopt_unset (hsc_dflags top) flag})
+
 unsetGOptM :: GeneralFlag -> TcRnIf gbl lcl a -> TcRnIf gbl lcl a
 unsetGOptM flag =
   updTopEnv (\top -> top { hsc_dflags = gopt_unset (hsc_dflags top) flag})
@@ -503,12 +623,6 @@ updTcRef :: TcRef a -> (a -> a) -> TcRnIf gbl lcl ()
 -- Returns ()
 updTcRef ref fn = liftIO $ do { old <- readIORef ref
                               ; writeIORef ref (fn old) }
-
-updTcRefX :: TcRef a -> (a -> a) -> TcRnIf gbl lcl a
--- Returns previous value
-updTcRefX ref fn = liftIO $ do { old <- readIORef ref
-                              ; writeIORef ref (fn old)
-                              ; return old }
 
 {-
 ************************************************************************
@@ -798,12 +912,15 @@ reportWarning reason err
 try_m :: TcRn r -> TcRn (Either IOEnvFailure r)
 -- Does tryM, with a debug-trace on failure
 try_m thing
-  = do { mb_r <- tryM thing ;
-         case mb_r of
-             Left exn -> do { traceTc "tryTc/recoverM recovering from" $
-                                      text (showException exn)
-                            ; return mb_r }
-             Right _  -> return mb_r }
+  = do { mb_r <- tryM (captureConstraints thing)
+            -- See Note [Constraints and errors] for the
+            -- captureConstraints/emitContraints dance
+       ; case mb_r of
+           Left exn -> do { traceTc "tryTc/recoverM recovering from" $
+                            text (showException exn)
+                          ; return (Left exn) }
+           Right (res, lie) -> do { emitConstraints lie
+                                  ; return (Right res) } }
 
 -----------------------
 recoverM :: TcRn r      -- Recovery action; do this if the main one fails
@@ -890,27 +1007,15 @@ tryTcErrs thing
         }
 
 -----------------------
-tryTcLIE :: TcM a -> TcM (Messages, Maybe a)
--- Just like tryTcErrs, except that it ensures that the LIE
--- for the thing is propagated only if there are no errors
--- Hence it's restricted to the type-check monad
-tryTcLIE thing_inside
-  = do  { ((msgs, mb_res), lie) <- captureConstraints (tryTcErrs thing_inside) ;
-        ; case mb_res of
-            Nothing  -> return (msgs, Nothing)
-            Just val -> do { emitConstraints lie; return (msgs, Just val) }
-        }
-
------------------------
 tryTcLIE_ :: TcM r -> TcM r -> TcM r
 -- (tryTcLIE_ r m) tries m;
 --      if m succeeds with no error messages, it's the answer
 --      otherwise tryTcLIE_ drops everything from m and tries r instead.
 tryTcLIE_ recover main
-  = do  { (msgs, mb_res) <- tryTcLIE main
+  = do  { (msgs, mb_res) <- tryTcErrs main
         ; case mb_res of
              Just val -> do { addMessages msgs  -- There might be warnings
-                             ; return val }
+                            ; return val }
              Nothing  -> recover                -- Discard all msgs
         }
 
@@ -923,7 +1028,7 @@ checkNoErrs :: TcM r -> TcM r
 --      If so, it fails too.
 -- Regardless, any errors generated by m are propagated to the enclosing context.
 checkNoErrs main
-  = do  { (msgs, mb_res) <- tryTcLIE main
+  = do  { (msgs, mb_res) <- tryTcErrs main
         ; addMessages msgs
         ; case mb_res of
             Nothing  -> failM
@@ -965,7 +1070,42 @@ failTH e what  -- Raise an error in a stage-1 compiler
                           2 (ppr e)
                      , text "Perhaps you are using a stage-1 compiler?" ])
 
-{-
+{- Note [Constraints and errors]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider this (Trac #12124):
+
+  foo :: Maybe Int
+  foo = return (case Left 3 of
+                  Left -> 1  -- Error here!
+                  _    -> 0)
+
+The call to 'return' will generate a (Monad m) wanted constraint; but
+then there'll be "hard error" (i.e. an exception in the TcM monad).
+We'll recover in tcPolyBinds, using recoverM.  But then the final
+tcSimplifyTop will see that (Monad m) constraint, with 'm' utterly
+un-filled-in, and will emit a misleading error message.
+
+The underlying problem is that an exception interrupts the constraint
+gathering process. Bottom line: if we have an exception, it's best
+simply to discard any gathered constraints.  Hence in 'try_m' we
+capture the constraints in a fresh variable, and only emit them into
+the surrounding context if we exit normally.  If an exception is
+raised, simply discard the collected constraints... we have a hard
+error to report.  So this capture-the-emit dance isn't as stupid as it
+looks :-).
+
+However suppose we throw an exception inside an invocation of
+captureConstraints.  Then we'll discard all the costraints. But some
+of those contraints might be "variable out of scope" Hole constraints,
+and that might have been the actual original cause of the exception!
+For example (Trac #12529):
+   f = p @ Int
+Here 'p' is out of scope, so we get an insolube Hole constraint. But
+the visible type application fails in the monad (thows an exception).
+We must not discard the out-of-scope error.  Hence the use of tryM in
+captureConstraints to propagate insoluble constraints.
+
+
 ************************************************************************
 *                                                                      *
         Context management for the type checker
@@ -1143,7 +1283,7 @@ tcInitTidyEnv
 
 -- | Get a 'TidyEnv' that includes mappings for all vars free in the given
 -- type. Useful when tidying open types.
-tcInitOpenTidyEnv :: TyCoVarSet -> TcM TidyEnv
+tcInitOpenTidyEnv :: [TyCoVar] -> TcM TidyEnv
 tcInitOpenTidyEnv tvs
   = do { env1 <- tcInitTidyEnv
        ; let env2 = tidyFreeTyCoVars env1 tvs
@@ -1265,10 +1405,16 @@ emitImplications ct
 
 emitInsoluble :: Ct -> TcM ()
 emitInsoluble ct
-  = do { lie_var <- getConstraintVar ;
-         updTcRef lie_var (`addInsols` unitBag ct) ;
-         v <- readTcRef lie_var ;
-         traceTc "emitInsoluble" (ppr v) }
+  = do { traceTc "emitInsoluble" (ppr ct)
+       ; lie_var <- getConstraintVar
+       ; updTcRef lie_var (`addInsols` unitBag ct) }
+
+emitInsolubles :: Cts -> TcM ()
+emitInsolubles cts
+  | isEmptyBag cts = return ()
+  | otherwise      = do { traceTc "emitInsolubles" (ppr cts)
+                        ; lie_var <- getConstraintVar
+                        ; updTcRef lie_var (`addInsols` cts) }
 
 -- | Throw out any constraints emitted by the thing_inside
 discardConstraints :: TcM a -> TcM a
@@ -1277,21 +1423,38 @@ discardConstraints thing_inside = fst <$> captureConstraints thing_inside
 captureConstraints :: TcM a -> TcM (a, WantedConstraints)
 -- (captureConstraints m) runs m, and returns the type constraints it generates
 captureConstraints thing_inside
-  = do { lie_var <- newTcRef emptyWC ;
-         res <- updLclEnv (\ env -> env { tcl_lie = lie_var })
-                          thing_inside ;
-         lie <- readTcRef lie_var ;
-         return (res, lie) }
+  = do { lie_var <- newTcRef emptyWC
+       ; mb_res <- tryM $
+                   updLclEnv (\ env -> env { tcl_lie = lie_var }) $
+                   thing_inside
+
+       ; lie <- readTcRef lie_var
+
+            -- See Note [Constraints and errors] for the
+            -- tryM/failM dance here
+       ; case mb_res of
+           Left _    -> do { emitInsolubles (getInsolubles lie)
+                           ; failM }
+           Right res -> return (res, lie) }
+
+captureTopConstraints :: TcM a -> TcM (a, WantedConstraints)
+-- (captureTopConstraints m) runs m, and returns the type constraints it
+-- generates plus the constraints produced by static forms inside.
+captureTopConstraints thing_inside
+  = do { (res, lie) <- captureConstraints thing_inside ;
+         -- wanted constraints from static forms
+       ; tcg_static_wc_ref <- tcg_static_wc <$> getGblEnv
+       ; stWC <- readTcRef tcg_static_wc_ref
+       ; writeTcRef tcg_static_wc_ref emptyWC
+       ; return (res, andWC stWC lie)
+       }
 
 pushLevelAndCaptureConstraints :: TcM a -> TcM (TcLevel, WantedConstraints, a)
 pushLevelAndCaptureConstraints thing_inside
   = do { env <- getLclEnv
-       ; lie_var <- newTcRef emptyWC
        ; let tclvl' = pushTcLevel (tcl_tclvl env)
-       ; res <- setLclEnv (env { tcl_tclvl = tclvl'
-                               , tcl_lie   = lie_var })
-                thing_inside
-       ; lie <- readTcRef lie_var
+       ; (res, lie) <- setLclEnv (env { tcl_tclvl = tclvl' }) $
+                       captureConstraints thing_inside
        ; return (tclvl', lie, res) }
 
 pushTcLevelM_ :: TcM a -> TcM a
@@ -1334,24 +1497,28 @@ traceTcConstraints :: String -> TcM ()
 traceTcConstraints msg
   = do { lie_var <- getConstraintVar
        ; lie     <- readTcRef lie_var
-       ; traceTc (msg ++ ": LIE:") (ppr lie)
+       ; traceOptTcRn Opt_D_dump_tc_trace $
+         hang (text (msg ++ ": LIE:")) 2 (ppr lie)
        }
 
 emitWildCardHoleConstraints :: [(Name, TcTyVar)] -> TcM ()
 emitWildCardHoleConstraints wcs
-  = do { ctLoc <- getCtLocM HoleOrigin Nothing
-       ; forM_ wcs $ \(name, tv) -> do {
-       ; let real_span = case nameSrcSpan name of
+  = do { ct_loc <- getCtLocM HoleOrigin Nothing
+       ; emitInsolubles $ listToBag $
+         map (do_one ct_loc) wcs }
+  where
+    do_one :: CtLoc -> (Name, TcTyVar) -> Ct
+    do_one ct_loc (name, tv)
+       = CHoleCan { cc_ev = CtDerived { ctev_pred = mkTyVarTy tv
+                                      , ctev_loc  = ct_loc' }
+                  , cc_hole = TypeHole (occName name) }
+       where
+         real_span = case nameSrcSpan name of
                            RealSrcSpan span  -> span
                            UnhelpfulSpan str -> pprPanic "emitWildCardHoleConstraints"
                                                       (ppr name <+> quotes (ftext str))
                -- Wildcards are defined locally, and so have RealSrcSpans
-             ctLoc' = setCtLocSpan ctLoc real_span
-             ty     = mkTyVarTy tv
-             can    = CHoleCan { cc_ev   = CtDerived { ctev_pred = ty
-                                                     , ctev_loc  = ctLoc' }
-                               , cc_hole = TypeHole (occName name) }
-       ; emitInsoluble can } }
+         ct_loc' = setCtLocSpan ct_loc real_span
 
 {-
 ************************************************************************
@@ -1401,6 +1568,21 @@ getStageAndBindLevel name
 
 setStage :: ThStage -> TcM a -> TcRn a
 setStage s = updLclEnv (\ env -> env { tcl_th_ctxt = s })
+
+#ifdef GHCI
+-- | Adds the given modFinalizers to the global environment and set them to use
+-- the current local environment.
+addModFinalizersWithLclEnv :: ThModFinalizers -> TcM ()
+addModFinalizersWithLclEnv mod_finalizers
+  = do lcl_env <- getLclEnv
+       th_modfinalizers_var <- fmap tcg_th_modfinalizers getGblEnv
+       updTcRef th_modfinalizers_var $ \fins ->
+         setLclEnv lcl_env (runRemoteModFinalizers mod_finalizers)
+         : fins
+#else
+addModFinalizersWithLclEnv :: ThModFinalizers -> TcM ()
+addModFinalizersWithLclEnv ThModFinalizers = return ()
+#endif
 
 {-
 ************************************************************************
@@ -1459,8 +1641,8 @@ setLocalRdrEnv rdr_env thing_inside
 mkIfLclEnv :: Module -> SDoc -> IfLclEnv
 mkIfLclEnv mod loc = IfLclEnv { if_mod     = mod,
                                 if_loc     = loc,
-                                if_tv_env  = emptyUFM,
-                                if_id_env  = emptyUFM }
+                                if_tv_env  = emptyFsEnv,
+                                if_id_env  = emptyFsEnv }
 
 -- | Run an 'IfG' (top-level interface monad) computation inside an existing
 -- 'TcRn' (typecheck-renaming monad) computation by initializing an 'IfGblEnv'
@@ -1469,6 +1651,7 @@ initIfaceTcRn :: IfG a -> TcRn a
 initIfaceTcRn thing_inside
   = do  { tcg_env <- getGblEnv
         ; let { if_env = IfGblEnv {
+                            if_doc = text "initIfaceTcRn",
                             if_rec_types = Just (tcg_mod tcg_env, get_type_env)
                          }
               ; get_type_env = readTcRef (tcg_type_env_var tcg_env) }
@@ -1481,7 +1664,10 @@ initIfaceCheck hsc_env do_this
  = do let rec_types = case hsc_type_env_var hsc_env of
                          Just (mod,var) -> Just (mod, readTcRef var)
                          Nothing        -> Nothing
-          gbl_env = IfGblEnv { if_rec_types = rec_types }
+          gbl_env = IfGblEnv {
+                        if_doc = text "initIfaceCheck",
+                        if_rec_types = rec_types
+                    }
       initTcRnIf 'i' hsc_env gbl_env () do_this
 
 initIfaceTc :: ModIface
@@ -1491,6 +1677,7 @@ initIfaceTc :: ModIface
 initIfaceTc iface do_this
  = do   { tc_env_var <- newTcRef emptyTypeEnv
         ; let { gbl_env = IfGblEnv {
+                            if_doc = text "initIfaceTc",
                             if_rec_types = Just (mod, readTcRef tc_env_var)
                           } ;
               ; if_lenv = mkIfLclEnv mod doc

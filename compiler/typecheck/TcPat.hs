@@ -601,6 +601,15 @@ tc_pat penv (NPlusKPat (L nm_loc name) (L loc lit) _ ge minus _) pat_ty thing_in
                                ge' minus'' pat_ty
         ; return (pat', res) }
 
+-- HsSpliced is an annotation produced by 'RnSplice.rnSplicePat'.
+-- Here we get rid of it and add the finalizers to the global environment.
+--
+-- See Note [Delaying modFinalizers in untyped splices] in RnSplice.
+tc_pat penv (SplicePat (HsSpliced mod_finalizers (HsSplicedPat pat)))
+            pat_ty thing_inside
+  = do addModFinalizersWithLclEnv mod_finalizers
+       tc_pat penv pat pat_ty thing_inside
+
 tc_pat _ _other_pat _ _ = panic "tc_pat"        -- ConPatOut, SigPatOut
 
 ----------------
@@ -880,21 +889,24 @@ matchExpectedConTy :: PatEnv
                    -> TcM (HsWrapper, [TcSigmaType])
 -- See Note [Matching constructor patterns]
 -- Returns a wrapper : pat_ty "->" T ty1 ... tyn
-matchExpectedConTy (PE { pe_orig = orig }) data_tc pat_ty
+matchExpectedConTy (PE { pe_orig = orig }) data_tc exp_pat_ty
   | Just (fam_tc, fam_args, co_tc) <- tyConFamInstSig_maybe data_tc
          -- Comments refer to Note [Matching constructor patterns]
          -- co_tc :: forall a. T [a] ~ T7 a
-  = do { pat_ty <- expTypeToType pat_ty
-       ; (wrap, pat_ty) <- topInstantiate orig pat_ty
+  = do { pat_ty <- expTypeToType exp_pat_ty
+       ; (wrap, pat_rho) <- topInstantiate orig pat_ty
 
        ; (subst, tvs') <- newMetaTyVars (tyConTyVars data_tc)
              -- tys = [ty1,ty2]
 
        ; traceTc "matchExpectedConTy" (vcat [ppr data_tc,
                                              ppr (tyConTyVars data_tc),
-                                             ppr fam_tc, ppr fam_args])
-       ; co1 <- unifyType noThing (mkTyConApp fam_tc (substTys subst fam_args)) pat_ty
-             -- co1 : T (ty1,ty2) ~N pat_ty
+                                             ppr fam_tc, ppr fam_args,
+                                             ppr exp_pat_ty,
+                                             ppr pat_ty,
+                                             ppr pat_rho, ppr wrap])
+       ; co1 <- unifyType noThing (mkTyConApp fam_tc (substTys subst fam_args)) pat_rho
+             -- co1 : T (ty1,ty2) ~N pat_rho
              -- could use tcSubType here... but it's the wrong way round
              -- for actual vs. expected in error messages.
 
@@ -902,12 +914,13 @@ matchExpectedConTy (PE { pe_orig = orig }) data_tc pat_ty
              co2 = mkTcUnbranchedAxInstCo co_tc tys' []
              -- co2 : T (ty1,ty2) ~R T7 ty1 ty2
 
-       ; return ( wrap <.> (mkWpCastR $
-                            mkTcSubCo (mkTcSymCo co1) `mkTcTransCo` co2)
-                , tys') }
+             full_co = mkTcSubCo (mkTcSymCo co1) `mkTcTransCo` co2
+             -- full_co :: pat_rho ~R T7 ty1 ty2
+
+       ; return ( mkWpCastR full_co <.> wrap, tys') }
 
   | otherwise
-  = do { pat_ty <- expTypeToType pat_ty
+  = do { pat_ty <- expTypeToType exp_pat_ty
        ; (wrap, pat_rho) <- topInstantiate orig pat_ty
        ; (coi, tys) <- matchExpectedTyConApp data_tc pat_rho
        ; return (mkWpCastN (mkTcSymCo coi) <.> wrap, tys) }

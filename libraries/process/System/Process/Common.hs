@@ -57,6 +57,7 @@ import System.Posix.Types
 -- will never actually be used, as the setuid/setgid system calls are not
 -- applicable on Windows. No value of this type will ever exist.
 newtype CGid = CGid Word32
+  deriving (Show, Eq)
 type GroupID = CGid
 type UserID = CGid
 #else
@@ -64,7 +65,7 @@ type PHANDLE = CPid
 #endif
 
 data CreateProcess = CreateProcess{
-  cmdspec      :: CmdSpec,                 -- ^ Executable & arguments, or shell command
+  cmdspec      :: CmdSpec,                 -- ^ Executable & arguments, or shell command.  Relative paths are resolved with respect to 'cwd' if given, and otherwise the current working directory.
   cwd          :: Maybe FilePath,          -- ^ Optional path to the working directory for the new process
   env          :: Maybe [(String,String)], -- ^ Optional environment (otherwise inherit from the current process)
   std_in       :: StdStream,               -- ^ How to determine stdin
@@ -98,7 +99,7 @@ data CreateProcess = CreateProcess{
                                            --   Default: @Nothing@
                                            --
                                            --   @since 1.4.0.0
- }
+ } deriving (Show, Eq)
 
 data CmdSpec
   = ShellCommand String
@@ -125,6 +126,7 @@ data CmdSpec
       --   see the
       --   <http://msdn.microsoft.com/en-us/library/windows/desktop/aa365527%28v=vs.85%29.aspx documentation>
       --   for the Windows @SearchPath@ API.
+  deriving (Show, Eq)
 
 
 -- | construct a `ShellCommand` from a string literal
@@ -141,6 +143,7 @@ data StdStream
                              -- and newline translation mode (just
                              -- like @Handle@s created by @openFile@).
   | NoStream                 -- ^ No stream handle will be passed
+  deriving (Eq, Show)
 
 -- ----------------------------------------------------------------------------
 -- ProcessHandle type

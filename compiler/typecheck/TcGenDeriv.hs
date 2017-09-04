@@ -529,11 +529,13 @@ unliftedCompare :: RdrName -> RdrName
                 -> LHsExpr RdrName
 -- Return (if a < b then lt else if a == b then eq else gt)
 unliftedCompare lt_op eq_op a_expr b_expr lt eq gt
-  = nlHsIf (genPrimOpApp a_expr lt_op b_expr) lt $
+  = nlHsIf (ascribeBool $ genPrimOpApp a_expr lt_op b_expr) lt $
                         -- Test (<) first, not (==), because the latter
                         -- is true less often, so putting it first would
                         -- mean more tests (dynamically)
-        nlHsIf (genPrimOpApp a_expr eq_op b_expr) eq gt
+        nlHsIf (ascribeBool $ genPrimOpApp a_expr eq_op b_expr) eq gt
+  where
+    ascribeBool e = nlExprWithTySig e boolTy
 
 nlConWildPat :: DataCon -> LPat RdrName
 -- The pattern (K {})
@@ -865,7 +867,12 @@ gen_Ix_binds loc tycon
       = mk_easy_FunBind loc inRange_RDR
                 [nlTuplePat [con_pat as_needed, con_pat bs_needed] Boxed,
                  con_pat cs_needed] $
-          foldl1 and_Expr (zipWith3Equal "single_con_inRange" in_range as_needed bs_needed cs_needed)
+          if con_arity == 0
+             -- If the product type has no fields, inRange is trivially true
+             -- (see Trac #12853).
+             then true_Expr
+             else foldl1 and_Expr (zipWith3Equal "single_con_inRange" in_range
+                    as_needed bs_needed cs_needed)
       where
         in_range a b c = nlHsApps inRange_RDR [mkLHsVarTuple [a,b], nlHsVar c]
 
@@ -1656,7 +1663,11 @@ functorLikeTraverse var (FT { ft_triv = caseTrivial,     ft_var = caseVar
                           = (caseTyApp fun_ty (last xrs), True)
        | otherwise        = (caseWrongArg, True)   -- Non-decomposable (eg type function)
        where
-         (xrs,xcs) = unzip (map (go co) args)
+         -- When folding over an unboxed tuple, we must explicitly drop the
+         -- runtime rep arguments, or else GHC will generate twice as many
+         -- variables in a unboxed tuple pattern match and expression as it
+         -- actually needs. See Trac #12399
+         (xrs,xcs) = unzip (map (go co) (dropRuntimeRepArgs args))
     go _  (ForAllTy (Named _ Visible) _) = panic "unexpected visible binder"
     go co (ForAllTy (Named v _)       x) | v /= var && xc = (caseForAll v xr,True)
         where (xr,xc) = go co x
@@ -2126,35 +2137,42 @@ mk_appE_app a b = nlHsApps appE_RDR [a, b]
 *                                                                      *
 ************************************************************************
 
+Note [Newtype-deriving instances]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 We take every method in the original instance and `coerce` it to fit
 into the derived instance. We need a type annotation on the argument
 to `coerce` to make it obvious what instantiation of the method we're
-coercing from.
+coercing from.  So from, say,
+  class C a b where
+    op :: a -> [b] -> Int
+
+  newtype T x = MkT <rep-ty>
+
+  instance C a <rep-ty> => C a (T x) where
+    op = (coerce
+             (op :: a -> [<rep-ty>] -> Int)
+         ) :: a -> [T x] -> Int
+
+Notice that we give the 'coerce' two explicitly-visible type arguments
+to say how it should be instantiated.  Recall
 
 See #8503 for more discussion.
+
+Here's a wrinkle. Supppose 'op' is locally overloaded:
+
+  class C2 b where
+    op2 :: forall a. Eq a => a -> [b] -> Int
+
+Then we could do exactly as above, but it's a bit redundant to
+instantiate op, then re-generalise with the inner signature.
+(The inner sig is only there to fix the type at which 'op' is
+called.)  So we just instantiate the signature, and add
+
+  instance C2 <rep-ty> => C2 (T x) where
+    op2 = (coerce
+             (op2 :: a -> [<rep-ty>] -> Int)
+          ) :: forall a. Eq a => a -> [T x] -> Int
 -}
-
-mkCoerceClassMethEqn :: Class   -- the class being derived
-                     -> [TyVar] -- the tvs in the instance head
-                     -> [Type]  -- instance head parameters (incl. newtype)
-                     -> Type    -- the representation type (already eta-reduced)
-                     -> Id      -- the method to look at
-                     -> Pair Type
-mkCoerceClassMethEqn cls inst_tvs cls_tys rhs_ty id
-  = Pair (substTy rhs_subst user_meth_ty) (substTy lhs_subst user_meth_ty)
-  where
-    cls_tvs = classTyVars cls
-    in_scope = mkInScopeSet $ mkVarSet inst_tvs
-    lhs_subst = mkTvSubst in_scope (zipTyEnv cls_tvs cls_tys)
-    rhs_subst = mkTvSubst in_scope (zipTyEnv cls_tvs (changeLast cls_tys rhs_ty))
-    (_class_tvs, _class_constraint, user_meth_ty)
-      = tcSplitSigmaTy (varType id)
-
-    changeLast :: [a] -> a -> [a]
-    changeLast []     _  = panic "changeLast"
-    changeLast [_]    x  = [x]
-    changeLast (x:xs) x' = x : changeLast xs x'
-
 
 gen_Newtype_binds :: SrcSpan
                   -> Class   -- the class being derived
@@ -2162,28 +2180,58 @@ gen_Newtype_binds :: SrcSpan
                   -> [Type]  -- instance head parameters (incl. newtype)
                   -> Type    -- the representation type (already eta-reduced)
                   -> LHsBinds RdrName
+-- See Note [Newtype-deriving instances]
 gen_Newtype_binds loc cls inst_tvs cls_tys rhs_ty
-  = listToBag $ zipWith mk_bind
-        (classMethods cls)
-        (map (mkCoerceClassMethEqn cls inst_tvs cls_tys rhs_ty) (classMethods cls))
+  = listToBag $ map mk_bind (classMethods cls)
   where
     coerce_RDR = getRdrName coerceId
-    mk_bind :: Id -> Pair Type -> LHsBind RdrName
-    mk_bind id (Pair tau_ty user_ty)
+
+    mk_bind :: Id -> LHsBind RdrName
+    mk_bind meth_id
       = mkRdrFunBind (L loc meth_RDR) [mkSimpleMatch [] rhs_expr]
       where
-        meth_RDR = getRdrName id
-        rhs_expr
-          = ( nlHsVar coerce_RDR
-                `nlHsApp`
-              (nlHsVar meth_RDR `nlExprWithTySig` toLHsSigWcType tau_ty'))
-            `nlExprWithTySig` toLHsSigWcType user_ty
-        -- Open the representation type here, so that it's forall'ed type
-        -- variables refer to the ones bound in the user_ty
-        (_, _, tau_ty')  = tcSplitSigmaTy tau_ty
+        Pair from_ty to_ty = mkCoerceClassMethEqn cls inst_tvs cls_tys rhs_ty meth_id
 
-    nlExprWithTySig :: LHsExpr RdrName -> LHsSigWcType RdrName -> LHsExpr RdrName
-    nlExprWithTySig e s = noLoc (ExprWithTySig e s)
+        meth_RDR = getRdrName meth_id
+
+        rhs_expr = nlHsVar coerce_RDR `nlHsAppType` from_ty
+                                      `nlHsAppType` to_ty
+                                      `nlHsApp`     nlHsVar meth_RDR
+
+nlHsAppType :: LHsExpr RdrName -> Type -> LHsExpr RdrName
+nlHsAppType e s = noLoc (e `HsAppType` hs_ty)
+  where
+    hs_ty = mkHsWildCardBndrs (typeToLHsType s)
+
+nlExprWithTySig :: LHsExpr RdrName -> Type -> LHsExpr RdrName
+nlExprWithTySig e s = noLoc (e `ExprWithTySig` hs_ty)
+  where
+    hs_ty = mkLHsSigWcType (typeToLHsType s)
+
+mkCoerceClassMethEqn :: Class   -- the class being derived
+                     -> [TyVar] -- the tvs in the instance head
+                     -> [Type]  -- instance head parameters (incl. newtype)
+                     -> Type    -- the representation type (already eta-reduced)
+                     -> Id      -- the method to look at
+                     -> Pair Type
+-- See Note [Newtype-deriving instances]
+-- The pair is the (from_type, to_type), where to_type is
+-- the type of the method we are tyrying to get
+mkCoerceClassMethEqn cls inst_tvs cls_tys rhs_ty id
+  = Pair (substTy rhs_subst user_meth_ty)
+         (substTy lhs_subst user_meth_ty)
+  where
+    cls_tvs = classTyVars cls
+    in_scope = mkInScopeSet $ mkVarSet inst_tvs
+    lhs_subst = mkTvSubst in_scope (zipTyEnv cls_tvs cls_tys)
+    rhs_subst = mkTvSubst in_scope (zipTyEnv cls_tvs (changeLast cls_tys rhs_ty))
+    (_class_tvs, _class_constraint, user_meth_ty)
+      = tcSplitMethodTy (varType id)
+
+    changeLast :: [a] -> a -> [a]
+    changeLast []     _  = panic "changeLast"
+    changeLast [_]    x  = [x]
+    changeLast (x:xs) x' = x : changeLast xs x'
 
 {-
 ************************************************************************
@@ -2725,7 +2773,7 @@ a is the last type variable in a given datatype):
 * ft_tup:     A tuple type which mentions the last type variable in at least
               one of its fields. The TyCon argument of ft_tup represents the
               particular tuple's type constructor.
-              Examples: (a, Int), (Maybe a, [a], Either a Int)
+              Examples: (a, Int), (Maybe a, [a], Either a Int), (# Int, a #)
 
 * ft_ty_app:  A type is being applied to the last type parameter, where the
               applied type does not mention the last type parameter (if it

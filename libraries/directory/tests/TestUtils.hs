@@ -5,18 +5,15 @@ module TestUtils
   , modifyPermissions
   , tryCreateSymbolicLink
   ) where
+import Prelude ()
+import System.Directory.Internal.Prelude
 import System.Directory
 import System.FilePath ((</>))
-import System.IO.Error (ioeSetLocation, modifyIOError)
 #ifdef mingw32_HOST_OS
-import Foreign (Ptr)
-import Foreign.C (CUChar(..), CULong(..), CWchar(..), withCWString)
 import System.FilePath (takeDirectory)
-import System.IO.Error (catchIOError, ioeSetErrorString, isPermissionError,
-                        mkIOError, permissionErrorType)
-import System.Win32.Types (failWith, getLastError)
+import qualified System.Win32 as Win32
 #else
-import System.Posix.Files (createSymbolicLink)
+import System.Posix (createSymbolicLink)
 #endif
 
 #ifdef mingw32_HOST_OS
@@ -52,25 +49,28 @@ modifyPermissions path modify = do
   permissions <- getPermissions path
   setPermissions path (modify permissions)
 
-#if mingw32_HOST_OS
+#ifdef mingw32_HOST_OS
 createSymbolicLink :: String -> String -> IO ()
 createSymbolicLink target link =
   (`ioeSetLocation` "createSymbolicLink") `modifyIOError` do
     isDir <- (fromIntegral . fromEnum) `fmap`
              doesDirectoryExist (takeDirectory link </> target)
-    withCWString target $ \ target' ->
-      withCWString link $ \ link' -> do
-        status <- c_CreateSymbolicLink link' target' isDir
+    let target' = fixSlash <$> target
+    withCWString target' $ \ pTarget ->
+      withCWString link $ \ pLink -> do
+        status <- c_CreateSymbolicLink pLink pTarget isDir
         if status == 0
           then do
-            errCode <- getLastError
+            errCode <- Win32.getLastError
             if errCode == c_ERROR_PRIVILEGE_NOT_HELD
               then ioError . (`ioeSetErrorString` permissionErrorMsg) $
                    mkIOError permissionErrorType "" Nothing (Just link)
-              else failWith "createSymbolicLink" errCode
+              else Win32.failWith "createSymbolicLink" errCode
           else return ()
   where c_ERROR_PRIVILEGE_NOT_HELD = 0x522
         permissionErrorMsg = "no permission to create symbolic links"
+        fixSlash '/' = '\\'
+        fixSlash c   = c
 #endif
 
 -- | Attempt to create a symbolic link.  On Windows, this falls back to

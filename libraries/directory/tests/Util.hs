@@ -1,35 +1,11 @@
-{-# LANGUAGE BangPatterns, CPP #-}
+{-# LANGUAGE BangPatterns #-}
 module Util where
-import Prelude (Eq(..), Num(..), Ord(..), RealFrac(..), Show(..),
-                Bool(..), Double, Either(..), Int, Integer, Maybe(..), String,
-                ($), (.), not, otherwise)
-import Data.Char (toLower)
-import Data.Foldable (traverse_)
-import Data.Functor ((<$>))
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
-import Data.List (drop, elem, intercalate, lookup, reverse, span)
-import Data.Maybe (fromMaybe)
-import Data.Monoid ((<>))
+import Prelude ()
+import System.Directory.Internal.Prelude
+import System.Directory
 import Data.Time.Clock (NominalDiffTime, UTCTime, diffUTCTime)
-import Control.Arrow (second)
-import Control.Concurrent (forkIO, killThread)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
-import Control.Exception (SomeException, bracket_, catch,
-                          mask, onException, try)
-import Control.Monad (Monad(..), unless, when)
-import System.Directory (createDirectoryIfMissing, emptyPermissions,
-                         doesDirectoryExist, isSymbolicLink, listDirectory,
-                         makeAbsolute, removeDirectoryRecursive, readable,
-                         searchable, setPermissions, withCurrentDirectory,
-                         writable)
-import System.Environment (getArgs)
-import System.Exit (exitFailure)
-import System.FilePath (FilePath, (</>), normalise)
-import System.IO (IO, hFlush, hPutStrLn, putStrLn, stderr, stdout)
-import System.IO.Error (IOError, isDoesNotExistError,
-                        ioError, tryIOError, userError)
-import System.Timeout (timeout)
-import Text.Read (Read, reads)
+import System.FilePath ((</>), normalise)
+import qualified Data.List as List
 
 modifyIORef' :: IORef a -> (a -> a) -> IO ()
 modifyIORef' r f = do
@@ -47,7 +23,7 @@ timeLimit :: Double -> IO a -> IO a
 timeLimit time action = do
   result <- timeout (round (1000000 * time)) action
   case result of
-    Nothing -> ioError (userError "timed out")
+    Nothing -> throwIO (userError "timed out")
     Just x  -> return x
 
 data TestEnv =
@@ -61,12 +37,12 @@ data TestEnv =
 printInfo :: TestEnv -> [String] -> IO ()
 printInfo TestEnv{testSilent = True}  _   = return ()
 printInfo TestEnv{testSilent = False} msg = do
-  putStrLn (intercalate ": " msg)
+  putStrLn (List.intercalate ": " msg)
   hFlush stdout
 
 printErr :: [String] -> IO ()
 printErr msg = do
-  hPutStrLn stderr ("*** " <> intercalate ": " msg)
+  hPutStrLn stderr ("*** " <> List.intercalate ": " msg)
   hFlush stderr
 
 printFailure :: TestEnv -> [String] -> IO ()
@@ -108,6 +84,14 @@ expectEq t file line context x y =
   [show x <> " equals "     <> show y]
   [show x <> " is not equal to " <> show y]
 
+expectNe :: (Eq a, Show a, Show b) =>
+            TestEnv -> String -> Integer -> b -> a -> a -> IO ()
+expectNe t file line context x y =
+  check t (x /= y)
+  [showContext file line context]
+  [show x <> " is not equal to " <> show y]
+  [show x <> " equals "     <> show y]
+
 expectNear :: (Num a, Ord a, Show a, Show b) =>
               TestEnv -> String -> Integer -> b -> a -> a -> a -> IO ()
 expectNear t file line context x y diff =
@@ -129,7 +113,7 @@ expectIOErrorType :: Show a =>
                      TestEnv -> String -> Integer -> a
                   -> (IOError -> Bool) -> IO b -> IO ()
 expectIOErrorType t file line context which action = do
-  result <- tryIOError action
+  result <- try action
   checkEither t [showContext file line context] $ case result of
     Left  e | which e   -> Right ["got expected exception (" <> show e <> ")"]
             | otherwise -> Left  ["got wrong exception: ", show e]
@@ -141,7 +125,7 @@ preprocessPathRecursive f path = do
   dirExists <- doesDirectoryExist path
   if dirExists
     then do
-      isLink <- isSymbolicLink path
+      isLink <- pathIsSymbolicLink path
       f path
       when (not isLink) $ do
         names <- listDirectory path
@@ -154,24 +138,15 @@ withNewDirectory keep dir action = do
   dir' <- makeAbsolute dir
   bracket_ (createDirectoryIfMissing True dir') (cleanup dir') action
   where cleanup dir' | keep      = return ()
-                     | otherwise = removeDirectoryRecursive dir'
+                     | otherwise = removePathForcibly dir'
 
 isolateWorkingDirectory :: Bool -> FilePath -> IO a -> IO a
 isolateWorkingDirectory keep dir action = do
-  when (normalise dir `elem` [".", "./"]) $
-    ioError (userError ("isolateWorkingDirectory cannot be used " <>
+  when (normalise dir `List.elem` [".", "./"]) $
+    throwIO (userError ("isolateWorkingDirectory cannot be used " <>
                         "with current directory"))
   dir' <- makeAbsolute dir
-  (`preprocessPathRecursive` dir') $ \ f -> do
-    setPermissions f emptyPermissions{ readable = True
-                                     , searchable = True
-                                     , writable = True }
-      `catch` \ e ->
-        unless (isDoesNotExistError e) $
-          ioError e
-  removeDirectoryRecursive dir' `catch` \ e ->
-    unless (isDoesNotExistError e) $
-      ioError e
+  removePathForcibly dir'
   withNewDirectory keep dir' $
     withCurrentDirectory dir' $
       action
@@ -196,7 +171,7 @@ tryRead s =
 
 getArg :: (String -> Maybe a) -> TestEnv -> String -> String -> a -> a
 getArg parse TestEnv{testArgs = args} testname name defaultValue =
-  fromMaybe defaultValue (lookup (prefix <> name) args >>= parse)
+  fromMaybe defaultValue (List.lookup (prefix <> name) args >>= parse)
   where prefix | testname == "" = ""
                | otherwise      = testname <> "."
 
@@ -211,7 +186,7 @@ readBool s = Just $
     _       -> False
 
 parseArgs :: [String] -> [(String, String)]
-parseArgs = reverse . (second (drop 1) . span (/= '=') <$>)
+parseArgs = List.reverse . (second (List.drop 1) . List.span (/= '=') <$>)
 
 testMain :: (TestEnv -> IO ()) -> IO ()
 testMain action = do

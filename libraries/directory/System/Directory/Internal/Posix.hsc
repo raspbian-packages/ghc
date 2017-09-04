@@ -1,15 +1,11 @@
+module System.Directory.Internal.Posix where
 #include <HsDirectoryConfig.h>
-
+#ifndef mingw32_HOST_OS
 #ifdef HAVE_LIMITS_H
 # include <limits.h>
 #endif
-
-module System.Directory.Internal.Posix where
-#ifndef mingw32_HOST_OS
-import Control.Monad ((>=>))
-import Control.Exception (bracket)
-import Foreign
-import Foreign.C
+import Prelude ()
+import System.Directory.Internal.Prelude
 
 -- we use the 'free' from the standard library here since it's not entirely
 -- clear whether Haskell's 'free' corresponds to the same one

@@ -1,19 +1,64 @@
 Changelog for the [`directory`][1] package
 ==========================================
 
-## 1.2.6.2 (April 2015)
+## 1.3.0.0 (December 2016)
+
+  * Drop trailing slashes in `canonicalizePath`
+    ([#63](https://github.com/haskell/directory/issues/63))
+
+  * Rename `isSymbolicLink` to `pathIsSymbolicLink`.  The old name will remain
+    available but may be removed in the next major release.
+    ([#52](https://github.com/haskell/directory/issues/52))
+
+  * Changed `canonicalizePath` to dereference symbolic links even if it points
+    to a file and is not the last path segment
+
+  * On Windows, `canonicalizePath` now canonicalizes the letter case too
+
+  * On Windows, `canonicalizePath` now also dereferences symbolic links
+
+  * When exceptions are thrown, the error location will now contain additional
+    information about the internal function(s) used.
+
+## 1.2.7.1 (November 2016)
+
+  * Don't abort `removePathForcibly` if files or directories go missing.
+    In addition, keep going even if an exception occurs.
+    ([#60](https://github.com/haskell/directory/issues/60))
+
+## 1.2.7.0 (August 2016)
+
+  * Remove deprecated C bits.  This means `HsDirectory.h` and its functions
+    are no longer available.
+    ([#50](https://github.com/haskell/directory/issues/50))
+
+  * Add `doesPathExist` and `getFileSize`
+    ([#57](https://github.com/haskell/directory/issues/57))
+
+  * Add `renamePath`
+    ([#58](https://github.com/haskell/directory/issues/58))
+
+  * Add `removePathForcibly`
+    ([#59](https://github.com/haskell/directory/issues/59))
+
+## 1.2.6.3 (May 2016)
+
+  * Add missing import of `(<*>)` on Windows for `base` earlier than 4.8.0.0
+    ([#53](https://github.com/haskell/directory/issues/53))
+
+## 1.2.6.2 (April 2016)
+
+  * Bundled with GHC 8.0.1
 
   * Fix typo in file time functions when `utimensat` is not available and
     version of `unix` package is lower than 2.7.0.0
 
-## 1.2.6.1 (April 2015)
-
-  * Bundled with GHC 8.0.1
+## 1.2.6.1 (April 2016)
 
   * Fix mistake in file time functions when `utimensat` is not available
     ([#47](https://github.com/haskell/directory/pull/47))
 
-## 1.2.6.0 (April 2015)
+## 1.2.6.0 (April 2016)
 
   * Make `findExecutable`, `findExecutables`, `findExecutablesInDirectories`,
     `findFile`, and `findFilesWith` lazier
@@ -21,7 +66,7 @@ Changelog for the [`directory`][1] package
 
   * Add `findFileWith`
 
-  * Add `copyFileWithAttrs`, which copies additional metadata
+  * Add `copyFileWithMetadata`, which copies additional metadata
     ([#40](https://github.com/haskell/directory/issues/40))
 
   * Improve error message of `removeDirectoryRecursive` when used on a
@@ -31,7 +76,7 @@ Changelog for the [`directory`][1] package
 
   * Drop support for Hugs.
 
-## 1.2.5.1 (February 2015)
+## 1.2.5.1 (February 2016)
 
   * Improve error message of `getCurrentDirectory` when the current working
     directory no longer exists

@@ -23,6 +23,7 @@ module TcType (
   TcType, TcSigmaType, TcRhoType, TcTauType, TcPredType, TcThetaType,
   TcTyVar, TcTyVarSet, TcDTyVarSet, TcTyCoVarSet, TcDTyCoVarSet,
   TcKind, TcCoVar, TcTyCoVar, TcTyBinder, TcTyCon,
+  tcSplitMethodTy,
 
   ExpType(..), ExpSigmaType, ExpRhoType, mkCheckExpType,
 
@@ -83,6 +84,7 @@ module TcType (
   ---------------------------------
   -- Misc type manipulators
   deNoteType, occurCheckExpand, OccCheckResult(..),
+  occCheckExpand,
   orphNamesOfType, orphNamesOfCo,
   orphNamesOfTypes, orphNamesOfCoCon,
   getDFunTyKey,
@@ -100,6 +102,7 @@ module TcType (
 
   -- * Finding "exact" (non-dead) type variables
   exactTyCoVarsOfType, exactTyCoVarsOfTypes,
+  splitDepVarsOfType, splitDepVarsOfTypes, TcDepVars(..), depVarsTyVars,
 
   -- * Extracting bound variables
   allBoundVariables, allBoundVariabless,
@@ -168,7 +171,7 @@ module TcType (
 
   tyCoVarsOfType, tyCoVarsOfTypes, closeOverKinds,
   tyCoVarsOfTelescope,
-  tyCoVarsOfTypeAcc, tyCoVarsOfTypesAcc,
+  tyCoFVsOfType, tyCoFVsOfTypes,
   tyCoVarsOfTypeDSet, tyCoVarsOfTypesDSet, closeOverKindsDSet,
   tyCoVarsOfTypeList, tyCoVarsOfTypesList,
 
@@ -223,6 +226,8 @@ import qualified GHC.LanguageExtensions as LangExt
 import Data.IORef
 import Control.Monad (liftM, ap)
 #if __GLASGOW_HASKELL__ < 709
+import Data.Monoid (mempty, mappend)
+import Data.Foldable (foldMap)
 import Control.Applicative (Applicative(..), (<$>) )
 #endif
 import Data.Functor.Identity
@@ -815,18 +820,18 @@ exactTyCoVarsOfTypes tys = mapUnionVarSet exactTyCoVarsOfType tys
 -- | Find all variables bound anywhere in a type.
 -- See also Note [Scope-check inferred kinds] in TcHsType
 allBoundVariables :: Type -> TyVarSet
-allBoundVariables ty = runFVSet $ go ty
+allBoundVariables ty = fvVarSet $ go ty
   where
     go :: Type -> FV
     go (TyVarTy tv)     = go (tyVarKind tv)
     go (TyConApp _ tys) = mapUnionFV go tys
     go (AppTy t1 t2)    = go t1 `unionFV` go t2
     go (ForAllTy (Anon t1) t2) = go t1 `unionFV` go t2
-    go (ForAllTy (Named tv _) t2) = oneVar tv `unionFV`
+    go (ForAllTy (Named tv _) t2) = FV.unitFV tv `unionFV`
                                     go (tyVarKind tv) `unionFV` go t2
-    go (LitTy {})       = noVars
+    go (LitTy {})       = emptyFV
     go (CastTy ty _)    = go ty
-    go (CoercionTy {})  = noVars
+    go (CoercionTy {})  = emptyFV
       -- any types mentioned in a coercion should also be mentioned in
       -- a type.
 
@@ -842,6 +847,110 @@ allBoundVariabless = mapUnionVarSet allBoundVariables
 -}
 
 isTouchableOrFmv :: TcLevel -> TcTyVar -> Bool
+{- *********************************************************************
+*                                                                      *
+          Type and kind variables in a type
+*                                                                      *
+********************************************************************* -}
+
+data TcDepVars  -- See Note [Dependent type variables]
+                -- See Note [TcDepVars determinism]
+  = DV { dv_kvs :: DTyCoVarSet  -- "kind" variables (dependent)
+       , dv_tvs :: DTyVarSet    -- "type" variables (non-dependent)
+                                -- The two are disjoint sets
+    }
+
+depVarsTyVars :: TcDepVars -> DTyVarSet
+depVarsTyVars = dv_tvs
+
+instance Outputable TcDepVars where
+  ppr (DV {dv_kvs = kvs, dv_tvs = tvs })
+    = text "DV" <+> braces (sep [ text "dv_kvs =" <+> ppr kvs
+                                , text "dv_tvs =" <+> ppr tvs ])
+
+{- Note [Dependent type variables]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In Haskell type inference we quantify over type variables; but we only
+quantify over /kind/ variables when -XPolyKinds is on. So when
+collecting the free vars of a type, prior to quantifying, we must keep
+the type and kind veraibles separate.  But what does that mean in a
+system where kind variables /are/ type variables? It's a fairly
+arbitrary distinction based on how the variables appear:
+
+  - "Kind variables" appear in the kind of some other free variable
+     PLUS any free coercion variables
+
+  - "Type variables" are all free vars that are not kind variables
+
+E.g.  In the type    T k (a::k)
+      'k' is a kind variable, because it occurs in the kind of 'a',
+          even though it also appears at "top level" of the type
+      'a' is a type variable, becuase it doesn't
+
+Note that
+
+* We include any coercion variables in the "dependent",
+  "kind-variable" set because we never quantify over them.
+
+* Both sets are un-ordered, of course.
+
+* The "kind variables" might depend on each other; e.g
+     (k1 :: k2), (k2 :: *)
+  The "type variables" do not depend on each other; if
+  one did, it'd be classified as a kind variable!
+
+Note [TcDepVars determinism]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When we quantify over type variables we decide the order in which they
+appear in the final type. Because the order of type variables in the type
+can end up in the interface file and affects some optimizations like
+worker-wrapper we want this order to be deterministic.
+
+To achieve that we use deterministic sets of variables that can be converted to
+lists in a deterministic order.
+
+For more information about deterministic sets see
+Note [Deterministic UniqFM] in UniqDFM.
+-}
+
+splitDepVarsOfType :: Type -> TcDepVars
+-- See Note [Dependent type variables]
+splitDepVarsOfType ty
+  = DV { dv_kvs = dep_vars
+       , dv_tvs = nondep_vars `minusDVarSet` dep_vars }
+  where
+    Pair dep_vars nondep_vars = split_dep_vars ty
+
+-- | Like 'splitDepVarsOfType', but over a list of types
+splitDepVarsOfTypes :: [Type] -> TcDepVars
+-- See Note [Dependent type variables]
+splitDepVarsOfTypes tys
+  = DV { dv_kvs = dep_vars
+       , dv_tvs = nondep_vars `minusDVarSet` dep_vars }
+  where
+    Pair dep_vars nondep_vars = foldMap split_dep_vars tys
+
+-- | Worker for 'splitDepVarsOfType'. This might output the same var
+-- in both sets, if it's used in both a type and a kind.
+-- See Note [TcDepVars determinism]
+split_dep_vars :: Type -> Pair DTyCoVarSet   -- Pair kvs tvs
+split_dep_vars = go
+  where
+    go (TyVarTy tv)              = Pair (tyCoVarsOfTypeDSet $ tyVarKind tv)
+                                        (unitDVarSet tv)
+    go (AppTy t1 t2)             = go t1 `mappend` go t2
+    go (TyConApp _ tys)          = foldMap go tys
+    go (ForAllTy (Anon arg) res) = go arg `mappend` go res
+    go (ForAllTy (Named tv _) ty)
+      = let Pair kvs tvs = go ty in
+        Pair (kvs `delDVarSet` tv
+                  `extendDVarSetList` tyCoVarsOfTypeList (tyVarKind tv))
+             (tvs `delDVarSet` tv)
+    go (LitTy {})                = mempty
+    go (CastTy ty co)            = go ty `mappend` Pair (tyCoVarsOfCoDSet co)
+                                                        emptyDVarSet
+    go (CoercionTy co)           = Pair (tyCoVarsOfCoDSet co) emptyDVarSet
+
 isTouchableOrFmv ctxt_tclvl tv
   = ASSERT2( isTcTyVar tv, ppr tv )
     case tcTyVarDetails tv of
@@ -1289,6 +1398,25 @@ tcSplitDFunTy ty
 tcSplitDFunHead :: Type -> (Class, [Type])
 tcSplitDFunHead = getClassPredTys
 
+tcSplitMethodTy :: Type -> ([TyVar], PredType, Type)
+-- A class method (selector) always has a type like
+--   forall as. C as => blah
+-- So if the class looks like
+--   class C a where
+--     op :: forall b. (Eq a, Ix b) => a -> b
+-- the class method type looks like
+--  op :: forall a. C a => forall b. (Eq a, Ix b) => a -> b
+--
+-- tcSplitMethodTy just peels off the outer forall and
+-- that first predicate
+tcSplitMethodTy ty
+  | (sel_tyvars,sel_rho) <- tcSplitForAllTys ty
+  , Just (first_pred, local_meth_ty) <- tcSplitPredFunTy_maybe sel_rho
+  = (sel_tyvars, first_pred, local_meth_ty)
+  | otherwise
+  = pprPanic "tcSplitMethodTy" (ppr ty)
+
+-----------------------
 tcEqKind :: TcKind -> TcKind -> Bool
 tcEqKind = tcEqType
 
@@ -1423,13 +1551,54 @@ The two variants of the function are to support TcUnify.checkTauTvUpdate,
 which wants to prevent unification with type families. For more on this
 point, see Note [Prevent unification with type families] in TcUnify.
 
-See also Note [occurCheckExpand] in TcCanonical
+Note [Occurrence checking: look inside kinds]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Suppose we are considering unifying
+   (alpha :: *)  ~  Int -> (beta :: alpha -> alpha)
+This may be an error (what is that alpha doing inside beta's kind?),
+but we must not make the mistake of actuallyy unifying or we'll
+build an infinite data structure.  So when looking for occurrences
+of alpha in the rhs, we must look in the kinds of type variables
+that occur there.
+
+NB: we may be able to remove the problem via expansion; see
+    Note [Occurs check expansion].  So we have to try that.
+
+Note [Checking for foralls]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Unless we have -XImpredicativeTypes (which is a totally unsupported
+feature), we do not want to unify
+    alpha ~ (forall a. a->a) -> Int
+So we look for foralls hidden inside the type, and it's convenient
+to do that at the same time as the occurs check (which looks for
+occurrences of alpha).
+
+However, it's not just a question of looking for foralls /anywhere/!
+Consider
+   (alpha :: forall k. k->*)  ~  (beta :: forall k. k->*)
+This is legal; e.g. dependent/should_compile/T11635.
+
+We don't want to reject it because of the forall in beta's kind,
+but (see Note [Occurrence checking: look inside kinds]) we do
+need to look in beta's kind.  So we carry a flag saying if a 'forall'
+is OK, and sitch the flag on when stepping inside a kind.
+
+Why is it OK?  Why does it not count as impredicative polymorphism?
+The reason foralls are bad is because we reply on "seeing" foralls
+when doing implicit instantiation.  But the forall inside the kind is
+fine.  We'll generate a kind equality constraint
+  (forall k. k->*) ~ (forall k. k->*)
+to check that the kinds of lhs and rhs are compatible.  If alpha's
+kind had instead been
+  (alpha :: kappa)
+then this kind equality would rightly complain about unifying kappa
+with (forall k. k->*)
+
 -}
 
 data OccCheckResult a
   = OC_OK a
   | OC_Forall
-  | OC_NonTyVar
   | OC_Occurs
 
 instance Functor OccCheckResult where
@@ -1443,7 +1612,6 @@ instance Monad OccCheckResult where
   return            = pure
   OC_OK x     >>= k = k x
   OC_Forall   >>= _ = OC_Forall
-  OC_NonTyVar >>= _ = OC_NonTyVar
   OC_Occurs   >>= _ = OC_Occurs
 
 occurCheckExpand :: DynFlags -> TcTyVar -> Type -> OccCheckResult Type
@@ -1451,58 +1619,76 @@ occurCheckExpand :: DynFlags -> TcTyVar -> Type -> OccCheckResult Type
 -- Check whether
 --   a) the given variable occurs in the given type.
 --   b) there is a forall in the type (unless we have -XImpredicativeTypes)
---   c) if it's a SigTv, ty should be a tyvar
 --
 -- We may have needed to do some type synonym unfolding in order to
 -- get rid of the variable (or forall), so we also return the unfolded
 -- version of the type, which is guaranteed to be syntactically free
 -- of the given type variable.  If the type is already syntactically
 -- free of the variable, then the same type is returned.
-
+--
+-- NB: in the past we also rejected a SigTv matched with a non-tyvar
+--     But it is wrong to reject that for Givens;
+--     and SigTv is in any case handled separately by
+--        - TcUnify.checkTauTvUpdate (on-the-fly unifier)
+--        - TcInteract.canSolveByUnification (main constraint solver)
 occurCheckExpand dflags tv ty
-  | MetaTv { mtv_info = SigTv } <- details
-                  = go_sig_tv ty
-  | fast_check ty = return ty
-  | otherwise     = go emptyVarEnv ty
+  = case fast_check impredicative ty of
+      OC_OK _   -> OC_OK ty
+      OC_Forall -> OC_Forall
+      OC_Occurs -> case occCheckExpand tv ty of
+                     Nothing  -> OC_Occurs
+                     Just ty' -> OC_OK ty'
   where
-    details = tcTyVarDetails tv
-
+    details       = tcTyVarDetails tv
     impredicative = canUnifyWithPolyType dflags details
 
-    -- Check 'ty' is a tyvar, or can be expanded into one
-    go_sig_tv ty@(TyVarTy tv')
-      | fast_check (tyVarKind tv') = return ty
-      | otherwise                  = do { k' <- go emptyVarEnv (tyVarKind tv')
-                                        ; return (mkTyVarTy (setTyVarKind tv' k')) }
-    go_sig_tv ty | Just ty' <- coreView ty = go_sig_tv ty'
-    go_sig_tv _                            = OC_NonTyVar
+    ok :: OccCheckResult ()
+    ok = OC_OK ()
 
-    -- True => fine
-    fast_check (LitTy {})          = True
-    fast_check (TyVarTy tv')       = tv /= tv' && fast_check (tyVarKind tv')
-    fast_check (TyConApp tc tys)   = all fast_check tys
-                                     && (isTauTyCon tc || impredicative)
-    fast_check (ForAllTy (Anon a) r) = fast_check a && fast_check r
-    fast_check (AppTy fun arg)     = fast_check fun && fast_check arg
-    fast_check (ForAllTy (Named tv' _) ty)
-                                   = impredicative
-                                   && fast_check (tyVarKind tv')
-                                   && (tv == tv' || fast_check ty)
-    fast_check (CastTy ty co)      = fast_check ty && fast_check_co co
-    fast_check (CoercionTy co)     = fast_check_co co
+    fast_check :: Bool -> TcType -> OccCheckResult ()
+      -- True <=> Foralls are ok; otherwise stop with OC_Forall
+      -- See Note [Checking for foralls]
+
+    fast_check _ (TyVarTy tv')
+      | tv == tv' = OC_Occurs
+      | otherwise = fast_check True (tyVarKind tv')
+           -- See Note [Occurrence checking: look inside kinds]
+
+    fast_check b (TyConApp tc tys)
+      | not (b || isTauTyCon tc) = OC_Forall
+      | otherwise                = mapM (fast_check b) tys >> ok
+    fast_check _ (LitTy {})      = ok
+    fast_check b (ForAllTy (Anon a) r) = fast_check b a >> fast_check b r
+    fast_check b (AppTy fun arg) = fast_check b fun >> fast_check b arg
+    fast_check b (CastTy ty co)  = fast_check b ty >> fast_check_co co
+    fast_check _ (CoercionTy co) = fast_check_co co
+    fast_check b (ForAllTy (Named tv' _) ty)
+       | not b     = OC_Forall
+       | tv == tv' = ok
+       | otherwise = do { fast_check True (tyVarKind tv')
+                        ; fast_check b ty }
 
      -- we really are only doing an occurs check here; no bother about
      -- impredicativity in coercions, as they're inferred
-    fast_check_co co = not (tv `elemVarSet` tyCoVarsOfCo co)
+    fast_check_co co | tv `elemVarSet` tyCoVarsOfCo co = OC_Occurs
+                     | otherwise                       = ok
 
-    go :: VarEnv TyVar  -- carries mappings necessary because of kind expansion
-       -> Type -> OccCheckResult Type
+
+occCheckExpand :: TcTyVar -> TcType -> Maybe TcType
+occCheckExpand tv ty
+  = go emptyVarEnv ty
+  where
+    go :: VarEnv TyVar -> Type -> Maybe Type
+          -- The Varenv carries mappings necessary
+          -- because of kind expansion
     go env (TyVarTy tv')
-      | tv == tv'                         = OC_Occurs
+      | tv == tv'                         = Nothing
       | Just tv'' <- lookupVarEnv env tv' = return (mkTyVarTy tv'')
       | otherwise                         = do { k' <- go env (tyVarKind tv')
                                                ; return (mkTyVarTy $
                                                          setTyVarKind tv' k') }
+           -- See Note [Occurrence checking: look inside kinds]
+
     go _   ty@(LitTy {}) = return ty
     go env (AppTy ty1 ty2) = do { ty1' <- go env ty1
                                 ; ty2' <- go env ty2
@@ -1512,29 +1698,22 @@ occurCheckExpand dflags tv ty
                                 ; ty2' <- go env ty2
                                 ; return (mkFunTy ty1' ty2') }
     go env ty@(ForAllTy (Named tv' vis) body_ty)
-       | not impredicative = OC_Forall
        | tv == tv'         = return ty
-       | otherwise         = do { ki' <- go env ki
+       | otherwise         = do { ki' <- go env (tyVarKind tv')
                                 ; let tv'' = setTyVarKind tv' ki'
                                       env' = extendVarEnv env tv' tv''
                                 ; body' <- go env' body_ty
                                 ; return (ForAllTy (Named tv'' vis) body') }
-      where ki = tyVarKind tv'
 
     -- For a type constructor application, first try expanding away the
     -- offending variable from the arguments.  If that doesn't work, next
     -- see if the type constructor is a type synonym, and if so, expand
     -- it and try again.
     go env ty@(TyConApp tc tys)
-      = case do { tys <- mapM (go env) tys
-                ; return (mkTyConApp tc tys) } of
-          OC_OK ty
-              | impredicative || isTauTyCon tc
-              -> return ty  -- First try to eliminate the tyvar from the args
-              | otherwise
-              -> OC_Forall  -- A type synonym with a forall on the RHS
-          bad | Just ty' <- coreView ty -> go env ty'
-              | otherwise               -> bad
+      = case mapM (go env) tys of
+          Just tys' -> return (mkTyConApp tc tys')
+          Nothing | Just ty' <- coreView ty -> go env ty'
+                  | otherwise               -> Nothing
                       -- Failing that, try to expand a synonym
 
     go env (CastTy ty co) =  do { ty' <- go env ty
@@ -1552,7 +1731,6 @@ occurCheckExpand dflags tv ty
                                              ; arg' <- go_co env arg
                                              ; return (mkAppCo co' arg') }
     go_co env co@(ForAllCo tv' kind_co body_co)
-      | not impredicative = OC_Forall
       | tv == tv'         = return co
       | otherwise         = do { kind_co' <- go_co env kind_co
                                ; let tv'' = setTyVarKind tv' $

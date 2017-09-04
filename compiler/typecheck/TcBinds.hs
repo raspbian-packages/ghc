@@ -778,8 +778,11 @@ chooseInferredQuantifiers inferred_theta tau_tvs qtvs
   | PartialSig { sig_cts = extra } <- bndr_info
   , Just loc <- extra
   = do { annotated_theta <- zonkTcTypes annotated_theta
-       ; let free_tvs = closeOverKinds (tyCoVarsOfTypes annotated_theta
-                                        `unionVarSet` tau_tvs)
+       ; let free_tvs = closeOverKinds (growThetaTyVars inferred_theta seed_tvs)
+                          -- growThetaVars just like the no-type-sig case
+                          -- Omitting this caused #12844
+             seed_tvs = tyCoVarsOfTypes annotated_theta  -- These are put there
+                        `unionVarSet` tau_tvs            --       by the user
              my_theta = pickQuantifiablePreds free_tvs annotated_theta inferred_theta
 
        -- Report the inferred constraints for an extra-constraints wildcard/hole as
@@ -1772,8 +1775,9 @@ tcUserTypeSig hs_sig_ty mb_name
            <- pushTcLevelM_  $
                   -- When instantiating the signature, do so "one level in"
                   -- so that they can be unified under the forall
-              tcImplicitTKBndrs vars $
-              tcWildCardBinders wcs  $ \ wcs ->
+              solveEqualities           $
+              tcImplicitTKBndrs vars    $
+              tcWildCardBinders wcs     $ \ wcs ->
               tcExplicitTKBndrs hs_tvs  $ \ tvs2 ->
          do { -- Instantiate the type-class context; but if there
               -- is an extra-constraints wildcard, just discard it here
@@ -1790,20 +1794,14 @@ tcUserTypeSig hs_sig_ty mb_name
             ; theta <- zonkTcTypes theta
             ; tau   <- zonkTcType tau
 
-              -- Check for validity (eg rankN etc)
-              -- The ambiguity check will happen (from checkValidType),
-              -- but unnecessarily; it will always succeed because there
-              -- is no quantification
-            ; checkValidType ctxt_F (mkPhiTy theta tau)
-                -- NB: Do this in the context of the pushTcLevel so that
-                -- the TcLevel invariant is respected
-
             ; let bound_tvs
                     = unionVarSets [ allBoundVariabless theta
                                    , allBoundVariables tau
                                    , mkVarSet (map snd wcs) ]
             ; return ((wcs, tvs2, theta, tau), bound_tvs) }
 
+       -- NB: checkValidType on the final inferred type will
+       --     be done later by checkInferredPolyId
        ; loc <- getSrcSpanM
        ; return $
          TISI { sig_bndr  = PartialSig { sig_name = name, sig_hs_ty = hs_ty

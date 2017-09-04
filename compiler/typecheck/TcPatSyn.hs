@@ -14,7 +14,7 @@ module TcPatSyn ( tcPatSynSig, tcInferPatSynDecl, tcCheckPatSynDecl
 import HsSyn
 import TcPat
 import TcHsType( tcImplicitTKBndrs, tcExplicitTKBndrs
-               , tcHsContext, tcHsLiftedType, tcHsOpenType )
+               , tcHsContext, tcHsOpenType, kindGeneralize )
 import TcRnMonad
 import TcEnv
 import TcMType
@@ -29,7 +29,6 @@ import Outputable
 import FastString
 import Var
 import VarEnv( emptyTidyEnv )
-import Type( tidyTyCoVarBndrs, tidyTypes, tidyType )
 import Id
 import IdInfo( RecSelParent(..))
 import TcBinds
@@ -50,7 +49,6 @@ import Util
 import ErrUtils
 import Control.Monad ( unless, zipWithM )
 import Data.List( partition )
-import Pair( Pair(..) )
 #if __GLASGOW_HASKELL__ < 709
 import Data.Monoid( mconcat, mappend, mempty )
 import Data.Traversable( mapM )
@@ -118,7 +116,9 @@ tcPatSynSig name sig_ty
               do { req     <- tcHsContext hs_req
                  ; prov    <- tcHsContext hs_prov
                  ; arg_tys <- mapM tcHsOpenType (hs_arg_tys :: [LHsType Name])
-                 ; body_ty <- tcHsLiftedType hs_body_ty
+                 -- A (literal) pattern can be unlifted;
+                 -- -- e.g. pattern Zero <- 0#   (Trac #12094)
+                 ; body_ty <- tcHsOpenType hs_body_ty
                  ; let bound_tvs
                          = unionVarSets [ allBoundVariabless req
                                         , allBoundVariabless prov
@@ -127,16 +127,14 @@ tcPatSynSig name sig_ty
                  ; return ( (univ_tvs, req, ex_tvs, prov, arg_tys, body_ty)
                           , bound_tvs) }
 
-       -- Kind generalisation; c.f. kindGeneralise
-       ; free_kvs <- zonkTcTypeAndFV $
-                     mkSpecForAllTys (implicit_tvs ++ univ_tvs) $
-                     mkFunTys req $
-                     mkSpecForAllTys ex_tvs $
-                     mkFunTys prov $
-                     mkFunTys arg_tys $
-                     body_ty
-
-       ; kvs <- quantifyZonkedTyVars emptyVarSet (Pair free_kvs emptyVarSet)
+       -- Kind generalisation
+       ; kvs <- kindGeneralize $
+                mkSpecForAllTys (implicit_tvs ++ univ_tvs) $
+                mkFunTys req $
+                mkSpecForAllTys ex_tvs $
+                mkFunTys prov $
+                mkFunTys arg_tys $
+                body_ty
 
        -- These are /signatures/ so we zonk to squeeze out any kind
        -- unification variables.  Do this after quantifyTyVars which may
@@ -223,13 +221,13 @@ tcInferPatSynDecl PSB{ psb_id = lname@(L _ name), psb_args = details,
 
        ; (qtvs, req_dicts, ev_binds) <- simplifyInfer tclvl False [] named_taus wanted
 
-       ; let (ex_vars, prov_dicts) = tcCollectEx lpat'
-             univ_tvs   = filter (not . (`elemVarSet` ex_vars)) qtvs
-             ex_tvs     = varSetElems ex_vars
+       ; let (ex_tvs, prov_dicts) = tcCollectEx lpat'
+             ex_tv_set  = mkVarSet ex_tvs
+             univ_tvs   = filterOut (`elemVarSet` ex_tv_set) qtvs
              prov_theta = map evVarPred prov_dicts
              req_theta  = map evVarPred req_dicts
 
-       ; traceTc "tcInferPatSynDecl }" $ ppr name
+       ; traceTc "tcInferPatSynDecl }" $ (ppr name $$ ppr ex_tvs)
        ; tc_patsyn_finish lname dir is_infix lpat'
                           (univ_tvs, mkNamedBinders Invisible univ_tvs
                             , req_theta,  ev_binds, req_dicts)
@@ -295,8 +293,10 @@ tcCheckPatSynDecl psb@PSB{ psb_id = lname@(L _ name), psb_args = details
 
        -- Solve the constraints now, because we are about to make a PatSyn,
        -- which should not contain unification variables and the like (Trac #10997)
+       ; empty_binds <- simplifyTop (mkImplicWC implics)
+
        -- Since all the inputs are implications the returned bindings will be empty
-       ; _ <- simplifyTop (mkImplicWC implics)
+       ; MASSERT2( isEmptyBag empty_binds, ppr empty_binds )
 
        -- ToDo: in the bidirectional case, check that the ex_tvs' are all distinct
        -- Otherwise we may get a type error when typechecking the builder,
@@ -952,34 +952,43 @@ nonBidirectionalErr name = failWithTc $
 -- These are used in computing the type of a pattern synonym and also
 -- in generating matcher functions, since success continuations need
 -- to be passed these pattern-bound evidences.
-tcCollectEx :: LPat Id -> (TyVarSet, [EvVar])
+tcCollectEx
+  :: LPat Id
+  -> ( [TyVar]        -- Existentially-bound type variables
+                      -- in correctly-scoped order; e.g. [ k:*, x:k ]
+     , [EvVar] )      -- and evidence variables
+
 tcCollectEx pat = go pat
   where
-    go :: LPat Id -> (TyVarSet, [EvVar])
+    go :: LPat Id -> ([TyVar], [EvVar])
     go = go1 . unLoc
 
-    go1 :: Pat Id -> (TyVarSet, [EvVar])
+    go1 :: Pat Id -> ([TyVar], [EvVar])
     go1 (LazyPat p)         = go p
     go1 (AsPat _ p)         = go p
     go1 (ParPat p)          = go p
     go1 (BangPat p)         = go p
-    go1 (ListPat ps _ _)    = mconcat . map go $ ps
-    go1 (TuplePat ps _ _)   = mconcat . map go $ ps
-    go1 (PArrPat ps _)      = mconcat . map go $ ps
+    go1 (ListPat ps _ _)    = mergeMany . map go $ ps
+    go1 (TuplePat ps _ _)   = mergeMany . map go $ ps
+    go1 (PArrPat ps _)      = mergeMany . map go $ ps
     go1 (ViewPat _ p _)     = go p
-    go1 con@ConPatOut{}     = mappend (mkVarSet (pat_tvs con), pat_dicts con) $
-                                 goConDetails $ pat_args con
+    go1 con@ConPatOut{}     = merge (pat_tvs con, pat_dicts con) $
+                              goConDetails $ pat_args con
     go1 (SigPatOut p _)     = go p
     go1 (CoPat _ p _)       = go1 p
     go1 (NPlusKPat n k _ geq subtract _)
       = pprPanic "TODO: NPlusKPat" $ ppr n $$ ppr k $$ ppr geq $$ ppr subtract
-    go1 _                   = mempty
+    go1 _                   = empty
 
-    goConDetails :: HsConPatDetails Id -> (TyVarSet, [EvVar])
-    goConDetails (PrefixCon ps) = mconcat . map go $ ps
-    goConDetails (InfixCon p1 p2) = go p1 `mappend` go p2
+    goConDetails :: HsConPatDetails Id -> ([TyVar], [EvVar])
+    goConDetails (PrefixCon ps) = mergeMany . map go $ ps
+    goConDetails (InfixCon p1 p2) = go p1 `merge` go p2
     goConDetails (RecCon HsRecFields{ rec_flds = flds })
-      = mconcat . map goRecFd $ flds
+      = mergeMany . map goRecFd $ flds
 
-    goRecFd :: LHsRecField Id (LPat Id) -> (TyVarSet, [EvVar])
+    goRecFd :: LHsRecField Id (LPat Id) -> ([TyVar], [EvVar])
     goRecFd (L _ HsRecField{ hsRecFieldArg = p }) = go p
+
+    merge (vs1, evs1) (vs2, evs2) = (vs1 ++ vs2, evs1 ++ evs2)
+    mergeMany = foldr merge empty
+    empty     = ([], [])

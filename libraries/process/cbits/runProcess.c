@@ -84,6 +84,10 @@ runInteractiveProcess (char *const args[],
     if (fdStdOut == -1) {
         r = pipe(fdStdOutput);
         if (r == -1) {
+            if (fdStdIn == -1) {
+                close(fdStdInput[0]);
+                close(fdStdInput[1]);
+            }
             *failed_doing = "runInteractiveProcess: pipe";
             return -1;
         }
@@ -92,6 +96,14 @@ runInteractiveProcess (char *const args[],
         r = pipe(fdStdError);
         if (r == -1) {
             *failed_doing = "runInteractiveProcess: pipe";
+            if (fdStdIn == -1) {
+                close(fdStdInput[0]);
+                close(fdStdInput[1]);
+            }
+            if (fdStdOut == -1) {
+                close(fdStdOutput[0]);
+                close(fdStdOutput[1]);
+            }
             return -1;
         }
     }
@@ -149,7 +161,7 @@ runInteractiveProcess (char *const args[],
         if ((flags & RUN_PROCESS_IN_NEW_GROUP) != 0) {
             setpgid(0, 0);
         }
-        
+
         if ( childGroup) {
             if ( setgid( *childGroup) != 0) {
                 // ERROR
@@ -228,9 +240,9 @@ runInteractiveProcess (char *const args[],
             }
             // XXX Not the pipe
             for (i = 3; i < max_fd; i++) {
-		if (i != forkCommunicationFds[1]) {
-		    close(i);
-		}
+                if (i != forkCommunicationFds[1]) {
+                    close(i);
+                }
             }
         }
 
@@ -327,6 +339,19 @@ runInteractiveProcess (char *const args[],
         // We forked the child, but the child had a problem and stopped so it's
         // our responsibility to reap here as nobody else can.
         waitpid(pid, NULL, 0);
+
+        if (fdStdIn == -1) {
+            // Already closed fdStdInput[0] above
+            close(fdStdInput[1]);
+        }
+        if (fdStdOut == -1) {
+            close(fdStdOutput[0]);
+            // Already closed fdStdOutput[1] above
+        }
+        if (fdStdErr == -1) {
+            close(fdStdError[0]);
+            // Already closed fdStdError[1] above
+        }
 
         pid = -1;
     }

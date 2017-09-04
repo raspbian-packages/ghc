@@ -2,6 +2,14 @@
 
 _Note: below all `FilePath` values are unquoted, so `\\` really means two backslashes._
 
+## 1.4.1.1  *Nov 2016*
+
+ * Bundled with GHC 8.0.2
+
+ * Documentation improvements
+
+ * Allow QuickCheck-2.9
+
 ## 1.4.1.0  *Dec 2015*
 
  * Bundled with GHC 8.0.1
