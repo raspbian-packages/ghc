@@ -1,4 +1,4 @@
-ghc (8.0.2-9+rpi1) buster-staging; urgency=medium
+ghc (8.0.2-10+rpi1) buster-staging; urgency=medium
 
   [changes brought forward from 7.6.3-21+rpi1 by Peter Michael Green <plugwash@raspbian.org> at Sun, 19 Apr 2015 14:00:16 +0000]
   * Change compiler defaults for armv6
@@ -9,7 +9,18 @@ ghc (8.0.2-9+rpi1) buster-staging; urgency=medium
   [changed introduced in 7.10.3-2+rpi1 by Peter Michael Green]
   * Add call to dh_autoreconf_clean
 
- -- Raspbian forward porter <root@raspbian.org>  Mon, 04 Sep 2017 14:21:06 +0000
+ -- Raspbian forward porter <root@raspbian.org>  Sun, 10 Sep 2017 00:21:44 +0000
+
+ghc (8.0.2-10) unstable; urgency=medium
+
+  [ John Paul Adrian Glaubitz ]
+  * Make ghc cross-buildable
+
+  [ Gianfranco Costamagna ]
+  * Drop arm64 switch to gold, now gcc/binutils should be fixed.
+  * Team upload.
+
+ -- Gianfranco Costamagna <locutusofborg@debian.org>  Tue, 29 Aug 2017 23:10:26 +0200
 
 ghc (8.0.2-9) unstable; urgency=medium
 
