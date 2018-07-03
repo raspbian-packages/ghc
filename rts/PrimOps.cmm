@@ -23,6 +23,7 @@
 
 #include "Cmm.h"
 #include "MachDeps.h"
+#include "SMPClosureOps.h"
 
 #ifdef __PIC__
 import pthread_mutex_lock;
@@ -141,6 +142,24 @@ stg_newAlignedPinnedByteArrayzh ( W_ n, W_ alignment )
     return (p);
 }
 
+stg_isByteArrayPinnedzh ( gcptr ba )
+// ByteArray# s -> Int#
+{
+    W_ bd, flags;
+    bd = Bdescr(ba);
+    // Pinned byte arrays live in blocks with the BF_PINNED flag set.
+    // We also consider BF_LARGE objects to be unmoveable. See #13894.
+    // See the comment in Storage.c:allocatePinned.
+    flags = TO_W_(bdescr_flags(bd));
+    return (flags & (BF_PINNED | BF_LARGE) != 0);
+}
+
+stg_isMutableByteArrayPinnedzh ( gcptr mba )
+// MutableByteArray# s -> Int#
+{
+    jump stg_isByteArrayPinnedzh(mba);
+}
+
 // shrink size of MutableByteArray in-place
 stg_shrinkMutableByteArrayzh ( gcptr mba, W_ new_size )
 // MutableByteArray# s -> Int# -> State# s -> State# s
@@ -203,7 +222,7 @@ stg_casIntArrayzh( gcptr arr, W_ ind, W_ old, W_ new )
     W_ p, h;
 
     p = arr + SIZEOF_StgArrBytes + WDS(ind);
-    (h) = ccall cas(p, old, new);
+    (h) = prim %cmpxchgW(p, old, new);
 
     return(h);
 }
@@ -320,7 +339,7 @@ stg_casArrayzh ( gcptr arr, W_ ind, gcptr old, gcptr new )
     W_ p, len;
 
     p = arr + SIZEOF_StgMutArrPtrs + WDS(ind);
-    (h) = ccall cas(p, old, new);
+    (h) = prim %cmpxchgW(p, old, new);
 
     if (h != old) {
         // Failure, return what was there instead of 'old':
@@ -472,7 +491,7 @@ stg_casSmallArrayzh ( gcptr arr, W_ ind, gcptr old, gcptr new )
     W_ p, len;
 
     p = arr + SIZEOF_StgSmallMutArrPtrs + WDS(ind);
-    (h) = ccall cas(p, old, new);
+    (h) = prim %cmpxchgW(p, old, new);
 
     if (h != old) {
         // Failure, return what was there instead of 'old':
@@ -512,7 +531,7 @@ stg_casMutVarzh ( gcptr mv, gcptr old, gcptr new )
 {
     gcptr h;
 
-    (h) = ccall cas(mv + SIZEOF_StgHeader + OFFSET_StgMutVar_var, old, new);
+    (h) = prim %cmpxchgW(mv + SIZEOF_StgHeader + OFFSET_StgMutVar_var, old, new);
     if (h != old) {
         return (1,h);
     } else {
@@ -588,7 +607,7 @@ stg_atomicModifyMutVarzh ( gcptr mv, gcptr f )
     x = StgMutVar_var(mv);
     StgThunk_payload(z,1) = x;
 #ifdef THREADED_RTS
-    (h) = ccall cas(mv + SIZEOF_StgHeader + OFFSET_StgMutVar_var, x, y);
+    (h) = prim %cmpxchgW(mv + SIZEOF_StgHeader + OFFSET_StgMutVar_var, x, y);
     if (h != x) { goto retry; }
 #else
     StgMutVar_var(mv) = y;
@@ -705,7 +724,7 @@ stg_finalizzeWeakzh ( gcptr w )
     //    LDV_recordDead((StgClosure *)w, sizeofW(StgWeak) - sizeofW(StgProfHeader));
     // Furthermore, when PROFILING is turned on, dead weak pointers are exactly as
     // large as weak pointers, so there is no need to fill the slop, either.
-    // See stg_DEAD_WEAK_info in StgMiscClosures.hc.
+    // See stg_DEAD_WEAK_info in StgMiscClosures.cmm.
 #endif
 
     //
@@ -1721,6 +1740,13 @@ loop:
 }
 
 
+// NOTE: there is another implementation of this function in
+// Threads.c:performTryPutMVar().  Keep them in sync!  It was
+// measurably slower to call the C function from here (70% for a
+// tight loop doing tryPutMVar#).
+//
+// TODO: we could kill the duplication by making tryPutMVar# into an
+// inline primop that expands into a C call to performTryPutMVar().
 stg_tryPutMVarzh ( P_ mvar, /* :: MVar a */
                    P_ val,  /* :: a */ )
 {
@@ -1793,6 +1819,7 @@ loop:
     unlockClosure(mvar, info);
     return (1);
 }
+
 
 stg_readMVarzh ( P_ mvar, /* :: MVar a */ )
 {
@@ -1942,7 +1969,7 @@ stg_mkApUpd0zh ( P_ bco )
     W_ ap;
 
     // This function is *only* used to wrap zero-arity BCOs in an
-    // updatable wrapper (see ByteCodeLink.lhs).  An AP thunk is always
+    // updatable wrapper (see ByteCodeLink.hs).  An AP thunk is always
     // saturated and always points directly to a FUN or BCO.
     ASSERT(%INFO_TYPE(%GET_STD_INFO(bco)) == HALF_W_(BCO) &&
            StgBCO_arity(bco) == HALF_W_(0));
@@ -1962,8 +1989,9 @@ stg_mkApUpd0zh ( P_ bco )
 
 stg_unpackClosurezh ( P_ closure )
 {
-    W_ info, ptrs, nptrs, p, ptrs_arr, nptrs_arr;
-    info  = %GET_STD_INFO(UNTAG(closure));
+    W_ clos, info, ptrs, nptrs, p, ptrs_arr, nptrs_arr;
+    clos  = UNTAG(closure);
+    info  = %GET_STD_INFO(clos);
 
     // Some closures have non-standard layout, so we omit those here.
     W_ type;
@@ -1985,17 +2013,14 @@ stg_unpackClosurezh ( P_ closure )
         nptrs = TO_W_(%INFO_NPTRS(info));
         goto out;
     }}
-out:
 
+out:
     W_ ptrs_arr_sz, ptrs_arr_cards, nptrs_arr_sz;
     nptrs_arr_sz = SIZEOF_StgArrBytes   + WDS(nptrs);
     ptrs_arr_cards = mutArrPtrsCardWords(ptrs);
     ptrs_arr_sz  = SIZEOF_StgMutArrPtrs + WDS(ptrs) + WDS(ptrs_arr_cards);
 
     ALLOC_PRIM_P (ptrs_arr_sz + nptrs_arr_sz, stg_unpackClosurezh, closure);
-
-    W_ clos;
-    clos = UNTAG(closure);
 
     ptrs_arr  = Hp - nptrs_arr_sz - ptrs_arr_sz + WDS(1);
     nptrs_arr = Hp - nptrs_arr_sz + WDS(1);
@@ -2005,11 +2030,12 @@ out:
     StgMutArrPtrs_size(ptrs_arr) = ptrs + ptrs_arr_cards;
 
     p = 0;
-for:
+
+write_ptrs:
     if(p < ptrs) {
          W_[ptrs_arr + SIZEOF_StgMutArrPtrs + WDS(p)] = StgClosure_payload(clos,p);
          p = p + 1;
-         goto for;
+         goto write_ptrs;
     }
     /* We can leave the card table uninitialised, since the array is
        allocated in the nursery.  The GC will fill it in if/when the array
@@ -2018,12 +2044,14 @@ for:
     SET_HDR(nptrs_arr, stg_ARR_WORDS_info, CCCS);
     StgArrBytes_bytes(nptrs_arr) = WDS(nptrs);
     p = 0;
-for2:
+
+write_nptrs:
     if(p < nptrs) {
          W_[BYTE_ARR_CTS(nptrs_arr) + WDS(p)] = StgClosure_payload(clos, p+ptrs);
          p = p + 1;
-         goto for2;
+         goto write_nptrs;
     }
+
     return (info, ptrs_arr, nptrs_arr);
 }
 

@@ -1,8 +1,6 @@
 {-# LANGUAGE DeriveDataTypeable, FlexibleInstances, MultiParamTypeClasses,
              CPP #-}
-#if __GLASGOW_HASKELL__ >= 708
 {-# LANGUAGE RoleAnnotations #-}
-#endif
 
 {-# OPTIONS_HADDOCK hide #-}
 -----------------------------------------------------------------------------
@@ -24,6 +22,7 @@ module Data.Array.IO.Internals (
     IOUArray(..),        -- instance of: Eq, Typeable
     castIOUArray,        -- :: IOUArray ix a -> IO (IOUArray ix b)
     unsafeThawIOUArray,
+    unsafeFreezeIOUArray
   ) where
 
 import Data.Int
@@ -54,10 +53,8 @@ import GHC.IOArray (IOArray(..))
 --
 newtype IOUArray i e = IOUArray (STUArray RealWorld i e)
                        deriving Typeable
-#if __GLASGOW_HASKELL__ >= 708
 -- Both parameters have class-based invariants. See also #9220.
 type role IOUArray nominal nominal
-#endif
 
 instance Eq (IOUArray i e) where
     IOUArray s1 == IOUArray s2  =  s1 == s2

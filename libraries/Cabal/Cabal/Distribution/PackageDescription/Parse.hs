@@ -1,5 +1,8 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.PackageDescription.Parse
@@ -16,31 +19,46 @@
 
 module Distribution.PackageDescription.Parse (
         -- * Package descriptions
+        readGenericPackageDescription,
+        parseGenericPackageDescription,
+
+        -- ** Deprecated names
         readPackageDescription,
-        writePackageDescription,
         parsePackageDescription,
-        showPackageDescription,
 
         -- ** Parsing
         ParseResult(..),
         FieldDescr(..),
         LineNo,
 
+        -- ** Private, but needed for pretty-printer
+        TestSuiteStanza(..),
+        BenchmarkStanza(..),
+
         -- ** Supplementary build information
         readHookedBuildInfo,
         parseHookedBuildInfo,
-        writeHookedBuildInfo,
-        showHookedBuildInfo,
 
         pkgDescrFieldDescrs,
         libFieldDescrs,
+        foreignLibFieldDescrs,
         executableFieldDescrs,
         binfoFieldDescrs,
         sourceRepoFieldDescrs,
         testSuiteFieldDescrs,
+        benchmarkFieldDescrs,
         flagFieldDescrs
   ) where
 
+import Prelude ()
+import Distribution.Compat.Prelude
+
+import Distribution.Types.Dependency
+import Distribution.Types.ForeignLib
+import Distribution.Types.ForeignLibType
+import Distribution.Types.UnqualComponentName
+import Distribution.Types.CondTree
+import Distribution.Types.PackageId
 import Distribution.ParseUtils hiding (parseFields)
 import Distribution.PackageDescription
 import Distribution.PackageDescription.Utils
@@ -54,20 +72,13 @@ import Distribution.Simple.Utils
 import Distribution.Text
 import Distribution.Compat.ReadP hiding (get)
 
-import Data.Char     (isSpace)
-import Data.Foldable (traverse_)
-import Data.Maybe    (listToMaybe, isJust)
-import Data.List     (nub, unfoldr, partition, (\\))
-import Control.Monad (liftM, foldM, when, unless, ap)
-#if __GLASGOW_HASKELL__ < 710
-import Data.Monoid         (Monoid(..))
-import Control.Applicative (Applicative(..))
-#endif
-import Control.Arrow    (first)
+import Data.List        (partition, (\\))
 import System.Directory (doesFileExist)
-import qualified Data.ByteString.Lazy.Char8 as BS.Char8
+import Control.Monad    (mapM)
 
 import Text.PrettyPrint
+       (vcat, ($$), (<+>), text, render,
+        comma, fsep, nest, ($+$), punctuate)
 
 
 -- -----------------------------------------------------------------------------
@@ -85,7 +96,7 @@ pkgDescrFieldDescrs =
            (either disp disp)     (liftM Left parse +++ liftM Right parse)
            specVersionRaw         (\v pkg -> pkg{specVersionRaw=v})
  , simpleField "build-type"
-           (maybe empty disp)     (fmap Just parse)
+           (maybe mempty disp)  (fmap Just parse)
            buildType              (\t pkg -> pkg{buildType=t})
  , simpleField "license"
            disp                   parseLicenseQ
@@ -177,11 +188,8 @@ libFieldDescrs =
   , commaListFieldWithSep vcat "reexported-modules" disp parse
       reexportedModules (\mods lib -> lib{reexportedModules=mods})
 
-  , listFieldWithSep vcat "required-signatures" disp parseModuleNameQ
-      requiredSignatures (\mods lib -> lib{requiredSignatures=mods})
-
-  , listFieldWithSep vcat "exposed-signatures" disp parseModuleNameQ
-      exposedSignatures (\mods lib -> lib{exposedSignatures=mods})
+  , listFieldWithSep vcat "signatures" disp parseModuleNameQ
+      signatures (\mods lib -> lib{signatures=mods})
 
   , boolField "exposed"
       libExposed     (\val lib -> lib{libExposed=val})
@@ -195,19 +203,51 @@ storeXFieldsLib (f@('x':'-':_), val) l@(Library { libBuildInfo = bi }) =
 storeXFieldsLib _ _ = Nothing
 
 -- ---------------------------------------------------------------------------
+-- Foreign libraries
+
+foreignLibFieldDescrs :: [FieldDescr ForeignLib]
+foreignLibFieldDescrs =
+  [ simpleField "type"
+      disp                   parse
+      foreignLibType         (\x flib -> flib { foreignLibType = x })
+  , listField "options"
+      disp                   parse
+      foreignLibOptions      (\x flib -> flib { foreignLibOptions = x })
+  , simpleField "lib-version-info"
+      (maybe mempty disp)    (fmap Just parse)
+      foreignLibVersionInfo  (\x flib -> flib { foreignLibVersionInfo = x })
+  , simpleField "lib-version-linux"
+      (maybe mempty disp)    (fmap Just parse)
+      foreignLibVersionLinux (\x flib -> flib { foreignLibVersionLinux = x })
+  , listField "mod-def-file"
+      showFilePath           parseFilePathQ
+      foreignLibModDefFile   (\x flib -> flib { foreignLibModDefFile = x })
+  ]
+  ++ map biToFLib binfoFieldDescrs
+  where biToFLib = liftField foreignLibBuildInfo $ \bi flib ->
+          flib { foreignLibBuildInfo = bi }
+
+storeXFieldsForeignLib :: UnrecFieldParser ForeignLib
+storeXFieldsForeignLib (f@('x':'-':_), val)
+                        l@(ForeignLib { foreignLibBuildInfo = bi }) =
+    Just $ l { foreignLibBuildInfo = bi {
+                   customFieldsBI = (f,val):customFieldsBI bi
+                 }
+             }
+storeXFieldsForeignLib _ _ = Nothing
+
+-- ---------------------------------------------------------------------------
 -- The Executable type
 
 
 executableFieldDescrs :: [FieldDescr Executable]
 executableFieldDescrs =
-  [ -- note ordering: configuration must come first, for
-    -- showPackageDescription.
-    simpleField "executable"
-                           showToken          parseTokenQ
-                           exeName            (\xs    exe -> exe{exeName=xs})
-  , simpleField "main-is"
+  [ simpleField "main-is"
                            showFilePath       parseFilePathQ
                            modulePath         (\xs    exe -> exe{modulePath=xs})
+  , simpleField "scope"
+                           disp               parse
+                           exeScope           (\sc    exe -> exe{exeScope=sc})
   ]
   ++ map biToExe binfoFieldDescrs
   where biToExe = liftField buildInfo (\bi exe -> exe{buildInfo=bi})
@@ -235,13 +275,13 @@ emptyTestStanza = TestSuiteStanza Nothing Nothing Nothing mempty
 testSuiteFieldDescrs :: [FieldDescr TestSuiteStanza]
 testSuiteFieldDescrs =
     [ simpleField "type"
-        (maybe empty disp)    (fmap Just parse)
+        (maybe mempty disp) (fmap Just parse)
         testStanzaTestType    (\x suite -> suite { testStanzaTestType = x })
     , simpleField "main-is"
-        (maybe empty showFilePath)  (fmap Just parseFilePathQ)
+        (maybe mempty showFilePath)  (fmap Just parseFilePathQ)
         testStanzaMainIs      (\x suite -> suite { testStanzaMainIs = x })
     , simpleField "test-module"
-        (maybe empty disp)    (fmap Just parseModuleNameQ)
+        (maybe mempty disp) (fmap Just parseModuleNameQ)
         testStanzaTestModule  (\x suite -> suite { testStanzaTestModule = x })
     ]
     ++ map biToTest binfoFieldDescrs
@@ -320,11 +360,11 @@ emptyBenchmarkStanza = BenchmarkStanza Nothing Nothing Nothing mempty
 benchmarkFieldDescrs :: [FieldDescr BenchmarkStanza]
 benchmarkFieldDescrs =
     [ simpleField "type"
-        (maybe empty disp)    (fmap Just parse)
+        (maybe mempty disp)    (fmap Just parse)
         benchmarkStanzaBenchmarkType
         (\x suite -> suite { benchmarkStanzaBenchmarkType = x })
     , simpleField "main-is"
-        (maybe empty showFilePath)  (fmap Just parseFilePathQ)
+        (maybe mempty showFilePath)  (fmap Just parseFilePathQ)
         benchmarkStanzaMainIs
         (\x suite -> suite { benchmarkStanzaMainIs = x })
     ]
@@ -379,17 +419,22 @@ validateBenchmark line stanza =
 -- ---------------------------------------------------------------------------
 -- The BuildInfo type
 
-
 binfoFieldDescrs :: [FieldDescr BuildInfo]
 binfoFieldDescrs =
  [ boolField "buildable"
            buildable          (\val binfo -> binfo{buildable=val})
  , commaListField  "build-tools"
-           disp               parseBuildTool
+           disp               parse
            buildTools         (\xs  binfo -> binfo{buildTools=xs})
+ , commaListField  "build-tool-depends"
+           disp               parse
+           buildToolDepends   (\xs  binfo -> binfo{buildToolDepends=xs})
  , commaListFieldWithSep vcat "build-depends"
            disp                   parse
            targetBuildDepends (\xs binfo -> binfo{targetBuildDepends=xs})
+ , commaListFieldWithSep vcat "mixins"
+           disp                   parse
+           mixins   (\xs binfo -> binfo{mixins=xs})
  , spaceListField "cpp-options"
            showToken          parseTokenQ'
            cppOptions          (\val binfo -> binfo{cppOptions=val})
@@ -400,7 +445,7 @@ binfoFieldDescrs =
            showToken          parseTokenQ'
            ldOptions          (\val binfo -> binfo{ldOptions=val})
  , commaListField  "pkgconfig-depends"
-           disp               parsePkgconfigDependency
+           disp               parse
            pkgconfigDepends   (\xs  binfo -> binfo{pkgconfigDepends=xs})
  , listField "frameworks"
            showToken          parseTokenQ
@@ -415,7 +460,7 @@ binfoFieldDescrs =
            showFilePath       parseFilePathQ
            jsSources          (\paths binfo -> binfo{jsSources=paths})
  , simpleField "default-language"
-           (maybe empty disp) (option Nothing (fmap Just parseLanguageQ))
+           (maybe mempty disp) (option Nothing (fmap Just parseLanguageQ))
            defaultLanguage    (\lang  binfo -> binfo{defaultLanguage=lang})
  , listField   "other-languages"
            disp               parseLanguageQ
@@ -454,6 +499,9 @@ binfoFieldDescrs =
  , listFieldWithSep vcat "other-modules"
            disp               parseModuleNameQ
            otherModules       (\val binfo -> binfo{otherModules=val})
+ , listFieldWithSep vcat "autogen-modules"
+           disp               parseModuleNameQ
+           autogenModules       (\val binfo -> binfo{autogenModules=val})
  , optsField   "ghc-prof-options" GHC
            profOptions        (\val binfo -> binfo{profOptions=val})
  , optsField   "ghcjs-prof-options" GHCJS
@@ -499,22 +547,22 @@ flagFieldDescrs =
 sourceRepoFieldDescrs :: [FieldDescr SourceRepo]
 sourceRepoFieldDescrs =
     [ simpleField "type"
-        (maybe empty disp)         (fmap Just parse)
+        (maybe mempty disp)         (fmap Just parse)
         repoType                   (\val repo -> repo { repoType = val })
     , simpleField "location"
-        (maybe empty showFreeText) (fmap Just parseFreeText)
+        (maybe mempty showFreeText) (fmap Just parseFreeText)
         repoLocation               (\val repo -> repo { repoLocation = val })
     , simpleField "module"
-        (maybe empty showToken)    (fmap Just parseTokenQ)
+        (maybe mempty showToken)    (fmap Just parseTokenQ)
         repoModule                 (\val repo -> repo { repoModule = val })
     , simpleField "branch"
-        (maybe empty showToken)    (fmap Just parseTokenQ)
+        (maybe mempty showToken)    (fmap Just parseTokenQ)
         repoBranch                 (\val repo -> repo { repoBranch = val })
     , simpleField "tag"
-        (maybe empty showToken)    (fmap Just parseTokenQ)
+        (maybe mempty showToken)    (fmap Just parseTokenQ)
         repoTag                    (\val repo -> repo { repoTag = val })
     , simpleField "subdir"
-        (maybe empty showFilePath) (fmap Just parseFilePathQ)
+        (maybe mempty showFilePath) (fmap Just parseFilePathQ)
         repoSubdir                 (\val repo -> repo { repoSubdir = val })
     ]
 
@@ -538,24 +586,29 @@ readAndParseFile :: (FilePath -> (String -> IO a) -> IO a)
                  -> FilePath -> IO a
 readAndParseFile withFileContents' parser verbosity fpath = do
   exists <- doesFileExist fpath
-  unless exists
-    (die $ "Error Parsing: file \"" ++ fpath ++ "\" doesn't exist. Cannot continue.")
+  unless exists $
+    die' verbosity $
+      "Error Parsing: file \"" ++ fpath ++ "\" doesn't exist. Cannot continue."
   withFileContents' fpath $ \str -> case parser str of
     ParseFailed e -> do
         let (line, message) = locatedErrorMsg e
-        dieWithLocation fpath line message
+        dieWithLocation' verbosity fpath line message
     ParseOk warnings x -> do
-        mapM_ (warn verbosity . showPWarning fpath) $ reverse warnings
+        traverse_ (warn verbosity . showPWarning fpath) $ reverse warnings
         return x
 
 readHookedBuildInfo :: Verbosity -> FilePath -> IO HookedBuildInfo
 readHookedBuildInfo =
     readAndParseFile withFileContents parseHookedBuildInfo
 
--- |Parse the given package file.
 readPackageDescription :: Verbosity -> FilePath -> IO GenericPackageDescription
-readPackageDescription =
-    readAndParseFile withUTF8FileContents parsePackageDescription
+readPackageDescription = readGenericPackageDescription
+{-# DEPRECATED readPackageDescription "Use readGenericPackageDescription, old name is misleading." #-}
+
+-- | Parse the given package file.
+readGenericPackageDescription :: Verbosity -> FilePath -> IO GenericPackageDescription
+readGenericPackageDescription =
+    readAndParseFile withUTF8FileContents parseGenericPackageDescription
 
 stanzas :: [Field] -> [[Field]]
 stanzas [] = []
@@ -572,15 +625,15 @@ isStanzaHeader _ = False
 
 mapSimpleFields :: (Field -> ParseResult Field) -> [Field]
                 -> ParseResult [Field]
-mapSimpleFields f = mapM walk
+mapSimpleFields f = traverse walk
   where
     walk fld@F{} = f fld
     walk (IfBlock l c fs1 fs2) = do
-      fs1' <- mapM walk fs1
-      fs2' <- mapM walk fs2
+      fs1' <- traverse walk fs1
+      fs2' <- traverse walk fs2
       return (IfBlock l c fs1' fs2')
     walk (Section ln n l fs1) = do
-      fs1' <-  mapM walk fs1
+      fs1' <-  traverse walk fs1
       return (Section ln n l fs1')
 
 -- prop_isMapM fs = mapSimpleFields return fs == return fs
@@ -642,8 +695,8 @@ instance Monad m => Monad (StT s m) where
                         (a,s') <- f s
                         runStT (g a) s'
 
-get :: Monad m => StT s m s
-get = StT $ \s -> return (s, s)
+getSt :: Monad m => StT s m s
+getSt = StT $ \s -> return (s, s)
 
 modify :: Monad m => (s -> s) -> StT s m ()
 modify f = StT $ \s -> return ((),f s)
@@ -663,7 +716,7 @@ type PM a = StT [Field] ParseResult a
 
 -- return look-ahead field or nothing if we're at the end of the file
 peekField :: PM (Maybe Field)
-peekField = liftM listToMaybe get
+peekField = liftM listToMaybe getSt
 
 -- Unconditionally discard the first field in our state.  Will error when it
 -- reaches end of file.  (Yes, that's evil.)
@@ -673,12 +726,16 @@ skipField = modify tail
 --FIXME: this should take a ByteString, not a String. We have to be able to
 -- decode UTF8 and handle the BOM.
 
+parsePackageDescription :: String -> ParseResult GenericPackageDescription
+parsePackageDescription = parseGenericPackageDescription
+{-# DEPRECATED parsePackageDescription "Use parseGenericPackageDescription, old name is misleading" #-}
+
 -- | Parses the given file into a 'GenericPackageDescription'.
 --
 -- In Cabal 1.2 the syntax for package descriptions was changed to a format
 -- with sections and possibly indented property descriptions.
-parsePackageDescription :: String -> ParseResult GenericPackageDescription
-parsePackageDescription file = do
+parseGenericPackageDescription :: String -> ParseResult GenericPackageDescription
+parseGenericPackageDescription file = do
 
     -- This function is quite complex because it needs to be able to parse
     -- both pre-Cabal-1.2 and post-Cabal-1.2 files.  Additionally, it contains
@@ -702,10 +759,10 @@ parsePackageDescription file = do
           head $ [ minVersionBound versionRange
                  | Just versionRange <- [ simpleParse v
                                         | F _ "cabal-version" v <- fields0 ] ]
-              ++ [Version [0] []]
+              ++ [mkVersion [0]]
         minVersionBound versionRange =
           case asVersionIntervals versionRange of
-            []                            -> Version [0] []
+            []                            -> mkVersion [0]
             ((LowerBound version _, _):_) -> version
 
     handleFutureVersionParseFailure cabalVersionNeeded $ do
@@ -741,14 +798,14 @@ parsePackageDescription file = do
 
           -- 'getBody' assumes that the remaining fields only consist of
           -- flags, lib and exe sections.
-        (repos, flags, mcsetup, mlib, exes, tests, bms) <- getBody
+        (repos, flags, mcsetup, mlib, sub_libs, flibs, exes, tests, bms) <- getBody pkg
         warnIfRest  -- warn if getBody did not parse up to the last field.
           -- warn about using old/new syntax with wrong cabal-version:
         maybeWarnCabalVersion (not $ oldSyntax fields0) pkg
-        checkForUndefinedFlags flags mlib exes tests
+        checkForUndefinedFlags flags mlib sub_libs exes tests
         return $ GenericPackageDescription
                    pkg { sourceRepos = repos, setupBuildInfo = mcsetup }
-                   flags mlib exes tests bms
+                   flags mlib sub_libs flibs exes tests bms
 
   where
     oldSyntax = all isSimpleField
@@ -758,13 +815,13 @@ parsePackageDescription file = do
           ++ "  Tabs were used at (line,column): " ++ show tabs
 
     maybeWarnCabalVersion newsyntax pkg
-      | newsyntax && specVersion pkg < Version [1,2] []
+      | newsyntax && specVersion pkg < mkVersion [1,2]
       = lift $ warning $
              "A package using section syntax must specify at least\n"
           ++ "'cabal-version: >= 1.2'."
 
     maybeWarnCabalVersion newsyntax pkg
-      | not newsyntax && specVersion pkg >= Version [1,2] []
+      | not newsyntax && specVersion pkg >= mkVersion [1,2]
       = lift $ warning $
              "A package using 'cabal-version: "
           ++ displaySpecVersion (specVersionRaw pkg)
@@ -835,7 +892,7 @@ parsePackageDescription file = do
     -- warn if there's something at the end of the file
     warnIfRest :: PM ()
     warnIfRest = do
-      s <- get
+      s <- getSt
       case s of
         [] -> return ()
         _ -> lift $ warning "Ignoring trailing declarations."  -- add line no.
@@ -848,17 +905,25 @@ parsePackageDescription file = do
         _ -> return (reverse acc)
 
     --
-    -- body ::= { repo | flag | library | executable | test }+   -- at most one lib
+    -- body ::= { repo | flag | library | sub library | foreign library
+    --          | executable | test | bench }+
     --
     -- The body consists of an optional sequence of declarations of flags and
-    -- an arbitrary number of executables and at most one library.
-    getBody :: PM ([SourceRepo], [Flag]
+    -- an arbitrary number of components
+    --
+    -- TODO: This method is long due for a rewrite to use a accumulator
+    -- data type, or perhaps some more general way of balling the
+    -- components up.
+    getBody :: PackageDescription
+            -> PM ([SourceRepo], [Flag]
                   ,Maybe SetupBuildInfo
-                  ,Maybe (CondTree ConfVar [Dependency] Library)
-                  ,[(String, CondTree ConfVar [Dependency] Executable)]
-                  ,[(String, CondTree ConfVar [Dependency] TestSuite)]
-                  ,[(String, CondTree ConfVar [Dependency] Benchmark)])
-    getBody = peekField >>= \mf -> case mf of
+                  ,(Maybe (CondTree ConfVar [Dependency] Library))
+                  ,[(UnqualComponentName, CondTree ConfVar [Dependency] Library)]
+                  ,[(UnqualComponentName, CondTree ConfVar [Dependency] ForeignLib)]
+                  ,[(UnqualComponentName, CondTree ConfVar [Dependency] Executable)]
+                  ,[(UnqualComponentName, CondTree ConfVar [Dependency] TestSuite)]
+                  ,[(UnqualComponentName, CondTree ConfVar [Dependency] Benchmark)])
+    getBody pkg = peekField >>= \mf -> case mf of
       Just (Section line_no sec_type sec_label sec_fields)
         | sec_type == "executable" -> do
             when (null sec_label) $ lift $ syntaxError line_no
@@ -866,8 +931,33 @@ parsePackageDescription file = do
             exename <- lift $ runP line_no "executable" parseTokenQ sec_label
             flds <- collectFields parseExeFields sec_fields
             skipField
-            (repos, flags, csetup, lib, exes, tests, bms) <- getBody
-            return (repos, flags, csetup, lib, (exename, flds): exes, tests, bms)
+            (repos, flags, csetup, mlib, sub_libs, flibs, exes, tests, bms) <- getBody pkg
+            return (repos, flags, csetup, mlib, sub_libs, flibs, (mkUnqualComponentName exename, flds): exes, tests, bms)
+
+        | sec_type == "foreign-library" -> do
+            when (null sec_label) $ lift $ syntaxError line_no
+              "'foreign-library' needs one argument (the library's name)"
+            libname <- lift $ runP line_no "foreign-library" parseTokenQ sec_label
+            flds <- collectFields parseForeignLibFields sec_fields
+
+            -- Check that a valid foreign library type has been chosen. A type
+            -- field may be given inside a conditional block, so we must check
+            -- for that before complaining that a type field has not been given.
+            -- The foreign library must always have a valid type, so we need to
+            -- check both the 'then' and 'else' blocks, though the blocks need
+            -- not have the same type.
+            let hasType ts = foreignLibType ts /= foreignLibType mempty
+            if onAllBranches hasType flds
+                then do
+                    skipField
+                    (repos, flags, csetup, mlib, sub_libs, flibs, exes, tests, bms) <- getBody pkg
+                    return (repos, flags, csetup, mlib, sub_libs, (mkUnqualComponentName libname, flds):flibs, exes, tests, bms)
+                else lift $ syntaxError line_no $
+                         "Foreign library \"" ++ libname
+                      ++ "\" is missing required field \"type\" or the field "
+                      ++ "is not present in all conditional branches. The "
+                      ++ "available test types are: "
+                      ++ intercalate ", " (map display knownForeignLibTypes)
 
         | sec_type == "test-suite" -> do
             when (null sec_label) $ lift $ syntaxError line_no
@@ -875,41 +965,19 @@ parsePackageDescription file = do
             testname <- lift $ runP line_no "test" parseTokenQ sec_label
             flds <- collectFields (parseTestFields line_no) sec_fields
 
-            -- Check that a valid test suite type has been chosen. A type
-            -- field may be given inside a conditional block, so we must
-            -- check for that before complaining that a type field has not
-            -- been given. The test suite must always have a valid type, so
-            -- we need to check both the 'then' and 'else' blocks, though
-            -- the blocks need not have the same type.
-            let checkTestType ts ct =
-                    let ts' = mappend ts $ condTreeData ct
-                        -- If a conditional has only a 'then' block and no
-                        -- 'else' block, then it cannot have a valid type
-                        -- in every branch, unless the type is specified at
-                        -- a higher level in the tree.
-                        checkComponent (_, _, Nothing) = False
-                        -- If a conditional has a 'then' block and an 'else'
-                        -- block, both must specify a test type, unless the
-                        -- type is specified higher in the tree.
-                        checkComponent (_, t, Just e) =
-                            checkTestType ts' t && checkTestType ts' e
-                        -- Does the current node specify a test type?
-                        hasTestType = testInterface ts'
-                            /= testInterface emptyTestSuite
-                    -- If the current level of the tree specifies a type,
-                    -- then we are done. If not, then one of the conditional
-                    -- branches below the current node must specify a type.
-                    -- Each node may have multiple immediate children; we
-                    -- only one need one to specify a type because the
-                    -- configure step uses 'mappend' to join together the
-                    -- results of flag resolution.
-                    in hasTestType || any checkComponent (condTreeComponents ct)
-            if checkTestType emptyTestSuite flds
+            -- Check that a valid test suite type has been chosen. A type field
+            -- may be given inside a conditional block, so we must check for
+            -- that before complaining that a type field has not been given. The
+            -- test suite must always have a valid type, so we need to check
+            -- both the 'then' and 'else' blocks, though the blocks need not
+            -- have the same type.
+            let hasType ts = testInterface ts /= testInterface mempty
+            if onAllBranches hasType flds
                 then do
                     skipField
-                    (repos, flags, csetup, lib, exes, tests, bms) <- getBody
-                    return (repos, flags, csetup, lib, exes,
-                            (testname, flds) : tests, bms)
+                    (repos, flags, csetup, mlib, sub_libs, flibs, exes, tests, bms) <- getBody pkg
+                    return (repos, flags, csetup, mlib, sub_libs, flibs, exes,
+                            (mkUnqualComponentName testname, flds) : tests, bms)
                 else lift $ syntaxError line_no $
                          "Test suite \"" ++ testname
                       ++ "\" is missing required field \"type\" or the field "
@@ -923,41 +991,19 @@ parsePackageDescription file = do
             benchname <- lift $ runP line_no "benchmark" parseTokenQ sec_label
             flds <- collectFields (parseBenchmarkFields line_no) sec_fields
 
-            -- Check that a valid benchmark type has been chosen. A type
-            -- field may be given inside a conditional block, so we must
-            -- check for that before complaining that a type field has not
-            -- been given. The benchmark must always have a valid type, so
-            -- we need to check both the 'then' and 'else' blocks, though
-            -- the blocks need not have the same type.
-            let checkBenchmarkType ts ct =
-                    let ts' = mappend ts $ condTreeData ct
-                        -- If a conditional has only a 'then' block and no
-                        -- 'else' block, then it cannot have a valid type
-                        -- in every branch, unless the type is specified at
-                        -- a higher level in the tree.
-                        checkComponent (_, _, Nothing) = False
-                        -- If a conditional has a 'then' block and an 'else'
-                        -- block, both must specify a benchmark type, unless the
-                        -- type is specified higher in the tree.
-                        checkComponent (_, t, Just e) =
-                            checkBenchmarkType ts' t && checkBenchmarkType ts' e
-                        -- Does the current node specify a benchmark type?
-                        hasBenchmarkType = benchmarkInterface ts'
-                            /= benchmarkInterface emptyBenchmark
-                    -- If the current level of the tree specifies a type,
-                    -- then we are done. If not, then one of the conditional
-                    -- branches below the current node must specify a type.
-                    -- Each node may have multiple immediate children; we
-                    -- only one need one to specify a type because the
-                    -- configure step uses 'mappend' to join together the
-                    -- results of flag resolution.
-                    in hasBenchmarkType || any checkComponent (condTreeComponents ct)
-            if checkBenchmarkType emptyBenchmark flds
+            -- Check that a valid benchmark type has been chosen. A type field
+            -- may be given inside a conditional block, so we must check for
+            -- that before complaining that a type field has not been given. The
+            -- benchmark must always have a valid type, so we need to check both
+            -- the 'then' and 'else' blocks, though the blocks need not have the
+            -- same type.
+            let hasType ts = benchmarkInterface ts /= benchmarkInterface mempty
+            if onAllBranches hasType flds
                 then do
                     skipField
-                    (repos, flags, csetup, lib, exes, tests, bms) <- getBody
-                    return (repos, flags, csetup, lib, exes,
-                            tests, (benchname, flds) : bms)
+                    (repos, flags, csetup, mlib, sub_libs, flibs, exes, tests, bms) <- getBody pkg
+                    return (repos, flags, csetup, mlib, sub_libs, flibs, exes,
+                            tests, (mkUnqualComponentName benchname, flds) : bms)
                 else lift $ syntaxError line_no $
                          "Benchmark \"" ++ benchname
                       ++ "\" is missing required field \"type\" or the field "
@@ -966,14 +1012,22 @@ parsePackageDescription file = do
                       ++ intercalate ", " (map display knownBenchmarkTypes)
 
         | sec_type == "library" -> do
-            unless (null sec_label) $ lift $
-              syntaxError line_no "'library' expects no argument"
+            mb_libname <- if null sec_label
+                            then return Nothing
+                            -- TODO: relax this parsing so that scoping is handled
+                            -- correctly
+                            else fmap Just . lift
+                                  $ runP line_no "library" parseTokenQ sec_label
             flds <- collectFields parseLibFields sec_fields
             skipField
-            (repos, flags, csetup, lib, exes, tests, bms) <- getBody
-            when (isJust lib) $ lift $ syntaxError line_no
-              "There can only be one library section in a package description."
-            return (repos, flags, csetup, Just flds, exes, tests, bms)
+            (repos, flags, csetup, mlib, sub_libs, flibs, exes, tests, bms) <- getBody pkg
+            case mb_libname of
+                Just libname ->
+                    return (repos, flags, csetup, mlib, (mkUnqualComponentName libname, flds) : sub_libs, flibs, exes, tests, bms)
+                Nothing -> do
+                    when (isJust mlib) $ lift $ syntaxError line_no
+                      "There can only be one (public) library section in a package description."
+                    return (repos, flags, csetup, Just flds, sub_libs, flibs, exes, tests, bms)
 
         | sec_type == "flag" -> do
             when (null sec_label) $ lift $
@@ -981,11 +1035,11 @@ parsePackageDescription file = do
             flag <- lift $ parseFields
                     flagFieldDescrs
                     warnUnrec
-                    (MkFlag (FlagName (lowercase sec_label)) "" True False)
+                    (emptyFlag (mkFlagName (lowercase sec_label)))
                     sec_fields
             skipField
-            (repos, flags, csetup, lib, exes, tests, bms) <- getBody
-            return (repos, flag:flags, csetup, lib, exes, tests, bms)
+            (repos, flags, csetup, mlib, sub_libs, flibs, exes, tests, bms) <- getBody pkg
+            return (repos, flag:flags, csetup, mlib, sub_libs, flibs, exes, tests, bms)
 
         | sec_type == "source-repository" -> do
             when (null sec_label) $ lift $ syntaxError line_no $
@@ -998,19 +1052,11 @@ parsePackageDescription file = do
             repo <- lift $ parseFields
                     sourceRepoFieldDescrs
                     warnUnrec
-                    SourceRepo {
-                      repoKind     = kind,
-                      repoType     = Nothing,
-                      repoLocation = Nothing,
-                      repoModule   = Nothing,
-                      repoBranch   = Nothing,
-                      repoTag      = Nothing,
-                      repoSubdir   = Nothing
-                    }
+                    (emptySourceRepo kind)
                     sec_fields
             skipField
-            (repos, flags, csetup, lib, exes, tests, bms) <- getBody
-            return (repo:repos, flags, csetup, lib, exes, tests, bms)
+            (repos, flags, csetup, mlib, sub_libs, flibs, exes, tests, bms) <- getBody pkg
+            return (repo:repos, flags, csetup, mlib, sub_libs, flibs, exes, tests, bms)
 
         | sec_type == "custom-setup" -> do
             unless (null sec_label) $ lift $
@@ -1021,26 +1067,26 @@ parsePackageDescription file = do
                              mempty
                              sec_fields
             skipField
-            (repos, flags, csetup0, lib, exes, tests, bms) <- getBody
+            (repos, flags, csetup0, mlib, sub_libs, flibs, exes, tests, bms) <- getBody pkg
             when (isJust csetup0) $ lift $ syntaxError line_no
               "There can only be one 'custom-setup' section in a package description."
-            return (repos, flags, Just flds, lib, exes, tests, bms)
+            return (repos, flags, Just flds, mlib, sub_libs, flibs, exes, tests, bms)
 
         | otherwise -> do
             lift $ warning $ "Ignoring unknown section type: " ++ sec_type
             skipField
-            getBody
+            getBody pkg
       Just f@(F {}) -> do
             _ <- lift $ syntaxError (lineNo f) $
               "Plain fields are not allowed in between stanzas: " ++ show f
             skipField
-            getBody
+            getBody pkg
       Just f@(IfBlock {}) -> do
             _ <- lift $ syntaxError (lineNo f) $
               "If-blocks are not allowed in between stanzas: " ++ show f
             skipField
-            getBody
-      Nothing -> return ([], [], Nothing, Nothing, [], [], [])
+            getBody pkg
+      Nothing -> return ([], [], Nothing, Nothing, [], [], [], [], [])
 
     -- Extracts all fields in a block and returns a 'CondTree'.
     --
@@ -1054,7 +1100,7 @@ parsePackageDescription file = do
             condFlds = [ f | f@IfBlock{} <- allflds ]
             sections = [ s | s@Section{} <- allflds ]
 
-        mapM_
+        traverse_
             (\(Section l n _ _) -> lift . warning $
                 "Unexpected section '" ++ n ++ "' on line " ++ show l)
             sections
@@ -1074,11 +1120,11 @@ parsePackageDescription file = do
         -- to check the CondTree, rather than grovel everywhere
         -- inside the conditional bits).
         deps <- liftM concat
-              . mapM (lift . parseConstraint)
+              . traverse (lift . parseConstraint)
               . filter isConstraint
               $ simplFlds
 
-        ifs <- mapM processIfs condFlds
+        ifs <- traverse processIfs condFlds
 
         return (CondNode a deps ifs)
       where
@@ -1092,7 +1138,7 @@ parsePackageDescription file = do
                    [] -> return Nothing
                    es -> do fs <- collectFields parser es
                             return (Just fs)
-            return (cnd, t', e')
+            return (CondBranch cnd t' e')
         processIfs _ = cabalBug "processIfs called with wrong field type"
 
     parseLibFields :: [Field] -> PM Library
@@ -1100,8 +1146,14 @@ parsePackageDescription file = do
 
     -- Note: we don't parse the "executable" field here, hence the tail hack.
     parseExeFields :: [Field] -> PM Executable
-    parseExeFields = lift . parseFields (tail executableFieldDescrs)
+    parseExeFields = lift . parseFields executableFieldDescrs
                                         storeXFieldsExe emptyExecutable
+
+    parseForeignLibFields :: [Field] -> PM ForeignLib
+    parseForeignLibFields =
+        lift . parseFields foreignLibFieldDescrs
+                           storeXFieldsForeignLib
+                           emptyForeignLib
 
     parseTestFields :: LineNo -> [Field] -> PM TestSuite
     parseTestFields line fields = do
@@ -1118,22 +1170,41 @@ parsePackageDescription file = do
     checkForUndefinedFlags ::
         [Flag] ->
         Maybe (CondTree ConfVar [Dependency] Library) ->
-        [(String, CondTree ConfVar [Dependency] Executable)] ->
-        [(String, CondTree ConfVar [Dependency] TestSuite)] ->
+        [(UnqualComponentName, CondTree ConfVar [Dependency] Library)] ->
+        [(UnqualComponentName, CondTree ConfVar [Dependency] Executable)] ->
+        [(UnqualComponentName, CondTree ConfVar [Dependency] TestSuite)] ->
         PM ()
-    checkForUndefinedFlags flags mlib exes tests = do
+    checkForUndefinedFlags flags mlib sub_libs exes tests = do
         let definedFlags = map flagName flags
-        traverse_ (checkCondTreeFlags definedFlags) mlib
-        mapM_ (checkCondTreeFlags definedFlags . snd) exes
-        mapM_ (checkCondTreeFlags definedFlags . snd) tests
+        traverse_ (checkCondTreeFlags definedFlags) (maybeToList mlib)
+        traverse_ (checkCondTreeFlags definedFlags . snd) sub_libs
+        traverse_ (checkCondTreeFlags definedFlags . snd) exes
+        traverse_ (checkCondTreeFlags definedFlags . snd) tests
 
     checkCondTreeFlags :: [FlagName] -> CondTree ConfVar c a -> PM ()
     checkCondTreeFlags definedFlags ct = do
         let fv = nub $ freeVars ct
         unless (all (`elem` definedFlags) fv) $
             fail $ "These flags are used without having been defined: "
-                ++ intercalate ", " [ n | FlagName n <- fv \\ definedFlags ]
+                ++ intercalate ", " [ unFlagName fn | fn <- fv \\ definedFlags ]
 
+-- Check that a property holds on all branches of a condition tree
+onAllBranches :: forall v c a. Monoid a => (a -> Bool) -> CondTree v c a -> Bool
+onAllBranches p = go mempty
+  where
+    -- If the current level of the tree satisfies the property, then we are
+    -- done. If not, then one of the conditional branches below the current node
+    -- must satisfy it. Each node may have multiple immediate children; we only
+    -- one need one to satisfy the property because the configure step uses
+    -- 'mappend' to join together the results of flag resolution.
+    go :: a -> CondTree v c a -> Bool
+    go acc ct = let acc' = acc `mappend` condTreeData ct
+                in p acc' || any (goBranch acc') (condTreeComponents ct)
+
+    -- Both the 'true' and the 'false' block must satisfy the property.
+    goBranch :: a -> CondBranch v c a -> Bool
+    goBranch _   (CondBranch _ _ Nothing) = False
+    goBranch acc (CondBranch _ t (Just e))  = go acc t && go acc e
 
 -- | Parse a list of fields, given a list of field descriptions,
 --   a structure to accumulate the parsed fields, and a function
@@ -1210,60 +1281,16 @@ parseHookedBuildInfo inp = do
         | lowercase inFieldName /= "executable" = liftM Just (parseBI bi)
     parseLib _ = return Nothing
 
-    parseExe :: [Field] -> ParseResult (String, BuildInfo)
+    parseExe :: [Field] -> ParseResult (UnqualComponentName, BuildInfo)
     parseExe (F line inFieldName mName:bi)
         | lowercase inFieldName == "executable"
             = do bis <- parseBI bi
-                 return (mName, bis)
+                 return (mkUnqualComponentName mName, bis)
         | otherwise = syntaxError line "expecting 'executable' at top of stanza"
     parseExe (_:_) = cabalBug "`parseExe' called on a non-field"
     parseExe [] = syntaxError 0 "error in parsing buildinfo file. Expected executable stanza"
 
     parseBI st = parseFields binfoFieldDescrs storeXFieldsBI emptyBuildInfo st
-
--- ---------------------------------------------------------------------------
--- Pretty printing
-
-writePackageDescription :: FilePath -> PackageDescription -> IO ()
-writePackageDescription fpath pkg = writeUTF8File fpath (showPackageDescription pkg)
-
---TODO: make this use section syntax
--- add equivalent for GenericPackageDescription
-showPackageDescription :: PackageDescription -> String
-showPackageDescription pkg = render $
-     ppPackage pkg
-  $$ ppCustomFields (customFieldsPD pkg)
-  $$ (case library pkg of
-        Nothing  -> empty
-        Just lib -> ppLibrary lib)
-  $$ vcat [ space $$ ppExecutable exe | exe <- executables pkg ]
-  where
-    ppPackage    = ppFields pkgDescrFieldDescrs
-    ppLibrary    = ppFields libFieldDescrs
-    ppExecutable = ppFields executableFieldDescrs
-
-ppCustomFields :: [(String,String)] -> Doc
-ppCustomFields flds = vcat (map ppCustomField flds)
-
-ppCustomField :: (String,String) -> Doc
-ppCustomField (name,val) = text name <> colon <+> showFreeText val
-
-writeHookedBuildInfo :: FilePath -> HookedBuildInfo -> IO ()
-writeHookedBuildInfo fpath = writeFileAtomic fpath . BS.Char8.pack
-                             . showHookedBuildInfo
-
-showHookedBuildInfo :: HookedBuildInfo -> String
-showHookedBuildInfo (mb_lib_bi, ex_bis) = render $
-     (case mb_lib_bi of
-        Nothing -> empty
-        Just bi -> ppBuildInfo bi)
-  $$ vcat [    space
-            $$ text "executable:" <+> text name
-            $$ ppBuildInfo bi
-          | (name, bi) <- ex_bis ]
-  where
-    ppBuildInfo bi = ppFields binfoFieldDescrs bi
-                  $$ ppCustomFields (customFieldsBI bi)
 
 -- replace all tabs used as indentation with whitespace, also return where
 -- tabs were found

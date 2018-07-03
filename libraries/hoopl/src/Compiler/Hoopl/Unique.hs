@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP, TypeFamilies #-}
+{-# LANGUAGE DeriveFunctor, DeriveFoldable, DeriveTraversable #-}
 #if __GLASGOW_HASKELL__ >= 709
 {-# LANGUAGE Safe #-}
 #elif __GLASGOW_HASKELL__ >= 701
@@ -26,6 +27,10 @@ import qualified Data.IntSet as S
 
 import Control.Applicative as AP
 import Control.Monad (ap,liftM)
+#if !MIN_VERSION_base(4,8,0)
+import Data.Traversable (Traversable)
+import Data.Foldable (Foldable)
+#endif
 
 -----------------------------------------------------------------------------
 --		Unique
@@ -61,7 +66,7 @@ instance IsSet UniqueSet where
   setIntersection (US x) (US y) = US (S.intersection x y)
   setIsSubsetOf (US x) (US y) = S.isSubsetOf x y
 
-  setFold k z (US s) = S.fold k z s
+  setFold k z (US s) = S.foldr k z s
 
   setElems (US s) = S.elems s
   setFromList ks = US (S.fromList ks)
@@ -69,7 +74,8 @@ instance IsSet UniqueSet where
 -----------------------------------------------------------------------------
 -- UniqueMap
 
-newtype UniqueMap v = UM (M.IntMap v) deriving (Eq, Ord, Show)
+newtype UniqueMap v = UM (M.IntMap v)
+  deriving (Eq, Ord, Show, Functor, Foldable, Traversable)
 
 instance IsMap UniqueMap where
   type KeyOf UniqueMap = Unique
@@ -94,8 +100,8 @@ instance IsMap UniqueMap where
 
   mapMap f (UM m) = UM (M.map f m)
   mapMapWithKey f (UM m) = UM (M.mapWithKey (f . intToUnique) m)
-  mapFold k z (UM m) = M.fold k z m
-  mapFoldWithKey k z (UM m) = M.foldWithKey (k . intToUnique) z m
+  mapFold k z (UM m) = M.foldr k z m
+  mapFoldWithKey k z (UM m) = M.foldrWithKey (k . intToUnique) z m
   mapFilter f (UM m) = UM (M.filter f m)
 
   mapElems (UM m) = M.elems m

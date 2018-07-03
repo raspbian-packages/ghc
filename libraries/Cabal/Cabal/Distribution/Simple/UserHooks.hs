@@ -1,3 +1,6 @@
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Simple.UserHooks
@@ -27,6 +30,9 @@ module Distribution.Simple.UserHooks (
         UserHooks(..), Args,
         emptyUserHooks,
   ) where
+
+import Prelude ()
+import Distribution.Compat.Prelude
 
 import Distribution.PackageDescription
 import Distribution.Simple.Program
@@ -129,6 +135,13 @@ data UserHooks = UserHooks {
     -- |Hook to run after hscolour command.  Second arg indicates verbosity level.
     postHscolour :: Args -> HscolourFlags -> PackageDescription -> LocalBuildInfo -> IO (),
 
+    -- |Hook to run before doctest command.  Second arg indicates verbosity level.
+    preDoctest  :: Args -> DoctestFlags -> IO HookedBuildInfo,
+    -- |Over-ride this hook to get different behavior during doctest.
+    doctestHook :: PackageDescription -> LocalBuildInfo -> UserHooks -> DoctestFlags -> IO (),
+    -- |Hook to run after doctest command.  Second arg indicates verbosity level.
+    postDoctest :: Args -> DoctestFlags -> PackageDescription -> LocalBuildInfo -> IO (),
+
     -- |Hook to run before haddock command.  Second arg indicates verbosity level.
     preHaddock  :: Args -> HaddockFlags -> IO HookedBuildInfo,
     -- |Over-ride this hook to get different behavior during haddock.
@@ -161,7 +174,7 @@ emptyUserHooks
       readDesc  = return Nothing,
       hookedPreProcessors = [],
       hookedPrograms      = [],
-      preConf   = rn,
+      preConf   = rn',
       confHook  = (\_ _ -> return (error "No local build info generated during configure. Over-ride empty configure hook.")),
       postConf  = ru,
       preBuild  = rn',
@@ -173,7 +186,7 @@ emptyUserHooks
       preClean  = rn,
       cleanHook = ru,
       postClean = ru,
-      preCopy   = rn,
+      preCopy   = rn',
       copyHook  = ru,
       postCopy  = ru,
       preInst   = rn,
@@ -182,7 +195,7 @@ emptyUserHooks
       preSDist  = rn,
       sDistHook = ru,
       postSDist = ru,
-      preReg    = rn,
+      preReg    = rn',
       regHook   = ru,
       postReg   = ru,
       preUnreg  = rn,
@@ -191,6 +204,9 @@ emptyUserHooks
       preHscolour  = rn,
       hscolourHook = ru,
       postHscolour = ru,
+      preDoctest   = rn,
+      doctestHook  = ru,
+      postDoctest  = ru,
       preHaddock   = rn,
       haddockHook  = ru,
       postHaddock  = ru,

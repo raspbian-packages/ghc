@@ -15,17 +15,18 @@ module Data.Time.Format.Parse
     ) where
 
 import Text.Read(readMaybe)
+import Data.Time.Clock.Internal.UniversalTime
 import Data.Time.Clock.POSIX
-import Data.Time.Clock.Scale
-import Data.Time.Clock.UTC
+import Data.Time.Clock.Internal.UTCTime
 import Data.Time.Calendar.Days
 import Data.Time.Calendar.Gregorian
 import Data.Time.Calendar.OrdinalDate
 import Data.Time.Calendar.WeekDate
 import Data.Time.Calendar.Private(clipValid)
-import Data.Time.LocalTime.TimeZone
-import Data.Time.LocalTime.TimeOfDay
-import Data.Time.LocalTime.LocalTime
+import Data.Time.LocalTime.Internal.TimeZone
+import Data.Time.LocalTime.Internal.TimeOfDay
+import Data.Time.LocalTime.Internal.LocalTime
+import Data.Time.LocalTime.Internal.ZonedTime
 
 #if !MIN_VERSION_base(4,8,0)
 import Control.Applicative ((<$>),(<*>))
@@ -75,8 +76,8 @@ class ParseTime t where
 
 #if LANGUAGE_Rank2Types
 -- | Parses a time value given a format string.
--- Supports the same %-codes as 'formatTime', including @%-@, @%_@ and @%0@ modifiers.
--- Case is not significant.
+-- Supports the same %-codes as 'formatTime', including @%-@, @%_@ and @%0@ modifiers, however padding widths are not supported.
+-- Case is not significant in the input string.
 -- Some variations in the input are accepted:
 --
 -- [@%z@] accepts any of @-HHMM@ or @-HH:MM@.
@@ -509,10 +510,10 @@ instance ParseTime TimeOfDay where
                     return $ TimeOfDay h m (fromInteger a)
                 'q' -> do
                     a <- ra
-                    return $ TimeOfDay h m (mkPico (truncate s) a)
+                    return $ TimeOfDay h m (mkPico (floor s) a)
                 'Q' -> if null x then Just t else do
                     ps <- readMaybe $ take 12 $ rpad 12 '0' $ drop 1 x
-                    return $ TimeOfDay h m (mkPico (truncate s) ps)
+                    return $ TimeOfDay h m (mkPico (floor s) ps)
                 _   -> Just t
 
         in mfoldl f (Just midnight)

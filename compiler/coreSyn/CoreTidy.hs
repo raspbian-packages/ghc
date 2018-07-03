@@ -15,9 +15,11 @@ module CoreTidy (
 #include "HsVersions.h"
 
 import CoreSyn
+import CoreUnfold ( mkCoreUnfolding )
 import CoreArity
 import Id
 import IdInfo
+import Demand ( zapUsageEnvSig )
 import Type( tidyType, tidyTyCoVarBndr )
 import Coercion( tidyCo )
 import Var
@@ -54,30 +56,30 @@ tidyBind env (Rec prs)
 
 ------------  Expressions  --------------
 tidyExpr :: TidyEnv -> CoreExpr -> CoreExpr
-tidyExpr env (Var v)     =  Var (tidyVarOcc env v)
-tidyExpr env (Type ty)  =  Type (tidyType env ty)
+tidyExpr env (Var v)       = Var (tidyVarOcc env v)
+tidyExpr env (Type ty)     = Type (tidyType env ty)
 tidyExpr env (Coercion co) = Coercion (tidyCo env co)
-tidyExpr _   (Lit lit)   =  Lit lit
-tidyExpr env (App f a)   =  App (tidyExpr env f) (tidyExpr env a)
-tidyExpr env (Tick t e) =  Tick (tidyTickish env t) (tidyExpr env e)
-tidyExpr env (Cast e co) =  Cast (tidyExpr env e) (tidyCo env co)
+tidyExpr _   (Lit lit)     = Lit lit
+tidyExpr env (App f a)     = App (tidyExpr env f) (tidyExpr env a)
+tidyExpr env (Tick t e)    = Tick (tidyTickish env t) (tidyExpr env e)
+tidyExpr env (Cast e co)   = Cast (tidyExpr env e) (tidyCo env co)
 
 tidyExpr env (Let b e)
   = tidyBind env b      =: \ (env', b') ->
     Let b' (tidyExpr env' e)
 
 tidyExpr env (Case e b ty alts)
-  = tidyBndr env b      =: \ (env', b) ->
+  = tidyBndr env b  =: \ (env', b) ->
     Case (tidyExpr env e) b (tidyType env ty)
-         (map (tidyAlt b env') alts)
+         (map (tidyAlt env') alts)
 
 tidyExpr env (Lam b e)
   = tidyBndr env b      =: \ (env', b) ->
     Lam b (tidyExpr env' e)
 
 ------------  Case alternatives  --------------
-tidyAlt :: CoreBndr -> TidyEnv -> CoreAlt -> CoreAlt
-tidyAlt _case_bndr env (con, vs, rhs)
+tidyAlt :: TidyEnv -> CoreAlt -> CoreAlt
+tidyAlt env (con, vs, rhs)
   = tidyBndrs env vs    =: \ (env', vs) ->
     (con, vs, tidyExpr env' rhs)
 
@@ -187,6 +189,8 @@ tidyLetBndr rec_tidy_env env@(tidy_env, var_env) (id,rhs)
         --
         -- Similarly for the demand info - on a let binder, this tells
         -- CorePrep to turn the let into a case.
+        -- But: Remove the usage demand here
+        --      (See Note [Zapping DmdEnv after Demand Analyzer] in WorkWrap)
         --
         -- Similarly arity info for eta expansion in CorePrep
         --
@@ -196,12 +200,14 @@ tidyLetBndr rec_tidy_env env@(tidy_env, var_env) (id,rhs)
         new_info = vanillaIdInfo
                     `setOccInfo`        occInfo old_info
                     `setArityInfo`      exprArity rhs
-                    `setStrictnessInfo` strictnessInfo old_info
+                    `setStrictnessInfo` zapUsageEnvSig (strictnessInfo old_info)
                     `setDemandInfo`     demandInfo old_info
                     `setInlinePragInfo` inlinePragInfo old_info
                     `setUnfoldingInfo`  new_unf
 
         new_unf | isStableUnfolding old_unf = tidyUnfolding rec_tidy_env old_unf old_unf
+                | isEvaldUnfolding  old_unf = evaldUnfolding
+                                              -- See Note [Preserve evaluatedness]
                 | otherwise                 = noUnfolding
         old_unf = unfoldingInfo old_info
     in
@@ -215,10 +221,19 @@ tidyUnfolding tidy_env df@(DFunUnfolding { df_bndrs = bndrs, df_args = args }) _
     (tidy_env', bndrs') = tidyBndrs tidy_env bndrs
 
 tidyUnfolding tidy_env
-              unf@(CoreUnfolding { uf_tmpl = unf_rhs, uf_src = src })
+              (CoreUnfolding { uf_tmpl = unf_rhs, uf_is_top = top_lvl
+                             , uf_src = src, uf_guidance = guidance })
               unf_from_rhs
   | isStableSource src
-  = unf { uf_tmpl = tidyExpr tidy_env unf_rhs }    -- Preserves OccInfo
+  = mkCoreUnfolding src top_lvl (tidyExpr tidy_env unf_rhs) guidance
+    -- Preserves OccInfo
+
+    -- Note that uf_is_value and friends may be a thunk containing a reference
+    -- to the old template. Consequently it is important that we rebuild them,
+    -- despite the fact that they won't change, to avoid a space leak (since,
+    -- e.g., ToIface doesn't look at them; see #13564). This is the same
+    -- approach we use in Simplify.simplUnfolding and TcIface.tcUnfolding.
+
   | otherwise
   = unf_from_rhs
 tidyUnfolding _ unf _ = unf     -- NoUnfolding or OtherCon

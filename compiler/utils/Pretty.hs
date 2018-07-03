@@ -566,7 +566,7 @@ above (Above p g1 q1)  g2 q2 = above p g1 (above q1 g2 q2)
 above p@(Beside{})     g  q  = aboveNest (reduceDoc p) g 0 (reduceDoc q)
 above p g q                  = aboveNest p             g 0 (reduceDoc q)
 
--- Specfication: aboveNest p g k q = p $g$ (nest k q)
+-- Specification: aboveNest p g k q = p $g$ (nest k q)
 aboveNest :: RDoc -> Bool -> Int -> RDoc -> RDoc
 aboveNest _                   _ k _ | k `seq` False = undefined
 aboveNest NoDoc               _ _ _ = NoDoc
@@ -1018,9 +1018,6 @@ hPutLitString handle a l = if l == 0
 --     and async exception-safe.  We only have a single thread and don't
 --     care about exceptions, so we add a layer of fast buffering
 --     over the Handle interface.
---
--- (3) a few hacks in layLeft below to convince GHC to generate the right
---     code.
 
 printLeftRender :: Handle -> Doc -> IO ()
 printLeftRender hdl doc = do
@@ -1031,14 +1028,11 @@ printLeftRender hdl doc = do
 bufLeftRender :: BufHandle -> Doc -> IO ()
 bufLeftRender b doc = layLeft b (reduceDoc doc)
 
--- HACK ALERT!  the "return () >>" below convinces GHC to eta-expand
--- this function with the IO state lambda.  Otherwise we end up with
--- closures in all the case branches.
 layLeft :: BufHandle -> Doc -> IO ()
 layLeft b _ | b `seq` False  = undefined -- make it strict in b
 layLeft _ NoDoc              = error "layLeft: NoDoc"
-layLeft b (Union p q)        = return () >> layLeft b (first p q)
-layLeft b (Nest _ p)         = return () >> layLeft b p
+layLeft b (Union p q)        = layLeft b (first p q)
+layLeft b (Nest _ p)         = layLeft b p
 layLeft b Empty              = bPutChar b '\n'
 layLeft b (NilAbove p)       = bPutChar b '\n' >> layLeft b p
 layLeft b (TextBeside s _ p) = put b s >> layLeft b p

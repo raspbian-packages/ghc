@@ -236,9 +236,11 @@ numericEnumFromThenTo e1 e2 e3
 -- Instances for Int
 --------------------------------------------------------------
 
+-- | @since 2.0.1
 instance  Real Int  where
     toRational x        =  toInteger x :% 1
 
+-- | @since 2.0.1
 instance  Integral Int  where
     toInteger (I# i) = smallInteger i
 
@@ -286,9 +288,11 @@ instance  Integral Int  where
 -- Instances for @Word@
 --------------------------------------------------------------
 
+-- | @since 2.01
 instance Real Word where
     toRational x = toInteger x % 1
 
+-- | @since 2.01
 instance Integral Word where
     quot    (W# x#) y@(W# y#)
         | y /= 0                = W# (x# `quotWord#` y#)
@@ -316,6 +320,7 @@ instance Integral Word where
 -- Instances for Integer
 --------------------------------------------------------------
 
+-- | @since 2.0.1
 instance  Real Integer  where
     toRational x        =  x :% 1
 
@@ -324,13 +329,14 @@ instance  Real Integer  where
 --
 -- Constant folding of quot, rem, div, mod, divMod and quotRem for
 -- Integer arguments depends crucially on inlining. Constant folding
--- rules defined in compiler/prelude/PrelRules.lhs trigger for
+-- rules defined in compiler/prelude/PrelRules.hs trigger for
 -- quotInteger, remInteger and so on. So if calls to quot, rem and so on
 -- were not inlined the rules would not fire. The rules would also not
 -- fire if calls to quotInteger and so on were inlined, but this does not
 -- happen because they are all marked with NOINLINE pragma - see documentation
 -- of integer-gmp or integer-simple.
 
+-- | @since 2.0.1
 instance  Integral Integer where
     toInteger n      = n
 
@@ -364,11 +370,13 @@ instance  Integral Integer where
 -- Instances for @Ratio@
 --------------------------------------------------------------
 
+-- | @since 2.0.1
 instance  (Integral a)  => Ord (Ratio a)  where
     {-# SPECIALIZE instance Ord Rational #-}
     (x:%y) <= (x':%y')  =  x * y' <= x' * y
     (x:%y) <  (x':%y')  =  x * y' <  x' * y
 
+-- | @since 2.0.1
 instance  (Integral a)  => Num (Ratio a)  where
     {-# SPECIALIZE instance Num Rational #-}
     (x:%y) + (x':%y')   =  reduce (x*y' + x'*y) (y*y')
@@ -379,6 +387,7 @@ instance  (Integral a)  => Num (Ratio a)  where
     signum (x:%_)       =  signum x :% 1
     fromInteger x       =  fromInteger x :% 1
 
+-- | @since 2.0.1
 {-# RULES "fromRational/id" fromRational = id :: Rational -> Rational #-}
 instance  (Integral a)  => Fractional (Ratio a)  where
     {-# SPECIALIZE instance Fractional Rational #-}
@@ -389,15 +398,18 @@ instance  (Integral a)  => Fractional (Ratio a)  where
         | otherwise     = y :% x
     fromRational (x:%y) =  fromInteger x % fromInteger y
 
+-- | @since 2.0.1
 instance  (Integral a)  => Real (Ratio a)  where
     {-# SPECIALIZE instance Real Rational #-}
     toRational (x:%y)   =  toInteger x :% toInteger y
 
+-- | @since 2.0.1
 instance  (Integral a)  => RealFrac (Ratio a)  where
     {-# SPECIALIZE instance RealFrac Rational #-}
     properFraction (x:%y) = (fromInteger (toInteger q), r:%y)
                           where (q,r) = quotRem x y
 
+-- | @since 2.0.1
 instance  (Show a)  => Show (Ratio a)  where
     {-# SPECIALIZE instance Show Rational #-}
     showsPrec p (x:%y)  =  showParen (p > ratioPrec) $
@@ -409,6 +421,7 @@ instance  (Show a)  => Show (Ratio a)  where
                            -- Haskell 98 [Sep 08, #1920]
                            showsPrec ratioPrec1 y
 
+-- | @since 2.0.1
 instance  (Integral a)  => Enum (Ratio a)  where
     {-# SPECIALIZE instance Enum Rational #-}
     succ x              =  x + 1
@@ -463,8 +476,8 @@ showSigned showPos p x
 even, odd       :: (Integral a) => a -> Bool
 even n          =  n `rem` 2 == 0
 odd             =  not . even
-{-# INLINEABLE even #-}
-{-# INLINEABLE odd  #-}
+{-# INLINABLE even #-}
+{-# INLINABLE odd  #-}
 
 -------------------------------------------------------
 -- | raise a number to a non-negative integral power

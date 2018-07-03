@@ -18,6 +18,7 @@ module Distribution.Client.Init.Types where
 import Distribution.Simple.Setup
   ( Flag(..) )
 
+import Distribution.Types.Dependency as P
 import Distribution.Compat.Semigroup
 import Distribution.Version
 import Distribution.Verbosity
@@ -82,7 +83,7 @@ data PackageType = Library | Executable
 
 instance Text PackageType where
   disp = Disp.text . show
-  parse = Parse.choice $ map (fmap read . Parse.string . show) [Library, Executable]
+  parse = Parse.choice $ map (fmap read . Parse.string . show) [Library, Executable] -- TODO: eradicateNoParse
 
 instance Monoid InitFlags where
   mempty = gmempty
@@ -114,5 +115,5 @@ data Category
 
 instance Text Category where
   disp  = Disp.text . show
-  parse = Parse.choice $ map (fmap read . Parse.string . show) [Codec .. ]
+  parse = Parse.choice $ map (fmap read . Parse.string . show) [Codec .. ] -- TODO: eradicateNoParse
 

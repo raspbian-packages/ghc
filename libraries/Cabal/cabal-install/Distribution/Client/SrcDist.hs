@@ -1,4 +1,6 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE NondecreasingIndentation #-}
+{-# LANGUAGE FlexibleContexts #-}
 -- Implements the \"@.\/cabal sdist@\" command, which creates a source
 -- distribution for this package.  That is, packs up the source code
 -- into a tarball, making use of the corresponding Cabal module.
@@ -18,11 +20,16 @@ import Distribution.PackageDescription
          ( PackageDescription )
 import Distribution.PackageDescription.Configuration
          ( flattenPackageDescription )
+#ifdef CABAL_PARSEC
+import Distribution.PackageDescription.Parsec
+         ( readGenericPackageDescription )
+#else
 import Distribution.PackageDescription.Parse
-         ( readPackageDescription )
+         ( readGenericPackageDescription )
+#endif
 import Distribution.Simple.Utils
          ( createDirectoryIfMissingVerbose, defaultPackageDesc
-         , warn, die, notice, withTempDirectory )
+         , warn, die', notice, withTempDirectory )
 import Distribution.Client.Setup
          ( SDistFlags(..), SDistExFlags(..), ArchiveFormat(..) )
 import Distribution.Simple.Setup
@@ -33,7 +40,7 @@ import Distribution.Simple.Program (requireProgram, simpleProgram, programPath)
 import Distribution.Simple.Program.Db (emptyProgramDb)
 import Distribution.Text ( display )
 import Distribution.Verbosity (Verbosity, normal, lessVerbose)
-import Distribution.Version   (Version(..), orLaterVersion)
+import Distribution.Version   (mkVersion, orLaterVersion, intersectVersionRanges)
 
 import Distribution.Client.Utils
   (tryFindAddSourcePackageDesc)
@@ -50,8 +57,9 @@ import Control.Exception                             (IOException, evaluate)
 sdist :: SDistFlags -> SDistExFlags -> IO ()
 sdist flags exflags = do
   pkg <- liftM flattenPackageDescription
-    (readPackageDescription verbosity =<< defaultPackageDesc verbosity)
-  let withDir = if not needMakeArchive then (\f -> f tmpTargetDir)
+    (readGenericPackageDescription verbosity =<< defaultPackageDesc verbosity)
+  let withDir :: (FilePath -> IO a) -> IO a
+      withDir = if not needMakeArchive then \f -> f tmpTargetDir
                 else withTempDirectory verbosity tmpTargetDir "sdist."
   -- 'withTempDir' fails if we don't create 'tmpTargetDir'...
   when needMakeArchive $
@@ -94,8 +102,8 @@ sdist flags exflags = do
       -- The '--output-directory' sdist flag was introduced in Cabal 1.12, and
       -- '--list-sources' in 1.17.
       useCabalVersion = if isListSources
-                        then orLaterVersion $ Version [1,17,0] []
-                        else orLaterVersion $ Version [1,12,0] []
+                        then orLaterVersion $ mkVersion [1,17,0]
+                        else orLaterVersion $ mkVersion [1,12,0]
       }
     format        = fromFlag (sDistFormat exflags)
     createArchive = case format of
@@ -140,7 +148,7 @@ createZipArchive verbosity pkg tmpDir targetPref = do
                       Nothing Nothing Nothing Nothing
     exitCode <- waitForProcess hnd
     unless (exitCode == ExitSuccess) $
-      die $ "Generating the zip file failed "
+      die' verbosity $ "Generating the zip file failed "
          ++ "(zip returned exit code " ++ show exitCode ++ ")"
     notice verbosity $ "Source zip archive created: " ++ zipfile
   where
@@ -148,12 +156,13 @@ createZipArchive verbosity pkg tmpDir targetPref = do
 
 -- | List all source files of a given add-source dependency. Exits with error if
 -- something is wrong (e.g. there is no .cabal file in the given directory).
-allPackageSourceFiles :: Verbosity -> FilePath -> IO [FilePath]
-allPackageSourceFiles verbosity packageDir = do
+allPackageSourceFiles :: Verbosity -> SetupScriptOptions -> FilePath
+                         -> IO [FilePath]
+allPackageSourceFiles verbosity setupOpts0 packageDir = do
   pkg <- do
     let err = "Error reading source files of package."
-    desc <- tryFindAddSourcePackageDesc packageDir err
-    flattenPackageDescription `fmap` readPackageDescription verbosity desc
+    desc <- tryFindAddSourcePackageDesc verbosity packageDir err
+    flattenPackageDescription `fmap` readGenericPackageDescription verbosity desc
   globalTmp <- getTemporaryDirectory
   withTempDirectory verbosity globalTmp "cabal-list-sources." $ \tempDir -> do
   let file      = tempDir </> "cabal-sdist-list-sources"
@@ -162,9 +171,11 @@ allPackageSourceFiles verbosity packageDir = do
                                   then lessVerbose verbosity else verbosity,
         sDistListSources = Flag file
         }
-      setupOpts = defaultSetupScriptOptions {
+      setupOpts = setupOpts0 {
         -- 'sdist --list-sources' was introduced in Cabal 1.18.
-        useCabalVersion = orLaterVersion $ Version [1,18,0] [],
+        useCabalVersion = intersectVersionRanges
+                            (orLaterVersion $ mkVersion [1,18,0])
+                            (useCabalVersion setupOpts0),
         useWorkingDir = Just packageDir
         }
 

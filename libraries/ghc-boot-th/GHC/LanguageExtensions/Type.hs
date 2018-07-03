@@ -47,6 +47,7 @@ data Extension
    | ScopedTypeVariables
    | AllowAmbiguousTypes
    | UnboxedTuples
+   | UnboxedSums
    | BangPatterns
    | TypeFamilies
    | TypeFamilyDependencies
@@ -79,6 +80,7 @@ data Extension
    | DefaultSignatures        -- Allow extra signatures for defmeths
    | DeriveAnyClass           -- Allow deriving any class
    | DeriveLift               -- Allow deriving Lift
+   | DerivingStrategies
 
    | TypeSynonymInstances
    | FlexibleContexts

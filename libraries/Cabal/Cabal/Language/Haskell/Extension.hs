@@ -15,23 +15,23 @@
 module Language.Haskell.Extension (
         Language(..),
         knownLanguages,
+        classifyLanguage,
 
         Extension(..),
         KnownExtension(..),
         knownExtensions,
-        deprecatedExtensions
+        deprecatedExtensions,
+        classifyExtension,
   ) where
+
+import Prelude ()
+import Distribution.Compat.Prelude
 
 import Distribution.Text
 import qualified Distribution.Compat.ReadP as Parse
-import Distribution.Compat.Binary
 
 import qualified Text.PrettyPrint as Disp
-import qualified Data.Char as Char (isAlphaNum)
 import Data.Array (Array, accumArray, bounds, Ix(inRange), (!))
-import Data.Data (Data)
-import Data.Typeable (Typeable)
-import GHC.Generics (Generic)
 
 -- ------------------------------------------------------------
 -- * Language
@@ -66,7 +66,7 @@ instance Text Language where
   disp other                   = Disp.text (show other)
 
   parse = do
-    lang <- Parse.munch1 Char.isAlphaNum
+    lang <- Parse.munch1 isAlphaNum
     return (classifyLanguage lang)
 
 classifyLanguage :: String -> Language
@@ -417,7 +417,7 @@ data KnownExtension =
   -- | Allow default instantiation of polymorphic types in more
   -- situations.
   --
-  -- * <http://www.haskell.org/ghc/docs/latest/html/users_guide/interactive-evaluation.html#extended-default-rules>
+  -- * <http://downloads.haskell.org/~ghc/latest/docs/html/users_guide/ghci.html#type-defaulting-in-ghci>
   | ExtendedDefaultRules
 
   -- | Enable unboxed tuples.
@@ -766,6 +766,10 @@ data KnownExtension =
   -- | Allows use of the @#label@ syntax.
   | OverloadedLabels
 
+  -- | Allow functional dependency annotations on type families to declare them
+  -- as injective.
+  | TypeFamilyDependencies
+
   deriving (Generic, Show, Read, Eq, Ord, Enum, Bounded, Typeable, Data)
 
 instance Binary KnownExtension
@@ -796,14 +800,14 @@ instance Text Extension where
   disp (DisableExtension ke)    = Disp.text ("No" ++ show ke)
 
   parse = do
-    extension <- Parse.munch1 Char.isAlphaNum
+    extension <- Parse.munch1 isAlphaNum
     return (classifyExtension extension)
 
 instance Text KnownExtension where
   disp ke = Disp.text (show ke)
 
   parse = do
-    extension <- Parse.munch1 Char.isAlphaNum
+    extension <- Parse.munch1 isAlphaNum
     case classifyKnownExtension extension of
         Just ke ->
             return ke

@@ -312,7 +312,7 @@ genCondJump bid bool = do
 
 genSwitch :: DynFlags -> CmmExpr -> SwitchTargets -> NatM InstrBlock
 genSwitch dflags expr targets
-        | gopt Opt_PIC dflags
+        | positionIndependent dflags
         = error "MachCodeGen: sparc genSwitch PIC not finished\n"
 
         | otherwise
@@ -610,6 +610,7 @@ outOfLineMachOp_table mop
         MO_F32_Exp    -> fsLit "expf"
         MO_F32_Log    -> fsLit "logf"
         MO_F32_Sqrt   -> fsLit "sqrtf"
+        MO_F32_Fabs   -> unsupported
         MO_F32_Pwr    -> fsLit "powf"
 
         MO_F32_Sin    -> fsLit "sinf"
@@ -627,6 +628,7 @@ outOfLineMachOp_table mop
         MO_F64_Exp    -> fsLit "exp"
         MO_F64_Log    -> fsLit "log"
         MO_F64_Sqrt   -> fsLit "sqrt"
+        MO_F64_Fabs   -> unsupported
         MO_F64_Pwr    -> fsLit "pow"
 
         MO_F64_Sin    -> fsLit "sin"

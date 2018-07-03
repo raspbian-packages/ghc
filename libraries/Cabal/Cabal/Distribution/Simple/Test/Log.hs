@@ -1,3 +1,6 @@
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+
 module Distribution.Simple.Test.Log
        ( PackageLog(..)
        , TestLogs(..)
@@ -11,7 +14,11 @@ module Distribution.Simple.Test.Log
        , testSuiteLogPath
        ) where
 
+import Prelude ()
+import Distribution.Compat.Prelude
+
 import Distribution.Package
+import Distribution.Types.UnqualComponentName
 import qualified Distribution.PackageDescription as PD
 import Distribution.Simple.Compiler
 import Distribution.Simple.InstallDirs
@@ -21,9 +28,7 @@ import Distribution.Simple.Utils
 import Distribution.System
 import Distribution.TestSuite
 import Distribution.Verbosity
-
-import Control.Monad ( when )
-import Data.Char ( toUpper )
+import Distribution.Text
 
 -- | Logs all test results for a package, broken down first by test suite and
 -- then by test case.
@@ -46,7 +51,7 @@ localPackageLog pkg_descr lbi = PackageLog
 
 -- | Logs test suite results, itemized by test case.
 data TestSuiteLog = TestSuiteLog
-    { testSuiteName :: String
+    { testSuiteName :: UnqualComponentName
     , testLogs :: TestLogs
     , logFile :: FilePath    -- path to human-readable log file
     }
@@ -150,7 +155,7 @@ summarizeTest verbosity details t =
 -- output for certain verbosity or test filter levels.
 summarizeSuiteFinish :: TestSuiteLog -> String
 summarizeSuiteFinish testLog = unlines
-    [ "Test suite " ++ testSuiteName testLog ++ ": " ++ resStr
+    [ "Test suite " ++ display (testSuiteName testLog) ++ ": " ++ resStr
     , "Test suite logged to: " ++ logFile testLog
     ]
     where resStr = map toUpper (resultString $ testLogs testLog)

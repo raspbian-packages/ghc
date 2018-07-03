@@ -78,7 +78,7 @@ extern void *adjustorCode;
  * recover the writable address, we subtract 1 word from the executable
  * address and fetch. This works because Linux kernel magic gives us two
  * pointers with different addresses that refer to the same memory. Whatever
- * you write into the writeable address can be read back at the executable
+ * you write into the writable address can be read back at the executable
  * address. This method is very efficient.
  *
  * On iOS this breaks for two reasons: 1. the two pointers do not refer to
@@ -137,7 +137,7 @@ createAdjustor (int cconv,
 {
     ffi_cif *cif;
     ffi_type **arg_types;
-    nat n_args, i;
+    uint32_t n_args, i;
     ffi_type *result_type;
     ffi_closure *cl;
     int r, abi;
@@ -251,7 +251,7 @@ static void *
 stgAllocStable(size_t size_in_bytes, StgStablePtr *stable)
 {
   StgArrBytes* arr;
-  nat data_size_in_words, total_size_in_words;
+  uint32_t data_size_in_words, total_size_in_words;
   
   /* round up to a whole number of words */
   data_size_in_words  = ROUNDUP_BYTES_TO_WDS(size_in_bytes);

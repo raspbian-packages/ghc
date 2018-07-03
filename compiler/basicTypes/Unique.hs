@@ -22,21 +22,22 @@ Haskell).
 module Unique (
         -- * Main data types
         Unique, Uniquable(..),
+        uNIQUE_BITS,
 
         -- ** Constructors, destructors and operations on 'Unique's
         hasKey,
 
-        pprUnique,
+        pprUniqueAlways,
 
         mkUniqueGrimily,                -- Used in UniqSupply only!
         getKey,                         -- Used in Var, UniqFM, Name only!
         mkUnique, unpkUnique,           -- Used in BinIface only
 
-        incrUnique,                     -- Used for renumbering
         deriveUnique,                   -- Ditto
         newTagUnique,                   -- Used in CgCase
         initTyVarUnique,
         nonDetCmpUnique,
+        isValidKnownKeyUnique,          -- Used in PrelInfo.knownKeyNamesOkay
 
         -- ** Making built-in uniques
 
@@ -44,8 +45,6 @@ module Unique (
         -- [the Oh-So-Wonderful Haskell module system wins again...]
         mkAlphaTyVarUnique,
         mkPrimOpIdUnique,
-        mkTupleTyConUnique, mkTupleDataConUnique,
-        mkCTupleTyConUnique,
         mkPreludeMiscIdUnique, mkPreludeDataConUnique,
         mkPreludeTyConUnique, mkPreludeClassUnique,
         mkPArrDataConUnique, mkCoVarUnique,
@@ -54,13 +53,16 @@ module Unique (
         mkRegSingleUnique, mkRegPairUnique, mkRegClassUnique, mkRegSubUnique,
         mkCostCentreUnique,
 
-        tyConRepNameUnique,
-        dataConWorkerUnique, dataConRepNameUnique,
-
         mkBuiltinUnique,
         mkPseudoUniqueD,
         mkPseudoUniqueE,
-        mkPseudoUniqueH
+        mkPseudoUniqueH,
+
+        -- ** Deriving uniques
+        -- *** From TyCon name uniques
+        tyConRepNameUnique,
+        -- *** From DataCon name uniques
+        dataConWorkerUnique, dataConRepNameUnique
     ) where
 
 #include "HsVersions.h"
@@ -88,12 +90,18 @@ The @Chars@ are ``tag letters'' that identify the @UniqueSupply@.
 Fast comparison is everything on @Uniques@:
 -}
 
---why not newtype Int?
-
--- | The type of unique identifiers that are used in many places in GHC
+-- | Unique identifier.
+--
+-- The type of unique identifiers that are used in many places in GHC
 -- for fast ordering and equality tests. You should generate these with
 -- the functions from the 'UniqSupply' module
-data Unique = MkUnique {-# UNPACK #-} !Int
+--
+-- These are sometimes also referred to as \"keys\" in comments in GHC.
+newtype Unique = MkUnique Int
+
+{-# INLINE uNIQUE_BITS #-}
+uNIQUE_BITS :: Int
+uNIQUE_BITS = finiteBitSize (0 :: Int) - UNIQUE_TAG_BITS
 
 {-
 Now come the functions which construct uniques from their pieces, and vice versa.
@@ -129,7 +137,7 @@ newTagUnique u c = mkUnique c i where (_,i) = unpkUnique u
 -- | How many bits are devoted to the unique index (as opposed to the class
 -- character).
 uniqueMask :: Int
-uniqueMask = (1 `shiftL` UNIQUE_BITS) - 1
+uniqueMask = (1 `shiftL` uNIQUE_BITS) - 1
 
 -- pop the Char in the top 8 bits of the Unique(Supply)
 
@@ -143,17 +151,26 @@ mkUnique :: Char -> Int -> Unique       -- Builds a unique from pieces
 mkUnique c i
   = MkUnique (tag .|. bits)
   where
-    tag  = ord c `shiftL` UNIQUE_BITS
+    tag  = ord c `shiftL` uNIQUE_BITS
     bits = i .&. uniqueMask
 
 unpkUnique (MkUnique u)
   = let
         -- as long as the Char may have its eighth bit set, we
         -- really do need the logical right-shift here!
-        tag = chr (u `shiftR` UNIQUE_BITS)
+        tag = chr (u `shiftR` uNIQUE_BITS)
         i   = u .&. uniqueMask
     in
     (tag, i)
+
+-- | The interface file symbol-table encoding assumes that known-key uniques fit
+-- in 30-bits; verify this.
+--
+-- See Note [Symbol table representation of names] in BinIface for details.
+isValidKnownKeyUnique :: Unique -> Bool
+isValidKnownKeyUnique u =
+    case unpkUnique u of
+      (c, x) -> ord c < 0xff && x <= (1 `shiftL` 22)
 
 {-
 ************************************************************************
@@ -203,31 +220,54 @@ use `deriving' because we want {\em precise} control of ordering
 -- As such, to get deterministic builds, the order of the allocated
 -- @Uniques@ should not affect the final result.
 -- see also wiki/DeterministicBuilds
+--
+-- Note [Unique Determinism and code generation]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- The goal of the deterministic builds (wiki/DeterministicBuilds, #4012)
+-- is to get ABI compatible binaries given the same inputs and environment.
+-- The motivation behind that is that if the ABI doesn't change the
+-- binaries can be safely reused.
+-- Note that this is weaker than bit-for-bit identical binaries and getting
+-- bit-for-bit identical binaries is not a goal for now.
+-- This means that we don't care about nondeterminism that happens after
+-- the interface files are created, in particular we don't care about
+-- register allocation and code generation.
+-- To track progress on bit-for-bit determinism see #12262.
 
-eqUnique, ltUnique, leUnique :: Unique -> Unique -> Bool
+eqUnique :: Unique -> Unique -> Bool
 eqUnique (MkUnique u1) (MkUnique u2) = u1 == u2
-ltUnique (MkUnique u1) (MkUnique u2) = u1 <  u2
-leUnique (MkUnique u1) (MkUnique u2) = u1 <= u2
 
 -- Provided here to make it explicit at the call-site that it can
 -- introduce non-determinism.
 -- See Note [Unique Determinism]
+-- See Note [No Ord for Unique]
 nonDetCmpUnique :: Unique -> Unique -> Ordering
 nonDetCmpUnique (MkUnique u1) (MkUnique u2)
   = if u1 == u2 then EQ else if u1 < u2 then LT else GT
+
+{-
+Note [No Ord for Unique]
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+As explained in Note [Unique Determinism] the relative order of Uniques
+is nondeterministic. To prevent from accidental use the Ord Unique
+instance has been removed.
+This makes it easier to maintain deterministic builds, but comes with some
+drawbacks.
+The biggest drawback is that Maps keyed by Uniques can't directly be used.
+The alternatives are:
+
+  1) Use UniqFM or UniqDFM, see Note [Deterministic UniqFM] to decide which
+  2) Create a newtype wrapper based on Unique ordering where nondeterminism
+     is controlled. See Module.ModuleEnv
+  3) Change the algorithm to use nonDetCmpUnique and document why it's still
+     deterministic
+  4) Use TrieMap as done in CmmCommonBlockElim.groupByLabel
+-}
 
 instance Eq Unique where
     a == b = eqUnique a b
     a /= b = not (eqUnique a b)
 
-instance Ord Unique where
-    a  < b = ltUnique a b
-    a <= b = leUnique a b
-    a  > b = not (leUnique a b)
-    a >= b = not (ltUnique a b)
-    compare a b = nonDetCmpUnique a b
-
------------------
 instance Uniquable Unique where
     getUnique u = u
 
@@ -245,11 +285,16 @@ finish_show 't' u _pp_u | u < 26
     [chr (ord 'a' + u)]
 finish_show tag _ pp_u = tag : pp_u
 
-pprUnique :: Unique -> SDoc
-pprUnique u = text (showUnique u)
+pprUniqueAlways :: Unique -> SDoc
+-- The "always" means regardless of -dsuppress-uniques
+-- It replaces the old pprUnique to remind callers that
+-- they should consider whether they want to consult
+-- Opt_SuppressUniques
+pprUniqueAlways u
+  = text (showUnique u)
 
 instance Outputable Unique where
-    ppr = pprUnique
+    ppr = pprUniqueAlways
 
 instance Show Unique where
     show uniq = showUnique uniq
@@ -303,18 +348,18 @@ Allocation of unique supply characters:
         d       desugarer
         f       AbsC flattener
         g       SimplStg
+        k       constraint tuple tycons
+        m       constraint tuple datacons
         n       Native codegen
         r       Hsc name cache
         s       simplifier
+        z       anonymous sums
 -}
 
 mkAlphaTyVarUnique     :: Int -> Unique
 mkPreludeClassUnique   :: Int -> Unique
 mkPreludeTyConUnique   :: Int -> Unique
-mkTupleTyConUnique     :: Boxity -> Arity -> Unique
-mkCTupleTyConUnique    :: Arity -> Unique
 mkPreludeDataConUnique :: Arity -> Unique
-mkTupleDataConUnique   :: Boxity -> Arity -> Unique
 mkPrimOpIdUnique       :: Int -> Unique
 mkPreludeMiscIdUnique  :: Int -> Unique
 mkPArrDataConUnique    :: Int -> Unique
@@ -329,9 +374,6 @@ mkPreludeClassUnique i = mkUnique '2' i
 --    * u: the TyCon itself
 --    * u+1: the TyConRepName of the TyCon
 mkPreludeTyConUnique i                = mkUnique '3' (2*i)
-mkTupleTyConUnique Boxed           a  = mkUnique '4' (2*a)
-mkTupleTyConUnique Unboxed         a  = mkUnique '5' (2*a)
-mkCTupleTyConUnique                a  = mkUnique 'k' (2*a)
 
 tyConRepNameUnique :: Unique -> Unique
 tyConRepNameUnique  u = incrUnique u
@@ -350,9 +392,8 @@ tyConRepNameUnique  u = incrUnique u
 -- Prelude data constructors are too simple to need wrappers.
 
 mkPreludeDataConUnique i              = mkUnique '6' (3*i)    -- Must be alphabetic
-mkTupleDataConUnique Boxed          a = mkUnique '7' (3*a)    -- ditto (*may* be used in C labels)
-mkTupleDataConUnique Unboxed        a = mkUnique '8' (3*a)
 
+--------------------------------------------------
 dataConRepNameUnique, dataConWorkerUnique :: Unique -> Unique
 dataConWorkerUnique  u = incrUnique u
 dataConRepNameUnique u = stepUnique u 2

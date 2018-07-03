@@ -229,14 +229,12 @@ import Control.Applicative      ((<$>))
 import Data.Monoid              (Monoid(..))
 #endif
 import Control.Monad            (mplus)
-
 import Data.Word                (Word8)
 import Data.Int                 (Int64)
-import System.IO                (Handle,stdin,stdout,openBinaryFile,IOMode(..)
+import System.IO                (Handle,openBinaryFile,stdin,stdout,withBinaryFile,IOMode(..)
                                 ,hClose)
 import System.IO.Error          (mkIOError, illegalOperationErrorType)
 import System.IO.Unsafe
-import Control.Exception        (bracket)
 
 import Foreign.ForeignPtr       (withForeignPtr)
 import Foreign.Ptr
@@ -284,17 +282,40 @@ fromStrict bs | S.null bs = Empty
 -- avoid converting back and forth between strict and lazy bytestrings.
 --
 toStrict :: ByteString -> S.ByteString
-toStrict Empty           = S.empty
-toStrict (Chunk c Empty) = c
-toStrict cs0 = S.unsafeCreate totalLen $ \ptr -> go cs0 ptr
+toStrict = \cs -> goLen0 cs cs
+    -- We pass the original [ByteString] (bss0) through as an argument through
+    -- goLen0, goLen1, and goLen since we will need it again in goCopy. Passing
+    -- it as an explicit argument avoids capturing it in these functions'
+    -- closures which would result in unnecessary closure allocation.
   where
-    totalLen = S.checkedSum "Lazy.toStrict" . L.map S.length . toChunks $ cs0
+    -- It's still possible that the result is empty
+    goLen0 _   Empty                   = S.empty
+    goLen0 cs0 (Chunk c cs) | S.null c = goLen0 cs0 cs
+    goLen0 cs0 (Chunk c cs)            = goLen1 cs0 c cs
 
-    go Empty                        !_       = return ()
-    go (Chunk (S.PS fp off len) cs) !destptr =
+    -- It's still possible that the result is a single chunk
+    goLen1 _   bs Empty                = bs
+    goLen1 cs0 bs (Chunk c cs)
+      | S.null c                   = goLen1 cs0 bs cs
+      | otherwise                  =
+        goLen cs0 (S.checkedAdd "Lazy.concat" (S.length bs) (S.length c)) cs
+
+    -- General case, just find the total length we'll need
+    goLen cs0 !total (Chunk c cs)      = goLen cs0 total' cs
+      where
+        total' = S.checkedAdd "Lazy.concat" total (S.length c)
+    goLen cs0 total Empty =
+      S.unsafeCreate total $ \ptr -> goCopy cs0 ptr
+
+    -- Copy the data
+    goCopy Empty                        !_   = return ()
+    goCopy (Chunk (S.PS _  _   0  ) cs) !ptr = goCopy cs ptr
+    goCopy (Chunk (S.PS fp off len) cs) !ptr = do
       withForeignPtr fp $ \p -> do
-        S.memcpy destptr (p `plusPtr` off) len
-        go cs (destptr `plusPtr` len)
+        S.memcpy ptr (p `plusPtr` off) len
+        goCopy cs (ptr `plusPtr` len)
+-- See the comment on Data.ByteString.Internal.concat for some background on
+-- this implementation.
 
 ------------------------------------------------------------------------
 
@@ -478,7 +499,7 @@ foldl' f z = go z
 -- (typically the right-identity of the operator), and a ByteString,
 -- reduces the ByteString using the binary operator, from right to left.
 foldr :: (Word8 -> a -> a) -> a -> ByteString -> a
-foldr k z cs = foldrChunks (flip (S.foldr k)) z cs
+foldr k z = foldrChunks (flip (S.foldr k)) z
 {-# INLINE foldr #-}
 
 -- | 'foldl1' is a variant of 'foldl' that has no starting value
@@ -555,7 +576,7 @@ minimum (Chunk c cs) = foldlChunks (\n c' -> n `min` S.minimum c')
 -- passing an accumulating parameter from left to right, and returning a
 -- final value of this accumulator together with the new ByteString.
 mapAccumL :: (acc -> Word8 -> (acc, Word8)) -> acc -> ByteString -> (acc, ByteString)
-mapAccumL f s0 cs0 = go s0 cs0
+mapAccumL f s0 = go s0
   where
     go s Empty        = (s, Empty)
     go s (Chunk c cs) = (s'', Chunk c' cs')
@@ -567,7 +588,7 @@ mapAccumL f s0 cs0 = go s0 cs0
 -- passing an accumulating parameter from right to left, and returning a
 -- final value of this accumulator together with the new ByteString.
 mapAccumR :: (acc -> Word8 -> (acc, Word8)) -> acc -> ByteString -> (acc, ByteString)
-mapAccumR f s0 cs0 = go s0 cs0
+mapAccumR f s0 = go s0
   where
     go s Empty        = (s, Empty)
     go s (Chunk c cs) = (s'', Chunk c' cs')
@@ -638,13 +659,13 @@ cycle cs    = cs' where cs' = foldrChunks Chunk cs' cs
 -- prepending to the ByteString and @b@ is used as the next element in a
 -- recursive call.
 unfoldr :: (a -> Maybe (Word8, a)) -> a -> ByteString
-unfoldr f s0 = unfoldChunk 32 s0
-  where unfoldChunk n s =
-          case S.unfoldrN n f s of
+unfoldr f z = unfoldChunk 32 z
+  where unfoldChunk n x =
+          case S.unfoldrN n f x of
             (c, Nothing)
               | S.null c  -> Empty
               | otherwise -> Chunk c Empty
-            (c, Just s')  -> Chunk c (unfoldChunk (n*2) s')
+            (c, Just x')  -> Chunk c (unfoldChunk (n*2) x')
 
 -- ---------------------------------------------------------------------
 -- Substrings
@@ -781,7 +802,6 @@ splitWith p (Chunk c0 cs0) = comb [] (S.splitWith p c0) cs0
         comb acc (s:[]) Empty        = revChunks (s:acc) : []
         comb acc (s:[]) (Chunk c cs) = comb (s:acc) (S.splitWith p c) cs
         comb acc (s:ss) cs           = revChunks (s:acc) : comb [] ss cs
-
 {-# INLINE splitWith #-}
 
 -- | /O(n)/ Break a 'ByteString' into pieces separated by the byte
@@ -807,7 +827,7 @@ split w (Chunk c0 cs0) = comb [] (S.split w c0) cs0
   where comb :: [P.ByteString] -> [P.ByteString] -> ByteString -> [ByteString]
         comb acc (s:[]) Empty        = revChunks (s:acc) : []
         comb acc (s:[]) (Chunk c cs) = comb (s:acc) (S.split w c) cs
-        comb acc (s:ss) cs           = revChunks (s:acc) : comb [] ss cs
+        comb acc (s:ss) cs        = revChunks (s:acc) : comb [] ss cs
 {-# INLINE split #-}
 
 -- | The 'group' function takes a ByteString and returns a list of
@@ -859,7 +879,7 @@ groupBy k = go
 -- 'ByteString's and concatenates the list after interspersing the first
 -- argument between each element of the list.
 intercalate :: ByteString -> [ByteString] -> ByteString
-intercalate s = concat . (L.intersperse s)
+intercalate s = concat . L.intersperse s
 
 -- ---------------------------------------------------------------------
 -- Indexing ByteStrings
@@ -893,7 +913,8 @@ elemIndex w cs0 = elemIndex' 0 cs0
 --
 -- > elemIndexEnd c xs ==
 -- > (-) (length xs - 1) `fmap` elemIndex c (reverse xs)
-
+--
+-- @since 0.10.6.0
 elemIndexEnd :: Word8 -> ByteString -> Maybe Int64
 elemIndexEnd w = elemIndexEnd' 0
   where
@@ -1040,6 +1061,8 @@ isPrefixOf (Chunk x xs) (Chunk y ys)
 -- | /O(n)/ The 'stripPrefix' function takes two ByteStrings and returns 'Just'
 -- the remainder of the second iff the first is its prefix, and otherwise
 -- 'Nothing'.
+--
+-- @since 0.10.8.0
 stripPrefix :: ByteString -> ByteString -> Maybe ByteString
 stripPrefix Empty bs  = Just bs
 stripPrefix _ Empty  = Nothing
@@ -1111,7 +1134,7 @@ unzip ls = (pack (L.map fst ls), pack (L.map snd ls))
 inits :: ByteString -> [ByteString]
 inits = (Empty :) . inits'
   where inits' Empty        = []
-        inits' (Chunk c cs) = L.map (\c' -> Chunk c' Empty) (L.tail (S.inits c))
+        inits' (Chunk c cs) = L.map (`Chunk` Empty) (L.tail (S.inits c))
                            ++ L.map (Chunk c) (inits' cs)
 
 -- | /O(n)/ Return all final segments of the given 'ByteString', longest first.
@@ -1166,7 +1189,7 @@ hGetContentsN k h = lazyRead -- TODO close on exceptions
     loop = do
         c <- S.hGetSome h k -- only blocks if there is no data available
         if S.null c
-          then do hClose h >> return Empty
+          then hClose h >> return Empty
           else do cs <- lazyRead
                   return (Chunk c cs)
 
@@ -1244,24 +1267,27 @@ hGetNonBlocking = hGetNonBlockingN defaultChunkSize
 readFile :: FilePath -> IO ByteString
 readFile f = openBinaryFile f ReadMode >>= hGetContents
 
+modifyFile :: IOMode -> FilePath -> ByteString -> IO ()
+modifyFile mode f txt = withBinaryFile f mode (`hPut` txt)
+
 -- | Write a 'ByteString' to a file.
 --
 writeFile :: FilePath -> ByteString -> IO ()
-writeFile f txt = bracket (openBinaryFile f WriteMode) hClose
-    (\hdl -> hPut hdl txt)
+writeFile = modifyFile WriteMode
 
 -- | Append a 'ByteString' to a file.
 --
 appendFile :: FilePath -> ByteString -> IO ()
-appendFile f txt = bracket (openBinaryFile f AppendMode) hClose
-    (\hdl -> hPut hdl txt)
+appendFile = modifyFile AppendMode
 
 -- | getContents. Equivalent to hGetContents stdin. Will read /lazily/
 --
 getContents :: IO ByteString
 getContents = hGetContents stdin
 
--- | Outputs a 'ByteString' to the specified 'Handle'.
+-- | Outputs a 'ByteString' to the specified 'Handle'. The chunks will be
+-- written one at a time. Other threads might write to the 'Handle' between the
+-- writes, and hence 'hPut' alone might not be suitable for concurrent writes.
 --
 hPut :: Handle -> ByteString -> IO ()
 hPut h cs = foldrChunks (\c rest -> S.hPut h c >> rest) (return ()) cs

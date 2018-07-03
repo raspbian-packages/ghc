@@ -72,7 +72,7 @@ import System.Win32.File (LPSECURITY_ATTRIBUTES)
 import System.Win32.Time (FILETIME)
 import System.Win32.Types (DWORD, ErrCode, HKEY, LPCTSTR, PKEY, withTString)
 import System.Win32.Types (HANDLE, LONG, LPBYTE, newForeignHANDLE, peekTString)
-import System.Win32.Types (LPTSTR, TCHAR, failUnlessSuccess, withTStringLen)
+import System.Win32.Types (LPTSTR, TCHAR, failUnlessSuccess)
 import System.Win32.Types (castUINTPtrToPtr, failUnlessSuccessOr, maybePtr)
 
 ##include "windows_cconv.h"
@@ -353,29 +353,29 @@ regQueryInfoKey key =
     c_RegQueryInfoKey p_key c_class_string p_class_id nullPtr p_subkeys
         p_max_subkey_len p_max_class_len p_values p_max_value_name_len
         p_max_value_len p_sec_len p_lastWrite
-  class_string <- peekTString c_class_string
-  class_id <- peek p_class_id
-  subkeys <- peek p_subkeys
-  max_subkey_len <- peek p_max_subkey_len
-  max_class_len <- peek p_max_class_len
-  values <- peek p_values
-  max_value_name_len <- peek p_max_value_name_len
-  max_value_len <- peek p_max_value_len
-  sec_len <- peek p_sec_len
-  lastWrite_lo <- #{peek FILETIME,dwLowDateTime} p_lastWrite
-  lastWrite_hi <- #{peek FILETIME,dwHighDateTime} p_lastWrite
+  class_string' <- peekTString c_class_string
+  class_id' <- peek p_class_id
+  subkeys' <- peek p_subkeys
+  max_subkey_len' <- peek p_max_subkey_len
+  max_class_len' <- peek p_max_class_len
+  values' <- peek p_values
+  max_value_name_len' <- peek p_max_value_name_len
+  max_value_len' <- peek p_max_value_len
+  sec_len' <- peek p_sec_len
+  lastWrite_lo' <- #{peek FILETIME,dwLowDateTime} p_lastWrite
+  lastWrite_hi' <- #{peek FILETIME,dwHighDateTime} p_lastWrite
   return $ RegInfoKey
-    { class_string = class_string
-    , class_id = fromIntegral class_id
-    , subkeys = subkeys
-    , max_subkey_len = max_subkey_len
-    , max_class_len = max_class_len
-    , values = values
-    , max_value_name_len = max_value_name_len
-    , max_value_len = max_value_len
-    , sec_len = fromIntegral sec_len
-    , lastWrite_lo = lastWrite_lo
-    , lastWrite_hi = lastWrite_hi
+    { class_string = class_string'
+    , class_id = fromIntegral class_id'
+    , subkeys = subkeys'
+    , max_subkey_len = max_subkey_len'
+    , max_class_len = max_class_len'
+    , values = values'
+    , max_value_name_len = max_value_name_len'
+    , max_value_len = max_value_len'
+    , sec_len = fromIntegral sec_len'
+    , lastWrite_lo = lastWrite_lo'
+    , lastWrite_hi = lastWrite_hi'
     }
 foreign import WINDOWS_CCONV unsafe "windows.h RegQueryInfoKeyW"
   c_RegQueryInfoKey :: PKEY -> LPTSTR -> Ptr DWORD -> Ptr DWORD -> Ptr DWORD -> Ptr DWORD -> Ptr DWORD -> Ptr DWORD -> Ptr DWORD -> Ptr DWORD -> Ptr DWORD -> Ptr FILETIME -> IO ErrCode
@@ -477,9 +477,9 @@ regSetValue :: HKEY -> String -> String -> IO ()
 regSetValue key subkey value =
   withForeignPtr key $ \ p_key ->
   withTString subkey $ \ c_subkey ->
-  withTStringLen value $ \ (c_value, value_len) ->
+  withTString value $ \ c_value ->
   failUnlessSuccess "RegSetValue" $
-    c_RegSetValue p_key c_subkey rEG_SZ c_value value_len
+    c_RegSetValue p_key c_subkey rEG_SZ c_value 0 -- cbData is ignored, value needs to be null terminated.
 foreign import WINDOWS_CCONV unsafe "windows.h RegSetValueW"
   c_RegSetValue :: PKEY -> LPCTSTR -> DWORD -> LPCTSTR -> Int -> IO ErrCode
 

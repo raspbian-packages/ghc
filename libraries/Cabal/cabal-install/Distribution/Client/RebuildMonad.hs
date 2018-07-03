@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 
 -- | An abstraction for re-running actions if values or files have changed.
@@ -13,6 +12,7 @@ module Distribution.Client.RebuildMonad (
     -- * Rebuild monad
     Rebuild,
     runRebuild,
+    execRebuild,
     askRoot,
 
     -- * Setting up file monitoring
@@ -42,7 +42,19 @@ module Distribution.Client.RebuildMonad (
 
     -- * Utils
     matchFileGlob,
+    getDirectoryContentsMonitored,
+    createDirectoryMonitored,
+    monitorDirectoryStatus,
+    doesFileExistMonitored,
+    need,
+    needIfExists,
+    findFileWithExtensionMonitored,
+    findFirstFileMonitored,
+    findFileMonitored,
   ) where
+
+import Prelude ()
+import Distribution.Client.Compat.Prelude
 
 import Distribution.Client.FileMonitor
 import Distribution.Client.Glob hiding (matchFileGlob)
@@ -51,13 +63,10 @@ import qualified Distribution.Client.Glob as Glob (matchFileGlob)
 import Distribution.Simple.Utils (debug)
 import Distribution.Verbosity    (Verbosity)
 
-#if !MIN_VERSION_base(4,8,0)
-import Control.Applicative
-#endif
 import Control.Monad.State as State
 import Control.Monad.Reader as Reader
-import Distribution.Compat.Binary     (Binary)
-import System.FilePath (takeFileName)
+import System.FilePath
+import System.Directory
 
 
 -- | A monad layered on top of 'IO' to help with re-running actions when the
@@ -85,6 +94,10 @@ unRebuild rootDir (Rebuild action) = runStateT (runReaderT action rootDir) []
 -- | Run a 'Rebuild' IO action.
 runRebuild :: FilePath -> Rebuild a -> IO a
 runRebuild rootDir (Rebuild action) = evalStateT (runReaderT action rootDir) []
+
+-- | Run a 'Rebuild' IO action.
+execRebuild :: FilePath -> Rebuild a -> IO [MonitorFilePath]
+execRebuild rootDir (Rebuild action) = execStateT (runReaderT action rootDir) []
 
 -- | The root that relative paths are interpreted as being relative to.
 askRoot :: Rebuild FilePath
@@ -145,3 +158,80 @@ matchFileGlob glob = do
     monitorFiles [monitorFileGlobExistence glob]
     liftIO $ Glob.matchFileGlob root glob
 
+getDirectoryContentsMonitored :: FilePath -> Rebuild [FilePath]
+getDirectoryContentsMonitored dir = do
+    exists <- monitorDirectoryStatus dir
+    if exists
+      then liftIO $ getDirectoryContents dir
+      else return []
+
+createDirectoryMonitored :: Bool -> FilePath -> Rebuild ()
+createDirectoryMonitored createParents dir = do
+    monitorFiles [monitorDirectoryExistence dir]
+    liftIO $ createDirectoryIfMissing createParents dir
+
+-- | Monitor a directory as in 'monitorDirectory' if it currently exists or
+-- as 'monitorNonExistentDirectory' if it does not.
+monitorDirectoryStatus :: FilePath -> Rebuild Bool
+monitorDirectoryStatus dir = do
+    exists <- liftIO $ doesDirectoryExist dir
+    monitorFiles [if exists
+                    then monitorDirectory dir
+                    else monitorNonExistentDirectory dir]
+    return exists
+
+-- | Like 'doesFileExist', but in the 'Rebuild' monad.  This does
+-- NOT track the contents of 'FilePath'; use 'need' in that case.
+doesFileExistMonitored :: FilePath -> Rebuild Bool
+doesFileExistMonitored f = do
+    root <- askRoot
+    exists <- liftIO $ doesFileExist (root </> f)
+    monitorFiles [if exists
+                    then monitorFileExistence f
+                    else monitorNonExistentFile f]
+    return exists
+
+-- | Monitor a single file
+need :: FilePath -> Rebuild ()
+need f = monitorFiles [monitorFileHashed f]
+
+-- | Monitor a file if it exists; otherwise check for when it
+-- gets created.  This is a bit better for recompilation avoidance
+-- because sometimes users give bad package metadata, and we don't
+-- want to repeatedly rebuild in this case (which we would if we
+-- need'ed a non-existent file).
+needIfExists :: FilePath -> Rebuild ()
+needIfExists f = do
+    root <- askRoot
+    exists <- liftIO $ doesFileExist (root </> f)
+    monitorFiles [if exists
+                    then monitorFileHashed f
+                    else monitorNonExistentFile f]
+
+-- | Like 'findFileWithExtension', but in the 'Rebuild' monad.
+findFileWithExtensionMonitored
+    :: [String]
+    -> [FilePath]
+    -> FilePath
+    -> Rebuild (Maybe FilePath)
+findFileWithExtensionMonitored extensions searchPath baseName =
+  findFirstFileMonitored id
+    [ path </> baseName <.> ext
+    | path <- nub searchPath
+    , ext <- nub extensions ]
+
+-- | Like 'findFirstFile', but in the 'Rebuild' monad.
+findFirstFileMonitored :: (a -> FilePath) -> [a] -> Rebuild (Maybe a)
+findFirstFileMonitored file = findFirst
+  where findFirst []     = return Nothing
+        findFirst (x:xs) = do exists <- doesFileExistMonitored (file x)
+                              if exists
+                                then return (Just x)
+                                else findFirst xs
+
+-- | Like 'findFile', but in the 'Rebuild' monad.
+findFileMonitored :: [FilePath] -> FilePath -> Rebuild (Maybe FilePath)
+findFileMonitored searchPath fileName =
+  findFirstFileMonitored id
+    [ path </> fileName
+    | path <- nub searchPath]

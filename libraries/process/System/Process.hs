@@ -77,7 +77,7 @@ import System.Process.Internals
 
 import Control.Concurrent
 import Control.DeepSeq (rnf)
-import Control.Exception (SomeException, mask, try, throwIO)
+import Control.Exception (SomeException, mask, bracket, try, throwIO)
 import qualified Control.Exception as C
 import Control.Monad
 import Data.Maybe
@@ -115,7 +115,8 @@ proc cmd args = CreateProcess { cmdspec = RawCommand cmd args,
                                 create_new_console = False,
                                 new_session = False,
                                 child_group = Nothing,
-                                child_user = Nothing }
+                                child_user = Nothing,
+                                use_process_jobs = False }
 
 -- | Construct a 'CreateProcess' record for passing to 'createProcess',
 -- representing a command to be passed to the shell.
@@ -133,7 +134,8 @@ shell str = CreateProcess { cmdspec = ShellCommand str,
                             create_new_console = False,
                             new_session = False,
                             child_group = Nothing,
-                            child_user = Nothing }
+                            child_user = Nothing,
+                            use_process_jobs = False }
 
 {- |
 This is the most general way to spawn an external process.  The
@@ -178,7 +180,8 @@ Note that @Handle@s provided for @std_in@, @std_out@, or @std_err@ via the
 @UseHandle@ constructor will be closed by calling this function. This is not
 always the desired behavior. In cases where you would like to leave the
 @Handle@ open after spawning the child process, please use 'createProcess_'
-instead.
+instead. All created @Handle@s are initially in text mode; if you need them
+to be in binary mode then use 'hSetBinaryMode'.
 
 -}
 createProcess
@@ -196,7 +199,6 @@ createProcess cp = do
     | hdl /= stdin && hdl /= stdout && hdl /= stderr = hClose hdl
   maybeCloseStd _ = return ()
 
-{-
 -- | A 'C.bracket'-style resource handler for 'createProcess'.
 --
 -- Does automatic cleanup when the action finishes. If there is an exception
@@ -211,7 +213,6 @@ createProcess cp = do
 -- >   ...
 --
 -- @since 1.4.3.0
--}
 withCreateProcess
   :: CreateProcess
   -> (Maybe Handle -> Maybe Handle -> Maybe Handle -> ProcessHandle -> IO a)
@@ -234,7 +235,7 @@ withCreateProcess_ fun c action =
 cleanupProcess :: (Maybe Handle, Maybe Handle, Maybe Handle, ProcessHandle)
                -> IO ()
 cleanupProcess (mb_stdin, mb_stdout, mb_stderr,
-                ph@(ProcessHandle _ delegating_ctlc)) = do
+                ph@(ProcessHandle _ delegating_ctlc _)) = do
     terminateProcess ph
     -- Note, it's important that other threads that might be reading/writing
     -- these handles also get killed off, since otherwise they might be holding
@@ -255,7 +256,7 @@ cleanupProcess (mb_stdin, mb_stdout, mb_stderr,
     _ <- forkIO (waitForProcess (resetCtlcDelegation ph) >> return ())
     return ()
   where
-    resetCtlcDelegation (ProcessHandle m _) = ProcessHandle m False
+    resetCtlcDelegation (ProcessHandle m _ l) = ProcessHandle m False l
 
 -- ----------------------------------------------------------------------------
 -- spawnProcess/spawnCommand
@@ -581,20 +582,19 @@ detail.
 waitForProcess
   :: ProcessHandle
   -> IO ExitCode
-waitForProcess ph@(ProcessHandle _ delegating_ctlc) = do
+waitForProcess ph@(ProcessHandle _ delegating_ctlc _) = lockWaitpid $ do
   p_ <- modifyProcessHandle ph $ \p_ -> return (p_,p_)
   case p_ of
     ClosedHandle e -> return e
     OpenHandle h  -> do
-        -- don't hold the MVar while we call c_waitForProcess...
-        -- (XXX but there's a small race window here during which another
-        -- thread could close the handle or call waitForProcess)
         e <- alloca $ \pret -> do
+          -- don't hold the MVar while we call c_waitForProcess...
           throwErrnoIfMinus1Retry_ "waitForProcess" (c_waitForProcess h pret)
           modifyProcessHandle ph $ \p_' ->
             case p_' of
-              ClosedHandle e -> return (p_',e)
-              OpenHandle ph' -> do
+              ClosedHandle e  -> return (p_', e)
+              OpenExtHandle{} -> return (p_', ExitFailure (-1))
+              OpenHandle ph'  -> do
                 closePHANDLE ph'
                 code <- peek pret
                 let e = if (code == 0)
@@ -604,7 +604,22 @@ waitForProcess ph@(ProcessHandle _ delegating_ctlc) = do
         when delegating_ctlc $
           endDelegateControlC e
         return e
-
+#if defined(WINDOWS)
+    OpenExtHandle _ job iocp ->
+        maybe (ExitFailure (-1)) mkExitCode `fmap` waitForJobCompletion job iocp timeout_Infinite
+      where mkExitCode code | code == 0 = ExitSuccess
+                            | otherwise = ExitFailure $ fromIntegral code
+#else
+    OpenExtHandle _ _job _iocp ->
+        return $ ExitFailure (-1)
+#endif
+  where
+    -- If more than one thread calls `waitpid` at a time, `waitpid` will
+    -- return the exit code to one of them and (-1) to the rest of them,
+    -- causing an exception to be thrown.
+    -- Cf. https://github.com/haskell/process/issues/46, and
+    -- https://github.com/haskell/process/pull/58 for further discussion
+    lockWaitpid m = withMVar (waitpidLock ph) $ \() -> m
 
 -- ----------------------------------------------------------------------------
 -- getProcessExitCode
@@ -619,27 +634,51 @@ when the process died as the result of a signal.
 -}
 
 getProcessExitCode :: ProcessHandle -> IO (Maybe ExitCode)
-getProcessExitCode ph@(ProcessHandle _ delegating_ctlc) = do
+getProcessExitCode ph@(ProcessHandle _ delegating_ctlc _) = tryLockWaitpid $ do
   (m_e, was_open) <- modifyProcessHandle ph $ \p_ ->
     case p_ of
       ClosedHandle e -> return (p_, (Just e, False))
-      OpenHandle h ->
+      open -> do
         alloca $ \pExitCode -> do
-            res <- throwErrnoIfMinus1Retry "getProcessExitCode" $
-                        c_getProcessExitCode h pExitCode
-            code <- peek pExitCode
-            if res == 0
-              then return (p_, (Nothing, False))
-              else do
-                   closePHANDLE h
-                   let e  | code == 0 = ExitSuccess
-                          | otherwise = ExitFailure (fromIntegral code)
-                   return (ClosedHandle e, (Just e, True))
+          case getHandle open of
+            Nothing -> return (p_, (Nothing, False))
+            Just h  -> do
+                res <- throwErrnoIfMinus1Retry "getProcessExitCode" $
+                                        c_getProcessExitCode h pExitCode
+                code <- peek pExitCode
+                if res == 0
+                   then return (p_, (Nothing, False))
+                   else do
+                        closePHANDLE h
+                        let e  | code == 0 = ExitSuccess
+                               | otherwise = ExitFailure (fromIntegral code)
+                        return (ClosedHandle e, (Just e, True))
   case m_e of
     Just e | was_open && delegating_ctlc -> endDelegateControlC e
     _                                    -> return ()
   return m_e
+    where getHandle :: ProcessHandle__ -> Maybe PHANDLE
+          getHandle (OpenHandle        h) = Just h
+          getHandle (ClosedHandle      _) = Nothing
+          getHandle (OpenExtHandle h _ _) = Just h
 
+          -- If somebody is currently holding the waitpid lock, we don't want to
+          -- accidentally remove the pid from the process table.
+          -- Try acquiring the waitpid lock. If it is held, we are done
+          -- since that means the process is still running and we can return
+          -- `Nothing`. If it is not held, acquire it so we can run the
+          -- (non-blocking) call to `waitpid` without worrying about any
+          -- other threads calling it at the same time.
+          tryLockWaitpid :: IO (Maybe ExitCode) -> IO (Maybe ExitCode)
+          tryLockWaitpid action = bracket acquire release between
+            where
+              acquire   = tryTakeMVar (waitpidLock ph)
+              release m = case m of
+                Nothing -> return ()
+                Just () -> putMVar (waitpidLock ph) ()
+              between m = case m of
+                Nothing -> return Nothing
+                Just () -> action
 
 -- ----------------------------------------------------------------------------
 -- terminateProcess
@@ -663,8 +702,13 @@ terminateProcess :: ProcessHandle -> IO ()
 terminateProcess ph = do
   withProcessHandle ph $ \p_ ->
     case p_ of
-      ClosedHandle _ -> return ()
-      OpenHandle h -> do
+      ClosedHandle  _ -> return ()
+#if defined(WINDOWS)
+      OpenExtHandle{} -> terminateJob ph 1 >> return ()
+#else
+      OpenExtHandle{} -> error "terminateProcess with OpenExtHandle should not happen on POSIX."
+#endif
+      OpenHandle    h -> do
         throwErrnoIfMinus1Retry_ "terminateProcess" $ c_terminateProcess h
         return ()
         -- does not close the handle, we might want to try terminating it
@@ -774,8 +818,7 @@ runProcess cmd args mb_cwd mb_env mb_stdin mb_stdout mb_stderr = do
 
 {- | Runs a command using the shell, and returns 'Handle's that may
      be used to communicate with the process via its @stdin@, @stdout@,
-     and @stderr@ respectively. The 'Handle's are initially in binary
-     mode; if you need them to be in text mode then use 'hSetBinaryMode'.
+     and @stderr@ respectively.
 -}
 runInteractiveCommand
   :: String
@@ -797,9 +840,6 @@ runInteractiveCommand string =
 
 >   (inp,out,err,pid) <- runInteractiveProcess "..."
 >   forkIO (hPutStr inp str)
-
-    The 'Handle's are initially in binary mode; if you need them to be
-    in text mode then use 'hSetBinaryMode'.
 -}
 runInteractiveProcess
   :: FilePath                   -- ^ Filename of the executable (see 'RawCommand' for details)

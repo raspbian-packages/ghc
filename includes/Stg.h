@@ -26,6 +26,10 @@
 #ifndef STG_H
 #define STG_H
 
+#if !(__STDC_VERSION__ >= 199901L)
+# error __STDC_VERSION__ does not advertise C99 or later
+#endif
+
 /*
  * If we are compiling a .hc file, then we want all the register
  * variables.  This is the what happens if you #include "Stg.h" first:
@@ -137,7 +141,6 @@
 // The problem, however, is with 'extern inline' whose semantics significantly
 // differs between gnu90 and C99
 #define INLINE_HEADER static inline
-#define INLINE_ME inline
 #define STATIC_INLINE static inline
 
 // Figure out whether `__attributes__((gnu_inline))` is needed
@@ -220,6 +223,8 @@ typedef StgInt    I_;
 typedef StgWord StgWordArray[];
 typedef StgFunPtr       F_;
 
+#define EB_(X)    extern char X[]
+#define IB_(X)    static char X[]
 #define EI_(X)          extern StgWordArray (X) GNU_ATTRIBUTE(aligned (8))
 #define II_(X)          static StgWordArray (X) GNU_ATTRIBUTE(aligned (8))
 #define IF_(f)    static StgFunPtr GNUC3_ATTRIBUTE(used) f(void)

@@ -10,8 +10,8 @@
 
 module CmmUtils(
         -- CmmType
-        primRepCmmType, primRepForeignHint,
-        typeCmmType, typeForeignHint,
+        primRepCmmType, slotCmmType, slotForeignHint,
+        typeCmmType, typeForeignHint, primRepForeignHint,
 
         -- CmmLit
         zeroCLit, mkIntCLit,
@@ -58,10 +58,6 @@ module CmmUtils(
         toBlockListEntryFirst, toBlockListEntryFirstFalseFallthrough,
         foldGraphBlocks, mapGraphNodes, postorderDfs, mapGraphNodes1,
 
-        analFwd, analBwd, analRewFwd, analRewBwd,
-        dataflowPassFwd, dataflowPassBwd, dataflowAnalFwd, dataflowAnalBwd,
-        dataflowAnalFwdBlocks,
-
         -- * Ticks
         blockTicks
   ) where
@@ -69,15 +65,13 @@ module CmmUtils(
 #include "HsVersions.h"
 
 import TyCon    ( PrimRep(..), PrimElemRep(..) )
-import Type     ( UnaryType, typePrimRep )
+import RepType  ( UnaryType, SlotTy (..), typePrimRep1 )
 
 import SMRep
 import Cmm
 import BlockId
 import CLabel
 import Outputable
-import Unique
-import UniqSupply
 import DynFlags
 import Util
 import CodeGen.Platform
@@ -95,7 +89,8 @@ import Hoopl
 
 primRepCmmType :: DynFlags -> PrimRep -> CmmType
 primRepCmmType _      VoidRep          = panic "primRepCmmType:VoidRep"
-primRepCmmType dflags PtrRep           = gcWord dflags
+primRepCmmType dflags LiftedRep        = gcWord dflags
+primRepCmmType dflags UnliftedRep      = gcWord dflags
 primRepCmmType dflags IntRep           = bWord dflags
 primRepCmmType dflags WordRep          = bWord dflags
 primRepCmmType _      Int64Rep         = b64
@@ -104,6 +99,13 @@ primRepCmmType dflags AddrRep          = bWord dflags
 primRepCmmType _      FloatRep         = f32
 primRepCmmType _      DoubleRep        = f64
 primRepCmmType _      (VecRep len rep) = vec len (primElemRepCmmType rep)
+
+slotCmmType :: DynFlags -> SlotTy -> CmmType
+slotCmmType dflags PtrSlot    = gcWord dflags
+slotCmmType dflags WordSlot   = bWord dflags
+slotCmmType _      Word64Slot = b64
+slotCmmType _      FloatSlot  = f32
+slotCmmType _      DoubleSlot = f64
 
 primElemRepCmmType :: PrimElemRep -> CmmType
 primElemRepCmmType Int8ElemRep   = b8
@@ -118,11 +120,12 @@ primElemRepCmmType FloatElemRep  = f32
 primElemRepCmmType DoubleElemRep = f64
 
 typeCmmType :: DynFlags -> UnaryType -> CmmType
-typeCmmType dflags ty = primRepCmmType dflags (typePrimRep ty)
+typeCmmType dflags ty = primRepCmmType dflags (typePrimRep1 ty)
 
 primRepForeignHint :: PrimRep -> ForeignHint
 primRepForeignHint VoidRep      = panic "primRepForeignHint:VoidRep"
-primRepForeignHint PtrRep       = AddrHint
+primRepForeignHint LiftedRep    = AddrHint
+primRepForeignHint UnliftedRep  = AddrHint
 primRepForeignHint IntRep       = SignedHint
 primRepForeignHint WordRep      = NoHint
 primRepForeignHint Int64Rep     = SignedHint
@@ -132,8 +135,15 @@ primRepForeignHint FloatRep     = NoHint
 primRepForeignHint DoubleRep    = NoHint
 primRepForeignHint (VecRep {})  = NoHint
 
+slotForeignHint :: SlotTy -> ForeignHint
+slotForeignHint PtrSlot       = AddrHint
+slotForeignHint WordSlot      = NoHint
+slotForeignHint Word64Slot    = NoHint
+slotForeignHint FloatSlot     = NoHint
+slotForeignHint DoubleSlot    = NoHint
+
 typeForeignHint :: UnaryType -> ForeignHint
-typeForeignHint = primRepForeignHint . typePrimRep
+typeForeignHint = primRepForeignHint . typePrimRep1
 
 ---------------------------------------------------
 --
@@ -158,14 +168,17 @@ zeroExpr dflags = CmmLit (zeroCLit dflags)
 mkWordCLit :: DynFlags -> Integer -> CmmLit
 mkWordCLit dflags wd = CmmInt wd (wordWidth dflags)
 
-mkByteStringCLit :: Unique -> [Word8] -> (CmmLit, GenCmmDecl CmmStatics info stmt)
+mkByteStringCLit
+  :: CLabel -> [Word8] -> (CmmLit, GenCmmDecl CmmStatics info stmt)
 -- We have to make a top-level decl for the string,
 -- and return a literal pointing to it
-mkByteStringCLit uniq bytes
-  = (CmmLabel lbl, CmmData sec $ Statics lbl [CmmString bytes])
+mkByteStringCLit lbl bytes
+  = (CmmLabel lbl, CmmData (Section sec lbl) $ Statics lbl [CmmString bytes])
   where
-    lbl = mkStringLitLabel uniq
-    sec = Section ReadOnlyData lbl
+    -- This can not happen for String literals (as there \NUL is replaced by
+    -- C0 80). However, it can happen with Addr# literals.
+    sec = if 0 `elem` bytes then ReadOnlyData else CString
+
 mkDataLits :: Section -> CLabel -> [CmmLit] -> GenCmmDecl CmmStatics info stmt
 -- Build a data-segment data block
 mkDataLits section lbl lits
@@ -464,13 +477,13 @@ mkLiveness dflags (reg:regs)
 modifyGraph :: (Graph n C C -> Graph n' C C) -> GenCmmGraph n -> GenCmmGraph n'
 modifyGraph f g = CmmGraph {g_entry=g_entry g, g_graph=f (g_graph g)}
 
-toBlockMap :: CmmGraph -> BlockEnv CmmBlock
+toBlockMap :: CmmGraph -> LabelMap CmmBlock
 toBlockMap (CmmGraph {g_graph=GMany NothingO body NothingO}) = body
 
-ofBlockMap :: BlockId -> BlockEnv CmmBlock -> CmmGraph
+ofBlockMap :: BlockId -> LabelMap CmmBlock -> CmmGraph
 ofBlockMap entry bodyMap = CmmGraph {g_entry=entry, g_graph=GMany NothingO bodyMap NothingO}
 
-insertBlock :: CmmBlock -> BlockEnv CmmBlock -> BlockEnv CmmBlock
+insertBlock :: CmmBlock -> LabelMap CmmBlock -> LabelMap CmmBlock
 insertBlock block map =
   ASSERT(isNothing $ mapLookup id map)
   mapInsert id block map
@@ -543,69 +556,6 @@ foldGraphBlocks k z g = mapFold k z $ toBlockMap g
 
 postorderDfs :: CmmGraph -> [CmmBlock]
 postorderDfs g = {-# SCC "postorderDfs" #-} postorder_dfs_from (toBlockMap g) (g_entry g)
-
--------------------------------------------------
--- Running dataflow analysis and/or rewrites
-
--- Constructing forward and backward analysis-only pass
-analFwd    :: DataflowLattice f -> FwdTransfer n f -> FwdPass UniqSM n f
-analBwd    :: DataflowLattice f -> BwdTransfer n f -> BwdPass UniqSM n f
-
-analFwd lat xfer = analRewFwd lat xfer noFwdRewrite
-analBwd lat xfer = analRewBwd lat xfer noBwdRewrite
-
--- Constructing forward and backward analysis + rewrite pass
-analRewFwd :: DataflowLattice f -> FwdTransfer n f
-           -> FwdRewrite UniqSM n f
-           -> FwdPass UniqSM n f
-
-analRewBwd :: DataflowLattice f
-           -> BwdTransfer n f
-           -> BwdRewrite UniqSM n f
-           -> BwdPass UniqSM n f
-
-analRewFwd lat xfer rew = FwdPass {fp_lattice = lat, fp_transfer = xfer, fp_rewrite = rew}
-analRewBwd lat xfer rew = BwdPass {bp_lattice = lat, bp_transfer = xfer, bp_rewrite = rew}
-
--- Running forward and backward dataflow analysis + optional rewrite
-dataflowPassFwd :: NonLocal n =>
-                   GenCmmGraph n -> [(BlockId, f)]
-                -> FwdPass UniqSM n f
-                -> UniqSM (GenCmmGraph n, BlockEnv f)
-dataflowPassFwd (CmmGraph {g_entry=entry, g_graph=graph}) facts fwd = do
-  (graph, facts, NothingO) <- analyzeAndRewriteFwd fwd (JustC [entry]) graph (mkFactBase (fp_lattice fwd) facts)
-  return (CmmGraph {g_entry=entry, g_graph=graph}, facts)
-
-dataflowAnalFwd :: NonLocal n =>
-                   GenCmmGraph n -> [(BlockId, f)]
-                -> FwdPass UniqSM n f
-                -> BlockEnv f
-dataflowAnalFwd (CmmGraph {g_entry=entry, g_graph=graph}) facts fwd =
-  analyzeFwd fwd (JustC [entry]) graph (mkFactBase (fp_lattice fwd) facts)
-
-dataflowAnalFwdBlocks :: NonLocal n =>
-                   GenCmmGraph n -> [(BlockId, f)]
-                -> FwdPass UniqSM n f
-                -> UniqSM (BlockEnv f)
-dataflowAnalFwdBlocks (CmmGraph {g_entry=entry, g_graph=graph}) facts fwd = do
---  (graph, facts, NothingO) <- analyzeAndRewriteFwd fwd (JustC [entry]) graph (mkFactBase (fp_lattice fwd) facts)
---  return facts
-  return (analyzeFwdBlocks fwd (JustC [entry]) graph (mkFactBase (fp_lattice fwd) facts))
-
-dataflowAnalBwd :: NonLocal n =>
-                   GenCmmGraph n -> [(BlockId, f)]
-                -> BwdPass UniqSM n f
-                -> BlockEnv f
-dataflowAnalBwd (CmmGraph {g_entry=entry, g_graph=graph}) facts bwd =
-  analyzeBwd bwd (JustC [entry]) graph (mkFactBase (bp_lattice bwd) facts)
-
-dataflowPassBwd :: NonLocal n =>
-                   GenCmmGraph n -> [(BlockId, f)]
-                -> BwdPass UniqSM n f
-                -> UniqSM (GenCmmGraph n, BlockEnv f)
-dataflowPassBwd (CmmGraph {g_entry=entry, g_graph=graph}) facts bwd = do
-  (graph, facts, NothingO) <- analyzeAndRewriteBwd bwd (JustC [entry]) graph (mkFactBase (bp_lattice bwd) facts)
-  return (CmmGraph {g_entry=entry, g_graph=graph}, facts)
 
 -------------------------------------------------
 -- Tick utilities

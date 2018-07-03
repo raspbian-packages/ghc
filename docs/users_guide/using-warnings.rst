@@ -17,6 +17,7 @@ generally likely to indicate bugs in your program. These are:
 
     * :ghc-flag:`-Woverlapping-patterns`
     * :ghc-flag:`-Wwarnings-deprecations`
+    * :ghc-flag:`-Wdeprecations`
     * :ghc-flag:`-Wdeprecated-flags`
     * :ghc-flag:`-Wunrecognised-pragmas`
     * :ghc-flag:`-Wduplicate-constraints`
@@ -49,6 +50,7 @@ The following flags are simple ways to select standard "packages" of warnings:
         * :ghc-flag:`-Wincomplete-patterns`
         * :ghc-flag:`-Wdodgy-exports`
         * :ghc-flag:`-Wdodgy-imports`
+        * :ghc-flag:`-Wunbanged-strict-patterns`
 
 .. ghc-flag:: -Wall
 
@@ -65,7 +67,9 @@ The following flags are simple ways to select standard "packages" of warnings:
         * :ghc-flag:`-Wmissing-local-signatures`
         * :ghc-flag:`-Wmissing-exported-signatures`
         * :ghc-flag:`-Wmissing-import-lists`
+        * :ghc-flag:`-Wmissing-home-modules`
         * :ghc-flag:`-Widentities`
+        * :ghc-flag:`-Wredundant-constraints`
 
 .. ghc-flag:: -Wcompat
 
@@ -92,15 +96,34 @@ The following flags are simple ways to select standard "packages" of warnings:
     Turns off all warnings, including the standard ones and those that
     :ghc-flag:`-Wall` doesn't enable.
 
+These options control which warnings are considered fatal and cause compilation
+to abort.
+
 .. ghc-flag:: -Werror
 
     Makes any warning into a fatal error. Useful so that you don't miss
     warnings when doing batch compilation.
 
+.. ghc-flag:: -Werror=⟨wflag⟩
+    :noindex:
+
+    :implies: ``-W<wflag>``
+
+    Makes a specific warning into a fatal error. The warning will be enabled if
+    it hasn't been enabled yet.
+
 .. ghc-flag:: -Wwarn
 
     Warnings are treated only as warnings, not as errors. This is the
     default, but can be useful to negate a :ghc-flag:`-Werror` flag.
+
+.. ghc-flag:: -Wwarn=⟨wflag⟩
+    :noindex:
+
+    Causes a specific warning to be treated as normal warning, not fatal error.
+
+    Note that it doesn't fully negate the effects of ``-Werror=<wflag>`` - the
+    warning will still be enabled.
 
 When a warning is emitted, the specific warning flag which controls
 it is shown.
@@ -163,13 +186,17 @@ of ``-W(no-)*``.
 
 .. ghc-flag:: -fdefer-out-of-scope-variables
 
-    Defer variable out of scope errors (errors about names without a leading underscore)
+    Defer variable out-of-scope errors (errors about names without a leading underscore)
     until runtime. This will turn variable-out-of-scope errors into warnings.
     Using a value that depends on a typed hole produces a runtime error,
     the same as :ghc-flag:`-fdefer-type-errors` (which implies this option).
     See :ref:`typed-holes` and :ref:`defer-type-errors`.
 
     Implied by :ghc-flag:`-fdefer-type-errors`. See also :ghc-flag:`-Wdeferred-out-of-scope-variables`.
+
+.. ghc-flag:: -Wdeferred-out-of-scope-variables
+
+    Warn when a deferred out-of-scope variable is encountered.
 
 .. ghc-flag:: -Wpartial-type-signatures
 
@@ -201,12 +228,12 @@ of ``-W(no-)*``.
               -Wall-missed-specialisations
 
     Emits a warning if GHC cannot specialise an overloaded function, usually
-    because the function needs an ``INLINEABLE`` pragma. The "all" form reports
+    because the function needs an ``INLINABLE`` pragma. The "all" form reports
     all such situations whereas the "non-all" form only reports when the
     situation arises during specialisation of an imported function.
 
     The "non-all" form is intended to catch cases where an imported function
-    that is marked as ``INLINEABLE`` (presumably to enable specialisation) cannot
+    that is marked as ``INLINABLE`` (presumably to enable specialisation) cannot
     be specialised as it calls other functions that are themselves not specialised.
 
     Note that these warnings will not throw errors if used with :ghc-flag:`-Werror`.
@@ -221,6 +248,18 @@ of ``-W(no-)*``.
     Causes a warning to be emitted when a module, function or type with
     a ``WARNING`` or ``DEPRECATED pragma`` is used. See
     :ref:`warning-deprecated-pragma` for more details on the pragmas.
+
+    This option is on by default.
+
+.. ghc-flag:: -Wdeprecations
+
+    .. index::
+       single: deprecations
+
+    Causes a warning to be emitted when a module, function or type with
+    a ``WARNING`` or ``DEPRECATED pragma`` is used. See
+    :ref:`warning-deprecated-pragma` for more details on the pragmas.
+    An alias for :ghc-flag:`-Wwarnings-deprecations`.
 
     This option is on by default.
 
@@ -437,7 +476,7 @@ of ``-W(no-)*``.
     declaration.
 
     This option is on by default. As usual you can suppress it on a
-    per-module basis with :ghc-flag:`-Wno-redundant-constraints`.
+    per-module basis with :ghc-flag:`-Wno-redundant-constraints <-Wredundant-constraints>`.
     Occasionally you may specifically want a function to have a more
     constrained signature than necessary, perhaps to leave yourself
     wiggle-room for changing the implementation without changing the
@@ -527,7 +566,7 @@ of ``-W(no-)*``.
         h = \[] -> 2
         Just k = f y
 
-.. ghc-flag:: -fmax-pmcheck-iterations=<N>
+.. ghc-flag:: -fmax-pmcheck-iterations=⟨n⟩
 
     :default: 2000000
 
@@ -736,6 +775,29 @@ of ``-W(no-)*``.
     second pattern overlaps it. More often than not, redundant patterns
     is a programmer mistake/error, so this option is enabled by default.
 
+.. ghc-flag:: -Wsimplifiable-class-constraints
+
+    :since: 8.2
+
+    .. index::
+       single: simplifiable class constraints, warning
+
+    Warn about class constraints in a type signature that can be simplified
+    using a top-level instance declaration.  For example: ::
+
+       f :: Eq [a] => a -> a
+
+    Here the ``Eq [a]`` in the signature overlaps with the top-level
+    instance for ``Eq [a]``.  GHC goes to some efforts to use the former,
+    but if it should use the latter, it would then have an
+    insoluble ``Eq a`` constraint.  Best avoided by instead writing: ::
+
+       f :: Eq a => a -> a
+
+    This option is on by default. As usual you can suppress it on a
+    per-module basis with :ghc-flag:`-Wno-simplifiable-class-constraints
+    <-Wsimplifiable-class-constraints>`.
+
 .. ghc-flag:: -Wtabs
 
     .. index::
@@ -794,7 +856,7 @@ of ``-W(no-)*``.
     Will raise two warnings because ``Zero`` and ``Succ`` are not
     written as ``'Zero`` and ``'Succ``.
 
-    This warning is is enabled by default in :ghc-flag:`-Wall` mode.
+    This warning is enabled by default in :ghc-flag:`-Wall` mode.
 
 .. ghc-flag:: -Wunused-binds
 
@@ -937,7 +999,7 @@ of ``-W(no-)*``.
 
         type instance F _x _y = []
 
-    Unlike :ghc-flag:`-Wunused-matches`, :ghc-flag:`-Wunused-type-variables` is
+    Unlike :ghc-flag:`-Wunused-matches`, :ghc-flag:`-Wunused-type-patterns` is
     not implied by :ghc-flag:`-Wall`. The rationale for this decision is that
     unlike term-level pattern names, type names are often chosen expressly for
     documentation purposes, so using underscores in type names can make the
@@ -984,6 +1046,28 @@ of ``-W(no-)*``.
     Warn if a rewrite RULE might fail to fire because the function might
     be inlined before the rule has a chance to fire. See
     :ref:`rules-inline`.
+
+.. ghc-flag:: -Wcpp-undef
+
+    This flag passes ``-Wundef`` to the C pre-processor (if its being used)
+    which causes the pre-processor to warn on uses of the `#if` directive on
+    undefined identifiers.
+
+.. ghc-flag:: -Wunbanged-strict-patterns
+
+    This flag warns whenever you write a pattern that binds a variable whose
+    type is unlifted, and yet the pattern is not a bang pattern nor a bare variable.
+    See :ref:`glasgow-unboxed` for information about unlifted types.
+
+.. ghc-flag:: -Wmissing-home-modules
+
+    :since: 8.2
+
+    When a module provided by the package currently being compiled
+    (i.e. the "home" package) is imported, but not explicitly listed in
+    command line as a target. Useful for Cabal to ensure GHC won't
+    pick up modules, not listed neither in ``exposed-modules``, nor in
+    ``other-modules``.
 
 If you're feeling really paranoid, the :ghc-flag:`-dcore-lint` option is a good choice.
 It turns on heavyweight intra-pass sanity-checking within GHC. (It checks GHC's

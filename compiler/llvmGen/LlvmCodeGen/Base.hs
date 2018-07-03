@@ -44,9 +44,8 @@ import CLabel
 import CodeGen.Platform ( activeStgRegs )
 import DynFlags
 import FastString
-import Cmm
+import Cmm              hiding ( succ )
 import Outputable as Outp
-import qualified Pretty as Prt
 import Platform
 import UniqFM
 import Unique
@@ -57,9 +56,6 @@ import ErrUtils
 import qualified Stream
 
 import Control.Monad (ap)
-#if __GLASGOW_HASKELL__ < 709
-import Control.Applicative (Applicative(..))
-#endif
 
 -- ----------------------------------------------------------------------------
 -- * Some Data Types
@@ -196,8 +192,8 @@ data LlvmEnv = LlvmEnv
   , envDynFlags :: DynFlags        -- ^ Dynamic flags
   , envOutput :: BufHandle         -- ^ Output buffer
   , envUniq :: UniqSupply          -- ^ Supply of unique values
-  , envFreshMeta :: Int            -- ^ Supply of fresh metadata IDs
-  , envUniqMeta :: UniqFM Int      -- ^ Global metadata nodes
+  , envFreshMeta :: MetaId         -- ^ Supply of fresh metadata IDs
+  , envUniqMeta :: UniqFM MetaId   -- ^ Global metadata nodes
   , envFunMap :: LlvmEnvMap        -- ^ Global functions so far, with type
   , envAliases :: UniqSet LMString -- ^ Globals that we had to alias, see [Llvm Forward References]
   , envUsedVars :: [LlvmVar]       -- ^ Pointers to be added to llvm.used (see @cmmUsedLlvmGens@)
@@ -221,7 +217,6 @@ instance Applicative LlvmM where
     (<*>) = ap
 
 instance Monad LlvmM where
-    return = pure
     m >>= f  = LlvmM $ \env -> do (x, env') <- runLlvmM m env
                                   runLlvmM (f x) env'
 
@@ -260,7 +255,7 @@ runLlvm dflags ver out us m = do
                       , envDynFlags = dflags
                       , envOutput = out
                       , envUniq = us
-                      , envFreshMeta = 0
+                      , envFreshMeta = MetaId 0
                       , envUniqMeta = emptyUFM
                       }
 
@@ -305,8 +300,9 @@ checkStackReg :: GlobalReg -> LlvmM Bool
 checkStackReg r = getEnv ((elem r) . envStackRegs)
 
 -- | Allocate a new global unnamed metadata identifier
-getMetaUniqueId :: LlvmM Int
-getMetaUniqueId = LlvmM $ \env -> return (envFreshMeta env, env { envFreshMeta = envFreshMeta env + 1})
+getMetaUniqueId :: LlvmM MetaId
+getMetaUniqueId = LlvmM $ \env ->
+    return (envFreshMeta env, env { envFreshMeta = succ $ envFreshMeta env })
 
 -- | Get the LLVM version we are generating code for
 getLlvmVer :: LlvmM LlvmVersion
@@ -333,8 +329,8 @@ renderLlvm sdoc = do
     -- Write to output
     dflags <- getDynFlags
     out <- getEnv envOutput
-    let doc = Outp.withPprStyleDoc dflags (Outp.mkCodeStyle Outp.CStyle) sdoc
-    liftIO $ Prt.bufLeftRender out doc
+    liftIO $ Outp.bufLeftRenderSDoc dflags out
+               (Outp.mkCodeStyle Outp.CStyle) sdoc
 
     -- Dump, if requested
     dumpIfSetLlvm Opt_D_dump_llvm "LLVM Code" sdoc
@@ -354,10 +350,11 @@ saveAlias :: LMString -> LlvmM ()
 saveAlias lbl = modifyEnv $ \env -> env { envAliases = addOneToUniqSet (envAliases env) lbl }
 
 -- | Sets metadata node for a given unique
-setUniqMeta :: Unique -> Int -> LlvmM ()
+setUniqMeta :: Unique -> MetaId -> LlvmM ()
 setUniqMeta f m = modifyEnv $ \env -> env { envUniqMeta = addToUFM (envUniqMeta env) f m }
+
 -- | Gets metadata node for given unique
-getUniqMeta :: Unique -> LlvmM (Maybe Int)
+getUniqMeta :: Unique -> LlvmM (Maybe MetaId)
 getUniqMeta s = getEnv (flip lookupUFM s . envUniqMeta)
 
 -- ----------------------------------------------------------------------------
@@ -403,7 +400,7 @@ strDisplayName_llvm lbl = do
     dflags <- getDynFlags
     let sdoc = pprCLabel platform lbl
         depth = Outp.PartWay 1
-        style = Outp.mkUserStyle Outp.reallyAlwaysQualify depth
+        style = Outp.mkUserStyle dflags Outp.reallyAlwaysQualify depth
         str = Outp.renderWithStyle dflags sdoc style
     return (fsLit (dropInfoSuffix str))
 
@@ -421,7 +418,7 @@ strProcedureName_llvm lbl = do
     dflags <- getDynFlags
     let sdoc = pprCLabel platform lbl
         depth = Outp.PartWay 1
-        style = Outp.mkUserStyle Outp.neverQualify depth
+        style = Outp.mkUserStyle dflags Outp.neverQualify depth
         str = Outp.renderWithStyle dflags sdoc style
     return (fsLit str)
 
@@ -450,7 +447,10 @@ getGlobalPtr llvmLbl = do
 -- will be generated anymore!
 generateExternDecls :: LlvmM ([LMGlobal], [LlvmType])
 generateExternDecls = do
-  delayed <- fmap uniqSetToList $ getEnv envAliases
+  delayed <- fmap nonDetEltsUniqSet $ getEnv envAliases
+  -- This is non-deterministic but we do not
+  -- currently support deterministic code-generation.
+  -- See Note [Unique Determinism and code generation]
   defss <- flip mapM delayed $ \lbl -> do
     m_ty <- funLookup lbl
     case m_ty of

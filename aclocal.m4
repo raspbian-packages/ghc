@@ -14,7 +14,8 @@ AC_DEFUN([GHC_SELECT_FILE_EXTENSIONS],
         AC_MSG_WARN([I'm assuming you wanted to build for i386-unknown-mingw32])
         exit 1
         ;;
-    *-unknown-mingw32)
+    # examples: i386-unknown-mingw32, i686-w64-mingw32, x86_64-w64-mingw32
+    *-mingw32)
         windows=YES
         $2='.exe'
         $3='.dll'
@@ -25,7 +26,7 @@ AC_DEFUN([GHC_SELECT_FILE_EXTENSIONS],
     x86_64-apple-darwin)
         $3='.dylib'
         ;;
-    arm-apple-darwin10|i386-apple-darwin11|aarch64-apple-darwin14)
+    arm-apple-darwin10|i386-apple-darwin11|aarch64-apple-darwin14|x86_64-apple-darwin14)
         $2='.a'
         $3='.dylib'
         ;;
@@ -227,11 +228,10 @@ AC_DEFUN([FPTOOLS_SET_HASKELL_PLATFORM_VARS],
 
     checkVendor() {
         case [$]1 in
-        dec|unknown|hp|apple|next|sun|sgi|ibm|montavista|portbld)
+        dec|none|unknown|hp|apple|next|sun|sgi|ibm|montavista|portbld)
             ;;
         *)
-            echo "Unknown vendor [$]1"
-            exit 1
+            AC_MSG_WARN([Unknown vendor [$]1])
             ;;
         esac
     }
@@ -271,13 +271,10 @@ AC_DEFUN([FPTOOLS_SET_HASKELL_PLATFORM_VARS],
         haiku)
             test -z "[$]2" || eval "[$]2=OSHaiku"
             ;;
-        osf3)
-            test -z "[$]2" || eval "[$]2=OSOsf3"
-            ;;
         nto-qnx)
             test -z "[$]2" || eval "[$]2=OSQNXNTO"
             ;;
-        dragonfly|osf1|hpux|linuxaout|freebsd2|nextstep2|nextstep3|sunos4|ultrix|irix)
+        dragonfly|hpux|linuxaout|freebsd2|nextstep2|nextstep3|sunos4|ultrix)
             test -z "[$]2" || eval "[$]2=OSUnknown"
             ;;
         aix)
@@ -477,7 +474,7 @@ AC_DEFUN([FP_SETTINGS],
         SettingsWindresCommand="\$topdir/../${mingw_bin_prefix}windres.exe"
         SettingsTouchCommand='$topdir/bin/touchy.exe'
     else
-        SettingsCCompilerCommand="$WhatGccIsCalled"
+        SettingsCCompilerCommand="$CC"
         SettingsHaskellCPPCommand="$HaskellCPPCmd"
         SettingsHaskellCPPFlags="$HaskellCPPArgs"
         SettingsLdCommand="$LdCmd"
@@ -522,6 +519,48 @@ AC_DEFUN([FP_SETTINGS],
     AC_SUBST(SettingsOptCommand)
 ])
 
+# Helper for cloning a shell variable's state
+AC_DEFUN([FP_COPY_SHELLVAR],
+[if test -n "${$1+set}"; then $2="$$1"; else unset $2; fi ])
+
+# FP_SET_CFLAGS_C99
+# ----------------------------------
+# figure out which CFLAGS are needed to place the compiler into C99 mode
+# $1 is name of CC variable (unmodified)
+# $2 is name of CC flags variable (augmented if needed)
+# $3 is name of CPP flags variable (augmented if needed)
+AC_DEFUN([FP_SET_CFLAGS_C99],
+[
+    dnl save current state of AC_PROG_CC_C99
+    FP_COPY_SHELLVAR([CC],[fp_save_CC])
+    FP_COPY_SHELLVAR([CFLAGS],[fp_save_CFLAGS])
+    FP_COPY_SHELLVAR([CPPFLAGS],[fp_save_CPPFLAGS])
+    FP_COPY_SHELLVAR([ac_cv_prog_cc_c99],[fp_save_cc_c99])
+    dnl set local state
+    CC="$$1"
+    CFLAGS="$$2"
+    CPPFLAGS="$$3"
+    unset ac_cv_prog_cc_c99
+    dnl perform detection
+    _AC_PROG_CC_C99
+    fp_cc_c99="$ac_cv_prog_cc_c99"
+    case "x$ac_cv_prog_cc_c99" in
+      x)   ;; # noop
+      xno) AC_MSG_ERROR([C99-compatible compiler needed]) ;;
+      *)   $2="$$2 $ac_cv_prog_cc_c99"
+           $3="$$3 $ac_cv_prog_cc_c99"
+           ;;
+    esac
+    dnl restore saved state
+    FP_COPY_SHELLVAR([fp_save_CC],[CC])
+    FP_COPY_SHELLVAR([fp_save_CFLAGS],[CFLAGS])
+    FP_COPY_SHELLVAR([fp_save_CPPFLAGS],[CPPFLAGS])
+    FP_COPY_SHELLVAR([fp_save_cc_c99],[ac_cv_prog_cc_c99])
+    dnl cleanup
+    unset fp_save_CC
+    unset fp_save_CFLAGS
+    unset fp_save_cc_c99
+])
 
 # FPTOOLS_SET_C_LD_FLAGS
 # ----------------------------------
@@ -586,15 +625,12 @@ AC_DEFUN([FPTOOLS_SET_C_LD_FLAGS],
         # instructions (ie not Thumb) and to link using the gold linker.
         # Forcing LD to be ld.gold is done in FIND_LD m4 macro.
         $2="$$2 -marm"
-        $3="$$3 -fuse-ld=gold -Wl,-z,noexecstack"
+        $3="$$3 -Wl,-z,noexecstack"
         $4="$$4 -z noexecstack"
         ;;
 
     aarch64*linux*)
-        # On aarch64/linux and aarch64/android, tell gcc to link using the
-        # gold linker.
-        # Forcing LD to be ld.gold is done in FIND_LD m4 macro.
-        $3="$$3 -fuse-ld=gold -Wl,-z,noexecstack"
+        $3="$$3 -Wl,-z,noexecstack"
         $4="$$4 -z noexecstack"
         ;;
 
@@ -804,6 +840,16 @@ m4_popdef([fp_Cache])[]dnl
 ])# FP_CHECK_ALIGNMENT
 
 
+
+# FP_CHECK_SIZEOF_AND_ALIGNMENT(TYPE)
+# ------------------------------------------------------------------
+# Combines AC_CHECK_SIZEOF and FP_CHECK_ALIGNMENT.
+AC_DEFUN([FP_CHECK_SIZEOF_AND_ALIGNMENT],
+[AC_CHECK_SIZEOF([$1])
+FP_CHECK_ALIGNMENT([$1])
+])# FP_CHECK_SIZEOF_AND_ALIGNMENT
+
+
 # FP_LEADING_UNDERSCORE
 # ---------------------
 # Test for determining whether symbol names have a leading underscore. We assume
@@ -815,18 +861,19 @@ m4_popdef([fp_Cache])[]dnl
 # checking for *no* leading underscore first. Sigh.  --SDM
 #
 # Similarly on OpenBSD, but this test doesn't help. -- dons
+#
 AC_DEFUN([FP_LEADING_UNDERSCORE],
 [AC_CHECK_LIB([elf], [nlist], [LIBS="-lelf $LIBS"])
 AC_CACHE_CHECK([leading underscore in symbol names], [fptools_cv_leading_underscore], [
 # Hack!: nlist() under Digital UNIX insist on there being an _,
 # but symbol table listings shows none. What is going on here?!?
-case $HostPlatform in
+case $TargetPlatform in
+*linux-android*) fptools_cv_leading_underscore=no;;
 *openbsd*) # x86 openbsd is ELF from 3.4 >, meaning no leading uscore
   case $build in
     i386-*2\.@<:@0-9@:>@ | i386-*3\.@<:@0-3@:>@ ) fptools_cv_leading_underscore=yes ;;
     *) fptools_cv_leading_underscore=no ;;
   esac ;;
-alpha-dec-osf*) fptools_cv_leading_underscore=no;;
 i386-unknown-mingw32) fptools_cv_leading_underscore=yes;;
 x86_64-unknown-mingw32) fptools_cv_leading_underscore=no;;
 
@@ -998,15 +1045,14 @@ AC_SUBST([LdHasBuildId])
 # -----------------
 # Sets the output variable LdIsGNULd to YES or NO, depending on whether it is
 # GNU ld or not.
-AC_DEFUN([FP_PROG_LD_IS_GNU],
-[
+AC_DEFUN([FP_PROG_LD_IS_GNU],[
 AC_CACHE_CHECK([whether ld is GNU ld], [fp_cv_gnu_ld],
-[if ${LdCmd} --version 2> /dev/null | grep "GNU" > /dev/null 2>&1; then
-  fp_cv_gnu_ld=yes
+[[if ${LdCmd} --version 2> /dev/null | grep "GNU" > /dev/null 2>&1; then
+  fp_cv_gnu_ld=YES
 else
-  fp_cv_gnu_ld=no
-fi])
-AC_SUBST([LdIsGNULd], [`echo $fp_cv_gnu_ld | sed 'y/yesno/YESNO/'`])
+  fp_cv_gnu_ld=NO
+fi]])
+AC_SUBST([LdIsGNULd],["$fp_cv_gnu_ld"])
 ])# FP_PROG_LD_IS_GNU
 
 
@@ -1071,7 +1117,9 @@ AC_SUBST([LdHasFilelist])
 # ----------
 # Sets fp_prog_ar to a path to ar. Exits if no ar can be found
 AC_DEFUN([FP_PROG_AR],
-[AC_PATH_PROG([fp_prog_ar], [ar])
+[if test -z "$fp_prog_ar"; then
+  AC_PATH_PROG([fp_prog_ar], [ar])
+fi
 if test -z "$fp_prog_ar"; then
   AC_MSG_ERROR([cannot find ar in your PATH, no idea how to make a library])
 fi
@@ -1216,6 +1264,7 @@ then
   AC_MSG_ERROR([gcc is required])
 fi
 GccLT34=NO
+GccLT44=NO
 GccLT46=NO
 AC_CACHE_CHECK([version of gcc], [fp_cv_gcc_version],
 [
@@ -1226,10 +1275,12 @@ AC_CACHE_CHECK([version of gcc], [fp_cv_gcc_version],
     # isn't a very good reason for that, but for now just make configure
     # fail.
     FP_COMPARE_VERSIONS([$fp_cv_gcc_version], [-lt], [3.4], GccLT34=YES)
+    FP_COMPARE_VERSIONS([$fp_cv_gcc_version], [-lt], [4.4], GccLT44=YES)
     FP_COMPARE_VERSIONS([$fp_cv_gcc_version], [-lt], [4.6], GccLT46=YES)
 ])
 AC_SUBST([GccVersion], [$fp_cv_gcc_version])
 AC_SUBST(GccLT34)
+AC_SUBST(GccLT44)
 AC_SUBST(GccLT46)
 ])# FP_GCC_VERSION
 
@@ -1766,33 +1817,17 @@ AC_DEFUN([FP_CURSES],
 # Calculate absolute path to build tree
 # --------------------------------------------------------------
 
-AC_DEFUN([FP_INTREE_GHC_PWD],[
-AC_MSG_NOTICE(Building in-tree ghc-pwd)
-    dnl This would be
-    dnl     make -C utils/ghc-pwd clean && make -C utils/ghc-pwd
-    dnl except we don't want to have to know what make is called. Sigh.
-    rm -rf utils/ghc-pwd/dist-boot
-    mkdir  utils/ghc-pwd/dist-boot
-    dnl If special linker flags are needed to build things, then allow
-    dnl the user to pass them in via LDFLAGS.
-    changequote(, )dnl
-    GHC_LDFLAGS=`perl -e 'foreach (@ARGV) { print "-optl$_ " }' -- $LDFLAGS`
-    changequote([, ])dnl
-    if ! "$WithGhc" $GHC_LDFLAGS -v0 -no-user-$GHC_PACKAGE_DB_FLAG -hidir utils/ghc-pwd/dist-boot -odir utils/ghc-pwd/dist-boot -stubdir utils/ghc-pwd/dist-boot --make utils/ghc-pwd/Main.hs -o utils/ghc-pwd/dist-boot/ghc-pwd
-    then
-        AC_MSG_ERROR([Building ghc-pwd failed])
-    fi
-
-    GHC_PWD=utils/ghc-pwd/dist-boot/ghc-pwd
-])
-
-AC_DEFUN([FP_BINDIST_GHC_PWD],[
-    GHC_PWD=utils/ghc-pwd/dist-install/build/tmp/ghc-pwd-bindist
-])
-
 AC_DEFUN([FP_FIND_ROOT],[
 AC_MSG_CHECKING(for path to top of build tree)
-    hardtop=`$GHC_PWD`
+    if test "$windows" = YES
+    then
+      dnl Make sure this is a c:/foo/bar (mixed) style path. Some parts of
+      dnl the build system might depend on it (such as the sed expression
+      dnl `"s|$(TOP)/||i"` in addCFileDeps in rules/build-dependencies.mk).
+      hardtop=$(cygpath -m "$(pwd)")
+    else
+      hardtop=$(pwd)
+    fi
 
     dnl Remove common automounter nonsense
     hardtop=`echo $hardtop | sed 's|^/tmp_mnt.*\(/local/.*\)$|\1|' | sed 's|^/tmp_mnt/|/|'`
@@ -1920,7 +1955,7 @@ AC_DEFUN([GHC_CONVERT_VENDOR],[
 # converts os from gnu to ghc naming, and assigns the result to $target_var
 AC_DEFUN([GHC_CONVERT_OS],[
 case "$1-$2" in
-  darwin10-arm|darwin11-i386|darwin14-aarch64)
+  darwin10-arm|darwin11-i386|darwin14-aarch64|darwin14-x86_64)
     $3="ios"
     ;;
   *)
@@ -1932,7 +1967,7 @@ case "$1-$2" in
         $3="linux"
         ;;
       # As far as I'm aware, none of these have relevant variants
-      freebsd|netbsd|openbsd|dragonfly|osf1|osf3|hpux|linuxaout|kfreebsdgnu|freebsd2|solaris2|mingw32|darwin|gnu|nextstep2|nextstep3|sunos4|ultrix|irix|haiku)
+      freebsd|netbsd|openbsd|dragonfly|hpux|linuxaout|kfreebsdgnu|freebsd2|solaris2|mingw32|darwin|gnu|nextstep2|nextstep3|sunos4|ultrix|haiku)
         $3="$1"
         ;;
       aix*) # e.g. powerpc-ibm-aix7.1.3.0
@@ -2034,27 +2069,63 @@ AC_DEFUN([FIND_LLVM_PROG],[
     fi
 ])
 
-# FIND_LD
-# Find the version of `ld` to use. This is used in both in the top level
-# configure.ac and in distrib/configure.ac.in.
+# CHECK_LD_COPY_BUG()
+# -------------------
+# Check for binutils bug #16177 present in some versions of the bfd ld
+# implementation affecting ARM relocations.
+# https://sourceware.org/bugzilla/show_bug.cgi?id=16177
 #
-# $1 = the variable to set
+# $1 = the platform
 #
-AC_DEFUN([FIND_LD],[
-    FP_ARG_WITH_PATH_GNU_PROG([LD], [ld], [ld])
-    case $target in
-        arm*linux*       | \
-        aarch64*linux*   )
-            # Arm and Aarch64 requires use of the binutils ld.gold linker.
-            # This case should catch at least arm-unknown-linux-gnueabihf,
-            # arm-linux-androideabi, arm64-unknown-linux and
-            # aarch64-linux-android
-            FP_ARG_WITH_PATH_GNU_PROG([LD_GOLD], [ld.gold], [ld.gold])
-            $1="$LD_GOLD"
-            ;;
-        *)
-            $1="$LD"
-            ;;
+AC_DEFUN([CHECK_LD_COPY_BUG],[
+    case $1 in
+      arm*linux*)
+        AC_CHECK_TARGET_TOOL([READELF], [readelf])
+        AC_CHECK_TARGET_TOOL([AS], [as])
+        AC_MSG_CHECKING([for ld bug 16177])
+        cat >actest.s <<-EOF
+          .globl _start
+          .p2align 4
+        _start:
+          bkpt
+
+        .data
+          .globl data_object
+        object_reference:
+          .long data_object
+          .size object_reference, 4
+EOF
+
+        cat >aclib.s <<-EOF
+          .data
+          .globl data_object
+          .type data_object, %object
+          .size data_object, 4
+        data_object:
+            .long 123
+EOF
+
+        $AS -o aclib.o aclib.s
+        $LD -shared -o aclib.so aclib.o
+
+        $AS -o actest.o actest.s
+        $LD -o actest actest.o aclib.so
+
+        if $READELF -r actest | grep R_ARM_COPY > /dev/null; then
+            AC_MSG_RESULT([affected])
+            AC_MSG_ERROR(
+              [Your linker is affected by binutils #16177, which
+               critically breaks linkage of GHC objects. Please either upgrade
+               binutils or supply a different linker with the LD environment
+               variable.])
+        else
+            AC_MSG_RESULT([unaffected])
+        fi
+
+        rm -f aclib.s aclib.o aclib.so actest.s actest.o actest
+        ;;
+      *)
+        ;;
     esac
 ])
 
@@ -2077,38 +2148,6 @@ AC_DEFUN([FIND_GHC_BOOTSTRAP_PROG],[
 ])
 
 
-# FIND_GCC()
-# --------------------------------
-# Finds where gcc is
-#
-# $1 = the variable to set
-# $2 = the with option name
-# $3 = the command to look for
-AC_DEFUN([FIND_GCC],[
-    if test "$windows" = YES
-    then
-        $1="$CC"
-    else
-        FP_ARG_WITH_PATH_GNU_PROG_OPTIONAL([$1], [$2], [$3])
-        # fallback to CC if set and no --with-$2=... was used
-        if test -z "$With_$2" -a -n "$CC"
-        then
-            With_$2="$CC"
-            $1="$CC"
-        # From Xcode 5 on/, OS X command line tools do not include gcc
-        # anymore. Use clang.
-        elif test -z "$$1"
-        then
-            FP_ARG_WITH_PATH_GNU_PROG_OPTIONAL([$1], [clang], [clang])
-        fi
-        if test -z "$$1"
-        then
-            AC_MSG_ERROR([cannot find $3 nor clang in your PATH])
-        fi
-    fi
-    AC_SUBST($1)
-])
-
 AC_DEFUN([MAYBE_OVERRIDE_STAGE0],[
   if test ! -z "$With_$1" -a "$CrossCompiling" != "YES"; then
       AC_MSG_NOTICE([Not cross-compiling, so --with-$1 also sets $2])
@@ -2122,7 +2161,7 @@ AC_DEFUN([MAYBE_OVERRIDE_STAGE0],[
 # sets CPP command and its arguments
 #
 # $1 = the variable to set to CPP command
-# $2 = the varibale to set to CPP command arguments
+# $2 = the variable to set to CPP command arguments
 
 AC_DEFUN([FP_CPP_CMD_WITH_ARGS],[
 dnl ** what cpp to use?
@@ -2142,13 +2181,13 @@ AC_ARG_WITH(hs-cpp,
 
     # We can't use $CPP here, since HS_CPP_CMD is expected to be a single
     # command (no flags), and AC_PROG_CPP defines CPP as "/usr/bin/gcc -E".
-    HS_CPP_CMD=$WhatGccIsCalled
+    HS_CPP_CMD=$CC
 
     SOLARIS_GCC_CPP_BROKEN=NO
     SOLARIS_FOUND_GOOD_CPP=NO
     case $host in
         i386-*-solaris2)
-        GCC_MAJOR_MINOR=`$WhatGccIsCalled --version|grep "gcc (GCC)"|cut -d ' ' -f 3-3|cut -d '.' -f 1-2`
+        GCC_MAJOR_MINOR=`$CC --version|grep "gcc (GCC)"|cut -d ' ' -f 3-3|cut -d '.' -f 1-2`
         if test "$GCC_MAJOR_MINOR" != "3.4"; then
           # this is not 3.4.x release so with broken CPP
           SOLARIS_GCC_CPP_BROKEN=YES
@@ -2264,6 +2303,91 @@ AC_DEFUN([FP_BFD_SUPPORT], [
             LIBS="$save_LIBS"
         ]
     )
+])
+
+
+# FP_CC_LINKER_FLAG_TRY()
+# --------------------
+# Try a particular linker to see whether we can use it. In particular, determine
+# whether we can convince gcc to use it via a -fuse-ld=... flag.
+#
+# $1 = the name of the linker to try
+# $2 = the variable to set with the appropriate GHC flag if the linker is
+# found to be usable
+AC_DEFUN([FP_CC_LINKER_FLAG_TRY], [
+    AC_MSG_CHECKING([whether C compiler supports -fuse-ld=$1])
+    echo 'int main(void) {return 0;}' > conftest.c
+    if $CC -o conftest.o -fuse-ld=$1 conftest.c > /dev/null 2>&1
+    then
+        $2="-fuse-ld=$1"
+        AC_MSG_RESULT([yes])
+    else
+        AC_MSG_RESULT([no])
+    fi
+    rm -f conftest.c conftest.o
+])
+
+# FIND_LD
+# ---------
+# Find the version of `ld` to use and figure out how to get gcc to use it for
+# linking (if --enable-ld-override is enabled). This is used in both in the top
+# level configure.ac and in distrib/configure.ac.in.
+#
+# $1 = the platform
+# $2 = the variable to set with GHC options to configure gcc to use the chosen linker
+#
+AC_DEFUN([FIND_LD],[
+    AC_ARG_ENABLE(ld-override,
+      [AC_HELP_STRING([--disable-ld-override],
+        [Prevent GHC from overriding the default linker used by gcc. If ld-override is enabled GHC will try to tell gcc to use whichever linker is selected by the LD environment variable. [default=override enabled]])],
+      [],
+      [enable_ld_override=yes])
+
+    find_ld() {
+        # Make sure the user didn't specify LD manually.
+        if test "z$LD" != "z"; then
+            AC_CHECK_TARGET_TOOL([LD], [ld])
+            return
+        fi
+
+        # Manually iterate over possible names since we want to ensure that, e.g.,
+        # if ld.lld is installed but gcc doesn't support -fuse-ld=lld, that we
+        # then still try ld.gold and -fuse-ld=gold.
+        for possible_ld in ld.lld ld.gold ld; do
+            TmpLd="" # In case the user set LD
+            AC_CHECK_TARGET_TOOL([TmpLd], [$possible_ld])
+            if test "x$TmpLd" = "x"; then continue; fi
+
+            out=`$TmpLd --version`
+            case $out in
+              "GNU ld"*)   FP_CC_LINKER_FLAG_TRY(bfd, $2) ;;
+              "GNU gold"*) FP_CC_LINKER_FLAG_TRY(gold, $2) ;;
+              "LLD"*)      FP_CC_LINKER_FLAG_TRY(lld, $2) ;;
+              *) AC_MSG_NOTICE([unknown linker version $out]) ;;
+            esac
+            if test "z$$2" = "z"; then
+                AC_MSG_NOTICE([unable to convince '$CC' to use linker '$TmpLd'])
+                # a terrible hack to prevent autoconf from caching the previous
+                # AC_CHECK_TARGET_TOOL result since next time we'll be looking
+                # for another ld variant.
+                $as_unset ac_cv_prog_ac_ct_TmpLd
+            else
+                LD="$TmpLd"
+                return
+            fi
+        done
+
+        # Fallback
+        AC_CHECK_TARGET_TOOL([LD], [ld])
+    }
+
+    if test "x$enable_ld_override" = "xyes"; then
+        find_ld
+    else
+        AC_CHECK_TARGET_TOOL([LD], [ld])
+    fi
+
+    CHECK_LD_COPY_BUG([$1])
 ])
 
 # LocalWords:  fi

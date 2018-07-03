@@ -8,7 +8,7 @@
 -----------------------------------------------------------------------------
 -}
 
-{-# LANGUAGE CPP, ScopedTypeVariables #-}
+{-# LANGUAGE CPP, MultiWayIf, ScopedTypeVariables #-}
 
 module SysTools (
         -- Initialisation
@@ -31,7 +31,7 @@ module SysTools (
 
         linkDynLib,
 
-        askCc,
+        askLd,
 
         touch,                  -- String -> String -> IO ()
         copy,
@@ -44,6 +44,9 @@ module SysTools (
         addFilesToClean,
 
         Option(..),
+
+        -- platform-specifics
+        libmLinkOpts,
 
         -- frameworks
         getPkgFrameworkOpts,
@@ -80,20 +83,22 @@ import System.Directory
 import Data.Char
 import Data.List
 import qualified Data.Map as Map
+import qualified Data.Set as Set
 
 #ifndef mingw32_HOST_OS
 import qualified System.Posix.Internals
 #else /* Must be Win32 */
 import Foreign
 import Foreign.C.String
-import qualified System.Win32.Info as Info
-import Control.Exception (finally)
-import Foreign.Ptr (FunPtr, castPtrToFunPtr)
+#if MIN_VERSION_Win32(2,5,0)
+import qualified System.Win32.Types as Win32
+#else
+import qualified System.Win32.Info as Win32
+#endif
 import System.Win32.Types (DWORD, LPTSTR, HANDLE)
 import System.Win32.Types (failIfNull, failIf, iNVALID_HANDLE_VALUE)
 import System.Win32.File (createFile,closeHandle, gENERIC_READ, fILE_SHARE_READ, oPEN_EXISTING, fILE_ATTRIBUTE_NORMAL, fILE_FLAG_BACKUP_SEMANTICS )
 import System.Win32.DLL (loadLibrary, getProcAddress)
-import Data.Bits((.|.))
 #endif
 
 import System.Process
@@ -127,9 +132,9 @@ On Unix:
 On Windows:
   - ghc never has a shell wrapper.
   - we can find the location of the ghc binary, which is
-        $topdir/bin/<something>.exe
+        $topdir/<foo>/<something>.exe
     where <something> may be "ghc", "ghc-stage2", or similar
-  - we strip off the "bin/<something>.exe" to leave $topdir.
+  - we strip off the "<foo>/<something>.exe" to leave $topdir.
 
 from topdir we can find package.conf, ghc-asm, etc.
 
@@ -406,9 +411,8 @@ runCpp :: DynFlags -> [Option] -> IO ()
 runCpp dflags args =   do
   let (p,args0) = pgm_P dflags
       args1 = map Option (getOpts dflags opt_P)
-      args2 = if gopt Opt_WarnIsError dflags
-                 then [Option "-Werror"]
-                 else []
+      args2 = [Option "-Werror" | gopt Opt_WarnIsError dflags]
+                ++ [Option "-Wundef" | wopt Opt_WarnCPPUndef dflags]
   mb_env <- getGccEnv args2
   runSomethingFiltered dflags id  "C pre-processor" p
                        (args0 ++ args1 ++ args2 ++ args) mb_env
@@ -480,11 +484,12 @@ runCc dflags args =   do
 isContainedIn :: String -> String -> Bool
 xs `isContainedIn` ys = any (xs `isPrefixOf`) (tails ys)
 
-askCc :: DynFlags -> [Option] -> IO String
-askCc dflags args = do
-  let (p,args0) = pgm_c dflags
-      args1 = map Option (getOpts dflags opt_c)
-      args2 = args0 ++ args1 ++ args
+-- | Run the linker with some arguments and return the output
+askLd :: DynFlags -> [Option] -> IO String
+askLd dflags args = do
+  let (p,args0) = pgm_l dflags
+      args1     = map Option (getOpts dflags opt_l)
+      args2     = args0 ++ args1 ++ args
   mb_env <- getGccEnv args2
   runSomethingWith dflags "gcc" p args2 $ \real_args ->
     readCreateProcessWithExitCode' (proc p real_args){ env = mb_env }
@@ -512,51 +517,25 @@ readCreateProcessWithExitCode' proc = do
 
     return (ex, output)
 
+replaceVar :: (String, String) -> [(String, String)] -> [(String, String)]
+replaceVar (var, value) env =
+    (var, value) : filter (\(var',_) -> var /= var') env
+
+-- | Version of @System.Process.readProcessWithExitCode@ that takes a
+-- key-value tuple to insert into the environment.
 readProcessEnvWithExitCode
     :: String -- ^ program path
     -> [String] -- ^ program args
-    -> [(String, String)] -- ^ environment to override
+    -> (String, String) -- ^ addition to the environment
     -> IO (ExitCode, String, String) -- ^ (exit_code, stdout, stderr)
 readProcessEnvWithExitCode prog args env_update = do
     current_env <- getEnvironment
-    let new_env = env_update ++ [ (k, v)
-                                | let overriden_keys = map fst env_update
-                                , (k, v) <- current_env
-                                , k `notElem` overriden_keys
-                                ]
-        p       = proc prog args
-
-    (_stdin, Just stdoh, Just stdeh, pid) <-
-        createProcess p{ std_out = CreatePipe
-                       , std_err = CreatePipe
-                       , env     = Just new_env
-                       }
-
-    outMVar <- newEmptyMVar
-    errMVar <- newEmptyMVar
-
-    _ <- forkIO $ do
-        stdo <- hGetContents stdoh
-        _ <- evaluate (length stdo)
-        putMVar outMVar stdo
-
-    _ <- forkIO $ do
-        stde <- hGetContents stdeh
-        _ <- evaluate (length stde)
-        putMVar errMVar stde
-
-    out <- takeMVar outMVar
-    hClose stdoh
-    err <- takeMVar errMVar
-    hClose stdeh
-
-    ex <- waitForProcess pid
-
-    return (ex, out, err)
+    readCreateProcessWithExitCode (proc prog args) {
+        env = Just (replaceVar env_update current_env) } ""
 
 -- Don't let gcc localize version info string, #8825
-en_locale_env :: [(String, String)]
-en_locale_env = [("LANGUAGE", "en")]
+c_locale_env :: (String, String)
+c_locale_env = ("LANGUAGE", "C")
 
 -- If the -B<dir> option is set, add <dir> to PATH.  This works around
 -- a bug in gcc on Windows Vista where it can't find its auxiliary
@@ -673,7 +652,7 @@ figureLlvmVersion dflags = do
 
 {- Note [Windows stack usage]
 
-See: Trac #8870 (and #8834 for related info)
+See: Trac #8870 (and #8834 for related info) and #12186
 
 On Windows, occasionally we need to grow the stack. In order to do
 this, we would normally just bump the stack pointer - but there's a
@@ -694,17 +673,11 @@ stack space in GHC itself. In the x86 codegen, we needed approximately
 ~12kb of stack space in one go, which caused the process to segfault,
 as the intervening pages were not committed.
 
-In the future, we should do the same thing, to make the problem
-completely go away. In the mean time, we're using a workaround: we
-instruct the linker to specify the generated PE as having an initial
-reserved stack size of 8mb, as well as a initial *committed* stack
-size of 8mb. The default committed size was previously only 4k.
+GCC can emit such a check for us automatically but only when the flag
+-fstack-check is used.
 
-Theoretically it's possible to still hit this problem if you request a
-stack bump of more than 8mb in one go. But the amount of code
-necessary is quite large, and 8mb "should be more than enough for
-anyone" right now (he said, before millions of lines of code cried out
-in terror).
+See https://gcc.gnu.org/onlinedocs/gnat_ugn/Stack-Overflow-Checking.html
+for more information.
 
 -}
 
@@ -857,8 +830,9 @@ getLinkerInfo' dflags = do
                    [ -- Reduce ld memory usage
                      "-Wl,--hash-size=31"
                    , "-Wl,--reduce-memory-overheads"
-                     -- Increase default stack, see
+                     -- Emit gcc stack checks
                      -- Note [Windows stack usage]
+                   , "-fstack-check"
                      -- Force static linking of libGCC
                      -- Note [Windows static libGCC]
                    , "-static-libgcc" ]
@@ -867,7 +841,7 @@ getLinkerInfo' dflags = do
                  -- -Wl,--version to get linker version info.
                  (exitc, stdo, stde) <- readProcessEnvWithExitCode pgm
                                         (["-Wl,--version"] ++ args3)
-                                        en_locale_env
+                                        c_locale_env
                  -- Split the output by lines to make certain kinds
                  -- of processing easier. In particular, 'clang' and 'gcc'
                  -- have slightly different outputs for '-Wl,--version', but
@@ -923,7 +897,7 @@ getCompilerInfo' dflags = do
   -- Process the executable call
   info <- catchIO (do
                 (exitc, stdo, stde) <-
-                    readProcessEnvWithExitCode pgm ["-v"] en_locale_env
+                    readProcessEnvWithExitCode pgm ["-v"] c_locale_env
                 -- Split the output by lines to make certain kinds
                 -- of processing easier.
                 parseCompilerInfo (lines stdo) (lines stde) exitc
@@ -1097,9 +1071,11 @@ cleanTempFilesExcept dflags dont_delete
    $ mask_
    $ do let ref = filesToClean dflags
         to_delete <- atomicModifyIORef' ref $ \files ->
-            let (to_keep,to_delete) = partition (`elem` dont_delete) files
-            in  (to_keep,to_delete)
+            let res@(_to_keep, _to_delete) =
+                    partition (`Set.member` dont_delete_set) files
+            in  res
         removeTmpFiles dflags to_delete
+  where dont_delete_set = Set.fromList dont_delete
 
 
 -- Return a unique numeric temp file suffix
@@ -1273,7 +1249,11 @@ runSomethingResponseFile dflags filter_fn phase_name pgm args mb_env =
     getResponseFile args = do
       fp <- newTempName dflags "rsp"
       withFile fp WriteMode $ \h -> do
+#if defined(mingw32_HOST_OS)
+          hSetEncoding h latin1
+#else
           hSetEncoding h utf8
+#endif
           hPutStr h $ unlines $ map escape args
       return fp
 
@@ -1378,10 +1358,12 @@ builderMainLoop dflags filter_fn pgm real_args mb_env = do
               msg <- readChan chan
               case msg of
                 BuildMsg msg -> do
-                  log_action dflags dflags NoReason SevInfo noSrcSpan defaultUserStyle msg
+                  putLogMsg dflags NoReason SevInfo noSrcSpan
+                     (defaultUserStyle dflags) msg
                   loop chan hProcess t p exitcode
                 BuildError loc msg -> do
-                  log_action dflags dflags NoReason SevError (mkSrcSpan loc loc) defaultUserStyle msg
+                  putLogMsg dflags NoReason SevError (mkSrcSpan loc loc)
+                     (defaultUserStyle dflags) msg
                   loop chan hProcess t p exitcode
                 EOF ->
                   loop chan hProcess (t-1) p exitcode
@@ -1483,7 +1465,7 @@ traceCmd dflags phase_name cmd_line action
 
 getBaseDir :: IO (Maybe String)
 #if defined(mingw32_HOST_OS)
--- Assuming we are running ghc, accessed by path  $(stuff)/bin/ghc.exe,
+-- Assuming we are running ghc, accessed by path  $(stuff)/<foo>/ghc.exe,
 -- return the path $(stuff)/lib.
 getBaseDir = try_size 2048 -- plenty, PATH_MAX is 512 under Win32.
   where
@@ -1491,9 +1473,14 @@ getBaseDir = try_size 2048 -- plenty, PATH_MAX is 512 under Win32.
         ret <- c_GetModuleFileName nullPtr buf size
         case ret of
           0 -> return Nothing
-          _ | ret < size -> do path <- peekCWString buf
-                               real <- getFinalPath path -- try to resolve symlinks paths
-                               return $ (Just . rootDir . sanitize . maybe path id) real
+          _ | ret < size -> do
+                path <- peekCWString buf
+                real <- getFinalPath path -- try to resolve symlinks paths
+                let libdir = (rootDir . sanitize . maybe path id) real
+                exists <- doesDirectoryExist libdir
+                if exists
+                   then return $ Just libdir
+                   else fail path
             | otherwise  -> try_size (size * 2)
 
     -- getFinalPath returns paths in full raw form.
@@ -1512,11 +1499,11 @@ getBaseDir = try_size 2048 -- plenty, PATH_MAX is 512 under Win32.
                                          "ghc-stage3.exe"] ->
                     case splitFileName $ takeDirectory d of
                     -- ghc is in $topdir/bin/ghc.exe
-                    (d', bin) | lower bin == "bin" -> takeDirectory d' </> "lib"
-                    _ -> fail
-                _ -> fail
-        where fail = panic ("can't decompose ghc.exe path: " ++ show s)
-              lower = map toLower
+                    (d', _) -> takeDirectory d' </> "lib"
+                _ -> fail s
+
+    fail s = panic ("can't decompose ghc.exe path: " ++ show s)
+    lower = map toLower
 
 foreign import WINDOWS_CCONV unsafe "windows.h GetModuleFileNameW"
   c_GetModuleFileName :: Ptr () -> CWString -> Word32 -> IO Word32
@@ -1543,9 +1530,18 @@ getFinalPath name = do
                                                      (fILE_ATTRIBUTE_NORMAL .|. fILE_FLAG_BACKUP_SEMANTICS)
                                                      Nothing
                       let fnPtr = makeGetFinalPathNameByHandle $ castPtrToFunPtr addr
-                      path    <- Info.try "GetFinalPathName"
+                      -- First try to resolve the path to get the actual path
+                      -- of any symlinks or other file system redirections that
+                      -- may be in place. However this function can fail, and in
+                      -- the event it does fail, we need to try using the
+                      -- original path and see if we can decompose that.
+                      -- If the call fails Win32.try will raise an exception
+                      -- that needs to be caught. See #14159
+                      path    <- (Win32.try "GetFinalPathName"
                                     (\buf len -> fnPtr handle buf len 0) 512
-                                    `finally` closeHandle handle
+                                    `finally` closeHandle handle)
+                                `catch`
+                                 (\(_ :: IOException) -> return name)
                       return $ Just path
 
 type GetFinalPath = HANDLE -> LPTSTR -> DWORD -> DWORD -> IO DWORD
@@ -1588,16 +1584,7 @@ linesPlatform xs =
 
 #endif
 
-{-
-Note [No PIE eating while linking]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-As of 2016 some Linux distributions (e.g. Debian) have started enabling -pie by
-default in their gcc builds. This is incompatible with -r as it implies that we
-are producing an executable. Consequently, we must manually pass -no-pie to gcc
-when joining object files or linking dynamic libraries. See #12759.
--}
-
-linkDynLib :: DynFlags -> [String] -> [UnitId] -> IO ()
+linkDynLib :: DynFlags -> [String] -> [InstalledUnitId] -> IO ()
 linkDynLib dflags0 o_files dep_packages
  = do
     let -- This is a rather ugly hack to fix dynamically linked
@@ -1624,7 +1611,8 @@ linkDynLib dflags0 o_files dep_packages
              osMachOTarget (platformOS (targetPlatform dflags)) ) &&
            dynLibLoader dflags == SystemDependent &&
            WayDyn `elem` ways dflags
-            = ["-L" ++ l, "-Wl,-rpath", "-Wl," ++ l]
+            = ["-L" ++ l, "-Xlinker", "-rpath", "-Xlinker", l]
+              -- See Note [-Xlinker -rpath vs -Wl,-rpath]
          | otherwise = ["-L" ++ l]
 
     let lib_paths = libraryPaths dflags
@@ -1759,13 +1747,10 @@ linkDynLib dflags0 o_files dep_packages
 
             runLink dflags (
                     map Option verbFlags
+                 ++ libmLinkOpts
                  ++ [ Option "-o"
                     , FileOption "" output_fn
                     ]
-                    -- See Note [No PIE eating when linking]
-                 ++ (if sGccSupportsNoPie (settings dflags)
-                     then [Option "-no-pie"]
-                     else [])
                  ++ map Option o_files
                  ++ [ Option "-shared" ]
                  ++ map Option bsymbolicFlag
@@ -1778,7 +1763,17 @@ linkDynLib dflags0 o_files dep_packages
                  ++ map Option pkg_link_opts
               )
 
-getPkgFrameworkOpts :: DynFlags -> Platform -> [UnitId] -> IO [String]
+-- | Some platforms require that we explicitly link against @libm@ if any
+-- math-y things are used (which we assume to include all programs). See #14022.
+libmLinkOpts :: [Option]
+libmLinkOpts =
+#if defined(HAVE_LIBM)
+  [Option "-lm"]
+#else
+  []
+#endif
+
+getPkgFrameworkOpts :: DynFlags -> Platform -> [InstalledUnitId] -> IO [String]
 getPkgFrameworkOpts dflags platform dep_packages
   | platformUsesFrameworks platform = do
     pkg_framework_path_opts <- do

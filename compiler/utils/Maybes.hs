@@ -1,3 +1,8 @@
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE FlexibleContexts #-}
+
 {-
 (c) The University of Glasgow 2006
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
@@ -18,11 +23,11 @@ module Maybes (
         MaybeT(..), liftMaybeT, tryMaybeT
     ) where
 
-import Control.Applicative as A
 import Control.Monad
 import Control.Monad.Trans.Maybe
 import Control.Exception (catch, SomeException(..))
 import Data.Maybe
+import Util (HasCallStack)
 
 infixr 4 `orElse`
 
@@ -42,7 +47,7 @@ firstJust a b = firstJusts [a, b]
 firstJusts :: [Maybe a] -> Maybe a
 firstJusts = msum
 
-expectJust :: String -> Maybe a -> a
+expectJust :: HasCallStack => String -> Maybe a -> a
 {-# INLINE expectJust #-}
 expectJust _   (Just x) = x
 expectJust err Nothing  = error ("expectJust " ++ err)
@@ -92,7 +97,6 @@ instance Applicative (MaybeErr err) where
   (<*>) = ap
 
 instance Monad (MaybeErr err) where
-  return = A.pure
   Succeeded v >>= k = k v
   Failed e    >>= _ = Failed e
 

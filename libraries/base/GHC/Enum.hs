@@ -1,5 +1,9 @@
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE NoImplicitPrelude #-}
+{-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE Trustworthy #-}
-{-# LANGUAGE CPP, NoImplicitPrelude, BangPatterns, MagicHash #-}
 {-# OPTIONS_HADDOCK hide #-}
 
 -----------------------------------------------------------------------------
@@ -150,10 +154,10 @@ predError inst_ty =
 -- Tuples
 ------------------------------------------------------------------------
 
-instance Bounded () where
-    minBound = ()
-    maxBound = ()
+-- | @since 2.01
+deriving instance Bounded ()
 
+-- | @since 2.01
 instance Enum () where
     succ _      = errorWithoutStackTrace "Prelude.Enum.().succ: bad argument"
     pred _      = errorWithoutStackTrace "Prelude.Enum.().pred: bad argument"
@@ -168,102 +172,71 @@ instance Enum () where
     enumFromThenTo () () () = let many = ():many in many
 
 -- Report requires instances up to 15
-instance (Bounded a, Bounded b) => Bounded (a,b) where
-   minBound = (minBound, minBound)
-   maxBound = (maxBound, maxBound)
-
-instance (Bounded a, Bounded b, Bounded c) => Bounded (a,b,c) where
-   minBound = (minBound, minBound, minBound)
-   maxBound = (maxBound, maxBound, maxBound)
-
-instance (Bounded a, Bounded b, Bounded c, Bounded d) => Bounded (a,b,c,d) where
-   minBound = (minBound, minBound, minBound, minBound)
-   maxBound = (maxBound, maxBound, maxBound, maxBound)
-
-instance (Bounded a, Bounded b, Bounded c, Bounded d, Bounded e) => Bounded (a,b,c,d,e) where
-   minBound = (minBound, minBound, minBound, minBound, minBound)
-   maxBound = (maxBound, maxBound, maxBound, maxBound, maxBound)
-
-instance (Bounded a, Bounded b, Bounded c, Bounded d, Bounded e, Bounded f)
-        => Bounded (a,b,c,d,e,f) where
-   minBound = (minBound, minBound, minBound, minBound, minBound, minBound)
-   maxBound = (maxBound, maxBound, maxBound, maxBound, maxBound, maxBound)
-
-instance (Bounded a, Bounded b, Bounded c, Bounded d, Bounded e, Bounded f, Bounded g)
-        => Bounded (a,b,c,d,e,f,g) where
-   minBound = (minBound, minBound, minBound, minBound, minBound, minBound, minBound)
-   maxBound = (maxBound, maxBound, maxBound, maxBound, maxBound, maxBound, maxBound)
-
-instance (Bounded a, Bounded b, Bounded c, Bounded d, Bounded e, Bounded f, Bounded g,
-          Bounded h)
-        => Bounded (a,b,c,d,e,f,g,h) where
-   minBound = (minBound, minBound, minBound, minBound, minBound, minBound, minBound, minBound)
-   maxBound = (maxBound, maxBound, maxBound, maxBound, maxBound, maxBound, maxBound, maxBound)
-
-instance (Bounded a, Bounded b, Bounded c, Bounded d, Bounded e, Bounded f, Bounded g,
-          Bounded h, Bounded i)
-        => Bounded (a,b,c,d,e,f,g,h,i) where
-   minBound = (minBound, minBound, minBound, minBound, minBound, minBound, minBound, minBound,
-               minBound)
-   maxBound = (maxBound, maxBound, maxBound, maxBound, maxBound, maxBound, maxBound, maxBound,
-               maxBound)
-
-instance (Bounded a, Bounded b, Bounded c, Bounded d, Bounded e, Bounded f, Bounded g,
-          Bounded h, Bounded i, Bounded j)
-        => Bounded (a,b,c,d,e,f,g,h,i,j) where
-   minBound = (minBound, minBound, minBound, minBound, minBound, minBound, minBound, minBound,
-               minBound, minBound)
-   maxBound = (maxBound, maxBound, maxBound, maxBound, maxBound, maxBound, maxBound, maxBound,
-               maxBound, maxBound)
-
-instance (Bounded a, Bounded b, Bounded c, Bounded d, Bounded e, Bounded f, Bounded g,
-          Bounded h, Bounded i, Bounded j, Bounded k)
-        => Bounded (a,b,c,d,e,f,g,h,i,j,k) where
-   minBound = (minBound, minBound, minBound, minBound, minBound, minBound, minBound, minBound,
-               minBound, minBound, minBound)
-   maxBound = (maxBound, maxBound, maxBound, maxBound, maxBound, maxBound, maxBound, maxBound,
-               maxBound, maxBound, maxBound)
-
-instance (Bounded a, Bounded b, Bounded c, Bounded d, Bounded e, Bounded f, Bounded g,
-          Bounded h, Bounded i, Bounded j, Bounded k, Bounded l)
-        => Bounded (a,b,c,d,e,f,g,h,i,j,k,l) where
-   minBound = (minBound, minBound, minBound, minBound, minBound, minBound, minBound, minBound,
-               minBound, minBound, minBound, minBound)
-   maxBound = (maxBound, maxBound, maxBound, maxBound, maxBound, maxBound, maxBound, maxBound,
-               maxBound, maxBound, maxBound, maxBound)
-
-instance (Bounded a, Bounded b, Bounded c, Bounded d, Bounded e, Bounded f, Bounded g,
-          Bounded h, Bounded i, Bounded j, Bounded k, Bounded l, Bounded m)
-        => Bounded (a,b,c,d,e,f,g,h,i,j,k,l,m) where
-   minBound = (minBound, minBound, minBound, minBound, minBound, minBound, minBound, minBound,
-               minBound, minBound, minBound, minBound, minBound)
-   maxBound = (maxBound, maxBound, maxBound, maxBound, maxBound, maxBound, maxBound, maxBound,
-               maxBound, maxBound, maxBound, maxBound, maxBound)
-
-instance (Bounded a, Bounded b, Bounded c, Bounded d, Bounded e, Bounded f, Bounded g,
-          Bounded h, Bounded i, Bounded j, Bounded k, Bounded l, Bounded m, Bounded n)
-        => Bounded (a,b,c,d,e,f,g,h,i,j,k,l,m,n) where
-   minBound = (minBound, minBound, minBound, minBound, minBound, minBound, minBound, minBound,
-               minBound, minBound, minBound, minBound, minBound, minBound)
-   maxBound = (maxBound, maxBound, maxBound, maxBound, maxBound, maxBound, maxBound, maxBound,
-               maxBound, maxBound, maxBound, maxBound, maxBound, maxBound)
-
-instance (Bounded a, Bounded b, Bounded c, Bounded d, Bounded e, Bounded f, Bounded g,
-          Bounded h, Bounded i, Bounded j, Bounded k, Bounded l, Bounded m, Bounded n, Bounded o)
-        => Bounded (a,b,c,d,e,f,g,h,i,j,k,l,m,n,o) where
-   minBound = (minBound, minBound, minBound, minBound, minBound, minBound, minBound, minBound,
-               minBound, minBound, minBound, minBound, minBound, minBound, minBound)
-   maxBound = (maxBound, maxBound, maxBound, maxBound, maxBound, maxBound, maxBound, maxBound,
-               maxBound, maxBound, maxBound, maxBound, maxBound, maxBound, maxBound)
+-- | @since 2.01
+deriving instance (Bounded a, Bounded b)
+        => Bounded (a,b)
+-- | @since 2.01
+deriving instance (Bounded a, Bounded b, Bounded c)
+        => Bounded (a,b,c)
+-- | @since 2.01
+deriving instance (Bounded a, Bounded b, Bounded c, Bounded d)
+        => Bounded (a,b,c,d)
+-- | @since 2.01
+deriving instance (Bounded a, Bounded b, Bounded c, Bounded d, Bounded e)
+        => Bounded (a,b,c,d,e)
+-- | @since 2.01
+deriving instance (Bounded a, Bounded b, Bounded c, Bounded d, Bounded e,
+          Bounded f)
+        => Bounded (a,b,c,d,e,f)
+-- | @since 2.01
+deriving instance (Bounded a, Bounded b, Bounded c, Bounded d, Bounded e,
+          Bounded f, Bounded g)
+        => Bounded (a,b,c,d,e,f,g)
+-- | @since 2.01
+deriving instance (Bounded a, Bounded b, Bounded c, Bounded d, Bounded e,
+          Bounded f, Bounded g, Bounded h)
+        => Bounded (a,b,c,d,e,f,g,h)
+-- | @since 2.01
+deriving instance (Bounded a, Bounded b, Bounded c, Bounded d, Bounded e,
+          Bounded f, Bounded g, Bounded h, Bounded i)
+        => Bounded (a,b,c,d,e,f,g,h,i)
+-- | @since 2.01
+deriving instance (Bounded a, Bounded b, Bounded c, Bounded d, Bounded e,
+          Bounded f, Bounded g, Bounded h, Bounded i, Bounded j)
+        => Bounded (a,b,c,d,e,f,g,h,i,j)
+-- | @since 2.01
+deriving instance (Bounded a, Bounded b, Bounded c, Bounded d, Bounded e,
+          Bounded f, Bounded g, Bounded h, Bounded i, Bounded j, Bounded k)
+        => Bounded (a,b,c,d,e,f,g,h,i,j,k)
+-- | @since 2.01
+deriving instance (Bounded a, Bounded b, Bounded c, Bounded d, Bounded e,
+          Bounded f, Bounded g, Bounded h, Bounded i, Bounded j, Bounded k,
+          Bounded l)
+        => Bounded (a,b,c,d,e,f,g,h,i,j,k,l)
+-- | @since 2.01
+deriving instance (Bounded a, Bounded b, Bounded c, Bounded d, Bounded e,
+          Bounded f, Bounded g, Bounded h, Bounded i, Bounded j, Bounded k,
+          Bounded l, Bounded m)
+        => Bounded (a,b,c,d,e,f,g,h,i,j,k,l,m)
+-- | @since 2.01
+deriving instance (Bounded a, Bounded b, Bounded c, Bounded d, Bounded e,
+          Bounded f, Bounded g, Bounded h, Bounded i, Bounded j, Bounded k,
+          Bounded l, Bounded m, Bounded n)
+        => Bounded (a,b,c,d,e,f,g,h,i,j,k,l,m,n)
+-- | @since 2.01
+deriving instance (Bounded a, Bounded b, Bounded c, Bounded d, Bounded e,
+          Bounded f, Bounded g, Bounded h, Bounded i, Bounded j, Bounded k,
+          Bounded l, Bounded m, Bounded n, Bounded o)
+        => Bounded (a,b,c,d,e,f,g,h,i,j,k,l,m,n,o)
 
 ------------------------------------------------------------------------
 -- Bool
 ------------------------------------------------------------------------
 
-instance Bounded Bool where
-  minBound = False
-  maxBound = True
+-- | @since 2.01
+deriving instance Bounded Bool
 
+-- | @since 2.01
 instance Enum Bool where
   succ False = True
   succ True  = errorWithoutStackTrace "Prelude.Enum.Bool.succ: bad argument"
@@ -286,10 +259,9 @@ instance Enum Bool where
 -- Ordering
 ------------------------------------------------------------------------
 
-instance Bounded Ordering where
-  minBound = LT
-  maxBound = GT
-
+-- | @since 2.01
+deriving instance Bounded Ordering
+-- | @since 2.01
 instance Enum Ordering where
   succ LT = EQ
   succ EQ = GT
@@ -316,10 +288,12 @@ instance Enum Ordering where
 -- Char
 ------------------------------------------------------------------------
 
+-- | @since 2.01
 instance  Bounded Char  where
     minBound =  '\0'
     maxBound =  '\x10FFFF'
 
+-- | @since 2.01
 instance  Enum Char  where
     succ (C# c#)
        | isTrue# (ord# c# /=# 0x10FFFF#) = C# (chr# (ord# c# +# 1#))
@@ -357,7 +331,7 @@ instance  Enum Char  where
 
 -- We can do better than for Ints because we don't
 -- have hassles about arithmetic overflow at maxBound
-{-# INLINE [0] eftCharFB #-}
+{-# INLINE [0] eftCharFB #-} -- See Note [Inline FB functions] in GHC.List
 eftCharFB :: (Char -> a -> a) -> a -> Int# -> Int# -> a
 eftCharFB c n x0 y = go x0
                  where
@@ -371,7 +345,7 @@ eftChar x y | isTrue# (x ># y ) = []
 
 
 -- For enumFromThenTo we give up on inlining
-{-# NOINLINE [0] efdCharFB #-}
+{-# INLINE [0] efdCharFB #-} -- See Note [Inline FB functions] in GHC.List
 efdCharFB :: (Char -> a -> a) -> a -> Int# -> Int# -> a
 efdCharFB c n x1 x2
   | isTrue# (delta >=# 0#) = go_up_char_fb c n x1 delta 0x10FFFF#
@@ -387,7 +361,7 @@ efdChar x1 x2
   where
     !delta = x2 -# x1
 
-{-# NOINLINE [0] efdtCharFB #-}
+{-# INLINE [0] efdtCharFB #-} -- See Note [Inline FB functions] in GHC.List
 efdtCharFB :: (Char -> a -> a) -> a -> Int# -> Int# -> Int# -> a
 efdtCharFB c n x1 x2 lim
   | isTrue# (delta >=# 0#) = go_up_char_fb c n x1 delta lim
@@ -443,10 +417,12 @@ Be careful about these instances.
         (c) remember that Int is bounded, so [1..] terminates at maxInt
 -}
 
+-- | @since 2.01
 instance  Bounded Int where
     minBound =  minInt
     maxBound =  maxInt
 
+-- | @since 2.01
 instance  Enum Int  where
     succ x
        | x == maxBound  = errorWithoutStackTrace "Prelude.Enum.succ{Int}: tried to take `succ' of maxBound"
@@ -500,7 +476,7 @@ eftInt x0 y | isTrue# (x0 ># y) = []
                                then []
                                else go (x +# 1#)
 
-{-# INLINE [0] eftIntFB #-}
+{-# INLINE [0] eftIntFB #-} -- See Note [Inline FB functions] in GHC.List
 eftIntFB :: (Int -> r -> r) -> r -> Int# -> Int# -> r
 eftIntFB c n x0 y | isTrue# (x0 ># y) = n
                   | otherwise         = go x0
@@ -538,7 +514,7 @@ efdtInt x1 x2 y
  | isTrue# (x2 >=# x1) = efdtIntUp x1 x2 y
  | otherwise           = efdtIntDn x1 x2 y
 
-{-# INLINE [0] efdtIntFB #-}
+{-# INLINE [0] efdtIntFB #-} -- See Note [Inline FB functions] in GHC.List
 efdtIntFB :: (Int -> r -> r) -> r -> Int# -> Int# -> Int# -> r
 efdtIntFB c n x1 x2 y
  | isTrue# (x2 >=# x1) = efdtIntUpFB c n x1 x2 y
@@ -560,6 +536,7 @@ efdtIntUp x1 x2 y    -- Be careful about overflow!
                in I# x1 : go_up x2
 
 -- Requires x2 >= x1
+{-# INLINE [0] efdtIntUpFB #-} -- See Note [Inline FB functions] in GHC.List
 efdtIntUpFB :: (Int -> r -> r) -> r -> Int# -> Int# -> Int# -> r
 efdtIntUpFB c n x1 x2 y    -- Be careful about overflow!
  | isTrue# (y <# x2) = if isTrue# (y <# x1) then n else I# x1 `c` n
@@ -590,6 +567,7 @@ efdtIntDn x1 x2 y    -- Be careful about underflow!
    in I# x1 : go_dn x2
 
 -- Requires x2 <= x1
+{-# INLINE [0] efdtIntDnFB #-} -- See Note [Inline FB functions] in GHC.List
 efdtIntDnFB :: (Int -> r -> r) -> r -> Int# -> Int# -> Int# -> r
 efdtIntDnFB c n x1 x2 y    -- Be careful about underflow!
  | isTrue# (y ># x2) = if isTrue# (y ># x1) then n else I# x1 `c` n
@@ -609,6 +587,7 @@ efdtIntDnFB c n x1 x2 y    -- Be careful about underflow!
 -- Word
 ------------------------------------------------------------------------
 
+-- | @since 2.01
 instance Bounded Word where
     minBound = 0
 
@@ -622,6 +601,7 @@ instance Bounded Word where
 #error Unhandled value for WORD_SIZE_IN_BITS
 #endif
 
+-- | @since 2.01
 instance Enum Word where
     succ x
         | x /= maxBound = x + 1
@@ -677,7 +657,7 @@ eftWord x0 y | isTrue# (x0 `gtWord#` y) = []
                                 then []
                                 else go (x `plusWord#` 1##)
 
-{-# INLINE [0] eftWordFB #-}
+{-# INLINE [0] eftWordFB #-} -- See Note [Inline FB functions] in GHC.List
 eftWordFB :: (Word -> r -> r) -> r -> Word# -> Word# -> r
 eftWordFB c n x0 y | isTrue# (x0 `gtWord#` y) = n
                    | otherwise                = go x0
@@ -715,7 +695,7 @@ efdtWord x1 x2 y
  | isTrue# (x2 `geWord#` x1) = efdtWordUp x1 x2 y
  | otherwise                 = efdtWordDn x1 x2 y
 
-{-# INLINE [0] efdtWordFB #-}
+{-# INLINE [0] efdtWordFB #-} -- See Note [Inline FB functions] in GHC.List
 efdtWordFB :: (Word -> r -> r) -> r -> Word# -> Word# -> Word# -> r
 efdtWordFB c n x1 x2 y
  | isTrue# (x2 `geWord#` x1) = efdtWordUpFB c n x1 x2 y
@@ -737,6 +717,7 @@ efdtWordUp x1 x2 y    -- Be careful about overflow!
                in W# x1 : go_up x2
 
 -- Requires x2 >= x1
+{-# INLINE [0] efdtWordUpFB #-} -- See Note [Inline FB functions] in GHC.List
 efdtWordUpFB :: (Word -> r -> r) -> r -> Word# -> Word# -> Word# -> r
 efdtWordUpFB c n x1 x2 y    -- Be careful about overflow!
  | isTrue# (y `ltWord#` x2) = if isTrue# (y `ltWord#` x1) then n else W# x1 `c` n
@@ -767,6 +748,7 @@ efdtWordDn x1 x2 y    -- Be careful about underflow!
    in W# x1 : go_dn x2
 
 -- Requires x2 <= x1
+{-# INLINE [0] efdtWordDnFB #-} -- See Note [Inline FB functions] in GHC.List
 efdtWordDnFB :: (Word -> r -> r) -> r -> Word# -> Word# -> Word# -> r
 efdtWordDnFB c n x1 x2 y    -- Be careful about underflow!
  | isTrue# (y `gtWord#` x2) = if isTrue# (y `gtWord#` x1) then n else W# x1 `c` n
@@ -785,6 +767,7 @@ efdtWordDnFB c n x1 x2 y    -- Be careful about underflow!
 -- Integer
 ------------------------------------------------------------------------
 
+-- | @since 2.01
 instance  Enum Integer  where
     succ x               = x + 1
     pred x               = x - 1
@@ -826,7 +809,8 @@ We do not do it for Int this way because hand-tuned code already exists, and
 the special case varies more from the general case, due to the issue of overflows.
 -}
 
-{-# NOINLINE [0] enumDeltaIntegerFB #-}
+{-# INLINE [0] enumDeltaIntegerFB #-}
+-- See Note [Inline FB functions] in GHC.List
 enumDeltaIntegerFB :: (Integer -> b -> b) -> Integer -> Integer -> b
 enumDeltaIntegerFB c x0 d = go x0
   where go x = x `seq` (x `c` go (x+d))
@@ -838,7 +822,8 @@ enumDeltaInteger x d = x `seq` (x : enumDeltaInteger (x+d) d)
 --     head (drop 1000000 [1 .. ]
 -- works
 
-{-# NOINLINE [0] enumDeltaToIntegerFB #-}
+{-# INLINE [0] enumDeltaToIntegerFB #-}
+-- See Note [Inline FB functions] in GHC.List
 -- Don't inline this until RULE "enumDeltaToInteger" has had a chance to fire
 enumDeltaToIntegerFB :: (Integer -> a -> a) -> a
                      -> Integer -> Integer -> Integer -> a
@@ -846,7 +831,8 @@ enumDeltaToIntegerFB c n x delta lim
   | delta >= 0 = up_fb c n x delta lim
   | otherwise  = dn_fb c n x delta lim
 
-{-# NOINLINE [0] enumDeltaToInteger1FB #-}
+{-# INLINE [0] enumDeltaToInteger1FB #-}
+-- See Note [Inline FB functions] in GHC.List
 -- Don't inline this until RULE "enumDeltaToInteger" has had a chance to fire
 enumDeltaToInteger1FB :: (Integer -> a -> a) -> a
                       -> Integer -> Integer -> a
@@ -890,3 +876,15 @@ dn_list x0 delta lim = go (x0 :: Integer)
                     where
                         go x | x < lim   = []
                              | otherwise = x : go (x+delta)
+
+-- Instances from GHC.Types
+
+-- | @since 4.10.0.0
+deriving instance Bounded VecCount
+-- | @since 4.10.0.0
+deriving instance Enum VecCount
+
+-- | @since 4.10.0.0
+deriving instance Bounded VecElem
+-- | @since 4.10.0.0
+deriving instance Enum VecElem

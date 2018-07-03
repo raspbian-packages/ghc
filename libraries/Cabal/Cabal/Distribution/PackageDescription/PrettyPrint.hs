@@ -13,29 +13,46 @@
 -----------------------------------------------------------------------------
 
 module Distribution.PackageDescription.PrettyPrint (
+    -- * Generic package descriptions
     writeGenericPackageDescription,
     showGenericPackageDescription,
+
+    -- * Package descriptions
+     writePackageDescription,
+     showPackageDescription,
+
+     -- ** Supplementary build information
+     writeHookedBuildInfo,
+     showHookedBuildInfo,
 ) where
+
+import Prelude ()
+import Distribution.Compat.Prelude
+
+import Distribution.Types.Dependency
+import Distribution.Types.ForeignLib
+import Distribution.Types.UnqualComponentName
+import Distribution.Types.CondTree
 
 import Distribution.PackageDescription
 import Distribution.Simple.Utils
 import Distribution.ParseUtils
 import Distribution.PackageDescription.Parse
-import Distribution.Package
 import Distribution.Text
+import Distribution.ModuleName
 
-import Data.Monoid as Mon (Monoid(mempty))
-import Data.Maybe (isJust)
 import Text.PrettyPrint
-       (hsep, parens, char, nest, empty, isEmpty, ($$), (<+>),
-        colon, (<>), text, vcat, ($+$), Doc, render)
+       (hsep, space, parens, char, nest, isEmpty, ($$), (<+>),
+        colon, text, vcat, ($+$), Doc, render)
+
+import qualified Data.ByteString.Lazy.Char8 as BS.Char8
 
 -- | Recompile with false for regression testing
 simplifiedPrinting :: Bool
 simplifiedPrinting = False
 
 -- | Writes a .cabal file from a generic package description
-writeGenericPackageDescription :: FilePath -> GenericPackageDescription -> IO ()
+writeGenericPackageDescription :: FilePath -> GenericPackageDescription -> NoCallStackIO ()
 writeGenericPackageDescription fpath pkg = writeUTF8File fpath (showGenericPackageDescription pkg)
 
 -- | Writes a generic package description to a string
@@ -46,10 +63,11 @@ ppGenericPackageDescription :: GenericPackageDescription -> Doc
 ppGenericPackageDescription gpd          =
         ppPackageDescription (packageDescription gpd)
         $+$ ppGenPackageFlags (genPackageFlags gpd)
-        $+$ ppLibrary (condLibrary gpd)
-        $+$ ppExecutables (condExecutables gpd)
-        $+$ ppTestSuites (condTestSuites gpd)
-        $+$ ppBenchmarks (condBenchmarks gpd)
+        $+$ ppCondLibrary (condLibrary gpd)
+        $+$ ppCondSubLibraries (condSubLibraries gpd)
+        $+$ ppCondExecutables (condExecutables gpd)
+        $+$ ppCondTestSuites (condTestSuites gpd)
+        $+$ ppCondBenchmarks (condBenchmarks gpd)
 
 ppPackageDescription :: PackageDescription -> Doc
 ppPackageDescription pd                  =      ppFields pkgDescrFieldDescrs pd
@@ -57,7 +75,7 @@ ppPackageDescription pd                  =      ppFields pkgDescrFieldDescrs pd
                                                 $+$ ppSourceRepos (sourceRepos pd)
 
 ppSourceRepos :: [SourceRepo] -> Doc
-ppSourceRepos []                         = empty
+ppSourceRepos []                         = mempty
 ppSourceRepos (hd:tl)                    = ppSourceRepo hd $+$ ppSourceRepos tl
 
 ppSourceRepo :: SourceRepo -> Doc
@@ -95,7 +113,7 @@ ppCustomFields :: [(String,String)] -> Doc
 ppCustomFields flds                      = vcat [ppCustomField f | f <- flds]
 
 ppCustomField :: (String,String) -> Doc
-ppCustomField (name,val)                 = text name <> colon <+> showFreeText val
+ppCustomField (name,val)                 = text name <<>> colon <+> showFreeText val
 
 ppGenPackageFlags :: [Flag] -> Doc
 ppGenPackageFlags flds                   = vcat [ppFlag f | f <- flds]
@@ -106,44 +124,52 @@ ppFlag flag@(MkFlag name _ _ _)    =
   where
     fields = ppFieldsFiltered flagDefaults flagFieldDescrs flag
 
-ppLibrary :: (Maybe (CondTree ConfVar [Dependency] Library)) -> Doc
-ppLibrary Nothing                        = empty
-ppLibrary (Just condTree)                =
-    emptyLine $ text "library" $+$ nest indentWith (ppCondTree condTree Nothing ppLib)
-  where
-    ppLib lib Nothing     = ppFieldsFiltered libDefaults libFieldDescrs lib
-                            $$  ppCustomFields (customFieldsBI (libBuildInfo lib))
-    ppLib lib (Just plib) = ppDiffFields libFieldDescrs lib plib
-                            $$  ppCustomFields (customFieldsBI (libBuildInfo lib))
+ppCondLibrary :: Maybe (CondTree ConfVar [Dependency] Library) -> Doc
+ppCondLibrary Nothing = mempty
+ppCondLibrary (Just condTree) =
+    emptyLine $ text "library"
+        $+$ nest indentWith (ppCondTree condTree Nothing ppLib)
+ppCondSubLibraries :: [(UnqualComponentName, CondTree ConfVar [Dependency] Library)] -> Doc
+ppCondSubLibraries libs                           =
+    vcat [emptyLine $ (text "library " <+> disp n)
+              $+$ nest indentWith (ppCondTree condTree Nothing ppLib)| (n,condTree) <- libs]
 
-ppExecutables :: [(String, CondTree ConfVar [Dependency] Executable)] -> Doc
-ppExecutables exes                       =
-    vcat [emptyLine $ text ("executable " ++ n)
+ppLib :: Library -> Maybe Library -> Doc
+ppLib lib Nothing     = ppFieldsFiltered libDefaults libFieldDescrs lib
+                        $$  ppCustomFields (customFieldsBI (libBuildInfo lib))
+ppLib lib (Just plib) = ppDiffFields libFieldDescrs lib plib
+                        $$  ppCustomFields (customFieldsBI (libBuildInfo lib))
+
+ppCondExecutables :: [(UnqualComponentName, CondTree ConfVar [Dependency] Executable)] -> Doc
+ppCondExecutables exes                       =
+    vcat [emptyLine $ (text "executable " <+> disp n)
               $+$ nest indentWith (ppCondTree condTree Nothing ppExe)| (n,condTree) <- exes]
   where
-    ppExe (Executable _ modulePath' buildInfo') Nothing =
-        (if modulePath' == "" then empty else text "main-is:" <+> text modulePath')
+    ppExe (Executable _ modulePath' exeScope' buildInfo') Nothing =
+        (if modulePath' == "" then mempty else text "main-is:" <+> text modulePath')
+            $+$ if exeScope' == mempty then mempty else text "scope:" <+> disp exeScope'
             $+$ ppFieldsFiltered binfoDefaults binfoFieldDescrs buildInfo'
             $+$  ppCustomFields (customFieldsBI buildInfo')
-    ppExe (Executable _ modulePath' buildInfo')
-            (Just (Executable _ modulePath2 buildInfo2)) =
+    ppExe (Executable _ modulePath' exeScope' buildInfo')
+            (Just (Executable _ modulePath2 exeScope2 buildInfo2)) =
             (if modulePath' == "" || modulePath' == modulePath2
-                then empty else text "main-is:" <+> text modulePath')
+                then mempty else text "main-is:" <+> text modulePath')
+            $+$ if exeScope' == exeScope2 then mempty else text "scope:" <+> disp exeScope'
             $+$ ppDiffFields binfoFieldDescrs buildInfo' buildInfo2
             $+$ ppCustomFields (customFieldsBI buildInfo')
 
-ppTestSuites :: [(String, CondTree ConfVar [Dependency] TestSuite)] -> Doc
-ppTestSuites suites =
-    emptyLine $ vcat [     text ("test-suite " ++ n)
+ppCondTestSuites :: [(UnqualComponentName, CondTree ConfVar [Dependency] TestSuite)] -> Doc
+ppCondTestSuites suites =
+    emptyLine $ vcat [     (text "test-suite " <+> disp n)
                        $+$ nest indentWith (ppCondTree condTree Nothing ppTestSuite)
                      | (n,condTree) <- suites]
   where
     ppTestSuite testsuite Nothing =
-                maybe empty (\t -> text "type:"        <+> disp t)
+                maybe mempty (\t -> text "type:"        <+> disp t)
                             maybeTestType
-            $+$ maybe empty (\f -> text "main-is:"     <+> text f)
+            $+$ maybe mempty (\f -> text "main-is:"     <+> text f)
                             (testSuiteMainIs testsuite)
-            $+$ maybe empty (\m -> text "test-module:" <+> disp m)
+            $+$ maybe mempty (\m -> text "test-module:" <+> disp m)
                             (testSuiteModule testsuite)
             $+$ ppFieldsFiltered binfoDefaults binfoFieldDescrs (testBuildInfo testsuite)
             $+$ ppCustomFields (customFieldsBI (testBuildInfo testsuite))
@@ -151,10 +177,10 @@ ppTestSuites suites =
         maybeTestType | testInterface testsuite == mempty = Nothing
                       | otherwise = Just (testType testsuite)
 
-    ppTestSuite (TestSuite _ _ buildInfo' _)
-                    (Just (TestSuite _ _ buildInfo2 _)) =
-            ppDiffFields binfoFieldDescrs buildInfo' buildInfo2
-            $+$ ppCustomFields (customFieldsBI buildInfo')
+    ppTestSuite test' (Just test2) =
+            ppDiffFields binfoFieldDescrs
+                (testBuildInfo test') (testBuildInfo test2)
+            $+$ ppCustomFields (customFieldsBI (testBuildInfo test'))
 
     testSuiteMainIs test = case testInterface test of
       TestSuiteExeV10 _ f -> Just f
@@ -164,16 +190,16 @@ ppTestSuites suites =
       TestSuiteLibV09 _ m -> Just m
       _                   -> Nothing
 
-ppBenchmarks :: [(String, CondTree ConfVar [Dependency] Benchmark)] -> Doc
-ppBenchmarks suites =
-    emptyLine $ vcat [     text ("benchmark " ++ n)
+ppCondBenchmarks :: [(UnqualComponentName, CondTree ConfVar [Dependency] Benchmark)] -> Doc
+ppCondBenchmarks suites =
+    emptyLine $ vcat [     (text "benchmark " <+> disp n)
                        $+$ nest indentWith (ppCondTree condTree Nothing ppBenchmark)
                      | (n,condTree) <- suites]
   where
     ppBenchmark benchmark Nothing =
-                maybe empty (\t -> text "type:"        <+> disp t)
+                maybe mempty (\t -> text "type:"        <+> disp t)
                             maybeBenchmarkType
-            $+$ maybe empty (\f -> text "main-is:"     <+> text f)
+            $+$ maybe mempty (\f -> text "main-is:"     <+> text f)
                             (benchmarkMainIs benchmark)
             $+$ ppFieldsFiltered binfoDefaults binfoFieldDescrs (benchmarkBuildInfo benchmark)
             $+$ ppCustomFields (customFieldsBI (benchmarkBuildInfo benchmark))
@@ -181,10 +207,10 @@ ppBenchmarks suites =
         maybeBenchmarkType | benchmarkInterface benchmark == mempty = Nothing
                            | otherwise = Just (benchmarkType benchmark)
 
-    ppBenchmark (Benchmark _ _ buildInfo' _)
-                    (Just (Benchmark _ _ buildInfo2 _)) =
-            ppDiffFields binfoFieldDescrs buildInfo' buildInfo2
-            $+$ ppCustomFields (customFieldsBI buildInfo')
+    ppBenchmark bench' (Just bench2) =
+            ppDiffFields binfoFieldDescrs
+                (benchmarkBuildInfo bench') (benchmarkBuildInfo bench2)
+            $+$ ppCustomFields (customFieldsBI (benchmarkBuildInfo bench'))
 
     benchmarkMainIs benchmark = case benchmarkInterface benchmark of
       BenchmarkExeV10 _ f -> Just f
@@ -193,19 +219,19 @@ ppBenchmarks suites =
 ppCondition :: Condition ConfVar -> Doc
 ppCondition (Var x)                      = ppConfVar x
 ppCondition (Lit b)                      = text (show b)
-ppCondition (CNot c)                     = char '!' <> (ppCondition c)
+ppCondition (CNot c)                     = char '!' <<>> (ppCondition c)
 ppCondition (COr c1 c2)                  = parens (hsep [ppCondition c1, text "||"
                                                          <+> ppCondition c2])
 ppCondition (CAnd c1 c2)                 = parens (hsep [ppCondition c1, text "&&"
                                                          <+> ppCondition c2])
 ppConfVar :: ConfVar -> Doc
-ppConfVar (OS os)                        = text "os"   <> parens (disp os)
-ppConfVar (Arch arch)                    = text "arch" <> parens (disp arch)
-ppConfVar (Flag name)                    = text "flag" <> parens (ppFlagName name)
-ppConfVar (Impl c v)                     = text "impl" <> parens (disp c <+> disp v)
+ppConfVar (OS os)                        = text "os"   <<>> parens (disp os)
+ppConfVar (Arch arch)                    = text "arch" <<>> parens (disp arch)
+ppConfVar (Flag name)                    = text "flag" <<>> parens (ppFlagName name)
+ppConfVar (Impl c v)                     = text "impl" <<>> parens (disp c <+> disp v)
 
 ppFlagName :: FlagName -> Doc
-ppFlagName (FlagName name)               = text name
+ppFlagName                               = text . unFlagName
 
 ppCondTree :: CondTree ConfVar [Dependency] a -> Maybe a -> (a -> Maybe a -> Doc) ->  Doc
 ppCondTree ct@(CondNode it _ ifs) mbIt ppIt =
@@ -216,8 +242,8 @@ ppCondTree ct@(CondNode it _ ifs) mbIt ppIt =
         else res
   where
     -- TODO: this ends up printing trailing spaces when combined with nest.
-    ppIf (c, thenTree, Just elseTree) = ppIfElse it ppIt c thenTree elseTree
-    ppIf (c, thenTree, Nothing)       = ppIf' it ppIt c thenTree
+    ppIf (CondBranch c thenTree (Just elseTree)) = ppIfElse it ppIt c thenTree elseTree
+    ppIf (CondBranch c thenTree Nothing)         = ppIf' it ppIt c thenTree
 
 ppIfCondition :: (Condition ConfVar) -> Doc
 ppIfCondition c = (emptyLine $ text "if" <+> ppCondition c)
@@ -228,7 +254,7 @@ ppIf' :: a -> (a -> Maybe a -> Doc)
            -> Doc
 ppIf' it ppIt c thenTree =
   if isEmpty thenDoc
-     then Mon.mempty
+     then mempty
      else ppIfCondition c $$ nest indentWith thenDoc
   where thenDoc = ppCondTree thenTree (if simplifiedPrinting then (Just it) else Nothing) ppIt
 
@@ -239,7 +265,7 @@ ppIfElse :: a -> (a -> Maybe a -> Doc)
               -> Doc
 ppIfElse it ppIt c thenTree elseTree =
   case (isEmpty thenDoc, isEmpty elseDoc) of
-    (True,  True)  -> Mon.mempty
+    (True,  True)  -> mempty
     (False, True)  -> ppIfCondition c $$ nest indentWith thenDoc
     (True,  False) -> ppIfCondition (cNot c) $$ nest indentWith elseDoc
     (False, False) -> (ppIfCondition c $$ nest indentWith thenDoc)
@@ -250,3 +276,113 @@ ppIfElse it ppIt c thenTree elseTree =
 emptyLine :: Doc -> Doc
 emptyLine d                              = text "" $+$ d
 
+-- | @since 2.0.0.2
+writePackageDescription :: FilePath -> PackageDescription -> NoCallStackIO ()
+writePackageDescription fpath pkg = writeUTF8File fpath (showPackageDescription pkg)
+
+--TODO: make this use section syntax
+-- add equivalent for GenericPackageDescription
+
+-- | @since 2.0.0.2
+showPackageDescription :: PackageDescription -> String
+showPackageDescription pkg = render $
+     ppPackageDescription pkg
+     $+$ ppMaybeLibrary (library pkg)
+     $+$ ppSubLibraries (subLibraries pkg)
+     $+$ ppForeignLibs  (foreignLibs pkg)
+     $+$ ppExecutables  (executables pkg)
+     $+$ ppTestSuites   (testSuites pkg)
+     $+$ ppBenchmarks   (benchmarks pkg)
+
+ppMaybeLibrary :: Maybe Library -> Doc
+ppMaybeLibrary Nothing = mempty
+ppMaybeLibrary (Just lib) =
+    emptyLine $ text "library"
+        $+$ nest indentWith (ppFields libFieldDescrs lib)
+
+ppSubLibraries :: [Library] -> Doc
+ppSubLibraries libs = vcat [
+    emptyLine $ text "library" <+> disp libname
+        $+$ nest indentWith (ppFields libFieldDescrs lib)
+    | lib@Library{ libName = Just libname } <- libs ]
+
+ppForeignLibs :: [ForeignLib] -> Doc
+ppForeignLibs flibs = vcat [
+    emptyLine $ text "foreign library" <+> disp flibname
+        $+$ nest indentWith (ppFields foreignLibFieldDescrs flib)
+    | flib@ForeignLib{ foreignLibName = flibname } <- flibs ]
+
+ppExecutables :: [Executable] -> Doc
+ppExecutables exes = vcat [
+    emptyLine $ text "executable" <+> disp (exeName exe)
+        $+$ nest indentWith (ppFields executableFieldDescrs exe)
+    | exe <- exes ]
+
+ppTestSuites :: [TestSuite] -> Doc
+ppTestSuites tests = vcat [
+    emptyLine $ text "test-suite" <+> disp (testName test)
+        $+$ nest indentWith (ppFields testSuiteFieldDescrs test_stanza)
+    | test <- tests
+    , let test_stanza
+            = TestSuiteStanza {
+                testStanzaTestType = Just (testSuiteInterfaceToTestType (testInterface test)),
+                testStanzaMainIs = testSuiteInterfaceToMaybeMainIs (testInterface test),
+                testStanzaTestModule = testSuiteInterfaceToMaybeModule (testInterface test),
+                testStanzaBuildInfo = testBuildInfo test
+            }
+    ]
+
+testSuiteInterfaceToTestType :: TestSuiteInterface -> TestType
+testSuiteInterfaceToTestType (TestSuiteExeV10 ver _) = TestTypeExe ver
+testSuiteInterfaceToTestType (TestSuiteLibV09 ver _) = TestTypeLib ver
+testSuiteInterfaceToTestType (TestSuiteUnsupported ty) = ty
+
+testSuiteInterfaceToMaybeMainIs :: TestSuiteInterface -> Maybe FilePath
+testSuiteInterfaceToMaybeMainIs (TestSuiteExeV10 _ fp) = Just fp
+testSuiteInterfaceToMaybeMainIs TestSuiteLibV09{} = Nothing
+testSuiteInterfaceToMaybeMainIs TestSuiteUnsupported{} = Nothing
+
+testSuiteInterfaceToMaybeModule :: TestSuiteInterface -> Maybe ModuleName
+testSuiteInterfaceToMaybeModule (TestSuiteLibV09 _ mod_name) = Just mod_name
+testSuiteInterfaceToMaybeModule TestSuiteExeV10{} = Nothing
+testSuiteInterfaceToMaybeModule TestSuiteUnsupported{} = Nothing
+
+ppBenchmarks :: [Benchmark] -> Doc
+ppBenchmarks benchs = vcat [
+    emptyLine $ text "benchmark" <+> disp (benchmarkName bench)
+        $+$ nest indentWith (ppFields benchmarkFieldDescrs bench_stanza)
+    | bench <- benchs
+    , let bench_stanza = BenchmarkStanza {
+                benchmarkStanzaBenchmarkType = Just (benchmarkInterfaceToBenchmarkType (benchmarkInterface bench)),
+                benchmarkStanzaMainIs = benchmarkInterfaceToMaybeMainIs (benchmarkInterface bench),
+                benchmarkStanzaBenchmarkModule = Nothing,
+                benchmarkStanzaBuildInfo = benchmarkBuildInfo bench
+            }]
+
+benchmarkInterfaceToBenchmarkType :: BenchmarkInterface -> BenchmarkType
+benchmarkInterfaceToBenchmarkType (BenchmarkExeV10 ver _)   = BenchmarkTypeExe ver
+benchmarkInterfaceToBenchmarkType (BenchmarkUnsupported ty) = ty
+
+benchmarkInterfaceToMaybeMainIs :: BenchmarkInterface -> Maybe FilePath
+benchmarkInterfaceToMaybeMainIs (BenchmarkExeV10 _ fp) = Just fp
+benchmarkInterfaceToMaybeMainIs BenchmarkUnsupported{} = Nothing
+
+
+-- | @since 2.0.0.2
+writeHookedBuildInfo :: FilePath -> HookedBuildInfo -> NoCallStackIO ()
+writeHookedBuildInfo fpath = writeFileAtomic fpath . BS.Char8.pack
+                             . showHookedBuildInfo
+
+-- | @since 2.0.0.2
+showHookedBuildInfo :: HookedBuildInfo -> String
+showHookedBuildInfo (mb_lib_bi, ex_bis) = render $
+     (case mb_lib_bi of
+        Nothing -> mempty
+        Just bi -> ppBuildInfo bi)
+   $$ vcat [    space
+             $$ (text "executable:" <+> disp name)
+             $$ ppBuildInfo bi
+           | (name, bi) <- ex_bis ]
+  where
+     ppBuildInfo bi = ppFields binfoFieldDescrs bi
+                   $$ ppCustomFields (customFieldsBI bi)

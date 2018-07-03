@@ -14,14 +14,14 @@
 
 #include "ProfHeap.h"
 
-RTS_PRIVATE void LdvCensusForDead ( nat );
+RTS_PRIVATE void LdvCensusForDead ( uint32_t );
 RTS_PRIVATE void LdvCensusKillAll ( void );
 
 // Creates a 0-filled slop of size 'howManyBackwards' backwards from the
 // address 'from'.
 //
 // Invoked when:
-//   1) Hp is incremented and exceeds HpLim (in Updates.hc).
+//   1) Hp is incremented and exceeds HpLim (in Updates.cmm).
 //   2) copypart() is called (in GC.c).
 #define LDV_FILL_SLOP(from, howMany)    \
   if (era > 0) {                                \

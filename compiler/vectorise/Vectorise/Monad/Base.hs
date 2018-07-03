@@ -51,7 +51,6 @@ newtype VM a
   = VM { runVM :: Builtins -> GlobalEnv -> LocalEnv -> DsM (VResult a) }
 
 instance Monad VM where
-  return = pure
   VM p >>= f = VM $ \bi genv lenv -> do
                                        r <- p bi genv lenv
                                        case r of
@@ -124,9 +123,7 @@ emitVt herald doc
 --
 traceVt :: String -> SDoc -> VM ()
 traceVt herald doc
-  = do dflags <- getDynFlags
-       when (1 <= traceLevel dflags) $
-           liftDs $ traceOptIf Opt_D_dump_vt_trace $ hang (text herald) 2 doc
+  = liftDs $ traceOptIf Opt_D_dump_vt_trace $ hang (text herald) 2 doc
 
 -- |Dump the given program conditionally.
 --

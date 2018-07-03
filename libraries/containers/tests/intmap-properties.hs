@@ -1,10 +1,11 @@
 {-# LANGUAGE CPP #-}
 
 #ifdef STRICT
-import Data.IntMap.Strict as Data.IntMap
+import Data.IntMap.Strict as Data.IntMap hiding (showTree)
 #else
-import Data.IntMap.Lazy as Data.IntMap
+import Data.IntMap.Lazy as Data.IntMap hiding (showTree)
 #endif
+import Data.IntMap.Internal.Debug (showTree)
 
 import Data.Monoid
 import Data.Maybe hiding (mapMaybe)
@@ -16,13 +17,13 @@ import qualified Prelude (map)
 
 import Data.List (nub,sort)
 import qualified Data.List as List
-import qualified Data.IntSet
+import qualified Data.IntSet as IntSet
 import Test.Framework
 import Test.Framework.Providers.HUnit
 import Test.Framework.Providers.QuickCheck2
 import Test.HUnit hiding (Test, Testable)
 import Test.QuickCheck
-import Text.Show.Functions ()
+import Test.QuickCheck.Function (Fun(..), apply)
 
 default (Int)
 
@@ -141,6 +142,7 @@ main = defaultMain
              , testProperty "alter"                prop_alter
              , testProperty "index"                prop_index
              , testProperty "null"                 prop_null
+             , testProperty "size"                 prop_size
              , testProperty "member"               prop_member
              , testProperty "notmember"            prop_notmember
              , testProperty "lookup"               prop_lookup
@@ -167,7 +169,16 @@ main = defaultMain
              , testProperty "foldl'"               prop_foldl'
              , testProperty "keysSet"              prop_keysSet
              , testProperty "fromSet"              prop_fromSet
+             , testProperty "restrictKeys"         prop_restrictKeys
+             , testProperty "withoutKeys"          prop_withoutKeys
              ]
+
+apply2 :: Fun (a, b) c -> a -> b -> c
+apply2 f a b = apply f (a, b)
+
+apply3 :: Fun (a, b, c) d -> a -> b -> c -> d
+apply3 f a b c = apply f (a, b, c)
+
 
 {--------------------------------------------------------------------
   Arbitrary, reasonably balanced trees
@@ -499,13 +510,13 @@ test_assocs = do
 
 test_keysSet :: Assertion
 test_keysSet = do
-    keysSet (fromList [(5,"a"), (3,"b")]) @?= Data.IntSet.fromList [3,5]
-    keysSet (empty :: UMap) @?= Data.IntSet.empty
+    keysSet (fromList [(5,"a"), (3,"b")]) @?= IntSet.fromList [3,5]
+    keysSet (empty :: UMap) @?= IntSet.empty
 
 test_fromSet :: Assertion
 test_fromSet = do
-   fromSet (\k -> replicate k 'a') (Data.IntSet.fromList [3, 5]) @?= fromList [(5,"aaaaa"), (3,"aaa")]
-   fromSet undefined Data.IntSet.empty @?= (empty :: IMap)
+   fromSet (\k -> replicate k 'a') (IntSet.fromList [3, 5]) @?= fromList [(5,"aaaaa"), (3,"aaa")]
+   fromSet undefined IntSet.empty @?= (empty :: IMap)
 
 ----------------------------------------------------------------
 -- Lists
@@ -796,6 +807,22 @@ prop_intersectionWithKeyModel xs ys
           ys' = List.nubBy ((==) `on` fst) ys
           f k l r = k + 2 * l + 3 * r
 
+-- TODO: the second argument should be simply an 'IntSet', but that
+-- runs afoul of our orphan instance.
+prop_restrictKeys :: IMap -> IMap -> Property
+prop_restrictKeys m s0 =
+    m `restrictKeys` s === filterWithKey (\k _ -> k `IntSet.member` s) m
+  where
+    s = keysSet s0
+
+-- TODO: the second argument should be simply an 'IntSet', but that
+-- runs afoul of our orphan instance.
+prop_withoutKeys :: IMap -> IMap -> Property
+prop_withoutKeys m s0 =
+    m `withoutKeys` s === filterWithKey (\k _ -> k `IntSet.notMember` s) m
+  where
+    s = keysSet s0
+
 prop_mergeWithKeyModel :: [(Int,Int)] -> [(Int,Int)] -> Bool
 prop_mergeWithKeyModel xs ys
   = and [ testMergeWithKey f keep_x keep_y
@@ -880,6 +907,11 @@ prop_index xs = length xs > 0 ==>
 prop_null :: IMap -> Bool
 prop_null m = null m == (size m == 0)
 
+prop_size :: UMap -> Property
+prop_size im = sz === foldl' (\i _ -> i + 1) (0 :: Int) im .&&.
+               sz === List.length (toList im)
+  where sz = size im
+
 prop_member :: [Int] -> Int -> Bool
 prop_member xs n =
   let m  = fromList (zip xs xs)
@@ -958,35 +990,35 @@ prop_deleteMaxModel ys = length ys > 0 ==>
       m  = fromList xs
   in  toAscList (deleteMax m) == init (sort xs)
 
-prop_filter :: (Int -> Bool) -> [(Int, Int)] -> Property
+prop_filter :: Fun Int Bool -> [(Int, Int)] -> Property
 prop_filter p ys = length ys > 0 ==>
   let xs = List.nubBy ((==) `on` fst) ys
       m  = fromList xs
-  in  filter p m == fromList (List.filter (p . snd) xs)
+  in  filter (apply p) m == fromList (List.filter (apply p . snd) xs)
 
-prop_partition :: (Int -> Bool) -> [(Int, Int)] -> Property
+prop_partition :: Fun Int Bool -> [(Int, Int)] -> Property
 prop_partition p ys = length ys > 0 ==>
   let xs = List.nubBy ((==) `on` fst) ys
       m  = fromList xs
-  in  partition p m == let (a,b) = (List.partition (p . snd) xs) in (fromList a, fromList b)
+  in  partition (apply p) m == let (a,b) = (List.partition (apply p . snd) xs) in (fromList a, fromList b)
 
-prop_map :: (Int -> Int) -> [(Int, Int)] -> Property
+prop_map :: Fun Int Int -> [(Int, Int)] -> Property
 prop_map f ys = length ys > 0 ==>
   let xs = List.nubBy ((==) `on` fst) ys
       m  = fromList xs
-  in  map f m == fromList [ (a, f b) | (a,b) <- xs ]
+  in  map (apply f) m == fromList [ (a, apply f b) | (a,b) <- xs ]
 
-prop_fmap :: (Int -> Int) -> [(Int, Int)] -> Property
+prop_fmap :: Fun Int Int -> [(Int, Int)] -> Property
 prop_fmap f ys = length ys > 0 ==>
   let xs = List.nubBy ((==) `on` fst) ys
       m  = fromList xs
-  in  fmap f m == fromList [ (a, f b) | (a,b) <- xs ]
+  in  fmap (apply f) m == fromList [ (a, apply f b) | (a,b) <- xs ]
 
-prop_mapkeys :: (Int -> Int) -> [(Int, Int)] -> Property
+prop_mapkeys :: Fun Int Int -> [(Int, Int)] -> Property
 prop_mapkeys f ys = length ys > 0 ==>
   let xs = List.nubBy ((==) `on` fst) ys
       m  = fromList xs
-  in  mapKeys f m == (fromList $ List.nubBy ((==) `on` fst) $ reverse [ (f a, b) | (a,b) <- sort xs])
+  in  mapKeys (apply f) m == (fromList $ List.nubBy ((==) `on` fst) $ reverse [ (apply f a, b) | (a,b) <- sort xs])
 
 prop_splitModel :: Int -> [(Int, Int)] -> Property
 prop_splitModel n ys = length ys > 0 ==>
@@ -1048,9 +1080,9 @@ prop_foldl' n ys = length ys > 0 ==>
 
 prop_keysSet :: [(Int, Int)] -> Bool
 prop_keysSet xs =
-  keysSet (fromList xs) == Data.IntSet.fromList (List.map fst xs)
+  keysSet (fromList xs) == IntSet.fromList (List.map fst xs)
 
 prop_fromSet :: [(Int, Int)] -> Bool
 prop_fromSet ys =
   let xs = List.nubBy ((==) `on` fst) ys
-  in fromSet (\k -> fromJust $ List.lookup k xs) (Data.IntSet.fromList $ List.map fst xs) == fromList xs
+  in fromSet (\k -> fromJust $ List.lookup k xs) (IntSet.fromList $ List.map fst xs) == fromList xs

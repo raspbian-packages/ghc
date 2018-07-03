@@ -1,5 +1,8 @@
 {-# LANGUAGE CPP, MagicHash, UnboxedTuples #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE PolyKinds #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE GADTs #-}
 
 {-# OPTIONS_GHC -O -funbox-strict-fields #-}
 -- We always optimise this, otherwise performance of a non-optimised
@@ -29,25 +32,23 @@ module Binary
    seekBy,
    tellBin,
    castBin,
+   isEOFBin,
+   withBinBuffer,
 
    writeBinMem,
    readBinMem,
 
-   fingerprintBinMem,
-   computeFingerprint,
-
-   isEOFBin,
-
    putAt, getAt,
 
-   -- for writing instances:
+   -- * For writing instances
    putByte,
    getByte,
 
-   -- lazy Bin I/O
+   -- * Lazy Binary I/O
    lazyGet,
    lazyPut,
 
+   -- * User data
    UserData(..), getUserData, setUserData,
    newReadState, newWriteState,
    putDictionary, getDictionary, putFS,
@@ -75,7 +76,14 @@ import qualified Data.ByteString.Unsafe   as BS
 import Data.IORef
 import Data.Char                ( ord, chr )
 import Data.Time
+#if MIN_VERSION_base(4,10,0)
+import Type.Reflection
+import Type.Reflection.Unsafe
+import Data.Kind (Type)
+import GHC.Exts (RuntimeRep(..), VecCount(..), VecElem(..))
+#else
 import Data.Typeable
+#endif
 import Control.Monad            ( when )
 import System.IO as IO
 import System.IO.Unsafe         ( unsafeInterleaveIO )
@@ -104,6 +112,17 @@ getUserData bh = bh_usr bh
 
 setUserData :: BinHandle -> UserData -> BinHandle
 setUserData bh us = bh { bh_usr = us }
+
+-- | Get access to the underlying buffer.
+--
+-- It is quite important that no references to the 'ByteString' leak out of the
+-- continuation lest terrible things happen.
+withBinBuffer :: BinHandle -> (ByteString -> IO a) -> IO a
+withBinBuffer (BinMem _ ix_r _ arr_r) action = do
+  arr <- readIORef arr_r
+  ix <- readFastMutInt ix_r
+  withForeignPtr arr $ \ptr ->
+    BS.unsafePackCStringLen (castPtr ptr, ix) >>= action
 
 
 ---------------------------------------------------------------
@@ -188,7 +207,7 @@ readBinMem filename = do
   h <- openBinaryFile filename ReadMode
   filesize' <- hFileSize h
   let filesize = fromIntegral filesize'
-  arr <- mallocForeignPtrBytes (filesize*2)
+  arr <- mallocForeignPtrBytes filesize
   count <- withForeignPtr arr $ \p -> hGetBuf h p filesize
   when (count /= filesize) $
        error ("Binary.readBinMem: only read " ++ show count ++ " bytes")
@@ -199,23 +218,6 @@ readBinMem filename = do
   sz_r <- newFastMutInt
   writeFastMutInt sz_r filesize
   return (BinMem noUserData ix_r sz_r arr_r)
-
-fingerprintBinMem :: BinHandle -> IO Fingerprint
-fingerprintBinMem (BinMem _ ix_r _ arr_r) = do
-  arr <- readIORef arr_r
-  ix <- readFastMutInt ix_r
-  withForeignPtr arr $ \p -> fingerprintData p ix
-
-computeFingerprint :: Binary a
-                   => (BinHandle -> Name -> IO ())
-                   -> a
-                   -> IO Fingerprint
-
-computeFingerprint put_name a = do
-  bh <- openBinMem (3*1024) -- just less than a block
-  bh <- return $ setUserData bh $ newWriteState put_name putFS
-  put_ bh a
-  fingerprintBinMem bh
 
 -- expand the size of the array to include a specified offset
 expandBin :: BinHandle -> Int -> IO ()
@@ -233,35 +235,105 @@ expandBin (BinMem _ _ sz_r arr_r) off = do
 -- -----------------------------------------------------------------------------
 -- Low-level reading/writing of bytes
 
+putPrim :: BinHandle -> Int -> (Ptr Word8 -> IO ()) -> IO ()
+putPrim h@(BinMem _ ix_r sz_r arr_r) size f = do
+  ix <- readFastMutInt ix_r
+  sz <- readFastMutInt sz_r
+  when (ix + size > sz) $
+    expandBin h (ix + size)
+  arr <- readIORef arr_r
+  withForeignPtr arr $ \op -> f (op `plusPtr` ix)
+  writeFastMutInt ix_r (ix + size)
+
+getPrim :: BinHandle -> Int -> (Ptr Word8 -> IO a) -> IO a
+getPrim (BinMem _ ix_r sz_r arr_r) size f = do
+  ix <- readFastMutInt ix_r
+  sz <- readFastMutInt sz_r
+  when (ix + size > sz) $
+      ioError (mkIOError eofErrorType "Data.Binary.getPrim" Nothing Nothing)
+  arr <- readIORef arr_r
+  w <- withForeignPtr arr $ \op -> f (op `plusPtr` ix)
+  writeFastMutInt ix_r (ix + size)
+  return w
+
 putWord8 :: BinHandle -> Word8 -> IO ()
-putWord8 h@(BinMem _ ix_r sz_r arr_r) w = do
-    ix <- readFastMutInt ix_r
-    sz <- readFastMutInt sz_r
-    -- double the size of the array if it overflows
-    if (ix >= sz)
-        then do expandBin h ix
-                putWord8 h w
-        else do arr <- readIORef arr_r
-                withForeignPtr arr $ \p -> pokeByteOff p ix w
-                writeFastMutInt ix_r (ix+1)
-                return ()
+putWord8 h w = putPrim h 1 (\op -> poke op w)
 
 getWord8 :: BinHandle -> IO Word8
-getWord8 (BinMem _ ix_r sz_r arr_r) = do
-    ix <- readFastMutInt ix_r
-    sz <- readFastMutInt sz_r
-    when (ix >= sz) $
-        ioError (mkIOError eofErrorType "Data.Binary.getWord8" Nothing Nothing)
-    arr <- readIORef arr_r
-    w <- withForeignPtr arr $ \p -> peekByteOff p ix
-    writeFastMutInt ix_r (ix+1)
-    return w
+getWord8 h = getPrim h 1 peek
+
+putWord16 :: BinHandle -> Word16 -> IO ()
+putWord16 h w = putPrim h 2 (\op -> do
+  pokeElemOff op 0 (fromIntegral (w `shiftR` 8))
+  pokeElemOff op 1 (fromIntegral (w .&. 0xFF))
+  )
+
+getWord16 :: BinHandle -> IO Word16
+getWord16 h = getPrim h 2 (\op -> do
+  w0 <- fromIntegral <$> peekElemOff op 0
+  w1 <- fromIntegral <$> peekElemOff op 1
+  return $! w0 `shiftL` 8 .|. w1
+  )
+
+putWord32 :: BinHandle -> Word32 -> IO ()
+putWord32 h w = putPrim h 4 (\op -> do
+  pokeElemOff op 0 (fromIntegral (w `shiftR` 24))
+  pokeElemOff op 1 (fromIntegral ((w `shiftR` 16) .&. 0xFF))
+  pokeElemOff op 2 (fromIntegral ((w `shiftR` 8) .&. 0xFF))
+  pokeElemOff op 3 (fromIntegral (w .&. 0xFF))
+  )
+
+getWord32 :: BinHandle -> IO Word32
+getWord32 h = getPrim h 4 (\op -> do
+  w0 <- fromIntegral <$> peekElemOff op 0
+  w1 <- fromIntegral <$> peekElemOff op 1
+  w2 <- fromIntegral <$> peekElemOff op 2
+  w3 <- fromIntegral <$> peekElemOff op 3
+
+  return $! (w0 `shiftL` 24) .|.
+            (w1 `shiftL` 16) .|.
+            (w2 `shiftL` 8)  .|.
+            w3
+  )
+
+putWord64 :: BinHandle -> Word64 -> IO ()
+putWord64 h w = putPrim h 8 (\op -> do
+  pokeElemOff op 0 (fromIntegral (w `shiftR` 56))
+  pokeElemOff op 1 (fromIntegral ((w `shiftR` 48) .&. 0xFF))
+  pokeElemOff op 2 (fromIntegral ((w `shiftR` 40) .&. 0xFF))
+  pokeElemOff op 3 (fromIntegral ((w `shiftR` 32) .&. 0xFF))
+  pokeElemOff op 4 (fromIntegral ((w `shiftR` 24) .&. 0xFF))
+  pokeElemOff op 5 (fromIntegral ((w `shiftR` 16) .&. 0xFF))
+  pokeElemOff op 6 (fromIntegral ((w `shiftR` 8) .&. 0xFF))
+  pokeElemOff op 7 (fromIntegral (w .&. 0xFF))
+  )
+
+getWord64 :: BinHandle -> IO Word64
+getWord64 h = getPrim h 8 (\op -> do
+  w0 <- fromIntegral <$> peekElemOff op 0
+  w1 <- fromIntegral <$> peekElemOff op 1
+  w2 <- fromIntegral <$> peekElemOff op 2
+  w3 <- fromIntegral <$> peekElemOff op 3
+  w4 <- fromIntegral <$> peekElemOff op 4
+  w5 <- fromIntegral <$> peekElemOff op 5
+  w6 <- fromIntegral <$> peekElemOff op 6
+  w7 <- fromIntegral <$> peekElemOff op 7
+
+  return $! (w0 `shiftL` 56) .|.
+            (w1 `shiftL` 48) .|.
+            (w2 `shiftL` 40) .|.
+            (w3 `shiftL` 32) .|.
+            (w4 `shiftL` 24) .|.
+            (w5 `shiftL` 16) .|.
+            (w6 `shiftL` 8)  .|.
+            w7
+  )
 
 putByte :: BinHandle -> Word8 -> IO ()
-putByte bh w = put_ bh w
+putByte bh w = putWord8 bh w
 
 getByte :: BinHandle -> IO Word8
-getByte = getWord8
+getByte h = getWord8 h
 
 -- -----------------------------------------------------------------------------
 -- Primitve Word writes
@@ -271,58 +343,16 @@ instance Binary Word8 where
   get  = getWord8
 
 instance Binary Word16 where
-  put_ h w = do -- XXX too slow.. inline putWord8?
-    putByte h (fromIntegral (w `shiftR` 8))
-    putByte h (fromIntegral (w .&. 0xff))
-  get h = do
-    w1 <- getWord8 h
-    w2 <- getWord8 h
-    return $! ((fromIntegral w1 `shiftL` 8) .|. fromIntegral w2)
-
+  put_ h w = putWord16 h w
+  get h = getWord16 h
 
 instance Binary Word32 where
-  put_ h w = do
-    putByte h (fromIntegral (w `shiftR` 24))
-    putByte h (fromIntegral ((w `shiftR` 16) .&. 0xff))
-    putByte h (fromIntegral ((w `shiftR` 8)  .&. 0xff))
-    putByte h (fromIntegral (w .&. 0xff))
-  get h = do
-    w1 <- getWord8 h
-    w2 <- getWord8 h
-    w3 <- getWord8 h
-    w4 <- getWord8 h
-    return $! ((fromIntegral w1 `shiftL` 24) .|.
-               (fromIntegral w2 `shiftL` 16) .|.
-               (fromIntegral w3 `shiftL`  8) .|.
-               (fromIntegral w4))
+  put_ h w = putWord32 h w
+  get h = getWord32 h
 
 instance Binary Word64 where
-  put_ h w = do
-    putByte h (fromIntegral (w `shiftR` 56))
-    putByte h (fromIntegral ((w `shiftR` 48) .&. 0xff))
-    putByte h (fromIntegral ((w `shiftR` 40) .&. 0xff))
-    putByte h (fromIntegral ((w `shiftR` 32) .&. 0xff))
-    putByte h (fromIntegral ((w `shiftR` 24) .&. 0xff))
-    putByte h (fromIntegral ((w `shiftR` 16) .&. 0xff))
-    putByte h (fromIntegral ((w `shiftR`  8) .&. 0xff))
-    putByte h (fromIntegral (w .&. 0xff))
-  get h = do
-    w1 <- getWord8 h
-    w2 <- getWord8 h
-    w3 <- getWord8 h
-    w4 <- getWord8 h
-    w5 <- getWord8 h
-    w6 <- getWord8 h
-    w7 <- getWord8 h
-    w8 <- getWord8 h
-    return $! ((fromIntegral w1 `shiftL` 56) .|.
-               (fromIntegral w2 `shiftL` 48) .|.
-               (fromIntegral w3 `shiftL` 40) .|.
-               (fromIntegral w4 `shiftL` 32) .|.
-               (fromIntegral w5 `shiftL` 24) .|.
-               (fromIntegral w6 `shiftL` 16) .|.
-               (fromIntegral w7 `shiftL`  8) .|.
-               (fromIntegral w8))
+  put_ h w = putWord64 h w
+  get h = getWord64 h
 
 -- -----------------------------------------------------------------------------
 -- Primitve Int writes
@@ -420,6 +450,17 @@ instance (Binary a, Binary b, Binary c, Binary d, Binary e, Binary f) => Binary 
                                  f <- get bh
                                  return (a,b,c,d,e,f)
 
+instance (Binary a, Binary b, Binary c, Binary d, Binary e, Binary f, Binary g) => Binary (a,b,c,d,e,f,g) where
+    put_ bh (a,b,c,d,e,f,g) = do put_ bh a; put_ bh b; put_ bh c; put_ bh d; put_ bh e; put_ bh f; put_ bh g
+    get bh                  = do a <- get bh
+                                 b <- get bh
+                                 c <- get bh
+                                 d <- get bh
+                                 e <- get bh
+                                 f <- get bh
+                                 g <- get bh
+                                 return (a,b,c,d,e,f,g)
+
 instance Binary a => Binary (Maybe a) where
     put_ bh Nothing  = putByte bh 0
     put_ bh (Just a) = do putByte bh 1; put_ bh a
@@ -468,12 +509,25 @@ instance Binary DiffTime where
 -- yes, we need Binary Integer and Binary Rational in basicTypes/Literal.hs
 
 instance Binary Integer where
-    -- XXX This is hideous
-    put_ bh i = put_ bh (show i)
-    get bh = do str <- get bh
+    put_ bh i
+      | i >= lo32 && i <= hi32 = do
+          putWord8 bh 0
+          put_ bh (fromIntegral i :: Int32)
+      | otherwise = do
+          putWord8 bh 1
+          put_ bh (show i)
+      where
+        lo32 = fromIntegral (minBound :: Int32)
+        hi32 = fromIntegral (maxBound :: Int32)
+
+    get bh = do
+      int_kind <- getWord8 bh
+      case int_kind of
+        0 -> fromIntegral <$> (get bh :: IO Int32)
+        _ -> do str <- get bh
                 case reads str of
-                    [(i, "")] -> return i
-                    _ -> fail ("Binary Integer: got " ++ show str)
+                  [(i, "")] -> return i
+                  _ -> fail ("Binary integer: got " ++ show str)
 
     {-
     -- This code is currently commented out.
@@ -553,17 +607,174 @@ instance Binary (Bin a) where
 -- -----------------------------------------------------------------------------
 -- Instances for Data.Typeable stuff
 
+#if MIN_VERSION_base(4,10,0)
 instance Binary TyCon where
     put_ bh tc = do
         put_ bh (tyConPackage tc)
         put_ bh (tyConModule tc)
         put_ bh (tyConName tc)
-    get bh = do
-        p <- get bh
-        m <- get bh
-        n <- get bh
-        return (mkTyCon3 p m n)
+        put_ bh (tyConKindArgs tc)
+        put_ bh (tyConKindRep tc)
+    get bh =
+        mkTyCon <$> get bh <*> get bh <*> get bh <*> get bh <*> get bh
+#else
+instance Binary TyCon where
+    put_ bh tc = do
+        put_ bh (tyConPackage tc)
+        put_ bh (tyConModule tc)
+        put_ bh (tyConName tc)
+    get bh =
+        mkTyCon3 <$> get bh <*> get bh <*> get bh
+#endif
 
+#if MIN_VERSION_base(4,10,0)
+instance Binary VecCount where
+    put_ bh = putByte bh . fromIntegral . fromEnum
+    get bh = toEnum . fromIntegral <$> getByte bh
+
+instance Binary VecElem where
+    put_ bh = putByte bh . fromIntegral . fromEnum
+    get bh = toEnum . fromIntegral <$> getByte bh
+
+instance Binary RuntimeRep where
+    put_ bh (VecRep a b)    = putByte bh 0 >> put_ bh a >> put_ bh b
+    put_ bh (TupleRep reps) = putByte bh 1 >> put_ bh reps
+    put_ bh (SumRep reps)   = putByte bh 2 >> put_ bh reps
+    put_ bh LiftedRep       = putByte bh 3
+    put_ bh UnliftedRep     = putByte bh 4
+    put_ bh IntRep          = putByte bh 5
+    put_ bh WordRep         = putByte bh 6
+    put_ bh Int64Rep        = putByte bh 7
+    put_ bh Word64Rep       = putByte bh 8
+    put_ bh AddrRep         = putByte bh 9
+    put_ bh FloatRep        = putByte bh 10
+    put_ bh DoubleRep       = putByte bh 11
+
+    get bh = do
+        tag <- getByte bh
+        case tag of
+          0  -> VecRep <$> get bh <*> get bh
+          1  -> TupleRep <$> get bh
+          2  -> SumRep <$> get bh
+          3  -> pure LiftedRep
+          4  -> pure UnliftedRep
+          5  -> pure IntRep
+          6  -> pure WordRep
+          7  -> pure Int64Rep
+          8  -> pure Word64Rep
+          9  -> pure AddrRep
+          10 -> pure FloatRep
+          11 -> pure DoubleRep
+          _  -> fail "Binary.putRuntimeRep: invalid tag"
+
+instance Binary KindRep where
+    put_ bh (KindRepTyConApp tc k) = putByte bh 0 >> put_ bh tc >> put_ bh k
+    put_ bh (KindRepVar bndr) = putByte bh 1 >> put_ bh bndr
+    put_ bh (KindRepApp a b) = putByte bh 2 >> put_ bh a >> put_ bh b
+    put_ bh (KindRepFun a b) = putByte bh 3 >> put_ bh a >> put_ bh b
+    put_ bh (KindRepTYPE r) = putByte bh 4 >> put_ bh r
+    put_ bh (KindRepTypeLit sort r) = putByte bh 5 >> put_ bh sort >> put_ bh r
+
+    get bh = do
+        tag <- getByte bh
+        case tag of
+          0 -> KindRepTyConApp <$> get bh <*> get bh
+          1 -> KindRepVar <$> get bh
+          2 -> KindRepApp <$> get bh <*> get bh
+          3 -> KindRepFun <$> get bh <*> get bh
+          4 -> KindRepTYPE <$> get bh
+          5 -> KindRepTypeLit <$> get bh <*> get bh
+          _ -> fail "Binary.putKindRep: invalid tag"
+
+instance Binary TypeLitSort where
+    put_ bh TypeLitSymbol = putByte bh 0
+    put_ bh TypeLitNat = putByte bh 1
+    get bh = do
+        tag <- getByte bh
+        case tag of
+          0 -> pure TypeLitSymbol
+          1 -> pure TypeLitNat
+          _ -> fail "Binary.putTypeLitSort: invalid tag"
+
+putTypeRep :: BinHandle -> TypeRep a -> IO ()
+-- Special handling for TYPE, (->), and RuntimeRep due to recursive kind
+-- relations.
+-- See Note [Mutually recursive representations of primitive types]
+putTypeRep bh rep
+  | Just HRefl <- rep `eqTypeRep` (typeRep :: TypeRep Type)
+  = put_ bh (0 :: Word8)
+putTypeRep bh (Con' con ks) = do
+    put_ bh (1 :: Word8)
+    put_ bh con
+    put_ bh ks
+putTypeRep bh (App f x) = do
+    put_ bh (2 :: Word8)
+    putTypeRep bh f
+    putTypeRep bh x
+putTypeRep bh (Fun arg res) = do
+    put_ bh (3 :: Word8)
+    putTypeRep bh arg
+    putTypeRep bh res
+putTypeRep _ _ = fail "Binary.putTypeRep: Impossible"
+
+getSomeTypeRep :: BinHandle -> IO SomeTypeRep
+getSomeTypeRep bh = do
+    tag <- get bh :: IO Word8
+    case tag of
+        0 -> return $ SomeTypeRep (typeRep :: TypeRep Type)
+        1 -> do con <- get bh :: IO TyCon
+                ks <- get bh :: IO [SomeTypeRep]
+                return $ SomeTypeRep $ mkTrCon con ks
+
+        2 -> do SomeTypeRep f <- getSomeTypeRep bh
+                SomeTypeRep x <- getSomeTypeRep bh
+                case typeRepKind f of
+                  Fun arg res ->
+                      case arg `eqTypeRep` typeRepKind x of
+                        Just HRefl ->
+                            case typeRepKind res `eqTypeRep` (typeRep :: TypeRep Type) of
+                              Just HRefl -> return $ SomeTypeRep $ mkTrApp f x
+                              _ -> failure "Kind mismatch in type application" []
+                        _ -> failure "Kind mismatch in type application"
+                             [ "    Found argument of kind: " ++ show (typeRepKind x)
+                             , "    Where the constructor:  " ++ show f
+                             , "    Expects kind:           " ++ show arg
+                             ]
+                  _ -> failure "Applied non-arrow"
+                       [ "    Applied type: " ++ show f
+                       , "    To argument:  " ++ show x
+                       ]
+        3 -> do SomeTypeRep arg <- getSomeTypeRep bh
+                SomeTypeRep res <- getSomeTypeRep bh
+                case typeRepKind arg `eqTypeRep` (typeRep :: TypeRep Type) of
+                  Just HRefl ->
+                      case typeRepKind res `eqTypeRep` (typeRep :: TypeRep Type) of
+                        Just HRefl -> return $ SomeTypeRep $ Fun arg res
+                        Nothing -> failure "Kind mismatch" []
+                  _ -> failure "Kind mismatch" []
+        _ -> failure "Invalid SomeTypeRep" []
+  where
+    failure description info =
+        fail $ unlines $ [ "Binary.getSomeTypeRep: "++description ]
+                      ++ map ("    "++) info
+
+instance Typeable a => Binary (TypeRep (a :: k)) where
+    put_ = putTypeRep
+    get bh = do
+        SomeTypeRep rep <- getSomeTypeRep bh
+        case rep `eqTypeRep` expected of
+            Just HRefl -> pure rep
+            Nothing    -> fail $ unlines
+                               [ "Binary: Type mismatch"
+                               , "    Deserialized type: " ++ show rep
+                               , "    Expected type:     " ++ show expected
+                               ]
+     where expected = typeRep :: TypeRep a
+
+instance Binary SomeTypeRep where
+    put_ bh (SomeTypeRep rep) = putTypeRep bh rep
+    get = getSomeTypeRep
+#else
 instance Binary TypeRep where
     put_ bh type_rep = do
         let (ty_con, child_type_reps) = splitTyConApp type_rep
@@ -573,6 +784,7 @@ instance Binary TypeRep where
         ty_con <- get bh
         child_type_reps <- get bh
         return (mkTyConApp ty_con child_type_reps)
+#endif
 
 -- -----------------------------------------------------------------------------
 -- Lazy reading/writing
@@ -603,6 +815,25 @@ lazyGet bh = do
 -- UserData
 -- -----------------------------------------------------------------------------
 
+-- | Information we keep around during interface file
+-- serialization/deserialization. Namely we keep the functions for serializing
+-- and deserializing 'Name's and 'FastString's. We do this because we actually
+-- use serialization in two distinct settings,
+--
+-- * When serializing interface files themselves
+--
+-- * When computing the fingerprint of an IfaceDecl (which we computing by
+--   hashing its Binary serialization)
+--
+-- These two settings have different needs while serializing Names:
+--
+-- * Names in interface files are serialized via a symbol table (see Note
+--   [Symbol table representation of names] in BinIface).
+--
+-- * During fingerprinting a binding Name is serialized as the OccName and a
+--   non-binding Name is serialized as the fingerprint of the thing they
+--   represent. See Note [Fingerprinting IfaceDecls] for further discussion.
+--
 data UserData =
    UserData {
         -- for *deserialising* only:
@@ -610,27 +841,36 @@ data UserData =
         ud_get_fs   :: BinHandle -> IO FastString,
 
         -- for *serialising* only:
-        ud_put_name :: BinHandle -> Name       -> IO (),
+        ud_put_nonbinding_name :: BinHandle -> Name -> IO (),
+        -- ^ serialize a non-binding 'Name' (e.g. a reference to another
+        -- binding).
+        ud_put_binding_name :: BinHandle -> Name -> IO (),
+        -- ^ serialize a binding 'Name' (e.g. the name of an IfaceDecl)
         ud_put_fs   :: BinHandle -> FastString -> IO ()
    }
 
-newReadState :: (BinHandle -> IO Name)
+newReadState :: (BinHandle -> IO Name)   -- ^ how to deserialize 'Name's
              -> (BinHandle -> IO FastString)
              -> UserData
 newReadState get_name get_fs
   = UserData { ud_get_name = get_name,
                ud_get_fs   = get_fs,
-               ud_put_name = undef "put_name",
+               ud_put_nonbinding_name = undef "put_nonbinding_name",
+               ud_put_binding_name    = undef "put_binding_name",
                ud_put_fs   = undef "put_fs"
              }
 
-newWriteState :: (BinHandle -> Name       -> IO ())
+newWriteState :: (BinHandle -> Name -> IO ())
+                 -- ^ how to serialize non-binding 'Name's
+              -> (BinHandle -> Name -> IO ())
+                 -- ^ how to serialize binding 'Name's
               -> (BinHandle -> FastString -> IO ())
               -> UserData
-newWriteState put_name put_fs
+newWriteState put_nonbinding_name put_binding_name put_fs
   = UserData { ud_get_name = undef "get_name",
                ud_get_fs   = undef "get_fs",
-               ud_put_name = put_name,
+               ud_put_nonbinding_name = put_nonbinding_name,
+               ud_put_binding_name    = put_binding_name,
                ud_put_fs   = put_fs
              }
 
@@ -650,7 +890,9 @@ type Dictionary = Array Int FastString -- The dictionary
 putDictionary :: BinHandle -> Int -> UniqFM (Int,FastString) -> IO ()
 putDictionary bh sz dict = do
   put_ bh sz
-  mapM_ (putFS bh) (elems (array (0,sz-1) (eltsUFM dict)))
+  mapM_ (putFS bh) (elems (array (0,sz-1) (nonDetEltsUFM dict)))
+    -- It's OK to use nonDetEltsUFM here because the elements have indices
+    -- that array uses to create order
 
 getDictionary :: BinHandle -> IO Dictionary
 getDictionary bh = do
@@ -662,7 +904,7 @@ getDictionary bh = do
 -- The Symbol Table
 ---------------------------------------------------------
 
--- On disk, the symbol table is an array of IfaceExtName, when
+-- On disk, the symbol table is an array of IfExtName, when
 -- reading it in we turn it into a SymbolTable.
 
 type SymbolTable = Array Int Name
@@ -675,40 +917,21 @@ putFS :: BinHandle -> FastString -> IO ()
 putFS bh fs = putBS bh $ fastStringToByteString fs
 
 getFS :: BinHandle -> IO FastString
-getFS bh = do bs <- getBS bh
-              return $! mkFastStringByteString bs
+getFS bh = do
+  l  <- get bh :: IO Int
+  getPrim bh l (\src -> pure $! mkFastStringBytes src l )
 
 putBS :: BinHandle -> ByteString -> IO ()
 putBS bh bs =
   BS.unsafeUseAsCStringLen bs $ \(ptr, l) -> do
-  put_ bh l
-  let
-        go n | n == l    = return ()
-             | otherwise = do
-                b <- peekElemOff (castPtr ptr) n
-                putByte bh b
-                go (n+1)
-  go 0
+    put_ bh l
+    putPrim bh l (\op -> BS.memcpy op (castPtr ptr) l)
 
-{- -- possible faster version, not quite there yet:
-getBS bh@BinMem{} = do
-  (I# l) <- get bh
-  arr <- readIORef (arr_r bh)
-  off <- readFastMutInt (off_r bh)
-  return $! (mkFastSubBytesBA# arr off l)
--}
 getBS :: BinHandle -> IO ByteString
 getBS bh = do
-  l <- get bh
-  fp <- mallocForeignPtrBytes l
-  withForeignPtr fp $ \ptr -> do
-    let go n | n == l = return $ BS.fromForeignPtr fp 0 l
-             | otherwise = do
-                b <- getByte bh
-                pokeElemOff ptr n b
-                go (n+1)
-    --
-    go 0
+  l <- get bh :: IO Int
+  BS.create l $ \dest -> do
+    getPrim bh l (\src -> BS.memcpy dest src l)
 
 instance Binary ByteString where
   put_ bh f = putBS bh f
@@ -724,6 +947,14 @@ instance Binary FastString where
         UserData { ud_get_fs = get_fs } -> get_fs bh
 
 -- Here to avoid loop
+instance Binary LeftOrRight where
+   put_ bh CLeft  = putByte bh 0
+   put_ bh CRight = putByte bh 1
+
+   get bh = do { h <- getByte bh
+               ; case h of
+                   0 -> return CLeft
+                   _ -> return CRight }
 
 instance Binary Fingerprint where
   put_ h (Fingerprint w1 w2) = do put_ h w1; put_ h w2
@@ -946,3 +1177,18 @@ instance Binary Serialized where
         the_type <- get bh
         bytes <- get bh
         return (Serialized the_type bytes)
+
+instance Binary SourceText where
+  put_ bh NoSourceText = putByte bh 0
+  put_ bh (SourceText s) = do
+        putByte bh 1
+        put_ bh s
+
+  get bh = do
+    h <- getByte bh
+    case h of
+      0 -> return NoSourceText
+      1 -> do
+        s <- get bh
+        return (SourceText s)
+      _ -> panic $ "Binary SourceText:" ++ show h

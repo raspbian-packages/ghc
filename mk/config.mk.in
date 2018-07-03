@@ -70,16 +70,6 @@ GhcStage1HcOpts=
 GhcStage2HcOpts=-O2
 GhcStage3HcOpts=-O2
 
-# Disable -O2 optimization. Otherwise amount of generated C code
-# makes things very slow to compile (~5 minutes on core-i7 for 'compiler/hsSyn/HsExpr.lhs')
-# and sometimes not compile at all (powerpc64 overflows something
-# on 'compiler/hsSyn/HsExpr.lhs').
-ifeq "$(GhcUnregisterised)" "YES"
-GhcStage1HcOpts=
-GhcStage2HcOpts=
-GhcStage3HcOpts=
-endif
-
 # Note [Stage number in build variables].
 #
 # There are (unfortunately) two different naming schemes for build variables
@@ -99,6 +89,18 @@ GhcDynamic=NO
 
 # GhcProfiled=YES means compile a profiled stage-2 compiler
 GhcProfiled=NO
+
+# WITH_TERMINFO can be used to disable terminfo support throughout the compiler
+# and its tools. This is handy in the case of cross-compilation, where we may
+# not have an ncurses build for the target.
+ifeq "$(TargetOS_CPP)" "ios"
+# iOS has no terminfo support
+WITH_TERMINFO=NO
+else ifeq "$(Windows_Target)" "YES"
+WITH_TERMINFO=NO
+else
+WITH_TERMINFO=YES
+endif
 
 ifeq "$(findstring $(TargetOS_CPP),linux freebsd dragonfly openbsd netbsd solaris2 kfreebsdgnu haiku linux-android)" ""
 TargetElf = NO
@@ -192,6 +194,8 @@ else
 ArchSupportsSMP=$(strip $(patsubst $(TargetArch_CPP), YES, $(findstring $(TargetArch_CPP), i386 x86_64 sparc powerpc powerpc64 powerpc64le aarch64)))
 endif
 
+# The THREADED_RTS requires `BaseReg` to be in a register and the
+# `GhcUnregisterised` mode doesn't allow that.
 GhcWithSMP := $(strip $(if $(filter YESNO, $(ArchSupportsSMP)$(GhcUnregisterised)),YES,NO))
 
 # Whether to include GHCi in the compiler.  Depends on whether the RTS linker
@@ -272,14 +276,21 @@ BuildSharedLibs=$(strip $(if $(findstring dyn,$(GhcLibWays)),YES,NO))
 # In addition, the RTS is built in some further variations.  Ways that
 # make sense here:
 #
-#   thr         : threaded
-#   thr_p       : threaded profiled
-#   debug       : debugging (compile with -g for the C compiler, and -DDEBUG)
-#   debug_p     : debugging profiled
-#   thr_debug   : debugging threaded
-#   thr_debug_p : debugging threaded profiled
-#   l           : event logging
-#   thr_l       : threaded and event logging
+#   thr           : threaded
+#   thr_p         : threaded + profiled + eventlog
+#   debug         : debugging + eventlog
+#   thr_debug     : debugging + threaded, + eventlog
+#   l             : eventlog
+#   p             : profiled + eventlog
+#   thr_l         : threaded + eventlog
+#
+# Note how there are a few cases which are handled specially (in packageHsLibs)
+# to reduce the number of distinct ways,
+#
+#   debug     implies  eventlog
+#   profiled  implies  eventlog
+#
+# This means, for instance, that there is no debug_l way.
 #
 GhcRTSWays=l
 
@@ -305,6 +316,17 @@ GhcThreaded = $(if $(findstring thr,$(GhcRTSWays)),YES,NO)
 
 GhcLibHcOpts=-O2
 
+# Disable -O2 optimization. Otherwise amount of generated C code
+# makes things very slow to compile (~5 minutes on core-i7 for 'compiler/hsSyn/HsExpr.hs')
+# and sometimes not compile at all (powerpc64 overflows something
+# on 'compiler/hsSyn/HsExpr.hs').
+ifeq "$(GhcUnregisterised)" "YES"
+GhcStage1HcOpts=
+GhcStage2HcOpts=
+GhcStage3HcOpts=
+GhcLibHcOpts=
+endif
+
 # Strip local symbols from libraries?  This can make the libraries smaller,
 # but makes debugging somewhat more difficult.  Doesn't work with all ld's.
 #
@@ -319,19 +341,24 @@ StripLibraries=NO
 #		system needs to do other special magic if you are
 #		doing object-file splitting
 
-ArchSupportsSplitObjs=$(strip $(if $(filter $(TargetArch_CPP),i386 x86_64 powerpc sparc),YES,NO))
-OsSupportsSplitObjs=$(strip $(if $(filter $(TargetOS_CPP),mingw32 linux darwin solaris2 freebsd dragonfly netbsd openbsd),YES,NO))
+ArchSupportsSplitObjs=$(if $(filter \
+  $(TargetArch_CPP),i386 x86_64 powerpc sparc),YES,NO)#
+
+# We used to support splitting on Darwin, but there is no point, since Darwin
+# uses subsections via symbols
+OsSupportsSplitObjs=$(if $(filter $(TargetOS_CPP),\
+   mingw32 linux solaris2 freebsd dragonfly netbsd openbsd),YES,NO)
 SplitObjsBroken = @SplitObjsBroken@
 
-SupportsSplitObjs := $(strip \
-                    $(if $(and $(filter YES,$(ArchSupportsSplitObjs)),\
-                               $(filter YES,$(OsSupportsSplitObjs)),\
-                               $(filter NO,$(SplitObjsBroken)),\
-                               $(filter NO,$(GhcUnregisterised))),\
-                          YES,NO))
+SupportsSplitObjs := $(if $(and $(filter YES,$(ArchSupportsSplitObjs)),\
+                                $(filter YES,$(OsSupportsSplitObjs)),\
+                                $(filter NO,$(SplitObjsBroken)),\
+                                $(filter YES,$(GhcWithNativeCodeGen))),YES,NO)
 
-# By default, enable SplitObjs for the libraries if this build supports it
-SplitObjs=$(SupportsSplitObjs)
+# By default, enable SplitObjs for the libraries if this build supports it.
+# Unless SplitSections is enabled - then let that take precedence.
+SplitObjs = $(if $(and $(filter YES,$(SupportsSplitObjs)),\
+                       $(filter NO,$(SplitSections))),YES,NO)
 
 # ----------------------------------------------------------------------------
 # Section splitting
@@ -340,9 +367,14 @@ SplitObjs=$(SupportsSplitObjs)
 # like SplitObjs, but doesn't require post-processing and splitting of object
 # files.
 #
-# Set SplitSections=YES in your build.mk to enable.
-
-SplitSections=NO
+# Set SplitSections=YES or NO in your build.mk to override the default.
+#
+# This is not supported on Darwin (where you can use subsections-via-symbols
+# instead) and Windows is not yet working. (See #11445 and related tickets.)
+OsSupportsSplitSections=$(if $(filter $(TargetOS_CPP),mingw32 darwin),NO,YES)
+SupportsSplitSections=$(if $(and $(filter YES,$(OsSupportsSplitSections)),\
+                                   $(filter YES,$(LdIsGNULd))),YES,NO)
+SplitSections ?= $(SupportsSplitSections)
 
 # ----------------------------------------------------------------------------
 
@@ -379,28 +411,13 @@ FFIIncludeDir=@FFIIncludeDir@
 
 # GHC needs arch-specific tweak at least in
 #     rts/Libdw.c:set_initial_registers()
-GhcRtsWithLibdw=$(strip $(if $(filter $(TargetArch_CPP),i386 x86_64),@HaveLibdw@,NO))
+GhcRtsWithLibdw=$(strip $(if $(filter $(TargetArch_CPP),i386 x86_64),@UseLibdw@,NO))
 
 ################################################################################
 #
 #		Paths (see paths.mk)
 #
 ################################################################################
-
-# Directory used by GHC (and possibly other tools) for storing
-# temporary files.  If your TMPDIR isn't big enough, either override
-# this in build.mk or set your environment variable "TMPDIR" to point
-# to somewhere with more space.  (TMPDIR=. is a good choice).
-
-# DEFAULT_TMPDIR isn't called TMPDIR because GNU make tends to
-# override an environment variable with the value of the make variable
-# of the same name (if it exists) when executing sub-processes, so
-# setting the TMPDIR env var would have no effect in the build tree.
-
-DEFAULT_TMPDIR		= /tmp
-ifeq "$(TARGETPLATFORM)" "i386-unknown-mingw32"
-DEFAULT_TMPDIR		= /C/TEMP
-endif
 
 BIN_DIST_NAME         = ghc-$(ProjectVersion)
 BIN_DIST_PREP_DIR     = bindistprep/$(BIN_DIST_NAME)
@@ -504,39 +521,42 @@ endif
 
 GHC_PACKAGE_DB_FLAG = @GHC_PACKAGE_DB_FLAG@
 
-CMM_SINK_BOOTSTRAP_IS_NEEDED = @CMM_SINK_BOOTSTRAP_IS_NEEDED@
-
-SUPPORTS_COMPONENT_ID = @SUPPORTS_COMPONENT_ID@
 SUPPORTS_THIS_UNIT_ID = @SUPPORTS_THIS_UNIT_ID@
 
 #-----------------------------------------------------------------------------
 # C compiler
 #
-# NB. Don't override $(WhatGccIsCalled) using build.mk,  re-configure using
-# the flag --with-gcc=<blah> instead.  The reason is that the configure script
+# NB. Don't override $(CC) using build.mk,  re-configure using
+# the flag CC=<blah> instead.  The reason is that the configure script
 # needs to know which gcc you're using in order to perform its tests.
 
-WhatGccIsCalled       = @WhatGccIsCalled@
 GccVersion            = @GccVersion@
+ifeq "$(phase)" "0"
+CrossCompilePrefix    =
+else
+CrossCompilePrefix    = @CrossCompilePrefix@
+endif
 # TargetPlatformFull retains the string passed to configure so we have it in
 # the necessary format to pass to libffi's configure.
 TargetPlatformFull    = @TargetPlatformFull@
 GccLT34         = @GccLT34@
+GccLT44         = @GccLT44@
 GccLT46         = @GccLT46@
 GccIsClang      = @GccIsClang@
 
-CC              = $(WhatGccIsCalled)
+CC              = @CC@
 CC_STAGE0       = @CC_STAGE0@
 CC_STAGE1       = $(CC)
 CC_STAGE2       = $(CC)
 CC_STAGE3       = $(CC)
 
-AS              = $(WhatGccIsCalled)
+AS              = @CC@
 AS_STAGE0       = @CC_STAGE0@
 AS_STAGE1       = $(AS)
 AS_STAGE2       = $(AS)
 AS_STAGE3       = $(AS)
 
+# why no LD=@LD@ ?
 LD_STAGE0       = @LD_STAGE0@
 LD_STAGE1       = $(LD)
 LD_STAGE2       = $(LD)
@@ -551,11 +571,6 @@ CrossCompiling        = @CrossCompiling@
 # See Note [CrossCompiling vs Stage1Only]
 # See Note [Stage1Only vs stage=1]
 Stage1Only = NO
-
-# Installed tools prefix:
-#    we add prefix to crosscompiler GHC only (ghc-stage1),
-#    not cross-built GHC (not ghc-stage2).
-CrossCompilePrefix    = $(if $(filter YES,$(Stage1Only)),@CrossCompilePrefix@,)
 
 # Install stage 2 by default, or stage 1 in the cross compiler
 # case. Can be changed to 3
@@ -630,10 +645,6 @@ CONF_HC_OPTS_STAGE0 = @CONF_HC_OPTS_STAGE0@
 CONF_HC_OPTS_STAGE1 = @CONF_HC_OPTS_STAGE1@
 CONF_HC_OPTS_STAGE2 = @CONF_HC_OPTS_STAGE2@
 
-ifeq "$(TARGETPLATFORM)" "ia64-unknown-linux"
-CONF_CC_OPTS += -G0
-endif
-
 # The .hsc files aren't currently safe for cross-compilation on Windows:
 #     libraries\haskeline\.\System\Console\Haskeline\Backend\Win32.hsc:160
 #     directive "let" is not safe for cross-compilation
@@ -655,9 +666,9 @@ ifeq "$(CrossCompiling)" "YES"
 SRC_HSC2HS_OPTS_STAGE1 += --cross-compile
 SRC_HSC2HS_OPTS_STAGE2 += --cross-compile
 endif
-SRC_HSC2HS_OPTS_STAGE0 += --cflag=-D$(HostArch_CPP)_HOST_ARCH=1 --cflag=-D$(HostOS_CPP)_HOST_OS=1
-SRC_HSC2HS_OPTS_STAGE1 += --cflag=-D$(TargetArch_CPP)_HOST_ARCH=1 --cflag=-D$(TargetOS_CPP)_HOST_OS=1
-SRC_HSC2HS_OPTS_STAGE2 += --cflag=-D$(TargetArch_CPP)_HOST_ARCH=1 --cflag=-D$(TargetOS_CPP)_HOST_OS=1
+SRC_HSC2HS_OPTS_STAGE0 += --cflag=-D$(HostArch_CPP)_HOST_ARCH --cflag=-D$(HostOS_CPP)_HOST_OS
+SRC_HSC2HS_OPTS_STAGE1 += --cflag=-D$(TargetArch_CPP)_HOST_ARCH --cflag=-D$(TargetOS_CPP)_HOST_OS
+SRC_HSC2HS_OPTS_STAGE2 += --cflag=-D$(TargetArch_CPP)_HOST_ARCH --cflag=-D$(TargetOS_CPP)_HOST_OS
 
 ifeq "$(TARGETPLATFORM)" "i386-unknown-mingw32"
 WINDRES = $(INPLACE_MINGW)/bin/windres
@@ -779,9 +790,9 @@ STRIP_CMD      = strip
 endif
 PATCH_CMD      = @PatchCmd@
 TAR_CMD        = @TarCmd@
-BZIP2_CMD      = bzip2
-GZIP_CMD       = gzip
-XZ_CMD         = xz
+BZIP2_CMD      = @Bzip2Cmd@
+GZIP_CMD       = @GzipCmd@
+XZ_CMD         = @XzCmd@
 
 # xz is default compression
 TAR_COMP      ?= xz

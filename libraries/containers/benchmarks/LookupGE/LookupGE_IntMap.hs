@@ -2,10 +2,7 @@
 module LookupGE_IntMap where
 
 import Prelude hiding (null)
-import Data.IntMap.Base
-#ifdef TESTING
-import Test.QuickCheck
-#endif
+import Data.IntMap.Internal
 
 lookupGE1 :: Key -> IntMap a -> Maybe (Key,a)
 lookupGE1 k m =

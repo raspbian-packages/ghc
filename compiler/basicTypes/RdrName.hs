@@ -46,12 +46,14 @@ module RdrName (
         GlobalRdrEnv, emptyGlobalRdrEnv, mkGlobalRdrEnv, plusGlobalRdrEnv,
         lookupGlobalRdrEnv, extendGlobalRdrEnv, greOccName, shadowNames,
         pprGlobalRdrEnv, globalRdrEnvElts,
-        lookupGRE_RdrName, lookupGRE_Name, lookupGRE_Field_Name, getGRE_NameQualifier_maybes,
+        lookupGRE_RdrName, lookupGRE_Name, lookupGRE_FieldLabel,
+        getGRE_NameQualifier_maybes,
         transformGREs, pickGREs, pickGREsModExp,
 
         -- * GlobalRdrElts
         gresFromAvails, gresFromAvail, localGREsFromAvail, availFromGRE,
         greUsedRdrName, greRdrNames, greSrcSpan, greQualModName,
+        gresToAvailInfo,
 
         -- ** Global 'RdrName' mapping elements: 'GlobalRdrElt', 'Provenance', 'ImportSpec'
         GlobalRdrElt(..), isLocalGRE, isRecFldGRE, greLabel,
@@ -74,11 +76,13 @@ import FastString
 import FieldLabel
 import Outputable
 import Unique
+import UniqFM
+import UniqSet
 import Util
-import StaticFlags( opt_PprStyle_Debug )
+import NameEnv
 
 import Data.Data
-import Data.List( sortBy )
+import Data.List( sortBy, foldl', nub )
 
 {-
 ************************************************************************
@@ -88,7 +92,9 @@ import Data.List( sortBy )
 ************************************************************************
 -}
 
--- | Do not use the data constructors of RdrName directly: prefer the family
+-- | Reader Name
+--
+-- Do not use the data constructors of RdrName directly: prefer the family
 -- of functions that creates them, such as 'mkRdrUnqual'
 --
 -- - Note: A Located RdrName will only have API Annotations if it is a
@@ -108,11 +114,15 @@ import Data.List( sortBy )
 -- For details on above see note [Api annotations] in ApiAnnotation
 data RdrName
   = Unqual OccName
-        -- ^ Used for ordinary, unqualified occurrences, e.g. @x@, @y@ or @Foo@.
+        -- ^ Unqualified  name
+        --
+        -- Used for ordinary, unqualified occurrences, e.g. @x@, @y@ or @Foo@.
         -- Create such a 'RdrName' with 'mkRdrUnqual'
 
   | Qual ModuleName OccName
-        -- ^ A qualified name written by the user in
+        -- ^ Qualified name
+        --
+        -- A qualified name written by the user in
         -- /source/ code.  The module isn't necessarily
         -- the module where the thing is defined;
         -- just the one from which it is imported.
@@ -120,14 +130,18 @@ data RdrName
         -- Create such a 'RdrName' with 'mkRdrQual'
 
   | Orig Module OccName
-        -- ^ An original name; the module is the /defining/ module.
+        -- ^ Original name
+        --
+        -- An original name; the module is the /defining/ module.
         -- This is used when GHC generates code that will be fed
         -- into the renamer (e.g. from deriving clauses), but where
         -- we want to say \"Use Prelude.map dammit\". One of these
         -- can be created with 'mkOrig'
 
   | Exact Name
-        -- ^ We know exactly the 'Name'. This is used:
+        -- ^ Exact name
+        --
+        -- We know exactly the 'Name'. This is used:
         --
         --  (1) When the parser parses built-in syntax like @[]@
         --      and @(,)@, but wants a 'RdrName' from it
@@ -135,7 +149,7 @@ data RdrName
         --  (2) By Template Haskell, when TH has generated a unique name
         --
         -- Such a 'RdrName' can be created by using 'getRdrName' on a 'Name'
-  deriving (Data, Typeable)
+  deriving Data
 
 {-
 ************************************************************************
@@ -318,13 +332,13 @@ instance Ord RdrName where
 ************************************************************************
 -}
 
--- | This environment is used to store local bindings (@let@, @where@, lambda, @case@).
+-- | Local Reader Environment
+--
+-- This environment is used to store local bindings
+-- (@let@, @where@, lambda, @case@).
 -- It is keyed by OccName, because we never use it for qualified names
 -- We keep the current mapping, *and* the set of all Names in scope
 -- Reason: see Note [Splicing Exact names] in RnEnv
--- The field lre_nwcs is used to keep names of type variables that should
--- be replaced with named wildcards.
--- See Note [Renaming named wild cards] in RnTypes
 data LocalRdrEnv = LRE { lre_env      :: OccEnv Name
                        , lre_in_scope :: NameSet }
 
@@ -333,7 +347,7 @@ instance Outputable LocalRdrEnv where
     = hang (text "LocalRdrEnv {")
          2 (vcat [ text "env =" <+> pprOccEnv ppr_elt env
                  , text "in_scope ="
-                    <+> braces (pprWithCommas ppr (nameSetElems ns))
+                    <+> pprUFM (getUniqSet ns) (braces . pprWithCommas ppr)
                  ] <+> char '}')
     where
       ppr_elt name = parens (ppr (getUnique (nameOccName name))) <+> ppr name
@@ -407,6 +421,7 @@ the in-scope-name-set.
 ************************************************************************
 -}
 
+-- | Global Reader Environment
 type GlobalRdrEnv = OccEnv [GlobalRdrElt]
 -- ^ Keyed by 'OccName'; when looking up a qualified name
 -- we look up the 'OccName' part, and then check the 'Provenance'
@@ -425,14 +440,23 @@ type GlobalRdrEnv = OccEnv [GlobalRdrElt]
 --              happens only when type-checking a [d| ... |] Template
 --              Haskell quotation; see this note in RnNames
 --              Note [Top-level Names in Template Haskell decl quotes]
+--
+-- INVARIANT 3: If the GlobalRdrEnv maps [occ -> gre], then
+--                 greOccName gre = occ
+--
+--              NB: greOccName gre is usually the same as
+--                  nameOccName (gre_name gre), but not always in the
+--                  case of record seectors; see greOccName
 
--- | An element of the 'GlobalRdrEnv'
+-- | Global Reader Element
+--
+-- An element of the 'GlobalRdrEnv'
 data GlobalRdrElt
   = GRE { gre_name :: Name
         , gre_par  :: Parent
         , gre_lcl :: Bool          -- ^ True <=> the thing was defined locally
         , gre_imp :: [ImportSpec]  -- ^ In scope through these imports
-    } deriving (Data, Typeable)
+    } deriving (Data, Eq)
          -- INVARIANT: either gre_lcl = True or gre_imp is non-empty
          -- See Note [GlobalRdrElt provenance]
 
@@ -442,7 +466,6 @@ data Parent = NoParent
             | ParentIs  { par_is :: Name }
             | FldParent { par_is :: Name, par_lbl :: Maybe FieldLabelString }
               -- ^ See Note [Parents for record fields]
-            | PatternSynonym
             deriving (Eq, Data, Typeable)
 
 instance Outputable Parent where
@@ -450,7 +473,6 @@ instance Outputable Parent where
    ppr (ParentIs n)    = text "parent:" <> ppr n
    ppr (FldParent n f) = text "fldparent:"
                              <> ppr n <> colon <> ppr f
-   ppr (PatternSynonym) = text "pattern synonym"
 
 plusParent :: Parent -> Parent -> Parent
 -- See Note [Combining parents]
@@ -458,7 +480,6 @@ plusParent p1@(ParentIs _)    p2 = hasParent p1 p2
 plusParent p1@(FldParent _ _) p2 = hasParent p1 p2
 plusParent p1 p2@(ParentIs _)    = hasParent p2 p1
 plusParent p1 p2@(FldParent _ _) = hasParent p2 p1
-plusParent PatternSynonym PatternSynonym = PatternSynonym
 plusParent _ _                   = NoParent
 
 hasParent :: Parent -> Parent -> Parent
@@ -509,19 +530,12 @@ Note [Parents]
   class C          Class operations
                    Associated type constructors
 
-The `PatternSynonym` constructor is so called as pattern synonyms can be
-bundled with any type constructor (during renaming). In other words, they can
-have any parent.
-
 ~~~~~~~~~~~~~~~~~~~~~~~~~
  Constructor      Meaning
  ~~~~~~~~~~~~~~~~~~~~~~~~
   NoParent        Can not be bundled with a type constructor.
   ParentIs n      Can be bundled with the type constructor corresponding to
                   n.
-  PatternSynonym  Can be bundled with any type constructor. It is so called
-                  because only pattern synonyms can be bundled with any type
-                  constructor.
   FldParent       See Note [Parents for record fields]
 
 
@@ -551,6 +565,16 @@ entry looks like this:
 Note that the OccName used when adding a GRE to the environment
 (greOccName) now depends on the parent field: for FldParent it is the
 field label, if present, rather than the selector name.
+
+~~
+
+Record pattern synonym selectors are treated differently. Their parent
+information is `NoParent` in the module in which they are defined. This is because
+a pattern synonym `P` has no parent constructor either.
+
+However, if `f` is bundled with a type constructor `T` then whenever `f` is
+imported the parent will use the `Parent` constructor so the parent of `f` is
+now `T`.
 
 
 Note [Combining parents]
@@ -605,7 +629,8 @@ gresFromAvail prov_fn avail
           Just is -> GRE { gre_name = n, gre_par = mkParent n avail
                          , gre_lcl = False, gre_imp = [is] }
 
-    mk_fld_gre (FieldLabel lbl is_overloaded n)
+    mk_fld_gre (FieldLabel { flLabel = lbl, flIsOverloaded = is_overloaded
+                           , flSelector = n })
       = case prov_fn n of  -- Nothing => bound locally
                            -- Just is => imported from 'is'
           Nothing -> GRE { gre_name = n, gre_par = FldParent (availName avail) mb_lbl
@@ -661,10 +686,51 @@ greSrcSpan gre@(GRE { gre_name = name, gre_lcl = lcl, gre_imp = iss } )
   | otherwise     = pprPanic "greSrcSpan" (ppr gre)
 
 mkParent :: Name -> AvailInfo -> Parent
-mkParent _ (Avail NotPatSyn _)           = NoParent
-mkParent _ (Avail IsPatSyn  _)           = PatternSynonym
+mkParent _ (Avail _)           = NoParent
 mkParent n (AvailTC m _ _) | n == m    = NoParent
                          | otherwise = ParentIs m
+
+greParentName :: GlobalRdrElt -> Maybe Name
+greParentName gre = case gre_par gre of
+                      NoParent -> Nothing
+                      ParentIs n -> Just n
+                      FldParent n _ -> Just n
+
+-- | Takes a list of distinct GREs and folds them
+-- into AvailInfos. This is more efficient than mapping each individual
+-- GRE to an AvailInfo and the folding using `plusAvail` but needs the
+-- uniqueness assumption.
+gresToAvailInfo :: [GlobalRdrElt] -> [AvailInfo]
+gresToAvailInfo gres
+  = ASSERT( nub gres == gres ) nameEnvElts avail_env
+  where
+    avail_env :: NameEnv AvailInfo -- keyed by the parent
+    avail_env = foldl' add emptyNameEnv gres
+
+    add :: NameEnv AvailInfo -> GlobalRdrElt -> NameEnv AvailInfo
+    add env gre = extendNameEnv_Acc comb availFromGRE env
+                    (fromMaybe (gre_name gre)
+                               (greParentName gre)) gre
+
+      where
+        -- We want to insert the child `k` into a list of children but
+        -- need to maintain the invariant that the parent is first.
+        --
+        -- We also use the invariant that `k` is not already in `ns`.
+        insertChildIntoChildren :: Name -> [Name] -> Name -> [Name]
+        insertChildIntoChildren _ [] k = [k]
+        insertChildIntoChildren p (n:ns) k
+          | p == k = k:n:ns
+          | otherwise = n:k:ns
+
+        comb :: GlobalRdrElt -> AvailInfo -> AvailInfo
+        comb _ (Avail n) = Avail n -- Duplicated name
+        comb gre (AvailTC m ns fls) =
+          let n = gre_name gre
+          in case gre_par gre of
+              NoParent -> AvailTC m (n:ns) fls -- Not sure this ever happens
+              ParentIs {} -> AvailTC m (insertChildIntoChildren m ns n) fls
+              FldParent _ mb_lbl ->  AvailTC m ns (mkFieldLabel n mb_lbl : fls)
 
 availFromGRE :: GlobalRdrElt -> AvailInfo
 availFromGRE (GRE { gre_name = me, gre_par = parent })
@@ -672,9 +738,17 @@ availFromGRE (GRE { gre_name = me, gre_par = parent })
       ParentIs p                  -> AvailTC p [me] []
       NoParent   | isTyConName me -> AvailTC me [me] []
                  | otherwise      -> avail   me
-      FldParent p Nothing         -> AvailTC p [] [FieldLabel (occNameFS $ nameOccName me) False me]
-      FldParent p (Just lbl)      -> AvailTC p [] [FieldLabel lbl True me]
-      PatternSynonym              -> patSynAvail me
+      FldParent p mb_lbl -> AvailTC p [] [mkFieldLabel me mb_lbl]
+
+mkFieldLabel :: Name -> Maybe FastString -> FieldLabel
+mkFieldLabel me mb_lbl =
+          case mb_lbl of
+                 Nothing  -> FieldLabel { flLabel = occNameFS (nameOccName me)
+                                        , flIsOverloaded = False
+                                        , flSelector = me }
+                 Just lbl -> FieldLabel { flLabel = lbl
+                                        , flIsOverloaded = True
+                                        , flSelector = me }
 
 emptyGlobalRdrEnv :: GlobalRdrEnv
 emptyGlobalRdrEnv = emptyOccEnv
@@ -718,25 +792,42 @@ lookupGRE_RdrName rdr_name env
     Nothing   -> []
     Just gres -> pickGREs rdr_name gres
 
-lookupGRE_Name :: GlobalRdrEnv -> Name -> [GlobalRdrElt]
+lookupGRE_Name :: GlobalRdrEnv -> Name -> Maybe GlobalRdrElt
+-- ^ Look for precisely this 'Name' in the environment.  This tests
+-- whether it is in scope, ignoring anything else that might be in
+-- scope with the same 'OccName'.
 lookupGRE_Name env name
-  = [ gre | gre <- lookupGlobalRdrEnv env (nameOccName name),
-            gre_name gre == name ]
+  = lookupGRE_Name_OccName env name (nameOccName name)
 
-lookupGRE_Field_Name :: GlobalRdrEnv -> Name -> FastString -> [GlobalRdrElt]
--- Used when looking up record fields, where the selector name and
--- field label are different: the GlobalRdrEnv is keyed on the label
-lookupGRE_Field_Name env sel_name lbl
-  = [ gre | gre <- lookupGlobalRdrEnv env (mkVarOccFS lbl),
-            gre_name gre == sel_name ]
+lookupGRE_FieldLabel :: GlobalRdrEnv -> FieldLabel -> Maybe GlobalRdrElt
+-- ^ Look for a particular record field selector in the environment, where the
+-- selector name and field label may be different: the GlobalRdrEnv is keyed on
+-- the label.  See Note [Parents for record fields] for why this happens.
+lookupGRE_FieldLabel env fl
+  = lookupGRE_Name_OccName env (flSelector fl) (mkVarOccFS (flLabel fl))
+
+lookupGRE_Name_OccName :: GlobalRdrEnv -> Name -> OccName -> Maybe GlobalRdrElt
+-- ^ Look for precisely this 'Name' in the environment, but with an 'OccName'
+-- that might differ from that of the 'Name'.  See 'lookupGRE_FieldLabel' and
+-- Note [Parents for record fields].
+lookupGRE_Name_OccName env name occ
+  = case [ gre | gre <- lookupGlobalRdrEnv env occ
+               , gre_name gre == name ] of
+      []    -> Nothing
+      [gre] -> Just gre
+      gres  -> pprPanic "lookupGRE_Name_OccName"
+                        (ppr name $$ ppr occ $$ ppr gres)
+               -- See INVARIANT 1 on GlobalRdrEnv
 
 
 getGRE_NameQualifier_maybes :: GlobalRdrEnv -> Name -> [Maybe [ModuleName]]
 -- Returns all the qualifiers by which 'x' is in scope
 -- Nothing means "the unqualified version is in scope"
 -- [] means the thing is not in scope at all
-getGRE_NameQualifier_maybes env
-  = map (qualifier_maybe) . lookupGRE_Name env
+getGRE_NameQualifier_maybes env name
+  = case lookupGRE_Name env name of
+      Just gre -> [qualifier_maybe gre]
+      Nothing  -> []
   where
     qualifier_maybe (GRE { gre_lcl = lcl, gre_imp = iss })
       | lcl       = Nothing
@@ -756,7 +847,7 @@ greLabel (GRE{gre_name = n, gre_par = FldParent{}})     = Just (occNameFS (nameO
 greLabel _                                              = Nothing
 
 unQualOK :: GlobalRdrElt -> Bool
--- ^ Test if an unqualifed version of this thing would be in scope
+-- ^ Test if an unqualified version of this thing would be in scope
 unQualOK (GRE {gre_lcl = lcl, gre_imp = iss })
   | lcl = True
   | otherwise = any unQualSpecOK iss
@@ -771,7 +862,7 @@ as 'rdr', say "x".  It does two things:
     * Unqualified, as 'x'    if want_unqual  is Unqual _
 
 (b) for that subset, filter the provenance field (gre_lcl and gre_imp)
-    to ones that brought it into scope qualifed or unqualified resp.
+    to ones that brought it into scope qualified or unqualified resp.
 
 Example:
       module A ( f ) where
@@ -801,7 +892,7 @@ pickGREs :: RdrName -> [GlobalRdrElt] -> [GlobalRdrElt]
 --    * Unqualified, as 'x'    if want_unqual  is Unqual _
 --
 -- Return each such GRE, with its ImportSpecs filtered, to reflect
--- how it is in scope qualifed or unqualified respectively.
+-- how it is in scope qualified or unqualified respectively.
 -- See Note [GRE filtering]
 pickGREs (Unqual {})  gres = mapMaybe pickUnqualGRE     gres
 pickGREs (Qual mod _) gres = mapMaybe (pickQualGRE mod) gres
@@ -1000,13 +1091,17 @@ shadowName env name
 ************************************************************************
 -}
 
--- | The 'ImportSpec' of something says how it came to be imported
+-- | Import Specification
+--
+-- The 'ImportSpec' of something says how it came to be imported
 -- It's quite elaborate so that we can give accurate unused-name warnings.
 data ImportSpec = ImpSpec { is_decl :: ImpDeclSpec,
                             is_item :: ImpItemSpec }
-                deriving( Eq, Ord, Data, Typeable )
+                deriving( Eq, Ord, Data )
 
--- | Describes a particular import declaration and is
+-- | Import Declaration Specification
+--
+-- Describes a particular import declaration and is
 -- shared among all the 'Provenance's for that decl
 data ImpDeclSpec
   = ImpDeclSpec {
@@ -1019,9 +1114,11 @@ data ImpDeclSpec
         is_as       :: ModuleName, -- ^ Import alias, e.g. from @as M@ (or @Muggle@ if there is no @as@ clause)
         is_qual     :: Bool,       -- ^ Was this import qualified?
         is_dloc     :: SrcSpan     -- ^ The location of the entire import declaration
-    } deriving (Data, Typeable)
+    } deriving Data
 
--- | Describes import info a particular Name
+-- | Import Item Specification
+--
+-- Describes import info a particular Name
 data ImpItemSpec
   = ImpAll              -- ^ The import had no import list,
                         -- or had a hiding list
@@ -1038,7 +1135,7 @@ data ImpItemSpec
         --
         -- Here the constructors of @T@ are not named explicitly;
         -- only @T@ is named explicitly.
-  deriving (Data, Typeable)
+  deriving Data
 
 instance Eq ImpDeclSpec where
   p1 == p2 = case p1 `compare` p2 of EQ -> True; _ -> False
@@ -1051,12 +1148,17 @@ instance Eq ImpItemSpec where
   p1 == p2 = case p1 `compare` p2 of EQ -> True; _ -> False
 
 instance Ord ImpItemSpec where
-   compare is1 is2 = is_iloc is1 `compare` is_iloc is2
+   compare is1 is2 =
+    case (is1, is2) of
+      (ImpAll, ImpAll) -> EQ
+      (ImpAll, _)      -> GT
+      (_, ImpAll)      -> LT
+      (ImpSome _ l1, ImpSome _ l2) -> l1 `compare` l2
 
 
 bestImport :: [ImportSpec] -> ImportSpec
 -- Given a non-empty bunch of ImportSpecs, return the one that
--- imported the item most specficially (e.g. by name), using
+-- imported the item most specifically (e.g. by name), using
 -- textually-first as a tie breaker. This is used when reporting
 -- redundant imports
 bestImport iss
@@ -1101,8 +1203,9 @@ pprNameProvenance :: GlobalRdrElt -> SDoc
 -- ^ Print out one place where the name was define/imported
 -- (With -dppr-debug, print them all)
 pprNameProvenance (GRE { gre_name = name, gre_lcl = lcl, gre_imp = iss })
-  | opt_PprStyle_Debug = vcat pp_provs
-  | otherwise          = head pp_provs
+  = sdocWithPprDebug $ \dbg -> if dbg
+      then vcat pp_provs
+      else head pp_provs
   where
     pp_provs = pp_lcl ++ map pp_is iss
     pp_lcl = if lcl then [text "defined at" <+> ppr (nameSrcLoc name)]
@@ -1120,7 +1223,7 @@ ppr_defn_site imp_spec name
                 2 (pprLoc loc)
   where
     loc = nameSrcSpan name
-    defining_mod = nameModule name
+    defining_mod = ASSERT2( isExternalName name, ppr name ) nameModule name
     same_module = importSpecModule imp_spec == moduleName defining_mod
     pp_mod | same_module = empty
            | otherwise   = text "in" <+> quotes (ppr defining_mod)

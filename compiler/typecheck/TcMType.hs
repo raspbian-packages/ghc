@@ -19,20 +19,22 @@ module TcMType (
   newFlexiTyVar,
   newFlexiTyVarTy,              -- Kind -> TcM TcType
   newFlexiTyVarTys,             -- Int -> Kind -> TcM [TcType]
-  newOpenFlexiTyVarTy,
-  newMetaKindVar, newMetaKindVars,
+  newOpenFlexiTyVarTy, newOpenTypeKind,
+  newMetaKindVar, newMetaKindVars, newMetaTyVarTyAtLevel,
   cloneMetaTyVar,
   newFmvTyVar, newFskTyVar,
 
-  readMetaTyVar, writeMetaTyVar, writeMetaTyVarRef,
+  readMetaTyVar, writeMetaTyVar,
   newMetaDetails, isFilledMetaTyVar, isUnfilledMetaTyVar,
 
   --------------------------------
   -- Expected types
   ExpType(..), ExpSigmaType, ExpRhoType,
-  mkCheckExpType, newOpenInferExpType, readExpType, readExpType_maybe,
-  writeExpType, expTypeToType, checkingExpType_maybe, checkingExpType,
-  tauifyExpType,
+  mkCheckExpType,
+  newInferExpType, newInferExpTypeInst, newInferExpTypeNoInst,
+  readExpType, readExpType_maybe,
+  expTypeToType, checkingExpType_maybe, checkingExpType,
+  tauifyExpType, inferResultToType,
 
   --------------------------------
   -- Creating fresh type variables for pm checking
@@ -41,7 +43,7 @@ module TcMType (
   --------------------------------
   -- Creating new evidence variables
   newEvVar, newEvVars, newDict,
-  newWanted, newWanteds,
+  newWanted, newWanteds, cloneWanted, cloneWC,
   emitWanted, emitWantedEq, emitWantedEvVar, emitWantedEvVars,
   newTcEvBinds, addTcEvBind,
 
@@ -51,12 +53,12 @@ module TcMType (
 
   --------------------------------
   -- Instantiation
-  newMetaTyVars, newMetaTyVarX, newMetaSigTyVars,
-  newSigTyVar,
+  newMetaTyVars, newMetaTyVarX, newMetaTyVarsX,
+  newMetaSigTyVars, newMetaSigTyVarX,
+  newSigTyVar, newWildCardX,
   tcInstType,
-  tcInstSkolTyVars, tcInstSkolTyVarsLoc, tcInstSuperSkolTyVarsX,
-  tcInstSigTyVarsLoc, tcInstSigTyVars,
-  tcInstSkolType,
+  tcInstSkolTyVars,tcInstSkolTyVarsX,
+  tcInstSuperSkolTyVarsX,
   tcSkolDFunType, tcSuperSkolTyVars,
 
   instSkolTyCoVars, freshenTyVarBndrs, freshenCoVarBndrsX,
@@ -66,20 +68,24 @@ module TcMType (
   zonkTidyTcType, zonkTidyOrigin,
   mkTypeErrorThing, mkTypeErrorThingArgs,
   tidyEvVar, tidyCt, tidySkolemInfo,
-  skolemiseUnboundMetaTyVar,
+  skolemiseRuntimeUnk,
   zonkTcTyVar, zonkTcTyVars, zonkTcTyVarToTyVar,
   zonkTyCoVarsAndFV, zonkTcTypeAndFV,
   zonkTyCoVarsAndFVList,
   zonkTcTypeAndSplitDepVars, zonkTcTypesAndSplitDepVars,
-  zonkQuantifiedTyVar, zonkQuantifiedTyVarOrType,
+  zonkQuantifiedTyVar, defaultTyVar,
   quantifyTyVars, quantifyZonkedTyVars,
-  defaultKindVar,
-  zonkTcTyCoVarBndr, zonkTcTyBinder, zonkTcType, zonkTcTypes, zonkCo,
+  zonkTcTyCoVarBndr, zonkTcTyVarBinder,
+  zonkTcType, zonkTcTypes, zonkCo,
   zonkTyCoVarKind, zonkTcTypeMapper,
 
   zonkEvVar, zonkWC, zonkSimples, zonkId, zonkCt, zonkSkolemInfo,
 
-  tcGetGlobalTyCoVars
+  tcGetGlobalTyCoVars,
+
+  ------------------------------
+  -- Levity polymorphism
+  ensureNotLevPoly, checkForLevPoly, checkForLevPolyX, formatLevPolyErr
   ) where
 
 #include "HsVersions.h"
@@ -102,6 +108,7 @@ import VarSet
 import TysWiredIn
 import TysPrim
 import VarEnv
+import NameEnv
 import PrelNames
 import Util
 import Outputable
@@ -109,11 +116,12 @@ import FastString
 import SrcLoc
 import Bag
 import Pair
+import UniqSet
 import qualified GHC.LanguageExtensions as LangExt
 
 import Control.Monad
 import Maybes
-import Data.List        ( mapAccumL, partition )
+import Data.List        ( mapAccumL )
 import Control.Arrow    ( second )
 
 {-
@@ -166,10 +174,29 @@ newWanted orig t_or_k pty
                             else EvVarDest <$> newEvVar pty
        return $ CtWanted { ctev_dest = d
                          , ctev_pred = pty
+                         , ctev_nosh = WDeriv
                          , ctev_loc = loc }
 
 newWanteds :: CtOrigin -> ThetaType -> TcM [CtEvidence]
 newWanteds orig = mapM (newWanted orig Nothing)
+
+cloneWanted :: Ct -> TcM CtEvidence
+cloneWanted ct
+  = newWanted (ctEvOrigin ev) Nothing (ctEvPred ev)
+  where
+    ev = ctEvidence ct
+
+cloneWC :: WantedConstraints -> TcM WantedConstraints
+cloneWC wc@(WC { wc_simple = simples, wc_impl = implics })
+  = do { simples' <- mapBagM clone_one simples
+       ; implics' <- mapBagM clone_implic implics
+       ; return (wc { wc_simple = simples', wc_impl = implics' }) }
+  where
+    clone_one ct = do { ev <- cloneWanted ct; return (mkNonCanonical ev) }
+
+    clone_implic implic@(Implic { ic_wanted = inner_wanted })
+      = do { inner_wanted' <- cloneWC inner_wanted
+           ; return (implic { ic_wanted = inner_wanted' }) }
 
 -- | Emits a new Wanted. Deals with both equalities and non-equalities.
 emitWanted :: CtOrigin -> TcPredType -> TcM EvTerm
@@ -184,7 +211,8 @@ emitWantedEq origin t_or_k role ty1 ty2
   = do { hole <- newCoercionHole
        ; loc <- getCtLocM origin (Just t_or_k)
        ; emitSimple $ mkNonCanonical $
-           CtWanted { ctev_pred = pty, ctev_dest = HoleDest hole, ctev_loc = loc }
+         CtWanted { ctev_pred = pty, ctev_dest = HoleDest hole
+                  , ctev_nosh = WDeriv, ctev_loc = loc }
        ; return (mkHoleCo hole role ty1 ty2) }
   where
     pty = mkPrimEqPredRole role ty1 ty2
@@ -197,6 +225,7 @@ emitWantedEvVar origin ty
        ; loc <- getCtLocM origin Nothing
        ; let ctev = CtWanted { ctev_dest = EvVarDest new_cv
                              , ctev_pred = ty
+                             , ctev_nosh = WDeriv
                              , ctev_loc  = loc }
        ; emitSimple $ mkNonCanonical ctev
        ; return new_cv }
@@ -333,21 +362,26 @@ test gadt/gadt-escape1.
 -- actual data definition is in TcType
 
 -- | Make an 'ExpType' suitable for inferring a type of kind * or #.
-newOpenInferExpType :: TcM ExpType
-newOpenInferExpType
-  = do { rr <- newFlexiTyVarTy runtimeRepTy
-       ; u <- newUnique
+newInferExpTypeNoInst :: TcM ExpSigmaType
+newInferExpTypeNoInst = newInferExpType False
+
+newInferExpTypeInst :: TcM ExpRhoType
+newInferExpTypeInst = newInferExpType True
+
+newInferExpType :: Bool -> TcM ExpType
+newInferExpType inst
+  = do { u <- newUnique
        ; tclvl <- getTcLevel
-       ; let ki = tYPE rr
-       ; traceTc "newOpenInferExpType" (ppr u <+> dcolon <+> ppr ki)
+       ; traceTc "newOpenInferExpType" (ppr u <+> ppr inst <+> ppr tclvl)
        ; ref <- newMutVar Nothing
-       ; return (Infer u tclvl ki ref) }
+       ; return (Infer (IR { ir_uniq = u, ir_lvl = tclvl
+                           , ir_ref = ref, ir_inst = inst })) }
 
 -- | Extract a type out of an ExpType, if one exists. But one should always
 -- exist. Unless you're quite sure you know what you're doing.
 readExpType_maybe :: ExpType -> TcM (Maybe TcType)
-readExpType_maybe (Check ty)        = return (Just ty)
-readExpType_maybe (Infer _ _ _ ref) = readMutVar ref
+readExpType_maybe (Check ty)                   = return (Just ty)
+readExpType_maybe (Infer (IR { ir_ref = ref})) = readMutVar ref
 
 -- | Extract a type out of an ExpType. Otherwise, panics.
 readExpType :: ExpType -> TcM TcType
@@ -356,30 +390,6 @@ readExpType exp_ty
        ; case mb_ty of
            Just ty -> return ty
            Nothing -> pprPanic "Unknown expected type" (ppr exp_ty) }
-
--- | Write into an 'ExpType'. It must be an 'Infer'.
-writeExpType :: ExpType -> TcType -> TcM ()
-writeExpType (Infer u tc_lvl ki ref) ty
-  | debugIsOn
-  = do { ki1 <- zonkTcType (typeKind ty)
-       ; ki2 <- zonkTcType ki
-       ; MASSERT2( ki1 `eqType` ki2, ppr ki1 $$ ppr ki2 $$ ppr u )
-       ; lvl_now <- getTcLevel
-       ; MASSERT2( tc_lvl == lvl_now, ppr u $$ ppr tc_lvl $$ ppr lvl_now )
-       ; cts <- readTcRef ref
-       ; case cts of
-           Just already_there -> pprPanic "writeExpType"
-                                   (vcat [ ppr u
-                                         , ppr ty
-                                         , ppr already_there ])
-           Nothing -> write }
-  | otherwise
-  = write
-  where
-    write = do { traceTc "Filling ExpType" $
-                   ppr u <+> text ":=" <+> ppr ty
-               ; writeTcRef ref (Just ty) }
-writeExpType (Check ty1) ty2 = pprPanic "writeExpType" (ppr ty1 $$ ppr ty2)
 
 -- | Returns the expected type when in checking mode.
 checkingExpType_maybe :: ExpType -> Maybe TcType
@@ -394,46 +404,42 @@ checkingExpType err et         = pprPanic "checkingExpType" (text err $$ ppr et)
 
 tauifyExpType :: ExpType -> TcM ExpType
 -- ^ Turn a (Infer hole) type into a (Check alpha),
--- where alpha is a fresh unificaiton variable
-tauifyExpType exp_ty = do { ty <- expTypeToType exp_ty
-                          ; return (Check ty) }
+-- where alpha is a fresh unification variable
+tauifyExpType (Check ty)      = return (Check ty)  -- No-op for (Check ty)
+tauifyExpType (Infer inf_res) = do { ty <- inferResultToType inf_res
+                                   ; return (Check ty) }
 
 -- | Extracts the expected type if there is one, or generates a new
 -- TauTv if there isn't.
 expTypeToType :: ExpType -> TcM TcType
-expTypeToType (Check ty) = return ty
-expTypeToType (Infer u tc_lvl ki ref)
-  = do { uniq <- newUnique
-       ; tv_ref <- newMutVar Flexi
-       ; let details = MetaTv { mtv_info = TauTv
-                              , mtv_ref  = tv_ref
-                              , mtv_tclvl = tc_lvl }
-             name   = mkMetaTyVarName uniq (fsLit "t")
-             tau_tv = mkTcTyVar name ki details
-             tau    = mkTyVarTy tau_tv
-             -- can't use newFlexiTyVarTy because we need to set the tc_lvl
-             -- See also Note [TcLevel of ExpType]
+expTypeToType (Check ty)      = return ty
+expTypeToType (Infer inf_res) = inferResultToType inf_res
 
+inferResultToType :: InferResult -> TcM Type
+inferResultToType (IR { ir_uniq = u, ir_lvl = tc_lvl
+                      , ir_ref = ref })
+  = do { rr  <- newMetaTyVarTyAtLevel tc_lvl runtimeRepTy
+       ; tau <- newMetaTyVarTyAtLevel tc_lvl (tYPE rr)
+             -- See Note [TcLevel of ExpType]
        ; writeMutVar ref (Just tau)
        ; traceTc "Forcing ExpType to be monomorphic:"
-                 (ppr u <+> dcolon <+> ppr ki <+> text ":=" <+> ppr tau)
+                 (ppr u <+> text ":=" <+> ppr tau)
        ; return tau }
 
-{-
-************************************************************************
+
+{- *********************************************************************
 *                                                                      *
         SkolemTvs (immutable)
 *                                                                      *
-************************************************************************
--}
+********************************************************************* -}
 
 tcInstType :: ([TyVar] -> TcM (TCvSubst, [TcTyVar]))
                    -- ^ How to instantiate the type variables
-           -> TcType                                  -- ^ Type to instantiate
-           -> TcM ([TcTyVar], TcThetaType, TcType)  -- ^ Result
+           -> Id                                            -- ^ Type to instantiate
+           -> TcM ([(Name, TcTyVar)], TcThetaType, TcType)  -- ^ Result
                 -- (type vars, preds (incl equalities), rho)
-tcInstType inst_tyvars ty
-  = case tcSplitForAllTys ty of
+tcInstType inst_tyvars id
+  = case tcSplitForAllTys (idType id) of
         ([],    rho) -> let     -- There may be overloading despite no type variables;
                                 --      (?x :: Int) => Int -> Int
                                 (theta, tau) = tcSplitPhiTy rho
@@ -442,12 +448,15 @@ tcInstType inst_tyvars ty
 
         (tyvars, rho) -> do { (subst, tyvars') <- inst_tyvars tyvars
                             ; let (theta, tau) = tcSplitPhiTy (substTyAddInScope subst rho)
-                            ; return (tyvars', theta, tau) }
+                                  tv_prs       = map tyVarName tyvars `zip` tyvars'
+                            ; return (tv_prs, theta, tau) }
 
-tcSkolDFunType :: Type -> TcM ([TcTyVar], TcThetaType, TcType)
+tcSkolDFunType :: DFunId -> TcM ([TcTyVar], TcThetaType, TcType)
 -- Instantiate a type signature with skolem constants.
 -- We could give them fresh names, but no need to do so
-tcSkolDFunType ty = tcInstType tcInstSuperSkolTyVars ty
+tcSkolDFunType dfun
+  = do { (tv_prs, theta, tau) <- tcInstType tcInstSuperSkolTyVars dfun
+       ; return (map snd tv_prs, theta, tau) }
 
 tcSuperSkolTyVars :: [TyVar] -> (TCvSubst, [TcTyVar])
 -- Make skolem constants, but do *not* give them new names, as above
@@ -463,13 +472,17 @@ tcSuperSkolTyVar subst tv
     kind   = substTyUnchecked subst (tyVarKind tv)
     new_tv = mkTcTyVar (tyVarName tv) kind superSkolemTv
 
--- Wrappers
--- we need to be able to do this from outside the TcM monad:
-tcInstSkolTyVarsLoc :: SrcSpan -> [TyVar] -> TcRnIf gbl lcl (TCvSubst, [TcTyVar])
-tcInstSkolTyVarsLoc loc = instSkolTyCoVars (mkTcSkolTyVar loc False)
-
+-- | Given a list of @['TyVar']@, skolemize the type variables,
+-- returning a substitution mapping the original tyvars to the
+-- skolems, and the list of newly bound skolems.  See also
+-- tcInstSkolTyVars' for a precondition.  The resulting
+-- skolems are non-overlappable; see Note [Overlap and deriving]
+-- for an example where this matters.
 tcInstSkolTyVars :: [TyVar] -> TcM (TCvSubst, [TcTyVar])
-tcInstSkolTyVars = tcInstSkolTyVars' False emptyTCvSubst
+tcInstSkolTyVars = tcInstSkolTyVarsX emptyTCvSubst
+
+tcInstSkolTyVarsX :: TCvSubst -> [TyVar] -> TcM (TCvSubst, [TcTyVar])
+tcInstSkolTyVarsX = tcInstSkolTyVars' False
 
 tcInstSuperSkolTyVars :: [TyVar] -> TcM (TCvSubst, [TcTyVar])
 tcInstSuperSkolTyVars = tcInstSuperSkolTyVarsX emptyTCvSubst
@@ -483,31 +496,16 @@ tcInstSkolTyVars' :: Bool -> TCvSubst -> [TyVar] -> TcM (TCvSubst, [TcTyVar])
 -- Get the location from the monad; this is a complete freshening operation
 tcInstSkolTyVars' overlappable subst tvs
   = do { loc <- getSrcSpanM
-       ; instSkolTyCoVarsX (mkTcSkolTyVar loc overlappable) subst tvs }
+       ; lvl <- getTcLevel
+       ; instSkolTyCoVarsX (mkTcSkolTyVar lvl loc overlappable) subst tvs }
 
-mkTcSkolTyVar :: SrcSpan -> Bool -> Unique -> Name -> Kind -> TcTyVar
-mkTcSkolTyVar loc overlappable uniq old_name kind
-  = mkTcTyVar (mkInternalName uniq (getOccName old_name) loc)
-              kind
-              (SkolemTv overlappable)
-
-tcInstSigTyVarsLoc :: SrcSpan -> [TyVar]
-                   -> TcRnIf gbl lcl (TCvSubst, [TcTyVar])
--- We specify the location
-tcInstSigTyVarsLoc loc = instSkolTyCoVars (mkTcSkolTyVar loc False)
-
-tcInstSigTyVars :: [TyVar] -> TcRnIf gbl lcl (TCvSubst, [TcTyVar])
--- Get the location from the TyVar itself, not the monad
-tcInstSigTyVars
-  = instSkolTyCoVars mk_tv
+mkTcSkolTyVar :: TcLevel -> SrcSpan -> Bool -> TcTyVarMaker
+mkTcSkolTyVar lvl loc overlappable
+  = \ uniq old_name kind -> mkTcTyVar (mkInternalName uniq (getOccName old_name) loc)
+                                      kind details
   where
-    mk_tv uniq old_name kind
-       = mkTcTyVar (setNameUnique old_name uniq) kind (SkolemTv False)
-
-tcInstSkolType :: TcType -> TcM ([TcTyVar], TcThetaType, TcType)
--- Instantiate a type with fresh skolem constants
--- Binding location comes from the monad
-tcInstSkolType ty = tcInstType tcInstSkolTyVars ty
+    details = SkolemTv (pushTcLevel lvl) overlappable
+              -- NB: skolems bump the level
 
 ------------------
 freshenTyVarBndrs :: [TyVar] -> TcRnIf gbl lcl (TCvSubst, [TyVar])
@@ -526,15 +524,15 @@ freshenCoVarBndrsX subst = instSkolTyCoVarsX mk_cv subst
     mk_cv uniq old_name kind = mkCoVar (setNameUnique old_name uniq) kind
 
 ------------------
-instSkolTyCoVars :: (Unique -> Name -> Kind -> TyCoVar)
-                 -> [TyVar] -> TcRnIf gbl lcl (TCvSubst, [TyCoVar])
+type TcTyVarMaker = Unique -> Name -> Kind -> TyCoVar
+instSkolTyCoVars :: TcTyVarMaker -> [TyVar] -> TcRnIf gbl lcl (TCvSubst, [TyCoVar])
 instSkolTyCoVars mk_tcv = instSkolTyCoVarsX mk_tcv emptyTCvSubst
 
-instSkolTyCoVarsX :: (Unique -> Name -> Kind -> TyCoVar)
+instSkolTyCoVarsX :: TcTyVarMaker
                   -> TCvSubst -> [TyCoVar] -> TcRnIf gbl lcl (TCvSubst, [TyCoVar])
 instSkolTyCoVarsX mk_tcv = mapAccumLM (instSkolTyCoVarX mk_tcv)
 
-instSkolTyCoVarX :: (Unique -> Name -> Kind -> TyCoVar)
+instSkolTyCoVarX :: TcTyVarMaker
                  -> TCvSubst -> TyCoVar -> TcRnIf gbl lcl (TCvSubst, TyCoVar)
 instSkolTyCoVarX mk_tcv subst tycovar
   = do  { uniq <- newUnique  -- using a new unique is critical. See
@@ -624,7 +622,7 @@ cloneMetaTyVar tv
 -- Works for both type and kind variables
 readMetaTyVar :: TyVar -> TcM MetaDetails
 readMetaTyVar tyvar = ASSERT2( isMetaTyVar tyvar, ppr tyvar )
-                      readMutVar (metaTvRef tyvar)
+                      readMutVar (metaTyVarRef tyvar)
 
 isFilledMetaTyVar :: TyVar -> TcM Bool
 -- True of a filled-in (Indirect) meta type variable
@@ -649,7 +647,7 @@ writeMetaTyVar :: TcTyVar -> TcType -> TcM ()
 
 writeMetaTyVar tyvar ty
   | not debugIsOn
-  = writeMetaTyVarRef tyvar (metaTvRef tyvar) ty
+  = writeMetaTyVarRef tyvar (metaTyVarRef tyvar) ty
 
 -- Everything from here on only happens if DEBUG is on
   | not (isTcTyVar tyvar)
@@ -673,31 +671,63 @@ writeMetaTyVarRef tyvar ref ty
                                    <+> text ":=" <+> ppr ty)
        ; writeTcRef ref (Indirect ty) }
 
--- Everything from here on only happens if DEBUG is on
+  -- Everything from here on only happens if DEBUG is on
   | otherwise
   = do { meta_details <- readMutVar ref;
        -- Zonk kinds to allow the error check to work
        ; zonked_tv_kind <- zonkTcType tv_kind
        ; zonked_ty_kind <- zonkTcType ty_kind
+       ; let kind_check_ok = isPredTy tv_kind  -- Don't check kinds for updates
+                                               -- to coercion variables.  Why not??
+                          || isConstraintKind zonked_tv_kind
+                          || tcEqKind zonked_ty_kind zonked_tv_kind
+             -- Hack alert! isConstraintKind: see TcHsType
+             -- Note [Extra-constraint holes in partial type signatures]
+
+             kind_msg = hang (text "Ill-kinded update to meta tyvar")
+                           2 (    ppr tyvar <+> text "::" <+> (ppr tv_kind $$ ppr zonked_tv_kind)
+                              <+> text ":="
+                              <+> ppr ty <+> text "::" <+> (ppr ty_kind $$ ppr zonked_ty_kind) )
+
+       ; traceTc "writeMetaTyVar" (ppr tyvar <+> text ":=" <+> ppr ty)
 
        -- Check for double updates
-       ; ASSERT2( isFlexi meta_details,
-                  hang (text "Double update of meta tyvar")
-                   2 (ppr tyvar $$ ppr meta_details) )
+       ; MASSERT2( isFlexi meta_details, double_upd_msg meta_details )
 
-         traceTc "writeMetaTyVar" (ppr tyvar <+> text ":=" <+> ppr ty)
-       ; writeMutVar ref (Indirect ty)
-       ; when (   not (isPredTy tv_kind)
-                    -- Don't check kinds for updates to coercion variables
-               && not (zonked_ty_kind `tcEqKind` zonked_tv_kind))
-       $ WARN( True, hang (text "Ill-kinded update to meta tyvar")
-                        2 (    ppr tyvar <+> text "::" <+> (ppr tv_kind $$ ppr zonked_tv_kind)
-                           <+> text ":="
-                           <+> ppr ty    <+> text "::" <+> (ppr ty_kind $$ ppr zonked_ty_kind) ) )
-         (return ()) }
+       -- Check for level OK
+       -- See Note [Level check when unifying]
+       ; MASSERT2( level_check_ok, level_check_msg )
+
+       -- Check Kinds ok
+       ; MASSERT2( kind_check_ok, kind_msg )
+
+       -- Do the write
+       ; writeMutVar ref (Indirect ty) }
   where
     tv_kind = tyVarKind tyvar
     ty_kind = typeKind ty
+
+    tv_lvl = tcTyVarLevel tyvar
+    ty_lvl = tcTypeLevel ty
+
+    level_check_ok = isFmvTyVar tyvar
+                  || not (ty_lvl `strictlyDeeperThan` tv_lvl)
+    level_check_msg = ppr ty_lvl $$ ppr tv_lvl $$ ppr tyvar $$ ppr ty
+
+    double_upd_msg details = hang (text "Double update of meta tyvar")
+                                2 (ppr tyvar $$ ppr details)
+
+
+{- Note [Level check when unifying]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When unifying
+     alpha:lvl := ty
+we expect that the TcLevel of 'ty' will be <= lvl.
+However, during unflatting we do
+     fuv:l := ty:(l+1)
+which is usually wrong; hence the check isFmmvTyVar in level_check_ok.
+See Note [TcLevel assignment] in TcType.
+-}
 
 {-
 % Generating fresh variables for pattern match check
@@ -709,7 +739,8 @@ genInstSkolTyVarsX :: SrcSpan -> TCvSubst -> [TyVar]
 -- Precondition: tyvars should be scoping-ordered
 -- see Note [Kind substitution when instantiating]
 -- Get the location from the monad; this is a complete freshening operation
-genInstSkolTyVarsX loc subst tvs = instSkolTyCoVarsX (mkTcSkolTyVar loc False) subst tvs
+genInstSkolTyVarsX loc subst tvs
+  = instSkolTyCoVarsX (mkTcSkolTyVar topTcLevel loc False) subst tvs
 
 {-
 ************************************************************************
@@ -747,7 +778,7 @@ newAnonMetaTyVar meta_info kind
 newFlexiTyVar :: Kind -> TcM TcTyVar
 newFlexiTyVar kind = newAnonMetaTyVar TauTv kind
 
-newFlexiTyVarTy  :: Kind -> TcM TcType
+newFlexiTyVarTy :: Kind -> TcM TcType
 newFlexiTyVarTy kind = do
     tc_tyvar <- newFlexiTyVar kind
     return (mkTyVarTy tc_tyvar)
@@ -755,11 +786,17 @@ newFlexiTyVarTy kind = do
 newFlexiTyVarTys :: Int -> Kind -> TcM [TcType]
 newFlexiTyVarTys n kind = mapM newFlexiTyVarTy (nOfThem n kind)
 
+newOpenTypeKind :: TcM TcKind
+newOpenTypeKind
+  = do { rr <- newFlexiTyVarTy runtimeRepTy
+       ; return (tYPE rr) }
+
 -- | Create a tyvar that can be a lifted or unlifted type.
+-- Returns alpha :: TYPE kappa, where both alpha and kappa are fresh
 newOpenFlexiTyVarTy :: TcM TcType
 newOpenFlexiTyVarTy
-  = do { rr <- newFlexiTyVarTy runtimeRepTy
-       ; newFlexiTyVarTy (tYPE rr) }
+  = do { kind <- newOpenTypeKind
+       ; newFlexiTyVarTy kind }
 
 newMetaSigTyVars :: [TyVar] -> TcM (TCvSubst, [TcTyVar])
 newMetaSigTyVars = mapAccumLM newMetaSigTyVarX emptyTCvSubst
@@ -779,20 +816,48 @@ newMetaTyVarX :: TCvSubst -> TyVar -> TcM (TCvSubst, TcTyVar)
 -- an existing TyVar. We substitute kind variables in the kind.
 newMetaTyVarX subst tyvar = new_meta_tv_x TauTv subst tyvar
 
+newMetaTyVarsX :: TCvSubst -> [TyVar] -> TcM (TCvSubst, [TcTyVar])
+-- Just like newMetaTyVars, but start with an existing substitution.
+newMetaTyVarsX subst = mapAccumLM newMetaTyVarX subst
+
 newMetaSigTyVarX :: TCvSubst -> TyVar -> TcM (TCvSubst, TcTyVar)
 -- Just like newMetaTyVarX, but make a SigTv
 newMetaSigTyVarX subst tyvar = new_meta_tv_x SigTv subst tyvar
 
+newWildCardX :: TCvSubst -> TyVar -> TcM (TCvSubst, TcTyVar)
+newWildCardX subst tv
+  = do { new_tv <- newAnonMetaTyVar TauTv (substTy subst (tyVarKind tv))
+       ; return (extendTvSubstWithClone subst tv new_tv, new_tv) }
+
 new_meta_tv_x :: MetaInfo -> TCvSubst -> TyVar -> TcM (TCvSubst, TcTyVar)
-new_meta_tv_x info subst tyvar
+new_meta_tv_x info subst tv
   = do  { uniq <- newUnique
         ; details <- newMetaDetails info
-        ; let name   = mkSystemName uniq (getOccName tyvar)
+        ; let name   = mkSystemName uniq (getOccName tv)
                        -- See Note [Name of an instantiated type variable]
-              kind   = substTyUnchecked subst (tyVarKind tyvar)
+              kind   = substTyUnchecked subst (tyVarKind tv)
+                       -- NOTE: Trac #12549 is fixed so we could use
+                       -- substTy here, but the tc_infer_args problem
+                       -- is not yet fixed so leaving as unchecked for now.
+                       -- OLD NOTE:
+                       -- Unchecked because we call newMetaTyVarX from
+                       -- tcInstBinderX, which is called from tc_infer_args
+                       -- which does not yet take enough trouble to ensure
+                       -- the in-scope set is right; e.g. Trac #12785 trips
+                       -- if we use substTy here
               new_tv = mkTcTyVar name kind details
-              subst1 = extendTvSubstWithClone subst tyvar new_tv
+              subst1 = extendTvSubstWithClone subst tv new_tv
         ; return (subst1, new_tv) }
+
+newMetaTyVarTyAtLevel :: TcLevel -> TcKind -> TcM TcType
+newMetaTyVarTyAtLevel tc_lvl kind
+  = do  { uniq <- newUnique
+        ; ref  <- newMutVar Flexi
+        ; let name = mkMetaTyVarName uniq (fsLit "p")
+              details = MetaTv { mtv_info  = TauTv
+                               , mtv_ref   = ref
+                               , mtv_tclvl = tc_lvl }
+        ; return (mkTyVarTy (mkTcTyVar name kind details)) }
 
 {- Note [Name of an instantiated type variable]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -838,7 +903,7 @@ interface file. One such example is inferred type signatures. They also affect
 the results of optimizations, for example worker-wrapper. This means that to
 get deterministic builds quantifyTyVars needs to be deterministic.
 
-To achieve this TcDepVars is backed by deterministic sets which allows them
+To achieve this CandidatesQTvs is backed by deterministic sets which allows them
 to be later converted to a list in a deterministic order.
 
 For more information about deterministic sets see
@@ -846,8 +911,8 @@ Note [Deterministic UniqFM] in UniqDFM.
 -}
 
 quantifyTyVars, quantifyZonkedTyVars
-  :: TcTyCoVarSet   -- global tvs
-  -> TcDepVars      -- See Note [Dependent type variables] in TcType
+  :: TcTyCoVarSet     -- global tvs
+  -> CandidatesQTvs   -- See Note [Dependent type variables] in TcType
   -> TcM [TcTyVar]
 -- See Note [quantifyTyVars]
 -- Can be given a mixture of TcTyVars and TyVars, in the case of
@@ -857,13 +922,13 @@ quantifyTyVars, quantifyZonkedTyVars
 
 quantifyTyVars gbl_tvs (DV { dv_kvs = dep_tkvs, dv_tvs = nondep_tkvs })
   = do { dep_tkvs    <- zonkTyCoVarsAndFVDSet dep_tkvs
-       ; nondep_tkvs <- (`minusDVarSet` dep_tkvs) <$>
-                        zonkTyCoVarsAndFVDSet nondep_tkvs
+       ; nondep_tkvs <- zonkTyCoVarsAndFVDSet nondep_tkvs
        ; gbl_tvs     <- zonkTyCoVarsAndFV gbl_tvs
        ; quantifyZonkedTyVars gbl_tvs (DV { dv_kvs = dep_tkvs, dv_tvs = nondep_tkvs }) }
 
-quantifyZonkedTyVars gbl_tvs (DV{ dv_kvs = dep_tkvs, dv_tvs = nondep_tkvs })
-  = do { let all_cvs = filterVarSet isCoVar $ dVarSetToVarSet dep_tkvs
+quantifyZonkedTyVars gbl_tvs dvs@(DV{ dv_kvs = dep_tkvs, dv_tvs = nondep_tkvs })
+  = do { traceTc "quantifyZonkedTyVars" (vcat [ppr dvs, ppr gbl_tvs])
+       ; let all_cvs = filterVarSet isCoVar $ dVarSetToVarSet dep_tkvs
              dep_kvs = dVarSetElemsWellScoped $
                        dep_tkvs `dVarSetMinusVarSet` gbl_tvs
                                 `dVarSetMinusVarSet` closeOverKinds all_cvs
@@ -874,48 +939,49 @@ quantifyZonkedTyVars gbl_tvs (DV{ dv_kvs = dep_tkvs, dv_tvs = nondep_tkvs })
                  --    variables, or any any tvs that a covar depends on
 
              nondep_tvs = dVarSetElems $
-                          nondep_tkvs `dVarSetMinusVarSet` gbl_tvs
-                 -- No worry about dependent covars here; they are
-                 --    all in dep_tkvs
-                 -- No worry about scoping, becuase these are all
+                          (nondep_tkvs `minusDVarSet` dep_tkvs)
+                           `dVarSetMinusVarSet` gbl_tvs
+                 -- See Note [Dependent type variables] in TcType
+                 -- The `minus` dep_tkvs removes any kind-level vars
+                 --    e.g. T k (a::k)   Since k appear in a kind it'll
+                 --    be in dv_kvs, and is dependent. So remove it from
+                 --    dv_tvs which will also contain k
+                 -- No worry about dependent covars here;
+                 --    they are all in dep_tkvs
+                 -- No worry about scoping, because these are all
                  --    type variables
-                 --    See Note [Dependent type variables] in TcType
                  -- NB kinds of tvs are zonked by zonkTyCoVarsAndFV
 
              -- In the non-PolyKinds case, default the kind variables
              -- to *, and zonk the tyvars as usual.  Notice that this
              -- may make quantifyTyVars return a shorter list
              -- than it was passed, but that's ok
-       ; poly_kinds <- xoptM LangExt.PolyKinds
-       ; dep_vars2 <- if poly_kinds
-                      then return dep_kvs
-                      else do { let (meta_kvs, skolem_kvs) = partition is_meta dep_kvs
-                                    is_meta kv = isTcTyVar kv && isMetaTyVar kv
-
-                              ; mapM_ defaultKindVar meta_kvs
-                              ; return skolem_kvs }  -- should be empty
-
-       ; let quant_vars = dep_vars2 ++ nondep_tvs
-
-       ; traceTc "quantifyTyVars"
-           (vcat [ text "globals:" <+> ppr gbl_tvs
-                 , text "nondep:" <+> ppr nondep_tvs
-                 , text "dep:" <+> ppr dep_kvs
-                 , text "dep2:" <+> ppr dep_vars2
-                 , text "quant_vars:" <+> ppr quant_vars ])
-
-       ; mapMaybeM zonk_quant quant_vars }
+       ; poly_kinds  <- xoptM LangExt.PolyKinds
+       ; dep_kvs'    <- mapMaybeM (zonk_quant (not poly_kinds)) dep_kvs
+       ; nondep_tvs' <- mapMaybeM (zonk_quant False)            nondep_tvs
            -- Because of the order, any kind variables
-           -- mentioned in the kinds of the type variables refer to
-           -- the now-quantified versions
+           -- mentioned in the kinds of the nondep_tvs'
+           -- now refer to the dep_kvs'
+
+       ; traceTc "quantifyZonkedTyVars"
+           (vcat [ text "globals:" <+> ppr gbl_tvs
+                 , text "nondep:"  <+> pprTyVars nondep_tvs
+                 , text "dep:"     <+> pprTyVars dep_kvs
+                 , text "dep_kvs'" <+> pprTyVars dep_kvs'
+                 , text "nondep_tvs'" <+> pprTyVars nondep_tvs' ])
+
+       ; return (dep_kvs' ++ nondep_tvs') }
   where
-    zonk_quant tkv
-      | isTcTyVar tkv = zonkQuantifiedTyVar tkv
+    zonk_quant default_kind tkv
+      | isTcTyVar tkv = zonkQuantifiedTyVar default_kind tkv
       | otherwise     = return $ Just tkv
       -- For associated types, we have the class variables
       -- in scope, and they are TyVars not TcTyVars
 
-zonkQuantifiedTyVar :: TcTyVar -> TcM (Maybe TcTyVar)
+zonkQuantifiedTyVar :: Bool     -- True  <=> this is a kind var and -XNoPolyKinds
+                                -- False <=> not a kind var or -XPolyKinds
+                    -> TcTyVar
+                    -> TcM (Maybe TcTyVar)
 -- The quantified type variables often include meta type variables
 -- we want to freeze them into ordinary type variables, and
 -- default their kind (e.g. from TYPE v to TYPE Lifted)
@@ -928,68 +994,84 @@ zonkQuantifiedTyVar :: TcTyVar -> TcM (Maybe TcTyVar)
 -- This function is called on both kind and type variables,
 -- but kind variables *only* if PolyKinds is on.
 --
--- This returns a tyvar if it should be quantified over; otherwise,
--- it returns Nothing. Nothing is
--- returned only if zonkQuantifiedTyVar is passed a RuntimeRep meta-tyvar,
--- in order to default to PtrRepLifted.
-zonkQuantifiedTyVar tv = left_only `liftM` zonkQuantifiedTyVarOrType tv
-  where left_only :: Either a b -> Maybe a
-        left_only (Left x) =  Just x
-        left_only (Right _) = Nothing
+-- This returns a tyvar if it should be quantified over;
+-- otherwise, it returns Nothing. The latter case happens for
+--    * Kind variables, with -XNoPolyKinds: don't quantify over these
+--    * RuntimeRep variables: we never quantify over these
 
--- | Like zonkQuantifiedTyVar, but if zonking reveals that the tyvar
--- should become a type (when defaulting a RuntimeRep var to PtrRepLifted), it
--- returns the type instead.
-zonkQuantifiedTyVarOrType :: TcTyVar -> TcM (Either TcTyVar TcType)
-zonkQuantifiedTyVarOrType tv
+zonkQuantifiedTyVar default_kind tv
   = case tcTyVarDetails tv of
       SkolemTv {} -> do { kind <- zonkTcType (tyVarKind tv)
-                        ; return $ Left $ setTyVarKind tv kind }
+                        ; return $ Just (setTyVarKind tv kind) }
         -- It might be a skolem type variable,
         -- for example from a user type signature
 
-      MetaTv { mtv_ref = ref } ->
-          do when debugIsOn $ do
-                 -- [Sept 04] Check for non-empty.
-                 -- See note [Silly Type Synonym]
-                 cts <- readMutVar ref
-                 case cts of
-                     Flexi -> return ()
-                     Indirect ty -> WARN( True, ppr tv $$ ppr ty )
-                                    return ()
-             if isRuntimeRepVar tv
-             then do { writeMetaTyVar tv ptrRepLiftedTy
-                     ; return (Right ptrRepLiftedTy) }
-             else Left `liftM` skolemiseUnboundMetaTyVar tv vanillaSkolemTv
+      MetaTv {}
+        -> do { mb_tv <- defaultTyVar default_kind tv
+              ; case mb_tv of
+                  True  -> return Nothing
+                  False -> do { tv' <- skolemiseUnboundMetaTyVar tv
+                              ; return (Just tv') } }
+
       _other -> pprPanic "zonkQuantifiedTyVar" (ppr tv) -- FlatSkol, RuntimeUnk
 
--- | Take an (unconstrained) meta tyvar and default it. Works only on
--- vars of type RuntimeRep and of type *. For other kinds, it issues
--- an error. See Note [Defaulting with -XNoPolyKinds]
-defaultKindVar :: TcTyVar -> TcM Kind
-defaultKindVar kv
-  | ASSERT( isMetaTyVar kv )
-    isRuntimeRepVar kv
-  = writeMetaTyVar kv ptrRepLiftedTy >> return ptrRepLiftedTy
-  | isStarKind (tyVarKind kv)
-  = writeMetaTyVar kv liftedTypeKind >> return liftedTypeKind
-  | otherwise
-  = do { addErr (vcat [ text "Cannot default kind variable" <+> quotes (ppr kv')
-                      , text "of kind:" <+> ppr (tyVarKind kv')
-                      , text "Perhaps enable PolyKinds or add a kind signature" ])
-       ; return (mkTyVarTy kv) }
-  where
-    (_, kv') = tidyOpenTyCoVar emptyTidyEnv kv
+defaultTyVar :: Bool      -- True <=> please default this kind variable to *
+             -> TcTyVar   -- Always an unbound meta tyvar
+             -> TcM Bool  -- True <=> defaulted away altogether
 
-skolemiseUnboundMetaTyVar :: TcTyVar -> TcTyVarDetails -> TcM TyVar
+defaultTyVar default_kind tv
+  | isRuntimeRepVar tv && not_sig_tv  -- We never quantify over a RuntimeRep var
+  = do { traceTc "Defaulting a RuntimeRep var to LiftedRep" (ppr tv)
+       ; writeMetaTyVar tv liftedRepTy
+       ; return True }
+
+  | default_kind && not_sig_tv        -- -XNoPolyKinds and this is a kind var
+  = do { default_kind_var tv          -- so default it to * if possible
+       ; return True }
+
+  | otherwise
+  = return False
+
+  where
+    -- Do not default SigTvs. Doing so would violate the invariants
+    -- on SigTvs; see Note [Signature skolems] in TcType.
+    -- Trac #13343 is an example
+    not_sig_tv = not (isSigTyVar tv)
+
+    default_kind_var :: TyVar -> TcM ()
+       -- defaultKindVar is used exclusively with -XNoPolyKinds
+       -- See Note [Defaulting with -XNoPolyKinds]
+       -- It takes an (unconstrained) meta tyvar and defaults it.
+       -- Works only on vars of type *; for other kinds, it issues an error.
+    default_kind_var kv
+      | isStarKind (tyVarKind kv)
+      = do { traceTc "Defaulting a kind var to *" (ppr kv)
+           ; writeMetaTyVar kv liftedTypeKind }
+      | otherwise
+      = addErr (vcat [ text "Cannot default kind variable" <+> quotes (ppr kv')
+                     , text "of kind:" <+> ppr (tyVarKind kv')
+                     , text "Perhaps enable PolyKinds or add a kind signature" ])
+      where
+        (_, kv') = tidyOpenTyCoVar emptyTidyEnv kv
+
+skolemiseRuntimeUnk :: TcTyVar -> TcM TyVar
+skolemiseRuntimeUnk tv
+  = skolemise_tv tv RuntimeUnk
+
+skolemiseUnboundMetaTyVar :: TcTyVar -> TcM TyVar
+skolemiseUnboundMetaTyVar tv
+  = skolemise_tv tv (SkolemTv (metaTyVarTcLevel tv) False)
+
+skolemise_tv :: TcTyVar -> TcTyVarDetails -> TcM TyVar
 -- We have a Meta tyvar with a ref-cell inside it
 -- Skolemise it, so that
 --   we are totally out of Meta-tyvar-land
 -- We create a skolem TyVar, not a regular TyVar
 --   See Note [Zonking to Skolem]
-skolemiseUnboundMetaTyVar tv details
+skolemise_tv tv details
   = ASSERT2( isMetaTyVar tv, ppr tv )
-    do  { span <- getSrcSpanM    -- Get the location from "here"
+    do  { when debugIsOn (check_empty tv)
+        ; span <- getSrcSpanM    -- Get the location from "here"
                                  -- ie where we are generalising
         ; kind <- zonkTcType (tyVarKind tv)
         ; let uniq        = getUnique tv
@@ -1004,9 +1086,17 @@ skolemiseUnboundMetaTyVar tv details
         ; writeMetaTyVar tv (mkTyVarTy final_tv)
         ; return final_tv }
 
-{-
-Note [Defaulting with -XNoPolyKinds]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  where
+    check_empty tv       -- [Sept 04] Check for non-empty.
+      = when debugIsOn $  -- See note [Silly Type Synonym]
+        do { cts <- readMetaTyVar tv
+           ; case cts of
+               Flexi       -> return ()
+               Indirect ty -> WARN( True, ppr tv $$ ppr ty )
+                              return () }
+
+{- Note [Defaulting with -XNoPolyKinds]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Consider
 
   data Compose f g a = Mk (f (g a))
@@ -1062,7 +1152,7 @@ variables (the MetaTv constructor of TcTyVarDetails) are represented by mutable
 variables (known as TcRefs).
 
 Zonking is the process of ripping out these mutable variables and replacing them
-with a real TcType. This involves traversing the entire type expression, but the
+with a real Type. This involves traversing the entire type expression, but the
 interesting part of replacing the mutable variables occurs in zonkTyVarOcc.
 
 There are two ways to zonk a Type:
@@ -1180,15 +1270,15 @@ zonkTcTypeAndFV :: TcType -> TcM DTyCoVarSet
 zonkTcTypeAndFV ty
   = tyCoVarsOfTypeDSet <$> zonkTcTypeInKnot ty
 
--- | Zonk a type and call 'splitDepVarsOfType' on it.
+-- | Zonk a type and call 'candidateQTyVarsOfType' on it.
 -- Works within the knot.
-zonkTcTypeAndSplitDepVars :: TcType -> TcM TcDepVars
+zonkTcTypeAndSplitDepVars :: TcType -> TcM CandidatesQTvs
 zonkTcTypeAndSplitDepVars ty
-  = splitDepVarsOfType <$> zonkTcTypeInKnot ty
+  = candidateQTyVarsOfType <$> zonkTcTypeInKnot ty
 
-zonkTcTypesAndSplitDepVars :: [TcType] -> TcM TcDepVars
+zonkTcTypesAndSplitDepVars :: [TcType] -> TcM CandidatesQTvs
 zonkTcTypesAndSplitDepVars tys
-  = splitDepVarsOfTypes <$> mapM zonkTcTypeInKnot tys
+  = candidateQTyVarsOfTypes <$> mapM zonkTcTypeInKnot tys
 
 zonkTyCoVar :: TyCoVar -> TcM TcType
 -- Works on TyVars and TcTyVars
@@ -1202,7 +1292,11 @@ zonkTyCoVar tv | isTcTyVar tv = zonkTcTyVar tv
    -- painful to make them into TcTyVars there
 
 zonkTyCoVarsAndFV :: TyCoVarSet -> TcM TyCoVarSet
-zonkTyCoVarsAndFV tycovars = tyCoVarsOfTypes <$> mapM zonkTyCoVar (varSetElems tycovars)
+zonkTyCoVarsAndFV tycovars =
+  tyCoVarsOfTypes <$> mapM zonkTyCoVar (nonDetEltsUniqSet tycovars)
+  -- It's OK to use nonDetEltsUniqSet here because we immediately forget about
+  -- the ordering by turning it into a nondeterministic set and the order
+  -- of zonking doesn't matter for determinism.
 
 -- Takes a list of TyCoVars, zonks them and returns a
 -- deterministically ordered list of their free variables.
@@ -1274,12 +1368,50 @@ zonkSimples cts = do { cts' <- mapBagM zonkCt' cts
 zonkCt' :: Ct -> TcM Ct
 zonkCt' ct = zonkCt ct
 
+{- Note [zonkCt behaviour]
+zonkCt tries to maintain the canonical form of a Ct.  For example,
+  - a CDictCan should stay a CDictCan;
+  - a CTyEqCan should stay a CTyEqCan (if the LHS stays as a variable.).
+  - a CHoleCan should stay a CHoleCan
+
+Why?, for example:
+- For CDictCan, the @TcSimplify.expandSuperClasses@ step, which runs after the
+  simple wanted and plugin loop, looks for @CDictCan@s. If a plugin is in use,
+  constraints are zonked before being passed to the plugin. This means if we
+  don't preserve a canonical form, @expandSuperClasses@ fails to expand
+  superclasses. This is what happened in Trac #11525.
+
+- For CHoleCan, once we forget that it's a hole, we can never recover that info.
+
+NB: we do not expect to see any CFunEqCans, because zonkCt is only
+called on unflattened constraints.
+NB: Constraints are always re-flattened etc by the canonicaliser in
+@TcCanonical@ even if they come in as CDictCan. Only canonical constraints that
+are actually in the inert set carry all the guarantees. So it is okay if zonkCt
+creates e.g. a CDictCan where the cc_tyars are /not/ function free.
+-}
 zonkCt :: Ct -> TcM Ct
 zonkCt ct@(CHoleCan { cc_ev = ev })
   = do { ev' <- zonkCtEvidence ev
        ; return $ ct { cc_ev = ev' } }
+zonkCt ct@(CDictCan { cc_ev = ev, cc_tyargs = args })
+  = do { ev'   <- zonkCtEvidence ev
+       ; args' <- mapM zonkTcType args
+       ; return $ ct { cc_ev = ev', cc_tyargs = args' } }
+zonkCt ct@(CTyEqCan { cc_ev = ev, cc_tyvar = tv, cc_rhs = rhs })
+  = do { ev'    <- zonkCtEvidence ev
+       ; tv_ty' <- zonkTcTyVar tv
+       ; case getTyVar_maybe tv_ty' of
+           Just tv' -> do { rhs' <- zonkTcType rhs
+                          ; return ct { cc_ev    = ev'
+                                      , cc_tyvar = tv'
+                                      , cc_rhs   = rhs' } }
+           Nothing  -> return (mkNonCanonical ev') }
 zonkCt ct
-  = do { fl' <- zonkCtEvidence (cc_ev ct)
+  = ASSERT( not (isCFunEqCan ct) )
+  -- We do not expect to see any CFunEqCans, because zonkCt is only called on
+  -- unflattened constraints.
+    do { fl' <- zonkCtEvidence (cc_ev ct)
        ; return (mkNonCanonical fl') }
 
 zonkCtEvidence :: CtEvidence -> TcM CtEvidence
@@ -1298,9 +1430,8 @@ zonkCtEvidence ctev@(CtDerived { ctev_pred = pred })
        ; return (ctev { ctev_pred = pred' }) }
 
 zonkSkolemInfo :: SkolemInfo -> TcM SkolemInfo
-zonkSkolemInfo (SigSkol cx ty)  = do { ty  <- readExpType ty
-                                     ; ty' <- zonkTcType ty
-                                     ; return (SigSkol cx (mkCheckExpType ty')) }
+zonkSkolemInfo (SigSkol cx ty tv_prs)  = do { ty' <- zonkTcType ty
+                                            ; return (SigSkol cx ty' tv_prs) }
 zonkSkolemInfo (InferSkol ntys) = do { ntys' <- mapM do_one ntys
                                      ; return (InferSkol ntys') }
   where
@@ -1363,13 +1494,13 @@ zonkTcTyCoVarBndr :: TcTyCoVar -> TcM TcTyCoVar
 -- unification variables.
 zonkTcTyCoVarBndr tyvar
     -- can't use isCoVar, because it looks at a TyCon. Argh.
-  = ASSERT2( isImmutableTyVar tyvar || (not $ isTyVar tyvar), pprTvBndr tyvar )
+  = ASSERT2( isImmutableTyVar tyvar || (not $ isTyVar tyvar), pprTyVar tyvar )
     updateTyVarKindM zonkTcType tyvar
 
--- | Zonk a TyBinder
-zonkTcTyBinder :: TcTyBinder -> TcM TcTyBinder
-zonkTcTyBinder (Anon ty)      = Anon <$> zonkTcType ty
-zonkTcTyBinder (Named tv vis) = Named <$> zonkTcTyCoVarBndr tv <*> pure vis
+zonkTcTyVarBinder :: TyVarBndr TcTyVar vis -> TcM (TyVarBndr TcTyVar vis)
+zonkTcTyVarBinder (TvBndr tv vis)
+  = do { tv' <- zonkTcTyCoVarBndr tv
+       ; return (TvBndr tv' vis) }
 
 zonkTcTyVar :: TcTyVar -> TcM TcType
 -- Simply look through all Flexis
@@ -1431,11 +1562,7 @@ zonkTidyOrigin env orig@(TypeEqOrigin { uo_actual   = act
                                       , uo_expected = exp
                                       , uo_thing    = m_thing })
   = do { (env1, act') <- zonkTidyTcType env  act
-       ; mb_exp <- readExpType_maybe exp  -- it really should be filled in.
-                                          -- unless we're debugging.
-       ; (env2, exp') <- case mb_exp of
-           Just ty -> second mkCheckExpType <$> zonkTidyTcType env1 ty
-           Nothing -> return (env1, exp)
+       ; (env2, exp') <- zonkTidyTcType env1 exp
        ; (env3, m_thing') <- zonkTidyErrorThing env2 m_thing
        ; return ( env3, orig { uo_actual   = act'
                              , uo_expected = exp'
@@ -1492,10 +1619,88 @@ tidyEvVar env var = setVarType var (tidyType env (varType var))
 
 ----------------
 tidySkolemInfo :: TidyEnv -> SkolemInfo -> SkolemInfo
-tidySkolemInfo env (DerivSkol ty)       = DerivSkol (tidyType env ty)
-tidySkolemInfo env (SigSkol cx ty)      = SigSkol cx (mkCheckExpType $
-                                                      tidyType env $
-                                                      checkingExpType "tidySkolemInfo" ty)
-tidySkolemInfo env (InferSkol ids)      = InferSkol (mapSnd (tidyType env) ids)
-tidySkolemInfo env (UnifyForAllSkol ty) = UnifyForAllSkol (tidyType env ty)
-tidySkolemInfo _   info                 = info
+tidySkolemInfo env (DerivSkol ty)         = DerivSkol (tidyType env ty)
+tidySkolemInfo env (SigSkol cx ty tv_prs) = tidySigSkol env cx ty tv_prs
+tidySkolemInfo env (InferSkol ids)        = InferSkol (mapSnd (tidyType env) ids)
+tidySkolemInfo env (UnifyForAllSkol ty)   = UnifyForAllSkol (tidyType env ty)
+tidySkolemInfo _   info                   = info
+
+tidySigSkol :: TidyEnv -> UserTypeCtxt
+            -> TcType -> [(Name,TcTyVar)] -> SkolemInfo
+-- We need to take special care when tidying SigSkol
+-- See Note [SigSkol SkolemInfo] in TcRnTypes
+tidySigSkol env cx ty tv_prs
+  = SigSkol cx (tidy_ty env ty) tv_prs'
+  where
+    tv_prs' = mapSnd (tidyTyVarOcc env) tv_prs
+    inst_env = mkNameEnv tv_prs'
+
+    tidy_ty env (ForAllTy (TvBndr tv vis) ty)
+      = ForAllTy (TvBndr tv' vis) (tidy_ty env' ty)
+      where
+        (env', tv') = tidy_tv_bndr env tv
+
+    tidy_ty env (FunTy arg res)
+      = FunTy (tidyType env arg) (tidy_ty env res)
+
+    tidy_ty env ty = tidyType env ty
+
+    tidy_tv_bndr :: TidyEnv -> TyVar -> (TidyEnv, TyVar)
+    tidy_tv_bndr env@(occ_env, subst) tv
+      | Just tv' <- lookupNameEnv inst_env (tyVarName tv)
+      = ((occ_env, extendVarEnv subst tv tv'), tv')
+
+      | otherwise
+      = tidyTyCoVarBndr env tv
+
+-------------------------------------------------------------------------
+{-
+%************************************************************************
+%*                                                                      *
+             Levity polymorphism checks
+*                                                                      *
+************************************************************************
+
+See Note [Levity polymorphism checking] in DsMonad
+
+-}
+
+-- | According to the rules around representation polymorphism
+-- (see https://ghc.haskell.org/trac/ghc/wiki/NoSubKinds), no binder
+-- can have a representation-polymorphic type. This check ensures
+-- that we respect this rule. It is a bit regrettable that this error
+-- occurs in zonking, after which we should have reported all errors.
+-- But it's hard to see where else to do it, because this can be discovered
+-- only after all solving is done. And, perhaps most importantly, this
+-- isn't really a compositional property of a type system, so it's
+-- not a terrible surprise that the check has to go in an awkward spot.
+ensureNotLevPoly :: Type  -- its zonked type
+                 -> SDoc  -- where this happened
+                 -> TcM ()
+ensureNotLevPoly ty doc
+  = whenNoErrs $   -- sometimes we end up zonking bogus definitions of type
+                   -- forall a. a. See, for example, test ghci/scripts/T9140
+    checkForLevPoly doc ty
+
+  -- See Note [Levity polymorphism checking] in DsMonad
+checkForLevPoly :: SDoc -> Type -> TcM ()
+checkForLevPoly = checkForLevPolyX addErr
+
+checkForLevPolyX :: Monad m
+                 => (SDoc -> m ())  -- how to report an error
+                 -> SDoc -> Type -> m ()
+checkForLevPolyX add_err extra ty
+  | isTypeLevPoly ty
+  = add_err (formatLevPolyErr ty $$ extra)
+  | otherwise
+  = return ()
+
+formatLevPolyErr :: Type  -- levity-polymorphic type
+                 -> SDoc
+formatLevPolyErr ty
+  = hang (text "A levity-polymorphic type is not allowed here:")
+       2 (vcat [ text "Type:" <+> ppr tidy_ty
+               , text "Kind:" <+> ppr tidy_ki ])
+  where
+    (tidy_env, tidy_ty) = tidyOpenType emptyTidyEnv ty
+    tidy_ki             = tidyType tidy_env (typeKind ty)

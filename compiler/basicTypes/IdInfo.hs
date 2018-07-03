@@ -8,9 +8,13 @@
 Haskell. [WDP 94/11])
 -}
 
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE FlexibleContexts #-}
+
 module IdInfo (
         -- * The IdDetails type
         IdDetails(..), pprIdDetails, coVarDetails, isCoVarDetails,
+        JoinArity, isJoinIdDetails_maybe,
         RecSelParent(..),
 
         -- * The IdInfo type
@@ -24,7 +28,8 @@ module IdInfo (
 
         -- ** Zapping various forms of Info
         zapLamInfo, zapFragileInfo,
-        zapDemandInfo, zapUsageInfo,
+        zapDemandInfo, zapUsageInfo, zapUsageEnvInfo, zapUsedOnceInfo,
+        zapTailCallInfo, zapCallArityInfo,
 
         -- ** The ArityInfo type
         ArityInfo,
@@ -38,7 +43,7 @@ module IdInfo (
         demandInfo, setDemandInfo, pprStrictness,
 
         -- ** Unfolding Info
-        unfoldingInfo, setUnfoldingInfo, setUnfoldingInfoLazily,
+        unfoldingInfo, setUnfoldingInfo,
 
         -- ** The InlinePragInfo type
         InlinePragInfo,
@@ -51,6 +56,9 @@ module IdInfo (
 
         InsideLam, OneBranch,
         insideLam, notInsideLam, oneBranch, notOneBranch,
+
+        TailCallInfo(..),
+        tailCallInfo, isAlwaysTailCalled,
 
         -- ** The RuleInfo type
         RuleInfo(..),
@@ -66,7 +74,13 @@ module IdInfo (
 
         -- ** Tick-box Info
         TickBoxOp(..), TickBoxId,
+
+        -- ** Levity info
+        LevityInfo, levityInfo, setNeverLevPoly, setLevityInfoWithType,
+        isNeverLevPolyIdInfo
     ) where
+
+#include "HsVersions.h"
 
 import CoreSyn
 
@@ -77,11 +91,13 @@ import VarSet
 import BasicTypes
 import DataCon
 import TyCon
-import {-# SOURCE #-} PatSyn
+import PatSyn
+import Type
 import ForeignCall
 import Outputable
 import Module
 import Demand
+import Util
 
 -- infixl so you can say (id `set` a `set` b)
 infixl  1 `setRuleInfo`,
@@ -92,7 +108,9 @@ infixl  1 `setRuleInfo`,
           `setOccInfo`,
           `setCafInfo`,
           `setStrictnessInfo`,
-          `setDemandInfo`
+          `setDemandInfo`,
+          `setNeverLevPoly`,
+          `setLevityInfoWithType`
 
 {-
 ************************************************************************
@@ -102,7 +120,9 @@ infixl  1 `setRuleInfo`,
 ************************************************************************
 -}
 
--- | The 'IdDetails' of an 'Id' give stable, and necessary,
+-- | Identifier Details
+--
+-- The 'IdDetails' of an 'Id' give stable, and necessary,
 -- information about the Id.
 data IdDetails
   = VanillaId
@@ -125,7 +145,8 @@ data IdDetails
                                 -- or class operation of a class
 
   | PrimOpId PrimOp             -- ^ The 'Id' is for a primitive operator
-  | FCallId ForeignCall         -- ^ The 'Id' is for a foreign call
+  | FCallId ForeignCall         -- ^ The 'Id' is for a foreign call.
+                                -- Type will be simple: no type families, newtypes, etc
 
   | TickBoxOpId TickBoxOp       -- ^ The 'Id' is for a HPC tick box (both traditional and binary)
 
@@ -137,7 +158,10 @@ data IdDetails
   | CoVarId    -- ^ A coercion variable
                -- This only covers /un-lifted/ coercions, of type
                -- (t1 ~# t2) or (t1 ~R# t2), not their lifted variants
+  | JoinId JoinArity           -- ^ An 'Id' for a join point taking n arguments
+       -- Note [Join points] in CoreSyn
 
+-- | Recursive Selector Parent
 data RecSelParent = RecSelData TyCon | RecSelPatSyn PatSyn deriving Eq
   -- Either `TyCon` or `PatSyn` depending
   -- on the origin of the record selector.
@@ -159,6 +183,10 @@ isCoVarDetails :: IdDetails -> Bool
 isCoVarDetails CoVarId = True
 isCoVarDetails _       = False
 
+isJoinIdDetails_maybe :: IdDetails -> Maybe JoinArity
+isJoinIdDetails_maybe (JoinId join_arity) = Just join_arity
+isJoinIdDetails_maybe _                   = Nothing
+
 instance Outputable IdDetails where
     ppr = pprIdDetails
 
@@ -166,18 +194,19 @@ pprIdDetails :: IdDetails -> SDoc
 pprIdDetails VanillaId = empty
 pprIdDetails other     = brackets (pp other)
  where
-   pp VanillaId         = panic "pprIdDetails"
-   pp (DataConWorkId _) = text "DataCon"
-   pp (DataConWrapId _) = text "DataConWrapper"
-   pp (ClassOpId {})    = text "ClassOp"
-   pp (PrimOpId _)      = text "PrimOp"
-   pp (FCallId _)       = text "ForeignCall"
-   pp (TickBoxOpId _)   = text "TickBoxOp"
-   pp (DFunId nt)       = text "DFunId" <> ppWhen nt (text "(nt)")
+   pp VanillaId               = panic "pprIdDetails"
+   pp (DataConWorkId _)       = text "DataCon"
+   pp (DataConWrapId _)       = text "DataConWrapper"
+   pp (ClassOpId {})          = text "ClassOp"
+   pp (PrimOpId _)            = text "PrimOp"
+   pp (FCallId _)             = text "ForeignCall"
+   pp (TickBoxOpId _)         = text "TickBoxOp"
+   pp (DFunId nt)             = text "DFunId" <> ppWhen nt (text "(nt)")
    pp (RecSelId { sel_naughty = is_naughty })
-                         = brackets $ text "RecSel"
-                            <> ppWhen is_naughty (text "(naughty)")
-   pp CoVarId           = text "CoVarId"
+                              = brackets $ text "RecSel" <>
+                                           ppWhen is_naughty (text "(naughty)")
+   pp CoVarId                 = text "CoVarId"
+   pp (JoinId arity)          = text "JoinId" <> parens (int arity)
 
 {-
 ************************************************************************
@@ -187,7 +216,9 @@ pprIdDetails other     = brackets (pp other)
 ************************************************************************
 -}
 
--- | An 'IdInfo' gives /optional/ information about an 'Id'.  If
+-- | Identifier Information
+--
+-- An 'IdInfo' gives /optional/ information about an 'Id'.  If
 -- present it never lies, but it may not be present, in which case there
 -- is always a conservative assumption which can be made.
 --
@@ -198,6 +229,10 @@ pprIdDetails other     = brackets (pp other)
 -- Most of the 'IdInfo' gives information about the value, or definition, of
 -- the 'Id', independent of its usage. Exceptions to this
 -- are 'demandInfo', 'occInfo', 'oneShotInfo' and 'callArityInfo'.
+--
+-- Performance note: when we update 'IdInfo', we have to reallocate this
+-- entire record, so it is a good idea not to let this data structure get
+-- too big.
 data IdInfo
   = IdInfo {
         arityInfo       :: !ArityInfo,          -- ^ 'Id' arity
@@ -212,8 +247,10 @@ data IdInfo
         strictnessInfo  :: StrictSig,      --  ^ A strictness signature
 
         demandInfo      :: Demand,       -- ^ ID demand information
-        callArityInfo :: !ArityInfo    -- ^ How this is called.
+        callArityInfo   :: !ArityInfo,   -- ^ How this is called.
                                          -- n <=> all calls have at least n arguments
+
+        levityInfo      :: LevityInfo    -- ^ when applied, will this Id ever have a levity-polymorphic type?
     }
 
 -- Setters
@@ -225,11 +262,6 @@ setInlinePragInfo info pr = pr `seq` info { inlinePragInfo = pr }
 setOccInfo :: IdInfo -> OccInfo -> IdInfo
 setOccInfo        info oc = oc `seq` info { occInfo = oc }
         -- Try to avoid spack leaks by seq'ing
-
-setUnfoldingInfoLazily :: IdInfo -> Unfolding -> IdInfo
-setUnfoldingInfoLazily info uf  -- Lazy variant to avoid looking at the
-  =                             -- unfolding of an imported Id unless necessary
-    info { unfoldingInfo = uf } -- (In this case the demand-zapping is redundant.)
 
 setUnfoldingInfo :: IdInfo -> Unfolding -> IdInfo
 setUnfoldingInfo info uf
@@ -265,10 +297,11 @@ vanillaIdInfo
             unfoldingInfo       = noUnfolding,
             oneShotInfo         = NoOneShotInfo,
             inlinePragInfo      = defaultInlinePragma,
-            occInfo             = NoOccInfo,
+            occInfo             = noOccInfo,
             demandInfo          = topDmd,
             strictnessInfo      = nopSig,
-            callArityInfo     = unknownArity
+            callArityInfo       = unknownArity,
+            levityInfo          = NoLevityInfo
            }
 
 -- | More informative 'IdInfo' we can use when we know the 'Id' has no CAF references
@@ -288,7 +321,9 @@ of their arities; so it should not be asking...  (but other things
 besides the code-generator need arity info!)
 -}
 
--- | An 'ArityInfo' of @n@ tells us that partial application of this
+-- | Arity Information
+--
+-- An 'ArityInfo' of @n@ tells us that partial application of this
 -- 'Id' to up to @n-1@ value arguments does essentially no work.
 --
 -- That is not necessarily the same as saying that it has @n@ leading
@@ -300,7 +335,7 @@ type ArityInfo = Arity
 
 -- | It is always safe to assume that an 'Id' has an arity of 0
 unknownArity :: Arity
-unknownArity = 0 :: Arity
+unknownArity = 0
 
 ppArityInfo :: Int -> SDoc
 ppArityInfo 0 = empty
@@ -314,7 +349,9 @@ ppArityInfo n = hsep [text "Arity", int n]
 ************************************************************************
 -}
 
--- | Tells when the inlining is active.
+-- | Inline Pragma Information
+--
+-- Tells when the inlining is active.
 -- When it is active the thing may be inlined, depending on how
 -- big it is.
 --
@@ -363,7 +400,9 @@ In TidyPgm, when the LocalId becomes a GlobalId, its RULES are stripped off
 and put in the global list.
 -}
 
--- | Records the specializations of this 'Id' that we know about
+-- | Rule Information
+--
+-- Records the specializations of this 'Id' that we know about
 -- in the form of rewrite 'CoreRule's that target them
 data RuleInfo
   = RuleInfo
@@ -403,7 +442,9 @@ setRuleInfoHead fn (RuleInfo rules fvs)
 
 -- CafInfo is used to build Static Reference Tables (see simplStg/SRT.hs).
 
--- | Records whether an 'Id' makes Constant Applicative Form references
+-- | Constant applicative form Information
+--
+-- Records whether an 'Id' makes Constant Applicative Form references
 data CafInfo
         = MayHaveCafRefs                -- ^ Indicates that the 'Id' is for either:
                                         --
@@ -453,12 +494,16 @@ zapLamInfo info@(IdInfo {occInfo = occ, demandInfo = demand})
   where
         -- The "unsafe" occ info is the ones that say I'm not in a lambda
         -- because that might not be true for an unsaturated lambda
-    is_safe_occ (OneOcc in_lam _ _) = in_lam
-    is_safe_occ _other              = True
+    is_safe_occ occ | isAlwaysTailCalled occ     = False
+    is_safe_occ (OneOcc { occ_in_lam = in_lam }) = in_lam
+    is_safe_occ _other                           = True
 
     safe_occ = case occ of
-                 OneOcc _ once int_cxt -> OneOcc insideLam once int_cxt
-                 _other                -> occ
+                 OneOcc{} -> occ { occ_in_lam = True
+                                 , occ_tail   = NoTailCallInfo }
+                 IAmALoopBreaker{}
+                          -> occ { occ_tail   = NoTailCallInfo }
+                 _other   -> occ
 
     is_safe_dmd dmd = not (isStrictDmd dmd)
 
@@ -470,14 +515,46 @@ zapDemandInfo info = Just (info {demandInfo = topDmd})
 zapUsageInfo :: IdInfo -> Maybe IdInfo
 zapUsageInfo info = Just (info {demandInfo = zapUsageDemand (demandInfo info)})
 
+-- | Remove usage environment info from the strictness signature on the 'IdInfo'
+zapUsageEnvInfo :: IdInfo -> Maybe IdInfo
+zapUsageEnvInfo info
+    | hasDemandEnvSig (strictnessInfo info)
+    = Just (info {strictnessInfo = zapUsageEnvSig (strictnessInfo info)})
+    | otherwise
+    = Nothing
+
+zapUsedOnceInfo :: IdInfo -> Maybe IdInfo
+zapUsedOnceInfo info
+    = Just $ info { strictnessInfo = zapUsedOnceSig    (strictnessInfo info)
+                  , demandInfo     = zapUsedOnceDemand (demandInfo     info) }
+
 zapFragileInfo :: IdInfo -> Maybe IdInfo
 -- ^ Zap info that depends on free variables
-zapFragileInfo info
-  = Just (info `setRuleInfo` emptyRuleInfo
-               `setUnfoldingInfo` noUnfolding
-               `setOccInfo` zapFragileOcc occ)
+zapFragileInfo info@(IdInfo { occInfo = occ, unfoldingInfo = unf })
+  = new_unf `seq`  -- The unfolding field is not (currently) strict, so we
+                   -- force it here to avoid a (zapFragileUnfolding unf) thunk
+                   -- which might leak space
+    Just (info `setRuleInfo` emptyRuleInfo
+               `setUnfoldingInfo` new_unf
+               `setOccInfo`       zapFragileOcc occ)
   where
-    occ = occInfo info
+    new_unf = zapFragileUnfolding unf
+
+zapFragileUnfolding :: Unfolding -> Unfolding
+zapFragileUnfolding unf
+ | isFragileUnfolding unf = noUnfolding
+ | otherwise              = unf
+
+zapTailCallInfo :: IdInfo -> Maybe IdInfo
+zapTailCallInfo info
+  = case occInfo info of
+      occ | isAlwaysTailCalled occ -> Just (info `setOccInfo` safe_occ)
+          | otherwise              -> Nothing
+        where
+          safe_occ = occ { occ_tail = NoTailCallInfo }
+
+zapCallArityInfo :: IdInfo -> IdInfo
+zapCallArityInfo info = setCallArityInfo info 0
 
 {-
 ************************************************************************
@@ -495,3 +572,51 @@ data TickBoxOp
 
 instance Outputable TickBoxOp where
     ppr (TickBox mod n)         = text "tick" <+> ppr (mod,n)
+
+{-
+************************************************************************
+*                                                                      *
+   Levity
+*                                                                      *
+************************************************************************
+
+Note [Levity info]
+~~~~~~~~~~~~~~~~~~
+
+Ids store whether or not they can be levity-polymorphic at any amount
+of saturation. This is helpful in optimizing the levity-polymorphism check
+done in the desugarer, where we can usually learn that something is not
+levity-polymorphic without actually figuring out its type. See
+isExprLevPoly in CoreUtils for where this info is used. Storing
+this is required to prevent perf/compiler/T5631 from blowing up.
+
+-}
+
+-- See Note [Levity info]
+data LevityInfo = NoLevityInfo  -- always safe
+                | NeverLevityPolymorphic
+  deriving Eq
+
+instance Outputable LevityInfo where
+  ppr NoLevityInfo           = text "NoLevityInfo"
+  ppr NeverLevityPolymorphic = text "NeverLevityPolymorphic"
+
+-- | Marks an IdInfo describing an Id that is never levity polymorphic (even when
+-- applied). The Type is only there for checking that it's really never levity
+-- polymorphic
+setNeverLevPoly :: HasDebugCallStack => IdInfo -> Type -> IdInfo
+setNeverLevPoly info ty
+  = ASSERT2( not (resultIsLevPoly ty), ppr ty )
+    info { levityInfo = NeverLevityPolymorphic }
+
+setLevityInfoWithType :: IdInfo -> Type -> IdInfo
+setLevityInfoWithType info ty
+  | not (resultIsLevPoly ty)
+  = info { levityInfo = NeverLevityPolymorphic }
+  | otherwise
+  = info
+
+isNeverLevPolyIdInfo :: IdInfo -> Bool
+isNeverLevPolyIdInfo info
+  | NeverLevityPolymorphic <- levityInfo info = True
+  | otherwise                                 = False

@@ -10,9 +10,11 @@
 #include "RtsSymbols.h"
 
 #include "Rts.h"
+#include "TopHandler.h"
 #include "HsFFI.h"
 
 #include "sm/Storage.h"
+#include <stdbool.h>
 
 #if !defined(mingw32_HOST_OS)
 #include "posix/Signals.h"
@@ -70,6 +72,27 @@
 #define RTS_WIN64_ONLY(X) /**/
 #endif
 
+/*
+ * Note [Symbols for MinGW's printf]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ *
+ * The printf offered by Microsoft's libc implementation, msvcrt, is quite
+ * incomplete, lacking support for even %ull. Consequently mingw-w64 offers its
+ * own implementation which we enable. However, to be thread-safe the
+ * implementation uses _lock_file. This would be fine except msvcrt.dll doesn't
+ * export _lock_file, only numbered versions do (e.g. msvcrt90.dll).
+ *
+ * To work around this mingw-w64 packages a static archive of msvcrt which
+ * includes their own implementation of _lock_file. However, this means that
+ * the archive contains things which the dynamic library does not; consequently
+ * we need to ensure that the runtime linker provides this symbol.
+ *
+ * It's all just so terrible.
+ *
+ * See also:
+ * https://sourceforge.net/p/mingw-w64/wiki2/gnu%20printf/
+ * https://sourceforge.net/p/mingw-w64/discussion/723797/thread/55520785/
+ */
 #define RTS_MINGW_ONLY_SYMBOLS                           \
       SymI_HasProto(stg_asyncReadzh)                     \
       SymI_HasProto(stg_asyncWritezh)                    \
@@ -84,7 +107,10 @@
       RTS_WIN32_ONLY(SymI_HasProto(_imp___environ))      \
       RTS_WIN64_ONLY(SymI_HasProto(__imp__environ))      \
       RTS_WIN32_ONLY(SymI_HasProto(_imp___iob))          \
-      RTS_WIN64_ONLY(SymI_HasProto(__iob_func))
+      RTS_WIN64_ONLY(SymI_HasProto(__iob_func))          \
+      /* see Note [Symbols for MinGW's printf] */        \
+      SymI_HasProto(_lock_file)                          \
+      SymI_HasProto(_unlock_file)
 
 #define RTS_MINGW_COMPAT_SYMBOLS                         \
       SymI_HasProto_deprecated(access)                   \
@@ -533,6 +559,17 @@
       SymI_HasProto(stg_catchSTMzh)                                     \
       SymI_HasProto(stg_checkzh)                                        \
       SymI_HasProto(stg_clearCCSzh)                                     \
+      SymI_HasProto(stg_compactAddWithSharingzh)                        \
+      SymI_HasProto(stg_compactAddzh)                                   \
+      SymI_HasProto(stg_compactNewzh)                                   \
+      SymI_HasProto(stg_compactResizzezh)                               \
+      SymI_HasProto(stg_compactContainszh)                              \
+      SymI_HasProto(stg_compactContainsAnyzh)                           \
+      SymI_HasProto(stg_compactGetFirstBlockzh)                         \
+      SymI_HasProto(stg_compactGetNextBlockzh)                          \
+      SymI_HasProto(stg_compactAllocateBlockzh)                         \
+      SymI_HasProto(stg_compactFixupPointerszh)                         \
+      SymI_HasProto(stg_compactSizzezh)                                 \
       SymI_HasProto(closure_flags)                                      \
       SymI_HasProto(cmp_thread)                                         \
       SymI_HasProto(createAdjustor)                                     \
@@ -558,15 +595,23 @@
       SymI_HasProto(getOrSetSystemTimerThreadEventManagerStore)         \
       SymI_HasProto(getOrSetSystemTimerThreadIOManagerThreadStore)      \
       SymI_HasProto(getOrSetLibHSghcFastStringTable)                    \
-      SymI_HasProto(getGCStats)                                         \
-      SymI_HasProto(getGCStatsEnabled)                                  \
+      SymI_HasProto(getRTSStats)                                        \
+      SymI_HasProto(getRTSStatsEnabled)                                 \
+      SymI_HasProto(getOrSetLibHSghcPersistentLinkerState)              \
+      SymI_HasProto(getOrSetLibHSghcInitLinkerDone)                     \
+      SymI_HasProto(getOrSetLibHSghcGlobalDynFlags)                     \
       SymI_HasProto(genericRaise)                                       \
       SymI_HasProto(getProgArgv)                                        \
       SymI_HasProto(getFullProgArgv)                                    \
+      SymI_HasProto(setFullProgArgv)                                    \
+      SymI_HasProto(freeFullProgArgv)                                   \
       SymI_HasProto(getStablePtr)                                       \
       SymI_HasProto(foreignExportStablePtr)                             \
       SymI_HasProto(hs_init)                                            \
+      SymI_HasProto(hs_init_with_rtsopts)                               \
+      SymI_HasProto(hs_init_ghc)                                        \
       SymI_HasProto(hs_exit)                                            \
+      SymI_HasProto(hs_exit_nowait)                                     \
       SymI_HasProto(hs_set_argv)                                        \
       SymI_HasProto(hs_add_root)                                        \
       SymI_HasProto(hs_perform_gc)                                      \
@@ -577,6 +622,9 @@
       SymI_HasProto(hs_free_fun_ptr)                                    \
       SymI_HasProto(hs_hpc_rootModule)                                  \
       SymI_HasProto(hs_hpc_module)                                      \
+      SymI_HasProto(hs_thread_done)                                     \
+      SymI_HasProto(hs_try_putmvar)                                     \
+      SymI_HasProto(defaultRtsConfig)                                   \
       SymI_HasProto(initLinker)                                         \
       SymI_HasProto(initLinker_)                                        \
       SymI_HasProto(stg_unpackClosurezh)                                \
@@ -588,6 +636,7 @@
       SymI_HasProto(stg_killThreadzh)                                   \
       SymI_HasProto(loadArchive)                                        \
       SymI_HasProto(loadObj)                                            \
+      SymI_HasProto(purgeObj)                                           \
       SymI_HasProto(insertSymbol)                                       \
       SymI_HasProto(lookupSymbol)                                       \
       SymI_HasProto(stg_makeStablePtrzh)                                \
@@ -625,6 +674,8 @@
       SymI_HasProto(stg_casMutVarzh)                                    \
       SymI_HasProto(stg_newPinnedByteArrayzh)                           \
       SymI_HasProto(stg_newAlignedPinnedByteArrayzh)                    \
+      SymI_HasProto(stg_isByteArrayPinnedzh)                            \
+      SymI_HasProto(stg_isMutableByteArrayPinnedzh)                     \
       SymI_HasProto(stg_shrinkMutableByteArrayzh)                       \
       SymI_HasProto(stg_resizzeMutableByteArrayzh)                      \
       SymI_HasProto(newSpark)                                           \
@@ -647,6 +698,7 @@
       SymI_HasProto(rts_eval)                                           \
       SymI_HasProto(rts_evalIO)                                         \
       SymI_HasProto(rts_evalLazyIO)                                     \
+      SymI_HasProto(rts_evalStableIOMain)                               \
       SymI_HasProto(rts_evalStableIO)                                   \
       SymI_HasProto(rts_eval_)                                          \
       SymI_HasProto(rts_getBool)                                        \
@@ -691,17 +743,20 @@
       SymI_HasProto(rtsSupportsBoundThreads)                            \
       SymI_HasProto(rts_isProfiled)                                     \
       SymI_HasProto(rts_isDynamic)                                      \
+      SymI_HasProto(rts_setInCallCapability)                            \
       SymI_HasProto(rts_getThreadAllocationCounter)                     \
       SymI_HasProto(rts_setThreadAllocationCounter)                     \
       SymI_HasProto(rts_enableThreadAllocationLimit)                    \
       SymI_HasProto(rts_disableThreadAllocationLimit)                   \
+      SymI_HasProto(rts_setMainThread)                                  \
       SymI_HasProto(setProgArgv)                                        \
       SymI_HasProto(startupHaskell)                                     \
       SymI_HasProto(shutdownHaskell)                                    \
       SymI_HasProto(shutdownHaskellAndExit)                             \
       SymI_HasProto(stable_name_table)                                  \
       SymI_HasProto(stable_ptr_table)                                   \
-      SymI_HasProto(stackOverflow)                                      \
+      SymI_HasProto(reportStackOverflow)                                \
+      SymI_HasProto(reportHeapOverflow)                                 \
       SymI_HasProto(stg_CAF_BLACKHOLE_info)                             \
       SymI_HasProto(stg_BLACKHOLE_info)                                 \
       SymI_HasProto(__stg_EAGER_BLACKHOLE_info)                         \
@@ -849,9 +904,14 @@
       SymI_HasProto(atomic_dec)                                         \
       SymI_HasProto(hs_spt_lookup)                                      \
       SymI_HasProto(hs_spt_insert)                                      \
+      SymI_HasProto(hs_spt_insert_stableptr)                            \
       SymI_HasProto(hs_spt_remove)                                      \
       SymI_HasProto(hs_spt_keys)                                        \
       SymI_HasProto(hs_spt_key_count)                                   \
+      SymI_HasProto(write_barrier)                                      \
+      SymI_HasProto(store_load_barrier)                                 \
+      SymI_HasProto(load_load_barrier)                                  \
+      SymI_HasProto(cas)                                                \
       RTS_USER_SIGNALS_SYMBOLS                                          \
       RTS_INTCHAR_SYMBOLS
 
@@ -924,11 +984,11 @@ RTS_LIBFFI_SYMBOLS
 #undef SymE_NeedsDataProto
 
 #define SymI_HasProto(vvv) { MAYBE_LEADING_UNDERSCORE_STR(#vvv), \
-                    (void*)(&(vvv)) },
+                    (void*)(&(vvv)), false },
 #define SymI_HasDataProto(vvv) \
                     SymI_HasProto(vvv)
 #define SymE_HasProto(vvv) { MAYBE_LEADING_UNDERSCORE_STR(#vvv), \
-            (void*)DLL_IMPORT_DATA_REF(vvv) },
+            (void*)DLL_IMPORT_DATA_REF(vvv), false },
 #define SymE_HasDataProto(vvv) \
                     SymE_HasProto(vvv)
 
@@ -941,14 +1001,17 @@ RTS_LIBFFI_SYMBOLS
 // another symbol.  See newCAF/newRetainedCAF/newGCdCAF for an example.
 #define SymI_HasProto_redirect(vvv,xxx)   \
     { MAYBE_LEADING_UNDERSCORE_STR(#vvv), \
-      (void*)(&(xxx)) },
+      (void*)(&(xxx)), false },
 
 // SymI_HasProto_deprecated allows us to redirect references from their deprecated
 // names to the undeprecated ones. e.g. access -> _access.
 // We use the hexspeak for unallocated memory 0xBAADF00D to signal the RTS
 // that this needs to be loaded from somewhere else.
+// These are inserted as weak symbols to prevent us overriding packages that do
+// define them, since on Windows these functions shouldn't be in the top level
+// namespace, but we have them for POSIX compatibility.
 #define SymI_HasProto_deprecated(vvv)   \
-   { #vvv, (void*)0xBAADF00D },
+   { #vvv, (void*)0xBAADF00D, true },
 
 RtsSymbolVal rtsSyms[] = {
       RTS_SYMBOLS
@@ -964,7 +1027,7 @@ RtsSymbolVal rtsSyms[] = {
       // dyld stub code contains references to this,
       // but it should never be called because we treat
       // lazy pointers as nonlazy.
-      { "dyld_stub_binding_helper", (void*)0xDEADBEEF },
+      { "dyld_stub_binding_helper", (void*)0xDEADBEEF, false },
 #endif
-      { 0, 0 } /* sentinel */
+      { 0, 0, false } /* sentinel */
 };

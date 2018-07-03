@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Client.Init
@@ -23,48 +22,40 @@ module Distribution.Client.Init (
 
   ) where
 
+import Prelude ()
+import Distribution.Client.Compat.Prelude hiding (empty)
+
 import System.IO
   ( hSetBuffering, stdout, BufferMode(..) )
 import System.Directory
   ( getCurrentDirectory, doesDirectoryExist, doesFileExist, copyFile
   , getDirectoryContents, createDirectoryIfMissing )
 import System.FilePath
-  ( (</>), (<.>), takeBaseName )
+  ( (</>), (<.>), takeBaseName, equalFilePath )
 import Data.Time
   ( getCurrentTime, utcToLocalTime, toGregorian, localDay, getCurrentTimeZone )
 
-import Data.Char
-  ( toUpper )
 import Data.List
-  ( intercalate, nub, groupBy, (\\) )
-import Data.Maybe
-  ( fromMaybe, isJust, catMaybes, listToMaybe )
+  ( groupBy, (\\) )
 import Data.Function
   ( on )
 import qualified Data.Map as M
-#if !MIN_VERSION_base(4,8,0)
-import Control.Applicative
-  ( (<$>) )
-import Data.Traversable
-  ( traverse )
-#endif
 import Control.Monad
-  ( when, unless, (>=>), join, forM_ )
+  ( (>=>), join, forM_, mapM, mapM_ )
 import Control.Arrow
   ( (&&&), (***) )
 
 import Text.PrettyPrint hiding (mode, cat)
 
-import Data.Version
-  ( Version(..) )
 import Distribution.Version
-  ( orLaterVersion, earlierVersion, intersectVersionRanges, VersionRange )
+  ( Version, mkVersion, alterVersion
+  , orLaterVersion, earlierVersion, intersectVersionRanges, VersionRange )
 import Distribution.Verbosity
   ( Verbosity )
 import Distribution.ModuleName
-  ( ModuleName, fromString )  -- And for the Text instance
+  ( ModuleName )  -- And for the Text instance
 import Distribution.InstalledPackageInfo
-  ( InstalledPackageInfo, sourcePackageId, exposed )
+  ( InstalledPackageInfo, exposed )
 import qualified Distribution.Package as P
 import Language.Haskell.Extension ( Language(..) )
 
@@ -89,14 +80,15 @@ import Distribution.Simple.Configure
 import Distribution.Simple.Compiler
   ( PackageDBStack, Compiler )
 import Distribution.Simple.Program
-  ( ProgramConfiguration )
+  ( ProgramDb )
 import Distribution.Simple.PackageIndex
   ( InstalledPackageIndex, moduleNameIndex )
 import Distribution.Text
   ( display, Text(..) )
 
-import Distribution.Client.PackageIndex
+import Distribution.Solver.Types.PackageIndex
   ( elemByPackageName )
+
 import Distribution.Client.IndexUtils
   ( getSourcePackages )
 import Distribution.Client.Types
@@ -108,12 +100,12 @@ initCabal :: Verbosity
           -> PackageDBStack
           -> RepoContext
           -> Compiler
-          -> ProgramConfiguration
+          -> ProgramDb
           -> InitFlags
           -> IO ()
-initCabal verbosity packageDBs repoCtxt comp conf initFlags = do
+initCabal verbosity packageDBs repoCtxt comp progdb initFlags = do
 
-  installedPkgIndex <- getInstalledPackages verbosity comp packageDBs conf
+  installedPkgIndex <- getInstalledPackages verbosity comp packageDBs progdb
   sourcePkgDb <- getSourcePackages verbosity repoCtxt
 
   hSetBuffering stdout NoBuffering
@@ -202,7 +194,7 @@ getPackageName sourcePkgDb flags = do
 --  if possible.
 getVersion :: InitFlags -> IO InitFlags
 getVersion flags = do
-  let v = Just $ Version [0,1,0,0] []
+  let v = Just $ mkVersion [0,1,0,0]
   v' <-     return (flagToMaybe $ version flags)
         ?>> maybePrompt flags (prompt "Package version" v)
         ?>> return v
@@ -380,13 +372,20 @@ guessSourceDir flags = do
              then Just "src"
              else Nothing
 
+-- | Check whether a potential source file is located in one of the
+--   source directories.
+isSourceFile :: Maybe [FilePath] -> SourceFileEntry -> Bool
+isSourceFile Nothing        sf = isSourceFile (Just ["."]) sf
+isSourceFile (Just srcDirs) sf = any (equalFilePath (relativeSourcePath sf)) srcDirs
+
 -- | Get the list of exposed modules and extra tools needed to build them.
 getModulesBuildToolsAndDeps :: InstalledPackageIndex -> InitFlags -> IO InitFlags
 getModulesBuildToolsAndDeps pkgIx flags = do
   dir <- maybe getCurrentDirectory return . flagToMaybe $ packageDir flags
 
-  -- TODO: really should use guessed source roots.
-  sourceFiles <- scanForModules dir
+  sourceFiles0 <- scanForModules dir
+
+  let sourceFiles = filter (isSourceFile (sourceDirs flags)) sourceFiles0
 
   Just mods <-      return (exposedModules flags)
            ?>> (return . Just . map moduleName $ sourceFiles)
@@ -455,7 +454,7 @@ chooseDep flags (m, Just ps)
                   message flags "You will need to pick one and manually add it to the Build-depends: field."
                   return Nothing
   where
-    pkgGroups = groupBy ((==) `on` P.pkgName) (map sourcePackageId ps)
+    pkgGroups = groupBy ((==) `on` P.pkgName) (map P.packageId ps)
 
     -- Given a list of available versions of the same package, pick a dependency.
     toDep :: [P.PackageIdentifier] -> IO P.Dependency
@@ -477,11 +476,11 @@ pvpize :: Version -> VersionRange
 pvpize v = orLaterVersion v'
            `intersectVersionRanges`
            earlierVersion (incVersion 1 v')
-  where v' = (v { versionBranch = take 2 (versionBranch v) })
+  where v' = alterVersion (take 2) v
 
 -- | Increment the nth version component (counting from 0).
 incVersion :: Int -> Version -> Version
-incVersion n (Version vlist tags) = Version (incVersion' n vlist) tags
+incVersion n = alterVersion (incVersion' n)
   where
     incVersion' 0 []     = [1]
     incVersion' 0 (v:_)  = [v+1]
@@ -603,11 +602,6 @@ promptList' displayItem numChoices choices def other = do
                                   = return . Right $ choices !! (n-1)
                    | otherwise    = Left `fmap` promptStr "Please specify" Nothing
 
-readMaybe :: (Read a) => String -> Maybe a
-readMaybe s = case reads s of
-                [(a,"")] -> Just a
-                _        -> Nothing
-
 ---------------------------------------------------------------------------
 --  File generation  ------------------------------------------------------
 ---------------------------------------------------------------------------
@@ -625,28 +619,28 @@ writeLicense flags = do
           Flag BSD3
             -> Just $ bsd3 authors year
 
-          Flag (GPL (Just (Version {versionBranch = [2]})))
+          Flag (GPL (Just v)) | v == mkVersion [2]
             -> Just gplv2
 
-          Flag (GPL (Just (Version {versionBranch = [3]})))
+          Flag (GPL (Just v)) | v == mkVersion [3]
             -> Just gplv3
 
-          Flag (LGPL (Just (Version {versionBranch = [2, 1]})))
+          Flag (LGPL (Just v)) | v == mkVersion [2,1]
             -> Just lgpl21
 
-          Flag (LGPL (Just (Version {versionBranch = [3]})))
+          Flag (LGPL (Just v)) | v == mkVersion [3]
             -> Just lgpl3
 
-          Flag (AGPL (Just (Version {versionBranch = [3]})))
+          Flag (AGPL (Just v)) | v == mkVersion [3]
             -> Just agplv3
 
-          Flag (Apache (Just (Version {versionBranch = [2, 0]})))
+          Flag (Apache (Just v)) | v == mkVersion [2,0]
             -> Just apache20
 
           Flag MIT
             -> Just $ mit authors year
 
-          Flag (MPL (Version {versionBranch = [2, 0]}))
+          Flag (MPL v) | v == mkVersion [2,0]
             -> Just mpl20
 
           Flag ISC
@@ -850,7 +844,7 @@ generateCabalFile fileName c =
                 (Just "Extra files to be distributed with the package, such as examples or a README.")
                 True
 
-       , field  "cabal-version" (Flag $ orLaterVersion (Version [1,10] []))
+       , field  "cabal-version" (Flag $ orLaterVersion (mkVersion [1,10]))
                 (Just "Constraint on the version of Cabal needed to build this package.")
                 False
 
@@ -924,9 +918,9 @@ generateCabalFile fileName c =
                         (True, _, _)      -> (showComment com $$) . ($$ text "")
                         (False, _, _)     -> ($$ text "")
                       $
-                      comment f <> text s <> colon
-                                <> text (replicate (20 - length s) ' ')
-                                <> text (fromMaybe "" . flagToMaybe $ f)
+                      comment f <<>> text s <<>> colon
+                                <<>> text (replicate (20 - length s) ' ')
+                                <<>> text (fromMaybe "" . flagToMaybe $ f)
    comment NoFlag    = text "-- "
    comment (Flag "") = text "-- "
    comment _         = text ""

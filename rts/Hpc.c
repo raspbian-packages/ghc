@@ -106,7 +106,8 @@ static StgWord64 expectWord64(void) {
 static void
 readTix(void) {
   unsigned int i;
-  HpcModuleInfo *tmpModule, *lookup;
+  HpcModuleInfo *tmpModule;
+  const HpcModuleInfo *lookup;
 
   ws();
   expect('T');
@@ -119,7 +120,7 @@ readTix(void) {
   while(tix_ch != ']') {
     tmpModule = (HpcModuleInfo *)stgMallocBytes(sizeof(HpcModuleInfo),
                                                 "Hpc.readTix");
-    tmpModule->from_file = rtsTrue;
+    tmpModule->from_file = true;
     expect('T');
     expect('i');
     expect('x');
@@ -257,7 +258,7 @@ hs_hpc_module(char *modName,
               StgWord64 *tixArr)
 {
   HpcModuleInfo *tmpModule;
-  nat i;
+  uint32_t i;
 
   if (moduleHash == NULL) {
       moduleHash = allocStrHashTable();
@@ -278,7 +279,7 @@ hs_hpc_module(char *modName,
           tixArr[i] = 0;
       }
       tmpModule->next = modules;
-      tmpModule->from_file = rtsFalse;
+      tmpModule->from_file = false;
       modules = tmpModule;
       insertHashTable(moduleHash, (StgWord)modName, tmpModule);
   }
@@ -307,7 +308,7 @@ hs_hpc_module(char *modName,
           stgFree(tmpModule->modName);
           stgFree(tmpModule->tixArr);
       }
-      tmpModule->from_file = rtsFalse;
+      tmpModule->from_file = false;
   }
 }
 
@@ -332,12 +333,12 @@ writeTix(FILE *f) {
     }
     fprintf(f," TixModule \"%s\" %u %u [",
            tmpModule->modName,
-            (nat)tmpModule->hashNo,
-            (nat)tmpModule->tickCount);
+            (uint32_t)tmpModule->hashNo,
+            (uint32_t)tmpModule->tickCount);
     debugTrace(DEBUG_hpc,"%s: %u (hash=%u)\n",
                tmpModule->modName,
-               (nat)tmpModule->tickCount,
-               (nat)tmpModule->hashNo);
+               (uint32_t)tmpModule->tickCount,
+               (uint32_t)tmpModule->hashNo);
 
     inner_comma = 0;
     for(i = 0;i < tmpModule->tickCount;i++) {

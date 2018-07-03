@@ -5,7 +5,6 @@ module CmmSink (
 
 import Cmm
 import CmmOpt
-import BlockId
 import CmmLive
 import CmmUtils
 import Hoopl
@@ -139,7 +138,7 @@ type Assignment = (LocalReg, CmmExpr, AbsMem)
   -- the RHS of the assignment.
 
 type Assignments = [Assignment]
-  -- A sequence of assignements; kept in *reverse* order
+  -- A sequence of assignments; kept in *reverse* order
   -- So the list [ x=e1, y=e2 ] means the sequence of assignments
   --     y = e2
   --     x = e1
@@ -154,7 +153,7 @@ cmmSink dflags graph = ofBlockList (g_entry graph) $ sink mapEmpty $ blocks
 
   join_pts = findJoinPoints blocks
 
-  sink :: BlockEnv Assignments -> [CmmBlock] -> [CmmBlock]
+  sink :: LabelMap Assignments -> [CmmBlock] -> [CmmBlock]
   sink _ [] = []
   sink sunk (b:bs) =
     -- pprTrace "sink" (ppr lbl) $
@@ -253,12 +252,12 @@ annotate dflags live nodes = snd $ foldr ann (live,[]) nodes
 --
 -- Find the blocks that have multiple successors (join points)
 --
-findJoinPoints :: [CmmBlock] -> BlockEnv Int
+findJoinPoints :: [CmmBlock] -> LabelMap Int
 findJoinPoints blocks = mapFilter (>1) succ_counts
  where
   all_succs = concatMap successors blocks
 
-  succ_counts :: BlockEnv Int
+  succ_counts :: LabelMap Int
   succ_counts = foldr (\l -> mapInsertWith (+) l 1) mapEmpty all_succs
 
 --
@@ -337,7 +336,7 @@ shouldSink _ _other = Nothing
 
 --
 -- discard dead assignments.  This doesn't do as good a job as
--- removeDeadAsssignments, because it would need multiple passes
+-- removeDeadAssignments, because it would need multiple passes
 -- to get all the dead code, but it catches the common case of
 -- superfluous reloads from the stack that the stack allocator
 -- leaves behind.

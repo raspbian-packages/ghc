@@ -1,4 +1,6 @@
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
 
 module Distribution.Simple.Program.GHC (
     GhcOptions(..),
@@ -14,9 +16,11 @@ module Distribution.Simple.Program.GHC (
 
   ) where
 
-import Distribution.Compat.Semigroup as Semi
+import Prelude ()
+import Distribution.Compat.Prelude
+
+import Distribution.Backpack
 import Distribution.Simple.GHC.ImplInfo
-import Distribution.Package
 import Distribution.PackageDescription hiding (Flag)
 import Distribution.ModuleName
 import Distribution.Simple.Compiler hiding (Flag)
@@ -25,12 +29,12 @@ import Distribution.Simple.Program.Types
 import Distribution.Simple.Program.Run
 import Distribution.System
 import Distribution.Text
+import Distribution.Types.ComponentId
 import Distribution.Verbosity
 import Distribution.Utils.NubList
 import Language.Haskell.Extension
 
-import GHC.Generics (Generic)
-import qualified Data.Map as M
+import qualified Data.Map as Map
 
 -- | A structured set of GHC options/flags
 --
@@ -80,17 +84,34 @@ data GhcOptions = GhcOptions {
   -- (we need to handle backwards compatibility.)
   ghcOptThisUnitId   :: Flag String,
 
+  -- | GHC doesn't make any assumptions about the format of
+  -- definite unit ids, so when we are instantiating a package it
+  -- needs to be told explicitly what the component being instantiated
+  -- is.  This only gets set when 'ghcOptInstantiatedWith' is non-empty
+  ghcOptThisComponentId :: Flag ComponentId,
+
+  -- | How the requirements of the package being compiled are to
+  -- be filled.  When typechecking an indefinite package, the 'OpenModule'
+  -- is always a 'OpenModuleVar'; otherwise, it specifies the installed module
+  -- that instantiates a package.
+  ghcOptInstantiatedWith :: [(ModuleName, OpenModule)],
+
+  -- | No code? (But we turn on interface writing
+  ghcOptNoCode :: Flag Bool,
+
   -- | GHC package databases to use, the @ghc -package-conf@ flag.
   ghcOptPackageDBs    :: PackageDBStack,
 
-  -- | The GHC packages to use. For compatability with old and new ghc, this
-  -- requires both the short and long form of the package id;
-  -- the @ghc -package@ or @ghc -package-id@ flags.
+  -- | The GHC packages to bring into scope when compiling,
+  -- the @ghc -package-id@ flags.
   ghcOptPackages      ::
-    NubListR (UnitId, PackageId, ModuleRenaming),
+    NubListR (OpenUnitId, ModuleRenaming),
 
   -- | Start with a clean package set; the @ghc -hide-all-packages@ flag
   ghcOptHideAllPackages :: Flag Bool,
+
+  -- | Warn about modules, not listed in command line
+  ghcOptWarnMissingHomeModules :: Flag Bool,
 
   -- | Don't automatically link in Haskell98 etc; the @ghc
   -- -no-auto-link-packages@ flag.
@@ -122,6 +143,9 @@ data GhcOptions = GhcOptions {
   -- flag.
   ghcOptLinkNoHsMain :: Flag Bool,
 
+  -- | Module definition files (Windows specific)
+  ghcOptLinkModDefFiles :: NubListR FilePath,
+
   --------------------
   -- C and CPP stuff
 
@@ -151,7 +175,7 @@ data GhcOptions = GhcOptions {
 
   -- | A GHC version-dependent mapping of extensions to flags. This must be
   -- set to be able to make use of the 'ghcOptExtensions'.
-  ghcOptExtensionMap    :: M.Map Extension String,
+  ghcOptExtensionMap    :: Map Extension String,
 
   ----------------
   -- Compilation
@@ -160,7 +184,7 @@ data GhcOptions = GhcOptions {
   ghcOptOptimisation  :: Flag GhcOptimisation,
 
     -- | Emit debug info; the @ghc -g@ flag.
-  ghcOptDebugInfo  :: Flag Bool,
+  ghcOptDebugInfo     :: Flag DebugInfoLevel,
 
   -- | Compile in profiling mode; the @ghc -prof@ flag.
   ghcOptProfilingMode :: Flag Bool,
@@ -196,9 +220,10 @@ data GhcOptions = GhcOptions {
   ghcOptStubDir       :: Flag FilePath,
 
   --------------------
-  -- Dynamic linking
+  -- Creating libraries
 
   ghcOptDynLinkMode   :: Flag GhcDynLinkMode,
+  ghcOptStaticLib     :: Flag Bool,
   ghcOptShared        :: Flag Bool,
   ghcOptFPic          :: Flag Bool,
   ghcOptDylibName     :: Flag String,
@@ -209,6 +234,10 @@ data GhcOptions = GhcOptions {
 
   -- | Get GHC to be quiet or verbose with what it's doing; the @ghc -v@ flag.
   ghcOptVerbosity     :: Flag Verbosity,
+
+  -- | Put the extra folders in the PATH environment variable we invoke
+  -- GHC with
+  ghcOptExtraPath     :: NubListR FilePath,
 
   -- | Let GHC know that it is Cabal that's calling it.
   -- Modifies some of the GHC error messages.
@@ -251,7 +280,9 @@ runGHC verbosity ghcProg comp platform opts = do
 ghcInvocation :: ConfiguredProgram -> Compiler -> Platform -> GhcOptions
               -> ProgramInvocation
 ghcInvocation prog comp platform opts =
-    programInvocation prog (renderGhcOptions comp platform opts)
+    (programInvocation prog (renderGhcOptions comp platform opts)) {
+        progInvokePathEnv = fromNubListR (ghcOptExtraPath opts)
+    }
 
 renderGhcOptions :: Compiler -> Platform -> GhcOptions -> [String]
 renderGhcOptions comp _platform@(Platform _arch os) opts
@@ -279,8 +310,7 @@ renderGhcOptions comp _platform@(Platform _arch os) opts
 
   , maybe [] verbosityOpts (flagToMaybe (ghcOptVerbosity opts))
 
-  , [ "-fbuilding-cabal-package" | flagBool ghcOptCabal
-                                 , flagBuildingCabalPkg implInfo ]
+  , [ "-fbuilding-cabal-package" | flagBool ghcOptCabal ]
 
   ----------------
   -- Compilation
@@ -292,7 +322,12 @@ renderGhcOptions comp _platform@(Platform _arch os) opts
       Just GhcMaximumOptimisation     -> ["-O2"]
       Just (GhcSpecialOptimisation s) -> ["-O" ++ s] -- eg -Odph
 
-  , [ "-g" | flagDebugInfo implInfo && flagBool ghcOptDebugInfo ]
+  , case flagToMaybe (ghcOptDebugInfo opts) of
+      Nothing                                -> []
+      Just NoDebugInfo                       -> []
+      Just MinimalDebugInfo                  -> ["-g1"]
+      Just NormalDebugInfo                   -> ["-g2"]
+      Just MaximalDebugInfo                  -> ["-g3"]
 
   , [ "-prof" | flagBool ghcOptProfilingMode ]
 
@@ -323,9 +358,10 @@ renderGhcOptions comp _platform@(Platform _arch os) opts
     else []
 
   --------------------
-  -- Dynamic linking
+  -- Creating libraries
 
-  , [ "-shared"  | flagBool ghcOptShared  ]
+  , [ "-staticlib" | flagBool ghcOptStaticLib ]
+  , [ "-shared"    | flagBool ghcOptShared    ]
   , case flagToMaybe (ghcOptDynLinkMode opts) of
       Nothing                  -> []
       Just GhcStaticOnly       -> ["-static"]
@@ -342,12 +378,10 @@ renderGhcOptions comp _platform@(Platform _arch os) opts
   , concat [ ["-hisuf",   suf] | suf <- flag ghcOptHiSuffix  ]
   , concat [ ["-dynosuf", suf] | suf <- flag ghcOptDynObjSuffix ]
   , concat [ ["-dynhisuf",suf] | suf <- flag ghcOptDynHiSuffix  ]
-  , concat [ ["-outputdir", dir] | dir <- flag ghcOptOutputDir
-                                 , flagOutputDir implInfo ]
+  , concat [ ["-outputdir", dir] | dir <- flag ghcOptOutputDir ]
   , concat [ ["-odir",    dir] | dir <- flag ghcOptObjDir ]
   , concat [ ["-hidir",   dir] | dir <- flag ghcOptHiDir  ]
-  , concat [ ["-stubdir", dir] | dir <- flag ghcOptStubDir
-                               , flagStubdir implInfo ]
+  , concat [ ["-stubdir", dir] | dir <- flag ghcOptStubDir ]
 
   -----------------------
   -- Source search path
@@ -362,8 +396,6 @@ renderGhcOptions comp _platform@(Platform _arch os) opts
   , [ "-optP" ++ opt | opt <- flags ghcOptCppOptions ]
   , concat [ [ "-optP-include", "-optP" ++ inc]
            | inc <- flags ghcOptCppIncludes ]
-  , [ "-#include \"" ++ inc ++ "\""
-    | inc <- flags ghcOptFfiIncludes, flagFfiIncludes implInfo ]
   , [ "-optc" ++ opt | opt <- flags ghcOptCcOptions ]
 
   -----------------
@@ -384,6 +416,7 @@ renderGhcOptions comp _platform@(Platform _arch os) opts
   , [ "-dynload deploy" | not (null (flags ghcOptRPaths)) ]
   , concat [ [ "-optl-Wl,-rpath," ++ dir]
            | dir <- flags ghcOptRPaths ]
+  , [ modDefFile | modDefFile <- flags ghcOptLinkModDefFiles ]
 
   -------------
   -- Packages
@@ -395,18 +428,29 @@ renderGhcOptions comp _platform@(Platform _arch os) opts
              , this_arg ]
              | this_arg <- flag ghcOptThisUnitId ]
 
+  , concat [ ["-this-component-id", display this_cid ]
+           | this_cid <- flag ghcOptThisComponentId ]
+
+  , if null (ghcOptInstantiatedWith opts)
+        then []
+        else "-instantiated-with"
+             : intercalate "," (map (\(n,m) -> display n ++ "="
+                                            ++ display m)
+                                    (ghcOptInstantiatedWith opts))
+             : []
+
+  , concat [ ["-fno-code", "-fwrite-interface"] | flagBool ghcOptNoCode ]
+
   , [ "-hide-all-packages"     | flagBool ghcOptHideAllPackages ]
+  , [ "-Wmissing-home-modules" | flagBool ghcOptWarnMissingHomeModules ]
   , [ "-no-auto-link-packages" | flagBool ghcOptNoAutoLinkPackages ]
 
   , packageDbArgs implInfo (ghcOptPackageDBs opts)
 
-  , concat $ if flagPackageId implInfo
-      then let space "" = ""
-               space xs = ' ' : xs
-           in [ ["-package-id", display ipkgid ++ space (display rns)]
-              | (ipkgid,_,rns) <- flags ghcOptPackages ]
-      else [ ["-package",    display  pkgid]
-           | (_,pkgid,_)  <- flags ghcOptPackages ]
+  , concat $ let space "" = ""
+                 space xs = ' ' : xs
+             in [ ["-package-id", display ipkgid ++ space (display rns)]
+                | (ipkgid,rns) <- flags ghcOptPackages ]
 
   ----------------------------
   -- Language and extensions
@@ -415,7 +459,7 @@ renderGhcOptions comp _platform@(Platform _arch os) opts
     then [ "-X" ++ display lang | lang <- flag ghcOptLanguage ]
     else []
 
-  , [ case M.lookup ext (ghcOptExtensionMap opts) of
+  , [ case Map.lookup ext (ghcOptExtensionMap opts) of
         Just arg -> arg
         Nothing  -> error $ "Distribution.Simple.Program.GHC.renderGhcOptions: "
                           ++ display ext ++ " not present in ghcOptExtensionMap."
@@ -500,7 +544,7 @@ packageDbArgs implInfo
 
 instance Monoid GhcOptions where
   mempty = gmempty
-  mappend = (Semi.<>)
+  mappend = (<>)
 
 instance Semigroup GhcOptions where
   (<>) = gmappend

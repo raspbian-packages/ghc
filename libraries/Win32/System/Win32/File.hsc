@@ -36,6 +36,7 @@ import Control.Concurrent
 ##include "windows_cconv.h"
 
 #include <windows.h>
+#include "alignment.h"
 
 ----------------------------------------------------------------
 -- Enumeration types
@@ -47,23 +48,38 @@ gENERIC_NONE :: AccessMode
 gENERIC_NONE = 0
 
 #{enum AccessMode,
- , gENERIC_READ             = GENERIC_READ
- , gENERIC_WRITE            = GENERIC_WRITE
- , gENERIC_EXECUTE          = GENERIC_EXECUTE
- , gENERIC_ALL              = GENERIC_ALL
- , dELETE                   = DELETE
- , rEAD_CONTROL             = READ_CONTROL
- , wRITE_DAC                = WRITE_DAC
- , wRITE_OWNER              = WRITE_OWNER
- , sYNCHRONIZE              = SYNCHRONIZE
- , sTANDARD_RIGHTS_REQUIRED = STANDARD_RIGHTS_REQUIRED
- , sTANDARD_RIGHTS_READ     = STANDARD_RIGHTS_READ
- , sTANDARD_RIGHTS_WRITE    = STANDARD_RIGHTS_WRITE
- , sTANDARD_RIGHTS_EXECUTE  = STANDARD_RIGHTS_EXECUTE
- , sTANDARD_RIGHTS_ALL      = STANDARD_RIGHTS_ALL
- , sPECIFIC_RIGHTS_ALL      = SPECIFIC_RIGHTS_ALL
- , aCCESS_SYSTEM_SECURITY   = ACCESS_SYSTEM_SECURITY
- , mAXIMUM_ALLOWED          = MAXIMUM_ALLOWED
+ , gENERIC_READ              = GENERIC_READ
+ , gENERIC_WRITE             = GENERIC_WRITE
+ , gENERIC_EXECUTE           = GENERIC_EXECUTE
+ , gENERIC_ALL               = GENERIC_ALL
+ , dELETE                    = DELETE
+ , rEAD_CONTROL              = READ_CONTROL
+ , wRITE_DAC                 = WRITE_DAC
+ , wRITE_OWNER               = WRITE_OWNER
+ , sYNCHRONIZE               = SYNCHRONIZE
+ , sTANDARD_RIGHTS_REQUIRED  = STANDARD_RIGHTS_REQUIRED
+ , sTANDARD_RIGHTS_READ      = STANDARD_RIGHTS_READ
+ , sTANDARD_RIGHTS_WRITE     = STANDARD_RIGHTS_WRITE
+ , sTANDARD_RIGHTS_EXECUTE   = STANDARD_RIGHTS_EXECUTE
+ , sTANDARD_RIGHTS_ALL       = STANDARD_RIGHTS_ALL
+ , sPECIFIC_RIGHTS_ALL       = SPECIFIC_RIGHTS_ALL
+ , aCCESS_SYSTEM_SECURITY    = ACCESS_SYSTEM_SECURITY
+ , mAXIMUM_ALLOWED           = MAXIMUM_ALLOWED
+ , fILE_ADD_FILE             = FILE_ADD_FILE
+ , fILE_ADD_SUBDIRECTORY     = FILE_ADD_SUBDIRECTORY
+ , fILE_ALL_ACCESS           = FILE_ALL_ACCESS
+ , fILE_APPEND_DATA          = FILE_APPEND_DATA
+ , fILE_CREATE_PIPE_INSTANCE = FILE_CREATE_PIPE_INSTANCE
+ , fILE_DELETE_CHILD         = FILE_DELETE_CHILD
+ , fILE_EXECUTE              = FILE_EXECUTE
+ , fILE_LIST_DIRECTORY       = FILE_LIST_DIRECTORY
+ , fILE_READ_ATTRIBUTES      = FILE_READ_ATTRIBUTES
+ , fILE_READ_DATA            = FILE_READ_DATA
+ , fILE_READ_EA              = FILE_READ_EA
+ , fILE_TRAVERSE             = FILE_TRAVERSE
+ , fILE_WRITE_ATTRIBUTES     = FILE_WRITE_ATTRIBUTES
+ , fILE_WRITE_DATA           = FILE_WRITE_DATA
+ , fILE_WRITE_EA             = FILE_WRITE_EA
  }
 
 ----------------------------------------------------------------
@@ -104,6 +120,7 @@ type FileAttributeOrFlag   = UINT
  , fILE_ATTRIBUTE_NORMAL        = FILE_ATTRIBUTE_NORMAL
  , fILE_ATTRIBUTE_TEMPORARY     = FILE_ATTRIBUTE_TEMPORARY
  , fILE_ATTRIBUTE_COMPRESSED    = FILE_ATTRIBUTE_COMPRESSED
+ , fILE_ATTRIBUTE_REPARSE_POINT = FILE_ATTRIBUTE_REPARSE_POINT
  , fILE_FLAG_WRITE_THROUGH      = FILE_FLAG_WRITE_THROUGH
  , fILE_FLAG_OVERLAPPED         = FILE_FLAG_OVERLAPPED
  , fILE_FLAG_NO_BUFFERING       = FILE_FLAG_NO_BUFFERING
@@ -238,7 +255,7 @@ data BY_HANDLE_FILE_INFORMATION = BY_HANDLE_FILE_INFORMATION
 
 instance Storable BY_HANDLE_FILE_INFORMATION where
     sizeOf = const (#size BY_HANDLE_FILE_INFORMATION)
-    alignment = sizeOf
+    alignment _ = #alignment BY_HANDLE_FILE_INFORMATION
     poke buf bhi = do
         (#poke BY_HANDLE_FILE_INFORMATION, dwFileAttributes)     buf (bhfiFileAttributes bhi)
         (#poke BY_HANDLE_FILE_INFORMATION, ftCreationTime)       buf (bhfiCreationTime bhi)
@@ -278,7 +295,7 @@ data WIN32_FILE_ATTRIBUTE_DATA = WIN32_FILE_ATTRIBUTE_DATA
 
 instance Storable WIN32_FILE_ATTRIBUTE_DATA where
     sizeOf = const (#size WIN32_FILE_ATTRIBUTE_DATA)
-    alignment = sizeOf
+    alignment _ = #alignment WIN32_FILE_ATTRIBUTE_DATA
     poke buf ad = do
         (#poke WIN32_FILE_ATTRIBUTE_DATA, dwFileAttributes) buf (fadFileAttributes ad)
         (#poke WIN32_FILE_ATTRIBUTE_DATA, ftCreationTime)   buf (fadCreationTime ad)

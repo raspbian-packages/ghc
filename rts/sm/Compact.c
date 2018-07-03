@@ -169,7 +169,8 @@ loop:
     case 1:
     {
         StgWord r = *(StgPtr)(q-1);
-        ASSERT(LOOKS_LIKE_INFO_PTR((StgWord)UNTAG_CLOSURE((StgClosure *)r)));
+        ASSERT(LOOKS_LIKE_INFO_PTR((StgWord)
+               UNTAG_CONST_CLOSURE((StgClosure *)r)));
         return r;
     }
     case 2:
@@ -213,7 +214,13 @@ thread_static( StgClosure* p )
     case FUN_STATIC:
         p = *FUN_STATIC_LINK(p);
         continue;
-    case CONSTR_STATIC:
+    case CONSTR:
+    case CONSTR_NOCAF:
+    case CONSTR_1_0:
+    case CONSTR_0_1:
+    case CONSTR_2_0:
+    case CONSTR_1_1:
+    case CONSTR_0_2:
         p = *STATIC_LINK(info,p);
         continue;
 
@@ -469,6 +476,7 @@ update_fwd_large( bdescr *bd )
     switch (info->type) {
 
     case ARR_WORDS:
+    case COMPACT_NFDATA:
       // nothing to follow
       continue;
 
@@ -539,7 +547,7 @@ update_fwd_large( bdescr *bd )
 
 // ToDo: too big to inline
 static /* STATIC_INLINE */ StgPtr
-thread_obj (StgInfoTable *info, StgPtr p)
+thread_obj (const StgInfoTable *info, StgPtr p)
 {
     switch (info->type) {
     case THUNK_0_1:
@@ -607,6 +615,7 @@ thread_obj (StgInfoTable *info, StgPtr p)
 
     case FUN:
     case CONSTR:
+    case CONSTR_NOCAF:
     case PRIM:
     case MUT_PRIM:
     case MUT_VAR_CLEAN:
@@ -649,7 +658,6 @@ thread_obj (StgInfoTable *info, StgPtr p)
     }
 
     case IND:
-    case IND_PERM:
         thread(&((StgInd *)p)->indirectee);
         return p + sizeofW(StgInd);
 
@@ -739,7 +747,7 @@ update_fwd( bdescr *blocks )
 {
     StgPtr p;
     bdescr *bd;
-    StgInfoTable *info;
+    const StgInfoTable *info;
 
     bd = blocks;
 
@@ -849,7 +857,7 @@ update_bkwd_compact( generation *gen )
     StgWord m;
 #endif
     bdescr *bd, *free_bd;
-    StgInfoTable *info;
+    const StgInfoTable *info;
     StgWord size;
     W_ free_blocks;
     StgWord iptr;

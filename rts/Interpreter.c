@@ -115,6 +115,16 @@
    cap->r.rRet = (retcode);                     \
    return cap;
 
+// Note [avoiding threadPaused]
+//
+// Switching between the interpreter to compiled code can happen very
+// frequently, so we don't want to call threadPaused(), which is
+// expensive.  BUT we must be careful not to violate the invariant
+// that threadPaused() has been called on all threads before we GC
+// (see Note [upd-black-hole].  So the scheduler must ensure that when
+// we return in this way that we definitely immediately run the thread
+// again and don't GC or do something else.
+//
 #define RETURN_TO_SCHEDULER_NO_PAUSE(todo,retcode)      \
    SAVE_THREAD_STATE();                                 \
    cap->r.rCurrentTSO->what_next = (todo);              \
@@ -214,6 +224,48 @@ void interp_shutdown ( void )
 
 #endif
 
+#ifdef PROFILING
+
+//
+// Build a zero-argument PAP with the current CCS
+// See Note [Evaluating functions with profiling] in Apply.cmm
+//
+STATIC_INLINE
+StgClosure * newEmptyPAP (Capability *cap,
+                          StgClosure *tagged_obj, // a FUN or a BCO
+                          uint32_t arity)
+{
+    StgPAP *pap = (StgPAP *)allocate(cap, sizeofW(StgPAP));
+    SET_HDR(pap, &stg_PAP_info, cap->r.rCCCS);
+    pap->arity = arity;
+    pap->n_args = 0;
+    pap->fun = tagged_obj;
+    return (StgClosure *)pap;
+}
+
+//
+// Make an exact copy of a PAP, except that we combine the current CCS with the
+// CCS in the PAP.  See Note [Evaluating functions with profiling] in Apply.cmm
+//
+STATIC_INLINE
+StgClosure * copyPAP  (Capability *cap, StgPAP *oldpap)
+{
+    uint32_t size = PAP_sizeW(oldpap->n_args);
+    StgPAP *pap = (StgPAP *)allocate(cap, size);
+    enterFunCCS(&cap->r, oldpap->header.prof.ccs);
+    SET_HDR(pap, &stg_PAP_info, cap->r.rCCCS);
+    pap->arity = oldpap->arity;
+    pap->n_args = oldpap->n_args;
+    pap->fun = oldpap->fun;
+    uint32_t i;
+    for (i = 0; i < ((StgPAP *)pap)->n_args; i++) {
+        pap->payload[i] = oldpap->payload[i];
+    }
+    return (StgClosure *)pap;
+}
+
+#endif
+
 static StgWord app_ptrs_itbl[] = {
     (W_)&stg_ap_p_info,
     (W_)&stg_ap_pp_info,
@@ -233,8 +285,8 @@ interpretBCO (Capability* cap)
     // that these entities are non-aliasable.
     register StgPtr       Sp;    // local state -- stack pointer
     register StgPtr       SpLim; // local state -- stack lim pointer
-    register StgClosure   *tagged_obj = 0, *obj;
-    nat n, m;
+    register StgClosure   *tagged_obj = 0, *obj = NULL;
+    uint32_t n, m;
 
     LOAD_THREAD_STATE();
 
@@ -330,7 +382,6 @@ eval_obj:
     switch ( get_itbl(obj)->type ) {
 
     case IND:
-    case IND_PERM:
     case IND_STATIC:
     {
         tagged_obj = ((StgInd*)obj)->indirectee;
@@ -343,8 +394,9 @@ eval_obj:
     case CONSTR_2_0:
     case CONSTR_1_1:
     case CONSTR_0_2:
-    case CONSTR_STATIC:
-    case CONSTR_NOCAF_STATIC:
+    case CONSTR_NOCAF:
+        break;
+
     case FUN:
     case FUN_1_0:
     case FUN_0_1:
@@ -352,19 +404,34 @@ eval_obj:
     case FUN_1_1:
     case FUN_0_2:
     case FUN_STATIC:
+#ifdef PROFILING
+        if (cap->r.rCCCS != obj->header.prof.ccs) {
+            tagged_obj =
+                newEmptyPAP(cap, tagged_obj, get_fun_itbl(obj)->f.arity);
+        }
+#endif
+        break;
+
     case PAP:
-        // already in WHNF
+#ifdef PROFILING
+        if (cap->r.rCCCS != obj->header.prof.ccs) {
+            tagged_obj = copyPAP(cap, (StgPAP *)obj);
+        }
+#endif
         break;
 
     case BCO:
-    {
         ASSERT(((StgBCO *)obj)->arity > 0);
+#ifdef PROFILING
+        if (cap->r.rCCCS != obj->header.prof.ccs) {
+            tagged_obj = newEmptyPAP(cap, tagged_obj, ((StgBCO *)obj)->arity);
+        }
+#endif
         break;
-    }
 
     case AP:    /* Copied from stg_AP_entry. */
     {
-        nat i, words;
+        uint32_t i, words;
         StgAP *ap;
 
         ap = (StgAP*)obj;
@@ -382,7 +449,7 @@ eval_obj:
         // restore the CCCS after evaluating the AP
         Sp -= 2;
         Sp[1] = (W_)cap->r.rCCCS;
-        Sp[0] = (W_)&stg_restore_cccs_info;
+        Sp[0] = (W_)&stg_restore_cccs_eval_info;
 #endif
 
         Sp -= sizeofW(StgUpdateFrame);
@@ -427,7 +494,7 @@ eval_obj:
         // restore the CCCS after evaluating the closure
         Sp -= 2;
         Sp[1] = (W_)cap->r.rCCCS;
-        Sp[0] = (W_)&stg_restore_cccs_info;
+        Sp[0] = (W_)&stg_restore_cccs_eval_info;
 #endif
         Sp -= 2;
         Sp[1] = (W_)tagged_obj;
@@ -467,7 +534,8 @@ do_return:
         // NOTE: not using get_itbl().
         info = ((StgClosure *)Sp)->header.info;
 
-        if (info == (StgInfoTable *)&stg_restore_cccs_info) {
+        if (info == (StgInfoTable *)&stg_restore_cccs_info ||
+            info == (StgInfoTable *)&stg_restore_cccs_eval_info) {
             cap->r.rCCCS = (CostCentreStack*)Sp[1];
             Sp += 2;
             goto do_return;
@@ -644,7 +712,7 @@ do_apply:
 
         case PAP: {
             StgPAP *pap;
-            nat i, arity;
+            uint32_t i, arity;
 
             pap = (StgPAP *)obj;
 
@@ -675,7 +743,7 @@ do_apply:
                 // the appropriate info table in the gap.
                 for (i = 0; i < arity; i++) {
                     Sp[(int)i-1] = Sp[i];
-                    // ^^^^^ careful, i-1 might be negative, but i in unsigned
+                    // ^^^^^ careful, i-1 might be negative, but i is unsigned
                 }
                 Sp[arity-1] = app_ptrs_itbl[n-arity-1];
                 Sp--;
@@ -723,7 +791,7 @@ do_apply:
         }
 
         case BCO: {
-            nat arity, i;
+            uint32_t arity, i;
 
             Sp++;
             arity = ((StgBCO *)obj)->arity;
@@ -737,7 +805,7 @@ do_apply:
                 // the appropriate info table in the gap.
                 for (i = 0; i < arity; i++) {
                     Sp[(int)i-1] = Sp[i];
-                    // ^^^^^ careful, i-1 might be negative, but i in unsigned
+                    // ^^^^^ careful, i-1 might be negative, but i is unsigned
                 }
                 Sp[arity-1] = app_ptrs_itbl[n-arity-1];
                 Sp--;
@@ -749,7 +817,7 @@ do_apply:
             else /* arity > n */ {
                 // build a PAP and return it.
                 StgPAP *pap;
-                nat i;
+                uint32_t i;
                 pap = (StgPAP *)allocate(cap, PAP_sizeW(m));
                 SET_HDR(pap, &stg_PAP_info,cap->r.rCCCS);
                 pap->arity = arity - n;
@@ -974,13 +1042,13 @@ run_BCO:
                // "rts_stop_next_breakpoint" flag is true OR if the
                // breakpoint flag for this particular expression is
                // true
-               if (rts_stop_next_breakpoint == rtsTrue ||
+               if (rts_stop_next_breakpoint == true ||
                    ((StgWord8*)breakPoints->payload)[arg2_array_index]
-                     == rtsTrue)
+                     == true)
                {
                   // make sure we don't automatically stop at the
                   // next breakpoint
-                  rts_stop_next_breakpoint = rtsFalse;
+                  rts_stop_next_breakpoint = false;
 
                   // allocate memory for a new AP_STACK, enough to
                   // store the top stack frame plus an
@@ -1559,9 +1627,9 @@ run_BCO:
 #define ROUND_UP_WDS(p)  ((((StgWord)(p)) + sizeof(W_)-1)/sizeof(W_))
 
             ffi_cif *cif = (ffi_cif *)marshall_fn;
-            nat nargs = cif->nargs;
-            nat ret_size;
-            nat i;
+            uint32_t nargs = cif->nargs;
+            uint32_t ret_size;
+            uint32_t i;
             int j;
             StgPtr p;
             W_ ret[2];                  // max needed
@@ -1619,7 +1687,7 @@ run_BCO:
             Sp[0] = (W_)&stg_ret_p_info;
 
             SAVE_THREAD_STATE();
-            tok = suspendThread(&cap->r, interruptible ? rtsTrue : rtsFalse);
+            tok = suspendThread(&cap->r, interruptible);
 
             // We already made a copy of the arguments above.
             ffi_call(cif, fn, ret, argptrs);

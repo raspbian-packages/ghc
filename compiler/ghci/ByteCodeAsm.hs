@@ -34,13 +34,11 @@ import Outputable
 import Platform
 import Util
 import Unique
+import UniqDSet
 
 -- From iserv
 import SizedSeq
 
-#if __GLASGOW_HASKELL__ < 709
-import Control.Applicative (Applicative(..))
-#endif
 import Control.Monad
 import Control.Monad.ST ( runST )
 import Control.Monad.Trans.Class
@@ -68,14 +66,14 @@ import qualified Data.Map as Map
 
 -- | Finds external references.  Remember to remove the names
 -- defined by this group of BCOs themselves
-bcoFreeNames :: UnlinkedBCO -> NameSet
+bcoFreeNames :: UnlinkedBCO -> UniqDSet Name
 bcoFreeNames bco
-  = bco_refs bco `minusNameSet` mkNameSet [unlinkedBCOName bco]
+  = bco_refs bco `uniqDSetMinusUniqSet` mkNameSet [unlinkedBCOName bco]
   where
     bco_refs (UnlinkedBCO _ _ _ _ nonptrs ptrs)
-        = unionNameSets (
-             mkNameSet [ n | BCOPtrName n <- ssElts ptrs ] :
-             mkNameSet [ n | BCONPtrItbl n <- ssElts nonptrs ] :
+        = unionManyUniqDSets (
+             mkUniqDSet [ n | BCOPtrName n <- ssElts ptrs ] :
+             mkUniqDSet [ n | BCONPtrItbl n <- ssElts nonptrs ] :
              map bco_refs [ bco | BCOPtrBCO bco <- ssElts ptrs ]
           )
 
@@ -91,9 +89,10 @@ bcoFreeNames bco
 
 -- Top level assembler fn.
 assembleBCOs
-  :: HscEnv -> [ProtoBCO Name] -> [TyCon] -> Maybe ModBreaks
+  :: HscEnv -> [ProtoBCO Name] -> [TyCon] -> [RemotePtr ()]
+  -> Maybe ModBreaks
   -> IO CompiledByteCode
-assembleBCOs hsc_env proto_bcos tycons modbreaks = do
+assembleBCOs hsc_env proto_bcos tycons top_strs modbreaks = do
   itblenv <- mkITbls hsc_env tycons
   bcos    <- mapM (assembleBCO (hsc_dflags hsc_env)) proto_bcos
   (bcos',ptrs) <- mallocStrings hsc_env bcos
@@ -101,7 +100,7 @@ assembleBCOs hsc_env proto_bcos tycons modbreaks = do
     { bc_bcos = bcos'
     , bc_itbls =  itblenv
     , bc_ffis = concat (map protoBCOFFIs proto_bcos)
-    , bc_strs = ptrs
+    , bc_strs = top_strs ++ ptrs
     , bc_breaks = modbreaks
     }
 
@@ -229,7 +228,6 @@ instance Applicative Assembler where
     (<*>) = ap
 
 instance Monad Assembler where
-  return = pure
   NullAsm x >>= f = f x
   AllocPtr p k >>= f = AllocPtr p (k >=> f)
   AllocLit l k >>= f = AllocLit l (k >=> f)

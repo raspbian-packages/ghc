@@ -16,7 +16,7 @@ type ReST = String
 
 main :: IO ()
 main = do
-  -- users guide
+  -- user's guide
   writeRestFile (usersGuideFile "what_glasgow_exts_does.gen.rst")
     $ whatGlasgowExtsDoes
   forM_ groups $ \(Group name _ theFlags) ->
@@ -45,11 +45,11 @@ whatGlasgowExtsDoes = unlines
     parseExt ext = inlineCode $ "-X" ++ show ext
 
 -- | Generate a reference table of the given set of flags. This is used in
--- the users guide.
+-- the user's guide.
 flagsTable :: [Flag] -> ReST
 flagsTable theFlags =
-    table [50, 100, 30, 50]
-          ["Flag", "Description", "Static/Dynamic", "Reverse"]
+    table [60, 100, 30, 55]
+          ["Flag", "Description", "Type", "Reverse"]
           (map flagRow theFlags)
   where
     flagRow flag =
@@ -60,7 +60,6 @@ flagsTable theFlags =
         ]
       where
         type_ = case flagType flag of
-                  StaticFlag          -> "static"
                   DynamicFlag         -> "dynamic"
                   DynamicSettableFlag -> "dynamic/``:set``"
                   ModeFlag            -> "mode"
@@ -73,7 +72,12 @@ inlineCode s = "``" ++ s ++ "``"
 -- @:hi:`Hello world`@.
 role :: String -> String -> ReST
 role _ "" = ""
-role r c  = concat [":",r,":`",c,"`"]
+role r c  = concat [":",r,":`",flag,"`",next]
+  where
+    -- Handle multiple comma separated flags
+    (flag, rest) =  span (/= ',') c
+    next | rest == "" = rest
+         | otherwise  = concat [", ", role r $ dropWhile (/= '-') rest]
 
 heading :: Char -> String -> ReST
 heading chr title = unlines

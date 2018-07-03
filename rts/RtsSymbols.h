@@ -10,6 +10,8 @@
 #define RTS_SYMBOLS_H
 
 #include "ghcautoconf.h"
+#include "LinkerInternals.h"
+#include <stdbool.h>
 
 #ifdef LEADING_UNDERSCORE
 #define MAYBE_LEADING_UNDERSCORE_STR(s) ("_" s)
@@ -18,8 +20,9 @@
 #endif
 
 typedef struct _RtsSymbolVal {
-    const char   *lbl;
-    void   *addr;
+    const SymbolName* lbl;
+    SymbolAddr* addr;
+    bool weak;
 } RtsSymbolVal;
 
 extern RtsSymbolVal rtsSyms[];

@@ -253,7 +253,7 @@ waiting for the results in the main thread.
 -- If @rtsSupportsBoundThreads@ is 'False', 'isCurrentThreadBound'
 -- will always return 'False' and both 'forkOS' and 'runInBoundThread' will
 -- fail.
-foreign import ccall rtsSupportsBoundThreads :: Bool
+foreign import ccall unsafe rtsSupportsBoundThreads :: Bool
 
 
 {- |
@@ -308,7 +308,7 @@ forkOS action0
                         MaskedInterruptible -> action0
                         MaskedUninterruptible -> uninterruptibleMask_ action0
 
-            action_plus = catchException action1 childHandler
+            action_plus = catch action1 childHandler
 
         entry <- newStablePtr (myThreadId >>= putMVar mv >> action_plus)
         err <- forkOS_createThread entry

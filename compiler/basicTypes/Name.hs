@@ -5,7 +5,6 @@
 \section[Name]{@Name@: to transmit name info from renamer to typechecker}
 -}
 
-{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE RecordWildCards #-}
 
 -- |
@@ -63,7 +62,8 @@ module Name (
         isWiredInName, isBuiltInSyntax,
         isHoleName,
         wiredInNameTyThing_maybe,
-        nameIsLocalOrFrom, nameIsHomePackageImport, nameIsFromExternalPackage,
+        nameIsLocalOrFrom, nameIsHomePackage,
+        nameIsHomePackageImport, nameIsFromExternalPackage,
         stableNameCmp,
 
         -- * Class 'NamedThing' and overloaded friends
@@ -102,7 +102,7 @@ import Data.Data
 ************************************************************************
 -}
 
--- | A unique, unambigious name for something, containing information about where
+-- | A unique, unambiguous name for something, containing information about where
 -- that thing originated.
 data Name = Name {
                 n_sort :: NameSort,     -- What sort of name it is
@@ -110,7 +110,6 @@ data Name = Name {
                 n_uniq :: {-# UNPACK #-} !Int,
                 n_loc  :: !SrcSpan      -- Definition site
             }
-    deriving Typeable
 
 -- NOTE: we make the n_loc field strict to eliminate some potential
 -- (and real!) space leaks, due to the fact that we don't look at
@@ -270,6 +269,17 @@ nameIsLocalOrFrom :: Module -> Name -> Bool
 nameIsLocalOrFrom from name
   | Just mod <- nameModule_maybe name = from == mod || isInteractiveModule mod
   | otherwise                         = True
+
+nameIsHomePackage :: Module -> Name -> Bool
+-- True if the Name is defined in module of this package
+nameIsHomePackage this_mod
+  = \nm -> case n_sort nm of
+              External nm_mod    -> moduleUnitId nm_mod == this_pkg
+              WiredIn nm_mod _ _ -> moduleUnitId nm_mod == this_pkg
+              Internal -> True
+              System   -> False
+  where
+    this_pkg = moduleUnitId this_mod
 
 nameIsHomePackageImport :: Module -> Name -> Bool
 -- True if the Name is defined in module of this package
@@ -486,10 +496,13 @@ instance Data Name where
 ************************************************************************
 -}
 
+-- | Assumes that the 'Name' is a non-binding one. See
+-- 'IfaceSyn.putIfaceTopBndr' and 'IfaceSyn.getIfaceTopBndr' for serializing
+-- binding 'Name's. See 'UserData' for the rationale for this distinction.
 instance Binary Name where
    put_ bh name =
       case getUserData bh of
-        UserData{ ud_put_name = put_name } -> put_name bh name
+        UserData{ ud_put_nonbinding_name = put_name } -> put_name bh name
 
    get bh =
       case getUserData bh of
@@ -510,7 +523,6 @@ instance OutputableBndr Name where
     pprBndr _ name = pprName name
     pprInfixOcc  = pprInfixName
     pprPrefixOcc = pprPrefixName
-
 
 pprName :: Name -> SDoc
 pprName (Name {n_sort = sort, n_uniq = u, n_occ = occ})
@@ -533,7 +545,12 @@ pprExternal sty uniq mod occ is_wired is_builtin
                                       pprNameSpaceBrief (occNameSpace occ),
                                       pprUnique uniq])
   | BuiltInSyntax <- is_builtin = ppr_occ_name occ  -- Never qualify builtin syntax
-  | otherwise                   = pprModulePrefix sty mod occ <> ppr_occ_name occ
+  | otherwise                   =
+        if isHoleModule mod
+            then case qualName sty mod occ of
+                    NameUnqual -> ppr_occ_name occ
+                    _ -> braces (ppr (moduleName mod) <> dot <> ppr_occ_name occ)
+            else pprModulePrefix sty mod occ <> ppr_occ_name occ
   where
     pp_mod = sdocWithDynFlags $ \dflags ->
              if gopt Opt_SuppressModulePrefixes dflags
@@ -542,7 +559,7 @@ pprExternal sty uniq mod occ is_wired is_builtin
 
 pprInternal :: PprStyle -> Unique -> OccName -> SDoc
 pprInternal sty uniq occ
-  | codeStyle sty  = pprUnique uniq
+  | codeStyle sty  = pprUniqueAlways uniq
   | debugStyle sty = ppr_occ_name occ <> braces (hsep [pprNameSpaceBrief (occNameSpace occ),
                                                        pprUnique uniq])
   | dumpStyle sty  = ppr_occ_name occ <> ppr_underscore_unique uniq
@@ -553,7 +570,7 @@ pprInternal sty uniq occ
 -- Like Internal, except that we only omit the unique in Iface style
 pprSystem :: PprStyle -> Unique -> OccName -> SDoc
 pprSystem sty uniq occ
-  | codeStyle sty  = pprUnique uniq
+  | codeStyle sty  = pprUniqueAlways uniq
   | debugStyle sty = ppr_occ_name occ <> ppr_underscore_unique uniq
                      <> braces (pprNameSpaceBrief (occNameSpace occ))
   | otherwise      = ppr_occ_name occ <> ppr_underscore_unique uniq
@@ -576,14 +593,20 @@ pprModulePrefix sty mod occ = sdocWithDynFlags $ \dflags ->
                           <> ppr (moduleName mod) <> dot          -- scope either
       NameUnqual       -> empty                   -- In scope unqualified
 
+pprUnique :: Unique -> SDoc
+-- Print a unique unless we are suppressing them
+pprUnique uniq
+  = sdocWithDynFlags $ \dflags ->
+    ppUnless (gopt Opt_SuppressUniques dflags) $
+    pprUniqueAlways uniq
+
 ppr_underscore_unique :: Unique -> SDoc
 -- Print an underscore separating the name from its unique
 -- But suppress it if we aren't printing the uniques anyway
 ppr_underscore_unique uniq
   = sdocWithDynFlags $ \dflags ->
-    if gopt Opt_SuppressUniques dflags
-    then empty
-    else char '_' <> pprUnique uniq
+    ppUnless (gopt Opt_SuppressUniques dflags) $
+    char '_' <> pprUniqueAlways uniq
 
 ppr_occ_name :: OccName -> SDoc
 ppr_occ_name occ = ftext (occNameFS occ)
@@ -644,6 +667,9 @@ class NamedThing a where
     getName    :: a -> Name
 
     getOccName n = nameOccName (getName n)      -- Default method
+
+instance NamedThing e => NamedThing (GenLocated l e) where
+    getName = getName . unLoc
 
 getSrcLoc           :: NamedThing a => a -> SrcLoc
 getSrcSpan          :: NamedThing a => a -> SrcSpan

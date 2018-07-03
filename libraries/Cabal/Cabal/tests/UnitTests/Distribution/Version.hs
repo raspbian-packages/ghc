@@ -15,79 +15,96 @@ import Test.Tasty
 import Test.Tasty.QuickCheck
 import qualified Test.Laws as Laws
 
-#if !MIN_VERSION_QuickCheck(2,9,0)
 import Test.QuickCheck.Utils
-#endif
 
 import Control.Monad (liftM, liftM2)
 import Data.Maybe (isJust, fromJust)
 import Data.List (sort, sortBy, nub)
 import Data.Ord  (comparing)
+import Data.Function (on)
+#if MIN_VERSION_base(4,6,0)
+import Text.Read (readMaybe)
+#endif
 
 versionTests :: [TestTree]
 versionTests =
-  zipWith (\n p -> testProperty ("Range Property " ++ show n) p) [1::Int ..]
-    -- properties to validate the test framework
-  [ property prop_nonNull
-  , property prop_gen_intervals1
-  , property prop_gen_intervals2
---, property prop_equivalentVersionRange --FIXME: runs out of test cases
-  , property prop_intermediateVersion
+    -- test 'Version' type
+    [ tp "versionNumbers . mkVersion = id @[NonNegative Int]"  prop_VersionId
+    , tp "versionNumbers . mkVersion = id @Base.Version"       prop_VersionId2
+    , tp "(==) = (==) `on` versionNumbers"                     prop_VersionEq
+    , tp "(==) = (==) `on` mkVersion"                          prop_VersionEq2
+    , tp "compare = compare `on` versionNumbers"               prop_VersionOrd
+    , tp "compare = compare `on` mkVersion"                    prop_VersionOrd2
 
-    -- the basic syntactic version range functions
-  , property prop_anyVersion
-  , property prop_noVersion
-  , property prop_thisVersion
-  , property prop_notThisVersion
-  , property prop_laterVersion
-  , property prop_orLaterVersion
-  , property prop_earlierVersion
-  , property prop_orEarlierVersion
-  , property prop_unionVersionRanges
-  , property prop_intersectVersionRanges
-  , property prop_differenceVersionRanges
-  , property prop_invertVersionRange
-  , property prop_withinVersion
-  , property prop_foldVersionRange
-  , property prop_foldVersionRange'
+    , tp "readMaybe . show = Just"                             prop_ShowRead
+    , tp "read example"                                        prop_ShowRead_example
+    ]
 
-    -- the semantic query functions
---, property prop_isAnyVersion1       --FIXME: runs out of test cases
---, property prop_isAnyVersion2       --FIXME: runs out of test cases
---, property prop_isNoVersion         --FIXME: runs out of test cases
---, property prop_isSpecificVersion1  --FIXME: runs out of test cases
---, property prop_isSpecificVersion2  --FIXME: runs out of test cases
-  , property prop_simplifyVersionRange1
-  , property prop_simplifyVersionRange1'
---, property prop_simplifyVersionRange2   --FIXME: runs out of test cases
---, property prop_simplifyVersionRange2'  --FIXME: runs out of test cases
---, property prop_simplifyVersionRange2'' --FIXME: actually wrong
+    ++ 
+    zipWith (\n p -> testProperty ("Range Property " ++ show n) p) [1::Int ..]
+      -- properties to validate the test framework
+    [ property prop_nonNull
+    , property prop_gen_intervals1
+    , property prop_gen_intervals2
+  --, property prop_equivalentVersionRange --FIXME: runs out of test cases
+    , property prop_intermediateVersion
 
-    -- converting between version ranges and version intervals
-  , property prop_to_intervals
---, property prop_to_intervals_canonical  --FIXME: runs out of test cases
---, property prop_to_intervals_canonical' --FIXME: runs out of test cases
-  , property prop_from_intervals
-  , property prop_to_from_intervals
-  , property prop_from_to_intervals
-  , property prop_from_to_intervals'
+    , property prop_anyVersion
+    , property prop_noVersion
+    , property prop_thisVersion
+    , property prop_notThisVersion
+    , property prop_laterVersion
+    , property prop_orLaterVersion
+    , property prop_earlierVersion
+    , property prop_orEarlierVersion
+    , property prop_unionVersionRanges
+    , property prop_intersectVersionRanges
+    , property prop_differenceVersionRanges
+    , property prop_invertVersionRange
+    , property prop_withinVersion
+    , property prop_foldVersionRange
+    , property prop_foldVersionRange'
 
-    -- union and intersection of version intervals
-  , property prop_unionVersionIntervals
-  , property prop_unionVersionIntervals_idempotent
-  , property prop_unionVersionIntervals_commutative
-  , property prop_unionVersionIntervals_associative
-  , property prop_intersectVersionIntervals
-  , property prop_intersectVersionIntervals_idempotent
-  , property prop_intersectVersionIntervals_commutative
-  , property prop_intersectVersionIntervals_associative
-  , property prop_union_intersect_distributive
-  , property prop_intersect_union_distributive
+      -- the semantic query functions
+  --, property prop_isAnyVersion1       --FIXME: runs out of test cases
+  --, property prop_isAnyVersion2       --FIXME: runs out of test cases
+  --, property prop_isNoVersion         --FIXME: runs out of test cases
+  --, property prop_isSpecificVersion1  --FIXME: runs out of test cases
+  --, property prop_isSpecificVersion2  --FIXME: runs out of test cases
+    , property prop_simplifyVersionRange1
+    , property prop_simplifyVersionRange1'
+  --, property prop_simplifyVersionRange2   --FIXME: runs out of test cases
+  --, property prop_simplifyVersionRange2'  --FIXME: runs out of test cases
+  --, property prop_simplifyVersionRange2'' --FIXME: actually wrong
 
-    -- inversion of version intervals
-  , property prop_invertVersionIntervals
-  , property prop_invertVersionIntervalsTwice
-  ]
+      -- converting between version ranges and version intervals
+    , property prop_to_intervals
+  --, property prop_to_intervals_canonical  --FIXME: runs out of test cases
+  --, property prop_to_intervals_canonical' --FIXME: runs out of test cases
+    , property prop_from_intervals
+    , property prop_to_from_intervals
+    , property prop_from_to_intervals
+    , property prop_from_to_intervals'
+
+      -- union and intersection of version intervals
+    , property prop_unionVersionIntervals
+    , property prop_unionVersionIntervals_idempotent
+    , property prop_unionVersionIntervals_commutative
+    , property prop_unionVersionIntervals_associative
+    , property prop_intersectVersionIntervals
+    , property prop_intersectVersionIntervals_idempotent
+    , property prop_intersectVersionIntervals_commutative
+    , property prop_intersectVersionIntervals_associative
+    , property prop_union_intersect_distributive
+    , property prop_intersect_union_distributive
+
+      -- inversion of version intervals
+    , property prop_invertVersionIntervals
+    , property prop_invertVersionIntervalsTwice
+    ]
+  where
+    tp :: Testable p => String -> p -> TestTree
+    tp = testProperty
 
 -- parseTests :: [TestTree]
 -- parseTests =
@@ -104,23 +121,44 @@ versionTests =
 --     -- , property prop_parse_disp5
 --   ]
 
-#if !MIN_VERSION_QuickCheck(2,9,0)
 instance Arbitrary Version where
   arbitrary = do
-    branch <- smallListOf1 $
-                frequency [(3, return 0)
-                          ,(3, return 1)
-                          ,(2, return 2)
-                          ,(1, return 3)]
-    return (Version branch []) -- deliberate []
+      branch <- smallListOf1 $
+                  frequency [(3, return 0)
+                            ,(3, return 1)
+                            ,(2, return 2)
+                            ,(2, return 3)
+                            ,(1, return 0xfffd)
+                            ,(1, return 0xfffe) -- max fitting into packed W64
+                            ,(1, return 0xffff)
+                            ,(1, return 0x10000)]
+      return (mkVersion branch)
     where
-      smallListOf1 = adjustSize (\n -> min 5 (n `div` 3)) . listOf1
+      smallListOf1 = adjustSize (\n -> min 6 (n `div` 3)) . listOf1
 
-  shrink (Version branch []) =
-    [ Version branch' [] | branch' <- shrink branch, not (null branch') ]
-  shrink (Version branch _tags) =
-    [ Version branch [] ]
-#endif
+  shrink ver = [ mkVersion ns | ns <- shrink (versionNumbers ver)
+                              , not (null ns) ]
+
+newtype VersionArb = VersionArb [Int]
+                   deriving (Eq,Ord,Show)
+
+-- | 'Version' instance as used by QC 2.9
+instance Arbitrary VersionArb where
+  arbitrary = sized $ \n ->
+    do k <- choose (0, log2 n)
+       xs <- vectorOf (k+1) arbitrarySizedNatural
+       return (VersionArb xs)
+    where
+      log2 :: Int -> Int
+      log2 n | n <= 1 = 0
+             | otherwise = 1 + log2 (n `div` 2)
+
+  shrink (VersionArb xs) =
+    [ VersionArb xs'
+    | xs' <- shrink xs
+    , length xs' > 0
+    , all (>=0) xs'
+    ]
 
 instance Arbitrary VersionRange where
   arbitrary = sized verRangeExp
@@ -148,12 +186,52 @@ instance Arbitrary VersionRange where
       orEarlierVersion' v =
         unionVersionRanges (EarlierVersion v) (ThisVersion v)
 
+---------------------
+-- Version properties
+--
+
+prop_VersionId :: [NonNegative Int] -> Bool
+prop_VersionId lst0 =
+    (versionNumbers . mkVersion) lst == lst
+  where
+    lst = map getNonNegative lst0
+
+prop_VersionId2 :: VersionArb -> Bool
+prop_VersionId2 (VersionArb lst) =
+    (versionNumbers . mkVersion) lst == lst
+
+prop_VersionEq :: Version -> Version -> Bool
+prop_VersionEq v1 v2 = (==) v1 v2 == ((==) `on` versionNumbers) v1 v2
+
+prop_VersionEq2 :: VersionArb -> VersionArb -> Bool
+prop_VersionEq2 (VersionArb v1) (VersionArb v2) =
+    (==) v1 v2 == ((==) `on` mkVersion) v1 v2
+
+prop_VersionOrd :: Version -> Version -> Bool
+prop_VersionOrd v1 v2 =
+    compare v1 v2 == (compare `on` versionNumbers) v1 v2
+
+prop_VersionOrd2 :: VersionArb -> VersionArb -> Bool
+prop_VersionOrd2 (VersionArb v1) (VersionArb v2) =
+    (==) v1 v2 == ((==) `on` mkVersion) v1 v2
+
+prop_ShowRead :: Version -> Property
+#if MIN_VERSION_base(4,6,0)
+prop_ShowRead v = Just v === readMaybe (show v)
+#else
+-- readMaybe is since base-4.6
+prop_ShowRead v = v === read (show v)
+#endif
+
+prop_ShowRead_example :: Bool
+prop_ShowRead_example = show (mkVersion [1,2,3]) == "mkVersion [1,2,3]"
+
 ---------------------------
 -- VersionRange properties
 --
 
 prop_nonNull :: Version -> Bool
-prop_nonNull = not . null . versionBranch
+prop_nonNull = (/= nullVersion)
 
 prop_anyVersion :: Version -> Bool
 prop_anyVersion v' =
@@ -218,7 +296,7 @@ prop_withinVersion v v' =
      withinRange v' (withinVersion v)
   == (v' >= v && v' < upper v)
   where
-    upper (Version lower t) = Version (init lower ++ [last lower + 1]) t
+    upper = alterVersion $ \numbers -> init numbers ++ [last numbers + 1]
 
 prop_foldVersionRange :: VersionRange -> Bool
 prop_foldVersionRange range =
@@ -230,9 +308,6 @@ prop_foldVersionRange range =
   where
     expandWildcard (WildcardVersion v) =
         intersectVersionRanges (orLaterVersion v) (earlierVersion (upper v))
-      where
-        upper (Version lower t) = Version (init lower ++ [last lower + 1]) t
-
     expandWildcard (UnionVersionRanges     v1 v2) =
       UnionVersionRanges (expandWildcard v1) (expandWildcard v2)
     expandWildcard (IntersectVersionRanges v1 v2) =
@@ -240,6 +315,7 @@ prop_foldVersionRange range =
     expandWildcard (VersionRangeParens v) = expandWildcard v
     expandWildcard v = v
 
+    upper = alterVersion $ \numbers -> init numbers ++ [last numbers + 1]
 
 prop_foldVersionRange' :: VersionRange -> Bool
 prop_foldVersionRange' range =
@@ -248,6 +324,7 @@ prop_foldVersionRange' range =
                        laterVersion earlierVersion
                        orLaterVersion orEarlierVersion
                        (\v _ -> withinVersion v)
+                       (\v _ -> majorBoundVersion v)
                        unionVersionRanges intersectVersionRanges id
                        range
   where
@@ -580,10 +657,9 @@ prop_equivalentVersionRange range range' version =
 equivalentVersionRange :: VersionRange -> VersionRange -> Bool
 equivalentVersionRange vr1 vr2 =
   let allVersionsUsed = nub (sort (versionsUsed vr1 ++ versionsUsed vr2))
-      minPoint = Version [0] []
+      minPoint = mkVersion [0]
       maxPoint | null allVersionsUsed = minPoint
-               | otherwise = case maximum allVersionsUsed of
-                   Version vs _ -> Version (vs ++ [1]) []
+               | otherwise = alterVersion (++[1]) (maximum allVersionsUsed)
       probeVersions = minPoint : maxPoint
                     : intermediateVersions allVersionsUsed
 
@@ -597,8 +673,8 @@ equivalentVersionRange vr1 vr2 =
 
 intermediateVersion :: Version -> Version -> Version
 intermediateVersion v1 v2 | v1 >= v2 = error "intermediateVersion: v1 >= v2"
-intermediateVersion (Version v1 _) (Version v2 _) =
-  Version (intermediateList v1 v2) []
+intermediateVersion v1 v2 =
+  mkVersion (intermediateList (versionNumbers v1) (versionNumbers v2))
   where
     intermediateList :: [Int] -> [Int] -> [Int]
     intermediateList []     (_:_) = [0]
@@ -616,8 +692,10 @@ prop_intermediateVersion v1 v2 =
           in v1 > v && v > v2
 
 adjacentVersions :: Version -> Version -> Bool
-adjacentVersions (Version v1 _) (Version v2 _) = v1 ++ [0] == v2
-                                              || v2 ++ [0] == v1
+adjacentVersions ver1 ver2 = v1 ++ [0] == v2 || v2 ++ [0] == v1
+  where
+    v1 = versionNumbers ver1
+    v2 = versionNumbers ver2
 
 --------------------------------
 -- Parsing and pretty printing
@@ -655,6 +733,7 @@ prop_parse_disp1 vr =
                         laterVersion earlierVersion
                         orLaterVersion orEarlierVersion
                         (\v _ -> withinVersion v)
+                        (\v _ -> MajorBoundVersion v)
                         unionVersionRanges intersectVersionRanges id
 
     stripParens :: VersionRange -> VersionRange
@@ -713,11 +792,13 @@ displayRaw =
      (\v     -> Disp.text ">=" <> disp v)
      (\v     -> Disp.text "<=" <> disp v)
      (\v _   -> Disp.text "==" <> dispWild v)
+     (\v _   -> Disp.text "^>=" <> disp v)
      (\r1 r2 -> r1 <+> Disp.text "||" <+> r2)
      (\r1 r2 -> r1 <+> Disp.text "&&" <+> r2)
      (\r     -> Disp.parens r) -- parens
 
   where
-    dispWild (Version b _) =
-           Disp.hcat (Disp.punctuate (Disp.char '.') (map Disp.int b))
+    dispWild v =
+           Disp.hcat (Disp.punctuate (Disp.char '.')
+                                     (map Disp.int (versionNumbers v)))
         <> Disp.text ".*"

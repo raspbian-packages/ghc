@@ -7,10 +7,11 @@ module FamInst (
         checkFamInstConsistency, tcExtendLocalFamInstEnv,
         tcLookupDataFamInst, tcLookupDataFamInst_maybe,
         tcInstNewTyCon_maybe, tcTopNormaliseNewTypeTF_maybe,
+        checkRecFamInstConsistency,
         newFamInst,
 
         -- * Injectivity
-        makeInjectivityErrors
+        makeInjectivityErrors, injTyVarsOfType, injTyVarsOfTypes
     ) where
 
 import HscTypes
@@ -27,7 +28,6 @@ import CoAxiom
 import DynFlags
 import Module
 import Outputable
-import UniqFM
 import Util
 import RdrName
 import DataCon ( dataConName )
@@ -42,15 +42,106 @@ import VarSet
 import Bag( Bag, unionBags, unitBag )
 import Control.Monad
 import Unique
+import NameEnv
 import Data.Set (Set)
 import qualified Data.Set as Set
-
-#if __GLASGOW_HASKELL__ < 709
-import Prelude hiding ( and )
-import Data.Foldable ( and )
-#endif
+import Data.List
 
 #include "HsVersions.h"
+
+{-
+
+Note [The type family instance consistency story]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+To preserve type safety we must ensure that for any given module, all
+the type family instances used either in that module or in any module
+it directly or indirectly imports are consistent. For example, consider
+
+  module F where
+    type family F a
+
+  module A where
+    import F( F )
+    type instance F Int = Bool
+    f :: F Int -> Bool
+    f x = x
+
+  module B where
+    import F( F )
+    type instance F Int = Char
+    g :: Char -> F Int
+    g x = x
+
+  module Bad where
+    import A( f )
+    import B( g )
+    bad :: Char -> Int
+    bad c = f (g c)
+
+Even though module Bad never mentions the type family F at all, by
+combining the functions f and g that were type checked in contradictory
+type family instance environments, the function bad is able to coerce
+from one type to another. So when we type check Bad we must verify that
+the type family instances defined in module A are consistent with those
+defined in module B.
+
+How do we ensure that we maintain the necessary consistency?
+
+* Call a module which defines at least one type family instance a
+"family instance module". This flag `mi_finsts` is recorded in the
+interface file.
+
+* For every module we calculate the set of all of its direct and
+indirect dependencies that are family instance modules. This list
+`dep_finsts` is also recorded in the interface file so we can compute
+this list for a module from the lists for its direct dependencies.
+
+* When type checking a module M we check consistency of all the type
+family instances that are either provided by its `dep_finsts` or
+defined in the module M itself. This is a pairwise check, i.e., for
+every pair of instances we must check that they are consistent.
+
+- For family instances coming from `dep_finsts`, this is checked in
+checkFamInstConsistency, called from tcRnImports, and in
+checkRecFamInstConsistency, called from tcTyClGroup. See Note
+[Checking family instance consistency] for details on this check (and
+in particular how we avoid having to do all these checks for every
+module we compile).
+
+- That leaves checking the family instances defined in M itself
+against instances defined in either M or its `dep_finsts`. This is
+checked in `tcExtendLocalFamInstEnv'.
+
+There are two subtle points in this scheme which have not been
+addressed yet.
+
+* We have checked consistency of the family instances *defined* by M
+or its imports, but this is not by definition the same thing as the
+family instances *used* by M or its imports.  Specifically, we need to
+ensure when we use a type family instance while compiling M that this
+instance was really defined from either M or one of its imports,
+rather than being an instance that we happened to know about from
+reading an interface file in the course of compiling an unrelated
+module. Otherwise, we'll end up with no record of the fact that M
+depends on this family instance and type safety will be compromised.
+See #13102.
+
+* It can also happen that M uses a function defined in another module
+which is not transitively imported by M. Examples include the
+desugaring of various overloaded constructs, and references inserted
+by Template Haskell splices. If that function's definition makes use
+of type family instances which are not checked against those visible
+from M, type safety can again be compromised. See #13251.
+
+* When a module C imports a boot module B.hs-boot, we check that C's
+type family instances are compatible with those visible from
+B.hs-boot. However, C will eventually be linked against a different
+module B.hs, which might define additional type family instances which
+are inconsistent with C's. This can also lead to loss of type safety.
+See #9562.
+
+-}
 
 {-
 ************************************************************************
@@ -100,6 +191,8 @@ newFamInst flavor axiom@(CoAxiom { co_ax_tc = fam_tc })
 *                                                                      *
 ************************************************************************
 
+Note [Checking family instance consistency]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 For any two family instance modules that we import directly or indirectly, we
 check whether the instances in the two modules are consistent, *unless* we can
 be certain that the instances of the two modules have already been checked for
@@ -115,11 +208,18 @@ Why do we need to check?  Consider
 Now if we import both X1 and X2 we could make (f2 . f1) :: Int -> Char.
 Notice that neither instance is an orphan.
 
-How do we know which pairs of modules have already been checked?  Any pair of
-modules where both modules occur in the `HscTypes.dep_finsts' set (of the
-`HscTypes.Dependencies') of one of our directly imported modules must have
-already been checked.  Everything else, we check now.  (So that we can be
+How do we know which pairs of modules have already been checked? For each
+module M we directly import, we look up the family instance modules that M
+imports (directly or indirectly), say F1, ..., FN. For any two modules
+among M, F1, ..., FN, we know that the family instances defined in those
+two modules are consistent--because we checked that when we compiled M.
+
+For every other pair of family instance modules we import (directly or
+indirectly), we check that they are consistent now. (So that we can be
 certain that the modules in our `HscTypes.dep_finsts' are consistent.)
+
+There is some fancy footwork regarding hs-boot module loops, see
+Note [Don't check hs-boot type family instances too early]
 -}
 
 -- The optimisation of overlap tests is based on determining pairs of modules
@@ -173,7 +273,27 @@ See Note [Unique Determinism] in Unique
 listToSet :: [ModulePair] -> ModulePairSet
 listToSet l = Set.fromList l
 
-checkFamInstConsistency :: [Module] -> [Module] -> TcM ()
+-- | Check family instance consistency, given:
+--
+-- 1. The list of all modules transitively imported by us
+--    which define a family instance (these are the ones
+--    we have to check for consistency), and
+--
+-- 2. The list of modules which we directly imported
+--    (these specify the sets of family instance defining
+--    modules which are already known to be consistent).
+--
+-- See Note [Checking family instance consistency] for more
+-- details, and Note [The type family instance consistency story]
+-- for the big picture.
+--
+-- This function doesn't check ALL instances for consistency,
+-- only ones that aren't involved in recursive knot-tying
+-- loops; see Note [Don't check hs-boot type family instances too early].
+-- It returns a modified 'TcGblEnv' that has saved the
+-- instances that need to be checked later; use 'checkRecFamInstConsistency'
+-- to check those.
+checkFamInstConsistency :: [Module] -> [Module] -> TcM TcGblEnv
 checkFamInstConsistency famInstMods directlyImpMods
   = do { dflags     <- getDynFlags
        ; (eps, hpt) <- getEpsAndHpt
@@ -185,13 +305,16 @@ checkFamInstConsistency famInstMods directlyImpMods
                                           (ppr mod $$ pprHPT hpt)
                    Just iface -> iface
 
+               -- Which modules were checked for consistency when we compiled
+               -- `mod`? Itself and its dep_finsts.
+             ; modConsistent mod = mod : (dep_finsts . mi_deps . modIface $ mod)
+
              ; hmiModule     = mi_module . hm_iface
              ; hmiFamInstEnv = extendFamInstEnvList emptyFamInstEnv
                                . md_fam_insts . hm_details
              ; hpt_fam_insts = mkModuleEnv [ (hmiModule hmi, hmiFamInstEnv hmi)
-                                           | hmi <- eltsUFM hpt]
-             ; groups        = map (dep_finsts . mi_deps . modIface)
-                                   directlyImpMods
+                                           | hmi <- eltsHpt hpt]
+             ; groups        = map modConsistent directlyImpMods
              ; okPairs       = listToSet $ concatMap allPairs groups
                  -- instances of okPairs are consistent
              ; criticalPairs = listToSet $ allPairs famInstMods
@@ -202,20 +325,124 @@ checkFamInstConsistency famInstMods directlyImpMods
                  -- See Note [ModulePairSet determinism and performance]
              }
 
-       ; mapM_ (check hpt_fam_insts) toCheckPairs
+       ; pending_checks <- mapM (check hpt_fam_insts) toCheckPairs
+       ; tcg_env <- getGblEnv
+       ; return tcg_env { tcg_pending_fam_checks
+                           = foldl' (plusNameEnv_C (++)) emptyNameEnv pending_checks }
        }
   where
     allPairs []     = []
     allPairs (m:ms) = map (modulePair m) ms ++ allPairs ms
 
     check hpt_fam_insts (ModulePair m1 m2)
-      = do { env1 <- getFamInsts hpt_fam_insts m1
-           ; env2 <- getFamInsts hpt_fam_insts m2
-           ; mapM_ (checkForConflicts (emptyFamInstEnv, env2))
-                   (famInstEnvElts env1)
-           ; mapM_ (checkForInjectivityConflicts (emptyFamInstEnv,env2))
-                   (famInstEnvElts env1)
+      = do { env1' <- getFamInsts hpt_fam_insts m1
+           ; env2' <- getFamInsts hpt_fam_insts m2
+           -- We're checking each element of env1 against env2.
+           -- The cost of that is dominated by the size of env1, because
+           -- for each instance in env1 we look it up in the type family
+           -- environment env2, and lookup is cheap.
+           -- The code below ensures that env1 is the smaller environment.
+           ; let sizeE1 = famInstEnvSize env1'
+                 sizeE2 = famInstEnvSize env2'
+                 (env1, env2) = if sizeE1 < sizeE2 then (env1', env2')
+                                                   else (env2', env1')
+           -- Note [Don't check hs-boot type family instances too early]
+           -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+           -- Family instance consistency checking involves checking that
+           -- the family instances of our imported modules are consistent with
+           -- one another; this might lead you to think that this process
+           -- has nothing to do with the module we are about to typecheck.
+           -- Not so!  Consider the following case:
+           --
+           --   -- A.hs-boot
+           --   type family F a
+           --
+           --   -- B.hs
+           --   import {-# SOURCE #-} A
+           --   type instance F Int = Bool
+           --
+           --   -- A.hs
+           --   import B
+           --   type family F a
+           --
+           -- When typechecking A, we are NOT allowed to poke the TyThing
+           -- for for F until we have typechecked the family.  Thus, we
+           -- can't do consistency checking for the instance in B
+           -- (checkFamInstConsistency is called during renaming).
+           -- Failing to defer the consistency check lead to #11062.
+           --
+           -- Additionally, we should also defer consistency checking when
+           -- type from the hs-boot file of the current module occurs on
+           -- the left hand side, as we will poke its TyThing when checking
+           -- for overlap.
+           --
+           --   -- F.hs
+           --   type family F a
+           --
+           --   -- A.hs-boot
+           --   import F
+           --   data T
+           --
+           --   -- B.hs
+           --   import {-# SOURCE #-} A
+           --   import F
+           --   type instance F T = Int
+           --
+           --   -- A.hs
+           --   import B
+           --   data T = MkT
+           --
+           -- However, this is not yet done; see #13981.
+           --
+           -- Note that it is NOT necessary to defer for occurrences in the
+           -- RHS (e.g., type instance F Int = T, in the above example),
+           -- since that never participates in consistency checking
+           -- in any nontrivial way.
+           --
+           -- Why don't we defer ALL of the checks to later?  Well, many
+           -- instances aren't involved in the recursive loop at all.  So
+           -- we might as well check them immediately; and there isn't
+           -- a good time to check them later in any case: every time
+           -- we finish kind-checking a type declaration and add it to
+           -- a context, we *then* consistency check all of the instances
+           -- which mentioned that type.  We DO want to check instances
+           -- as quickly as possible, so that we aren't typechecking
+           -- values with inconsistent axioms in scope.
+           --
+           -- See also Note [Tying the knot] and Note [Type-checking inside the knot]
+           -- for why we are doing this at all.
+           ; this_mod <- getModule
+                    -- NB: == this_mod only holds if there's an hs-boot file;
+                    -- otherwise we cannot possible see instances for families
+                    -- defined by the module we are compiling in imports.
+           ; let shouldCheckNow = ((/= this_mod) . nameModule . fi_fam)
+                 (check_now, check_later) =
+                    partition shouldCheckNow (famInstEnvElts env1)
+           ; mapM_ (checkForConflicts (emptyFamInstEnv, env2))           check_now
+           ; mapM_ (checkForInjectivityConflicts (emptyFamInstEnv,env2)) check_now
+           ; let check_later_map =
+                    extendNameEnvList_C (++) emptyNameEnv
+                        [(fi_fam finst, [finst]) | finst <- check_later]
+           ; return (mapNameEnv (\xs -> [(xs, env2)]) check_later_map)
  }
+
+-- | Given a 'TyCon' that has been incorporated into the type
+-- environment (the knot is tied), if it is a type family, check
+-- that all deferred instances for it are consistent.
+-- See Note [Don't check hs-boot type family instances too early]
+checkRecFamInstConsistency :: TyCon -> TcM ()
+checkRecFamInstConsistency tc = do
+   tcg_env <- getGblEnv
+   let checkConsistency tc
+        | isFamilyTyCon tc
+        , Just pairs <- lookupNameEnv (tcg_pending_fam_checks tcg_env)
+                                      (tyConName tc)
+        = forM_ pairs $ \(check_now, env2) -> do
+            mapM_ (checkForConflicts (emptyFamInstEnv, env2))           check_now
+            mapM_ (checkForInjectivityConflicts (emptyFamInstEnv,env2)) check_now
+        | otherwise
+        = return ()
+   checkConsistency tc
 
 
 getFamInsts :: ModuleEnv FamInstEnv -> Module -> TcM FamInstEnv
@@ -314,7 +541,7 @@ tcTopNormaliseNewTypeTF_maybe faminsts rdr_env ty
     stepper = unwrap_newtype `composeSteppers` unwrap_newtype_instance
 
     -- For newtype instances we take a double step or nothing, so that
-    -- we don't return the reprsentation type of the newtype instance,
+    -- we don't return the representation type of the newtype instance,
     -- which would lead to terrible error messages
     unwrap_newtype_instance rec_nts tc tys
       | Just (tc', tys', co) <- tcLookupDataFamInst_maybe faminsts tc tys
@@ -324,7 +551,7 @@ tcTopNormaliseNewTypeTF_maybe faminsts rdr_env ty
 
     unwrap_newtype rec_nts tc tys
       | Just con <- newTyConDataCon_maybe tc
-      , [gre] <- lookupGRE_Name rdr_env (dataConName con)
+      , Just gre <- lookupGRE_Name rdr_env (dataConName con)
            -- This is where we check that the
            -- data constructor is in scope
       = mapStepResult (\co -> (unitBag gre, co)) $
@@ -341,10 +568,42 @@ tcTopNormaliseNewTypeTF_maybe faminsts rdr_env ty
 ************************************************************************
 -}
 
--- Add new locally-defined family instances
+-- Add new locally-defined family instances, checking consistency with
+-- previous locally-defined family instances as well as all instances
+-- available from imported modules. This requires loading all of our
+-- imports that define family instances (if we haven't loaded them already).
 tcExtendLocalFamInstEnv :: [FamInst] -> TcM a -> TcM a
+
+-- If we weren't actually given any instances to add, then we don't want
+-- to go to the bother of loading family instance module dependencies.
+tcExtendLocalFamInstEnv [] thing_inside = thing_inside
+
+-- Otherwise proceed...
 tcExtendLocalFamInstEnv fam_insts thing_inside
  = do { env <- getGblEnv
+      ; let this_mod = tcg_mod env
+            imports = tcg_imports env
+
+            -- Optimization: If we're only defining type family instances
+            -- for type families *defined in the home package*, then we
+            -- only have to load interface files that belong to the home
+            -- package. The reason is that there's no recursion between
+            -- packages, so modules in other packages can't possibly define
+            -- instances for our type families.
+            --
+            -- (Within the home package, we could import a module M that
+            -- imports us via an hs-boot file, and thereby defines an
+            -- instance of a type family defined in this module. So we can't
+            -- apply the same logic to avoid reading any interface files at
+            -- all, when we define an instances for type family defined in
+            -- the current module.)
+            home_fams_only = all (nameIsHomePackage this_mod . fi_fam) fam_insts
+            want_module mod
+              | mod == this_mod = False
+              | home_fams_only  = moduleUnitId mod == moduleUnitId this_mod
+              | otherwise       = True
+      ; loadModuleInterfaces (text "Loading family-instance modules")
+                             (filter want_module (imp_finsts imports))
       ; (inst_env', fam_insts') <- foldlM addLocalFamInst
                                        (tcg_fam_inst_env env, tcg_fam_insts env)
                                        fam_insts
@@ -365,31 +624,30 @@ addLocalFamInst (home_fie, my_fis) fam_inst
         -- my_fies is just the ones from this module
   = do { traceTc "addLocalFamInst" (ppr fam_inst)
 
-       ; isGHCi <- getIsGHCi
+           -- Unlike the case of class instances, don't override existing
+           -- instances in GHCi; it's unsound. See #7102.
+
        ; mod <- getModule
-       ; traceTc "alfi" (ppr mod $$ ppr isGHCi)
+       ; traceTc "alfi" (ppr mod)
 
-           -- In GHCi, we *override* any identical instances
-           -- that are also defined in the interactive context
-           -- See Note [Override identical instances in GHCi] in HscTypes
-       ; let home_fie'
-               | isGHCi    = deleteFromFamInstEnv home_fie fam_inst
-               | otherwise = home_fie
-
-           -- Load imported instances, so that we report
-           -- overlaps correctly
+           -- Fetch imported instances, so that we report
+           -- overlaps correctly.
+           -- Really we ought to only check consistency with
+           -- those instances which are transitively imported
+           -- by the current module, rather than every instance
+           -- we've ever seen. Fixing this is part of #13102.
        ; eps <- getEps
-       ; let inst_envs  = (eps_fam_inst_env eps, home_fie')
-             home_fie'' = extendFamInstEnv home_fie fam_inst
+       ; let inst_envs = (eps_fam_inst_env eps, home_fie)
+             home_fie' = extendFamInstEnv home_fie fam_inst
 
            -- Check for conflicting instance decls and injectivity violations
        ; no_conflict    <- checkForConflicts            inst_envs fam_inst
        ; injectivity_ok <- checkForInjectivityConflicts inst_envs fam_inst
 
        ; if no_conflict && injectivity_ok then
-            return (home_fie'', fam_inst : my_fis)
+            return (home_fie', fam_inst : my_fis)
          else
-            return (home_fie,   my_fis) }
+            return (home_fie,  my_fis) }
 
 {-
 ************************************************************************
@@ -496,35 +754,39 @@ unusedInjTvsInRHS tycon injList lhs rhs =
       -- set of type variables appearing in the RHS on an injective position.
       -- For all returned variables we assume their associated kind variables
       -- also appear in the RHS.
-      injRhsVars = collectInjVars rhs
+      injRhsVars = injTyVarsOfType rhs
 
-      -- Collect all type variables that are either arguments to a type
-      -- constructor or to injective type families.
-      collectInjVars :: Type -> VarSet
-      collectInjVars (TyVarTy v)
-        = unitVarSet v `unionVarSet` collectInjVars (tyVarKind v)
-      collectInjVars (TyConApp tc tys)
-        | isTypeFamilyTyCon tc = collectInjTFVars tys
-                                                 (familyTyConInjectivityInfo tc)
-        | otherwise            = mapUnionVarSet collectInjVars tys
-      collectInjVars (LitTy {})
-        = emptyVarSet
-      collectInjVars (ForAllTy (Anon arg) res)
-        = collectInjVars arg `unionVarSet` collectInjVars res
-      collectInjVars (AppTy fun arg)
-        = collectInjVars fun `unionVarSet` collectInjVars arg
-      -- no forall types in the RHS of a type family
-      collectInjVars (ForAllTy _ _)    =
-          panic "unusedInjTvsInRHS.collectInjVars"
-      collectInjVars (CastTy ty _)   = collectInjVars ty
-      collectInjVars (CoercionTy {}) = emptyVarSet
+injTyVarsOfType :: TcTauType -> TcTyVarSet
+-- Collect all type variables that are either arguments to a type
+--   constructor or to /injective/ type families.
+-- Determining the overall type determines thes variables
+--
+-- E.g.   Suppose F is injective in its second arg, but not its first
+--        then injVarOfType (Either a (F [b] (a,c))) = {a,c}
+--        Determining the overall type determines a,c but not b.
+injTyVarsOfType (TyVarTy v)
+  = unitVarSet v `unionVarSet` injTyVarsOfType (tyVarKind v)
+injTyVarsOfType (TyConApp tc tys)
+  | isTypeFamilyTyCon tc
+   = case familyTyConInjectivityInfo tc of
+        NotInjective  -> emptyVarSet
+        Injective inj -> injTyVarsOfTypes (filterByList inj tys)
+  | otherwise
+  = injTyVarsOfTypes tys
+injTyVarsOfType (LitTy {})
+  = emptyVarSet
+injTyVarsOfType (FunTy arg res)
+  = injTyVarsOfType arg `unionVarSet` injTyVarsOfType res
+injTyVarsOfType (AppTy fun arg)
+  = injTyVarsOfType fun `unionVarSet` injTyVarsOfType arg
+-- No forall types in the RHS of a type family
+injTyVarsOfType (CastTy ty _)   = injTyVarsOfType ty
+injTyVarsOfType (CoercionTy {}) = emptyVarSet
+injTyVarsOfType (ForAllTy {})    =
+    panic "unusedInjTvsInRHS.injTyVarsOfType"
 
-      collectInjTFVars :: [Type] -> Injectivity -> VarSet
-      collectInjTFVars _ NotInjective
-          = emptyVarSet
-      collectInjTFVars tys (Injective injList)
-          = mapUnionVarSet collectInjVars (filterByList injList tys)
-
+injTyVarsOfTypes :: [Type] -> VarSet
+injTyVarsOfTypes tys = mapUnionVarSet injTyVarsOfType tys
 
 -- | Is type headed by a type family application?
 isTFHeaded :: Type -> Bool
@@ -600,17 +862,14 @@ unusedInjectiveVarsErr (Pair invis_vars vis_vars) errorBuilder tyfamEqn
       has_kinds = not $ isEmptyVarSet invis_vars
 
       doc = sep [ what <+> text "variable" <>
-                  pluralVarSet tvs <+> pprVarSet (pprQuotedList . toposortTyVars) tvs
+                  pluralVarSet tvs <+> pprVarSet tvs (pprQuotedList . toposortTyVars)
                 , text "cannot be inferred from the right-hand side." ]
       what = case (has_types, has_kinds) of
                (True, True)   -> text "Type and kind"
                (True, False)  -> text "Type"
                (False, True)  -> text "Kind"
                (False, False) -> pprPanic "mkUnusedInjectiveVarsErr" $ ppr tvs
-      print_kinds_info = sdocWithDynFlags $ \ dflags ->
-                         if has_kinds && not (gopt Opt_PrintExplicitKinds dflags)
-                         then text "(enabling -fprint-explicit-kinds might help)"
-                         else empty
+      print_kinds_info = ppWhen has_kinds ppSuggestExplicitKinds
       msg = doc $$ print_kinds_info $$
             text "In the type family equation:"
 

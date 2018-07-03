@@ -22,13 +22,14 @@ module CoreUtils (
         filterAlts, combineIdenticalAlts, refineDefaultAlt,
 
         -- * Properties of expressions
-        exprType, coreAltType, coreAltsType,
+        exprType, coreAltType, coreAltsType, isExprLevPoly,
         exprIsDupable, exprIsTrivial, getIdFromTrivialExpr, exprIsBottom,
         getIdFromTrivialExpr_maybe,
-        exprIsCheap, exprIsExpandable, exprIsCheap', CheapAppFun,
+        exprIsCheap, exprIsExpandable, exprIsOk, CheapAppFun,
         exprIsHNF, exprOkForSpeculation, exprOkForSideEffects, exprIsWorkFree,
         exprIsBig, exprIsConLike,
         rhsIsStatic, isCheapApp, isExpandableApp,
+        exprIsLiteralString, exprIsTopLevelBindable,
 
         -- * Equality
         cheapEqExpr, cheapEqExpr', eqExpr,
@@ -45,12 +46,19 @@ module CoreUtils (
 
         -- * Working with ticks
         stripTicksTop, stripTicksTopE, stripTicksTopT,
-        stripTicksE, stripTicksT
+        stripTicksE, stripTicksT,
+
+        -- * StaticPtr
+        collectMakeStaticArgs,
+
+        -- * Join points
+        isJoinBind
     ) where
 
 #include "HsVersions.h"
 
 import CoreSyn
+import PrelNames ( makeStaticName )
 import PprCore
 import CoreFVs( exprFreeVars )
 import Var
@@ -63,7 +71,9 @@ import DataCon
 import PrimOp
 import Id
 import IdInfo
+import PrelNames( absentErrorIdKey )
 import Type
+import TyCoRep( TyBinder(..) )
 import Coercion
 import TyCon
 import Unique
@@ -73,6 +83,7 @@ import DynFlags
 import FastString
 import Maybes
 import ListSetOps       ( minusList )
+import BasicTypes       ( Arity )
 import Platform
 import Util
 import Pair
@@ -103,7 +114,7 @@ exprType (Let bind body)
 exprType (Case _ _ ty _)     = ty
 exprType (Cast _ co)         = pSnd (coercionKind co)
 exprType (Tick _ e)          = exprType e
-exprType (Lam binder expr)   = mkPiType binder (exprType expr)
+exprType (Lam binder expr)   = mkLamType binder (exprType expr)
 exprType e@(App _ _)
   = case collectArgs e of
         (fun, args) -> applyTypeToArgs e (exprType fun) args
@@ -124,6 +135,45 @@ coreAltsType :: [CoreAlt] -> Type
 -- ^ Returns the type of the first alternative, which should be the same as for all alternatives
 coreAltsType (alt:_) = coreAltType alt
 coreAltsType []      = panic "corAltsType"
+
+-- | Is this expression levity polymorphic? This should be the
+-- same as saying (isKindLevPoly . typeKind . exprType) but
+-- much faster.
+isExprLevPoly :: CoreExpr -> Bool
+isExprLevPoly = go
+  where
+   go (Var _)                      = False  -- no levity-polymorphic binders
+   go (Lit _)                      = False  -- no levity-polymorphic literals
+   go e@(App f _) | not (go_app f) = False
+                  | otherwise      = check_type e
+   go (Lam _ _)                    = False
+   go (Let _ e)                    = go e
+   go e@(Case {})                  = check_type e -- checking type is fast
+   go e@(Cast {})                  = check_type e
+   go (Tick _ e)                   = go e
+   go e@(Type {})                  = pprPanic "isExprLevPoly ty" (ppr e)
+   go (Coercion {})                = False  -- this case can happen in SetLevels
+
+   check_type = isTypeLevPoly . exprType  -- slow approach
+
+      -- if the function is a variable (common case), check its
+      -- levityInfo. This might mean we don't need to look up and compute
+      -- on the type. Spec of these functions: return False if there is
+      -- no possibility, ever, of this expression becoming levity polymorphic,
+      -- no matter what it's applied to; return True otherwise.
+      -- returning True is always safe. See also Note [Levity info] in
+      -- IdInfo
+   go_app (Var id)        = not (isNeverLevPolyId id)
+   go_app (Lit _)         = False
+   go_app (App f _)       = go_app f
+   go_app (Lam _ e)       = go_app e
+   go_app (Let _ e)       = go_app e
+   go_app (Case _ _ ty _) = resultIsLevPoly ty
+   go_app (Cast _ co)     = resultIsLevPoly (pSnd $ coercionKind co)
+   go_app (Tick _ e)      = go_app e
+   go_app e@(Type {})     = pprPanic "isExprLevPoly app ty" (ppr e)
+   go_app e@(Coercion {}) = pprPanic "isExprLevPoly app co" (ppr e)
+
 
 {-
 Note [Type bindings]
@@ -250,6 +300,11 @@ mkTick t orig_expr = mkTick' id id orig_expr
           -> CoreExpr
   mkTick' top rest expr = case expr of
 
+    -- Never tick primitive string literals. These should ultimately float up to
+    -- the top-level where they must be unadorned. See Note
+    -- [CoreSyn top-level string literals] for details.
+    _ | exprIsLiteralString expr          -> expr
+
     -- Cost centre ticks should never be reordered relative to each
     -- other. Therefore we can stop whenever two collide.
     Tick t2 e
@@ -353,7 +408,7 @@ stripTicksTop p = go []
         go ts other            = (reverse ts, other)
 
 -- | Strip ticks satisfying a predicate from top of an expression,
--- returning the remaining expresion
+-- returning the remaining expression
 stripTicksTopE :: (Tickish Id -> Bool) -> Expr b -> Expr b
 stripTicksTopE p = go
   where go (Tick t e) | p t = go e
@@ -587,10 +642,10 @@ filterAlts _tycon inst_tys imposs_cons alts
     impossible_alt _  _                         = False
 
 refineDefaultAlt :: [Unique] -> TyCon -> [Type]
-                 -> [AltCon]  -- Constructors tha cannot match the DEFAULT (if any)
+                 -> [AltCon]  -- Constructors that cannot match the DEFAULT (if any)
                  -> [CoreAlt]
                  -> (Bool, [CoreAlt])
--- Refine the default alterantive to a DataAlt,
+-- Refine the default alternative to a DataAlt,
 -- if there is a unique way to do so
 refineDefaultAlt us tycon tys imposs_deflt_cons all_alts
   | (DEFAULT,_,rhs) : rest_alts <- all_alts
@@ -714,7 +769,7 @@ missed the first one.)
 combineIdenticalAlts :: [AltCon]    -- Constructors that cannot match DEFAULT
                      -> [CoreAlt]
                      -> (Bool,      -- True <=> something happened
-                         [AltCon],  -- New contructors that cannot match DEFAULT
+                         [AltCon],  -- New constructors that cannot match DEFAULT
                          [CoreAlt]) -- New alternatives
 -- See Note [Combine identical alternatives]
 -- True <=> we did some combining, result is a single DEFAULT alternative
@@ -754,8 +809,8 @@ Note [exprIsTrivial]
                 applications.  Note that primop Ids aren't considered
                 trivial unless
 
-Note [Variable are trivial]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Note [Variables are trivial]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 There used to be a gruesome test for (hasNoBinding v) in the
 Var case:
         exprIsTrivial (Var v) | hasNoBinding v = idArity v == 0
@@ -799,10 +854,10 @@ exprIsTrivial (Type _)         = True
 exprIsTrivial (Coercion _)     = True
 exprIsTrivial (Lit lit)        = litIsTrivial lit
 exprIsTrivial (App e arg)      = not (isRuntimeArg arg) && exprIsTrivial e
+exprIsTrivial (Lam b e)        = not (isRuntimeVar b) && exprIsTrivial e
 exprIsTrivial (Tick t e)       = not (tickishIsCode t) && exprIsTrivial e
                                  -- See Note [Tick trivial]
 exprIsTrivial (Cast e _)       = exprIsTrivial e
-exprIsTrivial (Lam b body)     = not (isRuntimeVar b) && exprIsTrivial body
 exprIsTrivial (Case e _ _ [])  = exprIsTrivial e  -- See Note [Empty case is trivial]
 exprIsTrivial _                = False
 
@@ -971,29 +1026,7 @@ heap-allocates noFactor's argument.  At the moment (May 12) we are just
 going to put up with this, because the previous more aggressive inlining
 (which treated 'noFactor' as work-free) was duplicating primops, which
 in turn was making inner loops of array calculations runs slow (#5623)
--}
 
-exprIsWorkFree :: CoreExpr -> Bool
--- See Note [exprIsWorkFree]
-exprIsWorkFree e = go 0 e
-  where    -- n is the number of value arguments
-    go _ (Lit {})                     = True
-    go _ (Type {})                    = True
-    go _ (Coercion {})                = True
-    go n (Cast e _)                   = go n e
-    go n (Case scrut _ _ alts)        = foldl (&&) (exprIsWorkFree scrut)
-                                              [ go n rhs | (_,_,rhs) <- alts ]
-         -- See Note [Case expressions are work-free]
-    go _ (Let {})                     = False
-    go n (Var v)                      = isCheapApp v n
-    go n (Tick t e) | tickishCounts t = False
-                    | otherwise       = go n e
-    go n (Lam x e)  | isRuntimeVar x = n==0 || go (n-1) e
-                    | otherwise      = go n e
-    go n (App f e)  | isRuntimeArg e = exprIsWorkFree e && go (n+1) f
-                    | otherwise      = go n f
-
-{-
 Note [Case expressions are work-free]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Are case-expressions work-free?  Consider
@@ -1005,6 +1038,8 @@ that increased allocation slightly.  It's a fairly small effect, and at
 the moment we go for the slightly more aggressive version which treats
 (case x of ....) as work-free if the alternatives are.
 
+Moreover it improves arities of overloaded functions where
+there is only dictionary selection (no construction) involved
 
 Note [exprIsCheap]   See also Note [Interaction of exprIsCheap and lone variables]
 ~~~~~~~~~~~~~~~~~~   in CoreUnfold.hs
@@ -1042,137 +1077,166 @@ Note that exprIsHNF does not imply exprIsCheap.  Eg
         let x = fac 20 in Just x
 This responds True to exprIsHNF (you can discard a seq), but
 False to exprIsCheap.
+
+Note [exprIsExpandable]
+~~~~~~~~~~~~~~~~~~~~~~~
+An expression is "expandable" if we are willing to dupicate it, if doing
+so might make a RULE or case-of-constructor fire.  Mainly this means
+data-constructor applications, but it's a bit more generous than exprIsCheap
+because it is true of "CONLIKE" Ids: see Note [CONLIKE pragma] in BasicTypes.
+
+It is used to set the uf_expandable field of an Unfolding, and that
+in turn is used
+  * In RULE matching
+  * In exprIsConApp_maybe, exprIsLiteral_maybe, exprIsLambda_maybe
+
+But take care: exprIsExpandable should /not/ be true of primops.  I
+found this in test T5623a:
+    let q = /\a. Ptr a (a +# b)
+    in case q @ Float of Ptr v -> ...q...
+
+q's inlining should not be expandable, else exprIsConApp_maybe will
+say that (q @ Float) expands to (Ptr a (a +# b)), and that will
+duplicate the (a +# b) primop, which we should not do lightly.
+(It's quite hard to trigger this bug, but T13155 does so for GHC 8.0.)
+
+
+Note [Arguments in exprIsOk]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+What predicate should we apply to the argument of an application?  We
+used to say "exprIsTrivial arg" due to concerns about duplicating
+nested constructor applications, but see #4978.  The principle here is
+that
+   let x = a +# b in c *# x
+should behave equivalently to
+   c *# (a +# b)
+Since lets with cheap RHSs are accepted, so should paps with cheap arguments
 -}
 
+--------------------
 exprIsCheap :: CoreExpr -> Bool
-exprIsCheap = exprIsCheap' isCheapApp
+exprIsCheap = exprIsOk isCheapApp
 
-exprIsExpandable :: CoreExpr -> Bool
-exprIsExpandable = exprIsCheap' isExpandableApp -- See Note [CONLIKE pragma] in BasicTypes
+exprIsExpandable :: CoreExpr -> Bool -- See Note [exprIsExpandable]
+exprIsExpandable = exprIsOk isExpandableApp
 
-exprIsCheap' :: CheapAppFun -> CoreExpr -> Bool
-exprIsCheap' _        (Lit _)      = True
-exprIsCheap' _        (Type _)    = True
-exprIsCheap' _        (Coercion _) = True
-exprIsCheap' _        (Var _)      = True
-exprIsCheap' good_app (Cast e _)   = exprIsCheap' good_app e
-exprIsCheap' good_app (Lam x e)    = isRuntimeVar x
-                                  || exprIsCheap' good_app e
+exprIsWorkFree :: CoreExpr -> Bool   -- See Note [exprIsWorkFree]
+exprIsWorkFree = exprIsOk isWorkFreeApp
 
-exprIsCheap' good_app (Case e _ _ alts) = exprIsCheap' good_app e &&
-                                          and [exprIsCheap' good_app rhs | (_,_,rhs) <- alts]
-        -- Experimentally, treat (case x of ...) as cheap
-        -- (and case __coerce x etc.)
-        -- This improves arities of overloaded functions where
-        -- there is only dictionary selection (no construction) involved
-
-exprIsCheap' good_app (Tick t e)
-  | tickishCounts t = False
-  | otherwise       = exprIsCheap' good_app e
-     -- never duplicate counting ticks.  If we get this wrong, then
-     -- HPC's entry counts will be off (check test in
-     -- libraries/hpc/tests/raytrace)
-
-exprIsCheap' good_app (Let (NonRec _ b) e)
-  = exprIsCheap' good_app b && exprIsCheap' good_app e
-exprIsCheap' good_app (Let (Rec prs) e)
-  = all (exprIsCheap' good_app . snd) prs && exprIsCheap' good_app e
-
-exprIsCheap' good_app other_expr        -- Applications and variables
-  = go other_expr []
+--------------------
+exprIsOk :: CheapAppFun -> CoreExpr -> Bool
+exprIsOk ok_app e
+  = ok e
   where
-        -- Accumulate value arguments, then decide
-    go (Cast e _) val_args                 = go e val_args
-    go (App f a) val_args | isRuntimeArg a = go f (a:val_args)
-                          | otherwise      = go f val_args
+    ok e = go 0 e
 
-    go (Var _) [] = True
-         -- Just a type application of a variable
-         -- (f t1 t2 t3) counts as WHNF
-         -- This case is probably handeld by the good_app case
-         -- below, which should have a case for n=0, but putting
-         -- it here too is belt and braces; and it's such a common
-         -- case that checking for null directly seems like a
-         -- good plan
+    -- n is the number of value arguments
+    go n (Var v)                      = ok_app v n
+    go _ (Lit {})                     = True
+    go _ (Type {})                    = True
+    go _ (Coercion {})                = True
+    go n (Cast e _)                   = go n e
+    go n (Case scrut _ _ alts)        = foldl (&&) (ok scrut)
+                                        [ go n rhs | (_,_,rhs) <- alts ]
+    go n (Tick t e) | tickishCounts t = False
+                    | otherwise       = go n e
+    go n (Lam x e)  | isRuntimeVar x  = n==0 || go (n-1) e
+                    | otherwise       = go n e
+    go n (App f e)  | isRuntimeArg e  = go (n+1) f && ok e
+                    | otherwise       = go n f
+    go _ (Let {})                     = False
 
-    go (Var f) args
-       | good_app f (length args)  -- Typically holds of data constructor applications
-       = go_pap args               -- E.g. good_app = isCheapApp below
+      -- Case: see Note [Case expressions are work-free]
+      -- App:  see Note [Arguments in exprIsOk]
+      -- Let:  the old exprIsCheap worked through lets
 
-       | otherwise
-        = case idDetails f of
-                RecSelId {}         -> go_sel args
-                ClassOpId {}        -> go_sel args
-                PrimOpId op         -> go_primop op args
-                _ | isBottomingId f -> True
-                  | otherwise       -> False
-                        -- Application of a function which
-                        -- always gives bottom; we treat this as cheap
-                        -- because it certainly doesn't need to be shared!
 
-    go (Tick t e) args
-      | not (tickishCounts t) -- don't duplicate counting ticks, see above
-      = go e args
+-------------------------------------
+type CheapAppFun = Id -> Arity -> Bool
+  -- Is an application of this function to n *value* args
+  -- always cheap, assuming the arguments are cheap?
+  -- True mainly of data constructors, partial applications;
+  -- but with minor variations:
+  --    isWorkFreeApp
+  --    isCheapApp
+  --    isExpandableApp
 
-    go _ _ = False
+  -- NB: isCheapApp and isExpandableApp are called from outside
+  --     this module, so don't be tempted to move the notRedex
+  --     stuff into the call site in exprIsOk, and remove it
+  --     from the CheapAppFun implementations
 
-    --------------
-    go_pap args = all (exprIsCheap' good_app) args
-        -- Used to be "all exprIsTrivial args" due to concerns about
-        -- duplicating nested constructor applications, but see #4978.
-        -- The principle here is that
-        --    let x = a +# b in c *# x
-        -- should behave equivalently to
-        --    c *# (a +# b)
-        -- Since lets with cheap RHSs are accepted,
-        -- so should paps with cheap arguments
 
-    --------------
-    go_primop op args = primOpIsCheap op && all (exprIsCheap' good_app) args
+notRedex :: CheapAppFun
+notRedex fn n_val_args
+  =  n_val_args == 0           -- No value args
+  || n_val_args < idArity fn   -- Partial application
+  || isBottomingId fn   -- OK to duplicate calls to bottom;
+                        -- it certainly doesn't need to be shared!
+
+isWorkFreeApp :: CheapAppFun
+isWorkFreeApp fn n_val_args
+  | notRedex fn n_val_args
+  = True
+  | otherwise
+  = case idDetails fn of
+      DataConWorkId {} -> True
+      _                -> False
+
+isCheapApp :: CheapAppFun
+isCheapApp fn n_val_args
+  | notRedex fn n_val_args
+  = True
+  | otherwise
+  = case idDetails fn of
+      DataConWorkId {} -> True
+      RecSelId {}      -> n_val_args == 1  -- See Note [Record selection]
+      ClassOpId {}     -> n_val_args == 1
+      PrimOpId op      -> primOpIsCheap op
+      _                -> False
         -- In principle we should worry about primops
         -- that return a type variable, since the result
         -- might be applied to something, but I'm not going
         -- to bother to check the number of args
 
-    --------------
-    go_sel [arg] = exprIsCheap' good_app arg    -- I'm experimenting with making record selection
-    go_sel _     = False                -- look cheap, so we will substitute it inside a
-                                        -- lambda.  Particularly for dictionary field selection.
-                -- BUT: Take care with (sel d x)!  The (sel d) might be cheap, but
-                --      there's no guarantee that (sel d x) will be too.  Hence (n_val_args == 1)
-
--------------------------------------
-type CheapAppFun = Id -> Int -> Bool
-  -- Is an application of this function to n *value* args
-  -- always cheap, assuming the arguments are cheap?
-  -- Mainly true of partial applications, data constructors,
-  -- and of course true if the number of args is zero
-
-isCheapApp :: CheapAppFun
-isCheapApp fn n_val_args
-  =  isDataConWorkId fn
-  || n_val_args == 0
-  || n_val_args < idArity fn
-
 isExpandableApp :: CheapAppFun
 isExpandableApp fn n_val_args
-  =  isConLikeId fn
-  || n_val_args < idArity fn
-  || go n_val_args (idType fn)
+  | notRedex fn n_val_args
+  = True
+  | isConLikeId fn
+  = True
+  | otherwise
+  = case idDetails fn of
+      DataConWorkId {} -> True
+      RecSelId {}      -> n_val_args == 1  -- See Note [Record selection]
+      ClassOpId {}     -> n_val_args == 1
+      PrimOpId {}      -> False
+      _                -> all_pred_args n_val_args (idType fn)
+
   where
   -- See if all the arguments are PredTys (implicit params or classes)
   -- If so we'll regard it as expandable; see Note [Expandable overloadings]
-  -- This incidentally picks up the (n_val_args = 0) case
-     go 0 _ = True
-     go n_val_args ty
+     all_pred_args n_val_args ty
+       | n_val_args == 0
+       = True
+
        | Just (bndr, ty) <- splitPiTy_maybe ty
        = caseBinder bndr
-           (\_tv -> go n_val_args ty)
-           (\bndr_ty -> isPredTy bndr_ty && go (n_val_args-1) ty)
+           (\_tv -> all_pred_args n_val_args ty)
+           (\bndr_ty -> isPredTy bndr_ty && all_pred_args (n_val_args-1) ty)
+
        | otherwise
        = False
 
-{-
+{- Note [Record selection]
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+I'm experimenting with making record selection
+look cheap, so we will substitute it inside a
+lambda.  Particularly for dictionary field selection.
+
+BUT: Take care with (sel d x)!  The (sel d) might be cheap, but
+there's no guarantee that (sel d x) will be too.  Hence (n_val_args == 1)
+
 Note [Expandable overloadings]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Suppose the user wrote this
@@ -1237,18 +1301,23 @@ it's applied only to dictionaries.
 --
 -- We can only do this if the @y + 1@ is ok for speculation: it has no
 -- side effects, and can't diverge or raise an exception.
-exprOkForSpeculation, exprOkForSideEffects :: Expr b -> Bool
+exprOkForSpeculation, exprOkForSideEffects :: CoreExpr -> Bool
 exprOkForSpeculation = expr_ok primOpOkForSpeculation
 exprOkForSideEffects = expr_ok primOpOkForSideEffects
   -- Polymorphic in binder type
   -- There is one call at a non-Id binder type, in SetLevels
 
-expr_ok :: (PrimOp -> Bool) -> Expr b -> Bool
+expr_ok :: (PrimOp -> Bool) -> CoreExpr -> Bool
 expr_ok _ (Lit _)      = True
 expr_ok _ (Type _)     = True
 expr_ok _ (Coercion _) = True
-expr_ok primop_ok (Var v)      = app_ok primop_ok v []
-expr_ok primop_ok (Cast e _)   = expr_ok primop_ok e
+
+expr_ok primop_ok (Var v)    = app_ok primop_ok v []
+expr_ok primop_ok (Cast e _) = expr_ok primop_ok e
+expr_ok primop_ok (Lam b e)
+                 | isTyVar b = expr_ok primop_ok  e
+                 | otherwise = True
+
 
 -- Tick annotations that *tick* cannot be speculated, because these
 -- are meant to identify whether or not (and how often) the particular
@@ -1269,7 +1338,7 @@ expr_ok primop_ok other_expr
         _            -> False
 
 -----------------------------
-app_ok :: (PrimOp -> Bool) -> Id -> [Expr b] -> Bool
+app_ok :: (PrimOp -> Bool) -> Id -> [CoreExpr] -> Bool
 app_ok primop_ok fun args
   = case idDetails fun of
       DFunId new_type ->  not new_type
@@ -1282,18 +1351,19 @@ app_ok primop_ok fun args
                 -- to take the arguments into account
 
       PrimOpId op
-        | isDivOp op              -- Special case for dividing operations that fail
-        , [arg1, Lit lit] <- args -- only if the divisor is zero
+        | isDivOp op
+        , [arg1, Lit lit] <- args
         -> not (isZeroLit lit) && expr_ok primop_ok arg1
-                  -- Often there is a literal divisor, and this
-                  -- can get rid of a thunk in an inner looop
-
-        | DataToTagOp <- op      -- See Note [dataToTag speculation]
-        -> True
+              -- Special case for dividing operations that fail
+              -- In general they are NOT ok-for-speculation
+              -- (which primop_ok will catch), but they ARE OK
+              -- if the divisor is definitely non-zero.
+              -- Often there is a literal divisor, and this
+              -- can get rid of a thunk in an inner loop
 
         | otherwise
-        -> primop_ok op                   -- A bit conservative: we don't really need
-        && all (expr_ok primop_ok) args   -- to care about lazy arguments, but this is easy
+        -> primop_ok op     -- Check the primop itself
+        && and (zipWith arg_ok arg_tys args)  -- Check the arguments
 
       _other -> isUnliftedType (idType fun)          -- c.f. the Var case of exprIsHNF
              || idArity fun > n_val_args             -- Partial apps
@@ -1301,6 +1371,14 @@ app_ok primop_ok fun args
                  isEvaldUnfolding (idUnfolding fun)) -- Let-bound values
              where
                n_val_args = valArgCount args
+  where
+    (arg_tys, _) = splitPiTys (idType fun)
+
+    arg_ok :: TyBinder -> CoreExpr -> Bool
+    arg_ok (Named _) _ = True   -- A type argument
+    arg_ok (Anon ty) arg        -- A term argument
+       | isUnliftedType ty = expr_ok primop_ok arg
+       | otherwise         = True  -- See Note [Primops with lifted arguments]
 
 -----------------------------
 altsAreExhaustive :: [Alt b] -> Bool
@@ -1382,26 +1460,33 @@ One could try to be clever, but the easy fix is simpy to regard
 a non-exhaustive case as *not* okForSpeculation.
 
 
-Note [dataToTag speculation]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Is this OK?
-   f x = let v::Int# = dataToTag# x
-         in ...
-We say "yes", even though 'x' may not be evaluated.  Reasons
+Note [Primops with lifted arguments]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Is this ok-for-speculation (see Trac #13027)?
+   reallyUnsafePtrEq# a b
+Well, yes.  The primop accepts lifted arguments and does not
+evaluate them.  Indeed, in general primops are, well, primitive
+and do not perform evaluation.
 
-  * dataToTag#'s strictness means that its argument often will be
-    evaluated, but FloatOut makes that temporarily untrue
-         case x of y -> let v = dataToTag# y in ...
-    -->
-         case x of y -> let v = dataToTag# x in ...
-    Note that we look at 'x' instead of 'y' (this is to improve
-    floating in FloatOut).  So Lint complains.
+There is one primop, dataToTag#, which does /require/ a lifted
+argument to be evaluted.  To ensure this, CorePrep adds an
+eval if it can't see the the argument is definitely evaluated
+(see [dataToTag magic] in CorePrep).
 
-    Moreover, it really *might* improve floating to let the
-    v-binding float out
+We make no attempt to guarantee that dataToTag#'s argument is
+evaluated here.  Main reason: it's very fragile to test for the
+evaluatedness of a lifted argument.  Consider
+    case x of y -> let v = dataToTag# y in ...
 
-  * CorePrep makes sure dataToTag#'s argument is evaluated, just
-    before code gen.  Until then, it's not guaranteed
+where x/y have type Int, say.  'y' looks evaluated (by the enclosing
+case) so all is well.  Now the FloatOut pass does a binder-swap (for
+very good reasons), changing to
+   case x of y -> let v = dataToTag# x in ...
+
+See also Note [dataToTag#] in primops.txt.pp.
+
+Bottom line:
+  * in exprOkForSpeculation we simply ignore all lifted arguments.
 
 
 ************************************************************************
@@ -1486,15 +1571,20 @@ exprIsHNFlike is_con is_con_unf = is_hnf_like
     -- There is at least one value argument
     -- 'n' is number of value args to which the expression is applied
     app_is_value :: CoreExpr -> Int -> Bool
-    app_is_value (Var fun) n_val_args
-      = idArity fun > n_val_args    -- Under-applied function
-        || is_con fun               --  or constructor-like
+    app_is_value (Var f)    nva = id_app_is_value f nva
     app_is_value (Tick _ f) nva = app_is_value f nva
     app_is_value (Cast f _) nva = app_is_value f nva
     app_is_value (App f a)  nva
       | isValArg a              = app_is_value f (nva + 1)
       | otherwise               = app_is_value f nva
     app_is_value _ _ = False
+
+    id_app_is_value id n_val_args
+       = is_con id
+       || idArity id > n_val_args
+       || id `hasKey` absentErrorIdKey  -- See Note [aBSENT_ERROR_ID] in MkCore
+                      -- absentError behaves like an honorary data constructor
+
 
 {-
 Note [exprIsHNF Tick]
@@ -1510,6 +1600,18 @@ regarded as HNF if the expression they surround is HNF, because the
 tick is there to tell us that the expression was evaluated, so we
 don't want to discard a seq on it.
 -}
+
+-- | Can we bind this 'CoreExpr' at the top level?
+exprIsTopLevelBindable :: CoreExpr -> Type -> Bool
+-- See Note [CoreSyn top-level string literals]
+-- Precondition: exprType expr = ty
+exprIsTopLevelBindable expr ty
+  = exprIsLiteralString expr
+  || not (isUnliftedType ty)
+
+exprIsLiteralString :: CoreExpr -> Bool
+exprIsLiteralString (Lit (MachStr _)) = True
+exprIsLiteralString _ = False
 
 {-
 ************************************************************************
@@ -1532,7 +1634,7 @@ dataConInstPat :: [FastString]          -- A long enough list of FSs to use for 
                -> DataCon
                -> [Type]                -- Types to instantiate the universally quantified tyvars
                -> ([TyVar], [Id])       -- Return instantiated variables
--- dataConInstPat arg_fun fss us con inst_tys returns a triple
+-- dataConInstPat arg_fun fss us con inst_tys returns a tuple
 -- (ex_tvs, arg_ids),
 --
 --   ex_tvs are intended to be used as binders for existential type args
@@ -1576,13 +1678,13 @@ dataConInstPat fss uniqs con inst_tys
       -- Make the instantiating substitution for universals
     univ_subst = zipTvSubst univ_tvs inst_tys
 
-      -- Make existential type variables, applyingn and extending the substitution
+      -- Make existential type variables, applying and extending the substitution
     (full_subst, ex_bndrs) = mapAccumL mk_ex_var univ_subst
                                        (zip3 ex_tvs ex_fss ex_uniqs)
 
     mk_ex_var :: TCvSubst -> (TyVar, FastString, Unique) -> (TCvSubst, TyVar)
-    mk_ex_var subst (tv, fs, uniq) = (Type.extendTvSubst subst tv
-                                       (mkTyVarTy new_tv)
+    mk_ex_var subst (tv, fs, uniq) = (Type.extendTvSubstWithClone subst tv
+                                       new_tv
                                      , new_tv)
       where
         new_tv = mkTyVar (mkSysTvName uniq fs) kind
@@ -1591,12 +1693,10 @@ dataConInstPat fss uniqs con inst_tys
       -- Make value vars, instantiating types
     arg_ids = zipWith4 mk_id_var id_uniqs id_fss arg_tys arg_strs
     mk_id_var uniq fs ty str
-      = mkLocalIdOrCoVarWithInfo name (Type.substTyUnchecked full_subst ty) info
+      = setCaseBndrEvald str $  -- See Note [Mark evaluated arguments]
+        mkLocalIdOrCoVar name (Type.substTy full_subst ty)
       where
         name = mkInternalName uniq (mkVarOccFS fs) noSrcSpan
-        info | isMarkedStrict str = vanillaIdInfo `setUnfoldingInfo` evaldUnfolding
-             | otherwise          = vanillaIdInfo
-             -- See Note [Mark evaluated arguments]
 
 {-
 Note [Mark evaluated arguments]
@@ -1760,7 +1860,7 @@ diffExpr _  _ e1 e2
 -- all possible mappings, which would be seriously expensive. So
 -- instead we simply match single bindings as far as we can. This
 -- leaves us just with mutually recursive and/or mismatching bindings,
--- which we then specuatively match by ordering them. It's by no means
+-- which we then speculatively match by ordering them. It's by no means
 -- perfect, but gets the job done well enough.
 diffBinds :: Bool -> RnEnv2 -> [(Var, CoreExpr)] -> [(Var, CoreExpr)]
           -> ([SDoc], RnEnv2)
@@ -1820,6 +1920,7 @@ diffIdInfo env bndr1 bndr2
     && occInfo info1 == occInfo info2
     && demandInfo info1 == demandInfo info2
     && callArityInfo info1 == callArityInfo info2
+    && levityInfo info1 == levityInfo info2
   = locBind "in unfolding of" bndr1 bndr2 $
     diffUnfold env (unfoldingInfo info1) (unfoldingInfo info2)
   | otherwise
@@ -1832,6 +1933,7 @@ diffIdInfo env bndr1 bndr2
 -- redundant, and can lead to an exponential blow-up in complexity.
 diffUnfold :: RnEnv2 -> Unfolding -> Unfolding -> [SDoc]
 diffUnfold _   NoUnfolding    NoUnfolding                 = []
+diffUnfold _   BootUnfolding  BootUnfolding               = []
 diffUnfold _   (OtherCon cs1) (OtherCon cs2) | cs1 == cs2 = []
 diffUnfold env (DFunUnfolding bs1 c1 a1)
                (DFunUnfolding bs2 c2 a2)
@@ -2032,7 +2134,7 @@ tryEtaReduce bndrs body
 {-
 Note [Eta reduction of an eval'd function]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-In Haskell is is not true that    f = \x. f x
+In Haskell it is not true that    f = \x. f x
 because f might be bottom, and 'seq' can distinguish them.
 
 But it *is* true that   f = f `seq` \x. f x
@@ -2086,7 +2188,7 @@ rhsIsStatic :: Platform
 --
 -- (ii) We treat partial applications as redexes, because in fact we
 --      make a thunk for them that runs and builds a PAP
---      at run-time.  The only appliations that are treated as
+--      at run-time.  The only applications that are treated as
 --      static are *saturated* applications of constructors.
 
 -- We used to try to be clever with nested structures like this:
@@ -2118,7 +2220,7 @@ rhsIsStatic :: Platform
 -- This is a bit like CoreUtils.exprIsHNF, with the following differences:
 --    a) scc "foo" (\x -> ...) is updatable (so we catch the right SCC)
 --
---    b) (C x xs), where C is a contructor is updatable if the application is
+--    b) (C x xs), where C is a constructor is updatable if the application is
 --         dynamic
 --
 --    c) don't look through unfolding of f in (f x).
@@ -2203,3 +2305,36 @@ isEmptyTy ty
     = True
     | otherwise
     = False
+
+{-
+*****************************************************
+*
+* StaticPtr
+*
+*****************************************************
+-}
+
+-- | @collectMakeStaticArgs (makeStatic t srcLoc e)@ yields
+-- @Just (makeStatic, t, srcLoc, e)@.
+--
+-- Returns @Nothing@ for every other expression.
+collectMakeStaticArgs
+  :: CoreExpr -> Maybe (CoreExpr, Type, CoreExpr, CoreExpr)
+collectMakeStaticArgs e
+    | (fun@(Var b), [Type t, loc, arg], _) <- collectArgsTicks (const True) e
+    , idName b == makeStaticName = Just (fun, t, loc, arg)
+collectMakeStaticArgs _          = Nothing
+
+{-
+************************************************************************
+*                                                                      *
+\subsection{Join points}
+*                                                                      *
+************************************************************************
+-}
+
+-- | Does this binding bind a join point (or a recursive group of join points)?
+isJoinBind :: CoreBind -> Bool
+isJoinBind (NonRec b _)       = isJoinId b
+isJoinBind (Rec ((b, _) : _)) = isJoinId b
+isJoinBind _                  = False

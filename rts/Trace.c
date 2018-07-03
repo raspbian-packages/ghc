@@ -18,31 +18,13 @@
 #include "GetEnv.h"
 #include "Stats.h"
 #include "eventlog/EventLog.h"
+#include "rts/EventLogWriter.h"
 #include "Threads.h"
 #include "Printer.h"
+#include "RtsFlags.h"
 
 #ifdef HAVE_UNISTD_H
 #include <unistd.h>
-#endif
-
-#ifdef DEBUG
-// debugging flags, set with +RTS -D<something>
-int DEBUG_sched;
-int DEBUG_interp;
-int DEBUG_weak;
-int DEBUG_gccafs;
-int DEBUG_gc;
-int DEBUG_block_alloc;
-int DEBUG_sanity;
-int DEBUG_stable;
-int DEBUG_stm;
-int DEBUG_prof;
-int DEBUG_gran;
-int DEBUG_par;
-int DEBUG_linker;
-int DEBUG_squeeze;
-int DEBUG_hpc;
-int DEBUG_sparks;
 #endif
 
 // events
@@ -51,42 +33,29 @@ int TRACE_gc;
 int TRACE_spark_sampled;
 int TRACE_spark_full;
 int TRACE_user;
+int TRACE_cap;
 
 #ifdef THREADED_RTS
 static Mutex trace_utx;
 #endif
 
-static rtsBool eventlog_enabled;
+static bool eventlog_enabled;
 
 /* ---------------------------------------------------------------------------
-   Starting up / shuttting down the tracing facilities
+   Starting up / shutting down the tracing facilities
  --------------------------------------------------------------------------- */
+
+static const EventLogWriter *getEventLogWriter(void)
+{
+    return rtsConfig.eventlog_writer;
+}
 
 void initTracing (void)
 {
+    const EventLogWriter *eventlog_writer = getEventLogWriter();
+
 #ifdef THREADED_RTS
     initMutex(&trace_utx);
-#endif
-
-#ifdef DEBUG
-#define DEBUG_FLAG(name, class) \
-    class = RtsFlags.DebugFlags.name ? 1 : 0;
-
-    DEBUG_FLAG(scheduler,    DEBUG_sched);
-
-    DEBUG_FLAG(interpreter,  DEBUG_interp);
-    DEBUG_FLAG(weak,         DEBUG_weak);
-    DEBUG_FLAG(gccafs,       DEBUG_gccafs);
-    DEBUG_FLAG(gc,           DEBUG_gc);
-    DEBUG_FLAG(block_alloc,  DEBUG_block_alloc);
-    DEBUG_FLAG(sanity,       DEBUG_sanity);
-    DEBUG_FLAG(stable,       DEBUG_stable);
-    DEBUG_FLAG(stm,          DEBUG_stm);
-    DEBUG_FLAG(prof,         DEBUG_prof);
-    DEBUG_FLAG(linker,       DEBUG_linker);
-    DEBUG_FLAG(squeeze,      DEBUG_squeeze);
-    DEBUG_FLAG(hpc,          DEBUG_hpc);
-    DEBUG_FLAG(sparks,       DEBUG_sparks);
 #endif
 
     // -Ds turns on scheduler tracing too
@@ -114,14 +83,23 @@ void initTracing (void)
     TRACE_user =
         RtsFlags.TraceFlags.user;
 
-    eventlog_enabled = RtsFlags.TraceFlags.tracing == TRACE_EVENTLOG;
+    // We trace cap events if we're tracing anything else
+    TRACE_cap =
+        TRACE_sched ||
+        TRACE_gc ||
+        TRACE_spark_sampled ||
+        TRACE_spark_full ||
+        TRACE_user;
+
+    eventlog_enabled = RtsFlags.TraceFlags.tracing == TRACE_EVENTLOG &&
+                        eventlog_writer != NULL;
 
     /* Note: we can have any of the TRACE_* flags turned on even when
        eventlog_enabled is off. In the DEBUG way we may be tracing to stderr.
      */
 
     if (eventlog_enabled) {
-        initEventLogging();
+        initEventLogging(eventlog_writer);
     }
 }
 
@@ -141,13 +119,18 @@ void freeTracing (void)
 
 void resetTracing (void)
 {
+    const EventLogWriter *eventlog_writer;
+    eventlog_writer = getEventLogWriter();
+
     if (eventlog_enabled) {
         abortEventLogging(); // abort eventlog inherited from parent
-        initEventLogging(); // child starts its own eventlog
+        if (eventlog_writer != NULL) {
+            initEventLogging(eventlog_writer); // child starts its own eventlog
+        }
     }
 }
 
-void tracingAddCapapilities (nat from, nat to)
+void tracingAddCapapilities (uint32_t from, uint32_t to)
 {
     if (eventlog_enabled) {
         moreCapEventBufs(from,to);
@@ -338,7 +321,7 @@ void traceHeapEvent_ (Capability   *cap,
 }
 
 void traceEventHeapInfo_ (CapsetID    heap_capset,
-                          nat         gens,
+                          uint32_t  gens,
                           W_        maxHeapSize,
                           W_        allocAreaSize,
                           W_        mblockSize,
@@ -358,11 +341,11 @@ void traceEventHeapInfo_ (CapsetID    heap_capset,
 
 void traceEventGcStats_  (Capability *cap,
                           CapsetID    heap_capset,
-                          nat         gen,
+                          uint32_t  gen,
                           W_        copied,
                           W_        slop,
                           W_        fragmentation,
-                          nat         par_n_threads,
+                          uint32_t  par_n_threads,
                           W_        par_max_copied,
                           W_        par_tot_copied)
 {
@@ -378,8 +361,8 @@ void traceEventGcStats_  (Capability *cap,
     }
 }
 
-void traceCapEvent (Capability   *cap,
-                    EventTypeNum  tag)
+void traceCapEvent_ (Capability   *cap,
+                     EventTypeNum  tag)
 {
 #ifdef DEBUG
     if (RtsFlags.TraceFlags.tracing == TRACE_STDERR) {
@@ -410,9 +393,9 @@ void traceCapEvent (Capability   *cap,
     }
 }
 
-void traceCapsetEvent (EventTypeNum tag,
-                       CapsetID     capset,
-                       StgWord      info)
+void traceCapsetEvent_ (EventTypeNum tag,
+                        CapsetID     capset,
+                        StgWord      info)
 {
 #ifdef DEBUG
     if (RtsFlags.TraceFlags.tracing == TRACE_STDERR && TRACE_sched)
@@ -424,18 +407,19 @@ void traceCapsetEvent (EventTypeNum tag,
         tracePreface();
         switch (tag) {
         case EVENT_CAPSET_CREATE:   // (capset, capset_type)
-            debugBelch("created capset %" FMT_Word " of type %d\n", (W_)capset, (int)info);
+            debugBelch("created capset %" FMT_Word32 " of type %d\n", capset,
+                       (int)info);
             break;
         case EVENT_CAPSET_DELETE:   // (capset)
-            debugBelch("deleted capset %" FMT_Word "\n", (W_)capset);
+            debugBelch("deleted capset %" FMT_Word32 "\n", capset);
             break;
         case EVENT_CAPSET_ASSIGN_CAP:  // (capset, capno)
-            debugBelch("assigned cap %" FMT_Word " to capset %" FMT_Word "\n",
-                       (W_)info, (W_)capset);
+            debugBelch("assigned cap %" FMT_Word " to capset %" FMT_Word32 "\n",
+                       info, capset);
             break;
         case EVENT_CAPSET_REMOVE_CAP:  // (capset, capno)
-            debugBelch("removed cap %" FMT_Word " from capset %" FMT_Word "\n",
-                       (W_)info, (W_)capset);
+            debugBelch("removed cap %" FMT_Word " from capset %" FMT_Word32
+                       "\n", info, capset);
             break;
         }
         RELEASE_LOCK(&trace_utx);
@@ -620,6 +604,49 @@ void traceTaskDelete_ (Task *task)
         postTaskDeleteEvent(taskid);
     }
 }
+
+void traceHeapProfBegin(StgWord8 profile_id)
+{
+    if (eventlog_enabled) {
+        postHeapProfBegin(profile_id);
+    }
+}
+
+void traceHeapProfSampleBegin(StgInt era)
+{
+    if (eventlog_enabled) {
+        postHeapProfSampleBegin(era);
+    }
+}
+
+void traceHeapProfSampleString(StgWord8 profile_id,
+                               const char *label, StgWord residency)
+{
+    if (eventlog_enabled) {
+        postHeapProfSampleString(profile_id, label, residency);
+    }
+}
+
+#ifdef PROFILING
+void traceHeapProfCostCentre(StgWord32 ccID,
+                             const char *label,
+                             const char *module,
+                             const char *srcloc,
+                             StgBool is_caf)
+{
+    if (eventlog_enabled) {
+        postHeapProfCostCentre(ccID, label, module, srcloc, is_caf);
+    }
+}
+
+void traceHeapProfSampleCostCentre(StgWord8 profile_id,
+                                   CostCentreStack *stack, StgWord residency)
+{
+    if (eventlog_enabled) {
+        postHeapProfSampleCostCentre(profile_id, stack, residency);
+    }
+}
+#endif
 
 #ifdef DEBUG
 static void vtraceCap_stderr(Capability *cap, char *msg, va_list ap)

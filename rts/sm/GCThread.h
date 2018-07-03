@@ -6,7 +6,7 @@
  *
  * Documentation on the architecture of the Garbage Collector can be
  * found in the online commentary:
- * 
+ *
  *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/Rts/Storage/GC
  *
  * ---------------------------------------------------------------------------*/
@@ -21,7 +21,7 @@
 
 /* -----------------------------------------------------------------------------
    General scheme
-   
+
    ToDo: move this to the wiki when the implementation is done.
 
    We're only going to try to parallelise the copying GC for now.  The
@@ -67,13 +67,13 @@
 
 /* -----------------------------------------------------------------------------
    Generation Workspace
-  
+
    A generation workspace exists for each generation for each GC
    thread. The GC thread takes a block from the todos list of the
    generation into the scanbd and then scans it.  Objects referred to
    by those in the scan block are copied into the todo or scavd blocks
    of the relevant generation.
-  
+
    ------------------------------------------------------------------------- */
 
 typedef struct gen_workspace_ {
@@ -87,7 +87,7 @@ typedef struct gen_workspace_ {
 
     WSDeque *    todo_q;
     bdescr *     todo_overflow;
-    nat          n_todo_overflow;
+    uint32_t     n_todo_overflow;
 
     // where large objects to be scavenged go
     bdescr *     todo_large_objects;
@@ -126,8 +126,7 @@ typedef struct gc_thread_ {
     SpinLock   mut_spin;
     volatile StgWord wakeup;       // NB not StgWord8; only StgWord is guaranteed atomic
 #endif
-    nat thread_index;              // a zero based index identifying the thread
-    rtsBool idle;                  // sitting out of this GC cycle
+    uint32_t thread_index;         // a zero based index identifying the thread
 
     bdescr * free_blocks;          // a buffer of free blocks for this thread
                                    //  during GC without accessing the block
@@ -139,7 +138,7 @@ typedef struct gc_thread_ {
     StgClosure* static_objects;            // live static objects
     StgClosure* scavenged_static_objects;  // static objects scavenged so far
 
-    W_ gc_count;                 // number of GCs this thread has done
+    W_ gc_count;                   // number of GCs this thread has done
 
     // block that is currently being scanned
     bdescr *     scan_bd;
@@ -155,7 +154,7 @@ typedef struct gc_thread_ {
     // --------------------
     // evacuate flags
 
-    nat evac_gen_no;               // Youngest generation that objects
+    uint32_t evac_gen_no;          // Youngest generation that objects
                                    // should be evacuated to in
                                    // evacuate().  (Logically an
                                    // argument to evacuate, but it's
@@ -163,11 +162,11 @@ typedef struct gc_thread_ {
                                    // optimise it into a per-thread
                                    // variable).
 
-    rtsBool failed_to_evac;        // failure to evacuate an object typically
+    bool failed_to_evac;           // failure to evacuate an object typically
                                    // Causes it to be recorded in the mutable
                                    // object list
 
-    rtsBool eager_promotion;       // forces promotion to the evac gen
+    bool eager_promotion;          // forces promotion to the evac gen
                                    // instead of the to-space
                                    // corresponding to the object
 
@@ -200,7 +199,7 @@ typedef struct gc_thread_ {
 } gc_thread;
 
 
-extern nat n_gc_threads;
+extern uint32_t n_gc_threads;
 
 extern gc_thread **gc_threads;
 
@@ -211,4 +210,3 @@ extern ThreadLocalKey gctKey;
 #include "EndPrivate.h"
 
 #endif // SM_GCTHREAD_H
-

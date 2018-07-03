@@ -33,37 +33,50 @@ module Distribution.PackageDescription.Check (
         checkPackageFileNames,
   ) where
 
+import Prelude ()
+import Distribution.Compat.Prelude
+
 import Distribution.PackageDescription
 import Distribution.PackageDescription.Configuration
 import Distribution.Compiler
 import Distribution.System
 import Distribution.License
+import Distribution.Simple.BuildPaths (autogenPathsModuleName)
+import Distribution.Simple.BuildToolDepends
 import Distribution.Simple.CCompiler
+import Distribution.Types.ComponentRequestedSpec
+import Distribution.Types.CondTree
+import Distribution.Types.Dependency
+import Distribution.Types.ExeDependency
+import Distribution.Types.PackageName
+import Distribution.Types.ExecutableScope
+import Distribution.Types.UnqualComponentName
 import Distribution.Simple.Utils hiding (findPackageDesc, notice)
 import Distribution.Version
 import Distribution.Package
 import Distribution.Text
+import Distribution.Utils.Generic (isAscii)
 import Language.Haskell.Extension
 
-import Data.Maybe
-         ( isNothing, isJust, catMaybes, mapMaybe, maybeToList, fromMaybe )
-import Data.List  (sort, group, isPrefixOf, nub, find)
-import Control.Monad
-         ( filterM, liftM )
+import Control.Applicative (Const (..))
+import Control.Monad (mapM)
+import Data.List  (group)
+import Data.Monoid (Endo (..))
 import qualified System.Directory as System
          ( doesFileExist, doesDirectoryExist )
 import qualified Data.Map as Map
 
 import qualified Text.PrettyPrint as Disp
-import Text.PrettyPrint ((<>), (<+>))
+import Text.PrettyPrint ((<+>))
 
 import qualified System.Directory (getDirectoryContents)
 import System.IO (openBinaryFile, IOMode(ReadMode), hGetContents)
 import System.FilePath
-         ( (</>), takeExtension, isRelative, isAbsolute
-         , splitDirectories,  splitPath, splitExtension )
+         ( (</>), takeExtension, splitDirectories, splitPath, splitExtension )
 import System.FilePath.Windows as FilePath.Windows
          ( isValid )
+
+import qualified Data.Set as Set
 
 -- | Results of some kind of failed package check.
 --
@@ -111,7 +124,7 @@ check True  pc = Just pc
 checkSpecVersion :: PackageDescription -> [Int] -> Bool -> PackageCheck
                  -> Maybe PackageCheck
 checkSpecVersion pkg specver cond pc
-  | specVersion pkg >= Version specver [] = Nothing
+  | specVersion pkg >= mkVersion specver  = Nothing
   | otherwise                             = check cond pc
 
 -- ------------------------------------------------------------
@@ -136,6 +149,8 @@ checkPackage gpkg mpkg =
   ++ checkConditionals gpkg
   ++ checkPackageVersions gpkg
   ++ checkDevelopmentOnlyFlags gpkg
+  ++ checkFlagNames gpkg
+  ++ checkUnusedFlags gpkg
   where
     pkg = fromMaybe (flattenPackageDescription gpkg) mpkg
 
@@ -164,28 +179,45 @@ checkSanity :: PackageDescription -> [PackageCheck]
 checkSanity pkg =
   catMaybes [
 
-    check (null . (\(PackageName n) -> n) . packageName $ pkg) $
+    check (null . unPackageName . packageName $ pkg) $
       PackageBuildImpossible "No 'name' field."
 
-  , check (null . versionBranch . packageVersion $ pkg) $
+  , check (nullVersion == packageVersion pkg) $
       PackageBuildImpossible "No 'version' field."
 
   , check (all ($ pkg) [ null . executables
                        , null . testSuites
                        , null . benchmarks
-                       , isNothing . library ]) $
+                       , null . allLibraries
+                       , null . foreignLibs ]) $
       PackageBuildImpossible
         "No executables, libraries, tests, or benchmarks found. Nothing to do."
 
+  , check (any isNothing (map libName $ subLibraries pkg)) $
+      PackageBuildImpossible $ "Found one or more unnamed internal libraries. "
+        ++ "Only the non-internal library can have the same name as the package."
+
   , check (not (null duplicateNames)) $
-      PackageBuildImpossible $ "Duplicate sections: " ++ commaSep duplicateNames
-        ++ ". The name of every executable, test suite, and benchmark section in"
+      PackageBuildImpossible $ "Duplicate sections: "
+        ++ commaSep (map unUnqualComponentName duplicateNames)
+        ++ ". The name of every library, executable, test suite,"
+        ++ " and benchmark section in"
         ++ " the package must be unique."
+
+  -- NB: but it's OK for executables to have the same name!
+  -- TODO shouldn't need to compare on the string level
+  , check (any (== display (packageName pkg)) (display <$> subLibNames)) $
+      PackageBuildImpossible $ "Illegal internal library name "
+        ++ display (packageName pkg)
+        ++ ". Internal libraries cannot have the same name as the package."
+        ++ " Maybe you wanted a non-internal library?"
+        ++ " If so, rewrite the section stanza"
+        ++ " from 'library: '" ++ display (packageName pkg) ++ "' to 'library'."
   ]
   --TODO: check for name clashes case insensitively: windows file systems cannot
   --cope.
 
-  ++ maybe []  (checkLibrary    pkg) (library pkg)
+  ++ concatMap (checkLibrary    pkg) (allLibraries pkg)
   ++ concatMap (checkExecutable pkg) (executables pkg)
   ++ concatMap (checkTestSuite  pkg) (testSuites pkg)
   ++ concatMap (checkBenchmark  pkg) (benchmarks pkg)
@@ -199,10 +231,14 @@ checkSanity pkg =
         ++ "tool only supports up to version " ++ display cabalVersion ++ "."
   ]
   where
+    -- The public 'library' gets special dispensation, because it
+    -- is common practice to export a library and name the executable
+    -- the same as the package.
+    subLibNames = catMaybes . map libName $ subLibraries pkg
     exeNames = map exeName $ executables pkg
     testNames = map testName $ testSuites pkg
     bmNames = map benchmarkName $ benchmarks pkg
-    duplicateNames = dups $ exeNames ++ testNames ++ bmNames
+    duplicateNames = dups $ subLibNames ++ exeNames ++ testNames ++ bmNames
 
 checkLibrary :: PackageDescription -> Library -> [PackageCheck]
 checkLibrary pkg lib =
@@ -213,25 +249,37 @@ checkLibrary pkg lib =
             "Duplicate modules in library: "
          ++ commaSep (map display moduleDuplicates)
 
-    -- check use of required-signatures/exposed-signatures sections
-  , checkVersion [1,21] (not (null (requiredSignatures lib))) $
-      PackageDistInexcusable $
-           "To use the 'required-signatures' field the package needs to specify "
-        ++ "at least 'cabal-version: >= 1.21'."
+  -- TODO: This check is bogus if a required-signature was passed through
+  , check (null (explicitLibModules lib) && null (reexportedModules lib)) $
+      PackageDistSuspiciousWarn $
+           "Library " ++ (case libName lib of
+                            Nothing -> ""
+                            Just n -> display n
+                            ) ++ "does not expose any modules"
 
-  , checkVersion [1,21] (not (null (exposedSignatures lib))) $
+    -- check use of signatures sections
+  , checkVersion [1,25] (not (null (signatures lib))) $
       PackageDistInexcusable $
-           "To use the 'exposed-signatures' field the package needs to specify "
-        ++ "at least 'cabal-version: >= 1.21'."
+           "To use the 'signatures' field the package needs to specify "
+        ++ "at least 'cabal-version: >= 1.25'."
+
+    -- check that all autogen-modules appear on other-modules or exposed-modules
+  , check
+      (not $ and $ map (flip elem (explicitLibModules lib)) (libModulesAutogen lib)) $
+      PackageBuildImpossible $
+           "An 'autogen-module' is neither on 'exposed-modules' or "
+        ++ "'other-modules'."
+
   ]
 
   where
     checkVersion :: [Int] -> Bool -> PackageCheck -> Maybe PackageCheck
     checkVersion ver cond pc
-      | specVersion pkg >= Version ver []      = Nothing
+      | specVersion pkg >= mkVersion ver       = Nothing
       | otherwise                              = check cond pc
 
-    moduleDuplicates = dups (libModules lib ++
+    -- TODO: not sure if this check is always right in Backpack
+    moduleDuplicates = dups (explicitLibModules lib ++
                              map moduleReexportName (reexportedModules lib))
 
 checkExecutable :: PackageDescription -> Executable -> [PackageCheck]
@@ -240,7 +288,7 @@ checkExecutable pkg exe =
 
     check (null (modulePath exe)) $
       PackageBuildImpossible $
-        "No 'main-is' field found for executable " ++ exeName exe
+        "No 'main-is' field found for executable " ++ display (exeName exe)
 
   , check (not (null (modulePath exe))
        && (not $ fileExtensionSupportedLanguage $ modulePath exe)) $
@@ -258,8 +306,21 @@ checkExecutable pkg exe =
 
   , check (not (null moduleDuplicates)) $
        PackageBuildImpossible $
-            "Duplicate modules in executable '" ++ exeName exe ++ "': "
+            "Duplicate modules in executable '" ++ display (exeName exe) ++ "': "
          ++ commaSep (map display moduleDuplicates)
+
+    -- check that all autogen-modules appear on other-modules
+  , check
+      (not $ and $ map (flip elem (exeModules exe)) (exeModulesAutogen exe)) $
+      PackageBuildImpossible $
+           "On executable '" ++ display (exeName exe) ++ "' an 'autogen-module' is not "
+        ++ "on 'other-modules'"
+
+  , checkSpecVersion pkg [2,0] (exeScope exe /= ExecutableScopeUnknown) $
+      PackageDistSuspiciousWarn $
+           "To use the 'scope' field the package needs to specify "
+        ++ "at least 'cabal-version: >= 2.0'."
+
   ]
   where
     moduleDuplicates = dups (exeModules exe)
@@ -284,7 +345,7 @@ checkTestSuite pkg test =
 
   , check (not $ null moduleDuplicates) $
       PackageBuildImpossible $
-           "Duplicate modules in test suite '" ++ testName test ++ "': "
+           "Duplicate modules in test suite '" ++ display (testName test) ++ "': "
         ++ commaSep (map display moduleDuplicates)
 
   , check mainIsWrongExt $
@@ -297,6 +358,16 @@ checkTestSuite pkg test =
       PackageDistInexcusable $
            "The package uses a C/C++/obj-C source file for the 'main-is' field. "
         ++ "To use this feature you must specify 'cabal-version: >= 1.18'."
+
+    -- check that all autogen-modules appear on other-modules
+  , check
+      (not $ and $ map
+        (flip elem (testModules test))
+        (testModulesAutogen test)
+      ) $
+      PackageBuildImpossible $
+           "On test suite '" ++ display (testName test) ++ "' an 'autogen-module' is not "
+        ++ "on 'other-modules'"
   ]
   where
     moduleDuplicates = dups $ testModules test
@@ -329,13 +400,23 @@ checkBenchmark _pkg bm =
 
   , check (not $ null moduleDuplicates) $
       PackageBuildImpossible $
-           "Duplicate modules in benchmark '" ++ benchmarkName bm ++ "': "
+           "Duplicate modules in benchmark '" ++ display (benchmarkName bm) ++ "': "
         ++ commaSep (map display moduleDuplicates)
 
   , check mainIsWrongExt $
       PackageBuildImpossible $
            "The 'main-is' field must specify a '.hs' or '.lhs' file "
         ++ "(even if it is generated by a preprocessor)."
+
+    -- check that all autogen-modules appear on other-modules
+  , check
+      (not $ and $ map
+        (flip elem (benchmarkModules bm))
+        (benchmarkModulesAutogen bm)
+      ) $
+      PackageBuildImpossible $
+             "On benchmark '" ++ display (benchmarkName bm) ++ "' an 'autogen-module' is "
+          ++ "not on 'other-modules'"
   ]
   where
     moduleDuplicates = dups $ benchmarkModules bm
@@ -358,6 +439,11 @@ checkFields pkg =
         ++ "' is one of the reserved system file names on Windows. Many tools "
         ++ "need to convert package names to file names so using this name "
         ++ "would cause problems."
+
+  , check ((isPrefixOf "z-") . display . packageName $ pkg) $
+      PackageDistInexcusable $
+           "Package names with the prefix 'z-' are reserved by Cabal and "
+        ++ "cannot be used."
 
   , check (isNothing (buildType pkg)) $
       PackageBuildWarning $
@@ -430,6 +516,22 @@ checkFields pkg =
       PackageDistSuspicious
         "The 'synopsis' field is rather long (max 80 chars is recommended)."
 
+    -- See also https://github.com/haskell/cabal/pull/3479
+  , check (not (null (description pkg))
+           && length (description pkg) <= length (synopsis pkg)) $
+      PackageDistSuspicious $
+           "The 'description' field should be longer than the 'synopsis' "
+        ++ "field. "
+        ++ "It's useful to provide an informative 'description' to allow "
+        ++ "Haskell programmers who have never heard about your package to "
+        ++ "understand the purpose of your package. "
+        ++ "The 'description' field content is typically shown by tooling "
+        ++ "(e.g. 'cabal info', Haddock, Hackage) below the 'synopsis' which "
+        ++ "serves as a headline. "
+        ++ "Please refer to <https://www.haskell.org/"
+        ++ "cabal/users-guide/developing-packages.html#package-properties>"
+        ++ " for more details."
+
     -- check use of impossible constraints "tested-with: GHC== 6.10 && ==6.12"
   , check (not (null testedWithImpossibleRanges)) $
       PackageDistInexcusable $
@@ -439,6 +541,43 @@ checkFields pkg =
         ++ "different versions of the same compiler use multiple entries, "
         ++ "for example 'tested-with: GHC==6.10.4, GHC==6.12.3' and not "
         ++ "'tested-with: GHC==6.10.4 && ==6.12.3'."
+
+  , check (not (null depInternalLibraryWithExtraVersion)) $
+      PackageBuildWarning $
+           "The package has an extraneous version range for a dependency on an "
+        ++ "internal library: "
+        ++ commaSep (map display depInternalLibraryWithExtraVersion)
+        ++ ". This version range includes the current package but isn't needed "
+        ++ "as the current package's library will always be used."
+
+  , check (not (null depInternalLibraryWithImpossibleVersion)) $
+      PackageBuildImpossible $
+           "The package has an impossible version range for a dependency on an "
+        ++ "internal library: "
+        ++ commaSep (map display depInternalLibraryWithImpossibleVersion)
+        ++ ". This version range does not include the current package, and must "
+        ++ "be removed as the current package's library will always be used."
+
+  , check (not (null depInternalExecutableWithExtraVersion)) $
+      PackageBuildWarning $
+           "The package has an extraneous version range for a dependency on an "
+        ++ "internal executable: "
+        ++ commaSep (map display depInternalExecutableWithExtraVersion)
+        ++ ". This version range includes the current package but isn't needed "
+        ++ "as the current package's executable will always be used."
+
+  , check (not (null depInternalExecutableWithImpossibleVersion)) $
+      PackageBuildImpossible $
+           "The package has an impossible version range for a dependency on an "
+        ++ "internal executable: "
+        ++ commaSep (map display depInternalExecutableWithImpossibleVersion)
+        ++ ". This version range does not include the current package, and must "
+        ++ "be removed as the current package's executable will always be used."
+
+  , check (not (null depMissingInternalExecutable)) $
+      PackageBuildImpossible $
+           "The package depends on a missing internal executable: "
+        ++ commaSep (map display depInternalExecutableWithImpossibleVersion)
   ]
   where
     unknownCompilers  = [ name | (OtherCompiler name, _) <- testedWith pkg ]
@@ -457,9 +596,61 @@ checkFields pkg =
              , name `elem` map display knownLanguages ]
 
     testedWithImpossibleRanges =
-      [ Dependency (PackageName (display compiler)) vr
+      [ Dependency (mkPackageName (display compiler)) vr
       | (compiler, vr) <- testedWith pkg
       , isNoVersion vr ]
+
+    internalLibraries =
+        map (maybe (packageName pkg) (unqualComponentNameToPackageName) . libName)
+            (allLibraries pkg)
+
+    internalExecutables = map exeName $ executables pkg
+
+    internalLibDeps =
+      [ dep
+      | bi <- allBuildInfo pkg
+      , dep@(Dependency name _) <- targetBuildDepends bi
+      , name `elem` internalLibraries
+      ]
+
+    internalExeDeps =
+      [ dep
+      | bi <- allBuildInfo pkg
+      , dep <- getAllToolDependencies pkg bi
+      , isInternal pkg dep
+      ]
+
+    depInternalLibraryWithExtraVersion =
+      [ dep
+      | dep@(Dependency _ versionRange) <- internalLibDeps
+      , not $ isAnyVersion versionRange
+      , packageVersion pkg `withinRange` versionRange
+      ]
+
+    depInternalLibraryWithImpossibleVersion =
+      [ dep
+      | dep@(Dependency _ versionRange) <- internalLibDeps
+      , not $ packageVersion pkg `withinRange` versionRange
+      ]
+
+    depInternalExecutableWithExtraVersion =
+      [ dep
+      | dep@(ExeDependency _ _ versionRange) <- internalExeDeps
+      , not $ isAnyVersion versionRange
+      , packageVersion pkg `withinRange` versionRange
+      ]
+
+    depInternalExecutableWithImpossibleVersion =
+      [ dep
+      | dep@(ExeDependency _ _ versionRange) <- internalExeDeps
+      , not $ packageVersion pkg `withinRange` versionRange
+      ]
+
+    depMissingInternalExecutable =
+      [ dep
+      | dep@(ExeDependency _ eName _) <- internalExeDeps
+      , not $ eName `elem` internalExecutables
+      ]
 
 
 checkLicense :: PackageDescription -> [PackageCheck]
@@ -547,7 +738,7 @@ checkSourceRepos pkg =
         ++ "field. It should specify the tag corresponding to this version "
         ++ "or release of the package."
 
-  , check (maybe False System.FilePath.isAbsolute (repoSubdir repo)) $
+  , check (maybe False isAbsoluteOnAnyPlatform (repoSubdir repo)) $
       PackageDistInexcusable
         "The 'subdir' field of a source-repository must be a relative path."
   ]
@@ -681,7 +872,8 @@ checkGhcOptions pkg =
 
   where
     all_ghc_options    = concatMap get_ghc_options (allBuildInfo pkg)
-    lib_ghc_options    = maybe [] (get_ghc_options . libBuildInfo) (library pkg)
+    lib_ghc_options    = concatMap (get_ghc_options . libBuildInfo)
+                         (allLibraries pkg)
     get_ghc_options bi = hcOptions GHC bi ++ hcProfOptions GHC bi
                          ++ hcSharedOptions GHC bi
 
@@ -770,7 +962,8 @@ checkCPPOptions pkg =
   where all_cppOptions = [ opts | bi <- allBuildInfo pkg
                                 , opts <- cppOptions bi ]
 
-checkAlternatives :: String -> String -> [(String, String)] -> Maybe PackageCheck
+checkAlternatives :: String -> String -> [(String, String)]
+                  -> Maybe PackageCheck
 checkAlternatives badField goodField flags =
   check (not (null badFlags)) $
     PackageBuildWarning $
@@ -791,7 +984,7 @@ checkPaths pkg =
   [ PackageDistInexcusable $
       quote (kind ++ ": " ++ path) ++ " is an absolute path."
   | (path, kind) <- relPaths
-  , isAbsolute path ]
+  , isAbsoluteOnAnyPlatform path ]
   ++
   [ PackageDistInexcusable $
          quote (kind ++ ": " ++ path) ++ " points inside the 'dist' "
@@ -856,7 +1049,7 @@ checkCabalVersion pkg =
   catMaybes [
 
     -- check syntax of cabal-version field
-    check (specVersion pkg >= Version [1,10] []
+    check (specVersion pkg >= mkVersion [1,10]
            && not simpleSpecVersionRangeSyntax) $
       PackageBuildWarning $
            "Packages relying on Cabal 1.10 or later must only specify a "
@@ -864,7 +1057,7 @@ checkCabalVersion pkg =
         ++ "'cabal-version: >= " ++ display (specVersion pkg) ++ "'."
 
     -- check syntax of cabal-version field
-  , check (specVersion pkg < Version [1,9] []
+  , check (specVersion pkg < mkVersion [1,9]
            && not simpleSpecVersionRangeSyntax) $
       PackageDistSuspicious $
            "It is recommended that the 'cabal-version' field only specify a "
@@ -895,7 +1088,7 @@ checkCabalVersion pkg =
            "To use the 'default-language' field the package needs to specify "
         ++ "at least 'cabal-version: >= 1.10'."
 
-  , check (specVersion pkg >= Version [1,10] []
+  , check (specVersion pkg >= mkVersion [1,10]
            && (any isNothing (buildInfoField defaultLanguage))) $
       PackageBuildWarning $
            "Packages using 'cabal-version: >= 1.10' must specify the "
@@ -904,21 +1097,30 @@ checkCabalVersion pkg =
         ++ "different modules then list the other ones in the "
         ++ "'other-languages' field."
 
+  , checkVersion [1,18]
+    (not . null $ extraDocFiles pkg) $
+      PackageDistInexcusable $
+           "To use the 'extra-doc-files' field the package needs to specify "
+        ++ "at least 'cabal-version: >= 1.18'."
+
+  , checkVersion [1,23]
+    (not (null (subLibraries pkg))) $
+      PackageDistInexcusable $
+           "To use multiple 'library' sections or a named library section "
+        ++ "the package needs to specify at least 'cabal-version >= 1.23'."
+
     -- check use of reexported-modules sections
   , checkVersion [1,21]
-    (maybe False (not.null.reexportedModules) (library pkg)) $
+    (any (not.null.reexportedModules) (allLibraries pkg)) $
       PackageDistInexcusable $
            "To use the 'reexported-module' field the package needs to specify "
         ++ "at least 'cabal-version: >= 1.21'."
 
     -- check use of thinning and renaming
-  , checkVersion [1,21] (not (null depsUsingThinningRenamingSyntax)) $
+  , checkVersion [1,25] usesBackpackIncludes $
       PackageDistInexcusable $
-           "The package uses "
-        ++ "thinning and renaming in the 'build-depends' field: "
-        ++ commaSep (map display depsUsingThinningRenamingSyntax)
-        ++ ". To use this new syntax, the package needs to specify at least"
-        ++ "'cabal-version: >= 1.21'."
+           "To use the 'mixins' field the package needs to specify "
+        ++ "at least 'cabal-version: >= 1.25'."
 
     -- check use of 'extra-framework-dirs' field
   , checkVersion [1,23] (any (not . null) (buildInfoField extraFrameworkDirs)) $
@@ -935,7 +1137,7 @@ checkCabalVersion pkg =
         ++ "at least 'cabal-version: >= 1.10'."
 
     -- check use of extensions field
-  , check (specVersion pkg >= Version [1,10] []
+  , check (specVersion pkg >= mkVersion [1,10]
            && (any (not . null) (buildInfoField oldExtensions))) $
       PackageBuildWarning $
            "For packages using 'cabal-version: >= 1.10' the 'extensions' "
@@ -965,6 +1167,18 @@ checkCabalVersion pkg =
         ++ "is important then use: " ++ commaSep
            [ display (Dependency name (eliminateWildcardSyntax versionRange))
            | Dependency name versionRange <- depsUsingWildcardSyntax ]
+
+    -- check use of "build-depends: foo ^>= 1.2.3" syntax
+  , checkVersion [2,0] (not (null depsUsingMajorBoundSyntax)) $
+      PackageDistInexcusable $
+           "The package uses major bounded version syntax in the "
+        ++ "'build-depends' field: "
+        ++ commaSep (map display depsUsingMajorBoundSyntax)
+        ++ ". To use this new syntax the package need to specify at least "
+        ++ "'cabal-version: >= 2.0'. Alternatively, if broader compatibility "
+        ++ "is important then use: " ++ commaSep
+           [ display (Dependency name (eliminateMajorBoundSyntax versionRange))
+           | Dependency name versionRange <- depsUsingMajorBoundSyntax ]
 
     -- check use of "tested-with: GHC (>= 1.0 && < 1.4) || >=1.8 " syntax
   , checkVersion [1,8] (not (null testedWithVersionRangeExpressions)) $
@@ -1039,7 +1253,7 @@ checkCabalVersion pkg =
         ++ "compatibility with earlier Cabal versions then you may be able to "
         ++ "use an equivalent compiler-specific flag."
 
-  , check (specVersion pkg >= Version [1,23] []
+  , check (specVersion pkg >= mkVersion [1,23]
            && isNothing (setupBuildInfo pkg)
            && buildType pkg == Just Custom) $
       PackageBuildWarning $
@@ -1049,7 +1263,7 @@ checkCabalVersion pkg =
         ++ "The 'setup-depends' field uses the same syntax as 'build-depends', "
         ++ "so a simple example would be 'setup-depends: base, Cabal'."
 
-  , check (specVersion pkg < Version [1,23] []
+  , check (specVersion pkg < mkVersion [1,23]
            && isNothing (setupBuildInfo pkg)
            && buildType pkg == Just Custom) $
       PackageDistSuspiciousWarn $
@@ -1059,6 +1273,18 @@ checkCabalVersion pkg =
         ++ "that specifies the dependencies of the Setup.hs script itself. "
         ++ "The 'setup-depends' field uses the same syntax as 'build-depends', "
         ++ "so a simple example would be 'setup-depends: base, Cabal'."
+
+  , check (specVersion pkg >= mkVersion [1,25]
+           && elem (autogenPathsModuleName pkg) allModuleNames
+           && not (elem (autogenPathsModuleName pkg) allModuleNamesAutogen) ) $
+      PackageDistInexcusable $
+           "Packages using 'cabal-version: >= 1.25' and the autogenerated "
+        ++ "module Paths_* must include it also on the 'autogen-modules' field "
+        ++ "besides 'exposed-modules' and 'other-modules'. This specifies that "
+        ++ "the module does not come with the package and is generated on "
+        ++ "setup. Modules built with a custom Setup.hs script also go here "
+        ++ "to ensure that commands like sdist don't fail."
+
   ]
   where
     -- Perform a check on packages that use a version of the spec less than
@@ -1067,7 +1293,7 @@ checkCabalVersion pkg =
     -- version.
     checkVersion :: [Int] -> Bool -> PackageCheck -> Maybe PackageCheck
     checkVersion ver cond pc
-      | specVersion pkg >= Version ver []      = Nothing
+      | specVersion pkg >= mkVersion ver       = Nothing
       | otherwise                              = check cond pc
 
     buildInfoField field         = map field (allBuildInfo pkg)
@@ -1082,7 +1308,7 @@ checkCabalVersion pkg =
               , usesNewVersionRangeSyntax vr ]
 
     testedWithVersionRangeExpressions =
-        [ Dependency (PackageName (display compiler)) vr
+        [ Dependency (mkPackageName (display compiler)) vr
         | (compiler, vr) <- testedWith pkg
         , usesNewVersionRangeSyntax vr ]
 
@@ -1094,6 +1320,7 @@ checkCabalVersion pkg =
                       (\_ -> False) (\_ -> False)
                       (\_ -> True)  -- >=
                       (\_ -> False)
+                      (\_ _ -> False)
                       (\_ _ -> False)
                       (\_ _ -> False) (\_ _ -> False)
                       id)
@@ -1112,22 +1339,20 @@ checkCabalVersion pkg =
           (const 1) (const 1)
           (const 1) (const 1)
           (const (const 1))
+          (const (const 1))
           (+) (+)
           (const 3) -- uses new ()'s syntax
 
     depsUsingWildcardSyntax = [ dep | dep@(Dependency _ vr) <- buildDepends pkg
                                     , usesWildcardSyntax vr ]
 
-    -- TODO: If the user writes build-depends: foo with (), this is
-    -- indistinguishable from build-depends: foo, so there won't be an
-    -- error even though there should be
-    depsUsingThinningRenamingSyntax =
-      [ name
-      | bi <- allBuildInfo pkg
-      , (name, _) <- Map.toList (targetBuildRenaming bi) ]
+    depsUsingMajorBoundSyntax = [ dep | dep@(Dependency _ vr) <- buildDepends pkg
+                                  , usesMajorBoundSyntax vr ]
+
+    usesBackpackIncludes = any (not . null . mixins) (allBuildInfo pkg)
 
     testedWithUsingWildcardSyntax =
-      [ Dependency (PackageName (display compiler)) vr
+      [ Dependency (mkPackageName (display compiler)) vr
       | (compiler, vr) <- testedWith pkg
       , usesWildcardSyntax vr ]
 
@@ -1138,15 +1363,39 @@ checkCabalVersion pkg =
         (const False) (const False)
         (const False) (const False)
         (\_ _ -> True) -- the wildcard case
+        (\_ _ -> False)
         (||) (||) id
 
+    -- NB: this eliminates both, WildcardVersion and MajorBoundVersion
+    -- because when WildcardVersion is not support, neither is MajorBoundVersion
     eliminateWildcardSyntax =
       foldVersionRange'
         anyVersion thisVersion
         laterVersion earlierVersion
         orLaterVersion orEarlierVersion
         (\v v' -> intersectVersionRanges (orLaterVersion v) (earlierVersion v'))
+        (\v v' -> intersectVersionRanges (orLaterVersion v) (earlierVersion v'))
         intersectVersionRanges unionVersionRanges id
+
+    usesMajorBoundSyntax :: VersionRange -> Bool
+    usesMajorBoundSyntax =
+      foldVersionRange'
+        False (const False)
+        (const False) (const False)
+        (const False) (const False)
+        (\_ _ -> False)
+        (\_ _ -> True) -- MajorBoundVersion
+        (||) (||) id
+
+    eliminateMajorBoundSyntax =
+      foldVersionRange'
+        anyVersion thisVersion
+        laterVersion earlierVersion
+        orLaterVersion orEarlierVersion
+        (\v _ -> withinVersion v)
+        (\v v' -> intersectVersionRanges (orLaterVersion v) (earlierVersion v'))
+        intersectVersionRanges unionVersionRanges id
+
 
     compatLicenses = [ GPL Nothing, LGPL Nothing, AGPL Nothing, BSD3, BSD4
                      , PublicDomain, AllRightsReserved
@@ -1193,6 +1442,15 @@ checkCabalVersion pkg =
       map DisableExtension
       [MonoPatBinds]
 
+    allModuleNames =
+         (case library pkg of
+           Nothing -> []
+           (Just lib) -> explicitLibModules lib
+         )
+      ++ concatMap otherModules (allBuildInfo pkg)
+
+    allModuleNamesAutogen = concatMap autogenModules (allBuildInfo pkg)
+
 -- | A variation on the normal 'Text' instance, shows any ()'s in the original
 -- textual syntax. We need to show these otherwise it's confusing to users when
 -- we complain of their presence but do not pretty print them!
@@ -1204,12 +1462,13 @@ displayRawVersionRange =
  . foldVersionRange'                         -- precedence:
      -- All the same as the usual pretty printer, except for the parens
      (         Disp.text "-any"                           , 0 :: Int)
-     (\v   -> (Disp.text "==" <> disp v                   , 0))
-     (\v   -> (Disp.char '>'  <> disp v                   , 0))
-     (\v   -> (Disp.char '<'  <> disp v                   , 0))
-     (\v   -> (Disp.text ">=" <> disp v                   , 0))
-     (\v   -> (Disp.text "<=" <> disp v                   , 0))
-     (\v _ -> (Disp.text "==" <> dispWild v               , 0))
+     (\v   -> (Disp.text "==" <<>> disp v                   , 0))
+     (\v   -> (Disp.char '>'  <<>> disp v                   , 0))
+     (\v   -> (Disp.char '<'  <<>> disp v                   , 0))
+     (\v   -> (Disp.text ">=" <<>> disp v                   , 0))
+     (\v   -> (Disp.text "<=" <<>> disp v                   , 0))
+     (\v _ -> (Disp.text "==" <<>> dispWild v               , 0))
+     (\v _ -> (Disp.text "^>=" <<>> disp v                   , 0))
      (\(r1, p1) (r2, p2) ->
        (punct 2 p1 r1 <+> Disp.text "||" <+> punct 2 p2 r2 , 2))
      (\(r1, p1) (r2, p2) ->
@@ -1217,9 +1476,10 @@ displayRawVersionRange =
      (\(r,  _ )          -> (Disp.parens r, 0)) -- parens
 
   where
-    dispWild (Version b _) =
-           Disp.hcat (Disp.punctuate (Disp.char '.') (map Disp.int b))
-        <> Disp.text ".*"
+    dispWild v =
+           Disp.hcat (Disp.punctuate (Disp.char '.')
+                                     (map Disp.int $ versionNumbers v))
+        <<>> Disp.text ".*"
     punct p p' | p < p'    = Disp.parens
                | otherwise = id
 
@@ -1264,19 +1524,22 @@ checkPackageVersions pkg =
     -- pick a single "typical" configuration and check if that has an
     -- open upper bound. To get a typical configuration we finalise
     -- using no package index and the current platform.
-    finalised = finalizePackageDescription
-                              [] (const True) buildPlatform
+    finalised = finalizePD
+                              [] defaultComponentRequestedSpec (const True)
+                              buildPlatform
                               (unknownCompilerInfo
-                                (CompilerId buildCompilerFlavor (Version [] [])) NoAbiTag)
+                                (CompilerId buildCompilerFlavor nullVersion)
+                                NoAbiTag)
                               [] pkg
     baseDependency = case finalised of
       Right (pkg', _) | not (null baseDeps) ->
           foldr intersectVersionRanges anyVersion baseDeps
         where
           baseDeps =
-            [ vr | Dependency (PackageName "base") vr <- buildDepends pkg' ]
+            [ vr | Dependency pname vr <- buildDepends pkg'
+                 , pname == mkPackageName "base" ]
 
-      -- Just in case finalizePackageDescription fails for any reason,
+      -- Just in case finalizePD fails for any reason,
       -- or if the package doesn't depend on the base package at all,
       -- then we will just skip the check, since boundedAbove noVersion = True
       _          -> noVersion
@@ -1312,16 +1575,70 @@ checkConditionals pkg =
     unknownOSs    = [ os   | OS   (OtherOS os)           <- conditions ]
     unknownArches = [ arch | Arch (OtherArch arch)       <- conditions ]
     unknownImpls  = [ impl | Impl (OtherCompiler impl) _ <- conditions ]
-    conditions = maybe [] fvs (condLibrary pkg)
+    conditions = concatMap fvs (maybeToList (condLibrary pkg))
+              ++ concatMap (fvs . snd) (condSubLibraries pkg)
               ++ concatMap (fvs . snd) (condExecutables pkg)
+              ++ concatMap (fvs . snd) (condTestSuites pkg)
+              ++ concatMap (fvs . snd) (condBenchmarks pkg)
     fvs (CondNode _ _ ifs) = concatMap compfv ifs -- free variables
-    compfv (c, ct, mct) = condfv c ++ fvs ct ++ maybe [] fvs mct
+    compfv (CondBranch c ct mct) = condfv c ++ fvs ct ++ maybe [] fvs mct
     condfv c = case c of
       Var v      -> [v]
       Lit _      -> []
       CNot c1    -> condfv c1
       COr  c1 c2 -> condfv c1 ++ condfv c2
       CAnd c1 c2 -> condfv c1 ++ condfv c2
+
+checkFlagNames :: GenericPackageDescription -> [PackageCheck]
+checkFlagNames gpd
+    | null invalidFlagNames = []
+    | otherwise             = [ PackageDistInexcusable
+        $ "Suspicious flag names: " ++ unwords invalidFlagNames ++ ". "
+        ++ "To avoid ambiguity in command line interfaces, flag shouldn't "
+        ++ "start with a dash. Also for better compatibility, flag names "
+        ++ "shouldn't contain non-ascii characters."
+        ]
+  where
+    invalidFlagNames =
+        [ fn
+        | flag <- genPackageFlags gpd
+        , let fn = unFlagName (flagName flag)
+        , invalidFlagName fn
+        ]
+    -- starts with dash
+    invalidFlagName ('-':_) = True
+    -- mon ascii letter
+    invalidFlagName cs = any (not . isAscii) cs
+
+checkUnusedFlags :: GenericPackageDescription -> [PackageCheck]
+checkUnusedFlags gpd
+    | declared == used = []
+    | otherwise        = [ PackageDistSuspicious
+        $ "Declared and used flag sets differ: "
+        ++ s declared ++ " /= " ++ s used ++ ". "
+        ]
+  where
+    s :: Set.Set FlagName -> String
+    s = commaSep . map unFlagName . Set.toList
+
+    declared :: Set.Set FlagName
+    declared = Set.fromList $ map flagName $ genPackageFlags gpd
+
+    used :: Set.Set FlagName
+    used = Set.fromList $ ($[]) $ appEndo $ getConst $
+        (traverse . traverseCondTreeV) tellFlag (condLibrary gpd) *>
+        (traverse . _2 . traverseCondTreeV) tellFlag (condSubLibraries gpd) *>
+        (traverse . _2 . traverseCondTreeV) tellFlag (condForeignLibs gpd) *>
+        (traverse . _2 . traverseCondTreeV) tellFlag (condExecutables gpd) *>
+        (traverse . _2 . traverseCondTreeV) tellFlag (condTestSuites gpd) *>
+        (traverse . _2 . traverseCondTreeV) tellFlag (condBenchmarks gpd)
+
+    _2 ::  Functor f => (a -> f b) -> (c, a) -> f (c, b)
+    _2 f (c, a) = (,) c <$> f a
+
+    tellFlag :: ConfVar -> Const (Endo [FlagName]) ConfVar
+    tellFlag (Flag fn) = Const (Endo (fn :))
+    tellFlag _         = Const mempty
 
 checkDevelopmentOnlyFlagsBuildInfo :: BuildInfo -> [PackageCheck]
 checkDevelopmentOnlyFlagsBuildInfo bi =
@@ -1359,7 +1676,7 @@ checkDevelopmentOnlyFlagsBuildInfo bi =
                "-fprof-cafs", "-fno-prof-count-entries",
                "-auto-all", "-auto", "-caf-all"] $
       PackageDistSuspicious $
-           "'ghc-options: -fprof*' profiling flags are typically not "
+           "'ghc-options/ghc-prof-options: -fprof*' profiling flags are typically not "
         ++ "appropriate for a distributed library package. These flags are "
         ++ "useful to profile this package, but when profiling other packages "
         ++ "that use this one these flags clutter the profile output with "
@@ -1419,6 +1736,9 @@ checkDevelopmentOnlyFlags pkg =
         concatMap (collectCondTreePaths libBuildInfo)
                   (maybeToList (condLibrary pkg))
 
+     ++ concatMap (collectCondTreePaths libBuildInfo . snd)
+                  (condSubLibraries pkg)
+
      ++ concatMap (collectCondTreePaths buildInfo . snd)
                   (condExecutables pkg)
 
@@ -1441,11 +1761,11 @@ checkDevelopmentOnlyFlags pkg =
 
           : concat
             [ go (condition:conditions) ifThen
-            | (condition, ifThen, _) <- condTreeComponents condNode ]
+            | (CondBranch condition ifThen _) <- condTreeComponents condNode ]
 
          ++ concat
             [ go (condition:conditions) elseThen
-            | (condition, _, Just elseThen) <- condTreeComponents condNode ]
+            | (CondBranch condition _ (Just elseThen)) <- condTreeComponents condNode ]
 
 
 -- ------------------------------------------------------------
@@ -1455,14 +1775,15 @@ checkDevelopmentOnlyFlags pkg =
 -- | Sanity check things that requires IO. It looks at the files in the
 -- package and expects to find the package unpacked in at the given file path.
 --
-checkPackageFiles :: PackageDescription -> FilePath -> IO [PackageCheck]
+checkPackageFiles :: PackageDescription -> FilePath -> NoCallStackIO [PackageCheck]
 checkPackageFiles pkg root = checkPackageContent checkFilesIO pkg
   where
     checkFilesIO = CheckPackageContentOps {
       doesFileExist        = System.doesFileExist                  . relative,
       doesDirectoryExist   = System.doesDirectoryExist             . relative,
       getDirectoryContents = System.Directory.getDirectoryContents . relative,
-      getFileContents      = \f -> openBinaryFile (relative f) ReadMode >>= hGetContents
+      getFileContents      = \f -> openBinaryFile (relative f) ReadMode
+                                   >>= hGetContents
     }
     relative path = root </> path
 
@@ -1504,10 +1825,18 @@ checkCabalFileBOM :: Monad m => CheckPackageContentOps m
 checkCabalFileBOM ops = do
   epdfile <- findPackageDesc ops
   case epdfile of
-    Left pc      -> return $ Just pc
-    Right pdfile -> (flip check pc . startsWithBOM . fromUTF8) `liftM` (getFileContents ops pdfile)
-                       where pc = PackageDistInexcusable $
-                                    pdfile ++ " starts with an Unicode byte order mark (BOM). This may cause problems with older cabal versions."
+    -- MASSIVE HACK.  If the Cabal file doesn't exist, that is
+    -- a very strange situation to be in, because the driver code
+    -- in 'Distribution.Setup' ought to have noticed already!
+    -- But this can be an issue, see #3552 and also when
+    -- --cabal-file is specified.  So if you can't find the file,
+    -- just don't bother with this check.
+    Left _       -> return $ Nothing
+    Right pdfile -> (flip check pc . startsWithBOM . fromUTF8)
+                    `liftM` (getFileContents ops pdfile)
+      where pc = PackageDistInexcusable $
+                 pdfile ++ " starts with an Unicode byte order mark (BOM)."
+                 ++ " This may cause problems with older cabal versions."
 
 -- |Find a package description file in the given directory.  Looks for
 -- @.cabal@ files.  Like 'Distribution.Simple.Utils.findPackageDesc',
@@ -1527,7 +1856,8 @@ findPackageDesc ops
       case cabalFiles of
         []          -> return (Left $ PackageBuildImpossible noDesc)
         [cabalFile] -> return (Right cabalFile)
-        multiple    -> return (Left $ PackageBuildImpossible $ multiDesc multiple)
+        multiple    -> return (Left $ PackageBuildImpossible
+                               $ multiDesc multiple)
 
   where
     noDesc :: String
@@ -1535,7 +1865,7 @@ findPackageDesc ops
              ++ "Please create a package description file <pkgname>.cabal"
 
     multiDesc :: [String] -> String
-    multiDesc l = "Multiple cabal files found.\n"
+    multiDesc l = "Multiple cabal files found while checking.\n"
                   ++ "Please use only one of: "
                   ++ intercalate ", " l
 
@@ -1587,7 +1917,7 @@ checkLocalPathsExist ops pkg = do
                   | dir <- extraFrameworkDirs  bi ]
                ++ [ (dir, "include-dirs")   | dir <- includeDirs  bi ]
                ++ [ (dir, "hs-source-dirs") | dir <- hsSourceDirs bi ]
-             , isRelative dir ]
+             , isRelativeOnAnyPlatform dir ]
   missing <- filterM (liftM not . doesDirectoryExist ops . fst) dirs
   return [ PackageBuildWarning {
              explanation = quote (kind ++ ": " ++ dir)
@@ -1666,13 +1996,13 @@ checkTarPath path
   | otherwise = case pack nameMax (reverse (splitPath path)) of
     Left err           -> Just err
     Right []           -> Nothing
-    Right (first:rest) -> case pack prefixMax remainder of
+    Right (h:rest) -> case pack prefixMax remainder of
       Left err         -> Just err
       Right []         -> Nothing
       Right (_:_)      -> Just noSplit
      where
         -- drop the '/' between the name and prefix:
-        remainder = init first : rest
+        remainder = init h : rest
 
   where
     nameMax, prefixMax :: Int

@@ -106,7 +106,6 @@ instance Applicative CpsRn where
     (<*>) = ap
 
 instance Monad CpsRn where
-  return = pure
   (CpsRn m) >>= mk = CpsRn (\k -> m (\v -> unCpsRn (mk v) k))
 
 runCps :: CpsRn a -> RnM (a, FreeVars)
@@ -250,7 +249,8 @@ report unused variables at the binding level. So we must use bindLocalNames
 here, *not* bindLocalNameFV.  Trac #3943.
 
 
-Note: [Don't report shadowing for pattern synonyms]
+Note [Don't report shadowing for pattern synonyms]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 There is one special context where a pattern doesn't introduce any new binders -
 pattern synonym declarations. Therefore we don't check to see if pattern
 variables shadow existing identifiers as they are never bound to anything
@@ -469,6 +469,11 @@ rnPatAndThen mk (TuplePat pats boxed _)
        ; pats' <- rnLPatsAndThen mk pats
        ; return (TuplePat pats' boxed []) }
 
+rnPatAndThen mk (SumPat pat alt arity _)
+  = do { pat <- rnLPatAndThen mk pat
+       ; return (SumPat pat alt arity PlaceHolder)
+       }
+
 -- If a splice has been run already, just rename the result.
 rnPatAndThen mk (SplicePat (HsSpliced mfs (HsSplicedPat pat)))
   = SplicePat . HsSpliced mfs . HsSplicedPat <$> rnPatAndThen mk pat
@@ -614,43 +619,34 @@ rnHsRecFields ctxt mk_arg (HsRecFields { rec_flds = flds, rec_dotdot = dotdot })
            ; (rdr_env, lcl_env) <- getRdrEnvs
            ; con_fields <- lookupConstructorFields con
            ; when (null con_fields) (addErr (badDotDotCon con))
-           ; let present_flds = map (occNameFS . rdrNameOcc) $ getFieldLbls flds
-                 parent_tc = find_tycon rdr_env con
+           ; let present_flds = mkOccSet $ map rdrNameOcc (getFieldLbls flds)
 
                    -- For constructor uses (but not patterns)
-                   -- the arg should be in scope (unqualified)
-                   -- ignoring the record field itself
+                   -- the arg should be in scope locally;
+                   -- i.e. not top level or imported
                    -- Eg.  data R = R { x,y :: Int }
                    --      f x = R { .. }   -- Should expand to R {x=x}, not R{x=x,y=y}
-                 arg_in_scope lbl
-                   = rdr `elemLocalRdrEnv` lcl_env
-                   || notNull [ gre | gre <- lookupGRE_RdrName rdr rdr_env
-                                    , case gre_par gre of
-                                        ParentIs p     -> Just p /= parent_tc
-                                        FldParent p _  -> Just p /= parent_tc
-                                        PatternSynonym -> False
-                                        NoParent       -> True ]
-                   where
-                     rdr = mkVarUnqual lbl
+                 arg_in_scope lbl = mkRdrUnqual lbl `elemLocalRdrEnv` lcl_env
 
-                 dot_dot_gres = [ (lbl, sel, head gres)
+                 (dot_dot_fields, dot_dot_gres)
+                        = unzip [ (fl, gre)
                                 | fl <- con_fields
-                                , let lbl = flLabel fl
-                                , let sel = flSelector fl
-                                , not (lbl `elem` present_flds)
-                                , let gres = lookupGRE_Field_Name rdr_env sel lbl
-                                , not (null gres)  -- Check selector is in scope
+                                , let lbl = mkVarOccFS (flLabel fl)
+                                , not (lbl `elemOccSet` present_flds)
+                                , Just gre <- [lookupGRE_FieldLabel rdr_env fl]
+                                              -- Check selector is in scope
                                 , case ctxt of
                                     HsRecFieldCon {} -> arg_in_scope lbl
                                     _other           -> True ]
 
-           ; addUsedGREs (map thdOf3 dot_dot_gres)
+           ; addUsedGREs dot_dot_gres
            ; return [ L loc (HsRecField
                         { hsRecFieldLbl = L loc (FieldOcc (L loc arg_rdr) sel)
                         , hsRecFieldArg = L loc (mk_arg loc arg_rdr)
                         , hsRecPun      = False })
-                    | (lbl, sel, _) <- dot_dot_gres
-                    , let arg_rdr = mkVarUnqual lbl ] }
+                    | fl <- dot_dot_fields
+                    , let sel     = flSelector fl
+                    , let arg_rdr = mkVarUnqual (flLabel fl) ] }
 
     check_disambiguation :: Bool -> Maybe Name -> RnM (Maybe Name)
     -- When disambiguation is on, return name of parent tycon.
@@ -664,19 +660,21 @@ rnHsRecFields ctxt mk_arg (HsRecFields { rec_flds = flds, rec_dotdot = dotdot })
     -- (that is, the parent of the data constructor),
     -- or 'Nothing' if it is a pattern synonym or not in scope.
     -- That's the parent to use for looking up record fields.
-    find_tycon env con
-      | Just (AConLike (RealDataCon dc)) <- wiredInNameTyThing_maybe con
+    find_tycon env con_name
+      | Just (AConLike (RealDataCon dc)) <- wiredInNameTyThing_maybe con_name
       = Just (tyConName (dataConTyCon dc))
         -- Special case for [], which is built-in syntax
         -- and not in the GlobalRdrEnv (Trac #8448)
-      | [gre] <- lookupGRE_Name env con
+
+      | Just gre <- lookupGRE_Name env con_name
       = case gre_par gre of
           ParentIs p -> Just p
-          _          -> Nothing
+          _          -> Nothing   -- Can happen if the con_name
+                                  -- is for a pattern synonym
 
       | otherwise = Nothing
-        -- This can happen if the datacon is not in scope
-        -- and we are in a TH splice (Trac #12130)
+        -- Data constructor not lexically in scope at all
+        -- See Note [Disambiguation and Template Haskell]
 
     dup_flds :: [[RdrName]]
         -- Each list represents a RdrName that occurred more than once
@@ -684,6 +682,22 @@ rnHsRecFields ctxt mk_arg (HsRecFields { rec_flds = flds, rec_dotdot = dotdot })
         -- Each list in dup_fields is non-empty
     (_, dup_flds) = removeDups compare (getFieldLbls flds)
 
+
+{- Note [Disambiguation and Template Haskell]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider (Trac #12130)
+   module Foo where
+     import M
+     b = $(funny)
+
+   module M(funny) where
+     data T = MkT { x :: Int }
+     funny :: Q Exp
+     funny = [| MkT { x = 3 } |]
+
+When we splice, neither T nor MkT are lexically in scope, so find_tycon will
+fail.  But there is no need for disambiguation anyway, so we just return Nothing
+-}
 
 rnHsRecUpdFields
     :: [LHsRecUpdField RdrName]
@@ -805,7 +819,7 @@ rnLit _ = return ()
 -- Integer-looking literal.
 generalizeOverLitVal :: OverLitVal -> OverLitVal
 generalizeOverLitVal (HsFractional (FL {fl_text=src,fl_value=val}))
-    | denominator val == 1 = HsIntegral src (numerator val)
+    | denominator val == 1 = HsIntegral (SourceText src) (numerator val)
 generalizeOverLitVal lit = lit
 
 rnOverLit :: HsOverLit t -> RnM (HsOverLit Name, FreeVars)

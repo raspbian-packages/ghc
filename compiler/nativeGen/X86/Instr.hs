@@ -26,6 +26,7 @@ import Reg
 import TargetReg
 
 import BlockId
+import Hoopl
 import CodeGen.Platform
 import Cmm
 import FastString
@@ -38,6 +39,7 @@ import DynFlags
 import UniqSet
 import Unique
 import UniqSupply
+import Debug (UnwindTable)
 
 import Control.Monad
 import Data.Maybe       (fromMaybe)
@@ -178,9 +180,13 @@ data Instr
         -- invariants for a BasicBlock (see Cmm).
         | NEWBLOCK BlockId
 
-        -- specify current stack offset for
-        -- benefit of subsequent passes
-        | DELTA   Int
+        -- unwinding information
+        -- See Note [Unwinding information in the NCG].
+        | UNWIND CLabel UnwindTable
+
+        -- specify current stack offset for benefit of subsequent passes.
+        -- This carries a BlockId so it can be used in unwinding information.
+        | DELTA  Int
 
         -- Moves.
         | MOV         Format Operand Operand
@@ -447,6 +453,7 @@ x86_regUsageOfInstr platform instr
 
     COMMENT _           -> noUsage
     LOCATION{}          -> noUsage
+    UNWIND{}            -> noUsage
     DELTA   _           -> noUsage
 
     POPCNT _ src dst -> mkRU (use_R src []) [dst]
@@ -620,6 +627,7 @@ x86_patchRegsOfInstr instr env
     NOP                 -> instr
     COMMENT _           -> instr
     LOCATION {}         -> instr
+    UNWIND {}           -> instr
     DELTA _             -> instr
 
     JXX _ _             -> instr
@@ -783,6 +791,7 @@ x86_isMetaInstr instr
         LOCATION{}      -> True
         LDATA{}         -> True
         NEWBLOCK{}      -> True
+        UNWIND{}        -> True
         DELTA{}         -> True
         _               -> False
 
@@ -964,7 +973,7 @@ allocMoreStack platform slots proc@(CmmProc info lbl live (ListGraph code)) = do
       alloc   = mkStackAllocInstr   platform delta
       dealloc = mkStackDeallocInstr platform delta
 
-      new_blockmap :: BlockEnv BlockId
+      new_blockmap :: LabelMap BlockId
       new_blockmap = mapFromList (zip entries (map mkBlockId uniqs))
 
       insert_stack_insns (BasicBlock id insns)
@@ -1002,7 +1011,7 @@ canShortcut _                    = Nothing
 -- This helper shortcuts a sequence of branches.
 -- The blockset helps avoid following cycles.
 shortcutJump :: (BlockId -> Maybe JumpDest) -> Instr -> Instr
-shortcutJump fn insn = shortcutJump' fn (setEmpty :: BlockSet) insn
+shortcutJump fn insn = shortcutJump' fn (setEmpty :: LabelSet) insn
   where shortcutJump' fn seen insn@(JXX cc id) =
           if setMember id seen then insn
           else case fn id of

@@ -1,33 +1,54 @@
 {-# LANGUAGE CPP, BangPatterns, RecordWildCards, NamedFieldPuns,
-             DeriveGeneric, DeriveDataTypeable, GeneralizedNewtypeDeriving,
              ScopedTypeVariables #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE NoMonoLocalBinds #-}
+{-# LANGUAGE ConstraintKinds #-}
 
--- | 
+-- |
 --
 module Distribution.Client.ProjectBuilding (
-    BuildStatus(..),
+    -- * Dry run phase
+    -- | What bits of the plan will we execute? The dry run does not change
+    -- anything but tells us what will need to be built.
+    rebuildTargetsDryRun,
+    improveInstallPlanWithUpToDatePackages,
+
+    -- ** Build status
+    -- | This is the detailed status information we get from the dry run.
     BuildStatusMap,
+    BuildStatus(..),
     BuildStatusRebuild(..),
     BuildReason(..),
     MonitorChangedReason(..),
-    rebuildTargetsDryRun,
-    rebuildTargets
+    buildStatusToString,
+
+    -- * Build phase
+    -- | Now we actually execute the plan.
+    rebuildTargets,
+    -- ** Build outcomes
+    -- | This is the outcome for each package of executing the plan.
+    -- For each package, did the build succeed or fail?
+    BuildOutcomes,
+    BuildOutcome,
+    BuildResult(..),
+    BuildFailure(..),
+    BuildFailureReason(..),
   ) where
 
 import           Distribution.Client.PackageHash (renderPackageHashInputs)
 import           Distribution.Client.RebuildMonad
 import           Distribution.Client.ProjectConfig
 import           Distribution.Client.ProjectPlanning
+import           Distribution.Client.ProjectPlanning.Types
+import           Distribution.Client.ProjectBuilding.Types
+import           Distribution.Client.Store
 
 import           Distribution.Client.Types
-                   ( PackageLocation(..), GenericReadyPackage(..)
-                   , PackageFixedDeps(..)
-                   , InstalledPackageId, installedPackageId )
+                   hiding (BuildOutcomes, BuildOutcome,
+                           BuildResult(..), BuildFailure(..))
 import           Distribution.Client.InstallPlan
-                   ( GenericInstallPlan, GenericPlanPackage )
+                   ( GenericInstallPlan, GenericPlanPackage, IsUnit )
 import qualified Distribution.Client.InstallPlan as InstallPlan
-import qualified Distribution.Client.ComponentDeps as CD
-import           Distribution.Client.ComponentDeps (ComponentDeps)
 import           Distribution.Client.DistDirLayout
 import           Distribution.Client.FileMonitor
 import           Distribution.Client.SetupWrapper
@@ -36,24 +57,30 @@ import           Distribution.Client.FetchUtils
 import           Distribution.Client.GlobalFlags (RepoContext)
 import qualified Distribution.Client.Tar as Tar
 import           Distribution.Client.Setup (filterConfigureFlags)
+import           Distribution.Client.SourceFiles
 import           Distribution.Client.SrcDist (allPackageSourceFiles)
 import           Distribution.Client.Utils (removeExistingFile)
 
 import           Distribution.Package hiding (InstalledPackageId, installedPackageId)
+import qualified Distribution.PackageDescription as PD
 import           Distribution.InstalledPackageInfo (InstalledPackageInfo)
 import qualified Distribution.InstalledPackageInfo as Installed
+import qualified Distribution.Simple.InstallDirs as InstallDirs
+import           Distribution.Types.BuildType
 import           Distribution.Simple.Program
 import qualified Distribution.Simple.Setup as Cabal
 import           Distribution.Simple.Command (CommandUI)
 import qualified Distribution.Simple.Register as Cabal
-import qualified Distribution.Simple.InstallDirs as InstallDirs
 import           Distribution.Simple.LocalBuildInfo (ComponentName)
+import           Distribution.Simple.Compiler
+                   ( Compiler, compilerId, PackageDB(..) )
 
 import           Distribution.Simple.Utils hiding (matchFileGlob)
 import           Distribution.Version
 import           Distribution.Verbosity
 import           Distribution.Text
 import           Distribution.ParseUtils ( showPWarning )
+import           Distribution.Compat.Graph (IsNode(..))
 
 import           Data.Map (Map)
 import qualified Data.Map as Map
@@ -61,20 +88,13 @@ import           Data.Set (Set)
 import qualified Data.Set as Set
 import qualified Data.ByteString.Lazy as LBS
 
-#if !MIN_VERSION_base(4,8,0)
-import           Control.Applicative
-#endif
 import           Control.Monad
 import           Control.Exception
-import           Control.Concurrent.Async
-import           Control.Concurrent.MVar
-import           Data.List
 import           Data.Maybe
 
 import           System.FilePath
 import           System.IO
 import           System.Directory
-import           System.Exit (ExitCode)
 
 
 ------------------------------------------------------------------------------
@@ -82,21 +102,25 @@ import           System.Exit (ExitCode)
 ------------------------------------------------------------------------------
 --
 -- We start with an 'ElaboratedInstallPlan' that has already been improved by
--- reusing packages from the store. So the remaining packages in the
+-- reusing packages from the store, and pruned to include only the targets of
+-- interest and their dependencies. So the remaining packages in the
 -- 'InstallPlan.Configured' state are ones we either need to build or rebuild.
 --
 -- First, we do a preliminary dry run phase where we work out which packages
 -- we really need to (re)build, and for the ones we do need to build which
 -- build phase to start at.
-
-
-------------------------------------------------------------------------------
--- * Dry run: what bits of the 'ElaboratedInstallPlan' will we execute?
-------------------------------------------------------------------------------
-
--- We split things like this for a couple reasons. Firstly we need to be able
--- to do dry runs, and these need to be reasonably accurate in terms of
--- letting users know what (and why) things are going to be (re)built.
+--
+-- We use this to improve the 'ElaboratedInstallPlan' again by changing
+-- up-to-date 'InstallPlan.Configured' packages to 'InstallPlan.Installed'
+-- so that the build phase will skip them.
+--
+-- Then we execute the plan, that is actually build packages. The outcomes of
+-- trying to build all the packages are collected and returned.
+--
+-- We split things like this (dry run and execute) for a couple reasons.
+-- Firstly we need to be able to do dry runs anyway, and these need to be
+-- reasonably accurate in terms of letting users know what (and why) things
+-- are going to be (re)built.
 --
 -- Given that we need to be able to do dry runs, it would not be great if
 -- we had to repeat all the same work when we do it for real. Not only is
@@ -110,136 +134,54 @@ import           System.Exit (ExitCode)
 -- An additional advantage is that it makes it easier to debug rebuild
 -- errors (ie rebuilding too much or too little), since all the rebuild
 -- decisions are made without making any state changes at the same time
--- (that would make it harder to reproduce the problem sitation).
-
-
--- | The 'BuildStatus' of every package in the 'ElaboratedInstallPlan'
+-- (that would make it harder to reproduce the problem situation).
 --
-type BuildStatusMap = Map InstalledPackageId BuildStatus
+-- Finally, we can use the dry run build status and the build outcomes to
+-- give us some information on the overall status of packages in the project.
+-- This includes limited information about the status of things that were
+-- not actually in the subset of the plan that was used for the dry run or
+-- execution phases. In particular we may know that some packages are now
+-- definitely out of date. See "Distribution.Client.ProjectPlanOutput" for
+-- details.
 
--- | The build status for an individual package. That is, the state that the
--- package is in prior to initiating a (re)build.
---
--- It serves two purposes:
---
---  * For dry-run output, it lets us explain to the user if and why a package
---    is going to be (re)built.
---
---  * It tell us what step to start or resume building from, and carries
---    enough information for us to be able to do so.
---
-data BuildStatus =
 
-     -- | The package is in the 'InstallPlan.PreExisting' state, so does not
-     --   need building.
-     BuildStatusPreExisting
+------------------------------------------------------------------------------
+-- * Dry run: what bits of the 'ElaboratedInstallPlan' will we execute?
+------------------------------------------------------------------------------
 
-     -- | The package has not been downloaded yet, so it will have to be
-     --   downloaded, unpacked and built.
-   | BuildStatusDownload
+-- Refer to ProjectBuilding.Types for details of these important types:
 
-     -- | The package has not been unpacked yet, so it will have to be
-     --   unpacked and built.
-   | BuildStatusUnpack FilePath
-
-     -- | The package exists in a local dir already, and just needs building
-     --   or rebuilding. So this can only happen for 'BuildInplaceOnly' style
-     --   packages.
-   | BuildStatusRebuild FilePath BuildStatusRebuild
-
-     -- | The package exists in a local dir already, and is fully up to date.
-     --   So this package can be put into the 'InstallPlan.Installed' state
-     --   and it does not need to be built.
-   | BuildStatusUpToDate (Maybe InstalledPackageInfo) BuildSuccess
-
--- | For a package that is going to be built or rebuilt, the state it's in now.
---
--- So again, this tells us why a package needs to be rebuilt and what build
--- phases need to be run. The 'MonitorChangedReason' gives us details like
--- which file changed, which is mainly for high verbosity debug output.
---
-data BuildStatusRebuild =
-
-     -- | The package configuration changed, so the configure and build phases
-     --   needs to be (re)run.
-     BuildStatusConfigure (MonitorChangedReason ())
-
-     -- | The configuration has not changed but the build phase needs to be
-     -- rerun. We record the reason the (re)build is needed.
-     --
-     -- The optional registration info here tells us if we've registered the
-     -- package already, or if we stil need to do that after building.
-     --
-   | BuildStatusBuild (Maybe (Maybe InstalledPackageInfo)) BuildReason
-
-data BuildReason =
-     -- | The depencencies of this package have been (re)built so the build
-     -- phase needs to be rerun.
-     --
-     -- The optional registration info here tells us if we've registered the
-     -- package already, or if we stil need to do that after building.
-     --
-     BuildReasonDepsRebuilt
-
-     -- | Changes in files within the package (or first run or corrupt cache) 
-   | BuildReasonFilesChanged (MonitorChangedReason ())
-
-     -- | An important special case is that no files have changed but the
-     -- set of components the /user asked to build/ has changed. We track the
-     -- set of components /we have built/, which of course only grows (until
-     -- some other change resets it).
-     --
-     -- The @Set 'ComponentName'@ is the set of components we have built
-     -- previously. When we update the monitor we take the union of the ones
-     -- we have built previously with the ones the user has asked for this
-     -- time and save those. See 'updatePackageBuildFileMonitor'.
-     --
-   | BuildReasonExtraTargets (Set ComponentName)
-
-     -- | Although we're not going to build any additional targets as a whole,
-     -- we're going to build some part of a component or run a repl or any
-     -- other action that does not result in additional persistent artifacts.
-     -- 
-   | BuildReasonEphemeralTargets
-
--- | Which 'BuildStatus' values indicate we'll have to do some build work of
--- some sort. In particular we use this as part of checking if any of a
--- package's deps have changed.
---
-buildStatusRequiresBuild :: BuildStatus -> Bool
-buildStatusRequiresBuild BuildStatusPreExisting = False
-buildStatusRequiresBuild BuildStatusUpToDate {} = False
-buildStatusRequiresBuild _                      = True
+-- type BuildStatusMap     = ...
+-- data BuildStatus        = ...
+-- data BuildStatusRebuild = ...
+-- data BuildReason        = ...
 
 -- | Do the dry run pass. This is a prerequisite of 'rebuildTargets'.
 --
--- It gives us the 'BuildStatusMap' and also gives us an improved version of
+-- It gives us the 'BuildStatusMap'. This should be used with
+-- 'improveInstallPlanWithUpToDatePackages' to give an improved version of
 -- the 'ElaboratedInstallPlan' with packages switched to the
 -- 'InstallPlan.Installed' state when we find that they're already up to date.
 --
 rebuildTargetsDryRun :: DistDirLayout
+                     -> ElaboratedSharedConfig
                      -> ElaboratedInstallPlan
-                     -> IO (ElaboratedInstallPlan, BuildStatusMap)
-rebuildTargetsDryRun distDirLayout@DistDirLayout{..} = \installPlan -> do
-
+                     -> IO BuildStatusMap
+rebuildTargetsDryRun distDirLayout@DistDirLayout{..} shared =
     -- Do the various checks to work out the 'BuildStatus' of each package
-    pkgsBuildStatus <- foldMInstallPlanDepOrder installPlan dryRunPkg
-
-    -- For 'BuildStatusUpToDate' packages, improve the plan by marking them as
-    -- 'InstallPlan.Installed'.
-    let installPlan' = improveInstallPlanWithUpToDatePackages
-                         installPlan pkgsBuildStatus
-
-    return (installPlan', pkgsBuildStatus)
+    foldMInstallPlanDepOrder dryRunPkg
   where
     dryRunPkg :: ElaboratedPlanPackage
-              -> ComponentDeps [BuildStatus]
+              -> [BuildStatus]
               -> IO BuildStatus
     dryRunPkg (InstallPlan.PreExisting _pkg) _depsBuildStatus =
       return BuildStatusPreExisting
 
+    dryRunPkg (InstallPlan.Installed _pkg) _depsBuildStatus =
+      return BuildStatusInstalled
+
     dryRunPkg (InstallPlan.Configured pkg) depsBuildStatus = do
-      mloc <- checkFetched (pkgSourceLocation pkg)
+      mloc <- checkFetched (elabPkgSourceLocation pkg)
       case mloc of
         Nothing -> return BuildStatusDownload
 
@@ -260,18 +202,12 @@ rebuildTargetsDryRun distDirLayout@DistDirLayout{..} = \installPlan -> do
         Just (RepoTarballPackage _ _ tarball) ->
           dryRunTarballPkg pkg depsBuildStatus tarball
 
-    dryRunPkg (InstallPlan.Processing {}) _ = unexpectedState
-    dryRunPkg (InstallPlan.Installed  {}) _ = unexpectedState
-    dryRunPkg (InstallPlan.Failed     {}) _ = unexpectedState
-
-    unexpectedState = error "rebuildTargetsDryRun: unexpected package state"
-
     dryRunTarballPkg :: ElaboratedConfiguredPackage
-                     -> ComponentDeps [BuildStatus]
+                     -> [BuildStatus]
                      -> FilePath
                      -> IO BuildStatus
     dryRunTarballPkg pkg depsBuildStatus tarball =
-      case pkgBuildStyle pkg of
+      case elabBuildStyle pkg of
         BuildAndInstall  -> return (BuildStatusUnpack tarball)
         BuildInplaceOnly -> do
           -- TODO: [nice to have] use a proper file monitor rather than this dir exists test
@@ -283,7 +219,7 @@ rebuildTargetsDryRun distDirLayout@DistDirLayout{..} = \installPlan -> do
         srcdir = distUnpackedSrcDirectory (packageId pkg)
 
     dryRunLocalPkg :: ElaboratedConfiguredPackage
-                   -> ComponentDeps [BuildStatus]
+                   -> [BuildStatus]
                    -> FilePath
                    -> IO BuildStatus
     dryRunLocalPkg pkg depsBuildStatus srcdir = do
@@ -297,65 +233,59 @@ rebuildTargetsDryRun distDirLayout@DistDirLayout{..} = \installPlan -> do
             return (BuildStatusRebuild srcdir rebuild)
 
           -- No changes, the package is up to date. Use the saved build results.
-          Right (mipkg, buildSuccess) ->
-            return (BuildStatusUpToDate mipkg buildSuccess)
+          Right buildResult ->
+            return (BuildStatusUpToDate buildResult)
       where
         packageFileMonitor =
-          newPackageFileMonitor distDirLayout (packageId pkg)
+          newPackageFileMonitor distDirLayout (elabDistDirParams shared pkg)
 
 
 -- | A specialised traversal over the packages in an install plan.
 --
 -- The packages are visited in dependency order, starting with packages with no
--- depencencies. The result for each package is accumulated into a 'Map' and
+-- dependencies. The result for each package is accumulated into a 'Map' and
 -- returned as the final result. In addition, when visting a package, the
 -- visiting function is passed the results for all the immediate package
--- depencencies. This can be used to propagate information from depencencies.
+-- dependencies. This can be used to propagate information from dependencies.
 --
 foldMInstallPlanDepOrder
-  :: forall m ipkg srcpkg iresult ifailure b.
-     (Monad m,
-      HasUnitId ipkg,   PackageFixedDeps ipkg,
-      HasUnitId srcpkg, PackageFixedDeps srcpkg)
-  => GenericInstallPlan ipkg srcpkg iresult ifailure
-  -> (GenericPlanPackage ipkg srcpkg iresult ifailure ->
-      ComponentDeps [b] -> m b)
-  -> m (Map InstalledPackageId b)
-foldMInstallPlanDepOrder plan0 visit =
-    go Map.empty (InstallPlan.reverseTopologicalOrder plan0)
+  :: forall m ipkg srcpkg b.
+     (Monad m, IsUnit ipkg, IsUnit srcpkg)
+  => (GenericPlanPackage ipkg srcpkg ->
+      [b] -> m b)
+  -> GenericInstallPlan ipkg srcpkg
+  -> m (Map UnitId b)
+foldMInstallPlanDepOrder visit =
+    go Map.empty . InstallPlan.reverseTopologicalOrder
   where
-    go :: Map InstalledPackageId b
-       -> [GenericPlanPackage ipkg srcpkg iresult ifailure]
-       -> m (Map InstalledPackageId b)
+    go :: Map UnitId b
+       -> [GenericPlanPackage ipkg srcpkg]
+       -> m (Map UnitId b)
     go !results [] = return results
 
     go !results (pkg : pkgs) = do
       -- we go in the right order so the results map has entries for all deps
-      let depresults :: ComponentDeps [b]
+      let depresults :: [b]
           depresults =
-            fmap (map (\ipkgid -> let Just result = Map.lookup ipkgid results
-                                   in result))
-                 (depends pkg)
+            map (\ipkgid -> let Just result = Map.lookup ipkgid results
+                              in result)
+                (InstallPlan.depends pkg)
       result <- visit pkg depresults
-      let results' = Map.insert (installedPackageId pkg) result results
+      let results' = Map.insert (nodeKey pkg) result results
       go results' pkgs
 
-improveInstallPlanWithUpToDatePackages :: ElaboratedInstallPlan
-                                       -> BuildStatusMap
+improveInstallPlanWithUpToDatePackages :: BuildStatusMap
                                        -> ElaboratedInstallPlan
-improveInstallPlanWithUpToDatePackages installPlan pkgsBuildStatus =
-    replaceWithPreInstalled installPlan
-      [ (installedPackageId pkg, mipkg, buildSuccess)
-      | InstallPlan.Configured pkg
-          <- InstallPlan.reverseTopologicalOrder installPlan
-      , let ipkgid = installedPackageId pkg
-            Just pkgBuildStatus = Map.lookup ipkgid pkgsBuildStatus
-      , BuildStatusUpToDate mipkg buildSuccess <- [pkgBuildStatus]
-      ]
+                                       -> ElaboratedInstallPlan
+improveInstallPlanWithUpToDatePackages pkgsBuildStatus =
+    InstallPlan.installed canPackageBeImproved
   where
-    replaceWithPreInstalled =
-      foldl' (\plan (ipkgid, mipkg, buildSuccess) ->
-                InstallPlan.preinstalled ipkgid mipkg buildSuccess plan)
+    canPackageBeImproved pkg =
+      case Map.lookup (installedUnitId pkg) pkgsBuildStatus of
+        Just BuildStatusUpToDate {} -> True
+        Just _                      -> False
+        Nothing -> error $ "improveInstallPlanWithUpToDatePackages: "
+                        ++ display (packageId pkg) ++ " not in status map"
 
 
 -----------------------------
@@ -374,26 +304,34 @@ improveInstallPlanWithUpToDatePackages installPlan pkgsBuildStatus =
 --
 data PackageFileMonitor = PackageFileMonitor {
        pkgFileMonitorConfig :: FileMonitor ElaboratedConfiguredPackage (),
-       pkgFileMonitorBuild  :: FileMonitor (Set ComponentName) BuildSuccess,
+       pkgFileMonitorBuild  :: FileMonitor (Set ComponentName) BuildResultMisc,
        pkgFileMonitorReg    :: FileMonitor () (Maybe InstalledPackageInfo)
      }
 
-newPackageFileMonitor :: DistDirLayout -> PackageId -> PackageFileMonitor
-newPackageFileMonitor DistDirLayout{distPackageCacheFile} pkgid =
+-- | This is all the components of the 'BuildResult' other than the
+-- @['InstalledPackageInfo']@.
+--
+-- We have to split up the 'BuildResult' components since they get produced
+-- at different times (or rather, when different things change).
+--
+type BuildResultMisc = (DocsResult, TestsResult)
+
+newPackageFileMonitor :: DistDirLayout -> DistDirParams -> PackageFileMonitor
+newPackageFileMonitor DistDirLayout{distPackageCacheFile} dparams =
     PackageFileMonitor {
       pkgFileMonitorConfig =
-        newFileMonitor (distPackageCacheFile pkgid "config"),
+        newFileMonitor (distPackageCacheFile dparams "config"),
 
       pkgFileMonitorBuild =
         FileMonitor {
-          fileMonitorCacheFile = distPackageCacheFile pkgid "build",
+          fileMonitorCacheFile = distPackageCacheFile dparams "build",
           fileMonitorKeyValid  = \componentsToBuild componentsAlreadyBuilt ->
             componentsToBuild `Set.isSubsetOf` componentsAlreadyBuilt,
           fileMonitorCheckIfOnlyValueChanged = True
         },
 
       pkgFileMonitorReg =
-        newFileMonitor (distPackageCacheFile pkgid "registration")
+        newFileMonitor (distPackageCacheFile dparams "registration")
     }
 
 -- | Helper function for 'checkPackageFileMonitorChanged',
@@ -404,8 +342,8 @@ newPackageFileMonitor DistDirLayout{distPackageCacheFile} pkgid =
 --
 packageFileMonitorKeyValues :: ElaboratedConfiguredPackage
                             -> (ElaboratedConfiguredPackage, Set ComponentName)
-packageFileMonitorKeyValues pkg =
-    (pkgconfig, buildComponents)
+packageFileMonitorKeyValues elab =
+    (elab_config, buildComponents)
   where
     -- The first part is the value used to guard (re)configuring the package.
     -- That is, if this value changes then we will reconfigure.
@@ -414,17 +352,19 @@ packageFileMonitorKeyValues pkg =
     -- do not affect the configure step need to be nulled out. Those parts are
     -- the specific targets that we're going to build.
     --
-    pkgconfig = pkg {
-      pkgBuildTargets  = [],
-      pkgReplTarget    = Nothing,
-      pkgBuildHaddocks = False
-    }
+    elab_config =
+        elab {
+            elabBuildTargets  = [],
+            elabTestTargets   = [],
+            elabReplTarget    = Nothing,
+            elabBuildHaddocks = False
+        }
 
     -- The second part is the value used to guard the build step. So this is
     -- more or less the opposite of the first part, as it's just the info about
     -- what targets we're going to build.
     --
-    buildComponents = pkgBuildTargetWholeComponents pkg
+    buildComponents = elabBuildTargetWholeComponents elab
 
 -- | Do all the checks on whether a package has changed and thus needs either
 -- rebuilding or reconfiguring and rebuilding.
@@ -432,10 +372,8 @@ packageFileMonitorKeyValues pkg =
 checkPackageFileMonitorChanged :: PackageFileMonitor
                                -> ElaboratedConfiguredPackage
                                -> FilePath
-                               -> ComponentDeps [BuildStatus]
-                               -> IO (Either BuildStatusRebuild
-                                            (Maybe InstalledPackageInfo,
-                                             BuildSuccess))
+                               -> [BuildStatus]
+                               -> IO (Either BuildStatusRebuild BuildResult)
 checkPackageFileMonitorChanged PackageFileMonitor{..}
                                pkg srcdir depsBuildStatus = do
     --TODO: [nice to have] some debug-level message about file changes, like rerunIfChanged
@@ -450,8 +388,8 @@ checkPackageFileMonitorChanged PackageFileMonitor{..}
       MonitorUnchanged () _
           -- The configChanged here includes the identity of the dependencies,
           -- so depsBuildStatus is just needed for the changes in the content
-          -- of depencencies.
-        | any buildStatusRequiresBuild (CD.flatDeps depsBuildStatus) -> do
+          -- of dependencies.
+        | any buildStatusRequiresBuild depsBuildStatus -> do
             regChanged <- checkFileMonitorChanged pkgFileMonitorReg srcdir ()
             let mreg = changedToMaybe regChanged
             return (Left (BuildStatusBuild mreg BuildReasonDepsRebuilt))
@@ -489,8 +427,14 @@ checkPackageFileMonitorChanged PackageFileMonitor{..}
                 where
                   buildReason = BuildReasonEphemeralTargets
 
-              (MonitorUnchanged buildSuccess _, MonitorUnchanged mipkg _) ->
-                return (Right (mipkg, buildSuccess))
+              (MonitorUnchanged buildResult _, MonitorUnchanged _ _) ->
+                  return $ Right BuildResult {
+                    buildResultDocs    = docsResult,
+                    buildResultTests   = testsResult,
+                    buildResultLogFile = Nothing
+                  }
+                where
+                  (docsResult, testsResult) = buildResult
   where
     (pkgconfig, buildComponents) = packageFileMonitorKeyValues pkg
     changedToMaybe (MonitorChanged     _) = Nothing
@@ -513,15 +457,14 @@ updatePackageBuildFileMonitor :: PackageFileMonitor
                               -> MonitorTimestamp
                               -> ElaboratedConfiguredPackage
                               -> BuildStatusRebuild
-                              -> [FilePath]
-                              -> BuildSuccess
+                              -> [MonitorFilePath]
+                              -> BuildResultMisc
                               -> IO ()
 updatePackageBuildFileMonitor PackageFileMonitor{pkgFileMonitorBuild}
                               srcdir timestamp pkg pkgBuildStatus
-                              allSrcFiles buildSuccess =
+                              monitors buildResult =
     updateFileMonitor pkgFileMonitorBuild srcdir (Just timestamp)
-                      (map monitorFileHashed allSrcFiles)
-                      buildComponents' buildSuccess
+                      monitors buildComponents' buildResult
   where
     (_pkgconfig, buildComponents) = packageFileMonitorKeyValues pkg
 
@@ -556,36 +499,58 @@ invalidatePackageRegFileMonitor PackageFileMonitor{pkgFileMonitorReg} =
 -- * Doing it: executing an 'ElaboratedInstallPlan'
 ------------------------------------------------------------------------------
 
+-- Refer to ProjectBuilding.Types for details of these important types:
+
+-- type BuildOutcomes = ...
+-- type BuildOutcome  = ...
+-- data BuildResult   = ...
+-- data BuildFailure  = ...
+-- data BuildFailureReason = ...
 
 -- | Build things for real.
 --
--- It requires the 'BuildStatusMap' gatthered by 'rebuildTargetsDryRun'.
+-- It requires the 'BuildStatusMap' gathered by 'rebuildTargetsDryRun'.
 --
 rebuildTargets :: Verbosity
                -> DistDirLayout
+               -> StoreDirLayout
                -> ElaboratedInstallPlan
                -> ElaboratedSharedConfig
                -> BuildStatusMap
                -> BuildTimeSettings
-               -> IO ElaboratedInstallPlan
+               -> IO BuildOutcomes
 rebuildTargets verbosity
                distDirLayout@DistDirLayout{..}
+               storeDirLayout
                installPlan
-               sharedPackageConfig
+               sharedPackageConfig@ElaboratedSharedConfig {
+                 pkgConfigCompiler      = compiler,
+                 pkgConfigCompilerProgs = progdb
+               }
                pkgsBuildStatus
-               buildSettings@BuildTimeSettings{buildSettingNumJobs} = do
+               buildSettings@BuildTimeSettings{
+                 buildSettingNumJobs,
+                 buildSettingKeepGoing
+               } = do
 
     -- Concurrency control: create the job controller and concurrency limits
     -- for downloading, building and installing.
-    jobControl    <- if isParallelBuild then newParallelJobControl
-                                        else newSerialJobControl
-    buildLimit    <- newJobLimit buildSettingNumJobs
-    installLock   <- newLock -- serialise installation
+    jobControl    <- if isParallelBuild
+                       then newParallelJobControl buildSettingNumJobs
+                       else newSerialJobControl
+    registerLock  <- newLock -- serialise registration
     cacheLock     <- newLock -- serialise access to setup exe cache
                              --TODO: [code cleanup] eliminate setup exe cache
 
-    createDirectoryIfMissingVerbose verbosity False distBuildRootDirectory
-    createDirectoryIfMissingVerbose verbosity False distTempDirectory
+    debug verbosity $
+        "Executing install plan "
+     ++ if isParallelBuild
+          then " in parallel using " ++ show buildSettingNumJobs ++ " threads."
+          else " serially."
+
+    createDirectoryIfMissingVerbose verbosity True distBuildRootDirectory
+    createDirectoryIfMissingVerbose verbosity True distTempDirectory
+    mapM_ (createPackageDBIfMissing verbosity compiler progdb) packageDBsToUse
 
     -- Before traversing the install plan, pre-emptively find all packages that
     -- will need to be downloaded and start downloading them.
@@ -593,42 +558,73 @@ rebuildTargets verbosity
                           installPlan pkgsBuildStatus $ \downloadMap ->
 
       -- For each package in the plan, in dependency order, but in parallel...
-      executeInstallPlan verbosity jobControl installPlan $ \pkg ->
-        handle (return . BuildFailure) $ --TODO: review exception handling
+      InstallPlan.execute jobControl keepGoing
+                          (BuildFailure Nothing . DependentFailed . packageId)
+                          installPlan $ \pkg ->
+        --TODO: review exception handling
+        handle (\(e :: BuildFailure) -> return (Left e)) $ fmap Right $
 
-        let ipkgid = installedPackageId pkg
-            Just pkgBuildStatus = Map.lookup ipkgid pkgsBuildStatus in
+        let uid = installedUnitId pkg
+            Just pkgBuildStatus = Map.lookup uid pkgsBuildStatus in
 
         rebuildTarget
           verbosity
           distDirLayout
+          storeDirLayout
           buildSettings downloadMap
-          buildLimit installLock cacheLock 
+          registerLock cacheLock
           sharedPackageConfig
-          pkg
+          installPlan pkg
           pkgBuildStatus
   where
     isParallelBuild = buildSettingNumJobs >= 2
-    withRepoCtx     = projectConfigWithBuilderRepoContext verbosity 
+    keepGoing       = buildSettingKeepGoing
+    withRepoCtx     = projectConfigWithBuilderRepoContext verbosity
                         buildSettings
+    packageDBsToUse = -- all the package dbs we may need to create
+      (Set.toList . Set.fromList)
+        [ pkgdb
+        | InstallPlan.Configured elab <- InstallPlan.toList installPlan
+        , pkgdb <- concat [ elabBuildPackageDBStack elab
+                          , elabRegisterPackageDBStack elab
+                          , elabSetupPackageDBStack elab ]
+        ]
+
+
+-- | Create a package DB if it does not currently exist. Note that this action
+-- is /not/ safe to run concurrently.
+--
+createPackageDBIfMissing :: Verbosity -> Compiler -> ProgramDb
+                         -> PackageDB -> IO ()
+createPackageDBIfMissing verbosity compiler progdb
+                         (SpecificPackageDB dbPath) = do
+    exists <- Cabal.doesPackageDBExist dbPath
+    unless exists $ do
+      createDirectoryIfMissingVerbose verbosity True (takeDirectory dbPath)
+      Cabal.createPackageDB verbosity compiler progdb False dbPath
+createPackageDBIfMissing _ _ _ _ = return ()
+
 
 -- | Given all the context and resources, (re)build an individual package.
 --
 rebuildTarget :: Verbosity
               -> DistDirLayout
+              -> StoreDirLayout
               -> BuildTimeSettings
-              -> AsyncDownloadMap
-              -> JobLimit -> Lock -> Lock
+              -> AsyncFetchMap
+              -> Lock -> Lock
               -> ElaboratedSharedConfig
+              -> ElaboratedInstallPlan
               -> ElaboratedReadyPackage
               -> BuildStatus
               -> IO BuildResult
 rebuildTarget verbosity
               distDirLayout@DistDirLayout{distBuildDirectory}
+              storeDirLayout
               buildSettings downloadMap
-              buildLimit installLock cacheLock
+              registerLock cacheLock
               sharedPackageConfig
-              rpkg@(ReadyPackage pkg _)
+              plan rpkg@(ReadyPackage pkg)
               pkgBuildStatus =
 
     -- We rely on the 'BuildStatus' to decide which phase to start from:
@@ -639,25 +635,26 @@ rebuildTarget verbosity
 
       -- TODO: perhaps re-nest the types to make these impossible
       BuildStatusPreExisting {} -> unexpectedState
+      BuildStatusInstalled   {} -> unexpectedState
       BuildStatusUpToDate    {} -> unexpectedState
   where
     unexpectedState = error "rebuildTarget: unexpected package status"
 
     downloadPhase = do
-        downsrcloc <- waitAsyncPackageDownload verbosity downloadMap pkg
+        downsrcloc <- annotateFailureNoLog DownloadFailed $
+                        waitAsyncPackageDownload verbosity downloadMap pkg
         case downsrcloc of
           DownloadedTarball tarball -> unpackTarballPhase tarball
           --TODO: [nice to have] git/darcs repos etc
 
 
     unpackTarballPhase tarball =
-      withJobLimit buildLimit $
         withTarballLocalDirectory
           verbosity distDirLayout tarball
-          (packageId pkg) (pkgBuildStyle pkg)
-          (pkgDescriptionOverride pkg) $
+          (packageId pkg) (elabDistDirParams sharedPackageConfig pkg) (elabBuildStyle pkg)
+          (elabPkgDescriptionOverride pkg) $
 
-          case pkgBuildStyle pkg of
+          case elabBuildStyle pkg of
             BuildAndInstall  -> buildAndInstall
             BuildInplaceOnly -> buildInplace buildStatus
               where
@@ -668,17 +665,16 @@ rebuildTarget verbosity
     -- would only start from download or unpack phases.
     --
     rebuildPhase buildStatus srcdir =
-        assert (pkgBuildStyle pkg == BuildInplaceOnly) $
+        assert (elabBuildStyle pkg == BuildInplaceOnly) $
 
-        withJobLimit buildLimit $
           buildInplace buildStatus srcdir builddir
       where
-        builddir = distBuildDirectory (packageId pkg)
+        builddir = distBuildDirectory (elabDistDirParams sharedPackageConfig pkg)
 
     buildAndInstall srcdir builddir =
         buildAndInstallUnpackedPackage
-          verbosity distDirLayout
-          buildSettings installLock cacheLock
+          verbosity distDirLayout storeDirLayout
+          buildSettings registerLock cacheLock
           sharedPackageConfig
           rpkg
           srcdir builddir'
@@ -690,17 +686,60 @@ rebuildTarget verbosity
         --TODO: [nice to have] use a relative build dir rather than absolute
         buildInplaceUnpackedPackage
           verbosity distDirLayout
-          buildSettings cacheLock
+          buildSettings registerLock cacheLock
           sharedPackageConfig
-          rpkg
+          plan rpkg
           buildStatus
           srcdir builddir
 
 --TODO: [nice to have] do we need to use a with-style for the temp files for downloading http
 -- packages, or are we going to cache them persistently?
 
-type AsyncDownloadMap = Map (PackageLocation (Maybe FilePath))
-                            (MVar DownloadedSourceLocation)
+-- | Given the current 'InstallPlan' and 'BuildStatusMap', select all the
+-- packages we have to download and fork off an async action to download them.
+-- We download them in dependency order so that the one's we'll need
+-- first are the ones we will start downloading first.
+--
+-- The body action is passed a map from those packages (identified by their
+-- location) to a completion var for that package. So the body action should
+-- lookup the location and use 'waitAsyncPackageDownload' to get the result.
+--
+asyncDownloadPackages :: Verbosity
+                      -> ((RepoContext -> IO a) -> IO a)
+                      -> ElaboratedInstallPlan
+                      -> BuildStatusMap
+                      -> (AsyncFetchMap -> IO a)
+                      -> IO a
+asyncDownloadPackages verbosity withRepoCtx installPlan pkgsBuildStatus body
+  | null pkgsToDownload = body Map.empty
+  | otherwise           = withRepoCtx $ \repoctx ->
+                            asyncFetchPackages verbosity repoctx
+                                               pkgsToDownload body
+  where
+    pkgsToDownload =
+      ordNub $
+      [ elabPkgSourceLocation elab
+      | InstallPlan.Configured elab
+         <- InstallPlan.reverseTopologicalOrder installPlan
+      , let uid = installedUnitId elab
+            Just pkgBuildStatus = Map.lookup uid pkgsBuildStatus
+      , BuildStatusDownload <- [pkgBuildStatus]
+      ]
+
+
+-- | Check if a package needs downloading, and if so expect to find a download
+-- in progress in the given 'AsyncFetchMap' and wait on it to finish.
+--
+waitAsyncPackageDownload :: Verbosity
+                         -> AsyncFetchMap
+                         -> ElaboratedConfiguredPackage
+                         -> IO DownloadedSourceLocation
+waitAsyncPackageDownload verbosity downloadMap elab = do
+    pkgloc <- waitAsyncFetchPackage verbosity downloadMap
+                                    (elabPkgSourceLocation elab)
+    case downloadedSourceLocation pkgloc of
+      Just loc -> return loc
+      Nothing  -> fail "waitAsyncPackageDownload: unexpected source location"
 
 data DownloadedSourceLocation = DownloadedTarball FilePath
                               --TODO: [nice to have] git/darcs repos etc
@@ -713,147 +752,42 @@ downloadedSourceLocation pkgloc =
       RepoTarballPackage _ _ tarball -> Just (DownloadedTarball tarball)
       _                              -> Nothing
 
--- | Given the current 'InstallPlan' and 'BuildStatusMap', select all the
--- packages we have to download and fork off an async action to download them.
--- We download them in dependency order so that the one's we'll need
--- first are the ones we will start downloading first.
---
--- The body action is passed a map from those packages (identified by their
--- location) to a completion var for that package. So the body action should
--- lookup the location and use 'waitAsyncPackageDownload' to get the result.
---
-asyncDownloadPackages :: Verbosity
-                      -> ((RepoContext -> IO ()) -> IO ())
-                      -> ElaboratedInstallPlan
-                      -> BuildStatusMap
-                      -> (AsyncDownloadMap -> IO a)
-                      -> IO a
-asyncDownloadPackages verbosity withRepoCtx installPlan pkgsBuildStatus body
-  | null pkgsToDownload = body Map.empty
-  | otherwise = do
-    --TODO: [research required] use parallel downloads? if so, use the fetchLimit
 
-    asyncDownloadVars <- mapM (\loc -> (,) loc <$> newEmptyMVar) pkgsToDownload
-
-    let downloadAction :: IO ()
-        downloadAction =
-          withRepoCtx $ \repoctx ->
-            forM_ asyncDownloadVars $ \(pkgloc, var) -> do
-              Just scrloc <- downloadedSourceLocation <$>
-                             fetchPackage verbosity repoctx pkgloc
-              putMVar var scrloc
-
-    withAsync downloadAction $ \_ ->
-      body (Map.fromList asyncDownloadVars)
-  where
-    pkgsToDownload = 
-      [ pkgSourceLocation pkg
-      | InstallPlan.Configured pkg
-         <- InstallPlan.reverseTopologicalOrder installPlan
-      , let ipkgid = installedPackageId pkg
-            Just pkgBuildStatus = Map.lookup ipkgid pkgsBuildStatus
-      , BuildStatusDownload <- [pkgBuildStatus]
-      ]
-
-
--- | Check if a package needs downloading, and if so expect to find a download
--- in progress in the given 'AsyncDownloadMap' and wait on it to finish.
---
-waitAsyncPackageDownload :: Verbosity
-                         -> AsyncDownloadMap
-                         -> ElaboratedConfiguredPackage
-                         -> IO DownloadedSourceLocation
-waitAsyncPackageDownload verbosity downloadMap pkg =
-    case Map.lookup (pkgSourceLocation pkg) downloadMap of
-      Just hnd -> do
-        debug verbosity $
-          "Waiting for download of " ++ display (packageId pkg) ++ " to finish"
-        --TODO: [required eventually] do the exception handling on download stuff
-        takeMVar hnd
-      Nothing ->
-        fail "waitAsyncPackageDownload: package not being download"
-
-
-executeInstallPlan
-  :: forall ipkg srcpkg iresult.
-     (HasUnitId ipkg,   PackageFixedDeps ipkg,
-      HasUnitId srcpkg, PackageFixedDeps srcpkg)
-  => Verbosity
-  -> JobControl IO ( GenericReadyPackage srcpkg ipkg
-                   , GenericBuildResult ipkg iresult BuildFailure )
-  -> GenericInstallPlan ipkg srcpkg iresult BuildFailure
-  -> (    GenericReadyPackage srcpkg ipkg
-       -> IO (GenericBuildResult ipkg iresult BuildFailure))
-  -> IO (GenericInstallPlan ipkg srcpkg iresult BuildFailure)
-executeInstallPlan verbosity jobCtl plan0 installPkg =
-    tryNewTasks 0 plan0
-  where
-    tryNewTasks taskCount plan = do
-      case InstallPlan.ready plan of
-        [] | taskCount == 0 -> return plan
-           | otherwise      -> waitForTasks taskCount plan
-        pkgs                -> do
-          sequence_
-            [ do debug verbosity $ "Ready to install " ++ display pkgid
-                 spawnJob jobCtl $ do
-                   buildResult <- installPkg pkg
-                   return (pkg, buildResult)
-            | pkg <- pkgs
-            , let pkgid = packageId pkg
-            ]
-
-          let taskCount' = taskCount + length pkgs
-              plan'      = InstallPlan.processing pkgs plan
-          waitForTasks taskCount' plan'
-
-    waitForTasks taskCount plan = do
-      debug verbosity $ "Waiting for install task to finish..."
-      (pkg, buildResult) <- collectJob jobCtl
-      let taskCount' = taskCount-1
-          plan'      = updatePlan pkg buildResult plan
-      tryNewTasks taskCount' plan'
-
-    updatePlan :: GenericReadyPackage srcpkg ipkg
-               -> GenericBuildResult ipkg iresult BuildFailure
-               -> GenericInstallPlan ipkg srcpkg iresult BuildFailure
-               -> GenericInstallPlan ipkg srcpkg iresult BuildFailure
-    updatePlan pkg (BuildSuccess mipkg buildSuccess) =
-        InstallPlan.completed (installedPackageId pkg) mipkg buildSuccess
-
-    updatePlan pkg (BuildFailure buildFailure) =
-        InstallPlan.failed (installedPackageId pkg) buildFailure depsFailure
-      where
-        depsFailure = DependentFailed (packageId pkg)
-        -- So this first pkgid failed for whatever reason (buildFailure).
-        -- All the other packages that depended on this pkgid, which we
-        -- now cannot build, we mark as failing due to 'DependentFailed'
-        -- which kind of means it was not their fault.
 
 
 -- | Ensure that the package is unpacked in an appropriate directory, either
--- a temporary one or a persistent one under the shared dist directory. 
+-- a temporary one or a persistent one under the shared dist directory.
 --
 withTarballLocalDirectory
   :: Verbosity
   -> DistDirLayout
   -> FilePath
   -> PackageId
+  -> DistDirParams
   -> BuildStyle
   -> Maybe CabalFileText
-  -> (FilePath -> FilePath -> IO a)
+  -> (FilePath -> -- Source directory
+      FilePath -> -- Build directory
+      IO a)
   -> IO a
 withTarballLocalDirectory verbosity distDirLayout@DistDirLayout{..}
-                          tarball pkgid buildstyle pkgTextOverride
+                          tarball pkgid dparams buildstyle pkgTextOverride
                           buildPkg  =
       case buildstyle of
-        -- In this case we make a temp dir, unpack the tarball to there and
-        -- build and install it from that temp dir.
+        -- In this case we make a temp dir (e.g. tmp/src2345/), unpack
+        -- the tarball to it (e.g. tmp/src2345/foo-1.0/), and for
+        -- compatibility we put the dist dir within it
+        -- (i.e. tmp/src2345/foo-1.0/dist/).
+        --
+        -- Unfortunately, a few custom Setup.hs scripts do not respect
+        -- the --builddir flag and always look for it at ./dist/ so
+        -- this way we avoid breaking those packages
         BuildAndInstall ->
-          withTempDirectory verbosity distTempDirectory
-                            (display (packageName pkgid)) $ \tmpdir -> do
-            unpackPackageTarball verbosity tarball tmpdir
+          let tmpdir = distTempDirectory in
+          withTempDirectory verbosity tmpdir "src"   $ \unpackdir -> do
+            unpackPackageTarball verbosity tarball unpackdir
                                  pkgid pkgTextOverride
-            let srcdir   = tmpdir </> display pkgid
+            let srcdir   = unpackdir </> display pkgid
                 builddir = srcdir </> "dist"
             buildPkg srcdir builddir
 
@@ -863,15 +797,15 @@ withTarballLocalDirectory verbosity distDirLayout@DistDirLayout{..}
         BuildInplaceOnly -> do
           let srcrootdir = distUnpackedSrcRootDirectory
               srcdir     = distUnpackedSrcDirectory pkgid
-              builddir   = distBuildDirectory pkgid
+              builddir   = distBuildDirectory dparams
           -- TODO: [nice to have] use a proper file monitor rather than this dir exists test
           exists <- doesDirectoryExist srcdir
           unless exists $ do
-            createDirectoryIfMissingVerbose verbosity False srcrootdir
+            createDirectoryIfMissingVerbose verbosity True srcrootdir
             unpackPackageTarball verbosity tarball srcrootdir
                                  pkgid pkgTextOverride
             moveTarballShippedDistDirectory verbosity distDirLayout
-                                            srcrootdir pkgid
+                                            srcrootdir pkgid dparams
           buildPkg srcdir builddir
 
 
@@ -880,7 +814,7 @@ unpackPackageTarball :: Verbosity -> FilePath -> FilePath
                      -> IO ()
 unpackPackageTarball verbosity tarball parentdir pkgid pkgTextOverride =
     --TODO: [nice to have] switch to tar package and catch tar exceptions
-    annotateFailure UnpackFailed $ do
+    annotateFailureNoLog UnpackFailed $ do
 
       -- Unpack the tarball
       --
@@ -891,7 +825,7 @@ unpackPackageTarball verbosity tarball parentdir pkgid pkgTextOverride =
       --
       exists <- doesFileExist cabalFile
       when (not exists) $
-        die $ "Package .cabal file not found in the tarball: " ++ cabalFile
+        die' verbosity $ "Package .cabal file not found in the tarball: " ++ cabalFile
 
       -- Overwrite the .cabal with the one from the index, when appropriate
       --
@@ -917,9 +851,9 @@ unpackPackageTarball verbosity tarball parentdir pkgid pkgTextOverride =
 -- system, though we'll still need to keep this hack for older packages.
 --
 moveTarballShippedDistDirectory :: Verbosity -> DistDirLayout
-                                -> FilePath -> PackageId -> IO ()
+                                -> FilePath -> PackageId -> DistDirParams -> IO ()
 moveTarballShippedDistDirectory verbosity DistDirLayout{distBuildDirectory}
-                                parentdir pkgid = do
+                                parentdir pkgid dparams = do
     distDirExists <- doesDirectoryExist tarballDistDir
     when distDirExists $ do
       debug verbosity $ "Moving '" ++ tarballDistDir ++ "' to '"
@@ -928,11 +862,12 @@ moveTarballShippedDistDirectory verbosity DistDirLayout{distBuildDirectory}
       renameDirectory tarballDistDir targetDistDir
   where
     tarballDistDir = parentdir </> display pkgid </> "dist"
-    targetDistDir  = distBuildDirectory pkgid
+    targetDistDir  = distBuildDirectory dparams
 
 
 buildAndInstallUnpackedPackage :: Verbosity
                                -> DistDirLayout
+                               -> StoreDirLayout
                                -> BuildTimeSettings -> Lock -> Lock
                                -> ElaboratedSharedConfig
                                -> ElaboratedReadyPackage
@@ -940,20 +875,23 @@ buildAndInstallUnpackedPackage :: Verbosity
                                -> IO BuildResult
 buildAndInstallUnpackedPackage verbosity
                                DistDirLayout{distTempDirectory}
+                               storeDirLayout@StoreDirLayout {
+                                 storePackageDBStack
+                               }
                                BuildTimeSettings {
                                  buildSettingNumJobs,
                                  buildSettingLogFile
                                }
-                               installLock cacheLock
+                               registerLock cacheLock
                                pkgshared@ElaboratedSharedConfig {
                                  pkgConfigPlatform      = platform,
                                  pkgConfigCompiler      = compiler,
                                  pkgConfigCompilerProgs = progdb
                                }
-                               rpkg@(ReadyPackage pkg _deps)
+                               rpkg@(ReadyPackage pkg)
                                srcdir builddir = do
 
-    createDirectoryIfMissingVerbose verbosity False builddir
+    createDirectoryIfMissingVerbose verbosity True builddir
     initLogFile
 
     --TODO: [code cleanup] deal consistently with talking to older Setup.hs versions, much like
@@ -966,112 +904,136 @@ buildAndInstallUnpackedPackage verbosity
     --TODO: [required feature] docs and tests
     --TODO: [required feature] sudo re-exec
 
+    let dispname = case elabPkgOrComp pkg of
+            ElabPackage _ -> display pkgid
+                ++ " (all, legacy fallback)"
+            ElabComponent comp -> display pkgid
+                ++ " (" ++ maybe "custom" display (compComponentName comp) ++ ")"
+
     -- Configure phase
     when isParallelBuild $
-      notice verbosity $ "Configuring " ++ display pkgid ++ "..."
-    annotateFailure ConfigureFailed $
-      setup configureCommand configureFlags
+      notice verbosity $ "Configuring " ++ dispname ++ "..."
+    annotateFailure mlogFile ConfigureFailed $
+      setup' configureCommand configureFlags configureArgs
 
     -- Build phase
     when isParallelBuild $
-      notice verbosity $ "Building " ++ display pkgid ++ "..."
-    annotateFailure BuildFailed $
+      notice verbosity $ "Building " ++ dispname ++ "..."
+    annotateFailure mlogFile BuildFailed $
       setup buildCommand buildFlags
 
     -- Install phase
-    mipkg <-
-      criticalSection installLock $ 
-      annotateFailure InstallFailed $ do
-      --TODO: [research required] do we need the installLock for copying? can we not do that in
-      -- parallel? Isn't it just registering that we have to lock for?
+    annotateFailure mlogFile InstallFailed $ do
 
-      --TODO: [required eventually] need to lock installing this ipkig so other processes don't
-      -- stomp on our files, since we don't have ABI compat, not safe to replace
+      let copyPkgFiles tmpDir = do
+            setup Cabal.copyCommand (copyFlags tmpDir)
+            -- Note that the copy command has put the files into
+            -- @$tmpDir/$prefix@ so we need to return this dir so
+            -- the store knows which dir will be the final store entry.
+            let prefix   = dropDrive (InstallDirs.prefix (elabInstallDirs pkg))
+                entryDir = tmpDir </> prefix
+            LBS.writeFile
+              (entryDir </> "cabal-hash.txt")
+              (renderPackageHashInputs (packageHashInputs pkgshared pkg))
+            -- here's where we could keep track of the installed files ourselves
+            -- if we wanted to by making a manifest of the files in the tmp dir
+            return entryDir
 
-      -- TODO: [required eventually] note that for nix-style installations it is not necessary to do
-      -- the 'withWin32SelfUpgrade' dance, but it would be necessary for a
-      -- shared bin dir.
+          registerPkg
+            | not (elabRequiresRegistration pkg) =
+              debug verbosity $
+                "registerPkg: elab does NOT require registration for " ++ display uid
+            | otherwise = do
+            -- We register ourselves rather than via Setup.hs. We need to
+            -- grab and modify the InstalledPackageInfo. We decide what
+            -- the installed package id is, not the build system.
+            ipkg0 <- generateInstalledPackageInfo
+            let ipkg = ipkg0 { Installed.installedUnitId = uid }
+            assert (   elabRegisterPackageDBStack pkg
+                    == storePackageDBStack compid) (return ())
+            criticalSection registerLock $
+              Cabal.registerPackage
+                verbosity compiler progdb
+                (storePackageDBStack compid) ipkg
+                Cabal.defaultRegisterOptions {
+                  Cabal.registerMultiInstance      = True,
+                  Cabal.registerSuppressFilesCheck = True
+                }
+
 
       -- Actual installation
-      setup Cabal.copyCommand copyFlags
-      
-      LBS.writeFile
-        (InstallDirs.prefix (pkgInstallDirs pkg) </> "cabal-hash.txt") $
-        (renderPackageHashInputs (packageHashInputs pkgshared pkg))
+      void $ newStoreEntry verbosity storeDirLayout
+                           compid uid
+                           copyPkgFiles registerPkg
 
-      -- here's where we could keep track of the installed files ourselves if
-      -- we wanted by calling copy to an image dir and then we would make a
-      -- manifest and move it to its final location
+    --TODO: [nice to have] we currently rely on Setup.hs copy to do the right
+    -- thing. Although we do copy into an image dir and do the move into the
+    -- final location ourselves, perhaps we ought to do some sanity checks on
+    -- the image dir first.
 
-      --TODO: [nice to have] we should actually have it make an image in store/incomming and
-      -- then when it's done, move it to its final location, to reduce problems
-      -- with installs failing half-way. Could also register and then move.
-
-      -- For libraries, grab the package configuration file
-      -- and register it ourselves
-      if pkgRequiresRegistration pkg
-        then do
-          ipkg <- generateInstalledPackageInfo
-          -- We register ourselves rather than via Setup.hs. We need to
-          -- grab and modify the InstalledPackageInfo. We decide what
-          -- the installed package id is, not the build system.
-          let ipkg' = ipkg { Installed.installedUnitId = ipkgid }
-          Cabal.registerPackage verbosity compiler progdb
-                                True -- multi-instance, nix style
-                                (pkgRegisterPackageDBStack pkg) ipkg'
-          return (Just ipkg')
-        else return Nothing
+    -- TODO: [required eventually] note that for nix-style installations it is not necessary to do
+    -- the 'withWin32SelfUpgrade' dance, but it would be necessary for a
+    -- shared bin dir.
 
     --TODO: [required feature] docs and test phases
     let docsResult  = DocsNotTried
         testsResult = TestsNotTried
 
-    return (BuildSuccess mipkg (BuildOk docsResult testsResult))
+    return BuildResult {
+       buildResultDocs    = docsResult,
+       buildResultTests   = testsResult,
+       buildResultLogFile = mlogFile
+    }
 
   where
     pkgid  = packageId rpkg
-    ipkgid = installedPackageId rpkg
+    uid    = installedUnitId rpkg
+    compid = compilerId compiler
 
     isParallelBuild = buildSettingNumJobs >= 2
 
-    configureCommand = Cabal.configureCommand defaultProgramConfiguration
+    configureCommand = Cabal.configureCommand defaultProgramDb
     configureFlags v = flip filterConfigureFlags v $
                        setupHsConfigureFlags rpkg pkgshared
                                              verbosity builddir
+    configureArgs    = setupHsConfigureArgs pkg
 
-    buildCommand     = Cabal.buildCommand defaultProgramConfiguration
+    buildCommand     = Cabal.buildCommand defaultProgramDb
     buildFlags   _   = setupHsBuildFlags pkg pkgshared verbosity builddir
 
     generateInstalledPackageInfo :: IO InstalledPackageInfo
     generateInstalledPackageInfo =
       withTempInstalledPackageInfoFile
-        verbosity distTempDirectory $ \pkgConfFile -> do
-        -- make absolute since setup changes dir
-        pkgConfFile' <- canonicalizePath pkgConfFile
+        verbosity distTempDirectory $ \pkgConfDest -> do
         let registerFlags _ = setupHsRegisterFlags
                                 pkg pkgshared
                                 verbosity builddir
-                                pkgConfFile'
+                                pkgConfDest
         setup Cabal.registerCommand registerFlags
 
-    copyFlags _ = setupHsCopyFlags pkg pkgshared verbosity builddir
+    copyFlags destdir _ = setupHsCopyFlags pkg pkgshared verbosity
+                                           builddir destdir
 
     scriptOptions = setupHsScriptOptions rpkg pkgshared srcdir builddir
                                          isParallelBuild cacheLock
 
     setup :: CommandUI flags -> (Version -> flags) -> IO ()
-    setup cmd flags =
-      withLogging $ \mLogFileHandle -> 
+    setup cmd flags = setup' cmd flags []
+
+    setup' :: CommandUI flags -> (Version -> flags) -> [String] -> IO ()
+    setup' cmd flags args =
+      withLogging $ \mLogFileHandle ->
         setupWrapper
           verbosity
           scriptOptions { useLoggingHandle = mLogFileHandle }
-          (Just (pkgDescription pkg))
-          cmd flags []
+          (Just (elabPkgDescription pkg))
+          cmd flags args
 
+    mlogFile :: Maybe FilePath
     mlogFile =
       case buildSettingLogFile of
         Nothing        -> Nothing
-        Just mkLogFile -> Just (mkLogFile compiler platform pkgid ipkgid)
+        Just mkLogFile -> Just (mkLogFile compiler platform pkgid uid)
 
     initLogFile =
       case mlogFile of
@@ -1089,8 +1051,9 @@ buildAndInstallUnpackedPackage verbosity
 
 buildInplaceUnpackedPackage :: Verbosity
                             -> DistDirLayout
-                            -> BuildTimeSettings -> Lock
+                            -> BuildTimeSettings -> Lock -> Lock
                             -> ElaboratedSharedConfig
+                            -> ElaboratedInstallPlan
                             -> ElaboratedReadyPackage
                             -> BuildStatusRebuild
                             -> FilePath -> FilePath
@@ -1101,26 +1064,26 @@ buildInplaceUnpackedPackage verbosity
                               distPackageCacheDirectory
                             }
                             BuildTimeSettings{buildSettingNumJobs}
-                            cacheLock
+                            registerLock cacheLock
                             pkgshared@ElaboratedSharedConfig {
                               pkgConfigCompiler      = compiler,
                               pkgConfigCompilerProgs = progdb
                             }
-                            rpkg@(ReadyPackage pkg _deps)
+                            plan
+                            rpkg@(ReadyPackage pkg)
                             buildStatus
                             srcdir builddir = do
 
         --TODO: [code cleanup] there is duplication between the distdirlayout and the builddir here
         --      builddir is not enough, we also need the per-package cachedir
-        createDirectoryIfMissingVerbose verbosity False builddir
-        createDirectoryIfMissingVerbose verbosity False (distPackageCacheDirectory pkgid)
-        createPackageDBIfMissing verbosity compiler progdb (pkgBuildPackageDBStack pkg)
+        createDirectoryIfMissingVerbose verbosity True builddir
+        createDirectoryIfMissingVerbose verbosity True (distPackageCacheDirectory dparams)
 
         -- Configure phase
         --
         whenReConfigure $ do
-          annotateFailure ConfigureFailed $
-            setup configureCommand configureFlags []
+          annotateFailureNoLog ConfigureFailed $
+            setup configureCommand configureFlags configureArgs
           invalidatePackageRegFileMonitor packageFileMonitor
           updatePackageConfigFileMonitor packageFileMonitor srcdir pkg
 
@@ -1129,95 +1092,144 @@ buildInplaceUnpackedPackage verbosity
         let docsResult  = DocsNotTried
             testsResult = TestsNotTried
 
-            buildSuccess :: BuildSuccess
-            buildSuccess = BuildOk docsResult testsResult
+            buildResult :: BuildResultMisc
+            buildResult = (docsResult, testsResult)
 
         whenRebuild $ do
           timestamp <- beginUpdateFileMonitor
-          annotateFailure BuildFailed $
+          annotateFailureNoLog BuildFailed $
             setup buildCommand buildFlags buildArgs
 
-          --TODO: [required eventually] this doesn't track file
-          --non-existence, so we could fail to rebuild if someone
-          --adds a new file which changes behavior.
-          allSrcFiles <- allPackageSourceFiles verbosity srcdir
+          let listSimple =
+                execRebuild srcdir (needElaboratedConfiguredPackage pkg)
+              listSdist =
+                fmap (map monitorFileHashed) $
+                    allPackageSourceFiles verbosity scriptOptions srcdir
+              ifNullThen m m' = do xs <- m
+                                   if null xs then m' else return xs
+          monitors <- case PD.buildType (elabPkgDescription pkg) of
+            Just Simple -> listSimple
+            -- If a Custom setup was used, AND the Cabal is recent
+            -- enough to have sdist --list-sources, use that to
+            -- determine the files that we need to track.  This can
+            -- cause unnecessary rebuilding (for example, if README
+            -- is edited, we will try to rebuild) but there isn't
+            -- a more accurate Custom interface we can use to get
+            -- this info.  We prefer not to use listSimple here
+            -- as it can miss extra source files that are considered
+            -- by the Custom setup.
+            _ | elabSetupScriptCliVersion pkg >= mkVersion [1,17]
+              -- However, sometimes sdist --list-sources will fail
+              -- and return an empty list.  In that case, fall
+              -- back on the (inaccurate) simple tracking.
+              -> listSdist `ifNullThen` listSimple
+              | otherwise
+              -> listSimple
 
+          let dep_monitors = map monitorFileHashed
+                           $ elabInplaceDependencyBuildCacheFiles
+                                distDirLayout pkgshared plan pkg
           updatePackageBuildFileMonitor packageFileMonitor srcdir timestamp
                                         pkg buildStatus
-                                        allSrcFiles buildSuccess
+                                        (monitors ++ dep_monitors) buildResult
 
-        mipkg <- whenReRegister $ annotateFailure InstallFailed $ do
+        -- PURPOSELY omitted: no copy!
+
+        whenReRegister $ annotateFailureNoLog InstallFailed $ do
           -- Register locally
-          mipkg <- if pkgRequiresRegistration pkg
+          mipkg <- if elabRequiresRegistration pkg
             then do
-                ipkg <- generateInstalledPackageInfo
+                ipkg0 <- generateInstalledPackageInfo
                 -- We register ourselves rather than via Setup.hs. We need to
                 -- grab and modify the InstalledPackageInfo. We decide what
                 -- the installed package id is, not the build system.
-                let ipkg' = ipkg { Installed.installedUnitId = ipkgid }
-                Cabal.registerPackage verbosity compiler progdb False
-                                      (pkgRegisterPackageDBStack pkg)
-                                      ipkg'
-                return (Just ipkg')
+                let ipkg = ipkg0 { Installed.installedUnitId = ipkgid }
+                criticalSection registerLock $
+                    Cabal.registerPackage verbosity compiler progdb
+                                          (elabRegisterPackageDBStack pkg)
+                                          ipkg Cabal.defaultRegisterOptions
+                return (Just ipkg)
 
            else return Nothing
 
           updatePackageRegFileMonitor packageFileMonitor srcdir mipkg
-          return mipkg
+
+        whenTest $ do
+          annotateFailureNoLog TestsFailed $
+            setup testCommand testFlags testArgs
 
         -- Repl phase
         --
         whenRepl $
-          annotateFailure BuildFailed $
-          setup replCommand replFlags replArgs
+          annotateFailureNoLog ReplFailed $
+          setupInteractive replCommand replFlags replArgs
 
         -- Haddock phase
         whenHaddock $
-          annotateFailure BuildFailed $
+          annotateFailureNoLog HaddocksFailed $
           setup haddockCommand haddockFlags []
 
-        return (BuildSuccess mipkg buildSuccess)
+        return BuildResult {
+          buildResultDocs    = docsResult,
+          buildResultTests   = testsResult,
+          buildResultLogFile = Nothing
+        }
 
   where
-    pkgid  = packageId rpkg
-    ipkgid = installedPackageId rpkg
+    ipkgid  = installedUnitId pkg
+    dparams = elabDistDirParams pkgshared pkg
 
     isParallelBuild = buildSettingNumJobs >= 2
 
-    packageFileMonitor = newPackageFileMonitor distDirLayout pkgid
+    packageFileMonitor = newPackageFileMonitor distDirLayout dparams
 
     whenReConfigure action = case buildStatus of
       BuildStatusConfigure _ -> action
       _                      -> return ()
 
     whenRebuild action
-      | null (pkgBuildTargets pkg) = return ()
+      | null (elabBuildTargets pkg)
+      -- NB: we have to build the test suite!
+      , null (elabTestTargets pkg) = return ()
+      | otherwise                   = action
+
+    whenTest action
+      | null (elabTestTargets pkg) = return ()
       | otherwise                  = action
 
     whenRepl action
-      | isNothing (pkgReplTarget pkg) = return ()
+      | isNothing (elabReplTarget pkg) = return ()
       | otherwise                     = action
 
     whenHaddock action
-      | pkgBuildHaddocks pkg = action
+      | elabBuildHaddocks pkg = action
       | otherwise            = return ()
 
-    whenReRegister  action = case buildStatus of
-      BuildStatusConfigure          _ -> action
-      BuildStatusBuild Nothing      _ -> action
-      BuildStatusBuild (Just mipkg) _ -> return mipkg
+    whenReRegister  action
+      = case buildStatus of
+          -- We registered the package already
+          BuildStatusBuild (Just _) _     -> info verbosity "whenReRegister: previously registered"
+          -- There is nothing to register
+          _ | null (elabBuildTargets pkg) -> info verbosity "whenReRegister: nothing to register"
+            | otherwise                   -> action
 
-    configureCommand = Cabal.configureCommand defaultProgramConfiguration
+    configureCommand = Cabal.configureCommand defaultProgramDb
     configureFlags v = flip filterConfigureFlags v $
                        setupHsConfigureFlags rpkg pkgshared
                                              verbosity builddir
+    configureArgs    = setupHsConfigureArgs pkg
 
-    buildCommand     = Cabal.buildCommand defaultProgramConfiguration
+    buildCommand     = Cabal.buildCommand defaultProgramDb
     buildFlags   _   = setupHsBuildFlags pkg pkgshared
                                          verbosity builddir
     buildArgs        = setupHsBuildArgs  pkg
 
-    replCommand      = Cabal.replCommand defaultProgramConfiguration
+    testCommand      = Cabal.testCommand -- defaultProgramDb
+    testFlags    _   = setupHsTestFlags pkg pkgshared
+                                         verbosity builddir
+    testArgs         = setupHsTestArgs  pkg
+
+    replCommand      = Cabal.replCommand defaultProgramDb
     replFlags _      = setupHsReplFlags pkg pkgshared
                                         verbosity builddir
     replArgs         = setupHsReplArgs  pkg
@@ -1230,52 +1242,51 @@ buildInplaceUnpackedPackage verbosity
                                             srcdir builddir
                                             isParallelBuild cacheLock
 
+    setupInteractive :: CommandUI flags
+                     -> (Version -> flags) -> [String] -> IO ()
+    setupInteractive cmd flags args =
+      setupWrapper verbosity
+                   scriptOptions { isInteractive = True }
+                   (Just (elabPkgDescription pkg))
+                   cmd flags args
+
     setup :: CommandUI flags -> (Version -> flags) -> [String] -> IO ()
     setup cmd flags args =
       setupWrapper verbosity
                    scriptOptions
-                   (Just (pkgDescription pkg))
+                   (Just (elabPkgDescription pkg))
                    cmd flags args
 
     generateInstalledPackageInfo :: IO InstalledPackageInfo
     generateInstalledPackageInfo =
       withTempInstalledPackageInfoFile
-        verbosity distTempDirectory $ \pkgConfFile -> do
-        -- make absolute since setup changes dir
-        pkgConfFile' <- canonicalizePath pkgConfFile
+        verbosity distTempDirectory $ \pkgConfDest -> do
         let registerFlags _ = setupHsRegisterFlags
                                 pkg pkgshared
                                 verbosity builddir
-                                pkgConfFile'
+                                pkgConfDest
         setup Cabal.registerCommand registerFlags []
 
-
--- helper
-annotateFailure :: (String -> BuildFailure) -> IO a -> IO a
-annotateFailure annotate action =
-  action `catches`
-    [ Handler $ \ioe  -> handler (ioe  :: IOException)
-    , Handler $ \exit -> handler (exit :: ExitCode)
-    ]
-  where
-    handler :: Exception e => e -> IO a
-    handler = throwIO . annotate
-#if MIN_VERSION_base(4,8,0)
-            . displayException
-#else
-            . show
-#endif
-
-
 withTempInstalledPackageInfoFile :: Verbosity -> FilePath
-                                 -> (FilePath -> IO ())
-                                 -> IO InstalledPackageInfo
+                                  -> (FilePath -> IO ())
+                                  -> IO InstalledPackageInfo
 withTempInstalledPackageInfoFile verbosity tempdir action =
-    withTempFile tempdir "package-registration-" $ \pkgConfFile hnd -> do
-      hClose hnd
-      action pkgConfFile
+    withTempDirectory verbosity tempdir "package-registration-" $ \dir -> do
+      -- make absolute since @action@ will often change directory
+      abs_dir <- canonicalizePath dir
 
-      (warns, ipkg) <- withUTF8FileContents pkgConfFile $ \pkgConfStr ->
+      let pkgConfDest = abs_dir </> "pkgConf"
+      action pkgConfDest
+
+      readPkgConf "." pkgConfDest
+  where
+    pkgConfParseFailed :: Installed.PError -> IO a
+    pkgConfParseFailed perror =
+      die' verbosity $ "Couldn't parse the output of 'setup register --gen-pkg-config':"
+            ++ show perror
+
+    readPkgConf pkgConfDir pkgConfFile = do
+      (warns, ipkg) <- withUTF8FileContents (pkgConfDir </> pkgConfFile) $ \pkgConfStr ->
         case Installed.parseInstalledPackageInfo pkgConfStr of
           Installed.ParseFailed perror -> pkgConfParseFailed perror
           Installed.ParseOk warns ipkg -> return (warns, ipkg)
@@ -1284,9 +1295,34 @@ withTempInstalledPackageInfoFile verbosity tempdir action =
         warn verbosity $ unlines (map (showPWarning pkgConfFile) warns)
 
       return ipkg
+
+
+------------------------------------------------------------------------------
+-- * Utilities
+------------------------------------------------------------------------------
+
+annotateFailureNoLog :: (SomeException -> BuildFailureReason)
+                     -> IO a -> IO a
+annotateFailureNoLog annotate action =
+  annotateFailure Nothing annotate action
+
+annotateFailure :: Maybe FilePath
+                -> (SomeException -> BuildFailureReason)
+                -> IO a -> IO a
+annotateFailure mlogFile annotate action =
+  action `catches`
+    -- It's not just IOException and ExitCode we have to deal with, there's
+    -- lots, including exceptions from the hackage-security and tar packages.
+    -- So we take the strategy of catching everything except async exceptions.
+    [
+#if MIN_VERSION_base(4,7,0)
+      Handler $ \async -> throwIO (async :: SomeAsyncException)
+#else
+      Handler $ \async -> throwIO (async :: AsyncException)
+#endif
+    , Handler $ \other -> handler (other :: SomeException)
+    ]
   where
-    pkgConfParseFailed :: Installed.PError -> IO a
-    pkgConfParseFailed perror =
-      die $ "Couldn't parse the output of 'setup register --gen-pkg-config':"
-            ++ show perror
+    handler :: Exception e => e -> IO a
+    handler = throwIO . BuildFailure mlogFile . annotate . toException
 

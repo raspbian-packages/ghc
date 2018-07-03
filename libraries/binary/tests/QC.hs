@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, ScopedTypeVariables #-}
+{-# LANGUAGE CPP, ScopedTypeVariables, DataKinds, TypeSynonymInstances #-}
 module Main ( main ) where
 
 #if MIN_VERSION_base(4,8,0)
@@ -7,10 +7,6 @@ module Main ( main ) where
 
 #if MIN_VERSION_base(4,7,0)
 #define HAS_FIXED_CONSTRUCTOR
-#endif
-
-#if __GLASGOW_HASKELL__ >= 704
-#define HAS_GHC_FINGERPRINT
 #endif
 
 import           Control.Applicative
@@ -25,15 +21,14 @@ import           Data.ByteString.Short                (ShortByteString)
 #endif
 import           Data.Int
 import           Data.Ratio
+import           Data.Typeable
 import           System.IO.Unsafe
 
 #ifdef HAS_NATURAL
 import           Numeric.Natural
 #endif
 
-#ifdef HAS_GHC_FINGERPRINT
 import           GHC.Fingerprint
-#endif
 
 import qualified Data.Fixed as Fixed
 
@@ -46,6 +41,7 @@ import           Arbitrary                            ()
 import           Data.Binary
 import           Data.Binary.Get
 import           Data.Binary.Put
+import qualified Data.Binary.Class as Class
 
 ------------------------------------------------------------------------
 
@@ -137,6 +133,57 @@ prop_Int64host = roundTripWith putInt64host getInt64host
 prop_Inthost :: Int -> Property
 prop_Inthost = roundTripWith putInthost getInthost
 
+-- Floats and Doubles
+
+prop_Floatbe :: Float -> Property
+prop_Floatbe = roundTripWith putFloatbe getFloatbe
+
+prop_Floatle :: Float -> Property
+prop_Floatle = roundTripWith putFloatle getFloatle
+
+prop_Floathost :: Float -> Property
+prop_Floathost = roundTripWith putFloathost getFloathost
+
+prop_Doublebe :: Double -> Property
+prop_Doublebe = roundTripWith putDoublebe getDoublebe
+
+prop_Doublele :: Double -> Property
+prop_Doublele = roundTripWith putDoublele getDoublele
+
+prop_Doublehost :: Double -> Property
+prop_Doublehost = roundTripWith putDoublehost getDoublehost
+
+#if MIN_VERSION_base(4,10,0)
+testTypeable :: Test
+testTypeable = testProperty "TypeRep" prop_TypeRep
+
+prop_TypeRep :: TypeRep -> Property
+prop_TypeRep = roundTripWith Class.put Class.get
+
+atomicTypeReps :: [TypeRep]
+atomicTypeReps =
+    [ typeRep (Proxy :: Proxy ())
+    , typeRep (Proxy :: Proxy String)
+    , typeRep (Proxy :: Proxy Int)
+    , typeRep (Proxy :: Proxy (,))
+    , typeRep (Proxy :: Proxy ((,) (Maybe Int)))
+    , typeRep (Proxy :: Proxy Maybe)
+    , typeRep (Proxy :: Proxy 'Nothing)
+    , typeRep (Proxy :: Proxy 'Left)
+    , typeRep (Proxy :: Proxy "Hello")
+    , typeRep (Proxy :: Proxy 42)
+    , typeRep (Proxy :: Proxy '[1,2,3,4])
+    , typeRep (Proxy :: Proxy ('Left Int))
+    , typeRep (Proxy :: Proxy (Either Int String))
+    , typeRep (Proxy :: Proxy (() -> ()))
+    ]
+
+instance Arbitrary TypeRep where
+    arbitrary = oneof (map pure atomicTypeReps)
+#else
+testTypeable :: Test
+testTypeable = testGroup "Skipping Typeable tests" []
+#endif
 
 -- done, partial and fail
 
@@ -450,13 +497,11 @@ genNaturalBig = do
 
 ------------------------------------------------------------------------
 
-#ifdef HAS_GHC_FINGERPRINT
 genFingerprint :: Gen Fingerprint
 genFingerprint = liftM2 Fingerprint arbitrary arbitrary
 #if !MIN_VERSION_base(4,7,0)
 instance Show Fingerprint where
   show (Fingerprint x1 x2) = show (x1,x2)
-#endif
 #endif
 
 ------------------------------------------------------------------------
@@ -560,6 +605,13 @@ tests =
             , testProperty "Int64le"    (p prop_Int64le)
             , testProperty "Int64host"  (p prop_Int64host)
             , testProperty "Inthost"    (p prop_Inthost)
+              -- Float/Double
+            , testProperty "Floatbe"    (p prop_Floatbe)
+            , testProperty "Floatle"    (p prop_Floatle)
+            , testProperty "Floathost"  (p prop_Floathost)
+            , testProperty "Doublebe"   (p prop_Doublebe)
+            , testProperty "Doublele"   (p prop_Doublele)
+            , testProperty "Doublehost" (p prop_Doublehost)
             ]
 
         , testGroup "String utils"
@@ -598,9 +650,7 @@ tests =
             , testWithGen "Natural small" genNaturalSmall
             , testWithGen "Natural big"   genNaturalBig
 #endif
-#ifdef HAS_GHC_FINGERPRINT
             , testWithGen "GHC.Fingerprint" genFingerprint
-#endif
 
             , test' "Float"       (test :: T Float ) test
             , test' "Double"      (test :: T Double) test
@@ -659,4 +709,5 @@ tests =
             , testProperty "HasResolution -> MkFixed" $ p prop_fixed_resolution_constr
             ]
 #endif
+        , testTypeable
         ]

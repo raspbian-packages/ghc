@@ -1,30 +1,5 @@
-{-# LANGUAGE CPP, DeriveDataTypeable #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
-#if __GLASGOW_HASKELL__ < 707
-{-# LANGUAGE StandaloneDeriving #-}
-#endif
-
--- Hack approach to support bootstrapping.
--- When MIN_VERSION_binary macro is available, use it. But it's not available
--- during bootstrapping (or anyone else building Setup.hs directly). If the
--- builder specifies -DMIN_VERSION_binary_0_8_0=1 or =0 then we respect that.
--- Otherwise we pick a default based on GHC version: assume binary <0.8 when
--- GHC < 8.0, and binary >=0.8 when GHC >= 8.0.
-#ifdef MIN_VERSION_binary
-#define MIN_VERSION_binary_0_8_0 MIN_VERSION_binary(0,8,0)
-#else
-#ifndef MIN_VERSION_binary_0_8_0
-#if __GLASGOW_HASKELL__ >= 800
-#define MIN_VERSION_binary_0_8_0 1
-#else
-#define MIN_VERSION_binary_0_8_0 0
-#endif
-#endif
-#endif
-
-#if !MIN_VERSION_binary_0_8_0
-{-# OPTIONS_GHC -fno-warn-orphans #-}
-#endif
 
 -----------------------------------------------------------------------------
 -- |
@@ -42,7 +17,15 @@
 
 module Distribution.Version (
   -- * Package versions
-  Version(..),
+  Version,
+  mkVersion,
+  mkVersion',
+  versionNumbers,
+  nullVersion,
+  alterVersion,
+
+  -- ** Backwards compatibility
+  showVersion,
 
   -- * Version ranges
   VersionRange(..),
@@ -56,6 +39,7 @@ module Distribution.Version (
   differenceVersionRanges,
   invertVersionRange,
   withinVersion,
+  majorBoundVersion,
   betweenVersionsInclusive,
 
   -- ** Inspection
@@ -71,6 +55,7 @@ module Distribution.Version (
 
   -- ** Modification
   removeUpperBound,
+  removeLowerBound,
 
   -- * Version intervals view
   asVersionIntervals,
@@ -97,20 +82,214 @@ module Distribution.Version (
 
  ) where
 
-import Distribution.Compat.Binary ( Binary(..) )
-import Data.Data        ( Data )
-import Data.Typeable    ( Typeable )
-import Data.Version     ( Version(..) )
-import GHC.Generics     ( Generic )
+import Prelude ()
+import Distribution.Compat.Prelude
+import qualified Data.Version as Base
+import Data.Bits (shiftL, shiftR, (.|.), (.&.))
 
 import Distribution.Text
 import qualified Distribution.Compat.ReadP as Parse
 import Distribution.Compat.ReadP hiding (get)
 
 import qualified Text.PrettyPrint as Disp
-import Text.PrettyPrint ((<>), (<+>))
-import qualified Data.Char as Char (isDigit)
+import Text.PrettyPrint ((<+>))
 import Control.Exception (assert)
+
+import qualified Text.Read as Read
+
+-- -----------------------------------------------------------------------------
+-- Versions
+
+-- | A 'Version' represents the version of a software entity.
+--
+-- Instances of 'Eq' and 'Ord' are provided, which gives exact
+-- equality and lexicographic ordering of the version number
+-- components (i.e. 2.1 > 2.0, 1.2.3 > 1.2.2, etc.).
+--
+-- This type is opaque and distinct from the 'Base.Version' type in
+-- "Data.Version" since @Cabal-2.0@. The difference extends to the
+-- 'Binary' instance using a different (and more compact) encoding.
+--
+-- @since 2.0.0.2
+data Version = PV0 {-# UNPACK #-} !Word64
+             | PV1 !Int [Int]
+             -- NOTE: If a version fits into the packed Word64
+             -- representation (i.e. at most four version components
+             -- which all fall into the [0..0xfffe] range), then PV0
+             -- MUST be used. This is essential for the 'Eq' instance
+             -- to work.
+             deriving (Data,Eq,Generic,Typeable)
+
+instance Ord Version where
+    compare (PV0 x)    (PV0 y)    = compare x y
+    compare (PV1 x xs) (PV1 y ys) = case compare x y of
+        EQ -> compare xs ys
+        c  -> c
+    compare (PV0 w)    (PV1 y ys) = case compare x y of
+        EQ -> compare [x2,x3,x4] ys
+        c  -> c
+      where
+        x  = fromIntegral ((w `shiftR` 48) .&. 0xffff) - 1
+        x2 = fromIntegral ((w `shiftR` 32) .&. 0xffff) - 1
+        x3 = fromIntegral ((w `shiftR` 16) .&. 0xffff) - 1
+        x4 = fromIntegral               (w .&. 0xffff) - 1
+    compare (PV1 x xs) (PV0 w)    = case compare x y of
+        EQ -> compare xs [y2,y3,y4]
+        c  -> c
+      where
+        y  = fromIntegral ((w `shiftR` 48) .&. 0xffff) - 1
+        y2 = fromIntegral ((w `shiftR` 32) .&. 0xffff) - 1
+        y3 = fromIntegral ((w `shiftR` 16) .&. 0xffff) - 1
+        y4 = fromIntegral               (w .&. 0xffff) - 1
+
+instance Show Version where
+    showsPrec d v = showParen (d > 10)
+        $ showString "mkVersion "
+        . showsPrec 11 (versionNumbers v)
+
+instance Read Version where
+    readPrec = Read.parens $ do
+        Read.Ident "mkVersion" <- Read.lexP
+        v <- Read.step Read.readPrec
+        return (mkVersion v)
+
+instance Binary Version
+
+instance NFData Version where
+    rnf (PV0 _) = ()
+    rnf (PV1 _ ns) = rnf ns
+
+instance Text Version where
+  disp ver
+    = Disp.hcat (Disp.punctuate (Disp.char '.')
+                                (map Disp.int $ versionNumbers ver))
+
+  parse = do
+      branch <- Parse.sepBy1 parseNat (Parse.char '.')
+                -- allow but ignore tags:
+      _tags  <- Parse.many (Parse.char '-' >> Parse.munch1 isAlphaNum)
+      return (mkVersion branch)
+    where
+      parseNat = read `fmap` Parse.munch1 isDigit
+
+-- | Construct 'Version' from list of version number components.
+--
+-- For instance, @mkVersion [3,2,1]@ constructs a 'Version'
+-- representing the version @3.2.1@.
+--
+-- All version components must be non-negative. @mkVersion []@
+-- currently represents the special /null/ version; see also 'nullVersion'.
+--
+-- @since 2.0.0.2
+mkVersion :: [Int] -> Version
+-- TODO: add validity check; disallow 'mkVersion []' (we have
+-- 'nullVersion' for that)
+mkVersion []                    = nullVersion
+mkVersion (v1:[])
+  | inWord16VerRep1 v1          = PV0 (mkWord64VerRep1 v1)
+  | otherwise                   = PV1 v1 []
+  where
+    inWord16VerRep1 x1 = inWord16 (x1 .|. (x1+1))
+    mkWord64VerRep1 y1 = mkWord64VerRep (y1+1) 0 0 0
+
+mkVersion (v1:vs@(v2:[]))
+  | inWord16VerRep2 v1 v2       = PV0 (mkWord64VerRep2 v1 v2)
+  | otherwise                   = PV1 v1 vs
+  where
+    inWord16VerRep2 x1 x2 = inWord16 (x1 .|. (x1+1)
+                                  .|. x2 .|. (x2+1))
+    mkWord64VerRep2 y1 y2 = mkWord64VerRep (y1+1) (y2+1) 0 0
+
+mkVersion (v1:vs@(v2:v3:[]))
+  | inWord16VerRep3 v1 v2 v3    = PV0 (mkWord64VerRep3 v1 v2 v3)
+  | otherwise                   = PV1 v1 vs
+  where
+    inWord16VerRep3 x1 x2 x3 = inWord16 (x1 .|. (x1+1)
+                                     .|. x2 .|. (x2+1)
+                                     .|. x3 .|. (x3+1))
+    mkWord64VerRep3 y1 y2 y3 = mkWord64VerRep (y1+1) (y2+1) (y3+1) 0
+
+mkVersion (v1:vs@(v2:v3:v4:[]))
+  | inWord16VerRep4 v1 v2 v3 v4 = PV0 (mkWord64VerRep4 v1 v2 v3 v4)
+  | otherwise                   = PV1 v1 vs
+  where
+    inWord16VerRep4 x1 x2 x3 x4 = inWord16 (x1 .|. (x1+1)
+                                        .|. x2 .|. (x2+1)
+                                        .|. x3 .|. (x3+1)
+                                        .|. x4 .|. (x4+1))
+    mkWord64VerRep4 y1 y2 y3 y4 = mkWord64VerRep (y1+1) (y2+1) (y3+1) (y4+1)
+
+mkVersion (v1:vs)               = PV1 v1 vs
+
+
+{-# INLINE mkWord64VerRep #-}
+mkWord64VerRep :: Int -> Int -> Int -> Int -> Word64
+mkWord64VerRep v1 v2 v3 v4 =
+      (fromIntegral v1 `shiftL` 48)
+  .|. (fromIntegral v2 `shiftL` 32)
+  .|. (fromIntegral v3 `shiftL` 16)
+  .|.  fromIntegral v4
+
+{-# INLINE inWord16 #-}
+inWord16 :: Int -> Bool
+inWord16 x = (fromIntegral x :: Word) <= 0xffff
+
+-- | Variant of 'Version' which converts a "Data.Version" 'Version'
+-- into Cabal's 'Version' type.
+--
+-- @since 2.0.0.2
+mkVersion' :: Base.Version -> Version
+mkVersion' = mkVersion . Base.versionBranch
+
+-- | Unpack 'Version' into list of version number components.
+--
+-- This is the inverse to 'mkVersion', so the following holds:
+--
+-- > (versionNumbers . mkVersion) vs == vs
+--
+-- @since 2.0.0.2
+versionNumbers :: Version -> [Int]
+versionNumbers (PV1 n ns) = n:ns
+versionNumbers (PV0 w)
+  | v1 < 0    = []
+  | v2 < 0    = [v1]
+  | v3 < 0    = [v1,v2]
+  | v4 < 0    = [v1,v2,v3]
+  | otherwise = [v1,v2,v3,v4]
+  where
+    v1 = fromIntegral ((w `shiftR` 48) .&. 0xffff) - 1
+    v2 = fromIntegral ((w `shiftR` 32) .&. 0xffff) - 1
+    v3 = fromIntegral ((w `shiftR` 16) .&. 0xffff) - 1
+    v4 = fromIntegral (w .&. 0xffff) - 1
+
+
+-- | Constant representing the special /null/ 'Version'
+--
+-- The 'nullVersion' compares (via 'Ord') as less than every proper
+-- 'Version' value.
+--
+-- @since 2.0.0.2
+nullVersion :: Version
+-- TODO: at some point, 'mkVersion' may disallow creating /null/
+-- 'Version's
+nullVersion = PV0 0
+
+-- | Apply function to list of version number components
+--
+-- > alterVersion f == mkVersion . f . versionNumbers
+--
+-- @since 2.0.0.2
+alterVersion :: ([Int] -> [Int]) -> Version -> Version
+alterVersion f = mkVersion . f . versionNumbers
+
+-- internal helper
+validVersion :: Version -> Bool
+validVersion v = v /= nullVersion && all (>=0) (versionNumbers v)
+
+-- BC
+
+showVersion :: Version -> String
+showVersion = display
 
 -- -----------------------------------------------------------------------------
 -- Version ranges
@@ -124,6 +303,7 @@ data VersionRange
   | LaterVersion           Version -- > version  (NB. not >=)
   | EarlierVersion         Version -- < version
   | WildcardVersion        Version -- == ver.*   (same as >= ver && < ver+1)
+  | MajorBoundVersion      Version -- @^>= ver@ (same as >= ver && < MAJ(ver)+1)
   | UnionVersionRanges     VersionRange VersionRange
   | IntersectVersionRanges VersionRange VersionRange
   | VersionRangeParens     VersionRange -- just '(exp)' parentheses syntax
@@ -131,23 +311,7 @@ data VersionRange
 
 instance Binary VersionRange
 
-#if __GLASGOW_HASKELL__ < 707
--- starting with ghc-7.7/base-4.7 this instance is provided in "Data.Data"
-deriving instance Data Version
-#endif
-
-#if !(MIN_VERSION_binary_0_8_0)
--- Deriving this instance from Generic gives trouble on GHC 7.2 because the
--- Generic instance has to be standalone-derived. So, we hand-roll our own.
--- We can't use a generic Binary instance on later versions because we must
--- maintain compatibility between compiler versions.
-instance Binary Version where
-    get = do
-        br <- get
-        tags <- get
-        return $ Version br tags
-    put (Version br tags) = put br >> put tags
-#endif
+instance NFData VersionRange where rnf = genericRnf
 
 {-# DeprecateD AnyVersion
     "Use 'anyVersion', 'foldVersionRange' or 'asVersionIntervals'" #-}
@@ -181,7 +345,7 @@ anyVersion = AnyVersion
 --
 noVersion :: VersionRange
 noVersion = IntersectVersionRanges (LaterVersion v) (EarlierVersion v)
-  where v = Version [1] []
+  where v = mkVersion [1]
 
 -- | The version range @== v@
 --
@@ -273,8 +437,17 @@ invertVersionRange =
 withinVersion :: Version -> VersionRange
 withinVersion = WildcardVersion
 
--- | The version range @>= v1 && <= v2@.
+-- | The version range @^>= v@.
 --
+-- For example, for version @1.2.3.4@, the version range @^>= 1.2.3.4@ is the same as
+-- @>= 1.2.3.4 && < 1.3@.
+--
+-- Note that @^>= 1@ is equivalent to @>= 1 && < 1.1@.
+--
+-- @since 2.0.0.2
+majorBoundVersion :: Version -> VersionRange
+majorBoundVersion = MajorBoundVersion
+
 -- In practice this is not very useful because we normally use inclusive lower
 -- bounds and exclusive upper bounds.
 --
@@ -299,6 +472,18 @@ removeUpperBound = fromVersionIntervals . relaxLastInterval . toVersionIntervals
     relaxLastInterval' [(l,_)] = [(l, NoUpperBound)]
     relaxLastInterval' (i:is)  = i : relaxLastInterval' is
 
+-- | Given a version range, remove the lowest lower bound.
+-- Example: @(>= 1 && < 3) || (>= 4 && < 5)@ is converted to
+-- @(>= 0 && < 3) || (>= 4 && < 5)@.
+removeLowerBound :: VersionRange -> VersionRange
+removeLowerBound = fromVersionIntervals . relaxHeadInterval . toVersionIntervals
+  where
+    relaxHeadInterval (VersionIntervals intervals) =
+      VersionIntervals (relaxHeadInterval' intervals)
+
+    relaxHeadInterval' []         = []
+    relaxHeadInterval' ((_,u):is) = (minLowerBound,u) : is
+
 -- | Fold over the basic syntactic structure of a 'VersionRange'.
 --
 -- This provides a syntactic view of the expression defining the version range.
@@ -321,6 +506,7 @@ foldVersionRange anyv this later earlier union intersect = fold
     fold (LaterVersion v)               = later v
     fold (EarlierVersion v)             = earlier v
     fold (WildcardVersion v)            = fold (wildcard v)
+    fold (MajorBoundVersion v)          = fold (majorBound v)
     fold (UnionVersionRanges v1 v2)     = union (fold v1) (fold v2)
     fold (IntersectVersionRanges v1 v2) = intersect (fold v1) (fold v2)
     fold (VersionRangeParens v)         = fold v
@@ -328,6 +514,10 @@ foldVersionRange anyv this later earlier union intersect = fold
     wildcard v = intersectVersionRanges
                    (orLaterVersion v)
                    (earlierVersion (wildcardUpperBound v))
+
+    majorBound v = intersectVersionRanges
+                     (orLaterVersion v)
+                     (earlierVersion (majorUpperBound v))
 
 -- | An extended variant of 'foldVersionRange' that also provides a view of the
 -- expression in which the syntactic sugar @\">= v\"@, @\"<= v\"@ and @\"==
@@ -345,12 +535,18 @@ foldVersionRange' :: a                         -- ^ @\"-any\"@ version
                                                -- inclusive lower bound and the
                                                -- exclusive upper bounds of the
                                                -- range defined by the wildcard.
+                  -> (Version -> Version -> a) -- ^ @\"^>= v\"@ major upper bound
+                                               -- The function is passed the
+                                               -- inclusive lower bound and the
+                                               -- exclusive major upper bounds
+                                               -- of the range defined by this
+                                               -- operator.
                   -> (a -> a -> a)             -- ^ @\"_ || _\"@ union
                   -> (a -> a -> a)             -- ^ @\"_ && _\"@ intersection
                   -> (a -> a)                  -- ^ @\"(_)\"@ parentheses
                   -> VersionRange -> a
 foldVersionRange' anyv this later earlier orLater orEarlier
-                  wildcard union intersect parens = fold
+                  wildcard major union intersect parens = fold
   where
     fold AnyVersion                     = anyv
     fold (ThisVersion v)                = this v
@@ -367,6 +563,7 @@ foldVersionRange' anyv this later earlier orLater orEarlier
                              (ThisVersion    v')) | v==v' = orEarlier v
 
     fold (WildcardVersion v)            = wildcard v (wildcardUpperBound v)
+    fold (MajorBoundVersion v)          = major v (majorUpperBound v)
     fold (UnionVersionRanges v1 v2)     = union (fold v1) (fold v2)
     fold (IntersectVersionRanges v1 v2) = intersect (fold v1) (fold v2)
     fold (VersionRangeParens v)         = parens (fold v)
@@ -379,9 +576,9 @@ foldVersionRange' anyv this later earlier orLater orEarlier
 withinRange :: Version -> VersionRange -> Bool
 withinRange v = foldVersionRange
                    True
-                   (\v'  -> versionBranch v == versionBranch v')
-                   (\v'  -> versionBranch v >  versionBranch v')
-                   (\v'  -> versionBranch v <  versionBranch v')
+                   (\v'  -> v == v')
+                   (\v'  -> v >  v')
+                   (\v'  -> v <  v')
                    (||)
                    (&&)
 
@@ -478,15 +675,24 @@ simplifyVersionRange vr
 --
 
 wildcardUpperBound :: Version -> Version
-wildcardUpperBound (Version lowerBound ts) = Version upperBound ts
-  where
-    upperBound = init lowerBound ++ [last lowerBound + 1]
+wildcardUpperBound = alterVersion $
+    \lowerBound -> init lowerBound ++ [last lowerBound + 1]
 
 isWildcardRange :: Version -> Version -> Bool
-isWildcardRange (Version branch1 _) (Version branch2 _) = check branch1 branch2
+isWildcardRange ver1 ver2 = check (versionNumbers ver1) (versionNumbers ver2)
   where check (n:[]) (m:[]) | n+1 == m = True
         check (n:ns) (m:ms) | n   == m = check ns ms
         check _      _                 = False
+
+-- | Compute next greater major version to be used as upper bound
+--
+-- Example: @0.4.1@ produces the version @0.5@ which then can be used
+-- to construct a range @>= 0.4.1 && < 0.5@
+majorUpperBound :: Version -> Version
+majorUpperBound = alterVersion $ \numbers -> case numbers of
+    []        -> [0,1] -- should not happen
+    [m1]      -> [m1,1] -- e.g. version '1'
+    (m1:m2:_) -> [m1,m2+1]
 
 ------------------
 -- Intervals view
@@ -518,11 +724,10 @@ data UpperBound = NoUpperBound | UpperBound Version !Bound deriving (Eq, Show)
 data Bound      = ExclusiveBound | InclusiveBound          deriving (Eq, Show)
 
 minLowerBound :: LowerBound
-minLowerBound = LowerBound (Version [0] []) InclusiveBound
+minLowerBound = LowerBound (mkVersion [0]) InclusiveBound
 
 isVersion0 :: Version -> Bool
-isVersion0 (Version [0] _) = True
-isVersion0 _               = False
+isVersion0 = (== mkVersion [0])
 
 instance Ord LowerBound where
   LowerBound ver bound <= LowerBound ver' bound' = case compare ver ver' of
@@ -563,10 +768,6 @@ mkVersionIntervals :: [VersionInterval] -> Maybe VersionIntervals
 mkVersionIntervals intervals
   | invariant (VersionIntervals intervals) = Just (VersionIntervals intervals)
   | otherwise                              = Nothing
-
-validVersion :: Version -> Bool
-validVersion (Version [] _) = False
-validVersion (Version vs _) = all (>=0) vs
 
 validInterval :: (LowerBound, UpperBound) -> Bool
 validInterval i@(l, u) = validLower l && validUpper u && nonEmpty i
@@ -773,7 +974,7 @@ invertVersionIntervals (VersionIntervals xs) =
       invertBound InclusiveBound = ExclusiveBound
 
       noLowerBound :: LowerBound
-      noLowerBound = LowerBound (Version [0] []) InclusiveBound
+      noLowerBound = LowerBound (mkVersion [0]) InclusiveBound
 
 -------------------------------
 -- Parsing and pretty printing
@@ -783,21 +984,23 @@ instance Text VersionRange where
   disp = fst
        . foldVersionRange'                         -- precedence:
            (         Disp.text "-any"                           , 0 :: Int)
-           (\v   -> (Disp.text "==" <> disp v                   , 0))
-           (\v   -> (Disp.char '>'  <> disp v                   , 0))
-           (\v   -> (Disp.char '<'  <> disp v                   , 0))
-           (\v   -> (Disp.text ">=" <> disp v                   , 0))
-           (\v   -> (Disp.text "<=" <> disp v                   , 0))
-           (\v _ -> (Disp.text "==" <> dispWild v               , 0))
+           (\v   -> (Disp.text "==" <<>> disp v                   , 0))
+           (\v   -> (Disp.char '>'  <<>> disp v                   , 0))
+           (\v   -> (Disp.char '<'  <<>> disp v                   , 0))
+           (\v   -> (Disp.text ">=" <<>> disp v                   , 0))
+           (\v   -> (Disp.text "<=" <<>> disp v                   , 0))
+           (\v _ -> (Disp.text "==" <<>> dispWild v               , 0))
+           (\v _ -> (Disp.text "^>=" <<>> disp v                  , 0))
            (\(r1, p1) (r2, p2) ->
              (punct 2 p1 r1 <+> Disp.text "||" <+> punct 2 p2 r2 , 2))
            (\(r1, p1) (r2, p2) ->
              (punct 1 p1 r1 <+> Disp.text "&&" <+> punct 1 p2 r2 , 1))
            (\(r, _)   -> (Disp.parens r, 0))
 
-    where dispWild (Version b _) =
-               Disp.hcat (Disp.punctuate (Disp.char '.') (map Disp.int b))
-            <> Disp.text ".*"
+    where dispWild ver =
+               Disp.hcat (Disp.punctuate (Disp.char '.')
+                                         (map Disp.int $ versionNumbers ver))
+            <<>> Disp.text ".*"
           punct p p' | p < p'    = Disp.parens
                      | otherwise = id
 
@@ -834,7 +1037,7 @@ instance Text VersionRange where
           branch <- Parse.sepBy1 digits (Parse.char '.')
           _ <- Parse.char '.'
           _ <- Parse.char '*'
-          return (WildcardVersion (Version branch []))
+          return (WildcardVersion (mkVersion branch))
 
         parens p = Parse.between (Parse.char '(' >> Parse.skipSpaces)
                                  (Parse.char ')' >> Parse.skipSpaces)
@@ -843,17 +1046,18 @@ instance Text VersionRange where
                                      return (VersionRangeParens a))
 
         digits = do
-          first <- Parse.satisfy Char.isDigit
-          if first == '0'
+          firstDigit <- Parse.satisfy isDigit
+          if firstDigit == '0'
             then return 0
-            else do rest <- Parse.munch Char.isDigit
-                    return (read (first : rest))
+            else do rest <- Parse.munch isDigit
+                    return (read (firstDigit : rest)) -- TODO: eradicateNoParse
 
         parseRangeOp (s,f) = Parse.string s >> Parse.skipSpaces >> fmap f parse
         rangeOps = [ ("<",  EarlierVersion),
                      ("<=", orEarlierVersion),
                      (">",  LaterVersion),
                      (">=", orLaterVersion),
+                     ("^>=", MajorBoundVersion),
                      ("==", ThisVersion) ]
 
 -- | Does the version range have an upper bound?

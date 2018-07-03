@@ -37,8 +37,10 @@ AC_CHECK_FUNCS([nanosleep])
 AC_CHECK_FUNCS([ptsname])
 AC_CHECK_FUNCS([setitimer])
 AC_CHECK_FUNCS([readdir_r])
+
 dnl not available on android so check for it
-AC_CHECK_FUNCS([telldir seekdir])
+AC_CANONICAL_TARGET
+AS_CASE([$target_os],[*-android*],[],[AC_CHECK_FUNCS([telldir seekdir])])
 
 dnl When available, _NSGetEnviron() (defined in <crt_externs.h>) is
 dnl the preferred way to access environ(7)
@@ -71,7 +73,10 @@ AC_CHECK_FUNCS([utimensat futimens])
 AC_CHECK_FUNCS([lutimes futimes])
 
 # Additional temp functions
-AC_CHECK_FUNCS([mkstemps mkdtemp])
+dnl androids bionic doesn't have mkstemps
+# We explicilty check for android, as the check AC_CHECK_FUNCS performs returns "yes" for mkstemps
+# when targetting android. See similar conditionals for seekdir and telldir.
+AS_CASE([$target_os],[*-android*],[AC_CHECK_FUNCS([mkdtemp])],[AC_CHECK_FUNCS([mkstemps mkdtemp])])
 
 # Functions for file synchronization and allocation control
 AC_CHECK_FUNCS([fsync])

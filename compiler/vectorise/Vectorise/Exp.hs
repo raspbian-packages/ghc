@@ -44,9 +44,6 @@ import Outputable
 import FastString
 import DynFlags
 import Util
-#if __GLASGOW_HASKELL__ < 709
-import MonadUtils
-#endif
 
 import Control.Monad
 import Data.Maybe
@@ -326,6 +323,7 @@ liftSimple aexpr
 isToplevel :: Var -> Bool
 isToplevel v | isId v    = case realIdUnfolding v of
                              NoUnfolding                     -> False
+                             BootUnfolding                   -> False
                              OtherCon      {}                -> True
                              DFunUnfolding {}                -> True
                              CoreUnfolding {uf_is_top = top} -> top
@@ -362,7 +360,8 @@ vectExpr (_, AnnApp (_, AnnApp (_, AnnVar v) (_, AnnType ty)) err)
   | v == pAT_ERROR_ID
   = do
     { (vty, lty) <- vectAndLiftType ty
-    ; return (mkCoreApps (Var v) [Type (getRuntimeRep "vectExpr" vty), Type vty, err'], mkCoreApps (Var v) [Type lty, err'])
+    ; return (mkCoreApps (Var v) [Type (getRuntimeRep vty), Type vty, err'],
+              mkCoreApps (Var v) [Type lty, err'])
     }
   where
     err' = deAnnotate err

@@ -46,7 +46,7 @@ void sendMessage(Capability *from_cap, Capability *to_cap, Message *msg)
     if (to_cap->running_task == NULL) {
         to_cap->running_task = myTask();
             // precond for releaseCapability_()
-        releaseCapability_(to_cap,rtsFalse);
+        releaseCapability_(to_cap,false);
     } else {
         interruptCapability(to_cap);
     }
@@ -80,7 +80,7 @@ loop:
     else if (i == &stg_MSG_THROWTO_info)
     {
         MessageThrowTo *t = (MessageThrowTo *)m;
-        nat r;
+        uint32_t r;
         const StgInfoTable *i;
 
         i = lockClosure((StgClosure*)m);
@@ -113,7 +113,7 @@ loop:
     }
     else if (i == &stg_MSG_BLACKHOLE_info)
     {
-        nat r;
+        uint32_t r;
         MessageBlackHole *b = (MessageBlackHole*)m;
 
         r = messageBlackHole(cap, b);
@@ -158,7 +158,7 @@ loop:
 
    ------------------------------------------------------------------------- */
 
-nat messageBlackHole(Capability *cap, MessageBlackHole *msg)
+uint32_t messageBlackHole(Capability *cap, MessageBlackHole *msg)
 {
     const StgInfoTable *info;
     StgClosure *p;
@@ -289,7 +289,9 @@ loop:
             recordClosureMutated(cap,(StgClosure*)bq);
         }
 
-        debugTraceCap(DEBUG_sched, cap, "thread %d blocked on thread %d",
+        debugTraceCap(DEBUG_sched, cap,
+                      "thread %d blocked on existing BLOCKING_QUEUE "
+                      "owned by thread %d",
                       (W_)msg->tso->id, (W_)owner->id);
 
         // See above, #3838

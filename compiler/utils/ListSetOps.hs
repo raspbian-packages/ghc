@@ -8,14 +8,14 @@
 {-# LANGUAGE CPP #-}
 
 module ListSetOps (
-        unionLists, minusList, insertList,
+        unionLists, minusList,
 
         -- Association lists
         Assoc, assoc, assocMaybe, assocUsing, assocDefault, assocDefaultUsing,
 
         -- Duplicate handling
         hasNoDups, runs, removeDups, findDupsEq,
-        equivClasses, equivClassesByUniq,
+        equivClasses,
 
         -- Indexing
         getNth
@@ -24,8 +24,6 @@ module ListSetOps (
 #include "HsVersions.h"
 
 import Outputable
-import Unique
-import UniqFM
 import Util
 
 import Data.List
@@ -43,10 +41,6 @@ getNth xs n = ASSERT2( xs `lengthExceeds` n, ppr n $$ ppr xs )
 ************************************************************************
 -}
 
-insertList :: Eq a => a -> [a] -> [a]
--- Assumes the arg list contains no dups; guarantees the result has no dups
-insertList x xs | isIn "insert" x xs = xs
-                | otherwise          = x : xs
 
 unionLists :: (Outputable a, Eq a) => [a] -> [a] -> [a]
 -- Assumes that the arguments contain no duplicates
@@ -159,16 +153,3 @@ findDupsEq _  [] = []
 findDupsEq eq (x:xs) | null eq_xs  = findDupsEq eq xs
                      | otherwise   = (x:eq_xs) : findDupsEq eq neq_xs
     where (eq_xs, neq_xs) = partition (eq x) xs
-
-equivClassesByUniq :: (a -> Unique) -> [a] -> [[a]]
-        -- NB: it's *very* important that if we have the input list [a,b,c],
-        -- where a,b,c all have the same unique, then we get back the list
-        --      [a,b,c]
-        -- not
-        --      [c,b,a]
-        -- Hence the use of foldr, plus the reversed-args tack_on below
-equivClassesByUniq get_uniq xs
-  = eltsUFM (foldr add emptyUFM xs)
-  where
-    add a ufm = addToUFM_C tack_on ufm (get_uniq a) [a]
-    tack_on old new = new++old

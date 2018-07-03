@@ -14,20 +14,25 @@
 -- -----------------------------------------------------------------------------
 module GhcMake(
         depanal,
-        load, LoadHowMuch(..),
+        load, load', LoadHowMuch(..),
 
         topSortModuleGraph,
 
         ms_home_srcimps, ms_home_imps,
 
-        noModError, cyclicModuleErr
+        IsBoot(..),
+        summariseModule,
+        hscSourceToIsBoot,
+        findExtraSigImports,
+        implicitRequirements,
+
+        noModError, cyclicModuleErr,
+        moduleGraphNodes, SummaryNode
     ) where
 
 #include "HsVersions.h"
 
-#ifdef GHCI
 import qualified Linker         ( unload )
-#endif
 
 import DriverPhases
 import DriverPipeline
@@ -40,6 +45,7 @@ import HscTypes
 import Module
 import TcIface          ( typecheckIface )
 import TcRnMonad        ( initIfaceCheck )
+import HscMain
 
 import Bag              ( listToBag )
 import BasicTypes
@@ -55,8 +61,13 @@ import SrcLoc
 import StringBuffer
 import SysTools
 import UniqFM
+import UniqDSet
+import TcBackpack
+import Packages
+import UniqSet
 import Util
 import qualified GHC.LanguageExtensions as LangExt
+import NameEnv
 
 import Data.Either ( rights, partitionEithers )
 import qualified Data.Map as Map
@@ -114,7 +125,7 @@ depanal excluded_mods allow_dup_roots = do
          targets = hsc_targets hsc_env
          old_graph = hsc_mod_graph hsc_env
 
-  withTiming (return dflags) (text "Chasing dependencies") (const ()) $ do
+  withTiming (pure dflags) (text "Chasing dependencies") (const ()) $ do
     liftIO $ debugTraceMsg dflags 2 (hcat [
               text "Chasing modules from: ",
               hcat (punctuate comma (map pprTarget targets))])
@@ -122,8 +133,70 @@ depanal excluded_mods allow_dup_roots = do
     mod_graphE <- liftIO $ downsweep hsc_env old_graph
                                      excluded_mods allow_dup_roots
     mod_graph <- reportImportErrors mod_graphE
-    modifySession $ \_ -> hsc_env { hsc_mod_graph = mod_graph }
+
+    warnMissingHomeModules hsc_env mod_graph
+
+    setSession hsc_env { hsc_mod_graph = mod_graph }
     return mod_graph
+
+-- Note [Missing home modules]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- Sometimes user doesn't want GHC to pick up modules, not explicitly listed
+-- in a command line. For example, cabal may want to enable this warning
+-- when building a library, so that GHC warns user about modules, not listed
+-- neither in `exposed-modules`, nor in `other-modules`.
+--
+-- Here "home module" means a module, that doesn't come from an other package.
+--
+-- For example, if GHC is invoked with modules "A" and "B" as targets,
+-- but "A" imports some other module "C", then GHC will issue a warning
+-- about module "C" not being listed in a command line.
+--
+-- The warning in enabled by `-Wmissing-home-modules`. See Trac #13129
+warnMissingHomeModules :: GhcMonad m => HscEnv -> ModuleGraph -> m ()
+warnMissingHomeModules hsc_env mod_graph =
+    when (wopt Opt_WarnMissingHomeModules dflags && not (null missing)) $
+        logWarnings (listToBag [warn])
+  where
+    dflags = hsc_dflags hsc_env
+    targets = map targetId (hsc_targets hsc_env)
+
+    is_known_module mod = any (is_my_target mod) targets
+
+    -- We need to be careful to handle the case where (possibly
+    -- path-qualified) filenames (aka 'TargetFile') rather than module
+    -- names are being passed on the GHC command-line.
+    --
+    -- For instance, `ghc --make src-exe/Main.hs` and
+    -- `ghc --make -isrc-exe Main` are supposed to be equivalent.
+    -- Note also that we can't always infer the associated module name
+    -- directly from the filename argument.  See Trac #13727.
+    is_my_target mod (TargetModule name)
+      = moduleName (ms_mod mod) == name
+    is_my_target mod (TargetFile target_file _)
+      | Just mod_file <- ml_hs_file (ms_location mod)
+      = target_file == mod_file ||
+           --  We can get a file target even if a module name was
+           --  originally specified in a command line because it can
+           --  be converted in guessTarget (by appending .hs/.lhs).
+           --  So let's convert it back and compare with module name
+           mkModuleName (fst $ splitExtension target_file)
+            == moduleName (ms_mod mod)
+    is_my_target _ _ = False
+
+    missing = map (moduleName . ms_mod) $
+      filter (not . is_known_module) mod_graph
+
+    msg
+      | gopt Opt_BuildingCabalPackage dflags
+      = text "These modules are needed for compilation but not listed in your .cabal file's other-modules: "
+        <> sep (map ppr missing)
+      | otherwise
+      = text "Modules are not listed in command line but needed for compilation: "
+        <> sep (map ppr missing)
+    warn = makeIntoWarning
+      (Reason Opt_WarnMissingHomeModules)
+      (mkPlainErrMsg dflags noSrcSpan msg)
 
 -- | Describes which modules of the module graph need to be loaded.
 data LoadHowMuch
@@ -152,6 +225,14 @@ data LoadHowMuch
 load :: GhcMonad m => LoadHowMuch -> m SuccessFlag
 load how_much = do
     mod_graph <- depanal [] False
+    load' how_much (Just batchMsg) mod_graph
+
+-- | Generalized version of 'load' which also supports a custom
+-- 'Messager' (for reporting progress) and 'ModuleGraph' (generally
+-- produced by calling 'depanal'.
+load' :: GhcMonad m => LoadHowMuch -> Maybe Messager -> ModuleGraph -> m SuccessFlag
+load' how_much mHscMessage mod_graph = do
+    modifySession $ \hsc_env -> hsc_env { hsc_mod_graph = mod_graph }
     guessOutputFile
     hsc_env <- getSession
 
@@ -222,7 +303,7 @@ load how_much = do
     -- Unload any modules which are going to be re-linked this time around.
     let stable_linkables = [ linkable
                            | m <- stable_obj++stable_bco,
-                             Just hmi <- [lookupUFM pruned_hpt m],
+                             Just hmi <- [lookupHpt pruned_hpt m],
                              Just linkable <- [hm_linkable hmi] ]
     liftIO $ unload hsc_env stable_linkables
 
@@ -296,7 +377,7 @@ load how_much = do
 
     setSession hsc_env{ hsc_HPT = emptyHomePackageTable }
     (upsweep_ok, modsUpswept)
-       <- upsweep_fn pruned_hpt stable_mods cleanup mg
+       <- upsweep_fn mHscMessage pruned_hpt stable_mods cleanup mg
 
     -- Make modsDone be the summaries for each home module now
     -- available; this should equal the domain of hpt3.
@@ -357,7 +438,7 @@ load how_much = do
                  = findPartiallyCompletedCycles modsDone_names
                       mg2_with_srcimps
           let mods_to_keep
-                 = filter ((`notElem` mods_to_zap_names).ms_mod)
+                 = filter ((`Set.notMember` mods_to_zap_names).ms_mod)
                       modsDone
 
           hsc_env1 <- getSession
@@ -370,9 +451,9 @@ load how_much = do
           -- there should be no Nothings where linkables should be, now
           let just_linkables =
                     isNoLink (ghcLink dflags)
-                 || all (isJust.hm_linkable)
-                        (filter ((== HsSrcFile).mi_hsc_src.hm_iface)
-                                (eltsUFM hpt4))
+                 || allHpt (isJust.hm_linkable)
+                        (filterHpt ((== HsSrcFile).mi_hsc_src.hm_iface)
+                                hpt4)
           ASSERT( just_linkables ) do
 
           -- Link everything together
@@ -459,7 +540,7 @@ guessOutputFile = modifySession $ \env ->
 
         name_exe = do
 #if defined(mingw32_HOST_OS)
-          -- we must add the .exe extention unconditionally here, otherwise
+          -- we must add the .exe extension unconditionally here, otherwise
           -- when name has an extension of its own, the .exe extension will
           -- not be added by DriverPipeline.exeFileName.  See #2248
           name' <- fmap (<.> "exe") name
@@ -498,7 +579,7 @@ pruneHomePackageTable :: HomePackageTable
                       -> ([ModuleName],[ModuleName])
                       -> HomePackageTable
 pruneHomePackageTable hpt summ (stable_obj, stable_bco)
-  = mapUFM prune hpt
+  = mapHpt prune hpt
   where prune hmi
           | is_stable modl = hmi'
           | otherwise      = hmi'{ hm_details = emptyModDetails }
@@ -518,23 +599,18 @@ pruneHomePackageTable hpt summ (stable_obj, stable_bco)
 --
 -- | Return (names of) all those in modsDone who are part of a cycle as defined
 -- by theGraph.
-findPartiallyCompletedCycles :: [Module] -> [SCC ModSummary] -> [Module]
+findPartiallyCompletedCycles :: [Module] -> [SCC ModSummary] -> Set.Set Module
 findPartiallyCompletedCycles modsDone theGraph
-   = chew theGraph
-     where
-        chew [] = []
-        chew ((AcyclicSCC _):rest) = chew rest    -- acyclic?  not interesting.
-        chew ((CyclicSCC vs):rest)
-           = let names_in_this_cycle = nub (map ms_mod vs)
-                 mods_in_this_cycle
-                    = nub ([done | done <- modsDone,
-                                   done `elem` names_in_this_cycle])
-                 chewed_rest = chew rest
-             in
-             if   notNull mods_in_this_cycle
-                  && length mods_in_this_cycle < length names_in_this_cycle
-             then mods_in_this_cycle ++ chewed_rest
-             else chewed_rest
+   = Set.unions
+       [mods_in_this_cycle
+       | CyclicSCC vs <- theGraph  -- Acyclic? Not interesting.
+       , let names_in_this_cycle = Set.fromList (map ms_mod vs)
+             mods_in_this_cycle =
+                    Set.intersection (Set.fromList modsDone) names_in_this_cycle
+         -- If size mods_in_this_cycle == size names_in_this_cycle,
+         -- then this cycle has already been completed and we're not
+         -- interested.
+       , Set.size mods_in_this_cycle < Set.size names_in_this_cycle]
 
 
 -- ---------------------------------------------------------------------------
@@ -543,13 +619,7 @@ findPartiallyCompletedCycles modsDone theGraph
 unload :: HscEnv -> [Linkable] -> IO ()
 unload hsc_env stable_linkables -- Unload everthing *except* 'stable_linkables'
   = case ghcLink (hsc_dflags hsc_env) of
-#ifdef GHCI
         LinkInMemory -> Linker.unload hsc_env stable_linkables
-#else
-        LinkInMemory -> panic "unload: no interpreter"
-                                -- urgh.  avoid warnings:
-                                hsc_env stable_linkables
-#endif
         _other -> return ()
 
 -- -----------------------------------------------------------------------------
@@ -600,6 +670,11 @@ unload hsc_env stable_linkables -- Unload everthing *except* 'stable_linkables'
 
     - Note that objects are only considered stable if they only depend
       on other objects.  We can't link object code against byte code.
+
+    - Note that even if an object is stable, we may end up recompiling
+      if the interface is out of date because an *external* interface
+      has changed.  The current code in GhcMake handles this case
+      fairly poorly, so be careful.
 -}
 checkStability
         :: HomePackageTable   -- HPT from last compilation
@@ -639,7 +714,7 @@ checkStability hpt sccs all_home_mods = foldl checkSCC ([],[]) sccs
                                          && same_as_prev t
           | otherwise = False
           where
-             same_as_prev t = case lookupUFM hpt (ms_mod_name ms) of
+             same_as_prev t = case lookupHpt hpt (ms_mod_name ms) of
                                 Just hmi  | Just l <- hm_linkable hmi
                                  -> isObjectLinkable l && t == linkableTime l
                                 _other  -> True
@@ -655,7 +730,7 @@ checkStability hpt sccs all_home_mods = foldl checkSCC ([],[]) sccs
 
         bco_ok ms
           | gopt Opt_ForceRecomp (ms_hspp_opts ms) = False
-          | otherwise = case lookupUFM hpt (ms_mod_name ms) of
+          | otherwise = case lookupHpt hpt (ms_mod_name ms) of
                 Just hmi  | Just l <- hm_linkable hmi ->
                         not (isObjectLinkable l) &&
                         linkableTime l >= ms_hs_date ms
@@ -735,15 +810,19 @@ parUpsweep
     :: GhcMonad m
     => Int
     -- ^ The number of workers we wish to run in parallel
+    -> Maybe Messager
     -> HomePackageTable
     -> ([ModuleName],[ModuleName])
     -> (HscEnv -> IO ())
     -> [SCC ModSummary]
     -> m (SuccessFlag,
           [ModSummary])
-parUpsweep n_jobs old_hpt stable_mods cleanup sccs = do
+parUpsweep n_jobs mHscMessage old_hpt stable_mods cleanup sccs = do
     hsc_env <- getSession
     let dflags = hsc_dflags hsc_env
+
+    when (not (null (unitIdsToCheck dflags))) $
+      throwGhcException (ProgramError "Backpack typechecking not supported with -j")
 
     -- The bits of shared state we'll be using:
 
@@ -761,7 +840,12 @@ parUpsweep n_jobs old_hpt stable_mods cleanup sccs = do
 
     let updNumCapabilities = liftIO $ do
             n_capabilities <- getNumCapabilities
-            unless (n_capabilities /= 1) $ setNumCapabilities n_jobs
+            n_cpus <- getNumProcessors
+            -- Setting number of capabilities more than
+            -- CPU count usually leads to high userspace
+            -- lock contention. Trac #9221
+            let n_caps = min n_jobs n_cpus
+            unless (n_capabilities /= 1) $ setNumCapabilities n_caps
             return n_capabilities
     -- Reset the number of capabilities once the upsweep ends.
     let resetNumCapabilities orig_n = liftIO $ setNumCapabilities orig_n
@@ -829,7 +913,7 @@ parUpsweep n_jobs old_hpt stable_mods cleanup sccs = do
                 -- work to compile the module (see parUpsweep_one).
                 m_res <- try $ unmask $ prettyPrintGhcErrors lcl_dflags $
                         parUpsweep_one mod home_mod_map comp_graph_loops
-                                       lcl_dflags cleanup
+                                       lcl_dflags mHscMessage cleanup
                                        par_sem hsc_env_var old_hpt_var
                                        stable_mods mod_idx (length sccs)
 
@@ -913,7 +997,7 @@ parUpsweep n_jobs old_hpt stable_mods cleanup sccs = do
             print_loop [] = read_msgs
             print_loop (x:xs) = case x of
                 Just (reason,severity,srcSpan,style,msg) -> do
-                    log_action dflags dflags reason severity srcSpan style msg
+                    putLogMsg dflags reason severity srcSpan style msg
                     print_loop xs
                 -- Exit the loop once we encounter the end marker.
                 Nothing -> return ()
@@ -928,6 +1012,8 @@ parUpsweep_one
     -- ^ The list of all module loops within the compilation graph.
     -> DynFlags
     -- ^ The thread-local DynFlags
+    -> Maybe Messager
+    -- ^ The messager
     -> (HscEnv -> IO ())
     -- ^ The callback for cleaning up intermediate files
     -> QSem
@@ -944,7 +1030,7 @@ parUpsweep_one
     -- ^ The total number of modules
     -> IO SuccessFlag
     -- ^ The result of this compile
-parUpsweep_one mod home_mod_map comp_graph_loops lcl_dflags cleanup par_sem
+parUpsweep_one mod home_mod_map comp_graph_loops lcl_dflags mHscMessage cleanup par_sem
                hsc_env_var old_hpt_var stable_mods mod_index num_mods = do
 
     let this_build_mod = mkBuildModule mod
@@ -1047,9 +1133,26 @@ parUpsweep_one mod home_mod_map comp_graph_loops lcl_dflags cleanup par_sem
                 let lcl_mod = localize_mod mod
                 let lcl_hsc_env = localize_hsc_env hsc_env
 
+                -- Re-typecheck the loop
+                -- This is necessary to make sure the knot is tied when
+                -- we close a recursive module loop, see bug #12035.
+                type_env_var <- liftIO $ newIORef emptyNameEnv
+                let lcl_hsc_env' = lcl_hsc_env { hsc_type_env_var =
+                                    Just (ms_mod lcl_mod, type_env_var) }
+                lcl_hsc_env'' <- case finish_loop of
+                    Nothing   -> return lcl_hsc_env'
+                    -- In the non-parallel case, the retypecheck prior to
+                    -- typechecking the loop closer includes all modules
+                    -- EXCEPT the loop closer.  However, our precomputed
+                    -- SCCs include the loop closer, so we have to filter
+                    -- it out.
+                    Just loop -> typecheckLoop lcl_dflags lcl_hsc_env' $
+                                 filter (/= moduleName (fst this_build_mod)) $
+                                 map (moduleName . fst) loop
+
                 -- Compile the module.
-                mod_info <- upsweep_mod lcl_hsc_env old_hpt stable_mods lcl_mod
-                                        mod_index num_mods
+                mod_info <- upsweep_mod lcl_hsc_env'' mHscMessage old_hpt stable_mods
+                                        lcl_mod mod_index num_mods
                 return (Just mod_info)
 
         case mb_mod_info of
@@ -1060,14 +1163,17 @@ parUpsweep_one mod home_mod_map comp_graph_loops lcl_dflags cleanup par_sem
                 -- Prune the old HPT unless this is an hs-boot module.
                 unless (isBootSummary mod) $
                     atomicModifyIORef' old_hpt_var $ \old_hpt ->
-                        (delFromUFM old_hpt this_mod, ())
+                        (delFromHpt old_hpt this_mod, ())
 
                 -- Update and fetch the global HscEnv.
                 lcl_hsc_env' <- modifyMVar hsc_env_var $ \hsc_env -> do
-                    let hsc_env' = hsc_env { hsc_HPT = addToUFM (hsc_HPT hsc_env)
-                                                                this_mod mod_info }
-                    -- If this module is a loop finisher, now is the time to
-                    -- re-typecheck the loop.
+                    let hsc_env' = hsc_env
+                                     { hsc_HPT = addToHpt (hsc_HPT hsc_env)
+                                                           this_mod mod_info }
+                    -- We've finished typechecking the module, now we must
+                    -- retypecheck the loop AGAIN to ensure unfoldings are
+                    -- updated.  This time, however, we include the loop
+                    -- closer!
                     hsc_env'' <- case finish_loop of
                         Nothing   -> return hsc_env'
                         Just loop -> typecheckLoop lcl_dflags hsc_env' $
@@ -1099,7 +1205,8 @@ parUpsweep_one mod home_mod_map comp_graph_loops lcl_dflags cleanup par_sem
 -- There better had not be any cyclic groups here -- we check for them.
 upsweep
     :: GhcMonad m
-    => HomePackageTable            -- ^ HPT from last time round (pruned)
+    => Maybe Messager
+    -> HomePackageTable            -- ^ HPT from last time round (pruned)
     -> ([ModuleName],[ModuleName]) -- ^ stable modules (see checkStability)
     -> (HscEnv -> IO ())           -- ^ How to clean up unwanted tmp files
     -> [SCC ModSummary]            -- ^ Mods to do (the worklist)
@@ -1111,23 +1218,28 @@ upsweep
        --  2. The 'HscEnv' in the monad has an updated HPT
        --  3. A list of modules which succeeded loading.
 
-upsweep old_hpt stable_mods cleanup sccs = do
+upsweep mHscMessage old_hpt stable_mods cleanup sccs = do
+   dflags <- getSessionDynFlags
    (res, done) <- upsweep' old_hpt [] sccs 1 (length sccs)
+                           (unitIdsToCheck dflags) done_holes
    return (res, reverse done)
  where
+  done_holes = emptyUniqSet
 
   upsweep' _old_hpt done
-     [] _ _
-   = return (Succeeded, done)
+     [] _ _ uids_to_check _
+   = do hsc_env <- getSession
+        liftIO . runHsc hsc_env $ mapM_ (ioMsgMaybe . tcRnCheckUnitId hsc_env) uids_to_check
+        return (Succeeded, done)
 
   upsweep' _old_hpt done
-     (CyclicSCC ms:_) _ _
+     (CyclicSCC ms:_) _ _ _ _
    = do dflags <- getSessionDynFlags
         liftIO $ fatalErrorMsg dflags (cyclicModuleErr ms)
         return (Failed, done)
 
   upsweep' old_hpt done
-     (AcyclicSCC mod:mods) mod_index nmods
+     (AcyclicSCC mod:mods) mod_index nmods uids_to_check done_holes
    = do -- putStrLn ("UPSWEEP_MOD: hpt = " ++
         --           show (map (moduleUserString.moduleName.mi_module.hm_iface)
         --                     (moduleEnvElts (hsc_HPT hsc_env)))
@@ -1135,13 +1247,39 @@ upsweep old_hpt stable_mods cleanup sccs = do
 
         hsc_env <- getSession
 
+        -- TODO: Cache this, so that we don't repeatedly re-check
+        -- our imports when you run --make.
+        let (ready_uids, uids_to_check')
+                = partition (\uid -> isEmptyUniqDSet
+                    (unitIdFreeHoles uid `uniqDSetMinusUniqSet` done_holes))
+                     uids_to_check
+            done_holes'
+                | ms_hsc_src mod == HsigFile
+                = addOneToUniqSet done_holes (ms_mod_name mod)
+                | otherwise = done_holes
+        liftIO . runHsc hsc_env $ mapM_ (ioMsgMaybe . tcRnCheckUnitId hsc_env) ready_uids
+
         -- Remove unwanted tmp files between compilations
         liftIO (cleanup hsc_env)
+
+        -- Get ready to tie the knot
+        type_env_var <- liftIO $ newIORef emptyNameEnv
+        let hsc_env1 = hsc_env { hsc_type_env_var =
+                                    Just (ms_mod mod, type_env_var) }
+        setSession hsc_env1
+
+        -- Lazily reload the HPT modules participating in the loop.
+        -- See Note [Tying the knot]--if we don't throw out the old HPT
+        -- and reinitalize the knot-tying process, anything that was forced
+        -- while we were previously typechecking won't get updated, this
+        -- was bug #12035.
+        hsc_env2 <- liftIO $ reTypecheckLoop hsc_env1 mod done
+        setSession hsc_env2
 
         mb_mod_info
             <- handleSourceError
                    (\err -> do logger mod (Just err); return Nothing) $ do
-                 mod_info <- liftIO $ upsweep_mod hsc_env old_hpt stable_mods
+                 mod_info <- liftIO $ upsweep_mod hsc_env2 mHscMessage old_hpt stable_mods
                                                   mod mod_index nmods
                  logger mod Nothing -- log warnings
                  return (Just mod_info)
@@ -1152,8 +1290,8 @@ upsweep old_hpt stable_mods cleanup sccs = do
                 let this_mod = ms_mod_name mod
 
                         -- Add new info to hsc_env
-                    hpt1     = addToUFM (hsc_HPT hsc_env) this_mod mod_info
-                    hsc_env1 = hsc_env { hsc_HPT = hpt1 }
+                    hpt1     = addToHpt (hsc_HPT hsc_env2) this_mod mod_info
+                    hsc_env3 = hsc_env2 { hsc_HPT = hpt1, hsc_type_env_var = Nothing }
 
                         -- Space-saving: delete the old HPT entry
                         -- for mod BUT if mod is a hs-boot
@@ -1163,16 +1301,42 @@ upsweep old_hpt stable_mods cleanup sccs = do
                         -- would force the real module to be recompiled
                         -- every time.
                     old_hpt1 | isBootSummary mod = old_hpt
-                             | otherwise = delFromUFM old_hpt this_mod
+                             | otherwise = delFromHpt old_hpt this_mod
 
                     done' = mod:done
 
                         -- fixup our HomePackageTable after we've finished compiling
-                        -- a mutually-recursive loop.  See reTypecheckLoop, below.
-                hsc_env2 <- liftIO $ reTypecheckLoop hsc_env1 mod done'
-                setSession hsc_env2
+                        -- a mutually-recursive loop.  We have to do this again
+                        -- to make sure we have the final unfoldings, which may
+                        -- not have been computed accurately in the previous
+                        -- retypecheck.
+                hsc_env4 <- liftIO $ reTypecheckLoop hsc_env3 mod done'
+                setSession hsc_env4
 
-                upsweep' old_hpt1 done' mods (mod_index+1) nmods
+                        -- Add any necessary entries to the static pointer
+                        -- table. See Note [Grand plan for static forms] in
+                        -- StaticPtrTable.
+                when (hscTarget (hsc_dflags hsc_env4) == HscInterpreted) $
+                    liftIO $ hscAddSptEntries hsc_env4
+                                 [ spt
+                                 | Just linkable <- pure $ hm_linkable mod_info
+                                 , unlinked <- linkableUnlinked linkable
+                                 , BCOs _ spts <- pure unlinked
+                                 , spt <- spts
+                                 ]
+
+                upsweep' old_hpt1 done' mods (mod_index+1) nmods uids_to_check' done_holes'
+
+unitIdsToCheck :: DynFlags -> [UnitId]
+unitIdsToCheck dflags =
+  nubSort $ concatMap goUnitId (explicitPackages (pkgState dflags))
+ where
+  goUnitId uid =
+    case splitUnitIdInsts uid of
+      (_, Just indef) ->
+        let insts = indefUnitIdInsts indef
+        in uid : concatMap (goUnitId . moduleUnitId . snd) insts
+      _ -> []
 
 maybeGetIfaceDate :: DynFlags -> ModLocation -> IO (Maybe UTCTime)
 maybeGetIfaceDate dflags location
@@ -1186,13 +1350,14 @@ maybeGetIfaceDate dflags location
 -- | Compile a single module.  Always produce a Linkable for it if
 -- successful.  If no compilation happened, return the old Linkable.
 upsweep_mod :: HscEnv
+            -> Maybe Messager
             -> HomePackageTable
             -> ([ModuleName],[ModuleName])
             -> ModSummary
             -> Int  -- index of module
             -> Int  -- total number of modules
             -> IO HomeModInfo
-upsweep_mod hsc_env old_hpt (stable_obj, stable_bco) summary mod_index nmods
+upsweep_mod hsc_env mHscMessage old_hpt (stable_obj, stable_bco) summary mod_index nmods
    =    let
             this_mod_name = ms_mod_name summary
             this_mod    = ms_mod summary
@@ -1204,7 +1369,7 @@ upsweep_mod hsc_env old_hpt (stable_obj, stable_bco) summary mod_index nmods
             is_stable_obj = this_mod_name `elem` stable_obj
             is_stable_bco = this_mod_name `elem` stable_bco
 
-            old_hmi = lookupUFM old_hpt this_mod_name
+            old_hmi = lookupHpt old_hpt this_mod_name
 
             -- We're using the dflags for this module now, obtained by
             -- applying any options in its LANGUAGE & OPTIONS_GHC pragmas.
@@ -1245,13 +1410,13 @@ upsweep_mod hsc_env old_hpt (stable_obj, stable_bco) summary mod_index nmods
 
             compile_it :: Maybe Linkable -> SourceModified -> IO HomeModInfo
             compile_it  mb_linkable src_modified =
-                  compileOne hsc_env summary' mod_index nmods
+                  compileOne' Nothing mHscMessage hsc_env summary' mod_index nmods
                              mb_old_iface mb_linkable src_modified
 
             compile_it_discard_iface :: Maybe Linkable -> SourceModified
                                      -> IO HomeModInfo
             compile_it_discard_iface mb_linkable  src_modified =
-                  compileOne hsc_env summary' mod_index nmods
+                  compileOne' Nothing mHscMessage hsc_env summary' mod_index nmods
                              Nothing mb_linkable src_modified
 
             -- With the HscNothing target we create empty linkables to avoid
@@ -1360,9 +1525,9 @@ upsweep_mod hsc_env old_hpt (stable_obj, stable_bco) summary mod_index nmods
 -- Filter modules in the HPT
 retainInTopLevelEnvs :: [ModuleName] -> HomePackageTable -> HomePackageTable
 retainInTopLevelEnvs keep_these hpt
-   = listToUFM   [ (mod, expectJust "retain" mb_mod_info)
+   = listToHpt   [ (mod, expectJust "retain" mb_mod_info)
                  | mod <- keep_these
-                 , let mb_mod_info = lookupUFM hpt mod
+                 , let mb_mod_info = lookupHpt hpt mod
                  , isJust mb_mod_info ]
 
 -- ---------------------------------------------------------------------------
@@ -1398,11 +1563,50 @@ Following this fix, GHC can compile itself with --make -O2.
 reTypecheckLoop :: HscEnv -> ModSummary -> ModuleGraph -> IO HscEnv
 reTypecheckLoop hsc_env ms graph
   | Just loop <- getModLoop ms graph
-  , let non_boot = filter (not.isBootSummary) loop
+  -- SOME hs-boot files should still
+  -- get used, just not the loop-closer.
+  , let non_boot = filter (\l -> not (isBootSummary l &&
+                                 ms_mod l == ms_mod ms)) loop
   = typecheckLoop (hsc_dflags hsc_env) hsc_env (map ms_mod_name non_boot)
   | otherwise
   = return hsc_env
 
+-- | Given a non-boot ModSummary @ms@ of a module, for which there exists a
+-- corresponding boot file in @graph@, return the set of modules which
+-- transitively depend on this boot file.  This function is slightly misnamed,
+-- but its name "getModLoop" alludes to the fact that, when getModLoop is called
+-- with a graph that does not contain @ms@ (non-parallel case) or is an
+-- SCC with hs-boot nodes dropped (parallel-case), the modules which
+-- depend on the hs-boot file are typically (but not always) the
+-- modules participating in the recursive module loop.  The returned
+-- list includes the hs-boot file.
+--
+-- Example:
+--      let g represent the module graph:
+--          C.hs
+--          A.hs-boot imports C.hs
+--          B.hs imports A.hs-boot
+--          A.hs imports B.hs
+--      genModLoop A.hs g == Just [A.hs-boot, B.hs, A.hs]
+--
+--      It would also be permissible to omit A.hs from the graph,
+--      in which case the result is [A.hs-boot, B.hs]
+--
+-- Example:
+--      A counter-example to the claim that modules returned
+--      by this function participate in the loop occurs here:
+--
+--      let g represent the module graph:
+--          C.hs
+--          A.hs-boot imports C.hs
+--          B.hs imports A.hs-boot
+--          A.hs imports B.hs
+--          D.hs imports A.hs-boot
+--      genModLoop A.hs g == Just [A.hs-boot, B.hs, A.hs, D.hs]
+--
+--      Arguably, D.hs should import A.hs, not A.hs-boot, but
+--      a dependency on the boot file is not illegal.
+--
 getModLoop :: ModSummary -> ModuleGraph -> Maybe [ModSummary]
 getModLoop ms graph
   | not (isBootSummary ms)
@@ -1414,6 +1618,8 @@ getModLoop ms graph
  where
   this_mod = ms_mod ms
 
+-- NB: sometimes mods has duplicates; this is harmless because
+-- any duplicates get clobbered in addListToHpt and never get forced.
 typecheckLoop :: DynFlags -> HscEnv -> [ModuleName] -> IO HscEnv
 typecheckLoop dflags hsc_env mods = do
   debugTraceMsg dflags 2 $
@@ -1421,16 +1627,16 @@ typecheckLoop dflags hsc_env mods = do
   new_hpt <-
     fixIO $ \new_hpt -> do
       let new_hsc_env = hsc_env{ hsc_HPT = new_hpt }
-      mds <- initIfaceCheck new_hsc_env $
+      mds <- initIfaceCheck (text "typecheckLoop") new_hsc_env $
                 mapM (typecheckIface . hm_iface) hmis
-      let new_hpt = addListToUFM old_hpt
+      let new_hpt = addListToHpt old_hpt
                         (zip mods [ hmi{ hm_details = details }
                                   | (hmi,details) <- zip hmis mds ])
       return new_hpt
   return hsc_env{ hsc_HPT = new_hpt }
   where
     old_hpt = hsc_HPT hsc_env
-    hmis    = map (expectJust "typecheckLoop" . lookupUFM old_hpt) mods
+    hmis    = map (expectJust "typecheckLoop" . lookupHpt old_hpt) mods
 
 reachableBackwards :: ModuleName -> [ModSummary] -> [ModSummary]
 reachableBackwards mod summaries
@@ -1467,7 +1673,9 @@ topSortModuleGraph
 topSortModuleGraph drop_hs_boot_nodes summaries mb_root_mod
   = map (fmap summaryNodeSummary) $ stronglyConnCompG initial_graph
   where
-    (graph, lookup_node) = moduleGraphNodes drop_hs_boot_nodes summaries
+    -- stronglyConnCompG flips the original order, so if we reverse
+    -- the summaries we get a stable topological sort.
+    (graph, lookup_node) = moduleGraphNodes drop_hs_boot_nodes (reverse summaries)
 
     initial_graph = case mb_root_mod of
         Nothing -> graph
@@ -1478,7 +1686,7 @@ topSortModuleGraph drop_hs_boot_nodes summaries mb_root_mod
             -- the specified node.
             let root | Just node <- lookup_node HsSrcFile root_mod, graph `hasVertexG` node = node
                      | otherwise = throwGhcException (ProgramError "module does not exist")
-            in graphFromEdgedVertices (seq root (reachableG graph root))
+            in graphFromEdgedVerticesUniq (seq root (reachableG graph root))
 
 type SummaryNode = (ModSummary, Int, [Int])
 
@@ -1490,7 +1698,8 @@ summaryNodeSummary (s, _, _) = s
 
 moduleGraphNodes :: Bool -> [ModSummary]
   -> (Graph SummaryNode, HscSource -> ModuleName -> Maybe SummaryNode)
-moduleGraphNodes drop_hs_boot_nodes summaries = (graphFromEdgedVertices nodes, lookup_node)
+moduleGraphNodes drop_hs_boot_nodes summaries =
+  (graphFromEdgedVerticesUniq nodes, lookup_node)
   where
     numbered_summaries = zip summaries [1..]
 
@@ -1618,15 +1827,7 @@ downsweep hsc_env old_summaries excl_mods allow_dup_roots
        summs <- loop (concatMap calcDeps rootSummariesOk) root_map
        return summs
      where
-        -- When we're compiling a signature file, we have an implicit
-        -- dependency on what-ever the signature's implementation is.
-        -- (But not when we're type checking!)
-        calcDeps summ
-          | HsigFile <- ms_hsc_src summ
-          , Just m <- getSigOf (hsc_dflags hsc_env) (moduleName (ms_mod summ))
-          , moduleUnitId m == thisPackage (hsc_dflags hsc_env)
-                      = (noLoc (moduleName m), NotBoot) : msDeps summ
-          | otherwise = msDeps summ
+        calcDeps = msDeps
 
         dflags = hsc_dflags hsc_env
         roots = hsc_targets hsc_env
@@ -1647,7 +1848,7 @@ downsweep hsc_env old_summaries excl_mods allow_dup_roots
                                            (L rootLoc modl) obj_allowed
                                            maybe_buf excl_mods
                 case maybe_summary of
-                   Nothing -> return $ Left $ packageModErr dflags modl
+                   Nothing -> return $ Left $ moduleNotFoundErr dflags modl
                    Just s  -> return s
 
         rootLoc = mkGeneralSrcSpan (fsLit "<command line>")
@@ -1792,7 +1993,7 @@ summariseFile hsc_env old_summaries file mb_phase obj_allowed maybe_buf
     get_src_timestamp = case maybe_buf of
                            Just (_,t) -> return t
                            Nothing    -> liftIO $ getModificationUTCTime file
-                        -- getMofificationUTCTime may fail
+                        -- getModificationUTCTime may fail
 
     new_summary src_timestamp = do
         let dflags = hsc_dflags hsc_env
@@ -1821,12 +2022,18 @@ summariseFile hsc_env old_summaries file mb_phase obj_allowed maybe_buf
 
         hi_timestamp <- maybeGetIfaceDate dflags location
 
-        return (ModSummary { ms_mod = mod, ms_hsc_src = hsc_src,
+        extra_sig_imports <- findExtraSigImports hsc_env hsc_src mod_name
+        required_by_imports <- implicitRequirements hsc_env the_imps
+
+        return (ModSummary { ms_mod = mod,
+                             ms_hsc_src = hsc_src,
                              ms_location = location,
                              ms_hspp_file = hspp_fn,
                              ms_hspp_opts = dflags',
                              ms_hspp_buf  = Just buf,
-                             ms_srcimps = srcimps, ms_textual_imps = the_imps,
+                             ms_parsed_mod = Nothing,
+                             ms_srcimps = srcimps,
+                             ms_textual_imps = the_imps ++ extra_sig_imports ++ required_by_imports,
                              ms_hs_date = src_timestamp,
                              ms_iface_date = hi_timestamp,
                              ms_obj_date = obj_timestamp })
@@ -1950,6 +2157,24 @@ summariseModule hsc_env old_summary_map is_boot (L loc wanted_mod)
                               $$ text "Saw:" <+> quotes (ppr mod_name)
                               $$ text "Expected:" <+> quotes (ppr wanted_mod)
 
+        when (hsc_src == HsigFile && isNothing (lookup mod_name (thisUnitIdInsts dflags))) $
+            let suggested_instantiated_with =
+                    hcat (punctuate comma $
+                        [ ppr k <> text "=" <> ppr v
+                        | (k,v) <- ((mod_name, mkHoleModule mod_name)
+                                : thisUnitIdInsts dflags)
+                        ])
+            in throwOneError $ mkPlainErrMsg dflags' mod_loc $
+                text "Unexpected signature:" <+> quotes (ppr mod_name)
+                $$ if gopt Opt_BuildingCabalPackage dflags
+                    then parens (text "Try adding" <+> quotes (ppr mod_name)
+                            <+> text "to the"
+                            <+> quotes (text "signatures")
+                            <+> text "field in your Cabal file.")
+                    else parens (text "Try passing -instantiated-with=\"" <>
+                                 suggested_instantiated_with <> text "\"" $$
+                                text "replacing <" <> ppr mod_name <> text "> as necessary.")
+
                 -- Find the object timestamp, and return the summary
         obj_timestamp <-
            if isObjectTarget (hscTarget (hsc_dflags hsc_env))
@@ -1959,14 +2184,18 @@ summariseModule hsc_env old_summary_map is_boot (L loc wanted_mod)
 
         hi_timestamp <- maybeGetIfaceDate dflags location
 
+        extra_sig_imports <- findExtraSigImports hsc_env hsc_src mod_name
+        required_by_imports <- implicitRequirements hsc_env the_imps
+
         return (Just (Right (ModSummary { ms_mod       = mod,
                               ms_hsc_src   = hsc_src,
                               ms_location  = location,
                               ms_hspp_file = hspp_fn,
                               ms_hspp_opts = dflags',
                               ms_hspp_buf  = Just buf,
+                              ms_parsed_mod = Nothing,
                               ms_srcimps      = srcimps,
-                              ms_textual_imps = the_imps,
+                              ms_textual_imps = the_imps ++ extra_sig_imports ++ required_by_imports,
                               ms_hs_date   = src_timestamp,
                               ms_iface_date = hi_timestamp,
                               ms_obj_date  = obj_timestamp })))
@@ -2026,10 +2255,10 @@ noHsFileErr :: DynFlags -> SrcSpan -> String -> ErrMsg
 noHsFileErr dflags loc path
   = mkPlainErrMsg dflags loc $ text "Can't find" <+> text path
 
-packageModErr :: DynFlags -> ModuleName -> ErrMsg
-packageModErr dflags mod
+moduleNotFoundErr :: DynFlags -> ModuleName -> ErrMsg
+moduleNotFoundErr dflags mod
   = mkPlainErrMsg dflags noSrcSpan $
-        text "module" <+> quotes (ppr mod) <+> text "is a package module"
+        text "module" <+> quotes (ppr mod) <+> text "cannot be found locally"
 
 multiRootsErr :: DynFlags -> [ModSummary] -> IO ()
 multiRootsErr _      [] = panic "multiRootsErr"

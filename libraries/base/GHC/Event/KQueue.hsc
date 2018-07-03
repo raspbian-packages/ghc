@@ -27,6 +27,7 @@ available = False
 #else
 
 import Data.Bits (Bits(..), FiniteBits(..))
+import Data.Int
 import Data.Word (Word16, Word32)
 import Foreign.C.Error (throwErrnoIfMinus1, eINTR, eINVAL,
                         eNOTSUP, getErrno, throwErrno)
@@ -142,6 +143,7 @@ data Event = KEvent {
 event :: Fd -> Filter -> Flag -> FFlag -> Event
 event fd filt flag fflag = KEvent (fromIntegral fd) filt flag fflag 0 nullPtr
 
+-- | @since 4.3.1.0
 instance Storable Event where
     sizeOf _ = #size struct kevent
     alignment _ = alignment (undefined :: CInt)
@@ -185,10 +187,10 @@ newtype Flag = Flag Word16
  , flagOneshot = EV_ONESHOT
  }
 
-#if SIZEOF_KEV_FILTER == 4 /*kevent.filter: uint32_t or uint16_t. */
-newtype Filter = Filter Word32
+#if SIZEOF_KEV_FILTER == 4 /*kevent.filter: int32_t or int16_t. */
+newtype Filter = Filter Int32
 #else
-newtype Filter = Filter Word16
+newtype Filter = Filter Int16
 #endif
     deriving (Bits, FiniteBits, Eq, Num, Show, Storable)
 
@@ -202,6 +204,7 @@ data TimeSpec = TimeSpec {
     , tv_nsec :: {-# UNPACK #-} !CLong
     }
 
+-- | @since 4.3.1.0
 instance Storable TimeSpec where
     sizeOf _ = #size struct timespec
     alignment _ = alignment (undefined :: CInt)

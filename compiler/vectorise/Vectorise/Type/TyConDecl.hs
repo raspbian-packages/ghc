@@ -12,7 +12,6 @@ import Class
 import Type
 import TyCon
 import DataCon
-import BasicTypes
 import DynFlags
 import BasicTypes( DefMethSpec(..) )
 import SrcLoc( SrcSpan, noSrcSpan )
@@ -53,9 +52,6 @@ vectTyConDecl tycon name'
              opTys        = drop (length argTys - length opItems) argTys  -- only method types
        ; methods' <- sequence [ vectMethod id meth ty | ((id, meth), ty) <- zip opItems opTys]
 
-           -- keep the original recursiveness flag
-       ; let rec_flag = boolToRecFlag (isRecursiveTyCon tycon)
-
            -- construct the vectorised class (this also creates the class type constructors and its
            -- data constructor)
            --
@@ -63,15 +59,14 @@ vectTyConDecl tycon name'
        ; cls' <- liftDs $
                    buildClass
                      name'                      -- new name: "V:Class"
-                     (tyConTyVars tycon)        -- keep original type vars
-                     (map (const Nominal) (tyConRoles tycon)) -- all role are N for safety
-                     theta'                     -- superclasses
                      (tyConBinders tycon)       -- keep original kind
+                     (map (const Nominal) (tyConRoles tycon)) -- all role are N for safety
                      (snd . classTvsFds $ cls)  -- keep the original functional dependencies
-                     []                         -- no associated types (for the moment)
-                     methods'                   -- method info
-                     (classMinimalDef cls)      -- Inherit minimal complete definition from cls
-                     rec_flag                   -- whether recursive
+                     (Just (
+                         theta',                 -- superclasses
+                         [],                     -- no associated types (for the moment)
+                         methods',               -- method info
+                         (classMinimalDef cls))) -- Inherit minimal complete definition from cls
 
            -- the original dictionary constructor must map to the vectorised one
        ; let tycon'        = classTyCon cls'
@@ -97,9 +92,8 @@ vectTyConDecl tycon name'
            -- vectorise the data constructor of the class tycon
        ; rhs' <- vectAlgTyConRhs tycon (algTyConRhs tycon)
 
-           -- keep the original recursiveness and GADT flags
-       ; let rec_flag  = boolToRecFlag (isRecursiveTyCon tycon)
-             gadt_flag = isGadtSyntaxTyCon tycon
+           -- keep the original GADT flags
+       ; let gadt_flag = isGadtSyntaxTyCon tycon
 
            -- build the vectorised type constructor
        ; tc_rep_name <- mkDerivedName mkTyConRepOcc name'
@@ -107,13 +101,11 @@ vectTyConDecl tycon name'
                     name'                   -- new name
                     (tyConBinders tycon)
                     (tyConResKind tycon)    -- keep original kind
-                    (tyConTyVars tycon)     -- keep original type vars
                     (map (const Nominal) (tyConRoles tycon)) -- all roles are N for safety
                     Nothing
                     []                      -- no stupid theta
                     rhs'                    -- new constructor defs
                     (VanillaAlgTyCon tc_rep_name)
-                    rec_flag                -- whether recursive
                     gadt_flag               -- whether in GADT syntax
        }
 
@@ -164,6 +156,12 @@ vectAlgTyConRhs tc (TupleTyCon { data_con = con })
     -- but it's the behaviour we had before I refactored the
     -- representation of AlgTyConRhs to add tuples
 
+vectAlgTyConRhs tc (SumTyCon { data_cons = cons })
+  = -- FIXME (osa): I'm pretty sure this is broken.. TupleTyCon case is probably
+    -- also broken when the tuple is unboxed.
+    vectAlgTyConRhs tc (DataTyCon { data_cons = cons
+                                  , is_enum = all (((==) 0) . dataConRepArity) cons })
+
 vectAlgTyConRhs tc (NewTyCon {})
   = do dflags <- getDynFlags
        cantVectorise dflags noNewtypeErr (ppr tc)
@@ -200,8 +198,8 @@ vectDataCon dc
                     (dataConSrcBangs dc)           -- strictness as original constructor
                     (Just $ dataConImplBangs dc)
                     []                             -- no labelled fields for now
-                    univ_tvs univ_bndrs            -- universally quantified vars
-                    [] []                          -- no existential tvs for now
+                    univ_bndrs                     -- universally quantified vars
+                    []                             -- no existential tvs for now
                     []                             -- no equalities for now
                     []                             -- no context for now
                     arg_tys                        -- argument types
@@ -213,4 +211,4 @@ vectDataCon dc
     rep_arg_tys = dataConRepArgTys dc
     tycon       = dataConTyCon dc
     (univ_tvs, ex_tvs, eq_spec, theta, _arg_tys, _res_ty) = dataConFullSig dc
-    univ_bndrs  = dataConUnivTyBinders dc
+    univ_bndrs  = dataConUnivTyVarBinders dc

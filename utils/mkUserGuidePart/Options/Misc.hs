@@ -4,9 +4,10 @@ import Types
 
 miscOptions :: [Flag]
 miscOptions =
-  [ flag { flagName = "-jN"
+  [ flag { flagName = "-j[⟨n⟩]"
          , flagDescription =
-           "When compiling with :ghc-flag:`--make`, compile ⟨N⟩ modules in parallel."
+           "When compiling with :ghc-flag:`--make`, compile ⟨n⟩ modules" ++
+           " in parallel."
          , flagType = DynamicFlag
          }
   , flag { flagName = "-fno-hi-version-check"
@@ -29,11 +30,11 @@ miscOptions =
            "the main thread, rather than a forked thread."
          , flagType = DynamicFlag
          }
-  , flag { flagName = "-freverse-errors"
+  , flag { flagName = "-flocal-ghci-history"
          , flagDescription =
-           "Display errors in GHC/GHCi sorted by reverse order of "++
-           "source code line numbers."
+           "Use current directory for the GHCi command history "++
+           "file ``.ghci-history``."
          , flagType = DynamicFlag
-         , flagReverse = "-fno-reverse-errors"
+         , flagReverse = "-fno-local-ghci-history"
          }
   ]

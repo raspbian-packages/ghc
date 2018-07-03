@@ -1,5 +1,5 @@
 Name: hsc2hs
-Version: 0.68.1
+Version: 0.68.2
 Copyright: 2000, Marcin Kowalczyk
 License: BSD3
 License-File: LICENSE
@@ -27,7 +27,7 @@ extra-source-files: changelog.md
 
 source-repository head
     Type: git
-    Location: git://git.haskell.org/hsc2hs
+    Location: http://git.haskell.org/hsc2hs.git
 
 Executable hsc2hs
     Default-Language: Haskell2010
@@ -47,5 +47,5 @@ Executable hsc2hs
                    containers >= 0.2 && < 0.6,
                    directory  >= 1   && < 1.4,
                    filepath   >= 1   && < 1.5,
-                   process    >= 1.1 && < 1.5
+                   process    >= 1.1 && < 1.7
 

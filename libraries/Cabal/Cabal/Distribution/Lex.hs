@@ -1,4 +1,3 @@
-{-# LANGUAGE PatternGuards #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Lex
@@ -13,23 +12,9 @@ module Distribution.Lex (
         tokenizeQuotedWords
  ) where
 
-import Data.Char (isSpace)
-import Distribution.Compat.Semigroup as Semi
-
-newtype DList a = DList ([a] -> [a])
-
-runDList :: DList a -> [a]
-runDList (DList run) = run []
-
-singleton :: a -> DList a
-singleton a = DList (a:)
-
-instance Monoid (DList a) where
-  mempty = DList id
-  mappend = (Semi.<>)
-
-instance Semigroup (DList a) where
-  DList a <> DList b = DList (a . b)
+import Prelude ()
+import Distribution.Compat.Prelude
+import Distribution.Compat.DList
 
 tokenizeQuotedWords :: String -> [String]
 tokenizeQuotedWords = filter (not . null) . go False mempty

@@ -15,6 +15,11 @@ optimizationsOptions =
          , flagType = DynamicFlag
          , flagReverse = "-fno-case-merge"
          }
+  , flag { flagName = "-fcase-folding"
+         , flagDescription = "Enable constant folding in case expressions. Implied by :ghc-flag:`-O`."
+         , flagType = DynamicFlag
+         , flagReverse = "-fno-case-folding"
+         }
   , flag { flagName = "-fcmm-elim-common-blocks"
          , flagDescription =
            "Enable Cmm common block elimination. Implied by :ghc-flag:`-O`."
@@ -178,6 +183,12 @@ optimizationsOptions =
          , flagType = DynamicFlag
          , flagReverse = "-fno-max-relevant-bindings"
          }
+  , flag { flagName = "-fmax-uncovered-patterns=⟨n⟩"
+         , flagDescription =
+           "*default: 4.* Set the maximum number of patterns to display in "++
+           "warnings about non-exhaustive ones."
+         , flagType = DynamicFlag
+         }
   , flag { flagName = "-fmax-simplifier-iterations=⟨n⟩"
          , flagDescription =
            "*default: 4.* Set the max iterations for the simplifier."
@@ -191,7 +202,7 @@ optimizationsOptions =
          }
   , flag { flagName = "-fno-opt-coercion"
          , flagDescription = "Turn off the coercion optimiser"
-         , flagType = StaticFlag
+         , flagType = DynamicFlag
          }
   , flag { flagName = "-fno-pre-inlining"
          , flagDescription = "Turn off pre-inlining"
@@ -202,7 +213,7 @@ optimizationsOptions =
            "Turn off the \"state hack\" whereby any lambda with a real-world "++
            "state token as argument is considered to be single-entry. Hence "++
            "OK to inline things inside it."
-         , flagType = StaticFlag
+         , flagType = DynamicFlag
          }
   , flag { flagName = "-fomit-interface-pragmas"
          , flagDescription =

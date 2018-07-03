@@ -22,19 +22,13 @@ import System.Console.Haskeline.Monads hiding (Handler)
 import System.Console.Haskeline.LineState
 import System.Console.Haskeline.Term
 import System.Console.Haskeline.Backend.WCWidth
+import System.Console.Haskeline.Backend.Win32.Echo (hWithoutInputEcho)
 
 import Data.ByteString.Internal (createAndTrim)
 import qualified Data.ByteString as B
 
-##if defined(i386_HOST_ARCH)
-## define WINDOWS_CCONV stdcall
-##elif defined(x86_64_HOST_ARCH)
-## define WINDOWS_CCONV ccall
-##else
-## error Unknown mingw32 arch
-##endif
-
 #include "win_console.h"
+##include "windows_cconv.h"
 
 foreign import WINDOWS_CCONV "windows.h ReadConsoleInputW" c_ReadConsoleInput
     :: HANDLE -> Ptr () -> DWORD -> Ptr DWORD -> IO Bool
@@ -79,8 +73,12 @@ consoleHandles = do
 
 
 processEvent :: InputEvent -> Maybe Event
-processEvent KeyEvent {keyDown = True, unicodeChar = c, virtualKeyCode = vc,
+processEvent KeyEvent {keyDown = kd, unicodeChar = c, virtualKeyCode = vc,
                     controlKeyState = cstate}
+    | kd || ((testMod (#const LEFT_ALT_PRESSED) || vc == (#const VK_MENU))
+             && c /= '\NUL')
+      -- Make sure not to ignore Unicode key events! The Unicode character might
+      -- only be emitted on a keyup event. See also GH issue #54.
     = fmap (\e -> KeyInput [Key modifier' e]) $ keyFromCode vc `mplus` simpleKeyChar
   where
     simpleKeyChar = guard (c /= '\NUL') >> return (KeyChar c)
@@ -232,7 +230,8 @@ writeConsole h str = writeConsole' >> writeConsole h ys
 foreign import WINDOWS_CCONV "windows.h MessageBeep" c_messageBeep :: UINT -> IO Bool
 
 messageBeep :: IO ()
-messageBeep = c_messageBeep (-1) >> return ()-- intentionally ignore failures.
+messageBeep = c_messageBeep simpleBeep >> return ()-- intentionally ignore failures.
+  where simpleBeep = 0xffffffff
 
 
 ----------
@@ -409,7 +408,7 @@ fileRunTerm h_in = do
                     putStrOut = putter,
                     wrapInterrupt = withCtrlCHandler,
                     termOps = Right FileOps
-                                { inputHandle = h_in
+                                { withoutInputEcho = hWithoutInputEcho h_in
                                 , wrapFileInput = hWithBinaryMode h_in
                                 , getLocaleChar = getMultiByteChar cp h_in
                                 , maybeReadNewline = hMaybeReadNewline h_in

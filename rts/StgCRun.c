@@ -141,7 +141,7 @@ StgWord8 *win32AllocStack(void)
  * we only jump to other STG procedures, so we maintain the 16n - word_size
  * alignment for these jumps.
  *
- * This gives us binary compatability with LLVM and GCC as well as dealing
+ * This gives us binary compatibility with LLVM and GCC as well as dealing
  * with the FFI. Previously we just maintianed a 16n byte alignment for
  * procedure entry and calls, which led to bugs (see #4211 and #5250).
  *
@@ -245,7 +245,7 @@ StgRunIsImplementedInAssembler(void)
 
 #define STG_GLOBAL ".globl "
 
-#ifdef darwin_HOST_OS
+#if defined(darwin_HOST_OS) || defined(ios_HOST_OS)
 #define STG_HIDDEN ".private_extern "
 #else
 #define STG_HIDDEN ".hidden "
@@ -320,11 +320,7 @@ StgRunIsImplementedInAssembler(void)
 
         :
         : "i"(RESERVED_C_STACK_BYTES),
-#if defined(mingw32_HOST_OS)
-          "i"(80 /*stack frame size; 8 too large to make the alignment right*/)
-#else
-          "i"(48 /*stack frame size*/)
-#endif
+          "i"(STG_RUN_STACK_FRAME_SIZE /* stack frame size */)
         );
         /*
          * See Note [Stack Alignment on X86]
@@ -417,7 +413,7 @@ StgRun(StgFunPtr f, StgRegTable *basereg) {
 
 #define STG_GLOBAL ".globl "
 
-#ifdef darwin_HOST_OS
+#if defined(darwin_HOST_OS)
 #define STG_HIDDEN ".private_extern "
 #else
 #define STG_HIDDEN ".hidden "

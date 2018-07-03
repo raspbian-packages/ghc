@@ -34,7 +34,6 @@ module Data.ByteString.Internal (
         unpackBytes, unpackAppendBytesLazy, unpackAppendBytesStrict,
         unpackChars, unpackAppendCharsLazy, unpackAppendCharsStrict,
         unsafePackAddress,
-        checkedSum,
 
         -- * Low level imperative construction
         create,                 -- :: Int -> (Ptr Word8 -> IO ()) -> IO ByteString
@@ -51,6 +50,7 @@ module Data.ByteString.Internal (
 
         -- * Utilities
         nullForeignPtr,         -- :: ForeignPtr Word8
+        checkedAdd,             -- :: String -> Int -> Int -> Int
 
         -- * Standard C Functions
         c_strlen,               -- :: CString -> IO CInt
@@ -76,17 +76,19 @@ module Data.ByteString.Internal (
         inlinePerformIO               -- :: IO a -> a
   ) where
 
-import Prelude hiding (concat)
+import Prelude hiding (concat, null)
 import qualified Data.List as List
 
 import Foreign.ForeignPtr       (ForeignPtr, withForeignPtr)
 import Foreign.Ptr              (Ptr, FunPtr, plusPtr)
 import Foreign.Storable         (Storable(..))
+
 #if MIN_VERSION_base(4,5,0) || __GLASGOW_HASKELL__ >= 703
 import Foreign.C.Types          (CInt(..), CSize(..), CULong(..))
 #else
 import Foreign.C.Types          (CInt, CSize, CULong)
 #endif
+
 import Foreign.C.String         (CString)
 
 #if MIN_VERSION_base(4,9,0)
@@ -95,6 +97,7 @@ import Data.Semigroup           (Semigroup((<>)))
 #if !(MIN_VERSION_base(4,8,0))
 import Data.Monoid              (Monoid(..))
 #endif
+
 import Control.DeepSeq          (NFData(rnf))
 
 import Data.String              (IsString(..))
@@ -107,25 +110,22 @@ import Data.Word                (Word8)
 import Data.Typeable            (Typeable)
 import Data.Data                (Data(..), mkNoRepType)
 
-import GHC.Base                 (realWorld#,unsafeChr)
+import GHC.Base                 (nullAddr#,realWorld#,unsafeChr)
+
 #if MIN_VERSION_base(4,4,0)
 import GHC.CString              (unpackCString#)
 #else
 import GHC.Base                 (unpackCString#)
 #endif
+
 import GHC.Prim                 (Addr#)
+
 #if __GLASGOW_HASKELL__ >= 611
-import GHC.IO                   (IO(IO))
+import GHC.IO                   (IO(IO),unsafeDupablePerformIO)
 #else
-import GHC.IOBase               (IO(IO),RawBuffer)
-#endif
-#if __GLASGOW_HASKELL__ >= 611
-import GHC.IO                   (unsafeDupablePerformIO)
-#else
-import GHC.IOBase               (unsafeDupablePerformIO)
+import GHC.IOBase               (IO(IO),RawBuffer,unsafeDupablePerformIO)
 #endif
 
-import GHC.Base                 (nullAddr#)
 import GHC.ForeignPtr           (ForeignPtr(ForeignPtr)
                                 ,newForeignPtr_, mallocPlainForeignPtrBytes)
 import GHC.Ptr                  (Ptr(..), castPtr)
@@ -168,7 +168,7 @@ instance Monoid ByteString where
     mconcat = concat
 
 instance NFData ByteString where
-    rnf (PS _ _ _) = ()
+    rnf PS{} = ()
 
 instance Show ByteString where
     showsPrec p ps r = showsPrec p (unpackChars ps) r
@@ -180,7 +180,7 @@ instance IsString ByteString where
     fromString = packChars
 
 instance Data ByteString where
-  gfoldl f z txt = z packBytes `f` (unpackBytes txt)
+  gfoldl f z txt = z packBytes `f` unpackBytes txt
   toConstr _     = error "Data.ByteString.ByteString.toConstr"
   gunfold _ _    = error "Data.ByteString.ByteString.gunfold"
   dataTypeOf _   = mkNoRepType "Data.ByteString.ByteString"
@@ -306,7 +306,7 @@ unpackAppendCharsLazy (PS fp off len) cs
 
 unpackAppendBytesStrict :: ByteString -> [Word8] -> [Word8]
 unpackAppendBytesStrict (PS fp off len) xs =
-    accursedUnutterablePerformIO $ withForeignPtr fp $ \base -> do
+    accursedUnutterablePerformIO $ withForeignPtr fp $ \base ->
       loop (base `plusPtr` (off-1)) (base `plusPtr` (off-1+len)) xs
   where
     loop !sentinal !p acc
@@ -343,7 +343,7 @@ fromForeignPtr :: ForeignPtr Word8
                -> Int -- ^ Offset
                -> Int -- ^ Length
                -> ByteString
-fromForeignPtr fp s l = PS fp s l
+fromForeignPtr = PS
 {-# INLINE fromForeignPtr #-}
 
 -- | /O(1)/ Deconstruct a ForeignPtr from a ByteString
@@ -418,15 +418,15 @@ createAndTrim' l f = do
     withForeignPtr fp $ \p -> do
         (off, l', res) <- f p
         if assert (l' <= l) $ l' >= l
-            then return $! (PS fp 0 l, res)
+            then return (PS fp 0 l, res)
             else do ps <- create l' $ \p' ->
                             memcpy p' (p `plusPtr` off) l'
-                    return $! (ps, res)
+                    return (ps, res)
 
 -- | Wrapper of 'mallocForeignPtrBytes' with faster implementation for GHC
 --
 mallocByteString :: Int -> IO (ForeignPtr a)
-mallocByteString l = mallocPlainForeignPtrBytes l
+mallocByteString = mallocPlainForeignPtrBytes
 {-# INLINE mallocByteString #-}
 
 ------------------------------------------------------------------------
@@ -461,24 +461,63 @@ append (PS fp1 off1 len1) (PS fp2 off2 len2) =
       withForeignPtr fp2 $ \p2 -> memcpy destptr2 (p2 `plusPtr` off2) len2
 
 concat :: [ByteString] -> ByteString
-concat []     = mempty
-concat [bs]   = bs
-concat bss0   = unsafeCreate totalLen $ \ptr -> go bss0 ptr
+concat = \bss0 -> goLen0 bss0 bss0
+    -- The idea here is we first do a pass over the input list to determine:
+    --
+    --  1. is a copy necessary? e.g. @concat []@, @concat [mempty, "hello"]@,
+    --     and @concat ["hello", mempty, mempty]@ can all be handled without
+    --     copying.
+    --  2. if a copy is necessary, how large is the result going to be?
+    --
+    -- If a copy is necessary then we create a buffer of the appropriate size
+    -- and do another pass over the input list, copying the chunks into the
+    -- buffer. Also, since foreign calls aren't entirely free we skip over
+    -- empty chunks while copying.
+    --
+    -- We pass the original [ByteString] (bss0) through as an argument through
+    -- goLen0, goLen1, and goLen since we will need it again in goCopy. Passing
+    -- it as an explicit argument avoids capturing it in these functions'
+    -- closures which would result in unnecessary closure allocation.
   where
-    totalLen = checkedSum "concat" [ len | (PS _ _ len) <- bss0 ]
-    go []                  !_   = return ()
-    go (PS fp off len:bss) !ptr = do
-      withForeignPtr fp $ \p -> memcpy ptr (p `plusPtr` off) len
-      go bss (ptr `plusPtr` len)
+    -- It's still possible that the result is empty
+    goLen0 _    []                     = mempty
+    goLen0 bss0 (PS _ _ 0     :bss)    = goLen0 bss0 bss
+    goLen0 bss0 (bs           :bss)    = goLen1 bss0 bs bss
 
--- | Add a list of non-negative numbers.  Errors out on overflow.
-checkedSum :: String -> [Int] -> Int
-checkedSum fun = go 0
-  where go !a (x:xs)
-            | ax >= 0   = go ax xs
-            | otherwise = overflowError fun
-          where ax = a + x
-        go a  _         = a
+    -- It's still possible that the result is a single chunk
+    goLen1 _    bs []                  = bs
+    goLen1 bss0 bs (PS _ _ 0  :bss)    = goLen1 bss0 bs bss
+    goLen1 bss0 bs (PS _ _ len:bss)    = goLen bss0 (checkedAdd "concat" len' len) bss
+      where PS _ _ len' = bs
+
+    -- General case, just find the total length we'll need
+    goLen bss0 !total (PS _ _ len:bss) = goLen bss0 total' bss
+      where total' = checkedAdd "concat" total len
+    goLen bss0 total [] =
+      unsafeCreate total $ \ptr -> goCopy bss0 ptr
+
+    -- Copy the data
+    goCopy []                  !_   = return ()
+    goCopy (PS _  _   0  :bss) !ptr = goCopy bss ptr
+    goCopy (PS fp off len:bss) !ptr = do
+      withForeignPtr fp $ \p -> memcpy ptr (p `plusPtr` off) len
+      goCopy bss (ptr `plusPtr` len)
+{-# NOINLINE concat #-}
+
+{-# RULES
+"ByteString concat [] -> mempty"
+   concat [] = mempty
+"ByteString concat [bs] -> bs" forall x.
+   concat [x] = x
+ #-}
+
+-- | Add two non-negative numbers. Errors out on overflow.
+checkedAdd :: String -> Int -> Int -> Int
+checkedAdd fun x y
+  | r >= 0    = r
+  | otherwise = overflowError fun
+  where r = x + y
+{-# INLINE checkedAdd #-}
 
 ------------------------------------------------------------------------
 

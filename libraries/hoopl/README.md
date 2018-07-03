@@ -3,35 +3,45 @@ The `hoopl` Package  [![Hackage](https://img.shields.io/hackage/v/hoopl.svg)](ht
 
 ## Hoopl: A Higher-Order OPtimization Library
 
-API documentation can be found on [Hackage](https://hackage.haskell.org/package/hoopl).
+API documentation can be found on
+[Hackage](https://hackage.haskell.org/package/hoopl).  For detailed explanation
+of the library design see paper ["Hoopl: A Modular, Reusable Library for
+Dataflow Analysis and
+Transformation"](http://research.microsoft.com/en-us/um/people/simonpj/Papers/c--/hoopl-haskell10.pdf)
 
 | Directory      | Contents
 | -------------- | ---------
-| `paper/`       | A paper about Hoopl
-| `prototypes/`  | A sampling of prototypes and early designs
 | `src/`         | The current official sources to the Cabal package
 | `testing/`     | Tests, including a sample client.  See [`testing/README`](testing/README)
 
 ### Development Notes
 
-To build the library, change to the src directory and run
+#### Building and testing
 
-    cabal configure --prefix=$HOME --user   # we have no idea what this means
+To build the library run:
+
+    cabal configure
     cabal build
     cabal install --enable-documentation
 
-To run the tests in the folder testing/, change to the src directory and run 
+To run the tests in the `testing/` folder run:
 
     cabal configure --enable-tests
     cabal test
 
-To run the tests with the test coverage report, change to the src directory and run 
+To run the tests with the test coverage report run:
 
-    cabal configure --enable-tests -f testcoverage
+    cabal configure --enable-tests --enable-coverage
     cabal test
 
 You'll need a Haskell Platform, which should include appropriate
 versions of Cabal and GHC.
+
+#### Coding style
+
+Please follow Johan Tibell's
+[Haskell Style Guide](https://github.com/tibbe/haskell-style-guide/blob/master/haskell-style.md)
+for all new/modified code.
 
 ### Checklist for Making Releases
 

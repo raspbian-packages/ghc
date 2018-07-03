@@ -37,12 +37,14 @@ module Distribution.Compat.ReadP
 
   -- * Other operations
   pfail,      -- :: ReadP a
+  eof,        -- :: ReadP ()
   satisfy,    -- :: (Char -> Bool) -> ReadP Char
   char,       -- :: Char -> ReadP Char
   string,     -- :: String -> ReadP String
   munch,      -- :: (Char -> Bool) -> ReadP String
   munch1,     -- :: (Char -> Bool) -> ReadP String
   skipSpaces, -- :: ReadP ()
+  skipSpaces1,-- :: ReadP ()
   choice,     -- :: [ReadP a] -> ReadP a
   count,      -- :: Int -> ReadP a -> ReadP [a]
   between,    -- :: ReadP open -> ReadP close -> ReadP a -> ReadP a
@@ -69,11 +71,12 @@ module Distribution.Compat.ReadP
   )
  where
 
+import Prelude ()
+import Distribution.Compat.Prelude hiding (many, get)
+
 import qualified Distribution.Compat.MonadFail as Fail
 
-import Control.Monad( MonadPlus(..), liftM, liftM2, replicateM, ap, (>=>) )
-import Data.Char (isSpace)
-import Control.Applicative as AP (Applicative(..), Alternative(empty, (<|>)))
+import Control.Monad( replicateM, (>=>) )
 
 infixr 5 +++, <++
 
@@ -98,7 +101,7 @@ instance Applicative (P s) where
   (<*>) = ap
 
 instance Monad (P s) where
-  return = AP.pure
+  return = pure
 
   (Get f)      >>= k = Get (f >=> k)
   (Look f)     >>= k = Look (f >=> k)
@@ -160,7 +163,7 @@ instance Applicative (Parser r s) where
   (<*>) = ap
 
 instance Monad (Parser r s) where
-  return = AP.pure
+  return = pure
   fail = Fail.fail
   R m >>= f = R (\k -> m (\a -> let R m' = f a in m' k))
 
@@ -202,6 +205,12 @@ look = R Look
 pfail :: ReadP r a
 -- ^ Always fails.
 pfail = R (const Fail)
+
+eof :: ReadP r ()
+-- ^ Succeeds iff we are at the end of input
+eof = do { s <- look
+         ; if null s then return ()
+                     else pfail }
 
 (+++) :: ReadP r a -> ReadP r a -> ReadP r a
 -- ^ Symmetric choice.
@@ -288,6 +297,11 @@ skipSpaces =
  where
   skip (c:s) | isSpace c = do _ <- get; skip s
   skip _                 = do return ()
+
+skipSpaces1 :: ReadP r ()
+-- ^ Like 'skipSpaces' but succeeds only if there is at least one
+-- whitespace character to skip.
+skipSpaces1 = satisfy isSpace >> skipSpaces
 
 count :: Int -> ReadP r a -> ReadP r [a]
 -- ^ @ count n p @ parses @n@ occurrences of @p@ in sequence. A list of

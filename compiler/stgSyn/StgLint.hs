@@ -6,7 +6,7 @@
 
 {-# LANGUAGE CPP #-}
 
-module StgLint ( lintStgBindings ) where
+module StgLint ( lintStgTopBindings ) where
 
 import StgSyn
 
@@ -21,15 +21,12 @@ import Maybes
 import Name             ( getSrcLoc )
 import ErrUtils         ( MsgDoc, Severity(..), mkLocMessage )
 import Type
+import RepType
 import TyCon
 import Util
 import SrcLoc
 import Outputable
-#if __GLASGOW_HASKELL__ < 709
-import Control.Applicative ( Applicative(..) )
-#endif
 import Control.Monad
-import Data.Function
 
 #include "HsVersions.h"
 
@@ -56,12 +53,12 @@ generation.  Solution: don't use it!  (KSW 2000-05).
 *                                                                      *
 ************************************************************************
 
-@lintStgBindings@ is the top-level interface function.
+@lintStgTopBindings@ is the top-level interface function.
 -}
 
-lintStgBindings :: String -> [StgBinding] -> [StgBinding]
+lintStgTopBindings :: String -> [StgTopBinding] -> [StgTopBinding]
 
-lintStgBindings whodunnit binds
+lintStgTopBindings whodunnit binds
   = {-# SCC "StgLint" #-}
     case (initL (lint_binds binds)) of
       Nothing  -> binds
@@ -70,16 +67,19 @@ lintStgBindings whodunnit binds
                               text whodunnit <+> text "***",
                         msg,
                         text "*** Offending Program ***",
-                        pprStgBindings binds,
+                        pprStgTopBindings binds,
                         text "*** End of Offense ***"])
   where
-    lint_binds :: [StgBinding] -> LintM ()
+    lint_binds :: [StgTopBinding] -> LintM ()
 
     lint_binds [] = return ()
     lint_binds (bind:binds) = do
-        binders <- lintStgBinds bind
+        binders <- lint_bind bind
         addInScopeVars binders $
             lint_binds binds
+
+    lint_bind (StgTopLifted bind) = lintStgBinds bind
+    lint_bind (StgTopStringLit v _) = return [v]
 
 lintStgArg :: StgArg -> LintM (Maybe Type)
 lintStgArg (StgLitArg lit) = return (Just (literalType lit))
@@ -127,18 +127,23 @@ lint_binds_help (binder, rhs)
 
 lintStgRhs :: StgRhs -> LintM (Maybe Type)   -- Just ty => type is exact
 
-lintStgRhs (StgRhsClosure _ _ _ _ _ [] expr)
+lintStgRhs (StgRhsClosure _ _ _ _ [] expr)
   = lintStgExpr expr
 
-lintStgRhs (StgRhsClosure _ _ _ _ _ binders expr)
+lintStgRhs (StgRhsClosure _ _ _ _ binders expr)
   = addLoc (LambdaBodyOf binders) $
       addInScopeVars binders $ runMaybeT $ do
         body_ty <- MaybeT $ lintStgExpr expr
         return (mkFunTys (map idType binders) body_ty)
 
-lintStgRhs (StgRhsCon _ con args) = runMaybeT $ do
-    arg_tys <- mapM (MaybeT . lintStgArg) args
-    MaybeT $ checkFunApp con_ty arg_tys (mkRhsConMsg con_ty arg_tys)
+lintStgRhs rhs@(StgRhsCon _ con args) = do
+    -- TODO: Check arg_tys
+    when (isUnboxedTupleCon con || isUnboxedSumCon con) $
+      addErrL (text "StgRhsCon is an unboxed tuple or sum application" $$
+               ppr rhs)
+    runMaybeT $ do
+      arg_tys <- mapM (MaybeT . lintStgArg) args
+      MaybeT $ checkFunApp con_ty arg_tys (mkRhsConMsg con_ty arg_tys)
   where
     con_ty = dataConRepType con
 
@@ -151,7 +156,8 @@ lintStgExpr e@(StgApp fun args) = runMaybeT $ do
     arg_tys <- mapM (MaybeT . lintStgArg) args
     MaybeT $ checkFunApp fun_ty arg_tys (mkFunAppMsg fun_ty arg_tys e)
 
-lintStgExpr e@(StgConApp con args) = runMaybeT $ do
+lintStgExpr e@(StgConApp con args _arg_tys) = runMaybeT $ do
+    -- TODO: Check arg_tys
     arg_tys <- mapM (MaybeT . lintStgArg) args
     MaybeT $ checkFunApp con_ty arg_tys (mkFunAppMsg con_ty arg_tys e)
   where
@@ -179,7 +185,7 @@ lintStgExpr (StgLet binds body) = do
       addInScopeVars binders $
         lintStgExpr body
 
-lintStgExpr (StgLetNoEscape _ _ binds body) = do
+lintStgExpr (StgLetNoEscape binds body) = do
     binders <- lintStgBinds binds
     addLoc (BodyOfLetRec binders) $
       addInScopeVars binders $
@@ -187,26 +193,24 @@ lintStgExpr (StgLetNoEscape _ _ binds body) = do
 
 lintStgExpr (StgTick _ expr) = lintStgExpr expr
 
-lintStgExpr (StgCase scrut _ _ bndr _ alts_type alts) = runMaybeT $ do
+lintStgExpr (StgCase scrut bndr alts_type alts) = runMaybeT $ do
     _ <- MaybeT $ lintStgExpr scrut
 
     in_scope <- MaybeT $ liftM Just $
      case alts_type of
-        AlgAlt tc    -> check_bndr tc >> return True
-        PrimAlt tc   -> check_bndr tc >> return True
-        UbxTupAlt _  -> return False -- Binder is always dead in this case
-        PolyAlt      -> return True
+        AlgAlt tc     -> check_bndr (tyConPrimRep tc) >> return True
+        PrimAlt rep   -> check_bndr [rep]             >> return True
+        MultiValAlt _ -> return False -- Binder is always dead in this case
+        PolyAlt       -> return True
 
     MaybeT $ addInScopeVars [bndr | in_scope] $
              lintStgAlts alts scrut_ty
   where
-    scrut_ty          = idType bndr
-    UnaryRep scrut_rep = repType scrut_ty -- Not used if scrutinee is unboxed tuple
-    check_bndr tc = case tyConAppTyCon_maybe scrut_rep of
-                        Just bndr_tc -> checkL (tc == bndr_tc) bad_bndr
-                        Nothing      -> addErrL bad_bndr
+    scrut_ty        = idType bndr
+    scrut_reps      = typePrimRep scrut_ty
+    check_bndr reps = checkL (scrut_reps == reps) bad_bndr
                   where
-                     bad_bndr = mkDefltMsg bndr tc
+                     bad_bndr = mkDefltMsg bndr reps
 
 lintStgAlts :: [StgAlt]
             -> Type               -- Type of scrutinee
@@ -226,15 +230,15 @@ lintStgAlts alts scrut_ty = do
           -- We can't check that the alternatives have the
           -- same type, because they don't, with unsafeCoerce#
 
-lintAlt :: Type -> (AltCon, [Id], [Bool], StgExpr) -> LintM (Maybe Type)
-lintAlt _ (DEFAULT, _, _, rhs)
+lintAlt :: Type -> (AltCon, [Id], StgExpr) -> LintM (Maybe Type)
+lintAlt _ (DEFAULT, _, rhs)
  = lintStgExpr rhs
 
-lintAlt scrut_ty (LitAlt lit, _, _, rhs) = do
+lintAlt scrut_ty (LitAlt lit, _, rhs) = do
    checkTys (literalType lit) scrut_ty (mkAltMsg1 scrut_ty)
    lintStgExpr rhs
 
-lintAlt scrut_ty (DataAlt con, args, _, rhs) = do
+lintAlt scrut_ty (DataAlt con, args, rhs) = do
     case splitTyConApp_maybe scrut_ty of
       Just (tycon, tys_applied) | isAlgTyCon tycon &&
                                   not (isNewTyCon tycon) -> do
@@ -317,7 +321,6 @@ instance Applicative LintM where
       (*>)  = thenL_
 
 instance Monad LintM where
-    return = pure
     (>>=) = thenL
     (>>)  = (*>)
 
@@ -352,19 +355,9 @@ addLoc extra_loc m = LintM $ \loc scope errs
 
 addInScopeVars :: [Id] -> LintM a -> LintM a
 addInScopeVars ids m = LintM $ \loc scope errs
- -> -- We check if these "new" ids are already
-    -- in scope, i.e., we have *shadowing* going on.
-    -- For now, it's just a "trace"; we may make
-    -- a real error out of it...
-    let
+ -> let
         new_set = mkVarSet ids
-    in
---  After adding -fliberate-case, Simon decided he likes shadowed
---  names after all.  WDP 94/07
---  (if isEmptyVarSet shadowed
---  then id
---  else pprTrace "Shadowed vars:" (ppr (varSetElems shadowed))) $
-    unLintM m loc (scope `unionVarSet` new_set) errs
+    in unLintM m loc (scope `unionVarSet` new_set) errs
 
 {-
 Checking function applications: we only check that the type has the
@@ -376,7 +369,7 @@ have long since disappeared.
 
 checkFunApp :: Type                 -- The function type
             -> [Type]               -- The arg type(s)
-            -> MsgDoc              -- Error message
+            -> MsgDoc               -- Error message
             -> LintM (Maybe Type)   -- Just ty => result type is accurate
 
 checkFunApp fun_ty arg_tys msg
@@ -425,20 +418,32 @@ stgEqType :: Type -> Type -> Bool
 -- Fundamentally this is a losing battle because of unsafeCoerce
 
 stgEqType orig_ty1 orig_ty2
-  = gos (repType orig_ty1) (repType orig_ty2)
+  = gos orig_ty1 orig_ty2
   where
-    gos :: RepType -> RepType -> Bool
-    gos (UbxTupleRep tys1) (UbxTupleRep tys2)
-      = equalLength tys1 tys2 && and (zipWith go tys1 tys2)
-    gos (UnaryRep ty1) (UnaryRep ty2) = go ty1 ty2
-    gos _ _ = False
+    gos :: Type -> Type -> Bool
+    gos ty1   ty2
+        -- These have no prim rep
+      | isRuntimeRepKindedTy ty1 && isRuntimeRepKindedTy ty2
+      = True
+
+        -- We have a unary type
+      | [_] <- reps1, [_] <- reps2
+      = go ty1 ty2
+
+        -- In the case of a tuple just compare prim reps
+      | otherwise
+      = reps1 == reps2
+      where
+        reps1 = typePrimRep ty1
+        reps2 = typePrimRep ty2
 
     go :: UnaryType -> UnaryType -> Bool
     go ty1 ty2
       | Just (tc1, tc_args1) <- splitTyConApp_maybe ty1
       , Just (tc2, tc_args2) <- splitTyConApp_maybe ty2
       , let res = if tc1 == tc2
-                  then equalLength tc_args1 tc_args2 && and (zipWith (gos `on` repType) tc_args1 tc_args2)
+                  then equalLength tc_args1 tc_args2
+                       && and (zipWith gos tc_args1 tc_args2)
                   else  -- TyCons don't match; but don't bleat if either is a
                         -- family TyCon because a coercion might have made it
                         -- equal to something else
@@ -469,10 +474,10 @@ _mkCaseAltMsg _alts
   = ($$) (text "In some case alternatives, type of alternatives not all same:")
             (Outputable.empty) -- LATER: ppr alts
 
-mkDefltMsg :: Id -> TyCon -> MsgDoc
-mkDefltMsg bndr tc
-  = ($$) (text "Binder of a case expression doesn't match type of scrutinee:")
-         (ppr bndr $$ ppr (idType bndr) $$ ppr tc)
+mkDefltMsg :: Id -> [PrimRep] -> MsgDoc
+mkDefltMsg bndr reps
+  = ($$) (text "Binder of a case expression doesn't match representation of scrutinee:")
+         (ppr bndr $$ ppr (idType bndr) $$ ppr reps)
 
 mkFunAppMsg :: Type -> [Type] -> StgExpr -> MsgDoc
 mkFunAppMsg fun_ty arg_tys expr

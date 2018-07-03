@@ -9,7 +9,7 @@ import Control.Monad.Fail (MonadFail(fail))
 -- the following code corresponds to
 -- http://hackage.haskell.org/package/fail-4.9.0.0
 import qualified Prelude as P
-import Prelude hiding (fail)
+import Distribution.Compat.Prelude hiding (fail)
 
 import Text.ParserCombinators.ReadP
 import Text.ParserCombinators.ReadPrec
@@ -25,7 +25,7 @@ instance MonadFail Maybe where
 instance MonadFail [] where
     fail _ = []
 
-instance MonadFail IO where
+instance MonadFail P.IO where
     fail = P.fail
 
 instance MonadFail ReadPrec where

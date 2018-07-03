@@ -1,5 +1,5 @@
 
 test('hpc_ghc_ghci',
-     [extra_clean(['A.hi', 'A.o', '.hpc/A.mix', '.hpc/']),
+     [extra_files(['A.hs', 'B.hs']),
       only_ways(['normal']), when(compiler_profiled(), skip), req_interp],
      run_command, ['$MAKE -s --no-print-directory hpc_ghc_ghci'])

@@ -332,9 +332,15 @@ the stack. See Note [Overlapping global registers] for implications.
 #define REG_F2          fr15
 #define REG_F3          fr16
 #define REG_F4          fr17
+#define REG_F5          fr18
+#define REG_F6          fr19
 
-#define REG_D1          fr18
-#define REG_D2          fr19
+#define REG_D1          fr20
+#define REG_D2          fr21
+#define REG_D3          fr22
+#define REG_D4          fr23
+#define REG_D5          fr24
+#define REG_D6          fr25
 
 #endif
 
@@ -485,14 +491,15 @@ the stack. See Note [Overlapping global registers] for implications.
    Here we consider ARM mode (i.e. 32bit isns)
    and also CPU with full VFPv3 implementation
 
-   ARM registers (see Chapter 5.1 in ARM IHI 0042D)
+   ARM registers (see Chapter 5.1 in ARM IHI 0042D and
+   Section 9.2.2 in ARM Software Development Toolkit Reference Guide)
 
    r15  PC         The Program Counter.
    r14  LR         The Link Register.
    r13  SP         The Stack Pointer.
    r12  IP         The Intra-Procedure-call scratch register.
-   r11  v8         Variable-register 8.
-   r10  v7         Variable-register 7.
+   r11  v8/fp      Variable-register 8.
+   r10  v7/sl      Variable-register 7.
    r9   v6/SB/TR   Platform register. The meaning of this register is
                    defined by the platform standard.
    r8   v5         Variable-register 5.
@@ -508,7 +515,7 @@ the stack. See Note [Overlapping global registers] for implications.
    VFPv2/VFPv3/NEON registers
    s0-s15/d0-d7/q0-q3    Argument / result/ scratch registers
    s16-s31/d8-d15/q4-q7  callee-saved registers (must be preserved across
-                         subrutine calls)
+                         subroutine calls)
 
    VFPv3/NEON registers (added to the VFPv2 registers set)
    d16-d31/q8-q15        Argument / result/ scratch registers
@@ -565,7 +572,7 @@ the stack. See Note [Overlapping global registers] for implications.
    FPU/SIMD registers
 
    s/d/q/v0-v7    Argument / result/ scratch registers
-   s/d/q/v8-v15   callee-saved registers (must be preserved across subrutine calls,
+   s/d/q/v8-v15   callee-saved registers (must be preserved across subroutine calls,
                   but only bottom 64-bit value needs to be preserved)
    s/d/q/v16-v31  temporary registers
 

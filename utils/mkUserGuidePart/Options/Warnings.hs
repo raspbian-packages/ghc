@@ -31,10 +31,20 @@ warningsOptions =
          , flagType = DynamicFlag
          , flagReverse = "-Wwarn"
          }
+  , flag { flagName = "-Werror=⟨wflag⟩"
+         , flagDescription = "make a specific warning fatal"
+         , flagType = DynamicFlag
+         , flagReverse = "-Wwarn=⟨wflag⟩"
+         }
   , flag { flagName = "-Wwarn"
          , flagDescription = "make warnings non-fatal"
          , flagType = DynamicFlag
          , flagReverse = "-Werror"
+         }
+  , flag { flagName = "-Wwarn=⟨wflag⟩"
+         , flagDescription = "make a specific warning non-fatal"
+         , flagType = DynamicFlag
+         , flagReverse = "-Werror=⟨wflag⟩"
          }
   , flag { flagName = "-Wunrecognised-warning-flags"
          , flagDescription =
@@ -79,6 +89,19 @@ warningsOptions =
          , flagDescription = "Make suggestions for mis-spelled names."
          , flagType = DynamicFlag
          , flagReverse = "-fno-helpful-errors"
+         }
+  , flag { flagName = "-freverse-errors"
+         , flagDescription =
+           "Display errors in GHC/GHCi sorted by reverse order of "++
+           "source code line numbers."
+         , flagType = DynamicFlag
+         , flagReverse = "-fno-reverse-errors"
+         }
+  , flag { flagName = "-fmax-errors"
+         , flagDescription =
+           "Limit the number of errors displayed in GHC/GHCi."
+         , flagType = DynamicFlag
+         , flagReverse = "-fno-max-errors"
          }
   , flag { flagName = "-Wdeprecated-flags"
          , flagDescription =
@@ -127,7 +150,7 @@ warningsOptions =
          , flagType = DynamicFlag
          , flagReverse = "-Wno-incomplete-uni-patterns"
          }
-  , flag { flagName = "-Wmax-pmcheck-iterations=<N>"
+  , flag { flagName = "-fmax-pmcheck-iterations=⟨n⟩"
          , flagDescription =
            "the iteration limit for the pattern match checker"
          , flagType = DynamicFlag
@@ -378,6 +401,13 @@ warningsOptions =
          , flagType = DynamicFlag
          , flagReverse = "-Wno-warnings-deprecations"
          }
+  , flag { flagName = "-Wdeprecations"
+         , flagDescription =
+           "warn about uses of functions & types that have warnings or "++
+           "deprecated pragmas. Alias for :ghc-flag:`-Wwarnings-deprecations`"
+         , flagType = DynamicFlag
+         , flagReverse = "-Wno-deprecations"
+         }
   , flag { flagName = "-Wamp"
          , flagDescription =
            "*(deprecated)* warn on definitions conflicting with the "++
@@ -411,7 +441,7 @@ warningsOptions =
   , flag { flagName = "-Wdeferred-out-of-scope-variables"
          , flagDescription =
            "Report warnings when variable out-of-scope errors are "++
-           ":ref:`deferred until runtime <defer-out-of-scope-variables>`. "++
+           ":ref:`deferred until runtime. "++
            "See :ghc-flag:`-fdefer-out-of-scope-variables`."
          , flagType = DynamicFlag
          , flagReverse = "-Wno-deferred-out-of-scope-variables"
@@ -434,5 +464,14 @@ warningsOptions =
            "for discharging this type of constraint."
          , flagType = DynamicFlag
          , flagReverse = "-Wno-deriving-typeable"
+         }
+  , flag { flagName = "-Wmissing-home-modules"
+         , flagDescription =
+           "warn when encountering a home module imported, but not listed "++
+           "on the command line. Useful for cabal to ensure GHC won't pick "++
+           "up modules, not listed neither in ``exposed-modules``, nor in "++
+           "``other-modules``."
+         , flagType = DynamicFlag
+         , flagReverse = "-Wno-missing-home-modules"
          }
   ]

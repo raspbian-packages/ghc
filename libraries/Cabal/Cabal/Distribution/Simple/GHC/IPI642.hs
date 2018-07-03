@@ -13,9 +13,15 @@ module Distribution.Simple.GHC.IPI642 (
     toCurrent,
   ) where
 
+import Prelude ()
+import Distribution.Compat.Prelude
+
 import qualified Distribution.InstalledPackageInfo as Current
-import qualified Distribution.Package as Current hiding (installedUnitId)
+import qualified Distribution.Types.AbiHash        as Current
+import qualified Distribution.Types.ComponentId    as Current
+import qualified Distribution.Types.UnitId         as Current
 import Distribution.Simple.GHC.IPIConvert
+import Distribution.Text
 
 -- | This is the InstalledPackageInfo type used by ghc-6.4.2 and later.
 --
@@ -61,13 +67,17 @@ data InstalledPackageInfo = InstalledPackageInfo {
 
 toCurrent :: InstalledPackageInfo -> Current.InstalledPackageInfo
 toCurrent ipi@InstalledPackageInfo{} =
-  let pid = convertPackageId (package ipi)
-      mkExposedModule m = Current.ExposedModule m Nothing
+  let mkExposedModule m = Current.ExposedModule m Nothing
+      pid = convertPackageId (package ipi)
   in Current.InstalledPackageInfo {
     Current.sourcePackageId    = pid,
     Current.installedUnitId    = Current.mkLegacyUnitId pid,
+    Current.installedComponentId_ = Current.mkComponentId (display pid),
+    Current.instantiatedWith   = [],
+    -- Internal libraries not supported!
+    Current.sourceLibName      = Nothing,
     Current.compatPackageKey   = "",
-    Current.abiHash            = Current.AbiHash "", -- bogus but old GHCs don't care.
+    Current.abiHash            = Current.mkAbiHash "", -- bogus but old GHCs don't care.
     Current.license            = convertLicense (license ipi),
     Current.copyright          = copyright ipi,
     Current.maintainer         = maintainer ipi,
@@ -78,6 +88,7 @@ toCurrent ipi@InstalledPackageInfo{} =
     Current.synopsis           = "",
     Current.description        = description ipi,
     Current.category           = category ipi,
+    Current.indefinite         = False,
     Current.exposed            = exposed ipi,
     Current.exposedModules     = map (mkExposedModule . convertModuleName) (exposedModules ipi),
     Current.hiddenModules      = map convertModuleName (hiddenModules ipi),
@@ -92,6 +103,7 @@ toCurrent ipi@InstalledPackageInfo{} =
     Current.includeDirs        = includeDirs ipi,
     Current.includes           = includes ipi,
     Current.depends            = map (Current.mkLegacyUnitId . convertPackageId) (depends ipi),
+    Current.abiDepends         = [],
     Current.ccOptions          = ccOptions ipi,
     Current.ldOptions          = ldOptions ipi,
     Current.frameworkDirs      = frameworkDirs ipi,

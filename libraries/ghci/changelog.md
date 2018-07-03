@@ -1,8 +1,10 @@
-## 8.0.2  *Jan 2017*
+## 8.2.1 Jul 2017
 
-  * Bundled with GHC 8.0.2
+  * Bundled with GHC 8.2.1
 
-  * Tag pointers in interpreted constructors (#12523)
+  * Add support for StaticPointers in GHCi (#12356)
+
+  * Move Typeable Binary instances to `binary` package
 
 ## 8.0.1  *Feb 2016*
 

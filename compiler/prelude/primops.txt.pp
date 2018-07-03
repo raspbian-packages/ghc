@@ -221,12 +221,16 @@ primop   IntMulMayOfloOp  "mulIntMayOflo#"
 
 primop   IntQuotOp    "quotInt#"    Dyadic
    Int# -> Int# -> Int#
-   {Rounds towards zero.}
+   {Rounds towards zero. The behavior is undefined if the second argument is
+    zero.
+   }
    with can_fail = True
 
 primop   IntRemOp    "remInt#"    Dyadic
    Int# -> Int# -> Int#
-   {Satisfies \texttt{(quotInt\# x y) *\# y +\# (remInt\# x y) == x}.}
+   {Satisfies \texttt{(quotInt\# x y) *\# y +\# (remInt\# x y) == x}. The
+    behavior is undefined if the second argument is zero.
+   }
    with can_fail = True
 
 primop   IntQuotRemOp "quotRemInt#"    GenPrimOp
@@ -527,6 +531,8 @@ primop   DoubleDivOp   "/##"   Dyadic
 
 primop   DoubleNegOp   "negateDouble#"  Monadic   Double# -> Double#
 
+primop   DoubleFabsOp  "fabsDouble#"    Monadic   Double# -> Double#
+
 primop   Double2IntOp   "double2Int#"          GenPrimOp  Double# -> Int#
    {Truncates a {\tt Double#} value to the nearest {\tt Int#}.
     Results are undefined if the truncation if truncation yields
@@ -652,6 +658,8 @@ primop   FloatDivOp   "divideFloat#"      Dyadic
    with can_fail = True
 
 primop   FloatNegOp   "negateFloat#"      Monadic    Float# -> Float#
+
+primop   FloatFabsOp  "fabsFloat#"        Monadic    Float# -> Float#
 
 primop   Float2IntOp   "float2Int#"      GenPrimOp  Float# -> Int#
    {Truncates a {\tt Float#} value to the nearest {\tt Int#}.
@@ -1077,6 +1085,17 @@ primop  NewAlignedPinnedByteArrayOp_Char "newAlignedPinnedByteArray#" GenPrimOp
    with out_of_line = True
         has_side_effects = True
 
+primop  MutableByteArrayIsPinnedOp "isMutableByteArrayPinned#" GenPrimOp
+   MutableByteArray# s -> Int#
+   {Determine whether a {\tt MutableByteArray\#} is guaranteed not to move
+   during GC.}
+   with out_of_line = True
+
+primop  ByteArrayIsPinnedOp "isByteArrayPinned#" GenPrimOp
+   ByteArray# -> Int#
+   {Determine whether a {\tt ByteArray\#} is guaranteed not to move during GC.}
+   with out_of_line = True
+
 primop  ByteArrayContents_Char "byteArrayContents#" GenPrimOp
    ByteArray# -> Addr#
    {Intended for use with pinned arrays; otherwise very unsafe!}
@@ -1425,7 +1444,8 @@ primop  CopyAddrToByteArrayOp "copyAddrToByteArray#" GenPrimOp
 
 primop  SetByteArrayOp "setByteArray#" GenPrimOp
   MutableByteArray# s -> Int# -> Int# -> Int# -> State# s -> State# s
-  {Set the range of the MutableByteArray# to the specified character.}
+  {{\tt setByteArray# ba off len c} sets the byte range {\tt [off, off+len]} of
+   the {\tt MutableByteArray#} to the byte {\tt c}.}
   with
   has_side_effects = True
   code_size = { primOpCodeSizeForeignCall + 4 }
@@ -1908,13 +1928,25 @@ primop  WriteMutVarOp "writeMutVar#"  GenPrimOp
 primop  SameMutVarOp "sameMutVar#" GenPrimOp
    MutVar# s a -> MutVar# s a -> Int#
 
--- not really the right type, but we don't know about pairs here.  The
--- correct type is
+-- Note [Why not an unboxed tuple in atomicModifyMutVar#?]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 --
---   MutVar# s a -> (a -> (a,b)) -> State# s -> (# State# s, b #)
+-- Looking at the type of atomicModifyMutVar#, one might wonder why
+-- it doesn't return an unboxed tuple. e.g.,
 --
+--   MutVar# s a -> (a -> (# a, b #)) -> State# s -> (# State# s, b #)
+--
+-- The reason is that atomicModifyMutVar# relies on laziness for its atomicity.
+-- Given a MutVar# containing x, atomicModifyMutVar# merely replaces the
+-- its contents with a thunk of the form (fst (f x)). This can be done using an
+-- atomic compare-and-swap as it is merely replacing a pointer.
+
 primop  AtomicModifyMutVarOp "atomicModifyMutVar#" GenPrimOp
    MutVar# s a -> (a -> b) -> State# s -> (# State# s, c #)
+   { Modify the contents of a {\tt MutVar\#}. Note that this isn't strictly
+     speaking the correct type for this function, it should really be
+     {\tt MutVar# s a -> (a -> (a,b)) -> State# s -> (# State# s, b #)}, however
+     we don't know about pairs here. }
    with
    out_of_line = True
    has_side_effects = True
@@ -1930,19 +1962,18 @@ primop  CasMutVarOp "casMutVar#" GenPrimOp
 section "Exceptions"
 ------------------------------------------------------------------------
 
-{- Note [Strictness for mask/unmask/catch]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Consider this example, which comes from GHC.IO.Handle.Internals:
-   wantReadableHandle3 f ma b st
-     = case ... of
-         DEFAULT -> case ma of MVar a -> ...
-         0#      -> maskAsynchExceptions# (\st -> case ma of MVar a -> ...)
-The outer case just decides whether to mask exceptions, but we don't want
-thereby to hide the strictness in 'ma'!  Hence the use of strictApply1Dmd.
-
-For catch, we must be extra careful; see
-Note [Exceptions and strictness] in Demand
--}
+-- Note [Strictness for mask/unmask/catch]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- Consider this example, which comes from GHC.IO.Handle.Internals:
+--    wantReadableHandle3 f ma b st
+--      = case ... of
+--          DEFAULT -> case ma of MVar a -> ...
+--          0#      -> maskAsynchExceptions# (\st -> case ma of MVar a -> ...)
+-- The outer case just decides whether to mask exceptions, but we don't want
+-- thereby to hide the strictness in 'ma'!  Hence the use of strictApply1Dmd.
+--
+-- For catch, catchSTM, and catchRetry, we must be extra careful; see
+-- Note [Exceptions and strictness] in Demand
 
 primop  CatchOp "catch#" GenPrimOp
           (State# RealWorld -> (# State# RealWorld, a #) )
@@ -1950,7 +1981,7 @@ primop  CatchOp "catch#" GenPrimOp
        -> State# RealWorld
        -> (# State# RealWorld, a #)
    with
-   strictness  = { \ _arity -> mkClosedStrictSig [ catchArgDmd
+   strictness  = { \ _arity -> mkClosedStrictSig [ lazyApply1Dmd
                                                  , lazyApply2Dmd
                                                  , topDmd] topRes }
                  -- See Note [Strictness for mask/unmask/catch]
@@ -1979,6 +2010,13 @@ primop  RaiseOp "raise#" GenPrimOp
 --     f x y | x>0       = raiseIO blah
 --           | y>0       = return 1
 --           | otherwise = return 2
+--
+-- TODO Check that the above notes on @f@ are valid. The function successfully
+-- produces an IO exception when compiled without optimization. If we analyze
+-- it as strict in @y@, won't we change that behavior under optimization?
+-- I thought the rule was that it was okay to replace one valid imprecise
+-- exception with another, but not to replace a precise exception with
+-- an imprecise one (dfeuer, 2017-03-05).
 
 primop  RaiseIOOp "raiseIO#" GenPrimOp
    a -> State# RealWorld -> (# State# RealWorld, b #)
@@ -2034,7 +2072,7 @@ primop  AtomicallyOp "atomically#" GenPrimOp
    out_of_line = True
    has_side_effects = True
 
--- NB: retry#'s strictness information specifies it to return bottom.
+-- NB: retry#'s strictness information specifies it to throw an exception
 -- This lets the compiler perform some extra simplifications, since retry#
 -- will technically never return.
 --
@@ -2044,10 +2082,13 @@ primop  AtomicallyOp "atomically#" GenPrimOp
 -- with:
 --   retry# s1
 -- where 'e' would be unreachable anyway.  See Trac #8091.
+--
+-- Note that it *does not* return botRes as the "exception" that is throw may be
+-- "caught" by catchRetry#. This mistake caused #14171.
 primop  RetryOp "retry#" GenPrimOp
    State# RealWorld -> (# State# RealWorld, a #)
    with
-   strictness  = { \ _arity -> mkClosedStrictSig [topDmd] botRes }
+   strictness  = { \ _arity -> mkClosedStrictSig [topDmd] exnRes }
    out_of_line = True
    has_side_effects = True
 
@@ -2068,7 +2109,7 @@ primop  CatchSTMOp "catchSTM#" GenPrimOp
    -> (b -> State# RealWorld -> (# State# RealWorld, a #) )
    -> (State# RealWorld -> (# State# RealWorld, a #) )
    with
-   strictness  = { \ _arity -> mkClosedStrictSig [ catchArgDmd
+   strictness  = { \ _arity -> mkClosedStrictSig [ lazyApply1Dmd
                                                  , lazyApply2Dmd
                                                  , topDmd ] topRes }
                  -- See Note [Strictness for mask/unmask/catch]
@@ -2308,7 +2349,7 @@ primop  IsCurrentThreadBoundOp "isCurrentThreadBound#" GenPrimOp
    has_side_effects = True
 
 primop  NoDuplicateOp "noDuplicate#" GenPrimOp
-   State# RealWorld -> State# RealWorld
+   State# s -> State# s
    with
    out_of_line = True
    has_side_effects = True
@@ -2330,6 +2371,11 @@ primtype Weak# b
 primop  MkWeakOp "mkWeak#" GenPrimOp
    o -> b -> (State# RealWorld -> (# State# RealWorld, c #))
      -> State# RealWorld -> (# State# RealWorld, Weak# b #)
+   { {\tt mkWeak# k v finalizer s} creates a weak reference to value {\tt k},
+     with an associated reference to some value {\tt v}. If {\tt k} is still
+     alive then {\tt v} can be retrieved using {\tt deRefWeak#}. Note that
+     the type of {\tt k} must be represented by a pointer (i.e. of kind {\tt
+     TYPE 'LiftedRep} or {\tt TYPE 'UnliftedRep}). }
    with
    has_side_effects = True
    out_of_line      = True
@@ -2415,12 +2461,153 @@ primop  StableNameToIntOp "stableNameToInt#" GenPrimOp
    StableName# a -> Int#
 
 ------------------------------------------------------------------------
+section "Compact normal form"
+------------------------------------------------------------------------
+
+primtype Compact#
+
+primop  CompactNewOp "compactNew#" GenPrimOp
+   Word# -> State# RealWorld -> (# State# RealWorld, Compact# #)
+   { Create a new Compact with the given size (in bytes, not words).
+     The size is rounded up to a multiple of the allocator block size,
+     and capped to one mega block. }
+   with
+   has_side_effects = True
+   out_of_line      = True
+
+primop  CompactResizeOp "compactResize#" GenPrimOp
+   Compact# -> Word# -> State# RealWorld ->
+   State# RealWorld
+   { Set the new allocation size of the compact. This value (in bytes)
+     determines the size of each block in the compact chain. }
+   with
+   has_side_effects = True
+   out_of_line      = True
+
+primop  CompactContainsOp "compactContains#" GenPrimOp
+   Compact# -> a -> State# RealWorld -> (# State# RealWorld, Int# #)
+   { Returns 1# if the object is contained in the compact, 0# otherwise. }
+   with
+   out_of_line      = True
+
+primop  CompactContainsAnyOp "compactContainsAny#" GenPrimOp
+   a -> State# RealWorld -> (# State# RealWorld, Int# #)
+   { Returns 1# if the object is in any compact at all, 0# otherwise. }
+   with
+   out_of_line      = True
+
+primop  CompactGetFirstBlockOp "compactGetFirstBlock#" GenPrimOp
+   Compact# -> State# RealWorld -> (# State# RealWorld, Addr#, Word# #)
+   { Returns the address and the size (in bytes) of the first block of
+     a compact. }
+   with
+   out_of_line      = True
+
+primop  CompactGetNextBlockOp "compactGetNextBlock#" GenPrimOp
+   Compact# -> Addr# -> State# RealWorld -> (# State# RealWorld, Addr#, Word# #)
+   { Given a compact and the address of one its blocks, returns the
+     next block and its size, or #nullAddr if the argument was the
+     last block in the compact. }
+   with
+   out_of_line      = True
+
+primop  CompactAllocateBlockOp "compactAllocateBlock#" GenPrimOp
+   Word# -> Addr# -> State# RealWorld -> (# State# RealWorld, Addr# #)
+   { Attempt to allocate a compact block with the given size (in
+     bytes) at the given address. The first argument is a hint to
+     the allocator, allocation might be satisfied at a different
+     address (which is returned).
+     The resulting block is not known to the GC until
+     compactFixupPointers# is called on it, and care must be taken
+     so that the address does not escape or memory will be leaked.
+   }
+   with
+   has_side_effects = True
+   out_of_line      = True
+
+primop  CompactFixupPointersOp "compactFixupPointers#" GenPrimOp
+   Addr# -> Addr# -> State# RealWorld -> (# State# RealWorld, Compact#, Addr# #)
+   { Given the pointer to the first block of a compact, and the
+     address of the root object in the old address space, fix up
+     the internal pointers inside the compact to account for
+     a different position in memory than when it was serialized.
+     This method must be called exactly once after importing
+     a serialized compact, and returns the new compact and
+     the new adjusted root address. }
+   with
+   has_side_effects = True
+   out_of_line      = True
+
+primop CompactAdd "compactAdd#" GenPrimOp
+   Compact# -> a -> State# RealWorld -> (# State# RealWorld, a #)
+   { Recursively add a closure and its transitive closure to a
+     {\texttt Compact\#}, evaluating any unevaluated components at the
+     same time.  Note: {\texttt compactAdd\#} is not thread-safe, so
+     only one thread may call {\texttt compactAdd\#} with a particular
+     {\texttt Compact#} at any given time.  The primop does not
+     enforce any mutual exclusion; the caller is expected to
+     arrange this. }
+   with
+   has_side_effects = True
+   out_of_line      = True
+
+primop CompactAddWithSharing "compactAddWithSharing#" GenPrimOp
+   Compact# -> a -> State# RealWorld -> (# State# RealWorld, a #)
+   { Like {\texttt compactAdd\#}, but retains sharing and cycles
+   during compaction. }
+   with
+   has_side_effects = True
+   out_of_line      = True
+
+primop CompactSize "compactSize#" GenPrimOp
+   Compact# -> State# RealWorld -> (# State# RealWorld, Word# #)
+   { Return the size (in bytes) of the total amount of data in the Compact# }
+   with
+   has_side_effects = True
+   out_of_line      = True
+
+------------------------------------------------------------------------
 section "Unsafe pointer equality"
---  (#1 Bad Guy: Alistair Reid :)
+--  (#1 Bad Guy: Alastair Reid :)
 ------------------------------------------------------------------------
 
 primop  ReallyUnsafePtrEqualityOp "reallyUnsafePtrEquality#" GenPrimOp
    a -> a -> Int#
+   { Returns 1# if the given pointers are equal and 0# otherwise. }
+   with
+   can_fail   = True -- See Note [reallyUnsafePtrEquality#]
+
+
+-- Note [reallyUnsafePtrEquality#]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- 
+-- reallyUnsafePtrEquality# can't actually fail, per se, but we mark it can_fail
+-- anyway. Until 5a9a1738023a, GHC considered primops okay for speculation only
+-- when their arguments were known to be forced. This was unnecessarily
+-- conservative, but it prevented reallyUnsafePtrEquality# from floating out of
+-- places where its arguments were known to be forced. Unfortunately, GHC could
+-- sometimes lose track of whether those arguments were forced, leading to let/app
+-- invariant failures (see Trac 13027 and the discussion in Trac 11444). Now that
+-- ok_for_speculation skips over lifted arguments, we need to explicitly prevent
+-- reallyUnsafePtrEquality# from floating out. The reasons are closely related
+-- to those described in Note [dataToTag#], although the consequences are less
+-- severe. Imagine if we had
+-- 
+--     \x y . case x of x'
+--              DEFAULT ->
+--            case y of y'
+--              DEFAULT ->
+--               let eq = reallyUnsafePtrEquality# x' y'
+--               in ...
+-- 
+-- If the let floats out, we'll get
+-- 
+--     \x y . let eq = reallyUnsafePtrEquality# x y
+--            in case x of ...
+-- 
+-- The trouble is that pointer equality between thunks is very different
+-- from pointer equality between the values those thunks reduce to, and the latter
+-- is typically much more precise.
 
 ------------------------------------------------------------------------
 section "Parallelism"
@@ -2430,7 +2617,7 @@ primop  ParOp "par#" GenPrimOp
    a -> Int#
    with
       -- Note that Par is lazy to avoid that the sparked thing
-      -- gets evaluted strictly, which it should *not* be
+      -- gets evaluated strictly, which it should *not* be
    has_side_effects = True
    code_size = { primOpCodeSizeForeignCall }
 
@@ -2471,12 +2658,36 @@ section "Tag to enum stuff"
 primop  DataToTagOp "dataToTag#" GenPrimOp
    a -> Int#
    with
-   strictness  = { \ _arity -> mkClosedStrictSig [evalDmd] topRes }
-
-        -- dataToTag# must have an evaluated argument
+   can_fail   = True -- See Note [dataToTag#]
+   strictness = { \ _arity -> mkClosedStrictSig [evalDmd] topRes }
+                -- dataToTag# must have an evaluated argument
 
 primop  TagToEnumOp "tagToEnum#" GenPrimOp
    Int# -> a
+
+{- Note [dataToTag#]
+~~~~~~~~~~~~~~~~~~~~
+The dataToTag# primop should always be applied to an evaluated argument.
+The way to ensure this is to invoke it via the 'getTag' wrapper in GHC.Base:
+   getTag :: a -> Int#
+   getTag !x = dataToTag# x
+
+But now consider
+    \z. case x of y -> let v = dataToTag# y in ...
+
+To improve floating, the FloatOut pass (deliberately) does a
+binder-swap on the case, to give
+    \z. case x of y -> let v = dataToTag# x in ...
+
+Now FloatOut might float that v-binding outside the \z.  But that is
+bad because that might mean x gest evaluated much too early!  (CorePrep
+adds an eval to a dataToTag# call, to ensure that the argument really is
+evaluated; see CorePrep Note [dataToTag magic].)
+
+Solution: make DataToTag into a can_fail primop.  That will stop it floating
+(see Note [PrimOp can_fail and has_side_effects] in PrimOp).  It's a bit of
+a hack but never mind.
+-}
 
 ------------------------------------------------------------------------
 section "Bytecode operations"
@@ -2493,6 +2704,21 @@ primtype BCO#
 primop   AddrToAnyOp "addrToAny#" GenPrimOp
    Addr# -> (# a #)
    { Convert an {\tt Addr\#} to a followable Any type. }
+   with
+   code_size = 0
+
+primop   AnyToAddrOp "anyToAddr#" GenPrimOp
+   a -> State# RealWorld -> (# State# RealWorld, Addr# #)
+   { Retrive the address of any Haskell value. This is
+     essentially an {\texttt unsafeCoerce\#}, but if implemented as such
+     the core lint pass complains and fails to compile.
+     As a primop, it is opaque to core/stg, and only appears
+     in cmm (where the copy propagation pass will get rid of it).
+     Note that "a" must be a value, not a thunk! It's too late
+     for strictness analysis to enforce this, so you're on your
+     own to guarantee this. Also note that {\texttt Addr\#} is not a GC
+     pointer - up to you to guarantee that it does not become
+     a dangling pointer immediately after you get it.}
    with
    code_size = 0
 
@@ -2515,6 +2741,11 @@ primop  NewBCOOp "newBCO#" GenPrimOp
 
 primop  UnpackClosureOp "unpackClosure#" GenPrimOp
    a -> (# Addr#, Array# b, ByteArray# #)
+   { {\tt unpackClosure\# closure} copies non-pointers and pointers in the
+     payload of the given closure into two new arrays, and returns a pointer to
+     the first word of the closure's info table, a pointer array for the
+     pointers in the payload, and a non-pointer array for the non-pointers in
+     the payload. }
    with
    out_of_line = True
 
@@ -2577,52 +2808,6 @@ pseudoop   "seq"
      In particular, this means that {\tt b} may be evaluated before
      {\tt a}. If you need to guarantee a specific order of evaluation,
      you must use the function {\tt pseq} from the "parallel" package. }
-
-primtype Any
-        { The type constructor {\tt Any} is type to which you can unsafely coerce any
-        lifted type, and back.
-
-          * It is lifted, and hence represented by a pointer
-
-          * It does not claim to be a {\it data} type, and that's important for
-            the code generator, because the code gen may {\it enter} a data value
-            but never enters a function value.
-
-        It's also used to instantiate un-constrained type variables after type
-        checking.  For example, {\tt length} has type
-
-        {\tt length :: forall a. [a] -> Int}
-
-        and the list datacon for the empty list has type
-
-        {\tt [] :: forall a. [a]}
-
-        In order to compose these two terms as {\tt length []} a type
-        application is required, but there is no constraint on the
-        choice.  In this situation GHC uses {\tt Any}:
-
-        {\tt length (Any *) ([] (Any *))}
-
-        Above, we print kinds explicitly, as if with
-        {\tt -fprint-explicit-kinds}.
-
-        Note that {\tt Any} is kind polymorphic; its kind is thus
-        {\tt forall k. k}.}
-
-primtype AnyK
-        { The kind {\tt AnyK} is the kind level counterpart to {\tt Any}. In a
-        kind polymorphic setting, a similar example to the length of the empty
-        list can be given at the type level:
-
-        {\tt type family Length (l :: [k]) :: Nat}
-        {\tt type instance Length [] = Zero}
-
-        When {\tt Length} is applied to the empty (promoted) list it will have
-        the kind {\tt Length AnyK []}.
-
-        {\tt AnyK} is currently not exported and cannot be used directly, but
-        you might see it in debug output from the compiler.
-        }
 
 pseudoop   "unsafeCoerce#"
    a -> b

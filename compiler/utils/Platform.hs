@@ -14,6 +14,7 @@ module Platform (
         isARM,
         osElfTarget,
         osMachOTarget,
+        osSubsectionsViaSymbols,
         platformUsesFrameworks,
         platformBinariesAreStaticLibs,
 )
@@ -84,7 +85,6 @@ data OS
         | OSNetBSD
         | OSKFreeBSD
         | OSHaiku
-        | OSOsf3
         | OSQNXNTO
         | OSAndroid
         | OSAIX
@@ -137,8 +137,6 @@ osElfTarget OSiOS       = False
 osElfTarget OSMinGW32   = False
 osElfTarget OSKFreeBSD  = True
 osElfTarget OSHaiku     = True
-osElfTarget OSOsf3      = False -- I don't know if this is right, but as
-                                -- per comment below it's safe
 osElfTarget OSQNXNTO    = False
 osElfTarget OSAndroid   = True
 osElfTarget OSAIX       = False
@@ -165,6 +163,11 @@ platformUsesFrameworks = osUsesFrameworks . platformOS
 osBinariesAreStaticLibs :: OS -> Bool
 osBinariesAreStaticLibs OSiOS = True
 osBinariesAreStaticLibs _     = False
+
+osSubsectionsViaSymbols :: OS -> Bool
+osSubsectionsViaSymbols OSDarwin = True
+osSubsectionsViaSymbols OSiOS    = True
+osSubsectionsViaSymbols _        = False
 
 platformBinariesAreStaticLibs :: Platform -> Bool
 platformBinariesAreStaticLibs = osBinariesAreStaticLibs . platformOS

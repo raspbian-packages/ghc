@@ -31,6 +31,11 @@ import Distribution.Client.Targets
 import Distribution.Utils.NubList
 import Network.URI
 
+import Distribution.Solver.Types.PackageConstraint
+import Distribution.Solver.Types.ConstraintSource
+import Distribution.Solver.Types.OptionalStanza
+import Distribution.Solver.Types.Settings
+
 import Distribution.Client.ProjectConfig
 import Distribution.Client.ProjectConfig.Legacy
 
@@ -72,7 +77,7 @@ tests =
   where
     usingGhc76orOlder =
       case buildCompilerId of
-        CompilerId GHC v -> v < Version [7,7] []
+        CompilerId GHC v -> v < mkVersion [7,7]
         _                -> False
 
 
@@ -91,8 +96,11 @@ roundtrip_legacytypes =
 
 
 prop_roundtrip_legacytypes_all :: ProjectConfig -> Bool
-prop_roundtrip_legacytypes_all =
+prop_roundtrip_legacytypes_all config =
     roundtrip_legacytypes
+      config {
+        projectConfigProvenance = mempty
+      }
 
 prop_roundtrip_legacytypes_packages :: ProjectConfig -> Bool
 prop_roundtrip_legacytypes_packages config =
@@ -100,6 +108,7 @@ prop_roundtrip_legacytypes_packages config =
       config {
         projectConfigBuildOnly       = mempty,
         projectConfigShared          = mempty,
+        projectConfigProvenance      = mempty,
         projectConfigLocalPackages   = mempty,
         projectConfigSpecificPackage = mempty
       }
@@ -136,7 +145,7 @@ roundtrip_printparse config =
         . showLegacyProjectConfig
         . convertToLegacyProjectConfig)
           config of
-      ParseOk _ x -> x == config
+      ParseOk _ x -> x == config { projectConfigProvenance = mempty }
       _           -> False
 
 
@@ -190,12 +199,13 @@ prop_roundtrip_printparse_shared config =
 hackProjectConfigShared :: ProjectConfigShared -> ProjectConfigShared
 hackProjectConfigShared config =
     config {
+      projectConfigProjectFile = mempty, -- not present within project files
       projectConfigConstraints =
       --TODO: [required eventually] parse ambiguity in constraint
       -- "pkgname -any" as either any version or disabled flag "any".
-        let ambiguous ((UserConstraintFlags _pkg flags), _) =
-              (not . null) [ () | (FlagName name, False) <- flags
-                                , "any" `isPrefixOf` name ]
+        let ambiguous (UserConstraint _ (PackagePropertyFlags flags), _) =
+              (not . null) [ () | (name, False) <- flags
+                                , "any" `isPrefixOf` unFlagName name ]
             ambiguous _ = False
          in filter (not . ambiguous) (projectConfigConstraints config)
     }
@@ -240,19 +250,21 @@ instance Arbitrary ProjectConfig where
         <*> (map getPackageLocationString <$> arbitrary)
         <*> shortListOf 3 arbitrary
         <*> arbitrary
-        <*> arbitrary <*> arbitrary
+        <*> arbitrary
+        <*> arbitrary
+        <*> arbitrary
         <*> arbitrary
         <*> (MapMappend . fmap getNonMEmpty . Map.fromList
                <$> shortListOf 3 arbitrary)
         -- package entries with no content are equivalent to
         -- the entry not existing at all, so exclude empty
 
-    shrink (ProjectConfig x0 x1 x2 x3 x4 x5 x6 x7) =
+    shrink (ProjectConfig x0 x1 x2 x3 x4 x5 x6 x7 x8) =
       [ ProjectConfig x0' x1' x2' x3'
-                      x4' x5' x6' (MapMappend (fmap getNonMEmpty x7'))
-      | ((x0', x1', x2', x3'), (x4', x5', x6', x7'))
+                      x4' x5' x6' x7' (MapMappend (fmap getNonMEmpty x8'))
+      | ((x0', x1', x2', x3'), (x4', x5', x6', x7', x8'))
           <- shrink ((x0, x1, x2, x3),
-                     (x4, x5, x6, fmap NonMEmpty (getMapMappend x7)))
+                     (x4, x5, x6, x7, fmap NonMEmpty (getMapMappend x8)))
       ]
 
 newtype PackageLocationString
@@ -295,32 +307,59 @@ instance Arbitrary ProjectConfigBuildOnly where
         <*> arbitrary
         <*> arbitraryNumJobs
         <*> arbitrary
-        <*> arbitrary                                           -- 12
+        <*> arbitrary
+        <*> arbitrary
         <*> (fmap getShortToken <$> arbitrary)
         <*> arbitrary
         <*> (fmap getShortToken <$> arbitrary)
-        <*> (fmap getShortToken <$> arbitrary)                  -- 16
         <*> (fmap getShortToken <$> arbitrary)
         <*> (fmap getShortToken <$> arbitrary)
       where
         arbitraryNumJobs = fmap (fmap getPositive) <$> arbitrary
 
-    shrink (ProjectConfigBuildOnly
-              x00 x01 x02 x03 x04 x05 x06 x07
-              x08 x09 x10 x11 x12 x13 x14 x15
-              x16 x17) =
-      [ ProjectConfigBuildOnly
-          x00' x01' x02' x03' x04'
-          x05' x06' x07' x08' (postShrink_NumJobs x09')
-          x10' x11' x12  x13' x14
-          x15 x16 x17
+    shrink ProjectConfigBuildOnly { projectConfigVerbosity = x00
+                                  , projectConfigDryRun = x01
+                                  , projectConfigOnlyDeps = x02
+                                  , projectConfigSummaryFile = x03
+                                  , projectConfigLogFile = x04
+                                  , projectConfigBuildReports = x05
+                                  , projectConfigReportPlanningFailure = x06
+                                  , projectConfigSymlinkBinDir = x07
+                                  , projectConfigOneShot = x08
+                                  , projectConfigNumJobs = x09
+                                  , projectConfigKeepGoing = x10
+                                  , projectConfigOfflineMode = x11
+                                  , projectConfigKeepTempFiles = x12
+                                  , projectConfigHttpTransport = x13
+                                  , projectConfigIgnoreExpiry = x14
+                                  , projectConfigCacheDir = x15
+                                  , projectConfigLogsDir = x16
+                                  , projectConfigStoreDir = x17 } =
+      [ ProjectConfigBuildOnly { projectConfigVerbosity = x00'
+                               , projectConfigDryRun = x01'
+                               , projectConfigOnlyDeps = x02'
+                               , projectConfigSummaryFile = x03'
+                               , projectConfigLogFile = x04'
+                               , projectConfigBuildReports = x05'
+                               , projectConfigReportPlanningFailure = x06'
+                               , projectConfigSymlinkBinDir = x07'
+                               , projectConfigOneShot = x08'
+                               , projectConfigNumJobs = postShrink_NumJobs x09'
+                               , projectConfigKeepGoing = x10'
+                               , projectConfigOfflineMode = x11'
+                               , projectConfigKeepTempFiles = x12'
+                               , projectConfigHttpTransport = x13
+                               , projectConfigIgnoreExpiry = x14'
+                               , projectConfigCacheDir = x15
+                               , projectConfigLogsDir = x16
+                               , projectConfigStoreDir = x17}
       | ((x00', x01', x02', x03', x04'),
          (x05', x06', x07', x08', x09'),
-         (x10', x11',       x13'))
+         (x10', x11', x12',       x14'))
           <- shrink
                ((x00, x01, x02, x03, x04),
                 (x05, x06, x07, x08, preShrink_NumJobs x09),
-                (x10, x11,      x13))
+                (x10, x11, x12,      x14))
       ]
       where
         preShrink_NumJobs  = fmap (fmap Positive)
@@ -329,17 +368,23 @@ instance Arbitrary ProjectConfigBuildOnly where
 instance Arbitrary ProjectConfigShared where
     arbitrary =
       ProjectConfigShared
-        <$> arbitrary                                           --  4
+        <$> arbitraryFlag arbitraryShortToken
+        <*> arbitraryFlag arbitraryShortToken
+        <*> arbitrary
         <*> arbitraryFlag arbitraryShortToken
         <*> arbitraryFlag arbitraryShortToken
         <*> arbitrary
         <*> arbitrary
         <*> (toNubList <$> listOf arbitraryShortToken)
+        <*> arbitrary
         <*> arbitraryConstraints
         <*> shortListOf 2 arbitrary
         <*> arbitrary <*> arbitrary
         <*> arbitrary <*> arbitrary
         <*> arbitrary <*> arbitrary
+        <*> arbitrary <*> arbitrary
+        <*> arbitrary
+        <*> arbitrary
       where
         arbitraryConstraints :: Gen [(UserConstraint, ConstraintSource)]
         arbitraryConstraints =
@@ -348,18 +393,24 @@ instance Arbitrary ProjectConfigShared where
     shrink (ProjectConfigShared
               x00 x01 x02 x03 x04
               x05 x06 x07 x08 x09
-              x10 x11 x12 x13) =
+              x10 x11 x12 x13 x14
+              x15 x16 x17 x18 x19
+              x20) =
       [ ProjectConfigShared
-          x00' (fmap getNonEmpty x01') (fmap getNonEmpty x02') x03' x04'
-          x05' (postShrink_Constraints x06') x07' x08' x09'
-          x10' x11' x12' x13'
+          x00' x01' x02' (fmap getNonEmpty x03') (fmap getNonEmpty x04')
+          x05' x06' x07' x08' (postShrink_Constraints x09')
+          x10' x11' x12' x13' x14' x15' x16' x17' x18' x19' x20'
       | ((x00', x01', x02', x03', x04'),
          (x05', x06', x07', x08', x09'),
-         (x10', x11', x12', x13'))
+         (x10', x11', x12', x13', x14'),
+         (x15', x16', x17', x18', x19'),
+         x20')
           <- shrink
-               ((x00, fmap NonEmpty x01, fmap NonEmpty x02, x03, x04),
-                (x05, preShrink_Constraints x06, x07, x08, x09),
-                (x10, x11, x12, x13))
+               ((x00, x01, x02, fmap NonEmpty x03, fmap NonEmpty x04),
+                (x05, x06, x07, x08, preShrink_Constraints x09),
+                (x10, x11, x12, x13, x14),
+                (x15, x16, x17, x18, x19),
+                x20)
       ]
       where
         preShrink_Constraints  = map fst
@@ -368,6 +419,9 @@ instance Arbitrary ProjectConfigShared where
 projectConfigConstraintSource :: ConstraintSource
 projectConfigConstraintSource = 
     ConstraintSourceProjectConfig "TODO"
+
+instance Arbitrary ProjectConfigProvenance where
+    arbitrary = elements [Implicit, Explicit "cabal.project"]
 
 instance Arbitrary PackageConfig where
     arbitrary =
@@ -399,6 +453,7 @@ instance Arbitrary PackageConfig where
         <*> arbitrary <*> arbitrary
         <*> arbitraryFlag arbitraryShortToken
         <*> arbitrary
+        <*> arbitrary
         <*> arbitrary <*> arbitrary
         <*> arbitrary
         <*> arbitraryFlag arbitraryShortToken
@@ -418,7 +473,7 @@ instance Arbitrary PackageConfig where
               x15 x16 x17 x18 x19
               x20 x21 x22 x23 x24
               x25 x26 x27 x28 x29
-              x30 x31 x32 x33 x34
+              x30 x31 x32 x33 x33_1 x34
               x35 x36 x37 x38 x39
               x40) =
       [ PackageConfig
@@ -432,7 +487,7 @@ instance Arbitrary PackageConfig where
                               x19'
           x20' x21' x22' x23' x24'
           x25' x26' x27' x28' x29'
-          x30' x31' x32' x33' x34'
+          x30' x31' x32' x33' x33_1' x34'
           x35' x36' (fmap getNonEmpty x37') x38'
                     (fmap getNonEmpty x39')
           x40'
@@ -442,7 +497,7 @@ instance Arbitrary PackageConfig where
           (x15', x16', x17', x18', x19')),
          ((x20', x21', x22', x23', x24'),
           (x25', x26', x27', x28', x29'),
-          (x30', x31', x32', x33', x34'),
+          (x30', x31', x32', (x33', x33_1'), x34'),
           (x35', x36', x37', x38', x39'),
           (x40')))
           <- shrink
@@ -455,7 +510,7 @@ instance Arbitrary PackageConfig where
                        x19)),
                 ((x20, x21, x22, x23, x24),
                  (x25, x26, x27, x28, x29),
-                 (x30, x31, x32, x33, x34),
+                 (x30, x31, x32, (x33, x33_1), x34),
                  (x35, x36, fmap NonEmpty x37, x38, fmap NonEmpty x39),
                  (x40)))
       ]
@@ -482,7 +537,7 @@ instance Arbitrary SourceRepo where
                            <*> (fmap getShortToken <$> arbitrary)
                            <*> (fmap getShortToken <$> arbitrary)
                            <*> (fmap getShortToken <$> arbitrary))
-                `suchThat` (/= emptySourceRepo)
+                `suchThat` (/= emptySourceRepo RepoThis)
 
     shrink (SourceRepo _ x1 x2 x3 x4 x5 x6) =
       [ repo
@@ -499,13 +554,8 @@ instance Arbitrary SourceRepo where
                               (fmap getShortToken x4')
                               (fmap getShortToken x5')
                               (fmap getShortToken x6')
-      , repo /= emptySourceRepo
+      , repo /= emptySourceRepo RepoThis
       ]
-
-emptySourceRepo :: SourceRepo
-emptySourceRepo = SourceRepo RepoThis Nothing Nothing Nothing
-                                      Nothing Nothing Nothing
-
 
 instance Arbitrary RepoType where
     arbitrary = elements knownRepoTypes
@@ -527,7 +577,7 @@ instance Arbitrary a => Arbitrary (InstallDirs a) where
         <$> arbitrary <*> arbitrary <*> arbitrary <*> arbitrary --  4
         <*> arbitrary <*> arbitrary <*> arbitrary <*> arbitrary --  8
         <*> arbitrary <*> arbitrary <*> arbitrary <*> arbitrary -- 12
-        <*> arbitrary <*> arbitrary                             -- 14
+        <*> arbitrary <*> arbitrary <*> arbitrary <*> arbitrary -- 16
 
 instance Arbitrary PackageDB where
     arbitrary = oneof [ pure GlobalPackageDB
@@ -549,21 +599,36 @@ instance Arbitrary RemoteRepo where
           shortListOf1 5 (oneof [ choose ('0', '9')
                                 , choose ('a', 'f') ])
 
+instance Arbitrary UserConstraintScope where
+    arbitrary = oneof [ UserQualified <$> arbitrary <*> arbitrary
+                      , UserAnySetupQualifier <$> arbitrary
+                      , UserAnyQualifier <$> arbitrary
+                      ]
+
+instance Arbitrary UserQualifier where
+    arbitrary = oneof [ pure UserQualToplevel
+                      , UserQualSetup <$> arbitrary
+
+                      -- -- TODO: Re-enable UserQualExe tests once we decide on a syntax.
+                      -- , UserQualExe <$> arbitrary <*> arbitrary
+                      ]
+
 instance Arbitrary UserConstraint where
-    arbitrary =
-      oneof
-        [ UserConstraintVersion   <$> arbitrary <*> arbitrary
-        , UserConstraintInstalled <$> arbitrary
-        , UserConstraintSource    <$> arbitrary
-        , UserConstraintFlags     <$> arbitrary <*> shortListOf1 3 arbitrary
-        , UserConstraintStanzas   <$> arbitrary <*> ((\x->[x]) <$> arbitrary)
-        ]
+    arbitrary = UserConstraint <$> arbitrary <*> arbitrary
+
+instance Arbitrary PackageProperty where
+    arbitrary = oneof [ PackagePropertyVersion <$> arbitrary
+                      , pure PackagePropertyInstalled
+                      , pure PackagePropertySource
+                      , PackagePropertyFlags <$> shortListOf1 3 arbitrary
+                      , PackagePropertyStanzas . (\x->[x]) <$> arbitrary
+                      ]
 
 instance Arbitrary OptionalStanza where
     arbitrary = elements [minBound..maxBound]
 
 instance Arbitrary FlagName where
-    arbitrary = FlagName <$> flagident
+    arbitrary = mkFlagName <$> flagident
       where
         flagident   = lowercase <$> shortListOf1 5 (elements flagChars)
                       `suchThat` (("-" /=) . take 1)
@@ -572,15 +637,33 @@ instance Arbitrary FlagName where
 instance Arbitrary PreSolver where
     arbitrary = elements [minBound..maxBound]
 
+instance Arbitrary ReorderGoals where
+    arbitrary = ReorderGoals <$> arbitrary
+
+instance Arbitrary CountConflicts where
+    arbitrary = CountConflicts <$> arbitrary
+
+instance Arbitrary StrongFlags where
+    arbitrary = StrongFlags <$> arbitrary
+
+instance Arbitrary AllowBootLibInstalls where
+    arbitrary = AllowBootLibInstalls <$> arbitrary
+
 instance Arbitrary AllowNewer where
-    arbitrary = oneof [ pure AllowNewerNone
-                      , AllowNewerSome <$> shortListOf1 3 arbitrary
-                      , pure AllowNewerAll
+    arbitrary = AllowNewer <$> arbitrary
+
+instance Arbitrary AllowOlder where
+    arbitrary = AllowOlder <$> arbitrary
+
+instance Arbitrary RelaxDeps where
+    arbitrary = oneof [ pure RelaxDepsNone
+                      , RelaxDepsSome <$> shortListOf1 3 arbitrary
+                      , pure RelaxDepsAll
                       ]
 
-instance Arbitrary AllowNewerDep where
-    arbitrary = oneof [ AllowNewerDep       <$> arbitrary
-                      , AllowNewerDepScoped <$> arbitrary <*> arbitrary
+instance Arbitrary RelaxedDep where
+    arbitrary = oneof [ RelaxedDep       <$> arbitrary
+                      , RelaxedDepScoped <$> arbitrary <*> arbitrary
                       ]
 
 instance Arbitrary ProfDetailLevel where

@@ -26,13 +26,7 @@
 #include <unistd.h>
 #endif
 
-// PID of the process that writes to event_log_filename (#4512)
-static pid_t event_log_pid = -1;
-
-static char *event_log_filename = NULL;
-
-// File for logging events
-FILE *event_log_file = NULL;
+static const EventLogWriter *event_log_writer;
 
 #define EVENT_LOG_SIZE 2 * (1024 * 1024) // 2MB
 
@@ -106,13 +100,18 @@ char *EventDesc[] = {
   [EVENT_TASK_MIGRATE]        = "Task migrate",
   [EVENT_TASK_DELETE]         = "Task delete",
   [EVENT_HACK_BUG_T9003]      = "Empty event for bug #9003",
+  [EVENT_HEAP_PROF_BEGIN]     = "Start of heap profile",
+  [EVENT_HEAP_PROF_COST_CENTRE]   = "Cost center definition",
+  [EVENT_HEAP_PROF_SAMPLE_BEGIN]  = "Start of heap profile sample",
+  [EVENT_HEAP_PROF_SAMPLE_STRING] = "Heap profile string sample",
+  [EVENT_HEAP_PROF_SAMPLE_COST_CENTRE] = "Heap profile cost-centre sample",
 };
 
 // Event type.
 
 typedef struct _EventType {
   EventTypeNum etNum;  // Event Type number.
-  nat   size;     // size of the payload in bytes
+  uint32_t   size;     // size of the payload in bytes
   char *desc;     // Description
 } EventType;
 
@@ -130,7 +129,7 @@ static void postBlockMarker(EventsBuf *eb);
 static void closeBlockMarker(EventsBuf *ebuf);
 
 static StgBool hasRoomForEvent(EventsBuf *eb, EventTypeNum eNum);
-static StgBool hasRoomForVariableEvent(EventsBuf *eb, nat payload_bytes);
+static StgBool hasRoomForVariableEvent(EventsBuf *eb, uint32_t payload_bytes);
 
 static void ensureRoomForEvent(EventsBuf *eb, EventTypeNum tag);
 static int ensureRoomForVariableEvent(EventsBuf *eb, StgWord16 size);
@@ -158,10 +157,26 @@ static inline void postWord64(EventsBuf *eb, StgWord64 i)
     postWord32(eb, (StgWord32)i);
 }
 
-static inline void postBuf(EventsBuf *eb, StgWord8 *buf, nat size)
+static inline void postBuf(EventsBuf *eb, StgWord8 *buf, uint32_t size)
 {
     memcpy(eb->pos, buf, size);
     eb->pos += size;
+}
+
+/* Post a null-terminated string to the event log.
+ * It is the caller's responsibility to ensure that there is
+ * enough room for strlen(buf)+1 bytes.
+ */
+static inline void postString(EventsBuf *eb, const char *buf)
+{
+    if (buf) {
+        int len = strlen(buf);
+        ASSERT(eb->begin + eb->size > eb->pos + len);
+        memcpy(eb->pos, buf, len);
+        eb->pos += len;
+    }
+    *eb->pos = 0;
+    eb->pos++;
 }
 
 static inline StgWord64 time_ns(void)
@@ -209,56 +224,57 @@ static inline void postInt8(EventsBuf *eb, StgInt8 i)
 static inline void postInt32(EventsBuf *eb, StgInt32 i)
 { postWord32(eb, (StgWord32)i); }
 
+#define EVENT_SIZE_DYNAMIC (-1)
+
+static void
+initEventLogWriter(void)
+{
+    if (event_log_writer != NULL &&
+            event_log_writer->initEventLogWriter != NULL) {
+        event_log_writer->initEventLogWriter();
+    }
+}
+
+static bool
+writeEventLog(void *eventlog, size_t eventlog_size)
+{
+    if (event_log_writer != NULL &&
+            event_log_writer->writeEventLog != NULL) {
+        return event_log_writer->writeEventLog(eventlog, eventlog_size);
+    } else {
+        return false;
+    }
+}
+
+static void
+stopEventLogWriter(void)
+{
+    if (event_log_writer != NULL &&
+            event_log_writer->stopEventLogWriter != NULL) {
+        event_log_writer->stopEventLogWriter();
+    }
+}
 
 void
-initEventLogging(void)
+flushEventLog(void)
+{
+    if (event_log_writer != NULL &&
+            event_log_writer->flushEventLog != NULL) {
+        event_log_writer->flushEventLog();
+    }
+}
+
+void
+initEventLogging(const EventLogWriter *ev_writer)
 {
     StgWord8 t, c;
-    nat n_caps;
-    char *prog;
+    uint32_t n_caps;
 
-    prog = stgMallocBytes(strlen(prog_name) + 1, "initEventLogging");
-    strcpy(prog, prog_name);
-#ifdef mingw32_HOST_OS
-    // on Windows, drop the .exe suffix if there is one
-    {
-        char *suff;
-        suff = strrchr(prog,'.');
-        if (suff != NULL && !strcmp(suff,".exe")) {
-            *suff = '\0';
-        }
-    }
-#endif
-
-    event_log_filename = stgMallocBytes(strlen(prog)
-                                        + 10 /* .%d */
-                                        + 10 /* .eventlog */,
-                                        "initEventLogging");
+    event_log_writer = ev_writer;
+    initEventLogWriter();
 
     if (sizeof(EventDesc) / sizeof(char*) != NUM_GHC_EVENT_TAGS) {
         barf("EventDesc array has the wrong number of elements");
-    }
-
-    if (event_log_pid == -1) { // #4512
-        // Single process
-        sprintf(event_log_filename, "%s.eventlog", prog);
-        event_log_pid = getpid();
-    } else {
-        // Forked process, eventlog already started by the parent
-        // before fork
-        event_log_pid = getpid();
-        // We don't have a FMT* symbol for pid_t, so we go via Word64
-        // to be sure of not losing range. It would be nicer to have a
-        // FMT* symbol or similar, though.
-        sprintf(event_log_filename, "%s.%" FMT_Word64 ".eventlog",
-                prog, (StgWord64)event_log_pid);
-    }
-    stgFree(prog);
-
-    /* Open event log file for writing. */
-    if ((event_log_file = fopen(event_log_filename, "wb")) == NULL) {
-        sysErrorBelch("initEventLogging: can't open %s", event_log_filename);
-        stg_exit(EXIT_FAILURE);
     }
 
     /*
@@ -273,7 +289,7 @@ initEventLogging(void)
      */
 #ifdef THREADED_RTS
     // XXX n_capabilities hasn't been initislised yet
-    n_caps = RtsFlags.ParFlags.nNodes;
+    n_caps = RtsFlags.ParFlags.nCapabilities;
 #else
     n_caps = 1;
 #endif
@@ -429,6 +445,26 @@ initEventLogging(void)
             eventTypes[t].size = 0;
             break;
 
+        case EVENT_HEAP_PROF_BEGIN:
+            eventTypes[t].size = EVENT_SIZE_DYNAMIC;
+            break;
+
+        case EVENT_HEAP_PROF_COST_CENTRE:
+            eventTypes[t].size = EVENT_SIZE_DYNAMIC;
+            break;
+
+        case EVENT_HEAP_PROF_SAMPLE_BEGIN:
+            eventTypes[t].size = 8;
+            break;
+
+        case EVENT_HEAP_PROF_SAMPLE_STRING:
+            eventTypes[t].size = EVENT_SIZE_DYNAMIC;
+            break;
+
+        case EVENT_HEAP_PROF_SAMPLE_COST_CENTRE:
+            eventTypes[t].size = EVENT_SIZE_DYNAMIC;
+            break;
+
         default:
             continue; /* ignore deprecated events */
         }
@@ -465,7 +501,7 @@ initEventLogging(void)
 void
 endEventLogging(void)
 {
-    nat c;
+    uint32_t c;
 
     // Flush all events remaining in the buffers.
     for (c = 0; c < n_capabilities; ++c) {
@@ -480,15 +516,13 @@ endEventLogging(void)
     // Flush the end of data marker.
     printAndClearEventBuf(&eventBuf);
 
-    if (event_log_file != NULL) {
-        fclose(event_log_file);
-    }
+    stopEventLogWriter();
 }
 
 void
-moreCapEventBufs (nat from, nat to)
+moreCapEventBufs (uint32_t from, uint32_t to)
 {
-    nat c;
+    uint32_t c;
 
     if (from > 0) {
         capEventBuf = stgReallocBytes(capEventBuf, to * sizeof(EventsBuf),
@@ -526,26 +560,13 @@ freeEventLogging(void)
     if (capEventBuf != NULL)  {
         stgFree(capEventBuf);
     }
-    if (event_log_filename != NULL) {
-        stgFree(event_log_filename);
-    }
-}
-
-void
-flushEventLog(void)
-{
-    if (event_log_file != NULL) {
-        fflush(event_log_file);
-    }
 }
 
 void
 abortEventLogging(void)
 {
     freeEventLogging();
-    if (event_log_file != NULL) {
-        fclose(event_log_file);
-    }
+    stopEventLogWriter();
 }
 
 /*
@@ -867,7 +888,7 @@ void postHeapEvent (Capability    *cap,
 }
 
 void postEventHeapInfo (EventCapsetID heap_capset,
-                        nat           gens,
+                        uint32_t    gens,
                         W_          maxHeapSize,
                         W_          allocAreaSize,
                         W_          mblockSize,
@@ -892,11 +913,11 @@ void postEventHeapInfo (EventCapsetID heap_capset,
 
 void postEventGcStats  (Capability    *cap,
                         EventCapsetID  heap_capset,
-                        nat            gen,
+                        uint32_t     gen,
                         W_           copied,
                         W_           slop,
                         W_           fragmentation,
-                        nat            par_n_threads,
+                        uint32_t     par_n_threads,
                         W_           par_max_copied,
                         W_           par_tot_copied)
 {
@@ -993,7 +1014,7 @@ postEventAtTimestamp (Capability *cap, EventTimestamp ts, EventTypeNum tag)
 void postLogMsg(EventsBuf *eb, EventTypeNum type, char *msg, va_list ap)
 {
     char buf[BUF];
-    nat size;
+    uint32_t size;
 
     size = vsnprintf(buf,BUF,msg,ap);
     if (size > BUF) {
@@ -1098,24 +1119,153 @@ void postBlockMarker (EventsBuf *eb)
     postCapNo(eb, eb->capno);
 }
 
+static HeapProfBreakdown getHeapProfBreakdown(void)
+{
+    switch (RtsFlags.ProfFlags.doHeapProfile) {
+    case HEAP_BY_CCS:
+        return HEAP_PROF_BREAKDOWN_COST_CENTRE;
+    case HEAP_BY_MOD:
+        return HEAP_PROF_BREAKDOWN_MODULE;
+    case HEAP_BY_DESCR:
+        return HEAP_PROF_BREAKDOWN_CLOSURE_DESCR;
+    case HEAP_BY_TYPE:
+        return HEAP_PROF_BREAKDOWN_TYPE_DESCR;
+    case HEAP_BY_RETAINER:
+        return HEAP_PROF_BREAKDOWN_RETAINER;
+    case HEAP_BY_LDV:
+        return HEAP_PROF_BREAKDOWN_BIOGRAPHY;
+    case HEAP_BY_CLOSURE_TYPE:
+        return HEAP_PROF_BREAKDOWN_CLOSURE_TYPE;
+    default:
+        barf("getHeapProfBreakdown: unknown heap profiling mode");
+    }
+}
+
+void postHeapProfBegin(StgWord8 profile_id)
+{
+    ACQUIRE_LOCK(&eventBufMutex);
+    PROFILING_FLAGS *flags = &RtsFlags.ProfFlags;
+    StgWord modSelector_len   =
+        flags->modSelector ? strlen(flags->modSelector) : 0;
+    StgWord descrSelector_len =
+        flags->descrSelector ? strlen(flags->descrSelector) : 0;
+    StgWord typeSelector_len  =
+        flags->typeSelector ? strlen(flags->typeSelector) : 0;
+    StgWord ccSelector_len    =
+        flags->ccSelector ? strlen(flags->ccSelector) : 0;
+    StgWord ccsSelector_len   =
+        flags->ccsSelector ? strlen(flags->ccsSelector) : 0;
+    StgWord retainerSelector_len =
+        flags->retainerSelector ? strlen(flags->retainerSelector) : 0;
+    StgWord bioSelector_len   =
+        flags->bioSelector ? strlen(flags->bioSelector) : 0;
+    StgWord len =
+        1+8+4 + modSelector_len + descrSelector_len +
+        typeSelector_len + ccSelector_len + ccsSelector_len +
+        retainerSelector_len + bioSelector_len + 7;
+    ensureRoomForVariableEvent(&eventBuf, len);
+    postEventHeader(&eventBuf, EVENT_HEAP_PROF_BEGIN);
+    postPayloadSize(&eventBuf, len);
+    postWord8(&eventBuf, profile_id);
+    postWord64(&eventBuf, TimeToNS(flags->heapProfileInterval));
+    postWord32(&eventBuf, getHeapProfBreakdown());
+    postString(&eventBuf, flags->modSelector);
+    postString(&eventBuf, flags->descrSelector);
+    postString(&eventBuf, flags->typeSelector);
+    postString(&eventBuf, flags->ccSelector);
+    postString(&eventBuf, flags->ccsSelector);
+    postString(&eventBuf, flags->retainerSelector);
+    postString(&eventBuf, flags->bioSelector);
+    RELEASE_LOCK(&eventBufMutex);
+}
+
+void postHeapProfSampleBegin(StgInt era)
+{
+    ACQUIRE_LOCK(&eventBufMutex);
+    ensureRoomForEvent(&eventBuf, EVENT_HEAP_PROF_SAMPLE_BEGIN);
+    postEventHeader(&eventBuf, EVENT_HEAP_PROF_SAMPLE_BEGIN);
+    postWord64(&eventBuf, era);
+    RELEASE_LOCK(&eventBufMutex);
+}
+
+void postHeapProfSampleString(StgWord8 profile_id,
+                              const char *label,
+                              StgWord64 residency)
+{
+    ACQUIRE_LOCK(&eventBufMutex);
+    StgWord label_len = strlen(label);
+    StgWord len = 1+8+label_len+1;
+    ensureRoomForVariableEvent(&eventBuf, len);
+    postEventHeader(&eventBuf, EVENT_HEAP_PROF_SAMPLE_STRING);
+    postPayloadSize(&eventBuf, len);
+    postWord8(&eventBuf, profile_id);
+    postWord64(&eventBuf, residency);
+    postString(&eventBuf, label);
+    RELEASE_LOCK(&eventBufMutex);
+}
+
+#ifdef PROFILING
+void postHeapProfCostCentre(StgWord32 ccID,
+                            const char *label,
+                            const char *module,
+                            const char *srcloc,
+                            StgBool is_caf)
+{
+    ACQUIRE_LOCK(&eventBufMutex);
+    StgWord label_len = strlen(label);
+    StgWord module_len = strlen(module);
+    StgWord srcloc_len = strlen(srcloc);
+    StgWord len = 4+label_len+module_len+srcloc_len+3+1;
+    ensureRoomForVariableEvent(&eventBuf, len);
+    postEventHeader(&eventBuf, EVENT_HEAP_PROF_COST_CENTRE);
+    postPayloadSize(&eventBuf, len);
+    postWord32(&eventBuf, ccID);
+    postString(&eventBuf, label);
+    postString(&eventBuf, module);
+    postString(&eventBuf, srcloc);
+    postWord8(&eventBuf, is_caf);
+    RELEASE_LOCK(&eventBufMutex);
+}
+
+void postHeapProfSampleCostCentre(StgWord8 profile_id,
+                                  CostCentreStack *stack,
+                                  StgWord64 residency)
+{
+    ACQUIRE_LOCK(&eventBufMutex);
+    StgWord depth = 0;
+    CostCentreStack *ccs;
+    for (ccs = stack; ccs != NULL && ccs != CCS_MAIN; ccs = ccs->prevStack)
+        depth++;
+    if (depth > 0xff) depth = 0xff;
+
+    StgWord len = 1+8+1+depth*4;
+    ensureRoomForVariableEvent(&eventBuf, len);
+    postEventHeader(&eventBuf, EVENT_HEAP_PROF_SAMPLE_COST_CENTRE);
+    postPayloadSize(&eventBuf, len);
+    postWord8(&eventBuf, profile_id);
+    postWord64(&eventBuf, residency);
+    postWord8(&eventBuf, depth);
+    for (ccs = stack;
+         depth>0 && ccs != NULL && ccs != CCS_MAIN;
+         ccs = ccs->prevStack, depth--)
+        postWord32(&eventBuf, ccs->cc->ccID);
+    RELEASE_LOCK(&eventBufMutex);
+}
+#endif /* PROFILING */
+
 void printAndClearEventBuf (EventsBuf *ebuf)
 {
     closeBlockMarker(ebuf);
 
     if (ebuf->begin != NULL && ebuf->pos != ebuf->begin)
     {
-        StgInt8 *begin = ebuf->begin;
-        while (begin < ebuf->pos) {
-            StgWord64 remain = ebuf->pos - begin;
-            StgWord64 written = fwrite(begin, 1, remain, event_log_file);
-            if (written == 0) {
-                debugBelch(
-                    "printAndClearEventLog: fwrite() failed to write anything;"
-                    " tried to write numBytes=%" FMT_Word64, remain);
-                resetEventsBuf(ebuf);
-                return;
-            }
-            begin += written;
+        size_t elog_size = ebuf->pos - ebuf->begin;
+        if (!writeEventLog(ebuf->begin, elog_size)) {
+            debugBelch(
+                    "printAndClearEventLog: could not flush event log"
+                );
+            resetEventsBuf(ebuf);
+            return;
         }
 
         resetEventsBuf(ebuf);
@@ -1141,7 +1291,7 @@ void resetEventsBuf(EventsBuf* eb)
 
 StgBool hasRoomForEvent(EventsBuf *eb, EventTypeNum eNum)
 {
-  nat size;
+  uint32_t size;
 
   size = sizeof(EventTypeNum) + sizeof(EventTimestamp) + eventTypes[eNum].size;
 
@@ -1152,9 +1302,9 @@ StgBool hasRoomForEvent(EventsBuf *eb, EventTypeNum eNum)
   }
 }
 
-StgBool hasRoomForVariableEvent(EventsBuf *eb, nat payload_bytes)
+StgBool hasRoomForVariableEvent(EventsBuf *eb, uint32_t payload_bytes)
 {
-  nat size;
+  uint32_t size;
 
   size = sizeof(EventTypeNum) + sizeof(EventTimestamp) +
       sizeof(EventPayloadSize) + payload_bytes;
@@ -1189,7 +1339,7 @@ int ensureRoomForVariableEvent(EventsBuf *eb, StgWord16 size)
 void postEventType(EventsBuf *eb, EventType *et)
 {
     StgWord8 d;
-    nat desclen;
+    uint32_t desclen;
 
     postInt32(eb, EVENT_ET_BEGIN);
     postEventTypeNum(eb, et->etNum);

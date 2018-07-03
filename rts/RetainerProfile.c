@@ -46,10 +46,11 @@
  * Declarations...
  * -------------------------------------------------------------------------- */
 
-static nat retainerGeneration;  // generation
+static uint32_t retainerGeneration;  // generation
 
-static nat numObjectVisited;    // total number of objects visited
-static nat timesAnyObjectVisited; // number of times any objects are visited
+static uint32_t numObjectVisited;    // total number of objects visited
+static uint32_t timesAnyObjectVisited;  // number of times any objects are
+                                        // visited
 
 /*
   The rs field in the profile header of any object points to its retainer
@@ -79,18 +80,18 @@ static void belongToHeap(StgPtr p);
   Invariants:
     cStackSize <= maxCStackSize
  */
-static nat cStackSize, maxCStackSize;
+static uint32_t cStackSize, maxCStackSize;
 
-static nat sumOfNewCost;        // sum of the cost of each object, computed
+static uint32_t sumOfNewCost;        // sum of the cost of each object, computed
                                 // when the object is first visited
-static nat sumOfNewCostExtra;   // for those objects not visited during
+static uint32_t sumOfNewCostExtra;   // for those objects not visited during
                                 // retainer profiling, e.g., MUT_VAR
-static nat costArray[N_CLOSURE_TYPES];
+static uint32_t costArray[N_CLOSURE_TYPES];
 
-nat sumOfCostLinear;            // sum of the costs of all object, computed
+uint32_t sumOfCostLinear;            // sum of the costs of all object, computed
                                 // when linearly traversing the heap after
                                 // retainer profiling
-nat costArrayLinear[N_CLOSURE_TYPES];
+uint32_t costArrayLinear[N_CLOSURE_TYPES];
 #endif
 
 /* -----------------------------------------------------------------------------
@@ -116,14 +117,9 @@ typedef union {
 
     // layout.payload
     struct {
-    // See StgClosureInfo in InfoTables.h
-#if SIZEOF_VOID_P == 8
-        StgWord32 pos;
-        StgWord32 ptrs;
-#else
-        StgWord16 pos;
-        StgWord16 ptrs;
-#endif
+        // See StgClosureInfo in InfoTables.h
+        StgHalfWord pos;
+        StgHalfWord ptrs;
         StgPtr payload;
     } ptrs;
 
@@ -260,9 +256,9 @@ closeTraverseStack( void )
 }
 
 /* -----------------------------------------------------------------------------
- * Returns rtsTrue if the whole stack is empty.
+ * Returns true if the whole stack is empty.
  * -------------------------------------------------------------------------- */
-static INLINE rtsBool
+static INLINE bool
 isEmptyRetainerStack( void )
 {
     return (firstStack == currentStack) && stackTop == stackLimit;
@@ -286,10 +282,10 @@ retainerStackBlocks( void )
 #endif
 
 /* -----------------------------------------------------------------------------
- * Returns rtsTrue if stackTop is at the stack boundary of the current stack,
+ * Returns true if stackTop is at the stack boundary of the current stack,
  * i.e., if the current stack chunk is empty.
  * -------------------------------------------------------------------------- */
-static INLINE rtsBool
+static INLINE bool
 isOnBoundary( void )
 {
     return stackTop == currentStackBoundary;
@@ -301,7 +297,7 @@ isOnBoundary( void )
  *   payload[] begins with ptrs pointers followed by non-pointers.
  * -------------------------------------------------------------------------- */
 static INLINE void
-init_ptrs( stackPos *info, nat ptrs, StgPtr payload )
+init_ptrs( stackPos *info, uint32_t ptrs, StgPtr payload )
 {
     info->type              = posTypePtrs;
     info->next.ptrs.pos     = 0;
@@ -326,7 +322,7 @@ find_ptrs( stackPos *info )
  *  Initializes *info from SRT information stored in *infoTable.
  * -------------------------------------------------------------------------- */
 static INLINE void
-init_srt_fun( stackPos *info, StgFunInfoTable *infoTable )
+init_srt_fun( stackPos *info, const StgFunInfoTable *infoTable )
 {
     if (infoTable->i.srt_bitmap == (StgHalfWord)(-1)) {
         info->type = posTypeLargeSRT;
@@ -340,7 +336,7 @@ init_srt_fun( stackPos *info, StgFunInfoTable *infoTable )
 }
 
 static INLINE void
-init_srt_thunk( stackPos *info, StgThunkInfoTable *infoTable )
+init_srt_thunk( stackPos *info, const StgThunkInfoTable *infoTable )
 {
     if (infoTable->i.srt_bitmap == (StgHalfWord)(-1)) {
         info->type = posTypeLargeSRT;
@@ -388,7 +384,7 @@ find_srt( stackPos *info )
     }
     else {
         // Large SRT bitmap
-        nat i = info->next.large_srt.offset;
+        uint32_t i = info->next.large_srt.offset;
         StgWord bitmap;
 
         // Follow the pattern from GC.c:scavenge_large_srt_bitmap().
@@ -455,6 +451,7 @@ push( StgClosure *c, retainer c_child_r, StgClosure **first_child )
     case CONSTR_0_1:
     case CONSTR_0_2:
     case ARR_WORDS:
+    case COMPACT_NFDATA:
         *first_child = NULL;
         return;
 
@@ -466,7 +463,6 @@ push( StgClosure *c, retainer c_child_r, StgClosure **first_child )
     case THUNK_SELECTOR:
         *first_child = ((StgSelector *)c)->selectee;
         return;
-    case IND_PERM:
     case BLACKHOLE:
         *first_child = ((StgInd *)c)->indirectee;
         return;
@@ -508,10 +504,10 @@ push( StgClosure *c, retainer c_child_r, StgClosure **first_child )
         // layout.payload.ptrs, no SRT
     case TVAR:
     case CONSTR:
+    case CONSTR_NOCAF:
     case PRIM:
     case MUT_PRIM:
     case BCO:
-    case CONSTR_STATIC:
         init_ptrs(&se.info, get_itbl(c)->layout.payload.ptrs,
                   (StgPtr)c->payload);
         *first_child = find_ptrs(&se.info);
@@ -613,7 +609,6 @@ push( StgClosure *c, retainer c_child_r, StgClosure **first_child )
     case TSO:
     case STACK:
     case IND_STATIC:
-    case CONSTR_NOCAF_STATIC:
         // stack objects
     case UPDATE_FRAME:
     case CATCH_FRAME:
@@ -767,7 +762,7 @@ popOff(void) {
  *  the next object.
  *  If the topmost stack element indicates no more objects are left, pop
  *  off the stack element until either an object can be retrieved or
- *  the current stack chunk becomes empty, indicated by rtsTrue returned by
+ *  the current stack chunk becomes empty, indicated by true returned by
  *  isOnBoundary(), in which case *c is set to NULL.
  *  Note:
  *    It is okay to call this function even when the current stack chunk
@@ -837,8 +832,8 @@ pop( StgClosure **c, StgClosure **cp, retainer *r )
             // which field, and the rest of the bits indicate the
             // entry number (starting from zero).
             TRecEntry *entry;
-            nat entry_no = se->info.next.step >> 2;
-            nat field_no = se->info.next.step & 3;
+            uint32_t entry_no = se->info.next.step >> 2;
+            uint32_t field_no = se->info.next.step & 3;
             if (entry_no == ((StgTRecChunk *)se->c)->next_entry_idx) {
                 *c = NULL;
                 popOff();
@@ -863,7 +858,6 @@ pop( StgClosure **c, StgClosure **cp, retainer *r )
         case PRIM:
         case MUT_PRIM:
         case BCO:
-        case CONSTR_STATIC:
             // StgMutArrPtr.ptrs, no SRT
         case MUT_ARR_PTRS_CLEAN:
         case MUT_ARR_PTRS_DIRTY:
@@ -934,7 +928,6 @@ pop( StgClosure **c, StgClosure **cp, retainer *r )
         case MUT_VAR_CLEAN:
         case MUT_VAR_DIRTY:
         case THUNK_SELECTOR:
-        case IND_PERM:
         case CONSTR_1_1:
             // cannot appear
         case PAP:
@@ -943,7 +936,7 @@ pop( StgClosure **c, StgClosure **cp, retainer *r )
         case TSO:
         case STACK:
         case IND_STATIC:
-        case CONSTR_NOCAF_STATIC:
+        case CONSTR_NOCAF:
             // stack objects
         case UPDATE_FRAME:
         case CATCH_FRAME:
@@ -959,7 +952,7 @@ pop( StgClosure **c, StgClosure **cp, retainer *r )
             barf("Invalid object *c in pop()");
             return;
         }
-    } while (rtsTrue);
+    } while (true);
 }
 
 /* -----------------------------------------------------------------------------
@@ -1007,9 +1000,9 @@ maybeInitRetainerSet( StgClosure *c )
 }
 
 /* -----------------------------------------------------------------------------
- * Returns rtsTrue if *c is a retainer.
+ * Returns true if *c is a retainer.
  * -------------------------------------------------------------------------- */
-static INLINE rtsBool
+static INLINE bool
 isRetainer( StgClosure *c )
 {
     switch (get_itbl(c)->type) {
@@ -1047,7 +1040,7 @@ isRetainer( StgClosure *c )
         // WEAK objects are roots; there is separate code in which traversing
         // begins from WEAK objects.
     case WEAK:
-        return rtsTrue;
+        return true;
 
         //
         // False case
@@ -1055,6 +1048,7 @@ isRetainer( StgClosure *c )
 
         // constructors
     case CONSTR:
+    case CONSTR_NOCAF:
     case CONSTR_1_0:
     case CONSTR_0_1:
     case CONSTR_2_0:
@@ -1070,14 +1064,12 @@ isRetainer( StgClosure *c )
         // partial applications
     case PAP:
         // indirection
-    case IND_PERM:
     // IND_STATIC used to be an error, but at the moment it can happen
     // as isAlive doesn't look through IND_STATIC as it ignores static
     // closures. See trac #3956 for a program that hit this error.
     case IND_STATIC:
     case BLACKHOLE:
         // static objects
-    case CONSTR_STATIC:
     case FUN_STATIC:
         // misc
     case PRIM:
@@ -1088,14 +1080,11 @@ isRetainer( StgClosure *c )
         // immutable arrays
     case MUT_ARR_PTRS_FROZEN:
     case MUT_ARR_PTRS_FROZEN0:
-        return rtsFalse;
+        return false;
 
         //
         // Error case
         //
-        // CONSTR_NOCAF_STATIC
-        // cannot be *c, *cp, *r in the retainer profiling loop.
-    case CONSTR_NOCAF_STATIC:
         // Stack objects are invalid because they are never treated as
         // legal objects during retainer profiling.
     case UPDATE_FRAME:
@@ -1110,7 +1099,7 @@ isRetainer( StgClosure *c )
     case INVALID_OBJECT:
     default:
         barf("Invalid object in isRetainer(): %d", get_itbl(c)->type);
-        return rtsFalse;
+        return false;
     }
 }
 
@@ -1165,10 +1154,10 @@ associate( StgClosure *c, RetainerSet *s )
    -------------------------------------------------------------------------- */
 
 static void
-retain_large_bitmap (StgPtr p, StgLargeBitmap *large_bitmap, nat size,
+retain_large_bitmap (StgPtr p, StgLargeBitmap *large_bitmap, uint32_t size,
                      StgClosure *c, retainer c_child_r)
 {
-    nat i, b;
+    uint32_t i, b;
     StgWord bitmap;
 
     b = 0;
@@ -1189,7 +1178,7 @@ retain_large_bitmap (StgPtr p, StgLargeBitmap *large_bitmap, nat size,
 }
 
 static INLINE StgPtr
-retain_small_bitmap (StgPtr p, nat size, StgWord bitmap,
+retain_small_bitmap (StgPtr p, uint32_t size, StgWord bitmap,
                      StgClosure *c, retainer c_child_r)
 {
     while (size > 0) {
@@ -1210,7 +1199,7 @@ retain_small_bitmap (StgPtr p, nat size, StgWord bitmap,
 static void
 retain_large_srt_bitmap (StgLargeSRT *srt, StgClosure *c, retainer c_child_r)
 {
-    nat i, b, size;
+    uint32_t i, b, size;
     StgWord bitmap;
     StgClosure **p;
 
@@ -1234,9 +1223,10 @@ retain_large_srt_bitmap (StgLargeSRT *srt, StgClosure *c, retainer c_child_r)
 }
 
 static INLINE void
-retainSRT (StgClosure **srt, nat srt_bitmap, StgClosure *c, retainer c_child_r)
+retainSRT (StgClosure **srt, uint32_t srt_bitmap, StgClosure *c,
+            retainer c_child_r)
 {
-  nat bitmap;
+  uint32_t bitmap;
   StgClosure **p;
 
   bitmap = srt_bitmap;
@@ -1289,9 +1279,9 @@ retainStack( StgClosure *c, retainer c_child_r,
 {
     stackElement *oldStackBoundary;
     StgPtr p;
-    StgRetInfoTable *info;
+    const StgRetInfoTable *info;
     StgWord bitmap;
-    nat size;
+    uint32_t size;
 
 #ifdef DEBUG_RETAINER
     cStackSize++;
@@ -1365,10 +1355,10 @@ retainStack( StgClosure *c, retainer c_child_r,
 
         case RET_FUN: {
             StgRetFun *ret_fun = (StgRetFun *)p;
-            StgFunInfoTable *fun_info;
+            const StgFunInfoTable *fun_info;
 
             retainClosure(ret_fun->fun, c, c_child_r);
-            fun_info = get_fun_itbl(UNTAG_CLOSURE(ret_fun->fun));
+            fun_info = get_fun_itbl(UNTAG_CONST_CLOSURE(ret_fun->fun));
 
             p = (P_)&ret_fun->payload;
             switch (fun_info->f.fun_type) {
@@ -1421,7 +1411,7 @@ retain_PAP_payload (StgClosure *pap,    /* NOT tagged */
 {
     StgPtr p;
     StgWord bitmap;
-    StgFunInfoTable *fun_info;
+    const StgFunInfoTable *fun_info;
 
     retainClosure(fun, pap, c_child_r);
     fun = UNTAG_CLOSURE(fun);
@@ -1532,8 +1522,7 @@ inner_loop:
 #ifdef DEBUG_RETAINER
     switch (typeOfc) {
     case IND_STATIC:
-    case CONSTR_NOCAF_STATIC:
-    case CONSTR_STATIC:
+    case CONSTR_NOCAF:
     case THUNK_STATIC:
     case FUN_STATIC:
         break;
@@ -1563,9 +1552,9 @@ inner_loop:
         c = ((StgIndStatic *)c)->indirectee;
         goto inner_loop;
         // static objects with no pointers out, so goto loop.
-    case CONSTR_NOCAF_STATIC:
+    case CONSTR_NOCAF:
         // It is not just enough not to compute the retainer set for *c; it is
-        // mandatory because CONSTR_NOCAF_STATIC are not reachable from
+        // mandatory because CONSTR_NOCAF are not reachable from
         // scavenged_static_objects, the list from which is assumed to traverse
         // all static objects after major garbage collections.
         goto loop;
@@ -1590,7 +1579,7 @@ inner_loop:
             // "appear".  A closure with a non-empty SRT, and which is
             // still required, will always be reachable.
             //
-            // But what about CONSTR_STATIC?  Surely these may be able
+            // But what about CONSTR?  Surely these may be able
             // to appear, and they don't have SRTs, so we can't
             // check.  So for now, we're calling
             // resetStaticObjectForRetainerProfiling() from the
@@ -1611,8 +1600,8 @@ inner_loop:
     retainerSetOfc = retainerSetOf(c);
 
     // Now compute s:
-    //    isRetainer(cp) == rtsTrue => s == NULL
-    //    isRetainer(cp) == rtsFalse => s == cp.retainer
+    //    isRetainer(cp) == true => s == NULL
+    //    isRetainer(cp) == false => s == cp.retainer
     if (isRetainer(cp))
         s = NULL;
     else
@@ -1680,10 +1669,10 @@ inner_loop:
     {
         StgTSO *tso = (StgTSO *)c;
 
-        retainClosure(tso->stackobj,           c, c_child_r);
-        retainClosure(tso->blocked_exceptions, c, c_child_r);
-        retainClosure(tso->bq,                 c, c_child_r);
-        retainClosure(tso->trec,               c, c_child_r);
+        retainClosure((StgClosure*) tso->stackobj,           c, c_child_r);
+        retainClosure((StgClosure*) tso->blocked_exceptions, c, c_child_r);
+        retainClosure((StgClosure*) tso->bq,                 c, c_child_r);
+        retainClosure((StgClosure*) tso->trec,               c, c_child_r);
         if (   tso->why_blocked == BlockedOnMVar
                || tso->why_blocked == BlockedOnMVarRead
                || tso->why_blocked == BlockedOnBlackHole
@@ -1767,7 +1756,7 @@ computeRetainerSet( void )
 {
     StgWeak *weak;
     RetainerSet *rtl;
-    nat g, n;
+    uint32_t g, n;
     StgPtr ml;
     bdescr *bd;
 #ifdef DEBUG_RETAINER
@@ -1801,7 +1790,7 @@ computeRetainerSet( void )
     // object (computing sumOfNewCostExtra and updating costArray[] when
     // debugging retainer profiler).
     for (g = 0; g < RtsFlags.GcFlags.generations; g++) {
-        // NOT TRUE: even G0 has a block on its mutable list
+        // NOT true: even G0 has a block on its mutable list
         // ASSERT(g != 0 || (generations[g].mut_list == NULL));
 
         // Traversing through mut_list is necessary
@@ -1824,8 +1813,7 @@ computeRetainerSet( void )
                     case IND_STATIC:
                         // no cost involved
                         break;
-                    case CONSTR_NOCAF_STATIC:
-                    case CONSTR_STATIC:
+                    case CONSTR_NOCAF:
                     case THUNK_STATIC:
                     case FUN_STATIC:
                         barf("Invalid object in computeRetainerSet(): %d", get_itbl((StgClosure*)ml)->type);
@@ -1849,7 +1837,7 @@ computeRetainerSet( void )
  *  and reset their rs fields to NULL, which is accomplished by
  *  invoking maybeInitRetainerSet(). This function must be called
  *  before zeroing all objects reachable from scavenged_static_objects
- *  in the case of major gabage collections. See GarbageCollect() in
+ *  in the case of major garbage collections. See GarbageCollect() in
  *  GC.c.
  *  Note:
  *    The mut_once_list of the oldest generation must also be traversed?
@@ -1873,7 +1861,7 @@ void
 resetStaticObjectForRetainerProfiling( StgClosure *static_objects )
 {
 #ifdef DEBUG_RETAINER
-    nat count;
+    uint32_t count;
 #endif
     StgClosure *p;
 
@@ -1901,7 +1889,11 @@ resetStaticObjectForRetainerProfiling( StgClosure *static_objects )
             maybeInitRetainerSet(p);
             p = (StgClosure*)*FUN_STATIC_LINK(p);
             break;
-        case CONSTR_STATIC:
+        case CONSTR:
+        case CONSTR_1_0:
+        case CONSTR_2_0:
+        case CONSTR_1_1:
+        case CONSTR_NOCAF:
             maybeInitRetainerSet(p);
             p = (StgClosure*)*STATIC_LINK(get_itbl(p), p);
             break;
@@ -1929,8 +1921,8 @@ void
 retainerProfile(void)
 {
 #ifdef DEBUG_RETAINER
-  nat i;
-  nat totalHeapSize;        // total raw heap size (computed by linear scanning)
+  uint32_t i;
+  uint32_t totalHeapSize;   // total raw heap size (computed by linear scanning)
 #endif
 
 #ifdef DEBUG_RETAINER
@@ -1963,8 +1955,7 @@ retainerProfile(void)
     debugBelch("costArrayLinear[" #index "] = %u\n", costArrayLinear[index])
   pcostArrayLinear(THUNK_STATIC);
   pcostArrayLinear(FUN_STATIC);
-  pcostArrayLinear(CONSTR_STATIC);
-  pcostArrayLinear(CONSTR_NOCAF_STATIC);
+  pcostArrayLinear(CONSTR_NOCAF);
 */
 #endif
 
@@ -2068,13 +2059,10 @@ retainerProfile(void)
         ((HEAP_ALLOCED(r) && ((Bdescr((P_)r)->flags & BF_FREE) == 0)))) && \
         ((StgWord)(*(StgPtr)r)!=(StgWord)0xaaaaaaaaaaaaaaaaULL))
 
-static nat
+static uint32_t
 sanityCheckHeapClosure( StgClosure *c )
 {
-    StgInfoTable *info;
-
     ASSERT(LOOKS_LIKE_GHC_INFO(c->header.info));
-    ASSERT(!closure_STATIC(c));
     ASSERT(LOOKS_LIKE_PTR(c));
 
     if ((((StgWord)RSET(c) & 1) ^ flip) != 0) {
@@ -2097,11 +2085,11 @@ sanityCheckHeapClosure( StgClosure *c )
     return closure_sizeW(c);
 }
 
-static nat
+static uint32_t
 heapCheck( bdescr *bd )
 {
     StgPtr p;
-    static nat costSum, size;
+    static uint32_t costSum, size;
 
     costSum = 0;
     while (bd != NULL) {
@@ -2121,12 +2109,12 @@ heapCheck( bdescr *bd )
     return costSum;
 }
 
-static nat
+static uint32_t
 smallObjectPoolCheck(void)
 {
     bdescr *bd;
     StgPtr p;
-    static nat costSum, size;
+    static uint32_t costSum, size;
 
     bd = g0s0->blocks;
     costSum = 0;
@@ -2162,10 +2150,10 @@ smallObjectPoolCheck(void)
     return costSum;
 }
 
-static nat
+static uint32_t
 chainCheck(bdescr *bd)
 {
-    nat costSum, size;
+    uint32_t costSum, size;
 
     costSum = 0;
     while (bd != NULL) {
@@ -2182,10 +2170,10 @@ chainCheck(bdescr *bd)
     return costSum;
 }
 
-static nat
+static uint32_t
 checkHeapSanityForRetainerProfiling( void )
 {
-    nat costSum, g, s;
+    uint32_t costSum, g, s;
 
     costSum = 0;
     debugBelch("START: sumOfCostLinear = %d, costSum = %d\n", sumOfCostLinear, costSum);
@@ -2226,7 +2214,7 @@ findPointer(StgPtr p)
 {
     StgPtr q, r, e;
     bdescr *bd;
-    nat g, s;
+    uint32_t g, s;
 
     for (g = 0; g < RtsFlags.GcFlags.generations; g++) {
         for (s = 0; s < generations[g].n_steps; s++) {
@@ -2262,7 +2250,7 @@ static void
 belongToHeap(StgPtr p)
 {
     bdescr *bd;
-    nat g, s;
+    uint32_t g, s;
 
     for (g = 0; g < RtsFlags.GcFlags.generations; g++) {
         for (s = 0; s < generations[g].n_steps; s++) {

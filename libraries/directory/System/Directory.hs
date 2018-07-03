@@ -530,7 +530,8 @@ removeContentsRecursive path =
 -- Unlike other removal functions, this function will also attempt to delete
 -- files marked as read-only or otherwise made unremovable due to permissions.
 -- As a result, if the removal is incomplete, the permissions or attributes on
--- the remaining files may be altered.
+-- the remaining files may be altered.  If there are hard links in the
+-- directory, then permissions on all related hard links may be altered.
 --
 -- If an entry within the directory vanishes while @removePathForcibly@ is
 -- running, it is silently ignored.
@@ -896,7 +897,7 @@ copyHandleData hFrom hTo =
   (`ioeAddLocation` "copyData") `modifyIOError` do
     allocaBytes bufferSize go
   where
-    bufferSize = 1024
+    bufferSize = 131072 -- 128 KiB, as coreutils `cp` uses as of May 2014 (see ioblksize.h)
     go buffer = do
       count <- hGetBuf hFrom buffer bufferSize
       when (count > 0) $ do

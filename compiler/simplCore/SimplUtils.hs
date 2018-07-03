@@ -21,7 +21,7 @@ module SimplUtils (
         isSimplified,
         contIsDupable, contResultType, contHoleType,
         contIsTrivial, contArgs,
-        countValArgs, countArgs,
+        countArgs,
         mkBoringStop, mkRhsStop, mkLazyArgStop, contIsRhsOrArg,
         interestingCallContext,
 
@@ -47,6 +47,7 @@ import CoreArity
 import CoreUnfold
 import Name
 import Id
+import IdInfo
 import Var
 import Demand
 import SimplMonad
@@ -60,8 +61,11 @@ import Util
 import MonadUtils
 import Outputable
 import Pair
+import PrelRules
+import Literal
 
 import Control.Monad    ( when )
+import Data.List        ( sortBy )
 
 {-
 ************************************************************************
@@ -175,7 +179,7 @@ instance Outputable DupFlag where
 
 instance Outputable SimplCont where
   ppr (Stop ty interesting) = text "Stop" <> brackets (ppr interesting) <+> ppr ty
-  ppr (CastIt co cont  )    = (text "CastIt" <+> ppr co) $$ ppr cont
+  ppr (CastIt co cont  )    = (text "CastIt" <+> pprOptCo co) $$ ppr cont
   ppr (TickIt t cont)       = (text "TickIt" <+> ppr t) $$ ppr cont
   ppr (ApplyToTy  { sc_arg_ty = ty, sc_cont = cont })
     = (text "ApplyToTy" <+> pprParendType ty) $$ ppr cont
@@ -217,9 +221,10 @@ data ArgInfo
   = ArgInfo {
         ai_fun   :: OutId,      -- The function
         ai_args  :: [ArgSpec],  -- ...applied to these args (which are in *reverse* order)
+
         ai_type  :: OutType,    -- Type of (f a1 ... an)
 
-        ai_rules :: [CoreRule], -- Rules for this function
+        ai_rules :: FunRules,   -- Rules for this function
 
         ai_encl :: Bool,        -- Flag saying whether this function
                                 -- or an enclosing one has rules (recursively)
@@ -246,11 +251,13 @@ instance Outputable ArgSpec where
 
 addValArgTo :: ArgInfo -> OutExpr -> ArgInfo
 addValArgTo ai arg = ai { ai_args = ValArg arg : ai_args ai
-                        , ai_type = applyTypeToArg (ai_type ai) arg }
+                        , ai_type = applyTypeToArg (ai_type ai) arg
+                        , ai_rules = decRules (ai_rules ai) }
 
 addTyArgTo :: ArgInfo -> OutType -> ArgInfo
 addTyArgTo ai arg_ty = ai { ai_args = arg_spec : ai_args ai
-                          , ai_type = piResultTy poly_fun_ty arg_ty }
+                          , ai_type = piResultTy poly_fun_ty arg_ty
+                          , ai_rules = decRules (ai_rules ai) }
   where
     poly_fun_ty = ai_type ai
     arg_spec    = TyArg { as_arg_ty = arg_ty, as_hole_ty = poly_fun_ty }
@@ -288,6 +295,20 @@ argInfoExpr fun rev_args
     go (TyArg { as_arg_ty = ty } : as) = go as `App` Type ty
     go (CastBy co                : as) = mkCast (go as) co
 
+
+type FunRules = Maybe (Int, [CoreRule]) -- Remaining rules for this function
+     -- Nothing => No rules
+     -- Just (n, rules) => some rules, requiring at least n more type/value args
+
+decRules :: FunRules -> FunRules
+decRules (Just (n, rules)) = Just (n-1, rules)
+decRules Nothing           = Nothing
+
+mkFunRules :: [CoreRule] -> FunRules
+mkFunRules [] = Nothing
+mkFunRules rs = Just (n_required, rs)
+  where
+    n_required = maximum (map ruleArity rs)
 
 {-
 ************************************************************************
@@ -359,13 +380,6 @@ contHoleType (Select { sc_dup = d, sc_bndr =  b, sc_env = se })
   = perhapsSubstTy d se (idType b)
 
 -------------------
-countValArgs :: SimplCont -> Int
--- Count value arguments excluding coercions
-countValArgs (ApplyToVal { sc_arg = arg, sc_cont = cont })
-  | Coercion {} <- arg = countValArgs cont
-  | otherwise          = 1 + countValArgs cont
-countValArgs _         = 0
-
 countArgs :: SimplCont -> Int
 -- Count all arguments, including types, coercions, and other values
 countArgs (ApplyToTy  { sc_cont = cont }) = 1 + countArgs cont
@@ -406,17 +420,19 @@ mkArgInfo :: Id
 mkArgInfo fun rules n_val_args call_cont
   | n_val_args < idArity fun            -- Note [Unsaturated functions]
   = ArgInfo { ai_fun = fun, ai_args = [], ai_type = fun_ty
-            , ai_rules = rules, ai_encl = False
+            , ai_rules = fun_rules, ai_encl = False
             , ai_strs = vanilla_stricts
             , ai_discs = vanilla_discounts }
   | otherwise
   = ArgInfo { ai_fun = fun, ai_args = [], ai_type = fun_ty
-            , ai_rules = rules
+            , ai_rules = fun_rules
             , ai_encl = interestingArgContext rules call_cont
             , ai_strs  = add_type_str fun_ty arg_stricts
             , ai_discs = arg_discounts }
   where
     fun_ty = idType fun
+
+    fun_rules = mkFunRules rules
 
     vanilla_discounts, arg_discounts :: [Int]
     vanilla_discounts = repeat 0
@@ -455,15 +471,22 @@ mkArgInfo fun rules n_val_args call_cont
     -- add_type_str is done repeatedly (for each call); might be better
     -- once-for-all in the function
     -- But beware primops/datacons with no strictness
-    add_type_str _ [] = []
-    add_type_str fun_ty strs            -- Look through foralls
-        | Just (_, fun_ty') <- splitForAllTy_maybe fun_ty       -- Includes coercions
-        = add_type_str fun_ty' strs
-    add_type_str fun_ty (str:strs)      -- Add strict-type info
-        | Just (arg_ty, fun_ty') <- splitFunTy_maybe fun_ty
-        = (str || isStrictType arg_ty) : add_type_str fun_ty' strs
-    add_type_str _ strs
-        = strs
+
+    add_type_str
+      = go
+      where
+        go _ [] = []
+        go fun_ty strs            -- Look through foralls
+            | Just (_, fun_ty') <- splitForAllTy_maybe fun_ty       -- Includes coercions
+            = go fun_ty' strs
+        go fun_ty (str:strs)      -- Add strict-type info
+            | Just (arg_ty, fun_ty') <- splitFunTy_maybe fun_ty
+            = (str || Just False == isLiftedType_maybe arg_ty) : go fun_ty' strs
+               -- If the type is levity-polymorphic, we can't know whether it's
+               -- strict. isLiftedType_maybe will return Just False only when
+               -- we're sure the type is unlifted.
+        go _ strs
+            = strs
 
 {- Note [Unsaturated functions]
   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -528,6 +551,8 @@ interestingCallContext cont
         -- If f has an INLINE prag we need to give it some
         -- motivation to inline. See Note [Cast then apply]
         -- in CoreUnfold
+
+    interesting (StrictArg _ BoringCtxt _)  = RhsCtxt
     interesting (StrictArg _ cci _)         = cci
     interesting (StrictBind {})             = BoringCtxt
     interesting (Stop _ cci)                = cci
@@ -626,7 +651,7 @@ interestingArg env e = go env 0 e
     -- n is # value args to which the expression is applied
     go env n (Var v)
        | SimplEnv { seIdSubst = ids, seInScope = in_scope } <- env
-       = case lookupVarEnv ids v of
+       = case snd <$> lookupVarEnv ids v of
            Nothing                     -> go_var n (refineFromInScope in_scope v)
            Just (DoneId v')            -> go_var n (refineFromInScope in_scope v')
            Just (DoneEx e)             -> go (zapSubstEnv env)             n e
@@ -693,11 +718,12 @@ simplEnvForGHCi dflags
 updModeForStableUnfoldings :: Activation -> SimplifierMode -> SimplifierMode
 -- See Note [Simplifying inside stable unfoldings]
 updModeForStableUnfoldings inline_rule_act current_mode
-  = current_mode { sm_phase = phaseFromActivation inline_rule_act
-                 , sm_inline = True
+  = current_mode { sm_phase      = phaseFromActivation inline_rule_act
+                 , sm_inline     = True
                  , sm_eta_expand = False }
-                 -- For sm_rules, just inherit; sm_rules might be "off"
-                 -- because of -fno-enable-rewrite-rules
+                     -- sm_eta_expand: see Note [No eta expansion in stable unfoldings]
+       -- For sm_rules, just inherit; sm_rules might be "off"
+       -- because of -fno-enable-rewrite-rules
   where
     phaseFromActivation (ActiveAfter _ n) = Phase n
     phaseFromActivation _                 = InitialPhase
@@ -712,7 +738,8 @@ updModeForRules current_mode
 
 {- Note [Simplifying rules]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-When simplifying a rule, refrain from any inlining or applying of other RULES.
+When simplifying a rule LHS, refrain from /any/ inlining or applying
+of other RULES.
 
 Doing anything to the LHS is plain confusing, because it means that what the
 rule matches is not what the user wrote. c.f. Trac #10595, and #10528.
@@ -721,6 +748,25 @@ Ticks into the LHS, which makes matching trickier. Trac #10665, #10745.
 
 Doing this to either side confounds tools like HERMIT, which seek to reason
 about and apply the RULES as originally written. See Trac #10829.
+
+Note [No eta expansion in stable unfoldings]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+If we have a stable unfolding
+
+  f :: Ord a => a -> IO ()
+  -- Unfolding template
+  --    = /\a \(d:Ord a) (x:a). bla
+
+we do not want to eta-expand to
+
+  f :: Ord a => a -> IO ()
+  -- Unfolding template
+  --    = (/\a \(d:Ord a) (x:a) (eta:State#). bla eta) |> co
+
+because not specialisation of the overloading doesn't work properly
+(see Note [Specialisation shape] in Specialise), Trac #9509.
+
+So we disable eta-expansion in stable unfoldings.
 
 Note [Inlining in gentle mode]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -840,11 +886,17 @@ continuation.
 -}
 
 activeUnfolding :: SimplEnv -> Id -> Bool
-activeUnfolding env
-  | not (sm_inline mode) = active_unfolding_minimal
-  | otherwise            = case sm_phase mode of
-                             InitialPhase -> active_unfolding_gentle
-                             Phase n      -> active_unfolding n
+activeUnfolding env id
+  | isCompulsoryUnfolding (realIdUnfolding id)
+  = True   -- Even sm_inline can't override compulsory unfoldings
+  | otherwise
+  = isActive (sm_phase mode) (idInlineActivation id)
+  && sm_inline mode
+      -- `or` isStableUnfolding (realIdUnfolding id)
+      -- Inline things when
+      --  (a) they are active
+      --  (b) sm_inline says so, except that for stable unfoldings
+      --                         (ie pragmas) we inline anyway
   where
     mode = getMode env
 
@@ -863,34 +915,12 @@ getUnfoldingInRuleMatch env
     id_unf id | unf_is_active id = idUnfolding id
               | otherwise        = NoUnfolding
     unf_is_active id
-     | not (sm_rules mode) = active_unfolding_minimal id
+     | not (sm_rules mode) = -- active_unfolding_minimal id
+                             isStableUnfolding (realIdUnfolding id)
+        -- Do we even need to test this?  I think this InScopeEnv
+        -- is only consulted if activeRule returns True, which
+        -- never happens if sm_rules is False
      | otherwise           = isActive (sm_phase mode) (idInlineActivation id)
-
-active_unfolding_minimal :: Id -> Bool
--- Compuslory unfoldings only
--- Ignore SimplGently, because we want to inline regardless;
--- the Id has no top-level binding at all
---
--- NB: we used to have a second exception, for data con wrappers.
--- On the grounds that we use gentle mode for rule LHSs, and
--- they match better when data con wrappers are inlined.
--- But that only really applies to the trivial wrappers (like (:)),
--- and they are now constructed as Compulsory unfoldings (in MkId)
--- so they'll happen anyway.
-active_unfolding_minimal id = isCompulsoryUnfolding (realIdUnfolding id)
-
-active_unfolding :: PhaseNum -> Id -> Bool
-active_unfolding n id = isActiveIn n (idInlineActivation id)
-
-active_unfolding_gentle :: Id -> Bool
--- Anything that is early-active
--- See Note [Gentle mode]
-active_unfolding_gentle id
-  =  isInlinePragma prag
-  && isEarlyActive (inlinePragmaActivation prag)
-       -- NB: wrappers are not early-active
-  where
-    prag = idInlinePragma id
 
 ----------------------
 activeRule :: SimplEnv -> Activation -> Bool
@@ -999,10 +1029,11 @@ Example
    ...fInt...fInt...fInt...
 
 Here f occurs just once, in the RHS of fInt. But if we inline it there
-we'll lose the opportunity to inline at each of fInt's call sites.
-The INLINE pragma will only inline when the application is saturated
-for exactly this reason; and we don't want PreInlineUnconditionally
-to second-guess it.  A live example is Trac #3736.
+it might make fInt look big, and we'll lose the opportunity to inline f
+at each of fInt's call sites.  The INLINE pragma will only inline when
+the application is saturated for exactly this reason; and we don't
+want PreInlineUnconditionally to second-guess it.  A live example is
+Trac #3736.
     c.f. Note [Stable unfoldings and postInlineUnconditionally]
 
 Note [Top-level bottoming Ids]
@@ -1022,7 +1053,7 @@ preInlineUnconditionally :: DynFlags -> SimplEnv -> TopLevelFlag -> InId -> InEx
 -- Precondition: rhs satisfies the let/app invariant
 -- See Note [CoreSyn let/app invariant] in CoreSyn
 -- Reason: we don't want to inline single uses, or discard dead bindings,
---         for unlifted, side-effect-full bindings
+--         for unlifted, side-effect-ful bindings
 preInlineUnconditionally dflags env top_lvl bndr rhs
   | not active                               = False
   | isStableUnfolding (idUnfolding bndr)     = False -- Note [Stable unfoldings and preInlineUnconditionally]
@@ -1031,7 +1062,9 @@ preInlineUnconditionally dflags env top_lvl bndr rhs
   | isCoVar bndr                             = False -- Note [Do not inline CoVars unconditionally]
   | otherwise = case idOccInfo bndr of
                   IAmDead                    -> True -- Happens in ((\x.1) v)
-                  OneOcc in_lam True int_cxt -> try_once in_lam int_cxt
+                  occ@OneOcc { occ_one_br = True }
+                                             -> try_once (occ_in_lam occ)
+                                                         (occ_int_cxt occ)
                   _                          -> False
   where
     mode = getMode env
@@ -1106,7 +1139,7 @@ only have *forward* references. Hence, it's safe to discard the binding
 
 NOTE: This isn't our last opportunity to inline.  We're at the binding
 site right now, and we'll get another opportunity when we get to the
-ocurrence(s)
+occurrence(s)
 
 Note that we do this unconditional inlining only for trival RHSs.
 Don't inline even WHNFs inside lambdas; doing so may simply increase
@@ -1135,12 +1168,11 @@ postInlineUnconditionally
 -- Precondition: rhs satisfies the let/app invariant
 -- See Note [CoreSyn let/app invariant] in CoreSyn
 -- Reason: we don't want to inline single uses, or discard dead bindings,
---         for unlifted, side-effect-full bindings
+--         for unlifted, side-effect-ful bindings
 postInlineUnconditionally dflags env top_lvl bndr occ_info rhs unfolding
   | not active                  = False
   | isWeakLoopBreaker occ_info  = False -- If it's a loop-breaker of any kind, don't inline
                                         -- because it might be referred to "earlier"
-  | isExportedId bndr           = False
   | isStableUnfolding unfolding = False -- Note [Stable unfoldings and postInlineUnconditionally]
   | isTopLevel top_lvl          = False -- Note [Top level and postInlineUnconditionally]
   | exprIsTrivial rhs           = True
@@ -1158,7 +1190,8 @@ postInlineUnconditionally dflags env top_lvl bndr occ_info rhs unfolding
         --         False -> case x of ...
         -- This is very important in practice; e.g. wheel-seive1 doubles
         -- in allocation if you miss this out
-      OneOcc in_lam _one_br int_cxt     -- OneOcc => no code-duplication issue
+      OneOcc { occ_in_lam = in_lam, occ_int_cxt = int_cxt }
+               -- OneOcc => no code-duplication issue
         ->     smallEnoughToInline dflags unfolding     -- Small enough to dup
                         -- ToDo: consider discount on smallEnoughToInline if int_cxt is true
                         --
@@ -1234,6 +1267,10 @@ ones that are trivial):
 
   * The inliner should inline trivial things at call sites anyway.
 
+  * The Id might be exported.  We could check for that separately,
+    but since we aren't going to postInlineUnconditionally /any/
+    top-level bindings, we don't need to test.
+
 Note [Stable unfoldings and postInlineUnconditionally]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Do not do postInlineUnconditionally if the Id has an stable unfolding,
@@ -1261,16 +1298,16 @@ won't inline because 'e' is too big.
 ************************************************************************
 -}
 
-mkLam :: [OutBndr] -> OutExpr -> SimplCont -> SimplM OutExpr
+mkLam :: SimplEnv -> [OutBndr] -> OutExpr -> SimplCont -> SimplM OutExpr
 -- mkLam tries three things
 --      a) eta reduction, if that gives a trivial expression
 --      b) eta expansion [only if there are some value lambdas]
 
-mkLam [] body _cont
+mkLam _env [] body _cont
   = return body
-mkLam bndrs body cont
-  = do  { dflags <- getDynFlags
-        ; mkLam' dflags bndrs body }
+mkLam env bndrs body cont
+  = do { dflags <- getDynFlags
+       ; mkLam' dflags bndrs body }
   where
     mkLam' :: DynFlags -> [OutBndr] -> OutExpr -> SimplM OutExpr
     mkLam' dflags bndrs (Cast body co)
@@ -1298,7 +1335,7 @@ mkLam bndrs body cont
            ; return etad_lam }
 
       | not (contIsRhs cont)   -- See Note [Eta-expanding lambdas]
-      , gopt Opt_DoLambdaEtaExpansion dflags
+      , sm_eta_expand (getMode env)
       , any isRuntimeVar bndrs
       , let body_arity = exprEtaExpandArity dflags body
       , body_arity > 0
@@ -1329,6 +1366,9 @@ However, when the lambda is let-bound, as the RHS of a let, we have a
 better eta-expander (in the form of tryEtaExpandRhs), so we don't
 bother to try expansion in mkLam in that case; hence the contIsRhs
 guard.
+
+NB: We check the SimplEnv (sm_eta_expand), not DynFlags.
+    See Note [No eta expansion in stable unfoldings]
 
 Note [Casts and lambdas]
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1369,9 +1409,10 @@ because the latter is not well-kinded.
 ************************************************************************
 -}
 
-tryEtaExpandRhs :: SimplEnv -> OutId -> OutExpr -> SimplM (Arity, OutExpr)
+tryEtaExpandRhs :: SimplEnv -> RecFlag -> OutId -> OutExpr
+                -> SimplM (Arity, OutExpr)
 -- See Note [Eta-expanding at let bindings]
-tryEtaExpandRhs env bndr rhs
+tryEtaExpandRhs env is_rec bndr rhs
   = do { dflags <- getDynFlags
        ; (new_arity, new_rhs) <- try_expand dflags
 
@@ -1390,8 +1431,12 @@ tryEtaExpandRhs env bndr rhs
             new_arity2 = idCallArity bndr
             new_arity  = max new_arity1 new_arity2
       , new_arity > old_arity      -- And the current manifest arity isn't enough
-      = do { tick (EtaExpansion bndr)
-           ; return (new_arity, etaExpand new_arity rhs) }
+      = if is_rec == Recursive && isJoinId bndr
+           then WARN(True, text "Can't eta-expand recursive join point:" <+>
+                             ppr bndr)
+                return (old_arity, rhs)
+           else do { tick (EtaExpansion bndr)
+                   ; return (new_arity, etaExpand new_arity rhs) }
       | otherwise
       = return (old_arity, rhs)
 
@@ -1759,9 +1804,46 @@ mkCase tries these things
                 False -> False
 
     and similar friends.
+
+3.  Scrutinee Constant Folding
+
+     case x op# k# of _ {  ===> case x of _ {
+        a1# -> e1                  (a1# inv_op# k#) -> e1
+        a2# -> e2                  (a2# inv_op# k#) -> e2
+        ...                        ...
+        DEFAULT -> ed              DEFAULT -> ed
+
+     where (x op# k#) inv_op# k# == x
+
+    And similarly for commuted arguments and for some unary operations.
+
+    The purpose of this transformation is not only to avoid an arithmetic
+    operation at runtime but to allow other transformations to apply in cascade.
+
+    Example with the "Merge Nested Cases" optimization (from #12877):
+
+          main = case t of t0
+             0##     -> ...
+             DEFAULT -> case t0 `minusWord#` 1## of t1
+                0##    -> ...
+                DEFAUT -> case t1 `minusWord#` 1## of t2
+                   0##     -> ...
+                   DEFAULT -> case t2 `minusWord#` 1## of _
+                      0##     -> ...
+                      DEFAULT -> ...
+
+      becomes:
+
+          main = case t of _
+          0##     -> ...
+          1##     -> ...
+          2##     -> ...
+          3##     -> ...
+          DEFAULT -> ...
+
 -}
 
-mkCase, mkCase1, mkCase2
+mkCase, mkCase1, mkCase2, mkCase3
    :: DynFlags
    -> OutExpr -> OutId
    -> OutType -> [OutAlt]               -- Alternatives in standard (increasing) order
@@ -1821,21 +1903,21 @@ mkCase1 _dflags scrut case_bndr _ alts@((_,_,rhs1) : _)      -- Identity case
     ticks = concatMap (stripTicksT tickishFloatable . thdOf3) (tail alts)
     identity_alt (con, args, rhs) = check_eq rhs con args
 
-    check_eq (Cast rhs co) con        args
+    check_eq (Cast rhs co) con args        -- See Note [RHS casts]
       = not (any (`elemVarSet` tyCoVarsOfCo co) args) && check_eq rhs con args
-        -- See Note [RHS casts]
-    check_eq (Lit lit)  (LitAlt lit') _    = lit == lit'
+    check_eq (Tick t e) alt args
+      = tickishFloatable t && check_eq e alt args
+
+    check_eq (Lit lit) (LitAlt lit') _     = lit == lit'
     check_eq (Var v) _ _  | v == case_bndr = True
-    check_eq (Var v)    (DataAlt con) []   = v == dataConWorkId con
+    check_eq (Var v)   (DataAlt con) args
+      | null arg_tys, null args            = v == dataConWorkId con
                                              -- Optimisation only
-    check_eq (Tick t e) alt           args = tickishFloatable t &&
-                                             check_eq e alt args
     check_eq rhs        (DataAlt con) args = cheapEqExpr' tickishFloatable rhs $
-                                             mkConApp con (arg_tys ++
-                                                           varsToCoreExprs args)
+                                             mkConApp2 con arg_tys args
     check_eq _          _             _    = False
 
-    arg_tys = map Type (tyConAppArgs (idType case_bndr))
+    arg_tys = tyConAppArgs (idType case_bndr)
 
         -- Note [RHS casts]
         -- ~~~~~~~~~~~~~~~~
@@ -1855,9 +1937,46 @@ mkCase1 _dflags scrut case_bndr _ alts@((_,_,rhs1) : _)      -- Identity case
 mkCase1 dflags scrut bndr alts_ty alts = mkCase2 dflags scrut bndr alts_ty alts
 
 --------------------------------------------------
+--      2. Scrutinee Constant Folding
+--------------------------------------------------
+
+mkCase2 dflags scrut bndr alts_ty alts
+  | gopt Opt_CaseFolding dflags
+  , Just (scrut',f) <- caseRules dflags scrut
+  = mkCase3 dflags scrut' bndr alts_ty (new_alts f)
+  | otherwise
+  = mkCase3 dflags scrut bndr alts_ty alts
+  where
+    -- We need to keep the correct association between the scrutinee and its
+    -- binder if the latter isn't dead. Hence we wrap rhs of alternatives with
+    -- "let bndr = ... in":
+    --
+    --     case v + 10 of y        =====> case v of y
+    --        20      -> e1                 10      -> let y = 20     in e1
+    --        DEFAULT -> e2                 DEFAULT -> let y = v + 10 in e2
+    --
+    -- Other transformations give: =====> case v of y'
+    --                                      10      -> let y = 20      in e1
+    --                                      DEFAULT -> let y = y' + 10 in e2
+    --
+    wrap_rhs l rhs
+      | isDeadBinder bndr = rhs
+      | otherwise         = Let (NonRec bndr l) rhs
+
+    -- We need to re-sort the alternatives to preserve the #case_invariants#
+    new_alts f = sortBy cmpAlt (map (mapAlt f) alts)
+
+    mapAlt f alt@(c,bs,e) = case c of
+      DEFAULT          -> (c, bs, wrap_rhs scrut e)
+      LitAlt l
+        | isLitValue l -> (LitAlt (mapLitValue dflags f l),
+                           bs, wrap_rhs (Lit l) e)
+      _ -> pprPanic "Unexpected alternative (mkCase2)" (ppr alt)
+
+--------------------------------------------------
 --      Catch-all
 --------------------------------------------------
-mkCase2 _dflags scrut bndr alts_ty alts
+mkCase3 _dflags scrut bndr alts_ty alts
   = return (Case scrut bndr alts_ty alts)
 
 {-

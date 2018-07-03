@@ -1,4 +1,5 @@
 {-# LANGUAGE RecordWildCards, NamedFieldPuns, GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 
 -- | Functions to calculate nix-style hashes for package ids.
 --
@@ -29,11 +30,12 @@ module Distribution.Client.PackageHash (
   ) where
 
 import Distribution.Package
-         ( PackageId, PackageIdentifier(..), mkUnitId )
+         ( PackageId, PackageIdentifier(..), mkComponentId
+         , PkgconfigName )
 import Distribution.System
          ( Platform, OS(Windows), buildOS )
 import Distribution.PackageDescription
-         ( FlagName(..), FlagAssignment )
+         ( FlagAssignment, showFlagValue )
 import Distribution.Simple.Compiler
          ( CompilerId, OptimisationLevel(..), DebugInfoLevel(..)
          , ProfDetailLevel(..), showProfDetailLevel )
@@ -41,8 +43,10 @@ import Distribution.Simple.InstallDirs
          ( PathTemplate, fromPathTemplate )
 import Distribution.Text
          ( display )
+import Distribution.Version
 import Distribution.Client.Types
          ( InstalledPackageId )
+import qualified Distribution.Solver.Types.ComponentDeps as CD
 
 import qualified Hackage.Security.Client    as Sec
 
@@ -50,11 +54,14 @@ import qualified Crypto.Hash.SHA256         as SHA256
 import qualified Data.ByteString.Base16     as Base16
 import qualified Data.ByteString.Char8      as BS
 import qualified Data.ByteString.Lazy.Char8 as LBS
+import qualified Data.Map as Map
 import qualified Data.Set as Set
 import           Data.Set (Set)
 
+import Data.Typeable
 import Data.Maybe        (catMaybes)
 import Data.List         (sortBy, intercalate)
+import Data.Map          (Map)
 import Data.Function     (on)
 import Distribution.Compat.Binary (Binary(..))
 import Control.Exception (evaluate)
@@ -85,7 +92,7 @@ hashedInstalledPackageId
 --
 hashedInstalledPackageIdLong :: PackageHashInputs -> InstalledPackageId
 hashedInstalledPackageIdLong pkghashinputs@PackageHashInputs{pkgHashPkgId} =
-    mkUnitId $
+    mkComponentId $
          display pkgHashPkgId   -- to be a bit user friendly
       ++ "-"
       ++ showHashValue (hashPackageHashInputs pkghashinputs)
@@ -105,12 +112,12 @@ hashedInstalledPackageIdLong pkghashinputs@PackageHashInputs{pkgHashPkgId} =
 -- in the hash.
 --
 -- Truncating the hash size is disappointing but also technically ok. We
--- rely on the hash primarily for collision avoidance not for any securty
+-- rely on the hash primarily for collision avoidance not for any security
 -- properties (at least for now).
 --
 hashedInstalledPackageIdShort :: PackageHashInputs -> InstalledPackageId
 hashedInstalledPackageIdShort pkghashinputs@PackageHashInputs{pkgHashPkgId} =
-    mkUnitId $
+    mkComponentId $
       intercalate "-"
         -- max length now 64
         [ truncateStr 14 (display name)
@@ -133,7 +140,9 @@ hashedInstalledPackageIdShort pkghashinputs@PackageHashInputs{pkgHashPkgId} =
 --
 data PackageHashInputs = PackageHashInputs {
        pkgHashPkgId         :: PackageId,
+       pkgHashComponent     :: Maybe CD.Component,
        pkgHashSourceHash    :: PackageSourceHash,
+       pkgHashPkgConfigDeps :: Set (PkgconfigName, Maybe Version),
        pkgHashDirectDeps    :: Set InstalledPackageId,
        pkgHashOtherConfig   :: PackageHashConfigInputs
      }
@@ -162,13 +171,13 @@ data PackageHashConfigInputs = PackageHashConfigInputs {
        pkgHashStripLibs           :: Bool,
        pkgHashStripExes           :: Bool,
        pkgHashDebugInfo           :: DebugInfoLevel,
+       pkgHashProgramArgs         :: Map String [String],
        pkgHashExtraLibDirs        :: [FilePath],
        pkgHashExtraFrameworkDirs  :: [FilePath],
        pkgHashExtraIncludeDirs    :: [FilePath],
        pkgHashProgPrefix          :: Maybe PathTemplate,
        pkgHashProgSuffix          :: Maybe PathTemplate
 
---     TODO: [required eventually] extra program options
 --     TODO: [required eventually] pkgHashToolsVersions     ?
 --     TODO: [required eventually] pkgHashToolsExtraOptions ?
 --     TODO: [research required] and what about docs?
@@ -188,8 +197,10 @@ hashPackageHashInputs = hashValue . renderPackageHashInputs
 renderPackageHashInputs :: PackageHashInputs -> LBS.ByteString
 renderPackageHashInputs PackageHashInputs{
                           pkgHashPkgId,
+                          pkgHashComponent,
                           pkgHashSourceHash,
                           pkgHashDirectDeps,
+                          pkgHashPkgConfigDeps,
                           pkgHashOtherConfig =
                             PackageHashConfigInputs{..}
                         } =
@@ -207,9 +218,16 @@ renderPackageHashInputs PackageHashInputs{
     --TODO: [nice to have] ultimately we probably want to put this config info
     -- into the ghc-pkg db. At that point this should probably be changed to
     -- use the config file infrastructure so it can be read back in again.
-    LBS.pack $ unlines $ catMaybes
+    LBS.pack $ unlines $ catMaybes $
       [ entry "pkgid"       display pkgHashPkgId
+      , mentry "component"  show pkgHashComponent
       , entry "src"         showHashValue pkgHashSourceHash
+      , entry "pkg-config-deps"
+                            (intercalate ", " . map (\(pn, mb_v) -> display pn ++
+                                                    case mb_v of
+                                                        Nothing -> ""
+                                                        Just v -> " " ++ display v)
+                                              . Set.toList) pkgHashPkgConfigDeps
       , entry "deps"        (intercalate ", " . map display
                                               . Set.toList) pkgHashDirectDeps
         -- and then all the config
@@ -236,17 +254,15 @@ renderPackageHashInputs PackageHashInputs{
       , opt   "extra-include-dirs" [] unwords pkgHashExtraIncludeDirs
       , opt   "prog-prefix" Nothing (maybe "" fromPathTemplate) pkgHashProgPrefix
       , opt   "prog-suffix" Nothing (maybe "" fromPathTemplate) pkgHashProgSuffix
-      ]
+      ] ++ Map.foldrWithKey (\prog args acc -> opt (prog ++ "-options") [] unwords args : acc) [] pkgHashProgramArgs
   where
     entry key     format value = Just (key ++ ": " ++ format value)
+    mentry key    format value = fmap (\v -> key ++ ": " ++ format v) value
     opt   key def format value
          | value == def = Nothing
          | otherwise    = entry key format value
 
-    showFlagAssignment = unwords . map showEntry . sortBy (compare `on` fst)
-      where
-        showEntry (FlagName name, False) = '-' : name
-        showEntry (FlagName name, True)  = '+' : name
+    showFlagAssignment = unwords . map showFlagValue . sortBy (compare `on` fst)
 
 -----------------------------------------------
 -- The specific choice of hash implementation
@@ -263,7 +279,7 @@ renderPackageHashInputs PackageHashInputs{
 -- package ids.
 
 newtype HashValue = HashValue BS.ByteString
-  deriving (Eq, Show)
+  deriving (Eq, Show, Typeable)
 
 instance Binary HashValue where
   put (HashValue digest) = put digest

@@ -8,6 +8,7 @@ module Distribution.Client.ProjectConfig.Types (
     ProjectConfig(..),
     ProjectConfigBuildOnly(..),
     ProjectConfigShared(..),
+    ProjectConfigProvenance(..),
     PackageConfig(..),
 
     -- * Resolving configuration
@@ -22,14 +23,21 @@ module Distribution.Client.ProjectConfig.Types (
 import Distribution.Client.Types
          ( RemoteRepo )
 import Distribution.Client.Dependency.Types
-         ( PreSolver, ConstraintSource )
+         ( PreSolver )
 import Distribution.Client.Targets
          ( UserConstraint )
-import Distribution.Client.BuildReports.Types 
+import Distribution.Client.BuildReports.Types
          ( ReportLevel(..) )
 
+import Distribution.Client.IndexUtils.Timestamp
+         ( IndexState )
+
+import Distribution.Solver.Types.Settings
+import Distribution.Solver.Types.ConstraintSource
+
 import Distribution.Package
-         ( PackageName, PackageId, UnitId, Dependency )
+         ( PackageName, PackageId, UnitId )
+import Distribution.Types.Dependency
 import Distribution.Version
          ( Version )
 import Distribution.System
@@ -40,7 +48,7 @@ import Distribution.Simple.Compiler
          ( Compiler, CompilerFlavor
          , OptimisationLevel(..), ProfDetailLevel, DebugInfoLevel(..) )
 import Distribution.Simple.Setup
-         ( Flag, AllowNewer(..) )
+         ( Flag, AllowNewer(..), AllowOlder(..) )
 import Distribution.Simple.InstallDirs
          ( PathTemplate )
 import Distribution.Utils.NubList
@@ -50,9 +58,11 @@ import Distribution.Verbosity
 
 import Data.Map (Map)
 import qualified Data.Map as Map
+import Data.Set (Set)
 import Distribution.Compat.Binary (Binary)
 import Distribution.Compat.Semigroup
 import GHC.Generics (Generic)
+import Data.Typeable
 
 
 -------------------------------
@@ -80,14 +90,15 @@ data ProjectConfig
    = ProjectConfig {
 
        -- | Packages in this project, including local dirs, local .cabal files
-       -- local and remote tarballs. Where these are file globs, they must
-       -- match something.
+       -- local and remote tarballs. When these are file globs, they must
+       -- match at least one package.
        projectPackages              :: [String],
 
        -- | Like 'projectConfigPackageGlobs' but /optional/ in the sense that
        -- file globs are allowed to match nothing. The primary use case for
        -- this is to be able to say @optional-packages: */@ to automagically
-       -- pick up deps that we unpack locally.
+       -- pick up deps that we unpack locally without erroring when
+       -- there aren't any.
        projectPackagesOptional      :: [String],
 
        -- | Packages in this project from remote source repositories.
@@ -96,12 +107,18 @@ data ProjectConfig
        -- | Packages in this project from hackage repositories.
        projectPackagesNamed         :: [Dependency],
 
+       -- See respective types for an explanation of what these
+       -- values are about:
        projectConfigBuildOnly       :: ProjectConfigBuildOnly,
        projectConfigShared          :: ProjectConfigShared,
+       projectConfigProvenance      :: Set ProjectConfigProvenance,
+
+       -- | Configuration to be applied to *local* packages; i.e.,
+       -- any packages which are explicitly named in `cabal.project`.
        projectConfigLocalPackages   :: PackageConfig,
        projectConfigSpecificPackage :: MapMappend PackageName PackageConfig
      }
-  deriving (Eq, Show, Generic)
+  deriving (Eq, Show, Generic, Typeable)
 
 -- | That part of the project configuration that only affects /how/ we build
 -- and not the /value/ of the things we build. This means this information
@@ -120,14 +137,14 @@ data ProjectConfigBuildOnly
        projectConfigSymlinkBinDir         :: Flag FilePath,
        projectConfigOneShot               :: Flag Bool,
        projectConfigNumJobs               :: Flag (Maybe Int),
+       projectConfigKeepGoing             :: Flag Bool,
        projectConfigOfflineMode           :: Flag Bool,
        projectConfigKeepTempFiles         :: Flag Bool,
        projectConfigHttpTransport         :: Flag String,
        projectConfigIgnoreExpiry          :: Flag Bool,
        projectConfigCacheDir              :: Flag FilePath,
        projectConfigLogsDir               :: Flag FilePath,
-       projectConfigWorldFile             :: Flag FilePath,
-       projectConfigRootCmd               :: Flag String
+       projectConfigStoreDir              :: Flag FilePath
      }
   deriving (Eq, Show, Generic)
 
@@ -137,6 +154,8 @@ data ProjectConfigBuildOnly
 --
 data ProjectConfigShared
    = ProjectConfigShared {
+       projectConfigDistDir           :: Flag FilePath,
+       projectConfigProjectFile       :: Flag FilePath,
        projectConfigHcFlavor          :: Flag CompilerFlavor,
        projectConfigHcPath            :: Flag FilePath,
        projectConfigHcPkg             :: Flag FilePath,
@@ -153,20 +172,25 @@ data ProjectConfigShared
        -- configuration used both by the solver and other phases
        projectConfigRemoteRepos       :: NubList RemoteRepo,     -- ^ Available Hackage servers.
        projectConfigLocalRepos        :: NubList FilePath,
+       projectConfigIndexState        :: Flag IndexState,
 
        -- solver configuration
        projectConfigConstraints       :: [(UserConstraint, ConstraintSource)],
        projectConfigPreferences       :: [Dependency],
        projectConfigCabalVersion      :: Flag Version,  --TODO: [required eventually] unused
        projectConfigSolver            :: Flag PreSolver,
+       projectConfigAllowOlder        :: Maybe AllowOlder,
        projectConfigAllowNewer        :: Maybe AllowNewer,
        projectConfigMaxBackjumps      :: Flag Int,
-       projectConfigReorderGoals      :: Flag Bool,
-       projectConfigStrongFlags       :: Flag Bool
+       projectConfigReorderGoals      :: Flag ReorderGoals,
+       projectConfigCountConflicts    :: Flag CountConflicts,
+       projectConfigStrongFlags       :: Flag StrongFlags,
+       projectConfigAllowBootLibInstalls :: Flag AllowBootLibInstalls,
+       projectConfigPerComponent      :: Flag Bool
 
        -- More things that only make sense for manual mode, not --local mode
        -- too much control!
-     --projectConfigIndependentGoals  :: Flag Bool,
+     --projectConfigIndependentGoals  :: Flag IndependentGoals,
      --projectConfigShadowPkgs        :: Flag Bool,
      --projectConfigReinstall         :: Flag Bool,
      --projectConfigAvoidReinstalls   :: Flag Bool,
@@ -174,6 +198,21 @@ data ProjectConfigShared
      --projectConfigUpgradeDeps       :: Flag Bool
      }
   deriving (Eq, Show, Generic)
+
+
+-- | Specifies the provenance of project configuration, whether defaults were
+-- used or if the configuration was read from an explicit file path.
+data ProjectConfigProvenance
+
+     -- | The configuration is implicit due to no explicit configuration
+     -- being found. See 'Distribution.Client.ProjectConfig.readProjectConfig'
+     -- for how implicit configuration is determined.
+   = Implicit
+
+     -- | The path the project configuration was explicitly read from.
+     -- | The configuration was explicitly read from the specified 'FilePath'.
+   | Explicit FilePath
+  deriving (Eq, Ord, Show, Generic)
 
 
 -- | Project configuration that is specific to each package, that is where we
@@ -215,6 +254,7 @@ data PackageConfig
        packageConfigHaddockHoogle       :: Flag Bool, --TODO: [required eventually] use this
        packageConfigHaddockHtml         :: Flag Bool, --TODO: [required eventually] use this
        packageConfigHaddockHtmlLocation :: Flag String, --TODO: [required eventually] use this
+       packageConfigHaddockForeignLibs  :: Flag Bool, --TODO: [required eventually] use this
        packageConfigHaddockExecutables  :: Flag Bool, --TODO: [required eventually] use this
        packageConfigHaddockTestSuites   :: Flag Bool, --TODO: [required eventually] use this
        packageConfigHaddockBenchmarks   :: Flag Bool, --TODO: [required eventually] use this
@@ -229,13 +269,14 @@ data PackageConfig
 instance Binary ProjectConfig
 instance Binary ProjectConfigBuildOnly
 instance Binary ProjectConfigShared
+instance Binary ProjectConfigProvenance
 instance Binary PackageConfig
 
 
 -- | Newtype wrapper for 'Map' that provides a 'Monoid' instance that takes
 -- the last value rather than the first value for overlapping keys.
 newtype MapLast k v = MapLast { getMapLast :: Map k v }
-  deriving (Eq, Show, Functor, Generic, Binary)
+  deriving (Eq, Show, Functor, Generic, Binary, Typeable)
 
 instance Ord k => Monoid (MapLast k v) where
   mempty  = MapLast Map.empty
@@ -249,7 +290,7 @@ instance Ord k => Semigroup (MapLast k v) where
 -- | Newtype wrapper for 'Map' that provides a 'Monoid' instance that
 -- 'mappend's values of overlapping keys rather than taking the first.
 newtype MapMappend k v = MapMappend { getMapMappend :: Map k v }
-  deriving (Eq, Show, Functor, Generic, Binary)
+  deriving (Eq, Show, Functor, Generic, Binary, Typeable)
 
 instance (Semigroup v, Ord k) => Monoid (MapMappend k v) where
   mempty  = MapMappend Map.empty
@@ -313,20 +354,24 @@ data SolverSettings
        solverSettingFlagAssignments   :: Map PackageName FlagAssignment,
        solverSettingCabalVersion      :: Maybe Version,  --TODO: [required eventually] unused
        solverSettingSolver            :: PreSolver,
+       solverSettingAllowOlder        :: AllowOlder,
        solverSettingAllowNewer        :: AllowNewer,
        solverSettingMaxBackjumps      :: Maybe Int,
-       solverSettingReorderGoals      :: Bool,
-       solverSettingStrongFlags       :: Bool
+       solverSettingReorderGoals      :: ReorderGoals,
+       solverSettingCountConflicts    :: CountConflicts,
+       solverSettingStrongFlags       :: StrongFlags,
+       solverSettingAllowBootLibInstalls :: AllowBootLibInstalls,
+       solverSettingIndexState        :: IndexState
        -- Things that only make sense for manual mode, not --local mode
        -- too much control!
-     --solverSettingIndependentGoals  :: Bool,
+     --solverSettingIndependentGoals  :: IndependentGoals,
      --solverSettingShadowPkgs        :: Bool,
      --solverSettingReinstall         :: Bool,
      --solverSettingAvoidReinstalls   :: Bool,
      --solverSettingOverrideReinstall :: Bool,
      --solverSettingUpgradeDeps       :: Bool
      }
-  deriving (Eq, Show, Generic)
+  deriving (Eq, Show, Generic, Typeable)
 
 instance Binary SolverSettings
 
@@ -354,13 +399,13 @@ data BuildTimeSettings
        buildSettingSymlinkBinDir         :: [FilePath],
        buildSettingOneShot               :: Bool,
        buildSettingNumJobs               :: Int,
+       buildSettingKeepGoing             :: Bool,
        buildSettingOfflineMode           :: Bool,
        buildSettingKeepTempFiles         :: Bool,
        buildSettingRemoteRepos           :: [RemoteRepo],
        buildSettingLocalRepos            :: [FilePath],
        buildSettingCacheDir              :: FilePath,
        buildSettingHttpTransport         :: Maybe String,
-       buildSettingIgnoreExpiry          :: Bool,
-       buildSettingRootCmd               :: Maybe String
+       buildSettingIgnoreExpiry          :: Bool
      }
 

@@ -1,5 +1,5 @@
 name:           template-haskell
-version:        2.11.1.0
+version:        2.12.0.0
 -- NOTE: Don't forget to update ./changelog.md
 license:        BSD3
 license-file:   LICENSE
@@ -49,8 +49,8 @@ Library
         Language.Haskell.TH.Lib.Map
 
     build-depends:
-        base        >= 4.7 && < 4.10,
-        ghc-boot-th == 8.0.*,
+        base        >= 4.8 && < 4.11,
+        ghc-boot-th == 8.2.*,
         pretty      == 1.1.*
 
     -- We need to set the unit ID to template-haskell (without a

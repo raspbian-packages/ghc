@@ -1,3 +1,4 @@
+{-# OPTIONS_GHC -fno-warn-warnings-deprecations #-}
 
 module Main (main) where
 
@@ -19,6 +20,7 @@ import Distribution.Simple.Utils (defaultPackageDesc, writeFileAtomic, toUTF8)
 import Distribution.Simple.Build (writeAutogenFiles)
 import Distribution.Simple.Register
 import Distribution.Text
+import Distribution.Types.MungedPackageId
 import Distribution.Verbosity
 import qualified Distribution.InstalledPackageInfo as Installed
 import qualified Distribution.Simple.PackageIndex as PackageIndex
@@ -65,9 +67,13 @@ main = do hSetBuffering stdout LineBuffering
 
 syntax_error :: [String]
 syntax_error =
-    ["syntax: ghc-cabal configure <configure-args> -- <distdir> <directory>...",
-     "        ghc-cabal install <ghc-pkg> <directory> <distdir> <destdir> <prefix> <args>...",
-     "        ghc-cabal hscolour <distdir> <directory> <args>..."]
+    ["syntax: ghc-cabal configure <directory> <distdir> <dll0modules> <args>...",
+     "        ghc-cabal copy <directory> <distdir> <strip> <destdir> <prefix> <libdir> <docdir> <libways> <args>...",
+     "        ghc-cabal register <directory> <distdir> <ghc> <ghcpkg> <topdir> <destdir> <prefix> <libdir> <docdir> <relocatable> <args>...",
+     "        ghc-cabal hscolour <directory> <distdir> <args>...",
+     "        ghc-cabal check <directory>",
+     "        ghc-cabal sdist <directory> <distdir>",
+     "        ghc-cabal --version"]
 
 die :: [String] -> IO a
 die errs = do mapM_ (hPutStrLn stderr) errs
@@ -149,7 +155,7 @@ doCopy directory distDir
     where
       noGhcPrimHook f pd lbi us flags
               = let pd'
-                     | packageName pd == PackageName "ghc-prim" =
+                     | packageName pd == mkPackageName "ghc-prim" =
                         case library pd of
                         Just lib ->
                             let ghcPrim = fromJust (simpleParse "GHC.Prim")
@@ -227,12 +233,7 @@ doRegister directory distDir ghc ghcpkg topdir
             progs' <- configurePrograms [ghcProgram', ghcPkgProgram'] progs
             instInfos <- dump (hcPkgInfo progs') verbosity GlobalPackageDB
             let installedPkgs' = PackageIndex.fromList instInfos
-            let updateComponentConfig (cn, clbi, deps)
-                    = (cn, updateComponentLocalBuildInfo clbi, deps)
-                updateComponentLocalBuildInfo clbi = clbi -- TODO: remove
-                ccs' = map updateComponentConfig (componentsConfigs lbi)
-                lbi' = lbi {
-                               componentsConfigs = ccs',
+            let lbi' = lbi {
                                installedPkgs = installedPkgs',
                                installDirTemplates = idts,
                                withPrograms = progs'
@@ -312,14 +313,15 @@ generate directory distdir dll0Modules config_args
       let pd = updatePackageDescription hooked_bi pd0
 
       -- generate Paths_<pkg>.hs and cabal-macros.h
-      writeAutogenFiles verbosity pd lbi
+      withAllComponentsInBuildOrder pd lbi $ \_ clbi ->
+        writeAutogenFiles verbosity pd lbi clbi
 
       -- generate inplace-pkg-config
       withLibLBI pd lbi $ \lib clbi ->
           do cwd <- getCurrentDirectory
              let ipid = mkUnitId (display (packageId pd))
              let installedPkgInfo = inplaceInstalledPackageInfo cwd distdir
-                                        pd (AbiHash "") lib lbi clbi
+                                        pd (mkAbiHash "inplace") lib lbi clbi
                  final_ipi = mangleIPI directory distdir lbi $ installedPkgInfo {
                                  Installed.installedUnitId = ipid,
                                  Installed.compatPackageKey = display (packageId pd),
@@ -332,7 +334,7 @@ generate directory distdir dll0Modules config_args
           comp = compiler lbi
           libBiModules lib = (libBuildInfo lib, libModules lib)
           exeBiModules exe = (buildInfo exe, ModuleName.main : exeModules exe)
-          biModuless = (maybeToList $ fmap libBiModules $ library pd)
+          biModuless = (map libBiModules . maybeToList $ library pd)
                     ++ (map exeBiModules $ executables pd)
           buildableBiModuless = filter isBuildable biModuless
               where isBuildable (bi', _) = buildable bi'
@@ -357,7 +359,7 @@ generate directory distdir dll0Modules config_args
           -- stricter than gnu ld). Thus we remove the ldOptions for
           -- GHC's rts package:
           hackRtsPackage index =
-            case PackageIndex.lookupPackageName index (PackageName "rts") of
+            case PackageIndex.lookupPackageName index (mkPackageName "rts") of
               [(_,[rts])] ->
                  PackageIndex.insert rts{
                      Installed.ldOptions = [],
@@ -382,7 +384,7 @@ generate directory distdir dll0Modules config_args
           depLibNames
             | packageKeySupported comp = dep_ipids
             | otherwise = deps
-          depNames = map (display . packageName) dep_ids
+          depNames = map (display . mungedName) dep_ids
 
           transitive_dep_ids = map Installed.sourcePackageId dep_pkgs
           transitiveDeps = map display transitive_dep_ids

@@ -1,7 +1,5 @@
 {-# LANGUAGE CPP, RankNTypes, MagicHash, BangPatterns #-}
-#if __GLASGOW_HASKELL__ >= 701
 {-# LANGUAGE Trustworthy #-}
-#endif
 
 #if defined(__GLASGOW_HASKELL__) && !defined(__HADDOCK__)
 #include "MachDeps.h"
@@ -43,7 +41,7 @@
 -- The fields in @Trade@ are marked as strict (using @!@) since we don't need
 -- laziness here. In practise, you would probably consider using the UNPACK
 -- pragma as well.
--- <http://www.haskell.org/ghc/docs/latest/html/users_guide/pragmas.html#unpack-pragma>
+-- <https://downloads.haskell.org/~ghc/latest/docs/html/users_guide/glasgow_exts.html#unpack-pragma>
 --
 -- Now, let's have a look at a decoder for this format.
 --
@@ -207,6 +205,14 @@ module Data.Binary.Get (
     , getInt32host
     , getInt64host
 
+    -- ** Decoding Floats/Doubles
+    , getFloatbe
+    , getFloatle
+    , getFloathost
+    , getDoublebe
+    , getDoublele
+    , getDoublehost
+
     -- * Deprecated functions
     , runGetState -- DEPRECATED
     , remaining -- DEPRECATED
@@ -230,6 +236,9 @@ import qualified Data.Binary.Get.Internal as I
 import GHC.Base
 import GHC.Word
 #endif
+
+-- needed for casting words to float/double
+import Data.Binary.FloatCast (wordToFloat, wordToDouble)
 
 -- $lazyinterface
 -- The lazy interface consumes a single lazy 'L.ByteString'. It's the easiest
@@ -531,33 +540,33 @@ word64le = \s ->
 {-# INLINE word64le #-}
 
 
--- | Read an Int16 in big endian format
+-- | Read an Int16 in big endian format.
 getInt16be :: Get Int16
 getInt16be = fromIntegral <$> getWord16be
 {-# INLINE getInt16be #-}
 
--- | Read an Int32 in big endian format
+-- | Read an Int32 in big endian format.
 getInt32be :: Get Int32
 getInt32be =  fromIntegral <$> getWord32be
 {-# INLINE getInt32be #-}
 
--- | Read an Int64 in big endian format
+-- | Read an Int64 in big endian format.
 getInt64be :: Get Int64
 getInt64be = fromIntegral <$> getWord64be
 {-# INLINE getInt64be #-}
 
 
--- | Read an Int16 in little endian format
+-- | Read an Int16 in little endian format.
 getInt16le :: Get Int16
 getInt16le = fromIntegral <$> getWord16le
 {-# INLINE getInt16le #-}
 
--- | Read an Int32 in little endian format
+-- | Read an Int32 in little endian format.
 getInt32le :: Get Int32
 getInt32le =  fromIntegral <$> getWord32le
 {-# INLINE getInt32le #-}
 
--- | Read an Int64 in little endian format
+-- | Read an Int64 in little endian format.
 getInt64le :: Get Int64
 getInt64le = fromIntegral <$> getWord64le
 {-# INLINE getInt64le #-}
@@ -611,6 +620,39 @@ getInt64host = getPtr  (sizeOf (undefined :: Int64))
 
 
 ------------------------------------------------------------------------
+-- Double/Float reads
+
+-- | Read a 'Float' in big endian IEEE-754 format.
+getFloatbe :: Get Float
+getFloatbe = wordToFloat <$> getWord32be
+{-# INLINE getFloatbe #-}
+
+-- | Read a 'Float' in little endian IEEE-754 format.
+getFloatle :: Get Float
+getFloatle = wordToFloat <$> getWord32le
+{-# INLINE getFloatle #-}
+
+-- | Read a 'Float' in IEEE-754 format and host endian.
+getFloathost :: Get Float
+getFloathost = wordToFloat <$> getWord32host
+{-# INLINE getFloathost #-}
+
+-- | Read a 'Double' in big endian IEEE-754 format.
+getDoublebe :: Get Double
+getDoublebe = wordToDouble <$> getWord64be
+{-# INLINE getDoublebe #-}
+
+-- | Read a 'Double' in little endian IEEE-754 format.
+getDoublele :: Get Double
+getDoublele = wordToDouble <$> getWord64le
+{-# INLINE getDoublele #-}
+
+-- | Read a 'Double' in IEEE-754 format and host endian.
+getDoublehost :: Get Double
+getDoublehost = wordToDouble <$> getWord64host
+{-# INLINE getDoublehost #-}
+
+------------------------------------------------------------------------
 -- Unchecked shifts
 
 shiftl_w16 :: Word16 -> Int -> Word16
@@ -623,12 +665,6 @@ shiftl_w32 (W32# w) (I# i) = W32# (w `uncheckedShiftL#`   i)
 
 #if WORD_SIZE_IN_BITS < 64
 shiftl_w64 (W64# w) (I# i) = W64# (w `uncheckedShiftL64#` i)
-
-#if __GLASGOW_HASKELL__ <= 606
--- Exported by GHC.Word in GHC 6.8 and higher
-foreign import ccall unsafe "stg_uncheckedShiftL64"
-    uncheckedShiftL64#     :: Word64# -> Int# -> Word64#
-#endif
 
 #else
 shiftl_w64 (W64# w) (I# i) = W64# (w `uncheckedShiftL#` i)

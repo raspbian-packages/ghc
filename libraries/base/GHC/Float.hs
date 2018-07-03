@@ -239,14 +239,13 @@ class  (RealFrac a, Floating a) => RealFloat a  where
 -- Float
 ------------------------------------------------------------------------
 
+-- | @since 2.01
 instance  Num Float  where
     (+)         x y     =  plusFloat x y
     (-)         x y     =  minusFloat x y
     negate      x       =  negateFloat x
     (*)         x y     =  timesFloat x y
-    abs x    | x == 0    = 0 -- handles (-0.0)
-             | x >  0    = x
-             | otherwise = negateFloat x
+    abs         x       =  fabsFloat x
     signum x | x > 0     = 1
              | x < 0     = negateFloat 1
              | otherwise = x -- handles 0.0, (-0.0), and NaN
@@ -254,6 +253,7 @@ instance  Num Float  where
     {-# INLINE fromInteger #-}
     fromInteger i = F# (floatFromInteger i)
 
+-- | @since 2.01
 instance  Real Float  where
     toRational (F# x#)  =
         case decodeFloat_Int# x# of
@@ -266,6 +266,7 @@ instance  Real Float  where
             | otherwise                                         ->
                     smallInteger m# :% shiftLInteger 1 (negateInt# e#)
 
+-- | @since 2.01
 instance  Fractional Float  where
     (/) x y             =  divideFloat x y
     {-# INLINE fromRational #-}
@@ -299,6 +300,7 @@ rationalToFloat n d
 "ceiling/Float->Int"                ceiling = ceilingFloatInt
 "round/Float->Int"                  round = roundFloatInt
   #-}
+-- | @since 2.01
 instance  RealFrac Float  where
 
         -- ceiling, floor, and truncate are all small
@@ -342,6 +344,7 @@ instance  RealFrac Float  where
     floor x     = case properFraction x of
                     (n,r) -> if r < 0.0 then n - 1 else n
 
+-- | @since 2.01
 instance  Floating Float  where
     pi                  =  3.141592653589793238
     exp x               =  expFloat x
@@ -376,6 +379,7 @@ instance  Floating Float  where
       | otherwise = a
     {-# INLINE log1pexp #-}
 
+-- | @since 2.01
 instance  RealFloat Float  where
     floatRadix _        =  FLT_RADIX        -- from float.h
     floatDigits _       =  FLT_MANT_DIG     -- ditto
@@ -406,6 +410,7 @@ instance  RealFloat Float  where
     isNegativeZero x = 0 /= isFloatNegativeZero x
     isIEEE _         = True
 
+-- | @since 2.01
 instance  Show Float  where
     showsPrec   x = showSignedFloat showFloat x
     showList = showList__ (showsPrec 0)
@@ -414,14 +419,13 @@ instance  Show Float  where
 -- Double
 ------------------------------------------------------------------------
 
+-- | @since 2.01
 instance  Num Double  where
     (+)         x y     =  plusDouble x y
     (-)         x y     =  minusDouble x y
     negate      x       =  negateDouble x
     (*)         x y     =  timesDouble x y
-    abs x    | x == 0    = 0 -- handles (-0.0)
-             | x >  0    = x
-             | otherwise = negateDouble x
+    abs         x       =  fabsDouble x
     signum x | x > 0     = 1
              | x < 0     = negateDouble 1
              | otherwise = x -- handles 0.0, (-0.0), and NaN
@@ -431,6 +435,7 @@ instance  Num Double  where
     fromInteger i = D# (doubleFromInteger i)
 
 
+-- | @since 2.01
 instance  Real Double  where
     toRational (D# x#)  =
         case decodeDoubleInteger x# of
@@ -443,6 +448,7 @@ instance  Real Double  where
             | otherwise                                            ->
                 m :% shiftLInteger 1 (negateInt# e#)
 
+-- | @since 2.01
 instance  Fractional Double  where
     (/) x y             =  divideDouble x y
     {-# INLINE fromRational #-}
@@ -463,6 +469,7 @@ rationalToDouble n d
         minEx       = DBL_MIN_EXP
         mantDigs    = DBL_MANT_DIG
 
+-- | @since 2.01
 instance  Floating Double  where
     pi                  =  3.141592653589793238
     exp x               =  expDouble x
@@ -510,6 +517,7 @@ instance  Floating Double  where
 "ceiling/Double->Int"               ceiling = ceilingDoubleInt
 "round/Double->Int"                 round = roundDoubleInt
   #-}
+-- | @since 2.01
 instance  RealFrac Double  where
 
         -- ceiling, floor, and truncate are all small
@@ -546,6 +554,7 @@ instance  RealFrac Double  where
     floor x     = case properFraction x of
                     (n,r) -> if r < 0.0 then n - 1 else n
 
+-- | @since 2.01
 instance  RealFloat Double  where
     floatRadix _        =  FLT_RADIX        -- from float.h
     floatDigits _       =  DBL_MANT_DIG     -- ditto
@@ -577,6 +586,7 @@ instance  RealFloat Double  where
     isNegativeZero x    = 0 /= isDoubleNegativeZero x
     isIEEE _            = True
 
+-- | @since 2.01
 instance  Show Double  where
     showsPrec   x = showSignedFloat showFloat x
     showList = showList__ (showsPrec 0)
@@ -601,6 +611,7 @@ a `non-lossy' conversion to and from Ints. Instead we make use of the
 for these (@numericEnumFromTo@ and @numericEnumFromThenTo@ below.)
 -}
 
+-- | @since 2.01
 instance  Enum Float  where
     succ x         = x + 1
     pred x         = x - 1
@@ -611,6 +622,7 @@ instance  Enum Float  where
     enumFromThen   = numericEnumFromThen
     enumFromThenTo = numericEnumFromThenTo
 
+-- | @since 2.01
 instance  Enum Double  where
     succ x         = x + 1
     pred x         = x - 1
@@ -1071,13 +1083,14 @@ geFloat     (F# x) (F# y) = isTrue# (geFloat# x y)
 ltFloat     (F# x) (F# y) = isTrue# (ltFloat# x y)
 leFloat     (F# x) (F# y) = isTrue# (leFloat# x y)
 
-expFloat, logFloat, sqrtFloat :: Float -> Float
+expFloat, logFloat, sqrtFloat, fabsFloat :: Float -> Float
 sinFloat, cosFloat, tanFloat  :: Float -> Float
 asinFloat, acosFloat, atanFloat  :: Float -> Float
 sinhFloat, coshFloat, tanhFloat  :: Float -> Float
 expFloat    (F# x) = F# (expFloat# x)
 logFloat    (F# x) = F# (logFloat# x)
 sqrtFloat   (F# x) = F# (sqrtFloat# x)
+fabsFloat   (F# x) = F# (fabsFloat# x)
 sinFloat    (F# x) = F# (sinFloat# x)
 cosFloat    (F# x) = F# (cosFloat# x)
 tanFloat    (F# x) = F# (tanFloat# x)
@@ -1115,13 +1128,14 @@ double2Float (D# x) = F# (double2Float# x)
 float2Double :: Float -> Double
 float2Double (F# x) = D# (float2Double# x)
 
-expDouble, logDouble, sqrtDouble :: Double -> Double
+expDouble, logDouble, sqrtDouble, fabsDouble :: Double -> Double
 sinDouble, cosDouble, tanDouble  :: Double -> Double
 asinDouble, acosDouble, atanDouble  :: Double -> Double
 sinhDouble, coshDouble, tanhDouble  :: Double -> Double
 expDouble    (D# x) = D# (expDouble# x)
 logDouble    (D# x) = D# (logDouble# x)
 sqrtDouble   (D# x) = D# (sqrtDouble# x)
+fabsDouble   (D# x) = D# (fabsDouble# x)
 sinDouble    (D# x) = D# (sinDouble# x)
 cosDouble    (D# x) = D# (cosDouble# x)
 tanDouble    (D# x) = D# (tanDouble# x)

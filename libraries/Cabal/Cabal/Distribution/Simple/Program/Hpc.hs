@@ -1,3 +1,6 @@
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Simple.Program.Hpc
@@ -12,6 +15,9 @@ module Distribution.Simple.Program.Hpc
     ( markup
     , union
     ) where
+
+import Prelude ()
+import Distribution.Compat.Prelude
 
 import Distribution.ModuleName
 import Distribution.Simple.Program.Run
@@ -54,7 +60,7 @@ markup hpc hpcVer verbosity tixFile hpcDirs destDir excluded = do
     runProgramInvocation verbosity
       (markupInvocation hpc tixFile hpcDirs' destDir excluded)
   where
-    version07 = Version [0, 7] []
+    version07 = mkVersion [0, 7]
     (passedDirs, droppedDirs) = splitAt 1 hpcDirs
 
 markupInvocation :: ConfiguredProgram

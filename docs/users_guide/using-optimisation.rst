@@ -45,11 +45,9 @@ optimisation to be performed, which can have an impact on how much of
 your program needs to be recompiled when you change something. This is
 one reason to stick to no-optimisation when developing code.
 
-.. ghc-flag:: -O*
-
-    This is taken to mean: “Please compile quickly; I'm not
-    over-bothered about compiled-code quality.” So, for example:
-    ``ghc -c Foo.hs``
+**No ``-O*``-type option specified:** This is taken to mean “Please 
+compile quickly; I'm not over-bothered about compiled-code quality.”
+So, for example, ``ghc -c Foo.hs``
 
 .. ghc-flag:: -O0
 
@@ -108,19 +106,18 @@ The easiest way to see what ``-O`` (etc.) “really mean” is to run with
 These flags turn on and off individual optimisations. Flags marked as
 on by default are enabled by ``-O``, and as such you shouldn't
 need to set any of them explicitly. A flag ``-fwombat`` can be negated
-by saying ``-fno-wombat``. See :ref:`options-f-compact` for a compact
-list.
+by saying ``-fno-wombat``.
 
 .. ghc-flag:: -fcase-merge
 
     :default: on
 
-    Merge immediately-nested case expressions that scrutinse the same variable.
+    Merge immediately-nested case expressions that scrutinise the same variable.
     For example, ::
 
           case x of
              Red -> e1
-             _   -> case x of 
+             _   -> case x of
                       Blue -> e2
                       Green -> e3
 
@@ -130,6 +127,25 @@ list.
              Red -> e1
              Blue -> e2
              Green -> e2
+
+.. ghc-flag:: -fcase-folding
+
+    :default: on
+
+    Allow constant folding in case expressions that scrutinise some primops:
+    For example, ::
+
+          case x `minusWord#` 10## of
+             10## -> e1
+             20## -> e2
+             v    -> e3
+
+    Is transformed to, ::
+
+          case x of
+             20## -> e1
+             30## -> e2
+             _    -> let v = x `minusWord#` 10## in e3
 
 .. ghc-flag:: -fcall-arity
 
@@ -167,18 +183,30 @@ list.
     optimisation. Switching this off can be useful if you have some
     ``unsafePerformIO`` expressions that you don't want commoned-up.
 
+.. ghc-flag:: -fstg-cse
+
+    :default: on
+
+    Enables the common-sub-expression elimination optimisation on the STG
+    intermediate language, where it is able to common up some subexpressions
+    that differ in their types, but not their represetation.
+
 .. ghc-flag:: -fdicts-cheap
+
+    :default: off
 
     A very experimental flag that makes dictionary-valued expressions
     seem cheap to the optimiser.
 
 .. ghc-flag:: -fdicts-strict
 
+    :default: off
+
     Make dictionaries strict.
 
 .. ghc-flag:: -fdmd-tx-dict-sel
 
-    *On by default for ``-O0``, ``-O``, ``-O2``.*
+    :default: on
 
     Use a special demand transformer for dictionary selectors.
 
@@ -197,12 +225,16 @@ list.
 
 .. ghc-flag:: -feager-blackholing
 
+    :default: off
+
     Usually GHC black-holes a thunk only when it switches threads. This
     flag makes it do so as soon as the thunk is entered. See `Haskell on
     a shared-memory
-    multiprocessor <http://research.microsoft.com/en-us/um/people/simonpj/papers/parallel/>`__.
+    multiprocessor <http://community.haskell.org/~simonmar/papers/multiproc.pdf>`__.
 
 .. ghc-flag:: -fexcess-precision
+
+    :default: off
 
     When this option is given, intermediate floating point values can
     have a *greater* precision/range than the final type. Generally this
@@ -216,6 +248,8 @@ list.
     :ref:`bugs-ghc`.
 
 .. ghc-flag:: -fexpose-all-unfoldings
+
+    :default: off
 
     An experimental flag to expose all unfoldings, even for very large
     or recursive functions. This allows for all functions to be inlined
@@ -282,12 +316,16 @@ list.
 
 .. ghc-flag:: -fignore-interface-pragmas
 
+    :default: off
+
     Tells GHC to ignore all inessential information when reading
     interface files. That is, even if :file:`M.hi` contains unfolding or
     strictness information for a function, GHC will ignore that
     information.
 
 .. ghc-flag:: -flate-dmd-anal
+
+    :default: off
 
     Run demand analysis again, at the end of the simplification
     pipeline. We found some opportunities for discovering strictness
@@ -298,13 +336,14 @@ list.
 
 .. ghc-flag:: -fliberate-case
 
-    *Off by default, but enabled by -O2.* Turn on the liberate-case
-    transformation. This unrolls recursive function once in its own RHS,
-    to avoid repeated case analysis of free variables. It's a bit like
-    the call-pattern specialiser (:ghc-flag:`-fspec-constr`) but for free
-    variables rather than arguments.
+    :default: off but enabled with :ghc-flag:`-O2`.
 
-.. ghc-flag:: -fliberate-case-threshold=<n>
+    Turn on the liberate-case transformation. This unrolls recursive function
+    once in its own RHS, to avoid repeated case analysis of free variables. It's
+    a bit like the call-pattern specialiser (:ghc-flag:`-fspec-constr`) but for
+    free variables rather than arguments.
+
+.. ghc-flag:: -fliberate-case-threshold=⟨n⟩
 
     :default: 2000
 
@@ -318,7 +357,7 @@ list.
     self-recursive saturated tail calls into local jumps rather than
     function calls.
 
-.. ghc-flag:: -fmax-inline-alloc-size=<n>
+.. ghc-flag:: -fmax-inline-alloc-size=⟨n⟩
 
     :default: 128
 
@@ -327,20 +366,20 @@ list.
     nursery block if they're no bigger than n bytes, ignoring GC overheap. This
     value should be quite a bit smaller than the block size (typically: 4096).
 
-.. ghc-flag:: -fmax-inline-memcpy-insn=<n>
+.. ghc-flag:: -fmax-inline-memcpy-insns=⟨n⟩
 
     :default: 32
 
     Inline ``memcpy`` calls if they would generate no more than ⟨n⟩ pseudo-instructions.
 
-.. ghc-flag:: -fmax-inline-memset-insns=<n>
+.. ghc-flag:: -fmax-inline-memset-insns=⟨n⟩
 
     :default: 32
 
     Inline ``memset`` calls if they would generate no more than n pseudo
     instructions.
 
-.. ghc-flag:: -fmax-relevant-binds=<n>
+.. ghc-flag:: -fmax-relevant-binds=⟨n⟩
               -fno-max-relevant-bindings
 
     :default: 6
@@ -353,13 +392,20 @@ list.
     they may be numerous), but ``-fno-max-relevant-bindings`` includes
     them too.
 
-.. ghc-flag:: -fmax-simplifier-iterations=<n>
+.. ghc-flag:: -fmax-uncovered-patterns=⟨n⟩
+
+    :default: 4
+
+    Maximum number of unmatched patterns to be shown in warnings generated by
+    :ghc-flag:`-Wincomplete-patterns` and :ghc-flag:`-Wincomplete-uni-patterns`.
+
+.. ghc-flag:: -fmax-simplifier-iterations=⟨n⟩
 
     :default: 4
 
     Sets the maximal number of iterations for the simplifier.
 
-.. ghc-flag:: -fmax-worker-args=<n>
+.. ghc-flag:: -fmax-worker-args=⟨n⟩
 
     :default: 10
 
@@ -367,13 +413,19 @@ list.
 
 .. ghc-flag:: -fno-opt-coercion
 
+    :default: off
+
     Turn off the coercion optimiser.
 
 .. ghc-flag:: -fno-pre-inlining
 
+    :default: off
+
     Turn off pre-inlining.
 
 .. ghc-flag:: -fno-state-hack
+
+    :default: off
 
     Turn off the "state hack" whereby any lambda with a ``State#`` token
     as argument is considered to be single-entry, hence it is considered
@@ -381,6 +433,8 @@ list.
     and ST monad code, but it runs the risk of reducing sharing.
 
 .. ghc-flag:: -fomit-interface-pragmas
+
+    :default: off
 
     Tells GHC to omit all inessential information from the interface
     file generated for the module being compiled (say M). This means
@@ -412,28 +466,34 @@ list.
 
 .. ghc-flag:: -fregs-graph
 
-    *Off by default due to a performance regression bug. Only applies in
-    combination with the native code generator.* Use the graph colouring
-    register allocator for register allocation in the native code
-    generator. By default, GHC uses a simpler, faster linear register
-    allocator. The downside being that the linear register allocator
-    usually generates worse code.
+    :default: off due to a performance regression bug (:ghc-ticket:`7679`)
+
+    *Only applies in combination with the native code generator.* Use the graph
+    colouring register allocator for register allocation in the native code
+    generator. By default, GHC uses a simpler, faster linear register allocator.
+    The downside being that the linear register allocator usually generates
+    worse code.
+
+    Note that the graph colouring allocator is a bit experimental and may fail
+    when faced with code with high register pressure :ghc-ticket:`8657`.
 
 .. ghc-flag:: -fregs-iterative
 
-    *Off by default, only applies in combination with the native code
-    generator.* Use the iterative coalescing graph colouring register
-    allocator for register allocation in the native code generator. This
-    is the same register allocator as the ``-fregs-graph`` one but also
-    enables iterative coalescing during register allocation.
+    :default: off
 
-.. ghc-flag:: -fsimplifier-phases=<n>
+    *Only applies in combination with the native code generator.* Use the
+    iterative coalescing graph colouring register allocator for register
+    allocation in the native code generator. This is the same register allocator
+    as the :ghc-flag:`-fregs-graph` one but also enables iterative coalescing
+    during register allocation.
+
+.. ghc-flag:: -fsimplifier-phases=⟨n⟩
 
     :default: 2
 
     Set the number of phases for the simplifier. Ignored with ``-O0``.
 
-.. ghc-flag:: -fsimpl-tick-factor=<n>
+.. ghc-flag:: -fsimpl-tick-factor=⟨n⟩
 
     :default: 100
 
@@ -455,9 +515,11 @@ list.
 
 .. ghc-flag:: -fspec-constr
 
-    *Off by default, but enabled by -O2.* Turn on call-pattern
-    specialisation; see `Call-pattern specialisation for Haskell
-    programs <http://research.microsoft.com/en-us/um/people/simonpj/papers/spec-constr/index.htm>`__.
+    :default: off but enabled by :ghc-flag:`-O2`.
+
+    Turn on call-pattern specialisation; see `Call-pattern specialisation for
+    Haskell programs
+    <https://www.microsoft.com/en-us/research/publication/system-f-with-type-equality-coercions-2/>`__.
 
     This optimisation specializes recursive functions according to their
     argument "shapes". This is best explained by example so consider: ::
@@ -515,14 +577,24 @@ list.
     body directly, allowing heavy specialisation over the recursive
     cases.
 
-.. ghc-flag:: -fspec-constr-count=<n>
+.. ghc-flag:: -fspec-constr-keen
+
+    :default: off
+
+    If this flag is on, call-pattern specialisation will specialise a call
+    ``(f (Just x))`` with an explicit constructor argument, even if the argument
+    is not scrutinised in the body of the function. This is sometimes
+    beneficial; e.g. the argument might be given to some other function
+    that can itself be specialised.
+
+.. ghc-flag:: -fspec-constr-count=⟨n⟩
 
     :default: 3
 
     Set the maximum number of specialisations that will be created for
     any one function by the SpecConstr transformation.
 
-.. ghc-flag:: -fspec-constr-threshold=<n>
+.. ghc-flag:: -fspec-constr-threshold=⟨n⟩
 
     :default: 2000
 
@@ -538,6 +610,18 @@ list.
     that have an INLINABLE pragma (:ref:`inlinable-pragma`) will be
     specialised as well.
 
+.. ghc-flag:: -fspecialise-aggressively
+
+    :default: off
+
+    By default only type class methods and methods marked ``INLINABLE`` or
+    ``INLINE`` are specialised. This flag will specialise any overloaded function
+    regardless of size if its unfolding is available. This flag is not
+    included in any optimisation level as it can massively increase code
+    size. It can be used in conjunction with :ghc-flag:`-fexpose-all-unfoldings`
+    if you want to ensure all calls are specialised.
+
+
 .. ghc-flag:: -fcross-module-specialise
 
     :default: on
@@ -547,7 +631,40 @@ list.
     which they are called in this module. Note that specialisation must be
     enabled (by ``-fspecialise``) for this to have any effect.
 
+.. ghc-flag:: -fsolve-constant-dicts
+
+    :default: on
+
+    When solving constraints, try to eagerly solve
+    super classes using available dictionaries.
+
+    For example::
+
+      class M a b where m :: a -> b
+
+      type C a b = (Num a, M a b)
+
+      f :: C Int b => b -> Int -> Int
+      f _ x = x + 1
+
+    The body of `f` requires a `Num Int` instance. We could solve this
+    constraint from the context  because we have `C Int b` and that provides us
+    a
+    solution for `Num Int`. However, we can often produce much better code
+    by directly solving for an available `Num Int` dictionary we might have at
+    hand. This removes potentially many layers of indirection and crucially
+    allows other optimisations to fire as the dictionary will be statically
+    known and selector functions can be inlined.
+
+    The optimisation also works for GADTs which bind dictionaries. If we
+    statically know which class dictionary we need then we will solve it
+    directly rather than indirectly using the one passed in at run time.
+
+
+
 .. ghc-flag:: -fstatic-argument-transformation
+
+    :default: off
 
     Turn on the static argument transformation, which turns a recursive
     function into a non-recursive one with a local recursive loop. See
@@ -612,6 +729,8 @@ list.
 
 .. ghc-flag:: -funbox-strict-fields
 
+    :default: off
+
     .. index::
        single: strict constructor fields
        single: constructor fields, strict
@@ -628,7 +747,10 @@ list.
     it for certain constructor fields using the ``NOUNPACK`` pragma (see
     :ref:`nounpack-pragma`).
 
-.. ghc-flag:: -funfolding-creation-threshold=<n>
+    Alternatively you can use :ghc-flag:`-funbox-small-strict-fields` to only
+    unbox strict fields which are "small".
+
+.. ghc-flag:: -funfolding-creation-threshold=⟨n⟩
 
     :default: 750
 
@@ -647,11 +769,11 @@ list.
     a. nothing larger than this will be inlined (unless it has an ``INLINE`` pragma)
     b. nothing larger than this will be spewed into an interface file.
 
-    Increasing this figure is more likely to result in longer compile
-    times than faster code. The :ghc-flag:`-funfolding-use-threshold` is more
+    Increasing this figure is more likely to result in longer compile times
+    than faster code. The :ghc-flag:`-funfolding-use-threshold=⟨n⟩` is more
     useful.
 
-.. ghc-flag:: -funfolding-dict-discount=<n>
+.. ghc-flag:: -funfolding-dict-discount=⟨n⟩
 
     :default: 30
 
@@ -661,7 +783,7 @@ list.
 
     How eager should the compiler be to inline dictionaries?
 
-.. ghc-flag:: -funfolding-fun-discount=<n>
+.. ghc-flag:: -funfolding-fun-discount=⟨n⟩
 
     :default: 60
 
@@ -671,7 +793,7 @@ list.
 
     How eager should the compiler be to inline functions?
 
-.. ghc-flag:: -funfolding-keeness-factor=<n>
+.. ghc-flag:: -funfolding-keeness-factor=⟨n⟩
 
     :default: 1.5
 
@@ -681,7 +803,7 @@ list.
 
     How eager should the compiler be to inline functions?
 
-.. ghc-flag:: -funfolding-use-threshold=<n>
+.. ghc-flag:: -funfolding-use-threshold=⟨n⟩
 
     :default: 60
 
@@ -696,10 +818,11 @@ list.
     minus any discounts that apply depending on the context into which
     the expression is to be inlined.
 
-    The difference between this and :ghc-flag:`-funfolding-creation-threshold`
-    is that this one determines if a function definition will be inlined
-    *at a call site*. The other option determines if a function
-    definition will be kept around at all for potential inlining.
+    The difference between this and
+    :ghc-flag:`-funfolding-creation-threshold=⟨n⟩` is that this one determines
+    if a function definition will be inlined *at a call site*. The other option
+    determines if a function definition will be kept around at all for
+    potential inlining.
 
 .. ghc-flag:: -fvectorisation-avoidance
 

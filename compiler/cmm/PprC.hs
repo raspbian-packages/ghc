@@ -42,6 +42,7 @@ import FastString
 import Outputable
 import Platform
 import UniqSet
+import UniqFM
 import Unique
 import Util
 
@@ -55,10 +56,6 @@ import Data.Word
 import System.IO
 import qualified Data.Map as Map
 import Control.Monad (liftM, ap)
-#if __GLASGOW_HASKELL__ < 709
-import Control.Applicative (Applicative(..))
-#endif
-
 import qualified Data.Array.Unsafe as U ( castSTUArray )
 import Data.Array.ST
 
@@ -757,6 +754,7 @@ pprCallishMachOp_for_C mop
         MO_F64_Log      -> text "log"
         MO_F64_Exp      -> text "exp"
         MO_F64_Sqrt     -> text "sqrt"
+        MO_F64_Fabs     -> text "fabs"
         MO_F32_Pwr      -> text "powf"
         MO_F32_Sin      -> text "sinf"
         MO_F32_Cos      -> text "cosf"
@@ -770,6 +768,7 @@ pprCallishMachOp_for_C mop
         MO_F32_Log      -> text "logf"
         MO_F32_Exp      -> text "expf"
         MO_F32_Sqrt     -> text "sqrtf"
+        MO_F32_Fabs     -> text "fabsf"
         MO_WriteBarrier -> text "write_barrier"
         MO_Memcpy _     -> text "memcpy"
         MO_Memset _     -> text "memset"
@@ -988,7 +987,7 @@ is_cishCC JavaScriptCallConv = False
 --
 pprTempAndExternDecls :: [CmmBlock] -> (SDoc{-temps-}, SDoc{-externs-})
 pprTempAndExternDecls stmts
-  = (vcat (map pprTempDecl (uniqSetToList temps)),
+  = (pprUFM (getUniqSet temps) (vcat . map pprTempDecl),
      vcat (map (pprExternDecl False{-ToDo-}) (Map.keys lbls)))
   where (temps, lbls) = runTE (mapM_ te_BB stmts)
 
@@ -1010,7 +1009,8 @@ pprExternDecl _in_srt lbl
         hcat [ visibility, label_type lbl,
                lparen, ppr lbl, text ");" ]
  where
-  label_type lbl | isForeignLabel lbl && isCFunctionLabel lbl = text "FF_"
+  label_type lbl | isBytesLabel lbl     = text "B_"
+                 | isForeignLabel lbl && isCFunctionLabel lbl = text "FF_"
                  | isCFunctionLabel lbl = text "F_"
                  | otherwise            = text "I_"
 
@@ -1038,7 +1038,6 @@ instance Applicative TE where
 
 instance Monad TE where
    TE m >>= k  = TE $ \s -> case m s of (a, s') -> unTE (k a) s'
-   return = pure
 
 te_lbl :: CLabel -> TE ()
 te_lbl lbl = TE $ \(temps,lbls) -> ((), (temps, Map.insert lbl () lbls))

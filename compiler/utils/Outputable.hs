@@ -16,9 +16,10 @@ module Outputable (
 
         -- * Pretty printing combinators
         SDoc, runSDoc, initSDocContext,
-        docToSDoc,
+        docToSDoc, sdocWithPprDebug,
         interppSP, interpp'SP,
         pprQuotedList, pprWithCommas, quotedListWithOr, quotedListWithNor,
+        pprWithBars,
         empty, isEmpty, nest,
         char,
         text, ftext, ptext, ztext,
@@ -28,7 +29,7 @@ module Outputable (
         semi, comma, colon, dcolon, space, equals, dot, vbar,
         arrow, larrow, darrow, arrowt, larrowt, arrowtt, larrowtt,
         lparen, rparen, lbrack, rbrack, lbrace, rbrace, underscore,
-        blankLine, forAllLit,
+        blankLine, forAllLit, kindStar, bullet,
         (<>), (<+>), hcat, hsep,
         ($$), ($+$), vcat,
         sep, cat,
@@ -37,11 +38,11 @@ module Outputable (
         speakNth, speakN, speakNOf, plural, isOrAre, doOrDoes,
         unicodeSyntax,
 
-        coloured, PprColour, colType, colCoerc, colDataCon,
-        colBinder, bold, keyword,
+        coloured, keyword,
 
         -- * Converting 'SDoc' into strings and outputing it
-        printForC, printForAsm, printForUser, printForUserPartWay,
+        printSDoc, printSDocLn, printForUser, printForUserPartWay,
+        printForC, bufLeftRenderSDoc,
         pprCode, mkCodeStyle,
         showSDoc, showSDocUnsafe, showSDocOneLine,
         showSDocForUser, showSDocDebug, showSDocDump, showSDocDumpOneLine,
@@ -51,7 +52,9 @@ module Outputable (
         pprInfixVar, pprPrefixVar,
         pprHsChar, pprHsString, pprHsBytes,
 
-        primFloatSuffix, primDoubleSuffix,
+        primFloatSuffix, primCharSuffix, primWordSuffix, primDoubleSuffix,
+        primInt64Suffix, primWord64Suffix, primIntSuffix,
+
         pprPrimChar, pprPrimInt, pprPrimWord, pprPrimInt64, pprPrimWord64,
 
         pprFastFilePath,
@@ -67,7 +70,7 @@ module Outputable (
         alwaysQualifyPackages, neverQualifyPackages,
         QualifyName(..), queryQual,
         sdocWithDynFlags, sdocWithPlatform,
-        getPprStyle, withPprStyle, withPprStyleDoc,
+        getPprStyle, withPprStyle, withPprStyleDoc, setStyleColoured,
         pprDeeper, pprDeeperList, pprSetDepth,
         codeStyle, userStyle, debugStyle, dumpStyle, asmStyle,
         ifPprDebug, qualName, qualModule, qualPackage,
@@ -76,27 +79,30 @@ module Outputable (
 
         -- * Error handling and debugging utilities
         pprPanic, pprSorry, assertPprPanic, pprPgmError,
-        pprTrace, pprTraceIt, warnPprTrace, pprSTrace,
+        pprTrace, pprTraceDebug, pprTraceIt, warnPprTrace, pprSTrace,
         trace, pgmError, panic, sorry, assertPanic,
-        pprDebugAndThen,
+        pprDebugAndThen, callStackDoc
     ) where
 
-import {-# SOURCE #-}   DynFlags( DynFlags,
+import {-# SOURCE #-}   DynFlags( DynFlags, hasPprDebug, hasNoDebugOutput,
                                   targetPlatform, pprUserLength, pprCols,
                                   useUnicode, useUnicodeSyntax,
-                                  unsafeGlobalDynFlags )
+                                  shouldUseColor, unsafeGlobalDynFlags )
 import {-# SOURCE #-}   Module( UnitId, Module, ModuleName, moduleName )
 import {-# SOURCE #-}   OccName( OccName )
-import {-# SOURCE #-}   StaticFlags( opt_PprStyle_Debug, opt_NoDebugOutput )
 
+import BufWrite (BufHandle)
 import FastString
 import qualified Pretty
 import Util
 import Platform
+import qualified PprColour as Col
 import Pretty           ( Doc, Mode(..) )
 import Panic
 import GHC.Serialized
+import GHC.LanguageExtensions (Extension)
 
+import Control.Exception (finally)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Char
@@ -112,12 +118,10 @@ import System.FilePath
 import Text.Printf
 import Numeric (showFFloat)
 import Data.Graph (SCC(..))
+import Data.List (intersperse)
 
 import GHC.Fingerprint
 import GHC.Show         ( showMultiLineString )
-#if __GLASGOW_HASKELL__ > 710
-import GHC.Stack
-#endif
 
 {-
 ************************************************************************
@@ -128,7 +132,7 @@ import GHC.Stack
 -}
 
 data PprStyle
-  = PprUser PrintUnqualified Depth
+  = PprUser PrintUnqualified Depth Coloured
                 -- Pretty-print in a way that will make sense to the
                 -- ordinary user; must be very close to Haskell
                 -- syntax, etc.
@@ -151,6 +155,9 @@ data CodeStyle = CStyle         -- The format of labels differs for C and assemb
 data Depth = AllTheWay
            | PartWay Int        -- 0 => stop
 
+data Coloured
+  = Uncoloured
+  | Coloured
 
 -- -----------------------------------------------------------------------------
 -- Printing original names
@@ -178,7 +185,7 @@ type QueryQualifyName = Module -> OccName -> QualifyName
 type QueryQualifyModule = Module -> Bool
 
 -- | For a given package, we need to know whether to print it with
--- the unit id to disambiguate it.
+-- the component id to disambiguate it.
 type QueryQualifyPackage = UnitId -> Bool
 
 -- See Note [Printing original names] in HscTypes
@@ -193,6 +200,12 @@ data QualifyName   -- Given P:M.T
 
   | NameNotInScope2      -- It's not in scope at all, and M.T is already bound in
                          -- the current scope, so we must refer to it as "P:M.T"
+
+instance Outputable QualifyName where
+  ppr NameUnqual      = text "NameUnqual"
+  ppr (NameQual _mod) = text "NameQual"  -- can't print the mod without module loops :(
+  ppr NameNotInScope1 = text "NameNotInScope1"
+  ppr NameNotInScope2 = text "NameNotInScope2"
 
 reallyAlwaysQualifyNames :: QueryQualifyName
 reallyAlwaysQualifyNames _ _ = NameNotInScope2
@@ -228,17 +241,19 @@ neverQualify  = QueryQualify neverQualifyNames
                              neverQualifyModules
                              neverQualifyPackages
 
-defaultUserStyle, defaultDumpStyle :: PprStyle
+defaultUserStyle :: DynFlags -> PprStyle
+defaultUserStyle dflags = mkUserStyle dflags neverQualify AllTheWay
 
-defaultUserStyle = mkUserStyle neverQualify AllTheWay
+defaultDumpStyle :: DynFlags -> PprStyle
  -- Print without qualifiers to reduce verbosity, unless -dppr-debug
+defaultDumpStyle dflags
+   |  hasPprDebug dflags = PprDebug
+   |  otherwise          = PprDump neverQualify
 
-defaultDumpStyle |  opt_PprStyle_Debug = PprDebug
-                 |  otherwise          = PprDump neverQualify
-
-mkDumpStyle :: PrintUnqualified -> PprStyle
-mkDumpStyle print_unqual | opt_PprStyle_Debug = PprDebug
-                         | otherwise          = PprDump print_unqual
+mkDumpStyle :: DynFlags -> PrintUnqualified -> PprStyle
+mkDumpStyle dflags print_unqual
+   | hasPprDebug dflags = PprDebug
+   | otherwise          = PprDump print_unqual
 
 defaultErrStyle :: DynFlags -> PprStyle
 -- Default style for error messages, when we don't know PrintUnqualified
@@ -249,15 +264,25 @@ defaultErrStyle dflags = mkErrStyle dflags neverQualify
 
 -- | Style for printing error messages
 mkErrStyle :: DynFlags -> PrintUnqualified -> PprStyle
-mkErrStyle dflags qual = mkUserStyle qual (PartWay (pprUserLength dflags))
+mkErrStyle dflags qual =
+   mkUserStyle dflags qual (PartWay (pprUserLength dflags))
 
-cmdlineParserStyle :: PprStyle
-cmdlineParserStyle = mkUserStyle alwaysQualify AllTheWay
+cmdlineParserStyle :: DynFlags -> PprStyle
+cmdlineParserStyle dflags = mkUserStyle dflags alwaysQualify AllTheWay
 
-mkUserStyle :: PrintUnqualified -> Depth -> PprStyle
-mkUserStyle unqual depth
-   | opt_PprStyle_Debug = PprDebug
-   | otherwise          = PprUser unqual depth
+mkUserStyle :: DynFlags -> PrintUnqualified -> Depth -> PprStyle
+mkUserStyle dflags unqual depth
+   | hasPprDebug dflags = PprDebug
+   | otherwise          = PprUser unqual depth Uncoloured
+
+setStyleColoured :: Bool -> PprStyle -> PprStyle
+setStyleColoured col style =
+  case style of
+    PprUser q d _ -> PprUser q d c
+    _             -> style
+  where
+    c | col       = Coloured
+      | otherwise = Uncoloured
 
 instance Outputable PprStyle where
   ppr (PprUser {})  = text "user-style"
@@ -281,11 +306,16 @@ code (either C or assembly), or generating interface files.
 ************************************************************************
 -}
 
+-- | Represents a pretty-printable document.
+--
+-- To display an 'SDoc', use 'printSDoc', 'printSDocLn', 'bufLeftRenderSDoc',
+-- or 'renderWithStyle'.  Avoid calling 'runSDoc' directly as it breaks the
+-- abstraction layer.
 newtype SDoc = SDoc { runSDoc :: SDocContext -> Doc }
 
 data SDocContext = SDC
   { sdocStyle      :: !PprStyle
-  , sdocLastColour :: !PprColour
+  , sdocLastColour :: !Col.PprColour
     -- ^ The most recently used colour.  This allows nesting colours.
   , sdocDynFlags   :: !DynFlags
   }
@@ -296,21 +326,27 @@ instance IsString SDoc where
 initSDocContext :: DynFlags -> PprStyle -> SDocContext
 initSDocContext dflags sty = SDC
   { sdocStyle = sty
-  , sdocLastColour = colReset
+  , sdocLastColour = Col.colReset
   , sdocDynFlags = dflags
   }
 
 withPprStyle :: PprStyle -> SDoc -> SDoc
 withPprStyle sty d = SDoc $ \ctxt -> runSDoc d ctxt{sdocStyle=sty}
 
+-- | This is not a recommended way to render 'SDoc', since it breaks the
+-- abstraction layer of 'SDoc'.  Prefer to use 'printSDoc', 'printSDocLn',
+-- 'bufLeftRenderSDoc', or 'renderWithStyle' instead.
 withPprStyleDoc :: DynFlags -> PprStyle -> SDoc -> Doc
 withPprStyleDoc dflags sty d = runSDoc d (initSDocContext dflags sty)
 
+sdocWithPprDebug :: (Bool -> SDoc) -> SDoc
+sdocWithPprDebug f = sdocWithDynFlags $ \dflags -> f (hasPprDebug dflags)
+
 pprDeeper :: SDoc -> SDoc
 pprDeeper d = SDoc $ \ctx -> case ctx of
-  SDC{sdocStyle=PprUser _ (PartWay 0)} -> Pretty.text "..."
-  SDC{sdocStyle=PprUser q (PartWay n)} ->
-    runSDoc d ctx{sdocStyle = PprUser q (PartWay (n-1))}
+  SDC{sdocStyle=PprUser _ (PartWay 0) _} -> Pretty.text "..."
+  SDC{sdocStyle=PprUser q (PartWay n) c} ->
+    runSDoc d ctx{sdocStyle = PprUser q (PartWay (n-1)) c}
   _ -> runSDoc d ctx
 
 -- | Truncate a list that is longer than the current depth.
@@ -319,10 +355,10 @@ pprDeeperList f ds
   | null ds   = f []
   | otherwise = SDoc work
  where
-  work ctx@SDC{sdocStyle=PprUser q (PartWay n)}
+  work ctx@SDC{sdocStyle=PprUser q (PartWay n) c}
    | n==0      = Pretty.text "..."
    | otherwise =
-      runSDoc (f (go 0 ds)) ctx{sdocStyle = PprUser q (PartWay (n-1))}
+      runSDoc (f (go 0 ds)) ctx{sdocStyle = PprUser q (PartWay (n-1)) c}
    where
      go _ [] = []
      go i (d:ds) | i >= n    = [text "...."]
@@ -332,8 +368,8 @@ pprDeeperList f ds
 pprSetDepth :: Depth -> SDoc -> SDoc
 pprSetDepth depth doc = SDoc $ \ctx ->
     case ctx of
-        SDC{sdocStyle=PprUser q _} ->
-            runSDoc doc ctx{sdocStyle = PprUser q depth}
+        SDC{sdocStyle=PprUser q _ c} ->
+            runSDoc doc ctx{sdocStyle = PprUser q depth c}
         _ ->
             runSDoc doc ctx
 
@@ -347,19 +383,19 @@ sdocWithPlatform :: (Platform -> SDoc) -> SDoc
 sdocWithPlatform f = sdocWithDynFlags (f . targetPlatform)
 
 qualName :: PprStyle -> QueryQualifyName
-qualName (PprUser q _)  mod occ = queryQualifyName q mod occ
-qualName (PprDump q)    mod occ = queryQualifyName q mod occ
-qualName _other         mod _   = NameQual (moduleName mod)
+qualName (PprUser q _ _) mod occ = queryQualifyName q mod occ
+qualName (PprDump q)     mod occ = queryQualifyName q mod occ
+qualName _other          mod _   = NameQual (moduleName mod)
 
 qualModule :: PprStyle -> QueryQualifyModule
-qualModule (PprUser q _)  m = queryQualifyModule q m
-qualModule (PprDump q)    m = queryQualifyModule q m
-qualModule _other        _m = True
+qualModule (PprUser q _ _)  m = queryQualifyModule q m
+qualModule (PprDump q)      m = queryQualifyModule q m
+qualModule _other          _m = True
 
 qualPackage :: PprStyle -> QueryQualifyPackage
-qualPackage (PprUser q _)  m = queryQualifyPackage q m
-qualPackage (PprDump q)    m = queryQualifyPackage q m
-qualPackage _other        _m = True
+qualPackage (PprUser q _ _)  m = queryQualifyPackage q m
+qualPackage (PprDump q)      m = queryQualifyPackage q m
+qualPackage _other          _m = True
 
 queryQual :: PprStyle -> PrintUnqualified
 queryQual s = QueryQualify (qualName s)
@@ -383,8 +419,8 @@ debugStyle PprDebug = True
 debugStyle _other   = False
 
 userStyle ::  PprStyle -> Bool
-userStyle (PprUser _ _) = True
-userStyle _other        = False
+userStyle (PprUser {}) = True
+userStyle _other       = False
 
 ifPprDebug :: SDoc -> SDoc        -- Empty for non-debug style
 ifPprDebug d = SDoc $ \ctx ->
@@ -392,27 +428,46 @@ ifPprDebug d = SDoc $ \ctx ->
         SDC{sdocStyle=PprDebug} -> runSDoc d ctx
         _                       -> Pretty.empty
 
+-- | The analog of 'Pretty.printDoc_' for 'SDoc', which tries to make sure the
+--   terminal doesn't get screwed up by the ANSI color codes if an exception
+--   is thrown during pretty-printing.
+printSDoc :: Mode -> DynFlags -> Handle -> PprStyle -> SDoc -> IO ()
+printSDoc mode dflags handle sty doc =
+  Pretty.printDoc_ mode cols handle (runSDoc doc ctx)
+    `finally`
+      Pretty.printDoc_ mode cols handle
+        (runSDoc (coloured Col.colReset empty) ctx)
+  where
+    cols = pprCols dflags
+    ctx = initSDocContext dflags sty
+
+-- | Like 'printSDoc' but appends an extra newline.
+printSDocLn :: Mode -> DynFlags -> Handle -> PprStyle -> SDoc -> IO ()
+printSDocLn mode dflags handle sty doc =
+  printSDoc mode dflags handle sty (doc $$ text "")
+
 printForUser :: DynFlags -> Handle -> PrintUnqualified -> SDoc -> IO ()
 printForUser dflags handle unqual doc
-  = Pretty.printDoc PageMode (pprCols dflags) handle
-      (runSDoc doc (initSDocContext dflags (mkUserStyle unqual AllTheWay)))
+  = printSDocLn PageMode dflags handle
+               (mkUserStyle dflags unqual AllTheWay) doc
 
 printForUserPartWay :: DynFlags -> Handle -> Int -> PrintUnqualified -> SDoc
                     -> IO ()
 printForUserPartWay dflags handle d unqual doc
-  = Pretty.printDoc PageMode (pprCols dflags) handle
-      (runSDoc doc (initSDocContext dflags (mkUserStyle unqual (PartWay d))))
+  = printSDocLn PageMode dflags handle
+                (mkUserStyle dflags unqual (PartWay d)) doc
 
--- printForC, printForAsm do what they sound like
+-- | Like 'printSDocLn' but specialized with 'LeftMode' and
+-- @'PprCode' 'CStyle'@.  This is typically used to output C-- code.
 printForC :: DynFlags -> Handle -> SDoc -> IO ()
 printForC dflags handle doc =
-  Pretty.printDoc LeftMode (pprCols dflags) handle
-    (runSDoc doc (initSDocContext dflags (PprCode CStyle)))
+  printSDocLn LeftMode dflags handle (PprCode CStyle) doc
 
-printForAsm :: DynFlags -> Handle -> SDoc -> IO ()
-printForAsm dflags handle doc =
-  Pretty.printDoc LeftMode (pprCols dflags) handle
-    (runSDoc doc (initSDocContext dflags (PprCode AsmStyle)))
+-- | An efficient variant of 'printSDoc' specialized for 'LeftMode' that
+-- outputs to a 'BufHandle'.
+bufLeftRenderSDoc :: DynFlags -> BufHandle -> PprStyle -> SDoc -> IO ()
+bufLeftRenderSDoc dflags bufHandle sty doc =
+  Pretty.bufLeftRender bufHandle (runSDoc doc (initSDocContext dflags sty))
 
 pprCode :: CodeStyle -> SDoc -> SDoc
 pprCode cs d = withPprStyle (PprCode cs) d
@@ -424,7 +479,7 @@ mkCodeStyle = PprCode
 -- However, Doc *is* an instance of Show
 -- showSDoc just blasts it out as a string
 showSDoc :: DynFlags -> SDoc -> String
-showSDoc dflags sdoc = renderWithStyle dflags sdoc defaultUserStyle
+showSDoc dflags sdoc = renderWithStyle dflags sdoc (defaultUserStyle dflags)
 
 -- showSDocUnsafe is unsafe, because `unsafeGlobalDynFlags` might not be
 -- initialised yet.
@@ -441,10 +496,10 @@ showSDocUnqual dflags sdoc = showSDoc dflags sdoc
 showSDocForUser :: DynFlags -> PrintUnqualified -> SDoc -> String
 -- Allows caller to specify the PrintUnqualified to use
 showSDocForUser dflags unqual doc
- = renderWithStyle dflags doc (mkUserStyle unqual AllTheWay)
+ = renderWithStyle dflags doc (mkUserStyle dflags unqual AllTheWay)
 
 showSDocDump :: DynFlags -> SDoc -> String
-showSDocDump dflags d = renderWithStyle dflags d defaultDumpStyle
+showSDocDump dflags d = renderWithStyle dflags d (defaultDumpStyle dflags)
 
 showSDocDebug :: DynFlags -> SDoc -> String
 showSDocDebug dflags d = renderWithStyle dflags d PprDebug
@@ -462,13 +517,15 @@ showSDocOneLine :: DynFlags -> SDoc -> String
 showSDocOneLine dflags d
  = let s = Pretty.style{ Pretty.mode = OneLineMode,
                          Pretty.lineLength = pprCols dflags } in
-   Pretty.renderStyle s $ runSDoc d (initSDocContext dflags defaultUserStyle)
+   Pretty.renderStyle s $
+      runSDoc d (initSDocContext dflags (defaultUserStyle dflags))
 
 showSDocDumpOneLine :: DynFlags -> SDoc -> String
 showSDocDumpOneLine dflags d
  = let s = Pretty.style{ Pretty.mode = OneLineMode,
                          Pretty.lineLength = irrelevantNCols } in
-   Pretty.renderStyle s $ runSDoc d (initSDocContext dflags defaultDumpStyle)
+   Pretty.renderStyle s $
+      runSDoc d (initSDocContext dflags (defaultDumpStyle dflags))
 
 irrelevantNCols :: Int
 -- Used for OneLineMode and LeftMode when number of cols isn't used
@@ -573,9 +630,21 @@ rbrace     = docToSDoc $ Pretty.rbrace
 forAllLit :: SDoc
 forAllLit = unicodeSyntax (char '∀') (text "forall")
 
+kindStar :: SDoc
+kindStar = unicodeSyntax (char '★') (char '*')
+
+bullet :: SDoc
+bullet = unicode (char '•') (char '*')
+
 unicodeSyntax :: SDoc -> SDoc -> SDoc
 unicodeSyntax unicode plain = sdocWithDynFlags $ \dflags ->
     if useUnicode dflags && useUnicodeSyntax dflags
+    then unicode
+    else plain
+
+unicode :: SDoc -> SDoc -> SDoc
+unicode unicode plain = sdocWithDynFlags $ \dflags ->
+    if useUnicode dflags
     then unicode
     else plain
 
@@ -650,44 +719,25 @@ ppWhen False _   = empty
 ppUnless True  _   = empty
 ppUnless False doc = doc
 
--- | A colour\/style for use with 'coloured'.
-newtype PprColour = PprColour String
-
--- Colours
-
-colType :: PprColour
-colType = PprColour "\27[34m"
-
-colBold :: PprColour
-colBold = PprColour "\27[;1m"
-
-colCoerc :: PprColour
-colCoerc = PprColour "\27[34m"
-
-colDataCon :: PprColour
-colDataCon = PprColour "\27[31m"
-
-colBinder :: PprColour
-colBinder = PprColour "\27[32m"
-
-colReset :: PprColour
-colReset = PprColour "\27[0m"
-
 -- | Apply the given colour\/style for the argument.
 --
 -- Only takes effect if colours are enabled.
-coloured :: PprColour -> SDoc -> SDoc
--- TODO: coloured _ sdoc ctxt | coloursDisabled = sdoc ctxt
-coloured col@(PprColour c) sdoc =
-  SDoc $ \ctx@SDC{ sdocLastColour = PprColour lc } ->
-    let ctx' = ctx{ sdocLastColour = col } in
-    Pretty.zeroWidthText c Pretty.<> runSDoc sdoc ctx' Pretty.<> Pretty.zeroWidthText lc
-
-bold :: SDoc -> SDoc
-bold = coloured colBold
+coloured :: Col.PprColour -> SDoc -> SDoc
+coloured col sdoc =
+  sdocWithDynFlags $ \dflags ->
+    if shouldUseColor dflags
+    then SDoc $ \ctx@SDC{ sdocLastColour = lastCol } ->
+         case ctx of
+           SDC{ sdocStyle = PprUser _ _ Coloured } ->
+             let ctx' = ctx{ sdocLastColour = lastCol `mappend` col } in
+             Pretty.zeroWidthText (Col.renderColour col)
+               Pretty.<> runSDoc sdoc ctx'
+               Pretty.<> Pretty.zeroWidthText (Col.renderColourAfresh lastCol)
+           _ -> runSDoc sdoc ctx
+    else sdoc
 
 keyword :: SDoc -> SDoc
-keyword = bold
+keyword = coloured Col.colBold
 
 {-
 ************************************************************************
@@ -822,6 +872,9 @@ instance Outputable a => Outputable (SCC a) where
 instance Outputable Serialized where
     ppr (Serialized the_type bytes) = int (length bytes) <+> text "of type" <+> text (show the_type)
 
+instance Outputable Extension where
+    ppr = text . show
+
 {-
 ************************************************************************
 *                                                                      *
@@ -833,7 +886,12 @@ instance Outputable Serialized where
 -- | 'BindingSite' is used to tell the thing that prints binder what
 -- language construct is binding the identifier.  This can be used
 -- to decide how much info to print.
-data BindingSite = LambdaBind | CaseBind | LetBind
+-- Also see Note [Binding-site specific printing] in PprCore
+data BindingSite
+    = LambdaBind  -- ^ The x in   (\x. e)
+    | CaseBind    -- ^ The x in   case scrut of x { (y,z) -> ... }
+    | CasePatBind -- ^ The y,z in case scrut of x { (y,z) -> ... }
+    | LetBind     -- ^ The x in   (let x = rhs in e)
 
 -- | When we print a binder, we often want to print its type too.
 -- The @OutputableBndr@ class encapsulates this idea.
@@ -845,6 +903,13 @@ class Outputable a => OutputableBndr a where
       -- Print an occurrence of the name, suitable either in the
       -- prefix position of an application, thus   (f a b) or  ((+) x)
       -- or infix position,                 thus   (a `f` b) or  (x + y)
+
+   bndrIsJoin_maybe :: a -> Maybe Int
+   bndrIsJoin_maybe _ = Nothing
+      -- When pretty-printing we sometimes want to find
+      -- whether the binder is a join point.  You might think
+      -- we could have a function of type (a->Var), but Var
+      -- isn't available yet, alas
 
 {-
 ************************************************************************
@@ -926,6 +991,12 @@ pprWithCommas :: (a -> SDoc) -- ^ The pretty printing function to use
               -> SDoc        -- ^ 'SDoc' where the things have been pretty printed,
                              -- comma-separated and finally packed into a paragraph.
 pprWithCommas pp xs = fsep (punctuate comma (map pp xs))
+
+pprWithBars :: (a -> SDoc) -- ^ The pretty printing function to use
+            -> [a]         -- ^ The things to be pretty printed
+            -> SDoc        -- ^ 'SDoc' where the things have been pretty printed,
+                           -- bar-separated and finally packed into a paragraph.
+pprWithBars pp xs = fsep (intersperse vbar (map pp xs))
 
 -- | Returns the separated concatenation of the pretty printed things.
 interppSP  :: Outputable a => [a] -> SDoc
@@ -1057,9 +1128,13 @@ doOrDoes _   = text "do"
 ************************************************************************
 -}
 
-pprPanic :: String -> SDoc -> a
+callStackDoc :: HasCallStack => SDoc
+callStackDoc =
+    hang (text "Call stack:") 4 (vcat $ map text $ lines prettyCurrentCallStack)
+
+pprPanic :: HasCallStack => String -> SDoc -> a
 -- ^ Throw an exception saying "bug in GHC"
-pprPanic    = panicDoc
+pprPanic s doc = panicDoc s (doc $$ callStackDoc)
 
 pprSorry :: String -> SDoc -> a
 -- ^ Throw an exception saying "this isn't finished yet"
@@ -1070,12 +1145,17 @@ pprPgmError :: String -> SDoc -> a
 -- ^ Throw an exception saying "bug in pgm being compiled" (used for unusual program errors)
 pprPgmError = pgmErrorDoc
 
+pprTraceDebug :: String -> SDoc -> a -> a
+pprTraceDebug str doc x
+   | debugIsOn && hasPprDebug unsafeGlobalDynFlags = pprTrace str doc x
+   | otherwise                                     = x
 
 pprTrace :: String -> SDoc -> a -> a
 -- ^ If debug output is on, show some 'SDoc' on the screen
 pprTrace str doc x
-   | opt_NoDebugOutput = x
-   | otherwise         = pprDebugAndThen unsafeGlobalDynFlags trace (text str) doc x
+   | hasNoDebugOutput unsafeGlobalDynFlags = x
+   | otherwise                             =
+      pprDebugAndThen unsafeGlobalDynFlags trace (text str) doc x
 
 -- | @pprTraceIt desc x@ is equivalent to @pprTrace desc (ppr x) x@
 pprTraceIt :: Outputable a => String -> a -> a
@@ -1084,19 +1164,15 @@ pprTraceIt desc x = pprTrace desc (ppr x) x
 
 -- | If debug output is on, show some 'SDoc' on the screen along
 -- with a call stack when available.
-#if __GLASGOW_HASKELL__ > 710
-pprSTrace :: (?callStack :: CallStack) => SDoc -> a -> a
-pprSTrace = pprTrace (prettyCallStack ?callStack)
-#else
-pprSTrace :: SDoc -> a -> a
-pprSTrace = pprTrace "no callstack info"
-#endif
+pprSTrace :: HasCallStack => SDoc -> a -> a
+pprSTrace doc = pprTrace "" (doc $$ callStackDoc)
 
 warnPprTrace :: Bool -> String -> Int -> SDoc -> a -> a
 -- ^ Just warn about an assertion failure, recording the given file and line number.
 -- Should typically be accessed with the WARN macros
 warnPprTrace _     _     _     _    x | not debugIsOn     = x
-warnPprTrace _     _file _line _msg x | opt_NoDebugOutput = x
+warnPprTrace _     _file _line _msg x
+   | hasNoDebugOutput unsafeGlobalDynFlags = x
 warnPprTrace False _file _line _msg x = x
 warnPprTrace True   file  line  msg x
   = pprDebugAndThen unsafeGlobalDynFlags trace heading msg x
@@ -1105,22 +1181,11 @@ warnPprTrace True   file  line  msg x
 
 -- | Panic with an assertation failure, recording the given file and
 -- line number. Should typically be accessed with the ASSERT family of macros
-#if __GLASGOW_HASKELL__ > 710
-assertPprPanic :: (?callStack :: CallStack) => String -> Int -> SDoc -> a
+assertPprPanic :: HasCallStack => String -> Int -> SDoc -> a
 assertPprPanic _file _line msg
   = pprPanic "ASSERT failed!" doc
   where
-    doc = sep [ text (prettyCallStack ?callStack)
-              , msg ]
-#else
-assertPprPanic :: String -> Int -> SDoc -> a
-assertPprPanic file line msg
-  = pprPanic "ASSERT failed!" doc
-  where
-    doc = sep [ hsep [ text "file", text file
-                     , text "line", int line ]
-              , msg ]
-#endif
+    doc = sep [ msg, callStackDoc ]
 
 pprDebugAndThen :: DynFlags -> (String -> a) -> SDoc -> SDoc -> a
 pprDebugAndThen dflags cont heading pretty_msg

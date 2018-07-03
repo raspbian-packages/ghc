@@ -38,20 +38,32 @@ Dumping out compiler intermediate structures
 
         Dump parser output
 
+    .. ghc-flag:: -ddump-parsed-ast
+
+        Dump parser output as a syntax tree
+
     .. ghc-flag:: -ddump-rn
 
         Dump renamer output
 
+    .. ghc-flag:: -ddump-rn-ast
+
+        Dump renamer output as a syntax tree
+
     .. ghc-flag:: -ddump-tc
 
         Dump typechecker output
+
+    .. ghc-flag:: -ddump-tc-ast
+
+        Dump typechecker output as a syntax tree
 
     .. ghc-flag:: -ddump-splices
 
         Dump Template Haskell expressions that we splice in, and what
         Haskell code the expression evaluates to.
 
-    .. ghc-flag:: -dth-dec-file=<file>
+    .. ghc-flag:: -dth-dec-file=⟨file⟩
 
         Dump expansions of all top-level Template Haskell splices into ⟨file⟩.
 
@@ -99,7 +111,9 @@ Dumping out compiler intermediate structures
 
     .. ghc-flag:: -ddump-inlinings
 
-        Dumps inlining info from the simplifier
+        Dumps inlining info from the simplifier. Note that if used in conjunction with
+        :ghc-flag:`-dverbose-core2core` the compiler will also dump the inlinings that
+        it considers but passes up, along with its rationale.
 
     .. ghc-flag:: -ddump-stranal
 
@@ -131,7 +145,17 @@ Dumping out compiler intermediate structures
 
     .. ghc-flag:: -ddump-cmm
 
-        Print the C-- code out.
+        Dump the result of the C-- pipeline processing
+
+    .. ghc-flag:: -ddump-cmm-from-stg
+
+        Dump the result of STG-to-C-- conversion
+
+    .. ghc-flag:: -ddump-cmm-verbose
+
+        Dump output from all C-- pipeline stages. In case of
+        ``.cmm`` compilation this also dumps the result of
+        file parsing.
 
     .. ghc-flag:: -ddump-opt-cmm
 
@@ -155,6 +179,12 @@ Dumping out compiler intermediate structures
     .. ghc-flag:: -ddump-foreign
 
         dump foreign export stubs
+
+    .. ghc-flag:: -ddump-json
+
+         Dump error messages as JSON documents. This is intended to be consumed
+         by external tooling. A good way to use it is in conjunction with
+         :ghc-flag:`-ddump-to-file`.
 
 .. ghc-flag:: -ddump-simpl-iterations
 
@@ -182,6 +212,11 @@ Dumping out compiler intermediate structures
 .. ghc-flag:: -ddump-rn-trace
 
     Make the renamer be *real* chatty about what it is up to.
+
+.. ghc-flag:: -ddump-ec-trace
+
+    Make the pattern match exhaustiveness checker be *real* chatty about
+    what it is up to.
 
 .. ghc-flag:: -ddump-rn-stats
 
@@ -232,6 +267,7 @@ Dumping out compiler intermediate structures
     aren't). This flag makes debugging output appear in the more verbose
     debug style.
 
+
 .. _formatting dumps:
 
 Formatting dumps
@@ -246,7 +282,7 @@ Formatting dumps
     with subexpressions beyond the depth replaced by ellipses. This flag
     sets the depth. Its default value is 5.
 
-.. ghc-flag:: -dppr-cols=N
+.. ghc-flag:: -dppr-cols=⟨n⟩
 
     Set the width of debugging output. Use this if your code is wrapping
     too much. For example: ``-dppr-cols=200``.
@@ -282,6 +318,10 @@ parts that you are not interested in.
     Suppress everything that can be suppressed, except for unique ids as
     this often makes the printout ambiguous. If you just want to see the
     overall structure of the code, then start here.
+
+.. ghc-flag:: -dsuppress-ticks
+
+    Suppress "ticks" in the pretty-printer output.
 
 .. ghc-flag:: -dsuppress-uniques
 
@@ -343,6 +383,12 @@ Checking for consistency
 
     Ditto for C-- level.
 
+.. ghc-flag:: -fllvm-fill-undef-with-garbage
+
+    Instructs the LLVM code generator to fill dead STG registers with garbage
+    instead of ``undef`` in calls. This makes it easier to catch subtle
+    code generator and runtime system bugs (e.g. see :ghc-ticket:`11487`).
+
 .. _checking-determinism:
 
 Checking for determinism
@@ -359,8 +405,8 @@ Checking for determinism
 
     Set the increment for the generated ``Unique``'s to ⟨i⟩.
 
-    This is useful in combination with :ghc-flag:`-dinitial-unique` to test if the
-    generated files depend on the order of ``Unique``'s.
+    This is useful in combination with :ghc-flag:`-dinitial-unique=⟨s⟩` to test
+    if the generated files depend on the order of ``Unique``'s.
 
     Some interesting values:
 

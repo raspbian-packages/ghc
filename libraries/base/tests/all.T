@@ -47,7 +47,7 @@ test('trace001', normal, compile_and_run, [''])
 test('hGetBuf002', normal, compile_and_run, [''])
 test('hGetBuf003', normal, compile_and_run, [''])
 test('hPutBuf001', normal, compile_and_run, [''])
-test('hPutBuf002', extra_clean(['hPutBuf002.out']), compile_and_run, [''])
+test('hPutBuf002', [], compile_and_run, [''])
 
 test('char001', 	normal, compile_and_run, [''])
 test('char002', 	normal, compile_and_run, [''])
@@ -78,10 +78,13 @@ test('dynamic003',      extra_run_opts('+RTS -K32m -RTS'), compile_and_run, ['']
 test('dynamic004',      omit_ways(['normal', 'threaded1', 'ghci']), compile_and_run, [''])
 test('dynamic005',      normal, compile_and_run, [''])
 
-enum_setups = [when(fast(), skip), when(opsys('mingw32'), expect_broken(9399))]
-test('enum01',          enum_setups, compile_and_run, [''])
-test('enum02',          enum_setups, compile_and_run, [''])
-test('enum03',          enum_setups, compile_and_run, [''])
+enum_setups = [when(fast(), skip)]
+test('enum01',          [extra_files(['enum_processor.bat', 'enum_processor.py']),
+                         enum_setups], compile_and_run, [''])
+test('enum02',          [extra_files(['enum_processor.bat', 'enum_processor.py']),
+                         enum_setups], compile_and_run, [''])
+test('enum03',          [extra_files(['enum_processor.bat', 'enum_processor.py']),
+                         enum_setups], compile_and_run, [''])
 test('enum04',          normal, compile_and_run, [''])
 
 test('exceptionsrun001',        normal, compile_and_run, [''])
@@ -92,18 +95,13 @@ test('list002', when(fast(), skip), compile_and_run, [''])
 test('list003', when(fast(), skip), compile_and_run, [''])
 test('isSuffixOf', normal, compile_and_run, [''])
 
-test('memo001',
-     [extra_run_opts('+RTS -A10k -RTS'),
-      extra_clean(['Memo1.hi', 'Memo1.o'])],
-     multimod_compile_and_run,
-     ['memo001',''])
+test('memo001', [extra_files(['Memo1.lhs']),
+                 extra_run_opts('+RTS -A10k -RTS')], multimod_compile_and_run,
+     ['memo001', ''])
 
-test('memo002',
-     [extra_run_opts('20'),
-      extra_clean(['Memo2.hi', 'Memo2.o'])],
-	multimod_compile_and_run, ['memo002',''])
-
-test('packedstring001', reqlib('packedstring'), compile_and_run, ['-package packedstring'])
+test('memo002', [extra_files(['Memo2.lhs']),
+                 extra_run_opts('20')], multimod_compile_and_run,
+     ['memo002', ''])
 
 test('stableptr001',
      [when(fast(), skip), extra_run_opts('+RTS -K8m -RTS')],
@@ -149,18 +147,10 @@ test('topHandler01', when(opsys('mingw32'), skip), compile_and_run, [''])
 test('topHandler02',
      [when(opsys('mingw32'), skip),
       omit_ways(['ghci']),
-      # Irritatingly, the test driver calls the programs via a shell, and
-      # depending on the shell, they can add their own "helpful" commentary,
-      # pretty printing the name of the signal that killed the process. So we
-      # ignore the stdout here, we only care about the exit code (which itself
-      # is messed up because of the shell, using 128+sig encoding)
-      ignore_output,
       signal_exit_code(2)
      ], compile_and_run, [''])
 test('topHandler03',
-     [when(opsys('mingw32'), skip),
-      # As above, shells, grrr.
-      ignore_output,
+     [when(opsys('mingw32'), skip), ignore_stderr,
       signal_exit_code(15)
      ], compile_and_run, [''])
 test('topHandler04',
@@ -196,12 +186,9 @@ test('T9681', normal, compile_fail, [''])
 #   Probably something like 1s is already enough, but I don't know enough to
 #   make an educated guess how long it needs to be guaranteed to reach the C
 #   call."
-test('T8089', [exit_code(99),
-               run_timeout_multiplier(0.01),
-               when(opsys('mingw32'),
-                    expect_broken_for(7325, ['normal', 'hpc', 'optasm'])),
-               ],
-              compile_and_run, [''])
+test('T8089',
+     [exit_code(99), run_timeout_multiplier(0.01)],
+     compile_and_run, [''])
 test('T9826',normal, compile_and_run,[''])
 test('T9848',
         [ stats_num_field('bytes allocated',
@@ -213,3 +200,15 @@ test('T9848',
 test('T10149', normal, compile_and_run, [''])
 test('T11334a', normal, compile_and_run, [''])
 test('T11555', normal, compile_and_run, [''])
+test('T12852', when(opsys('mingw32'), skip), compile_and_run, [''])
+test('lazySTexamples', normal, compile_and_run, [''])
+test('T11760', normal, compile_and_run, ['-threaded -with-rtsopts=-N2'])
+test('T13191',
+        [ stats_num_field('bytes allocated',
+                          [ (wordsize(64), 185943272, 5) ])
+        # with GHC-8.1 before liftA2 change: 325065128
+        # GHC-8.1 with custom liftA2:        185943272
+        , only_ways(['normal'])],
+      compile_and_run,
+      ['-O'])
+test('T13525', normal, compile_and_run, [''])

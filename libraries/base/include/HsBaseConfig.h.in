@@ -327,6 +327,9 @@
 /* Define to 1 if you have the <fcntl.h> header file. */
 #undef HAVE_FCNTL_H
 
+/* Define if you have flock support. */
+#undef HAVE_FLOCK
+
 /* Define to 1 if you have the `ftruncate' function. */
 #undef HAVE_FTRUNCATE
 
@@ -372,6 +375,9 @@
 /* Define to 1 if you have the <memory.h> header file. */
 #undef HAVE_MEMORY_H
 
+/* Define if you have open file descriptor lock support. */
+#undef HAVE_OFD_LOCKING
+
 /* Define if you have poll support. */
 #undef HAVE_POLL
 
@@ -401,6 +407,9 @@
 
 /* Define to 1 if you have the <sys/event.h> header file. */
 #undef HAVE_SYS_EVENT_H
+
+/* Define to 1 if you have the <sys/file.h> header file. */
+#undef HAVE_SYS_FILE_H
 
 /* Define to 1 if you have the <sys/resource.h> header file. */
 #undef HAVE_SYS_RESOURCE_H
@@ -465,11 +474,23 @@
 /* Define to 1 if you have the `_chsize' function. */
 #undef HAVE__CHSIZE
 
+/* Define to Haskell type for blkcnt_t */
+#undef HTYPE_BLKCNT_T
+
+/* Define to Haskell type for blksize_t */
+#undef HTYPE_BLKSIZE_T
+
+/* Define to Haskell type for bool */
+#undef HTYPE_BOOL
+
 /* Define to Haskell type for cc_t */
 #undef HTYPE_CC_T
 
 /* Define to Haskell type for char */
 #undef HTYPE_CHAR
+
+/* Define to Haskell type for clockid_t */
+#undef HTYPE_CLOCKID_T
 
 /* Define to Haskell type for clock_t */
 #undef HTYPE_CLOCK_T
@@ -483,8 +504,17 @@
 /* Define to Haskell type for float */
 #undef HTYPE_FLOAT
 
+/* Define to Haskell type for fsblkcnt_t */
+#undef HTYPE_FSBLKCNT_T
+
+/* Define to Haskell type for fsfilcnt_t */
+#undef HTYPE_FSFILCNT_T
+
 /* Define to Haskell type for gid_t */
 #undef HTYPE_GID_T
+
+/* Define to Haskell type for id_t */
+#undef HTYPE_ID_T
 
 /* Define to Haskell type for ino_t */
 #undef HTYPE_INO_T
@@ -497,6 +527,9 @@
 
 /* Define to Haskell type for intptr_t */
 #undef HTYPE_INTPTR_T
+
+/* Define to Haskell type for key_t */
+#undef HTYPE_KEY_T
 
 /* Define to Haskell type for long */
 #undef HTYPE_LONG
@@ -545,6 +578,9 @@
 
 /* Define to Haskell type for tcflag_t */
 #undef HTYPE_TCFLAG_T
+
+/* Define to Haskell type for timer_t */
+#undef HTYPE_TIMER_T
 
 /* Define to Haskell type for time_t */
 #undef HTYPE_TIME_T

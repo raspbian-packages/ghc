@@ -23,6 +23,9 @@
 #include "win32/IOManager.h"
 #endif
 
+static void blockedThrowTo (Capability *cap,
+                            StgTSO *target, MessageThrowTo *msg);
+
 static void removeFromQueues(Capability *cap, StgTSO *tso);
 
 static void removeFromMVarBlockedQueue (StgTSO *tso);
@@ -50,7 +53,7 @@ static void throwToSendMsg (Capability *cap USED_IF_THREADS,
 
 static void
 throwToSingleThreaded__ (Capability *cap, StgTSO *tso, StgClosure *exception,
-                         rtsBool stop_at_atomically, StgUpdateFrame *stop_here)
+                         bool stop_at_atomically, StgUpdateFrame *stop_here)
 {
     // Thread already dead?
     if (tso->what_next == ThreadComplete || tso->what_next == ThreadKilled) {
@@ -66,12 +69,12 @@ throwToSingleThreaded__ (Capability *cap, StgTSO *tso, StgClosure *exception,
 void
 throwToSingleThreaded (Capability *cap, StgTSO *tso, StgClosure *exception)
 {
-    throwToSingleThreaded__(cap, tso, exception, rtsFalse, NULL);
+    throwToSingleThreaded__(cap, tso, exception, false, NULL);
 }
 
 void
 throwToSingleThreaded_ (Capability *cap, StgTSO *tso, StgClosure *exception,
-                        rtsBool stop_at_atomically)
+                        bool stop_at_atomically)
 {
     throwToSingleThreaded__ (cap, tso, exception, stop_at_atomically, NULL);
 }
@@ -79,7 +82,7 @@ throwToSingleThreaded_ (Capability *cap, StgTSO *tso, StgClosure *exception,
 void // cannot return a different TSO
 suspendComputation (Capability *cap, StgTSO *tso, StgUpdateFrame *stop_here)
 {
-    throwToSingleThreaded__ (cap, tso, NULL, rtsFalse, stop_here);
+    throwToSingleThreaded__ (cap, tso, NULL, false, stop_here);
 }
 
 /* -----------------------------------------------------------------------------
@@ -225,7 +228,7 @@ throwTo (Capability *cap,       // the Capability we hold
 }
 
 
-nat
+uint32_t
 throwToMsg (Capability *cap, MessageThrowTo *msg)
 {
     StgWord status;
@@ -269,7 +272,7 @@ check_target:
     {
         if ((target->flags & TSO_BLOCKEX) == 0) {
             // It's on our run queue and not blocking exceptions
-            raiseAsync(cap, target, msg->exception, rtsFalse, NULL);
+            raiseAsync(cap, target, msg->exception, false, NULL);
             return THROWTO_SUCCESS;
         } else {
             blockedThrowTo(cap,target,msg);
@@ -334,7 +337,7 @@ check_target:
         // nobody else can wake up this TSO after we claim the message
         doneWithMsgThrowTo(m);
 
-        raiseAsync(cap, target, msg->exception, rtsFalse, NULL);
+        raiseAsync(cap, target, msg->exception, false, NULL);
         return THROWTO_SUCCESS;
     }
 
@@ -388,7 +391,7 @@ check_target:
         } else {
             // revoke the MVar operation
             removeFromMVarBlockedQueue(target);
-            raiseAsync(cap, target, msg->exception, rtsFalse, NULL);
+            raiseAsync(cap, target, msg->exception, false, NULL);
             unlockClosure((StgClosure *)mvar, info);
             return THROWTO_SUCCESS;
         }
@@ -407,7 +410,7 @@ check_target:
             // future, but that doesn't matter.
             ASSERT(target->block_info.bh->header.info == &stg_MSG_BLACKHOLE_info);
             OVERWRITE_INFO(target->block_info.bh, &stg_IND_info);
-            raiseAsync(cap, target, msg->exception, rtsFalse, NULL);
+            raiseAsync(cap, target, msg->exception, false, NULL);
             return THROWTO_SUCCESS;
         }
     }
@@ -426,7 +429,7 @@ check_target:
             unlockTSO(target);
             return THROWTO_BLOCKED;
         } else {
-            raiseAsync(cap, target, msg->exception, rtsFalse, NULL);
+            raiseAsync(cap, target, msg->exception, false, NULL);
             unlockTSO(target);
             return THROWTO_SUCCESS;
         }
@@ -473,13 +476,13 @@ check_target:
             return THROWTO_BLOCKED;
         } else {
             removeFromQueues(cap,target);
-            raiseAsync(cap, target, msg->exception, rtsFalse, NULL);
+            raiseAsync(cap, target, msg->exception, false, NULL);
             return THROWTO_SUCCESS;
         }
 #endif
 
     case ThreadMigrating:
-        // if is is ThreadMigrating and tso->cap is ours, then it
+        // if it is ThreadMigrating and tso->cap is ours, then it
         // *must* be migrating *to* this capability.  If it were
         // migrating away from the capability, then tso->cap would
         // point to the destination.
@@ -773,12 +776,12 @@ removeFromQueues(Capability *cap, StgTSO *tso)
 
 StgTSO *
 raiseAsync(Capability *cap, StgTSO *tso, StgClosure *exception,
-           rtsBool stop_at_atomically, StgUpdateFrame *stop_here)
+           bool stop_at_atomically, StgUpdateFrame *stop_here)
 {
-    StgRetInfoTable *info;
+    const StgRetInfoTable *info;
     StgPtr sp, frame;
     StgClosure *updatee;
-    nat i;
+    uint32_t i;
     StgStack *stack;
 
     debugTraceCap(DEBUG_sched, cap,
@@ -858,7 +861,7 @@ raiseAsync(Capability *cap, StgTSO *tso, StgClosure *exception,
         case UPDATE_FRAME:
         {
             StgAP_STACK * ap;
-            nat words;
+            uint32_t words;
 
             // First build an AP_STACK consisting of the stack chunk above the
             // current update frame, with the top word on the stack as the
@@ -869,8 +872,9 @@ raiseAsync(Capability *cap, StgTSO *tso, StgClosure *exception,
 
             ap->size = words;
             ap->fun  = (StgClosure *)sp[0];
+
             sp++;
-            for(i=0; i < (nat)words; ++i) {
+            for(i=0; i < words; ++i) {
                 ap->payload[i] = (StgClosure *)*sp++;
             }
 
@@ -909,7 +913,7 @@ raiseAsync(Capability *cap, StgTSO *tso, StgClosure *exception,
         case UNDERFLOW_FRAME:
         {
             StgAP_STACK * ap;
-            nat words;
+            uint32_t words;
 
             // First build an AP_STACK consisting of the stack chunk above the
             // current update frame, with the top word on the stack as the
@@ -921,7 +925,7 @@ raiseAsync(Capability *cap, StgTSO *tso, StgClosure *exception,
             ap->size = words;
             ap->fun  = (StgClosure *)sp[0];
             sp++;
-            for(i=0; i < (nat)words; ++i) {
+            for(i=0; i < words; ++i) {
                 ap->payload[i] = (StgClosure *)*sp++;
             }
 

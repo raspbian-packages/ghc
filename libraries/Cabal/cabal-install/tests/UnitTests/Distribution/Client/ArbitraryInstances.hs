@@ -21,6 +21,7 @@ import Control.Applicative
 import Control.Monad
 
 import Distribution.Version
+import Distribution.Types.Dependency
 import Distribution.Package
 import Distribution.System
 import Distribution.Verbosity
@@ -29,6 +30,8 @@ import Distribution.Simple.Setup
 import Distribution.Simple.InstallDirs
 
 import Distribution.Utils.NubList
+
+import Distribution.Client.IndexUtils.Timestamp
 
 import Test.QuickCheck
 
@@ -67,7 +70,6 @@ instance Arbitrary ShortToken where
 arbitraryShortToken :: Gen String
 arbitraryShortToken = getShortToken <$> arbitrary
 
-#if !MIN_VERSION_QuickCheck(2,9,0)
 instance Arbitrary Version where
   arbitrary = do
     branch <- shortListOf1 4 $
@@ -75,14 +77,11 @@ instance Arbitrary Version where
                           ,(3, return 1)
                           ,(2, return 2)
                           ,(1, return 3)]
-    return (Version branch []) -- deliberate []
+    return (mkVersion branch)
     where
 
-  shrink (Version branch []) =
-    [ Version branch' [] | branch' <- shrink branch, not (null branch') ]
-  shrink (Version branch _tags) =
-    [ Version branch [] ]
-#endif
+  shrink ver = [ mkVersion branch' | branch' <- shrink (versionNumbers ver)
+                                   , not (null branch') ]
 
 instance Arbitrary VersionRange where
   arbitrary = canonicaliseVersionRange <$> sized verRangeExp
@@ -113,7 +112,7 @@ instance Arbitrary VersionRange where
       canonicaliseVersionRange = fromVersionIntervals . toVersionIntervals
 
 instance Arbitrary PackageName where
-    arbitrary = PackageName . intercalate "-" <$> shortListOf1 2 nameComponent
+    arbitrary = mkPackageName . intercalate "-" <$> shortListOf1 2 nameComponent
       where
         nameComponent = shortListOf1 5 (elements packageChars)
                         `suchThat` (not . all isDigit)
@@ -172,3 +171,10 @@ instance Arbitrary a => Arbitrary (NoShrink a) where
     arbitrary = NoShrink <$> arbitrary
     shrink _  = []
 
+instance Arbitrary Timestamp where
+    arbitrary = (maybe (toEnum 0) id . epochTimeToTimestamp) <$> arbitrary
+
+instance Arbitrary IndexState where
+    arbitrary = frequency [ (1, pure IndexStateHead)
+                          , (50, IndexStateTime <$> arbitrary)
+                          ]

@@ -15,17 +15,19 @@ module StgCmmMonad (
         returnFC, fixC,
         newUnique, newUniqSupply,
 
-        newLabelC, emitLabel,
+        emitLabel,
 
         emit, emitDecl, emitProc,
         emitProcWithConvention, emitProcWithStackFrame,
-        emitOutOfLine, emitAssign, emitStore, emitComment,
-        emitTick, emitUnwind,
+        emitOutOfLine, emitAssign, emitStore,
+        emitComment, emitTick, emitUnwind,
 
         getCmm, aGraphToGraph,
         getCodeR, getCode, getCodeScoped, getHeapUsage,
 
         mkCmmIfThenElse, mkCmmIfThen, mkCmmIfGoto,
+        mkCmmIfThenElse', mkCmmIfThen', mkCmmIfGoto',
+
         mkCall, mkCmmCall,
 
         forkClosureBody, forkLneBody, forkAlts, codeOnly,
@@ -77,7 +79,6 @@ import UniqSupply
 import FastString
 import Outputable
 
-import qualified Control.Applicative as A
 import Control.Monad
 import Data.List
 import Prelude hiding( sequence, succ )
@@ -117,17 +118,22 @@ newtype FCode a = FCode (CgInfoDownwards -> CgState -> (# a, CgState #))
 instance Functor FCode where
   fmap f (FCode g) = FCode $ \i s -> case g i s of (# a, s' #) -> (# f a, s' #)
 
-instance A.Applicative FCode where
+instance Applicative FCode where
       pure = returnFC
       (<*>) = ap
 
 instance Monad FCode where
         (>>=) = thenFC
-        return = A.pure
 
 {-# INLINE thenC #-}
 {-# INLINE thenFC #-}
 {-# INLINE returnFC #-}
+
+instance MonadUnique FCode where
+  getUniqueSupplyM = cgs_uniqs <$> getState
+  getUniqueM = FCode $ \_ st ->
+    let (u, us') = takeUniqFromSupply (cgs_uniqs st)
+    in (# u, st { cgs_uniqs = us' } #)
 
 initC :: IO CgState
 initC  = do { uniqs <- mkSplitUniqSupply 'c'
@@ -214,8 +220,7 @@ instance Outputable CgIdInfo where
 
 -- Sequel tells what to do with the result of this expression
 data Sequel
-  = Return Bool         -- Return result(s) to continuation found on the stack.
-                        -- True <=> the continuation is update code (???)
+  = Return              -- Return result(s) to continuation found on the stack.
 
   | AssignTo
         [LocalReg]      -- Put result(s) in these regs and fall through
@@ -228,7 +233,7 @@ data Sequel
                         -- allocating primOp)
 
 instance Outputable Sequel where
-    ppr (Return b) = text "Return" <+> ppr b
+    ppr Return = text "Return"
     ppr (AssignTo regs b) = text "AssignTo" <+> ppr regs <+> ppr b
 
 -- See Note [sharing continuations] below
@@ -315,7 +320,7 @@ initCgInfoDown dflags mod
                  , cgd_tick_scope= GlobalScope }
 
 initSequel :: Sequel
-initSequel = Return False
+initSequel = Return
 
 initUpdFrameOff :: DynFlags -> UpdFrameOffset
 initUpdFrameOff dflags = widthInBytes (wordWidth dflags) -- space for the RA
@@ -730,22 +735,17 @@ emitComment _ = return ()
 emitTick :: CmmTickish -> FCode ()
 emitTick = emitCgStmt . CgStmt . CmmTick
 
-emitUnwind :: GlobalReg -> CmmExpr -> FCode ()
-emitUnwind g e = do
+emitUnwind :: [(GlobalReg, Maybe CmmExpr)] -> FCode ()
+emitUnwind regs = do
   dflags <- getDynFlags
-  when (debugLevel dflags > 0) $
-     emitCgStmt $ CgStmt $ CmmUnwind g e
+  when (debugLevel dflags > 0) $ do
+     emitCgStmt $ CgStmt $ CmmUnwind regs
 
 emitAssign :: CmmReg  -> CmmExpr -> FCode ()
 emitAssign l r = emitCgStmt (CgStmt (CmmAssign l r))
 
 emitStore :: CmmExpr  -> CmmExpr -> FCode ()
 emitStore l r = emitCgStmt (CgStmt (CmmStore l r))
-
-
-newLabelC :: FCode BlockId
-newLabelC = do { u <- newUnique
-               ; return $ mkBlockId u }
 
 emit :: CmmAGraph -> FCode ()
 emit ag
@@ -799,7 +799,7 @@ emitProc_ :: Maybe CmmInfoTable -> CLabel -> [GlobalReg] -> CmmAGraphScoped
           -> Int -> Bool -> FCode ()
 emitProc_ mb_info lbl live blocks offset do_layout
   = do  { dflags <- getDynFlags
-        ; l <- newLabelC
+        ; l <- newBlockId
         ; let
               blks = labelAGraph l blocks
 
@@ -830,42 +830,62 @@ getCmm code
 
 
 mkCmmIfThenElse :: CmmExpr -> CmmAGraph -> CmmAGraph -> FCode CmmAGraph
-mkCmmIfThenElse e tbranch fbranch = do
+mkCmmIfThenElse e tbranch fbranch = mkCmmIfThenElse' e tbranch fbranch Nothing
+
+mkCmmIfThenElse' :: CmmExpr -> CmmAGraph -> CmmAGraph
+                 -> Maybe Bool -> FCode CmmAGraph
+mkCmmIfThenElse' e tbranch fbranch likely = do
   tscp  <- getTickScope
-  endif <- newLabelC
-  tid   <- newLabelC
-  fid   <- newLabelC
-  return $ catAGraphs [ mkCbranch e tid fid Nothing
-                      , mkLabel tid tscp, tbranch, mkBranch endif
-                      , mkLabel fid tscp, fbranch, mkLabel endif tscp ]
+  endif <- newBlockId
+  tid   <- newBlockId
+  fid   <- newBlockId
+
+  let
+    (test, then_, else_, likely') = case likely of
+      Just False | Just e' <- maybeInvertCmmExpr e
+        -- currently NCG doesn't know about likely
+        -- annotations. We manually switch then and
+        -- else branch so the likely false branch
+        -- becomes a fallthrough.
+        -> (e', fbranch, tbranch, Just True)
+      _ -> (e, tbranch, fbranch, likely)
+
+  return $ catAGraphs [ mkCbranch test tid fid likely'
+                      , mkLabel tid tscp, then_, mkBranch endif
+                      , mkLabel fid tscp, else_, mkLabel endif tscp ]
 
 mkCmmIfGoto :: CmmExpr -> BlockId -> FCode CmmAGraph
-mkCmmIfGoto e tid = do
-  endif <- newLabelC
+mkCmmIfGoto e tid = mkCmmIfGoto' e tid Nothing
+
+mkCmmIfGoto' :: CmmExpr -> BlockId -> Maybe Bool -> FCode CmmAGraph
+mkCmmIfGoto' e tid l = do
+  endif <- newBlockId
   tscp  <- getTickScope
-  return $ catAGraphs [ mkCbranch e tid endif Nothing, mkLabel endif tscp ]
+  return $ catAGraphs [ mkCbranch e tid endif l, mkLabel endif tscp ]
 
 mkCmmIfThen :: CmmExpr -> CmmAGraph -> FCode CmmAGraph
-mkCmmIfThen e tbranch = do
-  endif <- newLabelC
-  tid   <- newLabelC
+mkCmmIfThen e tbranch = mkCmmIfThen' e tbranch Nothing
+
+mkCmmIfThen' :: CmmExpr -> CmmAGraph -> Maybe Bool -> FCode CmmAGraph
+mkCmmIfThen' e tbranch l = do
+  endif <- newBlockId
+  tid   <- newBlockId
   tscp  <- getTickScope
-  return $ catAGraphs [ mkCbranch e tid endif Nothing
+  return $ catAGraphs [ mkCbranch e tid endif l
                       , mkLabel tid tscp, tbranch, mkLabel endif tscp ]
 
-
-mkCall :: CmmExpr -> (Convention, Convention) -> [CmmFormal] -> [CmmActual]
-       -> UpdFrameOffset -> [CmmActual] -> FCode CmmAGraph
+mkCall :: CmmExpr -> (Convention, Convention) -> [CmmFormal] -> [CmmExpr]
+       -> UpdFrameOffset -> [CmmExpr] -> FCode CmmAGraph
 mkCall f (callConv, retConv) results actuals updfr_off extra_stack = do
   dflags <- getDynFlags
-  k      <- newLabelC
+  k      <- newBlockId
   tscp   <- getTickScope
   let area = Young k
       (off, _, copyin) = copyInOflow dflags retConv area results []
       copyout = mkCallReturnsTo dflags f callConv actuals k off updfr_off extra_stack
   return $ catAGraphs [copyout, mkLabel k tscp, copyin]
 
-mkCmmCall :: CmmExpr -> [CmmFormal] -> [CmmActual] -> UpdFrameOffset
+mkCmmCall :: CmmExpr -> [CmmFormal] -> [CmmExpr] -> UpdFrameOffset
           -> FCode CmmAGraph
 mkCmmCall f results actuals updfr_off
    = mkCall f (NativeDirectCall, NativeReturn) results actuals updfr_off []
@@ -876,5 +896,5 @@ mkCmmCall f results actuals updfr_off
 
 aGraphToGraph :: CmmAGraphScoped -> FCode CmmGraph
 aGraphToGraph stmts
-  = do  { l <- newLabelC
+  = do  { l <- newBlockId
         ; return (labelAGraph l stmts) }

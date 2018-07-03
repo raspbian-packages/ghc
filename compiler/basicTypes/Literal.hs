@@ -13,15 +13,16 @@ module Literal
           Literal(..)           -- Exported to ParseIface
 
         -- ** Creating Literals
-        , mkMachInt, mkMachWord
-        , mkMachInt64, mkMachWord64
+        , mkMachInt, mkMachIntWrap
+        , mkMachWord, mkMachWordWrap
+        , mkMachInt64, mkMachInt64Wrap
+        , mkMachWord64, mkMachWord64Wrap
         , mkMachFloat, mkMachDouble
         , mkMachChar, mkMachString
         , mkLitInteger
 
         -- ** Operations on Literals
         , literalType
-        , hashLiteral
         , absentLiteralOf
         , pprLiteral
 
@@ -30,7 +31,7 @@ module Literal
         , inIntRange, inWordRange, tARGET_MAX_INT, inCharRange
         , isZeroLit
         , litFitsInChar
-        , litValue
+        , litValue, isLitValue, isLitValue_maybe, mapLitValue
 
         -- ** Coercions
         , word2IntLit, int2WordLit
@@ -53,15 +54,16 @@ import BasicTypes
 import Binary
 import Constants
 import DynFlags
+import Platform
 import UniqFM
 import Util
 
 import Data.ByteString (ByteString)
 import Data.Int
-import Data.Ratio
 import Data.Word
 import Data.Char
-import Data.Data ( Data, Typeable )
+import Data.Maybe ( isJust )
+import Data.Data ( Data )
 import Numeric ( fromRat )
 
 {-
@@ -77,6 +79,12 @@ import Numeric ( fromRat )
 -- * An unboxed (/machine/) literal ('MachInt', 'MachFloat', etc.),
 --   which is presumed to be surrounded by appropriate constructors
 --   (@Int#@, etc.), so that the overall thing makes sense.
+--
+--   We maintain the invariant that the 'Integer' the Mach{Int,Word}*
+--   constructors are actually in the (possibly target-dependent) range.
+--   The mkMach{Int,Word}*Wrap smart constructors ensure this by applying
+--   the target machine's wrapping semantics. Use these in situations
+--   where you know the wrapping semantics are correct.
 --
 -- * The literal derived from the label mentioned in a \"foreign label\"
 --   declaration ('MachLabel')
@@ -94,10 +102,10 @@ data Literal
                                 -- that can be represented as a Literal. Create
                                 -- with 'nullAddrLit'
 
-  | MachInt     Integer         -- ^ @Int#@ - at least @WORD_SIZE_IN_BITS@ bits. Create with 'mkMachInt'
-  | MachInt64   Integer         -- ^ @Int64#@ - at least 64 bits. Create with 'mkMachInt64'
-  | MachWord    Integer         -- ^ @Word#@ - at least @WORD_SIZE_IN_BITS@ bits. Create with 'mkMachWord'
-  | MachWord64  Integer         -- ^ @Word64#@ - at least 64 bits. Create with 'mkMachWord64'
+  | MachInt     Integer         -- ^ @Int#@ - according to target machine
+  | MachInt64   Integer         -- ^ @Int64#@ - exactly 64 bits
+  | MachWord    Integer         -- ^ @Word#@ - according to target machine
+  | MachWord64  Integer         -- ^ @Word64#@ - exactly 64 bits
 
   | MachFloat   Rational        -- ^ @Float#@. Create with 'mkMachFloat'
   | MachDouble  Rational        -- ^ @Double#@. Create with 'mkMachDouble'
@@ -116,7 +124,7 @@ data Literal
 
   | LitInteger Integer Type --  ^ Integer literals
                             -- See Note [Integer literals]
-  deriving (Data, Typeable)
+  deriving Data
 
 {-
 Note [Integer literals]
@@ -219,18 +227,48 @@ mkMachInt :: DynFlags -> Integer -> Literal
 mkMachInt dflags x   = ASSERT2( inIntRange dflags x,  integer x )
                        MachInt x
 
+-- | Creates a 'Literal' of type @Int#@.
+--   If the argument is out of the (target-dependent) range, it is wrapped.
+mkMachIntWrap :: DynFlags -> Integer -> Literal
+mkMachIntWrap dflags i
+ = MachInt $ case platformWordSize (targetPlatform dflags) of
+   4 -> toInteger (fromIntegral i :: Int32)
+   8 -> toInteger (fromIntegral i :: Int64)
+   w -> panic ("toIntRange: Unknown platformWordSize: " ++ show w)
+
 -- | Creates a 'Literal' of type @Word#@
 mkMachWord :: DynFlags -> Integer -> Literal
 mkMachWord dflags x   = ASSERT2( inWordRange dflags x, integer x )
                         MachWord x
 
+-- | Creates a 'Literal' of type @Word#@.
+--   If the argument is out of the (target-dependent) range, it is wrapped.
+mkMachWordWrap :: DynFlags -> Integer -> Literal
+mkMachWordWrap dflags i
+ = MachWord $ case platformWordSize (targetPlatform dflags) of
+   4 -> toInteger (fromInteger i :: Word32)
+   8 -> toInteger (fromInteger i :: Word64)
+   w -> panic ("toWordRange: Unknown platformWordSize: " ++ show w)
+
 -- | Creates a 'Literal' of type @Int64#@
 mkMachInt64 :: Integer -> Literal
-mkMachInt64  x = MachInt64 x
+mkMachInt64  x = ASSERT2( inInt64Range x, integer x )
+                 MachInt64 x
+
+-- | Creates a 'Literal' of type @Int64#@.
+--   If the argument is out of the range, it is wrapped.
+mkMachInt64Wrap :: Integer -> Literal
+mkMachInt64Wrap  i = MachInt64 (toInteger (fromIntegral i :: Int64))
 
 -- | Creates a 'Literal' of type @Word64#@
 mkMachWord64 :: Integer -> Literal
-mkMachWord64 x = MachWord64 x
+mkMachWord64 x = ASSERT2( inWord64Range x, integer x )
+                 MachWord64 x
+
+-- | Creates a 'Literal' of type @Word64#@.
+--   If the argument is out of the range, it is wrapped.
+mkMachWord64Wrap :: Integer -> Literal
+mkMachWord64Wrap i = MachWord64 (toInteger (fromIntegral i :: Word64))
 
 -- | Creates a 'Literal' of type @Float#@
 mkMachFloat :: Rational -> Literal
@@ -257,6 +295,12 @@ inIntRange, inWordRange :: DynFlags -> Integer -> Bool
 inIntRange  dflags x = x >= tARGET_MIN_INT dflags && x <= tARGET_MAX_INT dflags
 inWordRange dflags x = x >= 0                     && x <= tARGET_MAX_WORD dflags
 
+inInt64Range, inWord64Range :: Integer -> Bool
+inInt64Range x  = x >= toInteger (minBound :: Int64) &&
+                  x <= toInteger (maxBound :: Int64)
+inWord64Range x = x >= toInteger (minBound :: Word64) &&
+                  x <= toInteger (maxBound :: Word64)
+
 inCharRange :: Char -> Bool
 inCharRange c =  c >= '\0' && c <= chr tARGET_MAX_CHAR
 
@@ -273,13 +317,39 @@ isZeroLit _              = False
 -- | Returns the 'Integer' contained in the 'Literal', for when that makes
 -- sense, i.e. for 'Char', 'Int', 'Word' and 'LitInteger'.
 litValue  :: Literal -> Integer
-litValue (MachChar   c) = toInteger $ ord c
-litValue (MachInt    i) = i
-litValue (MachInt64  i) = i
-litValue (MachWord   i) = i
-litValue (MachWord64 i) = i
-litValue (LitInteger i _) = i
-litValue l = pprPanic "litValue" (ppr l)
+litValue l = case isLitValue_maybe l of
+   Just x  -> x
+   Nothing -> pprPanic "litValue" (ppr l)
+
+-- | Returns the 'Integer' contained in the 'Literal', for when that makes
+-- sense, i.e. for 'Char', 'Int', 'Word' and 'LitInteger'.
+isLitValue_maybe  :: Literal -> Maybe Integer
+isLitValue_maybe (MachChar   c)   = Just $ toInteger $ ord c
+isLitValue_maybe (MachInt    i)   = Just i
+isLitValue_maybe (MachInt64  i)   = Just i
+isLitValue_maybe (MachWord   i)   = Just i
+isLitValue_maybe (MachWord64 i)   = Just i
+isLitValue_maybe (LitInteger i _) = Just i
+isLitValue_maybe _                = Nothing
+
+-- | Apply a function to the 'Integer' contained in the 'Literal', for when that
+-- makes sense, e.g. for 'Char', 'Int', 'Word' and 'LitInteger'. For
+-- fixed-size integral literals, the result will be wrapped in
+-- accordance with the semantics of the target type.
+mapLitValue  :: DynFlags -> (Integer -> Integer) -> Literal -> Literal
+mapLitValue _      f (MachChar   c)   = mkMachChar (fchar c)
+   where fchar = chr . fromInteger . f . toInteger . ord
+mapLitValue dflags f (MachInt    i)   = mkMachIntWrap dflags (f i)
+mapLitValue _      f (MachInt64  i)   = mkMachInt64Wrap (f i)
+mapLitValue dflags f (MachWord   i)   = mkMachWordWrap dflags (f i)
+mapLitValue _      f (MachWord64 i)   = mkMachWord64Wrap (f i)
+mapLitValue _      f (LitInteger i t) = mkLitInteger (f i) t
+mapLitValue _      _ l                = pprPanic "mapLitValue" (ppr l)
+
+-- | Indicate if the `Literal` contains an 'Integer' value, e.g. 'Char',
+-- 'Int', 'Word' and 'LitInteger'.
+isLitValue  :: Literal -> Bool
+isLitValue = isJust . isLitValue_maybe
 
 {-
         Coercions
@@ -531,38 +601,3 @@ MachDouble      -1.0##
 LitInteger      -1                 (-1)
 MachLabel       "__label" ...      ("__label" ...)
 -}
-
-{-
-************************************************************************
-*                                                                      *
-\subsection{Hashing}
-*                                                                      *
-************************************************************************
-
-Hash values should be zero or a positive integer.  No negatives please.
-(They mess up the UniqFM for some reason.)
--}
-
-hashLiteral :: Literal -> Int
-hashLiteral (MachChar c)        = ord c + 1000  -- Keep it out of range of common ints
-hashLiteral (MachStr s)         = hashByteString s
-hashLiteral (MachNullAddr)      = 0
-hashLiteral (MachInt i)         = hashInteger i
-hashLiteral (MachInt64 i)       = hashInteger i
-hashLiteral (MachWord i)        = hashInteger i
-hashLiteral (MachWord64 i)      = hashInteger i
-hashLiteral (MachFloat r)       = hashRational r
-hashLiteral (MachDouble r)      = hashRational r
-hashLiteral (MachLabel s _ _)     = hashFS s
-hashLiteral (LitInteger i _)    = hashInteger i
-
-hashRational :: Rational -> Int
-hashRational r = hashInteger (numerator r)
-
-hashInteger :: Integer -> Int
-hashInteger i = 1 + abs (fromInteger (i `rem` 10000))
-                -- The 1+ is to avoid zero, which is a Bad Number
-                -- since we use * to combine hash values
-
-hashFS :: FastString -> Int
-hashFS s = uniqueOfFS s

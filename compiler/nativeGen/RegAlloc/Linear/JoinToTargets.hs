@@ -17,6 +17,7 @@ import Instruction
 import Reg
 
 import BlockId
+import Hoopl
 import Digraph
 import DynFlags
 import Outputable
@@ -24,6 +25,7 @@ import Unique
 import UniqFM
 import UniqSet
 
+import Data.Foldable (foldl')
 
 -- | For a jump instruction at the end of a block, generate fixup code so its
 --      vregs are in the correct regs for its destination.
@@ -87,7 +89,10 @@ joinToTargets' block_live new_blocks block_id instr (dest:dests)
 
         -- and free up those registers which are now free.
         let to_free =
-                [ r     | (reg, loc) <- ufmToList assig
+                [ r     | (reg, loc) <- nonDetUFMToList assig
+                        -- This is non-deterministic but we do not
+                        -- currently support deterministic code-generation.
+                        -- See Note [Unique Determinism and code generation]
                         , not (elemUniqSet_Directly reg live_set)
                         , r          <- regsOfLoc loc ]
 
@@ -124,7 +129,7 @@ joinToTargets_first block_live new_blocks block_id instr dest dests
 
         -- free up the regs that are not live on entry to this block.
         freeregs        <- getFreeRegsR
-        let freeregs' = foldr (frReleaseReg platform) freeregs to_free
+        let freeregs' = foldl' (flip $ frReleaseReg platform) freeregs to_free
 
         -- remember the current assignment on entry to this block.
         setBlockAssigR (mapInsert dest (freeregs', src_assig) block_assig)
@@ -148,7 +153,10 @@ joinToTargets_again
     src_assig dest_assig
 
         -- the assignments already match, no problem.
-        | ufmToList dest_assig == ufmToList src_assig
+        | nonDetUFMToList dest_assig == nonDetUFMToList src_assig
+        -- This is non-deterministic but we do not
+        -- currently support deterministic code-generation.
+        -- See Note [Unique Determinism and code generation]
         = joinToTargets' block_live new_blocks block_id instr dests
 
         -- assignments don't match, need fixup code
@@ -169,7 +177,7 @@ joinToTargets_again
                 --
                 -- We need to do the R2 -> R3 move before R1 -> R2.
                 --
-                let sccs  = stronglyConnCompFromEdgedVerticesR graph
+                let sccs  = stronglyConnCompFromEdgedVerticesOrdR graph
 
 {-              -- debugging
                 pprTrace
@@ -223,7 +231,10 @@ joinToTargets_again
 --
 makeRegMovementGraph :: RegMap Loc -> RegMap Loc -> [(Unique, Loc, [Loc])]
 makeRegMovementGraph adjusted_assig dest_assig
- = [ node       | (vreg, src) <- ufmToList adjusted_assig
+ = [ node       | (vreg, src) <- nonDetUFMToList adjusted_assig
+                    -- This is non-deterministic but we do not
+                    -- currently support deterministic code-generation.
+                    -- See Note [Unique Determinism and code generation]
                     -- source reg might not be needed at the dest:
                 , Just loc <- [lookupUFM_Directly dest_assig vreg]
                 , node <- expandNode vreg src loc ]
@@ -313,7 +324,7 @@ handleComponent delta instr
         instrLoad       <- loadR (RegReal dreg) slot
 
         remainingFixUps <- mapM (handleComponent delta instr)
-                                (stronglyConnCompFromEdgedVerticesR rest)
+                                (stronglyConnCompFromEdgedVerticesOrdR rest)
 
         -- make sure to do all the reloads after all the spills,
         --      so we don't end up clobbering the source values.

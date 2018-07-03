@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE FlexibleContexts #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Client.Sandbox
@@ -38,12 +39,16 @@ module Distribution.Client.Sandbox (
     updateSandboxConfigFileFlag,
     updateInstallDirs,
 
-    configPackageDB', configCompilerAux', getPersistOrConfigCompiler
+    getPersistOrConfigCompiler
   ) where
+
+import Prelude ()
+import Distribution.Client.Compat.Prelude
 
 import Distribution.Client.Setup
   ( SandboxFlags(..), ConfigFlags(..), ConfigExFlags(..), InstallFlags(..)
-  , GlobalFlags(..), defaultConfigExFlags, defaultInstallFlags
+  , GlobalFlags(..), configCompilerAux', configPackageDB'
+  , defaultConfigExFlags, defaultInstallFlags
   , defaultSandboxLocation, withRepoContext )
 import Distribution.Client.Sandbox.Timestamp  ( listModifiedDeps
                                               , maybeAddCompilerTimestampRecord
@@ -70,59 +75,55 @@ import Distribution.Client.Sandbox.Types      ( SandboxPackageInfo(..)
                                               , UseSandbox(..) )
 import Distribution.Client.SetupWrapper
   ( SetupScriptOptions(..), defaultSetupScriptOptions )
-import Distribution.Client.Types              ( PackageLocation(..)
-                                              , SourcePackage(..) )
+import Distribution.Client.Types              ( PackageLocation(..) )
 import Distribution.Client.Utils              ( inDir, tryCanonicalizePath
                                               , tryFindAddSourcePackageDesc)
 import Distribution.PackageDescription.Configuration
                                               ( flattenPackageDescription )
-import Distribution.PackageDescription.Parse  ( readPackageDescription )
-import Distribution.Simple.Compiler           ( Compiler(..), PackageDB(..)
-                                              , PackageDBStack )
+#ifdef CABAL_PARSEC
+import Distribution.PackageDescription.Parsec ( readGenericPackageDescription )
+#else
+import Distribution.PackageDescription.Parse  ( readGenericPackageDescription )
+#endif
+import Distribution.Simple.Compiler           ( Compiler(..), PackageDB(..) )
 import Distribution.Simple.Configure          ( configCompilerAuxEx
-                                              , interpretPackageDbFlags
                                               , getPackageDBContents
                                               , maybeGetPersistBuildConfig
                                               , findDistPrefOrDefault
                                               , findDistPref )
 import qualified Distribution.Simple.LocalBuildInfo as LocalBuildInfo
 import Distribution.Simple.PreProcess         ( knownSuffixHandlers )
-import Distribution.Simple.Program            ( ProgramConfiguration )
+import Distribution.Simple.Program            ( ProgramDb )
 import Distribution.Simple.Setup              ( Flag(..), HaddockFlags(..)
                                               , fromFlagOrDefault, flagToMaybe )
 import Distribution.Simple.SrcDist            ( prepareTree )
-import Distribution.Simple.Utils              ( die, debug, notice, info, warn
+import Distribution.Simple.Utils              ( die', debug, notice, info, warn
                                               , debugNoWrap, defaultPackageDesc
-                                              , intercalate, topHandlerWith
+                                              , topHandlerWith
                                               , createDirectoryIfMissingVerbose )
 import Distribution.Package                   ( Package(..) )
 import Distribution.System                    ( Platform )
 import Distribution.Text                      ( display )
-import Distribution.Verbosity                 ( Verbosity, lessVerbose )
+import Distribution.Verbosity                 ( Verbosity )
 import Distribution.Compat.Environment        ( lookupEnv, setEnv )
 import Distribution.Client.Compat.FilePerms   ( setFileHidden )
 import qualified Distribution.Client.Sandbox.Index as Index
 import Distribution.Simple.PackageIndex       ( InstalledPackageIndex )
 import qualified Distribution.Simple.PackageIndex  as InstalledPackageIndex
 import qualified Distribution.Simple.Register      as Register
+
+import Distribution.Solver.Types.SourcePackage
+
 import qualified Data.Map                          as M
 import qualified Data.Set                          as S
 import Data.Either                            (partitionEithers)
 import Control.Exception                      ( assert, bracket_ )
-import Control.Monad                          ( forM, liftM, liftM2, unless, when )
+import Control.Monad                          ( forM, mapM, mapM_ )
 import Data.Bits                              ( shiftL, shiftR, xor )
-import Data.Char                              ( ord )
 import Data.IORef                             ( newIORef, writeIORef, readIORef )
 import Data.List                              ( delete
-                                              , foldl'
-                                              , intersperse
-                                              , isPrefixOf
                                               , groupBy )
 import Data.Maybe                             ( fromJust )
-#if !MIN_VERSION_base(4,8,0)
-import Data.Monoid                            ( mempty, mappend )
-#endif
-import Data.Word                              ( Word32 )
 import Numeric                                ( showHex )
 import System.Directory                       ( canonicalizePath
                                               , createDirectory
@@ -210,16 +211,16 @@ tryLoadSandboxConfig verbosity globalFlags = do
     (globalConfigFile globalFlags)
 
 -- | Return the name of the package index file for this package environment.
-tryGetIndexFilePath :: SavedConfig -> IO FilePath
-tryGetIndexFilePath config = tryGetIndexFilePath' (savedGlobalFlags config)
+tryGetIndexFilePath :: Verbosity -> SavedConfig -> IO FilePath
+tryGetIndexFilePath verbosity config = tryGetIndexFilePath' verbosity (savedGlobalFlags config)
 
 -- | The same as 'tryGetIndexFilePath', but takes 'GlobalFlags' instead of
 -- 'SavedConfig'.
-tryGetIndexFilePath' :: GlobalFlags -> IO FilePath
-tryGetIndexFilePath' globalFlags = do
+tryGetIndexFilePath' :: Verbosity -> GlobalFlags -> IO FilePath
+tryGetIndexFilePath' verbosity globalFlags = do
   let paths = fromNubList $ globalLocalRepos globalFlags
   case paths of
-    []  -> die $ "Distribution.Client.Sandbox.tryGetIndexFilePath: " ++
+    []  -> die' verbosity $ "Distribution.Client.Sandbox.tryGetIndexFilePath: " ++
            "no local repos found. " ++ checkConfiguration
     _   -> return $ (last paths) </> Index.defaultIndexFileName
   where
@@ -228,19 +229,19 @@ tryGetIndexFilePath' globalFlags = do
 
 -- | Try to extract a 'PackageDB' from 'ConfigFlags'. Gives a better error
 -- message than just pattern-matching.
-getSandboxPackageDB :: ConfigFlags -> IO PackageDB
-getSandboxPackageDB configFlags = do
+getSandboxPackageDB :: Verbosity -> ConfigFlags -> IO PackageDB
+getSandboxPackageDB verbosity configFlags = do
   case configPackageDBs configFlags of
     [Just sandboxDB@(SpecificPackageDB _)] -> return sandboxDB
     -- TODO: should we allow multiple package DBs (e.g. with 'inherit')?
 
     []                                     ->
-      die $ "Sandbox package DB is not specified. " ++ sandboxConfigCorrupt
+      die' verbosity $ "Sandbox package DB is not specified. " ++ sandboxConfigCorrupt
     [_]                                    ->
-      die $ "Unexpected contents of the 'package-db' field. "
+      die' verbosity $ "Unexpected contents of the 'package-db' field. "
             ++ sandboxConfigCorrupt
     _                                      ->
-      die $ "Too many package DBs provided. " ++ sandboxConfigCorrupt
+      die' verbosity $ "Too many package DBs provided. " ++ sandboxConfigCorrupt
 
   where
     sandboxConfigCorrupt = "Your 'cabal.sandbox.config' is probably corrupt."
@@ -248,11 +249,11 @@ getSandboxPackageDB configFlags = do
 
 -- | Which packages are installed in the sandbox package DB?
 getInstalledPackagesInSandbox :: Verbosity -> ConfigFlags
-                                 -> Compiler -> ProgramConfiguration
+                                 -> Compiler -> ProgramDb
                                  -> IO InstalledPackageIndex
-getInstalledPackagesInSandbox verbosity configFlags comp conf = do
-    sandboxDB <- getSandboxPackageDB configFlags
-    getPackageDBContents verbosity comp sandboxDB conf
+getInstalledPackagesInSandbox verbosity configFlags comp progdb = do
+    sandboxDB <- getSandboxPackageDB verbosity configFlags
+    getPackageDBContents verbosity comp sandboxDB progdb
 
 -- | Temporarily add $SANDBOX_DIR/bin to $PATH.
 withSandboxBinDirOnSearchPath :: FilePath -> IO a -> IO a
@@ -280,13 +281,13 @@ withSandboxBinDirOnSearchPath sandboxDir = bracket_ addBinDir rmBinDir
 
 -- | Initialise a package DB for this compiler if it doesn't exist.
 initPackageDBIfNeeded :: Verbosity -> ConfigFlags
-                         -> Compiler -> ProgramConfiguration
+                         -> Compiler -> ProgramDb
                          -> IO ()
-initPackageDBIfNeeded verbosity configFlags comp conf = do
-  SpecificPackageDB dbPath <- getSandboxPackageDB configFlags
+initPackageDBIfNeeded verbosity configFlags comp progdb = do
+  SpecificPackageDB dbPath <- getSandboxPackageDB verbosity configFlags
   packageDBExists <- doesDirectoryExist dbPath
   unless packageDBExists $
-    Register.initPackageDB verbosity comp conf dbPath
+    Register.initPackageDB verbosity comp progdb dbPath
   when packageDBExists $
     debug verbosity $ "The package database already exists: " ++ dbPath
 
@@ -318,7 +319,7 @@ sandboxInit verbosity sandboxFlags globalFlags = do
 
   -- Determine which compiler to use (using the value from ~/.cabal/config).
   userConfig <- loadConfig verbosity (globalConfigFile globalFlags)
-  (comp, platform, conf) <- configCompilerAuxEx (savedConfigureFlags userConfig)
+  (comp, platform, progdb) <- configCompilerAuxEx (savedConfigureFlags userConfig)
 
   -- Create the package environment file.
   pkgEnvFile <- getSandboxConfigFilePath globalFlags
@@ -328,7 +329,7 @@ sandboxInit verbosity sandboxFlags globalFlags = do
       configFlags = savedConfigureFlags config
 
   -- Create the index file if it doesn't exist.
-  indexFile <- tryGetIndexFilePath config
+  indexFile <- tryGetIndexFilePath verbosity config
   indexFileExists <- doesFileExist indexFile
   if indexFileExists
     then notice verbosity $ "Using an existing sandbox located at " ++ sandboxDir
@@ -336,7 +337,7 @@ sandboxInit verbosity sandboxFlags globalFlags = do
   Index.createEmpty verbosity indexFile
 
   -- Create the package DB for the default compiler.
-  initPackageDBIfNeeded verbosity configFlags comp conf
+  initPackageDBIfNeeded verbosity configFlags comp progdb
   maybeAddCompilerTimestampRecord verbosity sandboxDir indexFile
     (compilerId comp) platform
 
@@ -367,7 +368,7 @@ sandboxDelete verbosity _sandboxFlags globalFlags = do
                                         curDir </> defaultSandboxLocation
 
       when isNonDefaultSandboxLocation $
-        die $ "Non-default sandbox location used: '" ++ sandboxDir
+        die' verbosity $ "Non-default sandbox location used: '" ++ sandboxDir
         ++ "'.\nAssuming a shared sandbox. Please delete '"
         ++ sandboxDir ++ "' manually."
 
@@ -399,7 +400,7 @@ doAddSource :: Verbosity -> [FilePath] -> FilePath -> PackageEnvironment
                -> IO ()
 doAddSource verbosity buildTreeRefs sandboxDir pkgEnv refType = do
   let savedConfig       = pkgEnvSavedConfig pkgEnv
-  indexFile            <- tryGetIndexFilePath savedConfig
+  indexFile            <- tryGetIndexFilePath verbosity savedConfig
 
   -- If we're running 'sandbox add-source' for the first time for this compiler,
   -- we need to create an initial timestamp record.
@@ -407,7 +408,7 @@ doAddSource verbosity buildTreeRefs sandboxDir pkgEnv refType = do
   maybeAddCompilerTimestampRecord verbosity sandboxDir indexFile
     (compilerId comp) platform
 
-  withAddTimestamps sandboxDir $ do
+  withAddTimestamps verbosity sandboxDir $ do
     -- Path canonicalisation is done in addBuildTreeRefs, but we do it
     -- twice because of the timestamps file.
     buildTreeRefs' <- mapM tryCanonicalizePath buildTreeRefs
@@ -440,7 +441,7 @@ sandboxAddSourceSnapshot verbosity buildTreeRefs sandboxDir pkgEnv = do
   pkgs      <- forM buildTreeRefs $ \buildTreeRef ->
     inDir (Just buildTreeRef) $
     return . flattenPackageDescription
-            =<< readPackageDescription verbosity
+            =<< readGenericPackageDescription verbosity
             =<< defaultPackageDesc     verbosity
 
   -- Copy the package sources to "snapshots/$PKGNAME-$VERSION-tmp". If
@@ -474,7 +475,7 @@ sandboxDeleteSource :: Verbosity -> [FilePath] -> SandboxFlags -> GlobalFlags
                        -> IO ()
 sandboxDeleteSource verbosity buildTreeRefs _sandboxFlags globalFlags = do
   (sandboxDir, pkgEnv) <- tryLoadSandboxConfig verbosity globalFlags
-  indexFile            <- tryGetIndexFilePath (pkgEnvSavedConfig pkgEnv)
+  indexFile            <- tryGetIndexFilePath verbosity (pkgEnvSavedConfig pkgEnv)
 
   (results, convDict) <-
     Index.removeBuildTreeRefs verbosity indexFile buildTreeRefs
@@ -483,7 +484,7 @@ sandboxDeleteSource verbosity buildTreeRefs _sandboxFlags globalFlags = do
       removedRefs = fmap convDict removedPaths
 
   unless (null removedPaths) $ do
-    removeTimestamps sandboxDir removedPaths
+    removeTimestamps verbosity sandboxDir removedPaths
 
     notice verbosity $ "Success deleting sources: " ++
       showL removedRefs ++ "\n\n"
@@ -491,7 +492,7 @@ sandboxDeleteSource verbosity buildTreeRefs _sandboxFlags globalFlags = do
   unless (null failedPaths) $ do
     let groupedFailures = groupBy errorType failedPaths
     mapM_ handleErrors groupedFailures
-    die $ "The sources with the above errors were skipped. (" ++
+    die' verbosity $ "The sources with the above errors were skipped. (" ++
       showL (fmap getPath failedPaths) ++ ")"
 
   notice verbosity $ "Note: 'sandbox delete-source' only unregisters the " ++
@@ -529,7 +530,7 @@ sandboxListSources :: Verbosity -> SandboxFlags -> GlobalFlags
                       -> IO ()
 sandboxListSources verbosity _sandboxFlags globalFlags = do
   (sandboxDir, pkgEnv) <- tryLoadSandboxConfig verbosity globalFlags
-  indexFile            <- tryGetIndexFilePath (pkgEnvSavedConfig pkgEnv)
+  indexFile            <- tryGetIndexFilePath verbosity (pkgEnvSavedConfig pkgEnv)
 
   refs <- Index.listBuildTreeRefs verbosity
           Index.ListIgnored Index.LinksAndSnapshots indexFile
@@ -551,10 +552,10 @@ sandboxHcPkg verbosity _sandboxFlags globalFlags extraArgs = do
   let configFlags = savedConfigureFlags . pkgEnvSavedConfig $ pkgEnv
   -- Invoke hc-pkg for the most recently configured compiler (if any),
   -- using the right package-db for the compiler (see #1935).
-  (comp, platform, conf) <- getPersistOrConfigCompiler configFlags
+  (comp, platform, progdb) <- getPersistOrConfigCompiler configFlags
   let dir         = sandboxPackageDBPath sandboxDir comp platform
       dbStack     = [GlobalPackageDB, SpecificPackageDB dir]
-  Register.invokeHcPkg verbosity comp conf dbStack extraArgs
+  Register.invokeHcPkg verbosity comp progdb dbStack extraArgs
 
 updateInstallDirs :: Flag Bool
                   -> (UseSandbox, SavedConfig) -> (UseSandbox, SavedConfig)
@@ -596,7 +597,7 @@ loadConfigOrSandboxConfig verbosity globalFlags = do
     -- A @cabal.sandbox.config@ file (and possibly @cabal.config@) is present.
     SandboxPackageEnvironment -> do
       (sandboxDir, pkgEnv) <- tryLoadSandboxConfig verbosity globalFlags
-                              -- ^ Prints an error message and exits on error.
+                              -- Prints an error message and exits on error.
       let config = pkgEnvSavedConfig pkgEnv
       return (UseSandbox sandboxDir, config)
 
@@ -635,7 +636,7 @@ loadConfigOrSandboxConfig verbosity globalFlags = do
         flag = (globalRequireSandbox . savedGlobalFlags $ config)
                `mappend` (globalRequireSandbox globalFlags)
         checkFlag (Flag True)  =
-          die $ "'require-sandbox' is set to True, but no sandbox is present. "
+          die' verbosity $ "'require-sandbox' is set to True, but no sandbox is present. "
              ++ "Use '--no-require-sandbox' if you want to override "
              ++ "'require-sandbox' temporarily."
         checkFlag (Flag False) = return ()
@@ -673,37 +674,37 @@ reinstallAddSourceDeps verbosity configFlags' configExFlags
                             { configDistPref  = Flag sandboxDistPref }
       haddockFlags        = mempty
                             { haddockDistPref = Flag sandboxDistPref }
-  (comp, platform, conf) <- configCompilerAux' configFlags
-  retVal                 <- newIORef NoDepsReinstalled
+  (comp, platform, progdb) <- configCompilerAux' configFlags
+  retVal                   <- newIORef NoDepsReinstalled
 
   withSandboxPackageInfo verbosity configFlags globalFlags
-                         comp platform conf sandboxDir $ \sandboxPkgInfo ->
+                         comp platform progdb sandboxDir $ \sandboxPkgInfo ->
     unless (null $ modifiedAddSourceDependencies sandboxPkgInfo) $ do
 
-     withRepoContext verbosity globalFlags $ \repoContext -> do
-      let args :: InstallArgs
-          args = ((configPackageDB' configFlags)
-                 ,repoContext
-                 ,comp, platform, conf
-                 ,UseSandbox sandboxDir, Just sandboxPkgInfo
-                 ,globalFlags, configFlags, configExFlags, installFlags
-                 ,haddockFlags)
+      withRepoContext verbosity globalFlags $ \repoContext -> do
+        let args :: InstallArgs
+            args = ((configPackageDB' configFlags)
+                  ,repoContext
+                  ,comp, platform, progdb
+                  ,UseSandbox sandboxDir, Just sandboxPkgInfo
+                  ,globalFlags, configFlags, configExFlags, installFlags
+                  ,haddockFlags)
 
-      -- This can actually be replaced by a call to 'install', but we use a
-      -- lower-level API because of layer separation reasons. Additionally, we
-      -- might want to use some lower-level features this in the future.
-      withSandboxBinDirOnSearchPath sandboxDir $ do
-        installContext <- makeInstallContext verbosity args Nothing
-        installPlan    <- foldProgress logMsg die' return =<<
-                          makeInstallPlan verbosity args installContext
+        -- This can actually be replaced by a call to 'install', but we use a
+        -- lower-level API because of layer separation reasons. Additionally, we
+        -- might want to use some lower-level features this in the future.
+        withSandboxBinDirOnSearchPath sandboxDir $ do
+          installContext <- makeInstallContext verbosity args Nothing
+          installPlan    <- foldProgress logMsg die'' return =<<
+                            makeInstallPlan verbosity args installContext
 
-        processInstallPlan verbosity args installContext installPlan
-        writeIORef retVal ReinstalledSomeDeps
+          processInstallPlan verbosity args installContext installPlan
+          writeIORef retVal ReinstalledSomeDeps
 
   readIORef retVal
 
     where
-      die' message = die (message ++ installFailedInSandbox)
+      die'' message = die' verbosity (message ++ installFailedInSandbox)
       -- TODO: use a better error message, remove duplication.
       installFailedInSandbox =
         "Note: when using a sandbox, all packages are required to have "
@@ -721,25 +722,25 @@ reinstallAddSourceDeps verbosity configFlags' configExFlags
 -- we don't update the timestamp file here - this is done in
 -- 'postInstallActions'.
 withSandboxPackageInfo :: Verbosity -> ConfigFlags -> GlobalFlags
-                          -> Compiler -> Platform -> ProgramConfiguration
+                          -> Compiler -> Platform -> ProgramDb
                           -> FilePath
                           -> (SandboxPackageInfo -> IO ())
                           -> IO ()
 withSandboxPackageInfo verbosity configFlags globalFlags
-                       comp platform conf sandboxDir cont = do
+                       comp platform progdb sandboxDir cont = do
   -- List all add-source deps.
-  indexFile              <- tryGetIndexFilePath' globalFlags
+  indexFile              <- tryGetIndexFilePath' verbosity globalFlags
   buildTreeRefs          <- Index.listBuildTreeRefs verbosity
                             Index.DontListIgnored Index.OnlyLinks indexFile
   let allAddSourceDepsSet = S.fromList buildTreeRefs
 
   -- List all packages installed in the sandbox.
   installedPkgIndex <- getInstalledPackagesInSandbox verbosity
-                       configFlags comp conf
+                       configFlags comp progdb
   let err = "Error reading sandbox package information."
   -- Get the package descriptions for all add-source deps.
-  depsCabalFiles <- mapM (flip tryFindAddSourcePackageDesc err) buildTreeRefs
-  depsPkgDescs   <- mapM (readPackageDescription verbosity) depsCabalFiles
+  depsCabalFiles <- mapM (flip (tryFindAddSourcePackageDesc verbosity) err) buildTreeRefs
+  depsPkgDescs   <- mapM (readGenericPackageDescription verbosity) depsCabalFiles
   let depsMap           = M.fromList (zip buildTreeRefs depsPkgDescs)
       isInstalled pkgid = not . null
         . InstalledPackageIndex.lookupSourcePackageId installedPkgIndex $ pkgid
@@ -775,17 +776,17 @@ withSandboxPackageInfo verbosity configFlags globalFlags
 -- | Same as 'withSandboxPackageInfo' if we're inside a sandbox and the
 -- identity otherwise.
 maybeWithSandboxPackageInfo :: Verbosity -> ConfigFlags -> GlobalFlags
-                               -> Compiler -> Platform -> ProgramConfiguration
+                               -> Compiler -> Platform -> ProgramDb
                                -> UseSandbox
                                -> (Maybe SandboxPackageInfo -> IO ())
                                -> IO ()
 maybeWithSandboxPackageInfo verbosity configFlags globalFlags
-                            comp platform conf useSandbox cont =
+                            comp platform progdb useSandbox cont =
   case useSandbox of
     NoSandbox             -> cont Nothing
     UseSandbox sandboxDir -> withSandboxPackageInfo verbosity
                              configFlags globalFlags
-                             comp platform conf sandboxDir
+                             comp platform progdb sandboxDir
                              (\spi -> cont (Just spi))
 
 -- | Check if a sandbox is present and call @reinstallAddSourceDeps@ in that
@@ -853,28 +854,12 @@ maybeReinstallAddSourceDeps verbosity numJobsFlag configFlags'
 --
 -- Utils (transitionary)
 --
--- FIXME: configPackageDB' and configCompilerAux' don't really belong in this
--- module
---
-
-configPackageDB' :: ConfigFlags -> PackageDBStack
-configPackageDB' cfg =
-    interpretPackageDbFlags userInstall (configPackageDBs cfg)
-  where
-    userInstall = fromFlagOrDefault True (configUserInstall cfg)
-
-configCompilerAux' :: ConfigFlags
-                   -> IO (Compiler, Platform, ProgramConfiguration)
-configCompilerAux' configFlags =
-  configCompilerAuxEx configFlags
-    --FIXME: make configCompilerAux use a sensible verbosity
-    { configVerbosity = fmap lessVerbose (configVerbosity configFlags) }
 
 -- | Try to read the most recently configured compiler from the
 -- 'localBuildInfoFile', falling back on 'configCompilerAuxEx' if it
 -- cannot be read.
 getPersistOrConfigCompiler :: ConfigFlags
-                           -> IO (Compiler, Platform, ProgramConfiguration)
+                           -> IO (Compiler, Platform, ProgramDb)
 getPersistOrConfigCompiler configFlags = do
   distPref <- findDistPrefOrDefault (configDistPref configFlags)
   mlbi <- maybeGetPersistBuildConfig distPref

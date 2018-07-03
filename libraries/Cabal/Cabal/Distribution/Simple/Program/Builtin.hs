@@ -18,6 +18,7 @@ module Distribution.Simple.Program.Builtin (
     -- * Programs that Cabal knows about
     ghcProgram,
     ghcPkgProgram,
+    runghcProgram,
     ghcjsProgram,
     ghcjsPkgProgram,
     lhcProgram,
@@ -36,6 +37,7 @@ module Distribution.Simple.Program.Builtin (
     c2hsProgram,
     cpphsProgram,
     hscolourProgram,
+    doctestProgram,
     haddockProgram,
     greencardProgram,
     ldProgram,
@@ -44,6 +46,9 @@ module Distribution.Simple.Program.Builtin (
     pkgConfigProgram,
     hpcProgram,
   ) where
+
+import Prelude ()
+import Distribution.Compat.Prelude
 
 import Distribution.Simple.Program.Find
 import Distribution.Simple.Program.Internal
@@ -54,8 +59,6 @@ import Distribution.Compat.Exception
 import Distribution.Verbosity
 import Distribution.Version
 
-import Data.Char
-         ( isDigit )
 import qualified Data.Map as Map
 
 -- ------------------------------------------------------------
@@ -69,6 +72,7 @@ builtinPrograms =
     [
     -- compilers and related progs
       ghcProgram
+    , runghcProgram
     , ghcPkgProgram
     , ghcjsProgram
     , ghcjsPkgProgram
@@ -82,6 +86,7 @@ builtinPrograms =
     , hpcProgram
     -- preprocessors
     , hscolourProgram
+    , doctestProgram
     , haddockProgram
     , happyProgram
     , alexProgram
@@ -112,12 +117,21 @@ ghcProgram = (simpleProgram "ghc") {
              }
            -- Only the 7.8 branch seems to be affected. Fixed in 7.8.4.
            affectedVersionRange = intersectVersionRanges
-                                  (laterVersion   $ Version [7,8,0] [])
-                                  (earlierVersion $ Version [7,8,4] [])
+                                  (laterVersion   $ mkVersion [7,8,0])
+                                  (earlierVersion $ mkVersion [7,8,4])
        return $ maybe ghcProg
          (\v -> if withinRange v affectedVersionRange
                 then ghcProg' else ghcProg)
          (programVersion ghcProg)
+  }
+
+runghcProgram :: Program
+runghcProgram = (simpleProgram "runghc") {
+    programFindVersion = findProgramVersion "--version" $ \str ->
+      case words str of
+        -- "runghc 7.10.3"
+        (_:ver:_) -> ver
+        _ -> ""
   }
 
 ghcPkgProgram :: Program
@@ -295,6 +309,18 @@ hscolourProgram = (simpleProgram "hscolour") {
       case words str of
         (_:ver:_) -> ver
         _         -> ""
+  }
+
+-- TODO: Ensure that doctest is built against the same GHC as the one
+--       that's being used.  Same for haddock.  @phadej pointed this out.
+doctestProgram :: Program
+doctestProgram = (simpleProgram "doctest") {
+    programFindLocation = \v p -> findProgramOnSearchPath v p "doctest"
+  , programFindVersion  = findProgramVersion "--version" $ \str ->
+         -- "doctest version 0.11.2"
+         case words str of
+           (_:_:ver:_) -> ver
+           _           -> ""
   }
 
 haddockProgram :: Program

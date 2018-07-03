@@ -1,8 +1,8 @@
 name: containers
-version: 0.5.7.1
+version: 0.5.10.2
 license: BSD3
 license-file: LICENSE
-maintainer: fox@ucw.cz
+maintainer: libraries@haskell.org
 bug-reports: https://github.com/haskell/containers/issues
 synopsis: Assorted concrete container types
 category: Data Structures
@@ -25,45 +25,191 @@ extra-source-files:
     benchmarks/SetOperations/*.hs
     benchmarks/LookupGE/Makefile
     benchmarks/LookupGE/*.hs
+    changelog.md
 
 source-repository head
     type:     git
     location: http://github.com/haskell/containers.git
 
 Library
-    build-depends: base >= 4.2 && < 5, array, deepseq >= 1.2 && < 1.5
-    if impl(ghc>=6.10)
+    build-depends: base >= 4.3 && < 5, array, deepseq >= 1.2 && < 1.5
+    if impl(ghc)
         build-depends: ghc-prim
 
     ghc-options: -O2 -Wall
+
+    other-extensions: CPP, BangPatterns
 
     exposed-modules:
         Data.IntMap
         Data.IntMap.Lazy
         Data.IntMap.Strict
+        Data.IntMap.Internal
+        Data.IntMap.Internal.Debug
+        Data.IntMap.Merge.Lazy
+        Data.IntMap.Merge.Strict
+        Data.IntSet.Internal
         Data.IntSet
         Data.Map
         Data.Map.Lazy
+        Data.Map.Lazy.Merge
+        Data.Map.Merge.Lazy
+        Data.Map.Strict.Internal
         Data.Map.Strict
+        Data.Map.Strict.Merge
+        Data.Map.Merge.Strict
+        Data.Map.Internal
+        Data.Map.Internal.Debug
+        Data.Set.Internal
         Data.Set
-    if !impl(nhc98)
-        exposed-modules:
-            Data.Graph
-            Data.Sequence
-            Data.Tree
+        Data.Graph
+        Data.Sequence
+        Data.Sequence.Internal
+        Data.Tree
+        Utils.Containers.Internal.BitUtil
+        Utils.Containers.Internal.BitQueue
+        Utils.Containers.Internal.StrictPair
+
     other-modules:
-        Data.IntMap.Base
-        Data.IntSet.Base
-        Data.Map.Base
-        Data.Set.Base
-        Data.Utils.BitUtil
-        Data.Utils.StrictFold
-        Data.Utils.StrictPair
+        Utils.Containers.Internal.StrictFold
+        Utils.Containers.Internal.StrictMaybe
+        Utils.Containers.Internal.PtrEquality
+        Data.Map.Internal.DeprecatedShowTree
+        Data.IntMap.Internal.DeprecatedDebug
 
     include-dirs: include
 
-    if impl(ghc<7.0)
-        extensions: MagicHash, DeriveDataTypeable, StandaloneDeriving, Rank2Types
+-----------------------------
+-- B E N C H M A R K I N G --
+-----------------------------
+
+benchmark intmap-benchmarks
+  type: exitcode-stdio-1.0
+  hs-source-dirs: benchmarks
+  main-is: IntMap.hs
+  ghc-options: -O2
+  build-depends:
+    base >= 4.2 && < 5,
+    containers,
+    criterion >= 0.4.0 && < 1.2,
+    deepseq >= 1.1.0.0 && < 1.5
+
+benchmark intset-benchmarks
+  type: exitcode-stdio-1.0
+  hs-source-dirs: benchmarks
+  main-is: IntSet.hs
+  ghc-options: -O2
+  build-depends:
+    base >= 4.2 && < 5,
+    containers,
+    criterion >= 0.4.0 && < 1.2,
+    deepseq >= 1.1.0.0 && < 1.5
+
+benchmark map-benchmarks
+  type: exitcode-stdio-1.0
+  hs-source-dirs: benchmarks
+  main-is: Map.hs
+  ghc-options: -O2
+  build-depends:
+    base >= 4.2 && < 5,
+    containers,
+    criterion >= 0.4.0 && < 1.2,
+    deepseq >= 1.1.0.0 && < 1.5,
+    transformers
+
+benchmark sequence-benchmarks
+  type: exitcode-stdio-1.0
+  hs-source-dirs: benchmarks
+  main-is: Sequence.hs
+  ghc-options: -O2
+  build-depends:
+    base >= 4.2 && < 5,
+    containers,
+    criterion >= 0.4.0 && < 1.2,
+    deepseq >= 1.1.0.0 && < 1.5,
+    random < 1.2,
+    transformers
+
+benchmark set-benchmarks
+  type: exitcode-stdio-1.0
+  hs-source-dirs: benchmarks
+  main-is: Set.hs
+  ghc-options: -O2
+  build-depends:
+    base >= 4.2 && < 5,
+    containers,
+    criterion >= 0.4.0 && < 1.2,
+    deepseq >= 1.1.0.0 && < 1.5
+
+benchmark set-operations-intmap
+  type: exitcode-stdio-1.0
+  hs-source-dirs: benchmarks/SetOperations
+  main-is: SetOperations-IntMap.hs
+  ghc-options: -O2
+  build-depends:
+    base >= 4.2 && < 5,
+    containers,
+    criterion >= 0.4.0 && < 1.2
+
+benchmark set-operations-intset
+  type: exitcode-stdio-1.0
+  hs-source-dirs: benchmarks/SetOperations
+  main-is: SetOperations-IntSet.hs
+  ghc-options: -O2
+  build-depends:
+    base >= 4.2 && < 5,
+    containers,
+    criterion >= 0.4.0 && < 1.2
+
+benchmark set-operations-map
+  type: exitcode-stdio-1.0
+  hs-source-dirs: benchmarks/SetOperations
+  main-is: SetOperations-Map.hs
+  ghc-options: -O2
+  build-depends:
+    base >= 4.2 && < 5,
+    containers,
+    criterion >= 0.4.0 && < 1.2
+
+benchmark set-operations-set
+  type: exitcode-stdio-1.0
+  hs-source-dirs: benchmarks/SetOperations
+  main-is: SetOperations-Set.hs
+  ghc-options: -O2
+  build-depends:
+    base >= 4.2 && < 5,
+    containers,
+    criterion >= 0.4.0 && < 1.2
+
+benchmark lookupge-intmap
+  type: exitcode-stdio-1.0
+  hs-source-dirs: benchmarks/LookupGE, .
+  main-is: IntMap.hs
+  ghc-options: -O2
+  cpp-options: -DTESTING
+  other-modules:
+    Data.IntMap.Internal
+  build-depends:
+    base >= 4.2 && < 5,
+    containers,
+    criterion >= 0.4.0 && < 1.2,
+    deepseq >= 1.1.0.0 && < 1.5,
+    ghc-prim
+
+benchmark lookupge-map
+  type: exitcode-stdio-1.0
+  hs-source-dirs: benchmarks/LookupGE, .
+  main-is: Map.hs
+  ghc-options: -O2
+  cpp-options: -DTESTING
+  other-modules:
+    Data.Map.Internal
+  build-depends:
+    base >= 4.2 && < 5,
+    containers,
+    criterion >= 0.4.0 && < 1.2,
+    deepseq >= 1.1.0.0 && < 1.5,
+    ghc-prim
 
 -------------------
 -- T E S T I N G --
@@ -72,28 +218,24 @@ Library
 -- Every test-suite contains the build-depends and options of the library,
 -- plus the testing stuff.
 
--- Because the test-suites cannot contain conditionals in GHC 7.0, the extensions
--- are switched on for every compiler to allow GHC < 7.0 to compile the tests
--- (because GHC < 7.0 cannot handle conditional LANGUAGE pragmas).
--- When testing with GHC < 7.0 is not needed, the extensions should be removed.
-
 Test-suite map-lazy-properties
     hs-source-dirs: tests, .
     main-is: map-properties.hs
     type: exitcode-stdio-1.0
     cpp-options: -DTESTING
 
-    build-depends: base >= 4.2 && < 5, array, deepseq >= 1.2 && < 1.5, ghc-prim
+    build-depends: base >= 4.3 && < 5, array, deepseq >= 1.2 && < 1.5, ghc-prim
     ghc-options: -O2
+    other-extensions: CPP, BangPatterns
     include-dirs: include
-    extensions: MagicHash, DeriveDataTypeable, StandaloneDeriving, Rank2Types
 
     build-depends:
         HUnit,
         QuickCheck,
         test-framework,
         test-framework-hunit,
-        test-framework-quickcheck2
+        test-framework-quickcheck2,
+        transformers
 
 Test-suite map-strict-properties
     hs-source-dirs: tests, .
@@ -101,16 +243,33 @@ Test-suite map-strict-properties
     type: exitcode-stdio-1.0
     cpp-options: -DTESTING -DSTRICT
 
-    build-depends: base >= 4.2 && < 5, array, deepseq >= 1.2 && < 1.5, ghc-prim
+    build-depends: base >= 4.3 && < 5, array, deepseq >= 1.2 && < 1.5, ghc-prim
     ghc-options: -O2
+    other-extensions: CPP, BangPatterns
     include-dirs: include
-    extensions: MagicHash, DeriveDataTypeable, StandaloneDeriving, Rank2Types
 
     build-depends:
         HUnit,
         QuickCheck,
         test-framework,
         test-framework-hunit,
+        test-framework-quickcheck2,
+        transformers
+
+Test-suite bitqueue-properties
+    hs-source-dirs: tests, .
+    main-is: bitqueue-properties.hs
+    type: exitcode-stdio-1.0
+    cpp-options: -DTESTING
+
+    build-depends: base >= 4.3 && < 5, ghc-prim
+    ghc-options: -O2
+    other-extensions: CPP, BangPatterns
+    include-dirs: include
+
+    build-depends:
+        QuickCheck,
+        test-framework,
         test-framework-quickcheck2
 
 Test-suite set-properties
@@ -119,17 +278,18 @@ Test-suite set-properties
     type: exitcode-stdio-1.0
     cpp-options: -DTESTING
 
-    build-depends: base >= 4.2 && < 5, array, deepseq >= 1.2 && < 1.5, ghc-prim
+    build-depends: base >= 4.3 && < 5, array, deepseq >= 1.2 && < 1.5, ghc-prim
     ghc-options: -O2
+    other-extensions: CPP, BangPatterns
     include-dirs: include
-    extensions: MagicHash, DeriveDataTypeable, StandaloneDeriving, Rank2Types
 
     build-depends:
         HUnit,
         QuickCheck,
         test-framework,
         test-framework-hunit,
-        test-framework-quickcheck2
+        test-framework-quickcheck2,
+        transformers
 
 Test-suite intmap-lazy-properties
     hs-source-dirs: tests, .
@@ -137,10 +297,10 @@ Test-suite intmap-lazy-properties
     type: exitcode-stdio-1.0
     cpp-options: -DTESTING
 
-    build-depends: base >= 4.2 && < 5, array, deepseq >= 1.2 && < 1.5, ghc-prim
+    build-depends: base >= 4.3 && < 5, array, deepseq >= 1.2 && < 1.5, ghc-prim
     ghc-options: -O2
+    other-extensions: CPP, BangPatterns
     include-dirs: include
-    extensions: MagicHash, DeriveDataTypeable, StandaloneDeriving, Rank2Types
 
     build-depends:
         HUnit,
@@ -155,10 +315,10 @@ Test-suite intmap-strict-properties
     type: exitcode-stdio-1.0
     cpp-options: -DTESTING -DSTRICT
 
-    build-depends: base >= 4.2 && < 5, array, deepseq >= 1.2 && < 1.5, ghc-prim
+    build-depends: base >= 4.3 && < 5, array, deepseq >= 1.2 && < 1.5, ghc-prim
     ghc-options: -O2
+    other-extensions: CPP, BangPatterns
     include-dirs: include
-    extensions: MagicHash, DeriveDataTypeable, StandaloneDeriving, Rank2Types
 
     build-depends:
         HUnit,
@@ -173,10 +333,10 @@ Test-suite intset-properties
     type: exitcode-stdio-1.0
     cpp-options: -DTESTING
 
-    build-depends: base >= 4.2 && < 5, array, deepseq >= 1.2 && < 1.5, ghc-prim
+    build-depends: base >= 4.3 && < 5, array, deepseq >= 1.2 && < 1.5, ghc-prim
     ghc-options: -O2
+    other-extensions: CPP, BangPatterns
     include-dirs: include
-    extensions: MagicHash, DeriveDataTypeable, StandaloneDeriving, Rank2Types
 
     build-depends:
         HUnit,
@@ -191,10 +351,10 @@ Test-suite deprecated-properties
     type: exitcode-stdio-1.0
     cpp-options: -DTESTING
 
-    build-depends: base >= 4.2 && < 5, array, deepseq >= 1.2 && < 1.5, ghc-prim
+    build-depends: base >= 4.3 && < 5, array, deepseq >= 1.2 && < 1.5, ghc-prim
     ghc-options: -O2
+    other-extensions: CPP, BangPatterns
     include-dirs: include
-    extensions: MagicHash, DeriveDataTypeable, StandaloneDeriving, Rank2Types
 
     build-depends:
         QuickCheck,
@@ -207,15 +367,16 @@ Test-suite seq-properties
     type: exitcode-stdio-1.0
     cpp-options: -DTESTING
 
-    build-depends: base >= 4.2 && < 5, array, deepseq >= 1.2 && < 1.5, ghc-prim
+    build-depends: base >= 4.3 && < 5, array, deepseq >= 1.2 && < 1.5, ghc-prim
     ghc-options: -O2
+    other-extensions: CPP, BangPatterns
     include-dirs: include
-    extensions: MagicHash, DeriveDataTypeable, StandaloneDeriving, Rank2Types
 
     build-depends:
         QuickCheck,
         test-framework,
-        test-framework-quickcheck2
+        test-framework-quickcheck2,
+        transformers
 
 test-suite map-strictness-properties
   hs-source-dirs: tests, .
@@ -224,7 +385,7 @@ test-suite map-strictness-properties
 
   build-depends:
     array,
-    base >= 4.2 && < 5,
+    base >= 4.3 && < 5,
     ChasingBottoms,
     deepseq >= 1.2 && < 1.5,
     QuickCheck >= 2.4.0.1,
@@ -233,16 +394,18 @@ test-suite map-strictness-properties
     test-framework-quickcheck2 >= 0.2.9
 
   ghc-options: -Wall
+  other-extensions: CPP, BangPatterns
   include-dirs: include
 
 test-suite intmap-strictness-properties
   hs-source-dirs: tests, .
   main-is: intmap-strictness.hs
   type: exitcode-stdio-1.0
+  other-extensions: CPP, BangPatterns
 
   build-depends:
     array,
-    base >= 4.2 && < 5,
+    base >= 4.3 && < 5,
     ChasingBottoms,
     deepseq >= 1.2 && < 1.5,
     QuickCheck >= 2.4.0.1,
@@ -257,10 +420,11 @@ test-suite intset-strictness-properties
   hs-source-dirs: tests, .
   main-is: intset-strictness.hs
   type: exitcode-stdio-1.0
+  other-extensions: CPP, BangPatterns
 
   build-depends:
     array,
-    base >= 4.2 && < 5,
+    base >= 4.3 && < 5,
     ChasingBottoms,
     deepseq >= 1.2 && < 1.5,
     QuickCheck >= 2.4.0.1,

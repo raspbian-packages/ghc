@@ -51,8 +51,10 @@ import Module
 
 import Maybes
 import UniqSupply       ( UniqSupply, mkSplitUniqSupply, splitUniqSupply )
+import UniqFM
 import Outputable
 import Control.Monad
+import qualified GHC.LanguageExtensions as LangExt
 
 #ifdef GHCI
 import DynamicLoading   ( loadPlugins )
@@ -130,6 +132,8 @@ getCoreToDo dflags
     rules_on      = gopt Opt_EnableRewriteRules           dflags
     eta_expand_on = gopt Opt_DoLambdaEtaExpansion         dflags
     ww_on         = gopt Opt_WorkerWrapper                dflags
+    vectorise_on  = gopt Opt_Vectorise                    dflags
+    static_ptrs   = xopt LangExt.StaticPointers           dflags
 
     maybe_rule_check phase = runMaybe rule_check (CoreDoRuleCheck phase)
 
@@ -157,12 +161,12 @@ getCoreToDo dflags
           --  We need to eliminate these common sub expressions before their definitions
           --  are inlined in phase 2. The CSE introduces lots of  v1 = v2 bindings,
           --  so we also run simpl_gently to inline them.
-      ++  (if gopt Opt_Vectorise dflags && phase == 3
+      ++  (if vectorise_on && phase == 3
             then [CoreCSE, simpl_gently]
             else [])
 
     vectorisation
-      = runWhen (gopt Opt_Vectorise dflags) $
+      = runWhen vectorise_on $
           CoreDoPasses [ simpl_gently, CoreDoVectorisation ]
 
                 -- By default, we have 2 phases before phase 0.
@@ -185,7 +189,8 @@ getCoreToDo dflags
                        (base_mode { sm_phase = InitialPhase
                                   , sm_names = ["Gentle"]
                                   , sm_rules = rules_on   -- Note [RULEs enabled in SimplGently]
-                                  , sm_inline = False
+                                  , sm_inline = not vectorise_on
+                                              -- See Note [Inline in InitialPhase]
                                   , sm_case_case = False })
                           -- Don't do case-of-case transformations.
                           -- This makes full laziness work better
@@ -201,10 +206,25 @@ getCoreToDo dflags
                            [simpl_phase 0 ["post-worker-wrapper"] max_iter]
                            ))
 
+    -- Static forms are moved to the top level with the FloatOut pass.
+    -- See Note [Grand plan for static forms] in StaticPtrTable.
+    static_ptrs_float_outwards =
+      runWhen static_ptrs $ CoreDoPasses
+        [ simpl_gently -- Float Out can't handle type lets (sometimes created
+                       -- by simpleOptPgm via mkParallelBindings)
+        , CoreDoFloatOutwards FloatOutSwitches
+          { floatOutLambdas   = Just 0
+          , floatOutConstants = True
+          , floatOutOverSatApps = False
+          , floatToTopLevelOnly = True
+          }
+        ]
+
     core_todo =
      if opt_level == 0 then
-       [ vectorisation
-       , CoreDoSimplify max_iter
+       [ vectorisation,
+         static_ptrs_float_outwards,
+         CoreDoSimplify max_iter
              (base_mode { sm_phase = Phase 0
                         , sm_names = ["Non-opt simplification"] })
        ]
@@ -228,11 +248,12 @@ getCoreToDo dflags
         -- so that overloaded functions have all their dictionary lambdas manifest
         runWhen do_specialise CoreDoSpecialising,
 
-        runWhen full_laziness $
+        if full_laziness then
            CoreDoFloatOutwards FloatOutSwitches {
                                  floatOutLambdas   = Just 0,
                                  floatOutConstants = True,
-                                 floatOutOverSatApps = False },
+                                 floatOutOverSatApps = False,
+                                 floatToTopLevelOnly = False }
                 -- Was: gentleFloatOutSwitches
                 --
                 -- I have no idea why, but not floating constants to
@@ -250,6 +271,11 @@ getCoreToDo dflags
                 -- difference at all to performance if we do it here,
                 -- but maybe we save some unnecessary to-and-fro in
                 -- the simplifier.
+        else
+           -- Even with full laziness turned off, we still need to float static
+           -- forms to the top level. See Note [Grand plan for static forms] in
+           -- StaticPtrTable.
+           static_ptrs_float_outwards,
 
         simpl_phases,
 
@@ -283,7 +309,8 @@ getCoreToDo dflags
            CoreDoFloatOutwards FloatOutSwitches {
                                  floatOutLambdas     = floatLamArgs dflags,
                                  floatOutConstants   = True,
-                                 floatOutOverSatApps = True },
+                                 floatOutOverSatApps = True,
+                                 floatToTopLevelOnly = False },
                 -- nofib/spectral/hartel/wang doubles in speed if you
                 -- do full laziness late in the day.  It only happens
                 -- after fusion and other stuff, so the early pass doesn't
@@ -306,7 +333,7 @@ getCoreToDo dflags
             CoreLiberateCase,
             simpl_phase 0 ["post-liberate-case"] max_iter
             ]),         -- Run the simplifier after LiberateCase to vastly
-                        -- reduce the possiblility of shadowing
+                        -- reduce the possibility of shadowing
                         -- Reason: see Note [Shadowing] in SpecConstr.hs
 
         runWhen spec_constr CoreDoSpecConstr,
@@ -320,6 +347,13 @@ getCoreToDo dflags
             strictness_pass ++
             [simpl_phase 0 ["post-late-ww"] max_iter]
           ),
+
+        -- Final run of the demand_analyser, ensures that one-shot thunks are
+        -- really really one-shot thunks. Only needed if the demand analyser
+        -- has run at all. See Note [Final Demand Analyser run] in DmdAnal
+        -- It is EXTREMELY IMPORTANT to run this pass, otherwise execution
+        -- can become /exponentially/ more expensive. See Trac #11731, #12996.
+        runWhen (strictness || late_dmd_anal) CoreDoStrictness,
 
         maybe_rule_check (Phase 0)
      ]
@@ -349,7 +383,51 @@ addPluginPasses builtin_passes
     query_plug todos (_, plug, options) = installCoreToDos plug options todos
 #endif
 
-{-
+{- Note [Inline in InitialPhase]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In GHC 8 and earlier we did not inline anything in the InitialPhase. But that is
+confusing for users because when they say INLINE they expect the function to inline
+right away.
+
+So now we do inlining immediately, even in the InitialPhase, assuming that the
+Id's Activation allows it.
+
+This is a surprisingly big deal. Compiler performance improved a lot
+when I made this change:
+
+   perf/compiler/T5837.run            T5837 [stat too good] (normal)
+   perf/compiler/parsing001.run       parsing001 [stat too good] (normal)
+   perf/compiler/T12234.run           T12234 [stat too good] (optasm)
+   perf/compiler/T9020.run            T9020 [stat too good] (optasm)
+   perf/compiler/T3064.run            T3064 [stat too good] (normal)
+   perf/compiler/T9961.run            T9961 [stat too good] (normal)
+   perf/compiler/T13056.run           T13056 [stat too good] (optasm)
+   perf/compiler/T9872d.run           T9872d [stat too good] (normal)
+   perf/compiler/T783.run             T783 [stat too good] (normal)
+   perf/compiler/T12227.run           T12227 [stat too good] (normal)
+   perf/should_run/lazy-bs-alloc.run  lazy-bs-alloc [stat too good] (normal)
+   perf/compiler/T1969.run            T1969 [stat too good] (normal)
+   perf/compiler/T9872a.run           T9872a [stat too good] (normal)
+   perf/compiler/T9872c.run           T9872c [stat too good] (normal)
+   perf/compiler/T9872b.run           T9872b [stat too good] (normal)
+   perf/compiler/T9872d.run           T9872d [stat too good] (normal)
+
+Note [RULEs enabled in SimplGently]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+RULES are enabled when doing "gentle" simplification.  Two reasons:
+
+  * We really want the class-op cancellation to happen:
+        op (df d1 d2) --> $cop3 d1 d2
+    because this breaks the mutual recursion between 'op' and 'df'
+
+  * I wanted the RULE
+        lift String ===> ...
+    to work in Template Haskell when simplifying
+    splices, so we get simpler code for literal strings
+
+But watch out: list fusion can prevent floating.  So use phase control
+to switch off those rules until after floating.
+
 ************************************************************************
 *                                                                      *
                   The CoreToDo interpreter
@@ -384,7 +462,7 @@ doCorePass CoreLiberateCase          = {-# SCC "LiberateCase" #-}
                                        doPassD liberateCase
 
 doCorePass CoreDoFloatInwards        = {-# SCC "FloatInwards" #-}
-                                       doPassD floatInwards
+                                       floatInwards
 
 doCorePass (CoreDoFloatOutwards f)   = {-# SCC "FloatOutwards" #-}
                                        doPassDUM (floatOutwards f)
@@ -441,8 +519,8 @@ ruleCheckPass current_phase pat guts =
     { rb <- getRuleBase
     ; dflags <- getDynFlags
     ; vis_orphs <- getVisibleOrphanMods
-    ; liftIO $ log_action dflags dflags NoReason Err.SevDump noSrcSpan
-                   defaultDumpStyle
+    ; liftIO $ putLogMsg dflags NoReason Err.SevDump noSrcSpan
+                   (defaultDumpStyle dflags)
                    (ruleCheckProgram current_phase pat
                       (RuleEnv rb vis_orphs) (mg_binds guts))
     ; return guts }
@@ -513,7 +591,7 @@ simplifyExpr :: DynFlags -- includes spec of what core-to-core passes to do
 --
 -- Also used by Template Haskell
 simplifyExpr dflags expr
-  = withTiming (return dflags) (text "Simplify [expr]") (const ()) $
+  = withTiming (pure dflags) (text "Simplify [expr]") (const ()) $
     do  {
         ; us <-  mkSplitUniqSupply 's'
 
@@ -642,10 +720,10 @@ simplifyPgmIO pass@(CoreDoSimplify max_iterations mode)
                    -- (In contrast to automatically vectorised variables, their unvectorised versions
                    -- don't depend on them.)
                  vectVars = mkVarSet $
-                              catMaybes [ fmap snd $ lookupVarEnv (vectInfoVar (mg_vect_info guts)) bndr
+                              catMaybes [ fmap snd $ lookupDVarEnv (vectInfoVar (mg_vect_info guts)) bndr
                                         | Vect bndr _ <- mg_vect_decls guts]
                               ++
-                              catMaybes [ fmap snd $ lookupVarEnv (vectInfoVar (mg_vect_info guts)) bndr
+                              catMaybes [ fmap snd $ lookupDVarEnv (vectInfoVar (mg_vect_info guts)) bndr
                                         | bndr <- bindersOfBinds binds]
                                         -- FIXME: This second comprehensions is only needed as long as we
                                         --        have vectorised bindings where we get "Could NOT call
@@ -891,7 +969,10 @@ shortOutIndirections binds
   where
     ind_env            = makeIndEnv binds
     -- These exported Ids are the subjects  of the indirection-elimination
-    exp_ids            = map fst $ varEnvElts ind_env
+    exp_ids            = map fst $ nonDetEltsUFM ind_env
+      -- It's OK to use nonDetEltsUFM here because we forget the ordering
+      -- by immediately converting to a set or check if all the elements
+      -- satisfy a predicate.
     exp_id_set         = mkVarSet exp_ids
     no_need_to_flatten = all (null . ruleInfoRules . idSpecialisation) exp_ids
     binds'             = concatMap zap binds

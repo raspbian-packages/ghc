@@ -15,6 +15,18 @@
 /* The alignment of a `int'. */
 #undef ALIGNMENT_INT
 
+/* The alignment of a `int16_t'. */
+#undef ALIGNMENT_INT16_T
+
+/* The alignment of a `int32_t'. */
+#undef ALIGNMENT_INT32_T
+
+/* The alignment of a `int64_t'. */
+#undef ALIGNMENT_INT64_T
+
+/* The alignment of a `int8_t'. */
+#undef ALIGNMENT_INT8_T
+
 /* The alignment of a `long'. */
 #undef ALIGNMENT_LONG
 
@@ -23,6 +35,18 @@
 
 /* The alignment of a `short'. */
 #undef ALIGNMENT_SHORT
+
+/* The alignment of a `uint16_t'. */
+#undef ALIGNMENT_UINT16_T
+
+/* The alignment of a `uint32_t'. */
+#undef ALIGNMENT_UINT32_T
+
+/* The alignment of a `uint64_t'. */
+#undef ALIGNMENT_UINT64_T
+
+/* The alignment of a `uint8_t'. */
+#undef ALIGNMENT_UINT8_T
 
 /* The alignment of a `unsigned char'. */
 #undef ALIGNMENT_UNSIGNED_CHAR
@@ -149,6 +173,9 @@
 /* Define to 1 if you need to link with libm */
 #undef HAVE_LIBM
 
+/* Define to 1 if you have libnuma */
+#undef HAVE_LIBNUMA
+
 /* Define to 1 if you have the `pthread' library (-lpthread). */
 #undef HAVE_LIBPTHREAD
 
@@ -172,6 +199,12 @@
 
 /* Define to 1 if you have the <nlist.h> header file. */
 #undef HAVE_NLIST_H
+
+/* Define to 1 if you have the <numaif.h> header file. */
+#undef HAVE_NUMAIF_H
+
+/* Define to 1 if you have the <numa.h> header file. */
+#undef HAVE_NUMA_H
 
 /* Define to 1 if we have printf$LDBLStub (Apple Mac OS >= 10.4, PPC). */
 #undef HAVE_PRINTF_LDBLSTUB
@@ -245,6 +278,9 @@
 /* Define to 1 if you have the <sys/timeb.h> header file. */
 #undef HAVE_SYS_TIMEB_H
 
+/* Define to 1 if you have the <sys/timerfd.h> header file. */
+#undef HAVE_SYS_TIMERFD_H
+
 /* Define to 1 if you have the <sys/timers.h> header file. */
 #undef HAVE_SYS_TIMERS_H
 
@@ -306,6 +342,9 @@
    */
 #undef LEADING_UNDERSCORE
 
+/* Define 1 if we need to link code using pthreads with -lpthread */
+#undef NEED_PTHREAD_LIB
+
 /* Define to the address where bug reports for this package should be sent. */
 #undef PACKAGE_BUGREPORT
 
@@ -324,6 +363,9 @@
 /* Define to the version of this package. */
 #undef PACKAGE_VERSION
 
+/* Use mmap in the runtime linker */
+#undef RTS_LINKER_USE_MMAP
+
 /* The size of `char', as computed by sizeof. */
 #undef SIZEOF_CHAR
 
@@ -336,6 +378,18 @@
 /* The size of `int', as computed by sizeof. */
 #undef SIZEOF_INT
 
+/* The size of `int16_t', as computed by sizeof. */
+#undef SIZEOF_INT16_T
+
+/* The size of `int32_t', as computed by sizeof. */
+#undef SIZEOF_INT32_T
+
+/* The size of `int64_t', as computed by sizeof. */
+#undef SIZEOF_INT64_T
+
+/* The size of `int8_t', as computed by sizeof. */
+#undef SIZEOF_INT8_T
+
 /* The size of `long', as computed by sizeof. */
 #undef SIZEOF_LONG
 
@@ -344,6 +398,18 @@
 
 /* The size of `short', as computed by sizeof. */
 #undef SIZEOF_SHORT
+
+/* The size of `uint16_t', as computed by sizeof. */
+#undef SIZEOF_UINT16_T
+
+/* The size of `uint32_t', as computed by sizeof. */
+#undef SIZEOF_UINT32_T
+
+/* The size of `uint64_t', as computed by sizeof. */
+#undef SIZEOF_UINT64_T
+
+/* The size of `uint8_t', as computed by sizeof. */
+#undef SIZEOF_UINT8_T
 
 /* The size of `unsigned char', as computed by sizeof. */
 #undef SIZEOF_UNSIGNED_CHAR
@@ -379,6 +445,9 @@
 
 /* Enable single heap address space support */
 #undef USE_LARGE_ADDRESS_SPACE
+
+/* Set to 1 to use libdw */
+#undef USE_LIBDW
 
 /* Enable extensions on AIX 3, Interix.  */
 #ifndef _ALL_SOURCE

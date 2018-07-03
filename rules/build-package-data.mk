@@ -113,7 +113,7 @@ $1_$2_CONFIGURE_OPTS += $$(if $$(HAPPY),--with-happy="$$(HAPPY)")
 ifneq "$$(BINDIST)" "YES"
 ifneq "$$(NO_GENERATED_MAKEFILE_RULES)" "YES"
 $1/$2/inplace-pkg-config : $1/$2/package-data.mk
-$1/$2/build/autogen/cabal_macros.h : $1/$2/package-data.mk
+$1/$2/build/$$(or $$($1_EXECUTABLE),$$($1_$2_PROGNAME),.)/autogen/cabal_macros.h : $1/$2/package-data.mk
 
 # This rule configures the package, generates the package-data.mk file
 # for our build system, and registers the package for use in-place in
@@ -129,7 +129,7 @@ endif
 endif
 	"$$(ghc-cabal_INPLACE)" configure $1 $2 "$$($1_$2_dll0_MODULES)" --with-ghc="$$($1_$2_HC_CONFIG)" --with-ghc-pkg="$$($1_$2_GHC_PKG)" $$($1_CONFIGURE_OPTS) $$($1_$2_CONFIGURE_OPTS)
 ifeq "$$($1_$2_PROG)" ""
-	$$(call cmd,$1_$2_GHC_PKG) update --force $$($1_$2_GHC_PKG_OPTS) $1/$2/inplace-pkg-config
+	$$(call cmd,$1_$2_GHC_PKG) update -v0 --force $$($1_$2_GHC_PKG_OPTS) $1/$2/inplace-pkg-config
 endif
 endif # NO_GENERATED_MAKEFILE_RULES
 endif # BINDIST

@@ -20,8 +20,16 @@ compilerDebuggingOptions =
          , flagDescription = "Dump interpreter byte code"
          , flagType = DynamicFlag
          }
+  , flag { flagName = "-ddump-cmm-from-stg"
+         , flagDescription = "Dump STG-to-C-- output"
+         , flagType = DynamicFlag
+         }
+  , flag { flagName = "-ddump-cmm-verbose"
+         , flagDescription = "Show output from each C-- pipeline pass"
+         , flagType = DynamicFlag
+         }
   , flag { flagName = "-ddump-cmm"
-         , flagDescription = "Dump C-- output"
+         , flagDescription = "Dump the final C-- output"
          , flagType = DynamicFlag
          }
   , flag { flagName = "-ddump-core-stats"
@@ -128,7 +136,7 @@ compilerDebuggingOptions =
          , flagDescription = "Dump typechecker output"
          , flagType = DynamicFlag
          }
-  , flag { flagName = "-dth-dec-file"
+  , flag { flagName = "-dth-dec-file=⟨file⟩"
          , flagDescription =
            "Show evaluated TH declarations in a .th.hs file"
          , flagType = DynamicFlag
@@ -167,18 +175,18 @@ compilerDebuggingOptions =
          }
   , flag { flagName = "-dno-debug-output"
          , flagDescription = "Suppress unsolicited debugging output"
-         , flagType = StaticFlag
+         , flagType = DynamicFlag
          }
   , flag { flagName = "-dppr-debug"
          , flagDescription = "Turn on debug printing (more verbose)"
-         , flagType = StaticFlag
+         , flagType = DynamicFlag
          }
   , flag { flagName = "-dppr-user-length"
          , flagDescription =
            "Set the depth for printing expressions in error msgs"
          , flagType = DynamicFlag
          }
-  , flag { flagName = "-dppr-cols⟨N⟩"
+  , flag { flagName = "-dppr-cols=⟨n⟩"
          , flagDescription =
            "Set the width of debugging output. For example ``-dppr-cols200``"
          , flagType = DynamicFlag

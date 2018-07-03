@@ -1,7 +1,14 @@
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+
 module Distribution.Simple.Test.ExeV10
        ( runTest
        ) where
 
+import Prelude ()
+import Distribution.Compat.Prelude
+
+import Distribution.Types.UnqualComponentName
 import Distribution.Compat.CreatePipe
 import Distribution.Compat.Environment
 import qualified Distribution.PackageDescription as PD
@@ -11,6 +18,7 @@ import Distribution.Simple.Compiler
 import Distribution.Simple.Hpc
 import Distribution.Simple.InstallDirs
 import qualified Distribution.Simple.LocalBuildInfo as LBI
+import qualified Distribution.Types.LocalBuildInfo as LBI
 import Distribution.Simple.Setup
 import Distribution.Simple.Test.Log
 import Distribution.Simple.Utils
@@ -20,7 +28,6 @@ import Distribution.Text
 import Distribution.Verbosity
 
 import Control.Concurrent (forkIO)
-import Control.Monad ( unless, void, when )
 import System.Directory
     ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist
     , getCurrentDirectory, removeDirectoryRecursive )
@@ -30,22 +37,23 @@ import System.IO ( hGetContents, hPutStr, stdout, stderr )
 
 runTest :: PD.PackageDescription
         -> LBI.LocalBuildInfo
+        -> LBI.ComponentLocalBuildInfo
         -> TestFlags
         -> PD.TestSuite
         -> IO TestSuiteLog
-runTest pkg_descr lbi flags suite = do
-    let isCoverageEnabled = fromFlag $ configCoverage $ LBI.configFlags lbi
+runTest pkg_descr lbi clbi flags suite = do
+    let isCoverageEnabled = LBI.testCoverage lbi
         way = guessWay lbi
-        tixDir_ = tixDir distPref way $ PD.testName suite
+        tixDir_ = tixDir distPref way testName'
 
     pwd <- getCurrentDirectory
     existingEnv <- getEnvironment
 
-    let cmd = LBI.buildDir lbi </> PD.testName suite
-                  </> PD.testName suite <.> exeExtension
+    let cmd = LBI.buildDir lbi </> testName'
+                  </> testName' <.> exeExtension
     -- Check that the test executable exists.
     exists <- doesFileExist cmd
-    unless exists $ die $ "Error: Could not find test program \"" ++ cmd
+    unless exists $ die' verbosity $ "Error: Could not find test program \"" ++ cmd
                           ++ "\". Did you build the package first?"
 
     -- Remove old .tix files if appropriate.
@@ -57,7 +65,7 @@ runTest pkg_descr lbi flags suite = do
     createDirectoryIfMissing True tixDir_
 
     -- Write summary notices indicating start of test suite
-    notice verbosity $ summarizeSuiteStart $ PD.testName suite
+    notice verbosity $ summarizeSuiteStart $ testName'
 
     (wOut, wErr, logText) <- case details of
         Direct -> return (stdout, stderr, "")
@@ -78,7 +86,7 @@ runTest pkg_descr lbi flags suite = do
     let opts = map (testOption pkg_descr lbi suite)
                    (testOptions flags)
         dataDirPath = pwd </> PD.dataDir pkg_descr
-        tixFile = pwd </> tixFilePath distPref way (PD.testName suite)
+        tixFile = pwd </> tixFilePath distPref way (testName')
         pkgPathEnv = (pkgPathEnvVar pkg_descr "datadir", dataDirPath)
                    : existingEnv
         shellEnv = [("HPCTIXFILE", tixFile) | isCoverageEnabled] ++ pkgPathEnv
@@ -86,8 +94,6 @@ runTest pkg_descr lbi flags suite = do
     -- Add (DY)LD_LIBRARY_PATH if needed
     shellEnv' <- if LBI.withDynExe lbi
                     then do let (Platform _ os) = LBI.hostPlatform lbi
-                                clbi = LBI.getComponentLocalBuildInfo lbi
-                                         (LBI.CTestName (PD.testName suite))
                             paths <- LBI.depLibraryPaths True False lbi clbi
                             return (addLibraryPath os paths shellEnv)
                     else return shellEnv
@@ -101,7 +107,7 @@ runTest pkg_descr lbi flags suite = do
     let suiteLog = buildLog exit
 
     -- Write summary notice to log file indicating start of test suite
-    appendFile (logFile suiteLog) $ summarizeSuiteStart $ PD.testName suite
+    appendFile (logFile suiteLog) $ summarizeSuiteStart $ testName'
 
     -- Append contents of temporary log file to the final human-
     -- readable log file
@@ -127,6 +133,8 @@ runTest pkg_descr lbi flags suite = do
 
     return suiteLog
   where
+    testName' = unUnqualComponentName $ PD.testName suite
+
     distPref = fromFlag $ testDistPref flags
     verbosity = fromFlag $ testVerbosity flags
     details = fromFlag $ testShowDetails flags
@@ -136,19 +144,19 @@ runTest pkg_descr lbi flags suite = do
         let r = case exit of
                     ExitSuccess -> Pass
                     ExitFailure c -> Fail $ "exit code: " ++ show c
-            n = PD.testName suite
+            --n = unUnqualComponentName $ PD.testName suite
             l = TestLog
-                { testName = n
+                { testName = testName'
                 , testOptionsReturned = []
                 , testResult = r
                 }
         in TestSuiteLog
-                { testSuiteName = n
+                { testSuiteName = PD.testName suite
                 , testLogs = l
                 , logFile =
                     testLogDir
                     </> testSuiteLogPath (fromFlag $ testHumanLog flags)
-                                         pkg_descr lbi n l
+                                         pkg_descr lbi testName' l
                 }
 
 -- TODO: This is abusing the notion of a 'PathTemplate'.  The result isn't
@@ -164,4 +172,4 @@ testOption pkg_descr lbi suite template =
     env = initialPathTemplateEnv
           (PD.package pkg_descr) (LBI.localUnitId lbi)
           (compilerInfo $ LBI.compiler lbi) (LBI.hostPlatform lbi) ++
-          [(TestSuiteNameVar, toPathTemplate $ PD.testName suite)]
+          [(TestSuiteNameVar, toPathTemplate $ unUnqualComponentName $ PD.testName suite)]

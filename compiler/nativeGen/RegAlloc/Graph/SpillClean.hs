@@ -33,6 +33,7 @@ import Instruction
 import Reg
 
 import BlockId
+import Hoopl
 import Cmm
 import UniqSet
 import UniqFM
@@ -43,10 +44,8 @@ import Platform
 
 import Data.List
 import Data.Maybe
-import Data.Map                 (Map)
-import Data.Set                 (Set)
-import qualified Data.Map       as Map
-import qualified Data.Set       as Set
+import Data.IntSet              (IntSet)
+import qualified Data.IntSet    as IntSet
 
 
 -- | The identification number of a spill slot.
@@ -309,7 +308,7 @@ cleanTopBackward cmm
 
 cleanBlockBackward
         :: Instruction instr
-        => Map BlockId (Set Int)
+        => BlockMap IntSet
         -> LiveBasicBlock instr
         -> CleanM (LiveBasicBlock instr)
 
@@ -321,7 +320,7 @@ cleanBlockBackward liveSlotsOnEntry (BasicBlock blockId instrs)
 
 cleanBackward
         :: Instruction instr
-        => Map BlockId (Set Int)    -- ^ Slots live on entry to each block
+        => BlockMap IntSet          -- ^ Slots live on entry to each block
         -> UniqSet Int              -- ^ Slots that have been spilled, but not reloaded from
         -> [LiveInstr instr]        -- ^ acc
         -> [LiveInstr instr]        -- ^ Instrs to clean (in forwards order)
@@ -334,7 +333,7 @@ cleanBackward liveSlotsOnEntry noReloads acc lis
 
 cleanBackward'
         :: Instruction instr
-        => Map BlockId (Set Int)
+        => BlockMap IntSet
         -> UniqFM [BlockId]
         -> UniqSet Int
         -> [LiveInstr instr]
@@ -381,14 +380,14 @@ cleanBackward' liveSlotsOnEntry reloadedBy noReloads acc (li : instrs)
         , targets               <- jumpDestsOfInstr instr
         = do
                 let slotsReloadedByTargets
-                        = Set.unions
+                        = IntSet.unions
                         $ catMaybes
-                        $ map (flip Map.lookup liveSlotsOnEntry)
+                        $ map (flip mapLookup liveSlotsOnEntry)
                         $ targets
 
                 let noReloads'
                         = foldl' delOneFromUniqSet noReloads
-                        $ Set.toList slotsReloadedByTargets
+                        $ IntSet.toList slotsReloadedByTargets
 
                 cleanBackward liveSlotsOnEntry noReloads' (li : acc) instrs
 
@@ -414,7 +413,8 @@ intersects assocs       = foldl1' intersectAssoc assocs
 findRegOfSlot :: Assoc Store -> Int -> Maybe Reg
 findRegOfSlot assoc slot
         | close                 <- closeAssoc (SSlot slot) assoc
-        , Just (SReg reg)       <- find isStoreReg $ uniqSetToList close
+        , Just (SReg reg)       <- find isStoreReg $ nonDetEltsUniqSet close
+           -- See Note [Unique Determinism and code generation]
         = Just reg
 
         | otherwise
@@ -549,7 +549,8 @@ delAssoc :: (Uniquable a)
 delAssoc a m
         | Just aSet     <- lookupUFM  m a
         , m1            <- delFromUFM m a
-        = foldUniqSet (\x m -> delAssoc1 x a m) m1 aSet
+        = nonDetFoldUniqSet (\x m -> delAssoc1 x a m) m1 aSet
+          -- It's OK to use nonDetFoldUFM here because deletion is commutative
 
         | otherwise     = m
 
@@ -581,7 +582,8 @@ closeAssoc a assoc
  =      closeAssoc' assoc emptyUniqSet (unitUniqSet a)
  where
         closeAssoc' assoc visited toVisit
-         = case uniqSetToList toVisit of
+         = case nonDetEltsUniqSet toVisit of
+             -- See Note [Unique Determinism and code generation]
 
                 -- nothing else to visit, we're done
                 []      -> visited

@@ -8,24 +8,29 @@ module Kind (
         -- ** Predicates on Kinds
         isLiftedTypeKind, isUnliftedTypeKind,
         isConstraintKind,
+        isTYPEApp,
         returnsTyCon, returnsConstraintKind,
         isConstraintKindCon,
         okArrowArgKind, okArrowResultKind,
 
         classifiesTypeWithValues,
         isStarKind, isStarKindSynonymTyCon,
-        isRuntimeRepPolymorphic
+        tcIsStarKind,
+        isKindLevPoly
        ) where
 
 #include "HsVersions.h"
 
-import {-# SOURCE #-} Type       ( typeKind, coreViewOneStarKind )
+import {-# SOURCE #-} Type    ( typeKind, coreView, tcView
+                              , splitTyConApp_maybe )
+import {-# SOURCE #-} DataCon ( DataCon )
 
 import TyCoRep
 import TyCon
-import VarSet ( isEmptyVarSet )
 import PrelNames
-import Util  ( (<&&>) )
+
+import Outputable
+import Util
 
 {-
 ************************************************************************
@@ -50,7 +55,7 @@ Constraint and *.  Indeed we can have coercions between the two. Consider
      op :: a -> a
 For this single-method class we may generate a newtype, which in turn
 generates an axiom witnessing
-    Ord a ~ (a -> a)
+    C a ~ (a -> a)
 so on the left we have Constraint, and on the right we have *.
 See Trac #7451.
 
@@ -67,29 +72,59 @@ isConstraintKindCon   tc = tyConUnique tc == constraintKindTyConKey
 isConstraintKind (TyConApp tc _) = isConstraintKindCon tc
 isConstraintKind _               = False
 
+isTYPEApp :: Kind -> Maybe DataCon
+isTYPEApp (TyConApp tc args)
+  | tc `hasKey` tYPETyConKey
+  , [arg] <- args
+  , Just (tc, []) <- splitTyConApp_maybe arg
+  , Just dc <- isPromotedDataCon_maybe tc
+  = Just dc
+isTYPEApp _ = Nothing
+
 -- | Does the given type "end" in the given tycon? For example @k -> [a] -> *@
 -- ends in @*@ and @Maybe a -> [a]@ ends in @[]@.
 returnsTyCon :: Unique -> Type -> Bool
 returnsTyCon tc_u (ForAllTy _ ty)  = returnsTyCon tc_u ty
+returnsTyCon tc_u (FunTy    _ ty)  = returnsTyCon tc_u ty
 returnsTyCon tc_u (TyConApp tc' _) = tc' `hasKey` tc_u
 returnsTyCon _  _                  = False
 
 returnsConstraintKind :: Kind -> Bool
 returnsConstraintKind = returnsTyCon constraintKindTyConKey
 
--- | Tests whether the given type (which should look like "TYPE ...") has any
--- free variables
-isRuntimeRepPolymorphic :: Kind -> Bool
-isRuntimeRepPolymorphic k
-  = not $ isEmptyVarSet $ tyCoVarsOfType k
+-- | Tests whether the given kind (which should look like @TYPE x@)
+-- is something other than a constructor tree (that is, constructors at every node).
+isKindLevPoly :: Kind -> Bool
+isKindLevPoly k = ASSERT2( isStarKind k || _is_type, ppr k )
+                      -- the isStarKind check is necessary b/c of Constraint
+                  go k
+  where
+    go ty | Just ty' <- coreView ty = go ty'
+    go TyVarTy{}         = True
+    go AppTy{}           = True  -- it can't be a TyConApp
+    go (TyConApp tc tys) = isFamilyTyCon tc || any go tys
+    go ForAllTy{}        = True
+    go (FunTy t1 t2)     = go t1 || go t2
+    go LitTy{}           = False
+    go CastTy{}          = True
+    go CoercionTy{}      = True
+
+    _is_type
+      | TyConApp typ [_] <- k
+      = typ `hasKey` tYPETyConKey
+      | otherwise
+      = False
+
 
 --------------------------------------------
 --            Kinding for arrow (->)
 -- Says when a kind is acceptable on lhs or rhs of an arrow
 --     arg -> res
+--
+-- See Note [Levity polymorphism]
 
 okArrowArgKind, okArrowResultKind :: Kind -> Bool
-okArrowArgKind = classifiesTypeWithValues <&&> (not . isRuntimeRepPolymorphic)
+okArrowArgKind    = classifiesTypeWithValues
 okArrowResultKind = classifiesTypeWithValues
 
 -----------------------------------------
@@ -103,19 +138,55 @@ okArrowResultKind = classifiesTypeWithValues
 -- like *, #, TYPE Lifted, TYPE v, Constraint.
 classifiesTypeWithValues :: Kind -> Bool
 -- ^ True of any sub-kind of OpenTypeKind
-classifiesTypeWithValues t | Just t' <- coreViewOneStarKind t = classifiesTypeWithValues t'
+classifiesTypeWithValues t | Just t' <- coreView t = classifiesTypeWithValues t'
 classifiesTypeWithValues (TyConApp tc [_]) = tc `hasKey` tYPETyConKey
 classifiesTypeWithValues _ = False
 
 -- | Is this kind equivalent to *?
+tcIsStarKind :: Kind -> Bool
+tcIsStarKind k | Just k' <- tcView k = isStarKind k'
+tcIsStarKind (TyConApp tc [TyConApp ptr_rep []])
+  =  tc      `hasKey` tYPETyConKey
+  && ptr_rep `hasKey` liftedRepDataConKey
+tcIsStarKind _ = False
+
+-- | Is this kind equivalent to *?
 isStarKind :: Kind -> Bool
-isStarKind k | Just k' <- coreViewOneStarKind k = isStarKind k'
+isStarKind k | Just k' <- coreView k = isStarKind k'
 isStarKind (TyConApp tc [TyConApp ptr_rep []])
   =  tc      `hasKey` tYPETyConKey
-  && ptr_rep `hasKey` ptrRepLiftedDataConKey
+  && ptr_rep `hasKey` liftedRepDataConKey
 isStarKind _ = False
                               -- See Note [Kind Constraint and kind *]
 
 -- | Is the tycon @Constraint@?
 isStarKindSynonymTyCon :: TyCon -> Bool
 isStarKindSynonymTyCon tc = tc `hasKey` constraintKindTyConKey
+
+
+{- Note [Levity polymorphism]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Is this type legal?
+   (a :: TYPE rep) -> Int
+   where 'rep :: RuntimeRep'
+
+You might think not, because no lambda can have a
+runtime-rep-polymorphic binder.  So no lambda has the
+above type.  BUT here's a way it can be useful (taken from
+Trac #12708):
+
+  data T rep (a :: TYPE rep)
+     = MkT (a -> Int)
+
+  x1 :: T LiftedRep Int
+  x1 =  MkT LiftedRep Int  (\x::Int -> 3)
+
+  x2 :: T IntRep Int#
+  x2 = MkT IntRep Int# (\x:Int# -> 3)
+
+Note that the lambdas are just fine!
+
+Hence, okArrowArgKind and okArrowResultKind both just
+check that the type is of the form (TYPE r) for some
+representation type r.
+-}

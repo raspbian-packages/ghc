@@ -1,8 +1,8 @@
-.. GHC Users Guide documentation master file, created by
+.. GHC User's Guide documentation master file, created by
 
 
-Welcome to the GHC Users Guide
-==============================
+Welcome to the GHC User's Guide
+===============================
 
 Contents:
 
@@ -12,8 +12,8 @@ Contents:
 
    license
    intro
-   8.0.1-notes
-   8.0.2-notes
+   8.2.1-notes
+   8.2.2-notes
    ghci
    runghc
    usage
@@ -27,6 +27,7 @@ Contents:
    utils
    win32-dlls
    bugs
+   eventlog-formats
    editing-guide
 
 

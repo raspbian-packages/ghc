@@ -43,24 +43,32 @@ newtype Const a b = Const { getConst :: a }
 
 -- | This instance would be equivalent to the derived instances of the
 -- 'Const' newtype if the 'runConst' field were removed
+--
+-- @since 4.8.0.0
 instance Read a => Read (Const a b) where
     readsPrec d = readParen (d > 10)
         $ \r -> [(Const x,t) | ("Const", s) <- lex r, (x, t) <- readsPrec 11 s]
 
 -- | This instance would be equivalent to the derived instances of the
 -- 'Const' newtype if the 'runConst' field were removed
+--
+-- @since 4.8.0.0
 instance Show a => Show (Const a b) where
     showsPrec d (Const x) = showParen (d > 10) $
                             showString "Const " . showsPrec 11 x
 
+-- | @since 4.7.0.0
 instance Foldable (Const m) where
     foldMap _ _ = mempty
 
+-- | @since 2.01
 instance Functor (Const m) where
     fmap _ (Const v) = Const v
 
+-- | @since 2.0.1
 instance Monoid m => Applicative (Const m) where
     pure _ = Const mempty
+    liftA2 _ (Const x) (Const y) = Const (x `mappend` y)
     (<*>) = coerce (mappend :: m -> m -> m)
 -- This is pretty much the same as
 -- Const f <*> Const v = Const (f `mappend` v)

@@ -59,6 +59,8 @@ module GHC.Conc.Sync
         , threadStatus
         , threadCapability
 
+        , newStablePtrPrimMVar, PrimMVar
+
         -- * Allocation counter and quota
         , setAllocationCounter
         , getAllocationCounter
@@ -89,7 +91,7 @@ module GHC.Conc.Sync
         , setUncaughtExceptionHandler
         , getUncaughtExceptionHandler
 
-        , reportError, reportStackOverflow
+        , reportError, reportStackOverflow, reportHeapOverflow
 
         , sharedCAF
         ) where
@@ -97,11 +99,7 @@ module GHC.Conc.Sync
 import Foreign
 import Foreign.C
 
-#ifndef mingw32_HOST_OS
-import Data.Dynamic
-#else
 import Data.Typeable
-#endif
 import Data.Maybe
 
 import GHC.Base
@@ -117,6 +115,7 @@ import GHC.MVar
 import GHC.Ptr
 import GHC.Real         ( fromIntegral )
 import GHC.Show         ( Show(..), showString )
+import GHC.Stable       ( StablePtr(..) )
 import GHC.Weak
 
 infixr 0 `par`, `pseq`
@@ -145,6 +144,7 @@ This misfeature will hopefully be corrected at a later date.
 
 -}
 
+-- | @since 4.2.0.0
 instance Show ThreadId where
    showsPrec d t =
         showString "ThreadId " .
@@ -165,12 +165,14 @@ cmpThread t1 t2 =
       0  -> EQ
       _  -> GT -- must be 1
 
+-- | @since 4.2.0.0
 instance Eq ThreadId where
    t1 == t2 =
       case t1 `cmpThread` t2 of
          EQ -> True
          _  -> False
 
+-- | @since 4.2.0.0
 instance Ord ThreadId where
    compare = cmpThread
 
@@ -278,7 +280,9 @@ forkIO :: IO () -> IO ThreadId
 forkIO action = IO $ \ s ->
    case (fork# action_plus s) of (# s1, tid #) -> (# s1, ThreadId tid #)
  where
-  action_plus = catchException action childHandler
+  -- We must use 'catch' rather than 'catchException' because the action
+  -- could be bottom. #13330
+  action_plus = catch action childHandler
 
 -- | Like 'forkIO', but the child thread is passed a function that can
 -- be used to unmask asynchronous exceptions.  This function is
@@ -326,7 +330,9 @@ forkOn :: Int -> IO () -> IO ThreadId
 forkOn (I# cpu) action = IO $ \ s ->
    case (forkOn# cpu action_plus s) of (# s1, tid #) -> (# s1, ThreadId tid #)
  where
-  action_plus = catchException action childHandler
+  -- We must use 'catch' rather than 'catchException' because the action
+  -- could be bottom. #13330
+  action_plus = catch action childHandler
 
 -- | Like 'forkIOWithUnmask', but the child thread is pinned to the
 -- given CPU, as with 'forkOn'.
@@ -373,7 +379,9 @@ to avoid contention with other processes in the machine.
 @since 4.5.0.0
 -}
 setNumCapabilities :: Int -> IO ()
-setNumCapabilities i = c_setNumCapabilities (fromIntegral i)
+setNumCapabilities i
+  | i <= 0    = fail $ "setNumCapabilities: Capability count ("++show i++") must be positive"
+  | otherwise = c_setNumCapabilities (fromIntegral i)
 
 foreign import ccall safe "setNumCapabilities"
   c_setNumCapabilities :: CUInt -> IO ()
@@ -394,7 +402,11 @@ numSparks = IO $ \s -> case numSparks# s of (# s', n #) -> (# s', I# n #)
 foreign import ccall "&enabled_capabilities" enabled_capabilities :: Ptr CInt
 
 childHandler :: SomeException -> IO ()
-childHandler err = catchException (real_handler err) childHandler
+childHandler err = catch (real_handler err) childHandler
+  -- We must use catch here rather than catchException. If the
+  -- raised exception throws an (imprecise) exception, then real_handler err
+  -- will do so as well. If we use catchException here, then we could miss
+  -- that exception.
 
 real_handler :: SomeException -> IO ()
 real_handler se
@@ -612,6 +624,17 @@ mkWeakThreadId t@(ThreadId t#) = IO $ \s ->
       (# s1, w #) -> (# s1, Weak w #)
 
 
+data PrimMVar
+
+-- | Make a StablePtr that can be passed to the C function
+-- @hs_try_putmvar()@.  The RTS wants a 'StablePtr' to the underlying
+-- 'MVar#', but a 'StablePtr#' can only refer to lifted types, so we
+-- have to cheat by coercing.
+newStablePtrPrimMVar :: MVar () -> IO (StablePtr PrimMVar)
+newStablePtrPrimMVar (MVar m) = IO $ \s0 ->
+  case makeStablePtr# (unsafeCoerce# m :: PrimMVar) s0 of
+    (# s1, sp #) -> (# s1, StablePtr sp #)
+
 -----------------------------------------------------------------------------
 -- Transactional heap operations
 -----------------------------------------------------------------------------
@@ -625,16 +648,21 @@ newtype STM a = STM (State# RealWorld -> (# State# RealWorld, a #))
 unSTM :: STM a -> (State# RealWorld -> (# State# RealWorld, a #))
 unSTM (STM a) = a
 
+-- | @since 4.3.0.0
 instance  Functor STM where
    fmap f x = x >>= (pure . f)
 
+-- | @since 4.8.0.0
 instance Applicative STM where
   {-# INLINE pure #-}
   {-# INLINE (*>) #-}
+  {-# INLINE liftA2 #-}
   pure x = returnSTM x
   (<*>) = ap
+  liftA2 = liftM2
   m *> k = thenSTM m k
 
+-- | @since 4.3.0.0
 instance  Monad STM  where
     {-# INLINE (>>=)  #-}
     m >>= k     = bindSTM m k
@@ -655,13 +683,13 @@ thenSTM (STM m) k = STM ( \s ->
 returnSTM :: a -> STM a
 returnSTM x = STM (\s -> (# s, x #))
 
+-- | @since 4.8.0.0
 instance Alternative STM where
   empty = retry
   (<|>) = orElse
 
-instance MonadPlus STM where
-  mzero = empty
-  mplus = (<|>)
+-- | @since 4.3.0.0
+instance MonadPlus STM
 
 -- | Unsafely performs IO in the STM monad.  Beware: this is a highly
 -- dangerous thing to do.
@@ -771,6 +799,7 @@ always i = alwaysSucceeds ( do v <- i
 -- |Shared memory locations that support atomic memory transactions.
 data TVar a = TVar (TVar# RealWorld a)
 
+-- | @since 4.8.0.0
 instance Eq (TVar a) where
         (TVar tvar1#) == (TVar tvar2#) = isTrue# (sameTVar# tvar1# tvar2#)
 
@@ -835,7 +864,7 @@ modifyMVar_ m io =
 -- Thread waiting
 -----------------------------------------------------------------------------
 
--- Machinery needed to ensureb that we only have one copy of certain
+-- Machinery needed to ensure that we only have one copy of certain
 -- CAFs in this module even when the base package is present twice, as
 -- it is when base is dynamically loaded into GHCi.  The RTS keeps
 -- track of the single true value of the CAF, so even when the CAFs in
@@ -856,7 +885,7 @@ sharedCAF a get_or_set =
 reportStackOverflow :: IO ()
 reportStackOverflow = do
      ThreadId tid <- myThreadId
-     callStackOverflowHook tid
+     c_reportStackOverflow tid
 
 reportError :: SomeException -> IO ()
 reportError ex = do
@@ -865,8 +894,11 @@ reportError ex = do
 
 -- SUP: Are the hooks allowed to re-enter Haskell land?  If so, remove
 -- the unsafe below.
-foreign import ccall unsafe "stackOverflow"
-        callStackOverflowHook :: ThreadId# -> IO ()
+foreign import ccall unsafe "reportStackOverflow"
+        c_reportStackOverflow :: ThreadId# -> IO ()
+
+foreign import ccall unsafe "reportHeapOverflow"
+        reportHeapOverflow :: IO ()
 
 {-# NOINLINE uncaughtExceptionHandler #-}
 uncaughtExceptionHandler :: IORef (SomeException -> IO ())

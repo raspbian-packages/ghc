@@ -50,7 +50,7 @@ GHC.Num         Class: Num, plus instances for Int
 GHC.Real        Classes: Real, Integral, Fractional, RealFrac
                          plus instances for Int, Integer
                 Types:  Ratio, Rational
-                        plus intances for classes so far
+                        plus instances for classes so far
 
                 Rational is needed here because it is mentioned in the signature
                 of 'toRational' in class Real
@@ -237,6 +237,7 @@ class Monoid a where
 
         mconcat = foldr mappend mempty
 
+-- | @since 2.01
 instance Monoid [a] where
         {-# INLINE mempty #-}
         mempty  = []
@@ -260,37 +261,43 @@ mechanism to define mconcat and the Applicative and Monad instances for lists.
 We mark them INLINE because the inliner is not generally too keen to inline
 build forms such as the ones these desugar to without our insistence.  Defining
 these using list comprehensions instead of foldr has an additional potential
-benefit, as described in compiler/deSugar/DsListComp.lhs: if optimizations
+benefit, as described in compiler/deSugar/DsListComp.hs: if optimizations
 needed to make foldr/build forms efficient are turned off, we'll get reasonably
 efficient translations anyway.
 -}
 
+-- | @since 2.01
 instance Monoid b => Monoid (a -> b) where
         mempty _ = mempty
         mappend f g x = f x `mappend` g x
 
+-- | @since 2.01
 instance Monoid () where
         -- Should it be strict?
         mempty        = ()
         _ `mappend` _ = ()
         mconcat _     = ()
 
+-- | @since 2.01
 instance (Monoid a, Monoid b) => Monoid (a,b) where
         mempty = (mempty, mempty)
         (a1,b1) `mappend` (a2,b2) =
                 (a1 `mappend` a2, b1 `mappend` b2)
 
+-- | @since 2.01
 instance (Monoid a, Monoid b, Monoid c) => Monoid (a,b,c) where
         mempty = (mempty, mempty, mempty)
         (a1,b1,c1) `mappend` (a2,b2,c2) =
                 (a1 `mappend` a2, b1 `mappend` b2, c1 `mappend` c2)
 
+-- | @since 2.01
 instance (Monoid a, Monoid b, Monoid c, Monoid d) => Monoid (a,b,c,d) where
         mempty = (mempty, mempty, mempty, mempty)
         (a1,b1,c1,d1) `mappend` (a2,b2,c2,d2) =
                 (a1 `mappend` a2, b1 `mappend` b2,
                  c1 `mappend` c2, d1 `mappend` d2)
 
+-- | @since 2.01
 instance (Monoid a, Monoid b, Monoid c, Monoid d, Monoid e) =>
                 Monoid (a,b,c,d,e) where
         mempty = (mempty, mempty, mempty, mempty, mempty)
@@ -299,6 +306,7 @@ instance (Monoid a, Monoid b, Monoid c, Monoid d, Monoid e) =>
                  d1 `mappend` d2, e1 `mappend` e2)
 
 -- lexicographical ordering
+-- | @since 2.01
 instance Monoid Ordering where
         mempty         = EQ
         LT `mappend` _ = LT
@@ -309,21 +317,34 @@ instance Monoid Ordering where
 -- <http://en.wikipedia.org/wiki/Monoid>: \"Any semigroup @S@ may be
 -- turned into a monoid simply by adjoining an element @e@ not in @S@
 -- and defining @e*e = e@ and @e*s = s = s*e@ for all @s ∈ S@.\" Since
--- there is no \"Semigroup\" typeclass providing just 'mappend', we
--- use 'Monoid' instead.
+-- there used to be no \"Semigroup\" typeclass providing just 'mappend',
+-- we use 'Monoid' instead.
+--
+-- @since 2.01
 instance Monoid a => Monoid (Maybe a) where
   mempty = Nothing
   Nothing `mappend` m = m
   m `mappend` Nothing = m
   Just m1 `mappend` Just m2 = Just (m1 `mappend` m2)
 
+-- | For tuples, the 'Monoid' constraint on @a@ determines
+-- how the first values merge.
+-- For example, 'String's concatenate:
+--
+-- > ("hello ", (+15)) <*> ("world!", 2002)
+-- > ("hello world!",2017)
+--
+-- @since 2.01
 instance Monoid a => Applicative ((,) a) where
     pure x = (mempty, x)
     (u, f) <*> (v, x) = (u `mappend` v, f x)
+    liftA2 f (u, x) (v, y) = (u `mappend` v, f x y)
 
+-- | @since 4.9.0.0
 instance Monoid a => Monad ((,) a) where
     (u, a) >>= k = case k a of (v, b) -> (u `mappend` v, b)
 
+-- | @since 4.9.0.0
 instance Monoid a => Monoid (IO a) where
     mempty = pure mempty
     mappend = liftA2 mappend
@@ -351,10 +372,16 @@ class  Functor f  where
 --
 -- * embed pure expressions ('pure'), and
 --
--- * sequence computations and combine their results ('<*>').
+-- * sequence computations and combine their results ('<*>' and 'liftA2').
 --
--- A minimal complete definition must include implementations of these
--- functions satisfying the following laws:
+-- A minimal complete definition must include implementations of 'pure'
+-- and of either '<*>' or 'liftA2'. If it defines both, then they must behave
+-- the same as their default definitions:
+--
+--      @('<*>') = 'liftA2' 'id'@
+--      @'liftA2' f x y = f '<$>' x '<*>' y@
+--
+-- Further, any definition must satisfy the following:
 --
 -- [/identity/]
 --
@@ -372,16 +399,27 @@ class  Functor f  where
 --
 --      @u '<*>' 'pure' y = 'pure' ('$' y) '<*>' u@
 --
+--
 -- The other methods have the following default definitions, which may
 -- be overridden with equivalent specialized implementations:
 --
---   * @u '*>' v = 'pure' ('const' 'id') '<*>' u '<*>' v@
+--   * @u '*>' v = ('id' '<$' u) '<*>' v@
 --
---   * @u '<*' v = 'pure' 'const' '<*>' u '<*>' v@
+--   * @u '<*' v = 'liftA2' 'const' u v@
 --
 -- As a consequence of these laws, the 'Functor' instance for @f@ will satisfy
 --
 --   * @'fmap' f x = 'pure' f '<*>' x@
+--
+--
+-- It may be useful to note that supposing
+--
+--      @forall x y. p (q x y) = f x . g y@
+--
+-- it follows from the above that
+--
+--      @'liftA2' p ('liftA2' q u v) = 'liftA2' f u . 'liftA2' g v@
+--
 --
 -- If @f@ is also a 'Monad', it should satisfy
 --
@@ -392,17 +430,37 @@ class  Functor f  where
 -- (which implies that 'pure' and '<*>' satisfy the applicative functor laws).
 
 class Functor f => Applicative f where
+    {-# MINIMAL pure, ((<*>) | liftA2) #-}
     -- | Lift a value.
     pure :: a -> f a
 
     -- | Sequential application.
+    --
+    -- A few functors support an implementation of '<*>' that is more
+    -- efficient than the default one.
     (<*>) :: f (a -> b) -> f a -> f b
+    (<*>) = liftA2 id
+
+    -- | Lift a binary function to actions.
+    --
+    -- Some functors support an implementation of 'liftA2' that is more
+    -- efficient than the default one. In particular, if 'fmap' is an
+    -- expensive operation, it is likely better to use 'liftA2' than to
+    -- 'fmap' over the structure and then use '<*>'.
+    liftA2 :: (a -> b -> c) -> f a -> f b -> f c
+    liftA2 f x = (<*>) (fmap f x)
 
     -- | Sequence actions, discarding the value of the first argument.
     (*>) :: f a -> f b -> f b
     a1 *> a2 = (id <$ a1) <*> a2
-    -- This is essentially the same as liftA2 (const id), but if the
-    -- Functor instance has an optimized (<$), we want to use that instead.
+    -- This is essentially the same as liftA2 (flip const), but if the
+    -- Functor instance has an optimized (<$), it may be better to use
+    -- that instead. Before liftA2 became a method, this definition
+    -- was strictly better, but now it depends on the functor. For a
+    -- functor supporting a sharing-enhancing (<$), this definition
+    -- may reduce allocation by preventing a1 from ever being fully
+    -- realized. In an implementation with a boring (<$) but an optimizing
+    -- liftA2, it would likely be better to define (*>) using liftA2.
 
     -- | Sequence actions, discarding the value of the second argument.
     (<*) :: f a -> f b -> f a
@@ -410,7 +468,8 @@ class Functor f => Applicative f where
 
 -- | A variant of '<*>' with the arguments reversed.
 (<**>) :: Applicative f => f a -> f (a -> b) -> f b
-(<**>) = liftA2 (flip ($))
+(<**>) = liftA2 (\a f -> f a)
+-- Don't use $ here, see the note at the top of the page
 
 -- | Lift a function to actions.
 -- This function may be used as a value for `fmap` in a `Functor` instance.
@@ -419,22 +478,15 @@ liftA f a = pure f <*> a
 -- Caution: since this may be used for `fmap`, we can't use the obvious
 -- definition of liftA = fmap.
 
--- | Lift a binary function to actions.
-liftA2 :: Applicative f => (a -> b -> c) -> f a -> f b -> f c
-liftA2 f a b = fmap f a <*> b
-
 -- | Lift a ternary function to actions.
 liftA3 :: Applicative f => (a -> b -> c -> d) -> f a -> f b -> f c -> f d
-liftA3 f a b c = fmap f a <*> b <*> c
+liftA3 f a b c = liftA2 f a b <*> c
 
 
-{-# INLINEABLE liftA #-}
+{-# INLINABLE liftA #-}
 {-# SPECIALISE liftA :: (a1->r) -> IO a1 -> IO r #-}
 {-# SPECIALISE liftA :: (a1->r) -> Maybe a1 -> Maybe r #-}
-{-# INLINEABLE liftA2 #-}
-{-# SPECIALISE liftA2 :: (a1->a2->r) -> IO a1 -> IO a2 -> IO r #-}
-{-# SPECIALISE liftA2 :: (a1->a2->r) -> Maybe a1 -> Maybe a2 -> Maybe r #-}
-{-# INLINEABLE liftA3 #-}
+{-# INLINABLE liftA3 #-}
 {-# SPECIALISE liftA3 :: (a1->a2->a3->r) -> IO a1 -> IO a2 -> IO a3 -> IO r #-}
 {-# SPECIALISE liftA3 :: (a1->a2->a3->r) ->
                                 Maybe a1 -> Maybe a2 -> Maybe a3 -> Maybe r #-}
@@ -534,7 +586,7 @@ f =<< x         = x >>= f
 -- will output the string @Debugging@ if the Boolean value @debug@
 -- is 'True', and otherwise do nothing.
 when      :: (Applicative f) => Bool -> f () -> f ()
-{-# INLINEABLE when #-}
+{-# INLINABLE when #-}
 {-# SPECIALISE when :: Bool -> IO () -> IO () #-}
 {-# SPECIALISE when :: Bool -> Maybe () -> Maybe () #-}
 when p s  = if p then s else pure ()
@@ -582,6 +634,8 @@ liftM f m1              = do { x1 <- m1; return (f x1) }
 --
 liftM2  :: (Monad m) => (a1 -> a2 -> r) -> m a1 -> m a2 -> m r
 liftM2 f m1 m2          = do { x1 <- m1; x2 <- m2; return (f x1 x2) }
+-- Caution: since this may be used for `liftA2`, we can't use the obvious
+-- definition of liftM2 = liftA2.
 
 -- | Promote a function to a monad, scanning the monadic arguments from
 -- left to right (cf. 'liftM2').
@@ -598,19 +652,19 @@ liftM4 f m1 m2 m3 m4    = do { x1 <- m1; x2 <- m2; x3 <- m3; x4 <- m4; return (f
 liftM5  :: (Monad m) => (a1 -> a2 -> a3 -> a4 -> a5 -> r) -> m a1 -> m a2 -> m a3 -> m a4 -> m a5 -> m r
 liftM5 f m1 m2 m3 m4 m5 = do { x1 <- m1; x2 <- m2; x3 <- m3; x4 <- m4; x5 <- m5; return (f x1 x2 x3 x4 x5) }
 
-{-# INLINEABLE liftM #-}
+{-# INLINABLE liftM #-}
 {-# SPECIALISE liftM :: (a1->r) -> IO a1 -> IO r #-}
 {-# SPECIALISE liftM :: (a1->r) -> Maybe a1 -> Maybe r #-}
-{-# INLINEABLE liftM2 #-}
+{-# INLINABLE liftM2 #-}
 {-# SPECIALISE liftM2 :: (a1->a2->r) -> IO a1 -> IO a2 -> IO r #-}
 {-# SPECIALISE liftM2 :: (a1->a2->r) -> Maybe a1 -> Maybe a2 -> Maybe r #-}
-{-# INLINEABLE liftM3 #-}
+{-# INLINABLE liftM3 #-}
 {-# SPECIALISE liftM3 :: (a1->a2->a3->r) -> IO a1 -> IO a2 -> IO a3 -> IO r #-}
 {-# SPECIALISE liftM3 :: (a1->a2->a3->r) -> Maybe a1 -> Maybe a2 -> Maybe a3 -> Maybe r #-}
-{-# INLINEABLE liftM4 #-}
+{-# INLINABLE liftM4 #-}
 {-# SPECIALISE liftM4 :: (a1->a2->a3->a4->r) -> IO a1 -> IO a2 -> IO a3 -> IO a4 -> IO r #-}
 {-# SPECIALISE liftM4 :: (a1->a2->a3->a4->r) -> Maybe a1 -> Maybe a2 -> Maybe a3 -> Maybe a4 -> Maybe r #-}
-{-# INLINEABLE liftM5 #-}
+{-# INLINABLE liftM5 #-}
 {-# SPECIALISE liftM5 :: (a1->a2->a3->a4->a5->r) -> IO a1 -> IO a2 -> IO a3 -> IO a4 -> IO a5 -> IO r #-}
 {-# SPECIALISE liftM5 :: (a1->a2->a3->a4->a5->r) -> Maybe a1 -> Maybe a2 -> Maybe a3 -> Maybe a4 -> Maybe a5 -> Maybe r #-}
 
@@ -629,39 +683,49 @@ ap                :: (Monad m) => m (a -> b) -> m a -> m b
 ap m1 m2          = do { x1 <- m1; x2 <- m2; return (x1 x2) }
 -- Since many Applicative instances define (<*>) = ap, we
 -- cannot define ap = (<*>)
-{-# INLINEABLE ap #-}
+{-# INLINABLE ap #-}
 {-# SPECIALISE ap :: IO (a -> b) -> IO a -> IO b #-}
 {-# SPECIALISE ap :: Maybe (a -> b) -> Maybe a -> Maybe b #-}
 
 -- instances for Prelude types
 
+-- | @since 2.01
 instance Functor ((->) r) where
     fmap = (.)
 
+-- | @since 2.01
 instance Applicative ((->) a) where
     pure = const
     (<*>) f g x = f x (g x)
+    liftA2 q f g x = q (f x) (g x)
 
+-- | @since 2.01
 instance Monad ((->) r) where
     f >>= k = \ r -> k (f r) r
 
+-- | @since 2.01
 instance Functor ((,) a) where
     fmap f (x,y) = (x, f y)
 
-
+-- | @since 2.01
 instance  Functor Maybe  where
     fmap _ Nothing       = Nothing
     fmap f (Just a)      = Just (f a)
 
+-- | @since 2.01
 instance Applicative Maybe where
     pure = Just
 
     Just f  <*> m       = fmap f m
     Nothing <*> _m      = Nothing
 
+    liftA2 f (Just x) (Just y) = Just (f x y)
+    liftA2 _ _ _ = Nothing
+
     Just _m1 *> m2      = m2
     Nothing  *> _m2     = Nothing
 
+-- | @since 2.01
 instance  Monad Maybe  where
     (Just x) >>= k      = k x
     Nothing  >>= _      = Nothing
@@ -694,16 +758,17 @@ class Applicative f => Alternative f where
     some v = some_v
       where
         many_v = some_v <|> pure []
-        some_v = (fmap (:) v) <*> many_v
+        some_v = liftA2 (:) v many_v
 
     -- | Zero or more.
     many :: f a -> f [a]
     many v = many_v
       where
         many_v = some_v <|> pure []
-        some_v = (fmap (:) v) <*> many_v
+        some_v = liftA2 (:) v many_v
 
 
+-- | @since 2.01
 instance Alternative Maybe where
     empty = Nothing
     Nothing <|> r = r
@@ -726,25 +791,31 @@ class (Alternative m, Monad m) => MonadPlus m where
    mplus :: m a -> m a -> m a
    mplus = (<|>)
 
+-- | @since 2.01
 instance MonadPlus Maybe
 
 ----------------------------------------------
 -- The list type
 
+-- | @since 2.01
 instance Functor [] where
     {-# INLINE fmap #-}
     fmap = map
 
 -- See Note: [List comprehensions and inlining]
+-- | @since 2.01
 instance Applicative [] where
     {-# INLINE pure #-}
     pure x    = [x]
     {-# INLINE (<*>) #-}
     fs <*> xs = [f x | f <- fs, x <- xs]
+    {-# INLINE liftA2 #-}
+    liftA2 f xs ys = [f x y | x <- xs, y <- ys]
     {-# INLINE (*>) #-}
     xs *> ys  = [y | _ <- xs, y <- ys]
 
 -- See Note: [List comprehensions and inlining]
+-- | @since 2.01
 instance Monad []  where
     {-# INLINE (>>=) #-}
     xs >>= f             = [y | x <- xs, y <- f x]
@@ -753,10 +824,12 @@ instance Monad []  where
     {-# INLINE fail #-}
     fail _              = []
 
+-- | @since 2.01
 instance Alternative [] where
     empty = []
     (<|>) = (++)
 
+-- | @since 2.01
 instance MonadPlus []
 
 {-
@@ -875,7 +948,7 @@ map f (x:xs) = f x : map f xs
 
 -- Note eta expanded
 mapFB ::  (elt -> lst -> lst) -> (a -> elt) -> a -> lst -> lst
-{-# INLINE [0] mapFB #-}
+{-# INLINE [0] mapFB #-} -- See Note [Inline FB functions] in GHC.List
 mapFB c f = \x ys -> c (f x) ys
 
 -- The rules for map work like this.
@@ -891,15 +964,18 @@ mapFB c f = \x ys -> c (f x) ys
 -- (along with build's unfolding) else we'd get an infinite loop
 -- in the rules.  Hence the activation control below.
 --
--- The "mapFB" rule optimises compositions of map.
---
 -- This same pattern is followed by many other functions:
 -- e.g. append, filter, iterate, repeat, etc.
+--
+-- The "mapFB" rule optimises compositions of map and
+-- the "mapFB/id" rule get rids of 'map id' calls.
+-- (Any similarity to the Functor laws for [] is expected.)
 
 {-# RULES
 "map"       [~1] forall f xs.   map f xs                = build (\c n -> foldr (mapFB c f) n xs)
 "mapList"   [1]  forall f.      foldr (mapFB (:) f) []  = map f
 "mapFB"     forall c f g.       mapFB (mapFB c f) g     = mapFB c (f.g)
+"mapFB/id"  forall c.           mapFB c (\x -> x)       = c
   #-}
 
 -- See Breitner, Eisenberg, Peyton Jones, and Weirich, "Safe Zero-cost
@@ -964,8 +1040,8 @@ eqString (c1:cs1) (c2:cs2) = c1 == c2 && cs1 `eqString` cs2
 eqString _        _        = False
 
 {-# RULES "eqString" (==) = eqString #-}
--- eqString also has a BuiltInRule in PrelRules.lhs:
---      eqString (unpackCString# (Lit s1)) (unpackCString# (Lit s2) = s1==s2
+-- eqString also has a BuiltInRule in PrelRules.hs:
+--      eqString (unpackCString# (Lit s1)) (unpackCString# (Lit s2)) = s1==s2
 
 
 ----------------------------------------------
@@ -1011,7 +1087,7 @@ id x                    =  x
 
 --      SLPJ: in 5.04 etc 'assert' is in GHC.Prim,
 --      but from Template Haskell onwards it's simply
---      defined here in Base.lhs
+--      defined here in Base.hs
 assert :: Bool -> a -> a
 assert _pred r = r
 
@@ -1022,7 +1098,6 @@ breakpointCond :: Bool -> a -> a
 breakpointCond _ r = r
 
 data Opaque = forall a. O a
-
 -- | @const x@ is a unary function which evaluates to @x@ for all inputs.
 --
 -- For instance,
@@ -1080,16 +1155,21 @@ asTypeOf                =  const
 -- Functor/Applicative/Monad instances for IO
 ----------------------------------------------
 
+-- | @since 2.01
 instance  Functor IO where
    fmap f x = x >>= (pure . f)
 
+-- | @since 2.01
 instance Applicative IO where
     {-# INLINE pure #-}
     {-# INLINE (*>) #-}
-    pure   = returnIO
-    m *> k = m >>= \ _ -> k
-    (<*>)  = ap
+    {-# INLINE liftA2 #-}
+    pure  = returnIO
+    (*>)  = thenIO
+    (<*>) = ap
+    liftA2 = liftM2
 
+-- | @since 2.01
 instance  Monad IO  where
     {-# INLINE (>>)   #-}
     {-# INLINE (>>=)  #-}
@@ -1097,10 +1177,12 @@ instance  Monad IO  where
     (>>=)     = bindIO
     fail s    = failIO s
 
+-- | @since 4.9.0.0
 instance Alternative IO where
     empty = failIO "mzero"
     (<|>) = mplusIO
 
+-- | @since 4.9.0.0
 instance MonadPlus IO
 
 returnIO :: a -> IO a
@@ -1218,7 +1300,7 @@ a `iShiftRL#` b | isTrue# (b >=# WORD_SIZE_IN_BITS#) = 0#
 "unpack-list"  [1]  forall a   . unpackFoldrCString# a (:) [] = unpackCString# a
 "unpack-append"     forall a n . unpackFoldrCString# a (:) n  = unpackAppendCString# a n
 
--- There's a built-in rule (in PrelRules.lhs) for
+-- There's a built-in rule (in PrelRules.hs) for
 --      unpackFoldr "foo" c (unpackFoldr "baz" c n)  =  unpackFoldr "foobaz" c n
 
   #-}

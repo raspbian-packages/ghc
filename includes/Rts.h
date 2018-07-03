@@ -39,15 +39,7 @@ extern "C" {
 #endif
 
 #include "rts/Types.h"
-
-#if __GNUC__ >= 3
-/* Assume that a flexible array member at the end of a struct
- * can be defined thus: T arr[]; */
-#define FLEXIBLE_ARRAY
-#else
-/* Assume that it must be defined thus: T arr[0]; */
-#define FLEXIBLE_ARRAY 0
-#endif
+#include "rts/Time.h"
 
 #if __GNUC__ >= 3
 #define ATTRIBUTE_ALIGNED(n) __attribute__((aligned(n)))
@@ -68,6 +60,13 @@ extern "C" {
 #define RTS_UNLIKELY(p) __builtin_expect((p),0)
 #else
 #define RTS_UNLIKELY(p) p
+#endif
+
+/* __builtin_unreachable is supported since GNU C 4.5 */
+#if __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 5)
+#define RTS_UNREACHABLE __builtin_unreachable()
+#else
+#define RTS_UNREACHABLE abort()
 #endif
 
 /* Fix for mingw stat problem (done here so it's early enough) */
@@ -147,38 +146,6 @@ void _assertFail(const char *filename, unsigned int linenum)
 #define FMT_HexSizeT "zx"
 
 /* -----------------------------------------------------------------------------
-   Time values in the RTS
-   -------------------------------------------------------------------------- */
-
-// For most time values in the RTS we use a fixed resolution of nanoseconds,
-// normalising the time we get from platform-dependent APIs to this
-// resolution.
-#define TIME_RESOLUTION 1000000000
-typedef StgInt64 Time;
-
-#define TIME_MAX HS_INT64_MAX
-
-#if TIME_RESOLUTION == 1000000000
-// I'm being lazy, but it's awkward to define fully general versions of these
-#define TimeToUS(t)      ((t) / 1000)
-#define TimeToNS(t)      (t)
-#define USToTime(t)      ((Time)(t) * 1000)
-#define NSToTime(t)      ((Time)(t))
-#else
-#error Fix TimeToNS(), TimeToUS() etc.
-#endif
-
-#define SecondsToTime(t) ((Time)(t) * TIME_RESOLUTION)
-#define TimeToSeconds(t) ((t) / TIME_RESOLUTION)
-
-// Use instead of SecondsToTime() when we have a floating-point
-// seconds value, to avoid truncating it.
-INLINE_HEADER Time fsecondsToTime (double t)
-{
-    return (Time)(t * TIME_RESOLUTION);
-}
-
-/* -----------------------------------------------------------------------------
    Include everything STG-ish
    -------------------------------------------------------------------------- */
 
@@ -212,7 +179,6 @@ INLINE_HEADER Time fsecondsToTime (double t)
 #include "rts/storage/ClosureTypes.h"
 #include "rts/storage/TSO.h"
 #include "stg/MiscClosures.h" /* InfoTables, closures etc. defined in the RTS */
-#include "rts/storage/SMPClosureOps.h"
 #include "rts/storage/Block.h"
 #include "rts/storage/ClosureMacros.h"
 #include "rts/storage/MBlock.h"
@@ -252,7 +218,8 @@ void getWin32ProgArgv(int *argc, wchar_t **argv[]);
 void setWin32ProgArgv(int argc, wchar_t *argv[]);
 #endif
 
-void stackOverflow(StgTSO* tso);
+void reportStackOverflow(StgTSO* tso);
+void reportHeapOverflow(void);
 
 void stg_exit(int n) GNU_ATTRIBUTE(__noreturn__);
 
@@ -301,13 +268,13 @@ TICK_VAR(2)
    Assertions and Debuggery
    -------------------------------------------------------------------------- */
 
-#define IF_RTSFLAGS(c,s)  if (RtsFlags.c) { s; }
+#define IF_RTSFLAGS(c,s)  if (RtsFlags.c) { s; } doNothing()
 
 #ifdef DEBUG
 #if IN_STG_CODE
-#define IF_DEBUG(c,s)  if (RtsFlags[0].DebugFlags.c) { s; }
+#define IF_DEBUG(c,s)  if (RtsFlags[0].DebugFlags.c) { s; } doNothing()
 #else
-#define IF_DEBUG(c,s)  if (RtsFlags.DebugFlags.c) { s; }
+#define IF_DEBUG(c,s)  if (RtsFlags.DebugFlags.c) { s; } doNothing()
 #endif
 #else
 #define IF_DEBUG(c,s)  doNothing()

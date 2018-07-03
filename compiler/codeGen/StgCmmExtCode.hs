@@ -1,5 +1,3 @@
-{-# LANGUAGE CPP #-}
-
 -- | Our extended FCode monad.
 
 -- We add a mapping from names to CmmExpr, to support local variable names in
@@ -45,18 +43,15 @@ import Cmm
 import CLabel
 import MkGraph
 
--- import BasicTypes
 import BlockId
 import DynFlags
 import FastString
 import Module
 import UniqFM
 import Unique
+import UniqSupply
 
 import Control.Monad (liftM, ap)
-#if __GLASGOW_HASKELL__ < 709
-import Control.Applicative (Applicative(..))
-#endif
 
 -- | The environment contains variable definitions or blockids.
 data Named
@@ -94,7 +89,12 @@ instance Applicative CmmParse where
 
 instance Monad CmmParse where
   (>>=) = thenExtFC
-  return = pure
+
+instance MonadUnique CmmParse where
+  getUniqueSupplyM = code getUniqueSupplyM
+  getUniqueM = EC $ \_ _ decls -> do
+    u <- getUniqueM
+    return (decls, u)
 
 instance HasDynFlags CmmParse where
     getDynFlags = EC (\_ _ d -> do dflags <- getDynFlags
@@ -160,9 +160,6 @@ newLabel name = do
    u <- code newUnique
    addLabel name (mkBlockId u)
    return (mkBlockId u)
-
-newBlockId :: CmmParse BlockId
-newBlockId = code F.newLabelC
 
 -- | Add add a local function to the environment.
 newFunctionName

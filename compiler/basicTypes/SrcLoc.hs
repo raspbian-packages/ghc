@@ -1,12 +1,12 @@
 -- (c) The University of Glasgow, 1992-2006
 
-{-# LANGUAGE CPP #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE DeriveFunctor      #-}
 {-# LANGUAGE DeriveFoldable     #-}
 {-# LANGUAGE DeriveTraversable  #-}
 {-# LANGUAGE FlexibleInstances  #-}
+{-# LANGUAGE RecordWildCards    #-}
 {-# OPTIONS_GHC -fno-omit-interface-pragmas #-}
    -- Workaround for Trac #5252 crashes the bootstrap compiler without -O
    -- When the earliest compiler we want to boostrap with is
@@ -82,13 +82,10 @@ module SrcLoc (
     ) where
 
 import Util
+import Json
 import Outputable
 import FastString
 
-#if __GLASGOW_HASKELL__ < 709
-import Data.Foldable ( Foldable )
-import Data.Traversable ( Traversable )
-#endif
 import Control.DeepSeq
 import Data.Bits
 import Data.Data
@@ -106,16 +103,20 @@ We keep information about the {\em definition} point for each entity;
 this is the obvious stuff:
 -}
 
--- | Represents a single point within a file
+-- | Real Source Location
+--
+-- Represents a single point within a file
 data RealSrcLoc
   = SrcLoc      FastString              -- A precise location (file name)
                 {-# UNPACK #-} !Int     -- line number, begins at 1
                 {-# UNPACK #-} !Int     -- column number, begins at 1
+  deriving (Eq, Ord)
 
+-- | Source Location
 data SrcLoc
   = RealSrcLoc {-# UNPACK #-}!RealSrcLoc
   | UnhelpfulLoc FastString     -- Just a general indication
-  deriving Show
+  deriving (Eq, Ord, Show)
 
 {-
 ************************************************************************
@@ -170,35 +171,8 @@ advanceSrcLoc (SrcLoc f l c) _    = SrcLoc f  l (c + 1)
 ************************************************************************
 -}
 
--- SrcLoc is an instance of Ord so that we can sort error messages easily
-instance Eq SrcLoc where
-  loc1 == loc2 = case loc1 `cmpSrcLoc` loc2 of
-                 EQ     -> True
-                 _other -> False
-
-instance Eq RealSrcLoc where
-  loc1 == loc2 = case loc1 `cmpRealSrcLoc` loc2 of
-                 EQ     -> True
-                 _other -> False
-
-instance Ord SrcLoc where
-  compare = cmpSrcLoc
-
-instance Ord RealSrcLoc where
-  compare = cmpRealSrcLoc
-
 sortLocated :: [Located a] -> [Located a]
 sortLocated things = sortBy (comparing getLoc) things
-
-cmpSrcLoc :: SrcLoc -> SrcLoc -> Ordering
-cmpSrcLoc (UnhelpfulLoc s1) (UnhelpfulLoc s2) = s1 `compare` s2
-cmpSrcLoc (UnhelpfulLoc _)  (RealSrcLoc _)    = GT
-cmpSrcLoc (RealSrcLoc _)    (UnhelpfulLoc _)  = LT
-cmpSrcLoc (RealSrcLoc l1)   (RealSrcLoc l2)   = (l1 `compare` l2)
-
-cmpRealSrcLoc :: RealSrcLoc -> RealSrcLoc -> Ordering
-cmpRealSrcLoc (SrcLoc s1 l1 c1) (SrcLoc s2 l2 c2)
-  = (s1 `compare` s2) `thenCmp` (l1 `compare` l2) `thenCmp` (c1 `compare` c2)
 
 instance Outputable RealSrcLoc where
     ppr (SrcLoc src_path src_line src_col)
@@ -250,6 +224,8 @@ The end position is defined to be the column /after/ the end of the
 span.  That is, a span of (1,1)-(1,2) is one character long, and a
 span of (1,1)-(1,1) is zero characters long.
 -}
+
+-- | Real Source Span
 data RealSrcSpan
   = RealSrcSpan'
         { srcSpanFile     :: !FastString,
@@ -258,17 +234,31 @@ data RealSrcSpan
           srcSpanELine    :: {-# UNPACK #-} !Int,
           srcSpanECol     :: {-# UNPACK #-} !Int
         }
-  deriving (Eq, Typeable)
+  deriving Eq
 
--- | A 'SrcSpan' identifies either a specific portion of a text file
+-- | Source Span
+--
+-- A 'SrcSpan' identifies either a specific portion of a text file
 -- or a human-readable description of a location.
 data SrcSpan =
     RealSrcSpan !RealSrcSpan
   | UnhelpfulSpan !FastString   -- Just a general indication
                                 -- also used to indicate an empty span
 
-  deriving (Eq, Ord, Typeable, Show) -- Show is used by Lexer.x, because we
-                                     -- derive Show for Token
+  deriving (Eq, Ord, Show) -- Show is used by Lexer.x, because we
+                           -- derive Show for Token
+
+instance ToJson SrcSpan where
+  json (UnhelpfulSpan {} ) = JSNull --JSObject [( "type", "unhelpful")]
+  json (RealSrcSpan rss)  = json rss
+
+instance ToJson RealSrcSpan where
+  json (RealSrcSpan'{..}) = JSObject [ ("file", JSString (unpackFS srcSpanFile))
+                                     , ("startLine", JSInt srcSpanSLine)
+                                     , ("startCol", JSInt srcSpanSCol)
+                                     , ("endLine", JSInt srcSpanELine)
+                                     , ("endCol", JSInt srcSpanECol)
+                                     ]
 
 instance NFData SrcSpan where
   rnf x = x `seq` ()
@@ -368,12 +358,13 @@ isOneLineSpan (UnhelpfulSpan _) = False
 -- that it covers at least as much source code. True where spans are equal.
 containsSpan :: RealSrcSpan -> RealSrcSpan -> Bool
 containsSpan s1 s2
-  = srcSpanFile s1 == srcSpanFile s2
-    && (srcSpanStartLine s1, srcSpanStartCol s1)
+  = (srcSpanStartLine s1, srcSpanStartCol s1)
        <= (srcSpanStartLine s2, srcSpanStartCol s2)
     && (srcSpanEndLine s1, srcSpanEndCol s1)
        >= (srcSpanEndLine s2, srcSpanEndCol s2)
-
+    && (srcSpanFile s1 == srcSpanFile s2)
+    -- We check file equality last because it is (presumably?) least
+    -- likely to fail.
 {-
 %************************************************************************
 %*                                                                      *
@@ -520,7 +511,7 @@ pprUserRealSpan show_path (RealSrcSpan' src_path sline scol eline ecol)
 
 -- | We attach SrcSpans to lots of things, so let's have a datatype for it.
 data GenLocated l e = L l e
-  deriving (Eq, Ord, Typeable, Data, Functor, Foldable, Traversable)
+  deriving (Eq, Ord, Data, Functor, Foldable, Traversable)
 
 type Located e = GenLocated SrcSpan e
 type RealLocated e = GenLocated RealSrcSpan e

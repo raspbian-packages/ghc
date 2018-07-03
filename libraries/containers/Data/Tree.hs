@@ -2,6 +2,9 @@
 #if __GLASGOW_HASKELL__
 {-# LANGUAGE DeriveDataTypeable, StandaloneDeriving #-}
 #endif
+#if __GLASGOW_HASKELL__ >= 702
+{-# LANGUAGE DeriveGeneric #-}
+#endif
 #if __GLASGOW_HASKELL__ >= 703
 {-# LANGUAGE Trustworthy #-}
 #endif
@@ -15,7 +18,6 @@
 -- License     :  BSD-style (see the file libraries/base/LICENSE)
 --
 -- Maintainer  :  libraries@haskell.org
--- Stability   :  experimental
 -- Portability :  portable
 --
 -- Multi-way trees (/aka/ rose trees) and forests.
@@ -27,7 +29,7 @@ module Data.Tree(
     -- * Two-dimensional drawing
     drawTree, drawForest,
     -- * Extraction
-    flatten, levels,
+    flatten, levels, foldTree,
     -- * Building trees
     unfoldTree, unfoldForest,
     unfoldTreeM, unfoldForestM,
@@ -36,8 +38,9 @@ module Data.Tree(
 
 #if MIN_VERSION_base(4,8,0)
 import Data.Foldable (toList)
+import Control.Applicative (Applicative(..), liftA2)
 #else
-import Control.Applicative (Applicative(..), (<$>))
+import Control.Applicative (Applicative(..), liftA2, (<$>))
 import Data.Foldable (Foldable(foldMap), toList)
 import Data.Monoid (Monoid(..))
 import Data.Traversable (Traversable(traverse))
@@ -52,9 +55,27 @@ import Control.DeepSeq (NFData(rnf))
 #ifdef __GLASGOW_HASKELL__
 import Data.Data (Data)
 #endif
+#if __GLASGOW_HASKELL__ >= 706
+import GHC.Generics (Generic, Generic1)
+#elif __GLASGOW_HASKELL__ >= 702
+import GHC.Generics (Generic)
+#endif
+
+#if MIN_VERSION_base(4,4,0)
+import Control.Monad.Zip (MonadZip (..))
+#endif
 
 #if MIN_VERSION_base(4,8,0)
 import Data.Coerce
+#endif
+
+#if MIN_VERSION_base(4,9,0)
+import Data.Functor.Classes
+import Data.Semigroup (Semigroup (..))
+#endif
+
+#if !MIN_VERSION_base(4,8,0)
+import Data.Functor ((<$))
 #endif
 
 -- | Multi-way trees, also known as /rose trees/.
@@ -63,16 +84,56 @@ data Tree a = Node {
         subForest :: Forest a   -- ^ zero or more child trees
     }
 #ifdef __GLASGOW_HASKELL__
+#if __GLASGOW_HASKELL__ >= 706
+  deriving (Eq, Read, Show, Data, Generic, Generic1)
+#elif __GLASGOW_HASKELL__ >= 702
+  deriving (Eq, Read, Show, Data, Generic)
+#else
   deriving (Eq, Read, Show, Data)
+#endif
 #else
   deriving (Eq, Read, Show)
 #endif
 type Forest a = [Tree a]
 
-INSTANCE_TYPEABLE1(Tree,treeTc,"Tree")
+#if MIN_VERSION_base(4,9,0)
+instance Eq1 Tree where
+  liftEq eq = leq
+    where
+      leq (Node a fr) (Node a' fr') = eq a a' && liftEq leq fr fr'
+
+instance Ord1 Tree where
+  liftCompare cmp = lcomp
+    where
+      lcomp (Node a fr) (Node a' fr') = cmp a a' <> liftCompare lcomp fr fr'
+
+instance Show1 Tree where
+  liftShowsPrec shw shwl p (Node a fr) = showParen (p > 10) $
+        showString "Node {rootLabel = " . shw 0 a . showString ", " .
+          showString "subForest = " . liftShowList shw shwl fr .
+          showString "}"
+
+instance Read1 Tree where
+  liftReadsPrec rd rdl p = readParen (p > 10) $
+    \s -> do
+      ("Node", s1) <- lex s
+      ("{", s2) <- lex s1
+      ("rootLabel", s3) <- lex s2
+      ("=", s4) <- lex s3
+      (a, s5) <- rd 0 s4
+      (",", s6) <- lex s5
+      ("subForest", s7) <- lex s6
+      ("=", s8) <- lex s7
+      (fr, s9) <- liftReadList rd rdl s8
+      ("}", s10) <- lex s9
+      pure (Node a fr, s10)
+#endif
+
+INSTANCE_TYPEABLE1(Tree)
 
 instance Functor Tree where
     fmap = fmapTree
+    x <$ Node _ ts = Node x (map (x <$) ts)
 
 fmapTree :: (a -> b) -> Tree a -> Tree b
 fmapTree f (Node x ts) = Node (f x) (map (fmapTree f) ts)
@@ -89,6 +150,14 @@ instance Applicative Tree where
     pure x = Node x []
     Node f tfs <*> tx@(Node x txs) =
         Node (f x) (map (f <$>) txs ++ map (<*> tx) tfs)
+#if MIN_VERSION_base(4,10,0)
+    liftA2 f (Node x txs) ty@(Node y tys) =
+        Node (f x y) (map (f x <$>) tys ++ map (\tx -> liftA2 f tx ty) txs)
+#endif
+    Node x txs <* ty@(Node _ tys) =
+        Node x (map (x <$) tys ++ map (<* ty) txs)
+    Node _ txs *> ty@(Node y tys) =
+        Node y (tys ++ map (*> ty) txs)
 
 instance Monad Tree where
     return = pure
@@ -96,7 +165,7 @@ instance Monad Tree where
       where Node x' ts' = f x
 
 instance Traversable Tree where
-    traverse f (Node x ts) = Node <$> f x <*> traverse (traverse f) ts
+    traverse f (Node x ts) = liftA2 Node (f x) (traverse (traverse f) ts)
 
 instance Foldable Tree where
     foldMap f (Node x ts) = f x `mappend` foldMap (foldMap f) ts
@@ -111,6 +180,15 @@ instance Foldable Tree where
 instance NFData a => NFData (Tree a) where
     rnf (Node x ts) = rnf x `seq` rnf ts
 
+#if MIN_VERSION_base(4,4,0)
+instance MonadZip Tree where
+  mzipWith f (Node a as) (Node b bs)
+    = Node (f a b) (mzipWith (mzipWith f) as bs)
+
+  munzip (Node (a, b) ts) = (Node a as, Node b bs)
+    where (as, bs) = munzip (map munzip ts)
+#endif
+
 -- | Neat 2-dimensional drawing of a tree.
 drawTree :: Tree String -> String
 drawTree  = unlines . draw
@@ -120,7 +198,7 @@ drawForest :: Forest String -> String
 drawForest  = unlines . map drawTree
 
 draw :: Tree String -> [String]
-draw (Node x ts0) = x : drawSubTrees ts0
+draw (Node x ts0) = lines x ++ drawSubTrees ts0
   where
     drawSubTrees [] = []
     drawSubTrees [t] =
@@ -142,6 +220,11 @@ levels t =
         takeWhile (not . null) $
         iterate (concatMap subForest) [t]
 
+-- | Catamorphism on trees.
+foldTree :: (a -> [b] -> b) -> Tree a -> b
+foldTree f = go where
+    go (Node x ts) = f x (map go ts)
+
 -- | Build a tree from a seed value
 unfoldTree :: (b -> (a, [b])) -> b -> Tree a
 unfoldTree f b = let (a, bs) = f b in Node a (unfoldForest f bs)
@@ -158,9 +241,7 @@ unfoldTreeM f b = do
     return (Node a ts)
 
 -- | Monadic forest builder, in depth-first order
-#ifndef __NHC__
 unfoldForestM :: Monad m => (b -> m (a, [b])) -> [b] -> m (Forest a)
-#endif
 unfoldForestM f = Prelude.mapM (unfoldTreeM f)
 
 -- | Monadic tree builder, in breadth-first order,

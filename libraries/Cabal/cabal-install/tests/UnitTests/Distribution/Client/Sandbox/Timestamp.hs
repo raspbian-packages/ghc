@@ -5,7 +5,7 @@ import System.FilePath
 import Distribution.Simple.Utils (withTempDirectory)
 import Distribution.Verbosity
 
-import Distribution.Client.Compat.Time
+import Distribution.Compat.Time
 import Distribution.Client.Sandbox.Timestamp
 
 import Test.Tasty
@@ -44,7 +44,7 @@ timestampReadTest fileContent expected =
   withTempDirectory silent "." "cabal-timestamp-" $ \dir -> do
     let fileName = dir </> "timestamp-record"
     writeFile fileName fileContent
-    tRec <- readTimestampFile fileName
+    tRec <- readTimestampFile normal fileName
     assertEqual "expected timestamp records to be equal"
       expected tRec
 
@@ -58,6 +58,6 @@ timestampReadWriteTest =
   withTempDirectory silent "." "cabal-timestamp-" $ \dir -> do
     let fileName = dir </> "timestamp-record"
     writeTimestampFile fileName timestampRecord
-    tRec <- readTimestampFile fileName
+    tRec <- readTimestampFile normal fileName
     assertEqual "expected timestamp records to be equal"
       timestampRecord tRec

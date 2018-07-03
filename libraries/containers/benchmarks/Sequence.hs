@@ -1,14 +1,15 @@
--- > ghc -DTESTING --make -O2 -fforce-recomp -i.. Sequence.hs
 module Main where
 
 import Control.Applicative
-import Control.DeepSeq
+import Control.DeepSeq (rnf)
 import Control.Exception (evaluate)
-import Criterion.Main
-import Data.List (foldl')
+import Control.Monad.Trans.State.Strict
+import Criterion.Main (bench, bgroup, defaultMain, nf)
+import Data.Foldable (foldl', foldr')
 import qualified Data.Sequence as S
 import qualified Data.Foldable
-import System.Random
+import Data.Traversable (traverse)
+import System.Random (mkStdGen, randoms)
 
 main = do
     let s10 = S.fromList [1..10] :: S.Seq Int
@@ -33,6 +34,66 @@ main = do
          [ bench "10" $ nf (shuffle r10) s10
          , bench "100" $ nf (shuffle r100) s100
          , bench "1000" $ nf (shuffle r1000) s1000
+         ]
+      , bgroup "fromList"
+         [ bench "10" $ nf S.fromList [(0 :: Int)..9]
+         , bench "100" $ nf S.fromList [(0 :: Int)..99]
+         , bench "1000" $ nf S.fromList [(0 :: Int)..999]
+         , bench "10000" $ nf S.fromList [(0 :: Int)..9999]
+         , bench "100000" $ nf S.fromList [(0 :: Int)..99999]
+         ]
+      , bgroup "partition"
+         [ bench "10" $ nf (S.partition even) s10
+         , bench "100" $ nf (S.partition even) s100
+         , bench "1000" $ nf (S.partition even) s1000
+         , bench "10000" $ nf (S.partition even) s10000
+         ]
+      , bgroup "foldl'"
+         [ bench "10" $ nf (foldl' (+) 0) s10
+         , bench "100" $ nf (foldl' (+) 0) s100
+         , bench "1000" $ nf (foldl' (+) 0) s1000
+         , bench "10000" $ nf (foldl' (+) 0) s10000
+         ]
+      , bgroup "foldr'"
+         [ bench "10" $ nf (foldr' (+) 0) s10
+         , bench "100" $ nf (foldr' (+) 0) s100
+         , bench "1000" $ nf (foldr' (+) 0) s1000
+         , bench "10000" $ nf (foldr' (+) 0) s10000
+         ]
+      , bgroup "update"
+         [ bench "10" $ nf (updatePoints r10 10) s10
+         , bench "100" $ nf (updatePoints r100 10) s100
+         , bench "1000" $ nf (updatePoints r1000 10) s1000
+         ]
+      , bgroup "adjust"
+         [ bench "10" $ nf (adjustPoints r10 (+10)) s10
+         , bench "100" $ nf (adjustPoints r100 (+10)) s100
+         , bench "1000" $ nf (adjustPoints r1000 (+10)) s1000
+         ]
+      , bgroup "deleteAt"
+         [ bench "10" $ nf (deleteAtPoints r10) s10
+         , bench "100" $ nf (deleteAtPoints r100) s100
+         , bench "1000" $ nf (deleteAtPoints r1000) s1000
+         ]
+      , bgroup "insertAt"
+         [ bench "10" $ nf (insertAtPoints r10 10) s10
+         , bench "100" $ nf (insertAtPoints r100 10) s100
+         , bench "1000" $ nf (insertAtPoints r1000 10) s1000
+         ]
+      , bgroup "traverseWithIndex/State"
+         [ bench "10" $ nf multiplyDown s10
+         , bench "100" $ nf multiplyDown s100
+         , bench "1000" $ nf multiplyDown s1000
+         ]
+      , bgroup "traverse/State"
+         [ bench "10" $ nf multiplyUp s10
+         , bench "100" $ nf multiplyUp s100
+         , bench "1000" $ nf multiplyUp s1000
+         ]
+      , bgroup "replicateA/State"
+         [ bench "10" $ nf stateReplicate 10
+         , bench "100" $ nf stateReplicate 100
+         , bench "1000" $ nf stateReplicate 1000
          ]
       , bgroup "zip"
          [ bench "ix10000/5000" $ nf (\(xs,ys) -> S.zip xs ys `S.index` 5000) (s10000, u10000)
@@ -69,6 +130,51 @@ main = do
          ]
       ]
 
+{-
+-- This is around 4.6 times as slow as insertAt
+fakeInsertAt :: Int -> a -> S.Seq a -> S.Seq a
+fakeInsertAt i x xs = case S.splitAt i xs of
+  (before, after) -> before S.>< x S.<| after
+-}
+
+adjustPoints :: [Int] -> (a -> a) -> S.Seq a -> S.Seq a
+adjustPoints points f xs =
+  foldl' (\acc k -> S.adjust f k acc) xs points
+
+insertAtPoints :: [Int] -> a -> S.Seq a -> S.Seq a
+insertAtPoints points x xs =
+  foldl' (\acc k -> S.insertAt k x acc) xs points
+
+updatePoints :: [Int] -> a -> S.Seq a -> S.Seq a
+updatePoints points x xs =
+  foldl' (\acc k -> S.update k x acc) xs points
+
+{-
+-- For comparison. Using the old implementation of update,
+-- which this simulates, can cause thunks to build up in the leaves.
+fakeupdatePoints :: [Int] -> a -> S.Seq a -> S.Seq a
+fakeupdatePoints points x xs =
+  foldl' (\acc k -> S.adjust (const x) k acc) xs points
+-}
+
+deleteAtPoints :: [Int] -> S.Seq a -> S.Seq a
+deleteAtPoints points xs =
+  foldl' (\acc k -> S.deleteAt k acc) xs points
+
+{-
+fakedeleteAtPoints :: [Int] -> S.Seq a -> S.Seq a
+fakedeleteAtPoints points xs =
+  foldl' (\acc k -> fakeDeleteAt k acc) xs points
+
+-- For comparison with deleteAt. deleteAt is several
+-- times faster for long sequences.
+fakeDeleteAt :: Int -> S.Seq a -> S.Seq a
+fakeDeleteAt i xs
+  | 0 < i && i < S.length xs = case S.splitAt i xs of
+                               (before, after) -> before S.>< S.drop 1 after
+  | otherwise = xs
+-}
+
 -- splitAt+append: repeatedly cut the sequence at a random point
 -- and rejoin the pieces in the opposite order.
 -- Finally getting the middle element forces the whole spine.
@@ -76,3 +182,23 @@ shuffle :: [Int] -> S.Seq Int -> Int
 shuffle ps s = case S.viewl (S.drop (S.length s `div` 2) (foldl' cut s ps)) of
     x S.:< _ -> x
   where cut xs p = let (front, back) = S.splitAt p xs in back S.>< front
+
+stateReplicate :: Int -> S.Seq Char
+stateReplicate n = flip evalState 0 . S.replicateA n $ do
+  old <- get
+  if old > (10 :: Int) then put 0 else put (old + 1)
+  return $ toEnum old
+
+multiplyUp :: S.Seq Int -> S.Seq Int
+multiplyUp = flip evalState 0 . traverse go where
+  go x = do
+    s <- get
+    put (s + 1)
+    return (s * x)
+
+multiplyDown :: S.Seq Int -> S.Seq Int
+multiplyDown = flip evalState 0 . S.traverseWithIndex go where
+  go i x = do
+    s <- get
+    put (s - 1)
+    return (s * i * x)

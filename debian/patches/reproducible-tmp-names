@@ -4,11 +4,9 @@ up in the resulting binary (in the debug section), but not the directory.
 Instead of using the process id, create a hash from the command line arguments,
 and assume that is going to be unique.
 
-Index: ghc-8.0.2/compiler/main/SysTools.hs
-===================================================================
---- ghc-8.0.2.orig/compiler/main/SysTools.hs
-+++ ghc-8.0.2/compiler/main/SysTools.hs
-@@ -65,6 +65,7 @@
+--- a/compiler/main/SysTools.hs
++++ b/compiler/main/SysTools.hs
+@@ -68,6 +68,7 @@ import Platform
  import Util
  import DynFlags
  import Exception
@@ -16,7 +14,7 @@ Index: ghc-8.0.2/compiler/main/SysTools.hs
  
  import LlvmCodeGen.Base (llvmVersionStr, supportedLlvmVersion)
  
-@@ -1145,8 +1146,8 @@
+@@ -1121,8 +1122,8 @@ getTempDir dflags = do
      mapping <- readIORef dir_ref
      case Map.lookup tmp_dir mapping of
          Nothing -> do
@@ -27,7 +25,7 @@ Index: ghc-8.0.2/compiler/main/SysTools.hs
              mask_ $ mkTempDir prefix
          Just dir -> return dir
    where
-@@ -1562,6 +1563,13 @@
+@@ -1558,6 +1559,13 @@ getProcessID :: IO Int
  getProcessID = System.Posix.Internals.c_getpid >>= return . fromIntegral
  #endif
  

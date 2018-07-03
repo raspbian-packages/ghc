@@ -1,13 +1,26 @@
 Changelog for the [`directory`][1] package
 ==========================================
 
+## 1.3.0.2 (February 2017)
+
+  * [optimization] Increase internal buffer size of `copyFile`
+    ([#69](https://github.com/haskell/directory/pull/69))
+
+  * Relax `time` version bounds to support 1.8.
+
+## 1.3.0.1 (January 2017)
+
+  * Relax `Win32` version bounds to support 2.5.
+    ([#67](https://github.com/haskell/directory/pull/67))
+
 ## 1.3.0.0 (December 2016)
 
-  * Drop trailing slashes in `canonicalizePath`
+  * **[breaking]** Drop trailing slashes in `canonicalizePath`
     ([#63](https://github.com/haskell/directory/issues/63))
 
-  * Rename `isSymbolicLink` to `pathIsSymbolicLink`.  The old name will remain
-    available but may be removed in the next major release.
+  * **[deprecation]** Rename `isSymbolicLink` to `pathIsSymbolicLink`.  The
+    old name will remain available but may be removed in the next major
+    release.
     ([#52](https://github.com/haskell/directory/issues/52))
 
   * Changed `canonicalizePath` to dereference symbolic links even if it points

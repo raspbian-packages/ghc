@@ -11,14 +11,14 @@
 
 #include "BeginPrivate.h"
 
-void    heapCensus         (Time t);
-nat     initHeapProfiling  (void);
-void    endHeapProfiling   (void);
-rtsBool strMatchesSelector (const char* str, const char* sel);
+void        heapCensus         (Time t);
+uint32_t    initHeapProfiling  (void);
+void        endHeapProfiling   (void);
+bool        strMatchesSelector (const char* str, const char* sel);
 
 #ifdef PROFILING
 // doingRetainerProfiling: `-hr` or `-hr<cc> -h<x>`
-rtsBool doingRetainerProfiling(void);
+bool doingRetainerProfiling(void);
 #endif
 
 #include "EndPrivate.h"

@@ -20,8 +20,8 @@ module TcClassDcl ( tcClassSigs, tcClassDecl2,
 
 import HsSyn
 import TcEnv
-import TcPat( addInlinePrags, lookupPragEnv, emptyPragEnv )
-import TcEvidence( idHsWrapper )
+import TcSigs
+import TcEvidence ( idHsWrapper )
 import TcBinds
 import TcUnify
 import TcHsType
@@ -29,6 +29,7 @@ import TcMType
 import Type     ( getClassPredTys_maybe, piResultTys )
 import TcType
 import TcRnMonad
+import DriverPhases (HscSource(..))
 import BuildTyCl( TcMethInfo )
 import Class
 import Coercion ( pprCoAxiom )
@@ -95,6 +96,10 @@ Death to "ExpandingDicts".
 ************************************************************************
 -}
 
+illegalHsigDefaultMethod :: Name -> SDoc
+illegalHsigDefaultMethod n =
+    text "Illegal default method(s) in class definition of" <+> ppr n <+> text "in hsig file"
+
 tcClassSigs :: Name                -- Name of the class
             -> [LSig Name]
             -> LHsBinds Name
@@ -113,9 +118,19 @@ tcClassSigs clas sigs def_methods
                    | n <- dm_bind_names, not (n `elemNameSet` op_names) ]
                    -- Value binding for non class-method (ie no TypeSig)
 
-       ; sequence_ [ failWithTc (badGenericMethod clas n)
-                   | (n,_) <- gen_dm_prs, not (n `elem` dm_bind_names) ]
-                   -- Generic signature without value binding
+       ; tcg_env <- getGblEnv
+       ; if tcg_src tcg_env == HsigFile
+            then
+               -- Error if we have value bindings
+               -- (Generic signatures without value bindings indicate
+               -- that a default of this form is expected to be
+               -- provided.)
+               when (not (null def_methods)) $
+                failWithTc (illegalHsigDefaultMethod clas)
+            else
+               -- Error for each generic signature without value binding
+               sequence_ [ failWithTc (badGenericMethod clas n)
+                         | (n,_) <- gen_dm_prs, not (n `elem` dm_bind_names) ]
 
        ; traceTc "tcClassSigs 2" (ppr clas)
        ; return op_info }
@@ -152,10 +167,10 @@ tcClassSigs clas sigs def_methods
 tcClassDecl2 :: LTyClDecl Name          -- The class declaration
              -> TcM (LHsBinds Id)
 
-tcClassDecl2 (L loc (ClassDecl {tcdLName = class_name, tcdSigs = sigs,
+tcClassDecl2 (L _ (ClassDecl {tcdLName = class_name, tcdSigs = sigs,
                                 tcdMeths = default_binds}))
   = recoverM (return emptyLHsBinds)     $
-    setSrcSpan loc                      $
+    setSrcSpan (getLoc class_name)      $
     do  { clas <- tcLookupLocatedClass class_name
 
         -- We make a separate binding for each default method.
@@ -213,7 +228,7 @@ tcDefMeth clas tyvars this_dict binds_in hs_sig_fn prag_fn
 
          global_dm_id  <- tcLookupId dm_name
        ; global_dm_id  <- addInlinePrags global_dm_id prags
-       ; local_dm_name <- setSrcSpan bndr_loc (newLocalName sel_name)
+       ; local_dm_name <- newNameAt (getOccName sel_name) bndr_loc
             -- Base the local_dm_name on the selector name, because
             -- type errors from tcInstanceMethodBody come from here
 
@@ -251,26 +266,27 @@ tcDefMeth clas tyvars this_dict binds_in hs_sig_fn prag_fn
 
              ctxt = FunSigCtxt sel_name warn_redundant
 
-       ; local_dm_sig <- instTcTySig ctxt hs_ty local_dm_ty local_dm_name
-        ; (ev_binds, (tc_bind, _))
+       ; let local_dm_id = mkLocalId local_dm_name local_dm_ty
+             local_dm_sig = CompleteSig { sig_bndr = local_dm_id
+                                        , sig_ctxt  = ctxt
+                                        , sig_loc   = getLoc (hsSigType hs_ty) }
+
+       ; (ev_binds, (tc_bind, _))
                <- checkConstraints (ClsSkol clas) tyvars [this_dict] $
-                  tcPolyCheck NonRecursive no_prag_fn local_dm_sig
+                  tcPolyCheck no_prag_fn local_dm_sig
                               (L bind_loc lm_bind)
 
-        ; let export = ABE { abe_poly      = global_dm_id
-                           -- We have created a complete type signature in
-                           -- instTcTySig, hence it is safe to call
-                           -- completeSigPolyId
-                           , abe_mono      = completeIdSigPolyId local_dm_sig
-                           , abe_wrap      = idHsWrapper
-                           , abe_prags     = IsDefaultMethod }
-              full_bind = AbsBinds { abs_tvs      = tyvars
-                                   , abs_ev_vars  = [this_dict]
-                                   , abs_exports  = [export]
-                                   , abs_ev_binds = [ev_binds]
-                                   , abs_binds    = tc_bind }
+       ; let export = ABE { abe_poly   = global_dm_id
+                           , abe_mono  = local_dm_id
+                           , abe_wrap  = idHsWrapper
+                           , abe_prags = IsDefaultMethod }
+             full_bind = AbsBinds { abs_tvs      = tyvars
+                                  , abs_ev_vars  = [this_dict]
+                                  , abs_exports  = [export]
+                                  , abs_ev_binds = [ev_binds]
+                                  , abs_binds    = tc_bind }
 
-        ; return (unitBag (L bind_loc full_bind)) }
+       ; return (unitBag (L bind_loc full_bind)) }
 
   | otherwise = pprPanic "tcDefMeth" (ppr sel_id)
   where
@@ -288,16 +304,18 @@ tcClassMinimalDef _clas sigs op_info
         -- That is, the given mindef should at least ensure that the
         -- class ops without default methods are required, since we
         -- have no way to fill them in otherwise
-        whenIsJust (isUnsatisfied (mindef `impliesAtom`) defMindef) $
-                   (\bf -> addWarnTc NoReason (warningMinimalDefIncomplete bf))
+        tcg_env <- getGblEnv
+        -- However, only do this test when it's not an hsig file,
+        -- since you can't write a default implementation.
+        when (tcg_src tcg_env /= HsigFile) $
+            whenIsJust (isUnsatisfied (mindef `impliesAtom`) defMindef) $
+                       (\bf -> addWarnTc NoReason (warningMinimalDefIncomplete bf))
         return mindef
   where
-    -- By default require all methods without a default
-    -- implementation whose names don't start with '_'
+    -- By default require all methods without a default implementation
     defMindef :: ClassMinimalDef
     defMindef = mkAnd [ noLoc (mkVar name)
-                      | (name, _, Nothing) <- op_info
-                      , not (startsWithUnderscore (getOccName name)) ]
+                      | (name, _, Nothing) <- op_info ]
 
 instantiateMethod :: Class -> Id -> [TcType] -> TcType
 -- Take a class operation, say
@@ -456,7 +474,7 @@ tcATDefault emit_warn loc inst_subst defined_ats (ATI fam_tc defs)
   | tyConName fam_tc `elemNameSet` defined_ats
   = return []
 
-  -- No user instance, have defaults ==> instatiate them
+  -- No user instance, have defaults ==> instantiate them
    -- Example:   class C a where { type F a b :: *; type F a b = () }
    --            instance C [x]
    -- Then we want to generate the decl:   type F [x] b = ()
@@ -498,7 +516,9 @@ warnMissingAT :: Name -> TcM ()
 warnMissingAT name
   = do { warn <- woptM Opt_WarnMissingMethods
        ; traceTc "warn" (ppr name <+> ppr warn)
-       ; warnTc (Reason Opt_WarnMissingMethods) warn  -- Warn only if -Wmissing-methods
+       ; hsc_src <- fmap tcg_src getGblEnv
+       -- Warn only if -Wmissing-methods AND not a signature
+       ; warnTc (Reason Opt_WarnMissingMethods) (warn && hsc_src /= HsigFile)
                 (text "No explicit" <+> text "associated type"
                     <+> text "or default declaration for     "
                     <+> quotes (ppr name)) }

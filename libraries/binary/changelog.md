@@ -1,6 +1,33 @@
 binary
 ======
 
+binary-0.9.0.0
+--------------
+
+- `0.8.5.0` was first released as version `0.9.0.0`. It didn't have any
+  breaking changes though, so it was again released as version `0.8.5.0`
+  according to PVP. Next breaking release of `binary` will be version
+  `0.10.0.0`.
+
+binary-0.8.5.0
+--------------
+
+- Add Binary instances for Typeable TypeReps, #131.
+
+binary-0.8.4.1
+--------------
+
+- Fix compilation with bytestring < 0.10.4.
+
+binary-0.8.4.0
+--------------
+
+- `binary` supports GHC >= 7.4.2
+- Performance improvements for `Alternative` functions.
+- put/get functions for IEEE-754 floats and doubles, #119.
+- Fix performance bugs, #115.
+- Binary instances for datatypes in `Data.Monoid` and `Data.Semigroup`, #114.
+
 binary-0.8.3.0
 --------------
 

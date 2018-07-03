@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, RecordWildCards #-}
+{-# LANGUAGE CPP, RecordWildCards, FlexibleInstances, MultiParamTypeClasses #-}
 
 -- |
 -- Package configuration information: essentially the interface to Cabal, with
@@ -11,6 +11,9 @@ module PackageConfig (
 
         -- * UnitId
         packageConfigId,
+        expandedPackageConfigId,
+        definitePackageConfigId,
+        installedPackageConfigId,
 
         -- * The PackageConfig type: information about a package
         PackageConfig,
@@ -40,22 +43,20 @@ import Unique
 -- which is similar to a subset of the InstalledPackageInfo type from Cabal.
 
 type PackageConfig = InstalledPackageInfo
+                       ComponentId
                        SourcePackageId
                        PackageName
+                       Module.InstalledUnitId
                        Module.UnitId
                        Module.ModuleName
+                       Module.Module
 
 -- TODO: there's no need for these to be FastString, as we don't need the uniq
 --       feature, but ghc doesn't currently have convenient support for any
 --       other compact string types, e.g. plain ByteString or Text.
 
-newtype ComponentId = ComponentId FastString deriving (Eq, Ord)
 newtype SourcePackageId    = SourcePackageId    FastString deriving (Eq, Ord)
 newtype PackageName        = PackageName        FastString deriving (Eq, Ord)
-
-instance BinaryStringRep ComponentId where
-  fromStringRep = ComponentId . mkFastStringByteString
-  toStringRep (ComponentId s) = fastStringToByteString s
 
 instance BinaryStringRep SourcePackageId where
   fromStringRep = SourcePackageId . mkFastStringByteString
@@ -65,39 +66,17 @@ instance BinaryStringRep PackageName where
   fromStringRep = PackageName . mkFastStringByteString
   toStringRep (PackageName s) = fastStringToByteString s
 
-instance Uniquable ComponentId where
-  getUnique (ComponentId n) = getUnique n
-
 instance Uniquable SourcePackageId where
   getUnique (SourcePackageId n) = getUnique n
 
 instance Uniquable PackageName where
   getUnique (PackageName n) = getUnique n
 
-instance Outputable ComponentId where
-  ppr (ComponentId str) = ftext str
-
 instance Outputable SourcePackageId where
   ppr (SourcePackageId str) = ftext str
 
 instance Outputable PackageName where
   ppr (PackageName str) = ftext str
-
--- | Pretty-print an 'ExposedModule' in the same format used by the textual
--- installed package database.
-pprExposedModule :: (Outputable a, Outputable b) => ExposedModule a b -> SDoc
-pprExposedModule (ExposedModule exposedName exposedReexport) =
-    sep [ ppr exposedName
-        , case exposedReexport of
-            Just m -> sep [text "from", pprOriginalModule m]
-            Nothing -> empty
-        ]
-
--- | Pretty-print an 'OriginalModule' in the same format used by the textual
--- installed package database.
-pprOriginalModule :: (Outputable a, Outputable b) => OriginalModule a b -> SDoc
-pprOriginalModule (OriginalModule originalPackageId originalModuleName) =
-    ppr originalPackageId <> char ':' <> ppr originalModuleName
 
 defaultPackageConfig :: PackageConfig
 defaultPackageConfig = emptyInstalledPackageInfo
@@ -119,10 +98,7 @@ pprPackageConfig InstalledPackageInfo {..} =
       field "version"              (text (showVersion packageVersion)),
       field "id"                   (ppr unitId),
       field "exposed"              (ppr exposed),
-      field "exposed-modules"
-        (if all isExposedModule exposedModules
-           then fsep (map pprExposedModule exposedModules)
-           else pprWithCommas pprExposedModule exposedModules),
+      field "exposed-modules"      (ppr exposedModules),
       field "hidden-modules"       (fsep (map ppr hiddenModules)),
       field "trusted"              (ppr trusted),
       field "import-dirs"          (fsep (map text importDirs)),
@@ -143,9 +119,6 @@ pprPackageConfig InstalledPackageInfo {..} =
     ]
   where
     field name body = text name <> colon <+> nest 4 body
-    isExposedModule (ExposedModule _ Nothing) = True
-    isExposedModule _ = False
-
 
 -- -----------------------------------------------------------------------------
 -- UnitId (package names, versions and dep hash)
@@ -159,5 +132,21 @@ pprPackageConfig InstalledPackageInfo {..} =
 -- version is, so these are handled specially; see #wired_in_packages#.
 
 -- | Get the GHC 'UnitId' right out of a Cabalish 'PackageConfig'
+installedPackageConfigId :: PackageConfig -> InstalledUnitId
+installedPackageConfigId = unitId
+
 packageConfigId :: PackageConfig -> UnitId
-packageConfigId = unitId
+packageConfigId p =
+    if indefinite p
+        then newUnitId (componentId p) (instantiatedWith p)
+        else DefiniteUnitId (DefUnitId (unitId p))
+
+expandedPackageConfigId :: PackageConfig -> UnitId
+expandedPackageConfigId p =
+    newUnitId (componentId p) (instantiatedWith p)
+
+definitePackageConfigId :: PackageConfig -> Maybe DefUnitId
+definitePackageConfigId p =
+    case packageConfigId p of
+        DefiniteUnitId def_uid -> Just def_uid
+        _ -> Nothing

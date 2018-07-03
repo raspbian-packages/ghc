@@ -233,6 +233,8 @@ import System.Posix.Types
 
 import GHC.Base
 import GHC.List
+import GHC.IORef
+import GHC.Num
 import GHC.IO hiding ( bracket, onException )
 import GHC.IO.IOMode
 import GHC.IO.Handle.FD
@@ -424,7 +426,7 @@ fixIO k = do
 -- | The function creates a temporary file in ReadWrite mode.
 -- The created file isn\'t deleted automatically, so you need to delete it manually.
 --
--- The file is creates with permissions such that only the current
+-- The file is created with permissions such that only the current
 -- user can read\/write it.
 --
 -- With some exceptions (see below), the file will be created securely
@@ -439,7 +441,8 @@ fixIO k = do
 openTempFile :: FilePath   -- ^ Directory in which to create the file
              -> String     -- ^ File name template. If the template is \"foo.ext\" then
                            -- the created file will be \"fooXXX.ext\" where XXX is some
-                           -- random number.
+                           -- random number. Note that this should not contain any path
+                           -- separator characters.
              -> IO (FilePath, Handle)
 openTempFile tmp_dir template
     = openTempFile' "openTempFile" tmp_dir template False 0o600
@@ -463,7 +466,10 @@ openBinaryTempFileWithDefaultPermissions tmp_dir template
 
 openTempFile' :: String -> FilePath -> String -> Bool -> CMode
               -> IO (FilePath, Handle)
-openTempFile' loc tmp_dir template binary mode = findTempName
+openTempFile' loc tmp_dir template binary mode
+    | pathSeparator `elem` template
+    = fail $ "openTempFile': Template string must not contain path separator characters: "++template
+    | otherwise = findTempName
   where
     -- We split off the last extension, so we can use .foo.ext files
     -- for temporary files (hidden on Unix OSes). Unfortunately we're
@@ -508,15 +514,16 @@ openTempFile' loc tmp_dir template binary mode = findTempName
                   | last a == pathSeparator = a ++ b
                   | otherwise = a ++ [pathSeparator] ++ b
 
--- int rand(void) from <stdlib.h>, limited by RAND_MAX (small value, 32768)
-foreign import capi "stdlib.h rand" c_rand :: IO CInt
+tempCounter :: IORef Int
+tempCounter = unsafePerformIO $ newIORef 0
+{-# NOINLINE tempCounter #-}
 
 -- build large digit-alike number
 rand_string :: IO String
 rand_string = do
-  r1 <- c_rand
-  r2 <- c_rand
-  return $ show r1 ++ show r2
+  r1 <- c_getpid
+  r2 <- atomicModifyIORef tempCounter (\n -> (n+1, n))
+  return $ show r1 ++ "-" ++ show r2
 
 data OpenNewFileResult
   = NewFileCreated CInt

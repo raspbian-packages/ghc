@@ -21,7 +21,7 @@
  * Locks assumed   :  none
  */
 void initScheduler (void);
-void exitScheduler (rtsBool wait_foreign);
+void exitScheduler (bool wait_foreign);
 void freeScheduler (void);
 void markScheduler (evac_fn evac, void *user);
 
@@ -51,11 +51,10 @@ StgWord findRetryFrameHelper (Capability *cap, StgTSO *tso);
 void scheduleWorker (Capability *cap, Task *task);
 
 /* The state of the scheduler.  This is used to control the sequence
- * of events during shutdown, and when the runtime is interrupted
- * using ^C.
+ * of events during shutdown.  See Note [shutdown] in Schedule.c.
  */
 #define SCHED_RUNNING       0  /* running as normal */
-#define SCHED_INTERRUPTING  1  /* ^C detected, before threads are deleted */
+#define SCHED_INTERRUPTING  1  /* before threads are deleted */
 #define SCHED_SHUTTING_DOWN 2  /* final shutdown */
 
 extern volatile StgWord sched_state;
@@ -102,7 +101,7 @@ extern  StgTSO *blocked_queue_hd, *blocked_queue_tl;
 extern  StgTSO *sleeping_queue;
 #endif
 
-extern rtsBool heap_overflow;
+extern bool heap_overflow;
 
 #if defined(THREADED_RTS)
 extern Mutex sched_mutex;
@@ -189,8 +188,7 @@ peekRunQueue (Capability *cap)
     return cap->run_queue_hd;
 }
 
-void removeFromRunQueue (Capability *cap, StgTSO *tso);
-extern void promoteInRunQueue (Capability *cap, StgTSO *tso);
+void promoteInRunQueue (Capability *cap, StgTSO *tso);
 
 /* Add a thread to the end of the blocked queue.
  */
@@ -210,13 +208,13 @@ appendToBlockedQueue(StgTSO *tso)
 
 /* Check whether various thread queues are empty
  */
-INLINE_HEADER rtsBool
+INLINE_HEADER bool
 emptyQueue (StgTSO *q)
 {
     return (q == END_TSO_QUEUE);
 }
 
-INLINE_HEADER rtsBool
+INLINE_HEADER bool
 emptyRunQueue(Capability *cap)
 {
     return cap->n_run_queue == 0;
@@ -235,7 +233,7 @@ truncateRunQueue(Capability *cap)
 #define EMPTY_SLEEPING_QUEUE() (emptyQueue(sleeping_queue))
 #endif
 
-INLINE_HEADER rtsBool
+INLINE_HEADER bool
 emptyThreadQueues(Capability *cap)
 {
     return emptyRunQueue(cap)

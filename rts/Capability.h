@@ -34,7 +34,16 @@ struct Capability_ {
     StgFunTable f;
     StgRegTable r;
 
-    nat no;  // capability number.
+    uint32_t no;  // capability number.
+
+    // The NUMA node on which this capability resides.  This is used to allocate
+    // node-local memory in allocate().
+    //
+    // Note: this is always equal to cap->no % n_numa_nodes.
+    // The reason we slice it this way is that if we add or remove capabilities
+    // via setNumCapabilities(), then we keep the number of capabilities on each
+    // NUMA node balanced.
+    uint32_t node;
 
     // The Task currently holding this Capability.  This task has
     // exclusive access to the contents of this Capability (apart from
@@ -44,12 +53,12 @@ struct Capability_ {
 
     // true if this Capability is running Haskell code, used for
     // catching unsafe call-ins.
-    rtsBool in_haskell;
+    bool in_haskell;
 
     // Has there been any activity on this Capability since the last GC?
-    nat idle;
+    uint32_t idle;
 
-    rtsBool disabled;
+    bool disabled;
 
     // The run queue.  The Task owning this Capability has exclusive
     // access to its run queue, so can wake up threads without
@@ -107,13 +116,14 @@ struct Capability_ {
 #if defined(THREADED_RTS)
     // Worker Tasks waiting in the wings.  Singly-linked.
     Task *spare_workers;
-    nat n_spare_workers; // count of above
+    uint32_t n_spare_workers; // count of above
 
     // This lock protects:
     //    running_task
     //    returning_tasks_{hd,tl}
     //    wakeup_queue
     //    inbox
+    //    putMVars
     Mutex lock;
 
     // Tasks waiting to return from a foreign call, or waiting to make
@@ -128,6 +138,10 @@ struct Capability_ {
     // Messages, or END_TSO_QUEUE.
     // Locks required: cap->lock
     Message *inbox;
+
+    // putMVars are really messages, but they're allocated with malloc() so they
+    // can't go on the inbox queue: the GC would get confused.
+    struct PutMVar_ *putMVars;
 
     SparkPool *sparks;
 
@@ -144,7 +158,7 @@ struct Capability_ {
     StgInvariantCheckQueue *free_invariant_check_queues;
     StgTRecChunk *free_trec_chunks;
     StgTRecHeader *free_trec_headers;
-    nat transaction_tokens;
+    uint32_t transaction_tokens;
 } // typedef Capability is defined in RtsAPI.h
   // We never want a Capability to overlap a cache line with anything
   // else, so round it up to a cache line size:
@@ -152,7 +166,6 @@ struct Capability_ {
   ATTRIBUTE_ALIGNED(64)
 #endif
   ;
-
 
 #if defined(THREADED_RTS)
 #define ASSERT_TASK_ID(task) ASSERT(task->id == osThreadId())
@@ -191,7 +204,7 @@ struct Capability_ {
   ASSERT_TASK_ID(task);
 
 #if defined(THREADED_RTS)
-rtsBool checkSparkCountInvariant (void);
+bool checkSparkCountInvariant (void);
 #endif
 
 // Converts a *StgRegTable into a *Capability.
@@ -208,7 +221,7 @@ void initCapabilities (void);
 
 // Add and initialise more Capabilities
 //
-void moreCapabilities (nat from, nat to);
+void moreCapabilities (uint32_t from, uint32_t to);
 
 // Release a capability.  This is called by a Task that is exiting
 // Haskell to make a foreign call, or in various other cases when we
@@ -219,31 +232,25 @@ void moreCapabilities (nat from, nat to);
 #if defined(THREADED_RTS)
 void releaseCapability           (Capability* cap);
 void releaseAndWakeupCapability  (Capability* cap);
-void releaseCapability_ (Capability* cap, rtsBool always_wakeup);
+void releaseCapability_ (Capability* cap, bool always_wakeup);
 // assumes cap->lock is held
 #else
 // releaseCapability() is empty in non-threaded RTS
 INLINE_HEADER void releaseCapability  (Capability* cap STG_UNUSED) {};
 INLINE_HEADER void releaseAndWakeupCapability  (Capability* cap STG_UNUSED) {};
 INLINE_HEADER void releaseCapability_ (Capability* cap STG_UNUSED,
-                                       rtsBool always_wakeup STG_UNUSED) {};
+                                       bool always_wakeup STG_UNUSED) {};
 #endif
 
 // declared in includes/rts/Threads.h:
 // extern Capability MainCapability;
 
 // declared in includes/rts/Threads.h:
-// extern nat n_capabilities;
-// extern nat enabled_capabilities;
+// extern uint32_t n_capabilities;
+// extern uint32_t enabled_capabilities;
 
 // Array of all the capabilities
-//
 extern Capability **capabilities;
-
-// The Capability that was last free.  Used as a good guess for where
-// to assign new threads.
-//
-extern Capability *last_free_capability;
 
 //
 // Types of global synchronisation
@@ -259,7 +266,7 @@ typedef enum {
 //
 typedef struct {
     SyncType type;              // The kind of synchronisation
-    rtsBool *idle;
+    bool *idle;
     Task *task;                 // The Task performing the sync
 } PendingSync;
 
@@ -281,7 +288,8 @@ extern PendingSync * volatile pending_sync;
 //
 void waitForCapability (Capability **cap/*in/out*/, Task *task);
 
-EXTERN_INLINE void recordMutableCap (StgClosure *p, Capability *cap, nat gen);
+EXTERN_INLINE void recordMutableCap (const StgClosure *p, Capability *cap,
+                                        uint32_t gen);
 
 EXTERN_INLINE void recordClosureMutated (Capability *cap, StgClosure *p);
 
@@ -298,7 +306,7 @@ EXTERN_INLINE void recordClosureMutated (Capability *cap, StgClosure *p);
 // On return: *pCap is NULL if the capability was released.  The
 // current task should then re-acquire it using waitForCapability().
 //
-rtsBool yieldCapability (Capability** pCap, Task *task, rtsBool gcAllowed);
+bool yieldCapability (Capability** pCap, Task *task, bool gcAllowed);
 
 // Wakes up a worker thread on just one Capability, used when we
 // need to service some global event.
@@ -312,7 +320,7 @@ void prodAllCapabilities (void);
 
 // Attempt to gain control of a Capability if it is free.
 //
-rtsBool tryGrabCapability (Capability *cap, Task *task);
+bool tryGrabCapability (Capability *cap, Task *task);
 
 // Try to find a spark to run
 //
@@ -320,10 +328,10 @@ StgClosure *findSpark (Capability *cap);
 
 // True if any capabilities have sparks
 //
-rtsBool anySparks (void);
+bool anySparks (void);
 
-INLINE_HEADER rtsBool emptySparkPoolCap (Capability *cap);
-INLINE_HEADER nat     sparkPoolSizeCap  (Capability *cap);
+INLINE_HEADER bool emptySparkPoolCap (Capability *cap);
+INLINE_HEADER uint32_t sparkPoolSizeCap  (Capability *cap);
 INLINE_HEADER void    discardSparksCap  (Capability *cap);
 
 #else // !THREADED_RTS
@@ -335,14 +343,9 @@ extern void grabCapability (Capability **pCap);
 
 #endif /* !THREADED_RTS */
 
-// Waits for a capability to drain of runnable threads and workers,
-// and then acquires it.  Used at shutdown time.
-//
-void shutdownCapability (Capability *cap, Task *task, rtsBool wait_foreign);
-
 // Shut down all capabilities.
 //
-void shutdownCapabilities(Task *task, rtsBool wait_foreign);
+void shutdownCapabilities(Task *task, bool wait_foreign);
 
 // cause all capabilities to context switch as soon as possible.
 void contextSwitchAllCapabilities(void);
@@ -358,19 +361,36 @@ void freeCapabilities (void);
 
 // For the GC:
 void markCapability (evac_fn evac, void *user, Capability *cap,
-                     rtsBool no_mark_sparks USED_IF_THREADS);
+                     bool no_mark_sparks USED_IF_THREADS);
 
 void markCapabilities (evac_fn evac, void *user);
 
 void traverseSparkQueues (evac_fn evac, void *user);
 
 /* -----------------------------------------------------------------------------
+   NUMA
+   -------------------------------------------------------------------------- */
+
+/* Number of logical NUMA nodes */
+extern uint32_t n_numa_nodes;
+
+/* Map logical NUMA node to OS node numbers */
+extern uint32_t numa_map[MAX_NUMA_NODES];
+
+#define capNoToNumaNode(n) ((n) % n_numa_nodes)
+
+/* -----------------------------------------------------------------------------
    Messages
    -------------------------------------------------------------------------- */
 
+typedef struct PutMVar_ {
+    StgStablePtr mvar;
+    struct PutMVar_ *link;
+} PutMVar;
+
 #ifdef THREADED_RTS
 
-INLINE_HEADER rtsBool emptyInbox(Capability *cap);
+INLINE_HEADER bool emptyInbox(Capability *cap);
 
 #endif // THREADED_RTS
 
@@ -379,7 +399,7 @@ INLINE_HEADER rtsBool emptyInbox(Capability *cap);
  * -------------------------------------------------------------------------- */
 
 EXTERN_INLINE void
-recordMutableCap (StgClosure *p, Capability *cap, nat gen)
+recordMutableCap (const StgClosure *p, Capability *cap, uint32_t gen)
 {
     bdescr *bd;
 
@@ -389,7 +409,7 @@ recordMutableCap (StgClosure *p, Capability *cap, nat gen)
     bd = cap->mut_lists[gen];
     if (bd->free >= bd->start + BLOCK_SIZE_W) {
         bdescr *new_bd;
-        new_bd = allocBlock_lock();
+        new_bd = allocBlockOnNode_lock(cap->node);
         new_bd->link = bd;
         bd = new_bd;
         cap->mut_lists[gen] = bd;
@@ -407,11 +427,11 @@ recordClosureMutated (Capability *cap, StgClosure *p)
 
 
 #if defined(THREADED_RTS)
-INLINE_HEADER rtsBool
+INLINE_HEADER bool
 emptySparkPoolCap (Capability *cap)
 { return looksEmpty(cap->sparks); }
 
-INLINE_HEADER nat
+INLINE_HEADER uint32_t
 sparkPoolSizeCap (Capability *cap)
 { return sparkPoolSize(cap->sparks); }
 
@@ -447,9 +467,10 @@ contextSwitchCapability (Capability *cap)
 
 #ifdef THREADED_RTS
 
-INLINE_HEADER rtsBool emptyInbox(Capability *cap)
+INLINE_HEADER bool emptyInbox(Capability *cap)
 {
-    return (cap->inbox == (Message*)END_TSO_QUEUE);
+    return (cap->inbox == (Message*)END_TSO_QUEUE &&
+            cap->putMVars == NULL);
 }
 
 #endif

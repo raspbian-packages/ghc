@@ -55,8 +55,8 @@ else
 # needs to make a choice which of the above two implicit rules to follow (it
 # never runs 2 recipes for the same target, unless double colon rules are
 # used, which we don't), logically it will choose the first rule: Lexer.o will
-# depend on Lexer.hs in the build directory, that file will be build, and then
-# Lexer.o can be build.
+# depend on Lexer.hs in the build directory, that file will be built, and then
+# Lexer.o can be built.
 #
 # In an sdist however, Lexer.hs is present in the source directory. It was
 # copied there during the creation of the sdist by a rule in
@@ -65,7 +65,7 @@ else
 # building from sdist and 2) the sdist creation process renamed Lexer.x to
 # Lexer.x.source. So normally make would now choose the second rule: Lexer.o
 # will depend on Lexer.hs in the source directory, for which nothing needs to
-# be done, and then Lexer.o can be build.
+# be done, and then Lexer.o can be built.
 #
 # There is however another actor in play, a rule in sdist-ghc-file.mk, which
 # after after instantiating with the same directory ($1=utils/genprimops) and
@@ -117,10 +117,10 @@ $1/$2/build/%.$$($3_hcsuf) : $1/$2/build/%.hs $$(LAX_DEPS_FOLLOW) $$$$($1_$2_HC_
 $1/$2/build/%.$$($3_osuf) : $1/$2/build/%.hs $$(LAX_DEPS_FOLLOW) $$$$($1_$2_HC_DEP)
 	$$(call cmd,$1_$2_HC) $$($1_$2_$3_ALL_HC_OPTS) -c $$< -o $$@ $$(if $$(findstring YES,$$($1_$2_DYNAMIC_TOO)),-dyno $$(addsuffix .$$(dyn_osuf),$$(basename $$@)))
 
-$1/$2/build/%.$$($3_hcsuf) : $1/$2/build/autogen/%.hs $$(LAX_DEPS_FOLLOW) $$$$($1_$2_HC_DEP)
+$1/$2/build/%.$$($3_hcsuf) : $1/$2/build/$$(or $$($1_EXECUTABLE),$$($1_$2_PROGNAME),.)/autogen/%.hs $$(LAX_DEPS_FOLLOW) $$$$($1_$2_HC_DEP)
 	$$(call cmd,$1_$2_HC) $$($1_$2_$3_ALL_HC_OPTS) -C $$< -o $$@
 
-$1/$2/build/%.$$($3_osuf) : $1/$2/build/autogen/%.hs $$(LAX_DEPS_FOLLOW) $$$$($1_$2_HC_DEP)
+$1/$2/build/%.$$($3_osuf) : $1/$2/build/$$(or $$($1_EXECUTABLE),$$($1_$2_PROGNAME),.)/autogen/%.hs $$(LAX_DEPS_FOLLOW) $$$$($1_$2_HC_DEP)
 	$$(call cmd,$1_$2_HC) $$($1_$2_$3_ALL_HC_OPTS) -c $$< -o $$@ $$(if $$(findstring YES,$$($1_$2_DYNAMIC_TOO)),-dyno $$(addsuffix .$$(dyn_osuf),$$(basename $$@)))
 
 endif

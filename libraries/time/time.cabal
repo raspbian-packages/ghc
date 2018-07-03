@@ -1,5 +1,5 @@
 name:           time
-version:        1.6.0.1
+version:        1.8.0.2
 stability:      stable
 license:        BSD3
 license-file:   LICENSE
@@ -9,7 +9,7 @@ homepage:       https://github.com/haskell/time
 bug-reports:    https://github.com/haskell/time/issues
 synopsis:       A time library
 description:    A time library
-category:       System
+category:       Time
 build-type:     Configure
 cabal-version:  >=1.10
 tested-with:    GHC == 8.0.1, GHC == 7.10.3, GHC == 7.8.4
@@ -23,8 +23,8 @@ extra-source-files:
     lib/include/HsConfigure.h
     lib/include/HsTime.h
     lib/include/HsTimeConfig.h.in
-    test/Test/*.c
-    test/Test/*.h
+    test/unix/Test/Format/*.c
+    test/unix/Test/Format/*.h
 extra-tmp-files:
     config.log
     config.status
@@ -62,6 +62,7 @@ library
         Data.Time.Calendar.Julian,
         Data.Time.Calendar.Easter,
         Data.Time.Clock,
+        Data.Time.Clock.System,
         Data.Time.Clock.POSIX,
         Data.Time.Clock.TAI,
         Data.Time.LocalTime,
@@ -74,14 +75,20 @@ library
         Data.Time.Calendar.Days,
         Data.Time.Calendar.Gregorian,
         Data.Time.Calendar.JulianYearDay,
-        Data.Time.Clock.Scale,
-        Data.Time.Clock.UTC,
-        Data.Time.Clock.CTimeval,
-        Data.Time.Clock.CTimespec,
-        Data.Time.Clock.UTCDiff,
-        Data.Time.LocalTime.TimeZone,
-        Data.Time.LocalTime.TimeOfDay,
-        Data.Time.LocalTime.LocalTime,
+        Data.Time.Clock.Internal.DiffTime,
+        Data.Time.Clock.Internal.AbsoluteTime,
+        Data.Time.Clock.Internal.NominalDiffTime,
+        Data.Time.Clock.Internal.POSIXTime,
+        Data.Time.Clock.Internal.UniversalTime,
+        Data.Time.Clock.Internal.SystemTime,
+        Data.Time.Clock.Internal.UTCTime,
+        Data.Time.Clock.Internal.CTimeval,
+        Data.Time.Clock.Internal.CTimespec,
+        Data.Time.Clock.Internal.UTCDiff,
+        Data.Time.LocalTime.Internal.TimeZone,
+        Data.Time.LocalTime.Internal.TimeOfDay,
+        Data.Time.LocalTime.Internal.LocalTime,
+        Data.Time.LocalTime.Internal.ZonedTime,
         Data.Time.Format.Parse
         Data.Time.Format.Locale
     include-dirs: lib/include
@@ -100,12 +107,63 @@ test-suite ShowDefaultTZAbbreviations
     ghc-options: -Wall -fwarn-tabs
     build-depends:
         base,
-        time == 1.6.0.1
+        time
     main-is: ShowDefaultTZAbbreviations.hs
 
-test-suite tests
+test-suite test-main
     type: exitcode-stdio-1.0
-    hs-source-dirs: test
+    hs-source-dirs: test/main
+    default-language: Haskell2010
+    default-extensions:
+        Rank2Types
+        CPP
+        DeriveDataTypeable
+        StandaloneDeriving
+        ExistentialQuantification
+        MultiParamTypeClasses
+        FlexibleInstances
+        UndecidableInstances
+        ScopedTypeVariables
+        TupleSections
+    ghc-options: -Wall -fwarn-tabs
+    build-depends:
+        base,
+        deepseq,
+        time,
+        QuickCheck,
+        tasty,
+        tasty-hunit,
+        tasty-quickcheck
+    main-is: Main.hs
+    other-modules:
+        Test.TestUtil
+        Test.Calendar.AddDays
+        Test.Calendar.AddDaysRef
+        Test.Calendar.Calendars
+        Test.Calendar.CalendarsRef
+        Test.Calendar.ClipDates
+        Test.Calendar.ClipDatesRef
+        Test.Calendar.ConvertBack
+        Test.Calendar.Easter
+        Test.Calendar.EasterRef
+        Test.Calendar.LongWeekYears
+        Test.Calendar.LongWeekYearsRef
+        Test.Calendar.MonthDay
+        Test.Calendar.MonthDayRef
+        Test.Calendar.Valid
+        Test.Clock.Conversion
+        Test.Clock.Resolution
+        Test.Clock.TAI
+        Test.Format.Format
+        Test.Format.ParseTime
+        Test.LocalTime.Time
+        Test.LocalTime.TimeRef
+
+test-suite test-unix
+    if os(windows)
+        buildable: False
+    type: exitcode-stdio-1.0
+    hs-source-dirs: test/unix
     default-language: Haskell2010
     default-extensions:
         Rank2Types
@@ -118,38 +176,20 @@ test-suite tests
         UndecidableInstances
         ScopedTypeVariables
     ghc-options: -Wall -fwarn-tabs
-    c-sources: test/Test/TestFormatStuff.c
+    c-sources: test/unix/Test/Format/FormatStuff.c
     build-depends:
         base,
         deepseq,
-        time == 1.6.0.1,
-        QuickCheck >= 2.5.1,
-        test-framework >= 0.8,
-        test-framework-quickcheck2 >= 0.3,
-        unix
-    main-is: Test.hs
+        time,
+        random,
+        QuickCheck,
+        tasty,
+        tasty-hunit,
+        tasty-quickcheck
+    if !os(windows)
+        build-depends: unix
+    main-is: Main.hs
     other-modules:
-        Test.Tests
-        Test.TestTime
-        Test.TestTimeRef
-        Test.TestParseDAT
-        Test.TAI_UTC_DAT
-        Test.TestParseDAT_Ref
-        Test.TestParseTime
-        Test.TestMonthDay
-        Test.TestMonthDayRef
-        Test.TestFormat
-        Test.TestEaster
-        Test.TestEasterRef
-        Test.TestCalendars
-        Test.TestCalendarsRef
-        Test.TestTimeZone
-        Test.TestValid
-        Test.LongWeekYears
-        Test.LongWeekYearsRef
-        Test.ConvertBack
-        Test.ClipDates
-        Test.ClipDatesRef
-        Test.AddDays
-        Test.AddDaysRef
         Test.TestUtil
+        Test.Format.Format
+        Test.LocalTime.TimeZone

@@ -217,7 +217,11 @@ import Prelude hiding           (reverse,head,tail,last,init,null
                                 ,scanl,scanl1,scanr,scanr1
                                 ,readFile,writeFile,appendFile,replicate
                                 ,getContents,getLine,putStr,putStrLn,interact
-                                ,zip,zipWith,unzip,notElem)
+                                ,zip,zipWith,unzip,notElem
+#if !MIN_VERSION_base(4,6,0)
+                                ,catch
+#endif
+                                )
 
 #if MIN_VERSION_base(4,7,0)
 import Data.Bits                (finiteBitSize, shiftL, (.|.), (.&.))
@@ -233,7 +237,7 @@ import qualified Data.List as List
 import Data.Word                (Word8)
 import Data.Maybe               (isJust)
 
-import Control.Exception        (finally, bracket, assert, throwIO)
+import Control.Exception        (IOException, catch, finally, assert, throwIO)
 import Control.Monad            (when)
 
 import Foreign.C.String         (CString, CStringLen)
@@ -251,16 +255,14 @@ import Foreign.Storable         (Storable(..))
 
 -- hGetBuf and hPutBuf not available in yhc or nhc
 import System.IO                (stdin,stdout,hClose,hFileSize
-                                ,hGetBuf,hPutBuf,openBinaryFile
+                                ,hGetBuf,hPutBuf,hGetBufNonBlocking
+                                ,hPutBufNonBlocking,withBinaryFile
                                 ,IOMode(..))
 import System.IO.Error          (mkIOError, illegalOperationErrorType)
 
 #if !(MIN_VERSION_base(4,8,0))
 import Data.Monoid              (Monoid(..))
 #endif
-
-
-import System.IO                (hGetBufNonBlocking, hPutBufNonBlocking)
 
 #if MIN_VERSION_base(4,3,0)
 import System.IO                (hGetBufSome)
@@ -318,14 +320,14 @@ singleton c = unsafeCreate 1 $ \p -> poke p c
 --
 --
 
--- | /O(n)/ Convert a '[Word8]' into a 'ByteString'.
+-- | /O(n)/ Convert a @['Word8']@ into a 'ByteString'.
 --
 -- For applications with large numbers of string literals, pack can be a
 -- bottleneck. In such cases, consider using packAddress (GHC only).
 pack :: [Word8] -> ByteString
 pack = packBytes
 
--- | /O(n)/ Converts a 'ByteString' to a '[Word8]'.
+-- | /O(n)/ Converts a 'ByteString' to a @['Word8']@.
 unpack :: ByteString -> [Word8]
 unpack bs = build (unpackFoldr bs)
 {-# INLINE unpack #-}
@@ -353,7 +355,7 @@ null (PS _ _ l) = assert (l >= 0) $ l <= 0
 -- ---------------------------------------------------------------------
 -- | /O(1)/ 'length' returns the length of a ByteString as an 'Int'.
 length :: ByteString -> Int
-length (PS _ _ l) = assert (l >= 0) $ l
+length (PS _ _ l) = assert (l >= 0) l
 {-# INLINE length #-}
 
 ------------------------------------------------------------------------
@@ -472,7 +474,7 @@ intersperse c ps@(PS x s l)
 -- | The 'transpose' function transposes the rows and columns of its
 -- 'ByteString' argument.
 transpose :: [ByteString] -> [ByteString]
-transpose ps = P.map pack (List.transpose (P.map unpack ps))
+transpose ps = P.map pack . List.transpose . P.map unpack $ ps
 
 -- ---------------------------------------------------------------------
 -- Reducing 'ByteString's
@@ -645,7 +647,7 @@ mapAccumL :: (acc -> Word8 -> (acc, Word8)) -> acc -> ByteString -> (acc, ByteSt
 mapAccumL f acc (PS fp o len) = unsafeDupablePerformIO $ withForeignPtr fp $ \a -> do
     gp   <- mallocByteString len
     acc' <- withForeignPtr gp $ \p -> mapAccumL_ acc 0 (a `plusPtr` o) p
-    return $! (acc', PS gp 0 len)
+    return (acc', PS gp 0 len)
   where
     mapAccumL_ !s !n !p1 !p2
        | n >= len = return s
@@ -1042,12 +1044,12 @@ groupBy k xs
 -- 'ByteString's and concatenates the list after interspersing the first
 -- argument between each element of the list.
 intercalate :: ByteString -> [ByteString] -> ByteString
-intercalate s = concat . (List.intersperse s)
+intercalate s = concat . List.intersperse s
 {-# INLINE [1] intercalate #-}
 
 {-# RULES
 "ByteString specialise intercalate c -> intercalateByte" forall c s1 s2 .
-    intercalate (singleton c) (s1 : s2 : []) = intercalateWithByte c s1 s2
+    intercalate (singleton c) [s1, s2] = intercalateWithByte c s1 s2
   #-}
 
 -- | /O(n)/ intercalateWithByte. An efficient way to join to two ByteStrings
@@ -1275,6 +1277,8 @@ isPrefixOf (PS x1 s1 l1) (PS x2 s2 l2)
 -- | /O(n)/ The 'stripPrefix' function takes two ByteStrings and returns 'Just'
 -- the remainder of the second iff the first is its prefix, and otherwise
 -- 'Nothing'.
+--
+-- @since 0.10.8.0
 stripPrefix :: ByteString -> ByteString -> Maybe ByteString
 stripPrefix bs1@(PS _ _ l1) bs2
    | bs1 `isPrefixOf` bs2 = Just (unsafeDrop l1 bs2)
@@ -1514,7 +1518,7 @@ sort (PS input s l) = unsafeCreate l $ \p -> allocaArray 256 $ \arr -> do
     let go 256 !_   = return ()
         go i   !ptr = do n <- peekElemOff arr i
                          when (n /= 0) $ memset ptr (fromIntegral i) n >> return ()
-                         go (i + 1) (ptr `plusPtr` (fromIntegral n))
+                         go (i + 1) (ptr `plusPtr` fromIntegral n)
     go 0 p
   where
     -- | Count the number of occurrences of each byte.
@@ -1535,9 +1539,10 @@ sort (PS input s l) = unsafeCreate l $ \p -> allocaArray 256 $ \arr -> do
 
 -- | /O(n) construction/ Use a @ByteString@ with a function requiring a
 -- null-terminated @CString@.  The @CString@ is a copy and will be freed
--- automatically.
+-- automatically; it must not be stored or used after the
+-- subcomputation finishes.
 useAsCString :: ByteString -> (CString -> IO a) -> IO a
-useAsCString (PS fp o l) action = do
+useAsCString (PS fp o l) action =
  allocaBytes (l+1) $ \buf ->
    withForeignPtr fp $ \p -> do
      memcpy buf (p `plusPtr` o) (fromIntegral l)
@@ -1546,6 +1551,7 @@ useAsCString (PS fp o l) action = do
 
 -- | /O(n) construction/ Use a @ByteString@ with a function requiring a @CStringLen@.
 -- As for @useAsCString@ this function makes a copy of the original @ByteString@.
+-- It must not be stored or used after the subcomputation finishes.
 useAsCStringLen :: ByteString -> (CStringLen -> IO a) -> IO a
 useAsCStringLen p@(PS _ _ l) f = useAsCString p $ \cstr -> f (cstr,l)
 
@@ -1622,12 +1628,11 @@ hGetLine h =
       -- if eol == True, then off is the offset of the '\n'
       -- otherwise off == w and the buffer is now empty.
         if off /= w
-            then do if (w == off + 1)
+            then do if w == off + 1
                             then writeIORef haByteBuffer buf{ bufL=0, bufR=0 }
                             else writeIORef haByteBuffer buf{ bufL = off + 1 }
                     mkBigPS new_len (xs:xss)
-            else do
-                 fill h_ buf{ bufL=0, bufR=0 } new_len (xs:xss)
+            else fill h_ buf{ bufL=0, bufR=0 } new_len (xs:xss)
 
   -- find the end-of-line character, if there is one
   findEOL r w raw
@@ -1641,8 +1646,7 @@ hGetLine h =
 mkPS :: RawBuffer Word8 -> Int -> Int -> IO ByteString
 mkPS buf start end =
  create len $ \p ->
-   withRawBuffer buf $ \pbuf -> do
-   copyBytes p (pbuf `plusPtr` start) len
+   withRawBuffer buf $ \pbuf -> copyBytes p (pbuf `plusPtr` start) len
  where
    len = end - start
 
@@ -1820,24 +1824,30 @@ interact transformer = putStr . transformer =<< getContents
 --
 readFile :: FilePath -> IO ByteString
 readFile f =
-    bracket (openBinaryFile f ReadMode) hClose $ \h -> do
-      filesz <- hFileSize h
+    withBinaryFile f ReadMode $ \h -> do
+      -- hFileSize fails if file is not regular file (like
+      -- /dev/null). Catch exception and try reading anyway.
+      filesz <- catch (hFileSize h) useZeroIfNotRegularFile
       let readsz = (fromIntegral filesz `max` 0) + 1
       hGetContentsSizeHint h readsz (readsz `max` 255)
       -- Our initial size is one bigger than the file size so that in the
       -- typical case we will read the whole file in one go and not have
       -- to allocate any more chunks. We'll still do the right thing if the
       -- file size is 0 or is changed before we do the read.
+  where
+    useZeroIfNotRegularFile :: IOException -> IO Integer
+    useZeroIfNotRegularFile _ = return 0
+
+modifyFile :: IOMode -> FilePath -> ByteString -> IO ()
+modifyFile mode f txt = withBinaryFile f mode (`hPut` txt)
 
 -- | Write a 'ByteString' to a file.
 writeFile :: FilePath -> ByteString -> IO ()
-writeFile f txt = bracket (openBinaryFile f WriteMode) hClose
-    (\h -> hPut h txt)
+writeFile = modifyFile WriteMode
 
 -- | Append a 'ByteString' to a file.
 appendFile :: FilePath -> ByteString -> IO ()
-appendFile f txt = bracket (openBinaryFile f AppendMode) hClose
-    (\h -> hPut h txt)
+appendFile = modifyFile AppendMode
 
 -- ---------------------------------------------------------------------
 -- Internal utilities
@@ -1876,7 +1886,7 @@ moduleErrorMsg fun msg = "Data.ByteString." ++ fun ++ ':':' ':msg
 
 -- Find from the end of the string using predicate
 findFromEndUntil :: (Word8 -> Bool) -> ByteString -> Int
-findFromEndUntil f ps@(PS x s l) =
-    if null ps then 0
-    else if f (unsafeLast ps) then l
-         else findFromEndUntil f (PS x s (l-1))
+findFromEndUntil f ps@(PS x s l)
+  | null ps = 0
+  | f (unsafeLast ps) = l
+  | otherwise = findFromEndUntil f (PS x s (l - 1))

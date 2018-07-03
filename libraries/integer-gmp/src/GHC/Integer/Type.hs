@@ -418,10 +418,42 @@ plusInteger (Jp# x) (Jn# y)
       GT -> bigNatToInteger (minusBigNat x y)
 {-# CONSTANT_FOLDED plusInteger #-}
 
--- TODO
--- | Subtract two 'Integer's from each other.
+-- | Subtract one 'Integer' from another.
 minusInteger :: Integer -> Integer -> Integer
-minusInteger x y = inline plusInteger x (inline negateInteger y)
+minusInteger x       (S# 0#)            = x
+minusInteger (S# x#) (S# y#)
+  = case subIntC# x# y# of
+    (# z#, 0# #) -> S# z#
+    (# 0#, _  #) -> Jn# (wordToBigNat2 1## 0##)
+    (# z#, _  #)
+      | isTrue# (z# ># 0#) -> Jn# (wordToBigNat ( (int2Word# (negateInt# z#))))
+      | True               -> Jp# (wordToBigNat ( (int2Word# z#)))
+minusInteger (S# x#) (Jp# y)
+  | isTrue# (x# >=# 0#) = bigNatToNegInteger (minusBigNatWord y (int2Word# x#))
+  | True                = Jn# (plusBigNatWord y (int2Word# (negateInt# x#)))
+minusInteger (S# x#) (Jn# y)
+  | isTrue# (x# >=# 0#) = Jp# (plusBigNatWord y (int2Word# x#))
+  | True                = bigNatToInteger (minusBigNatWord y (int2Word#
+                                                              (negateInt# x#)))
+minusInteger (Jp# x) (Jp# y)
+    = case compareBigNat x y of
+      LT -> bigNatToNegInteger (minusBigNat y x)
+      EQ -> S# 0#
+      GT -> bigNatToInteger (minusBigNat x y)
+minusInteger (Jp# x) (Jn# y) = Jp# (plusBigNat x y)
+minusInteger (Jn# x) (Jp# y) = Jn# (plusBigNat x y)
+minusInteger (Jn# x) (Jn# y)
+    = case compareBigNat x y of
+      LT -> bigNatToInteger (minusBigNat y x)
+      EQ -> S# 0#
+      GT -> bigNatToNegInteger (minusBigNat x y)
+minusInteger (Jp# x) (S# y#)
+  | isTrue# (y# >=# 0#) = bigNatToInteger (minusBigNatWord x (int2Word# y#))
+  | True                = Jp# (plusBigNatWord x (int2Word# (negateInt# y#)))
+minusInteger (Jn# x) (S# y#)
+  | isTrue# (y# >=# 0#) = Jn# (plusBigNatWord x (int2Word# y#))
+  | True                = bigNatToNegInteger (minusBigNatWord x
+                                              (int2Word# (negateInt# y#)))
 {-# CONSTANT_FOLDED minusInteger #-}
 
 -- | Multiply two 'Integer's
@@ -728,7 +760,7 @@ divModInteger n d
        in (# q', r' #)
   | True = qr
   where
-    qr@(# q, r #) = quotRemInteger n d
+    !qr@(# q, r #) = quotRemInteger n d
 {-# CONSTANT_FOLDED divModInteger #-}
 
 divInteger :: Integer -> Integer -> Integer
@@ -1002,7 +1034,7 @@ timesBigNatWord !_ 0## = zeroBigNat
 timesBigNatWord x 1## = x
 timesBigNatWord x@(BN# x#) y#
   | isTrue# (nx# ==# 1#) =
-      let (# !h#, !l# #) = timesWord2# (bigNatToWord x) y#
+      let !(# !h#, !l# #) = timesWord2# (bigNatToWord x) y#
       in wordToBigNat2 h# l#
   | True = runS $ do
         mbn@(MBN# mba#) <- newBigNat# nx#
@@ -1032,7 +1064,7 @@ bitBigNat i#
       _ <- svoid (writeBigNat# mbn li# (uncheckedShiftL# 1## bi#))
       unsafeFreezeBigNat# mbn
   where
-    (# li#, bi# #) = quotRemInt# i# GMP_LIMB_BITS#
+    !(# li#, bi# #) = quotRemInt# i# GMP_LIMB_BITS#
 
 testBitBigNat :: BigNat -> Int# -> Bool
 testBitBigNat bn i#
@@ -1040,7 +1072,7 @@ testBitBigNat bn i#
   | isTrue# (li# <# nx#) = isTrue# (testBitWord# (indexBigNat# bn li#) bi#)
   | True                 = False
   where
-    (# li#, bi# #) = quotRemInt# i# GMP_LIMB_BITS#
+    !(# li#, bi# #) = quotRemInt# i# GMP_LIMB_BITS#
     nx# = sizeofBigNat# bn
 
 testBitNegBigNat :: BigNat -> Int# -> Bool
@@ -1051,7 +1083,7 @@ testBitNegBigNat bn i#
                          (indexBigNat# bn li# `minusWord#` 1##) bi#) ==# 0#)
   | True     = isTrue# ((testBitWord# (indexBigNat# bn li#) bi#) ==# 0#)
   where
-    (# li#, bi# #) = quotRemInt# i# GMP_LIMB_BITS#
+    !(# li#, bi# #) = quotRemInt# i# GMP_LIMB_BITS#
     nx# = sizeofBigNat# bn
 
     allZ 0# = True
@@ -1074,7 +1106,7 @@ shiftLBigNat x@(BN# xba#) n# = runS $ do
   where
     xn# = sizeofBigNat# x
     yn# = xn# +# nlimbs# +# (nbits# /=# 0#)
-    (# nlimbs#, nbits# #) = quotRemInt# n# GMP_LIMB_BITS#
+    !(# nlimbs#, nbits# #) = quotRemInt# n# GMP_LIMB_BITS#
 
 
 
@@ -1108,7 +1140,7 @@ shiftRNegBigNat x@(BN# xba#) n#
   where
     xn# = sizeofBigNat# x
     yn# = xn# -# nlimbs#
-    nlimbs# = quotInt# n# GMP_LIMB_BITS#
+    nlimbs# = quotInt# (n# -# 1#) GMP_LIMB_BITS#
 
 
 orBigNat :: BigNat -> BigNat -> BigNat
@@ -1659,7 +1691,7 @@ resizeMutBigNat# (MBN# mba0#) nsz# s
         (# s'', mba# #) -> (# s'', MBN# mba# #)
   where
     bsz# = nsz# `uncheckedIShiftL#` GMP_LIMB_SHIFT#
-    (# s', n# #) = getSizeofMutableByteArray# mba0# s
+    !(# s', n# #) = getSizeofMutableByteArray# mba0# s
 
 shrinkMutBigNat# :: MutBigNat s -> GmpSize# -> State# s -> State# s
 shrinkMutBigNat# (MBN# mba0#) nsz# s
@@ -1667,13 +1699,13 @@ shrinkMutBigNat# (MBN# mba0#) nsz# s
   | True                  = shrinkMutableByteArray# mba0# bsz# s'
   where
     bsz# = nsz# `uncheckedIShiftL#` GMP_LIMB_SHIFT#
-    (# s', n# #) = getSizeofMutableByteArray# mba0# s
+    !(# s', n# #) = getSizeofMutableByteArray# mba0# s
 
 unsafeSnocFreezeBigNat# :: MutBigNat s -> GmpLimb# -> S s BigNat
 unsafeSnocFreezeBigNat# mbn0@(MBN# mba0#) limb# s = go s'
   where
     n#   = nb0# `uncheckedIShiftRL#` GMP_LIMB_SHIFT#
-    (# s', nb0# #) = getSizeofMutableByteArray# mba0# s
+    !(# s', nb0# #) = getSizeofMutableByteArray# mba0# s
     go = do
         (MBN# mba#) <- resizeMutBigNat# mbn0 (n# +# 1#)
         _ <- svoid (writeWordArray# mba# n# limb#)
@@ -1687,8 +1719,8 @@ unsafeRenormFreezeBigNat# mbn s
   | isTrue# (n#  ==# n0#) = (unsafeFreezeBigNat# mbn) s''
   | True                  = (unsafeShrinkFreezeBigNat# mbn n#) s''
   where
-    (# s', n0# #) = getSizeofMutBigNat# mbn s
-    (# s'', n# #) = normSizeofMutBigNat'# mbn n0# s'
+    !(# s', n0# #) = getSizeofMutBigNat# mbn s
+    !(# s'', n# #) = normSizeofMutBigNat'# mbn n0# s'
 
 -- | Shrink MBN
 unsafeShrinkFreezeBigNat# :: MutBigNat s -> GmpSize# -> S s BigNat
@@ -1718,7 +1750,7 @@ copyWordArray# src src_ofs dst dst_ofs len
 normSizeofMutBigNat# :: MutBigNat s -> State# s -> (# State# s, Int# #)
 normSizeofMutBigNat# mbn@(MBN# mba) s = normSizeofMutBigNat'# mbn sz# s'
   where
-    (# s', n# #) = getSizeofMutableByteArray# mba s
+    !(# s', n# #) = getSizeofMutableByteArray# mba s
     sz# = n# `uncheckedIShiftRA#` GMP_LIMB_SHIFT#
 
 -- | Find most-significant non-zero limb and return its index-position
@@ -1749,17 +1781,17 @@ byteArrayToBigNat# ba# n0#
   | isTrue# (baszr# ==# 0#) -- i.e. ba# is multiple of limb-size
   , isTrue# (baszq# ==# n#) = (BN# ba#)
   | True = runS $ \s ->
-      let (# s', mbn@(MBN# mba#) #) = newBigNat# n# s
-          (# s'', ba_sz# #) = getSizeofMutableByteArray# mba# s'
+      let !(# s', mbn@(MBN# mba#) #) = newBigNat# n# s
+          !(# s'', ba_sz# #) = getSizeofMutableByteArray# mba# s'
           go = do _ <- svoid (copyByteArray# ba# 0# mba# 0# ba_sz# )
                   unsafeFreezeBigNat# mbn
       in go s''
   where
-    (# baszq#, baszr# #) = quotRemInt# (sizeofByteArray# ba#) GMP_LIMB_BYTES#
+    !(# baszq#, baszr# #) = quotRemInt# (sizeofByteArray# ba#) GMP_LIMB_BYTES#
 
     n#  = fmssl (n0# -# 1#)
 
-    -- find most signifcant set limb, return normalized size
+    -- find most significant set limb, return normalized size
     fmssl i#
       | isTrue# (i# <# 0#)                             = 0#
       | isTrue# (neWord# (indexWordArray# ba# i#) 0##) = i# +# 1#
@@ -1880,7 +1912,7 @@ isValidBigNat# (BN# ba#)
 
     sz# = sizeofByteArray# ba#
 
-    (# szq#, szr# #) = quotRemInt# sz# GMP_LIMB_BYTES#
+    !(# szq#, szr# #) = quotRemInt# sz# GMP_LIMB_BYTES#
 
 -- | Version of 'nextPrimeInteger' operating on 'BigNat's
 --

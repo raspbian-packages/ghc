@@ -75,7 +75,7 @@ countN = Map.singleton
 ************************************************************************
 -}
 
-showStgStats :: [StgBinding] -> String
+showStgStats :: [StgTopBinding] -> String
 
 showStgStats prog
   = "STG Statistics:\n\n"
@@ -99,10 +99,8 @@ showStgStats prog
     s (SingleEntryBinds _)    = "SingleEntryBinds_Nested    "
     s (UpdatableBinds _)      = "UpdatableBinds_Nested      "
 
-gatherStgStats :: [StgBinding] -> StatEnv
-
-gatherStgStats binds
-  = combineSEs (map (statBinding True{-top-level-}) binds)
+gatherStgStats :: [StgTopBinding] -> StatEnv
+gatherStgStats binds = combineSEs (map statTopBinding binds)
 
 {-
 ************************************************************************
@@ -111,6 +109,10 @@ gatherStgStats binds
 *                                                                      *
 ************************************************************************
 -}
+
+statTopBinding :: StgTopBinding -> StatEnv
+statTopBinding (StgTopStringLit _ _) = countOne Literals
+statTopBinding (StgTopLifted bind) = statBinding True bind
 
 statBinding :: Bool -- True <=> top-level; False <=> nested
             -> StgBinding
@@ -127,7 +129,7 @@ statRhs :: Bool -> (Id, StgRhs) -> StatEnv
 statRhs top (_, StgRhsCon _ _ _)
   = countOne (ConstructorBinds top)
 
-statRhs top (_, StgRhsClosure _ _ fv u _ _ body)
+statRhs top (_, StgRhsClosure _ _ fv u _ body)
   = statExpr body                       `combineSE`
     countN FreeVariables (length fv)    `combineSE`
     countOne (
@@ -149,11 +151,11 @@ statExpr :: StgExpr -> StatEnv
 
 statExpr (StgApp _ _)     = countOne Applications
 statExpr (StgLit _)       = countOne Literals
-statExpr (StgConApp _ _)  = countOne ConstructorApps
+statExpr (StgConApp _ _ _)= countOne ConstructorApps
 statExpr (StgOpApp _ _ _) = countOne PrimitiveApps
 statExpr (StgTick _ e)    = statExpr e
 
-statExpr (StgLetNoEscape _ _ binds body)
+statExpr (StgLetNoEscape binds body)
   = statBinding False{-not top-level-} binds    `combineSE`
     statExpr body                               `combineSE`
     countOne LetNoEscapes
@@ -162,12 +164,12 @@ statExpr (StgLet binds body)
   = statBinding False{-not top-level-} binds    `combineSE`
     statExpr body
 
-statExpr (StgCase expr _ _ _ _ _ alts)
+statExpr (StgCase expr _ _ alts)
   = statExpr expr       `combineSE`
     stat_alts alts      `combineSE`
     countOne StgCases
   where
     stat_alts alts
-        = combineSEs (map statExpr [ e | (_,_,_,e) <- alts ])
+        = combineSEs (map statExpr [ e | (_,_,e) <- alts ])
 
 statExpr (StgLam {}) = panic "statExpr StgLam"

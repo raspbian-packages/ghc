@@ -19,11 +19,11 @@ module HsLit where
 #include "HsVersions.h"
 
 import {-# SOURCE #-} HsExpr( HsExpr, pprExpr )
-import BasicTypes ( FractionalLit(..),SourceText )
+import BasicTypes ( FractionalLit(..),SourceText(..),pprWithSourceText )
 import Type       ( Type )
 import Outputable
 import FastString
-import PlaceHolder ( PostTc,PostRn,DataId )
+import PlaceHolder ( PostTc,PostRn,DataId,OutputableBndrId )
 
 import Data.ByteString (ByteString)
 import Data.Data hiding ( Fixity )
@@ -38,26 +38,40 @@ import Data.Data hiding ( Fixity )
 
 -- Note [Literal source text] in BasicTypes for SourceText fields in
 -- the following
+-- | Haskell Literal
 data HsLit
-  = HsChar          SourceText Char        -- Character
-  | HsCharPrim      SourceText Char        -- Unboxed character
-  | HsString        SourceText FastString  -- String
-  | HsStringPrim    SourceText ByteString  -- Packed bytes
-  | HsInt           SourceText Integer     -- Genuinely an Int; arises from
-                                       --     TcGenDeriv, and from TRANSLATION
-  | HsIntPrim       SourceText Integer     -- literal Int#
-  | HsWordPrim      SourceText Integer     -- literal Word#
-  | HsInt64Prim     SourceText Integer     -- literal Int64#
-  | HsWord64Prim    SourceText Integer     -- literal Word64#
-  | HsInteger       SourceText Integer Type -- Genuinely an integer; arises only
-                                          --   from TRANSLATION (overloaded
-                                          --   literals are done with HsOverLit)
-  | HsRat           FractionalLit Type -- Genuinely a rational; arises only from
-                                       --   TRANSLATION (overloaded literals are
-                                       --   done with HsOverLit)
-  | HsFloatPrim     FractionalLit      -- Unboxed Float
-  | HsDoublePrim    FractionalLit      -- Unboxed Double
-  deriving (Data, Typeable)
+  = HsChar          SourceText Char
+      -- ^ Character
+  | HsCharPrim      SourceText Char
+      -- ^ Unboxed character
+  | HsString        SourceText FastString
+      -- ^ String
+  | HsStringPrim    SourceText ByteString
+      -- ^ Packed bytes
+  | HsInt           SourceText Integer
+      -- ^ Genuinely an Int; arises from
+      -- @TcGenDeriv@, and from TRANSLATION
+  | HsIntPrim       SourceText Integer
+      -- ^ literal @Int#@
+  | HsWordPrim      SourceText Integer
+      -- ^ literal @Word#@
+  | HsInt64Prim     SourceText Integer
+      -- ^ literal @Int64#@
+  | HsWord64Prim    SourceText Integer
+      -- ^ literal @Word64#@
+  | HsInteger       SourceText Integer Type
+      -- ^ Genuinely an integer; arises only
+      -- from TRANSLATION (overloaded
+      -- literals are done with HsOverLit)
+  | HsRat           FractionalLit Type
+      -- ^ Genuinely a rational; arises only from
+      -- TRANSLATION (overloaded literals are
+      -- done with HsOverLit)
+  | HsFloatPrim     FractionalLit
+      -- ^ Unboxed Float
+  | HsDoublePrim    FractionalLit
+      -- ^ Unboxed Double
+  deriving Data
 
 instance Eq HsLit where
   (HsChar _ x1)       == (HsChar _ x2)       = x1==x2
@@ -75,22 +89,23 @@ instance Eq HsLit where
   (HsDoublePrim x1)   == (HsDoublePrim x2)   = x1==x2
   _                   == _                   = False
 
-data HsOverLit id       -- An overloaded literal
+-- | Haskell Overloaded Literal
+data HsOverLit id
   = OverLit {
         ol_val :: OverLitVal,
         ol_rebindable :: PostRn id Bool, -- Note [ol_rebindable]
         ol_witness :: HsExpr id,     -- Note [Overloaded literal witnesses]
         ol_type :: PostTc id Type }
-  deriving (Typeable)
 deriving instance (DataId id) => Data (HsOverLit id)
 
 -- Note [Literal source text] in BasicTypes for SourceText fields in
 -- the following
+-- | Overloaded Literal Value
 data OverLitVal
-  = HsIntegral   !SourceText !Integer    -- Integer-looking literals;
-  | HsFractional !FractionalLit          -- Frac-looking literals
-  | HsIsString   !SourceText !FastString -- String-looking literals
-  deriving (Data, Typeable)
+  = HsIntegral   !SourceText !Integer    -- ^ Integer-looking literals;
+  | HsFractional !FractionalLit          -- ^ Frac-looking literals
+  | HsIsString   !SourceText !FastString -- ^ String-looking literals
+  deriving Data
 
 overLitType :: HsOverLit a -> PostTc a Type
 overLitType = ol_type
@@ -151,29 +166,33 @@ instance Ord OverLitVal where
   compare (HsIsString _ _)    (HsFractional _)    = GT
 
 instance Outputable HsLit where
-    ppr (HsChar _ c)       = pprHsChar c
-    ppr (HsCharPrim _ c)   = pprPrimChar c
-    ppr (HsString _ s)     = pprHsString s
-    ppr (HsStringPrim _ s) = pprHsBytes s
-    ppr (HsInt _ i)        = integer i
-    ppr (HsInteger _ i _)  = integer i
-    ppr (HsRat f _)        = ppr f
-    ppr (HsFloatPrim f)    = ppr f <> primFloatSuffix
-    ppr (HsDoublePrim d)   = ppr d <> primDoubleSuffix
-    ppr (HsIntPrim _ i)    = pprPrimInt i
-    ppr (HsWordPrim _ w)   = pprPrimWord w
-    ppr (HsInt64Prim _ i)  = pprPrimInt64 i
-    ppr (HsWord64Prim _ w) = pprPrimWord64 w
+    ppr (HsChar st c)       = pprWithSourceText st (pprHsChar c)
+    ppr (HsCharPrim st c)   = pp_st_suffix st primCharSuffix (pprPrimChar c)
+    ppr (HsString st s)     = pprWithSourceText st (pprHsString s)
+    ppr (HsStringPrim st s) = pprWithSourceText st (pprHsBytes s)
+    ppr (HsInt st i)        = pprWithSourceText st (integer i)
+    ppr (HsInteger st i _)  = pprWithSourceText st (integer i)
+    ppr (HsRat f _)         = ppr f
+    ppr (HsFloatPrim f)     = ppr f <> primFloatSuffix
+    ppr (HsDoublePrim d)    = ppr d <> primDoubleSuffix
+    ppr (HsIntPrim st i)    = pprWithSourceText st (pprPrimInt i)
+    ppr (HsWordPrim st w)   = pprWithSourceText st (pprPrimWord w)
+    ppr (HsInt64Prim st i)  = pp_st_suffix st primInt64Suffix  (pprPrimInt64 i)
+    ppr (HsWord64Prim st w) = pp_st_suffix st primWord64Suffix (pprPrimWord64 w)
+
+pp_st_suffix :: SourceText -> SDoc -> SDoc -> SDoc
+pp_st_suffix NoSourceText         _ doc = doc
+pp_st_suffix (SourceText st) suffix _   = text st <> suffix
 
 -- in debug mode, print the expression that it's resolved to, too
-instance OutputableBndr id => Outputable (HsOverLit id) where
+instance (OutputableBndrId id) => Outputable (HsOverLit id) where
   ppr (OverLit {ol_val=val, ol_witness=witness})
         = ppr val <+> (ifPprDebug (parens (pprExpr witness)))
 
 instance Outputable OverLitVal where
-  ppr (HsIntegral _ i)   = integer i
+  ppr (HsIntegral st i)  = pprWithSourceText st (integer i)
   ppr (HsFractional f)   = ppr f
-  ppr (HsIsString _ s)   = pprHsString s
+  ppr (HsIsString st s)  = pprWithSourceText st (pprHsString s)
 
 -- | pmPprHsLit pretty prints literals and is used when pretty printing pattern
 -- match warnings. All are printed the same (i.e., without hashes if they are
@@ -184,7 +203,7 @@ instance Outputable OverLitVal where
 pmPprHsLit :: HsLit -> SDoc
 pmPprHsLit (HsChar _ c)       = pprHsChar c
 pmPprHsLit (HsCharPrim _ c)   = pprHsChar c
-pmPprHsLit (HsString _ s)     = pprHsString s
+pmPprHsLit (HsString st s)    = pprWithSourceText st (pprHsString s)
 pmPprHsLit (HsStringPrim _ s) = pprHsBytes s
 pmPprHsLit (HsInt _ i)        = integer i
 pmPprHsLit (HsIntPrim _ i)    = integer i

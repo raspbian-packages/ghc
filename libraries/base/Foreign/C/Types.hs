@@ -1,6 +1,10 @@
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE NoImplicitPrelude #-}
+{-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE Trustworthy #-}
-{-# LANGUAGE CPP, NoImplicitPrelude, MagicHash, GeneralizedNewtypeDeriving,
-             StandaloneDeriving #-}
 {-# OPTIONS_GHC -Wno-unused-binds #-}
 -- XXX -Wno-unused-binds stops us warning about unused constructors,
 -- but really we should just remove them if we don't want them
@@ -10,7 +14,7 @@
 -- Module      :  Foreign.C.Types
 -- Copyright   :  (c) The FFI task force 2001
 -- License     :  BSD-style (see the file libraries/base/LICENSE)
--- 
+--
 -- Maintainer  :  ffi@haskell.org
 -- Stability   :  provisional
 -- Portability :  portable
@@ -40,7 +44,7 @@ module Foreign.C.Types
         , CShort(..),   CUShort(..),  CInt(..),      CUInt(..)
         , CLong(..),    CULong(..)
         , CPtrdiff(..), CSize(..),    CWchar(..),    CSigAtomic(..)
-        , CLLong(..),   CULLong(..)
+        , CLLong(..),   CULLong(..), CBool(..)
         , CIntPtr(..),  CUIntPtr(..), CIntMax(..),   CUIntMax(..)
 
           -- ** Numeric types
@@ -68,6 +72,10 @@ module Foreign.C.Types
         , CFloat(..),   CDouble(..)
         -- XXX GHC doesn't support CLDouble yet
         -- , CLDouble(..)
+
+          -- See Note [Exporting constructors of marshallable foreign types]
+          -- in Foreign.Ptr for why the constructors for these newtypes are
+          -- exported.
 
           -- ** Other types
 
@@ -118,6 +126,11 @@ INTEGRAL_TYPE(CLLong,HTYPE_LONG_LONG)
 -- | Haskell type representing the C @unsigned long long@ type.
 INTEGRAL_TYPE(CULLong,HTYPE_UNSIGNED_LONG_LONG)
 
+-- | Haskell type representing the C @bool@ type.
+--
+-- @since 4.10.0.0
+INTEGRAL_TYPE_WITH_CTYPE(CBool,bool,HTYPE_BOOL)
+
 {-# RULES
 "fromIntegral/a->CChar"   fromIntegral = \x -> CChar   (fromIntegral x)
 "fromIntegral/a->CSChar"  fromIntegral = \x -> CSChar  (fromIntegral x)
@@ -142,6 +155,7 @@ INTEGRAL_TYPE(CULLong,HTYPE_UNSIGNED_LONG_LONG)
 "fromIntegral/CULong->a"  fromIntegral = \(CULong  x) -> fromIntegral x
 "fromIntegral/CLLong->a"  fromIntegral = \(CLLong  x) -> fromIntegral x
 "fromIntegral/CULLong->a" fromIntegral = \(CULLong x) -> fromIntegral x
+"fromIntegral/CBool->a"   fromIntegral = \(CBool   x) -> fromIntegral x
  #-}
 
 -- | Haskell type representing the C @float@ type.
@@ -190,6 +204,7 @@ ARITHMETIC_TYPE(CTime,HTYPE_TIME_T)
 -- | Haskell type representing the C @useconds_t@ type.
 --
 -- @since 4.4.0.0
+
 ARITHMETIC_TYPE(CUSeconds,HTYPE_USECONDS_T)
 -- | Haskell type representing the C @suseconds_t@ type.
 --

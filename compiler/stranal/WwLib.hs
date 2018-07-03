@@ -8,6 +8,7 @@
 
 module WwLib ( mkWwBodies, mkWWstr, mkWorkerArgs
              , deepSplitProductType_maybe, findTypeShape
+             , isWorkerSmallEnough
  ) where
 
 #include "HsVersions.h"
@@ -15,20 +16,22 @@ module WwLib ( mkWwBodies, mkWWstr, mkWorkerArgs
 import CoreSyn
 import CoreUtils        ( exprType, mkCast )
 import Id
-import IdInfo           ( vanillaIdInfo )
+import IdInfo           ( JoinArity, vanillaIdInfo )
 import DataCon
 import Demand
-import MkCore           ( mkRuntimeErrorApp, aBSENT_ERROR_ID, mkCoreUbxTup )
+import MkCore           ( mkAbsentErrorApp, mkCoreUbxTup
+                        , mkCoreApp, mkCoreLet )
 import MkId             ( voidArgId, voidPrimId )
-import TysPrim          ( voidPrimTy )
 import TysWiredIn       ( tupleDataCon )
+import TysPrim          ( voidPrimTy )
+import Literal          ( absentLiteralOf )
 import VarEnv           ( mkInScopeSet )
+import VarSet           ( VarSet )
 import Type
+import RepType          ( isVoidTy )
 import Coercion
 import FamInstEnv
-import BasicTypes       ( Boxity(..), OneShotInfo(..), worstOneShot )
-import Literal          ( absentLiteralOf )
-import VarSet
+import BasicTypes       ( Boxity(..) )
 import TyCon
 import UniqSupply
 import Unique
@@ -110,6 +113,7 @@ the unusable strictness-info into the interfaces.
 
 type WwResult
   = ([Demand],              -- Demands for worker (value) args
+     JoinArity,             -- Number of worker (type OR value) args
      Id -> CoreExpr,        -- Wrapper body, lacking only the worker Id
      CoreExpr -> CoreExpr)  -- Worker body, lacking the original function rhs
 
@@ -117,10 +121,10 @@ mkWwBodies :: DynFlags
            -> FamInstEnvs
            -> VarSet         -- Free vars of RHS
                              -- See Note [Freshen WW arguments]
-           -> Type                                  -- Type of original function
-           -> [Demand]                              -- Strictness of original function
-           -> DmdResult                             -- Info about function result
-           -> [OneShotInfo]                         -- One-shot-ness of the function, value args only
+           -> Maybe JoinArity -- Just ar <=> is join point with join arity ar
+           -> Type           -- Type of original function
+           -> [Demand]       -- Strictness of original function
+           -> DmdResult      -- Info about function result
            -> UniqSM (Maybe WwResult)
 
 -- wrap_fn_args E       = \x y -> E
@@ -134,25 +138,27 @@ mkWwBodies :: DynFlags
 --                        let x = (a,b) in
 --                        E
 
-mkWwBodies dflags fam_envs rhs_fvs fun_ty demands res_info one_shots
-  = do  { let arg_info = demands `zip` (one_shots ++ repeat NoOneShotInfo)
-              all_one_shots = foldr (worstOneShot . snd) OneShotLam arg_info
-              empty_subst = mkEmptyTCvSubst (mkInScopeSet rhs_fvs)
+mkWwBodies dflags fam_envs rhs_fvs mb_join_arity fun_ty demands res_info
+  = do  { let empty_subst = mkEmptyTCvSubst (mkInScopeSet rhs_fvs)
                 -- See Note [Freshen WW arguments]
-        ; (wrap_args, wrap_fn_args, work_fn_args, res_ty) <- mkWWargs empty_subst fun_ty arg_info
+
+        ; (wrap_args, wrap_fn_args, work_fn_args, res_ty) <- mkWWargs empty_subst fun_ty demands
         ; (useful1, work_args, wrap_fn_str, work_fn_str) <- mkWWstr dflags fam_envs wrap_args
 
         -- Do CPR w/w.  See Note [Always do CPR w/w]
         ; (useful2, wrap_fn_cpr, work_fn_cpr, cpr_res_ty)
               <- mkWWcpr (gopt Opt_CprAnal dflags) fam_envs res_ty res_info
 
-        ; let (work_lam_args, work_call_args) = mkWorkerArgs dflags work_args all_one_shots cpr_res_ty
+        ; let (work_lam_args, work_call_args) = mkWorkerArgs dflags work_args cpr_res_ty
               worker_args_dmds = [idDemandInfo v | v <- work_call_args, isId v]
               wrapper_body = wrap_fn_args . wrap_fn_cpr . wrap_fn_str . applyToVars work_call_args . Var
               worker_body = mkLams work_lam_args. work_fn_str . work_fn_cpr . work_fn_args
 
-        ; if useful1 && not (only_one_void_argument) || useful2
-          then return (Just (worker_args_dmds, wrapper_body, worker_body))
+        ; if isWorkerSmallEnough dflags work_args
+             && not (too_many_args_for_join_point wrap_args)
+             && (useful1 && not only_one_void_argument || useful2)
+          then return (Just (worker_args_dmds, length work_call_args,
+                       wrapper_body, worker_body))
           else return Nothing
         }
         -- We use an INLINE unconditionally, even if the wrapper turns out to be
@@ -172,6 +178,23 @@ mkWwBodies dflags fam_envs rhs_fvs fun_ty demands res_info one_shots
       | otherwise
       = False
 
+    -- Note [Join points returning functions]
+    too_many_args_for_join_point wrap_args
+      | Just join_arity <- mb_join_arity
+      , wrap_args `lengthExceeds` join_arity
+      = WARN(True, text "Unable to worker/wrapper join point with arity " <+>
+                     int join_arity <+> text "but" <+>
+                     int (length wrap_args) <+> text "args")
+        True
+      | otherwise
+      = False
+
+-- See Note [Limit w/w arity]
+isWorkerSmallEnough :: DynFlags -> [Var] -> Bool
+isWorkerSmallEnough dflags vars = count isId vars <= maxWorkerArgs dflags
+    -- We count only Free variables (isId) to skip Type, Kind
+    -- variables which have no runtime representation.
+
 {-
 Note [Always do CPR w/w]
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -185,6 +208,30 @@ a disaster, because then the enclosing function might say it has the CPR
 property, but now doesn't and there a cascade of disaster.  A good example
 is Trac #5920.
 
+Note [Limit w/w arity]
+~~~~~~~~~~~~~~~~~~~~~~~~
+Guard against high worker arity as it generates a lot of stack traffic.
+A simplified example is Trac #11565#comment:6
+
+Current strategy is very simple: don't perform w/w transformation at all
+if the result produces a wrapper with arity higher than -fmax-worker-args=.
+
+It is a bit all or nothing, consider
+
+        f (x,y) (a,b,c,d,e ... , z) = rhs
+
+Currently we will remove all w/w ness entirely. But actually we could
+w/w on the (x,y) pair... it's the huge product that is the problem.
+
+Could we instead refrain from w/w on an arg-by-arg basis? Yes, that'd
+solve f. But we can get a lot of args from deeply-nested products:
+
+        g (a, (b, (c, (d, ...)))) = rhs
+
+This is harder to spot on an arg-by-arg basis. Previously mkWwStr was
+given some "fuel" saying how many arguments it could add; when we ran
+out of fuel it would stop w/wing.
+Still not very clever because it had a left-right bias.
 
 ************************************************************************
 *                                                                      *
@@ -205,23 +252,19 @@ We use the state-token type which generates no code.
 -}
 
 mkWorkerArgs :: DynFlags -> [Var]
-             -> OneShotInfo  -- Whether all arguments are one-shot
              -> Type    -- Type of body
              -> ([Var], -- Lambda bound args
                  [Var]) -- Args at call site
-mkWorkerArgs dflags args all_one_shot res_ty
+mkWorkerArgs dflags args res_ty
     | any isId args || not needsAValueLambda
     = (args, args)
     | otherwise
-    = (args ++ [newArg], args ++ [voidPrimId])
+    = (args ++ [voidArgId], args ++ [voidPrimId])
     where
       needsAValueLambda =
         isUnliftedType res_ty
         || not (gopt Opt_FunToThunk dflags)
            -- see Note [Protecting the last value argument]
-
-      -- see Note [All One-Shot Arguments of a Worker]
-      newArg = setIdOneShotInfo voidArgId all_one_shot
 
 {-
 Note [Protecting the last value argument]
@@ -237,29 +280,67 @@ create a space leak. 2) It can prevent inlining *under a lambda*. If w/w
 removes the last argument from a function f, then f now looks like a thunk, and
 so f can't be inlined *under a lambda*.
 
-Note [All One-Shot Arguments of a Worker]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Sometimes, derived join-points are just lambda-lifted thunks, whose
-only argument is of the unit type and is never used. This might
-interfere with the absence analysis, basing on which results these
-never-used arguments are eliminated in the worker. The additional
-argument `all_one_shot` of `mkWorkerArgs` is to prevent this.
+Note [Join points and beta-redexes]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Example.  Suppose we have
-   foo = \p(one-shot) q(one-shot). y + 3
-Then we drop the unused args to give
-   foo   = \pq. $wfoo void#
-   $wfoo = \void(one-shot). y + 3
+Originally, the worker would invoke the original function by calling it with
+arguments, thus producing a beta-redex for the simplifier to munch away:
 
-But suppse foo didn't have all one-shot args:
-   foo = \p(not-one-shot) q(one-shot). expensive y + 3
-Then we drop the unused args to give
-   foo   = \pq. $wfoo void#
-   $wfoo = \void(not-one-shot). y + 3
+  \x y z -> e => (\x y z -> e) wx wy wz
 
-If we made the void-arg one-shot we might inline an expensive
-computation for y, which would be terrible!
+Now that we have special rules about join points, however, this is Not Good if
+the original function is itself a join point, as then it may contain invocations
+of other join points:
 
+  join j1 x = ...
+  join j2 y = if y == 0 then 0 else j1 y
+
+  =>
+
+  join j1 x = ...
+  join $wj2 y# = let wy = I# y# in (\y -> if y == 0 then 0 else jump j1 y) wy
+  join j2 y = case y of I# y# -> jump $wj2 y#
+
+There can't be an intervening lambda between a join point's declaration and its
+occurrences, so $wj2 here is wrong. But of course, this is easy enough to fix:
+
+  ...
+  let join $wj2 y# = let wy = I# y# in let y = wy in if y == 0 then 0 else j1 y
+  ...
+
+Hence we simply do the beta-reduction here. (This would be harder if we had to
+worry about hygiene, but luckily wy is freshly generated.)
+
+Note [Join points returning functions]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+It is crucial that the arity of a join point depends on its *callers,* not its
+own syntax. What this means is that a join point can have "extra lambdas":
+
+f :: Int -> Int -> (Int, Int) -> Int
+f x y = join j (z, w) = \(u, v) -> ...
+        in jump j (x, y)
+
+Typically this happens with functions that are seen as computing functions,
+rather than being curried. (The real-life example was GraphOps.addConflicts.)
+
+When we create the wrapper, it *must* be in "eta-contracted" form so that the
+jump has the right number of arguments:
+
+f x y = join $wj z' w' = \u' v' -> let {z = z'; w = w'; u = u'; v = v'} in ...
+             j (z, w)  = jump $wj z w
+
+(See Note [Join points and beta-redexes] for where the lets come from.) If j
+were a function, we would instead say
+
+f x y = let $wj = \z' w' u' v' -> let {z = z'; w = w'; u = u'; v = v'} in ...
+            j (z, w) (u, v) = $wj z w u v
+
+Notice that the worker ends up with the same lambdas; it's only the wrapper we
+have to be concerned about.
+
+FIXME Currently the functionality to produce "eta-contracted" wrappers is
+unimplemented; we simply give up.
 
 ************************************************************************
 *                                                                      *
@@ -301,26 +382,26 @@ the \x to get what we want.
 mkWWargs :: TCvSubst            -- Freshening substitution to apply to the type
                                 --   See Note [Freshen WW arguments]
          -> Type                -- The type of the function
-         -> [(Demand,OneShotInfo)]     -- Demands and one-shot info for value arguments
+         -> [Demand]     -- Demands and one-shot info for value arguments
          -> UniqSM  ([Var],            -- Wrapper args
                      CoreExpr -> CoreExpr,      -- Wrapper fn
                      CoreExpr -> CoreExpr,      -- Worker fn
                      Type)                      -- Type of wrapper body
 
-mkWWargs subst fun_ty arg_info
-  | null arg_info
+mkWWargs subst fun_ty demands
+  | null demands
   = return ([], id, id, substTy subst fun_ty)
 
-  | ((dmd,one_shot):arg_info') <- arg_info
+  | (dmd:demands') <- demands
   , Just (arg_ty, fun_ty') <- splitFunTy_maybe fun_ty
   = do  { uniq <- getUniqueM
         ; let arg_ty' = substTy subst arg_ty
-              id = mk_wrap_arg uniq arg_ty' dmd one_shot
+              id = mk_wrap_arg uniq arg_ty' dmd
         ; (wrap_args, wrap_fn_args, work_fn_args, res_ty)
-              <- mkWWargs subst fun_ty' arg_info'
+              <- mkWWargs subst fun_ty' demands'
         ; return (id : wrap_args,
                   Lam id . wrap_fn_args,
-                  work_fn_args . (`App` varToCoreExpr id),
+                  apply_or_bind_then work_fn_args (varToCoreExpr id),
                   res_ty) }
 
   | Just (tv, fun_ty') <- splitForAllTy_maybe fun_ty
@@ -328,10 +409,10 @@ mkWWargs subst fun_ty arg_info
         ; let (subst', tv') = cloneTyVarBndr subst tv uniq
                 -- See Note [Freshen WW arguments]
         ; (wrap_args, wrap_fn_args, work_fn_args, res_ty)
-             <- mkWWargs subst' fun_ty' arg_info
+             <- mkWWargs subst' fun_ty' demands
         ; return (tv' : wrap_args,
                   Lam tv' . wrap_fn_args,
-                  work_fn_args . (`mkTyApps` [mkTyVarTy tv']),
+                  apply_or_bind_then work_fn_args (mkTyArg (mkTyVarTy tv')),
                   res_ty) }
 
   | Just (co, rep_ty) <- topNormaliseNewType_maybe fun_ty
@@ -344,7 +425,7 @@ mkWWargs subst fun_ty arg_info
         -- simply coerces.
 
   = do { (wrap_args, wrap_fn_args, work_fn_args, res_ty)
-            <-  mkWWargs subst rep_ty arg_info
+            <-  mkWWargs subst rep_ty demands
        ; let co' = substCo subst co
        ; return (wrap_args,
                   \e -> Cast (wrap_fn_args e) (mkSymCo co'),
@@ -354,15 +435,19 @@ mkWWargs subst fun_ty arg_info
   | otherwise
   = WARN( True, ppr fun_ty )                    -- Should not happen: if there is a demand
     return ([], id, id, substTy subst fun_ty)   -- then there should be a function arrow
-
+  where
+    -- See Note [Join points and beta-redexes]
+    apply_or_bind_then k arg (Lam bndr body)
+      = mkCoreLet (NonRec bndr arg) (k body)    -- Important that arg is fresh!
+    apply_or_bind_then k arg fun
+      = k $ mkCoreApp (text "mkWWargs") fun arg
 applyToVars :: [Var] -> CoreExpr -> CoreExpr
 applyToVars vars fn = mkVarApps fn vars
 
-mk_wrap_arg :: Unique -> Type -> Demand -> OneShotInfo -> Id
-mk_wrap_arg uniq ty dmd one_shot
+mk_wrap_arg :: Unique -> Type -> Demand -> Id
+mk_wrap_arg uniq ty dmd
   = mkSysLocalOrCoVar (fsLit "w") uniq ty
        `setIdDemandInfo` dmd
-       `setIdOneShotInfo` one_shot
 
 {- Note [Freshen WW arguments]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -380,7 +465,7 @@ To avoid this:
 
   * We use a fresh unique for both type-variable and term-variable binders
     Originally we lacked this freshness for type variables, and that led
-    to the very obscure Trac #12562.  (A type varaible in the worker shadowed
+    to the very obscure Trac #12562.  (A type variable in the worker shadowed
     an outer term-variable binding.)
 
   * Because of this cloning we have to substitute in the type/kind of the
@@ -498,14 +583,13 @@ mkWWstr_one dflags fam_envs arg
              <- deepSplitProductType_maybe fam_envs (idType arg)
   , cs `equalLength` inst_con_arg_tys
       -- See Note [mkWWstr and unsafeCoerce]
-  =  do { (uniq1:uniqs) <- getUniquesM
-        ; let   unpk_args      = zipWith mk_ww_local uniqs inst_con_arg_tys
-                unpk_args_w_ds = zipWithEqual "mkWWstr" set_worker_arg_info unpk_args cs
-                unbox_fn       = mkUnpackCase (Var arg) co uniq1
-                                              data_con unpk_args
-                rebox_fn       = Let (NonRec arg con_app)
-                con_app        = mkConApp2 data_con inst_tys unpk_args `mkCast` mkSymCo co
-         ; (_, worker_args, wrap_fn, work_fn) <- mkWWstr dflags fam_envs unpk_args_w_ds
+  = do { (uniq1:uniqs) <- getUniquesM
+        ; let   unpk_args = zipWith3 mk_ww_arg uniqs inst_con_arg_tys cs
+                unbox_fn  = mkUnpackCase (Var arg) co uniq1
+                                         data_con unpk_args
+                rebox_fn  = Let (NonRec arg con_app)
+                con_app   = mkConApp2 data_con inst_tys unpk_args `mkCast` mkSymCo co
+         ; (_, worker_args, wrap_fn, work_fn) <- mkWWstr dflags fam_envs unpk_args
          ; return (True, worker_args, unbox_fn . wrap_fn, work_fn . rebox_fn) }
                            -- Don't pass the arg, rebox instead
 
@@ -514,13 +598,7 @@ mkWWstr_one dflags fam_envs arg
 
   where
     dmd = idDemandInfo arg
-    one_shot = idOneShotInfo arg
-        -- If the wrapper argument is a one-shot lambda, then
-        -- so should (all) the corresponding worker arguments be
-        -- This bites when we do w/w on a case join point
-    set_worker_arg_info worker_arg demand
-      = worker_arg `setIdDemandInfo`  demand
-                   `setIdOneShotInfo` one_shot
+    mk_ww_arg uniq ty sub_dmd = setIdDemandInfo (mk_ww_local uniq ty) sub_dmd
 
 ----------------------
 nop_fn :: CoreExpr -> CoreExpr
@@ -534,9 +612,51 @@ match the number of constructor arguments; this happened in Trac #8037.
 If so, the worker/wrapper split doesn't work right and we get a Core Lint
 bug.  The fix here is simply to decline to do w/w if that happens.
 
+Note [Record evaluated-ness in worker/wrapper]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Suppose we have
+
+   data T = MkT !Int Int
+
+   f :: T -> T
+   f x = e
+
+and f's is strict, and has the CPR property.  The we are going to generate
+this w/w split
+
+   f x = case x of
+           MkT x1 x2 -> case $wf x1 x2 of
+                           (# r1, r2 #) -> MkT r1 r2
+
+   $wfw x1 x2 = let x = MkT x1 x2 in
+                case e of
+                  MkT r1 r2 -> (# r1, r2 #)
+
+Note that
+
+* In the worker $wf, inside 'e' we can be sure that x1 will be
+  evaluated (it came from unpacking the argument MkT.  But that's no
+  immediately apparent in $wf
+
+* In the wrapper 'f', which we'll inline at call sites, we can be sure
+  that 'r1' has been evaluated (because it came from unpacking the result
+  MkT.  But that is not immediately apparent from the wrapper code.
+
+Missing these facts isn't unsound, but it loses possible future
+opportunities for optimisation.
+
+Solution: use setCaseBndrEvald when creating
+ (A) The arg binders x1,x2 in mkWstr_one
+         See Trac #13077, test T13077
+ (B) The result binders r1,r2 in mkWWcpr_help
+         See Trace #13077, test T13077a
+         And Trac #13027 comment:20, item (4)
+to record that the relevant binder is evaluated.
+
+
 ************************************************************************
 *                                                                      *
-         Type scrutiny that is specfic to demand analysis
+         Type scrutiny that is specific to demand analysis
 *                                                                      *
 ************************************************************************
 
@@ -545,7 +665,7 @@ Note [Do not unpack class dictionaries]
 If we have
    f :: Ord a => [a] -> Int -> a
    {-# INLINABLE f #-}
-and we worker/wrapper f, we'll get a worker with an INLINALBE pragma
+and we worker/wrapper f, we'll get a worker with an INLINABLE pragma
 (see Note [Worker-wrapper for INLINABLE functions] in WorkWrap), which
 can still be specialised by the type-class specialiser, something like
    fw :: Ord a => [a] -> Int# -> a
@@ -555,29 +675,39 @@ BUT if f is strict in the Ord dictionary, we might unpack it, to get
 and the type-class specialiser can't specialise that.  An example is
 Trac #6056.
 
-Moreover, dictinoaries can have a lot of fields, so unpacking them can
+Moreover, dictionaries can have a lot of fields, so unpacking them can
 increase closure sizes.
 
 Conclusion: don't unpack dictionaries.
 -}
 
-deepSplitProductType_maybe :: FamInstEnvs -> Type -> Maybe (DataCon, [Type], [Type], Coercion)
+deepSplitProductType_maybe
+    :: FamInstEnvs -> Type
+    -> Maybe (DataCon, [Type], [(Type, StrictnessMark)], Coercion)
 -- If    deepSplitProductType_maybe ty = Just (dc, tys, arg_tys, co)
 -- then  dc @ tys (args::arg_tys) :: rep_ty
 --       co :: ty ~ rep_ty
+-- Why do we return the strictness of the data-con arguments?
+-- Answer: see Note [Record evaluated-ness in worker/wrapper]
 deepSplitProductType_maybe fam_envs ty
   | let (co, ty1) = topNormaliseType_maybe fam_envs ty
                     `orElse` (mkRepReflCo ty, ty)
   , Just (tc, tc_args) <- splitTyConApp_maybe ty1
   , Just con <- isDataProductTyCon_maybe tc
   , not (isClassTyCon tc)  -- See Note [Do not unpack class dictionaries]
-  = Just (con, tc_args, dataConInstArgTys con tc_args, co)
+  , let arg_tys = dataConInstArgTys con tc_args
+        strict_marks = dataConRepStrictness con
+  = Just (con, tc_args, zipEqual "dspt" arg_tys strict_marks, co)
 deepSplitProductType_maybe _ _ = Nothing
 
-deepSplitCprType_maybe :: FamInstEnvs -> ConTag -> Type -> Maybe (DataCon, [Type], [Type], Coercion)
+deepSplitCprType_maybe
+    :: FamInstEnvs -> ConTag -> Type
+    -> Maybe (DataCon, [Type], [(Type, StrictnessMark)], Coercion)
 -- If    deepSplitCprType_maybe n ty = Just (dc, tys, arg_tys, co)
 -- then  dc @ tys (args::arg_tys) :: rep_ty
 --       co :: ty ~ rep_ty
+-- Why do we return the strictness of the data-con arguments?
+-- Answer: see Note [Record evaluated-ness in worker/wrapper]
 deepSplitCprType_maybe fam_envs con_tag ty
   | let (co, ty1) = topNormaliseType_maybe fam_envs ty
                     `orElse` (mkRepReflCo ty, ty)
@@ -586,8 +716,10 @@ deepSplitCprType_maybe fam_envs con_tag ty
   , let cons = tyConDataCons tc
   , cons `lengthAtLeast` con_tag -- This might not be true if we import the
                                  -- type constructor via a .hs-bool file (#8743)
-  , let con  = cons `getNth` (con_tag - fIRST_TAG)
-  = Just (con, tc_args, dataConInstArgTys con tc_args, co)
+  , let con = cons `getNth` (con_tag - fIRST_TAG)
+        arg_tys = dataConInstArgTys con tc_args
+        strict_marks = dataConRepStrictness con
+  = Just (con, tc_args, zipEqual "dsct" arg_tys strict_marks, co)
 deepSplitCprType_maybe _ _ _ = Nothing
 
 findTypeShape :: FamInstEnvs -> Type -> TypeShape
@@ -651,18 +783,18 @@ mkWWcpr opt_CprAnal fam_envs body_ty res
                     -> WARN( True, text "mkWWcpr: non-algebraic or open body type" <+> ppr body_ty )
                        return (False, id, id, body_ty)
 
-mkWWcpr_help :: (DataCon, [Type], [Type], Coercion)
+mkWWcpr_help :: (DataCon, [Type], [(Type,StrictnessMark)], Coercion)
              -> UniqSM (Bool, CoreExpr -> CoreExpr, CoreExpr -> CoreExpr, Type)
 
 mkWWcpr_help (data_con, inst_tys, arg_tys, co)
-  | [arg_ty1] <- arg_tys
+  | [arg1@(arg_ty1, _)] <- arg_tys
   , isUnliftedType arg_ty1
         -- Special case when there is a single result of unlifted type
         --
         -- Wrapper:     case (..call worker..) of x -> C x
         -- Worker:      case (   ..body..    ) of C x -> x
   = do { (work_uniq : arg_uniq : _) <- getUniquesM
-       ; let arg       = mk_ww_local arg_uniq  arg_ty1
+       ; let arg       = mk_ww_local arg_uniq arg1
              con_app   = mkConApp2 data_con inst_tys [arg] `mkCast` mkSymCo co
 
        ; return ( True
@@ -675,11 +807,12 @@ mkWWcpr_help (data_con, inst_tys, arg_tys, co)
   | otherwise   -- The general case
         -- Wrapper: case (..call worker..) of (# a, b #) -> C a b
         -- Worker:  case (   ...body...  ) of C a b -> (# a, b #)
-  = do { (work_uniq : uniqs) <- getUniquesM
-       ; let (wrap_wild : args) = zipWith mk_ww_local uniqs (ubx_tup_ty : arg_tys)
-             ubx_tup_ty   = exprType ubx_tup_app
-             ubx_tup_app  = mkCoreUbxTup arg_tys (map varToCoreExpr args)
-             con_app      = mkConApp2 data_con inst_tys args `mkCast` mkSymCo co
+  = do { (work_uniq : wild_uniq : uniqs) <- getUniquesM
+       ; let wrap_wild   = mk_ww_local wild_uniq (ubx_tup_ty,MarkedStrict)
+             args        = zipWith mk_ww_local uniqs arg_tys
+             ubx_tup_ty  = exprType ubx_tup_app
+             ubx_tup_app = mkCoreUbxTup (map fst arg_tys) (map varToCoreExpr args)
+             con_app     = mkConApp2 data_con inst_tys args `mkCast` mkSymCo co
 
        ; return (True
                 , \ wkr_call -> Case wkr_call wrap_wild (exprType con_app)  [(DataAlt (tupleDataCon Unboxed (length arg_tys)), args, con_app)]
@@ -698,7 +831,7 @@ mkUnpackCase scrut co uniq boxing_con unpk_args body
          [(DataAlt boxing_con, unpk_args, body)]
   where
     casted_scrut = scrut `mkCast` co
-    bndr = mk_ww_local uniq (exprType casted_scrut)
+    bndr = mk_ww_local uniq (exprType casted_scrut, MarkedStrict)
 
 {-
 Note [non-algebraic or open body type warning]
@@ -757,21 +890,30 @@ example, Trac #4306.  For these we find a suitable literal,
 using Literal.absentLiteralOf.  We don't have literals for
 every primitive type, so the function is partial.
 
-    [I did try the experiment of using an error thunk for unlifted
-    things too, relying on the simplifier to drop it as dead code,
-    by making absentError
-      (a) *not* be a bottoming Id,
-      (b) be "ok for speculation"
-    But that relies on the simplifier finding that it really
-    is dead code, which is fragile, and indeed failed when
-    profiling is on, which disables various optimisations.  So
-    using a literal will do.]
+Note: I did try the experiment of using an error thunk for unlifted
+things too, relying on the simplifier to drop it as dead code.
+But this is fragile
+
+ - It fails when profiling is on, which disables various optimisations
+
+ - It fails when reboxing happens. E.g.
+      data T = MkT Int Int#
+      f p@(MkT a _) = ...g p....
+   where g is /lazy/ in 'p', but only uses the first component.  Then
+   'f' is /strict/ in 'p', and only uses the first component.  So we only
+   pass that component to the worker for 'f', which reconstructs 'p' to
+   pass it to 'g'.  Alas we can't say
+       ...f (MkT a (absentError Int# "blah"))...
+   bacause `MkT` is strict in its Int# argument, so we get an absentError
+   exception when we shouldn't.  Very annoying!
+
+So absentError is only used for lifted types.
 -}
 
 mk_absent_let :: DynFlags -> Id -> Maybe (CoreExpr -> CoreExpr)
 mk_absent_let dflags arg
   | not (isUnliftedType arg_ty)
-  = Just (Let (NonRec arg abs_rhs))
+  = Just (Let (NonRec lifted_arg abs_rhs))
   | Just tc <- tyConAppTyCon_maybe arg_ty
   , Just lit <- absentLiteralOf tc
   = Just (Let (NonRec arg (Lit lit)))
@@ -781,10 +923,14 @@ mk_absent_let dflags arg
   = WARN( True, text "No absent value for" <+> ppr arg_ty )
     Nothing
   where
-    arg_ty  = idType arg
-    abs_rhs = mkRuntimeErrorApp aBSENT_ERROR_ID arg_ty msg
-    msg     = showSDoc (gopt_set dflags Opt_SuppressUniques)
-                       (ppr arg <+> ppr (idType arg))
+    lifted_arg = arg `setIdStrictness` exnSig
+              -- Note in strictness signature that this is bottoming
+              -- (for the sake of the "empty case scrutinee not known to
+              -- diverge for sure lint" warning)
+    arg_ty     = idType arg
+    abs_rhs    = mkAbsentErrorApp arg_ty msg
+    msg        = showSDoc (gopt_set dflags Opt_SuppressUniques)
+                          (ppr arg <+> ppr (idType arg))
               -- We need to suppress uniques here because otherwise they'd
               -- end up in the generated code as strings. This is bad for
               -- determinism, because with different uniques the strings
@@ -806,5 +952,10 @@ sanitiseCaseBndr :: Id -> Id
 -- like         (x+y) `seq` ....
 sanitiseCaseBndr id = id `setIdInfo` vanillaIdInfo
 
-mk_ww_local :: Unique -> Type -> Id
-mk_ww_local uniq ty = mkSysLocalOrCoVar (fsLit "ww") uniq ty
+mk_ww_local :: Unique -> (Type, StrictnessMark) -> Id
+-- The StrictnessMark comes form the data constructor and says
+-- whether this field is strict
+-- See Note [Record evaluated-ness in worker/wrapper]
+mk_ww_local uniq (ty,str)
+  = setCaseBndrEvald str $
+    mkSysLocalOrCoVar (fsLit "ww") uniq ty

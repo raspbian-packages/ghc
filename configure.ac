@@ -13,7 +13,7 @@ dnl
 # see what flags are available. (Better yet, read the documentation!)
 #
 
-AC_INIT([The Glorious Glasgow Haskell Compilation System], [8.0.2], [glasgow-haskell-bugs@haskell.org], [ghc-AC_PACKAGE_VERSION])
+AC_INIT([The Glorious Glasgow Haskell Compilation System], [8.2.2], [glasgow-haskell-bugs@haskell.org], [ghc-AC_PACKAGE_VERSION])
 
 # Set this to YES for a released version, otherwise NO
 : ${RELEASE=YES}
@@ -32,6 +32,11 @@ if test ! -f mk/config.h.in; then
 fi
 
 AC_SUBST([CONFIGURE_ARGS], [$ac_configure_args])
+
+dnl this makes sure `./configure --target=<cross-compile-target>`
+dnl works as expected, since we're slightly modifying how Autoconf
+dnl interprets build/host/target and how this interacts with $CC tests
+test -n "$target_alias" && ac_tool_prefix=$target_alias-
 
 dnl ----------------------------------------------------------
 dnl ** Find unixy sort and find commands,
@@ -107,10 +112,15 @@ AC_ARG_ENABLE(tarballs-autodownload,
         TarballsAutodownload=YES,
         TarballsAutodownload=NO
 )
+
+dnl CC_STAGE0 is like the "previous" variable CC (inherited by CC_STAGE[123])
+dnl but instead used by stage0 for bootstrapping stage1
+AC_ARG_VAR(CC_STAGE0, [C compiler command (bootstrap)])
+
 if test "$WithGhc" != ""; then
   FPTOOLS_GHC_VERSION([GhcVersion], [GhcMajVersion], [GhcMinVersion], [GhcPatchLevel])dnl
 
-  if test "$GhcMajVersion" = "unknown" -o "$GhcMinVersion" = "unknown"; then
+  if test "$GhcMajVersion" = "unknown" || test "$GhcMinVersion" = "unknown"; then
      AC_MSG_ERROR([Cannot determine the version of $WithGhc.  Is it really GHC?])
   fi
 
@@ -121,7 +131,11 @@ if test "$WithGhc" != ""; then
   GhcMinVersion2=`echo "$GhcMinVersion" | sed 's/^\\(.\\)$/0\\1/'`
   GhcCanonVersion="$GhcMajVersion$GhcMinVersion2"
 
-  BOOTSTRAPPING_GHC_INFO_FIELD([CC_STAGE0],[C compiler command])
+  dnl infer CC_STAGE0 from `ghc --info` unless explicitly set by user
+  if test -z "$CC_STAGE0"; then
+    BOOTSTRAPPING_GHC_INFO_FIELD([CC_STAGE0],[C compiler command])
+  fi
+
   BOOTSTRAPPING_GHC_INFO_FIELD([LD_STAGE0],[ld command])
   BOOTSTRAPPING_GHC_INFO_FIELD([AR_STAGE0],[ar command])
   BOOTSTRAPPING_GHC_INFO_FIELD([AR_OPTS_STAGE0],[ar flags])
@@ -133,8 +147,8 @@ if test "$WithGhc" = ""
 then
     AC_MSG_ERROR([GHC is required.])
 fi
-FP_COMPARE_VERSIONS([$GhcVersion],[-lt],[7.8],
-    [AC_MSG_ERROR([GHC version 7.8 or later is required to compile GHC.])])
+FP_COMPARE_VERSIONS([$GhcVersion],[-lt],[7.10],
+    [AC_MSG_ERROR([GHC version 7.10 or later is required to compile GHC.])])
 
 if test `expr $GhcMinVersion % 2` = "1"
 then
@@ -150,17 +164,6 @@ fi
 
 GHC_PACKAGE_DB_FLAG=package-db
 AC_SUBST(GHC_PACKAGE_DB_FLAG)
-
-# GHC 7.7+ needs -fcmm-sink when compiling Parser.hs. See #8182
-FP_COMPARE_VERSIONS([$GhcVersion],[-gt],[7.7],
-                    CMM_SINK_BOOTSTRAP_IS_NEEDED=YES,
-                    CMM_SINK_BOOTSTRAP_IS_NEEDED=NO)
-AC_SUBST(CMM_SINK_BOOTSTRAP_IS_NEEDED)
-
-FP_COMPARE_VERSIONS([$GhcVersion],[-lt],[7.9],
-                    SUPPORTS_COMPONENT_ID=NO,
-                    SUPPORTS_COMPONENT_ID=YES)
-AC_SUBST(SUPPORTS_COMPONENT_ID)
 
 FP_COMPARE_VERSIONS([$GhcVersion],[-lt],[7.11],
                     SUPPORTS_THIS_UNIT_ID=NO,
@@ -242,8 +245,8 @@ AC_SUBST(SOLARIS_BROKEN_SHLD)
 
 dnl ** Do an unregisterised build?
 dnl --------------------------------------------------------------
-case "$HostArch" in
-    i386|x86_64|powerpc|powerpc64|powerpc64le|arm)
+case "$TargetArch" in
+    i386|x86_64|powerpc|powerpc64|powerpc64le|arm|aarch64)
         UnregisterisedDefault=NO
         ;;
     *)
@@ -263,17 +266,19 @@ AC_ARG_ENABLE(unregisterised,
 )
 AC_SUBST(Unregisterised)
 
-AC_ARG_WITH(hc,
-[AC_HELP_STRING([--with-hc=ARG],
-        [Use ARG as the path to the compiler for compiling ordinary
-         Haskell code  (default= value of --with-ghc)])],
-[WithHc="$withval"],
-[WithHc=$WithGhc]
-)
-AC_SUBST(WithHc)
+dnl ** Does target have runtime linker support?
+dnl --------------------------------------------------------------
+case "$target" in
+    powerpc64-*|powerpc64le-*|powerpc-ibm-aix*)
+        HaskellHaveRTSLinker=NO
+        ;;
+    *)
+        HaskellHaveRTSLinker=YES
+        ;;
+esac
+AC_SUBST(HaskellHaveRTSLinker)
 
-# This uses GHC, so put it after the "GHC is required" check above:
-FP_INTREE_GHC_PWD
+# Requires FPTOOLS_SET_PLATFORM_VARS to be run first.
 FP_FIND_ROOT
 
 fail() {
@@ -396,24 +401,6 @@ FP_CURSES
 
 XCODE_VERSION()
 
-SplitObjsBroken=NO
-if test "$TargetOS_CPP" = "darwin"
-then
-    # Split objects is broken (#4013) with XCode < 3.2
-    if test "$XCodeVersion1" -lt 3
-    then
-        SplitObjsBroken=YES
-    else
-        if test "$XCodeVersion1" -eq 3
-        then
-            if test "$XCodeVersion2" -lt 2
-            then
-                SplitObjsBroken=YES
-            fi
-        fi
-    fi
-fi
-AC_SUBST([SplitObjsBroken])
 
 dnl ** Building a cross compiler?
 dnl --------------------------------------------------------------
@@ -440,26 +427,56 @@ with a cross-compiler.  To cross-compile GHC itself, set TARGET: stage
 GHC.
 ])
 fi
+# Despite its similarity in name to TargetPlatform, TargetPlatformFull is used
+# in calls to subproject configure scripts and thus must be set to the autoconf
+# triple, not the normalized GHC triple that TargetPlatform is set to.
+#
+# We use the non-canonicalized triple, target_alias, here since the subproject
+# configure scripts will use this triple to construct the names of the toolchain
+# executables. If we instead passed down the triple produced by
+# AC_CANONICAL_TARGET then it may look for the target toolchain under the wrong
+# name (this is a known problem in the case of the Android NDK, which has
+# slightly odd triples).
+#
+# It may be better to just do away with the GHC triples altogether. This would
+# all be taken care of for us if we configured the subprojects using
+# AC_CONFIG_DIR, but unfortunately Cabal needs to be the one to do the
+# configuration.
+#
+# We also use non-canonicalized triple when install stage1 crosscompiler
+if test -z "${target_alias}"
+then
+  # --target wasn't given; use result from AC_CANONICAL_TARGET
+  TargetPlatformFull="${target}"
+else
+  TargetPlatformFull="${target_alias}"
+fi
 if test "$CrossCompiling" = "YES"
 then
-  CrossCompilePrefix="${target}-"
+  # Use value passed by user from --target=
+  CrossCompilePrefix="${TargetPlatformFull}-"
 else
   CrossCompilePrefix=""
 fi
-TargetPlatformFull="${TargetPlatform}"
 AC_SUBST(CrossCompiling)
 AC_SUBST(CrossCompilePrefix)
 AC_SUBST(TargetPlatformFull)
 
 dnl ** Which gcc to use?
 dnl --------------------------------------------------------------
-FIND_GCC([WhatGccIsCalled], [gcc], [gcc])
-CC="$WhatGccIsCalled"
-export CC
 
-# If --with-gcc was used, and we're not cross-compiling, then it also
-# applies to the stage0 compiler.
-MAYBE_OVERRIDE_STAGE0([gcc],[CC_STAGE0])
+AC_ARG_WITH([gcc],
+        AS_HELP_STRING([--with-gcc=ARG], [Use ARG as the path to gcc (obsolete, use CC=ARG instead) [default=autodetect]]),
+        AC_MSG_ERROR([--with-gcc=$withval is obsolete (use './configure CC=$withval' or 'CC=$withval ./configure' instead)]))
+
+AC_ARG_WITH([clang],
+        AS_HELP_STRING([--with-clang=ARG], [Use ARG as the path to gcc (obsolete, use CC=ARG instead) [default=autodetect]]),
+        AC_MSG_ERROR([--with-clang=$withval is obsolete (use './configure CC=$withval' or 'CC=$withval ./configure' instead)]))
+
+dnl detect compiler (prefer gcc over clang) and set $CC (unless CC already set),
+dnl later CC is copied to CC_STAGE{1,2,3}
+AC_PROG_CC([gcc clang])
+
 MAYBE_OVERRIDE_STAGE0([ar],[AR_STAGE0])
 
 dnl make extensions visible to allow feature-tests to detect them lateron
@@ -473,14 +490,49 @@ FP_CPP_CMD_WITH_ARGS(HaskellCPPCmd, HaskellCPPArgs)
 AC_SUBST([HaskellCPPCmd])
 AC_SUBST([HaskellCPPArgs])
 
-dnl ** Which ld to use?
+FP_SET_CFLAGS_C99([CC],[CFLAGS],[CPPFLAGS])
+FP_SET_CFLAGS_C99([CC_STAGE0],[CONF_CC_OPTS_STAGE0],[CONF_CPP_OPTS_STAGE0])
+FP_SET_CFLAGS_C99([CC],[CONF_CC_OPTS_STAGE1],[CONF_CPP_OPTS_STAGE1])
+FP_SET_CFLAGS_C99([CC],[CONF_CC_OPTS_STAGE2],[CONF_CPP_OPTS_STAGE2])
+
+dnl ** Choose a linker
 dnl --------------------------------------------------------------
-FIND_LD([LdCmd])
+FIND_LD([$target],[GccUseLdOpt])
+CONF_GCC_LINKER_OPTS_STAGE1="$CONF_GCC_LINKER_OPTS_STAGE1 $GccUseLdOpt"
+CONF_GCC_LINKER_OPTS_STAGE2="$CONF_GCC_LINKER_OPTS_STAGE2 $GccUseLdOpt"
+LdCmd="$LD"
+CFLAGS="$CFLAGS $GccUseLdOpt"
 AC_SUBST([LdCmd])
 
 dnl ** Which nm to use?
 dnl --------------------------------------------------------------
 FP_ARG_WITH_PATH_GNU_PROG([NM], [nm], [nm])
+
+if test "$TargetOS_CPP" = "darwin"
+then
+    AC_MSG_CHECKING(whether nm program is broken)
+    # Some versions of XCode ship a broken version of `nm`. Detect and work
+    # around this issue. See : https://ghc.haskell.org/trac/ghc/ticket/11744
+    nmver=$(${NM} --version | grep version | sed 's/ //g')
+    case "$nmver" in
+        LLVMversion7.3.0|LLVMversion7.3.1)
+            AC_MSG_RESULT(yes)
+            echo "The detected nm program is broken."
+            echo
+            echo "See: https://ghc.haskell.org/trac/ghc/ticket/11744"
+            echo
+            echo "Try re-running configure with:"
+            echo
+            echo '   ./configure --with-nm=$(xcrun --find nm-classic)'
+            echo
+            exit 1
+            ;;
+        *)
+            AC_MSG_RESULT(no)
+            ;;
+        esac
+fi
+
 NmCmd="$NM"
 AC_SUBST([NmCmd])
 
@@ -519,7 +571,7 @@ esac
 # tools we are looking for. In the past, GHC supported a number of
 # versions of LLVM simultaneously, but that stopped working around
 # 3.5/3.6 release of LLVM.
-LlvmVersion=3.7
+LlvmVersion=3.9
 AC_SUBST([LlvmVersion])
 sUPPORTED_LLVM_VERSION=$(echo \($LlvmVersion\) | sed 's/\./,/')
 AC_DEFINE_UNQUOTED([sUPPORTED_LLVM_VERSION], ${sUPPORTED_LLVM_VERSION}, [The supported LLVM version number])
@@ -542,73 +594,6 @@ dnl --------------------------------------------------------------
 
 
 dnl --------------------------------------------------------------
-dnl * General configuration checks
-dnl --------------------------------------------------------------
-
-dnl ** Bug 9439: Some GHC 7.8 releases had broken LLVM code generator.
-dnl Unfortunately we don't know whether the user is going to request a
-dnl build with the LLVM backend as this is only given in build.mk.
-dnl
-dnl Instead, we try to do as much work as possible here, checking
-dnl whether -fllvm is the stage 0 compiler's default. If so we
-dnl fail. If not, we check whether -fllvm is affected explicitly and
-dnl if so set a flag. The build system will later check this flag
-dnl after the desired build flags are known.
-
-dnl This problem is further complicated by the fact that the llvm
-dnl version used by the bootstrap compiler may be different from the
-dnl version we arre trying to compile GHC against. Therefore, we need
-dnl to find the boostrap compiler's `settings` file then check to see
-dnl if the `opt` and `llc` command strings are non-empty and if these
-dnl programs exist. Only if they exist to we test for bug #9439.
-
-FIND_GHC_BOOTSTRAP_PROG([BootstrapLlcCmd], [${WithGhc}], "LLVM llc command")
-FIND_GHC_BOOTSTRAP_PROG([BootstrapOptCmd], [${WithGhc}], "LLVM opt command")
-
-if test -n "$BootstrapLlcCmd" && test -n "$BootstrapOptCmd"
-then
-    AC_MSG_CHECKING(whether bootstrap compiler is affected by bug 9439)
-    echo "main = putStrLn \"%function\"" > conftestghc.hs
-
-    # Check whether LLVM backend is default for this platform
-    "${WithGhc}" -pgmlc="${BootstrapLlcCmd}" -pgmlo="${BootstrapOptCmd}" conftestghc.hs 2>&1 >/dev/null
-    res=`./conftestghc`
-    if test "x$res" = "x%object"
-    then
-        AC_MSG_RESULT(yes)
-        echo "Buggy bootstrap compiler"
-        echo ""
-        echo "The stage 0 compiler $WithGhc is affected by GHC Bug \#9439"
-        echo "and therefore will miscompile the LLVM backend if -fllvm is"
-        echo "used."
-        echo
-        echo "Please use another bootstrap compiler"
-        exit 1
-    fi
-
-    # -fllvm is not the default, but set a flag so the Makefile can check
-    # -for it in the build flags later on
-    "${WithGhc}" -fforce-recomp -pgmlc="${BootstrapLlcCmd}" -pgmlo="${BootstrapOptCmd}" -fllvm conftestghc.hs 2>&1 >/dev/null
-    if test $? = 0
-    then
-        res=`./conftestghc`
-        if test "x$res" = "x%object"
-        then
-            AC_MSG_RESULT(yes)
-            GHC_LLVM_AFFECTED_BY_9439=1
-        elif test "x$res" = "x%function"
-        then
-            AC_MSG_RESULT(no)
-            GHC_LLVM_AFFECTED_BY_9439=0
-        else
-            AC_MSG_WARN(unexpected output $res)
-        fi
-    else
-        AC_MSG_RESULT(failed to compile, assuming no)
-    fi
-fi
-AC_SUBST([GHC_LLVM_AFFECTED_BY_9439])
-
 dnl ** Can the unix package be built?
 dnl --------------------------------------------------------------
 
@@ -623,23 +608,25 @@ AC_SUBST([GhcLibsWithUnix])
 dnl ** does #! work?
 AC_SYS_INTERPRETER()
 
+# Check for split-objs
+SplitObjsBroken=NO
 dnl ** look for `perl'
 case $HostOS_CPP in
 cygwin32|mingw32)
-    PerlCmd=$hardtop/inplace/perl/perl
-    ;;
+  PerlCmd=$hardtop/inplace/perl/perl
+  ;;
 *)
-    AC_PATH_PROG(PerlCmd,perl)
+    AC_PATH_PROG([PerlCmd],[perl])
     if test -z "$PerlCmd"
     then
-        echo "You must install perl before you can continue"
-        echo "Perhaps it is already installed, but not in your PATH?"
-        exit 1
+        AC_MSG_WARN([No Perl on PATH, disabling split object support])
+        SplitObjsBroken=YES
     else
         FPTOOLS_CHECK_PERL_VERSION
     fi
     ;;
 esac
+AC_SUBST([SplitObjsBroken])
 
 dnl ** look for GCC and find out which version
 dnl     Figure out which C compiler to use.  Gcc is preferred.
@@ -724,6 +711,11 @@ dnl ** check for tar
 dnl   if GNU tar is named gtar, look for it first.
 AC_PATH_PROGS(TarCmd,gnutar gtar tar,tar)
 
+dnl ** check for compressors
+AC_PATH_PROGS(Bzip2Cmd,bzip2, bzip2)
+AC_PATH_PROGS(GzipCmd,gzip, gzip)
+AC_PATH_PROGS(XzCmd,pxz xz, xz)
+
 dnl ** check for patch
 dnl if GNU patch is named gpatch, look for it first
 AC_PATH_PROGS(PatchCmd,gpatch patch, patch)
@@ -788,7 +780,7 @@ dnl    off_t, because it will affect the result of that test.
 AC_SYS_LARGEFILE
 
 dnl ** check for specific header (.h) files that we are interested in
-AC_CHECK_HEADERS([ctype.h dirent.h dlfcn.h errno.h fcntl.h grp.h limits.h locale.h nlist.h pthread.h pwd.h signal.h sys/param.h sys/mman.h sys/resource.h sys/select.h sys/time.h sys/timeb.h sys/timers.h sys/times.h sys/utsname.h sys/wait.h termios.h time.h utime.h windows.h winsock.h sched.h])
+AC_CHECK_HEADERS([ctype.h dirent.h dlfcn.h errno.h fcntl.h grp.h limits.h locale.h nlist.h pthread.h pwd.h signal.h sys/param.h sys/mman.h sys/resource.h sys/select.h sys/time.h sys/timeb.h sys/timerfd.h sys/timers.h sys/times.h sys/utsname.h sys/wait.h termios.h time.h utime.h windows.h winsock.h sched.h])
 
 dnl sys/cpuset.h needs sys/param.h to be included first on FreeBSD 9.1; #7708
 AC_CHECK_HEADERS([sys/cpuset.h], [], [],
@@ -804,47 +796,37 @@ dnl ** do we have long longs?
 AC_CHECK_TYPES([long long])
 
 dnl ** what are the sizes of various types
-AC_CHECK_SIZEOF(char,               1)
-AC_CHECK_SIZEOF(double,             8)
-AC_CHECK_SIZEOF(float,              4)
-AC_CHECK_SIZEOF(int,                4)
-AC_CHECK_SIZEOF(long,               4)
+FP_CHECK_SIZEOF_AND_ALIGNMENT(char)
+FP_CHECK_SIZEOF_AND_ALIGNMENT(double)
+FP_CHECK_SIZEOF_AND_ALIGNMENT(float)
+FP_CHECK_SIZEOF_AND_ALIGNMENT(int)
+FP_CHECK_SIZEOF_AND_ALIGNMENT(long)
 if test "$ac_cv_type_long_long" = yes; then
-AC_CHECK_SIZEOF(long long,          8)
+FP_CHECK_SIZEOF_AND_ALIGNMENT(long long)
 fi
-AC_CHECK_SIZEOF(short,              2)
-AC_CHECK_SIZEOF(unsigned char,      1)
-AC_CHECK_SIZEOF(unsigned int,       4)
-AC_CHECK_SIZEOF(unsigned long,      4)
+FP_CHECK_SIZEOF_AND_ALIGNMENT(short)
+FP_CHECK_SIZEOF_AND_ALIGNMENT(unsigned char)
+FP_CHECK_SIZEOF_AND_ALIGNMENT(unsigned int)
+FP_CHECK_SIZEOF_AND_ALIGNMENT(unsigned long)
 if test "$ac_cv_type_long_long" = yes; then
-AC_CHECK_SIZEOF(unsigned long long, 8)
+FP_CHECK_SIZEOF_AND_ALIGNMENT(unsigned long long)
 fi
-AC_CHECK_SIZEOF(unsigned short,     2)
-AC_CHECK_SIZEOF(void *,             4)
+FP_CHECK_SIZEOF_AND_ALIGNMENT(unsigned short)
+FP_CHECK_SIZEOF_AND_ALIGNMENT(void *)
+
+FP_CHECK_SIZEOF_AND_ALIGNMENT(int8_t)
+FP_CHECK_SIZEOF_AND_ALIGNMENT(uint8_t)
+FP_CHECK_SIZEOF_AND_ALIGNMENT(int16_t)
+FP_CHECK_SIZEOF_AND_ALIGNMENT(uint16_t)
+FP_CHECK_SIZEOF_AND_ALIGNMENT(int32_t)
+FP_CHECK_SIZEOF_AND_ALIGNMENT(uint32_t)
+FP_CHECK_SIZEOF_AND_ALIGNMENT(int64_t)
+FP_CHECK_SIZEOF_AND_ALIGNMENT(uint64_t)
+
 
 dnl for use in settings.in
 WordSize=$ac_cv_sizeof_void_p
 AC_SUBST(WordSize)
-
-dnl ** what are alignment constraints on various types
-FP_CHECK_ALIGNMENT(char)
-FP_CHECK_ALIGNMENT(double)
-FP_CHECK_ALIGNMENT(float)
-FP_CHECK_ALIGNMENT(int)
-FP_CHECK_ALIGNMENT(long)
-if test "$ac_cv_type_long_long" = yes; then
-FP_CHECK_ALIGNMENT(long long)
-fi
-FP_CHECK_ALIGNMENT(short)
-FP_CHECK_ALIGNMENT(unsigned char)
-FP_CHECK_ALIGNMENT(unsigned int)
-FP_CHECK_ALIGNMENT(unsigned long)
-if test "$ac_cv_type_long_long" = yes; then
-FP_CHECK_ALIGNMENT(unsigned long long)
-fi
-FP_CHECK_ALIGNMENT(unsigned short)
-FP_CHECK_ALIGNMENT(void *)
-
 FP_CHECK_FUNC([WinExec],
   [@%:@include <windows.h>], [WinExec("",0)])
 
@@ -996,6 +978,31 @@ AC_TRY_LINK_FUNC(printf\$LDBLStub,
             [Define to 1 if we have printf$LDBLStub (Apple Mac OS >= 10.4, PPC).])
     ])
 
+dnl Some platforms (e.g. Android's Bionic) have pthreads support available
+dnl without linking against libpthread. Check whether -lpthread is necessary
+dnl to use pthreads.
+dnl
+dnl Note that it is important that this happens before we AC_CHECK_LIB(thread)
+AC_MSG_CHECKING(whether -lpthread is needed for pthreads)
+AC_CHECK_FUNC(pthread_create,
+    [
+        AC_MSG_RESULT(no)
+        need_lpthread=0
+    ],
+    [
+        AC_CHECK_LIB(pthread, pthread_create,
+            [
+                AC_MSG_RESULT(yes)
+                need_lpthread=1
+            ],
+            [
+                AC_MSG_RESULT([no pthreads support found.])
+                need_lpthread=0
+            ])
+    ])
+AC_DEFINE_UNQUOTED([NEED_PTHREAD_LIB], [$need_lpthread],
+    [Define 1 if we need to link code using pthreads with -lpthread])
+
 dnl ** pthread_setname_np is a recent addition to glibc, and OS X has
 dnl    a different single-argument version.
 AC_CHECK_LIB(pthread, pthread_setname_np)
@@ -1080,16 +1087,62 @@ if test "$use_large_address_space" = "yes" ; then
    AC_DEFINE([USE_LARGE_ADDRESS_SPACE], [1], [Enable single heap address space support])
 fi
 
+dnl ** Use MMAP in the runtime linker?
+dnl --------------------------------------------------------------
+
+case ${TargetOS} in
+    linux|linux-android|freebsd|dragonfly|netbsd|openbsd|kfreebsdgnu|gnu|solaris2)
+        RtsLinkerUseMmap=1
+        ;;
+    darwin)
+        # Don't use mmap on powerpc/darwin as the mmap there doesn't support
+        # reallocating. Reallocating is needed to allocate jump islands just
+        # after each object image. Jumps to these jump islands use relative
+        # branches which are limited to offsets that can be represented in
+        # 24-bits.
+        if test "$TargetArch" != "powerpc" ; then
+            RtsLinkerUseMmap=1
+        else
+            RtsLinkerUseMmap=0
+        fi
+        ;;
+    *)
+        # Windows (which doesn't have mmap) and everything else.
+        RtsLinkerUseMmap=0
+        ;;
+    esac
+
+AC_DEFINE_UNQUOTED([RTS_LINKER_USE_MMAP], [$RtsLinkerUseMmap],
+                   [Use mmap in the runtime linker])
+
 dnl ** Have libdw?
 dnl --------------------------------------------------------------
-AC_ARG_ENABLE(libdw,
+UseLibdw=NO
+USE_LIBDW=0
+AC_ARG_ENABLE(dwarf-unwind,
     [AC_HELP_STRING([--enable-dwarf-unwind],
         [Enable DWARF unwinding support in the runtime system via elfutils' libdw [default=no]])],
-    [AC_CHECK_LIB(dw, dwfl_attach_state, [HaveLibdw=YES], [HaveLibdw=NO])],
-    [HaveLibdw=NO]
+    [AC_CHECK_LIB(dw, dwfl_attach_state, [UseLibdw=YES], [UseLibdw=NO])],
+    [UseLibdw=NO]
 )
-AC_SUBST(HaveLibdw)
+AC_SUBST(UseLibdw)
+if test $UseLibdw = "YES" ; then
+	USE_LIBDW=1
+fi
+AC_DEFINE_UNQUOTED([USE_LIBDW], [$USE_LIBDW], [Set to 1 to use libdw])
 
+dnl ** Have libnuma?
+dnl --------------------------------------------------------------
+HaveLibNuma=0
+AC_CHECK_HEADERS([numa.h numaif.h])
+
+if test "$ac_cv_header_numa_h$ac_cv_header_numaif_h" = "yesyes" ; then
+    AC_CHECK_LIB(numa, numa_available,HaveLibNuma=1)
+fi
+AC_DEFINE_UNQUOTED([HAVE_LIBNUMA], [$HaveLibNuma], [Define to 1 if you have libnuma])
+
+dnl ** Documentation
+dnl --------------------------------------------------------------
 if test -n "$SPHINXBUILD"; then
     BUILD_MAN=YES
     BUILD_SPHINX_HTML=YES
@@ -1110,6 +1163,7 @@ AC_SUBST(BUILD_SPHINX_PDF)
 LIBRARY_VERSION(base)
 LIBRARY_VERSION(Cabal, Cabal/Cabal)
 LIBRARY_VERSION(ghc-prim)
+LIBRARY_VERSION(ghc-compact)
 LIBRARY_ghc_VERSION="$ProjectVersion"
 AC_SUBST(LIBRARY_ghc_VERSION)
 
@@ -1117,9 +1171,9 @@ if grep '	' compiler/ghc.cabal.in 2>&1 >/dev/null; then
    AC_MSG_ERROR([compiler/ghc.cabal.in contains tab characters; please remove them])
 fi
 
-# Create the configuration for the Shake-based build system if it is present
-if test -e shake-build/cfg/system.config.in; then
-    AC_CONFIG_FILES([shake-build/cfg/system.config])
+# Create the configuration for the Hadrian build system if it is present
+if test -e hadrian/cfg/system.config.in; then
+    AC_CONFIG_FILES([hadrian/cfg/system.config])
 fi
 
 # We got caught by
@@ -1145,9 +1199,9 @@ checkMake380() {
 checkMake380 make
 checkMake380 gmake
 
-AC_CONFIG_FILES([mk/config.mk mk/install.mk mk/project.mk compiler/ghc.cabal ghc/ghc-bin.cabal utils/runghc/runghc.cabal libraries/ghc-boot/ghc-boot.cabal libraries/ghc-boot-th/ghc-boot-th.cabal libraries/ghci/ghci.cabal settings docs/users_guide/ghc_config.py docs/index.html libraries/prologue.txt distrib/configure.ac])
+AC_CONFIG_FILES([mk/config.mk mk/install.mk mk/project.mk compiler/ghc.cabal ghc/ghc-bin.cabal utils/runghc/runghc.cabal libraries/ghc-boot/ghc-boot.cabal libraries/ghc-boot-th/ghc-boot-th.cabal libraries/ghci/ghci.cabal settings docs/users_guide/ghc_config.py docs/index.html libraries/prologue.txt utils/mkUserGuidePart/mkUserGuidePart.cabal distrib/configure.ac])
 AC_OUTPUT
-
+[
 if test "$print_make_warning" = "true"; then
    echo
    echo "WARNING: It looks like \"$MakeCmd\" is GNU make 3.80."
@@ -1155,7 +1209,7 @@ if test "$print_make_warning" = "true"; then
    echo "Please use GNU make >= 3.81."
 fi
 
-echo ["
+echo "
 ----------------------------------------------------------------------
 Configure completed successfully.
 
@@ -1165,12 +1219,12 @@ Configure completed successfully.
    Build platform        : $BuildPlatform
    Host platform         : $HostPlatform
    Target platform       : $TargetPlatform
-"]
+"
 
-echo ["\
+echo "\
    Bootstrapping using   : $WithGhc
       which is version   : $GhcVersion
-"]
+"
 
 if test "x$CC_LLVM_BACKEND" = "x1"; then
     if test "x$CC_CLANG_BACKEND" = "x1"; then
@@ -1182,15 +1236,21 @@ else
     CompilerName="gcc          "
 fi
 
-echo ["\
-   Using $CompilerName       : $WhatGccIsCalled
+echo "\
+   Using (for bootstrapping) : $CC_STAGE0
+   Using $CompilerName       : $CC
       which is version       : $GccVersion
    Building a cross compiler : $CrossCompiling
+   Unregisterised            : $Unregisterised
    hs-cpp       : $HaskellCPPCmd
    hs-cpp-flags : $HaskellCPPArgs
+   ar           : $ArCmd
    ld           : $LdCmd
    nm           : $NmCmd
    objdump      : $ObjdumpCmd
+   ranlib       : $RanlibCmd
+   windres      : $Windres
+   dllwrap      : $DllWrap
    Happy        : $HappyCmd ($HappyVersion)
    Alex         : $AlexCmd ($AlexVersion)
    Perl         : $PerlCmd
@@ -1199,24 +1259,24 @@ echo ["\
 
    Using LLVM tools
       llc   : $LlcCmd
-      opt   : $OptCmd"]
+      opt   : $OptCmd"
 
 if test "$HSCOLOUR" = ""; then
-echo ["
+echo "
    HsColour was not found; documentation will not contain source links
-"]
+"
 else
-echo ["\
+echo "\
    HsColour : $HSCOLOUR
-"]
+"
 fi
 
-echo ["\
+echo "\
    Tools to build Sphinx HTML documentation available: $BUILD_SPHINX_HTML
-   Tools to build Sphinx PDF documentation available: $BUILD_SPHINX_PDF"]
+   Tools to build Sphinx PDF documentation available: $BUILD_SPHINX_PDF"
 
-echo ["----------------------------------------------------------------------
-"]
+echo "----------------------------------------------------------------------
+"
 
 echo "\
 For a standard build of GHC (fully optimised with profiling), type (g)make.
@@ -1226,4 +1286,4 @@ mk/build.mk.sample to mk/build.mk, and edit the settings in there.
 
 For more information on how to configure your GHC build, see
    http://ghc.haskell.org/trac/ghc/wiki/Building
-"
+"]

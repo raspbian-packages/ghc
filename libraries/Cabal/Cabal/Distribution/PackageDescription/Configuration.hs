@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP #-}
 -- -fno-warn-deprecations for use of Map.foldWithKey
 {-# OPTIONS_GHC -fno-warn-deprecations #-}
 -----------------------------------------------------------------------------
@@ -11,12 +10,13 @@
 -- Portability :  portable
 --
 -- This is about the cabal configurations feature. It exports
--- 'finalizePackageDescription' and 'flattenPackageDescription' which are
+-- 'finalizePD' and 'flattenPackageDescription' which are
 -- functions for converting 'GenericPackageDescription's down to
 -- 'PackageDescription's. It has code for working with the tree of conditions
 -- and resolving or flattening conditions.
 
 module Distribution.PackageDescription.Configuration (
+    finalizePD,
     finalizePackageDescription,
     flattenPackageDescription,
 
@@ -34,10 +34,9 @@ module Distribution.PackageDescription.Configuration (
     transformAllBuildDepends,
   ) where
 
-import Control.Applicative -- 7.10 -Werror workaround.
-import Prelude
+import Prelude ()
+import Distribution.Compat.Prelude
 
-import Distribution.Package
 import Distribution.PackageDescription
 import Distribution.PackageDescription.Utils
 import Distribution.Version
@@ -47,50 +46,20 @@ import Distribution.Simple.Utils
 import Distribution.Text
 import Distribution.Compat.ReadP as ReadP hiding ( char )
 import qualified Distribution.Compat.ReadP as ReadP ( char )
-import Distribution.Compat.Semigroup as Semi
+import Distribution.Types.ComponentRequestedSpec
+import Distribution.Types.ForeignLib
+import Distribution.Types.Component
+import Distribution.Types.Dependency
+import Distribution.Types.PackageName
+import Distribution.Types.UnqualComponentName
+import Distribution.Types.CondTree
+import Distribution.Types.Condition
+import Distribution.Types.DependencyMap
 
-import Control.Arrow (first)
-import Data.Char ( isAlphaNum )
-import Data.Maybe ( mapMaybe, maybeToList )
-import Data.Map ( Map, fromListWith, toList )
 import qualified Data.Map as Map
 import Data.Tree ( Tree(Node) )
 
 ------------------------------------------------------------------------------
-
--- | Simplify the condition and return its free variables.
-simplifyCondition :: Condition c
-                  -> (c -> Either d Bool)   -- ^ (partial) variable assignment
-                  -> (Condition d, [d])
-simplifyCondition cond i = fv . walk $ cond
-  where
-    walk cnd = case cnd of
-      Var v   -> either Var Lit (i v)
-      Lit b   -> Lit b
-      CNot c  -> case walk c of
-                   Lit True -> Lit False
-                   Lit False -> Lit True
-                   c' -> CNot c'
-      COr c d -> case (walk c, walk d) of
-                   (Lit False, d') -> d'
-                   (Lit True, _)   -> Lit True
-                   (c', Lit False) -> c'
-                   (_, Lit True)   -> Lit True
-                   (c',d')         -> COr c' d'
-      CAnd c d -> case (walk c, walk d) of
-                    (Lit False, _) -> Lit False
-                    (Lit True, d') -> d'
-                    (_, Lit False) -> Lit False
-                    (c', Lit True) -> c'
-                    (c',d')        -> CAnd c' d'
-    -- gather free vars
-    fv c = (c, fv' c)
-    fv' c = case c of
-      Var v     -> [v]
-      Lit _      -> []
-      CNot c'    -> fv' c'
-      COr c1 c2  -> fv' c1 ++ fv' c2
-      CAnd c1 c2 -> fv' c1 ++ fv' c2
 
 -- | Simplify a configuration condition using the OS and arch names.  Returns
 --   the names of all the flags occurring in the condition.
@@ -146,7 +115,7 @@ parseCondition = condOr
     boolLiteral   = fmap Lit  parse
     archIdent     = fmap Arch parse
     osIdent       = fmap OS   parse
-    flagIdent     = fmap (Flag . FlagName . lowercase) (munch1 isIdentChar)
+    flagIdent     = fmap (Flag . mkFlagName . lowercase) (munch1 isIdentChar)
     isIdentChar c = isAlphaNum c || c == '_' || c == '-'
     oper s        = sp >> string s >> sp
     sp            = skipSpaces
@@ -156,30 +125,13 @@ parseCondition = condOr
 
 ------------------------------------------------------------------------------
 
-mapCondTree :: (a -> b) -> (c -> d) -> (Condition v -> Condition w)
-            -> CondTree v c a -> CondTree w d b
-mapCondTree fa fc fcnd (CondNode a c ifs) =
-    CondNode (fa a) (fc c) (map g ifs)
-  where
-    g (cnd, t, me) = (fcnd cnd, mapCondTree fa fc fcnd t,
-                           fmap (mapCondTree fa fc fcnd) me)
-
-mapTreeConstrs :: (c -> d) -> CondTree v c a -> CondTree v d a
-mapTreeConstrs f = mapCondTree id f id
-
-mapTreeConds :: (Condition v -> Condition w) -> CondTree v c a -> CondTree w c a
-mapTreeConds f = mapCondTree id id f
-
-mapTreeData :: (a -> b) -> CondTree v c a -> CondTree v c b
-mapTreeData f = mapCondTree f id id
-
 -- | Result of dependency test. Isomorphic to @Maybe d@ but renamed for
 --   clarity.
 data DepTestRslt d = DepOk | MissingDeps d
 
 instance Semigroup d => Monoid (DepTestRslt d) where
     mempty = DepOk
-    mappend = (Semi.<>)
+    mappend = (<>)
 
 instance Semigroup d => Semigroup (DepTestRslt d) where
     DepOk <> x     = x
@@ -211,6 +163,7 @@ instance Semigroup d => Semigroup (DepTestRslt d) where
 resolveWithFlags ::
      [(FlagName,[Bool])]
         -- ^ Domain for each flag name, will be tested in order.
+  -> ComponentRequestedSpec
   -> OS      -- ^ OS as returned by Distribution.System.buildOS
   -> Arch    -- ^ Arch as returned by Distribution.System.buildArch
   -> CompilerInfo  -- ^ Compiler information
@@ -220,7 +173,7 @@ resolveWithFlags ::
   -> Either [Dependency] (TargetSet PDTagged, FlagAssignment)
        -- ^ Either the missing dependencies (error case), or a pair of
        -- (set of build targets with dependencies, chosen flag assignments)
-resolveWithFlags dom os arch impl constrs trees checkDeps =
+resolveWithFlags dom enabled os arch impl constrs trees checkDeps =
     either (Left . fromDepMapUnion) Right $ explore (build [] dom)
   where
     extraConstrs = toDepMap constrs
@@ -245,7 +198,7 @@ resolveWithFlags dom os arch impl constrs trees checkDeps =
                 -- apply additional constraints to all dependencies
                 first (`constrainBy` extraConstrs) .
                 simplifyCondTree (env flags)
-            deps = overallDependencies targetSet
+            deps = overallDependencies enabled targetSet
         in case checkDeps (fromDepMap deps) of
              DepOk | null ts   -> Right (targetSet, flags)
                    | otherwise -> tryAll $ map explore ts
@@ -289,7 +242,7 @@ addBuildableCondition getInfo t =
   case extractCondition (buildable . getInfo) t of
     Lit True  -> t
     Lit False -> CondNode mempty mempty []
-    c         -> CondNode mempty mempty [(c, t, Nothing)]
+    c         -> CondNode mempty mempty [condIfThen c t]
 
 -- | This is a special version of 'addBuildableCondition' for the 'PDTagged'
 -- type.
@@ -308,15 +261,13 @@ addBuildableConditionPDTagged t =
     case extractCondition (buildable . getInfo) t of
       Lit True  -> t
       Lit False -> deleteConstraints t
-      c         -> CondNode mempty mempty [(c, t, Just (deleteConstraints t))]
+      c         -> CondNode mempty mempty [condIfThenElse c t (deleteConstraints t)]
   where
     deleteConstraints = mapTreeConstrs (const mempty)
 
     getInfo :: PDTagged -> BuildInfo
     getInfo (Lib l) = libBuildInfo l
-    getInfo (Exe _ e) = buildInfo e
-    getInfo (Test _ test) = testBuildInfo test
-    getInfo (Bench _ b) = benchmarkBuildInfo b
+    getInfo (SubComp _ c) = componentBuildInfo c
     getInfo PDNull = mempty
 
 
@@ -333,35 +284,17 @@ addBuildableConditionPDTagged t =
 -- extract the condition under which Buildable is True. The predicate determines
 -- whether data under a 'CondTree' is buildable.
 
-
--- | Extract the condition matched by the given predicate from a cond tree.
---
--- We use this mainly for extracting buildable conditions (see the Note above),
--- but the function is in fact more general.
-extractCondition :: Eq v => (a -> Bool) -> CondTree v c a -> Condition v
-extractCondition p = go
-  where
-    go (CondNode x _ cs) | not (p x) = Lit False
-                         | otherwise = goList cs
-
-    goList []               = Lit True
-    goList ((c, t, e) : cs) =
-      let
-        ct = go t
-        ce = maybe (Lit True) go e
-      in
-        ((c `cAnd` ct) `cOr` (CNot c `cAnd` ce)) `cAnd` goList cs
-
 -- | Extract conditions matched by the given predicate from all cond trees in a
 -- 'GenericPackageDescription'.
 extractConditions :: (BuildInfo -> Bool) -> GenericPackageDescription
                      -> [Condition ConfVar]
 extractConditions f gpkg =
   concat [
-      maybeToList $ extractCondition (f . libBuildInfo) <$> condLibrary     gpkg
-    , extractCondition (f . buildInfo)          . snd   <$> condExecutables gpkg
-    , extractCondition (f . testBuildInfo)      . snd   <$> condTestSuites  gpkg
-    , extractCondition (f . benchmarkBuildInfo) . snd   <$> condBenchmarks  gpkg
+      extractCondition (f . libBuildInfo)             <$> maybeToList (condLibrary gpkg)
+    , extractCondition (f . libBuildInfo)       . snd <$> condSubLibraries   gpkg
+    , extractCondition (f . buildInfo)          . snd <$> condExecutables gpkg
+    , extractCondition (f . testBuildInfo)      . snd <$> condTestSuites  gpkg
+    , extractCondition (f . benchmarkBuildInfo) . snd <$> condBenchmarks  gpkg
     ]
 
 
@@ -370,59 +303,16 @@ newtype DepMapUnion = DepMapUnion { unDepMapUnion :: Map PackageName VersionRang
 
 toDepMapUnion :: [Dependency] -> DepMapUnion
 toDepMapUnion ds =
-  DepMapUnion $ fromListWith unionVersionRanges [ (p,vr) | Dependency p vr <- ds ]
+  DepMapUnion $ Map.fromListWith unionVersionRanges [ (p,vr) | Dependency p vr <- ds ]
 
 fromDepMapUnion :: DepMapUnion -> [Dependency]
-fromDepMapUnion m = [ Dependency p vr | (p,vr) <- toList (unDepMapUnion m) ]
-
--- | A map of dependencies.  Newtyped since the default monoid instance is not
---   appropriate.  The monoid instance uses 'intersectVersionRanges'.
-newtype DependencyMap = DependencyMap { unDependencyMap :: Map PackageName VersionRange }
-  deriving (Show, Read)
-
-instance Monoid DependencyMap where
-    mempty = DependencyMap Map.empty
-    mappend = (Semi.<>)
-
-instance Semigroup DependencyMap where
-    (DependencyMap a) <> (DependencyMap b) =
-        DependencyMap (Map.unionWith intersectVersionRanges a b)
-
-toDepMap :: [Dependency] -> DependencyMap
-toDepMap ds =
-  DependencyMap $ fromListWith intersectVersionRanges [ (p,vr) | Dependency p vr <- ds ]
-
-fromDepMap :: DependencyMap -> [Dependency]
-fromDepMap m = [ Dependency p vr | (p,vr) <- toList (unDependencyMap m) ]
-
--- | Flattens a CondTree using a partial flag assignment.  When a condition
--- cannot be evaluated, both branches are ignored.
-simplifyCondTree :: (Monoid a, Monoid d) =>
-                    (v -> Either v Bool)
-                 -> CondTree v d a
-                 -> (d, a)
-simplifyCondTree env (CondNode a d ifs) =
-    mconcat $ (d, a) : mapMaybe simplifyIf ifs
-  where
-    simplifyIf (cnd, t, me) =
-        case simplifyCondition cnd env of
-          (Lit True, _) -> Just $ simplifyCondTree env t
-          (Lit False, _) -> fmap (simplifyCondTree env) me
-          _ -> Nothing
-
--- | Flatten a CondTree.  This will resolve the CondTree by taking all
---  possible paths into account.  Note that since branches represent exclusive
---  choices this may not result in a \"sane\" result.
-ignoreConditions :: (Monoid a, Monoid c) => CondTree v c a -> (a, c)
-ignoreConditions (CondNode a c ifs) = (a, c) `mappend` mconcat (concatMap f ifs)
-  where f (_, t, me) = ignoreConditions t
-                       : maybeToList (fmap ignoreConditions me)
+fromDepMapUnion m = [ Dependency p vr | (p,vr) <- Map.toList (unDepMapUnion m) ]
 
 freeVars :: CondTree ConfVar c a  -> [FlagName]
 freeVars t = [ f | Flag f <- freeVars' t ]
   where
     freeVars' (CondNode _ _ ifs) = concatMap compfv ifs
-    compfv (c, ct, mct) = condfv c ++ freeVars' ct ++ maybe [] freeVars' mct
+    compfv (CondBranch c ct mct) = condfv c ++ freeVars' ct ++ maybe [] freeVars' mct
     condfv c = case c of
       Var v      -> [v]
       Lit _      -> []
@@ -438,85 +328,39 @@ newtype TargetSet a = TargetSet [(DependencyMap, a)]
 
 -- | Combine the target-specific dependencies in a TargetSet to give the
 -- dependencies for the package as a whole.
-overallDependencies :: TargetSet PDTagged -> DependencyMap
-overallDependencies (TargetSet targets) = mconcat depss
+overallDependencies :: ComponentRequestedSpec -> TargetSet PDTagged -> DependencyMap
+overallDependencies enabled (TargetSet targets) = mconcat depss
   where
     (depss, _) = unzip $ filter (removeDisabledSections . snd) targets
     removeDisabledSections :: PDTagged -> Bool
-    removeDisabledSections (Lib l)     = buildable (libBuildInfo l)
-    removeDisabledSections (Exe _ e)   = buildable (buildInfo e)
-    removeDisabledSections (Test _ t)  = testEnabled t && buildable (testBuildInfo t)
-    removeDisabledSections (Bench _ b) = benchmarkEnabled b && buildable (benchmarkBuildInfo b)
+    -- UGH. The embedded componentName in the 'Component's here is
+    -- BLANK.  I don't know whose fault this is but I'll use the tag
+    -- instead. -- ezyang
+    removeDisabledSections (Lib _)     = componentNameRequested enabled CLibName
+    removeDisabledSections (SubComp t c)
+        -- Do NOT use componentName
+        = componentNameRequested enabled
+        $ case c of
+            CLib  _ -> CSubLibName t
+            CFLib _ -> CFLibName   t
+            CExe  _ -> CExeName    t
+            CTest _ -> CTestName   t
+            CBench _ -> CBenchName t
     removeDisabledSections PDNull      = True
-
--- Apply extra constraints to a dependency map.
--- Combines dependencies where the result will only contain keys from the left
--- (first) map.  If a key also exists in the right map, both constraints will
--- be intersected.
-constrainBy :: DependencyMap  -- ^ Input map
-            -> DependencyMap  -- ^ Extra constraints
-            -> DependencyMap
-constrainBy left extra =
-    DependencyMap $
-      Map.foldWithKey tightenConstraint (unDependencyMap left)
-                                        (unDependencyMap extra)
-  where tightenConstraint n c l =
-            case Map.lookup n l of
-              Nothing -> l
-              Just vr -> Map.insert n (intersectVersionRanges vr c) l
 
 -- | Collect up the targets in a TargetSet of tagged targets, storing the
 -- dependencies as we go.
-flattenTaggedTargets :: TargetSet PDTagged ->
-        (Maybe Library, [(String, Executable)], [(String, TestSuite)]
-        , [(String, Benchmark)])
-flattenTaggedTargets (TargetSet targets) = foldr untag (Nothing, [], [], []) targets
+flattenTaggedTargets :: TargetSet PDTagged -> (Maybe Library, [(UnqualComponentName, Component)])
+flattenTaggedTargets (TargetSet targets) = foldr untag (Nothing, []) targets
   where
-    untag (_, Lib _) (Just _, _, _, _) = userBug "Only one library expected"
-    untag (deps, Lib l) (Nothing, exes, tests, bms) =
-        (Just l', exes, tests, bms)
-      where
-        l' = l {
-                libBuildInfo = (libBuildInfo l) { targetBuildDepends = fromDepMap deps }
-            }
-    untag (deps, Exe n e) (mlib, exes, tests, bms)
-        | any ((== n) . fst) exes =
-          userBug $ "There exist several exes with the same name: '" ++ n ++ "'"
-        | any ((== n) . fst) tests =
-          userBug $ "There exists a test with the same name as an exe: '" ++ n ++ "'"
-        | any ((== n) . fst) bms =
-          userBug $ "There exists a benchmark with the same name as an exe: '" ++ n ++ "'"
-        | otherwise = (mlib, (n, e'):exes, tests, bms)
-      where
-        e' = e {
-                buildInfo = (buildInfo e) { targetBuildDepends = fromDepMap deps }
-            }
-    untag (deps, Test n t) (mlib, exes, tests, bms)
-        | any ((== n) . fst) tests =
-          userBug $ "There exist several tests with the same name: '" ++ n ++ "'"
-        | any ((== n) . fst) exes =
-          userBug $ "There exists an exe with the same name as the test: '" ++ n ++ "'"
-        | any ((== n) . fst) bms =
-          userBug $ "There exists a benchmark with the same name as the test: '" ++ n ++ "'"
-        | otherwise = (mlib, exes, (n, t'):tests, bms)
-      where
-        t' = t {
-            testBuildInfo = (testBuildInfo t)
-                { targetBuildDepends = fromDepMap deps }
-            }
-    untag (deps, Bench n b) (mlib, exes, tests, bms)
-        | any ((== n) . fst) bms =
-          userBug $ "There exist several benchmarks with the same name: '" ++ n ++ "'"
-        | any ((== n) . fst) exes =
-          userBug $ "There exists an exe with the same name as the benchmark: '" ++ n ++ "'"
-        | any ((== n) . fst) tests =
-          userBug $ "There exists a test with the same name as the benchmark: '" ++ n ++ "'"
-        | otherwise = (mlib, exes, tests, (n, b'):bms)
-      where
-        b' = b {
-            benchmarkBuildInfo = (benchmarkBuildInfo b)
-                { targetBuildDepends = fromDepMap deps }
-            }
+    untag (_, Lib _) (Just _, _) = userBug "Only one library expected"
+    untag (_, Lib l) (Nothing, comps) = (Just l, comps)
+    untag (_, SubComp n c) (mb_lib, comps)
+        | any ((== n) . fst) comps =
+          userBug $ "There exist several components with the same name: '" ++ unUnqualComponentName n ++ "'"
+
+        | otherwise = (mb_lib, (n, c) : comps)
+
     untag (_, PDNull) x = x  -- actually this should not happen, but let's be liberal
 
 
@@ -525,23 +369,19 @@ flattenTaggedTargets (TargetSet targets) = foldr untag (Nothing, [], [], []) tar
 --
 
 data PDTagged = Lib Library
-              | Exe String Executable
-              | Test String TestSuite
-              | Bench String Benchmark
+              | SubComp UnqualComponentName Component
               | PDNull
               deriving Show
 
 instance Monoid PDTagged where
     mempty = PDNull
-    mappend = (Semi.<>)
+    mappend = (<>)
 
 instance Semigroup PDTagged where
     PDNull    <> x      = x
     x         <> PDNull = x
     Lib l     <> Lib l' = Lib (l <> l')
-    Exe n e   <> Exe   n' e' | n == n' = Exe n (e <> e')
-    Test n t  <> Test  n' t' | n == n' = Test n (t <> t')
-    Bench n b <> Bench n' b' | n == n' = Bench n (b <> b')
+    SubComp n x <> SubComp n' x' | n == n' = SubComp n (x <> x')
     _         <> _  = cabalBug "Cannot combine incompatible tags"
 
 -- | Create a package description with all configurations resolved.
@@ -566,8 +406,13 @@ instance Semigroup PDTagged where
 -- On success, it will return the package description and the full flag
 -- assignment chosen.
 --
-finalizePackageDescription ::
+-- Note that this drops any stanzas which have @buildable: False@.  While
+-- this is arguably the right thing to do, it means we give bad error
+-- messages in some situations, see #3858.
+--
+finalizePD ::
      FlagAssignment  -- ^ Explicitly specified flag assignments
+  -> ComponentRequestedSpec
   -> (Dependency -> Bool) -- ^ Is a given dependency satisfiable from the set of
                           -- available packages?  If this is unknown then use
                           -- True.
@@ -579,37 +424,40 @@ finalizePackageDescription ::
             (PackageDescription, FlagAssignment)
              -- ^ Either missing dependencies or the resolved package
              -- description along with the flag assignments chosen.
-finalizePackageDescription userflags satisfyDep
+finalizePD userflags enabled satisfyDep
         (Platform arch os) impl constraints
-        (GenericPackageDescription pkg flags mlib0 exes0 tests0 bms0) =
-    case resolveFlags of
-      Right ((mlib, exes', tests', bms'), targetSet, flagVals) ->
-        Right ( pkg { library = mlib
-                    , executables = exes'
-                    , testSuites = tests'
-                    , benchmarks = bms'
-                    , buildDepends = fromDepMap (overallDependencies targetSet)
-                    }
-              , flagVals )
-
-      Left missing -> Left missing
+        (GenericPackageDescription pkg flags mb_lib0 sub_libs0 flibs0 exes0 tests0 bms0) = do
+  (targetSet, flagVals) <-
+    resolveWithFlags flagChoices enabled os arch impl constraints condTrees check
+  let
+    (mb_lib, comps) = flattenTaggedTargets targetSet
+    mb_lib' = fmap libFillInDefaults mb_lib
+    comps' = flip map comps $ \(n,c) -> foldComponent
+      (\l -> CLib   (libFillInDefaults l)   { libName = Just n
+                                            , libExposed = False })
+      (\l -> CFLib  (flibFillInDefaults l)  { foreignLibName = n })
+      (\e -> CExe   (exeFillInDefaults e)   { exeName = n })
+      (\t -> CTest  (testFillInDefaults t)  { testName = n })
+      (\b -> CBench (benchFillInDefaults b) { benchmarkName = n })
+      c
+    (sub_libs', flibs', exes', tests', bms') = partitionComponents comps'
+  return ( pkg { library = mb_lib'
+               , subLibraries = sub_libs'
+               , foreignLibs = flibs'
+               , executables = exes'
+               , testSuites = tests'
+               , benchmarks = bms'
+               , buildDepends = fromDepMap (overallDependencies enabled targetSet)
+               }
+         , flagVals )
   where
     -- Combine lib, exes, and tests into one list of @CondTree@s with tagged data
-    condTrees = maybeToList (fmap (mapTreeData Lib) mlib0 )
-                ++ map (\(name,tree) -> mapTreeData (Exe name) tree) exes0
-                ++ map (\(name,tree) -> mapTreeData (Test name) tree) tests0
-                ++ map (\(name,tree) -> mapTreeData (Bench name) tree) bms0
-
-    resolveFlags =
-        case resolveWithFlags flagChoices os arch impl constraints condTrees check of
-          Right (targetSet, fs) ->
-              let (mlib, exes, tests, bms) = flattenTaggedTargets targetSet in
-              Right ( (fmap libFillInDefaults mlib,
-                       map (\(n,e) -> (exeFillInDefaults e) { exeName = n }) exes,
-                       map (\(n,t) -> (testFillInDefaults t) { testName = n }) tests,
-                       map (\(n,b) -> (benchFillInDefaults b) { benchmarkName = n }) bms),
-                     targetSet, fs)
-          Left missing      -> Left missing
+    condTrees =    maybeToList (fmap (mapTreeData Lib) mb_lib0)
+                ++ map (\(name,tree) -> mapTreeData (SubComp name . CLib) tree) sub_libs0
+                ++ map (\(name,tree) -> mapTreeData (SubComp name . CFLib) tree) flibs0
+                ++ map (\(name,tree) -> mapTreeData (SubComp name . CExe) tree) exes0
+                ++ map (\(name,tree) -> mapTreeData (SubComp name . CTest) tree) tests0
+                ++ map (\(name,tree) -> mapTreeData (SubComp name . CBench) tree) bms0
 
     flagChoices    = map (\(MkFlag n _ d manual) -> (n, d2c manual n d)) flags
     d2c manual n b = case lookup n userflags of
@@ -622,6 +470,20 @@ finalizePackageDescription userflags satisfyDep
                    in if null missingDeps
                       then DepOk
                       else MissingDeps missingDeps
+
+{-# DEPRECATED finalizePackageDescription "This function now always assumes tests and benchmarks are disabled; use finalizePD with ComponentRequestedSpec to specify something more specific." #-}
+finalizePackageDescription ::
+     FlagAssignment  -- ^ Explicitly specified flag assignments
+  -> (Dependency -> Bool) -- ^ Is a given dependency satisfiable from the set of
+                          -- available packages?  If this is unknown then use
+                          -- True.
+  -> Platform      -- ^ The 'Arch' and 'OS'
+  -> CompilerInfo  -- ^ Compiler information
+  -> [Dependency]  -- ^ Additional constraints
+  -> GenericPackageDescription
+  -> Either [Dependency]
+            (PackageDescription, FlagAssignment)
+finalizePackageDescription flags = finalizePD flags defaultComponentRequestedSpec
 
 {-
 let tst_p = (CondNode [1::Int] [Distribution.Package.Dependency "a" AnyVersion] [])
@@ -647,21 +509,37 @@ resolveWithFlags [] Distribution.System.Linux Distribution.System.I386 (Distribu
 -- default path will be missing from the package description returned by this
 -- function.
 flattenPackageDescription :: GenericPackageDescription -> PackageDescription
-flattenPackageDescription (GenericPackageDescription pkg _ mlib0 exes0 tests0 bms0) =
-    pkg { library = mlib
-        , executables = reverse exes
-        , testSuites = reverse tests
-        , benchmarks = reverse bms
-        , buildDepends = ldeps ++ reverse edeps ++ reverse tdeps ++ reverse bdeps
+flattenPackageDescription
+  (GenericPackageDescription pkg _ mlib0 sub_libs0 flibs0 exes0 tests0 bms0) =
+    pkg { library      = mlib
+        , subLibraries = reverse sub_libs
+        , foreignLibs  = reverse flibs
+        , executables  = reverse exes
+        , testSuites   = reverse tests
+        , benchmarks   = reverse bms
+        , buildDepends = ldeps
+                      ++ reverse sub_ldeps
+                      ++ reverse pldeps
+                      ++ reverse edeps
+                      ++ reverse tdeps
+                      ++ reverse bdeps
         }
   where
     (mlib, ldeps) = case mlib0 of
         Just lib -> let (l,ds) = ignoreConditions lib in
-                    (Just (libFillInDefaults l), ds)
+                    (Just ((libFillInDefaults l) { libName = Nothing }), ds)
         Nothing -> (Nothing, [])
-    (exes, edeps) = foldr flattenExe ([],[]) exes0
-    (tests, tdeps) = foldr flattenTst ([],[]) tests0
-    (bms, bdeps) = foldr flattenBm ([],[]) bms0
+    (sub_libs, sub_ldeps) = foldr flattenLib  ([],[]) sub_libs0
+    (flibs,    pldeps)    = foldr flattenFLib ([],[]) flibs0
+    (exes,     edeps)     = foldr flattenExe  ([],[]) exes0
+    (tests,    tdeps)     = foldr flattenTst  ([],[]) tests0
+    (bms,      bdeps)     = foldr flattenBm   ([],[]) bms0
+    flattenLib (n, t) (es, ds) =
+        let (e, ds') = ignoreConditions t in
+        ( (libFillInDefaults $ e { libName = Just n, libExposed = False }) : es, ds' ++ ds )
+    flattenFLib (n, t) (es, ds) =
+        let (e, ds') = ignoreConditions t in
+        ( (flibFillInDefaults $ e { foreignLibName = n }) : es, ds' ++ ds )
     flattenExe (n, t) (es, ds) =
         let (e, ds') = ignoreConditions t in
         ( (exeFillInDefaults $ e { exeName = n }) : es, ds' ++ ds )
@@ -682,6 +560,10 @@ flattenPackageDescription (GenericPackageDescription pkg _ mlib0 exes0 tests0 bm
 libFillInDefaults :: Library -> Library
 libFillInDefaults lib@(Library { libBuildInfo = bi }) =
     lib { libBuildInfo = biFillInDefaults bi }
+
+flibFillInDefaults :: ForeignLib -> ForeignLib
+flibFillInDefaults flib@(ForeignLib { foreignLibBuildInfo = bi }) =
+    flib { foreignLibBuildInfo = biFillInDefaults bi }
 
 exeFillInDefaults :: Executable -> Executable
 exeFillInDefaults exe@(Executable { buildInfo = bi }) =
@@ -718,6 +600,7 @@ transformAllBuildInfos onBuildInfo onSetupBuildInfo gpd = gpd'
     pd = packageDescription gpd
     pd'  = pd {
       library        = fmap onLibrary        (library pd),
+      subLibraries   = map  onLibrary        (subLibraries pd),
       executables    = map  onExecutable     (executables pd),
       testSuites     = map  onTestSuite      (testSuites pd),
       benchmarks     = map  onBenchmark      (benchmarks pd),
@@ -758,17 +641,20 @@ transformAllCondTrees onLibrary onExecutable
   where
     gpd'    = gpd {
       condLibrary        = condLib',
+      condSubLibraries   = condSubLibs',
       condExecutables    = condExes',
       condTestSuites     = condTests',
       condBenchmarks     = condBenchs'
       }
 
     condLib    = condLibrary        gpd
+    condSubLibs = condSubLibraries  gpd
     condExes   = condExecutables    gpd
     condTests  = condTestSuites     gpd
     condBenchs = condBenchmarks     gpd
 
-    condLib'    = fmap (onCondTree onLibrary)             condLib
+    condLib'    = fmap (onCondTree onLibrary) condLib
+    condSubLibs' = map (mapSnd $ onCondTree onLibrary)    condSubLibs
     condExes'   = map  (mapSnd $ onCondTree onExecutable) condExes
     condTests'  = map  (mapSnd $ onCondTree onTestSuite)  condTests
     condBenchs' = map  (mapSnd $ onCondTree onBenchmark)  condBenchs

@@ -1,6 +1,14 @@
 -- (c) The University of Glasgow 2006
 
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE BangPatterns #-}
+#if __GLASGOW_HASKELL__ < 800
+-- For CallStack business
+{-# LANGUAGE ImplicitParams #-}
+{-# LANGUAGE FlexibleContexts #-}
+#endif
 
 -- | Highly random utility functions
 --
@@ -39,6 +47,8 @@ module Util (
 
         chunkList,
 
+        changeLast,
+
         -- * Tuples
         fstOf3, sndOf3, thdOf3,
         firstM, first3M,
@@ -48,7 +58,7 @@ module Util (
 
         -- * List operations controlled by another list
         takeList, dropList, splitAtList, split,
-        dropTail,
+        dropTail, capitalise,
 
         -- * For loop
         nTimes,
@@ -78,6 +88,9 @@ module Util (
         -- * Argument processing
         getCmd, toCmdArgs, toArgs,
 
+        -- * Integers
+        exactLog2,
+
         -- * Floating point
         readRational,
 
@@ -91,6 +104,7 @@ module Util (
         hSetTranslit,
 
         global, consIORef, globalM,
+        sharedGlobal, sharedGlobalM,
 
         -- * Filenames and paths
         Suffix,
@@ -107,6 +121,18 @@ module Util (
 
         -- * Hashing
         hashString,
+
+        -- * Call stacks
+#if MIN_VERSION_GLASGOW_HASKELL(7,10,2,0)
+        GHC.Stack.CallStack,
+#endif
+        HasCallStack,
+        HasDebugCallStack,
+        prettyCurrentCallStack,
+
+        -- * Utils for flags
+        OverridingBool(..),
+        overrideWith,
     ) where
 
 #include "HsVersions.h"
@@ -120,19 +146,18 @@ import System.IO.Unsafe ( unsafePerformIO )
 import Data.List        hiding (group)
 
 import GHC.Exts
+import qualified GHC.Stack
 
-#if __GLASGOW_HASKELL__ < 709
-import Control.Applicative (Applicative)
-#endif
 import Control.Applicative ( liftA2 )
 import Control.Monad    ( liftM )
 import GHC.IO.Encoding (mkTextEncoding, textEncodingName)
+import GHC.Conc.Sync ( sharedCAF )
 import System.IO (Handle, hGetEncoding, hSetEncoding)
 import System.IO.Error as IO ( isDoesNotExistError )
 import System.Directory ( doesDirectoryExist, getModificationTime )
 import System.FilePath
 
-import Data.Char        ( isUpper, isAlphaNum, isSpace, chr, ord, isDigit )
+import Data.Char        ( isUpper, isAlphaNum, isSpace, chr, ord, isDigit, toUpper)
 import Data.Int
 import Data.Ratio       ( (%) )
 import Data.Ord         ( comparing )
@@ -446,9 +471,9 @@ atLength :: ([a] -> b)   -- Called when length ls >= n, passed (drop n ls)
          -> [a]
          -> Int
          -> b
-atLength atLenPred atEnd ls n
-  | n < 0     = atLenPred ls
-  | otherwise = go n ls
+atLength atLenPred atEnd ls0 n0
+  | n0 < 0    = atLenPred ls0
+  | otherwise = go n0 ls0
   where
     -- go's first arg n >= 0
     go 0 ls     = atLenPred ls
@@ -457,15 +482,24 @@ atLength atLenPred atEnd ls n
 
 -- Some special cases of atLength:
 
+-- | @(lengthExceeds xs n) = (length xs > n)@
 lengthExceeds :: [a] -> Int -> Bool
--- ^ > (lengthExceeds xs n) = (length xs > n)
-lengthExceeds = atLength notNull False
+lengthExceeds lst n
+  | n < 0
+  = True
+  | otherwise
+  = atLength notNull False lst n
 
 lengthAtLeast :: [a] -> Int -> Bool
 lengthAtLeast = atLength (const True) False
 
+-- | @(lengthIs xs n) = (length xs == n)@
 lengthIs :: [a] -> Int -> Bool
-lengthIs = atLength null False
+lengthIs lst n
+  | n < 0
+  = False
+  | otherwise
+  = atLength null False lst n
 
 listLengthCmp :: [a] -> Int -> Ordering
 listLengthCmp = atLength atLen atEnd
@@ -547,6 +581,12 @@ chunkList :: Int -> [a] -> [[a]]
 chunkList _ [] = []
 chunkList n xs = as : chunkList n bs where (as,bs) = splitAt n xs
 
+-- | Replace the last element of a list with another element.
+changeLast :: [a] -> a -> [a]
+changeLast []     _  = panic "changeLast"
+changeLast [_]    x  = [x]
+changeLast (x:xs) x' = x : changeLast xs x'
+
 {-
 ************************************************************************
 *                                                                      *
@@ -613,9 +653,10 @@ all2 _ _      _      = False
 -- Count the number of times a predicate is true
 
 count :: (a -> Bool) -> [a] -> Int
-count _ [] = 0
-count p (x:xs) | p x       = 1 + count p xs
-               | otherwise = count p xs
+count p = go 0
+  where go !n [] = n
+        go !n (x:xs) | p x       = go (n+1) xs
+                     | otherwise = go n xs
 
 {-
 @splitAt@, @take@, and @drop@ but with length of another
@@ -694,6 +735,12 @@ split c s = case rest of
                 []     -> [chunk]
                 _:rest -> chunk : split c rest
   where (chunk, rest) = break (==c) s
+
+-- | Convert a word to title case by capitalising the first letter
+capitalise :: String -> String
+capitalise [] = []
+capitalise (c:cs) = toUpper c : cs
+
 
 {-
 ************************************************************************
@@ -864,7 +911,7 @@ fuzzyLookup user_entered possibilites
   where
     -- Work out an approriate match threshold:
     -- We report a candidate if its edit distance is <= the threshold,
-    -- The threshhold is set to about a quarter of the # of characters the user entered
+    -- The threshold is set to about a quarter of the # of characters the user entered
     --   Length    Threshold
     --     1         0          -- Don't suggest *any* candidates
     --     2         1          -- for single-char identifiers
@@ -891,6 +938,28 @@ seqList :: [a] -> b -> b
 seqList [] b = b
 seqList (x:xs) b = x `seq` seqList xs b
 
+
+{-
+************************************************************************
+*                                                                      *
+                        Globals and the RTS
+*                                                                      *
+************************************************************************
+
+When a plugin is loaded, it currently gets linked against a *newly
+loaded* copy of the GHC package. This would not be a problem, except
+that the new copy has its own mutable state that is not shared with
+that state that has already been initialized by the original GHC
+package.
+
+(Note that if the GHC executable was dynamically linked this
+wouldn't be a problem, because we could share the GHC library it
+links to; this is only a problem if DYNAMIC_GHC_PROGRAMS=NO.)
+
+The solution is to make use of @sharedCAF@ through @sharedGlobal@
+for globals that are shared between multiple copies of ghc packages.
+-}
+
 -- Global variables:
 
 global :: a -> IORef a
@@ -902,6 +971,16 @@ consIORef var x = do
 
 globalM :: IO a -> IORef a
 globalM ma = unsafePerformIO (ma >>= newIORef)
+
+-- Shared global variables:
+
+sharedGlobal :: a -> (Ptr (IORef a) -> IO (Ptr (IORef a))) -> IORef a
+sharedGlobal a get_or_set = unsafePerformIO $
+  newIORef a >>= flip sharedCAF get_or_set
+
+sharedGlobalM :: IO a -> (Ptr (IORef a) -> IO (Ptr (IORef a))) -> IORef a
+sharedGlobalM ma get_or_set = unsafePerformIO $
+  ma >>= newIORef >>= flip sharedCAF get_or_set
 
 -- Module names:
 
@@ -978,6 +1057,27 @@ toArgs str
                     Right (arg, rest)
                 _ ->
                     Left ("Couldn't read " ++ show s ++ " as String")
+-----------------------------------------------------------------------------
+-- Integers
+
+-- This algorithm for determining the $\log_2$ of exact powers of 2 comes
+-- from GCC.  It requires bit manipulation primitives, and we use GHC
+-- extensions.  Tough.
+
+exactLog2 :: Integer -> Maybe Integer
+exactLog2 x
+  = if (x <= 0 || x >= 2147483648) then
+       Nothing
+    else
+       if (x .&. (-x)) /= x then
+          Nothing
+       else
+          Just (pow2 x)
+  where
+    pow2 x | x == 1 = 0
+           | otherwise = 1 + pow2 (x `shiftR` 1)
+
+
 {-
 -- -----------------------------------------------------------------------------
 -- Floats
@@ -1229,3 +1329,43 @@ mulHi :: Int32 -> Int32 -> Int32
 mulHi a b = fromIntegral (r `shiftR` 32)
    where r :: Int64
          r = fromIntegral a * fromIntegral b
+
+-- | A compatibility wrapper for the @GHC.Stack.HasCallStack@ constraint.
+#if __GLASGOW_HASKELL__ >= 800
+type HasCallStack = GHC.Stack.HasCallStack
+#elif MIN_VERSION_GLASGOW_HASKELL(7,10,2,0)
+type HasCallStack = (?callStack :: GHC.Stack.CallStack)
+-- CallStack wasn't present in GHC 7.10.1, disable callstacks in stage 1
+#else
+type HasCallStack = (() :: Constraint)
+#endif
+
+-- | A call stack constraint, but only when 'isDebugOn'.
+#if DEBUG
+type HasDebugCallStack = HasCallStack
+#else
+type HasDebugCallStack = (() :: Constraint)
+#endif
+
+-- | Pretty-print the current callstack
+#if __GLASGOW_HASKELL__ >= 800
+prettyCurrentCallStack :: HasCallStack => String
+prettyCurrentCallStack = GHC.Stack.prettyCallStack GHC.Stack.callStack
+#elif MIN_VERSION_GLASGOW_HASKELL(7,10,2,0)
+prettyCurrentCallStack :: (?callStack :: GHC.Stack.CallStack) => String
+prettyCurrentCallStack = GHC.Stack.showCallStack ?callStack
+#else
+prettyCurrentCallStack :: HasCallStack => String
+prettyCurrentCallStack = "Call stack unavailable"
+#endif
+
+data OverridingBool
+  = Auto
+  | Always
+  | Never
+  deriving Show
+
+overrideWith :: Bool -> OverridingBool -> Bool
+overrideWith b Auto   = b
+overrideWith _ Always = True
+overrideWith _ Never  = False

@@ -1,4 +1,5 @@
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -26,6 +27,7 @@ module Distribution.Simple.Compiler (
         Compiler(..),
         showCompilerId, showCompilerIdWithAbi,
         compilerFlavor, compilerVersion,
+        compilerCompatFlavor,
         compilerCompatVersion,
         compilerInfo,
 
@@ -56,6 +58,9 @@ module Distribution.Simple.Compiler (
         unifiedIPIDRequired,
         packageKeySupported,
         unitIdSupported,
+        coverageSupported,
+        profilingSupported,
+        backpackSupported,
         libraryDynDirSupported,
 
         -- * Support for profiling detail levels
@@ -65,35 +70,35 @@ module Distribution.Simple.Compiler (
         showProfDetailLevel,
   ) where
 
+import Prelude ()
+import Distribution.Compat.Prelude
+
 import Distribution.Compiler
 import Distribution.Version
 import Distribution.Text
 import Language.Haskell.Extension
 import Distribution.Simple.Utils
-import Distribution.Compat.Binary
 
-import Control.Monad (liftM)
-import Data.List (nub)
-import qualified Data.Map as M (Map, lookup)
-import Data.Maybe (catMaybes, isNothing, listToMaybe)
-import GHC.Generics (Generic)
+import qualified Data.Map as Map (lookup)
 import System.Directory (canonicalizePath)
 
 data Compiler = Compiler {
         compilerId              :: CompilerId,
         -- ^ Compiler flavour and version.
         compilerAbiTag          :: AbiTag,
-        -- ^ Tag for distinguishing incompatible ABI's on the same architecture/os.
+        -- ^ Tag for distinguishing incompatible ABI's on the same
+        -- architecture/os.
         compilerCompat          :: [CompilerId],
-        -- ^ Other implementations that this compiler claims to be compatible with.
+        -- ^ Other implementations that this compiler claims to be
+        -- compatible with.
         compilerLanguages       :: [(Language, Flag)],
         -- ^ Supported language standards.
         compilerExtensions      :: [(Extension, Flag)],
         -- ^ Supported extensions.
-        compilerProperties      :: M.Map String String
+        compilerProperties      :: Map String String
         -- ^ A key-value map for properties not covered by the above fields.
     }
-    deriving (Eq, Generic, Show, Read)
+    deriving (Eq, Generic, Typeable, Show, Read)
 
 instance Binary Compiler
 
@@ -113,6 +118,30 @@ compilerFlavor = (\(CompilerId f _) -> f) . compilerId
 compilerVersion :: Compiler -> Version
 compilerVersion = (\(CompilerId _ v) -> v) . compilerId
 
+
+-- | Is this compiler compatible with the compiler flavour we're interested in?
+--
+-- For example this checks if the compiler is actually GHC or is another
+-- compiler that claims to be compatible with some version of GHC, e.g. GHCJS.
+--
+-- > if compilerCompatFlavor GHC compiler then ... else ...
+--
+compilerCompatFlavor :: CompilerFlavor -> Compiler -> Bool
+compilerCompatFlavor flavor comp =
+    flavor == compilerFlavor comp
+ || flavor `elem` [ flavor' | CompilerId flavor' _ <- compilerCompat comp ]
+
+
+-- | Is this compiler compatible with the compiler flavour we're interested in,
+-- and if so what version does it claim to be compatible with.
+--
+-- For example this checks if the compiler is actually GHC-7.x or is another
+-- compiler that claims to be compatible with some GHC-7.x version.
+--
+-- > case compilerCompatVersion GHC compiler of
+-- >   Just (Version (7:_)) -> ...
+-- >   _                    -> ...
+--
 compilerCompatVersion :: CompilerFlavor -> Compiler -> Maybe Version
 compilerCompatVersion flavor comp
   | compilerFlavor comp == flavor = Just (compilerVersion comp)
@@ -172,10 +201,10 @@ registrationPackageDB dbs = last dbs
 -- | Make package paths absolute
 
 
-absolutePackageDBPaths :: PackageDBStack -> IO PackageDBStack
-absolutePackageDBPaths = mapM absolutePackageDBPath
+absolutePackageDBPaths :: PackageDBStack -> NoCallStackIO PackageDBStack
+absolutePackageDBPaths = traverse absolutePackageDBPath
 
-absolutePackageDBPath :: PackageDB -> IO PackageDB
+absolutePackageDBPath :: PackageDB -> NoCallStackIO PackageDB
 absolutePackageDBPath GlobalPackageDB        = return GlobalPackageDB
 absolutePackageDBPath UserPackageDB          = return UserPackageDB
 absolutePackageDBPath (SpecificPackageDB db) =
@@ -278,7 +307,8 @@ reexportedModulesSupported = ghcSupported "Support reexported-modules"
 
 -- | Does this compiler support thinning/renaming on package flags?
 renamingPackageFlagsSupported :: Compiler -> Bool
-renamingPackageFlagsSupported = ghcSupported "Support thinning and renaming package flags"
+renamingPackageFlagsSupported = ghcSupported
+  "Support thinning and renaming package flags"
 
 -- | Does this compiler have unified IPIDs (so no package keys)
 unifiedIPIDRequired :: Compiler -> Bool
@@ -292,12 +322,39 @@ packageKeySupported = ghcSupported "Uses package keys"
 unitIdSupported :: Compiler -> Bool
 unitIdSupported = ghcSupported "Uses unit IDs"
 
+-- | Does this compiler support Backpack?
+backpackSupported :: Compiler -> Bool
+backpackSupported = ghcSupported "Support Backpack"
+
 -- | Does this compiler support a package database entry with:
 -- "dynamic-library-dirs"?
 libraryDynDirSupported :: Compiler -> Bool
 libraryDynDirSupported comp = case compilerFlavor comp of
-  GHC -> compilerVersion comp >= Version [8,0,1,20161021] []
+  GHC ->
+      -- Not just v >= mkVersion [8,0,1,20161022], as there
+      -- are many GHC 8.1 nightlies which don't support this.
+    ((v >= mkVersion [8,0,1,20161022] && v < mkVersion [8,1]) ||
+      v >= mkVersion [8,1,20161021])
   _   -> False
+ where
+  v = compilerVersion comp
+
+-- | Does this compiler support Haskell program coverage?
+coverageSupported :: Compiler -> Bool
+coverageSupported comp =
+  case compilerFlavor comp of
+    GHC   -> True
+    GHCJS -> True
+    _     -> False
+
+-- | Does this compiler support profiling?
+profilingSupported :: Compiler -> Bool
+profilingSupported comp =
+  case compilerFlavor comp of
+    GHC   -> True
+    GHCJS -> True
+    LHC   -> True
+    _     -> False
 
 -- | Utility function for GHC only features
 ghcSupported :: String -> Compiler -> Bool
@@ -307,7 +364,7 @@ ghcSupported key comp =
     GHCJS -> checkProp
     _     -> False
   where checkProp =
-          case M.lookup key (compilerProperties comp) of
+          case Map.lookup key (compilerProperties comp) of
             Just "YES" -> True
             _          -> False
 

@@ -11,8 +11,8 @@ module FamInstEnv (
         mkImportedFamInst,
 
         FamInstEnvs, FamInstEnv, emptyFamInstEnv, emptyFamInstEnvs,
-        extendFamInstEnv, deleteFromFamInstEnv, extendFamInstEnvList,
-        identicalFamInstHead, famInstEnvElts, familyInstances,
+        extendFamInstEnv, extendFamInstEnvList,
+        famInstEnvElts, famInstEnvSize, familyInstances,
 
         -- * CoAxioms
         mkCoAxBranch, mkBranchedCoAxiom, mkUnbranchedCoAxiom, mkSingleCoAxiom,
@@ -31,6 +31,7 @@ module FamInstEnv (
         topNormaliseType, topNormaliseType_maybe,
         normaliseType, normaliseTcApp,
         reduceTyFamApp_maybe,
+        pmTopNormaliseType_maybe,
 
         -- Flattening
         flattenTys
@@ -42,13 +43,14 @@ import Unify
 import Type
 import TyCoRep
 import TyCon
+import DataCon (DataCon)
 import Coercion
 import CoAxiom
 import VarSet
 import VarEnv
 import Name
 import PrelNames ( eqPrimTyConKey )
-import UniqFM
+import UniqDFM
 import Outputable
 import Maybes
 import TrieMap
@@ -60,8 +62,7 @@ import SrcLoc
 import FastString
 import MonadUtils
 import Control.Monad
-import Data.Function ( on )
-import Data.List( mapAccumL )
+import Data.List( mapAccumL, find )
 
 {-
 ************************************************************************
@@ -329,7 +330,7 @@ A FamInstEnv maps a family name to the list of known instances for that family.
 
 The same FamInstEnv includes both 'data family' and 'type family' instances.
 Type families are reduced during type inference, but not data families;
-the user explains when to use a data family instance by using contructors
+the user explains when to use a data family instance by using constructors
 and pattern matching.
 
 Nevertheless it is still useful to have data families in the FamInstEnv:
@@ -359,10 +360,23 @@ Then we get a data type for each instance, and an axiom:
 
 These two axioms for T, one with one pattern, one with two;
 see Note [Eta reduction for data families]
+
+Note [FamInstEnv determinism]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We turn FamInstEnvs into a list in some places that don't directly affect
+the ABI. That happens in family consistency checks and when producing output
+for `:info`. Unfortunately that nondeterminism is nonlocal and it's hard
+to tell what it affects without following a chain of functions. It's also
+easy to accidentally make that nondeterminism affect the ABI. Furthermore
+the envs should be relatively small, so it should be free to use deterministic
+maps here. Testing with nofib and validate detected no difference between
+UniqFM and UniqDFM.
+See Note [Deterministic UniqFM].
 -}
 
-type FamInstEnv = UniqFM FamilyInstEnv  -- Maps a family to its instances
+type FamInstEnv = UniqDFM FamilyInstEnv  -- Maps a family to its instances
      -- See Note [FamInstEnv]
+     -- See Note [FamInstEnv determinism]
 
 type FamInstEnvs = (FamInstEnv, FamInstEnv)
      -- External package inst-env, Home-package inst-env
@@ -381,16 +395,22 @@ emptyFamInstEnvs :: (FamInstEnv, FamInstEnv)
 emptyFamInstEnvs = (emptyFamInstEnv, emptyFamInstEnv)
 
 emptyFamInstEnv :: FamInstEnv
-emptyFamInstEnv = emptyUFM
+emptyFamInstEnv = emptyUDFM
 
 famInstEnvElts :: FamInstEnv -> [FamInst]
-famInstEnvElts fi = [elt | FamIE elts <- eltsUFM fi, elt <- elts]
+famInstEnvElts fi = [elt | FamIE elts <- eltsUDFM fi, elt <- elts]
+  -- See Note [FamInstEnv determinism]
+
+famInstEnvSize :: FamInstEnv -> Int
+famInstEnvSize = nonDetFoldUDFM (\(FamIE elt) sum -> sum + length elt) 0
+  -- It's OK to use nonDetFoldUDFM here since we're just computing the
+  -- size.
 
 familyInstances :: (FamInstEnv, FamInstEnv) -> TyCon -> [FamInst]
 familyInstances (pkg_fie, home_fie) fam
   = get home_fie ++ get pkg_fie
   where
-    get env = case lookupUFM env fam of
+    get env = case lookupUDFM env fam of
                 Just (FamIE insts) -> insts
                 Nothing                      -> []
 
@@ -400,36 +420,9 @@ extendFamInstEnvList inst_env fis = foldl extendFamInstEnv inst_env fis
 extendFamInstEnv :: FamInstEnv -> FamInst -> FamInstEnv
 extendFamInstEnv inst_env
                  ins_item@(FamInst {fi_fam = cls_nm})
-  = addToUFM_C add inst_env cls_nm (FamIE [ins_item])
+  = addToUDFM_C add inst_env cls_nm (FamIE [ins_item])
   where
     add (FamIE items) _ = FamIE (ins_item:items)
-
-deleteFromFamInstEnv :: FamInstEnv -> FamInst -> FamInstEnv
--- Used only for overriding in GHCi
-deleteFromFamInstEnv inst_env fam_inst@(FamInst {fi_fam = fam_nm})
- = adjustUFM adjust inst_env fam_nm
- where
-   adjust :: FamilyInstEnv -> FamilyInstEnv
-   adjust (FamIE items)
-     = FamIE (filterOut (identicalFamInstHead fam_inst) items)
-
-identicalFamInstHead :: FamInst -> FamInst -> Bool
--- ^ True when the LHSs are identical
--- Used for overriding in GHCi
-identicalFamInstHead (FamInst { fi_axiom = ax1 }) (FamInst { fi_axiom = ax2 })
-  =  coAxiomTyCon ax1 == coAxiomTyCon ax2
-  && numBranches brs1 == numBranches brs2
-  && and ((zipWith identical_branch `on` fromBranches) brs1 brs2)
-  where
-    brs1 = coAxiomBranches ax1
-    brs2 = coAxiomBranches ax2
-
-    identical_branch br1 br2
-      =  isJust (tcMatchTys lhs1 lhs2)
-      && isJust (tcMatchTys lhs2 lhs1)
-      where
-        lhs1 = coAxBranchLHS br1
-        lhs2 = coAxBranchLHS br2
 
 {-
 ************************************************************************
@@ -712,7 +705,7 @@ lookupFamInstEnvByTyCon :: FamInstEnvs -> TyCon -> [FamInst]
 lookupFamInstEnvByTyCon (pkg_ie, home_ie) fam_tc
   = get pkg_ie ++ get home_ie
   where
-    get ie = case lookupUFM ie fam_tc of
+    get ie = case lookupUDFM ie fam_tc of
                Nothing          -> []
                Just (FamIE fis) -> fis
 
@@ -875,7 +868,7 @@ lookupFamInstEnvInjectivityConflicts injList (pkg_ie, home_ie)
           | otherwise = True
 
       lookup_inj_fam_conflicts ie
-          | isOpenFamilyTyCon fam, Just (FamIE insts) <- lookupUFM ie fam
+          | isOpenFamilyTyCon fam, Just (FamIE insts) <- lookupUDFM ie fam
           = map (coAxiomSingleBranch . fi_axiom) $
             filter isInjConflict insts
           | otherwise = []
@@ -915,7 +908,7 @@ lookup_fam_inst_env'          -- The worker, local to this module
     -> [FamInstMatch]
 lookup_fam_inst_env' match_fun ie fam match_tys
   | isOpenFamilyTyCon fam
-  , Just (FamIE insts) <- lookupUFM ie fam
+  , Just (FamIE insts) <- lookupUDFM ie fam
   = find insts    -- The common case
   | otherwise = []
   where
@@ -1183,6 +1176,22 @@ coercion. Because coercions are irrelevant anyway, there is no point in doing
 this. So, whenever we encounter a coercion, we just say that it won't change.
 That's what the CoercionTy case is doing within normalise_type.
 
+Note [Normalisation and type synonyms]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We need to be a bit careful about normalising in the presence of type
+synonyms (Trac #13035).  Suppose S is a type synonym, and we have
+   S t1 t2
+If S is family-free (on its RHS) we can just normalise t1 and t2 and
+reconstruct (S t1' t2').   Expanding S could not reveal any new redexes
+because type families are saturated.
+
+But if S has a type family on its RHS we expand /before/ normalising
+the args t1, t2.  If we normalise t1, t2 first, we'll re-normalise them
+after expansion, and that can lead to /exponential/ behavour; see Trac #13035.
+
+Notice, though, that expanding first can in principle duplicate t1,t2,
+which might contain redexes. I'm sure you could conjure up an exponential
+case by that route too, but it hasn't happened in practice yet!
 -}
 
 topNormaliseType :: FamInstEnvs -> Type -> Type
@@ -1197,22 +1206,20 @@ topNormaliseType_maybe :: FamInstEnvs -> Type -> Maybe (Coercion, Type)
 --      * data family redex
 --      * newtypes
 -- returning an appropriate Representational coercion.  Specifically, if
---   topNormaliseType_maybe env ty = Maybe (co, ty')
+--   topNormaliseType_maybe env ty = Just (co, ty')
 -- then
 --   (a) co :: ty ~R ty'
 --   (b) ty' is not a newtype, and is not a type-family or data-family redex
 --
 -- However, ty' can be something like (Maybe (F ty)), where
 -- (F ty) is a redex.
---
--- Its a bit like Type.repType, but handles type families too
 
 topNormaliseType_maybe env ty
   = topNormaliseTypeX stepper mkTransCo ty
   where
     stepper = unwrapNewTypeStepper `composeSteppers` tyFamStepper
 
-    tyFamStepper rec_nts tc tys  -- Try to step a type/data familiy
+    tyFamStepper rec_nts tc tys  -- Try to step a type/data family
       = let (args_co, ntys) = normaliseTcArgs env Representational tc tys in
           -- NB: It's OK to use normaliseTcArgs here instead of
           -- normalise_tc_args (which takes the LiftingContext described
@@ -1225,6 +1232,114 @@ topNormaliseType_maybe env ty
           _              -> NS_Done
 
 ---------------
+pmTopNormaliseType_maybe :: FamInstEnvs -> Type -> Maybe (Type, [DataCon], Type)
+-- ^ Get rid of *outermost* (or toplevel)
+--      * type function redex
+--      * data family redex
+--      * newtypes
+--
+-- Behaves exactly like `topNormaliseType_maybe`, but instead of returning a
+-- coercion, it returns useful information for issuing pattern matching
+-- warnings. See Note [Type normalisation for EmptyCase] for details.
+pmTopNormaliseType_maybe env typ
+  = do ((ty_f,tm_f), ty) <- topNormaliseTypeX stepper comb typ
+       return (eq_src_ty ty (typ : ty_f [ty]), tm_f [], ty)
+  where
+    -- Find the first type in the sequence of rewrites that is a data type,
+    -- newtype, or a data family application (not the representation tycon!).
+    -- This is the one that is equal (in source Haskell) to the initial type.
+    -- If none is found in the list, then all of them are type family
+    -- applications, so we simply return the last one, which is the *simplest*.
+    eq_src_ty :: Type -> [Type] -> Type
+    eq_src_ty ty tys = maybe ty id (find is_alg_or_data_family tys)
+
+    is_alg_or_data_family :: Type -> Bool
+    is_alg_or_data_family ty = isClosedAlgType ty || isDataFamilyAppType ty
+
+    -- For efficiency, represent both lists as difference lists.
+    -- comb performs the concatenation, for both lists.
+    comb (tyf1, tmf1) (tyf2, tmf2) = (tyf1 . tyf2, tmf1 . tmf2)
+
+    stepper = newTypeStepper `composeSteppers` tyFamStepper
+
+    -- A 'NormaliseStepper' that unwraps newtypes, careful not to fall into
+    -- a loop. If it would fall into a loop, it produces 'NS_Abort'.
+    newTypeStepper :: NormaliseStepper ([Type] -> [Type],[DataCon] -> [DataCon])
+    newTypeStepper rec_nts tc tys
+      | Just (ty', _co) <- instNewTyCon_maybe tc tys
+      = case checkRecTc rec_nts tc of
+          Just rec_nts' -> let tyf = ((TyConApp tc tys):)
+                               tmf = ((tyConSingleDataCon tc):)
+                           in  NS_Step rec_nts' ty' (tyf, tmf)
+          Nothing       -> NS_Abort
+      | otherwise
+      = NS_Done
+
+    tyFamStepper :: NormaliseStepper ([Type] -> [Type], [DataCon] -> [DataCon])
+    tyFamStepper rec_nts tc tys  -- Try to step a type/data family
+      = let (_args_co, ntys) = normaliseTcArgs env Representational tc tys in
+          -- NB: It's OK to use normaliseTcArgs here instead of
+          -- normalise_tc_args (which takes the LiftingContext described
+          -- in Note [Normalising types]) because the reduceTyFamApp below
+          -- works only at top level. We'll never recur in this function
+          -- after reducing the kind of a bound tyvar.
+
+        case reduceTyFamApp_maybe env Representational tc ntys of
+          Just (_co, rhs) -> NS_Step rec_nts rhs ((rhs:), id)
+          _               -> NS_Done
+
+{- Note [Type normalisation for EmptyCase]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+EmptyCase is an exception for pattern matching, since it is strict. This means
+that it boils down to checking whether the type of the scrutinee is inhabited.
+Function pmTopNormaliseType_maybe gets rid of the outermost type function/data
+family redex and newtypes, in search of an algebraic type constructor, which is
+easier to check for inhabitation.
+
+It returns 3 results instead of one, because there are 2 subtle points:
+1. Newtypes are isomorphic to the underlying type in core but not in the source
+   language,
+2. The representational data family tycon is used internally but should not be
+   shown to the user
+
+Hence, if pmTopNormaliseType_maybe env ty = Just (src_ty, dcs, core_ty), then
+  (a) src_ty is the rewritten type which we can show to the user. That is, the
+      type we get if we rewrite type families but not data families or
+      newtypes.
+  (b) dcs is the list of data constructors "skipped", every time we normalise a
+      newtype to it's core representation, we keep track of the source data
+      constructor.
+  (c) core_ty is the rewritten type. That is,
+        pmTopNormaliseType_maybe env ty = Just (src_ty, dcs, core_ty)
+      implies
+        topNormaliseType_maybe env ty = Just (co, core_ty)
+      for some coercion co.
+
+To see how all cases come into play, consider the following example:
+
+  data family T a :: *
+  data instance T Int = T1 | T2 Bool
+  -- Which gives rise to FC:
+  --   data T a
+  --   data R:TInt = T1 | T2 Bool
+  --   axiom ax_ti : T Int ~R R:TInt
+
+  newtype G1 = MkG1 (T Int)
+  newtype G2 = MkG2 G1
+
+  type instance F Int  = F Char
+  type instance F Char = G2
+
+In this case pmTopNormaliseType_maybe env (F Int) results in
+
+  Just (G2, [MkG2,MkG1], R:TInt)
+
+Which means that in source Haskell:
+  - G2 is equivalent to F Int (in contrast, G1 isn't).
+  - if (x : R:TInt) then (MkG2 (MkG1 x) : F Int).
+-}
+
+---------------
 normaliseTcApp :: FamInstEnvs -> Role -> TyCon -> [Type] -> (Coercion, Type)
 -- See comments on normaliseType for the arguments of this function
 normaliseTcApp env role tc tys
@@ -1234,18 +1349,18 @@ normaliseTcApp env role tc tys
 -- See Note [Normalising types] about the LiftingContext
 normalise_tc_app :: TyCon -> [Type] -> NormM (Coercion, Type)
 normalise_tc_app tc tys
-  = do { (args_co, ntys) <- normalise_tc_args tc tys
-       ; case expandSynTyCon_maybe tc ntys of
-         { Just (tenv, rhs, ntys') ->
-           do { (co2, ninst_rhs)
-                  <- normalise_type (substTy (mkTvSubstPrs tenv) rhs)
-              ; return $
-                if isReflCo co2
-                then (args_co,                 mkTyConApp tc ntys)
-                else (args_co `mkTransCo` co2, mkAppTys ninst_rhs ntys') }
-         ; Nothing ->
+  | Just (tenv, rhs, tys') <- expandSynTyCon_maybe tc tys
+  , not (isFamFreeTyCon tc)  -- Expand and try again
+  = -- A synonym with type families in the RHS
+    -- Expand and try again
+    -- See Note [Normalisation and type synonyms]
+    normalise_type (mkAppTys (substTy (mkTvSubstPrs tenv) rhs) tys')
+
+  | isFamilyTyCon tc
+  = -- A type-family application
     do { env <- getEnv
        ; role <- getRole
+       ; (args_co, ntys) <- normalise_tc_args tc tys
        ; case reduceTyFamApp_maybe env role tc ntys of
            Just (first_co, ty')
              -> do { (rest_co,nty) <- normalise_type ty'
@@ -1253,7 +1368,13 @@ normalise_tc_app tc tys
                             , nty ) }
            _ -> -- No unique matching family instance exists;
                 -- we do not do anything
-                return (args_co, mkTyConApp tc ntys) }}}
+                return (args_co, mkTyConApp tc ntys) }
+
+  | otherwise
+  = -- A synonym with no type families in the RHS; or data type etc
+    -- Just normalise the arguments and rebuild
+    do { (args_co, ntys) <- normalise_tc_args tc tys
+       ; return (args_co, mkTyConApp tc ntys) }
 
 ---------------
 -- | Normalise arguments to a tycon
@@ -1295,8 +1416,8 @@ normalise_type :: Type                     -- old type
 -- See Note [Normalising types]
 -- Try to not to disturb type synonyms if possible
 
-normalise_type
-  = go
+normalise_type ty
+  = go ty
   where
     go (TyConApp tc tys) = normalise_tc_app tc tys
     go ty@(LitTy {})     = do { r <- getRole
@@ -1305,16 +1426,16 @@ normalise_type
       = do { (co,  nty1) <- go ty1
            ; (arg, nty2) <- withRole Nominal $ go ty2
            ; return (mkAppCo co arg, mkAppTy nty1 nty2) }
-    go (ForAllTy (Anon ty1) ty2)
+    go (FunTy ty1 ty2)
       = do { (co1, nty1) <- go ty1
            ; (co2, nty2) <- go ty2
            ; r <- getRole
            ; return (mkFunCo r co1 co2, mkFunTy nty1 nty2) }
-    go (ForAllTy (Named tyvar vis) ty)
+    go (ForAllTy (TvBndr tyvar vis) ty)
       = do { (lc', tv', h, ki') <- normalise_tyvar_bndr tyvar
            ; (co, nty)          <- withLC lc' $ normalise_type ty
            ; let tv2 = setTyVarKind tv' ki'
-           ; return (mkForAllCo tv' h co, mkNamedForAllTy tv2 vis nty) }
+           ; return (mkForAllCo tv' h co, ForAllTy (TvBndr tv2 vis) nty) }
     go (TyVarTy tv)    = normalise_tyvar tv
     go (CastTy ty co)
       = do { (nco, nty) <- go ty
@@ -1377,7 +1498,6 @@ withLC :: LiftingContext -> NormM a -> NormM a
 withLC lc thing = NormM $ \ envs _old_lc r -> runNormM thing envs lc r
 
 instance Monad NormM where
-  return     = pure
   ma >>= fmb = NormM $ \env lc r ->
                let a = runNormM ma env lc r in
                runNormM (fmb a) env lc r
@@ -1476,14 +1596,14 @@ coreFlattenTy = go
       = let (env', tys') = coreFlattenTys env tys in
         (env', mkTyConApp tc tys')
 
-    go env (ForAllTy (Anon ty1) ty2) = let (env1, ty1') = go env  ty1
-                                           (env2, ty2') = go env1 ty2 in
-                                       (env2, mkFunTy ty1' ty2')
+    go env (FunTy ty1 ty2) = let (env1, ty1') = go env  ty1
+                                 (env2, ty2') = go env1 ty2 in
+                             (env2, mkFunTy ty1' ty2')
 
-    go env (ForAllTy (Named tv vis) ty)
+    go env (ForAllTy (TvBndr tv vis) ty)
       = let (env1, tv') = coreFlattenVarBndr env tv
             (env2, ty') = go env1 ty in
-        (env2, mkNamedForAllTy tv' vis ty')
+        (env2, ForAllTy (TvBndr tv' vis) ty')
 
     go env ty@(LitTy {}) = (env, ty)
 
@@ -1557,12 +1677,13 @@ allTyVarsInTy :: Type -> VarSet
 allTyVarsInTy = go
   where
     go (TyVarTy tv)      = unitVarSet tv
-    go (AppTy ty1 ty2)   = (go ty1) `unionVarSet` (go ty2)
     go (TyConApp _ tys)  = allTyVarsInTys tys
-    go (ForAllTy bndr ty) =
-      caseBinder bndr (\tv -> unitVarSet tv) (const emptyVarSet)
-      `unionVarSet` go (binderType bndr) `unionVarSet` go ty
-        -- don't remove the tv from the set!
+    go (AppTy ty1 ty2)   = (go ty1) `unionVarSet` (go ty2)
+    go (FunTy ty1 ty2)   = (go ty1) `unionVarSet` (go ty2)
+    go (ForAllTy (TvBndr tv _) ty) = unitVarSet tv     `unionVarSet`
+                                     go (tyVarKind tv) `unionVarSet`
+                                     go ty
+                                     -- Don't remove the tv from the set!
     go (LitTy {})        = emptyVarSet
     go (CastTy ty co)    = go ty `unionVarSet` go_co co
     go (CoercionTy co)   = go_co co
@@ -1572,6 +1693,7 @@ allTyVarsInTy = go
     go_co (AppCo co arg)        = go_co co `unionVarSet` go_co arg
     go_co (ForAllCo tv h co)
       = unionVarSets [unitVarSet tv, go_co co, go_co h]
+    go_co (FunCo _ c1 c2)       = go_co c1 `unionVarSet` go_co c2
     go_co (CoVarCo cv)          = unitVarSet cv
     go_co (AxiomInstCo _ _ cos) = go_cos cos
     go_co (UnivCo p _ t1 t2)    = go_prov p `unionVarSet` go t1 `unionVarSet` go t2

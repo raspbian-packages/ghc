@@ -38,7 +38,7 @@ module StgCmmUtils (
         addToMem, addToMemE, addToMemLblE, addToMemLbl,
         mkWordCLit,
         newStringCLit, newByteStringCLit,
-        blankWord
+        blankWord,
   ) where
 
 #include "HsVersions.h"
@@ -63,9 +63,11 @@ import Literal
 import Digraph
 import Util
 import Unique
+import UniqSupply (MonadUnique(..))
 import DynFlags
 import FastString
 import Outputable
+import RepType
 
 import qualified Data.ByteString as BS
 import qualified Data.Map as M
@@ -250,7 +252,7 @@ callerSaveVolatileRegs dflags = (caller_save, caller_load)
 
     callerRestoreGlobalReg reg
         = mkAssign (CmmGlobal reg)
-                    (CmmLoad (get_GlobalReg_addr dflags reg) (globalRegType dflags reg))
+                   (CmmLoad (get_GlobalReg_addr dflags reg) (globalRegType dflags reg))
 
 -- -----------------------------------------------------------------------------
 -- Global registers
@@ -296,7 +298,7 @@ baseRegOffset dflags CurrentNursery = oFFSET_StgRegTable_rCurrentNursery dflags
 baseRegOffset dflags HpAlloc        = oFFSET_StgRegTable_rHpAlloc dflags
 baseRegOffset dflags GCEnter1       = oFFSET_stgGCEnter1 dflags
 baseRegOffset dflags GCFun          = oFFSET_stgGCFun dflags
-baseRegOffset _      reg            = pprPanic "baseRegOffset:" (ppr reg)
+baseRegOffset _      reg            = pprPanic "StgCmmUtils.baseRegOffset:" (ppr reg)
 
 -------------------------------------------------------------------------
 --
@@ -320,7 +322,7 @@ newStringCLit str = newByteStringCLit (map (fromIntegral . ord) str)
 newByteStringCLit :: [Word8] -> FCode CmmLit
 newByteStringCLit bytes
   = do  { uniq <- newUnique
-        ; let (lit, decl) = mkByteStringCLit uniq bytes
+        ; let (lit, decl) = mkByteStringCLit (mkStringLitLabel uniq) bytes
         ; emitDecl decl
         ; return lit }
 
@@ -345,8 +347,8 @@ assignTemp e = do { dflags <- getDynFlags
                   ; emitAssign (CmmLocal reg) e
                   ; return reg }
 
-newTemp :: CmmType -> FCode LocalReg
-newTemp rep = do { uniq <- newUnique
+newTemp :: MonadUnique m => CmmType -> m LocalReg
+newTemp rep = do { uniq <- getUniqueM
                  ; return (LocalReg uniq rep) }
 
 newUnboxedTupleRegs :: Type -> FCode ([LocalReg], [ForeignHint])
@@ -362,11 +364,7 @@ newUnboxedTupleRegs res_ty
         ; ASSERT( regs `equalLength` reps )
           return (regs, map primRepForeignHint reps) }
   where
-    UbxTupleRep ty_args = repType res_ty
-    reps = [ rep
-           | ty <- ty_args
-           , let rep = typePrimRep ty
-           , not (isVoidRep rep) ]
+    reps = typePrimRep res_ty
     choose_regs _ (AssignTo regs _) = return regs
     choose_regs dflags _            = mapM (newTemp . primRepCmmType dflags) reps
 
@@ -395,7 +393,7 @@ emitMultiAssign []    []    = return ()
 emitMultiAssign [reg] [rhs] = emitAssign (CmmLocal reg) rhs
 emitMultiAssign regs rhss   = do
   dflags <- getDynFlags
-  ASSERT( equalLength regs rhss )
+  ASSERT2( equalLength regs rhss, ppr regs $$ ppr rhss )
     unscramble dflags ([1..] `zip` (regs `zip` rhss))
 
 unscramble :: DynFlags -> [Vrtx] -> FCode ()
@@ -410,7 +408,7 @@ unscramble dflags vertices = mapM_ do_component components
                                     stmt1 `mustFollow` stmt2 ]
 
         components :: [SCC Vrtx]
-        components = stronglyConnCompFromEdgedVertices edges
+        components = stronglyConnCompFromEdgedVerticesUniq edges
 
         -- do_components deal with one strongly-connected component
         -- Not cyclic, or singleton?  Just do it
@@ -461,7 +459,7 @@ emitSwitch _ [(_,code)] Nothing     _ _ = emit (fst code)
 
 -- Right, off we go
 emitSwitch tag_expr branches mb_deflt lo_tag hi_tag = do
-    join_lbl      <- newLabelC
+    join_lbl      <- newBlockId
     mb_deflt_lbl  <- label_default join_lbl mb_deflt
     branches_lbls <- label_branches join_lbl branches
     tag_expr'     <- assignTemp' tag_expr
@@ -519,7 +517,7 @@ emitCmmLitSwitch :: CmmExpr                    -- Tag to switch on
 emitCmmLitSwitch _scrut []       deflt = emit $ fst deflt
 emitCmmLitSwitch scrut  branches deflt = do
     scrut' <- assignTemp' scrut
-    join_lbl <- newLabelC
+    join_lbl <- newBlockId
     deflt_lbl <- label_code join_lbl deflt
     branches_lbls <- label_branches join_lbl branches
 
@@ -606,7 +604,7 @@ label_code :: BlockId -> CmmAGraphScoped -> FCode BlockId
 --  [L: code; goto J]
 -- and returns L
 label_code join_lbl (code,tsc) = do
-    lbl <- newLabelC
+    lbl <- newBlockId
     emitOutOfLine lbl (code MkGraph.<*> mkBranch join_lbl, tsc)
     return lbl
 

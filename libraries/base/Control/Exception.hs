@@ -49,6 +49,7 @@ module Control.Exception (
         BlockedIndefinitelyOnMVar(..),
         BlockedIndefinitelyOnSTM(..),
         AllocationLimitExceeded(..),
+        CompactionFailed(..),
         Deadlock(..),
         NoMethodError(..),
         PatternMatchFail(..),
@@ -140,6 +141,7 @@ import GHC.IO (interruptible)
 -- | You need this when using 'catches'.
 data Handler a = forall e . Exception e => Handler (e -> IO a)
 
+-- | @since 4.6.0.0
 instance Functor Handler where
      fmap f (Handler h) = Handler (fmap f . h)
 
@@ -304,7 +306,7 @@ exceptions is that they normally can occur anywhere, but within a
 interruptible (or call other interruptible operations).  In many cases
 these operations may themselves raise exceptions, such as I\/O errors,
 so the caller will usually be prepared to handle exceptions arising from the
-operation anyway.  To perfom an explicit poll for asynchronous exceptions
+operation anyway.  To perform an explicit poll for asynchronous exceptions
 inside 'mask', use 'allowInterrupt'.
 
 Sometimes it is too onerous to handle exceptions in the middle of a

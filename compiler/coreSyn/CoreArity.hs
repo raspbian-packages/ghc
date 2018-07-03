@@ -10,8 +10,10 @@
 
 -- | Arity and eta expansion
 module CoreArity (
-        manifestArity, exprArity, typeArity, exprBotStrictness_maybe,
-        exprEtaExpandArity, findRhsArity, CheapFun, etaExpand
+        manifestArity, joinRhsArity, exprArity, typeArity,
+        exprEtaExpandArity, findRhsArity, CheapFun, etaExpand,
+        etaExpandToJoinPoint, etaExpandToJoinPointRule,
+        exprBotStrictness_maybe
     ) where
 
 #include "HsVersions.h"
@@ -76,6 +78,14 @@ manifestArity (Tick t e) | not (tickishIsCode t) =  manifestArity e
 manifestArity (Cast e _)                = manifestArity e
 manifestArity _                         = 0
 
+joinRhsArity :: CoreExpr -> JoinArity
+-- Join points are supposed to have manifestly-visible
+-- lambdas at the top: no ticks, no casts, nothing
+-- Moreover, type lambdas count in JoinArity
+joinRhsArity (Lam _ e) = 1 + joinRhsArity e
+joinRhsArity _         = 0
+
+
 ---------------
 exprArity :: CoreExpr -> Arity
 -- ^ An approximate, fast, version of 'exprEtaExpandArity'
@@ -106,10 +116,11 @@ typeArity ty
   = go initRecTc ty
   where
     go rec_nts ty
-      | Just (bndr, ty')  <- splitPiTy_maybe ty
-      = if isIdLikeBinder bndr
-        then typeOneShot (binderType bndr) : go rec_nts ty'
-        else go rec_nts ty'
+      | Just (_, ty')  <- splitForAllTy_maybe ty
+      = go rec_nts ty'
+
+      | Just (arg,res) <- splitFunTy_maybe ty
+      = typeOneShot arg : go rec_nts res
 
       | Just (tc,tys) <- splitTyConApp_maybe ty
       , Just (ty', _) <- instNewTyCon_maybe tc tys
@@ -497,9 +508,9 @@ getBotArity _        = Nothing
 mk_cheap_fn :: DynFlags -> CheapAppFun -> CheapFun
 mk_cheap_fn dflags cheap_app
   | not (gopt Opt_DictsCheap dflags)
-  = \e _     -> exprIsCheap' cheap_app e
+  = \e _     -> exprIsOk cheap_app e
   | otherwise
-  = \e mb_ty -> exprIsCheap' cheap_app e
+  = \e mb_ty -> exprIsOk cheap_app e
              || case mb_ty of
                   Nothing -> False
                   Just ty -> isDictLikeTy ty
@@ -633,7 +644,7 @@ when saturated" so we don't want to be too gung-ho about saturating!
 -}
 
 arityLam :: Id -> ArityType -> ArityType
-arityLam id (ATop as) = ATop (idOneShotInfo id : as)
+arityLam id (ATop as) = ATop (idStateHackOneShotInfo id : as)
 arityLam _  (ABot n)  = ABot (n+1)
 
 floatIn :: Bool -> ArityType -> ArityType
@@ -653,8 +664,7 @@ arityApp (ATop [])     _     = ATop []
 arityApp (ATop (_:as)) cheap = floatIn cheap (ATop as)
 
 andArityType :: ArityType -> ArityType -> ArityType   -- Used for branches of a 'case'
-andArityType (ABot n1) (ABot n2)
-  = ABot (n1 `min` n2)
+andArityType (ABot n1) (ABot n2)  = ABot (n1 `max` n2) -- Note [ABot branches: use max]
 andArityType (ATop as)  (ABot _)  = ATop as
 andArityType (ABot _)   (ATop bs) = ATop bs
 andArityType (ATop as)  (ATop bs) = ATop (as `combine` bs)
@@ -663,7 +673,15 @@ andArityType (ATop as)  (ATop bs) = ATop (as `combine` bs)
     combine []     bs     = takeWhile isOneShotInfo bs
     combine as     []     = takeWhile isOneShotInfo as
 
-{-
+{- Note [ABot branches: use max]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider   case x of
+             True  -> \x.  error "urk"
+             False -> \xy. error "urk2"
+
+Remember: ABot n means "if you apply to n args, it'll definitely diverge".
+So we need (ABot 2) for the whole thing, the /max/ of the ABot arities.
+
 Note [Combining case branches]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Consider
@@ -711,7 +729,7 @@ arityType env (Cast e co)
 
 arityType _ (Var v)
   | strict_sig <- idStrictness v
-  , not $ isNopSig strict_sig
+  , not $ isTopSig strict_sig
   , (ds, res) <- splitStrictSig strict_sig
   , let arity = length ds
   = if isBotRes res then ABot arity
@@ -854,6 +872,9 @@ to re-add floats on the top.
 etaExpand :: Arity              -- ^ Result should have this number of value args
           -> CoreExpr           -- ^ Expression to expand
           -> CoreExpr
+-- etaExpand arity e = res
+-- Then 'res' has at least 'arity' lambdas at the top
+--
 -- etaExpand deals with for-alls. For example:
 --              etaExpand 1 E
 -- where  E :: forall a. a -> a
@@ -941,10 +962,16 @@ etaInfoApp subst (Case e b ty alts) eis
 etaInfoApp subst (Let b e) eis
   = Let b' (etaInfoApp subst' e eis)
   where
-    (subst', b') = subst_bind subst b
+    (subst', b') = etaInfoAppBind subst b eis
 
 etaInfoApp subst (Tick t e) eis
   = Tick (substTickish subst t) (etaInfoApp subst e eis)
+
+etaInfoApp subst expr _
+  | (Var fun, _) <- collectArgs expr
+  , Var fun' <- lookupIdSubst (text "etaInfoApp" <+> ppr fun) subst fun
+  , isJoinId fun'
+  = subst_expr subst expr
 
 etaInfoApp subst e eis
   = go (subst_expr subst e) eis
@@ -952,6 +979,94 @@ etaInfoApp subst e eis
     go e []                  = e
     go e (EtaVar v    : eis) = go (App e (varToCoreExpr v)) eis
     go e (EtaCo co    : eis) = go (Cast e co) eis
+
+--------------
+-- | Apply the eta info to a local binding. Mostly delegates to
+-- `etaInfoAppLocalBndr` and `etaInfoAppRhs`.
+etaInfoAppBind :: Subst -> CoreBind -> [EtaInfo] -> (Subst, CoreBind)
+etaInfoAppBind subst (NonRec bndr rhs) eis
+  = (subst', NonRec bndr' rhs')
+  where
+    bndr_w_new_type = etaInfoAppLocalBndr bndr eis
+    (subst', bndr1) = substBndr subst bndr_w_new_type
+    rhs'            = etaInfoAppRhs subst bndr1 rhs eis
+    bndr'           | isJoinId bndr = bndr1 `setIdArity` manifestArity rhs'
+                                        -- Arity may have changed
+                                        -- (see etaInfoAppRhs example)
+                    | otherwise     = bndr1
+etaInfoAppBind subst (Rec pairs) eis
+  = (subst', Rec (bndrs' `zip` rhss'))
+  where
+    (bndrs, rhss)     = unzip pairs
+    bndrs_w_new_types = map (\bndr -> etaInfoAppLocalBndr bndr eis) bndrs
+    (subst', bndrs1)  = substRecBndrs subst bndrs_w_new_types
+    rhss'             = zipWith process bndrs1 rhss
+    process bndr' rhs = etaInfoAppRhs subst' bndr' rhs eis
+    bndrs'            | isJoinId (head bndrs)
+                      = [ bndr1 `setIdArity` manifestArity rhs'
+                        | (bndr1, rhs') <- bndrs1 `zip` rhss' ]
+                          -- Arities may have changed
+                          -- (see etaInfoAppRhs example)
+                      | otherwise
+                      = bndrs1
+
+--------------
+-- | Apply the eta info to a binder's RHS. Only interesting for a join point,
+-- where we might have this:
+--   join j :: a -> [a] -> [a]
+--        j x = \xs -> x : xs in jump j z
+-- Eta-expanding produces this:
+--   \ys -> (join j :: a -> [a] -> [a]
+--                j x = \xs -> x : xs in jump j z) ys
+-- Now when we push the application to ys inward (see Note [No crap in
+-- eta-expanded code]), it goes to the body of the RHS of the join point (after
+-- the lambda x!):
+--   \ys -> join j :: a -> [a]
+--               j x = x : ys in jump j z
+-- Note that the type and arity of j have both changed.
+etaInfoAppRhs :: Subst -> CoreBndr -> CoreExpr -> [EtaInfo] -> CoreExpr
+etaInfoAppRhs subst bndr expr eis
+  | Just arity <- isJoinId_maybe bndr
+  = do_join_point arity
+  | otherwise
+  = subst_expr subst expr
+  where
+    do_join_point arity = mkLams join_bndrs' join_body'
+      where
+        (join_bndrs, join_body) = collectNBinders arity expr
+        (subst', join_bndrs') = substBndrs subst join_bndrs
+        join_body' = etaInfoApp subst' join_body eis
+
+
+--------------
+-- | Apply the eta info to a local binder. A join point will have the EtaInfos
+-- applied to its RHS, so its type may change. See comment on etaInfoAppRhs for
+-- an example. See Note [No crap in eta-expanded code] for why all this is
+-- necessary.
+etaInfoAppLocalBndr :: CoreBndr -> [EtaInfo] -> CoreBndr
+etaInfoAppLocalBndr bndr orig_eis
+  = case isJoinId_maybe bndr of
+      Just arity -> bndr `setIdType` modifyJoinResTy arity (app orig_eis) ty
+      Nothing    -> bndr
+  where
+    ty = idType bndr
+
+    -- | Apply the given EtaInfos to the result type of the join point.
+    app :: [EtaInfo] -- To apply
+        -> Type      -- Result type of join point
+        -> Type      -- New result type
+    app [] ty
+      = ty
+    app (EtaVar v : eis) ty
+      | isId v    = app eis (funResultTy ty)
+      | otherwise = app eis (piResultTy ty (mkTyVarTy v))
+    app (EtaCo co : eis) ty
+      = ASSERT2(from_ty `eqType` ty, fsep ([text "can't apply", ppr orig_eis,
+                                            text "to", ppr bndr <+> dcolon <+>
+                                                       ppr (idType bndr)]))
+        app eis to_ty
+      where
+        Pair from_ty to_ty = coercionKind co
 
 --------------
 mkEtaWW :: Arity -> CoreExpr -> InScopeSet -> Type
@@ -970,13 +1085,19 @@ mkEtaWW orig_n orig_expr in_scope orig_ty
        | n == 0
        = (getTCvInScope subst, reverse eis)
 
-       | Just (bndr,ty') <- splitPiTy_maybe ty
-       = let ((subst', eta_id'), new_n) = caseBinder bndr
-               (\tv -> (Type.substTyVarBndr subst tv, n))
-               (\arg_ty -> (freshEtaVar n subst arg_ty, n-1))
-         in
-            -- Avoid free vars of the original expression
-         go new_n subst' ty' (EtaVar eta_id' : eis)
+       | Just (tv,ty') <- splitForAllTy_maybe ty
+       , let (subst', tv') = Type.substTyVarBndr subst tv
+           -- Avoid free vars of the original expression
+       = go n subst' ty' (EtaVar tv' : eis)
+
+       | Just (arg_ty, res_ty) <- splitFunTy_maybe ty
+       , not (isTypeLevPoly arg_ty)
+          -- See Note [Levity polymorphism invariants] in CoreSyn
+          -- See also test case typecheck/should_run/EtaExpandLevPoly
+
+       , let (subst', eta_id') = freshEtaId n subst arg_ty
+           -- Avoid free vars of the original expression
+       = go (n-1) subst' res_ty (EtaVar eta_id' : eis)
 
        | Just (co, ty') <- topNormaliseNewType_maybe ty
        =        -- Given this:
@@ -988,7 +1109,8 @@ mkEtaWW orig_n orig_expr in_scope orig_ty
          go n subst ty' (EtaCo co : eis)
 
        | otherwise       -- We have an expression of arity > 0,
-                         -- but its type isn't a function.
+                         -- but its type isn't a function, or a binder
+                         -- is levity-polymorphic
        = WARN( True, (ppr orig_n <+> ppr orig_ty) $$ ppr orig_expr )
          (getTCvInScope subst, reverse eis)
         -- This *can* legitmately happen:
@@ -998,18 +1120,70 @@ mkEtaWW orig_n orig_expr in_scope orig_ty
         -- with an explicit lambda having a non-function type
 
 
+
 --------------
--- Avoiding unnecessary substitution; use short-cutting versions
+-- Don't use short-cutting substitution - we may be changing the types of join
+-- points, so applying the in-scope set is necessary
+-- TODO Check if we actually *are* changing any join points' types
 
 subst_expr :: Subst -> CoreExpr -> CoreExpr
-subst_expr = substExprSC (text "CoreArity:substExpr")
-
-subst_bind :: Subst -> CoreBind -> (Subst, CoreBind)
-subst_bind = substBindSC
+subst_expr = substExpr (text "CoreArity:substExpr")
 
 
 --------------
-freshEtaVar :: Int -> TCvSubst -> Type -> (TCvSubst, Var)
+
+-- | Split an expression into the given number of binders and a body,
+-- eta-expanding if necessary. Counts value *and* type binders.
+etaExpandToJoinPoint :: JoinArity -> CoreExpr -> ([CoreBndr], CoreExpr)
+etaExpandToJoinPoint join_arity expr
+  = go join_arity [] expr
+  where
+    go 0 rev_bs e         = (reverse rev_bs, e)
+    go n rev_bs (Lam b e) = go (n-1) (b : rev_bs) e
+    go n rev_bs e         = case etaBodyForJoinPoint n e of
+                              (bs, e') -> (reverse rev_bs ++ bs, e')
+
+etaExpandToJoinPointRule :: JoinArity -> CoreRule -> CoreRule
+etaExpandToJoinPointRule _ rule@(BuiltinRule {})
+  = WARN(True, (sep [text "Can't eta-expand built-in rule:", ppr rule]))
+      -- How did a local binding get a built-in rule anyway? Probably a plugin.
+    rule
+etaExpandToJoinPointRule join_arity rule@(Rule { ru_bndrs = bndrs, ru_rhs = rhs
+                                               , ru_args  = args })
+  | need_args == 0
+  = rule
+  | need_args < 0
+  = pprPanic "etaExpandToJoinPointRule" (ppr join_arity $$ ppr rule)
+  | otherwise
+  = rule { ru_bndrs = bndrs ++ new_bndrs, ru_args = args ++ new_args
+         , ru_rhs = new_rhs }
+  where
+    need_args = join_arity - length args
+    (new_bndrs, new_rhs) = etaBodyForJoinPoint need_args rhs
+    new_args = varsToCoreExprs new_bndrs
+
+-- Adds as many binders as asked for; assumes expr is not a lambda
+etaBodyForJoinPoint :: Int -> CoreExpr -> ([CoreBndr], CoreExpr)
+etaBodyForJoinPoint need_args body
+  = go need_args (exprType body) (init_subst body) [] body
+  where
+    go 0 _  _     rev_bs e
+      = (reverse rev_bs, e)
+    go n ty subst rev_bs e
+      | Just (tv, res_ty) <- splitForAllTy_maybe ty
+      , let (subst', tv') = Type.substTyVarBndr subst tv
+      = go (n-1) res_ty subst' (tv' : rev_bs) (e `App` Type (mkTyVarTy tv'))
+      | Just (arg_ty, res_ty) <- splitFunTy_maybe ty
+      , let (subst', b) = freshEtaId n subst arg_ty
+      = go (n-1) res_ty subst' (b : rev_bs) (e `App` Var b)
+      | otherwise
+      = pprPanic "etaBodyForJoinPoint" $ int need_args $$
+                                         ppr body $$ ppr (exprType body)
+
+    init_subst e = mkEmptyTCvSubst (mkInScopeSet (exprFreeVars e))
+
+--------------
+freshEtaId :: Int -> TCvSubst -> Type -> (TCvSubst, Id)
 -- Make a fresh Id, with specified type (after applying substitution)
 -- It should be "fresh" in the sense that it's not in the in-scope set
 -- of the TvSubstEnv; and it should itself then be added to the in-scope
@@ -1017,7 +1191,7 @@ freshEtaVar :: Int -> TCvSubst -> Type -> (TCvSubst, Var)
 --
 -- The Int is just a reasonable starting point for generating a unique;
 -- it does not necessarily have to be unique itself.
-freshEtaVar n subst ty
+freshEtaId n subst ty
       = (subst', eta_id')
       where
         ty'     = Type.substTy subst ty

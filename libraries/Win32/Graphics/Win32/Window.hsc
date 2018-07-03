@@ -1,4 +1,5 @@
 {-# LANGUAGE CApiFFI #-}
+{-# LANGUAGE NegativeLiterals #-}
 #if __GLASGOW_HASKELL__ >= 701
 {-# LANGUAGE Trustworthy #-}
 #endif
@@ -20,11 +21,12 @@ module Graphics.Win32.Window where
 
 import Control.Monad (liftM)
 import Data.Maybe (fromMaybe)
-import Data.Word (Word32)
+import Data.Int (Int32)
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Ptr (FunPtr, Ptr, castFunPtrToPtr, castPtr, nullPtr)
 import Foreign.Storable (pokeByteOff)
+import Foreign.C.Types (CIntPtr(..))
 import Graphics.Win32.GDI.Types (HBITMAP, HCURSOR, HDC, HDWP, HRGN, HWND, PRGN)
 import Graphics.Win32.GDI.Types (HBRUSH, HICON, HMENU, prim_ChildWindowFromPoint)
 import Graphics.Win32.GDI.Types (LPRECT, RECT, allocaRECT, peekRECT, withRECT)
@@ -184,7 +186,10 @@ type WindowStyleEx   = DWORD
 
 cW_USEDEFAULT :: Pos
 -- See Note [Overflow checking and fromIntegral] in Graphics/Win32/GDI/HDC.hs
-cW_USEDEFAULT = fromIntegral (#{const CW_USEDEFAULT} :: Word32)
+-- Weird way to essentially get a value with the top bit set. But GHC 7.8.4 was
+-- rejecting all other sane attempts.
+cW_USEDEFAULT = let val = negate (#{const CW_USEDEFAULT}) :: Integer
+                in fromIntegral (fromIntegral val :: Int32) :: Pos
 
 type Pos = Int
 
@@ -474,6 +479,11 @@ findWindow cname wname =
   withTString cname $ \ c_cname ->
   withTString wname $ \ c_wname ->
   liftM ptrToMaybe $ c_FindWindow c_cname c_wname
+
+findWindowByName :: String -> IO (Maybe HWND)
+findWindowByName wname = withTString wname $ \ c_wname ->
+  liftM ptrToMaybe $ c_FindWindow nullPtr c_wname
+
 foreign import WINDOWS_CCONV unsafe "windows.h FindWindowW"
   c_FindWindow :: LPCTSTR -> LPCTSTR -> IO HWND
 

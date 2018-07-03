@@ -10,15 +10,14 @@ module WorkWrap ( wwTopBinds ) where
 import CoreSyn
 import CoreUnfold       ( certainlyWillInline, mkWwInlineRule, mkWorkerUnfolding )
 import CoreUtils        ( exprType, exprIsHNF )
-import CoreArity        ( exprArity )
 import CoreFVs          ( exprFreeVars )
 import Var
 import Id
 import IdInfo
+import Type
 import UniqSupply
 import BasicTypes
 import DynFlags
-import VarEnv           ( isEmptyVarEnv )
 import Demand
 import WwLib
 import Util
@@ -109,7 +108,10 @@ wwExpr _      _ e@(Lit  {}) = return e
 wwExpr _      _ e@(Var  {}) = return e
 
 wwExpr dflags fam_envs (Lam binder expr)
-  = Lam binder <$> wwExpr dflags fam_envs expr
+  = Lam new_binder <$> wwExpr dflags fam_envs expr
+  where new_binder | isId binder = zapIdUsedOnceInfo binder
+                   | otherwise   = binder
+  -- See Note [Zapping Used Once info in WorkWrap]
 
 wwExpr dflags fam_envs (App f a)
   = App <$> wwExpr dflags fam_envs f <*> wwExpr dflags fam_envs a
@@ -127,11 +129,16 @@ wwExpr dflags fam_envs (Let bind expr)
 wwExpr dflags fam_envs (Case expr binder ty alts) = do
     new_expr <- wwExpr dflags fam_envs expr
     new_alts <- mapM ww_alt alts
-    return (Case new_expr binder ty new_alts)
+    let new_binder = zapIdUsedOnceInfo binder
+      -- See Note [Zapping Used Once info in WorkWrap]
+    return (Case new_expr new_binder ty new_alts)
   where
     ww_alt (con, binders, rhs) = do
         new_rhs <- wwExpr dflags fam_envs rhs
-        return (con, binders, new_rhs)
+        let new_binders = [ if isId b then zapIdUsedOnceInfo b else b
+                          | b <- binders ]
+           -- See Note [Zapping Used Once info in WorkWrap]
+        return (con, new_binders, new_rhs)
 
 {-
 ************************************************************************
@@ -192,17 +199,79 @@ unfolding to the *worker*.  So we will get something like this:
 How do we "transfer the unfolding"? Easy: by using the old one, wrapped
 in work_fn! See CoreUnfold.mkWorkerUnfolding.
 
-Note [Activation for INLINABLE worker]
+Note [Worker-wrapper for NOINLINE functions]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We used to disable worker/wrapper for NOINLINE things, but it turns out
+this can cause unnecessary reboxing of values. Consider
+
+  {-# NOINLINE f #-}
+  f :: Int -> a
+  f x = error (show x)
+
+  g :: Bool -> Bool -> Int -> Int
+  g True  True  p = f p
+  g False True  p = p + 1
+  g b     False p = g b True p
+
+the strictness analysis will discover f and g are strict, but because f
+has no wrapper, the worker for g will rebox p. So we get
+
+  $wg x y p# =
+    let p = I# p# in  -- Yikes! Reboxing!
+    case x of
+      False ->
+        case y of
+          False -> $wg False True p#
+          True -> +# p# 1#
+      True ->
+        case y of
+          False -> $wg True True p#
+          True -> case f p of { }
+
+  g x y p = case p of (I# p#) -> $wg x y p#
+
+Now, in this case the reboxing will float into the True branch, an so
+the allocation will only happen on the error path. But it won't float
+inwards if there are multiple branches that call (f p), so the reboxing
+will happen on every call of g. Disaster.
+
+Solution: do worker/wrapper even on NOINLINE things; but move the
+NOINLINE pragma to the worker.
+
+(See Trac #13143 for a real-world example.)
+
+Note [Activation for workers]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Follows on from Note [Worker-wrapper for INLINABLE functions]
+
 It is *vital* that if the worker gets an INLINABLE pragma (from the
 original function), then the worker has the same phase activation as
 the wrapper (or later).  That is necessary to allow the wrapper to
 inline into the worker's unfolding: see SimplUtils
 Note [Simplifying inside stable unfoldings].
 
-Notihng is lost by giving the worker the same activation as the
-worker, because the worker won't have any chance of inlining until the
+If the original is NOINLINE, it's important that the work inherit the
+original activation. Consider
+
+  {-# NOINLINE expensive #-}
+  expensive x = x + 1
+
+  f y = let z = expensive y in ...
+
+If expensive's worker inherits the wrapper's activation, we'll get
+
+  {-# NOINLINE[0] $wexpensive #-}
+  $wexpensive x = x + 1
+  {-# INLINE[0] expensive #-}
+  expensive x = $wexpensive x
+
+  f y = let z = expensive y in ...
+
+and $wexpensive will be immediately inlined into expensive, followed by
+expensive into f. This effectively removes the original NOINLINE!
+
+Otherwise, nothing is lost by giving the worker the same activation as the
+wrapper, because the worker won't have any chance of inlining until the
 wrapper does; there's no point in giving it an earlier activation.
 
 Note [Don't w/w inline small non-loop-breaker things]
@@ -230,6 +299,48 @@ There is an infelicity though.  We may get something like
 
 The code for f duplicates that for g, without any real benefit. It
 won't really be executed, because calls to f will go via the inlining.
+
+Note [Don't CPR join points]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+There's no point in doing CPR on a join point. If the whole function is getting
+CPR'd, then the case expression around the worker function will get pushed into
+the join point by the simplifier, which will have the same effect that CPR would
+have - the result will be returned in an unboxed tuple.
+
+  f z = let join j x y = (x+1, y+1)
+        in case z of A -> j 1 2
+                     B -> j 2 3
+
+  =>
+
+  f z = case $wf z of (# a, b #) -> (a, b)
+  $wf z = case (let join j x y = (x+1, y+1)
+                in case z of A -> j 1 2
+                             B -> j 2 3) of (a, b) -> (# a, b #)
+
+  =>
+
+  f z = case $wf z of (# a, b #) -> (a, b)
+  $wf z = let join j x y = (# x+1, y+1 #)
+          in case z of A -> j 1 2
+                       B -> j 2 3
+
+Doing CPR on a join point would be tricky anyway, as the worker could not be
+a join point because it would not be tail-called. However, doing the *argument*
+part of W/W still works for join points, since the wrapper body will make a tail
+call:
+
+  f z = let join j x y = x + y
+        in ...
+
+  =>
+
+  f z = let join $wj x# y# = x# +# y#
+                 j x y = case x of I# x# ->
+                         case y of I# y# ->
+                         $wj x# y#
+        in ...
 
 Note [Wrapper activation]
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -277,20 +388,12 @@ tryWW   :: DynFlags
                                         -- if two, then a worker and a
                                         -- wrapper.
 tryWW dflags fam_envs is_rec fn_id rhs
-  | isNeverActive inline_act
-        -- No point in worker/wrappering if the thing is never inlined!
-        -- Because the no-inline prag will prevent the wrapper ever
-        -- being inlined at a call site.
-        --
-        -- Furthermore, don't even expose strictness info
-  = return [ (fn_id, rhs) ]
+  -- See Note [Worker-wrapper for NOINLINE functions]
 
-  | not loop_breaker
-  , Just stable_unf <- certainlyWillInline dflags fn_unf
+  | Just stable_unf <- certainlyWillInline dflags fn_info
   = return [ (fn_id `setIdUnfolding` stable_unf, rhs) ]
-        -- Note [Don't w/w inline small non-loop-breaker, or INLINE, things]
-        -- NB: use idUnfolding because we don't want to apply
-        --     this criterion to a loop breaker!
+        -- See Note [Don't w/w INLINE things]
+        -- See Note [Don't w/w inline small non-loop-breaker things]
 
   | is_fun
   = splitFun dflags fam_envs new_fn_id fn_info wrap_dmds res_info rhs
@@ -302,27 +405,56 @@ tryWW dflags fam_envs is_rec fn_id rhs
   = return [ (new_fn_id, rhs) ]
 
   where
-    loop_breaker = isStrongLoopBreaker (occInfo fn_info)
     fn_info      = idInfo fn_id
-    inline_act   = inlinePragmaActivation (inlinePragInfo fn_info)
-    fn_unf       = unfoldingInfo fn_info
+    (wrap_dmds, res_info) = splitStrictSig (strictnessInfo fn_info)
 
-        -- In practice it always will have a strictness
-        -- signature, even if it's a uninformative one
-    strict_sig  = strictnessInfo fn_info
-    StrictSig (DmdType env wrap_dmds res_info) = strict_sig
+    new_fn_id = zapIdUsedOnceInfo (zapIdUsageEnvInfo fn_id)
+        -- See Note [Zapping DmdEnv after Demand Analyzer] and
+        -- See Note [Zapping Used Once info in WorkWrap]
 
-        -- new_fn_id has the DmdEnv zapped.
-        --      (a) it is never used again
-        --      (b) it wastes space
-        --      (c) it becomes incorrect as things are cloned, because
-        --          we don't push the substitution into it
-    new_fn_id | isEmptyVarEnv env = fn_id
-              | otherwise         = fn_id `setIdStrictness`
-                                     mkClosedStrictSig wrap_dmds res_info
+    is_fun    = notNull wrap_dmds || isJoinId fn_id
+    is_thunk  = not is_fun && not (exprIsHNF rhs) && not (isJoinId fn_id)
+                           && not (isUnliftedType (idType fn_id))
 
-    is_fun    = notNull wrap_dmds
-    is_thunk  = not is_fun && not (exprIsHNF rhs)
+{-
+Note [Zapping DmdEnv after Demand Analyzer]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In the worker-wrapper pass we zap the DmdEnv.  Why?
+ (a) it is never used again
+ (b) it wastes space
+ (c) it becomes incorrect as things are cloned, because
+     we don't push the substitution into it
+
+Why here?
+ * Because we don’t want to do it in the Demand Analyzer, as we never know
+   there when we are doing the last pass.
+ * We want them to be still there at the end of DmdAnal, so that
+   -ddump-str-anal contains them.
+ * We don’t want a second pass just for that.
+ * WorkWrap looks at all bindings anyway.
+
+We also need to do it in TidyCore.tidyLetBndr to clean up after the
+final, worker/wrapper-less run of the demand analyser (see
+Note [Final Demand Analyser run] in DmdAnal).
+
+Note [Zapping Used Once info in WorkWrap]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In the worker-wrapper pass we zap the used once info in demands and in
+strictness signatures.
+
+Why?
+ * The simplifier may happen to transform code in a way that invalidates the
+   data (see #11731 for an example).
+ * It is not used in later passes, up to code generation.
+
+So as the data is useless and possibly wrong, we want to remove it. The most
+convenient place to do that is the worker wrapper phase, as it runs after every
+run of the demand analyser besides the very last one (which is the one where we
+want to _keep_ the info for the code generator).
+
+We do not do it in the demand analyser for the same reasons outlined in
+Note [Zapping DmdEnv after Demand Analyzer] above.
+-}
 
 
 ---------------------
@@ -331,20 +463,29 @@ splitFun :: DynFlags -> FamInstEnvs -> Id -> IdInfo -> [Demand] -> DmdResult -> 
 splitFun dflags fam_envs fn_id fn_info wrap_dmds res_info rhs
   = WARN( not (wrap_dmds `lengthIs` arity), ppr fn_id <+> (ppr arity $$ ppr wrap_dmds $$ ppr res_info) ) do
     -- The arity should match the signature
-    stuff <- mkWwBodies dflags fam_envs rhs_fvs fun_ty wrap_dmds res_info one_shots
+    stuff <- mkWwBodies dflags fam_envs rhs_fvs mb_join_arity fun_ty
+                        wrap_dmds use_res_info
     case stuff of
-      Just (work_demands, wrap_fn, work_fn) -> do
+      Just (work_demands, join_arity, wrap_fn, work_fn) -> do
         work_uniq <- getUniqueM
         let work_rhs = work_fn rhs
-            work_prag = InlinePragma { inl_src = "{-# INLINE"
-                                     , inl_inline = inl_inline inl_prag
+            work_inline = inl_inline inl_prag
+            work_act = case work_inline of
+              -- See Note [Activation for workers]
+              NoInline -> inl_act inl_prag
+              _        -> wrap_act
+            work_prag = InlinePragma { inl_src = SourceText "{-# INLINE"
+                                     , inl_inline = work_inline
                                      , inl_sat    = Nothing
-                                     , inl_act    = wrap_act
+                                     , inl_act    = work_act
                                      , inl_rule   = FunLike }
               -- idl_inline: copy from fn_id; see Note [Worker-wrapper for INLINABLE functions]
-              -- idl_act: see Note [Activation for INLINABLE workers]
+              -- idl_act: see Note [Activation for workers]
               -- inl_rule: it does not make sense for workers to be constructorlike.
-
+            work_join_arity | isJoinId fn_id = Just join_arity
+                            | otherwise      = Nothing
+              -- worker is join point iff wrapper is join point
+              -- (see Note [Don't CPR join points])
             work_id  = mkWorkerId work_uniq fn_id (exprType work_rhs)
                         `setIdOccInfo` occInfo fn_info
                                 -- Copy over occurrence info from parent
@@ -361,13 +502,25 @@ splitFun dflags fam_envs fn_id fn_info wrap_dmds res_info rhs
                                 -- Even though we may not be at top level,
                                 -- it's ok to give it an empty DmdEnv
 
-                        `setIdArity` exprArity work_rhs
-                                -- Set the arity so that the Core Lint check that the
-                                -- arity is consistent with the demand type goes through
+                        `setIdDemandInfo` worker_demand
 
-            wrap_act  = ActiveAfter "0" 0
+                        `setIdArity` work_arity
+                                -- Set the arity so that the Core Lint check that the
+                                -- arity is consistent with the demand type goes
+                                -- through
+                        `asJoinId_maybe` work_join_arity
+
+            work_arity = length work_demands
+
+            -- See Note [Demand on the Worker]
+            single_call = saturatedByOneShots arity (demandInfo fn_info)
+            worker_demand | single_call = mkWorkerDemand work_arity
+                          | otherwise   = topDmd
+
+
+            wrap_act  = ActiveAfter NoSourceText 0
             wrap_rhs  = wrap_fn work_id
-            wrap_prag = InlinePragma { inl_src = "{-# INLINE"
+            wrap_prag = InlinePragma { inl_src = SourceText "{-# INLINE"
                                      , inl_inline = Inline
                                      , inl_sat    = Nothing
                                      , inl_act    = wrap_act
@@ -377,15 +530,18 @@ splitFun dflags fam_envs fn_id fn_info wrap_dmds res_info rhs
 
             wrap_id   = fn_id `setIdUnfolding`  mkWwInlineRule wrap_rhs arity
                               `setInlinePragma` wrap_prag
-                              `setIdOccInfo`    NoOccInfo
+                              `setIdOccInfo`    noOccInfo
                                 -- Zap any loop-breaker-ness, to avoid bleating from Lint
                                 -- about a loop breaker with an INLINE rule
+
+
 
         return $ [(work_id, work_rhs), (wrap_id, wrap_rhs)]
             -- Worker first, because wrapper mentions it
 
       Nothing -> return [(fn_id, rhs)]
   where
+    mb_join_arity   = isJoinId_maybe fn_id
     rhs_fvs         = exprFreeVars rhs
     fun_ty          = idType fn_id
     inl_prag        = inlinePragInfo fn_info
@@ -394,24 +550,47 @@ splitFun dflags fam_envs fn_id fn_info wrap_dmds res_info rhs
                     -- The arity is set by the simplifier using exprEtaExpandArity
                     -- So it may be more than the number of top-level-visible lambdas
 
-    work_res_info = case returnsCPR_maybe res_info of
+    use_res_info  | isJoinId fn_id = topRes -- Note [Don't CPR join points]
+                  | otherwise      = res_info
+    work_res_info | isJoinId fn_id = res_info -- Worker remains CPR-able
+                  | otherwise
+                  = case returnsCPR_maybe res_info of
                        Just _  -> topRes    -- Cpr stuff done by wrapper; kill it here
                        Nothing -> res_info  -- Preserve exception/divergence
 
-    one_shots = get_one_shots rhs
-
--- If the original function has one-shot arguments, it is important to
--- make the wrapper and worker have corresponding one-shot arguments too.
--- Otherwise we spuriously float stuff out of case-expression join points,
--- which is very annoying.
-get_one_shots :: Expr Var -> [OneShotInfo]
-get_one_shots (Lam b e)
-  | isId b    = idOneShotInfo b : get_one_shots e
-  | otherwise = get_one_shots e
-get_one_shots (Tick _ e) = get_one_shots e
-get_one_shots _          = []
 
 {-
+Note [Demand on the worker]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+If the original function is called once, according to its demand info, then
+so is the worker. This is important so that the occurrence analyser can
+attach OneShot annotations to the worker’s lambda binders.
+
+
+Example:
+
+  -- Original function
+  f [Demand=<L,1*C1(U)>] :: (a,a) -> a
+  f = \p -> ...
+
+  -- Wrapper
+  f [Demand=<L,1*C1(U)>] :: a -> a -> a
+  f = \p -> case p of (a,b) -> $wf a b
+
+  -- Worker
+  $wf [Demand=<L,1*C1(C1(U))>] :: Int -> Int
+  $wf = \a b -> ...
+
+We need to check whether the original function is called once, with
+sufficiently many arguments. This is done using saturatedByOneShots, which
+takes the arity of the original function (resp. the wrapper) and the demand on
+the original function.
+
+The demand on the worker is then calculated using mkWorkerDemand, and always of
+the form [Demand=<L,1*(C1(...(C1(U))))>]
+
+
 Note [Do not split void functions]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Consider this rather common form of binding:
@@ -474,7 +653,8 @@ then the splitting will go deeper too.
 
 splitThunk :: DynFlags -> FamInstEnvs -> RecFlag -> Var -> Expr Var -> UniqSM [(Var, Expr Var)]
 splitThunk dflags fam_envs is_rec fn_id rhs
-  = do { (useful,_, wrap_fn, work_fn) <- mkWWstr dflags fam_envs [fn_id]
+  = ASSERT(not (isJoinId fn_id))
+    do { (useful,_, wrap_fn, work_fn) <- mkWWstr dflags fam_envs [fn_id]
        ; let res = [ (fn_id, Let (NonRec fn_id rhs) (wrap_fn (work_fn (Var fn_id)))) ]
        ; if useful then ASSERT2( isNonRec is_rec, ppr fn_id ) -- The thunk must be non-recursive
                    return res

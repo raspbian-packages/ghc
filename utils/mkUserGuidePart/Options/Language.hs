@@ -191,6 +191,13 @@ languageOptions =
          , flagReverse = "-XNoDeriveTraversable"
          , flagSince = "7.10.1"
          }
+  , flag { flagName = "-XDerivingStrategies"
+         , flagDescription =
+           "Enables :ref:`deriving strategies <deriving-strategies>`."
+         , flagType = DynamicFlag
+         , flagReverse = "-XNoDerivingStrategies"
+         , flagSince = "8.2.1"
+         }
   , flag { flagName = "-XDisambiguateRecordFields"
          , flagDescription =
            "Enable :ref:`record field disambiguation <disambiguate-fields>`. "++
@@ -447,10 +454,11 @@ languageOptions =
          , flagReverse = "-XNoNegativeLiterals"
          , flagSince = "7.8.1"
          }
-  , flag { flagName = "-XNoNPlusKPatterns"
-         , flagDescription = "Disable support for ``n+k`` patterns."
+  , flag { flagName = "-XNPlusKPatterns"
+         , flagDescription = "Enable support for ``n+k`` patterns. "++
+           "Implied by :ghc-flag:`-XHaskell98`."
          , flagType = DynamicFlag
-         , flagReverse = "-XNPlusKPatterns"
+         , flagReverse = "-XNoNPlusKPatterns"
          , flagSince = "6.12.1"
          }
   , flag { flagName = "-XNullaryTypeClasses"
@@ -475,6 +483,13 @@ languageOptions =
          , flagType = DynamicFlag
          , flagReverse = "-XNoOverlappingInstances"
          , flagSince = "6.8.1"
+         }
+  , flag { flagName = "-XOverloadedLabels"
+         , flagDescription =
+           "Enable :ref:`overloaded labels <overloaded-labels>`."
+         , flagType = DynamicFlag
+         , flagReverse = "-XNoOverloadedLabels"
+         , flagSince = "8.0.1"
          }
   , flag { flagName = "-XOverloadedLists"
          , flagDescription =
@@ -520,10 +535,11 @@ languageOptions =
          , flagReverse = "-XNoPartialTypeSignatures"
          , flagSince = "7.10.1"
          }
-  , flag { flagName = "-XPatternGuards"
-         , flagDescription = "Enable :ref:`pattern guards <pattern-guards>`."
+  , flag { flagName = "-XNoPatternGuards"
+         , flagDescription = "Disable :ref:`pattern guards <pattern-guards>`. "++
+           "Implied by :ghc-flag:`-XHaskell98`."
          , flagType = DynamicFlag
-         , flagReverse = "-XNoPatternGuards"
+         , flagReverse = "-XPatternGuards"
          , flagSince = "6.8.1"
          }
   , flag { flagName = "-XPatternSynonyms"
@@ -629,6 +645,13 @@ languageOptions =
          , flagReverse = "-XNoStandaloneDeriving"
          , flagSince = "6.8.1"
          }
+  , flag { flagName = "-XStaticPointers"
+         , flagDescription =
+           "Enable :ref:`static pointers <static-pointers>`."
+         , flagType = DynamicFlag
+         , flagReverse = "-XNoStaticPointers"
+         , flagSince = "7.10.1"
+         }
   , flag { flagName = "-XStrictData"
          , flagDescription =
            "Enable :ref:`default strict datatype fields <strict-data>`."
@@ -686,6 +709,17 @@ languageOptions =
          , flagReverse = "-XNoTypeFamilies"
          , flagSince = "6.8.1"
          }
+  , flag { flagName = "-XTypeInType"
+         , flagDescription =
+           "Allow :ref:`kinds to be used as types <type-in-type>`, " ++
+           "including explicit kind variable quantification, higher-rank "++
+           "kinds, kind synonyms, and kind families. "++
+           "Implies :ghc-flag:`-XDataKinds`, :ghc-flag:`-XKindSignatures`, " ++
+           "and :ghc-flag:`-XPolyKinds`."
+         , flagType = DynamicFlag
+         , flagReverse = "-XNoTypeInType"
+         , flagSince = "8.0.1"
+         }
   , flag { flagName = "-XTypeOperators"
          , flagDescription =
            "Enable :ref:`type operators <type-operators>`. "++
@@ -707,6 +741,12 @@ languageOptions =
          , flagType = DynamicFlag
          , flagReverse = "-XNoUnboxedTuples"
          , flagSince = "6.8.1"
+         }
+  , flag { flagName ="-XUnboxedSums"
+         , flagDescription = "Enable :ref: `unboxed sums <unboxed-sums>`."
+         , flagType = DynamicFlag
+         , flagReverse = "-XNoUnboxedSums"
+         , flagSince = "8.2.1"
          }
   , flag { flagName = "-XUndecidableInstances"
          , flagDescription =

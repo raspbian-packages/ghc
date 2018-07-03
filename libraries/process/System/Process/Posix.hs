@@ -40,7 +40,7 @@ import System.Posix.Signals as Sig
 import qualified System.Posix.IO as Posix
 import System.Posix.Process (getProcessGroupIDOf)
 
-import System.Process.Common
+import System.Process.Common hiding (mb_delegate_ctlc)
 
 #include "HsProcessConfig.h"
 #include "processFlags.h"
@@ -48,7 +48,8 @@ import System.Process.Common
 mkProcessHandle :: PHANDLE -> Bool -> IO ProcessHandle
 mkProcessHandle p mb_delegate_ctlc = do
   m <- newMVar (OpenHandle p)
-  return (ProcessHandle m mb_delegate_ctlc)
+  l <- newMVar ()
+  return (ProcessHandle m mb_delegate_ctlc l)
 
 closePHANDLE :: PHANDLE -> IO ()
 closePHANDLE _ = return ()
@@ -100,7 +101,7 @@ withCEnvironment envir act =
 createProcess_Internal
     :: String
     -> CreateProcess
-    -> IO (Maybe Handle, Maybe Handle, Maybe Handle, ProcessHandle)
+    -> IO ProcRetHandles
 createProcess_Internal fun
                    CreateProcess{ cmdspec = cmdsp,
                                   cwd = mb_cwd,
@@ -166,7 +167,11 @@ createProcess_Internal fun
      hndStdError  <- mbPipe mb_stderr pfdStdError  ReadMode
 
      ph <- mkProcessHandle proc_handle mb_delegate_ctlc
-     return (hndStdInput, hndStdOutput, hndStdError, ph)
+     return ProcRetHandles { hStdInput    = hndStdInput
+                           , hStdOutput   = hndStdOutput
+                           , hStdError    = hndStdError
+                           , procHandle   = ph
+                           }
 
 {-# NOINLINE runInteractiveProcess_lock #-}
 runInteractiveProcess_lock :: MVar ()
@@ -291,7 +296,8 @@ interruptProcessGroupOfInternal
 interruptProcessGroupOfInternal ph = do
     withProcessHandle ph $ \p_ -> do
         case p_ of
-            ClosedHandle _ -> return ()
-            OpenHandle h -> do
+            OpenExtHandle{} -> return ()
+            ClosedHandle  _ -> return ()
+            OpenHandle    h -> do
                 pgid <- getProcessGroupIDOf h
                 signalProcessGroup sigINT pgid

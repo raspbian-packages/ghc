@@ -1,3 +1,4 @@
+{-# OPTIONS_GHC -fno-warn-unused-binds -fno-warn-missing-signatures #-}
 {-# LANGUAGE CPP,MagicHash #-}
 {-# LINE 13 "compiler/cmm/CmmLex.x" #-}
 
@@ -15,6 +16,7 @@ module CmmLex (
 import CmmExpr
 
 import Lexer
+import CmmMonad
 import SrcLoc
 import UniqFM
 import StringBuffer
@@ -33,17 +35,17 @@ import Data.Char
 #endif
 #if __GLASGOW_HASKELL__ >= 503
 import Data.Array
-import Data.Char (ord)
 import Data.Array.Base (unsafeAt)
 #else
 import Array
-import Char (ord)
 #endif
 #if __GLASGOW_HASKELL__ >= 503
 import GHC.Exts
 #else
 import GlaExts
 #endif
+alex_tab_size :: Int
+alex_tab_size = 8
 alex_base :: AlexAddr
 alex_base = AlexA# "\x01\x00\x00\x00\xc9\x00\x00\x00\x4e\x00\x00\x00\xb9\x00\x00\x00\x9f\xff\xff\xff\xd6\x00\x00\x00\xf2\x00\x00\x00\x0f\x01\x00\x00\x1d\x01\x00\x00\xa4\xff\xff\xff\x2b\x01\x00\x00\xb8\xff\xff\xff\xd8\xff\xff\xff\xdb\xff\xff\xff\xe5\xff\xff\xff\xd6\xff\xff\xff\x43\x01\x00\x00\xdc\xff\xff\xff\xba\x01\x00\x00\xdd\x01\x00\x00\x41\x00\x00\x00\x42\x00\x00\x00\xd2\x00\x00\x00\x72\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xf4\xff\xff\xff\x45\x00\x00\x00\x5b\x00\x00\x00\x65\x01\x00\x00\x00\x00\x00\x00\x5c\x00\x00\x00\x68\x00\x00\x00\x5f\x00\x00\x00\x65\x00\x00\x00\x61\x00\x00\x00\x6c\x00\x00\x00\x46\x00\x00\x00\x5d\x00\x00\x00\x62\x00\x00\x00\x48\x00\x00\x00\x00\x00\x00\x00\x18\x00\x00\x00\x1b\x00\x00\x00\x00\x00\x00\x00\xe6\xff\xff\xff\x44\x00\x00\x00\x37\x00\x00\x00\x3a\x00\x00\x00\x2e\x00\x00\x00\x15\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xdd\x02\x00\x00\xdc\x03\x00\x00\xdb\x04\x00\x00\xda\x05\x00\x00\xd9\x06\x00\x00\xd9\x07\x00\x00\xac\x08\x00\x00\x7f\x09\x00\x00\x52\x0a\x00\x00\x25\x0b\x00\x00\xf8\x0b\x00\x00\xcb\x0c\x00\x00\x9e\x0d\x00\x00\x71\x0e\x00\x00\x44\x0f\x00\x00\x17\x10\x00\x00\xdf\x10\x00\x00\xde\x11\x00\x00\xdd\x12\x00\x00\xdc\x13\x00\x00\xdb\x14\x00\x00\xdb\x15\x00\x00\xae\x16\x00\x00\x81\x17\x00\x00\x54\x18\x00\x00\x27\x19\x00\x00\xfa\x19\x00\x00\xcd\x1a\x00\x00\xa0\x1b\x00\x00\x73\x1c\x00\x00\x46\x1d\x00\x00\x19\x1e\x00\x00\xec\x1e\x00\x00\xbf\x1f\x00\x00\x92\x20\x00\x00\x65\x21\x00\x00\x38\x22\x00\x00\x0b\x23\x00\x00\xde\x23\x00\x00\xb1\x24\x00\x00\x84\x25\x00\x00\x57\x26\x00\x00\x2a\x27\x00\x00\xfd\x27\x00\x00\xd0\x28\x00\x00\xa3\x29\x00\x00\x76\x2a\x00\x00\x49\x2b\x00\x00\x1c\x2c\x00\x00\xef\x2c\x00\x00\xc2\x2d\x00\x00\x95\x2e\x00\x00\x68\x2f\x00\x00\x3b\x30\x00\x00\x0e\x31\x00\x00\xe1\x31\x00\x00\xb4\x32\x00\x00\x87\x33\x00\x00\x5a\x34\x00\x00\x2d\x35\x00\x00\x00\x36\x00\x00\xd3\x36\x00\x00\xa6\x37\x00\x00\x79\x38\x00\x00\x4c\x39\x00\x00\x1f\x3a\x00\x00\xf2\x3a\x00\x00\xc5\x3b\x00\x00\x98\x3c\x00\x00\x6b\x3d\x00\x00\x3e\x3e\x00\x00\x11\x3f\x00\x00\xe4\x3f\x00\x00\xb7\x40\x00\x00\x8a\x41\x00\x00\x37\x03\x00\x00\xb3\x03\x00\x00\x52\x42\x00\x00\x5c\x42\x00\x00\x36\x04\x00\x00\x46\x02\x00\x00\x00\x00\x00\x00"#
 
@@ -56,8 +58,11 @@ alex_check = AlexA# "\xff\xff\x00\x00\x01\x00\x02\x00\x65\x00\x61\x00\x05\x00\x0
 alex_deflt :: AlexAddr
 alex_deflt = AlexA# "\x6f\x00\xff\xff\xff\xff\x25\x00\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x13\x00\x13\x00\x14\x00\x15\x00\xff\xff\x25\x00\xff\xff\xff\xff\xff\xff\x25\x00\x25\x00\xff\xff\xff\xff\x25\x00\x25\x00\x25\x00\x25\x00\x25\x00\x25\x00\x25\x00\x25\x00\x25\x00\x28\x00\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x6f\x00\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\x6f\x00\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"#
 
-alex_accept = listArray (0::Int,141) [AlexAccNone,AlexAccNone,AlexAccNone,AlexAcc (alex_action_5),AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccSkip,AlexAccSkip,AlexAccSkipPred  (alexPrevCharMatches(\c -> c >= '\n' && c <= '\n' || False))(AlexAccNone),AlexAccPred  (alex_action_2) (alexPrevCharMatches(\c -> c >= '\n' && c <= '\n' || False))(AlexAccNone),AlexAccPred  (alex_action_2) (alexPrevCharMatches(\c -> c >= '\n' && c <= '\n' || False))(AlexAccNone),AlexAccPred  (alex_action_2) (alexPrevCharMatches(\c -> c >= '\n' && c <= '\n' || False))(AlexAcc (alex_action_5)),AlexAccPred  (alex_action_2) (alexPrevCharMatches(\c -> c >= '\n' && c <= '\n' || False))(AlexAcc (alex_action_5)),AlexAcc (alex_action_3),AlexAcc (alex_action_4),AlexAcc (alex_action_5),AlexAcc (alex_action_5),AlexAcc (alex_action_5),AlexAcc (alex_action_5),AlexAcc (alex_action_5),AlexAcc (alex_action_5),AlexAcc (alex_action_5),AlexAcc (alex_action_5),AlexAcc (alex_action_5),AlexAcc (alex_action_5),AlexAccSkip,AlexAcc (alex_action_7),AlexAcc (alex_action_7),AlexAcc (alex_action_7),AlexAcc (alex_action_7),AlexAcc (alex_action_7),AlexAcc (alex_action_7),AlexAcc (alex_action_7),AlexAcc (alex_action_7),AlexAcc (alex_action_8),AlexAcc (alex_action_9),AlexAcc (alex_action_10),AlexAcc (alex_action_11),AlexAcc (alex_action_12),AlexAcc (alex_action_13),AlexAcc (alex_action_14),AlexAcc (alex_action_15),AlexAcc (alex_action_16),AlexAcc (alex_action_17),AlexAcc (alex_action_18),AlexAcc (alex_action_19),AlexAcc (alex_action_20),AlexAcc (alex_action_21),AlexAcc (alex_action_22),AlexAcc (alex_action_23),AlexAcc (alex_action_24),AlexAcc (alex_action_25),AlexAcc (alex_action_26),AlexAcc (alex_action_27),AlexAcc (alex_action_28),AlexAcc (alex_action_29),AlexAcc (alex_action_30),AlexAcc (alex_action_31),AlexAcc (alex_action_32),AlexAcc (alex_action_33),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_34),AlexAcc (alex_action_35),AlexAcc (alex_action_36),AlexAcc (alex_action_36),AlexAcc (alex_action_37),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_39)]
-{-# LINE 126 "compiler/cmm/CmmLex.x" #-}
+alex_accept = listArray (0::Int,141) [AlexAccNone,AlexAccNone,AlexAccNone,AlexAcc 118,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccSkip,AlexAccSkip,AlexAccSkipPred (alexPrevCharMatches(\c -> c >= '\n' && c <= '\n' || False))(AlexAccNone),AlexAccPred 117 (alexPrevCharMatches(\c -> c >= '\n' && c <= '\n' || False))(AlexAccNone),AlexAccPred 116 (alexPrevCharMatches(\c -> c >= '\n' && c <= '\n' || False))(AlexAccNone),AlexAccPred 115 (alexPrevCharMatches(\c -> c >= '\n' && c <= '\n' || False))(AlexAcc 114),AlexAccPred 113 (alexPrevCharMatches(\c -> c >= '\n' && c <= '\n' || False))(AlexAcc 112),AlexAcc 111,AlexAcc 110,AlexAcc 109,AlexAcc 108,AlexAcc 107,AlexAcc 106,AlexAcc 105,AlexAcc 104,AlexAcc 103,AlexAcc 102,AlexAcc 101,AlexAcc 100,AlexAccSkip,AlexAcc 99,AlexAcc 98,AlexAcc 97,AlexAcc 96,AlexAcc 95,AlexAcc 94,AlexAcc 93,AlexAcc 92,AlexAcc 91,AlexAcc 90,AlexAcc 89,AlexAcc 88,AlexAcc 87,AlexAcc 86,AlexAcc 85,AlexAcc 84,AlexAcc 83,AlexAcc 82,AlexAcc 81,AlexAcc 80,AlexAcc 79,AlexAcc 78,AlexAcc 77,AlexAcc 76,AlexAcc 75,AlexAcc 74,AlexAcc 73,AlexAcc 72,AlexAcc 71,AlexAcc 70,AlexAcc 69,AlexAcc 68,AlexAcc 67,AlexAcc 66,AlexAcc 65,AlexAcc 64,AlexAcc 63,AlexAcc 62,AlexAcc 61,AlexAcc 60,AlexAcc 59,AlexAcc 58,AlexAcc 57,AlexAcc 56,AlexAcc 55,AlexAcc 54,AlexAcc 53,AlexAcc 52,AlexAcc 51,AlexAcc 50,AlexAcc 49,AlexAcc 48,AlexAcc 47,AlexAcc 46,AlexAcc 45,AlexAcc 44,AlexAcc 43,AlexAcc 42,AlexAcc 41,AlexAcc 40,AlexAcc 39,AlexAcc 38,AlexAcc 37,AlexAcc 36,AlexAcc 35,AlexAcc 34,AlexAcc 33,AlexAcc 32,AlexAcc 31,AlexAcc 30,AlexAcc 29,AlexAcc 28,AlexAcc 27,AlexAcc 26,AlexAcc 25,AlexAcc 24,AlexAcc 23,AlexAcc 22,AlexAcc 21,AlexAcc 20,AlexAcc 19,AlexAcc 18,AlexAcc 17,AlexAcc 16,AlexAcc 15,AlexAcc 14,AlexAcc 13,AlexAcc 12,AlexAcc 11,AlexAcc 10,AlexAcc 9,AlexAcc 8,AlexAcc 7,AlexAcc 6,AlexAcc 5,AlexAcc 4,AlexAcc 3,AlexAcc 2,AlexAcc 1,AlexAcc 0]
+
+alex_actions = array (0::Int,119) [(118,alex_action_5),(117,alex_action_2),(116,alex_action_2),(115,alex_action_2),(114,alex_action_5),(113,alex_action_2),(112,alex_action_5),(111,alex_action_3),(110,alex_action_4),(109,alex_action_5),(108,alex_action_5),(107,alex_action_5),(106,alex_action_5),(105,alex_action_5),(104,alex_action_5),(103,alex_action_5),(102,alex_action_5),(101,alex_action_5),(100,alex_action_5),(99,alex_action_7),(98,alex_action_7),(97,alex_action_7),(96,alex_action_7),(95,alex_action_7),(94,alex_action_7),(93,alex_action_7),(92,alex_action_7),(91,alex_action_8),(90,alex_action_9),(89,alex_action_10),(88,alex_action_11),(87,alex_action_12),(86,alex_action_13),(85,alex_action_14),(84,alex_action_15),(83,alex_action_16),(82,alex_action_17),(81,alex_action_18),(80,alex_action_19),(79,alex_action_20),(78,alex_action_21),(77,alex_action_22),(76,alex_action_23),(75,alex_action_24),(74,alex_action_25),(73,alex_action_26),(72,alex_action_27),(71,alex_action_28),(70,alex_action_29),(69,alex_action_30),(68,alex_action_31),(67,alex_action_32),(66,alex_action_33),(65,alex_action_34),(64,alex_action_34),(63,alex_action_34),(62,alex_action_34),(61,alex_action_34),(60,alex_action_34),(59,alex_action_34),(58,alex_action_34),(57,alex_action_34),(56,alex_action_34),(55,alex_action_34),(54,alex_action_34),(53,alex_action_34),(52,alex_action_34),(51,alex_action_34),(50,alex_action_34),(49,alex_action_34),(48,alex_action_34),(47,alex_action_34),(46,alex_action_34),(45,alex_action_34),(44,alex_action_34),(43,alex_action_34),(42,alex_action_34),(41,alex_action_34),(40,alex_action_34),(39,alex_action_34),(38,alex_action_34),(37,alex_action_34),(36,alex_action_34),(35,alex_action_34),(34,alex_action_34),(33,alex_action_34),(32,alex_action_34),(31,alex_action_34),(30,alex_action_34),(29,alex_action_34),(28,alex_action_34),(27,alex_action_34),(26,alex_action_34),(25,alex_action_34),(24,alex_action_34),(23,alex_action_34),(22,alex_action_34),(21,alex_action_34),(20,alex_action_34),(19,alex_action_34),(18,alex_action_34),(17,alex_action_34),(16,alex_action_34),(15,alex_action_34),(14,alex_action_34),(13,alex_action_34),(12,alex_action_34),(11,alex_action_34),(10,alex_action_34),(9,alex_action_34),(8,alex_action_34),(7,alex_action_34),(6,alex_action_35),(5,alex_action_36),(4,alex_action_36),(3,alex_action_37),(2,alex_action_38),(1,alex_action_38),(0,alex_action_39)]
+
+{-# LINE 127 "compiler/cmm/CmmLex.x" #-}
 
 data CmmToken
   = CmmT_SpecChar  Char
@@ -117,13 +122,13 @@ data CmmToken
 -- -----------------------------------------------------------------------------
 -- Lexer actions
 
-type Action = RealSrcSpan -> StringBuffer -> Int -> P (RealLocated CmmToken)
+type Action = RealSrcSpan -> StringBuffer -> Int -> PD (RealLocated CmmToken)
 
 begin :: Int -> Action
-begin code _span _str _len = do pushLexState code; lexToken
+begin code _span _str _len = do liftP (pushLexState code); lexToken
 
 pop :: Action
-pop _span _buf _len = popLexState >> lexToken
+pop _span _buf _len = liftP popLexState >> lexToken
 
 special_char :: Action
 special_char span buf _len = return (L span (CmmT_SpecChar (currentChar buf)))
@@ -221,45 +226,47 @@ tok_string str = CmmT_String (read str)
 setLine :: Int -> Action
 setLine code span buf len = do
   let line = parseUnsignedInteger buf len 10 octDecDigit
-  setSrcLoc (mkRealSrcLoc (srcSpanFile span) (fromIntegral line - 1) 1)
-        -- subtract one: the line number refers to the *following* line
-  -- trace ("setLine "  ++ show line) $ do
-  popLexState >> pushLexState code
+  liftP $ do
+    setSrcLoc (mkRealSrcLoc (srcSpanFile span) (fromIntegral line - 1) 1)
+          -- subtract one: the line number refers to the *following* line
+    -- trace ("setLine "  ++ show line) $ do
+    popLexState >> pushLexState code
   lexToken
 
 setFile :: Int -> Action
 setFile code span buf len = do
   let file = lexemeToFastString (stepOn buf) (len-2)
-  setSrcLoc (mkRealSrcLoc file (srcSpanEndLine span) (srcSpanEndCol span))
-  popLexState >> pushLexState code
+  liftP $ do
+    setSrcLoc (mkRealSrcLoc file (srcSpanEndLine span) (srcSpanEndCol span))
+    popLexState >> pushLexState code
   lexToken
 
 -- -----------------------------------------------------------------------------
 -- This is the top-level function: called from the parser each time a
 -- new token is to be read from the input.
 
-cmmlex :: (Located CmmToken -> P a) -> P a
+cmmlex :: (Located CmmToken -> PD a) -> PD a
 cmmlex cont = do
   (L span tok) <- lexToken
   --trace ("token: " ++ show tok) $ do
   cont (L (RealSrcSpan span) tok)
 
-lexToken :: P (RealLocated CmmToken)
+lexToken :: PD (RealLocated CmmToken)
 lexToken = do
   inp@(loc1,buf) <- getInput
-  sc <- getLexState
+  sc <- liftP getLexState
   case alexScan inp sc of
     AlexEOF -> do let span = mkRealSrcSpan loc1 loc1
-                  setLastToken span 0
+                  liftP (setLastToken span 0)
                   return (L span CmmT_EOF)
-    AlexError (loc2,_) -> do failLocMsgP loc1 loc2 "lexical error"
+    AlexError (loc2,_) -> liftP $ failLocMsgP loc1 loc2 "lexical error"
     AlexSkip inp2 _ -> do
         setInput inp2
         lexToken
     AlexToken inp2@(end,_buf2) len t -> do
         setInput inp2
         let span = mkRealSrcSpan loc1 end
-        span `seq` setLastToken span len
+        span `seq` liftP (setLastToken span len)
         t span buf len
 
 -- -----------------------------------------------------------------------------
@@ -287,11 +294,11 @@ alexGetByte (loc,s)
         loc' = advanceSrcLoc loc c
         s'   = stepOn s
 
-getInput :: P AlexInput
-getInput = P $ \s@PState{ loc=l, buffer=b } -> POk s (l,b)
+getInput :: PD AlexInput
+getInput = PD $ \_ s@PState{ loc=l, buffer=b } -> POk s (l,b)
 
-setInput :: AlexInput -> P ()
-setInput (l,b) = P $ \s -> POk s{ loc=l, buffer=b } ()
+setInput :: AlexInput -> PD ()
+setInput (l,b) = PD $ \_ s -> POk s{ loc=l, buffer=b } ()
 
 
 line_prag,line_prag1,line_prag2 :: Int
@@ -339,7 +346,7 @@ alex_action_39 =  strtoken tok_string
 {-# LINE 1 "templates/GenericTemplate.hs" #-}
 {-# LINE 1 "<built-in>" #-}
 {-# LINE 1 "<command-line>" #-}
-{-# LINE 9 "<command-line>" #-}
+{-# LINE 8 "<command-line>" #-}
 # 1 "/usr/include/stdc-predef.h" 1 3 4
 
 # 17 "/usr/include/stdc-predef.h" 3 4
@@ -385,8 +392,28 @@ alex_action_39 =  strtoken tok_string
 
 
 
-{-# LINE 9 "<command-line>" #-}
-{-# LINE 1 "/opt/exp/ghc/root-ghc-7.10/lib/ghc-7.10.1.20150506/include/ghcversion.h" #-}
+
+
+
+{-# LINE 8 "<command-line>" #-}
+{-# LINE 1 "/opt/exp/ghc/roots/8.2.1/lib/ghc-8.2.1/include/ghcversion.h" #-}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+{-# LINE 8 "<command-line>" #-}
+{-# LINE 1 "/tmp/ghc23243_1/ghc_3.h" #-}
 
 
 
@@ -405,7 +432,1273 @@ alex_action_39 =  strtoken tok_string
 
 
 
-{-# LINE 9 "<command-line>" #-}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+{-# LINE 8 "<command-line>" #-}
 {-# LINE 1 "templates/GenericTemplate.hs" #-}
 -- -----------------------------------------------------------------------------
 -- ALEX TEMPLATE
@@ -457,13 +1750,13 @@ alexIndexInt16OffAddr (AlexA# arr) off =
 
 
 {-# INLINE alexIndexInt32OffAddr #-}
-alexIndexInt32OffAddr (AlexA# arr) off = 
+alexIndexInt32OffAddr (AlexA# arr) off =
 #ifdef WORDS_BIGENDIAN
   narrow32Int# i
   where
    i    = word2Int# ((b3 `uncheckedShiftL#` 24#) `or#`
-		     (b2 `uncheckedShiftL#` 16#) `or#`
-		     (b1 `uncheckedShiftL#` 8#) `or#` b0)
+                     (b2 `uncheckedShiftL#` 16#) `or#`
+                     (b1 `uncheckedShiftL#` 8#) `or#` b0)
    b3   = int2Word# (ord# (indexCharOffAddr# arr (off' +# 3#)))
    b2   = int2Word# (ord# (indexCharOffAddr# arr (off' +# 2#)))
    b1   = int2Word# (ord# (indexCharOffAddr# arr (off' +# 1#)))
@@ -503,30 +1796,30 @@ alexScan input (I# (sc))
 
 alexScanUser user input (I# (sc))
   = case alex_scan_tkn user input 0# input sc AlexNone of
-	(AlexNone, input') ->
-		case alexGetByte input of
-			Nothing -> 
+  (AlexNone, input') ->
+    case alexGetByte input of
+      Nothing ->
 
 
 
-				   AlexEOF
-			Just _ ->
+                                   AlexEOF
+      Just _ ->
 
 
 
-				   AlexError input'
+                                   AlexError input'
 
-	(AlexLastSkip input'' len, _) ->
-
-
-
-		AlexSkip input'' len
-
-	(AlexLastAcc k input''' len, _) ->
+  (AlexLastSkip input'' len, _) ->
 
 
 
-		AlexToken input''' len k
+    AlexSkip input'' len
+
+  (AlexLastAcc k input''' len, _) ->
+
+
+
+    AlexToken input''' len (alex_actions ! k)
 
 
 -- Push the input through the DFA, remembering the most recent accepting
@@ -534,13 +1827,13 @@ alexScanUser user input (I# (sc))
 
 alex_scan_tkn user orig_input len input s last_acc =
   input `seq` -- strict in the input
-  let 
-	new_acc = (check_accs (alex_accept `quickIndex` (I# (s))))
+  let
+  new_acc = (check_accs (alex_accept `quickIndex` (I# (s))))
   in
   new_acc `seq`
   case alexGetByte input of
      Nothing -> (new_acc, input)
-     Just (c, new_input) -> 
+     Just (c, new_input) ->
 
 
 
@@ -549,53 +1842,48 @@ alex_scan_tkn user orig_input len input s last_acc =
                 base   = alexIndexInt32OffAddr alex_base s
                 offset = (base +# ord_c)
                 check  = alexIndexInt16OffAddr alex_check offset
-		
+
                 new_s = if GTE(offset,0#) && EQ(check,ord_c)
-			  then alexIndexInt16OffAddr alex_table offset
-			  else alexIndexInt16OffAddr alex_deflt s
-	in
+                          then alexIndexInt16OffAddr alex_table offset
+                          else alexIndexInt16OffAddr alex_deflt s
+        in
         case new_s of
-	    -1# -> (new_acc, input)
-		-- on an error, we want to keep the input *before* the
-		-- character that failed, not after.
-    	    _ -> alex_scan_tkn user orig_input (if c < 0x80 || c >= 0xC0 then (len +# 1#) else len)
+            -1# -> (new_acc, input)
+                -- on an error, we want to keep the input *before* the
+                -- character that failed, not after.
+            _ -> alex_scan_tkn user orig_input (if c < 0x80 || c >= 0xC0 then (len +# 1#) else len)
                                                 -- note that the length is increased ONLY if this is the 1st byte in a char encoding)
-			new_input new_s new_acc
+                        new_input new_s new_acc
       }
   where
-	check_accs (AlexAccNone) = last_acc
-	check_accs (AlexAcc a  ) = AlexLastAcc a input (I# (len))
-	check_accs (AlexAccSkip) = AlexLastSkip  input (I# (len))
+        check_accs (AlexAccNone) = last_acc
+        check_accs (AlexAcc a  ) = AlexLastAcc a input (I# (len))
+        check_accs (AlexAccSkip) = AlexLastSkip  input (I# (len))
 
-	check_accs (AlexAccPred a predx rest)
-	   | predx user orig_input (I# (len)) input
-	   = AlexLastAcc a input (I# (len))
-	   | otherwise
-	   = check_accs rest
-	check_accs (AlexAccSkipPred predx rest)
-	   | predx user orig_input (I# (len)) input
-	   = AlexLastSkip input (I# (len))
-	   | otherwise
-	   = check_accs rest
+        check_accs (AlexAccPred a predx rest)
+           | predx user orig_input (I# (len)) input
+           = AlexLastAcc a input (I# (len))
+           | otherwise
+           = check_accs rest
+        check_accs (AlexAccSkipPred predx rest)
+           | predx user orig_input (I# (len)) input
+           = AlexLastSkip input (I# (len))
+           | otherwise
+           = check_accs rest
 
 
-data AlexLastAcc a
+data AlexLastAcc
   = AlexNone
-  | AlexLastAcc a !AlexInput !Int
-  | AlexLastSkip  !AlexInput !Int
+  | AlexLastAcc !Int !AlexInput !Int
+  | AlexLastSkip     !AlexInput !Int
 
-instance Functor AlexLastAcc where
-    fmap f AlexNone = AlexNone
-    fmap f (AlexLastAcc x y z) = AlexLastAcc (f x) y z
-    fmap f (AlexLastSkip x y) = AlexLastSkip x y
-
-data AlexAcc a user
+data AlexAcc user
   = AlexAccNone
-  | AlexAcc a
+  | AlexAcc Int
   | AlexAccSkip
 
-  | AlexAccPred a   (AlexAccPred user) (AlexAcc a user)
-  | AlexAccSkipPred (AlexAccPred user) (AlexAcc a user)
+  | AlexAccPred Int (AlexAccPred user) (AlexAcc user)
+  | AlexAccSkipPred (AlexAccPred user) (AlexAcc user)
 
 type AlexAccPred user = user -> AlexInput -> Int -> AlexInput -> Bool
 
@@ -605,23 +1893,19 @@ type AlexAccPred user = user -> AlexInput -> Int -> AlexInput -> Bool
 alexAndPred p1 p2 user in1 len in2
   = p1 user in1 len in2 && p2 user in1 len in2
 
---alexPrevCharIsPred :: Char -> AlexAccPred _ 
+--alexPrevCharIsPred :: Char -> AlexAccPred _
 alexPrevCharIs c _ input _ _ = c == alexInputPrevChar input
 
 alexPrevCharMatches f _ input _ _ = f (alexInputPrevChar input)
 
---alexPrevCharIsOneOfPred :: Array Char Bool -> AlexAccPred _ 
+--alexPrevCharIsOneOfPred :: Array Char Bool -> AlexAccPred _
 alexPrevCharIsOneOf arr _ input _ _ = arr ! alexInputPrevChar input
 
 --alexRightContext :: Int -> AlexAccPred _
-alexRightContext (I# (sc)) user _ _ input = 
+alexRightContext (I# (sc)) user _ _ input =
      case alex_scan_tkn user input 0# input sc AlexNone of
-	  (AlexNone, _) -> False
-	  _ -> True
-	-- TODO: there's no need to find the longest
-	-- match when checking the right context, just
-	-- the first match will do.
-
-
--- used by wrappers
-iUnbox (I# (i)) = i
+          (AlexNone, _) -> False
+          _ -> True
+        -- TODO: there's no need to find the longest
+        -- match when checking the right context, just
+        -- the first match will do.

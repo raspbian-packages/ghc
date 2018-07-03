@@ -1,3 +1,4 @@
+{-# OPTIONS_GHC -fno-warn-unused-binds -fno-warn-missing-signatures #-}
 {-# LANGUAGE CPP,MagicHash #-}
 {-# LINE 2 "utils/genprimopcode/./Lexer.x" #-}
 
@@ -24,17 +25,17 @@ import qualified ParserM as ParserM (input)
 #endif
 #if __GLASGOW_HASKELL__ >= 503
 import Data.Array
-import Data.Char (ord)
 import Data.Array.Base (unsafeAt)
 #else
 import Array
-import Char (ord)
 #endif
 #if __GLASGOW_HASKELL__ >= 503
 import GHC.Exts
 #else
 import GlaExts
 #endif
+alex_tab_size :: Int
+alex_tab_size = 8
 alex_base :: AlexAddr
 alex_base = AlexA# "\xf8\xff\xff\xff\xfc\xff\xff\xff\xde\xff\xff\xff\x7c\x00\x00\x00\xfc\x00\x00\x00\x7c\x01\x00\x00\xfc\x01\x00\x00\x7c\x02\x00\x00\xfc\x02\x00\x00\x00\x00\x00\x00\x6d\x03\x00\x00\x00\x00\x00\x00\xde\x03\x00\x00\x00\x00\x00\x00\x4f\x04\x00\x00\x00\x00\x00\x00\x90\x04\x00\x00\x00\x00\x00\x00\xd1\x04\x00\x00\x00\x00\x00\x00\x12\x05\x00\x00\x12\x06\x00\x00\xd2\x05\x00\x00\x00\x00\x00\x00\xd2\x06\x00\x00\x92\x06\x00\x00\x00\x00\x00\x00\x92\x07\x00\x00\x52\x07\x00\x00\x00\x00\x00\x00\x48\x08\x00\x00\xdb\xff\xff\xff\x3e\x09\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xcb\xff\xff\xff\x00\x00\x00\x00\xe7\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x30\x08\x00\x00\x26\x09\x00\x00\x1b\x0a\x00\x00\x73\x0a\x00\x00\xcb\x0a\x00\x00\x23\x0b\x00\x00\x7b\x0b\x00\x00\xd3\x0b\x00\x00\x2b\x0c\x00\x00\x83\x0c\x00\x00\xdb\x0c\x00\x00\x33\x0d\x00\x00\x8b\x0d\x00\x00\xe3\x0d\x00\x00\x3b\x0e\x00\x00\x93\x0e\x00\x00\xeb\x0e\x00\x00\x43\x0f\x00\x00\x9b\x0f\x00\x00\xf3\x0f\x00\x00\x4b\x10\x00\x00\xa3\x10\x00\x00\xfb\x10\x00\x00\x53\x11\x00\x00\xab\x11\x00\x00\x03\x12\x00\x00\x5b\x12\x00\x00\xb3\x12\x00\x00\x0b\x13\x00\x00\x63\x13\x00\x00\xbb\x13\x00\x00\x13\x14\x00\x00\x6b\x14\x00\x00\xc3\x14\x00\x00\x1b\x15\x00\x00\x73\x15\x00\x00\xcb\x15\x00\x00\x23\x16\x00\x00\x7b\x16\x00\x00\xd3\x16\x00\x00\x2b\x17\x00\x00\x83\x17\x00\x00\xdb\x17\x00\x00\x33\x18\x00\x00\x8b\x18\x00\x00\xe3\x18\x00\x00\x3b\x19\x00\x00\x93\x19\x00\x00\xeb\x19\x00\x00\x43\x1a\x00\x00\x9b\x1a\x00\x00\xf3\x1a\x00\x00\x4b\x1b\x00\x00\xa3\x1b\x00\x00\xfb\x1b\x00\x00\x53\x1c\x00\x00\xab\x1c\x00\x00\x03\x1d\x00\x00\x5b\x1d\x00\x00\xb3\x1d\x00\x00\x0b\x1e\x00\x00\x63\x1e\x00\x00\xbb\x1e\x00\x00\x13\x1f\x00\x00\x6b\x1f\x00\x00\xc3\x1f\x00\x00\x1b\x20\x00\x00\x73\x20\x00\x00\xcb\x20\x00\x00\x23\x21\x00\x00\x7b\x21\x00\x00\xd3\x21\x00\x00\x2b\x22\x00\x00\x83\x22\x00\x00\xdb\x22\x00\x00\x33\x23\x00\x00\x8b\x23\x00\x00\xe3\x23\x00\x00\x3b\x24\x00\x00\x93\x24\x00\x00\xeb\x24\x00\x00\x43\x25\x00\x00\x9b\x25\x00\x00\xf3\x25\x00\x00\x4b\x26\x00\x00\xa3\x26\x00\x00\xfb\x26\x00\x00\x53\x27\x00\x00\xab\x27\x00\x00\x03\x28\x00\x00\x5b\x28\x00\x00\xb3\x28\x00\x00\x0b\x29\x00\x00\x63\x29\x00\x00\xbb\x29\x00\x00\x13\x2a\x00\x00\x6b\x2a\x00\x00\xc3\x2a\x00\x00\x1b\x2b\x00\x00\x73\x2b\x00\x00\xcb\x2b\x00\x00\x23\x2c\x00\x00\x7b\x2c\x00\x00\xd3\x2c\x00\x00\x2b\x2d\x00\x00\x83\x2d\x00\x00\xdb\x2d\x00\x00\x33\x2e\x00\x00\x8b\x2e\x00\x00\xe3\x2e\x00\x00\x3b\x2f\x00\x00\x93\x2f\x00\x00\xeb\x2f\x00\x00\x43\x30\x00\x00\x9b\x30\x00\x00\xf3\x30\x00\x00\x4b\x31\x00\x00\xa3\x31\x00\x00\xfb\x31\x00\x00\x53\x32\x00\x00\xab\x32\x00\x00\x03\x33\x00\x00\x5b\x33\x00\x00\xb3\x33\x00\x00\x0b\x34\x00\x00\x63\x34\x00\x00\xbb\x34\x00\x00\x13\x35\x00\x00\x6b\x35\x00\x00\xc3\x35\x00\x00\x1b\x36\x00\x00\x73\x36\x00\x00\xcb\x36\x00\x00\x24\x08\x00\x00\x00\x00\x00\x00\xe5\x36\x00\x00\x00\x00\x00\x00"#
 
@@ -47,7 +48,10 @@ alex_check = AlexA# "\xff\xff\x09\x00\x0a\x00\x0b\x00\x0c\x00\x0d\x00\x0a\x00\x2
 alex_deflt :: AlexAddr
 alex_deflt = AlexA# "\xff\xff\xb8\x00\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x0f\x00\x0f\x00\x11\x00\x11\x00\x13\x00\x13\x00\x17\x00\x17\x00\x1a\x00\x1a\x00\x1d\x00\x1d\x00\x1e\x00\x1e\x00\x1e\x00\x20\x00\x20\x00\x20\x00\xb8\x00\xb8\x00\xb8\x00\x1e\x00\xff\xff\x20\x00\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xb8\x00\xff\xff"#
 
-alex_accept = listArray (0::Int,185) [AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccSkip,AlexAccSkip,AlexAcc (alex_action_2),AlexAcc (alex_action_3),AlexAcc (alex_action_4),AlexAcc (alex_action_5),AlexAcc (alex_action_6),AlexAcc (alex_action_7),AlexAcc (alex_action_8),AlexAcc (alex_action_9),AlexAcc (alex_action_10),AlexAcc (alex_action_11),AlexAcc (alex_action_12),AlexAcc (alex_action_13),AlexAcc (alex_action_14),AlexAcc (alex_action_15),AlexAcc (alex_action_16),AlexAcc (alex_action_17),AlexAcc (alex_action_18),AlexAcc (alex_action_19),AlexAcc (alex_action_20),AlexAcc (alex_action_21),AlexAcc (alex_action_22),AlexAcc (alex_action_23),AlexAcc (alex_action_24),AlexAcc (alex_action_25),AlexAcc (alex_action_26),AlexAcc (alex_action_27),AlexAcc (alex_action_28),AlexAcc (alex_action_29),AlexAcc (alex_action_30),AlexAcc (alex_action_31),AlexAcc (alex_action_32),AlexAcc (alex_action_33),AlexAcc (alex_action_34),AlexAcc (alex_action_35),AlexAcc (alex_action_36),AlexAcc (alex_action_37),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_38),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_39),AlexAcc (alex_action_40),AlexAcc (alex_action_41),AlexAcc (alex_action_42),AlexAcc (alex_action_43)]
+alex_accept = listArray (0::Int,185) [AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccNone,AlexAccSkip,AlexAccSkip,AlexAcc 150,AlexAcc 149,AlexAcc 148,AlexAcc 147,AlexAcc 146,AlexAcc 145,AlexAcc 144,AlexAcc 143,AlexAcc 142,AlexAcc 141,AlexAcc 140,AlexAcc 139,AlexAcc 138,AlexAcc 137,AlexAcc 136,AlexAcc 135,AlexAcc 134,AlexAcc 133,AlexAcc 132,AlexAcc 131,AlexAcc 130,AlexAcc 129,AlexAcc 128,AlexAcc 127,AlexAcc 126,AlexAcc 125,AlexAcc 124,AlexAcc 123,AlexAcc 122,AlexAcc 121,AlexAcc 120,AlexAcc 119,AlexAcc 118,AlexAcc 117,AlexAcc 116,AlexAcc 115,AlexAcc 114,AlexAcc 113,AlexAcc 112,AlexAcc 111,AlexAcc 110,AlexAcc 109,AlexAcc 108,AlexAcc 107,AlexAcc 106,AlexAcc 105,AlexAcc 104,AlexAcc 103,AlexAcc 102,AlexAcc 101,AlexAcc 100,AlexAcc 99,AlexAcc 98,AlexAcc 97,AlexAcc 96,AlexAcc 95,AlexAcc 94,AlexAcc 93,AlexAcc 92,AlexAcc 91,AlexAcc 90,AlexAcc 89,AlexAcc 88,AlexAcc 87,AlexAcc 86,AlexAcc 85,AlexAcc 84,AlexAcc 83,AlexAcc 82,AlexAcc 81,AlexAcc 80,AlexAcc 79,AlexAcc 78,AlexAcc 77,AlexAcc 76,AlexAcc 75,AlexAcc 74,AlexAcc 73,AlexAcc 72,AlexAcc 71,AlexAcc 70,AlexAcc 69,AlexAcc 68,AlexAcc 67,AlexAcc 66,AlexAcc 65,AlexAcc 64,AlexAcc 63,AlexAcc 62,AlexAcc 61,AlexAcc 60,AlexAcc 59,AlexAcc 58,AlexAcc 57,AlexAcc 56,AlexAcc 55,AlexAcc 54,AlexAcc 53,AlexAcc 52,AlexAcc 51,AlexAcc 50,AlexAcc 49,AlexAcc 48,AlexAcc 47,AlexAcc 46,AlexAcc 45,AlexAcc 44,AlexAcc 43,AlexAcc 42,AlexAcc 41,AlexAcc 40,AlexAcc 39,AlexAcc 38,AlexAcc 37,AlexAcc 36,AlexAcc 35,AlexAcc 34,AlexAcc 33,AlexAcc 32,AlexAcc 31,AlexAcc 30,AlexAcc 29,AlexAcc 28,AlexAcc 27,AlexAcc 26,AlexAcc 25,AlexAcc 24,AlexAcc 23,AlexAcc 22,AlexAcc 21,AlexAcc 20,AlexAcc 19,AlexAcc 18,AlexAcc 17,AlexAcc 16,AlexAcc 15,AlexAcc 14,AlexAcc 13,AlexAcc 12,AlexAcc 11,AlexAcc 10,AlexAcc 9,AlexAcc 8,AlexAcc 7,AlexAcc 6,AlexAcc 5,AlexAcc 4,AlexAcc 3,AlexAcc 2,AlexAcc 1,AlexAcc 0]
+
+alex_actions = array (0::Int,151) [(150,alex_action_2),(149,alex_action_3),(148,alex_action_4),(147,alex_action_5),(146,alex_action_6),(145,alex_action_7),(144,alex_action_8),(143,alex_action_9),(142,alex_action_10),(141,alex_action_11),(140,alex_action_12),(139,alex_action_13),(138,alex_action_14),(137,alex_action_15),(136,alex_action_16),(135,alex_action_17),(134,alex_action_18),(133,alex_action_19),(132,alex_action_20),(131,alex_action_21),(130,alex_action_22),(129,alex_action_23),(128,alex_action_24),(127,alex_action_25),(126,alex_action_26),(125,alex_action_27),(124,alex_action_28),(123,alex_action_29),(122,alex_action_30),(121,alex_action_31),(120,alex_action_32),(119,alex_action_33),(118,alex_action_34),(117,alex_action_35),(116,alex_action_36),(115,alex_action_37),(114,alex_action_38),(113,alex_action_38),(112,alex_action_38),(111,alex_action_38),(110,alex_action_38),(109,alex_action_38),(108,alex_action_38),(107,alex_action_38),(106,alex_action_38),(105,alex_action_38),(104,alex_action_38),(103,alex_action_38),(102,alex_action_38),(101,alex_action_38),(100,alex_action_38),(99,alex_action_38),(98,alex_action_38),(97,alex_action_38),(96,alex_action_38),(95,alex_action_38),(94,alex_action_38),(93,alex_action_38),(92,alex_action_38),(91,alex_action_38),(90,alex_action_38),(89,alex_action_38),(88,alex_action_38),(87,alex_action_38),(86,alex_action_38),(85,alex_action_38),(84,alex_action_38),(83,alex_action_38),(82,alex_action_38),(81,alex_action_38),(80,alex_action_38),(79,alex_action_38),(78,alex_action_38),(77,alex_action_38),(76,alex_action_38),(75,alex_action_38),(74,alex_action_38),(73,alex_action_38),(72,alex_action_38),(71,alex_action_38),(70,alex_action_38),(69,alex_action_38),(68,alex_action_38),(67,alex_action_38),(66,alex_action_38),(65,alex_action_38),(64,alex_action_38),(63,alex_action_38),(62,alex_action_38),(61,alex_action_38),(60,alex_action_38),(59,alex_action_38),(58,alex_action_38),(57,alex_action_38),(56,alex_action_38),(55,alex_action_39),(54,alex_action_39),(53,alex_action_39),(52,alex_action_39),(51,alex_action_39),(50,alex_action_39),(49,alex_action_39),(48,alex_action_39),(47,alex_action_39),(46,alex_action_39),(45,alex_action_39),(44,alex_action_39),(43,alex_action_39),(42,alex_action_39),(41,alex_action_39),(40,alex_action_39),(39,alex_action_39),(38,alex_action_39),(37,alex_action_39),(36,alex_action_39),(35,alex_action_39),(34,alex_action_39),(33,alex_action_39),(32,alex_action_39),(31,alex_action_39),(30,alex_action_39),(29,alex_action_39),(28,alex_action_39),(27,alex_action_39),(26,alex_action_39),(25,alex_action_39),(24,alex_action_39),(23,alex_action_39),(22,alex_action_39),(21,alex_action_39),(20,alex_action_39),(19,alex_action_39),(18,alex_action_39),(17,alex_action_39),(16,alex_action_39),(15,alex_action_39),(14,alex_action_39),(13,alex_action_39),(12,alex_action_39),(11,alex_action_39),(10,alex_action_39),(9,alex_action_39),(8,alex_action_39),(7,alex_action_39),(6,alex_action_39),(5,alex_action_39),(4,alex_action_39),(3,alex_action_40),(2,alex_action_41),(1,alex_action_42),(0,alex_action_43)]
+
 {-# LINE 76 "utils/genprimopcode/./Lexer.x" #-}
 
 get_tok :: ParserM Token
@@ -121,7 +125,7 @@ alex_action_43 =  mkTv TNoBraces
 {-# LINE 1 "templates/GenericTemplate.hs" #-}
 {-# LINE 1 "<built-in>" #-}
 {-# LINE 1 "<command-line>" #-}
-{-# LINE 10 "<command-line>" #-}
+{-# LINE 9 "<command-line>" #-}
 # 1 "/usr/include/stdc-predef.h" 1 3 4
 
 # 17 "/usr/include/stdc-predef.h" 3 4
@@ -167,8 +171,28 @@ alex_action_43 =  mkTv TNoBraces
 
 
 
-{-# LINE 10 "<command-line>" #-}
-{-# LINE 1 "/opt/exp/ghc/root-ghc-7.10/lib/ghc-7.10.1.20150506/include/ghcversion.h" #-}
+
+
+
+{-# LINE 9 "<command-line>" #-}
+{-# LINE 1 "/opt/exp/ghc/roots/8.2.1/lib/ghc-8.2.1/include/ghcversion.h" #-}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+{-# LINE 9 "<command-line>" #-}
+{-# LINE 1 "/tmp/ghc23250_0/ghc_2.h" #-}
 
 
 
@@ -187,7 +211,1273 @@ alex_action_43 =  mkTv TNoBraces
 
 
 
-{-# LINE 10 "<command-line>" #-}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+{-# LINE 9 "<command-line>" #-}
 {-# LINE 1 "templates/GenericTemplate.hs" #-}
 -- -----------------------------------------------------------------------------
 -- ALEX TEMPLATE
@@ -239,13 +1529,13 @@ alexIndexInt16OffAddr (AlexA# arr) off =
 
 
 {-# INLINE alexIndexInt32OffAddr #-}
-alexIndexInt32OffAddr (AlexA# arr) off = 
+alexIndexInt32OffAddr (AlexA# arr) off =
 #ifdef WORDS_BIGENDIAN
   narrow32Int# i
   where
    i    = word2Int# ((b3 `uncheckedShiftL#` 24#) `or#`
-		     (b2 `uncheckedShiftL#` 16#) `or#`
-		     (b1 `uncheckedShiftL#` 8#) `or#` b0)
+                     (b2 `uncheckedShiftL#` 16#) `or#`
+                     (b1 `uncheckedShiftL#` 8#) `or#` b0)
    b3   = int2Word# (ord# (indexCharOffAddr# arr (off' +# 3#)))
    b2   = int2Word# (ord# (indexCharOffAddr# arr (off' +# 2#)))
    b1   = int2Word# (ord# (indexCharOffAddr# arr (off' +# 1#)))
@@ -285,30 +1575,30 @@ alexScan input (I# (sc))
 
 alexScanUser user input (I# (sc))
   = case alex_scan_tkn user input 0# input sc AlexNone of
-	(AlexNone, input') ->
-		case alexGetByte input of
-			Nothing -> 
+  (AlexNone, input') ->
+    case alexGetByte input of
+      Nothing ->
 
 
 
-				   AlexEOF
-			Just _ ->
+                                   AlexEOF
+      Just _ ->
 
 
 
-				   AlexError input'
+                                   AlexError input'
 
-	(AlexLastSkip input'' len, _) ->
-
-
-
-		AlexSkip input'' len
-
-	(AlexLastAcc k input''' len, _) ->
+  (AlexLastSkip input'' len, _) ->
 
 
 
-		AlexToken input''' len k
+    AlexSkip input'' len
+
+  (AlexLastAcc k input''' len, _) ->
+
+
+
+    AlexToken input''' len (alex_actions ! k)
 
 
 -- Push the input through the DFA, remembering the most recent accepting
@@ -316,13 +1606,13 @@ alexScanUser user input (I# (sc))
 
 alex_scan_tkn user orig_input len input s last_acc =
   input `seq` -- strict in the input
-  let 
-	new_acc = (check_accs (alex_accept `quickIndex` (I# (s))))
+  let
+  new_acc = (check_accs (alex_accept `quickIndex` (I# (s))))
   in
   new_acc `seq`
   case alexGetByte input of
      Nothing -> (new_acc, input)
-     Just (c, new_input) -> 
+     Just (c, new_input) ->
 
 
 
@@ -331,40 +1621,31 @@ alex_scan_tkn user orig_input len input s last_acc =
                 base   = alexIndexInt32OffAddr alex_base s
                 offset = (base +# ord_c)
                 check  = alexIndexInt16OffAddr alex_check offset
-		
+
                 new_s = if GTE(offset,0#) && EQ(check,ord_c)
-			  then alexIndexInt16OffAddr alex_table offset
-			  else alexIndexInt16OffAddr alex_deflt s
-	in
+                          then alexIndexInt16OffAddr alex_table offset
+                          else alexIndexInt16OffAddr alex_deflt s
+        in
         case new_s of
-	    -1# -> (new_acc, input)
-		-- on an error, we want to keep the input *before* the
-		-- character that failed, not after.
-    	    _ -> alex_scan_tkn user orig_input (if c < 0x80 || c >= 0xC0 then (len +# 1#) else len)
+            -1# -> (new_acc, input)
+                -- on an error, we want to keep the input *before* the
+                -- character that failed, not after.
+            _ -> alex_scan_tkn user orig_input (if c < 0x80 || c >= 0xC0 then (len +# 1#) else len)
                                                 -- note that the length is increased ONLY if this is the 1st byte in a char encoding)
-			new_input new_s new_acc
+                        new_input new_s new_acc
       }
   where
-	check_accs (AlexAccNone) = last_acc
-	check_accs (AlexAcc a  ) = AlexLastAcc a input (I# (len))
-	check_accs (AlexAccSkip) = AlexLastSkip  input (I# (len))
+        check_accs (AlexAccNone) = last_acc
+        check_accs (AlexAcc a  ) = AlexLastAcc a input (I# (len))
+        check_accs (AlexAccSkip) = AlexLastSkip  input (I# (len))
 {-# LINE 198 "templates/GenericTemplate.hs" #-}
 
-data AlexLastAcc a
+data AlexLastAcc
   = AlexNone
-  | AlexLastAcc a !AlexInput !Int
-  | AlexLastSkip  !AlexInput !Int
+  | AlexLastAcc !Int !AlexInput !Int
+  | AlexLastSkip     !AlexInput !Int
 
-instance Functor AlexLastAcc where
-    fmap f AlexNone = AlexNone
-    fmap f (AlexLastAcc x y z) = AlexLastAcc (f x) y z
-    fmap f (AlexLastSkip x y) = AlexLastSkip x y
-
-data AlexAcc a user
+data AlexAcc user
   = AlexAccNone
-  | AlexAcc a
+  | AlexAcc Int
   | AlexAccSkip
-{-# LINE 242 "templates/GenericTemplate.hs" #-}
-
--- used by wrappers
-iUnbox (I# (i)) = i

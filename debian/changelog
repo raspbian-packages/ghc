@@ -1,4 +1,4 @@
-ghc (8.0.2-11+rpi1) buster-staging; urgency=medium
+ghc (8.2.2-4+rpi1) buster-staging; urgency=medium
 
   [changes brought forward from 7.6.3-21+rpi1 by Peter Michael Green <plugwash@raspbian.org> at Sun, 19 Apr 2015 14:00:16 +0000]
   * Change compiler defaults for armv6
@@ -9,7 +9,74 @@ ghc (8.0.2-11+rpi1) buster-staging; urgency=medium
   [changed introduced in 7.10.3-2+rpi1 by Peter Michael Green]
   * Add call to dh_autoreconf_clean
 
- -- Raspbian forward porter <root@raspbian.org>  Thu, 15 Feb 2018 12:54:03 +0000
+ -- Raspbian forward porter <root@raspbian.org>  Tue, 03 Jul 2018 12:25:58 +0000
+
+ghc (8.2.2-4) unstable; urgency=medium
+
+  [ Clint Adams ]
+  * Bump to Standards-Version 4.1.4.
+  * Set Rules-Requires-Root to no.
+
+  [ Ilias Tsitsimpis ]
+  * Use system's default ld (ld.bfd) on mips/mipsel, instead of ld.gold
+
+ -- Ilias Tsitsimpis <iliastsi@debian.org>  Mon, 25 Jun 2018 12:24:52 +0300
+
+ghc (8.2.2-3) unstable; urgency=medium
+
+  * Upload to unstable.
+
+ -- Clint Adams <clint@debian.org>  Sun, 08 Apr 2018 16:24:00 -0400
+
+ghc (8.2.2-2) experimental; urgency=medium
+
+  * Merge 8.0.2-12 unreleased changes.
+
+ -- Clint Adams <clint@debian.org>  Sat, 07 Apr 2018 08:08:41 -0400
+
+ghc (8.2.2-1) experimental; urgency=medium
+
+  * Merge 8.0.2-11 unreleased changes
+  * New upstream release, patch refresh
+  * Fixup regex fix in watch file
+
+ -- Gianfranco Costamagna <locutusofborg@debian.org>  Mon, 27 Nov 2017 12:08:38 +0100
+
+ghc (8.2.1-2) experimental; urgency=medium
+
+  [ Sean Whitton ]
+  * Upload to experimental again, after merging in changes from unstable.
+    - Refresh patches.
+    - Drop osdecommitmemory-compat.patch from series file
+      Merged upstream.
+
+  [ Clint Adams ]
+  * Drop avoid-CrossCompilerPrefix-stage2.patch.
+
+ -- Clint Adams <clint@debian.org>  Sun, 17 Sep 2017 07:52:14 -0400
+
+ghc (8.2.1-1) experimental; urgency=medium
+
+  * New upstream release
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Fri, 15 Sep 2017 17:15:49 -0700
+
+ghc (8.2.0~20170507-3) experimental; urgency=medium
+
+  * 8.2.1-rc2.
+    - Switches to LLVM 3.9.
+
+ -- Clint Adams <clint@debian.org>  Wed, 12 Jul 2017 17:51:16 -0400
+
+ghc (8.0.2-12) UNRELEASED; urgency=medium
+
+  [ Ilias Tsitsimpis ]
+  * Use salsa.debian.org URLs in Vcs-{Browser,Git} fields
+
+  [ Sean Whitton ]
+  * Add lower-optimization-for-unreg.patch (Closes: #890763).
+
+ -- Ilias Tsitsimpis <iliastsi@debian.org>  Fri, 09 Feb 2018 20:44:09 +0200
 
 ghc (8.0.2-11) unstable; urgency=medium
 
@@ -62,6 +129,19 @@ ghc (8.0.2-6) unstable; urgency=medium
   * Switch arm64 linker to bfd, since gold is garbage.
 
  -- Clint Adams <clint@debian.org>  Fri, 25 Aug 2017 08:36:53 -0400
+
+ghc (8.2.0~20170507-2) experimental; urgency=medium
+
+  * 8.2.1-rc2.
+    - Switches to LLVM 3.9.
+
+ -- Clint Adams <clint@debian.org>  Wed, 12 Jul 2017 17:51:16 -0400
+
+ghc (8.2.0~20170507-1) experimental; urgency=medium
+
+  * 8.2.1-rc2.
+
+ -- Clint Adams <clint@debian.org>  Wed, 12 Jul 2017 17:51:16 -0400
 
 ghc (8.0.2-5) unstable; urgency=medium
 

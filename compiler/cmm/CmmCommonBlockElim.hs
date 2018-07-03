@@ -21,6 +21,8 @@ import Data.Word
 import qualified Data.Map as M
 import Outputable
 import UniqFM
+import UniqDFM
+import qualified TrieMap as TM
 import Unique
 import Control.Arrow (first, second)
 
@@ -64,7 +66,7 @@ elimCommonBlocks g = replaceLabels env $ copyTicks env g
 -- (so avoid comparing them again)
 type DistinctBlocks = [CmmBlock]
 type Key = [Label]
-type Subst = BlockEnv BlockId
+type Subst = LabelMap BlockId
 
 -- The outer list groups by hash. We retain this grouping throughout.
 iterate :: Subst -> [[(Key, DistinctBlocks)]] -> Subst
@@ -132,7 +134,6 @@ hash_block block =
 
         hash_node :: CmmNode O x -> Word32
         hash_node n | dont_care n = 0 -- don't care
-        hash_node (CmmUnwind _ e) = hash_e e
         hash_node (CmmAssign r e) = hash_reg r + hash_e e
         hash_node (CmmStore e e') = hash_e e + hash_e e'
         hash_node (CmmUnsafeForeignCall t _ as) = hash_tgt t + hash_list hash_e as
@@ -179,14 +180,15 @@ hash_block block =
 dont_care :: CmmNode O x -> Bool
 dont_care CmmComment {}  = True
 dont_care CmmTick {}     = True
+dont_care CmmUnwind {}   = True
 dont_care _other         = False
 
 -- Utilities: equality and substitution on the graph.
 
 -- Given a map ``subst'' from BlockID -> BlockID, we define equality.
-eqBid :: BlockEnv BlockId -> BlockId -> BlockId -> Bool
+eqBid :: LabelMap BlockId -> BlockId -> BlockId -> Bool
 eqBid subst bid bid' = lookupBid subst bid == lookupBid subst bid'
-lookupBid :: BlockEnv BlockId -> BlockId -> BlockId
+lookupBid :: LabelMap BlockId -> BlockId -> BlockId
 lookupBid subst bid = case mapLookup bid subst of
                         Just bid  -> lookupBid subst bid
                         Nothing -> bid
@@ -264,7 +266,7 @@ eqMaybeWith _ _ _ = False
 -- the same ticks as the respective "source" blocks. This not only
 -- means copying ticks, but also adjusting tick scopes where
 -- necessary.
-copyTicks :: BlockEnv BlockId -> CmmGraph -> CmmGraph
+copyTicks :: LabelMap BlockId -> CmmGraph -> CmmGraph
 copyTicks env g
   | mapNull env = g
   | otherwise   = ofBlockMap (g_entry g) $ mapMap copyTo blockMap
@@ -285,15 +287,16 @@ copyTicks env g
 
 -- Group by [Label]
 groupByLabel :: [(Key, a)] -> [(Key, [a])]
-groupByLabel = go M.empty
+groupByLabel = go (TM.emptyTM :: TM.ListMap UniqDFM a)
   where
-    go !m [] = M.elems m
-    go !m ((k,v) : entries) = go (M.alter adjust k' m) entries
+    go !m [] = TM.foldTM (:) m []
+    go !m ((k,v) : entries) = go (TM.alterTM k' adjust m) entries
       where k' = map getUnique k
             adjust Nothing       = Just (k,[v])
             adjust (Just (_,vs)) = Just (k,v:vs)
 
 
 groupByInt :: (a -> Int) -> [a] -> [[a]]
-groupByInt f xs = eltsUFM $ List.foldl' go emptyUFM xs
+groupByInt f xs = nonDetEltsUFM $ List.foldl' go emptyUFM xs
+  -- See Note [Unique Determinism and code generation]
   where go m x = alterUFM (Just . maybe [x] (x:)) m (f x)

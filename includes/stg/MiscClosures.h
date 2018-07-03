@@ -63,6 +63,7 @@ RTS_RET(stg_maskUninterruptiblezh_ret);
 RTS_RET(stg_maskAsyncExceptionszh_ret);
 RTS_RET(stg_stack_underflow_frame);
 RTS_RET(stg_restore_cccs);
+RTS_RET(stg_restore_cccs_eval);
 
 // RTS_FUN(stg_interp_constr1_entry);
 // RTS_FUN(stg_interp_constr2_entry);
@@ -92,7 +93,6 @@ RTS_RET(stg_apply_interp);
 RTS_ENTRY(stg_IND);
 RTS_ENTRY(stg_IND_direct);
 RTS_ENTRY(stg_IND_STATIC);
-RTS_ENTRY(stg_IND_PERM);
 RTS_ENTRY(stg_BLACKHOLE);
 RTS_ENTRY(stg_CAF_BLACKHOLE);
 RTS_ENTRY(__stg_EAGER_BLACKHOLE);
@@ -112,6 +112,7 @@ RTS_ENTRY(stg_TVAR_CLEAN);
 RTS_ENTRY(stg_TVAR_DIRTY);
 RTS_ENTRY(stg_TSO);
 RTS_ENTRY(stg_STACK);
+RTS_ENTRY(stg_RUBBISH_ENTRY);
 RTS_ENTRY(stg_ARR_WORDS);
 RTS_ENTRY(stg_MUT_ARR_WORDS);
 RTS_ENTRY(stg_MUT_ARR_PTRS_CLEAN);
@@ -151,6 +152,8 @@ RTS_ENTRY(stg_END_STM_WATCH_QUEUE);
 RTS_ENTRY(stg_END_INVARIANT_CHECK_QUEUE);
 RTS_ENTRY(stg_END_STM_CHUNK_LIST);
 RTS_ENTRY(stg_NO_TREC);
+RTS_ENTRY(stg_COMPACT_NFDATA_CLEAN);
+RTS_ENTRY(stg_COMPACT_NFDATA_DIRTY);
 
 /* closures */
 
@@ -229,7 +232,7 @@ RTS_THUNK(stg_ap_6_upd);
 RTS_THUNK(stg_ap_7_upd);
 
 /* standard application routines (see also utils/genapply,
- * and compiler/codeGen/CgStackery.lhs).
+ * and compiler/codeGen/StgCmmArgRep.hs).
  */
 RTS_RET(stg_ap_v);
 RTS_RET(stg_ap_f);
@@ -269,11 +272,9 @@ RTS_FUN_DECL(stg_ap_ppppp_fast);
 RTS_FUN_DECL(stg_ap_pppppp_fast);
 RTS_FUN_DECL(stg_PAP_apply);
 
-/* standard GC & stack check entry points, all defined in HeapStackCheck.hc */
+/* standard GC & stack check entry points, all defined in HeapStackCheck.cmm */
 
 RTS_FUN_DECL(stg_gc_noregs);
-
-RTS_RET(stg_enter_checkbh);
 
 RTS_RET(stg_ret_v);
 RTS_RET(stg_ret_p);
@@ -354,6 +355,8 @@ RTS_FUN_DECL(stg_casArrayzh);
 RTS_FUN_DECL(stg_newByteArrayzh);
 RTS_FUN_DECL(stg_newPinnedByteArrayzh);
 RTS_FUN_DECL(stg_newAlignedPinnedByteArrayzh);
+RTS_FUN_DECL(stg_isByteArrayPinnedzh);
+RTS_FUN_DECL(stg_isMutableByteArrayPinnedzh);
 RTS_FUN_DECL(stg_shrinkMutableByteArrayzh);
 RTS_FUN_DECL(stg_resizzeMutableByteArrayzh);
 RTS_FUN_DECL(stg_casIntArrayzh);
@@ -407,6 +410,20 @@ RTS_FUN_DECL(stg_raiseIOzh);
 RTS_FUN_DECL(stg_makeStableNamezh);
 RTS_FUN_DECL(stg_makeStablePtrzh);
 RTS_FUN_DECL(stg_deRefStablePtrzh);
+
+RTS_FUN_DECL(stg_compactAddzh);
+RTS_FUN_DECL(stg_compactAddWithSharingzh);
+RTS_FUN_DECL(stg_compactNewzh);
+RTS_FUN_DECL(stg_compactAppendzh);
+RTS_FUN_DECL(stg_compactResizzezh);
+RTS_FUN_DECL(stg_compactGetRootzh);
+RTS_FUN_DECL(stg_compactContainszh);
+RTS_FUN_DECL(stg_compactContainsAnyzh);
+RTS_FUN_DECL(stg_compactGetFirstBlockzh);
+RTS_FUN_DECL(stg_compactGetNextBlockzh);
+RTS_FUN_DECL(stg_compactAllocateBlockzh);
+RTS_FUN_DECL(stg_compactFixupPointerszh);
+RTS_FUN_DECL(stg_compactSizzezh);
 
 RTS_FUN_DECL(stg_forkzh);
 RTS_FUN_DECL(stg_forkOnzh);
@@ -494,6 +511,7 @@ extern unsigned int RTS_VAR(era);
 extern unsigned int RTS_VAR(entering_PAP);
 extern StgWord      RTS_VAR(CC_LIST);          /* registered CC list */
 extern StgWord      RTS_VAR(CCS_LIST);         /* registered CCS list */
+extern StgWord      CCS_OVERHEAD[];
 extern StgWord      CCS_SYSTEM[];
 extern unsigned int RTS_VAR(CC_ID);            /* global ids */
 extern unsigned int RTS_VAR(CCS_ID);

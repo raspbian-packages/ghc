@@ -3,7 +3,7 @@
  * (c) The GHC Team, 1998-2006
  *
  * The IO manager thread in THREADED_RTS.
- * See also libraries/base/GHC/Conc.lhs.
+ * See also libraries/base/GHC/Conc.hs.
  *
  * ---------------------------------------------------------------------------*/
 
@@ -26,7 +26,7 @@ static HANDLE io_manager_event = INVALID_HANDLE_VALUE;
 #define EVENT_BUFSIZ 256
 Mutex event_buf_mutex;
 StgWord32 event_buf[EVENT_BUFSIZ];
-nat next_event;
+uint32_t next_event;
 
 #endif
 
@@ -43,8 +43,8 @@ getIOManagerEvent (void)
 
     if (io_manager_event == INVALID_HANDLE_VALUE) {
         hRes = CreateEvent ( NULL, // no security attrs
-                             TRUE, // manual reset
-                             FALSE, // initial state,
+                             true, // manual reset
+                             false, // initial state,
                              NULL ); // event name: NULL for private events
         if (hRes == NULL) {
             sysErrorBelch("getIOManagerEvent");

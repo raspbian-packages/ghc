@@ -18,18 +18,25 @@ This is where we do all the grimy bindings' generation.
 module TcGenDeriv (
         BagDerivStuff, DerivStuff(..),
 
-        hasBuiltinDeriving,
-        FFoldType(..), functorLikeTraverse,
-        deepSubtypesContaining, foldDataConArgs,
-        mkCoerceClassMethEqn,
+        gen_Eq_binds,
+        gen_Ord_binds,
+        gen_Enum_binds,
+        gen_Bounded_binds,
+        gen_Ix_binds,
+        gen_Show_binds,
+        gen_Read_binds,
+        gen_Data_binds,
+        gen_Lift_binds,
         gen_Newtype_binds,
+        mkCoerceClassMethEqn,
         genAuxBinds,
         ordOpTbl, boxConTbl, litConTbl,
-        mkRdrFunBind
+        mkRdrFunBind, error_Expr
     ) where
 
 #include "HsVersions.h"
 
+import TcRnMonad
 import HsSyn
 import RdrName
 import BasicTypes
@@ -40,7 +47,8 @@ import Encoding
 
 import DynFlags
 import PrelInfo
-import FamInstEnv( FamInst )
+import FamInst
+import FamInstEnv
 import PrelNames
 import THNames
 import Module ( moduleName, moduleNameString
@@ -49,33 +57,24 @@ import MkId ( coerceId )
 import PrimOp
 import SrcLoc
 import TyCon
+import TcEnv
 import TcType
+import TcValidity ( checkValidTyFamEqn )
 import TysPrim
 import TysWiredIn
 import Type
 import Class
-import TyCoRep
 import VarSet
 import VarEnv
-import State
 import Util
 import Var
-#if __GLASGOW_HASKELL__ < 709
-import MonadUtils
-#endif
 import Outputable
 import Lexeme
 import FastString
 import Pair
 import Bag
-import TcEnv (InstInfo)
-import StaticFlags( opt_PprStyle_Debug )
 
-import ListSetOps ( assocMaybe )
 import Data.List  ( partition, intersperse )
-import Data.Maybe ( catMaybes, isJust )
-import Data.Traversable ( mapM )
-import Prelude hiding (mapM)
 
 type BagDerivStuff = Bag DerivStuff
 
@@ -90,50 +89,12 @@ data AuxBindSpec
 data DerivStuff     -- Please add this auxiliary stuff
   = DerivAuxBind AuxBindSpec
 
-  -- Generics
+  -- Generics and DeriveAnyClass
   | DerivFamInst FamInst               -- New type family instances
 
   -- New top-level auxiliary bindings
   | DerivHsBind (LHsBind RdrName, LSig RdrName) -- Also used for SYB
-  | DerivInst (InstInfo RdrName)                -- New, auxiliary instances
 
-{-
-************************************************************************
-*                                                                      *
-                Class deriving diagnostics
-*                                                                      *
-************************************************************************
-
-Only certain blessed classes can be used in a deriving clause. These classes
-are listed below in the definition of hasBuiltinDeriving (with the exception
-of Generic and Generic1, which are handled separately in TcGenGenerics).
-
-A class might be able to be used in a deriving clause if it -XDeriveAnyClass
-is willing to support it. The canDeriveAnyClass function checks if this is
-the case.
--}
-
-hasBuiltinDeriving :: DynFlags
-                   -> (Name -> Fixity)
-                   -> Class
-                   -> Maybe (SrcSpan
-                             -> TyCon
-                             -> (LHsBinds RdrName, BagDerivStuff))
-hasBuiltinDeriving dflags fix_env clas = assocMaybe gen_list (getUnique clas)
-  where
-    gen_list :: [(Unique, SrcSpan -> TyCon -> (LHsBinds RdrName, BagDerivStuff))]
-    gen_list = [ (eqClassKey,          gen_Eq_binds)
-               , (ordClassKey,         gen_Ord_binds)
-               , (enumClassKey,        gen_Enum_binds)
-               , (boundedClassKey,     gen_Bounded_binds)
-               , (ixClassKey,          gen_Ix_binds)
-               , (showClassKey,        gen_Show_binds fix_env)
-               , (readClassKey,        gen_Read_binds fix_env)
-               , (dataClassKey,        gen_Data_binds dflags)
-               , (functorClassKey,     gen_Functor_binds)
-               , (foldableClassKey,    gen_Foldable_binds)
-               , (traversableClassKey, gen_Traversable_binds)
-               , (liftClassKey,        gen_Lift_binds) ]
 
 {-
 ************************************************************************
@@ -194,9 +155,10 @@ for the instance decl, which it probably wasn't, so the decls
 produced don't get through the typechecker.
 -}
 
-gen_Eq_binds :: SrcSpan -> TyCon -> (LHsBinds RdrName, BagDerivStuff)
-gen_Eq_binds loc tycon
-  = (method_binds, aux_binds)
+gen_Eq_binds :: SrcSpan -> TyCon -> TcM (LHsBinds RdrName, BagDerivStuff)
+gen_Eq_binds loc tycon = do
+    dflags <- getDynFlags
+    return (method_binds dflags, aux_binds)
   where
     all_cons = tyConDataCons tycon
     (nullary_cons, non_nullary_cons) = partition isNullarySrcDataCon all_cons
@@ -210,7 +172,7 @@ gen_Eq_binds loc tycon
 
     no_tag_match_cons = null tag_match_cons
 
-    fall_through_eqn
+    fall_through_eqn dflags
       | no_tag_match_cons   -- All constructors have arguments
       = case pat_match_cons of
           []  -> []   -- No constructors; no fall-though case
@@ -222,22 +184,26 @@ gen_Eq_binds loc tycon
       | otherwise -- One or more tag_match cons; add fall-through of
                   -- extract tags compare for equality
       = [([a_Pat, b_Pat],
-         untag_Expr tycon [(a_RDR,ah_RDR), (b_RDR,bh_RDR)]
+         untag_Expr dflags tycon [(a_RDR,ah_RDR), (b_RDR,bh_RDR)]
                     (genPrimOpApp (nlHsVar ah_RDR) eqInt_RDR (nlHsVar bh_RDR)))]
 
     aux_binds | no_tag_match_cons = emptyBag
               | otherwise         = unitBag $ DerivAuxBind $ DerivCon2Tag tycon
 
-    method_binds = listToBag [eq_bind, ne_bind]
-    eq_bind = mk_FunBind loc eq_RDR (map pats_etc pat_match_cons ++ fall_through_eqn)
+    method_binds dflags = listToBag
+      [ eq_bind dflags
+      , ne_bind
+      ]
+    eq_bind dflags = mk_FunBind loc eq_RDR (map pats_etc pat_match_cons
+                                            ++ fall_through_eqn dflags)
     ne_bind = mk_easy_FunBind loc ne_RDR [a_Pat, b_Pat] (
                         nlHsApp (nlHsVar not_RDR) (nlHsPar (nlHsVarApps eq_RDR [a_RDR, b_RDR])))
 
     ------------------------------------------------------------------
     pats_etc data_con
       = let
-            con1_pat = nlConVarPat data_con_RDR as_needed
-            con2_pat = nlConVarPat data_con_RDR bs_needed
+            con1_pat = nlParPat $ nlConVarPat data_con_RDR as_needed
+            con2_pat = nlParPat $ nlConVarPat data_con_RDR bs_needed
 
             data_con_RDR = getRdrName data_con
             con_arity   = length tys_needed
@@ -307,7 +273,7 @@ Several special cases:
   values we can't call the overloaded functions.
   See function unliftedOrdOp
 
-Note [Do not rely on compare]
+Note [Game plan for deriving Ord]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 It's a bad idea to define only 'compare', and build the other binary
 comparisons on top of it; see Trac #2130, #4019.  Reason: we don't
@@ -319,8 +285,16 @@ binary result, something like this:
                                        True  -> False
                                        False -> True
 
+This being said, we can get away with generating full code only for
+'compare' and '<' thus saving us generation of other three operators.
+Other operators can be cheaply expressed through '<':
+a <= b = not $ b < a
+a > b = b < a
+a >= b = not $ a < b
+
 So for sufficiently small types (few constructors, or all nullary)
 we generate all methods; for large ones we just use 'compare'.
+
 -}
 
 data OrdOp = OrdCompare | OrdLT | OrdLE | OrdGE | OrdGT
@@ -363,22 +337,33 @@ gtResult OrdGE      = true_Expr
 gtResult OrdGT      = true_Expr
 
 ------------
-gen_Ord_binds :: SrcSpan -> TyCon -> (LHsBinds RdrName, BagDerivStuff)
-gen_Ord_binds loc tycon
-  | null tycon_data_cons        -- No data-cons => invoke bale-out case
-  = (unitBag $ mk_FunBind loc compare_RDR [], emptyBag)
-  | otherwise
-  = (unitBag (mkOrdOp OrdCompare) `unionBags` other_ops, aux_binds)
+gen_Ord_binds :: SrcSpan -> TyCon -> TcM (LHsBinds RdrName, BagDerivStuff)
+gen_Ord_binds loc tycon = do
+    dflags <- getDynFlags
+    return $ if null tycon_data_cons -- No data-cons => invoke bale-out case
+      then ( unitBag $ mk_FunBind loc compare_RDR []
+           , emptyBag)
+      else ( unitBag (mkOrdOp dflags OrdCompare) `unionBags` other_ops dflags
+           , aux_binds)
   where
     aux_binds | single_con_type = emptyBag
               | otherwise       = unitBag $ DerivAuxBind $ DerivCon2Tag tycon
 
-        -- Note [Do not rely on compare]
-    other_ops | (last_tag - first_tag) <= 2     -- 1-3 constructors
-                || null non_nullary_cons        -- Or it's an enumeration
-              = listToBag (map mkOrdOp [OrdLT,OrdLE,OrdGE,OrdGT])
-              | otherwise
-              = emptyBag
+        -- Note [Game plan for deriving Ord]
+    other_ops dflags
+      | (last_tag - first_tag) <= 2     -- 1-3 constructors
+        || null non_nullary_cons        -- Or it's an enumeration
+      = listToBag [mkOrdOp dflags OrdLT, lE, gT, gE]
+      | otherwise
+      = emptyBag
+
+    negate_expr = nlHsApp (nlHsVar not_RDR)
+    lE = mk_easy_FunBind loc le_RDR [a_Pat, b_Pat] $
+        negate_expr (nlHsApp (nlHsApp (nlHsVar lt_RDR) b_Expr) a_Expr)
+    gT = mk_easy_FunBind loc gt_RDR [a_Pat, b_Pat] $
+        nlHsApp (nlHsApp (nlHsVar lt_RDR) b_Expr) a_Expr
+    gE = mk_easy_FunBind loc ge_RDR [a_Pat, b_Pat] $
+        negate_expr (nlHsApp (nlHsApp (nlHsVar lt_RDR) a_Expr) b_Expr)
 
     get_tag con = dataConTag con - fIRST_TAG
         -- We want *zero-based* tags, because that's what
@@ -394,87 +379,93 @@ gen_Ord_binds loc tycon
     (nullary_cons, non_nullary_cons) = partition isNullarySrcDataCon tycon_data_cons
 
 
-    mkOrdOp :: OrdOp -> LHsBind RdrName
+    mkOrdOp :: DynFlags -> OrdOp -> LHsBind RdrName
     -- Returns a binding   op a b = ... compares a and b according to op ....
-    mkOrdOp op = mk_easy_FunBind loc (ordMethRdr op) [a_Pat, b_Pat] (mkOrdOpRhs op)
+    mkOrdOp dflags op = mk_easy_FunBind loc (ordMethRdr op) [a_Pat, b_Pat]
+                                        (mkOrdOpRhs dflags op)
 
-    mkOrdOpRhs :: OrdOp -> LHsExpr RdrName
-    mkOrdOpRhs op       -- RHS for comparing 'a' and 'b' according to op
+    mkOrdOpRhs :: DynFlags -> OrdOp -> LHsExpr RdrName
+    mkOrdOpRhs dflags op       -- RHS for comparing 'a' and 'b' according to op
       | length nullary_cons <= 2  -- Two nullary or fewer, so use cases
       = nlHsCase (nlHsVar a_RDR) $
-        map (mkOrdOpAlt op) tycon_data_cons
+        map (mkOrdOpAlt dflags op) tycon_data_cons
         -- i.e.  case a of { C1 x y -> case b of C1 x y -> ....compare x,y...
         --                   C2 x   -> case b of C2 x -> ....comopare x.... }
 
       | null non_nullary_cons    -- All nullary, so go straight to comparing tags
-      = mkTagCmp op
+      = mkTagCmp dflags op
 
       | otherwise                -- Mixed nullary and non-nullary
       = nlHsCase (nlHsVar a_RDR) $
-        (map (mkOrdOpAlt op) non_nullary_cons
-         ++ [mkSimpleHsAlt nlWildPat (mkTagCmp op)])
+        (map (mkOrdOpAlt dflags op) non_nullary_cons
+         ++ [mkHsCaseAlt nlWildPat (mkTagCmp dflags op)])
 
 
-    mkOrdOpAlt :: OrdOp -> DataCon -> LMatch RdrName (LHsExpr RdrName)
+    mkOrdOpAlt :: DynFlags -> OrdOp -> DataCon
+                  -> LMatch RdrName (LHsExpr RdrName)
     -- Make the alternative  (Ki a1 a2 .. av ->
-    mkOrdOpAlt op data_con
-      = mkSimpleHsAlt (nlConVarPat data_con_RDR as_needed) (mkInnerRhs op data_con)
+    mkOrdOpAlt dflags op data_con
+      = mkHsCaseAlt (nlConVarPat data_con_RDR as_needed)
+                    (mkInnerRhs dflags op data_con)
       where
         as_needed    = take (dataConSourceArity data_con) as_RDRs
         data_con_RDR = getRdrName data_con
 
-    mkInnerRhs op data_con
+    mkInnerRhs dflags op data_con
       | single_con_type
       = nlHsCase (nlHsVar b_RDR) [ mkInnerEqAlt op data_con ]
 
       | tag == first_tag
       = nlHsCase (nlHsVar b_RDR) [ mkInnerEqAlt op data_con
-                                 , mkSimpleHsAlt nlWildPat (ltResult op) ]
+                                 , mkHsCaseAlt nlWildPat (ltResult op) ]
       | tag == last_tag
       = nlHsCase (nlHsVar b_RDR) [ mkInnerEqAlt op data_con
-                                 , mkSimpleHsAlt nlWildPat (gtResult op) ]
+                                 , mkHsCaseAlt nlWildPat (gtResult op) ]
 
       | tag == first_tag + 1
-      = nlHsCase (nlHsVar b_RDR) [ mkSimpleHsAlt (nlConWildPat first_con) (gtResult op)
+      = nlHsCase (nlHsVar b_RDR) [ mkHsCaseAlt (nlConWildPat first_con)
+                                             (gtResult op)
                                  , mkInnerEqAlt op data_con
-                                 , mkSimpleHsAlt nlWildPat (ltResult op) ]
+                                 , mkHsCaseAlt nlWildPat (ltResult op) ]
       | tag == last_tag - 1
-      = nlHsCase (nlHsVar b_RDR) [ mkSimpleHsAlt (nlConWildPat last_con) (ltResult op)
+      = nlHsCase (nlHsVar b_RDR) [ mkHsCaseAlt (nlConWildPat last_con)
+                                             (ltResult op)
                                  , mkInnerEqAlt op data_con
-                                 , mkSimpleHsAlt nlWildPat (gtResult op) ]
+                                 , mkHsCaseAlt nlWildPat (gtResult op) ]
 
       | tag > last_tag `div` 2  -- lower range is larger
-      = untag_Expr tycon [(b_RDR, bh_RDR)] $
+      = untag_Expr dflags tycon [(b_RDR, bh_RDR)] $
         nlHsIf (genPrimOpApp (nlHsVar bh_RDR) ltInt_RDR tag_lit)
                (gtResult op) $  -- Definitely GT
         nlHsCase (nlHsVar b_RDR) [ mkInnerEqAlt op data_con
-                                 , mkSimpleHsAlt nlWildPat (ltResult op) ]
+                                 , mkHsCaseAlt nlWildPat (ltResult op) ]
 
       | otherwise               -- upper range is larger
-      = untag_Expr tycon [(b_RDR, bh_RDR)] $
+      = untag_Expr dflags tycon [(b_RDR, bh_RDR)] $
         nlHsIf (genPrimOpApp (nlHsVar bh_RDR) gtInt_RDR tag_lit)
                (ltResult op) $  -- Definitely LT
         nlHsCase (nlHsVar b_RDR) [ mkInnerEqAlt op data_con
-                                 , mkSimpleHsAlt nlWildPat (gtResult op) ]
+                                 , mkHsCaseAlt nlWildPat (gtResult op) ]
       where
         tag     = get_tag data_con
-        tag_lit = noLoc (HsLit (HsIntPrim "" (toInteger tag)))
+        tag_lit = noLoc (HsLit (HsIntPrim NoSourceText (toInteger tag)))
 
     mkInnerEqAlt :: OrdOp -> DataCon -> LMatch RdrName (LHsExpr RdrName)
     -- First argument 'a' known to be built with K
     -- Returns a case alternative  Ki b1 b2 ... bv -> compare (a1,a2,...) with (b1,b2,...)
     mkInnerEqAlt op data_con
-      = mkSimpleHsAlt (nlConVarPat data_con_RDR bs_needed) $
+      = mkHsCaseAlt (nlConVarPat data_con_RDR bs_needed) $
         mkCompareFields tycon op (dataConOrigArgTys data_con)
       where
         data_con_RDR = getRdrName data_con
         bs_needed    = take (dataConSourceArity data_con) bs_RDRs
 
-    mkTagCmp :: OrdOp -> LHsExpr RdrName
+    mkTagCmp :: DynFlags -> OrdOp -> LHsExpr RdrName
     -- Both constructors known to be nullary
     -- genreates (case data2Tag a of a# -> case data2Tag b of b# -> a# `op` b#
-    mkTagCmp op = untag_Expr tycon [(a_RDR, ah_RDR),(b_RDR, bh_RDR)] $
-                  unliftedOrdOp tycon intPrimTy op ah_RDR bh_RDR
+    mkTagCmp dflags op =
+      untag_Expr dflags tycon[(a_RDR, ah_RDR),(b_RDR, bh_RDR)] $
+        unliftedOrdOp tycon intPrimTy op ah_RDR bh_RDR
 
 mkCompareFields :: TyCon -> OrdOp -> [Type] -> LHsExpr RdrName
 -- Generates nested comparisons for (a1,a2...) against (b1,b2,...)
@@ -500,9 +491,9 @@ mkCompareFields tycon op tys
       = unliftedCompare lt_op eq_op a_expr b_expr lt eq gt
       | otherwise
       = nlHsCase (nlHsPar (nlHsApp (nlHsApp (nlHsVar compare_RDR) a_expr) b_expr))
-          [mkSimpleHsAlt (nlNullaryConPat ltTag_RDR) lt,
-           mkSimpleHsAlt (nlNullaryConPat eqTag_RDR) eq,
-           mkSimpleHsAlt (nlNullaryConPat gtTag_RDR) gt]
+          [mkHsCaseAlt (nlNullaryConPat ltTag_RDR) lt,
+           mkHsCaseAlt (nlNullaryConPat eqTag_RDR) eq,
+           mkHsCaseAlt (nlNullaryConPat gtTag_RDR) gt]
       where
         a_expr = nlHsVar a
         b_expr = nlHsVar b
@@ -586,76 +577,78 @@ instance ... Enum (Foo ...) where
 For @enumFromTo@ and @enumFromThenTo@, we use the default methods.
 -}
 
-gen_Enum_binds :: SrcSpan -> TyCon -> (LHsBinds RdrName, BagDerivStuff)
-gen_Enum_binds loc tycon
-  = (method_binds, aux_binds)
+gen_Enum_binds :: SrcSpan -> TyCon -> TcM (LHsBinds RdrName, BagDerivStuff)
+gen_Enum_binds loc tycon = do
+    dflags <- getDynFlags
+    return (method_binds dflags, aux_binds)
   where
-    method_binds = listToBag [
-                        succ_enum,
-                        pred_enum,
-                        to_enum,
-                        enum_from,
-                        enum_from_then,
-                        from_enum
-                    ]
+    method_binds dflags = listToBag
+      [ succ_enum      dflags
+      , pred_enum      dflags
+      , to_enum        dflags
+      , enum_from      dflags
+      , enum_from_then dflags
+      , from_enum      dflags
+      ]
     aux_binds = listToBag $ map DerivAuxBind
                   [DerivCon2Tag tycon, DerivTag2Con tycon, DerivMaxTag tycon]
 
     occ_nm = getOccString tycon
 
-    succ_enum
+    succ_enum dflags
       = mk_easy_FunBind loc succ_RDR [a_Pat] $
-        untag_Expr tycon [(a_RDR, ah_RDR)] $
-        nlHsIf (nlHsApps eq_RDR [nlHsVar (maxtag_RDR tycon),
+        untag_Expr dflags tycon [(a_RDR, ah_RDR)] $
+        nlHsIf (nlHsApps eq_RDR [nlHsVar (maxtag_RDR dflags tycon),
                                nlHsVarApps intDataCon_RDR [ah_RDR]])
              (illegal_Expr "succ" occ_nm "tried to take `succ' of last tag in enumeration")
-             (nlHsApp (nlHsVar (tag2con_RDR tycon))
+             (nlHsApp (nlHsVar (tag2con_RDR dflags tycon))
                     (nlHsApps plus_RDR [nlHsVarApps intDataCon_RDR [ah_RDR],
                                         nlHsIntLit 1]))
 
-    pred_enum
+    pred_enum dflags
       = mk_easy_FunBind loc pred_RDR [a_Pat] $
-        untag_Expr tycon [(a_RDR, ah_RDR)] $
+        untag_Expr dflags tycon [(a_RDR, ah_RDR)] $
         nlHsIf (nlHsApps eq_RDR [nlHsIntLit 0,
                                nlHsVarApps intDataCon_RDR [ah_RDR]])
              (illegal_Expr "pred" occ_nm "tried to take `pred' of first tag in enumeration")
-             (nlHsApp (nlHsVar (tag2con_RDR tycon))
+             (nlHsApp (nlHsVar (tag2con_RDR dflags tycon))
                            (nlHsApps plus_RDR [nlHsVarApps intDataCon_RDR [ah_RDR],
-                                               nlHsLit (HsInt "-1" (-1))]))
+                                           nlHsLit (HsInt NoSourceText (-1))]))
 
-    to_enum
+    to_enum dflags
       = mk_easy_FunBind loc toEnum_RDR [a_Pat] $
         nlHsIf (nlHsApps and_RDR
                 [nlHsApps ge_RDR [nlHsVar a_RDR, nlHsIntLit 0],
-                 nlHsApps le_RDR [nlHsVar a_RDR, nlHsVar (maxtag_RDR tycon)]])
-             (nlHsVarApps (tag2con_RDR tycon) [a_RDR])
-             (illegal_toEnum_tag occ_nm (maxtag_RDR tycon))
+                 nlHsApps le_RDR [ nlHsVar a_RDR
+                                 , nlHsVar (maxtag_RDR dflags tycon)]])
+             (nlHsVarApps (tag2con_RDR dflags tycon) [a_RDR])
+             (illegal_toEnum_tag occ_nm (maxtag_RDR dflags tycon))
 
-    enum_from
+    enum_from dflags
       = mk_easy_FunBind loc enumFrom_RDR [a_Pat] $
-          untag_Expr tycon [(a_RDR, ah_RDR)] $
+          untag_Expr dflags tycon [(a_RDR, ah_RDR)] $
           nlHsApps map_RDR
-                [nlHsVar (tag2con_RDR tycon),
+                [nlHsVar (tag2con_RDR dflags tycon),
                  nlHsPar (enum_from_to_Expr
                             (nlHsVarApps intDataCon_RDR [ah_RDR])
-                            (nlHsVar (maxtag_RDR tycon)))]
+                            (nlHsVar (maxtag_RDR dflags tycon)))]
 
-    enum_from_then
+    enum_from_then dflags
       = mk_easy_FunBind loc enumFromThen_RDR [a_Pat, b_Pat] $
-          untag_Expr tycon [(a_RDR, ah_RDR), (b_RDR, bh_RDR)] $
-          nlHsApp (nlHsVarApps map_RDR [tag2con_RDR tycon]) $
+          untag_Expr dflags tycon [(a_RDR, ah_RDR), (b_RDR, bh_RDR)] $
+          nlHsApp (nlHsVarApps map_RDR [tag2con_RDR dflags tycon]) $
             nlHsPar (enum_from_then_to_Expr
                     (nlHsVarApps intDataCon_RDR [ah_RDR])
                     (nlHsVarApps intDataCon_RDR [bh_RDR])
                     (nlHsIf  (nlHsApps gt_RDR [nlHsVarApps intDataCon_RDR [ah_RDR],
                                                nlHsVarApps intDataCon_RDR [bh_RDR]])
                            (nlHsIntLit 0)
-                           (nlHsVar (maxtag_RDR tycon))
+                           (nlHsVar (maxtag_RDR dflags tycon))
                            ))
 
-    from_enum
+    from_enum dflags
       = mk_easy_FunBind loc fromEnum_RDR [a_Pat] $
-          untag_Expr tycon [(a_RDR, ah_RDR)] $
+          untag_Expr dflags tycon [(a_RDR, ah_RDR)] $
           (nlHsVarApps intDataCon_RDR [ah_RDR])
 
 {-
@@ -753,50 +746,53 @@ we follow the scheme given in Figure~19 of the Haskell~1.2 report
 (p.~147).
 -}
 
-gen_Ix_binds :: SrcSpan -> TyCon -> (LHsBinds RdrName, BagDerivStuff)
+gen_Ix_binds :: SrcSpan -> TyCon -> TcM (LHsBinds RdrName, BagDerivStuff)
 
-gen_Ix_binds loc tycon
-  | isEnumerationTyCon tycon
-  = ( enum_ixes
-    , listToBag $ map DerivAuxBind
+gen_Ix_binds loc tycon = do
+    dflags <- getDynFlags
+    return $ if isEnumerationTyCon tycon
+      then (enum_ixes dflags, listToBag $ map DerivAuxBind
                    [DerivCon2Tag tycon, DerivTag2Con tycon, DerivMaxTag tycon])
-  | otherwise
-  = (single_con_ixes, unitBag (DerivAuxBind (DerivCon2Tag tycon)))
+      else (single_con_ixes, unitBag (DerivAuxBind (DerivCon2Tag tycon)))
   where
     --------------------------------------------------------------
-    enum_ixes = listToBag [ enum_range, enum_index, enum_inRange ]
+    enum_ixes dflags = listToBag
+      [ enum_range   dflags
+      , enum_index   dflags
+      , enum_inRange dflags
+      ]
 
-    enum_range
+    enum_range dflags
       = mk_easy_FunBind loc range_RDR [nlTuplePat [a_Pat, b_Pat] Boxed] $
-          untag_Expr tycon [(a_RDR, ah_RDR)] $
-          untag_Expr tycon [(b_RDR, bh_RDR)] $
-          nlHsApp (nlHsVarApps map_RDR [tag2con_RDR tycon]) $
+          untag_Expr dflags tycon [(a_RDR, ah_RDR)] $
+          untag_Expr dflags tycon [(b_RDR, bh_RDR)] $
+          nlHsApp (nlHsVarApps map_RDR [tag2con_RDR dflags tycon]) $
               nlHsPar (enum_from_to_Expr
                         (nlHsVarApps intDataCon_RDR [ah_RDR])
                         (nlHsVarApps intDataCon_RDR [bh_RDR]))
 
-    enum_index
+    enum_index dflags
       = mk_easy_FunBind loc unsafeIndex_RDR
                 [noLoc (AsPat (noLoc c_RDR)
                            (nlTuplePat [a_Pat, nlWildPat] Boxed)),
                                 d_Pat] (
-           untag_Expr tycon [(a_RDR, ah_RDR)] (
-           untag_Expr tycon [(d_RDR, dh_RDR)] (
+           untag_Expr dflags tycon [(a_RDR, ah_RDR)] (
+           untag_Expr dflags tycon [(d_RDR, dh_RDR)] (
            let
                 rhs = nlHsVarApps intDataCon_RDR [c_RDR]
            in
            nlHsCase
              (genOpApp (nlHsVar dh_RDR) minusInt_RDR (nlHsVar ah_RDR))
-             [mkSimpleHsAlt (nlVarPat c_RDR) rhs]
+             [mkHsCaseAlt (nlVarPat c_RDR) rhs]
            ))
         )
 
     -- This produces something like `(ch >= ah) && (ch <= bh)`
-    enum_inRange
+    enum_inRange dflags
       = mk_easy_FunBind loc inRange_RDR [nlTuplePat [a_Pat, b_Pat] Boxed, c_Pat] $
-          untag_Expr tycon [(a_RDR, ah_RDR)] (
-          untag_Expr tycon [(b_RDR, bh_RDR)] (
-          untag_Expr tycon [(c_RDR, ch_RDR)] (
+          untag_Expr dflags tycon [(a_RDR, ah_RDR)] (
+          untag_Expr dflags tycon [(b_RDR, bh_RDR)] (
+          untag_Expr dflags tycon [(c_RDR, ch_RDR)] (
           -- This used to use `if`, which interacts badly with RebindableSyntax.
           -- See #11396.
           nlHsApps and_RDR
@@ -1129,6 +1125,7 @@ gen_Show_binds get_fixity loc tycon
     -----------------------------------------------------------------------
     data_cons = tyConDataCons tycon
     shows_prec = mk_FunBind loc showsPrec_RDR (map pats_etc data_cons)
+    comma_space = nlHsVar showCommaSpace_RDR
 
     pats_etc data_con
       | nullary_con =  -- skip the showParen junk...
@@ -1137,7 +1134,7 @@ gen_Show_binds get_fixity loc tycon
       | otherwise   =
          ([a_Pat, con_pat],
           showParen_Expr (genOpApp a_Expr ge_RDR
-                              (nlHsLit (HsInt "" con_prec_plus_one)))
+                              (nlHsLit (HsInt NoSourceText con_prec_plus_one)))
                          (nlHsPar (nested_compose_Expr show_thingies)))
         where
              data_con_RDR  = getRdrName data_con
@@ -1178,7 +1175,7 @@ gen_Show_binds get_fixity loc tycon
                 -- Assumption for record syntax: no of fields == no of
                 -- labelled fields (and in same order)
              show_record_args = concat $
-                                intersperse [mk_showString_app ", "] $
+                                intersperse [comma_space] $
                                 [ [show_label lbl, arg]
                                 | (lbl,arg) <- zipEqual "gen_Show_binds"
                                                         labels show_args ]
@@ -1220,7 +1217,8 @@ mk_showString_app str = nlHsApp (nlHsVar showString_RDR) (nlHsLit (mkHsString st
 
 -- | showsPrec :: Show a => Int -> a -> ShowS
 mk_showsPrec_app :: Integer -> LHsExpr RdrName -> LHsExpr RdrName
-mk_showsPrec_app p x = nlHsApps showsPrec_RDR [nlHsLit (HsInt "" p), x]
+mk_showsPrec_app p x
+  = nlHsApps showsPrec_RDR [nlHsLit (HsInt NoSourceText p), x]
 
 -- | shows :: Show a => a -> ShowS
 mk_shows_app :: LHsExpr RdrName -> LHsExpr RdrName
@@ -1280,57 +1278,71 @@ we generate
     dataCast2 = gcast2   -- if T :: * -> * -> *
 -}
 
-gen_Data_binds :: DynFlags
-               -> SrcSpan
+gen_Data_binds :: SrcSpan
                -> TyCon                 -- For data families, this is the
                                         --  *representation* TyCon
-               -> (LHsBinds RdrName,    -- The method bindings
-                   BagDerivStuff)       -- Auxiliary bindings
-gen_Data_binds dflags loc rep_tc
+               -> TcM (LHsBinds RdrName,    -- The method bindings
+                       BagDerivStuff)       -- Auxiliary bindings
+gen_Data_binds loc rep_tc
+  = do { dflags  <- getDynFlags
+
+       -- Make unique names for the data type and constructor
+       -- auxiliary bindings.  Start with the name of the TyCon/DataCon
+       -- but that might not be unique: see Trac #12245.
+       ; dt_occ  <- chooseUniqueOccTc (mkDataTOcc (getOccName rep_tc))
+       ; dc_occs <- mapM (chooseUniqueOccTc . mkDataCOcc . getOccName)
+                         (tyConDataCons rep_tc)
+       ; let dt_rdr  = mkRdrUnqual dt_occ
+             dc_rdrs = map mkRdrUnqual dc_occs
+
+       -- OK, now do the work
+       ; return (gen_data dflags dt_rdr dc_rdrs loc rep_tc) }
+
+gen_data :: DynFlags -> RdrName -> [RdrName]
+         -> SrcSpan -> TyCon
+         -> (LHsBinds RdrName,    -- The method bindings
+             BagDerivStuff)       -- Auxiliary bindings
+gen_data dflags data_type_name constr_names loc rep_tc
   = (listToBag [gfoldl_bind, gunfold_bind, toCon_bind, dataTypeOf_bind]
      `unionBags` gcast_binds,
                 -- Auxiliary definitions: the data type and constructors
-     listToBag ( DerivHsBind (genDataTyCon)
-               : map (DerivHsBind . genDataDataCon) data_cons))
+     listToBag ( genDataTyCon
+               : zipWith genDataDataCon data_cons constr_names ) )
   where
     data_cons  = tyConDataCons rep_tc
     n_cons     = length data_cons
     one_constr = n_cons == 1
-
-    genDataTyCon :: (LHsBind RdrName, LSig RdrName)
+    genDataTyCon :: DerivStuff
     genDataTyCon        --  $dT
-      = (mkHsVarBind loc rdr_name rhs,
-         L loc (TypeSig [L loc rdr_name] sig_ty))
-      where
-        rdr_name = mk_data_type_name rep_tc
-        sig_ty   = mkLHsSigWcType (nlHsTyVar dataType_RDR)
-        constrs  = [nlHsVar (mk_constr_name con) | con <- tyConDataCons rep_tc]
-        rhs = nlHsVar mkDataType_RDR
-              `nlHsApp` nlHsLit (mkHsString (showSDocOneLine dflags (ppr rep_tc)))
-              `nlHsApp` nlList constrs
+      = DerivHsBind (mkHsVarBind loc data_type_name rhs,
+                     L loc (TypeSig [L loc data_type_name] sig_ty))
 
-    genDataDataCon :: DataCon -> (LHsBind RdrName, LSig RdrName)
-    genDataDataCon dc       --  $cT1 etc
-      = (mkHsVarBind loc rdr_name rhs,
-         L loc (TypeSig [L loc rdr_name] sig_ty))
+    sig_ty = mkLHsSigWcType (nlHsTyVar dataType_RDR)
+    rhs    = nlHsVar mkDataType_RDR
+             `nlHsApp` nlHsLit (mkHsString (showSDocOneLine dflags (ppr rep_tc)))
+             `nlHsApp` nlList (map nlHsVar constr_names)
+
+    genDataDataCon :: DataCon -> RdrName -> DerivStuff
+    genDataDataCon dc constr_name       --  $cT1 etc
+      = DerivHsBind (mkHsVarBind loc constr_name rhs,
+                     L loc (TypeSig [L loc constr_name] sig_ty))
       where
-        rdr_name = mk_constr_name dc
         sig_ty   = mkLHsSigWcType (nlHsTyVar constr_RDR)
         rhs      = nlHsApps mkConstr_RDR constr_args
 
         constr_args
-           = [ -- nlHsIntLit (toInteger (dataConTag dc)), -- Tag
-           nlHsVar (mk_data_type_name (dataConTyCon dc)), -- DataType
-           nlHsLit (mkHsString (occNameString dc_occ)),   -- String name
-               nlList  labels,                            -- Field labels
-           nlHsVar fixity]                                -- Fixity
+           = [ -- nlHsIntLit (toInteger (dataConTag dc)),   -- Tag
+               nlHsVar (data_type_name)                     -- DataType
+             , nlHsLit (mkHsString (occNameString dc_occ))  -- String name
+             , nlList  labels                               -- Field labels
+             , nlHsVar fixity ]                             -- Fixity
 
         labels   = map (nlHsLit . mkHsString . unpackFS . flLabel)
                        (dataConFieldLabels dc)
         dc_occ   = getOccName dc
         is_infix = isDataSymOcc dc_occ
         fixity | is_infix  = infix_RDR
-           | otherwise = prefix_RDR
+               | otherwise = prefix_RDR
 
         ------------ gfoldl
     gfoldl_bind = mk_HRFunBind 2 loc gfoldl_RDR (map gfoldl_eqn data_cons)
@@ -1355,7 +1367,7 @@ gen_Data_binds dflags loc rep_tc
         | otherwise  = nlHsCase (nlHsVar conIndex_RDR `nlHsApp` c_Expr)
                                 (map gunfold_alt data_cons)
 
-    gunfold_alt dc = mkSimpleHsAlt (mk_unfold_pat dc) (mk_unfold_rhs dc)
+    gunfold_alt dc = mkHsCaseAlt (mk_unfold_pat dc) (mk_unfold_rhs dc)
     mk_unfold_rhs dc = foldr nlHsApp
                            (nlHsVar z_RDR `nlHsApp` nlHsVar (getRdrName dc))
                            (replicate (dataConSourceArity dc) (nlHsVar k_RDR))
@@ -1364,20 +1376,20 @@ gen_Data_binds dflags loc rep_tc
                         -- redundant test, and annoying warning
       | tag-fIRST_TAG == n_cons-1 = nlWildPat   -- Last constructor
       | otherwise = nlConPat intDataCon_RDR
-                             [nlLitPat (HsIntPrim "" (toInteger tag))]
+                             [nlLitPat (HsIntPrim NoSourceText (toInteger tag))]
       where
         tag = dataConTag dc
 
         ------------ toConstr
-    toCon_bind = mk_FunBind loc toConstr_RDR (map to_con_eqn data_cons)
-    to_con_eqn dc = ([nlWildConPat dc], nlHsVar (mk_constr_name dc))
+    toCon_bind = mk_FunBind loc toConstr_RDR (zipWith to_con_eqn data_cons constr_names)
+    to_con_eqn dc con_name = ([nlWildConPat dc], nlHsVar con_name)
 
         ------------ dataTypeOf
     dataTypeOf_bind = mk_easy_FunBind
                         loc
                         dataTypeOf_RDR
                         [nlWildPat]
-                        (nlHsVar (mk_data_type_name rep_tc))
+                        (nlHsVar data_type_name)
 
         ------------ gcast1/2
         -- Make the binding    dataCast1 x = gcast1 x  -- if T :: * -> *
@@ -1473,581 +1485,6 @@ geDouble_RDR   = varQual_RDR  gHC_PRIM (fsLit ">=##")
 {-
 ************************************************************************
 *                                                                      *
-                        Functor instances
-
- see http://www.mail-archive.com/haskell-prime@haskell.org/msg02116.html
-
-*                                                                      *
-************************************************************************
-
-For the data type:
-
-  data T a = T1 Int a | T2 (T a)
-
-We generate the instance:
-
-  instance Functor T where
-      fmap f (T1 b1 a) = T1 b1 (f a)
-      fmap f (T2 ta)   = T2 (fmap f ta)
-
-Notice that we don't simply apply 'fmap' to the constructor arguments.
-Rather
-  - Do nothing to an argument whose type doesn't mention 'a'
-  - Apply 'f' to an argument of type 'a'
-  - Apply 'fmap f' to other arguments
-That's why we have to recurse deeply into the constructor argument types,
-rather than just one level, as we typically do.
-
-What about types with more than one type parameter?  In general, we only
-derive Functor for the last position:
-
-  data S a b = S1 [b] | S2 (a, T a b)
-  instance Functor (S a) where
-    fmap f (S1 bs)    = S1 (fmap f bs)
-    fmap f (S2 (p,q)) = S2 (a, fmap f q)
-
-However, we have special cases for
-         - tuples
-         - functions
-
-More formally, we write the derivation of fmap code over type variable
-'a for type 'b as ($fmap 'a 'b).  In this general notation the derived
-instance for T is:
-
-  instance Functor T where
-      fmap f (T1 x1 x2) = T1 ($(fmap 'a 'b1) x1) ($(fmap 'a 'a) x2)
-      fmap f (T2 x1)    = T2 ($(fmap 'a '(T a)) x1)
-
-  $(fmap 'a 'b)          =  \x -> x     -- when b does not contain a
-  $(fmap 'a 'a)          =  f
-  $(fmap 'a '(b1,b2))    =  \x -> case x of (x1,x2) -> ($(fmap 'a 'b1) x1, $(fmap 'a 'b2) x2)
-  $(fmap 'a '(T b1 b2))  =  fmap $(fmap 'a 'b2)   -- when a only occurs in the last parameter, b2
-  $(fmap 'a '(b -> c))   =  \x b -> $(fmap 'a' 'c) (x ($(cofmap 'a 'b) b))
-
-For functions, the type parameter 'a can occur in a contravariant position,
-which means we need to derive a function like:
-
-  cofmap :: (a -> b) -> (f b -> f a)
-
-This is pretty much the same as $fmap, only without the $(cofmap 'a 'a) case:
-
-  $(cofmap 'a 'b)          =  \x -> x     -- when b does not contain a
-  $(cofmap 'a 'a)          =  error "type variable in contravariant position"
-  $(cofmap 'a '(b1,b2))    =  \x -> case x of (x1,x2) -> ($(cofmap 'a 'b1) x1, $(cofmap 'a 'b2) x2)
-  $(cofmap 'a '[b])        =  map $(cofmap 'a 'b)
-  $(cofmap 'a '(T b1 b2))  =  fmap $(cofmap 'a 'b2)   -- when a only occurs in the last parameter, b2
-  $(cofmap 'a '(b -> c))   =  \x b -> $(cofmap 'a' 'c) (x ($(fmap 'a 'c) b))
-
-Note that the code produced by $(fmap _ _) is always a higher order function,
-with type `(a -> b) -> (g a -> g b)` for some g. When we need to do pattern
-matching on the type, this means create a lambda function (see the (,) case above).
-The resulting code for fmap can look a bit weird, for example:
-
-  data X a = X (a,Int)
-  -- generated instance
-  instance Functor X where
-      fmap f (X x) = (\y -> case y of (x1,x2) -> X (f x1, (\z -> z) x2)) x
-
-The optimizer should be able to simplify this code by simple inlining.
-
-An older version of the deriving code tried to avoid these applied
-lambda functions by producing a meta level function. But the function to
-be mapped, `f`, is a function on the code level, not on the meta level,
-so it was eta expanded to `\x -> [| f $x |]`. This resulted in too much eta expansion.
-It is better to produce too many lambdas than to eta expand, see ticket #7436.
--}
-
-gen_Functor_binds :: SrcSpan -> TyCon -> (LHsBinds RdrName, BagDerivStuff)
-gen_Functor_binds loc tycon
-  = (unitBag fmap_bind, emptyBag)
-  where
-    data_cons = tyConDataCons tycon
-    fmap_bind = mkRdrFunBind (L loc fmap_RDR) eqns
-
-    fmap_eqn con = evalState (match_for_con [f_Pat] con =<< parts) bs_RDRs
-      where
-        parts = sequence $ foldDataConArgs ft_fmap con
-
-    eqns | null data_cons = [mkSimpleMatch [nlWildPat, nlWildPat]
-                                           (error_Expr "Void fmap")]
-         | otherwise      = map fmap_eqn data_cons
-
-    ft_fmap :: FFoldType (State [RdrName] (LHsExpr RdrName))
-    ft_fmap = FT { ft_triv = mkSimpleLam $ \x -> return x
-                   -- fmap f = \x -> x
-                 , ft_var  = return f_Expr
-                   -- fmap f = f
-                 , ft_fun  = \g h -> do
-                     gg <- g
-                     hh <- h
-                     mkSimpleLam2 $ \x b -> return $
-                       nlHsApp hh (nlHsApp x (nlHsApp gg b))
-                   -- fmap f = \x b -> h (x (g b))
-                 , ft_tup = \t gs -> do
-                     gg <- sequence gs
-                     mkSimpleLam $ mkSimpleTupleCase match_for_con t gg
-                   -- fmap f = \x -> case x of (a1,a2,..) -> (g1 a1,g2 a2,..)
-                 , ft_ty_app = \_ g -> nlHsApp fmap_Expr <$> g
-                   -- fmap f = fmap g
-                 , ft_forall = \_ g -> g
-                 , ft_bad_app = panic "in other argument"
-                 , ft_co_var = panic "contravariant" }
-
-    -- Con a1 a2 ... -> Con (f1 a1) (f2 a2) ...
-    match_for_con :: [LPat RdrName] -> DataCon -> [LHsExpr RdrName]
-                  -> State [RdrName] (LMatch RdrName (LHsExpr RdrName))
-    match_for_con = mkSimpleConMatch $
-        \con_name xs -> return $ nlHsApps con_name xs  -- Con x1 x2 ..
-
-{-
-Utility functions related to Functor deriving.
-
-Since several things use the same pattern of traversal, this is abstracted into functorLikeTraverse.
-This function works like a fold: it makes a value of type 'a' in a bottom up way.
--}
-
--- Generic traversal for Functor deriving
--- See Note [FFoldType and functorLikeTraverse]
-data FFoldType a      -- Describes how to fold over a Type in a functor like way
-   = FT { ft_triv    :: a
-          -- ^ Does not contain variable
-        , ft_var     :: a
-          -- ^ The variable itself
-        , ft_co_var  :: a
-          -- ^ The variable itself, contravariantly
-        , ft_fun     :: a -> a -> a
-          -- ^ Function type
-        , ft_tup     :: TyCon -> [a] -> a
-          -- ^ Tuple type
-        , ft_ty_app  :: Type -> a -> a
-          -- ^ Type app, variable only in last argument
-        , ft_bad_app :: a
-          -- ^ Type app, variable other than in last argument
-        , ft_forall  :: TcTyVar -> a -> a
-          -- ^ Forall type
-     }
-
-functorLikeTraverse :: forall a.
-                       TyVar         -- ^ Variable to look for
-                    -> FFoldType a   -- ^ How to fold
-                    -> Type          -- ^ Type to process
-                    -> a
-functorLikeTraverse var (FT { ft_triv = caseTrivial,     ft_var = caseVar
-                            , ft_co_var = caseCoVar,     ft_fun = caseFun
-                            , ft_tup = caseTuple,        ft_ty_app = caseTyApp
-                            , ft_bad_app = caseWrongArg, ft_forall = caseForAll })
-                    ty
-  = fst (go False ty)
-  where
-    go :: Bool        -- Covariant or contravariant context
-       -> Type
-       -> (a, Bool)   -- (result of type a, does type contain var)
-
-    go co ty | Just ty' <- coreView ty = go co ty'
-    go co (TyVarTy    v) | v == var = (if co then caseCoVar else caseVar,True)
-    go co (ForAllTy (Anon x) y)  | isPredTy x = go co y
-                                 | xc || yc   = (caseFun xr yr,True)
-        where (xr,xc) = go (not co) x
-              (yr,yc) = go co       y
-    go co (AppTy    x y) | xc = (caseWrongArg,   True)
-                         | yc = (caseTyApp x yr, True)
-        where (_, xc) = go co x
-              (yr,yc) = go co y
-    go co ty@(TyConApp con args)
-       | not (or xcs)     = (caseTrivial, False)   -- Variable does not occur
-       -- At this point we know that xrs, xcs is not empty,
-       -- and at least one xr is True
-       | isTupleTyCon con = (caseTuple con xrs, True)
-       | or (init xcs)    = (caseWrongArg, True)         -- T (..var..)    ty
-       | Just (fun_ty, _) <- splitAppTy_maybe ty         -- T (..no var..) ty
-                          = (caseTyApp fun_ty (last xrs), True)
-       | otherwise        = (caseWrongArg, True)   -- Non-decomposable (eg type function)
-       where
-         -- When folding over an unboxed tuple, we must explicitly drop the
-         -- runtime rep arguments, or else GHC will generate twice as many
-         -- variables in a unboxed tuple pattern match and expression as it
-         -- actually needs. See Trac #12399
-         (xrs,xcs) = unzip (map (go co) (dropRuntimeRepArgs args))
-    go _  (ForAllTy (Named _ Visible) _) = panic "unexpected visible binder"
-    go co (ForAllTy (Named v _)       x) | v /= var && xc = (caseForAll v xr,True)
-        where (xr,xc) = go co x
-
-    go _ _ = (caseTrivial,False)
-
--- Return all syntactic subterms of ty that contain var somewhere
--- These are the things that should appear in instance constraints
-deepSubtypesContaining :: TyVar -> Type -> [TcType]
-deepSubtypesContaining tv
-  = functorLikeTraverse tv
-        (FT { ft_triv = []
-            , ft_var = []
-            , ft_fun = (++)
-            , ft_tup = \_ xs -> concat xs
-            , ft_ty_app = (:)
-            , ft_bad_app = panic "in other argument"
-            , ft_co_var = panic "contravariant"
-            , ft_forall = \v xs -> filterOut ((v `elemVarSet`) . tyCoVarsOfType) xs })
-
-
-foldDataConArgs :: FFoldType a -> DataCon -> [a]
--- Fold over the arguments of the datacon
-foldDataConArgs ft con
-  = map foldArg (dataConOrigArgTys con)
-  where
-    foldArg
-      = case getTyVar_maybe (last (tyConAppArgs (dataConOrigResTy con))) of
-             Just tv -> functorLikeTraverse tv ft
-             Nothing -> const (ft_triv ft)
-    -- If we are deriving Foldable for a GADT, there is a chance that the last
-    -- type variable in the data type isn't actually a type variable at all.
-    -- (for example, this can happen if the last type variable is refined to
-    -- be a concrete type such as Int). If the last type variable is refined
-    -- to be a specific type, then getTyVar_maybe will return Nothing.
-    -- See Note [DeriveFoldable with ExistentialQuantification]
-    --
-    -- The kind checks have ensured the last type parameter is of kind *.
-
--- Make a HsLam using a fresh variable from a State monad
-mkSimpleLam :: (LHsExpr RdrName -> State [RdrName] (LHsExpr RdrName))
-            -> State [RdrName] (LHsExpr RdrName)
--- (mkSimpleLam fn) returns (\x. fn(x))
-mkSimpleLam lam = do
-    (n:names) <- get
-    put names
-    body <- lam (nlHsVar n)
-    return (mkHsLam [nlVarPat n] body)
-
-mkSimpleLam2 :: (LHsExpr RdrName -> LHsExpr RdrName
-             -> State [RdrName] (LHsExpr RdrName))
-             -> State [RdrName] (LHsExpr RdrName)
-mkSimpleLam2 lam = do
-    (n1:n2:names) <- get
-    put names
-    body <- lam (nlHsVar n1) (nlHsVar n2)
-    return (mkHsLam [nlVarPat n1,nlVarPat n2] body)
-
--- "Con a1 a2 a3 -> fold [x1 a1, x2 a2, x3 a3]"
---
--- @mkSimpleConMatch fold extra_pats con insides@ produces a match clause in
--- which the LHS pattern-matches on @extra_pats@, followed by a match on the
--- constructor @con@ and its arguments. The RHS folds (with @fold@) over @con@
--- and its arguments, applying an expression (from @insides@) to each of the
--- respective arguments of @con@.
-mkSimpleConMatch :: Monad m => (RdrName -> [LHsExpr RdrName] -> m (LHsExpr RdrName))
-                 -> [LPat RdrName]
-                 -> DataCon
-                 -> [LHsExpr RdrName]
-                 -> m (LMatch RdrName (LHsExpr RdrName))
-mkSimpleConMatch fold extra_pats con insides = do
-    let con_name = getRdrName con
-    let vars_needed = takeList insides as_RDRs
-    let pat = nlConVarPat con_name vars_needed
-    rhs <- fold con_name (zipWith nlHsApp insides (map nlHsVar vars_needed))
-    return $ mkMatch (extra_pats ++ [pat]) rhs (noLoc emptyLocalBinds)
-
--- "Con a1 a2 a3 -> fmap (\b2 -> Con a1 b2 a3) (traverse f a2)"
---
--- @mkSimpleConMatch2 fold extra_pats con insides@ behaves very similarly to
--- 'mkSimpleConMatch', with two key differences:
---
--- 1. @insides@ is a @[Maybe (LHsExpr RdrName)]@ instead of a
---    @[LHsExpr RdrName]@. This is because it filters out the expressions
---    corresponding to arguments whose types do not mention the last type
---    variable in a derived 'Foldable' or 'Traversable' instance (i.e., the
---    'Nothing' elements of @insides@).
---
--- 2. @fold@ takes an expression as its first argument instead of a
---    constructor name. This is because it uses a specialized
---    constructor function expression that only takes as many parameters as
---    there are argument types that mention the last type variable.
---
--- See Note [Generated code for DeriveFoldable and DeriveTraversable]
-mkSimpleConMatch2 :: Monad m
-                  => (LHsExpr RdrName -> [LHsExpr RdrName]
-                                      -> m (LHsExpr RdrName))
-                  -> [LPat RdrName]
-                  -> DataCon
-                  -> [Maybe (LHsExpr RdrName)]
-                  -> m (LMatch RdrName (LHsExpr RdrName))
-mkSimpleConMatch2 fold extra_pats con insides = do
-    let con_name = getRdrName con
-        vars_needed = takeList insides as_RDRs
-        pat = nlConVarPat con_name vars_needed
-        -- Make sure to zip BEFORE invoking catMaybes. We want the variable
-        -- indicies in each expression to match up with the argument indices
-        -- in con_expr (defined below).
-        exps = catMaybes $ zipWith (\i v -> (`nlHsApp` v) <$> i)
-                                   insides (map nlHsVar vars_needed)
-        -- An element of argTysTyVarInfo is True if the constructor argument
-        -- with the same index has a type which mentions the last type
-        -- variable.
-        argTysTyVarInfo = map isJust insides
-        (asWithTyVar, asWithoutTyVar) = partitionByList argTysTyVarInfo as_RDRs
-
-        con_expr
-          | null asWithTyVar = nlHsApps con_name $ map nlHsVar asWithoutTyVar
-          | otherwise =
-              let bs   = filterByList  argTysTyVarInfo bs_RDRs
-                  vars = filterByLists argTysTyVarInfo
-                                       (map nlHsVar bs_RDRs)
-                                       (map nlHsVar as_RDRs)
-              in mkHsLam (map nlVarPat bs) (nlHsApps con_name vars)
-
-    rhs <- fold con_expr exps
-    return $ mkMatch (extra_pats ++ [pat]) rhs (noLoc emptyLocalBinds)
-
--- "case x of (a1,a2,a3) -> fold [x1 a1, x2 a2, x3 a3]"
-mkSimpleTupleCase :: Monad m => ([LPat RdrName] -> DataCon -> [a]
-                                 -> m (LMatch RdrName (LHsExpr RdrName)))
-                  -> TyCon -> [a] -> LHsExpr RdrName -> m (LHsExpr RdrName)
-mkSimpleTupleCase match_for_con tc insides x
-  = do { let data_con = tyConSingleDataCon tc
-       ; match <- match_for_con [] data_con insides
-       ; return $ nlHsCase x [match] }
-
-{-
-************************************************************************
-*                                                                      *
-                        Foldable instances
-
- see http://www.mail-archive.com/haskell-prime@haskell.org/msg02116.html
-
-*                                                                      *
-************************************************************************
-
-Deriving Foldable instances works the same way as Functor instances,
-only Foldable instances are not possible for function types at all.
-Given (data T a = T a a (T a) deriving Foldable), we get:
-
-  instance Foldable T where
-      foldr f z (T1 x1 x2 x3) =
-        $(foldr 'a 'a) x1 ( $(foldr 'a 'a) x2 ( $(foldr 'a '(T a)) x3 z ) )
-
--XDeriveFoldable is different from -XDeriveFunctor in that it filters out
-arguments to the constructor that would produce useless code in a Foldable
-instance. For example, the following datatype:
-
-  data Foo a = Foo Int a Int deriving Foldable
-
-would have the following generated Foldable instance:
-
-  instance Foldable Foo where
-    foldr f z (Foo x1 x2 x3) = $(foldr 'a 'a) x2
-
-since neither of the two Int arguments are folded over.
-
-The cases are:
-
-  $(foldr 'a 'a)         =  f
-  $(foldr 'a '(b1,b2))   =  \x z -> case x of (x1,x2) -> $(foldr 'a 'b1) x1 ( $(foldr 'a 'b2) x2 z )
-  $(foldr 'a '(T b1 b2)) =  \x z -> foldr $(foldr 'a 'b2) z x  -- when a only occurs in the last parameter, b2
-
-Note that the arguments to the real foldr function are the wrong way around,
-since (f :: a -> b -> b), while (foldr f :: b -> t a -> b).
-
-One can envision a case for types that don't contain the last type variable:
-
-  $(foldr 'a 'b)         =  \x z -> z     -- when b does not contain a
-
-But this case will never materialize, since the aforementioned filtering
-removes all such types from consideration.
-See Note [Generated code for DeriveFoldable and DeriveTraversable].
-
-Foldable instances differ from Functor and Traversable instances in that
-Foldable instances can be derived for data types in which the last type
-variable is existentially quantified. In particular, if the last type variable
-is refined to a more specific type in a GADT:
-
-  data GADT a where
-      G :: a ~ Int => a -> G Int
-
-then the deriving machinery does not attempt to check that the type a contains
-Int, since it is not syntactically equal to a type variable. That is, the
-derived Foldable instance for GADT is:
-
-  instance Foldable GADT where
-      foldr _ z (GADT _) = z
-
-See Note [DeriveFoldable with ExistentialQuantification].
-
--}
-
-gen_Foldable_binds :: SrcSpan -> TyCon -> (LHsBinds RdrName, BagDerivStuff)
-gen_Foldable_binds loc tycon
-  = (listToBag [foldr_bind, foldMap_bind], emptyBag)
-  where
-    data_cons = tyConDataCons tycon
-
-    foldr_bind = mkRdrFunBind (L loc foldable_foldr_RDR) eqns
-    eqns = map foldr_eqn data_cons
-    foldr_eqn con
-      = evalState (match_foldr z_Expr [f_Pat,z_Pat] con =<< parts) bs_RDRs
-      where
-        parts = sequence $ foldDataConArgs ft_foldr con
-
-    foldMap_bind = mkRdrFunBind (L loc foldMap_RDR) (map foldMap_eqn data_cons)
-    foldMap_eqn con
-      = evalState (match_foldMap [f_Pat] con =<< parts) bs_RDRs
-      where
-        parts = sequence $ foldDataConArgs ft_foldMap con
-
-    -- Yields 'Just' an expression if we're folding over a type that mentions
-    -- the last type parameter of the datatype. Otherwise, yields 'Nothing'.
-    -- See Note [FFoldType and functorLikeTraverse]
-    ft_foldr :: FFoldType (State [RdrName] (Maybe (LHsExpr RdrName)))
-    ft_foldr
-      = FT { ft_triv    = return Nothing
-             -- foldr f = \x z -> z
-           , ft_var     = return $ Just f_Expr
-             -- foldr f = f
-           , ft_tup     = \t g -> do
-               gg  <- sequence g
-               lam <- mkSimpleLam2 $ \x z ->
-                 mkSimpleTupleCase (match_foldr z) t gg x
-               return (Just lam)
-             -- foldr f = (\x z -> case x of ...)
-           , ft_ty_app  = \_ g -> do
-               gg <- g
-               mapM (\gg' -> mkSimpleLam2 $ \x z -> return $
-                 nlHsApps foldable_foldr_RDR [gg',z,x]) gg
-             -- foldr f = (\x z -> foldr g z x)
-           , ft_forall  = \_ g -> g
-           , ft_co_var  = panic "contravariant"
-           , ft_fun     = panic "function"
-           , ft_bad_app = panic "in other argument" }
-
-    match_foldr :: LHsExpr RdrName
-                -> [LPat RdrName]
-                -> DataCon
-                -> [Maybe (LHsExpr RdrName)]
-                -> State [RdrName] (LMatch RdrName (LHsExpr RdrName))
-    match_foldr z = mkSimpleConMatch2 $ \_ xs -> return (mkFoldr xs)
-      where
-        -- g1 v1 (g2 v2 (.. z))
-        mkFoldr :: [LHsExpr RdrName] -> LHsExpr RdrName
-        mkFoldr = foldr nlHsApp z
-
-    -- See Note [FFoldType and functorLikeTraverse]
-    ft_foldMap :: FFoldType (State [RdrName] (Maybe (LHsExpr RdrName)))
-    ft_foldMap
-      = FT { ft_triv = return Nothing
-             -- foldMap f = \x -> mempty
-           , ft_var  = return (Just f_Expr)
-             -- foldMap f = f
-           , ft_tup  = \t g -> do
-               gg  <- sequence g
-               lam <- mkSimpleLam $ mkSimpleTupleCase match_foldMap t gg
-               return (Just lam)
-             -- foldMap f = \x -> case x of (..,)
-           , ft_ty_app = \_ g -> fmap (nlHsApp foldMap_Expr) <$> g
-             -- foldMap f = foldMap g
-           , ft_forall = \_ g -> g
-           , ft_co_var = panic "contravariant"
-           , ft_fun = panic "function"
-           , ft_bad_app = panic "in other argument" }
-
-    match_foldMap :: [LPat RdrName]
-                  -> DataCon
-                  -> [Maybe (LHsExpr RdrName)]
-                  -> State [RdrName] (LMatch RdrName (LHsExpr RdrName))
-    match_foldMap = mkSimpleConMatch2 $ \_ xs -> return (mkFoldMap xs)
-      where
-        -- mappend v1 (mappend v2 ..)
-        mkFoldMap :: [LHsExpr RdrName] -> LHsExpr RdrName
-        mkFoldMap [] = mempty_Expr
-        mkFoldMap xs = foldr1 (\x y -> nlHsApps mappend_RDR [x,y]) xs
-
-{-
-************************************************************************
-*                                                                      *
-                        Traversable instances
-
- see http://www.mail-archive.com/haskell-prime@haskell.org/msg02116.html
-*                                                                      *
-************************************************************************
-
-Again, Traversable is much like Functor and Foldable.
-
-The cases are:
-
-  $(traverse 'a 'a)          =  f
-  $(traverse 'a '(b1,b2))    =  \x -> case x of (x1,x2) -> (,) <$> $(traverse 'a 'b1) x1 <*> $(traverse 'a 'b2) x2
-  $(traverse 'a '(T b1 b2))  =  traverse $(traverse 'a 'b2)  -- when a only occurs in the last parameter, b2
-
-Like -XDeriveFoldable, -XDeriveTraversable filters out arguments whose types
-do not mention the last type parameter. Therefore, the following datatype:
-
-  data Foo a = Foo Int a Int
-
-would have the following derived Traversable instance:
-
-  instance Traversable Foo where
-    traverse f (Foo x1 x2 x3) =
-      fmap (\b2 -> Foo x1 b2 x3) ( $(traverse 'a 'a) x2 )
-
-since the two Int arguments do not produce any effects in a traversal.
-
-One can envision a case for types that do not mention the last type parameter:
-
-  $(traverse 'a 'b)          =  pure     -- when b does not contain a
-
-But this case will never materialize, since the aforementioned filtering
-removes all such types from consideration.
-See Note [Generated code for DeriveFoldable and DeriveTraversable].
--}
-
-gen_Traversable_binds :: SrcSpan -> TyCon -> (LHsBinds RdrName, BagDerivStuff)
-gen_Traversable_binds loc tycon
-  = (unitBag traverse_bind, emptyBag)
-  where
-    data_cons = tyConDataCons tycon
-
-    traverse_bind = mkRdrFunBind (L loc traverse_RDR) eqns
-    eqns = map traverse_eqn data_cons
-    traverse_eqn con
-      = evalState (match_for_con [f_Pat] con =<< parts) bs_RDRs
-      where
-        parts = sequence $ foldDataConArgs ft_trav con
-
-    -- Yields 'Just' an expression if we're folding over a type that mentions
-    -- the last type parameter of the datatype. Otherwise, yields 'Nothing'.
-    -- See Note [FFoldType and functorLikeTraverse]
-    ft_trav :: FFoldType (State [RdrName] (Maybe (LHsExpr RdrName)))
-    ft_trav
-      = FT { ft_triv    = return Nothing
-             -- traverse f = pure x
-           , ft_var     = return (Just f_Expr)
-             -- traverse f = f x
-           , ft_tup     = \t gs -> do
-               gg  <- sequence gs
-               lam <- mkSimpleLam $ mkSimpleTupleCase match_for_con t gg
-               return (Just lam)
-             -- traverse f = \x -> case x of (a1,a2,..) ->
-             --                           (,,) <$> g1 a1 <*> g2 a2 <*> ..
-           , ft_ty_app  = \_ g -> fmap (nlHsApp traverse_Expr) <$> g
-             -- traverse f = traverse g
-           , ft_forall  = \_ g -> g
-           , ft_co_var  = panic "contravariant"
-           , ft_fun     = panic "function"
-           , ft_bad_app = panic "in other argument" }
-
-    -- Con a1 a2 ... -> fmap (\b1 b2 ... -> Con b1 b2 ...) (g1 a1)
-    --                    <*> g2 a2 <*> ...
-    match_for_con :: [LPat RdrName]
-                  -> DataCon
-                  -> [Maybe (LHsExpr RdrName)]
-                  -> State [RdrName] (LMatch RdrName (LHsExpr RdrName))
-    match_for_con = mkSimpleConMatch2 $ \con xs -> return (mkApCon con xs)
-      where
-        -- fmap (\b1 b2 ... -> Con b1 b2 ...) x1 <*> x2 <*> ..
-        mkApCon :: LHsExpr RdrName -> [LHsExpr RdrName] -> LHsExpr RdrName
-        mkApCon con [] = nlHsApps pure_RDR [con]
-        mkApCon con (x:xs) = foldl appAp (nlHsApps fmap_RDR [con,x]) xs
-          where appAp x y = nlHsApps ap_RDR [x,y]
-
-{-
-************************************************************************
-*                                                                      *
                         Lift instances
 *                                                                      *
 ************************************************************************
@@ -2073,15 +1510,16 @@ Example:
 
 Note that (mkNameG_d "package-name" "ModuleName" "Foo") is equivalent to what
 'Foo would be when using the -XTemplateHaskell extension. To make sure that
--XDeriveLift can be used on stage-1 compilers, however, we expliticly invoke
+-XDeriveLift can be used on stage-1 compilers, however, we explicitly invoke
 makeG_d.
 -}
 
 gen_Lift_binds :: SrcSpan -> TyCon -> (LHsBinds RdrName, BagDerivStuff)
 gen_Lift_binds loc tycon
   | null data_cons = (unitBag (L loc $ mkFunBind (L loc lift_RDR)
-                       [mkMatch [nlWildPat] errorMsg_Expr
-                                            (noLoc emptyLocalBinds)])
+                       [mkMatch (mkPrefixFunRhs (L loc lift_RDR))
+                                        [nlWildPat] errorMsg_Expr
+                                        (noLoc emptyLocalBinds)])
                      , emptyBag)
   | otherwise = (unitBag lift_bind, emptyBag)
   where
@@ -2149,48 +1587,84 @@ coercing from.  So from, say,
   newtype T x = MkT <rep-ty>
 
   instance C a <rep-ty> => C a (T x) where
-    op = (coerce
-             (op :: a -> [<rep-ty>] -> Int)
-         ) :: a -> [T x] -> Int
+    op = coerce @ (a -> [<rep-ty>] -> Int)
+                @ (a -> [T x]      -> Int)
+                op
 
 Notice that we give the 'coerce' two explicitly-visible type arguments
 to say how it should be instantiated.  Recall
 
+  coerce :: Coeercible a b => a -> b
+
+By giving it explicit type arguments we deal with the case where
+'op' has a higher rank type, and so we must instantiate 'coerce' with
+a polytype.  E.g.
+   class C a where op :: forall b. a -> b -> b
+   newtype T x = MkT <rep-ty>
+   instance C <rep-ty> => C (T x) where
+     op = coerce @ (forall b. <rep-ty> -> b -> b)
+                 @ (forall b. T x -> b -> b)
+                op
+
+The type checker checks this code, and it currently requires
+-XImpredicativeTypes to permit that polymorphic type instantiation,
+so we have to switch that flag on locally in TcDeriv.genInst.
+
 See #8503 for more discussion.
 
-Here's a wrinkle. Supppose 'op' is locally overloaded:
+Note [Newtype-deriving trickiness]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider (Trac #12768):
+  class C a where { op :: D a => a -> a }
 
-  class C2 b where
-    op2 :: forall a. Eq a => a -> [b] -> Int
+  instance C a  => C [a] where { op = opList }
 
-Then we could do exactly as above, but it's a bit redundant to
-instantiate op, then re-generalise with the inner signature.
-(The inner sig is only there to fix the type at which 'op' is
-called.)  So we just instantiate the signature, and add
+  opList :: (C a, D [a]) => [a] -> [a]
+  opList = ...
 
-  instance C2 <rep-ty> => C2 (T x) where
-    op2 = (coerce
-             (op2 :: a -> [<rep-ty>] -> Int)
-          ) :: forall a. Eq a => a -> [T x] -> Int
+Now suppose we try GND on this:
+  newtype N a = MkN [a] deriving( C )
+
+The GND is expecting to get an implementation of op for N by
+coercing opList, thus:
+
+  instance C a => C (N a) where { op = opN }
+
+  opN :: (C a, D (N a)) => N a -> N a
+  opN = coerce @(D [a]   => [a] -> [a])
+               @(D (N a) => [N a] -> [N a]
+               opList
+
+But there is no reason to suppose that (D [a]) and (D (N a))
+are inter-coercible; these instances might completely different.
+So GHC rightly rejects this code.
 -}
 
 gen_Newtype_binds :: SrcSpan
                   -> Class   -- the class being derived
-                  -> [TyVar] -- the tvs in the instance head
+                  -> [TyVar] -- the tvs in the instance head (this includes
+                             -- the tvs from both the class types and the
+                             -- newtype itself)
                   -> [Type]  -- instance head parameters (incl. newtype)
-                  -> Type    -- the representation type (already eta-reduced)
-                  -> LHsBinds RdrName
+                  -> Type    -- the representation type
+                  -> TcM (LHsBinds RdrName, BagDerivStuff)
 -- See Note [Newtype-deriving instances]
-gen_Newtype_binds loc cls inst_tvs cls_tys rhs_ty
-  = listToBag $ map mk_bind (classMethods cls)
+gen_Newtype_binds loc cls inst_tvs inst_tys rhs_ty
+  = do let ats = classATs cls
+       atf_insts <- ASSERT( all (not . isDataFamilyTyCon) ats )
+                    mapM mk_atf_inst ats
+       return ( listToBag $ map mk_bind (classMethods cls)
+              , listToBag $ map DerivFamInst atf_insts )
   where
     coerce_RDR = getRdrName coerceId
 
     mk_bind :: Id -> LHsBind RdrName
     mk_bind meth_id
-      = mkRdrFunBind (L loc meth_RDR) [mkSimpleMatch [] rhs_expr]
+      = mkRdrFunBind (L loc meth_RDR) [mkSimpleMatch
+                                          (mkPrefixFunRhs (L loc meth_RDR))
+                                          [] rhs_expr]
       where
-        Pair from_ty to_ty = mkCoerceClassMethEqn cls inst_tvs cls_tys rhs_ty meth_id
+        Pair from_ty to_ty = mkCoerceClassMethEqn cls inst_tvs inst_tys rhs_ty meth_id
 
         meth_RDR = getRdrName meth_id
 
@@ -2198,10 +1672,36 @@ gen_Newtype_binds loc cls inst_tvs cls_tys rhs_ty
                                       `nlHsAppType` to_ty
                                       `nlHsApp`     nlHsVar meth_RDR
 
+    mk_atf_inst :: TyCon -> TcM FamInst
+    mk_atf_inst fam_tc = do
+        rep_tc_name <- newFamInstTyConName (L loc (tyConName fam_tc))
+                                           rep_lhs_tys
+        let axiom = mkSingleCoAxiom Nominal rep_tc_name rep_tvs' rep_cvs'
+                                    fam_tc rep_lhs_tys rep_rhs_ty
+        -- Check (c) from Note [GND and associated type families] in TcDeriv
+        checkValidTyFamEqn (Just (cls, cls_tvs, lhs_env)) fam_tc rep_tvs'
+                           rep_cvs' rep_lhs_tys rep_rhs_ty loc
+        newFamInst SynFamilyInst axiom
+      where
+        cls_tvs     = classTyVars cls
+        in_scope    = mkInScopeSet $ mkVarSet inst_tvs
+        lhs_env     = zipTyEnv cls_tvs inst_tys
+        lhs_subst   = mkTvSubst in_scope lhs_env
+        rhs_env     = zipTyEnv cls_tvs $ changeLast inst_tys rhs_ty
+        rhs_subst   = mkTvSubst in_scope rhs_env
+        fam_tvs     = tyConTyVars fam_tc
+        rep_lhs_tys = substTyVars lhs_subst fam_tvs
+        rep_rhs_tys = substTyVars rhs_subst fam_tvs
+        rep_rhs_ty  = mkTyConApp fam_tc rep_rhs_tys
+        rep_tcvs    = tyCoVarsOfTypesList rep_lhs_tys
+        (rep_tvs, rep_cvs) = partition isTyVar rep_tcvs
+        rep_tvs'    = toposortTyVars rep_tvs
+        rep_cvs'    = toposortTyVars rep_cvs
+
 nlHsAppType :: LHsExpr RdrName -> Type -> LHsExpr RdrName
 nlHsAppType e s = noLoc (e `HsAppType` hs_ty)
   where
-    hs_ty = mkHsWildCardBndrs (typeToLHsType s)
+    hs_ty = mkHsWildCardBndrs $ nlHsParTy (typeToLHsType s)
 
 nlExprWithTySig :: LHsExpr RdrName -> Type -> LHsExpr RdrName
 nlExprWithTySig e s = noLoc (e `ExprWithTySig` hs_ty)
@@ -2209,29 +1709,27 @@ nlExprWithTySig e s = noLoc (e `ExprWithTySig` hs_ty)
     hs_ty = mkLHsSigWcType (typeToLHsType s)
 
 mkCoerceClassMethEqn :: Class   -- the class being derived
-                     -> [TyVar] -- the tvs in the instance head
+                     -> [TyVar] -- the tvs in the instance head (this includes
+                                -- the tvs from both the class types and the
+                                -- newtype itself)
                      -> [Type]  -- instance head parameters (incl. newtype)
-                     -> Type    -- the representation type (already eta-reduced)
+                     -> Type    -- the representation type
                      -> Id      -- the method to look at
                      -> Pair Type
 -- See Note [Newtype-deriving instances]
+-- See also Note [Newtype-deriving trickiness]
 -- The pair is the (from_type, to_type), where to_type is
 -- the type of the method we are tyrying to get
-mkCoerceClassMethEqn cls inst_tvs cls_tys rhs_ty id
+mkCoerceClassMethEqn cls inst_tvs inst_tys rhs_ty id
   = Pair (substTy rhs_subst user_meth_ty)
          (substTy lhs_subst user_meth_ty)
   where
     cls_tvs = classTyVars cls
     in_scope = mkInScopeSet $ mkVarSet inst_tvs
-    lhs_subst = mkTvSubst in_scope (zipTyEnv cls_tvs cls_tys)
-    rhs_subst = mkTvSubst in_scope (zipTyEnv cls_tvs (changeLast cls_tys rhs_ty))
+    lhs_subst = mkTvSubst in_scope (zipTyEnv cls_tvs inst_tys)
+    rhs_subst = mkTvSubst in_scope (zipTyEnv cls_tvs (changeLast inst_tys rhs_ty))
     (_class_tvs, _class_constraint, user_meth_ty)
       = tcSplitMethodTy (varType id)
-
-    changeLast :: [a] -> a -> [a]
-    changeLast []     _  = panic "changeLast"
-    changeLast [_]    x  = [x]
-    changeLast (x:xs) x' = x : changeLast xs x'
 
 {-
 ************************************************************************
@@ -2252,12 +1750,13 @@ The `tags' here start at zero, hence the @fIRST_TAG@ (currently one)
 fiddling around.
 -}
 
-genAuxBindSpec :: SrcSpan -> AuxBindSpec -> (LHsBind RdrName, LSig RdrName)
-genAuxBindSpec loc (DerivCon2Tag tycon)
+genAuxBindSpec :: DynFlags -> SrcSpan -> AuxBindSpec
+                  -> (LHsBind RdrName, LSig RdrName)
+genAuxBindSpec dflags loc (DerivCon2Tag tycon)
   = (mk_FunBind loc rdr_name eqns,
      L loc (TypeSig [L loc rdr_name] sig_ty))
   where
-    rdr_name = con2tag_RDR tycon
+    rdr_name = con2tag_RDR dflags tycon
 
     sig_ty = mkLHsSigWcType $ L loc $ HsCoreTy $
              mkSpecSigmaTy (tyConTyVars tycon) (tyConStupidTheta tycon) $
@@ -2274,10 +1773,10 @@ genAuxBindSpec loc (DerivCon2Tag tycon)
 
     mk_eqn :: DataCon -> ([LPat RdrName], LHsExpr RdrName)
     mk_eqn con = ([nlWildConPat con],
-                  nlHsLit (HsIntPrim ""
+                  nlHsLit (HsIntPrim NoSourceText
                                     (toInteger ((dataConTag con) - fIRST_TAG))))
 
-genAuxBindSpec loc (DerivTag2Con tycon)
+genAuxBindSpec dflags loc (DerivTag2Con tycon)
   = (mk_FunBind loc rdr_name
         [([nlConVarPat intDataCon_RDR [a_RDR]],
            nlHsApp (nlHsVar tagToEnum_RDR) a_Expr)],
@@ -2287,26 +1786,27 @@ genAuxBindSpec loc (DerivTag2Con tycon)
              HsCoreTy $ mkSpecForAllTys (tyConTyVars tycon) $
              intTy `mkFunTy` mkParentType tycon
 
-    rdr_name = tag2con_RDR tycon
+    rdr_name = tag2con_RDR dflags tycon
 
-genAuxBindSpec loc (DerivMaxTag tycon)
+genAuxBindSpec dflags loc (DerivMaxTag tycon)
   = (mkHsVarBind loc rdr_name rhs,
      L loc (TypeSig [L loc rdr_name] sig_ty))
   where
-    rdr_name = maxtag_RDR tycon
+    rdr_name = maxtag_RDR dflags tycon
     sig_ty = mkLHsSigWcType (L loc (HsCoreTy intTy))
-    rhs = nlHsApp (nlHsVar intDataCon_RDR) (nlHsLit (HsIntPrim "" max_tag))
+    rhs = nlHsApp (nlHsVar intDataCon_RDR)
+                  (nlHsLit (HsIntPrim NoSourceText max_tag))
     max_tag =  case (tyConDataCons tycon) of
                  data_cons -> toInteger ((length data_cons) - fIRST_TAG)
 
-type SeparateBagsDerivStuff = -- AuxBinds and SYB bindings
-                              ( Bag (LHsBind RdrName, LSig RdrName)
-                                -- Extra bindings (used by Generic only)
-                              , Bag (FamInst)           -- Extra family instances
-                              , Bag (InstInfo RdrName)) -- Extra instances
+type SeparateBagsDerivStuff =
+  -- AuxBinds and SYB bindings
+  ( Bag (LHsBind RdrName, LSig RdrName)
+  -- Extra family instances (used by Generic and DeriveAnyClass)
+  , Bag (FamInst) )
 
-genAuxBinds :: SrcSpan -> BagDerivStuff -> SeparateBagsDerivStuff
-genAuxBinds loc b = genAuxBinds' b2 where
+genAuxBinds :: DynFlags -> SrcSpan -> BagDerivStuff -> SeparateBagsDerivStuff
+genAuxBinds dflags loc b = genAuxBinds' b2 where
   (b1,b2) = partitionBagWith splitDerivAuxBind b
   splitDerivAuxBind (DerivAuxBind x) = Left x
   splitDerivAuxBind  x               = Right x
@@ -2315,23 +1815,15 @@ genAuxBinds loc b = genAuxBinds' b2 where
   dup_check a b = if anyBag (== a) b then b else consBag a b
 
   genAuxBinds' :: BagDerivStuff -> SeparateBagsDerivStuff
-  genAuxBinds' = foldrBag f ( mapBag (genAuxBindSpec loc) (rm_dups b1)
-                            , emptyBag, emptyBag)
+  genAuxBinds' = foldrBag f ( mapBag (genAuxBindSpec dflags loc) (rm_dups b1)
+                            , emptyBag )
   f :: DerivStuff -> SeparateBagsDerivStuff -> SeparateBagsDerivStuff
   f (DerivAuxBind _) = panic "genAuxBinds'" -- We have removed these before
   f (DerivHsBind  b) = add1 b
   f (DerivFamInst t) = add2 t
-  f (DerivInst    i) = add3 i
 
-  add1 x (a,b,c) = (x `consBag` a,b,c)
-  add2 x (a,b,c) = (a,x `consBag` b,c)
-  add3 x (a,b,c) = (a,b,x `consBag` c)
-
-mk_data_type_name :: TyCon -> RdrName   -- "$tT"
-mk_data_type_name tycon = mkAuxBinderName (tyConName tycon) mkDataTOcc
-
-mk_constr_name :: DataCon -> RdrName    -- "$cC"
-mk_constr_name con = mkAuxBinderName (dataConName con) mkDataCOcc
+  add1 x (a,b) = (x `consBag` a,b)
+  add2 x (a,b) = (a,x `consBag` b)
 
 mkParentType :: TyCon -> Type
 -- Turn the representation tycon of a family into
@@ -2365,7 +1857,9 @@ mk_HRFunBind :: Arity -> SrcSpan -> RdrName
 mk_HRFunBind arity loc fun pats_and_exprs
   = mkHRRdrFunBind arity (L loc fun) matches
   where
-    matches = [mkMatch p e (noLoc emptyLocalBinds) | (p,e) <-pats_and_exprs]
+    matches = [mkMatch (mkPrefixFunRhs (L loc fun)) p e
+                               (noLoc emptyLocalBinds)
+              | (p,e) <-pats_and_exprs]
 
 mkRdrFunBind :: Located RdrName -> [LMatch RdrName (LHsExpr RdrName)] -> LHsBind RdrName
 mkRdrFunBind = mkHRRdrFunBind 0
@@ -2379,7 +1873,8 @@ mkHRRdrFunBind arity fun@(L loc fun_rdr) matches = L loc (mkFunBind fun matches'
    -- which can happen with -XEmptyDataDecls
    -- See Trac #4302
    matches' = if null matches
-              then [mkMatch (replicate arity nlWildPat)
+              then [mkMatch (mkPrefixFunRhs fun)
+                            (replicate arity nlWildPat)
                             (error_Expr str) (noLoc emptyLocalBinds)]
               else matches
    str = "Void " ++ occNameString (rdrNameOcc fun_rdr)
@@ -2491,11 +1986,13 @@ eq_Expr tycon ty a b
  where
    (_, _, prim_eq, _, _) = primOrdOps "Eq" tycon ty
 
-untag_Expr :: TyCon -> [( RdrName,  RdrName)] -> LHsExpr RdrName -> LHsExpr RdrName
-untag_Expr _ [] expr = expr
-untag_Expr tycon ((untag_this, put_tag_here) : more) expr
-  = nlHsCase (nlHsPar (nlHsVarApps (con2tag_RDR tycon) [untag_this])) {-of-}
-      [mkSimpleHsAlt (nlVarPat put_tag_here) (untag_Expr tycon more expr)]
+untag_Expr :: DynFlags -> TyCon -> [( RdrName,  RdrName)]
+              -> LHsExpr RdrName -> LHsExpr RdrName
+untag_Expr _ _ [] expr = expr
+untag_Expr dflags tycon ((untag_this, put_tag_here) : more) expr
+  = nlHsCase (nlHsPar (nlHsVarApps (con2tag_RDR dflags tycon)
+                                   [untag_this])) {-of-}
+      [mkHsCaseAlt (nlVarPat put_tag_here) (untag_Expr dflags tycon more expr)]
 
 enum_from_to_Expr
         :: LHsExpr RdrName -> LHsExpr RdrName
@@ -2582,31 +2079,22 @@ as_RDRs         = [ mkVarUnqual (mkFastString ("a"++show i)) | i <- [(1::Int) ..
 bs_RDRs         = [ mkVarUnqual (mkFastString ("b"++show i)) | i <- [(1::Int) .. ] ]
 cs_RDRs         = [ mkVarUnqual (mkFastString ("c"++show i)) | i <- [(1::Int) .. ] ]
 
-a_Expr, c_Expr, f_Expr, z_Expr, ltTag_Expr, eqTag_Expr, gtTag_Expr,
-    false_Expr, true_Expr, fmap_Expr,
-    mempty_Expr, foldMap_Expr, traverse_Expr :: LHsExpr RdrName
+a_Expr, b_Expr, c_Expr, ltTag_Expr, eqTag_Expr, gtTag_Expr, false_Expr,
+    true_Expr :: LHsExpr RdrName
 a_Expr          = nlHsVar a_RDR
--- b_Expr       = nlHsVar b_RDR
+b_Expr          = nlHsVar b_RDR
 c_Expr          = nlHsVar c_RDR
-f_Expr          = nlHsVar f_RDR
-z_Expr          = nlHsVar z_RDR
 ltTag_Expr      = nlHsVar ltTag_RDR
 eqTag_Expr      = nlHsVar eqTag_RDR
 gtTag_Expr      = nlHsVar gtTag_RDR
 false_Expr      = nlHsVar false_RDR
 true_Expr       = nlHsVar true_RDR
-fmap_Expr       = nlHsVar fmap_RDR
--- pure_Expr       = nlHsVar pure_RDR
-mempty_Expr     = nlHsVar mempty_RDR
-foldMap_Expr    = nlHsVar foldMap_RDR
-traverse_Expr   = nlHsVar traverse_RDR
 
-a_Pat, b_Pat, c_Pat, d_Pat, f_Pat, k_Pat, z_Pat :: LPat RdrName
+a_Pat, b_Pat, c_Pat, d_Pat, k_Pat, z_Pat :: LPat RdrName
 a_Pat           = nlVarPat a_RDR
 b_Pat           = nlVarPat b_RDR
 c_Pat           = nlVarPat c_RDR
 d_Pat           = nlVarPat d_RDR
-f_Pat           = nlVarPat f_RDR
 k_Pat           = nlVarPat k_RDR
 z_Pat           = nlVarPat z_RDR
 
@@ -2614,30 +2102,31 @@ minusInt_RDR, tagToEnum_RDR :: RdrName
 minusInt_RDR  = getRdrName (primOpId IntSubOp   )
 tagToEnum_RDR = getRdrName (primOpId TagToEnumOp)
 
-con2tag_RDR, tag2con_RDR, maxtag_RDR :: TyCon -> RdrName
+con2tag_RDR, tag2con_RDR, maxtag_RDR :: DynFlags -> TyCon -> RdrName
 -- Generates Orig s RdrName, for the binding positions
-con2tag_RDR tycon = mk_tc_deriv_name tycon mkCon2TagOcc
-tag2con_RDR tycon = mk_tc_deriv_name tycon mkTag2ConOcc
-maxtag_RDR  tycon = mk_tc_deriv_name tycon mkMaxTagOcc
+con2tag_RDR dflags tycon = mk_tc_deriv_name dflags tycon mkCon2TagOcc
+tag2con_RDR dflags tycon = mk_tc_deriv_name dflags tycon mkTag2ConOcc
+maxtag_RDR  dflags tycon = mk_tc_deriv_name dflags tycon mkMaxTagOcc
 
-mk_tc_deriv_name :: TyCon -> (OccName -> OccName) -> RdrName
-mk_tc_deriv_name tycon occ_fun = mkAuxBinderName (tyConName tycon) occ_fun
+mk_tc_deriv_name :: DynFlags -> TyCon -> (OccName -> OccName) -> RdrName
+mk_tc_deriv_name dflags tycon occ_fun =
+   mkAuxBinderName dflags (tyConName tycon) occ_fun
 
-mkAuxBinderName :: Name -> (OccName -> OccName) -> RdrName
+mkAuxBinderName :: DynFlags -> Name -> (OccName -> OccName) -> RdrName
 -- ^ Make a top-level binder name for an auxiliary binding for a parent name
 -- See Note [Auxiliary binders]
-mkAuxBinderName parent occ_fun
+mkAuxBinderName dflags parent occ_fun
   = mkRdrUnqual (occ_fun stable_parent_occ)
   where
     stable_parent_occ = mkOccName (occNameSpace parent_occ) stable_string
     stable_string
-      | opt_PprStyle_Debug = parent_stable
-      | otherwise = parent_stable_hash
+      | hasPprDebug dflags = parent_stable
+      | otherwise          = parent_stable_hash
     parent_stable = nameStableString parent
     parent_stable_hash =
       let Fingerprint high low = fingerprintString parent_stable
       in toBase62 high ++ toBase62Padded low
-      -- See Note [Base 62 encoding 128-bit integers]
+      -- See Note [Base 62 encoding 128-bit integers] in Encoding
     parent_occ  = nameOccName parent
 
 
@@ -2663,235 +2152,4 @@ To make the symbol names short we take a base62 hash of the full name.
 
 In the past we used the *unique* from the parent, but that's not stable across
 recompilations as uniques are nondeterministic.
-
-Note [DeriveFoldable with ExistentialQuantification]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Functor and Traversable instances can only be derived for data types whose
-last type parameter is truly universally polymorphic. For example:
-
-  data T a b where
-    T1 ::                 b   -> T a b   -- YES, b is unconstrained
-    T2 :: Ord b   =>      b   -> T a b   -- NO, b is constrained by (Ord b)
-    T3 :: b ~ Int =>      b   -> T a b   -- NO, b is constrained by (b ~ Int)
-    T4 ::                 Int -> T a Int -- NO, this is just like T3
-    T5 :: Ord a   => a -> b   -> T a b   -- YES, b is unconstrained, even
-                                         -- though a is existential
-    T6 ::                 Int -> T Int b -- YES, b is unconstrained
-
-For Foldable instances, however, we can completely lift the constraint that
-the last type parameter be truly universally polymorphic. This means that T
-(as defined above) can have a derived Foldable instance:
-
-  instance Foldable (T a) where
-    foldr f z (T1 b)   = f b z
-    foldr f z (T2 b)   = f b z
-    foldr f z (T3 b)   = f b z
-    foldr f z (T4 b)   = z
-    foldr f z (T5 a b) = f b z
-    foldr f z (T6 a)   = z
-
-    foldMap f (T1 b)   = f b
-    foldMap f (T2 b)   = f b
-    foldMap f (T3 b)   = f b
-    foldMap f (T4 b)   = mempty
-    foldMap f (T5 a b) = f b
-    foldMap f (T6 a)   = mempty
-
-In a Foldable instance, it is safe to fold over an occurrence of the last type
-parameter that is not truly universally polymorphic. However, there is a bit
-of subtlety in determining what is actually an occurrence of a type parameter.
-T3 and T4, as defined above, provide one example:
-
-  data T a b where
-    ...
-    T3 :: b ~ Int => b   -> T a b
-    T4 ::            Int -> T a Int
-    ...
-
-  instance Foldable (T a) where
-    ...
-    foldr f z (T3 b) = f b z
-    foldr f z (T4 b) = z
-    ...
-    foldMap f (T3 b) = f b
-    foldMap f (T4 b) = mempty
-    ...
-
-Notice that the argument of T3 is folded over, whereas the argument of T4 is
-not. This is because we only fold over constructor arguments that
-syntactically mention the universally quantified type parameter of that
-particular data constructor. See foldDataConArgs for how this is implemented.
-
-As another example, consider the following data type. The argument of each
-constructor has the same type as the last type parameter:
-
-  data E a where
-    E1 :: (a ~ Int) => a   -> E a
-    E2 ::              Int -> E Int
-    E3 :: (a ~ Int) => a   -> E Int
-    E4 :: (a ~ Int) => Int -> E a
-
-Only E1's argument is an occurrence of a universally quantified type variable
-that is syntactically equivalent to the last type parameter, so only E1's
-argument will be be folded over in a derived Foldable instance.
-
-See Trac #10447 for the original discussion on this feature. Also see
-https://ghc.haskell.org/trac/ghc/wiki/Commentary/Compiler/DeriveFunctor
-for a more in-depth explanation.
-
-Note [FFoldType and functorLikeTraverse]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Deriving Functor, Foldable, and Traversable all require generating expressions
-which perform an operation on each argument of a data constructor depending
-on the argument's type. In particular, a generated operation can be different
-depending on whether the type mentions the last type variable of the datatype
-(e.g., if you have data T a = MkT a Int, then a generated foldr expresion would
-fold over the first argument of MkT, but not the second).
-
-This pattern is abstracted with the FFoldType datatype, which provides hooks
-for the user to specify how a constructor argument should be folded when it
-has a type with a particular "shape". The shapes are as follows (assume that
-a is the last type variable in a given datatype):
-
-* ft_triv:    The type does not mention the last type variable at all.
-              Examples: Int, b
-
-* ft_var:     The type is syntactically equal to the last type variable.
-              Moreover, the type appears in a covariant position (see
-              the Deriving Functor instances section of the users' guide
-              for an in-depth explanation of covariance vs. contravariance).
-              Example: a (covariantly)
-
-* ft_co_var:  The type is syntactically equal to the last type variable.
-              Moreover, the type appears in a contravariant position.
-              Example: a (contravariantly)
-
-* ft_fun:     A function type which mentions the last type variable in
-              the argument position, result position or both.
-              Examples: a -> Int, Int -> a, Maybe a -> [a]
-
-* ft_tup:     A tuple type which mentions the last type variable in at least
-              one of its fields. The TyCon argument of ft_tup represents the
-              particular tuple's type constructor.
-              Examples: (a, Int), (Maybe a, [a], Either a Int), (# Int, a #)
-
-* ft_ty_app:  A type is being applied to the last type parameter, where the
-              applied type does not mention the last type parameter (if it
-              did, it would fall under ft_bad_app). The Type argument to
-              ft_ty_app represents the applied type.
-
-              Note that functions, tuples, and foralls are distinct cases
-              and take precedence of ft_ty_app. (For example, (Int -> a) would
-              fall under (ft_fun Int a), not (ft_ty_app ((->) Int) a).
-              Examples: Maybe a, Either b a
-
-* ft_bad_app: A type application uses the last type parameter in a position
-              other than the last argument. This case is singled out because
-              Functor, Foldable, and Traversable instances cannot be derived
-              for datatypes containing arguments with such types.
-              Examples: Either a Int, Const a b
-
-* ft_forall:  A forall'd type mentions the last type parameter on its right-
-              hand side (and is not quantified on the left-hand side). This
-              case is present mostly for plumbing purposes.
-              Example: forall b. Either b a
-
-If FFoldType describes a strategy for folding subcomponents of a Type, then
-functorLikeTraverse is the function that applies that strategy to the entirety
-of a Type, returning the final folded-up result.
-
-foldDataConArgs applies functorLikeTraverse to every argument type of a
-constructor, returning a list of the fold results. This makes foldDataConArgs
-a natural way to generate the subexpressions in a generated fmap, foldr,
-foldMap, or traverse definition (the subexpressions must then be combined in
-a method-specific fashion to form the final generated expression).
-
-Deriving Generic1 also does validity checking by looking for the last type
-variable in certain positions of a constructor's argument types, so it also
-uses foldDataConArgs. See Note [degenerate use of FFoldType] in TcGenGenerics.
-
-Note [Generated code for DeriveFoldable and DeriveTraversable]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-We adapt the algorithms for -XDeriveFoldable and -XDeriveTraversable based on
-that of -XDeriveFunctor. However, there an important difference between deriving
-the former two typeclasses and the latter one, which is best illustrated by the
-following scenario:
-
-  data WithInt a = WithInt a Int# deriving (Functor, Foldable, Traversable)
-
-The generated code for the Functor instance is straightforward:
-
-  instance Functor WithInt where
-    fmap f (WithInt a i) = WithInt (f a) i
-
-But if we use too similar of a strategy for deriving the Foldable and
-Traversable instances, we end up with this code:
-
-  instance Foldable WithInt where
-    foldMap f (WithInt a i) = f a <> mempty
-
-  instance Traversable WithInt where
-    traverse f (WithInt a i) = fmap WithInt (f a) <*> pure i
-
-This is unsatisfying for two reasons:
-
-1. The Traversable instance doesn't typecheck! Int# is of kind #, but pure
-   expects an argument whose type is of kind *. This effectively prevents
-   Traversable from being derived for any datatype with an unlifted argument
-   type (Trac #11174).
-
-2. The generated code contains superfluous expressions. By the Monoid laws,
-   we can reduce (f a <> mempty) to (f a), and by the Applicative laws, we can
-   reduce (fmap WithInt (f a) <*> pure i) to (fmap (\b -> WithInt b i) (f a)).
-
-We can fix both of these issues by incorporating a slight twist to the usual
-algorithm that we use for -XDeriveFunctor. The differences can be summarized
-as follows:
-
-1. In the generated expression, we only fold over arguments whose types
-   mention the last type parameter. Any other argument types will simply
-   produce useless 'mempty's or 'pure's, so they can be safely ignored.
-
-2. In the case of -XDeriveTraversable, instead of applying ConName,
-   we apply (\b_i ... b_k -> ConName a_1 ... a_n), where
-
-   * ConName has n arguments
-   * {b_i, ..., b_k} is a subset of {a_1, ..., a_n} whose indices correspond
-     to the arguments whose types mention the last type parameter. As a
-     consequence, taking the difference of {a_1, ..., a_n} and
-     {b_i, ..., b_k} yields the all the argument values of ConName whose types
-     do not mention the last type parameter. Note that [i, ..., k] is a
-     strictly increasing—but not necessarily consecutive—integer sequence.
-
-     For example, the datatype
-
-       data Foo a = Foo Int a Int a
-
-     would generate the following Traversable instance:
-
-       instance Traversable Foo where
-         traverse f (Foo a1 a2 a3 a4) =
-           fmap (\b2 b4 -> Foo a1 b2 a3 b4) (f a2) <*> f a4
-
-Technically, this approach would also work for -XDeriveFunctor as well, but we
-decide not to do so because:
-
-1. There's not much benefit to generating, e.g., ((\b -> WithInt b i) (f a))
-   instead of (WithInt (f a) i).
-
-2. There would be certain datatypes for which the above strategy would
-   generate Functor code that would fail to typecheck. For example:
-
-     data Bar f a = Bar (forall f. Functor f => f a) deriving Functor
-
-   With the conventional algorithm, it would generate something like:
-
-     fmap f (Bar a) = Bar (fmap f a)
-
-   which typechecks. But with the strategy mentioned above, it would generate:
-
-     fmap f (Bar a) = (\b -> Bar b) (fmap f a)
-
-   which does not typecheck, since GHC cannot unify the rank-2 type variables
-   in the types of b and (fmap f a).
 -}

@@ -6,10 +6,9 @@
 {-# LANGUAGE CPP #-}
 
 module BuildTyCl (
-        buildDataCon,
+        buildDataCon, mkDataConUnivTyVarBinders,
         buildPatSyn,
         TcMethInfo, buildClass,
-        distinctAbstractTyConRhs, totallyAbstractTyConRhs,
         mkNewTyConRhs, mkDataTyConRhs,
         newImplicitBinder, newTyConRepName
     ) where
@@ -39,10 +38,6 @@ import TcRnMonad
 import UniqSupply
 import Util
 import Outputable
-
-distinctAbstractTyConRhs, totallyAbstractTyConRhs :: AlgTyConRhs
-distinctAbstractTyConRhs = AbstractTyCon True
-totallyAbstractTyConRhs  = AbstractTyCon False
 
 mkDataTyConRhs :: [DataCon] -> AlgTyConRhs
 mkDataTyConRhs cons
@@ -112,9 +107,8 @@ buildDataCon :: FamInstEnvs
             -> Maybe [HsImplBang]
                 -- See Note [Bangs on imported data constructors] in MkId
            -> [FieldLabel]             -- Field labels
-           -> [TyVar] -> [TyBinder]    -- Universals; see
-                                       -- Note [TyBinders in DataCons] in DataCon
-           -> [TyVar] -> [TyBinder]    -- existentials
+           -> [TyVarBinder]            -- Universals
+           -> [TyVarBinder]            -- Existentials
            -> [EqSpec]                 -- Equality spec
            -> ThetaType                -- Does not include the "stupid theta"
                                        -- or the GADT equalities
@@ -125,9 +119,9 @@ buildDataCon :: FamInstEnvs
 --   a) makes the worker Id
 --   b) makes the wrapper Id if necessary, including
 --      allocating its unique (hence monadic)
---   c) Sorts out the TyBinders. See Note [TyBinders in DataCons] in DataCon
+--   c) Sorts out the TyVarBinders. See mkDataConUnivTyBinders
 buildDataCon fam_envs src_name declared_infix prom_info src_bangs impl_bangs field_lbls
-             univ_tvs univ_bndrs ex_tvs ex_bndrs eq_spec ctxt arg_tys res_ty rep_tycon
+             univ_tvs ex_tvs eq_spec ctxt arg_tys res_ty rep_tycon
   = do  { wrap_name <- newImplicitBinder src_name mkDataConWrapperOcc
         ; work_name <- newImplicitBinder src_name mkDataConWorkerOcc
         -- This last one takes the name of the data constructor in the source
@@ -137,18 +131,10 @@ buildDataCon fam_envs src_name declared_infix prom_info src_bangs impl_bangs fie
         ; traceIf (text "buildDataCon 1" <+> ppr src_name)
         ; us <- newUniqueSupply
         ; dflags <- getDynFlags
-        ; let   -- See Note [TyBinders in DataCons] in DataCon
-              dc_bndrs = zipWith mk_binder univ_tvs univ_bndrs
-              mk_binder tv bndr = mkNamedBinder vis tv
-                where
-                  vis = case binderVisibility bndr of
-                    Invisible -> Invisible
-                    _         -> Specified
-
-              stupid_ctxt = mkDataConStupidTheta rep_tycon arg_tys univ_tvs
+        ; let stupid_ctxt = mkDataConStupidTheta rep_tycon arg_tys univ_tvs
               data_con = mkDataCon src_name declared_infix prom_info
                                    src_bangs field_lbls
-                                   univ_tvs dc_bndrs ex_tvs ex_bndrs eq_spec ctxt
+                                   univ_tvs ex_tvs eq_spec ctxt
                                    arg_tys res_ty NoRRI rep_tycon
                                    stupid_ctxt dc_wrk dc_rep
               dc_wrk = mkDataConWorkId work_name data_con
@@ -163,12 +149,13 @@ buildDataCon fam_envs src_name declared_infix prom_info src_bangs impl_bangs fie
 -- the type variables mentioned in the arg_tys
 -- ToDo: Or functionally dependent on?
 --       This whole stupid theta thing is, well, stupid.
-mkDataConStupidTheta :: TyCon -> [Type] -> [TyVar] -> [PredType]
+mkDataConStupidTheta :: TyCon -> [Type] -> [TyVarBinder] -> [PredType]
 mkDataConStupidTheta tycon arg_tys univ_tvs
   | null stupid_theta = []      -- The common case
   | otherwise         = filter in_arg_tys stupid_theta
   where
-    tc_subst     = zipTvSubst (tyConTyVars tycon) (mkTyVarTys univ_tvs)
+    tc_subst     = zipTvSubst (tyConTyVars tycon)
+                              (mkTyVarTys (binderVars univ_tvs))
     stupid_theta = substTheta tc_subst (tyConStupidTheta tycon)
         -- Start by instantiating the master copy of the
         -- stupid theta, taken from the TyCon
@@ -178,18 +165,81 @@ mkDataConStupidTheta tycon arg_tys univ_tvs
                       tyCoVarsOfType pred `intersectVarSet` arg_tyvars
 
 
+mkDataConUnivTyVarBinders :: [TyConBinder]   -- From the TyCon
+                          -> [TyVarBinder]   -- For the DataCon
+-- See Note [Building the TyBinders for a DataCon]
+mkDataConUnivTyVarBinders tc_bndrs
+ = map mk_binder tc_bndrs
+ where
+   mk_binder (TvBndr tv tc_vis) = mkTyVarBinder vis tv
+      where
+        vis = case tc_vis of
+                AnonTCB           -> Specified
+                NamedTCB Required -> Specified
+                NamedTCB vis      -> vis
+
+{- Note [Building the TyBinders for a DataCon]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A DataCon needs to keep track of the visibility of its universals and
+existentials, so that visible type application can work properly. This
+is done by storing the universal and existential TyVarBinders.
+See Note [TyVarBinders in DataCons] in DataCon.
+
+During construction of a DataCon, we often start from the TyBinders of
+the parent TyCon.  For example
+   data Maybe a = Nothing | Just a
+The DataCons start from the TyBinders of the parent TyCon.
+
+But the ultimate TyBinders for the DataCon are *different* than those
+of the DataCon. Here is an example:
+
+  data App a b = MkApp (a b) -- App :: forall {k}. (k->*) -> k -> *
+
+The TyCon has
+
+  tyConTyVars    = [ k:*,                              a:k->*,      b:k]
+  tyConTyBinders = [ Named (TvBndr (k :: *) Inferred), Anon (k->*), Anon k ]
+
+The TyBinders for App line up with App's kind, given above.
+
+But the DataCon MkApp has the type
+  MkApp :: forall {k} (a:k->*) (b:k). a b -> App k a b
+
+That is, its TyBinders should be
+
+  dataConUnivTyVarBinders = [ TvBndr (k:*)    Inferred
+                            , TvBndr (a:k->*) Specified
+                            , TvBndr (b:k)    Specified ]
+
+So we want to take the TyCon's TyBinders and the TyCon's TyVars and
+merge them, pulling
+  - variable names from the TyVars
+  - visibilities from the TyBinders
+  - but changing Anon/Required to Specified
+
+The last part about Required->Specified comes from this:
+  data T k (a:k) b = MkT (a b)
+Here k is Required in T's kind, but we don't have Required binders in
+the TyBinders for a term (see Note [No Required TyBinder in terms]
+in TyCoRep), so we change it to Specified when making MkT's TyBinders
+
+This merging operation is done by mkDataConUnivTyBinders. In contrast,
+the TyBinders passed to mkDataCon are the final TyBinders stored in the
+DataCon (mkDataCon does no further work).
+-}
+
 ------------------------------------------------------
 buildPatSyn :: Name -> Bool
             -> (Id,Bool) -> Maybe (Id, Bool)
-            -> ([TyVar], [TyBinder], ThetaType) -- ^ Univ and req
-            -> ([TyVar], [TyBinder], ThetaType) -- ^ Ex and prov
+            -> ([TyVarBinder], ThetaType) -- ^ Univ and req
+            -> ([TyVarBinder], ThetaType) -- ^ Ex and prov
             -> [Type]               -- ^ Argument types
             -> Type                 -- ^ Result type
             -> [FieldLabel]         -- ^ Field labels for
                                     --   a record pattern synonym
             -> PatSyn
 buildPatSyn src_name declared_infix matcher@(matcher_id,_) builder
-            (univ_tvs, univ_bndrs, req_theta) (ex_tvs, ex_bndrs, prov_theta) arg_tys
+            (univ_tvs, req_theta) (ex_tvs, prov_theta) arg_tys
             pat_ty field_labels
   = -- The assertion checks that the matcher is
     -- compatible with the pattern synonym
@@ -207,17 +257,17 @@ buildPatSyn src_name declared_infix matcher@(matcher_id,_) builder
                     , ppr req_theta <+> twiddle <+> ppr req_theta1
                     , ppr arg_tys <+> twiddle <+> ppr arg_tys1]))
     mkPatSyn src_name declared_infix
-             (univ_tvs, univ_bndrs, req_theta) (ex_tvs, ex_bndrs, prov_theta)
+             (univ_tvs, req_theta) (ex_tvs, prov_theta)
              arg_tys pat_ty
              matcher builder field_labels
   where
     ((_:_:univ_tvs1), req_theta1, tau) = tcSplitSigmaTy $ idType matcher_id
-    ([pat_ty1, cont_sigma, _], _) = tcSplitFunTys tau
-    (ex_tvs1, prov_theta1, cont_tau) = tcSplitSigmaTy cont_sigma
-    (arg_tys1, _) = tcSplitFunTys cont_tau
+    ([pat_ty1, cont_sigma, _], _)      = tcSplitFunTys tau
+    (ex_tvs1, prov_theta1, cont_tau)   = tcSplitSigmaTy cont_sigma
+    (arg_tys1, _) = (tcSplitFunTys cont_tau)
     twiddle = char '~'
     subst = zipTvSubst (univ_tvs1 ++ ex_tvs1)
-                       (mkTyVarTys (univ_tvs ++ ex_tvs))
+                       (mkTyVarTys (binderVars (univ_tvs ++ ex_tvs)))
 
     -- For a nullary pattern synonym we add a single void argument to the
     -- matcher to preserve laziness in the case of unlifted types.
@@ -225,6 +275,7 @@ buildPatSyn src_name declared_infix matcher@(matcher_id,_) builder
     compareArgTys :: [Type] -> [Type] -> Bool
     compareArgTys [] [x] = x `eqType` voidPrimTy
     compareArgTys arg_tys matcher_arg_tys = arg_tys `eqTypes` matcher_arg_tys
+
 
 ------------------------------------------------------
 type TcMethInfo     -- A temporary intermediate, to communicate
@@ -246,17 +297,29 @@ type TcMethInfo     -- A temporary intermediate, to communicate
          --    for the generic default method, spat out by checkValidClass
 
 buildClass :: Name  -- Name of the class/tycon (they have the same Name)
-           -> [TyVar] -> [Role] -> ThetaType
-           -> [TyBinder]                   -- of the tycon
+           -> [TyConBinder]                -- Of the tycon
+           -> [Role]
            -> [FunDep TyVar]               -- Functional dependencies
-           -> [ClassATItem]                -- Associated types
-           -> [TcMethInfo]                 -- Method info
-           -> ClassMinimalDef              -- Minimal complete definition
-           -> RecFlag                      -- Info for type constructor
+           -- Super classes, associated types, method info, minimal complete def.
+           -- This is Nothing if the class is abstract.
+           -> Maybe (ThetaType, [ClassATItem], [TcMethInfo], ClassMinimalDef)
            -> TcRnIf m n Class
 
-buildClass tycon_name tvs roles sc_theta binders
-           fds at_items sig_stuff mindef tc_isrec
+buildClass tycon_name binders roles fds Nothing
+  = fixM  $ \ rec_clas ->       -- Only name generation inside loop
+    do  { traceIf (text "buildClass")
+
+        ; tc_rep_name  <- newTyConRepName tycon_name
+        ; let univ_bndrs = mkDataConUnivTyVarBinders binders
+              univ_tvs   = binderVars univ_bndrs
+              tycon = mkClassTyCon tycon_name binders roles
+                                   AbstractTyCon rec_clas tc_rep_name
+              result = mkAbstractClass tycon_name univ_tvs fds tycon
+        ; traceIf (text "buildClass" <+> ppr tycon)
+        ; return result }
+
+buildClass tycon_name binders roles fds
+           (Just (sc_theta, at_items, sig_stuff, mindef))
   = fixM  $ \ rec_clas ->       -- Only name generation inside loop
     do  { traceIf (text "buildClass")
 
@@ -291,11 +354,13 @@ buildClass tycon_name tvs roles sc_theta binders
                 -- That means that in the case of
                 --     class C a => D a
                 -- we don't get a newtype with no arguments!
-              args      = sc_sel_names ++ op_names
-              op_tys    = [ty | (_,ty,_) <- sig_stuff]
-              op_names  = [op | (op,_,_) <- sig_stuff]
-              arg_tys   = sc_theta ++ op_tys
-              rec_tycon = classTyCon rec_clas
+              args       = sc_sel_names ++ op_names
+              op_tys     = [ty | (_,ty,_) <- sig_stuff]
+              op_names   = [op | (op,_,_) <- sig_stuff]
+              arg_tys    = sc_theta ++ op_tys
+              rec_tycon  = classTyCon rec_clas
+              univ_bndrs = mkDataConUnivTyVarBinders binders
+              univ_tvs   = binderVars univ_bndrs
 
         ; rep_nm   <- newTyConRepName datacon_name
         ; dict_con <- buildDataCon (panic "buildClass: FamInstEnvs")
@@ -305,24 +370,25 @@ buildClass tycon_name tvs roles sc_theta binders
                                    (map (const no_bang) args)
                                    (Just (map (const HsLazy) args))
                                    [{- No fields -}]
-                                   tvs binders
-                                   [{- no existentials -}]
+                                   univ_bndrs
                                    [{- no existentials -}]
                                    [{- No GADT equalities -}]
                                    [{- No theta -}]
                                    arg_tys
-                                   (mkTyConApp rec_tycon (mkTyVarTys tvs))
+                                   (mkTyConApp rec_tycon (mkTyVarTys univ_tvs))
                                    rec_tycon
 
-        ; rhs <- if use_newtype
-                 then mkNewTyConRhs tycon_name rec_tycon dict_con
-                 else if isCTupleTyConName tycon_name
-                 then return (TupleTyCon { data_con = dict_con
-                                         , tup_sort = ConstraintTuple })
-                 else return (mkDataTyConRhs [dict_con])
+        ; rhs <- case () of
+                  _ | use_newtype
+                    -> mkNewTyConRhs tycon_name rec_tycon dict_con
+                    | isCTupleTyConName tycon_name
+                    -> return (TupleTyCon { data_con = dict_con
+                                          , tup_sort = ConstraintTuple })
+                    | otherwise
+                    -> return (mkDataTyConRhs [dict_con])
 
-        ; let { tycon = mkClassTyCon tycon_name binders tvs roles
-                                     rhs rec_clas tc_isrec tc_rep_name
+        ; let { tycon = mkClassTyCon tycon_name binders roles
+                                     rhs rec_clas tc_rep_name
                 -- A class can be recursive, and in the case of newtypes
                 -- this matters.  For example
                 --      class C a where { op :: C b => a -> b -> Int }
@@ -332,14 +398,14 @@ buildClass tycon_name tvs roles sc_theta binders
                 -- newtype like a synonym, but that will lead to an infinite
                 -- type]
 
-              ; result = mkClass tvs fds
+              ; result = mkClass tycon_name univ_tvs fds
                                  sc_theta sc_sel_ids at_items
                                  op_items mindef tycon
               }
         ; traceIf (text "buildClass" <+> ppr tycon)
         ; return result }
   where
-    no_bang = HsSrcBang Nothing NoSrcUnpack NoSrcStrict
+    no_bang = HsSrcBang NoSourceText NoSrcUnpack NoSrcStrict
 
     mk_op_item :: Class -> TcMethInfo -> TcRnIf n m ClassOpItem
     mk_op_item rec_clas (op_name, _, dm_spec)
@@ -380,7 +446,7 @@ newImplicitBinder :: Name                       -- Base name
                   -> TcRnIf m n Name            -- Implicit name
 -- Called in BuildTyCl to allocate the implicit binders of type/class decls
 -- For source type/class decls, this is the first occurrence
--- For iface ones, the LoadIface has alrady allocated a suitable name in the cache
+-- For iface ones, the LoadIface has already allocated a suitable name in the cache
 newImplicitBinder base_name mk_sys_occ
   = newImplicitBinderLoc base_name mk_sys_occ (nameSrcSpan base_name)
 

@@ -57,13 +57,11 @@ extern char *ctime_r(const time_t *, char *);
    -------------------------------------------------------------------------- */
 
 void *
-stgMallocBytes (int n, char *msg)
+stgMallocBytes (size_t n, char *msg)
 {
-    char *space;
-    size_t n2;
+    void *space;
 
-    n2 = (size_t) n;
-    if ((space = (char *) malloc(n2)) == NULL) {
+    if ((space = malloc(n)) == NULL) {
       /* Quoting POSIX.1-2008 (which says more or less the same as ISO C99):
        *
        *   "Upon successful completion with size not equal to 0, malloc() shall
@@ -81,17 +79,16 @@ stgMallocBytes (int n, char *msg)
       rtsConfig.mallocFailHook((W_) n, msg); /*msg*/
       stg_exit(EXIT_INTERNAL_ERROR);
     }
+    IF_DEBUG(sanity, memset(space, 0xbb, n));
     return space;
 }
 
 void *
-stgReallocBytes (void *p, int n, char *msg)
+stgReallocBytes (void *p, size_t n, char *msg)
 {
-    char *space;
-    size_t n2;
+    void *space;
 
-    n2 = (size_t) n;
-    if ((space = (char *) realloc(p, (size_t) n2)) == NULL) {
+    if ((space = realloc(p, n)) == NULL) {
       /* don't fflush(stdout); WORKAROUND bug in Linux glibc */
       rtsConfig.mallocFailHook((W_) n, msg); /*msg*/
       stg_exit(EXIT_INTERNAL_ERROR);
@@ -100,11 +97,11 @@ stgReallocBytes (void *p, int n, char *msg)
 }
 
 void *
-stgCallocBytes (int n, int m, char *msg)
+stgCallocBytes (size_t n, size_t m, char *msg)
 {
-    char *space;
+    void *space;
 
-    if ((space = (char *) calloc((size_t) n, (size_t) m)) == NULL) {
+    if ((space = calloc(n, m)) == NULL) {
       /* don't fflush(stdout); WORKAROUND bug in Linux glibc */
       rtsConfig.mallocFailHook((W_) n*m, msg); /*msg*/
       stg_exit(EXIT_INTERNAL_ERROR);
@@ -134,13 +131,11 @@ stgFree(void* p)
 }
 
 /* -----------------------------------------------------------------------------
-   Stack overflow
-
-   Not sure if this belongs here.
+   Stack/heap overflow
    -------------------------------------------------------------------------- */
 
 void
-stackOverflow(StgTSO* tso)
+reportStackOverflow(StgTSO* tso)
 {
     rtsConfig.stackOverflowHook(tso->tot_stack_size * sizeof(W_));
 
@@ -150,16 +145,11 @@ stackOverflow(StgTSO* tso)
 }
 
 void
-heapOverflow(void)
+reportHeapOverflow(void)
 {
-    if (!heap_overflow)
-    {
-        /* don't fflush(stdout); WORKAROUND bug in Linux glibc */
-        rtsConfig.outOfHeapHook(0/*unknown request size*/,
-                                (W_)RtsFlags.GcFlags.maxHeapSize * BLOCK_SIZE);
-
-        heap_overflow = rtsTrue;
-    }
+    /* don't fflush(stdout); WORKAROUND bug in Linux glibc */
+    rtsConfig.outOfHeapHook(0/*unknown request size*/,
+                            (W_)RtsFlags.GcFlags.maxHeapSize * BLOCK_SIZE);
 }
 
 /* -----------------------------------------------------------------------------
@@ -190,7 +180,7 @@ time_str(void)
    -------------------------------------------------------------------------- */
 
 char *
-showStgWord64(StgWord64 x, char *s, rtsBool with_commas)
+showStgWord64(StgWord64 x, char *s, bool with_commas)
 {
     if (with_commas) {
         if (x < (StgWord64)1e3)
@@ -354,4 +344,3 @@ void checkFPUStack(void)
     }
 #endif
 }
-

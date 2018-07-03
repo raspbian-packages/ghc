@@ -1,7 +1,9 @@
 {-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE TypeFamilies #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 -----------------------------------------------------------------------------
 -- |
@@ -19,30 +21,44 @@
 module Distribution.Client.Types where
 
 import Distribution.Package
-         ( PackageName, PackageId, Package(..)
-         , UnitId(..), mkUnitId
-         , HasUnitId(..), PackageInstalled(..) )
+         ( Package(..), HasMungedPackageId(..), HasUnitId(..)
+         , PackageInstalled(..), newSimpleUnitId )
 import Distribution.InstalledPackageInfo
-         ( InstalledPackageInfo )
+         ( InstalledPackageInfo, installedComponentId, sourceComponentName )
 import Distribution.PackageDescription
-         ( Benchmark(..), GenericPackageDescription(..), FlagAssignment
-         , TestSuite(..) )
-import Distribution.PackageDescription.Configuration
-         ( mapTreeData )
-import Distribution.Client.PackageIndex
-         ( PackageIndex )
-import Distribution.Client.ComponentDeps
-         ( ComponentDeps )
-import qualified Distribution.Client.ComponentDeps as CD
+         ( FlagAssignment )
 import Distribution.Version
          ( VersionRange )
-import Distribution.Text (display)
+import Distribution.Types.ComponentId
+         ( ComponentId )
+import Distribution.Types.MungedPackageId
+         ( computeCompatPackageId )
+import Distribution.Types.PackageId
+         ( PackageId )
+import Distribution.Types.AnnotatedId
+import Distribution.Types.UnitId
+         ( UnitId )
+import Distribution.Types.PackageName
+         ( PackageName )
+import Distribution.Types.ComponentName
+         ( ComponentName(..) )
+
+import Distribution.Solver.Types.PackageIndex
+         ( PackageIndex )
+import qualified Distribution.Solver.Types.ComponentDeps as CD
+import Distribution.Solver.Types.ComponentDeps
+         ( ComponentDeps )
+import Distribution.Solver.Types.OptionalStanza
+import Distribution.Solver.Types.PackageFixedDeps
+import Distribution.Solver.Types.SourcePackage
+import Distribution.Compat.Graph (IsNode(..))
+import Distribution.Simple.Utils (ordNub)
 
 import Data.Map (Map)
 import Network.URI (URI(..), URIAuth(..), nullURI)
-import Data.ByteString.Lazy (ByteString)
 import Control.Exception
-         ( SomeException )
+         ( Exception, SomeException )
+import Data.Typeable (Typeable)
 import GHC.Generics (Generic)
 import Distribution.Compat.Binary (Binary(..))
 
@@ -53,7 +69,7 @@ newtype Password = Password { unPassword :: String }
 -- | This is the information we get from a @00-index.tar.gz@ hackage index.
 --
 data SourcePackageDb = SourcePackageDb {
-  packageIndex       :: PackageIndex SourcePackage,
+  packageIndex       :: PackageIndex UnresolvedSourcePackage,
   packagePreferences :: Map PackageName VersionRange
 }
   deriving (Eq, Generic)
@@ -75,159 +91,130 @@ instance Binary SourcePackageDb
 -- slightly and we may distinguish these two types and have an explicit
 -- conversion when we register units with the compiler.
 --
-type InstalledPackageId = UnitId
+type InstalledPackageId = ComponentId
 
-installedPackageId :: HasUnitId pkg => pkg -> InstalledPackageId
-installedPackageId = installedUnitId
-
--- | Subclass of packages that have specific versioned dependencies.
---
--- So for example a not-yet-configured package has dependencies on version
--- ranges, not specific versions. A configured or an already installed package
--- depends on exact versions. Some operations or data structures (like
---  dependency graphs) only make sense on this subclass of package types.
---
-class Package pkg => PackageFixedDeps pkg where
-  depends :: pkg -> ComponentDeps [UnitId]
-
-instance PackageFixedDeps InstalledPackageInfo where
-  depends = CD.fromInstalled . installedDepends
-
-
--- | In order to reuse the implementation of PackageIndex which relies on
--- 'UnitId', we need to be able to synthesize these IDs prior
--- to installation.  Eventually, we'll move to a representation of
--- 'UnitId' which can be properly computed before compilation
--- (of course, it's a bit of a misnomer since the packages are not actually
--- installed yet.)  In any case, we'll synthesize temporary installed package
--- IDs to use as keys during install planning.  These should never be written
--- out!  Additionally, they need to be guaranteed unique within the install
--- plan.
-fakeUnitId :: PackageId -> UnitId
-fakeUnitId = mkUnitId . (".fake."++) . display
 
 -- | A 'ConfiguredPackage' is a not-yet-installed package along with the
 -- total configuration information. The configuration information is total in
 -- the sense that it provides all the configuration information and so the
 -- final configure process will be independent of the environment.
 --
-data ConfiguredPackage = ConfiguredPackage
-       SourcePackage       -- package info, including repo
-       FlagAssignment      -- complete flag assignment for the package
-       [OptionalStanza]    -- list of enabled optional stanzas for the package
-       (ComponentDeps [ConfiguredId])
-                           -- set of exact dependencies (installed or source).
-                           -- These must be consistent with the 'buildDepends'
-                           -- in the 'PackageDescription' that you'd get by
-                           -- applying the flag assignment and optional stanzas.
+-- 'ConfiguredPackage' is assumed to not support Backpack.  Only the
+-- @new-build@ codepath supports Backpack.
+--
+data ConfiguredPackage loc = ConfiguredPackage {
+       confPkgId :: InstalledPackageId,
+       confPkgSource :: SourcePackage loc, -- package info, including repo
+       confPkgFlags :: FlagAssignment,     -- complete flag assignment for the package
+       confPkgStanzas :: [OptionalStanza], -- list of enabled optional stanzas for the package
+       confPkgDeps :: ComponentDeps [ConfiguredId]
+                               -- set of exact dependencies (installed or source).
+                               -- These must be consistent with the 'buildDepends'
+                               -- in the 'PackageDescription' that you'd get by
+                               -- applying the flag assignment and optional stanzas.
+    }
   deriving (Eq, Show, Generic)
 
-instance Binary ConfiguredPackage
+-- | 'HasConfiguredId' indicates data types which have a 'ConfiguredId'.
+-- This type class is mostly used to conveniently finesse between
+-- 'ElaboratedPackage' and 'ElaboratedComponent'.
+--
+instance HasConfiguredId (ConfiguredPackage loc) where
+    configuredId pkg = ConfiguredId (packageId pkg) (Just CLibName) (confPkgId pkg)
+
+-- 'ConfiguredPackage' is the legacy codepath, we are guaranteed
+-- to never have a nontrivial 'UnitId'
+instance PackageFixedDeps (ConfiguredPackage loc) where
+    depends = fmap (map (newSimpleUnitId . confInstId)) . confPkgDeps
+
+instance IsNode (ConfiguredPackage loc) where
+    type Key (ConfiguredPackage loc) = UnitId
+    nodeKey       = newSimpleUnitId . confPkgId
+    -- TODO: if we update ConfiguredPackage to support order-only
+    -- dependencies, need to include those here.
+    -- NB: have to deduplicate, otherwise the planner gets confused
+    nodeNeighbors = ordNub . CD.flatDeps . depends
+
+instance (Binary loc) => Binary (ConfiguredPackage loc)
+
 
 -- | A ConfiguredId is a package ID for a configured package.
 --
--- Once we configure a source package we know it's UnitId
--- (at least, in principle, even if we have to fake it currently). It is still
+-- Once we configure a source package we know it's UnitId. It is still
 -- however useful in lots of places to also know the source ID for the package.
 -- We therefore bundle the two.
 --
 -- An already installed package of course is also "configured" (all it's
 -- configuration parameters and dependencies have been specified).
---
--- TODO: I wonder if it would make sense to promote this datatype to Cabal
--- and use it consistently instead of UnitIds?
 data ConfiguredId = ConfiguredId {
     confSrcId  :: PackageId
-  , confInstId :: UnitId
+  , confCompName :: Maybe ComponentName
+  , confInstId :: ComponentId
   }
-  deriving (Eq, Generic)
+  deriving (Eq, Ord, Generic)
+
+annotatedIdToConfiguredId :: AnnotatedId ComponentId -> ConfiguredId
+annotatedIdToConfiguredId aid = ConfiguredId {
+        confSrcId    = ann_pid aid,
+        confCompName = Just (ann_cname aid),
+        confInstId   = ann_id aid
+    }
 
 instance Binary ConfiguredId
 
 instance Show ConfiguredId where
-  show = show . confSrcId
+  show cid = show (confInstId cid)
 
 instance Package ConfiguredId where
   packageId = confSrcId
 
-instance HasUnitId ConfiguredId where
-  installedUnitId = confInstId
+instance Package (ConfiguredPackage loc) where
+  packageId cpkg = packageId (confPkgSource cpkg)
 
-instance Package ConfiguredPackage where
-  packageId (ConfiguredPackage pkg _ _ _) = packageId pkg
+instance HasMungedPackageId (ConfiguredPackage loc) where
+  mungedId cpkg = computeCompatPackageId (packageId cpkg) Nothing
 
-instance PackageFixedDeps ConfiguredPackage where
-  depends (ConfiguredPackage _ _ _ deps) = fmap (map confInstId) deps
+-- Never has nontrivial UnitId
+instance HasUnitId (ConfiguredPackage loc) where
+  installedUnitId = newSimpleUnitId . confPkgId
 
-instance HasUnitId ConfiguredPackage where
-  installedUnitId = fakeUnitId . packageId
+instance PackageInstalled (ConfiguredPackage loc) where
+  installedDepends = CD.flatDeps . depends
+
+class HasConfiguredId a where
+    configuredId :: a -> ConfiguredId
+
+-- NB: This instance is slightly dangerous, in that you'll lose
+-- information about the specific UnitId you depended on.
+instance HasConfiguredId InstalledPackageInfo where
+    configuredId ipkg = ConfiguredId (packageId ipkg)
+                            (Just (sourceComponentName ipkg))
+                            (installedComponentId ipkg)
 
 -- | Like 'ConfiguredPackage', but with all dependencies guaranteed to be
 -- installed already, hence itself ready to be installed.
-data GenericReadyPackage srcpkg ipkg
-   = ReadyPackage
-       srcpkg                  -- see 'ConfiguredPackage'.
-       (ComponentDeps [ipkg])  -- Installed dependencies.
-  deriving (Eq, Show, Generic)
+newtype GenericReadyPackage srcpkg = ReadyPackage srcpkg -- see 'ConfiguredPackage'.
+  deriving (Eq, Show, Generic, Package, PackageFixedDeps,
+            HasMungedPackageId, HasUnitId, PackageInstalled, Binary)
 
-type ReadyPackage = GenericReadyPackage ConfiguredPackage InstalledPackageInfo
+-- Can't newtype derive this
+instance IsNode srcpkg => IsNode (GenericReadyPackage srcpkg) where
+    type Key (GenericReadyPackage srcpkg) = Key srcpkg
+    nodeKey (ReadyPackage spkg) = nodeKey spkg
+    nodeNeighbors (ReadyPackage spkg) = nodeNeighbors spkg
 
-instance Package srcpkg => Package (GenericReadyPackage srcpkg ipkg) where
-  packageId (ReadyPackage srcpkg _deps) = packageId srcpkg
+type ReadyPackage = GenericReadyPackage (ConfiguredPackage UnresolvedPkgLoc)
 
-instance (Package srcpkg, HasUnitId ipkg) =>
-         PackageFixedDeps (GenericReadyPackage srcpkg ipkg) where
-  depends (ReadyPackage _ deps) = fmap (map installedUnitId) deps
-
-instance HasUnitId srcpkg =>
-         HasUnitId (GenericReadyPackage srcpkg ipkg) where
-  installedUnitId (ReadyPackage pkg _) = installedUnitId pkg
-
-instance (Binary srcpkg, Binary ipkg) => Binary (GenericReadyPackage srcpkg ipkg)
-
-
--- | A package description along with the location of the package sources.
---
-data SourcePackage = SourcePackage {
-    packageInfoId        :: PackageId,
-    packageDescription   :: GenericPackageDescription,
-    packageSource        :: PackageLocation (Maybe FilePath),
-    packageDescrOverride :: PackageDescriptionOverride
-  }
-  deriving (Eq, Show, Generic)
-
-instance Binary SourcePackage
-
--- | We sometimes need to override the .cabal file in the tarball with
--- the newer one from the package index.
-type PackageDescriptionOverride = Maybe ByteString
-
-instance Package SourcePackage where packageId = packageInfoId
-
-data OptionalStanza
-    = TestStanzas
-    | BenchStanzas
-  deriving (Eq, Ord, Enum, Bounded, Show, Generic)
-
-instance Binary OptionalStanza
-
-enableStanzas
-    :: [OptionalStanza]
-    -> GenericPackageDescription
-    -> GenericPackageDescription
-enableStanzas stanzas gpkg = gpkg
-    { condBenchmarks = flagBenchmarks $ condBenchmarks gpkg
-    , condTestSuites = flagTests $ condTestSuites gpkg
-    }
-  where
-    enableTest t = t { testEnabled = TestStanzas `elem` stanzas }
-    enableBenchmark bm = bm { benchmarkEnabled = BenchStanzas `elem` stanzas }
-    flagBenchmarks = map (\(n, bm) -> (n, mapTreeData enableBenchmark bm))
-    flagTests = map (\(n, t) -> (n, mapTreeData enableTest t))
+-- | Convenience alias for 'SourcePackage UnresolvedPkgLoc'.
+type UnresolvedSourcePackage = SourcePackage UnresolvedPkgLoc
 
 -- ------------------------------------------------------------
 -- * Package locations and repositories
 -- ------------------------------------------------------------
+
+type UnresolvedPkgLoc = PackageLocation (Maybe FilePath)
+
+type ResolvedPkgLoc = PackageLocation FilePath
 
 data PackageLocation local =
 
@@ -249,7 +236,7 @@ data PackageLocation local =
 --TODO:
 --  * add support for darcs and other SCM style remote repos with a local cache
 --  | ScmPackage
-  deriving (Show, Functor, Eq, Ord, Generic)
+  deriving (Show, Functor, Eq, Ord, Generic, Typeable)
 
 instance Binary local => Binary (PackageLocation local)
 
@@ -341,7 +328,14 @@ maybeRepoRemote (RepoSecure r _localDir) = Just r
 -- * Build results
 -- ------------------------------------------------------------
 
-type BuildResult  = Either BuildFailure BuildSuccess
+-- | A summary of the outcome for building a single package.
+--
+type BuildOutcome = Either BuildFailure BuildResult
+
+-- | A summary of the outcome for building a whole set of packages.
+--
+type BuildOutcomes = Map UnitId BuildOutcome
+
 data BuildFailure = PlanningFailed
                   | DependentFailed PackageId
                   | DownloadFailed  SomeException
@@ -350,18 +344,25 @@ data BuildFailure = PlanningFailed
                   | BuildFailed     SomeException
                   | TestsFailed     SomeException
                   | InstallFailed   SomeException
-  deriving (Show, Generic)
-data BuildSuccess = BuildOk         DocsResult TestsResult
-                                    (Maybe InstalledPackageInfo)
+  deriving (Show, Typeable, Generic)
+
+instance Exception BuildFailure
+
+-- Note that the @Maybe InstalledPackageInfo@ is a slight hack: we only
+-- the public library's 'InstalledPackageInfo' is stored here, even if
+-- there were 'InstalledPackageInfo' from internal libraries.  This
+-- 'InstalledPackageInfo' is not used anyway, so it makes no difference.
+data BuildResult = BuildResult DocsResult TestsResult
+                               (Maybe InstalledPackageInfo)
   deriving (Show, Generic)
 
 data DocsResult  = DocsNotTried  | DocsFailed  | DocsOk
-  deriving (Show, Generic)
+  deriving (Show, Generic, Typeable)
 data TestsResult = TestsNotTried | TestsOk
-  deriving (Show, Generic)
+  deriving (Show, Generic, Typeable)
 
 instance Binary BuildFailure
-instance Binary BuildSuccess
+instance Binary BuildResult
 instance Binary DocsResult
 instance Binary TestsResult
 

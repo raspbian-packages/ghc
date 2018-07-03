@@ -10,12 +10,25 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE UndecidableInstances #-}
 module TrieMap(
+   -- * Maps over Core expressions
    CoreMap, emptyCoreMap, extendCoreMap, lookupCoreMap, foldCoreMap,
+   -- * Maps over 'Type's
    TypeMap, emptyTypeMap, extendTypeMap, lookupTypeMap, foldTypeMap,
    LooseTypeMap,
+   -- ** With explicit scoping
+   CmEnv, lookupCME, extendTypeMapWithScope, lookupTypeMapWithScope,
+   mkDeBruijnContext,
+   -- * Maps over 'Maybe' values
    MaybeMap,
+   -- * Maps over 'List' values
    ListMap,
-   TrieMap(..), insertTM, deleteTM
+   -- * Maps over 'Literal's
+   LiteralMap,
+   -- * 'TrieMap' class
+   TrieMap(..), insertTM, deleteTM,
+   lkDFreeVar, xtDFreeVar,
+   lkDNamed, xtDNamed,
+   (>.>), (|>), (|>>),
  ) where
 
 import CoreSyn
@@ -115,7 +128,7 @@ instance TrieMap IntMap.IntMap where
   emptyTM = IntMap.empty
   lookupTM k m = IntMap.lookup k m
   alterTM = xtInt
-  foldTM k m z = IntMap.fold k z m
+  foldTM k m z = IntMap.foldr k z m
   mapTM f m = IntMap.map f m
 
 xtInt :: Int -> XT a -> IntMap.IntMap a -> IntMap.IntMap a
@@ -126,7 +139,7 @@ instance Ord k => TrieMap (Map.Map k) where
   emptyTM = Map.empty
   lookupTM = Map.lookup
   alterTM k f m = Map.alter f k m
-  foldTM k m z = Map.fold k z m
+  foldTM k m z = Map.foldr k z m
   mapTM f m = Map.map f m
 
 
@@ -208,7 +221,7 @@ instance TrieMap UniqDFM where
 {-
 ************************************************************************
 *                                                                      *
-                   Lists
+                   Maybes
 *                                                                      *
 ************************************************************************
 
@@ -244,7 +257,14 @@ fdMaybe :: TrieMap m => (a -> b -> b) -> MaybeMap m a -> b -> b
 fdMaybe k m = foldMaybe k (mm_nothing m)
             . foldTM k (mm_just m)
 
---------------------
+{-
+************************************************************************
+*                                                                      *
+                   Lists
+*                                                                      *
+************************************************************************
+-}
+
 data ListMap m a
   = LM { lm_nil  :: Maybe a
        , lm_cons :: m (ListMap m a) }
@@ -766,7 +786,9 @@ xtC (D env co) f (CoercionMapX m)
 -- but it is strictly internal to this module.  If you are including a 'TypeMap'
 -- inside another 'TrieMap', this is the type you want. Note that this
 -- lookup does not do a kind-check. Thus, all keys in this map must have
--- the same kind.
+-- the same kind. Also note that this map respects the distinction between
+-- @Type@ and @Constraint@, despite the fact that they are equivalent type
+-- synonyms in Core.
 type TypeMapG = GenMap TypeMapX
 
 -- | @TypeMapX a@ is the base map from @DeBruijn Type@ to @a@, but without the
@@ -781,13 +803,20 @@ data TypeMapX a
        }
     -- Note that there is no tyconapp case; see Note [Equality on AppTys] in Type
 
--- | squeeze out any synonyms, convert Constraint to *, and change TyConApps
--- to nested AppTys. Why the last one? See Note [Equality on AppTys] in Type
+-- | Squeeze out any synonyms, and change TyConApps to nested AppTys. Why the
+-- last one? See Note [Equality on AppTys] in Type
+--
+-- Note, however, that we keep Constraint and Type apart here, despite the fact
+-- that they are both synonyms of TYPE 'LiftedRep (see #11715).
 trieMapView :: Type -> Maybe Type
-trieMapView ty | Just ty' <- coreViewOneStarKind ty = Just ty'
-trieMapView (TyConApp tc tys@(_:_)) = Just $ foldl AppTy (TyConApp tc []) tys
-trieMapView (ForAllTy (Anon arg) res)
-  = Just ((TyConApp funTyCon [] `AppTy` arg) `AppTy` res)
+trieMapView ty
+  -- First check for TyConApps that need to be expanded to
+  -- AppTy chains.
+  | Just (tc, tys@(_:_)) <- tcSplitTyConApp_maybe ty
+  = Just $ foldl AppTy (TyConApp tc []) tys
+
+  -- Then resolve any remaining nullary synonyms.
+  | Just ty' <- tcView ty = Just ty'
 trieMapView _ = Nothing
 
 instance TrieMap TypeMapX where
@@ -800,8 +829,8 @@ instance TrieMap TypeMapX where
 
 instance Eq (DeBruijn Type) where
   env_t@(D env t) == env_t'@(D env' t')
-    | Just new_t  <- coreViewOneStarKind t  = D env new_t == env_t'
-    | Just new_t' <- coreViewOneStarKind t' = env_t       == D env' new_t'
+    | Just new_t  <- tcView t  = D env new_t == env_t'
+    | Just new_t' <- tcView t' = env_t       == D env' new_t'
     | otherwise
     = case (t, t') of
         (CastTy t1 _, _)  -> D env t1 == D env t'
@@ -817,13 +846,13 @@ instance Eq (DeBruijn Type) where
             -> D env t1 == D env' t1' && D env t2 == D env' t2'
         (s, AppTy t1' t2') | Just (t1, t2) <- repSplitAppTy_maybe s
             -> D env t1 == D env' t1' && D env t2 == D env' t2'
-        (ForAllTy (Anon t1) t2, ForAllTy (Anon t1') t2')
+        (FunTy t1 t2, FunTy t1' t2')
             -> D env t1 == D env' t1' && D env t2 == D env' t2'
         (TyConApp tc tys, TyConApp tc' tys')
             -> tc == tc' && D env tys == D env' tys'
         (LitTy l, LitTy l')
             -> l == l'
-        (ForAllTy (Named tv _) ty, ForAllTy (Named tv' _) ty')
+        (ForAllTy (TvBndr tv _) ty, ForAllTy (TvBndr tv' _) ty')
             -> D env (tyVarKind tv)    == D env' (tyVarKind tv') &&
                D (extendCME env tv) ty == D (extendCME env' tv') ty'
         (CoercionTy {}, CoercionTy {})
@@ -864,9 +893,9 @@ lkT (D env ty) m = go ty m
     go (TyConApp tc [])            = tm_tycon  >.> lkDNamed tc
     go ty@(TyConApp _ (_:_))       = pprPanic "lkT TyConApp" (ppr ty)
     go (LitTy l)                   = tm_tylit  >.> lkTyLit l
-    go (ForAllTy (Named tv _) ty)  = tm_forall >.> lkG (D (extendCME env tv) ty)
+    go (ForAllTy (TvBndr tv _) ty) = tm_forall >.> lkG (D (extendCME env tv) ty)
                                                >=> lkBndr env tv
-    go ty@(ForAllTy (Anon _) _)    = pprPanic "lkT FunTy" (ppr ty)
+    go ty@(FunTy {})               = pprPanic "lkT FunTy" (ppr ty)
     go (CastTy t _)                = go t
     go (CoercionTy {})             = tm_coerce
 
@@ -881,11 +910,11 @@ xtT (D _   (TyConApp tc []))  f m = m { tm_tycon  = tm_tycon m |> xtDNamed tc f 
 xtT (D _   (LitTy l))         f m = m { tm_tylit  = tm_tylit m |> xtTyLit l f }
 xtT (D env (CastTy t _))      f m = xtT (D env t) f m
 xtT (D _   (CoercionTy {}))   f m = m { tm_coerce = tm_coerce m |> f }
-xtT (D env (ForAllTy (Named tv _) ty))  f m
+xtT (D env (ForAllTy (TvBndr tv _) ty))  f m
   = m { tm_forall = tm_forall m |> xtG (D (extendCME env tv) ty)
                                 |>> xtBndr env tv f }
-xtT (D _   ty@(TyConApp _ (_:_)))    _ _ = pprPanic "xtT TyConApp" (ppr ty)
-xtT (D _   ty@(ForAllTy (Anon _) _)) _ _ = pprPanic "xtT FunTy" (ppr ty)
+xtT (D _   ty@(TyConApp _ (_:_))) _ _ = pprPanic "xtT TyConApp" (ppr ty)
+xtT (D _   ty@(FunTy {}))         _ _ = pprPanic "xtT FunTy" (ppr ty)
 
 fdT :: (a -> b -> b) -> TypeMapX a -> b -> b
 fdT k m = foldTM k (tm_var m)
@@ -928,8 +957,8 @@ xtTyLit l f m =
     StrTyLit n -> m { tlm_string = tlm_string m |> Map.alter f n }
 
 foldTyLit :: (a -> b -> b) -> TyLitMap a -> b -> b
-foldTyLit l m = flip (Map.fold l) (tlm_string m)
-              . flip (Map.fold l) (tlm_number m)
+foldTyLit l m = flip (Map.foldr l) (tlm_string m)
+              . flip (Map.foldr l) (tlm_number m)
 
 -------------------------------------------------
 -- | @TypeMap a@ is a map from 'Type' to @a@.  If you are a client, this
@@ -967,6 +996,21 @@ lookupTypeMap cm t = lookupTM t cm
 extendTypeMap :: TypeMap a -> Type -> a -> TypeMap a
 extendTypeMap m t v = alterTM t (const (Just v)) m
 
+lookupTypeMapWithScope :: TypeMap a -> CmEnv -> Type -> Maybe a
+lookupTypeMapWithScope m cm t = lkTT (D cm t) m
+
+-- | Extend a 'TypeMap' with a type in the given context.
+-- @extendTypeMapWithScope m (mkDeBruijnContext [a,b,c]) t v@ is equivalent to
+-- @extendTypeMap m (forall a b c. t) v@, but allows reuse of the context over
+-- multiple insertions.
+extendTypeMapWithScope :: TypeMap a -> CmEnv -> Type -> a -> TypeMap a
+extendTypeMapWithScope m cm t v = xtTT (D cm t) (const (Just v)) m
+
+-- | Construct a deBruijn environment with the given variables in scope.
+-- e.g. @mkDeBruijnEnv [a,b,c]@ constructs a context @forall a b c.@
+mkDeBruijnContext :: [Var] -> CmEnv
+mkDeBruijnContext = extendCMEs emptyCME
+
 -- | A 'LooseTypeMap' doesn't do a kind-check. Thus, when lookup up (t |> g),
 -- you'll find entries inserted under (t), even if (g) is non-reflexive.
 newtype LooseTypeMap a
@@ -991,7 +1035,7 @@ instance TrieMap LooseTypeMap where
 type BoundVar = Int  -- Bound variables are deBruijn numbered
 type BoundVarMap a = IntMap.IntMap a
 
-data CmEnv = CME { cme_next :: BoundVar
+data CmEnv = CME { cme_next :: !BoundVar
                  , cme_env  :: VarEnv BoundVar }
 
 emptyCME :: CmEnv

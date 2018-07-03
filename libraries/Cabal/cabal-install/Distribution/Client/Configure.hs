@@ -15,70 +15,82 @@ module Distribution.Client.Configure (
     configure,
     configureSetupScript,
     chooseCabalVersion,
-    checkConfigExFlags
+    checkConfigExFlags,
+    -- * Saved configure flags
+    readConfigFlagsFrom, readConfigFlags,
+    cabalConfigFlagsFile,
+    writeConfigFlagsTo, writeConfigFlags,
   ) where
 
+import Prelude ()
+import Distribution.Client.Compat.Prelude
+
 import Distribution.Client.Dependency
-import Distribution.Client.Dependency.Types
-         ( ConstraintSource(..)
-         , LabeledPackageConstraint(..), showConstraintSource )
 import qualified Distribution.Client.InstallPlan as InstallPlan
-import Distribution.Client.InstallPlan (InstallPlan)
+import Distribution.Client.SolverInstallPlan (SolverInstallPlan)
 import Distribution.Client.IndexUtils as IndexUtils
          ( getSourcePackages, getInstalledPackages )
-import Distribution.Client.PackageIndex ( PackageIndex, elemByPackageName )
-import Distribution.Client.PkgConfigDb (PkgConfigDb, readPkgConfigDb)
 import Distribution.Client.Setup
-         ( ConfigExFlags(..), configureCommand, filterConfigureFlags
-         , RepoContext(..) )
+         ( ConfigExFlags(..), RepoContext(..)
+         , configureCommand, configureExCommand, filterConfigureFlags )
 import Distribution.Client.Types as Source
 import Distribution.Client.SetupWrapper
          ( setupWrapper, SetupScriptOptions(..), defaultSetupScriptOptions )
 import Distribution.Client.Targets
          ( userToPackageConstraint, userConstraintPackageName )
-import qualified Distribution.Client.ComponentDeps as CD
 import Distribution.Package (PackageId)
 import Distribution.Client.JobControl (Lock)
 
+import qualified Distribution.Solver.Types.ComponentDeps as CD
+import           Distribution.Solver.Types.Settings
+import           Distribution.Solver.Types.ConstraintSource
+import           Distribution.Solver.Types.LabeledPackageConstraint
+import           Distribution.Solver.Types.OptionalStanza
+import           Distribution.Solver.Types.PackageIndex
+                   ( PackageIndex, elemByPackageName )
+import           Distribution.Solver.Types.PkgConfigDb
+                   (PkgConfigDb, readPkgConfigDb)
+import           Distribution.Solver.Types.SourcePackage
+
 import Distribution.Simple.Compiler
          ( Compiler, CompilerInfo, compilerInfo, PackageDB(..), PackageDBStack )
-import Distribution.Simple.Program (ProgramConfiguration )
+import Distribution.Simple.Program (ProgramDb)
+import Distribution.Client.SavedFlags ( readCommandFlags, writeCommandFlags )
 import Distribution.Simple.Setup
-         ( ConfigFlags(..), AllowNewer(..)
+         ( ConfigFlags(..), AllowNewer(..), AllowOlder(..), RelaxDeps(..)
          , fromFlag, toFlag, flagToMaybe, fromFlagOrDefault )
 import Distribution.Simple.PackageIndex
          ( InstalledPackageIndex, lookupPackageName )
 import Distribution.Simple.Utils
          ( defaultPackageDesc )
-import qualified Distribution.InstalledPackageInfo as Installed
 import Distribution.Package
-         ( Package(..), UnitId, packageName
-         , Dependency(..), thisPackageVersion
-         )
+         ( Package(..), packageName )
+import Distribution.Types.Dependency
+         ( Dependency(..), thisPackageVersion )
 import qualified Distribution.PackageDescription as PkgDesc
+#ifdef CABAL_PARSEC
+import Distribution.PackageDescription.Parsec
+         ( readGenericPackageDescription )
+#else
 import Distribution.PackageDescription.Parse
-         ( readPackageDescription )
+         ( readGenericPackageDescription )
+#endif
 import Distribution.PackageDescription.Configuration
-         ( finalizePackageDescription )
+         ( finalizePD )
 import Distribution.Version
-         ( anyVersion, thisVersion )
+         ( Version, mkVersion, anyVersion, thisVersion
+         , VersionRange, orLaterVersion )
 import Distribution.Simple.Utils as Utils
-         ( warn, notice, debug, die )
+         ( warn, notice, debug, die' )
 import Distribution.Simple.Setup
-         ( isAllowNewer )
+         ( isRelaxDeps )
 import Distribution.System
          ( Platform )
 import Distribution.Text ( display )
 import Distribution.Verbosity as Verbosity
          ( Verbosity )
-import Distribution.Version
-         ( Version(..), VersionRange, orLaterVersion )
 
-import Control.Monad (unless)
-#if !MIN_VERSION_base(4,8,0)
-import Data.Monoid (Monoid(..))
-#endif
-import Data.Maybe (isJust, fromMaybe)
+import System.FilePath ( (</>) )
 
 -- | Choose the Cabal version such that the setup scripts compiled against this
 -- version will support the given command-line flags.
@@ -88,11 +100,13 @@ chooseCabalVersion configFlags maybeVersion =
   where
     -- Cabal < 1.19.2 doesn't support '--exact-configuration' which is needed
     -- for '--allow-newer' to work.
-    allowNewer = isAllowNewer
-                 (fromMaybe AllowNewerNone $ configAllowNewer configFlags)
+    allowNewer = isRelaxDeps
+                 (maybe RelaxDepsNone unAllowNewer $ configAllowNewer configFlags)
+    allowOlder = isRelaxDeps
+                 (maybe RelaxDepsNone unAllowOlder $ configAllowOlder configFlags)
 
-    defaultVersionRange = if allowNewer
-                          then orLaterVersion (Version [1,19,2] [])
+    defaultVersionRange = if allowOlder || allowNewer
+                          then orLaterVersion (mkVersion [1,19,2])
                           else anyVersion
 
 -- | Configure the package found in the local directory
@@ -101,17 +115,17 @@ configure :: Verbosity
           -> RepoContext
           -> Compiler
           -> Platform
-          -> ProgramConfiguration
+          -> ProgramDb
           -> ConfigFlags
           -> ConfigExFlags
           -> [String]
           -> IO ()
-configure verbosity packageDBs repoCtxt comp platform conf
+configure verbosity packageDBs repoCtxt comp platform progdb
   configFlags configExFlags extraArgs = do
 
-  installedPkgIndex <- getInstalledPackages verbosity comp packageDBs conf
+  installedPkgIndex <- getInstalledPackages verbosity comp packageDBs progdb
   sourcePkgDb       <- getSourcePackages    verbosity repoCtxt
-  pkgConfigDb       <- readPkgConfigDb      verbosity conf
+  pkgConfigDb       <- readPkgConfigDb      verbosity progdb
 
   checkConfigExFlags verbosity installedPkgIndex
                      (packageIndex sourcePkgDb) configExFlags
@@ -127,21 +141,22 @@ configure verbosity packageDBs repoCtxt comp platform conf
       warn verbosity $
            "solver failed to find a solution:\n"
         ++ message
-        ++ "Trying configure anyway."
+        ++ "\nTrying configure anyway."
       setupWrapper verbosity (setupScriptOptions installedPkgIndex Nothing)
         Nothing configureCommand (const configFlags) extraArgs
 
-    Right installPlan -> case InstallPlan.ready installPlan of
+    Right installPlan0 ->
+     let installPlan = InstallPlan.configureInstallPlan configFlags installPlan0
+     in case fst (InstallPlan.ready installPlan) of
       [pkg@(ReadyPackage
-             (ConfiguredPackage (SourcePackage _ _ (LocalUnpackedPackage _) _)
-                                 _ _ _)
-             _)] -> do
+              (ConfiguredPackage _ (SourcePackage _ _ (LocalUnpackedPackage _) _)
+                                 _ _ _))] -> do
         configurePackage verbosity
           platform (compilerInfo comp)
           (setupScriptOptions installedPkgIndex (Just pkg))
           configFlags pkg extraArgs
 
-      _ -> die $ "internal error: configure install plan should have exactly "
+      _ -> die' verbosity $ "internal error: configure install plan should have exactly "
               ++ "one local ready package."
 
   where
@@ -153,7 +168,7 @@ configure verbosity packageDBs repoCtxt comp platform conf
         packageDBs
         comp
         platform
-        conf
+        progdb
         (fromFlagOrDefault
            (useDistPref defaultSetupScriptOptions)
            (configDistPref configFlags))
@@ -168,7 +183,7 @@ configure verbosity packageDBs repoCtxt comp platform conf
 configureSetupScript :: PackageDBStack
                      -> Compiler
                      -> Platform
-                     -> ProgramConfiguration
+                     -> ProgramDb
                      -> FilePath
                      -> VersionRange
                      -> Maybe Lock
@@ -179,7 +194,7 @@ configureSetupScript :: PackageDBStack
 configureSetupScript packageDBs
                      comp
                      platform
-                     conf
+                     progdb
                      distPref
                      cabalVersion
                      lock
@@ -193,10 +208,11 @@ configureSetupScript packageDBs
     , usePlatform              = Just platform
     , usePackageDB             = packageDBs'
     , usePackageIndex          = index'
-    , useProgramConfig         = conf
+    , useProgramDb             = progdb
     , useDistPref              = distPref
     , useLoggingHandle         = Nothing
     , useWorkingDir            = Nothing
+    , useExtraPathEnv          = []
     , setupCacheLock           = lock
     , useWin32CleanHack        = False
     , forceExternalSetupMethod = forceExternal
@@ -209,6 +225,7 @@ configureSetupScript packageDBs
     , useDependencies          = fromMaybe [] explicitSetupDeps
     , useDependenciesExclusive = not defaultSetupDeps && isJust explicitSetupDeps
     , useVersionMacros         = not defaultSetupDeps && isJust explicitSetupDeps
+    , isInteractive            = False
     }
   where
     -- When we are compiling a legacy setup script without an explicit
@@ -228,8 +245,8 @@ configureSetupScript packageDBs
 
     maybeSetupBuildInfo :: Maybe PkgDesc.SetupBuildInfo
     maybeSetupBuildInfo = do
-      ReadyPackage (ConfiguredPackage (SourcePackage _ gpkg _ _) _ _ _) _
-                 <- mpkg
+      ReadyPackage cpkg <- mpkg
+      let gpkg = packageDescription (confPkgSource cpkg)
       PkgDesc.setupBuildInfo (PkgDesc.packageDescription gpkg)
 
     -- Was a default 'custom-setup' stanza added by 'cabal-install' itself? If
@@ -238,16 +255,14 @@ configureSetupScript packageDBs
     defaultSetupDeps = maybe False PkgDesc.defaultSetupDepends
                        maybeSetupBuildInfo
 
-    explicitSetupDeps :: Maybe [(UnitId, PackageId)]
+    explicitSetupDeps :: Maybe [(InstalledPackageId, PackageId)]
     explicitSetupDeps = do
       -- Check if there is an explicit setup stanza.
       _buildInfo <- maybeSetupBuildInfo
       -- Return the setup dependencies computed by the solver
-      ReadyPackage _ deps <- mpkg
-      return [ ( Installed.installedUnitId deppkg
-               , Installed.sourcePackageId    deppkg
-               )
-             | deppkg <- CD.setupDeps deps
+      ReadyPackage cpkg <- mpkg
+      return [ ( cid, srcid )
+             | ConfiguredId srcid (Just PkgDesc.CLibName) cid <- CD.setupDeps (confPkgDeps cpkg)
              ]
 
 -- | Warn if any constraints or preferences name packages that are not in the
@@ -284,17 +299,20 @@ planLocalPackage :: Verbosity -> Compiler
                  -> InstalledPackageIndex
                  -> SourcePackageDb
                  -> PkgConfigDb
-                 -> IO (Progress String String InstallPlan)
+                 -> IO (Progress String String SolverInstallPlan)
 planLocalPackage verbosity comp platform configFlags configExFlags
   installedPkgIndex (SourcePackageDb _ packagePrefs) pkgConfigDb = do
-  pkg <- readPackageDescription verbosity =<< defaultPackageDesc verbosity
+  pkg <- readGenericPackageDescription verbosity =<<
+            case flagToMaybe (configCabalFilePath configFlags) of
+                Nothing -> defaultPackageDesc verbosity
+                Just fp -> return fp
   solver <- chooseSolver verbosity (fromFlag $ configSolver configExFlags)
             (compilerInfo comp)
 
   let -- We create a local package and ask to resolve a dependency on it
       localPkg = SourcePackage {
         packageInfoId             = packageId pkg,
-        Source.packageDescription = pkg,
+        packageDescription        = pkg,
         packageSource             = LocalUnpackedPackage ".",
         packageDescrOverride      = Nothing
       }
@@ -304,8 +322,10 @@ planLocalPackage verbosity comp platform configFlags configExFlags
         fromFlagOrDefault False $ configBenchmarks configFlags
 
       resolverParams =
-          removeUpperBounds
-          (fromMaybe AllowNewerNone $ configAllowNewer configFlags)
+          removeLowerBounds
+          (fromMaybe (AllowOlder RelaxDepsNone) $ configAllowOlder configFlags)
+        . removeUpperBounds
+          (fromMaybe (AllowNewer RelaxDepsNone) $ configAllowNewer configFlags)
 
         . addPreferences
             -- preferences from the config file or command line
@@ -321,22 +341,34 @@ planLocalPackage verbosity comp platform configFlags configExFlags
 
         . addConstraints
             -- package flags from the config file or command line
-            [ let pc = PackageConstraintFlags (packageName pkg)
-                       (configConfigurationsFlags configFlags)
+            [ let pc = PackageConstraint
+                       (scopeToplevel $ packageName pkg)
+                       (PackagePropertyFlags $ configConfigurationsFlags configFlags)
               in LabeledPackageConstraint pc ConstraintSourceConfigFlagOrTarget
             ]
 
         . addConstraints
             -- '--enable-tests' and '--enable-benchmarks' constraints from
             -- the config file or command line
-            [ let pc = PackageConstraintStanzas (packageName pkg) $
+            [ let pc = PackageConstraint (scopeToplevel $ packageName pkg) .
+                       PackagePropertyStanzas $
                        [ TestStanzas  | testsEnabled ] ++
                        [ BenchStanzas | benchmarksEnabled ]
               in LabeledPackageConstraint pc ConstraintSourceConfigFlagOrTarget
             ]
 
+            -- Don't solve for executables, since we use an empty source
+            -- package database and executables never show up in the
+            -- installed package index
+        . setSolveExecutables (SolveExecutables False)
+
+        . setSolverVerbosity verbosity
+
         $ standardInstallPolicy
             installedPkgIndex
+            -- NB: We pass in an *empty* source package database,
+            -- because cabal configure assumes that all dependencies
+            -- have already been installed
             (SourcePackageDb mempty packagePrefs)
             [SpecificSourcePackage localPkg]
 
@@ -359,34 +391,78 @@ configurePackage :: Verbosity
                  -> [String]
                  -> IO ()
 configurePackage verbosity platform comp scriptOptions configFlags
-                 (ReadyPackage (ConfiguredPackage (SourcePackage _ gpkg _ _)
-                                                  flags stanzas _)
-                               deps)
+                 (ReadyPackage (ConfiguredPackage ipid spkg flags stanzas deps))
                  extraArgs =
 
   setupWrapper verbosity
     scriptOptions (Just pkg) configureCommand configureFlags extraArgs
 
   where
+    gpkg = packageDescription spkg
     configureFlags   = filterConfigureFlags configFlags {
+      configIPID = if isJust (flagToMaybe (configIPID configFlags))
+                    -- Make sure cabal configure --ipid works.
+                    then configIPID configFlags
+                    else toFlag (display ipid),
       configConfigurationsFlags = flags,
       -- We generate the legacy constraints as well as the new style precise
       -- deps.  In the end only one set gets passed to Setup.hs configure,
       -- depending on the Cabal version we are talking to.
-      configConstraints  = [ thisPackageVersion (packageId deppkg)
-                           | deppkg <- CD.nonSetupDeps deps ],
-      configDependencies = [ (packageName (Installed.sourcePackageId deppkg),
-                              Installed.installedUnitId deppkg)
-                           | deppkg <- CD.nonSetupDeps deps ],
+      configConstraints  = [ thisPackageVersion srcid
+                           | ConfiguredId srcid (Just PkgDesc.CLibName) _uid <- CD.nonSetupDeps deps ],
+      configDependencies = [ (packageName srcid, uid)
+                           | ConfiguredId srcid (Just PkgDesc.CLibName) uid <- CD.nonSetupDeps deps ],
       -- Use '--exact-configuration' if supported.
       configExactConfiguration = toFlag True,
       configVerbosity          = toFlag verbosity,
-      configBenchmarks         = toFlag (BenchStanzas `elem` stanzas),
+      -- NB: if the user explicitly specified
+      -- --enable-tests/--enable-benchmarks, always respect it.
+      -- (But if they didn't, let solver decide.)
+      configBenchmarks         = toFlag (BenchStanzas `elem` stanzas)
+                                    `mappend` configBenchmarks configFlags,
       configTests              = toFlag (TestStanzas `elem` stanzas)
+                                    `mappend` configTests configFlags
     }
 
-    pkg = case finalizePackageDescription flags
+    pkg = case finalizePD flags (enableStanzas stanzas)
            (const True)
-           platform comp [] (enableStanzas stanzas gpkg) of
-      Left _ -> error "finalizePackageDescription ReadyPackage failed"
+           platform comp [] gpkg of
+      Left _ -> error "finalizePD ReadyPackage failed"
       Right (desc, _) -> desc
+
+-- -----------------------------------------------------------------------------
+-- * Saved configure environments and flags
+-- -----------------------------------------------------------------------------
+
+-- | Read saved configure flags and restore the saved environment from the
+-- specified files.
+readConfigFlagsFrom :: FilePath  -- ^ path to saved flags file
+                    -> IO (ConfigFlags, ConfigExFlags)
+readConfigFlagsFrom flags = do
+  readCommandFlags flags configureExCommand
+
+-- | The path (relative to @--build-dir@) where the arguments to @configure@
+-- should be saved.
+cabalConfigFlagsFile :: FilePath -> FilePath
+cabalConfigFlagsFile dist = dist </> "cabal-config-flags"
+
+-- | Read saved configure flags and restore the saved environment from the
+-- usual location.
+readConfigFlags :: FilePath  -- ^ @--build-dir@
+                -> IO (ConfigFlags, ConfigExFlags)
+readConfigFlags dist =
+  readConfigFlagsFrom (cabalConfigFlagsFile dist)
+
+-- | Save the configure flags and environment to the specified files.
+writeConfigFlagsTo :: FilePath  -- ^ path to saved flags file
+                   -> Verbosity -> (ConfigFlags, ConfigExFlags)
+                   -> IO ()
+writeConfigFlagsTo file verb flags = do
+  writeCommandFlags verb file configureExCommand flags
+
+-- | Save the build flags to the usual location.
+writeConfigFlags :: Verbosity
+                 -> FilePath  -- ^ @--build-dir@
+                 -> (ConfigFlags, ConfigExFlags) -> IO ()
+writeConfigFlags verb dist =
+  writeConfigFlagsTo (cabalConfigFlagsFile dist) verb

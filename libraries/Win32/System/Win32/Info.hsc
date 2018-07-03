@@ -21,12 +21,13 @@ module System.Win32.Info where
 
 import Control.Exception (catch)
 import Foreign.Marshal.Alloc (alloca)
+import Foreign.Marshal.Utils (with)
 import Foreign.Marshal.Array (allocaArray)
 import Foreign.Ptr (Ptr, nullPtr)
 import Foreign.Storable (Storable(..))
 import System.IO.Error (isDoesNotExistError)
-import System.Win32.Types (DWORD, LPCTSTR, LPTSTR, LPVOID, UINT, WORD)
-import System.Win32.Types (failIfZero, peekTStringLen, withTString)
+import System.Win32.Types (DWORD, LPDWORD, LPCTSTR, LPTSTR, LPVOID, UINT, WORD)
+import System.Win32.Types (failIfFalse_, peekTStringLen, withTString, try)
 
 #if !MIN_VERSION_base(4,6,0)
 import Prelude hiding (catch)
@@ -35,6 +36,7 @@ import Prelude hiding (catch)
 ##include "windows_cconv.h"
 
 #include <windows.h>
+#include "alignment.h"
 
 ----------------------------------------------------------------
 -- Environment Strings
@@ -118,6 +120,18 @@ getFullPathName name = do
     try "getFullPathName"
       (\buf len -> c_GetFullPathName c_name len buf nullPtr) 512
 
+getLongPathName :: FilePath -> IO FilePath
+getLongPathName name = do
+  withTString name $ \ c_name ->
+    try "getLongPathName"
+      (c_GetLongPathName c_name) 512
+
+getShortPathName :: FilePath -> IO FilePath
+getShortPathName name = do
+  withTString name $ \ c_name ->
+    try "getShortPathName"
+      (c_GetShortPathName c_name) 512
+
 searchPath :: Maybe String -> FilePath -> String -> IO (Maybe FilePath)
 searchPath path filename ext =
   maybe ($ nullPtr) withTString path $ \p_path ->
@@ -130,20 +144,6 @@ searchPath path filename ext =
      `catch` \e -> if isDoesNotExistError e
                        then return Nothing
                        else ioError e
-
--- Support for API calls that are passed a fixed-size buffer and tell
--- you via the return value if the buffer was too small.  In that
--- case, we double the buffer size and try again.
-try :: String -> (LPTSTR -> UINT -> IO UINT) -> UINT -> IO String
-try loc f n = do
-   e <- allocaArray (fromIntegral n) $ \lptstr -> do
-          r <- failIfZero loc $ f lptstr n
-          if (r > n) then return (Left r) else do
-            str <- peekTStringLen (lptstr, fromIntegral r)
-            return (Right str)
-   case e of
-        Left n    -> try loc f n
-        Right str -> return str
 
 foreign import WINDOWS_CCONV unsafe "GetWindowsDirectoryW"
   c_getWindowsDirectory :: LPTSTR -> UINT -> IO UINT
@@ -159,6 +159,12 @@ foreign import WINDOWS_CCONV unsafe "GetTempPathW"
 
 foreign import WINDOWS_CCONV unsafe "GetFullPathNameW"
   c_GetFullPathName :: LPCTSTR -> DWORD -> LPTSTR -> Ptr LPTSTR -> IO DWORD
+
+foreign import WINDOWS_CCONV unsafe "GetLongPathNameW"
+  c_GetLongPathName :: LPCTSTR -> LPTSTR -> DWORD -> IO DWORD
+
+foreign import WINDOWS_CCONV unsafe "GetShortPathNameW"
+  c_GetShortPathName :: LPCTSTR -> LPTSTR -> DWORD -> IO DWORD
 
 foreign import WINDOWS_CCONV unsafe "SearchPathW"
   c_SearchPath :: LPCTSTR -> LPCTSTR -> LPCTSTR -> DWORD -> LPTSTR -> Ptr LPTSTR
@@ -213,7 +219,7 @@ data SYSTEM_INFO = SYSTEM_INFO
 
 instance Storable SYSTEM_INFO where
     sizeOf = const #size SYSTEM_INFO
-    alignment = sizeOf
+    alignment _ = #alignment SYSTEM_INFO
     poke buf si = do
         (#poke SYSTEM_INFO, wProcessorArchitecture) buf (siProcessorArchitecture si)
         (#poke SYSTEM_INFO, dwPageSize)             buf (siPageSize si)
@@ -352,44 +358,16 @@ type SMSetting = UINT
 
 -- %fun GetUserName :: IO String
 
-----------------------------------------------------------------
--- Version Info
-----------------------------------------------------------------
-
--- %fun GetVersionEx :: IO VersionInfo
---
--- typedef struct _OSVERSIONINFO{
---     DWORD dwOSVersionInfoSize;
---     DWORD dwMajorVersion;
---     DWORD dwMinorVersion;
---     DWORD dwBuildNumber;
---     DWORD dwPlatformId;
---     TCHAR szCSDVersion[ 128 ];
--- } OSVERSIONINFO;
-
-----------------------------------------------------------------
--- Processor features
-----------------------------------------------------------------
-
---
--- Including these lines causes problems on Win95
--- %fun IsProcessorFeaturePresent :: ProcessorFeature -> Bool
---
--- type ProcessorFeature   = DWORD
--- %dis processorFeature x = dWORD x
---
--- %const ProcessorFeature
--- % [ PF_FLOATING_POINT_PRECISION_ERRATA
--- % , PF_FLOATING_POINT_EMULATED
--- % , PF_COMPARE_EXCHANGE_DOUBLE
--- % , PF_MMX_INSTRUCTIONS_AVAILABLE
--- % ]
-
-----------------------------------------------------------------
--- System Parameter Information
-----------------------------------------------------------------
-
--- %fun SystemParametersInfo :: ?? -> Bool -> IO ??
+foreign import WINDOWS_CCONV unsafe "windows.h GetUserNameW"
+  c_GetUserName :: LPTSTR -> LPDWORD -> IO Bool
+  
+getUserName :: IO String
+getUserName =     
+  allocaArray 512 $ \ c_str -> 
+    with 512 $ \ c_len -> do
+        failIfFalse_ "GetUserName" $ c_GetUserName c_str c_len
+        len <- peek c_len
+        peekTStringLen (c_str, fromIntegral len - 1)
 
 ----------------------------------------------------------------
 -- End

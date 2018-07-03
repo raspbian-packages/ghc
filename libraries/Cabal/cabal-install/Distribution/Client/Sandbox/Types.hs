@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Client.Sandbox.Types
@@ -13,13 +12,12 @@ module Distribution.Client.Sandbox.Types (
   SandboxPackageInfo(..)
   ) where
 
-import qualified Distribution.Simple.PackageIndex as InstalledPackageIndex
-import Distribution.Client.Types (SourcePackage)
-import Distribution.Compat.Semigroup (Semigroup((<>)))
+import Prelude ()
+import Distribution.Client.Compat.Prelude
 
-#if !MIN_VERSION_base(4,8,0)
-import Data.Monoid (Monoid(..))
-#endif
+import qualified Distribution.Simple.PackageIndex as InstalledPackageIndex
+import Distribution.Client.Types (UnresolvedSourcePackage)
+
 import qualified Data.Set as S
 
 -- | Are we using a sandbox?
@@ -49,11 +47,11 @@ whenUsingSandbox (UseSandbox sandboxDir) act = act sandboxDir
 -- | Data about the packages installed in the sandbox that is passed from
 -- 'reinstallAddSourceDeps' to the solver.
 data SandboxPackageInfo = SandboxPackageInfo {
-  modifiedAddSourceDependencies :: ![SourcePackage],
+  modifiedAddSourceDependencies :: ![UnresolvedSourcePackage],
   -- ^ Modified add-source deps that we want to reinstall. These are guaranteed
   -- to be already installed in the sandbox.
 
-  otherAddSourceDependencies    :: ![SourcePackage],
+  otherAddSourceDependencies    :: ![UnresolvedSourcePackage],
   -- ^ Remaining add-source deps. Some of these may be not installed in the
   -- sandbox.
 

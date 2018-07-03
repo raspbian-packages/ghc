@@ -44,7 +44,10 @@ module GHC.Exts
         breakpoint, breakpointCond,
 
         -- * Ids with special behaviour
-        lazy, inline,
+        lazy, inline, oneShot,
+
+        -- * Running 'RealWorld' state transformers
+        runRW#,
 
         -- * Safe coercions
         --
@@ -73,6 +76,9 @@ module GHC.Exts
 
         -- * The Constraint kind
         Constraint,
+
+        -- * The Any type
+        Any,
 
         -- * Overloaded lists
         IsList(..)
@@ -118,6 +124,7 @@ sortWith f = sortBy (\x y -> compare (f x) (f y))
 groupWith :: Ord b => (a -> b) -> [a] -> [[a]]
 groupWith f xs = build (\c n -> groupByFB c n (\x y -> f x == f y) (sortWith f xs))
 
+{-# INLINE [0] groupByFB #-} -- See Note [Inline FB functions] in GHC.List
 groupByFB :: ([a] -> lst -> lst) -> lst -> (a -> a -> Bool) -> [a] -> lst
 groupByFB c n eq xs0 = groupByFBCore xs0
   where groupByFBCore [] = n
@@ -181,6 +188,7 @@ class IsList l where
   --   It should satisfy fromList . toList = id.
   toList :: l -> [Item l]
 
+-- | @since 4.7.0.0
 instance IsList [a] where
   type (Item [a]) = a
   fromList = id

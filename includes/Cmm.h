@@ -50,6 +50,7 @@
 
      CInt                 has the same size as an int in C on this platform
      CLong                has the same size as a long in C on this platform
+     CBool                has the same size as a bool in C on this platform
 
   --------------------------------------------------------------------------- */
 
@@ -94,6 +95,8 @@
 #else
 #error Unknown long size
 #endif
+
+#define CBool bits8
 
 #define F_   float32
 #define D_   float64
@@ -179,6 +182,16 @@
 #endif
 
 /* -----------------------------------------------------------------------------
+   Atomic memory operations.
+   -------------------------------------------------------------------------- */
+
+#if SIZEOF_W == 4
+#define cmpxchgW cmpxchg32
+#elif SIZEOF_W == 8
+#define cmpxchgW cmpxchg64
+#endif
+
+/* -----------------------------------------------------------------------------
    Heap/stack access, and adjusting the heap/stack pointers.
    -------------------------------------------------------------------------- */
 
@@ -219,7 +232,7 @@
  * Note the syntax is slightly different to the C version of this macro.
  */
 #ifdef DEBUG
-#define IF_DEBUG(c,s)  if (RtsFlags_DebugFlags_##c(RtsFlags) != 0::I32) { s; }
+#define IF_DEBUG(c,s)  if (RtsFlags_DebugFlags_##c(RtsFlags) != 0::CBool) { s; }
 #else
 #define IF_DEBUG(c,s)  /* nothing */
 #endif
@@ -275,7 +288,13 @@
 //    explicit jumps, for use when we are doing the stack management
 //    ourselves.
 
+#if defined(PROFILING)
+// See Note [Evaluating functions with profiling] in rts/Apply.cmm
+#define ENTER(x) jump stg_ap_0_fast(x);
+#else
 #define ENTER(x) ENTER_(return,x)
+#endif
+
 #define ENTER_R1() ENTER_(RET_R1,R1)
 
 #define RET_R1(x) jump %ENTRY_CODE(Sp(0)) [R1]
@@ -288,7 +307,6 @@
          (TO_W_( %INFO_TYPE(%STD_INFO(info)) )) {       \
   case                                                  \
     IND,                                                \
-    IND_PERM,                                           \
     IND_STATIC:                                         \
    {                                                    \
       x = StgInd_indirectee(x);                         \
@@ -326,7 +344,6 @@
 #include "DerivedConstants.h"
 #include "rts/storage/ClosureTypes.h"
 #include "rts/storage/FunTypes.h"
-#include "rts/storage/SMPClosureOps.h"
 #include "rts/OSThreads.h"
 
 /*

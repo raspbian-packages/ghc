@@ -15,6 +15,7 @@
 #define SM_MARKSTACK_H
 
 #include "BeginPrivate.h"
+#include "GCUtils.h"
 
 INLINE_HEADER void
 push_mark_stack(StgPtr p)
@@ -60,7 +61,7 @@ pop_mark_stack(void)
     return (StgPtr)*--mark_sp;
 }
 
-INLINE_HEADER rtsBool
+INLINE_HEADER bool
 mark_stack_empty(void)
 {
     return (((W_)mark_sp & BLOCK_MASK) == 0 && mark_stack_bd->link == NULL);

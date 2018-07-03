@@ -14,31 +14,35 @@ module Distribution.Simple.GHC.IPIConvert (
     convertModuleName
   ) where
 
-import qualified Distribution.Package as Current hiding (installedUnitId)
+import Prelude ()
+import Distribution.Compat.Prelude
+
+import qualified Distribution.Types.PackageId as Current
+import qualified Distribution.Types.PackageName as Current
 import qualified Distribution.License as Current
 
 import Distribution.Version
 import Distribution.ModuleName
 import Distribution.Text
 
-import Data.Maybe
-
+-- | This is a indeed a munged package id, but the constructor name cannot be
+-- changed or the Read instance (the entire point of this type) will break.
 data PackageIdentifier = PackageIdentifier {
     pkgName    :: String,
     pkgVersion :: Version
   }
   deriving Read
 
-convertPackageId :: PackageIdentifier -> Current.PackageIdentifier
+convertPackageId :: PackageIdentifier -> Current.PackageId
 convertPackageId PackageIdentifier { pkgName = n, pkgVersion = v } =
-  Current.PackageIdentifier (Current.PackageName n) v
+  Current.PackageIdentifier (Current.mkPackageName n) v
 
 data License = GPL | LGPL | BSD3 | BSD4
              | PublicDomain | AllRightsReserved | OtherLicense
   deriving Read
 
 convertModuleName :: String -> ModuleName
-convertModuleName s = fromJust $ simpleParse s
+convertModuleName s = fromMaybe (error "convertModuleName") $ simpleParse s
 
 convertLicense :: License -> Current.License
 convertLicense GPL  = Current.GPL  Nothing

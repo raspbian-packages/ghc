@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, RecordWildCards, NamedFieldPuns, DeriveGeneric #-}
+{-# LANGUAGE RecordWildCards, NamedFieldPuns, DeriveGeneric #-}
 
 -- | Project configuration, implementation in terms of legacy types.
 --
@@ -20,17 +20,21 @@ module Distribution.Client.ProjectConfig.Legacy (
     renderPackageLocationToken,
   ) where
 
+import Prelude ()
+import Distribution.Client.Compat.Prelude
+
 import Distribution.Client.ProjectConfig.Types
 import Distribution.Client.Types
          ( RemoteRepo(..), emptyRemoteRepo )
-import Distribution.Client.Dependency.Types
-         ( ConstraintSource(..) )
 import Distribution.Client.Config
          ( SavedConfig(..), remoteRepoFields )
 
+import Distribution.Solver.Types.ConstraintSource
+
 import Distribution.Package
 import Distribution.PackageDescription
-         ( SourceRepo(..), RepoKind(..) )
+         ( SourceRepo(..), RepoKind(..) 
+         , dispFlagAssignment, parseFlagAssignment )
 import Distribution.PackageDescription.Parse
          ( sourceRepoFieldDescrs )
 import Distribution.Simple.Compiler
@@ -39,8 +43,8 @@ import Distribution.Simple.Setup
          ( Flag(Flag), toFlag, fromFlagOrDefault
          , ConfigFlags(..), configureOptions
          , HaddockFlags(..), haddockOptions, defaultHaddockFlags
-         , programConfigurationPaths', splitArgs
-         , AllowNewer(..) )
+         , programDbPaths', splitArgs
+         , AllowNewer(..), AllowOlder(..), RelaxDeps(..) )
 import Distribution.Client.Setup
          ( GlobalFlags(..), globalCommand
          , ConfigExFlags(..), configureExOptions, defaultConfigExFlags
@@ -49,8 +53,6 @@ import Distribution.Simple.Program
          ( programName, knownPrograms )
 import Distribution.Simple.Program.Db
          ( ProgramDb, defaultProgramDb )
-import Distribution.Client.Targets
-         ( dispFlagAssignment, parseFlagAssignment )
 import Distribution.Simple.Utils
          ( lowercase )
 import Distribution.Utils.NubList
@@ -76,14 +78,7 @@ import Distribution.Simple.Command
          ( CommandUI(commandOptions), ShowOrParseArgs(..)
          , OptionField, option, reqArg' )
 
-#if !MIN_VERSION_base(4,8,0)
-import Control.Applicative
-#endif
-import Control.Monad
 import qualified Data.Map as Map
-import Data.Char (isSpace)
-import Distribution.Compat.Semigroup
-import GHC.Generics (Generic)
 
 ------------------------------------------------------------------
 -- Representing the project config file in terms of legacy types
@@ -242,6 +237,7 @@ convertLegacyProjectConfig
 
       projectConfigBuildOnly       = configBuildOnly,
       projectConfigShared          = configAllPackages,
+      projectConfigProvenance      = mempty,
       projectConfigLocalPackages   = configLocalPackages,
       projectConfigSpecificPackage = fmap perPackage legacySpecificConfig
     }
@@ -279,12 +275,14 @@ convertLegacyAllPackageFlags globalFlags configFlags
     } = globalFlags
 
     ConfigFlags {
+      configDistPref            = projectConfigDistDir,
       configHcFlavor            = projectConfigHcFlavor,
       configHcPath              = projectConfigHcPath,
       configHcPkg               = projectConfigHcPkg,
     --configInstallDirs         = projectConfigInstallDirs,
     --configUserInstall         = projectConfigUserInstall,
     --configPackageDBs          = projectConfigPackageDBs,
+      configAllowOlder          = projectConfigAllowOlder,
       configAllowNewer          = projectConfigAllowNewer
     } = configFlags
 
@@ -296,16 +294,21 @@ convertLegacyAllPackageFlags globalFlags configFlags
     } = configExFlags
 
     InstallFlags {
+      installProjectFileName    = projectConfigProjectFile,
       installHaddockIndex       = projectConfigHaddockIndex,
     --installReinstall          = projectConfigReinstall,
     --installAvoidReinstalls    = projectConfigAvoidReinstalls,
     --installOverrideReinstall  = projectConfigOverrideReinstall,
+      installIndexState         = projectConfigIndexState,
       installMaxBackjumps       = projectConfigMaxBackjumps,
     --installUpgradeDeps        = projectConfigUpgradeDeps,
       installReorderGoals       = projectConfigReorderGoals,
+      installCountConflicts     = projectConfigCountConflicts,
+      installPerComponent       = projectConfigPerComponent,
     --installIndependentGoals   = projectConfigIndependentGoals,
     --installShadowPkgs         = projectConfigShadowPkgs,
-      installStrongFlags        = projectConfigStrongFlags
+      installStrongFlags        = projectConfigStrongFlags,
+      installAllowBootLibInstalls = projectConfigAllowBootLibInstalls
     } = installFlags
 
 
@@ -364,6 +367,7 @@ convertLegacyPerPackageFlags configFlags installFlags haddockFlags =
       haddockHoogle             = packageConfigHaddockHoogle,
       haddockHtml               = packageConfigHaddockHtml,
       haddockHtmlLocation       = packageConfigHaddockHtmlLocation,
+      haddockForeignLibs        = packageConfigHaddockForeignLibs,
       haddockExecutables        = packageConfigHaddockExecutables,
       haddockTestSuites         = packageConfigHaddockTestSuites,
       haddockBenchmarks         = packageConfigHaddockBenchmarks,
@@ -389,9 +393,10 @@ convertLegacyBuildOnlyFlags globalFlags configFlags
     GlobalFlags {
       globalCacheDir          = projectConfigCacheDir,
       globalLogsDir           = projectConfigLogsDir,
-      globalWorldFile         = projectConfigWorldFile,
+      globalWorldFile         = _,
       globalHttpTransport     = projectConfigHttpTransport,
-      globalIgnoreExpiry      = projectConfigIgnoreExpiry
+      globalIgnoreExpiry      = projectConfigIgnoreExpiry,
+      globalStoreDir          = projectConfigStoreDir
     } = globalFlags
 
     ConfigFlags {
@@ -402,7 +407,7 @@ convertLegacyBuildOnlyFlags globalFlags configFlags
       installDryRun             = projectConfigDryRun,
       installOnly               = _,
       installOnlyDeps           = projectConfigOnlyDeps,
-      installRootCmd            = projectConfigRootCmd,
+      installRootCmd            = _,
       installSummaryFile        = projectConfigSummaryFile,
       installLogFile            = projectConfigLogFile,
       installBuildReports       = projectConfigBuildReports,
@@ -410,6 +415,7 @@ convertLegacyBuildOnlyFlags globalFlags configFlags
       installSymlinkBinDir      = projectConfigSymlinkBinDir,
       installOneShot            = projectConfigOneShot,
       installNumJobs            = projectConfigNumJobs,
+      installKeepGoing          = projectConfigKeepGoing,
       installOfflineMode        = projectConfigOfflineMode
     } = installFlags
 
@@ -465,15 +471,19 @@ convertToLegacySharedConfig
       globalCacheDir          = projectConfigCacheDir,
       globalLocalRepos        = projectConfigLocalRepos,
       globalLogsDir           = projectConfigLogsDir,
-      globalWorldFile         = projectConfigWorldFile,
+      globalWorldFile         = mempty,
       globalRequireSandbox    = mempty,
       globalIgnoreSandbox     = mempty,
       globalIgnoreExpiry      = projectConfigIgnoreExpiry,
-      globalHttpTransport     = projectConfigHttpTransport
+      globalHttpTransport     = projectConfigHttpTransport,
+      globalNix               = mempty,
+      globalStoreDir          = projectConfigStoreDir
     }
 
     configFlags = mempty {
       configVerbosity     = projectConfigVerbosity,
+      configDistPref      = projectConfigDistDir,
+      configAllowOlder    = projectConfigAllowOlder,
       configAllowNewer    = projectConfigAllowNewer
     }
 
@@ -494,21 +504,27 @@ convertToLegacySharedConfig
       installMaxBackjumps      = projectConfigMaxBackjumps,
       installUpgradeDeps       = mempty, --projectConfigUpgradeDeps,
       installReorderGoals      = projectConfigReorderGoals,
+      installCountConflicts    = projectConfigCountConflicts,
       installIndependentGoals  = mempty, --projectConfigIndependentGoals,
       installShadowPkgs        = mempty, --projectConfigShadowPkgs,
       installStrongFlags       = projectConfigStrongFlags,
+      installAllowBootLibInstalls = projectConfigAllowBootLibInstalls,
       installOnly              = mempty,
       installOnlyDeps          = projectConfigOnlyDeps,
-      installRootCmd           = projectConfigRootCmd,
+      installIndexState        = projectConfigIndexState,
+      installRootCmd           = mempty, --no longer supported
       installSummaryFile       = projectConfigSummaryFile,
       installLogFile           = projectConfigLogFile,
       installBuildReports      = projectConfigBuildReports,
       installReportPlanningFailure = projectConfigReportPlanningFailure,
       installSymlinkBinDir     = projectConfigSymlinkBinDir,
+      installPerComponent      = projectConfigPerComponent,
       installOneShot           = projectConfigOneShot,
       installNumJobs           = projectConfigNumJobs,
+      installKeepGoing         = projectConfigKeepGoing,
       installRunTests          = mempty,
-      installOfflineMode       = projectConfigOfflineMode
+      installOfflineMode       = projectConfigOfflineMode,
+      installProjectFileName   = projectConfigProjectFile
     }
 
 
@@ -526,6 +542,7 @@ convertToLegacyAllPackageConfig
     }
   where
     configFlags = ConfigFlags {
+      configArgs                = mempty,
       configPrograms_           = mempty,
       configProgramPaths        = mempty,
       configProgramArgs         = mempty,
@@ -533,6 +550,7 @@ convertToLegacyAllPackageConfig
       configHcFlavor            = projectConfigHcFlavor,
       configHcPath              = projectConfigHcPath,
       configHcPkg               = projectConfigHcPkg,
+      configInstantiateWith     = mempty,
       configVanillaLib          = mempty,
       configProfLib             = mempty,
       configSharedLib           = mempty,
@@ -548,6 +566,7 @@ convertToLegacyAllPackageConfig
       configInstallDirs         = mempty,
       configScratchDir          = mempty,
       configDistPref            = mempty,
+      configCabalFilePath       = mempty,
       configVerbosity           = mempty,
       configUserInstall         = mempty, --projectConfigUserInstall,
       configPackageDBs          = mempty, --projectConfigPackageDBs,
@@ -560,7 +579,9 @@ convertToLegacyAllPackageConfig
       configConstraints         = mempty,
       configDependencies        = mempty,
       configExtraIncludeDirs    = mempty,
+      configDeterministic       = mempty,
       configIPID                = mempty,
+      configCID                 = mempty,
       configConfigurationsFlags = mempty,
       configTests               = mempty,
       configCoverage            = mempty, --TODO: don't merge
@@ -570,6 +591,7 @@ convertToLegacyAllPackageConfig
       configFlagError           = mempty,                --TODO: ???
       configRelocatable         = mempty,
       configDebugInfo           = mempty,
+      configAllowOlder          = mempty,
       configAllowNewer          = mempty
     }
 
@@ -587,6 +609,7 @@ convertToLegacyPerPackageConfig PackageConfig {..} =
     }
   where
     configFlags = ConfigFlags {
+      configArgs                = mempty,
       configPrograms_           = configPrograms_ mempty,
       configProgramPaths        = Map.toList (getMapLast packageConfigProgramPaths),
       configProgramArgs         = Map.toList (getMapMappend packageConfigProgramArgs),
@@ -594,6 +617,7 @@ convertToLegacyPerPackageConfig PackageConfig {..} =
       configHcFlavor            = mempty,
       configHcPath              = mempty,
       configHcPkg               = mempty,
+      configInstantiateWith     = mempty,
       configVanillaLib          = packageConfigVanillaLib,
       configProfLib             = packageConfigProfLib,
       configSharedLib           = packageConfigSharedLib,
@@ -609,6 +633,7 @@ convertToLegacyPerPackageConfig PackageConfig {..} =
       configInstallDirs         = mempty,
       configScratchDir          = mempty,
       configDistPref            = mempty,
+      configCabalFilePath       = mempty,
       configVerbosity           = mempty,
       configUserInstall         = mempty,
       configPackageDBs          = mempty,
@@ -622,6 +647,8 @@ convertToLegacyPerPackageConfig PackageConfig {..} =
       configDependencies        = mempty,
       configExtraIncludeDirs    = packageConfigExtraIncludeDirs,
       configIPID                = mempty,
+      configCID                 = mempty,
+      configDeterministic       = mempty,
       configConfigurationsFlags = packageConfigFlagAssignment,
       configTests               = packageConfigTests,
       configCoverage            = packageConfigCoverage, --TODO: don't merge
@@ -631,6 +658,7 @@ convertToLegacyPerPackageConfig PackageConfig {..} =
       configFlagError           = mempty,                --TODO: ???
       configRelocatable         = packageConfigRelocatable,
       configDebugInfo           = packageConfigDebugInfo,
+      configAllowOlder          = mempty,
       configAllowNewer          = mempty
     }
 
@@ -646,6 +674,7 @@ convertToLegacyPerPackageConfig PackageConfig {..} =
       haddockHtml          = packageConfigHaddockHtml,
       haddockHtmlLocation  = packageConfigHaddockHtmlLocation,
       haddockForHackage    = mempty, --TODO: added recently
+      haddockForeignLibs   = packageConfigHaddockForeignLibs,
       haddockExecutables   = packageConfigHaddockExecutables,
       haddockTestSuites    = packageConfigHaddockTestSuites,
       haddockBenchmarks    = packageConfigHaddockBenchmarks,
@@ -773,7 +802,7 @@ legacySharedConfigFieldDescrs =
       ]
   . filterFields
       [ "remote-repo-cache"
-      , "logs-dir", "world-file", "ignore-expiry", "http-transport"
+      , "logs-dir", "store-dir", "ignore-expiry", "http-transport"
       ]
   . commandOptionsToFields
   ) (commandOptions (globalCommand []) ParseArgs)
@@ -782,11 +811,18 @@ legacySharedConfigFieldDescrs =
       legacyConfigureShFlags
       (\flags conf -> conf { legacyConfigureShFlags = flags })
   . addFields
-      [ simpleField "allow-newer"
-        (maybe mempty dispAllowNewer) (fmap Just parseAllowNewer)
-        configAllowNewer (\v conf -> conf { configAllowNewer = v })
+      [ monoidField "allow-older"
+        (maybe mempty dispRelaxDeps) (fmap Just parseRelaxDeps)
+        (fmap unAllowOlder . configAllowOlder)
+        (\v conf -> conf { configAllowOlder = fmap AllowOlder v })
       ]
-  . filterFields ["verbose"]
+  . addFields
+      [ monoidField "allow-newer"
+        (maybe mempty dispRelaxDeps) (fmap Just parseRelaxDeps)
+        (fmap unAllowNewer . configAllowNewer)
+        (\v conf -> conf { configAllowNewer = fmap AllowNewer v })
+      ]
+  . filterFields ["verbose", "builddir" ]
   . commandOptionsToFields
   ) (configureOptions ParseArgs)
  ++
@@ -823,26 +859,27 @@ legacySharedConfigFieldDescrs =
       , "root-cmd", "symlink-bindir"
       , "build-log"
       , "remote-build-reporting", "report-planning-failure"
-      , "one-shot", "jobs", "offline"
+      , "one-shot", "jobs", "keep-going", "offline", "per-component"
         -- solver flags:
-      , "max-backjumps", "reorder-goals", "strong-flags"
+      , "max-backjumps", "reorder-goals", "count-conflicts", "strong-flags"
+      , "allow-boot-library-installs", "index-state"
       ]
   . commandOptionsToFields
   ) (installOptions ParseArgs)
   where
     constraintSrc = ConstraintSourceProjectConfig "TODO"
 
-parseAllowNewer :: ReadP r AllowNewer
-parseAllowNewer =
-     ((const AllowNewerNone <$> (Parse.string "none" +++ Parse.string "None"))
-  +++ (const AllowNewerAll  <$> (Parse.string "all"  +++ Parse.string "All")))
-  <++ (      AllowNewerSome <$> parseOptCommaList parse)
+parseRelaxDeps :: ReadP r RelaxDeps
+parseRelaxDeps =
+     ((const RelaxDepsNone <$> (Parse.string "none" +++ Parse.string "None"))
+  +++ (const RelaxDepsAll  <$> (Parse.string "all"  +++ Parse.string "All")))
+  <++ (      RelaxDepsSome <$> parseOptCommaList parse)
 
-dispAllowNewer :: AllowNewer -> Doc
-dispAllowNewer  AllowNewerNone       = Disp.text "None"
-dispAllowNewer (AllowNewerSome pkgs) = Disp.fsep . Disp.punctuate Disp.comma
-                                                 . map disp $ pkgs
-dispAllowNewer  AllowNewerAll        = Disp.text "All"
+dispRelaxDeps :: RelaxDeps -> Doc
+dispRelaxDeps  RelaxDepsNone       = Disp.text "None"
+dispRelaxDeps (RelaxDepsSome pkgs) = Disp.fsep . Disp.punctuate Disp.comma
+                                               . map disp $ pkgs
+dispRelaxDeps  RelaxDepsAll        = Disp.text "All"
 
 
 legacyPackageConfigFieldDescrs :: [FieldDescr LegacyPackageConfig]
@@ -877,13 +914,13 @@ legacyPackageConfigFieldDescrs =
           (\v conf -> conf { configConfigurationsFlags = v })
       ]
   . filterFields
-      [ "compiler", "with-compiler", "with-hc-pkg"
+      [ "with-compiler", "with-hc-pkg"
       , "program-prefix", "program-suffix"
       , "library-vanilla", "library-profiling"
       , "shared", "executable-dynamic"
       , "profiling", "executable-profiling"
       , "profiling-detail", "library-profiling-detail"
-      , "optimization", "debug-info", "library-for-ghci", "split-objs"
+      , "library-for-ghci", "split-objs"
       , "executable-stripping", "library-stripping"
       , "tests", "benchmarks"
       , "coverage", "library-coverage"
@@ -919,6 +956,7 @@ legacyPackageConfigFieldDescrs =
       ("haddock-"++)
   . filterFields
       [ "hoogle", "html", "html-location"
+      , "foreign-libraries"
       , "executables", "tests", "benchmarks", "all", "internal", "css"
       , "hyperlink-source", "hscolour-css"
       , "contents-location", "keep-temp-files"
@@ -1081,11 +1119,11 @@ packageSpecificOptionsSectionDescr =
 programOptionsFieldDescrs :: (a -> [(String, [String])])
                           -> ([(String, [String])] -> a -> a)
                           -> [FieldDescr a]
-programOptionsFieldDescrs get set =
+programOptionsFieldDescrs get' set =
     commandOptionsToFields
-  $ programConfigurationOptions
+  $ programDbOptions
       defaultProgramDb
-      ParseArgs get set
+      ParseArgs get' set
 
 programOptionsSectionDescr :: SectionDescr LegacyPackageConfig
 programOptionsSectionDescr =
@@ -1110,7 +1148,7 @@ programOptionsSectionDescr =
 programLocationsFieldDescrs :: [FieldDescr ConfigFlags]
 programLocationsFieldDescrs =
      commandOptionsToFields
-   $ programConfigurationPaths'
+   $ programDbPaths'
        (++ "-location")
        defaultProgramDb
        ParseArgs
@@ -1136,25 +1174,25 @@ programLocationsSectionDescr =
     }
 
 
--- | For each known program @PROG@ in 'progConf', produce a @PROG-options@
+-- | For each known program @PROG@ in 'progDb', produce a @PROG-options@
 -- 'OptionField'.
-programConfigurationOptions
+programDbOptions
   :: ProgramDb
   -> ShowOrParseArgs
   -> (flags -> [(String, [String])])
   -> ([(String, [String])] -> (flags -> flags))
   -> [OptionField flags]
-programConfigurationOptions progConf showOrParseArgs get set =
+programDbOptions progDb showOrParseArgs get' set =
   case showOrParseArgs of
     -- we don't want a verbose help text list so we just show a generic one:
     ShowArgs  -> [programOptions  "PROG"]
     ParseArgs -> map (programOptions . programName . fst)
-                 (knownPrograms progConf)
+                 (knownPrograms progDb)
   where
     programOptions prog =
       option "" [prog ++ "-options"]
         ("give extra options to " ++ prog)
-        get set
+        get' set
         (reqArg' "OPTS" (\args -> [(prog, splitArgs args)])
            (\progArgs -> [ joinsArgs args
                          | (prog', args) <- progArgs, prog==prog' ]))
@@ -1213,12 +1251,21 @@ newLineListField = listFieldWithSep Disp.sep
 -- of parseOptCommaList below
 listFieldWithSep :: ([Doc] -> Doc) -> String -> (a -> Doc) -> ReadP [a] a
                  -> (b -> [a]) -> ([a] -> b -> b) -> FieldDescr b
-listFieldWithSep separator name showF readF get set =
-  liftField get set' $
+listFieldWithSep separator name showF readF get' set =
+  liftField get' set' $
     ParseUtils.field name showF' (parseOptCommaList readF)
   where
-    set' xs b = set (get b ++ xs) b
+    set' xs b = set (get' b ++ xs) b
     showF'    = separator . map showF
+
+-- | Parser combinator for simple fields which uses the field type's
+-- 'Monoid' instance for combining multiple occurences of the field.
+monoidField :: Monoid a => String -> (a -> Doc) -> ReadP a a
+            -> (b -> a) -> (a -> b -> b) -> FieldDescr b
+monoidField name showF readF get' set =
+  liftField get' set' $ ParseUtils.field name showF readF
+  where
+    set' xs b = set (get' b `mappend` xs) b
 
 --TODO: [code cleanup] local redefinition that should replace the version in
 -- D.ParseUtils. This version avoid parse ambiguity for list element parsers

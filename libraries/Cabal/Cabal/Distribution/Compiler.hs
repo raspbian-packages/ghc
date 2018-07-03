@@ -15,8 +15,8 @@
 -- case analysis on this compiler flavour enumeration like:
 --
 -- > case compilerFlavor comp of
--- >   GHC -> GHC.getInstalledPackages verbosity packageDb progconf
--- >   JHC -> JHC.getInstalledPackages verbosity packageDb progconf
+-- >   GHC -> GHC.getInstalledPackages verbosity packageDb progdb
+-- >   JHC -> JHC.getInstalledPackages verbosity packageDb progdb
 --
 -- Obviously it would be better to use the proper 'Compiler' abstraction
 -- because that would keep all the compiler-specific code together.
@@ -32,6 +32,7 @@ module Distribution.Compiler (
   buildCompilerFlavor,
   defaultCompilerFlavor,
   parseCompilerFlavorCompat,
+  classifyCompilerFlavor,
 
   -- * Compiler id
   CompilerId(..),
@@ -42,27 +43,22 @@ module Distribution.Compiler (
   AbiTag(..), abiTagString
   ) where
 
-import Distribution.Compat.Binary
+import Prelude ()
+import Distribution.Compat.Prelude
+
 import Language.Haskell.Extension
 
-import Data.Data (Data)
-import Data.Typeable (Typeable)
-import Data.Maybe (fromMaybe)
-import Distribution.Version (Version(..))
-import GHC.Generics (Generic)
+import Distribution.Version (Version, mkVersion', nullVersion)
 
 import qualified System.Info (compilerName, compilerVersion)
 import Distribution.Text (Text(..), display)
 import qualified Distribution.Compat.ReadP as Parse
 import qualified Text.PrettyPrint as Disp
-import Text.PrettyPrint ((<>))
 
-import qualified Data.Char as Char (toLower, isDigit, isAlphaNum)
-import Control.Monad (when)
-
-data CompilerFlavor = GHC | GHCJS | NHC | YHC | Hugs | HBC | Helium | JHC | LHC | UHC
-                    | HaskellSuite String -- string is the id of the actual compiler
-                    | OtherCompiler String
+data CompilerFlavor =
+  GHC | GHCJS | NHC | YHC | Hugs | HBC | Helium | JHC | LHC | UHC
+  | HaskellSuite String -- string is the id of the actual compiler
+  | OtherCompiler String
   deriving (Generic, Show, Read, Eq, Ord, Typeable, Data)
 
 instance Binary CompilerFlavor
@@ -77,8 +73,8 @@ instance Text CompilerFlavor where
   disp other                = Disp.text (lowercase (show other))
 
   parse = do
-    comp <- Parse.munch1 Char.isAlphaNum
-    when (all Char.isDigit comp) Parse.pfail
+    comp <- Parse.munch1 isAlphaNum
+    when (all isDigit comp) Parse.pfail
     return (classifyCompilerFlavor comp)
 
 classifyCompilerFlavor :: String -> CompilerFlavor
@@ -103,8 +99,8 @@ classifyCompilerFlavor s =
 --
 parseCompilerFlavorCompat :: Parse.ReadP r CompilerFlavor
 parseCompilerFlavorCompat = do
-  comp <- Parse.munch1 Char.isAlphaNum
-  when (all Char.isDigit comp) Parse.pfail
+  comp <- Parse.munch1 isAlphaNum
+  when (all isDigit comp) Parse.pfail
   case lookup comp compilerMap of
     Just compiler -> return compiler
     Nothing       -> return (OtherCompiler comp)
@@ -117,7 +113,7 @@ buildCompilerFlavor :: CompilerFlavor
 buildCompilerFlavor = classifyCompilerFlavor System.Info.compilerName
 
 buildCompilerVersion :: Version
-buildCompilerVersion = System.Info.compilerVersion
+buildCompilerVersion = mkVersion' System.Info.compilerVersion
 
 buildCompilerId :: CompilerId
 buildCompilerId = CompilerId buildCompilerFlavor buildCompilerVersion
@@ -143,31 +139,35 @@ data CompilerId = CompilerId CompilerFlavor Version
 instance Binary CompilerId
 
 instance Text CompilerId where
-  disp (CompilerId f (Version [] _)) = disp f
-  disp (CompilerId f v) = disp f <> Disp.char '-' <> disp v
+  disp (CompilerId f v)
+    | v == nullVersion = disp f
+    | otherwise        = disp f <<>> Disp.char '-' <<>> disp v
 
   parse = do
     flavour <- parse
-    version <- (Parse.char '-' >> parse) Parse.<++ return (Version [] [])
+    version <- (Parse.char '-' >> parse) Parse.<++ return nullVersion
     return (CompilerId flavour version)
 
 lowercase :: String -> String
-lowercase = map Char.toLower
+lowercase = map toLower
 
 -- ------------------------------------------------------------
 -- * Compiler Info
 -- ------------------------------------------------------------
 
--- | Compiler information used for resolving configurations. Some fields can be
---   set to Nothing to indicate that the information is unknown.
+-- | Compiler information used for resolving configurations. Some
+--   fields can be set to Nothing to indicate that the information is
+--   unknown.
 
 data CompilerInfo = CompilerInfo {
          compilerInfoId         :: CompilerId,
          -- ^ Compiler flavour and version.
          compilerInfoAbiTag     :: AbiTag,
-         -- ^ Tag for distinguishing incompatible ABI's on the same architecture/os.
+         -- ^ Tag for distinguishing incompatible ABI's on the same
+         -- architecture/os.
          compilerInfoCompat     :: Maybe [CompilerId],
-         -- ^ Other implementations that this compiler claims to be compatible with, if known.
+         -- ^ Other implementations that this compiler claims to be
+         -- compatible with, if known.
          compilerInfoLanguages  :: Maybe [Language],
          -- ^ Supported language standards, if known.
          compilerInfoExtensions :: Maybe [Extension]
@@ -189,7 +189,7 @@ instance Text AbiTag where
   disp (AbiTag tag) = Disp.text tag
 
   parse = do
-    tag <- Parse.munch (\c -> Char.isAlphaNum c || c == '_')
+    tag <- Parse.munch (\c -> isAlphaNum c || c == '_')
     if null tag then return NoAbiTag else return (AbiTag tag)
 
 abiTagString :: AbiTag -> String

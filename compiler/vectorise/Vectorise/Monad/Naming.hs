@@ -35,7 +35,7 @@ import Control.Monad
 
 -- |Create a localised variant of a name, using the provided function to transform its `OccName`.
 --
--- If the name external, encode the orignal name's module into the new 'OccName'.  The result is
+-- If the name external, encode the original name's module into the new 'OccName'.  The result is
 -- always an internal system name.
 --
 mkLocalisedName :: (Maybe String -> OccName -> OccName) -> Name -> VM Name
@@ -123,7 +123,7 @@ newTyVar fs k
  = do u <- liftDs newUnique
       return $ mkTyVar (mkSysTvName u fs) k
 
--- |Mkae a fresh coercion variable with the given kind.
+-- |Make a fresh coercion variable with the given kind.
 newCoVar :: FastString -> Kind -> VM Var
 newCoVar fs k
   = do u <- liftDs newUnique

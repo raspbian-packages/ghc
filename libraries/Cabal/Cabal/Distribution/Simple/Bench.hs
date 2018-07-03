@@ -1,3 +1,6 @@
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Simple.Bench
@@ -15,6 +18,10 @@ module Distribution.Simple.Bench
     ( bench
     ) where
 
+import Prelude ()
+import Distribution.Compat.Prelude
+
+import Distribution.Types.UnqualComponentName
 import qualified Distribution.PackageDescription as PD
 import Distribution.Simple.BuildPaths
 import Distribution.Simple.Compiler
@@ -25,7 +32,6 @@ import Distribution.Simple.UserHooks
 import Distribution.Simple.Utils
 import Distribution.Text
 
-import Control.Monad ( when, unless, forM )
 import System.Exit ( ExitCode(..), exitFailure, exitSuccess )
 import System.Directory ( doesFileExist )
 import System.FilePath ( (</>), (<.>) )
@@ -40,23 +46,19 @@ bench args pkg_descr lbi flags = do
     let verbosity         = fromFlag $ benchmarkVerbosity flags
         benchmarkNames    = args
         pkgBenchmarks     = PD.benchmarks pkg_descr
-        enabledBenchmarks = [ t | t <- pkgBenchmarks
-                            , PD.benchmarkEnabled t
-                            , PD.buildable (PD.benchmarkBuildInfo t) ]
+        enabledBenchmarks = map fst (LBI.enabledBenchLBIs pkg_descr lbi)
 
         -- Run the benchmark
         doBench :: PD.Benchmark -> IO ExitCode
         doBench bm =
             case PD.benchmarkInterface bm of
               PD.BenchmarkExeV10 _ _ -> do
-                  let cmd = LBI.buildDir lbi </> PD.benchmarkName bm
-                            </> PD.benchmarkName bm <.> exeExtension
+                  let cmd = LBI.buildDir lbi </> name </> name <.> exeExtension
                       options = map (benchOption pkg_descr lbi bm) $
                                 benchmarkOptions flags
-                      name = PD.benchmarkName bm
                   -- Check that the benchmark executable exists.
                   exists <- doesFileExist cmd
-                  unless exists $ die $
+                  unless exists $ die' verbosity $
                       "Error: Could not find benchmark program \""
                       ++ cmd ++ "\". Did you build the package first?"
 
@@ -69,34 +71,35 @@ bench args pkg_descr lbi flags = do
 
               _ -> do
                   notice verbosity $ "No support for running "
-                      ++ "benchmark " ++ PD.benchmarkName bm ++ " of type: "
-                      ++ show (disp $ PD.benchmarkType bm)
+                      ++ "benchmark " ++ name ++ " of type: "
+                      ++ display (PD.benchmarkType bm)
                   exitFailure
+          where name = unUnqualComponentName $ PD.benchmarkName bm
 
     unless (PD.hasBenchmarks pkg_descr) $ do
         notice verbosity "Package has no benchmarks."
         exitSuccess
 
     when (PD.hasBenchmarks pkg_descr && null enabledBenchmarks) $
-        die $ "No benchmarks enabled. Did you remember to configure with "
+        die' verbosity $ "No benchmarks enabled. Did you remember to configure with "
               ++ "\'--enable-benchmarks\'?"
 
     bmsToRun <- case benchmarkNames of
             [] -> return enabledBenchmarks
-            names -> forM names $ \bmName ->
+            names -> for names $ \bmName ->
                 let benchmarkMap = zip enabledNames enabledBenchmarks
                     enabledNames = map PD.benchmarkName enabledBenchmarks
                     allNames = map PD.benchmarkName pkgBenchmarks
-                in case lookup bmName benchmarkMap of
+                in case lookup (mkUnqualComponentName bmName) benchmarkMap of
                     Just t -> return t
-                    _ | bmName `elem` allNames ->
-                          die $ "Package configured with benchmark "
+                    _ | mkUnqualComponentName bmName `elem` allNames ->
+                          die' verbosity $ "Package configured with benchmark "
                                 ++ bmName ++ " disabled."
-                      | otherwise -> die $ "no such benchmark: " ++ bmName
+                      | otherwise -> die' verbosity $ "no such benchmark: " ++ bmName
 
     let totalBenchmarks = length bmsToRun
     notice verbosity $ "Running " ++ show totalBenchmarks ++ " benchmarks..."
-    exitcodes <- mapM doBench bmsToRun
+    exitcodes <- traverse doBench bmsToRun
     let allOk = totalBenchmarks == length (filter (== ExitSuccess) exitcodes)
     unless allOk exitFailure
   where
@@ -120,4 +123,4 @@ benchOption pkg_descr lbi bm template =
     env = initialPathTemplateEnv
           (PD.package pkg_descr) (LBI.localUnitId lbi)
           (compilerInfo $ LBI.compiler lbi) (LBI.hostPlatform lbi) ++
-          [(BenchmarkNameVar, toPathTemplate $ PD.benchmarkName bm)]
+          [(BenchmarkNameVar, toPathTemplate $ unUnqualComponentName $ PD.benchmarkName bm)]

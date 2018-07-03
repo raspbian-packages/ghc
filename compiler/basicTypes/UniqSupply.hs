@@ -48,7 +48,9 @@ import Data.Char
 ************************************************************************
 -}
 
--- | A value of type 'UniqSupply' is unique, and it can
+-- | Unique Supply
+--
+-- A value of type 'UniqSupply' is unique, and it can
 -- supply /one/ distinct 'Unique'.  Also, from the supply, one can
 -- also manufacture an arbitrary number of further 'UniqueSupply' values,
 -- which will be distinct from the first and from all others.
@@ -75,7 +77,7 @@ takeUniqFromSupply :: UniqSupply -> (Unique, UniqSupply)
 -- ^ Obtain the 'Unique' from this particular 'UniqSupply', and a new supply
 
 mkSplitUniqSupply c
-  = case ord c `shiftL` UNIQUE_BITS of
+  = case ord c `shiftL` uNIQUE_BITS of
      mask -> let
         -- here comes THE MAGIC:
 
@@ -129,7 +131,6 @@ splitUniqSupply4 us = (us1, us2, us3, us4)
 newtype UniqSM result = USM { unUSM :: UniqSupply -> (# result, UniqSupply #) }
 
 instance Monad UniqSM where
-  return = pure
   (>>=) = thenUs
   (>>)  = (*>)
 

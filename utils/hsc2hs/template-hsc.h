@@ -26,9 +26,12 @@ void *hsc_stdout(void);
 #if __NHC__
 #define hsc_line(line, file) \
     hsc_printf ("# %d \"%s\"\n", line, file);
+#define hsc_column(column)
 #else
 #define hsc_line(line, file) \
     hsc_printf ("{-# LINE %d \"%s\" #-}\n", line, file);
+#define hsc_column(column) \
+    hsc_printf ("{-# COLUMN %d #-}", column);
 #endif
 
 #define hsc_const(x...)                               \
@@ -85,8 +88,14 @@ void *hsc_stdout(void);
 #define hsc_size(t...) \
     hsc_printf("(%ld)", (long) sizeof(t));
 
-#define hsc_alignment(t...) \
-    hsc_printf("(%ld)", (long) offsetof(struct {char x__; t (y__); }, y__));
+#define hsc_alignment(x...)                                           \
+  do {                                                                \
+    struct __anon_x__ {                                               \
+      char a;                                                         \
+      x b;                                                            \
+    };                                                                \
+    hsc_printf("%lu", (unsigned long)offsetof(struct __anon_x__, b)); \
+  } while (0)
 
 #define hsc_enum(t, f, print_name, x)                   \
     print_name;                                         \

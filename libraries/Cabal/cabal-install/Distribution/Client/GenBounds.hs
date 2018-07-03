@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Client.GenBounds
@@ -14,8 +15,6 @@ module Distribution.Client.GenBounds (
     genBounds
   ) where
 
-import Data.Version
-         ( Version(..), showVersion )
 import Distribution.Client.Init
          ( incVersion )
 import Distribution.Client.Freeze
@@ -25,26 +24,36 @@ import Distribution.Client.Sandbox.Types
 import Distribution.Client.Setup
          ( GlobalFlags(..), FreezeFlags(..), RepoContext )
 import Distribution.Package
-         ( Package(..), Dependency(..), PackageName(..)
-         , packageName, packageVersion )
+         ( Package(..), unPackageName, packageName, packageVersion )
 import Distribution.PackageDescription
          ( buildDepends )
 import Distribution.PackageDescription.Configuration
-         ( finalizePackageDescription )
+         ( finalizePD )
+#ifdef CABAL_PARSEC
+import Distribution.PackageDescription.Parsec
+         ( readGenericPackageDescription )
+#else
 import Distribution.PackageDescription.Parse
-         ( readPackageDescription )
+         ( readGenericPackageDescription )
+#endif
+import Distribution.Types.ComponentRequestedSpec
+         ( defaultComponentRequestedSpec )
+import Distribution.Types.Dependency
 import Distribution.Simple.Compiler
          ( Compiler, PackageDBStack, compilerInfo )
 import Distribution.Simple.Program
-         ( ProgramConfiguration )
+         ( ProgramDb )
 import Distribution.Simple.Utils
          ( tryFindPackageDesc )
 import Distribution.System
          ( Platform )
+import Distribution.Text
+         ( display )
 import Distribution.Verbosity
          ( Verbosity )
 import Distribution.Version
-         ( LowerBound(..), UpperBound(..), VersionRange(..), asVersionIntervals
+         ( Version, alterVersion
+         , LowerBound(..), UpperBound(..), VersionRange(..), asVersionIntervals
          , orLaterVersion, earlierVersion, intersectVersionRanges )
 import System.Directory
          ( getCurrentDirectory )
@@ -69,7 +78,7 @@ pvpize v = orLaterVersion (vn 3)
            `intersectVersionRanges`
            earlierVersion (incVersion 1 (vn 2))
   where
-    vn n = (v { versionBranch = take n (versionBranch v) })
+    vn n = alterVersion (take n) v
 
 -- | Show the PVP-mandated version range for this package. The @padTo@ parameter
 -- specifies the width of the package name column.
@@ -85,7 +94,7 @@ showBounds padTo p = unwords $
     showInterval (LowerBound _ _, NoUpperBound) =
       error "Error: expected upper bound...this should never happen!"
     showInterval (LowerBound l _, UpperBound u _) =
-      unwords [">=", showVersion l, "&& <", showVersion u]
+      unwords [">=", display l, "&& <", display u]
 
 -- | Entry point for the @gen-bounds@ command.
 genBounds
@@ -94,22 +103,25 @@ genBounds
     -> RepoContext
     -> Compiler
     -> Platform
-    -> ProgramConfiguration
+    -> ProgramDb
     -> Maybe SandboxPackageInfo
     -> GlobalFlags
     -> FreezeFlags
     -> IO ()
-genBounds verbosity packageDBs repoCtxt comp platform conf mSandboxPkgInfo
+genBounds verbosity packageDBs repoCtxt comp platform progdb mSandboxPkgInfo
       globalFlags freezeFlags = do
 
     let cinfo = compilerInfo comp
 
     cwd <- getCurrentDirectory
     path <- tryFindPackageDesc cwd
-    gpd <- readPackageDescription verbosity path
-    let epd = finalizePackageDescription [] (const True) platform cinfo [] gpd
+    gpd <- readGenericPackageDescription verbosity path
+    -- NB: We don't enable tests or benchmarks, since often they
+    -- don't really have useful bounds.
+    let epd = finalizePD [] defaultComponentRequestedSpec
+                    (const True) platform cinfo [] gpd
     case epd of
-      Left _ -> putStrLn "finalizePackageDescription failed"
+      Left _ -> putStrLn "finalizePD failed"
       Right (pd,_) -> do
         let needBounds = filter (not . hasUpperBound . depVersion) $
                          buildDepends pd
@@ -121,7 +133,7 @@ genBounds verbosity packageDBs repoCtxt comp platform conf mSandboxPkgInfo
   where
      go needBounds = do
        pkgs  <- getFreezePkgs
-                  verbosity packageDBs repoCtxt comp platform conf
+                  verbosity packageDBs repoCtxt comp platform progdb
                   mSandboxPkgInfo globalFlags freezeFlags
 
        putStrLn boundsNeededMsg
@@ -134,7 +146,7 @@ genBounds verbosity packageDBs repoCtxt comp platform conf mSandboxPkgInfo
        mapM_ (putStrLn . (++",") . showBounds padTo) thePkgs
 
      depName :: Dependency -> String
-     depName (Dependency (PackageName nm) _) = nm
+     depName (Dependency pn _) = unPackageName pn
 
      depVersion :: Dependency -> VersionRange
      depVersion (Dependency _ vr) = vr

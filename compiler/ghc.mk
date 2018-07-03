@@ -177,11 +177,6 @@ compiler/stage1/$(PLATFORM_H) : mk/config.mk mk/project.mk | $$(dir $$@)/.
 	@echo "#define BUILD_OS \"$(BuildOS_CPP)\""               >> $@
 	@echo "#define HOST_OS \"$(HostOS_CPP)\""                 >> $@
 	@echo "#define TARGET_OS \"$(TargetOS_CPP)\""             >> $@
-ifeq "$(TargetOS_CPP)" "irix"
-	@echo "#ifndef $(IRIX_MAJOR)_TARGET_OS"                   >> $@
-	@echo "#define $(IRIX_MAJOR)_TARGET_OS 1"                 >> $@
-	@echo "#endif"                                            >> $@
-endif
 	@echo                                                     >> $@
 	@echo "#define $(BuildVendor_CPP)_BUILD_VENDOR 1"         >> $@
 	@echo "#define $(HostVendor_CPP)_HOST_VENDOR 1"           >> $@
@@ -223,11 +218,6 @@ compiler/stage2/$(PLATFORM_H) : mk/config.mk mk/project.mk | $$(dir $$@)/.
 	@echo "#define BUILD_OS \"$(HostOS_CPP)\""                >> $@
 	@echo "#define HOST_OS \"$(TargetOS_CPP)\""               >> $@
 	@echo "#define TARGET_OS \"$(TargetOS_CPP)\""             >> $@
-ifeq "$(TargetOS_CPP)" "irix"
-	@echo "#ifndef $(IRIX_MAJOR)_TARGET_OS"                   >> $@
-	@echo "#define $(IRIX_MAJOR)_TARGET_OS 1"                 >> $@
-	@echo "#endif"                                            >> $@
-endif
 	@echo                                                     >> $@
 	@echo "#define $(HostVendor_CPP)_BUILD_VENDOR 1"          >> $@
 	@echo "#define $(TargetVendor_CPP)_HOST_VENDOR 1"         >> $@
@@ -243,7 +233,7 @@ compiler/stage3/$(PLATFORM_H) : compiler/stage2/$(PLATFORM_H)
 	"$(CP)" $< $@
 
 # ----------------------------------------------------------------------------
-#		Generate supporting stuff for prelude/PrimOp.lhs
+#		Generate supporting stuff for prelude/PrimOp.hs
 #		from prelude/primops.txt
 
 PRIMOP_BITS_NAMES = primop-data-decl.hs-incl        \
@@ -268,6 +258,11 @@ PRIMOP_BITS_STAGE3 = $(addprefix compiler/stage3/build/,$(PRIMOP_BITS_NAMES))
 
 compiler_CPP_OPTS += $(addprefix -I,$(GHC_INCLUDE_DIRS))
 compiler_CPP_OPTS += ${GhcCppOpts}
+
+# We add these paths to the Haskell compiler's #include search path list since
+# we must avoid #including files by paths relative to the source file as Hadrian
+# moves the build artifacts out of the source tree. See #8040.
+compiler_HC_OPTS += $(addprefix -I,$(GHC_INCLUDE_DIRS))
 
 define preprocessCompilerFiles
 # $0 = stage
@@ -366,21 +361,20 @@ compiler_CONFIGURE_OPTS += --ghc-option=-DNOSMP
 compiler_CONFIGURE_OPTS += --ghc-option=-optc-DNOSMP
 endif
 
+ifeq "$(WITH_TERMINFO)" "NO"
+compiler_stage2_CONFIGURE_OPTS += --flags=-terminfo
+endif
+
 # Careful optimisation of the parser: we don't want to throw everything
 # at it, because that takes too long and doesn't buy much, but we do want
 # to inline certain key external functions, so we instruct GHC not to
 # throw away inlinings as it would normally do in -O0 mode.
-compiler/stage1/build/Parser_HC_OPTS += -O0 -fno-ignore-interface-pragmas
-# If we're bootstrapping the compiler during stage2, or we're being
-# built by a GHC whose version is > 7.8, we need -fcmm-sink to be
+# Since GHC version 7.8, we need -fcmm-sink to be
 # passed to the compiler. This is required on x86 to avoid the
 # register allocator running out of stack slots when compiling this
 # module with -fPIC -dynamic.
 # See #8182 for all the details
-ifeq "$(CMM_SINK_BOOTSTRAP_IS_NEEDED)" "YES"
-compiler/stage1/build/Parser_HC_OPTS += -fcmm-sink
-endif
-# We also pass -fcmm-sink to every stage != 1
+compiler/stage1/build/Parser_HC_OPTS += -O0 -fno-ignore-interface-pragmas -fcmm-sink
 compiler/stage2/build/Parser_HC_OPTS += -O0 -fno-ignore-interface-pragmas -fcmm-sink
 compiler/stage3/build/Parser_HC_OPTS += -O0 -fno-ignore-interface-pragmas -fcmm-sink
 
@@ -432,9 +426,10 @@ compiler_stage1_SplitSections = NO
 compiler_stage2_SplitSections = NO
 compiler_stage3_SplitSections = NO
 
-# There are too many symbols in the ghc package for a Windows DLL.
-# We therefore need to split some of the modules off into a separate
-# DLL. This clump are the modules reachable from DynFlags:
+# There are too many symbols in the ghc package for a Windows DLL
+# (due to a limitation of bfd ld, see Trac #5987). We therefore need to split
+# some of the modules off into a separate DLL. This clump are the modules
+# reachable from DynFlags:
 compiler_stage2_dll0_START_MODULE = DynFlags
 compiler_stage2_dll0_MODULES = \
 	Annotations \
@@ -443,8 +438,10 @@ compiler_stage2_dll0_MODULES = \
 	Bag \
 	BasicTypes \
 	Binary \
+	BinFingerprint \
 	BooleanFormula \
 	BufWrite \
+	ByteCodeTypes \
 	Class \
 	CmdLineParser \
 	CmmType \
@@ -456,6 +453,7 @@ compiler_stage2_dll0_MODULES = \
 	CoreArity \
 	CoreFVs \
 	CoreSubst \
+	CoreOpt \
 	CoreSyn \
 	CoreTidy \
 	CoreUnfold \
@@ -496,12 +494,17 @@ compiler_stage2_dll0_MODULES = \
 	HsUtils \
 	HscTypes \
 	IOEnv \
+	NameCache \
 	Id \
 	IdInfo \
 	IfaceSyn \
 	IfaceType \
+	InteractiveEvalTypes \
+	Json \
+	ToIface \
 	InstEnv \
 	Kind \
+	KnownUniques \
 	Lexeme \
 	ListSetOps \
 	Literal \
@@ -526,16 +529,18 @@ compiler_stage2_dll0_MODULES = \
 	PipelineMonad \
 	Platform \
 	PlatformConstants \
+	PprColour \
 	PprCore \
 	PrelNames \
 	PrelRules \
 	Pretty \
 	PrimOp \
+	RepType \
 	RdrName \
 	Rules \
 	SrcLoc \
-	StaticFlags \
 	StringBuffer \
+	SysTools.Terminal \
 	TcEvidence \
 	TcRnTypes \
 	TcType \
@@ -560,9 +565,7 @@ compiler_stage2_dll0_MODULES = \
 ifeq "$(GhcWithInterpreter)" "YES"
 # These files are reacheable from DynFlags
 # only by GHCi-enabled code (see #9552)
-compiler_stage2_dll0_MODULES += \
-	ByteCodeTypes \
-	InteractiveEvalTypes
+compiler_stage2_dll0_MODULES += # none
 endif
 
 compiler_stage2_dll0_HS_OBJS = \

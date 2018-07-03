@@ -1,3 +1,6 @@
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Simple.Program.Ld
@@ -11,6 +14,9 @@
 module Distribution.Simple.Program.Ld (
     combineObjectFiles,
   ) where
+
+import Prelude ()
+import Distribution.Compat.Prelude
 
 import Distribution.Simple.Program.Types
          ( ConfiguredProgram(..) )

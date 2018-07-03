@@ -14,6 +14,7 @@
 #include "Signals.h"
 #include "RtsUtils.h"
 #include "Prelude.h"
+#include "Ticker.h"
 #include "Stable.h"
 #include "Libdw.h"
 
@@ -64,7 +65,7 @@ HsInt nocldstop = 0;
 StgInt *signal_handlers = NULL; /* Dynamically grown array of signal handlers */
 static StgInt nHandlers = 0;    /* Size of handlers array */
 
-static nat n_haskell_handlers = 0;
+static uint32_t n_haskell_handlers = 0;
 
 static sigset_t userSignals;
 static sigset_t savedSignals;
@@ -184,7 +185,7 @@ void
 ioManagerDie (void)
 {
     StgWord8 byte = (StgWord8)IO_MANAGER_DIE;
-    nat i;
+    uint32_t i;
     int fd;
     int r;
 
@@ -330,7 +331,7 @@ unblockUserSignals(void)
     sigprocmask(SIG_SETMASK, &savedSignals, NULL);
 }
 
-rtsBool
+bool
 anyUserHandlers(void)
 {
     return n_haskell_handlers != 0;
@@ -535,7 +536,7 @@ shutdown_handler(int sig STG_UNUSED)
 static void
 backtrace_handler(int sig STG_UNUSED)
 {
-#ifdef USE_LIBDW
+#if USE_LIBDW
     LibdwSession *session = libdwInit();
     Backtrace *bt = libdwGetBacktrace(session);
     libdwPrintBacktrace(session, stderr, bt);
@@ -560,7 +561,7 @@ empty_handler (int sig STG_UNUSED)
 
    When a process is suspeended with ^Z and resumed again, the shell
    makes no attempt to save and restore the terminal settings.  So on
-   resume, any terminal setting modificaions we made (e.g. turning off
+   resume, any terminal setting modifications we made (e.g. turning off
    ICANON due to hSetBuffering NoBuffering) may well be lost.  Hence,
    we arrange to save and restore the terminal settings ourselves.
 
@@ -584,7 +585,7 @@ empty_handler (int sig STG_UNUSED)
    -------------------------------------------------------------------------- */
 
 static void sigtstp_handler(int sig);
-static void set_sigtstp_action (rtsBool handle);
+static void set_sigtstp_action (bool handle);
 
 static void
 sigtstp_handler (int sig STG_UNUSED)
@@ -611,7 +612,7 @@ sigtstp_handler (int sig STG_UNUSED)
 }
 
 static void
-set_sigtstp_action (rtsBool handle)
+set_sigtstp_action (bool handle)
 {
     struct sigaction sa;
     if (handle) {
@@ -623,6 +624,34 @@ set_sigtstp_action (rtsBool handle)
     sigemptyset(&sa.sa_mask);
     if (sigaction(SIGTSTP, &sa, NULL) != 0) {
         sysErrorBelch("warning: failed to install SIGTSTP handler");
+    }
+}
+
+/* Used by ItimerTimerCreate and ItimerSetitimer implementations */
+void
+install_vtalrm_handler(int sig, TickProc handle_tick)
+{
+    struct sigaction action;
+
+    action.sa_handler = handle_tick;
+
+    sigemptyset(&action.sa_mask);
+
+#ifdef SA_RESTART
+    // specify SA_RESTART.  One consequence if we don't do this is
+    // that readline gets confused by the -threaded RTS.  It seems
+    // that if a SIGALRM handler is installed without SA_RESTART,
+    // readline installs its own SIGALRM signal handler (see
+    // readline's signals.c), and this somehow causes readline to go
+    // wrong when the input exceeds a single line (try it).
+    action.sa_flags = SA_RESTART;
+#else
+    action.sa_flags = 0;
+#endif
+
+    if (sigaction(sig, &action, NULL) == -1) {
+        sysErrorBelch("sigaction");
+        stg_exit(EXIT_FAILURE);
     }
 }
 
@@ -699,7 +728,7 @@ initDefaultHandlers(void)
         sysErrorBelch("warning: failed to install SIGUSR2 handler");
     }
 
-    set_sigtstp_action(rtsTrue);
+    set_sigtstp_action(true);
 }
 
 void
@@ -720,7 +749,7 @@ resetDefaultHandlers(void)
         sysErrorBelch("warning: failed to uninstall SIGPIPE handler");
     }
 
-    set_sigtstp_action(rtsFalse);
+    set_sigtstp_action(false);
 }
 
 #endif /* RTS_USER_SIGNALS */

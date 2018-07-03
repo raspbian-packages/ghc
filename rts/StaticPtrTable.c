@@ -31,7 +31,7 @@ static int compareFingerprint(StgWord64 ptra[2], StgWord64 ptrb[2]) {
   return ptra[0] == ptrb[0] && ptra[1] == ptrb[1];
 }
 
-void hs_spt_insert(StgWord64 key[2],void *spe_closure) {
+void hs_spt_insert_stableptr(StgWord64 key[2], StgStablePtr *entry) {
   // hs_spt_insert is called from constructor functions, so
   // the SPT needs to be initialized here.
   if (spt == NULL) {
@@ -43,13 +43,20 @@ void hs_spt_insert(StgWord64 key[2],void *spe_closure) {
 #endif
   }
 
+  ACQUIRE_LOCK(&spt_lock);
+  insertHashTable(spt, (StgWord)key, entry);
+  RELEASE_LOCK(&spt_lock);
+}
+
+void hs_spt_insert(StgWord64 key[2], void *spe_closure) {
+  // Cannot remove this indirection yet because getStablePtr()
+  // might return NULL, in which case hs_spt_lookup() returns NULL
+  // instead of the actual closure pointer.
   StgStablePtr * entry = stgMallocBytes( sizeof(StgStablePtr)
                                        , "hs_spt_insert: entry"
                                        );
   *entry = getStablePtr(spe_closure);
-  ACQUIRE_LOCK(&spt_lock);
-  insertHashTable(spt, (StgWord)key, entry);
-  RELEASE_LOCK(&spt_lock);
+  hs_spt_insert_stableptr(key, entry);
 }
 
 static void freeSptEntry(void* entry) {
@@ -72,8 +79,8 @@ StgPtr hs_spt_lookup(StgWord64 key[2]) {
   if (spt) {
     ACQUIRE_LOCK(&spt_lock);
     const StgStablePtr * entry = lookupHashTable(spt, (StgWord)key);
-    RELEASE_LOCK(&spt_lock);
     const StgPtr ret = entry ? deRefStablePtr(*entry) : NULL;
+    RELEASE_LOCK(&spt_lock);
     return ret;
   } else
     return NULL;

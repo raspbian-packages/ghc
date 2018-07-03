@@ -12,7 +12,6 @@
 --                (c) Andriy Palamarchuk 2008
 -- License     :  BSD-style
 -- Maintainer  :  libraries@haskell.org
--- Stability   :  provisional
 -- Portability :  portable
 --
 -- An efficient implementation of maps from integer keys to values
@@ -96,6 +95,7 @@ module Data.IntMap.Lazy (
     , updateWithKey
     , updateLookupWithKey
     , alter
+    , alterF
 
     -- * Combine
 
@@ -168,6 +168,8 @@ module Data.IntMap.Lazy (
     -- * Filter
     , IM.filter
     , filterWithKey
+    , restrictKeys
+    , withoutKeys
     , partition
     , partitionWithKey
 
@@ -205,7 +207,8 @@ module Data.IntMap.Lazy (
     , showTreeWith
     ) where
 
-import Data.IntMap.Base as IM
+import Data.IntMap.Internal as IM hiding (showTree, showTreeWith)
+import Data.IntMap.Internal.DeprecatedDebug
 
 -- $strictness
 --

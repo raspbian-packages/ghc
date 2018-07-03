@@ -36,6 +36,7 @@ module Data.Complex
 
         )  where
 
+import GHC.Base (Applicative (..))
 import GHC.Generics (Generic, Generic1)
 import GHC.Float (Floating(..))
 import Data.Data (Data)
@@ -115,6 +116,7 @@ phase (x:+y)     = atan2 y x
 -- -----------------------------------------------------------------------------
 -- Instances of Complex
 
+-- | @since 2.01
 instance  (RealFloat a) => Num (Complex a)  where
     {-# SPECIALISE instance Num (Complex Float) #-}
     {-# SPECIALISE instance Num (Complex Double) #-}
@@ -127,6 +129,7 @@ instance  (RealFloat a) => Num (Complex a)  where
     signum z@(x:+y)     =  x/r :+ y/r  where r = magnitude z
     fromInteger n       =  fromInteger n :+ 0
 
+-- | @since 2.01
 instance  (RealFloat a) => Fractional (Complex a)  where
     {-# SPECIALISE instance Fractional (Complex Float) #-}
     {-# SPECIALISE instance Fractional (Complex Double) #-}
@@ -138,6 +141,7 @@ instance  (RealFloat a) => Fractional (Complex a)  where
 
     fromRational a      =  fromRational a :+ 0
 
+-- | @since 2.01
 instance  (RealFloat a) => Floating (Complex a) where
     {-# SPECIALISE instance Floating (Complex Float) #-}
     {-# SPECIALISE instance Floating (Complex Double) #-}
@@ -210,6 +214,7 @@ instance  (RealFloat a) => Floating (Complex a) where
       | otherwise = exp x - 1
     {-# INLINE expm1 #-}
 
+-- | @since 4.8.0.0
 instance Storable a => Storable (Complex a) where
     sizeOf a       = 2 * sizeOf (realPart a)
     alignment a    = alignment (realPart a)
@@ -223,9 +228,25 @@ instance Storable a => Storable (Complex a) where
                         poke q r
                         pokeElemOff q 1 i
 
+-- | @since 4.9.0.0
 instance Applicative Complex where
   pure a = a :+ a
   f :+ g <*> a :+ b = f a :+ g b
+  liftA2 f (x :+ y) (a :+ b) = f x a :+ f y b
 
+-- | @since 4.9.0.0
 instance Monad Complex where
   a :+ b >>= f = realPart (f a) :+ imagPart (f b)
+
+-- -----------------------------------------------------------------------------
+-- Rules on Complex
+
+{-# RULES
+
+"realToFrac/a->Complex Double"
+  realToFrac = \x -> realToFrac x :+ (0 :: Double)
+
+"realToFrac/a->Complex Float"
+  realToFrac = \x -> realToFrac x :+ (0 :: Float)
+
+  #-}

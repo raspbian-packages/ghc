@@ -10,6 +10,7 @@ TcMatches: Typecheck some @Matches@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE FlexibleContexts #-}
 
 module TcMatches ( tcMatchesFun, tcGRHS, tcGRHSsPat, tcMatchesCase, tcMatchLambda,
                    TcMatchCtxt(..), TcStmtChecker, TcExprStmtChecker, TcCmdStmtChecker,
@@ -20,6 +21,7 @@ module TcMatches ( tcMatchesFun, tcGRHS, tcGRHSsPat, tcMatchesCase, tcMatchLambd
 import {-# SOURCE #-}   TcExpr( tcSyntaxOp, tcInferSigmaNC, tcInferSigma
                               , tcCheckId, tcMonoExpr, tcMonoExprNC, tcPolyExpr )
 
+import BasicTypes (LexicalFixity(..))
 import HsSyn
 import TcRnMonad
 import TcEnv
@@ -47,10 +49,6 @@ import MkCore
 import Control.Monad
 import Control.Arrow ( second )
 
-#if __GLASGOW_HASKELL__ < 709
-import Data.Traversable ( traverse )
-#endif
-
 #include "HsVersions.h"
 
 {-
@@ -72,12 +70,12 @@ so it must be prepared to use tcSkolemise to skolemise it.
 See Note [sig_tau may be polymorphic] in TcPat.
 -}
 
-tcMatchesFun :: Name
+tcMatchesFun :: Located Name
              -> MatchGroup Name (LHsExpr Name)
              -> ExpRhoType     -- Expected type of function
              -> TcM (HsWrapper, MatchGroup TcId (LHsExpr TcId))
                                 -- Returns type of body
-tcMatchesFun fun_name matches exp_ty
+tcMatchesFun fn@(L _ fun_name) matches exp_ty
   = do  {  -- Check that they all have the same no of arguments
            -- Location is in the monad, set the caller so that
            -- any inter-equation error messages get some vaguely
@@ -93,16 +91,20 @@ tcMatchesFun fun_name matches exp_ty
                do { (matches', wrap_fun)
                        <- matchExpectedFunTys herald arity exp_rho $
                           \ pat_tys rhs_ty ->
-                     -- See Note [Case branches must never infer a non-tau type]
-                     do { rhs_ty:pat_tys <- tauifyMultipleMatches matches (rhs_ty:pat_tys)
-                        ; tcMatches match_ctxt pat_tys rhs_ty matches }
+                          tcMatches match_ctxt pat_tys rhs_ty matches
                   ; return (wrap_fun, matches') }
         ; return (wrap_gen <.> wrap_fun, group) }
   where
     arity = matchGroupArity matches
     herald = text "The equation(s) for"
              <+> quotes (ppr fun_name) <+> text "have"
-    match_ctxt = MC { mc_what = FunRhs fun_name, mc_body = tcBody }
+    match_ctxt = MC { mc_what = FunRhs fn Prefix strictness, mc_body = tcBody }
+    strictness
+      | [L _ match] <- unLoc $ mg_alts matches
+      , FunRhs{mc_strictness = SrcStrict} <- m_ctxt match
+      = SrcStrict
+      | otherwise
+      = NoSrcStrict
 
 {-
 @tcMatchesCase@ doesn't do the argument-count check because the
@@ -119,24 +121,16 @@ tcMatchesCase :: (Outputable (body Name)) =>
                  -- wrapper goes from MatchGroup's ty to expected ty
 
 tcMatchesCase ctxt scrut_ty matches res_ty
-  = do { [res_ty] <- tauifyMultipleMatches matches [res_ty]
-       ; tcMatches ctxt [mkCheckExpType scrut_ty] res_ty matches }
+  = tcMatches ctxt [mkCheckExpType scrut_ty] res_ty matches
 
 tcMatchLambda :: SDoc -- see Note [Herald for matchExpectedFunTys] in TcUnify
               -> TcMatchCtxt HsExpr
               -> MatchGroup Name (LHsExpr Name)
               -> ExpRhoType   -- deeply skolemised
-              -> TcM (HsWrapper, [TcSigmaType], MatchGroup TcId (LHsExpr TcId))
-                     -- also returns the argument types
+              -> TcM (MatchGroup TcId (LHsExpr TcId), HsWrapper)
 tcMatchLambda herald match_ctxt match res_ty
-  = do { ((match', pat_tys), wrap)
-           <- matchExpectedFunTys herald n_pats res_ty $
-              \ pat_tys rhs_ty ->
-              do { rhs_ty:pat_tys <- tauifyMultipleMatches match (rhs_ty:pat_tys)
-                 ; match' <- tcMatches match_ctxt pat_tys rhs_ty match
-                 ; pat_tys <- mapM readExpType pat_tys
-                 ; return (match', pat_tys) }
-       ; return (wrap, pat_tys, match') }
+  = matchExpectedFunTys herald n_pats res_ty $ \ pat_tys rhs_ty ->
+    tcMatches match_ctxt pat_tys rhs_ty match
   where
     n_pats | isEmptyMatchGroup match = 1   -- must be lambda-case
            | otherwise               = matchGroupArity match
@@ -192,17 +186,14 @@ still gets assigned a polytype.
 -- | When the MatchGroup has multiple RHSs, convert an Infer ExpType in the
 -- expected type into TauTvs.
 -- See Note [Case branches must never infer a non-tau type]
-tauifyMultipleMatches :: MatchGroup id body
+tauifyMultipleMatches :: [LMatch id body]
                       -> [ExpType] -> TcM [ExpType]
 tauifyMultipleMatches group exp_tys
   | isSingletonMatchGroup group = return exp_tys
   | otherwise                   = mapM tauifyExpType exp_tys
   -- NB: In the empty-match case, this ensures we fill in the ExpType
 
--- | Type-check a MatchGroup. If there are multiple RHSs, the expected type
--- must already be tauified.
--- See Note [Case branches must never infer a non-tau type]
--- about tauifyMultipleMatches
+-- | Type-check a MatchGroup.
 tcMatches :: (Outputable (body Name)) => TcMatchCtxt body
           -> [ExpSigmaType]      -- Expected pattern types
           -> ExpRhoType          -- Expected result-type of the Match.
@@ -218,7 +209,10 @@ data TcMatchCtxt body   -- c.f. TcStmtCtxt, also in this module
 
 tcMatches ctxt pat_tys rhs_ty (MG { mg_alts = L l matches
                                   , mg_origin = origin })
-  = do { matches' <- mapM (tcMatch ctxt pat_tys rhs_ty) matches
+  = do { rhs_ty:pat_tys <- tauifyMultipleMatches matches (rhs_ty:pat_tys)
+            -- See Note [Case branches must never infer a non-tau type]
+
+       ; matches' <- mapM (tcMatch ctxt pat_tys rhs_ty) matches
        ; pat_tys  <- mapM readExpType pat_tys
        ; rhs_ty   <- readExpType rhs_ty
        ; return (MG { mg_alts = L l matches'
@@ -240,7 +234,7 @@ tcMatch ctxt pat_tys rhs_ty match
       = add_match_ctxt match $
         do { (pats', grhss') <- tcPats (mc_what ctxt) pats pat_tys $
                                 tc_grhss ctxt maybe_rhs_sig grhss rhs_ty
-           ; return (Match NonFunBindMatch pats' Nothing grhss') }
+           ; return (Match (mc_what ctxt) pats' Nothing grhss') }
 
     tc_grhss ctxt Nothing grhss rhs_ty
       = tcGRHSs ctxt grhss rhs_ty       -- No result signature
@@ -249,12 +243,12 @@ tcMatch ctxt pat_tys rhs_ty match
     tc_grhss _ (Just {}) _ _
       = panic "tc_ghrss"        -- Rejected by renamer
 
-        -- For (\x -> e), tcExpr has already said "In the expresssion \x->e"
+        -- For (\x -> e), tcExpr has already said "In the expression \x->e"
         -- so we don't want to add "In the lambda abstraction \x->e"
     add_match_ctxt match thing_inside
         = case mc_what ctxt of
             LambdaExpr -> thing_inside
-            m_ctxt     -> addErrCtxt (pprMatchInCtxt m_ctxt match) thing_inside
+            _          -> addErrCtxt (pprMatchInCtxt match) thing_inside
 
 -------------
 tcGRHSs :: TcMatchCtxt body -> GRHSs Name (Located (body Name)) -> ExpRhoType
@@ -420,7 +414,7 @@ tcGuardStmt _ (BodyStmt guard _ _ _) res_ty thing_inside
 tcGuardStmt ctxt (BindStmt pat rhs _ _ _) res_ty thing_inside
   = do  { (rhs', rhs_ty) <- tcInferSigmaNC rhs
                                    -- Stmt has a context already
-        ; (pat', thing)  <- tcPat_O (StmtCtxt ctxt) (exprCtOrigin (unLoc rhs))
+        ; (pat', thing)  <- tcPat_O (StmtCtxt ctxt) (lexprCtOrigin rhs)
                                     pat (mkCheckExpType rhs_ty) $
                             thing_inside res_ty
         ; return (mkTcBindStmt pat' rhs', thing) }
@@ -514,7 +508,7 @@ tcLcStmt m_tc ctxt (TransStmt { trS_form = form, trS_stmts = stmts
              tup_ty        = mkBigCoreVarTupTy bndr_ids
              poly_arg_ty   = m_app alphaTy
              poly_res_ty   = m_app (n_app alphaTy)
-             using_poly_ty = mkNamedForAllTy alphaTyVar Invisible $
+             using_poly_ty = mkInvForAllTy alphaTyVar $
                              by_arrow $
                              poly_arg_ty `mkFunTy` poly_res_ty
 
@@ -651,7 +645,7 @@ tcMcStmt ctxt (TransStmt { trS_stmts = stmts, trS_bndrs = bindersMap
              using_arg_ty = m1_ty `mkAppTy` tup_ty
              poly_res_ty  = m2_ty `mkAppTy` n_app alphaTy
              using_res_ty = m2_ty `mkAppTy` n_app tup_ty
-             using_poly_ty = mkNamedForAllTy alphaTyVar Invisible $
+             using_poly_ty = mkInvForAllTy alphaTyVar $
                              by_arrow $
                              poly_arg_ty `mkFunTy` poly_res_ty
 
@@ -691,8 +685,8 @@ tcMcStmt ctxt (TransStmt { trS_stmts = stmts, trS_bndrs = bindersMap
        ; fmap_op' <- case form of
                        ThenForm -> return noExpr
                        _ -> fmap unLoc . tcPolyExpr (noLoc fmap_op) $
-                            mkNamedForAllTy alphaTyVar Invisible $
-                            mkNamedForAllTy betaTyVar  Invisible $
+                            mkInvForAllTy alphaTyVar $
+                            mkInvForAllTy betaTyVar  $
                             (alphaTy `mkFunTy` betaTy)
                             `mkFunTy` (n_app alphaTy)
                             `mkFunTy` (n_app betaTy)
@@ -882,10 +876,9 @@ tcDoStmt ctxt (RecStmt { recS_stmts = stmts, recS_later_ids = later_names
               tup_ty  = mkBigCoreTupTy tup_elt_tys
 
         ; tcExtendIdEnv tup_ids $ do
-        { stmts_ty <- newOpenInferExpType
-        ; (stmts', (ret_op', tup_rets))
-                <- tcStmtsAndThen ctxt tcDoStmt stmts stmts_ty   $
-                   \ inner_res_ty ->
+        { ((stmts', (ret_op', tup_rets)), stmts_ty)
+                <- tcInferInst $ \ exp_ty ->
+                   tcStmtsAndThen ctxt tcDoStmt stmts exp_ty $ \ inner_res_ty ->
                    do { tup_rets <- zipWithM tcCheckId tup_names
                                       (map mkCheckExpType tup_elt_tys)
                              -- Unify the types of the "final" Ids (which may
@@ -894,14 +887,12 @@ tcDoStmt ctxt (RecStmt { recS_stmts = stmts, recS_later_ids = later_names
                           <- tcSyntaxOp DoOrigin ret_op [synKnownType tup_ty]
                                         inner_res_ty $ \_ -> return ()
                       ; return (ret_op', tup_rets) }
-        ; stmts_ty <- readExpType stmts_ty
 
-        ; mfix_res_ty <- newOpenInferExpType
-        ; (_, mfix_op')
-            <- tcSyntaxOp DoOrigin mfix_op
-                          [synKnownType (mkFunTy tup_ty stmts_ty)] mfix_res_ty $
+        ; ((_, mfix_op'), mfix_res_ty)
+            <- tcInferInst $ \ exp_ty ->
+               tcSyntaxOp DoOrigin mfix_op
+                          [synKnownType (mkFunTy tup_ty stmts_ty)] exp_ty $
                \ _ -> return ()
-        ; mfix_res_ty <- readExpType mfix_res_ty
 
         ; ((thing, new_res_ty), bind_op')
             <- tcSyntaxOp DoOrigin bind_op
@@ -1017,6 +1008,7 @@ e_i   :: exp_ty_i
 <*>_i :: t_(i-1) -> exp_ty_i -> t_i
 join :: tn -> res_ty
 -}
+
 tcApplicativeStmts
   :: HsStmtContext Name
   -> [(SyntaxExpr Name, ApplicativeArg Name Name)]
@@ -1027,7 +1019,7 @@ tcApplicativeStmts
 tcApplicativeStmts ctxt pairs rhs_ty thing_inside
  = do { body_ty <- newFlexiTyVarTy liftedTypeKind
       ; let arity = length pairs
-      ; ts <- replicateM (arity-1) $ newOpenInferExpType
+      ; ts <- replicateM (arity-1) $ newInferExpTypeInst
       ; exp_tys <- replicateM arity $ newFlexiTyVarTy liftedTypeKind
       ; pat_tys <- replicateM arity $ newFlexiTyVarTy liftedTypeKind
       ; let fun_ty = mkFunTys pat_tys body_ty
@@ -1038,9 +1030,17 @@ tcApplicativeStmts ctxt pairs rhs_ty thing_inside
       ; let (ops, args) = unzip pairs
       ; ops' <- goOps fun_ty (zip3 ops (ts ++ [rhs_ty]) exp_tys)
 
-      ; (args', thing) <- goArgs (zip3 args pat_tys exp_tys) $
-                             thing_inside body_ty
-      ; return (zip ops' args', body_ty, thing) }
+      -- Typecheck each ApplicativeArg separately
+      -- See Note [ApplicativeDo and constraints]
+      ; args' <- mapM goArg (zip3 args pat_tys exp_tys)
+
+      -- Bring into scope all the things bound by the args,
+      -- and typecheck the thing_inside
+      -- See Note [ApplicativeDo and constraints]
+      ; res <- tcExtendIdEnv (concatMap get_arg_bndrs args') $
+               thing_inside body_ty
+
+      ; return (zip ops' args', body_ty, res) }
   where
     goOps _ [] = return []
     goOps t_left ((op,t_i,exp_ty) : ops)
@@ -1052,41 +1052,60 @@ tcApplicativeStmts ctxt pairs rhs_ty thing_inside
            ; ops' <- goOps t_i ops
            ; return (op' : ops') }
 
-    goArgs
-      :: [(ApplicativeArg Name Name, Type, Type)]
-      -> TcM t
-      -> TcM ([ApplicativeArg TcId TcId], t)
+    goArg :: (ApplicativeArg Name Name, Type, Type)
+          -> TcM (ApplicativeArg TcId TcId)
 
-    goArgs [] thing_inside
-      = do { thing <- thing_inside
-           ; return ([],thing)
-           }
-    goArgs ((ApplicativeArgOne pat rhs, pat_ty, exp_ty) : rest) thing_inside
-      = do { let stmt :: ExprStmt Name
-                 stmt = mkBindStmt pat rhs
-           ; setSrcSpan (combineSrcSpans (getLoc pat) (getLoc rhs)) $
-             addErrCtxt (pprStmtInCtxt ctxt stmt) $
-               do { rhs' <- tcMonoExprNC rhs (mkCheckExpType exp_ty)
-                  ; (pat',(pairs, thing)) <-
-                      tcPat (StmtCtxt ctxt) pat (mkCheckExpType pat_ty) $
-                      popErrCtxt $
-                      goArgs rest thing_inside
-                  ; return (ApplicativeArgOne pat' rhs' : pairs, thing) } }
+    goArg (ApplicativeArgOne pat rhs, pat_ty, exp_ty)
+      = setSrcSpan (combineSrcSpans (getLoc pat) (getLoc rhs)) $
+        addErrCtxt (pprStmtInCtxt ctxt (mkBindStmt pat rhs))   $
+        do { rhs' <- tcMonoExprNC rhs (mkCheckExpType exp_ty)
+           ; (pat', _) <- tcPat (StmtCtxt ctxt) pat (mkCheckExpType pat_ty) $
+                          return ()
+           ; return (ApplicativeArgOne pat' rhs') }
 
-    goArgs ((ApplicativeArgMany stmts ret pat, pat_ty, exp_ty) : rest)
-            thing_inside
-      = do { (stmts', (ret',pat',rest',thing))  <-
+    goArg (ApplicativeArgMany stmts ret pat, pat_ty, exp_ty)
+      = do { (stmts', (ret',pat')) <-
                 tcStmtsAndThen ctxt tcDoStmt stmts (mkCheckExpType exp_ty) $
                 \res_ty  -> do
                   { L _ ret' <- tcMonoExprNC (noLoc ret) res_ty
-                  ; (pat',(rest', thing)) <-
-                      tcPat (StmtCtxt ctxt) pat (mkCheckExpType pat_ty) $
-                        goArgs rest thing_inside
-                  ; return (ret', pat', rest', thing)
+                  ; (pat', _) <- tcPat (StmtCtxt ctxt) pat (mkCheckExpType pat_ty) $
+                                 return ()
+                  ; return (ret', pat')
                   }
-           ; return (ApplicativeArgMany stmts' ret' pat' : rest', thing) }
+           ; return (ApplicativeArgMany stmts' ret' pat') }
 
-{-
+    get_arg_bndrs :: ApplicativeArg TcId TcId -> [Id]
+    get_arg_bndrs (ApplicativeArgOne pat _)    = collectPatBinders pat
+    get_arg_bndrs (ApplicativeArgMany _ _ pat) = collectPatBinders pat
+
+
+{- Note [ApplicativeDo and constraints]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An applicative-do is supposed to take place in parallel, so
+constraints bound in one arm can't possibly be available in another
+(Trac #13242).  Our current rule is this (more details and discussion
+on the ticket). Consider
+
+   ...stmts...
+   ApplicativeStmts [arg1, arg2, ... argN]
+   ...more stmts...
+
+where argi :: ApplicativeArg. Each 'argi' itself contains one or more Stmts.
+Now, we say that:
+
+* Constraints required by the argi can be solved from
+  constraint bound by ...stmts...
+
+* Constraints and existentials bound by the argi are not available
+  to solve constraints required either by argj (where i /= j),
+  or by ...more stmts....
+
+* Within the stmts of each 'argi' individually, however, constraints bound
+  by earlier stmts can be used to solve later ones.
+
+To achieve this, we just typecheck each 'argi' separately, bring all
+the variables they bind into scope, and typecheck the thing_inside.
+
 ************************************************************************
 *                                                                      *
 \subsection{Errors and contexts}

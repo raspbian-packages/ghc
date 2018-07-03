@@ -27,16 +27,16 @@
 // Locks required: all_tasks_mutex.
 Task *all_tasks = NULL;
 
-nat taskCount; // current number of bound tasks + total number of worker tasks.
-nat workerCount;
-nat currentWorkerCount;
-nat peakWorkerCount;
+// current number of bound tasks + total number of worker tasks.
+uint32_t taskCount;
+uint32_t workerCount;
+uint32_t currentWorkerCount;
+uint32_t peakWorkerCount;
 
 static int tasksInitialized = 0;
 
 static void   freeTask  (Task *task);
-static Task * allocTask (void);
-static Task * newTask   (rtsBool);
+static Task * newTask   (bool);
 
 #if defined(THREADED_RTS)
 Mutex all_tasks_mutex;
@@ -80,11 +80,11 @@ initTaskManager (void)
     }
 }
 
-nat
+uint32_t
 freeTaskManager (void)
 {
     Task *task, *next;
-    nat tasksRunning = 0;
+    uint32_t tasksRunning = 0;
 
     ACQUIRE_LOCK(&all_tasks_mutex);
 
@@ -116,8 +116,7 @@ freeTaskManager (void)
     return tasksRunning;
 }
 
-static Task *
-allocTask (void)
+Task* getTask (void)
 {
     Task *task;
 
@@ -125,7 +124,7 @@ allocTask (void)
     if (task != NULL) {
         return task;
     } else {
-        task = newTask(rtsFalse);
+        task = newTask(false);
 #if defined(THREADED_RTS)
         task->id = osThreadId();
 #endif
@@ -199,7 +198,7 @@ freeTask (Task *task)
 }
 
 static Task*
-newTask (rtsBool worker)
+newTask (bool worker)
 {
     Task *task;
 
@@ -208,16 +207,18 @@ newTask (rtsBool worker)
 
     task->cap           = NULL;
     task->worker        = worker;
-    task->stopped       = rtsFalse;
-    task->running_finalizers = rtsFalse;
+    task->stopped       = true;
+    task->running_finalizers = false;
     task->n_spare_incalls = 0;
     task->spare_incalls = NULL;
     task->incall        = NULL;
+    task->preferred_capability = -1;
 
 #if defined(THREADED_RTS)
     initCondition(&task->cond);
     initMutex(&task->lock);
-    task->wakeup = rtsFalse;
+    task->wakeup = false;
+    task->node = 0;
 #endif
 
     task->next = NULL;
@@ -301,9 +302,9 @@ newBoundTask (void)
         stg_exit(EXIT_FAILURE);
     }
 
-    task = allocTask();
+    task = getTask();
 
-    task->stopped = rtsFalse;
+    task->stopped = false;
 
     newInCall(task);
 
@@ -326,7 +327,7 @@ boundTaskExiting (Task *task)
     // call and then a callback, so it can transform into a bound
     // Task for the duration of the callback.
     if (task->incall == NULL) {
-        task->stopped = rtsTrue;
+        task->stopped = true;
     }
 
     debugTrace(DEBUG_sched, "task exiting");
@@ -425,6 +426,9 @@ workerStart(Task *task)
     if (RtsFlags.ParFlags.setAffinity) {
         setThreadAffinity(cap->no, n_capabilities);
     }
+    if (RtsFlags.GcFlags.numa && !RtsFlags.DebugFlags.numa) {
+        setThreadNode(numa_map[task->node]);
+    }
 
     // set the thread-local pointer to the Task:
     setMyTask(task);
@@ -445,7 +449,8 @@ startWorkerTask (Capability *cap)
   Task *task;
 
   // A worker always gets a fresh Task structure.
-  task = newTask(rtsTrue);
+  task = newTask(true);
+  task->stopped = false;
 
   // The lock here is to synchronise with taskStart(), to make sure
   // that we have finished setting up the Task structure before the
@@ -455,6 +460,7 @@ startWorkerTask (Capability *cap)
   // We don't emit a task creation event here, but in workerStart,
   // where the kernel thread id is known.
   task->cap = cap;
+  task->node = cap->node;
 
   // Give the capability directly to the worker; we can't let anyone
   // else get in, because the new worker Task has nowhere to go to
@@ -488,6 +494,36 @@ interruptWorkerTask (Task *task)
 
 #endif /* THREADED_RTS */
 
+void rts_setInCallCapability (
+    int preferred_capability,
+    int affinity USED_IF_THREADS)
+{
+    Task *task = getTask();
+    task->preferred_capability = preferred_capability;
+
+#ifdef THREADED_RTS
+    if (affinity) {
+        if (RtsFlags.ParFlags.setAffinity) {
+            setThreadAffinity(preferred_capability, n_capabilities);
+        }
+    }
+#endif
+}
+
+void rts_pinThreadToNumaNode (
+    int node USED_IF_THREADS)
+{
+#ifdef THREADED_RTS
+    if (RtsFlags.GcFlags.numa) {
+        Task *task = getTask();
+        task->node = capNoToNumaNode(node);
+        if (!DEBUG_IS_ON || !RtsFlags.DebugFlags.numa) { // faking NUMA
+            setThreadNode(numa_map[task->node]);
+        }
+    }
+#endif
+}
+
 #ifdef DEBUG
 
 void printAllTasks(void);
@@ -515,4 +551,3 @@ printAllTasks(void)
 }
 
 #endif
-

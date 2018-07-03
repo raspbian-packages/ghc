@@ -1,4 +1,7 @@
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -32,13 +35,14 @@ module Distribution.Simple.Program.Types (
     simpleConfiguredProgram,
   ) where
 
+import Prelude ()
+import Distribution.Compat.Prelude
+
 import Distribution.Simple.Program.Find
 import Distribution.Version
 import Distribution.Verbosity
-import Distribution.Compat.Binary
 
 import qualified Data.Map as Map
-import GHC.Generics (Generic)
 
 -- | Represents a program which can be configured.
 --
@@ -72,6 +76,8 @@ data Program = Program {
        -- it could add args, or environment vars.
        programPostConf :: Verbosity -> ConfiguredProgram -> IO ConfiguredProgram
      }
+instance Show Program where
+  show (Program name _ _ _) = "Program: " ++ name
 
 type ProgArg = String
 
@@ -119,7 +125,7 @@ data ConfiguredProgram = ConfiguredProgram {
        --
        programMonitorFiles :: [FilePath]
      }
-  deriving (Eq, Generic, Read, Show)
+  deriving (Eq, Generic, Read, Show, Typeable)
 
 instance Binary ConfiguredProgram
 
@@ -148,7 +154,7 @@ suppressOverrideArgs prog = prog { programOverrideArgs = [] }
 -- By default we'll just search for it in the path and not try to find the
 -- version name. You can override these behaviours if necessary, eg:
 --
--- > simpleProgram "foo" { programFindLocation = ... , programFindVersion ... }
+-- > (simpleProgram "foo") { programFindLocation = ... , programFindVersion ... }
 --
 simpleProgram :: String -> Program
 simpleProgram name = Program {

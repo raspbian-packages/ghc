@@ -1,6 +1,7 @@
 {-# LANGUAGE CPP                    #-}
 {-# LANGUAGE DataKinds              #-}
 {-# LANGUAGE DeriveFunctor          #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE DeriveGeneric          #-}
 {-# LANGUAGE FlexibleContexts       #-}
 {-# LANGUAGE FlexibleInstances      #-}
@@ -13,6 +14,7 @@
 {-# LANGUAGE StandaloneDeriving     #-}
 {-# LANGUAGE Trustworthy            #-}
 {-# LANGUAGE TypeFamilies           #-}
+{-# LANGUAGE TypeInType             #-}
 {-# LANGUAGE TypeOperators          #-}
 {-# LANGUAGE TypeSynonymInstances   #-}
 {-# LANGUAGE UndecidableInstances   #-}
@@ -75,10 +77,10 @@ module GHC.Generics  (
 --   type 'Rep' (Tree a) =
 --     'D1' ('MetaData \"Tree\" \"Main\" \"package-name\" 'False)
 --       ('C1' ('MetaCons \"Leaf\" 'PrefixI 'False)
---          ('S1' '(MetaSel 'Nothing
---                           'NoSourceUnpackedness
---                           'NoSourceStrictness
---                           'DecidedLazy)
+--          ('S1' ('MetaSel 'Nothing
+--                          'NoSourceUnpackedness
+--                          'NoSourceStrictness
+--                          'DecidedLazy)
 --                 ('Rec0' a))
 --        ':+:'
 --        'C1' ('MetaCons \"Node\" 'PrefixI 'False)
@@ -475,7 +477,9 @@ module GHC.Generics  (
 --
 -- Like 'Generic', there is a class 'Generic1' that defines a
 -- representation 'Rep1' and conversion functions 'from1' and 'to1',
--- only that 'Generic1' ranges over types of kind @* -> *@.
+-- only that 'Generic1' ranges over types of kind @* -> *@. (More generally,
+-- it can range over types of kind @k -> *@, for any kind @k@, if the
+-- @PolyKinds@ extension is enabled. More on this later.)
 -- The 'Generic1' class is also derivable.
 --
 -- The representation 'Rep1' is ever so slightly different from 'Rep'.
@@ -512,7 +516,7 @@ module GHC.Generics  (
 --                          'DecidedLazy)
 --                ('Rec1' Tree)))
 --   ...
---  @
+-- @
 --
 -- The representation reuses 'D1', 'C1', 'S1' (and thereby 'M1') as well
 -- as ':+:' and ':*:' from 'Rep'. (This reusability is the reason that we
@@ -552,7 +556,7 @@ module GHC.Generics  (
 -- yields
 --
 -- @
--- class 'Rep1' WithInt where
+-- instance 'Generic1' WithInt where
 --   type 'Rep1' WithInt =
 --     'D1' ('MetaData \"WithInt\" \"Main\" \"package-name\" 'False)
 --       ('C1' ('MetaCons \"WithInt\" 'PrefixI 'False)
@@ -579,7 +583,7 @@ module GHC.Generics  (
 -- yields
 --
 -- @
--- class 'Rep1' Rose where
+-- instance 'Generic1' Rose where
 --   type 'Rep1' Rose =
 --     'D1' ('MetaData \"Rose\" \"Main\" \"package-name\" 'False)
 --       ('C1' ('MetaCons \"Fork\" 'PrefixI 'False)
@@ -602,6 +606,22 @@ module GHC.Generics  (
 -- newtype (':.:') f g p = 'Comp1' { 'unComp1' :: f (g p) }
 -- @
 
+-- *** Representation of @k -> *@ types
+--
+-- |
+--
+-- The 'Generic1' class can be generalized to range over types of kind
+-- @k -> *@, for any kind @k@. To do so, derive a 'Generic1' instance with the
+-- @PolyKinds@ extension enabled. For example, the declaration
+--
+-- @
+-- data Proxy (a :: k) = Proxy deriving 'Generic1'
+-- @
+--
+-- yields a slightly different instance depending on whether @PolyKinds@ is
+-- enabled. If compiled without @PolyKinds@, then @'Rep1' Proxy :: * -> *@, but
+-- if compiled with @PolyKinds@, then @'Rep1' Proxy :: k -> *@.
+
 -- *** Representation of unlifted types
 --
 -- |
@@ -609,8 +629,8 @@ module GHC.Generics  (
 -- If one were to attempt to derive a Generic instance for a datatype with an
 -- unlifted argument (for example, 'Int#'), one might expect the occurrence of
 -- the 'Int#' argument to be marked with @'Rec0' 'Int#'@. This won't work,
--- though, since 'Int#' is of kind @#@ and 'Rec0' expects a type of kind @*@.
--- In fact, polymorphism over unlifted types is disallowed completely.
+-- though, since 'Int#' is of an unlifted kind, and 'Rec0' expects a type of
+-- kind @*@.
 --
 -- One solution would be to represent an occurrence of 'Int#' with 'Rec0 Int'
 -- instead. With this approach, however, the programmer has no way of knowing
@@ -711,14 +731,14 @@ import GHC.Types
 -- Needed for instances
 import GHC.Arr     ( Ix )
 import GHC.Base    ( Alternative(..), Applicative(..), Functor(..)
-                   , Monad(..), MonadPlus(..), String )
+                   , Monad(..), MonadPlus(..), String, coerce )
 import GHC.Classes ( Eq(..), Ord(..) )
 import GHC.Enum    ( Bounded, Enum )
 import GHC.Read    ( Read(..), lex, readParen )
 import GHC.Show    ( Show(..), showString )
 
 -- Needed for metadata
-import Data.Proxy   ( Proxy(..), KProxy(..) )
+import Data.Proxy   ( Proxy(..) )
 import GHC.TypeLits ( Nat, Symbol, KnownSymbol, KnownNat, symbolVal, natVal )
 
 --------------------------------------------------------------------------------
@@ -726,7 +746,7 @@ import GHC.TypeLits ( Nat, Symbol, KnownSymbol, KnownNat, symbolVal, natVal )
 --------------------------------------------------------------------------------
 
 -- | Void: used for datatypes without constructors
-data V1 (p :: *)
+data V1 (p :: k)
   deriving (Functor, Generic, Generic1)
 
 deriving instance Eq   (V1 p)
@@ -735,169 +755,222 @@ deriving instance Read (V1 p)
 deriving instance Show (V1 p)
 
 -- | Unit: used for constructors without arguments
-data U1 (p :: *) = U1
+data U1 (p :: k) = U1
   deriving (Generic, Generic1)
 
+-- | @since 4.9.0.0
 instance Eq (U1 p) where
   _ == _ = True
 
+-- | @since 4.9.0.0
 instance Ord (U1 p) where
   compare _ _ = EQ
 
+-- | @since 4.9.0.0
 instance Read (U1 p) where
   readsPrec d = readParen (d > 10) (\r -> [(U1, s) | ("U1",s) <- lex r ])
 
+-- | @since 4.9.0.0
 instance Show (U1 p) where
   showsPrec _ _ = showString "U1"
 
+-- | @since 4.9.0.0
 instance Functor U1 where
   fmap _ _ = U1
 
+-- | @since 4.9.0.0
 instance Applicative U1 where
   pure _ = U1
   _ <*> _ = U1
+  liftA2 _ _ _ = U1
 
+-- | @since 4.9.0.0
 instance Alternative U1 where
   empty = U1
   _ <|> _ = U1
 
+-- | @since 4.9.0.0
 instance Monad U1 where
   _ >>= _ = U1
 
+-- | @since 4.9.0.0
 instance MonadPlus U1
 
 -- | Used for marking occurrences of the parameter
 newtype Par1 p = Par1 { unPar1 :: p }
   deriving (Eq, Ord, Read, Show, Functor, Generic, Generic1)
 
+-- | @since 4.9.0.0
 instance Applicative Par1 where
-  pure a = Par1 a
-  Par1 f <*> Par1 x = Par1 (f x)
+  pure = Par1
+  (<*>) = coerce
+  liftA2 = coerce
 
+-- | @since 4.9.0.0
 instance Monad Par1 where
   Par1 x >>= f = f x
 
--- | Recursive calls of kind * -> *
-newtype Rec1 f (p :: *) = Rec1 { unRec1 :: f p }
+-- | Recursive calls of kind @* -> *@ (or kind @k -> *@, when @PolyKinds@
+-- is enabled)
+newtype Rec1 (f :: k -> *) (p :: k) = Rec1 { unRec1 :: f p }
   deriving (Eq, Ord, Read, Show, Functor, Generic, Generic1)
 
-instance Applicative f => Applicative (Rec1 f) where
-  pure a = Rec1 (pure a)
-  Rec1 f <*> Rec1 x = Rec1 (f <*> x)
+-- | @since 4.9.0.0
+deriving instance Applicative f => Applicative (Rec1 f)
 
-instance Alternative f => Alternative (Rec1 f) where
-  empty = Rec1 empty
-  Rec1 l <|> Rec1 r = Rec1 (l <|> r)
+-- | @since 4.9.0.0
+deriving instance Alternative f => Alternative (Rec1 f)
 
+-- | @since 4.9.0.0
 instance Monad f => Monad (Rec1 f) where
   Rec1 x >>= f = Rec1 (x >>= \a -> unRec1 (f a))
 
-instance MonadPlus f => MonadPlus (Rec1 f)
+-- | @since 4.9.0.0
+deriving instance MonadPlus f => MonadPlus (Rec1 f)
 
--- | Constants, additional parameters and recursion of kind *
-newtype K1 (i :: *) c (p :: *) = K1 { unK1 :: c }
+-- | Constants, additional parameters and recursion of kind @*@
+newtype K1 (i :: *) c (p :: k) = K1 { unK1 :: c }
   deriving (Eq, Ord, Read, Show, Functor, Generic, Generic1)
 
-instance Applicative f => Applicative (M1 i c f) where
-  pure a = M1 (pure a)
-  M1 f <*> M1 x = M1 (f <*> x)
+-- | @since 4.9.0.0
+deriving instance Applicative f => Applicative (M1 i c f)
 
-instance Alternative f => Alternative (M1 i c f) where
-  empty = M1 empty
-  M1 l <|> M1 r = M1 (l <|> r)
+-- | @since 4.9.0.0
+deriving instance Alternative f => Alternative (M1 i c f)
 
-instance Monad f => Monad (M1 i c f) where
-  M1 x >>= f = M1 (x >>= \a -> unM1 (f a))
+-- | @since 4.9.0.0
+deriving instance Monad f => Monad (M1 i c f)
 
-instance MonadPlus f => MonadPlus (M1 i c f)
+-- | @since 4.9.0.0
+deriving instance MonadPlus f => MonadPlus (M1 i c f)
 
 -- | Meta-information (constructor names, etc.)
-newtype M1 (i :: *) (c :: Meta) f (p :: *) = M1 { unM1 :: f p }
+newtype M1 (i :: *) (c :: Meta) (f :: k -> *) (p :: k) = M1 { unM1 :: f p }
   deriving (Eq, Ord, Read, Show, Functor, Generic, Generic1)
 
 -- | Sums: encode choice between constructors
 infixr 5 :+:
-data (:+:) f g (p :: *) = L1 (f p) | R1 (g p)
+data (:+:) (f :: k -> *) (g :: k -> *) (p :: k) = L1 (f p) | R1 (g p)
   deriving (Eq, Ord, Read, Show, Functor, Generic, Generic1)
 
 -- | Products: encode multiple arguments to constructors
 infixr 6 :*:
-data (:*:) f g (p :: *) = f p :*: g p
+data (:*:) (f :: k -> *) (g :: k -> *) (p :: k) = f p :*: g p
   deriving (Eq, Ord, Read, Show, Functor, Generic, Generic1)
 
+-- | @since 4.9.0.0
 instance (Applicative f, Applicative g) => Applicative (f :*: g) where
   pure a = pure a :*: pure a
   (f :*: g) <*> (x :*: y) = (f <*> x) :*: (g <*> y)
+  liftA2 f (a :*: b) (x :*: y) = liftA2 f a x :*: liftA2 f b y
 
+-- | @since 4.9.0.0
 instance (Alternative f, Alternative g) => Alternative (f :*: g) where
   empty = empty :*: empty
   (x1 :*: y1) <|> (x2 :*: y2) = (x1 <|> x2) :*: (y1 <|> y2)
 
+-- | @since 4.9.0.0
 instance (Monad f, Monad g) => Monad (f :*: g) where
   (m :*: n) >>= f = (m >>= \a -> fstP (f a)) :*: (n >>= \a -> sndP (f a))
     where
       fstP (a :*: _) = a
       sndP (_ :*: b) = b
 
+-- | @since 4.9.0.0
 instance (MonadPlus f, MonadPlus g) => MonadPlus (f :*: g)
 
 -- | Composition of functors
 infixr 7 :.:
-newtype (:.:) f (g :: * -> *) (p :: *) = Comp1 { unComp1 :: f (g p) }
+newtype (:.:) (f :: k2 -> *) (g :: k1 -> k2) (p :: k1) =
+    Comp1 { unComp1 :: f (g p) }
   deriving (Eq, Ord, Read, Show, Functor, Generic, Generic1)
 
+-- | @since 4.9.0.0
 instance (Applicative f, Applicative g) => Applicative (f :.: g) where
   pure x = Comp1 (pure (pure x))
-  Comp1 f <*> Comp1 x = Comp1 (fmap (<*>) f <*> x)
+  Comp1 f <*> Comp1 x = Comp1 (liftA2 (<*>) f x)
+  liftA2 f (Comp1 x) (Comp1 y) = Comp1 (liftA2 (liftA2 f) x y)
 
+-- | @since 4.9.0.0
 instance (Alternative f, Applicative g) => Alternative (f :.: g) where
   empty = Comp1 empty
-  Comp1 x <|> Comp1 y = Comp1 (x <|> y)
+  (<|>) = coerce ((<|>) :: f (g a) -> f (g a) -> f (g a)) ::
+    forall a . (f :.: g) a -> (f :.: g) a -> (f :.: g) a
 
--- | Constants of kind @#@
-data family URec (a :: *) (p :: *)
+-- | Constants of unlifted kinds
+--
+-- @since 4.9.0.0
+data family URec (a :: *) (p :: k)
 
 -- | Used for marking occurrences of 'Addr#'
-data instance URec (Ptr ()) p = UAddr { uAddr# :: Addr# }
+--
+-- @since 4.9.0.0
+data instance URec (Ptr ()) (p :: k) = UAddr { uAddr# :: Addr# }
   deriving (Eq, Ord, Functor, Generic, Generic1)
 
 -- | Used for marking occurrences of 'Char#'
-data instance URec Char p = UChar { uChar# :: Char# }
+--
+-- @since 4.9.0.0
+data instance URec Char (p :: k) = UChar { uChar# :: Char# }
   deriving (Eq, Ord, Show, Functor, Generic, Generic1)
 
 -- | Used for marking occurrences of 'Double#'
-data instance URec Double p = UDouble { uDouble# :: Double# }
+--
+-- @since 4.9.0.0
+data instance URec Double (p :: k) = UDouble { uDouble# :: Double# }
   deriving (Eq, Ord, Show, Functor, Generic, Generic1)
 
 -- | Used for marking occurrences of 'Float#'
-data instance URec Float p = UFloat { uFloat# :: Float# }
+--
+-- @since 4.9.0.0
+data instance URec Float (p :: k) = UFloat { uFloat# :: Float# }
   deriving (Eq, Ord, Show, Functor, Generic, Generic1)
 
 -- | Used for marking occurrences of 'Int#'
-data instance URec Int p = UInt { uInt# :: Int# }
+--
+-- @since 4.9.0.0
+data instance URec Int (p :: k) = UInt { uInt# :: Int# }
   deriving (Eq, Ord, Show, Functor, Generic, Generic1)
 
 -- | Used for marking occurrences of 'Word#'
-data instance URec Word p = UWord { uWord# :: Word# }
+--
+-- @since 4.9.0.0
+data instance URec Word (p :: k) = UWord { uWord# :: Word# }
   deriving (Eq, Ord, Show, Functor, Generic, Generic1)
 
--- | Type synonym for 'URec': 'Addr#'
+-- | Type synonym for @'URec' 'Addr#'@
+--
+-- @since 4.9.0.0
 type UAddr   = URec (Ptr ())
--- | Type synonym for 'URec': 'Char#'
+-- | Type synonym for @'URec' 'Char#'@
+--
+-- @since 4.9.0.0
 type UChar   = URec Char
--- | Type synonym for 'URec': 'Double#'
+
+-- | Type synonym for @'URec' 'Double#'@
+--
+-- @since 4.9.0.0
 type UDouble = URec Double
--- | Type synonym for 'URec': 'Float#'
+
+-- | Type synonym for @'URec' 'Float#'@
+--
+-- @since 4.9.0.0
 type UFloat  = URec Float
--- | Type synonym for 'URec': 'Int#'
+
+-- | Type synonym for @'URec' 'Int#'@
+--
+-- @since 4.9.0.0
 type UInt    = URec Int
--- | Type synonym for 'URec': 'Word#'
+
+-- | Type synonym for @'URec' 'Word#'@
+--
+-- @since 4.9.0.0
 type UWord   = URec Word
 
--- | Tag for K1: recursion (of kind *)
+-- | Tag for K1: recursion (of kind @*@)
 data R
 
--- | Type synonym for encoding recursion (of kind *)
+-- | Type synonym for encoding recursion (of kind @*@)
 type Rec0  = K1 R
 
 -- | Tag for M1: datatype
@@ -919,15 +992,20 @@ type S1 = M1 S
 -- | Class for datatypes that represent datatypes
 class Datatype d where
   -- | The name of the datatype (unqualified)
-  datatypeName :: t d (f :: * -> *) a -> [Char]
+  datatypeName :: t d (f :: k -> *) (a :: k) -> [Char]
   -- | The fully-qualified name of the module where the type is declared
-  moduleName   :: t d (f :: * -> *) a -> [Char]
+  moduleName   :: t d (f :: k -> *) (a :: k) -> [Char]
   -- | The package name of the module where the type is declared
-  packageName :: t d (f :: * -> *) a -> [Char]
+  --
+  -- @since 4.9.0.0
+  packageName :: t d (f :: k -> *) (a :: k) -> [Char]
   -- | Marks if the datatype is actually a newtype
-  isNewtype    :: t d (f :: * -> *) a -> Bool
+  --
+  -- @since 4.7.0.0
+  isNewtype    :: t d (f :: k -> *) (a :: k) -> Bool
   isNewtype _ = False
 
+-- | @since 4.9.0.0
 instance (KnownSymbol n, KnownSymbol m, KnownSymbol p, SingI nt)
     => Datatype ('MetaData n m p nt) where
   datatypeName _ = symbolVal (Proxy :: Proxy n)
@@ -938,16 +1016,17 @@ instance (KnownSymbol n, KnownSymbol m, KnownSymbol p, SingI nt)
 -- | Class for datatypes that represent data constructors
 class Constructor c where
   -- | The name of the constructor
-  conName :: t c (f :: * -> *) a -> [Char]
+  conName :: t c (f :: k -> *) (a :: k) -> [Char]
 
   -- | The fixity of the constructor
-  conFixity :: t c (f :: * -> *) a -> Fixity
+  conFixity :: t c (f :: k -> *) (a :: k) -> Fixity
   conFixity _ = Prefix
 
   -- | Marks if this constructor is a record
-  conIsRecord :: t c (f :: * -> *) a -> Bool
+  conIsRecord :: t c (f :: k -> *) (a :: k) -> Bool
   conIsRecord _ = False
 
+-- | @since 4.9.0.0
 instance (KnownSymbol n, SingI f, SingI r)
     => Constructor ('MetaCons n f r) where
   conName     _ = symbolVal (Proxy :: Proxy n)
@@ -960,6 +1039,8 @@ data Fixity = Prefix | Infix Associativity Int
   deriving (Eq, Show, Ord, Read, Generic)
 
 -- | This variant of 'Fixity' appears at the type level.
+--
+-- @since 4.9.0.0
 data FixityI = PrefixI | InfixI Associativity Nat
 
 -- | Get the precedence of a fixity value.
@@ -984,6 +1065,8 @@ data Associativity = LeftAssociative
 --
 -- The fields of @ExampleConstructor@ have 'NoSourceUnpackedness',
 -- 'SourceNoUnpack', and 'SourceUnpack', respectively.
+--
+-- @since 4.9.0.0
 data SourceUnpackedness = NoSourceUnpackedness
                         | SourceNoUnpack
                         | SourceUnpack
@@ -998,6 +1081,8 @@ data SourceUnpackedness = NoSourceUnpackedness
 --
 -- The fields of @ExampleConstructor@ have 'NoSourceStrictness',
 -- 'SourceLazy', and 'SourceStrict', respectively.
+--
+-- @since 4.9.0.0
 data SourceStrictness = NoSourceStrictness
                       | SourceLazy
                       | SourceStrict
@@ -1023,6 +1108,8 @@ data SourceStrictness = NoSourceStrictness
 --
 -- * If compiled with @-O2@ enabled, then the fields will have 'DecidedUnpack',
 --   'DecidedStrict', and 'DecidedLazy', respectively.
+--
+-- @since 4.9.0.0
 data DecidedStrictness = DecidedLazy
                        | DecidedStrict
                        | DecidedUnpack
@@ -1031,14 +1118,21 @@ data DecidedStrictness = DecidedLazy
 -- | Class for datatypes that represent records
 class Selector s where
   -- | The name of the selector
-  selName :: t s (f :: * -> *) a -> [Char]
+  selName :: t s (f :: k -> *) (a :: k) -> [Char]
   -- | The selector's unpackedness annotation (if any)
-  selSourceUnpackedness :: t s (f :: * -> *) a -> SourceUnpackedness
+  --
+  -- @since 4.9.0.0
+  selSourceUnpackedness :: t s (f :: k -> *) (a :: k) -> SourceUnpackedness
   -- | The selector's strictness annotation (if any)
-  selSourceStrictness :: t s (f :: * -> *) a -> SourceStrictness
+  --
+  -- @since 4.9.0.0
+  selSourceStrictness :: t s (f :: k -> *) (a :: k) -> SourceStrictness
   -- | The strictness that the compiler inferred for the selector
-  selDecidedStrictness :: t s (f :: * -> *) a -> DecidedStrictness
+  --
+  -- @since 4.9.0.0
+  selDecidedStrictness :: t s (f :: k -> *) (a :: k) -> DecidedStrictness
 
+-- | @since 4.9.0.0
 instance (SingI mn, SingI su, SingI ss, SingI ds)
     => Selector ('MetaSel mn su ss ds) where
   selName _ = fromMaybe "" (fromSing (sing :: Sing mn))
@@ -1057,11 +1151,12 @@ class Generic a where
   to    :: (Rep a) x -> a
 
 
--- | Representable types of kind * -> *.
--- This class is derivable in GHC with the DeriveGeneric flag on.
-class Generic1 f where
+-- | Representable types of kind @* -> *@ (or kind @k -> *@, when @PolyKinds@
+-- is enabled).
+-- This class is derivable in GHC with the @DeriveGeneric@ flag on.
+class Generic1 (f :: k -> *) where
   -- | Generic representation type
-  type Rep1 f :: * -> *
+  type Rep1 f :: k -> *
   -- | Convert from the datatype to its representation
   from1  :: f a -> (Rep1 f) a
   -- | Convert from the representation to the datatype
@@ -1081,10 +1176,12 @@ class Generic1 f where
 -- * In @MetaCons n f s@, @n@ is the constructor's name, @f@ is its fixity,
 --   and @s@ is @'True@ if the constructor contains record selectors.
 --
--- * In @MetaSel mn su ss ds@, if the field is uses record syntax, then @mn@ is
---   'Just' the record name. Otherwise, @mn@ is 'Nothing. @su@ and @ss@ are the
---   field's unpackedness and strictness annotations, and @ds@ is the
+-- * In @MetaSel mn su ss ds@, if the field uses record syntax, then @mn@ is
+--   'Just' the record name. Otherwise, @mn@ is 'Nothing'. @su@ and @ss@ are
+--   the field's unpackedness and strictness annotations, and @ds@ is the
 --   strictness that GHC infers for the field.
+--
+-- @since 4.9.0.0
 data Meta = MetaData Symbol Symbol Symbol Bool
           | MetaCons Symbol FixityI Bool
           | MetaSel  (Maybe Symbol)
@@ -1137,22 +1234,24 @@ class SingI (a :: k) where
 -- | The 'SingKind' class is essentially a /kind/ class. It classifies all kinds
 -- for which singletons are defined. The class supports converting between a singleton
 -- type and the base (unrefined) type which it is built from.
-class (kparam ~ 'KProxy) => SingKind (kparam :: KProxy k) where
+class SingKind k where
   -- | Get a base type from a proxy for the promoted kind. For example,
-  -- @DemoteRep ('KProxy :: KProxy Bool)@ will be the type @Bool@.
-  type DemoteRep kparam :: *
+  -- @DemoteRep Bool@ will be the type @Bool@.
+  type DemoteRep k :: *
 
   -- | Convert a singleton to its unrefined version.
-  fromSing :: Sing (a :: k) -> DemoteRep kparam
+  fromSing :: Sing (a :: k) -> DemoteRep k
 
 -- Singleton symbols
 data instance Sing (s :: Symbol) where
   SSym :: KnownSymbol s => Sing s
 
+-- | @since 4.9.0.0
 instance KnownSymbol a => SingI a where sing = SSym
 
-instance SingKind ('KProxy :: KProxy Symbol) where
-  type DemoteRep ('KProxy :: KProxy Symbol) = String
+-- | @since 4.9.0.0
+instance SingKind Symbol where
+  type DemoteRep Symbol = String
   fromSing (SSym :: Sing s) = symbolVal (Proxy :: Proxy s)
 
 -- Singleton booleans
@@ -1160,11 +1259,15 @@ data instance Sing (a :: Bool) where
   STrue  :: Sing 'True
   SFalse :: Sing 'False
 
+-- | @since 4.9.0.0
 instance SingI 'True  where sing = STrue
+
+-- | @since 4.9.0.0
 instance SingI 'False where sing = SFalse
 
-instance SingKind ('KProxy :: KProxy Bool) where
-  type DemoteRep ('KProxy :: KProxy Bool) = Bool
+-- | @since 4.9.0.0
+instance SingKind Bool where
+  type DemoteRep Bool = Bool
   fromSing STrue  = True
   fromSing SFalse = False
 
@@ -1173,13 +1276,15 @@ data instance Sing (b :: Maybe a) where
   SNothing :: Sing 'Nothing
   SJust    :: Sing a -> Sing ('Just a)
 
+-- | @since 4.9.0.0
 instance            SingI 'Nothing  where sing = SNothing
+
+-- | @since 4.9.0.0
 instance SingI a => SingI ('Just a) where sing = SJust sing
 
-instance SingKind ('KProxy :: KProxy a) =>
-    SingKind ('KProxy :: KProxy (Maybe a)) where
-  type DemoteRep ('KProxy :: KProxy (Maybe a)) =
-      Maybe (DemoteRep ('KProxy :: KProxy a))
+-- | @since 4.9.0.0
+instance SingKind a => SingKind (Maybe a) where
+  type DemoteRep (Maybe a) = Maybe (DemoteRep a)
   fromSing SNothing  = Nothing
   fromSing (SJust a) = Just (fromSing a)
 
@@ -1188,12 +1293,16 @@ data instance Sing (a :: FixityI) where
   SPrefix :: Sing 'PrefixI
   SInfix  :: Sing a -> Integer -> Sing ('InfixI a n)
 
+-- | @since 4.9.0.0
 instance SingI 'PrefixI where sing = SPrefix
+
+-- | @since 4.9.0.0
 instance (SingI a, KnownNat n) => SingI ('InfixI a n) where
   sing = SInfix (sing :: Sing a) (natVal (Proxy :: Proxy n))
 
-instance SingKind ('KProxy :: KProxy FixityI) where
-  type DemoteRep ('KProxy :: KProxy FixityI) = Fixity
+-- | @since 4.9.0.0
+instance SingKind FixityI where
+  type DemoteRep FixityI = Fixity
   fromSing SPrefix      = Prefix
   fromSing (SInfix a n) = Infix (fromSing a) (I# (integerToInt n))
 
@@ -1203,12 +1312,18 @@ data instance Sing (a :: Associativity) where
   SRightAssociative :: Sing 'RightAssociative
   SNotAssociative   :: Sing 'NotAssociative
 
+-- | @since 4.9.0.0
 instance SingI 'LeftAssociative  where sing = SLeftAssociative
+
+-- | @since 4.9.0.0
 instance SingI 'RightAssociative where sing = SRightAssociative
+
+-- | @since 4.9.0.0
 instance SingI 'NotAssociative   where sing = SNotAssociative
 
-instance SingKind ('KProxy :: KProxy Associativity) where
-  type DemoteRep ('KProxy :: KProxy Associativity) = Associativity
+-- | @since 4.0.0.0
+instance SingKind Associativity where
+  type DemoteRep Associativity = Associativity
   fromSing SLeftAssociative  = LeftAssociative
   fromSing SRightAssociative = RightAssociative
   fromSing SNotAssociative   = NotAssociative
@@ -1219,12 +1334,18 @@ data instance Sing (a :: SourceUnpackedness) where
   SSourceNoUnpack       :: Sing 'SourceNoUnpack
   SSourceUnpack         :: Sing 'SourceUnpack
 
+-- | @since 4.9.0.0
 instance SingI 'NoSourceUnpackedness where sing = SNoSourceUnpackedness
+
+-- | @since 4.9.0.0
 instance SingI 'SourceNoUnpack       where sing = SSourceNoUnpack
+
+-- | @since 4.9.0.0
 instance SingI 'SourceUnpack         where sing = SSourceUnpack
 
-instance SingKind ('KProxy :: KProxy SourceUnpackedness) where
-  type DemoteRep ('KProxy :: KProxy SourceUnpackedness) = SourceUnpackedness
+-- | @since 4.9.0.0
+instance SingKind SourceUnpackedness where
+  type DemoteRep SourceUnpackedness = SourceUnpackedness
   fromSing SNoSourceUnpackedness = NoSourceUnpackedness
   fromSing SSourceNoUnpack       = SourceNoUnpack
   fromSing SSourceUnpack         = SourceUnpack
@@ -1235,12 +1356,18 @@ data instance Sing (a :: SourceStrictness) where
   SSourceLazy         :: Sing 'SourceLazy
   SSourceStrict       :: Sing 'SourceStrict
 
+-- | @since 4.9.0.0
 instance SingI 'NoSourceStrictness where sing = SNoSourceStrictness
+
+-- | @since 4.9.0.0
 instance SingI 'SourceLazy         where sing = SSourceLazy
+
+-- | @since 4.9.0.0
 instance SingI 'SourceStrict       where sing = SSourceStrict
 
-instance SingKind ('KProxy :: KProxy SourceStrictness) where
-  type DemoteRep ('KProxy :: KProxy SourceStrictness) = SourceStrictness
+-- | @since 4.9.0.0
+instance SingKind SourceStrictness where
+  type DemoteRep SourceStrictness = SourceStrictness
   fromSing SNoSourceStrictness = NoSourceStrictness
   fromSing SSourceLazy         = SourceLazy
   fromSing SSourceStrict       = SourceStrict
@@ -1251,12 +1378,18 @@ data instance Sing (a :: DecidedStrictness) where
   SDecidedStrict :: Sing 'DecidedStrict
   SDecidedUnpack :: Sing 'DecidedUnpack
 
+-- | @since 4.9.0.0
 instance SingI 'DecidedLazy   where sing = SDecidedLazy
+
+-- | @since 4.9.0.0
 instance SingI 'DecidedStrict where sing = SDecidedStrict
+
+-- | @since 4.9.0.0
 instance SingI 'DecidedUnpack where sing = SDecidedUnpack
 
-instance SingKind ('KProxy :: KProxy DecidedStrictness) where
-  type DemoteRep ('KProxy :: KProxy DecidedStrictness) = DecidedStrictness
+-- | @since 4.9.0.0
+instance SingKind DecidedStrictness where
+  type DemoteRep DecidedStrictness = DecidedStrictness
   fromSing SDecidedLazy   = DecidedLazy
   fromSing SDecidedStrict = DecidedStrict
   fromSing SDecidedUnpack = DecidedUnpack

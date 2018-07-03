@@ -1,9 +1,9 @@
 name:		Win32
-version:	2.3.1.1
+version:	2.5.4.1
 license:	BSD3
 license-file:	LICENSE
-author:		Alastair Reid
-copyright:	Alastair Reid, 1999-2003
+author:		Alastair Reid, shelarcy
+copyright:	Alastair Reid, 1999-2003; shelarcy, 2012-2013
 maintainer:	Haskell Libraries <libraries@haskell.org>
 bug-reports:    https://github.com/haskell/win32/issues
 homepage:       https://github.com/haskell/win32
@@ -14,10 +14,11 @@ build-type:     Simple
 cabal-version:  >=1.6
 extra-source-files:
 	include/diatemp.h include/dumpBMP.h include/ellipse.h include/errors.h
-	include/Win32Aux.h include/win32debug.h include/windows_cconv.h
+	include/Win32Aux.h include/win32debug.h include/alignment.h
+        changelog.md
 
 Library
-    build-depends:	base >= 4.5 && < 5, bytestring
+    build-depends:	base >= 4.5 && < 5, bytestring, filepath
     ghc-options:    -Wall -fno-warn-name-shadowing
     cc-options:     -fno-strict-aliasing
     exposed-modules:
@@ -43,13 +44,25 @@ Library
         Graphics.Win32.Misc
         Graphics.Win32.Resource
         Graphics.Win32.Window
+        Graphics.Win32.LayeredWindow
+        Graphics.Win32.GDI.AlphaBlend
+        Graphics.Win32.Window.AnimateWindow
+        Graphics.Win32.Window.HotKey
+        Graphics.Win32.Window.IMM
+        Graphics.Win32.Window.ForegroundWindow
+        Graphics.Win32.Window.PostMessage
+
+        Media.Win32
+
         System.Win32
         System.Win32.DebugApi
         System.Win32.DLL
         System.Win32.File
         System.Win32.FileMapping
         System.Win32.Info
+        System.Win32.Path
         System.Win32.Mem
+        System.Win32.MinTTY
         System.Win32.NLS
         System.Win32.Process
         System.Win32.Registry
@@ -59,14 +72,33 @@ Library
         System.Win32.Security
         System.Win32.Types
         System.Win32.Shell
-    extensions: ForeignFunctionInterface, CPP
+        System.Win32.Automation
+        System.Win32.Automation.Input
+        System.Win32.Automation.Input.Key
+        System.Win32.Automation.Input.Mouse
+        System.Win32.Console.CtrlHandler
+        System.Win32.Console.HWND
+        System.Win32.Console.Title
+        System.Win32.Encoding
+        System.Win32.Exception.Unsupported
+        System.Win32.HardLink
+        System.Win32.Info.Computer
+        System.Win32.Info.Version
+        System.Win32.String
+        System.Win32.SymbolicLink
+        System.Win32.Thread
+        System.Win32.Utils
+        System.Win32.Word
+
+    extensions:    ForeignFunctionInterface, CPP
     if impl(ghc >= 7.1)
         extensions: NondecreasingIndentation
     extra-libraries:
-        "user32", "gdi32", "winmm", "advapi32", "shell32", "shfolder"
-    include-dirs: 	include
-    includes:	"HsWin32.h", "HsGDI.h", "WndProc.h"
-    install-includes:	"HsWin32.h", "HsGDI.h", "WndProc.h"
+        "user32", "gdi32", "winmm", "advapi32", "shell32", "shfolder", "shlwapi", "msimg32", "imm32"
+    ghc-options:      -Wall
+    include-dirs:     include
+    includes:         "alphablend.h", "diatemp.h", "dumpBMP.h", "ellipse.h", "errors.h", "HsGDI.h", "HsWin32.h", "Win32Aux.h", "win32debug.h", "windows_cconv.h", "WndProc.h", "alignment.h"
+    install-includes: "HsWin32.h", "HsGDI.h", "WndProc.h", "windows_cconv.h", "alphablend.h", "winternl_compat.h", "winuser_compat.h"
     c-sources:
         cbits/HsGDI.c
         cbits/HsWin32.c
@@ -75,6 +107,8 @@ Library
         cbits/dumpBMP.c
         cbits/ellipse.c
         cbits/errors.c
+        cbits/alphablend.c
+    cc-options: -Wall
 
 source-repository head
     type:     git

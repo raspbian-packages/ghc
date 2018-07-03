@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
@@ -10,10 +11,10 @@ module CmmExpr
     , CmmLit(..), cmmLitType
     , LocalReg(..), localRegType
     , GlobalReg(..), isArgReg, globalRegType, spReg, hpReg, spLimReg, nodeReg, node, baseReg
-    , VGcPtr(..), vgcFlag       -- Temporary!
+    , VGcPtr(..)
 
     , DefinerOfRegs, UserOfRegs
-    , foldRegsDefd, foldRegsUsed, filterRegsUsed
+    , foldRegsDefd, foldRegsUsed
     , foldLocalRegsDefd, foldLocalRegsUsed
 
     , RegSet, LocalRegSet, GlobalRegSet
@@ -27,17 +28,16 @@ module CmmExpr
     )
 where
 
-#include "HsVersions.h"
-
-import CmmType
-import CmmMachOp
 import BlockId
 import CLabel
+import CmmMachOp
+import CmmType
 import DynFlags
-import Unique
 import Outputable (panic)
+import Unique
 
 import Data.Set (Set)
+import Data.List
 import qualified Data.Set as Set
 
 -----------------------------------------------------------------------------
@@ -250,8 +250,11 @@ data LocalReg
 instance Eq LocalReg where
   (LocalReg u1 _) == (LocalReg u2 _) = u1 == u2
 
+-- This is non-deterministic but we do not currently support deterministic
+-- code-generation. See Note [Unique Determinism and code generation]
+-- See Note [No Ord for Unique]
 instance Ord LocalReg where
-  compare (LocalReg u1 _) (LocalReg u2 _) = compare u1 u2
+  compare (LocalReg u1 _) (LocalReg u2 _) = nonDetCmpUnique u1 u2
 
 instance Uniquable LocalReg where
   getUnique (LocalReg uniq _) = uniq
@@ -315,12 +318,6 @@ foldLocalRegsDefd :: DefinerOfRegs LocalReg a
                   => DynFlags -> (b -> LocalReg -> b) -> b -> a -> b
 foldLocalRegsDefd = foldRegsDefd
 
-filterRegsUsed :: UserOfRegs r e => DynFlags -> (r -> Bool) -> e -> RegSet r
-filterRegsUsed dflags p e =
-    foldRegsUsed dflags
-                 (\regs r -> if p r then extendRegSet regs r else regs)
-                 emptyRegSet e
-
 instance UserOfRegs LocalReg CmmReg where
     foldRegsUsed _ f z (CmmLocal reg) = f z reg
     foldRegsUsed _ _ z (CmmGlobal _)  = z
@@ -343,13 +340,10 @@ instance Ord r => UserOfRegs r r where
 instance Ord r => DefinerOfRegs r r where
     foldRegsDefd _ f z r = f z r
 
-instance Ord r => UserOfRegs r (RegSet r) where
-    foldRegsUsed _ f = Set.fold (flip f)
-
 instance (Ord r, UserOfRegs r CmmReg) => UserOfRegs r CmmExpr where
   -- The (Ord r) in the context is necessary here
   -- See Note [Recursive superclasses] in TcInstDcls
-  foldRegsUsed dflags f z e = expr z e
+  foldRegsUsed dflags f !z e = expr z e
     where expr z (CmmLit _)          = z
           expr z (CmmLoad addr _)    = foldRegsUsed dflags f z addr
           expr z (CmmReg r)          = foldRegsUsed dflags f z r
@@ -357,36 +351,23 @@ instance (Ord r, UserOfRegs r CmmReg) => UserOfRegs r CmmExpr where
           expr z (CmmRegOff r _)     = foldRegsUsed dflags f z r
           expr z (CmmStackSlot _ _)  = z
 
-instance UserOfRegs r a => UserOfRegs r (Maybe a) where
-    foldRegsUsed dflags f z (Just x) = foldRegsUsed dflags f z x
-    foldRegsUsed _      _ z Nothing = z
-
 instance UserOfRegs r a => UserOfRegs r [a] where
-  foldRegsUsed _      _ set [] = set
-  foldRegsUsed dflags f set (x:xs) = foldRegsUsed dflags f (foldRegsUsed dflags f set x) xs
+  foldRegsUsed dflags f set as = foldl' (foldRegsUsed dflags f) set as
+  {-# INLINABLE foldRegsUsed #-}
 
 instance DefinerOfRegs r a => DefinerOfRegs r [a] where
-  foldRegsDefd _      _ set [] = set
-  foldRegsDefd dflags f set (x:xs) = foldRegsDefd dflags f (foldRegsDefd dflags f set x) xs
-
-instance DefinerOfRegs r a => DefinerOfRegs r (Maybe a) where
-  foldRegsDefd _      _ set Nothing  = set
-  foldRegsDefd dflags f set (Just x) = foldRegsDefd dflags f set x
+  foldRegsDefd dflags f set as = foldl' (foldRegsDefd dflags f) set as
+  {-# INLINABLE foldRegsDefd #-}
 
 -----------------------------------------------------------------------------
 --              Global STG registers
 -----------------------------------------------------------------------------
 
 data VGcPtr = VGcPtr | VNonGcPtr deriving( Eq, Show )
-        -- TEMPORARY!!!
 
 -----------------------------------------------------------------------------
 --              Global STG registers
 -----------------------------------------------------------------------------
-vgcFlag :: CmmType -> VGcPtr
-vgcFlag ty | isGcPtrType ty = VGcPtr
-           | otherwise      = VNonGcPtr
-
 {-
 Note [Overlapping global registers]
 

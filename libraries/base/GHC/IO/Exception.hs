@@ -24,6 +24,8 @@ module GHC.IO.Exception (
   Deadlock(..),
   AllocationLimitExceeded(..), allocationLimitExceeded,
   AssertionFailed(..),
+  CompactionFailed(..),
+  cannotCompactFunction, cannotCompactPinned, cannotCompactMutable,
 
   SomeAsyncException(..),
   asyncExceptionToException, asyncExceptionFromException,
@@ -64,8 +66,10 @@ import Data.Typeable ( cast )
 -- to the @MVar@ so it can't ever continue.
 data BlockedIndefinitelyOnMVar = BlockedIndefinitelyOnMVar
 
+-- | @since 4.1.0.0
 instance Exception BlockedIndefinitelyOnMVar
 
+-- | @since 4.1.0.0
 instance Show BlockedIndefinitelyOnMVar where
     showsPrec _ BlockedIndefinitelyOnMVar = showString "thread blocked indefinitely in an MVar operation"
 
@@ -78,8 +82,10 @@ blockedIndefinitelyOnMVar = toException BlockedIndefinitelyOnMVar
 -- other references to any @TVar@s involved, so it can't ever continue.
 data BlockedIndefinitelyOnSTM = BlockedIndefinitelyOnSTM
 
+-- | @since 4.1.0.0
 instance Exception BlockedIndefinitelyOnSTM
 
+-- | @since 4.1.0.0
 instance Show BlockedIndefinitelyOnSTM where
     showsPrec _ BlockedIndefinitelyOnSTM = showString "thread blocked indefinitely in an STM transaction"
 
@@ -92,8 +98,10 @@ blockedIndefinitelyOnSTM = toException BlockedIndefinitelyOnSTM
 -- The @Deadlock@ exception is raised in the main thread only.
 data Deadlock = Deadlock
 
+-- | @since 4.1.0.0
 instance Exception Deadlock
 
+-- | @since 4.1.0.0
 instance Show Deadlock where
     showsPrec _ Deadlock = showString "<<deadlock>>"
 
@@ -106,10 +114,12 @@ instance Show Deadlock where
 -- @since 4.8.0.0
 data AllocationLimitExceeded = AllocationLimitExceeded
 
+-- | @since 4.8.0.0
 instance Exception AllocationLimitExceeded where
   toException = asyncExceptionToException
   fromException = asyncExceptionFromException
 
+-- | @since 4.7.1.0
 instance Show AllocationLimitExceeded where
     showsPrec _ AllocationLimitExceeded =
       showString "allocation limit exceeded"
@@ -119,11 +129,42 @@ allocationLimitExceeded = toException AllocationLimitExceeded
 
 -----
 
+-- | Compaction found an object that cannot be compacted.  Functions
+-- cannot be compacted, nor can mutable objects or pinned objects.
+-- See 'GHC.Compact.compact'.
+--
+-- @since 4.10.0.0
+newtype CompactionFailed = CompactionFailed String
+
+-- | @since 4.10.0.0
+instance Exception CompactionFailed where
+
+-- | @since 4.10.0.0
+instance Show CompactionFailed where
+    showsPrec _ (CompactionFailed why) =
+      showString ("compaction failed: " ++ why)
+
+cannotCompactFunction :: SomeException -- for the RTS
+cannotCompactFunction =
+  toException (CompactionFailed "cannot compact functions")
+
+cannotCompactPinned :: SomeException -- for the RTS
+cannotCompactPinned =
+  toException (CompactionFailed "cannot compact pinned objects")
+
+cannotCompactMutable :: SomeException -- for the RTS
+cannotCompactMutable =
+  toException (CompactionFailed "cannot compact mutable objects")
+
+-----
+
 -- |'assert' was applied to 'False'.
 newtype AssertionFailed = AssertionFailed String
 
+-- | @since 4.1.0.0
 instance Exception AssertionFailed
 
+-- | @since 4.1.0.0
 instance Show AssertionFailed where
     showsPrec _ (AssertionFailed err) = showString err
 
@@ -134,9 +175,11 @@ instance Show AssertionFailed where
 -- @since 4.7.0.0
 data SomeAsyncException = forall e . Exception e => SomeAsyncException e
 
+-- | @since 4.7.0.0
 instance Show SomeAsyncException where
     show (SomeAsyncException e) = show e
 
+-- | @since 4.7.0.0
 instance Exception SomeAsyncException
 
 -- |@since 4.7.0.0
@@ -164,8 +207,15 @@ data AsyncException
         -- live data it has. Notes:
         --
         --   * It is undefined which thread receives this exception.
+        --     GHC currently throws this to the same thread that
+        --     receives 'UserInterrupt', but this may change in the
+        --     future.
         --
-        --   * GHC currently does not throw 'HeapOverflow' exceptions.
+        --   * The GHC RTS currently can only recover from heap overflow
+        --     if it detects that an explicit memory limit (set via RTS flags).
+        --     has been exceeded.  Currently, failure to allocate memory from
+        --     the operating system results in immediate termination of the
+        --     program.
   | ThreadKilled
         -- ^This exception is raised by another thread
         -- calling 'Control.Concurrent.killThread', or by the system
@@ -177,6 +227,7 @@ data AsyncException
         -- via the usual mechanism(s) (e.g. Control-C in the console).
   deriving (Eq, Ord)
 
+-- | @since 4.7.0.0
 instance Exception AsyncException where
   toException = asyncExceptionToException
   fromException = asyncExceptionFromException
@@ -191,6 +242,7 @@ data ArrayException
         -- array that had not been initialized.
   deriving (Eq, Ord)
 
+-- | @since 4.1.0.0
 instance Exception ArrayException
 
 -- for the RTS
@@ -198,12 +250,14 @@ stackOverflow, heapOverflow :: SomeException
 stackOverflow = toException StackOverflow
 heapOverflow  = toException HeapOverflow
 
+-- | @since 4.1.0.0
 instance Show AsyncException where
   showsPrec _ StackOverflow   = showString "stack overflow"
   showsPrec _ HeapOverflow    = showString "heap overflow"
   showsPrec _ ThreadKilled    = showString "thread killed"
   showsPrec _ UserInterrupt   = showString "user interrupt"
 
+-- | @since 4.1.0.0
 instance Show ArrayException where
   showsPrec _ (IndexOutOfBounds s)
         = showString "array index out of range"
@@ -230,6 +284,7 @@ data ExitCode
                 -- may be prohibited (e.g. 0 on a POSIX-compliant system).
   deriving (Eq, Ord, Read, Show, Generic)
 
+-- | @since 4.1.0.0
 instance Exception ExitCode
 
 ioException     :: IOException -> IO a
@@ -265,8 +320,10 @@ data IOException
      ioe_filename :: Maybe FilePath  -- filename the error is related to.
    }
 
+-- | @since 4.1.0.0
 instance Exception IOException
 
+-- | @since 4.1.0.0
 instance Eq IOException where
   (IOError h1 e1 loc1 str1 en1 fn1) == (IOError h2 e2 loc2 str2 en2 fn2) =
     e1==e2 && str1==str2 && h1==h2 && loc1==loc2 && en1==en2 && fn1==fn2
@@ -295,9 +352,11 @@ data IOErrorType
   | ResourceVanished
   | Interrupted
 
+-- | @since 4.1.0.0
 instance Eq IOErrorType where
    x == y = isTrue# (getTag x ==# getTag y)
 
+-- | @since 4.1.0.0
 instance Show IOErrorType where
   showsPrec _ e =
     showString $
@@ -336,6 +395,7 @@ userError str   =  IOError Nothing UserError "" str Nothing Nothing
 -- ---------------------------------------------------------------------------
 -- Showing IOErrors
 
+-- | @since 4.1.0.0
 instance Show IOException where
     showsPrec p (IOError hdl iot loc s _ fn) =
       (case fn of

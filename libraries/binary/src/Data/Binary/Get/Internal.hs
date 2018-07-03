@@ -54,12 +54,6 @@ import qualified Control.Monad.Fail as Fail
 
 import Data.Binary.Internal ( accursedUnutterablePerformIO )
 
-#if __GLASGOW_HASKELL__ < 704 && !defined(__HADDOCK__)
--- needed for (# unboxing #) with magic hash
--- Do we still need these? Works without on modern GHCs.
-import GHC.Base
-#endif
-
 -- Kolmodin 20100427: at zurihac we discussed of having partial take a
 -- "Maybe ByteString" and implemented it in this way.
 -- The reasoning was that you could accidently provide an empty bytestring,
@@ -265,20 +259,22 @@ getBytes = getByteString
 -- | /Since: 0.7.0.0/
 instance Alternative Get where
   empty = C $ \inp _ks -> Fail inp "Data.Binary.Get(Alternative).empty"
+  {-# INLINE empty #-}
   (<|>) f g = do
     (decoder, bs) <- runAndKeepTrack f
     case decoder of
       Done inp x -> C $ \_ ks -> ks inp x
       Fail _ _ -> pushBack bs >> g
       _ -> error "Binary: impossible"
-#if MIN_VERSION_base(4,2,0)
+  {-# INLINE (<|>) #-}
   some p = (:) <$> p <*> many p
+  {-# INLINE some #-}
   many p = do
     v <- (Just <$> p) <|> pure Nothing
     case v of
       Nothing -> pure []
       Just x -> (:) x <$> many p
-#endif
+  {-# INLINE many #-}
 
 -- | Run a decoder and keep track of all the input it consumes.
 -- Once it's finished, return the final decoder (always 'Done' or 'Fail'),
@@ -412,7 +408,11 @@ ensureN !n0 = C $ \inp ks -> do
     enoughChunks n str
       | B.length str >= n = Right (str,B.empty)
       | otherwise = Left (n - B.length str)
-    onSucc = B.concat
+    -- Sometimes we will produce leftovers lists of the form [B.empty, nonempty]
+    -- where `nonempty` is a non-empty ByteString. In this case we can avoid a copy
+    -- by simply dropping the empty prefix. In principle ByteString might want
+    -- to gain this optimization as well
+    onSucc = B.concat . dropWhile B.null
     onFail bss = C $ \_ _ -> Fail (B.concat bss) "not enough bytes"
 {-# INLINE ensureN #-}
 

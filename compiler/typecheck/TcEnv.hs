@@ -1,7 +1,10 @@
 -- (c) The University of Glasgow 2006
 {-# LANGUAGE CPP, FlexibleInstances #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}  -- instance MonadThings is necessarily an
                                        -- orphan
+{-# LANGUAGE UndecidableInstances #-} -- Note [Pass sensitive types]
+                                      -- in module PlaceHolder
 
 module TcEnv(
         TyThing(..), TcTyThing(..), TcId,
@@ -23,21 +26,21 @@ module TcEnv(
         lookupGlobal,
 
         -- Local environment
-        tcExtendKindEnv2,
+        tcExtendKindEnv, tcExtendKindEnvList,
         tcExtendTyVarEnv, tcExtendTyVarEnv2,
-        tcExtendLetEnv, tcExtendLetEnvIds,
+        tcExtendLetEnv, tcExtendSigIds, tcExtendRecIds,
         tcExtendIdEnv, tcExtendIdEnv1, tcExtendIdEnv2,
         tcExtendIdBndrs, tcExtendLocalTypeEnv,
-        isClosedLetBndr,
+        isTypeClosedLetBndr,
 
         tcLookup, tcLookupLocated, tcLookupLocalIds,
         tcLookupId, tcLookupTyVar,
         tcLookupLcl_maybe,
-        getScopedTyVarBinds, getInLocalScope,
+        getInLocalScope,
         wrongThingErr, pprBinders,
 
         tcAddDataFamConPlaceholders, tcAddPatSynPlaceholders,
-        getPatSynBinds, getTypeSigNames,
+        getTypeSigNames,
         tcExtendRecEnv,         -- For knot-tying
 
         -- Instances
@@ -57,7 +60,7 @@ module TcEnv(
         topIdLvl, isBrackStage,
 
         -- New Ids
-        newLocalName, newDFunName, newDFunName', newFamInstTyConName,
+        newDFunName, newDFunName', newFamInstTyConName,
         newFamInstAxiomName,
         mkStableIdFromString, mkStableIdFromName,
         mkWrapperName
@@ -96,10 +99,9 @@ import Module
 import Outputable
 import Encoding
 import FastString
-import Bag
 import ListSetOps
 import Util
-import Maybes( MaybeErr(..) )
+import Maybes( MaybeErr(..), orElse )
 import qualified GHC.LanguageExtensions as LangExt
 
 import Data.IORef
@@ -152,7 +154,9 @@ tcLookupGlobal name
                 Nothing    ->
 
                 -- Should it have been in the local envt?
-          if nameIsLocalOrFrom (tcg_mod env) name
+                -- (NB: use semantic mod here, since names never use
+                -- identity module, see Note [Identity versus semantic module].)
+          if nameIsLocalOrFrom (tcg_semantic_mod env) name
           then notFound name  -- Internal names can happen in GHCi
           else
 
@@ -364,15 +368,23 @@ getInLocalScope :: TcM (Name -> Bool)
 getInLocalScope = do { lcl_env <- getLclTypeEnv
                      ; return (`elemNameEnv` lcl_env) }
 
-tcExtendKindEnv2 :: [(Name, TcTyThing)] -> TcM r -> TcM r
+tcExtendKindEnvList :: [(Name, TcTyThing)] -> TcM r -> TcM r
 -- Used only during kind checking, for TcThings that are
 --      ATcTyCon or APromotionErr
 -- No need to update the global tyvars, or tcl_th_bndrs, or tcl_rdr
-tcExtendKindEnv2 things thing_inside
-  = do { traceTc "txExtendKindEnv" (ppr things)
+tcExtendKindEnvList things thing_inside
+  = do { traceTc "txExtendKindEnvList" (ppr things)
        ; updLclEnv upd_env thing_inside }
   where
     upd_env env = env { tcl_env = extendNameEnvList (tcl_env env) things }
+
+tcExtendKindEnv :: NameEnv TcTyThing -> TcM r -> TcM r
+-- A variant of tcExtendKindEvnList
+tcExtendKindEnv extra_env thing_inside
+  = do { traceTc "txExtendKindEnv" (ppr extra_env)
+       ; updLclEnv upd_env thing_inside }
+  where
+    upd_env env = env { tcl_env = tcl_env env `plusNameEnv` extra_env }
 
 -----------------------
 -- Scoped type and kind variables
@@ -404,35 +416,55 @@ tcExtendTyVarEnv2 binds thing_inside
                   tyvar' = setTyVarName tyvar name'
                   name'  = tidyNameOcc name occ'
 
-getScopedTyVarBinds :: TcM [(Name, TcTyVar)]
-getScopedTyVarBinds
-  = do  { lcl_env <- getLclEnv
-        ; return [(name, tv) | ATyVar name tv <- nameEnvElts (tcl_env lcl_env)] }
-
-isClosedLetBndr :: Id -> TopLevelFlag
+isTypeClosedLetBndr :: Id -> Bool
 -- See Note [Bindings with closed types] in TcRnTypes
--- Note that we decided if a let-bound variable is closed by
--- looking at its type, which is slightly more liberal, and a whole
--- lot easier to implement, than looking at its free variables
-isClosedLetBndr id
-  | isEmptyVarSet (tyCoVarsOfType (idType id)) = TopLevel
-  | otherwise                                  = NotTopLevel
+isTypeClosedLetBndr = noFreeVarsOfType . idType
 
-tcExtendLetEnv :: TopLevelFlag -> [TcId] -> TcM a -> TcM a
+tcExtendRecIds :: [(Name, TcId)] -> TcM a -> TcM a
+-- Used for binding the recurive uses of Ids in a binding
+-- both top-level value bindings and and nested let/where-bindings
+-- Does not extend the TcIdBinderStack
+tcExtendRecIds pairs thing_inside
+  = tc_extend_local_env NotTopLevel
+          [ (name, ATcId { tct_id   = let_id
+                         , tct_info = NonClosedLet emptyNameSet False })
+          | (name, let_id) <- pairs ] $
+    thing_inside
+
+tcExtendSigIds :: TopLevelFlag -> [TcId] -> TcM a -> TcM a
+-- Used for binding the Ids that have a complete user type signature
+-- Does not extend the TcIdBinderStack
+tcExtendSigIds top_lvl sig_ids thing_inside
+  = tc_extend_local_env top_lvl
+          [ (idName id, ATcId { tct_id   = id
+                              , tct_info = info })
+          | id <- sig_ids
+          , let closed = isTypeClosedLetBndr id
+                info   = NonClosedLet emptyNameSet closed ]
+     thing_inside
+
+
+tcExtendLetEnv :: TopLevelFlag -> TcSigFun -> IsGroupClosed
+                  -> [TcId] -> TcM a -> TcM a
 -- Used for both top-level value bindings and and nested let/where-bindings
 -- Adds to the TcIdBinderStack too
-tcExtendLetEnv top_lvl ids thing_inside
+tcExtendLetEnv top_lvl sig_fn (IsGroupClosed fvs fv_type_closed)
+               ids thing_inside
   = tcExtendIdBndrs [TcIdBndr id top_lvl | id <- ids] $
-    tcExtendLetEnvIds top_lvl [(idName id, id) | id <- ids] thing_inside
-
-tcExtendLetEnvIds :: TopLevelFlag -> [(Name,TcId)] -> TcM a -> TcM a
--- Used for both top-level value bindings and and nested let/where-bindings
--- Does not extend the TcIdBinderStack
-tcExtendLetEnvIds top_lvl pairs thing_inside
-  = tc_extend_local_env top_lvl [ (name, ATcId { tct_id = id
-                                               , tct_closed = isClosedLetBndr id })
-                                | (name,id) <- pairs ] $
+    tc_extend_local_env top_lvl
+          [ (idName id, ATcId { tct_id   = id
+                              , tct_info = mk_tct_info id })
+          | id <- ids ]
     thing_inside
+  where
+    mk_tct_info id
+      | type_closed && isEmptyNameSet rhs_fvs = ClosedLet
+      | otherwise                             = NonClosedLet rhs_fvs type_closed
+      where
+        name        = idName id
+        rhs_fvs     = lookupNameEnv fvs name `orElse` emptyNameSet
+        type_closed = isTypeClosedLetBndr id &&
+                      (fv_type_closed || hasCompleteSig sig_fn name)
 
 tcExtendIdEnv :: [TcId] -> TcM a -> TcM a
 -- For lambda-bound and case-bound Ids
@@ -449,14 +481,13 @@ tcExtendIdEnv2 :: [(Name,TcId)] -> TcM a -> TcM a
 tcExtendIdEnv2 names_w_ids thing_inside
   = tcExtendIdBndrs [ TcIdBndr mono_id NotTopLevel
                     | (_,mono_id) <- names_w_ids ] $
-    do  { tc_extend_local_env NotTopLevel
-                              [ (name, ATcId { tct_id = id
-                                             , tct_closed = NotTopLevel })
-                              | (name,id) <- names_w_ids] $
-          thing_inside }
+    tc_extend_local_env NotTopLevel
+            [ (name, ATcId { tct_id = id
+                           , tct_info    = NotLetBound })
+            | (name,id) <- names_w_ids]
+    thing_inside
 
-tc_extend_local_env :: TopLevelFlag -> [(Name, TcTyThing)]
-                    -> TcM a -> TcM a
+tc_extend_local_env :: TopLevelFlag -> [(Name, TcTyThing)] -> TcM a -> TcM a
 tc_extend_local_env top_lvl extra_env thing_inside
 -- Precondition: the argument list extra_env has TcTyThings
 --               that ATcId or ATyVar, but nothing else
@@ -503,11 +534,12 @@ tcExtendLocalTypeEnv lcl_env@(TcLclEnv { tcl_env = lcl_type_env }) tc_ty_things
   where
     extra_tvs = foldr get_tvs emptyVarSet tc_ty_things
 
-    get_tvs (_, ATcId { tct_id = id, tct_closed = closed }) tvs
+    get_tvs (_, ATcId { tct_id = id, tct_info = closed }) tvs
       = case closed of
-          TopLevel    -> ASSERT2( isEmptyVarSet id_tvs, ppr id $$ ppr (idType id) )
-                         tvs
-          NotTopLevel -> tvs `unionVarSet` id_tvs
+          ClosedLet ->
+            ASSERT2( isEmptyVarSet id_tvs, ppr id $$ ppr (idType id) ) tvs
+          _           ->
+            tvs `unionVarSet` id_tvs
         where id_tvs = tyCoVarsOfType (idType id)
 
     get_tvs (_, ATyVar _ tv) tvs          -- See Note [Global TyVars]
@@ -547,8 +579,8 @@ tcExtendIdBndrs bndrs thing_inside
 tcAddDataFamConPlaceholders :: [LInstDecl Name] -> TcM a -> TcM a
 -- See Note [AFamDataCon: not promoting data family constructors]
 tcAddDataFamConPlaceholders inst_decls thing_inside
-  = tcExtendKindEnv2 [ (con, APromotionErr FamDataConPE)
-                     | lid <- inst_decls, con <- get_cons lid ]
+  = tcExtendKindEnvList [ (con, APromotionErr FamDataConPE)
+                        | lid <- inst_decls, con <- get_cons lid ]
       thing_inside
       -- Note [AFamDataCon: not promoting data family constructors]
   where
@@ -567,15 +599,9 @@ tcAddDataFamConPlaceholders inst_decls thing_inside
 tcAddPatSynPlaceholders :: [PatSynBind Name Name] -> TcM a -> TcM a
 -- See Note [Don't promote pattern synonyms]
 tcAddPatSynPlaceholders pat_syns thing_inside
-  = tcExtendKindEnv2 [ (name, APromotionErr PatSynPE)
-                     | PSB{ psb_id = L _ name } <- pat_syns ]
+  = tcExtendKindEnvList [ (name, APromotionErr PatSynPE)
+                        | PSB{ psb_id = L _ name } <- pat_syns ]
        thing_inside
-
-getPatSynBinds :: [(RecFlag, LHsBinds Name)] -> [PatSynBind Name Name]
-getPatSynBinds binds
-  = [ psb | (_, lbinds) <- binds
-          , L _ (PatSynBind psb) <- bagToList lbinds ]
-
 
 getTypeSigNames :: [LSig Name] -> NameSet
 -- Get the names that have a user type sig
@@ -586,7 +612,7 @@ getTypeSigNames sigs
     get_type_sig sig ns =
       case sig of
         L _ (TypeSig names _) -> extendNameSetList ns (map unLoc names)
-        L _ (PatSynSig name _) -> extendNameSet ns (unLoc name)
+        L _ (PatSynSig names _) -> extendNameSetList ns (map unLoc names)
         _ -> ns
 
 
@@ -599,14 +625,17 @@ Consider
   data S = MkS (Proxy 'MkT)
 
 Is it ok to use the promoted data family instance constructor 'MkT' in
-the data declaration for S?  No, we don't allow this. It *might* make
-sense, but at least it would mean that we'd have to interleave
-typechecking instances and data types, whereas at present we do data
-types *then* instances.
+the data declaration for S (where both declarations live in the same module)?
+No, we don't allow this. It *might* make sense, but at least it would mean that
+we'd have to interleave typechecking instances and data types, whereas at
+present we do data types *then* instances.
 
 So to check for this we put in the TcLclEnv a binding for all the family
 constructors, bound to AFamDataCon, so that if we trip over 'MkT' when
 type checking 'S' we'll produce a decent error message.
+
+Trac #12088 describes this limitation. Of course, when MkT and S live in
+different modules then all is well.
 
 Note [Don't promote pattern synonyms]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -817,10 +846,10 @@ data InstBindings a
            --          Used only to improve error messages
       }
 
-instance OutputableBndr a => Outputable (InstInfo a) where
+instance (OutputableBndrId a) => Outputable (InstInfo a) where
     ppr = pprInstInfoDetails
 
-pprInstInfoDetails :: OutputableBndr a => InstInfo a -> SDoc
+pprInstInfoDetails :: (OutputableBndrId a) => InstInfo a -> SDoc
 pprInstInfoDetails info
    = hang (pprInstanceHdr (iSpec info) <+> text "where")
         2 (details (iBinds info))
@@ -984,7 +1013,7 @@ Consider
   x = 3
   data T = MkT $(foo x)
 
-where 'foo' is is imported from somewhere.
+where 'foo' is imported from somewhere.
 
 This is really a staging error, because we can't run code involving 'x'.
 But in fact the type checker processes types first, so 'x' won't even be

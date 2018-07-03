@@ -11,7 +11,7 @@ import Distribution.Simple.InstallDirs ( mandir
 import Distribution.Simple.LocalBuildInfo ( LocalBuildInfo(..)
                                           , absoluteInstallDirs
                                           )
-import Distribution.Simple.Utils ( copyFiles
+import Distribution.Simple.Utils ( installOrdinaryFiles
                                  , notice )
 import Distribution.Simple.Setup ( buildVerbosity
                                  , copyDest
@@ -27,6 +27,16 @@ import System.IO ( openFile
 import System.Process ( runProcess )
 import System.FilePath ( (</>) )
 
+-- WARNING to editors of this file:
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- At this moment (Cabal 1.23), whatever you write here must be
+-- compatible with ALL Cabal libraries which we support bootstrapping
+-- with.  This is because pre-setup-depends versions of cabal-install will
+-- build Setup.hs against the version of Cabal which MATCHES the library
+-- that cabal-install was built against.  There is no way of overriding
+-- this behavior without bumping the required 'cabal-version' in our
+-- Cabal file.  Travis will let you know if we fail to install from
+-- tarball!
 
 main :: IO ()
 main = defaultMainWithHooks $ simpleUserHooks
@@ -50,4 +60,4 @@ buildManpage lbi verbosity = do
 installManpage :: PackageDescription -> LocalBuildInfo -> Verbosity -> CopyDest -> IO ()
 installManpage pkg lbi verbosity copy = do
   let destDir = mandir (absoluteInstallDirs pkg lbi copy) </> "man1"
-  copyFiles verbosity destDir [(buildDir lbi </> "cabal", "cabal.1")]
+  installOrdinaryFiles verbosity destDir [(buildDir lbi </> "cabal", "cabal.1")]

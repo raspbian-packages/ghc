@@ -121,13 +121,17 @@ rnExpr (HsVar (L l v))
            Just (Right fs@(_:_:_)) -> return (HsRecFld (Ambiguous (L l v)
                                                         PlaceHolder)
                                              , mkFVs (map selectorFieldOcc fs));
-           Just (Right [])         -> error "runExpr/HsVar" } }
+           Just (Right [])         -> panic "runExpr/HsVar" } }
 
 rnExpr (HsIPVar v)
   = return (HsIPVar v, emptyFVs)
 
-rnExpr (HsOverLabel v)
-  = return (HsOverLabel v, emptyFVs)
+rnExpr (HsOverLabel _ v)
+  = do { rebindable_on <- xoptM LangExt.RebindableSyntax
+       ; if rebindable_on
+         then do { fromLabel <- lookupOccRn (mkVarUnqual (fsLit "fromLabel"))
+                 ; return (HsOverLabel (Just fromLabel) v, unitFV fromLabel) }
+         else return (HsOverLabel Nothing v, emptyFVs) }
 
 rnExpr (HsLit lit@(HsString src s))
   = do { opt_OverloadedStrings <- xoptM LangExt.OverloadedStrings
@@ -168,7 +172,7 @@ rnExpr (OpApp e1 op  _ e2)
         ; fixity <- case op' of
               L _ (HsVar (L _ n)) -> lookupFixityRn n
               L _ (HsRecFld f)    -> lookupFieldFixityRn f
-              _ -> return (Fixity (show minPrecedence) minPrecedence InfixL)
+              _ -> return (Fixity NoSourceText minPrecedence InfixL)
                    -- c.f. lookupFixity for unbound
 
         ; final_e <- mkOpAppRn e1' op' fixity e2'
@@ -224,10 +228,9 @@ rnExpr (HsLam matches)
   = do { (matches', fvMatch) <- rnMatchGroup LambdaExpr rnLExpr matches
        ; return (HsLam matches', fvMatch) }
 
-rnExpr (HsLamCase _arg matches)
+rnExpr (HsLamCase matches)
   = do { (matches', fvs_ms) <- rnMatchGroup CaseAlt rnLExpr matches
-       -- ; return (HsLamCase arg matches', fvs_ms) }
-       ; return (HsLamCase placeHolderType matches', fvs_ms) }
+       ; return (HsLamCase matches', fvs_ms) }
 
 rnExpr (HsCase expr matches)
   = do { (new_expr, e_fvs) <- rnLExpr expr
@@ -271,6 +274,10 @@ rnExpr (ExplicitTuple tup_args boxity)
                                     ; return (L l (Present e'), fvs) }
     rnTupArg (L l (Missing _)) = return (L l (Missing placeHolderType)
                                         , emptyFVs)
+
+rnExpr (ExplicitSum alt arity expr _)
+  = do { (expr', fvs) <- rnLExpr expr
+       ; return (ExplicitSum alt arity expr' PlaceHolder, fvs) }
 
 rnExpr (RecordCon { rcon_con_name = con_id
                   , rcon_flds = rec_binds@(HsRecFields { rec_dotdot = dd }) })
@@ -333,8 +340,14 @@ We return a (bogus) EWildPat in each case.
 -}
 
 rnExpr EWildPat        = return (hsHoleExpr, emptyFVs)   -- "_" is just a hole
-rnExpr e@(EAsPat {})   =
-  patSynErr e (text "Did you mean to enable TypeApplications?")
+rnExpr e@(EAsPat {})
+  = do { opt_TypeApplications <- xoptM LangExt.TypeApplications
+       ; let msg | opt_TypeApplications
+                    = "Type application syntax requires a space before '@'"
+                 | otherwise
+                    = "Did you mean to enable TypeApplications?"
+       ; patSynErr e (text msg)
+       }
 rnExpr e@(EViewPat {}) = patSynErr e empty
 rnExpr e@(ELazyPat {}) = patSynErr e empty
 
@@ -350,41 +363,18 @@ value bindings. This is done by checking that the name is external or
 wired-in. See the Notes about the NameSorts in Name.hs.
 -}
 
-rnExpr e@(HsStatic expr) = do
-    target <- fmap hscTarget getDynFlags
-    case target of
-      -- SPT entries are expected to exist in object code so far, and this is
-      -- not the case in interpreted mode. See bug #9878.
-      HscInterpreted -> addErr $ sep
-        [ text "The static form is not supported in interpreted mode."
-        , text "Please use -fobject-code."
-        ]
-      _ -> return ()
+rnExpr e@(HsStatic _ expr) = do
     (expr',fvExpr) <- rnLExpr expr
     stage <- getStage
     case stage of
-      Brack _ _ -> return () -- Don't check names if we are inside brackets.
-                             -- We don't want to reject cases like:
-                             -- \e -> [| static $(e) |]
-                             -- if $(e) turns out to produce a legal expression.
       Splice _ -> addErr $ sep
              [ text "static forms cannot be used in splices:"
              , nest 2 $ ppr e
              ]
-      _ -> do
-       let isTopLevelName n = isExternalName n || isWiredInName n
-       case nameSetElems $ filterNameSet
-                             (\n -> not (isTopLevelName n || isUnboundName n))
-                             fvExpr                                           of
-         [] -> return ()
-         fvNonGlobal -> addErr $ cat
-             [ text $ "Only identifiers of top-level bindings can "
-                      ++ "appear in the body of the static form:"
-             , nest 2 $ ppr e
-             , text "but the following identifiers were found instead:"
-             , nest 2 $ vcat $ map ppr fvNonGlobal
-             ]
-    return (HsStatic expr', fvExpr)
+      _ -> return ()
+    mod <- getModule
+    let fvExpr' = filterNameSet (nameIsLocalOrFrom mod) fvExpr
+    return (HsStatic fvExpr' expr', fvExpr)
 
 {-
 ************************************************************************
@@ -456,7 +446,7 @@ rnCmdTop = wrapLocFstM rnCmdTop'
   rnCmdTop' (HsCmdTop cmd _ _ _)
    = do { (cmd', fvCmd) <- rnLCmd cmd
         ; let cmd_names = [arrAName, composeAName, firstAName] ++
-                          nameSetElems (methodNamesCmd (unLoc cmd'))
+                          nameSetElemsStable (methodNamesCmd (unLoc cmd'))
         -- Generate the rebindable syntax for the monad
         ; (cmd_names', cmd_fvs) <- lookupSyntaxNames cmd_names
 
@@ -485,7 +475,7 @@ rnCmd (HsCmdArrApp arrow arg _ ho rtl)
         -- inside 'arrow'.  In the higher-order case (-<<), they are.
 
 -- infix form
-rnCmd (HsCmdArrForm op (Just _) [arg1, arg2])
+rnCmd (HsCmdArrForm op _ (Just _) [arg1, arg2])
   = do { (op',fv_op) <- escapeArrowScope (rnLExpr op)
        ; let L _ (HsVar (L _ op_name)) = op'
        ; (arg1',fv_arg1) <- rnCmdTop arg1
@@ -495,10 +485,10 @@ rnCmd (HsCmdArrForm op (Just _) [arg1, arg2])
        ; final_e <- mkOpFormRn arg1' op' fixity arg2'
        ; return (final_e, fv_arg1 `plusFV` fv_op `plusFV` fv_arg2) }
 
-rnCmd (HsCmdArrForm op fixity cmds)
+rnCmd (HsCmdArrForm op f fixity cmds)
   = do { (op',fvOp) <- escapeArrowScope (rnLExpr op)
        ; (cmds',fvCmds) <- rnCmdArgs cmds
-       ; return (HsCmdArrForm op' fixity cmds', fvOp `plusFV` fvCmds) }
+       ; return (HsCmdArrForm op' f fixity cmds', fvOp `plusFV` fvCmds) }
 
 rnCmd (HsCmdApp fun arg)
   = do { (fun',fvFun) <- rnLCmd  fun
@@ -774,6 +764,25 @@ rnStmtsWithFreeVars ctxt rnBody (lstmt@(L loc _) : lstmts) thing_inside
         ; return (((stmts1 ++ stmts2), thing), fvs) }
 
 ----------------------
+
+{-
+Note [Failing pattern matches in Stmts]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Many things desugar to HsStmts including monadic things like `do` and `mdo`
+statements, pattern guards, and list comprehensions (see 'HsStmtContext' for an
+exhaustive list). How we deal with pattern match failure is context-dependent.
+
+ * In the case of list comprehensions and pattern guards we don't need any 'fail'
+   function; the desugarer ignores the fail function field of 'BindStmt' entirely.
+ * In the case of monadic contexts (e.g. monad comprehensions, do, and mdo
+   expressions) we want pattern match failure to be desugared to the appropriate
+   'fail' function (either that of Monad or MonadFail, depending on whether
+   -XMonadFailDesugaring is enabled.)
+
+At one point we failed to make this distinction, leading to #11216.
+-}
+
 rnStmt :: Outputable (body RdrName)
        => HsStmtContext Name
        -> (Located (body RdrName) -> RnM (Located (body Name), FreeVars))
@@ -814,9 +823,19 @@ rnStmt ctxt rnBody (L loc (BindStmt pat body _ _ _)) thing_inside
         ; (bind_op, fvs1) <- lookupStmtName ctxt bindMName
 
         ; xMonadFailEnabled <- fmap (xopt LangExt.MonadFailDesugaring) getDynFlags
-        ; let failFunction | xMonadFailEnabled = failMName
-                           | otherwise         = failMName_preMFP
-        ; (fail_op, fvs2) <- lookupSyntaxName failFunction
+        ; let getFailFunction
+                -- If the pattern is irrefutible (e.g.: wildcard, tuple,
+                -- ~pat, etc.) we should not need to fail.
+                | isIrrefutableHsPat pat
+                                    = return (noSyntaxExpr, emptyFVs)
+                -- For non-monadic contexts (e.g. guard patterns, list
+                -- comprehensions, etc.) we should not need to fail.
+                -- See Note [Failing pattern matches in Stmts]
+                | not (isMonadFailStmtContext ctxt)
+                                    = return (noSyntaxExpr, emptyFVs)
+                | xMonadFailEnabled = lookupSyntaxName failMName
+                | otherwise         = lookupSyntaxName failMName_preMFP
+        ; (fail_op, fvs2) <- getFailFunction
 
         ; rnPat (StmtCtxt ctxt) pat $ \ pat' -> do
         { (thing, fvs3) <- thing_inside (collectPatBinders pat')
@@ -899,7 +918,7 @@ rnStmt ctxt _ (L loc (TransStmt { trS_stmts = stmts, trS_by = by, trS_form = for
              bndr_map = used_bndrs `zip` used_bndrs
              -- See Note [TransStmt binder map] in HsExpr
 
-       ; traceRn (text "rnStmt: implicitly rebound these used binders:" <+> ppr bndr_map)
+       ; traceRn "rnStmt: implicitly rebound these used binders:" (ppr bndr_map)
        ; return (([(L loc (TransStmt { trS_stmts = stmts', trS_bndrs = bndr_map
                                     , trS_by = by', trS_using = using', trS_form = form
                                     , trS_ret = return_op, trS_bind = bind_op
@@ -1573,7 +1592,7 @@ mkStmtTreeOptimal stmts =
               (StmtTreeOne (stmt_arr ! hi), 1))
            | left_cost < right_cost
            = ((left,left_cost), (StmtTreeOne (stmt_arr ! hi), 1))
-           | otherwise -- left_cost > right_cost
+           | left_cost > right_cost
            = ((StmtTreeOne (stmt_arr ! lo), 1), (right,right_cost))
            | otherwise = minimumBy (comparing cost) alternatives
            where
@@ -1603,12 +1622,8 @@ stmtTreeToStmts
 -- the bind form, which would give rise to a Monad constraint.
 stmtTreeToStmts monad_names ctxt (StmtTreeOne (L _ (BindStmt pat rhs _ _ _),_))
                 tail _tail_fvs
-  | isIrrefutableHsPat pat, (False,tail') <- needJoin monad_names tail
-    -- WARNING: isIrrefutableHsPat on (HsPat Name) doesn't have enough info
-    --          to know which types have only one constructor.  So only
-    --          tuples come out as irrefutable; other single-constructor
-    --          types, and newtypes, will not.  See the code for
-    --          isIrrefuatableHsPat
+  | not (isStrictPattern pat), (False,tail') <- needJoin monad_names tail
+  -- See Note [ApplicativeDo and strict patterns]
   = mkApplicativeStmt ctxt [ApplicativeArgOne pat rhs] False tail'
 
 stmtTreeToStmts _monad_names _ctxt (StmtTreeOne (s,_)) tail _tail_fvs =
@@ -1683,6 +1698,8 @@ segments stmts = map fst $ merge $ reverse $ map reverse $ walk (reverse stmts)
     chunter _ [] = ([], [])
     chunter vars ((stmt,fvs) : rest)
        | not (isEmptyNameSet vars)
+       || isStrictPatternBind stmt
+           -- See Note [ApplicativeDo and strict patterns]
        = ((stmt,fvs) : chunk, rest')
        where (chunk,rest') = chunter vars' rest
              (pvars, evars) = stmtRefs stmt fvs
@@ -1694,6 +1711,58 @@ segments stmts = map fst $ merge $ reverse $ map reverse $ walk (reverse stmts)
       | otherwise      = (pvars, fvs')
       where fvs' = fvs `intersectNameSet` allvars
             pvars = mkNameSet (collectStmtBinders (unLoc stmt))
+
+    isStrictPatternBind :: ExprLStmt Name -> Bool
+    isStrictPatternBind (L _ (BindStmt pat _ _ _ _)) = isStrictPattern pat
+    isStrictPatternBind _ = False
+
+{-
+Note [ApplicativeDo and strict patterns]
+
+A strict pattern match is really a dependency.  For example,
+
+do
+  (x,y) <- A
+  z <- B
+  return C
+
+The pattern (_,_) must be matched strictly before we do B.  If we
+allowed this to be transformed into
+
+  (\(x,y) -> \z -> C) <$> A <*> B
+
+then it could be lazier than the standard desuraging using >>=.  See #13875
+for more examples.
+
+Thus, whenever we have a strict pattern match, we treat it as a
+dependency between that statement and the following one.  The
+dependency prevents those two statements from being performed "in
+parallel" in an ApplicativeStmt, but doesn't otherwise affect what we
+can do with the rest of the statements in the same "do" expression.
+-}
+
+isStrictPattern :: LPat id -> Bool
+isStrictPattern (L _ pat) =
+  case pat of
+    WildPat{} -> False
+    VarPat{}  -> False
+    LazyPat{} -> False
+    AsPat _ p -> isStrictPattern p
+    ParPat p  -> isStrictPattern p
+    ViewPat _ p _ -> isStrictPattern p
+    SigPatIn p _ -> isStrictPattern p
+    SigPatOut p _ -> isStrictPattern p
+    BangPat{} -> True
+    TuplePat{} -> True
+    SumPat{} -> True
+    PArrPat{} -> True
+    ConPatIn{} -> True
+    ConPatOut{} -> True
+    LitPat{} -> True
+    NPat{} -> True
+    NPlusKPat{} -> True
+    SplicePat{} -> True
+    _otherwise -> panic "isStrictPattern"
 
 isLetStmt :: LStmt a b -> Bool
 isLetStmt (L _ LetStmt{}) = True
@@ -1728,9 +1797,12 @@ slurpIndependentStmts
 slurpIndependentStmts stmts = go [] [] emptyNameSet stmts
  where
   -- If we encounter a BindStmt that doesn't depend on a previous BindStmt
-  -- in this group, then add it to the group.
+  -- in this group, then add it to the group. We have to be careful about
+  -- strict patterns though; splitSegments expects that if we return Just
+  -- then we have actually done some splitting. Otherwise it will go into
+  -- an infinite loop (#14163).
   go lets indep bndrs ((L loc (BindStmt pat body bind_op fail_op ty), fvs) : rest)
-    | isEmptyNameSet (bndrs `intersectNameSet` fvs)
+    | isEmptyNameSet (bndrs `intersectNameSet` fvs) && not (isStrictPattern pat)
     = go lets ((L loc (BindStmt pat body bind_op fail_op ty), fvs) : indep)
          bndrs' rest
     where bndrs' = bndrs `unionNameSet` mkNameSet (collectPatBinders pat)

@@ -7,12 +7,15 @@ Type checking of type signatures in interface files
 -}
 
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE NondecreasingIndentation #-}
 
 module TcIface (
         tcLookupImported_maybe,
         importDecl, checkWiredInTyCon, tcHiBootIface, typecheckIface,
+        typecheckIfacesForMerging,
+        typecheckIfaceForInstantiate,
         tcIfaceDecl, tcIfaceInst, tcIfaceFamInst, tcIfaceRules,
-        tcIfaceVectInfo, tcIfaceAnnotations,
+        tcIfaceVectInfo, tcIfaceAnnotations, tcIfaceCompleteSigs,
         tcIfaceExpr,    -- Desired by HERMIT (Trac #7683)
         tcIfaceGlobal
  ) where
@@ -49,7 +52,7 @@ import DataCon
 import PrelNames
 import TysWiredIn
 import Literal
-import qualified Var
+import Var
 import VarEnv
 import VarSet
 import Name
@@ -68,13 +71,12 @@ import Util
 import FastString
 import BasicTypes hiding ( SuccessFlag(..) )
 import ListSetOps
+import GHC.Fingerprint
+import qualified BooleanFormula as BF
 
 import Data.List
 import Control.Monad
 import qualified Data.Map as Map
-#if __GLASGOW_HASKELL__ < 709
-import Data.Traversable ( traverse )
-#endif
 
 {-
 This module takes
@@ -110,14 +112,46 @@ we do things similarly as when we are typechecking source decls: we
 bring into scope the type envt for the interface all at once, using a
 knot.  Remember, the decls aren't necessarily in dependency order --
 and even if they were, the type decls might be mutually recursive.
+
+Note [Knot-tying typecheckIface]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Suppose we are typechecking an interface A.hi, and we come across
+a Name for another entity defined in A.hi.  How do we get the
+'TyCon', in this case?  There are three cases:
+
+    1) tcHiBootIface in TcIface: We're typechecking an hi-boot file in
+    preparation of checking if the hs file we're building
+    is compatible.  In this case, we want all of the internal
+    TyCons to MATCH the ones that we just constructed during
+    typechecking: the knot is thus tied through if_rec_types.
+
+    2) retypecheckLoop in GhcMake: We are retypechecking a
+    mutually recursive cluster of hi files, in order to ensure
+    that all of the references refer to each other correctly.
+    In this case, the knot is tied through the HPT passed in,
+    which contains all of the interfaces we are in the process
+    of typechecking.
+
+    3) genModDetails in HscMain: We are typechecking an
+    old interface to generate the ModDetails.  In this case,
+    we do the same thing as (2) and pass in an HPT with
+    the HomeModInfo being generated to tie knots.
+
+The upshot is that the CLIENT of this function is responsible
+for making sure that the knot is tied correctly.  If you don't,
+then you'll get a message saying that we couldn't load the
+declaration you wanted.
+
+BTW, in one-shot mode we never call typecheckIface; instead,
+loadInterface handles type-checking interface.  In that case,
+knots are tied through the EPS.  No problem!
 -}
 
+-- Clients of this function be careful, see Note [Knot-tying typecheckIface]
 typecheckIface :: ModIface      -- Get the decls from here
-               -> TcRnIf gbl lcl ModDetails
+               -> IfG ModDetails
 typecheckIface iface
-  = initIfaceTc iface $ \ tc_env_var -> do
-        -- The tc_env_var is freshly allocated, private to
-        -- type-checking this particular interface
+  = initIfaceLcl (mi_semantic_module iface) (text "typecheckIface") (mi_boot iface) $ do
         {       -- Get the right set of decls and rules.  If we are compiling without -O
                 -- we discard pragmas before typechecking, so that we don't "see"
                 -- information that we shouldn't.  From a versioning point of view
@@ -126,12 +160,10 @@ typecheckIface iface
           ignore_prags <- goptM Opt_IgnoreInterfacePragmas
 
                 -- Typecheck the decls.  This is done lazily, so that the knot-tying
-                -- within this single module work out right.  In the If monad there is
-                -- no global envt for the current interface; instead, the knot is tied
-                -- through the if_rec_types field of IfGblEnv
+                -- within this single module works out right.  It's the callers
+                -- job to make sure the knot is tied.
         ; names_w_things <- loadDecls ignore_prags (mi_decls iface)
         ; let type_env = mkNameEnv names_w_things
-        ; writeMutVar tc_env_var type_env
 
                 -- Now do those rules, instances and annotations
         ; insts     <- mapM tcIfaceInst (mi_insts iface)
@@ -140,10 +172,13 @@ typecheckIface iface
         ; anns      <- tcIfaceAnnotations (mi_anns iface)
 
                 -- Vectorisation information
-        ; vect_info <- tcIfaceVectInfo (mi_module iface) type_env (mi_vect_info iface)
+        ; vect_info <- tcIfaceVectInfo (mi_semantic_module iface) type_env (mi_vect_info iface)
 
                 -- Exports
         ; exports <- ifaceExportNames (mi_exports iface)
+
+                -- Complete Sigs
+        ; complete_sigs <- tcIfaceCompleteSigs (mi_complete_sigs iface)
 
                 -- Finished
         ; traceIf (vcat [text "Finished typechecking interface for" <+> ppr (mi_module iface),
@@ -158,8 +193,291 @@ typecheckIface iface
                               , md_anns      = anns
                               , md_vect_info = vect_info
                               , md_exports   = exports
+                              , md_complete_sigs = complete_sigs
                               }
     }
+
+{-
+************************************************************************
+*                                                                      *
+                Typechecking for merging
+*                                                                      *
+************************************************************************
+-}
+
+-- | Returns true if an 'IfaceDecl' is for @data T@ (an abstract data type)
+isAbstractIfaceDecl :: IfaceDecl -> Bool
+isAbstractIfaceDecl IfaceData{ ifCons = IfAbstractTyCon } = True
+isAbstractIfaceDecl IfaceClass{ ifBody = IfAbstractClass } = True
+isAbstractIfaceDecl IfaceFamily{ ifFamFlav = IfaceAbstractClosedSynFamilyTyCon } = True
+isAbstractIfaceDecl _ = False
+
+ifMaybeRoles :: IfaceDecl -> Maybe [Role]
+ifMaybeRoles IfaceData    { ifRoles = rs } = Just rs
+ifMaybeRoles IfaceSynonym { ifRoles = rs } = Just rs
+ifMaybeRoles IfaceClass   { ifRoles = rs } = Just rs
+ifMaybeRoles _ = Nothing
+
+-- | Merge two 'IfaceDecl's together, preferring a non-abstract one.  If
+-- both are non-abstract we pick one arbitrarily (and check for consistency
+-- later.)
+mergeIfaceDecl :: IfaceDecl -> IfaceDecl -> IfaceDecl
+mergeIfaceDecl d1 d2
+    | isAbstractIfaceDecl d1 = d2 `withRolesFrom` d1
+    | isAbstractIfaceDecl d2 = d1 `withRolesFrom` d2
+    | IfaceClass{ ifBody = IfConcreteClass { ifSigs = ops1, ifMinDef = bf1 } } <- d1
+    , IfaceClass{ ifBody = IfConcreteClass { ifSigs = ops2, ifMinDef = bf2 } } <- d2
+    = let ops = nameEnvElts $
+                  plusNameEnv_C mergeIfaceClassOp
+                    (mkNameEnv [ (n, op) | op@(IfaceClassOp n _ _) <- ops1 ])
+                    (mkNameEnv [ (n, op) | op@(IfaceClassOp n _ _) <- ops2 ])
+      in d1 { ifBody = (ifBody d1) {
+                ifSigs  = ops,
+                ifMinDef = BF.mkOr [noLoc bf1, noLoc bf2]
+                }
+            } `withRolesFrom` d2
+    -- It doesn't matter; we'll check for consistency later when
+    -- we merge, see 'mergeSignatures'
+    | otherwise              = d1 `withRolesFrom` d2
+
+-- Note [Role merging]
+-- ~~~~~~~~~~~~~~~~~~~
+-- First, why might it be necessary to do a non-trivial role
+-- merge?  It may rescue a merge that might otherwise fail:
+--
+--      signature A where
+--          type role T nominal representational
+--          data T a b
+--
+--      signature A where
+--          type role T representational nominal
+--          data T a b
+--
+-- A module that defines T as representational in both arguments
+-- would successfully fill both signatures, so it would be better
+-- if we merged the roles of these types in some nontrivial
+-- way.
+--
+-- However, we have to be very careful about how we go about
+-- doing this, because role subtyping is *conditional* on
+-- the supertype being NOT representationally injective, e.g.,
+-- if we have instead:
+--
+--      signature A where
+--          type role T nominal representational
+--          data T a b = T a b
+--
+--      signature A where
+--          type role T representational nominal
+--          data T a b = T a b
+--
+-- Should we merge the definitions of T so that the roles are R/R (or N/N)?
+-- Absolutely not: neither resulting type is a subtype of the original
+-- types (see Note [Role subtyping]), because data is not representationally
+-- injective.
+--
+-- Thus, merging only occurs when BOTH TyCons in question are
+-- representationally injective.  If they're not, no merge.
+
+withRolesFrom :: IfaceDecl -> IfaceDecl -> IfaceDecl
+d1 `withRolesFrom` d2
+    | Just roles1 <- ifMaybeRoles d1
+    , Just roles2 <- ifMaybeRoles d2
+    , not (isRepInjectiveIfaceDecl d1 || isRepInjectiveIfaceDecl d2)
+    = d1 { ifRoles = mergeRoles roles1 roles2 }
+    | otherwise = d1
+  where
+    mergeRoles roles1 roles2 = zipWith max roles1 roles2
+
+isRepInjectiveIfaceDecl :: IfaceDecl -> Bool
+isRepInjectiveIfaceDecl IfaceData{ ifCons = IfDataTyCon _ } = True
+isRepInjectiveIfaceDecl IfaceFamily{ ifFamFlav = IfaceDataFamilyTyCon } = True
+isRepInjectiveIfaceDecl _ = False
+
+mergeIfaceClassOp :: IfaceClassOp -> IfaceClassOp -> IfaceClassOp
+mergeIfaceClassOp op1@(IfaceClassOp _ _ (Just _)) _ = op1
+mergeIfaceClassOp _ op2 = op2
+
+-- | Merge two 'OccEnv's of 'IfaceDecl's by 'OccName'.
+mergeIfaceDecls :: OccEnv IfaceDecl -> OccEnv IfaceDecl -> OccEnv IfaceDecl
+mergeIfaceDecls = plusOccEnv_C mergeIfaceDecl
+
+-- | This is a very interesting function.  Like typecheckIface, we want
+-- to type check an interface file into a ModDetails.  However, the use-case
+-- for these ModDetails is different: we want to compare all of the
+-- ModDetails to ensure they define compatible declarations, and then
+-- merge them together.  So in particular, we have to take a different
+-- strategy for knot-tying: we first speculatively merge the declarations
+-- to get the "base" truth for what we believe the types will be
+-- (this is "type computation.")  Then we read everything in relative
+-- to this truth and check for compatibility.
+--
+-- During the merge process, we may need to nondeterministically
+-- pick a particular declaration to use, if multiple signatures define
+-- the declaration ('mergeIfaceDecl').  If, for all choices, there
+-- are no type synonym cycles in the resulting merged graph, then
+-- we can show that our choice cannot matter. Consider the
+-- set of entities which the declarations depend on: by assumption
+-- of acyclicity, we can assume that these have already been shown to be equal
+-- to each other (otherwise merging will fail).  Then it must
+-- be the case that all candidate declarations here are type-equal
+-- (the choice doesn't matter) or there is an inequality (in which
+-- case merging will fail.)
+--
+-- Unfortunately, the choice can matter if there is a cycle.  Consider the
+-- following merge:
+--
+--      signature H where { type A = C;  type B = A; data C      }
+--      signature H where { type A = (); data B;     type C = B  }
+--
+-- If we pick @type A = C@ as our representative, there will be
+-- a cycle and merging will fail. But if we pick @type A = ()@ as
+-- our representative, no cycle occurs, and we instead conclude
+-- that all of the types are unit.  So it seems that we either
+-- (a) need a stronger acyclicity check which considers *all*
+-- possible choices from a merge, or (b) we must find a selection
+-- of declarations which is acyclic, and show that this is always
+-- the "best" choice we could have made (ezyang conjectures this
+-- is the case but does not have a proof).  For now this is
+-- not implemented.
+--
+-- It's worth noting that at the moment, a data constructor and a
+-- type synonym are never compatible.  Consider:
+--
+--      signature H where { type Int=C;         type B = Int; data C = Int}
+--      signature H where { export Prelude.Int; data B;       type C = B; }
+--
+-- This will be rejected, because the reexported Int in the second
+-- signature (a proper data type) is never considered equal to a
+-- type synonym.  Perhaps this should be relaxed, where a type synonym
+-- in a signature is considered implemented by a data type declaration
+-- which matches the reference of the type synonym.
+typecheckIfacesForMerging :: Module -> [ModIface] -> IORef TypeEnv -> IfM lcl (TypeEnv, [ModDetails])
+typecheckIfacesForMerging mod ifaces tc_env_var =
+  -- cannot be boot (False)
+  initIfaceLcl mod (text "typecheckIfacesForMerging") False $ do
+    ignore_prags <- goptM Opt_IgnoreInterfacePragmas
+    -- Build the initial environment
+    -- NB: Don't include dfuns here, because we don't want to
+    -- serialize them out.  See Note [rnIfaceNeverExported] in RnModIface
+    -- NB: But coercions are OK, because they will have the right OccName.
+    let mk_decl_env decls
+            = mkOccEnv [ (getOccName decl, decl)
+                       | decl <- decls
+                       , case decl of
+                            IfaceId { ifIdDetails = IfDFunId } -> False -- exclude DFuns
+                            _ -> True ]
+        decl_envs = map (mk_decl_env . map snd . mi_decls) ifaces
+                        :: [OccEnv IfaceDecl]
+        decl_env = foldl' mergeIfaceDecls emptyOccEnv decl_envs
+                        ::  OccEnv IfaceDecl
+    -- TODO: change loadDecls to accept w/o Fingerprint
+    names_w_things <- loadDecls ignore_prags (map (\x -> (fingerprint0, x))
+                                                  (occEnvElts decl_env))
+    let global_type_env = mkNameEnv names_w_things
+    writeMutVar tc_env_var global_type_env
+
+    -- OK, now typecheck each ModIface using this environment
+    details <- forM ifaces $ \iface -> do
+        -- See Note [Resolving never-exported Names in TcIface]
+        type_env <- fixM $ \type_env -> do
+            setImplicitEnvM type_env $ do
+                decls <- loadDecls ignore_prags (mi_decls iface)
+                return (mkNameEnv decls)
+        -- But note that we use this type_env to typecheck references to DFun
+        -- in 'IfaceInst'
+        setImplicitEnvM type_env $ do
+        insts     <- mapM tcIfaceInst (mi_insts iface)
+        fam_insts <- mapM tcIfaceFamInst (mi_fam_insts iface)
+        rules     <- tcIfaceRules ignore_prags (mi_rules iface)
+        anns      <- tcIfaceAnnotations (mi_anns iface)
+        vect_info <- tcIfaceVectInfo (mi_semantic_module iface) type_env (mi_vect_info iface)
+        exports   <- ifaceExportNames (mi_exports iface)
+        complete_sigs <- tcIfaceCompleteSigs (mi_complete_sigs iface)
+        return $ ModDetails { md_types     = type_env
+                            , md_insts     = insts
+                            , md_fam_insts = fam_insts
+                            , md_rules     = rules
+                            , md_anns      = anns
+                            , md_vect_info = vect_info
+                            , md_exports   = exports
+                            , md_complete_sigs = complete_sigs
+                            }
+    return (global_type_env, details)
+
+-- | Typecheck a signature 'ModIface' under the assumption that we have
+-- instantiated it under some implementation (recorded in 'mi_semantic_module')
+-- and want to check if the implementation fills the signature.
+--
+-- This needs to operate slightly differently than 'typecheckIface'
+-- because (1) we have a 'NameShape', from the exports of the
+-- implementing module, which we will use to give our top-level
+-- declarations the correct 'Name's even when the implementor
+-- provided them with a reexport, and (2) we have to deal with
+-- DFun silliness (see Note [rnIfaceNeverExported])
+typecheckIfaceForInstantiate :: NameShape -> ModIface -> IfM lcl ModDetails
+typecheckIfaceForInstantiate nsubst iface =
+  initIfaceLclWithSubst (mi_semantic_module iface)
+                        (text "typecheckIfaceForInstantiate")
+                        (mi_boot iface) nsubst $ do
+    ignore_prags <- goptM Opt_IgnoreInterfacePragmas
+    -- See Note [Resolving never-exported Names in TcIface]
+    type_env <- fixM $ \type_env -> do
+        setImplicitEnvM type_env $ do
+            decls     <- loadDecls ignore_prags (mi_decls iface)
+            return (mkNameEnv decls)
+    -- See Note [rnIfaceNeverExported]
+    setImplicitEnvM type_env $ do
+    insts     <- mapM tcIfaceInst (mi_insts iface)
+    fam_insts <- mapM tcIfaceFamInst (mi_fam_insts iface)
+    rules     <- tcIfaceRules ignore_prags (mi_rules iface)
+    anns      <- tcIfaceAnnotations (mi_anns iface)
+    vect_info <- tcIfaceVectInfo (mi_semantic_module iface) type_env (mi_vect_info iface)
+    exports   <- ifaceExportNames (mi_exports iface)
+    complete_sigs <- tcIfaceCompleteSigs (mi_complete_sigs iface)
+    return $ ModDetails { md_types     = type_env
+                        , md_insts     = insts
+                        , md_fam_insts = fam_insts
+                        , md_rules     = rules
+                        , md_anns      = anns
+                        , md_vect_info = vect_info
+                        , md_exports   = exports
+                        , md_complete_sigs = complete_sigs
+                        }
+
+-- Note [Resolving never-exported Names in TcIface]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- For the high-level overview, see
+-- Note [Handling never-exported TyThings under Backpack]
+--
+-- As described in 'typecheckIfacesForMerging', the splendid innovation
+-- of signature merging is to rewrite all Names in each of the signatures
+-- we are merging together to a pre-merged structure; this is the key
+-- ingredient that lets us solve some problems when merging type
+-- synonyms.
+--
+-- However, when a 'Name' refers to a NON-exported entity, as is the
+-- case with the DFun of a ClsInst, or a CoAxiom of a type family,
+-- this strategy causes problems: if we pick one and rewrite all
+-- references to a shared 'Name', we will accidentally fail to check
+-- if the DFun or CoAxioms are compatible, as they will never be
+-- checked--only exported entities are checked for compatibility,
+-- and a non-exported TyThing is checked WHEN we are checking the
+-- ClsInst or type family for compatibility in checkBootDeclM.
+-- By virtue of the fact that everything's been pointed to the merged
+-- declaration, you'll never notice there's a difference even if there
+-- is one.
+--
+-- Fortunately, there are only a few places in the interface declarations
+-- where this can occur, so we replace those calls with 'tcIfaceImplicit',
+-- which will consult a local TypeEnv that records any never-exported
+-- TyThings which we should wire up with.
+--
+-- Note that we actually knot-tie this local TypeEnv (the 'fixM'), because a
+-- type family can refer to a coercion axiom, all of which are done in one go
+-- when we typecheck 'mi_decls'.  An alternate strategy would be to typecheck
+-- coercions first before type families, but that seemed more fragile.
+--
 
 {-
 ************************************************************************
@@ -192,9 +510,9 @@ tcHiBootIface hsc_src mod
                 -- And that's fine, because if M's ModInfo is in the HPT, then
                 -- it's been compiled once, and we don't need to check the boot iface
           then do { hpt <- getHpt
-                 ; case lookupHptByModule hpt mod of
+                 ; case lookupHpt hpt (moduleName mod) of
                       Just info | mi_boot (hm_iface info)
-                                -> return (mkSelfBootInfo (hm_details info))
+                                -> mkSelfBootInfo (hm_iface info) (hm_details info)
                       _ -> return NoSelfBoot }
           else do
 
@@ -203,12 +521,12 @@ tcHiBootIface hsc_src mod
         -- to check consistency against, rather than just when we notice
         -- that an hi-boot is necessary due to a circular import.
         { read_result <- findAndReadIface
-                                need mod
+                                need (fst (splitModuleInsts mod)) mod
                                 True    -- Hi-boot file
 
         ; case read_result of {
-            Succeeded (iface, _path) -> do { tc_iface <- typecheckIface iface
-                                           ; return (mkSelfBootInfo tc_iface) } ;
+            Succeeded (iface, _path) -> do { tc_iface <- initIfaceTcRn $ typecheckIface iface
+                                           ; mkSelfBootInfo iface tc_iface } ;
             Failed err               ->
 
         -- There was no hi-boot file. But if there is circularity in
@@ -240,13 +558,28 @@ tcHiBootIface hsc_src mod
                           quotes (ppr mod) <> colon) 4 err
 
 
-mkSelfBootInfo :: ModDetails -> SelfBootInfo
-mkSelfBootInfo mds
-  = SelfBoot { sb_mds = mds
-             , sb_tcs = mkNameSet (map tyConName (typeEnvTyCons iface_env))
-             , sb_ids = mkNameSet (map idName (typeEnvIds iface_env)) }
+mkSelfBootInfo :: ModIface -> ModDetails -> TcRn SelfBootInfo
+mkSelfBootInfo iface mds
+  = do -- NB: This is computed DIRECTLY from the ModIface rather
+       -- than from the ModDetails, so that we can query 'sb_tcs'
+       -- WITHOUT forcing the contents of the interface.
+       let tcs = map ifName
+                 . filter isIfaceTyCon
+                 . map snd
+                 $ mi_decls iface
+       return $ SelfBoot { sb_mds = mds
+                         , sb_tcs = mkNameSet tcs }
   where
-    iface_env = md_types mds
+    -- | Retuerns @True@ if, when you call 'tcIfaceDecl' on
+    -- this 'IfaceDecl', an ATyCon would be returned.
+    -- NB: This code assumes that a TyCon cannot be implicit.
+    isIfaceTyCon IfaceId{}      = False
+    isIfaceTyCon IfaceData{}    = True
+    isIfaceTyCon IfaceSynonym{} = True
+    isIfaceTyCon IfaceFamily{}  = True
+    isIfaceTyCon IfaceClass{}   = True
+    isIfaceTyCon IfaceAxiom{}   = False
+    isIfaceTyCon IfacePatSyn{}  = False
 
 {-
 ************************************************************************
@@ -262,7 +595,7 @@ interface files for types mentioned in the arg types.
 
 E.g.
         data Foo.S = MkS Baz.T
-Mabye we can get away without even loading the interface for Baz!
+Maybe we can get away without even loading the interface for Baz!
 
 This is not just a performance thing.  Suppose we have
         data Foo.S = MkS Baz.T
@@ -308,32 +641,31 @@ tc_iface_decl :: Maybe Class  -- ^ For associated type/data family declarations
               -> Bool         -- ^ True <=> discard IdInfo on IfaceId bindings
               -> IfaceDecl
               -> IfL TyThing
-tc_iface_decl _ ignore_prags (IfaceId {ifName = occ_name, ifType = iface_type,
+tc_iface_decl _ ignore_prags (IfaceId {ifName = name, ifType = iface_type,
                                        ifIdDetails = details, ifIdInfo = info})
-  = do  { name <- lookupIfaceTop occ_name
-        ; ty <- tcIfaceType iface_type
+  = do  { ty <- tcIfaceType iface_type
         ; details <- tcIdDetails ty details
         ; info <- tcIdInfo ignore_prags name ty info
         ; return (AnId (mkGlobalId details name ty info)) }
 
-tc_iface_decl _ _ (IfaceData {ifName = occ_name,
+tc_iface_decl _ _ (IfaceData {ifName = tc_name,
                           ifCType = cType,
                           ifBinders = binders,
                           ifResKind = res_kind,
                           ifRoles = roles,
                           ifCtxt = ctxt, ifGadtSyntax = gadt_syn,
                           ifCons = rdr_cons,
-                          ifRec = is_rec, ifParent = mb_parent })
-  = bindIfaceTyConBinders_AT binders $ \ tyvars binders' -> do
-    { tc_name <- lookupIfaceTop occ_name
-    ; res_kind' <- tcIfaceType res_kind
+                          ifParent = mb_parent })
+  = bindIfaceTyConBinders_AT binders $ \ binders' -> do
+    { res_kind' <- tcIfaceType res_kind
 
     ; tycon <- fixM $ \ tycon -> do
             { stupid_theta <- tcIfaceCtxt ctxt
             ; parent' <- tc_parent tc_name mb_parent
-            ; cons <- tcIfaceDataCons tc_name tycon tyvars binders' rdr_cons
-            ; return (mkAlgTyCon tc_name binders' res_kind' tyvars roles cType stupid_theta
-                                    cons parent' is_rec gadt_syn) }
+            ; cons <- tcIfaceDataCons tc_name tycon binders' rdr_cons
+            ; return (mkAlgTyCon tc_name binders' res_kind'
+                                 roles cType stupid_theta
+                                 cons parent' gadt_syn) }
     ; traceIf (text "tcIfaceDecl4" <+> ppr tycon)
     ; return (ATyCon tycon) }
   where
@@ -348,33 +680,31 @@ tc_iface_decl _ _ (IfaceData {ifName = occ_name,
            ; lhs_tys <- tcIfaceTcArgs arg_tys
            ; return (DataFamInstTyCon ax_unbr fam_tc lhs_tys) }
 
-tc_iface_decl _ _ (IfaceSynonym {ifName = occ_name,
+tc_iface_decl _ _ (IfaceSynonym {ifName = tc_name,
                                       ifRoles = roles,
                                       ifSynRhs = rhs_ty,
                                       ifBinders = binders,
                                       ifResKind = res_kind })
-   = bindIfaceTyConBinders_AT binders $ \ tyvars binders' -> do
-     { tc_name  <- lookupIfaceTop occ_name
-     ; res_kind' <- tcIfaceType res_kind     -- Note [Synonym kind loop]
+   = bindIfaceTyConBinders_AT binders $ \ binders' -> do
+     { res_kind' <- tcIfaceType res_kind     -- Note [Synonym kind loop]
      ; rhs      <- forkM (mk_doc tc_name) $
                    tcIfaceType rhs_ty
-     ; let tycon = mkSynonymTyCon tc_name binders' res_kind' tyvars roles rhs
+     ; let tycon = buildSynTyCon tc_name binders' res_kind' roles rhs
      ; return (ATyCon tycon) }
    where
      mk_doc n = text "Type synonym" <+> ppr n
 
-tc_iface_decl parent _ (IfaceFamily {ifName = occ_name,
+tc_iface_decl parent _ (IfaceFamily {ifName = tc_name,
                                      ifFamFlav = fam_flav,
                                      ifBinders = binders,
                                      ifResKind = res_kind,
                                      ifResVar = res, ifFamInj = inj })
-   = bindIfaceTyConBinders_AT binders $ \ tyvars binders' -> do
-     { tc_name   <- lookupIfaceTop occ_name
-     ; res_kind' <- tcIfaceType res_kind    -- Note [Synonym kind loop]
+   = bindIfaceTyConBinders_AT binders $ \ binders' -> do
+     { res_kind' <- tcIfaceType res_kind    -- Note [Synonym kind loop]
      ; rhs      <- forkM (mk_doc tc_name) $
                    tc_fam_flav tc_name fam_flav
      ; res_name <- traverse (newIfaceName . mkTyVarOccFS) res
-     ; let tycon = mkFamilyTyCon tc_name binders' res_kind' tyvars res_name rhs parent inj
+     ; let tycon = mkFamilyTyCon tc_name binders' res_kind' res_name rhs parent inj
      ; return (ATyCon tycon) }
    where
      mk_doc n = text "Type synonym" <+> ppr n
@@ -393,28 +723,39 @@ tc_iface_decl parent _ (IfaceFamily {ifName = occ_name,
          = pprPanic "tc_iface_decl"
                     (text "IfaceBuiltInSynFamTyCon in interface file")
 
-tc_iface_decl _parent ignore_prags
-            (IfaceClass {ifCtxt = rdr_ctxt, ifName = tc_occ,
+tc_iface_decl _parent _ignore_prags
+            (IfaceClass {ifName = tc_name,
                          ifRoles = roles,
                          ifBinders = binders,
                          ifFDs = rdr_fds,
-                         ifATs = rdr_ats, ifSigs = rdr_sigs,
-                         ifMinDef = mindef_occ, ifRec = tc_isrec })
--- ToDo: in hs-boot files we should really treat abstract classes specially,
---       as we do abstract tycons
-  = bindIfaceTyConBinders binders $ \ tyvars binders' -> do
-    { tc_name <- lookupIfaceTop tc_occ
-    ; traceIf (text "tc-iface-class1" <+> ppr tc_occ)
+                         ifBody = IfAbstractClass})
+  = bindIfaceTyConBinders binders $ \ binders' -> do
+    { fds  <- mapM tc_fd rdr_fds
+    ; cls  <- buildClass tc_name binders' roles fds Nothing
+    ; return (ATyCon (classTyCon cls)) }
+
+tc_iface_decl _parent ignore_prags
+            (IfaceClass {ifName = tc_name,
+                         ifRoles = roles,
+                         ifBinders = binders,
+                         ifFDs = rdr_fds,
+                         ifBody = IfConcreteClass {
+                             ifClassCtxt = rdr_ctxt,
+                             ifATs = rdr_ats, ifSigs = rdr_sigs,
+                             ifMinDef = mindef_occ
+                         }})
+  = bindIfaceTyConBinders binders $ \ binders' -> do
+    { traceIf (text "tc-iface-class1" <+> ppr tc_name)
     ; ctxt <- mapM tc_sc rdr_ctxt
-    ; traceIf (text "tc-iface-class2" <+> ppr tc_occ)
+    ; traceIf (text "tc-iface-class2" <+> ppr tc_name)
     ; sigs <- mapM tc_sig rdr_sigs
     ; fds  <- mapM tc_fd rdr_fds
-    ; traceIf (text "tc-iface-class3" <+> ppr tc_occ)
+    ; traceIf (text "tc-iface-class3" <+> ppr tc_name)
     ; mindef <- traverse (lookupIfaceTop . mkVarOccFS) mindef_occ
     ; cls  <- fixM $ \ cls -> do
               { ats  <- mapM (tc_at cls) rdr_ats
-              ; traceIf (text "tc-iface-class4" <+> ppr tc_occ)
-              ; buildClass tc_name tyvars roles ctxt binders' fds ats sigs mindef tc_isrec }
+              ; traceIf (text "tc-iface-class4" <+> ppr tc_name)
+              ; buildClass tc_name binders' roles fds (Just (ctxt, ats, sigs, mindef)) }
     ; return (ATyCon (classTyCon cls)) }
   where
    tc_sc pred = forkM (mk_sc_doc pred) (tcIfaceType pred)
@@ -427,9 +768,8 @@ tc_iface_decl _parent ignore_prags
         -- so we must not pull on T too eagerly.  See Trac #5970
 
    tc_sig :: IfaceClassOp -> IfL TcMethInfo
-   tc_sig (IfaceClassOp occ rdr_ty dm)
-     = do { op_name <- lookupIfaceTop occ
-          ; let doc = mk_op_doc op_name rdr_ty
+   tc_sig (IfaceClassOp op_name rdr_ty dm)
+     = do { let doc = mk_op_doc op_name rdr_ty
           ; op_ty <- forkM (doc <+> text "ty") $ tcIfaceType rdr_ty
                 -- Must be done lazily for just the same reason as the
                 -- type of a data con; to avoid sucking in types that
@@ -464,15 +804,17 @@ tc_iface_decl _parent ignore_prags
    mk_at_doc tc = text "Associated type" <+> ppr tc
    mk_op_doc op_name op_ty = text "Class op" <+> sep [ppr op_name, ppr op_ty]
 
-   tc_fd (tvs1, tvs2) = do { tvs1' <- mapM tcIfaceTyVar tvs1
-                           ; tvs2' <- mapM tcIfaceTyVar tvs2
-                           ; return (tvs1', tvs2') }
-
-tc_iface_decl _ _ (IfaceAxiom { ifName = ax_occ, ifTyCon = tc
+tc_iface_decl _ _ (IfaceAxiom { ifName = tc_name, ifTyCon = tc
                               , ifAxBranches = branches, ifRole = role })
-  = do { tc_name     <- lookupIfaceTop ax_occ
-       ; tc_tycon    <- tcIfaceTyCon tc
-       ; tc_branches <- tc_ax_branches branches
+  = do { tc_tycon    <- tcIfaceTyCon tc
+       -- Must be done lazily, because axioms are forced when checking
+       -- for family instance consistency, and the RHS may mention
+       -- a hs-boot declared type constructor that is going to be
+       -- defined by this module.
+       -- e.g. type instance F Int = ToBeDefined
+       -- See Trac #13803
+       ; tc_branches <- forkM (text "Axiom branches" <+> ppr tc_name)
+                      $ tc_ax_branches branches
        ; let axiom = CoAxiom { co_ax_unique   = nameUnique tc_name
                              , co_ax_name     = tc_name
                              , co_ax_tc       = tc_tycon
@@ -481,7 +823,7 @@ tc_iface_decl _ _ (IfaceAxiom { ifName = ax_occ, ifTyCon = tc
                              , co_ax_implicit = False }
        ; return (ACoAxiom axiom) }
 
-tc_iface_decl _ _ (IfacePatSyn{ ifName = occ_name
+tc_iface_decl _ _ (IfacePatSyn{ ifName = name
                               , ifPatMatcher = if_matcher
                               , ifPatBuilder = if_builder
                               , ifPatIsInfix = is_infix
@@ -492,20 +834,19 @@ tc_iface_decl _ _ (IfacePatSyn{ ifName = occ_name
                               , ifPatArgs = args
                               , ifPatTy = pat_ty
                               , ifFieldLabels = field_labels })
-  = do { name <- lookupIfaceTop occ_name
-       ; traceIf (text "tc_iface_decl" <+> ppr name)
+  = do { traceIf (text "tc_iface_decl" <+> ppr name)
        ; matcher <- tc_pr if_matcher
        ; builder <- fmapMaybeM tc_pr if_builder
-       ; bindIfaceForAllBndrs univ_bndrs $ \univ_tvs univ_bndrs -> do
-       { bindIfaceForAllBndrs ex_bndrs $ \ex_tvs ex_bndrs -> do
+       ; bindIfaceForAllBndrs univ_bndrs $ \univ_tvs -> do
+       { bindIfaceForAllBndrs ex_bndrs $ \ex_tvs -> do
        { patsyn <- forkM (mk_doc name) $
              do { prov_theta <- tcIfaceCtxt prov_ctxt
                 ; req_theta  <- tcIfaceCtxt req_ctxt
                 ; pat_ty     <- tcIfaceType pat_ty
                 ; arg_tys    <- mapM tcIfaceType args
                 ; return $ buildPatSyn name is_infix matcher builder
-                                       (univ_tvs, univ_bndrs, req_theta)
-                                       (ex_tvs, ex_bndrs, prov_theta)
+                                       (univ_tvs, req_theta)
+                                       (ex_tvs, prov_theta)
                                        arg_tys pat_ty field_labels }
        ; return $ AConLike . PatSynCon $ patsyn }}}
   where
@@ -513,6 +854,11 @@ tc_iface_decl _ _ (IfacePatSyn{ ifName = occ_name
      tc_pr :: (IfExtName, Bool) -> IfL (Id, Bool)
      tc_pr (nm, b) = do { id <- forkM (ppr nm) (tcIfaceExtId nm)
                         ; return (id, b) }
+
+tc_fd :: FunDep IfLclName -> IfL (FunDep TyVar)
+tc_fd (tvs1, tvs2) = do { tvs1' <- mapM tcIfaceTyVar tvs1
+                        ; tvs2' <- mapM tcIfaceTyVar tvs2
+                        ; return (tvs1', tvs2') }
 
 tc_ax_branches :: [IfaceAxBranch] -> IfL [CoAxBranch]
 tc_ax_branches if_branches = foldlM tc_ax_branch [] if_branches
@@ -523,13 +869,13 @@ tc_ax_branch prev_branches
                             , ifaxbLHS = lhs, ifaxbRHS = rhs
                             , ifaxbRoles = roles, ifaxbIncomps = incomps })
   = bindIfaceTyConBinders_AT
-      (map (\b -> IfaceNamed (IfaceTv b Invisible)) tv_bndrs) $ \ tvs _ ->
+      (map (\b -> TvBndr b (NamedTCB Inferred)) tv_bndrs) $ \ tvs ->
          -- The _AT variant is needed here; see Note [CoAxBranch type variables] in CoAxiom
     bindIfaceIds cv_bndrs $ \ cvs -> do
     { tc_lhs <- tcIfaceTcArgs lhs
     ; tc_rhs <- tcIfaceType rhs
     ; let br = CoAxBranch { cab_loc     = noSrcSpan
-                          , cab_tvs     = tvs
+                          , cab_tvs     = binderVars tvs
                           , cab_cvs     = cvs
                           , cab_lhs     = tc_lhs
                           , cab_roles   = roles
@@ -537,28 +883,29 @@ tc_ax_branch prev_branches
                           , cab_incomps = map (prev_branches `getNth`) incomps }
     ; return (prev_branches ++ [br]) }
 
-tcIfaceDataCons :: Name -> TyCon -> [TyVar] -> [TyBinder] -> IfaceConDecls -> IfL AlgTyConRhs
-tcIfaceDataCons tycon_name tycon tc_tyvars tc_tybinders if_cons
+tcIfaceDataCons :: Name -> TyCon -> [TyConBinder] -> IfaceConDecls -> IfL AlgTyConRhs
+tcIfaceDataCons tycon_name tycon tc_tybinders if_cons
   = case if_cons of
-        IfAbstractTyCon dis -> return (AbstractTyCon dis)
-        IfDataTyCon cons _ _ -> do  { field_lbls <- mapM (traverse lookupIfaceTop) (ifaceConDeclFields if_cons)
-                                    ; data_cons  <- mapM (tc_con_decl field_lbls) cons
-                                    ; return (mkDataTyConRhs data_cons) }
-        IfNewTyCon  con  _ _ -> do  { field_lbls <- mapM (traverse lookupIfaceTop) (ifaceConDeclFields if_cons)
-                                    ; data_con  <- tc_con_decl field_lbls con
-                                    ; mkNewTyConRhs tycon_name tycon data_con }
+        IfAbstractTyCon  -> return AbstractTyCon
+        IfDataTyCon cons -> do  { data_cons  <- mapM tc_con_decl cons
+                                ; return (mkDataTyConRhs data_cons) }
+        IfNewTyCon  con  -> do  { data_con  <- tc_con_decl con
+                                ; mkNewTyConRhs tycon_name tycon data_con }
   where
-    tc_con_decl field_lbls (IfCon { ifConInfix = is_infix,
+    univ_tv_bndrs :: [TyVarBinder]
+    univ_tv_bndrs = mkDataConUnivTyVarBinders tc_tybinders
+
+    tc_con_decl (IfCon { ifConInfix = is_infix,
                          ifConExTvs = ex_bndrs,
-                         ifConOcc = occ, ifConCtxt = ctxt, ifConEqSpec = spec,
-                         ifConArgTys = args, ifConFields = my_lbls,
+                         ifConName = dc_name,
+                         ifConCtxt = ctxt, ifConEqSpec = spec,
+                         ifConArgTys = args, ifConFields = lbl_names,
                          ifConStricts = if_stricts,
                          ifConSrcStricts = if_src_stricts})
      = -- Universally-quantified tyvars are shared with
-       -- parent TyCon, and are alrady in scope
-       bindIfaceForAllBndrs ex_bndrs    $ \ ex_tvs ex_binders' -> do
-        { traceIf (text "Start interface-file tc_con_decl" <+> ppr occ)
-        ; dc_name  <- lookupIfaceTop occ
+       -- parent TyCon, and are already in scope
+       bindIfaceForAllBndrs ex_bndrs    $ \ ex_tv_bndrs -> do
+        { traceIf (text "Start interface-file tc_con_decl" <+> ppr dc_name)
 
         -- Read the context and argument types, but lazily for two reasons
         -- (a) to avoid looking tugging on a recursive use of
@@ -574,17 +921,10 @@ tcIfaceDataCons tycon_name tycon tc_tyvars tc_tybinders if_cons
                         -- the type itself; hence inside forkM
                 ; return (eq_spec, theta, arg_tys, stricts) }
 
-        -- Look up the field labels for this constructor; note that
-        -- they should be in the same order as my_lbls!
-        ; let lbl_names = map find_lbl my_lbls
-              find_lbl x = case find (\ fl -> nameOccName (flSelector fl) == x) field_lbls of
-                             Just fl -> fl
-                             Nothing -> error $ "find_lbl missing " ++ occNameString x
-
         -- Remember, tycon is the representation tycon
         ; let orig_res_ty = mkFamilyTyConApp tycon
                                 (substTyVars (mkTvSubstPrs (map eqSpecPair eq_spec))
-                                             tc_tyvars)
+                                             (binderVars tc_tybinders))
 
         ; prom_rep_name <- newTyConRepName dc_name
 
@@ -598,7 +938,7 @@ tcIfaceDataCons tycon_name tycon tc_tyvars tc_tybinders if_cons
                        -- worker.
                        -- See Note [Bangs on imported data constructors] in MkId
                        lbl_names
-                       tc_tyvars tc_tybinders ex_tvs ex_binders'
+                       univ_tv_bndrs ex_tv_bndrs
                        eq_spec theta
                        arg_tys orig_res_ty tycon
         ; traceIf (text "Done interface-file tc_con_decl" <+> ppr dc_name)
@@ -613,7 +953,7 @@ tcIfaceDataCons tycon_name tycon tc_tyvars tc_tybinders if_cons
                                       ; return (HsUnpack (Just co)) }
 
     src_strict :: IfaceSrcBang -> HsSrcBang
-    src_strict (IfSrcBang unpk bang) = HsSrcBang Nothing unpk bang
+    src_strict (IfSrcBang unpk bang) = HsSrcBang NoSourceText unpk bang
 
 tcIfaceEqSpec :: IfaceEqSpec -> IfL [EqSpec]
 tcIfaceEqSpec spec
@@ -654,7 +994,7 @@ tcIfaceInst (IfaceClsInst { ifDFun = dfun_name, ifOFlag = oflag
                           , ifInstCls = cls, ifInstTys = mb_tcs
                           , ifInstOrph = orph })
   = do { dfun <- forkM (text "Dict fun" <+> ppr dfun_name) $
-                 tcIfaceExtId dfun_name
+                    fmap tyThingId (tcIfaceImplicit dfun_name)
        ; let mb_tcs' = map (fmap ifaceTyConName) mb_tcs
        ; return (mkImportedInstance cls mb_tcs' dfun_name dfun oflag orph) }
 
@@ -754,6 +1094,20 @@ tcIfaceAnnTarget (ModuleTarget mod) = do
 {-
 ************************************************************************
 *                                                                      *
+                Complete Match Pragmas
+*                                                                      *
+************************************************************************
+-}
+
+tcIfaceCompleteSigs :: [IfaceCompleteMatch] -> IfL [CompleteMatch]
+tcIfaceCompleteSigs = mapM tcIfaceCompleteSig
+
+tcIfaceCompleteSig :: IfaceCompleteMatch -> IfL CompleteMatch
+tcIfaceCompleteSig (IfaceCompleteMatch ms t) = return (CompleteMatch ms t)
+
+{-
+************************************************************************
+*                                                                      *
                 Vectorisation information
 *                                                                      *
 ************************************************************************
@@ -782,7 +1136,7 @@ tcIfaceVectInfo mod typeEnv (IfaceVectInfo
        ; vParallelVars <- mapM vectVar                         parallelVars
        ; let (vTyCons, vDataCons, vScSels) = unzip3 (tyConRes1 ++ tyConRes2)
        ; return $ VectInfo
-                  { vectInfoVar            = mkVarEnv  vVars `extendVarEnvList` concat vScSels
+                  { vectInfoVar            = mkDVarEnv vVars `extendDVarEnvList` concat vScSels
                   , vectInfoTyCon          = mkNameEnv vTyCons
                   , vectInfoDataCon        = mkNameEnv (concat vDataCons)
                   , vectInfoParallelVars   = mkDVarSet vParallelVars
@@ -891,30 +1245,32 @@ tcIfaceType :: IfaceType -> IfL Type
 tcIfaceType = go
   where
     go (IfaceTyVar n)         = TyVarTy <$> tcIfaceTyVar n
+    go (IfaceFreeTyVar n)     = pprPanic "tcIfaceType:IfaceFreeTyVar" (ppr n)
     go (IfaceAppTy t1 t2)     = AppTy <$> go t1 <*> go t2
     go (IfaceLitTy l)         = LitTy <$> tcIfaceTyLit l
-    go (IfaceFunTy t1 t2)     = ForAllTy <$> (Anon <$> go t1) <*> go t2
-    go (IfaceDFunTy t1 t2)    = ForAllTy <$> (Anon <$> go t1) <*> go t2
+    go (IfaceFunTy t1 t2)     = FunTy <$> go t1 <*> go t2
+    go (IfaceDFunTy t1 t2)    = FunTy <$> go t1 <*> go t2
     go (IfaceTupleTy s i tks) = tcIfaceTupleTy s i tks
     go (IfaceTyConApp tc tks)
       = do { tc' <- tcIfaceTyCon tc
            ; tks' <- mapM go (tcArgsIfaceTypes tks)
            ; return (mkTyConApp tc' tks') }
     go (IfaceForAllTy bndr t)
-      = bindIfaceForAllBndr bndr $ \ tv' vis -> mkNamedForAllTy tv' vis <$> go t
+      = bindIfaceForAllBndr bndr $ \ tv' vis ->
+        ForAllTy (TvBndr tv' vis) <$> go t
     go (IfaceCastTy ty co)   = CastTy <$> go ty <*> tcIfaceCo co
     go (IfaceCoercionTy co)  = CoercionTy <$> tcIfaceCo co
 
-tcIfaceTupleTy :: TupleSort -> IfaceTyConInfo -> IfaceTcArgs -> IfL Type
-tcIfaceTupleTy sort info args
+tcIfaceTupleTy :: TupleSort -> IsPromoted -> IfaceTcArgs -> IfL Type
+tcIfaceTupleTy sort is_promoted args
  = do { args' <- tcIfaceTcArgs args
       ; let arity = length args'
       ; base_tc <- tcTupleTyCon True sort arity
-      ; case info of
-          NoIfaceTyConInfo
+      ; case is_promoted of
+          IsNotPromoted
             -> return (mkTyConApp base_tc args')
 
-          IfacePromotedDataCon
+          IsPromoted
             -> do { let tc        = promoteDataCon (tyConSingleDataCon base_tc)
                         kind_args = map typeKind args'
                   ; return (mkTyConApp tc (kind_args ++ args')) } }
@@ -997,6 +1353,8 @@ tcIfaceUnivCoProv IfaceUnsafeCoerceProv     = return UnsafeCoerceProv
 tcIfaceUnivCoProv (IfacePhantomProv kco)    = PhantomProv <$> tcIfaceCo kco
 tcIfaceUnivCoProv (IfaceProofIrrelProv kco) = ProofIrrelProv <$> tcIfaceCo kco
 tcIfaceUnivCoProv (IfacePluginProv str)     = return $ PluginProv str
+tcIfaceUnivCoProv (IfaceHoleProv _)         =
+    pprPanic "tcIfaceUnivCoProv" (text "holes can't occur in interface files")
 
 {-
 ************************************************************************
@@ -1038,7 +1396,7 @@ tcIfaceExpr (IfaceTuple sort args)
        ; let con_tys = map exprType args'
              some_con_args = map Type con_tys ++ args'
              con_args = case sort of
-               UnboxedTuple -> map (Type . getRuntimeRep "tcIfaceExpr") con_tys ++ some_con_args
+               UnboxedTuple -> map (Type . getRuntimeRep) con_tys ++ some_con_args
                _            -> some_con_args
                         -- Put the missing type arguments back in
              con_id   = dataConWorkId (tyConSingleDataCon tc)
@@ -1078,12 +1436,13 @@ tcIfaceExpr (IfaceCase scrut case_bndr alts)  = do
      alts' <- mapM (tcIfaceAlt scrut' tc_app) alts
      return (Case scrut' case_bndr' (coreAltsType alts') alts')
 
-tcIfaceExpr (IfaceLet (IfaceNonRec (IfLetBndr fs ty info) rhs) body)
+tcIfaceExpr (IfaceLet (IfaceNonRec (IfLetBndr fs ty info ji) rhs) body)
   = do  { name    <- newIfaceName (mkVarOccFS fs)
         ; ty'     <- tcIfaceType ty
         ; id_info <- tcIdInfo False {- Don't ignore prags; we are inside one! -}
                               name ty' info
         ; let id = mkLocalIdOrCoVarWithInfo name ty' id_info
+                     `asJoinId_maybe` tcJoinInfo ji
         ; rhs' <- tcIfaceExpr rhs
         ; body' <- extendIfaceIdEnv [id] (tcIfaceExpr body)
         ; return (Let (NonRec id rhs') body') }
@@ -1095,11 +1454,11 @@ tcIfaceExpr (IfaceLet (IfaceRec pairs) body)
        ; body' <- tcIfaceExpr body
        ; return (Let (Rec pairs') body') } }
  where
-   tc_rec_bndr (IfLetBndr fs ty _)
+   tc_rec_bndr (IfLetBndr fs ty _ ji)
      = do { name <- newIfaceName (mkVarOccFS fs)
           ; ty'  <- tcIfaceType ty
-          ; return (mkLocalIdOrCoVar name ty') }
-   tc_pair (IfLetBndr _ _ info, rhs) id
+          ; return (mkLocalIdOrCoVar name ty' `asJoinId_maybe` tcJoinInfo ji) }
+   tc_pair (IfLetBndr _ _ info _, rhs) id
      = do { rhs' <- tcIfaceExpr rhs
           ; id_info <- tcIdInfo False {- Don't ignore prags; we are inside one! -}
                                 (idName id) (idType id) info
@@ -1194,28 +1553,35 @@ tcIdDetails _ (IfRecSelId tc naughty)
     tyThingPatSyn _ = panic "tcIdDetails: expecting patsyn"
 
 tcIdInfo :: Bool -> Name -> Type -> IfaceIdInfo -> IfL IdInfo
-tcIdInfo ignore_prags name ty info
-  | ignore_prags = return vanillaIdInfo
-  | otherwise    = case info of
-                        NoInfo       -> return vanillaIdInfo
-                        HasInfo info -> foldlM tcPrag init_info info
-  where
+tcIdInfo ignore_prags name ty info = do
+    lcl_env <- getLclEnv
     -- Set the CgInfo to something sensible but uninformative before
     -- we start; default assumption is that it has CAFs
-    init_info = vanillaIdInfo
-
+    let init_info | if_boot lcl_env = vanillaIdInfo `setUnfoldingInfo` BootUnfolding
+                  | otherwise       = vanillaIdInfo
+    if ignore_prags
+        then return init_info
+        else case info of
+                NoInfo -> return init_info
+                HasInfo info -> foldlM tcPrag init_info info
+  where
     tcPrag :: IdInfo -> IfaceInfoItem -> IfL IdInfo
     tcPrag info HsNoCafRefs        = return (info `setCafInfo`   NoCafRefs)
     tcPrag info (HsArity arity)    = return (info `setArityInfo` arity)
     tcPrag info (HsStrictness str) = return (info `setStrictnessInfo` str)
     tcPrag info (HsInline prag)    = return (info `setInlinePragInfo` prag)
+    tcPrag info HsLevity           = return (info `setNeverLevPoly` ty)
 
         -- The next two are lazy, so they don't transitively suck stuff in
     tcPrag info (HsUnfold lb if_unf)
       = do { unf <- tcUnfolding name ty info if_unf
            ; let info1 | lb        = info `setOccInfo` strongLoopBreaker
                        | otherwise = info
-           ; return (info1 `setUnfoldingInfoLazily` unf) }
+           ; return (info1 `setUnfoldingInfo` unf) }
+
+tcJoinInfo :: IfaceJoinInfo -> Maybe JoinArity
+tcJoinInfo (IfaceJoinPoint ar) = Just ar
+tcJoinInfo IfaceNotJoinPoint   = Nothing
 
 tcUnfolding :: Name -> Type -> IdInfo -> IfaceUnfolding -> IfL Unfolding
 tcUnfolding name _ info (IfCoreUnfold stable if_expr)
@@ -1361,19 +1727,21 @@ ifKnotErr name env_doc type_env = vcat
 
 -- Note [Tying the knot]
 -- ~~~~~~~~~~~~~~~~~~~~~
--- The if_rec_types field is used in two situations:
+-- The if_rec_types field is used when we are compiling M.hs, which indirectly
+-- imports Foo.hi, which mentions M.T Then we look up M.T in M's type
+-- environment, which is splatted into if_rec_types after we've built M's type
+-- envt.
 --
--- a) Compiling M.hs, which indirectly imports Foo.hi, which mentions M.T
---    Then we look up M.T in M's type environment, which is splatted into if_rec_types
---    after we've built M's type envt.
+-- This is a dark and complicated part of GHC type checking, with a lot
+-- of moving parts.  Interested readers should also look at:
 --
--- b) In ghc --make, during the upsweep, we encounter M.hs, whose interface M.hi
---    is up to date.  So we call typecheckIface on M.hi.  This splats M.T into
---    if_rec_types so that the (lazily typechecked) decls see all the other decls
+--      * Note [Knot-tying typecheckIface]
+--      * Note [DFun knot-tying]
+--      * Note [hsc_type_env_var hack]
 --
--- In case (b) it's important to do the if_rec_types check *before* looking in the HPT
--- Because if M.hs also has M.hs-boot, M.T will *already be* in the HPT, but in its
--- emasculated form (e.g. lacking data constructors).
+-- There is also a wiki page on the subject, see:
+--
+--      https://ghc.haskell.org/trac/ghc/wiki/Commentary/Compiler/TyingTheKnot
 
 tcIfaceTyConByName :: IfExtName -> IfL TyCon
 tcIfaceTyConByName name
@@ -1383,12 +1751,12 @@ tcIfaceTyConByName name
 tcIfaceTyCon :: IfaceTyCon -> IfL TyCon
 tcIfaceTyCon (IfaceTyCon name info)
   = do { thing <- tcIfaceGlobal name
-       ; return $ case info of
-           NoIfaceTyConInfo     -> tyThingTyCon thing
-           IfacePromotedDataCon -> promoteDataCon $ tyThingDataCon thing }
+       ; return $ case ifaceTyConIsPromoted info of
+           IsNotPromoted -> tyThingTyCon thing
+           IsPromoted    -> promoteDataCon $ tyThingDataCon thing }
 
 tcIfaceCoAxiom :: Name -> IfL (CoAxiom Branched)
-tcIfaceCoAxiom name = do { thing <- tcIfaceGlobal name
+tcIfaceCoAxiom name = do { thing <- tcIfaceImplicit name
                          ; return (tyThingCoAxiom thing) }
 
 tcIfaceDataCon :: Name -> IfL DataCon
@@ -1402,6 +1770,17 @@ tcIfaceExtId name = do { thing <- tcIfaceGlobal name
                        ; case thing of
                           AnId id -> return id
                           _       -> pprPanic "tcIfaceExtId" (ppr name$$ ppr thing) }
+
+-- See Note [Resolving never-exported Names in TcIface]
+tcIfaceImplicit :: Name -> IfL TyThing
+tcIfaceImplicit n = do
+    lcl_env <- getLclEnv
+    case if_implicits_env lcl_env of
+        Nothing -> tcIfaceGlobal n
+        Just tenv ->
+            case lookupTypeEnv tenv n of
+                Nothing -> pprPanic "tcIfaceInst" (ppr n $$ ppr tenv)
+                Just tything -> return tything
 
 {-
 ************************************************************************
@@ -1439,15 +1818,15 @@ bindIfaceBndrs (b:bs) thing_inside
     thing_inside (b':bs')
 
 -----------------------
-bindIfaceForAllBndrs :: [IfaceForAllBndr] -> ([TyVar] -> [TyBinder] -> IfL a) -> IfL a
-bindIfaceForAllBndrs [] thing_inside = thing_inside [] []
+bindIfaceForAllBndrs :: [IfaceForAllBndr] -> ([TyVarBinder] -> IfL a) -> IfL a
+bindIfaceForAllBndrs [] thing_inside = thing_inside []
 bindIfaceForAllBndrs (bndr:bndrs) thing_inside
   = bindIfaceForAllBndr bndr $ \tv vis ->
-    bindIfaceForAllBndrs bndrs $ \tvs bndrs' ->
-    thing_inside (tv:tvs) (mkNamedBinder vis tv : bndrs')
+    bindIfaceForAllBndrs bndrs $ \bndrs' ->
+    thing_inside (mkTyVarBinder vis tv : bndrs')
 
-bindIfaceForAllBndr :: IfaceForAllBndr -> (TyVar -> VisibilityFlag -> IfL a) -> IfL a
-bindIfaceForAllBndr (IfaceTv tv vis) thing_inside
+bindIfaceForAllBndr :: IfaceForAllBndr -> (TyVar -> ArgFlag -> IfL a) -> IfL a
+bindIfaceForAllBndr (TvBndr tv vis) thing_inside
   = bindIfaceTyVar tv $ \tv' -> thing_inside tv' vis
 
 bindIfaceTyVar :: IfaceTvBndr -> (TyVar -> IfL a) -> IfL a
@@ -1462,25 +1841,25 @@ mk_iface_tyvar name ifKind
         ; return (Var.mkTyVar name kind) }
 
 bindIfaceTyConBinders :: [IfaceTyConBinder]
-                      -> ([TyVar] -> [TyBinder] -> IfL a) -> IfL a
-bindIfaceTyConBinders [] thing_inside = thing_inside [] []
+                      -> ([TyConBinder] -> IfL a) -> IfL a
+bindIfaceTyConBinders [] thing_inside = thing_inside []
 bindIfaceTyConBinders (b:bs) thing_inside
-  = bindIfaceTyConBinderX bindIfaceTyVar b $ \ tv'  b'  ->
-    bindIfaceTyConBinders bs               $ \ tvs' bs' ->
-    thing_inside (tv':tvs') (b':bs')
+  = bindIfaceTyConBinderX bindIfaceTyVar b $ \ b'  ->
+    bindIfaceTyConBinders bs               $ \ bs' ->
+    thing_inside (b':bs')
 
 bindIfaceTyConBinders_AT :: [IfaceTyConBinder]
-                         -> ([TyVar] -> [TyBinder] -> IfL a) -> IfL a
+                         -> ([TyConBinder] -> IfL a) -> IfL a
 -- Used for type variable in nested associated data/type declarations
 -- where some of the type variables are already in scope
 --    class C a where { data T a b }
 -- Here 'a' is in scope when we look at the 'data T'
 bindIfaceTyConBinders_AT [] thing_inside
-  = thing_inside [] []
+  = thing_inside []
 bindIfaceTyConBinders_AT (b : bs) thing_inside
-  = bindIfaceTyConBinderX bind_tv b  $ \tv'  b'  ->
-    bindIfaceTyConBinders_AT      bs $ \tvs' bs' ->
-    thing_inside (tv':tvs') (b':bs')
+  = bindIfaceTyConBinderX bind_tv b  $ \b'  ->
+    bindIfaceTyConBinders_AT      bs $ \bs' ->
+    thing_inside (b':bs')
   where
     bind_tv tv thing
       = do { mb_tv <- lookupIfaceTyVar tv
@@ -1490,10 +1869,7 @@ bindIfaceTyConBinders_AT (b : bs) thing_inside
 
 bindIfaceTyConBinderX :: (IfaceTvBndr -> (TyVar -> IfL a) -> IfL a)
                       -> IfaceTyConBinder
-                      -> (TyVar -> TyBinder -> IfL a) -> IfL a
-bindIfaceTyConBinderX bind_tv (IfaceAnon name ki) thing_inside
-  = bind_tv (name, ki) $ \ tv' ->
-    thing_inside tv' (Anon (tyVarKind tv'))
-bindIfaceTyConBinderX bind_tv (IfaceNamed (IfaceTv tv vis)) thing_inside
+                      -> (TyConBinder -> IfL a) -> IfL a
+bindIfaceTyConBinderX bind_tv (TvBndr tv vis) thing_inside
   = bind_tv tv $ \tv' ->
-    thing_inside tv' (Named tv' vis)
+    thing_inside (TvBndr tv' vis)

@@ -11,10 +11,9 @@ fail() {
 
 download_file() {
     local file_url="$1"
-    local file_md5="$2"
-    local dest_file="$3"
-    local description="$4"
-    local extra_curl_opts="$5"
+    local dest_file="$2"
+    local description="$3"
+    local extra_curl_opts="$4"
     local dest_dir="$(dirname $dest_file)"
 
     if ! test -f "${dest_file}"
@@ -35,26 +34,38 @@ download_file() {
         fi
     fi
 
-    echo "${file_md5} *${dest_file}" | md5sum --quiet -c - ||
-        fail "ERROR: ${description} appears to be corrupted, please delete it and try again."
+    local sig_file="${dest_file}.sig"
+    if test "$sigs" = "1" -a ! -f "$sig_file"
+    then
+        echo "Downloading ${description} (signature) to ${dest_dir}..."
+        local curl_cmd="curl -L ${file_url}.sig -o ${sig_file} --create-dirs -# ${extra_curl_opts}"
+        $curl_cmd || {
+                rm -f "${dest_file}.sig"
+                fail "ERROR: Download failed."
+            }
+    fi
+
+    if test "$verify" = "1"
+    then
+        grep "${dest_file}$" mk/win32-tarballs.md5sum | md5sum --quiet -c - ||
+            fail "ERROR: ${description} appears to be corrupted, please delete it and try again."
+    fi
 }
 
 download_mingw() {
-    local mingw_url="$1"
-    local file_md5sum_x86="$2"
-    local file_md5sum_x64="$3"
-
-    if test "$mingw_arch" = "i686"
+    if test "$mingw_arch" = "sources"
     then
-        local file_md5sum="${file_md5sum_x86}"
+        local mingw_url=`echo "$1" | sed -e 's/-any\.pkg\.tar\.xz/\.src\.tar\.gz/' \
+                                         -e 's/-sources-/-/' \
+                                         -e 's/-libwinpthread-git-/-winpthreads-git-/' `
     else
-        local file_md5sum="${file_md5sum_x64}"
+        local mingw_url="$1"
     fi
 
     local mingw_toolchain="$(basename $mingw_url)"
     local mingw_w64="${tarball_dir}/${tarball_dest_dir}/${mingw_toolchain}"
 
-    download_file "${mingw_url}" "${file_md5sum}" "${mingw_w64}" "${mingw_toolchain}"
+    download_file "${mingw_url}" "${mingw_w64}" "${mingw_toolchain}"
 
     # Mark the tree as needing updates by deleting the folder
     if test -d inplace/mingw && test inplace/mingw -ot "$mingw_w64" ; then
@@ -64,25 +75,34 @@ download_mingw() {
 }
 
 download_tarballs() {
+    #local mingw_base_url="http://repo.msys2.org/mingw"
     local mingw_base_url="https://downloads.haskell.org/~ghc/mingw"
     local package_prefix="mingw-w64"
     local format_url="${mingw_base_url}/${mingw_arch}/${package_prefix}-${mingw_arch}"
 
-    download_mingw "${format_url}-crt-git-5.0.0.4531.49c7046-1-any.pkg.tar.xz"           "dd39323140c0c1b3e065e9edb1a66779" "ac22cedd38229bcd57f5999e4734054f"
-    download_mingw "${format_url}-winpthreads-git-5.0.0.4538.78dca70-1-any.pkg.tar.xz"   "0b14fe27790e94db454fbb3564e79a73" "65cf07b6f42a1a62d1844e08190cab0d"
-    download_mingw "${format_url}-headers-git-5.0.0.4531.49c7046-1-any.pkg.tar.xz"       "6ee9e3c2f9d3e507f60ee33d19417dc2" "f49a19cdea93998c33ac90ceb9570350"
-    download_mingw "${format_url}-libwinpthread-git-5.0.0.4538.78dca70-1-any.pkg.tar.xz" "fbb2114aa7fbb5507e21d8a2ea265cfd" "31ed10e2d8891f6251d968f81bfdd274"
-    download_mingw "${format_url}-zlib-1.2.8-8-any.pkg.tar.xz"                           "7f519cb6defa27a90c5353160cf088d4" "6a2f4a70ccb24acca70a01da331699a6"
-    download_mingw "${format_url}-isl-0.14.1-2-any.pkg.tar.xz"                           "4cd20fe75ed9ef03e260d529042cb742" "dc0e0a7fd23a8193cccb0bf8d7267685"
-    download_mingw "${format_url}-mpc-1.0.3-2-any.pkg.tar.xz"                            "719e76fa7a54a8676d2e60af3bb13c45" "df1a7d4050568d83c265ae78c32ef30b"
-    download_mingw "${format_url}-mpfr-3.1.3.p0-2-any.pkg.tar.xz"                        "e9cbd2402ac1afe6e86c102223b90dcb" "6e3b9ec27edab394aa41536839afdafe"
-    download_mingw "${format_url}-gmp-6.0.0-3-any.pkg.tar.xz"                            "c02f9759cd0140a6d8ea69ef5a88e167" "2970d4d8b176f8f36ae2d39269b25cce"
-    download_mingw "${format_url}-gcc-libs-5.2.0-3-any.pkg.tar.xz"                       "a9bd2e65cb350cc8f8a6deb6d3b346a8" "9c2ed24989e14fdf0c548a5215374660"
-    download_mingw "${format_url}-binutils-2.25.1-1-any.pkg.tar.xz"                      "997e9c2166fb851916cd8ac1bc9c6180" "7cb9f5f50a7103da41f7ec7547c09707"
-    download_mingw "${format_url}-libiconv-1.14-5-any.pkg.tar.xz"                        "2c99a163689ba8257627bb07274b3f86" "37418c6be92ef20be17cdc9fe844af35"
-    download_mingw "${format_url}-gcc-5.2.0-3-any.pkg.tar.xz"                            "efe6d6afc18aab89dc01e7ddcd2523a6" "0b697ce61112ba6e5a3c4d565957ea4e"
+    download_mingw "${format_url}-crt-git-5.0.0.4795.e3d96cb1-1-any.pkg.tar.xz"
+    download_mingw "${format_url}-winpthreads-git-5.0.0.4741.2c8939a-1-any.pkg.tar.xz"
+    download_mingw "${format_url}-headers-git-5.0.0.4747.0f8f626-1-any.pkg.tar.xz"
+    download_mingw "${format_url}-libwinpthread-git-5.0.0.4741.2c8939a-1-any.pkg.tar.xz"
+    download_mingw "${format_url}-zlib-1.2.8-9-any.pkg.tar.xz"
+    download_mingw "${format_url}-isl-0.17.1-1-any.pkg.tar.xz"
+    download_mingw "${format_url}-mpfr-3.1.4.p3-4-any.pkg.tar.xz"
+    download_mingw "${format_url}-gmp-6.1.1-1-any.pkg.tar.xz"
+    download_mingw "${format_url}-binutils-2.27-2-any.pkg.tar.xz"
+    download_mingw "${format_url}-libidn-1.32-3-any.pkg.tar.xz"
+    download_mingw "${format_url}-gcc-6.2.0-2-any.pkg.tar.xz"
 
-    download_file "https://github.com/ghc/ghc-tarballs/blob/master/perl/ghc-perl-1.tar.gz?raw=true" "b21d1681b61cf7a024e854096285b02e" "ghc-tarballs/perl/ghc-perl-1.tar.gz" "Windows Perl binary distributions" "--insecure"
+    # Upstream is unfortunately quite inconsistent in naming
+    if test "$mingw_arch" != "sources"; then
+        download_mingw "${format_url}-mpc-1.0.3-2-any.pkg.tar.xz"
+        download_mingw "${format_url}-gcc-libs-6.2.0-2-any.pkg.tar.xz"
+    else
+        local format_url="${mingw_base_url}/${mingw_arch}/${package_prefix}"
+        download_mingw "${format_url}-i686-mpc-1.0.3-2.src.tar.gz"
+        download_mingw "${format_url}-x86_64-mpc-1.0.3-2.src.tar.gz"
+    fi
+
+    download_file "https://downloads.haskell.org/~ghc/mingw/ghc-perl-1.tar.gz" "ghc-tarballs/perl/ghc-perl-1.tar.gz" "Windows Perl binary distributions"
 
     if ! test "$missing_files" = "0"
     then
@@ -102,6 +122,12 @@ download_x86_64() {
     download_tarballs
 }
 
+download_sources() {
+    mingw_arch="sources"
+    tarball_dest_dir="mingw-w64/sources"
+    download_tarballs
+}
+
 usage() {
     echo "$0 - Download GHC mingw toolchain tarballs"
     echo
@@ -109,16 +135,24 @@ usage() {
     echo
     echo "Where <action> is one of,"
     echo "    download     download the necessary tarballs for the given architecture"
-    echo "    verify       verify the existance and correctness of the necessary tarballs"
-    echo "and <arch> is one of i386, x86_64, or all"
+    echo "    fetch        download the necessary tarballs for the given architecture but doesn't verify their md5."d
+    echo "    verify       verify the existence and correctness of the necessary tarballs"
+    echo "and <arch> is one of i386, x86_64,all or mirror (which includes sources)"
 }
 
 case $1 in
     download)
         download=1
+        verify=1
+        sigs=0
+        ;;
+    fetch)
+        download=1
+        verify=0
         ;;
     verify)
         download=0
+        verify=1
         ;;
     *)
         usage
@@ -136,6 +170,13 @@ case $2 in
     all)
         download_i386
         download_x86_64
+        ;;
+    mirror)
+        sigs=1
+        download_i386
+        download_x86_64
+        verify=0
+        download_sources
         ;;
     *)
         usage

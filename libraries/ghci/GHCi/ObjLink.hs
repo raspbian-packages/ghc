@@ -11,11 +11,12 @@
 -- | Primarily, this module consists of an interface to the C-land
 -- dynamic linker.
 module GHCi.ObjLink
-  ( initObjLinker
+  ( initObjLinker, ShouldRetainCAFs(..)
   , loadDLL
   , loadArchive
   , loadObj
   , unloadObj
+  , purgeObj
   , lookupSymbol
   , lookupClosure
   , resolveObjs
@@ -25,6 +26,7 @@ module GHCi.ObjLink
   )  where
 
 import GHCi.RemoteTypes
+import Control.Exception (throwIO, ErrorCall(..))
 import Control.Monad    ( when )
 import Foreign.C
 import Foreign.Marshal.Alloc ( free )
@@ -33,9 +35,30 @@ import GHC.Exts
 import System.Posix.Internals ( CFilePath, withFilePath, peekFilePath )
 import System.FilePath  ( dropExtension, normalise )
 
+
+
+
 -- ---------------------------------------------------------------------------
 -- RTS Linker Interface
 -- ---------------------------------------------------------------------------
+
+data ShouldRetainCAFs
+  = RetainCAFs
+    -- ^ Retain CAFs unconditionally in linked Haskell code.
+    -- Note that this prevents any code from being unloaded.
+    -- It should not be necessary unless you are GHCi or
+    -- hs-plugins, which needs to be able call any function
+    -- in the compiled code.
+  | DontRetainCAFs
+    -- ^ Do not retain CAFs.  Everything reachable from foreign
+    -- exports will be retained, due to the StablePtrs
+    -- created by the module initialisation code.  unloadObj
+    -- frees these StablePtrs, which will allow the CAFs to
+    -- be GC'd and the code to be removed.
+
+initObjLinker :: ShouldRetainCAFs -> IO ()
+initObjLinker RetainCAFs = c_initLinker_ 1
+initObjLinker _ = c_initLinker_ 0
 
 lookupSymbol :: String -> IO (Maybe (Ptr a))
 lookupSymbol str_in = do
@@ -88,19 +111,31 @@ loadArchive :: String -> IO ()
 loadArchive str = do
    withFilePath str $ \c_str -> do
      r <- c_loadArchive c_str
-     when (r == 0) (error ("loadArchive " ++ show str ++ ": failed"))
+     when (r == 0) (throwIO (ErrorCall ("loadArchive " ++ show str ++ ": failed")))
 
 loadObj :: String -> IO ()
 loadObj str = do
    withFilePath str $ \c_str -> do
      r <- c_loadObj c_str
-     when (r == 0) (error ("loadObj " ++ show str ++ ": failed"))
+     when (r == 0) (throwIO (ErrorCall ("loadObj " ++ show str ++ ": failed")))
 
+-- | @unloadObj@ drops the given dynamic library from the symbol table
+-- as well as enables the library to be removed from memory during
+-- a future major GC.
 unloadObj :: String -> IO ()
 unloadObj str =
    withFilePath str $ \c_str -> do
      r <- c_unloadObj c_str
-     when (r == 0) (error ("unloadObj " ++ show str ++ ": failed"))
+     when (r == 0) (throwIO (ErrorCall ("unloadObj " ++ show str ++ ": failed")))
+
+-- | @purgeObj@ drops the symbols for the dynamic library from the symbol
+-- table. Unlike 'unloadObj', the library will not be dropped memory during
+-- a future major GC.
+purgeObj :: String -> IO ()
+purgeObj str =
+   withFilePath str $ \c_str -> do
+     r <- c_purgeObj c_str
+     when (r == 0) (throwIO (ErrorCall ("purgeObj " ++ show str ++ ": failed")))
 
 addLibrarySearchPath :: String -> IO (Ptr ())
 addLibrarySearchPath str =
@@ -128,10 +163,11 @@ resolveObjs = do
 -- ---------------------------------------------------------------------------
 
 foreign import ccall unsafe "addDLL"                  c_addDLL                  :: CFilePath -> IO CString
-foreign import ccall unsafe "initLinker"              initObjLinker             :: IO ()
+foreign import ccall unsafe "initLinker_"             c_initLinker_             :: CInt -> IO ()
 foreign import ccall unsafe "lookupSymbol"            c_lookupSymbol            :: CString -> IO (Ptr a)
 foreign import ccall unsafe "loadArchive"             c_loadArchive             :: CFilePath -> IO Int
 foreign import ccall unsafe "loadObj"                 c_loadObj                 :: CFilePath -> IO Int
+foreign import ccall unsafe "purgeObj"                c_purgeObj                :: CFilePath -> IO Int
 foreign import ccall unsafe "unloadObj"               c_unloadObj               :: CFilePath -> IO Int
 foreign import ccall unsafe "resolveObjs"             c_resolveObjs             :: IO Int
 foreign import ccall unsafe "addLibrarySearchPath"    c_addLibrarySearchPath    :: CFilePath -> IO (Ptr ())

@@ -24,7 +24,9 @@ import Var
 import Class
 import Type
 import TcType( transSuperClasses )
+import CoAxiom( TypeEqn )
 import Unify
+import FamInst( injTyVarsOfTypes )
 import InstEnv
 import VarSet
 import VarEnv
@@ -38,12 +40,6 @@ import Data.List        ( nubBy )
 import Data.Maybe
 import Data.Foldable    ( fold )
 
-#if __GLASGOW_HASKELL__ < 709
-import Prelude hiding ( and )
-import Control.Applicative ( (<$>) )
-import Data.Foldable       ( and )
-#endif
-
 {-
 ************************************************************************
 *                                                                      *
@@ -56,7 +52,7 @@ Each functional dependency with one variable in the RHS is responsible
 for generating a single equality. For instance:
      class C a b | a -> b
 The constraints ([Wanted] C Int Bool) and [Wanted] C Int alpha
-will generate the folloing FunDepEqn
+will generate the following FunDepEqn
      FDEqn { fd_qtvs = []
            , fd_eqs  = [Pair Bool alpha]
            , fd_pred1 = C Int Bool
@@ -109,10 +105,10 @@ data FunDepEqn loc
                                  --   to fresh unification vars,
                                  -- Non-empty only for FunDepEqns arising from instance decls
 
-          , fd_eqs  :: [Pair Type]  -- Make these pairs of types equal
-          , fd_pred1 :: PredType    -- The FunDepEqn arose from
-          , fd_pred2 :: PredType    --  combining these two constraints
-          , fd_loc :: loc  }
+          , fd_eqs   :: [TypeEqn]  -- Make these pairs of types equal
+          , fd_pred1 :: PredType   -- The FunDepEqn arose from
+          , fd_pred2 :: PredType   --  combining these two constraints
+          , fd_loc   :: loc  }
 
 {-
 Given a bunch of predicates that must hold, such as
@@ -153,7 +149,7 @@ instFD (ls,rs) tvs tys
 
 zipAndComputeFDEqs :: (Type -> Type -> Bool) -- Discard this FDEq if true
                    -> [Type] -> [Type]
-                   -> [Pair Type]
+                   -> [TypeEqn]
 -- Create a list of (Type,Type) pairs from two lists of types,
 -- making sure that the types are not already equal
 zipAndComputeFDEqs discard (ty1:tys1) (ty2:tys2)
@@ -188,6 +184,9 @@ improveFromAnother _ _ _ = []
 -- Improve a class constraint from instance declarations
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+instance Outputable (FunDepEqn a) where
+  ppr = pprEquation
+
 pprEquation :: FunDepEqn a -> SDoc
 pprEquation (FDEqn { fd_qtvs = qtvs, fd_eqs = pairs })
   = vcat [text "forall" <+> braces (pprWithCommas ppr qtvs),
@@ -200,11 +199,9 @@ improveFromInstEnv :: InstEnvs
                    -> [FunDepEqn loc] -- Needs to be a FunDepEqn because
                                       -- of quantified variables
 -- Post: Equations oriented from the template (matching instance) to the workitem!
-improveFromInstEnv _inst_env _ pred
-  | not (isClassPred pred)
-  = panic "improveFromInstEnv: not a class predicate"
 improveFromInstEnv inst_env mk_loc pred
-  | Just (cls, tys) <- getClassPredTys_maybe pred
+  | Just (cls, tys) <- ASSERT2( isClassPred pred, ppr pred )
+                       getClassPredTys_maybe pred
   , let (cls_tvs, cls_fds) = classTvsFds cls
         instances          = classInstances inst_env cls
         rough_tcs          = roughMatchTcs tys
@@ -215,7 +212,7 @@ improveFromInstEnv inst_env mk_loc pred
                                 -- because there often are none!
     , let trimmed_tcs = trimRoughMatchTcs cls_tvs fd rough_tcs
                 -- Trim the rough_tcs based on the head of the fundep.
-                -- Remember that instanceCantMatch treats both argumnents
+                -- Remember that instanceCantMatch treats both arguments
                 -- symmetrically, so it's ok to trim the rough_tcs,
                 -- rather than trimming each inst_tcs in turn
     , ispec <- instances
@@ -229,7 +226,7 @@ improveFromInstEnv _ _ _ = []
 improveClsFD :: [TyVar] -> FunDep TyVar    -- One functional dependency from the class
              -> ClsInst                    -- An instance template
              -> [Type] -> [Maybe Name]     -- Arguments of this (C tys) predicate
-             -> [([TyCoVar], [Pair Type])] -- Empty or singleton
+             -> [([TyCoVar], [TypeEqn])]   -- Empty or singleton
 
 improveClsFD clas_tvs fd
              (ClsInst { is_tvs = qtvs, is_tys = tys_inst, is_tcs = rough_tcs_inst })
@@ -262,9 +259,9 @@ improveClsFD clas_tvs fd
              length tys_inst == length clas_tvs
             , ppr tys_inst <+> ppr tys_actual )
 
-    case tcMatchTys ltys1 ltys2 of
+    case tcMatchTyKis ltys1 ltys2 of
         Nothing  -> []
-        Just subst | isJust (tcMatchTysX subst rtys1 rtys2)
+        Just subst | isJust (tcMatchTyKisX subst rtys1 rtys2)
                         -- Don't include any equations that already hold.
                         -- Reason: then we know if any actual improvement has happened,
                         --         in which case we need to iterate the solver
@@ -407,9 +404,9 @@ checkInstCoverage be_liberal clas theta inst_taus
                             <+> text "determine rhs type"<>plural rs
                             <+> pprQuotedList rs ]
                     , text "Un-determined variable" <> pluralVarSet undet_set <> colon
-                            <+> pprVarSet (pprWithCommas ppr) undet_set
+                            <+> pprVarSet undet_set (pprWithCommas ppr)
                     , ppWhen (isEmptyVarSet $ pSnd undetermined_tvs) $
-                      text "(Use -fprint-explicit-kinds to see the kind variables in the types)"
+                      ppSuggestExplicitKinds
                     , ppWhen (not be_liberal &&
                               and (isEmptyVarSet <$> liberal_undet_tvs)) $
                       text "Using UndecidableInstances might help" ]
@@ -497,6 +494,36 @@ also know `t2` and the other way.
 
 oclose is used (only) when checking the coverage condition for
 an instance declaration
+
+Note [Equality superclasses]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Suppose we have
+  class (a ~ [b]) => C a b
+
+Remember from Note [The equality types story] in TysPrim, that
+  * (a ~~ b) is a superclass of (a ~ b)
+  * (a ~# b) is a superclass of (a ~~ b)
+
+So when oclose expands superclasses we'll get a (a ~# [b]) superclass.
+But that's an EqPred not a ClassPred, and we jolly well do want to
+account for the mutual functional dependencies implied by (t1 ~# t2).
+Hence the EqPred handling in oclose.  See Trac #10778.
+
+Note [Care with type functions]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider (Trac #12803)
+  class C x y | x -> y
+  type family F a b
+  type family G c d = r | r -> d
+
+Now consider
+  oclose (C (F a b) (G c d)) {a,b}
+
+Knowing {a,b} fixes (F a b) regardless of the injectivity of F.
+But knowing (G c d) fixes only {d}, because G is only injective
+in its second parameter.
+
+Hence the tyCoVarsOfTypes/injTyVarsOfTypes dance in tv_fds.
 -}
 
 oclose :: [PredType] -> TyCoVarSet -> TyCoVarSet
@@ -513,7 +540,8 @@ oclose preds fixed_tvs
             -- closeOverKinds: see Note [Closing over kinds in coverage]
 
     tv_fds  :: [(TyCoVarSet,TyCoVarSet)]
-    tv_fds  = [ (tyCoVarsOfTypes ls, tyCoVarsOfTypes rs)
+    tv_fds  = [ (tyCoVarsOfTypes ls, injTyVarsOfTypes rs)
+                  -- See Note [Care with type functions]
               | pred <- preds
               , pred' <- pred : transSuperClasses pred
                    -- Look for fundeps in superclasses too
@@ -523,13 +551,14 @@ oclose preds fixed_tvs
     determined pred
        = case classifyPredType pred of
             EqPred NomEq t1 t2 -> [([t1],[t2]), ([t2],[t1])]
+               -- See Note [Equality superclasses]
             ClassPred cls tys  -> [ instFD fd cls_tvs tys
                                   | let (cls_tvs, cls_fds) = classTvsFds cls
                                   , fd <- cls_fds ]
             _ -> []
 
-{-
-************************************************************************
+
+{- *********************************************************************
 *                                                                      *
         Check that a new instance decl is OK wrt fundeps
 *                                                                      *
@@ -597,12 +626,12 @@ checkFunDeps inst_envs (ClsInst { is_tvs = qtvs1, is_cls = cls
       | instanceCantMatch trimmed_tcs rough_tcs2
       = False
       | otherwise
-      = case tcUnifyTys bind_fn ltys1 ltys2 of
+      = case tcUnifyTyKis bind_fn ltys1 ltys2 of
           Nothing         -> False
           Just subst
             -> isNothing $   -- Bogus legacy test (Trac #10675)
                              -- See Note [Bogus consistency check]
-               tcUnifyTys bind_fn (substTysUnchecked subst rtys1) (substTysUnchecked subst rtys2)
+               tcUnifyTyKis bind_fn (substTysUnchecked subst rtys1) (substTysUnchecked subst rtys2)
 
       where
         trimmed_tcs    = trimRoughMatchTcs cls_tvs fd rough_tcs1

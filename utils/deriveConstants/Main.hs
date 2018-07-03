@@ -391,6 +391,7 @@ wanteds os = concat
           ,structField Both "bdescr" "blocks"
           ,structField C    "bdescr" "gen_no"
           ,structField C    "bdescr" "link"
+          ,structField Both "bdescr" "flags"
 
           ,structSize C  "generation"
           ,structField C "generation" "n_new_large_words"
@@ -562,6 +563,21 @@ wanteds os = concat
           ,closureField C "MessageBlackHole" "tso"
           ,closureField C "MessageBlackHole" "bh"
 
+          ,closureSize  C "StgCompactNFData"
+          ,closureField C "StgCompactNFData" "totalW"
+          ,closureField C "StgCompactNFData" "autoBlockW"
+          ,closureField C "StgCompactNFData" "nursery"
+          ,closureField C "StgCompactNFData" "last"
+          ,closureField C "StgCompactNFData" "hp"
+          ,closureField C "StgCompactNFData" "hpLim"
+          ,closureField C "StgCompactNFData" "hash"
+          ,closureField C "StgCompactNFData" "result"
+
+          ,structSize   C "StgCompactNFDataBlock"
+          ,structField  C "StgCompactNFDataBlock" "self"
+          ,structField  C "StgCompactNFDataBlock" "owner"
+          ,structField  C "StgCompactNFDataBlock" "next"
+
           ,structField_ C "RtsFlags_ProfFlags_showCCSOnException"
                           "RTS_FLAGS" "ProfFlags.showCCSOnException"
           ,structField_ C "RtsFlags_DebugFlags_apply"
@@ -637,7 +653,7 @@ wanteds os = concat
           ,constantWord Haskell "MAX_Real_Long_REG"    "MAX_REAL_LONG_REG"
 
           -- This tells the native code generator the size of the spill
-          -- area is has available.
+          -- area it has available.
           ,constantWord Haskell "RESERVED_C_STACK_BYTES" "RESERVED_C_STACK_BYTES"
           -- The amount of (Haskell) stack to leave free for saving
           -- registers when returning to the scheduler.

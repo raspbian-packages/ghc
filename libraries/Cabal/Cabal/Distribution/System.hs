@@ -32,23 +32,23 @@ module Distribution.System (
 
   -- * Internal
   knownOSs,
-  knownArches
+  knownArches,
+
+  -- * Classification
+  ClassificationStrictness (..),
+  classifyOS,
+  classifyArch,
   ) where
 
-import qualified System.Info (os, arch)
-import qualified Data.Char as Char (toLower, isAlphaNum, isAlpha)
+import Prelude ()
+import Distribution.Compat.Prelude
 
-import Distribution.Compat.Binary
+import qualified System.Info (os, arch)
+
 import Distribution.Text
 import qualified Distribution.Compat.ReadP as Parse
 
-import Control.Monad (liftM2)
-import Data.Data (Data)
-import Data.Typeable (Typeable)
-import Data.Maybe (fromMaybe, listToMaybe)
-import GHC.Generics (Generic)
 import qualified Text.PrettyPrint as Disp
-import Text.PrettyPrint ((<>))
 
 -- | How strict to be when classifying strings into the 'OS' and 'Arch' enums.
 --
@@ -73,6 +73,18 @@ data ClassificationStrictness = Permissive | Compat | Strict
 -- * Operating System
 -- ------------------------------------------------------------
 
+-- | These are the known OS names: Linux, Windows, OSX
+--  ,FreeBSD, OpenBSD, NetBSD, DragonFly
+--  ,Solaris, AIX, HPUX, IRIX
+--  ,HaLVM ,Hurd ,IOS, Android,Ghcjs
+--
+-- The following aliases can also be used:,
+--    * Windows aliases: mingw32, win32, cygwin32
+--    * OSX alias: darwin
+--    * Hurd alias: gnu
+--    * FreeBSD alias: kfreebsdgnu
+--    * Solaris alias: solaris2
+--
 data OS = Linux | Windows | OSX        -- tier 1 desktop OSs
         | FreeBSD | OpenBSD | NetBSD   -- other free Unix OSs
         | DragonFly
@@ -127,6 +139,17 @@ buildOS = classifyOS Permissive System.Info.os
 -- * Machine Architecture
 -- ------------------------------------------------------------
 
+-- | These are the known Arches: I386, X86_64, PPC, PPC64, Sparc
+-- ,Arm, Mips, SH, IA64, S39, Alpha, Hppa, Rs6000, M68k, Vax
+-- and JavaScript.
+--
+-- The following aliases can also be used:
+--    * PPC alias: powerpc
+--    * PPC64 alias : powerpc64
+--    * Sparc aliases: sparc64, sun4
+--    * Mips aliases: mipsel, mipseb
+--    * Arm aliases: armeb, armel
+--
 data Arch = I386  | X86_64 | PPC | PPC64 | Sparc
           | Arm   | Mips   | SH
           | IA64  | S390
@@ -183,7 +206,7 @@ data Platform = Platform Arch OS
 instance Binary Platform
 
 instance Text Platform where
-  disp (Platform arch os) = disp arch <> Disp.char '-' <> disp os
+  disp (Platform arch os) = disp arch <<>> Disp.char '-' <<>> disp os
   -- TODO: there are ambigious platforms like: `arch-word-os`
   -- which could be parsed as
   --   * Platform "arch-word" "os"
@@ -209,22 +232,22 @@ buildPlatform = Platform buildArch buildOS
 -- Utils:
 
 ident :: Parse.ReadP r String
-ident = liftM2 (:) first rest
-  where first = Parse.satisfy Char.isAlpha
-        rest = Parse.munch (\c -> Char.isAlphaNum c || c == '_' || c == '-')
+ident = liftM2 (:) firstChar rest
+  where firstChar = Parse.satisfy isAlpha
+        rest = Parse.munch (\c -> isAlphaNum c || c == '_' || c == '-')
 
 dashlessIdent :: Parse.ReadP r String
-dashlessIdent = liftM2 (:) first rest
-  where first = Parse.satisfy Char.isAlpha
-        rest = Parse.munch (\c -> Char.isAlphaNum c || c == '_')
+dashlessIdent = liftM2 (:) firstChar rest
+  where firstChar = Parse.satisfy isAlpha
+        rest = Parse.munch (\c -> isAlphaNum c || c == '_')
 
 lowercase :: String -> String
-lowercase = map Char.toLower
+lowercase = map toLower
 
 platformFromTriple :: String -> Maybe Platform
 platformFromTriple triple =
   fmap fst (listToMaybe $ Parse.readP_to_S parseTriple triple)
-  where parseWord = Parse.munch1 (\c -> Char.isAlphaNum c || c == '_')
+  where parseWord = Parse.munch1 (\c -> isAlphaNum c || c == '_')
         parseTriple = do
           arch <- fmap (classifyArch Permissive) parseWord
           _ <- Parse.char '-'

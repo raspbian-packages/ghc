@@ -1,9 +1,24 @@
 # Changelog for [`process` package](http://hackage.haskell.org/package/process)
 
-## Unreleased changes
+## 1.6.1.1 *July 2017*
+
+* Expose `CGid`, `GroupID`, and `UserID` from `System.Process.Internals`
+  [#90](https://github.com/haskell/process/issues/90)
+  [#91](https://github.com/haskell/process/pull/91)
+
+## 1.6.0.0 *February 2017*
+
+* Fix: waitForProcess race condition
+  [#46](https://github.com/haskell/process/issues/46)
+  [#58](https://github.com/haskell/process/pull/58)
+
+## 1.5.0.0 *February 2017*
 
 * Bug fix: Don't close already closed pipes
   [#81](https://github.com/haskell/process/pull/81)
+* Relax version bounds of Win32 to allow 2.5.
+* Add support for monitoring process tree for termination with the parameter `use_process_jobs`
+  in `CreateProcess` on Windows. Also added a function `terminateJob` to kill entire process tree.
 
 ## 1.4.3.0 *December 2016*
 

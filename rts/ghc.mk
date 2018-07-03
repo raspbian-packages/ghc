@@ -37,9 +37,9 @@ $(eval $(call all-target,rts,$(ALL_RTS_LIBS)))
 # -----------------------------------------------------------------------------
 # Defining the sources
 
-ALL_DIRS = hooks sm eventlog
+ALL_DIRS = hooks sm eventlog linker
 
-ifeq "$(HostOS_CPP)" "mingw32"
+ifeq "$(TargetOS_CPP)" "mingw32"
 ALL_DIRS += win32
 else
 ALL_DIRS += posix
@@ -68,10 +68,6 @@ rts_AUTO_APPLY_CMM = rts/dist/build/AutoApply.cmm
 $(rts_AUTO_APPLY_CMM): $$(genapply_INPLACE)
 	"$(genapply_INPLACE)" >$@
 
-rts/dist/build/sm/Evac_thr.c : rts/sm/Evac.c | $$(dir $$@)/.
-	cp $< $@
-rts/dist/build/sm/Scav_thr.c : rts/sm/Scav.c | $$(dir $$@)/.
-	cp $< $@
 
 rts_H_FILES := $(wildcard rts/*.h rts/*/*.h)
 
@@ -96,7 +92,7 @@ rts/dist/libs.depend : $$(ghc-pkg_INPLACE) | $$(dir $$@)/.
 # 	These are made from rts/win32/libHS*.def which contain lists of
 # 	all the symbols in those libraries used by the RTS.
 #
-ifeq "$(HostOS_CPP)" "mingw32" 
+ifeq "$(TargetOS_CPP)" "mingw32"
 
 ALL_RTS_DEF_LIBNAMES 	= base ghc-prim
 ALL_RTS_DEF_LIBS	= \
@@ -120,7 +116,7 @@ endif
 
 ifneq "$(BINDIST)" "YES"
 ifneq "$(UseSystemLibFFI)" "YES"
-ifeq "$(HostOS_CPP)" "mingw32" 
+ifeq "$(TargetOS_CPP)" "mingw32"
 rts/dist/build/$(LIBFFI_DLL): libffi/build/inst/bin/$(LIBFFI_DLL)
 	cp $< $@
 else
@@ -151,17 +147,14 @@ rts_dist_$1_CC_OPTS += -fno-omit-frame-pointer -g -O0
 endif
 
 ifneq "$$(findstring dyn, $1)" ""
-ifeq "$$(HostOS_CPP)" "mingw32" 
+ifeq "$$(TargetOS_CPP)" "mingw32"
 rts_dist_$1_CC_OPTS += -DCOMPILING_WINDOWS_DLL
 endif
 rts_dist_$1_CC_OPTS += -DDYNAMIC
 endif
 
-ifneq "$$(findstring thr, $1)" ""
-rts_$1_EXTRA_C_SRCS  =  rts/dist/build/sm/Evac_thr.c rts/dist/build/sm/Scav_thr.c
-endif
 
-$(call distdir-way-opts,rts,dist,$1)
+$(call distdir-way-opts,rts,dist,$1,1) # 1 because the rts is built with stage1
 $(call c-suffix-rules,rts,dist,$1,YES)
 $(call cmm-suffix-rules,rts,dist,$1)
 
@@ -204,7 +197,7 @@ endif
 
 # Making a shared library for the RTS.
 ifneq "$$(findstring dyn, $1)" ""
-ifeq "$$(HostOS_CPP)" "mingw32" 
+ifeq "$$(TargetOS_CPP)" "mingw32"
 $$(rts_$1_LIB) : $$(rts_$1_OBJS) $$(ALL_RTS_DEF_LIBS) rts/dist/libs.depend rts/dist/build/$$(LIBFFI_DLL)
 	"$$(RM)" $$(RM_OPTS) $$@
 	"$$(rts_dist_HC)" -this-unit-id rts -shared -dynamic -dynload deploy \
@@ -321,7 +314,7 @@ rts_HC_OPTS += -dcmm-lint
 # StgClosure, StgMVar, etc.), and without -fno-strict-aliasing gcc is
 # allowed to assume that these pointers do not alias.  eg. without
 # this flag we get problems in sm/Evac.c:copy() with gcc 3.4.3, the
-# upd_evacee() assigments get moved before the object copy.
+# upd_evacuee() assignments get moved before the object copy.
 rts_CC_OPTS += -fno-strict-aliasing
 
 rts_CC_OPTS += -fno-common
@@ -333,10 +326,6 @@ endif
 # Set Windows version
 ifeq "$$(TargetOS_CPP)" "mingw32"
 rts_CC_OPTS += -DWINVER=$(rts_WINVER)
-endif
-
-ifeq "$(SplitSections)" "YES"
-rts_CC_OPTS += -ffunction-sections -fdata-sections
 endif
 
 #-----------------------------------------------------------------------------
@@ -456,12 +445,8 @@ endif
 
 # -O3 helps unroll some loops (especially in copy() with a constant argument).
 rts/sm/Evac_CC_OPTS += -funroll-loops
-rts/dist/build/sm/Evac_thr_HC_OPTS += -optc-funroll-loops
+rts/sm/Evac_thr_HC_OPTS += -optc-funroll-loops
 
-# These files are just copies of sm/Evac.c and sm/Scav.c respectively,
-# but compiled with -DPARALLEL_GC.
-rts/dist/build/sm/Evac_thr_CC_OPTS += -DPARALLEL_GC -Irts/sm
-rts/dist/build/sm/Scav_thr_CC_OPTS += -DPARALLEL_GC -Irts/sm
 
 #-----------------------------------------------------------------------------
 # Use system provided libffi
@@ -478,14 +463,6 @@ rts_PACKAGE_CPP_OPTS += -DFFI_INCLUDE_DIR=
 rts_PACKAGE_CPP_OPTS += -DFFI_LIB_DIR=
 rts_PACKAGE_CPP_OPTS += '-DFFI_LIB="C$(LIBFFI_NAME)"'
 
-endif
-
-#-----------------------------------------------------------------------------
-# Add support for reading DWARF debugging information, if available
-
-ifeq "$(GhcRtsWithLibdw)" "YES"
-rts_CC_OPTS          += -DUSE_LIBDW
-rts_PACKAGE_CPP_OPTS += -DUSE_LIBDW
 endif
 
 # -----------------------------------------------------------------------------
@@ -538,7 +515,7 @@ ifeq "$(TargetOS_CPP)" "darwin"
 # Darwin has a flag to tell dtrace which cpp to use.
 # Unfortunately, this isn't supported on Solaris (See Solaris Dynamic Tracing
 # Guide, Chapter 16, for the configuration variables available on Solaris)
-DTRACE_FLAGS = -x cpppath=$(WhatGccIsCalled)
+DTRACE_FLAGS = -x cpppath=$(CC)
 endif
 
 DTRACEPROBES_SRC = rts/RtsProbes.d

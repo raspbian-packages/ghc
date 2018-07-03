@@ -1,5 +1,5 @@
 name:           base
-version:        4.9.1.0
+version:        4.10.1.0
 -- NOTE: Don't forget to update ./changelog.md
 license:        BSD3
 license-file:   LICENSE
@@ -130,7 +130,9 @@ Library
         Control.Monad.ST.Strict
         Control.Monad.ST.Unsafe
         Control.Monad.Zip
+        Data.Bifoldable
         Data.Bifunctor
+        Data.Bitraversable
         Data.Bits
         Data.Bool
         Data.Char
@@ -172,7 +174,6 @@ Library
         Data.Type.Coercion
         Data.Type.Equality
         Data.Typeable
-        Data.Typeable.Internal
         Data.Unique
         Data.Version
         Data.Void
@@ -243,6 +244,7 @@ Library
         GHC.IO.Handle
         GHC.IO.Handle.FD
         GHC.IO.Handle.Internals
+        GHC.IO.Handle.Lock
         GHC.IO.Handle.Text
         GHC.IO.Handle.Types
         GHC.IO.IOMode
@@ -262,6 +264,7 @@ Library
         GHC.Ptr
         GHC.Read
         GHC.Real
+        GHC.Records
         GHC.RTS.Flags
         GHC.ST
         GHC.StaticPtr
@@ -275,6 +278,7 @@ Library
         GHC.Storable
         GHC.TopHandler
         GHC.TypeLits
+        GHC.TypeNats
         GHC.Unicode
         GHC.Weak
         GHC.Word
@@ -302,14 +306,20 @@ Library
         Text.Read.Lex
         Text.Show
         Text.Show.Functions
+        Type.Reflection
+        Type.Reflection.Unsafe
         Unsafe.Coerce
 
     other-modules:
         Control.Monad.ST.Imp
         Control.Monad.ST.Lazy.Imp
+        Data.Functor.Utils
         Data.OldList
+        Data.Typeable.Internal
         Foreign.ForeignPtr.Imp
+        GHC.StaticPtr.Internal
         System.Environment.ExecutablePath
+        System.CPUTime.Utils
 
     c-sources:
         cbits/DarwinUtils.c
@@ -322,7 +332,6 @@ Library
         cbits/inputReady.c
         cbits/md5.c
         cbits/primFloat.c
-        cbits/rts.c
         cbits/sysconf.c
 
     include-dirs: include
@@ -349,6 +358,8 @@ Library
             GHC.IO.Encoding.CodePage.Table
             GHC.Conc.Windows
             GHC.Windows
+        other-modules:
+            System.CPUTime.Windows
     else
         exposed-modules:
             GHC.Event
@@ -367,6 +378,11 @@ Library
             GHC.Event.Thread
             GHC.Event.TimerManager
             GHC.Event.Unique
+
+            System.CPUTime.Posix.ClockGetTime
+            System.CPUTime.Posix.Times
+            System.CPUTime.Posix.RUsage
+            System.CPUTime.Unsupported
 
     -- We need to set the unit id to base (without a version number)
     -- as it's magic.

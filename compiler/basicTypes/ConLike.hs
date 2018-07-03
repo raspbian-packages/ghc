@@ -5,7 +5,7 @@
 \section[ConLike]{@ConLike@: Constructor-like things}
 -}
 
-{-# LANGUAGE CPP, DeriveDataTypeable #-}
+{-# LANGUAGE CPP #-}
 
 module ConLike (
           ConLike(..)
@@ -21,6 +21,7 @@ module ConLike (
         , conLikeResTy
         , conLikeFieldType
         , conLikesWithFields
+        , conLikeIsInfix
     ) where
 
 #include "HsVersions.h"
@@ -36,12 +37,7 @@ import TyCoRep (Type, ThetaType)
 import Var
 import Type (mkTyConApp)
 
-import Data.Function (on)
 import qualified Data.Data as Data
-import qualified Data.Typeable
-#if __GLASGOW_HASKELL__ <= 708
-import Control.Applicative ((<$>))
-#endif
 
 {-
 ************************************************************************
@@ -54,7 +50,6 @@ import Control.Applicative ((<$>))
 -- | A constructor-like thing
 data ConLike = RealDataCon DataCon
              | PatSynCon PatSyn
-  deriving Data.Typeable.Typeable
 
 {-
 ************************************************************************
@@ -65,15 +60,14 @@ data ConLike = RealDataCon DataCon
 -}
 
 instance Eq ConLike where
-    (==) = (==) `on` getUnique
-    (/=) = (/=) `on` getUnique
+    (==) = eqConLike
 
-instance Ord ConLike where
-    (<=) = (<=) `on` getUnique
-    (<) = (<) `on` getUnique
-    (>=) = (>=) `on` getUnique
-    (>) = (>) `on` getUnique
-    compare = compare `on` getUnique
+eqConLike :: ConLike -> ConLike -> Bool
+eqConLike x y = getUnique x == getUnique y
+
+-- There used to be an Ord ConLike instance here that used Unique for ordering.
+-- It was intentionally removed to prevent determinism problems.
+-- See Note [Unique Determinism] in Unique.
 
 instance Uniquable ConLike where
     getUnique (RealDataCon dc) = getUnique dc
@@ -154,7 +148,7 @@ conLikeResTy (PatSynCon ps)    tys = patSynInstResTy ps tys
 
 -- | The \"full signature\" of the 'ConLike' returns, in order:
 --
--- 1) The universally quanitifed type variables
+-- 1) The universally quantified type variables
 --
 -- 2) The existentially quantified type variables
 --
@@ -192,3 +186,7 @@ conLikesWithFields :: [ConLike] -> [FieldLabelString] -> [ConLike]
 conLikesWithFields con_likes lbls = filter has_flds con_likes
   where has_flds dc = all (has_fld dc) lbls
         has_fld dc lbl = any (\ fl -> flLabel fl == lbl) (conLikeFieldLabels dc)
+
+conLikeIsInfix :: ConLike -> Bool
+conLikeIsInfix (RealDataCon dc) = dataConIsInfix dc
+conLikeIsInfix (PatSynCon ps)   = patSynIsInfix  ps

@@ -1,15 +1,32 @@
-import Data.Sequence    -- needs to be compiled with -DTESTING for use here
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE PatternGuards #-}
 
-import Control.Applicative (Applicative(..))
+#include "containers.h"
+
+import Data.Sequence.Internal
+  ( Sized (..)
+  , Seq (Seq)
+  , FingerTree(..)
+  , Node(..)
+  , Elem(..)
+  , Digit (..)
+  , node2
+  , node3
+  , deep )
+
+import Data.Sequence
+
+import Control.Applicative (Applicative(..), liftA2)
 import Control.Arrow ((***))
+import Control.Monad.Trans.State.Strict
 import Data.Array (listArray)
-import Data.Foldable (Foldable(foldl, foldl1, foldr, foldr1, foldMap), toList, all, sum)
+import Data.Foldable (Foldable(foldl, foldl1, foldr, foldr1, foldMap, fold), toList, all, sum, foldl', foldr')
 import Data.Functor ((<$>), (<$))
 import Data.Maybe
-import Data.Monoid (Monoid(..))
+import Data.Monoid (Monoid(..), All(..), Endo(..), Dual(..))
 import Data.Traversable (Traversable(traverse), sequenceA)
 import Prelude hiding (
-  null, length, take, drop, splitAt,
+  lookup, null, length, take, drop, splitAt,
   foldl, foldl1, foldr, foldr1, scanl, scanl1, scanr, scanr1,
   filter, reverse, replicate, zip, zipWith, zip3, zipWith3,
   all, sum)
@@ -17,9 +34,16 @@ import qualified Prelude
 import qualified Data.List
 import Test.QuickCheck hiding ((><))
 import Test.QuickCheck.Poly
+#if __GLASGOW_HASKELL__ >= 800
+import Test.QuickCheck.Property
+#endif
 import Test.QuickCheck.Function
 import Test.Framework
 import Test.Framework.Providers.QuickCheck2
+#if MIN_VERSION_base(4,4,0)
+import Control.Monad.Zip (MonadZip (..))
+#endif
+import Control.DeepSeq (deepseq)
 
 
 main :: IO ()
@@ -27,8 +51,10 @@ main = defaultMain
        [ testProperty "fmap" prop_fmap
        , testProperty "(<$)" prop_constmap
        , testProperty "foldr" prop_foldr
+       , testProperty "foldr'" prop_foldr'
        , testProperty "foldr1" prop_foldr1
        , testProperty "foldl" prop_foldl
+       , testProperty "foldl'" prop_foldl'
        , testProperty "foldl1" prop_foldl1
        , testProperty "(==)" prop_equals
        , testProperty "compare" prop_compare
@@ -71,11 +97,15 @@ main = defaultMain
        , testProperty "unstableSort" prop_unstableSort
        , testProperty "unstableSortBy" prop_unstableSortBy
        , testProperty "index" prop_index
+       , testProperty "(!?)" prop_safeIndex
        , testProperty "adjust" prop_adjust
+       , testProperty "insertAt" prop_insertAt
+       , testProperty "deleteAt" prop_deleteAt
        , testProperty "update" prop_update
        , testProperty "take" prop_take
        , testProperty "drop" prop_drop
        , testProperty "splitAt" prop_splitAt
+       , testProperty "chunksOf" prop_chunksOf
        , testProperty "elemIndexL" prop_elemIndexL
        , testProperty "elemIndicesL" prop_elemIndicesL
        , testProperty "elemIndexR" prop_elemIndexR
@@ -87,6 +117,9 @@ main = defaultMain
        , testProperty "foldlWithIndex" prop_foldlWithIndex
        , testProperty "foldrWithIndex" prop_foldrWithIndex
        , testProperty "mapWithIndex" prop_mapWithIndex
+       , testProperty "foldMapWithIndex/foldlWithIndex" prop_foldMapWithIndexL
+       , testProperty "foldMapWithIndex/foldrWithIndex" prop_foldMapWithIndexR
+       , testProperty "traverseWithIndex" prop_traverseWithIndex
        , testProperty "reverse" prop_reverse
        , testProperty "zip" prop_zip
        , testProperty "zipWith" prop_zipWith
@@ -94,9 +127,26 @@ main = defaultMain
        , testProperty "zipWith3" prop_zipWith3
        , testProperty "zip4" prop_zip4
        , testProperty "zipWith4" prop_zipWith4
+#if MIN_VERSION_base(4,4,0)
+       , testProperty "mzip-naturality" prop_mzipNaturality
+       , testProperty "mzip-preservation" prop_mzipPreservation
+       , testProperty "munzip-lazy" prop_munzipLazy
+#endif
        , testProperty "<*>" prop_ap
+       , testProperty "<*> NOINLINE" prop_ap_NOINLINE
+       , testProperty "liftA2" prop_liftA2
        , testProperty "*>" prop_then
+       , testProperty "cycleTaking" prop_cycleTaking
+       , testProperty "intersperse" prop_intersperse
        , testProperty ">>=" prop_bind
+#if __GLASGOW_HASKELL__ >= 800
+       , testProperty "Empty pattern" prop_empty_pat
+       , testProperty "Empty constructor" prop_empty_con
+       , testProperty "Left view pattern" prop_viewl_pat
+       , testProperty "Left view constructor" prop_viewl_con
+       , testProperty "Right view pattern" prop_viewr_pat
+       , testProperty "Right view constructor" prop_viewr_con
+#endif
        ]
 
 ------------------------------------------------------------------------
@@ -113,8 +163,8 @@ instance Arbitrary a => Arbitrary (Elem a) where
 instance (Arbitrary a, Sized a) => Arbitrary (FingerTree a) where
     arbitrary = sized arb
       where
-        arb :: (Arbitrary a, Sized a) => Int -> Gen (FingerTree a)
-        arb 0 = return Empty
+        arb :: (Arbitrary b, Sized b) => Int -> Gen (FingerTree b)
+        arb 0 = return EmptyT
         arb 1 = Single <$> arbitrary
         arb n = do
             pr <- arbitrary
@@ -126,13 +176,13 @@ instance (Arbitrary a, Sized a) => Arbitrary (FingerTree a) where
             m <- arb n_m
             return $ deep pr m sf
 
-    shrink (Deep _ (One a) Empty (One b)) = [Single a, Single b]
+    shrink (Deep _ (One a) EmptyT (One b)) = [Single a, Single b]
     shrink (Deep _ pr m sf) =
         [deep pr' m sf | pr' <- shrink pr] ++
         [deep pr m' sf | m' <- shrink m] ++
         [deep pr m sf' | sf' <- shrink sf]
     shrink (Single x) = map Single (shrink x)
-    shrink Empty = []
+    shrink EmptyT = []
 
 instance (Arbitrary a, Sized a) => Arbitrary (Node a) where
     arbitrary = oneof [
@@ -174,7 +224,7 @@ instance Valid (Seq a) where
     valid (Seq xs) = valid xs
 
 instance (Sized a, Valid a) => Valid (FingerTree a) where
-    valid Empty = True
+    valid EmptyT = True
     valid (Single x) = valid x
     valid (Deep s pr m sf) =
         s == size pr + size m + size sf && valid pr && valid m && valid sf
@@ -212,6 +262,20 @@ toListList' xss = toList' xss >>= mapM toList'
 toListPair' :: (Seq a, Seq b) -> Maybe ([a], [b])
 toListPair' (xs, ys) = (,) <$> toList' xs <*> toList' ys
 
+-- Extra "polymorphic" test type
+newtype D = D{ unD :: Integer }
+  deriving ( Eq )
+
+instance Show D where
+  showsPrec n (D x) = showsPrec n x
+
+instance Arbitrary D where
+  arbitrary    = (D . (+1) . abs) `fmap` arbitrary
+  shrink (D x) = [ D x' | x' <- shrink x, x' > 0 ]
+
+instance CoArbitrary D where
+  coarbitrary = coarbitrary . unD
+
 -- instances
 
 prop_fmap :: Seq Int -> Bool
@@ -223,9 +287,16 @@ prop_constmap :: A -> Seq A -> Bool
 prop_constmap x xs =
     toList' (x <$ xs) ~= map (const x) (toList xs)
 
-prop_foldr :: Seq A -> Bool
+prop_foldr :: Seq A -> Property
 prop_foldr xs =
-    foldr f z xs == Prelude.foldr f z (toList xs)
+    foldr f z xs === Prelude.foldr f z (toList xs)
+  where
+    f = (:)
+    z = []
+
+prop_foldr' :: Seq A -> Property
+prop_foldr' xs =
+    foldr' f z xs === foldr' f z (toList xs)
   where
     f = (:)
     z = []
@@ -235,9 +306,16 @@ prop_foldr1 xs =
     not (null xs) ==> foldr1 f xs == Data.List.foldr1 f (toList xs)
   where f = (-)
 
-prop_foldl :: Seq A -> Bool
+prop_foldl :: Seq A -> Property
 prop_foldl xs =
-    foldl f z xs == Prelude.foldl f z (toList xs)
+    foldl f z xs === Prelude.foldl f z (toList xs)
+  where
+    f = flip (:)
+    z = []
+
+prop_foldl' :: Seq A -> Property
+prop_foldl' xs =
+    foldl' f z xs === foldl' f z (toList xs)
   where
     f = flip (:)
     z = []
@@ -475,6 +553,26 @@ prop_index xs =
     not (null xs) ==> forAll (choose (0, length xs-1)) $ \ i ->
     index xs i == toList xs !! i
 
+prop_safeIndex :: Seq A -> Property
+prop_safeIndex xs =
+    forAll (choose (-3, length xs + 3)) $ \i ->
+    ((i < 0 || i >= length xs) .&&. lookup i xs === Nothing) .||.
+    lookup i xs === Just (toList xs !! i)
+
+prop_insertAt :: A -> Seq A -> Property
+prop_insertAt x xs =
+  forAll (choose (-3, length xs + 3)) $ \i ->
+      let res = insertAt i x xs
+      in valid res .&&. res === case splitAt i xs of (front, back) -> front >< x <| back
+
+prop_deleteAt :: Seq A -> Property
+prop_deleteAt xs =
+  forAll (choose (-3, length xs + 3)) $ \i ->
+      let res = deleteAt i xs
+      in valid res .&&.
+          (((0 <= i && i < length xs) .&&. res === case splitAt i xs of (front, back) -> front >< drop 1 back)
+            .||. ((i < 0 || i >= length xs) .&&. res === xs))
+
 prop_adjust :: Int -> Int -> Seq Int -> Bool
 prop_adjust n i xs =
     toList' (adjust f i xs) ~= adjustList f i (toList xs)
@@ -495,6 +593,14 @@ prop_drop n xs =
 prop_splitAt :: Int -> Seq A -> Bool
 prop_splitAt n xs =
     toListPair' (splitAt n xs) ~= Prelude.splitAt n (toList xs)
+
+prop_chunksOf :: Seq A -> Property
+prop_chunksOf xs =
+  forAll (choose (1, length xs + 3)) $ \n ->
+    let chunks = chunksOf n xs
+    in valid chunks .&&.
+       conjoin [valid c .&&. 1 <= length c && length c <= n | c <- toList chunks] .&&.
+       fold chunks === xs
 
 adjustList :: (a -> a) -> Int -> [a] -> [a]
 adjustList f i xs =
@@ -552,12 +658,27 @@ prop_foldrWithIndex z xs =
     foldrWithIndex f z xs == Data.List.foldr (uncurry f) z (Data.List.zip [0..] (toList xs))
   where f n y ys = (n,y):ys
 
+prop_foldMapWithIndexL :: (Fun (B, Int, A) B) -> B -> Seq A -> Bool
+prop_foldMapWithIndexL (Fun _ f) z t = foldlWithIndex f' z t ==
+  appEndo (getDual (foldMapWithIndex (\i -> Dual . Endo . flip (flip f' i)) t)) z
+  where f' b i a = f (b, i, a)
+
+prop_foldMapWithIndexR :: (Fun (Int, A, B) B) -> B -> Seq A -> Bool
+prop_foldMapWithIndexR (Fun _ f) z t = foldrWithIndex f' z t ==
+   appEndo (foldMapWithIndex (\i -> Endo . f' i) t) z
+  where f' i a b = f (i, a, b)
+
 -- * Transformations
 
 prop_mapWithIndex :: Seq A -> Bool
 prop_mapWithIndex xs =
     toList' (mapWithIndex f xs) ~= map (uncurry f) (Data.List.zip [0..] (toList xs))
   where f = (,)
+
+prop_traverseWithIndex :: Seq Int -> Bool
+prop_traverseWithIndex xs =
+    runState (traverseWithIndex (\i x -> modify ((i,x) :)) xs) [] ==
+    runState (sequenceA . mapWithIndex (\i x -> modify ((i,x) :)) $ xs) [] 
 
 prop_reverse :: Seq A -> Bool
 prop_reverse xs =
@@ -592,15 +713,93 @@ prop_zipWith4 xs ys zs ts =
     toList' (zipWith4 f xs ys zs ts) ~= Data.List.zipWith4 f (toList xs) (toList ys) (toList zs) (toList ts)
   where f = (,,,)
 
+#if MIN_VERSION_base(4,4,0)
+-- This comes straight from the MonadZip documentation
+prop_mzipNaturality :: Fun A C -> Fun B D -> Seq A -> Seq B -> Property
+prop_mzipNaturality f g sa sb =
+  fmap (apply f *** apply g) (mzip sa sb) ===
+  mzip (apply f <$> sa) (apply g <$> sb)
+
+-- This is a slight optimization of the MonadZip preservation
+-- law that works because sequences don't have any decorations.
+prop_mzipPreservation :: Fun A B -> Seq A -> Property
+prop_mzipPreservation f sa =
+  let sb = fmap (apply f) sa
+  in munzip (mzip sa sb) === (sa, sb)
+
+-- We want to ensure that
+--
+-- munzip xs = xs `seq` (fmap fst x, fmap snd x)
+--
+-- even in the presence of bottoms (alternatives are all balance-
+-- fragile).
+prop_munzipLazy :: Seq (Integer, B) -> Bool
+prop_munzipLazy pairs = deepseq ((`seq` ()) <$> repaired) True
+  where
+    partialpairs = mapWithIndex (\i a -> update i err pairs) pairs
+    firstPieces = fmap (fst . munzip) partialpairs
+    repaired = mapWithIndex (\i s -> update i 10000 s) firstPieces
+    err = error "munzip isn't lazy enough"
+#endif
+
 -- Applicative operations
 
 prop_ap :: Seq A -> Seq B -> Bool
 prop_ap xs ys =
     toList' ((,) <$> xs <*> ys) ~= ( (,) <$> toList xs <*> toList ys )
 
+prop_ap_NOINLINE :: Seq A -> Seq B -> Bool
+prop_ap_NOINLINE xs ys =
+    toList' (((,) <$> xs) `apNOINLINE` ys) ~= ( (,) <$> toList xs <*> toList ys )
+
+{-# NOINLINE apNOINLINE #-}
+apNOINLINE :: Seq (a -> b) -> Seq a -> Seq b
+apNOINLINE fs xs = fs <*> xs
+
+prop_liftA2 :: Seq A -> Seq B -> Property
+prop_liftA2 xs ys = valid q .&&.
+    toList q === liftA2 (,) (toList xs) (toList ys)
+  where
+    q = liftA2 (,) xs ys
+
 prop_then :: Seq A -> Seq B -> Bool
 prop_then xs ys =
     toList' (xs *> ys) ~= (toList xs *> toList ys)
+
+prop_intersperse :: A -> Seq A -> Bool
+prop_intersperse x xs =
+    toList' (intersperse x xs) ~= Data.List.intersperse x (toList xs)
+
+prop_cycleTaking :: Int -> Seq A -> Property
+prop_cycleTaking n xs =
+    (n <= 0 || not (null xs)) ==> toList' (cycleTaking n xs) ~= Data.List.take n (Data.List.cycle (toList xs))
+
+#if __GLASGOW_HASKELL__ >= 800
+prop_empty_pat :: Seq A -> Bool
+prop_empty_pat xs@Empty = null xs
+prop_empty_pat xs = not (null xs)
+
+prop_empty_con :: Bool
+prop_empty_con = null Empty
+
+prop_viewl_pat :: Seq A -> Property
+prop_viewl_pat xs@(y :<| ys)
+  | z :< zs <- viewl xs = y === z .&&. ys === zs
+  | otherwise = property failed
+prop_viewl_pat xs = property . liftBool $ null xs
+
+prop_viewl_con :: A -> Seq A -> Property
+prop_viewl_con x xs = x :<| xs === x <| xs
+
+prop_viewr_pat :: Seq A -> Property
+prop_viewr_pat xs@(ys :|> y)
+  | zs :> z <- viewr xs = y === z .&&. ys === zs
+  | otherwise = property failed
+prop_viewr_pat xs = property . liftBool $ null xs
+
+prop_viewr_con :: Seq A -> A -> Property
+prop_viewr_con xs x = xs :|> x === xs |> x
+#endif
 
 -- Monad operations
 

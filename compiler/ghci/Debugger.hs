@@ -22,12 +22,13 @@ import GHCi.RemoteTypes
 import GhcMonad
 import HscTypes
 import Id
+import IfaceSyn ( showToHeader )
 import IfaceEnv( newInteractiveBinder )
 import Name
 import Var hiding ( varName )
 import VarSet
+import UniqSet
 import Type
-import Kind
 import GHC
 import Outputable
 import PprTyThing
@@ -77,7 +78,7 @@ pprintClosureCommand bindThings force str = do
        term_    <- GHC.obtainTermFromId maxBound force id'
        term     <- tidyTermTyVars term_
        term'    <- if bindThings &&
-                      False == isUnliftedTypeKind (termType term)
+                      (not (isUnliftedType (termType term)))
                      then bindSuspensions term
                      else return term
      -- Before leaving, we compare the type obtained to see if it's more specific
@@ -99,9 +100,11 @@ pprintClosureCommand bindThings force str = do
          my_tvs       = termTyCoVars t
          tvs          = env_tvs `minusVarSet` my_tvs
          tyvarOccName = nameOccName . tyVarName
-         tidyEnv      = (initTidyOccEnv (map tyvarOccName (varSetElems tvs))
-                        , env_tvs `intersectVarSet` my_tvs)
-     return$ mapTermType (snd . tidyOpenType tidyEnv) t
+         tidyEnv      = (initTidyOccEnv (map tyvarOccName (nonDetEltsUniqSet tvs))
+           -- It's OK to use nonDetEltsUniqSet here because initTidyOccEnv
+           -- forgets the ordering immediately by creating an env
+                        , getUniqSet $ env_tvs `intersectVarSet` my_tvs)
+     return $ mapTermType (snd . tidyOpenType tidyEnv) t
 
 -- | Give names, and bind in the interactive environment, to all the suspensions
 --   included (inductively) in a term
@@ -121,7 +124,7 @@ bindSuspensions t = do
           new_ic = extendInteractiveContextWithIds ictxt ids
       fhvs <- liftIO $ mapM (mkFinalizedHValue hsc_env <=< mkRemoteRef) hvals
       liftIO $ extendLinkEnv (zip names fhvs)
-      modifySession $ \_ -> hsc_env {hsc_IC = new_ic }
+      setSession hsc_env {hsc_IC = new_ic }
       return t'
      where
 
@@ -212,7 +215,7 @@ pprTypeAndContents :: GhcMonad m => Id -> m SDoc
 pprTypeAndContents id = do
   dflags  <- GHC.getSessionDynFlags
   let pcontents = gopt Opt_PrintBindContents dflags
-      pprdId    = (PprTyThing.pprTyThing . AnId) id
+      pprdId    = (pprTyThing showToHeader . AnId) id
   if pcontents
     then do
       let depthBound = 100

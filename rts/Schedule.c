@@ -42,6 +42,7 @@
 #include "ThreadPaused.h"
 #include "Messages.h"
 #include "Stable.h"
+#include "TopHandler.h"
 
 #ifdef HAVE_SYS_TYPES_H
 #include <sys/types.h>
@@ -72,11 +73,16 @@ StgTSO *blocked_queue_tl = NULL;
 StgTSO *sleeping_queue = NULL;    // perhaps replace with a hash table?
 #endif
 
-/* Set to true when the latest garbage collection failed to reclaim
- * enough space, and the runtime should proceed to shut itself down in
- * an orderly fashion (emitting profiling info etc.)
+// Bytes allocated since the last time a HeapOverflow exception was thrown by
+// the RTS
+uint64_t allocated_bytes_at_heapoverflow = 0;
+
+/* Set to true when the latest garbage collection failed to reclaim enough
+ * space, and the runtime should proceed to shut itself down in an orderly
+ * fashion (emitting profiling info etc.), OR throw an exception to the main
+ * thread, if it is still alive.
  */
-rtsBool heap_overflow = rtsFalse;
+bool heap_overflow = false;
 
 /* flag that tracks whether we have done any execution in this time slice.
  * LOCK: currently none, perhaps we should lock (but needs to be
@@ -120,12 +126,12 @@ static void scheduleFindWork (Capability **pcap);
 static void scheduleYield (Capability **pcap, Task *task);
 #endif
 #if defined(THREADED_RTS)
-static rtsBool requestSync (Capability **pcap, Task *task,
-                            PendingSync *sync_type, SyncType *prev_sync_type);
+static bool requestSync (Capability **pcap, Task *task,
+                         PendingSync *sync_type, SyncType *prev_sync_type);
 static void acquireAllCapabilities(Capability *cap, Task *task);
-static void releaseAllCapabilities(nat n, Capability *cap, Task *task);
-static void stopAllCapabilities(Capability **pCap, Task *task);
-static void startWorkerTasks (nat from USED_IF_THREADS, nat to USED_IF_THREADS);
+static void releaseAllCapabilities(uint32_t n, Capability *cap, Task *task);
+static void startWorkerTasks (uint32_t from USED_IF_THREADS,
+                              uint32_t to USED_IF_THREADS);
 #endif
 static void scheduleStartSignalHandlers (Capability *cap);
 static void scheduleCheckBlockedThreads (Capability *cap);
@@ -136,14 +142,14 @@ static void schedulePushWork(Capability *cap, Task *task);
 static void scheduleActivateSpark(Capability *cap);
 #endif
 static void schedulePostRunThread(Capability *cap, StgTSO *t);
-static rtsBool scheduleHandleHeapOverflow( Capability *cap, StgTSO *t );
-static rtsBool scheduleHandleYield( Capability *cap, StgTSO *t,
-                                    nat prev_what_next );
+static bool scheduleHandleHeapOverflow( Capability *cap, StgTSO *t );
+static bool scheduleHandleYield( Capability *cap, StgTSO *t,
+                                 uint32_t prev_what_next );
 static void scheduleHandleThreadBlocked( StgTSO *t );
-static rtsBool scheduleHandleThreadFinished( Capability *cap, Task *task,
-                                             StgTSO *t );
-static rtsBool scheduleNeedHeapProfile(rtsBool ready_to_gc);
-static void scheduleDoGC(Capability **pcap, Task *task, rtsBool force_major);
+static bool scheduleHandleThreadFinished( Capability *cap, Task *task,
+                                          StgTSO *t );
+static bool scheduleNeedHeapProfile(bool ready_to_gc);
+static void scheduleDoGC(Capability **pcap, Task *task, bool force_major);
 
 static void deleteThread (Capability *cap, StgTSO *tso);
 static void deleteAllThreads (Capability *cap);
@@ -172,10 +178,10 @@ schedule (Capability *initialCapability, Task *task)
   StgTSO *t;
   Capability *cap;
   StgThreadReturnCode ret;
-  nat prev_what_next;
-  rtsBool ready_to_gc;
+  uint32_t prev_what_next;
+  bool ready_to_gc;
 #if defined(THREADED_RTS)
-  rtsBool first = rtsTrue;
+  bool first = true;
 #endif
 
   cap = initialCapability;
@@ -202,7 +208,7 @@ schedule (Capability *initialCapability, Task *task)
           stg_exit(EXIT_FAILURE);
     }
 
-    // The interruption / shutdown sequence.
+    // Note [shutdown]: The interruption / shutdown sequence.
     //
     // In order to cleanly shut down the runtime, we want to:
     //   * make sure that all main threads return to their callers
@@ -210,21 +216,25 @@ schedule (Capability *initialCapability, Task *task)
     //   * clean up all OS threads assocated with the runtime
     //   * free all memory etc.
     //
-    // So the sequence for ^C goes like this:
+    // So the sequence goes like this:
     //
-    //   * ^C handler sets sched_state := SCHED_INTERRUPTING and
-    //     arranges for some Capability to wake up
+    //   * The shutdown sequence is initiated by calling hs_exit(),
+    //     interruptStgRts(), or running out of memory in the GC.
     //
-    //   * all threads in the system are halted, and the zombies are
-    //     placed on the run queue for cleaning up.  We acquire all
-    //     the capabilities in order to delete the threads, this is
-    //     done by scheduleDoGC() for convenience (because GC already
-    //     needs to acquire all the capabilities).  We can't kill
-    //     threads involved in foreign calls.
+    //   * Set sched_state = SCHED_INTERRUPTING
     //
-    //   * somebody calls shutdownHaskell(), which calls exitScheduler()
+    //   * The scheduler notices sched_state = SCHED_INTERRUPTING and calls
+    //     scheduleDoGC(), which halts the whole runtime by acquiring all the
+    //     capabilities, does a GC and then calls deleteAllThreads() to kill all
+    //     the remaining threads.  The zombies are left on the run queue for
+    //     cleaning up.  We can't kill threads involved in foreign calls.
     //
-    //   * sched_state := SCHED_SHUTTING_DOWN
+    //   * scheduleDoGC() sets sched_state = SCHED_SHUTTING_DOWN
+    //
+    //   * After this point, there can be NO MORE HASKELL EXECUTION.  This is
+    //     enforced by the scheduler, which won't run any Haskell code when
+    //     sched_state >= SCHED_INTERRUPTING, and we already sync'd with the
+    //     other capabilities by doing the GC earlier.
     //
     //   * all workers exit when the run queue on their capability
     //     drains.  All main threads will also exit when their TSO
@@ -234,7 +244,7 @@ schedule (Capability *initialCapability, Task *task)
     //     exit.
     //
     //   * We might be left with threads blocked in foreign calls,
-    //     we should really attempt to kill these somehow (TODO);
+    //     we should really attempt to kill these somehow (TODO).
 
     switch (sched_state) {
     case SCHED_RUNNING:
@@ -242,7 +252,7 @@ schedule (Capability *initialCapability, Task *task)
     case SCHED_INTERRUPTING:
         debugTrace(DEBUG_sched, "SCHED_INTERRUPTING");
         /* scheduleDoGC() deletes all the threads */
-        scheduleDoGC(&cap,task,rtsTrue);
+        scheduleDoGC(&cap,task,true);
 
         // after scheduleDoGC(), we must be shutting down.  Either some
         // other Capability did the final GC, or we did it above,
@@ -288,7 +298,7 @@ schedule (Capability *initialCapability, Task *task)
     //     // don't yield the first time, we want a chance to run this
     //     // thread for a bit, even if there are others banging at the
     //     // door.
-    //     first = rtsFalse;
+    //     first = false;
     //     ASSERT_FULL_CAPABILITY_INVARIANTS(cap,task);
     }
 
@@ -408,7 +418,7 @@ run_thread:
     // reset the interrupt flag before running Haskell code
     cap->interrupt = 0;
 
-    cap->in_haskell = rtsTrue;
+    cap->in_haskell = true;
     cap->idle = 0;
 
     dirty_TSO(cap,t);
@@ -419,7 +429,7 @@ run_thread:
     case ACTIVITY_DONE_GC: {
         // ACTIVITY_DONE_GC means we turned off the timer signal to
         // conserve power (see #1623).  Re-enable it here.
-        nat prev;
+        uint32_t prev;
         prev = xchg((P_)&recent_activity, ACTIVITY_YES);
         if (prev == ACTIVITY_DONE_GC) {
 #ifndef PROFILING
@@ -466,7 +476,7 @@ run_thread:
         barf("schedule: invalid what_next field");
     }
 
-    cap->in_haskell = rtsFalse;
+    cap->in_haskell = false;
 
     // The TSO might have moved, eg. if it re-entered the RTS and a GC
     // happened.  So find the new location:
@@ -510,7 +520,7 @@ run_thread:
 
     schedulePostRunThread(cap,t);
 
-    ready_to_gc = rtsFalse;
+    ready_to_gc = false;
 
     switch (ret) {
     case HeapOverflow:
@@ -545,7 +555,7 @@ run_thread:
     }
 
     if (ready_to_gc || scheduleNeedHeapProfile(ready_to_gc)) {
-      scheduleDoGC(&cap,task,rtsFalse);
+      scheduleDoGC(&cap,task,false);
     }
   } /* end of while() */
 }
@@ -554,7 +564,7 @@ run_thread:
  * Run queue operations
  * -------------------------------------------------------------------------- */
 
-void
+static void
 removeFromRunQueue (Capability *cap, StgTSO *tso)
 {
     if (tso->block_info.prev == END_TSO_QUEUE) {
@@ -617,8 +627,8 @@ scheduleFindWork (Capability **pcap)
 }
 
 #if defined(THREADED_RTS)
-STATIC_INLINE rtsBool
-shouldYieldCapability (Capability *cap, Task *task, rtsBool didGcLast)
+STATIC_INLINE bool
+shouldYieldCapability (Capability *cap, Task *task, bool didGcLast)
 {
     // we need to yield this capability to someone else if..
     //   - another thread is initiating a GC, and we didn't just do a GC
@@ -656,11 +666,11 @@ static void
 scheduleYield (Capability **pcap, Task *task)
 {
     Capability *cap = *pcap;
-    int didGcLast = rtsFalse;
+    bool didGcLast = false;
 
     // if we have work, and we don't need to give up the Capability, continue.
     //
-    if (!shouldYieldCapability(cap,task,rtsFalse) &&
+    if (!shouldYieldCapability(cap,task,false) &&
         (!emptyRunQueue(cap) ||
          !emptyInbox(cap) ||
          sched_state >= SCHED_INTERRUPTING)) {
@@ -710,7 +720,8 @@ schedulePushWork(Capability *cap USED_IF_THREADS,
     n_wanted_caps = sparkPoolSizeCap(cap) + spare_threads;
     if (n_wanted_caps == 0) return;
 
-    // First grab as many free Capabilities as we can.
+    // First grab as many free Capabilities as we can.  ToDo: we should use
+    // capabilities on the same NUMA node preferably, but not exclusively.
     for (i = (cap->no + 1) % n_capabilities, n_free_caps=0;
          n_free_caps < n_wanted_caps && i != cap->no;
          i = (i + 1) % n_capabilities) {
@@ -718,7 +729,7 @@ schedulePushWork(Capability *cap USED_IF_THREADS,
         if (cap != cap0 && !cap0->disabled && tryGrabCapability(cap0,task)) {
             if (!emptyRunQueue(cap0)
                 || cap0->n_returning_tasks != 0
-                || cap0->inbox != (Message*)END_TSO_QUEUE) {
+                || !emptyInbox(cap0)) {
                 // it already has some work, we just grabbed it at
                 // the wrong moment.  Or maybe it's deadlocked!
                 releaseCapability(cap0);
@@ -914,9 +925,9 @@ scheduleDetectDeadlock (Capability **pcap, Task *task)
         // they are unreachable and will therefore be sent an
         // exception.  Any threads thus released will be immediately
         // runnable.
-        scheduleDoGC (pcap, task, rtsTrue/*force major GC*/);
+        scheduleDoGC (pcap, task, true/*force major GC*/);
         cap = *pcap;
-        // when force_major == rtsTrue. scheduleDoGC sets
+        // when force_major == true. scheduleDoGC sets
         // recent_activity to ACTIVITY_DONE_GC and turns off the timer
         // signal.
 
@@ -977,13 +988,14 @@ scheduleProcessInbox (Capability **pcap USED_IF_THREADS)
 {
 #if defined(THREADED_RTS)
     Message *m, *next;
+    PutMVar *p, *pnext;
     int r;
     Capability *cap = *pcap;
 
     while (!emptyInbox(cap)) {
         if (cap->r.rCurrentNursery->link == NULL ||
             g0->n_new_large_words >= large_alloc_lim) {
-            scheduleDoGC(pcap, cap->running_task, rtsFalse);
+            scheduleDoGC(pcap, cap->running_task, false);
             cap = *pcap;
         }
 
@@ -1001,7 +1013,9 @@ scheduleProcessInbox (Capability **pcap USED_IF_THREADS)
         if (r != 0) return;
 
         m = cap->inbox;
+        p = cap->putMVars;
         cap->inbox = (Message*)END_TSO_QUEUE;
+        cap->putMVars = NULL;
 
         RELEASE_LOCK(&cap->lock);
 
@@ -1010,9 +1024,19 @@ scheduleProcessInbox (Capability **pcap USED_IF_THREADS)
             executeMessage(cap, m);
             m = next;
         }
+
+        while (p != NULL) {
+            pnext = p->link;
+            performTryPutMVar(cap, (StgMVar*)deRefStablePtr(p->mvar),
+                              Unit_closure);
+            freeStablePtr(p->mvar);
+            stgFree(p);
+            p = pnext;
+        }
     }
 #endif
 }
+
 
 /* ----------------------------------------------------------------------------
  * Activate spark threads (THREADED_RTS)
@@ -1056,7 +1080,7 @@ schedulePostRunThread (Capability *cap, StgTSO *t)
             // ATOMICALLY_FRAME, aborting the (nested)
             // transaction, and saving the stack of any
             // partially-evaluated thunks on the heap.
-            throwToSingleThreaded_(cap, t, NULL, rtsTrue);
+            throwToSingleThreaded_(cap, t, NULL, true);
 
 //            ASSERT(get_itbl((StgClosure *)t->sp)->type == ATOMICALLY_FRAME);
         }
@@ -1084,7 +1108,7 @@ schedulePostRunThread (Capability *cap, StgTSO *t)
  * Handle a thread that returned to the scheduler with ThreadHeapOverflow
  * -------------------------------------------------------------------------- */
 
-static rtsBool
+static bool
 scheduleHandleHeapOverflow( Capability *cap, StgTSO *t )
 {
     if (cap->r.rHpLim == NULL || cap->context_switch) {
@@ -1121,7 +1145,7 @@ scheduleHandleHeapOverflow( Capability *cap, StgTSO *t )
                                                // nursery has only one
                                                // block.
 
-            bd = allocGroup_lock(blocks);
+            bd = allocGroupOnNode_lock(cap->node,blocks);
             cap->r.rNursery->n_blocks += blocks;
 
             // link the new group after CurrentNursery
@@ -1155,24 +1179,24 @@ scheduleHandleHeapOverflow( Capability *cap, StgTSO *t )
             // run queue before us and steal the large block, but in that
             // case the thread will just end up requesting another large
             // block.
-            return rtsFalse;  /* not actually GC'ing */
+            return false;  /* not actually GC'ing */
         }
     }
 
     // if we got here because we exceeded large_alloc_lim, then
     // proceed straight to GC.
     if (g0->n_new_large_words >= large_alloc_lim) {
-        return rtsTrue;
+        return true;
     }
 
     // Otherwise, we just ran out of space in the current nursery.
     // Grab another nursery if we can.
     if (getNewNursery(cap)) {
         debugTrace(DEBUG_sched, "thread %ld got a new nursery", t->id);
-        return rtsFalse;
+        return false;
     }
 
-    return rtsTrue;
+    return true;
     /* actual GC is done at the end of the while loop in schedule() */
 }
 
@@ -1180,8 +1204,8 @@ scheduleHandleHeapOverflow( Capability *cap, StgTSO *t )
  * Handle a thread that returned to the scheduler with ThreadYielding
  * -------------------------------------------------------------------------- */
 
-static rtsBool
-scheduleHandleYield( Capability *cap, StgTSO *t, nat prev_what_next )
+static bool
+scheduleHandleYield( Capability *cap, StgTSO *t, uint32_t prev_what_next )
 {
     /* put the thread back on the run queue.  Then, if we're ready to
      * GC, check whether this is the last task to stop.  If so, wake
@@ -1191,14 +1215,13 @@ scheduleHandleYield( Capability *cap, StgTSO *t, nat prev_what_next )
 
     ASSERT(t->_link == END_TSO_QUEUE);
 
-    // Shortcut if we're just switching evaluators: don't bother
-    // doing stack squeezing (which can be expensive), just run the
-    // thread.
-    if (cap->context_switch == 0 && t->what_next != prev_what_next) {
+    // Shortcut if we're just switching evaluators: just run the thread.  See
+    // Note [avoiding threadPaused] in Interpreter.c.
+    if (t->what_next != prev_what_next) {
         debugTrace(DEBUG_sched,
                    "--<< thread %ld (%s) stopped to switch evaluators",
                    (long)t->id, what_next_strs[t->what_next]);
-        return rtsTrue;
+        return true;
     }
 
     // Reset the context switch flag.  We don't do this just before
@@ -1218,7 +1241,7 @@ scheduleHandleYield( Capability *cap, StgTSO *t, nat prev_what_next )
              //debugBelch("&& Doing sanity check on yielding TSO %ld.", t->id);
              checkTSO(t));
 
-    return rtsFalse;
+    return false;
 }
 
 /* -----------------------------------------------------------------------------
@@ -1252,7 +1275,7 @@ scheduleHandleThreadBlocked( StgTSO *t
  * Handle a thread that returned to the scheduler with ThreadFinished
  * -------------------------------------------------------------------------- */
 
-static rtsBool
+static bool
 scheduleHandleThreadFinished (Capability *cap STG_UNUSED, Task *task, StgTSO *t)
 {
     /* Need to check whether this was a main thread, and if so,
@@ -1287,7 +1310,7 @@ scheduleHandleThreadFinished (Capability *cap STG_UNUSED, Task *task, StgTSO *t)
               // this thread and its return value (it gets dropped from the
               // step->threads list so there's no other way to find it).
               appendToRunQueue(cap,t);
-              return rtsFalse;
+              return false;
 #else
               // this cannot happen in the threaded RTS, because a
               // bound thread can only be run by the appropriate Task.
@@ -1299,7 +1322,7 @@ scheduleHandleThreadFinished (Capability *cap STG_UNUSED, Task *task, StgTSO *t)
 
           if (t->what_next == ThreadComplete) {
               if (task->incall->ret) {
-                  // NOTE: return val is stack->sp[1] (see StgStartup.hc)
+                  // NOTE: return val is stack->sp[1] (see StgStartup.cmm)
                   *(task->incall->ret) = (StgClosure *)task->incall->tso->stackobj->sp[1];
               }
               task->incall->rstat = Success;
@@ -1331,27 +1354,27 @@ scheduleHandleThreadFinished (Capability *cap STG_UNUSED, Task *task, StgTSO *t)
           t->bound = NULL;
           task->incall->tso = NULL;
 
-          return rtsTrue; // tells schedule() to return
+          return true; // tells schedule() to return
       }
 
-      return rtsFalse;
+      return false;
 }
 
 /* -----------------------------------------------------------------------------
  * Perform a heap census
  * -------------------------------------------------------------------------- */
 
-static rtsBool
-scheduleNeedHeapProfile( rtsBool ready_to_gc STG_UNUSED )
+static bool
+scheduleNeedHeapProfile( bool ready_to_gc STG_UNUSED )
 {
     // When we have +RTS -i0 and we're heap profiling, do a census at
     // every GC.  This lets us get repeatable runs for debugging.
     if (performHeapProfile ||
         (RtsFlags.ProfFlags.heapProfileInterval==0 &&
          RtsFlags.ProfFlags.doHeapProfile && ready_to_gc)) {
-        return rtsTrue;
+        return true;
     } else {
-        return rtsFalse;
+        return false;
     }
 }
 
@@ -1368,7 +1391,7 @@ scheduleNeedHeapProfile( rtsBool ready_to_gc STG_UNUSED )
 #if defined(THREADED_RTS)
 static void stopAllCapabilities (Capability **pCap, Task *task)
 {
-    rtsBool was_syncing;
+    bool was_syncing;
     SyncType prev_sync_type;
 
     PendingSync sync = {
@@ -1395,14 +1418,14 @@ static void stopAllCapabilities (Capability **pCap, Task *task)
  * has some special synchronisation requirements.
  *
  * Returns:
- *    rtsFalse if we successfully got a sync
- *    rtsTrue  if there was another sync request in progress,
+ *    false if we successfully got a sync
+ *    true  if there was another sync request in progress,
  *             and we yielded to it.  The value returned is the
  *             type of the other sync request.
  * -------------------------------------------------------------------------- */
 
 #if defined(THREADED_RTS)
-static rtsBool requestSync (
+static bool requestSync (
     Capability **pcap, Task *task, PendingSync *new_sync,
     SyncType *prev_sync_type)
 {
@@ -1422,16 +1445,16 @@ static rtsBool requestSync (
             debugTrace(DEBUG_sched, "someone else is trying to sync (%d)...",
                        sync->type);
             ASSERT(*pcap);
-            yieldCapability(pcap,task,rtsTrue);
+            yieldCapability(pcap,task,true);
             sync = pending_sync;
         } while (sync != NULL);
 
         // NOTE: task->cap might have changed now
-        return rtsTrue;
+        return true;
     }
     else
     {
-        return rtsFalse;
+        return false;
     }
 }
 #endif
@@ -1451,7 +1474,7 @@ static rtsBool requestSync (
 static void acquireAllCapabilities(Capability *cap, Task *task)
 {
     Capability *tmpcap;
-    nat i;
+    uint32_t i;
 
     ASSERT(pending_sync != NULL);
     for (i=0; i < n_capabilities; i++) {
@@ -1483,9 +1506,9 @@ static void acquireAllCapabilities(Capability *cap, Task *task)
  * -------------------------------------------------------------------------- */
 
 #ifdef THREADED_RTS
-static void releaseAllCapabilities(nat n, Capability *cap, Task *task)
+static void releaseAllCapabilities(uint32_t n, Capability *cap, Task *task)
 {
-    nat i;
+    uint32_t i;
 
     for (i = 0; i < n; i++) {
         if (cap->no != i) {
@@ -1503,19 +1526,23 @@ static void releaseAllCapabilities(nat n, Capability *cap, Task *task)
 
 static void
 scheduleDoGC (Capability **pcap, Task *task USED_IF_THREADS,
-              rtsBool force_major)
+              bool force_major)
 {
     Capability *cap = *pcap;
-    rtsBool heap_census;
-    nat collect_gen;
-    rtsBool major_gc;
+    bool heap_census;
+    uint32_t collect_gen;
+    bool major_gc;
 #ifdef THREADED_RTS
-    nat gc_type;
-    nat i;
-    nat need_idle;
-    nat n_idle_caps = 0, n_failed_trygrab_idles = 0;
+    uint32_t gc_type;
+    uint32_t i;
+    uint32_t need_idle;
+    uint32_t n_gc_threads;
+    uint32_t n_idle_caps = 0, n_failed_trygrab_idles = 0;
     StgTSO *tso;
-    rtsBool *idle_cap;
+    bool *idle_cap;
+      // idle_cap is an array (allocated later) of size n_capabilities, where
+      // idle_cap[i] is rtsTrue if capability i will be idle during this GC
+      // cycle.
 #endif
 
     if (sched_state == SCHED_SHUTTING_DOWN) {
@@ -1525,7 +1552,7 @@ scheduleDoGC (Capability **pcap, Task *task USED_IF_THREADS,
         return;
     }
 
-    heap_census = scheduleNeedHeapProfile(rtsTrue);
+    heap_census = scheduleNeedHeapProfile(true);
 
     // Figure out which generation we are collecting, so that we can
     // decide whether this is a parallel GC or not.
@@ -1560,7 +1587,7 @@ scheduleDoGC (Capability **pcap, Task *task USED_IF_THREADS,
 
     {
         SyncType prev_sync = 0;
-        rtsBool was_syncing;
+        bool was_syncing;
         do {
             // If -qn is not set and we have more capabilities than cores, set
             // the number of GC threads to #cores.  We do this here rather than
@@ -1577,39 +1604,43 @@ scheduleDoGC (Capability **pcap, Task *task USED_IF_THREADS,
             // enabled_capabilities may change if requestSync() below fails and
             // we retry.
             if (gc_type == SYNC_GC_PAR && n_gc_threads > 0) {
-                need_idle = stg_max(0, enabled_capabilities - n_gc_threads);
+                if (n_gc_threads >= enabled_capabilities) {
+                    need_idle = 0;
+                } else {
+                    need_idle = enabled_capabilities - n_gc_threads;
+                }
             } else {
                 need_idle = 0;
             }
 
             // We need an array of size n_capabilities, but since this may
             // change each time around the loop we must allocate it afresh.
-            idle_cap = (rtsBool *)stgMallocBytes(n_capabilities *
-                                                  sizeof(rtsBool),
-                                                  "scheduleDoGC");
+            idle_cap = (bool *)stgMallocBytes(n_capabilities *
+                                              sizeof(bool),
+                                              "scheduleDoGC");
             sync.idle = idle_cap;
 
             // When using +RTS -qn, we need some capabilities to be idle during
             // GC.  The best bet is to choose some inactive ones, so we look for
             // those first:
-            nat n_idle = need_idle;
+            uint32_t n_idle = need_idle;
             for (i=0; i < n_capabilities; i++) {
                 if (capabilities[i]->disabled) {
-                    idle_cap[i] = rtsTrue;
+                    idle_cap[i] = true;
                 } else if (n_idle > 0 &&
                            capabilities[i]->running_task == NULL) {
                     debugTrace(DEBUG_sched, "asking for cap %d to be idle", i);
                     n_idle--;
-                    idle_cap[i] = rtsTrue;
+                    idle_cap[i] = true;
                 } else {
-                    idle_cap[i] = rtsFalse;
+                    idle_cap[i] = false;
                 }
             }
             // If we didn't find enough inactive capabilities, just pick some
             // more to be idle.
             for (i=0; n_idle > 0 && i < n_capabilities; i++) {
                 if (!idle_cap[i] && i != cap->no) {
-                    idle_cap[i] = rtsTrue;
+                    idle_cap[i] = true;
                     n_idle--;
                 }
             }
@@ -1712,23 +1743,13 @@ scheduleDoGC (Capability **pcap, Task *task USED_IF_THREADS,
         }
         debugTrace(DEBUG_sched, "%d idle caps", n_idle_caps);
 
-        // We set the gc_thread[i]->idle flag if that
-        // capability/thread is not participating in this collection.
-        // We also keep a local record of which capabilities are idle
-        // in idle_cap[], because scheduleDoGC() is re-entrant:
-        // another thread might start a GC as soon as we've finished
-        // this one, and thus the gc_thread[]->idle flags are invalid
-        // as soon as we release any threads after GC.  Getting this
-        // wrong leads to a rare and hard to debug deadlock!
-
         for (i=0; i < n_capabilities; i++) {
-            gc_threads[i]->idle = idle_cap[i];
             capabilities[i]->idle++;
         }
 
         // For all capabilities participating in this GC, wait until
         // they have stopped mutating and are standing by for GC.
-        waitForGcThreads(cap);
+        waitForGcThreads(cap, idle_cap);
 
 #if defined(THREADED_RTS)
         // Stable point where we can do a global check on our spark counters
@@ -1796,9 +1817,9 @@ delete_threads_and_gc:
     // reset pending_sync *before* GC, so that when the GC threads
     // emerge they don't immediately re-enter the GC.
     pending_sync = 0;
-    GarbageCollect(collect_gen, heap_census, gc_type, cap);
+    GarbageCollect(collect_gen, heap_census, gc_type, cap, idle_cap);
 #else
-    GarbageCollect(collect_gen, heap_census, 0, cap);
+    GarbageCollect(collect_gen, heap_census, 0, cap, NULL);
 #endif
 
     traceSparkCounters(cap);
@@ -1838,7 +1859,7 @@ delete_threads_and_gc:
 
     // The heap census itself is done during GarbageCollect().
     if (heap_census) {
-        performHeapProfile = rtsFalse;
+        performHeapProfile = false;
     }
 
 #if defined(THREADED_RTS)
@@ -1848,7 +1869,6 @@ delete_threads_and_gc:
 
     if (gc_type == SYNC_GC_PAR)
     {
-        releaseGCThreads(cap);
         for (i = 0; i < n_capabilities; i++) {
             if (i != cap->no) {
                 if (idle_cap[i]) {
@@ -1861,26 +1881,58 @@ delete_threads_and_gc:
             }
         }
         task->cap = cap;
+
+        // releaseGCThreads() happens *after* we have released idle
+        // capabilities.  Otherwise what can happen is one of the released
+        // threads starts a new GC, and finds that it can't acquire some of
+        // the disabled capabilities, because the previous GC still holds
+        // them, so those disabled capabilities will not be idle during the
+        // next GC round.  However, if we release the capabilities first,
+        // then they will be free (because they're disabled) when the next
+        // GC cycle happens.
+        releaseGCThreads(cap, idle_cap);
     }
 #endif
-
     if (heap_overflow && sched_state < SCHED_INTERRUPTING) {
-        // GC set the heap_overflow flag, so we should proceed with
-        // an orderly shutdown now.  Ultimately we want the main
-        // thread to return to its caller with HeapExhausted, at which
-        // point the caller should call hs_exit().  The first step is
-        // to delete all the threads.
-        //
-        // Another way to do this would be to raise an exception in
-        // the main thread, which we really should do because it gives
-        // the program a chance to clean up.  But how do we find the
-        // main thread?  It should presumably be the same one that
-        // gets ^C exceptions, but that's all done on the Haskell side
-        // (GHC.TopHandler).
-        sched_state = SCHED_INTERRUPTING;
-        goto delete_threads_and_gc;
-    }
+        // GC set the heap_overflow flag.  We should throw an exception if we
+        // can, or shut down otherwise.
 
+        // Get the thread to which Ctrl-C is thrown
+        StgTSO *main_thread = getTopHandlerThread();
+        if (main_thread == NULL) {
+            // GC set the heap_overflow flag, and there is no main thread to
+            // throw an exception to, so we should proceed with an orderly
+            // shutdown now.  Ultimately we want the main thread to return to
+            // its caller with HeapExhausted, at which point the caller should
+            // call hs_exit().  The first step is to delete all the threads.
+            sched_state = SCHED_INTERRUPTING;
+            goto delete_threads_and_gc;
+        }
+
+        heap_overflow = false;
+        const uint64_t allocation_count = getAllocations();
+        if (RtsFlags.GcFlags.heapLimitGrace <
+              allocation_count - allocated_bytes_at_heapoverflow ||
+              allocated_bytes_at_heapoverflow == 0) {
+            allocated_bytes_at_heapoverflow = allocation_count;
+            // We used to simply exit, but throwing an exception gives the
+            // program a chance to clean up.  It also lets the exception be
+            // caught.
+
+            // FIXME this is not a good way to tell a program to release
+            // resources.  It is neither reliable (the RTS crashes if it fails
+            // to allocate memory from the OS) nor very usable (it is always
+            // thrown to the main thread, which might not be able to do anything
+            // useful with it).  We really should have a more general way to
+            // release resources in low-memory conditions.  Nevertheless, this
+            // is still a big improvement over just exiting.
+
+            // FIXME again: perhaps we should throw a synchronous exception
+            // instead an asynchronous one, or have a way for the program to
+            // register a handler to be called when heap overflow happens.
+            throwToSelf(cap, main_thread, heapOverflow_closure);
+        }
+    }
 #ifdef SPARKBALANCE
     /* JB
        Once we are all together... this would be the place to balance all
@@ -1916,9 +1968,9 @@ forkProcess(HsStablePtr *entry
     pid_t pid;
     StgTSO* t,*next;
     Capability *cap;
-    nat g;
+    uint32_t g;
     Task *task = NULL;
-    nat i;
+    uint32_t i;
 
     debugTrace(DEBUG_sched, "forking!");
 
@@ -1966,7 +2018,7 @@ forkProcess(HsStablePtr *entry
         RELEASE_LOCK(&task->lock);
 
         for (i=0; i < n_capabilities; i++) {
-            releaseCapability_(capabilities[i],rtsFalse);
+            releaseCapability_(capabilities[i],false);
             RELEASE_LOCK(&capabilities[i]->lock);
         }
 
@@ -2078,7 +2130,10 @@ forkProcess(HsStablePtr *entry
         ioManagerStartCap(&cap);
 #endif
 
-        rts_evalStableIO(&cap, entry, NULL);  // run the action
+        // Install toplevel exception handlers, so interruption
+        // signal will be sent to the main thread.
+        // See Trac #12903
+        rts_evalStableIOMain(&cap, entry, NULL);  // run the action
         rts_checkSchedStatus("forkProcess",cap);
 
         rts_unlock(cap);
@@ -2104,7 +2159,7 @@ forkProcess(HsStablePtr *entry
  * ------------------------------------------------------------------------- */
 
 void
-setNumCapabilities (nat new_n_capabilities USED_IF_THREADS)
+setNumCapabilities (uint32_t new_n_capabilities USED_IF_THREADS)
 {
 #if !defined(THREADED_RTS)
     if (new_n_capabilities != 1) {
@@ -2119,9 +2174,9 @@ setNumCapabilities (nat new_n_capabilities USED_IF_THREADS)
 #else
     Task *task;
     Capability *cap;
-    nat n;
+    uint32_t n;
     Capability *old_capabilities = NULL;
-    nat old_n_capabilities = n_capabilities;
+    uint32_t old_n_capabilities = n_capabilities;
 
     if (new_n_capabilities == enabled_capabilities) return;
 
@@ -2160,7 +2215,7 @@ setNumCapabilities (nat new_n_capabilities USED_IF_THREADS)
         // structures, the nursery, etc.
         //
         for (n = new_n_capabilities; n < enabled_capabilities; n++) {
-            capabilities[n]->disabled = rtsTrue;
+            capabilities[n]->disabled = true;
             traceCapDisable(capabilities[n]);
         }
         enabled_capabilities = new_n_capabilities;
@@ -2172,7 +2227,7 @@ setNumCapabilities (nat new_n_capabilities USED_IF_THREADS)
         // enable any disabled capabilities, up to the required number
         for (n = enabled_capabilities;
              n < new_n_capabilities && n < n_capabilities; n++) {
-            capabilities[n]->disabled = rtsFalse;
+            capabilities[n]->disabled = false;
             traceCapEnable(capabilities[n]);
         }
         enabled_capabilities = n;
@@ -2230,7 +2285,7 @@ deleteAllThreads ( Capability *cap )
     // NOTE: only safe to call if we own all capabilities.
 
     StgTSO* t, *next;
-    nat g;
+    uint32_t g;
 
     debugTrace(DEBUG_sched,"deleting all threads");
     for (g = 0; g < RtsFlags.GcFlags.generations; g++) {
@@ -2312,7 +2367,7 @@ recoverSuspendedTask (Capability *cap, Task *task)
  * ------------------------------------------------------------------------- */
 
 void *
-suspendThread (StgRegTable *reg, rtsBool interruptible)
+suspendThread (StgRegTable *reg, bool interruptible)
 {
   Capability *cap;
   int saved_errno;
@@ -2357,8 +2412,8 @@ suspendThread (StgRegTable *reg, rtsBool interruptible)
   ACQUIRE_LOCK(&cap->lock);
 
   suspendTask(cap,task);
-  cap->in_haskell = rtsFalse;
-  releaseCapability_(cap,rtsFalse);
+  cap->in_haskell = false;
+  releaseCapability_(cap,false);
 
   RELEASE_LOCK(&cap->lock);
 
@@ -2417,7 +2472,7 @@ resumeThread (void *task_)
     }
 
     cap->r.rCurrentTSO = tso;
-    cap->in_haskell = rtsTrue;
+    cap->in_haskell = true;
     errno = saved_errno;
 #if mingw32_HOST_OS
     SetLastError(saved_winerror);
@@ -2525,7 +2580,7 @@ void scheduleWorker (Capability *cap, Task *task)
     // Capability has been shut down.
     //
     ACQUIRE_LOCK(&cap->lock);
-    releaseCapability_(cap,rtsFalse);
+    releaseCapability_(cap,false);
     workerTaskStop(task);
     RELEASE_LOCK(&cap->lock);
 }
@@ -2536,10 +2591,10 @@ void scheduleWorker (Capability *cap, Task *task)
  * -------------------------------------------------------------------------- */
 
 static void
-startWorkerTasks (nat from USED_IF_THREADS, nat to USED_IF_THREADS)
+startWorkerTasks (uint32_t from USED_IF_THREADS, uint32_t to USED_IF_THREADS)
 {
 #if defined(THREADED_RTS)
-    nat i;
+    uint32_t i;
     Capability *cap;
 
     for (i = from; i < to; i++) {
@@ -2580,6 +2635,8 @@ initScheduler(void)
 
   ACQUIRE_LOCK(&sched_mutex);
 
+  allocated_bytes_at_heapoverflow = 0;
+
   /* A capability holds the state a native thread needs in
    * order to execute STG code. At least one capability is
    * floating around (only THREADED_RTS builds have more than one).
@@ -2601,7 +2658,7 @@ initScheduler(void)
 }
 
 void
-exitScheduler (rtsBool wait_foreign USED_IF_THREADS)
+exitScheduler (bool wait_foreign USED_IF_THREADS)
                /* see Capability.c, shutdownCapability() */
 {
     Task *task = NULL;
@@ -2613,7 +2670,7 @@ exitScheduler (rtsBool wait_foreign USED_IF_THREADS)
         sched_state = SCHED_INTERRUPTING;
         Capability *cap = task->cap;
         waitForCapability(&cap,task);
-        scheduleDoGC(&cap,task,rtsTrue);
+        scheduleDoGC(&cap,task,true);
         ASSERT(task->incall->tso == NULL);
         releaseCapability(cap);
     }
@@ -2630,7 +2687,7 @@ exitScheduler (rtsBool wait_foreign USED_IF_THREADS)
 void
 freeScheduler( void )
 {
-    nat still_running;
+    uint32_t still_running;
 
     ACQUIRE_LOCK(&sched_mutex);
     still_running = freeTaskManager();
@@ -2668,7 +2725,7 @@ void markScheduler (evac_fn evac USED_IF_NOT_THREADS,
    -------------------------------------------------------------------------- */
 
 static void
-performGC_(rtsBool force_major)
+performGC_(bool force_major)
 {
     Task *task;
     Capability *cap = NULL;
@@ -2689,18 +2746,18 @@ performGC_(rtsBool force_major)
 void
 performGC(void)
 {
-    performGC_(rtsFalse);
+    performGC_(false);
 }
 
 void
 performMajorGC(void)
 {
-    performGC_(rtsTrue);
+    performGC_(true);
 }
 
 /* ---------------------------------------------------------------------------
-   Interrupt execution
-   - usually called inside a signal handler so it mustn't do anything fancy.
+   Interrupt execution.
+   Might be called inside a signal handler so it mustn't do anything fancy.
    ------------------------------------------------------------------------ */
 
 void
@@ -2788,11 +2845,11 @@ raiseExceptionHelper (StgRegTable *reg, StgTSO *tso, StgClosure *exception)
     Capability *cap = regTableToCapability(reg);
     StgThunk *raise_closure = NULL;
     StgPtr p, next;
-    StgRetInfoTable *info;
+    const StgRetInfoTable *info;
     //
     // This closure represents the expression 'raise# E' where E
     // is the exception raise.  It is used to overwrite all the
-    // thunks which are currently under evaluataion.
+    // thunks which are currently under evaluation.
     //
 
     // OLD COMMENT (we don't have MIN_UPD_SIZE now):
@@ -2897,12 +2954,12 @@ raiseExceptionHelper (StgRegTable *reg, StgTSO *tso, StgClosure *exception)
 StgWord
 findRetryFrameHelper (Capability *cap, StgTSO *tso)
 {
-  StgPtr           p, next;
-  StgRetInfoTable *info;
+  const StgRetInfoTable *info;
+  StgPtr    p, next;
 
   p = tso->stackobj->sp;
   while (1) {
-    info = get_ret_itbl((StgClosure *)p);
+    info = get_ret_itbl((const StgClosure *)p);
     next = p + stack_frame_sizeW((StgClosure *)p);
     switch (info->i.type) {
 

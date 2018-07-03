@@ -40,7 +40,7 @@ The design of Safe Haskell covers the following aspects:
 Safe Haskell, however, *does not offer* compilation safety. During
 compilation time it is possible for arbitrary processes to be launched,
 using for example the :ref:`custom pre-processor <pre-processor>` flag.
-This can be manipulated to either compromise a users system at
+This can be manipulated to either compromise a user's system at
 compilation time, or to modify the source code just before compilation
 to try to alter Safe Haskell flags. This is discussed further in section
 :ref:`safe-compilation`.
@@ -85,7 +85,7 @@ due to the presence of functions like ``unsafePerformIO``. Safe Haskell
 gives users enough guarantees about the type system to allow them to
 build such secure systems.
 
-As an example, lets define an interface for a plugin system where the
+As an example, let's define an interface for a plugin system where the
 plugin authors are untrusted, possibly malicious third-parties. We do
 this by restricting the plugin interface to pure functions or to a
 restricted ``IO`` monad that we have defined. The restricted ``IO``
@@ -137,7 +137,7 @@ We then compile the ``Danger`` plugin using the new Safe Haskell
     runMe :: RIO ()
     runMe = ...
 
-Before going into the Safe Haskell details, lets point out some of the
+Before going into the Safe Haskell details, let's point out some of the
 reasons this security mechanism would fail without Safe Haskell:
 
 - The design attempts to restrict the operations that ``Danger`` can perform by
@@ -273,10 +273,19 @@ Furthermore, we restrict the following features:
   this reason, the ``Data.Coerce`` module is also considered unsafe. We are
   hoping to find a better solution here in the future.
 
-- ``Data.Typeable`` — Hand crafted instances of the Typeable type class are not allowed
-  in Safe Haskell as this can easily be abused to unsafely coerce
-  between types. Derived instances (through the :ghc-flag:`-XDeriveDataTypeable`
-  extension) are still allowed.
+- ``GHC.Generics`` — Hand crafted instances of the ``Generic`` type class are
+  not allowed in Safe Haskell. Such instances aren't strictly unsafe, but
+  there is an important invariant that a ``Generic`` instance should adhere to
+  the structure of the data type for which the instance is defined, and
+  allowing manually implemented ``Generic`` instances would break that
+  invariant. Derived instances (through the :ghc-flag:`-XDeriveGeneric`
+  extension) are still allowed. Note that the only allowed
+  :ref:`deriving strategy <deriving-strategies>` for deriving ``Generic`` under
+  Safe Haskell is ``stock``, as another strategy (e.g., ``anyclass``) would
+  produce an instance that violates the invariant.
+
+  Refer to the
+  :ref:`generic programming <generic-programming>` section for more details.
 
 .. _safe-overlapping-instances:
 
@@ -366,7 +375,7 @@ Safe Imports
 Safe Haskell enables a small extension to the usual import syntax of
 Haskell, adding a ``safe`` keyword:
 
-::
+.. code-block:: none
 
     impdecl -> import [safe] [qualified] modid [as modid] [impspec]
 
@@ -493,7 +502,7 @@ The reason there are two modes of checking trust is that the extra
 requirement enabled by :ghc-flag:`-fpackage-trust` causes the design of Safe
 Haskell to be invasive. Packages using Safe Haskell when the flag is
 enabled may or may not compile depending on the state of trusted
-packages on a users machine. This is both fragile, and causes
+packages on a user's machine. This is both fragile, and causes
 compilation failures for everyone, even if they aren't trying to use any
 of the guarantees provided by Safe Haskell. Disabling
 :ghc-flag:`-fpackage-trust` by default and turning it into a flag makes Safe
@@ -697,16 +706,19 @@ And one general flag:
 And three warning flags:
 
 .. ghc-flag:: -Wunsafe
+
     Issue a warning if the module being compiled is regarded to be
     unsafe. Should be used to check the safety type of modules when
     using safe inference.
 
 .. ghc-flag:: -Wsafe
+
     Issue a warning if the module being compiled is regarded to be safe.
     Should be used to check the safety type of modules when using safe
     inference.
 
 .. ghc-flag:: -Wtrustworthy-safe
+
     Issue a warning if the module being compiled is marked as
     -XTrustworthy but it could instead be marked as
     -XSafe , a more informative bound. Can be used to detect once a Safe Haskell

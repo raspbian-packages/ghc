@@ -15,6 +15,7 @@ module Distribution.Client.FileMonitor (
   monitorFile,
   monitorFileHashed,
   monitorNonExistentFile,
+  monitorFileExistence,
   monitorDirectory,
   monitorNonExistentDirectory,
   monitorDirectoryExistence,
@@ -35,23 +36,18 @@ module Distribution.Client.FileMonitor (
   beginUpdateFileMonitor,
   ) where
 
+import Prelude ()
+import Distribution.Client.Compat.Prelude
 
 #if MIN_VERSION_containers(0,5,0)
-import           Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 #else
-import           Data.Map        (Map)
 import qualified Data.Map        as Map
 #endif
 import qualified Data.ByteString.Lazy as BS
-import           Distribution.Compat.Binary
 import qualified Distribution.Compat.Binary as Binary
 import qualified Data.Hashable as Hashable
-import           Data.List (sort)
 
-#if !MIN_VERSION_base(4,8,0)
-import           Control.Applicative
-#endif
 import           Control.Monad
 import           Control.Monad.Trans (MonadIO, liftIO)
 import           Control.Monad.State (StateT, mapStateT)
@@ -60,7 +56,7 @@ import           Control.Monad.Except (ExceptT, runExceptT, withExceptT,
                                        throwError)
 import           Control.Exception
 
-import           Distribution.Client.Compat.Time
+import           Distribution.Compat.Time
 import           Distribution.Client.Glob
 import           Distribution.Simple.Utils (handleDoesNotExist, writeFileAtomic)
 import           Distribution.Client.Utils (mergeBy, MergeResult(..))
@@ -68,8 +64,6 @@ import           Distribution.Client.Utils (mergeBy, MergeResult(..))
 import           System.FilePath
 import           System.Directory
 import           System.IO
-import           GHC.Generics (Generic)
-
 
 ------------------------------------------------------------------------------
 -- Types for specifying files to monitor
@@ -129,6 +123,12 @@ monitorFileHashed = MonitorFile FileHashed DirNotExists
 --
 monitorNonExistentFile :: FilePath -> MonitorFilePath
 monitorNonExistentFile = MonitorFile FileNotExists DirNotExists
+
+-- | Monitor a single file for existence only. The monitored file is
+-- considered to have changed if it no longer exists.
+--
+monitorFileExistence :: FilePath -> MonitorFilePath
+monitorFileExistence = MonitorFile FileExists DirNotExists
 
 -- | Monitor a single directory for changes, based on its modification
 -- time. The monitored directory is considered to have changed if it no
@@ -199,8 +199,13 @@ monitorFileHashedSearchPath notFoundAtPaths foundAtPath =
 -- files to be monitored (index by their path), and a list of
 -- globs, which monitor may files at once.
 data MonitorStateFileSet
-   = MonitorStateFileSet !(Map FilePath MonitorStateFile)
+   = MonitorStateFileSet ![MonitorStateFile]
                          ![MonitorStateGlob]
+     -- Morally this is not actually a set but a bag (represented by lists).
+     -- There is no principled reason to use a bag here rather than a set, but
+     -- there is also no particular gain either. That said, we do preserve the
+     -- order of the lists just to reduce confusion (and have predictable I/O
+     -- patterns).
   deriving Show
 
 type Hash = Int
@@ -216,7 +221,7 @@ type Hash = Int
 -- no longer exists at all.
 --
 data MonitorStateFile = MonitorStateFile !MonitorKindFile !MonitorKindDir
-                                         !MonitorStateFileStatus
+                                         !FilePath !MonitorStateFileStatus
   deriving (Show, Generic)
 
 data MonitorStateFileStatus
@@ -262,11 +267,10 @@ instance Binary MonitorStateGlobRel
 --
 reconstructMonitorFilePaths :: MonitorStateFileSet -> [MonitorFilePath]
 reconstructMonitorFilePaths (MonitorStateFileSet singlePaths globPaths) =
-    Map.foldrWithKey (\k x r -> getSinglePath k x : r)
-                     (map getGlobPath globPaths)
-                     singlePaths
+    map getSinglePath singlePaths
+ ++ map getGlobPath globPaths
   where
-    getSinglePath filepath (MonitorStateFile kindfile kinddir _) =
+    getSinglePath (MonitorStateFile kindfile kinddir filepath _) =
       MonitorFile kindfile kinddir filepath
 
     getGlobPath (MonitorStateGlob kindfile kinddir root gstate) =
@@ -516,7 +520,7 @@ probeFileSystem root (MonitorStateFileSet singlePaths globPaths) =
   runChangedM $ do
     sequence_
       [ probeMonitorStateFileStatus root file status
-      | (file, MonitorStateFile _ _ status) <- Map.toList singlePaths ]
+      | MonitorStateFile _ _ file status <- singlePaths ]
     -- The glob monitors can require state changes
     globPaths' <-
       sequence
@@ -793,19 +797,19 @@ buildMonitorStateFileSet :: Maybe MonitorTimestamp -- ^ optional: timestamp
                                               --   relative to root
                          -> IO MonitorStateFileSet
 buildMonitorStateFileSet mstartTime hashcache root =
-    go Map.empty []
+    go [] []
   where
-    go :: Map FilePath MonitorStateFile -> [MonitorStateGlob]
+    go :: [MonitorStateFile] -> [MonitorStateGlob]
        -> [MonitorFilePath] -> IO MonitorStateFileSet
     go !singlePaths !globPaths [] =
-      return (MonitorStateFileSet singlePaths globPaths)
+      return (MonitorStateFileSet (reverse singlePaths) (reverse globPaths))
 
     go !singlePaths !globPaths
        (MonitorFile kindfile kinddir path : monitors) = do
-      monitorState <- MonitorStateFile kindfile kinddir
+      monitorState <- MonitorStateFile kindfile kinddir path
                   <$> buildMonitorStateFile mstartTime hashcache
                                             kindfile kinddir root path
-      go (Map.insert path monitorState singlePaths) globPaths monitors
+      go (monitorState : singlePaths) globPaths monitors
 
     go !singlePaths !globPaths
        (MonitorFileGlob kindfile kinddir globPath : monitors) = do
@@ -976,15 +980,15 @@ readCacheFileHashes monitor =
                     collectAllFileHashes singlePaths
         `Map.union` collectAllGlobHashes globPaths
 
-    collectAllFileHashes =
-      Map.mapMaybe $ \(MonitorStateFile _ _ fstate) -> case fstate of
-        MonitorStateFileHashed mtime hash -> Just (mtime, hash)
-        _                                 -> Nothing
+    collectAllFileHashes singlePaths =
+      Map.fromList [ (fpath, (mtime, hash))
+                   | MonitorStateFile _ _ fpath
+                       (MonitorStateFileHashed mtime hash) <- singlePaths ]
 
     collectAllGlobHashes globPaths =
-      Map.fromList [ (fpath, hash)
+      Map.fromList [ (fpath, (mtime, hash))
                    | MonitorStateGlob _ _ _ gstate <- globPaths
-                   , (fpath, hash) <- collectGlobHashes "" gstate ]
+                   , (fpath, (mtime, hash)) <- collectGlobHashes "" gstate ]
 
     collectGlobHashes dir (MonitorStateGlobDirs _ _ _ entries) =
       [ res

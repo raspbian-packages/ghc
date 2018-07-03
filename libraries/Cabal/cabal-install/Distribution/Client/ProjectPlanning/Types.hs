@@ -1,4 +1,6 @@
-{-# LANGUAGE DeriveGeneric, DeriveDataTypeable #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE TypeFamilies #-}
 
 -- | Types used while planning how to build everything in a project.
 --
@@ -10,46 +12,69 @@ module Distribution.Client.ProjectPlanning.Types (
     -- * Elaborated install plan types
     ElaboratedInstallPlan,
     ElaboratedConfiguredPackage(..),
+
+    elabDistDirParams,
+    elabExeDependencyPaths,
+    elabLibDependencies,
+    elabOrderLibDependencies,
+    elabExeDependencies,
+    elabOrderExeDependencies,
+    elabSetupDependencies,
+    elabPkgConfigDependencies,
+    elabInplaceDependencyBuildCacheFiles,
+    elabRequiresRegistration,
+
+    elabPlanPackageName,
+    elabConfiguredName,
+    elabComponentName,
+
+    ElaboratedPackageOrComponent(..),
+    ElaboratedComponent(..),
+    ElaboratedPackage(..),
+    pkgOrderDependencies,
     ElaboratedPlanPackage,
     ElaboratedSharedConfig(..),
     ElaboratedReadyPackage,
     BuildStyle(..),
     CabalFileText,
 
-    -- * Types used in executing an install plan
-    --TODO: [code cleanup] these types should live with execution, not with
-    --      plan definition. Need to better separate InstallPlan definition.
-    GenericBuildResult(..),
-    BuildResult,
-    BuildSuccess(..),
-    BuildFailure(..),
-    DocsResult(..),
-    TestsResult(..),
-
     -- * Build targets
-    PackageTarget(..),
     ComponentTarget(..),
+    showComponentTarget,
+    showTestComponentTarget,
     SubComponentTarget(..),
+
+    isTestComponentTarget,
 
     -- * Setup script
     SetupScriptStyle(..),
   ) where
 
+import           Distribution.Client.TargetSelector
+                   ( SubComponentTarget(..) )
 import           Distribution.Client.PackageHash
 
 import           Distribution.Client.Types
-                   hiding ( BuildResult, BuildSuccess(..), BuildFailure(..)
-                          , DocsResult(..), TestsResult(..) )
+import qualified Distribution.Client.InstallPlan as InstallPlan
 import           Distribution.Client.InstallPlan
-                   ( GenericInstallPlan, InstallPlan, GenericPlanPackage )
-import           Distribution.Client.ComponentDeps (ComponentDeps)
+                   ( GenericInstallPlan, GenericPlanPackage(..) )
+import           Distribution.Client.SolverInstallPlan
+                   ( SolverInstallPlan )
+import           Distribution.Client.DistDirLayout
 
+import           Distribution.Backpack
+import           Distribution.Backpack.ModuleShape
+
+import           Distribution.Verbosity
+import           Distribution.Text
+import           Distribution.Types.ComponentRequestedSpec
 import           Distribution.Package
                    hiding (InstalledPackageId, installedPackageId)
 import           Distribution.System
 import qualified Distribution.PackageDescription as Cabal
 import           Distribution.InstalledPackageInfo (InstalledPackageInfo)
 import           Distribution.Simple.Compiler
+import qualified Distribution.Simple.BuildTarget as Cabal
 import           Distribution.Simple.Program.Db
 import           Distribution.ModuleName (ModuleName)
 import           Distribution.Simple.LocalBuildInfo (ComponentName(..))
@@ -57,21 +82,21 @@ import qualified Distribution.Simple.InstallDirs as InstallDirs
 import           Distribution.Simple.InstallDirs (PathTemplate)
 import           Distribution.Version
 
+import qualified Distribution.Solver.Types.ComponentDeps as CD
+import           Distribution.Solver.Types.ComponentDeps (ComponentDeps)
+import           Distribution.Solver.Types.OptionalStanza
+import           Distribution.Compat.Graph (IsNode(..))
+import           Distribution.Simple.Utils (ordNub)
+
 import           Data.Map (Map)
 import           Data.Set (Set)
 import qualified Data.ByteString.Lazy as LBS
 import           Distribution.Compat.Binary
 import           GHC.Generics (Generic)
-import           Data.Typeable (Typeable)
-import           Control.Exception
+import qualified Data.Monoid as Mon
+import           Data.Typeable
+import           Control.Monad
 
-
-
--- | The type of install plan produced by the solver and used as the starting
--- point for the 'ElaboratedInstallPlan'.
---
-type SolverInstallPlan
-   = InstallPlan --TODO: [code cleanup] redefine locally or move def to solver interface
 
 
 -- | The combination of an elaborated install plan plus a
@@ -84,12 +109,20 @@ type SolverInstallPlan
 type ElaboratedInstallPlan
    = GenericInstallPlan InstalledPackageInfo
                         ElaboratedConfiguredPackage
-                        BuildSuccess BuildFailure
 
 type ElaboratedPlanPackage
    = GenericPlanPackage InstalledPackageInfo
                         ElaboratedConfiguredPackage
-                        BuildSuccess BuildFailure
+
+-- | User-friendly display string for an 'ElaboratedPlanPackage'.
+elabPlanPackageName :: Verbosity -> ElaboratedPlanPackage -> String
+elabPlanPackageName verbosity (PreExisting ipkg)
+    | verbosity <= normal = display (packageName ipkg)
+    | otherwise           = display (installedUnitId ipkg)
+elabPlanPackageName verbosity (Configured elab)
+    = elabConfiguredName verbosity elab
+elabPlanPackageName verbosity (Installed elab)
+    = elabConfiguredName verbosity elab
 
 --TODO: [code cleanup] decide if we really need this, there's not much in it, and in principle
 --      even platform and compiler could be different if we're building things
@@ -104,135 +137,462 @@ data ElaboratedSharedConfig
        -- used.
        pkgConfigCompilerProgs :: ProgramDb
      }
-  deriving (Show, Generic)
+  deriving (Show, Generic, Typeable)
   --TODO: [code cleanup] no Eq instance
 
 instance Binary ElaboratedSharedConfig
 
 data ElaboratedConfiguredPackage
    = ElaboratedConfiguredPackage {
+       -- | The 'UnitId' which uniquely identifies this item in a build plan
+       elabUnitId        :: UnitId,
 
-       pkgInstalledId :: InstalledPackageId,
-       pkgSourceId    :: PackageId,
+       elabComponentId :: ComponentId,
+       elabInstantiatedWith :: Map ModuleName Module,
+       elabLinkedInstantiatedWith :: Map ModuleName OpenModule,
 
-       -- | TODO: [code cleanup] we don't need this, just a few bits from it:
-       --   build type, spec version
-       pkgDescription :: Cabal.PackageDescription,
+       -- | This is true if this is an indefinite package, or this is a
+       -- package with no signatures.  (Notably, it's not true for instantiated
+       -- packages.)  The motivation for this is if you ask to build
+       -- @foo-indef@, this probably means that you want to typecheck
+       -- it, NOT that you want to rebuild all of the various
+       -- instantiations of it.
+       elabIsCanonical :: Bool,
 
-       -- | A total flag assignment for the package
-       pkgFlagAssignment   :: Cabal.FlagAssignment,
+       -- | The 'PackageId' of the originating package
+       elabPkgSourceId    :: PackageId,
+
+       -- | Shape of the package/component, for Backpack.
+       elabModuleShape    :: ModuleShape,
+
+       -- | A total flag assignment for the package.
+       -- TODO: Actually this can be per-component if we drop
+       -- all flags that don't affect a component.
+       elabFlagAssignment   :: Cabal.FlagAssignment,
 
        -- | The original default flag assignment, used only for reporting.
-       pkgFlagDefaults     :: Cabal.FlagAssignment,
+       elabFlagDefaults     :: Cabal.FlagAssignment,
 
-       -- | The exact dependencies (on other plan packages)
-       --
-       pkgDependencies     :: ComponentDeps [ConfiguredId],
+       elabPkgDescription :: Cabal.PackageDescription,
+
+       -- | Where the package comes from, e.g. tarball, local dir etc. This
+       --   is not the same as where it may be unpacked to for the build.
+       elabPkgSourceLocation :: PackageLocation (Maybe FilePath),
+
+       -- | The hash of the source, e.g. the tarball. We don't have this for
+       -- local source dir packages.
+       elabPkgSourceHash     :: Maybe PackageSourceHash,
+
+       -- | Is this package one of the ones specified by location in the
+       -- project file? (As opposed to a dependency, or a named package pulled
+       -- in)
+       elabLocalToProject         :: Bool,
+
+       -- | Are we going to build and install this package to the store, or are
+       -- we going to build it and register it locally.
+       elabBuildStyle             :: BuildStyle,
+
+       -- | Another way of phrasing 'pkgStanzasAvailable'.
+       elabEnabledSpec      :: ComponentRequestedSpec,
 
        -- | Which optional stanzas (ie testsuites, benchmarks) can be built.
        -- This means the solver produced a plan that has them available.
        -- This doesn't necessary mean we build them by default.
-       pkgStanzasAvailable :: Set OptionalStanza,
+       elabStanzasAvailable :: Set OptionalStanza,
 
        -- | Which optional stanzas the user explicitly asked to enable or
        -- to disable. This tells us which ones we build by default, and
        -- helps with error messages when the user asks to build something
        -- they explicitly disabled.
-       pkgStanzasRequested :: Map OptionalStanza Bool,
+       --
+       -- TODO: The 'Bool' here should be refined into an ADT with three
+       -- cases: NotRequested, ExplicitlyRequested and
+       -- ImplicitlyRequested.  A stanza is explicitly requested if
+       -- the user asked, for this *specific* package, that the stanza
+       -- be enabled; it's implicitly requested if the user asked for
+       -- all global packages to have this stanza enabled.  The
+       -- difference between an explicit and implicit request is
+       -- error reporting behavior: if a user asks for tests to be
+       -- enabled for a specific package that doesn't have any tests,
+       -- we should warn them about it, but we shouldn't complain
+       -- that a user enabled tests globally, and some local packages
+       -- just happen not to have any tests.  (But perhaps we should
+       -- warn if ALL local packages don't have any tests.)
+       elabStanzasRequested :: Map OptionalStanza Bool,
 
-       -- | Which optional stanzas (ie testsuites, benchmarks) will actually
-       -- be enabled during the package configure step.
-       pkgStanzasEnabled :: Set OptionalStanza,
+       elabSetupPackageDBStack    :: PackageDBStack,
+       elabBuildPackageDBStack    :: PackageDBStack,
+       elabRegisterPackageDBStack :: PackageDBStack,
 
-       -- | Where the package comes from, e.g. tarball, local dir etc. This
-       --   is not the same as where it may be unpacked to for the build.
-       pkgSourceLocation :: PackageLocation (Maybe FilePath),
+       elabPkgDescriptionOverride  :: Maybe CabalFileText,
 
-       -- | The hash of the source, e.g. the tarball. We don't have this for
-       -- local source dir packages.
-       pkgSourceHash     :: Maybe PackageSourceHash,
+       -- TODO: make per-component variants of these flags
+       elabVanillaLib           :: Bool,
+       elabSharedLib            :: Bool,
+       elabDynExe               :: Bool,
+       elabGHCiLib              :: Bool,
+       elabProfLib              :: Bool,
+       elabProfExe              :: Bool,
+       elabProfLibDetail        :: ProfDetailLevel,
+       elabProfExeDetail        :: ProfDetailLevel,
+       elabCoverage             :: Bool,
+       elabOptimization         :: OptimisationLevel,
+       elabSplitObjs            :: Bool,
+       elabStripLibs            :: Bool,
+       elabStripExes            :: Bool,
+       elabDebugInfo            :: DebugInfoLevel,
 
-       --pkgSourceDir ? -- currently passed in later because they can use temp locations
-       --pkgBuildDir  ? -- but could in principle still have it here, with optional instr to use temp loc
+       elabProgramPaths          :: Map String FilePath,
+       elabProgramArgs           :: Map String [String],
+       elabProgramPathExtra      :: [FilePath],
+       elabConfigureScriptArgs   :: [String],
+       elabExtraLibDirs          :: [FilePath],
+       elabExtraFrameworkDirs    :: [FilePath],
+       elabExtraIncludeDirs      :: [FilePath],
+       elabProgPrefix            :: Maybe PathTemplate,
+       elabProgSuffix            :: Maybe PathTemplate,
 
-       pkgBuildStyle             :: BuildStyle,
+       elabInstallDirs           :: InstallDirs.InstallDirs FilePath,
 
-       pkgSetupPackageDBStack    :: PackageDBStack,
-       pkgBuildPackageDBStack    :: PackageDBStack,
-       pkgRegisterPackageDBStack :: PackageDBStack,
-
-       -- | The package contains a library and so must be registered
-       pkgRequiresRegistration :: Bool,
-       pkgDescriptionOverride  :: Maybe CabalFileText,
-
-       pkgVanillaLib           :: Bool,
-       pkgSharedLib            :: Bool,
-       pkgDynExe               :: Bool,
-       pkgGHCiLib              :: Bool,
-       pkgProfLib              :: Bool,
-       pkgProfExe              :: Bool,
-       pkgProfLibDetail        :: ProfDetailLevel,
-       pkgProfExeDetail        :: ProfDetailLevel,
-       pkgCoverage             :: Bool,
-       pkgOptimization         :: OptimisationLevel,
-       pkgSplitObjs            :: Bool,
-       pkgStripLibs            :: Bool,
-       pkgStripExes            :: Bool,
-       pkgDebugInfo            :: DebugInfoLevel,
-
-       pkgProgramPaths          :: Map String FilePath,
-       pkgProgramArgs           :: Map String [String],
-       pkgProgramPathExtra      :: [FilePath],
-       pkgConfigureScriptArgs   :: [String],
-       pkgExtraLibDirs          :: [FilePath],
-       pkgExtraFrameworkDirs    :: [FilePath],
-       pkgExtraIncludeDirs      :: [FilePath],
-       pkgProgPrefix            :: Maybe PathTemplate,
-       pkgProgSuffix            :: Maybe PathTemplate,
-
-       pkgInstallDirs           :: InstallDirs.InstallDirs FilePath,
-
-       pkgHaddockHoogle         :: Bool,
-       pkgHaddockHtml           :: Bool,
-       pkgHaddockHtmlLocation   :: Maybe String,
-       pkgHaddockExecutables    :: Bool,
-       pkgHaddockTestSuites     :: Bool,
-       pkgHaddockBenchmarks     :: Bool,
-       pkgHaddockInternal       :: Bool,
-       pkgHaddockCss            :: Maybe FilePath,
-       pkgHaddockHscolour       :: Bool,
-       pkgHaddockHscolourCss    :: Maybe FilePath,
-       pkgHaddockContents       :: Maybe PathTemplate,
+       elabHaddockHoogle         :: Bool,
+       elabHaddockHtml           :: Bool,
+       elabHaddockHtmlLocation   :: Maybe String,
+       elabHaddockForeignLibs    :: Bool,
+       elabHaddockExecutables    :: Bool,
+       elabHaddockTestSuites     :: Bool,
+       elabHaddockBenchmarks     :: Bool,
+       elabHaddockInternal       :: Bool,
+       elabHaddockCss            :: Maybe FilePath,
+       elabHaddockHscolour       :: Bool,
+       elabHaddockHscolourCss    :: Maybe FilePath,
+       elabHaddockContents       :: Maybe PathTemplate,
 
        -- Setup.hs related things:
 
        -- | One of four modes for how we build and interact with the Setup.hs
        -- script, based on whether it's a build-type Custom, with or without
        -- explicit deps and the cabal spec version the .cabal file needs.
-       pkgSetupScriptStyle      :: SetupScriptStyle,
+       elabSetupScriptStyle      :: SetupScriptStyle,
 
        -- | The version of the Cabal command line interface that we are using
        -- for this package. This is typically the version of the Cabal lib
        -- that the Setup.hs is built against.
-       pkgSetupScriptCliVersion :: Version,
+       elabSetupScriptCliVersion :: Version,
 
        -- Build time related:
-       pkgBuildTargets          :: [ComponentTarget],
-       pkgReplTarget            :: Maybe ComponentTarget,
-       pkgBuildHaddocks         :: Bool
-     }
-  deriving (Eq, Show, Generic)
+       elabBuildTargets          :: [ComponentTarget],
+       elabTestTargets           :: [ComponentTarget],
+       elabReplTarget            :: Maybe ComponentTarget,
+       elabBuildHaddocks         :: Bool,
+
+       --pkgSourceDir ? -- currently passed in later because they can use temp locations
+       --pkgBuildDir  ? -- but could in principle still have it here, with optional instr to use temp loc
+
+       -- | Component/package specific information
+       elabPkgOrComp :: ElaboratedPackageOrComponent
+   }
+  deriving (Eq, Show, Generic, Typeable)
+
+-- | The package/component contains/is a library and so must be registered
+elabRequiresRegistration :: ElaboratedConfiguredPackage -> Bool
+elabRequiresRegistration elab =
+    case elabPkgOrComp elab of
+        ElabComponent comp ->
+            case compComponentName comp of
+                Just cn -> is_lib cn && build_target
+                _ -> False
+        ElabPackage pkg ->
+            -- Tricky! Not only do we have to test if the user selected
+            -- a library as a build target, we also have to test if
+            -- the library was TRANSITIVELY depended upon, since we will
+            -- also require a register in this case.
+            --
+            -- NB: It would have been far nicer to just unconditionally
+            -- register in all cases, but some Custom Setups will fall
+            -- over if you try to do that, ESPECIALLY if there actually is
+            -- a library but they hadn't built it.
+            build_target || any (depends_on_lib pkg) (elabBuildTargets elab)
+  where
+    depends_on_lib pkg (ComponentTarget cn _) =
+        not (null (CD.select (== CD.componentNameToComponent cn)
+                             (pkgDependsOnSelfLib pkg)))
+    build_target =
+        if not (null (elabBuildTargets elab))
+            then any is_lib_target (elabBuildTargets elab)
+            -- Empty build targets mean we build /everything/;
+            -- that means we have to look more carefully to see
+            -- if there is anything to register
+            else Cabal.hasLibs (elabPkgDescription elab)
+    -- NB: this means we DO NOT reregister if you just built a
+    -- single file
+    is_lib_target (ComponentTarget cn WholeComponent) = is_lib cn
+    is_lib_target _ = False
+    is_lib CLibName = True
+    is_lib (CSubLibName _) = True
+    is_lib _ = False
+
+instance Package ElaboratedConfiguredPackage where
+  packageId = elabPkgSourceId
+
+instance HasConfiguredId ElaboratedConfiguredPackage where
+  configuredId elab =
+    ConfiguredId (packageId elab) (elabComponentName elab) (elabComponentId elab)
+
+instance HasUnitId ElaboratedConfiguredPackage where
+  installedUnitId = elabUnitId
+
+instance IsNode ElaboratedConfiguredPackage where
+    type Key ElaboratedConfiguredPackage = UnitId
+    nodeKey = elabUnitId
+    nodeNeighbors = elabOrderDependencies
 
 instance Binary ElaboratedConfiguredPackage
 
-instance Package ElaboratedConfiguredPackage where
-  packageId = pkgSourceId
+data ElaboratedPackageOrComponent
+    = ElabPackage   ElaboratedPackage
+    | ElabComponent ElaboratedComponent
+  deriving (Eq, Show, Generic)
 
-instance HasUnitId ElaboratedConfiguredPackage where
-  installedUnitId = pkgInstalledId
+instance Binary ElaboratedPackageOrComponent
 
-instance PackageFixedDeps ElaboratedConfiguredPackage where
-  depends = fmap (map installedPackageId) . pkgDependencies
+elabComponentName :: ElaboratedConfiguredPackage -> Maybe ComponentName
+elabComponentName elab =
+    case elabPkgOrComp elab of
+        ElabPackage _      -> Just CLibName -- there could be more, but default this
+        ElabComponent comp -> compComponentName comp
+
+-- | A user-friendly descriptor for an 'ElaboratedConfiguredPackage'.
+elabConfiguredName :: Verbosity -> ElaboratedConfiguredPackage -> String
+elabConfiguredName verbosity elab
+    | verbosity <= normal
+    = (case elabPkgOrComp elab of
+        ElabPackage _ -> ""
+        ElabComponent comp ->
+            case compComponentName comp of
+                Nothing -> "setup from "
+                Just CLibName -> ""
+                Just cname -> display cname ++ " from ")
+      ++ display (packageId elab)
+    | otherwise
+    = display (elabUnitId elab)
+
+elabDistDirParams :: ElaboratedSharedConfig -> ElaboratedConfiguredPackage -> DistDirParams
+elabDistDirParams shared elab = DistDirParams {
+        distParamUnitId = installedUnitId elab,
+        distParamComponentId = elabComponentId elab,
+        distParamPackageId = elabPkgSourceId elab,
+        distParamComponentName = case elabPkgOrComp elab of
+            ElabComponent comp -> compComponentName comp
+            ElabPackage _ -> Nothing,
+        distParamCompilerId = compilerId (pkgConfigCompiler shared),
+        distParamPlatform = pkgConfigPlatform shared,
+        distParamOptimization = elabOptimization elab
+    }
+
+-- | The full set of dependencies which dictate what order we
+-- need to build things in the install plan: "order dependencies"
+-- balls everything together.  This is mostly only useful for
+-- ordering; if you are, for example, trying to compute what
+-- @--dependency@ flags to pass to a Setup script, you need to
+-- use 'elabLibDependencies'.  This method is the same as
+-- 'nodeNeighbors'.
+--
+-- NB: this method DOES include setup deps.
+elabOrderDependencies :: ElaboratedConfiguredPackage -> [UnitId]
+elabOrderDependencies elab =
+    case elabPkgOrComp elab of
+        -- Important not to have duplicates: otherwise InstallPlan gets
+        -- confused.
+        ElabPackage pkg    -> ordNub (CD.flatDeps (pkgOrderDependencies pkg))
+        ElabComponent comp -> compOrderDependencies comp
+
+-- | Like 'elabOrderDependencies', but only returns dependencies on
+-- libraries.
+elabOrderLibDependencies :: ElaboratedConfiguredPackage -> [UnitId]
+elabOrderLibDependencies elab =
+    case elabPkgOrComp elab of
+        ElabPackage _      -> map (newSimpleUnitId . confInstId) (elabLibDependencies elab)
+        ElabComponent comp -> compOrderLibDependencies comp
+
+-- | The library dependencies (i.e., the libraries we depend on, NOT
+-- the dependencies of the library), NOT including setup dependencies.
+-- These are passed to the @Setup@ script via @--dependency@.
+elabLibDependencies :: ElaboratedConfiguredPackage -> [ConfiguredId]
+elabLibDependencies elab =
+    case elabPkgOrComp elab of
+        ElabPackage pkg    -> ordNub (CD.nonSetupDeps (pkgLibDependencies pkg))
+        ElabComponent comp -> compLibDependencies comp
+
+-- | Like 'elabOrderDependencies', but only returns dependencies on
+-- executables.  (This coincides with 'elabExeDependencies'.)
+elabOrderExeDependencies :: ElaboratedConfiguredPackage -> [UnitId]
+elabOrderExeDependencies =
+    map newSimpleUnitId . elabExeDependencies
+
+-- | The executable dependencies (i.e., the executables we depend on);
+-- these are the executables we must add to the PATH before we invoke
+-- the setup script.
+elabExeDependencies :: ElaboratedConfiguredPackage -> [ComponentId]
+elabExeDependencies elab = map confInstId $
+    case elabPkgOrComp elab of
+        ElabPackage pkg    -> CD.nonSetupDeps (pkgExeDependencies pkg)
+        ElabComponent comp -> compExeDependencies comp
+
+-- | This returns the paths of all the executables we depend on; we
+-- must add these paths to PATH before invoking the setup script.
+-- (This is usually what you want, not 'elabExeDependencies', if you
+-- actually want to build something.)
+elabExeDependencyPaths :: ElaboratedConfiguredPackage -> [FilePath]
+elabExeDependencyPaths elab =
+    case elabPkgOrComp elab of
+        ElabPackage pkg    -> map snd $ CD.nonSetupDeps (pkgExeDependencyPaths pkg)
+        ElabComponent comp -> map snd (compExeDependencyPaths comp)
+
+-- | The setup dependencies (the library dependencies of the setup executable;
+-- note that it is not legal for setup scripts to have executable
+-- dependencies at the moment.)
+elabSetupDependencies :: ElaboratedConfiguredPackage -> [ConfiguredId]
+elabSetupDependencies elab =
+    case elabPkgOrComp elab of
+        ElabPackage pkg -> CD.setupDeps (pkgLibDependencies pkg)
+        -- TODO: Custom setups not supported for components yet.  When
+        -- they are, need to do this differently
+        ElabComponent _ -> []
+
+elabPkgConfigDependencies :: ElaboratedConfiguredPackage -> [(PkgconfigName, Maybe Version)]
+elabPkgConfigDependencies ElaboratedConfiguredPackage { elabPkgOrComp = ElabPackage pkg }
+    = pkgPkgConfigDependencies pkg
+elabPkgConfigDependencies ElaboratedConfiguredPackage { elabPkgOrComp = ElabComponent comp }
+    = compPkgConfigDependencies comp
+
+-- | The cache files of all our inplace dependencies which,
+-- when updated, require us to rebuild.  See #4202 for
+-- more details.  Essentially, this is a list of filepaths
+-- that, if our dependencies get rebuilt, will themselves
+-- get updated.
+--
+-- Note: the hash of these cache files gets built into
+-- the build cache ourselves, which means that we end
+-- up tracking transitive dependencies!
+--
+-- Note: This tracks the "build" cache file, but not
+-- "registration" or "config" cache files.  Why not?
+-- Arguably we should...
+--
+-- Note: This is a bit of a hack, because it is not really
+-- the hashes of the SOURCES of our (transitive) dependencies
+-- that we should use to decide whether or not to rebuild,
+-- but the output BUILD PRODUCTS.  The strategy we use
+-- here will never work if we want to implement unchanging
+-- rebuilds.
+elabInplaceDependencyBuildCacheFiles
+    :: DistDirLayout
+    -> ElaboratedSharedConfig
+    -> ElaboratedInstallPlan
+    -> ElaboratedConfiguredPackage
+    -> [FilePath]
+elabInplaceDependencyBuildCacheFiles layout sconf plan root_elab =
+    go =<< InstallPlan.directDeps plan (nodeKey root_elab)
+  where
+    go = InstallPlan.foldPlanPackage (const []) $ \elab -> do
+            guard (elabBuildStyle elab == BuildInplaceOnly)
+            return $ distPackageCacheFile layout (elabDistDirParams sconf elab) "build"
+
+-- | Some extra metadata associated with an
+-- 'ElaboratedConfiguredPackage' which indicates that the "package"
+-- in question is actually a single component to be built.  Arguably
+-- it would be clearer if there were an ADT which branched into
+-- package work items and component work items, but I've structured
+-- it this way to minimize change to the existing code (which I
+-- don't feel qualified to rewrite.)
+data ElaboratedComponent
+   = ElaboratedComponent {
+    -- | The name of the component to be built according to the solver
+    compSolverName :: CD.Component,
+    -- | The name of the component to be built.  Nothing if
+    -- it's a setup dep.
+    compComponentName :: Maybe ComponentName,
+    -- | The *external* library dependencies of this component.  We
+    -- pass this to the configure script.
+    compLibDependencies :: [ConfiguredId],
+    -- | In a component prior to instantiation, this list specifies
+    -- the 'OpenUnitId's which, after instantiation, are the
+    -- actual dependencies of this package.  Note that this does
+    -- NOT include signature packages, which do not turn into real
+    -- ordering dependencies when we instantiate.  This is intended to be
+    -- a purely temporary field, to carry some information to the
+    -- instantiation phase. It's more precise than
+    -- 'compLibDependencies', and also stores information about internal
+    -- dependencies.
+    compLinkedLibDependencies :: [OpenUnitId],
+    -- | The executable dependencies of this component (including
+    -- internal executables).
+    compExeDependencies :: [ConfiguredId],
+    -- | The @pkg-config@ dependencies of the component
+    compPkgConfigDependencies :: [(PkgconfigName, Maybe Version)],
+    -- | The paths all our executable dependencies will be installed
+    -- to once they are installed.
+    compExeDependencyPaths :: [(ConfiguredId, FilePath)],
+    compOrderLibDependencies :: [UnitId]
+   }
+  deriving (Eq, Show, Generic)
+
+instance Binary ElaboratedComponent
+
+-- | See 'elabOrderDependencies'.
+compOrderDependencies :: ElaboratedComponent -> [UnitId]
+compOrderDependencies comp =
+    compOrderLibDependencies comp
+ ++ compOrderExeDependencies comp
+
+-- | See 'elabOrderExeDependencies'.
+compOrderExeDependencies :: ElaboratedComponent -> [UnitId]
+compOrderExeDependencies = map (newSimpleUnitId . confInstId) . compExeDependencies
+
+data ElaboratedPackage
+   = ElaboratedPackage {
+       pkgInstalledId :: InstalledPackageId,
+
+       -- | The exact dependencies (on other plan packages)
+       --
+       pkgLibDependencies :: ComponentDeps [ConfiguredId],
+
+       -- | Components which depend (transitively) on an internally
+       -- defined library.  These are used by 'elabRequiresRegistration',
+       -- to determine if a user-requested build is going to need
+       -- a library registration
+       --
+       pkgDependsOnSelfLib :: ComponentDeps [()],
+
+       -- | Dependencies on executable packages.
+       --
+       pkgExeDependencies :: ComponentDeps [ConfiguredId],
+
+       -- | Paths where executable dependencies live.
+       --
+       pkgExeDependencyPaths :: ComponentDeps [(ConfiguredId, FilePath)],
+
+       -- | Dependencies on @pkg-config@ packages.
+       -- NB: this is NOT per-component (although it could be)
+       -- because Cabal library does not track per-component
+       -- pkg-config depends; it always does them all at once.
+       --
+       pkgPkgConfigDependencies :: [(PkgconfigName, Maybe Version)],
+
+       -- | Which optional stanzas (ie testsuites, benchmarks) will actually
+       -- be enabled during the package configure step.
+       pkgStanzasEnabled :: Set OptionalStanza
+     }
+  deriving (Eq, Show, Generic)
+
+instance Binary ElaboratedPackage
+
+-- | See 'elabOrderDependencies'.  This gives the unflattened version,
+-- which can be useful in some circumstances.
+pkgOrderDependencies :: ElaboratedPackage -> ComponentDeps [UnitId]
+pkgOrderDependencies pkg =
+    fmap (map (newSimpleUnitId . confInstId)) (pkgLibDependencies pkg) `Mon.mappend`
+    fmap (map (newSimpleUnitId . confInstId)) (pkgExeDependencies pkg)
 
 -- | This is used in the install plan to indicate how the package will be
 -- built.
@@ -261,82 +621,40 @@ instance Binary BuildStyle
 type CabalFileText = LBS.ByteString
 
 type ElaboratedReadyPackage = GenericReadyPackage ElaboratedConfiguredPackage
-                                                  InstalledPackageInfo
-
---TODO: [code cleanup] this duplicates the InstalledPackageInfo quite a bit in an install plan
--- because the same ipkg is used by many packages. So the binary file will be big.
--- Could we keep just (ipkgid, deps) instead of the whole InstalledPackageInfo?
--- or transform to a shared form when serialising / deserialising
-
-data GenericBuildResult ipkg iresult ifailure
-                  = BuildFailure ifailure
-                  | BuildSuccess (Maybe ipkg) iresult
-  deriving (Eq, Show, Generic)
-
-instance (Binary ipkg, Binary iresult, Binary ifailure) =>
-         Binary (GenericBuildResult ipkg iresult ifailure)
-
-type BuildResult  = GenericBuildResult InstalledPackageInfo 
-                                       BuildSuccess BuildFailure
-
-data BuildSuccess = BuildOk DocsResult TestsResult
-  deriving (Eq, Show, Generic)
-
-data DocsResult  = DocsNotTried  | DocsFailed  | DocsOk
-  deriving (Eq, Show, Generic)
-
-data TestsResult = TestsNotTried | TestsOk
-  deriving (Eq, Show, Generic)
-
-data BuildFailure = PlanningFailed              --TODO: [required eventually] not yet used
-                  | DependentFailed PackageId
-                  | DownloadFailed  String      --TODO: [required eventually] not yet used
-                  | UnpackFailed    String      --TODO: [required eventually] not yet used
-                  | ConfigureFailed String
-                  | BuildFailed     String
-                  | TestsFailed     String      --TODO: [required eventually] not yet used
-                  | InstallFailed   String
-  deriving (Eq, Show, Typeable, Generic)
-
-instance Exception BuildFailure
-
-instance Binary BuildFailure
-instance Binary BuildSuccess
-instance Binary DocsResult
-instance Binary TestsResult
 
 
 ---------------------------
 -- Build targets
 --
 
--- | The various targets within a package. This is more of a high level
--- specification than a elaborated prescription.
+-- | Specific targets within a package or component to act on e.g. to build,
+-- haddock or open a repl.
 --
-data PackageTarget =
-     -- | Build the default components in this package. This usually means
-     -- just the lib and exes, but it can also mean the testsuites and
-     -- benchmarks if the user explicitly requested them.
-     BuildDefaultComponents
-     -- | Build a specific component in this package.
-   | BuildSpecificComponent ComponentTarget
-   | ReplDefaultComponent
-   | ReplSpecificComponent  ComponentTarget
-   | HaddockDefaultComponents
-  deriving (Eq, Show, Generic)
-
 data ComponentTarget = ComponentTarget ComponentName SubComponentTarget
-  deriving (Eq, Show, Generic)
+  deriving (Eq, Ord, Show, Generic)
 
-data SubComponentTarget = WholeComponent
-                        | ModuleTarget ModuleName
-                        | FileTarget   FilePath
-  deriving (Eq, Show, Generic)
-
-instance Binary PackageTarget
 instance Binary ComponentTarget
-instance Binary SubComponentTarget
 
+-- | Unambiguously render a 'ComponentTarget', e.g., to pass
+-- to a Cabal Setup script.
+showComponentTarget :: PackageId -> ComponentTarget -> String
+showComponentTarget pkgid =
+    Cabal.showBuildTarget pkgid . toBuildTarget
+  where
+    toBuildTarget :: ComponentTarget -> Cabal.BuildTarget
+    toBuildTarget (ComponentTarget cname subtarget) =
+      case subtarget of
+        WholeComponent     -> Cabal.BuildTargetComponent cname
+        ModuleTarget mname -> Cabal.BuildTargetModule    cname mname
+        FileTarget   fname -> Cabal.BuildTargetFile      cname fname
+
+showTestComponentTarget :: PackageId -> ComponentTarget -> Maybe String
+showTestComponentTarget _ (ComponentTarget (CTestName n) _) = Just $ display n
+showTestComponentTarget _ _ = Nothing
+
+isTestComponentTarget :: ComponentTarget -> Bool
+isTestComponentTarget (ComponentTarget (CTestName _) _) = True
+isTestComponentTarget _                                 = False
 
 ---------------------------
 -- Setup.hs script policy
@@ -363,7 +681,7 @@ data SetupScriptStyle = SetupCustomExplicitDeps
                       | SetupCustomImplicitDeps
                       | SetupNonCustomExternalLib
                       | SetupNonCustomInternalLib
-  deriving (Eq, Show, Generic)
+  deriving (Eq, Show, Generic, Typeable)
 
 instance Binary SetupScriptStyle
 

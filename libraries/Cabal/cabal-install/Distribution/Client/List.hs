@@ -14,38 +14,41 @@ module Distribution.Client.List (
   ) where
 
 import Distribution.Package
-         ( PackageName(..), Package(..), packageName, packageVersion
-         , Dependency(..), simplifyDependency
-         , UnitId )
+         ( PackageName, Package(..), packageName
+         , packageVersion, UnitId )
+import Distribution.Types.Dependency
+import Distribution.Types.UnqualComponentName
 import Distribution.ModuleName (ModuleName)
 import Distribution.License (License)
 import qualified Distribution.InstalledPackageInfo as Installed
 import qualified Distribution.PackageDescription   as Source
 import Distribution.PackageDescription
-         ( Flag(..), FlagName(..) )
+         ( Flag(..), unFlagName )
 import Distribution.PackageDescription.Configuration
          ( flattenPackageDescription )
 
 import Distribution.Simple.Compiler
         ( Compiler, PackageDBStack )
-import Distribution.Simple.Program (ProgramConfiguration)
+import Distribution.Simple.Program (ProgramDb)
 import Distribution.Simple.Utils
-        ( equating, comparing, die, notice )
+        ( equating, comparing, die', notice )
 import Distribution.Simple.Setup (fromFlag)
 import Distribution.Simple.PackageIndex (InstalledPackageIndex)
 import qualified Distribution.Simple.PackageIndex as InstalledPackageIndex
-import qualified Distribution.Client.PackageIndex as PackageIndex
 import Distribution.Version
-         ( Version(..), VersionRange, withinRange, anyVersion
+         ( Version, mkVersion, versionNumbers, VersionRange, withinRange, anyVersion
          , intersectVersionRanges, simplifyVersionRange )
 import Distribution.Verbosity (Verbosity)
 import Distribution.Text
          ( Text(disp), display )
 
+import           Distribution.Solver.Types.PackageConstraint
+import qualified Distribution.Solver.Types.PackageIndex as PackageIndex
+import           Distribution.Solver.Types.SourcePackage
+
 import Distribution.Client.Types
-         ( SourcePackage(..), SourcePackageDb(..) )
-import Distribution.Client.Dependency.Types
-         ( PackageConstraint(..) )
+         ( SourcePackageDb(..)
+         , UnresolvedSourcePackage )
 import Distribution.Client.Targets
          ( UserTarget, resolveUserTargets, PackageSpecifier(..) )
 import Distribution.Client.Setup
@@ -61,7 +64,7 @@ import Distribution.Client.FetchUtils
 import Data.List
          ( sortBy, groupBy, sort, nub, intersperse, maximumBy, partition )
 import Data.Maybe
-         ( listToMaybe, fromJust, fromMaybe, isJust )
+         ( listToMaybe, fromJust, fromMaybe, isJust, maybeToList )
 import qualified Data.Map as Map
 import Data.Tree as Tree
 import Control.Monad
@@ -78,19 +81,19 @@ getPkgList :: Verbosity
            -> PackageDBStack
            -> RepoContext
            -> Compiler
-           -> ProgramConfiguration
+           -> ProgramDb
            -> ListFlags
            -> [String]
            -> IO [PackageDisplayInfo]
-getPkgList verbosity packageDBs repoCtxt comp conf listFlags pats = do
-    installedPkgIndex <- getInstalledPackages verbosity comp packageDBs conf
+getPkgList verbosity packageDBs repoCtxt comp progdb listFlags pats = do
+    installedPkgIndex <- getInstalledPackages verbosity comp packageDBs progdb
     sourcePkgDb       <- getSourcePackages verbosity repoCtxt
     let sourcePkgIndex = packageIndex sourcePkgDb
         prefs name = fromMaybe anyVersion
                        (Map.lookup name (packagePreferences sourcePkgDb))
 
         pkgsInfo ::
-          [(PackageName, [Installed.InstalledPackageInfo], [SourcePackage])]
+          [(PackageName, [Installed.InstalledPackageInfo], [UnresolvedSourcePackage])]
         pkgsInfo
             -- gather info for all packages
           | null pats = mergePackages
@@ -101,7 +104,7 @@ getPkgList verbosity packageDBs repoCtxt comp conf listFlags pats = do
           | otherwise = pkgsInfoMatching
 
         pkgsInfoMatching ::
-          [(PackageName, [Installed.InstalledPackageInfo], [SourcePackage])]
+          [(PackageName, [Installed.InstalledPackageInfo], [UnresolvedSourcePackage])]
         pkgsInfoMatching =
           let matchingInstalled = matchingPackages
                                   InstalledPackageIndex.searchByNameSubstring
@@ -134,12 +137,12 @@ list :: Verbosity
      -> PackageDBStack
      -> RepoContext
      -> Compiler
-     -> ProgramConfiguration
+     -> ProgramDb
      -> ListFlags
      -> [String]
      -> IO ()
-list verbosity packageDBs repos comp conf listFlags pats = do
-    matches <- getPkgList verbosity packageDBs repos comp conf listFlags pats
+list verbosity packageDBs repos comp progdb listFlags pats = do
+    matches <- getPkgList verbosity packageDBs repos comp progdb listFlags pats
 
     if simpleOutput
       then putStr $ unlines
@@ -164,7 +167,7 @@ info :: Verbosity
      -> PackageDBStack
      -> RepoContext
      -> Compiler
-     -> ProgramConfiguration
+     -> ProgramDb
      -> GlobalFlags
      -> InfoFlags
      -> [UserTarget]
@@ -172,10 +175,10 @@ info :: Verbosity
 info verbosity _ _ _ _ _ _ [] =
     notice verbosity "No packages requested. Nothing to do."
 
-info verbosity packageDBs repoCtxt comp conf
+info verbosity packageDBs repoCtxt comp progdb
      globalFlags _listFlags userTargets = do
 
-    installedPkgIndex <- getInstalledPackages verbosity comp packageDBs conf
+    installedPkgIndex <- getInstalledPackages verbosity comp packageDBs progdb
     sourcePkgDb       <- getSourcePackages verbosity repoCtxt
     let sourcePkgIndex = packageIndex sourcePkgDb
         prefs name = fromMaybe anyVersion
@@ -194,7 +197,7 @@ info verbosity packageDBs repoCtxt comp conf
                        sourcePkgs' userTargets
 
     pkgsinfo      <- sequence
-                       [ do pkginfo <- either die return $
+                       [ do pkginfo <- either (die' verbosity) return $
                                          gatherPkgInfo prefs
                                            installedPkgIndex sourcePkgIndex
                                            pkgSpecifier
@@ -206,11 +209,11 @@ info verbosity packageDBs repoCtxt comp conf
   where
     gatherPkgInfo :: (PackageName -> VersionRange) ->
                      InstalledPackageIndex ->
-                     PackageIndex.PackageIndex SourcePackage ->
-                     PackageSpecifier SourcePackage ->
+                     PackageIndex.PackageIndex UnresolvedSourcePackage ->
+                     PackageSpecifier UnresolvedSourcePackage ->
                      Either String PackageDisplayInfo
     gatherPkgInfo prefs installedPkgIndex sourcePkgIndex
-      (NamedPackage name constraints)
+      (NamedPackage name props)
       | null (selectedInstalledPkgs) && null (selectedSourcePkgs)
       = Left $ "There is no available version of " ++ display name
             ++ " that satisfies "
@@ -235,7 +238,7 @@ info verbosity packageDBs repoCtxt comp conf
                          -- supplied a non-trivial version constraint
         showPkgVersion = not (null verConstraints)
         verConstraint  = foldr intersectVersionRanges anyVersion verConstraints
-        verConstraints = [ vr | PackageConstraintVersion _ vr <- constraints ]
+        verConstraints = [ vr | PackagePropertyVersion vr <- props ]
 
     gatherPkgInfo prefs installedPkgIndex sourcePkgIndex
       (SpecificSourcePackage pkg) =
@@ -251,8 +254,8 @@ sourcePkgsInfo ::
   (PackageName -> VersionRange)
   -> PackageName
   -> InstalledPackageIndex
-  -> PackageIndex.PackageIndex SourcePackage
-  -> (VersionRange, [Installed.InstalledPackageInfo], [SourcePackage])
+  -> PackageIndex.PackageIndex UnresolvedSourcePackage
+  -> (VersionRange, [Installed.InstalledPackageInfo], [UnresolvedSourcePackage])
 sourcePkgsInfo prefs name installedPkgIndex sourcePkgIndex =
   (pref, installedPkgs, sourcePkgs)
   where
@@ -268,7 +271,7 @@ sourcePkgsInfo prefs name installedPkgIndex sourcePkgIndex =
 data PackageDisplayInfo = PackageDisplayInfo {
     pkgName           :: PackageName,
     selectedVersion   :: Maybe Version,
-    selectedSourcePkg :: Maybe SourcePackage,
+    selectedSourcePkg :: Maybe UnresolvedSourcePackage,
     installedVersions :: [Version],
     sourceVersions    :: [Version],
     preferredVersions :: VersionRange,
@@ -285,7 +288,7 @@ data PackageDisplayInfo = PackageDisplayInfo {
     flags             :: [Flag],
     hasLib            :: Bool,
     hasExe            :: Bool,
-    executables       :: [String],
+    executables       :: [UnqualComponentName],
     modules           :: [ModuleName],
     haddockHtml       :: FilePath,
     haveTarball       :: Bool
@@ -346,7 +349,7 @@ showPackageDetailedInfo pkginfo =
    , entry "Author"        author       hideIfNull     reflowLines
    , entry "Maintainer"    maintainer   hideIfNull     reflowLines
    , entry "Source repo"   sourceRepo   orNotSpecified text
-   , entry "Executables"   executables  hideIfNull     (commaSep text)
+   , entry "Executables"   executables  hideIfNull     (commaSep disp)
    , entry "Flags"         flags        hideIfNull     (commaSep dispFlag)
    , entry "Dependencies"  dependencies hideIfNull     (commaSep dispExtDep)
    , entry "Documentation" haddockHtml  showIfInstalled text
@@ -378,7 +381,7 @@ showPackageDetailedInfo pkginfo =
     orNotSpecified = altText null "[ Not specified ]"
 
     commaSep f = Disp.fsep . Disp.punctuate (Disp.char ',') . map f
-    dispFlag f = case flagName f of FlagName n -> text n
+    dispFlag = text . unFlagName . flagName
     dispYesNo True  = text "Yes"
     dispYesNo False = text "No"
 
@@ -417,8 +420,8 @@ reflowLines = vcat . map text . lines
 --
 mergePackageInfo :: VersionRange
                  -> [Installed.InstalledPackageInfo]
-                 -> [SourcePackage]
-                 -> Maybe SourcePackage
+                 -> [UnresolvedSourcePackage]
+                 -> Maybe UnresolvedSourcePackage
                  -> Bool
                  -> PackageDisplayInfo
 mergePackageInfo versionPref installedPkgs sourcePkgs selectedPkg showVer =
@@ -462,7 +465,8 @@ mergePackageInfo versionPref installedPkgs sourcePkgs selectedPkg showVer =
     executables  = map fst (maybe [] Source.condExecutables sourceGeneric),
     modules      = combine (map Installed.exposedName . Installed.exposedModules)
                            installed
-                           (maybe [] getListOfExposedModules . Source.library)
+                           -- NB: only for the PUBLIC library
+                           (concatMap getListOfExposedModules . maybeToList . Source.library)
                            source,
     dependencies =
       combine (map (SourceDependency . simplifyDependency)
@@ -520,10 +524,10 @@ latestWithPref pref pkgs = Just (maximumBy (comparing prefThenVersion) pkgs)
 -- both be empty.
 --
 mergePackages :: [Installed.InstalledPackageInfo]
-              -> [SourcePackage]
+              -> [UnresolvedSourcePackage]
               -> [( PackageName
                   , [Installed.InstalledPackageInfo]
-                  , [SourcePackage] )]
+                  , [UnresolvedSourcePackage] )]
 mergePackages installedPkgs sourcePkgs =
     map collect
   $ mergeBy (\i a -> fst i `compare` fst a)
@@ -567,13 +571,13 @@ dispTopVersions n pref vs =
 --
 interestingVersions :: (Version -> Bool) -> [Version] -> [Version]
 interestingVersions pref =
-      map ((\ns -> Version ns []) . fst) . filter snd
+      map (mkVersion . fst) . filter snd
     . concat  . Tree.levels
     . swizzleTree
-    . reorderTree (\(Node (v,_) _) -> pref (Version v []))
+    . reorderTree (\(Node (v,_) _) -> pref (mkVersion v))
     . reverseTree
     . mkTree
-    . map versionBranch
+    . map versionNumbers
 
   where
     swizzleTree = unfoldTree (spine [])

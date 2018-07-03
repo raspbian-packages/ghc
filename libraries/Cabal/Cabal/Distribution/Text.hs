@@ -15,34 +15,68 @@ module Distribution.Text (
   Text(..),
   defaultStyle,
   display,
+  flatStyle,
   simpleParse,
+  stdParse,
   ) where
+
+import Prelude ()
+import Distribution.Compat.Prelude
 
 import qualified Distribution.Compat.ReadP as Parse
 import qualified Text.PrettyPrint          as Disp
 
 import Data.Version (Version(Version))
-import qualified Data.Char as Char (isDigit, isAlphaNum, isSpace)
 
 class Text a where
   disp  :: a -> Disp.Doc
   parse :: Parse.ReadP r a
 
--- | The default rendering style used in Cabal for console output.
+-- | The default rendering style used in Cabal for console
+-- output. It has a fixed page width and adds line breaks
+-- automatically.
 defaultStyle :: Disp.Style
 defaultStyle = Disp.Style { Disp.mode           = Disp.PageMode
                           , Disp.lineLength     = 79
                           , Disp.ribbonsPerLine = 1.0
                           }
 
+-- | Pretty-prints with the default style.
 display :: Text a => a -> String
 display = Disp.renderStyle defaultStyle . disp
 
+-- | A style for rendering all on one line.
+flatStyle :: Disp.Style
+flatStyle = Disp.Style { Disp.mode = Disp.LeftMode
+                       , Disp.lineLength = err "lineLength"
+                       , Disp.ribbonsPerLine = err "ribbonsPerLine"
+                       }
+  where
+    err x = error ("flatStyle: tried to access " ++ x ++ " in LeftMode. " ++
+                   "This should never happen and indicates a bug in Cabal.")
+
 simpleParse :: Text a => String -> Maybe a
 simpleParse str = case [ p | (p, s) <- Parse.readP_to_S parse str
-                       , all Char.isSpace s ] of
+                       , all isSpace s ] of
   []    -> Nothing
   (p:_) -> Just p
+
+stdParse :: Text ver => (ver -> String -> res) -> Parse.ReadP r res
+stdParse f = do
+  cs   <- Parse.sepBy1 component (Parse.char '-')
+  _    <- Parse.char '-'
+  ver  <- parse
+  let name = intercalate "-" cs
+  return $! f ver (lowercase name)
+  where
+    component = do
+      cs <- Parse.munch1 isAlphaNum
+      if all isDigit cs then Parse.pfail else return cs
+      -- each component must contain an alphabetic character, to avoid
+      -- ambiguity in identifiers like foo-1 (the 1 is the version number).
+
+lowercase :: String -> String
+lowercase = map toLower
 
 -- -----------------------------------------------------------------------------
 -- Instances for types from the base package
@@ -60,7 +94,8 @@ instance Text Int where
 
 -- | Parser for non-negative integers.
 parseNat :: Parse.ReadP r Int
-parseNat = read `fmap` Parse.munch1 Char.isDigit
+parseNat = read `fmap` Parse.munch1 isDigit -- TODO: eradicateNoParse
+
 
 instance Text Version where
   disp (Version branch _tags)     -- Death to version tags!!
@@ -69,5 +104,5 @@ instance Text Version where
   parse = do
       branch <- Parse.sepBy1 parseNat (Parse.char '.')
                 -- allow but ignore tags:
-      _tags  <- Parse.many (Parse.char '-' >> Parse.munch1 Char.isAlphaNum)
+      _tags  <- Parse.many (Parse.char '-' >> Parse.munch1 isAlphaNum)
       return (Version branch [])

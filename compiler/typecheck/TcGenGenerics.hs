@@ -17,12 +17,13 @@ import HsSyn
 import Type
 import TcType
 import TcGenDeriv
+import TcGenFunctor
 import DataCon
 import TyCon
 import FamInstEnv       ( FamInst, FamFlavor(..), mkSingleCoAxiom )
 import FamInst
-import Module           ( Module, moduleName, moduleNameFS
-                        , moduleUnitId, unitIdFS )
+import Module           ( moduleName, moduleNameFS
+                        , moduleUnitId, unitIdFS, getModule )
 import IfaceEnv         ( newGlobalBinder )
 import Name      hiding ( varName )
 import RdrName
@@ -63,10 +64,10 @@ For the generic representation we need to generate:
 \end{itemize}
 -}
 
-gen_Generic_binds :: GenericKind -> TyCon -> Type -> Module
+gen_Generic_binds :: GenericKind -> TyCon -> [Type]
                  -> TcM (LHsBinds RdrName, FamInst)
-gen_Generic_binds gk tc inst_ty mod = do
-  repTyInsts <- tc_mkRepFamInsts gk tc inst_ty mod
+gen_Generic_binds gk tc inst_tys = do
+  repTyInsts <- tc_mkRepFamInsts gk tc inst_tys
   return (mkBindsRep gk tc, repTyInsts)
 
 {-
@@ -135,7 +136,8 @@ canDoGenerics :: TyCon -> Validity
 -- Check (a) from Note [Requirements for deriving Generic and Rep] is taken
 -- care of because canDoGenerics is applied to rep tycons.
 --
--- It returns Nothing if deriving is possible. It returns (Just reason) if not.
+-- It returns IsValid if deriving is possible. It returns (NotValid reason)
+-- if not.
 canDoGenerics tc
   = mergeErrors (
           -- Check (b) from Note [Requirements for deriving Generic and Rep].
@@ -221,7 +223,8 @@ explicitly, even though foldDataConArgs is also doing this internally.
 -- Checks (a) through (c) from Note [Requirements for deriving Generic and Rep]
 -- are taken care of by the call to canDoGenerics.
 --
--- It returns Nothing if deriving is possible. It returns (Just reason) if not.
+-- It returns IsValid if deriving is possible. It returns (NotValid reason)
+-- if not.
 canDoGenerics1 :: TyCon -> Validity
 canDoGenerics1 rep_tc =
   canDoGenerics rep_tc `andValid` additionalChecks
@@ -327,11 +330,12 @@ mkBindsRep gk tycon =
         -- across all cases of a from/to definition, and can be factored out
         -- to save some allocations during typechecking.
         -- See Note [Generics compilation speed tricks]
-        from_eqn = mkSimpleHsAlt x_Pat $ mkM1_E $ nlHsCase x_Expr from_matches
-        to_eqn   = mkSimpleHsAlt (mkM1_P x_Pat) $ nlHsCase x_Expr to_matches
+        from_eqn = mkHsCaseAlt x_Pat $ mkM1_E
+                                       $ nlHsPar $ nlHsCase x_Expr from_matches
+        to_eqn   = mkHsCaseAlt (mkM1_P x_Pat) $ nlHsCase x_Expr to_matches
 
-        from_matches  = [mkSimpleHsAlt pat rhs | (pat,rhs) <- from_alts]
-        to_matches    = [mkSimpleHsAlt pat rhs | (pat,rhs) <- to_alts  ]
+        from_matches  = [mkHsCaseAlt pat rhs | (pat,rhs) <- from_alts]
+        to_matches    = [mkHsCaseAlt pat rhs | (pat,rhs) <- to_alts  ]
         loc           = srcLocSpan (getSrcLoc tycon)
         datacons      = tyConDataCons tycon
 
@@ -354,13 +358,12 @@ mkBindsRep gk tycon =
 --       type Rep_D a b = ...representation type for D ...
 --------------------------------------------------------------------------------
 
-tc_mkRepFamInsts :: GenericKind     -- Gen0 or Gen1
-               -> TyCon           -- The type to generate representation for
-               -> Type            -- The above TyCon applied to its type
-                                  -- arguments in the generated instance
-               -> Module          -- Used as the location of the new RepTy
-               -> TcM (FamInst)   -- Generated representation0 coercion
-tc_mkRepFamInsts gk tycon inst_ty mod =
+tc_mkRepFamInsts :: GenericKind   -- Gen0 or Gen1
+                 -> TyCon         -- The type to generate representation for
+                 -> [Type]        -- The type(s) to which Generic(1) is applied
+                                  -- in the generated instance
+                 -> TcM FamInst   -- Generated representation0 coercion
+tc_mkRepFamInsts gk tycon inst_tys =
        -- Consider the example input tycon `D`, where data D a b = D_ a
        -- Also consider `R:DInt`, where { data family D x y :: * -> *
        --                               ; data instance D Int a b = D_ a }
@@ -370,6 +373,20 @@ tc_mkRepFamInsts gk tycon inst_ty mod =
          Gen1 -> tcLookupTyCon rep1TyConName
 
      ; fam_envs <- tcGetFamInstEnvs
+
+     ; let -- If the derived instance is
+           --   instance Generic (Foo x)
+           -- then:
+           --   `arg_ki` = *, `inst_ty` = Foo x :: *
+           --
+           -- If the derived instance is
+           --   instance Generic1 (Bar x :: k -> *)
+           -- then:
+           --   `arg_k` = k, `inst_ty` = Bar x :: k -> *
+           (arg_ki, inst_ty) = case (gk, inst_tys) of
+             (Gen0, [inst_t])        -> (liftedTypeKind, inst_t)
+             (Gen1, [arg_k, inst_t]) -> (arg_k,          inst_t)
+             _ -> pprPanic "tc_mkRepFamInsts" (ppr inst_tys)
 
      ; let mbFamInst         = tyConFamInst_maybe tycon
            -- If we're examining a data family instance, we grab the parent
@@ -387,27 +404,29 @@ tc_mkRepFamInsts gk tycon inst_ty mod =
              where all_tyvars = tyConTyVars tycon
 
        -- `repTy` = D1 ... (C1 ... (S1 ... (Rec0 a))) :: * -> *
-     ; repTy <- tc_mkRepTy gk_ tycon
+     ; repTy <- tc_mkRepTy gk_ tycon arg_ki
 
        -- `rep_name` is a name we generate for the synonym
-     ; rep_name <- let mkGen = case gk of Gen0 -> mkGenR; Gen1 -> mkGen1R
-                   in newGlobalBinder mod (mkGen (nameOccName (tyConName tycon)))
-                        (nameSrcSpan (tyConName tycon))
+     ; mod <- getModule
+     ; loc <- getSrcSpanM
+     ; let tc_occ  = nameOccName (tyConName tycon)
+           rep_occ = case gk of Gen0 -> mkGenR tc_occ; Gen1 -> mkGen1R tc_occ
+     ; rep_name <- newGlobalBinder mod rep_occ loc
 
        -- We make sure to substitute the tyvars with their user-supplied
        -- type arguments before generating the Rep/Rep1 instance, since some
        -- of the tyvars might have been instantiated when deriving.
        -- See Note [Generating a correctly typed Rep instance].
-     ; let env      = zipTyEnv tyvars inst_args
-           in_scope = mkInScopeSet (tyCoVarsOfType inst_ty)
-           subst    = mkTvSubst in_scope env
-           repTy'   = substTy  subst repTy
-           tcv' = tyCoVarsOfTypeList inst_ty
+     ; let env        = zipTyEnv tyvars inst_args
+           in_scope   = mkInScopeSet (tyCoVarsOfTypes inst_tys)
+           subst      = mkTvSubst in_scope env
+           repTy'     = substTy  subst repTy
+           tcv'       = tyCoVarsOfTypeList inst_ty
            (tv', cv') = partition isTyVar tcv'
-           tvs'     = toposortTyVars tv'
-           cvs'     = toposortTyVars cv'
-           axiom    = mkSingleCoAxiom Nominal rep_name tvs' cvs'
-                                      fam_tc [inst_ty] repTy'
+           tvs'       = toposortTyVars tv'
+           cvs'       = toposortTyVars cv'
+           axiom      = mkSingleCoAxiom Nominal rep_name tvs' cvs'
+                                        fam_tc inst_tys repTy'
 
      ; newFamInst SynFamilyInst axiom  }
 
@@ -484,9 +503,12 @@ tc_mkRepTy ::  -- Gen0_ or Gen1_, for Rep or Rep1
                GenericKind_
               -- The type to generate representation for
             -> TyCon
+              -- The kind of the representation type's argument
+              -- See Note [Handling kinds in a Rep instance]
+            -> Kind
                -- Generated representation0 type
             -> TcM Type
-tc_mkRepTy gk_ tycon =
+tc_mkRepTy gk_ tycon k =
   do
     d1      <- tcLookupTyCon d1TyConName
     c1      <- tcLookupTyCon c1TyConName
@@ -528,27 +550,27 @@ tc_mkRepTy gk_ tycon =
 
     fix_env <- getFixityEnv
 
-    let mkSum' a b = mkTyConApp plus  [a,b]
-        mkProd a b = mkTyConApp times [a,b]
-        mkComp a b = mkTyConApp comp  [a,b]
-        mkRec0 a   = mkBoxTy uAddr uChar uDouble uFloat uInt uWord rec0 a
-        mkRec1 a   = mkTyConApp rec1  [a]
+    let mkSum' a b = mkTyConApp plus  [k,a,b]
+        mkProd a b = mkTyConApp times [k,a,b]
+        mkRec0 a   = mkBoxTy uAddr uChar uDouble uFloat uInt uWord rec0 k a
+        mkRec1 a   = mkTyConApp rec1  [k,a]
         mkPar1     = mkTyConTy  par1
-        mkD    a   = mkTyConApp d1 [ metaDataTy, sumP (tyConDataCons a) ]
-        mkC      a = mkTyConApp c1 [ metaConsTy a
+        mkD    a   = mkTyConApp d1 [ k, metaDataTy, sumP (tyConDataCons a) ]
+        mkC      a = mkTyConApp c1 [ k
+                                   , metaConsTy a
                                    , prod (dataConInstOrigArgTys a
                                             . mkTyVarTys . tyConTyVars $ tycon)
                                           (dataConSrcBangs    a)
                                           (dataConImplBangs   a)
                                           (dataConFieldLabels a)]
-        mkS mlbl su ss ib a = mkTyConApp s1 [metaSelTy mlbl su ss ib, a]
+        mkS mlbl su ss ib a = mkTyConApp s1 [k, metaSelTy mlbl su ss ib, a]
 
         -- Sums and products are done in the same way for both Rep and Rep1
-        sumP [] = mkTyConTy v1
+        sumP [] = mkTyConApp v1 [k]
         sumP l  = foldBal mkSum' . map mkC  $ l
         -- The Bool is True if this constructor has labelled fields
         prod :: [Type] -> [HsSrcBang] -> [HsImplBang] -> [FieldLabel] -> Type
-        prod [] _  _  _  = mkTyConTy u1
+        prod [] _  _  _  = mkTyConApp u1 [k]
         prod l  sb ib fl = foldBal mkProd
                                    [ ASSERT(null fl || length fl > j)
                                      arg t sb' ib' (if null fl
@@ -569,7 +591,7 @@ tc_mkRepTy gk_ tycon =
             -- the presence of composition).
             argPar argVar = argTyFold argVar $ ArgTyAlg
               {ata_rec0 = mkRec0, ata_par1 = mkPar1,
-               ata_rec1 = mkRec1, ata_comp = mkComp}
+               ata_rec1 = mkRec1, ata_comp = mkComp comp k}
 
         tyConName_user = case tyConFamInst_maybe tycon of
                            Just (ptycon, _) -> tyConName ptycon
@@ -627,6 +649,21 @@ tc_mkRepTy gk_ tycon =
 
     return (mkD tycon)
 
+mkComp :: TyCon -> Kind -> Type -> Type -> Type
+mkComp comp k f g
+  | k1_first  = mkTyConApp comp  [k,liftedTypeKind,f,g]
+  | otherwise = mkTyConApp comp  [liftedTypeKind,k,f,g]
+  where
+    -- Which of these is the case?
+    --     newtype (:.:) {k1} {k2} (f :: k2->*) (g :: k1->k2) (p :: k1) = ...
+    -- or  newtype (:.:) {k2} {k1} (f :: k2->*) (g :: k1->k2) (p :: k1) = ...
+    -- We want to instantiate with k1=k, and k2=*
+    --    Reason for k2=*: see Note [Handling kinds in a Rep instance]
+    -- But we need to know which way round!
+    k1_first = k_first == p_kind_var
+    [k_first,_,_,_,p] = tyConTyVars comp
+    Just p_kind_var = getTyVar_maybe (tyVarKind p)
+
 -- Given the TyCons for each URec-related type synonym, check to see if the
 -- given type is an unlifted type that generics understands. If so, return
 -- its representation type. Otherwise, return Rec0.
@@ -638,16 +675,17 @@ mkBoxTy :: TyCon -- UAddr
         -> TyCon -- UInt
         -> TyCon -- UWord
         -> TyCon -- Rec0
+        -> Kind  -- What to instantiate Rec0's kind variable with
         -> Type
         -> Type
-mkBoxTy uAddr uChar uDouble uFloat uInt uWord rec0 ty
-  | ty `eqType` addrPrimTy   = mkTyConTy uAddr
-  | ty `eqType` charPrimTy   = mkTyConTy uChar
-  | ty `eqType` doublePrimTy = mkTyConTy uDouble
-  | ty `eqType` floatPrimTy  = mkTyConTy uFloat
-  | ty `eqType` intPrimTy    = mkTyConTy uInt
-  | ty `eqType` wordPrimTy   = mkTyConTy uWord
-  | otherwise                = mkTyConApp rec0 [ty]
+mkBoxTy uAddr uChar uDouble uFloat uInt uWord rec0 k ty
+  | ty `eqType` addrPrimTy   = mkTyConApp uAddr   [k]
+  | ty `eqType` charPrimTy   = mkTyConApp uChar   [k]
+  | ty `eqType` doublePrimTy = mkTyConApp uDouble [k]
+  | ty `eqType` floatPrimTy  = mkTyConApp uFloat  [k]
+  | ty `eqType` intPrimTy    = mkTyConApp uInt    [k]
+  | ty `eqType` wordPrimTy   = mkTyConApp uWord   [k]
+  | otherwise                = mkTyConApp rec0    [k,ty]
 
 --------------------------------------------------------------------------------
 -- Dealing with sums
@@ -723,8 +761,8 @@ genLR_P :: Int -> Int -> LPat RdrName -> LPat RdrName
 genLR_P i n p
   | n == 0       = error "impossible"
   | n == 1       = p
-  | i <= div n 2 = nlConPat l1DataCon_RDR [genLR_P i     (div n 2) p]
-  | otherwise    = nlConPat r1DataCon_RDR [genLR_P (i-m) (n-m)     p]
+  | i <= div n 2 = nlParPat $ nlConPat l1DataCon_RDR [genLR_P i     (div n 2) p]
+  | otherwise    = nlParPat $ nlConPat r1DataCon_RDR [genLR_P (i-m) (n-m)     p]
                      where m = div n 2
 
 -- Generates the L1/R1 sum expression
@@ -732,8 +770,10 @@ genLR_E :: Int -> Int -> LHsExpr RdrName -> LHsExpr RdrName
 genLR_E i n e
   | n == 0       = error "impossible"
   | n == 1       = e
-  | i <= div n 2 = nlHsVar l1DataCon_RDR `nlHsApp` genLR_E i     (div n 2) e
-  | otherwise    = nlHsVar r1DataCon_RDR `nlHsApp` genLR_E (i-m) (n-m)     e
+  | i <= div n 2 = nlHsVar l1DataCon_RDR `nlHsApp`
+                                            nlHsPar (genLR_E i     (div n 2) e)
+  | otherwise    = nlHsVar r1DataCon_RDR `nlHsApp`
+                                            nlHsPar (genLR_E (i-m) (n-m)     e)
                      where m = div n 2
 
 --------------------------------------------------------------------------------
@@ -795,12 +835,12 @@ mkProd_P gk _ varTys = mkM1_P (foldBal prod appVars)
                      -- These M1s are meta-information for the constructor
   where
     appVars = unzipWith (wrapArg_P gk) varTys
-    prod a b = prodDataCon_RDR `nlConPat` [a,b]
+    prod a b = nlParPat $ prodDataCon_RDR `nlConPat` [a,b]
 
 wrapArg_P :: GenericKind -> RdrName -> Type -> LPat RdrName
-wrapArg_P Gen0 v ty = mkM1_P (boxRepRDR ty `nlConVarPat` [v])
+wrapArg_P Gen0 v ty = mkM1_P (nlParPat $ boxRepRDR ty `nlConVarPat` [v])
                    -- This M1 is meta-information for the selector
-wrapArg_P Gen1 v _  = m1DataCon_RDR `nlConVarPat` [v]
+wrapArg_P Gen1 v _  = nlParPat $ m1DataCon_RDR `nlConVarPat` [v]
 
 mkGenericLocal :: US -> RdrName
 mkGenericLocal u = mkVarUnqual (mkFastString ("g" ++ show u))
@@ -818,7 +858,7 @@ mkM1_E :: LHsExpr RdrName -> LHsExpr RdrName
 mkM1_E e = nlHsVar m1DataCon_RDR `nlHsApp` e
 
 mkM1_P :: LPat RdrName -> LPat RdrName
-mkM1_P p = m1DataCon_RDR `nlConPat` [p]
+mkM1_P p = nlParPat $ m1DataCon_RDR `nlConPat` [p]
 
 nlHsCompose :: LHsExpr RdrName -> LHsExpr RdrName -> LHsExpr RdrName
 nlHsCompose x y = compose_RDR `nlHsApps` [x, y]

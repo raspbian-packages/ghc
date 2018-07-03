@@ -1,5 +1,5 @@
 name:          process
-version:       1.4.3.0
+version:       1.6.1.0
 -- NOTE: Don't forget to update ./changelog.md
 license:       BSD3
 license-file:  LICENSE
@@ -11,6 +11,12 @@ build-type:    Configure
 cabal-version: >=1.10
 description:
     This package contains libraries for dealing with system processes.
+    .
+    The typed-process package is a more recent take on a process API,
+    which uses this package internally. It features better binary
+    support, easier concurrency, and a more composable API. You can
+    read more about it at
+    <https://haskell-lang.org/library/typed-process>.
 
 extra-source-files:
     aclocal.m4
@@ -50,7 +56,7 @@ library
     other-modules: System.Process.Common
     if os(windows)
         other-modules: System.Process.Windows
-        build-depends: Win32 >=2.2 && < 2.4
+        build-depends: Win32 >=2.2 && < 2.6
         extra-libraries: kernel32
         cpp-options: -DWINDOWS
     else
@@ -82,3 +88,5 @@ test-suite test
                , bytestring
                , directory
                , process
+  ghc-options: -threaded
+               -with-rtsopts "-N"

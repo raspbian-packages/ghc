@@ -13,7 +13,6 @@ Datatype for: @BindGroup@, @Bind@, @Sig@, @Bind@.
 {-# LANGUAGE UndecidableInstances #-} -- Note [Pass sensitive types]
                                       -- in module PlaceHolder
 {-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE CPP #-}
 {-# LANGUAGE BangPatterns #-}
 
 module HsBinds where
@@ -23,7 +22,7 @@ import {-# SOURCE #-} HsExpr ( pprExpr, LHsExpr,
                                GRHSs, pprPatBind )
 import {-# SOURCE #-} HsPat  ( LPat )
 
-import PlaceHolder ( PostTc,PostRn,DataId )
+import PlaceHolder ( PostTc,PostRn,DataId,OutputableBndrId )
 import HsTypes
 import PprCore ()
 import CoreSyn
@@ -44,11 +43,6 @@ import Data.Data hiding ( Fixity )
 import Data.List hiding ( foldr )
 import Data.Ord
 import Data.Foldable ( Foldable(..) )
-#if __GLASGOW_HASKELL__ < 709
-import Data.Traversable ( Traversable(..) )
-import Data.Monoid ( mappend )
-import Control.Applicative hiding (empty)
-#endif
 
 {-
 ************************************************************************
@@ -66,59 +60,113 @@ Global bindings (where clauses)
 -- one for the left and one for the right.
 -- Other than during renaming, these will be the same.
 
+-- | Haskell Local Bindings
 type HsLocalBinds id = HsLocalBindsLR id id
 
--- | Bindings in a 'let' expression
+-- | Located Haskell local bindings
+type LHsLocalBinds id = Located (HsLocalBinds id)
+
+-- | Haskell Local Bindings with separate Left and Right identifier types
+--
+-- Bindings in a 'let' expression
 -- or a 'where' clause
 data HsLocalBindsLR idL idR
   = HsValBinds (HsValBindsLR idL idR)
+      -- ^ Haskell Value Bindings
+
          -- There should be no pattern synonyms in the HsValBindsLR
          -- These are *local* (not top level) bindings
          -- The parser accepts them, however, leaving the the
          -- renamer to report them
 
   | HsIPBinds  (HsIPBinds idR)
+      -- ^ Haskell Implicit Parameter Bindings
 
   | EmptyLocalBinds
-  deriving (Typeable)
+      -- ^ Empty Local Bindings
+
+type LHsLocalBindsLR idL idR = Located (HsLocalBindsLR idL idR)
 
 deriving instance (DataId idL, DataId idR)
   => Data (HsLocalBindsLR idL idR)
 
+-- | Haskell Value Bindings
 type HsValBinds id = HsValBindsLR id id
 
--- | Value bindings (not implicit parameters)
+-- | Haskell Value bindings with separate Left and Right identifier types
+-- (not implicit parameters)
 -- Used for both top level and nested bindings
 -- May contain pattern synonym bindings
 data HsValBindsLR idL idR
-  = -- | Before renaming RHS; idR is always RdrName
+  = -- | Value Bindings In
+    --
+    -- Before renaming RHS; idR is always RdrName
     -- Not dependency analysed
     -- Recursive by default
     ValBindsIn
         (LHsBindsLR idL idR) [LSig idR]
 
-    -- | After renaming RHS; idR can be Name or Id
-    --  Dependency analysed,
-    -- later bindings in the list may depend on earlier
-    -- ones.
+    -- | Value Bindings Out
+    --
+    -- After renaming RHS; idR can be Name or Id Dependency analysed,
+    -- later bindings in the list may depend on earlier ones.
   | ValBindsOut
         [(RecFlag, LHsBinds idL)]
         [LSig Name]
-  deriving (Typeable)
 
 deriving instance (DataId idL, DataId idR)
   => Data (HsValBindsLR idL idR)
 
+-- | Located Haskell Binding
 type LHsBind  id = LHsBindLR  id id
+
+-- | Located Haskell Bindings
 type LHsBinds id = LHsBindsLR id id
+
+-- | Haskell Binding
 type HsBind   id = HsBindLR   id id
 
+-- | Located Haskell Bindings with separate Left and Right identifier types
 type LHsBindsLR idL idR = Bag (LHsBindLR idL idR)
+
+-- | Located Haskell Binding with separate Left and Right identifier types
 type LHsBindLR  idL idR = Located (HsBindLR idL idR)
 
+{- Note [Varieties of binding pattern matches]
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The distinction between FunBind and PatBind is a bit subtle. FunBind covers
+patterns which resemble function bindings and simple variable bindings.
+
+    f x = e
+    f !x = e
+    f = e
+    !x = e          -- FunRhs has SrcStrict
+    x `f` y = e     -- FunRhs has Infix
+
+The actual patterns and RHSs of a FunBind are encoding in fun_matches.
+The m_ctxt field of Match will be FunRhs and carries two bits of information
+about the match,
+
+  * the mc_strictness field describes whether the match is decorated with a bang
+    (e.g. `!x = e`)
+  * the mc_fixity field describes the fixity of the function binder
+
+By contrast, PatBind represents data constructor patterns, as well as a few
+other interesting cases. Namely,
+
+    Just x = e
+    (x) = e
+    x :: Ty = e
+-}
+
+-- | Haskell Binding with separate Left and Right id's
 data HsBindLR idL idR
-  = -- | FunBind is used for both functions   @f x = e@
+  = -- | Function-like Binding
+    --
+    -- FunBind is used for both functions     @f x = e@
     -- and variables                          @f = \x -> e@
+    -- and strict variables                   @!x = x + 1@
     --
     -- Reason 1: Special case for type inference: see 'TcBinds.tcMonoBinds'.
     --
@@ -128,6 +176,10 @@ data HsBindLR idL idR
     -- But note that the form                 @f :: a->a = ...@
     -- parses as a pattern binding, just like
     --                                        @(f :: a -> a) = ... @
+    --
+    -- Strict bindings have their strictness recorded in the 'SrcStrictness' of their
+    -- 'MatchContext'. See Note [Varieties of binding pattern matches] for
+    -- details about the relationship between FunBind and PatBind.
     --
     --  'ApiAnnotation.AnnKeywordId's
     --
@@ -166,8 +218,13 @@ data HsBindLR idL idR
         fun_tick :: [Tickish Id]  -- ^ Ticks to put on the rhs, if any
     }
 
-  -- | The pattern is never a simple variable;
-  -- That case is done by FunBind
+  -- | Pattern Binding
+  --
+  -- The pattern is never a simple variable;
+  -- That case is done by FunBind.
+  -- See Note [Varieties of binding pattern matches] for details about the
+  -- relationship between FunBind and PatBind.
+
   --
   --  - 'ApiAnnotation.AnnKeywordId' : 'ApiAnnotation.AnnBang',
   --       'ApiAnnotation.AnnEqual','ApiAnnotation.AnnWhere',
@@ -184,7 +241,9 @@ data HsBindLR idL idR
                -- the bound variables.
     }
 
-  -- | Dictionary binding and suchlike.
+  -- | Variable Binding
+  --
+  -- Dictionary binding and suchlike.
   -- All VarBinds are introduced by the type checker
   | VarBind {
         var_id     :: idL,
@@ -193,6 +252,7 @@ data HsBindLR idL idR
                                      -- (used for implication constraints only)
     }
 
+  -- | Abstraction Bindings
   | AbsBinds {                      -- Binds abstraction; TRANSLATION
         abs_tvs     :: [TyVar],
         abs_ev_vars :: [EvVar],  -- ^ Includes equality constraints
@@ -211,6 +271,7 @@ data HsBindLR idL idR
         abs_binds    :: LHsBinds idL
     }
 
+  -- | Abstraction Bindings Signature
   | AbsBindsSig {  -- Simpler form of AbsBinds, used with a type sig
                    -- in tcPolyCheck. Produces simpler desugaring and
                    -- is necessary to avoid #11405, comment:3.
@@ -225,6 +286,7 @@ data HsBindLR idL idR
                                        -- FunBind
     }
 
+  -- | Patterns Synonym Binding
   | PatSynBind (PatSynBind idL idR)
         -- ^ - 'ApiAnnotation.AnnKeywordId' : 'ApiAnnotation.AnnPattern',
         --          'ApiAnnotation.AnnLarrow','ApiAnnotation.AnnEqual',
@@ -233,7 +295,6 @@ data HsBindLR idL idR
 
         -- For details on above see note [Api annotations] in ApiAnnotation
 
-  deriving (Typeable)
 deriving instance (DataId idL, DataId idR)
   => Data (HsBindLR idL idR)
 
@@ -249,13 +310,14 @@ deriving instance (DataId idL, DataId idR)
         --
         -- See Note [AbsBinds]
 
+-- | Abtraction Bindings Export
 data ABExport id
   = ABE { abe_poly      :: id    -- ^ Any INLINE pragmas is attached to this Id
         , abe_mono      :: id
         , abe_wrap      :: HsWrapper    -- ^ See Note [ABExport wrapper]
              -- Shape: (forall abs_tvs. abs_ev_vars => abe_mono) ~ abe_poly
         , abe_prags     :: TcSpecPrags  -- ^ SPECIALISE pragmas
-  } deriving (Data, Typeable)
+  } deriving Data
 
 -- | - 'ApiAnnotation.AnnKeywordId' : 'ApiAnnotation.AnnPattern',
 --             'ApiAnnotation.AnnEqual','ApiAnnotation.AnnLarrow'
@@ -263,13 +325,15 @@ data ABExport id
 --             'ApiAnnotation.AnnClose' @'}'@,
 
 -- For details on above see note [Api annotations] in ApiAnnotation
+
+-- | Pattern Synonym binding
 data PatSynBind idL idR
   = PSB { psb_id   :: Located idL,             -- ^ Name of the pattern synonym
           psb_fvs  :: PostRn idR NameSet,      -- ^ See Note [Bind free vars]
           psb_args :: HsPatSynDetails (Located idR), -- ^ Formal parameter names
           psb_def  :: LPat idR,                      -- ^ Right-hand side
           psb_dir  :: HsPatSynDir idR                -- ^ Directionality
-  } deriving (Typeable)
+  }
 deriving instance (DataId idL, DataId idR)
   => Data (PatSynBind idL idR)
 
@@ -391,13 +455,17 @@ variables.  The action happens in TcBinds.mkExport.
 Note [Bind free vars]
 ~~~~~~~~~~~~~~~~~~~~~
 The bind_fvs field of FunBind and PatBind records the free variables
-of the definition.  It is used for two purposes
+of the definition.  It is used for the following purposes
 
 a) Dependency analysis prior to type checking
     (see TcBinds.tc_group)
 
 b) Deciding whether we can do generalisation of the binding
     (see TcBinds.decideGeneralisationPlan)
+
+c) Deciding whether the binding can be used in static forms
+    (see TcExpr.checkClosedInStaticForm for the HsStatic case and
+     TcBinds.isClosedBndrGroup).
 
 Specifically,
 
@@ -410,12 +478,14 @@ Specifically,
     it's just an error thunk
 -}
 
-instance (OutputableBndr idL, OutputableBndr idR) => Outputable (HsLocalBindsLR idL idR) where
+instance (OutputableBndrId idL, OutputableBndrId idR)
+        => Outputable (HsLocalBindsLR idL idR) where
   ppr (HsValBinds bs) = ppr bs
   ppr (HsIPBinds bs)  = ppr bs
   ppr EmptyLocalBinds = empty
 
-instance (OutputableBndr idL, OutputableBndr idR) => Outputable (HsValBindsLR idL idR) where
+instance (OutputableBndrId idL, OutputableBndrId idR)
+        => Outputable (HsValBindsLR idL idR) where
   ppr (ValBindsIn binds sigs)
    = pprDeclList (pprLHsBindsForUser binds sigs)
 
@@ -430,12 +500,14 @@ instance (OutputableBndr idL, OutputableBndr idR) => Outputable (HsValBindsLR id
      pp_rec Recursive    = text "rec"
      pp_rec NonRecursive = text "nonrec"
 
-pprLHsBinds :: (OutputableBndr idL, OutputableBndr idR) => LHsBindsLR idL idR -> SDoc
+pprLHsBinds :: (OutputableBndrId idL, OutputableBndrId idR)
+            => LHsBindsLR idL idR -> SDoc
 pprLHsBinds binds
   | isEmptyLHsBinds binds = empty
   | otherwise = pprDeclList (map ppr (bagToList binds))
 
-pprLHsBindsForUser :: (OutputableBndr idL, OutputableBndr idR, OutputableBndr id2)
+pprLHsBindsForUser :: (OutputableBndrId idL, OutputableBndrId idR,
+                       OutputableBndrId id2)
                    => LHsBindsLR idL idR -> [LSig id2] -> [SDoc]
 --  pprLHsBindsForUser is different to pprLHsBinds because
 --  a) No braces: 'let' and 'where' include a list of HsBindGroups
@@ -473,6 +545,10 @@ isEmptyLocalBinds (HsValBinds ds) = isEmptyValBinds ds
 isEmptyLocalBinds (HsIPBinds ds)  = isEmptyIPBinds ds
 isEmptyLocalBinds EmptyLocalBinds = True
 
+eqEmptyLocalBinds :: HsLocalBindsLR a b -> Bool
+eqEmptyLocalBinds EmptyLocalBinds = True
+eqEmptyLocalBinds _               = False
+
 isEmptyValBinds :: HsValBindsLR a b -> Bool
 isEmptyValBinds (ValBindsIn ds sigs)  = isEmptyLHsBinds ds && null sigs
 isEmptyValBinds (ValBindsOut ds sigs) = null ds && null sigs
@@ -495,7 +571,6 @@ plusHsValBinds (ValBindsOut ds1 sigs1) (ValBindsOut ds2 sigs2)
   = ValBindsOut (ds1 ++ ds2) (sigs1 ++ sigs2)
 plusHsValBinds _ _
   = panic "HsBinds.plusHsValBinds"
-
 
 {-
 What AbsBinds means
@@ -523,15 +598,17 @@ So the desugarer tries to do a better job:
                                       in (fm,gm)
 -}
 
-instance (OutputableBndr idL, OutputableBndr idR) => Outputable (HsBindLR idL idR) where
+instance (OutputableBndrId idL, OutputableBndrId idR)
+         => Outputable (HsBindLR idL idR) where
     ppr mbind = ppr_monobind mbind
 
-ppr_monobind :: (OutputableBndr idL, OutputableBndr idR) => HsBindLR idL idR -> SDoc
+ppr_monobind :: (OutputableBndrId idL, OutputableBndrId idR)
+             => HsBindLR idL idR -> SDoc
 
 ppr_monobind (PatBind { pat_lhs = pat, pat_rhs = grhss })
   = pprPatBind pat grhss
 ppr_monobind (VarBind { var_id = var, var_rhs = rhs })
-  = sep [pprBndr CaseBind var, nest 2 $ equals <+> pprExpr (unLoc rhs)]
+  = sep [pprBndr CasePatBind var, nest 2 $ equals <+> pprExpr (unLoc rhs)]
 ppr_monobind (FunBind { fun_id = fun,
                         fun_co_fn = wrap,
                         fun_matches = matches,
@@ -539,7 +616,7 @@ ppr_monobind (FunBind { fun_id = fun,
   = pprTicks empty (if null ticks then empty
                     else text "-- ticks = " <> ppr ticks)
     $$  ifPprDebug (pprBndr LetBind (unLoc fun))
-    $$  pprFunBind (unLoc fun) matches
+    $$  pprFunBind  matches
     $$  ifPprDebug (ppr wrap)
 ppr_monobind (PatSynBind psb) = ppr psb
 ppr_monobind (AbsBinds { abs_tvs = tyvars, abs_ev_vars = dictvars
@@ -561,6 +638,7 @@ ppr_monobind (AbsBinds { abs_tvs = tyvars, abs_ev_vars = dictvars
       pprLHsBinds val_binds
 ppr_monobind (AbsBindsSig { abs_tvs         = tyvars
                           , abs_ev_vars     = dictvars
+                          , abs_sig_export  = poly_id
                           , abs_sig_ev_bind = ev_bind
                           , abs_sig_bind    = bind })
   = sdocWithDynFlags $ \ dflags ->
@@ -568,7 +646,8 @@ ppr_monobind (AbsBindsSig { abs_tvs         = tyvars
       hang (text "AbsBindsSig" <+> brackets (interpp'SP tyvars)
                                <+> brackets (interpp'SP dictvars))
          2 $ braces $ vcat
-      [ text "Bind:"     <+> ppr bind
+      [ text "Exported type:" <+> pprBndr LetBind poly_id
+      , text "Bind:"     <+> ppr bind
       , text "Evidence:" <+> ppr ev_bind ]
     else
       ppr bind
@@ -579,8 +658,10 @@ instance (OutputableBndr id) => Outputable (ABExport id) where
            , nest 2 (pprTcSpecPrags prags)
            , nest 2 (text "wrap:" <+> ppr wrap)]
 
-instance (OutputableBndr idL, OutputableBndr idR) => Outputable (PatSynBind idL idR) where
-  ppr (PSB{ psb_id = L _ psyn, psb_args = details, psb_def = pat, psb_dir = dir })
+instance (OutputableBndr idL, OutputableBndrId idR)
+          => Outputable (PatSynBind idL idR) where
+  ppr (PSB{ psb_id = (L _ psyn), psb_args = details, psb_def = pat,
+            psb_dir = dir })
       = ppr_lhs <+> ppr_rhs
     where
       ppr_lhs = text "pattern" <+> ppr_details
@@ -597,7 +678,7 @@ instance (OutputableBndr idL, OutputableBndr idR) => Outputable (PatSynBind idL 
           Unidirectional           -> ppr_simple (text "<-")
           ImplicitBidirectional    -> ppr_simple equals
           ExplicitBidirectional mg -> ppr_simple (text "<-") <+> ptext (sLit "where") $$
-                                      (nest 2 $ pprFunBind psyn mg)
+                                      (nest 2 $ pprFunBind mg)
 
 pprTicks :: SDoc -> SDoc -> SDoc
 -- Print stuff about ticks only when -dppr-debug is on, to avoid
@@ -617,17 +698,18 @@ pprTicks pp_no_debug pp_when_debug
 ************************************************************************
 -}
 
+-- | Haskell Implicit Parameter Bindings
 data HsIPBinds id
   = IPBinds
         [LIPBind id]
         TcEvBinds       -- Only in typechecker output; binds
                         -- uses of the implicit parameters
-  deriving (Typeable)
 deriving instance (DataId id) => Data (HsIPBinds id)
 
 isEmptyIPBinds :: HsIPBinds id -> Bool
 isEmptyIPBinds (IPBinds is ds) = null is && isEmptyTcEvBinds ds
 
+-- | Located Implicit Parameter Binding
 type LIPBind id = Located (IPBind id)
 -- ^ May have 'ApiAnnotation.AnnKeywordId' : 'ApiAnnotation.AnnSemi' when in a
 --   list
@@ -646,14 +728,13 @@ type LIPBind id = Located (IPBind id)
 -- For details on above see note [Api annotations] in ApiAnnotation
 data IPBind id
   = IPBind (Either (Located HsIPName) id) (LHsExpr id)
-  deriving (Typeable)
 deriving instance (DataId name) => Data (IPBind name)
 
-instance (OutputableBndr id) => Outputable (HsIPBinds id) where
+instance (OutputableBndrId id ) => Outputable (HsIPBinds id) where
   ppr (IPBinds bs ds) = pprDeeperList vcat (map ppr bs)
                         $$ ifPprDebug (ppr ds)
 
-instance (OutputableBndr id) => Outputable (IPBind id) where
+instance (OutputableBndrId id ) => Outputable (IPBind id) where
   ppr (IPBind lr rhs) = name <+> equals <+> pprExpr (unLoc rhs)
     where name = case lr of
                    Left (L _ ip) -> pprBndr LetBind ip
@@ -672,6 +753,7 @@ signatures.  Then all the machinery to move them into place, etc.,
 serves for both.
 -}
 
+-- | Located Signature
 type LSig name = Located (Sig name)
 
 -- | Signatures and pragmas
@@ -705,12 +787,12 @@ data Sig name
       --           'ApiAnnotation.AnnDot','ApiAnnotation.AnnDarrow'
 
       -- For details on above see note [Api annotations] in ApiAnnotation
-  | PatSynSig (Located name) (LHsSigType name)
+  | PatSynSig [Located name] (LHsSigType name)
       -- P :: forall a b. Req => Prov => ty
 
       -- | A signature for a class method
       --   False: ordinary class-method signature
-      --   True:  default class method signature
+      --   True:  generic-default class method signature
       -- e.g.   class C a where
       --          op :: a -> a                   -- Ordinary
       --          default op :: Eq a => a -> a   -- Generic default
@@ -796,23 +878,48 @@ data Sig name
   | MinimalSig SourceText (LBooleanFormula (Located name))
                -- Note [Pragma source text] in BasicTypes
 
-  deriving (Typeable)
+        -- | A "set cost centre" pragma for declarations
+        --
+        -- > {-# SCC funName #-}
+        --
+        -- or
+        --
+        -- > {-# SCC funName "cost_centre_name" #-}
+
+  | SCCFunSig  SourceText      -- Note [Pragma source text] in BasicTypes
+               (Located name)  -- Function name
+               (Maybe (Located StringLiteral))
+       -- | A complete match pragma
+       --
+       -- > {-# COMPLETE C, D [:: T] #-}
+       --
+       -- Used to inform the pattern match checker about additional
+       -- complete matchings which, for example, arise from pattern
+       -- synonym definitions.
+  | CompleteMatchSig SourceText (Located [Located name]) (Maybe (Located name))
+
 deriving instance (DataId name) => Data (Sig name)
 
-
+-- | Located Fixity Signature
 type LFixitySig name = Located (FixitySig name)
-data FixitySig name = FixitySig [Located name] Fixity
-  deriving (Data, Typeable)
 
--- | TsSpecPrags conveys pragmas from the type checker to the desugarer
+-- | Fixity Signature
+data FixitySig name = FixitySig [Located name] Fixity
+  deriving Data
+
+-- | Type checker Specialisation Pragmas
+--
+-- 'TcSpecPrags' conveys @SPECIALISE@ pragmas from the type checker to the desugarer
 data TcSpecPrags
   = IsDefaultMethod     -- ^ Super-specialised: a default method should
                         -- be macro-expanded at every call site
   | SpecPrags [LTcSpecPrag]
-  deriving (Data, Typeable)
+  deriving Data
 
+-- | Located Type checker Specification Pragmas
 type LTcSpecPrag = Located TcSpecPrag
 
+-- | Type checker Specification Pragma
 data TcSpecPrag
   = SpecPrag
         Id
@@ -820,7 +927,7 @@ data TcSpecPrag
         InlinePragma
   -- ^ The Id to be specialised, an wrapper that specialises the
   -- polymorphic function, and inlining spec for the specialised function
-  deriving (Data, Typeable)
+  deriving Data
 
 noSpecPrags :: TcSpecPrags
 noSpecPrags = SpecPrags []
@@ -856,6 +963,8 @@ isPragLSig :: LSig name -> Bool
 -- Identifies pragmas
 isPragLSig (L _ (SpecSig {}))   = True
 isPragLSig (L _ (InlineSig {})) = True
+isPragLSig (L _ (SCCFunSig {})) = True
+isPragLSig (L _ (CompleteMatchSig {})) = True
 isPragLSig _                    = False
 
 isInlineLSig :: LSig name -> Bool
@@ -865,7 +974,15 @@ isInlineLSig _                    = False
 
 isMinimalLSig :: LSig name -> Bool
 isMinimalLSig (L _ (MinimalSig {})) = True
-isMinimalLSig _                    = False
+isMinimalLSig _                     = False
+
+isSCCFunSig :: LSig name -> Bool
+isSCCFunSig (L _ (SCCFunSig {})) = True
+isSCCFunSig _                    = False
+
+isCompleteMatchSig :: LSig name -> Bool
+isCompleteMatchSig (L _ (CompleteMatchSig {} )) = True
+isCompleteMatchSig _                            = False
 
 hsSigDoc :: Sig name -> SDoc
 hsSigDoc (TypeSig {})           = text "type signature"
@@ -879,6 +996,8 @@ hsSigDoc (InlineSig _ prag)     = ppr (inlinePragmaSpec prag) <+> text "pragma"
 hsSigDoc (SpecInstSig {})       = text "SPECIALISE instance pragma"
 hsSigDoc (FixSig {})            = text "fixity declaration"
 hsSigDoc (MinimalSig {})        = text "MINIMAL pragma"
+hsSigDoc (SCCFunSig {})         = text "SCC pragma"
+hsSigDoc (CompleteMatchSig {})  = text "COMPLETE pragma"
 
 {-
 Check if signatures overlap; this is used when checking for duplicate
@@ -886,25 +1005,40 @@ signatures. Since some of the signatures contain a list of names, testing for
 equality is not enough -- we have to check if they overlap.
 -}
 
-instance (OutputableBndr name) => Outputable (Sig name) where
+instance (OutputableBndrId name ) => Outputable (Sig name) where
     ppr sig = ppr_sig sig
 
-ppr_sig :: OutputableBndr name => Sig name -> SDoc
+ppr_sig :: (OutputableBndrId name ) => Sig name -> SDoc
 ppr_sig (TypeSig vars ty)    = pprVarSig (map unLoc vars) (ppr ty)
 ppr_sig (ClassOpSig is_deflt vars ty)
   | is_deflt                 = text "default" <+> pprVarSig (map unLoc vars) (ppr ty)
   | otherwise                = pprVarSig (map unLoc vars) (ppr ty)
 ppr_sig (IdSig id)           = pprVarSig [id] (ppr (varType id))
 ppr_sig (FixSig fix_sig)     = ppr fix_sig
-ppr_sig (SpecSig var ty inl)
-  = pragBrackets (pprSpec (unLoc var) (interpp'SP ty) inl)
-ppr_sig (InlineSig var inl)       = pragBrackets (ppr inl <+> pprPrefixOcc (unLoc var))
-ppr_sig (SpecInstSig _ ty)
-  = pragBrackets (text "SPECIALIZE instance" <+> ppr ty)
-ppr_sig (MinimalSig _ bf)         = pragBrackets (pprMinimalSig bf)
-ppr_sig (PatSynSig name sig_ty)
-  = text "pattern" <+> pprPrefixOcc (unLoc name) <+> dcolon
-                           <+> ppr sig_ty
+ppr_sig (SpecSig var ty inl@(InlinePragma { inl_inline = spec }))
+  = pragSrcBrackets (inl_src inl) pragmaSrc (pprSpec (unLoc var)
+                                             (interpp'SP ty) inl)
+    where
+      pragmaSrc = case spec of
+        EmptyInlineSpec -> "{-# SPECIALISE"
+        _               -> "{-# SPECIALISE_INLINE"
+ppr_sig (InlineSig var inl)
+  = pragSrcBrackets (inl_src inl) "{-# INLINE"  (pprInline inl
+                                   <+> pprPrefixOcc (unLoc var))
+ppr_sig (SpecInstSig src ty)
+  = pragSrcBrackets src "{-# SPECIALISE" (text "instance" <+> ppr ty)
+ppr_sig (MinimalSig src bf)
+  = pragSrcBrackets src "{-# MINIMAL" (pprMinimalSig bf)
+ppr_sig (PatSynSig names sig_ty)
+  = text "pattern" <+> pprVarSig (map unLoc names) (ppr sig_ty)
+ppr_sig (SCCFunSig src fn mlabel)
+  = pragSrcBrackets src "{-# SCC" (ppr fn <+> maybe empty ppr mlabel )
+ppr_sig (CompleteMatchSig src cs mty)
+  = pragSrcBrackets src "{-# COMPLETE"
+      ((hsep (punctuate comma (map ppr (unLoc cs))))
+        <+> opt_sig)
+  where
+    opt_sig = maybe empty ((\t -> dcolon <+> ppr t) . unLoc) mty
 
 instance OutputableBndr name => Outputable (FixitySig name) where
   ppr (FixitySig names fixity) = sep [ppr fixity, pprops]
@@ -912,7 +1046,13 @@ instance OutputableBndr name => Outputable (FixitySig name) where
       pprops = hsep $ punctuate comma (map (pprInfixOcc . unLoc) names)
 
 pragBrackets :: SDoc -> SDoc
-pragBrackets doc = text "{-#" <+> doc <+> ptext (sLit "#-}")
+pragBrackets doc = text "{-#" <+> doc <+> text "#-}"
+
+-- | Using SourceText in case the pragma was spelled differently or used mixed
+-- case
+pragSrcBrackets :: SourceText -> String -> SDoc -> SDoc
+pragSrcBrackets (SourceText src) _   doc = text src <+> doc <+> text "#-}"
+pragSrcBrackets NoSourceText     alt doc = text alt <+> doc <+> text "#-}"
 
 pprVarSig :: (OutputableBndr id) => [id] -> SDoc -> SDoc
 pprVarSig vars pp_ty = sep [pprvars <+> dcolon, nest 2 pp_ty]
@@ -920,20 +1060,22 @@ pprVarSig vars pp_ty = sep [pprvars <+> dcolon, nest 2 pp_ty]
     pprvars = hsep $ punctuate comma (map pprPrefixOcc vars)
 
 pprSpec :: (OutputableBndr id) => id -> SDoc -> InlinePragma -> SDoc
-pprSpec var pp_ty inl = text "SPECIALIZE" <+> pp_inl <+> pprVarSig [var] pp_ty
+pprSpec var pp_ty inl = pp_inl <+> pprVarSig [var] pp_ty
   where
     pp_inl | isDefaultInlinePragma inl = empty
-           | otherwise = ppr inl
+           | otherwise = pprInline inl
 
 pprTcSpecPrags :: TcSpecPrags -> SDoc
 pprTcSpecPrags IsDefaultMethod = text "<default method>"
 pprTcSpecPrags (SpecPrags ps)  = vcat (map (ppr . unLoc) ps)
 
 instance Outputable TcSpecPrag where
-  ppr (SpecPrag var _ inl) = pprSpec var (text "<type>") inl
+  ppr (SpecPrag var _ inl)
+    = text "SPECIALIZE" <+> pprSpec var (text "<type>") inl
 
-pprMinimalSig :: OutputableBndr name => LBooleanFormula (Located name) -> SDoc
-pprMinimalSig (L _ bf) = text "MINIMAL" <+> ppr (fmap unLoc bf)
+pprMinimalSig :: (OutputableBndr name)
+              => LBooleanFormula (Located name) -> SDoc
+pprMinimalSig (L _ bf) = ppr (fmap unLoc bf)
 
 {-
 ************************************************************************
@@ -943,21 +1085,23 @@ pprMinimalSig (L _ bf) = text "MINIMAL" <+> ppr (fmap unLoc bf)
 ************************************************************************
 -}
 
+-- | Haskell Pattern Synonym Details
 data HsPatSynDetails a
-  = InfixPatSyn a a
-  | PrefixPatSyn [a]
-  | RecordPatSyn [RecordPatSynField a]
-  deriving (Typeable, Data)
+  = InfixPatSyn a a                    -- ^ Infix Pattern Synonym
+  | PrefixPatSyn [a]                   -- ^ Prefix Pattern Synonym
+  | RecordPatSyn [RecordPatSynField a] -- ^ Record Pattern Synonym
+  deriving Data
 
 
 -- See Note [Record PatSyn Fields]
+-- | Record Pattern Synonym Field
 data RecordPatSynField a
   = RecordPatSynField {
       recordPatSynSelectorId :: a  -- Selector name visible in rest of the file
       , recordPatSynPatVar :: a
       -- Filled in by renamer, the name used internally
       -- by the pattern
-      } deriving (Typeable, Data)
+      } deriving Data
 
 
 
@@ -983,19 +1127,25 @@ the distinction between the two names clear
 
 -}
 instance Functor RecordPatSynField where
-    fmap f (RecordPatSynField visible hidden) =
-      RecordPatSynField (f visible) (f hidden)
+    fmap f (RecordPatSynField { recordPatSynSelectorId = visible
+                              , recordPatSynPatVar = hidden })
+      = RecordPatSynField { recordPatSynSelectorId = f visible
+                          , recordPatSynPatVar = f hidden }
 
 instance Outputable a => Outputable (RecordPatSynField a) where
-    ppr (RecordPatSynField v _) = ppr v
+    ppr (RecordPatSynField { recordPatSynSelectorId = v }) = ppr v
 
 instance Foldable RecordPatSynField  where
-    foldMap f (RecordPatSynField visible hidden) =
-      f visible `mappend` f hidden
+    foldMap f (RecordPatSynField { recordPatSynSelectorId = visible
+                                 , recordPatSynPatVar = hidden })
+      = f visible `mappend` f hidden
 
 instance Traversable RecordPatSynField where
-    traverse f (RecordPatSynField visible hidden) =
-      RecordPatSynField <$> f visible <*> f hidden
+    traverse f (RecordPatSynField { recordPatSynSelectorId =visible
+                                  , recordPatSynPatVar = hidden })
+      = (\ sel_id pat_var -> RecordPatSynField { recordPatSynSelectorId = sel_id
+                                               , recordPatSynPatVar = pat_var })
+          <$> f visible <*> f hidden
 
 
 instance Functor HsPatSynDetails where
@@ -1018,8 +1168,6 @@ instance Foldable HsPatSynDetails where
     foldr1 f (RecordPatSyn args) =
       Data.List.foldr1 f (map (Data.Foldable.foldr1 f) args)
 
--- TODO: After a few more versions, we should probably use these.
-#if __GLASGOW_HASKELL__ >= 709
     length (InfixPatSyn _ _) = 2
     length (PrefixPatSyn args) = Data.List.length args
     length (RecordPatSyn args) = Data.List.length args
@@ -1031,16 +1179,15 @@ instance Foldable HsPatSynDetails where
     toList (InfixPatSyn left right) = [left, right]
     toList (PrefixPatSyn args) = args
     toList (RecordPatSyn args) = foldMap toList args
-#endif
 
 instance Traversable HsPatSynDetails where
     traverse f (InfixPatSyn left right) = InfixPatSyn <$> f left <*> f right
     traverse f (PrefixPatSyn args) = PrefixPatSyn <$> traverse f args
     traverse f (RecordPatSyn args) = RecordPatSyn <$> traverse (traverse f) args
 
+-- | Haskell Pattern Synonym Direction
 data HsPatSynDir id
   = Unidirectional
   | ImplicitBidirectional
   | ExplicitBidirectional (MatchGroup id (LHsExpr id))
-  deriving (Typeable)
 deriving instance (DataId id) => Data (HsPatSynDir id)

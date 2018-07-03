@@ -34,10 +34,6 @@ import Util
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.Writer
 
-#if MIN_VERSION_base(4,8,0)
-#else
-import Data.Monoid ( Monoid, mappend, mempty )
-#endif
 #if __GLASGOW_HASKELL__ > 710
 import Data.Semigroup   ( Semigroup )
 import qualified Data.Semigroup as Semigroup
@@ -122,8 +118,8 @@ stmtToInstrs stmt = case stmt of
     CmmStore addr src    -> genStore addr src
 
     CmmBranch id         -> genBranch id
-    CmmCondBranch arg true false _      -- TODO: likely annotation
-                         -> genCondBranch arg true false
+    CmmCondBranch arg true false likely
+                         -> genCondBranch arg true false likely
     CmmSwitch arg ids    -> genSwitch arg ids
 
     -- Foreign Call
@@ -694,6 +690,7 @@ cmmPrimOpFunctions mop = do
     MO_F32_Exp    -> fsLit "expf"
     MO_F32_Log    -> fsLit "logf"
     MO_F32_Sqrt   -> fsLit "llvm.sqrt.f32"
+    MO_F32_Fabs   -> fsLit "llvm.fabs.f32"
     MO_F32_Pwr    -> fsLit "llvm.pow.f32"
 
     MO_F32_Sin    -> fsLit "llvm.sin.f32"
@@ -711,6 +708,7 @@ cmmPrimOpFunctions mop = do
     MO_F64_Exp    -> fsLit "exp"
     MO_F64_Log    -> fsLit "log"
     MO_F64_Sqrt   -> fsLit "llvm.sqrt.f64"
+    MO_F64_Fabs   -> fsLit "llvm.fabs.f64"
     MO_F64_Pwr    -> fsLit "llvm.pow.f64"
 
     MO_F64_Sin    -> fsLit "llvm.sin.f64"
@@ -849,8 +847,7 @@ genStore addr@(CmmMachOp (MO_Sub _) [
 
 -- generic case
 genStore addr val
-    = do other <- getTBAAMeta otherN
-         genStore_slow addr val other
+    = getTBAAMeta topN >>= genStore_slow addr val
 
 -- | CmmStore operation
 -- This is a special case for storing to a global register pointer
@@ -929,19 +926,40 @@ genBranch id =
 
 
 -- | Conditional branch
-genCondBranch :: CmmExpr -> BlockId -> BlockId -> LlvmM StmtData
-genCondBranch cond idT idF = do
+genCondBranch :: CmmExpr -> BlockId -> BlockId -> Maybe Bool -> LlvmM StmtData
+genCondBranch cond idT idF likely = do
     let labelT = blockIdToLlvm idT
     let labelF = blockIdToLlvm idF
     -- See Note [Literals and branch conditions].
-    (vc, stmts, top) <- exprToVarOpt i1Option cond
+    (vc, stmts1, top1) <- exprToVarOpt i1Option cond
     if getVarType vc == i1
         then do
-            let s1 = BranchIf vc labelT labelF
-            return (stmts `snocOL` s1, top)
+            (vc', (stmts2, top2)) <- case likely of
+              Just b -> genExpectLit (if b then 1 else 0) i1  vc
+              _      -> pure (vc, (nilOL, []))
+            let s1 = BranchIf vc' labelT labelF
+            return (stmts1 `appOL` stmts2 `snocOL` s1, top1 ++ top2)
         else do
             dflags <- getDynFlags
             panic $ "genCondBranch: Cond expr not bool! (" ++ showSDoc dflags (ppr vc) ++ ")"
+
+
+-- | Generate call to llvm.expect.x intrinsic. Assigning result to a new var.
+genExpectLit :: Integer -> LlvmType -> LlvmVar -> LlvmM (LlvmVar, StmtData)
+genExpectLit expLit expTy var = do
+  dflags <- getDynFlags
+
+  let
+    lit = LMLitVar $ LMIntLit expLit expTy
+
+    llvmExpectName
+      | isInt expTy = fsLit $ "llvm.expect." ++ showSDoc dflags (ppr expTy)
+      | otherwise   = panic $ "genExpectedLit: Type not an int!"
+
+  (llvmExpect, stmts, top) <-
+    getInstrinct llvmExpectName expTy [expTy, expTy]
+  (var', call) <- doExpr expTy $ Call StdCall llvmExpect [var, lit] []
+  return (var', (stmts `snocOL` call, top))
 
 {- Note [Literals and branch conditions]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1477,8 +1495,7 @@ genLoad atomic e@(CmmMachOp (MO_Sub _) [
 
 -- generic case
 genLoad atomic e ty
-    = do other <- getTBAAMeta otherN
-         genLoad_slow atomic e ty other
+    = getTBAAMeta topN >>= genLoad_slow atomic e ty
 
 -- | Handle CmmLoad expression.
 -- This is a special case for loading from a global register pointer

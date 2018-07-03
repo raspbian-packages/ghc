@@ -22,7 +22,8 @@ module InstEnv (
         extendInstEnvList, lookupUniqueInstEnv, lookupInstEnv, instEnvElts,
         memberInstEnv, instIsVisible,
         classInstances, instanceBindFun,
-        instanceCantMatch, roughMatchTcs
+        instanceCantMatch, roughMatchTcs,
+        isOverlappable, isOverlapping, isIncoherent
     ) where
 
 #include "HsVersions.h"
@@ -40,14 +41,11 @@ import Unify
 import Outputable
 import ErrUtils
 import BasicTypes
-import UniqFM
+import UniqDFM
 import Util
 import Id
-import Data.Data        ( Data, Typeable )
+import Data.Data        ( Data )
 import Data.Maybe       ( isJust, isNothing )
-#if __GLASGOW_HASKELL__ < 709
-import Data.Monoid
-#endif
 
 {-
 ************************************************************************
@@ -92,7 +90,7 @@ data ClsInst
                                         -- the decl of BasicTypes.OverlapFlag
              , is_orphan :: IsOrphan
     }
-  deriving (Data, Typeable)
+  deriving Data
 
 -- | A fuzzy comparison function for class instances, intended for sorting
 -- instances before displaying them to the user.
@@ -105,6 +103,11 @@ fuzzyClsInstCmp x y =
     cmp (Nothing, Just _) = LT
     cmp (Just _, Nothing) = GT
     cmp (Just x, Just y) = stableNameCmp x y
+
+isOverlappable, isOverlapping, isIncoherent :: ClsInst -> Bool
+isOverlappable i = hasOverlappableFlag (overlapMode (is_flag i))
+isOverlapping  i = hasOverlappingFlag  (overlapMode (is_flag i))
+isIncoherent   i = hasIncoherentFlag   (overlapMode (is_flag i))
 
 {-
 Note [ClsInst laziness and the rough-match fields]
@@ -287,7 +290,7 @@ mkLocalInstance dfun oflag tvs cls tys
     do_one (_ltvs, rtvs) = choose_one [ns | (tv,ns) <- cls_tvs `zip` arg_names
                                             , not (tv `elem` rtvs)]
 
-    choose_one nss = chooseOrphanAnchor (nameSetElems (unionNameSets nss))
+    choose_one nss = chooseOrphanAnchor (unionNameSets nss)
 
 mkImportedInstance :: Name         -- ^ the name of the class
                    -> [Maybe Name] -- ^ the types which the class was applied to
@@ -364,7 +367,21 @@ or, to put it another way, we have
 -}
 
 ---------------------------------------------------
-type InstEnv = UniqFM ClsInstEnv        -- Maps Class to instances for that class
+{-
+Note [InstEnv determinism]
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+We turn InstEnvs into a list in some places that don't directly affect
+the ABI. That happens when we create output for `:info`.
+Unfortunately that nondeterminism is nonlocal and it's hard to tell what it
+affects without following a chain of functions. It's also easy to accidentally
+make that nondeterminism affect the ABI. Furthermore the envs should be
+relatively small, so it should be free to use deterministic maps here.
+Testing with nofib and validate detected no difference between UniqFM and
+UniqDFM. See also Note [Deterministic UniqFM]
+-}
+
+type InstEnv = UniqDFM ClsInstEnv      -- Maps Class to instances for that class
+  -- See Note [InstEnv determinism]
 
 -- | 'InstEnvs' represents the combination of the global type class instance
 -- environment, the local type class instance environment, and the set of
@@ -399,10 +416,11 @@ instance Outputable ClsInstEnv where
 -- the dfun type.
 
 emptyInstEnv :: InstEnv
-emptyInstEnv = emptyUFM
+emptyInstEnv = emptyUDFM
 
 instEnvElts :: InstEnv -> [ClsInst]
-instEnvElts ie = [elt | ClsIE elts <- eltsUFM ie, elt <- elts]
+instEnvElts ie = [elt | ClsIE elts <- eltsUDFM ie, elt <- elts]
+  -- See Note [InstEnv determinism]
 
 -- | Test if an instance is visible, by checking that its origin module
 -- is in 'VisibleOrphanModules'.
@@ -422,7 +440,7 @@ classInstances :: InstEnvs -> Class -> [ClsInst]
 classInstances (InstEnvs { ie_global = pkg_ie, ie_local = home_ie, ie_visible = vis_mods }) cls
   = get home_ie ++ get pkg_ie
   where
-    get env = case lookupUFM env cls of
+    get env = case lookupUDFM env cls of
                 Just (ClsIE insts) -> filter (instIsVisible vis_mods) insts
                 Nothing            -> []
 
@@ -430,21 +448,24 @@ classInstances (InstEnvs { ie_global = pkg_ie, ie_local = home_ie, ie_visible = 
 -- We use this when we do signature checking in TcRnDriver
 memberInstEnv :: InstEnv -> ClsInst -> Bool
 memberInstEnv inst_env ins_item@(ClsInst { is_cls_nm = cls_nm } ) =
-    maybe False (\(ClsIE items) -> any (identicalClsInstHead ins_item) items)
-          (lookupUFM inst_env cls_nm)
+    maybe False (\(ClsIE items) -> any (identicalDFunType ins_item) items)
+          (lookupUDFM inst_env cls_nm)
+ where
+  identicalDFunType cls1 cls2 =
+    eqType (varType (is_dfun cls1)) (varType (is_dfun cls2))
 
 extendInstEnvList :: InstEnv -> [ClsInst] -> InstEnv
 extendInstEnvList inst_env ispecs = foldl extendInstEnv inst_env ispecs
 
 extendInstEnv :: InstEnv -> ClsInst -> InstEnv
 extendInstEnv inst_env ins_item@(ClsInst { is_cls_nm = cls_nm })
-  = addToUFM_C add inst_env cls_nm (ClsIE [ins_item])
+  = addToUDFM_C add inst_env cls_nm (ClsIE [ins_item])
   where
     add (ClsIE cur_insts) _ = ClsIE (ins_item : cur_insts)
 
 deleteFromInstEnv :: InstEnv -> ClsInst -> InstEnv
 deleteFromInstEnv inst_env ins_item@(ClsInst { is_cls_nm = cls_nm })
-  = adjustUFM adjust inst_env cls_nm
+  = adjustUDFM adjust inst_env cls_nm
   where
     adjust (ClsIE items) = ClsIE (filterOut (identicalClsInstHead ins_item) items)
 
@@ -503,7 +524,7 @@ These functions implement the carefully-written rules in the user
 manual section on "overlapping instances". At risk of duplication,
 here are the rules.  If the rules change, change this text and the
 user manual simultaneously.  The link may be this:
-http://www.haskell.org/ghc/docs/latest/html/users_guide/type-class-extensions.html#instance-overlap
+http://www.haskell.org/ghc/docs/latest/html/users_guide/glasgow_exts.html#instance-overlap
 
 The willingness to be overlapped or incoherent is a property of the
 instance declaration itself, controlled as follows:
@@ -736,14 +757,14 @@ lookupInstEnv' ie vis_mods cls tys
     all_tvs    = all isNothing rough_tcs
 
     --------------
-    lookup env = case lookupUFM env cls of
+    lookup env = case lookupUDFM env cls of
                    Nothing -> ([],[])   -- No instances for this class
                    Just (ClsIE insts) -> find [] [] insts
 
     --------------
     find ms us [] = (ms, us)
     find ms us (item@(ClsInst { is_tcs = mb_tcs, is_tvs = tpl_tvs
-                              , is_tys = tpl_tys, is_flag = oflag }) : rest)
+                              , is_tys = tpl_tys }) : rest)
       | not (instIsVisible vis_mods item)
       = find ms us rest  -- See Note [Instance lookup and orphan instances]
 
@@ -756,7 +777,7 @@ lookupInstEnv' ie vis_mods cls tys
 
         -- Does not match, so next check whether the things unify
         -- See Note [Overlapping instances] and Note [Incoherent instances]
-      | Incoherent _ <- overlapMode oflag
+      | isIncoherent item
       = find ms us rest
 
       | otherwise
@@ -808,8 +829,8 @@ lookupInstEnv check_overlap_safe
 
     -- If the selected match is incoherent, discard all unifiers
     final_unifs = case final_matches of
-                    (m:_) | is_incoherent m -> []
-                    _ -> all_unifs
+                    (m:_) | isIncoherent (fst m) -> []
+                    _                            -> all_unifs
 
     -- NOTE [Safe Haskell isSafeOverlap]
     -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -841,8 +862,6 @@ lookupInstEnv check_overlap_safe
                     lb = isInternalName nb
                 in (la && lb) || (nameModule na == nameModule nb)
 
-            isOverlappable i = hasOverlappableFlag $ overlapMode $ is_flag i
-
     -- We consider the most specific instance unsafe when it both:
     --   (1) Comes from a module compiled as `Safe`
     --   (2) Is an orphan instance, OR, an instance for a MPTC
@@ -850,31 +869,25 @@ lookupInstEnv check_overlap_safe
         (isOrphan (is_orphan inst) || classArity (is_cls inst) > 1)
 
 ---------------
-is_incoherent :: InstMatch -> Bool
-is_incoherent (inst, _) = case overlapMode (is_flag inst) of
-                            Incoherent _ -> True
-                            _            -> False
-
----------------
 insert_overlapping :: InstMatch -> [InstMatch] -> [InstMatch]
 -- ^ Add a new solution, knocking out strictly less specific ones
 -- See Note [Rules for instance lookup]
 insert_overlapping new_item [] = [new_item]
-insert_overlapping new_item (old_item : old_items)
+insert_overlapping new_item@(new_inst,_) (old_item@(old_inst,_) : old_items)
   | new_beats_old        -- New strictly overrides old
   , not old_beats_new
-  , new_item `can_override` old_item
+  , new_inst `can_override` old_inst
   = insert_overlapping new_item old_items
 
   | old_beats_new        -- Old strictly overrides new
   , not new_beats_old
-  , old_item `can_override` new_item
+  , old_inst `can_override` new_inst
   = old_item : old_items
 
   -- Discard incoherent instances; see Note [Incoherent instances]
-  | is_incoherent old_item       -- Old is incoherent; discard it
+  | isIncoherent old_inst      -- Old is incoherent; discard it
   = insert_overlapping new_item old_items
-  | is_incoherent new_item       -- New is incoherent; discard it
+  | isIncoherent new_inst      -- New is incoherent; discard it
   = old_item : old_items
 
   -- Equal or incomparable, and neither is incoherent; keep both
@@ -882,17 +895,16 @@ insert_overlapping new_item (old_item : old_items)
   = old_item : insert_overlapping new_item old_items
   where
 
-    new_beats_old = new_item `more_specific_than` old_item
-    old_beats_new = old_item `more_specific_than` new_item
+    new_beats_old = new_inst `more_specific_than` old_inst
+    old_beats_new = old_inst `more_specific_than` new_inst
 
     -- `instB` can be instantiated to match `instA`
     -- or the two are equal
-    (instA,_) `more_specific_than` (instB,_)
+    instA `more_specific_than` instB
       = isJust (tcMatchTys (is_tys instB) (is_tys instA))
 
-    (instA, _) `can_override` (instB, _)
-       =  hasOverlappingFlag  (overlapMode (is_flag instA))
-       || hasOverlappableFlag (overlapMode (is_flag instB))
+    instA `can_override` instB
+       = isOverlapping instA || isOverlappable instB
        -- Overlap permitted if either the more specific instance
        -- is marked as overlapping, or the more general one is
        -- marked as overlappable.
@@ -953,8 +965,8 @@ incoherent instances as long as there are others.
 -}
 
 instanceBindFun :: TyCoVar -> BindFlag
-instanceBindFun tv | isTcTyVar tv && isOverlappableTyVar tv = Skolem
-                   | otherwise                              = BindMe
+instanceBindFun tv | isOverlappableTyVar tv = Skolem
+                   | otherwise              = BindMe
    -- Note [Binding when looking up instances]
 
 {-

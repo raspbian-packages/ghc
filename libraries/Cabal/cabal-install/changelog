@@ -1,4 +1,67 @@
 -*-change-log-*-
+
+2.0.0.1 Mikhail Glushenkov <mikhail.glushenkov@gmail.com> October 2017
+	* Support for GHC's numeric -g debug levels (#4673).
+	* Demoted 'scope' field version check to a warning (#4714).
+	* Fixed verbosity flags getting removed before being passed to
+	'printPlan' (#4724).
+	* Added a '--store-dir' option that can be used to configure the
+	location of the build global build store (#4623).
+	* Turned `allow-{newer,older}` in `cabal.project` files into an
+	accumulating field to match CLI flag semantics (#4679).
+	* Improve success message when `cabal upload`ing documentation
+	(#4777).
+	* Documentation fixes.
+
+2.0.0.0 Mikhail Glushenkov <mikhail.glushenkov@gmail.com> August 2017
+	* See http://coldwa.st/e/blog/2017-09-09-Cabal-2-0.html
+	for more detailed release notes.
+	* Removed the '--root-cmd' parameter of the 'install' command
+	(#3356).
+	* Deprecated 'cabal install --global' (#3356).
+	* Changed 'cabal upload' to upload a package candidate by default
+	(#3419). Same applies to uploading documentation.
+	* Added a new 'cabal upload' flag '--publish' for publishing a
+	package on Hackage instead of uploading a candidate (#3419).
+	* Added optional solver output visualisation support via the
+	tracetree package. Mainly intended for debugging (#3410).
+	* Removed the '--check' option from 'cabal upload'
+	(#1823). It was replaced by package candidates.
+	* Fixed various behaviour differences between network transports
+	(#3429).
+	* The bootstrap script now works correctly when run from a Git
+	clone (#3439).
+	* Removed the top-down solver (#3598).
+	* The '-v/--verbosity' option no longer affects GHC verbosity
+	(except in the case of '-v0'). Use '--ghc-options=-v' to enable
+	verbose GHC output (#3540, #3671).
+	* Changed the default logfile template from
+	'.../$pkgid.log' to '.../$compiler/$libname.log' (#3807).
+	* Added a new command, 'cabal reconfigure', which re-runs 'configure'
+	with the most recently used flags (#2214).
+	* Added the '--index-state' flag for requesting a specific
+	version of the package index (#3893, #4115).
+	* Support for building Backpack packages.  See
+	https://github.com/ezyang/ghc-proposals/blob/backpack/proposals/0000-backpack.rst
+	for more details.
+	* Support the Nix package manager (#3651).
+	* Made the 'template-haskell' package non-upgradable again (#4185).
+	* Fixed password echoing on MinTTY (#4128).
+	* Added a new solver flag, '--allow-boot-library-installs', that allows
+	any package to be installed or upgraded (#4209).
+	* New 'cabal-install' command: 'outdated', for listing outdated
+	version bounds in a .cabal file or a freeze file (#4207).
+	* Added qualified constraints for setup dependencies. For example,
+	--constraint="setup.bar == 1.0" constrains all setup dependencies on
+	bar, and --constraint="foo:setup.bar == 1.0" constrains foo's setup
+	dependency on bar (part of #3502).
+	* Non-qualified constraints, such as --constraint="bar == 1.0", now
+	only apply to top-level dependencies. They don't constrain setup or
+	build-tool dependencies. The new syntax --constraint="any.bar == 1.0"
+	constrains all uses of bar.
+	* Added a technical preview version of the 'cabal doctest' command
+	(#4480).
+
 1.24.0.2 Mikhail Glushenkov <mikhail.glushenkov@gmail.com> December 2016
 	* Adapted to the revert of a PVP-noncompliant API change in
 	Cabal 1.24.2.0 (#4123).
@@ -22,7 +85,7 @@
 	* 'cabal sdist' no longer ignores '--builddir' when the package's
 	build-type is Custom (#3794).
 
-1.24.0.0 Ryan Thomas <ryan@ryant.org> May 2016
+1.24.0.0 Ryan Thomas <ryan@ryant.org> March 2016
 	* If there are multiple remote repos, 'cabal update' now updates
 	them in parallel (#2503).
 	* New 'cabal upload' option '-P'/'--password-command' for reading
@@ -82,6 +145,39 @@
 	* Tech preview of new nix-style isolated project-based builds.
 	Currently provides the commands (new-)build/repl/configure.
 
+1.22.9.0 Ryan Thomas <ryan@ryant.org> March 2016
+	* Include Cabal-1.22.8.0
+
+1.22.8.0 Ryan Thomas <ryan@ryant.org> February 2016
+	* Only Custom setup scripts should be compiled with '-i -i.'.
+	* installedCabalVersion: Don't special-case Cabal anymore.
+	* Bump the HTTP upper bound. See #3069.
+
+1.22.7.0 Ryan Thomas <ryan@ryant.org> December 2015
+	* Remove GZipUtils tests
+	* maybeDecompress: bail on all errors at the beginning of the stream with zlib < 0.6
+	* Correct maybeDecompress
+
+1.22.6.0 Ryan Thomas <ryan@ryant.org> June 2015
+	* A fix for @ezyang's fix for #2502. (Mikhail Glushenkov)
+
+1.22.5.0 Ryan Thomas <ryan@ryant.org> June 2015
+	* Reduce temporary directory name length, fixes #2502. (Edward Z. Yang)
+
+1.22.4.0 Ryan Thomas <ryan@ryant.org> May 2015
+	* Force cabal upload to always use digest auth and never basic auth.
+	* Add dependency-graph information to `printPlan` output
+	* bootstrap.sh: fixes linker matching to avoid cases where tested linker names appear unexpectedly in compiler output (fixes #2542)
+
+1.22.3.0 Ryan Thomas <ryan@ryant.org> April 2015
+	* Fix bash completion for sandbox subcommands - Fixes #2513 (Mikhail Glushenkov)
+	* filterConfigureFlags: filter more flags (Mikhail Glushenkov)
+
+1.22.2.0 Ryan Thomas <ryan@ryant.org> March 2015
+	* Don't pass '--{en,dis}able-profiling' to old setup exes.
+	* -Wall police
+	* Allow filepath 1.4
+
 1.22.0.0 Johan Tibell <johan.tibell@gmail.com> January 2015
 	* New command: user-config (#2159).
 	* Implement 'cabal repl --only' (#2016).
@@ -95,6 +191,19 @@
 	* Support sandboxes in 'bootstrap.sh' (#2137).
 	* Install profiling and shared libs by default in 'bootstrap.sh'
 	(#2009).
+
+1.20.2.0 Ryan Thomas <ryan@ryant.org> February 2016
+	* Only Custom setup scripts should be compiled with '-i -i.'.
+	* installedCabalVersion: Don't special-case Cabal anymore.
+
+1.20.1.0 Ryan Thomas <ryan@ryant.org> May 2015
+	* Force cabal upload to always use digest auth and never basic auth.
+	* bootstrap.sh: install network-uri before HTTP
+
+1.20.0.5 Johan Tibell <johan.tibell@gmail.com> December 2014
+	* Support random 1.1.
+	* Fix bootstrap script after network package split.
+	* Support network-2.6 in test suite.
 
 1.20.0.3 Johan Tibell <johan.tibell@gmail.com> June 2014
 	* Don't attempt to rename dist if it is already named correctly
@@ -123,6 +232,28 @@
 	* Add experimental Cabal file format command
 	* Add haddock section to config file
 	* Add --main-is flag to init
+
+1.18.2.0 Ryan Thomas <ryan@ryant.org> February 2016
+	* Only Custom setup scripts should be compiled with '-i -i.'.
+	* installedCabalVersion: Don't special-case Cabal anymore.
+
+1.18.1.0 Ryan Thomas <ryan@ryant.org> May 2015
+	* Force cabal upload to always use digest auth and never basic auth.
+	* Merge pull request #2367 from juhp/patch-2
+	* Fix bootstrap.sh by bumping HTTP to 4000.2.16.1
+
+1.18.0.7 Johan Tibell <johan.tibell@gmail.com> December 2014
+	* Support random 1.1.
+	* Fix bootstrap script after network package split.
+	* Support network-2.6 in test suite.
+
+1.18.0.5 Johan Tibell <johan.tibell@gmail.com> July 2014
+	* Make solver flag resolution more conservative.
+
+1.18.0.4 Johan Tibell <johan.tibell@gmail.com> May 2014
+	* Increase max-backjumps to 2000.
+	* Fix solver bug which led to missed install plans.
+	* Tweak solver heuristics to avoid reinstalls.
 
 0.14.0 Andres Loeh <andres@well-typed.com> April 2012
 	* Works with ghc-7.4
@@ -187,7 +318,7 @@
 	* HTTP-4000 package required, should fix bugs with http proxies
 	* Now works with authenticated proxies.
 	* On Windows can now override the proxy setting using an env var
-	* Fix compatability with config files generated by older versions
+	* Fix compatibility with config files generated by older versions
 	* Warn if the hackage package list is very old
 	* More helpful --help output, mention config file and examples
 	* Better documentation in ~/.cabal/config file
@@ -244,7 +375,7 @@
 
 0.4 Duncan Coutts <duncan@haskell.org> Oct 2007
 	* Renamed executable from 'cabal-install' to 'cabal'
-	* Partial Windows compatability
+	* Partial Windows compatibility
 	* Do per-user installs by default
 	* cabal install now installs the package in the current directory
 	* Allow multiple remote servers

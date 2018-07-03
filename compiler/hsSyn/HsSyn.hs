@@ -44,9 +44,9 @@ import HsTypes
 import BasicTypes       ( Fixity, WarningTxt )
 import HsUtils
 import HsDoc
+import OccName          ( HasOccName(..) )
 
 -- others:
-import OccName          ( HasOccName )
 import Outputable
 import SrcLoc
 import Module           ( ModuleName )
@@ -54,7 +54,9 @@ import Module           ( ModuleName )
 -- libraries:
 import Data.Data hiding ( Fixity )
 
--- | All we actually declare here is the top-level structure for a module.
+-- | Haskell Module
+--
+-- All we actually declare here is the top-level structure for a module.
 data HsModule name
   = HsModule {
       hsmodName :: Maybe (Located ModuleName),
@@ -105,11 +107,10 @@ data HsModule name
      --    hsmodImports,hsmodDecls if this style is used.
 
      -- For details on above see note [Api annotations] in ApiAnnotation
-      deriving (Typeable)
 deriving instance (DataId name) => Data (HsModule name)
 
-instance (OutputableBndr name, HasOccName name)
-        => Outputable (HsModule name) where
+instance (OutputableBndrId name, HasOccName name)
+  => Outputable (HsModule name) where
 
     ppr (HsModule Nothing _ imports decls _ mbDoc)
       = pp_mb mbDoc $$ pp_nonnull imports

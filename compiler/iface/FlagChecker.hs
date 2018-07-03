@@ -13,6 +13,7 @@ import HscTypes
 import Module
 import Name
 import Fingerprint
+import BinFingerprint
 -- import Outputable
 
 import qualified Data.IntSet as IntSet
@@ -21,7 +22,12 @@ import System.FilePath (normalise)
 -- | Produce a fingerprint of a @DynFlags@ value. We only base
 -- the finger print on important fields in @DynFlags@ so that
 -- the recompilation checker can use this fingerprint.
-fingerprintDynFlags :: DynFlags -> Module -> (BinHandle -> Name -> IO ())
+--
+-- NB: The 'Module' parameter is the 'Module' recorded by the
+-- *interface* file, not the actual 'Module' according to our
+-- 'DynFlags'.
+fingerprintDynFlags :: DynFlags -> Module
+                    -> (BinHandle -> Name -> IO ())
                     -> IO Fingerprint
 
 fingerprintDynFlags dflags@DynFlags{..} this_mod nameio =
@@ -45,9 +51,21 @@ fingerprintDynFlags dflags@DynFlags{..} this_mod nameio =
         -- -fprof-auto etc.
         prof = if gopt Opt_SccProfilingOn dflags then fromEnum profAuto else 0
 
-    in -- pprTrace "flags" (ppr (mainis, safeHs, lang, cpp, paths)) $
-       computeFingerprint nameio (mainis, safeHs, lang, cpp, paths, prof)
+        -- -O, see https://ghc.haskell.org/trac/ghc/ticket/10923
+        opt = if hscTarget == HscInterpreted ||
+                 hscTarget == HscNothing
+                 then 0
+                 else optLevel
 
+        -- -fhpc, see https://ghc.haskell.org/trac/ghc/ticket/11798
+        -- hpcDir is output-only, so we should recompile if it changes
+        hpc = if gopt Opt_Hpc dflags then Just hpcDir else Nothing
+
+        -- Nesting just to avoid ever more Binary tuple instances
+        flags = (mainis, safeHs, lang, cpp, paths, (prof, opt, hpc))
+
+    in -- pprTrace "flags" (ppr flags) $
+       computeFingerprint nameio flags
 
 {- Note [path flags and recompilation]
 

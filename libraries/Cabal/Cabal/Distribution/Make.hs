@@ -1,3 +1,6 @@
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Make
@@ -56,9 +59,12 @@
 
 module Distribution.Make (
         module Distribution.Package,
-        License(..), Version(..),
+        License(..), Version,
         defaultMain, defaultMainArgs, defaultMainNoRead
   ) where
+
+import Prelude ()
+import Distribution.Compat.Prelude
 
 -- local
 import Distribution.Compat.Exception
@@ -112,7 +118,7 @@ defaultMainHelper args =
     printVersion        = putStrLn $ "Cabal library version "
                                   ++ display cabalVersion
 
-    progs = defaultProgramConfiguration
+    progs = defaultProgramDb
     commands =
       [configureCommand progs `commandAddAction` configureAction
       ,buildCommand     progs `commandAddAction` buildAction

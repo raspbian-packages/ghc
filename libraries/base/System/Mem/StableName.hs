@@ -53,7 +53,7 @@ import GHC.Base         ( Int(..), StableName#, makeStableName#
 
   The reverse is not necessarily true: if two stable names are not
   equal, then the objects they name may still be equal.  Note in particular
-  that `mkStableName` may return a different `StableName` after an
+  that `makeStableName` may return a different `StableName` after an
   object is evaluated.
 
   Stable Names are similar to Stable Pointers ("Foreign.StablePtr"),
@@ -85,6 +85,7 @@ makeStableName a = IO $ \ s ->
 hashStableName :: StableName a -> Int
 hashStableName (StableName sn) = I# (stableNameToInt# sn)
 
+-- | @since 2.01
 instance Eq (StableName a) where
     (StableName sn1) == (StableName sn2) =
        case eqStableName# sn1 sn2 of

@@ -203,7 +203,7 @@ Numbers, basic types, and built-in classes
 ``Num`` superclasses
     The ``Num`` class does not have ``Show`` or ``Eq`` superclasses.
 
-    
+
     You can make code that works with both Haskell98/Haskell2010 and GHC
     by:
 
@@ -213,8 +213,8 @@ Numbers, basic types, and built-in classes
     -  Whenever you give a function, instance or class a ``Num t``
         constraint, also give it ``Show t`` and ``Eq t`` constraints.
 
-``Bits`` superclasses
-    The ``Bits`` class does not have a ``Num`` superclasses. It
+``Bits`` superclass
+    The ``Bits`` class does not have a ``Num`` superclass. It
     therefore does not have default methods for the ``bit``, ``testBit``
     and ``popCount`` methods.
 
@@ -228,6 +228,21 @@ Numbers, basic types, and built-in classes
 
     -  Always define the ``bit``, ``testBit`` and ``popCount`` methods
         in ``Bits`` instances.
+
+``Read`` class methods
+    The ``Read`` class has two extra methods, ``readPrec`` and
+    ``readListPrec``, that are not found in the Haskell 2010 since they rely
+    on the ``ReadPrec`` data type, which requires the :ghc-flag:`-XRankNTypes`
+    extension. GHC also derives ``Read`` instances by implementing ``readPrec``
+    instead of ``readsPrec``, and relies on a default implementation of
+    ``readsPrec`` that is defined in terms of ``readPrec``. GHC adds these two
+    extra methods simply because ``ReadPrec`` is more efficient than ``ReadS``
+    (the type on which ``readsPrec`` is based).
+
+``Monad`` superclass
+    The ``Monad`` class has an ``Applicative`` superclass. You cannot write
+    ``Monad`` instances that work for GHC and also for a Haskell 2010
+    implementation that does not define ``Applicative``.
 
 Extra instances
     The following extra instances are defined: ::
@@ -327,7 +342,7 @@ The Foreign Function Interface
 ``hs_init()``, ``hs_exit()``
     The FFI spec requires the implementation to support re-initialising
     itself after being shut down with ``hs_exit()``, but GHC does not
-    currently support that.
+    currently support that. See :ghc-ticket:`13693`.
 
     .. index::
         single: hs_init
@@ -462,7 +477,7 @@ Bugs in GHC
    .. code-block:: none
 
        ghc: panic! (the 'impossible' happened)
-         (GHC version 7.10.1 for x86_64-unknown-linux):
+         (GHC version 8.2.1 for x86_64-unknown-linux):
            Simplifier ticks exhausted
          When trying UnfoldingDone x_alB
          To increase the limit, use -fsimpl-tick-factor=N (default 100)
@@ -530,10 +545,8 @@ Bugs in GHC
    in the compiler's internal representation and can be unified producing
    unexpected results. See :ghc-ticket:`11715` for one example.
 
--  There is known to be maleficent interactions between weak references and
-   laziness. Particularly, it has been observed that placing a thunk containing
-   a reference to a weak reference inside of another weak reference may cause
-   runtime crashes. See :ghc-ticket:`11108` for details.
+-  Because of a toolchain limitation we are unable to support full Unicode paths
+   on Windows. On Windows we support up to Latin-1. See :ghc-ticket:`12971` for more.
 
 .. _bugs-ghci:
 

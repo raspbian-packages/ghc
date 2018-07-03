@@ -1,4 +1,3 @@
-{-# LANGUAGE FlexibleInstances, GeneralizedNewtypeDeriving #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
 module Main (main) where
@@ -7,6 +6,7 @@ import Test.ChasingBottoms.IsBottom
 import Test.Framework (Test, defaultMain, testGroup)
 import Test.Framework.Providers.QuickCheck2 (testProperty)
 import Test.QuickCheck (Arbitrary(arbitrary))
+import Test.QuickCheck.Function (Fun(..), apply)
 
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as M
@@ -14,14 +14,11 @@ import qualified Data.IntMap.Strict as M
 instance Arbitrary v => Arbitrary (IntMap v) where
     arbitrary = M.fromList `fmap` arbitrary
 
-instance Show (Int -> Int) where
-    show _ = "<function>"
+apply2 :: Fun (a, b) c -> a -> b -> c
+apply2 f a b = apply f (a, b)
 
-instance Show (Int -> Int -> Int) where
-    show _ = "<function>"
-
-instance Show (Int -> Int -> Int -> Int) where
-    show _ = "<function>"
+apply3 :: Fun (a, b, c) d -> a -> b -> c -> d
+apply3 f a b c = apply f (a, b, c)
 
 ------------------------------------------------------------------------
 -- * Properties
@@ -42,8 +39,8 @@ pFindWithDefaultValueStrict :: Int -> IntMap Int -> Bool
 pFindWithDefaultValueStrict k m =
     M.member k m || (isBottom $ M.findWithDefault bottom k m)
 
-pAdjustKeyStrict :: (Int -> Int) -> IntMap Int -> Bool
-pAdjustKeyStrict f m = isBottom $ M.adjust f bottom m
+pAdjustKeyStrict :: Fun Int Int -> IntMap Int -> Bool
+pAdjustKeyStrict f m = isBottom $ M.adjust (apply f) bottom m
 
 pAdjustValueStrict :: Int -> IntMap Int -> Bool
 pAdjustValueStrict k m
@@ -58,26 +55,26 @@ pInsertKeyStrict v m = isBottom $ M.insert bottom v m
 pInsertValueStrict :: Int -> IntMap Int -> Bool
 pInsertValueStrict k m = isBottom $ M.insert k bottom m
 
-pInsertWithKeyStrict :: (Int -> Int -> Int) -> Int -> IntMap Int -> Bool
-pInsertWithKeyStrict f v m = isBottom $ M.insertWith f bottom v m
+pInsertWithKeyStrict :: Fun (Int, Int) Int -> Int -> IntMap Int -> Bool
+pInsertWithKeyStrict f v m = isBottom $ M.insertWith (apply2 f) bottom v m
 
-pInsertWithValueStrict :: (Int -> Int -> Int) -> Int -> Int -> IntMap Int
+pInsertWithValueStrict :: Fun (Int, Int) Int -> Int -> Int -> IntMap Int
                        -> Bool
 pInsertWithValueStrict f k v m
     | M.member k m = (isBottom $ M.insertWith (const2 bottom) k v m) &&
                      not (isBottom $ M.insertWith (const2 1) k bottom m)
-    | otherwise    = isBottom $ M.insertWith f k bottom m
+    | otherwise    = isBottom $ M.insertWith (apply2 f) k bottom m
 
-pInsertLookupWithKeyKeyStrict :: (Int -> Int -> Int -> Int) -> Int -> IntMap Int
+pInsertLookupWithKeyKeyStrict :: Fun (Int, Int, Int) Int -> Int -> IntMap Int
                               -> Bool
-pInsertLookupWithKeyKeyStrict f v m = isBottom $ M.insertLookupWithKey f bottom v m
+pInsertLookupWithKeyKeyStrict f v m = isBottom $ M.insertLookupWithKey (apply3 f) bottom v m
 
-pInsertLookupWithKeyValueStrict :: (Int -> Int -> Int -> Int) -> Int -> Int
+pInsertLookupWithKeyValueStrict :: Fun (Int, Int, Int) Int -> Int -> Int
                                 -> IntMap Int -> Bool
 pInsertLookupWithKeyValueStrict f k v m
     | M.member k m = (isBottom $ M.insertLookupWithKey (const3 bottom) k v m) &&
                      not (isBottom $ M.insertLookupWithKey (const3 1) k bottom m)
-    | otherwise    = isBottom $ M.insertLookupWithKey f k bottom m
+    | otherwise    = isBottom $ M.insertLookupWithKey (apply3 f) k bottom m
 
 ------------------------------------------------------------------------
 -- * Test list
