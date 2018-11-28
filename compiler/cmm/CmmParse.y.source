@@ -200,6 +200,8 @@ necessary to the stack to accommodate it (e.g. 2).
 {
 module CmmParse ( parseCmmFile ) where
 
+import GhcPrelude
+
 import StgCmmExtCode
 import CmmCallConv
 import StgCmmProf
@@ -992,6 +994,7 @@ callishMachOps = listToUFM $
         ( "memcpy", memcpyLikeTweakArgs MO_Memcpy ),
         ( "memset", memcpyLikeTweakArgs MO_Memset ),
         ( "memmove", memcpyLikeTweakArgs MO_Memmove ),
+        ( "memcmp", memcpyLikeTweakArgs MO_Memcmp ),
 
         ("prefetch0", (,) $ MO_Prefetch_Data 0),
         ("prefetch1", (,) $ MO_Prefetch_Data 1),
@@ -1002,6 +1005,16 @@ callishMachOps = listToUFM $
         ( "popcnt16", (,) $ MO_PopCnt W16 ),
         ( "popcnt32", (,) $ MO_PopCnt W32 ),
         ( "popcnt64", (,) $ MO_PopCnt W64 ),
+
+        ( "pdep8",  (,) $ MO_Pdep W8  ),
+        ( "pdep16", (,) $ MO_Pdep W16 ),
+        ( "pdep32", (,) $ MO_Pdep W32 ),
+        ( "pdep64", (,) $ MO_Pdep W64 ),
+
+        ( "pext8",  (,) $ MO_Pext W8  ),
+        ( "pext16", (,) $ MO_Pext W16 ),
+        ( "pext32", (,) $ MO_Pext W32 ),
+        ( "pext64", (,) $ MO_Pext W64 ),
 
         ( "cmpxchg8",  (,) $ MO_Cmpxchg W8  ),
         ( "cmpxchg16", (,) $ MO_Cmpxchg W16 ),
@@ -1403,9 +1416,11 @@ parseCmmFile dflags filename = withTiming (pure dflags) (text "ParseCmm"<+>brack
                 -- reset the lex_state: the Lexer monad leaves some stuff
                 -- in there we don't want.
   case unPD cmmParse dflags init_state of
-    PFailed span err -> do
+    PFailed warnFn span err -> do
         let msg = mkPlainErrMsg dflags span err
-        return ((emptyBag, unitBag msg), Nothing)
+            errMsgs = (emptyBag, unitBag msg)
+            warnMsgs = warnFn dflags
+        return (unionMessages warnMsgs errMsgs, Nothing)
     POk pst code -> do
         st <- initC
         let fcode = getCmm $ unEC code "global" (initEnv dflags) [] >> return ()

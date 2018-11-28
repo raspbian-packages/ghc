@@ -20,7 +20,9 @@ module CoreOpt (
 
 #include "HsVersions.h"
 
-import CoreArity( joinRhsArity, etaExpandToJoinPoint )
+import GhcPrelude
+
+import CoreArity( etaExpandToJoinPoint )
 
 import CoreSyn
 import CoreSubst
@@ -143,7 +145,7 @@ simpleOptPgm dflags this_mod binds rules vects
     rules' = substRulesForImportedIds final_subst rules
     vects' = substVects final_subst vects
              -- We never unconditionally inline into rules,
-             -- hence pasing just a substitution
+             -- hence paying just a substitution
 
     do_one (env, binds') bind
       = case simple_opt_bind env bind of
@@ -479,7 +481,7 @@ subst_opt_id_bndr (SOE { soe_subst = subst, soe_inl = inl }) old_id
     id1    = uniqAway in_scope old_id
     id2    = setIdType id1 (substTy subst (idType old_id))
     new_id = zapFragileIdInfo id2
-             -- Zaps rules, worker-info, unfolding, and fragile OccInfo
+             -- Zaps rules, unfolding, and fragile OccInfo
              -- The unfolding and rules will get added back later, by add_info
 
     new_in_scope = in_scope `extendInScopeSet` new_id
@@ -642,58 +644,18 @@ joinPointBinding_maybe bndr rhs
   = Just (bndr, rhs)
 
   | AlwaysTailCalled join_arity <- tailCallInfo (idOccInfo bndr)
-  , not (bad_unfolding join_arity (idUnfolding bndr))
   , (bndrs, body) <- etaExpandToJoinPoint join_arity rhs
   = Just (bndr `asJoinId` join_arity, mkLams bndrs body)
 
   | otherwise
   = Nothing
 
-  where
-    -- bad_unfolding returns True if we should /not/ convert a non-join-id
-    -- into a join-id, even though it is AlwaysTailCalled
-    -- See Note [Join points and INLINE pragmas]
-    bad_unfolding join_arity (CoreUnfolding { uf_src = src, uf_tmpl = rhs })
-      = isStableSource src && join_arity > joinRhsArity rhs
-    bad_unfolding _ (DFunUnfolding {})
-      = True
-    bad_unfolding _ _
-      = False
-
 joinPointBindings_maybe :: [(InBndr, InExpr)] -> Maybe [(InBndr, InExpr)]
 joinPointBindings_maybe bndrs
   = mapM (uncurry joinPointBinding_maybe) bndrs
 
 
-{- Note [Join points and INLINE pragmas]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Consider
-   f x = let g = \x. not  -- Arity 1
-             {-# INLINE g #-}
-         in case x of
-              A -> g True True
-              B -> g True False
-              C -> blah2
-
-Here 'g' is always tail-called applied to 2 args, but the stable
-unfolding captured by the INLINE pragma has arity 1.  If we try to
-convert g to be a join point, its unfolding will still have arity 1
-(since it is stable, and we don't meddle with stable unfoldings), and
-Lint will complain (see Note [Invariants on join points], (2a), in
-CoreSyn.  Trac #13413.
-
-Moreover, since g is going to be inlined anyway, there is no benefit
-from making it a join point.
-
-If it is recursive, and uselessly marked INLINE, this will stop us
-making it a join point, which is a annoying.  But occasionally
-(notably in class methods; see Note [Instances and loop breakers] in
-TcInstDcls) we mark recurive things as INLINE but the recursion
-unravels; so ignoring INLINE pragmas on recursive things isn't good
-either.
-
-
-************************************************************************
+{- *********************************************************************
 *                                                                      *
          exprIsConApp_maybe
 *                                                                      *
@@ -755,7 +717,7 @@ data ConCont = CC [CoreExpr] Coercion
 
 -- | Returns @Just (dc, [t1..tk], [x1..xn])@ if the argument expression is
 -- a *saturated* constructor application of the form @dc t1..tk x1 .. xn@,
--- where t1..tk are the *universally-qantified* type args of 'dc'
+-- where t1..tk are the *universally-quantified* type args of 'dc'
 exprIsConApp_maybe :: InScopeEnv -> CoreExpr -> Maybe (DataCon, [Type], [CoreExpr])
 exprIsConApp_maybe (in_scope, id_unf) expr
   = go (Left in_scope) expr (CC [] (mkRepReflCo (exprType expr)))
@@ -961,7 +923,7 @@ Here we implement the "push rules" from FC papers:
        (K e1 .. en) |> co
   and we want to tranform to
        (K e1' .. en')
-  by pushing the coercion into the oarguments
+  by pushing the coercion into the arguments
 -}
 
 pushCoArgs :: Coercion -> [CoreArg] -> Maybe ([CoreArg], Coercion)
@@ -1081,7 +1043,7 @@ pushCoDataCon dc dc_args co
         --      (C x y) `cast` (g :: T a ~ S [a]),
         -- where S is a type function.  In fact, exprIsConApp
         -- will probably not be called in such circumstances,
-        -- but there't nothing wrong with it
+        -- but there's nothing wrong with it
 
   = let
         tc_arity       = tyConArity to_tc

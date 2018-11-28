@@ -20,6 +20,7 @@ main = do
         ,"import TestUtil"
         ,"import qualified System.FilePath.Windows as W"
         ,"import qualified System.FilePath.Posix as P"
+        ,"{-# ANN module \"HLint: ignore\" #-}"
         ,"tests :: [(String, Property)]"
         ,"tests ="] ++
         ["    " ++ c ++ "(" ++ show t1 ++ ", " ++ t2 ++ ")" | (c,(t1,t2)) <- zip ("[":repeat ",") tests] ++
@@ -48,7 +49,9 @@ parseTest (stripPrefix "-- > " -> Just x) = platform $ toLexemes x
 
         free p val x = Test p [(ctor v, v) | v <- vars] x
             where vars = nub $ sort [v | v@[c] <- x, isAlpha c]
-                  ctor v = if v < "x" then "" else if v `elem` val then "QFilePathValid" ++ show p else "QFilePath"
+                  ctor v | v < "x" = ""
+                         | v `elem` val = "QFilePathValid" ++ show p
+                         | otherwise = "QFilePath"
 parseTest _ = []
 
 
@@ -79,7 +82,7 @@ renderTest Test{..} = (body, code)
 
 qualify :: PW -> String -> String
 qualify pw str
-    | str `elem` fpops || (all isAlpha str && length str > 1 && not (str `elem` prelude)) = show pw ++ "." ++ str
+    | str `elem` fpops || (all isAlpha str && length str > 1 && str `notElem` prelude) = show pw ++ "." ++ str
     | otherwise = str
     where
         prelude = ["elem","uncurry","snd","fst","not","null","if","then","else"

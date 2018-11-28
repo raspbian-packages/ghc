@@ -22,6 +22,8 @@ module Dwarf.Types
   )
   where
 
+import GhcPrelude
+
 import Debug
 import CLabel
 import CmmExpr         ( GlobalReg(..) )
@@ -32,6 +34,7 @@ import Platform
 import Unique
 import Reg
 import SrcLoc
+import Util
 
 import Dwarf.Constants
 
@@ -343,7 +346,7 @@ pprFrameProc frameLbl initUw (DwarfFrameProc procLbl hasInfo blocks)
         procEnd     = mkAsmTempEndLabel procLbl
         ifInfo str  = if hasInfo then text str else empty
                       -- see [Note: Info Offset]
-    in vcat [ ifPprDebug $ text "# Unwinding for" <+> ppr procLbl <> colon
+    in vcat [ whenPprDebug $ text "# Unwinding for" <+> ppr procLbl <> colon
             , pprData4' (ppr fdeEndLabel <> char '-' <> ppr fdeLabel)
             , ppr fdeLabel <> colon
             , pprData4' (ppr frameLbl <> char '-' <>
@@ -489,9 +492,11 @@ pprUnwindExpr spIsCFA expr
         pprE (UwPlus u1 u2)   = pprE u1 $$ pprE u2 $$ pprByte dW_OP_plus
         pprE (UwMinus u1 u2)  = pprE u1 $$ pprE u2 $$ pprByte dW_OP_minus
         pprE (UwTimes u1 u2)  = pprE u1 $$ pprE u2 $$ pprByte dW_OP_mul
-    in text "\t.uleb128 1f-.-1" $$ -- DW_FORM_block length
+    in text "\t.uleb128 2f-1f" $$ -- DW_FORM_block length
+       -- computed as the difference of the following local labels 2: and 1:
+       text "1:" $$
        pprE expr $$
-       text "1:"
+       text "2:"
 
 -- | Generate code for re-setting the unwind information for a
 -- register to @undefined@
@@ -570,7 +575,7 @@ pprString' str = text "\t.asciz \"" <> str <> char '"'
 pprString :: String -> SDoc
 pprString str
   = pprString' $ hcat $ map escapeChar $
-    if utf8EncodedLength str == length str
+    if str `lengthIs` utf8EncodedLength str
     then str
     else map (chr . fromIntegral) $ bytesFS $ mkFastString str
 

@@ -106,7 +106,7 @@ BINDIST_EXTRAS += $$($1_$2_BINDIST_WRAPPER)
 
 $$($1_$2_BINDIST_WRAPPER): $1/$2/build/tmp/$$($1_$2_PROG)
 	$$(call removeFiles,                                                  $$@)
-	echo '#!/bin/sh'                                                    >> $$@
+	echo '#!/bin/sh'                                                   >> $$@
 ifeq "$$(DYNAMIC_GHC_PROGRAMS)" "YES"
 	echo '$$(call prependLibraryPath,$$($1_$2_DEP_LIB_REL_DIRS_SEARCHPATH))' >> $$@
 endif

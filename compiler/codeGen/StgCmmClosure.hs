@@ -13,7 +13,6 @@
 
 module StgCmmClosure (
         DynTag,  tagForCon, isSmallFamily,
-        ConTagZ, dataConTagZ,
 
         idPrimRep, isVoidRep, isGcPtrRep, addIdReps, addArgReps,
         argPrimRep,
@@ -66,6 +65,8 @@ module StgCmmClosure (
 #include "../includes/MachDeps.h"
 
 #include "HsVersions.h"
+
+import GhcPrelude
 
 import StgSyn
 import SMRep
@@ -360,18 +361,18 @@ type DynTag = Int       -- The tag on a *pointer*
 isSmallFamily :: DynFlags -> Int -> Bool
 isSmallFamily dflags fam_size = fam_size <= mAX_PTR_TAG dflags
 
--- We keep the *zero-indexed* tag in the srt_len field of the info
--- table of a data constructor.
-dataConTagZ :: DataCon -> ConTagZ
-dataConTagZ con = dataConTag con - fIRST_TAG
+-- | Faster version of isSmallFamily if you haven't computed the size yet.
+isSmallFamilyTyCon :: DynFlags -> TyCon -> Bool
+isSmallFamilyTyCon dflags tycon =
+  tyConFamilySizeAtMost tycon (mAX_PTR_TAG dflags)
 
 tagForCon :: DynFlags -> DataCon -> DynTag
 tagForCon dflags con
-  | isSmallFamily dflags fam_size = con_tag + 1
-  | otherwise                     = 1
+  | isSmallFamilyTyCon dflags tycon = con_tag
+  | otherwise                       = 1
   where
-    con_tag  = dataConTagZ con
-    fam_size = tyConFamilySize (dataConTyCon con)
+    con_tag  = dataConTag con -- NB: 1-indexed
+    tycon = dataConTyCon con
 
 tagForArity :: DynFlags -> RepArity -> DynTag
 tagForArity dflags arity
@@ -411,7 +412,7 @@ isLFReEntrant _                = False
 lfClosureType :: LambdaFormInfo -> ClosureTypeInfo
 lfClosureType (LFReEntrant _ _ arity _ argd) = Fun arity argd
 lfClosureType (LFCon con)                    = Constr (dataConTagZ con)
-                                                    (dataConIdentity con)
+                                                      (dataConIdentity con)
 lfClosureType (LFThunk _ _ _ is_sel _)       = thunkClosureType is_sel
 lfClosureType _                              = panic "lfClosureType"
 
@@ -559,7 +560,7 @@ getCallMethod dflags _ id _ n_args v_args _cg_loc
               (Just (self_loop_id, block_id, args))
   | gopt Opt_Loopification dflags
   , id == self_loop_id
-  , n_args - v_args == length args
+  , args `lengthIs` (n_args - v_args)
   -- If these patterns match then we know that:
   --   * loopification optimisation is turned on
   --   * function is performing a self-recursive call in a tail position
@@ -1050,6 +1051,8 @@ mkDataConInfoTable dflags data_con is_static ptr_wds nonptr_wds
    info_lbl = mkConInfoTableLabel name NoCafRefs
    sm_rep = mkHeapRep dflags is_static ptr_wds nonptr_wds cl_type
    cl_type = Constr (dataConTagZ data_con) (dataConIdentity data_con)
+                  -- We keep the *zero-indexed* tag in the srt_len field
+                  -- of the info table of a data constructor.
 
    prof | not (gopt Opt_SccProfilingOn dflags) = NoProfilingInfo
         | otherwise                            = ProfilingInfo ty_descr val_descr

@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE RecordWildCards #-}
@@ -11,10 +12,15 @@ import qualified Haddock.Syb as Syb
 import Haddock.Backends.Hyperlinker.Types
 
 import qualified GHC
+import qualified SrcLoc
 
 import Control.Applicative
+import Control.Monad (guard)
 import Data.Data
+import qualified Data.Map.Strict as Map
 import Data.Maybe
+
+import Prelude hiding (span)
 
 everythingInRenamedSource :: (Alternative f, Data x)
   => (forall a. Data a => a -> f r) -> x -> f r
@@ -28,25 +34,39 @@ enrich src =
         , rtkDetails = enrichToken token detailsMap
         }
   where
-    detailsMap = concatMap ($ src)
-        [ variables
-        , types
-        , decls
-        , binds
-        , imports
-        ]
+    detailsMap =
+      mkDetailsMap (concatMap ($ src)
+                     [ variables
+                     , types
+                     , decls
+                     , binds
+                     , imports
+                     ])
+
+type LTokenDetails = [(GHC.SrcSpan, TokenDetails)]
 
 -- | A map containing association between source locations and "details" of
 -- this location.
 --
--- For the time being, it is just a list of pairs. However, looking up things
--- in such structure has linear complexity. We cannot use any hashmap-like
--- stuff because source locations are not ordered. In the future, this should
--- be replaced with interval tree data structure.
-type DetailsMap = [(GHC.SrcSpan, TokenDetails)]
+type DetailsMap = Map.Map Position (Span, TokenDetails)
+
+mkDetailsMap :: [(GHC.SrcSpan, TokenDetails)] -> DetailsMap
+mkDetailsMap xs =
+  Map.fromListWith select_details [ (start, (span, token_details))
+                                  | (ghc_span, token_details) <- xs
+                                  , GHC.RealSrcSpan span <- [ghc_span]
+                                  , let start = SrcLoc.realSrcSpanStart span
+                                  ]
+  where
+    -- favour token details which appear earlier in the list
+    select_details _new old = old
 
 lookupBySpan :: Span -> DetailsMap -> Maybe TokenDetails
-lookupBySpan tspan = listToMaybe . map snd . filter (matches tspan . fst)
+lookupBySpan span details = do
+  let pos = SrcLoc.realSrcSpanStart span
+  (_, (tok_span, tok_details)) <- Map.lookupLE pos details
+  guard (tok_span `SrcLoc.containsSpan` span)
+  return tok_details
 
 enrichToken :: Token -> DetailsMap -> Maybe TokenDetails
 enrichToken (Token typ _ spn) dm
@@ -54,28 +74,31 @@ enrichToken (Token typ _ spn) dm
 enrichToken _ _ = Nothing
 
 -- | Obtain details map for variables ("normally" used identifiers).
-variables :: GHC.RenamedSource -> DetailsMap
+variables :: GHC.RenamedSource -> LTokenDetails
 variables =
     everythingInRenamedSource (var `Syb.combine` rec)
   where
     var term = case cast term of
-        (Just (GHC.L sspan (GHC.HsVar name))) ->
+        (Just ((GHC.L sspan (GHC.HsVar name)) :: GHC.LHsExpr GHC.GhcRn)) ->
             pure (sspan, RtkVar (GHC.unLoc name))
         (Just (GHC.L _ (GHC.RecordCon (GHC.L sspan name) _ _ _))) ->
             pure (sspan, RtkVar name)
         _ -> empty
     rec term = case cast term of
-        Just (GHC.HsRecField (GHC.L sspan name) (_ :: GHC.LHsExpr GHC.Name) _) ->
+        Just (GHC.HsRecField (GHC.L sspan name) (_ :: GHC.LHsExpr GHC.GhcRn) _) ->
             pure (sspan, RtkVar name)
         _ -> empty
 
 -- | Obtain details map for types.
-types :: GHC.RenamedSource -> DetailsMap
+types :: GHC.RenamedSource -> LTokenDetails
 types = everythingInRenamedSource ty
   where
+    ty :: forall a. Data a => a -> [(GHC.SrcSpan, TokenDetails)]
     ty term = case cast term of
-        (Just (GHC.L sspan (GHC.HsTyVar _ name))) ->
+        (Just ((GHC.L sspan (GHC.HsTyVar _ name)) :: GHC.LHsType GHC.GhcRn)) ->
             pure (sspan, RtkType (GHC.unLoc name))
+        (Just ((GHC.L sspan (GHC.HsOpTy l name r)) :: GHC.LHsType GHC.GhcRn)) ->
+            (sspan, RtkType (GHC.unLoc name)):(ty l ++ ty r)
         _ -> empty
 
 -- | Obtain details map for identifier bindings.
@@ -84,16 +107,21 @@ types = everythingInRenamedSource ty
 -- ordinary assignment (in top-level declarations, let-expressions and where
 -- clauses).
 
-binds :: GHC.RenamedSource -> DetailsMap
+binds :: GHC.RenamedSource -> LTokenDetails
 binds = everythingInRenamedSource
       (fun `Syb.combine` pat `Syb.combine` tvar)
   where
     fun term = case cast term of
-        (Just (GHC.FunBind (GHC.L sspan name) _ _ _ _ :: GHC.HsBind GHC.Name)) ->
+        (Just (GHC.FunBind (GHC.L sspan name) _ _ _ _ :: GHC.HsBind GHC.GhcRn)) ->
             pure (sspan, RtkBind name)
+        (Just (GHC.PatSynBind (GHC.PSB (GHC.L sspan name) _ args _ _))) ->
+            pure (sspan, RtkBind name) ++ everythingInRenamedSource patsyn_binds args
+        _ -> empty
+    patsyn_binds term = case cast term of
+        (Just (GHC.L sspan (name :: GHC.Name))) -> pure (sspan, RtkVar name)
         _ -> empty
     pat term = case cast term of
-        (Just (GHC.L sspan (GHC.VarPat name))) ->
+        (Just ((GHC.L sspan (GHC.VarPat name)) :: GHC.LPat GHC.GhcRn)) ->
             pure (sspan, RtkBind (GHC.unLoc name))
         (Just (GHC.L _ (GHC.ConPatIn (GHC.L sspan name) recs))) ->
             [(sspan, RtkVar name)] ++ everythingInRenamedSource rec recs
@@ -101,21 +129,22 @@ binds = everythingInRenamedSource
             pure (sspan, RtkBind name)
         _ -> empty
     rec term = case cast term of
-        (Just (GHC.HsRecField (GHC.L sspan name) (_ :: GHC.LPat GHC.Name) _)) ->
+        (Just (GHC.HsRecField (GHC.L sspan name) (_ :: GHC.LPat GHC.GhcRn) _)) ->
             pure (sspan, RtkVar name)
         _ -> empty
     tvar term = case cast term of
-        (Just (GHC.L sspan (GHC.UserTyVar name))) ->
+        (Just ((GHC.L sspan (GHC.UserTyVar name)) :: GHC.LHsTyVarBndr GHC.GhcRn)) ->
             pure (sspan, RtkBind (GHC.unLoc name))
         (Just (GHC.L _ (GHC.KindedTyVar (GHC.L sspan name) _))) ->
             pure (sspan, RtkBind name)
         _ -> empty
 
 -- | Obtain details map for top-level declarations.
-decls :: GHC.RenamedSource -> DetailsMap
+decls :: GHC.RenamedSource -> LTokenDetails
 decls (group, _, _, _) = concatMap ($ group)
     [ concat . map typ . concat . map GHC.group_tyclds . GHC.hs_tyclds
     , everythingInRenamedSource fun . GHC.hs_valds
+    , everythingInRenamedSource fix . GHC.hs_fixds
     , everythingInRenamedSource (con `Syb.combine` ins)
     ]
   where
@@ -123,26 +152,40 @@ decls (group, _, _, _) = concatMap ($ group)
         GHC.DataDecl { tcdLName = name } -> pure . decl $ name
         GHC.SynDecl name _ _ _ _ -> pure . decl $ name
         GHC.FamDecl fam -> pure . decl $ GHC.fdLName fam
-        GHC.ClassDecl{..} -> [decl tcdLName] ++ concatMap sig tcdSigs
+        GHC.ClassDecl{..} ->
+          [decl tcdLName]
+            ++ concatMap sig tcdSigs
+            ++ concatMap tyfam tcdATs
     fun term = case cast term of
-        (Just (GHC.FunBind (GHC.L sspan name) _ _ _ _ :: GHC.HsBind GHC.Name))
+        (Just (GHC.FunBind (GHC.L sspan name) _ _ _ _ :: GHC.HsBind GHC.GhcRn))
+            | GHC.isExternalName name -> pure (sspan, RtkDecl name)
+        (Just (GHC.PatSynBind (GHC.PSB (GHC.L sspan name) _ _ _ _)))
             | GHC.isExternalName name -> pure (sspan, RtkDecl name)
         _ -> empty
     con term = case cast term of
-        (Just cdcl) ->
+        (Just (cdcl :: GHC.ConDecl GHC.GhcRn)) ->
             map decl (GHC.getConNames cdcl)
               ++ everythingInRenamedSource fld cdcl
         Nothing -> empty
     ins term = case cast term of
-        (Just (GHC.DataFamInstD inst)) -> pure . tyref $ GHC.dfid_tycon inst
-        (Just (GHC.TyFamInstD (GHC.TyFamInstDecl (GHC.L _ eqn) _))) ->
-            pure . tyref $ GHC.tfe_tycon eqn
+        (Just ((GHC.DataFamInstD (GHC.DataFamInstDecl eqn))
+                :: GHC.InstDecl GHC.GhcRn))
+          -> pure . tyref $ GHC.feqn_tycon $ GHC.hsib_body eqn
+        (Just (GHC.TyFamInstD (GHC.TyFamInstDecl eqn))) ->
+            pure . tyref $ GHC.feqn_tycon $ GHC.hsib_body eqn
         _ -> empty
     fld term = case cast term of
-        Just (field :: GHC.ConDeclField GHC.Name)
+        Just (field :: GHC.ConDeclField GHC.GhcRn)
           -> map (decl . fmap GHC.selectorFieldOcc) $ GHC.cd_fld_names field
         Nothing -> empty
+    fix term = case cast term of
+        Just ((GHC.FixitySig names _) :: GHC.FixitySig GHC.GhcRn)
+          -> map decl names
+        Nothing -> empty
+    tyfam (GHC.L _ (GHC.FamilyDecl{..})) = [decl fdLName]
     sig (GHC.L _ (GHC.TypeSig names _)) = map decl names
+    sig (GHC.L _ (GHC.PatSynSig names _)) = map decl names
+    sig (GHC.L _ (GHC.ClassOpSig _ names _)) = map decl names
     sig _ = []
     decl (GHC.L sspan name) = (sspan, RtkDecl name)
     tyref (GHC.L sspan name) = (sspan, RtkType name)
@@ -151,39 +194,21 @@ decls (group, _, _, _) = concatMap ($ group)
 --
 -- This map also includes type and variable details for items in export and
 -- import lists.
-imports :: GHC.RenamedSource -> DetailsMap
+imports :: GHC.RenamedSource -> LTokenDetails
 imports src@(_, imps, _, _) =
     everythingInRenamedSource ie src ++ mapMaybe (imp . GHC.unLoc) imps
   where
     ie term = case cast term of
-        (Just (GHC.IEVar v)) -> pure $ var $ GHC.ieLWrappedName v
+        (Just ((GHC.IEVar v) :: GHC.IE GHC.GhcRn)) -> pure $ var $ GHC.ieLWrappedName v
         (Just (GHC.IEThingAbs t)) -> pure $ typ $ GHC.ieLWrappedName t
         (Just (GHC.IEThingAll t)) -> pure $ typ $ GHC.ieLWrappedName t
         (Just (GHC.IEThingWith t _ vs _fls)) ->
           [typ $ GHC.ieLWrappedName t] ++ map (var . GHC.ieLWrappedName) vs
+        (Just (GHC.IEModuleContents m)) -> pure $ modu m
         _ -> empty
     typ (GHC.L sspan name) = (sspan, RtkType name)
     var (GHC.L sspan name) = (sspan, RtkVar name)
-    imp idecl | not . GHC.ideclImplicit $ idecl =
-        let (GHC.L sspan name) = GHC.ideclName idecl
-        in Just (sspan, RtkModule name)
-    imp _ = Nothing
-
--- | Check whether token stream span matches GHC source span.
---
--- Currently, it is implemented as checking whether "our" span is contained
--- in GHC span. The reason for that is because GHC span are generally wider
--- and may spread across couple tokens. For example, @(>>=)@ consists of three
--- tokens: @(@, @>>=@, @)@, but GHC source span associated with @>>=@ variable
--- contains @(@ and @)@. Similarly, qualified identifiers like @Foo.Bar.quux@
--- are tokenized as @Foo@, @.@, @Bar@, @.@, @quux@ but GHC source span
--- associated with @quux@ contains all five elements.
-matches :: Span -> GHC.SrcSpan -> Bool
-matches tspan (GHC.RealSrcSpan aspan)
-    | saspan <= stspan && etspan <= easpan = True
-  where
-    stspan = (posRow . spStart $ tspan, posCol . spStart $ tspan)
-    etspan = (posRow . spEnd $ tspan, posCol . spEnd $ tspan)
-    saspan = (GHC.srcSpanStartLine aspan, GHC.srcSpanStartCol aspan)
-    easpan = (GHC.srcSpanEndLine aspan, GHC.srcSpanEndCol aspan)
-matches _ _ = False
+    modu (GHC.L sspan name) = (sspan, RtkModule name)
+    imp idecl
+      | not . GHC.ideclImplicit $ idecl = Just (modu (GHC.ideclName idecl))
+      | otherwise = Nothing

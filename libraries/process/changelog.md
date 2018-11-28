@@ -1,6 +1,17 @@
 # Changelog for [`process` package](http://hackage.haskell.org/package/process)
 
-## 1.6.1.1 *July 2017*
+## 1.6.3.0 *January 2018*
+
+* Added `getPid` and export of platform specific `Pid` type
+  [#109](https://github.com/haskell/process/pull/109)
+
+## 1.6.2.0 *October 2017*
+
+* Allow async exceptions to be delivered to masked thread calling `waitForProcess`
+  [#101](https://github.com/haskell/process/pull/101)
+* Update Win32 package version to 2.6.x
+
+## 1.6.1.0 *July 2017*
 
 * Expose `CGid`, `GroupID`, and `UserID` from `System.Process.Internals`
   [#90](https://github.com/haskell/process/issues/90)

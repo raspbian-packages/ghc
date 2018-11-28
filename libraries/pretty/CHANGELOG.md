@@ -1,5 +1,20 @@
 # Pretty library change log
 
+## 1.1.3.6 -- 30th January, 2018
+
+* Fix compatability with GHC-8.4/base-4.11 (by Herbert Valerio Riedel).
+* Add in benchmarking framework (by Alfredo Di Napoli).
+
+## 1.1.3.5 -- 1st February, 2017
+
+* Fix documentation formatting bug (by Ivan Lazar Miljenovic)
+* Fix missing git tag on Github for v1.1.3.4 release.
+
+## 1.1.3.4 -- 3rd June, 2016
+
+* Fix over-zeleaous use of strictness causing stack allocation, fixes part of
+  issue #32 (by Neil Mitchell).
+
 ## 1.1.3.3 -- 29th February, 2016
 
 * Improve documentation.

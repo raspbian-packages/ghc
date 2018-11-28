@@ -1,4 +1,5 @@
-{-# LANGUAGE CPP, MagicHash #-}
+{-# LANGUAGE CPP, MagicHash, BangPatterns #-}
+{-# LANGUAGE TypeFamilies #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Haddock.Interface.AttachInstances
@@ -18,7 +19,6 @@ import Haddock.Types
 import Haddock.Convert
 import Haddock.GhcUtils
 
-import Control.Applicative
 import Control.Arrow hiding ((<+>))
 import Data.List
 import Data.Ord (comparing)
@@ -34,6 +34,7 @@ import FamInstEnv
 import FastString
 import GHC
 import InstEnv
+import Module ( ModuleSet, moduleSetElts )
 import MonadUtils (liftIO)
 import Name
 import NameEnv
@@ -51,11 +52,13 @@ type Modules = Set.Set Module
 type ExportInfo = (ExportedNames, Modules)
 
 -- Also attaches fixities
-attachInstances :: ExportInfo -> [Interface] -> InstIfaceMap -> Ghc [Interface]
-attachInstances expInfo ifaces instIfaceMap = do
-  (_msgs, mb_index) <- getNameToInstancesIndex
+attachInstances :: ExportInfo -> [Interface] -> InstIfaceMap -> ModuleSet -> Ghc [Interface]
+attachInstances expInfo ifaces instIfaceMap mods = do
+  (_msgs, mb_index) <- getNameToInstancesIndex2 (map ifaceMod ifaces) mods'
   mapM (attach $ fromMaybe emptyNameEnv mb_index) ifaces
   where
+    mods' = Just (moduleSetElts mods)
+
     -- TODO: take an IfaceMap as input
     ifaceMap = Map.fromList [ (ifaceMod i, i) | i <- ifaces ]
 
@@ -67,9 +70,9 @@ attachInstances expInfo ifaces instIfaceMap = do
                      , ifaceOrphanInstances = orphanInstances
                      }
 
-attachOrphanInstances :: ExportInfo -> Interface -> IfaceMap -> InstIfaceMap -> [ClsInst] -> [DocInstance Name]
+attachOrphanInstances :: ExportInfo -> Interface -> IfaceMap -> InstIfaceMap -> [ClsInst] -> [DocInstance GhcRn]
 attachOrphanInstances expInfo iface ifaceMap instIfaceMap cls_instances =
-  [ (synifyInstHead i, instLookup instDocMap n iface ifaceMap instIfaceMap, (L (getSrcSpan n) n))
+  [ (synifyInstHead i, instLookup instDocMap n iface ifaceMap instIfaceMap, (L (getSrcSpan n) n), Nothing)
   | let is = [ (instanceSig i, getName i) | i <- cls_instances, isOrphan (is_orphan i) ]
   , (i@(_,_,cls,tys), n) <- sortBy (comparing $ first instHead) is
   , not $ isInstanceHidden expInfo cls tys
@@ -82,8 +85,8 @@ attachToExportItem
   -> Interface
   -> IfaceMap
   -> InstIfaceMap
-  -> ExportItem Name
-  -> Ghc (ExportItem Name)
+  -> ExportItem GhcRn
+  -> Ghc (ExportItem GhcRn)
 attachToExportItem index expInfo iface ifaceMap instIfaceMap export =
   case attachFixities export of
     e@ExportDecl { expItemDecl = L eSpan (TyClD d) } -> do
@@ -91,7 +94,11 @@ attachToExportItem index expInfo iface ifaceMap instIfaceMap export =
         let mb_instances  = lookupNameEnv index (tcdName d)
             cls_instances = maybeToList mb_instances >>= fst
             fam_instances = maybeToList mb_instances >>= snd
-            fam_insts = [ (synifyFamInst i opaque, doc,spanNameE n (synifyFamInst i opaque) (L eSpan (tcdName d)) )
+            fam_insts = [ ( synifyFamInst i opaque
+                          , doc
+                          , spanNameE n (synifyFamInst i opaque) (L eSpan (tcdName d))
+                          , nameModule_maybe n
+                          )
                         | i <- sortBy (comparing instFam) fam_instances
                         , let n = getName i
                         , let doc = instLookup instDocMap n iface ifaceMap instIfaceMap
@@ -99,14 +106,18 @@ attachToExportItem index expInfo iface ifaceMap instIfaceMap export =
                         , not $ any (isTypeHidden expInfo) (fi_tys i)
                         , let opaque = isTypeHidden expInfo (fi_rhs i)
                         ]
-            cls_insts = [ (synifyInstHead i, instLookup instDocMap n iface ifaceMap instIfaceMap, spanName n (synifyInstHead i) (L eSpan (tcdName d)))
+            cls_insts = [ ( synifyInstHead i
+                          , instLookup instDocMap n iface ifaceMap instIfaceMap
+                          , spanName n (synifyInstHead i) (L eSpan (tcdName d))
+                          , nameModule_maybe n
+                          )
                         | let is = [ (instanceSig i, getName i) | i <- cls_instances ]
                         , (i@(_,_,cls,tys), n) <- sortBy (comparing $ first instHead) is
                         , not $ isInstanceHidden expInfo cls tys
                         ]
               -- fam_insts but with failing type fams filtered out
-            cleanFamInsts = [ (fi, n, L l r) | (Right fi, n, L l (Right r)) <- fam_insts ]
-            famInstErrs = [ errm | (Left errm, _, _) <- fam_insts ]
+            cleanFamInsts = [ (fi, n, L l r, m) | (Right fi, n, L l (Right r), m) <- fam_insts ]
+            famInstErrs = [ errm | (Left errm, _, _, _) <- fam_insts ]
         in do
           dfs <- getDynFlags
           let mkBug = (text "haddock-bug:" <+>) . text
@@ -117,12 +128,12 @@ attachToExportItem index expInfo iface ifaceMap instIfaceMap export =
   where
     attachFixities e@ExportDecl{ expItemDecl = L _ d
                                , expItemPats = patsyns
+                               , expItemSubDocs = subDocs
                                } = e { expItemFixities =
       nubByName fst $ expItemFixities e ++
       [ (n',f) | n <- getMainDeclBinder d
-              , Just subs <- [instLookup instSubMap n iface ifaceMap instIfaceMap <|> Just []]
-              , n' <- n : (subs ++ patsyn_names)
-              , Just f <- [instLookup instFixMap n' iface ifaceMap instIfaceMap]
+               , n' <- n : (map fst subDocs ++ patsyn_names)
+               , Just f <- [instLookup instFixMap n' iface ifaceMap instIfaceMap]
       ] }
       where
         patsyn_names = concatMap (getMainDeclBinder . fst) patsyns

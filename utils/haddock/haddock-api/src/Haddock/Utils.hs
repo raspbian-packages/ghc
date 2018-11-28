@@ -20,10 +20,11 @@ module Haddock.Utils (
 
   -- * Filename utilities
   moduleHtmlFile, moduleHtmlFile',
-  contentsHtmlFile, indexHtmlFile,
+  contentsHtmlFile, indexHtmlFile, indexJsonFile,
   moduleIndexFrameName, mainFrameName, synopsisFrameName,
   subIndexHtmlFile,
-  jsFile,
+  haddockJsFile, jsQuickJumpFile,
+  quickJumpCssFile,
 
   -- * Anchor and URL utilities
   moduleNameUrl, moduleNameUrl', moduleUrl,
@@ -37,8 +38,6 @@ module Haddock.Utils (
   html_xrefs_ref, html_xrefs_ref',
 
   -- * Doc markup
-  markup,
-  idMarkup,
   mkMeta,
 
   -- * List utilities
@@ -125,12 +124,12 @@ toInstalledDescription = fmap mkMeta . hmi_description . instInfo
 mkMeta :: Doc a -> MDoc a
 mkMeta x = emptyMetaDoc { _doc = x }
 
-mkEmptySigWcType :: LHsType Name -> LHsSigWcType Name
+mkEmptySigWcType :: LHsType GhcRn -> LHsSigWcType GhcRn
 -- Dubious, because the implicit binders are empty even
 -- though the type might have free varaiables
 mkEmptySigWcType ty = mkEmptyWildCardBndrs (mkEmptyImplicitBndrs ty)
 
-addClassContext :: Name -> LHsQTyVars Name -> LSig Name -> LSig Name
+addClassContext :: Name -> LHsQTyVars GhcRn -> LSig GhcRn -> LSig GhcRn
 -- Add the class context to a class-op signature
 addClassContext cls tvs0 (L pos (ClassOpSig _ lname ltype))
   = L pos (TypeSig lname (mkEmptySigWcType (go (hsSigType ltype))))
@@ -148,7 +147,7 @@ addClassContext cls tvs0 (L pos (ClassOpSig _ lname ltype))
 
 addClassContext _ _ sig = sig   -- E.g. a MinimalSig is fine
 
-lHsQTyVarsToTypes :: LHsQTyVars Name -> [LHsType Name]
+lHsQTyVarsToTypes :: LHsQTyVars GhcRn -> [LHsType GhcRn]
 lHsQTyVarsToTypes tvs
   = [ noLoc (HsTyVar NotPromoted (noLoc (hsLTyVarName tv)))
     | tv <- hsQTvExplicit tvs ]
@@ -158,7 +157,7 @@ lHsQTyVarsToTypes tvs
 --------------------------------------------------------------------------------
 
 
-restrictTo :: [Name] -> LHsDecl Name -> LHsDecl Name
+restrictTo :: [Name] -> LHsDecl GhcRn -> LHsDecl GhcRn
 restrictTo names (L loc decl) = L loc $ case decl of
   TyClD d | isDataDecl d  ->
     TyClD (d { tcdDataDefn = restrictDataDefn names (tcdDataDefn d) })
@@ -167,7 +166,7 @@ restrictTo names (L loc decl) = L loc $ case decl of
                tcdATs = restrictATs names (tcdATs d) })
   _ -> decl
 
-restrictDataDefn :: [Name] -> HsDataDefn Name -> HsDataDefn Name
+restrictDataDefn :: [Name] -> HsDataDefn GhcRn -> HsDataDefn GhcRn
 restrictDataDefn names defn@(HsDataDefn { dd_ND = new_or_data, dd_cons = cons })
   | DataType <- new_or_data
   = defn { dd_cons = restrictCons names cons }
@@ -177,7 +176,7 @@ restrictDataDefn names defn@(HsDataDefn { dd_ND = new_or_data, dd_cons = cons })
       [con] -> defn { dd_cons = [con] }
       _ -> error "Should not happen"
 
-restrictCons :: [Name] -> [LConDecl Name] -> [LConDecl Name]
+restrictCons :: [Name] -> [LConDecl GhcRn] -> [LConDecl GhcRn]
 restrictCons names decls = [ L p d | L p (Just d) <- map (fmap keep) decls ]
   where
     keep d | any (\n -> n `elem` names) (map unLoc $ getConNames d) =
@@ -197,7 +196,7 @@ restrictCons names decls = [ L p d | L p (Just d) <- map (fmap keep) decls ]
         h98ConDecl c@ConDeclGADT{} = c'
           where
             (details,_res_ty,cxt,tvs) = gadtDeclDetails (con_type c)
-            c' :: ConDecl Name
+            c' :: ConDecl GhcRn
             c' = ConDeclH98
                    { con_name = head (con_names c)
                    , con_qvars = Just $ HsQTvs { hsq_implicit = mempty
@@ -208,18 +207,18 @@ restrictCons names decls = [ L p d | L p (Just d) <- map (fmap keep) decls ]
                    , con_doc = con_doc c
                    }
 
-        field_avail :: LConDeclField Name -> Bool
+        field_avail :: LConDeclField GhcRn -> Bool
         field_avail (L _ (ConDeclField fs _ _))
             = all (\f -> selectorFieldOcc (unLoc f) `elem` names) fs
         field_types flds = [ t | ConDeclField _ t _ <- flds ]
 
     keep _ = Nothing
 
-restrictDecls :: [Name] -> [LSig Name] -> [LSig Name]
+restrictDecls :: [Name] -> [LSig GhcRn] -> [LSig GhcRn]
 restrictDecls names = mapMaybe (filterLSigNames (`elem` names))
 
 
-restrictATs :: [Name] -> [LFamilyDecl Name] -> [LFamilyDecl Name]
+restrictATs :: [Name] -> [LFamilyDecl GhcRn] -> [LFamilyDecl GhcRn]
 restrictATs names ats = [ at | at <- ats , unL (fdLName (unL at)) `elem` names ]
 
 emptyHsQTvs :: LHsQTyVars Name
@@ -256,9 +255,10 @@ moduleHtmlFile' mdl =
     Just fp0 -> HtmlPath.joinPath [fp0, baseName mdl ++ ".html"]
 
 
-contentsHtmlFile, indexHtmlFile :: String
+contentsHtmlFile, indexHtmlFile, indexJsonFile :: String
 contentsHtmlFile = "index.html"
 indexHtmlFile = "doc-index.html"
+indexJsonFile = "doc-index.json"
 
 
 
@@ -326,9 +326,14 @@ makeAnchorId (f:r) = escape isAlpha f ++ concatMap (escape isLegal) r
 -------------------------------------------------------------------------------
 
 
-jsFile :: String
-jsFile    = "haddock-util.js"
+haddockJsFile :: String
+haddockJsFile = "haddock-bundle.min.js"
 
+jsQuickJumpFile :: String
+jsQuickJumpFile = "quick-jump.min.js"
+
+quickJumpCssFile :: String
+quickJumpCssFile = "quick-jump.css"
 
 -------------------------------------------------------------------------------
 -- * Misc.
@@ -447,71 +452,6 @@ spanWith _ [] = ([],[])
 spanWith p xs@(a:as)
   | Just b <- p a = let (bs,cs) = spanWith p as in (b:bs,cs)
   | otherwise     = ([],xs)
-
-
------------------------------------------------------------------------------
--- * Put here temporarily
------------------------------------------------------------------------------
-
-
-markup :: DocMarkup id a -> Doc id -> a
-markup m DocEmpty                    = markupEmpty m
-markup m (DocAppend d1 d2)           = markupAppend m (markup m d1) (markup m d2)
-markup m (DocString s)               = markupString m s
-markup m (DocParagraph d)            = markupParagraph m (markup m d)
-markup m (DocIdentifier x)           = markupIdentifier m x
-markup m (DocIdentifierUnchecked x)  = markupIdentifierUnchecked m x
-markup m (DocModule mod0)            = markupModule m mod0
-markup m (DocWarning d)              = markupWarning m (markup m d)
-markup m (DocEmphasis d)             = markupEmphasis m (markup m d)
-markup m (DocBold d)                 = markupBold m (markup m d)
-markup m (DocMonospaced d)           = markupMonospaced m (markup m d)
-markup m (DocUnorderedList ds)       = markupUnorderedList m (map (markup m) ds)
-markup m (DocOrderedList ds)         = markupOrderedList m (map (markup m) ds)
-markup m (DocDefList ds)             = markupDefList m (map (markupPair m) ds)
-markup m (DocCodeBlock d)            = markupCodeBlock m (markup m d)
-markup m (DocHyperlink l)            = markupHyperlink m l
-markup m (DocAName ref)              = markupAName m ref
-markup m (DocPic img)                = markupPic m img
-markup m (DocMathInline mathjax)     = markupMathInline m mathjax
-markup m (DocMathDisplay mathjax)    = markupMathDisplay m mathjax
-markup m (DocProperty p)             = markupProperty m p
-markup m (DocExamples e)             = markupExample m e
-markup m (DocHeader (Header l t))    = markupHeader m (Header l (markup m t))
-
-
-markupPair :: DocMarkup id a -> (Doc id, Doc id) -> (a, a)
-markupPair m (a,b) = (markup m a, markup m b)
-
-
--- | The identity markup
-idMarkup :: DocMarkup a (Doc a)
-idMarkup = Markup {
-  markupEmpty                = DocEmpty,
-  markupString               = DocString,
-  markupParagraph            = DocParagraph,
-  markupAppend               = DocAppend,
-  markupIdentifier           = DocIdentifier,
-  markupIdentifierUnchecked  = DocIdentifierUnchecked,
-  markupModule               = DocModule,
-  markupWarning              = DocWarning,
-  markupEmphasis             = DocEmphasis,
-  markupBold                 = DocBold,
-  markupMonospaced           = DocMonospaced,
-  markupUnorderedList        = DocUnorderedList,
-  markupOrderedList          = DocOrderedList,
-  markupDefList              = DocDefList,
-  markupCodeBlock            = DocCodeBlock,
-  markupHyperlink            = DocHyperlink,
-  markupAName                = DocAName,
-  markupPic                  = DocPic,
-  markupMathInline           = DocMathInline,
-  markupMathDisplay          = DocMathDisplay,
-  markupProperty             = DocProperty,
-  markupExample              = DocExamples,
-  markupHeader               = DocHeader
-  }
-
 
 -----------------------------------------------------------------------------
 -- * System tools

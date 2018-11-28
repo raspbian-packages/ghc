@@ -1,10 +1,18 @@
 {-# LANGUAGE CPP #-}
-{-# OPTIONS_HADDOCK hide #-}
+-- |
+-- Stability: unstable
+-- Portability: portable
+--
+-- Internal modules are always subject to change from version to version.
+
 module System.Directory.Internal.Prelude
   ( module Prelude
-#if !MIN_VERSION_base(4, 8, 0)
+#if MIN_VERSION_base(4, 8, 0)
+  , module Data.Void
+#else
   , module Control.Applicative
   , module Data.Functor
+  , Void
 #endif
   , module Control.Arrow
   , module Control.Concurrent
@@ -29,7 +37,6 @@ module System.Directory.Internal.Prelude
   , module System.Posix.Internals
   , module System.Posix.Types
   , module System.Timeout
-  , Void
   ) where
 #if !MIN_VERSION_base(4, 6, 0)
 import Prelude hiding (catch)
@@ -62,7 +69,7 @@ import Control.Exception
   )
 import Control.Monad ((>=>), (<=<), unless, when, replicateM_)
 import Data.Bits ((.&.), (.|.), complement)
-import Data.Char (isAlpha, isAscii, toLower)
+import Data.Char (isAlpha, isAscii, toLower, toUpper)
 import Data.Foldable (for_, traverse_)
 import Data.Function (on)
 import Data.Maybe (catMaybes, fromMaybe, maybeToList)
@@ -137,6 +144,7 @@ import System.IO
 import System.IO.Error
   ( IOError
   , catchIOError
+  , illegalOperationErrorType
   , ioeGetErrorString
   , ioeGetErrorType
   , ioeGetLocation
@@ -145,6 +153,7 @@ import System.IO.Error
   , ioeSetLocation
   , isAlreadyExistsError
   , isDoesNotExistError
+  , isIllegalOperation
   , isPermissionError
   , mkIOError
   , modifyIOError
@@ -152,16 +161,8 @@ import System.IO.Error
   , tryIOError
   , userError
   )
-import System.Posix.Internals
-  ( CStat
-  , c_stat
-  , withFilePath
-  , s_isdir
-  , sizeof_stat
-  , st_mode
-  , st_size
-  )
-import System.Posix.Types (CMode(..), EpochTime, FileMode)
+import System.Posix.Internals (withFilePath)
+import System.Posix.Types (EpochTime)
 import System.Timeout (timeout)
 
 #if !MIN_VERSION_base(4, 8, 0)

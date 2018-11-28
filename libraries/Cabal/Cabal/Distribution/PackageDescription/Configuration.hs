@@ -174,7 +174,7 @@ resolveWithFlags ::
        -- ^ Either the missing dependencies (error case), or a pair of
        -- (set of build targets with dependencies, chosen flag assignments)
 resolveWithFlags dom enabled os arch impl constrs trees checkDeps =
-    either (Left . fromDepMapUnion) Right $ explore (build [] dom)
+    either (Left . fromDepMapUnion) Right $ explore (build mempty dom)
   where
     extraConstrs = toDepMap constrs
 
@@ -209,7 +209,7 @@ resolveWithFlags dom enabled os arch impl constrs trees checkDeps =
     build :: FlagAssignment -> [(FlagName, [Bool])] -> Tree FlagAssignment
     build assigned [] = Node assigned []
     build assigned ((fn, vals) : unassigned) =
-        Node assigned $ map (\v -> build ((fn, v) : assigned) unassigned) vals
+        Node assigned $ map (\v -> build (insertFlagAssignment fn v assigned) unassigned) vals
 
     tryAll :: [Either DepMapUnion a] -> Either DepMapUnion a
     tryAll = foldr mp mz
@@ -229,7 +229,7 @@ resolveWithFlags dom enabled os arch impl constrs trees checkDeps =
     mz = Left (DepMapUnion Map.empty)
 
     env :: FlagAssignment -> FlagName -> Either FlagName Bool
-    env flags flag = (maybe (Left flag) Right . lookup flag) flags
+    env flags flag = (maybe (Left flag) Right . lookupFlagAssignment flag) flags
 
 -- | Transforms a 'CondTree' by putting the input under the "then" branch of a
 -- conditional that is True when Buildable is True. If 'addBuildableCondition'
@@ -460,7 +460,7 @@ finalizePD userflags enabled satisfyDep
                 ++ map (\(name,tree) -> mapTreeData (SubComp name . CBench) tree) bms0
 
     flagChoices    = map (\(MkFlag n _ d manual) -> (n, d2c manual n d)) flags
-    d2c manual n b = case lookup n userflags of
+    d2c manual n b = case lookupFlagAssignment n userflags of
                      Just val -> [val]
                      Nothing
                       | manual -> [b]
@@ -471,7 +471,7 @@ finalizePD userflags enabled satisfyDep
                       then DepOk
                       else MissingDeps missingDeps
 
-{-# DEPRECATED finalizePackageDescription "This function now always assumes tests and benchmarks are disabled; use finalizePD with ComponentRequestedSpec to specify something more specific." #-}
+{-# DEPRECATED finalizePackageDescription "This function now always assumes tests and benchmarks are disabled; use finalizePD with ComponentRequestedSpec to specify something more specific. This symbol will be removed in Cabal-3.0 (est. Oct 2018)." #-}
 finalizePackageDescription ::
      FlagAssignment  -- ^ Explicitly specified flag assignments
   -> (Dependency -> Bool) -- ^ Is a given dependency satisfiable from the set of

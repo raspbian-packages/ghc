@@ -47,7 +47,7 @@ import Haddock.Backends.Xhtml.Utils
 import Haddock.Types
 import Haddock.Utils (makeAnchorId, nameAnchorId)
 import qualified Data.Map as Map
-import Text.XHtml hiding ( name, title, p, quote )
+import Text.XHtml hiding ( name, title, quote )
 
 import FastString            ( unpackFS )
 import GHC
@@ -128,38 +128,39 @@ divSubDecls cssClass captionName = maybe noHtml wrap
     subCaption = paragraph ! [theclass "caption"] << captionName
 
 
-subDlist :: Qualification -> [SubDecl] -> Maybe Html
-subDlist _ [] = Nothing
-subDlist qual decls = Just $ ulist << map subEntry decls
+subDlist :: Maybe Package -> Qualification -> [SubDecl] -> Maybe Html
+subDlist _ _ [] = Nothing
+subDlist pkg qual decls = Just $ ulist << map subEntry decls
   where
     subEntry (decl, mdoc, subs) =
       li <<
         (define ! [theclass "src"] << decl +++
-         docElement thediv << (fmap (docToHtml Nothing qual) mdoc +++ subs))
+         docElement thediv << (fmap (docToHtml Nothing pkg qual) mdoc +++ subs))
 
 
-subTable :: Qualification -> [SubDecl] -> Maybe Html
-subTable _ [] = Nothing
-subTable qual decls = Just $ table << aboves (concatMap subRow decls)
+subTable :: Maybe Package -> Qualification -> [SubDecl] -> Maybe Html
+subTable _ _ [] = Nothing
+subTable pkg qual decls = Just $ table << aboves (concatMap subRow decls)
   where
     subRow (decl, mdoc, subs) =
       (td ! [theclass "src"] << decl
        <->
-       docElement td << fmap (docToHtml Nothing qual) mdoc)
+       docElement td << fmap (docToHtml Nothing pkg qual) mdoc)
       : map (cell . (td <<)) subs
 
 
 -- | Sub table with source information (optional).
-subTableSrc :: Qualification -> LinksInfo -> Bool -> [(SubDecl,Located DocName)] -> Maybe Html
-subTableSrc _ _  _ [] = Nothing
-subTableSrc qual lnks splice decls = Just $ table << aboves (concatMap subRow decls)
+subTableSrc :: Maybe Package -> Qualification -> LinksInfo -> Bool
+            -> [(SubDecl,Located DocName)] -> Maybe Html
+subTableSrc _ _ _ _ [] = Nothing
+subTableSrc pkg qual lnks splice decls = Just $ table << aboves (concatMap subRow decls)
   where
     subRow ((decl, mdoc, subs),L loc dn) =
       (td ! [theclass "src clearfix"] <<
         (thespan ! [theclass "inst-left"] << decl)
         <+> linkHtml loc dn
       <->
-      docElement td << fmap (docToHtml Nothing qual) mdoc
+      docElement td << fmap (docToHtml Nothing pkg qual) mdoc
       )
       : map (cell . (td <<)) subs
     linkHtml loc@(RealSrcSpan _) dn = links lnks loc splice dn
@@ -170,49 +171,49 @@ subBlock [] = Nothing
 subBlock hs = Just $ toHtml hs
 
 
-subArguments :: Qualification -> [SubDecl] -> Html
-subArguments qual = divSubDecls "arguments" "Arguments" . subTable qual
+subArguments :: Maybe Package -> Qualification -> [SubDecl] -> Html
+subArguments pkg qual = divSubDecls "arguments" "Arguments" . subTable pkg qual
 
 
 subAssociatedTypes :: [Html] -> Html
 subAssociatedTypes = divSubDecls "associated-types" "Associated Types" . subBlock
 
 
-subConstructors :: Qualification -> [SubDecl] -> Html
-subConstructors qual = divSubDecls "constructors" "Constructors" . subTable qual
+subConstructors :: Maybe Package -> Qualification -> [SubDecl] -> Html
+subConstructors pkg qual = divSubDecls "constructors" "Constructors" . subTable pkg qual
 
-subPatterns :: Qualification -> [SubDecl] -> Html
-subPatterns qual = divSubDecls "bundled-patterns" "Bundled Patterns" . subTable qual
+subPatterns :: Maybe Package -> Qualification -> [SubDecl] -> Html
+subPatterns pkg qual = divSubDecls "bundled-patterns" "Bundled Patterns" . subTable pkg qual
 
-subFields :: Qualification -> [SubDecl] -> Html
-subFields qual = divSubDecls "fields" "Fields" . subDlist qual
+subFields :: Maybe Package -> Qualification -> [SubDecl] -> Html
+subFields pkg qual = divSubDecls "fields" "Fields" . subDlist pkg qual
 
 
-subEquations :: Qualification -> [SubDecl] -> Html
-subEquations qual = divSubDecls "equations" "Equations" . subTable qual
+subEquations :: Maybe Package -> Qualification -> [SubDecl] -> Html
+subEquations pkg qual = divSubDecls "equations" "Equations" . subTable pkg qual
 
 
 -- | Generate sub table for instance declarations, with source
-subInstances :: Qualification
+subInstances :: Maybe Package -> Qualification
              -> String -- ^ Class name, used for anchor generation
              -> LinksInfo -> Bool
              -> [(SubDecl,Located DocName)] -> Html
-subInstances qual nm lnks splice = maybe noHtml wrap . instTable
+subInstances pkg qual nm lnks splice = maybe noHtml wrap . instTable
   where
-    wrap = (subSection <<) . (subCaption +++)
-    instTable = fmap (thediv ! collapseSection id_ True [] <<) . subTableSrc qual lnks splice
+    wrap contents = subSection (collapseDetails id_ DetailsOpen (summary +++ contents))
+    instTable = subTableSrc pkg qual lnks splice
     subSection = thediv ! [theclass "subs instances"]
-    subCaption = paragraph ! collapseControl id_ True "caption" << "Instances"
+    summary = thesummary << "Instances"
     id_ = makeAnchorId $ "i:" ++ nm
 
 
-subOrphanInstances :: Qualification
+subOrphanInstances :: Maybe Package -> Qualification
                    -> LinksInfo -> Bool
                    -> [(SubDecl,Located DocName)] -> Html
-subOrphanInstances qual lnks splice  = maybe noHtml wrap . instTable
+subOrphanInstances pkg qual lnks splice  = maybe noHtml wrap . instTable
   where
     wrap = ((h1 << "Orphan instances") +++)
-    instTable = fmap (thediv ! collapseSection id_ True [] <<) . subTableSrc qual lnks splice
+    instTable = fmap (thediv ! [ identifier ("section." ++ id_) ] <<) . subTableSrc pkg qual lnks splice
     id_ = makeAnchorId $ "orphans"
 
 
@@ -222,26 +223,30 @@ subInstHead :: String -- ^ Instance unique id (for anchor generation)
 subInstHead iid hdr =
     expander noHtml <+> hdr
   where
-    expander = thespan ! collapseControl (instAnchorId iid) False "instance"
+    expander = thespan ! collapseControl (instAnchorId iid) "instance"
 
 
 subInstDetails :: String -- ^ Instance unique id (for anchor generation)
                -> [Html] -- ^ Associated type contents
                -> [Html] -- ^ Method contents (pretty-printed signatures)
+               -> Html   -- ^ Source module
                -> Html
-subInstDetails iid ats mets =
-    subInstSection iid << (subAssociatedTypes ats <+> subMethods mets)
+subInstDetails iid ats mets mdl =
+    subInstSection iid << (p mdl <+> subAssociatedTypes ats <+> subMethods mets)
 
 subFamInstDetails :: String -- ^ Instance unique id (for anchor generation)
                   -> Html   -- ^ Type or data family instance
+                  -> Html   -- ^ Source module TODO: use this
                   -> Html
-subFamInstDetails iid fi =
-    subInstSection iid << thediv ! [theclass "src"] << fi
+subFamInstDetails iid fi mdl =
+    subInstSection iid << (p mdl <+> (thediv ! [theclass "src"] << fi))
 
 subInstSection :: String -- ^ Instance unique id (for anchor generation)
                -> Html
                -> Html
-subInstSection iid = thediv ! collapseSection (instAnchorId iid) False "inst-details"
+subInstSection iid contents = collapseDetails (instAnchorId iid) DetailsClosed (summary +++ contents)
+  where
+    summary = thesummary ! [ theclass "hide-when-js-enabled" ] << "Instance details"
 
 instAnchorId :: String -> String
 instAnchorId iid = makeAnchorId $ "i:" ++ iid

@@ -1,5 +1,5 @@
 name:         transformers
-version:      0.5.2.0
+version:      0.5.5.0
 license:      BSD3
 license-file: LICENSE
 author:       Andy Gill, Ross Paterson
@@ -17,7 +17,6 @@ description:
     This package contains:
     .
     * the monad transformer class (in "Control.Monad.Trans.Class")
-      and IO monad class (in "Control.Monad.IO.Class")
     .
     * concrete functor and monad transformers, each with associated
       operations and functions to lift operations associated with other
@@ -65,6 +64,7 @@ library
     Control.Applicative.Backwards
     Control.Applicative.Lift
     Control.Monad.Signatures
+    Control.Monad.Trans.Accum
     Control.Monad.Trans.Class
     Control.Monad.Trans.Cont
     Control.Monad.Trans.Except
@@ -76,6 +76,7 @@ library
     Control.Monad.Trans.RWS
     Control.Monad.Trans.RWS.Lazy
     Control.Monad.Trans.RWS.Strict
+    Control.Monad.Trans.Select
     Control.Monad.Trans.State
     Control.Monad.Trans.State.Lazy
     Control.Monad.Trans.State.Strict

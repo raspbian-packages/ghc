@@ -3,6 +3,7 @@
 #if __GLASGOW_HASKELL__ >= 703
 {-# LANGUAGE Trustworthy #-}
 #endif
+{-# OPTIONS_HADDOCK not-home #-}
 
 #include "containers.h"
 
@@ -85,6 +86,7 @@ module Data.Map.Strict.Internal
 
     -- * Map type
     Map(..)          -- instance Eq,Show,Read
+    , L.Size
 
     -- * Operators
     , (!), (!?), (\\)
@@ -1432,7 +1434,8 @@ mapAccumRWithKey f a (Bin sx kx x l r) =
 --
 -- The size of the result may be smaller if @f@ maps two or more distinct
 -- keys to the same new key.  In this case the associated values will be
--- combined using @c@.
+-- combined using @c@. The value at the greater of the two original keys
+-- is used as the first argument to @c@.
 --
 -- > mapKeysWith (++) (\ _ -> 1) (fromList [(1,"b"), (2,"a"), (3,"d"), (4,"c")]) == singleton 1 "cdab"
 -- > mapKeysWith (++) (\ _ -> 3) (fromList [(1,"b"), (2,"a"), (3,"d"), (4,"c")]) == singleton 3 "cdab"

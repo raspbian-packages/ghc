@@ -46,6 +46,8 @@ module System.Process (
 
     -- ** Related utilities
     showCommandForUser,
+    Pid,
+    getPid,
 
     -- ** Control-C handling on Unix
     -- $ctlc-handling
@@ -77,7 +79,7 @@ import System.Process.Internals
 
 import Control.Concurrent
 import Control.DeepSeq (rnf)
-import Control.Exception (SomeException, mask, bracket, try, throwIO)
+import Control.Exception (SomeException, mask, allowInterrupt, bracket, try, throwIO)
 import qualified Control.Exception as C
 import Control.Monad
 import Data.Maybe
@@ -87,12 +89,24 @@ import System.Exit      ( ExitCode(..) )
 import System.IO
 import System.IO.Error (mkIOError, ioeSetErrorString)
 
--- Provide the data constructors for CPid on GHC 7.4 and later
-#if !defined(WINDOWS) && MIN_VERSION_base(4,5,0)
+#if defined(WINDOWS)
+import System.Win32.Process (getProcessId, ProcessId)
+#else
 import System.Posix.Types (CPid (..))
 #endif
 
 import GHC.IO.Exception ( ioException, IOErrorType(..), IOException(..) )
+
+-- | The platform specific type for a process identifier.
+--
+-- This is always an integral type. Width and signedness are platform specific.
+--
+-- @since 1.6.3.0
+#if defined(WINDOWS)
+type Pid = ProcessId
+#else
+type Pid = CPid
+#endif
 
 -- ----------------------------------------------------------------------------
 -- createProcess
@@ -209,7 +223,7 @@ createProcess cp = do
 --
 -- e.g.
 --
--- > withCreateProcess (proc cmd args) { ... }  $ \_ _ _ ph -> do
+-- > withCreateProcess (proc cmd args) { ... }  $ \stdin stdout stderr ph -> do
 -- >   ...
 --
 -- @since 1.4.3.0
@@ -563,6 +577,31 @@ showCommandForUser cmd args = unwords (map translate (cmd : args))
 
 
 -- ----------------------------------------------------------------------------
+-- getPid
+
+-- | Returns the PID (process ID) of a subprocess.
+--
+-- 'Nothing' is returned if the handle was already closed. Otherwise a
+-- PID is returned that remains valid as long as the handle is open.
+-- The operating system may reuse the PID as soon as the last handle to
+-- the process is closed.
+--
+-- @since 1.6.3.0
+getPid :: ProcessHandle -> IO (Maybe Pid)
+getPid (ProcessHandle mh _ _) = do
+  p_ <- readMVar mh
+  case p_ of
+#ifdef WINDOWS
+    OpenHandle h -> do
+      pid <- getProcessId h
+      return $ Just pid
+#else
+    OpenHandle pid -> return $ Just pid
+#endif
+    _ -> return Nothing
+
+
+-- ----------------------------------------------------------------------------
 -- waitForProcess
 
 {- | Waits for the specified process to terminate, and returns its exit code.
@@ -589,7 +628,7 @@ waitForProcess ph@(ProcessHandle _ delegating_ctlc _) = lockWaitpid $ do
     OpenHandle h  -> do
         e <- alloca $ \pret -> do
           -- don't hold the MVar while we call c_waitForProcess...
-          throwErrnoIfMinus1Retry_ "waitForProcess" (c_waitForProcess h pret)
+          throwErrnoIfMinus1Retry_ "waitForProcess" (allowInterrupt >> c_waitForProcess h pret)
           modifyProcessHandle ph $ \p_' ->
             case p_' of
               ClosedHandle e  -> return (p_', e)

@@ -47,6 +47,8 @@ module PIC (
 
 where
 
+import GhcPrelude
+
 import qualified PPC.Instr      as PPC
 import qualified PPC.Regs       as PPC
 
@@ -58,7 +60,7 @@ import Reg
 import NCGMonad
 
 
-import Hoopl
+import Hoopl.Collections
 import Cmm
 import CLabel           ( CLabel, ForeignLabelSource(..), pprCLabel,
                           mkDynamicLinkerLabel, DynamicLinkerLabelInfo(..),

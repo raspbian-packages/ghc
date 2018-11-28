@@ -49,8 +49,13 @@ module DsMonad (
         CanItFail(..), orFail,
 
         -- Levity polymorphism
-        dsNoLevPoly, dsNoLevPolyExpr, dsWhenNoErrs
+        dsNoLevPoly, dsNoLevPolyExpr, dsWhenNoErrs,
+
+        -- Trace injection
+        pprRuntimeTrace
     ) where
+
+import GhcPrelude
 
 import TcRnMonad
 import FamInstEnv
@@ -85,6 +90,7 @@ import Maybes
 import Var (EvVar)
 import qualified GHC.LanguageExtensions as LangExt
 import UniqFM ( lookupWithDefaultUFM )
+import Literal ( mkMachString )
 
 import Data.IORef
 import Control.Monad
@@ -105,7 +111,7 @@ instance Outputable DsMatchContext where
   ppr (DsMatchContext hs_match ss) = ppr ss <+> pprMatchContext hs_match
 
 data EquationInfo
-  = EqnInfo { eqn_pats :: [Pat Id],     -- The patterns for an eqn
+  = EqnInfo { eqn_pats :: [Pat GhcTc],  -- The patterns for an eqn
               eqn_rhs  :: MatchResult } -- What to do after match
 
 instance Outputable EquationInfo where
@@ -289,8 +295,7 @@ it easier to read debugging output.
 
 Note [Levity polymorphism checking]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-According to the Levity Polymorphism paper
-<http://cs.brynmawr.edu/~rae/papers/2017/levity/levity.pdf>, levity
+According to the "Levity Polymorphism" paper (PLDI '17), levity
 polymorphism is forbidden in precisely two places: in the type of a bound
 term-level argument and in the type of an argument to a function. The paper
 explains it more fully, but briefly: expressions in these contexts need to be
@@ -731,3 +736,31 @@ dsLookupDPHRdrEnv_maybe occ
            _     -> pprPanic multipleNames (ppr occ)
        }
   where multipleNames = "Multiple definitions in 'Data.Array.Parallel' and 'Data.Array.Parallel.Prim':"
+
+-- | Inject a trace message into the compiled program. Whereas
+-- pprTrace prints out information *while compiling*, pprRuntimeTrace
+-- captures that information and causes it to be printed *at runtime*
+-- using Debug.Trace.trace.
+--
+--   pprRuntimeTrace hdr doc expr
+--
+-- will produce an expression that looks like
+--
+--   trace (hdr + doc) expr
+--
+-- When using this to debug a module that Debug.Trace depends on,
+-- it is necessary to import {-# SOURCE #-} Debug.Trace () in that
+-- module. We could avoid this inconvenience by wiring in Debug.Trace.trace,
+-- but that doesn't seem worth the effort and maintenance cost.
+pprRuntimeTrace :: String   -- ^ header
+                -> SDoc     -- ^ information to output
+                -> CoreExpr -- ^ expression
+                -> DsM CoreExpr
+pprRuntimeTrace str doc expr = do
+  traceId <- dsLookupGlobalId traceName
+  unpackCStringId <- dsLookupGlobalId unpackCStringName
+  dflags <- getDynFlags
+  let message :: CoreExpr
+      message = App (Var unpackCStringId) $
+                Lit $ mkMachString $ showSDoc dflags (hang (text str) 4 doc)
+  return $ mkApps (Var traceId) [Type (exprType expr), message, expr]

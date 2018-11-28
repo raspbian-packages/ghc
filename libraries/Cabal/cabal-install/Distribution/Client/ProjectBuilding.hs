@@ -35,6 +35,10 @@ module Distribution.Client.ProjectBuilding (
     BuildFailureReason(..),
   ) where
 
+#if !MIN_VERSION_base(4,8,0)
+import Control.Applicative ((<$>))
+#endif
+
 import           Distribution.Client.PackageHash (renderPackageHashInputs)
 import           Distribution.Client.RebuildMonad
 import           Distribution.Client.ProjectConfig
@@ -65,6 +69,7 @@ import           Distribution.Package hiding (InstalledPackageId, installedPacka
 import qualified Distribution.PackageDescription as PD
 import           Distribution.InstalledPackageInfo (InstalledPackageInfo)
 import qualified Distribution.InstalledPackageInfo as Installed
+import           Distribution.Simple.BuildPaths (haddockDirName)
 import qualified Distribution.Simple.InstallDirs as InstallDirs
 import           Distribution.Types.BuildType
 import           Distribution.Simple.Program
@@ -87,6 +92,7 @@ import qualified Data.Map as Map
 import           Data.Set (Set)
 import qualified Data.Set as Set
 import qualified Data.ByteString.Lazy as LBS
+import           Data.List (isPrefixOf)
 
 import           Control.Monad
 import           Control.Exception
@@ -96,6 +102,12 @@ import           System.FilePath
 import           System.IO
 import           System.Directory
 
+#if !MIN_VERSION_directory(1,2,5)
+listDirectory :: FilePath -> IO [FilePath]
+listDirectory path =
+  (filter f) <$> (getDirectoryContents path)
+  where f filename = filename /= "." && filename /= ".."
+#endif
 
 ------------------------------------------------------------------------------
 -- * Overall building strategy.
@@ -356,6 +368,7 @@ packageFileMonitorKeyValues elab =
         elab {
             elabBuildTargets  = [],
             elabTestTargets   = [],
+            elabBenchTargets   = [],
             elabReplTarget    = Nothing,
             elabBuildHaddocks = False
         }
@@ -676,7 +689,7 @@ rebuildTarget verbosity
           verbosity distDirLayout storeDirLayout
           buildSettings registerLock cacheLock
           sharedPackageConfig
-          rpkg
+          plan rpkg
           srcdir builddir'
       where
         builddir' = makeRelative srcdir builddir
@@ -692,8 +705,9 @@ rebuildTarget verbosity
           buildStatus
           srcdir builddir
 
---TODO: [nice to have] do we need to use a with-style for the temp files for downloading http
--- packages, or are we going to cache them persistently?
+-- TODO: [nice to have] do we need to use a with-style for the temp
+-- files for downloading http packages, or are we going to cache them
+-- persistently?
 
 -- | Given the current 'InstallPlan' and 'BuildStatusMap', select all the
 -- packages we have to download and fork off an async action to download them.
@@ -824,7 +838,7 @@ unpackPackageTarball verbosity tarball parentdir pkgid pkgTextOverride =
       -- Sanity check
       --
       exists <- doesFileExist cabalFile
-      when (not exists) $
+      unless exists $
         die' verbosity $ "Package .cabal file not found in the tarball: " ++ cabalFile
 
       -- Overwrite the .cabal with the one from the index, when appropriate
@@ -870,6 +884,7 @@ buildAndInstallUnpackedPackage :: Verbosity
                                -> StoreDirLayout
                                -> BuildTimeSettings -> Lock -> Lock
                                -> ElaboratedSharedConfig
+                               -> ElaboratedInstallPlan
                                -> ElaboratedReadyPackage
                                -> FilePath -> FilePath
                                -> IO BuildResult
@@ -888,7 +903,7 @@ buildAndInstallUnpackedPackage verbosity
                                  pkgConfigCompiler      = compiler,
                                  pkgConfigCompilerProgs = progdb
                                }
-                               rpkg@(ReadyPackage pkg)
+                               plan rpkg@(ReadyPackage pkg)
                                srcdir builddir = do
 
     createDirectoryIfMissingVerbose verbosity True builddir
@@ -922,6 +937,13 @@ buildAndInstallUnpackedPackage verbosity
     annotateFailure mlogFile BuildFailed $
       setup buildCommand buildFlags
 
+    -- Haddock phase
+    whenHaddock $ do
+      when isParallelBuild $
+        notice verbosity $ "Generating " ++ dispname ++ " documentation..."
+      annotateFailureNoLog HaddocksFailed $
+        setup haddockCommand haddockFlags
+
     -- Install phase
     annotateFailure mlogFile InstallFailed $ do
 
@@ -935,9 +957,25 @@ buildAndInstallUnpackedPackage verbosity
             LBS.writeFile
               (entryDir </> "cabal-hash.txt")
               (renderPackageHashInputs (packageHashInputs pkgshared pkg))
+
+            -- Ensure that there are no files in `tmpDir`, that are not in `entryDir`
+            -- While this breaks the prefix-relocatable property of the lirbaries
+            -- it is necessary on macOS to stay under the load command limit of the
+            -- macOS mach-o linker. See also @PackageHash.hashedInstalledPackageIdVeryShort@.
+            otherFiles <- filter (not . isPrefixOf entryDir) <$> listFilesRecursive tmpDir
             -- here's where we could keep track of the installed files ourselves
             -- if we wanted to by making a manifest of the files in the tmp dir
-            return entryDir
+            return (entryDir, otherFiles)
+            where
+              listFilesRecursive :: FilePath -> IO [FilePath]
+              listFilesRecursive path = do
+                files <- fmap (path </>) <$> (listDirectory path)
+                allFiles <- forM files $ \file -> do
+                  isDir <- doesDirectoryExist file
+                  if isDir
+                    then listFilesRecursive file
+                    else return [file]
+                return (concat allFiles)
 
           registerPkg
             | not (elabRequiresRegistration pkg) =
@@ -992,6 +1030,10 @@ buildAndInstallUnpackedPackage verbosity
 
     isParallelBuild = buildSettingNumJobs >= 2
 
+    whenHaddock action
+      | elabBuildHaddocks pkg = action
+      | otherwise             = return ()
+
     configureCommand = Cabal.configureCommand defaultProgramDb
     configureFlags v = flip filterConfigureFlags v $
                        setupHsConfigureFlags rpkg pkgshared
@@ -1000,6 +1042,10 @@ buildAndInstallUnpackedPackage verbosity
 
     buildCommand     = Cabal.buildCommand defaultProgramDb
     buildFlags   _   = setupHsBuildFlags pkg pkgshared verbosity builddir
+
+    haddockCommand   = Cabal.haddockCommand
+    haddockFlags _   = setupHsHaddockFlags pkg pkgshared
+                                           verbosity builddir
 
     generateInstalledPackageInfo :: IO InstalledPackageInfo
     generateInstalledPackageInfo =
@@ -1014,7 +1060,7 @@ buildAndInstallUnpackedPackage verbosity
     copyFlags destdir _ = setupHsCopyFlags pkg pkgshared verbosity
                                            builddir destdir
 
-    scriptOptions = setupHsScriptOptions rpkg pkgshared srcdir builddir
+    scriptOptions = setupHsScriptOptions rpkg plan pkgshared srcdir builddir
                                          isParallelBuild cacheLock
 
     setup :: CommandUI flags -> (Version -> flags) -> IO ()
@@ -1025,7 +1071,9 @@ buildAndInstallUnpackedPackage verbosity
       withLogging $ \mLogFileHandle ->
         setupWrapper
           verbosity
-          scriptOptions { useLoggingHandle = mLogFileHandle }
+          scriptOptions
+            { useLoggingHandle     = mLogFileHandle
+            , useExtraEnvOverrides = dataDirsEnvironmentForPlan plan }
           (Just (elabPkgDescription pkg))
           cmd flags args
 
@@ -1061,7 +1109,8 @@ buildInplaceUnpackedPackage :: Verbosity
 buildInplaceUnpackedPackage verbosity
                             distDirLayout@DistDirLayout {
                               distTempDirectory,
-                              distPackageCacheDirectory
+                              distPackageCacheDirectory,
+                              distDirectory
                             }
                             BuildTimeSettings{buildSettingNumJobs}
                             registerLock cacheLock
@@ -1108,7 +1157,7 @@ buildInplaceUnpackedPackage verbosity
               ifNullThen m m' = do xs <- m
                                    if null xs then m' else return xs
           monitors <- case PD.buildType (elabPkgDescription pkg) of
-            Just Simple -> listSimple
+            Simple -> listSimple
             -- If a Custom setup was used, AND the Cabal is recent
             -- enough to have sdist --list-sources, use that to
             -- determine the files that we need to track.  This can
@@ -1158,6 +1207,10 @@ buildInplaceUnpackedPackage verbosity
           annotateFailureNoLog TestsFailed $
             setup testCommand testFlags testArgs
 
+        whenBench $
+          annotateFailureNoLog BenchFailed $
+            setup benchCommand benchFlags benchArgs
+
         -- Repl phase
         --
         whenRepl $
@@ -1166,8 +1219,15 @@ buildInplaceUnpackedPackage verbosity
 
         -- Haddock phase
         whenHaddock $
-          annotateFailureNoLog HaddocksFailed $
-          setup haddockCommand haddockFlags []
+          annotateFailureNoLog HaddocksFailed $ do
+            setup haddockCommand haddockFlags []
+            let haddockTarget = elabHaddockForHackage pkg
+            when (haddockTarget == Cabal.ForHackage) $ do
+              let dest = distDirectory </> name <.> "tar.gz"
+                  name = haddockDirName haddockTarget (elabPkgDescription pkg)
+                  docDir = distBuildDirectory distDirLayout dparams </> "doc" </> "html"
+              Tar.createTarGzFile dest docDir name
+              notice verbosity $ "Documentation tarball created: " ++ dest
 
         return BuildResult {
           buildResultDocs    = docsResult,
@@ -1189,13 +1249,18 @@ buildInplaceUnpackedPackage verbosity
 
     whenRebuild action
       | null (elabBuildTargets pkg)
-      -- NB: we have to build the test suite!
-      , null (elabTestTargets pkg) = return ()
+      -- NB: we have to build the test/bench suite!
+      , null (elabTestTargets pkg)
+      , null (elabBenchTargets pkg) = return ()
       | otherwise                   = action
 
     whenTest action
       | null (elabTestTargets pkg) = return ()
       | otherwise                  = action
+
+    whenBench action
+      | null (elabBenchTargets pkg) = return ()
+      | otherwise                   = action
 
     whenRepl action
       | isNothing (elabReplTarget pkg) = return ()
@@ -1229,6 +1294,11 @@ buildInplaceUnpackedPackage verbosity
                                          verbosity builddir
     testArgs         = setupHsTestArgs  pkg
 
+    benchCommand     = Cabal.benchmarkCommand
+    benchFlags    _  = setupHsBenchFlags pkg pkgshared
+                                          verbosity builddir
+    benchArgs        = setupHsBenchArgs  pkg
+
     replCommand      = Cabal.replCommand defaultProgramDb
     replFlags _      = setupHsReplFlags pkg pkgshared
                                         verbosity builddir
@@ -1238,7 +1308,7 @@ buildInplaceUnpackedPackage verbosity
     haddockFlags _   = setupHsHaddockFlags pkg pkgshared
                                            verbosity builddir
 
-    scriptOptions    = setupHsScriptOptions rpkg pkgshared
+    scriptOptions    = setupHsScriptOptions rpkg plan pkgshared
                                             srcdir builddir
                                             isParallelBuild cacheLock
 

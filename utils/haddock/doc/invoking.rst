@@ -39,7 +39,7 @@ The following options are available:
 
 .. option:: -B <dir>
 
-    Tell GHC that that its lib directory is dir. Can be used to override
+    Tell GHC that its lib directory is dir. Can be used to override
     the default path.
 
 .. option:: -o <dir>
@@ -87,6 +87,11 @@ The following options are available:
     that refers to the modules currently being processed - see the
     :option:`--read-interface` option for more details. The interface file is
     in a binary format; don't try to read it.
+
+.. option:: --show-interface=<file>
+
+    Dumps a binary interface file to stdout in a human readable fashion.
+    Uses json as output format.
 
 .. [1]
    Haddock interface files are not the same as Haskell interface files,

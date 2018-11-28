@@ -11,6 +11,8 @@
 
 module FloatOut ( floatOutwards ) where
 
+import GhcPrelude
+
 import CoreSyn
 import CoreUtils
 import MkCore
@@ -21,7 +23,6 @@ import DynFlags
 import ErrUtils         ( dumpIfSet_dyn )
 import Id               ( Id, idArity, idType, isBottomingId,
                           isJoinId, isJoinId_maybe )
-import Var              ( Var )
 import SetLevels
 import UniqSupply       ( UniqSupply )
 import Bag

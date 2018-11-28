@@ -1,6 +1,3 @@
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE DeriveGeneric #-}
-
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.PackageDescription
@@ -18,6 +15,8 @@ module Distribution.PackageDescription (
         PackageDescription(..),
         emptyPackageDescription,
         specVersion,
+        buildType,
+        license,
         descCabalVersion,
         BuildType(..),
         knownBuildTypes,
@@ -77,9 +76,11 @@ module Distribution.PackageDescription (
         allLanguages,
         allExtensions,
         usedExtensions,
+        usesTemplateHaskellOrQQ,
         hcOptions,
         hcProfOptions,
         hcSharedOptions,
+        hcStaticOptions,
 
         -- ** Supplementary build information
         ComponentName(..),
@@ -92,9 +93,11 @@ module Distribution.PackageDescription (
         GenericPackageDescription(..),
         Flag(..), emptyFlag,
         FlagName, mkFlagName, unFlagName,
-        FlagAssignment,
-        showFlagValue,
-        dispFlagAssignment, parseFlagAssignment,
+        FlagAssignment, mkFlagAssignment, unFlagAssignment,
+        nullFlagAssignment, showFlagValue,
+        diffFlagAssignment, lookupFlagAssignment, insertFlagAssignment,
+        dispFlagAssignment, parseFlagAssignment, parsecFlagAssignment,
+        findDuplicateFlagAssignments,
         CondTree(..), ConfVar(..), Condition(..),
         cNot, cAnd, cOr,
 

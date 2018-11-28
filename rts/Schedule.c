@@ -44,10 +44,10 @@
 #include "Stable.h"
 #include "TopHandler.h"
 
-#ifdef HAVE_SYS_TYPES_H
+#if defined(HAVE_SYS_TYPES_H)
 #include <sys/types.h>
 #endif
-#ifdef HAVE_UNISTD_H
+#if defined(HAVE_UNISTD_H)
 #include <unistd.h>
 #endif
 
@@ -55,11 +55,11 @@
 #include <stdlib.h>
 #include <stdarg.h>
 
-#ifdef HAVE_ERRNO_H
+#if defined(HAVE_ERRNO_H)
 #include <errno.h>
 #endif
 
-#ifdef TRACING
+#if defined(TRACING)
 #include "eventlog/EventLog.h"
 #endif
 /* -----------------------------------------------------------------------------
@@ -154,7 +154,7 @@ static void scheduleDoGC(Capability **pcap, Task *task, bool force_major);
 static void deleteThread (Capability *cap, StgTSO *tso);
 static void deleteAllThreads (Capability *cap);
 
-#ifdef FORKPROCESS_PRIMOP_SUPPORTED
+#if defined(FORKPROCESS_PRIMOP_SUPPORTED)
 static void deleteThread_(Capability *cap, StgTSO *tso);
 #endif
 
@@ -375,7 +375,7 @@ schedule (Capability *initialCapability, Task *task)
     // them back if it rises again.  Presumably we should, but after
     // the thread has been migrated we no longer know what capability
     // it was originally on.
-#ifdef THREADED_RTS
+#if defined(THREADED_RTS)
     if (cap->disabled && !t->bound) {
         Capability *dest_cap = capabilities[cap->no % enabled_capabilities];
         migrateThread(cap, t, dest_cap);
@@ -411,7 +411,7 @@ run_thread:
     prev_what_next = t->what_next;
 
     errno = t->saved_errno;
-#if mingw32_HOST_OS
+#if defined(mingw32_HOST_OS)
     SetLastError(t->saved_winerror);
 #endif
 
@@ -432,7 +432,7 @@ run_thread:
         uint32_t prev;
         prev = xchg((P_)&recent_activity, ACTIVITY_YES);
         if (prev == ACTIVITY_DONE_GC) {
-#ifndef PROFILING
+#if !defined(PROFILING)
             startTimer();
 #endif
         }
@@ -473,7 +473,7 @@ run_thread:
         break;
 
     default:
-        barf("schedule: invalid what_next field");
+        barf("schedule: invalid prev_what_next=%u field", prev_what_next);
     }
 
     cap->in_haskell = false;
@@ -490,7 +490,7 @@ run_thread:
     // XXX: possibly bogus for SMP because this thread might already
     // be running again, see code below.
     t->saved_errno = errno;
-#if mingw32_HOST_OS
+#if defined(mingw32_HOST_OS)
     // Similarly for Windows error code
     t->saved_winerror = GetLastError();
 #endif
@@ -993,8 +993,8 @@ scheduleProcessInbox (Capability **pcap USED_IF_THREADS)
     Capability *cap = *pcap;
 
     while (!emptyInbox(cap)) {
-        if (cap->r.rCurrentNursery->link == NULL ||
-            g0->n_new_large_words >= large_alloc_lim) {
+        // Executing messages might use heap, so we should check for GC.
+        if (doYouWantToGC(cap)) {
             scheduleDoGC(pcap, cap->running_task, false);
             cap = *pcap;
         }
@@ -1183,20 +1183,7 @@ scheduleHandleHeapOverflow( Capability *cap, StgTSO *t )
         }
     }
 
-    // if we got here because we exceeded large_alloc_lim, then
-    // proceed straight to GC.
-    if (g0->n_new_large_words >= large_alloc_lim) {
-        return true;
-    }
-
-    // Otherwise, we just ran out of space in the current nursery.
-    // Grab another nursery if we can.
-    if (getNewNursery(cap)) {
-        debugTrace(DEBUG_sched, "thread %ld got a new nursery", t->id);
-        return false;
-    }
-
-    return true;
+    return doYouWantToGC(cap);
     /* actual GC is done at the end of the while loop in schedule() */
 }
 
@@ -1266,7 +1253,7 @@ scheduleHandleThreadBlocked( StgTSO *t
     //      threadPaused() might have raised a blocked throwTo
     //      exception, see maybePerformBlockedException().
 
-#ifdef DEBUG
+#if defined(DEBUG)
     traceThreadStatus(DEBUG_sched, t);
 #endif
 }
@@ -1340,7 +1327,7 @@ scheduleHandleThreadFinished (Capability *cap STG_UNUSED, Task *task, StgTSO *t)
                   task->incall->rstat = Killed;
               }
           }
-#ifdef DEBUG
+#if defined(DEBUG)
           removeThreadLabel((StgWord)task->incall->tso->id);
 #endif
 
@@ -1470,7 +1457,7 @@ static bool requestSync (
  * ensue if another thread is trying to synchronise.
  * -------------------------------------------------------------------------- */
 
-#ifdef THREADED_RTS
+#if defined(THREADED_RTS)
 static void acquireAllCapabilities(Capability *cap, Task *task)
 {
     Capability *tmpcap;
@@ -1505,7 +1492,7 @@ static void acquireAllCapabilities(Capability *cap, Task *task)
  * the one passed in as cap.
  * -------------------------------------------------------------------------- */
 
-#ifdef THREADED_RTS
+#if defined(THREADED_RTS)
 static void releaseAllCapabilities(uint32_t n, Capability *cap, Task *task)
 {
     uint32_t i;
@@ -1532,7 +1519,7 @@ scheduleDoGC (Capability **pcap, Task *task USED_IF_THREADS,
     bool heap_census;
     uint32_t collect_gen;
     bool major_gc;
-#ifdef THREADED_RTS
+#if defined(THREADED_RTS)
     uint32_t gc_type;
     uint32_t i;
     uint32_t need_idle;
@@ -1559,7 +1546,7 @@ scheduleDoGC (Capability **pcap, Task *task USED_IF_THREADS,
     collect_gen = calcNeeded(force_major || heap_census, NULL);
     major_gc = (collect_gen == RtsFlags.GcFlags.generations-1);
 
-#ifdef THREADED_RTS
+#if defined(THREADED_RTS)
     if (sched_state < SCHED_INTERRUPTING
         && RtsFlags.ParFlags.parGcEnabled
         && collect_gen >= RtsFlags.ParFlags.parGcGen
@@ -1672,7 +1659,7 @@ scheduleDoGC (Capability **pcap, Task *task USED_IF_THREADS,
 
     stat_startGCSync(gc_threads[cap->no]);
 
-#ifdef DEBUG
+#if defined(DEBUG)
     unsigned int old_n_capabilities = n_capabilities;
 #endif
 
@@ -1832,7 +1819,7 @@ delete_threads_and_gc:
             // fact that we've done a GC and turn off the timer signal;
             // it will get re-enabled if we run any threads after the GC.
             recent_activity = ACTIVITY_DONE_GC;
-#ifndef PROFILING
+#if !defined(PROFILING)
             stopTimer();
 #endif
             break;
@@ -1933,7 +1920,7 @@ delete_threads_and_gc:
             throwToSelf(cap, main_thread, heapOverflow_closure);
         }
     }
-#ifdef SPARKBALANCE
+#if defined(SPARKBALANCE)
     /* JB
        Once we are all together... this would be the place to balance all
        spark pools. No concurrent stealing or adding of new sparks can
@@ -1959,12 +1946,12 @@ delete_threads_and_gc:
 
 pid_t
 forkProcess(HsStablePtr *entry
-#ifndef FORKPROCESS_PRIMOP_SUPPORTED
+#if !defined(FORKPROCESS_PRIMOP_SUPPORTED)
             STG_UNUSED
 #endif
            )
 {
-#ifdef FORKPROCESS_PRIMOP_SUPPORTED
+#if defined(FORKPROCESS_PRIMOP_SUPPORTED)
     pid_t pid;
     StgTSO* t,*next;
     Capability *cap;
@@ -1979,7 +1966,7 @@ forkProcess(HsStablePtr *entry
     cap = NULL;
     waitForCapability(&cap, task);
 
-#ifdef THREADED_RTS
+#if defined(THREADED_RTS)
     stopAllCapabilities(&cap, task);
 #endif
 
@@ -1996,7 +1983,7 @@ forkProcess(HsStablePtr *entry
         ACQUIRE_LOCK(&capabilities[i]->lock);
     }
 
-#ifdef THREADED_RTS
+#if defined(THREADED_RTS)
     ACQUIRE_LOCK(&all_tasks_mutex);
 #endif
 
@@ -2017,14 +2004,14 @@ forkProcess(HsStablePtr *entry
         RELEASE_LOCK(&stable_mutex);
         RELEASE_LOCK(&task->lock);
 
+#if defined(THREADED_RTS)
+        RELEASE_LOCK(&all_tasks_mutex);
+#endif
+
         for (i=0; i < n_capabilities; i++) {
             releaseCapability_(capabilities[i],false);
             RELEASE_LOCK(&capabilities[i]->lock);
         }
-
-#ifdef THREADED_RTS
-        RELEASE_LOCK(&all_tasks_mutex);
-#endif
 
         boundTaskExiting(task);
 
@@ -2046,7 +2033,7 @@ forkProcess(HsStablePtr *entry
         initMutex(&all_tasks_mutex);
 #endif
 
-#ifdef TRACING
+#if defined(TRACING)
         resetTracing();
 #endif
 
@@ -2178,7 +2165,13 @@ setNumCapabilities (uint32_t new_n_capabilities USED_IF_THREADS)
     Capability *old_capabilities = NULL;
     uint32_t old_n_capabilities = n_capabilities;
 
-    if (new_n_capabilities == enabled_capabilities) return;
+    if (new_n_capabilities == enabled_capabilities) {
+        return;
+    } else if (new_n_capabilities <= 0) {
+        errorBelch("setNumCapabilities: Capability count must be positive");
+        return;
+    }
+
 
     debugTrace(DEBUG_sched, "changing the number of Capabilities from %d to %d",
                enabled_capabilities, new_n_capabilities);
@@ -2373,12 +2366,12 @@ suspendThread (StgRegTable *reg, bool interruptible)
   int saved_errno;
   StgTSO *tso;
   Task *task;
-#if mingw32_HOST_OS
+#if defined(mingw32_HOST_OS)
   StgWord32 saved_winerror;
 #endif
 
   saved_errno = errno;
-#if mingw32_HOST_OS
+#if defined(mingw32_HOST_OS)
   saved_winerror = GetLastError();
 #endif
 
@@ -2418,7 +2411,7 @@ suspendThread (StgRegTable *reg, bool interruptible)
   RELEASE_LOCK(&cap->lock);
 
   errno = saved_errno;
-#if mingw32_HOST_OS
+#if defined(mingw32_HOST_OS)
   SetLastError(saved_winerror);
 #endif
   return task;
@@ -2432,12 +2425,12 @@ resumeThread (void *task_)
     Capability *cap;
     Task *task = task_;
     int saved_errno;
-#if mingw32_HOST_OS
+#if defined(mingw32_HOST_OS)
     StgWord32 saved_winerror;
 #endif
 
     saved_errno = errno;
-#if mingw32_HOST_OS
+#if defined(mingw32_HOST_OS)
     saved_winerror = GetLastError();
 #endif
 
@@ -2474,7 +2467,7 @@ resumeThread (void *task_)
     cap->r.rCurrentTSO = tso;
     cap->in_haskell = true;
     errno = saved_errno;
-#if mingw32_HOST_OS
+#if defined(mingw32_HOST_OS)
     SetLastError(saved_winerror);
 #endif
 
@@ -2815,7 +2808,7 @@ deleteThread (Capability *cap STG_UNUSED, StgTSO *tso)
     }
 }
 
-#ifdef FORKPROCESS_PRIMOP_SUPPORTED
+#if defined(FORKPROCESS_PRIMOP_SUPPORTED)
 static void
 deleteThread_(Capability *cap, StgTSO *tso)
 { // for forkProcess only:
@@ -2834,7 +2827,7 @@ deleteThread_(Capability *cap, StgTSO *tso)
 /* -----------------------------------------------------------------------------
    raiseExceptionHelper
 
-   This function is called by the raise# primitve, just so that we can
+   This function is called by the raise# primitive, just so that we can
    move some of the tricky bits of raising an exception from C-- into
    C.  Who knows, it might be a useful re-useable thing here too.
    -------------------------------------------------------------------------- */

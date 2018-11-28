@@ -53,7 +53,6 @@ module Distribution.Simple.Configure (configure,
                                       ConfigStateFileError(..),
                                       tryGetConfigStateFile,
                                       platformDefines,
-                                      relaxPackageDeps,
                                      )
     where
 
@@ -113,19 +112,22 @@ import qualified Distribution.Simple.HaskellSuite as HaskellSuite
 
 import Control.Exception
     ( ErrorCall, Exception, evaluate, throw, throwIO, try )
-import Distribution.Compat.Binary ( decodeOrFailIO, encode )
-import Data.ByteString.Lazy (ByteString)
+import Control.Monad ( forM, forM_ )
+import Distribution.Compat.Binary    ( decodeOrFailIO, encode )
+import Distribution.Compat.Directory ( listDirectory )
+import Data.ByteString.Lazy          ( ByteString )
 import qualified Data.ByteString            as BS
 import qualified Data.ByteString.Lazy.Char8 as BLC8
 import Data.List
-    ( (\\), partition, inits, stripPrefix )
+    ( (\\), partition, inits, stripPrefix, intersect )
 import Data.Either
     ( partitionEithers )
 import qualified Data.Map as Map
 import System.Directory
-    ( doesFileExist, createDirectoryIfMissing, getTemporaryDirectory )
+    ( doesFileExist, createDirectoryIfMissing, getTemporaryDirectory
+    , removeFile)
 import System.FilePath
-    ( (</>), isAbsolute )
+    ( (</>), isAbsolute, takeDirectory )
 import qualified System.Info
     ( compilerName, compilerVersion )
 import System.IO
@@ -137,6 +139,7 @@ import Text.PrettyPrint
     , punctuate, quotes, render, renderStyle, sep, text )
 import Distribution.Compat.Environment ( lookupEnv )
 import Distribution.Compat.Exception ( catchExit, catchIO )
+
 
 type UseExternalInternalDeps = Bool
 
@@ -330,18 +333,7 @@ findDistPrefOrDefault = findDistPref defaultDistPref
 -- Returns the @.setup-config@ file.
 configure :: (GenericPackageDescription, HookedBuildInfo)
           -> ConfigFlags -> IO LocalBuildInfo
-configure (pkg_descr0', pbi) cfg = do
-    let pkg_descr0 =
-          -- Ignore '--allow-{older,newer}' when we're given
-          -- '--exact-configuration'.
-          if fromFlagOrDefault False (configExactConfiguration cfg)
-          then pkg_descr0'
-          else relaxPackageDeps removeLowerBound
-               (maybe RelaxDepsNone unAllowOlder $ configAllowOlder cfg) $
-               relaxPackageDeps removeUpperBound
-               (maybe RelaxDepsNone unAllowNewer $ configAllowNewer cfg)
-               pkg_descr0'
-
+configure (pkg_descr0, pbi) cfg = do
     -- Determine the component we are configuring, if a user specified
     -- one on the command line.  We use a fake, flattened version of
     -- the package since at this point, we're not really sure what
@@ -618,11 +610,31 @@ configure (pkg_descr0', pbi) cfg = do
             installedPackageSet
             comp
 
+    -- Decide if we're going to compile with split sections.
+    split_sections :: Bool <-
+       if not (fromFlag $ configSplitSections cfg)
+            then return False
+            else case compilerFlavor comp of
+                        GHC | compilerVersion comp >= mkVersion [8,0]
+                          -> return True
+                        GHCJS
+                          -> return True
+                        _ -> do warn verbosity
+                                     ("this compiler does not support " ++
+                                      "--enable-split-sections; ignoring")
+                                return False
+
     -- Decide if we're going to compile with split objects.
     split_objs :: Bool <-
        if not (fromFlag $ configSplitObjs cfg)
             then return False
             else case compilerFlavor comp of
+                        _ | split_sections
+                          -> do warn verbosity
+                                     ("--enable-split-sections and " ++
+                                      "--enable-split-objs are mutually" ++
+                                      "exclusive; ignoring the latter")
+                                return False
                         GHC | compilerVersion comp >= mkVersion [6,5]
                           -> return True
                         GHCJS
@@ -667,6 +679,12 @@ configure (pkg_descr0', pbi) cfg = do
             -- building only static library archives with
             -- --disable-shared.
             fromFlagOrDefault sharedLibsByDefault $ configSharedLib cfg
+
+        withStaticLib_ =
+            -- build a static library (all dependent libraries rolled
+            -- into a huge .a archive) via GHCs -staticlib flag.
+            fromFlagOrDefault False $ configStaticLib cfg
+
         withDynExe_ = fromFlag $ configDynExe cfg
     when (withDynExe_ && not withSharedLib_) $ warn verbosity $
            "Executables will use dynamic linking, but a shared library "
@@ -677,10 +695,7 @@ configure (pkg_descr0', pbi) cfg = do
 
     setCoverageLBI <- configureCoverage verbosity cfg comp
 
-    reloc <-
-       if not (fromFlag $ configRelocatable cfg)
-            then return False
-            else return True
+    let reloc = fromFlagOrDefault False $ configRelocatable cfg
 
     let buildComponentsMap =
             foldl' (\m clbi -> Map.insertWith (++)
@@ -699,6 +714,7 @@ configure (pkg_descr0', pbi) cfg = do
                 compiler            = comp,
                 hostPlatform        = compPlatform,
                 buildDir            = buildDir,
+                cabalFilePath       = flagToMaybe (configCabalFilePath cfg),
                 componentGraph      = Graph.fromDistinctList buildComponents,
                 componentNameMap    = buildComponentsMap,
                 installedPkgs       = packageDependsIndex,
@@ -707,6 +723,7 @@ configure (pkg_descr0', pbi) cfg = do
                 withPrograms        = programDb'',
                 withVanillaLib      = fromFlag $ configVanillaLib cfg,
                 withSharedLib       = withSharedLib_,
+                withStaticLib       = withStaticLib_,
                 withDynExe          = withDynExe_,
                 withProfLib         = False,
                 withProfLibDetail   = ProfDetailNone,
@@ -716,6 +733,7 @@ configure (pkg_descr0', pbi) cfg = do
                 withDebugInfo       = fromFlag $ configDebugInfo cfg,
                 withGHCiLib         = fromFlagOrDefault ghciLibByDefault $
                                       configGHCiLib cfg,
+                splitSections       = split_sections,
                 splitObjs           = split_objs,
                 stripExes           = fromFlag $ configStripExes cfg,
                 stripLibs           = fromFlag $ configStripLibs cfg,
@@ -734,8 +752,24 @@ configure (pkg_descr0', pbi) cfg = do
     let dirs = absoluteInstallDirs pkg_descr lbi NoCopyDest
         relative = prefixRelativeInstallDirs (packageId pkg_descr) lbi
 
-    unless (isAbsolute (prefix dirs)) $ die' verbosity $
+    -- PKGROOT: allowing ${pkgroot} to be passed as --prefix to
+    -- cabal configure, is only a hidden option. It allows packages
+    -- to be relocatable with their package database.  This however
+    -- breaks when the Paths_* or other includes are used that
+    -- contain hard coded paths. This is still an open TODO.
+    --
+    -- Allowing ${pkgroot} here, however requires less custom hooks
+    -- in scripts that *really* want ${pkgroot}. See haskell/cabal/#4872
+    unless (isAbsolute (prefix dirs)
+           || "${pkgroot}" `isPrefixOf` prefix dirs) $ die' verbosity $
         "expected an absolute directory name for --prefix: " ++ prefix dirs
+
+    when ("${pkgroot}" `isPrefixOf` prefix dirs) $
+      warn verbosity $ "Using ${pkgroot} in prefix " ++ prefix dirs
+                    ++ " will not work if you rely on the Path_* module "
+                    ++ " or other hard coded paths.  Cabal does not yet "
+                    ++ " support fully  relocatable builds! "
+                    ++ " See #462 #2302 #2994 #3305 #3473 #3586 #3909 #4097 #4291 #4872"
 
     info verbosity $ "Using " ++ display currentCabalId
                   ++ " compiled by " ++ display currentCompilerId
@@ -802,7 +836,7 @@ checkDeprecatedFlags verbosity cfg = do
 checkExactConfiguration :: Verbosity -> GenericPackageDescription -> ConfigFlags -> IO ()
 checkExactConfiguration verbosity pkg_descr0 cfg =
     when (fromFlagOrDefault False (configExactConfiguration cfg)) $ do
-      let cmdlineFlags = map fst (configConfigurationsFlags cfg)
+      let cmdlineFlags = map fst (unFlagAssignment (configConfigurationsFlags cfg))
           allFlags     = map flagName . genPackageFlags $ pkg_descr0
           diffFlags    = allFlags \\ cmdlineFlags
       when (not . null $ diffFlags) $
@@ -890,30 +924,6 @@ dependencySatisfiable
            -- name
            = Just (mkUnqualComponentName (unPackageName depName))
 
--- | Relax the dependencies of this package if needed.
-relaxPackageDeps :: (VersionRange -> VersionRange)
-                 -> RelaxDeps
-                 -> GenericPackageDescription -> GenericPackageDescription
-relaxPackageDeps _ RelaxDepsNone gpd = gpd
-relaxPackageDeps vrtrans RelaxDepsAll  gpd = transformAllBuildDepends relaxAll gpd
-  where
-    relaxAll = \(Dependency pkgName verRange) ->
-      Dependency pkgName (vrtrans verRange)
-relaxPackageDeps vrtrans (RelaxDepsSome allowNewerDeps') gpd =
-  transformAllBuildDepends relaxSome gpd
-  where
-    thisPkgName    = packageName gpd
-    allowNewerDeps = mapMaybe f allowNewerDeps'
-
-    f (Setup.RelaxedDep p) = Just p
-    f (Setup.RelaxedDepScoped scope p) | scope == thisPkgName = Just p
-                                       | otherwise            = Nothing
-
-    relaxSome = \d@(Dependency depName verRange) ->
-      if depName `elem` allowNewerDeps
-      then Dependency depName (vrtrans verRange)
-      else d
-
 -- | Finalize a generic package description.  The workhorse is
 -- 'finalizePD' but there's a bit of other nattering
 -- about necessary.
@@ -954,10 +964,10 @@ configureFinalizedPackage verbosity cfg enabled
     -- we do it here so that those get checked too
     let pkg_descr = addExtraIncludeLibDirs pkg_descr0'
 
-    when (not (null flags)) $
+    unless (nullFlagAssignment flags) $
       info verbosity $ "Flags chosen: "
                     ++ intercalate ", " [ unFlagName fn ++ "=" ++ display value
-                                        | (fn, value) <- flags ]
+                                        | (fn, value) <- unFlagAssignment flags ]
 
     return (pkg_descr, flags)
   where
@@ -1648,8 +1658,40 @@ checkForeignDeps pkg lbi verbosity =
         allLibs    = collectField PD.extraLibs
 
         ifBuildsWith headers args success failure = do
+            checkDuplicateHeaders
             ok <- builds (makeProgram headers) args
             if ok then success else failure
+
+        -- Ensure that there is only one header with a given name
+        -- in either the generated (most likely by `configure`)
+        -- build directory (e.g. `dist/build`) or in the source directory.
+        --
+        -- If it exists in both, we'll remove the one in the source
+        -- directory, as the generated should take precedence.
+        --
+        -- C compilers like to prefer source local relative includes,
+        -- so the search paths provided to the compiler via -I are
+        -- ignored if the included file can be found relative to the
+        -- including file.  As such we need to take drastic measures
+        -- and delete the offending file in the source directory.
+        checkDuplicateHeaders = do
+          let relIncDirs = filter (not . isAbsolute) (collectField PD.includeDirs)
+              isHeader   = isSuffixOf ".h"
+          genHeaders <- forM relIncDirs $ \dir ->
+            fmap (dir </>) . filter isHeader <$> listDirectory (buildDir lbi </> dir)
+                                                 `catchIO` (\_ -> return [])
+          srcHeaders <- forM relIncDirs $ \dir ->
+            fmap (dir </>) . filter isHeader <$> listDirectory (baseDir lbi </> dir)
+                                                 `catchIO` (\_ -> return [])
+          let commonHeaders = concat genHeaders `intersect` concat srcHeaders
+          forM_ commonHeaders $ \hdr -> do
+            warn verbosity $ "Duplicate header found in "
+                          ++ (buildDir lbi </> hdr)
+                          ++ " and "
+                          ++ (baseDir lbi </> hdr)
+                          ++ "; removing "
+                          ++ (baseDir lbi </> hdr)
+            removeFile (baseDir lbi </> hdr)
 
         findOffendingHdr =
             ifBuildsWith allHeaders ccArgs
@@ -1675,14 +1717,23 @@ checkForeignDeps pkg lbi verbosity =
 
         libExists lib = builds (makeProgram []) (makeLdArgs [lib])
 
+        baseDir lbi' = fromMaybe "." (takeDirectory <$> cabalFilePath lbi')
+
         commonCppArgs = platformDefines lbi
                      -- TODO: This is a massive hack, to work around the
                      -- fact that the test performed here should be
                      -- PER-component (c.f. the "I'm Feeling Lucky"; we
                      -- should NOT be glomming everything together.)
                      ++ [ "-I" ++ buildDir lbi </> "autogen" ]
-                     ++ [ "-I" ++ dir | dir <- collectField PD.includeDirs ]
-                     ++ ["-I."]
+                     -- `configure' may generate headers in the build directory
+                     ++ [ "-I" ++ buildDir lbi </> dir | dir <- collectField PD.includeDirs
+                                                       , not (isAbsolute dir)]
+                     -- we might also reference headers from the packages directory.
+                     ++ [ "-I" ++ baseDir lbi </> dir | dir <- collectField PD.includeDirs
+                                                      , not (isAbsolute dir)]
+                     ++ [ "-I" ++ dir | dir <- collectField PD.includeDirs
+                                      , isAbsolute dir]
+                     ++ ["-I" ++ baseDir lbi]
                      ++ collectField PD.cppOptions
                      ++ collectField PD.ccOptions
                      ++ [ "-I" ++ dir
@@ -1754,8 +1805,8 @@ checkForeignDeps pkg lbi verbosity =
                _             -> []
           ++ case libs of
                []    -> []
-               [lib] -> ["* Missing C library: " ++ lib]
-               _     -> ["* Missing C libraries: " ++ intercalate ", " libs]
+               [lib] -> ["* Missing (or bad) C library: " ++ lib]
+               _     -> ["* Missing (or bad) C libraries: " ++ intercalate ", " libs]
           ++ [if plural then messagePlural else messageSingular | missing]
           ++ case hdr of
                Just (Left  _) -> [ headerCppMessage ]
@@ -1777,6 +1828,10 @@ checkForeignDeps pkg lbi verbosity =
           ++ "but in a non-standard location then you can use the flags "
           ++ "--extra-include-dirs= and --extra-lib-dirs= to specify "
           ++ "where it is."
+          ++ "If the library file does exist, it may contain errors that "
+          ++ "are caught by the C compiler at the preprocessing stage. "
+          ++ "In this case you can re-run configure with the verbosity "
+          ++ "flag -v3 to see the error messages."
         messagePlural =
              "This problem can usually be solved by installing the system "
           ++ "packages that provide these libraries (you may need the "
@@ -1784,6 +1839,10 @@ checkForeignDeps pkg lbi verbosity =
           ++ "but in a non-standard location then you can use the flags "
           ++ "--extra-include-dirs= and --extra-lib-dirs= to specify "
           ++ "where they are."
+          ++ "If the library files do exist, it may contain errors that "
+          ++ "are caught by the C compiler at the preprocessing stage. "
+          ++ "In this case you can re-run configure with the verbosity "
+          ++ "flag -v3 to see the error messages."
         headerCppMessage =
              "If the header file does exist, it may contain errors that "
           ++ "are caught by the C compiler at the preprocessing stage. "

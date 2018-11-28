@@ -24,8 +24,7 @@ package. All you need to do is write a simple configuration file, put a
 few files in the right places, and you have a package. See the `Cabal
 documentation <http://www.haskell.org/cabal/users-guide/>`__ for
 details, and also the Cabal libraries
-(:cabal-ref:`Distribution.Simple <Distribution-Simple.html>`,
-for example).
+(:cabal-ref:`Distribution.Simple.`, for example).
 
 .. _using-packages:
 
@@ -129,6 +128,9 @@ command (see :ref:`package-management`):
 The GHC command line options that control packages are:
 
 .. ghc-flag:: -package ⟨pkg⟩
+    :shortdesc: Expose package ⟨pkg⟩
+    :type: dynamic/ ``:set``
+    :category:
 
     This option causes the installed package ⟨pkg⟩ to be exposed. The
     package ⟨pkg⟩ can be specified in full with its version number (e.g.
@@ -178,6 +180,9 @@ The GHC command line options that control packages are:
         $ ghc -o myprog Foo.hs Main.hs -package network
 
 .. ghc-flag:: -package-id ⟨unit-id⟩
+    :shortdesc: Expose package by id ⟨unit-id⟩
+    :type: dynamic/ ``:set``
+    :category:
 
     Exposes a package like :ghc-flag:`-package ⟨pkg⟩`, but the package is named
     by its unit ID (i.e. the value of ``id`` in its entry in the installed
@@ -188,6 +193,9 @@ The GHC command line options that control packages are:
     renaming described in :ref:`package-thinning-and-renaming`.
 
 .. ghc-flag:: -hide-all-packages
+    :shortdesc: Hide all packages by default
+    :type: dynamic
+    :category:
 
     Ignore the exposed flag on installed packages, and hide them all by
     default. If you use this flag, then any packages you require
@@ -200,6 +208,9 @@ The GHC command line options that control packages are:
     ``-hide-all-packages`` flag to GHC, for exactly this reason.
 
 .. ghc-flag:: -hide-package ⟨pkg⟩
+    :shortdesc: Hide package ⟨pkg⟩
+    :type: dynamic/ ``:set``
+    :category:
 
     This option does the opposite of :ghc-flag:`-package ⟨pkg⟩`: it causes the
     specified package to be hidden, which means that none of its modules
@@ -210,6 +221,9 @@ The GHC command line options that control packages are:
     exposed package.
 
 .. ghc-flag:: -ignore-package ⟨pkg⟩
+    :shortdesc: Ignore package ⟨pkg⟩
+    :type: dynamic/ ``:set``
+    :category:
 
     Causes the compiler to behave as if package ⟨pkg⟩, and any packages
     that depend on ⟨pkg⟩, are not installed at all.
@@ -221,11 +235,18 @@ The GHC command line options that control packages are:
     :ghc-flag:`-ignore-package ⟨pkg⟩` flag can be useful.
 
 .. ghc-flag:: -no-auto-link-packages
+    :shortdesc: Don't automatically link in the base and rts packages.
+    :type: dynamic
+    :category:
 
     By default, GHC will automatically link in the ``base`` and ``rts``
     packages. This flag disables that behaviour.
 
 .. ghc-flag:: -this-unit-id ⟨unit-id⟩
+    :shortdesc: Compile to be part of unit (i.e. package)
+        ⟨unit-id⟩
+    :type: dynamic
+    :category:
 
     Tells GHC that the module being compiled forms part of unit ID
     ⟨unit-id⟩; internally, these keys are used to determine type equality
@@ -235,6 +256,10 @@ The GHC command line options that control packages are:
     way in later releases.
 
 .. ghc-flag:: -trust ⟨pkg⟩
+    :shortdesc: Expose package ⟨pkg⟩ and set it to be trusted
+    :type: dynamic/ ``:set``
+    :category:
+    :noindex:
 
     This option causes the install package ⟨pkg⟩ to be both exposed and
     trusted by GHC. This command functions in a very similar way
@@ -243,6 +268,10 @@ The GHC command line options that control packages are:
     package database. (see :ref:`safe-haskell`).
 
 .. ghc-flag:: -distrust ⟨pkg⟩
+    :shortdesc: Expose package ⟨pkg⟩ and set it to be distrusted
+    :type: dynamic/ ``:set``
+    :category:
+    :noindex:
 
     This option causes the install package ⟨pkg⟩ to be both exposed and
     distrusted by GHC. This command functions in a very similar way to the
@@ -250,7 +279,11 @@ The GHC command line options that control packages are:
     packages to be distrusted by GHC, regardless of the contents of the package
     database. (see :ref:`safe-haskell`).
 
-.. ghc-flag:: -distrust-all
+.. ghc-flag:: -distrust-all-packages
+    :shortdesc: Distrust all packages by default
+    :type: dynamic/ ``:set``
+    :category:
+    :noindex:
 
     Ignore the trusted flag on installed packages, and distrust them by
     default. If you use this flag and Safe Haskell then any packages you
@@ -398,19 +431,31 @@ You can control GHC's package database stack using the following
 options:
 
 .. ghc-flag:: -package-db ⟨file⟩
+    :shortdesc: Add ⟨file⟩ to the package db stack.
+    :type: dynamic
+    :category:
 
     Add the package database ⟨file⟩ on top of the current stack.
 
 .. ghc-flag:: -no-global-package-db
+    :shortdesc: Remove the global package db from the stack.
+    :type: dynamic
+    :category:
 
     Remove the global package database from the package database stack.
 
 .. ghc-flag:: -no-user-package-db
+    :shortdesc: Remove the user's package db from the stack.
+    :type: dynamic
+    :category:
 
     Prevent loading of the user's local package database in the initial
     stack.
 
 .. ghc-flag:: -clear-package-db
+    :shortdesc: Clear the package db stack.
+    :type: dynamic
+    :category:
 
     Reset the current package database stack. This option removes every
     previously specified package database (including those read from the
@@ -418,6 +463,9 @@ options:
     stack.
 
 .. ghc-flag:: -global-package-db
+    :shortdesc: Add the global package db to the stack.
+    :type: dynamic
+    :category:
 
     Add the global package database on top of the current stack. This
     option can be used after :ghc-flag:`-no-global-package-db` to specify the
@@ -425,6 +473,9 @@ options:
     loaded.
 
 .. ghc-flag:: -user-package-db
+    :shortdesc: Add the user's package db to the stack.
+    :type: dynamic
+    :category:
 
     Add the user's package database on top of the current stack. This
     option can be used after :ghc-flag:`-no-user-package-db` to specify the
@@ -522,6 +573,9 @@ Note that for the ``package-db`` directive, if a relative path is given it
 must be relative to the location of the package environment file.
 
 .. ghc-flag:: -package-env ⟨file⟩|⟨name⟩
+    :shortdesc: Use the specified package environment.
+    :type: dynamic
+    :category:
 
     Use the package environment in ⟨file⟩, or in
     ``$HOME/.ghc/arch-os-version/environments/⟨name⟩``
@@ -1033,8 +1087,7 @@ package as well.
 -------------------------------------------------
 
 A package specification is a Haskell record; in particular, it is the
-record
-:cabal-ref:`InstalledPackageInfo <Distribution-InstalledPackageInfo.html#%tInstalledPackageInfo>`
+record :cabal-ref:`Distribution.InstalledPackageInfo.InstalledPackageInfo`
 in the module Distribution.InstalledPackageInfo, which is part of the
 Cabal package distributed with GHC.
 
@@ -1142,7 +1195,7 @@ The allowed fields, with their types, are:
 
     (string) The type of license under which this package is
     distributed. This field is a value of the
-    :cabal-ref:`License <Distribution-License.html#t:License>` type.
+    :cabal-ref:`Distribution.License.License` type.
 
 ``license-file``
     .. index::

@@ -9,9 +9,8 @@ Using Concurrent Haskell
 GHC supports Concurrent Haskell by default, without requiring a special
 option or libraries compiled in a certain way. To get access to the
 support libraries for Concurrent Haskell, just import
-:base-ref:`Control.Concurrent <Control-Concurrent.html>`.
-More information on Concurrent Haskell is provided in the documentation
-for that module.
+:base-ref:`Control.Concurrent.`. More information on Concurrent Haskell is
+provided in the documentation for that module.
 
 Optionally, the program may be linked with the :ghc-flag:`-threaded` option (see
 :ref:`options-linker`. This provides two benefits:
@@ -77,6 +76,10 @@ the :ghc-flag:`-threaded` option (see :ref:`options-linker`). Additionally, the
 following compiler options affect parallelism:
 
 .. ghc-flag:: -feager-blackholing
+    :shortdesc: Turn on :ref:`eager blackholing <parallel-compile-options>`
+    :type: dynamic
+    :category:
+    :noindex:
 
     Blackholing is the act of marking a thunk (lazy computation) as
     being under evaluation. It is useful for three reasons: firstly it
@@ -104,8 +107,7 @@ RTS options for SMP parallelism
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 There are two ways to run a program on multiple processors: call
-:base-ref:`Control.Concurrent.setNumCapabilities
-<Control.Concurrent.html#v:setNumCapabilities>` from your program, or
+:base-ref:`Control.Concurrent.setNumCapabilities` from your program, or
 use the RTS :rts-flag:`-N ⟨x⟩` options.
 
 .. rts-flag:: -N ⟨x⟩
@@ -174,7 +176,7 @@ CPUs:
 
     This option is probably only of use for concurrent programs that
     explicitly schedule threads onto CPUs with
-    :base-ref:`Control.Concurrent.forkOn <Control-Concurrent.html#v:forkOn>`.
+    :base-ref:`Control.Concurrent.forkOn`.
 
 Hints for using SMP parallelism
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

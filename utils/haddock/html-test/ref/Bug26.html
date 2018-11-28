@@ -4,15 +4,11 @@
      /><title
     >Bug26</title
     ><link href="#" rel="stylesheet" type="text/css" title="Ocean"
-     /><script src="haddock-util.js" type="text/javascript"
+     /><link rel="stylesheet" type="text/css" href="#"
+     /><script src="haddock-bundle.min.js" async="async" type="text/javascript"
     ></script
     ><script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.0/MathJax.js?config=TeX-AMS-MML_HTMLorMML" type="text/javascript"
     ></script
-    ><script type="text/javascript"
-    >//
-window.onload = function () {pageLoad();};
-//
-</script
     ></head
   ><body
   ><div id="package-header"
@@ -55,28 +51,30 @@ window.onload = function () {pageLoad();};
 	  ></div
 	></div
       ><div id="synopsis"
-      ><p id="control.syn" class="caption expander" onclick="toggleSection('syn')"
-	>Synopsis</p
-	><ul id="section.syn" class="hide" onclick="toggleSection('syn')"
-	><li class="src short"
-	  ><a href="#"
-	    >f</a
-	    > :: ()</li
+      ><details id="syn"
+	><summary
+	  >Synopsis</summary
+	  ><ul class="details-toggle" data-details-id="syn"
 	  ><li class="src short"
-	  ><a href="#"
-	    >g</a
-	    > :: ()</li
-	  ><li class="src short"
-	  ><span class="keyword"
-	    >class</span
-	    > <a href="#"
-	    >C</a
-	    > a <span class="keyword"
-	    >where</span
-	    ><ul class="subs"
+	    ><a href="#"
+	      >f</a
+	      > :: ()</li
+	    ><li class="src short"
+	    ><a href="#"
+	      >g</a
+	      > :: ()</li
+	    ><li class="src short"
+	    ><span class="keyword"
+	      >class</span
+	      > <a href="#"
+	      >C</a
+	      > a <span class="keyword"
+	      >where</span
+	      ><ul class="subs"
+	      ></ul
+	      ></li
 	    ></ul
-	    ></li
-	  ></ul
+	  ></details
 	></div
       ><div id="interface"
       ><h1
@@ -132,7 +130,7 @@ window.onload = function () {pageLoad();};
 	  ><p class="caption"
 	    >Minimal complete definition</p
 	    ><p class="src"
-	    ><a href="#"
+	    ><a href="#" title="Bug26"
 	      >c_f</a
 	      ></p
 	    ></div
@@ -153,16 +151,16 @@ window.onload = function () {pageLoad();};
 	      ></div
 	    ></div
 	  ><div class="subs instances"
-	  ><p id="control.i:C" class="caption collapser" onclick="toggleSection('i:C')"
-	    >Instances</p
-	    ><div id="section.i:C" class="show"
-	    ><table
+	  ><details id="i:C" open="open"
+	    ><summary
+	      >Instances</summary
+	      ><table
 	      ><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:ic:C:C:1" class="instance expander" onclick="toggleSection('i:ic:C:C:1')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:ic:C:C:1"
 		      ></span
-		      > <a href="#"
+		      > <a href="#" title="Bug26"
 		      >C</a
 		      > ()</span
 		    > <a href="#" class="selflink"
@@ -179,8 +177,14 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:ic:C:C:1" class="inst-details hide"
-		    ><div class="subs methods"
+		  ><details id="i:ic:C:C:1"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>Bug26</a
+			></p
+		      > <div class="subs methods"
 		      ><p class="caption"
 			>Methods</p
 			><p class="src"
@@ -190,11 +194,11 @@ window.onload = function () {pageLoad();};
 			  >#</a
 			  ></p
 			></div
-		      ></div
+		      ></details
 		    ></td
 		  ></tr
 		></table
-	      ></div
+	      ></details
 	    ></div
 	  ></div
 	></div

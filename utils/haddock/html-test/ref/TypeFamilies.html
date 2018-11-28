@@ -4,15 +4,11 @@
      /><title
     >TypeFamilies</title
     ><link href="#" rel="stylesheet" type="text/css" title="Ocean"
-     /><script src="haddock-util.js" type="text/javascript"
+     /><link rel="stylesheet" type="text/css" href="#"
+     /><script src="haddock-bundle.min.js" async="async" type="text/javascript"
     ></script
     ><script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.0/MathJax.js?config=TeX-AMS-MML_HTMLorMML" type="text/javascript"
     ></script
-    ><script type="text/javascript"
-    >//
-window.onload = function () {pageLoad();};
-//
-</script
     ></head
   ><body
   ><div id="package-header"
@@ -51,118 +47,120 @@ window.onload = function () {pageLoad();};
 	  ></div
 	></div
       ><div id="synopsis"
-      ><p id="control.syn" class="caption expander" onclick="toggleSection('syn')"
-	>Synopsis</p
-	><ul id="section.syn" class="hide" onclick="toggleSection('syn')"
-	><li class="src short"
-	  ><span class="keyword"
-	    >data</span
-	    > <a href="#"
-	    >X</a
-	    ><ul class="subs"
-	    ><li
-	      >= <a href="#"
-		>X</a
-		></li
+      ><details id="syn"
+	><summary
+	  >Synopsis</summary
+	  ><ul class="details-toggle" data-details-id="syn"
+	  ><li class="src short"
+	    ><span class="keyword"
+	      >data</span
+	      > <a href="#"
+	      >X</a
+	      ><ul class="subs"
 	      ><li
-	      >| <a href="#"
-		>XX</a
-		></li
+		>= <a href="#"
+		  >X</a
+		  ></li
+		><li
+		>| <a href="#"
+		  >XX</a
+		  ></li
+		><li
+		>| <a href="#"
+		  >XXX</a
+		  ></li
+		></ul
+	      ></li
+	    ><li class="src short"
+	    ><span class="keyword"
+	      >data</span
+	      > <a href="#"
+	      >Y</a
+	      ></li
+	    ><li class="src short"
+	    ><span class="keyword"
+	      >data</span
+	      > <a href="#"
+	      >Z</a
+	      ><ul class="subs"
 	      ><li
-	      >| <a href="#"
-		>XXX</a
-		></li
-	      ></ul
-	    ></li
-	  ><li class="src short"
-	  ><span class="keyword"
-	    >data</span
-	    > <a href="#"
-	    >Y</a
-	    ></li
-	  ><li class="src short"
-	  ><span class="keyword"
-	    >data</span
-	    > <a href="#"
-	    >Z</a
-	    ><ul class="subs"
-	    ><li
-	      >= <a href="#"
-		>ZA</a
-		></li
+		>= <a href="#"
+		  >ZA</a
+		  ></li
+		><li
+		>| <a href="#"
+		  >ZB</a
+		  ></li
+		></ul
+	      ></li
+	    ><li class="src short"
+	    ><span class="keyword"
+	      >class</span
+	      > <a href="#"
+	      >Test</a
+	      > a</li
+	    ><li class="src short"
+	    ><span class="keyword"
+	      >type family</span
+	      > <a href="#"
+	      >Foo</a
+	      > a :: k</li
+	    ><li class="src short"
+	    ><span class="keyword"
+	      >data family</span
+	      > <a href="#"
+	      >Bat</a
+	      > (a :: k) :: <a href="#" title="Data.Kind"
+	      >*</a
+	      ></li
+	    ><li class="src short"
+	    ><span class="keyword"
+	      >class</span
+	      > <a href="#"
+	      >Assoc</a
+	      > a <span class="keyword"
+	      >where</span
+	      ><ul class="subs"
 	      ><li
-	      >| <a href="#"
-		>ZB</a
-		></li
-	      ></ul
-	    ></li
-	  ><li class="src short"
-	  ><span class="keyword"
-	    >class</span
-	    > <a href="#"
-	    >Test</a
-	    > a</li
-	  ><li class="src short"
-	  ><span class="keyword"
-	    >type family</span
-	    > <a href="#"
-	    >Foo</a
-	    > a :: k</li
-	  ><li class="src short"
-	  ><span class="keyword"
-	    >data family</span
-	    > <a href="#"
-	    >Bat</a
-	    > (a :: k) :: <a href="#"
-	    >*</a
-	    ></li
-	  ><li class="src short"
-	  ><span class="keyword"
-	    >class</span
-	    > <a href="#"
-	    >Assoc</a
-	    > a <span class="keyword"
-	    >where</span
-	    ><ul class="subs"
-	    ><li
-	      ><span class="keyword"
-		>data</span
-		> <a href="#"
-		>AssocD</a
-		> a :: <a href="#"
-		>*</a
-		></li
-	      ><li
-	      ><span class="keyword"
-		>type</span
-		> <a href="#"
-		>AssocT</a
-		> a :: <a href="#"
-		>*</a
-		></li
-	      ></ul
-	    ></li
-	  ><li class="src short"
-	  ><span class="keyword"
-	    >type family</span
-	    > <a href="#"
-	    >Bar</a
-	    > b <span class="keyword"
-	    >where ...</span
-	    ></li
-	  ><li class="src short"
-	  ><span class="keyword"
-	    >type family</span
-	    > (a :: k) <a href="#"
-	    >&lt;&gt;</a
-	    > (b :: k) :: k</li
-	  ><li class="src short"
-	  ><span class="keyword"
-	    >class</span
-	    > (a :: k) <a href="#"
-	    >&gt;&lt;</a
-	    > (b :: k)</li
-	  ></ul
+		><span class="keyword"
+		  >data</span
+		  > <a href="#"
+		  >AssocD</a
+		  > a :: <a href="#" title="Data.Kind"
+		  >*</a
+		  ></li
+		><li
+		><span class="keyword"
+		  >type</span
+		  > <a href="#"
+		  >AssocT</a
+		  > a :: <a href="#" title="Data.Kind"
+		  >*</a
+		  ></li
+		></ul
+	      ></li
+	    ><li class="src short"
+	    ><span class="keyword"
+	      >type family</span
+	      > <a href="#"
+	      >Bar</a
+	      > b <span class="keyword"
+	      >where ...</span
+	      ></li
+	    ><li class="src short"
+	    ><span class="keyword"
+	      >type family</span
+	      > (a :: k) <a href="#"
+	      >&lt;&gt;</a
+	      > (b :: k) :: k</li
+	    ><li class="src short"
+	    ><span class="keyword"
+	      >class</span
+	      > (a :: k) <a href="#"
+	      >&gt;&lt;</a
+	      > (b :: k)</li
+	    ></ul
+	  ></details
 	></div
       ><div id="interface"
       ><h1
@@ -217,22 +215,20 @@ window.onload = function () {pageLoad();};
 	      ></table
 	    ></div
 	  ><div class="subs instances"
-	  ><p id="control.i:X" class="caption collapser" onclick="toggleSection('i:X')"
-	    >Instances</p
-	    ><div id="section.i:X" class="show"
-	    ><table
+	  ><details id="i:X" open="open"
+	    ><summary
+	      >Instances</summary
+	      ><table
 	      ><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:id:X:-62--60-:1" class="instance expander" onclick="toggleSection('i:id:X:-62--60-:1')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:id:X:-62--60-:1"
 		      ></span
-		      > <a href="#"
-		      >(&gt;&lt;)</a
-		      > <a href="#"
-		      >X</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >XX</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
+		      >&gt;&lt;</a
+		      > <a href="#" title="TypeFamilies"
 		      >XXX</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -243,20 +239,24 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:id:X:-62--60-:1" class="inst-details hide"
-		    ></div
+		  ><details id="i:id:X:-62--60-:1"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      ></details
 		    ></td
 		  ></tr
 		><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:id:X:Assoc:2" class="instance expander" onclick="toggleSection('i:id:X:Assoc:2')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:id:X:Assoc:2"
 		      ></span
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Assoc</a
-		      > <a href="#"
-		      >*</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >X</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -269,20 +269,24 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:id:X:Assoc:2" class="inst-details hide"
-		    ><div class="subs associated-types"
+		  ><details id="i:id:X:Assoc:2"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      > <div class="subs associated-types"
 		      ><p class="caption"
 			>Associated Types</p
 			><p class="src"
 			><span class="keyword"
 			  >data</span
-			  > <a href="#"
+			  > <a href="#" title="TypeFamilies"
 			  >AssocD</a
-			  > <a href="#"
+			  > <a href="#" title="TypeFamilies"
 			  >X</a
-			  > (a :: <a href="#"
-			  >X</a
-			  >) :: <a href="#"
+			  > :: <a href="#" title="Data.Kind"
 			  >*</a
 			  > <a href="#" class="selflink"
 			  >#</a
@@ -290,31 +294,27 @@ window.onload = function () {pageLoad();};
 			><p class="src"
 			><span class="keyword"
 			  >type</span
-			  > <a href="#"
+			  > <a href="#" title="TypeFamilies"
 			  >AssocT</a
-			  > <a href="#"
+			  > <a href="#" title="TypeFamilies"
 			  >X</a
-			  > (a :: <a href="#"
-			  >X</a
-			  >) :: <a href="#"
+			  > :: <a href="#" title="Data.Kind"
 			  >*</a
 			  > <a href="#" class="selflink"
 			  >#</a
 			  ></p
 			></div
-		      ></div
+		      ></details
 		    ></td
 		  ></tr
 		><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:id:X:Test:3" class="instance expander" onclick="toggleSection('i:id:X:Test:3')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:id:X:Test:3"
 		      ></span
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Test</a
-		      > <a href="#"
-		      >*</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >X</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -327,20 +327,26 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:id:X:Test:3" class="inst-details hide"
-		    ></div
+		  ><details id="i:id:X:Test:3"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      ></details
 		    ></td
 		  ></tr
 		><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:id:X:Foo:4" class="instance expander" onclick="toggleSection('i:id:X:Foo:4')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:id:X:Foo:4"
 		      ></span
 		      > <span class="keyword"
 		      >type</span
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies2"
 		      >Foo</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >X</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -351,34 +357,38 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:id:X:Foo:4" class="inst-details hide"
-		    ><div class="src"
+		  ><details id="i:id:X:Foo:4"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      > <div class="src"
 		      ><span class="keyword"
 			>type</span
-			> <a href="#"
+			> <a href="#" title="TypeFamilies2"
 			>Foo</a
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>X</a
-			> = <a href="#"
+			> = <a href="#" title="TypeFamilies"
 			>Y</a
 			></div
-		      ></div
+		      ></details
 		    ></td
 		  ></tr
 		><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:id:X:-60--62-:5" class="instance expander" onclick="toggleSection('i:id:X:-60--62-:5')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:id:X:-60--62-:5"
 		      ></span
 		      > <span class="keyword"
 		      >type</span
-		      > <a href="#"
-		      >(&lt;&gt;)</a
-		      > <a href="#"
-		      >X</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >XXX</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
+		      >&lt;&gt;</a
+		      > <a href="#" title="TypeFamilies"
 		      >XX</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -389,36 +399,38 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:id:X:-60--62-:5" class="inst-details hide"
-		    ><div class="src"
+		  ><details id="i:id:X:-60--62-:5"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      > <div class="src"
 		      ><span class="keyword"
 			>type</span
-			> <a href="#"
-			>(&lt;&gt;)</a
-			> <a href="#"
-			>X</a
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>XXX</a
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
+			>&lt;&gt;</a
+			> <a href="#" title="TypeFamilies"
 			>XX</a
-			> = <a href="#"
+			> = <a href="#" title="TypeFamilies"
 			>X</a
 			></div
-		      ></div
+		      ></details
 		    ></td
 		  ></tr
 		><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:id:X:AssocD:6" class="instance expander" onclick="toggleSection('i:id:X:AssocD:6')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:id:X:AssocD:6"
 		      ></span
 		      > <span class="keyword"
 		      >data</span
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >AssocD</a
-		      > <a href="#"
-		      >*</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >X</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -429,34 +441,36 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:id:X:AssocD:6" class="inst-details hide"
-		    ><div class="src"
+		  ><details id="i:id:X:AssocD:6"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      > <div class="src"
 		      ><span class="keyword"
 			>data</span
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>AssocD</a
-			> <a href="#"
-			>*</a
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>X</a
 			> = <a id="v:AssocX" class="def"
 			>AssocX</a
 			></div
-		      ></div
+		      ></details
 		    ></td
 		  ></tr
 		><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:id:X:AssocT:7" class="instance expander" onclick="toggleSection('i:id:X:AssocT:7')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:id:X:AssocT:7"
 		      ></span
 		      > <span class="keyword"
 		      >type</span
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >AssocT</a
-		      > <a href="#"
-		      >*</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >X</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -467,38 +481,40 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:id:X:AssocT:7" class="inst-details hide"
-		    ><div class="src"
+		  ><details id="i:id:X:AssocT:7"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      > <div class="src"
 		      ><span class="keyword"
 			>type</span
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>AssocT</a
-			> <a href="#"
-			>*</a
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>X</a
-			> = <a href="#"
+			> = (<a href="#" title="TypeFamilies"
 			>Foo</a
-			> <a href="#"
-			>*</a
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>X</a
-			></div
-		      ></div
+			> :: <a href="#" title="Data.Kind"
+			>*</a
+			>)</div
+		      ></details
 		    ></td
 		  ></tr
 		><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:id:X:Bat:8" class="instance expander" onclick="toggleSection('i:id:X:Bat:8')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:id:X:Bat:8"
 		      ></span
 		      > <span class="keyword"
 		      >data</span
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Bat</a
-		      > <a href="#"
-		      >*</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >X</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -511,21 +527,25 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:id:X:Bat:8" class="inst-details hide"
-		    ><div class="src"
+		  ><details id="i:id:X:Bat:8"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      > <div class="src"
 		      ><span class="keyword"
 			>data</span
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>Bat</a
-			> <a href="#"
-			>*</a
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>X</a
 			> <ul class="inst"
 			><li class="inst"
 			  >= <a id="v:BatX" class="def"
 			    >BatX</a
-			    > <a href="#"
+			    > <a href="#" title="TypeFamilies"
 			    >X</a
 			    ></li
 			  ><li class="inst"
@@ -535,34 +555,32 @@ window.onload = function () {pageLoad();};
 			    ><li
 			      ><a id="v:aaa" class="def"
 				>aaa</a
-				> :: <a href="#"
+				> :: <a href="#" title="TypeFamilies"
 				>X</a
 				></li
 			      ><li
 			      ><a id="v:bbb" class="def"
 				>bbb</a
-				> :: <a href="#"
+				> :: <a href="#" title="TypeFamilies"
 				>Y</a
 				></li
 			      ></ul
 			    > }</li
 			  ></ul
 			></div
-		      ></div
+		      ></details
 		    ></td
 		  ></tr
 		><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:id:X:Foo:9" class="instance expander" onclick="toggleSection('i:id:X:Foo:9')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:id:X:Foo:9"
 		      ></span
 		      > <span class="keyword"
 		      >type</span
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Foo</a
-		      > <a href="#"
-		      >*</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >X</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -573,36 +591,40 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:id:X:Foo:9" class="inst-details hide"
-		    ><div class="src"
+		  ><details id="i:id:X:Foo:9"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      > <div class="src"
 		      ><span class="keyword"
 			>type</span
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>Foo</a
-			> <a href="#"
-			>*</a
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>X</a
-			> = <a href="#"
+			> = <a href="#" title="TypeFamilies"
 			>Y</a
 			></div
-		      ></div
+		      ></details
 		    ></td
 		  ></tr
 		><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:id:X:-60--62-:10" class="instance expander" onclick="toggleSection('i:id:X:-60--62-:10')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:id:X:-60--62-:10"
 		      ></span
 		      > <span class="keyword"
 		      >type</span
-		      > <a href="#"
-		      >(&lt;&gt;)</a
-		      > <a href="#"
-		      >*</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >X</a
-		      > a</span
+		      > <a href="#" title="TypeFamilies"
+		      >&lt;&gt;</a
+		      > (a :: <a href="#" title="Data.Kind"
+		      >*</a
+		      >)</span
 		    > <a href="#" class="selflink"
 		    >#</a
 		    ></td
@@ -611,24 +633,30 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:id:X:-60--62-:10" class="inst-details hide"
-		    ><div class="src"
+		  ><details id="i:id:X:-60--62-:10"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      > <div class="src"
 		      ><span class="keyword"
 			>type</span
-			> <a href="#"
-			>(&lt;&gt;)</a
-			> <a href="#"
-			>*</a
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>X</a
-			> a = <a href="#"
+			> <a href="#" title="TypeFamilies"
+			>&lt;&gt;</a
+			> (a :: <a href="#" title="Data.Kind"
+			>*</a
+			>) = <a href="#" title="TypeFamilies"
 			>X</a
 			></div
-		      ></div
+		      ></details
 		    ></td
 		  ></tr
 		></table
-	      ></div
+	      ></details
 	    ></div
 	  ></div
 	><div class="top"
@@ -645,20 +673,18 @@ window.onload = function () {pageLoad();};
 	    >Doc for: data Y</p
 	    ></div
 	  ><div class="subs instances"
-	  ><p id="control.i:Y" class="caption collapser" onclick="toggleSection('i:Y')"
-	    >Instances</p
-	    ><div id="section.i:Y" class="show"
-	    ><table
+	  ><details id="i:Y" open="open"
+	    ><summary
+	      >Instances</summary
+	      ><table
 	      ><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:id:Y:Assoc:1" class="instance expander" onclick="toggleSection('i:id:Y:Assoc:1')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:id:Y:Assoc:1"
 		      ></span
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Assoc</a
-		      > <a href="#"
-		      >*</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Y</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -671,20 +697,24 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:id:Y:Assoc:1" class="inst-details hide"
-		    ><div class="subs associated-types"
+		  ><details id="i:id:Y:Assoc:1"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      > <div class="subs associated-types"
 		      ><p class="caption"
 			>Associated Types</p
 			><p class="src"
 			><span class="keyword"
 			  >data</span
-			  > <a href="#"
+			  > <a href="#" title="TypeFamilies"
 			  >AssocD</a
-			  > <a href="#"
+			  > <a href="#" title="TypeFamilies"
 			  >Y</a
-			  > (a :: <a href="#"
-			  >Y</a
-			  >) :: <a href="#"
+			  > :: <a href="#" title="Data.Kind"
 			  >*</a
 			  > <a href="#" class="selflink"
 			  >#</a
@@ -692,31 +722,27 @@ window.onload = function () {pageLoad();};
 			><p class="src"
 			><span class="keyword"
 			  >type</span
-			  > <a href="#"
+			  > <a href="#" title="TypeFamilies"
 			  >AssocT</a
-			  > <a href="#"
+			  > <a href="#" title="TypeFamilies"
 			  >Y</a
-			  > (a :: <a href="#"
-			  >Y</a
-			  >) :: <a href="#"
+			  > :: <a href="#" title="Data.Kind"
 			  >*</a
 			  > <a href="#" class="selflink"
 			  >#</a
 			  ></p
 			></div
-		      ></div
+		      ></details
 		    ></td
 		  ></tr
 		><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:id:Y:Test:2" class="instance expander" onclick="toggleSection('i:id:Y:Test:2')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:id:Y:Test:2"
 		      ></span
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Test</a
-		      > <a href="#"
-		      >*</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Y</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -729,20 +755,26 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:id:Y:Test:2" class="inst-details hide"
-		    ></div
+		  ><details id="i:id:Y:Test:2"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      ></details
 		    ></td
 		  ></tr
 		><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:id:Y:Bar:3" class="instance expander" onclick="toggleSection('i:id:Y:Bar:3')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:id:Y:Bar:3"
 		      ></span
 		      > <span class="keyword"
 		      >data</span
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies2"
 		      >Bar</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Y</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -753,30 +785,34 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:id:Y:Bar:3" class="inst-details hide"
-		    ><div class="src"
+		  ><details id="i:id:Y:Bar:3"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      > <div class="src"
 		      ><span class="keyword"
 			>data</span
-			> <a href="#"
+			> <a href="#" title="TypeFamilies2"
 			>Bar</a
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>Y</a
 			></div
-		      ></div
+		      ></details
 		    ></td
 		  ></tr
 		><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:id:Y:AssocD:4" class="instance expander" onclick="toggleSection('i:id:Y:AssocD:4')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:id:Y:AssocD:4"
 		      ></span
 		      > <span class="keyword"
 		      >data</span
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >AssocD</a
-		      > <a href="#"
-		      >*</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Y</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -787,34 +823,36 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:id:Y:AssocD:4" class="inst-details hide"
-		    ><div class="src"
+		  ><details id="i:id:Y:AssocD:4"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      > <div class="src"
 		      ><span class="keyword"
 			>data</span
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>AssocD</a
-			> <a href="#"
-			>*</a
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>Y</a
 			> = <a id="v:AssocY" class="def"
 			>AssocY</a
 			></div
-		      ></div
+		      ></details
 		    ></td
 		  ></tr
 		><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:id:Y:AssocT:5" class="instance expander" onclick="toggleSection('i:id:Y:AssocT:5')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:id:Y:AssocT:5"
 		      ></span
 		      > <span class="keyword"
 		      >type</span
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >AssocT</a
-		      > <a href="#"
-		      >*</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Y</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -825,38 +863,38 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:id:Y:AssocT:5" class="inst-details hide"
-		    ><div class="src"
+		  ><details id="i:id:Y:AssocT:5"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      > <div class="src"
 		      ><span class="keyword"
 			>type</span
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>AssocT</a
-			> <a href="#"
-			>*</a
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>Y</a
-			> = <a href="#"
+			> = <a href="#" title="TypeFamilies"
 			>Bat</a
-			> <a href="#"
-			>*</a
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>Y</a
 			></div
-		      ></div
+		      ></details
 		    ></td
 		  ></tr
 		><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:id:Y:Bat:6" class="instance expander" onclick="toggleSection('i:id:Y:Bat:6')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:id:Y:Bat:6"
 		      ></span
 		      > <span class="keyword"
 		      >data</span
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Bat</a
-		      > <a href="#"
-		      >*</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Y</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -869,36 +907,38 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:id:Y:Bat:6" class="inst-details hide"
-		    ><div class="src"
+		  ><details id="i:id:Y:Bat:6"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      > <div class="src"
 		      ><span class="keyword"
 			>data</span
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>Bat</a
-			> <a href="#"
-			>*</a
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>Y</a
 			> = <a id="v:BatY" class="def"
 			>BatY</a
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>Y</a
 			></div
-		      ></div
+		      ></details
 		    ></td
 		  ></tr
 		><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:id:Y:Foo:7" class="instance expander" onclick="toggleSection('i:id:Y:Foo:7')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:id:Y:Foo:7"
 		      ></span
 		      > <span class="keyword"
 		      >type</span
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Foo</a
-		      > <a href="#"
-		      >*</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Y</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -909,36 +949,40 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:id:Y:Foo:7" class="inst-details hide"
-		    ><div class="src"
+		  ><details id="i:id:Y:Foo:7"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      > <div class="src"
 		      ><span class="keyword"
 			>type</span
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>Foo</a
-			> <a href="#"
-			>*</a
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>Y</a
-			> = <a href="#"
+			> = <a href="#" title="TypeFamilies"
 			>X</a
 			></div
-		      ></div
+		      ></details
 		    ></td
 		  ></tr
 		><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:id:Y:-60--62-:8" class="instance expander" onclick="toggleSection('i:id:Y:-60--62-:8')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:id:Y:-60--62-:8"
 		      ></span
 		      > <span class="keyword"
 		      >type</span
-		      > <a href="#"
-		      >(&lt;&gt;)</a
-		      > <a href="#"
-		      >*</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Y</a
-		      > a</span
+		      > <a href="#" title="TypeFamilies"
+		      >&lt;&gt;</a
+		      > (a :: <a href="#" title="Data.Kind"
+		      >*</a
+		      >)</span
 		    > <a href="#" class="selflink"
 		    >#</a
 		    ></td
@@ -947,22 +991,28 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:id:Y:-60--62-:8" class="inst-details hide"
-		    ><div class="src"
+		  ><details id="i:id:Y:-60--62-:8"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      > <div class="src"
 		      ><span class="keyword"
 			>type</span
-			> <a href="#"
-			>(&lt;&gt;)</a
-			> <a href="#"
-			>*</a
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>Y</a
-			> a = a</div
-		      ></div
+			> <a href="#" title="TypeFamilies"
+			>&lt;&gt;</a
+			> (a :: <a href="#" title="Data.Kind"
+			>*</a
+			>) = a</div
+		      ></details
 		    ></td
 		  ></tr
 		></table
-	      ></div
+	      ></details
 	    ></div
 	  ></div
 	><div class="top"
@@ -1001,22 +1051,22 @@ window.onload = function () {pageLoad();};
 	      ></table
 	    ></div
 	  ><div class="subs instances"
-	  ><p id="control.i:Z" class="caption collapser" onclick="toggleSection('i:Z')"
-	    >Instances</p
-	    ><div id="section.i:Z" class="show"
-	    ><table
+	  ><details id="i:Z" open="open"
+	    ><summary
+	      >Instances</summary
+	      ><table
 	      ><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:id:Z:Bat:1" class="instance expander" onclick="toggleSection('i:id:Z:Bat:1')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:id:Z:Bat:1"
 		      ></span
 		      > <span class="keyword"
 		      >data</span
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Bat</a
-		      > <a href="#"
+		      > (z :: <a href="#" title="TypeFamilies"
 		      >Z</a
-		      ></span
+		      >)</span
 		    > <a href="#" class="selflink"
 		    >#</a
 		    ></td
@@ -1027,44 +1077,46 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:id:Z:Bat:1" class="inst-details hide"
-		    ><div class="src"
+		  ><details id="i:id:Z:Bat:1"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      > <div class="src"
 		      ><span class="keyword"
 			>data</span
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>Bat</a
-			> <a href="#"
+			> (z :: <a href="#" title="TypeFamilies"
 			>Z</a
-			> <span class="keyword"
+			>) <span class="keyword"
 			>where</span
 			><ul class="inst"
 			><li class="inst"
 			  ><a id="v:BatZ1" class="def"
 			    >BatZ1</a
-			    > :: <a href="#"
+			    > :: <a href="#" title="TypeFamilies"
 			    >Bat</a
-			    > <a href="#"
-			    >Z</a
-			    > <a href="#"
+			    > <a href="#" title="TypeFamilies"
 			    >ZA</a
 			    ></li
 			  ><li class="inst"
 			  ><a id="v:BatZ2" class="def"
 			    >BatZ2</a
-			    > :: <a href="#"
+			    > :: <a href="#" title="TypeFamilies"
 			    >Bat</a
-			    > <a href="#"
-			    >Z</a
-			    > <a href="#"
+			    > <a href="#" title="TypeFamilies"
 			    >ZB</a
 			    ></li
 			  ></ul
 			></div
-		      ></div
+		      ></details
 		    ></td
 		  ></tr
 		></table
-	      ></div
+	      ></details
 	    ></div
 	  ></div
 	><div class="top"
@@ -1081,20 +1133,18 @@ window.onload = function () {pageLoad();};
 	    >Doc for: class Test a</p
 	    ></div
 	  ><div class="subs instances"
-	  ><p id="control.i:Test" class="caption collapser" onclick="toggleSection('i:Test')"
-	    >Instances</p
-	    ><div id="section.i:Test" class="show"
-	    ><table
+	  ><details id="i:Test" open="open"
+	    ><summary
+	      >Instances</summary
+	      ><table
 	      ><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:ic:Test:Test:1" class="instance expander" onclick="toggleSection('i:ic:Test:Test:1')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:ic:Test:Test:1"
 		      ></span
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Test</a
-		      > <a href="#"
-		      >*</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Y</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -1107,20 +1157,24 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:ic:Test:Test:1" class="inst-details hide"
-		    ></div
+		  ><details id="i:ic:Test:Test:1"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      ></details
 		    ></td
 		  ></tr
 		><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:ic:Test:Test:2" class="instance expander" onclick="toggleSection('i:ic:Test:Test:2')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:ic:Test:Test:2"
 		      ></span
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Test</a
-		      > <a href="#"
-		      >*</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >X</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -1133,12 +1187,18 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:ic:Test:Test:2" class="inst-details hide"
-		    ></div
+		  ><details id="i:ic:Test:Test:2"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      ></details
 		    ></td
 		  ></tr
 		></table
-	      ></div
+	      ></details
 	    ></div
 	  ></div
 	><div class="top"
@@ -1155,22 +1215,20 @@ window.onload = function () {pageLoad();};
 	    >Doc for: type family Foo a</p
 	    ></div
 	  ><div class="subs instances"
-	  ><p id="control.i:Foo" class="caption collapser" onclick="toggleSection('i:Foo')"
-	    >Instances</p
-	    ><div id="section.i:Foo" class="show"
-	    ><table
+	  ><details id="i:Foo" open="open"
+	    ><summary
+	      >Instances</summary
+	      ><table
 	      ><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:if:Foo:Foo:1" class="instance expander" onclick="toggleSection('i:if:Foo:Foo:1')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:if:Foo:Foo:1"
 		      ></span
 		      > <span class="keyword"
 		      >type</span
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Foo</a
-		      > <a href="#"
-		      >*</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Y</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -1181,34 +1239,36 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:if:Foo:Foo:1" class="inst-details hide"
-		    ><div class="src"
+		  ><details id="i:if:Foo:Foo:1"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      > <div class="src"
 		      ><span class="keyword"
 			>type</span
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>Foo</a
-			> <a href="#"
-			>*</a
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>Y</a
-			> = <a href="#"
+			> = <a href="#" title="TypeFamilies"
 			>X</a
 			></div
-		      ></div
+		      ></details
 		    ></td
 		  ></tr
 		><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:if:Foo:Foo:2" class="instance expander" onclick="toggleSection('i:if:Foo:Foo:2')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:if:Foo:Foo:2"
 		      ></span
 		      > <span class="keyword"
 		      >type</span
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Foo</a
-		      > <a href="#"
-		      >*</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >X</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -1219,24 +1279,28 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:if:Foo:Foo:2" class="inst-details hide"
-		    ><div class="src"
+		  ><details id="i:if:Foo:Foo:2"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      > <div class="src"
 		      ><span class="keyword"
 			>type</span
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>Foo</a
-			> <a href="#"
-			>*</a
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>X</a
-			> = <a href="#"
+			> = <a href="#" title="TypeFamilies"
 			>Y</a
 			></div
-		      ></div
+		      ></details
 		    ></td
 		  ></tr
 		></table
-	      ></div
+	      ></details
 	    ></div
 	  ></div
 	><div class="top"
@@ -1245,7 +1309,7 @@ window.onload = function () {pageLoad();};
 	    >data family</span
 	    > <a id="t:Bat" class="def"
 	    >Bat</a
-	    > (a :: k) :: <a href="#"
+	    > (a :: k) :: <a href="#" title="Data.Kind"
 	    >*</a
 	    > <a href="#" class="selflink"
 	    >#</a
@@ -1255,22 +1319,22 @@ window.onload = function () {pageLoad();};
 	    >Doc for: data family Bat a</p
 	    ></div
 	  ><div class="subs instances"
-	  ><p id="control.i:Bat" class="caption collapser" onclick="toggleSection('i:Bat')"
-	    >Instances</p
-	    ><div id="section.i:Bat" class="show"
-	    ><table
+	  ><details id="i:Bat" open="open"
+	    ><summary
+	      >Instances</summary
+	      ><table
 	      ><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:if:Bat:Bat:1" class="instance expander" onclick="toggleSection('i:if:Bat:Bat:1')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:if:Bat:Bat:1"
 		      ></span
 		      > <span class="keyword"
 		      >data</span
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Bat</a
-		      > <a href="#"
+		      > (z :: <a href="#" title="TypeFamilies"
 		      >Z</a
-		      ></span
+		      >)</span
 		    > <a href="#" class="selflink"
 		    >#</a
 		    ></td
@@ -1281,54 +1345,54 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:if:Bat:Bat:1" class="inst-details hide"
-		    ><div class="src"
+		  ><details id="i:if:Bat:Bat:1"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      > <div class="src"
 		      ><span class="keyword"
 			>data</span
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>Bat</a
-			> <a href="#"
+			> (z :: <a href="#" title="TypeFamilies"
 			>Z</a
-			> <span class="keyword"
+			>) <span class="keyword"
 			>where</span
 			><ul class="inst"
 			><li class="inst"
 			  ><a id="v:BatZ1" class="def"
 			    >BatZ1</a
-			    > :: <a href="#"
+			    > :: <a href="#" title="TypeFamilies"
 			    >Bat</a
-			    > <a href="#"
-			    >Z</a
-			    > <a href="#"
+			    > <a href="#" title="TypeFamilies"
 			    >ZA</a
 			    ></li
 			  ><li class="inst"
 			  ><a id="v:BatZ2" class="def"
 			    >BatZ2</a
-			    > :: <a href="#"
+			    > :: <a href="#" title="TypeFamilies"
 			    >Bat</a
-			    > <a href="#"
-			    >Z</a
-			    > <a href="#"
+			    > <a href="#" title="TypeFamilies"
 			    >ZB</a
 			    ></li
 			  ></ul
 			></div
-		      ></div
+		      ></details
 		    ></td
 		  ></tr
 		><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:if:Bat:Bat:2" class="instance expander" onclick="toggleSection('i:if:Bat:Bat:2')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:if:Bat:Bat:2"
 		      ></span
 		      > <span class="keyword"
 		      >data</span
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Bat</a
-		      > <a href="#"
-		      >*</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Y</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -1341,36 +1405,38 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:if:Bat:Bat:2" class="inst-details hide"
-		    ><div class="src"
+		  ><details id="i:if:Bat:Bat:2"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      > <div class="src"
 		      ><span class="keyword"
 			>data</span
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>Bat</a
-			> <a href="#"
-			>*</a
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>Y</a
 			> = <a id="v:BatY" class="def"
 			>BatY</a
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>Y</a
 			></div
-		      ></div
+		      ></details
 		    ></td
 		  ></tr
 		><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:if:Bat:Bat:3" class="instance expander" onclick="toggleSection('i:if:Bat:Bat:3')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:if:Bat:Bat:3"
 		      ></span
 		      > <span class="keyword"
 		      >data</span
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Bat</a
-		      > <a href="#"
-		      >*</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >X</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -1383,21 +1449,25 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:if:Bat:Bat:3" class="inst-details hide"
-		    ><div class="src"
+		  ><details id="i:if:Bat:Bat:3"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      > <div class="src"
 		      ><span class="keyword"
 			>data</span
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>Bat</a
-			> <a href="#"
-			>*</a
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>X</a
 			> <ul class="inst"
 			><li class="inst"
 			  >= <a id="v:BatX" class="def"
 			    >BatX</a
-			    > <a href="#"
+			    > <a href="#" title="TypeFamilies"
 			    >X</a
 			    ></li
 			  ><li class="inst"
@@ -1407,24 +1477,24 @@ window.onload = function () {pageLoad();};
 			    ><li
 			      ><a id="v:aaa" class="def"
 				>aaa</a
-				> :: <a href="#"
+				> :: <a href="#" title="TypeFamilies"
 				>X</a
 				></li
 			      ><li
 			      ><a id="v:bbb" class="def"
 				>bbb</a
-				> :: <a href="#"
+				> :: <a href="#" title="TypeFamilies"
 				>Y</a
 				></li
 			      ></ul
 			    > }</li
 			  ></ul
 			></div
-		      ></div
+		      ></details
 		    ></td
 		  ></tr
 		></table
-	      ></div
+	      ></details
 	    ></div
 	  ></div
 	><div class="top"
@@ -1448,7 +1518,7 @@ window.onload = function () {pageLoad();};
 	      >data</span
 	      > <a id="t:AssocD" class="def"
 	      >AssocD</a
-	      > a :: <a href="#"
+	      > a :: <a href="#" title="Data.Kind"
 	      >*</a
 	      > <a href="#" class="selflink"
 	      >#</a
@@ -1462,7 +1532,7 @@ window.onload = function () {pageLoad();};
 	      >type</span
 	      > <a id="t:AssocT" class="def"
 	      >AssocT</a
-	      > a :: <a href="#"
+	      > a :: <a href="#" title="Data.Kind"
 	      >*</a
 	      > <a href="#" class="selflink"
 	      >#</a
@@ -1473,20 +1543,18 @@ window.onload = function () {pageLoad();};
 	      ></div
 	    ></div
 	  ><div class="subs instances"
-	  ><p id="control.i:Assoc" class="caption collapser" onclick="toggleSection('i:Assoc')"
-	    >Instances</p
-	    ><div id="section.i:Assoc" class="show"
-	    ><table
+	  ><details id="i:Assoc" open="open"
+	    ><summary
+	      >Instances</summary
+	      ><table
 	      ><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:ic:Assoc:Assoc:1" class="instance expander" onclick="toggleSection('i:ic:Assoc:Assoc:1')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:ic:Assoc:Assoc:1"
 		      ></span
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Assoc</a
-		      > <a href="#"
-		      >*</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Y</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -1499,20 +1567,24 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:ic:Assoc:Assoc:1" class="inst-details hide"
-		    ><div class="subs associated-types"
+		  ><details id="i:ic:Assoc:Assoc:1"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      > <div class="subs associated-types"
 		      ><p class="caption"
 			>Associated Types</p
 			><p class="src"
 			><span class="keyword"
 			  >data</span
-			  > <a href="#"
+			  > <a href="#" title="TypeFamilies"
 			  >AssocD</a
-			  > <a href="#"
+			  > <a href="#" title="TypeFamilies"
 			  >Y</a
-			  > (a :: <a href="#"
-			  >Y</a
-			  >) :: <a href="#"
+			  > :: <a href="#" title="Data.Kind"
 			  >*</a
 			  > <a href="#" class="selflink"
 			  >#</a
@@ -1520,31 +1592,27 @@ window.onload = function () {pageLoad();};
 			><p class="src"
 			><span class="keyword"
 			  >type</span
-			  > <a href="#"
+			  > <a href="#" title="TypeFamilies"
 			  >AssocT</a
-			  > <a href="#"
+			  > <a href="#" title="TypeFamilies"
 			  >Y</a
-			  > (a :: <a href="#"
-			  >Y</a
-			  >) :: <a href="#"
+			  > :: <a href="#" title="Data.Kind"
 			  >*</a
 			  > <a href="#" class="selflink"
 			  >#</a
 			  ></p
 			></div
-		      ></div
+		      ></details
 		    ></td
 		  ></tr
 		><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:ic:Assoc:Assoc:2" class="instance expander" onclick="toggleSection('i:ic:Assoc:Assoc:2')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:ic:Assoc:Assoc:2"
 		      ></span
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Assoc</a
-		      > <a href="#"
-		      >*</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >X</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -1557,20 +1625,24 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:ic:Assoc:Assoc:2" class="inst-details hide"
-		    ><div class="subs associated-types"
+		  ><details id="i:ic:Assoc:Assoc:2"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      > <div class="subs associated-types"
 		      ><p class="caption"
 			>Associated Types</p
 			><p class="src"
 			><span class="keyword"
 			  >data</span
-			  > <a href="#"
+			  > <a href="#" title="TypeFamilies"
 			  >AssocD</a
-			  > <a href="#"
+			  > <a href="#" title="TypeFamilies"
 			  >X</a
-			  > (a :: <a href="#"
-			  >X</a
-			  >) :: <a href="#"
+			  > :: <a href="#" title="Data.Kind"
 			  >*</a
 			  > <a href="#" class="selflink"
 			  >#</a
@@ -1578,23 +1650,21 @@ window.onload = function () {pageLoad();};
 			><p class="src"
 			><span class="keyword"
 			  >type</span
-			  > <a href="#"
+			  > <a href="#" title="TypeFamilies"
 			  >AssocT</a
-			  > <a href="#"
+			  > <a href="#" title="TypeFamilies"
 			  >X</a
-			  > (a :: <a href="#"
-			  >X</a
-			  >) :: <a href="#"
+			  > :: <a href="#" title="Data.Kind"
 			  >*</a
 			  > <a href="#" class="selflink"
 			  >#</a
 			  ></p
 			></div
-		      ></div
+		      ></details
 		    ></td
 		  ></tr
 		></table
-	      ></div
+	      ></details
 	    ></div
 	  ></div
 	><div class="top"
@@ -1618,11 +1688,11 @@ window.onload = function () {pageLoad();};
 	    ><table
 	    ><tr
 	      ><td class="src"
-		><a href="#"
+		><a href="#" title="TypeFamilies"
 		  >Bar</a
-		  > <a href="#"
+		  > <a href="#" title="TypeFamilies"
 		  >X</a
-		  > = <a href="#"
+		  > = <a href="#" title="TypeFamilies"
 		  >X</a
 		  ></td
 		><td class="doc empty"
@@ -1630,9 +1700,9 @@ window.onload = function () {pageLoad();};
 		></tr
 	      ><tr
 	      ><td class="src"
-		><a href="#"
+		><a href="#" title="TypeFamilies"
 		  >Bar</a
-		  > y = <a href="#"
+		  > y = <a href="#" title="TypeFamilies"
 		  >Y</a
 		  ></td
 		><td class="doc empty"
@@ -1651,24 +1721,22 @@ window.onload = function () {pageLoad();};
 	    >#</a
 	    ></p
 	  ><div class="subs instances"
-	  ><p id="control.i:-60--62-" class="caption collapser" onclick="toggleSection('i:-60--62-')"
-	    >Instances</p
-	    ><div id="section.i:-60--62-" class="show"
-	    ><table
+	  ><details id="i:-60--62-" open="open"
+	    ><summary
+	      >Instances</summary
+	      ><table
 	      ><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:if:-60--62-:-60--62-:1" class="instance expander" onclick="toggleSection('i:if:-60--62-:-60--62-:1')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:if:-60--62-:-60--62-:1"
 		      ></span
 		      > <span class="keyword"
 		      >type</span
-		      > <a href="#"
-		      >(&lt;&gt;)</a
-		      > <a href="#"
-		      >X</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >XXX</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
+		      >&lt;&gt;</a
+		      > <a href="#" title="TypeFamilies"
 		      >XX</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -1679,38 +1747,42 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:if:-60--62-:-60--62-:1" class="inst-details hide"
-		    ><div class="src"
+		  ><details id="i:if:-60--62-:-60--62-:1"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      > <div class="src"
 		      ><span class="keyword"
 			>type</span
-			> <a href="#"
-			>(&lt;&gt;)</a
-			> <a href="#"
-			>X</a
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>XXX</a
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
+			>&lt;&gt;</a
+			> <a href="#" title="TypeFamilies"
 			>XX</a
-			> = <a href="#"
+			> = <a href="#" title="TypeFamilies"
 			>X</a
 			></div
-		      ></div
+		      ></details
 		    ></td
 		  ></tr
 		><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:if:-60--62-:-60--62-:2" class="instance expander" onclick="toggleSection('i:if:-60--62-:-60--62-:2')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:if:-60--62-:-60--62-:2"
 		      ></span
 		      > <span class="keyword"
 		      >type</span
-		      > <a href="#"
-		      >(&lt;&gt;)</a
-		      > <a href="#"
-		      >*</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >Y</a
-		      > a</span
+		      > <a href="#" title="TypeFamilies"
+		      >&lt;&gt;</a
+		      > (a :: <a href="#" title="Data.Kind"
+		      >*</a
+		      >)</span
 		    > <a href="#" class="selflink"
 		    >#</a
 		    ></td
@@ -1719,34 +1791,40 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:if:-60--62-:-60--62-:2" class="inst-details hide"
-		    ><div class="src"
+		  ><details id="i:if:-60--62-:-60--62-:2"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      > <div class="src"
 		      ><span class="keyword"
 			>type</span
-			> <a href="#"
-			>(&lt;&gt;)</a
-			> <a href="#"
-			>*</a
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>Y</a
-			> a = a</div
-		      ></div
+			> <a href="#" title="TypeFamilies"
+			>&lt;&gt;</a
+			> (a :: <a href="#" title="Data.Kind"
+			>*</a
+			>) = a</div
+		      ></details
 		    ></td
 		  ></tr
 		><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:if:-60--62-:-60--62-:3" class="instance expander" onclick="toggleSection('i:if:-60--62-:-60--62-:3')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:if:-60--62-:-60--62-:3"
 		      ></span
 		      > <span class="keyword"
 		      >type</span
-		      > <a href="#"
-		      >(&lt;&gt;)</a
-		      > <a href="#"
-		      >*</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >X</a
-		      > a</span
+		      > <a href="#" title="TypeFamilies"
+		      >&lt;&gt;</a
+		      > (a :: <a href="#" title="Data.Kind"
+		      >*</a
+		      >)</span
 		    > <a href="#" class="selflink"
 		    >#</a
 		    ></td
@@ -1755,24 +1833,30 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:if:-60--62-:-60--62-:3" class="inst-details hide"
-		    ><div class="src"
+		  ><details id="i:if:-60--62-:-60--62-:3"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      > <div class="src"
 		      ><span class="keyword"
 			>type</span
-			> <a href="#"
-			>(&lt;&gt;)</a
-			> <a href="#"
-			>*</a
-			> <a href="#"
+			> <a href="#" title="TypeFamilies"
 			>X</a
-			> a = <a href="#"
+			> <a href="#" title="TypeFamilies"
+			>&lt;&gt;</a
+			> (a :: <a href="#" title="Data.Kind"
+			>*</a
+			>) = <a href="#" title="TypeFamilies"
 			>X</a
 			></div
-		      ></div
+		      ></details
 		    ></td
 		  ></tr
 		></table
-	      ></div
+	      ></details
 	    ></div
 	  ></div
 	><div class="top"
@@ -1785,22 +1869,20 @@ window.onload = function () {pageLoad();};
 	    >#</a
 	    ></p
 	  ><div class="subs instances"
-	  ><p id="control.i:-62--60-" class="caption collapser" onclick="toggleSection('i:-62--60-')"
-	    >Instances</p
-	    ><div id="section.i:-62--60-" class="show"
-	    ><table
+	  ><details id="i:-62--60-" open="open"
+	    ><summary
+	      >Instances</summary
+	      ><table
 	      ><tr
 		><td class="src clearfix"
 		  ><span class="inst-left"
-		    ><span id="control.i:ic:-62--60-:-62--60-:1" class="instance expander" onclick="toggleSection('i:ic:-62--60-:-62--60-:1')"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:ic:-62--60-:-62--60-:1"
 		      ></span
-		      > <a href="#"
-		      >(&gt;&lt;)</a
-		      > <a href="#"
-		      >X</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
 		      >XX</a
-		      > <a href="#"
+		      > <a href="#" title="TypeFamilies"
+		      >&gt;&lt;</a
+		      > <a href="#" title="TypeFamilies"
 		      >XXX</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -1811,12 +1893,18 @@ window.onload = function () {pageLoad();};
 		  ></tr
 		><tr
 		><td colspan="2"
-		  ><div id="section.i:ic:-62--60-:-62--60-:1" class="inst-details hide"
-		    ></div
+		  ><details id="i:ic:-62--60-:-62--60-:1"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="#"
+			>TypeFamilies</a
+			></p
+		      ></details
 		    ></td
 		  ></tr
 		></table
-	      ></div
+	      ></details
 	    ></div
 	  ></div
 	></div

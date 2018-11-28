@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ViewPatterns #-}
 
@@ -10,12 +9,9 @@ module Distribution.Client.Nix
        , nixShellIfSandboxed
        ) where
 
-#if !MIN_VERSION_base(4,8,0)
-import Control.Applicative ((<$>))
-#endif
+import Distribution.Client.Compat.Prelude
 
 import Control.Exception (bracket, catch)
-import Control.Monad (filterM, when, unless)
 import System.Directory
        ( canonicalizePath, createDirectoryIfMissing, doesDirectoryExist
        , doesFileExist, removeDirectoryRecursive, removeFile )
@@ -28,7 +24,6 @@ import System.Process (showCommandForUser)
 
 import Distribution.Compat.Environment
        ( lookupEnv, setEnv, unsetEnv )
-import Distribution.Compat.Semigroup
 
 import Distribution.Verbosity
 
@@ -179,7 +174,7 @@ gcrootPath dist = dist </> "nix" </> "gcroots"
 
 
 inNixShell :: IO Bool
-inNixShell = maybe False (const True) <$> lookupEnv "CABAL_IN_NIX_SHELL"
+inNixShell = isJust <$> lookupEnv "CABAL_IN_NIX_SHELL"
 
 
 removeGCRoots :: Verbosity -> FilePath -> IO ()

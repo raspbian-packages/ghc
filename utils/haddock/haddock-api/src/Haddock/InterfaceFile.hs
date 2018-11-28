@@ -82,8 +82,8 @@ binaryInterfaceMagic = 0xD0Cface
 -- (2) set `binaryInterfaceVersionCompatibility` to [binaryInterfaceVersion]
 --
 binaryInterfaceVersion :: Word16
-#if (__GLASGOW_HASKELL__ >= 802) && (__GLASGOW_HASKELL__ < 804)
-binaryInterfaceVersion = 31
+#if (__GLASGOW_HASKELL__ >= 803) && (__GLASGOW_HASKELL__ < 805)
+binaryInterfaceVersion = 33
 
 binaryInterfaceVersionCompatibility :: [Word16]
 binaryInterfaceVersionCompatibility = [binaryInterfaceVersion]
@@ -158,7 +158,7 @@ writeInterfaceFile filename iface = do
 type NameCacheAccessor m = (m NameCache, NameCache -> m ())
 
 
-nameCacheFromGhc :: NameCacheAccessor Ghc
+nameCacheFromGhc :: forall m. (GhcMonad m, MonadIO m) => NameCacheAccessor m
 nameCacheFromGhc = ( read_from_session , write_to_session )
   where
     read_from_session = do
@@ -373,7 +373,7 @@ instance Binary InterfaceFile where
 
 instance Binary InstalledInterface where
   put_ bh (InstalledInterface modu is_sig info docMap argMap
-           exps visExps opts subMap patSynMap fixMap) = do
+           exps visExps opts fixMap) = do
     put_ bh modu
     put_ bh is_sig
     put_ bh info
@@ -381,8 +381,6 @@ instance Binary InstalledInterface where
     put_ bh exps
     put_ bh visExps
     put_ bh opts
-    put_ bh subMap
-    put_ bh patSynMap
     put_ bh fixMap
 
   get bh = do
@@ -393,12 +391,9 @@ instance Binary InstalledInterface where
     exps    <- get bh
     visExps <- get bh
     opts    <- get bh
-    subMap  <- get bh
-    patSynMap <- get bh
     fixMap  <- get bh
-
     return (InstalledInterface modu is_sig info docMap argMap
-            exps visExps opts subMap patSynMap fixMap)
+            exps visExps opts fixMap)
 
 
 instance Binary DocOption where
@@ -464,9 +459,40 @@ instance Binary a => Binary (Header a) where
         t <- get bh
         return (Header l t)
 
+instance Binary a => Binary (Table a) where
+    put_ bh (Table h b) = do
+        put_ bh h
+        put_ bh b
+    get bh = do
+        h <- get bh
+        b <- get bh
+        return (Table h b)
+
+instance Binary a => Binary (TableRow a) where
+    put_ bh (TableRow cs) = put_ bh cs
+    get bh = do
+        cs <- get bh
+        return (TableRow cs)
+
+instance Binary a => Binary (TableCell a) where
+    put_ bh (TableCell i j c) = do
+        put_ bh i
+        put_ bh j
+        put_ bh c
+    get bh = do
+        i <- get bh
+        j <- get bh
+        c <- get bh
+        return (TableCell i j c)
+
 instance Binary Meta where
-  put_ bh Meta { _version = v } = put_ bh v
-  get bh = (\v -> Meta { _version = v }) <$> get bh
+    put_ bh (Meta v p) = do
+        put_ bh v
+        put_ bh p
+    get bh = do
+        v <- get bh
+        p <- get bh
+        return (Meta v p)
 
 instance (Binary mod, Binary id) => Binary (MetaDoc mod id) where
   put_ bh MetaDoc { _meta = m, _doc = d } = do
@@ -547,6 +573,9 @@ instance (Binary mod, Binary id) => Binary (DocH mod id) where
     put_ bh (DocMathDisplay x) = do
             putByte bh 22
             put_ bh x
+    put_ bh (DocTable x) = do
+            putByte bh 23
+            put_ bh x
 
     get bh = do
             h <- getByte bh
@@ -620,6 +649,9 @@ instance (Binary mod, Binary id) => Binary (DocH mod id) where
               22 -> do
                     x <- get bh
                     return (DocMathDisplay x)
+              23 -> do
+                    x <- get bh
+                    return (DocTable x)
               _ -> error "invalid binary data found in the interface file"
 
 

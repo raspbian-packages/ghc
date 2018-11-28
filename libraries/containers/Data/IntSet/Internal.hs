@@ -10,6 +10,8 @@
 {-# LANGUAGE TypeFamilies #-}
 #endif
 
+{-# OPTIONS_HADDOCK not-home #-}
+
 #include "containers.h"
 
 -----------------------------------------------------------------------------
@@ -67,6 +69,8 @@
 -- This means that the operation can become linear in the number of
 -- elements with a maximum of /W/ -- the number of bits in an 'Int'
 -- (32 or 64).
+--
+-- @since 0.5.9
 -----------------------------------------------------------------------------
 
 -- [Note: INLINE bit fiddling]
@@ -98,6 +102,7 @@
 module Data.IntSet.Internal (
     -- * Set type
       IntSet(..), Key -- instance Eq,Show
+    , Prefix, Mask, BitMap
 
     -- * Operators
     , (\\)
@@ -113,6 +118,7 @@ module Data.IntSet.Internal (
     , lookupGE
     , isSubsetOf
     , isProperSubsetOf
+    , disjoint
 
     -- * Construction
     , empty
@@ -177,6 +183,7 @@ module Data.IntSet.Internal (
     , suffixBitMask
     , prefixBitMask
     , bitmapOf
+    , zero
     ) where
 
 import Control.DeepSeq (NFData(rnf))
@@ -247,8 +254,8 @@ data IntSet = Bin {-# UNPACK #-} !Prefix {-# UNPACK #-} !Mask !IntSet !IntSet
 -- Invariant: In Bin prefix mask left right, left consists of the elements that
 --            don't have the mask bit set; right is all the elements that do.
             | Tip {-# UNPACK #-} !Prefix {-# UNPACK #-} !BitMap
--- Invariant: The Prefix is zero for all but the last 5 (on 32 bit arches) or 6
---            bits (on 64 bit arches). The values of the map represented by a tip
+-- Invariant: The Prefix is zero for the last 5 (on 32 bit arches) or 6 bits
+--            (on 64 bit arches). The values of the set represented by a tip
 --            are the prefix plus the indices of the set bits in the bit map.
             | Nil
 
@@ -270,6 +277,7 @@ instance Monoid IntSet where
 #else
     mappend = (<>)
 
+-- | @since 0.5.7
 instance Semigroup IntSet where
     (<>)    = union
     stimes  = stimesIdempotentMonoid
@@ -319,7 +327,7 @@ size = go 0
 
 -- | /O(min(n,W))/. Is the value a member of the set?
 
--- See Note: Local 'go' functions and capturing]
+-- See Note: Local 'go' functions and capturing.
 member :: Key -> IntSet -> Bool
 member !x = go
   where
@@ -653,6 +661,54 @@ isSubsetOf Nil _         = True
 
 
 {--------------------------------------------------------------------
+  Disjoint
+--------------------------------------------------------------------}
+-- | /O(n+m)/. Check whether two sets are disjoint (i.e. their intersection
+--   is empty).
+--
+-- > disjoint (fromList [2,4,6])   (fromList [1,3])     == True
+-- > disjoint (fromList [2,4,6,8]) (fromList [2,3,5,7]) == False
+-- > disjoint (fromList [1,2])     (fromList [1,2,3,4]) == False
+-- > disjoint (fromList [])        (fromList [])        == True
+--
+-- @since 0.5.11
+disjoint :: IntSet -> IntSet -> Bool
+disjoint t1@(Bin p1 m1 l1 r1) t2@(Bin p2 m2 l2 r2)
+  | shorter m1 m2  = disjoint1
+  | shorter m2 m1  = disjoint2
+  | p1 == p2       = disjoint l1 l2 && disjoint r1 r2
+  | otherwise      = True
+  where
+    disjoint1 | nomatch p2 p1 m1  = True
+              | zero p2 m1        = disjoint l1 t2
+              | otherwise         = disjoint r1 t2
+
+    disjoint2 | nomatch p1 p2 m2  = True
+              | zero p1 m2        = disjoint t1 l2
+              | otherwise         = disjoint t1 r2
+
+disjoint t1@(Bin _ _ _ _) (Tip kx2 bm2) = disjointBM t1
+  where disjointBM (Bin p1 m1 l1 r1) | nomatch kx2 p1 m1 = True
+                                     | zero kx2 m1       = disjointBM l1
+                                     | otherwise         = disjointBM r1
+        disjointBM (Tip kx1 bm1) | kx1 == kx2 = (bm1 .&. bm2) == 0
+                                 | otherwise = True
+        disjointBM Nil = True
+
+disjoint (Bin _ _ _ _) Nil = True
+
+disjoint (Tip kx1 bm1) t2 = disjointBM t2
+  where disjointBM (Bin p2 m2 l2 r2) | nomatch kx1 p2 m2 = True
+                                     | zero kx1 m2       = disjointBM l2
+                                     | otherwise         = disjointBM r2
+        disjointBM (Tip kx2 bm2) | kx1 == kx2 = (bm1 .&. bm2) == 0
+                                 | otherwise = True
+        disjointBM Nil = True
+
+disjoint Nil _ = True
+
+
+{--------------------------------------------------------------------
   Filter
 --------------------------------------------------------------------}
 -- | /O(n)/. Filter all elements that satisfy some predicate.
@@ -933,6 +989,7 @@ elems
   Lists
 --------------------------------------------------------------------}
 #if __GLASGOW_HASKELL__ >= 708
+-- | @since 0.5.6.2
 instance GHCExts.IsList IntSet where
   type Item IntSet = Key
   fromList = fromList
@@ -1245,6 +1302,7 @@ bitmapOf x = bitmapOfSuffix (suffixOf x)
 {--------------------------------------------------------------------
   Endian independent bit twiddling
 --------------------------------------------------------------------}
+-- Returns True iff the bits set in i and the Mask m are disjoint.
 zero :: Int -> Mask -> Bool
 zero i m
   = (natFromInt i) .&. (natFromInt m) == 0
@@ -1447,28 +1505,6 @@ foldr'Bits prefix f z bm = let lb = lowestBitSet bm
                 | otherwise     =         go (bi + 1) (n `shiftRL` 1)
 
 #endif
-
-{----------------------------------------------------------------------
-  [bitcount] as posted by David F. Place to haskell-cafe on April 11, 2006,
-  based on the code on
-  http://graphics.stanford.edu/~seander/bithacks.html#CountBitsSetKernighan,
-  where the following source is given:
-    Published in 1988, the C Programming Language 2nd Ed. (by Brian W.
-    Kernighan and Dennis M. Ritchie) mentions this in exercise 2-9. On April
-    19, 2006 Don Knuth pointed out to me that this method "was first published
-    by Peter Wegner in CACM 3 (1960), 322. (Also discovered independently by
-    Derrick Lehmer and published in 1964 in a book edited by Beckenbach.)"
-----------------------------------------------------------------------}
-
-bitcount :: Int -> Word -> Int
-#if MIN_VERSION_base(4,5,0)
-bitcount a x = a + popCount x
-#else
-bitcount a0 x0 = go a0 x0
-  where go a 0 = a
-        go a x = go (a + 1) (x .&. (x-1))
-#endif
-{-# INLINE bitcount #-}
 
 
 {--------------------------------------------------------------------

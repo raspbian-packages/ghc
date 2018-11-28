@@ -1,8 +1,81 @@
 # Changelog for [`containers` package](http://github.com/haskell/containers)
 
+## 0.5.11
+
+* Released with GHC 8.4.
+
+### New functions and class instances
+
+* Add a `MonadFix` instance for `Data.Sequence`.
+
+* Add a `MonadFix` instance for `Data.Tree`.
+
+* Add `powerSet`, `cartesianProduct`, and `disjointUnion` for
+  `Data.Set`. (Thanks, Edward Kmett.)
+
+* Add `disjoint` for `Data.Set` and `Data.IntSet`. (Thanks, Víctor López Juan.)
+
+* Add `lookupMin` and `lookupMax` to `Data.IntMap`. (Thanks, bwroga.)
+
+* Add `unzip` and `unzipWith` to `Data.Sequence`. Make unzipping
+  build its results in lockstep to avoid certain space leaks.
+
+* Add carefully optimized implementations of `sortOn` and `unstableSortOn`
+  to `Data.Sequence`. (Thanks, Donnacha Oisín Kidney.)
+
+### Changes to existing functions and features
+
+* Make `Data.Sequence.replicateM` a synonym for `replicateA`
+  for post-AMP `base`.
+
+* Rewrite the `IsString` instance head for sequences, improving compatibility
+  with the list instance and also improving type inference. We used to have
+  
+  ```haskell
+  instance IsString (Seq Char)
+  ```
+  
+  Now we commit more eagerly with
+  
+  ```haskell
+  instance a ~ Char => IsString (Seq a)
+  ```
+
+* Make `>>=` for `Data.Tree` strict in the result of its second argument;
+  being too lazy here is almost useless, and violates one of the monad identity
+  laws. Specifically, `return () >>= \_ -> undefined` should always be
+  `undefined`, but this was not the case.
+
+* Harmonize laziness details for `minView` and `maxView` between
+  `Data.IntMap` and `Data.Map`.
+
+### Performance improvement
+
+* Speed up both stable and unstable sorting for `Data.Sequence` by (Thanks, Donnacha
+  Oisín Kidney.)
+
+### Other changes
+
+* Update for recent and upcoming GHC and Cabal versions (Thanks, Herbert
+  Valerio Reidel, Simon Jakobi, and Ryan Scott.)
+
+* Improve external and internal documentation (Thanks, Oleg Grenrus
+  and Benjamin Hodgson.)
+
+* Add tutorial-style documentation.
+
+* Add Haddock `@since` annotations for changes made since version
+  0.5.4 (Thanks, Simon Jakobi.)
+
+* Add a (very incomplete) test suite for `Data.Tree`.
+
+* Add structural validity checks to the test suites for `Data.IntMap`
+  and `Data.IntSet` (Thanks to Joachim Breitner for catching an error
+  in a first draft.)
+
 ## 0.5.10.2
 
-* Planned for GHC 8.2.
+* Released with GHC 8.2.
 
 * Use `COMPLETE` pragmas to declare complete sets of pattern synonyms
   for `Data.Sequence`. At last!

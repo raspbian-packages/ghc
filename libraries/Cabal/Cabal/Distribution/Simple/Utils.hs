@@ -57,6 +57,14 @@ module Distribution.Simple.Utils (
         findProgramLocation,
         findProgramVersion,
 
+        -- ** 'IOData' re-export
+        --
+        -- These types are re-exported from
+        -- "Distribution.Utils.IOData" for convience as they're
+        -- exposed in the API of 'rawSystemStdInOut'
+        IOData(..),
+        IODataMode(..),
+
         -- * copying files
         smartCopySources,
         createDirectoryIfMissingVerbose,
@@ -129,18 +137,16 @@ module Distribution.Simple.Utils (
         rewriteFileEx,
 
         -- * Unicode
-        fromUTF8,
         fromUTF8BS,
         fromUTF8LBS,
-        toUTF8,
+        toUTF8BS,
+        toUTF8LBS,
         readUTF8File,
         withUTF8FileContents,
         writeUTF8File,
         normaliseLineEndings,
 
         -- * BOM
-        startsWithBOM,
-        fileHasBOM,
         ignoreBOM,
 
         -- * generic utils
@@ -171,6 +177,8 @@ import Distribution.Compat.Prelude
 
 import Distribution.Text
 import Distribution.Utils.Generic
+import Distribution.Utils.IOData (IOData(..), IODataMode(..))
+import qualified Distribution.Utils.IOData as IOData
 import Distribution.ModuleName as ModuleName
 import Distribution.System
 import Distribution.Version
@@ -204,7 +212,7 @@ import qualified Data.ByteString.Lazy.Char8 as BS.Char8
 import System.Directory
     ( Permissions(executable), getDirectoryContents, getPermissions
     , doesDirectoryExist, doesFileExist, removeFile, findExecutable
-    , getModificationTime )
+    , getModificationTime, createDirectory, removeDirectoryRecursive )
 import System.Environment
     ( getProgName )
 import System.Exit
@@ -214,8 +222,6 @@ import System.FilePath
     , getSearchPath, joinPath, takeDirectory, splitFileName
     , splitExtension, splitExtensions, splitDirectories
     , searchPathSeparator )
-import System.Directory
-    ( createDirectory, removeDirectoryRecursive )
 import System.IO
     ( Handle, hSetBinaryMode, hGetContents, stderr, stdout, hPutStr, hFlush
     , hClose, hSetBuffering, BufferMode(..) )
@@ -224,8 +230,10 @@ import System.IO.Unsafe
     ( unsafeInterleaveIO )
 import qualified Control.Exception as Exception
 
+import Data.Time.Clock.POSIX (getPOSIXTime, POSIXTime)
 import Control.Exception (IOException, evaluate, throwIO)
 import Control.Concurrent (forkIO)
+import Numeric (showFFloat)
 import qualified System.Process as Process
          ( CreateProcess(..), StdStream(..), proc)
 import System.Process
@@ -333,9 +341,10 @@ verbatimUserError = ioeSetVerbatim . userError
 
 dieWithLocation' :: Verbosity -> FilePath -> Maybe Int -> String -> IO a
 dieWithLocation' verbosity filename mb_lineno msg = withFrozenCallStack $ do
+    ts <- getPOSIXTime
     pname <- getProgName
     ioError . verbatimUserError
-            . withMetadata AlwaysMark VerboseTrace verbosity
+            . withMetadata ts AlwaysMark VerboseTrace verbosity
             . wrapTextVerbosity verbosity
             $ pname ++ ": " ++
               filename ++ (case mb_lineno of
@@ -345,17 +354,19 @@ dieWithLocation' verbosity filename mb_lineno msg = withFrozenCallStack $ do
 
 die' :: Verbosity -> String -> IO a
 die' verbosity msg = withFrozenCallStack $ do
+    ts <- getPOSIXTime
     pname <- getProgName
     ioError . verbatimUserError
-            . withMetadata AlwaysMark VerboseTrace verbosity
+            . withMetadata ts AlwaysMark VerboseTrace verbosity
             . wrapTextVerbosity verbosity
             $ pname ++ ": " ++ msg
 
 dieNoWrap :: Verbosity -> String -> IO a
 dieNoWrap verbosity msg = withFrozenCallStack $ do
     -- TODO: should this have program name or not?
+    ts <- getPOSIXTime
     ioError . verbatimUserError
-            . withMetadata AlwaysMark VerboseTrace verbosity
+            . withMetadata ts AlwaysMark VerboseTrace verbosity
             $ msg
 
 -- | Given a block of IO code that may raise an exception, annotate
@@ -364,12 +375,16 @@ dieNoWrap verbosity msg = withFrozenCallStack $ do
 -- this function unconditionally wraps the error message with a trace
 -- (so it is NOT idempotent.)
 annotateIO :: Verbosity -> IO a -> IO a
-annotateIO verbosity = modifyIOError f
+annotateIO verbosity act = do
+    ts <- getPOSIXTime
+    modifyIOError (f ts) act
   where
-    f ioe = ioeSetErrorString ioe
-          . withMetadata NeverMark VerboseTrace verbosity
-          $ ioeGetErrorString ioe
+    f ts ioe = ioeSetErrorString ioe
+             . withMetadata ts NeverMark VerboseTrace verbosity
+             $ ioeGetErrorString ioe
 
+
+{-# NOINLINE topHandlerWith #-}
 topHandlerWith :: forall a. (Exception.SomeException -> IO a) -> IO a -> IO a
 topHandlerWith cont prog = do
     -- By default, stderr to a terminal device is NoBuffering. But this
@@ -403,7 +418,7 @@ topHandlerWith cont prog = do
         Just ioe
          | ioeGetVerbatim ioe ->
             -- Use the message verbatim
-            ioeGetErrorString ioe
+            ioeGetErrorString ioe ++ "\n"
          | isUserError ioe ->
           let file         = case ioeGetFileName ioe of
                                Nothing   -> ""
@@ -414,7 +429,7 @@ topHandlerWith cont prog = do
               detail       = ioeGetErrorString ioe
           in wrapText (pname ++ ": " ++ file ++ detail)
         _ ->
-          displaySomeException se
+          displaySomeException se ++ "\n"
 
 -- | BC wrapper around 'Exception.displayException'.
 displaySomeException :: Exception.Exception e => e -> String
@@ -435,8 +450,9 @@ topHandler prog = topHandlerWith (const $ exitWith (ExitFailure 1)) prog
 warn :: Verbosity -> String -> IO ()
 warn verbosity msg = withFrozenCallStack $ do
   when (verbosity >= normal) $ do
+    ts <- getPOSIXTime
     hFlush stdout
-    hPutStr stderr . withMetadata NormalMark FlagTrace verbosity
+    hPutStr stderr . withMetadata ts NormalMark FlagTrace verbosity
                    . wrapTextVerbosity verbosity
                    $ "Warning: " ++ msg
 
@@ -450,7 +466,8 @@ warn verbosity msg = withFrozenCallStack $ do
 notice :: Verbosity -> String -> IO ()
 notice verbosity msg = withFrozenCallStack $ do
   when (verbosity >= normal) $ do
-    hPutStr stdout . withMetadata NormalMark FlagTrace verbosity
+    ts <- getPOSIXTime
+    hPutStr stdout . withMetadata ts NormalMark FlagTrace verbosity
                    . wrapTextVerbosity verbosity
                    $ msg
 
@@ -460,7 +477,8 @@ notice verbosity msg = withFrozenCallStack $ do
 noticeNoWrap :: Verbosity -> String -> IO ()
 noticeNoWrap verbosity msg = withFrozenCallStack $ do
   when (verbosity >= normal) $ do
-    hPutStr stdout . withMetadata NormalMark FlagTrace verbosity $ msg
+    ts <- getPOSIXTime
+    hPutStr stdout . withMetadata ts NormalMark FlagTrace verbosity $ msg
 
 -- | Pretty-print a 'Disp.Doc' status message at 'normal' verbosity
 -- level.  Use this if you need fancy formatting.
@@ -468,7 +486,8 @@ noticeNoWrap verbosity msg = withFrozenCallStack $ do
 noticeDoc :: Verbosity -> Disp.Doc -> IO ()
 noticeDoc verbosity msg = withFrozenCallStack $ do
   when (verbosity >= normal) $ do
-    hPutStr stdout . withMetadata NormalMark FlagTrace verbosity
+    ts <- getPOSIXTime
+    hPutStr stdout . withMetadata ts NormalMark FlagTrace verbosity
                    . Disp.renderStyle defaultStyle $ msg
 
 -- | Display a "setup status message".  Prefer using setupMessage'
@@ -485,14 +504,16 @@ setupMessage verbosity msg pkgid = withFrozenCallStack $ do
 info :: Verbosity -> String -> IO ()
 info verbosity msg = withFrozenCallStack $
   when (verbosity >= verbose) $ do
-    hPutStr stdout . withMetadata NeverMark FlagTrace verbosity
+    ts <- getPOSIXTime
+    hPutStr stdout . withMetadata ts NeverMark FlagTrace verbosity
                    . wrapTextVerbosity verbosity
                    $ msg
 
 infoNoWrap :: Verbosity -> String -> IO ()
 infoNoWrap verbosity msg = withFrozenCallStack $
   when (verbosity >= verbose) $ do
-    hPutStr stdout . withMetadata NeverMark FlagTrace verbosity
+    ts <- getPOSIXTime
+    hPutStr stdout . withMetadata ts NeverMark FlagTrace verbosity
                    $ msg
 
 -- | Detailed internal debugging information
@@ -502,7 +523,8 @@ infoNoWrap verbosity msg = withFrozenCallStack $
 debug :: Verbosity -> String -> IO ()
 debug verbosity msg = withFrozenCallStack $
   when (verbosity >= deafening) $ do
-    hPutStr stdout . withMetadata NeverMark FlagTrace verbosity
+    ts <- getPOSIXTime
+    hPutStr stdout . withMetadata ts NeverMark FlagTrace verbosity
                    . wrapTextVerbosity verbosity
                    $ msg
     -- ensure that we don't lose output if we segfault/infinite loop
@@ -513,7 +535,8 @@ debug verbosity msg = withFrozenCallStack $
 debugNoWrap :: Verbosity -> String -> IO ()
 debugNoWrap verbosity msg = withFrozenCallStack $
   when (verbosity >= deafening) $ do
-    hPutStr stdout . withMetadata NeverMark FlagTrace verbosity
+    ts <- getPOSIXTime
+    hPutStr stdout . withMetadata ts NeverMark FlagTrace verbosity
                    $ msg
     -- ensure that we don't lose output if we segfault/infinite loop
     hFlush stdout
@@ -542,7 +565,27 @@ handleDoesNotExist e =
 wrapTextVerbosity :: Verbosity -> String -> String
 wrapTextVerbosity verb
   | isVerboseNoWrap verb = withTrailingNewline
-  | otherwise            = wrapText
+  | otherwise            = withTrailingNewline . wrapText
+
+
+-- | Prepends a timestamp if @+timestamp@ verbosity flag is set
+--
+-- This is used by 'withMetadata'
+--
+withTimestamp :: Verbosity -> POSIXTime -> String -> String
+withTimestamp v ts msg
+  | isVerboseTimestamp v  = msg'
+  | otherwise             = msg -- no-op
+  where
+    msg' = case lines msg of
+      []      -> tsstr "\n"
+      l1:rest -> unlines (tsstr (' ':l1) : map (contpfx++) rest)
+
+    -- format timestamp to be prepended to first line with msec precision
+    tsstr = showFFloat (Just 3) (realToFrac ts :: Double)
+
+    -- continuation prefix for subsequent lines of msg
+    contpfx = replicate (length (tsstr " ")) ' '
 
 -- | Wrap output with a marker if @+markoutput@ verbosity flag is set.
 --
@@ -553,6 +596,8 @@ wrapTextVerbosity verb
 -- guarantee that the markers are unambiguous, because some of
 -- Cabal's output comes straight from external programs, where
 -- we don't have the ability to interpose on the output.
+--
+-- This is used by 'withMetadata'
 --
 withOutputMarker :: Verbosity -> String -> String
 withOutputMarker v xs | not (isVerboseMarkOutput v) = xs
@@ -617,8 +662,8 @@ data MarkWhen = AlwaysMark | NormalMark | NeverMark
 
 -- | Add all necessary metadata to a logging message
 --
-withMetadata :: WithCallStack (MarkWhen -> TraceWhen -> Verbosity -> String -> String)
-withMetadata marker tracer verbosity x = withFrozenCallStack $
+withMetadata :: WithCallStack (POSIXTime -> MarkWhen -> TraceWhen -> Verbosity -> String -> String)
+withMetadata ts marker tracer verbosity x = withFrozenCallStack $
     -- NB: order matters.  Output marker first because we
     -- don't want to capture call stacks.
       withTrailingNewline
@@ -632,6 +677,7 @@ withMetadata marker tracer verbosity x = withFrozenCallStack $
         NeverMark  -> id)
     -- Clear out any existing markers
     . clearMarkers
+    . withTimestamp verbosity ts
     $ x
 
 clearMarkers :: String -> String
@@ -768,9 +814,9 @@ createProcessWithEnv verbosity path args mcwd menv inp out err = withFrozenCallS
 --
 rawSystemStdout :: Verbosity -> FilePath -> [String] -> IO String
 rawSystemStdout verbosity path args = withFrozenCallStack $ do
-  (output, errors, exitCode) <- rawSystemStdInOut verbosity path args
+  (IODataText output, errors, exitCode) <- rawSystemStdInOut verbosity path args
                                                   Nothing Nothing
-                                                  Nothing False
+                                                  Nothing IODataModeText
   when (exitCode /= ExitSuccess) $
     die errors
   return output
@@ -784,10 +830,10 @@ rawSystemStdInOut :: Verbosity
                   -> [String]                 -- ^ Arguments
                   -> Maybe FilePath           -- ^ New working dir or inherit
                   -> Maybe [(String, String)] -- ^ New environment or inherit
-                  -> Maybe (String, Bool)     -- ^ input text and binary mode
-                  -> Bool                     -- ^ output in binary mode
-                  -> IO (String, String, ExitCode) -- ^ output, errors, exit
-rawSystemStdInOut verbosity path args mcwd menv input outputBinary = withFrozenCallStack $ do
+                  -> Maybe IOData             -- ^ input text and binary mode
+                  -> IODataMode               -- ^ output in binary mode
+                  -> IO (IOData, String, ExitCode) -- ^ output, errors, exit
+rawSystemStdInOut verbosity path args mcwd menv input outputMode = withFrozenCallStack $ do
   printRawCommandAndArgs verbosity path args
 
   Exception.bracket
@@ -796,7 +842,6 @@ rawSystemStdInOut verbosity path args mcwd menv input outputBinary = withFrozenC
     $ \(inh,outh,errh,pid) -> do
 
       -- output mode depends on what the caller wants
-      hSetBinaryMode outh outputBinary
       -- but the errors are always assumed to be text (in the current locale)
       hSetBinaryMode errh False
 
@@ -804,11 +849,12 @@ rawSystemStdInOut verbosity path args mcwd menv input outputBinary = withFrozenC
       -- so if the process writes to stderr we do not block.
 
       err <- hGetContents errh
-      out <- hGetContents outh
+
+      out <- IOData.hGetContents outh outputMode
 
       mv <- newEmptyMVar
       let force str = do
-            mberr <- Exception.try (evaluate (length str) >> return ())
+            mberr <- Exception.try (evaluate (rnf str) >> return ())
             putMVar mv (mberr :: Either IOError ())
       _ <- forkIO $ force out
       _ <- forkIO $ force err
@@ -816,11 +862,9 @@ rawSystemStdInOut verbosity path args mcwd menv input outputBinary = withFrozenC
       -- push all the input, if any
       case input of
         Nothing -> return ()
-        Just (inputStr, inputBinary) -> do
-                -- input mode depends on what the caller wants
-          hSetBinaryMode inh inputBinary
-          hPutStr inh inputStr
-          hClose inh
+        Just inputData -> do
+          -- input mode depends on what the caller wants
+          IOData.hPutContents inh inputData
           --TODO: this probably fails if the process refuses to consume
           -- or if it closes stdin (eg if it exits)
 
@@ -836,8 +880,9 @@ rawSystemStdInOut verbosity path args mcwd menv input outputBinary = withFrozenC
                           " with error message:\n" ++ err
                        ++ case input of
                             Nothing       -> ""
-                            Just ("",  _) -> ""
-                            Just (inp, _) -> "\nstdin input:\n" ++ inp
+                            Just d | IOData.null d -> ""
+                            Just (IODataText inp) -> "\nstdin input:\n" ++ inp
+                            Just (IODataBinary inp) -> "\nstdin input (binary):\n" ++ show inp
 
       -- Check if we we hit an exception while consuming the output
       -- (e.g. a text decoding error)
@@ -1171,8 +1216,7 @@ createDirectoryIfMissingVerbose verbosity create_parents path0
           -- that the directory did indeed exist.
           | isAlreadyExistsError e -> (do
               isDir <- doesDirectoryExist dir
-              if isDir then return ()
-                       else throwIO e
+              unless isDir $ throwIO e
               ) `catchIO` ((\_ -> return ()) :: IOException -> IO ())
           | otherwise              -> throwIO e
 
@@ -1394,9 +1438,7 @@ withTempDirectoryEx _verbosity opts targetDir template f = withFrozenCallStack $
 -----------------------------------
 -- Safely reading and writing files
 
--- | See 'rewriteFileEx'
---
--- This function is provided for backwards-compatibility
+{-# DEPRECATED rewriteFile "Use rewriteFileEx so that Verbosity is respected" #-}
 rewriteFile :: FilePath -> String -> IO ()
 rewriteFile = rewriteFileEx normal
 
@@ -1494,6 +1536,7 @@ findPackageDesc dir
 tryFindPackageDesc :: FilePath -> IO FilePath
 tryFindPackageDesc dir = either die return =<< findPackageDesc dir
 
+{-# DEPRECATED defaultHookedPackageDesc "Use findHookedPackageDesc with the proper base directory instead" #-}
 -- |Optional auxiliary package information file (/pkgname/@.buildinfo@)
 defaultHookedPackageDesc :: IO (Maybe FilePath)
 defaultHookedPackageDesc = findHookedPackageDesc currentDir

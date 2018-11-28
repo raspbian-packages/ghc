@@ -11,7 +11,7 @@ The occurrence analyser re-typechecks a core expression, returning a new
 core expression with (hopefully) improved usage information.
 -}
 
-{-# LANGUAGE CPP, BangPatterns, MultiWayIf #-}
+{-# LANGUAGE CPP, BangPatterns, MultiWayIf, ViewPatterns  #-}
 
 module OccurAnal (
         occurAnalysePgm, occurAnalyseExpr, occurAnalyseExpr_NoBinderSwap
@@ -19,10 +19,13 @@ module OccurAnal (
 
 #include "HsVersions.h"
 
+import GhcPrelude
+
 import CoreSyn
 import CoreFVs
 import CoreUtils        ( exprIsTrivial, isDefaultAlt, isExpandableApp,
                           stripTicksTopE, mkTicks )
+import CoreArity        ( joinRhsArity )
 import Id
 import IdInfo
 import Name( localiseName )
@@ -35,7 +38,7 @@ import VarSet
 import VarEnv
 import Var
 import Demand           ( argOneShots, argsOneShots )
-import Digraph          ( SCC(..), Node
+import Digraph          ( SCC(..), Node(..)
                         , stronglyConnCompFromEdgedVerticesUniq
                         , stronglyConnCompFromEdgedVerticesUniqR )
 import Unique
@@ -170,7 +173,7 @@ we treat it like this (occAnalRecBind):
 
 4. To do so we form a new set of Nodes, with the same details, but
    different edges, the "loop-breaker nodes". The loop-breaker nodes
-   have both more and fewer depedencies than the scope edges
+   have both more and fewer dependencies than the scope edges
    (see Note [Choosing loop breakers])
 
    More edges: if f calls g, and g has an active rule that mentions h
@@ -732,8 +735,8 @@ It's not clear that this comes up often, however. TODO: Measure how often and
 add this analysis if necessary.
 
 ------------------------------------------------------------
-Note [Adjusting for lambdas]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Note [Adjusting right-hand sides]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 There's a bit of a dance we need to do after analysing a lambda expression or
 a right-hand side. In particular, we need to
 
@@ -892,7 +895,6 @@ occAnalRec lvl (CyclicSCC details_s) (body_uds, binds)
   | otherwise   -- At this point we always build a single Rec
   = -- pprTrace "occAnalRec" (vcat
     --  [ text "weak_fvs" <+> ppr weak_fvs
-    --  , text "tagged details" <+> ppr tagged_details_s
     --  , text "lb nodes" <+> ppr loop_breaker_nodes])
     (final_uds, Rec pairs : binds)
 
@@ -956,7 +958,8 @@ recording inlinings for any Ids which aren't marked as "no-inline" as it goes.
 
 -- Return the bindings sorted into a plausible order, and marked with loop breakers.
 loopBreakNodes depth bndr_set weak_fvs nodes binds
-  = go (stronglyConnCompFromEdgedVerticesUniqR nodes) binds
+  = -- pprTrace "loopBreakNodes" (ppr nodes) $
+    go (stronglyConnCompFromEdgedVerticesUniqR nodes) binds
   where
     go []         binds = binds
     go (scc:sccs) binds = loop_break_scc scc (go sccs binds)
@@ -973,13 +976,13 @@ reOrderNodes :: Int -> VarSet -> VarSet -> [LetrecNode] -> [Binding] -> [Binding
 reOrderNodes _ _ _ []     _     = panic "reOrderNodes"
 reOrderNodes _ _ _ [node] binds = mk_loop_breaker node : binds
 reOrderNodes depth bndr_set weak_fvs (node : nodes) binds
-  = -- pprTrace "reOrderNodes" (text "unchosen" <+> ppr unchosen $$
-    --                           text "chosen" <+> ppr chosen_nodes) $
+  = -- pprTrace "reOrderNodes" (vcat [ text "unchosen" <+> ppr unchosen
+    --                              , text "chosen" <+> ppr chosen_nodes ]) $
     loopBreakNodes new_depth bndr_set weak_fvs unchosen $
     (map mk_loop_breaker chosen_nodes ++ binds)
   where
     (chosen_nodes, unchosen) = chooseLoopBreaker approximate_lb
-                                                 (nd_score (fstOf3 node))
+                                                 (nd_score (node_payload node))
                                                  [node] [] nodes
 
     approximate_lb = depth >= 2
@@ -989,14 +992,15 @@ reOrderNodes depth bndr_set weak_fvs (node : nodes) binds
         -- and approximate, returning to d=0
 
 mk_loop_breaker :: LetrecNode -> Binding
-mk_loop_breaker (ND { nd_bndr = bndr, nd_rhs = rhs}, _, _)
+mk_loop_breaker (node_payload -> ND { nd_bndr = bndr, nd_rhs = rhs})
   = (bndr `setIdOccInfo` strongLoopBreaker { occ_tail = tail_info }, rhs)
   where
     tail_info = tailCallInfo (idOccInfo bndr)
 
 mk_non_loop_breaker :: VarSet -> LetrecNode -> Binding
 -- See Note [Weak loop breakers]
-mk_non_loop_breaker weak_fvs (ND { nd_bndr = bndr, nd_rhs = rhs}, _, _)
+mk_non_loop_breaker weak_fvs (node_payload -> ND { nd_bndr = bndr
+                                                 , nd_rhs = rhs})
   | bndr `elemVarSet` weak_fvs = (setIdOccInfo bndr occ', rhs)
   | otherwise                  = (bndr, rhs)
   where
@@ -1030,7 +1034,7 @@ chooseLoopBreaker approx_lb loop_sc loop_nodes acc (node : nodes)
   | otherwise              -- Worse score so don't pick it
   = chooseLoopBreaker approx_lb loop_sc loop_nodes (node : acc) nodes
   where
-    sc = nd_score (fstOf3 node)
+    sc = nd_score (node_payload node)
 
 {-
 Note [Complexity of loop breaking]
@@ -1204,6 +1208,7 @@ instance Outputable Details where
                   , text "inl =" <+> ppr (nd_inl nd)
                   , text "weak =" <+> ppr (nd_weak nd)
                   , text "rule =" <+> ppr (nd_active_rule_fvs nd)
+                  , text "score =" <+> ppr (nd_score nd)
              ])
 
 -- The NodeScore is compared lexicographically;
@@ -1223,7 +1228,7 @@ makeNode :: OccEnv -> ImpRuleEdges -> VarSet
          -> (Var, CoreExpr) -> LetrecNode
 -- See Note [Recursive bindings: the grand plan]
 makeNode env imp_rule_edges bndr_set (bndr, rhs)
-  = (details, varUnique bndr, nonDetKeysUniqSet node_fvs)
+  = DigraphNode details (varUnique bndr) (nonDetKeysUniqSet node_fvs)
     -- It's OK to use nonDetKeysUniqSet here as stronglyConnCompFromEdgedVerticesR
     -- is still deterministic with edges in nondeterministic order as
     -- explained in Note [Deterministic SCC] in Digraph.
@@ -1296,10 +1301,12 @@ mkLoopBreakerNodes lvl bndr_set body_uds details_s
   = (final_uds, zipWith mk_lb_node details_s bndrs')
   where
     (final_uds, bndrs') = tagRecBinders lvl body_uds
-                            [ (nd_bndr nd, nd_uds nd, nd_rhs_bndrs nd)
+                            [ ((nd_bndr nd)
+                               ,(nd_uds nd)
+                               ,(nd_rhs_bndrs nd))
                             | nd <- details_s ]
     mk_lb_node nd@(ND { nd_bndr = bndr, nd_rhs = rhs, nd_inl = inl_fvs }) bndr'
-      = (nd', varUnique bndr, nonDetKeysUniqSet lb_deps)
+      = DigraphNode nd' (varUnique bndr) (nonDetKeysUniqSet lb_deps)
               -- It's OK to use nonDetKeysUniqSet here as
               -- stronglyConnCompFromEdgedVerticesR is still deterministic with edges
               -- in nondeterministic order as explained in
@@ -1550,19 +1557,24 @@ occAnalNonRecRhs :: OccEnv
 occAnalNonRecRhs env bndr bndrs body
   = occAnalLamOrRhs rhs_env bndrs body
   where
-    -- See Note [Cascading inlines]
-    env1 | certainly_inline = env
+    env1 | is_join_point    = env  -- See Note [Join point RHSs]
+         | certainly_inline = env  -- See Note [Cascading inlines]
          | otherwise        = rhsCtxt env
 
     -- See Note [Sources of one-shot information]
     rhs_env = env1 { occ_one_shots = argOneShots dmd }
 
     certainly_inline -- See Note [Cascading inlines]
-      = case idOccInfo bndr of
+      = case occ of
           OneOcc { occ_in_lam = in_lam, occ_one_br = one_br }
-                                 -> not in_lam && one_br && active && not_stable
-          _                      -> False
+            -> not in_lam && one_br && active && not_stable
+          _ -> False
 
+    is_join_point = isAlwaysTailCalled occ
+    -- Like (isJoinId bndr) but happens one step earlier
+    --  c.f. willBeJoinId_maybe
+
+    occ        = idOccInfo bndr
     dmd        = idDemandInfo bndr
     active     = isAlwaysActive (idInlineActivation bndr)
     not_stable = not (isStableUnfolding (idUnfolding bndr))
@@ -1623,7 +1635,18 @@ occAnalRules env mb_expected_join_arity rec_flag id
       = case mb_expected_join_arity of
           Just ar | args `lengthIs` ar -> uds
           _                            -> markAllNonTailCalled uds
-{-
+{- Note [Join point RHSs]
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider
+   x = e
+   join j = Just x
+
+We want to inline x into j right away, so we don't want to give
+the join point a RhsCtxt (Trac #14137).  It's not a huge deal, because
+the FloatIn pass knows to float into join point RHSs; and the simplifier
+does not float things out of join point RHSs.  But it's a simple, cheap
+thing to do.  See Trac #14137.
+
 Note [Cascading inlines]
 ~~~~~~~~~~~~~~~~~~~~~~~~
 By default we use an rhsCtxt for the RHS of a binding.  This tells the
@@ -1650,15 +1673,19 @@ definitely inline the next time round, and so we analyse x3's rhs in
 an ordinary context, not rhsCtxt.  Hence the "certainly_inline" stuff.
 
 Annoyingly, we have to approximate SimplUtils.preInlineUnconditionally.
-If we say "yes" when preInlineUnconditionally says "no" the simplifier iterates
-indefinitely:
+If (a) the RHS is expandable (see isExpandableApp in occAnalApp), and
+   (b) certainly_inline says "yes" when preInlineUnconditionally says "no"
+then the simplifier iterates indefinitely:
         x = f y
-        k = Just x
+        k = Just x   -- We decide that k is 'certainly_inline'
+        v = ...k...  -- but preInlineUnconditionally doesn't inline it
 inline ==>
         k = Just (f y)
+        v = ...k...
 float ==>
         x1 = f y
         k = Just x1
+        v = ...k...
 
 This is worse than the slow cascade, so we only want to say "certainly_inline"
 if it really is certain.  Look at the note with preInlineUnconditionally
@@ -1699,6 +1726,12 @@ we can sort them into the right place when doing dependency analysis.
 -}
 
 occAnal env (Tick tickish body)
+  | SourceNote{} <- tickish
+  = (usage, Tick tickish body')
+                  -- SourceNotes are best-effort; so we just proceed as usual.
+                  -- If we drop a tick due to the issues described below it's
+                  -- not the end of the world.
+
   | tickish `tickishScopesLike` SoftScope
   = (markAllNonTailCalled usage, Tick tickish body')
 
@@ -1718,6 +1751,7 @@ occAnal env (Tick tickish body)
                   -- Making j a join point may cause the simplifier to drop t
                   -- (if the tick is put into the continuation). So we don't
                   -- count j 1 as a tail call.
+                  -- See #14242.
 
 occAnal env (Cast expr co)
   = case occAnal env expr of { (usage, expr') ->
@@ -2569,7 +2603,7 @@ adjustRhsUsage mb_join_arity rec_flag bndrs usage
                  Nothing            -> all isOneShotBndr bndrs
 
     exact_join = case mb_join_arity of
-                   Just join_arity -> join_arity == length bndrs
+                   Just join_arity -> bndrs `lengthIs` join_arity
                    _               -> False
 
 type IdWithOccInfo = Id
@@ -2606,7 +2640,8 @@ tagNonRecBinder lvl usage binder
  = let
      occ     = lookupDetails usage binder
      will_be_join = decideJoinPointHood lvl usage [binder]
-     occ'    | will_be_join = occ -- must already be marked AlwaysTailCalled
+     occ'    | will_be_join = -- must already be marked AlwaysTailCalled
+                              ASSERT(isAlwaysTailCalled occ) occ
              | otherwise    = markNonTailCalled occ
      binder' = setBinderOcc occ' binder
      usage'  = usage `delDetails` binder
@@ -2646,19 +2681,15 @@ tagRecBinders lvl body_uds triples
            , AlwaysTailCalled arity <- tailCallInfo occ
            = Just arity
            | otherwise
-           = ASSERT(not will_be_joins) -- Should be AlwaysTailCalled if we're
-                                       -- making join points!
-             Nothing
+           = ASSERT(not will_be_joins) -- Should be AlwaysTailCalled if
+             Nothing                   -- we are making join points!
 
      -- 3. Compute final usage details from adjusted RHS details
      adj_uds   = body_uds +++ combineUsageDetailsList rhs_udss'
 
-     -- 4. Tag each binder with its adjusted details modulo the
-     --    join-point-hood decision
-     occs      = map (lookupDetails adj_uds) bndrs
-     occs'     | will_be_joins = occs
-               | otherwise     = map markNonTailCalled occs
-     bndrs'    = zipWith setBinderOcc occs' bndrs
+     -- 4. Tag each binder with its adjusted details
+     bndrs'    = [ setBinderOcc (lookupDetails adj_uds bndr) bndr
+                 | bndr <- bndrs ]
 
      -- 5. Drop the binders from the adjusted details and return
      usage'    = adj_uds `delDetailsList` bndrs
@@ -2679,10 +2710,15 @@ setBinderOcc occ_info bndr
 
 -- | Decide whether some bindings should be made into join points or not.
 -- Returns `False` if they can't be join points. Note that it's an
--- all-or-nothing decision, as if multiple binders are given, they're assumed to
--- be mutually recursive.
+-- all-or-nothing decision, as if multiple binders are given, they're
+-- assumed to be mutually recursive.
 --
--- See Note [Invariants for join points] in CoreSyn.
+-- It must, however, be a final decision. If we say "True" for 'f',
+-- and then subsequently decide /not/ make 'f' into a join point, then
+-- the decision about another binding 'g' might be invalidated if (say)
+-- 'f' tail-calls 'g'.
+--
+-- See Note [Invariants on join points] in CoreSyn.
 decideJoinPointHood :: TopLevelFlag -> UsageDetails
                     -> [CoreBndr]
                     -> Bool
@@ -2706,6 +2742,9 @@ decideJoinPointHood NotTopLevel usage bndrs
         AlwaysTailCalled arity <- tailCallInfo (lookupDetails usage bndr)
       , -- Invariant 1 as applied to LHSes of rules
         all (ok_rule arity) (idCoreRules bndr)
+        -- Invariant 2a: stable unfoldings
+        -- See Note [Join points and INLINE pragmas]
+      , ok_unfolding arity (realIdUnfolding bndr)
         -- Invariant 4: Satisfies polymorphism rule
       , isValidJoinPointType arity (idType bndr)
       = True
@@ -2714,17 +2753,55 @@ decideJoinPointHood NotTopLevel usage bndrs
 
     ok_rule _ BuiltinRule{} = False -- only possible with plugin shenanigans
     ok_rule join_arity (Rule { ru_args = args })
-      = length args == join_arity
+      = args `lengthIs` join_arity
         -- Invariant 1 as applied to LHSes of rules
+
+    -- ok_unfolding returns False if we should /not/ convert a non-join-id
+    -- into a join-id, even though it is AlwaysTailCalled
+    ok_unfolding join_arity (CoreUnfolding { uf_src = src, uf_tmpl = rhs })
+      = not (isStableSource src && join_arity > joinRhsArity rhs)
+    ok_unfolding _ (DFunUnfolding {})
+      = False
+    ok_unfolding _ _
+      = True
 
 willBeJoinId_maybe :: CoreBndr -> Maybe JoinArity
 willBeJoinId_maybe bndr
-  | AlwaysTailCalled arity <- tailCallInfo (idOccInfo bndr)
-  = Just arity
-  | otherwise
-  = isJoinId_maybe bndr
+  = case tailCallInfo (idOccInfo bndr) of
+      AlwaysTailCalled arity -> Just arity
+      _                      -> isJoinId_maybe bndr
 
-{-
+
+{- Note [Join points and INLINE pragmas]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider
+   f x = let g = \x. not  -- Arity 1
+             {-# INLINE g #-}
+         in case x of
+              A -> g True True
+              B -> g True False
+              C -> blah2
+
+Here 'g' is always tail-called applied to 2 args, but the stable
+unfolding captured by the INLINE pragma has arity 1.  If we try to
+convert g to be a join point, its unfolding will still have arity 1
+(since it is stable, and we don't meddle with stable unfoldings), and
+Lint will complain (see Note [Invariants on join points], (2a), in
+CoreSyn.  Trac #13413.
+
+Moreover, since g is going to be inlined anyway, there is no benefit
+from making it a join point.
+
+If it is recursive, and uselessly marked INLINE, this will stop us
+making it a join point, which is annoying.  But occasionally
+(notably in class methods; see Note [Instances and loop breakers] in
+TcInstDcls) we mark recursive things as INLINE but the recursion
+unravels; so ignoring INLINE pragmas on recursive things isn't good
+either.
+
+See Invariant 2a of Note [Invariants on join points] in CoreSyn
+
+
 ************************************************************************
 *                                                                      *
 \subsection{Operations over OccInfo}

@@ -25,7 +25,9 @@ import Distribution.Client.Compat.Prelude
 
 import Distribution.Client.ProjectConfig.Types
 import Distribution.Client.Types
-         ( RemoteRepo(..), emptyRemoteRepo )
+         ( RemoteRepo(..), emptyRemoteRepo
+         , AllowNewer(..), AllowOlder(..) )
+
 import Distribution.Client.Config
          ( SavedConfig(..), remoteRepoFields )
 
@@ -33,18 +35,19 @@ import Distribution.Solver.Types.ConstraintSource
 
 import Distribution.Package
 import Distribution.PackageDescription
-         ( SourceRepo(..), RepoKind(..) 
+         ( SourceRepo(..), RepoKind(..)
          , dispFlagAssignment, parseFlagAssignment )
-import Distribution.PackageDescription.Parse
+import Distribution.Client.SourceRepoParse
          ( sourceRepoFieldDescrs )
 import Distribution.Simple.Compiler
          ( OptimisationLevel(..), DebugInfoLevel(..) )
+import Distribution.Simple.InstallDirs ( CopyDest (NoCopyDest) )
 import Distribution.Simple.Setup
          ( Flag(Flag), toFlag, fromFlagOrDefault
          , ConfigFlags(..), configureOptions
          , HaddockFlags(..), haddockOptions, defaultHaddockFlags
          , programDbPaths', splitArgs
-         , AllowNewer(..), AllowOlder(..), RelaxDeps(..) )
+         )
 import Distribution.Client.Setup
          ( GlobalFlags(..), globalCommand
          , ConfigExFlags(..), configureExOptions, defaultConfigExFlags
@@ -79,7 +82,6 @@ import Distribution.Simple.Command
          , OptionField, option, reqArg' )
 
 import qualified Data.Map as Map
-
 ------------------------------------------------------------------
 -- Representing the project config file in terms of legacy types
 --
@@ -100,6 +102,7 @@ data LegacyProjectConfig = LegacyProjectConfig {
        legacyPackagesNamed     :: [Dependency],
 
        legacySharedConfig      :: LegacySharedConfig,
+       legacyAllConfig         :: LegacyPackageConfig,
        legacyLocalConfig       :: LegacyPackageConfig,
        legacySpecificConfig    :: MapMappend PackageName LegacyPackageConfig
      } deriving Generic
@@ -163,10 +166,34 @@ commandLineFlagsToProjectConfig globalFlags configFlags configExFlags
       projectConfigShared        = convertLegacyAllPackageFlags
                                      globalFlags configFlags
                                      configExFlags installFlags,
-      projectConfigLocalPackages = convertLegacyPerPackageFlags
-                                     configFlags installFlags haddockFlags
+      projectConfigLocalPackages = localConfig,
+      projectConfigAllPackages   = allConfig
     }
-
+  where (localConfig, allConfig) = splitConfig
+                                 (convertLegacyPerPackageFlags
+                                    configFlags installFlags haddockFlags)
+        -- split the package config (from command line arguments) into
+        -- those applied to all packages and those to local only.
+        --
+        -- for now we will just copy over the ProgramPaths/Args/Extra into
+        -- the AllPackages.  The LocalPackages do not inherit them from
+        -- AllPackages, and as such need to retain them.
+        --
+        -- The general decision rule for what to put into allConfig
+        -- into localConfig is the following:
+        --
+        -- - anything that is host/toolchain/env specific should be applied
+        --   to all packages, as packagesets have to be host/toolchain/env
+        --   consistent.
+        -- - anything else should be in the local config and could potentially
+        --   be lifted into all-packages vial the `package *` cabal.project
+        --   section.
+        --
+        splitConfig :: PackageConfig -> (PackageConfig, PackageConfig)
+        splitConfig pc = (pc
+                         , mempty { packageConfigProgramPaths = packageConfigProgramPaths pc
+                                  , packageConfigProgramArgs  = packageConfigProgramArgs  pc
+                                  , packageConfigProgramPathExtra = packageConfigProgramPathExtra pc })
 
 -- | Convert from the types currently used for the user-wide @~/.cabal/config@
 -- file into the 'ProjectConfig' type.
@@ -190,9 +217,9 @@ convertLegacyGlobalConfig
       savedHaddockFlags      = haddockFlags
     } =
     mempty {
-      projectConfigShared        = configAllPackages,
-      projectConfigLocalPackages = configLocalPackages,
-      projectConfigBuildOnly     = configBuildOnly
+      projectConfigBuildOnly   = configBuildOnly,
+      projectConfigShared      = configShared,
+      projectConfigAllPackages = configAllPackages
     }
   where
     --TODO: [code cleanup] eliminate use of default*Flags here and specify the
@@ -201,9 +228,9 @@ convertLegacyGlobalConfig
     installFlags'  = defaultInstallFlags  <> installFlags
     haddockFlags'  = defaultHaddockFlags  <> haddockFlags
 
-    configLocalPackages = convertLegacyPerPackageFlags
+    configAllPackages   = convertLegacyPerPackageFlags
                             configFlags installFlags' haddockFlags'
-    configAllPackages   = convertLegacyAllPackageFlags
+    configShared        = convertLegacyAllPackageFlags
                             globalFlags configFlags
                             configExFlags' installFlags'
     configBuildOnly     = convertLegacyBuildOnlyFlags
@@ -224,6 +251,7 @@ convertLegacyProjectConfig
     legacyPackagesNamed,
     legacySharedConfig = LegacySharedConfig globalFlags configShFlags
                                             configExFlags installSharedFlags,
+    legacyAllConfig,
     legacyLocalConfig  = LegacyPackageConfig configFlags installPerPkgFlags
                                              haddockFlags,
     legacySpecificConfig
@@ -236,15 +264,18 @@ convertLegacyProjectConfig
       projectPackagesNamed         = legacyPackagesNamed,
 
       projectConfigBuildOnly       = configBuildOnly,
-      projectConfigShared          = configAllPackages,
+      projectConfigShared          = configPackagesShared,
       projectConfigProvenance      = mempty,
+      projectConfigAllPackages     = configAllPackages,
       projectConfigLocalPackages   = configLocalPackages,
       projectConfigSpecificPackage = fmap perPackage legacySpecificConfig
     }
   where
+    configAllPackages   = convertLegacyPerPackageFlags g i h
+                            where LegacyPackageConfig g i h = legacyAllConfig
     configLocalPackages = convertLegacyPerPackageFlags
                             configFlags installPerPkgFlags haddockFlags
-    configAllPackages   = convertLegacyAllPackageFlags
+    configPackagesShared= convertLegacyAllPackageFlags
                             globalFlags (configFlags <> configShFlags)
                             configExFlags installSharedFlags
     configBuildOnly     = convertLegacyBuildOnlyFlags
@@ -268,29 +299,31 @@ convertLegacyAllPackageFlags globalFlags configFlags
     ProjectConfigShared{..}
   where
     GlobalFlags {
-      globalConfigFile        = _, -- TODO: [required feature]
+      globalConfigFile        = projectConfigConfigFile,
       globalSandboxConfigFile = _, -- ??
       globalRemoteRepos       = projectConfigRemoteRepos,
-      globalLocalRepos        = projectConfigLocalRepos
+      globalLocalRepos        = projectConfigLocalRepos,
+      globalProgPathExtra     = projectConfigProgPathExtra
     } = globalFlags
 
     ConfigFlags {
       configDistPref            = projectConfigDistDir,
       configHcFlavor            = projectConfigHcFlavor,
       configHcPath              = projectConfigHcPath,
-      configHcPkg               = projectConfigHcPkg,
+      configHcPkg               = projectConfigHcPkg
+    --configProgramPathExtra    = projectConfigProgPathExtra DELETE ME
     --configInstallDirs         = projectConfigInstallDirs,
     --configUserInstall         = projectConfigUserInstall,
     --configPackageDBs          = projectConfigPackageDBs,
-      configAllowOlder          = projectConfigAllowOlder,
-      configAllowNewer          = projectConfigAllowNewer
     } = configFlags
 
     ConfigExFlags {
       configCabalVersion        = projectConfigCabalVersion,
       configExConstraints       = projectConfigConstraints,
       configPreferences         = projectConfigPreferences,
-      configSolver              = projectConfigSolver
+      configSolver              = projectConfigSolver,
+      configAllowOlder          = projectConfigAllowOlder,
+      configAllowNewer          = projectConfigAllowNewer
     } = configExFlags
 
     InstallFlags {
@@ -305,7 +338,7 @@ convertLegacyAllPackageFlags globalFlags configFlags
       installReorderGoals       = projectConfigReorderGoals,
       installCountConflicts     = projectConfigCountConflicts,
       installPerComponent       = projectConfigPerComponent,
-    --installIndependentGoals   = projectConfigIndependentGoals,
+      installIndependentGoals   = projectConfigIndependentGoals,
     --installShadowPkgs         = projectConfigShadowPkgs,
       installStrongFlags        = projectConfigStrongFlags,
       installAllowBootLibInstalls = projectConfigAllowBootLibInstalls
@@ -328,6 +361,7 @@ convertLegacyPerPackageFlags configFlags installFlags haddockFlags =
       configVanillaLib          = packageConfigVanillaLib,
       configProfLib             = packageConfigProfLib,
       configSharedLib           = packageConfigSharedLib,
+      configStaticLib           = packageConfigStaticLib,
       configDynExe              = packageConfigDynExe,
       configProfExe             = packageConfigProfExe,
       configProf                = packageConfigProf,
@@ -338,6 +372,7 @@ convertLegacyPerPackageFlags configFlags installFlags haddockFlags =
       configProgPrefix          = packageConfigProgPrefix,
       configProgSuffix          = packageConfigProgSuffix,
       configGHCiLib             = packageConfigGHCiLib,
+      configSplitSections       = packageConfigSplitSections,
       configSplitObjs           = packageConfigSplitObjs,
       configStripExes           = packageConfigStripExes,
       configStripLibs           = packageConfigStripLibs,
@@ -368,12 +403,13 @@ convertLegacyPerPackageFlags configFlags installFlags haddockFlags =
       haddockHtml               = packageConfigHaddockHtml,
       haddockHtmlLocation       = packageConfigHaddockHtmlLocation,
       haddockForeignLibs        = packageConfigHaddockForeignLibs,
+      haddockForHackage         = packageConfigHaddockForHackage,
       haddockExecutables        = packageConfigHaddockExecutables,
       haddockTestSuites         = packageConfigHaddockTestSuites,
       haddockBenchmarks         = packageConfigHaddockBenchmarks,
       haddockInternal           = packageConfigHaddockInternal,
       haddockCss                = packageConfigHaddockCss,
-      haddockHscolour           = packageConfigHaddockHscolour,
+      haddockLinkedSource       = packageConfigHaddockLinkedSource,
       haddockHscolourCss        = packageConfigHaddockHscolourCss,
       haddockContents           = packageConfigHaddockContents
     } = haddockFlags
@@ -431,6 +467,7 @@ convertToLegacyProjectConfig
       projectPackagesOptional,
       projectPackagesRepo,
       projectPackagesNamed,
+      projectConfigAllPackages,
       projectConfigLocalPackages,
       projectConfigSpecificPackage
     } =
@@ -440,6 +477,8 @@ convertToLegacyProjectConfig
       legacyPackagesRepo     = projectPackagesRepo,
       legacyPackagesNamed    = projectPackagesNamed,
       legacySharedConfig     = convertToLegacySharedConfig projectConfig,
+      legacyAllConfig        = convertToLegacyPerPackageConfig
+                                 projectConfigAllPackages,
       legacyLocalConfig      = convertToLegacyAllPackageConfig projectConfig
                             <> convertToLegacyPerPackageConfig
                                  projectConfigLocalPackages,
@@ -451,7 +490,10 @@ convertToLegacySharedConfig :: ProjectConfig -> LegacySharedConfig
 convertToLegacySharedConfig
     ProjectConfig {
       projectConfigBuildOnly     = ProjectConfigBuildOnly {..},
-      projectConfigShared        = ProjectConfigShared {..}
+      projectConfigShared        = ProjectConfigShared {..},
+      projectConfigAllPackages   = PackageConfig {
+        packageConfigDocumentation
+      }
     } =
 
     LegacySharedConfig {
@@ -464,7 +506,7 @@ convertToLegacySharedConfig
     globalFlags = GlobalFlags {
       globalVersion           = mempty,
       globalNumericVersion    = mempty,
-      globalConfigFile        = mempty,
+      globalConfigFile        = projectConfigConfigFile,
       globalSandboxConfigFile = mempty,
       globalConstraintsFile   = mempty,
       globalRemoteRepos       = projectConfigRemoteRepos,
@@ -477,26 +519,29 @@ convertToLegacySharedConfig
       globalIgnoreExpiry      = projectConfigIgnoreExpiry,
       globalHttpTransport     = projectConfigHttpTransport,
       globalNix               = mempty,
-      globalStoreDir          = projectConfigStoreDir
+      globalStoreDir          = projectConfigStoreDir,
+      globalProgPathExtra     = projectConfigProgPathExtra
     }
 
     configFlags = mempty {
       configVerbosity     = projectConfigVerbosity,
-      configDistPref      = projectConfigDistDir,
-      configAllowOlder    = projectConfigAllowOlder,
-      configAllowNewer    = projectConfigAllowNewer
+      configDistPref      = projectConfigDistDir
     }
 
     configExFlags = ConfigExFlags {
       configCabalVersion  = projectConfigCabalVersion,
       configExConstraints = projectConfigConstraints,
       configPreferences   = projectConfigPreferences,
-      configSolver        = projectConfigSolver
+      configSolver        = projectConfigSolver,
+      configAllowOlder    = projectConfigAllowOlder,
+      configAllowNewer    = projectConfigAllowNewer
+
     }
 
     installFlags = InstallFlags {
-      installDocumentation     = mempty,
+      installDocumentation     = packageConfigDocumentation,
       installHaddockIndex      = projectConfigHaddockIndex,
+      installDest              = Flag NoCopyDest,
       installDryRun            = projectConfigDryRun,
       installReinstall         = mempty, --projectConfigReinstall,
       installAvoidReinstalls   = mempty, --projectConfigAvoidReinstalls,
@@ -505,7 +550,7 @@ convertToLegacySharedConfig
       installUpgradeDeps       = mempty, --projectConfigUpgradeDeps,
       installReorderGoals      = projectConfigReorderGoals,
       installCountConflicts    = projectConfigCountConflicts,
-      installIndependentGoals  = mempty, --projectConfigIndependentGoals,
+      installIndependentGoals  = projectConfigIndependentGoals,
       installShadowPkgs        = mempty, --projectConfigShadowPkgs,
       installStrongFlags       = projectConfigStrongFlags,
       installAllowBootLibInstalls = projectConfigAllowBootLibInstalls,
@@ -554,6 +599,7 @@ convertToLegacyAllPackageConfig
       configVanillaLib          = mempty,
       configProfLib             = mempty,
       configSharedLib           = mempty,
+      configStaticLib           = mempty,
       configDynExe              = mempty,
       configProfExe             = mempty,
       configProf                = mempty,
@@ -571,6 +617,7 @@ convertToLegacyAllPackageConfig
       configUserInstall         = mempty, --projectConfigUserInstall,
       configPackageDBs          = mempty, --projectConfigPackageDBs,
       configGHCiLib             = mempty,
+      configSplitSections       = mempty,
       configSplitObjs           = mempty,
       configStripExes           = mempty,
       configStripLibs           = mempty,
@@ -591,8 +638,7 @@ convertToLegacyAllPackageConfig
       configFlagError           = mempty,                --TODO: ???
       configRelocatable         = mempty,
       configDebugInfo           = mempty,
-      configAllowOlder          = mempty,
-      configAllowNewer          = mempty
+      configUseResponseFiles    = mempty
     }
 
     haddockFlags = mempty {
@@ -621,6 +667,7 @@ convertToLegacyPerPackageConfig PackageConfig {..} =
       configVanillaLib          = packageConfigVanillaLib,
       configProfLib             = packageConfigProfLib,
       configSharedLib           = packageConfigSharedLib,
+      configStaticLib           = packageConfigStaticLib,
       configDynExe              = packageConfigDynExe,
       configProfExe             = packageConfigProfExe,
       configProf                = packageConfigProf,
@@ -638,6 +685,7 @@ convertToLegacyPerPackageConfig PackageConfig {..} =
       configUserInstall         = mempty,
       configPackageDBs          = mempty,
       configGHCiLib             = packageConfigGHCiLib,
+      configSplitSections       = packageConfigSplitSections,
       configSplitObjs           = packageConfigSplitObjs,
       configStripExes           = packageConfigStripExes,
       configStripLibs           = packageConfigStripLibs,
@@ -658,8 +706,7 @@ convertToLegacyPerPackageConfig PackageConfig {..} =
       configFlagError           = mempty,                --TODO: ???
       configRelocatable         = packageConfigRelocatable,
       configDebugInfo           = packageConfigDebugInfo,
-      configAllowOlder          = mempty,
-      configAllowNewer          = mempty
+      configUseResponseFiles    = mempty
     }
 
     installFlags = mempty {
@@ -673,19 +720,20 @@ convertToLegacyPerPackageConfig PackageConfig {..} =
       haddockHoogle        = packageConfigHaddockHoogle,
       haddockHtml          = packageConfigHaddockHtml,
       haddockHtmlLocation  = packageConfigHaddockHtmlLocation,
-      haddockForHackage    = mempty, --TODO: added recently
+      haddockForHackage    = packageConfigHaddockForHackage,
       haddockForeignLibs   = packageConfigHaddockForeignLibs,
       haddockExecutables   = packageConfigHaddockExecutables,
       haddockTestSuites    = packageConfigHaddockTestSuites,
       haddockBenchmarks    = packageConfigHaddockBenchmarks,
       haddockInternal      = packageConfigHaddockInternal,
       haddockCss           = packageConfigHaddockCss,
-      haddockHscolour      = packageConfigHaddockHscolour,
+      haddockLinkedSource  = packageConfigHaddockLinkedSource,
       haddockHscolourCss   = packageConfigHaddockHscolourCss,
       haddockContents      = packageConfigHaddockContents,
       haddockDistPref      = mempty,
       haddockKeepTempFiles = mempty,
-      haddockVerbosity     = mempty
+      haddockVerbosity     = mempty,
+      haddockCabalFilePath = mempty
     }
 
 
@@ -798,7 +846,11 @@ legacySharedConfigFieldDescrs =
       [ newLineListField "local-repo"
           showTokenQ parseTokenQ
           (fromNubList . globalLocalRepos)
-          (\v conf -> conf { globalLocalRepos = toNubList v })
+          (\v conf -> conf { globalLocalRepos = toNubList v }),
+         newLineListField "extra-prog-path-shared-only"
+          showTokenQ parseTokenQ
+          (fromNubList . globalProgPathExtra)
+          (\v conf -> conf { globalProgPathExtra = toNubList v })
       ]
   . filterFields
       [ "remote-repo-cache"
@@ -810,18 +862,6 @@ legacySharedConfigFieldDescrs =
   ( liftFields
       legacyConfigureShFlags
       (\flags conf -> conf { legacyConfigureShFlags = flags })
-  . addFields
-      [ monoidField "allow-older"
-        (maybe mempty dispRelaxDeps) (fmap Just parseRelaxDeps)
-        (fmap unAllowOlder . configAllowOlder)
-        (\v conf -> conf { configAllowOlder = fmap AllowOlder v })
-      ]
-  . addFields
-      [ monoidField "allow-newer"
-        (maybe mempty dispRelaxDeps) (fmap Just parseRelaxDeps)
-        (fmap unAllowNewer . configAllowNewer)
-        (\v conf -> conf { configAllowNewer = fmap AllowNewer v })
-      ]
   . filterFields ["verbose", "builddir" ]
   . commandOptionsToFields
   ) (configureOptions ParseArgs)
@@ -837,6 +877,16 @@ legacySharedConfigFieldDescrs =
       , commaNewLineListField "preferences"
         disp parse
         configPreferences (\v conf -> conf { configPreferences = v })
+
+      , monoidField "allow-older"
+        (maybe mempty disp) (fmap Just parse)
+        (fmap unAllowOlder . configAllowOlder)
+        (\v conf -> conf { configAllowOlder = fmap AllowOlder v })
+
+      , monoidField "allow-newer"
+        (maybe mempty disp) (fmap Just parse)
+        (fmap unAllowNewer . configAllowNewer)
+        (\v conf -> conf { configAllowNewer = fmap AllowNewer v })
       ]
   . filterFields
       [ "cabal-lib-version", "solver"
@@ -861,25 +911,13 @@ legacySharedConfigFieldDescrs =
       , "remote-build-reporting", "report-planning-failure"
       , "one-shot", "jobs", "keep-going", "offline", "per-component"
         -- solver flags:
-      , "max-backjumps", "reorder-goals", "count-conflicts", "strong-flags"
-      , "allow-boot-library-installs", "index-state"
+      , "max-backjumps", "reorder-goals", "count-conflicts", "independent-goals"
+      , "strong-flags" , "allow-boot-library-installs", "index-state"
       ]
   . commandOptionsToFields
   ) (installOptions ParseArgs)
   where
     constraintSrc = ConstraintSourceProjectConfig "TODO"
-
-parseRelaxDeps :: ReadP r RelaxDeps
-parseRelaxDeps =
-     ((const RelaxDepsNone <$> (Parse.string "none" +++ Parse.string "None"))
-  +++ (const RelaxDepsAll  <$> (Parse.string "all"  +++ Parse.string "All")))
-  <++ (      RelaxDepsSome <$> parseOptCommaList parse)
-
-dispRelaxDeps :: RelaxDeps -> Doc
-dispRelaxDeps  RelaxDepsNone       = Disp.text "None"
-dispRelaxDeps (RelaxDepsSome pkgs) = Disp.fsep . Disp.punctuate Disp.comma
-                                               . map disp $ pkgs
-dispRelaxDeps  RelaxDepsAll        = Disp.text "All"
 
 
 legacyPackageConfigFieldDescrs :: [FieldDescr LegacyPackageConfig]
@@ -917,10 +955,10 @@ legacyPackageConfigFieldDescrs =
       [ "with-compiler", "with-hc-pkg"
       , "program-prefix", "program-suffix"
       , "library-vanilla", "library-profiling"
-      , "shared", "executable-dynamic"
+      , "shared", "static", "executable-dynamic"
       , "profiling", "executable-profiling"
       , "profiling-detail", "library-profiling-detail"
-      , "library-for-ghci", "split-objs"
+      , "library-for-ghci", "split-objs", "split-sections"
       , "executable-stripping", "library-stripping"
       , "tests", "benchmarks"
       , "coverage", "library-coverage"
@@ -954,6 +992,12 @@ legacyPackageConfigFieldDescrs =
       (\flags conf -> conf { legacyHaddockFlags = flags })
   . mapFieldNames
       ("haddock-"++)
+  . addFields
+      [ simpleField "for-hackage"
+          -- TODO: turn this into a library function
+          (fromFlagOrDefault Disp.empty . fmap disp) (Parse.option mempty (fmap toFlag parse))
+          haddockForHackage (\v conf -> conf { haddockForHackage = v })
+      ]
   . filterFields
       [ "hoogle", "html", "html-location"
       , "foreign-libraries"
@@ -1074,45 +1118,61 @@ packageRepoSectionDescr =
                            }
     }
 
+-- | The definitions of all the fields that can appear in the @package pkgfoo@
+-- and @package *@ sections of the @cabal.project@-format files.
+--
+packageSpecificOptionsFieldDescrs :: [FieldDescr LegacyPackageConfig]
+packageSpecificOptionsFieldDescrs =
+    legacyPackageConfigFieldDescrs
+ ++ programOptionsFieldDescrs
+      (configProgramArgs . legacyConfigureFlags)
+      (\args pkgconf -> pkgconf {
+          legacyConfigureFlags = (legacyConfigureFlags pkgconf) {
+            configProgramArgs  = args
+          }
+        }
+      )
+ ++ liftFields
+      legacyConfigureFlags
+      (\flags pkgconf -> pkgconf {
+          legacyConfigureFlags = flags
+        }
+      )
+      programLocationsFieldDescrs
+
+-- | The definition of the @package pkgfoo@ sections of the @cabal.project@-format
+-- files. This section is per-package name. The special package @*@ applies to all
+-- packages used anywhere by the project, locally or as dependencies.
+--
 packageSpecificOptionsSectionDescr :: SectionDescr LegacyProjectConfig
 packageSpecificOptionsSectionDescr =
     SectionDescr {
       sectionName        = "package",
-      sectionFields      = legacyPackageConfigFieldDescrs
-                        ++ programOptionsFieldDescrs
-                             (configProgramArgs . legacyConfigureFlags)
-                             (\args pkgconf -> pkgconf {
-                                 legacyConfigureFlags = (legacyConfigureFlags pkgconf) {
-                                   configProgramArgs  = args
-                                 }
-                               }
-                             )
-                        ++ liftFields
-                             legacyConfigureFlags
-                             (\flags pkgconf -> pkgconf {
-                                 legacyConfigureFlags = flags
-                               }
-                             )
-                             programLocationsFieldDescrs,
+      sectionFields      = packageSpecificOptionsFieldDescrs,
       sectionSubsections = [],
       sectionGet         = \projconf ->
                              [ (display pkgname, pkgconf)
                              | (pkgname, pkgconf) <-
                                  Map.toList . getMapMappend
-                               . legacySpecificConfig $ projconf ],
+                               . legacySpecificConfig $ projconf ]
+                          ++ [ ("*", legacyAllConfig projconf) ],
       sectionSet         =
-        \lineno pkgnamestr pkgconf projconf -> do
-          pkgname <- case simpleParse pkgnamestr of
-            Just pkgname -> return pkgname
-            Nothing      -> syntaxError lineno $
-                                "a 'package' section requires a package name "
-                             ++ "as an argument"
-          return projconf {
-            legacySpecificConfig =
-              MapMappend $
-              Map.insertWith mappend pkgname pkgconf
-                             (getMapMappend $ legacySpecificConfig projconf)
-          },
+        \lineno pkgnamestr pkgconf projconf -> case pkgnamestr of
+          "*" -> return projconf {
+                   legacyAllConfig = legacyAllConfig projconf <> pkgconf
+                 }
+          _   -> do
+            pkgname <- case simpleParse pkgnamestr of
+              Just pkgname -> return pkgname
+              Nothing      -> syntaxError lineno $
+                                  "a 'package' section requires a package name "
+                               ++ "as an argument"
+            return projconf {
+              legacySpecificConfig =
+                MapMappend $
+                Map.insertWith mappend pkgname pkgconf
+                               (getMapMappend $ legacySpecificConfig projconf)
+            },
       sectionEmpty       = mempty
     }
 

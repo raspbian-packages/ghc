@@ -43,7 +43,11 @@ module Distribution.Verbosity (
 
   -- * line-wrapping
   verboseNoWrap, isVerboseNoWrap,
- ) where
+
+  -- * timestamps
+  verboseTimestamp, isVerboseTimestamp,
+  verboseNoTimestamp,
+  ) where
 
 import Prelude ()
 import Distribution.Compat.Prelude
@@ -125,15 +129,17 @@ lessVerbose v =
         Normal    -> v { vLevel = Silent }
         Silent    -> v
 
--- | Combinator for transforming verbosity level while retaining the original hidden state.
+-- | Combinator for transforming verbosity level while retaining the
+-- original hidden state.
 --
 -- For instance, the following property holds
 --
 -- prop> isVerboseNoWrap (modifyVerbosity (max verbose) v) == isVerboseNoWrap v
 --
--- __Note__: you can use @modifyVerbosity (const v1) v0@ to overwrite @v1@'s flags with @v0@'s flags.
+-- __Note__: you can use @modifyVerbosity (const v1) v0@ to overwrite
+-- @v1@'s flags with @v0@'s flags.
 --
--- @since 2.0.1
+-- @since 2.0.1.0
 modifyVerbosity :: (Verbosity -> Verbosity) -> Verbosity -> Verbosity
 modifyVerbosity f v = v { vLevel = vLevel (f v) }
 
@@ -165,6 +171,7 @@ parseVerbosity = parseIntVerbosity <++ parseStringVerbosity
         , string "callstack" >> return verboseCallStack
         , string "nowrap"    >> return verboseNoWrap
         , string "markoutput" >> return verboseMarkOutput
+        , string "timestamp" >> return verboseTimestamp
         ]
 
 flagToVerbosity :: ReadE Verbosity
@@ -196,6 +203,7 @@ showForCabal v
     showFlag VCallStack  = ["+callstack"]
     showFlag VNoWrap     = ["+nowrap"]
     showFlag VMarkOutput = ["+markoutput"]
+    showFlag VTimestamp  = ["+timestamp"]
 showForGHC   v = maybe (error "unknown verbosity") show $
     elemIndex v [silent,normal,__,verbose,deafening]
         where __ = silent -- this will be always ignored by elemIndex
@@ -205,6 +213,7 @@ data VerbosityFlag
     | VCallSite
     | VNoWrap
     | VMarkOutput
+    | VTimestamp
     deriving (Generic, Show, Read, Eq, Ord, Enum, Bounded)
 
 instance Binary VerbosityFlag
@@ -224,7 +233,7 @@ verboseMarkOutput = verboseFlag VMarkOutput
 
 -- | Turn off marking; useful for suppressing nondeterministic output.
 verboseUnmarkOutput :: Verbosity -> Verbosity
-verboseUnmarkOutput v = v { vFlags = Set.delete VMarkOutput (vFlags v) }
+verboseUnmarkOutput = verboseNoFlag VMarkOutput
 
 -- | Disable line-wrapping for log messages.
 verboseNoWrap :: Verbosity -> Verbosity
@@ -234,10 +243,23 @@ verboseNoWrap = verboseFlag VNoWrap
 verboseQuiet :: Verbosity -> Verbosity
 verboseQuiet v = v { vQuiet = True }
 
--- | Helper function for flag toggling functions
+-- | Turn on timestamps for log messages.
+verboseTimestamp :: Verbosity -> Verbosity
+verboseTimestamp = verboseFlag VTimestamp
+
+-- | Turn off timestamps for log messages.
+verboseNoTimestamp :: Verbosity -> Verbosity
+verboseNoTimestamp = verboseNoFlag VTimestamp
+
+-- | Helper function for flag enabling functions
 verboseFlag :: VerbosityFlag -> (Verbosity -> Verbosity)
 verboseFlag flag v = v { vFlags = Set.insert flag (vFlags v) }
 
+-- | Helper function for flag disabling functions
+verboseNoFlag :: VerbosityFlag -> (Verbosity -> Verbosity)
+verboseNoFlag flag v = v { vFlags = Set.delete flag (vFlags v) }
+
+-- | Turn off all flags
 verboseNoFlags :: Verbosity -> Verbosity
 verboseNoFlags v = v { vFlags = Set.empty }
 
@@ -264,6 +286,15 @@ isVerboseNoWrap = isVerboseFlag VNoWrap
 isVerboseQuiet :: Verbosity -> Bool
 isVerboseQuiet = vQuiet
 
+-- | Test if if we should output timestamps when we log.
+isVerboseTimestamp :: Verbosity -> Bool
+isVerboseTimestamp = isVerboseFlag VTimestamp
+
 -- | Helper function for flag testing functions.
 isVerboseFlag :: VerbosityFlag -> Verbosity -> Bool
 isVerboseFlag flag = (Set.member flag) . vFlags
+
+-- $setup
+-- >>> import Test.QuickCheck (Arbitrary (..), arbitraryBoundedEnum)
+-- >>> instance Arbitrary VerbosityLevel where arbitrary = arbitraryBoundedEnum
+-- >>> instance Arbitrary Verbosity where arbitrary = fmap mkVerbosity arbitrary

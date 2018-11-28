@@ -38,7 +38,6 @@ import Distribution.Client.SetupWrapper
          ( setupWrapper, SetupScriptOptions(..), defaultSetupScriptOptions )
 import Distribution.Client.Targets
          ( userToPackageConstraint, userConstraintPackageName )
-import Distribution.Package (PackageId)
 import Distribution.Client.JobControl (Lock)
 
 import qualified Distribution.Solver.Types.ComponentDeps as CD
@@ -57,33 +56,25 @@ import Distribution.Simple.Compiler
 import Distribution.Simple.Program (ProgramDb)
 import Distribution.Client.SavedFlags ( readCommandFlags, writeCommandFlags )
 import Distribution.Simple.Setup
-         ( ConfigFlags(..), AllowNewer(..), AllowOlder(..), RelaxDeps(..)
+         ( ConfigFlags(..)
          , fromFlag, toFlag, flagToMaybe, fromFlagOrDefault )
 import Distribution.Simple.PackageIndex
          ( InstalledPackageIndex, lookupPackageName )
-import Distribution.Simple.Utils
-         ( defaultPackageDesc )
 import Distribution.Package
-         ( Package(..), packageName )
+         ( Package(..), packageName, PackageId )
 import Distribution.Types.Dependency
          ( Dependency(..), thisPackageVersion )
 import qualified Distribution.PackageDescription as PkgDesc
-#ifdef CABAL_PARSEC
 import Distribution.PackageDescription.Parsec
          ( readGenericPackageDescription )
-#else
-import Distribution.PackageDescription.Parse
-         ( readGenericPackageDescription )
-#endif
 import Distribution.PackageDescription.Configuration
          ( finalizePD )
 import Distribution.Version
          ( Version, mkVersion, anyVersion, thisVersion
          , VersionRange, orLaterVersion )
 import Distribution.Simple.Utils as Utils
-         ( warn, notice, debug, die' )
-import Distribution.Simple.Setup
-         ( isRelaxDeps )
+         ( warn, notice, debug, die'
+         , defaultPackageDesc )
 import Distribution.System
          ( Platform )
 import Distribution.Text ( display )
@@ -94,16 +85,16 @@ import System.FilePath ( (</>) )
 
 -- | Choose the Cabal version such that the setup scripts compiled against this
 -- version will support the given command-line flags.
-chooseCabalVersion :: ConfigFlags -> Maybe Version -> VersionRange
-chooseCabalVersion configFlags maybeVersion =
+chooseCabalVersion :: ConfigExFlags -> Maybe Version -> VersionRange
+chooseCabalVersion configExFlags maybeVersion =
   maybe defaultVersionRange thisVersion maybeVersion
   where
     -- Cabal < 1.19.2 doesn't support '--exact-configuration' which is needed
     -- for '--allow-newer' to work.
     allowNewer = isRelaxDeps
-                 (maybe RelaxDepsNone unAllowNewer $ configAllowNewer configFlags)
+                 (maybe mempty unAllowNewer $ configAllowNewer configExFlags)
     allowOlder = isRelaxDeps
-                 (maybe RelaxDepsNone unAllowOlder $ configAllowOlder configFlags)
+                 (maybe mempty unAllowOlder $ configAllowOlder configExFlags)
 
     defaultVersionRange = if allowOlder || allowNewer
                           then orLaterVersion (mkVersion [1,19,2])
@@ -173,7 +164,7 @@ configure verbosity packageDBs repoCtxt comp platform progdb
            (useDistPref defaultSetupScriptOptions)
            (configDistPref configFlags))
         (chooseCabalVersion
-           configFlags
+           configExFlags
            (flagToMaybe (configCabalVersion configExFlags)))
         Nothing
         False
@@ -213,6 +204,7 @@ configureSetupScript packageDBs
     , useLoggingHandle         = Nothing
     , useWorkingDir            = Nothing
     , useExtraPathEnv          = []
+    , useExtraEnvOverrides     = []
     , setupCacheLock           = lock
     , useWin32CleanHack        = False
     , forceExternalSetupMethod = forceExternal
@@ -323,9 +315,9 @@ planLocalPackage verbosity comp platform configFlags configExFlags
 
       resolverParams =
           removeLowerBounds
-          (fromMaybe (AllowOlder RelaxDepsNone) $ configAllowOlder configFlags)
+          (fromMaybe (AllowOlder mempty) $ configAllowOlder configExFlags)
         . removeUpperBounds
-          (fromMaybe (AllowNewer RelaxDepsNone) $ configAllowNewer configFlags)
+          (fromMaybe (AllowNewer mempty) $ configAllowNewer configExFlags)
 
         . addPreferences
             -- preferences from the config file or command line

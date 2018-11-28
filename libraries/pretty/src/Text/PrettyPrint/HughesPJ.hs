@@ -22,7 +22,7 @@
 --
 -- For more information you can refer to the
 -- <http://belle.sourceforge.net/doc/hughes95design.pdf original paper> that
--- serves as the basis for this libraries design: /The Design -- of a
+-- serves as the basis for this libraries design: /The Design of a
 -- Pretty-printing Library/ by John Hughes, in Advanced Functional Programming,
 -- 1995.
 --
@@ -86,6 +86,9 @@ import qualified Text.PrettyPrint.Annotated.HughesPJ as Ann
 
 import Control.DeepSeq ( NFData(rnf) )
 import Data.Function   ( on )
+#if __GLASGOW_HASKELL__ >= 803
+import Prelude         hiding ( (<>) )
+#endif
 #if __GLASGOW_HASKELL__ >= 800
 import qualified Data.Semigroup as Semi ( Semigroup((<>)) )
 #elif __GLASGOW_HASKELL__ < 709
@@ -299,7 +302,7 @@ vcat = liftList Ann.vcat
 --
 -- * @'nest' k ('nest' k' x) = 'nest' (k+k') x@
 --
--- * @'nest' k (x '<>' y) = 'nest' k z '<>' 'nest' k y@
+-- * @'nest' k (x '<>' y) = 'nest' k x '<>' 'nest' k y@
 --
 -- * @'nest' k (x '$$' y) = 'nest' k x '$$' 'nest' k y@
 --

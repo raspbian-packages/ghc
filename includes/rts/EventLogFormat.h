@@ -154,7 +154,8 @@
 #define EVENT_GC_STATS_GHC        53 /* (heap_capset, generation,
                                          copied_bytes, slop_bytes, frag_bytes,
                                          par_n_threads,
-                                         par_max_copied, par_tot_copied) */
+                                         par_max_copied,
+                                         par_tot_copied, par_balanced_copied) */
 #define EVENT_GC_GLOBAL_SYNC      54 /* ()                     */
 #define EVENT_TASK_CREATE         55 /* (taskID, cap, tid)       */
 #define EVENT_TASK_MIGRATE        56 /* (taskID, cap, new_cap)   */

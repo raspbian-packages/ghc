@@ -1,13 +1,14 @@
 import Control.Exception
-import Control.Monad (unless, void)
+import Control.Monad (guard, unless, void)
 import System.Exit
 import System.IO.Error
 import System.Directory (getCurrentDirectory, setCurrentDirectory)
 import System.Process
 import Control.Concurrent
+import Data.Char (isDigit)
 import Data.List (isInfixOf)
 import Data.Maybe (isNothing)
-import System.IO (hClose, openBinaryTempFile)
+import System.IO (hClose, openBinaryTempFile, hGetContents)
 import qualified Data.ByteString as S
 import qualified Data.ByteString.Char8 as S8
 import System.Directory (getTemporaryDirectory, removeFile)
@@ -81,6 +82,31 @@ main = do
       unless (e1 == ExitSuccess && e2 == ExitSuccess)
             $ error "sleep exited with non-zero exit code!"
 
+    do
+      putStrLn "interrupt masked waitForProcess"
+      (_, _, _, p) <- createProcess (proc "sleep" ["1.0"])
+      mec <- newEmptyMVar
+      tid <- mask_ . forkIO $
+          (waitForProcess p >>= putMVar mec . Just)
+              `catchThreadKilled` putMVar mec Nothing
+      killThread tid
+      eec <- takeMVar mec
+      case eec of
+        Nothing -> return ()
+        Just ec -> error $ "waitForProcess not interrupted: sleep exited with " ++ show ec
+
+    putStrLn "testing getPid"
+    do
+      (_, Just out, _, p) <- createProcess $ (proc "sh" ["-c", "echo $$"]) {std_out = CreatePipe}
+      pid <- getPid p
+      line <- hGetContents out
+      putStrLn $ " queried PID: " ++ show pid
+      putStrLn $ " PID reported by stdout: " ++ show line
+      _ <- waitForProcess p
+      hClose out
+      let numStdoutPid = read (takeWhile isDigit line) :: Pid
+      unless (Just numStdoutPid == pid) $ error "subprocess reported unexpected PID"
+
     putStrLn "Tests passed successfully"
 
 withCurrentDirectory :: FilePath -> IO a -> IO a
@@ -90,3 +116,6 @@ withCurrentDirectory new inner = do
     (setCurrentDirectory new)
     (setCurrentDirectory orig)
     inner
+
+catchThreadKilled :: IO a -> IO a -> IO a
+catchThreadKilled f g = catchJust (\e -> guard (e == ThreadKilled)) f (\() -> g)

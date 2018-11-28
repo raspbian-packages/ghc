@@ -1,17 +1,20 @@
 Name:               cabal-install
-Version:            2.0.0.1
+Version:            2.2.0.0
 Synopsis:           The command-line interface for Cabal and Hackage.
 Description:
     The \'cabal\' command-line program simplifies the process of managing
     Haskell software by automating the fetching, configuration, compilation
     and installation of Haskell libraries and programs.
+    .
+    This package only provides an executable and cannot be used as a
+    library (ignore the module listing below.)
 homepage:           http://www.haskell.org/cabal/
 bug-reports:        https://github.com/haskell/cabal/issues
 License:            BSD3
 License-File:       LICENSE
 Author:             Cabal Development Team (see AUTHORS file)
 Maintainer:         Cabal Development Team <cabal-devel@haskell.org>
-Copyright:          2003-2017, Cabal Development Team
+Copyright:          2003-2018, Cabal Development Team
 Category:           Distribution
 Build-type:         Custom
 Cabal-Version:      >= 1.10
@@ -19,7 +22,7 @@ Extra-Source-Files:
   README.md bash-completion/cabal bootstrap.sh changelog
   tests/README.md
 
-  -- Generated with '../Cabal/misc/gen-extra-source-files.sh'
+  -- Generated with 'make gen-extra-source-files'
   -- Do NOT edit this section manually; instead, run the script.
   -- BEGIN gen-extra-source-files
   tests/IntegrationTests2/build/keep-going/cabal.project
@@ -62,6 +65,7 @@ Extra-Source-Files:
   tests/IntegrationTests2/targets/exes-disabled/cabal.project
   tests/IntegrationTests2/targets/exes-disabled/p/p.cabal
   tests/IntegrationTests2/targets/exes-disabled/q/q.cabal
+  tests/IntegrationTests2/targets/lib-only/p.cabal
   tests/IntegrationTests2/targets/libs-disabled/cabal.project
   tests/IntegrationTests2/targets/libs-disabled/p/p.cabal
   tests/IntegrationTests2/targets/libs-disabled/q/q.cabal
@@ -90,17 +94,10 @@ source-repository head
   location: https://github.com/haskell/cabal/
   subdir:   cabal-install
 
-Flag old-bytestring
-  description:  Use bytestring < 0.10.2 and bytestring-builder
-  default: False
-
-Flag old-directory
-  description:  Use directory < 1.2 and old-time
-  default:      False
-
-Flag network-uri
-  description:  Get Network.URI from the network-uri package
+Flag native-dns
+  description:  Enable use of the [resolv](https://hackage.haskell.org/package/resolv) & [windns](https://hackage.haskell.org/package/windns) packages for performing DNS lookups
   default:      True
+  manual:       True
 
 Flag debug-expensive-assertions
   description:  Enable expensive assertions for testing or debugging
@@ -117,32 +114,32 @@ Flag debug-tracetree
   default:      False
   manual:       True
 
-flag parsec
-  description:  Use parsec parser. This requires 'Cabal' library built with its parsec flag enabled.
-  default:      False
+flag lib
+  description:  Build cabal-install as a library. Please only use this if you are a cabal-install developer.
+  Default:      False
   manual:       True
 
--- When we do CI, we build our binaries on one machine, and then
--- ship them to another machine for testing.  Because we use
--- static linking (since it makes this sort of redeploy MUCH
--- easier), if we build five executables, that means we
--- need to ship ALL the Haskell libraries five times.  That's
--- a waste of space!  A better strategy is to statically link
--- everything into a single binary.  That's what this flag does.
+-- Build everything (including the test binaries) as a single static binary
+-- instead of 5 discrete binaries.
+-- This is useful for CI where we build our binaries on one machine, and then
+-- ship them to another machine for testing.  Since the test binaries are
+-- statically linked (making deployment easier), if we build five executables,
+-- that means we need to ship ALL 5 binaries (with 5 versions of all the
+-- statically linked libraries) to the test machines. This reduces that to one
+-- binary and one set of linked libraries.
 flag monolithic
   description:  Build cabal-install also with all of its test and support code.  Used by our continuous integration.
   default:      False
   manual:       True
 
-executable cabal
-    main-is:        Main.hs
-    ghc-options:    -Wall -fwarn-tabs -rtsopts
+library
+    ghc-options:    -Wall -fwarn-tabs
     if impl(ghc >= 8.0)
         ghc-options: -Wcompat
                      -Wnoncanonical-monad-instances
                      -Wnoncanonical-monadfail-instances
 
-    other-modules:
+    exposed-modules:
         Distribution.Client.BuildReports.Anonymous
         Distribution.Client.BuildReports.Storage
         Distribution.Client.BuildReports.Types
@@ -151,12 +148,22 @@ executable cabal
         Distribution.Client.CmdBench
         Distribution.Client.CmdBuild
         Distribution.Client.CmdConfigure
+        Distribution.Client.CmdUpdate
+        Distribution.Client.CmdErrorMessages
+        Distribution.Client.CmdExec
         Distribution.Client.CmdFreeze
         Distribution.Client.CmdHaddock
+        Distribution.Client.CmdInstall
         Distribution.Client.CmdRepl
         Distribution.Client.CmdRun
         Distribution.Client.CmdTest
-        Distribution.Client.CmdErrorMessages
+        Distribution.Client.Compat.Directory
+        Distribution.Client.Compat.ExecutablePath
+        Distribution.Client.Compat.FileLock
+        Distribution.Client.Compat.FilePerms
+        Distribution.Client.Compat.Prelude
+        Distribution.Client.Compat.Process
+        Distribution.Client.Compat.Semaphore
         Distribution.Client.Config
         Distribution.Client.Configure
         Distribution.Client.Dependency
@@ -167,11 +174,11 @@ executable cabal
         Distribution.Client.FetchUtils
         Distribution.Client.FileMonitor
         Distribution.Client.Freeze
+        Distribution.Client.GZipUtils
         Distribution.Client.GenBounds
         Distribution.Client.Get
         Distribution.Client.Glob
         Distribution.Client.GlobalFlags
-        Distribution.Client.GZipUtils
         Distribution.Client.Haddock
         Distribution.Client.HttpUtils
         Distribution.Client.IndexUtils
@@ -194,12 +201,12 @@ executable cabal
         Distribution.Client.ProjectBuilding
         Distribution.Client.ProjectBuilding.Types
         Distribution.Client.ProjectConfig
-        Distribution.Client.ProjectConfig.Types
         Distribution.Client.ProjectConfig.Legacy
+        Distribution.Client.ProjectConfig.Types
         Distribution.Client.ProjectOrchestration
+        Distribution.Client.ProjectPlanOutput
         Distribution.Client.ProjectPlanning
         Distribution.Client.ProjectPlanning.Types
-        Distribution.Client.ProjectPlanOutput
         Distribution.Client.RebuildMonad
         Distribution.Client.Reconfigure
         Distribution.Client.Run
@@ -213,33 +220,55 @@ executable cabal
         Distribution.Client.Security.HTTP
         Distribution.Client.Setup
         Distribution.Client.SetupWrapper
-        Distribution.Client.SrcDist
         Distribution.Client.SolverInstallPlan
         Distribution.Client.SourceFiles
+        Distribution.Client.SourceRepoParse
+        Distribution.Client.SrcDist
         Distribution.Client.Store
         Distribution.Client.Tar
-        Distribution.Client.Targets
         Distribution.Client.TargetSelector
+        Distribution.Client.Targets
         Distribution.Client.Types
         Distribution.Client.Update
         Distribution.Client.Upload
         Distribution.Client.Utils
         Distribution.Client.Utils.Assertion
         Distribution.Client.Utils.Json
-        Distribution.Client.World
         Distribution.Client.Win32SelfUpgrade
-        Distribution.Client.Compat.ExecutablePath
-        Distribution.Client.Compat.FileLock
-        Distribution.Client.Compat.FilePerms
-        Distribution.Client.Compat.Prelude
-        Distribution.Client.Compat.Process
-        Distribution.Client.Compat.Semaphore
+        Distribution.Client.World
+        Distribution.Solver.Compat.Prelude
+        Distribution.Solver.Modular
+        Distribution.Solver.Modular.Assignment
+        Distribution.Solver.Modular.Builder
+        Distribution.Solver.Modular.Configured
+        Distribution.Solver.Modular.ConfiguredConversion
+        Distribution.Solver.Modular.ConflictSet
+        Distribution.Solver.Modular.Cycles
+        Distribution.Solver.Modular.Dependency
+        Distribution.Solver.Modular.Explore
+        Distribution.Solver.Modular.Flag
+        Distribution.Solver.Modular.Index
+        Distribution.Solver.Modular.IndexConversion
+        Distribution.Solver.Modular.LabeledGraph
+        Distribution.Solver.Modular.Linking
+        Distribution.Solver.Modular.Log
+        Distribution.Solver.Modular.Message
+        Distribution.Solver.Modular.PSQ
+        Distribution.Solver.Modular.Package
+        Distribution.Solver.Modular.Preference
+        Distribution.Solver.Modular.RetryLog
+        Distribution.Solver.Modular.Solver
+        Distribution.Solver.Modular.Tree
+        Distribution.Solver.Modular.Validate
+        Distribution.Solver.Modular.Var
+        Distribution.Solver.Modular.Version
+        Distribution.Solver.Modular.WeightedPSQ
         Distribution.Solver.Types.ComponentDeps
         Distribution.Solver.Types.ConstraintSource
         Distribution.Solver.Types.DependencyResolver
         Distribution.Solver.Types.Flag
-        Distribution.Solver.Types.InstalledPreference
         Distribution.Solver.Types.InstSolverPackage
+        Distribution.Solver.Types.InstalledPreference
         Distribution.Solver.Types.LabeledPackageConstraint
         Distribution.Solver.Types.OptionalStanza
         Distribution.Solver.Types.PackageConstraint
@@ -255,32 +284,6 @@ executable cabal
         Distribution.Solver.Types.SolverPackage
         Distribution.Solver.Types.SourcePackage
         Distribution.Solver.Types.Variable
-        Distribution.Solver.Modular
-        Distribution.Solver.Modular.Assignment
-        Distribution.Solver.Modular.Builder
-        Distribution.Solver.Modular.Configured
-        Distribution.Solver.Modular.ConfiguredConversion
-        Distribution.Solver.Modular.ConflictSet
-        Distribution.Solver.Modular.Cycles
-        Distribution.Solver.Modular.Dependency
-        Distribution.Solver.Modular.Explore
-        Distribution.Solver.Modular.Flag
-        Distribution.Solver.Modular.Index
-        Distribution.Solver.Modular.IndexConversion
-        Distribution.Solver.Modular.Linking
-        Distribution.Solver.Modular.LabeledGraph
-        Distribution.Solver.Modular.Log
-        Distribution.Solver.Modular.Message
-        Distribution.Solver.Modular.Package
-        Distribution.Solver.Modular.Preference
-        Distribution.Solver.Modular.PSQ
-        Distribution.Solver.Modular.RetryLog
-        Distribution.Solver.Modular.Solver
-        Distribution.Solver.Modular.Tree
-        Distribution.Solver.Modular.Validate
-        Distribution.Solver.Modular.Var
-        Distribution.Solver.Modular.Version
-        Distribution.Solver.Modular.WeightedPSQ
         Paths_cabal_install
 
     -- NOTE: when updating build-depends, don't forget to update version regexps
@@ -290,19 +293,23 @@ executable cabal
         array      >= 0.4      && < 0.6,
         base       >= 4.5      && < 5,
         base16-bytestring >= 0.1.1 && < 0.2,
-        binary     >= 0.5      && < 0.9,
-        bytestring >= 0.9      && < 1,
-        Cabal      >= 2.0      && < 2.1,
+        binary     >= 0.7      && < 0.9,
+        bytestring >= 0.10.2   && < 1,
+        Cabal      >= 2.2      && < 2.3,
         containers >= 0.4      && < 0.6,
         cryptohash-sha256 >= 0.11 && < 0.12,
         deepseq    >= 1.3      && < 1.5,
+        directory  >= 1.2.2.0  && < 1.4,
         echo       >= 0.1.3    && < 0.2,
         edit-distance >= 0.2.2 && < 0.3,
         filepath   >= 1.3      && < 1.5,
         hashable   >= 1.0      && < 2,
         HTTP       >= 4000.1.5 && < 4000.4,
         mtl        >= 2.0      && < 3,
+        network-uri >= 2.6.0.2 && < 2.7,
+        network    >= 2.6      && < 2.7,
         pretty     >= 1.1      && < 1.2,
+        process    >= 1.1.0.2  && < 1.7,
         random     >= 1        && < 1.2,
         stm        >= 2.0      && < 3,
         tar        >= 0.5.0.3  && < 0.6,
@@ -310,41 +317,16 @@ executable cabal
         zlib       >= 0.5.3    && < 0.7,
         hackage-security >= 0.5.2.2 && < 0.6
 
-    if flag(old-bytestring)
-      build-depends: bytestring <  0.10.2, bytestring-builder >= 0.10 && < 1
-    else
-      build-depends: bytestring >= 0.10.2
-
-    if flag(old-directory)
-      build-depends: directory >= 1.1 && < 1.2, old-time >= 1 && < 1.2,
-                     process   >= 1.0.1.1  && < 1.1.0.2
-    else
-      build-depends: directory >= 1.2 && < 1.4,
-                     process   >= 1.1.0.2  && < 1.7
-
-    -- NOTE: you MUST include the network dependency even when network-uri
-    -- is pulled in, otherwise the constraint solver doesn't have enough
-    -- information
-    if flag(network-uri)
-      build-depends: network-uri >= 2.6 && < 2.7, network >= 2.6 && < 2.7
-    else
-      build-depends: network     >= 2.4 && < 2.6
-
-    -- Needed for GHC.Generics before GHC 7.6
-    if impl(ghc < 7.6)
-      build-depends: ghc-prim >= 0.2 && < 0.3
+    if flag(native-dns)
+      if os(windows)
+        build-depends: windns      >= 0.1.0 && < 0.2
+      else
+        build-depends: resolv      >= 0.1.1 && < 0.2
 
     if os(windows)
       build-depends: Win32 >= 2 && < 3
     else
       build-depends: unix >= 2.5 && < 2.8
-
-    if !(arch(arm) && impl(ghc < 7.6))
-      ghc-options: -threaded
-
-    -- On AIX, some legacy BSD operations such as flock(2) are provided by libbsd.a
-    if os(aix)
-      extra-libraries: bsd
 
     if flag(debug-expensive-assertions)
       cpp-options: -DDEBUG_EXPENSIVE_ASSERTIONS
@@ -357,14 +339,237 @@ executable cabal
       cpp-options: -DDEBUG_TRACETREE
       build-depends: tracetree >= 0.1 && < 0.2
 
-    if flag(parsec)
-      cpp-options: -DCABAL_PARSEC
+    if !flag(lib)
+      buildable: False
 
-    hs-source-dirs: .
+    default-language: Haskell2010
+
+executable cabal
+    main-is:        Main.hs
+    hs-source-dirs: main
+
+    ghc-options:    -Wall -fwarn-tabs -rtsopts
+    if impl(ghc >= 8.0)
+        ghc-options: -Wcompat
+                     -Wnoncanonical-monad-instances
+                     -Wnoncanonical-monadfail-instances
+
+    other-modules: Paths_cabal_install
+
+    if flag(lib)
+        build-depends:
+            cabal-install,
+            Cabal      >= 2.2      && < 2.3,
+            base,
+            directory,
+            filepath
+    else
+        hs-source-dirs: .
+        build-depends:
+            async      >= 2.0      && < 3,
+            array      >= 0.4      && < 0.6,
+            base       >= 4.5      && < 5,
+            base16-bytestring >= 0.1.1 && < 0.2,
+            binary     >= 0.7      && < 0.9,
+            bytestring >= 0.10.2   && < 1,
+            Cabal      >= 2.2      && < 2.3,
+            containers >= 0.4      && < 0.6,
+            cryptohash-sha256 >= 0.11 && < 0.12,
+            deepseq    >= 1.3      && < 1.5,
+            directory  >= 1.2.2.0  && < 1.4,
+            echo       >= 0.1.3    && < 0.2,
+            edit-distance >= 0.2.2 && < 0.3,
+            filepath   >= 1.3      && < 1.5,
+            hashable   >= 1.0      && < 2,
+            HTTP       >= 4000.1.5 && < 4000.4,
+            mtl        >= 2.0      && < 3,
+            network    >= 2.6      && < 2.7,
+            network-uri >= 2.6     && < 2.7,
+            pretty     >= 1.1      && < 1.2,
+            process    >= 1.2      && < 1.7,
+            random     >= 1        && < 1.2,
+            stm        >= 2.0      && < 3,
+            tar        >= 0.5.0.3  && < 0.6,
+            time       >= 1.4      && < 1.9,
+            zlib       >= 0.5.3    && < 0.7,
+            hackage-security >= 0.5.2.2 && < 0.6
+
+        other-modules:
+            Distribution.Client.BuildReports.Anonymous
+            Distribution.Client.BuildReports.Storage
+            Distribution.Client.BuildReports.Types
+            Distribution.Client.BuildReports.Upload
+            Distribution.Client.Check
+            Distribution.Client.CmdBench
+            Distribution.Client.CmdBuild
+            Distribution.Client.CmdConfigure
+            Distribution.Client.CmdUpdate
+            Distribution.Client.CmdErrorMessages
+            Distribution.Client.CmdExec
+            Distribution.Client.CmdFreeze
+            Distribution.Client.CmdHaddock
+            Distribution.Client.CmdInstall
+            Distribution.Client.CmdRepl
+            Distribution.Client.CmdRun
+            Distribution.Client.CmdTest
+            Distribution.Client.Compat.Directory
+            Distribution.Client.Compat.ExecutablePath
+            Distribution.Client.Compat.FileLock
+            Distribution.Client.Compat.FilePerms
+            Distribution.Client.Compat.Prelude
+            Distribution.Client.Compat.Process
+            Distribution.Client.Compat.Semaphore
+            Distribution.Client.Config
+            Distribution.Client.Configure
+            Distribution.Client.Dependency
+            Distribution.Client.Dependency.Types
+            Distribution.Client.DistDirLayout
+            Distribution.Client.Exec
+            Distribution.Client.Fetch
+            Distribution.Client.FetchUtils
+            Distribution.Client.FileMonitor
+            Distribution.Client.Freeze
+            Distribution.Client.GZipUtils
+            Distribution.Client.GenBounds
+            Distribution.Client.Get
+            Distribution.Client.Glob
+            Distribution.Client.GlobalFlags
+            Distribution.Client.Haddock
+            Distribution.Client.HttpUtils
+            Distribution.Client.IndexUtils
+            Distribution.Client.IndexUtils.Timestamp
+            Distribution.Client.Init
+            Distribution.Client.Init.Heuristics
+            Distribution.Client.Init.Licenses
+            Distribution.Client.Init.Types
+            Distribution.Client.Install
+            Distribution.Client.InstallPlan
+            Distribution.Client.InstallSymlink
+            Distribution.Client.JobControl
+            Distribution.Client.List
+            Distribution.Client.Manpage
+            Distribution.Client.Nix
+            Distribution.Client.Outdated
+            Distribution.Client.PackageHash
+            Distribution.Client.PackageUtils
+            Distribution.Client.ParseUtils
+            Distribution.Client.ProjectBuilding
+            Distribution.Client.ProjectBuilding.Types
+            Distribution.Client.ProjectConfig
+            Distribution.Client.ProjectConfig.Legacy
+            Distribution.Client.ProjectConfig.Types
+            Distribution.Client.ProjectOrchestration
+            Distribution.Client.ProjectPlanOutput
+            Distribution.Client.ProjectPlanning
+            Distribution.Client.ProjectPlanning.Types
+            Distribution.Client.RebuildMonad
+            Distribution.Client.Reconfigure
+            Distribution.Client.Run
+            Distribution.Client.Sandbox
+            Distribution.Client.Sandbox.Index
+            Distribution.Client.Sandbox.PackageEnvironment
+            Distribution.Client.Sandbox.Timestamp
+            Distribution.Client.Sandbox.Types
+            Distribution.Client.SavedFlags
+            Distribution.Client.Security.DNS
+            Distribution.Client.Security.HTTP
+            Distribution.Client.Setup
+            Distribution.Client.SetupWrapper
+            Distribution.Client.SolverInstallPlan
+            Distribution.Client.SourceFiles
+            Distribution.Client.SourceRepoParse
+            Distribution.Client.SrcDist
+            Distribution.Client.Store
+            Distribution.Client.Tar
+            Distribution.Client.TargetSelector
+            Distribution.Client.Targets
+            Distribution.Client.Types
+            Distribution.Client.Update
+            Distribution.Client.Upload
+            Distribution.Client.Utils
+            Distribution.Client.Utils.Assertion
+            Distribution.Client.Utils.Json
+            Distribution.Client.Win32SelfUpgrade
+            Distribution.Client.World
+            Distribution.Solver.Compat.Prelude
+            Distribution.Solver.Modular
+            Distribution.Solver.Modular.Assignment
+            Distribution.Solver.Modular.Builder
+            Distribution.Solver.Modular.Configured
+            Distribution.Solver.Modular.ConfiguredConversion
+            Distribution.Solver.Modular.ConflictSet
+            Distribution.Solver.Modular.Cycles
+            Distribution.Solver.Modular.Dependency
+            Distribution.Solver.Modular.Explore
+            Distribution.Solver.Modular.Flag
+            Distribution.Solver.Modular.Index
+            Distribution.Solver.Modular.IndexConversion
+            Distribution.Solver.Modular.LabeledGraph
+            Distribution.Solver.Modular.Linking
+            Distribution.Solver.Modular.Log
+            Distribution.Solver.Modular.Message
+            Distribution.Solver.Modular.PSQ
+            Distribution.Solver.Modular.Package
+            Distribution.Solver.Modular.Preference
+            Distribution.Solver.Modular.RetryLog
+            Distribution.Solver.Modular.Solver
+            Distribution.Solver.Modular.Tree
+            Distribution.Solver.Modular.Validate
+            Distribution.Solver.Modular.Var
+            Distribution.Solver.Modular.Version
+            Distribution.Solver.Modular.WeightedPSQ
+            Distribution.Solver.Types.ComponentDeps
+            Distribution.Solver.Types.ConstraintSource
+            Distribution.Solver.Types.DependencyResolver
+            Distribution.Solver.Types.Flag
+            Distribution.Solver.Types.InstSolverPackage
+            Distribution.Solver.Types.InstalledPreference
+            Distribution.Solver.Types.LabeledPackageConstraint
+            Distribution.Solver.Types.OptionalStanza
+            Distribution.Solver.Types.PackageConstraint
+            Distribution.Solver.Types.PackageFixedDeps
+            Distribution.Solver.Types.PackageIndex
+            Distribution.Solver.Types.PackagePath
+            Distribution.Solver.Types.PackagePreferences
+            Distribution.Solver.Types.PkgConfigDb
+            Distribution.Solver.Types.Progress
+            Distribution.Solver.Types.ResolverPackage
+            Distribution.Solver.Types.Settings
+            Distribution.Solver.Types.SolverId
+            Distribution.Solver.Types.SolverPackage
+            Distribution.Solver.Types.SourcePackage
+            Distribution.Solver.Types.Variable
+
+        if flag(native-dns)
+          if os(windows)
+            build-depends: windns      >= 0.1.0 && < 0.2
+          else
+            build-depends: resolv      >= 0.1.1 && < 0.2
+
+        if os(windows)
+          build-depends: Win32 >= 2 && < 3
+        else
+          build-depends: unix >= 2.5 && < 2.8
+
+        if flag(debug-expensive-assertions)
+          cpp-options: -DDEBUG_EXPENSIVE_ASSERTIONS
+
+        if flag(debug-conflict-sets)
+          cpp-options: -DDEBUG_CONFLICT_SETS
+          build-depends: base >= 4.8
+
+        if flag(debug-tracetree)
+          cpp-options: -DDEBUG_TRACETREE
+          build-depends: tracetree >= 0.1 && < 0.2
+
     if flag(monolithic)
       hs-source-dirs: tests
       other-modules:
         UnitTests
+        MemoryUsageTests
+        SolverQuickCheck
+        IntegrationTests2
+
         UnitTests.Distribution.Client.ArbitraryInstances
         UnitTests.Distribution.Client.FileMonitor
         UnitTests.Distribution.Client.GZipUtils
@@ -379,21 +584,20 @@ executable cabal
         UnitTests.Distribution.Client.Tar
         UnitTests.Distribution.Client.Targets
         UnitTests.Distribution.Client.UserConfig
+        UnitTests.Distribution.Solver.Modular.Builder
         UnitTests.Distribution.Solver.Modular.DSL
         UnitTests.Distribution.Solver.Modular.DSL.TestCaseUtils
         UnitTests.Distribution.Solver.Modular.MemoryUsage
-        UnitTests.Distribution.Solver.Modular.PSQ
         UnitTests.Distribution.Solver.Modular.QuickCheck
+        UnitTests.Distribution.Solver.Modular.QuickCheck.Utils
         UnitTests.Distribution.Solver.Modular.RetryLog
         UnitTests.Distribution.Solver.Modular.Solver
         UnitTests.Distribution.Solver.Modular.WeightedPSQ
         UnitTests.Options
-        MemoryUsageTests
-        SolverQuickCheck
-        IntegrationTests2
+
       cpp-options: -DMONOLITHIC
       build-depends:
-        Cabal      >= 2.0 && < 2.1,
+        Cabal      >= 2.2 && < 2.3,
         QuickCheck >= 2.8.2,
         array,
         async,
@@ -403,18 +607,25 @@ executable cabal
         directory,
         edit-distance,
         filepath,
+        hashable,
         mtl,
         network,
         network-uri,
-        pretty-show,
+        pretty-show >= 1.6.15,
         random,
         tagged,
         tar,
-        tasty,
-        tasty-hunit,
+        tasty >= 1.0 && < 1.1,
+        tasty-hunit >= 0.10,
         tasty-quickcheck,
         time,
         zlib
+
+    ghc-options: -threaded
+
+    -- On AIX, some legacy BSD operations such as flock(2) are provided by libbsd.a
+    if os(aix)
+      extra-libraries: bsd
 
     default-language: Haskell2010
 
@@ -422,91 +633,58 @@ executable cabal
 Test-Suite unit-tests
   type: exitcode-stdio-1.0
   main-is: UnitTests.hs
-  hs-source-dirs: tests, .
+  hs-source-dirs: tests
   ghc-options: -Wall -fwarn-tabs -main-is UnitTests
   other-modules:
-    Distribution.Client.Compat.FileLock
     UnitTests.Distribution.Client.ArbitraryInstances
+    UnitTests.Distribution.Client.Targets
     UnitTests.Distribution.Client.FileMonitor
-    UnitTests.Distribution.Client.GZipUtils
     UnitTests.Distribution.Client.Glob
-    UnitTests.Distribution.Client.IndexUtils.Timestamp
-    UnitTests.Distribution.Client.InstallPlan
-    UnitTests.Distribution.Client.JobControl
-    UnitTests.Distribution.Client.ProjectConfig
+    UnitTests.Distribution.Client.GZipUtils
     UnitTests.Distribution.Client.Sandbox
     UnitTests.Distribution.Client.Sandbox.Timestamp
     UnitTests.Distribution.Client.Store
     UnitTests.Distribution.Client.Tar
-    UnitTests.Distribution.Client.Targets
     UnitTests.Distribution.Client.UserConfig
-    UnitTests.Distribution.Solver.Modular.DSL
-    UnitTests.Distribution.Solver.Modular.DSL.TestCaseUtils
-    UnitTests.Distribution.Solver.Modular.PSQ
+    UnitTests.Distribution.Client.ProjectConfig
+    UnitTests.Distribution.Client.JobControl
+    UnitTests.Distribution.Client.IndexUtils.Timestamp
+    UnitTests.Distribution.Client.InstallPlan
+    UnitTests.Distribution.Solver.Modular.Builder
     UnitTests.Distribution.Solver.Modular.RetryLog
     UnitTests.Distribution.Solver.Modular.Solver
+    UnitTests.Distribution.Solver.Modular.DSL
+    UnitTests.Distribution.Solver.Modular.DSL.TestCaseUtils
     UnitTests.Distribution.Solver.Modular.WeightedPSQ
     UnitTests.Options
-
   build-depends:
+        array,
         base,
         async,
-        array,
         bytestring,
+        cabal-install,
         Cabal,
         containers,
         deepseq,
         mtl,
-        pretty,
-        process,
+        random,
         directory,
         filepath,
-        hashable,
-        stm,
         tar,
         time,
-        HTTP,
         zlib,
-        binary,
-        random,
-        hackage-security,
-        tasty,
-        tasty-hunit,
+        network-uri,
+        network,
+        tasty >= 1.0 && < 1.1,
+        tasty-hunit >= 0.10,
         tasty-quickcheck,
         tagged,
         QuickCheck >= 2.8.2
 
-  if flag(old-directory)
-    build-depends: old-time
+  ghc-options: -threaded
 
-  if flag(network-uri)
-    build-depends: network-uri >= 2.6, network >= 2.6
-  else
-    build-depends: network-uri < 2.6, network < 2.6
-
-  if impl(ghc < 7.6)
-    build-depends: ghc-prim >= 0.2 && < 0.3
-
-  if os(windows)
-    build-depends: Win32
-  else
-    build-depends: unix
-
-  ghc-options: -fno-ignore-asserts
-
-  if !(arch(arm) && impl(ghc < 7.6))
-    ghc-options: -threaded
-
-  if flag(debug-expensive-assertions)
-    cpp-options: -DDEBUG_EXPENSIVE_ASSERTIONS
-
-  if flag(debug-conflict-sets)
-    cpp-options: -DDEBUG_CONFLICT_SETS
-    build-depends: base >= 4.8
-
-  if flag(debug-tracetree)
-      cpp-options: -DDEBUG_TRACETREE
-      build-depends: tracetree >= 0.1 && < 0.2
+  if !flag(lib)
+    buildable: False
 
   default-language: Haskell2010
 
@@ -514,7 +692,7 @@ Test-Suite unit-tests
 Test-Suite memory-usage-tests
   type: exitcode-stdio-1.0
   main-is: MemoryUsageTests.hs
-  hs-source-dirs: tests, .
+  hs-source-dirs: tests
   ghc-options: -Wall -fwarn-tabs "-with-rtsopts=-M4M -K1K" -main-is MemoryUsageTests
   other-modules:
     UnitTests.Distribution.Solver.Modular.DSL
@@ -524,60 +702,18 @@ Test-Suite memory-usage-tests
   build-depends:
         base,
         async,
-        array,
-        bytestring,
         Cabal,
+        cabal-install,
         containers,
         deepseq,
-        mtl,
-        pretty,
-        process,
-        directory,
-        filepath,
-        hashable,
-        stm,
-        tar,
-        time,
-        HTTP,
-        zlib,
-        binary,
-        random,
-        hackage-security,
         tagged,
-        tasty,
-        tasty-hunit
+        tasty >= 1.0 && < 1.1,
+        tasty-hunit >= 0.10
 
-  if flag(old-directory)
-    build-depends: old-time
+  ghc-options: -threaded
 
-  if flag(network-uri)
-    build-depends: network-uri >= 2.6, network >= 2.6
-  else
-    build-depends: network-uri < 2.6, network < 2.6
-
-  if impl(ghc < 7.6)
-    build-depends: ghc-prim >= 0.2 && < 0.3
-
-  if os(windows)
-    build-depends: Win32
-  else
-    build-depends: unix
-
-  ghc-options: -fno-ignore-asserts
-
-  if !(arch(arm) && impl(ghc < 7.6))
-    ghc-options: -threaded
-
-  if flag(debug-expensive-assertions)
-    cpp-options: -DDEBUG_EXPENSIVE_ASSERTIONS
-
-  if flag(debug-conflict-sets)
-    cpp-options: -DDEBUG_CONFLICT_SETS
-    build-depends: base >= 4.8
-
-  if flag(debug-tracetree)
-      cpp-options: -DDEBUG_TRACETREE
-      build-depends: tracetree >= 0.1 && < 0.2
+  if !flag(lib)
+    buildable: False
 
   default-language: Haskell2010
 
@@ -585,67 +721,31 @@ Test-Suite memory-usage-tests
 Test-Suite solver-quickcheck
   type: exitcode-stdio-1.0
   main-is: SolverQuickCheck.hs
-  hs-source-dirs: tests, .
-  ghc-options: -Wall -fwarn-tabs -fno-ignore-asserts -main-is SolverQuickCheck
+  hs-source-dirs: tests
+  ghc-options: -Wall -fwarn-tabs -main-is SolverQuickCheck
   other-modules:
     UnitTests.Distribution.Solver.Modular.DSL
     UnitTests.Distribution.Solver.Modular.QuickCheck
+    UnitTests.Distribution.Solver.Modular.QuickCheck.Utils
   build-depends:
         base,
         async,
-        array,
-        bytestring,
         Cabal,
+        cabal-install,
         containers,
         deepseq >= 1.2,
-        mtl,
-        pretty,
-        process,
-        directory,
-        filepath,
         hashable,
-        stm,
-        tar,
-        time,
-        HTTP,
-        zlib,
-        binary,
         random,
-        hackage-security,
-        tasty,
+        tagged,
+        tasty >= 1.0 && <1.1,
         tasty-quickcheck,
         QuickCheck >= 2.8.2,
-        pretty-show
+        pretty-show >= 1.6.15
 
-  if flag(old-directory)
-    build-depends: old-time
+  ghc-options: -threaded
 
-  if flag(network-uri)
-    build-depends: network-uri >= 2.6, network >= 2.6
-  else
-    build-depends: network-uri < 2.6, network < 2.6
-
-  if impl(ghc < 7.6)
-    build-depends: ghc-prim >= 0.2 && < 0.3
-
-  if os(windows)
-    build-depends: Win32
-  else
-    build-depends: unix
-
-  if !(arch(arm) && impl(ghc < 7.6))
-    ghc-options: -threaded
-
-  if flag(debug-expensive-assertions)
-    cpp-options: -DDEBUG_EXPENSIVE_ASSERTIONS
-
-  if flag(debug-conflict-sets)
-    cpp-options: -DDEBUG_CONFLICT_SETS
-    build-depends: base >= 4.8
-
-  if flag(debug-tracetree)
-      cpp-options: -DDEBUG_TRACETREE
-      build-depends: tracetree >= 0.1 && < 0.2
+  if !flag(lib)
+    buildable: False
 
   default-language: Haskell2010
 
@@ -654,62 +754,30 @@ Test-Suite solver-quickcheck
 test-suite integration-tests2
   type: exitcode-stdio-1.0
   main-is: IntegrationTests2.hs
-  hs-source-dirs: tests, .
-  ghc-options: -Wall -fwarn-tabs -fno-ignore-asserts -main-is IntegrationTests2
-  other-modules: Distribution.Client.Compat.FileLock
+  hs-source-dirs: tests
+  ghc-options: -Wall -fwarn-tabs -main-is IntegrationTests2
+  other-modules:
   build-depends:
-        async,
-        array,
         base,
-        base16-bytestring,
-        binary,
-        bytestring,
         Cabal,
+        cabal-install,
         containers,
-        cryptohash-sha256,
         deepseq,
         directory,
         edit-distance,
         filepath,
-        hackage-security,
-        hashable,
-        HTTP,
-        mtl,
-        network,
-        network-uri,
-        pretty,
-        process,
-        random,
-        stm,
-        tar,
-        time,
-        zlib,
-        tasty,
-        tasty-hunit,
+        tasty >= 1.0 && < 1.1,
+        tasty-hunit >= 0.10,
         tagged
 
-  if flag(old-bytestring)
-    build-depends: bytestring-builder
+  if !flag(lib)
+    buildable: False
 
-  if flag(old-directory)
-    build-depends: old-time
-
-  if impl(ghc < 7.6)
-    build-depends: ghc-prim >= 0.2 && < 0.3
-
-  if os(windows)
-    build-depends: Win32
-  else
-    build-depends: unix
-
-  if arch(arm)
-    cc-options:  -DCABAL_NO_THREADED
-  else
-    ghc-options: -threaded
+  ghc-options: -threaded
   default-language: Haskell2010
 
 custom-setup
-  setup-depends: Cabal >= 2.0,
+  setup-depends: Cabal >= 2.2,
                  base,
                  process   >= 1.1.0.1  && < 1.7,
-                 filepath   >= 1.3      && < 1.5
+                 filepath  >= 1.3      && < 1.5

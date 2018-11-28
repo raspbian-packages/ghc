@@ -13,7 +13,8 @@ module TcEvidence (
   -- Evidence bindings
   TcEvBinds(..), EvBindsVar(..),
   EvBindMap(..), emptyEvBindMap, extendEvBinds,
-  lookupEvBind, evBindMapBinds, foldEvBindMap, isEmptyEvBindMap,
+  lookupEvBind, evBindMapBinds, foldEvBindMap, filterEvBindMap,
+  isEmptyEvBindMap,
   EvBind(..), emptyTcEvBinds, isEmptyTcEvBinds, mkGivenEvBind, mkWantedEvBind,
   sccEvBinds, evBindVar,
   EvTerm(..), mkEvCast, evVarsOfTerm, mkEvScSelectors,
@@ -33,11 +34,13 @@ module TcEvidence (
   mkTcKindCo,
   tcCoercionKind, coVarsOfTcCo,
   mkTcCoVarCo,
-  isTcReflCo,
+  isTcReflCo, isTcReflexiveCo,
   tcCoercionRole,
   unwrapIP, wrapIP
   ) where
 #include "HsVersions.h"
+
+import GhcPrelude
 
 import Var
 import CoAxiom
@@ -115,6 +118,10 @@ tcCoercionRole         :: TcCoercion -> Role
 coVarsOfTcCo           :: TcCoercion -> TcTyCoVarSet
 isTcReflCo             :: TcCoercion -> Bool
 
+-- | This version does a slow check, calculating the related types and seeing
+-- if they are equal.
+isTcReflexiveCo        :: TcCoercion -> Bool
+
 mkTcReflCo             = mkReflCo
 mkTcSymCo              = mkSymCo
 mkTcTransCo            = mkTransCo
@@ -143,7 +150,7 @@ tcCoercionKind         = coercionKind
 tcCoercionRole         = coercionRole
 coVarsOfTcCo           = coVarsOfCo
 isTcReflCo             = isReflCo
-
+isTcReflexiveCo        = isReflexiveCo
 
 {-
 %************************************************************************
@@ -435,6 +442,10 @@ evBindMapBinds = foldEvBindMap consBag emptyBag
 
 foldEvBindMap :: (EvBind -> a -> a) -> a -> EvBindMap -> a
 foldEvBindMap k z bs = foldDVarEnv k z (ev_bind_varenv bs)
+
+filterEvBindMap :: (EvBind -> Bool) -> EvBindMap -> EvBindMap
+filterEvBindMap k (EvBindMap { ev_bind_varenv = env })
+  = EvBindMap { ev_bind_varenv = filterDVarEnv k env }
 
 instance Outputable EvBindMap where
   ppr (EvBindMap m) = ppr m
@@ -805,12 +816,12 @@ evVarsOfTerms = mapUnionVarSet evVarsOfTerm
 sccEvBinds :: Bag EvBind -> [SCC EvBind]
 sccEvBinds bs = stronglyConnCompFromEdgedVerticesUniq edges
   where
-    edges :: [(EvBind, EvVar, [EvVar])]
+    edges :: [ Node EvVar EvBind ]
     edges = foldrBag ((:) . mk_node) [] bs
 
-    mk_node :: EvBind -> (EvBind, EvVar, [EvVar])
+    mk_node :: EvBind -> Node EvVar EvBind
     mk_node b@(EvBind { eb_lhs = var, eb_rhs = term })
-      = (b, var, nonDetEltsUniqSet (evVarsOfTerm term `unionVarSet`
+      = DigraphNode b var (nonDetEltsUniqSet (evVarsOfTerm term `unionVarSet`
                                 coVarsOfType (varType var)))
       -- It's OK to use nonDetEltsUniqSet here as stronglyConnCompFromEdgedVertices
       -- is still deterministic even if the edges are in nondeterministic order

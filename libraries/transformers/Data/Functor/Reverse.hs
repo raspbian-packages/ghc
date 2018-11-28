@@ -29,8 +29,12 @@ module Data.Functor.Reverse (
 import Control.Applicative.Backwards
 import Data.Functor.Classes
 
-import Prelude hiding (foldr, foldr1, foldl, foldl1)
+import Prelude hiding (foldr, foldr1, foldl, foldl1, null, length)
 import Control.Applicative
+import Control.Monad
+#if MIN_VERSION_base(4,9,0)
+import qualified Control.Monad.Fail as Fail
+#endif
 import Data.Foldable
 import Data.Traversable
 import Data.Monoid
@@ -79,6 +83,30 @@ instance (Alternative f) => Alternative (Reverse f) where
     Reverse x <|> Reverse y = Reverse (x <|> y)
     {-# INLINE (<|>) #-}
 
+-- | Derived instance.
+instance (Monad m) => Monad (Reverse m) where
+#if !(MIN_VERSION_base(4,8,0))
+    return a = Reverse (return a)
+    {-# INLINE return #-}
+#endif
+    m >>= f = Reverse (getReverse m >>= getReverse . f)
+    {-# INLINE (>>=) #-}
+    fail msg = Reverse (fail msg)
+    {-# INLINE fail #-}
+
+#if MIN_VERSION_base(4,9,0)
+instance (Fail.MonadFail m) => Fail.MonadFail (Reverse m) where
+    fail msg = Reverse (Fail.fail msg)
+    {-# INLINE fail #-}
+#endif
+
+-- | Derived instance.
+instance (MonadPlus m) => MonadPlus (Reverse m) where
+    mzero = Reverse mzero
+    {-# INLINE mzero #-}
+    Reverse x `mplus` Reverse y = Reverse (x `mplus` y)
+    {-# INLINE mplus #-}
+
 -- | Fold from right to left.
 instance (Foldable f) => Foldable (Reverse f) where
     foldMap f (Reverse t) = getDual (foldMap (Dual . f) t)
@@ -91,12 +119,13 @@ instance (Foldable f) => Foldable (Reverse f) where
     {-# INLINE foldr1 #-}
     foldl1 f (Reverse t) = foldr1 (flip f) t
     {-# INLINE foldl1 #-}
+#if MIN_VERSION_base(4,8,0)
+    null (Reverse t) = null t
+    length (Reverse t) = length t
+#endif
 
 -- | Traverse from right to left.
 instance (Traversable f) => Traversable (Reverse f) where
     traverse f (Reverse t) =
         fmap Reverse . forwards $ traverse (Backwards . f) t
     {-# INLINE traverse #-}
-    sequenceA (Reverse t) =
-        fmap Reverse . forwards $ sequenceA (fmap Backwards t)
-    {-# INLINE sequenceA #-}

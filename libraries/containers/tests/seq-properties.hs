@@ -23,6 +23,7 @@ import Data.Array (listArray)
 import Data.Foldable (Foldable(foldl, foldl1, foldr, foldr1, foldMap, fold), toList, all, sum, foldl', foldr')
 import Data.Functor ((<$>), (<$))
 import Data.Maybe
+import Data.Function (on)
 import Data.Monoid (Monoid(..), All(..), Endo(..), Dual(..))
 import Data.Traversable (Traversable(traverse), sequenceA)
 import Prelude hiding (
@@ -44,6 +45,7 @@ import Test.Framework.Providers.QuickCheck2
 import Control.Monad.Zip (MonadZip (..))
 #endif
 import Control.DeepSeq (deepseq)
+import Control.Monad.Fix (MonadFix (..))
 
 
 main :: IO ()
@@ -94,8 +96,10 @@ main = defaultMain
        , testProperty "filter" prop_filter
        , testProperty "sort" prop_sort
        , testProperty "sortBy" prop_sortBy
+       , testProperty "sortOn" prop_sortOn
        , testProperty "unstableSort" prop_unstableSort
        , testProperty "unstableSortBy" prop_unstableSortBy
+       , testProperty "unstableSortOn" prop_unstableSortOn
        , testProperty "index" prop_index
        , testProperty "(!?)" prop_safeIndex
        , testProperty "adjust" prop_adjust
@@ -139,6 +143,7 @@ main = defaultMain
        , testProperty "cycleTaking" prop_cycleTaking
        , testProperty "intersperse" prop_intersperse
        , testProperty ">>=" prop_bind
+       , testProperty "mfix" test_mfix
 #if __GLASGOW_HASKELL__ >= 800
        , testProperty "Empty pattern" prop_empty_pat
        , testProperty "Empty constructor" prop_empty_con
@@ -538,6 +543,16 @@ prop_sortBy xs =
     toList' (sortBy f xs) ~= Data.List.sortBy f (toList xs)
   where f (x1, _) (x2, _) = compare x1 x2
 
+prop_sortOn :: Fun A OrdB -> Seq A -> Bool
+prop_sortOn (Fun _ f) xs =
+    toList' (sortOn f xs) ~= listSortOn f (toList xs)
+  where
+#if MIN_VERSION_base(4,8,0)
+    listSortOn = Data.List.sortOn
+#else
+    listSortOn k = Data.List.sortBy (compare `on` k)
+#endif
+
 prop_unstableSort :: Seq OrdA -> Bool
 prop_unstableSort xs =
     toList' (unstableSort xs) ~= Data.List.sort (toList xs)
@@ -545,6 +560,10 @@ prop_unstableSort xs =
 prop_unstableSortBy :: Seq OrdA -> Bool
 prop_unstableSortBy xs =
     toList' (unstableSortBy compare xs) ~= Data.List.sort (toList xs)
+
+prop_unstableSortOn :: Fun A OrdB -> Seq A -> Property
+prop_unstableSortOn (Fun _ f) xs =
+    toList' (unstableSortBy (compare `on` f) xs) === toList' (unstableSortOn f xs)
 
 -- * Indexing
 
@@ -806,6 +825,24 @@ prop_viewr_con xs x = xs :|> x === xs |> x
 prop_bind :: Seq A -> Fun A (Seq B) -> Bool
 prop_bind xs (Fun _ f) =
     toList' (xs >>= f) ~= (toList xs >>= toList . f)
+
+-- MonadFix operation
+
+-- It's exceedingly difficult to construct a proper QuickCheck
+-- property for mfix because the function passed to it must be
+-- lazy. The following property is really just a unit test in
+-- disguise, and not a terribly meaningful one.
+test_mfix :: Property
+test_mfix = toList resS === resL
+  where
+    facty :: (Int -> Int) -> Int -> Int
+    facty _ 0 = 1; facty f n = n * f (n - 1)
+
+    resS :: Seq Int
+    resS = fmap ($ 12) $ mfix (\f -> fromList [facty f, facty (+1), facty (+2)])
+
+    resL :: [Int]
+    resL = fmap ($ 12) $ mfix (\f -> [facty f, facty (+1), facty (+2)])
 
 -- Simple test monad
 

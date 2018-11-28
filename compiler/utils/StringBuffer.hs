@@ -7,7 +7,7 @@ Buffers for scanning string input stored in external arrays.
 -}
 
 {-# LANGUAGE BangPatterns, CPP, MagicHash, UnboxedTuples #-}
-{-# OPTIONS_GHC -O #-}
+{-# OPTIONS_GHC -O2 #-}
 -- We always optimise this, otherwise performance of a non-optimised
 -- compiler is severely affected
 
@@ -37,12 +37,15 @@ module StringBuffer
         -- * Conversion
         lexemeToString,
         lexemeToFastString,
+        decodePrevNChars,
 
          -- * Parsing integers
         parseUnsignedInteger,
        ) where
 
 #include "HsVersions.h"
+
+import GhcPrelude
 
 import Encoding
 import FastString
@@ -298,6 +301,20 @@ lexemeToFastString (StringBuffer buf _ cur) len =
    inlinePerformIO $
      withForeignPtr buf $ \ptr ->
        return $! mkFastStringBytes (ptr `plusPtr` cur) len
+
+-- | Return the previous @n@ characters (or fewer if we are less than @n@
+-- characters into the buffer.
+decodePrevNChars :: Int -> StringBuffer -> String
+decodePrevNChars n (StringBuffer buf _ cur) =
+    inlinePerformIO $ withForeignPtr buf $ \p0 ->
+      go p0 n "" (p0 `plusPtr` (cur - 1))
+  where
+    go :: Ptr Word8 -> Int -> String -> Ptr Word8 -> IO String
+    go buf0 n acc p | n == 0 || buf0 >= p = return acc
+    go buf0 n acc p = do
+        p' <- utf8PrevChar p
+        let (c,_) = utf8DecodeChar p'
+        go buf0 (n - 1) (c:acc) p'
 
 -- -----------------------------------------------------------------------------
 -- Parsing integer strings in various bases

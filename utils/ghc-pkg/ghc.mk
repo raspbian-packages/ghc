@@ -27,7 +27,7 @@ utils/ghc-pkg_PACKAGE = ghc-pkg
 # Note [Why build certain utils twice?]
 #
 # We build certain utils twice: once with stage0, and once with stage1.
-# Examples are ghc-pkg, hsc2hs, hp2ps and unlit.
+# Examples are ghc-pkg and hsc2hs.
 #
 # These tools are needed during the bootstrapping process, so we have to use
 # stage0 to build them at first (stage1 doesn't exist yet). (side note: they're
@@ -37,11 +37,6 @@ utils/ghc-pkg_PACKAGE = ghc-pkg
 # that when DYNAMIC_GHC_PROGRAMS=YES, we want to install copies that are
 # dynamically linked. But the stage0 copies are either statically linked, or
 # linked against libraries on the build machine.
-#
-# Another reason why we can't install the stage0 copies is that they are
-# built to run on the build(=host) platform, but when installing a
-# "cross-compiled stage2 compiler" we need copies that run on the target
-# platform.
 #
 # Therefore we build fresh copies, using the stage1 compiler, and install them
 # when you run 'make install'. They are not used for any other purpose.
@@ -53,6 +48,12 @@ utils/ghc-pkg_dist_USES_CABAL = YES
 utils/ghc-pkg_dist_PROGNAME = ghc-pkg
 utils/ghc-pkg_dist_SHELL_WRAPPER = YES
 utils/ghc-pkg_dist_INSTALL_INPLACE = YES
+
+# When cross-built ghc-stage2 is installed 'make install' needs to call
+# native ghc-pkg (not the cross-built one) to register installed packages
+# 'ghc-pkg_DIST_BINARY' variable only refer to native binary.
+ghc-pkg_DIST_BINARY_NAME = ghc-pkg$(exeext0)
+ghc-pkg_DIST_BINARY = utils/ghc-pkg/dist/build/tmp/$(ghc-pkg_DIST_BINARY_NAME)
 
 # See Note [Stage1Only vs stage=1] in mk/config.mk.in.
 ifeq "$(Stage1Only)" "YES"

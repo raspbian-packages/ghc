@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE CPP, OverloadedStrings, BangPatterns #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Haddock.Interface
@@ -51,6 +51,7 @@ import System.Directory
 import System.FilePath
 import Text.Printf
 
+import Module (mkModuleSet, emptyModuleSet, unionModuleSet, ModuleSet)
 import Digraph
 import DynFlags hiding (verbosity)
 import Exception
@@ -58,6 +59,11 @@ import GHC hiding (verbosity)
 import HscTypes
 import FastString (unpackFS)
 import MonadUtils (liftIO)
+import TcRnTypes (tcg_rdr_env)
+import Name (nameIsFromExternalPackage, nameOccName)
+import OccName (isTcOcc)
+import RdrName (unQualOK, gre_name, globalRdrEnvElts)
+import ErrUtils (withTiming)
 
 #if defined(mingw32_HOST_OS)
 import System.IO
@@ -84,20 +90,22 @@ processModules verbosity modules flags extIfaces = do
   out verbosity verbose "Creating interfaces..."
   let instIfaceMap =  Map.fromList [ (instMod iface, iface) | ext <- extIfaces
                                    , iface <- ifInstalledIfaces ext ]
-  interfaces <- createIfaces0 verbosity modules flags instIfaceMap
+  (interfaces, ms) <- createIfaces0 verbosity modules flags instIfaceMap
 
   let exportedNames =
         Set.unions $ map (Set.fromList . ifaceExports) $
         filter (\i -> not $ OptHide `elem` ifaceOptions i) interfaces
       mods = Set.fromList $ map ifaceMod interfaces
   out verbosity verbose "Attaching instances..."
-  interfaces' <- attachInstances (exportedNames, mods) interfaces instIfaceMap
+  interfaces' <- {-# SCC attachInstances #-}
+                 withTiming getDynFlags "attachInstances" (const ()) $ do
+                   attachInstances (exportedNames, mods) interfaces instIfaceMap ms
 
   out verbosity verbose "Building cross-linking environment..."
   -- Combine the link envs of the external packages into one
   let extLinks  = Map.unions (map ifLinkEnv extIfaces)
-      homeLinks = buildHomeLinks interfaces -- Build the environment for the home
-                                            -- package
+      homeLinks = buildHomeLinks interfaces' -- Build the environment for the home
+                                             -- package
       links     = homeLinks `Map.union` extLinks
 
   out verbosity verbose "Renaming interfaces..."
@@ -115,18 +123,14 @@ processModules verbosity modules flags extIfaces = do
 --------------------------------------------------------------------------------
 
 
-createIfaces0 :: Verbosity -> [String] -> [Flag] -> InstIfaceMap -> Ghc [Interface]
+createIfaces0 :: Verbosity -> [String] -> [Flag] -> InstIfaceMap -> Ghc ([Interface], ModuleSet)
 createIfaces0 verbosity modules flags instIfaceMap =
   -- Output dir needs to be set before calling depanal since depanal uses it to
   -- compute output file names that are stored in the DynFlags of the
   -- resulting ModSummaries.
   (if useTempDir then withTempOutputDir else id) $ do
     modGraph <- depAnalysis
-    if needsTemplateHaskell modGraph then do
-      modGraph' <- enableCompilation modGraph
-      createIfaces verbosity flags instIfaceMap modGraph'
-    else
-      createIfaces verbosity flags instIfaceMap modGraph
+    createIfaces verbosity flags instIfaceMap modGraph
 
   where
     useTempDir :: Bool
@@ -149,38 +153,52 @@ createIfaces0 verbosity modules flags instIfaceMap =
       depanal [] False
 
 
-    enableCompilation :: ModuleGraph -> Ghc ModuleGraph
-    enableCompilation modGraph = do
-      let enableComp d = let platform = targetPlatform d
-                         in d { hscTarget = defaultObjectTarget platform }
-      modifySessionDynFlags enableComp
-      -- We need to update the DynFlags of the ModSummaries as well.
-      let upd m = m { ms_hspp_opts = enableComp (ms_hspp_opts m) }
-      let modGraph' = map upd modGraph
-      return modGraph'
-
-
-createIfaces :: Verbosity -> [Flag] -> InstIfaceMap -> ModuleGraph -> Ghc [Interface]
+createIfaces :: Verbosity -> [Flag] -> InstIfaceMap -> ModuleGraph -> Ghc ([Interface], ModuleSet)
 createIfaces verbosity flags instIfaceMap mods = do
   let sortedMods = flattenSCCs $ topSortModuleGraph False mods Nothing
   out verbosity normal "Haddock coverage:"
-  (ifaces, _) <- foldM f ([], Map.empty) sortedMods
-  return (reverse ifaces)
+  (ifaces, _, !ms) <- foldM f ([], Map.empty, emptyModuleSet) sortedMods
+  return (reverse ifaces, ms)
   where
-    f (ifaces, ifaceMap) modSummary = do
-      x <- processModule verbosity modSummary flags ifaceMap instIfaceMap
+    f (ifaces, ifaceMap, !ms) modSummary = do
+      x <- {-# SCC processModule #-}
+           withTiming getDynFlags "processModule" (const ()) $ do
+             processModule verbosity modSummary flags ifaceMap instIfaceMap
       return $ case x of
-        Just iface -> (iface:ifaces, Map.insert (ifaceMod iface) iface ifaceMap)
-        Nothing    -> (ifaces, ifaceMap) -- Boot modules don't generate ifaces.
+        Just (iface, ms') -> ( iface:ifaces
+                             , Map.insert (ifaceMod iface) iface ifaceMap
+                             , unionModuleSet ms ms' )
+        Nothing           -> ( ifaces
+                             , ifaceMap
+                             , ms ) -- Boot modules don't generate ifaces.
 
 
-processModule :: Verbosity -> ModSummary -> [Flag] -> IfaceMap -> InstIfaceMap -> Ghc (Maybe Interface)
+processModule :: Verbosity -> ModSummary -> [Flag] -> IfaceMap -> InstIfaceMap -> Ghc (Maybe (Interface, ModuleSet))
 processModule verbosity modsum flags modMap instIfaceMap = do
   out verbosity verbose $ "Checking module " ++ moduleString (ms_mod modsum) ++ "..."
-  tm <- loadModule =<< typecheckModule =<< parseModule modsum
+  tm <- {-# SCC "parse/typecheck/load" #-} loadModule =<< typecheckModule =<< parseModule modsum
+
   if not $ isBootSummary modsum then do
     out verbosity verbose "Creating interface..."
-    (interface, msg) <- runWriterGhc $ createInterface tm flags modMap instIfaceMap
+    (interface, msg) <- {-# SCC createIterface #-}
+                        withTiming getDynFlags "createInterface" (const ()) $ do
+                          runWriterGhc $ createInterface tm flags modMap instIfaceMap
+
+    -- We need to modify the interactive context's environment so that when
+    -- Haddock later looks for instances, it also looks in the modules it
+    -- encountered while typechecking.
+    --
+    -- See https://github.com/haskell/haddock/issues/469.
+    hsc_env <- getSession
+    let new_rdr_env = tcg_rdr_env . fst . GHC.tm_internals_ $ tm
+        this_pkg = thisPackage (hsc_dflags hsc_env)
+        !mods = mkModuleSet [ nameModule name
+                            | gre <- globalRdrEnvElts new_rdr_env
+                            , let name = gre_name gre
+                            , nameIsFromExternalPackage this_pkg name
+                            , isTcOcc (nameOccName name)   -- Types and classes only
+                            , unQualOK gre ]               -- In scope unqualified
+
     liftIO $ mapM_ putStrLn msg
     dflags <- getDynFlags
     let (haddockable, haddocked) = ifaceHaddockCoverage interface
@@ -194,7 +212,7 @@ processModule verbosity modsum flags modMap instIfaceMap = do
                                                             , expItemMbDoc = (Documentation Nothing _, _)
                                                             } <- ifaceExportItems interface ]
           where
-            formatName :: SrcSpan -> HsDecl Name -> String
+            formatName :: SrcSpan -> HsDecl GhcRn -> String
             formatName loc n = p (getMainDeclBinder n) ++ case loc of
               RealSrcSpan rss -> " (" ++ unpackFS (srcSpanFile rss) ++ ":" ++ show (srcSpanStartLine rss) ++ ")"
               _ -> ""
@@ -206,14 +224,15 @@ processModule verbosity modsum flags modMap instIfaceMap = do
                          then drop (length ms) n
                          else n
 
-    out verbosity normal coverageMsg
-    when (Flag_NoPrintMissingDocs `notElem` flags
-          && not (null undocumentedExports && header)) $ do
-      out verbosity normal "  Missing documentation for:"
-      unless header $ out verbosity normal "    Module header"
-      mapM_ (out verbosity normal . ("    " ++)) undocumentedExports
+    when (OptHide `notElem` ifaceOptions interface) $ do
+      out verbosity normal coverageMsg
+      when (Flag_NoPrintMissingDocs `notElem` flags
+            && not (null undocumentedExports && header)) $ do
+        out verbosity normal "  Missing documentation for:"
+        unless header $ out verbosity normal "    Module header"
+        mapM_ (out verbosity normal . ("    " ++)) undocumentedExports
     interface' <- liftIO $ evaluate interface
-    return (Just interface')
+    return (Just (interface', mods))
   else
     return Nothing
 

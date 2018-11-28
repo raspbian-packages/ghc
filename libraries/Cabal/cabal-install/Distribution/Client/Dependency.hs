@@ -61,23 +61,27 @@ module Distribution.Client.Dependency (
     removeUpperBounds,
     addDefaultSetupDependencies,
     addSetupCabalMinVersionConstraint,
+    addSetupCabalMaxVersionConstraint,
   ) where
 
 import Distribution.Solver.Modular
-         ( modularResolver, SolverConfig(..) )
+         ( modularResolver, SolverConfig(..), PruneAfterFirstSuccess(..) )
 import Distribution.Simple.PackageIndex (InstalledPackageIndex)
 import qualified Distribution.Simple.PackageIndex as InstalledPackageIndex
 import Distribution.Client.SolverInstallPlan (SolverInstallPlan)
 import qualified Distribution.Client.SolverInstallPlan as SolverInstallPlan
 import Distribution.Client.Types
          ( SourcePackageDb(SourcePackageDb)
-         , UnresolvedPkgLoc, UnresolvedSourcePackage )
+         , PackageSpecifier(..), pkgSpecifierTarget, pkgSpecifierConstraints
+         , UnresolvedPkgLoc, UnresolvedSourcePackage
+         , AllowNewer(..), AllowOlder(..), RelaxDeps(..), RelaxedDep(..)
+         , RelaxDepScope(..), RelaxDepMod(..), RelaxDepSubject(..), isRelaxDeps
+         )
 import Distribution.Client.Dependency.Types
          ( PreSolver(..), Solver(..)
          , PackagesPreferenceDefault(..) )
 import Distribution.Client.Sandbox.Types
          ( SandboxPackageInfo(..) )
-import Distribution.Client.Targets
 import Distribution.Package
          ( PackageName, mkPackageName, PackageIdentifier(PackageIdentifier), PackageId
          , Package(..), packageName, packageVersion )
@@ -88,26 +92,21 @@ import Distribution.PackageDescription.Configuration
          ( finalizePD )
 import Distribution.Client.PackageUtils
          ( externalBuildDepends )
-import Distribution.Version
-         ( Version, mkVersion
-         , VersionRange, anyVersion, thisVersion, orLaterVersion, withinRange
-         , simplifyVersionRange, removeLowerBound, removeUpperBound )
 import Distribution.Compiler
          ( CompilerInfo(..) )
 import Distribution.System
          ( Platform )
 import Distribution.Client.Utils
-         ( duplicates, duplicatesBy, mergeBy, MergeResult(..) )
+         ( duplicatesBy, mergeBy, MergeResult(..) )
 import Distribution.Simple.Utils
          ( comparing )
-import Distribution.Simple.Configure
-         ( relaxPackageDeps )
 import Distribution.Simple.Setup
-         ( asBool, AllowNewer(..), AllowOlder(..), RelaxDeps(..) )
+         ( asBool )
 import Distribution.Text
          ( display )
 import Distribution.Verbosity
          ( normal, Verbosity )
+import Distribution.Version
 import qualified Distribution.Compat.Graph as Graph
 
 import           Distribution.Solver.Types.ComponentDeps (ComponentDeps)
@@ -133,7 +132,7 @@ import           Distribution.Solver.Types.Variable
 import Data.List
          ( foldl', sort, sortBy, nubBy, maximumBy, intercalate, nub )
 import Data.Function (on)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 import Data.Set (Set)
@@ -426,24 +425,18 @@ hideInstalledPackagesAllVersions pkgnames params =
 -- 'addSourcePackages' won't have upper bounds in dependencies relaxed.
 --
 removeUpperBounds :: AllowNewer -> DepResolverParams -> DepResolverParams
-removeUpperBounds (AllowNewer RelaxDepsNone) params = params
-removeUpperBounds (AllowNewer allowNewer)    params =
-    params {
-      depResolverSourcePkgIndex = sourcePkgIndex'
-    }
-  where
-    sourcePkgIndex' = fmap relaxDeps $ depResolverSourcePkgIndex params
-
-    relaxDeps :: UnresolvedSourcePackage -> UnresolvedSourcePackage
-    relaxDeps srcPkg = srcPkg {
-      packageDescription = relaxPackageDeps removeUpperBound allowNewer
-                           (packageDescription srcPkg)
-      }
+removeUpperBounds (AllowNewer relDeps) = removeBounds RelaxUpper relDeps
 
 -- | Dual of 'removeUpperBounds'
 removeLowerBounds :: AllowOlder -> DepResolverParams -> DepResolverParams
-removeLowerBounds (AllowOlder RelaxDepsNone) params = params
-removeLowerBounds (AllowOlder allowNewer)    params =
+removeLowerBounds (AllowOlder relDeps) = removeBounds RelaxLower relDeps
+
+data RelaxKind = RelaxLower | RelaxUpper
+
+-- | Common internal implementation of 'removeLowerBounds'/'removeUpperBounds'
+removeBounds :: RelaxKind -> RelaxDeps -> DepResolverParams -> DepResolverParams
+removeBounds _ rd params | not (isRelaxDeps rd) = params -- no-op optimisation
+removeBounds  relKind relDeps            params =
     params {
       depResolverSourcePkgIndex = sourcePkgIndex'
     }
@@ -452,9 +445,64 @@ removeLowerBounds (AllowOlder allowNewer)    params =
 
     relaxDeps :: UnresolvedSourcePackage -> UnresolvedSourcePackage
     relaxDeps srcPkg = srcPkg {
-      packageDescription = relaxPackageDeps removeLowerBound allowNewer
+      packageDescription = relaxPackageDeps relKind relDeps
                            (packageDescription srcPkg)
       }
+
+-- | Relax the dependencies of this package if needed.
+--
+-- Helper function used by 'removeBounds'
+relaxPackageDeps :: RelaxKind
+                 -> RelaxDeps
+                 -> PD.GenericPackageDescription -> PD.GenericPackageDescription
+relaxPackageDeps _ rd gpd | not (isRelaxDeps rd) = gpd -- subsumed by no-op case in 'removeBounds'
+relaxPackageDeps relKind RelaxDepsAll  gpd = PD.transformAllBuildDepends relaxAll gpd
+  where
+    relaxAll :: Dependency -> Dependency
+    relaxAll (Dependency pkgName verRange) =
+        Dependency pkgName (removeBound relKind RelaxDepModNone verRange)
+
+relaxPackageDeps relKind (RelaxDepsSome depsToRelax0) gpd =
+  PD.transformAllBuildDepends relaxSome gpd
+  where
+    thisPkgName    = packageName gpd
+    thisPkgId      = packageId   gpd
+    depsToRelax    = Map.fromList $ mapMaybe f depsToRelax0
+
+    f :: RelaxedDep -> Maybe (RelaxDepSubject,RelaxDepMod)
+    f (RelaxedDep scope rdm p) = case scope of
+      RelaxDepScopeAll        -> Just (p,rdm)
+      RelaxDepScopePackage p0
+          | p0 == thisPkgName -> Just (p,rdm)
+          | otherwise         -> Nothing
+      RelaxDepScopePackageId p0
+          | p0 == thisPkgId   -> Just (p,rdm)
+          | otherwise         -> Nothing
+
+    relaxSome :: Dependency -> Dependency
+    relaxSome d@(Dependency depName verRange)
+        | Just relMod <- Map.lookup RelaxDepSubjectAll depsToRelax =
+            -- a '*'-subject acts absorbing, for consistency with
+            -- the 'Semigroup RelaxDeps' instance
+            Dependency depName (removeBound relKind relMod verRange)
+        | Just relMod <- Map.lookup (RelaxDepSubjectPkg depName) depsToRelax =
+            Dependency depName (removeBound relKind relMod verRange)
+        | otherwise = d -- no-op
+
+-- | Internal helper for 'relaxPackageDeps'
+removeBound :: RelaxKind -> RelaxDepMod -> VersionRange -> VersionRange
+removeBound RelaxLower RelaxDepModNone = removeLowerBound
+removeBound RelaxUpper RelaxDepModNone = removeUpperBound
+removeBound relKind RelaxDepModCaret = hyloVersionRange embed projectVersionRange
+  where
+    embed (MajorBoundVersionF v) = caretTransformation v (majorUpperBound v)
+    embed vr                     = embedVersionRange vr
+
+    -- This function is the interesting part as it defines the meaning
+    -- of 'RelaxDepModCaret', i.e. to transform only @^>=@ constraints;
+    caretTransformation l u = case relKind of
+      RelaxUpper -> orLaterVersion l -- rewrite @^>= x.y.z@ into @>= x.y.z@
+      RelaxLower -> earlierVersion u -- rewrite @^>= x.y.z@ into @< x.(y+1)@
 
 -- | Supply defaults for packages without explicit Setup dependencies
 --
@@ -478,16 +526,18 @@ addDefaultSetupDependencies defaultSetupDeps params =
               PD.setupBuildInfo =
                 case PD.setupBuildInfo pkgdesc of
                   Just sbi -> Just sbi
-                  Nothing  -> case defaultSetupDeps srcpkg of
+                  Nothing -> case defaultSetupDeps srcpkg of
                     Nothing -> Nothing
-                    Just deps -> Just PD.SetupBuildInfo {
-                      PD.defaultSetupDepends = True,
-                      PD.setupDepends        = deps
-                    }
+                    Just deps | isCustom -> Just PD.SetupBuildInfo {
+                                                PD.defaultSetupDepends = True,
+                                                PD.setupDepends        = deps
+                                            }
+                              | otherwise -> Nothing
             }
           }
         }
       where
+        isCustom = PD.buildType pkgdesc == PD.Custom
         gpkgdesc = packageDescription srcpkg
         pkgdesc  = PD.packageDescription gpkgdesc
 
@@ -502,6 +552,21 @@ addSetupCabalMinVersionConstraint minVersion =
           (PackageConstraint (ScopeAnySetupQualifier cabalPkgname)
                              (PackagePropertyVersion $ orLaterVersion minVersion))
           ConstraintSetupCabalMinVersion
+      ]
+  where
+    cabalPkgname = mkPackageName "Cabal"
+
+-- | Variant of 'addSetupCabalMinVersionConstraint' which sets an
+-- upper bound on @setup.Cabal@ labeled with 'ConstraintSetupCabalMaxVersion'.
+--
+addSetupCabalMaxVersionConstraint :: Version
+                                  -> DepResolverParams -> DepResolverParams
+addSetupCabalMaxVersionConstraint maxVersion =
+    addConstraints
+      [ LabeledPackageConstraint
+          (PackageConstraint (ScopeAnySetupQualifier cabalPkgname)
+                             (PackagePropertyVersion $ earlierVersion maxVersion))
+          ConstraintSetupCabalMaxVersion
       ]
   where
     cabalPkgname = mkPackageName "Cabal"
@@ -572,7 +637,7 @@ standardInstallPolicy installedPkgIndex sourcePkgDb pkgSpecifiers
         where
           gpkgdesc = packageDescription srcpkg
           pkgdesc  = PD.packageDescription gpkgdesc
-          bt       = fromMaybe PD.Custom (PD.buildType pkgdesc)
+          bt       = PD.buildType pkgdesc
           affected = bt == PD.Custom && hasBuildableFalse gpkgdesc
 
       -- Does this package contain any components with non-empty 'build-depends'
@@ -670,7 +735,7 @@ resolveDependencies platform comp pkgConfigDB solver params =
   $ runSolver solver (SolverConfig reordGoals cntConflicts
                       indGoals noReinstalls
                       shadowing strFlags allowBootLibs maxBkjumps enableBj
-                      solveExes order verbosity)
+                      solveExes order verbosity (PruneAfterFirstSuccess False))
                      platform comp installedPkgIndex sourcePkgIndex
                      pkgConfigDB preferences constraints targets
   where
@@ -842,7 +907,8 @@ configuredPackageProblems :: Platform -> CompilerInfo
                           -> SolverPackage UnresolvedPkgLoc -> [PackageProblem]
 configuredPackageProblems platform cinfo
   (SolverPackage pkg specifiedFlags stanzas specifiedDeps' _specifiedExeDeps') =
-     [ DuplicateFlag flag | ((flag,_):_) <- duplicates specifiedFlags ]
+     [ DuplicateFlag flag
+     | flag <- PD.findDuplicateFlagAssignments specifiedFlags ]
   ++ [ MissingFlag flag | OnlyInLeft  flag <- mergedFlags ]
   ++ [ ExtraFlag   flag | OnlyInRight flag <- mergedFlags ]
   ++ [ DuplicateDeps pkgs
@@ -859,7 +925,7 @@ configuredPackageProblems platform cinfo
 
     mergedFlags = mergeBy compare
       (sort $ map PD.flagName (PD.genPackageFlags (packageDescription pkg)))
-      (sort $ map fst specifiedFlags)
+      (sort $ map fst (PD.unFlagAssignment specifiedFlags)) -- TODO
 
     packageSatisfiesDependency
       (PackageIdentifier name  version)

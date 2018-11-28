@@ -7,10 +7,14 @@ Desugaring foreign declarations (see also DsCCall).
 -}
 
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE TypeFamilies #-}
 
 module DsForeign ( dsForeigns ) where
 
 #include "HsVersions.h"
+import GhcPrelude
+
 import TcRnMonad        -- temp
 
 import CoreSyn
@@ -70,14 +74,14 @@ is the same as
 so we reuse the desugaring code in @DsCCall@ to deal with these.
 -}
 
-type Binding = (Id, CoreExpr)   -- No rec/nonrec structure;
-                                -- the occurrence analyser will sort it all out
+type Binding = (Id, CoreExpr) -- No rec/nonrec structure;
+                              -- the occurrence analyser will sort it all out
 
-dsForeigns :: [LForeignDecl Id]
+dsForeigns :: [LForeignDecl GhcTc]
            -> DsM (ForeignStubs, OrdList Binding)
 dsForeigns fos = getHooked dsForeignsHook dsForeigns' >>= ($ fos)
 
-dsForeigns' :: [LForeignDecl Id]
+dsForeigns' :: [LForeignDecl GhcTc]
             -> DsM (ForeignStubs, OrdList Binding)
 dsForeigns' []
   = return (NoStubs, nilOL)

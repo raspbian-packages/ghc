@@ -22,6 +22,7 @@ import Control.Exception    ( bracket )
 import Control.Monad        ( liftM5 )
 import Foreign              ( Ptr, peekByteOff, allocaBytes, pokeByteOff
                             , plusPtr )
+import Foreign.C.Types      ( CUInt(..) )
 import System.Win32.File    ( closeHandle )
 import System.Win32.Types
 
@@ -80,6 +81,15 @@ getCurrentProcessId = c_GetCurrentProcessId
 
 getCurrentProcess :: IO ProcessHandle
 getCurrentProcess = c_GetCurrentProcess
+
+foreign import WINDOWS_CCONV unsafe "windows.h TerminateProcess"
+    c_TerminateProcess :: ProcessHandle -> CUInt -> IO Bool
+
+terminateProcessById :: ProcessId -> IO ()
+terminateProcessById p = bracket
+    (openProcess pROCESS_TERMINATE False p)
+    closeHandle
+    (\h -> failIfFalse_ "TerminateProcess" $ c_TerminateProcess h 1)
 
 type Th32SnapHandle = HANDLE
 type Th32SnapFlags = DWORD

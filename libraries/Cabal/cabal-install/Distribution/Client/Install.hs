@@ -32,8 +32,6 @@ module Distribution.Client.Install (
 import Prelude ()
 import Distribution.Client.Compat.Prelude
 
-import Data.List
-         ( (\\) )
 import qualified Data.Map as Map
 import qualified Data.Set as S
 import Control.Exception as Exception
@@ -72,7 +70,7 @@ import Distribution.Client.HttpUtils
 import Distribution.Solver.Types.PackageFixedDeps
 import qualified Distribution.Client.Haddock as Haddock (regenerateHaddockIndex)
 import Distribution.Client.IndexUtils as IndexUtils
-         ( getSourcePackagesAtIndexState, IndexState(..), getInstalledPackages )
+         ( getSourcePackagesAtIndexState, getInstalledPackages )
 import qualified Distribution.Client.InstallPlan as InstallPlan
 import qualified Distribution.Client.SolverInstallPlan as SolverInstallPlan
 import Distribution.Client.InstallPlan (InstallPlan)
@@ -125,7 +123,6 @@ import Distribution.Simple.PackageIndex (InstalledPackageIndex)
 import Distribution.Simple.Setup
          ( haddockCommand, HaddockFlags(..)
          , buildCommand, BuildFlags(..), emptyBuildFlags
-         , AllowNewer(..), AllowOlder(..), RelaxDeps(..)
          , toFlag, fromFlag, fromFlagOrDefault, flagToMaybe, defaultDistPref )
 import qualified Distribution.Simple.Setup as Cabal
          ( Flag(..)
@@ -150,7 +147,8 @@ import Distribution.Types.MungedPackageId
 import qualified Distribution.PackageDescription as PackageDescription
 import Distribution.PackageDescription
          ( PackageDescription, GenericPackageDescription(..), Flag(..)
-         , FlagAssignment, showFlagValue )
+         , FlagAssignment, mkFlagAssignment, unFlagAssignment
+         , showFlagValue, diffFlagAssignment, nullFlagAssignment )
 import Distribution.PackageDescription.Configuration
          ( finalizePD )
 import Distribution.ParseUtils
@@ -277,8 +275,7 @@ makeInstallContext verbosity
   (packageDBs, repoCtxt, comp, _, progdb,_,_,
    globalFlags, _, configExFlags, installFlags, _) mUserTargets = do
 
-    let idxState = fromFlagOrDefault IndexStateHead $
-                       installIndexState installFlags
+    let idxState = flagToMaybe (installIndexState installFlags)
 
     installedPkgIndex <- getInstalledPackages verbosity comp packageDBs progdb
     sourcePkgDb       <- getSourcePackagesAtIndexState verbosity repoCtxt idxState
@@ -340,7 +337,7 @@ processInstallPlan verbosity
 
     unless (dryRun || nothingToInstall) $ do
       buildOutcomes <- performInstallations verbosity
-                         args installedPkgIndex installPlan
+                       args installedPkgIndex installPlan
       postInstallActions verbosity args userTargets installPlan buildOutcomes
   where
     installPlan = InstallPlan.configureInstallPlan configFlags installPlan0
@@ -421,7 +418,7 @@ planPackages verbosity comp platform mSandboxPkgInfo solver
                      (PackagePropertyFlags flags)
             in LabeledPackageConstraint pc ConstraintSourceConfigFlagOrTarget
           | let flags = configConfigurationsFlags configFlags
-          , not (null flags)
+          , not (nullFlagAssignment flags)
           , pkgSpecifier <- pkgSpecifiers ]
 
       . addConstraints
@@ -459,10 +456,11 @@ planPackages verbosity comp platform mSandboxPkgInfo solver
     allowBootLibInstalls = fromFlag (installAllowBootLibInstalls installFlags)
     upgradeDeps      = fromFlag (installUpgradeDeps       installFlags)
     onlyDeps         = fromFlag (installOnlyDeps          installFlags)
-    allowOlder       = fromMaybe (AllowOlder RelaxDepsNone)
-                                 (configAllowOlder configFlags)
-    allowNewer       = fromMaybe (AllowNewer RelaxDepsNone)
-                                 (configAllowNewer configFlags)
+
+    allowOlder       = fromMaybe (AllowOlder mempty)
+                                 (configAllowOlder configExFlags)
+    allowNewer       = fromMaybe (AllowNewer mempty)
+                                 (configAllowNewer configExFlags)
 
 -- | Remove the provided targets from the install plan.
 pruneInstallPlan :: Package targetpkg
@@ -640,8 +638,7 @@ packageStatus installedPkgIndex cpkg =
         nub
       . sort
       . map mungedId
-      . catMaybes
-      . map (PackageIndex.lookupUnitId installedPkgIndex)
+      . mapMaybe (PackageIndex.lookupUnitId installedPkgIndex)
 
     changed (InBoth    pkgid pkgid') = pkgid /= pkgid'
     changed _                        = True
@@ -697,7 +694,7 @@ printPlan dryRun verbosity plan sourcePkgDb = case plan of
             x -> Just $ packageVersion $ last x
 
     toFlagAssignment :: [Flag] -> FlagAssignment
-    toFlagAssignment = map (\ f -> (flagName f, flagDefault f))
+    toFlagAssignment =  mkFlagAssignment . map (\ f -> (flagName f, flagDefault f))
 
     nonDefaultFlags :: ConfiguredPackage loc -> FlagAssignment
     nonDefaultFlags cpkg =
@@ -705,13 +702,13 @@ printPlan dryRun verbosity plan sourcePkgDb = case plan of
             toFlagAssignment
              (genPackageFlags (SourcePackage.packageDescription $
                                confPkgSource cpkg))
-      in  confPkgFlags cpkg \\ defaultAssignment
+      in  confPkgFlags cpkg `diffFlagAssignment` defaultAssignment
 
     showStanzas :: [OptionalStanza] -> String
     showStanzas = concatMap ((" *" ++) . showStanza)
 
     showFlagAssignment :: FlagAssignment -> String
-    showFlagAssignment = concatMap ((' ' :) . showFlagValue)
+    showFlagAssignment = concatMap ((' ' :) . showFlagValue) . unFlagAssignment
 
     change (OnlyInLeft pkgid)        = display pkgid ++ " removed"
     change (InBoth     pkgid pkgid') = display pkgid ++ " -> "
@@ -756,7 +753,7 @@ reportPlanningFailure verbosity
                        (compilerId comp) pkgids
                        (configConfigurationsFlags configFlags)
 
-    when (not (null buildReports)) $
+    unless (null buildReports) $
       info verbosity $
         "Solver failure will be reported for "
         ++ intercalate "," (map display pkgids)
@@ -824,10 +821,13 @@ postInstallActions verbosity
   ,globalFlags, configFlags, _, installFlags, _)
   targets installPlan buildOutcomes = do
 
+  updateSandboxTimestampsFile verbosity useSandbox mSandboxPkgInfo
+                              comp platform installPlan buildOutcomes
+
   unless oneShot $
     World.insert verbosity worldFile
       --FIXME: does not handle flags
-      [ World.WorldPkgInfo dep []
+      [ World.WorldPkgInfo dep mempty
       | UserTargetNamed dep <- targets ]
 
   let buildReports = BuildReports.fromInstallPlan platform (compilerId comp)
@@ -848,9 +848,6 @@ postInstallActions verbosity
                   installPlan buildOutcomes
 
   printBuildFailures verbosity buildOutcomes
-
-  updateSandboxTimestampsFile verbosity useSandbox mSandboxPkgInfo
-                              comp platform installPlan buildOutcomes
 
   where
     reportingLevel = fromFlag (installBuildReports installFlags)
@@ -1120,7 +1117,7 @@ performInstallations verbosity
         platform
         progdb
         distPref
-        (chooseCabalVersion configFlags (libVersion miscOptions))
+        (chooseCabalVersion configExFlags (libVersion miscOptions))
         (Just lock)
         parallelInstall
         index
@@ -1319,7 +1316,7 @@ installLocalTarballPackage verbosity pkgid
                     ++ " to " ++ tmpDirPath ++ "..."
       extractTarGzFile tmpDirPath relUnpackedPath tarballPath
       exists <- doesFileExist descFilePath
-      when (not exists) $
+      unless exists $
         die' verbosity $ "Package .cabal file not found: " ++ show descFilePath
       maybeRenameDistDir absUnpackedPath
       installPkg (Just absUnpackedPath)

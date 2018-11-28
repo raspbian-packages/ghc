@@ -11,8 +11,7 @@
  *
  * ---------------------------------------------------------------------------*/
 
-#ifndef SM_EVAC_H
-#define SM_EVAC_H
+#pragma once
 
 #include "BeginPrivate.h"
 
@@ -41,6 +40,3 @@ void evacuate_BLACKHOLE1(StgClosure **p);
 extern W_ thunk_selector_depth;
 
 #include "EndPrivate.h"
-
-#endif /* SM_EVAC_H */
-

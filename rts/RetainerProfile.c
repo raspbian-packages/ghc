@@ -7,10 +7,10 @@
  *
  * ---------------------------------------------------------------------------*/
 
-#ifdef PROFILING
+#if defined(PROFILING)
 
 // Turn off inlining when debugging - it obfuscates things
-#ifdef DEBUG
+#if defined(DEBUG)
 #define INLINE
 #else
 #define INLINE inline
@@ -32,6 +32,18 @@
 #include "Apply.h"
 #include "Stable.h" /* markStableTables */
 #include "sm/Storage.h" // for END_OF_STATIC_LIST
+
+/* Note [What is a retainer?]
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~
+The definition of what sorts of things are counted as retainers is a bit hard to
+pin down. Intuitively, we want to identify closures which will help the user
+identify memory leaks due to thunks. In practice we also end up lumping mutable
+objects in this group for reasons that have been lost to time.
+
+The definition of retainer is implemented in isRetainer(), defined later in this
+file.
+*/
+
 
 /*
   Note: what to change in order to plug-in a new retainer profiling scheme?
@@ -68,11 +80,11 @@ StgWord flip = 0;     // flip bit
 
 static void retainStack(StgClosure *, retainer, StgPtr, StgPtr);
 static void retainClosure(StgClosure *, StgClosure *, retainer);
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
 static void belongToHeap(StgPtr p);
 #endif
 
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
 /*
   cStackSize records how many times retainStack() has been invoked recursively,
   that is, the number of activation records for retainStack() on the C stack.
@@ -189,7 +201,7 @@ static stackElement *currentStackBoundary;
     retainer profiling, maxStackSize + maxCStackSize is some value no greater
     than the actual depth of the graph.
  */
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
 static int stackSize, maxStackSize;
 #endif
 
@@ -267,7 +279,7 @@ isEmptyRetainerStack( void )
 /* -----------------------------------------------------------------------------
  * Returns size of stack
  * -------------------------------------------------------------------------- */
-#ifdef DEBUG
+#if defined(DEBUG)
 W_
 retainerStackBlocks( void )
 {
@@ -414,7 +426,7 @@ find_srt( stackPos *info )
  *  push() pushes a stackElement representing the next child of *c
  *  onto the traverse stack. If *c has no child, *first_child is set
  *  to NULL and nothing is pushed onto the stack. If *c has only one
- *  child, *c_chlid is set to that child and nothing is pushed onto
+ *  child, *c_child is set to that child and nothing is pushed onto
  *  the stack.  If *c has more than two children, *first_child is set
  *  to the first child and a stackElement representing the second
  *  child is pushed onto the stack.
@@ -431,7 +443,7 @@ push( StgClosure *c, retainer c_child_r, StgClosure **first_child )
     stackElement se;
     bdescr *nbd;      // Next Block Descriptor
 
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
     // debugBelch("push(): stackTop = 0x%x, currentStackBoundary = 0x%x\n", stackTop, currentStackBoundary);
 #endif
 
@@ -626,7 +638,7 @@ push( StgClosure *c, retainer c_child_r, StgClosure **first_child )
     }
 
     if (stackTop - 1 < stackBottom) {
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
         // debugBelch("push() to the next stack.\n");
 #endif
         // currentStack->free is updated when the active stack is switched
@@ -658,7 +670,7 @@ push( StgClosure *c, retainer c_child_r, StgClosure **first_child )
     // field. Is this really harmless? Can we avoid the warning?
     *stackTop = se;
 
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
     stackSize++;
     if (stackSize > maxStackSize) maxStackSize = stackSize;
     // ASSERT(stackSize >= 0);
@@ -684,7 +696,7 @@ popOffReal(void)
 {
     bdescr *pbd;    // Previous Block Descriptor
 
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
     // debugBelch("pop() to the previous stack.\n");
 #endif
 
@@ -695,7 +707,7 @@ popOffReal(void)
         // The stack is completely empty.
         stackTop++;
         ASSERT(stackTop == stackLimit);
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
         stackSize--;
         if (stackSize > maxStackSize) maxStackSize = stackSize;
         /*
@@ -716,7 +728,7 @@ popOffReal(void)
 
     returnToOldStack(pbd);
 
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
     stackSize--;
     if (stackSize > maxStackSize) maxStackSize = stackSize;
     /*
@@ -728,7 +740,7 @@ popOffReal(void)
 
 static INLINE void
 popOff(void) {
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
     // debugBelch("\tpopOff(): stackTop = 0x%x, currentStackBoundary = 0x%x\n", stackTop, currentStackBoundary);
 #endif
 
@@ -738,7 +750,7 @@ popOff(void) {
     // <= (instead of <) is wrong!
     if (stackTop + 1 < stackLimit) {
         stackTop++;
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
         stackSize--;
         if (stackSize > maxStackSize) maxStackSize = stackSize;
         /*
@@ -773,7 +785,7 @@ pop( StgClosure **c, StgClosure **cp, retainer *r )
 {
     stackElement *se;
 
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
     // debugBelch("pop(): stackTop = 0x%x, currentStackBoundary = 0x%x\n", stackTop, currentStackBoundary);
 #endif
 
@@ -972,7 +984,7 @@ initRetainerProfiling( void )
 void
 endRetainerProfiling( void )
 {
-#ifdef SECOND_APPROACH
+#if defined(SECOND_APPROACH)
     outputAllRetainerSet(prof_file);
 #endif
 }
@@ -1022,6 +1034,9 @@ isRetainer( StgClosure *c )
     case MUT_VAR_DIRTY:
     case MUT_ARR_PTRS_CLEAN:
     case MUT_ARR_PTRS_DIRTY:
+    case SMALL_MUT_ARR_PTRS_CLEAN:
+    case SMALL_MUT_ARR_PTRS_DIRTY:
+    case BLOCKING_QUEUE:
 
         // thunks are retainers.
     case THUNK:
@@ -1069,17 +1084,21 @@ isRetainer( StgClosure *c )
     // closures. See trac #3956 for a program that hit this error.
     case IND_STATIC:
     case BLACKHOLE:
+    case WHITEHOLE:
         // static objects
     case FUN_STATIC:
         // misc
     case PRIM:
     case BCO:
     case ARR_WORDS:
+    case COMPACT_NFDATA:
         // STM
     case TREC_CHUNK:
         // immutable arrays
     case MUT_ARR_PTRS_FROZEN:
     case MUT_ARR_PTRS_FROZEN0:
+    case SMALL_MUT_ARR_PTRS_FROZEN:
+    case SMALL_MUT_ARR_PTRS_FROZEN0:
         return false;
 
         //
@@ -1089,11 +1108,15 @@ isRetainer( StgClosure *c )
         // legal objects during retainer profiling.
     case UPDATE_FRAME:
     case CATCH_FRAME:
+    case CATCH_RETRY_FRAME:
+    case CATCH_STM_FRAME:
     case UNDERFLOW_FRAME:
+    case ATOMICALLY_FRAME:
     case STOP_FRAME:
     case RET_BCO:
     case RET_SMALL:
     case RET_BIG:
+    case RET_FUN:
         // other cases
     case IND:
     case INVALID_OBJECT:
@@ -1283,7 +1306,7 @@ retainStack( StgClosure *c, retainer c_child_r,
     StgWord bitmap;
     uint32_t size;
 
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
     cStackSize++;
     if (cStackSize > maxCStackSize) maxCStackSize = cStackSize;
 #endif
@@ -1297,7 +1320,7 @@ retainStack( StgClosure *c, retainer c_child_r,
     oldStackBoundary = currentStackBoundary;
     currentStackBoundary = stackTop;
 
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
     // debugBelch("retainStack() called: oldStackBoundary = 0x%x, currentStackBoundary = 0x%x\n", oldStackBoundary, currentStackBoundary);
 #endif
 
@@ -1390,11 +1413,11 @@ retainStack( StgClosure *c, retainer c_child_r,
 
     // restore currentStackBoundary
     currentStackBoundary = oldStackBoundary;
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
     // debugBelch("retainStack() finished: currentStackBoundary = 0x%x\n", currentStackBoundary);
 #endif
 
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
     cStackSize--;
 #endif
 }
@@ -1473,11 +1496,11 @@ retainClosure( StgClosure *c0, StgClosure *cp0, retainer r0 )
     retainer r, c_child_r;
     StgWord typeOfc;
 
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
     // StgPtr oldStackTop;
 #endif
 
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
     // oldStackTop = stackTop;
     // debugBelch("retainClosure() called: c0 = 0x%x, cp0 = 0x%x, r0 = 0x%x\n", c0, cp0, r0);
 #endif
@@ -1494,7 +1517,7 @@ loop:
     pop(&c, &cp, &r);
 
     if (c == NULL) {
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
         // debugBelch("retainClosure() ends: oldStackTop = 0x%x, stackTop = 0x%x\n", oldStackTop, stackTop);
 #endif
         return;
@@ -1519,7 +1542,7 @@ inner_loop:
 
     typeOfc = get_itbl(c)->type;
 
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
     switch (typeOfc) {
     case IND_STATIC:
     case CONSTR_NOCAF:
@@ -1540,7 +1563,7 @@ inner_loop:
     case TSO:
         if (((StgTSO *)c)->what_next == ThreadComplete ||
             ((StgTSO *)c)->what_next == ThreadKilled) {
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
             debugBelch("ThreadComplete or ThreadKilled encountered in retainClosure()\n");
 #endif
             goto loop;
@@ -1683,6 +1706,15 @@ inner_loop:
         goto loop;
     }
 
+    case BLOCKING_QUEUE:
+    {
+        StgBlockingQueue *bq = (StgBlockingQueue *)c;
+        retainClosure((StgClosure*) bq->link,           c, c_child_r);
+        retainClosure((StgClosure*) bq->bh,             c, c_child_r);
+        retainClosure((StgClosure*) bq->owner,          c, c_child_r);
+        goto loop;
+    }
+
     case PAP:
     {
         StgPAP *pap = (StgPAP *)c;
@@ -1755,11 +1787,11 @@ static void
 computeRetainerSet( void )
 {
     StgWeak *weak;
-    RetainerSet *rtl;
     uint32_t g, n;
     StgPtr ml;
     bdescr *bd;
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
+    RetainerSet *rtl;
     RetainerSet tmpRetainerSet;
 #endif
 
@@ -1801,9 +1833,9 @@ computeRetainerSet( void )
             for (ml = bd->start; ml < bd->free; ml++) {
 
                 maybeInitRetainerSet((StgClosure *)*ml);
-                rtl = retainerSetOf((StgClosure *)*ml);
 
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
+                rtl = retainerSetOf((StgClosure *)*ml);
                 if (rtl == NULL) {
                     // first visit to *ml
                     // This is a violation of the interface rule!
@@ -1860,18 +1892,18 @@ computeRetainerSet( void )
 void
 resetStaticObjectForRetainerProfiling( StgClosure *static_objects )
 {
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
     uint32_t count;
 #endif
     StgClosure *p;
 
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
     count = 0;
 #endif
     p = static_objects;
     while (p != END_OF_STATIC_OBJECT_LIST) {
         p = UNTAG_STATIC_LIST_PTR(p);
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
         count++;
 #endif
         switch (get_itbl(p)->type) {
@@ -1903,7 +1935,7 @@ resetStaticObjectForRetainerProfiling( StgClosure *static_objects )
             break;
         }
     }
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
     // debugBelch("count in scavenged_static_objects = %d\n", count);
 #endif
 }
@@ -1920,19 +1952,19 @@ resetStaticObjectForRetainerProfiling( StgClosure *static_objects )
 void
 retainerProfile(void)
 {
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
   uint32_t i;
   uint32_t totalHeapSize;   // total raw heap size (computed by linear scanning)
 #endif
 
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
   debugBelch(" < retainerProfile() invoked : %d>\n", retainerGeneration);
 #endif
 
   stat_startRP();
 
   // We haven't flipped the bit yet.
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
   debugBelch("Before traversing:\n");
   sumOfCostLinear = 0;
   for (i = 0;i < N_CLOSURE_TYPES; i++)
@@ -1962,7 +1994,7 @@ retainerProfile(void)
   // Now we flips flip.
   flip = flip ^ 1;
 
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
   stackSize = 0;
   maxStackSize = 0;
   cStackSize = 0;
@@ -1971,7 +2003,7 @@ retainerProfile(void)
   numObjectVisited = 0;
   timesAnyObjectVisited = 0;
 
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
   debugBelch("During traversing:\n");
   sumOfNewCost = 0;
   sumOfNewCostExtra = 0;
@@ -1986,14 +2018,14 @@ retainerProfile(void)
     retainer sets.
    */
   initializeTraverseStack();
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
   initializeAllRetainerSet();
 #else
   refreshAllRetainerSet();
 #endif
   computeRetainerSet();
 
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
   debugBelch("After traversing:\n");
   sumOfCostLinear = 0;
   for (i = 0;i < N_CLOSURE_TYPES; i++)
@@ -2034,7 +2066,7 @@ retainerProfile(void)
 
   // post-processing
   closeTraverseStack();
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
   closeAllRetainerSet();
 #else
   // Note that there is no post-processing for the retainer sets.
@@ -2043,7 +2075,7 @@ retainerProfile(void)
 
   stat_endRP(
     retainerGeneration - 1,   // retainerGeneration has just been incremented!
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
     maxCStackSize, maxStackSize,
 #endif
     (double)timesAnyObjectVisited / numObjectVisited);
@@ -2053,7 +2085,7 @@ retainerProfile(void)
  * DEBUGGING CODE
  * -------------------------------------------------------------------------- */
 
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
 
 #define LOOKS_LIKE_PTR(r) ((LOOKS_LIKE_STATIC_CLOSURE(r) || \
         ((HEAP_ALLOCED(r) && ((Bdescr((P_)r)->flags & BF_FREE) == 0)))) && \

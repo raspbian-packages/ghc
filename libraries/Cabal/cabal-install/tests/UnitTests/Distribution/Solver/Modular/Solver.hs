@@ -21,7 +21,7 @@ import Language.Haskell.Extension ( Extension(..)
 import Distribution.Solver.Types.Flag
 import Distribution.Solver.Types.OptionalStanza
 import Distribution.Solver.Types.PackageConstraint
-import Distribution.Solver.Types.PackagePath
+import qualified Distribution.Solver.Types.PackagePath as P
 import UnitTests.Distribution.Solver.Modular.DSL
 import UnitTests.Distribution.Solver.Modular.DSL.TestCaseUtils
 
@@ -51,12 +51,17 @@ tests = [
         , runTest $ indep $ mkTest db4 "linkFlags2"   ["C", "D"] anySolverFailure
         , runTest $ indep $ mkTest db18 "linkFlags3"  ["A", "B"] (solverSuccess [("A", 1), ("B", 1), ("C", 1), ("D", 1), ("D", 2), ("F", 1)])
         ]
+    , testGroup "Lifting dependencies out of conditionals" [
+          runTest $ commonDependencyLogMessage "common dependency log message"
+        , runTest $ twoLevelDeepCommonDependencyLogMessage "two level deep common dependency log message"
+        , runTest $ testBackjumpingWithCommonDependency "backjumping with common dependency"
+        ]
     , testGroup "Manual flags" [
           runTest $ mkTest dbManualFlags "Use default value for manual flag" ["pkg"] $
           solverSuccess [("pkg", 1), ("true-dep", 1)]
 
         , let checkFullLog =
-                  any $ isInfixOf "rejecting: pkg-1.0.0:-flag (manual flag can only be changed explicitly)"
+                  any $ isInfixOf "rejecting: pkg:-flag (manual flag can only be changed explicitly)"
           in runTest $ constraints [ExVersionConstraint (ScopeAnyQualifier "true-dep") V.noVersion] $
              mkTest dbManualFlags "Don't toggle manual flag to avoid conflict" ["pkg"] $
              -- TODO: We should check the summarized log instead of the full log
@@ -71,39 +76,39 @@ tests = [
         ]
     , testGroup "Qualified manual flag constraints" [
           let name = "Top-level flag constraint does not constrain setup dep's flag"
-              cs = [ExFlagConstraint (ScopeQualified QualToplevel "B") "flag" False]
+              cs = [ExFlagConstraint (ScopeQualified P.QualToplevel "B") "flag" False]
           in runTest $ constraints cs $ mkTest dbSetupDepWithManualFlag name ["A"] $
              solverSuccess [ ("A", 1), ("B", 1), ("B", 2)
                            , ("b-1-false-dep", 1), ("b-2-true-dep", 1) ]
 
         , let name = "Solver can toggle setup dep's flag to match top-level constraint"
-              cs = [ ExFlagConstraint (ScopeQualified QualToplevel "B") "flag" False
+              cs = [ ExFlagConstraint (ScopeQualified P.QualToplevel "B") "flag" False
                    , ExVersionConstraint (ScopeAnyQualifier "b-2-true-dep") V.noVersion ]
           in runTest $ constraints cs $ mkTest dbSetupDepWithManualFlag name ["A"] $
              solverSuccess [ ("A", 1), ("B", 1), ("B", 2)
                            , ("b-1-false-dep", 1), ("b-2-false-dep", 1) ]
 
         , let name = "User can constrain flags separately with qualified constraints"
-              cs = [ ExFlagConstraint (ScopeQualified QualToplevel    "B") "flag" True
-                   , ExFlagConstraint (ScopeQualified (QualSetup "A") "B") "flag" False ]
+              cs = [ ExFlagConstraint (ScopeQualified P.QualToplevel    "B") "flag" True
+                   , ExFlagConstraint (ScopeQualified (P.QualSetup "A") "B") "flag" False ]
           in runTest $ constraints cs $ mkTest dbSetupDepWithManualFlag name ["A"] $
              solverSuccess [ ("A", 1), ("B", 1), ("B", 2)
                            , ("b-1-true-dep", 1), ("b-2-false-dep", 1) ]
 
           -- Regression test for #4299
         , let name = "Solver can link deps when only one has constrained manual flag"
-              cs = [ExFlagConstraint (ScopeQualified QualToplevel "B") "flag" False]
+              cs = [ExFlagConstraint (ScopeQualified P.QualToplevel "B") "flag" False]
           in runTest $ constraints cs $ mkTest dbLinkedSetupDepWithManualFlag name ["A"] $
              solverSuccess [ ("A", 1), ("B", 1), ("b-1-false-dep", 1) ]
 
         , let name = "Solver cannot link deps that have conflicting manual flag constraints"
-              cs = [ ExFlagConstraint (ScopeQualified QualToplevel    "B") "flag" True
-                   , ExFlagConstraint (ScopeQualified (QualSetup "A") "B") "flag" False ]
+              cs = [ ExFlagConstraint (ScopeQualified P.QualToplevel    "B") "flag" True
+                   , ExFlagConstraint (ScopeQualified (P.QualSetup "A") "B") "flag" False ]
               failureReason = "(constraint from unknown source requires opposite flag selection)"
               checkFullLog lns =
                   all (\msg -> any (msg `isInfixOf`) lns)
-                  [ "rejecting: B-1.0.0:-flag "         ++ failureReason
-                  , "rejecting: A:setup.B-1.0.0:+flag " ++ failureReason ]
+                  [ "rejecting: B:-flag "         ++ failureReason
+                  , "rejecting: A:setup.B:+flag " ++ failureReason ]
           in runTest $ constraints cs $
              mkTest dbLinkedSetupDepWithManualFlag name ["A"] $
              SolverResult checkFullLog (Left $ const True)
@@ -118,6 +123,7 @@ tests = [
         , runTest $ indep $ enableAllTests $ mkTest db5 "simpleTest7" ["E", "G"] (solverSuccess [("A", 1), ("A", 2), ("E", 1), ("G", 1)])
         , runTest $         enableAllTests $ mkTest db6 "depsWithTests1" ["C"]      (solverSuccess [("A", 1), ("B", 1), ("C", 1)])
         , runTest $ indep $ enableAllTests $ mkTest db6 "depsWithTests2" ["C", "D"] (solverSuccess [("A", 1), ("B", 1), ("C", 1), ("D", 1)])
+        , runTest $ testTestSuiteWithFlag "test suite with flag"
         ]
     , testGroup "Setup dependencies" [
           runTest $         mkTest db7  "setupDeps1" ["B"] (solverSuccess [("A", 2), ("B", 1)])
@@ -153,6 +159,7 @@ tests = [
         , runTest $ mkTest db15 "cycleThroughSetupDep3" ["C"]      (solverSuccess [("C", 2), ("D", 1)])
         , runTest $ mkTest db15 "cycleThroughSetupDep4" ["D"]      (solverSuccess [("D", 1)])
         , runTest $ mkTest db15 "cycleThroughSetupDep5" ["E"]      (solverSuccess [("C", 2), ("D", 1), ("E", 1)])
+        , runTest $ issue4161 "detect cycle between package and its setup script"
         , runTest $ testCyclicDependencyErrorMessages "cyclic dependency error messages"
         ]
     , testGroup "Extensions" [
@@ -179,8 +186,8 @@ tests = [
              mkTest dbConstraints "force older versions with unqualified constraint" ["A", "B", "C"] $
              solverSuccess [("A", 1), ("B", 2), ("C", 3), ("D", 1), ("D", 2), ("D", 3)]
 
-        , let cs = [ ExVersionConstraint (ScopeQualified QualToplevel    "D") $ mkVersionRange 1 4
-                   , ExVersionConstraint (ScopeQualified (QualSetup "B") "D") $ mkVersionRange 4 7
+        , let cs = [ ExVersionConstraint (ScopeQualified P.QualToplevel    "D") $ mkVersionRange 1 4
+                   , ExVersionConstraint (ScopeQualified (P.QualSetup "B") "D") $ mkVersionRange 4 7
                    ]
           in runTest $ constraints cs $
              mkTest dbConstraints "force multiple versions with qualified constraints" ["A", "B", "C"] $
@@ -215,6 +222,8 @@ tests = [
         , runTest $ preferences [ExStanzaPref "pkg" [TestStanzas]] $
           mkTest dbStanzaPreferences2 "disable testing when it's not possible" ["pkg"] $
           solverSuccess [("pkg", 1)]
+
+        , testStanzaPreference "test stanza preference"
         ]
      , testGroup "Buildable Field" [
           testBuildable "avoid building component with unknown dependency" (ExAny "unknown")
@@ -252,14 +261,73 @@ tests = [
         , runTest $         mkTest dbBJ7  "bj7"  ["A"]      (solverSuccess [("A", 1), ("B",  1), ("C", 1)])
         , runTest $ indep $ mkTest dbBJ8  "bj8"  ["A", "B"] (solverSuccess [("A", 1), ("B",  1), ("C", 1)])
         ]
-    -- Build-tools dependencies
-    , testGroup "build-tools" [
-          runTest $ mkTest dbBuildTools1 "bt1" ["A"] (solverSuccess [("A", 1), ("alex", 1)])
-        , runTest $ mkTest dbBuildTools2 "bt2" ["A"] (solverSuccess [("A", 1)])
-        , runTest $ mkTest dbBuildTools3 "bt3" ["C"] (solverSuccess [("A", 1), ("B", 1), ("C", 1), ("alex", 1), ("alex", 2)])
-        , runTest $ mkTest dbBuildTools4 "bt4" ["B"] (solverSuccess [("A", 1), ("A", 2), ("B", 1), ("alex", 1)])
-        , runTest $ mkTest dbBuildTools5 "bt5" ["A"] (solverSuccess [("A", 1), ("alex", 1), ("happy", 1)])
-        , runTest $ mkTest dbBuildTools6 "bt6" ["B"] (solverSuccess [("A", 2), ("B", 2), ("warp", 1)])
+    -- build-tool-depends dependencies
+    , testGroup "build-tool-depends" [
+          runTest $ mkTest dbBuildTools "simple exe dependency" ["A"] (solverSuccess [("A", 1), ("bt-pkg", 2)])
+
+        , runTest $ disableSolveExecutables $
+          mkTest dbBuildTools "don't install build tool packages in legacy mode" ["A"] (solverSuccess [("A", 1)])
+
+        , runTest $ mkTest dbBuildTools "flagged exe dependency" ["B"] (solverSuccess [("B", 1), ("bt-pkg", 2)])
+
+        , runTest $ enableAllTests $
+          mkTest dbBuildTools "test suite exe dependency" ["C"] (solverSuccess [("C", 1), ("bt-pkg", 2)])
+
+        , runTest $ mkTest dbBuildTools "unknown exe" ["D"] $
+          solverFailure (isInfixOf "does not contain executable unknown-exe, which is required by D")
+
+        , runTest $ disableSolveExecutables $
+          mkTest dbBuildTools "don't check for build tool executables in legacy mode" ["D"] $ solverSuccess [("D", 1)]
+
+        , runTest $ mkTest dbBuildTools "unknown build tools package error mentions package, not exe" ["E"] $
+          solverFailure (isInfixOf "unknown package: E:unknown-pkg:exe.unknown-pkg (dependency of E)")
+
+        , runTest $ mkTest dbBuildTools "unknown flagged exe" ["F"] $
+          solverFailure (isInfixOf "does not contain executable unknown-exe, which is required by F +flagF")
+
+        , runTest $ enableAllTests $ mkTest dbBuildTools "unknown test suite exe" ["G"] $
+          solverFailure (isInfixOf "does not contain executable unknown-exe, which is required by G *test")
+
+        , runTest $ mkTest dbBuildTools "wrong exe for build tool package version" ["H"] $
+          solverFailure $ isInfixOf $
+              -- The solver reports the version conflict when a version conflict
+              -- and an executable conflict apply to the same package version.
+              "[__1] rejecting: H:bt-pkg:exe.bt-pkg-4.0.0 (conflict: H => H:bt-pkg:exe.bt-pkg (exe exe1)==3.0.0)\n"
+           ++ "[__1] rejecting: H:bt-pkg:exe.bt-pkg-3.0.0 (does not contain executable exe1, which is required by H)\n"
+           ++ "[__1] rejecting: H:bt-pkg:exe.bt-pkg-2.0.0, H:bt-pkg:exe.bt-pkg-1.0.0 (conflict: H => H:bt-pkg:exe.bt-pkg (exe exe1)==3.0.0)"
+
+        , runTest $ chooseExeAfterBuildToolsPackage True "choose exe after choosing its package - success"
+
+        , runTest $ chooseExeAfterBuildToolsPackage False "choose exe after choosing its package - failure"
+
+        , runTest $ rejectInstalledBuildToolPackage "reject installed package for build-tool dependency"
+
+        , runTest $ requireConsistentBuildToolVersions "build tool versions must be consistent within one package"
+    ]
+    -- build-tools dependencies
+    , testGroup "legacy build-tools" [
+          runTest $ mkTest dbLegacyBuildTools1 "bt1" ["A"] (solverSuccess [("A", 1), ("alex", 1)])
+
+        , runTest $ disableSolveExecutables $
+          mkTest dbLegacyBuildTools1 "bt1 - don't install build tool packages in legacy mode" ["A"] (solverSuccess [("A", 1)])
+
+        , runTest $ mkTest dbLegacyBuildTools2 "bt2" ["A"] $
+          solverFailure (isInfixOf "does not contain executable alex, which is required by A")
+
+        , runTest $ disableSolveExecutables $
+          mkTest dbLegacyBuildTools2 "bt2 - don't check for build tool executables in legacy mode" ["A"] (solverSuccess [("A", 1)])
+
+        , runTest $ mkTest dbLegacyBuildTools3 "bt3" ["A"] (solverSuccess [("A", 1)])
+
+        , runTest $ mkTest dbLegacyBuildTools4 "bt4" ["C"] (solverSuccess [("A", 1), ("B", 1), ("C", 1), ("alex", 1), ("alex", 2)])
+
+        , runTest $ mkTest dbLegacyBuildTools5 "bt5" ["B"] (solverSuccess [("A", 1), ("A", 2), ("B", 1), ("alex", 1)])
+
+        , runTest $ mkTest dbLegacyBuildTools6 "bt6" ["A"] (solverSuccess [("A", 1), ("alex", 1), ("happy", 1)])
+        ]
+      -- internal dependencies
+    , testGroup "internal dependencies" [
+          runTest $ mkTest dbIssue3775 "issue #3775" ["B"] (solverSuccess [("A", 2), ("B", 2), ("warp", 1)])
         ]
       -- Tests for the contents of the solver's log
     , testGroup "Solver log" [
@@ -278,6 +346,25 @@ tests = [
                      ++ "these were the goals I've had most trouble fulfilling: A, B"
               in mkTest db "exhaustive search failure message" ["A"] $
                  solverFailure (isInfixOf msg)
+        , testSummarizedLog "show conflicts from final conflict set after exhaustive search" Nothing $
+                "Could not resolve dependencies:\n"
+             ++ "[__0] trying: A-1.0.0 (user goal)\n"
+             ++ "[__1] unknown package: D (dependency of A)\n"
+             ++ "[__1] fail (backjumping, conflict set: A, D)\n"
+             ++ "After searching the rest of the dependency tree exhaustively, "
+             ++ "these were the goals I've had most trouble fulfilling: A, D"
+        , testSummarizedLog "show first conflicts after inexhaustive search" (Just 2) $
+                "Could not resolve dependencies:\n"
+             ++ "[__0] trying: A-1.0.0 (user goal)\n"
+             ++ "[__1] trying: B-3.0.0 (dependency of A)\n"
+             ++ "[__2] next goal: C (dependency of B)\n"
+             ++ "[__2] rejecting: C-1.0.0 (conflict: B => C==3.0.0)\n"
+             ++ "Backjump limit reached (currently 2, change with --max-backjumps "
+             ++ "or try to run with --reorder-goals).\n"
+        , testSummarizedLog "don't show summarized log when backjump limit is too low" (Just 1) $
+                "Backjump limit reached (currently 1, change with --max-backjumps "
+             ++ "or try to run with --reorder-goals).\n"
+             ++ "Failed to generate a summarized dependency solver log due to low backjump limit."
         ]
     ]
   where
@@ -456,6 +543,35 @@ db6 = [
   , Right $ exAv "D" 1 [ExAny "B"]
   ]
 
+-- | This test checks that the solver can backjump to disable a flag, even if
+-- the problematic dependency is also under a test suite. (issue #4390)
+--
+-- The goal order forces the solver to choose the flag before enabling testing.
+-- Previously, the solver couldn't handle this case, because it only tried to
+-- disable testing, and when that failed, it backjumped past the flag choice.
+-- The solver should also try to set the flag to false, because that avoids the
+-- dependency on B.
+testTestSuiteWithFlag :: String -> SolverTest
+testTestSuiteWithFlag name =
+    goalOrder goals $ enableAllTests $ mkTest db name ["A", "B"] $
+    solverSuccess [("A", 1), ("B", 1)]
+  where
+    db :: ExampleDb
+    db = [
+        Right $ exAv "A" 1 []
+          `withTest`
+            ExTest "test" [exFlagged "flag" [ExFix "B" 2] []]
+      , Right $ exAv "B" 1 []
+      ]
+
+    goals :: [ExampleVar]
+    goals = [
+        P QualNone "B"
+      , P QualNone "A"
+      , F QualNone "A" "flag"
+      , S QualNone "A" TestStanzas
+      ]
+
 -- Packages with setup dependencies
 --
 -- Install..
@@ -624,6 +740,32 @@ dbStanzaPreferences2 = [
     Right $ exAv "pkg" 1 [] `withTest` ExTest "test" [ExAny "unknown"]
   ]
 
+-- | This is a test case for a bug in stanza preferences (#3930). The solver
+-- should be able to install 'A' by enabling 'flag' and disabling testing. When
+-- it tries goals in the specified order and prefers testing, it encounters
+-- 'unknown-pkg2'. 'unknown-pkg2' is only introduced by testing and 'flag', so
+-- the conflict set should contain both of those variables. Before the fix, it
+-- only contained 'flag'. The solver backjumped past the choice to disable
+-- testing and failed to find the solution.
+testStanzaPreference :: String -> TestTree
+testStanzaPreference name =
+  let pkg = exAv "A" 1    [exFlagged "flag"
+                              []
+                              [ExAny "unknown-pkg1"]]
+             `withTest`
+            ExTest "test" [exFlagged "flag"
+                              [ExAny "unknown-pkg2"]
+                              []]
+      goals = [
+          P QualNone "A"
+        , F QualNone "A" "flag"
+        , S QualNone "A" TestStanzas
+        ]
+  in runTest $ goalOrder goals $
+     preferences [ ExStanzaPref "A" [TestStanzas]] $
+     mkTest [Right pkg] name ["A"] $
+     solverSuccess [("A", 1)]
+
 -- | Database with some cycles
 --
 -- * Simplest non-trivial cycle: A -> B and B -> A
@@ -661,6 +803,30 @@ db15 = [
   , Right $ exAv   "E" 1            [ExFix "C" 2]
   ]
 
+-- | Detect a cycle between a package and its setup script.
+--
+-- This type of cycle can easily occur when new-build adds default setup
+-- dependencies to packages without custom-setup stanzas. For example, cabal
+-- adds 'time' as a setup dependency for 'time'. The solver should detect the
+-- cycle when it attempts to link the setup and non-setup instances of the
+-- package and then choose a different version for the setup dependency.
+issue4161 :: String -> SolverTest
+issue4161 name =
+    mkTest db name ["target"] $
+    SolverResult checkFullLog $ Right [("target", 1), ("time", 1), ("time", 2)]
+  where
+    db :: ExampleDb
+    db = [
+        Right $ exAv "target" 1 [ExFix "time" 2]
+      , Right $ exAv "time"   2 []               `withSetupDeps` [ExAny "time"]
+      , Right $ exAv "time"   1 []
+      ]
+
+    checkFullLog :: [String] -> Bool
+    checkFullLog = any $ isInfixOf $
+        "rejecting: time:setup.time~>time-2.0.0 (cyclic dependencies; "
+                ++ "conflict set: time:setup.time)"
+
 -- | Packages pkg-A, pkg-B, and pkg-C form a cycle. The solver should backtrack
 -- as soon as it chooses the last package in the cycle, to avoid searching parts
 -- of the tree that have no solution. Since there is no way to break the cycle,
@@ -692,7 +858,7 @@ testCyclicDependencyErrorMessages name =
 
     -- Solve for pkg-D and pkg-E last.
     goals :: [ExampleVar]
-    goals = [P None ("pkg-" ++ [c]) | c <- ['A'..'E']]
+    goals = [P QualNone ("pkg-" ++ [c]) | c <- ['A'..'E']]
 
 -- | Check that the solver can backtrack after encountering the SIR (issue #2843)
 --
@@ -752,14 +918,14 @@ testIndepGoals2 name =
 
     goals :: [ExampleVar]
     goals = [
-        P (Indep 0) "A"
-      , P (Indep 0) "C"
-      , P (Indep 0) "D"
-      , P (Indep 1) "B"
-      , P (Indep 1) "C"
-      , P (Indep 1) "D"
-      , S (Indep 1) "B" TestStanzas
-      , S (Indep 0) "A" TestStanzas
+        P (QualIndep "A") "A"
+      , P (QualIndep "A") "C"
+      , P (QualIndep "A") "D"
+      , P (QualIndep "B") "B"
+      , P (QualIndep "B") "C"
+      , P (QualIndep "B") "D"
+      , S (QualIndep "B") "B" TestStanzas
+      , S (QualIndep "A") "A" TestStanzas
       ]
 
 -- | Issue #2834
@@ -793,6 +959,61 @@ db18 = [
   , Right $ exAv "F" 1 []
   , Right $ exAv "G" 1 []
   ]
+
+-- | When both values for flagA introduce package B, the solver should be able
+-- to choose B before choosing a value for flagA. It should try to choose a
+-- version for B that is in the union of the version ranges required by +flagA
+-- and -flagA.
+commonDependencyLogMessage :: String -> SolverTest
+commonDependencyLogMessage name =
+    mkTest db name ["A"] $ solverFailure $ isInfixOf $
+        "[__0] trying: A-1.0.0 (user goal)\n"
+     ++ "[__1] next goal: B (dependency of A +/-flagA)\n"
+     ++ "[__1] rejecting: B-2.0.0 (conflict: A +/-flagA => B==1.0.0 || ==3.0.0)"
+  where
+    db :: ExampleDb
+    db = [
+        Right $ exAv "A" 1 [exFlagged "flagA"
+                               [ExFix "B" 1]
+                               [ExFix "B" 3]]
+      , Right $ exAv "B" 2 []
+      ]
+
+-- | Test lifting dependencies out of multiple levels of conditionals.
+twoLevelDeepCommonDependencyLogMessage :: String -> SolverTest
+twoLevelDeepCommonDependencyLogMessage name =
+    mkTest db name ["A"] $ solverFailure $ isInfixOf $
+        "unknown package: B (dependency of A +/-flagA +/-flagB)"
+  where
+    db :: ExampleDb
+    db = [
+        Right $ exAv "A" 1 [exFlagged "flagA"
+                               [exFlagged "flagB"
+                                   [ExAny "B"]
+                                   [ExAny "B"]]
+                               [exFlagged "flagB"
+                                   [ExAny "B"]
+                                   [ExAny "B"]]]
+      ]
+
+-- | Test handling nested conditionals that are controlled by the same flag.
+-- The solver should treat flagA as introducing 'unknown' with value true, not
+-- both true and false. That means that when +flagA causes a conflict, the
+-- solver should try flipping flagA to false to resolve the conflict, rather
+-- than backjumping past flagA.
+testBackjumpingWithCommonDependency :: String -> SolverTest
+testBackjumpingWithCommonDependency name =
+    mkTest db name ["A"] $ solverSuccess [("A", 1), ("B", 1)]
+  where
+    db :: ExampleDb
+    db = [
+        Right $ exAv "A" 1 [exFlagged "flagA"
+                               [exFlagged "flagA"
+                                   [ExAny "unknown"]
+                                   [ExAny "unknown"]]
+                               [ExAny "B"]]
+      , Right $ exAv "B" 1 []
+      ]
 
 -- | Tricky test case with independent goals (issue #2842)
 --
@@ -836,16 +1057,16 @@ testIndepGoals3 name =
 
     goals :: [ExampleVar]
     goals = [
-        P (Indep 0) "D"
-      , P (Indep 0) "C"
-      , P (Indep 0) "A"
-      , P (Indep 1) "E"
-      , P (Indep 1) "C"
-      , P (Indep 1) "B"
-      , P (Indep 2) "F"
-      , P (Indep 2) "B"
-      , P (Indep 2) "C"
-      , P (Indep 2) "A"
+        P (QualIndep "D") "D"
+      , P (QualIndep "D") "C"
+      , P (QualIndep "D") "A"
+      , P (QualIndep "E") "E"
+      , P (QualIndep "E") "C"
+      , P (QualIndep "E") "B"
+      , P (QualIndep "F") "F"
+      , P (QualIndep "F") "B"
+      , P (QualIndep "F") "C"
+      , P (QualIndep "F") "A"
       ]
 
 -- | This test checks that the solver correctly backjumps when dependencies
@@ -878,15 +1099,15 @@ testIndepGoals4 name =
 
     goals :: [ExampleVar]
     goals = [
-        P (Indep 0) "A"
-      , P (Indep 0) "E"
-      , P (Indep 1) "B"
-      , P (Indep 1) "D"
-      , P (Indep 1) "E"
-      , P (Indep 2) "C"
-      , P (Indep 2) "D"
-      , P (Indep 2) "E"
-      , S (Indep 2) "C" TestStanzas
+        P (QualIndep "A") "A"
+      , P (QualIndep "A") "E"
+      , P (QualIndep "B") "B"
+      , P (QualIndep "B") "D"
+      , P (QualIndep "B") "E"
+      , P (QualIndep "C") "C"
+      , P (QualIndep "C") "D"
+      , P (QualIndep "C") "E"
+      , S (QualIndep "C") "C" TestStanzas
       ]
 
 -- | Test the trace messages that we get when a package refers to an unknown pkg
@@ -955,14 +1176,14 @@ testIndepGoals5 name fixGoalOrder =
 
     goals :: [ExampleVar]
     goals = [
-        P (Indep 0) "X"
-      , P (Indep 0) "A"
-      , P (Indep 0) "B"
-      , P (Indep 0) "C"
-      , P (Indep 1) "Y"
-      , P (Indep 1) "A"
-      , P (Indep 1) "B"
-      , P (Indep 1) "C"
+        P (QualIndep "X") "X"
+      , P (QualIndep "X") "A"
+      , P (QualIndep "X") "B"
+      , P (QualIndep "X") "C"
+      , P (QualIndep "Y") "Y"
+      , P (QualIndep "Y") "A"
+      , P (QualIndep "Y") "B"
+      , P (QualIndep "Y") "C"
       ]
 
 -- | A simplified version of 'testIndepGoals5'.
@@ -989,12 +1210,12 @@ testIndepGoals6 name fixGoalOrder =
 
     goals :: [ExampleVar]
     goals = [
-        P (Indep 0) "X"
-      , P (Indep 0) "A"
-      , P (Indep 0) "B"
-      , P (Indep 1) "Y"
-      , P (Indep 1) "A"
-      , P (Indep 1) "B"
+        P (QualIndep "X") "X"
+      , P (QualIndep "X") "A"
+      , P (QualIndep "X") "B"
+      , P (QualIndep "Y") "Y"
+      , P (QualIndep "Y") "A"
+      , P (QualIndep "Y") "B"
       ]
 
 dbExts1 :: ExampleDb
@@ -1079,6 +1300,29 @@ dbPC1 = [
   , Right $ exAv "B" 2 [ExPkg ("pkgB", 2), ExAny "A"]
   , Right $ exAv "C" 1 [ExAny "B"]
   ]
+
+-- | Test for the solver's summarized log. The final conflict set is {A, D},
+-- though the goal order forces the solver to find the (avoidable) conflict
+-- between B >= 2 and C first. When the solver reaches the backjump limit, it
+-- should only show the log to the first conflict. When the backjump limit is
+-- high enough to allow an exhaustive search, the solver should make use of the
+-- final conflict set to only show the conflict between A and D in the
+-- summarized log.
+testSummarizedLog :: String -> Maybe Int -> String -> TestTree
+testSummarizedLog testName mbj expectedMsg =
+    runTest $ maxBackjumps mbj $ goalOrder goals $ mkTest db testName ["A"] $
+    solverFailure (== expectedMsg)
+  where
+    db = [
+        Right $ exAv "A" 1 [ExAny "B", ExAny "D"]
+      , Right $ exAv "B" 3 [ExFix "C" 3]
+      , Right $ exAv "B" 2 [ExFix "C" 2]
+      , Right $ exAv "B" 1 [ExAny "C"]
+      , Right $ exAv "C" 1 []
+      ]
+
+    goals :: [ExampleVar]
+    goals = [P QualNone pkg | pkg <- ["A", "B", "C", "D"]]
 
 {-------------------------------------------------------------------------------
   Simple databases for the illustrations for the backjumping blog post
@@ -1177,52 +1421,155 @@ dbBJ8 = [
   ]
 
 {-------------------------------------------------------------------------------
-  Databases for build-tools
+  Databases for build-tool-depends
 -------------------------------------------------------------------------------}
-dbBuildTools1 :: ExampleDb
-dbBuildTools1 = [
-    Right $ exAv "alex" 1 [],
-    Right $ exAv "A" 1 [ExBuildToolAny "alex"]
+
+-- | Multiple packages depending on exes from 'bt-pkg'.
+dbBuildTools :: ExampleDb
+dbBuildTools = [
+    Right $ exAv "A" 1 [ExBuildToolAny "bt-pkg" "exe1"]
+  , Right $ exAv "B" 1 [exFlagged "flagB" [ExAny "unknown"]
+                                          [ExBuildToolAny "bt-pkg" "exe1"]]
+  , Right $ exAv "C" 1 [] `withTest` ExTest "testC" [ExBuildToolAny "bt-pkg" "exe1"]
+  , Right $ exAv "D" 1 [ExBuildToolAny "bt-pkg" "unknown-exe"]
+  , Right $ exAv "E" 1 [ExBuildToolAny "unknown-pkg" "exe1"]
+  , Right $ exAv "F" 1 [exFlagged "flagF" [ExBuildToolAny "bt-pkg" "unknown-exe"]
+                                          [ExAny "unknown"]]
+  , Right $ exAv "G" 1 [] `withTest` ExTest "testG" [ExBuildToolAny "bt-pkg" "unknown-exe"]
+  , Right $ exAv "H" 1 [ExBuildToolFix "bt-pkg" "exe1" 3]
+
+  , Right $ exAv "bt-pkg" 4 []
+  , Right $ exAv "bt-pkg" 3 [] `withExe` ExExe "exe2" []
+  , Right $ exAv "bt-pkg" 2 [] `withExe` ExExe "exe1" []
+  , Right $ exAv "bt-pkg" 1 []
+  ]
+
+-- The solver should never choose an installed package for a build tool
+-- dependency.
+rejectInstalledBuildToolPackage :: String -> SolverTest
+rejectInstalledBuildToolPackage name =
+    mkTest db name ["A"] $ solverFailure $ isInfixOf $
+    "rejecting: A:B:exe.B-1.0.0/installed-1 "
+     ++ "(does not contain executable exe, which is required by A)"
+  where
+    db :: ExampleDb
+    db = [
+        Right $ exAv "A" 1 [ExBuildToolAny "B" "exe"]
+      , Left $ exInst "B" 1 "B-1" []
+      ]
+
+-- | This test forces the solver to choose B as a build-tool dependency before
+-- it sees the dependency on executable exe2 from B. The solver needs to check
+-- that the version that it already chose for B contains the necessary
+-- executable. This order causes a different "missing executable" error message
+-- than when the solver checks for the executable in the same step that it
+-- chooses the build-tool package.
+--
+-- This case may become impossible if we ever add the executable name to the
+-- build-tool goal qualifier. Then this test would involve two qualified goals
+-- for B, one for exe1 and another for exe2.
+chooseExeAfterBuildToolsPackage :: Bool -> String -> SolverTest
+chooseExeAfterBuildToolsPackage shouldSucceed name =
+    goalOrder goals $ mkTest db name ["A"] $
+      if shouldSucceed
+      then solverSuccess [("A", 1), ("B", 1)]
+      else solverFailure $ isInfixOf $
+           "rejecting: A:+flagA (requires executable exe2 from A:B:exe.B, "
+            ++ "but the executable does not exist)"
+  where
+    db :: ExampleDb
+    db = [
+        Right $ exAv "A" 1 [ ExBuildToolAny "B" "exe1"
+                           , exFlagged "flagA" [ExBuildToolAny "B" "exe2"]
+                                               [ExAny "unknown"]]
+      , Right $ exAv "B" 1 []
+         `withExes`
+           [ExExe exe [] | exe <- if shouldSucceed then ["exe1", "exe2"] else ["exe1"]]
+      ]
+
+    goals :: [ExampleVar]
+    goals = [
+        P QualNone "A"
+      , P (QualExe "A" "B") "B"
+      , F QualNone "A" "flagA"
+      ]
+
+-- | Test that when one package depends on two executables from another package,
+-- both executables must come from the same instance of that package. We could
+-- lift this restriction in the future by adding the executable name to the goal
+-- qualifier.
+requireConsistentBuildToolVersions :: String -> SolverTest
+requireConsistentBuildToolVersions name =
+    mkTest db name ["A"] $ solverFailure $ isInfixOf $
+        "[__1] rejecting: A:B:exe.B-2.0.0 (conflict: A => A:B:exe.B (exe exe1)==1.0.0)\n"
+     ++ "[__1] rejecting: A:B:exe.B-1.0.0 (conflict: A => A:B:exe.B (exe exe2)==2.0.0)"
+  where
+    db :: ExampleDb
+    db = [
+        Right $ exAv "A" 1 [ ExBuildToolFix "B" "exe1" 1
+                           , ExBuildToolFix "B" "exe2" 2 ]
+      , Right $ exAv "B" 2 [] `withExes` exes
+      , Right $ exAv "B" 1 [] `withExes` exes
+      ]
+
+    exes = [ExExe "exe1" [], ExExe "exe2" []]
+
+{-------------------------------------------------------------------------------
+  Databases for legacy build-tools
+-------------------------------------------------------------------------------}
+dbLegacyBuildTools1 :: ExampleDb
+dbLegacyBuildTools1 = [
+    Right $ exAv "alex" 1 [] `withExe` ExExe "alex" [],
+    Right $ exAv "A" 1 [ExLegacyBuildToolAny "alex"]
+  ]
+
+-- Test that a recognized build tool dependency specifies the name of both the
+-- package and the executable. This db has no solution.
+dbLegacyBuildTools2 :: ExampleDb
+dbLegacyBuildTools2 = [
+    Right $ exAv "alex" 1 [] `withExe` ExExe "other-exe" [],
+    Right $ exAv "other-package" 1 [] `withExe` ExExe "alex" [],
+    Right $ exAv "A" 1 [ExLegacyBuildToolAny "alex"]
   ]
 
 -- Test that build-tools on a random thing doesn't matter (only
 -- the ones we recognize need to be in db)
-dbBuildTools2 :: ExampleDb
-dbBuildTools2 = [
-    Right $ exAv "A" 1 [ExBuildToolAny "otherdude"]
+dbLegacyBuildTools3 :: ExampleDb
+dbLegacyBuildTools3 = [
+    Right $ exAv "A" 1 [ExLegacyBuildToolAny "otherdude"]
   ]
 
 -- Test that we can solve for different versions of executables
-dbBuildTools3 :: ExampleDb
-dbBuildTools3 = [
-    Right $ exAv "alex" 1 [],
-    Right $ exAv "alex" 2 [],
-    Right $ exAv "A" 1 [ExBuildToolFix "alex" 1],
-    Right $ exAv "B" 1 [ExBuildToolFix "alex" 2],
+dbLegacyBuildTools4 :: ExampleDb
+dbLegacyBuildTools4 = [
+    Right $ exAv "alex" 1 [] `withExe` ExExe "alex" [],
+    Right $ exAv "alex" 2 [] `withExe` ExExe "alex" [],
+    Right $ exAv "A" 1 [ExLegacyBuildToolFix "alex" 1],
+    Right $ exAv "B" 1 [ExLegacyBuildToolFix "alex" 2],
     Right $ exAv "C" 1 [ExAny "A", ExAny "B"]
   ]
 
 -- Test that exe is not related to library choices
-dbBuildTools4 :: ExampleDb
-dbBuildTools4 = [
-    Right $ exAv "alex" 1 [ExFix "A" 1],
+dbLegacyBuildTools5 :: ExampleDb
+dbLegacyBuildTools5 = [
+    Right $ exAv "alex" 1 [ExFix "A" 1] `withExe` ExExe "alex" [],
     Right $ exAv "A" 1 [],
     Right $ exAv "A" 2 [],
-    Right $ exAv "B" 1 [ExBuildToolFix "alex" 1, ExFix "A" 2]
+    Right $ exAv "B" 1 [ExLegacyBuildToolFix "alex" 1, ExFix "A" 2]
   ]
 
 -- Test that build-tools on build-tools works
-dbBuildTools5 :: ExampleDb
-dbBuildTools5 = [
-    Right $ exAv "alex" 1 [],
-    Right $ exAv "happy" 1 [ExBuildToolAny "alex"],
-    Right $ exAv "A" 1 [ExBuildToolAny "happy"]
+dbLegacyBuildTools6 :: ExampleDb
+dbLegacyBuildTools6 = [
+    Right $ exAv "alex" 1 [] `withExe` ExExe "alex" [],
+    Right $ exAv "happy" 1 [ExLegacyBuildToolAny "alex"] `withExe` ExExe "happy" [],
+    Right $ exAv "A" 1 [ExLegacyBuildToolAny "happy"]
   ]
 
 -- Test that build-depends on library/executable package works.
 -- Extracted from https://github.com/haskell/cabal/issues/3775
-dbBuildTools6 :: ExampleDb
-dbBuildTools6 = [
+dbIssue3775 :: ExampleDb
+dbIssue3775 = [
     Right $ exAv "warp" 1 [],
     -- NB: the warp build-depends refers to the package, not the internal
     -- executable!

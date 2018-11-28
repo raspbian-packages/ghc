@@ -309,6 +309,9 @@ Compiler options for profiling
    single: options; for profiling
 
 .. ghc-flag:: -prof
+    :shortdesc: Turn on profiling
+    :type: dynamic
+    :category:
 
     To make use of the profiling system *all* modules must be compiled
     and linked with the :ghc-flag:`-prof` option. Any ``SCC`` annotations you've
@@ -322,12 +325,20 @@ There are a few other profiling-related compilation options. Use them
 for all modules in a program.
 
 .. ghc-flag:: -fprof-auto
+    :shortdesc: Auto-add ``SCC``\\ s to all bindings not marked INLINE
+    :type: dynamic
+    :reverse: -fno-prof-auto
+    :category:
 
     *All* bindings not marked INLINE, whether exported or not, top level
     or nested, will be given automatic ``SCC`` annotations. Functions
     marked INLINE must be given a cost centre manually.
 
 .. ghc-flag:: -fprof-auto-top
+    :shortdesc: Auto-add ``SCC``\\ s to all top-level bindings not marked INLINE
+    :type: dynamic
+    :reverse: -fno-prof-auto
+    :category:
 
     .. index::
        single: cost centres; automatically inserting
@@ -337,6 +348,10 @@ for all modules in a program.
     function, you have to add it manually.
 
 .. ghc-flag:: -fprof-auto-exported
+    :shortdesc: Auto-add ``SCC``\\ s to all exported bindings not marked INLINE
+    :type: dynamic
+    :reverse: -fno-prof-auto
+    :category:
 
     .. index::
        single: cost centres; automatically inserting
@@ -346,35 +361,50 @@ for all modules in a program.
     function, you have to add it manually.
 
 .. ghc-flag:: -fprof-auto-calls
-
-    .. index::
-       single: -fprof-auto-calls
+    :shortdesc: Auto-add ``SCC``\\ s to all call sites
+    :type: dynamic
+    :reverse: -fno-prof-auto-calls
+    :category:
 
     Adds an automatic ``SCC`` annotation to all *call sites*. This is
     particularly useful when using profiling for the purposes of
-    generating stack traces; see the function :base-ref:`traceStack <Debug-Trace.html#traceShow>` in the
-    module ``Debug.Trace``, or the :rts-flag:`-xc` RTS flag
-    (:ref:`rts-options-debugging`) for more details.
+    generating stack traces; see the function :base-ref:`Debug.Trace.traceShow`,
+    or the :rts-flag:`-xc` RTS flag (:ref:`rts-options-debugging`) for more
+    details.
 
 .. ghc-flag:: -fprof-cafs
+    :shortdesc: Auto-add ``SCC``\\ s to all CAFs
+    :type: dynamic
+    :reverse: -fno-prof-cafs
+    :category:
 
     The costs of all CAFs in a module are usually attributed to one
     "big" CAF cost-centre. With this option, all CAFs get their own
     cost-centre. An “if all else fails” option…
 
 .. ghc-flag:: -fno-prof-auto
+    :shortdesc: Disables any previous :ghc-flag:`-fprof-auto`,
+        :ghc-flag:`-fprof-auto-top`, or :ghc-flag:`-fprof-auto-exported` options.
+    :type: dynamic
+    :reverse: -fprof-auto
+    :category:
 
     Disables any previous :ghc-flag:`-fprof-auto`, :ghc-flag:`-fprof-auto-top`, or
     :ghc-flag:`-fprof-auto-exported` options.
 
 .. ghc-flag:: -fno-prof-cafs
+    :shortdesc: Disables any previous :ghc-flag:`-fprof-cafs` option.
+    :type: dynamic
+    :reverse: -fprof-cafs
+    :category:
 
     Disables any previous :ghc-flag:`-fprof-cafs` option.
 
 .. ghc-flag:: -fno-prof-count-entries
-
-    .. index::
-       single: -fno-prof-count-entries
+    :shortdesc: Do not collect entry counts
+    :type: dynamic
+    :reverse: -fprof-count-entries
+    :category:
 
     Tells GHC not to collect information about how often functions are
     entered at runtime (the "entries" column of the time profile), for
@@ -1356,6 +1386,9 @@ Options for instrumenting code for coverage
 .. program:: hpc
 
 .. ghc-flag:: -fhpc
+    :shortdesc: Turn on Haskell program coverage instrumentation
+    :type: dynamic
+    :category: coverage
 
     Enable code coverage for the current module or modules being
     compiled.
@@ -1575,8 +1608,11 @@ Using “ticky-ticky” profiling (for implementors)
    single: ticky-ticky profiling
 
 .. ghc-flag:: -ticky
+    :shortdesc: :ref:`Turn on ticky-ticky profiling <ticky-ticky>`
+    :type: dynamic
+    :category:
 
-   Enable ticky-ticky profiling.
+    Enable ticky-ticky profiling.
 
 Because ticky-ticky profiling requires a certain familiarity with GHC
 internals, we have moved the documentation to the GHC developers wiki.

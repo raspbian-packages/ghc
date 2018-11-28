@@ -4,15 +4,11 @@
      /><title
     >GADTRecords</title
     ><link href="#" rel="stylesheet" type="text/css" title="Ocean"
-     /><script src="haddock-util.js" type="text/javascript"
+     /><link rel="stylesheet" type="text/css" href="#"
+     /><script src="haddock-bundle.min.js" async="async" type="text/javascript"
     ></script
     ><script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.0/MathJax.js?config=TeX-AMS-MML_HTMLorMML" type="text/javascript"
     ></script
-    ><script type="text/javascript"
-    >//
-window.onload = function () {pageLoad();};
-//
-</script
     ></head
   ><body
   ><div id="package-header"
@@ -43,52 +39,54 @@ window.onload = function () {pageLoad();};
 	>GADTRecords</p
 	></div
       ><div id="synopsis"
-      ><p id="control.syn" class="caption expander" onclick="toggleSection('syn')"
-	>Synopsis</p
-	><ul id="section.syn" class="hide" onclick="toggleSection('syn')"
-	><li class="src short"
-	  ><span class="keyword"
-	    >data</span
-	    > <a href="#"
-	    >H1</a
-	    > a b <span class="keyword"
-	    >where</span
-	    ><ul class="subs"
-	    ><li
-	      ><a href="#"
-		>C1</a
-		> :: <a href="#"
-		>H1</a
-		> a b</li
+      ><details id="syn"
+	><summary
+	  >Synopsis</summary
+	  ><ul class="details-toggle" data-details-id="syn"
+	  ><li class="src short"
+	    ><span class="keyword"
+	      >data</span
+	      > <a href="#"
+	      >H1</a
+	      > a b <span class="keyword"
+	      >where</span
+	      ><ul class="subs"
 	      ><li
-	      ><a href="#"
-		>C2</a
-		> :: <a href="#"
-		>Ord</a
-		> a =&gt; [a] -&gt; <a href="#"
-		>H1</a
-		> a a</li
-	      ><li
-	      ><a href="#"
-		>C3</a
-		> :: {..} -&gt; <a href="#"
-		>H1</a
-		> <a href="#"
-		>Int</a
-		> <a href="#"
-		>Int</a
-		></li
-	      ><li
-	      ><a href="#"
-		>C4</a
-		> :: {..} -&gt; <a href="#"
-		>H1</a
-		> <a href="#"
-		>Int</a
-		> a</li
-	      ></ul
-	    ></li
-	  ></ul
+		><a href="#"
+		  >C1</a
+		  > :: <a href="#" title="GADTRecords"
+		  >H1</a
+		  > a b</li
+		><li
+		><a href="#"
+		  >C2</a
+		  > :: <a href="#" title="Data.Ord"
+		  >Ord</a
+		  > a =&gt; [a] -&gt; <a href="#" title="GADTRecords"
+		  >H1</a
+		  > a a</li
+		><li
+		><a href="#"
+		  >C3</a
+		  > :: {..} -&gt; <a href="#" title="GADTRecords"
+		  >H1</a
+		  > <a href="#" title="Data.Int"
+		  >Int</a
+		  > <a href="#" title="Data.Int"
+		  >Int</a
+		  ></li
+		><li
+		><a href="#"
+		  >C4</a
+		  > :: {..} -&gt; <a href="#" title="GADTRecords"
+		  >H1</a
+		  > <a href="#" title="Data.Int"
+		  >Int</a
+		  > a</li
+		></ul
+	      ></li
+	    ></ul
+	  ></details
 	></div
       ><div id="interface"
       ><h1
@@ -116,7 +114,7 @@ window.onload = function () {pageLoad();};
 	      ><td class="src"
 		><a id="v:C1" class="def"
 		  >C1</a
-		  > :: <a href="#"
+		  > :: <a href="#" title="GADTRecords"
 		  >H1</a
 		  > a b</td
 		><td class="doc empty"
@@ -126,9 +124,9 @@ window.onload = function () {pageLoad();};
 	      ><td class="src"
 		><a id="v:C2" class="def"
 		  >C2</a
-		  > :: <a href="#"
+		  > :: <a href="#" title="Data.Ord"
 		  >Ord</a
-		  > a =&gt; [a] -&gt; <a href="#"
+		  > a =&gt; [a] -&gt; <a href="#" title="GADTRecords"
 		  >H1</a
 		  > a a</td
 		><td class="doc empty"
@@ -138,11 +136,11 @@ window.onload = function () {pageLoad();};
 	      ><td class="src"
 		><a id="v:C3" class="def"
 		  >C3</a
-		  > :: {..} -&gt; <a href="#"
+		  > :: {..} -&gt; <a href="#" title="GADTRecords"
 		  >H1</a
-		  > <a href="#"
+		  > <a href="#" title="Data.Int"
 		  >Int</a
-		  > <a href="#"
+		  > <a href="#" title="Data.Int"
 		  >Int</a
 		  ></td
 		><td class="doc empty"
@@ -158,7 +156,7 @@ window.onload = function () {pageLoad();};
 		      ><dfn class="src"
 			><a id="v:field" class="def"
 			  >field</a
-			  > :: <a href="#"
+			  > :: <a href="#" title="Data.Int"
 			  >Int</a
 			  ></dfn
 			><div class="doc"
@@ -174,9 +172,9 @@ window.onload = function () {pageLoad();};
 	      ><td class="src"
 		><a id="v:C4" class="def"
 		  >C4</a
-		  > :: {..} -&gt; <a href="#"
+		  > :: {..} -&gt; <a href="#" title="GADTRecords"
 		  >H1</a
-		  > <a href="#"
+		  > <a href="#" title="Data.Int"
 		  >Int</a
 		  > a</td
 		><td class="doc empty"

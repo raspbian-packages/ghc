@@ -39,11 +39,12 @@ import Distribution.Compat.Exception   ( tryIO )
 import Distribution.Verbosity    ( Verbosity )
 
 import qualified Data.ByteString.Lazy as BS
+import Control.DeepSeq           ( NFData(rnf) )
 import Control.Exception         ( evaluate, throw, Exception )
 import Control.Monad             ( liftM, unless )
 import Control.Monad.Writer.Lazy (WriterT(..), runWriterT, tell)
 import Data.List                 ( (\\), intersect, nub, find )
-import Data.Maybe                ( catMaybes, fromMaybe )
+import Data.Maybe                ( catMaybes )
 import Data.Either               (partitionEithers)
 import System.Directory          ( createDirectoryIfMissing,
                                    doesDirectoryExist, doesFileExist,
@@ -56,6 +57,9 @@ data BuildTreeRef = BuildTreeRef {
   buildTreeRefType :: !BuildTreeRefType,
   buildTreePath     :: !FilePath
   }
+
+instance NFData BuildTreeRef where
+  rnf (BuildTreeRef _ fp) = rnf fp
 
 defaultIndexFileName :: FilePath
 defaultIndexFileName = "00-index.tar"
@@ -224,7 +228,7 @@ removeBuildTreeRefs verbosity indexPath l = do
                                        then tell [pth] >> return False
                                        else return True
 
-      convertWith dict pth = fromMaybe pth $ fmap fst $ find ((==pth) . snd) dict
+      convertWith dict pth = maybe pth fst $ find ((==pth) . snd) dict
 
 -- | A build tree ref can become ignored if the user later adds a build tree ref
 -- with the same package ID. We display ignored build tree refs when the user

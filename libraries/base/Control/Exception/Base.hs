@@ -30,6 +30,7 @@ module Control.Exception.Base (
         NonTermination(..),
         NestedAtomically(..),
         BlockedIndefinitelyOnMVar(..),
+        FixIOException (..),
         BlockedIndefinitelyOnSTM(..),
         AllocationLimitExceeded(..),
         CompactionFailed(..),
@@ -94,7 +95,7 @@ module Control.Exception.Base (
         -- * Calls for GHC runtime
         recSelError, recConError, irrefutPatError, runtimeError,
         nonExhaustiveGuardsError, patError, noMethodBindingError,
-        absentError, typeError,
+        absentError, absentSumFieldError, typeError,
         nonTermination, nestedAtomically,
   ) where
 
@@ -398,3 +399,7 @@ nonTermination = toException NonTermination
 -- GHC's RTS calls this
 nestedAtomically :: SomeException
 nestedAtomically = toException NestedAtomically
+
+-- Introduced by unarise for unused unboxed sum fields
+absentSumFieldError :: a
+absentSumFieldError = absentError " in unboxed sum."#

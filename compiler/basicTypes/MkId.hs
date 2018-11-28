@@ -39,6 +39,8 @@ module MkId (
 
 #include "HsVersions.h"
 
+import GhcPrelude
+
 import Rules
 import TysPrim
 import TysWiredIn
@@ -276,7 +278,7 @@ mkDictSelId name clas
     sel_names      = map idName (classAllSelIds clas)
     new_tycon      = isNewTyCon tycon
     [data_con]     = tyConDataCons tycon
-    tyvars         = dataConUnivTyVarBinders data_con
+    tyvars         = dataConUserTyVarBinders data_con
     n_ty_args      = length tyvars
     arg_tys        = dataConRepArgTys data_con  -- Includes the dictionary superclasses
     val_index      = assoc "MkId.mkDictSelId" (sel_names `zip` [0..]) name
@@ -551,7 +553,6 @@ mkDataConRep dflags fam_envs wrap_name mb_bangs data_con
              -- Passing Nothing here allows the wrapper to inline when
              -- unsaturated.
              wrap_unf = mkInlineUnfolding wrap_rhs
-             wrap_tvs = (univ_tvs `minusList` map eqSpecTyVar eq_spec) ++ ex_tvs
              wrap_rhs = mkLams wrap_tvs $
                         mkLams wrap_args $
                         wrapFamInstBody tycon res_ty_args $
@@ -566,6 +567,7 @@ mkDataConRep dflags fam_envs wrap_name mb_bangs data_con
   where
     (univ_tvs, ex_tvs, eq_spec, theta, orig_arg_tys, _orig_res_ty)
       = dataConFullSig data_con
+    wrap_tvs     = dataConUserTyVars data_con
     res_ty_args  = substTyVars (mkTvSubstPrs (map eqSpecPair eq_spec)) univ_tvs
 
     tycon        = dataConTyCon data_con       -- The representation TyCon (not family)
@@ -593,11 +595,20 @@ mkDataConRep dflags fam_envs wrap_name mb_bangs data_con
     (unboxers, boxers) = unzip wrappers
     (rep_tys, rep_strs) = unzip (concat rep_tys_w_strs)
 
-    wrapper_reqd = not (isNewTyCon tycon)  -- Newtypes have only a worker
-                && (any isBanged (ev_ibangs ++ arg_ibangs)
-                      -- Some forcing/unboxing (includes eq_spec)
-                    || isFamInstTyCon tycon  -- Cast result
-                    || (not $ null eq_spec)) -- GADT
+    wrapper_reqd =
+        (not (isNewTyCon tycon)
+                     -- (Most) newtypes have only a worker, with the exception
+                     -- of some newtypes written with GADT syntax. See below.
+         && (any isBanged (ev_ibangs ++ arg_ibangs)
+                     -- Some forcing/unboxing (includes eq_spec)
+             || isFamInstTyCon tycon  -- Cast result
+             || (not $ null eq_spec))) -- GADT
+      || dataConUserTyVarsArePermuted data_con
+                     -- If the data type was written with GADT syntax and
+                     -- orders the type variables differently from what the
+                     -- worker expects, it needs a data con wrapper to reorder
+                     -- the type variables.
+                     -- See Note [Data con wrappers and GADT syntax].
 
     initial_wrap_app = Var (dataConWorkId data_con)
                        `mkTyApps`  res_ty_args
@@ -663,6 +674,52 @@ the interface file.
 The HsImplBangs passed are in 1-1 correspondence with the
 dataConOrigArgTys of the DataCon.
 
+Note [Data con wrappers and unlifted types]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider
+   data T = MkT !Int#
+
+We certainly do not want to make a wrapper
+   $WMkT x = case x of y { DEFAULT -> MkT y }
+
+For a start, it's still to generate a no-op.  But worse, since wrappers
+are currently injected at TidyCore, we don't even optimise it away!
+So the stupid case expression stays there.  This actually happened for
+the Integer data type (see Trac #1600 comment:66)!
+
+Note [Data con wrappers and GADT syntax]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider these two very similar data types:
+
+  data T1 a b = MkT1 b
+
+  data T2 a b where
+    MkT2 :: forall b a. b -> T2 a b
+
+Despite their similar appearance, T2 will have a data con wrapper but T1 will
+not. What sets them apart? The types of their constructors, which are:
+
+  MkT1 :: forall a b. b -> T1 a b
+  MkT2 :: forall b a. b -> T2 a b
+
+MkT2's use of GADT syntax allows it to permute the order in which `a` and `b`
+would normally appear. See Note [DataCon user type variable binders] in DataCon
+for further discussion on this topic.
+
+The worker data cons for T1 and T2, however, both have types such that `a` is
+expected to come before `b` as arguments. Because MkT2 permutes this order, it
+needs a data con wrapper to swizzle around the type variables to be in the
+order the worker expects.
+
+A somewhat surprising consequence of this is that *newtypes* can have data con
+wrappers! After all, a newtype can also be written with GADT syntax:
+
+  newtype T3 a b where
+    MkT3 :: forall b a. b -> T3 a b
+
+Again, this needs a wrapper data con to reorder the type variables. It does
+mean that this newtype constructor requires another level of indirection when
+being called, but the inliner should make swift work of that.
 -}
 
 -------------------------
@@ -679,7 +736,7 @@ dataConSrcToImplBang
    -> HsImplBang
 
 dataConSrcToImplBang dflags fam_envs arg_ty
-              (HsSrcBang ann unpk NoSrcStrict)
+                     (HsSrcBang ann unpk NoSrcStrict)
   | xopt LangExt.StrictData dflags -- StrictData => strict field
   = dataConSrcToImplBang dflags fam_envs arg_ty
                   (HsSrcBang ann unpk SrcStrict)
@@ -690,7 +747,11 @@ dataConSrcToImplBang _ _ _ (HsSrcBang _ _ SrcLazy)
   = HsLazy
 
 dataConSrcToImplBang dflags fam_envs arg_ty
-    (HsSrcBang _ unpk_prag SrcStrict)
+                     (HsSrcBang _ unpk_prag SrcStrict)
+  | isUnliftedType arg_ty
+  = HsLazy  -- For !Int#, say, use HsLazy
+            -- See Note [Data con wrappers and unlifted types]
+
   | not (gopt Opt_OmitInterfacePragmas dflags) -- Don't unpack if -fomit-iface-pragmas
           -- Don't unpack if we aren't optimising; rather arbitrarily,
           -- we use -fomit-iface-pragmas as the indication
@@ -703,7 +764,7 @@ dataConSrcToImplBang dflags fam_envs arg_ty
       NoSrcUnpack ->
         gopt Opt_UnboxStrictFields dflags
             || (gopt Opt_UnboxSmallStrictFields dflags
-                && length rep_tys <= 1) -- See Note [Unpack one-wide fields]
+                && rep_tys `lengthAtMost` 1) -- See Note [Unpack one-wide fields]
       srcUnpack -> isSrcUnpacked srcUnpack
   = case mb_co of
       Nothing     -> HsUnpack Nothing
@@ -1487,7 +1548,7 @@ Also see https://ghc.haskell.org/trac/ghc/wiki/OneShot.
 Note [magicDictId magic]
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 The identifier `magicDict` is just a place-holder, which is used to
-implement a primitve that we cannot define in Haskell but we can write
+implement a primitive that we cannot define in Haskell but we can write
 in Core.  It is declared with a place-holder type:
 
     magicDict :: forall a. a

@@ -7,6 +7,8 @@ module CmmPipeline (
   cmmPipeline
 ) where
 
+import GhcPrelude
+
 import Cmm
 import CmmLint
 import CmmBuildInfoTables
@@ -16,7 +18,7 @@ import CmmProcPoint
 import CmmContFlowOpt
 import CmmLayoutStack
 import CmmSink
-import Hoopl
+import Hoopl.Collections
 
 import UniqSupply
 import DynFlags

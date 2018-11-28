@@ -84,6 +84,9 @@ module Text.PrettyPrint.Annotated.HughesPJ (
 
 import Control.DeepSeq ( NFData(rnf) )
 import Data.Function   ( on )
+#if __GLASGOW_HASKELL__ >= 803
+import Prelude         hiding ( (<>) )
+#endif
 #if __GLASGOW_HASKELL__ >= 800
 import qualified Data.Semigroup as Semi ( Semigroup((<>)) )
 #elif __GLASGOW_HASKELL__ < 709
@@ -262,7 +265,11 @@ data TextDetails = Chr  {-# UNPACK #-} !Char -- ^ A single Char fragment
 -- Combining @Doc@ values
 #if __GLASGOW_HASKELL__ >= 800
 instance Semi.Semigroup (Doc a) where
+#ifndef TESTING
     (<>) = (Text.PrettyPrint.Annotated.HughesPJ.<>)
+#else
+    (<>) = (PrettyTestVersion.<>)
+#endif
 
 instance Monoid (Doc a) where
     mempty  = empty
@@ -691,7 +698,7 @@ beside p@(Beside p1 g1 q1) g2 q2
          | otherwise             = beside (reduceDoc p) g2 q2
 beside p@(Above{})         g q   = let !d = reduceDoc p in beside d g q
 beside (NilAbove p)        g q   = nilAbove_ $! beside p g q
-beside (TextBeside t p)    g q   = TextBeside t $! rest
+beside (TextBeside t p)    g q   = TextBeside t rest
                                where
                                   rest = case p of
                                            Empty -> nilBeside g q

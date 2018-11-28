@@ -171,7 +171,7 @@ copyComponent verbosity pkg_descr lbi (CLib lib) clbi copydest = do
 
     -- install include files for all compilers - they may be needed to compile
     -- haskell files (using the CPP extension)
-    installIncludeFiles verbosity lib incPref
+    installIncludeFiles verbosity lib lbi buildPref incPref
 
     case compilerFlavor (compiler lbi) of
       GHC   -> GHC.installLib   verbosity lbi libPref dynlibPref buildPref pkg_descr lib clbi
@@ -247,11 +247,13 @@ installDataFiles verbosity pkg_descr destDataDir =
 
 -- | Install the files listed in install-includes for a library
 --
-installIncludeFiles :: Verbosity -> Library -> FilePath -> IO ()
-installIncludeFiles verbosity lib destIncludeDir = do
-    let relincdirs = "." : filter isRelative (includeDirs lbi)
-        lbi = libBuildInfo lib
-    incs <- traverse (findInc relincdirs) (installIncludes lbi)
+installIncludeFiles :: Verbosity -> Library -> LocalBuildInfo -> FilePath -> FilePath -> IO ()
+installIncludeFiles verbosity lib lbi buildPref destIncludeDir = do
+    let relincdirs = "." : filter isRelative (includeDirs libBi)
+        libBi = libBuildInfo lib
+        incdirs = [ baseDir lbi </> dir | dir <- relincdirs ]
+                  ++ [ buildPref </> dir | dir <- relincdirs ]
+    incs <- traverse (findInc incdirs) (installIncludes libBi)
     sequence_
       [ do createDirectoryIfMissingVerbose verbosity True destDir
            installOrdinaryFile verbosity srcFile destFile
@@ -259,7 +261,7 @@ installIncludeFiles verbosity lib destIncludeDir = do
       , let destFile = destIncludeDir </> relFile
             destDir  = takeDirectory destFile ]
   where
-
+   baseDir lbi' = fromMaybe "" (takeDirectory <$> cabalFilePath lbi')
    findInc []         file = die' verbosity ("can't find include file " ++ file)
    findInc (dir:dirs) file = do
      let path = dir </> file

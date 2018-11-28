@@ -1,41 +1,49 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE StandaloneDeriving #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
 module UnitTests.Distribution.Solver.Modular.QuickCheck (tests) where
 
-import Control.DeepSeq (NFData, force)
-import Control.Monad (foldM)
+import Prelude ()
+import Distribution.Client.Compat.Prelude
+
+import Control.Arrow ((&&&))
+import Control.DeepSeq (force)
 import Data.Either (lefts)
 import Data.Function (on)
-import Data.List (groupBy, isInfixOf, nub, nubBy, sort)
-import Data.Maybe (isJust)
-import GHC.Generics (Generic)
-
-#if !MIN_VERSION_base(4,8,0)
-import Control.Applicative ((<$>), (<*>))
-import Data.Monoid (Monoid)
-#endif
+import Data.Hashable (Hashable(..))
+import Data.List (groupBy, isInfixOf)
+import Data.Ord (comparing)
 
 import Text.Show.Pretty (parseValue, valToStr)
 
 import Test.Tasty (TestTree)
 import Test.Tasty.QuickCheck
 
-import Distribution.Client.Dependency.Types
-         ( Solver(..) )
+import Distribution.Types.GenericPackageDescription (FlagName)
+import Distribution.Utils.ShortText (ShortText)
+
 import Distribution.Client.Setup (defaultMaxBackjumps)
 
+import           Distribution.Types.PackageName
 import           Distribution.Types.UnqualComponentName
 
 import qualified Distribution.Solver.Types.ComponentDeps as CD
 import           Distribution.Solver.Types.ComponentDeps
                    ( Component(..), ComponentDep, ComponentDeps )
+import           Distribution.Solver.Types.OptionalStanza
+import           Distribution.Solver.Types.PackageConstraint
+import qualified Distribution.Solver.Types.PackagePath as P
 import           Distribution.Solver.Types.PkgConfigDb
                    (pkgConfigDbFromList)
 import           Distribution.Solver.Types.Settings
+import           Distribution.Solver.Types.Variable
+import           Distribution.Version
 
 import UnitTests.Distribution.Solver.Modular.DSL
+import UnitTests.Distribution.Solver.Modular.QuickCheck.Utils
+    ( testPropertyWithSeed )
 
 tests :: [TestTree]
 tests = [
@@ -43,12 +51,15 @@ tests = [
       -- existence of a solution. It runs the solver twice, and only sets those
       -- parameters on the second run. The test also applies parameters that
       -- can affect the existence of a solution to both runs.
-      testProperty "target order and --reorder-goals do not affect solvability" $
-          \(SolverTest db targets) targetOrder reorderGoals indepGoals solver ->
-            let r1 = solve' (ReorderGoals False) targets  db
-                r2 = solve' reorderGoals         targets2 db
-                solve' reorder = solve (EnableBackjumping True) reorder
-                                       indepGoals solver
+      testPropertyWithSeed "target and goal order do not affect solvability" $
+          \test targetOrder mGoalOrder1 mGoalOrder2 indepGoals ->
+            let r1 = solve' mGoalOrder1 test
+                r2 = solve' mGoalOrder2 test { testTargets = targets2 }
+                solve' goalOrder =
+                    solve (EnableBackjumping True) (ReorderGoals False)
+                          (CountConflicts True) indepGoals
+                          (getBlind <$> goalOrder)
+                targets = testTargets test
                 targets2 = case targetOrder of
                              SameOrder -> targets
                              ReverseOrder -> reverse targets
@@ -56,25 +67,44 @@ tests = [
                noneReachedBackjumpLimit [r1, r2] ==>
                isRight (resultPlan r1) === isRight (resultPlan r2)
 
-    , testProperty
+    , testPropertyWithSeed
           "solvable without --independent-goals => solvable with --independent-goals" $
-          \(SolverTest db targets) reorderGoals solver ->
-            let r1 = solve' (IndependentGoals False) targets db
-                r2 = solve' (IndependentGoals True)  targets db
-                solve' indep = solve (EnableBackjumping True)
-                                     reorderGoals indep solver
+          \test reorderGoals ->
+            let r1 = solve' (IndependentGoals False) test
+                r2 = solve' (IndependentGoals True)  test
+                solve' indep = solve (EnableBackjumping True) reorderGoals
+                                     (CountConflicts True) indep Nothing
              in counterexample (showResults r1 r2) $
                 noneReachedBackjumpLimit [r1, r2] ==>
                 isRight (resultPlan r1) `implies` isRight (resultPlan r2)
 
-    , testProperty "backjumping does not affect solvability" $
-          \(SolverTest db targets) reorderGoals indepGoals ->
-            let r1 = solve' (EnableBackjumping True)  targets db
-                r2 = solve' (EnableBackjumping False) targets db
-                solve' enableBj = solve enableBj reorderGoals indepGoals Modular
+    , testPropertyWithSeed "backjumping does not affect solvability" $
+          \test reorderGoals indepGoals ->
+            let r1 = solve' (EnableBackjumping True)  test
+                r2 = solve' (EnableBackjumping False) test
+                solve' enableBj = solve enableBj reorderGoals
+                                        (CountConflicts True) indepGoals Nothing
              in counterexample (showResults r1 r2) $
                 noneReachedBackjumpLimit [r1, r2] ==>
                 isRight (resultPlan r1) === isRight (resultPlan r2)
+
+    -- This test uses --no-count-conflicts, because the goal order used with
+    -- --count-conflicts depends on the total set of conflicts seen by the
+    -- solver. The solver explores more of the tree and encounters more
+    -- conflicts when it doesn't backjump. The different goal orders can lead to
+    -- different solutions and cause the test to fail.
+    -- TODO: Find a faster way to randomly sort goals, and then use a random
+    -- goal order in this test.
+    , testPropertyWithSeed
+          "backjumping does not affect the result (with static goal order)" $
+          \test reorderGoals indepGoals ->
+            let r1 = solve' (EnableBackjumping True)  test
+                r2 = solve' (EnableBackjumping False) test
+                solve' enableBj = solve enableBj reorderGoals
+                                  (CountConflicts False) indepGoals Nothing
+             in counterexample (showResults r1 r2) $
+                noneReachedBackjumpLimit [r1, r2] ==>
+                resultPlan r1 === resultPlan r2
     ]
   where
     noneReachedBackjumpLimit :: [Result] -> Bool
@@ -97,19 +127,25 @@ tests = [
     isRight (Right _) = True
     isRight _         = False
 
-solve :: EnableBackjumping -> ReorderGoals -> IndependentGoals
-      -> Solver -> [PN] -> TestDb -> Result
-solve enableBj reorder indep solver targets (TestDb db) =
+newtype VarOrdering = VarOrdering {
+      unVarOrdering :: Variable P.QPN -> Variable P.QPN -> Ordering
+    }
+
+solve :: EnableBackjumping -> ReorderGoals -> CountConflicts -> IndependentGoals
+      -> Maybe VarOrdering
+      -> SolverTest -> Result
+solve enableBj reorder countConflicts indep goalOrder test =
   let (lg, result) =
-        runProgress $ exResolve db Nothing Nothing
+        runProgress $ exResolve (unTestDb (testDb test)) Nothing Nothing
                   (pkgConfigDbFromList [])
-                  (map unPN targets)
-                  solver
+                  (map unPN (testTargets test))
                   -- The backjump limit prevents individual tests from using
                   -- too much time and memory.
                   (Just defaultMaxBackjumps)
-                  indep reorder (AllowBootLibInstalls False) enableBj Nothing [] []
-                  (EnableAllTests True)
+                  countConflicts indep reorder (AllowBootLibInstalls False)
+                  enableBj (SolveExecutables True) (unVarOrdering <$> goalOrder)
+                  (testConstraints test) (testPreferences test)
+                  (EnableAllTests False)
 
       failure :: String -> Failure
       failure msg
@@ -168,26 +204,40 @@ getVersion = PV . either exInstVersion exAvVersion
 data SolverTest = SolverTest {
     testDb :: TestDb
   , testTargets :: [PN]
+  , testConstraints :: [ExConstraint]
+  , testPreferences :: [ExPreference]
   }
 
 -- | Pretty-print the test when quickcheck calls 'show'.
 instance Show SolverTest where
   show test =
     let str = "SolverTest {testDb = " ++ show (testDb test)
-                     ++ ", testTargets = " ++ show (testTargets test) ++ "}"
+                     ++ ", testTargets = " ++ show (testTargets test)
+                     ++ ", testConstraints = " ++ show (testConstraints test)
+                     ++ ", testPreferences = " ++ show (testPreferences test)
+                     ++ "}"
     in maybe str valToStr $ parseValue str
 
 instance Arbitrary SolverTest where
   arbitrary = do
     db <- arbitrary
-    let pkgs = nub $ map getName (unTestDb db)
+    let pkgVersions = nub $ map (getName &&& getVersion) (unTestDb db)
+        pkgs = nub $ map fst pkgVersions
     Positive n <- arbitrary
     targets <- randomSubset n pkgs
-    return (SolverTest db targets)
+    constraints <- case pkgVersions of
+                     [] -> return []
+                     _  -> boundedListOf 1 $ arbitraryConstraint pkgVersions
+    prefs <- case pkgVersions of
+               [] -> return []
+               _  -> boundedListOf 3 $ arbitraryPreference pkgVersions
+    return (SolverTest db targets constraints prefs)
 
   shrink test =
          [test { testDb = db } | db <- shrink (testDb test)]
       ++ [test { testTargets = targets } | targets <- shrink (testTargets test)]
+      ++ [test { testConstraints = cs } | cs <- shrink (testConstraints test)]
+      ++ [test { testPreferences = prefs } | prefs <- shrink (testPreferences test)]
 
 -- | Collection of source and installed packages.
 newtype TestDb = TestDb { unTestDb :: ExampleDb }
@@ -203,7 +253,7 @@ instance Arbitrary TestDb where
       TestDb <$> shuffle (unTestDb db)
     where
       nextPkgs :: TestDb -> [(PN, PV)] -> Gen TestDb
-      nextPkgs db pkgs = TestDb . (++ unTestDb db) <$> mapM (nextPkg db) pkgs
+      nextPkgs db pkgs = TestDb . (++ unTestDb db) <$> traverse (nextPkg db) pkgs
 
       nextPkg :: TestDb -> (PN, PV) -> Gen TestPackage
       nextPkg db (pn, v) = do
@@ -220,10 +270,10 @@ arbitraryExAv pn v db =
 
 arbitraryExInst :: PN -> PV -> [ExampleInstalled] -> Gen ExampleInstalled
 arbitraryExInst pn v pkgs = do
-  hash <- vectorOf 10 $ elements $ ['a'..'z'] ++ ['A'..'Z'] ++ ['0'..'9']
+  pkgHash <- vectorOf 10 $ elements $ ['a'..'z'] ++ ['A'..'Z'] ++ ['0'..'9']
   numDeps <- min 3 <$> arbitrary
   deps <- randomSubset numDeps pkgs
-  return $ ExInst (unPN pn) (unPV v) hash (map exInstHash deps)
+  return $ ExInst (unPN pn) (unPV v) pkgHash (map exInstHash deps)
 
 arbitraryComponentDeps :: TestDb -> Gen (ComponentDeps [ExampleDependency])
 arbitraryComponentDeps (TestDb []) = return $ CD.fromList []
@@ -288,6 +338,34 @@ arbitraryDeps db = frequency
 arbitraryFlagName :: Gen String
 arbitraryFlagName = (:[]) <$> elements ['A'..'E']
 
+arbitraryConstraint :: [(PN, PV)] -> Gen ExConstraint
+arbitraryConstraint pkgs = do
+  (PN pn, v) <- elements pkgs
+  let anyQualifier = ScopeAnyQualifier (mkPackageName pn)
+  oneof [
+      ExVersionConstraint anyQualifier <$> arbitraryVersionRange v
+    , ExStanzaConstraint anyQualifier <$> sublistOf [TestStanzas, BenchStanzas]
+    ]
+
+arbitraryPreference :: [(PN, PV)] -> Gen ExPreference
+arbitraryPreference pkgs = do
+  (PN pn, v) <- elements pkgs
+  oneof [
+      ExStanzaPref pn <$> sublistOf [TestStanzas, BenchStanzas]
+    , ExPkgPref pn <$> arbitraryVersionRange v
+    ]
+
+arbitraryVersionRange :: PV -> Gen VersionRange
+arbitraryVersionRange (PV v) =
+  let version = mkSimpleVersion v
+  in elements [
+         thisVersion version
+       , notThisVersion version
+       , earlierVersion version
+       , orLaterVersion version
+       , noVersion
+       ]
+
 instance Arbitrary ReorderGoals where
   arbitrary = ReorderGoals <$> arbitrary
 
@@ -297,11 +375,6 @@ instance Arbitrary IndependentGoals where
   arbitrary = IndependentGoals <$> arbitrary
 
   shrink (IndependentGoals indep) = [IndependentGoals False | indep]
-
-instance Arbitrary Solver where
-  arbitrary = return Modular
-
-  shrink Modular = []
 
 instance Arbitrary UnqualComponentName where
   arbitrary = mkUnqualComponentName <$> (:[]) <$> elements "ABC"
@@ -355,6 +428,56 @@ instance Arbitrary Dependencies where
 
   shrink NotBuildable = [Buildable []]
   shrink (Buildable deps) = map Buildable (shrink deps)
+
+instance Arbitrary ExConstraint where
+  arbitrary = error "arbitrary not implemented: ExConstraint"
+
+  shrink (ExStanzaConstraint scope stanzas) =
+      [ExStanzaConstraint scope stanzas' | stanzas' <- shrink stanzas]
+  shrink (ExVersionConstraint scope vr) =
+      [ExVersionConstraint scope vr' | vr' <- shrink vr]
+  shrink _ = []
+
+instance Arbitrary ExPreference where
+  arbitrary = error "arbitrary not implemented: ExPreference"
+
+  shrink (ExStanzaPref pn stanzas) =
+      [ExStanzaPref pn stanzas' | stanzas' <- shrink stanzas]
+  shrink (ExPkgPref pn vr) = [ExPkgPref pn vr' | vr' <- shrink vr]
+
+instance Arbitrary OptionalStanza where
+  arbitrary = error "arbitrary not implemented: OptionalStanza"
+
+  shrink BenchStanzas = [TestStanzas]
+  shrink TestStanzas  = []
+
+instance Arbitrary VersionRange where
+  arbitrary = error "arbitrary not implemented: VersionRange"
+
+  shrink vr = [noVersion | vr /= noVersion]
+
+-- Randomly sorts solver variables using 'hash'.
+-- TODO: Sorting goals with this function is very slow.
+instance Arbitrary VarOrdering where
+  arbitrary = do
+      f <- arbitrary :: Gen (Int -> Int)
+      return $ VarOrdering (comparing (f . hash))
+
+instance Hashable pn => Hashable (Variable pn)
+instance Hashable a => Hashable (P.Qualified a)
+instance Hashable P.PackagePath
+instance Hashable P.Qualifier
+instance Hashable P.Namespace
+instance Hashable OptionalStanza
+instance Hashable FlagName
+instance Hashable PackageName
+instance Hashable ShortText
+
+deriving instance Generic (Variable pn)
+deriving instance Generic (P.Qualified a)
+deriving instance Generic P.PackagePath
+deriving instance Generic P.Namespace
+deriving instance Generic P.Qualifier
 
 randomSubset :: Int -> [a] -> Gen [a]
 randomSubset n xs = take n <$> shuffle xs

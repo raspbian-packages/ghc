@@ -14,16 +14,19 @@ module Distribution.Solver.Modular.Preference
     , preferReallyEasyGoalChoices
     , requireInstalled
     , sortGoals
+    , pruneAfterFirstSuccess
     ) where
 
 import Prelude ()
-import Distribution.Client.Compat.Prelude
+import Distribution.Solver.Compat.Prelude
 
 import Data.Function (on)
 import qualified Data.List as L
 import qualified Data.Map as M
 import Control.Monad.Reader hiding (sequence)
 import Data.Traversable (sequence)
+
+import Distribution.PackageDescription (lookupFlagAssignment, unFlagAssignment) -- from Cabal
 
 import Distribution.Solver.Types.Flag
 import Distribution.Solver.Types.InstalledPreference
@@ -128,7 +131,7 @@ preferPackagePreferences pcs =
 preferPackageStanzaPreferences :: (PN -> PackagePreferences) -> Tree d c -> Tree d c
 preferPackageStanzaPreferences pcs = trav go
   where
-    go (SChoiceF qsn@(SN (PI (Q pp pn) _) s) rdm gr _tr ts)
+    go (SChoiceF qsn@(SN (Q pp pn) s) rdm gr _tr ts)
       | primaryPP pp && enableStanzaPref pn s =
           -- move True case first to try enabling the stanza
           let ts' = W.mapWeightsWithKey (\k w -> weight k : w) ts
@@ -187,7 +190,7 @@ processPackageConstraintF qpn f c b' (LabeledPackageConstraint (PackageConstrain
   where
     go :: PackageProperty -> Tree d c
     go (PackagePropertyFlags fa) =
-        case L.lookup f fa of
+        case lookupFlagAssignment f fa of
           Nothing            -> r
           Just b | b == b'   -> r
                  | otherwise -> Fail c (GlobalConstraintFlag src)
@@ -230,14 +233,14 @@ enforcePackageConstraints pcs = trav go
                                        id
                                        (M.findWithDefault [] pn pcs)
       in PChoiceF qpn rdm gr        (W.mapWithKey g ts)
-    go (FChoiceF qfn@(FN (PI qpn@(Q _ pn) _) f) rdm gr tr m d ts) =
+    go (FChoiceF qfn@(FN qpn@(Q _ pn) f) rdm gr tr m d ts) =
       let c = varToConflictSet (F qfn)
           -- compose the transformation functions for each of the relevant constraint
           g = \ b -> foldl (\ h pc -> h . processPackageConstraintF qpn f c b pc)
                            id
                            (M.findWithDefault [] pn pcs)
       in FChoiceF qfn rdm gr tr m d (W.mapWithKey g ts)
-    go (SChoiceF qsn@(SN (PI qpn@(Q _ pn) _) f) rdm gr tr   ts) =
+    go (SChoiceF qsn@(SN qpn@(Q _ pn) f) rdm gr tr   ts) =
       let c = varToConflictSet (S qsn)
           -- compose the transformation functions for each of the relevant constraint
           g = \ b -> foldl (\ h pc -> h . processPackageConstraintS qpn f c b pc)
@@ -260,23 +263,25 @@ enforcePackageConstraints pcs = trav go
 -- unconstrained goals to use the default value for x OR any of the values in
 -- the constraints on x (even though the constraints don't apply), in order to
 -- allow the unconstrained goals to be linked to the constrained goals. See
--- https://github.com/haskell/cabal/issues/4299.
+-- https://github.com/haskell/cabal/issues/4299. Removing the single instance
+-- restriction (SIR) would also fix #4299, so we may want to remove this
+-- exception and only let the user toggle manual flags if we remove the SIR.
 --
 -- This function does not enforce any of the constraints, since that is done by
 -- 'enforcePackageConstraints'.
 enforceManualFlags :: M.Map PN [LabeledPackageConstraint] -> Tree d c -> Tree d c
 enforceManualFlags pcs = trav go
   where
-    go (FChoiceF qfn@(FN (PI (Q _ pn) _) fn) rdm gr tr Manual d ts) =
+    go (FChoiceF qfn@(FN (Q _ pn) fn) rdm gr tr Manual d ts) =
         FChoiceF qfn rdm gr tr Manual d $
-          let -- A list of all values specified by constraints on 'fn',
-              -- regardless of scope.
+          let -- A list of all values specified by constraints on 'fn'.
+              -- We ignore the constraint scope in order to handle issue #4299.
               flagConstraintValues :: [Bool]
               flagConstraintValues =
                   [ flagVal
                   | let lpcs = M.findWithDefault [] pn pcs
                   , (LabeledPackageConstraint (PackageConstraint _ (PackagePropertyFlags fa)) _) <- lpcs
-                  , (fn', flagVal) <- fa
+                  , (fn', flagVal) <- unFlagAssignment fa
                   , fn' == fn ]
 
               -- Prune flag values that are not the default and do not match any
@@ -344,8 +349,19 @@ sortGoals variableOrder = trav go
 
     varToVariable :: Var QPN -> Variable QPN
     varToVariable (P qpn)                    = PackageVar qpn
-    varToVariable (F (FN (PI qpn _) fn))     = FlagVar qpn fn
-    varToVariable (S (SN (PI qpn _) stanza)) = StanzaVar qpn stanza
+    varToVariable (F (FN qpn fn))     = FlagVar qpn fn
+    varToVariable (S (SN qpn stanza)) = StanzaVar qpn stanza
+
+-- | Reduce the branching degree of the search tree by removing all choices
+-- after the first successful choice at each level. The returned tree is the
+-- minimal subtree containing the path to the first backjump.
+pruneAfterFirstSuccess :: Tree d c -> Tree d c
+pruneAfterFirstSuccess = trav go
+  where
+    go (PChoiceF qpn rdm gr       ts) = PChoiceF qpn rdm gr       (W.takeUntil active ts)
+    go (FChoiceF qfn rdm gr w m d ts) = FChoiceF qfn rdm gr w m d (W.takeUntil active ts)
+    go (SChoiceF qsn rdm gr w     ts) = SChoiceF qsn rdm gr w     (W.takeUntil active ts)
+    go x                              = x
 
 -- | Always choose the first goal in the list next, abandoning all
 -- other choices.

@@ -4,15 +4,11 @@
      /><title
     >PatternSyns</title
     ><link href="#" rel="stylesheet" type="text/css" title="Ocean"
-     /><script src="haddock-util.js" type="text/javascript"
+     /><link rel="stylesheet" type="text/css" href="#"
+     /><script src="haddock-bundle.min.js" async="async" type="text/javascript"
     ></script
     ><script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.0/MathJax.js?config=TeX-AMS-MML_HTMLorMML" type="text/javascript"
     ></script
-    ><script type="text/javascript"
-    >//
-window.onload = function () {pageLoad();};
-//
-</script
     ></head
   ><body
   ><div id="package-header"
@@ -51,84 +47,108 @@ window.onload = function () {pageLoad();};
 	  ></div
 	></div
       ><div id="synopsis"
-      ><p id="control.syn" class="caption expander" onclick="toggleSection('syn')"
-	>Synopsis</p
-	><ul id="section.syn" class="hide" onclick="toggleSection('syn')"
-	><li class="src short"
-	  ><span class="keyword"
-	    >data</span
-	    > <a href="#"
-	    >FooType</a
-	    > x = <a href="#"
-	    >FooCtor</a
-	    > x</li
+      ><details id="syn"
+	><summary
+	  >Synopsis</summary
+	  ><ul class="details-toggle" data-details-id="syn"
 	  ><li class="src short"
-	  ><span class="keyword"
-	    >pattern</span
-	    > <a href="#"
-	    >Foo</a
-	    > :: <span class="keyword"
-	    >forall</span
-	    > x. x -&gt; <a href="#"
-	    >FooType</a
-	    > x</li
-	  ><li class="src short"
-	  ><span class="keyword"
-	    >pattern</span
-	    > <a href="#"
-	    >Bar</a
-	    > :: <span class="keyword"
-	    >forall</span
-	    > x. x -&gt; <a href="#"
-	    >FooType</a
-	    > (<a href="#"
-	    >FooType</a
-	    > x)</li
-	  ><li class="src short"
-	  ><span class="keyword"
-	    >pattern</span
-	    > <a href="#"
-	    >(:&lt;-&gt;)</a
-	    > :: <span class="keyword"
-	    >forall</span
-	    > x x1. x -&gt; x1 -&gt; (<a href="#"
-	    >FooType</a
-	    > x, <a href="#"
-	    >FooType</a
-	    > (<a href="#"
-	    >FooType</a
-	    > x1))</li
-	  ><li class="src short"
-	  ><span class="keyword"
-	    >data</span
-	    > (a :: <a href="#"
-	    >*</a
-	    >) <a href="#"
-	    >&gt;&lt;</a
-	    > b = <a href="#"
-	    >Empty</a
-	    ></li
-	  ><li class="src short"
-	  ><span class="keyword"
-	    >pattern</span
-	    > <a href="#"
-	    >E</a
-	    > :: <span class="keyword"
-	    >forall</span
-	    > k a (b :: k). <a href="#"
-	    >(&gt;&lt;)</a
-	    > k a b</li
-	  ><li class="src short"
-	  ><span class="keyword"
-	    >pattern</span
-	    > <a href="#"
-	    >PatWithExplicitSig</a
-	    > :: <a href="#"
-	    >Eq</a
-	    > somex =&gt; somex -&gt; <a href="#"
-	    >FooType</a
-	    > somex</li
-	  ></ul
+	    ><span class="keyword"
+	      >data</span
+	      > <a href="#"
+	      >FooType</a
+	      > x = <a href="#"
+	      >FooCtor</a
+	      > x</li
+	    ><li class="src short"
+	    ><span class="keyword"
+	      >pattern</span
+	      > <a href="#"
+	      >Foo</a
+	      > :: <span class="keyword"
+	      >forall</span
+	      > x. x -&gt; <a href="#" title="PatternSyns"
+	      >FooType</a
+	      > x</li
+	    ><li class="src short"
+	    ><span class="keyword"
+	      >pattern</span
+	      > <a href="#"
+	      >Bar</a
+	      > :: <span class="keyword"
+	      >forall</span
+	      > x. x -&gt; <a href="#" title="PatternSyns"
+	      >FooType</a
+	      > (<a href="#" title="PatternSyns"
+	      >FooType</a
+	      > x)</li
+	    ><li class="src short"
+	    ><span class="keyword"
+	      >pattern</span
+	      > <a href="#"
+	      >(:&lt;-&gt;)</a
+	      > :: <span class="keyword"
+	      >forall</span
+	      > x x1. x -&gt; x1 -&gt; (<a href="#" title="PatternSyns"
+	      >FooType</a
+	      > x, <a href="#" title="PatternSyns"
+	      >FooType</a
+	      > (<a href="#" title="PatternSyns"
+	      >FooType</a
+	      > x1))</li
+	    ><li class="src short"
+	    ><span class="keyword"
+	      >data</span
+	      > <a href="#"
+	      >BlubType</a
+	      > = <a href="#" title="Text.Show"
+	      >Show</a
+	      > x =&gt; <a href="#"
+	      >BlubCtor</a
+	      > x</li
+	    ><li class="src short"
+	    ><span class="keyword"
+	      >pattern</span
+	      > <a href="#"
+	      >Blub</a
+	      > :: () =&gt; <span class="keyword"
+	      >forall</span
+	      > x. <a href="#" title="Text.Show"
+	      >Show</a
+	      > x =&gt; x -&gt; <a href="#" title="PatternSyns"
+	      >BlubType</a
+	      ></li
+	    ><li class="src short"
+	    ><span class="keyword"
+	      >data</span
+	      > (a :: <a href="#" title="Data.Kind"
+	      >*</a
+	      >) <a href="#"
+	      >&gt;&lt;</a
+	      > b = <a href="#"
+	      >Empty</a
+	      ></li
+	    ><li class="src short"
+	    ><span class="keyword"
+	      >pattern</span
+	      > <a href="#"
+	      >E</a
+	      > :: <span class="keyword"
+	      >forall</span
+	      > k a (b :: k). a <a href="#" title="PatternSyns"
+	      >&gt;&lt;</a
+	      > b</li
+	    ><li class="src short"
+	    ><span class="keyword"
+	      >pattern</span
+	      > <a href="#"
+	      >PatWithExplicitSig</a
+	      > :: <a href="#" title="Data.Eq"
+	      >Eq</a
+	      > somex =&gt; somex -&gt; <a href="#" title="PatternSyns"
+	      >FooType</a
+	      > somex</li
+	    ></ul
+	  ></details
 	></div
       ><div id="interface"
       ><h1
@@ -169,7 +189,7 @@ window.onload = function () {pageLoad();};
 	    >Foo</a
 	    > :: <span class="keyword"
 	    >forall</span
-	    > x. x -&gt; <a href="#"
+	    > x. x -&gt; <a href="#" title="PatternSyns"
 	    >FooType</a
 	    > x <a href="#" class="selflink"
 	    >#</a
@@ -177,7 +197,7 @@ window.onload = function () {pageLoad();};
 	  ><div class="doc"
 	  ><p
 	    >Pattern synonym for <code
-	      ><a href="#"
+	      ><a href="#" title="PatternSyns"
 		>Foo</a
 		></code
 	      > x</p
@@ -191,9 +211,9 @@ window.onload = function () {pageLoad();};
 	    >Bar</a
 	    > :: <span class="keyword"
 	    >forall</span
-	    > x. x -&gt; <a href="#"
+	    > x. x -&gt; <a href="#" title="PatternSyns"
 	    >FooType</a
-	    > (<a href="#"
+	    > (<a href="#" title="PatternSyns"
 	    >FooType</a
 	    > x) <a href="#" class="selflink"
 	    >#</a
@@ -201,7 +221,7 @@ window.onload = function () {pageLoad();};
 	  ><div class="doc"
 	  ><p
 	    >Pattern synonym for <code
-	      ><a href="#"
+	      ><a href="#" title="PatternSyns"
 		>Bar</a
 		></code
 	      > x</p
@@ -215,11 +235,11 @@ window.onload = function () {pageLoad();};
 	    >(:&lt;-&gt;)</a
 	    > :: <span class="keyword"
 	    >forall</span
-	    > x x1. x -&gt; x1 -&gt; (<a href="#"
+	    > x x1. x -&gt; x1 -&gt; (<a href="#" title="PatternSyns"
 	    >FooType</a
-	    > x, <a href="#"
+	    > x, <a href="#" title="PatternSyns"
 	    >FooType</a
-	    > (<a href="#"
+	    > (<a href="#" title="PatternSyns"
 	    >FooType</a
 	    > x1)) <a href="#" class="selflink"
 	    >#</a
@@ -227,7 +247,7 @@ window.onload = function () {pageLoad();};
 	  ><div class="doc"
 	  ><p
 	    >Pattern synonym for (<code
-	      ><a href="#"
+	      ><a href="#" title="PatternSyns"
 		>:&lt;-&gt;</a
 		></code
 	      >)</p
@@ -237,7 +257,61 @@ window.onload = function () {pageLoad();};
 	><p class="src"
 	  ><span class="keyword"
 	    >data</span
-	    > (a :: <a href="#"
+	    > <a id="t:BlubType" class="def"
+	    >BlubType</a
+	    > <a href="#" class="selflink"
+	    >#</a
+	    ></p
+	  ><div class="doc"
+	  ><p
+	    >BlubType is existentially quantified</p
+	    ></div
+	  ><div class="subs constructors"
+	  ><p class="caption"
+	    >Constructors</p
+	    ><table
+	    ><tr
+	      ><td class="src"
+		><a href="#" title="Text.Show"
+		  >Show</a
+		  > x =&gt; <a id="v:BlubCtor" class="def"
+		  >BlubCtor</a
+		  > x</td
+		><td class="doc empty"
+		></td
+		></tr
+	      ></table
+	    ></div
+	  ></div
+	><div class="top"
+	><p class="src"
+	  ><span class="keyword"
+	    >pattern</span
+	    > <a id="v:Blub" class="def"
+	    >Blub</a
+	    > :: () =&gt; <span class="keyword"
+	    >forall</span
+	    > x. <a href="#" title="Text.Show"
+	    >Show</a
+	    > x =&gt; x -&gt; <a href="#" title="PatternSyns"
+	    >BlubType</a
+	    > <a href="#" class="selflink"
+	    >#</a
+	    ></p
+	  ><div class="doc"
+	  ><p
+	    >Pattern synonym for <code
+	      ><a href="#" title="PatternSyns"
+		>Blub</a
+		></code
+	      > x</p
+	    ></div
+	  ></div
+	><div class="top"
+	><p class="src"
+	  ><span class="keyword"
+	    >data</span
+	    > (a :: <a href="#" title="Data.Kind"
 	    >*</a
 	    >) <a id="t:-62--60-" class="def"
 	    >&gt;&lt;</a
@@ -247,7 +321,7 @@ window.onload = function () {pageLoad();};
 	  ><div class="doc"
 	  ><p
 	    >Doc for (<code
-	      ><a href="#"
+	      ><a href="#" title="PatternSyns"
 		>&gt;&lt;</a
 		></code
 	      >)</p
@@ -275,15 +349,15 @@ window.onload = function () {pageLoad();};
 	    >E</a
 	    > :: <span class="keyword"
 	    >forall</span
-	    > k a (b :: k). <a href="#"
-	    >(&gt;&lt;)</a
-	    > k a b <a href="#" class="selflink"
+	    > k a (b :: k). a <a href="#" title="PatternSyns"
+	    >&gt;&lt;</a
+	    > b <a href="#" class="selflink"
 	    >#</a
 	    ></p
 	  ><div class="doc"
 	  ><p
 	    >Pattern for <code
-	      ><a href="#"
+	      ><a href="#" title="PatternSyns"
 		>Empty</a
 		></code
 	      ></p
@@ -295,9 +369,9 @@ window.onload = function () {pageLoad();};
 	    >pattern</span
 	    > <a id="v:PatWithExplicitSig" class="def"
 	    >PatWithExplicitSig</a
-	    > :: <a href="#"
+	    > :: <a href="#" title="Data.Eq"
 	    >Eq</a
-	    > somex =&gt; somex -&gt; <a href="#"
+	    > somex =&gt; somex -&gt; <a href="#" title="PatternSyns"
 	    >FooType</a
 	    > somex <a href="#" class="selflink"
 	    >#</a

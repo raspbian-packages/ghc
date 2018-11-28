@@ -51,11 +51,17 @@ module Distribution.Client.ProjectPlanning (
     setupHsReplArgs,
     setupHsTestFlags,
     setupHsTestArgs,
+    setupHsBenchFlags,
+    setupHsBenchArgs,
     setupHsCopyFlags,
     setupHsRegisterFlags,
     setupHsHaddockFlags,
 
     packageHashInputs,
+
+    -- * Path construction
+    binDirectoryFor,
+    binDirectories
   ) where
 
 import Prelude ()
@@ -74,6 +80,7 @@ import qualified Distribution.Client.SolverInstallPlan as SolverInstallPlan
 import           Distribution.Client.Dependency
 import           Distribution.Client.Dependency.Types
 import qualified Distribution.Client.IndexUtils as IndexUtils
+import           Distribution.Client.Init (incVersion)
 import           Distribution.Client.Targets (userToPackageConstraint)
 import           Distribution.Client.DistDirLayout
 import           Distribution.Client.SetupWrapper
@@ -287,7 +294,8 @@ sanityCheckElaboratedPackage ElaboratedConfiguredPackage{..}
 rebuildProjectConfig :: Verbosity
                      -> DistDirLayout
                      -> ProjectConfig
-                     -> IO (ProjectConfig, [UnresolvedSourcePackage])
+                     -> IO (ProjectConfig,
+                            [PackageSpecifier UnresolvedSourcePackage])
 rebuildProjectConfig verbosity
                      distDirLayout@DistDirLayout {
                        distProjectRootDirectory,
@@ -308,6 +316,10 @@ rebuildProjectConfig verbosity
     return (projectConfig <> cliConfig, localPackages)
 
   where
+    ProjectConfigShared {
+      projectConfigConfigFile
+    } = projectConfigShared cliConfig
+
     fileMonitorProjectConfig = newFileMonitor (distProjectCacheFile "config")
 
     -- Read the cabal.project (or implicit config) and combine it with
@@ -317,17 +329,22 @@ rebuildProjectConfig verbosity
     phaseReadProjectConfig = do
       liftIO $ do
         info verbosity "Project settings changed, reconfiguring..."
-        createDirectoryIfMissingVerbose verbosity True distDirectory
-        createDirectoryIfMissingVerbose verbosity True distProjectCacheDirectory
-
-      readProjectConfig verbosity distDirLayout
+      readProjectConfig verbosity projectConfigConfigFile distDirLayout
 
     -- Look for all the cabal packages in the project
     -- some of which may be local src dirs, tarballs etc
     --
-    phaseReadLocalPackages :: ProjectConfig -> Rebuild [UnresolvedSourcePackage]
+    phaseReadLocalPackages :: ProjectConfig
+                           -> Rebuild [PackageSpecifier UnresolvedSourcePackage]
     phaseReadLocalPackages projectConfig = do
       localCabalFiles <- findProjectPackages distDirLayout projectConfig
+
+      -- Create folder only if findProjectPackages did not throw a
+      -- BadPackageLocations exception.
+      liftIO $ do
+        createDirectoryIfMissingVerbose verbosity True distDirectory
+        createDirectoryIfMissingVerbose verbosity True distProjectCacheDirectory
+
       mapM (readSourcePackage verbosity) localCabalFiles
 
 
@@ -347,7 +364,7 @@ rebuildProjectConfig verbosity
 rebuildInstallPlan :: Verbosity
                    -> DistDirLayout -> CabalDirLayout
                    -> ProjectConfig
-                   -> [UnresolvedSourcePackage]
+                   -> [PackageSpecifier UnresolvedSourcePackage]
                    -> IO ( ElaboratedInstallPlan  -- with store packages
                          , ElaboratedInstallPlan  -- with source packages
                          , ElaboratedSharedConfig )
@@ -499,7 +516,7 @@ rebuildInstallPlan verbosity
     --
     phaseRunSolver :: ProjectConfig
                    -> (Compiler, Platform, ProgramDb)
-                   -> [UnresolvedSourcePackage]
+                   -> [PackageSpecifier UnresolvedSourcePackage]
                    -> Rebuild (SolverInstallPlan, PkgConfigDb)
     phaseRunSolver projectConfig@ProjectConfig {
                      projectConfigShared,
@@ -547,7 +564,7 @@ rebuildInstallPlan verbosity
           Map.fromList
             [ (pkgname, stanzas)
             | pkg <- localPackages
-            , let pkgname            = packageName pkg
+            , let pkgname            = pkgSpecifierTarget pkg
                   testsEnabled       = lookupLocalPackageConfig
                                          packageConfigTests
                                          projectConfig pkgname
@@ -569,11 +586,12 @@ rebuildInstallPlan verbosity
                        -> (Compiler, Platform, ProgramDb)
                        -> PkgConfigDb
                        -> SolverInstallPlan
-                       -> [SourcePackage loc]
+                       -> [PackageSpecifier (SourcePackage loc)]
                        -> Rebuild ( ElaboratedInstallPlan
                                   , ElaboratedSharedConfig )
     phaseElaboratePlan ProjectConfig {
                          projectConfigShared,
+                         projectConfigAllPackages,
                          projectConfigLocalPackages,
                          projectConfigSpecificPackage,
                          projectConfigBuildOnly
@@ -601,6 +619,7 @@ rebuildInstallPlan verbosity
                 sourcePackageHashes
                 defaultInstallDirs
                 projectConfigShared
+                projectConfigAllPackages
                 projectConfigLocalPackages
                 (getMapMappend projectConfigSpecificPackage)
         let instantiatedPlan = instantiateInstallPlan elaboratedPlan
@@ -705,7 +724,7 @@ getPackageDBContents verbosity compiler progdb platform packagedb = do
 -}
 
 getSourcePackages :: Verbosity -> (forall a. (RepoContext -> IO a) -> IO a)
-                  -> IndexUtils.IndexState -> Rebuild SourcePackageDb
+                  -> Maybe IndexUtils.IndexState -> Rebuild SourcePackageDb
 getSourcePackages verbosity withRepoCtx idxState = do
     (sourcePkgDb, repos) <-
       liftIO $
@@ -714,9 +733,9 @@ getSourcePackages verbosity withRepoCtx idxState = do
                                                                   repoctx idxState
           return (sourcePkgDb, repoContextRepos repoctx)
 
-    monitorFiles . map monitorFile
-                 . IndexUtils.getSourcePackagesMonitorFiles
-                 $ repos
+    mapM_ needIfExists
+        . IndexUtils.getSourcePackagesMonitorFiles
+        $ repos
     return sourcePkgDb
 
 
@@ -878,7 +897,7 @@ planPackages :: Verbosity
              -> InstalledPackageIndex
              -> SourcePackageDb
              -> PkgConfigDb
-             -> [UnresolvedSourcePackage]
+             -> [PackageSpecifier UnresolvedSourcePackage]
              -> Map PackageName (Map OptionalStanza Bool)
              -> Progress String String SolverInstallPlan
 planPackages verbosity comp platform solver SolverSettings{..}
@@ -898,8 +917,7 @@ planPackages verbosity comp platform solver SolverSettings{..}
 
         setMaxBackjumps solverSettingMaxBackjumps
 
-        --TODO: [required eventually] should only be configurable for custom installs
-   -- . setIndependentGoals solverSettingIndependentGoals
+      . setIndependentGoals solverSettingIndependentGoals
 
       . setReorderGoals solverSettingReorderGoals
 
@@ -932,18 +950,8 @@ planPackages verbosity comp platform solver SolverSettings{..}
                                    . PD.packageDescription
                                    . packageDescription)
 
-      . addSetupCabalMinVersionConstraint (mkVersion [1,20])
-          -- While we can talk to older Cabal versions (we need to be able to
-          -- do so for custom Setup scripts that require older Cabal lib
-          -- versions), we have problems talking to some older versions that
-          -- don't support certain features.
-          --
-          -- For example, Cabal-1.16 and older do not know about build targets.
-          -- Even worse, 1.18 and older only supported the --constraint flag
-          -- with source package ids, not --dependency with installed package
-          -- ids. That is bad because we cannot reliably select the right
-          -- dependencies in the presence of multiple instances (i.e. the
-          -- store). See issue #3932. So we require Cabal 1.20 as a minimum.
+      . addSetupCabalMinVersionConstraint setupMinCabalVersionConstraint
+      . addSetupCabalMaxVersionConstraint setupMaxCabalVersionConstraint
 
       . addPreferences
           -- preferences from the config file or command line
@@ -959,7 +967,7 @@ planPackages verbosity comp platform solver SolverSettings{..}
           -- enable stanza preference where the user did not specify
           [ PackageStanzasPreference pkgname stanzas
           | pkg <- localPackages
-          , let pkgname = packageName pkg
+          , let pkgname = pkgSpecifierTarget pkg
                 stanzaM = Map.findWithDefault Map.empty pkgname pkgStanzasEnable
                 stanzas = [ stanza | stanza <- [minBound..maxBound]
                           , Map.lookup stanza stanzaM == Nothing ]
@@ -973,7 +981,7 @@ planPackages verbosity comp platform solver SolverSettings{..}
                                  (PackagePropertyStanzas stanzas))
               ConstraintSourceConfigFlagOrTarget
           | pkg <- localPackages
-          , let pkgname = packageName pkg
+          , let pkgname = pkgSpecifierTarget pkg
                 stanzaM = Map.findWithDefault Map.empty pkgname pkgStanzasEnable
                 stanzas = [ stanza | stanza <- [minBound..maxBound]
                           , Map.lookup stanza stanzaM == Just True ]
@@ -999,9 +1007,9 @@ planPackages verbosity comp platform solver SolverSettings{..}
                                  (PackagePropertyFlags flags))
               ConstraintSourceConfigFlagOrTarget
           | let flags = solverSettingFlagAssignment
-          , not (null flags)
+          , not (PD.nullFlagAssignment flags)
           , pkg <- localPackages
-          , let pkgname = packageName pkg ]
+          , let pkgname = pkgSpecifierTarget pkg ]
 
       $ stdResolverParams
 
@@ -1010,8 +1018,72 @@ planPackages verbosity comp platform solver SolverSettings{..}
       -- its own addDefaultSetupDependencies that is not appropriate for us.
       basicInstallPolicy
         installedPkgIndex sourcePkgDb
-        (map SpecificSourcePackage localPackages)
+        localPackages
 
+    -- While we can talk to older Cabal versions (we need to be able to
+    -- do so for custom Setup scripts that require older Cabal lib
+    -- versions), we have problems talking to some older versions that
+    -- don't support certain features.
+    --
+    -- For example, Cabal-1.16 and older do not know about build targets.
+    -- Even worse, 1.18 and older only supported the --constraint flag
+    -- with source package ids, not --dependency with installed package
+    -- ids. That is bad because we cannot reliably select the right
+    -- dependencies in the presence of multiple instances (i.e. the
+    -- store). See issue #3932. So we require Cabal 1.20 as a minimum.
+    --
+    -- Moreover, lib:Cabal generally only supports the interface of
+    -- current and past compilers; in fact recent lib:Cabal versions
+    -- will warn when they encounter a too new or unknown GHC compiler
+    -- version (c.f. #415). To avoid running into unsupported
+    -- configurations we encode the compatiblity matrix as lower
+    -- bounds on lib:Cabal here (effectively corresponding to the
+    -- respective major Cabal version bundled with the respective GHC
+    -- release).
+    --
+    -- GHC 8.4   needs  Cabal >= 2.2
+    -- GHC 8.2   needs  Cabal >= 2.0
+    -- GHC 8.0   needs  Cabal >= 1.24
+    -- GHC 7.10  needs  Cabal >= 1.22
+    --
+    -- (NB: we don't need to consider older GHCs as Cabal >= 1.20 is
+    -- the absolute lower bound)
+    --
+    -- TODO: long-term, this compatibility matrix should be
+    --       stored as a field inside 'Distribution.Compiler.Compiler'
+    setupMinCabalVersionConstraint
+      | isGHC, compVer >= mkVersion [8,4,1] = mkVersion [2,2]
+        -- GHC 8.4.1-rc1 (GHC 8.4.0.20180224) still shipped with an
+        -- devel snapshot of Cabal-2.1.0.0; the rule below can be
+        -- dropped at some point
+      | isGHC, compVer >= mkVersion [8,4]  = mkVersion [2,1]
+      | isGHC, compVer >= mkVersion [8,2]  = mkVersion [2,0]
+      | isGHC, compVer >= mkVersion [8,0]  = mkVersion [1,24]
+      | isGHC, compVer >= mkVersion [7,10] = mkVersion [1,22]
+      | otherwise                          = mkVersion [1,20]
+      where
+        isGHC    = compFlav `elem` [GHC,GHCJS]
+        compFlav = compilerFlavor comp
+        compVer  = compilerVersion comp
+
+    -- As we can't predict the future, we also place a global upper
+    -- bound on the lib:Cabal version we know how to interact with:
+    --
+    -- The upper bound is computed by incrementing the current major
+    -- version twice in order to allow for the current version, as
+    -- well as the next adjacent major version (one of which will not
+    -- be released, as only "even major" versions of Cabal are
+    -- released to Hackage or bundled with proper GHC releases).
+    --
+    -- For instance, if the current version of cabal-install is an odd
+    -- development version, e.g.  Cabal-2.1.0.0, then we impose an
+    -- upper bound `setup.Cabal < 2.3`; if `cabal-install` is on a
+    -- stable/release even version, e.g. Cabal-2.2.1.0, the upper
+    -- bound is `setup.Cabal < 2.4`. This gives us enough flexibility
+    -- when dealing with development snapshots of Cabal and cabal-install.
+    --
+    setupMaxCabalVersionConstraint =
+      alterVersion (take 2) $ incVersion 1 $ incVersion 1 cabalVersion
 
 ------------------------------------------------------------------------------
 -- * Install plan post-processing
@@ -1122,20 +1194,22 @@ elaborateInstallPlan
   -> DistDirLayout
   -> StoreDirLayout
   -> SolverInstallPlan
-  -> [SourcePackage loc]
+  -> [PackageSpecifier (SourcePackage loc)]
   -> Map PackageId PackageSourceHash
   -> InstallDirs.InstallDirTemplates
   -> ProjectConfigShared
   -> PackageConfig
+  -> PackageConfig
   -> Map PackageName PackageConfig
   -> LogProgress (ElaboratedInstallPlan, ElaboratedSharedConfig)
 elaborateInstallPlan verbosity platform compiler compilerprogdb pkgConfigDB
-                     DistDirLayout{..}
+                     distDirLayout@DistDirLayout{..}
                      storeDirLayout@StoreDirLayout{storePackageDBStack}
                      solverPlan localPackages
                      sourcePackageHashes
                      defaultInstallDirs
                      sharedPackageConfig
+                     allPackagesConfig
                      localPackagesConfig
                      perPackageConfig = do
     x <- elaboratedInstallPlan
@@ -1191,7 +1265,7 @@ elaborateInstallPlan verbosity platform compiler compilerprogdb pkgConfigDB
             if null not_per_component_reasons
                 then return comps
                 else do checkPerPackageOk comps not_per_component_reasons
-                        return [elaborateSolverToPackage mapDep spkg g $
+                        return [elaborateSolverToPackage spkg g $
                                 comps ++ maybeToList setupComponent]
            Left cns ->
             dieProgress $
@@ -1200,19 +1274,24 @@ elaborateInstallPlan verbosity platform compiler compilerprogdb pkgConfigDB
       where
         -- You are eligible to per-component build if this list is empty
         why_not_per_component g
-            = cuz_custom ++ cuz_spec ++ cuz_length ++ cuz_flag
+            = cuz_buildtype ++ cuz_spec ++ cuz_length ++ cuz_flag ++ cuz_coverage
           where
             cuz reason = [text reason]
-            -- At this point in time, only non-Custom setup scripts
+            -- We have to disable per-component for now with
+            -- Configure-type scripts in order to prevent parallel
+            -- invocation of the same `./configure` script.
+            -- See https://github.com/haskell/cabal/issues/4548
+            --
+            -- Moreoever, at this point in time, only non-Custom setup scripts
             -- are supported.  Implementing per-component builds with
             -- Custom would require us to create a new 'ElabSetup'
             -- type, and teach all of the code paths how to handle it.
             -- Once you've implemented this, swap it for the code below.
-            cuz_custom =
+            cuz_buildtype =
                 case PD.buildType (elabPkgDescription elab0) of
-                    Nothing        -> cuz "build-type is not specified"
-                    Just PD.Custom -> cuz "build-type is Custom"
-                    Just _         -> []
+                    PD.Configure -> cuz "build-type is Configure"
+                    PD.Custom -> cuz "build-type is Custom"
+                    _         -> []
             -- cabal-format versions prior to 1.8 have different build-depends semantics
             -- for now it's easier to just fallback to legacy-mode when specVersion < 1.8
             -- see, https://github.com/haskell/cabal/issues/4121
@@ -1232,6 +1311,12 @@ elaborateInstallPlan verbosity platform compiler compilerprogdb pkgConfigDB
                 | fromFlagOrDefault True (projectConfigPerComponent sharedPackageConfig)
                 = []
                 | otherwise = cuz "you passed --disable-per-component"
+            -- Enabling program coverage introduces odd runtime dependencies
+            -- between components.
+            cuz_coverage
+                | fromFlagOrDefault False (packageConfigCoverage localPackagesConfig)
+                = cuz "program coverage is enabled"
+                | otherwise = []
 
         -- | Sometimes a package may make use of features which are only
         -- supported in per-package mode.  If this is the case, we should
@@ -1246,7 +1331,7 @@ elaborateInstallPlan verbosity platform compiler compilerprogdb pkgConfigDB
                         fsep (punctuate comma reasons)
             -- TODO: Maybe exclude Backpack too
 
-        elab0 = elaborateSolverToCommon mapDep spkg
+        elab0 = elaborateSolverToCommon spkg
         pkgid = elabPkgSourceId    elab0
         pd    = elabPkgDescription elab0
 
@@ -1256,7 +1341,7 @@ elaborateInstallPlan verbosity platform compiler compilerprogdb pkgConfigDB
         -- have to add dependencies on this from all other components
         setupComponent :: Maybe ElaboratedConfiguredPackage
         setupComponent
-            | fromMaybe PD.Custom (PD.buildType (elabPkgDescription elab0)) == PD.Custom
+            | PD.buildType (elabPkgDescription elab0) == PD.Custom
             = Just elab0 {
                 elabModuleShape = emptyModuleShape,
                 elabUnitId = notImpl "elabUnitId",
@@ -1435,21 +1520,15 @@ elaborateInstallPlan verbosity platform compiler compilerprogdb pkgConfigDB
                   (compilerId compiler)
                   cid
 
-            -- NB: For inplace NOT InstallPaths.bindir installDirs; for an
-            -- inplace build those values are utter nonsense.  So we
-            -- have to guess where the directory is going to be.
-            -- Fortunately this is "stable" part of Cabal API.
-            -- But the way we get the build directory is A HORRIBLE
-            -- HACK.
-            inplace_bin_dir elab
-              | shouldBuildInplaceOnly spkg
-              = distBuildDirectory
-                    (elabDistDirParams elaboratedSharedConfig elab) </>
-                    "build" </> case Cabal.componentNameString cname of
-                                    Just n -> display n
-                                    Nothing -> ""
-              | otherwise
-              = InstallDirs.bindir (elabInstallDirs elab)
+            inplace_bin_dir elab =
+                binDirectoryFor
+                    distDirLayout
+                    elaboratedSharedConfig
+                    elab $
+                    case Cabal.componentNameString cname of
+                             Just n -> display n
+                             Nothing -> ""
+
 
     -- | Given a 'SolverId' referencing a dependency on a library, return
     -- the 'ElaboratedPlanPackage' corresponding to the library.  This
@@ -1464,28 +1543,24 @@ elaborateInstallPlan verbosity platform compiler compilerprogdb pkgConfigDB
     planPackageExePath =
         -- Pre-existing executables are assumed to be in PATH
         -- already.  In fact, this should be impossible.
-        -- Modest duplication with 'inplace_bin_dir'
         InstallPlan.foldPlanPackage (const Nothing) $ \elab -> Just $
-            if elabBuildStyle elab == BuildInplaceOnly
-              then distBuildDirectory
-                    (elabDistDirParams elaboratedSharedConfig elab) </>
-                    "build" </>
-                        case elabPkgOrComp elab of
-                            ElabPackage _ -> ""
-                            ElabComponent comp ->
-                                case fmap Cabal.componentNameString
-                                          (compComponentName comp) of
-                                    Just (Just n) -> display n
-                                    _ -> ""
-              else InstallDirs.bindir (elabInstallDirs elab)
+            binDirectoryFor
+                distDirLayout
+                elaboratedSharedConfig
+                elab $
+                    case elabPkgOrComp elab of
+                        ElabPackage _ -> ""
+                        ElabComponent comp ->
+                            case fmap Cabal.componentNameString
+                                      (compComponentName comp) of
+                                Just (Just n) -> display n
+                                _ -> ""
 
-    elaborateSolverToPackage :: (SolverId -> [ElaboratedPlanPackage])
-                             -> SolverPackage UnresolvedPkgLoc
+    elaborateSolverToPackage :: SolverPackage UnresolvedPkgLoc
                              -> ComponentsGraph
                              -> [ElaboratedConfiguredPackage]
                              -> ElaboratedConfiguredPackage
     elaborateSolverToPackage
-        mapDep
         pkg@(SolverPackage (SourcePackage pkgid _gdesc _srcloc _descOverride)
                            _flags _stanzas _deps0 _exe_deps0)
         compGraph comps =
@@ -1494,7 +1569,7 @@ elaborateInstallPlan verbosity platform compiler compilerprogdb pkgConfigDB
         -- of the other fields of the elaboratedPackage.
         elab
       where
-        elab0@ElaboratedConfiguredPackage{..} = elaborateSolverToCommon mapDep pkg
+        elab0@ElaboratedConfiguredPackage{..} = elaborateSolverToCommon pkg
         elab = elab0 {
                 elabUnitId = newSimpleUnitId pkgInstalledId,
                 elabComponentId = pkgInstalledId,
@@ -1557,8 +1632,14 @@ elaborateInstallPlan verbosity platform compiler compilerprogdb pkgConfigDB
                             } <- comps
                           ]
 
-        -- Filled in later
-        pkgStanzasEnabled  = Set.empty
+        -- NB: This is not the final setting of 'pkgStanzasEnabled'.
+        -- See [Sticky enabled testsuites]; we may enable some extra
+        -- stanzas opportunistically when it is cheap to do so.
+        --
+        -- However, we start off by enabling everything that was
+        -- requested, so that we can maintain an invariant that
+        -- pkgStanzasEnabled is a superset of elabStanzasRequested
+        pkgStanzasEnabled  = Map.keysSet (Map.filter (id :: Bool -> Bool) elabStanzasRequested)
 
         install_dirs
           | shouldBuildInplaceOnly pkg
@@ -1585,10 +1666,9 @@ elaborateInstallPlan verbosity platform compiler compilerprogdb pkgConfigDB
               (compilerId compiler)
               pkgInstalledId
 
-    elaborateSolverToCommon :: (SolverId -> [ElaboratedPlanPackage])
-                            -> SolverPackage UnresolvedPkgLoc
+    elaborateSolverToCommon :: SolverPackage UnresolvedPkgLoc
                             -> ElaboratedConfiguredPackage
-    elaborateSolverToCommon mapDep
+    elaborateSolverToCommon
         pkg@(SolverPackage (SourcePackage pkgid gdesc srcloc descOverride)
                            flags stanzas deps0 _exe_deps0) =
         elaboratedPackage
@@ -1613,7 +1693,8 @@ elaborateInstallPlan verbosity platform compiler compilerprogdb pkgConfigDB
                                     [] gdesc
                                in desc
         elabFlagAssignment  = flags
-        elabFlagDefaults    = [ (Cabal.flagName flag, Cabal.flagDefault flag)
+        elabFlagDefaults    = PD.mkFlagAssignment
+                              [ (Cabal.flagName flag, Cabal.flagDefault flag)
                               | flag <- PD.genPackageFlags gdesc ]
 
         elabEnabledSpec      = enableStanzas stanzas
@@ -1644,8 +1725,10 @@ elaborateInstallPlan verbosity platform compiler compilerprogdb pkgConfigDB
         -- Check the comments of those functions for more details.
         elabBuildTargets    = []
         elabTestTargets     = []
+        elabBenchTargets    = []
         elabReplTarget      = Nothing
-        elabBuildHaddocks   = False
+        elabBuildHaddocks   =
+          perPkgOptionFlag pkgid False packageConfigDocumentation
 
         elabPkgSourceLocation = srcloc
         elabPkgSourceHash   = Map.lookup pkgid sourcePackageHashes
@@ -1656,10 +1739,9 @@ elaborateInstallPlan verbosity platform compiler compilerprogdb pkgConfigDB
         elabRegisterPackageDBStack = buildAndRegisterDbs
 
         elabSetupScriptStyle       = packageSetupScriptStyle elabPkgDescription
-        -- Computing the deps here is a little awful
-        deps = fmap (concatMap (elaborateLibSolverId mapDep)) deps0
-        elabSetupScriptCliVersion  = packageSetupScriptSpecVersion
-                                      elabSetupScriptStyle elabPkgDescription deps
+        elabSetupScriptCliVersion  =
+          packageSetupScriptSpecVersion
+          elabSetupScriptStyle elabPkgDescription libDepGraph deps0
         elabSetupPackageDBStack    = buildAndRegisterDbs
 
         buildAndRegisterDbs
@@ -1670,6 +1752,7 @@ elaborateInstallPlan verbosity platform compiler compilerprogdb pkgConfigDB
 
         elabVanillaLib    = perPkgOptionFlag pkgid True packageConfigVanillaLib --TODO: [required feature]: also needs to be handled recursively
         elabSharedLib     = pkgid `Set.member` pkgsUseSharedLibrary
+        elabStaticLib     = perPkgOptionFlag pkgid False packageConfigStaticLib
         elabDynExe        = perPkgOptionFlag pkgid False packageConfigDynExe
         elabGHCiLib       = perPkgOptionFlag pkgid False packageConfigGHCiLib --TODO: [required feature] needs to default to enabled on windows still
 
@@ -1684,6 +1767,7 @@ elaborateInstallPlan verbosity platform compiler compilerprogdb pkgConfigDB
 
         elabOptimization  = perPkgOptionFlag pkgid NormalOptimisation packageConfigOptimization
         elabSplitObjs     = perPkgOptionFlag pkgid False packageConfigSplitObjs
+        elabSplitSections = perPkgOptionFlag pkgid False packageConfigSplitSections
         elabStripLibs     = perPkgOptionFlag pkgid False packageConfigStripLibs
         elabStripExes     = perPkgOptionFlag pkgid False packageConfigStripExes
         elabDebugInfo     = perPkgOptionFlag pkgid NoDebugInfo packageConfigDebugInfo
@@ -1717,12 +1801,13 @@ elaborateInstallPlan verbosity platform compiler compilerprogdb pkgConfigDB
         elabHaddockHtml         = perPkgOptionFlag pkgid False packageConfigHaddockHtml
         elabHaddockHtmlLocation = perPkgOptionMaybe pkgid packageConfigHaddockHtmlLocation
         elabHaddockForeignLibs  = perPkgOptionFlag pkgid False packageConfigHaddockForeignLibs
+        elabHaddockForHackage   = perPkgOptionFlag pkgid Cabal.ForDevelopment packageConfigHaddockForHackage
         elabHaddockExecutables  = perPkgOptionFlag pkgid False packageConfigHaddockExecutables
         elabHaddockTestSuites   = perPkgOptionFlag pkgid False packageConfigHaddockTestSuites
         elabHaddockBenchmarks   = perPkgOptionFlag pkgid False packageConfigHaddockBenchmarks
         elabHaddockInternal     = perPkgOptionFlag pkgid False packageConfigHaddockInternal
         elabHaddockCss          = perPkgOptionMaybe pkgid packageConfigHaddockCss
-        elabHaddockHscolour     = perPkgOptionFlag pkgid False packageConfigHaddockHscolour
+        elabHaddockLinkedSource = perPkgOptionFlag pkgid False packageConfigHaddockLinkedSource
         elabHaddockHscolourCss  = perPkgOptionMaybe pkgid packageConfigHaddockHscolourCss
         elabHaddockContents     = perPkgOptionMaybe pkgid packageConfigHaddockContents
 
@@ -1747,14 +1832,17 @@ elaborateInstallPlan verbosity platform compiler compilerprogdb pkgConfigDB
 
     lookupPerPkgOption :: (Package pkg, Monoid m)
                        => pkg -> (PackageConfig -> m) -> m
-    lookupPerPkgOption pkg f
-      -- the project config specifies values that apply to packages local to
-      -- but by default non-local packages get all default config values
-      -- the project, and can specify per-package values for any package,
-      | isLocalToProject pkg = local `mappend` perpkg
-      | otherwise            =                 perpkg
+    lookupPerPkgOption pkg f =
+        -- This is where we merge the options from the project config that
+        -- apply to all packages, all project local packages, and to specific
+        -- named packages
+        global `mappend` local `mappend` perpkg
       where
-        local  = f localPackagesConfig
+        global = f allPackagesConfig
+        local  | isLocalToProject pkg
+               = f localPackagesConfig
+               | otherwise
+               = mempty
         perpkg = maybe mempty f (Map.lookup (packageName pkg) perPackageConfig)
 
     inplacePackageDbs = storePackageDbs
@@ -1776,15 +1864,25 @@ elaborateInstallPlan verbosity platform compiler compilerprogdb pkgConfigDB
       $ map packageId
       $ SolverInstallPlan.reverseDependencyClosure
           solverPlan
-          [ PlannedId (packageId pkg)
-          | pkg <- localPackages ]
+          (map PlannedId (Set.toList pkgsLocalToProject))
 
     isLocalToProject :: Package pkg => pkg -> Bool
     isLocalToProject pkg = Set.member (packageId pkg)
                                       pkgsLocalToProject
 
     pkgsLocalToProject :: Set PackageId
-    pkgsLocalToProject = Set.fromList [ packageId pkg | pkg <- localPackages ]
+    pkgsLocalToProject =
+        Set.fromList (catMaybes (map shouldBeLocal localPackages))
+        --TODO: localPackages is a misnomer, it's all project packages
+        -- here is where we decide which ones will be local!
+      where
+        shouldBeLocal :: PackageSpecifier (SourcePackage loc) -> Maybe PackageId
+        shouldBeLocal NamedPackage{}              = Nothing
+        shouldBeLocal (SpecificSourcePackage pkg) = Just (packageId pkg)
+        -- TODO: It's not actually obvious for all of the
+        -- 'ProjectPackageLocation's that they should all be local. We might
+        -- need to provide the user with a choice.
+        -- Also, review use of SourcePackage's loc vs ProjectPackageLocation
 
     pkgsUseSharedLibrary :: Set PackageId
     pkgsUseSharedLibrary =
@@ -1924,6 +2022,35 @@ mkShapeMapping dpkg =
         IndefFullUnitId dcid
             (Map.fromList [ (req, OpenModuleVar req)
                           | req <- Set.toList (modShapeRequires shape)])
+
+-- | Get the bin\/ directories that a package's executables should reside in.
+--
+-- The result may be empty if the package does not build any executables.
+--
+-- The result may have several entries if this is an inplace build of a package
+-- with multiple executables.
+binDirectories
+  :: DistDirLayout
+  -> ElaboratedSharedConfig
+  -> ElaboratedConfiguredPackage
+  -> [FilePath]
+binDirectories layout config package = case elabBuildStyle package of
+  -- quick sanity check: no sense returning a bin directory if we're not going
+  -- to put any executables in it, that will just clog up the PATH
+  _ | noExecutables -> []
+  BuildAndInstall -> [installedBinDirectory package]
+  BuildInplaceOnly -> map (root</>) $ case elabPkgOrComp package of
+    ElabComponent comp -> case compSolverName comp of
+      CD.ComponentExe n -> [display n]
+      _ -> []
+    ElabPackage _ -> map (display . PD.exeName)
+                   . PD.executables
+                   . elabPkgDescription
+                   $ package
+  where
+  noExecutables = null . PD.executables . elabPkgDescription $ package
+  root  =  distBuildDirectory layout (elabDistDirParams config package)
+       </> "build"
 
 -- | A newtype for 'SolverInstallPlan.SolverPlanPackage' for which the
 -- dependency graph considers only dependencies on libraries which are
@@ -2309,6 +2436,7 @@ pkgHasEphemeralBuildTargets :: ElaboratedConfiguredPackage -> Bool
 pkgHasEphemeralBuildTargets elab =
     isJust (elabReplTarget elab)
  || (not . null) (elabTestTargets elab)
+ || (not . null) (elabBenchTargets elab)
  || (not . null) [ () | ComponentTarget _ subtarget <- elabBuildTargets elab
                       , subtarget /= WholeComponent ]
 
@@ -2334,12 +2462,17 @@ elabBuildTargetWholeComponents elab =
 data TargetAction = TargetActionBuild
                   | TargetActionRepl
                   | TargetActionTest
+                  | TargetActionBench
                   | TargetActionHaddock
 
 -- | Given a set of per-package\/per-component targets, take the subset of the
 -- install plan needed to build those targets. Also, update the package config
 -- to specify which optional stanzas to enable, and which targets within each
 -- package to build.
+--
+-- NB: Pruning happens after improvement, which is important because we
+-- will prune differently depending on what is already installed (to
+-- implement "sticky" test suite enabling behavior).
 --
 pruneInstallPlanToTargets :: TargetAction
                           -> Map UnitId [ComponentTarget]
@@ -2401,6 +2534,7 @@ setRootTargets targetAction perPkgTargetsMap =
         (Nothing, _)                      -> elab
         (Just tgts,  TargetActionBuild)   -> elab { elabBuildTargets = tgts }
         (Just tgts,  TargetActionTest)    -> elab { elabTestTargets  = tgts }
+        (Just tgts,  TargetActionBench)   -> elab { elabBenchTargets  = tgts }
         (Just [tgt], TargetActionRepl)    -> elab { elabReplTarget = Just tgt }
         (Just _,     TargetActionHaddock) -> elab { elabBuildHaddocks = True }
         (Just _,     TargetActionRepl)    ->
@@ -2426,19 +2560,20 @@ pruneInstallPlanPass1 pkgs =
     roots = mapMaybe find_root pkgs'
 
     prune elab = PrunedPackage elab' (pruneOptionalDependencies elab')
-      where elab' = pruneOptionalStanzas elab
+      where elab' = addOptionalStanzas elab
 
     find_root (InstallPlan.Configured (PrunedPackage elab _)) =
         if not (null (elabBuildTargets elab)
                     && null (elabTestTargets elab)
+                    && null (elabBenchTargets elab)
                     && isNothing (elabReplTarget elab)
                     && not (elabBuildHaddocks elab))
             then Just (installedUnitId elab)
             else Nothing
     find_root _ = Nothing
 
-    -- Decide whether or not to enable testsuites and benchmarks
-    --
+    -- Note [Sticky enabled testsuites]
+    -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     -- The testsuite and benchmark targets are somewhat special in that we need
     -- to configure the packages with them enabled, and we need to do that even
     -- if we only want to build one of several testsuites.
@@ -2452,18 +2587,31 @@ pruneInstallPlanPass1 pkgs =
     -- would involve unnecessarily reconfiguring the package with testsuites
     -- disabled. Technically this introduces a little bit of stateful
     -- behaviour to make this "sticky", but it should be benign.
-    --
-    pruneOptionalStanzas :: ElaboratedConfiguredPackage -> ElaboratedConfiguredPackage
-    pruneOptionalStanzas elab@ElaboratedConfiguredPackage{ elabPkgOrComp = ElabPackage pkg } =
+
+    -- Decide whether or not to enable testsuites and benchmarks.
+    -- See [Sticky enabled testsuites]
+    addOptionalStanzas :: ElaboratedConfiguredPackage -> ElaboratedConfiguredPackage
+    addOptionalStanzas elab@ElaboratedConfiguredPackage{ elabPkgOrComp = ElabPackage pkg } =
         elab {
             elabPkgOrComp = ElabPackage (pkg { pkgStanzasEnabled = stanzas })
         }
       where
         stanzas :: Set OptionalStanza
-        stanzas = optionalStanzasRequiredByTargets  elab
-               <> optionalStanzasRequestedByDefault elab
+               -- By default, we enabled all stanzas requested by the user,
+               -- as per elabStanzasRequested, done in
+               -- 'elaborateSolverToPackage'
+        stanzas = pkgStanzasEnabled pkg
+               -- optionalStanzasRequiredByTargets has to be done at
+               -- prune-time because it depends on 'elabTestTargets'
+               -- et al, which is done by 'setRootTargets' at the
+               -- beginning of pruning.
+               <> optionalStanzasRequiredByTargets elab
+               -- optionalStanzasWithDepsAvailable has to be done at
+               -- prune-time because it depends on what packages are
+               -- installed, which is not known until after improvement
+               -- (pruning is done after improvement)
                <> optionalStanzasWithDepsAvailable availablePkgs elab pkg
-    pruneOptionalStanzas elab = elab
+    addOptionalStanzas elab = elab
 
     -- Calculate package dependencies but cut out those needed only by
     -- optional stanzas that we've determined we will not enable.
@@ -2489,16 +2637,10 @@ pruneInstallPlanPass1 pkgs =
         [ stanza
         | ComponentTarget cname _ <- elabBuildTargets pkg
                                   ++ elabTestTargets pkg
+                                  ++ elabBenchTargets pkg
                                   ++ maybeToList (elabReplTarget pkg)
         , stanza <- maybeToList (componentOptionalStanza cname)
         ]
-
-    optionalStanzasRequestedByDefault :: ElaboratedConfiguredPackage
-                                      -> Set OptionalStanza
-    optionalStanzasRequestedByDefault =
-        Map.keysSet
-      . Map.filter (id :: Bool -> Bool)
-      . elabStanzasRequested
 
     availablePkgs =
       Set.fromList
@@ -2668,7 +2810,7 @@ pruneInstallPlanToDependencies pkgTargets installPlan =
             Left $ CannotPruneDependencies
              [ (pkg, missingDeps)
              | (pkg, missingDepIds) <- brokenPackages
-             , let missingDeps = catMaybes (map lookupDep missingDepIds)
+             , let missingDeps = mapMaybe lookupDep missingDepIds
              ]
             where
               -- lookup in the original unpruned graph
@@ -2739,7 +2881,7 @@ packageSetupScriptStyle pkg
   | otherwise
   = SetupNonCustomInternalLib
   where
-    buildType = fromMaybe PD.Custom (PD.buildType pkg)
+    buildType = PD.buildType pkg
 
 
 -- | Part of our Setup.hs handling policy is implemented by getting the solver
@@ -2819,31 +2961,34 @@ defaultSetupDeps compiler platform pkg =
 -- of what the solver picked for us, based on the explicit setup deps or the
 -- ones added implicitly by 'defaultSetupDeps'.
 --
-packageSetupScriptSpecVersion :: Package pkg
-                              => SetupScriptStyle
+packageSetupScriptSpecVersion :: SetupScriptStyle
                               -> PD.PackageDescription
-                              -> ComponentDeps [pkg]
+                              -> Graph.Graph NonSetupLibDepSolverPlanPackage
+                              -> ComponentDeps [SolverId]
                               -> Version
 
 -- We're going to be using the internal Cabal library, so the spec version of
 -- that is simply the version of the Cabal library that cabal-install has been
 -- built with.
-packageSetupScriptSpecVersion SetupNonCustomInternalLib _ _ =
+packageSetupScriptSpecVersion SetupNonCustomInternalLib _ _ _ =
     cabalVersion
 
 -- If we happen to be building the Cabal lib itself then because that
 -- bootstraps itself then we use the version of the lib we're building.
-packageSetupScriptSpecVersion SetupCustomImplicitDeps pkg _
+packageSetupScriptSpecVersion SetupCustomImplicitDeps pkg _ _
   | packageName pkg == cabalPkgname
   = packageVersion pkg
 
 -- In all other cases we have a look at what version of the Cabal lib the
 -- solver picked. Or if it didn't depend on Cabal at all (which is very rare)
 -- then we look at the .cabal file to see what spec version it declares.
-packageSetupScriptSpecVersion _ pkg deps =
-    case find ((cabalPkgname ==) . packageName) (CD.setupDeps deps) of
+packageSetupScriptSpecVersion _ pkg libDepGraph deps =
+    case find ((cabalPkgname ==) . packageName) setupLibDeps of
       Just dep -> packageVersion dep
       Nothing  -> PD.specVersion pkg
+  where
+    setupLibDeps = map packageId $ fromMaybe [] $
+                   Graph.closure libDepGraph (CD.setupDeps deps)
 
 
 cabalPkgname, basePkgname :: PackageName
@@ -2875,6 +3020,7 @@ legacyCustomSetupPkgs compiler (Platform _ os) =
 -- in the store and local dbs.
 
 setupHsScriptOptions :: ElaboratedReadyPackage
+                     -> ElaboratedInstallPlan
                      -> ElaboratedSharedConfig
                      -> FilePath
                      -> FilePath
@@ -2884,7 +3030,7 @@ setupHsScriptOptions :: ElaboratedReadyPackage
 -- TODO: Fix this so custom is a separate component.  Custom can ALWAYS
 -- be a separate component!!!
 setupHsScriptOptions (ReadyPackage elab@ElaboratedConfiguredPackage{..})
-                     ElaboratedSharedConfig{..} srcdir builddir
+                     plan ElaboratedSharedConfig{..} srcdir builddir
                      isParallelBuild cacheLock =
     SetupScriptOptions {
       useCabalVersion          = thisVersion elabSetupScriptCliVersion,
@@ -2903,6 +3049,7 @@ setupHsScriptOptions (ReadyPackage elab@ElaboratedConfiguredPackage{..})
       useLoggingHandle         = Nothing, -- this gets set later
       useWorkingDir            = Just srcdir,
       useExtraPathEnv          = elabExeDependencyPaths elab,
+      useExtraEnvOverrides     = dataDirsEnvironmentForPlan plan,
       useWin32CleanHack        = False,   --TODO: [required eventually]
       forceExternalSetupMethod = isParallelBuild,
       setupCacheLock           = Just cacheLock,
@@ -2926,15 +3073,22 @@ storePackageInstallDirs :: StoreDirLayout
                         -> CompilerId
                         -> InstalledPackageId
                         -> InstallDirs.InstallDirs FilePath
-storePackageInstallDirs StoreDirLayout{storePackageDirectory}
+storePackageInstallDirs StoreDirLayout{ storePackageDirectory
+                                      , storeDirectory }
                         compid ipkgid =
     InstallDirs.InstallDirs {..}
   where
+    store        = storeDirectory compid
     prefix       = storePackageDirectory compid (newSimpleUnitId ipkgid)
     bindir       = prefix </> "bin"
     libdir       = prefix </> "lib"
     libsubdir    = ""
-    dynlibdir    = libdir
+    -- Note: on macOS, we place libraries into
+    --       @store/lib@ to work around the load
+    --       command size limit of macOSs mach-o linker.
+    --       See also @PackageHash.hashedInstalledPackageIdVeryShort@
+    dynlibdir    | buildOS == OSX = store </> "lib"
+                 | otherwise      = libdir
     flibdir      = libdir
     libexecdir   = prefix </> "libexec"
     libexecsubdir= ""
@@ -2980,7 +3134,25 @@ setupHsConfigureFlags (ReadyPackage elab@ElaboratedConfiguredPackage{..})
                                   ElabComponent _ -> toFlag elabComponentId
 
     configProgramPaths        = Map.toList elabProgramPaths
-    configProgramArgs         = Map.toList elabProgramArgs
+    configProgramArgs
+        | {- elabSetupScriptCliVersion < mkVersion [1,24,3] -} True
+          -- workaround for <https://github.com/haskell/cabal/issues/4010>
+          --
+          -- It turns out, that even with Cabal 2.0, there's still cases such as e.g.
+          -- custom Setup.hs scripts calling out to GHC even when going via
+          -- @runProgram ghcProgram@, as e.g. happy does in its
+          -- <http://hackage.haskell.org/package/happy-1.19.5/src/Setup.lhs>
+          -- (see also <https://github.com/haskell/cabal/pull/4433#issuecomment-299396099>)
+          --
+          -- So for now, let's pass the rather harmless and idempotent
+          -- `-hide-all-packages` flag to all invocations (which has
+          -- the benefit that every GHC invocation starts with a
+          -- conistently well-defined clean slate) until we find a
+          -- better way.
+                              = Map.toList $
+                                Map.insertWith (++) "ghc" ["-hide-all-packages"]
+                                               elabProgramArgs
+        | otherwise           = Map.toList elabProgramArgs
     configProgramPathExtra    = toNubList elabProgramPathExtra
     configHcFlavor            = toFlag (compilerFlavor pkgConfigCompiler)
     configHcPath              = mempty -- we use configProgramPaths instead
@@ -2988,6 +3160,8 @@ setupHsConfigureFlags (ReadyPackage elab@ElaboratedConfiguredPackage{..})
 
     configVanillaLib          = toFlag elabVanillaLib
     configSharedLib           = toFlag elabSharedLib
+    configStaticLib           = toFlag elabStaticLib
+
     configDynExe              = toFlag elabDynExe
     configGHCiLib             = toFlag elabGHCiLib
     configProfExe             = mempty
@@ -3003,12 +3177,11 @@ setupHsConfigureFlags (ReadyPackage elab@ElaboratedConfiguredPackage{..})
     configLibCoverage         = mempty
 
     configOptimization        = toFlag elabOptimization
+    configSplitSections       = toFlag elabSplitSections
     configSplitObjs           = toFlag elabSplitObjs
     configStripExes           = toFlag elabStripExes
     configStripLibs           = toFlag elabStripLibs
     configDebugInfo           = toFlag elabDebugInfo
-    configAllowOlder          = mempty -- we use configExactConfiguration True
-    configAllowNewer          = mempty -- we use configExactConfiguration True
 
     configConfigurationsFlags = elabFlagAssignment
     configConfigureArgs       = elabConfigureScriptArgs
@@ -3059,7 +3232,7 @@ setupHsConfigureFlags (ReadyPackage elab@ElaboratedConfiguredPackage{..})
     configScratchDir          = mempty -- never use
     configUserInstall         = mempty -- don't rely on defaults
     configPrograms_           = mempty -- never use, shouldn't exist
-
+    configUseResponseFiles    = mempty
 
 setupHsConfigureArgs :: ElaboratedConfiguredPackage
                      -> [String]
@@ -3082,7 +3255,8 @@ setupHsBuildFlags _ _ verbosity builddir =
       buildVerbosity    = toFlag verbosity,
       buildDistPref     = toFlag builddir,
       buildNumJobs      = mempty, --TODO: [nice to have] sometimes want to use toFlag (Just numBuildJobs),
-      buildArgs         = mempty  -- unused, passed via args not flags
+      buildArgs         = mempty, -- unused, passed via args not flags
+      buildCabalFilePath= mempty
     }
 
 
@@ -3117,6 +3291,23 @@ setupHsTestArgs :: ElaboratedConfiguredPackage -> [String]
 setupHsTestArgs elab =
     mapMaybe (showTestComponentTarget (packageId elab)) (elabTestTargets elab)
 
+
+setupHsBenchFlags :: ElaboratedConfiguredPackage
+                  -> ElaboratedSharedConfig
+                  -> Verbosity
+                  -> FilePath
+                  -> Cabal.BenchmarkFlags
+setupHsBenchFlags _ _ verbosity builddir = Cabal.BenchmarkFlags
+    { benchmarkDistPref  = toFlag builddir
+    , benchmarkVerbosity = toFlag verbosity
+    , benchmarkOptions   = mempty
+    }
+
+setupHsBenchArgs :: ElaboratedConfiguredPackage -> [String]
+setupHsBenchArgs elab =
+    mapMaybe (showBenchComponentTarget (packageId elab)) (elabBenchTargets elab)
+
+
 setupHsReplFlags :: ElaboratedConfiguredPackage
                  -> ElaboratedSharedConfig
                  -> Verbosity
@@ -3149,7 +3340,8 @@ setupHsCopyFlags _ _ verbosity builddir destdir =
       copyArgs      = [], -- TODO: could use this to only copy what we enabled
       copyDest      = toFlag (InstallDirs.CopyTo destdir),
       copyDistPref  = toFlag builddir,
-      copyVerbosity = toFlag verbosity
+      copyVerbosity = toFlag verbosity,
+      copyCabalFilePath = mempty
     }
 
 setupHsRegisterFlags :: ElaboratedConfiguredPackage
@@ -3170,7 +3362,8 @@ setupHsRegisterFlags ElaboratedConfiguredPackage{..} _
       regPrintId     = mempty,  -- never use
       regDistPref    = toFlag builddir,
       regArgs        = [],
-      regVerbosity   = toFlag verbosity
+      regVerbosity   = toFlag verbosity,
+      regCabalFilePath = mempty
     }
 
 setupHsHaddockFlags :: ElaboratedConfiguredPackage
@@ -3187,19 +3380,20 @@ setupHsHaddockFlags (ElaboratedConfiguredPackage{..}) _ verbosity builddir =
       haddockHoogle        = toFlag elabHaddockHoogle,
       haddockHtml          = toFlag elabHaddockHtml,
       haddockHtmlLocation  = maybe mempty toFlag elabHaddockHtmlLocation,
-      haddockForHackage    = mempty, --TODO: new flag
+      haddockForHackage    = toFlag elabHaddockForHackage,
       haddockForeignLibs   = toFlag elabHaddockForeignLibs,
       haddockExecutables   = toFlag elabHaddockExecutables,
       haddockTestSuites    = toFlag elabHaddockTestSuites,
       haddockBenchmarks    = toFlag elabHaddockBenchmarks,
       haddockInternal      = toFlag elabHaddockInternal,
       haddockCss           = maybe mempty toFlag elabHaddockCss,
-      haddockHscolour      = toFlag elabHaddockHscolour,
+      haddockLinkedSource  = toFlag elabHaddockLinkedSource,
       haddockHscolourCss   = maybe mempty toFlag elabHaddockHscolourCss,
       haddockContents      = maybe mempty toFlag elabHaddockContents,
       haddockDistPref      = toFlag builddir,
       haddockKeepTempFiles = mempty, --TODO: from build settings
-      haddockVerbosity     = toFlag verbosity
+      haddockVerbosity     = toFlag verbosity,
+      haddockCabalFilePath = mempty
     }
 
 {-
@@ -3323,6 +3517,7 @@ packageHashConfigInputs
       pkgHashProfExeDetail       = elabProfExeDetail,
       pkgHashCoverage            = elabCoverage,
       pkgHashOptimization        = elabOptimization,
+      pkgHashSplitSections       = elabSplitSections,
       pkgHashSplitObjs           = elabSplitObjs,
       pkgHashStripLibs           = elabStripLibs,
       pkgHashStripExes           = elabStripExes,
@@ -3354,3 +3549,39 @@ improveInstallPlanWithInstalledPackages installedPkgIdSet =
 
     --TODO: decide what to do if we encounter broken installed packages,
     -- since overwriting is never safe.
+
+
+-- Path construction
+------
+
+-- | The path to the directory that contains a specific executable.
+-- NB: For inplace NOT InstallPaths.bindir installDirs; for an
+-- inplace build those values are utter nonsense.  So we
+-- have to guess where the directory is going to be.
+-- Fortunately this is "stable" part of Cabal API.
+-- But the way we get the build directory is A HORRIBLE
+-- HACK.
+binDirectoryFor
+  :: DistDirLayout
+  -> ElaboratedSharedConfig
+  -> ElaboratedConfiguredPackage
+  -> FilePath
+  -> FilePath
+binDirectoryFor layout config package exe = case elabBuildStyle package of
+  BuildAndInstall -> installedBinDirectory package
+  BuildInplaceOnly -> inplaceBinRoot layout config package </> exe
+
+-- package has been built and installed.
+installedBinDirectory :: ElaboratedConfiguredPackage -> FilePath
+installedBinDirectory = InstallDirs.bindir . elabInstallDirs
+
+-- | The path to the @build@ directory for an inplace build.
+inplaceBinRoot
+  :: DistDirLayout
+  -> ElaboratedSharedConfig
+  -> ElaboratedConfiguredPackage
+  -> FilePath
+inplaceBinRoot layout config package
+  =  distBuildDirectory layout (elabDistDirParams config package)
+ </> "build"
+

@@ -21,7 +21,7 @@ module Distribution.Client.ProjectConfig.Types (
   ) where
 
 import Distribution.Client.Types
-         ( RemoteRepo )
+         ( RemoteRepo, AllowNewer(..), AllowOlder(..) )
 import Distribution.Client.Dependency.Types
          ( PreSolver )
 import Distribution.Client.Targets
@@ -48,7 +48,7 @@ import Distribution.Simple.Compiler
          ( Compiler, CompilerFlavor
          , OptimisationLevel(..), ProfDetailLevel, DebugInfoLevel(..) )
 import Distribution.Simple.Setup
-         ( Flag, AllowNewer(..), AllowOlder(..) )
+         ( Flag, HaddockTarget(..) )
 import Distribution.Simple.InstallDirs
          ( PathTemplate )
 import Distribution.Utils.NubList
@@ -113,6 +113,10 @@ data ProjectConfig
        projectConfigShared          :: ProjectConfigShared,
        projectConfigProvenance      :: Set ProjectConfigProvenance,
 
+       -- | Configuration to be applied to *all* packages,
+       -- whether named in `cabal.project` or not.
+       projectConfigAllPackages     :: PackageConfig,
+
        -- | Configuration to be applied to *local* packages; i.e.,
        -- any packages which are explicitly named in `cabal.project`.
        projectConfigLocalPackages   :: PackageConfig,
@@ -155,6 +159,7 @@ data ProjectConfigBuildOnly
 data ProjectConfigShared
    = ProjectConfigShared {
        projectConfigDistDir           :: Flag FilePath,
+       projectConfigConfigFile        :: Flag FilePath,
        projectConfigProjectFile       :: Flag FilePath,
        projectConfigHcFlavor          :: Flag CompilerFlavor,
        projectConfigHcPath            :: Flag FilePath,
@@ -186,11 +191,13 @@ data ProjectConfigShared
        projectConfigCountConflicts    :: Flag CountConflicts,
        projectConfigStrongFlags       :: Flag StrongFlags,
        projectConfigAllowBootLibInstalls :: Flag AllowBootLibInstalls,
-       projectConfigPerComponent      :: Flag Bool
+       projectConfigPerComponent      :: Flag Bool,
+       projectConfigIndependentGoals  :: Flag IndependentGoals,
+
+       projectConfigProgPathExtra     :: NubList FilePath
 
        -- More things that only make sense for manual mode, not --local mode
        -- too much control!
-     --projectConfigIndependentGoals  :: Flag IndependentGoals,
      --projectConfigShadowPkgs        :: Flag Bool,
      --projectConfigReinstall         :: Flag Bool,
      --projectConfigAvoidReinstalls   :: Flag Bool,
@@ -227,6 +234,7 @@ data PackageConfig
        packageConfigFlagAssignment      :: FlagAssignment,
        packageConfigVanillaLib          :: Flag Bool,
        packageConfigSharedLib           :: Flag Bool,
+       packageConfigStaticLib           :: Flag Bool,
        packageConfigDynExe              :: Flag Bool,
        packageConfigProf                :: Flag Bool, --TODO: [code cleanup] sort out
        packageConfigProfLib             :: Flag Bool, --      this duplication
@@ -241,6 +249,7 @@ data PackageConfig
        packageConfigExtraFrameworkDirs  :: [FilePath],
        packageConfigExtraIncludeDirs    :: [FilePath],
        packageConfigGHCiLib             :: Flag Bool,
+       packageConfigSplitSections       :: Flag Bool,
        packageConfigSplitObjs           :: Flag Bool,
        packageConfigStripExes           :: Flag Bool,
        packageConfigStripLibs           :: Flag Bool,
@@ -260,9 +269,10 @@ data PackageConfig
        packageConfigHaddockBenchmarks   :: Flag Bool, --TODO: [required eventually] use this
        packageConfigHaddockInternal     :: Flag Bool, --TODO: [required eventually] use this
        packageConfigHaddockCss          :: Flag FilePath, --TODO: [required eventually] use this
-       packageConfigHaddockHscolour     :: Flag Bool, --TODO: [required eventually] use this
+       packageConfigHaddockLinkedSource :: Flag Bool, --TODO: [required eventually] use this
        packageConfigHaddockHscolourCss  :: Flag FilePath, --TODO: [required eventually] use this
-       packageConfigHaddockContents     :: Flag PathTemplate --TODO: [required eventually] use this
+       packageConfigHaddockContents     :: Flag PathTemplate, --TODO: [required eventually] use this
+       packageConfigHaddockForHackage   :: Flag HaddockTarget
      }
   deriving (Eq, Show, Generic)
 
@@ -283,7 +293,7 @@ instance Ord k => Monoid (MapLast k v) where
   mappend = (<>)
 
 instance Ord k => Semigroup (MapLast k v) where
-  MapLast a <> MapLast b = MapLast (flip Map.union a b)
+  MapLast a <> MapLast b = MapLast $ Map.union b a
   -- rather than Map.union which is the normal Map monoid instance
 
 
@@ -361,10 +371,10 @@ data SolverSettings
        solverSettingCountConflicts    :: CountConflicts,
        solverSettingStrongFlags       :: StrongFlags,
        solverSettingAllowBootLibInstalls :: AllowBootLibInstalls,
-       solverSettingIndexState        :: IndexState
+       solverSettingIndexState        :: Maybe IndexState,
+       solverSettingIndependentGoals  :: IndependentGoals
        -- Things that only make sense for manual mode, not --local mode
        -- too much control!
-     --solverSettingIndependentGoals  :: IndependentGoals,
      --solverSettingShadowPkgs        :: Bool,
      --solverSettingReinstall         :: Bool,
      --solverSettingAvoidReinstalls   :: Bool,
@@ -406,6 +416,6 @@ data BuildTimeSettings
        buildSettingLocalRepos            :: [FilePath],
        buildSettingCacheDir              :: FilePath,
        buildSettingHttpTransport         :: Maybe String,
-       buildSettingIgnoreExpiry          :: Bool
+       buildSettingIgnoreExpiry          :: Bool,
+       buildSettingProgPathExtra         :: [FilePath]
      }
-

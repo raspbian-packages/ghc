@@ -4,15 +4,11 @@
      /><title
     >Bug6</title
     ><link href="#" rel="stylesheet" type="text/css" title="Ocean"
-     /><script src="haddock-util.js" type="text/javascript"
+     /><link rel="stylesheet" type="text/css" href="#"
+     /><script src="haddock-bundle.min.js" async="async" type="text/javascript"
     ></script
     ><script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.0/MathJax.js?config=TeX-AMS-MML_HTMLorMML" type="text/javascript"
     ></script
-    ><script type="text/javascript"
-    >//
-window.onload = function () {pageLoad();};
-//
-</script
     ></head
   ><body
   ><div id="package-header"
@@ -51,80 +47,84 @@ window.onload = function () {pageLoad();};
 	  ></div
 	></div
       ><div id="synopsis"
-      ><p id="control.syn" class="caption expander" onclick="toggleSection('syn')"
-	>Synopsis</p
-	><ul id="section.syn" class="hide" onclick="toggleSection('syn')"
-	><li class="src short"
-	  ><span class="keyword"
-	    >data</span
-	    > <a href="#"
-	    >A</a
-	    > = <a href="#"
-	    >A</a
-	    > <a href="#"
-	    >Int</a
-	    ></li
+      ><details id="syn"
+	><summary
+	  >Synopsis</summary
+	  ><ul class="details-toggle" data-details-id="syn"
 	  ><li class="src short"
-	  ><span class="keyword"
-	    >data</span
-	    > <a href="#"
-	    >B</a
-	    > = <a href="#"
-	    >B</a
-	    > {<ul class="subs"
-	    ><li
-	      ><a href="#"
-		>b</a
-		> :: <a href="#"
-		>Int</a
-		></li
-	      ></ul
-	    >}</li
-	  ><li class="src short"
-	  ><span class="keyword"
-	    >data</span
-	    > <a href="#"
-	    >C</a
-	    > = <a href="#"
-	    >C</a
-	    > {<ul class="subs"
-	    ><li
-	      ><a href="#"
-		>c1</a
-		> :: <a href="#"
-		>Int</a
-		></li
+	    ><span class="keyword"
+	      >data</span
+	      > <a href="#"
+	      >A</a
+	      > = <a href="#"
+	      >A</a
+	      > <a href="#" title="Data.Int"
+	      >Int</a
+	      ></li
+	    ><li class="src short"
+	    ><span class="keyword"
+	      >data</span
+	      > <a href="#"
+	      >B</a
+	      > = <a href="#"
+	      >B</a
+	      > <a href="#" title="Data.Int"
+	      >Int</a
+	      ></li
+	    ><li class="src short"
+	    ><a href="#"
+	      >b</a
+	      > :: <a href="#" title="Bug6"
+	      >B</a
+	      > -&gt; <a href="#" title="Data.Int"
+	      >Int</a
+	      ></li
+	    ><li class="src short"
+	    ><span class="keyword"
+	      >data</span
+	      > <a href="#"
+	      >C</a
+	      > = <a href="#"
+	      >C</a
+	      > {<ul class="subs"
 	      ><li
-	      ><a href="#"
-		>c2</a
-		> :: <a href="#"
-		>Int</a
-		></li
-	      ></ul
-	    >}</li
-	  ><li class="src short"
-	  ><span class="keyword"
-	    >data</span
-	    > <a href="#"
-	    >D</a
-	    > = <a href="#"
-	    >D</a
-	    > <a href="#"
-	    >Int</a
-	    > <a href="#"
-	    >Int</a
-	    ></li
-	  ><li class="src short"
-	  ><span class="keyword"
-	    >newtype</span
-	    > <a href="#"
-	    >E</a
-	    > = <a href="#"
-	    >E</a
-	    > <a href="#"
-	    >Int</a
-	    ></li
-	  ></ul
+		><a href="#"
+		  >c1</a
+		  > :: <a href="#" title="Data.Int"
+		  >Int</a
+		  ></li
+		><li
+		><a href="#"
+		  >c2</a
+		  > :: <a href="#" title="Data.Int"
+		  >Int</a
+		  ></li
+		></ul
+	      >}</li
+	    ><li class="src short"
+	    ><span class="keyword"
+	      >data</span
+	      > <a href="#"
+	      >D</a
+	      > = <a href="#"
+	      >D</a
+	      > <a href="#" title="Data.Int"
+	      >Int</a
+	      > <a href="#" title="Data.Int"
+	      >Int</a
+	      ></li
+	    ><li class="src short"
+	    ><span class="keyword"
+	      >newtype</span
+	      > <a href="#"
+	      >E</a
+	      > = <a href="#"
+	      >E</a
+	      > <a href="#" title="Data.Int"
+	      >Int</a
+	      ></li
+	    ></ul
+	  ></details
 	></div
       ><div id="interface"
       ><h1
@@ -150,7 +150,7 @@ window.onload = function () {pageLoad();};
 	      ><td class="src"
 		><a id="v:A" class="def"
 		  >A</a
-		  > <a href="#"
+		  > <a href="#" title="Data.Int"
 		  >Int</a
 		  ></td
 		><td class="doc empty"
@@ -181,32 +181,26 @@ window.onload = function () {pageLoad();};
 	      ><td class="src"
 		><a id="v:B" class="def"
 		  >B</a
+		  > <a href="#" title="Data.Int"
+		  >Int</a
 		  ></td
 		><td class="doc empty"
 		></td
 		></tr
-	      ><tr
-	      ><td colspan="2"
-		><div class="subs fields"
-		  ><p class="caption"
-		    >Fields</p
-		    ><ul
-		    ><li
-		      ><dfn class="src"
-			><a id="v:b" class="def"
-			  >b</a
-			  > :: <a href="#"
-			  >Int</a
-			  ></dfn
-			><div class="doc empty"
-			></div
-			></li
-		      ></ul
-		    ></div
-		  ></td
-		></tr
 	      ></table
 	    ></div
+	  ></div
+	><div class="top"
+	><p class="src"
+	  ><a id="v:b" class="def"
+	    >b</a
+	    > :: <a href="#" title="Bug6"
+	    >B</a
+	    > -&gt; <a href="#" title="Data.Int"
+	    >Int</a
+	    > <a href="#" class="selflink"
+	    >#</a
+	    ></p
 	  ></div
 	><div class="top"
 	><p class="src"
@@ -243,7 +237,7 @@ window.onload = function () {pageLoad();};
 		      ><dfn class="src"
 			><a id="v:c1" class="def"
 			  >c1</a
-			  > :: <a href="#"
+			  > :: <a href="#" title="Data.Int"
 			  >Int</a
 			  ></dfn
 			><div class="doc empty"
@@ -253,7 +247,7 @@ window.onload = function () {pageLoad();};
 		      ><dfn class="src"
 			><a id="v:c2" class="def"
 			  >c2</a
-			  > :: <a href="#"
+			  > :: <a href="#" title="Data.Int"
 			  >Int</a
 			  ></dfn
 			><div class="doc empty"
@@ -288,9 +282,9 @@ window.onload = function () {pageLoad();};
 	      ><td class="src"
 		><a id="v:D" class="def"
 		  >D</a
-		  > <a href="#"
+		  > <a href="#" title="Data.Int"
 		  >Int</a
-		  > <a href="#"
+		  > <a href="#" title="Data.Int"
 		  >Int</a
 		  ></td
 		><td class="doc empty"
@@ -320,7 +314,7 @@ window.onload = function () {pageLoad();};
 	      ><td class="src"
 		><a id="v:E" class="def"
 		  >E</a
-		  > <a href="#"
+		  > <a href="#" title="Data.Int"
 		  >Int</a
 		  ></td
 		><td class="doc empty"

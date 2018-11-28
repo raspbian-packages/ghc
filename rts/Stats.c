@@ -29,7 +29,7 @@ static Time
     start_exit_gc_elapsed, start_exit_gc_cpu,
     end_exit_cpu,   end_exit_elapsed;
 
-#ifdef PROFILING
+#if defined(PROFILING)
 static Time RP_start_time  = 0, RP_tot_time  = 0;  // retainer prof user time
 static Time RPe_start_time = 0, RPe_tot_time = 0;  // retainer prof elap time
 
@@ -37,7 +37,7 @@ static Time HC_start_time, HC_tot_time = 0;     // heap census prof user time
 static Time HCe_start_time, HCe_tot_time = 0;   // heap census prof elap time
 #endif
 
-#ifdef PROFILING
+#if defined(PROFILING)
 #define PROF_VAL(x)   (x)
 #else
 #define PROF_VAL(x)   0
@@ -90,7 +90,7 @@ mut_user_time( void )
     return mut_user_time_until(cpu);
 }
 
-#ifdef PROFILING
+#if defined(PROFILING)
 /*
   mut_user_time_during_RP() returns the MUT time during retainer profiling.
   The same is for mut_user_time_during_HC();
@@ -122,7 +122,7 @@ initStats0(void)
     end_exit_cpu     = 0;
     end_exit_elapsed  = 0;
 
-#ifdef PROFILING
+#if defined(PROFILING)
     RP_start_time  = 0;
     RP_tot_time  = 0;
     RPe_start_time = 0;
@@ -149,6 +149,7 @@ initStats0(void)
         .copied_bytes = 0,
         .par_copied_bytes = 0,
         .cumulative_par_max_copied_bytes = 0,
+        .cumulative_par_balanced_copied_bytes = 0,
         .mutator_cpu_ns = 0,
         .mutator_elapsed_ns = 0,
         .gc_cpu_ns = 0,
@@ -166,6 +167,7 @@ initStats0(void)
             .mem_in_use_bytes = 0,
             .copied_bytes = 0,
             .par_max_copied_bytes = 0,
+            .par_balanced_copied_bytes = 0,
             .sync_elapsed_ns = 0,
             .cpu_ns = 0,
             .elapsed_ns = 0
@@ -283,7 +285,8 @@ stat_startGC (Capability *cap, gc_thread *gct)
 void
 stat_endGC (Capability *cap, gc_thread *gct,
             W_ live, W_ copied, W_ slop, uint32_t gen,
-            uint32_t par_n_threads, W_ par_max_copied)
+            uint32_t par_n_threads, W_ par_max_copied,
+            W_ par_balanced_copied)
 {
     // -------------------------------------------------
     // Collect all the stats about this GC in stats.gc. We always do this since
@@ -305,7 +308,28 @@ stat_endGC (Capability *cap, gc_thread *gct,
     stats.gc.mem_in_use_bytes = mblocks_allocated * MBLOCK_SIZE;
     stats.gc.copied_bytes = copied * sizeof(W_);
     stats.gc.par_max_copied_bytes = par_max_copied * sizeof(W_);
+    stats.gc.par_balanced_copied_bytes = par_balanced_copied * sizeof(W_);
 
+    bool stats_enabled =
+        RtsFlags.GcFlags.giveStats != NO_GC_STATS ||
+        rtsConfig.gcDoneHook != NULL;
+
+    if (stats_enabled
+      || RtsFlags.ProfFlags.doHeapProfile) // heap profiling needs GC_tot_time
+    {
+        // We only update the times when stats are explicitly enabled since
+        // getProcessTimes (e.g. requiring a system call) can be expensive on
+        // some platforms.
+        Time current_cpu, current_elapsed;
+        getProcessTimes(&current_cpu, &current_elapsed);
+        stats.cpu_ns = current_cpu - start_init_cpu;
+        stats.elapsed_ns = current_elapsed - start_init_elapsed;
+
+        stats.gc.sync_elapsed_ns =
+            gct->gc_start_elapsed - gct->gc_sync_start_elapsed;
+        stats.gc.elapsed_ns = current_elapsed - gct->gc_start_elapsed;
+        stats.gc.cpu_ns = current_cpu - gct->gc_start_cpu;
+    }
     // -------------------------------------------------
     // Update the cumulative stats
 
@@ -324,6 +348,8 @@ stat_endGC (Capability *cap, gc_thread *gct,
         stats.par_copied_bytes += stats.gc.copied_bytes;
         stats.cumulative_par_max_copied_bytes +=
             stats.gc.par_max_copied_bytes;
+        stats.cumulative_par_balanced_copied_bytes +=
+            stats.gc.par_balanced_copied_bytes;
     }
     stats.gc_cpu_ns += stats.gc.cpu_ns;
     stats.gc_elapsed_ns += stats.gc.elapsed_ns;
@@ -348,23 +374,8 @@ stat_endGC (Capability *cap, gc_thread *gct,
     // -------------------------------------------------
     // Do the more expensive bits only when stats are enabled.
 
-    if (RtsFlags.GcFlags.giveStats != NO_GC_STATS ||
-        rtsConfig.gcDoneHook != NULL ||
-        RtsFlags.ProfFlags.doHeapProfile) // heap profiling needs GC_tot_time
+    if (stats_enabled)
     {
-        // We only update the times when stats are explicitly enabled since
-        // getProcessTimes (e.g. requiring a system call) can be expensive on
-        // some platforms.
-        Time current_cpu, current_elapsed;
-        getProcessTimes(&current_cpu, &current_elapsed);
-        stats.cpu_ns = current_cpu - start_init_cpu;
-        stats.elapsed_ns = current_elapsed - start_init_elapsed;
-
-        stats.gc.sync_elapsed_ns =
-          gct->gc_start_elapsed - gct->gc_sync_start_elapsed;
-        stats.gc.elapsed_ns = current_elapsed - gct->gc_start_elapsed;
-        stats.gc.cpu_ns = current_cpu - gct->gc_start_cpu;
-
         // -------------------------------------------------
         // Emit events to the event log
 
@@ -385,7 +396,8 @@ stat_endGC (Capability *cap, gc_thread *gct,
                                  * BLOCK_SIZE,
                           par_n_threads,
                           stats.gc.par_max_copied_bytes,
-                          stats.gc.copied_bytes);
+                          stats.gc.copied_bytes,
+                          stats.gc.par_balanced_copied_bytes);
 
         // Post EVENT_GC_END with the same timestamp as used for stats
         // (though converted from Time=StgInt64 to EventTimestamp=StgWord64).
@@ -438,7 +450,7 @@ stat_endGC (Capability *cap, gc_thread *gct,
 /* -----------------------------------------------------------------------------
    Called at the beginning of each Retainer Profiliing
    -------------------------------------------------------------------------- */
-#ifdef PROFILING
+#if defined(PROFILING)
 void
 stat_startRP(void)
 {
@@ -454,11 +466,11 @@ stat_startRP(void)
    Called at the end of each Retainer Profiliing
    -------------------------------------------------------------------------- */
 
-#ifdef PROFILING
+#if defined(PROFILING)
 void
 stat_endRP(
   uint32_t retainerGeneration,
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
   uint32_t maxCStackSize,
   int maxStackSize,
 #endif
@@ -472,7 +484,7 @@ stat_endRP(
 
   fprintf(prof_file, "Retainer Profiling: %d, at %f seconds\n",
     retainerGeneration, mut_user_time_during_RP());
-#ifdef DEBUG_RETAINER
+#if defined(DEBUG_RETAINER)
   fprintf(prof_file, "\tMax C stack size = %u\n", maxCStackSize);
   fprintf(prof_file, "\tMax auxiliary stack size = %u\n", maxStackSize);
 #endif
@@ -483,7 +495,7 @@ stat_endRP(
 /* -----------------------------------------------------------------------------
    Called at the beginning of each heap census
    -------------------------------------------------------------------------- */
-#ifdef PROFILING
+#if defined(PROFILING)
 void
 stat_startHeapCensus(void)
 {
@@ -498,7 +510,7 @@ stat_startHeapCensus(void)
 /* -----------------------------------------------------------------------------
    Called at the end of each heap census
    -------------------------------------------------------------------------- */
-#ifdef PROFILING
+#if defined(PROFILING)
 void
 stat_endHeapCensus(void)
 {
@@ -518,7 +530,7 @@ stat_endHeapCensus(void)
    were left unused when the heap-check failed.
    -------------------------------------------------------------------------- */
 
-#ifdef DEBUG
+#if defined(DEBUG)
 #define TICK_VAR_INI(arity) \
   StgInt SLOW_CALLS_##arity = 1; \
   StgInt RIGHT_ARITY_##arity = 1; \
@@ -621,7 +633,8 @@ stat_exit (void)
         exit_elapsed = end_exit_elapsed - start_exit_elapsed - exit_gc_elapsed;
 
         mut_elapsed = start_exit_elapsed - end_init_elapsed -
-            (gc_elapsed - exit_gc_elapsed);
+            (gc_elapsed - exit_gc_elapsed) -
+            PROF_VAL(RPe_tot_time + HCe_tot_time);
 
         mut_cpu = start_exit_cpu - end_init_cpu - (gc_cpu - exit_gc_cpu)
             - PROF_VAL(RP_tot_time + HC_tot_time);
@@ -672,11 +685,11 @@ stat_exit (void)
             }
 
 #if defined(THREADED_RTS)
-            if (RtsFlags.ParFlags.parGcEnabled && n_capabilities > 1) {
+            if (RtsFlags.ParFlags.parGcEnabled && stats.par_copied_bytes > 0) {
+                // See Note [Work Balance]
                 statsPrintf("\n  Parallel GC work balance: %.2f%% (serial 0%%, perfect 100%%)\n",
-                            100 * (((double)stats.par_copied_bytes / (double)stats.cumulative_par_max_copied_bytes) - 1)
-                                / (n_capabilities - 1)
-                    );
+                    100 * (double)stats.cumulative_par_balanced_copied_bytes /
+                          (double)stats.par_copied_bytes);
             }
 #endif
             statsPrintf("\n");
@@ -716,7 +729,7 @@ stat_exit (void)
             statsPrintf("  GC      time  %7.3fs  (%7.3fs elapsed)\n",
                         TimeToSecondsDbl(gc_cpu), TimeToSecondsDbl(gc_elapsed));
 
-#ifdef PROFILING
+#if defined(PROFILING)
             statsPrintf("  RP      time  %7.3fs  (%7.3fs elapsed)\n",
                     TimeToSecondsDbl(RP_tot_time), TimeToSecondsDbl(RPe_tot_time));
             statsPrintf("  PROF    time  %7.3fs  (%7.3fs elapsed)\n",
@@ -726,7 +739,7 @@ stat_exit (void)
                     TimeToSecondsDbl(exit_cpu), TimeToSecondsDbl(exit_elapsed));
             statsPrintf("  Total   time  %7.3fs  (%7.3fs elapsed)\n\n",
                     TimeToSecondsDbl(tot_cpu), TimeToSecondsDbl(tot_elapsed));
-#ifndef THREADED_RTS
+#if !defined(THREADED_RTS)
             statsPrintf("  %%GC     time     %5.1f%%  (%.1f%% elapsed)\n\n",
                     TimeToSecondsDbl(gc_cpu)*100/TimeToSecondsDbl(tot_cpu),
                     TimeToSecondsDbl(gc_elapsed)*100/TimeToSecondsDbl(tot_elapsed));
@@ -825,6 +838,84 @@ stat_exit (void)
     }
 }
 
+/* Note [Work Balance]
+----------------------
+Work balance is a measure of how evenly the work done during parallel garbage
+collection is spread across threads. To compute work balance we must take care
+to account for the number of GC threads changing between GCs. The statistics we
+track must have the number of GC threads "integrated out".
+
+We accumulate two values from each garbage collection:
+* par_copied: is a measure of the total work done during parallel garbage
+  collection
+* par_balanced_copied: is a measure of the balanced work done
+  during parallel garbage collection.
+
+par_copied is simple to compute, but par_balanced_copied_bytes is somewhat more
+complicated:
+
+For a given garbage collection:
+Let gc_copied := total copies during the gc
+    gc_copied_i := copies by the ith thread during the gc
+    num_gc_threads := the number of threads participating in the gc
+    balance_limit := (gc_copied / num_gc_threads)
+
+If we were to graph gc_copied_i, sorted from largest to smallest we would see
+something like:
+
+       |X
+  ^    |X X
+  |    |X X X            X: unbalanced copies
+copies |-----------      Y: balanced copies by the busiest GC thread
+       |Y Z Z            Z: other balanced copies
+       |Y Z Z Z
+       |Y Z Z Z Z
+       |Y Z Z Z Z Z
+       |===========
+       |1 2 3 4 5 6
+          i ->
+
+where the --- line is at balance_limit. Balanced copies are those under the ---
+line, i.e. the area of the Ys and Zs. Note that the area occupied by the Ys will
+always equal balance_limit. Completely balanced gc has every thread copying
+balance_limit and a completely unbalanced gc has a single thread copying
+gc_copied.
+
+One could define par_balance_copied as the areas of the Ys and Zs in the graph
+above, however we would like the ratio of (par_balance_copied / gc_copied) to
+range from 0 to 1, so that work_balance will be a nice percentage, also ranging
+from 0 to 1. We therefore define par_balanced_copied as:
+
+                                                        (  num_gc_threads  )
+{Sum[Min(gc_copied_i,balance_limit)] - balance_limit} * (------------------)
+  i                                                     (num_gc_threads - 1)
+                                          vvv                  vvv
+                                           S                    T
+
+Where the S and T terms serve to remove the area of the Ys, and
+to normalize the result to lie between 0 and gc_copied.
+
+Note that the implementation orders these operations differently to minimize
+error due to integer rounding.
+
+Then cumulative work balance is computed as
+(cumulative_par_balanced_copied_bytes / par_copied_byes)
+
+Previously, cumulative work balance was computed as:
+
+(cumulative_par_max_copied_bytes)
+(-------------------------------) - 1
+(       par_copied_bytes        )
+-------------------------------------
+        (n_capabilities - 1)
+
+This was less accurate than the current method, and invalid whenever a garbage
+collection had occurred with num_gc_threads /= n_capabilities; which can happen
+when setNumCapabilities is called, when -qn is passed as an RTS option, or when
+the number of gc threads is limited to the number of cores.
+See #13830
+*/
+
 /* -----------------------------------------------------------------------------
    stat_describe_gens
 
@@ -920,8 +1011,7 @@ void getRTSStats( RTSStats *s )
     s->cpu_ns = current_cpu - end_init_cpu;
     s->elapsed_ns = current_elapsed - end_init_elapsed;
 
-    s->mutator_cpu_ns = current_cpu - end_init_cpu - stats.gc_cpu_ns -
-        PROF_VAL(RP_tot_time + HC_tot_time);
+    s->mutator_cpu_ns = current_cpu - end_init_cpu - stats.gc_cpu_ns;
     s->mutator_elapsed_ns = current_elapsed - end_init_elapsed -
         stats.gc_elapsed_ns;
 }

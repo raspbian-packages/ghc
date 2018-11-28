@@ -6,6 +6,7 @@ import Data.IntMap.Strict as Data.IntMap hiding (showTree)
 import Data.IntMap.Lazy as Data.IntMap hiding (showTree)
 #endif
 import Data.IntMap.Internal.Debug (showTree)
+import IntMapValidity (valid)
 
 import Data.Monoid
 import Data.Maybe hiding (mapMaybe)
@@ -31,6 +32,7 @@ main :: IO ()
 main = defaultMain
          [
                testCase "index"      test_index
+             , testCase "index_lookup" test_index_lookup
              , testCase "size"       test_size
              , testCase "size2"      test_size2
              , testCase "member"     test_member
@@ -106,6 +108,8 @@ main = defaultMain
              , testCase "isSubmapOf" test_isSubmapOf
              , testCase "isProperSubmapOfBy" test_isProperSubmapOfBy
              , testCase "isProperSubmapOf" test_isProperSubmapOf
+             , testCase "lookupMin" test_lookupMin
+             , testCase "lookupMax" test_lookupMax
              , testCase "findMin" test_findMin
              , testCase "findMax" test_findMax
              , testCase "deleteMin" test_deleteMin
@@ -120,6 +124,8 @@ main = defaultMain
              , testCase "maxView" test_maxView
              , testCase "minViewWithKey" test_minViewWithKey
              , testCase "maxViewWithKey" test_maxViewWithKey
+             , testProperty "valid"                prop_valid
+             , testProperty "empty valid"          prop_emptyValid
              , testProperty "insert to singleton"  prop_singleton
              , testProperty "insert then lookup"   prop_insertLookup
              , testProperty "insert then delete"   prop_insertDelete
@@ -141,6 +147,7 @@ main = defaultMain
              , testProperty "fromList"             prop_fromList
              , testProperty "alter"                prop_alter
              , testProperty "index"                prop_index
+             , testProperty "index_lookup"         prop_index_lookup
              , testProperty "null"                 prop_null
              , testProperty "size"                 prop_size
              , testProperty "member"               prop_member
@@ -152,6 +159,8 @@ main = defaultMain
              , testProperty "lookupGT"             prop_lookupGT
              , testProperty "lookupLE"             prop_lookupLE
              , testProperty "lookupGE"             prop_lookupGE
+             , testProperty "lookupMin"            prop_lookupMin
+             , testProperty "lookupMax"            prop_lookupMax
              , testProperty "findMin"              prop_findMin
              , testProperty "findMax"              prop_findMax
              , testProperty "deleteMin"            prop_deleteMinModel
@@ -190,6 +199,11 @@ instance Arbitrary a => Arbitrary (IntMap a) where
                 ; return (fromList (zip xs ks))
                 }
 
+newtype NonEmptyIntMap a = NonEmptyIntMap {getNonEmptyIntMap :: IntMap a} deriving (Eq, Show)
+
+instance Arbitrary a => Arbitrary (NonEmptyIntMap a) where
+  arbitrary = fmap (NonEmptyIntMap . fromList . getNonEmpty) arbitrary
+
 
 ------------------------------------------------------------------------
 
@@ -216,6 +230,11 @@ tests = [ testGroup "Test Case" [
 
 test_index :: Assertion
 test_index = fromList [(5,'a'), (3,'b')] ! 5 @?= 'a'
+
+test_index_lookup :: Assertion
+test_index_lookup = do
+    fromList [(5,'a'), (3,'b')] !? 1 @?= Nothing
+    fromList [(5,'a'), (3,'b')] !? 5 @?= Just 'a'
 
 ----------------------------------------------------------------
 -- Query
@@ -682,6 +701,16 @@ test_isProperSubmapOf = do
 ----------------------------------------------------------------
 -- Min/Max
 
+test_lookupMin :: Assertion
+test_lookupMin = do
+  lookupMin (fromList [(5,"a"), (3,"b")]) @?= Just (3,"b")
+  lookupMin (empty :: SMap) @?= Nothing
+
+test_lookupMax :: Assertion
+test_lookupMax = do
+  lookupMax (fromList [(5,"a"), (3,"b")]) @?= Just (5,"a")
+  lookupMax (empty :: SMap) @?= Nothing
+
 test_findMin :: Assertion
 test_findMin = findMin (fromList [(5,"a"), (3,"b")]) @?= (3,"b")
 
@@ -745,27 +774,56 @@ test_maxViewWithKey = do
     maxViewWithKey (empty :: SMap) @?= Nothing
 
 ----------------------------------------------------------------
+-- Valid IntMaps
+----------------------------------------------------------------
+
+forValid :: Testable b => (SMap -> b) -> Property
+forValid f = forAll arbitrary $ \t ->
+    classify (size t == 0) "empty" $
+    classify (size t > 0 && size t <= 10) "small" $
+    classify (size t > 10 && size t <= 64) "medium" $
+    classify (size t > 64) "large" $ f t
+
+forValidUnitTree :: Testable b => (SMap -> b) -> Property
+forValidUnitTree f = forValid f
+
+prop_valid :: Property
+prop_valid = forValidUnitTree $ \t -> valid t
+
+----------------------------------------------------------------
 -- QuickCheck
 ----------------------------------------------------------------
 
-prop_singleton :: Int -> Int -> Bool
-prop_singleton k x = insert k x empty == singleton k x
+prop_emptyValid :: Property
+prop_emptyValid = valid empty
+
+prop_singleton :: Int -> Int -> Property
+prop_singleton k x =
+  case singleton k x of
+    s ->
+      valid s .&&.
+      s === insert k x empty
 
 prop_insertLookup :: Int -> UMap -> Bool
 prop_insertLookup k t = lookup k (insert k () t) /= Nothing
 
 prop_insertDelete :: Int -> UMap -> Property
-prop_insertDelete k t = (lookup k t == Nothing) ==> (delete k (insert k () t) == t)
+prop_insertDelete k t =
+  lookup k t == Nothing ==>
+    case delete k (insert k () t) of
+      t' -> valid t' .&&. t' === t
 
 prop_deleteNonMember :: Int -> UMap -> Property
 prop_deleteNonMember k t = (lookup k t == Nothing) ==> (delete k t == t)
 
 ----------------------------------------------------------------
 
-prop_unionModel :: [(Int,Int)] -> [(Int,Int)] -> Bool
-prop_unionModel xs ys
-  = sort (keys (union (fromList xs) (fromList ys)))
-    == sort (nub (Prelude.map fst xs ++ Prelude.map fst ys))
+prop_unionModel :: [(Int,Int)] -> [(Int,Int)] -> Property
+prop_unionModel xs ys =
+  case union (fromList xs) (fromList ys) of
+    t ->
+      valid t .&&.
+      sort (keys t) === sort (nub (Prelude.map fst xs ++ Prelude.map fst ys))
 
 prop_unionSingleton :: IMap -> Int -> Int -> Bool
 prop_unionSingleton t k x = union (singleton k x) t == insert k x t
@@ -781,15 +839,23 @@ prop_unionSum xs ys
   = sum (elems (unionWith (+) (fromListWith (+) xs) (fromListWith (+) ys)))
     == (sum (Prelude.map snd xs) + sum (Prelude.map snd ys))
 
-prop_differenceModel :: [(Int,Int)] -> [(Int,Int)] -> Bool
-prop_differenceModel xs ys
-  = sort (keys (difference (fromListWith (+) xs) (fromListWith (+) ys)))
-    == sort ((List.\\) (nub (Prelude.map fst xs)) (nub (Prelude.map fst ys)))
+prop_differenceModel :: [(Int,Int)] -> [(Int,Int)] -> Property
+prop_differenceModel xs ys =
+  case difference (fromListWith (+) xs) (fromListWith (+) ys) of
+    t ->
+      valid t .&&.
+      sort (keys t) === sort ((List.\\)
+                                 (nub (Prelude.map fst xs))
+                                 (nub (Prelude.map fst ys)))
 
-prop_intersectionModel :: [(Int,Int)] -> [(Int,Int)] -> Bool
-prop_intersectionModel xs ys
-  = sort (keys (intersection (fromListWith (+) xs) (fromListWith (+) ys)))
-    == sort (nub ((List.intersect) (Prelude.map fst xs) (Prelude.map fst ys)))
+prop_intersectionModel :: [(Int,Int)] -> [(Int,Int)] -> Property
+prop_intersectionModel xs ys =
+  case intersection (fromListWith (+) xs) (fromListWith (+) ys) of
+    t ->
+      valid t .&&.
+      sort (keys t) === sort (nub ((List.intersect)
+                                      (Prelude.map fst xs)
+                                      (Prelude.map fst ys)))
 
 prop_intersectionWithModel :: [(Int,Int)] -> [(Int,Int)] -> Bool
 prop_intersectionWithModel xs ys
@@ -876,19 +942,20 @@ prop_ascDescList :: [Int] -> Bool
 prop_ascDescList xs = toAscList m == reverse (toDescList m)
   where m = fromList $ zip xs $ repeat ()
 
-prop_fromList :: [Int] -> Bool
+prop_fromList :: [Int] -> Property
 prop_fromList xs
   = case fromList (zip xs xs) of
-      t -> t == fromAscList (zip sort_xs sort_xs) &&
-           t == fromDistinctAscList (zip nub_sort_xs nub_sort_xs) &&
-           t == List.foldr (uncurry insert) empty (zip xs xs)
+      t -> valid t .&&.
+           t === fromAscList (zip sort_xs sort_xs) .&&.
+           t === fromDistinctAscList (zip nub_sort_xs nub_sort_xs) .&&.
+           t === List.foldr (uncurry insert) empty (zip xs xs)
   where sort_xs = sort xs
         nub_sort_xs = List.map List.head $ List.group sort_xs
 
 ----------------------------------------------------------------
 
-prop_alter :: UMap -> Int -> Bool
-prop_alter t k = case lookup k t of
+prop_alter :: UMap -> Int -> Property
+prop_alter t k = valid t' .&&. case lookup k t of
     Just _  -> (size t - 1) == size t' && lookup k t' == Nothing
     Nothing -> (size t + 1) == size t' && lookup k t' /= Nothing
   where
@@ -903,6 +970,11 @@ prop_index :: [Int] -> Property
 prop_index xs = length xs > 0 ==>
   let m  = fromList (zip xs xs)
   in  xs == [ m ! i | i <- xs ]
+
+prop_index_lookup :: [Int] -> Property
+prop_index_lookup xs = length xs > 0 ==>
+  let m  = fromList (zip xs xs)
+  in  (Prelude.map Just xs) == [ m !? i | i <- xs ]
 
 prop_null :: IMap -> Bool
 prop_null m = null m == (size m == 0)
@@ -966,17 +1038,17 @@ prop_lookupLE = test_lookupSomething lookupLE (<=)
 prop_lookupGE :: [(Int, Int)] -> Bool
 prop_lookupGE = test_lookupSomething lookupGE (>=)
 
-prop_findMin :: [(Int, Int)] -> Property
-prop_findMin ys = length ys > 0 ==>
-  let xs = List.nubBy ((==) `on` fst) ys
-      m  = fromList xs
-  in  findMin m == List.minimumBy (comparing fst) xs
+prop_lookupMin :: IntMap Int -> Property
+prop_lookupMin im = lookupMin im === listToMaybe (toAscList im)
 
-prop_findMax :: [(Int, Int)] -> Property
-prop_findMax ys = length ys > 0 ==>
-  let xs = List.nubBy ((==) `on` fst) ys
-      m  = fromList xs
-  in  findMax m == List.maximumBy (comparing fst) xs
+prop_lookupMax :: IntMap Int -> Property
+prop_lookupMax im = lookupMax im === listToMaybe (toDescList im)
+
+prop_findMin :: NonEmptyIntMap Int -> Property
+prop_findMin (NonEmptyIntMap im) = findMin im === head (toAscList im)
+
+prop_findMax :: NonEmptyIntMap Int -> Property
+prop_findMax (NonEmptyIntMap im) = findMax im === head (toDescList im)
 
 prop_deleteMinModel :: [(Int, Int)] -> Property
 prop_deleteMinModel ys = length ys > 0 ==>
@@ -993,14 +1065,18 @@ prop_deleteMaxModel ys = length ys > 0 ==>
 prop_filter :: Fun Int Bool -> [(Int, Int)] -> Property
 prop_filter p ys = length ys > 0 ==>
   let xs = List.nubBy ((==) `on` fst) ys
-      m  = fromList xs
-  in  filter (apply p) m == fromList (List.filter (apply p . snd) xs)
+      m  = filter (apply p) (fromList xs)
+  in  valid m .&&.
+      m === fromList (List.filter (apply p . snd) xs)
 
 prop_partition :: Fun Int Bool -> [(Int, Int)] -> Property
 prop_partition p ys = length ys > 0 ==>
   let xs = List.nubBy ((==) `on` fst) ys
-      m  = fromList xs
-  in  partition (apply p) m == let (a,b) = (List.partition (apply p . snd) xs) in (fromList a, fromList b)
+      m@(l, r) = partition (apply p) (fromList xs)
+  in  valid l .&&.
+      valid r .&&.
+      m === let (a,b) = (List.partition (apply p . snd) xs)
+            in (fromList a, fromList b)
 
 prop_map :: Fun Int Int -> [(Int, Int)] -> Property
 prop_map f ys = length ys > 0 ==>
@@ -1024,8 +1100,10 @@ prop_splitModel :: Int -> [(Int, Int)] -> Property
 prop_splitModel n ys = length ys > 0 ==>
   let xs = List.nubBy ((==) `on` fst) ys
       (l, r) = split n $ fromList xs
-  in  toAscList l == sort [(k, v) | (k,v) <- xs, k < n] &&
-      toAscList r == sort [(k, v) | (k,v) <- xs, k > n]
+  in  valid l .&&.
+      valid r .&&.
+      toAscList l === sort [(k, v) | (k,v) <- xs, k < n] .&&.
+      toAscList r === sort [(k, v) | (k,v) <- xs, k > n]
 
 prop_splitRoot :: IMap -> Bool
 prop_splitRoot s = loop ls && (s == unions ls)

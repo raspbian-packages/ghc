@@ -9,9 +9,13 @@ import Prelude ()
 import Distribution.Compat.Prelude
 import Distribution.Utils.ShortText
 
-import qualified Text.PrettyPrint as Disp
-import Distribution.Compat.ReadP
+import Distribution.Pretty
+import Distribution.Parsec.Class
 import Distribution.Text
+
+import qualified Distribution.Compat.CharParsing as P
+import qualified Distribution.Compat.ReadP as Parse
+import qualified Text.PrettyPrint as Disp
 
 -- | A pkg-config library name
 --
@@ -49,10 +53,15 @@ instance Binary PkgconfigName
 -- pkg-config allows versions and other letters in package names, eg
 -- "gtk+-2.0" is a valid pkg-config package _name_.  It then has a package
 -- version number like 2.10.13
+instance Pretty PkgconfigName where
+  pretty = Disp.text . unPkgconfigName
+
+instance Parsec PkgconfigName where
+  parsec = mkPkgconfigName <$> P.munch1 (\c -> isAlphaNum c || c `elem` "+-._")
+
 instance Text PkgconfigName where
-  disp = Disp.text . unPkgconfigName
   parse = mkPkgconfigName
-          <$> munch1 (\c -> isAlphaNum c || c `elem` "+-._")
+          <$> Parse.munch1 (\c -> isAlphaNum c || c `elem` "+-._")
 
 instance NFData PkgconfigName where
     rnf (PkgconfigName pkg) = rnf pkg

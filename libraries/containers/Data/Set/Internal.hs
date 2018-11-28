@@ -12,6 +12,8 @@
 {-# LANGUAGE TypeFamilies #-}
 #endif
 
+{-# OPTIONS_HADDOCK not-home #-}
+
 #include "containers.h"
 
 -----------------------------------------------------------------------------
@@ -70,6 +72,8 @@
 -- /Warning/: The size of the set must not exceed @maxBound::Int@. Violation of
 -- this condition is not detected and if the size limit is exceeded, the
 -- behavior of the set is completely undefined.
+--
+-- @since 0.5.9
 -----------------------------------------------------------------------------
 
 -- [Note: Using INLINABLE]
@@ -121,6 +125,7 @@
 module Data.Set.Internal (
             -- * Set type
               Set(..)       -- instance Eq,Ord,Show,Read,Data,Typeable
+            , Size
 
             -- * Operators
             , (\\)
@@ -136,18 +141,22 @@ module Data.Set.Internal (
             , lookupGE
             , isSubsetOf
             , isProperSubsetOf
+            , disjoint
 
             -- * Construction
             , empty
             , singleton
             , insert
             , delete
+            , powerSet
 
             -- * Combine
             , union
             , unions
             , difference
             , intersection
+            , cartesianProduct
+            , disjointUnion
 
             -- * Filter
             , filter
@@ -231,6 +240,9 @@ import Data.Semigroup (Semigroup((<>), stimes), stimesIdempotentMonoid)
 import Data.Functor.Classes
 #endif
 import qualified Data.Foldable as Foldable
+#if !MIN_VERSION_base(4,8,0)
+import Data.Foldable (Foldable (foldMap))
+#endif
 import Data.Typeable
 import Control.DeepSeq (NFData(rnf))
 
@@ -243,7 +255,8 @@ import GHC.Exts ( build, lazy )
 #if __GLASGOW_HASKELL__ >= 708
 import qualified GHC.Exts as GHCExts
 #endif
-import Text.Read
+import Text.Read ( readPrec, Read (..), Lexeme (..), parens, prec
+                 , lexP, readListPrecDefault )
 import Data.Data
 #endif
 
@@ -283,6 +296,7 @@ instance Ord a => Monoid (Set a) where
 #else
     mappend = (<>)
 
+-- | @since 0.5.7
 instance Ord a => Semigroup (Set a) where
     (<>)    = union
     stimes  = stimesIdempotentMonoid
@@ -609,6 +623,27 @@ isSubsetOfX (Bin _ x l r) t
 {-# INLINABLE isSubsetOfX #-}
 #endif
 
+{--------------------------------------------------------------------
+  Disjoint
+--------------------------------------------------------------------}
+-- | /O(n+m)/. Check whether two sets are disjoint (i.e. their intersection
+--   is empty).
+--
+-- > disjoint (fromList [2,4,6])   (fromList [1,3])     == True
+-- > disjoint (fromList [2,4,6,8]) (fromList [2,3,5,7]) == False
+-- > disjoint (fromList [1,2])     (fromList [1,2,3,4]) == False
+-- > disjoint (fromList [])        (fromList [])        == True
+--
+-- @since 0.5.11
+
+disjoint :: Ord a => Set a -> Set a -> Bool
+disjoint Tip _ = True
+disjoint _ Tip = True
+disjoint (Bin _ x l r) t
+  -- Analogous implementation to `subsetOfX`
+  = not found && disjoint l lt && disjoint r gt
+  where
+    (lt,found,gt) = splitMember x t
 
 {--------------------------------------------------------------------
   Minimal, Maximal
@@ -872,6 +907,7 @@ elems = toAscList
   Lists
 --------------------------------------------------------------------}
 #if __GLASGOW_HASKELL__ >= 708
+-- | @since 0.5.6.2
 instance (Ord a) => GHCExts.IsList (Set a) where
   type Item (Set a) = a
   fromList = fromList
@@ -982,6 +1018,8 @@ fromAscList xs = fromDistinctAscList (combineEq xs)
 
 -- | /O(n)/. Build a set from a descending list in linear time.
 -- /The precondition (input list is descending) is not checked./
+--
+-- @since 0.5.8
 fromDescList :: Eq a => [a] -> Set a
 fromDescList xs = fromDistinctDescList (combineEq xs)
 #if __GLASGOW_HASKELL__
@@ -1029,6 +1067,8 @@ fromDistinctAscList (x0 : xs0) = go (1::Int) (Bin 1 x0 Tip Tip) xs0
 
 -- For some reason, when 'singleton' is used in fromDistinctDescList or in
 -- create, it is not inlined, so we inline it manually.
+--
+-- @since 0.5.8
 fromDistinctDescList :: [a] -> Set a
 fromDistinctDescList [] = Tip
 fromDistinctDescList (x0 : xs0) = go (1::Int) (Bin 1 x0 Tip Tip) xs0
@@ -1069,14 +1109,17 @@ instance Show a => Show (Set a) where
     showString "fromList " . shows (toList xs)
 
 #if MIN_VERSION_base(4,9,0)
+-- | @since 0.5.9
 instance Eq1 Set where
     liftEq eq m n =
         size m == size n && liftEq eq (toList m) (toList n)
 
+-- | @since 0.5.9
 instance Ord1 Set where
     liftCompare cmp m n =
         liftCompare cmp (toList m) (toList n)
 
+-- | @since 0.5.9
 instance Show1 Set where
     liftShowsPrec sp sl d m =
         showsUnaryWith (liftShowsPrec sp sl) "fromList" d (toList m)
@@ -1163,6 +1206,8 @@ splitMember x (Bin _ y l r)
 -- > findIndex 3 (fromList [5,3]) == 0
 -- > findIndex 5 (fromList [5,3]) == 1
 -- > findIndex 6 (fromList [5,3])    Error: element is not in the set
+--
+-- @since 0.5.4
 
 -- See Note: Type of local 'go' function
 findIndex :: Ord a => a -> Set a -> Int
@@ -1186,6 +1231,8 @@ findIndex = go 0
 -- > fromJust (lookupIndex 3 (fromList [5,3])) == 0
 -- > fromJust (lookupIndex 5 (fromList [5,3])) == 1
 -- > isJust   (lookupIndex 6 (fromList [5,3])) == False
+--
+-- @since 0.5.4
 
 -- See Note: Type of local 'go' function
 lookupIndex :: Ord a => a -> Set a -> Maybe Int
@@ -1208,6 +1255,8 @@ lookupIndex = go 0
 -- > elemAt 0 (fromList [5,3]) == 3
 -- > elemAt 1 (fromList [5,3]) == 5
 -- > elemAt 2 (fromList [5,3])    Error: index out of range
+--
+-- @since 0.5.4
 
 elemAt :: Int -> Set a -> a
 elemAt !_ Tip = error "Set.elemAt: index out of range"
@@ -1227,6 +1276,8 @@ elemAt i (Bin _ x l r)
 -- > deleteAt 1    (fromList [5,3]) == singleton 3
 -- > deleteAt 2    (fromList [5,3])    Error: index out of range
 -- > deleteAt (-1) (fromList [5,3])    Error: index out of range
+--
+-- @since 0.5.4
 
 deleteAt :: Int -> Set a -> Set a
 deleteAt !i t =
@@ -1245,6 +1296,8 @@ deleteAt !i t =
 -- @
 -- take n = 'fromDistinctAscList' . 'Prelude.take' n . 'toAscList'
 -- @
+--
+-- @since 0.5.8
 take :: Int -> Set a -> Set a
 take i m | i >= size m = m
 take i0 m0 = go i0 m0
@@ -1264,6 +1317,8 @@ take i0 m0 = go i0 m0
 -- @
 -- drop n = 'fromDistinctAscList' . 'Prelude.drop' n . 'toAscList'
 -- @
+--
+-- @since 0.5.8
 drop :: Int -> Set a -> Set a
 drop i m | i >= size m = Tip
 drop i0 m0 = go i0 m0
@@ -1306,6 +1361,8 @@ splitAt i0 m0
 -- takeWhileAntitone p = 'fromDistinctAscList' . 'Data.List.takeWhile' p . 'toList'
 -- takeWhileAntitone p = 'filter' p
 -- @
+--
+-- @since 0.5.8
 
 takeWhileAntitone :: (a -> Bool) -> Set a -> Set a
 takeWhileAntitone _ Tip = Tip
@@ -1321,6 +1378,8 @@ takeWhileAntitone p (Bin _ x l r)
 -- dropWhileAntitone p = 'fromDistinctAscList' . 'Data.List.dropWhile' p . 'toList'
 -- dropWhileAntitone p = 'filter' (not . p)
 -- @
+--
+-- @since 0.5.8
 
 dropWhileAntitone :: (a -> Bool) -> Set a -> Set a
 dropWhileAntitone _ Tip = Tip
@@ -1341,6 +1400,8 @@ dropWhileAntitone p (Bin _ x l r)
 -- at some /unspecified/ point where the predicate switches from holding to not
 -- holding (where the predicate is seen to hold before the first element and to fail
 -- after the last element).
+--
+-- @since 0.5.8
 
 spanAntitone :: (a -> Bool) -> Set a -> (Set a, Set a)
 spanAntitone p0 m = toPair (go p0 m)
@@ -1621,6 +1682,8 @@ bin x l r
 --  Note that the current implementation does not return more than three subsets,
 --  but you should not depend on this behaviour because it can change in the
 --  future without notice.
+--
+-- @since 0.5.4
 splitRoot :: Set a -> [Set a]
 splitRoot orig =
   case orig of
@@ -1628,6 +1691,77 @@ splitRoot orig =
     Bin _ v l r -> [l, singleton v, r]
 {-# INLINE splitRoot #-}
 
+
+-- | Calculate the power set of a set: the set of all its subsets.
+--
+-- @
+-- t `member` powerSet s == t `isSubsetOf` s
+-- @
+--
+-- Example:
+--
+-- @
+-- powerSet (fromList [1,2,3]) =
+--   fromList [[], [1], [2], [3], [1,2], [1,3], [2,3], [1,2,3]]
+-- @
+--
+-- @since 0.5.11
+powerSet :: Set a -> Set (Set a)
+powerSet xs0 = insertMin empty (foldr' step Tip xs0) where
+  step x pxs = insertMin (singleton x) (insertMin x `mapMonotonic` pxs) `glue` pxs
+
+-- | Calculate the Cartesian product of two sets.
+--
+-- @
+-- cartesianProduct xs ys = fromList $ liftA2 (,) (toList xs) (toList ys)
+-- @
+--
+-- Example:
+--
+-- @
+-- cartesianProduct (fromList [1,2]) (fromList ['a','b']) =
+--   fromList [(1,'a'), (1,'b'), (2,'a'), (2,'b')]
+-- @
+--
+-- @since 0.5.11
+cartesianProduct :: Set a -> Set b -> Set (a, b)
+cartesianProduct as bs =
+  getMergeSet $ foldMap (\a -> MergeSet $ mapMonotonic ((,) a) bs) as
+
+-- A version of Set with peculiar Semigroup and Monoid instances.
+-- The result of xs <> ys will only be a valid set if the greatest
+-- element of xs is strictly less than the least element of ys.
+-- This is used to define cartesianProduct.
+newtype MergeSet a = MergeSet { getMergeSet :: Set a }
+
+#if (MIN_VERSION_base(4,9,0))
+instance Semigroup (MergeSet a) where
+  MergeSet xs <> MergeSet ys = MergeSet (merge xs ys)
+#endif
+
+instance Monoid (MergeSet a) where
+  mempty = MergeSet empty
+
+#if (MIN_VERSION_base(4,9,0))
+  mappend = (<>)
+#else
+  mappend (MergeSet xs) (MergeSet ys) = MergeSet (merge xs ys)
+#endif
+
+-- | Calculate the disjoin union of two sets.
+--
+-- @ disjointUnion xs ys = map Left xs `union` map Right ys @
+--
+-- Example:
+--
+-- @
+-- disjointUnion (fromList [1,2]) (fromList ["hi", "bye"]) =
+--   fromList [Left 1, Left 2, Right "hi", Right "bye"]
+-- @
+--
+-- @since 0.5.11
+disjointUnion :: Set a -> Set b -> Set (Either a b)
+disjointUnion as bs = merge (mapMonotonic Left as) (mapMonotonic Right bs)
 
 {--------------------------------------------------------------------
   Debugging

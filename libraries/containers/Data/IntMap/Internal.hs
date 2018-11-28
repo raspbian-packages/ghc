@@ -1,5 +1,6 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE PatternGuards #-}
 #if __GLASGOW_HASKELL__
 {-# LANGUAGE MagicHash, DeriveDataTypeable, StandaloneDeriving #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -10,6 +11,8 @@
 #if __GLASGOW_HASKELL__ >= 708
 {-# LANGUAGE TypeFamilies #-}
 #endif
+
+{-# OPTIONS_HADDOCK not-home #-}
 
 #include "containers.h"
 
@@ -39,6 +42,8 @@
 --
 -- This defines the data structures and core (hidden) manipulations
 -- on representations.
+--
+-- @since 0.5.9
 -----------------------------------------------------------------------------
 
 -- [Note: INLINE bit fiddling]
@@ -72,7 +77,7 @@ module Data.IntMap.Internal (
       IntMap(..), Key          -- instance Eq,Show
 
     -- * Operators
-    , (!), (\\)
+    , (!), (!?), (\\)
 
     -- * Query
     , null
@@ -231,6 +236,8 @@ module Data.IntMap.Internal (
     , isProperSubmapOf, isProperSubmapOfBy
 
     -- * Min\/Max
+    , lookupMin
+    , lookupMax
     , findMin
     , findMax
     , deleteMin
@@ -294,7 +301,6 @@ import Data.Functor.Classes
 #endif
 
 import Control.DeepSeq (NFData(rnf))
-import Control.Monad (liftM)
 import Data.Bits
 import qualified Data.Foldable as Foldable
 import Data.Maybe (fromMaybe)
@@ -348,6 +354,17 @@ data IntMap a = Bin {-# UNPACK #-} !Prefix
                     {-# UNPACK #-} !Mask
                     !(IntMap a)
                     !(IntMap a)
+-- Fields:
+--   prefix: The most significant bits shared by all keys in this Bin.
+--   mask: The switching bit to determine if a key should follow the left
+--         or right subtree of a 'Bin'.
+-- Invariant: Nil is never found as a child of Bin.
+-- Invariant: The Mask is a power of 2. It is the largest bit position at which
+--            two keys of the map differ.
+-- Invariant: Prefix is the common high-order bits that all elements share to
+--            the left of the Mask bit.
+-- Invariant: In Bin prefix mask left right, left consists of the elements that
+--            don't have the mask bit set; right is all the elements that do.
               | Tip {-# UNPACK #-} !Key a
               | Nil
 
@@ -377,11 +394,22 @@ bitmapOf x = shiftLL 1 (x .&. IntSet.suffixBitMask)
 (!) :: IntMap a -> Key -> a
 (!) m k = find k m
 
+-- | /O(min(n,W))/. Find the value at a key.
+-- Returns 'Nothing' when the element can not be found.
+--
+-- > fromList [(5,'a'), (3,'b')] !? 1 == Nothing
+-- > fromList [(5,'a'), (3,'b')] !? 5 == Just 'a'
+--
+-- @since 0.5.11
+
+(!?) :: IntMap a -> Key -> Maybe a
+(!?) m k = lookup k m
+
 -- | Same as 'difference'.
 (\\) :: IntMap a -> IntMap b -> IntMap a
 m1 \\ m2 = difference m1 m2
 
-infixl 9 \\{-This comment teaches CPP correct behaviour -}
+infixl 9 !?,\\{-This comment teaches CPP correct behaviour -}
 
 {--------------------------------------------------------------------
   Types
@@ -395,6 +423,7 @@ instance Monoid (IntMap a) where
 #else
     mappend = (<>)
 
+-- | @since 0.5.7
 instance Semigroup (IntMap a) where
     (<>)    = union
     stimes  = stimesIdempotentMonoid
@@ -1330,17 +1359,20 @@ mergeWithKey' bin' f g1 g2 = go
 --
 -- A tactic of type @WhenMissing f k x z@ is an abstract representation
 -- of a function of type @Key -> x -> f (Maybe z)@.
+--
+-- @since 0.5.9
 
 data WhenMissing f x y = WhenMissing
   { missingSubtree :: IntMap x -> f (IntMap y)
   , missingKey :: Key -> x -> f (Maybe y)}
 
-
+-- | @since 0.5.9
 instance (Applicative f, Monad f) => Functor (WhenMissing f x) where
   fmap = mapWhenMissing
   {-# INLINE fmap #-}
 
 
+-- | @since 0.5.9
 instance (Applicative f, Monad f) => Category.Category (WhenMissing f)
   where
     id = preserveMissing
@@ -1355,6 +1387,8 @@ instance (Applicative f, Monad f) => Category.Category (WhenMissing f)
 
 
 -- | Equivalent to @ReaderT k (ReaderT x (MaybeT f))@.
+--
+-- @since 0.5.9
 instance (Applicative f, Monad f) => Applicative (WhenMissing f x) where
   pure x = mapMissing (\ _ _ -> x)
   f <*> g =
@@ -1368,6 +1402,8 @@ instance (Applicative f, Monad f) => Applicative (WhenMissing f x) where
 
 
 -- | Equivalent to @ReaderT k (ReaderT x (MaybeT f))@.
+--
+-- @since 0.5.9
 instance (Applicative f, Monad f) => Monad (WhenMissing f x) where
 #if !MIN_VERSION_base(4,8,0)
   return = pure
@@ -1382,6 +1418,8 @@ instance (Applicative f, Monad f) => Monad (WhenMissing f x) where
 
 
 -- | Map covariantly over a @'WhenMissing' f x@.
+--
+-- @since 0.5.9
 mapWhenMissing
   :: (Applicative f, Monad f)
   => (a -> b)
@@ -1419,6 +1457,8 @@ mapGentlyWhenMatched f t =
 
 
 -- | Map contravariantly over a @'WhenMissing' f _ x@.
+--
+-- @since 0.5.9
 lmapWhenMissing :: (b -> a) -> WhenMissing f a x -> WhenMissing f b x
 lmapWhenMissing f t = WhenMissing
   { missingSubtree = \m -> missingSubtree t (fmap f m)
@@ -1427,6 +1467,8 @@ lmapWhenMissing f t = WhenMissing
 
 
 -- | Map contravariantly over a @'WhenMatched' f _ y z@.
+--
+-- @since 0.5.9
 contramapFirstWhenMatched
   :: (b -> a)
   -> WhenMatched f a y z
@@ -1437,6 +1479,8 @@ contramapFirstWhenMatched f t =
 
 
 -- | Map contravariantly over a @'WhenMatched' f x _ z@.
+--
+-- @since 0.5.9
 contramapSecondWhenMatched
   :: (b -> a)
   -> WhenMatched f x a z
@@ -1462,6 +1506,8 @@ instance Applicative Identity where
 --
 -- A tactic of type @SimpleWhenMissing x z@ is an abstract
 -- representation of a function of type @Key -> x -> Maybe z@.
+--
+-- @since 0.5.9
 type SimpleWhenMissing = WhenMissing Identity
 
 
@@ -1470,12 +1516,16 @@ type SimpleWhenMissing = WhenMissing Identity
 --
 -- A tactic of type @WhenMatched f x y z@ is an abstract representation
 -- of a function of type @Key -> x -> y -> f (Maybe z)@.
+--
+-- @since 0.5.9
 newtype WhenMatched f x y z = WhenMatched
   { matchedKey :: Key -> x -> y -> f (Maybe z) }
 
 
 -- | Along with zipWithMaybeAMatched, witnesses the isomorphism
 -- between @WhenMatched f x y z@ and @Key -> x -> y -> f (Maybe z)@.
+--
+-- @since 0.5.9
 runWhenMatched :: WhenMatched f x y z -> Key -> x -> y -> f (Maybe z)
 runWhenMatched = matchedKey
 {-# INLINE runWhenMatched #-}
@@ -1483,16 +1533,20 @@ runWhenMatched = matchedKey
 
 -- | Along with traverseMaybeMissing, witnesses the isomorphism
 -- between @WhenMissing f x y@ and @Key -> x -> f (Maybe y)@.
+--
+-- @since 0.5.9
 runWhenMissing :: WhenMissing f x y -> Key-> x -> f (Maybe y)
 runWhenMissing = missingKey
 {-# INLINE runWhenMissing #-}
 
 
+-- | @since 0.5.9
 instance Functor f => Functor (WhenMatched f x y) where
   fmap = mapWhenMatched
   {-# INLINE fmap #-}
 
 
+-- | @since 0.5.9
 instance (Monad f, Applicative f) => Category.Category (WhenMatched f x)
   where
     id = zipWithMatched (\_ _ y -> y)
@@ -1507,6 +1561,8 @@ instance (Monad f, Applicative f) => Category.Category (WhenMatched f x)
 
 
 -- | Equivalent to @ReaderT Key (ReaderT x (ReaderT y (MaybeT f)))@
+--
+-- @since 0.5.9
 instance (Monad f, Applicative f) => Applicative (WhenMatched f x y) where
   pure x = zipWithMatched (\_ _ _ -> x)
   fs <*> xs =
@@ -1520,6 +1576,8 @@ instance (Monad f, Applicative f) => Applicative (WhenMatched f x y) where
 
 
 -- | Equivalent to @ReaderT Key (ReaderT x (ReaderT y (MaybeT f)))@
+--
+-- @since 0.5.9
 instance (Monad f, Applicative f) => Monad (WhenMatched f x y) where
 #if !MIN_VERSION_base(4,8,0)
   return = pure
@@ -1534,6 +1592,8 @@ instance (Monad f, Applicative f) => Monad (WhenMatched f x y) where
 
 
 -- | Map covariantly over a @'WhenMatched' f x y@.
+--
+-- @since 0.5.9
 mapWhenMatched
   :: Functor f
   => (a -> b)
@@ -1548,6 +1608,8 @@ mapWhenMatched f (WhenMatched g) =
 --
 -- A tactic of type @SimpleWhenMatched x y z@ is an abstract
 -- representation of a function of type @Key -> x -> y -> Maybe z@.
+--
+-- @since 0.5.9
 type SimpleWhenMatched = WhenMatched Identity
 
 
@@ -1557,6 +1619,8 @@ type SimpleWhenMatched = WhenMatched Identity
 -- > zipWithMatched
 -- >   :: (Key -> x -> y -> z)
 -- >   -> SimpleWhenMatched x y z
+--
+-- @since 0.5.9
 zipWithMatched
   :: Applicative f
   => (Key -> x -> y -> z)
@@ -1568,6 +1632,8 @@ zipWithMatched f = WhenMatched $ \ k x y -> pure . Just $ f k x y
 -- | When a key is found in both maps, apply a function to the key
 -- and values to produce an action and use its result in the merged
 -- map.
+--
+-- @since 0.5.9
 zipWithAMatched
   :: Applicative f
   => (Key -> x -> y -> f z)
@@ -1582,6 +1648,8 @@ zipWithAMatched f = WhenMatched $ \ k x y -> Just <$> f k x y
 -- > zipWithMaybeMatched
 -- >   :: (Key -> x -> y -> Maybe z)
 -- >   -> SimpleWhenMatched x y z
+--
+-- @since 0.5.9
 zipWithMaybeMatched
   :: Applicative f
   => (Key -> x -> y -> Maybe z)
@@ -1595,6 +1663,8 @@ zipWithMaybeMatched f = WhenMatched $ \ k x y -> pure $ f k x y
 -- result in the merged map.
 --
 -- This is the fundamental 'WhenMatched' tactic.
+--
+-- @since 0.5.9
 zipWithMaybeAMatched
   :: (Key -> x -> y -> f (Maybe z))
   -> WhenMatched f x y z
@@ -1610,6 +1680,8 @@ zipWithMaybeAMatched f = WhenMatched $ \ k x y -> f k x y
 -- prop> dropMissing = mapMaybeMissing (\_ _ -> Nothing)
 --
 -- but @dropMissing@ is much faster.
+--
+-- @since 0.5.9
 dropMissing :: Applicative f => WhenMissing f x y
 dropMissing = WhenMissing
   { missingSubtree = const (pure Nil)
@@ -1625,6 +1697,8 @@ dropMissing = WhenMissing
 -- prop> preserveMissing = Merge.Lazy.mapMaybeMissing (\_ x -> Just x)
 --
 -- but @preserveMissing@ is much faster.
+--
+-- @since 0.5.9
 preserveMissing :: Applicative f => WhenMissing f x x
 preserveMissing = WhenMissing
   { missingSubtree = pure
@@ -1639,6 +1713,8 @@ preserveMissing = WhenMissing
 -- prop> mapMissing f = mapMaybeMissing (\k x -> Just $ f k x)
 --
 -- but @mapMissing@ is somewhat faster.
+--
+-- @since 0.5.9
 mapMissing :: Applicative f => (Key -> x -> y) -> WhenMissing f x y
 mapMissing f = WhenMissing
   { missingSubtree = \m -> pure $! mapWithKey f m
@@ -1656,6 +1732,8 @@ mapMissing f = WhenMissing
 --
 -- but @mapMaybeMissing@ uses fewer unnecessary 'Applicative'
 -- operations.
+--
+-- @since 0.5.9
 mapMaybeMissing
   :: Applicative f => (Key -> x -> Maybe y) -> WhenMissing f x y
 mapMaybeMissing f = WhenMissing
@@ -1671,6 +1749,8 @@ mapMaybeMissing f = WhenMissing
 -- prop> filterMissing f = Merge.Lazy.mapMaybeMissing $ \k x -> guard (f k x) *> Just x
 --
 -- but this should be a little faster.
+--
+-- @since 0.5.9
 filterMissing
   :: Applicative f => (Key -> x -> Bool) -> WhenMissing f x x
 filterMissing f = WhenMissing
@@ -1686,6 +1766,8 @@ filterMissing f = WhenMissing
 -- >   \k x -> (\b -> guard b *> Just x) <$> f k x
 --
 -- but this should be a little faster.
+--
+-- @since 0.5.9
 filterAMissing
   :: Applicative f => (Key -> x -> f Bool) -> WhenMissing f x x
 filterAMissing f = WhenMissing
@@ -1710,6 +1792,8 @@ bool _ t True  = t
 
 -- | Traverse over the entries whose keys are missing from the other
 -- map.
+--
+-- @since 0.5.9
 traverseMissing
   :: Applicative f => (Key -> x -> f y) -> WhenMissing f x y
 traverseMissing f = WhenMissing
@@ -1722,6 +1806,8 @@ traverseMissing f = WhenMissing
 -- map, optionally producing values to put in the result. This is
 -- the most powerful 'WhenMissing' tactic, but others are usually
 -- more efficient.
+--
+-- @since 0.5.9
 traverseMaybeMissing
   :: Applicative f => (Key -> x -> f (Maybe y)) -> WhenMissing f x y
 traverseMaybeMissing f = WhenMissing
@@ -1809,7 +1895,7 @@ traverseMaybeWithKey f = go
 -- prop> symmetricDifference = merge diffPreserve diffPreserve (\ _ _ _ -> Nothing)
 -- prop> mapEachPiece f g h = merge (diffMapWithKey f) (diffMapWithKey g)
 --
--- @since 0.5.8
+-- @since 0.5.9
 merge
   :: SimpleWhenMissing a c -- ^ What to do with keys in @m1@ but not @m2@
   -> SimpleWhenMissing b c -- ^ What to do with keys in @m2@ but not @m1@
@@ -1884,7 +1970,7 @@ merge g1 g2 f m1 m2 =
 -- site. To prevent excessive inlining, you should generally only use
 -- 'mergeA' to define custom combining functions.
 --
--- @since 0.5.8
+-- @since 0.5.9
 mergeA
   :: (Applicative f)
   => WhenMissing f a c -- ^ What to do with keys in @m1@ but not @m2@
@@ -2022,17 +2108,26 @@ data View a = View {-# UNPACK #-} !Key a !(IntMap a)
 -- > maxViewWithKey empty == Nothing
 
 maxViewWithKey :: IntMap a -> Maybe ((Key, a), IntMap a)
-maxViewWithKey t =
+maxViewWithKey t = case t of
+  Nil -> Nothing
+  _ -> Just $ case maxViewWithKeySure t of
+                View k v t' -> ((k, v), t')
+{-# INLINE maxViewWithKey #-}
+
+maxViewWithKeySure :: IntMap a -> View a
+maxViewWithKeySure t =
   case t of
-    Nil -> Nothing
+    Nil -> error "maxViewWithKeySure Nil"
     Bin p m l r | m < 0 ->
-      Just $ case go l of View k a l' -> ((k, a), binCheckLeft p m l' r)
-    _ -> Just $ case go t of View k a t' -> ((k, a), t')
+      case go l of View k a l' -> View k a (binCheckLeft p m l' r)
+    _ -> go t
   where
     go (Bin p m l r) =
         case go r of View k a r' -> View k a (binCheckRight p m l r')
     go (Tip k y) = View k y Nil
-    go Nil = error "maxViewWithKey Nil"
+    go Nil = error "maxViewWithKey_go Nil"
+-- See note on NOINLINE at minViewWithKeySure
+{-# NOINLINE maxViewWithKeySure #-}
 
 -- | /O(min(n,W))/. Retrieves the minimal (key,value) pair of the map, and
 -- the map stripped of that element, or 'Nothing' if passed an empty map.
@@ -2044,14 +2139,31 @@ minViewWithKey :: IntMap a -> Maybe ((Key, a), IntMap a)
 minViewWithKey t =
   case t of
     Nil -> Nothing
+    _ -> Just $ case minViewWithKeySure t of
+                  View k v t' -> ((k, v), t')
+-- We inline this to give GHC the best possible chance of
+-- getting rid of the Maybe, pair, and Int constructors, as
+-- well as a thunk under the Just. That is, we really want to
+-- be certain this inlines!
+{-# INLINE minViewWithKey #-}
+
+minViewWithKeySure :: IntMap a -> View a
+minViewWithKeySure t =
+  case t of
+    Nil -> error "minViewWithKeySure Nil"
     Bin p m l r | m < 0 ->
-      Just $ case go r of View k a r' -> ((k, a), binCheckRight p m l r')
-    _ -> Just $ case go t of View k a t' -> ((k, a), t')
+      case go r of
+        View k a r' -> View k a (binCheckRight p m l r')
+    _ -> go t
   where
     go (Bin p m l r) =
         case go l of View k a l' -> View k a (binCheckLeft p m l' r)
     go (Tip k y) = View k y Nil
-    go Nil = error "minViewWithKey Nil"
+    go Nil = error "minViewWithKey_go Nil"
+-- There's never anything significant to be gained by inlining
+-- this. Sufficiently recent GHC versions will inline the wrapper
+-- anyway, which should be good enough.
+{-# NOINLINE minViewWithKeySure #-}
 
 -- | /O(min(n,W))/. Update the value at the maximal key.
 --
@@ -2069,49 +2181,63 @@ updateMax f = updateMaxWithKey (const f)
 updateMin :: (a -> Maybe a) -> IntMap a -> IntMap a
 updateMin f = updateMinWithKey (const f)
 
--- Similar to the Arrow instance.
-first :: (a -> c) -> (a, b) -> (c, b)
-first f (x,y) = (f x,y)
-
 -- | /O(min(n,W))/. Retrieves the maximal key of the map, and the map
 -- stripped of that element, or 'Nothing' if passed an empty map.
 maxView :: IntMap a -> Maybe (a, IntMap a)
-maxView t = liftM (first snd) (maxViewWithKey t)
+maxView t = fmap (\((_, x), t') -> (x, t')) (maxViewWithKey t)
 
 -- | /O(min(n,W))/. Retrieves the minimal key of the map, and the map
 -- stripped of that element, or 'Nothing' if passed an empty map.
 minView :: IntMap a -> Maybe (a, IntMap a)
-minView t = liftM (first snd) (minViewWithKey t)
+minView t = fmap (\((_, x), t') -> (x, t')) (minViewWithKey t)
 
 -- | /O(min(n,W))/. Delete and find the maximal element.
+-- This function throws an error if the map is empty. Use 'maxViewWithKey'
+-- if the map may be empty.
 deleteFindMax :: IntMap a -> ((Key, a), IntMap a)
 deleteFindMax = fromMaybe (error "deleteFindMax: empty map has no maximal element") . maxViewWithKey
 
 -- | /O(min(n,W))/. Delete and find the minimal element.
+-- This function throws an error if the map is empty. Use 'minViewWithKey'
+-- if the map may be empty.
 deleteFindMin :: IntMap a -> ((Key, a), IntMap a)
 deleteFindMin = fromMaybe (error "deleteFindMin: empty map has no minimal element") . minViewWithKey
 
--- | /O(min(n,W))/. The minimal key of the map.
-findMin :: IntMap a -> (Key, a)
-findMin Nil = error $ "findMin: empty map has no minimal element"
-findMin (Tip k v) = (k,v)
-findMin (Bin _ m l r)
+-- | /O(min(n,W))/. The minimal key of the map. Returns 'Nothing' if the map is empty.
+lookupMin :: IntMap a -> Maybe (Key, a)
+lookupMin Nil = Nothing
+lookupMin (Tip k v) = Just (k,v)
+lookupMin (Bin _ m l r)
   | m < 0     = go r
   | otherwise = go l
-    where go (Tip k v)      = (k,v)
+    where go (Tip k v)      = Just (k,v)
           go (Bin _ _ l' _) = go l'
-          go Nil            = error "findMax Nil"
+          go Nil            = Nothing
 
--- | /O(min(n,W))/. The maximal key of the map.
-findMax :: IntMap a -> (Key, a)
-findMax Nil = error $ "findMax: empty map has no maximal element"
-findMax (Tip k v) = (k,v)
-findMax (Bin _ m l r)
+-- | /O(min(n,W))/. The minimal key of the map. Calls 'error' if the map is empty.
+-- Use 'minViewWithKey' if the map may be empty.
+findMin :: IntMap a -> (Key, a)
+findMin t
+  | Just r <- lookupMin t = r
+  | otherwise = error "findMin: empty map has no minimal element"
+
+-- | /O(min(n,W))/. The maximal key of the map. Returns 'Nothing' if the map is empty.
+lookupMax :: IntMap a -> Maybe (Key, a)
+lookupMax Nil = Nothing
+lookupMax (Tip k v) = Just (k,v)
+lookupMax (Bin _ m l r)
   | m < 0     = go l
   | otherwise = go r
-    where go (Tip k v)      = (k,v)
+    where go (Tip k v)      = Just (k,v)
           go (Bin _ _ _ r') = go r'
-          go Nil            = error "findMax Nil"
+          go Nil            = Nothing
+
+-- | /O(min(n,W))/. The maximal key of the map. Calls 'error' if the map is empty.
+-- Use 'maxViewWithKey' if the map may be empty.
+findMax :: IntMap a -> (Key, a)
+findMax t
+  | Just r <- lookupMax t = r
+  | otherwise = error "findMax: empty map has no maximal element"
 
 -- | /O(min(n,W))/. Delete the minimal key. Returns an empty map if the map is empty.
 --
@@ -2737,6 +2863,8 @@ foldlWithKey' f z = \t ->      -- Use lambda t to be inlinable with two argument
 -- @'foldMapWithKey' f = 'Prelude.fold' . 'mapWithKey' f@
 --
 -- This can be an asymptotically faster than 'foldrWithKey' or 'foldlWithKey' for some monoids.
+--
+-- @since 0.5.4
 foldMapWithKey :: Monoid m => (Key -> a -> m) -> IntMap a -> m
 foldMapWithKey f = go
   where
@@ -2827,6 +2955,7 @@ fromSet f (IntSet.Tip kx bm) = buildTree f kx bm (IntSet.suffixBitMask + 1)
   Lists
 --------------------------------------------------------------------}
 #if __GLASGOW_HASKELL__ >= 708
+-- | @since 0.5.6.2
 instance GHCExts.IsList (IntMap a) where
   type Item (IntMap a) = (Key,a)
   fromList = fromList
@@ -3024,6 +3153,7 @@ nequal Nil Nil = False
 nequal _   _   = True
 
 #if MIN_VERSION_base(4,9,0)
+-- | @since 0.5.9
 instance Eq1 IntMap where
   liftEq eq (Bin p1 m1 l1 r1) (Bin p2 m2 l2 r2)
     = (m1 == m2) && (p1 == p2) && (liftEq eq l1 l2) && (liftEq eq r1 r2)
@@ -3041,6 +3171,7 @@ instance Ord a => Ord (IntMap a) where
     compare m1 m2 = compare (toList m1) (toList m2)
 
 #if MIN_VERSION_base(4,9,0)
+-- | @since 0.5.9
 instance Ord1 IntMap where
   liftCompare cmp m n =
     liftCompare (liftCompare cmp) (toList m) (toList n)
@@ -3068,6 +3199,7 @@ instance Show a => Show (IntMap a) where
     showString "fromList " . shows (toList m)
 
 #if MIN_VERSION_base(4,9,0)
+-- | @since 0.5.9
 instance Show1 IntMap where
     liftShowsPrec sp sl d m =
         showsUnaryWith (liftShowsPrec sp' sl') "fromList" d (toList m)
@@ -3095,6 +3227,7 @@ instance (Read e) => Read (IntMap e) where
 #endif
 
 #if MIN_VERSION_base(4,9,0)
+-- | @since 0.5.9
 instance Read1 IntMap where
     liftReadsPrec rp rl = readsData $
         readsUnaryWith (liftReadsPrec rp' rl') "fromList" fromList

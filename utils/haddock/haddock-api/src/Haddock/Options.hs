@@ -25,21 +25,27 @@ module Haddock.Options (
   sourceUrls,
   wikiUrls,
   optDumpInterfaceFile,
+  optShowInterfaceFile,
   optLaTeXStyle,
   optMathjax,
   qualification,
+  sinceQualification,
   verbosity,
   ghcFlags,
+  reexportFlags,
   readIfaceArgs,
   optPackageName,
-  optPackageVersion
+  optPackageVersion,
+  modulePackageInfo
 ) where
 
 
 import qualified Data.Char as Char
 import           Data.Version
+import           Control.Applicative
 import           Distribution.Verbosity
 import           FastString
+import           GHC ( DynFlags, Module, moduleUnitId )
 import           Haddock.Types
 import           Haddock.Utils
 import           Packages
@@ -53,6 +59,7 @@ data Flag
 --  | Flag_DocBook
   | Flag_ReadInterface String
   | Flag_DumpInterface String
+  | Flag_ShowInterface String
   | Flag_Heading String
   | Flag_Html
   | Flag_Hoogle
@@ -68,6 +75,7 @@ data Flag
   | Flag_WikiEntityURL String
   | Flag_LaTeX
   | Flag_LaTeXStyle String
+  | Flag_QuickJumpIndex
   | Flag_HyperlinkedSource
   | Flag_SourceCss String
   | Flag_Mathjax String
@@ -82,6 +90,8 @@ data Flag
   | Flag_GenIndex
   | Flag_IgnoreAllExports
   | Flag_HideModule String
+  | Flag_ShowModule String
+  | Flag_ShowAllModules
   | Flag_ShowExtensions String
   | Flag_OptGhc String
   | Flag_GhcLibDir String
@@ -96,6 +106,8 @@ data Flag
   | Flag_NoPrintMissingDocs
   | Flag_PackageName String
   | Flag_PackageVersion String
+  | Flag_Reexport String
+  | Flag_SinceQualification String
   deriving (Eq, Show)
 
 
@@ -112,6 +124,8 @@ options backwardsCompat =
       "read an interface from FILE",
     Option ['D']  ["dump-interface"] (ReqArg Flag_DumpInterface "FILE")
       "write the resulting interface to FILE",
+    Option []     ["show-interface"] (ReqArg Flag_ShowInterface "FILE")
+      "print the interface in a human readable form",
 --    Option ['S']  ["docbook"]  (NoArg Flag_DocBook)
 --  "output in DocBook XML",
     Option ['h']  ["html"]     (NoArg Flag_Html)
@@ -122,6 +136,8 @@ options backwardsCompat =
     Option ['U'] ["use-unicode"] (NoArg Flag_UseUnicode) "use Unicode in HTML output",
     Option []  ["hoogle"]     (NoArg Flag_Hoogle)
       "output for Hoogle; you may want --package-name and --package-version too",
+    Option [] ["quickjump"] (NoArg Flag_QuickJumpIndex)
+      "generate an index for interactive documentation navigation",
     Option [] ["hyperlinked-source"] (NoArg Flag_HyperlinkedSource)
       "generate highlighted and hyperlinked source code (for use with --html)",
     Option [] ["source-css"] (ReqArg Flag_SourceCss "FILE")
@@ -173,6 +189,10 @@ options backwardsCompat =
       "behave as if all modules have the\nignore-exports atribute",
     Option [] ["hide"] (ReqArg Flag_HideModule "MODULE")
       "behave as if MODULE has the hide attribute",
+    Option [] ["show"] (ReqArg Flag_ShowModule "MODULE")
+      "behave as if MODULE does not have the hide attribute",
+    Option [] ["show-all"] (NoArg Flag_ShowAllModules)
+      "behave as if not modules have the hide attribute",
     Option [] ["show-extensions"] (ReqArg Flag_ShowExtensions "MODULE")
       "behave as if MODULE has the show-extensions attribute",
     Option [] ["optghc"] (ReqArg Flag_OptGhc "OPTION")
@@ -190,10 +210,14 @@ options backwardsCompat =
       "generate html with newlines and indenting (for use with --html)",
     Option [] ["no-print-missing-docs"] (NoArg Flag_NoPrintMissingDocs)
       "don't print information about any undocumented entities",
+    Option []  ["reexport"] (ReqArg Flag_Reexport "MOD")
+      "reexport the module MOD, adding it to the index",
     Option [] ["package-name"] (ReqArg Flag_PackageName "NAME")
       "name of the package being documented",
     Option [] ["package-version"] (ReqArg Flag_PackageVersion "VERSION")
-      "version of the package being documented in usual x.y.z.w format"
+      "version of the package being documented in usual x.y.z.w format",
+    Option []  ["since-qual"] (ReqArg Flag_SinceQualification "QUAL")
+      "package qualification of @since, one of\n'always' (default) or 'only-external'"
   ]
 
 
@@ -270,6 +294,8 @@ wikiUrls flags =
 optDumpInterfaceFile :: [Flag] -> Maybe FilePath
 optDumpInterfaceFile flags = optLast [ str | Flag_DumpInterface str <- flags ]
 
+optShowInterfaceFile :: [Flag] -> Maybe FilePath
+optShowInterfaceFile flags = optLast [ str | Flag_ShowInterface str <- flags ]
 
 optLaTeXStyle :: [Flag] -> Maybe String
 optLaTeXStyle flags = optLast [ str | Flag_LaTeXStyle str <- flags ]
@@ -291,6 +317,14 @@ qualification flags =
       [arg]          -> Left $ "unknown qualification type " ++ show arg
       _:_            -> Left "qualification option given multiple times"
 
+sinceQualification :: [Flag] -> Either String SinceQual
+sinceQualification flags =
+  case map (map Char.toLower) [ str | Flag_SinceQualification str <- flags ] of
+      []             -> Right Always
+      ["always"]     -> Right Always
+      ["external"]   -> Right External
+      [arg]          -> Left $ "unknown since-qualification type " ++ show arg
+      _:_            -> Left "since-qualification option given multiple times"
 
 verbosity :: [Flag] -> Verbosity
 verbosity flags =
@@ -303,6 +337,9 @@ verbosity flags =
 
 ghcFlags :: [Flag] -> [String]
 ghcFlags flags = [ option | Flag_OptGhc option <- flags ]
+
+reexportFlags :: [Flag] -> [String]
+reexportFlags flags = [ option | Flag_Reexport option <- flags ]
 
 
 readIfaceArgs :: [Flag] -> [(DocPaths, FilePath)]
@@ -322,3 +359,23 @@ readIfaceArgs flags = [ parseIfaceOption s | Flag_ReadInterface s <- flags ]
 optLast :: [a] -> Maybe a
 optLast [] = Nothing
 optLast xs = Just (last xs)
+
+
+-- | This function has a potential to return 'Nothing' because package name and
+-- versions can no longer reliably be extracted in all cases: if the package is
+-- not installed yet then this info is no longer available.
+--
+-- The @--package-name@ and @--package-version@ Haddock flags allow the user to
+-- specify this information manually and it is returned here if present.
+modulePackageInfo :: DynFlags
+                  -> [Flag] -- ^ Haddock flags are checked as they may contain
+                            -- the package name or version provided by the user
+                            -- which we prioritise
+                  -> Module
+                  -> (Maybe PackageName, Maybe Data.Version.Version)
+modulePackageInfo dflags flags modu =
+  ( optPackageName flags    <|> fmap packageName pkgDb
+  , optPackageVersion flags <|> fmap packageVersion pkgDb
+  )
+  where
+    pkgDb = lookupPackage dflags (moduleUnitId modu)

@@ -10,20 +10,24 @@ module CSE (cseProgram, cseOneExpr) where
 
 #include "HsVersions.h"
 
+import GhcPrelude
+
 import CoreSubst
 import Var              ( Var )
-import VarEnv           ( elemInScopeSet )
+import VarEnv           ( elemInScopeSet, mkInScopeSet )
 import Id               ( Id, idType, idInlineActivation, isDeadBinder
                         , zapIdOccInfo, zapIdUsageInfo, idInlinePragma
-                        , isJoinId )
+                        , isJoinId, isJoinId_maybe )
 import CoreUtils        ( mkAltExpr, eqExpr
-                        , exprIsLiteralString
+                        , exprIsTickedString
                         , stripTicksE, stripTicksT, mkTicks )
+import CoreFVs          ( exprFreeVars )
 import Type             ( tyConAppArgs )
 import CoreSyn
 import Outputable
 import BasicTypes       ( TopLevelFlag(..), isTopLevel
-                        , isAlwaysActive, isAnyInlinePragma )
+                        , isAlwaysActive, isAnyInlinePragma,
+                          inlinePragmaSpec, noUserInlineSpec )
 import TrieMap
 import Util             ( filterOut )
 import Data.List        ( mapAccumL )
@@ -154,7 +158,7 @@ For example:
   This is the main reason that addBinding is called with a trivial rhs.
 
 * Non-trivial scrutinee
-     case (f x) of y { pat -> ...let y = f x in ... }
+     case (f x) of y { pat -> ...let z = f x in ... }
 
   By using addBinding we'll add (f x :-> y) to the cs_map, and
   thereby CSE the inner (f x) to y.
@@ -204,8 +208,12 @@ is small).  The conclusion here is this:
   might replace <rhs> by 'bar', and then later be unable to see that it
   really was <rhs>.
 
+An except to the rule is when the INLINE pragma is not from the user, e.g. from
+WorkWrap (see Note [Wrapper activation]). We can tell because noUserInlineSpec
+is then true.
+
 Note that we do not (currently) do CSE on the unfolding stored inside
-an Id, even if is a 'stable' unfolding.  That means that when an
+an Id, even if it is a 'stable' unfolding.  That means that when an
 unfolding happens, it is always faithful to what the stable unfolding
 originally was.
 
@@ -266,7 +274,28 @@ compiling ppHtml in Haddock.Backends.Xhtml).
 
 We could try and be careful by tracking which join points are still valid at
 each subexpression, but since join points aren't allocated or shared, there's
-less to gain by trying to CSE them.
+less to gain by trying to CSE them. (#13219)
+
+Note [Don’t tryForCSE the RHS of a Join Point]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Another way how CSE for joint points is tricky is
+
+  let join foo x = (x, 42)
+      join bar x = (x, 42)
+  in … jump foo 1 … jump bar 2 …
+
+naively, CSE would turn this into
+
+  let join foo x = (x, 42)
+      join bar = foo
+  in … jump foo 1 … jump bar 2 …
+
+but now bar is a join point that claims arity one, but its right-hand side
+is not a lambda, breaking the join-point invariant (this was #15002).
+
+Therefore, `cse_bind` will zoom past the lambdas of a join point (using
+`collectNBinders`) and resume searching for CSE opportunities only in the body
+of the join point.
 
 Note [CSE for recursive bindings]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -334,11 +363,23 @@ cseBind toplevel env (Rec pairs)
 
     do_one env (pr, b1) = cse_bind toplevel env pr b1
 
+-- | Given a binding of @in_id@ to @in_rhs@, and a fresh name to refer
+-- to @in_id@ (@out_id@, created from addBinder or addRecBinders),
+-- first try to CSE @in_rhs@, and then add the resulting (possibly CSE'd)
+-- binding to the 'CSEnv', so that we attempt to CSE any expressions
+-- which are equal to @out_rhs@.
 cse_bind :: TopLevelFlag -> CSEnv -> (InId, InExpr) -> OutId -> (CSEnv, (OutId, OutExpr))
 cse_bind toplevel env (in_id, in_rhs) out_id
-  | isTopLevel toplevel, exprIsLiteralString in_rhs
+  | isTopLevel toplevel, exprIsTickedString in_rhs
       -- See Note [Take care with literal strings]
   = (env', (out_id, in_rhs))
+
+  | Just arity <- isJoinId_maybe in_id
+      -- See Note [Don’t tryForCSE the RHS of a Join Point]
+  = let (params, in_body) = collectNBinders arity in_rhs
+        (env', params') = addBinders env params
+        out_body = tryForCSE env' in_body
+    in (env, (out_id, mkLams params' out_body))
 
   | otherwise
   = (env', (out_id', out_rhs))
@@ -379,8 +420,11 @@ addBinding env in_id out_id rhs'
                    Var {} -> True
                    _      -> False
 
+-- | Given a binder `let x = e`, this function
+-- determines whether we should add `e -> x` to the cs_map
 noCSE :: InId -> Bool
-noCSE id =  not (isAlwaysActive (idInlineActivation id))
+noCSE id =  not (isAlwaysActive (idInlineActivation id)) &&
+            not (noUserInlineSpec (inlinePragmaSpec (idInlinePragma id)))
              -- See Note [CSE for INLINE and NOINLINE]
          || isAnyInlinePragma (idInlinePragma id)
              -- See Note [CSE for stable unfoldings]
@@ -439,8 +483,13 @@ tryForCSE env expr
     -- top of the replaced sub-expression. This is probably not too
     -- useful in practice, but upholds our semantics.
 
+-- | Runs CSE on a single expression.
+--
+-- This entry point is not used in the compiler itself, but is provided
+-- as a convenient entry point for users of the GHC API.
 cseOneExpr :: InExpr -> OutExpr
-cseOneExpr = cseExpr emptyCSEnv
+cseOneExpr e = cseExpr env e
+  where env = emptyCSEnv {cs_subst = mkEmptySubst (mkInScopeSet (exprFreeVars e)) }
 
 cseExpr :: CSEnv -> InExpr -> OutExpr
 cseExpr env (Type t)              = Type (substTy (csEnvSubst env) t)
@@ -449,7 +498,7 @@ cseExpr _   (Lit lit)             = Lit lit
 cseExpr env (Var v)               = lookupSubst env v
 cseExpr env (App f a)             = App (cseExpr env f) (tryForCSE env a)
 cseExpr env (Tick t e)            = Tick t (cseExpr env e)
-cseExpr env (Cast e co)           = Cast (cseExpr env e) (substCo (csEnvSubst env) co)
+cseExpr env (Cast e co)           = Cast (tryForCSE env e) (substCo (csEnvSubst env) co)
 cseExpr env (Lam b e)             = let (env', b') = addBinder env b
                                     in Lam b' (cseExpr env' e)
 cseExpr env (Let bind e)          = let (env', bind') = cseBind NotTopLevel env bind
@@ -478,9 +527,11 @@ cseCase env scrut bndr ty alts
     arg_tys :: [OutType]
     arg_tys = tyConAppArgs (idType bndr3)
 
+    -- Given case x of { K y z -> ...K y z... }
+    -- CSE K y z into x...
     cse_alt (DataAlt con, args, rhs)
         | not (null args)
-                -- Don't try CSE if there are no args; it just increases the number
+                -- ... but don't try CSE if there are no args; it just increases the number
                 -- of live vars.  E.g.
                 --      case x of { True -> ....True.... }
                 -- Don't replace True by x!
@@ -512,7 +563,7 @@ combineAlts _ alts = alts  -- Default case
 {- Note [Combine case alternatives]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 combineAlts is just a more heavyweight version of the use of
-combineIdentialAlts in SimplUtils.prepareAlts.  The basic idea is
+combineIdenticalAlts in SimplUtils.prepareAlts.  The basic idea is
 to transform
 
     DEFAULT -> e1
@@ -585,6 +636,9 @@ lookupSubst (CS { cs_subst = sub}) x = lookupIdSubst (text "CSE.lookupSubst") su
 extendCSSubst :: CSEnv -> Id  -> CoreExpr -> CSEnv
 extendCSSubst cse x rhs = cse { cs_subst = extendSubst (cs_subst cse) x rhs }
 
+-- | Add clones to the substitution to deal with shadowing.  See
+-- Note [Shadowing] for more details.  You should call this whenever
+-- you go under a binder.
 addBinder :: CSEnv -> Var -> (CSEnv, Var)
 addBinder cse v = (cse { cs_subst = sub' }, v')
                 where

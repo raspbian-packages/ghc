@@ -1,4 +1,3 @@
-{-# LANGUAGE ViewPatterns #-}
 -- | cabal-install CLI command: configure
 --
 module Distribution.Client.CmdConfigure (
@@ -6,13 +5,16 @@ module Distribution.Client.CmdConfigure (
     configureAction,
   ) where
 
+import System.Directory
+import Control.Monad
+import qualified Data.Map as Map
+
 import Distribution.Client.ProjectOrchestration
 import Distribution.Client.ProjectConfig
          ( writeProjectLocalExtraConfig )
 
 import Distribution.Client.Setup
-         ( GlobalFlags, ConfigFlags(..), ConfigExFlags, InstallFlags
-         , applyFlagDefaults )
+         ( GlobalFlags, ConfigFlags(..), ConfigExFlags, InstallFlags )
 import Distribution.Simple.Setup
          ( HaddockFlags, fromFlagOrDefault )
 import Distribution.Verbosity
@@ -21,7 +23,7 @@ import Distribution.Verbosity
 import Distribution.Simple.Command
          ( CommandUI(..), usageAlternatives )
 import Distribution.Simple.Utils
-         ( wrapText )
+         ( wrapText, notice )
 import qualified Distribution.Client.Setup as Client
 
 configureCommand :: CommandUI (ConfigFlags, ConfigExFlags
@@ -78,25 +80,30 @@ configureCommand = Client.installCommand {
 --
 configureAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
                 -> [String] -> GlobalFlags -> IO ()
-configureAction (applyFlagDefaults -> (configFlags, configExFlags, installFlags, haddockFlags))
+configureAction (configFlags, configExFlags, installFlags, haddockFlags)
                 _extraArgs globalFlags = do
     --TODO: deal with _extraArgs, since flags with wrong syntax end up there
 
     baseCtx <- establishProjectBaseContext verbosity cliConfig
 
     -- Write out the @cabal.project.local@ so it gets picked up by the
-    -- planning phase.
+    -- planning phase. If old config exists, then print the contents
+    -- before overwriting
+    exists <- doesFileExist "cabal.project.local"
+    when exists $ do
+        notice verbosity "'cabal.project.local' file already exists. Now overwriting it."
+        copyFile "cabal.project.local" "cabal.project.local~"
     writeProjectLocalExtraConfig (distDirLayout baseCtx)
                                  cliConfig
 
     buildCtx <-
-      runProjectPreBuildPhase verbosity baseCtx $ \elaboratedPlan -> do
+      runProjectPreBuildPhase verbosity baseCtx $ \elaboratedPlan ->
 
             -- TODO: Select the same subset of targets as 'CmdBuild' would
             -- pick (ignoring, for example, executables in libraries
             -- we depend on). But we don't want it to fail, so actually we
             -- have to do it slightly differently from build.
-            return elaboratedPlan
+            return (elaboratedPlan, Map.empty)
 
     let baseCtx' = baseCtx {
                       buildSettings = (buildSettings baseCtx) {

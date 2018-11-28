@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE FlexibleContexts #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -42,12 +43,17 @@ module Distribution.System (
 
 import Prelude ()
 import Distribution.Compat.Prelude
+import Control.Applicative (liftA2)
 
 import qualified System.Info (os, arch)
+import Distribution.Utils.Generic (lowercase)
 
+import Distribution.Parsec.Class
+import Distribution.Pretty
 import Distribution.Text
-import qualified Distribution.Compat.ReadP as Parse
 
+import qualified Distribution.Compat.ReadP as Parse
+import qualified Distribution.Compat.CharParsing as P
 import qualified Text.PrettyPrint as Disp
 
 -- | How strict to be when classifying strings into the 'OS' and 'Arch' enums.
@@ -98,6 +104,8 @@ data OS = Linux | Windows | OSX        -- tier 1 desktop OSs
 
 instance Binary OS
 
+instance NFData OS where rnf = genericRnf
+
 knownOSs :: [OS]
 knownOSs = [Linux, Windows, OSX
            ,FreeBSD, OpenBSD, NetBSD, DragonFly
@@ -118,10 +126,14 @@ osAliases Permissive Solaris = ["solaris2"]
 osAliases Compat     Solaris = ["solaris2"]
 osAliases _          _       = []
 
-instance Text OS where
-  disp (OtherOS name) = Disp.text name
-  disp other          = Disp.text (lowercase (show other))
+instance Pretty OS where
+  pretty (OtherOS name) = Disp.text name
+  pretty other          = Disp.text (lowercase (show other))
 
+instance Parsec OS where
+  parsec = classifyOS Compat <$> parsecIdent
+
+instance Text OS where
   parse = fmap (classifyOS Compat) ident
 
 classifyOS :: ClassificationStrictness -> String -> OS
@@ -161,6 +173,8 @@ data Arch = I386  | X86_64 | PPC | PPC64 | Sparc
 
 instance Binary Arch
 
+instance NFData Arch where rnf = genericRnf
+
 knownArches :: [Arch]
 knownArches = [I386, X86_64, PPC, PPC64, Sparc
               ,Arm, Mips, SH
@@ -179,10 +193,14 @@ archAliases _      Mips  = ["mipsel", "mipseb"]
 archAliases _      Arm   = ["armeb", "armel"]
 archAliases _      _     = []
 
-instance Text Arch where
-  disp (OtherArch name) = Disp.text name
-  disp other            = Disp.text (lowercase (show other))
+instance Pretty Arch where
+  pretty (OtherArch name) = Disp.text name
+  pretty other            = Disp.text (lowercase (show other))
 
+instance Parsec Arch where
+  parsec = classifyArch Strict <$> parsecIdent
+
+instance Text Arch where
   parse = fmap (classifyArch Strict) ident
 
 classifyArch :: ClassificationStrictness -> String -> Arch
@@ -205,8 +223,26 @@ data Platform = Platform Arch OS
 
 instance Binary Platform
 
+instance NFData Platform where rnf = genericRnf
+
+instance Pretty Platform where
+  pretty (Platform arch os) = pretty arch <<>> Disp.char '-' <<>> pretty os
+
+instance Parsec Platform where
+    parsec = do
+        arch <- parsecDashlessArch
+        _ <- P.char '-'
+        os <- parsec
+        return (Platform arch os)
+      where
+        parsecDashlessArch = classifyArch Strict <$> dashlessIdent
+
+        dashlessIdent = liftA2 (:) firstChar rest
+          where
+            firstChar = P.satisfy isAlpha
+            rest = P.munch (\c -> isAlphaNum c || c == '_')
+
 instance Text Platform where
-  disp (Platform arch os) = disp arch <<>> Disp.char '-' <<>> disp os
   -- TODO: there are ambigious platforms like: `arch-word-os`
   -- which could be parsed as
   --   * Platform "arch-word" "os"
@@ -223,6 +259,11 @@ instance Text Platform where
         parseDashlessArch :: Parse.ReadP r Arch
         parseDashlessArch = fmap (classifyArch Strict) dashlessIdent
 
+        dashlessIdent :: Parse.ReadP r String
+        dashlessIdent = liftM2 (:) firstChar rest
+          where firstChar = Parse.satisfy isAlpha
+                rest = Parse.munch (\c -> isAlphaNum c || c == '_')
+
 -- | The platform Cabal was compiled on. In most cases,
 -- @LocalBuildInfo.hostPlatform@ should be used instead (the platform we're
 -- targeting).
@@ -236,13 +277,11 @@ ident = liftM2 (:) firstChar rest
   where firstChar = Parse.satisfy isAlpha
         rest = Parse.munch (\c -> isAlphaNum c || c == '_' || c == '-')
 
-dashlessIdent :: Parse.ReadP r String
-dashlessIdent = liftM2 (:) firstChar rest
-  where firstChar = Parse.satisfy isAlpha
-        rest = Parse.munch (\c -> isAlphaNum c || c == '_')
-
-lowercase :: String -> String
-lowercase = map toLower
+parsecIdent :: CabalParsing m => m String
+parsecIdent = (:) <$> firstChar <*> rest
+  where
+    firstChar = P.satisfy isAlpha
+    rest      = P.munch (\c -> isAlphaNum c || c == '_' || c == '-')
 
 platformFromTriple :: String -> Maybe Platform
 platformFromTriple triple =

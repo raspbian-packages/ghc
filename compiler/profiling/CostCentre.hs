@@ -4,9 +4,9 @@ module CostCentre (
                 -- All abstract except to friend: ParseIface.y
 
         CostCentreStack,
-        CollectedCCs,
-        noCCS, currentCCS, dontCareCCS,
-        noCCSAttached, isCurrentCCS,
+        CollectedCCs, emptyCollectedCCs, collectCC,
+        currentCCS, dontCareCCS,
+        isCurrentCCS,
         maybeSingletonCCS,
 
         mkUserCC, mkAutoCC, mkAllCafsCC,
@@ -19,6 +19,8 @@ module CostCentre (
 
         cmpCostCentre   -- used for removing dups in a list
     ) where
+
+import GhcPrelude
 
 import Binary
 import Var
@@ -158,9 +160,7 @@ mkAllCafsCC m loc = AllCafsCC { cc_mod = m, cc_loc = loc }
 --        pre-defined CCSs, see below).
 
 data CostCentreStack
-  = NoCCS
-
-  | CurrentCCS          -- Pinned on a let(rec)-bound
+  = CurrentCCS          -- Pinned on a let(rec)-bound
                         -- thunk/function/constructor, this says that the
                         -- cost centre to be attached to the object, when it
                         -- is allocated, is whatever is in the
@@ -180,23 +180,22 @@ data CostCentreStack
 -- code for a module.
 type CollectedCCs
   = ( [CostCentre]       -- local cost-centres that need to be decl'd
-    , [CostCentre]       -- "extern" cost-centres
     , [CostCentreStack]  -- pre-defined "singleton" cost centre stacks
     )
 
+emptyCollectedCCs :: CollectedCCs
+emptyCollectedCCs = ([], [])
 
-noCCS, currentCCS, dontCareCCS :: CostCentreStack
+collectCC :: CostCentre -> CostCentreStack -> CollectedCCs -> CollectedCCs
+collectCC cc ccs (c, cs) = (cc : c, ccs : cs)
 
-noCCS                   = NoCCS
+currentCCS, dontCareCCS :: CostCentreStack
+
 currentCCS              = CurrentCCS
 dontCareCCS             = DontCareCCS
 
 -----------------------------------------------------------------------------
 -- Predicates on Cost-Centre Stacks
-
-noCCSAttached :: CostCentreStack -> Bool
-noCCSAttached NoCCS                     = True
-noCCSAttached _                         = False
 
 isCurrentCCS :: CostCentreStack -> Bool
 isCurrentCCS CurrentCCS                 = True
@@ -221,7 +220,6 @@ mkSingletonCCS cc = SingletonCCS cc
 -- expression.
 
 instance Outputable CostCentreStack where
-  ppr NoCCS             = text "NO_CCS"
   ppr CurrentCCS        = text "CCCS"
   ppr DontCareCCS       = text "CCS_DONT_CARE"
   ppr (SingletonCCS cc) = ppr cc <> text "_ccs"
@@ -255,9 +253,9 @@ pprCostCentreCore (NormalCC {cc_key = key, cc_name = n, cc_mod = m, cc_loc = loc
                              cc_is_caf = caf})
   = text "__scc" <+> braces (hsep [
         ppr m <> char '.' <> ftext n,
-        ifPprDebug (ppr key),
+        whenPprDebug (ppr key),
         pp_caf caf,
-        ifPprDebug (ppr loc)
+        whenPprDebug (ppr loc)
     ])
 
 pp_caf :: IsCafCC -> SDoc

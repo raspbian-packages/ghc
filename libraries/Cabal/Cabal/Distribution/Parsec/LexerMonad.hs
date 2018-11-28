@@ -27,21 +27,22 @@ module Distribution.Parsec.LexerMonad (
     LexWarning(..),
     LexWarningType(..),
     addWarning,
-    toPWarning,
+    toPWarnings,
 
   ) where
 
-import           Prelude ()
+import qualified Data.ByteString             as B
 import           Distribution.Compat.Prelude
-import qualified Data.ByteString                  as B
-import           Distribution.Parsec.Types.Common
-                 (PWarnType (..), PWarning (..), Position (..))
+import           Distribution.Parsec.Common  (PWarnType (..), PWarning (..), Position (..), showPos)
+import           Prelude ()
+
+import qualified Distribution.Compat.Map.Strict as Map
 
 #ifdef CABAL_PARSEC_DEBUG
 -- testing only:
-import qualified Data.Text                        as T
-import qualified Data.Text.Encoding               as T
-import qualified Data.Vector                      as V
+import qualified Data.Text          as T
+import qualified Data.Text.Encoding as T
+import qualified Data.Vector        as V
 #endif
 
 -- simple state monad
@@ -63,19 +64,26 @@ data LexResult a = LexResult {-# UNPACK #-} !LexState a
 data LexWarningType
     = LexWarningNBSP  -- ^ Encountered non breaking space
     | LexWarningBOM   -- ^ BOM at the start of the cabal file
-  deriving (Show)
+    | LexWarningTab   -- ^ Leading tags
+  deriving (Eq, Ord, Show)
 
 data LexWarning = LexWarning                !LexWarningType
                              {-# UNPACK #-} !Position
-                                            !String
   deriving (Show)
 
-toPWarning :: LexWarning -> PWarning
-toPWarning (LexWarning t p s) = PWarning t' p s
+toPWarnings :: [LexWarning] -> [PWarning]
+toPWarnings
+    = map (uncurry toWarning)
+    . Map.toList
+    . Map.fromListWith (++)
+    . map (\(LexWarning t p) -> (t, [p]))
   where
-    t' = case t of
-        LexWarningNBSP -> PWTLexNBSP
-        LexWarningBOM  -> PWTLexBOM
+    toWarning LexWarningBOM poss =
+        PWarning PWTLexBOM (head poss) "Byte-order mark found at the beginning of the file"
+    toWarning LexWarningNBSP poss =
+        PWarning PWTLexNBSP (head poss) $ "Non breaking spaces at " ++ intercalate ", " (map showPos poss)
+    toWarning LexWarningTab poss =
+        PWarning PWTLexTab (head poss) $ "Tabs used as indentation at " ++ intercalate ", " (map showPos poss)
 
 data LexState = LexState {
         curPos   :: {-# UNPACK #-} !Position,        -- ^ position at current input location
@@ -140,6 +148,6 @@ setStartCode :: Int -> Lex ()
 setStartCode c = Lex $ \s -> LexResult s{ curCode = c } ()
 
 -- | Add warning at the current position
-addWarning :: LexWarningType -> String -> Lex ()
-addWarning wt msg = Lex $ \s@LexState{ curPos = pos, warnings = ws  } ->
-    LexResult s{ warnings = LexWarning wt pos msg : ws } ()
+addWarning :: LexWarningType -> Lex ()
+addWarning wt = Lex $ \s@LexState{ curPos = pos, warnings = ws  } ->
+    LexResult s{ warnings = LexWarning wt pos : ws } ()

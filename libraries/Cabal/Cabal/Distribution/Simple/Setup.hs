@@ -37,8 +37,6 @@ module Distribution.Simple.Setup (
   GlobalFlags(..),   emptyGlobalFlags,   defaultGlobalFlags,   globalCommand,
   ConfigFlags(..),   emptyConfigFlags,   defaultConfigFlags,   configureCommand,
   configPrograms,
-  RelaxDeps(..),    RelaxedDep(..),  isRelaxDeps,
-  AllowNewer(..),   AllowOlder(..),
   configAbsolutePaths, readPackageDbList, showPackageDbList,
   CopyFlags(..),     emptyCopyFlags,     defaultCopyFlags,     copyCommand,
   InstallFlags(..),  emptyInstallFlags,  defaultInstallFlags,  installCommand,
@@ -83,7 +81,10 @@ import Distribution.Compat.Prelude hiding (get)
 import Distribution.Compiler
 import Distribution.ReadE
 import Distribution.Text
+import Distribution.Parsec.Class
+import Distribution.Pretty
 import qualified Distribution.Compat.ReadP as Parse
+import qualified Distribution.Compat.CharParsing as P
 import Distribution.ParseUtils (readPToMaybe)
 import qualified Text.PrettyPrint as Disp
 import Distribution.ModuleName
@@ -273,92 +274,6 @@ instance Semigroup GlobalFlags where
 -- * Config flags
 -- ------------------------------------------------------------
 
--- | Generic data type for policy when relaxing bounds in dependencies.
--- Don't use this directly: use 'AllowOlder' or 'AllowNewer' depending
--- on whether or not you are relaxing an lower or upper bound
--- (respectively).
-data RelaxDeps =
-
-  -- | Default: honor the upper bounds in all dependencies, never choose
-  -- versions newer than allowed.
-  RelaxDepsNone
-
-  -- | Ignore upper bounds in dependencies on the given packages.
-  | RelaxDepsSome [RelaxedDep]
-
-  -- | Ignore upper bounds in dependencies on all packages.
-  | RelaxDepsAll
-  deriving (Eq, Read, Show, Generic)
-
--- | 'RelaxDeps' in the context of upper bounds (i.e. for @--allow-newer@ flag)
-newtype AllowNewer = AllowNewer { unAllowNewer :: RelaxDeps }
-                   deriving (Eq, Read, Show, Generic)
-
--- | 'RelaxDeps' in the context of lower bounds (i.e. for @--allow-older@ flag)
-newtype AllowOlder = AllowOlder { unAllowOlder :: RelaxDeps }
-                   deriving (Eq, Read, Show, Generic)
-
--- | Dependencies can be relaxed either for all packages in the install plan, or
--- only for some packages.
-data RelaxedDep = RelaxedDep PackageName
-                | RelaxedDepScoped PackageName PackageName
-                deriving (Eq, Read, Show, Generic)
-
-instance Text RelaxedDep where
-  disp (RelaxedDep p0)          = disp p0
-  disp (RelaxedDepScoped p0 p1) = disp p0 Disp.<> Disp.colon Disp.<> disp p1
-
-  parse = scopedP Parse.<++ normalP
-    where
-      scopedP = RelaxedDepScoped `fmap` parse <* Parse.char ':' <*> parse
-      normalP = RelaxedDep       `fmap` parse
-
-instance Binary RelaxDeps
-instance Binary RelaxedDep
-instance Binary AllowNewer
-instance Binary AllowOlder
-
-instance Semigroup RelaxDeps where
-  RelaxDepsNone       <> r                   = r
-  l@RelaxDepsAll      <> _                   = l
-  l@(RelaxDepsSome _) <> RelaxDepsNone       = l
-  (RelaxDepsSome   _) <> r@RelaxDepsAll      = r
-  (RelaxDepsSome   a) <> (RelaxDepsSome b)   = RelaxDepsSome (a ++ b)
-
-instance Monoid RelaxDeps where
-  mempty  = RelaxDepsNone
-  mappend = (<>)
-
-instance Semigroup AllowNewer where
-  AllowNewer x <> AllowNewer y = AllowNewer (x <> y)
-
-instance Semigroup AllowOlder where
-  AllowOlder x <> AllowOlder y = AllowOlder (x <> y)
-
-instance Monoid AllowNewer where
-  mempty  = AllowNewer mempty
-  mappend = (<>)
-
-instance Monoid AllowOlder where
-  mempty  = AllowOlder mempty
-  mappend = (<>)
-
--- | Convert 'RelaxDeps' to a boolean.
-isRelaxDeps :: RelaxDeps -> Bool
-isRelaxDeps RelaxDepsNone     = False
-isRelaxDeps (RelaxDepsSome _) = True
-isRelaxDeps RelaxDepsAll      = True
-
-relaxDepsParser :: Parse.ReadP r (Maybe RelaxDeps)
-relaxDepsParser =
-  (Just . RelaxDepsSome) `fmap` Parse.sepBy1 parse (Parse.char ',')
-
-relaxDepsPrinter :: (Maybe RelaxDeps) -> [Maybe String]
-relaxDepsPrinter Nothing                     = []
-relaxDepsPrinter (Just RelaxDepsNone)        = []
-relaxDepsPrinter (Just RelaxDepsAll)         = [Nothing]
-relaxDepsPrinter (Just (RelaxDepsSome pkgs)) = map (Just . display) $ pkgs
-
 -- | Flags to @configure@ command.
 --
 -- IMPORTANT: every time a new flag is added, 'D.C.Setup.filterConfigureFlags'
@@ -387,6 +302,7 @@ data ConfigFlags = ConfigFlags {
     configVanillaLib    :: Flag Bool,     -- ^Enable vanilla library
     configProfLib       :: Flag Bool,     -- ^Enable profiling in the library
     configSharedLib     :: Flag Bool,     -- ^Build shared library
+    configStaticLib     :: Flag Bool,     -- ^Build static library
     configDynExe        :: Flag Bool,     -- ^Enable dynamic linking of the
                                           -- executables.
     configProfExe       :: Flag Bool,     -- ^Enable profiling in the
@@ -420,6 +336,7 @@ data ConfigFlags = ConfigFlags {
     configUserInstall :: Flag Bool,    -- ^The --user\/--global flag
     configPackageDBs :: [Maybe PackageDB], -- ^Which package DBs to use
     configGHCiLib   :: Flag Bool,      -- ^Enable compiling library for GHCi
+    configSplitSections :: Flag Bool,      -- ^Enable -split-sections with GHC
     configSplitObjs :: Flag Bool,      -- ^Enable -split-objs with GHC
     configStripExes :: Flag Bool,      -- ^Enable executable stripping
     configStripLibs :: Flag Bool,      -- ^Enable library stripping
@@ -443,10 +360,9 @@ data ConfigFlags = ConfigFlags {
       -- ^Halt and show an error message indicating an error in flag assignment
     configRelocatable :: Flag Bool, -- ^ Enable relocatable package built
     configDebugInfo :: Flag DebugInfoLevel,  -- ^ Emit debug info.
-    configAllowOlder :: Maybe AllowOlder, -- ^ dual to 'configAllowNewer'
-    configAllowNewer :: Maybe AllowNewer
-    -- ^ Ignore upper bounds on all or some dependencies. Wrapped in 'Maybe' to
-    -- distinguish between "default" and "explicitly disabled".
+    configUseResponseFiles :: Flag Bool
+      -- ^ Whether to use response files at all. They're used for such tools
+      -- as haddock, or or ld.
   }
   deriving (Generic, Read, Show)
 
@@ -469,6 +385,7 @@ instance Eq ConfigFlags where
     && equal configVanillaLib
     && equal configProfLib
     && equal configSharedLib
+    && equal configStaticLib
     && equal configDynExe
     && equal configProfExe
     && equal configProf
@@ -489,6 +406,7 @@ instance Eq ConfigFlags where
     && equal configUserInstall
     && equal configPackageDBs
     && equal configGHCiLib
+    && equal configSplitSections
     && equal configSplitObjs
     && equal configStripExes
     && equal configStripLibs
@@ -503,6 +421,7 @@ instance Eq ConfigFlags where
     && equal configFlagError
     && equal configRelocatable
     && equal configDebugInfo
+    && equal configUseResponseFiles
     where
       equal f = on (==) f a b
 
@@ -520,6 +439,7 @@ defaultConfigFlags progDb = emptyConfigFlags {
     configVanillaLib   = Flag True,
     configProfLib      = NoFlag,
     configSharedLib    = NoFlag,
+    configStaticLib    = NoFlag,
     configDynExe       = Flag False,
     configProfExe      = NoFlag,
     configProf         = NoFlag,
@@ -538,6 +458,7 @@ defaultConfigFlags progDb = emptyConfigFlags {
 #else
     configGHCiLib      = NoFlag,
 #endif
+    configSplitSections = Flag False,
     configSplitObjs    = Flag False, -- takes longer, so turn off by default
     configStripExes    = Flag True,
     configStripLibs    = Flag True,
@@ -549,7 +470,7 @@ defaultConfigFlags progDb = emptyConfigFlags {
     configFlagError    = NoFlag,
     configRelocatable  = Flag False,
     configDebugInfo    = Flag NoDebugInfo,
-    configAllowNewer   = Nothing
+    configUseResponseFiles = NoFlag
   }
 
 configureCommand :: ProgramDb -> CommandUI ConfigFlags
@@ -577,12 +498,12 @@ configureCommand progDb = CommandUI
   }
 
 -- | Inverse to 'dispModSubstEntry'.
-parseModSubstEntry :: Parse.ReadP r (ModuleName, Module)
-parseModSubstEntry =
-    do k <- parse
-       _ <- Parse.char '='
-       v <- parse
-       return (k, v)
+parsecModSubstEntry :: ParsecParser (ModuleName, Module)
+parsecModSubstEntry = do
+    k <- parsec
+    _ <- P.char '='
+    v <- parsec
+    return (k, v)
 
 -- | Pretty-print a single entry of a module substitution.
 dispModSubstEntry :: (ModuleName, Module) -> Disp.Doc
@@ -650,6 +571,11 @@ configureOptions showOrParseArgs =
          configSharedLib (\v flags -> flags { configSharedLib = v })
          (boolOpt [] [])
 
+      ,option "" ["static"]
+         "Static library"
+         configStaticLib (\v flags -> flags { configStaticLib = v })
+         (boolOpt [] [])
+
       ,option "" ["executable-dynamic"]
          "Executable dynamic linking"
          configDynExe (\v flags -> flags { configDynExe = v })
@@ -714,6 +640,11 @@ configureOptions showOrParseArgs =
          configGHCiLib (\v flags -> flags { configGHCiLib = v })
          (boolOpt [] [])
 
+      ,option "" ["split-sections"]
+         "compile library code such that unneeded definitions can be dropped from the final executable (GHC 7.8+)"
+         configSplitSections (\v flags -> flags { configSplitSections = v })
+         (boolOpt [] [])
+
       ,option "" ["split-objs"]
          "split library into smaller objects to reduce binary sizes (GHC 6.6+)"
          configSplitObjs (\v flags -> flags { configSplitObjs = v })
@@ -753,8 +684,8 @@ configureOptions showOrParseArgs =
          "Force values for the given flags in Cabal conditionals in the .cabal file.  E.g., --flags=\"debug -usebytestrings\" forces the flag \"debug\" to true and \"usebytestrings\" to false."
          configConfigurationsFlags (\v flags -> flags { configConfigurationsFlags = v })
          (reqArg "FLAGS"
-              (readP_to_E (\err -> "Invalid flag assignment: " ++ err) parseFlagAssignment)
-              (map showFlagValue'))
+              (parsecToReadE (\err -> "Invalid flag assignment: " ++ err) parsecFlagAssignment)
+              showFlagAssignment)
 
       ,option "" ["extra-include-dirs"]
          "A list of directories to search for header files"
@@ -796,21 +727,21 @@ configureOptions showOrParseArgs =
          "A list of additional constraints on the dependencies."
          configConstraints (\v flags -> flags { configConstraints = v})
          (reqArg "DEPENDENCY"
-                 (readP_to_E (const "dependency expected") ((\x -> [x]) `fmap` parse))
-                 (map (\x -> display x)))
+                 (parsecToReadE (const "dependency expected") ((\x -> [x]) `fmap` parsec))
+                 (map display))
 
       ,option "" ["dependency"]
          "A list of exact dependencies. E.g., --dependency=\"void=void-0.5.8-177d5cdf20962d0581fe2e4932a6c309\""
          configDependencies (\v flags -> flags { configDependencies = v})
          (reqArg "NAME=CID"
-                 (readP_to_E (const "dependency expected") ((\x -> [x]) `fmap` parseDependency))
+                 (parsecToReadE (const "dependency expected") ((\x -> [x]) `fmap` parsecDependency))
                  (map (\x -> display (fst x) ++ "=" ++ display (snd x))))
 
       ,option "" ["instantiate-with"]
         "A mapping of signature names to concrete module instantiations."
         configInstantiateWith (\v flags -> flags { configInstantiateWith = v  })
         (reqArg "NAME=MOD"
-            (readP_to_E ("Cannot parse module substitution: " ++) (fmap (:[]) parseModSubstEntry))
+            (parsecToReadE ("Cannot parse module substitution: " ++) (fmap (:[]) parsecModSubstEntry))
             (map (Disp.renderStyle defaultStyle . dispModSubstEntry)))
 
       ,option "" ["tests"]
@@ -828,22 +759,6 @@ configureOptions showOrParseArgs =
          configLibCoverage (\v flags -> flags { configLibCoverage = v })
          (boolOpt [] [])
 
-      ,option [] ["allow-older"]
-       ("Ignore upper bounds in all dependencies or DEPS")
-       (fmap unAllowOlder . configAllowOlder)
-       (\v flags -> flags { configAllowOlder = fmap AllowOlder v})
-       (optArg "DEPS"
-        (readP_to_E ("Cannot parse the list of packages: " ++) relaxDepsParser)
-        (Just RelaxDepsAll) relaxDepsPrinter)
-
-      ,option [] ["allow-newer"]
-       ("Ignore upper bounds in all dependencies or DEPS")
-       (fmap unAllowNewer . configAllowNewer)
-       (\v flags -> flags { configAllowNewer = fmap AllowNewer v})
-       (optArg "DEPS"
-        (readP_to_E ("Cannot parse the list of packages: " ++) relaxDepsParser)
-        (Just RelaxDepsAll) relaxDepsPrinter)
-
       ,option "" ["exact-configuration"]
          "All direct dependencies and flags are provided on the command line."
          configExactConfiguration
@@ -859,6 +774,12 @@ configureOptions showOrParseArgs =
          "building a package that is relocatable. (GHC only)"
          configRelocatable (\v flags -> flags { configRelocatable = v})
          (boolOpt [] [])
+
+      ,option "" ["response-files"]
+         "enable workaround for old versions of programs like \"ar\" that do not support @file arguments"
+         configUseResponseFiles
+         (\v flags -> flags { configUseResponseFiles = v })
+         (boolOpt' ([], ["disable-response-files"]) ([], []))
       ]
   where
     liftInstallDirs =
@@ -868,6 +789,9 @@ configureOptions showOrParseArgs =
       reqArgFlag title _sf _lf d
         (fmap fromPathTemplate . get) (set . fmap toPathTemplate)
 
+showFlagAssignment :: FlagAssignment -> [String]
+showFlagAssignment = map showFlagValue' . unFlagAssignment
+  where
     -- We can't use 'showFlagValue' because legacy custom-setups don't
     -- support the '+' prefix in --flags; so we omit the (redundant) + prefix;
     -- NB: we assume that we never have to set/enable '-'-prefixed flags here.
@@ -893,11 +817,11 @@ showProfDetailLevelFlag :: Flag ProfDetailLevel -> [String]
 showProfDetailLevelFlag NoFlag    = []
 showProfDetailLevelFlag (Flag dl) = [showProfDetailLevel dl]
 
-parseDependency :: Parse.ReadP r (PackageName, ComponentId)
-parseDependency = do
-  x <- parse
-  _ <- Parse.char '='
-  y <- parse
+parsecDependency :: ParsecParser (PackageName, ComponentId)
+parsecDependency = do
+  x <- parsec
+  _ <- P.char '='
+  y <- parsec
   return (x, y)
 
 installDirsOptions :: [OptionField (InstallDirs (Flag PathTemplate))]
@@ -994,7 +918,8 @@ data CopyFlags = CopyFlags {
     -- This is the same hack as in 'buildArgs'.  But I (ezyang) don't
     -- think it's a hack, it's the right way to make hooks more robust
     -- TODO: Stop using this eventually when 'UserHooks' gets changed
-    copyArgs :: [String]
+    copyArgs :: [String],
+    copyCabalFilePath :: Flag FilePath
   }
   deriving (Show, Generic)
 
@@ -1003,7 +928,8 @@ defaultCopyFlags  = CopyFlags {
     copyDest      = Flag NoCopyDest,
     copyDistPref  = NoFlag,
     copyVerbosity = Flag normal,
-    copyArgs      = []
+    copyArgs      = [],
+    copyCabalFilePath = mempty
   }
 
 copyCommand :: CommandUI CopyFlags
@@ -1011,7 +937,7 @@ copyCommand = CommandUI
   { commandName         = "copy"
   , commandSynopsis     = "Copy the files of all/specific components to install locations."
   , commandDescription  = Just $ \_ -> wrapText $
-          "Components encompass executables and libraries."
+          "Components encompass executables and libraries. "
        ++ "Does not call register, and allows a prefix at install time. "
        ++ "Without the --destdir flag, configure determines location.\n"
   , commandNotes        = Just $ \pname ->
@@ -1025,20 +951,37 @@ copyCommand = CommandUI
       , "COMPONENTS [FLAGS]"
       ]
   , commandDefaultFlags = defaultCopyFlags
-  , commandOptions      = \showOrParseArgs ->
-      [optionVerbosity copyVerbosity (\v flags -> flags { copyVerbosity = v })
+  , commandOptions      = \showOrParseArgs -> case showOrParseArgs of
+      ShowArgs -> filter ((`notElem` ["target-package-db"])
+                          . optionName) $ copyOptions ShowArgs
+      ParseArgs -> copyOptions ParseArgs
+}
 
-      ,optionDistPref
-         copyDistPref (\d flags -> flags { copyDistPref = d })
-         showOrParseArgs
+copyOptions ::  ShowOrParseArgs -> [OptionField CopyFlags]
+copyOptions showOrParseArgs =
+  [optionVerbosity copyVerbosity (\v flags -> flags { copyVerbosity = v })
 
-      ,option "" ["destdir"]
-         "directory to copy files to, prepended to installation directories"
-         copyDest (\v flags -> flags { copyDest = v })
-         (reqArg "DIR" (succeedReadE (Flag . CopyTo))
-                       (\f -> case f of Flag (CopyTo p) -> [p]; _ -> []))
-      ]
-  }
+  ,optionDistPref
+    copyDistPref (\d flags -> flags { copyDistPref = d })
+    showOrParseArgs
+
+  ,option "" ["destdir"]
+    "directory to copy files to, prepended to installation directories"
+    copyDest (\v flags -> case copyDest flags of
+                 Flag (CopyToDb _) -> error "Use either 'destdir' or 'target-package-db'."
+                 _ -> flags { copyDest = v })
+    (reqArg "DIR" (succeedReadE (Flag . CopyTo))
+      (\f -> case f of Flag (CopyTo p) -> [p]; _ -> []))
+
+  ,option "" ["target-package-db"]
+    "package database to copy files into. Required when using ${pkgroot} prefix."
+    copyDest (\v flags -> case copyDest flags of
+                 NoFlag -> flags { copyDest = v }
+                 Flag NoCopyDest -> flags { copyDest = v }
+                 _ -> error "Use either 'destdir' or 'target-package-db'.")
+    (reqArg "DATABASE" (succeedReadE (Flag . CopyToDb))
+      (\f -> case f of Flag (CopyToDb p) -> [p]; _ -> []))
+  ]
 
 emptyCopyFlags :: CopyFlags
 emptyCopyFlags = mempty
@@ -1057,20 +1000,26 @@ instance Semigroup CopyFlags where
 -- | Flags to @install@: (package db, verbosity)
 data InstallFlags = InstallFlags {
     installPackageDB :: Flag PackageDB,
+    installDest      :: Flag CopyDest,
     installDistPref  :: Flag FilePath,
     installUseWrapper :: Flag Bool,
     installInPlace    :: Flag Bool,
-    installVerbosity :: Flag Verbosity
+    installVerbosity :: Flag Verbosity,
+    -- this is only here, because we can not
+    -- change the hooks API.
+    installCabalFilePath :: Flag FilePath
   }
   deriving (Show, Generic)
 
 defaultInstallFlags :: InstallFlags
 defaultInstallFlags  = InstallFlags {
     installPackageDB = NoFlag,
+    installDest      = Flag NoCopyDest,
     installDistPref  = NoFlag,
     installUseWrapper = Flag False,
     installInPlace    = Flag False,
-    installVerbosity = Flag normal
+    installVerbosity = Flag normal,
+    installCabalFilePath = mempty
   }
 
 installCommand :: CommandUI InstallFlags
@@ -1086,30 +1035,41 @@ installCommand = CommandUI
   , commandUsage        = \pname ->
       "Usage: " ++ pname ++ " install [FLAGS]\n"
   , commandDefaultFlags = defaultInstallFlags
-  , commandOptions      = \showOrParseArgs ->
-      [optionVerbosity installVerbosity (\v flags -> flags { installVerbosity = v })
-      ,optionDistPref
-         installDistPref (\d flags -> flags { installDistPref = d })
-         showOrParseArgs
-
-      ,option "" ["inplace"]
-         "install the package in the install subdirectory of the dist prefix, so it can be used without being installed"
-         installInPlace (\v flags -> flags { installInPlace = v })
-         trueArg
-
-      ,option "" ["shell-wrappers"]
-         "using shell script wrappers around executables"
-         installUseWrapper (\v flags -> flags { installUseWrapper = v })
-         (boolOpt [] [])
-
-      ,option "" ["package-db"] ""
-         installPackageDB (\v flags -> flags { installPackageDB = v })
-         (choiceOpt [ (Flag UserPackageDB, ([],["user"]),
-                      "upon configuration register this package in the user's local package database")
-                    , (Flag GlobalPackageDB, ([],["global"]),
-                      "(default) upon configuration register this package in the system-wide package database")])
-      ]
+  , commandOptions      = \showOrParseArgs -> case showOrParseArgs of
+      ShowArgs -> filter ((`notElem` ["target-package-db"])
+                          . optionName) $ installOptions ShowArgs
+      ParseArgs -> installOptions ParseArgs
   }
+
+installOptions ::  ShowOrParseArgs -> [OptionField InstallFlags]
+installOptions showOrParseArgs =
+  [optionVerbosity installVerbosity (\v flags -> flags { installVerbosity = v })
+  ,optionDistPref
+    installDistPref (\d flags -> flags { installDistPref = d })
+    showOrParseArgs
+
+  ,option "" ["inplace"]
+    "install the package in the install subdirectory of the dist prefix, so it can be used without being installed"
+    installInPlace (\v flags -> flags { installInPlace = v })
+    trueArg
+
+  ,option "" ["shell-wrappers"]
+    "using shell script wrappers around executables"
+    installUseWrapper (\v flags -> flags { installUseWrapper = v })
+    (boolOpt [] [])
+
+  ,option "" ["package-db"] ""
+    installPackageDB (\v flags -> flags { installPackageDB = v })
+    (choiceOpt [ (Flag UserPackageDB, ([],["user"]),
+                   "upon configuration register this package in the user's local package database")
+               , (Flag GlobalPackageDB, ([],["global"]),
+                   "(default) upon configuration register this package in the system-wide package database")])
+  ,option "" ["target-package-db"]
+    "package database to install into. Required when using ${pkgroot} prefix."
+    installDest (\v flags -> flags { installDest = v })
+    (reqArg "DATABASE" (succeedReadE (Flag . CopyToDb))
+      (\f -> case f of Flag (CopyToDb p) -> [p]; _ -> []))
+  ]
 
 emptyInstallFlags :: InstallFlags
 emptyInstallFlags = mempty
@@ -1203,7 +1163,8 @@ data RegisterFlags = RegisterFlags {
     regPrintId     :: Flag Bool,
     regVerbosity   :: Flag Verbosity,
     -- Same as in 'buildArgs' and 'copyArgs'
-    regArgs        :: [String]
+    regArgs        :: [String],
+    regCabalFilePath :: Flag FilePath
   }
   deriving (Show, Generic)
 
@@ -1216,6 +1177,7 @@ defaultRegisterFlags = RegisterFlags {
     regDistPref    = NoFlag,
     regPrintId     = Flag False,
     regArgs        = [],
+    regCabalFilePath = mempty,
     regVerbosity   = Flag normal
   }
 
@@ -1315,8 +1277,9 @@ data HscolourFlags = HscolourFlags {
     hscolourBenchmarks  :: Flag Bool,
     hscolourForeignLibs :: Flag Bool,
     hscolourDistPref    :: Flag FilePath,
-    hscolourVerbosity   :: Flag Verbosity
-  }
+    hscolourVerbosity   :: Flag Verbosity,
+    hscolourCabalFilePath :: Flag FilePath
+    }
   deriving (Show, Generic)
 
 emptyHscolourFlags :: HscolourFlags
@@ -1330,7 +1293,8 @@ defaultHscolourFlags = HscolourFlags {
     hscolourBenchmarks  = Flag False,
     hscolourDistPref    = NoFlag,
     hscolourForeignLibs = Flag False,
-    hscolourVerbosity   = Flag normal
+    hscolourVerbosity   = Flag normal,
+    hscolourCabalFilePath = mempty
   }
 
 instance Monoid HscolourFlags where
@@ -1478,6 +1442,15 @@ instance Semigroup DoctestFlags where
 --    documentation in @<dist>/doc/html/<package id>-docs@.
 data HaddockTarget = ForHackage | ForDevelopment deriving (Eq, Show, Generic)
 
+instance Binary HaddockTarget
+
+instance Text HaddockTarget where
+    disp ForHackage     = Disp.text "for-hackage"
+    disp ForDevelopment = Disp.text "for-development"
+
+    parse = Parse.choice [ Parse.string "for-hackage"     >> return ForHackage
+                         , Parse.string "for-development" >> return ForDevelopment]
+
 data HaddockFlags = HaddockFlags {
     haddockProgramPaths :: [(String, FilePath)],
     haddockProgramArgs  :: [(String, [String])],
@@ -1491,12 +1464,13 @@ data HaddockFlags = HaddockFlags {
     haddockForeignLibs  :: Flag Bool,
     haddockInternal     :: Flag Bool,
     haddockCss          :: Flag FilePath,
-    haddockHscolour     :: Flag Bool,
+    haddockLinkedSource :: Flag Bool,
     haddockHscolourCss  :: Flag FilePath,
     haddockContents     :: Flag PathTemplate,
     haddockDistPref     :: Flag FilePath,
     haddockKeepTempFiles:: Flag Bool,
-    haddockVerbosity    :: Flag Verbosity
+    haddockVerbosity    :: Flag Verbosity,
+    haddockCabalFilePath :: Flag FilePath
   }
   deriving (Show, Generic)
 
@@ -1507,19 +1481,20 @@ defaultHaddockFlags  = HaddockFlags {
     haddockHoogle       = Flag False,
     haddockHtml         = Flag False,
     haddockHtmlLocation = NoFlag,
-    haddockForHackage   = Flag ForDevelopment,
+    haddockForHackage   = NoFlag,
     haddockExecutables  = Flag False,
     haddockTestSuites   = Flag False,
     haddockBenchmarks   = Flag False,
     haddockForeignLibs  = Flag False,
     haddockInternal     = Flag False,
     haddockCss          = NoFlag,
-    haddockHscolour     = Flag False,
+    haddockLinkedSource = Flag False,
     haddockHscolourCss  = NoFlag,
     haddockContents     = NoFlag,
     haddockDistPref     = NoFlag,
     haddockKeepTempFiles= Flag False,
-    haddockVerbosity    = Flag normal
+    haddockVerbosity    = Flag normal,
+    haddockCabalFilePath = mempty
   }
 
 haddockCommand :: CommandUI HaddockFlags
@@ -1624,8 +1599,8 @@ haddockOptions showOrParseArgs =
    (reqArgFlag "PATH")
 
   ,option "" ["hyperlink-source","hyperlink-sources"]
-   "Hyperlink the documentation to the source code (using HsColour)"
-   haddockHscolour (\v flags -> flags { haddockHscolour = v })
+   "Hyperlink the documentation to the source code"
+   haddockLinkedSource (\v flags -> flags { haddockLinkedSource = v })
    trueArg
 
   ,option "" ["hscolour-css"]
@@ -1658,7 +1633,8 @@ instance Semigroup HaddockFlags where
 data CleanFlags = CleanFlags {
     cleanSaveConf  :: Flag Bool,
     cleanDistPref  :: Flag FilePath,
-    cleanVerbosity :: Flag Verbosity
+    cleanVerbosity :: Flag Verbosity,
+    cleanCabalFilePath :: Flag FilePath
   }
   deriving (Show, Generic)
 
@@ -1666,7 +1642,8 @@ defaultCleanFlags :: CleanFlags
 defaultCleanFlags  = CleanFlags {
     cleanSaveConf  = Flag False,
     cleanDistPref  = NoFlag,
-    cleanVerbosity = Flag normal
+    cleanVerbosity = Flag normal,
+    cleanCabalFilePath = mempty
   }
 
 cleanCommand :: CommandUI CleanFlags
@@ -1714,7 +1691,8 @@ data BuildFlags = BuildFlags {
     buildNumJobs     :: Flag (Maybe Int),
     -- TODO: this one should not be here, it's just that the silly
     -- UserHooks stop us from passing extra info in other ways
-    buildArgs :: [String]
+    buildArgs :: [String],
+    buildCabalFilePath :: Flag FilePath
   }
   deriving (Read, Show, Generic)
 
@@ -1729,7 +1707,8 @@ defaultBuildFlags  = BuildFlags {
     buildDistPref    = mempty,
     buildVerbosity   = Flag normal,
     buildNumJobs     = mempty,
-    buildArgs        = []
+    buildArgs        = [],
+    buildCabalFilePath = mempty
   }
 
 buildCommand :: ProgramDb -> CommandUI BuildFlags
@@ -1904,9 +1883,19 @@ data TestShowDetails = Never | Failures | Always | Streaming | Direct
 knownTestShowDetails :: [TestShowDetails]
 knownTestShowDetails = [minBound..maxBound]
 
-instance Text TestShowDetails where
-    disp  = Disp.text . lowercase . show
+instance Pretty TestShowDetails where
+    pretty  = Disp.text . lowercase . show
 
+instance Parsec TestShowDetails where
+    parsec = maybe (fail "invalid TestShowDetails") return . classify =<< ident
+      where
+        ident        = P.munch1 (\c -> isAlpha c || c == '_' || c == '-')
+        classify str = lookup (lowercase str) enumMap
+        enumMap     :: [(String, TestShowDetails)]
+        enumMap      = [ (display x, x)
+                       | x <- knownTestShowDetails ]
+
+instance Text TestShowDetails where
     parse = maybe Parse.pfail return . classify =<< ident
       where
         ident        = Parse.munch1 (\c -> isAlpha c || c == '_' || c == '-')
@@ -1993,10 +1982,10 @@ testCommand = CommandUI
              ++ "'direct': send results of test cases in real time; no log file.")
             testShowDetails (\v flags -> flags { testShowDetails = v })
             (reqArg "FILTER"
-                (readP_to_E (\_ -> "--show-details flag expects one of "
+                (parsecToReadE (\_ -> "--show-details flag expects one of "
                               ++ intercalate ", "
                                    (map display knownTestShowDetails))
-                            (fmap toFlag parse))
+                            (fmap toFlag parsec))
                 (flagToList . fmap display))
       , option [] ["keep-tix-files"]
             "keep .tix files for HPC between test runs"

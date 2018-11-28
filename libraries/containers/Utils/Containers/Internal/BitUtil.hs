@@ -3,7 +3,7 @@
 {-# LANGUAGE MagicHash #-}
 #endif
 #if !defined(TESTING) && __GLASGOW_HASKELL__ >= 703
-{-# LANGUAGE Trustworthy #-}
+{-# LANGUAGE Safe #-}
 #endif
 
 #include "containers.h"
@@ -31,26 +31,50 @@
 -- closely.
 
 module Utils.Containers.Internal.BitUtil
-    ( highestBitMask
+    ( bitcount
+    , highestBitMask
     , shiftLL
     , shiftRL
     , wordSize
     ) where
 
 import Data.Bits ((.|.), xor)
+#if MIN_VERSION_base(4,5,0)
+import Data.Bits (popCount, unsafeShiftL, unsafeShiftR)
+#else
+import Data.Bits ((.&.), shiftL, shiftR)
+#endif
 #if MIN_VERSION_base(4,7,0)
 import Data.Bits (finiteBitSize)
 #else
 import Data.Bits (bitSize)
 #endif
 
-
-#if __GLASGOW_HASKELL__
-import GHC.Exts (Word(..), Int(..))
-import GHC.Prim (uncheckedShiftL#, uncheckedShiftRL#)
-#else
-import Data.Word (shiftL, shiftR)
+#if !MIN_VERSION_base (4,8,0)
+import Data.Word (Word)
 #endif
+
+{----------------------------------------------------------------------
+  [bitcount] as posted by David F. Place to haskell-cafe on April 11, 2006,
+  based on the code on
+  http://graphics.stanford.edu/~seander/bithacks.html#CountBitsSetKernighan,
+  where the following source is given:
+    Published in 1988, the C Programming Language 2nd Ed. (by Brian W.
+    Kernighan and Dennis M. Ritchie) mentions this in exercise 2-9. On April
+    19, 2006 Don Knuth pointed out to me that this method "was first published
+    by Peter Wegner in CACM 3 (1960), 322. (Also discovered independently by
+    Derrick Lehmer and published in 1964 in a book edited by Beckenbach.)"
+----------------------------------------------------------------------}
+
+bitcount :: Int -> Word -> Int
+#if MIN_VERSION_base(4,5,0)
+bitcount a x = a + popCount x
+#else
+bitcount a0 x0 = go a0 x0
+  where go a 0 = a
+        go a x = go (a + 1) (x .&. (x-1))
+#endif
+{-# INLINE bitcount #-}
 
 -- The highestBitMask implementation is based on
 -- http://graphics.stanford.edu/~seander/bithacks.html#RoundUpPowerOf2
@@ -73,19 +97,12 @@ highestBitMask x1 = let x2 = x1 .|. x1 `shiftRL` 1
 
 -- Right and left logical shifts.
 shiftRL, shiftLL :: Word -> Int -> Word
-#if __GLASGOW_HASKELL__
-{--------------------------------------------------------------------
-  GHC: use unboxing to get @shiftRL@ inlined.
---------------------------------------------------------------------}
-shiftRL (W# x) (I# i) = W# (uncheckedShiftRL# x i)
-shiftLL (W# x) (I# i) = W# (uncheckedShiftL#  x i)
-{-# INLINE CONLIKE shiftRL #-}
-{-# INLINE CONLIKE shiftLL #-}
+#if MIN_VERSION_base(4,5,0)
+shiftRL = unsafeShiftR
+shiftLL = unsafeShiftL
 #else
-shiftRL x i   = shiftR x i
-shiftLL x i   = shiftL x i
-{-# INLINE shiftRL #-}
-{-# INLINE shiftLL #-}
+shiftRL = shiftR
+shiftLL = shiftL
 #endif
 
 {-# INLINE wordSize #-}

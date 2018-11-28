@@ -41,6 +41,7 @@ import qualified Distribution.ModuleName as ModuleName
 import Distribution.PackageDescription as PD hiding (Flag)
 import Distribution.Simple.Compiler hiding (Flag)
 import Distribution.Simple.Program.GHC
+import Distribution.Simple.Program.ResponseFile
 import Distribution.Simple.Program
 import Distribution.Simple.PreProcess
 import Distribution.Simple.Setup
@@ -65,7 +66,7 @@ import Data.Either      ( rights )
 
 import System.Directory (doesFileExist)
 import System.FilePath  ( (</>), (<.>), normalise, isAbsolute )
-import System.IO        (hClose, hPutStr, hPutStrLn, hSetEncoding, utf8)
+import System.IO        (hClose, hPutStrLn, hSetEncoding, utf8)
 
 -- ------------------------------------------------------------------------------
 -- Types
@@ -83,6 +84,8 @@ data HaddockArgs = HaddockArgs {
  -- ^ Ignore export lists in modules?
  argLinkSource :: Flag (Template,Template,Template),
  -- ^ (Template for modules, template for symbols, template for lines).
+ argLinkedSource :: Flag Bool,
+ -- ^ Generate hyperlinked sources
  argCssFile :: Flag FilePath,
  -- ^ Optional custom CSS file.
  argContents :: Flag String,
@@ -98,7 +101,7 @@ data HaddockArgs = HaddockArgs {
  -- ^ Page title, required.
  argPrologue :: Flag String,
  -- ^ Prologue text, required.
- argGhcOptions :: Flag (GhcOptions, Version),
+ argGhcOptions :: GhcOptions,
  -- ^ Additional flags to pass to GHC.
  argGhcLibDir :: Flag FilePath,
  -- ^ To find the correct GHC, required.
@@ -148,7 +151,7 @@ haddock pkg_descr lbi suffixes flags' = do
             , haddockHtml         = Flag True
             , haddockHtmlLocation = Flag (pkg_url ++ "/docs")
             , haddockContents     = Flag (toPathTemplate pkg_url)
-            , haddockHscolour     = Flag True
+            , haddockLinkedSource = Flag True
             }
         pkg_url       = "/package/$pkg-$version"
         flag f        = fromFlag $ f flags
@@ -184,7 +187,9 @@ haddock pkg_descr lbi suffixes flags' = do
 
     -- the tools match the requests, we can proceed
 
-    when (flag haddockHscolour) $
+    -- We fall back to using HsColour only for versions of Haddock which don't
+    -- support '--hyperlinked-sources'.
+    when (flag haddockLinkedSource && version < mkVersion [2,17]) $
       hscolour' (warn verbosity) haddockTarget pkg_descr lbi suffixes
       (defaultHscolourFlags `mappend` haddockToHscolour flags)
 
@@ -250,11 +255,12 @@ fromFlags env flags =
     mempty {
       argHideModules = (maybe mempty (All . not)
                         $ flagToMaybe (haddockInternal flags), mempty),
-      argLinkSource = if fromFlag (haddockHscolour flags)
+      argLinkSource = if fromFlag (haddockLinkedSource flags)
                                then Flag ("src/%{MODULE/./-}.html"
                                          ,"src/%{MODULE/./-}.html#%{NAME}"
                                          ,"src/%{MODULE/./-}.html#line-%{LINE}")
                                else NoFlag,
+      argLinkedSource = haddockLinkedSource flags,
       argCssFile = haddockCss flags,
       argContents = fmap (fromPathTemplate . substPathTemplate env)
                     (haddockContents flags),
@@ -265,8 +271,12 @@ fromFlags env flags =
                       [ Hoogle | Flag True <- [haddockHoogle flags] ]
                  of [] -> [ Html ]
                     os -> os,
-      argOutputDir = maybe mempty Dir . flagToMaybe $ haddockDistPref flags
+      argOutputDir = maybe mempty Dir . flagToMaybe $ haddockDistPref flags,
+
+      argGhcOptions = mempty { ghcOptExtra = toNubListR ghcArgs }
     }
+    where
+      ghcArgs = fromMaybe [] . lookup "ghc" . haddockProgramArgs $ flags
 
 fromPackageDescription :: HaddockTarget -> PackageDescription -> HaddockArgs
 fromPackageDescription haddockTarget pkg_descr =
@@ -331,12 +341,9 @@ mkHaddockArgs verbosity tmp lbi clbi htmlTemplate haddockVersion inFiles bi = do
             then return sharedOpts
             else die' verbosity $ "Must have vanilla or shared libraries "
                        ++ "enabled in order to run haddock"
-    ghcVersion <- maybe (die' verbosity "Compiler has no GHC version")
-                        return
-                        (compilerCompatVersion GHC (compiler lbi))
 
     return ifaceArgs {
-      argGhcOptions  = toFlag (opts, ghcVersion),
+      argGhcOptions  = opts,
       argTargets     = inFiles
     }
 
@@ -489,18 +496,14 @@ renderArgs verbosity tmpFileOpts version comp platform args k = do
                  renderedArgs = pflag : renderPureArgs version comp platform args
              if haddockSupportsResponseFiles
                then
-                 withTempFileEx tmpFileOpts outputDir "haddock-response.txt" $
-                    \responseFileName hf -> do
-                         when haddockSupportsUTF8 (hSetEncoding hf utf8)
-                         let responseContents =
-                                 unlines $ map escapeArg renderedArgs
-                         hPutStr hf responseContents
-                         hClose hf
-                         info verbosity $ responseFileName ++ " contents: <<<"
-                         info verbosity responseContents
-                         info verbosity $ ">>> " ++ responseFileName
-                         let respFile = "@" ++ responseFileName
-                         k ([respFile], result)
+                 withResponseFile
+                   verbosity
+                   tmpFileOpts
+                   outputDir
+                   "haddock-response.txt"
+                   (if haddockSupportsUTF8 then Just utf8 else Nothing)
+                   renderedArgs
+                   (\responseFileName -> k (["@" ++ responseFileName], result))
                else
                  k (renderedArgs, result)
     where
@@ -515,19 +518,6 @@ renderArgs verbosity tmpFileOpts version comp platform args k = do
               pkgstr = display $ packageName pkgid
               pkgid = arg argPackageName
       arg f = fromFlag $ f args
-      -- Support a gcc-like response file syntax.  Each separate
-      -- argument and its possible parameter(s), will be separated in the
-      -- response file by an actual newline; all other whitespace,
-      -- single quotes, double quotes, and the character used for escaping
-      -- (backslash) are escaped.  The called program will need to do a similar
-      -- inverse operation to de-escape and re-constitute the argument list.
-      escape cs c
-        |    isSpace c
-          || '\\' == c
-          || '\'' == c
-          || '"'  == c = c:'\\':cs -- n.b., our caller must reverse the result
-        | otherwise    = c:cs
-      escapeArg = reverse . foldl' escape []
 
 renderPureArgs :: Version -> Compiler -> Platform -> HaddockArgs -> [String]
 renderPureArgs version comp platform args = concat
@@ -540,6 +530,9 @@ renderPureArgs version comp platform args = concat
                       ])
              . fromFlag . argPackageName $ args
         else []
+
+    , [ "--hyperlinked-source" | isVersion 2 17
+                               , fromFlag . argLinkedSource $ args ]
 
     , (\(All b,xs) -> bool (map (("--hide=" ++). display) xs) [] b)
                      . argHideModules $ args
@@ -571,7 +564,7 @@ renderPureArgs version comp platform args = concat
          id (getAny $ argIgnoreExports args))
       . fromFlag . argTitle $ args
 
-    , [ "--optghc=" ++ opt | (opts, _ghcVer) <- flagToList (argGhcOptions args)
+    , [ "--optghc=" ++ opt | let opts = argGhcOptions args
                            , opt <- renderGhcOptions comp platform opts ]
 
     , maybe [] (\l -> ["-B"++l]) $
@@ -752,7 +745,8 @@ haddockToHscolour flags =
       hscolourBenchmarks  = haddockBenchmarks  flags,
       hscolourForeignLibs = haddockForeignLibs flags,
       hscolourVerbosity   = haddockVerbosity   flags,
-      hscolourDistPref    = haddockDistPref    flags
+      hscolourDistPref    = haddockDistPref    flags,
+      hscolourCabalFilePath = haddockCabalFilePath flags
     }
 
 -- ------------------------------------------------------------------------------

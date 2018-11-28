@@ -27,19 +27,26 @@ module Distribution.Utils.Generic (
         writeFileAtomic,
 
         -- * Unicode
-        fromUTF8,
+
+        -- ** Conversions
         fromUTF8BS,
         fromUTF8LBS,
-        toUTF8,
+
+        toUTF8BS,
+        toUTF8LBS,
+
+        validateUTF8,
+
+        -- ** File I/O
         readUTF8File,
         withUTF8FileContents,
         writeUTF8File,
-        normaliseLineEndings,
 
-        -- * BOM
-        startsWithBOM,
-        fileHasBOM,
+        -- ** BOM
         ignoreBOM,
+
+        -- ** Misc
+        normaliseLineEndings,
 
         -- * generic utils
         dropWhileEndLE,
@@ -61,6 +68,9 @@ module Distribution.Utils.Generic (
         unintersperse,
         wrapText,
         wrapLine,
+        unfoldrM,
+        spanMaybe,
+        breakMaybe,
 
         -- * FilePath stuff
         isAbsoluteOnAnyPlatform,
@@ -72,8 +82,7 @@ import Distribution.Compat.Prelude
 
 import Distribution.Utils.String
 
-import Data.Bits
-    ( Bits((.|.), (.&.), shiftL, shiftR) )
+import Data.Bits ((.&.), (.|.), shiftL)
 import Data.List
     ( isInfixOf )
 import Data.Ord
@@ -84,13 +93,12 @@ import qualified Data.Set as Set
 import qualified Data.ByteString as SBS
 
 import System.Directory
-    ( removeFile )
+    ( removeFile, renameFile )
 import System.FilePath
     ( (<.>), splitFileName )
-import System.Directory
-    ( renameFile )
 import System.IO
-    ( openFile, openBinaryFile, openBinaryTempFileWithDefaultPermissions
+    ( withFile, withBinaryFile
+    , openBinaryTempFileWithDefaultPermissions
     , IOMode(ReadMode), hGetContents, hClose )
 import qualified Control.Exception as Exception
 
@@ -132,8 +140,8 @@ wrapLine width = wrap 0 []
 --
 withFileContents :: FilePath -> (String -> NoCallStackIO a) -> NoCallStackIO a
 withFileContents name action =
-  Exception.bracket (openFile name ReadMode) hClose
-                    (\hnd -> hGetContents hnd >>= action)
+  withFile name ReadMode
+           (\hnd -> hGetContents hnd >>= action)
 
 -- | Writes a file atomically.
 --
@@ -158,84 +166,71 @@ writeFileAtomic targetPath content = do
 -- * Unicode stuff
 -- ------------------------------------------------------------
 
--- This is a modification of the UTF8 code from gtk2hs and the
--- utf8-string package.
-
-fromUTF8 :: String -> String
-fromUTF8 []     = []
-fromUTF8 (c:cs)
-  | c <= '\x7F' = c : fromUTF8 cs
-  | c <= '\xBF' = replacementChar : fromUTF8 cs
-  | c <= '\xDF' = twoBytes c cs
-  | c <= '\xEF' = moreBytes 3 0x800     cs (ord c .&. 0xF)
-  | c <= '\xF7' = moreBytes 4 0x10000   cs (ord c .&. 0x7)
-  | c <= '\xFB' = moreBytes 5 0x200000  cs (ord c .&. 0x3)
-  | c <= '\xFD' = moreBytes 6 0x4000000 cs (ord c .&. 0x1)
-  | otherwise   = replacementChar : fromUTF8 cs
-  where
-    twoBytes c0 (c1:cs')
-      | ord c1 .&. 0xC0 == 0x80
-      = let d = ((ord c0 .&. 0x1F) `shiftL` 6)
-             .|. (ord c1 .&. 0x3F)
-         in if d >= 0x80
-               then  chr d           : fromUTF8 cs'
-               else  replacementChar : fromUTF8 cs'
-    twoBytes _ cs' = replacementChar : fromUTF8 cs'
-
-    moreBytes :: Int -> Int -> [Char] -> Int -> [Char]
-    moreBytes 1 overlong cs' acc
-      | overlong <= acc && acc <= 0x10FFFF
-     && (acc < 0xD800 || 0xDFFF < acc)
-     && (acc < 0xFFFE || 0xFFFF < acc)
-      = chr acc : fromUTF8 cs'
-
-      | otherwise
-      = replacementChar : fromUTF8 cs'
-
-    moreBytes byteCount overlong (cn:cs') acc
-      | ord cn .&. 0xC0 == 0x80
-      = moreBytes (byteCount-1) overlong cs'
-          ((acc `shiftL` 6) .|. ord cn .&. 0x3F)
-
-    moreBytes _ _ cs' _
-      = replacementChar : fromUTF8 cs'
-
-    replacementChar = '\xfffd'
-
+-- | Decode 'String' from UTF8-encoded 'BS.ByteString'
+--
+-- Invalid data in the UTF8 stream (this includes code-points @U+D800@
+-- through @U+DFFF@) will be decoded as the replacement character (@U+FFFD@).
+--
 fromUTF8BS :: SBS.ByteString -> String
 fromUTF8BS = decodeStringUtf8 . SBS.unpack
 
+-- | Variant of 'fromUTF8BS' for lazy 'BS.ByteString's
+--
 fromUTF8LBS :: BS.ByteString -> String
 fromUTF8LBS = decodeStringUtf8 . BS.unpack
 
-toUTF8 :: String -> String
-toUTF8 []        = []
-toUTF8 (c:cs)
-  | c <= '\x07F' = c
-                 : toUTF8 cs
-  | c <= '\x7FF' = chr (0xC0 .|. (w `shiftR` 6))
-                 : chr (0x80 .|. (w .&. 0x3F))
-                 : toUTF8 cs
-  | c <= '\xFFFF'= chr (0xE0 .|.  (w `shiftR` 12))
-                 : chr (0x80 .|. ((w `shiftR` 6)  .&. 0x3F))
-                 : chr (0x80 .|.  (w .&. 0x3F))
-                 : toUTF8 cs
-  | otherwise    = chr (0xf0 .|.  (w `shiftR` 18))
-                 : chr (0x80 .|. ((w `shiftR` 12)  .&. 0x3F))
-                 : chr (0x80 .|. ((w `shiftR` 6)  .&. 0x3F))
-                 : chr (0x80 .|.  (w .&. 0x3F))
-                 : toUTF8 cs
-  where w = ord c
+-- | Encode 'String' to to UTF8-encoded 'SBS.ByteString'
+--
+-- Code-points in the @U+D800@-@U+DFFF@ range will be encoded
+-- as the replacement character (i.e. @U+FFFD@).
+--
+toUTF8BS :: String -> SBS.ByteString
+toUTF8BS = SBS.pack . encodeStringUtf8
 
--- | Whether BOM is at the beginning of the input
-startsWithBOM :: String -> Bool
-startsWithBOM ('\xFEFF':_) = True
-startsWithBOM _            = False
+-- | Variant of 'toUTF8BS' for lazy 'BS.ByteString's
+--
+toUTF8LBS :: String -> BS.ByteString
+toUTF8LBS = BS.pack . encodeStringUtf8
 
--- | Check whether a file has Unicode byte order mark (BOM).
-fileHasBOM :: FilePath -> NoCallStackIO Bool
-fileHasBOM f = fmap (startsWithBOM . fromUTF8)
-             . hGetContents =<< openBinaryFile f ReadMode
+-- | Check that strict 'ByteString' is valid UTF8. Returns 'Just offset' if it's not.
+validateUTF8 :: SBS.ByteString -> Maybe Int
+validateUTF8 = go 0 where
+    go off bs = case SBS.uncons bs of
+        Nothing -> Nothing
+        Just (c, bs')
+            | c <= 0x7F -> go (off + 1) bs'
+            | c <= 0xBF -> Just off
+            | c <= 0xDF -> twoBytes off c bs'
+            | c <= 0xEF -> moreBytes off 3 0x800     bs' (fromIntegral $ c .&. 0xF)
+            | c <= 0xF7 -> moreBytes off 4 0x10000   bs' (fromIntegral $ c .&. 0x7)
+            | c <= 0xFB -> moreBytes off 5 0x200000  bs' (fromIntegral $ c .&. 0x3)
+            | c <= 0xFD -> moreBytes off 6 0x4000000 bs' (fromIntegral $ c .&. 0x1)
+            | otherwise -> Just off
+
+    twoBytes off c0 bs = case SBS.uncons bs of
+        Nothing        -> Just off
+        Just (c1, bs')
+            | c1 .&. 0xC0 == 0x80 ->
+                if d >= (0x80 :: Int)
+                then go (off + 2) bs'
+                else Just off
+            | otherwise -> Just off
+          where
+            d = (fromIntegral (c0 .&. 0x1F) `shiftL` 6) .|. fromIntegral (c1 .&. 0x3F)
+
+    moreBytes :: Int -> Int -> Int -> SBS.ByteString -> Int -> Maybe Int
+    moreBytes off 1 overlong cs' acc
+      | overlong <= acc, acc <= 0x10FFFF, acc < 0xD800 || 0xDFFF < acc
+      = go (off + 1) cs'
+
+      | otherwise
+      = Just off
+
+    moreBytes off byteCount overlong bs acc = case SBS.uncons bs of
+        Just (cn, bs') | cn .&. 0xC0 == 0x80 ->
+            moreBytes (off + 1) (byteCount-1) overlong bs' ((acc `shiftL` 6) .|. fromIntegral cn .&. 0x3F)
+        _ -> Just off
+        
 
 -- | Ignore a Unicode byte order mark (BOM) at the beginning of the input
 --
@@ -248,8 +243,7 @@ ignoreBOM string            = string
 -- Reads lazily using ordinary 'readFile'.
 --
 readUTF8File :: FilePath -> NoCallStackIO String
-readUTF8File f = fmap (ignoreBOM . fromUTF8)
-               . hGetContents =<< openBinaryFile f ReadMode
+readUTF8File f = (ignoreBOM . fromUTF8LBS) <$> BS.readFile f
 
 -- | Reads a UTF8 encoded text file as a Unicode String
 --
@@ -257,10 +251,8 @@ readUTF8File f = fmap (ignoreBOM . fromUTF8)
 --
 withUTF8FileContents :: FilePath -> (String -> IO a) -> IO a
 withUTF8FileContents name action =
-  Exception.bracket
-    (openBinaryFile name ReadMode)
-    hClose
-    (\hnd -> hGetContents hnd >>= action . ignoreBOM . fromUTF8)
+  withBinaryFile name ReadMode
+    (\hnd -> BS.hGetContents hnd >>= action . ignoreBOM . fromUTF8LBS)
 
 -- | Writes a Unicode String as a UTF8 encoded text file.
 --
@@ -288,16 +280,20 @@ normaliseLineEndings (  c :s)      =   c  : normaliseLineEndings s
 --
 -- Example:
 --
--- @
--- > tail $ Data.List.dropWhileEnd (<3) [undefined, 5, 4, 3, 2, 1]
+-- >>> tail $ Data.List.dropWhileEnd (<3) [undefined, 5, 4, 3, 2, 1]
 -- *** Exception: Prelude.undefined
--- > tail $ dropWhileEndLE (<3) [undefined, 5, 4, 3, 2, 1]
+-- ...
+--
+-- >>> tail $ dropWhileEndLE (<3) [undefined, 5, 4, 3, 2, 1]
 -- [5,4,3]
--- > take 3 $ Data.List.dropWhileEnd (<3) [5, 4, 3, 2, 1, undefined]
+--
+-- >>> take 3 $ Data.List.dropWhileEnd (<3) [5, 4, 3, 2, 1, undefined]
 -- [5,4,3]
--- > take 3 $ dropWhileEndLE (<3) [5, 4, 3, 2, 1, undefined]
+--
+-- >>> take 3 $ dropWhileEndLE (<3) [5, 4, 3, 2, 1, undefined]
 -- *** Exception: Prelude.undefined
--- @
+-- ...
+--
 dropWhileEndLE :: (a -> Bool) -> [a] -> [a]
 dropWhileEndLE p = foldr (\x r -> if null r && p x then [] else x:r) []
 
@@ -340,12 +336,12 @@ listUnion a b = a ++ ordNub (filter (`Set.notMember` aSet) b)
 --
 -- Example:
 --
--- @
--- > ordNub [1,2,1]
+-- >>> ordNub [1,2,1] :: [Int]
 -- [1,2]
--- > ordNubRight [1,2,1]
+--
+-- >>> ordNubRight [1,2,1] :: [Int]
 -- [2,1]
--- @
+--
 ordNubRight :: (Ord a) => [a] -> [a]
 ordNubRight = fst . foldr go ([], Set.empty)
   where
@@ -356,12 +352,12 @@ ordNubRight = fst . foldr go ([], Set.empty)
 --
 -- Example:
 --
--- @
--- > listUnion [1,2,3,4,3] [2,1,1]
+-- >>> listUnion [1,2,3,4,3] [2,1,1]
 -- [1,2,3,4,3]
--- > listUnionRight [1,2,3,4,3] [2,1,1]
+--
+-- >>> listUnionRight [1,2,3,4,3] [2,1,1]
 -- [4,3,2,1,1]
--- @
+--
 listUnionRight :: (Ord a) => [a] -> [a] -> [a]
 listUnionRight a b = ordNubRight (filter (`Set.notMember` bSet) a) ++ b
   where
@@ -375,9 +371,14 @@ safeTail (_:xs) = xs
 equating :: Eq a => (b -> a) -> b -> b -> Bool
 equating p x y = p x == p y
 
+-- | Lower case string
+--
+-- >>> lowercase "Foobar"
+-- "foobar"
 lowercase :: String -> String
 lowercase = map toLower
 
+-- | Ascii characters
 isAscii :: Char -> Bool
 isAscii c = fromEnum c < 0x80
 
@@ -387,8 +388,15 @@ isAsciiAlpha c = ('a' <= c && c <= 'z')
     || ('A' <= c && c <= 'Z')
 
 -- | Ascii letters and digits.
+--
+-- >>> isAsciiAlphaNum 'a'
+-- True
+--
+-- >>> isAsciiAlphaNum 'ä'
+-- False
+--
 isAsciiAlphaNum :: Char -> Bool
-isAsciiAlphaNum c = isAscii c ||  isDigit c
+isAsciiAlphaNum c = isAscii c && isAlphaNum c
 
 unintersperse :: Char -> String -> [String]
 unintersperse mark = unfoldr unintersperse1 where
@@ -397,6 +405,54 @@ unintersperse mark = unfoldr unintersperse1 where
     | otherwise =
         let (this, rest) = break (== mark) str in
         Just (this, safeTail rest)
+
+-- | Like 'break', but with 'Maybe' predicate
+--
+-- >>> breakMaybe (readMaybe :: String -> Maybe Int) ["foo", "bar", "1", "2", "quu"]
+-- (["foo","bar"],Just (1,["2","quu"]))
+--
+-- >>> breakMaybe (readMaybe :: String -> Maybe Int) ["foo", "bar"]
+-- (["foo","bar"],Nothing)
+--
+-- @since 2.2
+--
+breakMaybe :: (a -> Maybe b) -> [a] -> ([a], Maybe (b, [a]))
+breakMaybe f = go id where
+    go !acc []     = (acc [], Nothing)
+    go !acc (x:xs) = case f x of
+        Nothing -> go (acc . (x:)) xs
+        Just b  -> (acc [], Just (b, xs))
+
+-- | Like 'span' but with 'Maybe' predicate
+--
+-- >>> spanMaybe listToMaybe [[1,2],[3],[],[4,5],[6,7]]
+-- ([1,3],[[],[4,5],[6,7]])
+--
+-- >>> spanMaybe (readMaybe :: String -> Maybe Int) ["1", "2", "foo"]
+-- ([1,2],["foo"])
+--
+-- @since 2.2
+--
+spanMaybe :: (a -> Maybe b) -> [a] -> ([b],[a])
+spanMaybe _ xs@[] =  ([], xs)
+spanMaybe p xs@(x:xs') = case p x of
+    Just y  -> let (ys, zs) = spanMaybe p xs' in (y : ys, zs)
+    Nothing -> ([], xs)
+
+-- | 'unfoldr' with monadic action.
+--
+-- >>> take 5 $ unfoldrM (\b r -> Just (r + b, b + 1)) (1 :: Int) 2
+-- [3,4,5,6,7]
+--
+-- @since 2.2
+--
+unfoldrM :: Monad m => (b -> m (Maybe (a, b))) -> b -> m [a]
+unfoldrM f = go where
+    go b = do
+        m <- f b
+        case m of
+            Nothing      -> return []
+            Just (a, b') -> liftM (a :) (go b')
 
 -- ------------------------------------------------------------
 -- * FilePath stuff
@@ -433,3 +489,7 @@ isAbsoluteOnAnyPlatform _ = False
 -- | @isRelativeOnAnyPlatform = not . 'isAbsoluteOnAnyPlatform'@
 isRelativeOnAnyPlatform :: FilePath -> Bool
 isRelativeOnAnyPlatform = not . isAbsoluteOnAnyPlatform
+
+-- $setup
+-- >>> import Data.Maybe
+-- >>> import Text.Read

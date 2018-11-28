@@ -1,3 +1,4 @@
+{-# LANGUAGE GADTs #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Compat.ReadP
@@ -67,7 +68,10 @@ module Distribution.Compat.ReadP
   -- * Running a parser
   ReadS,      -- :: *; = String -> [(a,String)]
   readP_to_S, -- :: ReadP a -> ReadS a
-  readS_to_P  -- :: ReadS a -> ReadP a
+  readS_to_P, -- :: ReadS a -> ReadP a
+
+  -- ** Internal
+  Parser,
   )
  where
 
@@ -162,6 +166,10 @@ instance Applicative (Parser r s) where
   pure x  = R (\k -> k x)
   (<*>) = ap
 
+instance s ~ Char => Alternative (Parser r s) where
+  empty = pfail
+  (<|>) = (+++)
+
 instance Monad (Parser r s) where
   return = pure
   fail = Fail.fail
@@ -170,9 +178,9 @@ instance Monad (Parser r s) where
 instance Fail.MonadFail (Parser r s) where
   fail _    = R (const Fail)
 
---instance MonadPlus (Parser r s) where
---  mzero = pfail
---  mplus = (+++)
+instance s ~ Char => MonadPlus (Parser r s) where
+  mzero = pfail
+  mplus = (+++)
 
 -- ---------------------------------------------------------------------------
 -- Operations over P

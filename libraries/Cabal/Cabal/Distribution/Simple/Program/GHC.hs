@@ -14,6 +14,8 @@ module Distribution.Simple.Program.GHC (
 
     runGHC,
 
+    packageDbArgsDb,
+
   ) where
 
 import Prelude ()
@@ -24,6 +26,7 @@ import Distribution.Simple.GHC.ImplInfo
 import Distribution.PackageDescription hiding (Flag)
 import Distribution.ModuleName
 import Distribution.Simple.Compiler hiding (Flag)
+import qualified Distribution.Simple.Compiler as Compiler (Flag)
 import Distribution.Simple.Setup
 import Distribution.Simple.Program.Types
 import Distribution.Simple.Program.Run
@@ -68,7 +71,7 @@ data GhcOptions = GhcOptions {
   ghcOptOutputDynFile :: Flag FilePath,
 
   -- | Start with an empty search path for Haskell source files;
-  -- the @ghc -i@ flag (@-i@ on it's own with no path argument).
+  -- the @ghc -i@ flag (@-i@ on its own with no path argument).
   ghcOptSourcePathClear :: Flag Bool,
 
   -- | Search path for Haskell source files; the @ghc -i@ flag.
@@ -152,6 +155,9 @@ data GhcOptions = GhcOptions {
   -- | Options to pass through to the C compiler; the @ghc -optc@ flag.
   ghcOptCcOptions     :: NubListR String,
 
+  -- | Options to pass through to the C++ compiler.
+  ghcOptCxxOptions     :: NubListR String,
+
   -- | Options to pass through to CPP; the @ghc -optP@ flag.
   ghcOptCppOptions    :: NubListR String,
 
@@ -175,7 +181,7 @@ data GhcOptions = GhcOptions {
 
   -- | A GHC version-dependent mapping of extensions to flags. This must be
   -- set to be able to make use of the 'ghcOptExtensions'.
-  ghcOptExtensionMap    :: Map Extension String,
+  ghcOptExtensionMap    :: Map Extension (Maybe Compiler.Flag),
 
   ----------------
   -- Compilation
@@ -191,6 +197,9 @@ data GhcOptions = GhcOptions {
 
   -- | Automatically add profiling cost centers; the @ghc -fprof-auto*@ flags.
   ghcOptProfilingAuto :: Flag GhcProfAuto,
+
+  -- | Use the \"split sections\" feature; the @ghc -split-sections@ flag.
+  ghcOptSplitSections :: Flag Bool,
 
   -- | Use the \"split object files\" feature; the @ghc -split-objs@ flag.
   ghcOptSplitObjs     :: Flag Bool,
@@ -345,6 +354,7 @@ renderGhcOptions comp _platform@(Platform _arch os) opts
         | flagProfAuto implInfo -> ["-fprof-auto-exported"]
         | otherwise             -> ["-auto"]
 
+  , [ "-split-sections" | flagBool ghcOptSplitSections ]
   , [ "-split-objs" | flagBool ghcOptSplitObjs ]
 
   , case flagToMaybe (ghcOptHPCDir opts) of
@@ -390,13 +400,16 @@ renderGhcOptions comp _platform@(Platform _arch os) opts
   , [ "-i" ++ dir | dir <- flags ghcOptSourcePath ]
 
   --------------------
-  -- C and CPP stuff
+
+  --------------------
+  -- CPP, C, and C++ stuff
 
   , [ "-I"    ++ dir | dir <- flags ghcOptCppIncludePath ]
   , [ "-optP" ++ opt | opt <- flags ghcOptCppOptions ]
   , concat [ [ "-optP-include", "-optP" ++ inc]
            | inc <- flags ghcOptCppIncludes ]
   , [ "-optc" ++ opt | opt <- flags ghcOptCcOptions ]
+  , [ "-optc" ++ opt | opt <- flags ghcOptCxxOptions ]
 
   -----------------
   -- Linker stuff
@@ -459,11 +472,15 @@ renderGhcOptions comp _platform@(Platform _arch os) opts
     then [ "-X" ++ display lang | lang <- flag ghcOptLanguage ]
     else []
 
-  , [ case Map.lookup ext (ghcOptExtensionMap opts) of
-        Just arg -> arg
-        Nothing  -> error $ "Distribution.Simple.Program.GHC.renderGhcOptions: "
-                          ++ display ext ++ " not present in ghcOptExtensionMap."
-    | ext <- flags ghcOptExtensions ]
+  , [ ext'
+    | ext  <- flags ghcOptExtensions
+    , ext' <- case Map.lookup ext (ghcOptExtensionMap opts) of
+        Just (Just arg) -> [arg]
+        Just Nothing    -> []
+        Nothing         ->
+            error $ "Distribution.Simple.Program.GHC.renderGhcOptions: "
+                  ++ display ext ++ " not present in ghcOptExtensionMap."
+    ]
 
   ----------------
   -- GHCi

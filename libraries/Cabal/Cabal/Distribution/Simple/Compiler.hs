@@ -11,7 +11,7 @@
 -- Portability :  portable
 --
 -- This should be a much more sophisticated abstraction than it is. Currently
--- it's just a bit of data about the compiler, like it's flavour and name and
+-- it's just a bit of data about the compiler, like its flavour and name and
 -- version. The reason it's just data is because currently it has to be in
 -- 'Read' and 'Show' so it can be saved along with the 'LocalBuildInfo'. The
 -- only interesting bit of info it contains is a mapping between language
@@ -61,6 +61,7 @@ module Distribution.Simple.Compiler (
         coverageSupported,
         profilingSupported,
         backpackSupported,
+        arResponseFilesSupported,
         libraryDynDirSupported,
 
         -- * Support for profiling detail levels
@@ -79,6 +80,7 @@ import Distribution.Text
 import Language.Haskell.Extension
 import Distribution.Simple.Utils
 
+import Control.Monad (join)
 import qualified Data.Map as Map (lookup)
 import System.Directory (canonicalizePath)
 
@@ -93,7 +95,7 @@ data Compiler = Compiler {
         -- compatible with.
         compilerLanguages       :: [(Language, Flag)],
         -- ^ Supported language standards.
-        compilerExtensions      :: [(Extension, Flag)],
+        compilerExtensions      :: [(Extension, Maybe Flag)],
         -- ^ Supported extensions.
         compilerProperties      :: Map String String
         -- ^ A key-value map for properties not covered by the above fields.
@@ -285,7 +287,7 @@ languageToFlag comp ext = lookup ext (compilerLanguages comp)
 unsupportedExtensions :: Compiler -> [Extension] -> [Extension]
 unsupportedExtensions comp exts =
   [ ext | ext <- exts
-        , isNothing (extensionToFlag comp ext) ]
+        , isNothing (extensionToFlag' comp ext) ]
 
 type Flag = String
 
@@ -294,8 +296,22 @@ extensionsToFlags :: Compiler -> [Extension] -> [Flag]
 extensionsToFlags comp = nub . filter (not . null)
                        . catMaybes . map (extensionToFlag comp)
 
+-- | Looks up the flag for a given extension, for a given compiler.
+-- Ignores the subtlety of extensions which lack associated flags.
 extensionToFlag :: Compiler -> Extension -> Maybe Flag
-extensionToFlag comp ext = lookup ext (compilerExtensions comp)
+extensionToFlag comp ext = join (extensionToFlag' comp ext)
+
+-- | Looks up the flag for a given extension, for a given compiler.
+-- However, the extension may be valid for the compiler but not have a flag.
+-- For example, NondecreasingIndentation is enabled by default on GHC 7.0.4,
+-- hence it is considered a supported extension but not an accepted flag.
+--
+-- The outer layer of Maybe indicates whether the extensions is supported, while
+-- the inner layer indicates whether it has a flag.
+-- When building strings, it is often more convenient to use 'extensionToFlag',
+-- which ignores the difference.
+extensionToFlag' :: Compiler -> Extension -> Maybe (Maybe Flag)
+extensionToFlag' comp ext = lookup ext (compilerExtensions comp)
 
 -- | Does this compiler support parallel --make mode?
 parmakeSupported :: Compiler -> Bool
@@ -338,6 +354,11 @@ libraryDynDirSupported comp = case compilerFlavor comp of
   _   -> False
  where
   v = compilerVersion comp
+
+-- | Does this compiler's "ar" command supports response file
+-- arguments (i.e. @file-style arguments).
+arResponseFilesSupported :: Compiler -> Bool
+arResponseFilesSupported = ghcSupported "ar supports at file"
 
 -- | Does this compiler support Haskell program coverage?
 coverageSupported :: Compiler -> Bool

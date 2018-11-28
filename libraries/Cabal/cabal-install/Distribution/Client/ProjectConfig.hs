@@ -20,6 +20,7 @@ module Distribution.Client.ProjectConfig (
 
     -- * Project config files
     readProjectConfig,
+    readGlobalConfig,
     readProjectLocalFreezeConfig,
     writeProjectLocalExtraConfig,
     writeProjectLocalFreezeConfig,
@@ -65,12 +66,12 @@ import Distribution.Client.GlobalFlags
 import Distribution.Client.BuildReports.Types
          ( ReportLevel(..) )
 import Distribution.Client.Config
-         ( loadConfig, defaultConfigFile )
-import Distribution.Client.IndexUtils.Timestamp
-         ( IndexState(..) )
+         ( loadConfig, getConfigFilePath )
 
 import Distribution.Solver.Types.SourcePackage
 import Distribution.Solver.Types.Settings
+import Distribution.Solver.Types.PackageConstraint
+         ( PackageProperty(..) )
 
 import Distribution.Package
          ( PackageName, PackageId, packageId, UnitId )
@@ -79,20 +80,15 @@ import Distribution.System
          ( Platform )
 import Distribution.PackageDescription
          ( SourceRepo(..) )
-#if CABAL_PARSEC
 import Distribution.PackageDescription.Parsec
          ( readGenericPackageDescription )
-#else
-import Distribution.PackageDescription.Parse
-         ( readGenericPackageDescription )
-#endif
 import Distribution.Simple.Compiler
          ( Compiler, compilerInfo )
 import Distribution.Simple.Program
          ( ConfiguredProgram(..) )
 import Distribution.Simple.Setup
          ( Flag(Flag), toFlag, flagToMaybe, flagToList
-         , fromFlag, fromFlagOrDefault, AllowNewer(..), AllowOlder(..), RelaxDeps(..) )
+         , fromFlag, fromFlagOrDefault )
 import Distribution.Client.Setup
          ( defaultSolver, defaultMaxBackjumps )
 import Distribution.Simple.InstallDirs
@@ -113,7 +109,6 @@ import Distribution.ParseUtils
 import Control.Monad
 import Control.Monad.Trans (liftIO)
 import Control.Exception
-import Data.Maybe
 import Data.Either
 import qualified Data.Map as Map
 import Data.Set (Set)
@@ -157,6 +152,7 @@ projectConfigWithBuilderRepoContext verbosity BuildTimeSettings{..} =
       buildSettingCacheDir
       buildSettingHttpTransport
       (Just buildSettingIgnoreExpiry)
+      buildSettingProgPathExtra
 
 
 -- | Use a 'RepoContext', but only for the solver. The solver does not use the
@@ -179,6 +175,7 @@ projectConfigWithSolverRepoContext verbosity
                          projectConfigCacheDir)
       (flagToMaybe projectConfigHttpTransport)
       (flagToMaybe projectConfigIgnoreExpiry)
+      (fromNubList projectConfigProgPathExtra)
 
 
 -- | Resolve the project configuration, with all its optional fields, into
@@ -203,8 +200,8 @@ resolveSolverSettings ProjectConfig{
                                           (getMapMappend projectConfigSpecificPackage)
     solverSettingCabalVersion      = flagToMaybe projectConfigCabalVersion
     solverSettingSolver            = fromFlag projectConfigSolver
-    solverSettingAllowOlder        = fromJust projectConfigAllowOlder
-    solverSettingAllowNewer        = fromJust projectConfigAllowNewer
+    solverSettingAllowOlder        = fromMaybe mempty projectConfigAllowOlder
+    solverSettingAllowNewer        = fromMaybe mempty projectConfigAllowNewer
     solverSettingMaxBackjumps      = case fromFlag projectConfigMaxBackjumps of
                                        n | n < 0     -> Nothing
                                          | otherwise -> Just n
@@ -212,8 +209,8 @@ resolveSolverSettings ProjectConfig{
     solverSettingCountConflicts    = fromFlag projectConfigCountConflicts
     solverSettingStrongFlags       = fromFlag projectConfigStrongFlags
     solverSettingAllowBootLibInstalls = fromFlag projectConfigAllowBootLibInstalls
-    solverSettingIndexState        = fromFlagOrDefault IndexStateHead projectConfigIndexState
-  --solverSettingIndependentGoals  = fromFlag projectConfigIndependentGoals
+    solverSettingIndexState        = flagToMaybe projectConfigIndexState
+    solverSettingIndependentGoals  = fromFlag projectConfigIndependentGoals
   --solverSettingShadowPkgs        = fromFlag projectConfigShadowPkgs
   --solverSettingReinstall         = fromFlag projectConfigReinstall
   --solverSettingAvoidReinstalls   = fromFlag projectConfigAvoidReinstalls
@@ -224,14 +221,14 @@ resolveSolverSettings ProjectConfig{
 
     defaults = mempty {
        projectConfigSolver            = Flag defaultSolver,
-       projectConfigAllowOlder        = Just (AllowOlder RelaxDepsNone),
-       projectConfigAllowNewer        = Just (AllowNewer RelaxDepsNone),
+       projectConfigAllowOlder        = Just (AllowOlder mempty),
+       projectConfigAllowNewer        = Just (AllowNewer mempty),
        projectConfigMaxBackjumps      = Flag defaultMaxBackjumps,
        projectConfigReorderGoals      = Flag (ReorderGoals False),
        projectConfigCountConflicts    = Flag (CountConflicts True),
        projectConfigStrongFlags       = Flag (StrongFlags False),
-       projectConfigAllowBootLibInstalls = Flag (AllowBootLibInstalls False)
-     --projectConfigIndependentGoals  = Flag (IndependentGoals False),
+       projectConfigAllowBootLibInstalls = Flag (AllowBootLibInstalls False),
+       projectConfigIndependentGoals  = Flag (IndependentGoals False)
      --projectConfigShadowPkgs        = Flag False,
      --projectConfigReinstall         = Flag False,
      --projectConfigAvoidReinstalls   = Flag False,
@@ -254,7 +251,8 @@ resolveBuildTimeSettings verbosity
                          ProjectConfig {
                            projectConfigShared = ProjectConfigShared {
                              projectConfigRemoteRepos,
-                             projectConfigLocalRepos
+                             projectConfigLocalRepos,
+                             projectConfigProgPathExtra
                            },
                            projectConfigBuildOnly
                          } =
@@ -279,6 +277,7 @@ resolveBuildTimeSettings verbosity
     buildSettingIgnoreExpiry  = fromFlag    projectConfigIgnoreExpiry
     buildSettingReportPlanningFailure
                               = fromFlag projectConfigReportPlanningFailure
+    buildSettingProgPathExtra = fromNubList projectConfigProgPathExtra
 
     ProjectConfigBuildOnly{..} = defaults
                               <> projectConfigBuildOnly
@@ -416,9 +415,9 @@ renderBadProjectRoot (BadProjectRootExplicitFile projectFile) =
 -- | Read all the config relevant for a project. This includes the project
 -- file if any, plus other global config.
 --
-readProjectConfig :: Verbosity -> DistDirLayout -> Rebuild ProjectConfig
-readProjectConfig verbosity distDirLayout = do
-    global <- readGlobalConfig             verbosity
+readProjectConfig :: Verbosity -> Flag FilePath -> DistDirLayout -> Rebuild ProjectConfig
+readProjectConfig verbosity configFileFlag distDirLayout = do
+    global <- readGlobalConfig             verbosity configFileFlag
     local  <- readProjectLocalConfig       verbosity distDirLayout
     freeze <- readProjectLocalFreezeConfig verbosity distDirLayout
     extra  <- readProjectLocalExtraConfig  verbosity distDirLayout
@@ -549,15 +548,12 @@ writeProjectConfigFile file =
 
 -- | Read the user's @~/.cabal/config@ file.
 --
-readGlobalConfig :: Verbosity -> Rebuild ProjectConfig
-readGlobalConfig verbosity = do
-    config     <- liftIO (loadConfig verbosity mempty)
-    configFile <- liftIO defaultConfigFile
+readGlobalConfig :: Verbosity -> Flag FilePath -> Rebuild ProjectConfig
+readGlobalConfig verbosity configFileFlag = do
+    config     <- liftIO (loadConfig verbosity configFileFlag)
+    configFile <- liftIO (getConfigFilePath configFileFlag)
     monitorFiles [monitorFileHashed configFile]
     return (convertLegacyGlobalConfig config)
-    --TODO: do this properly, there's several possible locations
-    -- and env vars, and flags for selecting the global config
-
 
 reportParseResult :: Verbosity -> String -> FilePath -> ParseResult a -> IO a
 reportParseResult verbosity _filetype filename (ParseOk warnings x) = do
@@ -764,29 +760,30 @@ findProjectPackages DistDirLayout{distProjectRootDirectory}
       :: String -> Rebuild (Maybe (Either BadPackageLocation
                                          [ProjectPackageLocation]))
     checkIsUriPackage pkglocstr =
-      return $!
       case parseAbsoluteURI pkglocstr of
         Just uri@URI {
             uriScheme    = scheme,
-            uriAuthority = Just URIAuth { uriRegName = host }
+            uriAuthority = Just URIAuth { uriRegName = host },
+            uriPath      = path,
+            uriQuery     = query,
+            uriFragment  = frag
           }
           | recognisedScheme && not (null host) ->
-            Just (Right [ProjectPackageRemoteTarball uri])
+            return (Just (Right [ProjectPackageRemoteTarball uri]))
 
-          --TODO: [required eventually] handle file: urls which do have a null
-          -- host. translate URI into filepath and use ProjectPackageLocalTarball
-          -- or keep as file url and use ProjectPackageRemoteTarball?
+          | scheme == "file:" && null host && null query && null frag ->
+            checkIsSingleFilePackage path
 
           | not recognisedScheme && not (null host) ->
-            Just (Left (BadLocUnexpectedUriScheme pkglocstr))
+            return (Just (Left (BadLocUnexpectedUriScheme pkglocstr)))
 
           | recognisedScheme && null host ->
-            Just (Left (BadLocUnrecognisedUri pkglocstr))
+            return (Just (Left (BadLocUnrecognisedUri pkglocstr)))
           where
             recognisedScheme = scheme == "http:" || scheme == "https:"
                             || scheme == "file:"
 
-        _ -> Nothing
+        _ -> return Nothing
 
 
     checkIsFileGlobPackage pkglocstr =
@@ -894,7 +891,7 @@ mplusMaybeT ma mb = do
 -- paths.
 --
 readSourcePackage :: Verbosity -> ProjectPackageLocation
-                  -> Rebuild UnresolvedSourcePackage
+                  -> Rebuild (PackageSpecifier UnresolvedSourcePackage)
 readSourcePackage verbosity (ProjectPackageLocalCabalFile cabalFile) =
     readSourcePackage verbosity (ProjectPackageLocalDirectory dir cabalFile)
   where
@@ -904,15 +901,27 @@ readSourcePackage verbosity (ProjectPackageLocalDirectory dir cabalFile) = do
     monitorFiles [monitorFileHashed cabalFile]
     root <- askRoot
     pkgdesc <- liftIO $ readGenericPackageDescription verbosity (root </> cabalFile)
-    return SourcePackage {
+    return $ SpecificSourcePackage SourcePackage {
       packageInfoId        = packageId pkgdesc,
       packageDescription   = pkgdesc,
       packageSource        = LocalUnpackedPackage (root </> dir),
       packageDescrOverride = Nothing
     }
+
+readSourcePackage _ (ProjectPackageNamed (Dependency pkgname verrange)) =
+    return $ NamedPackage pkgname [PackagePropertyVersion verrange]
+
 readSourcePackage _verbosity _ =
     fail $ "TODO: add support for fetching and reading local tarballs, remote "
         ++ "tarballs, remote repos and passing named packages through"
+
+
+-- TODO: add something like this, here or in the project planning
+-- Based on the package location, which packages will be built inplace in the
+-- build tree vs placed in the store. This has various implications on what we
+-- can do with the package, e.g. can we run tests, ghci etc.
+--
+-- packageIsLocalToProject :: ProjectPackageLocation -> Bool
 
 
 ---------------------------------------------

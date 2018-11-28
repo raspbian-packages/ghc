@@ -86,8 +86,47 @@ import GHC.Num  ( (-) )
 -- -----------------------------------------------------------------------------
 -- Functions mandated by the Prelude
 
--- | @'guard' b@ is @'pure' ()@ if @b@ is 'True',
--- and 'empty' if @b@ is 'False'.
+-- | Conditional failure of 'Alternative' computations. Defined by
+--
+-- @
+-- guard True  = 'pure' ()
+-- guard False = 'empty'
+-- @
+--
+-- ==== __Examples__
+--
+-- Common uses of 'guard' include conditionally signaling an error in
+-- an error monad and conditionally rejecting the current choice in an
+-- 'Alternative'-based parser.
+--
+-- As an example of signaling an error in the error monad 'Maybe',
+-- consider a safe division function @safeDiv x y@ that returns
+-- 'Nothing' when the denominator @y@ is zero and @'Just' (x \`div\`
+-- y)@ otherwise. For example:
+--
+-- @
+-- >>> safeDiv 4 0
+-- Nothing
+-- >>> safeDiv 4 2
+-- Just 2
+-- @
+--
+-- A definition of @safeDiv@ using guards, but not 'guard':
+--
+-- @
+-- safeDiv :: Int -> Int -> Maybe Int
+-- safeDiv x y | y /= 0    = Just (x \`div\` y)
+--             | otherwise = Nothing
+-- @
+--
+-- A definition of @safeDiv@ using 'guard' and 'Monad' @do@-notation:
+--
+-- @
+-- safeDiv :: Int -> Int -> Maybe Int
+-- safeDiv x y = do
+--   guard (y /= 0)
+--   return (x \`div\` y)
+-- @
 guard           :: (Alternative f) => Bool -> f ()
 guard True      =  pure ()
 guard False     =  empty
@@ -146,15 +185,15 @@ the list arguments. This could be an issue where @('>>')@ and the `folded
 function' are not commutative.
 
 
->       foldM f a1 [x1, x2, ..., xm]
-
-==
-
->       do
->         a2 <- f a1 x1
->         a3 <- f a2 x2
->         ...
->         f am xm
+> foldM f a1 [x1, x2, ..., xm]
+>
+> ==
+>
+> do
+>   a2 <- f a1 x1
+>   a3 <- f a2 x2
+>   ...
+>   f am xm
 
 If right-to-left evaluation is required, the input list should be reversed.
 
@@ -264,19 +303,19 @@ The functions in this library use the following naming conventions:
   The monad type constructor @m@ is added to function results
   (modulo currying) and nowhere else.  So, for example,
 
->  filter  ::              (a ->   Bool) -> [a] ->   [a]
->  filterM :: (Monad m) => (a -> m Bool) -> [a] -> m [a]
+> filter  ::              (a ->   Bool) -> [a] ->   [a]
+> filterM :: (Monad m) => (a -> m Bool) -> [a] -> m [a]
 
 * A postfix \'@_@\' changes the result type from @(m a)@ to @(m ())@.
   Thus, for example:
 
->  sequence  :: Monad m => [m a] -> m [a]
->  sequence_ :: Monad m => [m a] -> m ()
+> sequence  :: Monad m => [m a] -> m [a]
+> sequence_ :: Monad m => [m a] -> m ()
 
 * A prefix \'@m@\' generalizes an existing function to a monadic form.
   Thus, for example:
 
->  sum  :: Num a       => [a]   -> a
->  msum :: MonadPlus m => [m a] -> m a
+> filter  ::                (a -> Bool) -> [a] -> [a]
+> mfilter :: MonadPlus m => (a -> Bool) -> m a -> m a
 
 -}

@@ -17,17 +17,24 @@ import Distribution.Types.ModuleReexport
 import Distribution.Types.UnqualComponentName
 import Distribution.ModuleName
 
-data Library = Library {
-        libName :: Maybe UnqualComponentName,
-        exposedModules    :: [ModuleName],
-        reexportedModules :: [ModuleReexport],
-        signatures:: [ModuleName], -- ^ What sigs need implementations?
-        libExposed        :: Bool, -- ^ Is the lib to be exposed by default?
-        libBuildInfo      :: BuildInfo
+import qualified Distribution.Types.BuildInfo.Lens as L
+
+data Library = Library
+    { libName           :: Maybe UnqualComponentName
+    , exposedModules    :: [ModuleName]
+    , reexportedModules :: [ModuleReexport]
+    , signatures        :: [ModuleName]   -- ^ What sigs need implementations?
+    , libExposed        :: Bool           -- ^ Is the lib to be exposed by default?
+    , libBuildInfo      :: BuildInfo
     }
     deriving (Generic, Show, Eq, Read, Typeable, Data)
 
+instance L.HasBuildInfo Library where
+    buildInfo f l = (\x -> l { libBuildInfo = x }) <$> f (libBuildInfo l)
+
 instance Binary Library
+
+instance NFData Library where rnf = genericRnf
 
 instance Monoid Library where
   mempty = Library {
@@ -75,6 +82,6 @@ libModulesAutogen lib = autogenModules (libBuildInfo lib)
 -- in the package description ('explicitLibModules'); unfortunately, the
 -- type signature for 'allLibModules' is incompatible since we need a
 -- 'ComponentLocalBuildInfo'.
-{-# DEPRECATED libModules "If you want all modules that are built with a library, use 'allLibModules'.  Otherwise, use 'explicitLibModules' for ONLY the modules explicitly mentioned in the package description." #-}
+{-# DEPRECATED libModules "If you want all modules that are built with a library, use 'allLibModules'.  Otherwise, use 'explicitLibModules' for ONLY the modules explicitly mentioned in the package description. This symbol will be removed in Cabal-3.0 (est. Oct 2018)." #-}
 libModules :: Library -> [ModuleName]
 libModules = explicitLibModules

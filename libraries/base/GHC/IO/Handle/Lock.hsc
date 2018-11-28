@@ -8,6 +8,7 @@ module GHC.IO.Handle.Lock (
   , LockMode(..)
   , hLock
   , hTryLock
+  , hUnlock
   ) where
 
 #include "HsBaseConfig.h"
@@ -96,6 +97,10 @@ hLock h mode = void $ lockImpl h "hLock" mode True
 -- @since 4.10.0.0
 hTryLock :: Handle -> LockMode -> IO Bool
 hTryLock h mode = lockImpl h "hTryLock" mode False
+
+-- | Release a lock taken with 'hLock' or 'hTryLock'.
+hUnlock :: Handle -> IO ()
+hUnlock = unlockImpl
 
 ----------------------------------------
 
@@ -186,6 +191,11 @@ lockImpl h ctx mode block = do
       SharedLock    -> #{const LOCK_SH}
       ExclusiveLock -> #{const LOCK_EX}
 
+unlockImpl :: Handle -> IO ()
+unlockImpl h = do
+  FD{fdFD = fd} <- handleToFd h
+  throwErrnoIfMinus1_ "flock" $ c_flock fd #{const LOCK_UN}
+
 foreign import ccall interruptible "flock"
   c_flock :: CInt -> CInt -> IO CInt
 
@@ -201,9 +211,8 @@ lockImpl h ctx mode block = do
     -- We want to lock the whole file without looking up its size to be
     -- consistent with what flock does. According to documentation of LockFileEx
     -- "locking a region that goes beyond the current end-of-file position is
-    -- not an error", however some versions of Windows seem to have issues with
-    -- large regions and set ERROR_INVALID_LOCK_RANGE in such case for
-    -- mysterious reasons. Work around that by setting only low 32 bits.
+    -- not an error", hence we pass maximum value as the number of bytes to
+    -- lock.
     fix $ \retry -> c_LockFileEx wh flags 0 0xffffffff 0xffffffff ovrlpd >>= \case
       True  -> return True
       False -> getLastError >>= \err -> if
@@ -217,6 +226,18 @@ lockImpl h ctx mode block = do
       SharedLock    -> 0
       ExclusiveLock -> #{const LOCKFILE_EXCLUSIVE_LOCK}
 
+unlockImpl :: Handle -> IO ()
+unlockImpl h = do
+  FD{fdFD = fd} <- handleToFd h
+  wh <- throwErrnoIf (== iNVALID_HANDLE_VALUE) "hUnlock" $ c_get_osfhandle fd
+  allocaBytes sizeof_OVERLAPPED $ \ovrlpd -> do
+    fillBytes ovrlpd 0 sizeof_OVERLAPPED
+    c_UnlockFileEx wh 0 0xffffffff 0xffffffff ovrlpd >>= \case
+      True  -> return ()
+      False -> getLastError >>= failWith "hUnlock"
+  where
+    sizeof_OVERLAPPED = #{size OVERLAPPED}
+
 -- https://msdn.microsoft.com/en-us/library/aa297958.aspx
 foreign import ccall unsafe "_get_osfhandle"
   c_get_osfhandle :: CInt -> IO HANDLE
@@ -225,10 +246,18 @@ foreign import ccall unsafe "_get_osfhandle"
 foreign import WINDOWS_CCONV interruptible "LockFileEx"
   c_LockFileEx :: HANDLE -> DWORD -> DWORD -> DWORD -> DWORD -> Ptr () -> IO BOOL
 
+-- https://msdn.microsoft.com/en-us/library/windows/desktop/aa365716.aspx
+foreign import WINDOWS_CCONV interruptible "UnlockFileEx"
+  c_UnlockFileEx :: HANDLE -> DWORD -> DWORD -> DWORD -> Ptr () -> IO BOOL
+
 #else
 
 -- | No-op implementation.
 lockImpl :: Handle -> String -> LockMode -> Bool -> IO Bool
 lockImpl _ _ _ _ = throwIO FileLockingNotSupported
+
+-- | No-op implementation.
+unlockImpl :: Handle -> IO ()
+unlockImpl _ = throwIO FileLockingNotSupported
 
 #endif

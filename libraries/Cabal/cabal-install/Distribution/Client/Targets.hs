@@ -18,11 +18,6 @@ module Distribution.Client.Targets (
   UserTarget(..),
   readUserTargets,
 
-  -- * Package specifiers
-  PackageSpecifier(..),
-  pkgSpecifierTarget,
-  pkgSpecifierConstraints,
-
   -- * Resolving user targets to package specifiers
   resolveUserTargets,
 
@@ -60,11 +55,9 @@ import Distribution.Package
          , PackageIdentifier(..), packageName, packageVersion )
 import Distribution.Types.Dependency
 import Distribution.Client.Types
-         ( PackageLocation(..)
-         , ResolvedPkgLoc, UnresolvedSourcePackage )
+         ( PackageLocation(..), ResolvedPkgLoc, UnresolvedSourcePackage
+         , PackageSpecifier(..) )
 
-import           Distribution.Solver.Types.ConstraintSource
-import           Distribution.Solver.Types.LabeledPackageConstraint
 import           Distribution.Solver.Types.OptionalStanza
 import           Distribution.Solver.Types.PackageConstraint
 import           Distribution.Solver.Types.PackagePath
@@ -82,7 +75,7 @@ import Distribution.Client.GlobalFlags
          ( RepoContext(..) )
 
 import Distribution.PackageDescription
-         ( GenericPackageDescription, parseFlagAssignment )
+         ( GenericPackageDescription, parseFlagAssignment, nullFlagAssignment )
 import Distribution.Version
          ( nullVersion, thisVersion, anyVersion, isAnyVersion )
 import Distribution.Text
@@ -91,16 +84,8 @@ import Distribution.Verbosity (Verbosity)
 import Distribution.Simple.Utils
          ( die', warn, lowercase )
 
-#ifdef CABAL_PARSEC
 import Distribution.PackageDescription.Parsec
          ( readGenericPackageDescription, parseGenericPackageDescriptionMaybe )
-#else
-import Distribution.PackageDescription.Parse
-         ( readGenericPackageDescription, parseGenericPackageDescription, ParseResult(..) )
-import Distribution.Simple.Utils
-         ( fromUTF8, ignoreBOM )
-import qualified Data.ByteString.Lazy.Char8 as BS.Char8
-#endif
 
 -- import Data.List ( find, nub )
 import Data.Either
@@ -177,46 +162,6 @@ data UserTarget =
    | UserTargetRemoteTarball URI
   deriving (Show,Eq)
 
-
--- ------------------------------------------------------------
--- * Package specifier
--- ------------------------------------------------------------
-
--- | A fully or partially resolved reference to a package.
---
-data PackageSpecifier pkg =
-
-     -- | A partially specified reference to a package (either source or
-     -- installed). It is specified by package name and optionally some
-     -- required properties. Use a dependency resolver to pick a specific
-     -- package satisfying these properties.
-     --
-     NamedPackage PackageName [PackageProperty]
-
-     -- | A fully specified source package.
-     --
-   | SpecificSourcePackage pkg
-  deriving (Eq, Show, Generic)
-
-instance Binary pkg => Binary (PackageSpecifier pkg)
-
-pkgSpecifierTarget :: Package pkg => PackageSpecifier pkg -> PackageName
-pkgSpecifierTarget (NamedPackage name _)       = name
-pkgSpecifierTarget (SpecificSourcePackage pkg) = packageName pkg
-
-pkgSpecifierConstraints :: Package pkg
-                        => PackageSpecifier pkg -> [LabeledPackageConstraint]
-pkgSpecifierConstraints (NamedPackage name props) = map toLpc props
-  where
-    toLpc prop = LabeledPackageConstraint
-                 (PackageConstraint (scopeToplevel name) prop)
-                 ConstraintSourceUserTarget
-pkgSpecifierConstraints (SpecificSourcePackage pkg)  =
-    [LabeledPackageConstraint pc ConstraintSourceUserTarget]
-  where
-    pc = PackageConstraint
-         (scopeToplevel $ packageName pkg)
-         (PackagePropertyVersion $ thisVersion (packageVersion pkg))
 
 -- ------------------------------------------------------------
 -- * Parsing and checking user targets
@@ -444,7 +389,7 @@ expandUserTarget verbosity worldFile userTarget = case userTarget of
              , let props = [ PackagePropertyVersion vrange
                            | not (isAnyVersion vrange) ]
                         ++ [ PackagePropertyFlags flags
-                           | not (null flags) ] ]
+                           | not (nullFlagAssignment flags) ] ]
 
     UserTargetLocalDir dir ->
       return [ PackageTargetLocation (LocalUnpackedPackage dir) ]
@@ -558,15 +503,8 @@ readPackageTarget verbosity = traverse modifyLocation
           _                 -> False
 
     parsePackageDescription' :: BS.ByteString -> Maybe GenericPackageDescription
-#ifdef CABAL_PARSEC
     parsePackageDescription' bs = 
         parseGenericPackageDescriptionMaybe (BS.toStrict bs)
-#else
-    parsePackageDescription' content =
-      case parseGenericPackageDescription . ignoreBOM . fromUTF8 . BS.Char8.unpack $ content of
-        ParseOk _ pkg -> Just pkg
-        _             -> Nothing
-#endif
 
 -- ------------------------------------------------------------
 -- * Checking package targets
@@ -629,10 +567,13 @@ reportPackageTargetProblems verbosity problems = do
     case [ (pkg, matches) | PackageNameAmbiguous pkg matches _ <- problems ] of
       []          -> return ()
       ambiguities -> die' verbosity $ unlines
-                             [    "The package name '" ++ display name
-                               ++ "' is ambiguous. It could be: "
-                               ++ intercalate ", " (map display matches)
-                             | (name, matches) <- ambiguities ]
+                         [    "There is no package named '" ++ display name ++ "'. "
+                           ++ (if length matches > 1
+                               then "However, the following package names exist: "
+                               else "However, the following package name exists: ")
+                           ++ intercalate ", " [ "'" ++ display m ++ "'" | m <- matches]
+                           ++ "."
+                         | (name, matches) <- ambiguities ]
 
     case [ pkg | PackageNameUnknown pkg UserTargetWorld <- problems ] of
       []   -> return ()
@@ -651,11 +592,15 @@ reportPackageTargetProblems verbosity problems = do
 
 data MaybeAmbiguous a = None | Unambiguous a | Ambiguous [a]
 
--- | Given a package name and a list of matching names, figure out which one it
--- might be referring to. If there is an exact case-sensitive match then that's
--- ok. If it matches just one package case-insensitively then that's also ok.
--- The only problem is if it matches multiple packages case-insensitively, in
--- that case it is ambiguous.
+-- | Given a package name and a list of matching names, figure out
+-- which one it might be referring to. If there is an exact
+-- case-sensitive match then that's ok (i.e. returned via
+-- 'Unambiguous'). If it matches just one package case-insensitively
+-- or if it matches multiple packages case-insensitively, in that case
+-- the result is 'Ambiguous'.
+--
+-- Note: Before cabal 2.2, when only a single package matched
+--       case-insensitively it would be considered 'Unambigious'.
 --
 disambiguatePackageName :: PackageNameEnv
                         -> PackageName
@@ -663,7 +608,6 @@ disambiguatePackageName :: PackageNameEnv
 disambiguatePackageName (PackageNameEnv pkgNameLookup) name =
     case nub (pkgNameLookup name) of
       []      -> None
-      [name'] -> Unambiguous name'
       names   -> case find (name==) names of
                    Just name' -> Unambiguous name'
                    Nothing    -> Ambiguous names

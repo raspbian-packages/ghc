@@ -20,15 +20,19 @@
 -----------------------------------------------------------------------------
 module Distribution.Client.Types where
 
+import Prelude ()
+import Distribution.Client.Compat.Prelude
+
 import Distribution.Package
          ( Package(..), HasMungedPackageId(..), HasUnitId(..)
+         , PackageIdentifier(..), packageVersion, packageName
          , PackageInstalled(..), newSimpleUnitId )
 import Distribution.InstalledPackageInfo
          ( InstalledPackageInfo, installedComponentId, sourceComponentName )
 import Distribution.PackageDescription
          ( FlagAssignment )
 import Distribution.Version
-         ( VersionRange )
+         ( VersionRange, nullVersion, thisVersion )
 import Distribution.Types.ComponentId
          ( ComponentId )
 import Distribution.Types.MungedPackageId
@@ -39,7 +43,7 @@ import Distribution.Types.AnnotatedId
 import Distribution.Types.UnitId
          ( UnitId )
 import Distribution.Types.PackageName
-         ( PackageName )
+         ( PackageName, mkPackageName )
 import Distribution.Types.ComponentName
          ( ComponentName(..) )
 
@@ -48,19 +52,22 @@ import Distribution.Solver.Types.PackageIndex
 import qualified Distribution.Solver.Types.ComponentDeps as CD
 import Distribution.Solver.Types.ComponentDeps
          ( ComponentDeps )
+import Distribution.Solver.Types.ConstraintSource
+import Distribution.Solver.Types.LabeledPackageConstraint
 import Distribution.Solver.Types.OptionalStanza
+import Distribution.Solver.Types.PackageConstraint
 import Distribution.Solver.Types.PackageFixedDeps
 import Distribution.Solver.Types.SourcePackage
 import Distribution.Compat.Graph (IsNode(..))
+import qualified Distribution.Compat.ReadP as Parse
+import Distribution.ParseUtils (parseOptCommaList)
 import Distribution.Simple.Utils (ordNub)
+import Distribution.Text (Text(..))
 
-import Data.Map (Map)
 import Network.URI (URI(..), URIAuth(..), nullURI)
 import Control.Exception
          ( Exception, SomeException )
-import Data.Typeable (Typeable)
-import GHC.Generics (Generic)
-import Distribution.Compat.Binary (Binary(..))
+import qualified Text.PrettyPrint as Disp
 
 
 newtype Username = Username { unUsername :: String }
@@ -140,11 +147,11 @@ instance (Binary loc) => Binary (ConfiguredPackage loc)
 
 -- | A ConfiguredId is a package ID for a configured package.
 --
--- Once we configure a source package we know it's UnitId. It is still
+-- Once we configure a source package we know its UnitId. It is still
 -- however useful in lots of places to also know the source ID for the package.
 -- We therefore bundle the two.
 --
--- An already installed package of course is also "configured" (all it's
+-- An already installed package of course is also "configured" (all its
 -- configuration parameters and dependencies have been specified).
 data ConfiguredId = ConfiguredId {
     confSrcId  :: PackageId
@@ -207,6 +214,48 @@ type ReadyPackage = GenericReadyPackage (ConfiguredPackage UnresolvedPkgLoc)
 
 -- | Convenience alias for 'SourcePackage UnresolvedPkgLoc'.
 type UnresolvedSourcePackage = SourcePackage UnresolvedPkgLoc
+
+
+-- ------------------------------------------------------------
+-- * Package specifier
+-- ------------------------------------------------------------
+
+-- | A fully or partially resolved reference to a package.
+--
+data PackageSpecifier pkg =
+
+     -- | A partially specified reference to a package (either source or
+     -- installed). It is specified by package name and optionally some
+     -- required properties. Use a dependency resolver to pick a specific
+     -- package satisfying these properties.
+     --
+     NamedPackage PackageName [PackageProperty]
+
+     -- | A fully specified source package.
+     --
+   | SpecificSourcePackage pkg
+  deriving (Eq, Show, Generic)
+
+instance Binary pkg => Binary (PackageSpecifier pkg)
+
+pkgSpecifierTarget :: Package pkg => PackageSpecifier pkg -> PackageName
+pkgSpecifierTarget (NamedPackage name _)       = name
+pkgSpecifierTarget (SpecificSourcePackage pkg) = packageName pkg
+
+pkgSpecifierConstraints :: Package pkg
+                        => PackageSpecifier pkg -> [LabeledPackageConstraint]
+pkgSpecifierConstraints (NamedPackage name props) = map toLpc props
+  where
+    toLpc prop = LabeledPackageConstraint
+                 (PackageConstraint (scopeToplevel name) prop)
+                 ConstraintSourceUserTarget
+pkgSpecifierConstraints (SpecificSourcePackage pkg)  =
+    [LabeledPackageConstraint pc ConstraintSourceUserTarget]
+  where
+    pc = PackageConstraint
+         (ScopeTarget $ packageName pkg)
+         (PackagePropertyVersion $ thisVersion (packageVersion pkg))
+
 
 -- ------------------------------------------------------------
 -- * Package locations and repositories
@@ -319,6 +368,11 @@ data Repo =
 instance Binary Repo
 
 -- | Check if this is a remote repo
+isRepoRemote :: Repo -> Bool
+isRepoRemote RepoLocal{} = False
+isRepoRemote _           = True
+
+-- | Extract @RemoteRepo@ from @Repo@ if remote.
 maybeRepoRemote :: Repo -> Maybe RemoteRepo
 maybeRepoRemote (RepoLocal    _localDir) = Nothing
 maybeRepoRemote (RepoRemote r _localDir) = Just r
@@ -370,3 +424,167 @@ instance Binary TestsResult
 instance Binary SomeException where
   put _ = return ()
   get = fail "cannot serialise exceptions"
+
+
+-- ------------------------------------------------------------
+-- * --allow-newer/--allow-older
+-- ------------------------------------------------------------
+
+-- TODO: When https://github.com/haskell/cabal/issues/4203 gets tackled,
+-- it may make sense to move these definitions to the Solver.Types
+-- module
+
+-- | 'RelaxDeps' in the context of upper bounds (i.e. for @--allow-newer@ flag)
+newtype AllowNewer = AllowNewer { unAllowNewer :: RelaxDeps }
+                   deriving (Eq, Read, Show, Generic)
+
+-- | 'RelaxDeps' in the context of lower bounds (i.e. for @--allow-older@ flag)
+newtype AllowOlder = AllowOlder { unAllowOlder :: RelaxDeps }
+                   deriving (Eq, Read, Show, Generic)
+
+-- | Generic data type for policy when relaxing bounds in dependencies.
+-- Don't use this directly: use 'AllowOlder' or 'AllowNewer' depending
+-- on whether or not you are relaxing an lower or upper bound
+-- (respectively).
+data RelaxDeps =
+
+  -- | Ignore upper (resp. lower) bounds in some (or no) dependencies on the given packages.
+  --
+  -- @RelaxDepsSome []@ is the default, i.e. honor the bounds in all
+  -- dependencies, never choose versions newer (resp. older) than allowed.
+    RelaxDepsSome [RelaxedDep]
+
+  -- | Ignore upper (resp. lower) bounds in dependencies on all packages.
+  --
+  -- __Note__: This is should be semantically equivalent to
+  --
+  -- > RelaxDepsSome [RelaxedDep RelaxDepScopeAll RelaxDepModNone RelaxDepSubjectAll]
+  --
+  -- (TODO: consider normalising 'RelaxDeps' and/or 'RelaxedDep')
+  | RelaxDepsAll
+  deriving (Eq, Read, Show, Generic)
+
+-- | Dependencies can be relaxed either for all packages in the install plan, or
+-- only for some packages.
+data RelaxedDep = RelaxedDep !RelaxDepScope !RelaxDepMod !RelaxDepSubject
+                deriving (Eq, Read, Show, Generic)
+
+-- | Specify the scope of a relaxation, i.e. limit which depending
+-- packages are allowed to have their version constraints relaxed.
+data RelaxDepScope = RelaxDepScopeAll
+                     -- ^ Apply relaxation in any package
+                   | RelaxDepScopePackage !PackageName
+                     -- ^ Apply relaxation to in all versions of a package
+                   | RelaxDepScopePackageId !PackageId
+                     -- ^ Apply relaxation to a specific version of a package only
+                   deriving (Eq, Read, Show, Generic)
+
+-- | Modifier for dependency relaxation
+data RelaxDepMod = RelaxDepModNone  -- ^ Default semantics
+                 | RelaxDepModCaret -- ^ Apply relaxation only to @^>=@ constraints
+                 deriving (Eq, Read, Show, Generic)
+
+-- | Express whether to relax bounds /on/ @all@ packages, or a single package
+data RelaxDepSubject = RelaxDepSubjectAll
+                     | RelaxDepSubjectPkg !PackageName
+                     deriving (Eq, Ord, Read, Show, Generic)
+
+instance Text RelaxedDep where
+  disp (RelaxedDep scope rdmod subj) = case scope of
+      RelaxDepScopeAll          -> Disp.text "all:"           Disp.<> modDep
+      RelaxDepScopePackage   p0 -> disp p0 Disp.<> Disp.colon Disp.<> modDep
+      RelaxDepScopePackageId p0 -> disp p0 Disp.<> Disp.colon Disp.<> modDep
+    where
+      modDep = case rdmod of
+               RelaxDepModNone  -> disp subj
+               RelaxDepModCaret -> Disp.char '^' Disp.<> disp subj
+
+  parse = RelaxedDep <$> scopeP <*> modP <*> parse
+    where
+      -- "greedy" choices
+      scopeP =           (pure RelaxDepScopeAll  <* Parse.char '*' <* Parse.char ':')
+               Parse.<++ (pure RelaxDepScopeAll  <* Parse.string "all:")
+               Parse.<++ (RelaxDepScopePackageId <$> pidP  <* Parse.char ':')
+               Parse.<++ (RelaxDepScopePackage   <$> parse <* Parse.char ':')
+               Parse.<++ (pure RelaxDepScopeAll)
+
+      modP =           (pure RelaxDepModCaret <* Parse.char '^')
+             Parse.<++ (pure RelaxDepModNone)
+
+      -- | Stricter 'PackageId' parser which doesn't overlap with 'PackageName' parser
+      pidP = do
+          p0 <- parse
+          when (pkgVersion p0 == nullVersion) Parse.pfail
+          pure p0
+
+instance Text RelaxDepSubject where
+  disp RelaxDepSubjectAll      = Disp.text "all"
+  disp (RelaxDepSubjectPkg pn) = disp pn
+
+  parse = (pure RelaxDepSubjectAll <* Parse.char '*') Parse.<++ pkgn
+    where
+      pkgn = do
+          pn <- parse
+          pure (if (pn == mkPackageName "all")
+                then RelaxDepSubjectAll
+                else RelaxDepSubjectPkg pn)
+
+instance Text RelaxDeps where
+  disp rd | not (isRelaxDeps rd) = Disp.text "none"
+  disp (RelaxDepsSome pkgs)      = Disp.fsep .
+                                   Disp.punctuate Disp.comma .
+                                   map disp $ pkgs
+  disp RelaxDepsAll              = Disp.text "all"
+
+  parse =           (const mempty        <$> ((Parse.string "none" Parse.+++
+                                               Parse.string "None") <* Parse.eof))
+          Parse.<++ (const RelaxDepsAll  <$> ((Parse.string "all"  Parse.+++
+                                               Parse.string "All"  Parse.+++
+                                               Parse.string "*")  <* Parse.eof))
+          Parse.<++ (      RelaxDepsSome <$> parseOptCommaList parse)
+
+instance Binary RelaxDeps
+instance Binary RelaxDepMod
+instance Binary RelaxDepScope
+instance Binary RelaxDepSubject
+instance Binary RelaxedDep
+instance Binary AllowNewer
+instance Binary AllowOlder
+
+-- | Return 'True' if 'RelaxDeps' specifies a non-empty set of relaxations
+--
+-- Equivalent to @isRelaxDeps = (/= 'mempty')@
+isRelaxDeps :: RelaxDeps -> Bool
+isRelaxDeps (RelaxDepsSome [])    = False
+isRelaxDeps (RelaxDepsSome (_:_)) = True
+isRelaxDeps RelaxDepsAll          = True
+
+-- | 'RelaxDepsAll' is the /absorbing element/
+instance Semigroup RelaxDeps where
+  -- identity element
+  RelaxDepsSome []    <> r                   = r
+  l@(RelaxDepsSome _) <> RelaxDepsSome []    = l
+  -- absorbing element
+  l@RelaxDepsAll      <> _                   = l
+  (RelaxDepsSome   _) <> r@RelaxDepsAll      = r
+  -- combining non-{identity,absorbing} elements
+  (RelaxDepsSome   a) <> (RelaxDepsSome b)   = RelaxDepsSome (a ++ b)
+
+-- | @'RelaxDepsSome' []@ is the /identity element/
+instance Monoid RelaxDeps where
+  mempty  = RelaxDepsSome []
+  mappend = (<>)
+
+instance Semigroup AllowNewer where
+  AllowNewer x <> AllowNewer y = AllowNewer (x <> y)
+
+instance Semigroup AllowOlder where
+  AllowOlder x <> AllowOlder y = AllowOlder (x <> y)
+
+instance Monoid AllowNewer where
+  mempty  = AllowNewer mempty
+  mappend = (<>)
+
+instance Monoid AllowOlder where
+  mempty  = AllowOlder mempty
+  mappend = (<>)

@@ -1,20 +1,20 @@
+{-# LANGUAGE DeriveDataTypeable         #-}
+{-# LANGUAGE DeriveGeneric              #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE DeriveGeneric #-}
 module Distribution.Types.UnqualComponentName
   ( UnqualComponentName, unUnqualComponentName, mkUnqualComponentName
   , packageNameToUnqualComponentName, unqualComponentNameToPackageName
   ) where
 
-import Prelude ()
 import Distribution.Compat.Prelude
 import Distribution.Utils.ShortText
+import Prelude ()
 
+import Distribution.Parsec.Class
+import Distribution.ParseUtils        (parsePackageName)
+import Distribution.Pretty
 import Distribution.Text
-import Distribution.ParseUtils (parsePackageName)
 import Distribution.Types.PackageName
-
-import Text.PrettyPrint (text)
 
 -- | An unqualified component name, for any kind of component.
 --
@@ -52,8 +52,13 @@ instance IsString UnqualComponentName where
 
 instance Binary UnqualComponentName
 
+instance Pretty UnqualComponentName where
+  pretty = showToken . unUnqualComponentName
+
+instance Parsec UnqualComponentName where
+  parsec = mkUnqualComponentName <$> parsecUnqualComponentName
+
 instance Text UnqualComponentName where
-  disp = text . unUnqualComponentName
   parse = mkUnqualComponentName <$> parsePackageName
 
 instance NFData UnqualComponentName where

@@ -51,9 +51,11 @@ import Distribution.ModuleName
 import qualified Distribution.Compat.MonadFail as Fail
 import Distribution.Compat.ReadP as ReadP hiding (get)
 import Distribution.ReadE
+import Distribution.Compat.Newtype
+import Distribution.Parsec.Newtypes (TestedWith (..))
 import Distribution.Text
 import Distribution.Utils.Generic
-import Distribution.PrettyUtils
+import Distribution.Pretty
 import Language.Haskell.Extension
 
 import Text.PrettyPrint
@@ -283,6 +285,8 @@ ppField name fielddoc
          , "extra-source-files"
          , "extra-tmp-files"
          , "exposed-modules"
+         , "asm-sources"
+         , "cmm-sources"
          , "c-sources"
          , "js-sources"
          , "extra-libraries"
@@ -702,3 +706,10 @@ parseFreeText = ReadP.munch (const True)
 readPToMaybe :: ReadP a a -> String -> Maybe a
 readPToMaybe p str = listToMaybe [ r | (r,s) <- readP_to_S p str
                                      , all isSpace s ]
+
+-------------------------------------------------------------------------------
+-- Internal
+-------------------------------------------------------------------------------
+
+showTestedWith :: (CompilerFlavor, VersionRange) -> Doc
+showTestedWith = pretty . pack' TestedWith

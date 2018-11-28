@@ -1,6 +1,7 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE FlexibleContexts #-}
 
 module Distribution.Types.UnitId
   ( UnitId, unUnitId, mkUnitId
@@ -18,6 +19,9 @@ import Distribution.Compat.Prelude
 import Distribution.Utils.ShortText
 
 import qualified Distribution.Compat.ReadP as Parse
+import qualified Distribution.Compat.CharParsing as P
+import Distribution.Pretty
+import Distribution.Parsec.Class
 import Distribution.Text
 import Distribution.Types.ComponentId
 import Distribution.Types.PackageId
@@ -64,7 +68,7 @@ import Text.PrettyPrint (text)
 newtype UnitId = UnitId ShortText
   deriving (Generic, Read, Show, Eq, Ord, Typeable, Data, NFData)
 
-{-# DEPRECATED InstalledPackageId "Use UnitId instead" #-}
+{-# DEPRECATED InstalledPackageId "Use UnitId instead. This symbol will be removed in Cabal-3.0 (est. Oct 2018)." #-}
 type InstalledPackageId = UnitId
 
 instance Binary UnitId
@@ -72,8 +76,16 @@ instance Binary UnitId
 -- | The textual format for 'UnitId' coincides with the format
 -- GHC accepts for @-package-id@.
 --
+instance Pretty UnitId where
+    pretty = text . unUnitId
+
+-- | The textual format for 'UnitId' coincides with the format
+-- GHC accepts for @-package-id@.
+--
+instance Parsec UnitId where
+    parsec = mkUnitId <$> P.munch1 (\c -> isAlphaNum c || c `elem` "-_.+")
+
 instance Text UnitId where
-    disp = text . unUnitId
     parse = mkUnitId <$> Parse.munch1 (\c -> isAlphaNum c || c `elem` "-_.+")
 
 -- | If you need backwards compatibility, consider using 'display'
@@ -109,7 +121,12 @@ getHSLibraryName uid = "HS" ++ display uid
 -- that a 'UnitId' identified this way is definite; i.e., it has no
 -- unfilled holes.
 newtype DefUnitId = DefUnitId { unDefUnitId :: UnitId }
-  deriving (Generic, Read, Show, Eq, Ord, Typeable, Data, Binary, NFData, Text)
+  deriving (Generic, Read, Show, Eq, Ord, Typeable, Data, Binary, NFData, Pretty, Text)
+
+-- Workaround for a GHC 8.0.1 bug, see
+-- https://github.com/haskell/cabal/issues/4793#issuecomment-334258288
+instance Parsec DefUnitId where
+  parsec = DefUnitId <$> parsec
 
 -- | Unsafely create a 'DefUnitId' from a 'UnitId'.  Your responsibility
 -- is to ensure that the 'DefUnitId' invariant holds.

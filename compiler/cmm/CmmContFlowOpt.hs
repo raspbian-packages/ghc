@@ -1,4 +1,5 @@
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE BangPatterns #-}
 {-# OPTIONS_GHC -fno-warn-incomplete-patterns #-}
 module CmmContFlowOpt
     ( cmmCfgOpts
@@ -8,16 +9,21 @@ module CmmContFlowOpt
     )
 where
 
-import Hoopl
+import GhcPrelude hiding (succ, unzip, zip)
+
+import Hoopl.Block
+import Hoopl.Collections
+import Hoopl.Graph
+import Hoopl.Label
 import BlockId
 import Cmm
 import CmmUtils
 import CmmSwitch (mapSwitchTargets)
 import Maybes
 import Panic
+import Util
 
 import Control.Monad
-import Prelude hiding (succ, unzip, zip)
 
 
 -- Note [What is shortcutting]
@@ -49,7 +55,7 @@ import Prelude hiding (succ, unzip, zip)
 --
 -- This optimisation does three things:
 --
---   - If a block finishes in an unconditonal branch to another block
+--   - If a block finishes in an unconditional branch to another block
 --     and that is the only jump to that block we concatenate the
 --     destination block at the end of the current one.
 --
@@ -190,7 +196,7 @@ blockConcat splitting_procs g@CmmGraph { g_entry = entry_id }
      maybe_concat :: CmmBlock
                   -> (LabelMap CmmBlock, LabelMap BlockId, LabelMap Int)
                   -> (LabelMap CmmBlock, LabelMap BlockId, LabelMap Int)
-     maybe_concat block (blocks, shortcut_map, backEdges)
+     maybe_concat block (!blocks, !shortcut_map, !backEdges)
         -- If:
         --   (1) current block ends with unconditional branch to b' and
         --   (2) it has exactly one predecessor (namely, current block)
@@ -392,7 +398,7 @@ predMap blocks = foldr add_preds mapEmpty blocks
 -- Removing unreachable blocks
 removeUnreachableBlocksProc :: CmmDecl -> CmmDecl
 removeUnreachableBlocksProc proc@(CmmProc info lbl live g)
-   | length used_blocks < mapSize (toBlockMap g)
+   | used_blocks `lengthLessThan` mapSize (toBlockMap g)
    = CmmProc info' lbl live g'
    | otherwise
    = proc
@@ -412,4 +418,4 @@ removeUnreachableBlocksProc proc@(CmmProc info lbl live g)
      used_blocks = postorderDfs g
 
      used_lbls :: LabelSet
-     used_lbls = foldr (setInsert . entryLabel) setEmpty used_blocks
+     used_lbls = setFromList $ map entryLabel used_blocks

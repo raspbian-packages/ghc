@@ -5,7 +5,7 @@
 \section[Id]{@Ids@: Value and constructor identifiers}
 -}
 
-{-# LANGUAGE ImplicitParams, CPP #-}
+{-# LANGUAGE CPP #-}
 
 -- |
 -- #name_types#
@@ -53,7 +53,7 @@ module Id (
         setIdInfo, lazySetIdInfo, modifyIdInfo, maybeModifyIdInfo,
         zapLamIdInfo, zapIdDemandInfo, zapIdUsageInfo, zapIdUsageEnvInfo,
         zapIdUsedOnceInfo, zapIdTailCallInfo,
-        zapFragileIdInfo, zapIdStrictness,
+        zapFragileIdInfo, zapIdStrictness, zapStableUnfolding,
         transferPolyIdInfo,
 
         -- ** Predicates on Ids
@@ -74,7 +74,7 @@ module Id (
         DictId, isDictId, isEvVar,
 
         -- ** Join variables
-        JoinId, isJoinId, isJoinId_maybe, idJoinArity,
+        JoinId, isJoinId, isJoinId_maybe, idJoinArity, isExitJoinId,
         asJoinId, asJoinId_maybe, zapJoinId,
 
         -- ** Inline pragma stuff
@@ -116,8 +116,10 @@ module Id (
 
 #include "HsVersions.h"
 
+import GhcPrelude
+
 import DynFlags
-import CoreSyn ( CoreRule, evaldUnfolding, Unfolding( NoUnfolding ) )
+import CoreSyn ( CoreRule, isStableUnfolding, evaldUnfolding, Unfolding( NoUnfolding ) )
 
 import IdInfo
 import BasicTypes
@@ -201,7 +203,7 @@ setIdNotExported :: Id -> Id
 setIdNotExported = Var.setIdNotExported
 
 localiseId :: Id -> Id
--- Make an with the same unique and type as the
+-- Make an Id with the same unique and type as the
 -- incoming Id, but with an *Internal* Name and *LocalId* flavour
 localiseId id
   | ASSERT( isId id ) isLocalId id && isInternalName name
@@ -495,6 +497,10 @@ isJoinId_maybe id
                 _            -> Nothing
  | otherwise = Nothing
 
+-- see Note [Exitification] and see Note [Do not inline exit join points]
+isExitJoinId :: Var -> Bool
+isExitJoinId id = isJoinId id && isOneOcc (idOccInfo id) && occ_in_lam (idOccInfo id)
+
 idDataCon :: Id -> DataCon
 -- ^ Get from either the worker or the wrapper 'Id' to the 'DataCon'. Currently used only in the desugarer.
 --
@@ -715,7 +721,7 @@ setIdCafInfo :: Id -> CafInfo -> Id
 setIdCafInfo id caf_info = modifyIdInfo (`setCafInfo` caf_info) id
 
         ---------------------------------
-        -- Occcurrence INFO
+        -- Occurrence INFO
 idOccInfo :: Id -> OccInfo
 idOccInfo id = occInfo (idInfo id)
 
@@ -866,6 +872,11 @@ zapIdUsedOnceInfo = zapInfo zapUsedOnceInfo
 
 zapIdTailCallInfo :: Id -> Id
 zapIdTailCallInfo = zapInfo zapTailCallInfo
+
+zapStableUnfolding :: Id -> Id
+zapStableUnfolding id
+ | isStableUnfolding (realIdUnfolding id) = setIdUnfolding id NoUnfolding
+ | otherwise                              = id
 
 {-
 Note [transferPolyIdInfo]

@@ -4,10 +4,6 @@ module CanonicalizePath where
 import System.FilePath ((</>), dropFileName, dropTrailingPathSeparator,
                         normalise, takeFileName)
 import TestUtils
-#ifdef mingw32_HOST_OS
-import System.Directory.Internal (win32_getFinalPathNameByHandle)
-import qualified System.Win32 as Win32
-#endif
 
 main :: TestEnv -> IO ()
 main _t = do
@@ -68,47 +64,53 @@ main _t = do
   T(expectEq) () fooNon fooNon7
   T(expectEq) () fooNon fooNon8
 
-  supportsSymbolicLinks <- do
-#ifdef mingw32_HOST_OS
-    hasSymbolicLinkPrivileges <-
-      (True <$ createSymbolicLink "_symlinktest_src" "_symlinktest_dst")
-        -- only test if symbolic links can be created
-        -- (usually disabled on Windows by group policy)
-        `catchIOError` \ e ->
-          if isPermissionError e
-          then pure False
-          else ioError e
+  -- make sure ".." gets expanded properly by 'toExtendedLengthPath'
+  -- (turns out this test won't detect the problem because GetFullPathName
+  -- would expand them for us if we don't, but leaving it here anyway)
+  T(expectEq) () foo =<< canonicalizePath (foo </> ".." </> "foo")
 
-    supportsGetFinalPathNameByHandle <-
-      (True <$ win32_getFinalPathNameByHandle Win32.nullHANDLE 0)
-        `catchIOError` \ e ->
-          case ioeGetErrorType e of
-            UnsupportedOperation -> pure False
-            _ -> pure True
-
-    pure (hasSymbolicLinkPrivileges && supportsGetFinalPathNameByHandle)
-#else
-    pure True
-#endif
-
+  supportsSymbolicLinks <- supportsSymlinks
   when supportsSymbolicLinks $ do
 
     let barQux = dot </> "bar" </> "qux"
 
-    createSymbolicLink "../bar" "foo/bar"
+    -- note: this also checks that "../bar" gets normalized to "..\\bar"
+    --       since Windows does not like "/" in symbolic links targets
+    createFileLink "../bar" "foo/bar"
     T(expectEq) () bar =<< canonicalizePath "foo/bar"
     T(expectEq) () barQux =<< canonicalizePath "foo/bar/qux"
 
-    createSymbolicLink "foo" "lfoo"
+    createDirectoryLink "foo" "lfoo"
     T(expectEq) () foo =<< canonicalizePath "lfoo"
     T(expectEq) () foo =<< canonicalizePath "lfoo/"
     T(expectEq) () bar =<< canonicalizePath "lfoo/bar"
     T(expectEq) () barQux =<< canonicalizePath "lfoo/bar/qux"
 
-    -- FIXME: uncomment this test once #64 is fixed
-    -- createSymbolicLink "../foo/non-existent" "foo/qux"
-    -- qux <- canonicalizePath "foo/qux"
-    -- T(expectEq) () qux (dot </> "../foo/non-existent")
+    -- create a haphazard chain of links
+    createDirectoryLink "./../foo/../foo/." "./foo/./somelink3"
+    createDirectoryLink ".././foo/somelink3" "foo/somelink2"
+    createDirectoryLink "./foo/somelink2" "somelink"
+    T(expectEq) () foo =<< canonicalizePath "somelink"
+
+    -- regression test for #64
+    createFileLink "../foo/non-existent" "foo/qux"
+    removeDirectoryLink "foo/somelink3" -- break the chain made earlier
+    qux <- canonicalizePath "foo/qux"
+    T(expectEq) () qux =<< canonicalizePath "foo/non-existent"
+    T(expectEq) () (foo </> "somelink3") =<< canonicalizePath "somelink"
+
+    -- make sure it can handle loops
+    createFileLink "loop1" "loop2"
+    createFileLink "loop2" "loop1"
+    loop1 <- canonicalizePath "loop1"
+    loop2 <- canonicalizePath "loop2"
+    T(expectEq) () loop1 (normalise (dot </> "loop1"))
+    T(expectEq) () loop2 (normalise (dot </> "loop2"))
+
+    -- make sure ".." gets expanded properly by 'toExtendedLengthPath'
+    createDirectoryLink (foo </> ".." </> "foo") "foolink"
+    _ <- listDirectory "foolink" -- make sure directory is accessible
+    T(expectEq) () foo =<< canonicalizePath "foolink"
 
   caseInsensitive <-
     (False <$ createDirectory "FOO")

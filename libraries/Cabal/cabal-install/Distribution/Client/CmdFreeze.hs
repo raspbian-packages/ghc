@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, NamedFieldPuns, RecordWildCards, ViewPatterns #-}
+{-# LANGUAGE CPP, NamedFieldPuns, RecordWildCards #-}
 
 -- | cabal-install CLI command: freeze
 --
@@ -29,14 +29,13 @@ import Distribution.Version
          ( VersionRange, thisVersion
          , unionVersionRanges, simplifyVersionRange )
 import Distribution.PackageDescription
-         ( FlagAssignment )
+         ( FlagAssignment, nullFlagAssignment )
 import Distribution.Client.Setup
-         ( GlobalFlags, ConfigFlags(..), ConfigExFlags, InstallFlags
-         , applyFlagDefaults )
+         ( GlobalFlags, ConfigFlags(..), ConfigExFlags, InstallFlags )
 import Distribution.Simple.Setup
          ( HaddockFlags, fromFlagOrDefault )
 import Distribution.Simple.Utils
-         ( die', notice )
+         ( die', notice, wrapText )
 import Distribution.Verbosity
          ( normal )
 
@@ -47,8 +46,6 @@ import Control.Monad (unless)
 
 import Distribution.Simple.Command
          ( CommandUI(..), usageAlternatives )
-import Distribution.Simple.Utils
-         ( wrapText )
 import qualified Distribution.Client.Setup as Client
 
 
@@ -104,7 +101,7 @@ freezeCommand = Client.installCommand {
 --
 freezeAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
              -> [String] -> GlobalFlags -> IO ()
-freezeAction (applyFlagDefaults -> (configFlags, configExFlags, installFlags, haddockFlags))
+freezeAction (configFlags, configExFlags, installFlags, haddockFlags)
              extraArgs globalFlags = do
 
     unless (null extraArgs) $
@@ -175,7 +172,7 @@ projectFreezeConstraints plan =
     versionConstraints :: Map PackageName [(UserConstraint, ConstraintSource)]
     versionConstraints =
       Map.mapWithKey
-        (\p v -> [(UserConstraint (UserQualified UserQualToplevel p) (PackagePropertyVersion v),
+        (\p v -> [(UserConstraint (UserAnyQualifier p) (PackagePropertyVersion v),
                    ConstraintSourceFreeze)])
         versionRanges
 
@@ -204,7 +201,7 @@ projectFreezeConstraints plan =
         | InstallPlan.Configured elab <- InstallPlan.toList plan
         , let flags   = elabFlagAssignment elab
               pkgname = packageName elab
-        , not (null flags) ]
+        , not (nullFlagAssignment flags) ]
 
     -- As described above, remove the version constraints on local packages,
     -- but leave any flag constraints.

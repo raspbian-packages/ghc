@@ -1,5 +1,4 @@
 {-# LANGUAGE NamedFieldPuns #-}
-{-# LANGUAGE ViewPatterns   #-}
 
 -- | cabal-install CLI command: run
 --
@@ -14,29 +13,46 @@ module Distribution.Client.CmdRun (
     selectComponentTarget
   ) where
 
+import Prelude ()
+import Distribution.Client.Compat.Prelude
+
 import Distribution.Client.ProjectOrchestration
 import Distribution.Client.CmdErrorMessages
 
 import Distribution.Client.Setup
-         ( GlobalFlags, ConfigFlags(..), ConfigExFlags, InstallFlags
-         , applyFlagDefaults )
+         ( GlobalFlags, ConfigFlags(..), ConfigExFlags, InstallFlags )
 import qualified Distribution.Client.Setup as Client
 import Distribution.Simple.Setup
          ( HaddockFlags, fromFlagOrDefault )
 import Distribution.Simple.Command
          ( CommandUI(..), usageAlternatives )
 import Distribution.Types.ComponentName
-         ( componentNameString )
+         ( showComponentName )
 import Distribution.Text
          ( display )
 import Distribution.Verbosity
          ( Verbosity, normal )
 import Distribution.Simple.Utils
-         ( wrapText, die', ordNub )
+         ( wrapText, die', ordNub, info )
+import Distribution.Client.ProjectPlanning
+         ( ElaboratedConfiguredPackage(..)
+         , ElaboratedInstallPlan, binDirectoryFor )
+import Distribution.Client.ProjectPlanning.Types
+         ( dataDirsEnvironmentForPlan )
+import Distribution.Client.InstallPlan
+         ( toList, foldPlanPackage )
+import Distribution.Types.UnqualComponentName
+         ( UnqualComponentName, unUnqualComponentName )
+import Distribution.Simple.Program.Run
+         ( runProgramInvocation, ProgramInvocation(..),
+           emptyProgramInvocation )
+import Distribution.Types.UnitId
+         ( UnitId )
 
 import qualified Data.Map as Map
 import qualified Data.Set as Set
-import Control.Monad (when)
+import System.FilePath
+         ( (</>) )
 
 
 runCommand :: CommandUI (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
@@ -46,12 +62,13 @@ runCommand = Client.installCommand {
   commandUsage        = usageAlternatives "new-run"
                           [ "[TARGET] [FLAGS] [-- EXECUTABLE_FLAGS]" ],
   commandDescription  = Just $ \pname -> wrapText $
-        "Runs the specified executable, first ensuring it is up to date.\n\n"
+        "Runs the specified executable-like component (an executable, a test, "
+     ++ "or a benchmark), first ensuring it is up to date.\n\n"
 
-     ++ "Any executable in any package in the project can be specified. "
-     ++ "A package can be specified if contains just one executable. "
-     ++ "The default is to use the package in the current directory if it "
-     ++ "contains just one executable.\n\n"
+     ++ "Any executable-like component in any package in the project can be "
+     ++ "specified. A package can be specified if contains just one "
+     ++ "executable-like. The default is to use the package in the current "
+     ++ "directory if it contains just one executable-like.\n\n"
 
      ++ "Extra arguments can be passed to the program, but use '--' to "
      ++ "separate arguments for the program from arguments for " ++ pname
@@ -65,11 +82,11 @@ runCommand = Client.installCommand {
   commandNotes        = Just $ \pname ->
         "Examples:\n"
      ++ "  " ++ pname ++ " new-run\n"
-     ++ "    Run the executable in the package in the current directory\n"
+     ++ "    Run the executable-like in the package in the current directory\n"
      ++ "  " ++ pname ++ " new-run foo-tool\n"
-     ++ "    Run the named executable (in any package in the project)\n"
+     ++ "    Run the named executable-like (in any package in the project)\n"
      ++ "  " ++ pname ++ " new-run pkgfoo:foo-tool\n"
-     ++ "    Run the executable 'foo-tool' in the package 'pkgfoo'\n"
+     ++ "    Run the executable-like 'foo-tool' in the package 'pkgfoo'\n"
      ++ "  " ++ pname ++ " new-run foo -O2 -- dothing --fooflag\n"
      ++ "    Build with '-O2' and run the program, passing it extra arguments.\n\n"
 
@@ -77,22 +94,24 @@ runCommand = Client.installCommand {
    }
 
 
--- | The @build@ command does a lot. It brings the install plan up to date,
--- selects that part of the plan needed by the given or implicit targets and
--- then executes the plan.
+-- | The @run@ command runs a specified executable-like component, building it
+-- first if necessary. The component can be either an executable, a test,
+-- or a benchmark. This is particularly useful for passing arguments to
+-- exes/tests/benchs by simply appending them after a @--@.
 --
 -- For more details on how this works, see the module
 -- "Distribution.Client.ProjectOrchestration"
 --
 runAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
           -> [String] -> GlobalFlags -> IO ()
-runAction (applyFlagDefaults -> (configFlags, configExFlags, installFlags, haddockFlags))
+runAction (configFlags, configExFlags, installFlags, haddockFlags)
             targetStrings globalFlags = do
 
     baseCtx <- establishProjectBaseContext verbosity cliConfig
 
     targetSelectors <- either (reportTargetSelectorProblems verbosity) return
-                   =<< readTargetSelectors (localPackages baseCtx) targetStrings
+                   =<< readTargetSelectors (localPackages baseCtx)
+                         (take 1 targetStrings) -- Drop the exe's args.
 
     buildCtx <-
       runProjectPreBuildPhase verbosity baseCtx $ \elaboratedPlan -> do
@@ -116,25 +135,111 @@ runAction (applyFlagDefaults -> (configFlags, configExFlags, installFlags, haddo
             -- Reject multiple targets, or at least targets in different
             -- components. It is ok to have two module/file targets in the
             -- same component, but not two that live in different components.
-            when (Set.size (distinctTargetComponents targets) > 1) $
-              reportTargetProblems verbosity
-                [TargetProblemMultipleTargets targets]
+            --
+            -- Note that we discard the target and return the whole 'TargetsMap',
+            -- so this check will be repeated (and must succeed) after
+            -- the 'runProjectPreBuildPhase'. Keep it in mind when modifying this.
+            _ <- singleExeOrElse
+                   (reportTargetProblems
+                      verbosity
+                      [TargetProblemMultipleTargets targets])
+                   targets
 
             let elaboratedPlan' = pruneInstallPlanToTargets
                                     TargetActionBuild
                                     targets
                                     elaboratedPlan
-            return elaboratedPlan'
+            return (elaboratedPlan', targets)
+
+    (selectedUnitId, selectedComponent) <-
+      -- Slight duplication with 'runProjectPreBuildPhase'.
+      singleExeOrElse
+        (die' verbosity $ "No or multiple targets given, but the run "
+                       ++ "phase has been reached. This is a bug.")
+        $ targetsMap buildCtx
 
     printPlan verbosity baseCtx buildCtx
 
     buildOutcomes <- runProjectBuildPhase verbosity baseCtx buildCtx
     runProjectPostBuildPhase verbosity baseCtx buildCtx buildOutcomes
+
+
+    let elaboratedPlan = elaboratedPlanToExecute buildCtx
+        matchingElaboratedConfiguredPackages =
+          matchingPackagesByUnitId
+            selectedUnitId
+            elaboratedPlan
+
+    let exeName = unUnqualComponentName selectedComponent
+
+    -- In the common case, we expect @matchingElaboratedConfiguredPackages@
+    -- to consist of a single element that provides a single way of building
+    -- an appropriately-named executable. In that case we take that
+    -- package and continue.
+    --
+    -- However, multiple packages/components could provide that
+    -- executable, or it's possible we don't find the executable anywhere
+    -- in the build plan. I suppose in principle it's also possible that
+    -- a single package provides an executable in two different ways,
+    -- though that's probably a bug if. Anyway it's a good lint to report
+    -- an error in all of these cases, even if some seem like they
+    -- shouldn't happen.
+    pkg <- case matchingElaboratedConfiguredPackages of
+      [] -> die' verbosity $ "Unknown executable "
+                          ++ exeName
+                          ++ " in package "
+                          ++ display selectedUnitId
+      [elabPkg] -> do
+        info verbosity $ "Selecting "
+                       ++ display selectedUnitId
+                       ++ " to supply " ++ exeName
+        return elabPkg
+      elabPkgs -> die' verbosity
+        $ "Multiple matching executables found matching "
+        ++ exeName
+        ++ ":\n"
+        ++ unlines (fmap (\p -> " - in package " ++ display (elabUnitId p)) elabPkgs)
+    let exePath = binDirectoryFor (distDirLayout baseCtx)
+                                  (elaboratedShared buildCtx)
+                                  pkg
+                                  exeName
+               </> exeName
+    let args = drop 1 targetStrings
+    runProgramInvocation
+      verbosity
+      emptyProgramInvocation {
+        progInvokePath  = exePath,
+        progInvokeArgs  = args,
+        progInvokeEnv   = dataDirsEnvironmentForPlan elaboratedPlan
+      }
   where
     verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
     cliConfig = commandLineFlagsToProjectConfig
                   globalFlags configFlags configExFlags
                   installFlags haddockFlags
+
+singleExeOrElse :: IO (UnitId, UnqualComponentName) -> TargetsMap -> IO (UnitId, UnqualComponentName)
+singleExeOrElse action targetsMap =
+  case Set.toList . distinctTargetComponents $ targetsMap
+  of [(unitId, CExeName component)] -> return (unitId, component)
+     [(unitId, CTestName component)] -> return (unitId, component)
+     [(unitId, CBenchName component)] -> return (unitId, component)
+     _   -> action
+
+-- | Filter the 'ElaboratedInstallPlan' keeping only the
+-- 'ElaboratedConfiguredPackage's that match the specified
+-- 'UnitId'.
+matchingPackagesByUnitId :: UnitId
+                         -> ElaboratedInstallPlan
+                         -> [ElaboratedConfiguredPackage]
+matchingPackagesByUnitId uid =
+          catMaybes
+          . fmap (foldPlanPackage
+                    (const Nothing)
+                    (\x -> if elabUnitId x == uid
+                           then Just x
+                           else Nothing))
+          . toList
 
 -- | This defines what a 'TargetSelector' means for the @run@ command.
 -- It selects the 'AvailableTarget's that the 'TargetSelector' refers to,
@@ -143,7 +248,7 @@ runAction (applyFlagDefaults -> (configFlags, configExFlags, installFlags, haddo
 -- For the @run@ command we select the exe if there is only one and it's
 -- buildable. Fail if there are no or multiple buildable exe components.
 --
-selectPackageTargets :: TargetSelector PackageId
+selectPackageTargets :: TargetSelector
                      -> [AvailableTarget k] -> Either TargetProblem [k]
 selectPackageTargets targetSelector targets
 
@@ -167,33 +272,40 @@ selectPackageTargets targetSelector targets
   | otherwise
   = Left (TargetProblemNoTargets targetSelector)
   where
+    -- Targets that can be executed
+    targetsExecutableLike =
+      concatMap (\kind -> filterTargetsKind kind targets)
+                [ExeKind, TestKind, BenchKind]
     (targetsExesBuildable,
-     targetsExesBuildable') = selectBuildableTargets'
-                            . filterTargetsKind ExeKind
-                            $ targets
+     targetsExesBuildable') = selectBuildableTargets' targetsExecutableLike
 
-    targetsExes             = forgetTargetsDetail
-                            . filterTargetsKind ExeKind
-                            $ targets
+    targetsExes             = forgetTargetsDetail targetsExecutableLike
 
 
 -- | For a 'TargetComponent' 'TargetSelector', check if the component can be
 -- selected.
 --
--- For the @run@ command we just need to check it is a executable, in addition
+-- For the @run@ command we just need to check it is a executable-like
+-- (an executable, a test, or a benchmark), in addition
 -- to the basic checks on being buildable etc.
 --
-selectComponentTarget :: PackageId -> ComponentName -> SubComponentTarget
+selectComponentTarget :: SubComponentTarget
                       -> AvailableTarget k -> Either TargetProblem  k
-selectComponentTarget pkgid cname subtarget@WholeComponent t
-  | CExeName _ <- availableTargetComponentName t
-  = either (Left . TargetProblemCommon) return $
-           selectComponentTargetBasic pkgid cname subtarget t
-  | otherwise
-  = Left (TargetProblemComponentNotExe pkgid cname)
+selectComponentTarget subtarget@WholeComponent t
+  = case availableTargetComponentName t
+    of CExeName _ -> component
+       CTestName _ -> component
+       CBenchName _ -> component
+       _ -> Left (TargetProblemComponentNotExe pkgid cname)
+    where pkgid = availableTargetPackageId t
+          cname = availableTargetComponentName t
+          component = either (Left . TargetProblemCommon) return $
+                        selectComponentTargetBasic subtarget t
 
-selectComponentTarget pkgid cname subtarget _
-  = Left (TargetProblemIsSubComponent pkgid cname subtarget)
+selectComponentTarget subtarget t
+  = Left (TargetProblemIsSubComponent (availableTargetPackageId t)
+                                      (availableTargetComponentName t)
+                                       subtarget)
 
 -- | The various error conditions that can occur when matching a
 -- 'TargetSelector' against 'AvailableTarget's for the @run@ command.
@@ -201,16 +313,16 @@ selectComponentTarget pkgid cname subtarget _
 data TargetProblem =
      TargetProblemCommon       TargetProblemCommon
      -- | The 'TargetSelector' matches targets but none are buildable
-   | TargetProblemNoneEnabled (TargetSelector PackageId) [AvailableTarget ()]
+   | TargetProblemNoneEnabled TargetSelector [AvailableTarget ()]
 
      -- | There are no targets at all
-   | TargetProblemNoTargets   (TargetSelector PackageId)
+   | TargetProblemNoTargets   TargetSelector
 
      -- | The 'TargetSelector' matches targets but no executables
-   | TargetProblemNoExes      (TargetSelector PackageId)
+   | TargetProblemNoExes      TargetSelector
 
      -- | A single 'TargetSelector' matches multiple targets
-   | TargetProblemMatchesMultiple (TargetSelector PackageId) [AvailableTarget ()]
+   | TargetProblemMatchesMultiple TargetSelector [AvailableTarget ()]
 
      -- | Multiple 'TargetSelector's match multiple targets
    | TargetProblemMultipleTargets TargetsMap
@@ -248,21 +360,17 @@ renderTargetProblem (TargetProblemNoTargets targetSelector) =
            ++ renderTargetSelector targetSelector ++ "."
 
       _ -> renderTargetProblemNoTargets "run" targetSelector
-  where
-    targetSelectorFilter (TargetPackage  _ _ mkfilter) = mkfilter
-    targetSelectorFilter (TargetAllPackages  mkfilter) = mkfilter
-    targetSelectorFilter (TargetComponent _ _ _)       = Nothing
-
 
 renderTargetProblem (TargetProblemMatchesMultiple targetSelector targets) =
     "The run command is for running a single executable at once. The target '"
  ++ showTargetSelector targetSelector ++ "' refers to "
- ++ renderTargetSelector targetSelector ++ " which includes the executables "
- ++ renderListCommaAnd
-      [ display name
-      | cname@CExeName{} <- map availableTargetComponentName targets
-      , let Just name = componentNameString cname
-      ]
+ ++ renderTargetSelector targetSelector ++ " which includes "
+ ++ renderListCommaAnd ( ("the "++) <$>
+                         showComponentName <$>
+                         availableTargetComponentName <$>
+                         foldMap
+                           (\kind -> filterTargetsKind kind targets)
+                           [ExeKind, TestKind, BenchKind] )
  ++ "."
 
 renderTargetProblem (TargetProblemMultipleTargets selectorMap) =
@@ -286,4 +394,3 @@ renderTargetProblem (TargetProblemIsSubComponent pkgid cname subtarget) =
  ++ renderTargetSelector targetSelector ++ "."
   where
     targetSelector = TargetComponent pkgid cname subtarget
-

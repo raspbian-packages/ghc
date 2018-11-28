@@ -4,15 +4,11 @@
      /><title
     >DeprecatedReExport</title
     ><link href="#" rel="stylesheet" type="text/css" title="Ocean"
-     /><script src="haddock-util.js" type="text/javascript"
+     /><link rel="stylesheet" type="text/css" href="#"
+     /><script src="haddock-bundle.min.js" async="async" type="text/javascript"
     ></script
     ><script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.0/MathJax.js?config=TeX-AMS-MML_HTMLorMML" type="text/javascript"
     ></script
-    ><script type="text/javascript"
-    >//
-window.onload = function () {pageLoad();};
-//
-</script
     ></head
   ><body
   ><div id="package-header"
@@ -69,25 +65,29 @@ window.onload = function () {pageLoad();};
 	  ></div
 	></div
       ><div id="synopsis"
-      ><p id="control.syn" class="caption expander" onclick="toggleSection('syn')"
-	>Synopsis</p
-	><ul id="section.syn" class="hide" onclick="toggleSection('syn')"
-	><li class="src short"
-	  ><a href="#"
-	    >foo</a
-	    > :: <a href="#"
-	    >Int</a
-	    ></li
-	  ></ul
+      ><details id="syn"
+	><summary
+	  >Synopsis</summary
+	  ><ul class="details-toggle" data-details-id="syn"
+	  ><li class="src short"
+	    ><a href="#"
+	      >foo</a
+	      > :: <a href="#" title="Data.Int"
+	      >Int</a
+	      ></li
+	    ></ul
+	  ></details
 	></div
       ><div id="interface"
-      ><h1 id="g:1"
-	>Re-exported from an other module</h1
+      ><a href="#" id="g:1"
+	><h1
+	  >Re-exported from an other module</h1
+	  ></a
 	><div class="top"
 	><p class="src"
 	  ><a id="v:foo" class="def"
 	    >foo</a
-	    > :: <a href="#"
+	    > :: <a href="#" title="Data.Int"
 	    >Int</a
 	    > <a href="#" class="selflink"
 	    >#</a
@@ -96,7 +96,7 @@ window.onload = function () {pageLoad();};
 	  ><div class="warning"
 	    ><p
 	      >Deprecated: use <code
-		><a href="#"
+		><a href="#" title="DeprecatedFunction"
 		  >bar</a
 		  ></code
 		> instead</p
@@ -105,8 +105,10 @@ window.onload = function () {pageLoad();};
 	    >some documentation for foo</p
 	    ></div
 	  ></div
-	><h1 id="g:2"
-	>Re-exported from an other package</h1
+	><a href="#" id="g:2"
+	><h1
+	  >Re-exported from an other package</h1
+	  ></a
 	><div class="doc"
 	><p
 	  >Not yet working, see <a href="#"

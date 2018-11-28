@@ -27,7 +27,7 @@ import Distribution.Simple.Program.Db
 import Distribution.Simple.Program
 import Distribution.System (OS(Windows,Linux,OSX), buildOS)
 import Distribution.Simple.Utils
-    ( withFileContents )
+    ( withFileContents, tryFindPackageDesc )
 import Distribution.Simple.Configure
     ( getPersistBuildConfig )
 import Distribution.Version
@@ -35,9 +35,8 @@ import Distribution.Package
 import Distribution.Types.UnqualComponentName
 import Distribution.Types.LocalBuildInfo
 import Distribution.PackageDescription
-import Distribution.PackageDescription.Parse
+import Distribution.PackageDescription.Parsec
 
-import Distribution.Simple.Utils (tryFindPackageDesc)
 import Distribution.Compat.Stack
 
 import Text.Regex.TDFA
@@ -152,7 +151,7 @@ setup' cmd args = do
         else do
             pdfile <- liftIO $ tryFindPackageDesc (testCurrentDir env)
             pdesc <- liftIO $ readGenericPackageDescription (testVerbosity env) pdfile
-            if buildType (packageDescription pdesc) == Just Simple
+            if buildType (packageDescription pdesc) == Simple
                 then runM (testSetupPath env) full_args
                 -- Run the Custom script!
                 else do
@@ -603,6 +602,14 @@ getMarkedOutput out = unlines (go (lines out) False)
 assertFailure :: WithCallStack (String -> m ())
 assertFailure msg = withFrozenCallStack $ error msg
 
+assertExitCode :: MonadIO m => WithCallStack (ExitCode -> Result -> m ())
+assertExitCode code result =
+  when (code /= resultExitCode result) $
+    assertFailure $ "Expected exit code: "
+                 ++ show code
+                 ++ "\nActual: "
+                 ++ show (resultExitCode result)
+
 assertEqual :: (Eq a, Show a, MonadIO m) => WithCallStack (String -> a -> a -> m ())
 assertEqual s x y =
     withFrozenCallStack $
@@ -618,7 +625,7 @@ assertNotEqual s x y =
 assertBool :: MonadIO m => WithCallStack (String -> Bool -> m ())
 assertBool s x =
     withFrozenCallStack $
-      when (not x) $ error s
+      unless x $ error s
 
 shouldExist :: MonadIO m => WithCallStack (FilePath -> m ())
 shouldExist path =
@@ -832,7 +839,7 @@ withSourceCopy m = do
         dest = testSourceCopyDir env
     r <- git' "ls-files" ["--cached", "--modified"]
     forM_ (lines (resultOutput r)) $ \f -> do
-        when (not (isTestFile f)) $ do
+        unless (isTestFile f) $ do
             liftIO $ createDirectoryIfMissing True (takeDirectory (dest </> f))
             liftIO $ copyFile (cwd </> f) (dest </> f)
     withReaderT (\nenv -> nenv { testHaveSourceCopy = True }) m
@@ -843,8 +850,10 @@ getIPID pn = do
     r <- ghcPkg' "field" ["--global", pn, "id"]
     -- Don't choke on warnings from ghc-pkg
     case mapMaybe (stripPrefix "id: ") (lines (resultOutput r)) of
-        [x] -> return (takeWhile (not . Char.isSpace) x)
-        _ -> error $ "could not determine id of " ++ pn
+        -- ~/.cabal/store may contain multiple versions of single package
+        -- we pick first one. It should work
+        (x:_) -> return (takeWhile (not . Char.isSpace) x)
+        _     -> error $ "could not determine id of " ++ pn
 
 -- | Delay a sufficient period of time to permit file timestamp
 -- to be updated.
@@ -908,7 +917,7 @@ copySourceFileTo src dest = do
 requireHasSourceCopy :: TestM ()
 requireHasSourceCopy = do
     env <- getTestEnv
-    when (not (testHaveSourceCopy env)) $ do
+    unless (testHaveSourceCopy env) $ do
         error "This operation requires a source copy; use withSourceCopy and 'git add' all test files"
 
 -- NB: Keep this synchronized with partitionTests

@@ -118,7 +118,7 @@ configureToolchain :: ConfiguredProgram -> ProgramDb
                                         -> ProgramDb
 configureToolchain lhcProg =
     addKnownProgram gccProgram {
-      programFindLocation = findProg gccProgram (baseDir </> "gcc.exe"),
+      programFindLocation = findProg gccProgram (base_dir </> "gcc.exe"),
       programPostConf     = configureGcc
     }
   . addKnownProgram ldProgram {
@@ -127,9 +127,9 @@ configureToolchain lhcProg =
     }
   where
     compilerDir = takeDirectory (programPath lhcProg)
-    baseDir     = takeDirectory compilerDir
-    gccLibDir      = baseDir </> "gcc-lib"
-    includeDir  = baseDir </> "include" </> "mingw"
+    base_dir    = takeDirectory compilerDir
+    gccLibDir   = base_dir </> "gcc-lib"
+    includeDir  = base_dir </> "include" </> "mingw"
     isWindows   = case buildOS of Windows -> True; _ -> False
 
     -- on Windows finding and configuring ghc's gcc and ld is a bit special
@@ -183,7 +183,7 @@ getLanguages :: Verbosity -> ConfiguredProgram -> NoCallStackIO [(Language, Flag
 getLanguages _ _ = return [(Haskell98, "")]
 --FIXME: does lhc support -XHaskell98 flag? from what version?
 
-getExtensions :: Verbosity -> ConfiguredProgram -> IO [(Extension, Flag)]
+getExtensions :: Verbosity -> ConfiguredProgram -> IO [(Extension, Maybe Flag)]
 getExtensions verbosity lhcProg = do
     exts <- rawSystemStdout verbosity (programPath lhcProg)
               ["--supported-languages"]
@@ -194,7 +194,7 @@ getExtensions verbosity lhcProg = do
           case ext of
             UnknownExtension _ -> simpleParse str
             _                  -> return ext
-    return $ [ (ext, "-X" ++ display ext)
+    return $ [ (ext, Just $ "-X" ++ display ext)
              | Just ext <- map readExtension (lines exts) ]
 
 getInstalledPackages :: Verbosity -> PackageDBStack -> ProgramDb
@@ -306,7 +306,7 @@ buildLib verbosity pkg_descr lbi lib clbi = do
              (compiler lbi) (withProfLib lbi) (libBuildInfo lib)
 
   let libTargetDir = pref
-      forceVanillaLib = EnableExtension TemplateHaskell `elem` allExtensions libBi
+      forceVanillaLib = usesTemplateHaskellOrQQ libBi
       -- TH always needs vanilla libs, even when building for profiling
 
   createDirectoryIfMissingVerbose verbosity True libTargetDir
@@ -515,7 +515,7 @@ buildExe verbosity _pkg_descr lbi
   -- with profiling. This is because the code that TH needs to
   -- run at compile time needs to be the vanilla ABI so it can
   -- be loaded up and run by the compiler.
-  when (withProfExe lbi && EnableExtension TemplateHaskell `elem` allExtensions exeBi)
+  when (withProfExe lbi && usesTemplateHaskellOrQQ exeBi)
      (runGhcProg $ lhcWrap (binArgs False False))
 
   runGhcProg (binArgs True (withProfExe lbi))

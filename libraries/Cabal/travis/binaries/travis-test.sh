@@ -13,13 +13,19 @@ ln -s $TRAVIS_BUILD_DIR $UPSTREAM_BUILD_DIR
 # Run tests
 (timed Cabal/unit-tests $TEST_OPTIONS) || exit $?
 
-   if [ "x$PARSEC" = "xYES" ]; then
-       # Parser unit tests
-       (cd Cabal && timed ./parser-tests $TEST_OPTIONS) || exit $?
+# Check tests
+(cd Cabal && timed ./check-tests $TEST_OPTIONS) || exit $?
 
-       # Test we can parse Hackage
-       (cd Cabal && timed ./parser-hackage-tests $TEST_OPTIONS) | tail || exit $?
-   fi
+# Parser unit tests
+(cd Cabal && timed ./parser-tests $TEST_OPTIONS) || exit $?
+
+# Test we can parse Hackage
+# Note: no $TEST_OPTIONS as this isn't tasty suite
+
+# fetch 01-index.tar,
+# `hackage-tests parsec` tries to parse all of cabal files in the index.
+cabal update
+(cd Cabal && timed ./hackage-tests parsec) || exit $?
 
 if [ "x$CABAL_LIB_ONLY" = "xYES" ]; then
     exit 0;
@@ -34,7 +40,7 @@ fi
 
 # Run tests
 (timed env CABAL_INSTALL_MONOLITHIC_MODE=UnitTests        cabal-install/cabal $TEST_OPTIONS) || exit $?
-(timed env CABAL_INSTALL_MONOLITHIC_MODE=MemoryUsageTests cabal-install/cabal $TEST_OPTIONS) || exit $?
+(timed env CABAL_INSTALL_MONOLITHIC_MODE=MemoryUsageTests cabal-install/cabal $TEST_OPTIONS +RTS -M4M -K1K -RTS) || exit $?
 
 # These need the cabal-install directory
 (cd cabal-install && timed env CABAL_INSTALL_MONOLITHIC_MODE=SolverQuickCheck  ./cabal $TEST_OPTIONS --quickcheck-tests=1000) || exit $?

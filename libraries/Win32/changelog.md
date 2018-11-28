@@ -1,5 +1,17 @@
 # Changelog for [`Win32` package](http://hackage.haskell.org/package/Win32)
 
+## 2.6.1.0 *November 2017*
+
+* Add `terminateProcessById` (See #91)
+
+## 2.6.0.0 *September 2017*
+
+* Make cabal error out on compilation on non-Windows OSes. (See #80)
+* Update cabal format to 1.10 and set language 
+  default to Haskell2010. (See #81)
+* Use `Maybe` in wrappers for functions with nullable pointer parameters (See #83)
+* Improve cross compilation support. (See #87)
+
 ## 2.5.4.1 *April 2017*
 
 * Fixed GetWindowLong on 32-bit Windows

@@ -3,7 +3,7 @@
 -- access select functions of the 'TcM', principally those to do with
 -- reading parts of the state.
 module TcPluginM (
-#ifdef GHCI
+#if defined(GHCI)
         -- * Basic TcPluginM functionality
         TcPluginM,
         tcPluginIO,
@@ -52,7 +52,9 @@ module TcPluginM (
 #endif
     ) where
 
-#ifdef GHCI
+#if defined(GHCI)
+import GhcPrelude
+
 import qualified TcRnMonad as TcM
 import qualified TcSMonad  as TcS
 import qualified TcEnv     as TcM
@@ -179,8 +181,8 @@ newEvVar :: PredType -> TcPluginM EvVar
 newEvVar = unsafeTcPluginTcM . TcM.newEvVar
 
 -- | Create a fresh coercion hole.
-newCoercionHole :: TcPluginM CoercionHole
-newCoercionHole = unsafeTcPluginTcM $ TcM.newCoercionHole
+newCoercionHole :: PredType -> TcPluginM CoercionHole
+newCoercionHole = unsafeTcPluginTcM . TcM.newCoercionHole
 
 -- | Bind an evidence variable.  This must not be invoked from
 -- 'tcPluginInit' or 'tcPluginStop', or it will panic.
@@ -188,4 +190,7 @@ setEvBind :: EvBind -> TcPluginM ()
 setEvBind ev_bind = do
     tc_evbinds <- getEvBindsTcPluginM
     unsafeTcPluginTcM $ TcM.addTcEvBind tc_evbinds ev_bind
+#else
+-- this dummy import is needed as a consequence of NoImplicitPrelude
+import GhcPrelude ()
 #endif

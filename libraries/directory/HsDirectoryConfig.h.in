@@ -3,6 +3,9 @@
 /* Filename extension of executable files */
 #undef EXE_EXTENSION
 
+/* Define to 1 if you have the `CreateSymbolicLinkW' function. */
+#undef HAVE_CREATESYMBOLICLINKW
+
 /* Define to 1 if you have the <fcntl.h> header file. */
 #undef HAVE_FCNTL_H
 
