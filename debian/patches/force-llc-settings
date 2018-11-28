@@ -1,29 +1,14 @@
 Description: force llc settings to ones that are known to work
 Author: Peter Michael Green <plugwash@p10link.net>
 
----
-The information above should follow the Patch Tagging Guidelines, please
-checkout http://dep.debian.net/deps/dep3/ to learn about the format. Here
-are templates for supplementary fields that you might want to add:
-
-Origin: <vendor|upstream|other>, <url of original patch>
-Bug: <url in upstream bugtracker>
-Bug-Debian: http://bugs.debian.org/<bugnumber>
-Bug-Ubuntu: https://launchpad.net/bugs/<bugnumber>
-Forwarded: <no|not-needed|url proving that it has been forwarded>
-Reviewed-By: <name and email of someone who approved the patch>
-Last-Update: <YYYY-MM-DD>
-
-Index: ghc-8.0.1/compiler/main/SysTools.hs
-===================================================================
---- ghc-8.0.1.orig/compiler/main/SysTools.hs
-+++ ghc-8.0.1/compiler/main/SysTools.hs
-@@ -360,7 +360,7 @@ initSysTools mbMinusB
-                     sPgm_windres = windres_path,
-                     sPgm_libtool = libtool_path,
+--- ghc-8.4.3+dfsg1.orig/compiler/main/SysTools.hs
++++ ghc-8.4.3+dfsg1/compiler/main/SysTools.hs
+@@ -297,7 +297,7 @@ initSysTools mbMinusB
+                     sPgm_ar = ar_path,
+                     sPgm_ranlib = ranlib_path,
                      sPgm_lo  = (lo_prog,[]),
 -                    sPgm_lc  = (lc_prog,[]),
 +                    sPgm_lc  = (lc_prog,[Option "-mcpu=arm1176jzf-s"]),
+                     sPgm_lcc = (lcc_prog,[]),
                      sPgm_i   = iserv_prog,
                      sOpt_L       = [],
-                     sOpt_P       = [],
