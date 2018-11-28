@@ -297,7 +297,7 @@ initSysTools mbMinusB
                     sPgm_ar = ar_path,
                     sPgm_ranlib = ranlib_path,
                     sPgm_lo  = (lo_prog,[]),
-                    sPgm_lc  = (lc_prog,[Option "-mcpu=arm1176jzf-s"]),
+                    sPgm_lc  = (lc_prog,[]),
                     sPgm_lcc = (lcc_prog,[]),
                     sPgm_i   = iserv_prog,
                     sOpt_L       = [],
