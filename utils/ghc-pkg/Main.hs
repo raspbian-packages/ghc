@@ -1824,8 +1824,10 @@ checkPackageConfig pkg verbosity db_stack
   mapM_ (checkDir True  "dynamic-library-dirs") (libraryDynDirs pkg)
   mapM_ (checkDir True  "include-dirs") (includeDirs pkg)
   mapM_ (checkDir True  "framework-dirs") (frameworkDirs pkg)
-  mapM_ (checkFile   True "haddock-interfaces") (haddockInterfaces pkg)
-  mapM_ (checkDirURL True "haddock-html")       (haddockHTMLs pkg)
+  -- In Debian, it is quite normal that the package is installed without the
+  -- documentation. Do not print a warning there.
+  -- mapM_ (checkFile   True "haddock-interfaces") (haddockInterfaces pkg)
+  -- mapM_ (checkDirURL True "haddock-html")       (haddockHTMLs pkg)
   checkDuplicateModules pkg
   checkExposedModules db_stack pkg
   checkOtherModules pkg
