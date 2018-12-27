@@ -1,11 +1,20 @@
-ghc (8.4.3+dfsg1-4+rpi1) buster-staging; urgency=medium
+ghc (8.4.4+dfsg1-1+rpi1) buster-staging; urgency=medium
 
   [changes brought forward from 7.6.3-21+rpi1 by Peter Michael Green <plugwash@raspbian.org> at Sun, 19 Apr 2015 14:00:16 +0000]
   * Change compiler defaults for armv6
   [changed introduced in 7.10.3-2+rpi1 by Peter Michael Green]
   * Add call to dh_autoreconf_clean
 
- -- Peter Michael green <plugwash@raspbian.org>  Wed, 28 Nov 2018 06:00:51 +0000
+ -- Raspbian forward porter <root@raspbian.org>  Thu, 27 Dec 2018 14:28:53 +0000
+
+ghc (8.4.4+dfsg1-1) unstable; urgency=medium
+
+  * New upstream release
+  * Refresh patches to apply cleanly on new upstream
+  * Apply patch to build on GNU/kFreeBSD (Closes: #913140)
+  * Backport upstream patch to allow GHC to build on arm*
+
+ -- Ilias Tsitsimpis <iliastsi@debian.org>  Fri, 30 Nov 2018 12:11:18 +0200
 
 ghc (8.4.3+dfsg1-4) unstable; urgency=medium
 

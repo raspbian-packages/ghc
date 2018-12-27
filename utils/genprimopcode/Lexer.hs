@@ -465,266 +465,6 @@ alex_action_41 =  mkTv (TString . tail . init)
 alex_action_42 =  mkTv TNoBraces 
 alex_action_43 =  mkTv TNoBraces 
 {-# LINE 1 "templates/GenericTemplate.hs" #-}
-{-# LINE 1 "templates/GenericTemplate.hs" #-}
-{-# LINE 1 "<built-in>" #-}
-{-# LINE 1 "<command-line>" #-}
-{-# LINE 10 "<command-line>" #-}
-# 1 "/nix/store/p85kjy91dfvs4in358zyfxlksvibw0zn-glibc-2.26-131-dev/include/stdc-predef.h" 1 3 4
-
-# 17 "/nix/store/p85kjy91dfvs4in358zyfxlksvibw0zn-glibc-2.26-131-dev/include/stdc-predef.h" 3 4
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-{-# LINE 10 "<command-line>" #-}
-{-# LINE 1 "/nix/store/mmhdqindrpvg91a2vnrr76vxcn5a4n0x-ghc-8.2.2/lib/ghc-8.2.2/include/ghcversion.h" #-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-{-# LINE 10 "<command-line>" #-}
-{-# LINE 1 "/tmp/nix-build-alex-3.2.3.drv-0/ghc5439_0/ghc_2.h" #-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-{-# LINE 10 "<command-line>" #-}
-{-# LINE 1 "templates/GenericTemplate.hs" #-}
 -- -----------------------------------------------------------------------------
 -- ALEX TEMPLATE
 --
@@ -734,7 +474,17 @@ alex_action_43 =  mkTv TNoBraces
 -- -----------------------------------------------------------------------------
 -- INTERNALS and main scanner engine
 
-{-# LINE 21 "templates/GenericTemplate.hs" #-}
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -748,7 +498,23 @@ alex_action_43 =  mkTv TNoBraces
 #define GTE(n,m) (n >=# m)
 #define EQ(n,m) (n ==# m)
 #endif
-{-# LINE 51 "templates/GenericTemplate.hs" #-}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 data AlexAddr = AlexA# Addr#
@@ -884,7 +650,18 @@ alex_scan_tkn user__ orig_input len input__ s last_acc =
         check_accs (AlexAccNone) = last_acc
         check_accs (AlexAcc a  ) = AlexLastAcc a input__ (I# (len))
         check_accs (AlexAccSkip) = AlexLastSkip  input__ (I# (len))
-{-# LINE 198 "templates/GenericTemplate.hs" #-}
+
+
+
+
+
+
+
+
+
+
+
+
 
 data AlexLastAcc
   = AlexNone
@@ -895,3 +672,32 @@ data AlexAcc user
   = AlexAccNone
   | AlexAcc Int
   | AlexAccSkip
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
