@@ -1,11 +1,22 @@
-ghc (8.4.4+dfsg1-1+rpi1) buster-staging; urgency=medium
+ghc (8.4.4+dfsg1-2+rpi1) buster-staging; urgency=medium
 
   [changes brought forward from 7.6.3-21+rpi1 by Peter Michael Green <plugwash@raspbian.org> at Sun, 19 Apr 2015 14:00:16 +0000]
   * Change compiler defaults for armv6
   [changed introduced in 7.10.3-2+rpi1 by Peter Michael Green]
   * Add call to dh_autoreconf_clean
 
- -- Raspbian forward porter <root@raspbian.org>  Thu, 27 Dec 2018 14:28:53 +0000
+ -- Raspbian forward porter <root@raspbian.org>  Mon, 11 Mar 2019 15:23:48 +0000
+
+ghc (8.4.4+dfsg1-2) unstable; urgency=medium
+
+  [ Clint Adams ]
+  * Patch Sphinx config to use locally-installed MathJax instead of a
+    copy on the Internet.  closes: #919518.
+
+  [ Gianfranco Costamagna ]
+  * Fix sphinx 1.8 build with upstream patch (Closes: #923445)
+
+ -- Gianfranco Costamagna <locutusofborg@debian.org>  Thu, 28 Feb 2019 15:18:49 +0100
 
 ghc (8.4.4+dfsg1-1) unstable; urgency=medium
 
