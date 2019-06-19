@@ -117,6 +117,7 @@ module GHC (
         showModule,
         moduleIsBootOrNotObjectLinkable,
         getNameToInstancesIndex,
+        getNameToInstancesIndex2,
 
         -- ** Inspecting types and kinds
         exprType, TcRnExprMode(..),
@@ -297,7 +298,8 @@ import HscMain
 import GhcMake
 import DriverPipeline   ( compileOne' )
 import GhcMonad
-import TcRnMonad        ( finalSafeMode, fixSafeInstances )
+import TcRnMonad        ( finalSafeMode, fixSafeInstances, initIfaceTcRn )
+import LoadIface        ( loadSysInterface )
 import TcRnTypes
 import Packages
 import NameSet
@@ -1247,10 +1249,27 @@ getNameToInstancesIndex :: GhcMonad m
   => [Module]  -- ^ visible modules. An orphan instance will be returned if and
                -- only it is visible from at least one module in the list.
   -> m (Messages, Maybe (NameEnv ([ClsInst], [FamInst])))
-getNameToInstancesIndex visible_mods = do
+getNameToInstancesIndex visible_mods =
+  getNameToInstancesIndex2 visible_mods Nothing
+
+-- | Retrieve all type and family instances in the environment, indexed
+-- by 'Name'. Each name's lists will contain every instance in which that name
+-- is mentioned in the instance head.
+getNameToInstancesIndex2 :: GhcMonad m
+  => [Module]        -- ^ visible modules. An orphan instance will be returned
+                     -- if it is visible from at least one module in the list.
+  -> Maybe [Module]  -- ^ modules to load. If this is not specified, we load
+                     -- modules for everything that is in scope unqualified.
+  -> m (Messages, Maybe (NameEnv ([ClsInst], [FamInst])))
+getNameToInstancesIndex2 visible_mods mods_to_load = do
   hsc_env <- getSession
   liftIO $ runTcInteractive hsc_env $
-    do { loadUnqualIfaces hsc_env (hsc_IC hsc_env)
+    do { case mods_to_load of
+           Nothing -> loadUnqualIfaces hsc_env (hsc_IC hsc_env)
+           Just mods ->
+             let doc = text "Need interface for reporting instances in scope"
+             in initIfaceTcRn $ mapM_ (loadSysInterface doc) mods
+
        ; InstEnvs {ie_global, ie_local} <- tcGetInstEnvs
        ; let visible_mods' = mkModuleSet visible_mods
        ; (pkg_fie, home_fie) <- tcGetFamInstEnvs
