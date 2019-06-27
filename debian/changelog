@@ -1,11 +1,17 @@
-ghc (8.4.4+dfsg1-2+rpi1) buster-staging; urgency=medium
+ghc (8.4.4+dfsg1-3+rpi1) buster-staging; urgency=medium
 
   [changes brought forward from 7.6.3-21+rpi1 by Peter Michael Green <plugwash@raspbian.org> at Sun, 19 Apr 2015 14:00:16 +0000]
   * Change compiler defaults for armv6
   [changed introduced in 7.10.3-2+rpi1 by Peter Michael Green]
   * Add call to dh_autoreconf_clean
 
- -- Raspbian forward porter <root@raspbian.org>  Mon, 11 Mar 2019 15:23:48 +0000
+ -- Raspbian forward porter <root@raspbian.org>  Thu, 27 Jun 2019 10:56:09 +0000
+
+ghc (8.4.4+dfsg1-3) unstable; urgency=medium
+
+  * Use the ARM7TDMI core on armel (Closes: #915333)
+
+ -- Ilias Tsitsimpis <iliastsi@debian.org>  Thu, 20 Jun 2019 00:08:21 +0300
 
 ghc (8.4.4+dfsg1-2) unstable; urgency=medium
 
