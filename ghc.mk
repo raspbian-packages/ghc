@@ -961,8 +961,12 @@ else # CrossCompiling
 # Install packages in the right order, so that ghc-pkg doesn't complain.
 # Also, install ghc-pkg first.
 ifeq "$(Windows_Host)" "NO"
-INSTALLED_GHC_REAL=$(DESTDIR)$(ghclibexecdir)/bin/ghc
-INSTALLED_GHC_PKG_REAL=$(DESTDIR)$(ghclibexecdir)/bin/ghc-pkg
+# Use the inplace/stage1 versions for installation,
+# since the installed versions are built for the target
+#INSTALLED_GHC_REAL=$(DESTDIR)$(ghclibexecdir)/bin/ghc
+#INSTALLED_GHC_PKG_REAL=$(DESTDIR)$(ghclibexecdir)/bin/ghc-pkg
+INSTALLED_GHC_REAL=$(CURDIR)/inplace/bin/ghc-stage1
+INSTALLED_GHC_PKG_REAL=$(CURDIR)/utils/ghc-pkg/dist/build/tmp/ghc-pkg
 else
 INSTALLED_GHC_REAL=$(DESTDIR)$(bindir)/ghc.exe
 INSTALLED_GHC_PKG_REAL=$(DESTDIR)$(bindir)/ghc-pkg.exe
