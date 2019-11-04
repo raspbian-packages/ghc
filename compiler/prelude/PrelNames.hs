@@ -83,7 +83,6 @@ This is accomplished through a combination of mechanisms:
 
 Note [Infinite families of known-key names]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 Infinite families of known-key things (e.g. tuples and sums) pose a tricky
 problem: we can't add them to the knownKeyNames finite map which we use to
 ensure that, e.g., a reference to (,) gets assigned the right unique (if this
@@ -185,7 +184,7 @@ names with uniques.  These ones are the *non* wired-in ones.  The
 wired in ones are defined in TysWiredIn etc.
 -}
 
-basicKnownKeyNames :: [Name]
+basicKnownKeyNames :: [Name]  -- See Note [Known-key names]
 basicKnownKeyNames
  = genericTyConNames
  ++ [   --  Classes.  *Must* include:
@@ -217,6 +216,7 @@ basicKnownKeyNames
         -- See Note [TyConRepNames for non-wired-in TyCons]
         ioTyConName, ioDataConName,
         runMainIOName,
+        runRWName,
 
         -- Type representation types
         trModuleTyConName, trModuleDataConName,
@@ -335,6 +335,7 @@ basicKnownKeyNames
         breakpointAutoName,  opaqueTyConName,
         assertErrorName, traceName,
         printName, fstName, sndName,
+        dollarName,
 
         -- Integer
         integerTyConName, mkIntegerName,
@@ -357,7 +358,9 @@ basicKnownKeyNames
 
         -- Natural
         naturalTyConName,
-        naturalFromIntegerName,
+        naturalFromIntegerName, naturalToIntegerName,
+        plusNaturalName, minusNaturalName, timesNaturalName, mkNaturalName,
+        wordToNaturalName,
 
         -- Float/Double
         rationalToFloatName,
@@ -434,7 +437,7 @@ basicKnownKeyNames
         , eqTyConName
 
     ] ++ case cIntegerLibraryType of
-           IntegerGMP    -> [integerSDataConName]
+           IntegerGMP    -> [integerSDataConName,naturalSDataConName]
            IntegerSimple -> []
 
 genericTyConNames :: [Name]
@@ -472,8 +475,8 @@ pRELUDE         = mkBaseModule_ pRELUDE_NAME
 
 gHC_PRIM, gHC_TYPES, gHC_GENERICS, gHC_MAGIC,
     gHC_CLASSES, gHC_BASE, gHC_ENUM, gHC_GHCI, gHC_CSTRING,
-    gHC_SHOW, gHC_READ, gHC_NUM, gHC_INTEGER_TYPE, gHC_NATURAL, gHC_LIST,
-    gHC_TUPLE, dATA_TUPLE, dATA_EITHER, dATA_STRING,
+    gHC_SHOW, gHC_READ, gHC_NUM, gHC_MAYBE, gHC_INTEGER_TYPE, gHC_NATURAL,
+    gHC_LIST, gHC_TUPLE, dATA_TUPLE, dATA_EITHER, dATA_STRING,
     dATA_FOLDABLE, dATA_TRAVERSABLE,
     gHC_CONC, gHC_IO, gHC_IO_Exception,
     gHC_ST, gHC_ARR, gHC_STABLE, gHC_PTR, gHC_ERR, gHC_REAL,
@@ -496,6 +499,7 @@ gHC_GHCI        = mkBaseModule (fsLit "GHC.GHCi")
 gHC_SHOW        = mkBaseModule (fsLit "GHC.Show")
 gHC_READ        = mkBaseModule (fsLit "GHC.Read")
 gHC_NUM         = mkBaseModule (fsLit "GHC.Num")
+gHC_MAYBE       = mkBaseModule (fsLit "GHC.Maybe")
 gHC_INTEGER_TYPE= mkIntegerModule (fsLit "GHC.Integer.Type")
 gHC_NATURAL     = mkBaseModule (fsLit "GHC.Natural")
 gHC_LIST        = mkBaseModule (fsLit "GHC.List")
@@ -541,9 +545,6 @@ gHC_TYPENATS    = mkBaseModule (fsLit "GHC.TypeNats")
 dATA_TYPE_EQUALITY = mkBaseModule (fsLit "Data.Type.Equality")
 dATA_COERCE     = mkBaseModule (fsLit "Data.Coerce")
 dEBUG_TRACE     = mkBaseModule (fsLit "Debug.Trace")
-
-gHC_PARR' :: Module
-gHC_PARR' = mkBaseModule (fsLit "GHC.PArr")
 
 gHC_SRCLOC :: Module
 gHC_SRCLOC = mkBaseModule (fsLit "GHC.SrcLoc")
@@ -884,8 +885,9 @@ and it's convenient to write them all down in one place.
 wildCardName :: Name
 wildCardName = mkSystemVarName wildCardKey (fsLit "wild")
 
-runMainIOName :: Name
+runMainIOName, runRWName :: Name
 runMainIOName = varQual gHC_TOP_HANDLER (fsLit "runMainIO") runMainKey
+runRWName     = varQual gHC_MAGIC       (fsLit "runRW#")    runRWKey
 
 orderingTyConName, ltDataConName, eqDataConName, gtDataConName :: Name
 orderingTyConName = tcQual  gHC_TYPES (fsLit "Ordering") orderingTyConKey
@@ -1058,8 +1060,8 @@ groupWithName = varQual gHC_EXTS (fsLit "groupWith") groupWithIdKey
 fromStringName, otherwiseIdName, foldrName, buildName, augmentName,
     mapName, appendName, assertName,
     breakpointName, breakpointCondName, breakpointAutoName,
-    opaqueTyConName :: Name
-fromStringName = varQual dATA_STRING (fsLit "fromString") fromStringClassOpKey
+    opaqueTyConName, dollarName :: Name
+dollarName        = varQual gHC_BASE (fsLit "$")          dollarIdKey
 otherwiseIdName   = varQual gHC_BASE (fsLit "otherwise")  otherwiseIdKey
 foldrName         = varQual gHC_BASE (fsLit "foldr")      foldrIdKey
 buildName         = varQual gHC_BASE (fsLit "build")      buildIdKey
@@ -1071,6 +1073,7 @@ breakpointName    = varQual gHC_BASE (fsLit "breakpoint") breakpointIdKey
 breakpointCondName= varQual gHC_BASE (fsLit "breakpointCond") breakpointCondIdKey
 breakpointAutoName= varQual gHC_BASE (fsLit "breakpointAuto") breakpointAutoIdKey
 opaqueTyConName   = tcQual  gHC_BASE (fsLit "Opaque")     opaqueTyConKey
+fromStringName = varQual dATA_STRING (fsLit "fromString") fromStringClassOpKey
 
 breakpointJumpName :: Name
 breakpointJumpName
@@ -1121,7 +1124,7 @@ integerTyConName, mkIntegerName, integerSDataConName,
     andIntegerName, orIntegerName, xorIntegerName, complementIntegerName,
     shiftLIntegerName, shiftRIntegerName, bitIntegerName :: Name
 integerTyConName      = tcQual  gHC_INTEGER_TYPE (fsLit "Integer")           integerTyConKey
-integerSDataConName   = dcQual gHC_INTEGER_TYPE (fsLit n)                   integerSDataConKey
+integerSDataConName   = dcQual gHC_INTEGER_TYPE (fsLit n)                    integerSDataConKey
   where n = case cIntegerLibraryType of
             IntegerGMP    -> "S#"
             IntegerSimple -> panic "integerSDataConName evaluated for integer-simple"
@@ -1169,11 +1172,24 @@ shiftRIntegerName     = varQual gHC_INTEGER_TYPE (fsLit "shiftRInteger")     shi
 bitIntegerName        = varQual gHC_INTEGER_TYPE (fsLit "bitInteger")        bitIntegerIdKey
 
 -- GHC.Natural types
-naturalTyConName :: Name
+naturalTyConName, naturalSDataConName :: Name
 naturalTyConName     = tcQual gHC_NATURAL (fsLit "Natural") naturalTyConKey
+naturalSDataConName  = dcQual gHC_NATURAL (fsLit n)         naturalSDataConKey
+  where n = case cIntegerLibraryType of
+            IntegerGMP    -> "NatS#"
+            IntegerSimple -> panic "naturalSDataConName evaluated for integer-simple"
 
 naturalFromIntegerName :: Name
 naturalFromIntegerName = varQual gHC_NATURAL (fsLit "naturalFromInteger") naturalFromIntegerIdKey
+
+naturalToIntegerName, plusNaturalName, minusNaturalName, timesNaturalName,
+   mkNaturalName, wordToNaturalName :: Name
+naturalToIntegerName  = varQual gHC_NATURAL (fsLit "naturalToInteger")  naturalToIntegerIdKey
+plusNaturalName       = varQual gHC_NATURAL (fsLit "plusNatural")       plusNaturalIdKey
+minusNaturalName      = varQual gHC_NATURAL (fsLit "minusNatural")      minusNaturalIdKey
+timesNaturalName      = varQual gHC_NATURAL (fsLit "timesNatural")      timesNaturalIdKey
+mkNaturalName         = varQual gHC_NATURAL (fsLit "mkNatural")         mkNaturalIdKey
+wordToNaturalName     = varQual gHC_NATURAL (fsLit "wordToNatural#")    wordToNaturalIdKey
 
 -- GHC.Real types and classes
 rationalTyConName, ratioTyConName, ratioDataConName, realClassName,
@@ -1741,10 +1757,6 @@ funPtrTyConKey                          = mkPreludeTyConUnique 76
 tVarPrimTyConKey                        = mkPreludeTyConUnique 77
 compactPrimTyConKey                     = mkPreludeTyConUnique 78
 
--- Parallel array type constructor
-parrTyConKey :: Unique
-parrTyConKey                            = mkPreludeTyConUnique 82
-
 -- dotnet interop
 objectTyConKey :: Unique
 objectTyConKey                          = mkPreludeTyConUnique 83
@@ -1754,14 +1766,11 @@ eitherTyConKey                          = mkPreludeTyConUnique 84
 
 -- Kind constructors
 liftedTypeKindTyConKey, tYPETyConKey,
-  constraintKindTyConKey,
-  starKindTyConKey, unicodeStarKindTyConKey, runtimeRepTyConKey,
+  constraintKindTyConKey, runtimeRepTyConKey,
   vecCountTyConKey, vecElemTyConKey :: Unique
 liftedTypeKindTyConKey                  = mkPreludeTyConUnique 87
 tYPETyConKey                            = mkPreludeTyConUnique 88
 constraintKindTyConKey                  = mkPreludeTyConUnique 92
-starKindTyConKey                        = mkPreludeTyConUnique 93
-unicodeStarKindTyConKey                 = mkPreludeTyConUnique 94
 runtimeRepTyConKey                      = mkPreludeTyConUnique 95
 vecCountTyConKey                        = mkPreludeTyConUnique 96
 vecElemTyConKey                         = mkPreludeTyConUnique 97
@@ -1935,10 +1944,6 @@ inlDataConKey                           = mkPreludeDataConUnique 21
 inrDataConKey                           = mkPreludeDataConUnique 22
 genUnitDataConKey                       = mkPreludeDataConUnique 23
 
--- Data constructor for parallel arrays
-parrDataConKey :: Unique
-parrDataConKey                          = mkPreludeDataConUnique 24
-
 leftDataConKey, rightDataConKey :: Unique
 leftDataConKey                          = mkPreludeDataConUnique 25
 rightDataConKey                         = mkPreludeDataConUnique 26
@@ -2019,11 +2024,15 @@ tupleRepDataConKey                      = mkPreludeDataConUnique 72
 sumRepDataConKey                        = mkPreludeDataConUnique 73
 
 -- See Note [Wiring in RuntimeRep] in TysWiredIn
-runtimeRepSimpleDataConKeys :: [Unique]
+runtimeRepSimpleDataConKeys, unliftedSimpleRepDataConKeys, unliftedRepDataConKeys :: [Unique]
 liftedRepDataConKey :: Unique
-runtimeRepSimpleDataConKeys@(
-  liftedRepDataConKey : _)
+runtimeRepSimpleDataConKeys@(liftedRepDataConKey : unliftedSimpleRepDataConKeys)
   = map mkPreludeDataConUnique [74..82]
+
+unliftedRepDataConKeys = vecRepDataConKey :
+                         tupleRepDataConKey :
+                         sumRepDataConKey :
+                         unliftedSimpleRepDataConKeys
 
 -- See Note [Wiring in RuntimeRep] in TysWiredIn
 -- VecCount
@@ -2068,7 +2077,7 @@ typeLitNatDataConKey      = mkPreludeDataConUnique 108
 
 wildCardKey, absentErrorIdKey, augmentIdKey, appendIdKey,
     buildIdKey, errorIdKey, foldrIdKey, recSelErrorIdKey,
-    seqIdKey, irrefutPatErrorIdKey, eqStringIdKey,
+    seqIdKey, eqStringIdKey,
     noMethodBindingErrorIdKey, nonExhaustiveGuardsErrorIdKey,
     runtimeErrorIdKey, patErrorIdKey, voidPrimIdKey,
     realWorldPrimIdKey, recConErrorIdKey,
@@ -2086,7 +2095,6 @@ errorIdKey                    = mkPreludeMiscIdUnique  5
 foldrIdKey                    = mkPreludeMiscIdUnique  6
 recSelErrorIdKey              = mkPreludeMiscIdUnique  7
 seqIdKey                      = mkPreludeMiscIdUnique  8
-irrefutPatErrorIdKey          = mkPreludeMiscIdUnique  9
 eqStringIdKey                 = mkPreludeMiscIdUnique 10
 noMethodBindingErrorIdKey     = mkPreludeMiscIdUnique 11
 nonExhaustiveGuardsErrorIdKey = mkPreludeMiscIdUnique 12
@@ -2102,7 +2110,7 @@ voidPrimIdKey                 = mkPreludeMiscIdUnique 21
 typeErrorIdKey                = mkPreludeMiscIdUnique 22
 divIntIdKey                   = mkPreludeMiscIdUnique 23
 modIntIdKey                   = mkPreludeMiscIdUnique 24
-absentSumFieldErrorIdKey      = mkPreludeMiscIdUnique 25
+absentSumFieldErrorIdKey      = mkPreludeMiscIdUnique 9
 
 unsafeCoerceIdKey, concatIdKey, filterIdKey, zipIdKey, bindIOIdKey,
     returnIOIdKey, newStablePtrIdKey,
@@ -2396,8 +2404,17 @@ makeStaticKey :: Unique
 makeStaticKey = mkPreludeMiscIdUnique 561
 
 -- Natural
-naturalFromIntegerIdKey :: Unique
+naturalFromIntegerIdKey, naturalToIntegerIdKey, plusNaturalIdKey,
+   minusNaturalIdKey, timesNaturalIdKey, mkNaturalIdKey,
+   naturalSDataConKey, wordToNaturalIdKey :: Unique
 naturalFromIntegerIdKey = mkPreludeMiscIdUnique 562
+naturalToIntegerIdKey   = mkPreludeMiscIdUnique 563
+plusNaturalIdKey        = mkPreludeMiscIdUnique 564
+minusNaturalIdKey       = mkPreludeMiscIdUnique 565
+timesNaturalIdKey       = mkPreludeMiscIdUnique 566
+mkNaturalIdKey          = mkPreludeMiscIdUnique 567
+naturalSDataConKey      = mkPreludeMiscIdUnique 568
+wordToNaturalIdKey      = mkPreludeMiscIdUnique 569
 
 {-
 ************************************************************************
@@ -2476,5 +2493,5 @@ The following names should be considered by GHCi to be in scope always.
 pretendNameIsInScope :: Name -> Bool
 pretendNameIsInScope n
   = any (n `hasKey`)
-    [ starKindTyConKey, liftedTypeKindTyConKey, tYPETyConKey
+    [ liftedTypeKindTyConKey, tYPETyConKey
     , runtimeRepTyConKey, liftedRepDataConKey ]

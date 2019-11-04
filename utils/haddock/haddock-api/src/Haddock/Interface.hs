@@ -84,6 +84,7 @@ processModules
 processModules verbosity modules flags extIfaces = do
 #if defined(mingw32_HOST_OS)
   -- Avoid internal error: <stderr>: hPutChar: invalid argument (invalid character)' non UTF-8 Windows
+  liftIO $ hSetEncoding stdout $ mkLocaleEncoding TransliterateCodingFailure
   liftIO $ hSetEncoding stderr $ mkLocaleEncoding TransliterateCodingFailure
 #endif
 
@@ -180,13 +181,12 @@ processModule verbosity modsum flags modMap instIfaceMap = do
 
   if not $ isBootSummary modsum then do
     out verbosity verbose "Creating interface..."
-    (interface, msg) <- {-# SCC createIterface #-}
+    (interface, msgs) <- {-# SCC createIterface #-}
                         withTiming getDynFlags "createInterface" (const ()) $ do
                           runWriterGhc $ createInterface tm flags modMap instIfaceMap
 
-    -- We need to modify the interactive context's environment so that when
-    -- Haddock later looks for instances, it also looks in the modules it
-    -- encountered while typechecking.
+    -- We need to keep track of which modules were somehow in scope so that when
+    -- Haddock later looks for instances, it also looks in these modules too.
     --
     -- See https://github.com/haskell/haddock/issues/469.
     hsc_env <- getSession
@@ -199,7 +199,7 @@ processModule verbosity modsum flags modMap instIfaceMap = do
                             , isTcOcc (nameOccName name)   -- Types and classes only
                             , unQualOK gre ]               -- In scope unqualified
 
-    liftIO $ mapM_ putStrLn msg
+    liftIO $ mapM_ putStrLn (nub msgs)
     dflags <- getDynFlags
     let (haddockable, haddocked) = ifaceHaddockCoverage interface
         percentage = round (fromIntegral haddocked * 100 / fromIntegral haddockable :: Double) :: Int

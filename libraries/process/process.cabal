@@ -1,5 +1,5 @@
 name:          process
-version:       1.6.3.0
+version:       1.6.5.0
 -- NOTE: Don't forget to update ./changelog.md
 license:       BSD3
 license-file:  LICENSE
@@ -46,8 +46,7 @@ library
         InterruptibleFFI
         RecordWildCards
         Trustworthy
-    if impl(ghc>=7.9)
-        other-extensions: Safe
+        Safe
 
     exposed-modules:
         System.Cmd
@@ -61,7 +60,7 @@ library
         cpp-options: -DWINDOWS
     else
         other-modules: System.Process.Posix
-        build-depends: unix >= 2.5 && < 2.8
+        build-depends: unix >= 2.5 && < 2.9
 
     c-sources:
         cbits/runProcess.c
@@ -74,7 +73,7 @@ library
 
     ghc-options: -Wall
 
-    build-depends: base      >= 4.4 && < 4.12,
+    build-depends: base      >= 4.8.2 && < 4.13,
                    directory >= 1.1 && < 1.4,
                    filepath  >= 1.2 && < 1.5,
                    deepseq   >= 1.1 && < 1.5
@@ -84,7 +83,9 @@ test-suite test
   hs-source-dirs: test
   main-is: main.hs
   type: exitcode-stdio-1.0
-  build-depends: base
+  -- Add otherwise redundant bounds on base since GHC's build system runs
+  -- `cabal check`, which mandates bounds on base.
+  build-depends: base >= 4 && < 5
                , bytestring
                , directory
                , process

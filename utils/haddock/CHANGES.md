@@ -1,4 +1,25 @@
-## Changes in version 2.19.1
+## Changes in version 2.22.0
+
+ * Make `--package-version` optional for `--hoogle` (#899)
+
+ * Support type and data families in the LaTeX backend (#734)
+
+ * Support pattern synonyms in the Hoogle backend (#947)
+
+## Changes in version 2.21.0
+
+ * Overhaul handling of data declarations in XHTML and LaTeX. Adds support for
+   documenting individual arguments of constructors/patterns (#709)
+
+ * Actually list all fixities for `--hoogle` (#871)
+
+ * Fix broken instance source links (#869)
+
+ * Avoiding line breaks due to ling line in the output of `--hoogle` (#868)
+
+ * Capture docs on type family instances (#867)
+
+## Changes in version 2.20.0
 
  * Show where instances are defined (#748)
 
@@ -38,10 +59,16 @@
    This notably fixes rendering of quasiquotes.
 
  * Overhaul Haddock's rendering of kind signatures so that invisible kind
-   parameters are not printed (#681)
+   parameters are not printed (#681) (Fixes #544)
 
  * Recognise `SPDX-License-Identifier` as alias for `License` in module header
    parser (#743)
+
+ * Remove the response file related utilities, and use the ones that
+   come with `base` (Trac #13896)
+
+ * Remove the response file related utilities, and use the ones that
+   come with `base` (Trac #13896)
 
 ## Changes in version 2.18.1
 

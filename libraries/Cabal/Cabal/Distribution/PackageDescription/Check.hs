@@ -48,6 +48,7 @@ import Distribution.Pretty                           (prettyShow)
 import Distribution.Simple.BuildPaths                (autogenPathsModuleName)
 import Distribution.Simple.BuildToolDepends
 import Distribution.Simple.CCompiler
+import Distribution.Simple.Glob
 import Distribution.Simple.Utils                     hiding (findPackageDesc, notice)
 import Distribution.System
 import Distribution.Text
@@ -56,6 +57,7 @@ import Distribution.Types.CondTree
 import Distribution.Types.ExeDependency
 import Distribution.Types.UnqualComponentName
 import Distribution.Utils.Generic                    (isAscii)
+import Distribution.Verbosity
 import Distribution.Version
 import Language.Haskell.Extension
 import System.FilePath
@@ -110,7 +112,7 @@ data PackageCheck =
        -- quite legitimately refuse to publicly distribute packages with these
        -- problems.
      | PackageDistInexcusable { explanation :: String }
-  deriving (Eq)
+  deriving (Eq, Ord)
 
 instance Show PackageCheck where
     show notice = explanation notice
@@ -164,6 +166,7 @@ checkConfiguredPackage pkg =
  ++ checkSourceRepos pkg
  ++ checkGhcOptions pkg
  ++ checkCCOptions pkg
+ ++ checkCxxOptions pkg
  ++ checkCPPOptions pkg
  ++ checkPaths pkg
  ++ checkCabalVersion pkg
@@ -528,7 +531,10 @@ checkFields pkg =
         ++ "for example 'tested-with: GHC==6.10.4, GHC==6.12.3' and not "
         ++ "'tested-with: GHC==6.10.4 && ==6.12.3'."
 
-  , check (not (null depInternalLibraryWithExtraVersion)) $
+  -- Disabled due to #5119: we generate loads of spurious instances of
+  -- this warning. Re-enabling this check should be part of the fix to
+  -- #5119.
+  , check (False && not (null depInternalLibraryWithExtraVersion)) $
       PackageBuildWarning $
            "The package has an extraneous version range for a dependency on an "
         ++ "internal library: "
@@ -959,17 +965,23 @@ checkGhcOptions pkg =
     disable e = Just (DisableExtension e)
 
 checkCCOptions :: PackageDescription -> [PackageCheck]
-checkCCOptions pkg =
+checkCCOptions = checkCLikeOptions "C" "cc-options" ccOptions
+
+checkCxxOptions :: PackageDescription -> [PackageCheck]
+checkCxxOptions = checkCLikeOptions "C++" "cxx-options" cxxOptions
+
+checkCLikeOptions :: String -> String -> (BuildInfo -> [String]) -> PackageDescription -> [PackageCheck]
+checkCLikeOptions label prefix accessor pkg =
   catMaybes [
 
-    checkAlternatives "cc-options" "include-dirs"
-      [ (flag, dir) | flag@('-':'I':dir) <- all_ccOptions ]
+    checkAlternatives prefix "include-dirs"
+      [ (flag, dir) | flag@('-':'I':dir) <- all_cLikeOptions ]
 
-  , checkAlternatives "cc-options" "extra-libraries"
-      [ (flag, lib) | flag@('-':'l':lib) <- all_ccOptions ]
+  , checkAlternatives prefix "extra-libraries"
+      [ (flag, lib) | flag@('-':'l':lib) <- all_cLikeOptions ]
 
-  , checkAlternatives "cc-options" "extra-lib-dirs"
-      [ (flag, dir) | flag@('-':'L':dir) <- all_ccOptions ]
+  , checkAlternatives prefix "extra-lib-dirs"
+      [ (flag, dir) | flag@('-':'L':dir) <- all_cLikeOptions ]
 
   , checkAlternatives "ld-options" "extra-libraries"
       [ (flag, lib) | flag@('-':'l':lib) <- all_ldOptions ]
@@ -979,19 +991,18 @@ checkCCOptions pkg =
 
   , checkCCFlags [ "-O", "-Os", "-O0", "-O1", "-O2", "-O3" ] $
       PackageDistSuspicious $
-           "'cc-options: -O[n]' is generally not needed. When building with "
-        ++ " optimisations Cabal automatically adds '-O2' for C code. "
-        ++ "Setting it yourself interferes with the --disable-optimization "
-        ++ "flag."
+           "'"++prefix++": -O[n]' is generally not needed. When building with "
+        ++ " optimisations Cabal automatically adds '-O2' for "++label++" code. "
+        ++ "Setting it yourself interferes with the --disable-optimization flag."
   ]
 
-  where all_ccOptions = [ opts | bi <- allBuildInfo pkg
-                              , opts <- ccOptions bi ]
+  where all_cLikeOptions = [ opts | bi <- allBuildInfo pkg
+                                  , opts <- accessor bi ]
         all_ldOptions = [ opts | bi <- allBuildInfo pkg
                                , opts <- ldOptions bi ]
 
         checkCCFlags :: [String] -> PackageCheck -> Maybe PackageCheck
-        checkCCFlags flags = check (any (`elem` flags) all_ccOptions)
+        checkCCFlags flags = check (any (`elem` flags) all_cLikeOptions)
 
 checkCPPOptions :: PackageDescription -> [PackageCheck]
 checkCPPOptions pkg =
@@ -1045,6 +1056,24 @@ checkPaths pkg =
   , (GHC, flags) <- options bi
   , path <- flags
   , isInsideDist path ]
+  ++
+  [ PackageDistInexcusable $
+        "In the 'data-files' field: " ++ explainGlobSyntaxError pat err
+  | pat <- dataFiles pkg
+  , Left err <- [parseFileGlob (specVersion pkg) pat]
+  ]
+  ++
+  [ PackageDistInexcusable $
+        "In the 'extra-source-files' field: " ++ explainGlobSyntaxError pat err
+  | pat <- extraSrcFiles pkg
+  , Left err <- [parseFileGlob (specVersion pkg) pat]
+  ]
+  ++
+  [ PackageDistInexcusable $
+        "In the 'extra-doc-files' field: " ++ explainGlobSyntaxError pat err
+  | pat <- extraDocFiles pkg
+  , Left err <- [parseFileGlob (specVersion pkg) pat]
+  ]
   where
     isOutsideTree path = case splitDirectories path of
       "..":_     -> True
@@ -1056,12 +1085,12 @@ checkPaths pkg =
       _            -> False
     -- paths that must be relative
     relPaths =
-         [ (path, "extra-src-files") | path <- extraSrcFiles pkg ]
-      ++ [ (path, "extra-tmp-files") | path <- extraTmpFiles pkg ]
-      ++ [ (path, "extra-doc-files") | path <- extraDocFiles pkg ]
-      ++ [ (path, "data-files")      | path <- dataFiles     pkg ]
-      ++ [ (path, "data-dir")        | path <- [dataDir      pkg]]
-      ++ [ (path, "license-file")    | path <- licenseFiles  pkg ]
+         [ (path, "extra-source-files") | path <- extraSrcFiles pkg ]
+      ++ [ (path, "extra-tmp-files")    | path <- extraTmpFiles pkg ]
+      ++ [ (path, "extra-doc-files")    | path <- extraDocFiles pkg ]
+      ++ [ (path, "data-files")         | path <- dataFiles     pkg ]
+      ++ [ (path, "data-dir")           | path <- [dataDir      pkg]]
+      ++ [ (path, "license-file")       | path <- licenseFiles  pkg ]
       ++ concat
          [    [ (path, "asm-sources")      | path <- asmSources      bi ]
            ++ [ (path, "cmm-sources")      | path <- cmmSources      bi ]
@@ -1115,12 +1144,14 @@ checkCabalVersion pkg =
         ++ "range syntax rather than a simple version number. Use "
         ++ "'cabal-version: >= " ++ display (specVersion pkg) ++ "'."
 
+    -- check syntax of cabal-version field
   , check (specVersion pkg >= mkVersion [1,12]
            && not simpleSpecVersionSyntax) $
       (if specVersion pkg >= mkVersion [2,0] then PackageDistSuspicious else PackageDistSuspiciousWarn) $
            "Packages relying on Cabal 1.12 or later should specify a "
-        ++ "version range of the form 'cabal-version: x.y'. Use "
-        ++ "'cabal-version: " ++ display (specVersion pkg) ++ "'."
+        ++ "specific version of the Cabal spec of the form "
+        ++ "'cabal-version: x.y'. "
+        ++ "Use 'cabal-version: " ++ display (specVersion pkg) ++ "'."
 
     -- check use of test suite sections
   , checkVersion [1,8] (not (null $ testSuites pkg)) $
@@ -1267,25 +1298,6 @@ checkCabalVersion pkg =
            [ display (Dependency name (eliminateWildcardSyntax versionRange))
            | Dependency name versionRange <- testedWithUsingWildcardSyntax ]
 
-    -- check use of "data-files: data/*.txt" syntax
-  , checkVersion [1,6] (not (null dataFilesUsingGlobSyntax)) $
-      PackageDistInexcusable $
-           "Using wildcards like "
-        ++ commaSep (map quote $ take 3 dataFilesUsingGlobSyntax)
-        ++ " in the 'data-files' field requires 'cabal-version: >= 1.6'. "
-        ++ "Alternatively if you require compatibility with earlier Cabal "
-        ++ "versions then list all the files explicitly."
-
-    -- check use of "extra-source-files: mk/*.in" syntax
-  , checkVersion [1,6] (not (null extraSrcFilesUsingGlobSyntax)) $
-      PackageDistInexcusable $
-           "Using wildcards like "
-        ++ commaSep (map quote $ take 3 extraSrcFilesUsingGlobSyntax)
-        ++ " in the 'extra-source-files' field requires "
-        ++ "'cabal-version: >= 1.6'. Alternatively if you require "
-        ++ "compatibility with earlier Cabal versions then list all the files "
-        ++ "explicitly."
-
     -- check use of "source-repository" section
   , checkVersion [1,6] (not (null (sourceRepos pkg))) $
       PackageDistInexcusable $
@@ -1356,14 +1368,9 @@ checkCabalVersion pkg =
       | otherwise                              = check cond pc
 
     buildInfoField field         = map field (allBuildInfo pkg)
-    dataFilesUsingGlobSyntax     = filter usesGlobSyntax (dataFiles pkg)
-    extraSrcFilesUsingGlobSyntax = filter usesGlobSyntax (extraSrcFiles pkg)
-    usesGlobSyntax str = case parseFileGlob str of
-      Just (FileGlob _ _) -> True
-      _                   -> False
 
     versionRangeExpressions =
-        [ dep | dep@(Dependency _ vr) <- buildDepends pkg
+        [ dep | dep@(Dependency _ vr) <- allBuildDepends pkg
               , usesNewVersionRangeSyntax vr ]
 
     testedWithVersionRangeExpressions =
@@ -1391,10 +1398,10 @@ checkCabalVersion pkg =
         alg (VersionRangeParensF _) = 3
         alg _ = 1 :: Int
 
-    depsUsingWildcardSyntax = [ dep | dep@(Dependency _ vr) <- buildDepends pkg
+    depsUsingWildcardSyntax = [ dep | dep@(Dependency _ vr) <- allBuildDepends pkg
                                     , usesWildcardSyntax vr ]
 
-    depsUsingMajorBoundSyntax = [ dep | dep@(Dependency _ vr) <- buildDepends pkg
+    depsUsingMajorBoundSyntax = [ dep | dep@(Dependency _ vr) <- allBuildDepends pkg
                                       , usesMajorBoundSyntax vr ]
 
     usesBackpackIncludes = any (not . null . mixins) (allBuildInfo pkg)
@@ -1541,7 +1548,7 @@ checkPackageVersions pkg =
           foldr intersectVersionRanges anyVersion baseDeps
         where
           baseDeps =
-            [ vr | Dependency pname vr <- buildDepends pkg'
+            [ vr | Dependency pname vr <- allBuildDepends pkg'
                  , pname == mkPackageName "base" ]
 
       -- Just in case finalizePD fails for any reason,
@@ -1655,7 +1662,7 @@ checkUnicodeXFields gpd
     xfields :: [(String,String)]
     xfields = DList.runDList $ mconcat
         [ toDListOf (L.packageDescription . L.customFieldsPD . traverse) gpd
-        , toDListOf (L.buildInfos         . L.customFieldsBI . traverse) gpd
+        , toDListOf (L.traverseBuildInfos . L.customFieldsBI . traverse) gpd
         ]
 
 -- | cabal-version <2.2 + Paths_module + default-extensions: doesn't build.
@@ -1706,6 +1713,12 @@ checkDevelopmentOnlyFlagsBuildInfo bi =
         ++ "add new warnings. "
         ++ extraExplanation
 
+  , check (has_J) $
+      PackageDistInexcusable $
+           "'ghc-options: -j[N]' can make sense for specific user's setup,"
+        ++ " but it is not appropriate for a distributed package."
+        ++ extraExplanation
+
   , checkFlags ["-fdefer-type-errors"] $
       PackageDistInexcusable $
            "'ghc-options: -fdefer-type-errors' is fine during development but "
@@ -1743,6 +1756,13 @@ checkDevelopmentOnlyFlagsBuildInfo bi =
     has_Werror       = "-Werror" `elem` ghc_options
     has_Wall         = "-Wall"   `elem` ghc_options
     has_W            = "-W"      `elem` ghc_options
+    has_J            = any
+                         (\o -> case o of
+                           "-j"                -> True
+                           ('-' : 'j' : d : _) -> isDigit d
+                           _                   -> False
+                         )
+                         ghc_options
     ghc_options      = hcOptions GHC bi ++ hcProfOptions GHC bi
                        ++ hcSharedOptions GHC bi
 
@@ -1823,8 +1843,14 @@ checkDevelopmentOnlyFlags pkg =
 -- | Sanity check things that requires IO. It looks at the files in the
 -- package and expects to find the package unpacked in at the given file path.
 --
-checkPackageFiles :: PackageDescription -> FilePath -> NoCallStackIO [PackageCheck]
-checkPackageFiles pkg root = checkPackageContent checkFilesIO pkg
+checkPackageFiles :: Verbosity -> PackageDescription -> FilePath -> NoCallStackIO [PackageCheck]
+checkPackageFiles verbosity pkg root = do
+  contentChecks <- checkPackageContent checkFilesIO pkg
+  preDistributionChecks <- checkPackageFilesPreDistribution verbosity pkg root
+  -- Sort because different platforms will provide files from
+  -- `getDirectoryContents` in different orders, and we'd like to be
+  -- stable for test output.
+  return (sort contentChecks ++ sort preDistributionChecks)
   where
     checkFilesIO = CheckPackageContentOps {
       doesFileExist        = System.doesFileExist                  . relative,
@@ -2119,6 +2145,82 @@ checkTarPath path
          "Encountered a file with an empty name, something is very wrong! "
       ++ "Files with an empty name cannot be stored in a tar archive or in "
       ++ "standard file systems."
+
+-- --------------------------------------------------------------
+-- * Checks for missing content and other pre-distribution checks
+-- --------------------------------------------------------------
+
+-- | Similar to 'checkPackageContent', 'checkPackageFilesPreDistribution'
+-- inspects the files included in the package, but is primarily looking for
+-- files in the working tree that may have been missed or other similar
+-- problems that can only be detected pre-distribution.
+--
+-- Because Hackage necessarily checks the uploaded tarball, it is too late to
+-- check these on the server; these checks only make sense in the development
+-- and package-creation environment. Hence we can use IO, rather than needing
+-- to pass a 'CheckPackageContentOps' dictionary around.
+checkPackageFilesPreDistribution :: Verbosity -> PackageDescription -> FilePath -> NoCallStackIO [PackageCheck]
+-- Note: this really shouldn't return any 'Inexcusable' warnings,
+-- because that will make us say that Hackage would reject the package.
+-- But, because Hackage doesn't run these tests, that will be a lie!
+checkPackageFilesPreDistribution = checkGlobFiles
+
+-- | Discover problems with the package's wildcards.
+checkGlobFiles :: Verbosity
+               -> PackageDescription
+               -> FilePath
+               -> NoCallStackIO [PackageCheck]
+checkGlobFiles verbosity pkg root =
+  fmap concat $ for allGlobs $ \(field, dir, glob) ->
+    -- Note: we just skip over parse errors here; they're reported elsewhere.
+    case parseFileGlob (specVersion pkg) glob of
+      Left _ -> return []
+      Right parsedGlob -> do
+        results <- runDirFileGlob verbosity (root </> dir) parsedGlob
+        let individualWarnings = results >>= getWarning field glob
+            noMatchesWarning =
+              [ PackageDistSuspiciousWarn $
+                     "In '" ++ field ++ "': the pattern '" ++ glob ++ "' does not"
+                  ++ " match any files."
+              | all (not . suppressesNoMatchesWarning) results
+              ]
+        return (noMatchesWarning ++ individualWarnings)
+  where
+    adjustedDataDir = if null (dataDir pkg) then "." else dataDir pkg
+    allGlobs = concat
+      [ (,,) "extra-source-files" "." <$> extraSrcFiles pkg
+      , (,,) "extra-doc-files" "." <$> extraDocFiles pkg
+      , (,,) "data-files" adjustedDataDir <$> dataFiles pkg
+      ]
+
+    -- If there's a missing directory in play, since our globs don't
+    -- (currently) support disjunction, that will always mean there are no
+    -- matches. The no matches error in this case is strictly less informative
+    -- than the missing directory error, so sit on it.
+    suppressesNoMatchesWarning (GlobMatch _) = True
+    suppressesNoMatchesWarning (GlobWarnMultiDot _) = False
+    suppressesNoMatchesWarning (GlobMissingDirectory _) = True
+
+    getWarning :: String -> FilePath -> GlobResult FilePath -> [PackageCheck]
+    getWarning _ _ (GlobMatch _) =
+      []
+    -- Before Cabal 2.4, the extensions of globs had to match the file
+    -- exactly. This has been relaxed in 2.4 to allow matching only the
+    -- suffix. This warning detects when pre-2.4 package descriptions are
+    -- omitting files purely because of the stricter check.
+    getWarning field glob (GlobWarnMultiDot file) =
+      [ PackageDistSuspiciousWarn $
+             "In '" ++ field ++ "': the pattern '" ++ glob ++ "' does not"
+          ++ " match the file '" ++ file ++ "' because the extensions do not"
+          ++ " exactly match (e.g., foo.en.html does not exactly match *.html)."
+          ++ " To enable looser suffix-only matching, set 'cabal-version: 2.4' or higher."
+      ]
+    getWarning field glob (GlobMissingDirectory dir) =
+      [ PackageDistSuspiciousWarn $
+             "In '" ++ field ++ "': the pattern '" ++ glob ++ "' attempts to"
+          ++ " match files in the directory '" ++ dir ++ "', but there is no"
+          ++ " directory by that name."
+      ]
 
 -- ------------------------------------------------------------
 -- * Utils

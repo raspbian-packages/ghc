@@ -11,12 +11,13 @@ Error-checking and other utilities for @deriving@ clauses or declarations.
 module TcDerivUtils (
         DerivM, DerivEnv(..),
         DerivSpec(..), pprDerivSpec,
-        DerivSpecMechanism(..), isDerivSpecStock,
-        isDerivSpecNewtype, isDerivSpecAnyClass,
-        DerivContext, DerivStatus(..),
+        DerivSpecMechanism(..), derivSpecMechanismToStrategy, isDerivSpecStock,
+        isDerivSpecNewtype, isDerivSpecAnyClass, isDerivSpecVia,
+        DerivContext(..), OriginativeDerivStatus(..),
+        isStandaloneDeriv, isStandaloneWildcardDeriv, mkDerivOrigin,
         PredOrigin(..), ThetaOrigin(..), mkPredOrigin,
         mkThetaOrigin, mkThetaOriginFromPreds, substPredOrigin,
-        checkSideConditions, hasStockDeriving,
+        checkOriginativeSideConditions, hasStockDeriving,
         canDeriveAnyClass,
         std_class_via_coercible, non_coercible_class,
         newDerivClsInst, extendLocalInstEnv
@@ -52,6 +53,7 @@ import Util
 import VarSet
 
 import Control.Monad.Trans.Reader
+import Data.Maybe
 import qualified GHC.LanguageExtensions as LangExt
 import ListSetOps (assocMaybe)
 
@@ -59,6 +61,31 @@ import ListSetOps (assocMaybe)
 -- various functions in @TcDeriv@ and @TcDerivInfer@, we use 'DerivM', which
 -- is a simple reader around 'TcRn'.
 type DerivM = ReaderT DerivEnv TcRn
+
+-- | Is GHC processing a stanalone deriving declaration?
+isStandaloneDeriv :: DerivM Bool
+isStandaloneDeriv = asks (go . denv_ctxt)
+  where
+    go :: DerivContext -> Bool
+    go (InferContext wildcard) = isJust wildcard
+    go (SupplyContext {})      = True
+
+-- | Is GHC processing a standalone deriving declaration with an
+-- extra-constraints wildcard as the context?
+-- (e.g., @deriving instance _ => Eq (Foo a)@)
+isStandaloneWildcardDeriv :: DerivM Bool
+isStandaloneWildcardDeriv = asks (go . denv_ctxt)
+  where
+    go :: DerivContext -> Bool
+    go (InferContext wildcard) = isJust wildcard
+    go (SupplyContext {})      = False
+
+-- | @'mkDerivOrigin' wc@ returns 'StandAloneDerivOrigin' if @wc@ is 'True',
+-- and 'DerivClauseOrigin' if @wc@ is 'False'. Useful for error-reporting.
+mkDerivOrigin :: Bool -> CtOrigin
+mkDerivOrigin standalone_wildcard
+  | standalone_wildcard = StandAloneDerivOrigin
+  | otherwise           = DerivClauseOrigin
 
 -- | Contains all of the information known about a derived instance when
 -- determining what its @EarlyDerivSpec@ should be.
@@ -82,10 +109,13 @@ data DerivEnv = DerivEnv
   , denv_rep_tc_args  :: [Type]
     -- ^ The representation types for 'denv_tc_args'
     --   (for data family instances)
-  , denv_mtheta       :: DerivContext
-    -- ^ 'Just' the context of the instance, for standalone deriving.
-    --   'Nothing' for @deriving@ clauses.
-  , denv_strat        :: Maybe DerivStrategy
+  , denv_ctxt         :: DerivContext
+    -- ^ @'SupplyContext' theta@ for standalone deriving (where @theta@ is the
+    --   context of the instance).
+    --   'InferContext' for @deriving@ clauses, or for standalone deriving that
+    --   uses a wildcard constraint.
+    --   See @Note [Inferring the instance context]@.
+  , denv_strat        :: Maybe (DerivStrategy GhcTc)
     -- ^ 'Just' if user requests a particular deriving strategy.
     --   Otherwise, 'Nothing'.
   }
@@ -99,7 +129,7 @@ instance Outputable DerivEnv where
                 , denv_tc_args      = tc_args
                 , denv_rep_tc       = rep_tc
                 , denv_rep_tc_args  = rep_tc_args
-                , denv_mtheta       = mtheta
+                , denv_ctxt         = ctxt
                 , denv_strat        = mb_strat })
     = hang (text "DerivEnv")
          2 (vcat [ text "denv_overlap_mode" <+> ppr overlap_mode
@@ -110,18 +140,21 @@ instance Outputable DerivEnv where
                  , text "denv_tc_args"      <+> ppr tc_args
                  , text "denv_rep_tc"       <+> ppr rep_tc
                  , text "denv_rep_tc_args"  <+> ppr rep_tc_args
-                 , text "denv_mtheta"       <+> ppr mtheta
+                 , text "denv_ctxt"         <+> ppr ctxt
                  , text "denv_strat"        <+> ppr mb_strat ])
 
-data DerivSpec theta = DS { ds_loc       :: SrcSpan
-                          , ds_name      :: Name         -- DFun name
-                          , ds_tvs       :: [TyVar]
-                          , ds_theta     :: theta
-                          , ds_cls       :: Class
-                          , ds_tys       :: [Type]
-                          , ds_tc        :: TyCon
-                          , ds_overlap   :: Maybe OverlapMode
-                          , ds_mechanism :: DerivSpecMechanism }
+data DerivSpec theta = DS { ds_loc                 :: SrcSpan
+                          , ds_name                :: Name         -- DFun name
+                          , ds_tvs                 :: [TyVar]
+                          , ds_theta               :: theta
+                          , ds_cls                 :: Class
+                          , ds_tys                 :: [Type]
+                          , ds_tc                  :: TyCon
+                          , ds_overlap             :: Maybe OverlapMode
+                          , ds_standalone_wildcard :: Maybe SrcSpan
+                              -- See Note [Inferring the instance context]
+                              -- in TcDerivInfer
+                          , ds_mechanism           :: DerivSpecMechanism }
         -- This spec implies a dfun declaration of the form
         --       df :: forall tvs. theta => C tys
         -- The Name is the name for the DFun we'll build
@@ -151,15 +184,17 @@ Example:
 
 pprDerivSpec :: Outputable theta => DerivSpec theta -> SDoc
 pprDerivSpec (DS { ds_loc = l, ds_name = n, ds_tvs = tvs, ds_cls = c,
-                   ds_tys = tys, ds_theta = rhs, ds_mechanism = mech })
+                   ds_tys = tys, ds_theta = rhs,
+                   ds_standalone_wildcard = wildcard, ds_mechanism = mech })
   = hang (text "DerivSpec")
-       2 (vcat [ text "ds_loc       =" <+> ppr l
-               , text "ds_name      =" <+> ppr n
-               , text "ds_tvs       =" <+> ppr tvs
-               , text "ds_cls       =" <+> ppr c
-               , text "ds_tys       =" <+> ppr tys
-               , text "ds_theta     =" <+> ppr rhs
-               , text "ds_mechanism =" <+> ppr mech ])
+       2 (vcat [ text "ds_loc                  =" <+> ppr l
+               , text "ds_name                 =" <+> ppr n
+               , text "ds_tvs                  =" <+> ppr tvs
+               , text "ds_cls                  =" <+> ppr c
+               , text "ds_tys                  =" <+> ppr tys
+               , text "ds_theta                =" <+> ppr rhs
+               , text "ds_standalone_wildcard  =" <+> ppr wildcard
+               , text "ds_mechanism            =" <+> ppr mech ])
 
 instance Outputable theta => Outputable (DerivSpec theta) where
   ppr = pprDerivSpec
@@ -190,7 +225,17 @@ data DerivSpecMechanism
 
   | DerivSpecAnyClass -- -XDeriveAnyClass
 
-isDerivSpecStock, isDerivSpecNewtype, isDerivSpecAnyClass
+  | DerivSpecVia -- -XDerivingVia
+      Type -- The @via@ type
+
+-- | Convert a 'DerivSpecMechanism' to its corresponding 'DerivStrategy'.
+derivSpecMechanismToStrategy :: DerivSpecMechanism -> DerivStrategy GhcTc
+derivSpecMechanismToStrategy DerivSpecStock{}   = StockStrategy
+derivSpecMechanismToStrategy DerivSpecNewtype{} = NewtypeStrategy
+derivSpecMechanismToStrategy DerivSpecAnyClass  = AnyclassStrategy
+derivSpecMechanismToStrategy (DerivSpecVia t)   = ViaStrategy t
+
+isDerivSpecStock, isDerivSpecNewtype, isDerivSpecAnyClass, isDerivSpecVia
   :: DerivSpecMechanism -> Bool
 isDerivSpecStock (DerivSpecStock{}) = True
 isDerivSpecStock _                  = False
@@ -198,30 +243,57 @@ isDerivSpecStock _                  = False
 isDerivSpecNewtype (DerivSpecNewtype{}) = True
 isDerivSpecNewtype _                    = False
 
-isDerivSpecAnyClass (DerivSpecAnyClass{}) = True
-isDerivSpecAnyClass _                     = False
+isDerivSpecAnyClass DerivSpecAnyClass = True
+isDerivSpecAnyClass _                 = False
 
--- A DerivSpecMechanism can be losslessly converted to a DerivStrategy.
-mechanismToStrategy :: DerivSpecMechanism -> DerivStrategy
-mechanismToStrategy (DerivSpecStock{})    = StockStrategy
-mechanismToStrategy (DerivSpecNewtype{})  = NewtypeStrategy
-mechanismToStrategy (DerivSpecAnyClass{}) = AnyclassStrategy
+isDerivSpecVia (DerivSpecVia{}) = True
+isDerivSpecVia _                = False
 
 instance Outputable DerivSpecMechanism where
-  ppr = ppr . mechanismToStrategy
+  ppr (DerivSpecStock{})   = text "DerivSpecStock"
+  ppr (DerivSpecNewtype t) = text "DerivSpecNewtype" <> colon <+> ppr t
+  ppr DerivSpecAnyClass    = text "DerivSpecAnyClass"
+  ppr (DerivSpecVia t)     = text "DerivSpecVia" <> colon <+> ppr t
 
-type DerivContext = Maybe ThetaType
-   -- Nothing    <=> Vanilla deriving; infer the context of the instance decl
-   -- Just theta <=> Standalone deriving: context supplied by programmer
+-- | Whether GHC is processing a @deriving@ clause or a standalone deriving
+-- declaration.
+data DerivContext
+  = InferContext (Maybe SrcSpan) -- ^ @'InferContext mb_wildcard@ is either:
+                                 --
+                                 -- * A @deriving@ clause (in which case
+                                 --   @mb_wildcard@ is 'Nothing').
+                                 --
+                                 -- * A standalone deriving declaration with
+                                 --   an extra-constraints wildcard as the
+                                 --   context (in which case @mb_wildcard@ is
+                                 --   @'Just' loc@, where @loc@ is the location
+                                 --   of the wildcard.
+                                 --
+                                 -- GHC should infer the context.
 
-data DerivStatus = CanDerive                 -- Stock class, can derive
-                 | DerivableClassError SDoc  -- Stock class, but can't do it
-                 | DerivableViaInstance      -- See Note [Deriving any class]
-                 | NonDerivableClass SDoc    -- Non-stock class
+  | SupplyContext ThetaType      -- ^ @'SupplyContext' theta@ is a standalone
+                                 -- deriving declaration, where @theta@ is the
+                                 -- context supplied by the user.
+
+instance Outputable DerivContext where
+  ppr (InferContext standalone) = text "InferContext"  <+> ppr standalone
+  ppr (SupplyContext theta)     = text "SupplyContext" <+> ppr theta
+
+-- | Records whether a particular class can be derived by way of an
+-- /originative/ deriving strategy (i.e., @stock@ or @anyclass@).
+--
+-- See @Note [Deriving strategies]@ in "TcDeriv".
+data OriginativeDerivStatus
+  = CanDeriveStock            -- Stock class, can derive
+      (SrcSpan -> TyCon -> [Type]
+               -> TcM (LHsBinds GhcPs, BagDerivStuff, [Name]))
+  | StockClassError SDoc      -- Stock class, but can't do it
+  | CanDeriveAnyClass         -- See Note [Deriving any class]
+  | NonDerivableClass SDoc    -- Cannot derive with either stock or anyclass
 
 -- A stock class is one either defined in the Haskell report or for which GHC
 -- otherwise knows how to generate code for (possibly requiring the use of a
--- language extension), such as Eq, Ord, Ix, Data, Generic, etc.
+-- language extension), such as Eq, Ord, Ix, Data, Generic, etc.)
 
 -- | A 'PredType' annotated with the origin of the constraint 'CtOrigin',
 -- and whether or the constraint deals in types or kinds.
@@ -339,9 +411,9 @@ substPredOrigin subst (PredOrigin pred origin t_or_k)
 
 Only certain blessed classes can be used in a deriving clause (without the
 assistance of GeneralizedNewtypeDeriving or DeriveAnyClass). These classes
-are listed below in the definition of hasStockDeriving. The sideConditions
+are listed below in the definition of hasStockDeriving. The stockSideConditions
 function determines the criteria that needs to be met in order for a particular
-class to be able to be derived successfully.
+stock class to be able to be derived successfully.
 
 A class might be able to be used in a deriving clause if -XDeriveAnyClass
 is willing to support it. The canDeriveAnyClass function checks if this is the
@@ -447,35 +519,43 @@ getDataConFixityFun tc
     doc = text "Data con fixities for" <+> ppr name
 
 ------------------------------------------------------------------
--- Check side conditions that dis-allow derivability for particular classes
--- This is *apart* from the newtype-deriving mechanism
+-- Check side conditions that dis-allow derivability for the originative
+-- deriving strategies (stock and anyclass).
+-- See Note [Deriving strategies] in TcDeriv for an explanation of what
+-- "originative" means.
+--
+-- This is *apart* from the coerce-based strategies, newtype and via.
 --
 -- Here we get the representation tycon in case of family instances as it has
 -- the data constructors - but we need to be careful to fall back to the
 -- family tycon (with indexes) in error messages.
 
-checkSideConditions :: DynFlags -> DerivContext -> Class -> [TcType]
-                    -> TyCon -- tycon
-                    -> DerivStatus
-checkSideConditions dflags mtheta cls cls_tys rep_tc
-  | Just cond <- sideConditions mtheta cls
-  = case (cond dflags rep_tc) of
-        NotValid err -> DerivableClassError err  -- Class-specific error
+checkOriginativeSideConditions
+  :: DynFlags -> DerivContext -> Class -> [TcType]
+  -> TyCon -> TyCon
+  -> OriginativeDerivStatus
+checkOriginativeSideConditions dflags deriv_ctxt cls cls_tys tc rep_tc
+    -- First, check if stock deriving is possible...
+  | Just cond <- stockSideConditions deriv_ctxt cls
+  = case (cond dflags tc rep_tc) of
+        NotValid err -> StockClassError err  -- Class-specific error
         IsValid  | null (filterOutInvisibleTypes (classTyCon cls) cls_tys)
-                   -> CanDerive
                    -- All stock derivable classes are unary in the sense that
                    -- there should be not types in cls_tys (i.e., no type args
                    -- other than last). Note that cls_types can contain
                    -- invisible types as well (e.g., for Generic1, which is
                    -- poly-kinded), so make sure those are not counted.
-                 | otherwise -> DerivableClassError (classArgsErr cls cls_tys)
+                 , Just gen_fn <- hasStockDeriving cls
+                   -> CanDeriveStock gen_fn
+                 | otherwise -> StockClassError (classArgsErr cls cls_tys)
                    -- e.g. deriving( Eq s )
 
+    -- ...if not, try falling back on DeriveAnyClass.
   | NotValid err <- canDeriveAnyClass dflags
-  = NonDerivableClass err  -- DeriveAnyClass does not work
+  = NonDerivableClass err  -- Neither anyclass nor stock work
 
   | otherwise
-  = DerivableViaInstance   -- DeriveAnyClass should work
+  = CanDeriveAnyClass   -- DeriveAnyClass should work
 
 classArgsErr :: Class -> [Type] -> SDoc
 classArgsErr cls cls_tys = quotes (ppr (mkClassPred cls cls_tys)) <+> text "is not a class"
@@ -485,8 +565,8 @@ classArgsErr cls cls_tys = quotes (ppr (mkClassPred cls cls_tys)) <+> text "is n
 -- mechanism on certain classes (as opposed to classes that require
 -- GeneralizedNewtypeDeriving or DeriveAnyClass). Returns Nothing for a
 -- class for which stock deriving isn't possible.
-sideConditions :: DerivContext -> Class -> Maybe Condition
-sideConditions mtheta cls
+stockSideConditions :: DerivContext -> Class -> Maybe Condition
+stockSideConditions deriv_ctxt cls
   | cls_key == eqClassKey          = Just (cond_std `andCond` cond_args cls)
   | cls_key == ordClassKey         = Just (cond_std `andCond` cond_args cls)
   | cls_key == showClassKey        = Just (cond_std `andCond` cond_args cls)
@@ -520,10 +600,10 @@ sideConditions mtheta cls
   | otherwise                      = Nothing
   where
     cls_key = getUnique cls
-    cond_std     = cond_stdOK mtheta False  -- Vanilla data constructors, at least one,
-                                            --    and monotype arguments
-    cond_vanilla = cond_stdOK mtheta True   -- Vanilla data constructors but
-                                            --   allow no data cons or polytype arguments
+    cond_std     = cond_stdOK deriv_ctxt False
+      -- Vanilla data constructors, at least one, and monotype arguments
+    cond_vanilla = cond_stdOK deriv_ctxt True
+      -- Vanilla data constructors but allow no data cons or polytype arguments
 
 canDeriveAnyClass :: DynFlags -> Validity
 -- IsValid: we can (try to) derive it via an empty instance declaration
@@ -534,54 +614,108 @@ canDeriveAnyClass dflags
   | otherwise
   = IsValid   -- OK!
 
-type Condition = DynFlags -> TyCon -> Validity
-        -- TyCon is the *representation* tycon if the data type is an indexed one
-        -- Nothing => OK
+type Condition
+   = DynFlags
+
+  -> TyCon    -- ^ The data type's 'TyCon'. For data families, this is the
+              -- family 'TyCon'.
+
+  -> TyCon    -- ^ For data families, this is the representation 'TyCon'.
+              -- Otherwise, this is the same as the other 'TyCon' argument.
+
+  -> Validity -- ^ 'IsValid' if deriving an instance for this 'TyCon' is
+              -- possible. Otherwise, it's @'NotValid' err@, where @err@
+              -- explains what went wrong.
 
 orCond :: Condition -> Condition -> Condition
-orCond c1 c2 dflags tc
-  = case (c1 dflags tc, c2 dflags tc) of
+orCond c1 c2 dflags tc rep_tc
+  = case (c1 dflags tc rep_tc, c2 dflags tc rep_tc) of
      (IsValid,    _)          -> IsValid    -- c1 succeeds
      (_,          IsValid)    -> IsValid    -- c21 succeeds
      (NotValid x, NotValid y) -> NotValid (x $$ text "  or" $$ y)
                                             -- Both fail
 
 andCond :: Condition -> Condition -> Condition
-andCond c1 c2 dflags tc = c1 dflags tc `andValid` c2 dflags tc
+andCond c1 c2 dflags tc rep_tc
+  = c1 dflags tc rep_tc `andValid` c2 dflags tc rep_tc
 
-cond_stdOK :: DerivContext -- Says whether this is standalone deriving or not;
-                           --     if standalone, we just say "yes, go for it"
-           -> Bool         -- True <=> permissive: allow higher rank
-                           --          args and no data constructors
-           -> Condition
-cond_stdOK (Just _) _ _ _
-  = IsValid     -- Don't check these conservative conditions for
+-- | Some common validity checks shared among stock derivable classes. One
+-- check that absolutely must hold is that if an instance @C (T a)@ is being
+-- derived, then @T@ must be a tycon for a data type or a newtype. The
+-- remaining checks are only performed if using a @deriving@ clause (i.e.,
+-- they're ignored if using @StandaloneDeriving@):
+--
+-- 1. The data type must have at least one constructor (this check is ignored
+--    if using @EmptyDataDeriving@).
+--
+-- 2. The data type cannot have any GADT constructors.
+--
+-- 3. The data type cannot have any constructors with existentially quantified
+--    type variables.
+--
+-- 4. The data type cannot have a context (e.g., @data Foo a = Eq a => MkFoo@).
+--
+-- 5. The data type cannot have fields with higher-rank types.
+cond_stdOK
+  :: DerivContext -- ^ 'SupplyContext' if this is standalone deriving with a
+                  -- user-supplied context, 'InferContext' if not.
+                  -- If it is the former, we relax some of the validity checks
+                  -- we would otherwise perform (i.e., "just go for it").
+
+  -> Bool         -- ^ 'True' <=> allow higher rank arguments and empty data
+                  -- types (with no data constructors) even in the absence of
+                  -- the -XEmptyDataDeriving extension.
+
+  -> Condition
+cond_stdOK deriv_ctxt permissive dflags tc rep_tc
+  = valid_ADT `andValid` valid_misc
+  where
+    valid_ADT, valid_misc :: Validity
+    valid_ADT
+      | isAlgTyCon tc || isDataFamilyTyCon tc
+      = IsValid
+      | otherwise
+        -- Complain about functions, primitive types, and other tycons that
+        -- stock deriving can't handle.
+      = NotValid $ text "The last argument of the instance must be a"
+               <+> text "data or newtype application"
+
+    valid_misc
+      = case deriv_ctxt of
+         SupplyContext _ -> IsValid
+                -- Don't check these conservative conditions for
                 -- standalone deriving; just generate the code
                 -- and let the typechecker handle the result
-cond_stdOK Nothing permissive dflags rep_tc
-  | null data_cons
-  , not permissive = checkFlag LangExt.EmptyDataDeriving dflags rep_tc
-                     `orValid`
-                     NotValid (no_cons_why rep_tc $$ empty_data_suggestion)
-  | not (null con_whys) = NotValid (vcat con_whys $$ standalone_suggestion)
-  | otherwise           = IsValid
-  where
+         InferContext wildcard
+           | null data_cons -- 1.
+           , not permissive
+           -> checkFlag LangExt.EmptyDataDeriving dflags tc rep_tc `orValid`
+              NotValid (no_cons_why rep_tc $$ empty_data_suggestion)
+           | not (null con_whys)
+           -> NotValid (vcat con_whys $$ possible_fix_suggestion wildcard)
+           | otherwise
+           -> IsValid
+
     empty_data_suggestion =
       text "Use EmptyDataDeriving to enable deriving for empty data types"
-    standalone_suggestion =
-      text "Possible fix: use a standalone deriving declaration instead"
+    possible_fix_suggestion wildcard
+      = case wildcard of
+          Just _ ->
+            text "Possible fix: fill in the wildcard constraint yourself"
+          Nothing ->
+            text "Possible fix: use a standalone deriving declaration instead"
     data_cons  = tyConDataCons rep_tc
     con_whys   = getInvalids (map check_con data_cons)
 
     check_con :: DataCon -> Validity
     check_con con
-      | not (null eq_spec)
+      | not (null eq_spec) -- 2.
       = bad "is a GADT"
-      | not (null ex_tvs)
+      | not (null ex_tvs) -- 3.
       = bad "has existential type variables in its type"
-      | not (null theta)
+      | not (null theta) -- 4.
       = bad "has constraints in its type"
-      | not (permissive || all isTauTy (dataConOrigArgTys con))
+      | not (permissive || all isTauTy (dataConOrigArgTys con)) -- 5.
       = bad "has a higher-rank type"
       | otherwise
       = IsValid
@@ -594,10 +728,10 @@ no_cons_why rep_tc = quotes (pprSourceTyCon rep_tc) <+>
                      text "must have at least one data constructor"
 
 cond_RepresentableOk :: Condition
-cond_RepresentableOk _ tc = canDoGenerics tc
+cond_RepresentableOk _ _ rep_tc = canDoGenerics rep_tc
 
 cond_Representable1Ok :: Condition
-cond_Representable1Ok _ tc = canDoGenerics1 tc
+cond_Representable1Ok _ _ rep_tc = canDoGenerics1 rep_tc
 
 cond_enumOrProduct :: Class -> Condition
 cond_enumOrProduct cls = cond_isEnumeration `orCond`
@@ -606,13 +740,13 @@ cond_enumOrProduct cls = cond_isEnumeration `orCond`
 cond_args :: Class -> Condition
 -- For some classes (eg Eq, Ord) we allow unlifted arg types
 -- by generating specialised code.  For others (eg Data) we don't.
-cond_args cls _ tc
+cond_args cls _ _ rep_tc
   = case bad_args of
       []     -> IsValid
       (ty:_) -> NotValid (hang (text "Don't know how to derive" <+> quotes (ppr cls))
                              2 (text "for type" <+> quotes (ppr ty)))
   where
-    bad_args = [ arg_ty | con <- tyConDataCons tc
+    bad_args = [ arg_ty | con <- tyConDataCons rep_tc
                         , arg_ty <- dataConOrigArgTys con
                         , isUnliftedType arg_ty
                         , not (ok_ty arg_ty) ]
@@ -630,7 +764,7 @@ cond_args cls _ tc
 
 
 cond_isEnumeration :: Condition
-cond_isEnumeration _ rep_tc
+cond_isEnumeration _ _ rep_tc
   | isEnumerationTyCon rep_tc = IsValid
   | otherwise                 = NotValid why
   where
@@ -640,7 +774,7 @@ cond_isEnumeration _ rep_tc
                   -- See Note [Enumeration types] in TyCon
 
 cond_isProduct :: Condition
-cond_isProduct _ rep_tc
+cond_isProduct _ _ rep_tc
   | isProductTyCon rep_tc = IsValid
   | otherwise             = NotValid why
   where
@@ -654,7 +788,7 @@ cond_functorOK :: Bool -> Bool -> Condition
 --            (c) don't use argument in the wrong place, e.g. data T a = T (X a a)
 --            (d) optionally: don't use function types
 --            (e) no "stupid context" on data type
-cond_functorOK allowFunctions allowExQuantifiedLastTyVar _ rep_tc
+cond_functorOK allowFunctions allowExQuantifiedLastTyVar _ _ rep_tc
   | null tc_tvs
   = NotValid (text "Data type" <+> quotes (ppr rep_tc)
               <+> text "must have some type parameters")
@@ -703,7 +837,7 @@ cond_functorOK allowFunctions allowExQuantifiedLastTyVar _ rep_tc
     wrong_arg   = text "must use the type variable only as the last argument of a data type"
 
 checkFlag :: LangExt.Extension -> Condition
-checkFlag flag dflags _
+checkFlag flag dflags _ _
   | xopt flag dflags = IsValid
   | otherwise        = NotValid why
   where

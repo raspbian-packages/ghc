@@ -1,5 +1,19 @@
 # Changelog for [`process` package](http://hackage.haskell.org/package/process)
 
+## 1.6.5.0 *December 2018*
+
+* Bug fix: On Windows ignore ERROR_ACCESS_DENIED for TerminateProcess() if the process did terminate
+  [#110](https://github.com/haskell/process/issues/110)
+* Improve documentation of the `NoStream` data constructor
+
+## 1.6.4.0 *July 2018*
+
+* Bug fix: Don't leak pipes on failure
+  [#122](https://github.com/haskell/process/issues/122)
+* Expose `cleanupProcess` from `System.Process` 
+  [#130](https://github.com/haskell/process/pull/130)
+* Drop support for GHC before 7.10.3
+
 ## 1.6.3.0 *January 2018*
 
 * Added `getPid` and export of platform specific `Pid` type

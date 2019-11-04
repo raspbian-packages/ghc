@@ -13,7 +13,7 @@ dnl
 # see what flags are available. (Better yet, read the documentation!)
 #
 
-AC_INIT([The Glorious Glasgow Haskell Compilation System], [8.4.4], [glasgow-haskell-bugs@haskell.org], [ghc-AC_PACKAGE_VERSION])
+AC_INIT([The Glorious Glasgow Haskell Compilation System], [8.6.5], [glasgow-haskell-bugs@haskell.org], [ghc-AC_PACKAGE_VERSION])
 
 # Set this to YES for a released version, otherwise NO
 : ${RELEASE=YES}
@@ -55,13 +55,14 @@ AC_SUBST([release], [1])
 # First off, a distrib sanity check..
 AC_CONFIG_SRCDIR([mk/config.mk.in])
 
-dnl * We require autoconf version 2.60
-dnl We need 2.50 due to the use of AC_SYS_LARGEFILE and AC_MSG_NOTICE.
-dnl We need 2.52 due to the use of AS_TR_CPP and AS_TR_SH.
-dnl Using autoconf 2.59 started to give nonsense like this
-dnl  #define SIZEOF_CHAR 0
-dnl recently.
-AC_PREREQ([2.60])
+dnl * We require autoconf version 2.69 due to
+dnl   https://bugs.ruby-lang.org/issues/8179. Also see #14910.
+dnl * We need 2.50 due to the use of AC_SYS_LARGEFILE and AC_MSG_NOTICE.
+dnl * We need 2.52 due to the use of AS_TR_CPP and AS_TR_SH.
+dnl * Using autoconf 2.59 started to give nonsense like this
+dnl     #define SIZEOF_CHAR 0
+dnl   recently.
+AC_PREREQ([2.69])
 
 # -------------------------------------------------------------------------
 # Prepare to generate the following header files
@@ -131,6 +132,11 @@ AC_ARG_VAR(CC_STAGE0, [C compiler command (bootstrap)])
 if test "$WithGhc" != ""; then
   FPTOOLS_GHC_VERSION([GhcVersion], [GhcMajVersion], [GhcMinVersion], [GhcPatchLevel])dnl
 
+  # See #15281
+  if test "$GhcMajVersion" = "8" && test "$GhcMinVersion" = "2" && test "$GhcPatchLevel" = "1"; then
+     AC_MSG_ERROR([GHC 8.2.1 is known to be buggy and cannot bootstrap this GHC release (See Trac 15281); please use GHC 8.2.2 or later.])
+  fi
+
   if test "$GhcMajVersion" = "unknown" || test "$GhcMinVersion" = "unknown"; then
      AC_MSG_ERROR([Cannot determine the version of $WithGhc.  Is it really GHC?])
   fi
@@ -158,8 +164,8 @@ if test "$WithGhc" = ""
 then
     AC_MSG_ERROR([GHC is required.])
 fi
-FP_COMPARE_VERSIONS([$GhcVersion],[-lt],[8.0],
-    [AC_MSG_ERROR([GHC version 8.0 or later is required to compile GHC.])])
+FP_COMPARE_VERSIONS([$GhcVersion],[-lt],[8.2],
+    [AC_MSG_ERROR([GHC version 8.2 or later is required to compile GHC.])])
 
 if test `expr $GhcMinVersion % 2` = "1"
 then
@@ -418,6 +424,10 @@ then
     AC_PATH_PROG([DllWrap],[dllwrap])
     AC_PATH_PROG([Windres],[windres])
     AC_PATH_PROG([Genlib],[genlib])
+else
+    AC_CHECK_TARGET_TOOL([Windres],[windres])
+    AC_CHECK_TARGET_TOOL([DllWrap],[dllwrap])
+    AC_CHECK_TARGET_TOOL([OBJDUMP],[objdump])
 fi
 
 DllWrapCmd="$DllWrap"
@@ -665,6 +675,15 @@ dnl --------------------------------------------------------------
 dnl End of configure script option section
 dnl --------------------------------------------------------------
 
+dnl ** Copy the files from the "fs" utility into the right folders.
+dnl --------------------------------------------------------------
+AC_MSG_NOTICE([Creating links for in-tree file handling routines.])
+ln -f -v utils/fs/fs.* utils/lndir/
+ln -f -v utils/fs/fs.* utils/unlit/
+ln -f -v utils/fs/fs.* rts/
+ln -f -v utils/fs/fs.h libraries/base/include/
+ln -f -v utils/fs/fs.c libraries/base/cbits/
+AC_MSG_NOTICE([Routines in place. Packages can now be build normally.])
 
 dnl --------------------------------------------------------------
 dnl ** Can the unix package be built?
@@ -691,6 +710,12 @@ cygwin32|mingw32)
   else
     AC_PATH_PROG([PerlCmd],[perl])
   fi
+  # because of Trac #15051 SplitObjs is useless on Windows.  It regresses
+  # build times to days for a build, and this effect is also there for end users
+  # of GHC.  So unfortunately we have to disable it, even without having
+  # split-sections.  Though the compile time hit for split-sections should be
+  # tiny compared to this so maybe we should enable it for x86_64.
+  SplitObjsBroken=YES
   ;;
 *)
     AC_PATH_PROG([PerlCmd],[perl])
@@ -828,7 +853,7 @@ AC_PATH_PROG(SPHINXBUILD,sphinx-build)
 AC_CACHE_CHECK([for version of sphinx-build], fp_cv_sphinx_version,
 changequote(, )dnl
 [if test -n "$SPHINXBUILD"; then
-  fp_cv_sphinx_version=`"$SPHINXBUILD" --version 2>&1 | sed 's/Sphinx\( (sphinx-build)\)\? v\?\([0-9]\.[0-9]\.[0-9]\)/\2/' | head -n1`;
+  fp_cv_sphinx_version=`"$SPHINXBUILD" --version 2>&1 | sed 's/.* v\?\([0-9]\.[0-9]\.[0-9]\)/\1/' | head -n1`;
 fi;
 changequote([, ])dnl
 ])
@@ -1195,7 +1220,7 @@ case ${TargetOS} in
     linux|linux-android|freebsd|dragonfly|netbsd|openbsd|kfreebsdgnu|gnu|solaris2)
         RtsLinkerUseMmap=1
         ;;
-    darwin|ios)
+    darwin|ios|watchos|tvos)
         # Don't use mmap on powerpc/darwin as the mmap there doesn't support
         # reallocating. Reallocating is needed to allocate jump islands just
         # after each object image. Jumps to these jump islands use relative
@@ -1244,6 +1269,12 @@ if test "$ac_cv_header_numa_h$ac_cv_header_numaif_h" = "yesyes" ; then
     AC_CHECK_LIB(numa, numa_available,HaveLibNuma=1)
 fi
 AC_DEFINE_UNQUOTED([HAVE_LIBNUMA], [$HaveLibNuma], [Define to 1 if you have libnuma])
+if test $HaveLibNuma = "1" ; then
+  AC_SUBST([CabalHaveLibNuma],[True])
+else
+  AC_SUBST([CabalHaveLibNuma],[False])
+fi
+
 
 dnl ** Documentation
 dnl --------------------------------------------------------------
@@ -1303,7 +1334,7 @@ checkMake380() {
 checkMake380 make
 checkMake380 gmake
 
-AC_CONFIG_FILES([mk/config.mk mk/install.mk mk/project.mk rts/rts.cabal compiler/ghc.cabal ghc/ghc-bin.cabal utils/runghc/runghc.cabal utils/gen-dll/gen-dll.cabal libraries/ghc-boot/ghc-boot.cabal libraries/ghc-boot-th/ghc-boot-th.cabal libraries/ghci/ghci.cabal settings docs/users_guide/ghc_config.py docs/index.html libraries/prologue.txt distrib/configure.ac])
+AC_CONFIG_FILES([mk/config.mk mk/install.mk mk/project.mk rts/rts.cabal compiler/ghc.cabal ghc/ghc-bin.cabal utils/runghc/runghc.cabal utils/gen-dll/gen-dll.cabal libraries/ghc-boot/ghc-boot.cabal libraries/ghc-boot-th/ghc-boot-th.cabal libraries/ghci/ghci.cabal libraries/ghc-heap/ghc-heap.cabal settings docs/users_guide/ghc_config.py docs/index.html libraries/prologue.txt distrib/configure.ac])
 AC_OUTPUT
 [
 if test "$print_make_warning" = "true"; then

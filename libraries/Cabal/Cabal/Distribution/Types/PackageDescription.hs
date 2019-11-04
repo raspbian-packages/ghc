@@ -49,6 +49,8 @@ module Distribution.Types.PackageDescription (
     withForeignLib,
     allBuildInfo,
     enabledBuildInfos,
+    allBuildDepends,
+    enabledBuildDepends,
     updatePackageDescription,
     pkgComponents,
     pkgBuildableComponents,
@@ -60,6 +62,10 @@ module Distribution.Types.PackageDescription (
 import Prelude ()
 import Distribution.Compat.Prelude
 
+import Control.Monad ((<=<))
+
+-- lens
+import qualified Distribution.Types.BuildInfo.Lens  as L
 import Distribution.Types.Library
 import Distribution.Types.TestSuite
 import Distribution.Types.Executable
@@ -124,18 +130,6 @@ data PackageDescription
                                              -- with x-, stored in a
                                              -- simple assoc-list.
 
-        -- | YOU PROBABLY DON'T WANT TO USE THIS FIELD. This field is
-        -- special! Depending on how far along processing the
-        -- PackageDescription we are, the contents of this field are
-        -- either nonsense, or the collected dependencies of *all* the
-        -- components in this package.  buildDepends is initialized by
-        -- 'finalizePD' and 'flattenPackageDescription';
-        -- prior to that, dependency info is stored in the 'CondTree'
-        -- built around a 'GenericPackageDescription'.  When this
-        -- resolution is done, dependency info is written to the inner
-        -- 'BuildInfo' and this field.  This is all horrible, and #2066
-        -- tracks progress to get rid of this field.
-        buildDepends   :: [Dependency],
         -- | The original @build-type@ value as parsed from the
         -- @.cabal@ file without defaulting. See also 'buildType'.
         --
@@ -247,7 +241,6 @@ emptyPackageDescription
                       author       = "",
                       stability    = "",
                       testedWith   = [],
-                      buildDepends = [],
                       homepage     = "",
                       pkgUrl       = "",
                       bugReports   = "",
@@ -392,6 +385,16 @@ enabledBuildInfos pkg enabled =
 -- * Utils
 -- ------------------------------------------------------------
 
+-- | Get the combined build-depends entries of all components.
+allBuildDepends :: PackageDescription -> [Dependency]
+allBuildDepends = targetBuildDepends <=< allBuildInfo
+
+-- | Get the combined build-depends entries of all enabled components, per the
+-- given request spec.
+enabledBuildDepends :: PackageDescription -> ComponentRequestedSpec -> [Dependency]
+enabledBuildDepends spec pd = targetBuildDepends =<< enabledBuildInfos spec pd
+
+
 updatePackageDescription :: HookedBuildInfo -> PackageDescription -> PackageDescription
 updatePackageDescription (mb_lib_bi, exe_bi) p
     = p{ executables = updateExecutables exe_bi    (executables p)
@@ -467,3 +470,23 @@ getComponent pkg cname =
     missingComponent =
       error $ "internal error: the package description contains no "
            ++ "component corresponding to " ++ show cname
+
+-- -----------------------------------------------------------------------------
+-- Traversal Instances
+
+instance L.HasBuildInfos PackageDescription where
+  traverseBuildInfos f (PackageDescription a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19
+                                   x1 x2 x3 x4 x5 x6
+                                   a20 a21 a22 a23 a24) =
+    PackageDescription a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19
+        <$> (traverse . L.buildInfo) f x1 -- library
+        <*> (traverse . L.buildInfo) f x2 -- sub libraries
+        <*> (traverse . L.buildInfo) f x3 -- executables
+        <*> (traverse . L.buildInfo) f x4 -- foreign libs
+        <*> (traverse . L.buildInfo) f x5 -- test suites
+        <*> (traverse . L.buildInfo) f x6 -- benchmarks
+        <*> pure a20                      -- data files
+        <*> pure a21                      -- data dir
+        <*> pure a22                      -- exta src files
+        <*> pure a23                      -- extra temp files
+        <*> pure a24                      -- extra doc files

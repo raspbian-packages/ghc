@@ -15,7 +15,7 @@
 -- Stability   :  experimental
 -- Portability :  portable
 --
--- This monad transformer extends a monad with the ability throw exceptions.
+-- This monad transformer extends a monad with the ability to throw exceptions.
 --
 -- A sequence of actions terminates normally, producing a value,
 -- only if none of the actions in the sequence throws an exception.
@@ -51,6 +51,9 @@ import Control.Monad.IO.Class
 import Control.Monad.Signatures
 import Control.Monad.Trans.Class
 import Data.Functor.Classes
+#if MIN_VERSION_base(4,12,0)
+import Data.Functor.Contravariant
+#endif
 import Data.Functor.Identity
 
 import Control.Applicative
@@ -77,8 +80,8 @@ type Except e = ExceptT e Identity
 
 -- | Constructor for computations in the exception monad.
 -- (The inverse of 'runExcept').
-except :: Either e a -> Except e a
-except m = ExceptT (Identity m)
+except :: (Monad m) => Either e a -> ExceptT e m a
+except m = ExceptT (return m)
 {-# INLINE except #-}
 
 -- | Extractor for computations in the exception monad.
@@ -217,8 +220,10 @@ instance (Monad m) => Monad (ExceptT e m) where
             Left e -> return (Left e)
             Right x -> runExceptT (k x)
     {-# INLINE (>>=) #-}
+#if !(MIN_VERSION_base(4,13,0))
     fail = ExceptT . fail
     {-# INLINE fail #-}
+#endif
 
 #if MIN_VERSION_base(4,9,0)
 instance (Fail.MonadFail m) => Fail.MonadFail (ExceptT e m) where
@@ -255,6 +260,12 @@ instance (MonadZip m) => MonadZip (ExceptT e m) where
     {-# INLINE mzipWith #-}
 #endif
 
+#if MIN_VERSION_base(4,12,0)
+instance Contravariant m => Contravariant (ExceptT e m) where
+    contramap f = ExceptT . contramap (fmap f) . runExceptT
+    {-# INLINE contramap #-}
+#endif
+
 -- | Signal an exception value @e@.
 --
 -- * @'runExceptT' ('throwE' e) = 'return' ('Left' e)@
@@ -266,9 +277,9 @@ throwE = ExceptT . return . Left
 
 -- | Handle an exception.
 --
--- * @'catchE' h ('lift' m) = 'lift' m@
+-- * @'catchE' ('lift' m) h = 'lift' m@
 --
--- * @'catchE' h ('throwE' e) = h e@
+-- * @'catchE' ('throwE' e) h = h e@
 catchE :: (Monad m) =>
     ExceptT e m a               -- ^ the inner computation
     -> (e -> ExceptT e' m a)    -- ^ a handler for exceptions in the inner

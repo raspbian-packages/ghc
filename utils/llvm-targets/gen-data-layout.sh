@@ -29,6 +29,11 @@ TARGETS=(
     "i386-unknown-linux-gnu" "i386-unknown-linux" "x86_64-unknown-linux-gnu" "x86_64-unknown-linux"
     # Linux Android
     "armv7-unknown-linux-androideabi" "aarch64-unknown-linux-android"
+    # Linux ppc64le
+    "powerpc64le-unknown-linux"
+
+    # FreeBSD amd64
+    "amd64-portbld-freebsd"
 
     # QNX
     "arm-unknown-nto-qnx-eabi"
@@ -37,6 +42,9 @@ TARGETS=(
     "i386-apple-darwin" "x86_64-apple-darwin"
     # iOS
     "armv7-apple-ios arm64-apple-ios" "i386-apple-ios x86_64-apple-ios"
+
+    # FreeBSD ARM
+    "aarch64-unknown-freebsd" "armv6-unknown-freebsd-gnueabihf" "armv7-unknown-freebsd-gnueabihf"
 )
 
 # given the call to clang -c11 that clang --target -v generates,
@@ -73,7 +81,7 @@ FILE=_____dummy.c
 touch $FILE
 
 for target in "${TARGETS[@]}"; do
-    # find the cpu and attributes emitte by clang for the given $target
+    # find the cpu and attributes emitted by clang for the given $target
     CPU=""
     ATTR=()
     args=$(clang --target=$target -S $FILE -o /dev/null -v 2>&1 |grep $FILE)

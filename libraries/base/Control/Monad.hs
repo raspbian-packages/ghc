@@ -139,11 +139,12 @@ filterM p        = foldr (\ x -> liftA2 (\ flg -> if flg then (x:) else id) (p x
 
 infixr 1 <=<, >=>
 
--- | Left-to-right Kleisli composition of monads.
+-- | Left-to-right composition of Kleisli arrows.
 (>=>)       :: Monad m => (a -> m b) -> (b -> m c) -> (a -> m c)
 f >=> g     = \x -> f x >>= g
 
--- | Right-to-left Kleisli composition of monads. @('>=>')@, with the arguments flipped.
+-- | Right-to-left composition of Kleisli arrows. @('>=>')@, with the arguments
+-- flipped.
 --
 -- Note how this operator resembles function composition @('.')@:
 --
@@ -152,7 +153,30 @@ f >=> g     = \x -> f x >>= g
 (<=<)       :: Monad m => (b -> m c) -> (a -> m b) -> (a -> m c)
 (<=<)       = flip (>=>)
 
--- | @'forever' act@ repeats the action infinitely.
+-- | Repeat an action indefinitely.
+--
+-- ==== __Examples__
+--
+-- A common use of 'forever' is to process input from network sockets,
+-- 'System.IO.Handle's, and channels
+-- (e.g. 'Control.Concurrent.MVar.MVar' and
+-- 'Control.Concurrent.Chan.Chan').
+--
+-- For example, here is how we might implement an [echo
+-- server](https://en.wikipedia.org/wiki/Echo_Protocol), using
+-- 'forever' both to listen for client connections on a network socket
+-- and to echo client input on client connection handles:
+--
+-- @
+-- echoServer :: Socket -> IO ()
+-- echoServer socket = 'forever' $ do
+--   client <- accept socket
+--   'Control.Concurrent.forkFinally' (echo client) (\\_ -> hClose client)
+--   where
+--     echo :: Handle -> IO ()
+--     echo client = 'forever' $
+--       hGetLine client >>= hPutStrLn client
+-- @
 forever     :: (Applicative f) => f a -> f b
 {-# INLINE forever #-}
 forever a   = let a' = a *> a' in a'
@@ -283,12 +307,25 @@ f <$!> m = do
 -- -----------------------------------------------------------------------------
 -- Other MonadPlus functions
 
--- | Direct 'MonadPlus' equivalent of 'filter'
--- @'filter'@ = @(mfilter:: (a -> Bool) -> [a] -> [a]@
--- applicable to any 'MonadPlus', for example
--- @mfilter odd (Just 1) == Just 1@
--- @mfilter odd (Just 2) == Nothing@
-
+-- | Direct 'MonadPlus' equivalent of 'Data.List.filter'.
+--
+-- ==== __Examples__
+--
+-- The 'Data.List.filter' function is just 'mfilter' specialized to
+-- the list monad:
+--
+-- @
+-- 'Data.List.filter' = ( 'mfilter' :: (a -> Bool) -> [a] -> [a] )
+-- @
+--
+-- An example using 'mfilter' with the 'Maybe' monad:
+--
+-- @
+-- >>> mfilter odd (Just 1)
+-- Just 1
+-- >>> mfilter odd (Just 2)
+-- Nothing
+-- @
 mfilter :: (MonadPlus m) => (a -> Bool) -> m a -> m a
 {-# INLINABLE mfilter #-}
 mfilter p ma = do

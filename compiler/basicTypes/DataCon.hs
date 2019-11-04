@@ -53,7 +53,7 @@ module DataCon (
         isVanillaDataCon, classDataCon, dataConCannotMatch,
         dataConUserTyVarsArePermuted,
         isBanged, isMarkedStrict, eqHsBang, isSrcStrict, isSrcUnpacked,
-        specialPromotedDc, isLegacyPromotableDataCon, isLegacyPromotableTyCon,
+        specialPromotedDc,
 
         -- ** Promotion related functions
         promoteDataCon
@@ -75,7 +75,6 @@ import Name
 import PrelNames
 import Var
 import Outputable
-import ListSetOps
 import Util
 import BasicTypes
 import FastString
@@ -87,7 +86,7 @@ import Unique( mkAlphaTyVarUnique )
 import qualified Data.Data as Data
 import Data.Char
 import Data.Word
-import Data.List( mapAccumL, find )
+import Data.List( find )
 import qualified Data.Set as Set
 
 {-
@@ -846,26 +845,27 @@ isMarkedStrict _               = True   -- All others are strict
 
 -- | Build a new data constructor
 mkDataCon :: Name
-          -> Bool           -- ^ Is the constructor declared infix?
-          -> TyConRepName   -- ^  TyConRepName for the promoted TyCon
-          -> [HsSrcBang]    -- ^ Strictness/unpack annotations, from user
-          -> [FieldLabel]   -- ^ Field labels for the constructor,
-                            -- if it is a record, otherwise empty
-          -> [TyVar]        -- ^ Universals.
-          -> [TyVar]        -- ^ Existentials.
-          -> [TyVarBinder]  -- ^ User-written 'TyVarBinder's.
-                            --   These must be Inferred/Specified.
-                            --   See @Note [TyVarBinders in DataCons]@
-          -> [EqSpec]       -- ^ GADT equalities
-          -> ThetaType      -- ^ Theta-type occuring before the arguments proper
-          -> [Type]         -- ^ Original argument types
-          -> Type           -- ^ Original result type
-          -> RuntimeRepInfo -- ^ See comments on 'TyCon.RuntimeRepInfo'
-          -> TyCon          -- ^ Representation type constructor
-          -> ThetaType      -- ^ The "stupid theta", context of the data
-                            -- declaration e.g. @data Eq a => T a ...@
-          -> Id             -- ^ Worker Id
-          -> DataConRep     -- ^ Representation
+          -> Bool               -- ^ Is the constructor declared infix?
+          -> TyConRepName       -- ^  TyConRepName for the promoted TyCon
+          -> [HsSrcBang]        -- ^ Strictness/unpack annotations, from user
+          -> [FieldLabel]       -- ^ Field labels for the constructor,
+                                -- if it is a record, otherwise empty
+          -> [TyVar]            -- ^ Universals.
+          -> [TyVar]            -- ^ Existentials.
+          -> [TyVarBinder]      -- ^ User-written 'TyVarBinder's.
+                                --   These must be Inferred/Specified.
+                                --   See @Note [TyVarBinders in DataCons]@
+          -> [EqSpec]           -- ^ GADT equalities
+          -> KnotTied ThetaType -- ^ Theta-type occuring before the arguments proper
+          -> [KnotTied Type]    -- ^ Original argument types
+          -> KnotTied Type      -- ^ Original result type
+          -> RuntimeRepInfo     -- ^ See comments on 'TyCon.RuntimeRepInfo'
+          -> KnotTied TyCon     -- ^ Representation type constructor
+          -> ConTag             -- ^ Constructor tag
+          -> ThetaType          -- ^ The "stupid theta", context of the data
+                                -- declaration e.g. @data Eq a => T a ...@
+          -> Id                 -- ^ Worker Id
+          -> DataConRep         -- ^ Representation
           -> DataCon
   -- Can get the tag from the TyCon
 
@@ -874,7 +874,7 @@ mkDataCon name declared_infix prom_info
           fields
           univ_tvs ex_tvs user_tvbs
           eq_spec theta
-          orig_arg_tys orig_res_ty rep_info rep_tycon
+          orig_arg_tys orig_res_ty rep_info rep_tycon tag
           stupid_theta work_id rep
 -- Warning: mkDataCon is not a good place to check certain invariants.
 -- If the programmer writes the wrong result type in the decl, thus:
@@ -894,7 +894,11 @@ mkDataCon name declared_infix prom_info
       == Set.fromList (binderVars user_tvbs)
     user_tvbs' =
       ASSERT2( user_tvbs_invariant
-             , ppr univ_tvs $$ ppr ex_tvs $$ ppr user_tvbs )
+             , (vcat [ ppr name
+                     , ppr univ_tvs
+                     , ppr ex_tvs
+                     , ppr eq_spec
+                     , ppr user_tvbs ]) )
       user_tvbs
     con = MkData {dcName = name, dcUnique = nameUnique name,
                   dcVanilla = is_vanilla, dcInfix = declared_infix,
@@ -918,7 +922,6 @@ mkDataCon name declared_infix prom_info
         -- source-language arguments.  We add extra ones for the
         -- dictionary arguments right here.
 
-    tag = assoc "mkDataCon" (tyConDataCons rep_tycon `zip` [fIRST_TAG..]) con
     rep_arg_tys = dataConRepArgTys con
 
     rep_ty =
@@ -1186,7 +1189,7 @@ dataConInstSig (MkData { dcUnivTyVars = univ_tvs, dcExTyVars = ex_tvs
     , substTys   subst arg_tys)
   where
     univ_subst = zipTvSubst univ_tvs univ_tys
-    (subst, ex_tvs') = mapAccumL Type.substTyVarBndr univ_subst ex_tvs
+    (subst, ex_tvs') = Type.substTyVarBndrs univ_subst ex_tvs
 
 
 -- | The \"full signature\" of the 'DataCon' returns, in order:
@@ -1321,26 +1324,6 @@ isVanillaDataCon dc = dcVanilla dc
 specialPromotedDc :: DataCon -> Bool
 specialPromotedDc = isKindTyCon . dataConTyCon
 
--- | Was this datacon promotable before GHC 8.0? That is, is it promotable
--- without -XTypeInType
-isLegacyPromotableDataCon :: DataCon -> Bool
-isLegacyPromotableDataCon dc
-  =  null (dataConEqSpec dc)  -- no GADTs
-  && null (dataConTheta dc)   -- no context
-  && not (isFamInstTyCon (dataConTyCon dc))   -- no data instance constructors
-  && uniqSetAll isLegacyPromotableTyCon (tyConsOfType (dataConUserType dc))
-
--- | Was this tycon promotable before GHC 8.0? That is, is it promotable
--- without -XTypeInType
-isLegacyPromotableTyCon :: TyCon -> Bool
-isLegacyPromotableTyCon tc
-  = isVanillaAlgTyCon tc ||
-      -- This returns True more often than it should, but it's quite painful
-      -- to make this fully accurate. And no harm is caused; we just don't
-      -- require -XTypeInType every time we need to. (We'll always require
-      -- -XDataKinds, though, so there's no standards-compliance issue.)
-    isFunTyCon tc || isKindTyCon tc
-
 classDataCon :: Class -> DataCon
 classDataCon clas = case tyConDataCons (classTyCon clas) of
                       (dict_constr:no_more) -> ASSERT( null no_more ) dict_constr
@@ -1459,8 +1442,8 @@ buildAlgTyCon tc_name ktvs roles cType stupid_theta rhs
   where
     binders = mkTyConBindersPreferAnon ktvs liftedTypeKind
 
-buildSynTyCon :: Name -> [TyConBinder] -> Kind   -- ^ /result/ kind
-                  -> [Role] -> Type -> TyCon
+buildSynTyCon :: Name -> [KnotTied TyConBinder] -> Kind   -- ^ /result/ kind
+              -> [Role] -> KnotTied Type -> TyCon
 buildSynTyCon name binders res_kind roles rhs
   = mkSynonymTyCon name binders res_kind roles rhs is_tau is_fam_free
   where

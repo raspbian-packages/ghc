@@ -58,6 +58,18 @@ matrix:
     - env: CABALVER=2.0 GHCVER=8.2.1
       compiler: ": #GHC 8.2.1"
       addons: {apt: {packages: [cabal-install-2.0,ghc-8.2.1], sources: [hvr-ghc]}}
+    - env: CABALVER=2.0 GHCVER=8.2.2
+      compiler: ": #GHC 8.2.2"
+      addons: {apt: {packages: [cabal-install-2.0,ghc-8.2.2], sources: [hvr-ghc]}}
+    - env: CABALVER=2.2 GHCVER=8.4.1
+      compiler: ": #GHC 8.4.1"
+      addons: {apt: {packages: [cabal-install-2.2,ghc-8.4.1], sources: [hvr-ghc]}}
+    - env: CABALVER=2.2 GHCVER=8.4.2
+      compiler: ": #GHC 8.4.2"
+      addons: {apt: {packages: [cabal-install-2.2,ghc-8.4.2], sources: [hvr-ghc]}}
+    - env: CABALVER=2.2 GHCVER=8.4.3
+      compiler: ": #GHC 8.4.3"
+      addons: {apt: {packages: [cabal-install-2.2,ghc-8.4.3], sources: [hvr-ghc]}}
 
 before_install:
  - unset CC
@@ -77,7 +89,7 @@ install:
 # can't use "cabal install --only-dependencies --enable-tests" due to dep-cycle
  - if [ -n "$TEST_OPTS" ];
    then
-     cabal install 'test-framework == 0.8.*' 'test-framework-hunit == 0.3.*' 'HUnit >= 1.2 && < 1.6' --dry -v > installplan.txt;
+     cabal install 'test-framework == 0.8.*' 'test-framework-hunit == 0.3.*' 'HUnit >= 1.2 && < 1.7' --dry -v > installplan.txt;
    else
      cabal install --only-dependencies --dry -v > installplan.txt;
    fi
@@ -96,7 +108,7 @@ install:
      mkdir -p $HOME/.ghc $HOME/.cabal/lib $HOME/.cabal/share $HOME/.cabal/bin;
      if [ -n "$TEST_OPTS" ];
      then
-       cabal install -j 'test-framework == 0.8.*' 'test-framework-hunit == 0.3.*' 'HUnit >= 1.2 && < 1.6';
+       cabal install -j 'test-framework == 0.8.*' 'test-framework-hunit == 0.3.*' 'HUnit >= 1.2 && < 1.7';
      else
        cabal install -j --only-dependencies;
      fi

@@ -105,8 +105,6 @@ import Distribution.Utils.LogProgress
 
 import qualified Distribution.Simple.GHC   as GHC
 import qualified Distribution.Simple.GHCJS as GHCJS
-import qualified Distribution.Simple.JHC   as JHC
-import qualified Distribution.Simple.LHC   as LHC
 import qualified Distribution.Simple.UHC   as UHC
 import qualified Distribution.Simple.HaskellSuite as HaskellSuite
 
@@ -474,18 +472,11 @@ configure (pkg_descr0, pbi) cfg = do
 
     debug verbosity $ "Finalized package description:\n"
                   ++ showPackageDescription pkg_descr
-    -- NB: showPackageDescription does not display the AWFUL HACK GLOBAL
-    -- buildDepends, so we have to display it separately.  See #2066
-    -- Some day, we should eliminate this, so that
-    -- configureFinalizedPackage returns the set of overall dependencies
-    -- separately.  Then 'configureDependencies' and
-    -- 'Distribution.PackageDescription.Check' need to be adjusted
-    -- accordingly.
-    debug verbosity $ "Finalized build-depends: "
-                  ++ intercalate ", " (map display (buildDepends pkg_descr))
 
+    let cabalFileDir = maybe "." takeDirectory $
+          flagToMaybe (configCabalFilePath cfg)
     checkCompilerProblems verbosity comp pkg_descr enabled
-    checkPackageProblems verbosity pkg_descr0
+    checkPackageProblems verbosity cabalFileDir pkg_descr0
         (updatePackageDescription pbi pkg_descr)
 
     -- The list of 'InstalledPackageInfo' recording the selected
@@ -517,6 +508,7 @@ configure (pkg_descr0, pbi) cfg = do
                 installedPackageSet
                 requiredDepsMap
                 pkg_descr
+                enabled
 
     -- Compute installation directory templates, based on user
     -- configuration.
@@ -635,7 +627,7 @@ configure (pkg_descr0, pbi) cfg = do
                                       "--enable-split-objs are mutually" ++
                                       "exclusive; ignoring the latter")
                                 return False
-                        GHC | compilerVersion comp >= mkVersion [6,5]
+                        GHC
                           -> return True
                         GHCJS
                           -> return True
@@ -1022,14 +1014,15 @@ configureDependencies
     -> InstalledPackageIndex -- ^ installed packages
     -> Map PackageName InstalledPackageInfo -- ^ required deps
     -> PackageDescription
+    -> ComponentRequestedSpec
     -> IO [PreExistingComponent]
 configureDependencies verbosity use_external_internal_deps
-  internalPackageSet installedPackageSet requiredDepsMap pkg_descr = do
+  internalPackageSet installedPackageSet requiredDepsMap pkg_descr enableSpec = do
     let failedDeps :: [FailedDependency]
         allPkgDeps :: [ResolvedDependency]
         (failedDeps, allPkgDeps) = partitionEithers
           [ (\s -> (dep, s)) <$> status
-          | dep <- buildDepends pkg_descr
+          | dep <- enabledBuildDepends pkg_descr enableSpec
           , let status = selectDependency (package pkg_descr)
                   internalPackageSet installedPackageSet
                   requiredDepsMap use_external_internal_deps dep ]
@@ -1297,8 +1290,6 @@ getInstalledPackages verbosity comp packageDBs progdb = do
   case compilerFlavor comp of
     GHC   -> GHC.getInstalledPackages verbosity comp packageDBs progdb
     GHCJS -> GHCJS.getInstalledPackages verbosity packageDBs progdb
-    JHC   -> JHC.getInstalledPackages verbosity packageDBs progdb
-    LHC   -> LHC.getInstalledPackages verbosity packageDBs progdb
     UHC   -> UHC.getInstalledPackages verbosity comp packageDBs progdb
     HaskellSuite {} ->
       HaskellSuite.getInstalledPackages verbosity packageDBs progdb
@@ -1610,9 +1601,6 @@ configCompilerEx (Just hcFlavor) hcPath hcPkg progdb verbosity = do
   (comp, maybePlatform, programDb) <- case hcFlavor of
     GHC   -> GHC.configure  verbosity hcPath hcPkg progdb
     GHCJS -> GHCJS.configure verbosity hcPath hcPkg progdb
-    JHC   -> JHC.configure  verbosity hcPath hcPkg progdb
-    LHC   -> do (_, _, ghcConf) <- GHC.configure  verbosity Nothing hcPkg progdb
-                LHC.configure  verbosity hcPath Nothing ghcConf
     UHC   -> UHC.configure  verbosity hcPath hcPkg progdb
     HaskellSuite {} -> HaskellSuite.configure verbosity hcPath hcPkg progdb
     _    -> die' verbosity "Unknown compiler"
@@ -1726,12 +1714,12 @@ checkForeignDeps pkg lbi verbosity =
                      -- should NOT be glomming everything together.)
                      ++ [ "-I" ++ buildDir lbi </> "autogen" ]
                      -- `configure' may generate headers in the build directory
-                     ++ [ "-I" ++ buildDir lbi </> dir | dir <- collectField PD.includeDirs
+                     ++ [ "-I" ++ buildDir lbi </> dir | dir <- ordNub (collectField PD.includeDirs)
                                                        , not (isAbsolute dir)]
                      -- we might also reference headers from the packages directory.
-                     ++ [ "-I" ++ baseDir lbi </> dir | dir <- collectField PD.includeDirs
+                     ++ [ "-I" ++ baseDir lbi </> dir | dir <- ordNub (collectField PD.includeDirs)
                                                       , not (isAbsolute dir)]
-                     ++ [ "-I" ++ dir | dir <- collectField PD.includeDirs
+                     ++ [ "-I" ++ dir | dir <- ordNub (collectField PD.includeDirs)
                                       , isAbsolute dir]
                      ++ ["-I" ++ baseDir lbi]
                      ++ collectField PD.cppOptions
@@ -1753,7 +1741,7 @@ checkForeignDeps pkg lbi verbosity =
                         | dep <- deps
                         , opt <- Installed.ccOptions dep ]
 
-        commonLdArgs  = [ "-L" ++ dir | dir <- collectField PD.extraLibDirs ]
+        commonLdArgs  = [ "-L" ++ dir | dir <- ordNub (collectField PD.extraLibDirs) ]
                      ++ collectField PD.ldOptions
                      ++ [ "-L" ++ dir
                         | dir <- ordNub [ dir
@@ -1855,11 +1843,13 @@ checkForeignDeps pkg lbi verbosity =
 
 -- | Output package check warnings and errors. Exit if any errors.
 checkPackageProblems :: Verbosity
+                     -> FilePath
+                        -- ^ Path to the @.cabal@ file's directory
                      -> GenericPackageDescription
                      -> PackageDescription
                      -> IO ()
-checkPackageProblems verbosity gpkg pkg = do
-  ioChecks      <- checkPackageFiles pkg "."
+checkPackageProblems verbosity dir gpkg pkg = do
+  ioChecks      <- checkPackageFiles verbosity pkg dir
   let pureChecks = checkPackage gpkg (Just pkg)
       errors   = [ e | PackageBuildImpossible e <- pureChecks ++ ioChecks ]
       warnings = [ w | PackageBuildWarning    w <- pureChecks ++ ioChecks ]
@@ -1972,9 +1962,6 @@ checkForeignLibSupported comp platform flib = go (compilerFlavor comp)
 
     goGhcOsx :: ForeignLibType -> Maybe String
     goGhcOsx ForeignLibNativeShared
-      | standalone = unsupported [
-            "We cannot build standalone libraries on OSX"
-          ]
       | not (null (foreignLibModDefFile flib)) = unsupported [
             "Module definition file not supported on OSX"
           ]
@@ -1989,9 +1976,6 @@ checkForeignLibSupported comp platform flib = go (compilerFlavor comp)
 
     goGhcLinux :: ForeignLibType -> Maybe String
     goGhcLinux ForeignLibNativeShared
-      | standalone = unsupported [
-            "We cannot build standalone libraries on Linux"
-          ]
       | not (null (foreignLibModDefFile flib)) = unsupported [
             "Module definition file not supported on Linux"
           ]

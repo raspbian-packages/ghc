@@ -58,6 +58,9 @@ import Control.Monad.IO.Class
 import Control.Monad.Signatures
 import Control.Monad.Trans.Class
 import Data.Functor.Classes
+#if MIN_VERSION_base(4,12,0)
+import Data.Functor.Contravariant
+#endif
 
 import Control.Applicative
 import Control.Exception (IOException)
@@ -235,7 +238,9 @@ instance (Monad m, Error e) => Monad (ErrorT e m) where
         case a of
             Left  l -> return (Left l)
             Right r -> runErrorT (k r)
+#if !(MIN_VERSION_base(4,13,0))
     fail msg = ErrorT $ return (Left (strMsg msg))
+#endif
 
 #if MIN_VERSION_base(4,9,0)
 instance (Monad m, Error e) => Fail.MonadFail (ErrorT e m) where
@@ -262,6 +267,11 @@ instance MonadTrans (ErrorT e) where
 
 instance (Error e, MonadIO m) => MonadIO (ErrorT e m) where
     liftIO = lift . liftIO
+
+#if MIN_VERSION_base(4,12,0)
+instance Contravariant m => Contravariant (ErrorT e m) where
+    contramap f = ErrorT . contramap (fmap f) . runErrorT
+#endif
 
 -- | Signal an error value @e@.
 --

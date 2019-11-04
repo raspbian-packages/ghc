@@ -27,12 +27,12 @@ import Distribution.Solver.Types.PackageConstraint
 import Distribution.Solver.Types.PackageIndex
 import Distribution.Client.Sandbox.PackageEnvironment
 
-import Distribution.Package                          (PackageName
-                                                     ,packageVersion)
-import Distribution.PackageDescription               (buildDepends)
+import Distribution.Package                          (PackageName, packageVersion)
+import Distribution.PackageDescription               (allBuildDepends)
 import Distribution.PackageDescription.Configuration (finalizePD)
 import Distribution.Simple.Compiler                  (Compiler, compilerInfo)
-import Distribution.Simple.Setup                     (fromFlagOrDefault)
+import Distribution.Simple.Setup
+       (fromFlagOrDefault, flagToMaybe)
 import Distribution.Simple.Utils
        (die', notice, debug, tryFindPackageDesc)
 import Distribution.System                           (Platform)
@@ -61,6 +61,8 @@ outdated verbosity0 outdatedFlags repoContext comp platform = do
   let freezeFile    = fromFlagOrDefault False (outdatedFreezeFile outdatedFlags)
       newFreezeFile = fromFlagOrDefault False
                       (outdatedNewFreezeFile outdatedFlags)
+      mprojectFile  = flagToMaybe
+                      (outdatedProjectFile outdatedFlags)
       simpleOutput  = fromFlagOrDefault False
                       (outdatedSimpleOutput outdatedFlags)
       quiet         = fromFlagOrDefault False (outdatedQuiet outdatedFlags)
@@ -76,13 +78,17 @@ outdated verbosity0 outdatedFlags repoContext comp platform = do
                           in \pkgname -> pkgname `S.member` minorSet
       verbosity     = if quiet then silent else verbosity0
 
+  when (not newFreezeFile && isJust mprojectFile) $
+    die' verbosity $
+      "--project-file must only be used with --new-freeze-file."
+
   sourcePkgDb <- IndexUtils.getSourcePackages verbosity repoContext
   let pkgIndex = packageIndex sourcePkgDb
   deps <- if freezeFile
           then depsFromFreezeFile verbosity
           else if newFreezeFile
-               then depsFromNewFreezeFile verbosity
-               else depsFromPkgDesc       verbosity comp platform
+               then depsFromNewFreezeFile verbosity mprojectFile
+               else depsFromPkgDesc verbosity comp platform
   debug verbosity $ "Dependencies loaded: "
     ++ (intercalate ", " $ map display deps)
   let outdatedDeps = listOutdated deps pkgIndex
@@ -124,11 +130,10 @@ depsFromFreezeFile verbosity = do
   return deps
 
 -- | Read the list of dependencies from the new-style freeze file.
-depsFromNewFreezeFile :: Verbosity -> IO [Dependency]
-depsFromNewFreezeFile verbosity = do
+depsFromNewFreezeFile :: Verbosity -> Maybe FilePath -> IO [Dependency]
+depsFromNewFreezeFile verbosity mprojectFile = do
   projectRoot <- either throwIO return =<<
-                 findProjectRoot Nothing
-                 {- TODO: Support '--project-file': -} Nothing
+                 findProjectRoot Nothing mprojectFile
   let distDirLayout = defaultDistDirLayout projectRoot
                       {- TODO: Support dist dir override -} Nothing
   projectConfig  <- runRebuild (distProjectRootDirectory distDirLayout) $
@@ -136,8 +141,8 @@ depsFromNewFreezeFile verbosity = do
   let ucnstrs = map fst . projectConfigConstraints . projectConfigShared
                 $ projectConfig
       deps    = userConstraintsToDependencies ucnstrs
-  debug verbosity
-    "Reading the list of dependencies from the new-style freeze file"
+  debug verbosity $
+    "Reading the list of dependencies from the new-style freeze file " ++ distProjectFile distDirLayout "freeze"
   return deps
 
 -- | Read the list of dependencies from the package description.
@@ -152,7 +157,7 @@ depsFromPkgDesc verbosity comp platform = do
   case epd of
     Left _        -> die' verbosity "finalizePD failed"
     Right (pd, _) -> do
-      let bd = buildDepends pd
+      let bd = allBuildDepends pd
       debug verbosity
         "Reading the list of dependencies from the package description"
       return bd

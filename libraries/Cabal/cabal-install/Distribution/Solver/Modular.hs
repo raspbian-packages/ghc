@@ -10,7 +10,7 @@ module Distribution.Solver.Modular
 -- plan.
 
 import Prelude ()
-import Distribution.Client.Compat.Prelude
+import Distribution.Solver.Compat.Prelude
 
 import qualified Data.Map as M
 import Data.Set (Set)
@@ -48,6 +48,7 @@ import Distribution.System
          ( Platform(..) )
 import Distribution.Simple.Utils
          ( ordNubBy )
+import Distribution.Verbosity
 
 
 -- | Ties the two worlds together: classic cabal-install vs. the modular
@@ -58,7 +59,7 @@ modularResolver sc (Platform arch os) cinfo iidx sidx pkgConfigDB pprefs pcs pns
   solve' sc cinfo idx pkgConfigDB pprefs gcs pns
     where
       -- Indices have to be converted into solver-specific uniform index.
-      idx    = convPIs os arch cinfo (shadowPkgs sc) (strongFlags sc) (solveExecutables sc) iidx sidx
+      idx    = convPIs os arch cinfo gcs (shadowPkgs sc) (strongFlags sc) (solveExecutables sc) iidx sidx
       -- Constraints have to be converted into a finite map indexed by PN.
       gcs    = M.fromListWith (++) (map pair pcs)
         where
@@ -115,35 +116,36 @@ solve' :: SolverConfig
        -> Set PN
        -> Progress String String (Assignment, RevDepMap)
 solve' sc cinfo idx pkgConfigDB pprefs gcs pns =
-    foldProgress Step createErrorMsg Done (runSolver sc)
+    foldProgress Step (uncurry createErrorMsg) Done (runSolver printFullLog sc)
   where
-    runSolver :: SolverConfig
-              -> Progress String SolverFailure (Assignment, RevDepMap)
-    runSolver sc' =
-        logToProgress (solverVerbosity sc') (maxBackjumps sc') $ -- convert log format into progress format
+    runSolver :: Bool -> SolverConfig
+              -> Progress String (SolverFailure, String) (Assignment, RevDepMap)
+    runSolver keepLog sc' =
+        logToProgress keepLog (solverVerbosity sc') (maxBackjumps sc') $
         solve sc' cinfo idx pkgConfigDB pprefs gcs pns
 
-    createErrorMsg :: SolverFailure
+    createErrorMsg :: SolverFailure -> String
                    -> Progress String String (Assignment, RevDepMap)
-    createErrorMsg (NoSolution cs        msg) =
-        Fail $ rerunSolverForErrorMsg cs msg
-    createErrorMsg (BackjumpLimitReached msg) =
+    createErrorMsg (ExhaustiveSearch cs _) msg =
+        Fail $ rerunSolverForErrorMsg cs ++ msg
+    createErrorMsg BackjumpLimitReached    msg =
         Step ("Backjump limit reached. Rerunning dependency solver to generate "
               ++ "a final conflict set for the search tree containing the "
               ++ "first backjump.") $
-        foldProgress Step f Done $
-        runSolver sc { pruneAfterFirstSuccess = PruneAfterFirstSuccess True }
+        foldProgress Step (f . fst) Done $
+        runSolver printFullLog
+                  sc { pruneAfterFirstSuccess = PruneAfterFirstSuccess True }
       where
         f :: SolverFailure -> Progress String String (Assignment, RevDepMap)
-        f (NoSolution cs        _) = Fail $ rerunSolverForErrorMsg cs msg
-        f (BackjumpLimitReached _) =
+        f (ExhaustiveSearch cs _) = Fail $ rerunSolverForErrorMsg cs ++ msg
+        f BackjumpLimitReached    =
             -- This case is possible when the number of goals involved in
             -- conflicts is greater than the backjump limit.
             Fail $ msg ++ "Failed to generate a summarized dependency solver "
                        ++ "log due to low backjump limit."
 
-    rerunSolverForErrorMsg :: ConflictSet -> String -> String
-    rerunSolverForErrorMsg cs finalMsg =
+    rerunSolverForErrorMsg :: ConflictSet -> String
+    rerunSolverForErrorMsg cs =
       let sc' = sc {
                     goalOrder = Just goalOrder'
                   , maxBackjumps = Just 0
@@ -153,8 +155,9 @@ solve' sc cinfo idx pkgConfigDB pprefs gcs pns =
           -- original goal order.
           goalOrder' = preferGoalsFromConflictSet cs <> fromMaybe mempty (goalOrder sc)
 
-      in unlines ("Could not resolve dependencies:" : messages (runSolver sc'))
-          ++ finalMsg
+      in unlines ("Could not resolve dependencies:" : messages (runSolver True sc'))
+
+    printFullLog = solverVerbosity sc >= verbose
 
     messages :: Progress step fail done -> [step]
     messages = foldProgress (:) (const []) (const [])

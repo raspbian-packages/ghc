@@ -29,6 +29,7 @@
 #include "Arena.h"
 #include "RetainerProfile.h"
 #include "CNF.h"
+#include "Profiling.h" // prof_arena
 
 /* -----------------------------------------------------------------------------
    Forward decls.
@@ -210,6 +211,17 @@ checkPAP (StgClosure *tagged_fun, StgClosure** payload, StgWord n_args)
            : GET_CLOSURE_TAG(tagged_fun) == fun_info->f.arity);
 }
 
+#if defined(PROFILING)
+static void
+checkClosureProfSanity(const StgClosure *p)
+{
+    StgProfHeader prof_hdr = p->header.prof;
+    CostCentreStack *ccs = prof_hdr.ccs;
+    if (HEAP_ALLOCED_GC((void*)ccs)) {
+        checkPtrInArena((StgPtr)ccs, prof_arena);
+    }
+}
+#endif
 
 StgOffset
 checkClosure( const StgClosure* p )
@@ -225,6 +237,11 @@ checkClosure( const StgClosure* p )
     if (IS_FORWARDING_PTR(info)) {
         barf("checkClosure: found EVACUATED closure %d", info->type);
     }
+
+#if defined(PROFILING)
+    checkClosureProfSanity(p);
+#endif
+
     info = INFO_PTR_TO_STRUCT(info);
 
     switch (info->type) {
@@ -292,8 +309,12 @@ checkClosure( const StgClosure* p )
         ASSERT(LOOKS_LIKE_CLOSURE_PTR(bq->bh));
 
         ASSERT(get_itbl((StgClosure *)(bq->owner))->type == TSO);
-        ASSERT(bq->queue == (MessageBlackHole*)END_TSO_QUEUE
-               || bq->queue->header.info == &stg_MSG_BLACKHOLE_info);
+        ASSERT(// A bq with no other blocked TSOs:
+               bq->queue == (MessageBlackHole*)END_TSO_QUEUE ||
+               // A bq with blocked TSOs in its queue:
+               bq->queue->header.info == &stg_MSG_BLACKHOLE_info ||
+               // A bq with a deleted (in throwToMsg()) MSG_BLACKHOLE:
+               bq->queue->header.info == &stg_IND_info);
         ASSERT(bq->link == (StgBlockingQueue*)END_TSO_QUEUE ||
                get_itbl((StgClosure *)(bq->link))->type == IND ||
                get_itbl((StgClosure *)(bq->link))->type == BLOCKING_QUEUE);
@@ -380,8 +401,8 @@ checkClosure( const StgClosure* p )
 
     case MUT_ARR_PTRS_CLEAN:
     case MUT_ARR_PTRS_DIRTY:
-    case MUT_ARR_PTRS_FROZEN:
-    case MUT_ARR_PTRS_FROZEN0:
+    case MUT_ARR_PTRS_FROZEN_CLEAN:
+    case MUT_ARR_PTRS_FROZEN_DIRTY:
         {
             StgMutArrPtrs* a = (StgMutArrPtrs *)p;
             uint32_t i;
@@ -389,6 +410,18 @@ checkClosure( const StgClosure* p )
                 ASSERT(LOOKS_LIKE_CLOSURE_PTR(a->payload[i]));
             }
             return mut_arr_ptrs_sizeW(a);
+        }
+
+    case SMALL_MUT_ARR_PTRS_CLEAN:
+    case SMALL_MUT_ARR_PTRS_DIRTY:
+    case SMALL_MUT_ARR_PTRS_FROZEN_CLEAN:
+    case SMALL_MUT_ARR_PTRS_FROZEN_DIRTY:
+        {
+            StgSmallMutArrPtrs *a = (StgSmallMutArrPtrs *)p;
+            for (uint32_t i = 0; i < a->ptrs; i++) {
+                ASSERT(LOOKS_LIKE_CLOSURE_PTR(a->payload[i]));
+            }
+            return small_mut_arr_ptrs_sizeW(a);
         }
 
     case TSO:
@@ -535,7 +568,8 @@ checkTSO(StgTSO *tso)
     ASSERT(next == END_TSO_QUEUE ||
            info == &stg_MVAR_TSO_QUEUE_info ||
            info == &stg_TSO_info ||
-           info == &stg_WHITEHOLE_info); // happens due to STM doing lockTSO()
+           info == &stg_WHITEHOLE_info); // used to happen due to STM doing
+                                         // lockTSO(), might not happen now
 
     if (   tso->why_blocked == BlockedOnMVar
         || tso->why_blocked == BlockedOnMVarRead
@@ -677,7 +711,7 @@ checkStaticObjects ( StgClosure* static_objects )
       break;
 
     case FUN_STATIC:
-      p = *FUN_STATIC_LINK((StgClosure *)p);
+      p = *STATIC_LINK(info,(StgClosure *)p);
       break;
 
     case CONSTR:
@@ -859,7 +893,7 @@ void findSlop(bdescr *bd)
         slop = (bd->blocks * BLOCK_SIZE_W) - (bd->free - bd->start);
         if (slop > (1024/sizeof(W_))) {
             debugBelch("block at %p (bdescr %p) has %" FMT_Word "KB slop\n",
-                       bd->start, bd, slop / (1024/sizeof(W_)));
+                       bd->start, bd, slop / (1024/(W_)sizeof(W_)));
         }
     }
 }

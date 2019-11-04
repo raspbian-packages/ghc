@@ -43,6 +43,7 @@ module System.Process (
     readCreateProcessWithExitCode,
     readProcessWithExitCode,
     withCreateProcess,
+    cleanupProcess,
 
     -- ** Related utilities
     showCommandForUser,
@@ -245,7 +246,12 @@ withCreateProcess_ fun c action =
     C.bracketOnError (createProcess_ fun c) cleanupProcess
                      (\(m_in, m_out, m_err, ph) -> action m_in m_out m_err ph)
 
-
+-- | Cleans up the process.
+-- 
+-- This function is meant to be invoked from any application level cleanup 
+-- handler. It terminates the process, and closes any 'CreatePipe' 'handle's.
+-- 
+-- @since 1.6.4.0
 cleanupProcess :: (Maybe Handle, Maybe Handle, Maybe Handle, ProcessHandle)
                -> IO ()
 cleanupProcess (mb_stdin, mb_stdout, mb_stderr,
@@ -728,8 +734,10 @@ getProcessExitCode ph@(ProcessHandle _ delegating_ctlc _) = tryLockWaitpid $ do
 -- has indeed terminated, use 'getProcessExitCode'.
 --
 -- On Unix systems, 'terminateProcess' sends the process the SIGTERM signal.
--- On Windows systems, the Win32 @TerminateProcess@ function is called, passing
--- an exit code of 1.
+-- On Windows systems, if `use_process_jobs` is `True` then the Win32 @TerminateJobObject@
+-- function is called to kill all processes associated with the job and passing the
+-- exit code of 1 to each of them. Otherwise if `use_process_jobs` is `False` then the
+-- Win32 @TerminateProcess@ function is called, passing an exit code of 1.
 --
 -- Note: on Windows, if the process was a shell command created by
 -- 'createProcess' with 'shell', or created by 'runCommand' or

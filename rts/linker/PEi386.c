@@ -156,7 +156,7 @@ static uint8_t* cstring_from_COFF_symbol_name(
 #include <inttypes.h>
 #include <dbghelp.h>
 #include <stdlib.h>
-#include <Psapi.h>
+#include <psapi.h>
 
 #if defined(x86_64_HOST_ARCH)
 static size_t makeSymbolExtra_PEi386(
@@ -1467,7 +1467,7 @@ ocGetNames_PEi386 ( ObjectCode* oc )
    /* Copy exported symbols into the ObjectCode. */
 
    oc->n_symbols = info->numberOfSymbols;
-   oc->symbols   = stgCallocBytes(sizeof(SymbolName*), oc->n_symbols,
+   oc->symbols   = stgCallocBytes(sizeof(Symbol_t), oc->n_symbols,
                                   "ocGetNames_PEi386(oc->symbols)");
 
    /* Work out the size of the global BSS section */
@@ -1623,8 +1623,8 @@ ocGetNames_PEi386 ( ObjectCode* oc )
          /* debugBelch("addSymbol %p `%s' Weak:%lld \n", addr, sname, isWeak); */
          IF_DEBUG(linker, debugBelch("addSymbol %p `%s'\n", addr,sname));
          ASSERT(i < (uint32_t)oc->n_symbols);
-         /* cstring_from_COFF_symbol_name always succeeds. */
-         oc->symbols[i] = (SymbolName*)sname;
+         oc->symbols[i].name = sname;
+         oc->symbols[i].addr = addr;
          if (isWeak) {
              setWeakSymbol(oc, sname);
          }
@@ -1637,7 +1637,8 @@ ocGetNames_PEi386 ( ObjectCode* oc )
       } else {
           /* We're skipping the symbol, but if we ever load this
           object file we'll want to skip it then too. */
-          oc->symbols[i] = NULL;
+          oc->symbols[i].name = NULL;
+          oc->symbols[i].addr = NULL;
 
 #        if 0
          debugBelch(
@@ -2025,6 +2026,9 @@ SymbolAddr *lookupSymbol_PEi386(SymbolName *lbl)
         zapTrailingAtSign ( (unsigned char*)lbl );
 #endif
         sym = lookupSymbolInDLLs((unsigned char*)lbl);
+        /* TODO: We should really cache this symbol now that we've loaded it.
+                 The system loader is fast, but not fast enough to keep wasting
+                 cycles like this.  */
         return sym; // might be NULL if not found
     } else {
 #if defined(mingw32_HOST_OS)
@@ -2199,7 +2203,7 @@ resolveSymbolAddr_PEi386 (pathchar* buffer, int size,
                                    "resolveSymbolAddr");
       int blanks = 0;
       for (int i = 0; i < obj->n_symbols; i++) {
-          SymbolName* sym = obj->symbols[i];
+          SymbolName* sym = obj->symbols[i].name;
           if (sym == NULL)
             {
                blanks++;

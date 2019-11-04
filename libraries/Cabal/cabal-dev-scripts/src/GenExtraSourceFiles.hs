@@ -1,7 +1,9 @@
+{-# LANGUAGE OverloadedStrings #-}
+
 import qualified Distribution.ModuleName               as ModuleName
 import           Distribution.PackageDescription
-import           Distribution.PackageDescription.Parse
-                 (ParseResult (..), parseGenericPackageDescription)
+import           Distribution.PackageDescription.Parsec
+                 (parseGenericPackageDescription, runParseResult)
 import           Distribution.Verbosity                (silent)
 
 import Control.Monad      (liftM, filterM)
@@ -11,22 +13,28 @@ import System.Environment (getArgs, getProgName)
 import System.FilePath    ((</>), takeDirectory, takeExtension, takeFileName)
 import System.Process     (readProcess)
 
-import qualified System.IO as IO
 
-main' :: FilePath -> IO ()
-main' fp' = do
+import qualified Data.ByteString       as BS
+import qualified Data.ByteString.Char8 as BS8
+import qualified System.IO             as IO
+
+main' :: FilePath -> FilePath -> IO ()
+main' templateFp fp' = do
     fp <- canonicalizePath fp'
     setCurrentDirectory (takeDirectory fp)
+    print $ takeDirectory fp
 
     -- Read cabal file, so we can determine test modules
-    contents <- strictReadFile fp
-    cabal <- case parseGenericPackageDescription contents of
-        ParseOk _ x      -> pure x
-        ParseFailed errs -> fail (show errs)
+    contents <- BS.readFile fp
+    cabal <-
+      case snd . runParseResult . parseGenericPackageDescription $ contents of
+        Right x            -> pure x
+        Left (_mver, errs) -> fail (show errs)
 
     -- We skip some files
     testModuleFiles    <- getOtherModulesFiles cabal
     let skipPredicates' = skipPredicates ++ map (==) testModuleFiles
+    print testModuleFiles
 
     -- Read all files git knows about under "tests"
     files0 <- lines <$> readProcess "git" ["ls-files", "tests"] ""
@@ -40,13 +48,17 @@ main' fp' = do
     let files = files3
 
     -- Read current file
-    let inputLines  = lines contents
-        linesBefore = takeWhile (/= topLine) inputLines
-        linesAfter  = dropWhile (/= bottomLine) inputLines
+    templateContents <- BS.readFile templateFp
+    let topLine'    = BS8.pack topLine
+        bottomLine' = BS8.pack bottomLine
+        inputLines  = BS8.lines templateContents
+        linesBefore = takeWhile (/= topLine')    inputLines
+        linesAfter  = dropWhile (/= bottomLine') inputLines
 
     -- Output
-    let outputLines = linesBefore ++ [topLine] ++ map ("  " ++) files ++ linesAfter
-    writeFile fp (unlines outputLines)
+    let outputLines = linesBefore ++ [topLine']
+                      ++ map ((<>) "  " . BS8.pack) files ++ linesAfter
+    BS.writeFile templateFp (BS8.unlines outputLines)
 
 
 topLine, bottomLine :: String
@@ -99,19 +111,11 @@ main :: IO ()
 main = do
     args <- getArgs
     case args of
-        [fp] -> main' fp
-        _    -> do
+        [fp]     -> main' fp fp
+        [fp,fp'] -> main' fp fp'
+        _        -> do
             progName <- getProgName
             putStrLn "Error too few arguments!"
-            putStrLn $ "Usage: " ++ progName ++ " FILE"
+            putStrLn $ "Usage: " ++ progName ++ " <FILE | FILE CABAL>"
             putStrLn $ "  where FILE is Cabal.cabal, cabal-testsuite.cabal, "
               ++ "or cabal-install.cabal"
-
-strictReadFile :: FilePath -> IO String
-strictReadFile fp = do
-    handle <- IO.openFile fp IO.ReadMode
-    contents <- get handle
-    IO.hClose handle
-    return contents
-  where
-    get h = IO.hGetContents h >>= \s -> length s `seq` return s

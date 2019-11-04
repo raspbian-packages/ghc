@@ -28,9 +28,9 @@ import StgCmmHeap
 import StgCmmLayout
 import StgCmmUtils
 import StgCmmClosure
-import StgCmmProf ( curCCS )
 
 import CmmExpr
+import CmmUtils
 import CLabel
 import MkGraph
 import SMRep
@@ -86,8 +86,10 @@ cgTopRhsCon dflags id con args =
 
             mk_payload (Padding len _) = return (CmmInt 0 (widthFromBytes len))
             mk_payload (FieldOff arg _) = do
-                CmmLit lit <- getArgAmode arg
-                return lit
+                amode <- getArgAmode arg
+                case amode of
+                  CmmLit lit -> return lit
+                  _          -> panic "StgCmmCon.cgTopRhsCon"
 
             nonptr_wds = tot_wds - ptr_wds
 
@@ -198,7 +200,7 @@ because they don't support cross package data references well.
 buildDynCon' dflags platform binder _ _cc con [arg]
   | maybeIntLikeCon con
   , platformOS platform /= OSMinGW32 || not (positionIndependent dflags)
-  , NonVoid (StgLitArg (MachInt val)) <- arg
+  , NonVoid (StgLitArg (LitNumber LitNumInt val _)) <- arg
   , val <= fromIntegral (mAX_INTLIKE dflags) -- Comparisons at type Integer!
   , val >= fromIntegral (mIN_INTLIKE dflags) -- ...ditto...
   = do  { let intlike_lbl   = mkCmmClosureLabel rtsUnitId (fsLit "stg_INTLIKE")
@@ -245,7 +247,7 @@ buildDynCon' dflags _ binder actually_bound ccs con args
           ; return (mkRhsInit dflags reg lf_info hp_plus_n) }
     where
       use_cc      -- cost-centre to stick in the object
-        | isCurrentCCS ccs = curCCS
+        | isCurrentCCS ccs = cccsExpr
         | otherwise        = panic "buildDynCon: non-current CCS not implemented"
 
       blame_cc = use_cc -- cost-centre on which to blame the alloc (same)

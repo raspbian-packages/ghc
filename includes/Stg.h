@@ -25,8 +25,8 @@
 
 #pragma once
 
-#if !(__STDC_VERSION__ >= 199901L)
-# error __STDC_VERSION__ does not advertise C99 or later
+#if !(__STDC_VERSION__ >= 199901L) && !(__cplusplus >= 201103L)
+# error __STDC_VERSION__ does not advertise C99, C++11 or later
 #endif
 
 /*
@@ -232,16 +232,6 @@ typedef StgInt    I_;
 typedef StgWord StgWordArray[];
 typedef StgFunPtr       F_;
 
-#if __GLASGOW_HASKELL__ < 804
-#define EB_(X)    extern char X[]
-#define IB_(X)    static char X[]
-#define EI_(X)          extern StgWordArray (X) GNU_ATTRIBUTE(aligned (8))
-#define II_(X)          static StgWordArray (X) GNU_ATTRIBUTE(aligned (8))
-#define IF_(f)    static StgFunPtr GNUC3_ATTRIBUTE(used) f(void)
-#define FN_(f)    StgFunPtr f(void)
-#define EF_(f)    StgFunPtr f(void) /* External Cmm functions */
-#define EFF_(f)   void f() /* See Note [External function prototypes] */
-#else
 /* byte arrays (and strings): */
 #define EB_(X)    extern const char X[]
 #define IB_(X)    static const char X[]
@@ -260,7 +250,6 @@ typedef StgFunPtr       F_;
 #define EF_(f)           StgFunPtr f(void) /* External Cmm functions */
 /* foreign functions: */
 #define EFF_(f)   void f() /* See Note [External function prototypes] */
-#endif  /* __GLASGOW_HASKELL__ < 804 */
 
 /* Note [External function prototypes]  See Trac #8965, #11395
    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

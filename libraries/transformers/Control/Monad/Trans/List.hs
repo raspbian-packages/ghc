@@ -34,12 +34,16 @@ import Control.Monad.IO.Class
 import Control.Monad.Signatures
 import Control.Monad.Trans.Class
 import Data.Functor.Classes
+#if MIN_VERSION_base(4,12,0)
+import Data.Functor.Contravariant
+#endif
 
 import Control.Applicative
 import Control.Monad
 #if MIN_VERSION_base(4,9,0)
 import qualified Control.Monad.Fail as Fail
 #endif
+import Control.Monad.Fix
 #if MIN_VERSION_base(4,4,0)
 import Control.Monad.Zip (MonadZip(mzipWith))
 #endif
@@ -119,8 +123,10 @@ instance (Monad m) => Monad (ListT m) where
         b <- mapM (runListT . k) a
         return (concat b)
     {-# INLINE (>>=) #-}
+#if !(MIN_VERSION_base(4,13,0))
     fail _ = ListT $ return []
     {-# INLINE fail #-}
+#endif
 
 #if MIN_VERSION_base(4,9,0)
 instance (Monad m) => Fail.MonadFail (ListT m) where
@@ -137,6 +143,12 @@ instance (Monad m) => MonadPlus (ListT m) where
         return (a ++ b)
     {-# INLINE mplus #-}
 
+instance (MonadFix m) => MonadFix (ListT m) where
+    mfix f = ListT $ mfix (runListT . f . head) >>= \ xs -> case xs of
+        [] -> return []
+        x:_ -> liftM (x:) (runListT (mfix (mapListT (liftM tail) . f)))
+    {-# INLINE mfix #-}
+
 instance MonadTrans ListT where
     lift m = ListT $ do
         a <- m
@@ -151,6 +163,12 @@ instance (MonadIO m) => MonadIO (ListT m) where
 instance (MonadZip m) => MonadZip (ListT m) where
     mzipWith f (ListT a) (ListT b) = ListT $ mzipWith (zipWith f) a b
     {-# INLINE mzipWith #-}
+#endif
+
+#if MIN_VERSION_base(4,12,0)
+instance Contravariant m => Contravariant (ListT m) where
+    contramap f = ListT . contramap (fmap f) . runListT
+    {-# INLINE contramap #-}
 #endif
 
 -- | Lift a @callCC@ operation to the new monad.

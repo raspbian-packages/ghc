@@ -862,11 +862,13 @@ pprIfaceDecl _ (IfacePatSyn { ifName = name,
   = sdocWithDynFlags mk_msg
   where
     mk_msg dflags
-      = hsep [ text "pattern", pprPrefixOcc name, dcolon
-             , univ_msg, pprIfaceContextArr req_ctxt
-             , ppWhen insert_empty_ctxt $ parens empty <+> darrow
-             , ex_msg, pprIfaceContextArr prov_ctxt
-             , pprIfaceType $ foldr IfaceFunTy pat_ty arg_tys]
+      = hang (text "pattern" <+> pprPrefixOcc name)
+           2 (dcolon <+> sep [univ_msg
+                             , pprIfaceContextArr req_ctxt
+                             , ppWhen insert_empty_ctxt $ parens empty <+> darrow
+                             , ex_msg
+                             , pprIfaceContextArr prov_ctxt
+                             , pprIfaceType $ foldr IfaceFunTy pat_ty arg_tys ])
       where
         univ_msg = pprUserIfaceForAll univ_bndrs
         ex_msg   = pprUserIfaceForAll ex_bndrs
@@ -951,7 +953,7 @@ pprIfaceTyConParent IfNoParent
 pprIfaceTyConParent (IfDataInstance _ tc tys)
   = sdocWithDynFlags $ \dflags ->
     let ftys = stripInvisArgs dflags tys
-    in pprIfaceTypeApp TopPrec tc ftys
+    in pprIfaceTypeApp topPrec tc ftys
 
 pprIfaceDeclHead :: IfaceContext -> ShowSub -> Name
                  -> [IfaceTyConBinder]   -- of the tycon, for invisible-suppression

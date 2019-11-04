@@ -47,6 +47,7 @@ import Distribution.Simple.LocalBuildInfo
 import Distribution.Simple.BuildPaths
 import Distribution.Simple.Utils
 import Distribution.Simple.Program
+import Distribution.Simple.Program.ResponseFile
 import Distribution.Simple.Test.LibV09
 import Distribution.System
 import Distribution.Text
@@ -102,11 +103,11 @@ data PreProcessor = PreProcessor {
   -- Is the output of the pre-processor platform independent? eg happy output
   -- is portable haskell but c2hs's output is platform dependent.
   -- This matters since only platform independent generated code can be
-  -- inlcuded into a source tarball.
+  -- included into a source tarball.
   platformIndependent :: Bool,
 
-  -- TODO: deal with pre-processors that have implementaion dependent output
-  --       eg alex and happy have --ghc flags. However we can't really inlcude
+  -- TODO: deal with pre-processors that have implementation dependent output
+  --       eg alex and happy have --ghc flags. However we can't really include
   --       ghc-specific code into supposedly portable source tarballs.
 
   runPreProcessor :: (FilePath, FilePath) -- Location of the source file relative to a base dir
@@ -343,8 +344,8 @@ ppCpp = ppCpp' []
 ppCpp' :: [String] -> BuildInfo -> LocalBuildInfo -> ComponentLocalBuildInfo -> PreProcessor
 ppCpp' extraArgs bi lbi clbi =
   case compilerFlavor (compiler lbi) of
-    GHC   -> ppGhcCpp ghcProgram   (>= mkVersion [6,6])  args bi lbi clbi
-    GHCJS -> ppGhcCpp ghcjsProgram (const True)          args bi lbi clbi
+    GHC   -> ppGhcCpp ghcProgram   (const True) args bi lbi clbi
+    GHCJS -> ppGhcCpp ghcjsProgram (const True) args bi lbi clbi
     _     -> ppCpphs  args bi lbi clbi
   where cppArgs = getCppOptions bi lbi
         args    = cppArgs ++ extraArgs
@@ -392,7 +393,28 @@ ppHsc2hs bi lbi clbi =
     platformIndependent = False,
     runPreProcessor = mkSimplePreProcessor $ \inFile outFile verbosity -> do
       (gccProg, _) <- requireProgram verbosity gccProgram (withPrograms lbi)
-      runDbProgram verbosity hsc2hsProgram (withPrograms lbi) $
+      (hsc2hsProg, hsc2hsVersion, _) <- requireProgramVersion verbosity
+                                          hsc2hsProgram anyVersion (withPrograms lbi)
+      -- See Trac #13896 and https://github.com/haskell/cabal/issues/3122.
+      let hsc2hsSupportsResponseFiles = hsc2hsVersion >= mkVersion [0,68,4]
+          pureArgs = genPureArgs gccProg inFile outFile
+      if hsc2hsSupportsResponseFiles
+      then withResponseFile
+             verbosity
+             defaultTempFileOptions
+             (takeDirectory outFile)
+             "hsc2hs-response.txt"
+             Nothing
+             pureArgs
+             (\responseFileName ->
+                runProgram verbosity hsc2hsProg ["@"++ responseFileName])
+      else runProgram verbosity hsc2hsProg pureArgs
+  }
+  where
+    -- Returns a list of command line arguments that can either be passed
+    -- directly, or via a response file.
+    genPureArgs :: ConfiguredProgram -> String -> String -> [String]
+    genPureArgs gccProg inFile outFile =
           [ "--cc=" ++ programPath gccProg
           , "--ld=" ++ programPath gccProg ]
 
@@ -423,7 +445,16 @@ ppHsc2hs bi lbi clbi =
        ++ [ "--cflag=-I" ++ dir | dir <- PD.includeDirs  bi ]
        ++ [ "--cflag=-I" ++ buildDir lbi </> dir | dir <- PD.includeDirs bi ]
        ++ [ "--cflag="   ++ opt | opt <- PD.ccOptions    bi
-                                      ++ PD.cppOptions   bi ]
+                                      ++ PD.cppOptions   bi
+                                      -- hsc2hs uses the C ABI
+                                      -- We assume that there are only C sources
+                                      -- and C++ functions are exported via a C
+                                      -- interface and wrapped in a C source file.
+                                      -- Therefore we do not supply C++ flags
+                                      -- because there will not be C++ sources.
+                                      --
+                                      -- DO NOT add PD.cxxOptions unless this changes!
+                                      ]
        ++ [ "--cflag="   ++ opt | opt <-
                [ "-I" ++ autogenComponentModulesDir lbi clbi,
                  "-I" ++ autogenPackageModulesDir lbi,
@@ -447,8 +478,7 @@ ppHsc2hs bi lbi clbi =
                 ++ [ "-l" ++ opt | opt <- Installed.extraLibraries pkg ]
                 ++ [         opt | opt <- Installed.ldOptions      pkg ] ]
        ++ ["-o", outFile, inFile]
-  }
-  where
+
     hacked_index = packageHacks (installedPkgs lbi)
     -- Look only at the dependencies of the current component
     -- being built!  This relies on 'installedPkgs' maintaining
@@ -502,6 +532,15 @@ ppC2hs bi lbi clbi =
           | pkg <- pkgs
           , opt <- [ "-I" ++ opt | opt <- Installed.includeDirs pkg ]
                 ++ [         opt | opt@('-':c:_) <- Installed.ccOptions pkg
+                                                 -- c2hs uses the C ABI
+                                                 -- We assume that there are only C sources
+                                                 -- and C++ functions are exported via a C
+                                                 -- interface and wrapped in a C source file.
+                                                 -- Therefore we do not supply C++ flags
+                                                 -- because there will not be C++ sources.
+                                                 --
+                                                 --
+                                                 -- DO NOT add Installed.cxxOptions unless this changes!
                                  , c `elem` "DIU" ] ]
           --TODO: install .chi files for packages, so we can --include
           -- those dirs here, for the dependencies
@@ -520,12 +559,15 @@ ppC2hsExtras d = filter (\p -> takeExtensions p == ".chs.c") `fmap`
 
 --TODO: perhaps use this with hsc2hs too
 --TODO: remove cc-options from cpphs for cabal-version: >= 1.10
+--TODO: Refactor and add separate getCppOptionsForHs, getCppOptionsForCxx, & getCppOptionsForC
+--      instead of combining all these cases in a single function. This blind combination can
+--      potentially lead to compilation inconsistencies.
 getCppOptions :: BuildInfo -> LocalBuildInfo -> [String]
 getCppOptions bi lbi
     = platformDefines lbi
    ++ cppOptions bi
    ++ ["-I" ++ dir | dir <- PD.includeDirs bi]
-   ++ [opt | opt@('-':c:_) <- PD.ccOptions bi, c `elem` "DIU"]
+   ++ [opt | opt@('-':c:_) <- PD.ccOptions bi ++ PD.cxxOptions bi, c `elem` "DIU"]
 
 platformDefines :: LocalBuildInfo -> [String]
 platformDefines lbi =
@@ -543,7 +585,6 @@ platformDefines lbi =
       ["-D" ++ arch ++ "_BUILD_ARCH=1"] ++
       map (\os'   -> "-D" ++ os'   ++ "_HOST_OS=1")   osStr ++
       map (\arch' -> "-D" ++ arch' ++ "_HOST_ARCH=1") archStr
-    JHC  -> ["-D__JHC__=" ++ versionInt version]
     HaskellSuite {} ->
       ["-D__HASKELL_SUITE__"] ++
         map (\os'   -> "-D" ++ os'   ++ "_HOST_OS=1")   osStr ++
@@ -598,6 +639,7 @@ platformDefines lbi =
       PPC64       -> ["powerpc64"]
       Sparc       -> ["sparc"]
       Arm         -> ["arm"]
+      AArch64     -> ["aarch64"]
       Mips        -> ["mips"]
       SH          -> []
       IA64        -> ["ia64"]

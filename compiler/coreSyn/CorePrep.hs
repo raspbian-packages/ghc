@@ -8,8 +8,9 @@ Core pass to saturate constructors and PrimOps
 {-# LANGUAGE BangPatterns, CPP, MultiWayIf #-}
 
 module CorePrep (
-      corePrepPgm, corePrepExpr, cvtLitInteger,
-      lookupMkIntegerName, lookupIntegerSDataConName
+      corePrepPgm, corePrepExpr, cvtLitInteger, cvtLitNatural,
+      lookupMkIntegerName, lookupIntegerSDataConName,
+      lookupMkNaturalName, lookupNaturalSDataConName
   ) where
 
 #include "HsVersions.h"
@@ -42,7 +43,6 @@ import Id
 import IdInfo
 import TysWiredIn
 import DataCon
-import PrimOp
 import BasicTypes
 import Module
 import UniqSupply
@@ -122,11 +122,13 @@ The goal of this pass is to prepare for code generation.
     special case where we use the S# constructor for Integers that
     are in the range of Int.
 
-11. Uphold tick consistency while doing this: We move ticks out of
+11. Same for LitNatural.
+
+12. Uphold tick consistency while doing this: We move ticks out of
     (non-type) applications where we can, and make sure that we
     annotate according to scoping rules when floating.
 
-12. Collect cost centres (including cost centres in unfoldings) if we're in
+13. Collect cost centres (including cost centres in unfoldings) if we're in
     profiling mode. We have to do this here beucase we won't have unfoldings
     after this pass (see `zapUnfolding` and Note [Drop unfoldings and rules].
 
@@ -419,23 +421,21 @@ cpeBind top_lvl env (NonRec bndr rhs)
   = do { (_, bndr1) <- cpCloneBndr env bndr
        ; let dmd         = idDemandInfo bndr
              is_unlifted = isUnliftedType (idType bndr)
-       ; (floats, bndr2, rhs2) <- cpePair top_lvl NonRecursive
-                                          dmd
-                                          is_unlifted
-                                          env bndr1 rhs
+       ; (floats, rhs1) <- cpePair top_lvl NonRecursive
+                                   dmd is_unlifted
+                                   env bndr1 rhs
        -- See Note [Inlining in CorePrep]
-       ; if exprIsTrivial rhs2 && isNotTopLevel top_lvl
-            then return (extendCorePrepEnvExpr env bndr rhs2, floats, Nothing)
+       ; if exprIsTrivial rhs1 && isNotTopLevel top_lvl
+            then return (extendCorePrepEnvExpr env bndr rhs1, floats, Nothing)
             else do {
 
-       ; let new_float = mkFloat dmd is_unlifted bndr2 rhs2
+       ; let new_float = mkFloat dmd is_unlifted bndr1 rhs1
 
-        -- We want bndr'' in the envt, because it records
-        -- the evaluated-ness of the binder
-       ; return (extendCorePrepEnv env bndr bndr2,
+       ; return (extendCorePrepEnv env bndr bndr1,
                  addFloat floats new_float,
                  Nothing) }}
-  | otherwise -- See Note [Join points and floating]
+
+  | otherwise -- A join point; see Note [Join points and floating]
   = ASSERT(not (isTopLevel top_lvl)) -- can't have top-level join point
     do { (_, bndr1) <- cpCloneBndr env bndr
        ; (bndr2, rhs1) <- cpeJoinPair env bndr1 rhs
@@ -446,14 +446,17 @@ cpeBind top_lvl env (NonRec bndr rhs)
 cpeBind top_lvl env (Rec pairs)
   | not (isJoinId (head bndrs))
   = do { (env', bndrs1) <- cpCloneBndrs env bndrs
-       ; stuff <- zipWithM (cpePair top_lvl Recursive topDmd False env') bndrs1 rhss
+       ; stuff <- zipWithM (cpePair top_lvl Recursive topDmd False env')
+                           bndrs1 rhss
 
-       ; let (floats_s, bndrs2, rhss2) = unzip3 stuff
-             all_pairs = foldrOL add_float (bndrs2 `zip` rhss2)
+       ; let (floats_s, rhss1) = unzip stuff
+             all_pairs = foldrOL add_float (bndrs1 `zip` rhss1)
                                            (concatFloats floats_s)
-       ; return (extendCorePrepEnvList env (bndrs `zip` bndrs2),
+
+       ; return (extendCorePrepEnvList env (bndrs `zip` bndrs1),
                  unitFloat (FloatLet (Rec all_pairs)),
                  Nothing) }
+
   | otherwise -- See Note [Join points and floating]
   = do { (env', bndrs1) <- cpCloneBndrs env bndrs
        ; pairs1 <- zipWithM (cpeJoinPair env') bndrs1 rhss
@@ -473,9 +476,10 @@ cpeBind top_lvl env (Rec pairs)
 
 ---------------
 cpePair :: TopLevelFlag -> RecFlag -> Demand -> Bool
-        -> CorePrepEnv -> Id -> CoreExpr
-        -> UniqSM (Floats, Id, CpeRhs)
+        -> CorePrepEnv -> OutId -> CoreExpr
+        -> UniqSM (Floats, CpeRhs)
 -- Used for all bindings
+-- The binder is already cloned, hence an OutId
 cpePair top_lvl is_rec dmd is_unlifted env bndr rhs
   = ASSERT(not (isJoinId bndr)) -- those should use cpeJoinPair
     do { (floats1, rhs1) <- cpeRhsE env rhs
@@ -497,15 +501,7 @@ cpePair top_lvl is_rec dmd is_unlifted env bndr rhs
         -- Wrap floating ticks
        ; let (floats4, rhs4) = wrapTicks floats3 rhs3
 
-        -- Record if the binder is evaluated
-        -- and otherwise trim off the unfolding altogether
-        -- It's not used by the code generator; getting rid of it reduces
-        -- heap usage and, since we may be changing uniques, we'd have
-        -- to substitute to keep it right
-       ; let bndr' | exprIsHNF rhs3 = bndr `setIdUnfolding` evaldUnfolding
-                   | otherwise      = bndr `setIdUnfolding` noUnfolding
-
-       ; return (floats4, bndr', rhs4) }
+       ; return (floats4, rhs4) }
   where
     platform = targetPlatform (cpe_dynFlags env)
 
@@ -585,7 +581,6 @@ cpeJoinPair env bndr rhs
 {-
 Note [Arity and join points]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 Up to now, we've allowed a join point to have an arity greater than its join
 arity (minus type arguments), since this is what's useful for eta expansion.
 However, for code gen purposes, its arity must be exactly the number of value
@@ -615,9 +610,12 @@ cpeRhsE :: CorePrepEnv -> CoreExpr -> UniqSM (Floats, CpeRhs)
 
 cpeRhsE _env expr@(Type {})      = return (emptyFloats, expr)
 cpeRhsE _env expr@(Coercion {})  = return (emptyFloats, expr)
-cpeRhsE env (Lit (LitInteger i _))
+cpeRhsE env (Lit (LitNumber LitNumInteger i _))
     = cpeRhsE env (cvtLitInteger (cpe_dynFlags env) (getMkIntegerId env)
                    (cpe_integerSDataCon env) i)
+cpeRhsE env (Lit (LitNumber LitNumNatural i _))
+    = cpeRhsE env (cvtLitNatural (cpe_dynFlags env) (getMkNaturalId env)
+                   (cpe_naturalSDataCon env) i)
 cpeRhsE _env expr@(Lit {}) = return (emptyFloats, expr)
 cpeRhsE env expr@(Var {})  = cpeApp env expr
 cpeRhsE env expr@(App {}) = cpeApp env expr
@@ -656,9 +654,7 @@ cpeRhsE env expr@(Lam {})
 
 cpeRhsE env (Case scrut bndr ty alts)
   = do { (floats, scrut') <- cpeBody env scrut
-       ; let bndr1 = bndr `setIdUnfolding` evaldUnfolding
-            -- Record that the case binder is evaluated in the alternatives
-       ; (env', bndr2) <- cpCloneBndr env bndr1
+       ; (env', bndr2) <- cpCloneBndr env bndr
        ; let alts'
                  -- This flag is intended to aid in debugging strictness
                  -- analysis bugs. These are particularly nasty to chase down as
@@ -700,6 +696,24 @@ cvtLitInteger dflags mk_integer _ i
                   high = x `shiftR` bits
               in mkConApp intDataCon [Lit (mkMachInt dflags low)] : f high
         bits = 31
+        mask = 2 ^ bits - 1
+
+cvtLitNatural :: DynFlags -> Id -> Maybe DataCon -> Integer -> CoreExpr
+-- Here we convert a literal Natural to the low-level
+-- representation.
+-- See Note [Natural literals] in Literal
+cvtLitNatural dflags _ (Just sdatacon) i
+  | inWordRange dflags i -- Special case for small naturals
+    = mkConApp sdatacon [Lit (mkMachWord dflags i)]
+
+cvtLitNatural dflags mk_natural _ i
+    = mkApps (Var mk_natural) [words]
+  where words = mkListExpr wordTy (f i)
+        f 0 = []
+        f x = let low  = x .&. mask
+                  high = x `shiftR` bits
+              in mkConApp wordDataCon [Lit (mkMachWord dflags low)] : f high
+        bits = 32
         mask = 2 ^ bits - 1
 
 -- ---------------------------------------------------------------------------
@@ -837,6 +851,7 @@ cpeApp top_env expr
           in cpe_app env terminal (args' ++ args) (depth + depth' - 1)
     cpe_app env (Var f) [CpeApp _runtimeRep@Type{}, CpeApp _type@Type{}, CpeApp arg] 1
         | f `hasKey` runRWKey
+        -- See Note [runRW magic]
         -- Replace (runRW# f) by (f realWorld#), beta reducing if possible (this
         -- is why we return a CorePrepEnv as well)
         = case arg of
@@ -930,11 +945,51 @@ isLazyExpr (Tick _ e)              = isLazyExpr e
 isLazyExpr (Var f `App` _ `App` _) = f `hasKey` lazyIdKey
 isLazyExpr _                       = False
 
+{- Note [runRW magic]
+~~~~~~~~~~~~~~~~~~~~~
+Some definitions, for instance @runST@, must have careful control over float out
+of the bindings in their body. Consider this use of @runST@,
+
+    f x = runST ( \ s -> let (a, s')  = newArray# 100 [] s
+                             (_, s'') = fill_in_array_or_something a x s'
+                         in freezeArray# a s'' )
+
+If we inline @runST@, we'll get:
+
+    f x = let (a, s')  = newArray# 100 [] realWorld#{-NB-}
+              (_, s'') = fill_in_array_or_something a x s'
+          in freezeArray# a s''
+
+And now if we allow the @newArray#@ binding to float out to become a CAF,
+we end up with a result that is totally and utterly wrong:
+
+    f = let (a, s')  = newArray# 100 [] realWorld#{-NB-} -- YIKES!!!
+        in \ x ->
+            let (_, s'') = fill_in_array_or_something a x s'
+            in freezeArray# a s''
+
+All calls to @f@ will share a {\em single} array! Clearly this is nonsense and
+must be prevented.
+
+This is what @runRW#@ gives us: by being inlined extremely late in the
+optimization (right before lowering to STG, in CorePrep), we can ensure that
+no further floating will occur. This allows us to safely inline things like
+@runST@, which are otherwise needlessly expensive (see #10678 and #5916).
+
+'runRW' is defined (for historical reasons) in GHC.Magic, with a NOINLINE
+pragma.  It is levity-polymorphic.
+
+    runRW# :: forall (r1 :: RuntimeRep). (o :: TYPE r)
+           => (State# RealWorld -> (# State# RealWorld, o #))
+                              -> (# State# RealWorld, o #)
+
+It needs no special treatment in GHC except this special inlining here
+in CorePrep (and in ByteCodeGen).
+
 -- ---------------------------------------------------------------------------
 --      CpeArg: produces a result satisfying CpeArg
 -- ---------------------------------------------------------------------------
 
-{-
 Note [ANF-ising literal string arguments]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -1015,10 +1070,6 @@ The type is the type of the entire application
 
 maybeSaturate :: Id -> CpeApp -> Int -> UniqSM CpeRhs
 maybeSaturate fn expr n_args
-  | Just DataToTagOp <- isPrimOpId_maybe fn     -- DataToTag must have an evaluated arg
-                                                -- A gruesome special case
-  = saturateDataToTag sat_expr
-
   | hasNoBinding fn        -- There's no binding
   = return sat_expr
 
@@ -1029,42 +1080,7 @@ maybeSaturate fn expr n_args
     excess_arity = fn_arity - n_args
     sat_expr     = cpeEtaExpand excess_arity expr
 
--------------
-saturateDataToTag :: CpeApp -> UniqSM CpeApp
--- See Note [dataToTag magic]
-saturateDataToTag sat_expr
-  = do { let (eta_bndrs, eta_body) = collectBinders sat_expr
-       ; eta_body' <- eval_data2tag_arg eta_body
-       ; return (mkLams eta_bndrs eta_body') }
-  where
-    eval_data2tag_arg :: CpeApp -> UniqSM CpeBody
-    eval_data2tag_arg app@(fun `App` arg)
-        | exprIsHNF arg         -- Includes nullary constructors
-        = return app            -- The arg is evaluated
-        | otherwise                     -- Arg not evaluated, so evaluate it
-        = do { arg_id <- newVar (exprType arg)
-             ; let arg_id1 = setIdUnfolding arg_id evaldUnfolding
-             ; return (Case arg arg_id1 (exprType app)
-                            [(DEFAULT, [], fun `App` Var arg_id1)]) }
-
-    eval_data2tag_arg (Tick t app)    -- Scc notes can appear
-        = do { app' <- eval_data2tag_arg app
-             ; return (Tick t app') }
-
-    eval_data2tag_arg other     -- Should not happen
-        = pprPanic "eval_data2tag" (ppr other)
-
 {-
-Note [dataToTag magic]
-~~~~~~~~~~~~~~~~~~~~~~
-Horrid: we must ensure that the arg of data2TagOp is evaluated
-  (data2tag x) -->  (case x of y -> data2tag y)
-(yuk yuk) take into account the lambdas we've now introduced
-
-How might it not be evaluated?  Well, we might have floated it out
-of the scope of a `seq`, or dropped the `seq` altogether.
-
-
 ************************************************************************
 *                                                                      *
                 Simple CoreSyn operations
@@ -1346,8 +1362,8 @@ canFloatFromNoCaf platform (Floats ok_to_spec fs) rhs
     -- the new binding is static. However it can't mention
     -- any non-static things or it would *already* be Caffy
     rhs_ok = rhsIsStatic platform (\_ -> False)
-                         (\i -> pprPanic "rhsIsStatic" (integer i))
-                         -- Integer literals should not show up
+                         (\_nt i -> pprPanic "rhsIsStatic" (integer i))
+                         -- Integer or Natural literals should not show up
 
 wantFloatNested :: RecFlag -> Demand -> Bool -> Floats -> CpeRhs -> Bool
 wantFloatNested is_rec dmd is_unlifted floats rhs
@@ -1456,7 +1472,9 @@ data CorePrepEnv
         --      see Note [lazyId magic], Note [Inlining in CorePrep]
         --      and Note [CorePrep inlines trivial CoreExpr not Id] (#12076)
         , cpe_mkIntegerId     :: Id
+        , cpe_mkNaturalId     :: Id
         , cpe_integerSDataCon :: Maybe DataCon
+        , cpe_naturalSDataCon :: Maybe DataCon
     }
 
 lookupMkIntegerName :: DynFlags -> HscEnv -> IO Id
@@ -1464,13 +1482,24 @@ lookupMkIntegerName dflags hsc_env
     = guardIntegerUse dflags $ liftM tyThingId $
       lookupGlobal hsc_env mkIntegerName
 
+lookupMkNaturalName :: DynFlags -> HscEnv -> IO Id
+lookupMkNaturalName dflags hsc_env
+    = guardNaturalUse dflags $ liftM tyThingId $
+      lookupGlobal hsc_env mkNaturalName
+
 lookupIntegerSDataConName :: DynFlags -> HscEnv -> IO (Maybe DataCon)
 lookupIntegerSDataConName dflags hsc_env = case cIntegerLibraryType of
     IntegerGMP -> guardIntegerUse dflags $ liftM (Just . tyThingDataCon) $
                   lookupGlobal hsc_env integerSDataConName
     IntegerSimple -> return Nothing
 
--- | Helper for 'lookupMkIntegerName' and 'lookupIntegerSDataConName'
+lookupNaturalSDataConName :: DynFlags -> HscEnv -> IO (Maybe DataCon)
+lookupNaturalSDataConName dflags hsc_env = case cIntegerLibraryType of
+    IntegerGMP -> guardNaturalUse dflags $ liftM (Just . tyThingDataCon) $
+                  lookupGlobal hsc_env naturalSDataConName
+    IntegerSimple -> return Nothing
+
+-- | Helper for 'lookupMkIntegerName', 'lookupIntegerSDataConName'
 guardIntegerUse :: DynFlags -> IO a -> IO a
 guardIntegerUse dflags act
   | thisPackage dflags == primUnitId
@@ -1479,15 +1508,33 @@ guardIntegerUse dflags act
   = return $ panic "Can't use Integer in integer-*"
   | otherwise = act
 
+-- | Helper for 'lookupMkNaturalName', 'lookupNaturalSDataConName'
+--
+-- Just like we can't use Integer literals in `integer-*`, we can't use Natural
+-- literals in `base`. If we do, we get interface loading error for GHC.Natural.
+guardNaturalUse :: DynFlags -> IO a -> IO a
+guardNaturalUse dflags act
+  | thisPackage dflags == primUnitId
+  = return $ panic "Can't use Natural in ghc-prim"
+  | thisPackage dflags == integerUnitId
+  = return $ panic "Can't use Natural in integer-*"
+  | thisPackage dflags == baseUnitId
+  = return $ panic "Can't use Natural in base"
+  | otherwise = act
+
 mkInitialCorePrepEnv :: DynFlags -> HscEnv -> IO CorePrepEnv
 mkInitialCorePrepEnv dflags hsc_env
     = do mkIntegerId <- lookupMkIntegerName dflags hsc_env
+         mkNaturalId <- lookupMkNaturalName dflags hsc_env
          integerSDataCon <- lookupIntegerSDataConName dflags hsc_env
+         naturalSDataCon <- lookupNaturalSDataConName dflags hsc_env
          return $ CPE {
                       cpe_dynFlags = dflags,
                       cpe_env = emptyVarEnv,
                       cpe_mkIntegerId = mkIntegerId,
-                      cpe_integerSDataCon = integerSDataCon
+                      cpe_mkNaturalId = mkNaturalId,
+                      cpe_integerSDataCon = integerSDataCon,
+                      cpe_naturalSDataCon = naturalSDataCon
                   }
 
 extendCorePrepEnv :: CorePrepEnv -> Id -> Id -> CorePrepEnv
@@ -1512,30 +1559,61 @@ lookupCorePrepEnv cpe id
 getMkIntegerId :: CorePrepEnv -> Id
 getMkIntegerId = cpe_mkIntegerId
 
+getMkNaturalId :: CorePrepEnv -> Id
+getMkNaturalId = cpe_mkNaturalId
+
 ------------------------------------------------------------------------------
 -- Cloning binders
 -- ---------------------------------------------------------------------------
 
-cpCloneBndrs :: CorePrepEnv -> [Var] -> UniqSM (CorePrepEnv, [Var])
+cpCloneBndrs :: CorePrepEnv -> [InVar] -> UniqSM (CorePrepEnv, [OutVar])
 cpCloneBndrs env bs = mapAccumLM cpCloneBndr env bs
 
-cpCloneBndr  :: CorePrepEnv -> Var -> UniqSM (CorePrepEnv, Var)
+cpCloneBndr  :: CorePrepEnv -> InVar -> UniqSM (CorePrepEnv, OutVar)
 cpCloneBndr env bndr
-  | isLocalId bndr, not (isCoVar bndr)
-  = do bndr' <- setVarUnique bndr <$> getUniqueM
-
-       -- We are going to OccAnal soon, so drop (now-useless) rules/unfoldings
-       -- so that we can drop more stuff as dead code.
-       -- See also Note [Dead code in CorePrep]
-       let bndr'' = bndr' `setIdUnfolding` noUnfolding
-                          `setIdSpecialisation` emptyRuleInfo
-       return (extendCorePrepEnv env bndr bndr'', bndr'')
-
-  | otherwise   -- Top level things, which we don't want
-                -- to clone, have become GlobalIds by now
-                -- And we don't clone tyvars, or coercion variables
+  | not (isId bndr)
   = return (env, bndr)
 
+  | otherwise
+  = do { bndr' <- clone_it bndr
+
+       -- Drop (now-useless) rules/unfoldings
+       -- See Note [Drop unfoldings and rules]
+       -- and Note [Preserve evaluatedness] in CoreTidy
+       ; let unfolding' = zapUnfolding (realIdUnfolding bndr)
+                          -- Simplifier will set the Id's unfolding
+
+             bndr'' = bndr' `setIdUnfolding`      unfolding'
+                            `setIdSpecialisation` emptyRuleInfo
+
+       ; return (extendCorePrepEnv env bndr bndr'', bndr'') }
+  where
+    clone_it bndr
+      | isLocalId bndr, not (isCoVar bndr)
+      = do { uniq <- getUniqueM; return (setVarUnique bndr uniq) }
+      | otherwise   -- Top level things, which we don't want
+                    -- to clone, have become GlobalIds by now
+                    -- And we don't clone tyvars, or coercion variables
+      = return bndr
+
+{- Note [Drop unfoldings and rules]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We want to drop the unfolding/rules on every Id:
+
+  - We are now past interface-file generation, and in the
+    codegen pipeline, so we really don't need full unfoldings/rules
+
+  - The unfolding/rule may be keeping stuff alive that we'd like
+    to discard.  See  Note [Dead code in CorePrep]
+
+  - Getting rid of unnecessary unfoldings reduces heap usage
+
+  - We are changing uniques, so if we didn't discard unfoldings/rules
+    we'd have to substitute in them
+
+HOWEVER, we want to preserve evaluated-ness;
+see Note [Preserve evaluatedness] in CoreTidy.
+-}
 
 ------------------------------------------------------------------------------
 -- Cloning ccall Ids; each must have a unique name,

@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -9,7 +10,7 @@ module IntegrationTests2 where
 
 import Distribution.Client.DistDirLayout
 import Distribution.Client.ProjectConfig
-import Distribution.Client.Config (defaultCabalDir)
+import Distribution.Client.Config (getCabalDir)
 import Distribution.Client.TargetSelector hiding (DirActions(..))
 import qualified Distribution.Client.TargetSelector as TS (DirActions(..))
 import Distribution.Client.ProjectPlanning
@@ -48,7 +49,9 @@ import Distribution.ModuleName (ModuleName)
 import Distribution.Verbosity
 import Distribution.Text
 
-import Data.Monoid
+#if !MIN_VERSION_base(4,8,0)
+import Data.Monoid (mempty, mappend)
+#endif
 import Data.List (sort)
 import Data.String (IsString(..))
 import qualified Data.Map as Map
@@ -114,6 +117,7 @@ tests config =
   , testGroup "Successful builds" $
     [ testCaseSteps "Setup script styles" (testSetupScriptStyles config)
     , testCase      "keep-going"          (testBuildKeepGoing config)
+    , testCase      "local tarball"       (testBuildLocalTarball config)
     ]
 
   , testGroup "Regression tests" $
@@ -146,6 +150,7 @@ testTargetSelectors reportSubCase = do
     (_, _, _, localPackages, _) <- configureProject testdir config
     let readTargetSelectors' = readTargetSelectorsWith (dirActions testdir)
                                                        localPackages
+                                                       Nothing
 
     reportSubCase "cwd"
     do Right ts <- readTargetSelectors' []
@@ -253,7 +258,7 @@ testTargetSelectorBadSyntax = do
                   , "foo:", "foo::bar"
                   , "foo: ", "foo: :bar"
                   , "a:b:c:d:e:f", "a:b:c:d:e:f:g:h" ]
-    Left errs <- readTargetSelectors localPackages targets
+    Left errs <- readTargetSelectors localPackages Nothing targets
     zipWithM_ (@?=) errs (map TargetSelectorUnrecognised targets)
     cleanProject testdir
   where
@@ -374,6 +379,7 @@ testTargetSelectorAmbiguous reportSubCase = do
       res <- readTargetSelectorsWith
                fakeDirActions
                (map SpecificSourcePackage pkgs)
+               Nothing
                [str]
       case res of
         Left [TargetSelectorAmbiguous _ tss'] ->
@@ -389,6 +395,7 @@ testTargetSelectorAmbiguous reportSubCase = do
       res <- readTargetSelectorsWith
                fakeDirActions
                (map SpecificSourcePackage pkgs)
+               Nothing
                [str]
       case res of
         Right [ts'] -> ts' @?= ts
@@ -468,6 +475,7 @@ testTargetSelectorNoCurrentPackage = do
     (_, _, _, localPackages, _) <- configureProject testdir config
     let readTargetSelectors' = readTargetSelectorsWith (dirActions testdir)
                                                        localPackages
+                                                       Nothing
         targets = [ "libs",  ":cwd:libs"
                   , "flibs", ":cwd:flibs"
                   , "exes",  ":cwd:exes"
@@ -488,7 +496,7 @@ testTargetSelectorNoCurrentPackage = do
 testTargetSelectorNoTargets :: Assertion
 testTargetSelectorNoTargets = do
     (_, _, _, localPackages, _) <- configureProject testdir config
-    Left errs <- readTargetSelectors localPackages []
+    Left errs <- readTargetSelectors localPackages Nothing []
     errs @?= [TargetSelectorNoTargetsInCwd]
     cleanProject testdir
   where
@@ -499,7 +507,7 @@ testTargetSelectorNoTargets = do
 testTargetSelectorProjectEmpty :: Assertion
 testTargetSelectorProjectEmpty = do
     (_, _, _, localPackages, _) <- configureProject testdir config
-    Left errs <- readTargetSelectors localPackages []
+    Left errs <- readTargetSelectors localPackages Nothing []
     errs @?= [TargetSelectorNoTargetsInProject]
     cleanProject testdir
   where
@@ -1212,6 +1220,7 @@ assertProjectDistinctTargets elaboratedPlan
                 selectComponentTarget
                 liftProblem
                 elaboratedPlan
+                Nothing
                 targetSelectors
 
 
@@ -1257,7 +1266,8 @@ assertTargetProblems elaboratedPlan
   where
     assertTargetProblem expected targetSelector =
       let res = resolveTargets selectPackageTargets selectComponentTarget
-                               liftProblem elaboratedPlan [targetSelector] in
+                               liftProblem elaboratedPlan Nothing
+                               [targetSelector] in
       case res of
         Left [problem] ->
           problem @?= expected targetSelector
@@ -1388,14 +1398,14 @@ testBuildKeepGoing :: ProjectConfig -> Assertion
 testBuildKeepGoing config = do
     -- P is expected to fail, Q does not depend on P but without
     -- parallel build and without keep-going then we don't build Q yet.
-    (plan1, res1) <- executePlan =<< planProject testdir (config  <> keepGoing False)
+    (plan1, res1) <- executePlan =<< planProject testdir (config `mappend` keepGoing False)
     (_, failure1) <- expectPackageFailed plan1 res1 "p-0.1"
     expectBuildFailed failure1
     _ <- expectPackageConfigured plan1 res1 "q-0.1"
 
     -- With keep-going then we should go on to sucessfully build Q
     (plan2, res2) <- executePlan
-                 =<< planProject testdir (config <> keepGoing True)
+                 =<< planProject testdir (config `mappend` keepGoing True)
     (_, failure2) <- expectPackageFailed plan2 res2 "p-0.1"
     expectBuildFailed failure2
     _ <- expectPackageInstalled plan2 res2 "q-0.1"
@@ -1408,6 +1418,18 @@ testBuildKeepGoing config = do
           projectConfigKeepGoing = toFlag kg
         }
       }
+
+-- | Test we can successfully build packages from local tarball files.
+--
+testBuildLocalTarball :: ProjectConfig -> Assertion
+testBuildLocalTarball config = do
+    -- P is a tarball package, Q is a local dir package that depends on it.
+    (plan, res) <- executePlan =<< planProject testdir config
+    _ <- expectPackageInstalled plan res "p-0.1"
+    _ <- expectPackageInstalled plan res "q-0.1"
+    return ()
+  where
+    testdir = "build/local-tarball"
 
 -- | See <https://github.com/haskell/cabal/issues/3324>
 --
@@ -1463,7 +1485,7 @@ type ProjDetails = (DistDirLayout,
 
 configureProject :: FilePath -> ProjectConfig -> IO ProjDetails
 configureProject testdir cliConfig = do
-    cabalDir <- defaultCabalDir
+    cabalDir <- getCabalDir
     let cabalDirLayout = defaultCabalDirLayout cabalDir
 
     projectRootDir <- canonicalizePath (basedir </> testdir)

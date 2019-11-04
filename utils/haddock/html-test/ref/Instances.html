@@ -146,6 +146,12 @@
 	    > <a href="#" class="selflink"
 	    >#</a
 	    ></p
+	  ><div class="subs minimal"
+	  ><p class="caption"
+	    >Minimal complete definition</p
+	    ><p class="src"
+	    >Nothing</p
+	    ></div
 	  ><div class="subs methods"
 	  ><p class="caption"
 	    >Methods</p
@@ -228,7 +234,7 @@
 		      ></span
 		      > <a href="#" title="Instances"
 		      >Foo</a
-		      > <a href="#" title="Data.Maybe"
+		      > <a href="#" title="GHC.Maybe"
 		      >Maybe</a
 		      ></span
 		    > <a href="#" class="selflink"
@@ -252,11 +258,11 @@
 			><p class="src"
 			><a href="#"
 			  >foo</a
-			  > :: <a href="#" title="Data.Maybe"
+			  > :: <a href="#" title="GHC.Maybe"
 			  >Maybe</a
 			  > <a href="#" title="Data.Int"
 			  >Int</a
-			  > -&gt; a -&gt; <a href="#" title="Data.Maybe"
+			  > -&gt; a -&gt; <a href="#" title="GHC.Maybe"
 			  >Maybe</a
 			  > a <a href="#" class="selflink"
 			  >#</a
@@ -264,15 +270,15 @@
 			><p class="src"
 			><a href="#"
 			  >foo'</a
-			  > :: <a href="#" title="Data.Maybe"
+			  > :: <a href="#" title="GHC.Maybe"
 			  >Maybe</a
-			  > (<a href="#" title="Data.Maybe"
+			  > (<a href="#" title="GHC.Maybe"
 			  >Maybe</a
 			  > a) -&gt; <a href="#" title="Data.Int"
 			  >Int</a
-			  > -&gt; <a href="#" title="Data.Maybe"
+			  > -&gt; <a href="#" title="GHC.Maybe"
 			  >Maybe</a
-			  > (<a href="#" title="Data.Maybe"
+			  > (<a href="#" title="GHC.Maybe"
 			  >Maybe</a
 			  > <a href="#" title="Data.Int"
 			  >Int</a
@@ -581,9 +587,9 @@
 		      > <a href="#" title="Instances"
 		      >Foo</a
 		      > ((-&gt;) a :: <a href="#" title="Data.Kind"
-		      >*</a
+		      >Type</a
 		      > -&gt; <a href="#" title="Data.Kind"
-		      >*</a
+		      >Type</a
 		      >)</span
 		    > <a href="#" class="selflink"
 		    >#</a
@@ -614,11 +620,11 @@
 			><p class="src"
 			><a href="#"
 			  >foo'</a
-			  > :: (a -&gt; a -&gt; a0) -&gt; <a href="#" title="Data.Int"
+			  > :: (a -&gt; (a -&gt; a0)) -&gt; <a href="#" title="Data.Int"
 			  >Int</a
-			  > -&gt; a -&gt; a -&gt; <a href="#" title="Data.Int"
+			  > -&gt; a -&gt; (a -&gt; <a href="#" title="Data.Int"
 			  >Int</a
-			  > <a href="#" class="selflink"
+			  >) <a href="#" class="selflink"
 			  >#</a
 			  ></p
 			></div
@@ -642,6 +648,12 @@
 	    > <a href="#" class="selflink"
 	    >#</a
 	    ></p
+	  ><div class="subs minimal"
+	  ><p class="caption"
+	    >Minimal complete definition</p
+	    ><p class="src"
+	    >Nothing</p
+	    ></div
 	  ><div class="subs methods"
 	  ><p class="caption"
 	    >Methods</p
@@ -684,7 +696,7 @@
 		      ></span
 		      > <a href="#" title="Instances"
 		      >Bar</a
-		      > <a href="#" title="Data.Maybe"
+		      > <a href="#" title="GHC.Maybe"
 		      >Maybe</a
 		      > <a href="#" title="Data.Bool"
 		      >Bool</a
@@ -710,11 +722,11 @@
 			><p class="src"
 			><a href="#"
 			  >bar</a
-			  > :: <a href="#" title="Data.Maybe"
+			  > :: <a href="#" title="GHC.Maybe"
 			  >Maybe</a
 			  > <a href="#" title="Data.Bool"
 			  >Bool</a
-			  > -&gt; <a href="#" title="Data.Maybe"
+			  > -&gt; <a href="#" title="GHC.Maybe"
 			  >Maybe</a
 			  > <a href="#" title="Data.Bool"
 			  >Bool</a
@@ -726,17 +738,17 @@
 			><p class="src"
 			><a href="#"
 			  >bar'</a
-			  > :: <a href="#" title="Data.Maybe"
+			  > :: <a href="#" title="GHC.Maybe"
 			  >Maybe</a
-			  > (<a href="#" title="Data.Maybe"
+			  > (<a href="#" title="GHC.Maybe"
 			  >Maybe</a
 			  > <a href="#" title="Data.Bool"
 			  >Bool</a
-			  >) -&gt; <a href="#" title="Data.Maybe"
+			  >) -&gt; <a href="#" title="GHC.Maybe"
 			  >Maybe</a
-			  > (<a href="#" title="Data.Maybe"
+			  > (<a href="#" title="GHC.Maybe"
 			  >Maybe</a
-			  > (<a href="#" title="Data.Maybe"
+			  > (<a href="#" title="GHC.Maybe"
 			  >Maybe</a
 			  > b)) <a href="#" class="selflink"
 			  >#</a
@@ -744,17 +756,17 @@
 			><p class="src"
 			><a href="#"
 			  >bar0</a
-			  > :: (<a href="#" title="Data.Maybe"
+			  > :: (<a href="#" title="GHC.Maybe"
 			  >Maybe</a
 			  > <a href="#" title="Data.Bool"
 			  >Bool</a
-			  >, <a href="#" title="Data.Maybe"
+			  >, <a href="#" title="GHC.Maybe"
 			  >Maybe</a
 			  > <a href="#" title="Data.Bool"
 			  >Bool</a
-			  >) -&gt; (<a href="#" title="Data.Maybe"
+			  >) -&gt; (<a href="#" title="GHC.Maybe"
 			  >Maybe</a
-			  > b, <a href="#" title="Data.Maybe"
+			  > b, <a href="#" title="GHC.Maybe"
 			  >Maybe</a
 			  > c) <a href="#" class="selflink"
 			  >#</a
@@ -762,17 +774,17 @@
 			><p class="src"
 			><a href="#"
 			  >bar1</a
-			  > :: (<a href="#" title="Data.Maybe"
+			  > :: (<a href="#" title="GHC.Maybe"
 			  >Maybe</a
 			  > <a href="#" title="Data.Bool"
 			  >Bool</a
-			  >, <a href="#" title="Data.Maybe"
+			  >, <a href="#" title="GHC.Maybe"
 			  >Maybe</a
 			  > <a href="#" title="Data.Bool"
 			  >Bool</a
-			  >) -&gt; (<a href="#" title="Data.Maybe"
+			  >) -&gt; (<a href="#" title="GHC.Maybe"
 			  >Maybe</a
-			  > b, <a href="#" title="Data.Maybe"
+			  > b, <a href="#" title="GHC.Maybe"
 			  >Maybe</a
 			  > c) <a href="#" class="selflink"
 			  >#</a
@@ -788,7 +800,7 @@
 		      ></span
 		      > <a href="#" title="Instances"
 		      >Bar</a
-		      > <a href="#" title="Data.Maybe"
+		      > <a href="#" title="GHC.Maybe"
 		      >Maybe</a
 		      > [a]</span
 		    > <a href="#" class="selflink"
@@ -812,9 +824,9 @@
 			><p class="src"
 			><a href="#"
 			  >bar</a
-			  > :: <a href="#" title="Data.Maybe"
+			  > :: <a href="#" title="GHC.Maybe"
 			  >Maybe</a
-			  > [a] -&gt; <a href="#" title="Data.Maybe"
+			  > [a] -&gt; <a href="#" title="GHC.Maybe"
 			  >Maybe</a
 			  > <a href="#" title="Data.Bool"
 			  >Bool</a
@@ -824,15 +836,15 @@
 			><p class="src"
 			><a href="#"
 			  >bar'</a
-			  > :: <a href="#" title="Data.Maybe"
+			  > :: <a href="#" title="GHC.Maybe"
 			  >Maybe</a
-			  > (<a href="#" title="Data.Maybe"
+			  > (<a href="#" title="GHC.Maybe"
 			  >Maybe</a
-			  > [a]) -&gt; <a href="#" title="Data.Maybe"
+			  > [a]) -&gt; <a href="#" title="GHC.Maybe"
 			  >Maybe</a
-			  > (<a href="#" title="Data.Maybe"
+			  > (<a href="#" title="GHC.Maybe"
 			  >Maybe</a
-			  > (<a href="#" title="Data.Maybe"
+			  > (<a href="#" title="GHC.Maybe"
 			  >Maybe</a
 			  > b)) <a href="#" class="selflink"
 			  >#</a
@@ -840,13 +852,13 @@
 			><p class="src"
 			><a href="#"
 			  >bar0</a
-			  > :: (<a href="#" title="Data.Maybe"
+			  > :: (<a href="#" title="GHC.Maybe"
 			  >Maybe</a
-			  > [a], <a href="#" title="Data.Maybe"
+			  > [a], <a href="#" title="GHC.Maybe"
 			  >Maybe</a
-			  > [a]) -&gt; (<a href="#" title="Data.Maybe"
+			  > [a]) -&gt; (<a href="#" title="GHC.Maybe"
 			  >Maybe</a
-			  > b, <a href="#" title="Data.Maybe"
+			  > b, <a href="#" title="GHC.Maybe"
 			  >Maybe</a
 			  > c) <a href="#" class="selflink"
 			  >#</a
@@ -854,13 +866,13 @@
 			><p class="src"
 			><a href="#"
 			  >bar1</a
-			  > :: (<a href="#" title="Data.Maybe"
+			  > :: (<a href="#" title="GHC.Maybe"
 			  >Maybe</a
-			  > [a], <a href="#" title="Data.Maybe"
+			  > [a], <a href="#" title="GHC.Maybe"
 			  >Maybe</a
-			  > [a]) -&gt; (<a href="#" title="Data.Maybe"
+			  > [a]) -&gt; (<a href="#" title="GHC.Maybe"
 			  >Maybe</a
-			  > b, <a href="#" title="Data.Maybe"
+			  > b, <a href="#" title="GHC.Maybe"
 			  >Maybe</a
 			  > c) <a href="#" class="selflink"
 			  >#</a
@@ -1196,6 +1208,12 @@
 	    > <a href="#" class="selflink"
 	    >#</a
 	    ></p
+	  ><div class="subs minimal"
+	  ><p class="caption"
+	    >Minimal complete definition</p
+	    ><p class="src"
+	    >Nothing</p
+	    ></div
 	  ><div class="subs methods"
 	  ><p class="caption"
 	    >Methods</p
@@ -1922,6 +1940,12 @@
 	    > <a href="#" class="selflink"
 	    >#</a
 	    ></p
+	  ><div class="subs minimal"
+	  ><p class="caption"
+	    >Minimal complete definition</p
+	    ><p class="src"
+	    >Nothing</p
+	    ></div
 	  ><div class="subs associated-types"
 	  ><p class="caption"
 	    >Associated Types</p
@@ -1999,7 +2023,7 @@
 			  > c <a href="#" title="Data.Bool"
 			  >Bool</a
 			  > :: <a href="#" title="Data.Kind"
-			  >*</a
+			  >Type</a
 			  > <a href="#" class="selflink"
 			  >#</a
 			  ></p
@@ -2011,7 +2035,7 @@
 			  > <a href="#" title="Data.Int"
 			  >Int</a
 			  > c :: <a href="#" title="Data.Kind"
-			  >*</a
+			  >Type</a
 			  > <a href="#" class="selflink"
 			  >#</a
 			  ></p
@@ -2073,7 +2097,7 @@
 			  > <a href="#" title="Instances"
 			  >Plugh</a
 			  > [a] c [b] :: <a href="#" title="Data.Kind"
-			  >*</a
+			  >Type</a
 			  > <a href="#" class="selflink"
 			  >#</a
 			  ></p
@@ -2083,7 +2107,7 @@
 			  > <a href="#" title="Instances"
 			  >Thud</a
 			  > [a] c :: <a href="#" title="Data.Kind"
-			  >*</a
+			  >Type</a
 			  > <a href="#" class="selflink"
 			  >#</a
 			  ></p

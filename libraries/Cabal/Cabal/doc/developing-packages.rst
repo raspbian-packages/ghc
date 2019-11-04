@@ -409,6 +409,15 @@ management. The need to remain compatible with automatic package
 management means that Cabal's conditional dependencies system is a bit
 less flexible than with the "./configure" approach.
 
+.. note::
+   `GNU autoconf places restrictions on paths, including the
+   path that the user builds a package from.
+   <https://www.gnu.org/software/autoconf/manual/autoconf.html#File-System-Conventions>`_
+   Package authors using ``build-type: configure`` should be aware of
+   these restrictions; because users may be unexpectedly constrained and
+   face mysterious errors, it is recommended that ``build-type: configure``
+   is only used where strictly necessary.
+
 Portability
 -----------
 
@@ -707,7 +716,7 @@ The syntax of the value depends on the field. Field types include:
 *identifier*
     A letter followed by zero or more alphanumerics or underscores.
 *compiler*
-    A compiler flavor (one of: ``GHC``, ``JHC``, ``UHC`` or ``LHC``)
+    A compiler flavor (one of: ``GHC``, ``UHC`` or ``LHC``)
     followed by a version range. For example, ``GHC ==6.10.3``, or
     ``LHC >=0.6 && <0.8``.
 
@@ -981,22 +990,49 @@ describe the package as a whole:
 
     A limited form of ``*`` wildcards in file names, for example
     ``data-files: images/*.png`` matches all the ``.png`` files in the
-    ``images`` directory.
+    ``images`` directory. ``data-files: audio/**/*.mp3`` matches all
+    the ``.mp3`` files in the ``audio`` directory, including
+    subdirectories.
 
-    The limitation is that ``*`` wildcards are only allowed in place of
-    the file name, not in the directory name or file extension. In
-    particular, wildcards do not include directories contents
-    recursively. Furthermore, if a wildcard is used it must be used with
-    an extension, so ``data-files: data/*`` is not allowed. When
-    matching a wildcard plus extension, a file's full extension must
-    match exactly, so ``*.gz`` matches ``foo.gz`` but not
-    ``foo.tar.gz``. A wildcard that does not match any files is an
-    error.
+    The specific limitations of this wildcard syntax are
+
+    - ``*`` wildcards are only allowed in place of the file name, not
+      in the directory name or file extension. It must replace the
+      whole file name (e.g., ``*.html`` is allowed, but
+      ``chapter-*.html`` is not). If a wildcard is used, it must be
+      used with an extension, so ``data-files: data/*`` is not
+      allowed.
+
+    - Prior to Cabal 2.4, when matching a wildcard plus extension, a
+      file's full extension must match exactly, so ``*.gz`` matches
+      ``foo.gz`` but not ``foo.tar.gz``. This restriction has been
+      lifted when ``cabal-version: 2.4`` or greater so that ``*.gz``
+      does match ``foo.tar.gz``
+
+    - ``*`` wildcards will not match if the file name is empty (e.g.,
+      ``*.html`` will not match ``foo/.html``).
+
+    - ``**`` wildcards can only appear as the final path component
+      before the file name (e.g., ``data/**/images/*.jpg`` is not
+      allowed). If a ``**`` wildcard is used, then the file name must
+      include a ``*`` wildcard (e.g., ``data/**/README.rst`` is not
+      allowed).
+
+    - A wildcard that does not match any files is an error.
 
     The reason for providing only a very limited form of wildcard is to
     concisely express the common case of a large number of related files
     of the same file type without making it too easy to accidentally
     include unwanted files.
+
+    On efficiency: if you use ``**`` patterns, the directory tree will
+    be walked starting with the parent directory of the ``**``. If
+    that's the root of the project, this might include ``.git/``,
+    ``dist-newstyle/``, or other large directories! To avoid this
+    behaviour, put the files that wildcards will match against in
+    their own folder.
+
+    ``**`` wildcards are available starting in Cabal 2.4.
 
 .. pkg-field:: data-dir: directory
 
@@ -1027,12 +1063,20 @@ describe the package as a whole:
 Library
 ^^^^^^^
 
-.. pkg-section:: library
+.. pkg-section:: library name
     :synopsis: Library build information.
 
-    Build information for libraries. There can be only one library in a
+    Build information for libraries.
+
+    Currently, there can only be one publicly exposed library in a
     package, and its name is the same as package name set by global
-    :pkg-field:`name` field.
+    :pkg-field:`name` field. In this case, the ``name`` argument to
+    the :pkg-section:`library` section must be omitted.
+
+    Starting with Cabal 2.0, private internal sub-library components
+    can be defined by using setting the ``name`` field to a name
+    different from the current package's name; see section on
+    :ref:`Internal Libraries <sublibs>` for more information.
 
 The library section should contain the following fields:
 
@@ -1043,6 +1087,7 @@ The library section should contain the following fields:
     A list of modules added by this package.
 
 .. pkg-field:: virtual-modules: identifier list
+    :since: 2.2
 
     A list of virtual modules provided by this package.  Virtual modules
     are modules without a source file.  See for example the ``GHC.Prim``
@@ -1069,6 +1114,7 @@ The library section should contain the following fields:
     exposed modules would clash with other common modules.
 
 .. pkg-field:: reexported-modules: exportlist
+    :since: 1.22
 
     Supported only in GHC 7.10 and later. A list of modules to
     *reexport* from this package. The syntax of this field is
@@ -1086,8 +1132,28 @@ The library section should contain the following fields:
     conflict (as would be the case with a stub module.) They can also be
     used to resolve name conflicts.
 
+.. pkg-field:: signatures: signature list
+    :since: 2.0
+
+    Supported only in GHC 8.2 and later. A list of `module signatures <https://downloads.haskell.org/~ghc/master/users-guide/separate_compilation.html#module-signatures>`__ required by this package.
+
+    Module signatures are part of the
+    `Backpack <https://ghc.haskell.org/trac/ghc/wiki/Backpack>`__ extension to
+    the Haskell module system.
+
+    Packages that do not export any modules and only export required signatures
+    are called "signature-only packages", and their signatures are subjected to
+    `signature thinning
+    <https://wiki.haskell.org/Module_signature#How_to_use_a_signature_package>`__.
+
+    
+
 The library section may also contain build information fields (see the
 section on `build information`_).
+
+.. _sublibs:
+
+**Internal Libraries**
 
 Cabal 2.0 and later support "internal libraries", which are extra named
 libraries (as opposed to the usual unnamed library section). For
@@ -1099,10 +1165,10 @@ look something like this:
 
 ::
 
+    cabal-version:  2.0
     name:           foo
-    version:        1.0
+    version:        0.1.0.0
     license:        BSD3
-    cabal-version:  >= 1.24
     build-type:     Simple
 
     library foo-internal
@@ -1127,8 +1193,55 @@ executables, but do not define a publically accessible library. Internal
 libraries are only visible internally in the package (so they can only
 be added to the :pkg-field:`build-depends` of same-package libraries,
 executables, test suites, etc.) Internal libraries locally shadow any
-packages which have the same name (so don't name an internal library
-with the same name as an external dependency.)
+packages which have the same name; consequently, don't name an internal
+library with the same name as an external dependency if you need to be
+able to refer to the external dependency in a
+:pkg-field:`build-depends` declaration.
+
+Shadowing can be used to vendor an external dependency into a package
+and thus emulate *private dependencies*. Below is an example based on
+a real-world use case:
+
+::
+
+    cabal-version: 2.2
+    name: haddock-library
+    version: 1.6.0
+
+    library
+      build-depends:
+        , base         ^>= 4.11.1.0
+        , bytestring   ^>= 0.10.2.0
+        , containers   ^>= 0.4.2.1 || ^>= 0.5.0.0
+        , transformers ^>= 0.5.0.0
+
+      hs-source-dirs:       src
+
+      -- internal sub-lib
+      build-depends:        attoparsec
+
+      exposed-modules:
+        Documentation.Haddock
+
+    library attoparsec
+      build-depends:
+        , base         ^>= 4.11.1.0
+        , bytestring   ^>= 0.10.2.0
+        , deepseq      ^>= 1.4.0.0
+
+      hs-source-dirs:       vendor/attoparsec-0.13.1.0
+
+      -- NB: haddock-library needs only small part of lib:attoparsec
+      --     internally, so we only bundle that subset here
+      exposed-modules:
+        Data.Attoparsec.ByteString
+        Data.Attoparsec.Combinator
+
+      other-modules:
+        Data.Attoparsec.Internal
+
+      ghc-options: -funbox-strict-fields -Wall -fwarn-tabs -O2
+
 
 Opening an interpreter session
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -1220,9 +1333,20 @@ The following flags are supported by the ``outdated`` command:
 ``--freeze-file``
     Read dependency version bounds from the freeze file (``cabal.config``)
     instead of the package description file (``$PACKAGENAME.cabal``).
+    ``--v1-freeze-file`` is an alias for this flag starting in Cabal 2.4.
 ``--new-freeze-file``
     Read dependency version bounds from the new-style freeze file
-    (``cabal.project.freeze``) instead of the package description file.
+    (by default, ``cabal.project.freeze``) instead of the package
+    description file. ``--v2-freeze-file`` is an alias for this flag
+    starting in Cabal 2.4.
+``--project-file`` *PROJECTFILE*
+    :since: 2.4
+
+    Read dependendency version bounds from the new-style freeze file
+    related to the named project file (i.e., ``$PROJECTFILE.freeze``)
+    instead of the package desctription file. If multiple ``--project-file``
+    flags are provided, only the final one is considered. This flag
+    must only be passed in when ``--new-freeze-file`` is present.
 ``--simple-output``
     Print only the names of outdated dependencies, one per line.
 ``--exit-code``
@@ -1723,10 +1847,28 @@ of the corresponding library or executable. See also the sections on
 `system-dependent parameters`_ and `configurations`_ for a way to supply
 system-dependent values for these fields.
 
-.. pkg-field:: build-depends: package list
+.. pkg-field:: build-depends: library list
 
-    A list of packages needed to build this one. Each package can be
-    annotated with a version constraint.
+    Declares the *library* dependencies required to build the current
+    package component; see :pkg-field:`build-tool-depends` for
+    declaring build-time *tool* dependencies. External library
+    dependencies should be annotated with a version constraint.
+
+    **Library Names**
+
+    External libraries are identified by the package's name they're
+    provided by (currently a package can only publically expose its
+    main library compeonent; in future, packages with multiple exposed
+    public library components will be supported and a syntax for
+    referring to public sub-libraries will be provided).
+
+    In order to specify an intra-package dependency on an internal
+    library component you can use the unqualified name of the
+    component library component. Note that locally defined sub-library
+    names shadow external package names of the same name. See section on
+    :ref:`Internal Libraries <sublibs>` for examples and more information.
+
+    **Version Constraints**
 
     Version constraints use the operators ``==, >=, >, <, <=`` and a
     version number. Multiple constraints can be combined using ``&&`` or
@@ -2115,6 +2257,7 @@ system-dependent values for these fields.
     files.
 
 .. pkg-field:: cxx-sources: filename list
+    :since: 2.2
 
     A list of C++ source files to be compiled and linked with the Haskell
     files. Useful for segregating C and C++ sources when supplying different
@@ -2151,7 +2294,7 @@ system-dependent values for these fields.
 .. pkg-field:: extra-bundled-libraries: token list
 
    A list of libraries that are supposed to be copied from the build
-   directory alongside the produced haskell libraries.  Note that you
+   directory alongside the produced Haskell libraries.  Note that you
    are under the obligation to produce those lirbaries in the build
    directory (e.g. via a custom setup).  Libraries listed here will
    be included when ``copy``-ing packages and be listed in the
@@ -2170,10 +2313,11 @@ system-dependent values for these fields.
 .. pkg-field:: cpp-options: token list
 
     Command-line arguments for pre-processing Haskell code. Applies to
-    haskell source and other pre-processed Haskell source like .hsc
+    Haskell source and other pre-processed Haskell source like .hsc
     .chs. Does not apply to C code, that's what cc-options is for.
 
 .. pkg-field:: cxx-options: token list
+    :since: 2.2
 
     Command-line arguments to be passed to the compiler when compiling
     C++ code. The C++ sources to which these command-line arguments
@@ -2217,6 +2361,107 @@ system-dependent values for these fields.
 
     On Darwin/MacOS X, a list of directories to search for frameworks.
     This entry is ignored on all other platforms.
+
+.. pkg-field:: mixins: mixin list
+    :since: 2.0
+
+    Supported only in GHC 8.2 and later. A list of packages mentioned in the
+    :pkg-field:`build-depends` field, each optionally accompanied by a list of
+    module and module signature renamings.
+
+    The simplest mixin syntax is simply the name of a package mentioned in the
+    :pkg-field:`build-depends` field. For example:
+
+    ::
+
+        library
+          build-depends:
+            foo >= 1.2.3 && < 1.3
+          mixins:
+            foo
+
+    But this doesn't have any effect. More interesting is to use the mixin
+    entry to rename one or more modules from the package, like this:
+
+    ::
+
+        library
+          mixins:
+            foo (Foo.Bar as AnotherFoo.Bar, Foo.Baz as AnotherFoo.Baz)
+
+    Note that renaming a module like this will hide all the modules
+    that are not explicitly named.
+
+    Modules can also be hidden:
+
+    ::
+
+        library:
+          mixins:
+            foo hiding (Foo.Bar)
+
+    Hiding modules exposes everything that is not explicitly hidden.
+
+    .. Note::
+
+       The current version of Cabal suffers from an infelicity in how the
+       entries of :pkg-field:`mixins` are parsed: an entry will fail to parse
+       if the provided renaming clause has whitespace after the opening
+       parenthesis. This will be fixed in future versions of Cabal.
+
+       See issues `#5150 <https://github.com/haskell/cabal/issues/5150>`__,
+       `#4864 <https://github.com/haskell/cabal/issues/4864>`__, and
+       `#5293 <https://github.com/haskell/cabal/pull/5293>`__.
+
+    There can be multiple mixin entries for a given package, in effect creating
+    multiple copies of the dependency:
+
+    ::
+
+        library
+          mixins:
+            foo (Foo.Bar as AnotherFoo.Bar, Foo.Baz as AnotherFoo.Baz),
+            foo (Foo.Bar as YetAnotherFoo.Bar)
+
+    The ``requires`` clause is used to rename the module signatures required by
+    a package:
+
+    ::
+
+        library
+          mixins:
+            foo (Foo.Bar as AnotherFoo.Bar) requires (Foo.SomeSig as AnotherFoo.SomeSig)
+
+    Signature-only packages don't have any modules, so only the signatures can
+    be renamed, with the following syntax:
+
+    ::
+
+        library
+          mixins:
+            sigonly requires (SigOnly.SomeSig as AnotherSigOnly.SomeSig)
+
+    See the :pkg-field:`signatures` field for more details.
+
+    Mixin packages are part of the `Backpack
+    <https://ghc.haskell.org/trac/ghc/wiki/Backpack>`__ extension to the
+    Haskell module system.
+
+    The matching of the module signatures required by a
+    :pkg-field:`build-depends` dependency with the implementation modules
+    present in another dependency is triggered by a coincidence of names. When
+    the names of the signature and of the implementation are already the same,
+    the matching is automatic. But when the names don't coincide, or we want to
+    instantiate a signature in two different ways, adding mixin entries that
+    perform renamings becomes necessary.  
+
+    .. Warning::
+
+       Backpack has the limitation that implementation modules that instantiate
+       signatures required by a :pkg-field:`build-depends` dependency can't
+       reside in the same component that has the dependency. They must reside
+       in a different package dependency, or at least in a separate internal
+       library.
 
 Configurations
 ^^^^^^^^^^^^^^
@@ -2383,6 +2628,7 @@ Configuration Flags
 .. pkg-field:: manual: boolean
 
     :default: ``False``
+    :since: 1.6
 
     By default, Cabal will first try to satisfy dependencies with the
     default flag value and then, if that is not possible, with the

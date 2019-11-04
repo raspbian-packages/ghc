@@ -10,7 +10,7 @@
  * We use a realtime timer by default.  I found this much more
  * reliable than a CPU timer:
  *
- * Experiments with different frequences: using
+ * Experiments with different frequencies: using
  * CLOCK_REALTIME/CLOCK_MONOTONIC on Linux 2.6.32,
  *     1000us has  <1% impact on runtime
  *      100us has  ~2% impact on runtime
@@ -84,11 +84,11 @@ static Time itimer_interval = DEFAULT_TICK_INTERVAL;
 
 // Should we be firing ticks?
 // Writers to this must hold the mutex below.
-static volatile HsBool stopped = 0;
+static volatile bool stopped = false;
 
 // should the ticker thread exit?
 // This can be set without holding the mutex.
-static volatile HsBool exited = 1;
+static volatile bool exited = true;
 
 // Signaled when we want to (re)start the timer
 static Condition start_cond;
@@ -109,15 +109,13 @@ static void *itimer_thread_func(void *_handle_tick)
 
     timerfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
     if (timerfd == -1) {
-        sysErrorBelch("timerfd_create");
-        stg_exit(EXIT_FAILURE);
+        barf("timerfd_create");
     }
     if (!TFD_CLOEXEC) {
-      fcntl(timerfd, F_SETFD, FD_CLOEXEC);
+        fcntl(timerfd, F_SETFD, FD_CLOEXEC);
     }
     if (timerfd_settime(timerfd, 0, &it, NULL)) {
-        sysErrorBelch("timerfd_settime");
-        stg_exit(EXIT_FAILURE);
+        barf("timerfd_settime");
     }
 #endif
 
@@ -136,12 +134,12 @@ static void *itimer_thread_func(void *_handle_tick)
 
         // first try a cheap test
         if (stopped) {
-            ACQUIRE_LOCK(&mutex);
+            OS_ACQUIRE_LOCK(&mutex);
             // should we really stop?
             if (stopped) {
                 waitCondition(&start_cond, &mutex);
             }
-            RELEASE_LOCK(&mutex);
+            OS_RELEASE_LOCK(&mutex);
         } else {
             handle_tick(0);
         }
@@ -149,8 +147,6 @@ static void *itimer_thread_func(void *_handle_tick)
 
     if (USE_TIMERFD_FOR_ITIMER)
         close(timerfd);
-    closeMutex(&mutex);
-    closeCondition(&start_cond);
     return NULL;
 }
 
@@ -158,8 +154,8 @@ void
 initTicker (Time interval, TickProc handle_tick)
 {
     itimer_interval = interval;
-    stopped = 0;
-    exited = 0;
+    stopped = false;
+    exited = false;
 
     initCondition(&start_cond);
     initMutex(&mutex);
@@ -173,27 +169,26 @@ initTicker (Time interval, TickProc handle_tick)
         pthread_setname_np(thread, "ghc_ticker");
 #endif
     } else {
-        sysErrorBelch("Itimer: Failed to spawn thread");
-        stg_exit(EXIT_FAILURE);
+        barf("Itimer: Failed to spawn thread");
     }
 }
 
 void
 startTicker(void)
 {
-    ACQUIRE_LOCK(&mutex);
+    OS_ACQUIRE_LOCK(&mutex);
     stopped = 0;
     signalCondition(&start_cond);
-    RELEASE_LOCK(&mutex);
+    OS_RELEASE_LOCK(&mutex);
 }
 
 /* There may be at most one additional tick fired after a call to this */
 void
 stopTicker(void)
 {
-    ACQUIRE_LOCK(&mutex);
+    OS_ACQUIRE_LOCK(&mutex);
     stopped = 1;
-    RELEASE_LOCK(&mutex);
+    OS_RELEASE_LOCK(&mutex);
 }
 
 /* There may be at most one additional tick fired after a call to this */
@@ -201,7 +196,7 @@ void
 exitTicker (bool wait)
 {
     ASSERT(!exited);
-    exited = 1;
+    exited = true;
     // ensure that ticker wakes up if stopped
     startTicker();
 
@@ -210,6 +205,8 @@ exitTicker (bool wait)
         if (pthread_join(thread, NULL)) {
             sysErrorBelch("Itimer: Failed to join");
         }
+        closeMutex(&mutex);
+        closeCondition(&start_cond);
     } else {
         pthread_detach(thread);
     }

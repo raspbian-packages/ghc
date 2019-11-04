@@ -53,16 +53,10 @@ showMessages = go 0
         (atLevel l $ "rejecting: " ++ showQSNBool qsn b ++ showFR c fr) (go l ms)
     go !l (Step (Next (Goal (P _  ) gr)) (Step (TryP qpn' i) ms@(Step Enter (Step (Next _) _)))) =
         (atLevel l $ "trying: " ++ showQPNPOpt qpn' i ++ showGR gr) (go l ms)
-    go !l (Step (Next (Goal (P qpn) gr)) ms@(Fail _)) =
-        (atLevel l $ "unknown package: " ++ showQPN qpn ++ showGR gr) $ go l ms
-        -- the previous case potentially arises in the error output, because we remove the backjump itself
-        -- if we cut the log after the first error
     go !l (Step (Next (Goal (P qpn) gr)) ms@(Step (Failure _c Backjump) _)) =
         (atLevel l $ "unknown package: " ++ showQPN qpn ++ showGR gr) $ go l ms
     go !l (Step (Next (Goal (P qpn) gr)) (Step (Failure c fr) ms)) =
         (atLevel l $ showPackageGoal qpn gr) $ (atLevel l $ showFailure c fr) (go l ms)
-    go !l (Step (Failure c Backjump) ms@(Step Leave (Step (Failure c' Backjump) _)))
-        | c == c' = go l ms
     -- standard display
     go !l (Step Enter                    ms) = go (l+1) ms
     go !l (Step Leave                    ms) = go (l-1) ms
@@ -115,8 +109,10 @@ showFR _ (UnsupportedLanguage lang)       = " (conflict: requires " ++ display l
 showFR _ (MissingPkgconfigPackage pn vr)  = " (conflict: pkg-config package " ++ display pn ++ display vr ++ ", not found in the pkg-config database)"
 showFR _ (NewPackageDoesNotMatchExistingConstraint d) = " (conflict: " ++ showConflictingDep d ++ ")"
 showFR _ (ConflictingConstraints d1 d2)   = " (conflict: " ++ L.intercalate ", " (L.map showConflictingDep [d1, d2]) ++ ")"
-showFR _ (NewPackageIsMissingRequiredExe exe dr) = " (does not contain executable " ++ unUnqualComponentName exe ++ ", which is required by " ++ showDependencyReason dr ++ ")"
-showFR _ (PackageRequiresMissingExe qpn exe) = " (requires executable " ++ unUnqualComponentName exe ++ " from " ++ showQPN qpn ++ ", but the executable does not exist)"
+showFR _ (NewPackageIsMissingRequiredComponent comp dr) = " (does not contain " ++ showExposedComponent comp ++ ", which is required by " ++ showDependencyReason dr ++ ")"
+showFR _ (NewPackageHasUnbuildableRequiredComponent comp dr) = " (" ++ showExposedComponent comp ++ " is not buildable in the current environment, but it is required by " ++ showDependencyReason dr ++ ")"
+showFR _ (PackageRequiresMissingComponent qpn comp) = " (requires " ++ showExposedComponent comp ++ " from " ++ showQPN qpn ++ ", but the component does not exist)"
+showFR _ (PackageRequiresUnbuildableComponent qpn comp) = " (requires " ++ showExposedComponent comp ++ " from " ++ showQPN qpn ++ ", but the component is not buildable in the current environment)"
 showFR _ CannotInstall                    = " (only already installed instances can be used)"
 showFR _ CannotReinstall                  = " (avoiding to reinstall a package with same version but new dependencies)"
 showFR _ Shadowed                         = " (shadowed by another installed package with same version)"
@@ -138,17 +134,21 @@ showFR _ (MalformedFlagChoice qfn)        = " (INTERNAL ERROR: MALFORMED FLAG CH
 showFR _ (MalformedStanzaChoice qsn)      = " (INTERNAL ERROR: MALFORMED STANZA CHOICE: " ++ showQSN qsn ++ ")"
 showFR _ EmptyGoalChoice                  = " (INTERNAL ERROR: EMPTY GOAL CHOICE)"
 
+showExposedComponent :: ExposedComponent -> String
+showExposedComponent ExposedLib = "library"
+showExposedComponent (ExposedExe name) = "executable '" ++ unUnqualComponentName name ++ "'"
+
 constraintSource :: ConstraintSource -> String
 constraintSource src = "constraint from " ++ showConstraintSource src
 
 showConflictingDep :: ConflictingDep -> String
-showConflictingDep (ConflictingDep dr mExe qpn ci) =
+showConflictingDep (ConflictingDep dr (PkgComponent qpn comp) ci) =
   let DependencyReason qpn' _ _ = dr
-      exeStr = case mExe of
-                 Just exe -> " (exe " ++ unUnqualComponentName exe ++ ")"
-                 Nothing  -> ""
+      componentStr = case comp of
+                       ExposedExe exe -> " (exe " ++ unUnqualComponentName exe ++ ")"
+                       ExposedLib     -> ""
   in case ci of
        Fixed i        -> (if qpn /= qpn' then showDependencyReason dr ++ " => " else "") ++
-                         showQPN qpn ++ exeStr ++ "==" ++ showI i
+                         showQPN qpn ++ componentStr ++ "==" ++ showI i
        Constrained vr -> showDependencyReason dr ++ " => " ++ showQPN qpn ++
-                         exeStr ++ showVR vr
+                         componentStr ++ showVR vr

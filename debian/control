@@ -3,7 +3,7 @@ Section: haskell
 Priority: optional
 Maintainer: Debian Haskell Group <pkg-haskell-maintainers@lists.alioth.debian.org>
 Uploaders: Joachim Breitner <nomeata@debian.org>, Clint Adams <clint@debian.org>
-Standards-Version: 4.2.1
+Standards-Version: 4.4.0
 Rules-Requires-Root: no
 Build-Depends:
   debhelper (>= 10),
@@ -11,7 +11,7 @@ Build-Depends:
   devscripts,
   grep-dctrl,
   pkg-config,
-  ghc:native (>= 7.8),
+  ghc:native (>= 8.4),
   libgmp-dev,
   llvm-6.0 [arm64 armel armhf],
   libffi-dev,

@@ -54,7 +54,7 @@ type ExportInfo = (ExportedNames, Modules)
 -- Also attaches fixities
 attachInstances :: ExportInfo -> [Interface] -> InstIfaceMap -> ModuleSet -> Ghc [Interface]
 attachInstances expInfo ifaces instIfaceMap mods = do
-  (_msgs, mb_index) <- getNameToInstancesIndex2 (map ifaceMod ifaces) mods'
+  (_msgs, mb_index) <- getNameToInstancesIndex (map ifaceMod ifaces) mods'
   mapM (attach $ fromMaybe emptyNameEnv mb_index) ifaces
   where
     mods' = Just (moduleSetElts mods)
@@ -89,7 +89,7 @@ attachToExportItem
   -> Ghc (ExportItem GhcRn)
 attachToExportItem index expInfo iface ifaceMap instIfaceMap export =
   case attachFixities export of
-    e@ExportDecl { expItemDecl = L eSpan (TyClD d) } -> do
+    e@ExportDecl { expItemDecl = L eSpan (TyClD _ d) } -> do
       insts <-
         let mb_instances  = lookupNameEnv index (tcdName d)
             cls_instances = maybeToList mb_instances >>= fst

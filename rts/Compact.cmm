@@ -154,8 +154,8 @@ eval:
     }
 
     case
-        MUT_ARR_PTRS_FROZEN0,
-        MUT_ARR_PTRS_FROZEN: {
+        MUT_ARR_PTRS_FROZEN_DIRTY,
+        MUT_ARR_PTRS_FROZEN_CLEAN: {
 
         (should) = ccall shouldCompact(compact "ptr", p "ptr");
         if (should == SHOULDCOMPACT_IN_CNF) { P_[pp] = p; return(); }
@@ -174,7 +174,7 @@ eval:
         prim %memcpy(to + cards, p + cards , size - cards, 1);
         i = 0;
       loop0:
-        if (i < ptrs) {
+        if (i < ptrs) ( likely: True ) {
             W_ q;
             q = to + SIZEOF_StgMutArrPtrs + WDS(i);
             call stg_compactAddWorkerzh(
@@ -186,8 +186,8 @@ eval:
     }
 
     case
-        SMALL_MUT_ARR_PTRS_FROZEN0,
-        SMALL_MUT_ARR_PTRS_FROZEN: {
+        SMALL_MUT_ARR_PTRS_FROZEN_DIRTY,
+        SMALL_MUT_ARR_PTRS_FROZEN_CLEAN: {
 
         (should) = ccall shouldCompact(compact "ptr", p "ptr");
         if (should == SHOULDCOMPACT_IN_CNF) { P_[pp] = p; return(); }
@@ -202,7 +202,7 @@ eval:
         StgSmallMutArrPtrs_ptrs(to) = ptrs;
         i = 0;
       loop1:
-        if (i < ptrs) {
+        if (i < ptrs) ( likely: True ) {
             W_ q;
             q = to + SIZEOF_StgSmallMutArrPtrs + WDS(i);
             call stg_compactAddWorkerzh(
@@ -243,7 +243,7 @@ eval:
         loop2:
             StgClosure_payload(to,i) = StgClosure_payload(p,i);
             i = i + 1;
-            if (i < ptrs + nptrs) goto loop2;
+            if (i < ptrs + nptrs) ( likely: True ) goto loop2;
         }
 
         // Next, recursively compact and copy the pointers

@@ -117,7 +117,6 @@ module GHC (
         showModule,
         moduleIsBootOrNotObjectLinkable,
         getNameToInstancesIndex,
-        getNameToInstancesIndex2,
 
         -- ** Inspecting types and kinds
         exprType, TcRnExprMode(..),
@@ -132,6 +131,9 @@ module GHC (
         InteractiveEval.compileExpr, dynCompileExpr,
         ForeignHValue,
         compileExprRemote, compileParsedExprRemote,
+
+        -- ** Docs
+        getDocs, GetDocsFailure(..),
 
         -- ** Other
         runTcInteractive,   -- Desired by some clients (Trac #8878)
@@ -474,7 +476,6 @@ withCleanupSession ghc = ghc `gfinally` cleanup
           cleanTempFiles dflags
           cleanTempDirs dflags
           stopIServ hsc_env -- shut down the IServ
-          log_finaliser dflags dflags
           --  exceptions will be blocked while we clean the temporary files,
           -- so there shouldn't be any difficulty if we receive further
           -- signals.
@@ -495,8 +496,8 @@ initGhcMonad :: GhcMonad m => Maybe FilePath -> m ()
 initGhcMonad mb_top_dir
   = do { env <- liftIO $
                 do { mySettings <- initSysTools mb_top_dir
-                   ; myLlvmTargets <- initLlvmTargets mb_top_dir
-                   ; dflags <- initDynFlags (defaultDynFlags mySettings myLlvmTargets)
+                   ; myLlvmConfig <- initLlvmConfig mb_top_dir
+                   ; dflags <- initDynFlags (defaultDynFlags mySettings myLlvmConfig)
                    ; checkBrokenTablesNextToCode dflags
                    ; setUnsafeGlobalDynFlags dflags
                       -- c.f. DynFlags.parseDynamicFlagsFull, which
@@ -594,12 +595,11 @@ setProgramDynFlags dflags = setProgramDynFlags_ True dflags
 -- | Set the action taken when the compiler produces a message.  This
 -- can also be accomplished using 'setProgramDynFlags', but using
 -- 'setLogAction' avoids invalidating the cached module graph.
-setLogAction :: GhcMonad m => LogAction -> LogFinaliser -> m ()
-setLogAction action finaliser = do
+setLogAction :: GhcMonad m => LogAction -> m ()
+setLogAction action = do
   dflags' <- getProgramDynFlags
   void $ setProgramDynFlags_ False $
-    dflags' { log_action = action
-            , log_finaliser = finaliser }
+    dflags' { log_action = action }
 
 setProgramDynFlags_ :: GhcMonad m => Bool -> DynFlags -> m [InstalledUnitId]
 setProgramDynFlags_ invalidate_needed dflags = do
@@ -1246,22 +1246,12 @@ getGRE = withSession $ \hsc_env-> return $ ic_rn_gbl_env (hsc_IC hsc_env)
 -- by 'Name'. Each name's lists will contain every instance in which that name
 -- is mentioned in the instance head.
 getNameToInstancesIndex :: GhcMonad m
-  => [Module]  -- ^ visible modules. An orphan instance will be returned if and
-               -- only it is visible from at least one module in the list.
-  -> m (Messages, Maybe (NameEnv ([ClsInst], [FamInst])))
-getNameToInstancesIndex visible_mods =
-  getNameToInstancesIndex2 visible_mods Nothing
-
--- | Retrieve all type and family instances in the environment, indexed
--- by 'Name'. Each name's lists will contain every instance in which that name
--- is mentioned in the instance head.
-getNameToInstancesIndex2 :: GhcMonad m
   => [Module]        -- ^ visible modules. An orphan instance will be returned
                      -- if it is visible from at least one module in the list.
   -> Maybe [Module]  -- ^ modules to load. If this is not specified, we load
                      -- modules for everything that is in scope unqualified.
   -> m (Messages, Maybe (NameEnv ([ClsInst], [FamInst])))
-getNameToInstancesIndex2 visible_mods mods_to_load = do
+getNameToInstancesIndex visible_mods mods_to_load = do
   hsc_env <- getSession
   liftIO $ runTcInteractive hsc_env $
     do { case mods_to_load of

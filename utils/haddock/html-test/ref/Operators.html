@@ -136,15 +136,29 @@
 		  >type</span
 		  > a <a href="#"
 		  >&lt;&gt;&lt;</a
-		  > b :: <a href="#" title="Data.Kind"
-		  >*</a
-		  ></li
+		  > b :: *</li
 		><li
 		><span class="keyword"
 		  >data</span
 		  > a <a href="#"
 		  >&gt;&lt;&lt;</a
 		  > b</li
+		><li
+		><a href="#"
+		  >(&gt;&gt;&lt;)</a
+		  >, <a href="#"
+		  >(&lt;&lt;&gt;)</a
+		  > :: a -&gt; b -&gt; ()</li
+		><li
+		><a href="#"
+		  >(**&gt;)</a
+		  >, <a href="#"
+		  >(**&lt;)</a
+		  >, <a href="#"
+		  >(&gt;**)</a
+		  >, <a href="#"
+		  >(&lt;**)</a
+		  > :: a -&gt; a -&gt; ()</li
 		></ul
 	      ></li
 	    ><li class="src short"
@@ -376,24 +390,6 @@
 	  ><p
 	    >Class with fixity, including associated types</p
 	    ></div
-	  ><div class="subs minimal"
-	  ><p class="caption"
-	    >Minimal complete definition</p
-	    ><p class="src"
-	    ><a href="#" title="Operators"
-	      >(&gt;&gt;&lt;)</a
-	      >, <a href="#" title="Operators"
-	      >(&lt;&lt;&gt;)</a
-	      >, <a href="#" title="Operators"
-	      >(**&gt;)</a
-	      >, <a href="#" title="Operators"
-	      >(**&lt;)</a
-	      >, <a href="#" title="Operators"
-	      >(&gt;**)</a
-	      >, <a href="#" title="Operators"
-	      >(&lt;**)</a
-	      ></p
-	    ></div
 	  ><div class="subs associated-types"
 	  ><p class="caption"
 	    >Associated Types</p
@@ -402,9 +398,7 @@
 	      >type</span
 	      > a <a id="t:-60--62--60-" class="def"
 	      >&lt;&gt;&lt;</a
-	      > b :: <a href="#" title="Data.Kind"
-	      >*</a
-	      > <span class="fixity"
+	      > b :: * <span class="fixity"
 	      >infixl 2</span
 	      ><span class="rightedge"
 	      ></span

@@ -217,7 +217,7 @@ AC_DEFUN([FPTOOLS_SET_HASKELL_PLATFORM_VARS],
         mipsel)
             test -z "[$]2" || eval "[$]2=ArchMipsel"
             ;;
-        hppa|hppa1_1|ia64|m68k|riscv32|riscv64|rs6000|s390|s390x|sh4|vax)
+        hppa|hppa1_1|ia64|m68k|nios2|riscv32|riscv64|rs6000|s390|s390x|sh4|vax)
             test -z "[$]2" || eval "[$]2=ArchUnknown"
             ;;
         *)
@@ -242,7 +242,7 @@ AC_DEFUN([FPTOOLS_SET_HASKELL_PLATFORM_VARS],
         linux|linux-android)
             test -z "[$]2" || eval "[$]2=OSLinux"
             ;;
-        darwin|ios)
+        darwin|ios|watchos|tvos)
             test -z "[$]2" || eval "[$]2=OSDarwin"
             ;;
         solaris2)
@@ -288,11 +288,31 @@ AC_DEFUN([FPTOOLS_SET_HASKELL_PLATFORM_VARS],
         esac
     }
 
+    dnl Note [autoconf assembler checks and -flto]
+    dnl ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    dnl
+    dnl Autoconf's AC_COMPILE_IFELSE macro is fragile in the case of checks
+    dnl which require that the assembler is run. Specifically, GCC does not run
+    dnl the assembler if invoked with `-c -flto`; it merely dumps its internal
+    dnl AST to the object file, to be compiled and assembled during the final
+    dnl link.
+    dnl
+    dnl This can cause configure checks like that for the
+    dnl .subsections_via_symbols directive to pass unexpected (see #16440),
+    dnl leading the build system to incorrectly conclude that the directive is
+    dnl supported.
+    dnl
+    dnl For this reason, it is important that configure checks that rely on the
+    dnl assembler failing use AC_LINK_IFELSE rather than AC_COMPILE_IFELSE,
+    dnl ensuring that the assembler sees the check.
+    dnl
+
     dnl ** check for Apple-style dead-stripping support
     dnl    (.subsections-via-symbols assembler directive)
 
     AC_MSG_CHECKING(for .subsections_via_symbols)
-    AC_COMPILE_IFELSE(
+    dnl See Note [autoconf assembler checks and -flto]
+    AC_LINK_IFELSE(
         [AC_LANG_PROGRAM([], [__asm__ (".subsections_via_symbols");])],
         [AC_MSG_RESULT(yes)
          HaskellHaveSubsectionsViaSymbols=True
@@ -305,8 +325,9 @@ AC_DEFUN([FPTOOLS_SET_HASKELL_PLATFORM_VARS],
     dnl ** check for .ident assembler directive
 
     AC_MSG_CHECKING(whether your assembler supports .ident directive)
-    AC_COMPILE_IFELSE(
-        [AC_LANG_SOURCE([__asm__ (".ident \"GHC x.y.z\"");])],
+    dnl See Note [autoconf assembler checks and -flto]
+    AC_LINK_IFELSE(
+        [AC_LANG_PROGRAM([__asm__ (".ident \"GHC x.y.z\"");], [])],
         [AC_MSG_RESULT(yes)
          HaskellHaveIdentDirective=True],
         [AC_MSG_RESULT(no)
@@ -330,8 +351,15 @@ AC_DEFUN([FPTOOLS_SET_HASKELL_PLATFORM_VARS],
         ;;
     esac
     AC_MSG_CHECKING(for GNU non-executable stack support)
-    AC_COMPILE_IFELSE(
-        [AC_LANG_PROGRAM([__asm__ (".section .note.GNU-stack,\"\",$progbits");], [0])],
+    dnl See Note [autoconf assembler checks and -flto]
+    AC_LINK_IFELSE(
+       dnl the `main` function is placed after the .note.GNU-stack directive
+       dnl so we need to ensure that the active segment is correctly set,
+       dnl otherwise `main` will be placed in the wrong segment.
+        [AC_LANG_PROGRAM([
+           __asm__ (".section .note.GNU-stack,\"\",$progbits");
+           __asm__ (".section .text");
+         ], [0])],
         [AC_MSG_RESULT(yes)
          HaskellHaveGnuNonexecStack=True],
         [AC_MSG_RESULT(no)
@@ -470,15 +498,15 @@ AC_DEFUN([FP_SETTINGS],
     if test "$windows" = YES -a "$EnableDistroToolchain" = "NO"
     then
         mingw_bin_prefix=mingw/bin/
-        SettingsCCompilerCommand="\$topdir/../${mingw_bin_prefix}gcc.exe"
-        SettingsHaskellCPPCommand="\$topdir/../${mingw_bin_prefix}gcc.exe"
+	SettingsCCompilerCommand="\$tooldir/${mingw_bin_prefix}gcc.exe"
+	SettingsHaskellCPPCommand="\$tooldir/${mingw_bin_prefix}gcc.exe"
         SettingsHaskellCPPFlags="$HaskellCPPArgs"
-        SettingsLdCommand="\$topdir/../${mingw_bin_prefix}ld.exe"
-        SettingsArCommand="\$topdir/../${mingw_bin_prefix}ar.exe"
-        SettingsRanlibCommand="\$topdir/../${mingw_bin_prefix}ranlib.exe"
-        SettingsPerlCommand='$topdir/../perl/perl.exe'
-        SettingsDllWrapCommand="\$topdir/../${mingw_bin_prefix}dllwrap.exe"
-        SettingsWindresCommand="\$topdir/../${mingw_bin_prefix}windres.exe"
+	SettingsLdCommand="\$tooldir/${mingw_bin_prefix}ld.exe"
+	SettingsArCommand="\$tooldir/${mingw_bin_prefix}ar.exe"
+	SettingsRanlibCommand="\$tooldir/${mingw_bin_prefix}ranlib.exe"
+	SettingsPerlCommand='$tooldir/perl/perl.exe'
+	SettingsDllWrapCommand="\$tooldir/${mingw_bin_prefix}dllwrap.exe"
+	SettingsWindresCommand="\$tooldir/${mingw_bin_prefix}windres.exe"
         SettingsTouchCommand='$topdir/bin/touchy.exe'
     elif test "$EnableDistroToolchain" = "YES"
     then
@@ -651,6 +679,14 @@ AC_DEFUN([FPTOOLS_SET_C_LD_FLAGS],
         $3="$$3 -D_HPUX_SOURCE"
         $5="$$5 -D_HPUX_SOURCE"
         ;;
+
+    arm*freebsd*)
+        # On arm/freebsd, tell gcc to generate Arm
+        # instructions (ie not Thumb).
+        $2="$$2 -marm"
+        $3="$$3 -Wl,-z,noexecstack"
+        $4="$$4 -z noexecstack"
+        ;;
     arm*linux*)
         # On arm/linux and arm/android, tell gcc to generate Arm
         # instructions (ie not Thumb).
@@ -659,6 +695,10 @@ AC_DEFUN([FPTOOLS_SET_C_LD_FLAGS],
         $4="$$4 -z noexecstack"
         ;;
 
+    aarch64*freebsd*)
+        $3="$$3 -Wl,-z,noexecstack"
+        $4="$$4 -z noexecstack"
+        ;;
     aarch64*linux*)
         $3="$$3 -Wl,-z,noexecstack"
         $4="$$4 -z noexecstack"
@@ -1294,7 +1334,7 @@ AC_DEFUN([FP_GCC_SUPPORTS_NO_PIE],
    AC_MSG_CHECKING([whether GCC supports -no-pie])
    echo 'int main() { return 0; }' > conftest.c
    # Some GCC versions only warn when passed an unrecognized flag.
-   if $CC -no-pie -x c /dev/null -dM -E > conftest.txt 2>&1 && ! grep -i unrecognized conftest.txt > /dev/null 2>&1; then
+   if $CC -no-pie -Werror -x c /dev/null -dM -E > conftest.txt 2>&1 && ! grep -i unrecognized conftest.txt > /dev/null 2>&1; then
        CONF_GCC_SUPPORTS_NO_PIE=YES
        AC_MSG_RESULT([yes])
    else
@@ -1534,7 +1574,7 @@ if test "$RELEASE" = "NO"; then
 fi
 
     AC_MSG_CHECKING([for GHC Git commit id])
-    if test -d .git; then
+    if test -e .git; then
         git_commit_id=`git rev-parse HEAD`
         if test -n "$git_commit_id" 2>&1 >/dev/null; then true; else
             AC_MSG_ERROR([failed to detect revision: check that git is in your path])
@@ -1908,6 +1948,10 @@ case "$1" in
 # converts the canonicalized target into someting llvm can understand
 AC_DEFUN([GHC_LLVM_TARGET], [
   case "$2-$3" in
+    *-freebsd*-gnueabihf)
+      llvm_target_vendor="unknown"
+      llvm_target_os="freebsd-gnueabihf"
+      ;;
     hardfloat-*eabi)
       llvm_target_vendor="unknown"
       llvm_target_os="$3""hf"
@@ -1959,6 +2003,9 @@ AC_DEFUN([GHC_CONVERT_VENDOR],[
 # converts os from gnu to ghc naming, and assigns the result to $target_var
 AC_DEFUN([GHC_CONVERT_OS],[
     case "$1" in
+      gnu*) # e.g. i686-unknown-gnu0.9
+        $3="gnu"
+        ;;
       # watchos and tvos are ios variants as of May 2017.
       ios|watchos|tvos)
         $3="ios"
@@ -1973,8 +2020,11 @@ AC_DEFUN([GHC_CONVERT_OS],[
         $3="openbsd"
         ;;
       # As far as I'm aware, none of these have relevant variants
-      freebsd|netbsd|dragonfly|hpux|linuxaout|freebsd2|mingw32|darwin|gnu|nextstep2|nextstep3|sunos4|ultrix|haiku)
+      freebsd|netbsd|dragonfly|hpux|linuxaout|freebsd2|mingw32|darwin|nextstep2|nextstep3|sunos4|ultrix|haiku)
         $3="$1"
+        ;;
+      msys)
+        AC_MSG_ERROR([Building GHC using the msys toolchain is not supported; please use mingw instead. Perhaps you need to set 'MSYSTEM=MINGW64 or MINGW32?'])
         ;;
       aix*) # e.g. powerpc-ibm-aix7.1.3.0
         $3="aix"

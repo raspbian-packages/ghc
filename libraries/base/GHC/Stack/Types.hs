@@ -53,6 +53,7 @@ import GHC.Types (Char, Int)
 -- Make implicit dependency known to build system
 import GHC.Tuple ()
 import GHC.Integer ()
+import GHC.Natural ()
 
 ----------------------------------------------------------------------
 -- Explicit call-stacks built via ImplicitParams
@@ -215,4 +216,4 @@ data SrcLoc = SrcLoc
   , srcLocStartCol  :: Int
   , srcLocEndLine   :: Int
   , srcLocEndCol    :: Int
-  } deriving Eq
+  } deriving Eq -- ^ @since 4.9.0.0

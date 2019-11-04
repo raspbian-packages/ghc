@@ -27,10 +27,14 @@ import System.FilePath
 
 import Distribution.Package
          ( PackageId, ComponentId, UnitId )
+import Distribution.Client.Setup
+         ( ArchiveFormat(..) )
 import Distribution.Compiler
 import Distribution.Simple.Compiler
          ( PackageDB(..), PackageDBStack, OptimisationLevel(..) )
 import Distribution.Text
+import Distribution.Pretty
+         ( prettyShow )
 import Distribution.Types.ComponentName
 import Distribution.System
 
@@ -85,10 +89,14 @@ data DistDirLayout = DistDirLayout {
        distBuildDirectory           :: DistDirParams -> FilePath,
        distBuildRootDirectory       :: FilePath,
 
+       -- | The directory under dist where we download tarballs and source
+       -- control repos to.
+       --
+       distDownloadSrcDirectory     :: FilePath,
+
        -- | The directory under dist where we put the unpacked sources of
        -- packages, in those cases where it makes sense to keep the build
-       -- artifacts to reduce rebuild times. These can be tarballs or could be
-       -- scm repos.
+       -- artifacts to reduce rebuild times.
        --
        distUnpackedSrcDirectory     :: PackageId -> FilePath,
        distUnpackedSrcRootDirectory :: FilePath,
@@ -104,6 +112,10 @@ data DistDirLayout = DistDirLayout {
        --
        distPackageCacheFile         :: DistDirParams -> String -> FilePath,
        distPackageCacheDirectory    :: DistDirParams -> FilePath,
+
+       -- | The location that sdists are placed by default.
+       distSdistFile                :: PackageId -> ArchiveFormat -> FilePath,
+       distSdistDirectory           :: FilePath,
 
        distTempDirectory            :: FilePath,
        distBinDirectory             :: FilePath,
@@ -205,12 +217,22 @@ defaultDistDirLayout projectRoot mdistDirectory =
     distUnpackedSrcRootDirectory   = distDirectory </> "src"
     distUnpackedSrcDirectory pkgid = distUnpackedSrcRootDirectory
                                       </> display pkgid
+    -- we shouldn't get name clashes so this should be fine:
+    distDownloadSrcDirectory       = distUnpackedSrcRootDirectory
 
     distProjectCacheDirectory = distDirectory </> "cache"
     distProjectCacheFile name = distProjectCacheDirectory </> name
 
     distPackageCacheDirectory params = distBuildDirectory params </> "cache"
     distPackageCacheFile params name = distPackageCacheDirectory params </> name
+
+    distSdistFile pid format = distSdistDirectory </> prettyShow pid <.> ext
+        where
+          ext = case format of
+            TargzFormat -> "tar.gz"
+            ZipFormat -> "zip"
+    
+    distSdistDirectory = distDirectory </> "sdist"
 
     distTempDirectory = distDirectory </> "tmp"
 

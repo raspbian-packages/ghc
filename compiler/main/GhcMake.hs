@@ -201,11 +201,16 @@ warnMissingHomeModules hsc_env mod_graph =
 
     msg
       | gopt Opt_BuildingCabalPackage dflags
-      = text "These modules are needed for compilation but not listed in your .cabal file's other-modules: "
-        <> sep (map ppr missing)
+      = hang
+          (text "These modules are needed for compilation but not listed in your .cabal file's other-modules: ")
+          4
+          (sep (map ppr missing))
       | otherwise
-      = text "Modules are not listed in command line but needed for compilation: "
-        <> sep (map ppr missing)
+      =
+        hang
+          (text "Modules are not listed in command line but needed for compilation: ")
+          4
+          (sep (map ppr missing))
     warn = makeIntoWarning
       (Reason Opt_WarnMissingHomeModules)
       (mkPlainErrMsg dflags noSrcSpan msg)
@@ -2044,6 +2049,9 @@ enableCodeGenForTH target nodemap =
         , ms_hspp_opts = dflags@DynFlags
           {hscTarget = HscNothing}
         } <- ms
+      -- Don't enable codegen for TH on indefinite packages; we
+      -- can't compile anything anyway! See #16219.
+      , not (isIndefinite dflags)
       , ms_mod `Set.member` needs_codegen_set
       = do
         let new_temp_file suf dynsuf = do

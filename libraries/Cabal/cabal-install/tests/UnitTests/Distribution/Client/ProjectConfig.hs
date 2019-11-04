@@ -362,7 +362,6 @@ instance Arbitrary ProjectConfigBuildOnly where
         <*> arbitrary
         <*> (fmap getShortToken <$> arbitrary)
         <*> (fmap getShortToken <$> arbitrary)
-        <*> (fmap getShortToken <$> arbitrary)
       where
         arbitraryNumJobs = fmap (fmap getPositive) <$> arbitrary
 
@@ -382,8 +381,7 @@ instance Arbitrary ProjectConfigBuildOnly where
                                   , projectConfigHttpTransport = x13
                                   , projectConfigIgnoreExpiry = x14
                                   , projectConfigCacheDir = x15
-                                  , projectConfigLogsDir = x16
-                                  , projectConfigStoreDir = x17 } =
+                                  , projectConfigLogsDir = x16 } =
       [ ProjectConfigBuildOnly { projectConfigVerbosity = x00'
                                , projectConfigDryRun = x01'
                                , projectConfigOnlyDeps = x02'
@@ -400,8 +398,7 @@ instance Arbitrary ProjectConfigBuildOnly where
                                , projectConfigHttpTransport = x13
                                , projectConfigIgnoreExpiry = x14'
                                , projectConfigCacheDir = x15
-                               , projectConfigLogsDir = x16
-                               , projectConfigStoreDir = x17}
+                               , projectConfigLogsDir = x16 }
       | ((x00', x01', x02', x03', x04'),
          (x05', x06', x07', x08', x09'),
          (x10', x11', x12',       x14'))
@@ -427,6 +424,7 @@ instance Arbitrary ProjectConfigShared where
         <*> arbitrary
         <*> (toNubList <$> listOf arbitraryShortToken)
         <*> arbitrary
+        <*> arbitraryFlag arbitraryShortToken
         <*> arbitraryConstraints
         <*> shortListOf 2 arbitrary
         <*> arbitrary <*> arbitrary
@@ -465,7 +463,8 @@ instance Arbitrary ProjectConfigShared where
                                , projectConfigPerComponent = x20
                                , projectConfigIndependentGoals = x21
                                , projectConfigConfigFile = x22
-                               , projectConfigProgPathExtra = x23} =
+                               , projectConfigProgPathExtra = x23
+                               , projectConfigStoreDir = x24 } =
       [ ProjectConfigShared { projectConfigDistDir = x00'
                             , projectConfigProjectFile = x01'
                             , projectConfigHcFlavor = x02'
@@ -489,18 +488,19 @@ instance Arbitrary ProjectConfigShared where
                             , projectConfigPerComponent = x20'
                             , projectConfigIndependentGoals = x21'
                             , projectConfigConfigFile = x22'
-                            , projectConfigProgPathExtra = x23'}
+                            , projectConfigProgPathExtra = x23'
+                            , projectConfigStoreDir = x24' }
       | ((x00', x01', x02', x03', x04'),
          (x05', x06', x07', x08', x09'),
          (x10', x11', x12', x13', x14'),
          (x15', x16', x17', x18', x19'),
-          x20', x21', x22', x23')
+          x20', x21', x22', x23', x24')
           <- shrink
                ((x00, x01, x02, fmap NonEmpty x03, fmap NonEmpty x04),
                 (x05, x06, x07, x08, preShrink_Constraints x09),
                 (x10, x11, x12, x13, x14),
                 (x15, x16, x17, x18, x19),
-                 x20, x21, x22, x23)
+                 x20, x21, x22, x23, x24)
       ]
       where
         preShrink_Constraints  = map fst
@@ -550,6 +550,7 @@ instance Arbitrary PackageConfig where
         <*> arbitrary <*> arbitrary
         <*> arbitrary
         <*> arbitraryFlag arbitraryShortToken
+        <*> arbitrary
         <*> arbitrary
         <*> arbitraryFlag arbitraryShortToken
         <*> arbitrary
@@ -602,6 +603,7 @@ instance Arbitrary PackageConfig where
                          , packageConfigHaddockInternal = x36
                          , packageConfigHaddockCss = x37
                          , packageConfigHaddockLinkedSource = x38
+                         , packageConfigHaddockQuickJump = x43
                          , packageConfigHaddockHscolourCss = x39
                          , packageConfigHaddockContents = x40
                          , packageConfigHaddockForHackage = x41 } =
@@ -647,6 +649,7 @@ instance Arbitrary PackageConfig where
                       , packageConfigHaddockInternal = x36'
                       , packageConfigHaddockCss = fmap getNonEmpty x37'
                       , packageConfigHaddockLinkedSource = x38'
+                      , packageConfigHaddockQuickJump = x43'
                       , packageConfigHaddockHscolourCss = fmap getNonEmpty x39'
                       , packageConfigHaddockContents = x40'
                       , packageConfigHaddockForHackage = x41' }
@@ -657,7 +660,7 @@ instance Arbitrary PackageConfig where
          ((x20', x20_1', x21', x22', x23', x24'),
           (x25', x26', x27', x28', x29'),
           (x30', x31', x32', (x33', x33_1'), x34'),
-          (x35', x36', x37', x38', x39'),
+          (x35', x36', x37', x38', x43', x39'),
           (x40', x41')))
           <- shrink
              (((preShrink_Paths x00, preShrink_Args x01, x02, x03, x04),
@@ -670,7 +673,7 @@ instance Arbitrary PackageConfig where
                ((x20, x20_1, x21, x22, x23, x24),
                  (x25, x26, x27, x28, x29),
                  (x30, x31, x32, (x33, x33_1), x34),
-                 (x35, x36, fmap NonEmpty x37, x38, fmap NonEmpty x39),
+                 (x35, x36, fmap NonEmpty x37, x38, x43, fmap NonEmpty x39),
                  (x40, x41)))
       ]
       where
@@ -726,11 +729,6 @@ instance Arbitrary ReportLevel where
 
 instance Arbitrary CompilerFlavor where
     arbitrary = elements knownCompilerFlavors
-      where
-        --TODO: [code cleanup] export knownCompilerFlavors from D.Compiler
-        -- it's already defined there, just need it exported.
-        knownCompilerFlavors =
-          [GHC, GHCJS, NHC, YHC, Hugs, HBC, Helium, JHC, LHC, UHC]
 
 instance Arbitrary a => Arbitrary (InstallDirs a) where
     arbitrary =

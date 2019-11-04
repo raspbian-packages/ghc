@@ -40,6 +40,7 @@ import Module           ( ModuleName )
 
 
 -- Various other random stuff that we need
+import GHC.HandleEncoding
 import Config
 import Constants
 import HscTypes
@@ -55,6 +56,7 @@ import Util
 import Panic
 import UniqSupply
 import MonadUtils       ( liftIO )
+import DynamicLoading   ( initializePlugins )
 
 -- Imports for --abi-hash
 import LoadIface           ( loadUserInterface )
@@ -92,18 +94,7 @@ main = do
    hSetBuffering stdout LineBuffering
    hSetBuffering stderr LineBuffering
 
-   -- Handle GHC-specific character encoding flags, allowing us to control how
-   -- GHC produces output regardless of OS.
-   env <- getEnvironment
-   case lookup "GHC_CHARENC" env of
-    Just "UTF-8" -> do
-     hSetEncoding stdout utf8
-     hSetEncoding stderr utf8
-    _ -> do
-     -- Avoid GHC erroring out when trying to display unhandled characters
-     hSetTranslit stdout
-     hSetTranslit stderr
-
+   configureHandleEncoding
    GHC.defaultErrorHandler defaultFatalMessager defaultFlushOut $ do
     -- 1. extract the -B flag from the args
     argv0 <- getArgs
@@ -254,8 +245,9 @@ main' postLoadMode dflags0 args flagWarnings = do
        DoMake                 -> doMake srcs
        DoMkDependHS           -> doMkDependHS (map fst srcs)
        StopBefore p           -> liftIO (oneShot hsc_env p srcs)
-       DoInteractive          -> ghciUI srcs Nothing
-       DoEval exprs           -> ghciUI srcs $ Just $ reverse exprs
+       DoInteractive          -> ghciUI hsc_env dflags6 srcs Nothing
+       DoEval exprs           -> ghciUI hsc_env dflags6 srcs $ Just $
+                                   reverse exprs
        DoAbiHash              -> abiHash (map fst srcs)
        ShowPackages           -> liftIO $ showPackages dflags6
        DoFrontend f           -> doFrontend f srcs
@@ -263,11 +255,16 @@ main' postLoadMode dflags0 args flagWarnings = do
 
   liftIO $ dumpFinalStats dflags6
 
-ghciUI :: [(FilePath, Maybe Phase)] -> Maybe [String] -> Ghc ()
+ghciUI :: HscEnv -> DynFlags -> [(FilePath, Maybe Phase)] -> Maybe [String]
+       -> Ghc ()
 #if !defined(GHCI)
-ghciUI _ _ = throwGhcException (CmdLineError "not built for interactive use")
+ghciUI _ _ _ _ =
+  throwGhcException (CmdLineError "not built for interactive use")
 #else
-ghciUI     = interactiveUI defaultGhciSettings
+ghciUI hsc_env dflags0 srcs maybe_expr = do
+  dflags1 <- liftIO (initializePlugins hsc_env dflags0)
+  _ <- GHC.setSessionDynFlags dflags1
+  interactiveUI defaultGhciSettings srcs maybe_expr
 #endif
 
 -- -----------------------------------------------------------------------------

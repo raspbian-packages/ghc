@@ -1,10 +1,10 @@
 {-# LANGUAGE CPP #-}
 module System.Directory.Internal.Windows where
 #include <HsDirectoryConfig.h>
-#ifdef mingw32_HOST_OS
-##if defined i386_HOST_ARCH
+#if defined(mingw32_HOST_OS)
+##if defined(i386_HOST_ARCH)
 ## define WINAPI stdcall
-##elif defined x86_64_HOST_ARCH
+##elif defined(x86_64_HOST_ARCH)
 ## define WINAPI ccall
 ##else
 ## error unknown architecture
@@ -16,14 +16,60 @@ module System.Directory.Internal.Windows where
 import Prelude ()
 import System.Directory.Internal.Prelude
 import System.Directory.Internal.Common
+import System.Directory.Internal.Config (exeExtension)
 import Data.Time (UTCTime)
 import Data.Time.Clock.POSIX (POSIXTime, posixSecondsToUTCTime)
-import System.FilePath (addTrailingPathSeparator, hasTrailingPathSeparator,
-                        isPathSeparator, isRelative, joinDrive, joinPath,
-                        normalise, pathSeparator, pathSeparators,
-                        splitDirectories, splitDrive, takeExtension)
+import System.FilePath
+  ( (</>)
+  , addTrailingPathSeparator
+  , hasTrailingPathSeparator
+  , isPathSeparator
+  , isRelative
+  , joinDrive
+  , joinPath
+  , normalise
+  , pathSeparator
+  , pathSeparators
+  , splitDirectories
+  , splitDrive
+  , takeExtension
+  )
 import qualified Data.List as List
 import qualified System.Win32 as Win32
+
+createDirectoryInternal :: FilePath -> IO ()
+createDirectoryInternal path =
+  (`ioeSetFileName` path) `modifyIOError` do
+    path' <- toExtendedLengthPath <$> prependCurrentDirectory path
+    Win32.createDirectory path' Nothing
+
+removePathInternal :: Bool -> FilePath -> IO ()
+removePathInternal isDir path =
+  (`ioeSetFileName` path) `modifyIOError` do
+    toExtendedLengthPath <$> prependCurrentDirectory path
+      >>= if isDir then Win32.removeDirectory else Win32.deleteFile
+
+renamePathInternal :: FilePath -> FilePath -> IO ()
+renamePathInternal opath npath =
+  (`ioeSetFileName` opath) `modifyIOError` do
+    opath' <- toExtendedLengthPath <$> prependCurrentDirectory opath
+    npath' <- toExtendedLengthPath <$> prependCurrentDirectory npath
+#if MIN_VERSION_Win32(2, 6, 0)
+    Win32.moveFileEx opath' (Just npath') Win32.mOVEFILE_REPLACE_EXISTING
+#else
+    Win32.moveFileEx opath' npath' Win32.mOVEFILE_REPLACE_EXISTING
+#endif
+
+copyFileWithMetadataInternal :: (Metadata -> FilePath -> IO ())
+                             -> (Metadata -> FilePath -> IO ())
+                             -> FilePath
+                             -> FilePath
+                             -> IO ()
+copyFileWithMetadataInternal _ _ src dst =
+  (`ioeSetFileName` src) `modifyIOError` do
+    src' <- toExtendedLengthPath <$> prependCurrentDirectory src
+    dst' <- toExtendedLengthPath <$> prependCurrentDirectory dst
+    Win32.copyFile src' dst' False
 
 win32_cSIDL_LOCAL_APPDATA :: Win32.CSIDL
 #if MIN_VERSION_Win32(2, 3, 1)
@@ -32,8 +78,23 @@ win32_cSIDL_LOCAL_APPDATA = Win32.cSIDL_LOCAL_APPDATA
 win32_cSIDL_LOCAL_APPDATA = (#const CSIDL_LOCAL_APPDATA)
 #endif
 
+win32_cSIDL_COMMON_APPDATA :: Win32.CSIDL
+win32_cSIDL_COMMON_APPDATA = (#const CSIDL_COMMON_APPDATA)
+
 win32_eRROR_INVALID_FUNCTION :: Win32.ErrCode
-win32_eRROR_INVALID_FUNCTION = 0x1
+win32_eRROR_INVALID_FUNCTION = (#const ERROR_INVALID_FUNCTION)
+
+win32_eRROR_INVALID_PARAMETER :: Win32.ErrCode
+win32_eRROR_INVALID_PARAMETER = (#const ERROR_INVALID_PARAMETER)
+
+win32_eRROR_PRIVILEGE_NOT_HELD :: Win32.ErrCode
+win32_eRROR_PRIVILEGE_NOT_HELD = (#const ERROR_PRIVILEGE_NOT_HELD)
+
+win32_sYMBOLIC_LINK_FLAG_DIRECTORY :: Win32.DWORD
+win32_sYMBOLIC_LINK_FLAG_DIRECTORY = 0x1
+
+win32_sYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE :: Win32.DWORD
+win32_sYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE = 0x2
 
 win32_fILE_ATTRIBUTE_REPARSE_POINT :: Win32.FileAttributeOrFlag
 #if MIN_VERSION_Win32(2, 4, 0)
@@ -61,14 +122,14 @@ win32_getLongPathName = Win32.getLongPathName
 win32_getShortPathName = Win32.getShortPathName
 #else
 win32_getLongPathName path =
-  modifyIOError ((`ioeSetLocation` "GetLongPathName") .
-                 (`ioeSetFileName` path)) $ do
+  ((`ioeSetLocation` "GetLongPathName") .
+   (`ioeSetFileName` path)) `modifyIOError` do
     withCWString path $ \ ptrPath -> do
       getPathNameWith (c_GetLongPathName ptrPath)
 
 win32_getShortPathName path =
-  modifyIOError ((`ioeSetLocation` "GetShortPathName") .
-                 (`ioeSetFileName` path)) $ do
+  ((`ioeSetLocation` "GetShortPathName") .
+   (`ioeSetFileName` path)) `modifyIOError` do
     withCWString path $ \ ptrPath -> do
       getPathNameWith (c_GetShortPathName ptrPath)
 
@@ -89,7 +150,7 @@ foreign import WINAPI unsafe "windows.h GetShortPathNameW"
 
 win32_getFinalPathNameByHandle :: Win32.HANDLE -> Win32.DWORD -> IO FilePath
 win32_getFinalPathNameByHandle _h _flags =
-  modifyIOError (`ioeSetLocation` "GetFinalPathNameByHandle") $ do
+  (`ioeSetLocation` "GetFinalPathNameByHandle") `modifyIOError` do
 #ifdef HAVE_GETFINALPATHNAMEBYHANDLEW
     getPathNameWith $ \ ptr len -> do
       c_GetFinalPathNameByHandle _h ptr len _flags
@@ -207,13 +268,11 @@ deviceIoControl
   -> IO (Either Win32.ErrCode Int)
 deviceIoControl h code (inPtr, inSize) (outPtr, outSize) _ = do
   with 0 $ \ lenPtr -> do
-    status <- c_DeviceIoControl h code inPtr (fromIntegral inSize) outPtr
-                                (fromIntegral outSize) lenPtr nullPtr
-    if not status
-      then do
-        Left <$> Win32.getLastError
-      else
-        Right . fromIntegral <$> peek lenPtr
+    ok <- c_DeviceIoControl h code inPtr (fromIntegral inSize) outPtr
+                            (fromIntegral outSize) lenPtr nullPtr
+    if ok
+      then Right . fromIntegral <$> peek lenPtr
+      else Left <$> Win32.getLastError
 
 foreign import WINAPI unsafe "windows.h DeviceIoControl"
   c_DeviceIoControl
@@ -228,30 +287,31 @@ foreign import WINAPI unsafe "windows.h DeviceIoControl"
     -> IO Win32.BOOL
 
 readSymbolicLink :: FilePath -> IO FilePath
-readSymbolicLink path = modifyIOError (`ioeSetFileName` path) $ do
-  path' <- toExtendedLengthPath <$> prependCurrentDirectory path
-  let open = Win32.createFile path' 0 maxShareMode Nothing Win32.oPEN_EXISTING
-                              (Win32.fILE_FLAG_BACKUP_SEMANTICS .|.
-                              win32_fILE_FLAG_OPEN_REPARSE_POINT) Nothing
-  bracket open Win32.closeHandle $ \ h -> do
-    win32_alloca_REPARSE_DATA_BUFFER $ \ ptrAndSize@(ptr, _) -> do
-      result <- deviceIoControl h win32_fSCTL_GET_REPARSE_POINT
-                                (nullPtr, 0) ptrAndSize Nothing
-      case result of
-        Left e | e == win32_eRROR_INVALID_FUNCTION -> do
-                   let msg = "Incorrect function. The file system " <>
-                             "might not support symbolic links."
-                   throwIO (mkIOError illegalOperationErrorType
-                                      "DeviceIoControl" Nothing Nothing
-                            `ioeSetErrorString` msg)
-               | otherwise -> Win32.failWith "DeviceIoControl" e
-        Right _ -> return ()
-      rData <- win32_peek_REPARSE_DATA_BUFFER ptr
-      strip <$> case rData of
-        Win32_MOUNT_POINT_REPARSE_DATA_BUFFER sn _ -> pure sn
-        Win32_SYMLINK_REPARSE_DATA_BUFFER sn _ _ -> pure sn
-        _ -> throwIO (mkIOError InappropriateType
-                                "readSymbolicLink" Nothing Nothing)
+readSymbolicLink path =
+  (`ioeSetFileName` path) `modifyIOError` do
+    path' <- toExtendedLengthPath <$> prependCurrentDirectory path
+    let open = Win32.createFile path' 0 maxShareMode Nothing Win32.oPEN_EXISTING
+                                (Win32.fILE_FLAG_BACKUP_SEMANTICS .|.
+                                win32_fILE_FLAG_OPEN_REPARSE_POINT) Nothing
+    bracket open Win32.closeHandle $ \ h -> do
+      win32_alloca_REPARSE_DATA_BUFFER $ \ ptrAndSize@(ptr, _) -> do
+        result <- deviceIoControl h win32_fSCTL_GET_REPARSE_POINT
+                                  (nullPtr, 0) ptrAndSize Nothing
+        case result of
+          Left e | e == win32_eRROR_INVALID_FUNCTION -> do
+                     let msg = "Incorrect function. The file system " <>
+                               "might not support symbolic links."
+                     throwIO (mkIOError illegalOperationErrorType
+                                        "DeviceIoControl" Nothing Nothing
+                              `ioeSetErrorString` msg)
+                 | otherwise -> Win32.failWith "DeviceIoControl" e
+          Right _ -> pure ()
+        rData <- win32_peek_REPARSE_DATA_BUFFER ptr
+        strip <$> case rData of
+          Win32_MOUNT_POINT_REPARSE_DATA_BUFFER sn _ -> pure sn
+          Win32_SYMLINK_REPARSE_DATA_BUFFER sn _ _ -> pure sn
+          _ -> throwIO (mkIOError InappropriateType
+                                  "readSymbolicLink" Nothing Nothing)
   where
     strip sn = fromMaybe sn (List.stripPrefix "\\??\\" sn)
 
@@ -371,15 +431,74 @@ getPathNameWith cFunc = do
         Left _ -> throwIO (mkIOError OtherError "" Nothing Nothing
                            `ioeSetErrorString` "path changed unexpectedly")
 
-win32_createSymbolicLink :: String -> String -> Bool -> IO ()
-win32_createSymbolicLink link _target _isDir =
+canonicalizePathWith :: ((FilePath -> IO FilePath) -> FilePath -> IO FilePath)
+                     -> FilePath
+                     -> IO FilePath
+canonicalizePathWith attemptRealpath = attemptRealpath getFinalPathName
+
+canonicalizePathSimplify :: FilePath -> IO FilePath
+canonicalizePathSimplify path =
+  (fromExtendedLengthPath <$>
+   Win32.getFullPathName (toExtendedLengthPath path))
+    `catchIOError` \ _ ->
+      pure path
+
+searchPathEnvForExes :: String -> IO (Maybe FilePath)
+searchPathEnvForExes binary = Win32.searchPath Nothing binary $
+#if MIN_VERSION_Win32(2, 6, 0)
+  Just
+#endif
+  exeExtension
+
+findExecutablesLazyInternal :: ([FilePath] -> String -> ListT IO FilePath)
+                            -> String
+                            -> ListT IO FilePath
+findExecutablesLazyInternal _ = maybeToListT . searchPathEnvForExes
+
+exeExtensionInternal :: String
+exeExtensionInternal = exeExtension
+
+getDirectoryContentsInternal :: FilePath -> IO [FilePath]
+getDirectoryContentsInternal path = do
+  query <- toExtendedLengthPath <$> prependCurrentDirectory (path </> "*")
+  bracket
+    (Win32.findFirstFile query)
+    (\ (h, _) -> Win32.findClose h)
+    (\ (h, fdat) -> loop h fdat [])
+  where
+    -- we needn't worry about empty directories: a directory always
+    -- has at least "." and ".." entries
+    loop :: Win32.HANDLE -> Win32.FindData -> [FilePath] -> IO [FilePath]
+    loop h fdat acc = do
+      filename <- Win32.getFindDataFileName fdat
+      more <- Win32.findNextFile h fdat
+      if more
+        then loop h fdat (filename : acc)
+        else pure (filename : acc)
+             -- no need to reverse, ordering is undefined
+
+getCurrentDirectoryInternal :: IO FilePath
+getCurrentDirectoryInternal = Win32.getCurrentDirectory
+
+prependCurrentDirectory :: FilePath -> IO FilePath
+prependCurrentDirectory = prependCurrentDirectoryWith getCurrentDirectoryInternal
+
+-- SetCurrentDirectory does not support long paths even with the \\?\ prefix
+-- https://ghc.haskell.org/trac/ghc/ticket/13373#comment:6
+setCurrentDirectoryInternal :: FilePath -> IO ()
+setCurrentDirectoryInternal = Win32.setCurrentDirectory
+
+createSymbolicLinkUnpriv :: String -> String -> Bool -> IO ()
+createSymbolicLinkUnpriv link _target _isDir =
 #ifdef HAVE_CREATESYMBOLICLINKW
   withCWString link $ \ pLink ->
   withCWString _target $ \ pTarget -> do
     let flags = if _isDir then win32_sYMBOLIC_LINK_FLAG_DIRECTORY else 0
-    status <- c_CreateSymbolicLink pLink pTarget flags
-    if status == 0
-      then do
+    call pLink pTarget flags win32_sYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE
+  where
+    call pLink pTarget flags unpriv = do
+      status <- c_CreateSymbolicLink pLink pTarget (flags .|. unpriv)
+      when (status == 0) $ do
         e <- Win32.getLastError
         case () of
           _ | e == win32_eRROR_INVALID_FUNCTION -> do
@@ -395,15 +514,12 @@ win32_createSymbolicLink link _target _isDir =
                 throwIO (mkIOError permissionErrorType "CreateSymbolicLink"
                                    Nothing (Just link)
                          `ioeSetErrorString` msg)
+            | e == win32_eRROR_INVALID_PARAMETER &&
+              unpriv /= 0 ->
+                -- for compatibility with older versions of Windows,
+                -- try it again without the flag
+                call pLink pTarget flags 0
             | otherwise -> Win32.failWith "CreateSymbolicLink" e
-      else return ()
-  where
-
-win32_eRROR_PRIVILEGE_NOT_HELD :: Win32.ErrCode
-win32_eRROR_PRIVILEGE_NOT_HELD = 0x522
-
-win32_sYMBOLIC_LINK_FLAG_DIRECTORY :: Win32.DWORD
-win32_sYMBOLIC_LINK_FLAG_DIRECTORY = 0x1
 
 foreign import WINAPI unsafe "windows.h CreateSymbolicLinkW"
   c_CreateSymbolicLink
@@ -416,12 +532,15 @@ foreign import WINAPI unsafe "windows.h CreateSymbolicLinkW"
   where unsupportedErrorMsg = "Not supported on Windows XP or older"
 #endif
 
+linkToDirectoryIsDirectory :: Bool
+linkToDirectoryIsDirectory = True
+
 createSymbolicLink :: Bool -> FilePath -> FilePath -> IO ()
 createSymbolicLink isDir target link =
   (`ioeSetFileName` link) `modifyIOError` do
     -- normaliseSeparators ensures the target gets normalised properly
     link' <- toExtendedLengthPath <$> prependCurrentDirectory link
-    win32_createSymbolicLink link' (normaliseSeparators target) isDir
+    createSymbolicLinkUnpriv link' (normaliseSeparators target) isDir
 
 type Metadata = Win32.BY_HANDLE_FILE_INFORMATION
 
@@ -480,6 +599,25 @@ posixToWindowsTime :: POSIXTime -> Win32.FILETIME
 posixToWindowsTime t = Win32.FILETIME $
   truncate (t * 10000000 + windowsPosixEpochDifference)
 
+setTimes :: FilePath -> (Maybe POSIXTime, Maybe POSIXTime) -> IO ()
+setTimes path' (atime', mtime') =
+  bracket (openFileHandle path' Win32.gENERIC_WRITE)
+          Win32.closeHandle $ \ handle ->
+  maybeWith with (posixToWindowsTime <$> atime') $ \ atime'' ->
+  maybeWith with (posixToWindowsTime <$> mtime') $ \ mtime'' ->
+  Win32.failIf_ not "" $
+    Win32.c_SetFileTime handle nullPtr atime'' mtime''
+
+-- | Open the handle of an existing file or directory.
+openFileHandle :: String -> Win32.AccessMode -> IO Win32.HANDLE
+openFileHandle path mode =
+  (`ioeSetFileName` path) `modifyIOError` do
+    path' <- toExtendedLengthPath <$> prependCurrentDirectory path
+    Win32.createFile path' mode maxShareMode Nothing
+                     Win32.oPEN_EXISTING flags Nothing
+  where flags =  Win32.fILE_ATTRIBUTE_NORMAL
+             .|. Win32.fILE_FLAG_BACKUP_SEMANTICS -- required for directories
+
 type Mode = Win32.FileAttributeOrFlag
 
 modeFromMetadata :: Metadata -> Mode
@@ -513,15 +651,45 @@ getAccessPermissions path = do
   let w = hasWriteMode (modeFromMetadata m)
   let x = (toLower <$> takeExtension path)
           `elem` [".bat", ".cmd", ".com", ".exe"]
-  return Permissions
-         { readable   = True
-         , writable   = w
-         , executable = x && not isDir
-         , searchable = isDir
-         }
+  pure Permissions
+       { readable   = True
+       , writable   = w
+       , executable = x && not isDir
+       , searchable = isDir
+       }
 
 setAccessPermissions :: FilePath -> Permissions -> IO ()
 setAccessPermissions path Permissions{writable = w} = do
   setFilePermissions path (setWriteMode w 0)
+
+getFolderPath :: Win32.CSIDL -> IO FilePath
+getFolderPath what = Win32.sHGetFolderPath nullPtr what nullPtr 0
+
+getHomeDirectoryInternal :: IO FilePath
+getHomeDirectoryInternal =
+  getFolderPath Win32.cSIDL_PROFILE `catchIOError` \ _ ->
+    getFolderPath Win32.cSIDL_WINDOWS
+
+getXdgDirectoryInternal :: IO FilePath -> XdgDirectory -> IO FilePath
+getXdgDirectoryInternal _ xdgDir = do
+  case xdgDir of
+    XdgData   -> getFolderPath Win32.cSIDL_APPDATA
+    XdgConfig -> getFolderPath Win32.cSIDL_APPDATA
+    XdgCache  -> getFolderPath win32_cSIDL_LOCAL_APPDATA
+
+getXdgDirectoryListInternal :: XdgDirectoryList -> IO [FilePath]
+getXdgDirectoryListInternal _ =
+  pure <$> getFolderPath win32_cSIDL_COMMON_APPDATA
+
+getAppUserDataDirectoryInternal :: FilePath -> IO FilePath
+getAppUserDataDirectoryInternal appName =
+  (\ appData -> appData <> ('\\' : appName))
+  <$> getXdgDirectoryInternal getHomeDirectoryInternal XdgData
+
+getUserDocumentsDirectoryInternal :: IO FilePath
+getUserDocumentsDirectoryInternal = getFolderPath Win32.cSIDL_PERSONAL
+
+getTemporaryDirectoryInternal :: IO FilePath
+getTemporaryDirectoryInternal = Win32.getTemporaryDirectory
 
 #endif

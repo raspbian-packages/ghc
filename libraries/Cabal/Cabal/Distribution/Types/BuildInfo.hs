@@ -35,7 +35,7 @@ data BuildInfo = BuildInfo {
         buildable         :: Bool,
         -- | Tools needed to build this bit.
         --
-        -- This is a legacy field that 'buildToolDepends' larely supersedes.
+        -- This is a legacy field that 'buildToolDepends' largely supersedes.
         --
         -- Unless use are very sure what you are doing, use the functions in
         -- "Distribution.Simple.BuildToolDepends" rather than accessing this
@@ -150,7 +150,7 @@ instance Monoid BuildInfo where
     staticOptions       = [],
     customFieldsBI      = [],
     targetBuildDepends  = [],
-    mixins    = []
+    mixins              = []
   }
   mappend = (<>)
 
@@ -196,7 +196,7 @@ instance Semigroup BuildInfo where
     staticOptions       = combine    staticOptions,
     customFieldsBI      = combine    customFieldsBI,
     targetBuildDepends  = combineNub targetBuildDepends,
-    mixins    = combine mixins
+    mixins              = combine    mixins
   }
     where
       combine    field = field a `mappend` field b

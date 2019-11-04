@@ -105,7 +105,7 @@ section "The word size story."
          arithmetic operations, comparisons, and a range of
          conversions.  The 8-bit and 16-bit sizes are always
          represented as {\tt Int\#} and {\tt Word\#}, and the
-         operations implemented in terms of the the primops on these
+         operations implemented in terms of the primops on these
          types, with suitable range restrictions on the results (using
          the {\tt narrow$n$Int\#} and {\tt narrow$n$Word\#} families
          of primops.  The 32-bit sizes are represented using {\tt
@@ -265,6 +265,7 @@ primop   IntAddCOp   "addIntC#"    GenPrimOp   Int# -> Int# -> (# Int#, Int# #)
           nonzero if overflow occurred (the sum is either too large
           or too small to fit in an {\tt Int#}).}
    with code_size = 2
+        commutable = True
 
 primop   IntSubCOp   "subIntC#"    GenPrimOp   Int# -> Int# -> (# Int#, Int# #)
          {Subtract signed integers reporting overflow.
@@ -328,15 +329,25 @@ primtype Word#
 primop   WordAddOp   "plusWord#"   Dyadic   Word# -> Word# -> Word#
    with commutable = True
 
+primop   WordAddCOp   "addWordC#"   GenPrimOp   Word# -> Word# -> (# Word#, Int# #)
+         {Add unsigned integers reporting overflow.
+          The first element of the pair is the result.  The second element is
+          the carry flag, which is nonzero on overflow. See also {\tt plusWord2#}.}
+   with code_size = 2
+        commutable = True
+
 primop   WordSubCOp   "subWordC#"   GenPrimOp   Word# -> Word# -> (# Word#, Int# #)
          {Subtract unsigned integers reporting overflow.
           The first element of the pair is the result.  The second element is
           the carry flag, which is nonzero on overflow.}
+   with code_size = 2
 
--- Returns (# high, low #) (or equivalently, (# carry, low #))
-primop   WordAdd2Op  "plusWord2#"  GenPrimOp
-   Word# -> Word# -> (# Word#, Word# #)
-   with commutable = True
+primop   WordAdd2Op   "plusWord2#"   GenPrimOp   Word# -> Word# -> (# Word#, Word# #)
+         {Add unsigned integers, with the high part (carry) in the first
+          component of the returned pair and the low part in the second
+          component of the pair. See also {\tt addWordC#}.}
+   with code_size = 2
+        commutable = True
 
 primop   WordSubOp   "minusWord#"   Dyadic   Word# -> Word# -> Word#
 
@@ -818,8 +829,13 @@ primop  SizeofMutableArrayOp "sizeofMutableArray#" GenPrimOp
 
 primop  IndexArrayOp "indexArray#" GenPrimOp
    Array# a -> Int# -> (# a #)
-   {Read from specified index of immutable array. Result is packaged into
-    an unboxed singleton; the result itself is not yet evaluated.}
+   {Read from the specified index of an immutable array. The result is packaged
+    into an unboxed unary tuple; the result itself is not yet
+    evaluated. Pattern matching on the tuple forces the indexing of the
+    array to happen but does not evaluate the element itself. Evaluating
+    the thunk prevents additional thunks from building up on the
+    heap. Avoiding these thunks, in turn, reduces references to the
+    argument array, allowing it to be garbage collected more promptly.}
    with
    can_fail         = True
 
@@ -1254,6 +1270,76 @@ primop IndexByteArrayOp_Word64 "indexWord64Array#" GenPrimOp
    {Read 64-bit word; offset in 64-bit words.}
    with can_fail = True
 
+primop IndexByteArrayOp_Word8AsChar "indexWord8ArrayAsChar#" GenPrimOp
+   ByteArray# -> Int# -> Char#
+   {Read 8-bit character; offset in bytes.}
+   with can_fail = True
+
+primop IndexByteArrayOp_Word8AsWideChar "indexWord8ArrayAsWideChar#" GenPrimOp
+   ByteArray# -> Int# -> Char#
+   {Read 31-bit character; offset in bytes.}
+   with can_fail = True
+
+primop IndexByteArrayOp_Word8AsAddr "indexWord8ArrayAsAddr#" GenPrimOp
+   ByteArray# -> Int# -> Addr#
+   {Read address; offset in bytes.}
+   with can_fail = True
+
+primop IndexByteArrayOp_Word8AsFloat "indexWord8ArrayAsFloat#" GenPrimOp
+   ByteArray# -> Int# -> Float#
+   {Read float; offset in bytes.}
+   with can_fail = True
+
+primop IndexByteArrayOp_Word8AsDouble "indexWord8ArrayAsDouble#" GenPrimOp
+   ByteArray# -> Int# -> Double#
+   {Read double; offset in bytes.}
+   with can_fail = True
+
+primop IndexByteArrayOp_Word8AsStablePtr "indexWord8ArrayAsStablePtr#" GenPrimOp
+   ByteArray# -> Int# -> StablePtr# a
+   {Read stable pointer; offset in bytes.}
+   with can_fail = True
+
+primop IndexByteArrayOp_Word8AsInt16 "indexWord8ArrayAsInt16#" GenPrimOp
+   ByteArray# -> Int# -> Int#
+   {Read 16-bit int; offset in bytes.}
+   with can_fail = True
+
+primop IndexByteArrayOp_Word8AsInt32 "indexWord8ArrayAsInt32#" GenPrimOp
+   ByteArray# -> Int# -> INT32
+   {Read 32-bit int; offset in bytes.}
+   with can_fail = True
+
+primop IndexByteArrayOp_Word8AsInt64 "indexWord8ArrayAsInt64#" GenPrimOp
+   ByteArray# -> Int# -> INT64
+   {Read 64-bit int; offset in bytes.}
+   with can_fail = True
+
+primop IndexByteArrayOp_Word8AsInt "indexWord8ArrayAsInt#" GenPrimOp
+   ByteArray# -> Int# -> Int#
+   {Read int; offset in bytes.}
+   with can_fail = True
+
+primop IndexByteArrayOp_Word8AsWord16 "indexWord8ArrayAsWord16#" GenPrimOp
+   ByteArray# -> Int# -> Word#
+   {Read 16-bit word; offset in bytes.}
+   with can_fail = True
+
+primop IndexByteArrayOp_Word8AsWord32 "indexWord8ArrayAsWord32#" GenPrimOp
+   ByteArray# -> Int# -> WORD32
+   {Read 32-bit word; offset in bytes.}
+   with can_fail = True
+
+primop IndexByteArrayOp_Word8AsWord64 "indexWord8ArrayAsWord64#" GenPrimOp
+   ByteArray# -> Int# -> WORD64
+   {Read 64-bit word; offset in bytes.}
+   with can_fail = True
+
+primop IndexByteArrayOp_Word8AsWord "indexWord8ArrayAsWord#" GenPrimOp
+   ByteArray# -> Int# -> Word#
+   {Read word; offset in bytes.}
+   with can_fail = True
+
 primop  ReadByteArrayOp_Char "readCharArray#" GenPrimOp
    MutableByteArray# s -> Int# -> State# s -> (# State# s, Char# #)
    {Read 8-bit character; offset in bytes.}
@@ -1338,6 +1424,76 @@ primop  ReadByteArrayOp_Word64 "readWord64Array#" GenPrimOp
    with has_side_effects = True
         can_fail = True
 
+primop  ReadByteArrayOp_Word8AsChar "readWord8ArrayAsChar#" GenPrimOp
+   MutableByteArray# s -> Int# -> State# s -> (# State# s, Char# #)
+   with has_side_effects = True
+        can_fail = True
+
+primop  ReadByteArrayOp_Word8AsWideChar "readWord8ArrayAsWideChar#" GenPrimOp
+   MutableByteArray# s -> Int# -> State# s -> (# State# s, Char# #)
+   with has_side_effects = True
+        can_fail = True
+
+primop  ReadByteArrayOp_Word8AsAddr "readWord8ArrayAsAddr#" GenPrimOp
+   MutableByteArray# s -> Int# -> State# s -> (# State# s, Addr# #)
+   with has_side_effects = True
+        can_fail = True
+
+primop  ReadByteArrayOp_Word8AsFloat "readWord8ArrayAsFloat#" GenPrimOp
+   MutableByteArray# s -> Int# -> State# s -> (# State# s, Float# #)
+   with has_side_effects = True
+        can_fail = True
+
+primop  ReadByteArrayOp_Word8AsDouble "readWord8ArrayAsDouble#" GenPrimOp
+   MutableByteArray# s -> Int# -> State# s -> (# State# s, Double# #)
+   with has_side_effects = True
+        can_fail = True
+
+primop  ReadByteArrayOp_Word8AsStablePtr "readWord8ArrayAsStablePtr#" GenPrimOp
+   MutableByteArray# s -> Int# -> State# s -> (# State# s, StablePtr# a #)
+   with has_side_effects = True
+        can_fail = True
+
+primop  ReadByteArrayOp_Word8AsInt16 "readWord8ArrayAsInt16#" GenPrimOp
+   MutableByteArray# s -> Int# -> State# s -> (# State# s, Int# #)
+   with has_side_effects = True
+        can_fail = True
+
+primop  ReadByteArrayOp_Word8AsInt32 "readWord8ArrayAsInt32#" GenPrimOp
+   MutableByteArray# s -> Int# -> State# s -> (# State# s, INT32 #)
+   with has_side_effects = True
+        can_fail = True
+
+primop  ReadByteArrayOp_Word8AsInt64 "readWord8ArrayAsInt64#" GenPrimOp
+   MutableByteArray# s -> Int# -> State# s -> (# State# s, INT64 #)
+   with has_side_effects = True
+        can_fail = True
+
+primop  ReadByteArrayOp_Word8AsInt "readWord8ArrayAsInt#" GenPrimOp
+   MutableByteArray# s -> Int# -> State# s -> (# State# s, Int# #)
+   with has_side_effects = True
+        can_fail = True
+
+primop  ReadByteArrayOp_Word8AsWord16 "readWord8ArrayAsWord16#" GenPrimOp
+   MutableByteArray# s -> Int# -> State# s -> (# State# s, Word# #)
+   with has_side_effects = True
+        can_fail = True
+
+primop  ReadByteArrayOp_Word8AsWord32 "readWord8ArrayAsWord32#" GenPrimOp
+   MutableByteArray# s -> Int# -> State# s -> (# State# s, WORD32 #)
+   with has_side_effects = True
+        can_fail = True
+
+primop  ReadByteArrayOp_Word8AsWord64 "readWord8ArrayAsWord64#" GenPrimOp
+   MutableByteArray# s -> Int# -> State# s -> (# State# s, WORD64 #)
+   with has_side_effects = True
+        can_fail = True
+
+primop  ReadByteArrayOp_Word8AsWord "readWord8ArrayAsWord#" GenPrimOp
+   MutableByteArray# s -> Int# -> State# s -> (# State# s, Word# #)
+   with has_side_effects = True
+        can_fail = True
+
 primop  WriteByteArrayOp_Char "writeCharArray#" GenPrimOp
    MutableByteArray# s -> Int# -> Char# -> State# s -> State# s
    {Write 8-bit character; offset in bytes.}
@@ -1417,6 +1573,76 @@ primop  WriteByteArrayOp_Word32 "writeWord32Array#" GenPrimOp
 
 primop  WriteByteArrayOp_Word64 "writeWord64Array#" GenPrimOp
    MutableByteArray# s -> Int# -> WORD64 -> State# s -> State# s
+   with has_side_effects = True
+        can_fail = True
+
+primop  WriteByteArrayOp_Word8AsChar "writeWord8ArrayAsChar#" GenPrimOp
+   MutableByteArray# s -> Int# -> Char# -> State# s -> State# s
+   with has_side_effects = True
+        can_fail = True
+
+primop  WriteByteArrayOp_Word8AsWideChar "writeWord8ArrayAsWideChar#" GenPrimOp
+   MutableByteArray# s -> Int# -> Char# -> State# s -> State# s
+   with has_side_effects = True
+        can_fail = True
+
+primop  WriteByteArrayOp_Word8AsAddr "writeWord8ArrayAsAddr#" GenPrimOp
+   MutableByteArray# s -> Int# -> Addr# -> State# s -> State# s
+   with has_side_effects = True
+        can_fail = True
+
+primop  WriteByteArrayOp_Word8AsFloat "writeWord8ArrayAsFloat#" GenPrimOp
+   MutableByteArray# s -> Int# -> Float# -> State# s -> State# s
+   with has_side_effects = True
+        can_fail = True
+
+primop  WriteByteArrayOp_Word8AsDouble "writeWord8ArrayAsDouble#" GenPrimOp
+   MutableByteArray# s -> Int# -> Double# -> State# s -> State# s
+   with has_side_effects = True
+        can_fail = True
+
+primop  WriteByteArrayOp_Word8AsStablePtr "writeWord8ArrayAsStablePtr#" GenPrimOp
+   MutableByteArray# s -> Int# -> StablePtr# a -> State# s -> State# s
+   with has_side_effects = True
+        can_fail = True
+
+primop  WriteByteArrayOp_Word8AsInt16 "writeWord8ArrayAsInt16#" GenPrimOp
+   MutableByteArray# s -> Int# -> Int# -> State# s -> State# s
+   with has_side_effects = True
+        can_fail = True
+
+primop  WriteByteArrayOp_Word8AsInt32 "writeWord8ArrayAsInt32#" GenPrimOp
+   MutableByteArray# s -> Int# -> INT32 -> State# s -> State# s
+   with has_side_effects = True
+        can_fail = True
+
+primop  WriteByteArrayOp_Word8AsInt64 "writeWord8ArrayAsInt64#" GenPrimOp
+   MutableByteArray# s -> Int# -> INT64 -> State# s -> State# s
+   with has_side_effects = True
+        can_fail = True
+
+primop  WriteByteArrayOp_Word8AsInt "writeWord8ArrayAsInt#" GenPrimOp
+   MutableByteArray# s -> Int# -> Int# -> State# s -> State# s
+   with has_side_effects = True
+        can_fail = True
+
+primop  WriteByteArrayOp_Word8AsWord16 "writeWord8ArrayAsWord16#" GenPrimOp
+   MutableByteArray# s -> Int# -> Word# -> State# s -> State# s
+   with has_side_effects = True
+        can_fail = True
+
+primop  WriteByteArrayOp_Word8AsWord32 "writeWord8ArrayAsWord32#" GenPrimOp
+   MutableByteArray# s -> Int# -> WORD32 -> State# s -> State# s
+   with has_side_effects = True
+        can_fail = True
+
+primop  WriteByteArrayOp_Word8AsWord64 "writeWord8ArrayAsWord64#" GenPrimOp
+   MutableByteArray# s -> Int# -> WORD64 -> State# s -> State# s
+   with has_side_effects = True
+        can_fail = True
+
+primop  WriteByteArrayOp_Word8AsWord "writeWord8ArrayAsWord#" GenPrimOp
+   MutableByteArray# s -> Int# -> Word# -> State# s -> State# s
    with has_side_effects = True
         can_fail = True
 
@@ -2167,7 +2393,7 @@ primop  CatchRetryOp "catchRetry#" GenPrimOp
    -> (State# RealWorld -> (# State# RealWorld, a #) )
    -> (State# RealWorld -> (# State# RealWorld, a #) )
    with
-   strictness  = { \ _arity -> mkClosedStrictSig [ catchArgDmd
+   strictness  = { \ _arity -> mkClosedStrictSig [ lazyApply1Dmd
                                                  , lazyApply1Dmd
                                                  , topDmd ] topRes }
                  -- See Note [Strictness for mask/unmask/catch]
@@ -2183,13 +2409,6 @@ primop  CatchSTMOp "catchSTM#" GenPrimOp
                                                  , lazyApply2Dmd
                                                  , topDmd ] topRes }
                  -- See Note [Strictness for mask/unmask/catch]
-   out_of_line = True
-   has_side_effects = True
-
-primop  Check "check#" GenPrimOp
-      (State# RealWorld -> (# State# RealWorld, a #) )
-   -> (State# RealWorld -> State# RealWorld)
-   with
    out_of_line = True
    has_side_effects = True
 
@@ -2403,7 +2622,6 @@ primop  YieldOp "yield#" GenPrimOp
 primop  MyThreadIdOp "myThreadId#" GenPrimOp
    State# RealWorld -> (# State# RealWorld, ThreadId# #)
    with
-   out_of_line = True
    has_side_effects = True
 
 primop LabelThreadOp "labelThread#" GenPrimOp
@@ -2659,10 +2877,8 @@ primop  ReallyUnsafePtrEqualityOp "reallyUnsafePtrEquality#" GenPrimOp
 -- sometimes lose track of whether those arguments were forced, leading to let/app
 -- invariant failures (see Trac 13027 and the discussion in Trac 11444). Now that
 -- ok_for_speculation skips over lifted arguments, we need to explicitly prevent
--- reallyUnsafePtrEquality# from floating out. The reasons are closely related
--- to those described in Note [dataToTag#], although the consequences are less
--- severe. Imagine if we had
--- 
+-- reallyUnsafePtrEquality# from floating out. Imagine if we had
+--
 --     \x y . case x of x'
 --              DEFAULT ->
 --            case y of y'
@@ -2724,34 +2940,31 @@ primop  DataToTagOp "dataToTag#" GenPrimOp
    with
    can_fail   = True -- See Note [dataToTag#]
    strictness = { \ _arity -> mkClosedStrictSig [evalDmd] topRes }
-                -- dataToTag# must have an evaluated argument
 
 primop  TagToEnumOp "tagToEnum#" GenPrimOp
    Int# -> a
 
-{- Note [dataToTag#]
-~~~~~~~~~~~~~~~~~~~~
-The dataToTag# primop should always be applied to an evaluated argument.
-The way to ensure this is to invoke it via the 'getTag' wrapper in GHC.Base:
-   getTag :: a -> Int#
-   getTag !x = dataToTag# x
-
-But now consider
-    \z. case x of y -> let v = dataToTag# y in ...
-
-To improve floating, the FloatOut pass (deliberately) does a
-binder-swap on the case, to give
-    \z. case x of y -> let v = dataToTag# x in ...
-
-Now FloatOut might float that v-binding outside the \z.  But that is
-bad because that might mean x gest evaluated much too early!  (CorePrep
-adds an eval to a dataToTag# call, to ensure that the argument really is
-evaluated; see CorePrep Note [dataToTag magic].)
-
-Solution: make DataToTag into a can_fail primop.  That will stop it floating
-(see Note [PrimOp can_fail and has_side_effects] in PrimOp).  It's a bit of
-a hack but never mind.
--}
+-- Note [dataToTag#]
+-- ~~~~~~~~~~~~~~~~~
+-- dataToTag# evaluates its argument, so we don't want to float it out.
+-- Consider:
+--
+--     \z. case x of y -> let v = dataToTag# y in ...
+--
+-- To improve floating, the FloatOut pass (deliberately) does a
+-- binder-swap on the case, to give
+--
+--     \z. case x of y -> let v = dataToTag# x in ...
+--
+-- Now FloatOut might float that v-binding outside the \z
+--
+--     let v = dataToTag# x in \z. case x of y -> ...
+--
+-- But that is bad because that might mean x gets evaluated much too early!
+--
+-- Solution: make dataToTag# into a can_fail primop.  That will stop it floating
+-- (see Note [PrimOp can_fail and has_side_effects] in PrimOp).  It's a bit of
+-- a hack but never mind.
 
 ------------------------------------------------------------------------
 section "Bytecode operations"
@@ -2804,12 +3017,11 @@ primop  NewBCOOp "newBCO#" GenPrimOp
    out_of_line      = True
 
 primop  UnpackClosureOp "unpackClosure#" GenPrimOp
-   a -> (# Addr#, Array# b, ByteArray# #)
-   { {\tt unpackClosure\# closure} copies non-pointers and pointers in the
+   a -> (# Addr#, ByteArray#, Array# b #)
+   { {\tt unpackClosure\# closure} copies the closure and pointers in the
      payload of the given closure into two new arrays, and returns a pointer to
-     the first word of the closure's info table, a pointer array for the
-     pointers in the payload, and a non-pointer array for the non-pointers in
-     the payload. }
+     the first word of the closure's info table, a non-pointer array for the raw
+     bytes of the closure, and a pointer array for the pointers in the payload. }
    with
    out_of_line = True
 
@@ -2933,6 +3145,20 @@ primop  TraceMarkerOp "traceMarker#" GenPrimOp
      of the event is the zero-terminated byte string passed as the first
      argument.  The event will be emitted either to the .eventlog file,
      or to stderr, depending on the runtime RTS flags. }
+   with
+   has_side_effects = True
+   out_of_line      = True
+
+primop  GetThreadAllocationCounter "getThreadAllocationCounter#" GenPrimOp
+   State# RealWorld -> (# State# RealWorld, INT64 #)
+   { Retrieves the allocation counter for the current thread. }
+   with
+   has_side_effects = True
+   out_of_line      = True
+
+primop  SetThreadAllocationCounter "setThreadAllocationCounter#" GenPrimOp
+   INT64 -> State# RealWorld -> State# RealWorld
+   { Sets the allocation counter for the current thread to the given value. }
    with
    has_side_effects = True
    out_of_line      = True

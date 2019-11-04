@@ -23,8 +23,8 @@
 -- during the computation.  For more general access, use
 -- "Control.Monad.Trans.State" instead.
 --
--- This version builds its output lazily; for a strict version with
--- the same interface, see "Control.Monad.Trans.Writer.Strict".
+-- This version builds its output lazily; for a constant-space version
+-- with almost the same interface, see "Control.Monad.Trans.Writer.CPS".
 -----------------------------------------------------------------------------
 
 module Control.Monad.Trans.Writer.Lazy (
@@ -52,6 +52,9 @@ module Control.Monad.Trans.Writer.Lazy (
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Class
 import Data.Functor.Classes
+#if MIN_VERSION_base(4,12,0)
+import Data.Functor.Contravariant
+#endif
 import Data.Functor.Identity
 
 import Control.Applicative
@@ -201,8 +204,10 @@ instance (Monoid w, Monad m) => Monad (WriterT w m) where
         ~(b, w') <- runWriterT (k a)
         return (b, w `mappend` w')
     {-# INLINE (>>=) #-}
+#if !(MIN_VERSION_base(4,13,0))
     fail msg = WriterT $ fail msg
     {-# INLINE fail #-}
+#endif
 
 #if MIN_VERSION_base(4,9,0)
 instance (Monoid w, Fail.MonadFail m) => Fail.MonadFail (WriterT w m) where
@@ -235,6 +240,12 @@ instance (Monoid w, MonadZip m) => MonadZip (WriterT w m) where
     mzipWith f (WriterT x) (WriterT y) = WriterT $
         mzipWith (\ ~(a, w) ~(b, w') -> (f a b, w `mappend` w')) x y
     {-# INLINE mzipWith #-}
+#endif
+
+#if MIN_VERSION_base(4,12,0)
+instance Contravariant m => Contravariant (WriterT w m) where
+    contramap f = mapWriterT $ contramap $ \ ~(a, w) -> (f a, w)
+    {-# INLINE contramap #-}
 #endif
 
 -- | @'tell' w@ is an action that produces the output @w@.

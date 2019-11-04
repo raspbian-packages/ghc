@@ -3,7 +3,7 @@
 #if __GLASGOW_HASKELL__
 {-# LANGUAGE MagicHash, DeriveDataTypeable, StandaloneDeriving #-}
 #endif
-#if !defined(TESTING) && __GLASGOW_HASKELL__ >= 703
+#if !defined(TESTING) && defined(__GLASGOW_HASKELL__)
 {-# LANGUAGE Trustworthy #-}
 #endif
 #if __GLASGOW_HASKELL__ >= 708
@@ -201,7 +201,6 @@ import Data.Typeable
 import Prelude hiding (filter, foldr, foldl, null, map)
 
 import Utils.Containers.Internal.BitUtil
-import Utils.Containers.Internal.StrictFold
 import Utils.Containers.Internal.StrictPair
 
 #if __GLASGOW_HASKELL__
@@ -217,6 +216,8 @@ import qualified GHC.Exts as GHCExts
 import GHC.Prim (indexInt8OffAddr#)
 #endif
 
+import qualified Data.Foldable as Foldable
+import Data.Foldable (Foldable())
 
 infixl 9 \\{-This comment teaches CPP correct behaviour -}
 
@@ -499,9 +500,9 @@ deleteBM _ _ Nil = Nil
   Union
 --------------------------------------------------------------------}
 -- | The union of a list of sets.
-unions :: [IntSet] -> IntSet
+unions :: Foldable f => f IntSet -> IntSet
 unions xs
-  = foldlStrict union empty xs
+  = Foldable.foldl' union empty xs
 
 
 -- | /O(n+m)/. The union of two sets.
@@ -642,7 +643,7 @@ subsetCmp Nil Nil = EQ
 subsetCmp Nil _   = LT
 
 -- | /O(n+m)/. Is this a subset?
--- @(s1 `isSubsetOf` s2)@ tells whether @s1@ is a subset of @s2@.
+-- @(s1 \`isSubsetOf\` s2)@ tells whether @s1@ is a subset of @s2@.
 
 isSubsetOf :: IntSet -> IntSet -> Bool
 isSubsetOf t1@(Bin p1 m1 l1 r1) (Bin p2 m2 l2 r2)
@@ -1044,7 +1045,7 @@ foldlFB = foldl
 -- | /O(n*min(n,W))/. Create a set from a list of integers.
 fromList :: [Key] -> IntSet
 fromList xs
-  = foldlStrict ins empty xs
+  = Foldable.foldl' ins empty xs
   where
     ins t x  = insert x t
 

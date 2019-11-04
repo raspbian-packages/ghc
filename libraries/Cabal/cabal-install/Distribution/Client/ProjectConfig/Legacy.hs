@@ -193,7 +193,8 @@ commandLineFlagsToProjectConfig globalFlags configFlags configExFlags
         splitConfig pc = (pc
                          , mempty { packageConfigProgramPaths = packageConfigProgramPaths pc
                                   , packageConfigProgramArgs  = packageConfigProgramArgs  pc
-                                  , packageConfigProgramPathExtra = packageConfigProgramPathExtra pc })
+                                  , packageConfigProgramPathExtra = packageConfigProgramPathExtra pc
+                                  , packageConfigDocumentation = packageConfigDocumentation pc })
 
 -- | Convert from the types currently used for the user-wide @~/.cabal/config@
 -- file into the 'ProjectConfig' type.
@@ -303,7 +304,8 @@ convertLegacyAllPackageFlags globalFlags configFlags
       globalSandboxConfigFile = _, -- ??
       globalRemoteRepos       = projectConfigRemoteRepos,
       globalLocalRepos        = projectConfigLocalRepos,
-      globalProgPathExtra     = projectConfigProgPathExtra
+      globalProgPathExtra     = projectConfigProgPathExtra,
+      globalStoreDir          = projectConfigStoreDir
     } = globalFlags
 
     ConfigFlags {
@@ -388,7 +390,7 @@ convertLegacyPerPackageFlags configFlags installFlags haddockFlags =
       configRelocatable         = packageConfigRelocatable
     } = configFlags
     packageConfigProgramPaths   = MapLast    (Map.fromList configProgramPaths)
-    packageConfigProgramArgs    = MapMappend (Map.fromList configProgramArgs)
+    packageConfigProgramArgs    = MapMappend (Map.fromListWith (++) configProgramArgs)
 
     packageConfigCoverage       = coverage <> libcoverage
     --TODO: defer this merging to the resolve phase
@@ -410,6 +412,7 @@ convertLegacyPerPackageFlags configFlags installFlags haddockFlags =
       haddockInternal           = packageConfigHaddockInternal,
       haddockCss                = packageConfigHaddockCss,
       haddockLinkedSource       = packageConfigHaddockLinkedSource,
+      haddockQuickJump          = packageConfigHaddockQuickJump,
       haddockHscolourCss        = packageConfigHaddockHscolourCss,
       haddockContents           = packageConfigHaddockContents
     } = haddockFlags
@@ -431,8 +434,7 @@ convertLegacyBuildOnlyFlags globalFlags configFlags
       globalLogsDir           = projectConfigLogsDir,
       globalWorldFile         = _,
       globalHttpTransport     = projectConfigHttpTransport,
-      globalIgnoreExpiry      = projectConfigIgnoreExpiry,
-      globalStoreDir          = projectConfigStoreDir
+      globalIgnoreExpiry      = projectConfigIgnoreExpiry
     } = globalFlags
 
     ConfigFlags {
@@ -728,12 +730,14 @@ convertToLegacyPerPackageConfig PackageConfig {..} =
       haddockInternal      = packageConfigHaddockInternal,
       haddockCss           = packageConfigHaddockCss,
       haddockLinkedSource  = packageConfigHaddockLinkedSource,
+      haddockQuickJump     = packageConfigHaddockQuickJump,
       haddockHscolourCss   = packageConfigHaddockHscolourCss,
       haddockContents      = packageConfigHaddockContents,
       haddockDistPref      = mempty,
       haddockKeepTempFiles = mempty,
       haddockVerbosity     = mempty,
-      haddockCabalFilePath = mempty
+      haddockCabalFilePath = mempty,
+      haddockArgs          = mempty
     }
 
 
@@ -1002,7 +1006,7 @@ legacyPackageConfigFieldDescrs =
       [ "hoogle", "html", "html-location"
       , "foreign-libraries"
       , "executables", "tests", "benchmarks", "all", "internal", "css"
-      , "hyperlink-source", "hscolour-css"
+      , "hyperlink-source", "quickjump", "hscolour-css"
       , "contents-location", "keep-temp-files"
       ]
   . commandOptionsToFields

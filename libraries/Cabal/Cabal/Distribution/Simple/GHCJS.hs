@@ -150,12 +150,12 @@ guessToolFromGhcjsPath tool ghcjsProg verbosity searchpath
            path              = programPath ghcjsProg
            dir               = takeDirectory path
            versionSuffix     = takeVersionSuffix (dropExeExtension path)
-           guessNormal       = dir </> toolname <.> exeExtension
+           guessNormal       = dir </> toolname <.> exeExtension buildPlatform
            guessGhcjsVersioned = dir </> (toolname ++ "-ghcjs" ++ versionSuffix)
-                                 <.> exeExtension
+                                 <.> exeExtension buildPlatform
            guessGhcjs        = dir </> (toolname ++ "-ghcjs")
-                               <.> exeExtension
-           guessVersioned    = dir </> (toolname ++ versionSuffix) <.> exeExtension
+                               <.> exeExtension buildPlatform
+           guessVersioned    = dir </> (toolname ++ versionSuffix) <.> exeExtension buildPlatform
            guesses | null versionSuffix = [guessGhcjs, guessNormal]
                    | otherwise          = [guessGhcjsVersioned,
                                            guessGhcjs,
@@ -259,16 +259,22 @@ toJSLibName lib
   | takeExtension lib == ".a" = replaceExtension lib "js_a"
   | otherwise                 = lib <.> "js_a"
 
-buildLib, replLib :: Verbosity -> Cabal.Flag (Maybe Int) -> PackageDescription
-                  -> LocalBuildInfo -> Library -> ComponentLocalBuildInfo
-                  -> IO ()
-buildLib = buildOrReplLib False
-replLib  = buildOrReplLib True
+buildLib :: Verbosity -> Cabal.Flag (Maybe Int) -> PackageDescription
+         -> LocalBuildInfo -> Library -> ComponentLocalBuildInfo
+         -> IO ()
+buildLib = buildOrReplLib Nothing
 
-buildOrReplLib :: Bool -> Verbosity  -> Cabal.Flag (Maybe Int)
-               -> PackageDescription -> LocalBuildInfo
-               -> Library            -> ComponentLocalBuildInfo -> IO ()
-buildOrReplLib forRepl verbosity numJobs pkg_descr lbi lib clbi = do
+replLib :: [String]                -> Verbosity
+        -> Cabal.Flag (Maybe Int)  -> PackageDescription
+        -> LocalBuildInfo          -> Library
+        -> ComponentLocalBuildInfo -> IO ()
+replLib = buildOrReplLib . Just
+
+buildOrReplLib :: Maybe [String] -> Verbosity
+               -> Cabal.Flag (Maybe Int)  -> PackageDescription
+               -> LocalBuildInfo          -> Library
+               -> ComponentLocalBuildInfo -> IO ()
+buildOrReplLib mReplFlags verbosity numJobs pkg_descr lbi lib clbi = do
   let uid = componentUnitId clbi
       libTargetDir = buildDir lbi
       whenVanillaLib forceVanilla =
@@ -277,7 +283,9 @@ buildOrReplLib forRepl verbosity numJobs pkg_descr lbi lib clbi = do
       whenSharedLib forceShared =
         when (not forRepl &&  (forceShared || withSharedLib lbi))
       whenGHCiLib = when (not forRepl && withGHCiLib lbi && withVanillaLib lbi)
+      forRepl = maybe False (const True) mReplFlags
       ifReplLib = when forRepl
+      replFlags = fromMaybe mempty mReplFlags
       comp      = compiler lbi
       platform  = hostPlatform lbi
       implInfo  = getImplInfo comp
@@ -309,10 +317,10 @@ buildOrReplLib forRepl verbosity numJobs pkg_descr lbi lib clbi = do
       jsSrcs      = jsSources libBi
       baseOpts    = componentGhcOptions verbosity lbi libBi clbi libTargetDir
       linkJsLibOpts = mempty {
-                        ghcOptExtra = toNubListR $
+                        ghcOptExtra =
                           [ "-link-js-lib"     , getHSLibraryName uid
                           , "-js-lib-outputdir", libTargetDir ] ++
-                          concatMap (\x -> ["-js-lib-src",x]) jsSrcs
+                          jsSrcs
                       }
       vanillaOptsNoJsLib = baseOpts `mappend` mempty {
                       ghcOptMode         = toFlag GhcModeMake,
@@ -324,29 +332,27 @@ buildOrReplLib forRepl verbosity numJobs pkg_descr lbi lib clbi = do
 
       profOpts    = adjustExts "p_hi" "p_o" vanillaOpts `mappend` mempty {
                         ghcOptProfilingMode = toFlag True,
-                        ghcOptExtra         = toNubListR $
-                                              ghcjsProfOptions libBi,
+                        ghcOptExtra         = ghcjsProfOptions libBi,
                         ghcOptHPCDir        = hpcdir Hpc.Prof
                       }
       sharedOpts  = adjustExts "dyn_hi" "dyn_o" vanillaOpts `mappend` mempty {
                         ghcOptDynLinkMode = toFlag GhcDynamicOnly,
                         ghcOptFPic        = toFlag True,
-                        ghcOptExtra       = toNubListR $
-                                            ghcjsSharedOptions libBi,
+                        ghcOptExtra       = ghcjsSharedOptions libBi,
                         ghcOptHPCDir      = hpcdir Hpc.Dyn
                       }
       linkerOpts = mempty {
-                      ghcOptLinkOptions    = toNubListR $ PD.ldOptions libBi,
-                      ghcOptLinkLibs       = toNubListR $ extraLibs libBi,
+                      ghcOptLinkOptions    = PD.ldOptions libBi,
+                      ghcOptLinkLibs       = extraLibs libBi,
                       ghcOptLinkLibPath    = toNubListR $ extraLibDirs libBi,
                       ghcOptLinkFrameworks = toNubListR $ PD.frameworks libBi,
                       ghcOptInputFiles     =
                         toNubListR $ [libTargetDir </> x | x <- cObjs] ++ jsSrcs
                    }
       replOpts    = vanillaOptsNoJsLib {
-                      ghcOptExtra        = overNubListR
-                                           Internal.filterGhciFlags
-                                           (ghcOptExtra vanillaOpts),
+                      ghcOptExtra        = Internal.filterGhciFlags
+                                           (ghcOptExtra vanillaOpts)
+                                           <> replFlags,
                       ghcOptNumJobs      = mempty
                     }
                     `mappend` linkerOpts
@@ -427,7 +433,7 @@ buildOrReplLib forRepl verbosity numJobs pkg_descr lbi lib clbi = do
         compiler_id = compilerId (compiler lbi)
         vanillaLibFilePath = libTargetDir </> mkLibName            uid
         profileLibFilePath = libTargetDir </> mkProfLibName        uid
-        sharedLibFilePath  = libTargetDir </> mkSharedLibName compiler_id uid
+        sharedLibFilePath  = libTargetDir </> mkSharedLibName (hostPlatform lbi) compiler_id uid
         ghciLibFilePath    = libTargetDir </> Internal.mkGHCiLibName uid
 
     hObjs     <- Internal.getHaskellObjects implInfo lib lbi clbi
@@ -466,13 +472,12 @@ buildOrReplLib forRepl verbosity numJobs pkg_descr lbi lib clbi = do
                 ghcOptDynLinkMode        = toFlag GhcDynamicOnly,
                 ghcOptInputFiles         = toNubListR dynamicObjectFiles,
                 ghcOptOutputFile         = toFlag sharedLibFilePath,
-                ghcOptExtra              = toNubListR $
-                                           ghcjsSharedOptions libBi,
+                ghcOptExtra              = ghcjsSharedOptions libBi,
                 ghcOptNoAutoLinkPackages = toFlag True,
                 ghcOptPackageDBs         = withPackageDB lbi,
                 ghcOptPackages           = toNubListR $
                                            Internal.mkGhcOptPackages clbi,
-                ghcOptLinkLibs           = toNubListR $ extraLibs libBi,
+                ghcOptLinkLibs           = extraLibs libBi,
                 ghcOptLinkLibPath        = toNubListR $ extraLibDirs libBi
               }
 
@@ -502,20 +507,28 @@ startInterpreter verbosity progdb comp platform packageDBs = do
   (ghcjsProg, _) <- requireProgram verbosity ghcjsProgram progdb
   runGHC verbosity ghcjsProg comp platform replOpts
 
-buildExe, replExe :: Verbosity          -> Cabal.Flag (Maybe Int)
-                  -> PackageDescription -> LocalBuildInfo
-                  -> Executable         -> ComponentLocalBuildInfo -> IO ()
-buildExe = buildOrReplExe False
-replExe  = buildOrReplExe True
+buildExe :: Verbosity          -> Cabal.Flag (Maybe Int)
+         -> PackageDescription -> LocalBuildInfo
+         -> Executable         -> ComponentLocalBuildInfo -> IO ()
+buildExe = buildOrReplExe Nothing
 
-buildOrReplExe :: Bool -> Verbosity  -> Cabal.Flag (Maybe Int)
-               -> PackageDescription -> LocalBuildInfo
-               -> Executable         -> ComponentLocalBuildInfo -> IO ()
-buildOrReplExe forRepl verbosity numJobs _pkg_descr lbi
+replExe :: [String]                -> Verbosity
+        -> Cabal.Flag (Maybe Int)  -> PackageDescription
+        -> LocalBuildInfo          -> Executable
+        -> ComponentLocalBuildInfo -> IO ()
+replExe = buildOrReplExe . Just
+
+buildOrReplExe :: Maybe [String] -> Verbosity
+               -> Cabal.Flag (Maybe Int) -> PackageDescription
+               -> LocalBuildInfo -> Executable
+               -> ComponentLocalBuildInfo -> IO ()
+buildOrReplExe mReplFlags verbosity numJobs _pkg_descr lbi
   exe@Executable { exeName = exeName', modulePath = modPath } clbi = do
 
   (ghcjsProg, _) <- requireProgram verbosity ghcjsProgram (withPrograms lbi)
-  let comp         = compiler lbi
+  let forRepl = maybe False (const True) mReplFlags
+      replFlags = fromMaybe mempty mReplFlags
+      comp         = compiler lbi
       platform     = hostPlatform lbi
       implInfo     = getImplInfo comp
       runGhcjsProg = runGHC verbosity ghcjsProg comp platform
@@ -524,8 +537,8 @@ buildOrReplExe forRepl verbosity numJobs _pkg_descr lbi
   let exeName'' = unUnqualComponentName exeName'
   -- exeNameReal, the name that GHC really uses (with .exe on Windows)
   let exeNameReal = exeName'' <.>
-                    (if takeExtension exeName'' /= ('.':exeExtension)
-                       then exeExtension
+                    (if takeExtension exeName'' /= ('.':exeExtension buildPlatform)
+                       then exeExtension buildPlatform
                        else "")
 
   let targetDir = (buildDir lbi) </> exeName''
@@ -564,7 +577,7 @@ buildOrReplExe forRepl verbosity numJobs _pkg_descr lbi
                       ghcOptInputModules = toNubListR $
                         [ m | not isHaskellMain, m <- exeModules exe],
                       ghcOptExtra =
-                        if buildRunner then toNubListR ["-build-runner"]
+                        if buildRunner then ["-build-runner"]
                                        else mempty
                     }
       staticOpts = baseOpts `mappend` mempty {
@@ -573,13 +586,12 @@ buildOrReplExe forRepl verbosity numJobs _pkg_descr lbi
                    }
       profOpts   = adjustExts "p_hi" "p_o" baseOpts `mappend` mempty {
                       ghcOptProfilingMode  = toFlag True,
-                      ghcOptExtra          = toNubListR $ ghcjsProfOptions exeBi,
+                      ghcOptExtra          = ghcjsProfOptions exeBi,
                       ghcOptHPCDir         = hpcdir Hpc.Prof
                     }
       dynOpts    = adjustExts "dyn_hi" "dyn_o" baseOpts `mappend` mempty {
                       ghcOptDynLinkMode    = toFlag GhcDynamicOnly,
-                      ghcOptExtra          = toNubListR $
-                                             ghcjsSharedOptions exeBi,
+                      ghcOptExtra          = ghcjsSharedOptions exeBi,
                       ghcOptHPCDir         = hpcdir Hpc.Dyn
                     }
       dynTooOpts = adjustExts "dyn_hi" "dyn_o" staticOpts `mappend` mempty {
@@ -587,17 +599,17 @@ buildOrReplExe forRepl verbosity numJobs _pkg_descr lbi
                       ghcOptHPCDir         = hpcdir Hpc.Dyn
                     }
       linkerOpts = mempty {
-                      ghcOptLinkOptions    = toNubListR $ PD.ldOptions exeBi,
-                      ghcOptLinkLibs       = toNubListR $ extraLibs exeBi,
+                      ghcOptLinkOptions    = PD.ldOptions exeBi,
+                      ghcOptLinkLibs       = extraLibs exeBi,
                       ghcOptLinkLibPath    = toNubListR $ extraLibDirs exeBi,
                       ghcOptLinkFrameworks = toNubListR $ PD.frameworks exeBi,
                       ghcOptInputFiles     = toNubListR $
                                              [exeDir </> x | x <- cObjs] ++ jsSrcs
                    }
       replOpts   = baseOpts {
-                      ghcOptExtra          = overNubListR
-                                             Internal.filterGhciFlags
+                      ghcOptExtra          = Internal.filterGhciFlags
                                              (ghcOptExtra baseOpts)
+                                             <> replFlags
                    }
                    -- For a normal compile we do separate invocations of ghc for
                    -- compiling as for linking. But for repl we have to do just
@@ -735,7 +747,7 @@ installLib verbosity lbi targetDir dynlibTargetDir builtDir _pkg lib clbi = do
     vanillaLibName = mkLibName              uid
     profileLibName = mkProfLibName          uid
     ghciLibName    = Internal.mkGHCiLibName uid
-    sharedLibName  = (mkSharedLibName compiler_id)  uid
+    sharedLibName  = (mkSharedLibName (hostPlatform lbi) compiler_id)  uid
 
     hasLib    = not $ null (allLibModules lib clbi)
                    && null (cSources (libBuildInfo lib))
@@ -784,7 +796,7 @@ libAbiHash verbosity _pkg_descr lbi lib clbi = do
         }
       profArgs = adjustExts "js_p_hi" "js_p_o" vanillaArgs `mappend` mempty {
                      ghcOptProfilingMode = toFlag True,
-                     ghcOptExtra         = toNubListR (ghcjsProfOptions libBi)
+                     ghcOptExtra         = ghcjsProfOptions libBi
                  }
       ghcArgs | withVanillaLib lbi = vanillaArgs
               | withProfLib    lbi = profArgs
@@ -819,8 +831,7 @@ componentGhcOptions verbosity lbi bi clbi odir =
   let opts = Internal.componentGhcOptions verbosity implInfo lbi bi clbi odir
       comp = compiler lbi
       implInfo = getImplInfo comp
-  in  opts { ghcOptExtra = ghcOptExtra opts `mappend` toNubListR
-                             (hcOptions GHCJS bi)
+  in  opts { ghcOptExtra = ghcOptExtra opts `mappend` hcOptions GHCJS bi
            }
 
 ghcjsProfOptions :: BuildInfo -> [String]

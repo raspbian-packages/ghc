@@ -5,13 +5,13 @@
 {-# LANGUAGE StandaloneDeriving     #-}
 {-# LANGUAGE NoImplicitPrelude      #-}
 {-# LANGUAGE RankNTypes             #-}
-{-# LANGUAGE TypeInType             #-}
 {-# LANGUAGE TypeFamilies           #-}
 {-# LANGUAGE UndecidableInstances   #-}
 {-# LANGUAGE ExplicitNamespaces     #-}
 {-# LANGUAGE MultiParamTypeClasses  #-}
 {-# LANGUAGE FunctionalDependencies #-}
-{-# LANGUAGE TypeInType             #-}
+{-# LANGUAGE DataKinds              #-}
+{-# LANGUAGE PolyKinds              #-}
 {-# LANGUAGE Trustworthy            #-}
 
 -----------------------------------------------------------------------------
@@ -120,8 +120,13 @@ inner Refl = Refl
 outer :: (f a :~: g b) -> (f :~: g)
 outer Refl = Refl
 
+-- | @since 4.7.0.0
 deriving instance Eq   (a :~: b)
+
+-- | @since 4.7.0.0
 deriving instance Show (a :~: b)
+
+-- | @since 4.7.0.0
 deriving instance Ord  (a :~: b)
 
 -- | @since 4.7.0.0

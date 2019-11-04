@@ -1,4 +1,6 @@
 {-# LANGUAGE CPP #-}
+-- emitPrimOp is quite large
+{-# OPTIONS_GHC -fmax-pmcheck-iterations=4000000 #-}
 
 ----------------------------------------------------------------------------
 --
@@ -26,7 +28,7 @@ import StgCmmMonad
 import StgCmmUtils
 import StgCmmTicky
 import StgCmmHeap
-import StgCmmProf ( costCentreFrom, curCCS )
+import StgCmmProf ( costCentreFrom )
 
 import DynFlags
 import Platform
@@ -35,7 +37,6 @@ import BlockId
 import MkGraph
 import StgSyn
 import Cmm
-import CmmInfo
 import Type     ( Type, tyConAppTyCon )
 import TyCon
 import CLabel
@@ -192,7 +193,7 @@ shouldInlinePrimOp _ CopyMutableArrayArrayOp
 
 shouldInlinePrimOp dflags CloneArrayOp [src, src_off, (CmmLit (CmmInt n w))]
   | wordsToBytes dflags (asUnsigned w n) <= fromIntegral (maxInlineAllocSize dflags) =
-      Just $ \ [res] -> emitCloneArray mkMAP_FROZEN_infoLabel res src src_off (fromInteger n)
+      Just $ \ [res] -> emitCloneArray mkMAP_FROZEN_CLEAN_infoLabel res src src_off (fromInteger n)
 
 shouldInlinePrimOp dflags CloneMutableArrayOp [src, src_off, (CmmLit (CmmInt n w))]
   | wordsToBytes dflags (asUnsigned w n) <= fromIntegral (maxInlineAllocSize dflags) =
@@ -200,7 +201,7 @@ shouldInlinePrimOp dflags CloneMutableArrayOp [src, src_off, (CmmLit (CmmInt n w
 
 shouldInlinePrimOp dflags FreezeArrayOp [src, src_off, (CmmLit (CmmInt n w))]
   | wordsToBytes dflags (asUnsigned w n) <= fromIntegral (maxInlineAllocSize dflags) =
-      Just $ \ [res] -> emitCloneArray mkMAP_FROZEN_infoLabel res src src_off (fromInteger n)
+      Just $ \ [res] -> emitCloneArray mkMAP_FROZEN_CLEAN_infoLabel res src src_off (fromInteger n)
 
 shouldInlinePrimOp dflags ThawArrayOp [src, src_off, (CmmLit (CmmInt n w))]
   | wordsToBytes dflags (asUnsigned w n) <= fromIntegral (maxInlineAllocSize dflags) =
@@ -225,7 +226,7 @@ shouldInlinePrimOp _ CopySmallMutableArrayOp
 
 shouldInlinePrimOp dflags CloneSmallArrayOp [src, src_off, (CmmLit (CmmInt n w))]
   | wordsToBytes dflags (asUnsigned w n) <= fromIntegral (maxInlineAllocSize dflags) =
-      Just $ \ [res] -> emitCloneSmallArray mkSMAP_FROZEN_infoLabel res src src_off (fromInteger n)
+      Just $ \ [res] -> emitCloneSmallArray mkSMAP_FROZEN_CLEAN_infoLabel res src src_off (fromInteger n)
 
 shouldInlinePrimOp dflags CloneSmallMutableArrayOp [src, src_off, (CmmLit (CmmInt n w))]
   | wordsToBytes dflags (asUnsigned w n) <= fromIntegral (maxInlineAllocSize dflags) =
@@ -233,7 +234,7 @@ shouldInlinePrimOp dflags CloneSmallMutableArrayOp [src, src_off, (CmmLit (CmmIn
 
 shouldInlinePrimOp dflags FreezeSmallArrayOp [src, src_off, (CmmLit (CmmInt n w))]
   | wordsToBytes dflags (asUnsigned w n) <= fromIntegral (maxInlineAllocSize dflags) =
-      Just $ \ [res] -> emitCloneSmallArray mkSMAP_FROZEN_infoLabel res src src_off (fromInteger n)
+      Just $ \ [res] -> emitCloneSmallArray mkSMAP_FROZEN_CLEAN_infoLabel res src src_off (fromInteger n)
 
 shouldInlinePrimOp dflags ThawSmallArrayOp [src, src_off, (CmmLit (CmmInt n w))]
   | wordsToBytes dflags (asUnsigned w n) <= fromIntegral (maxInlineAllocSize dflags) =
@@ -281,7 +282,7 @@ emitPrimOp _ [res] ParOp [arg]
     emitCCall
         [(res,NoHint)]
         (CmmLit (CmmLabel (mkForeignLabel (fsLit "newSpark") Nothing ForeignLabelInExternalPackage IsFunction)))
-        [(CmmReg (CmmGlobal BaseReg), AddrHint), (arg,AddrHint)]
+        [(baseExpr, AddrHint), (arg,AddrHint)]
 
 emitPrimOp dflags [res] SparkOp [arg]
   = do
@@ -293,7 +294,7 @@ emitPrimOp dflags [res] SparkOp [arg]
         emitCCall
             [(tmp2,NoHint)]
             (CmmLit (CmmLabel (mkForeignLabel (fsLit "newSpark") Nothing ForeignLabelInExternalPackage IsFunction)))
-            [(CmmReg (CmmGlobal BaseReg), AddrHint), ((CmmReg (CmmLocal tmp)), AddrHint)]
+            [(baseExpr, AddrHint), ((CmmReg (CmmLocal tmp)), AddrHint)]
         emitAssign (CmmLocal res) (CmmReg (CmmLocal tmp))
 
 emitPrimOp dflags [res] GetCCSOfOp [arg]
@@ -304,7 +305,10 @@ emitPrimOp dflags [res] GetCCSOfOp [arg]
      | otherwise                      = CmmLit (zeroCLit dflags)
 
 emitPrimOp _ [res] GetCurrentCCSOp [_dummy_arg]
-   = emitAssign (CmmLocal res) curCCS
+   = emitAssign (CmmLocal res) cccsExpr
+
+emitPrimOp _ [res] MyThreadIdOp []
+   = emitAssign (CmmLocal res) currentTSOExpr
 
 emitPrimOp dflags [res] ReadMutVarOp [mutv]
    = emitAssign (CmmLocal res) (cmmLoadIndexW dflags mutv (fixedHdrSizeW dflags) (gcWord dflags))
@@ -317,7 +321,7 @@ emitPrimOp dflags res@[] WriteMutVarOp [mutv,var]
         emitCCall
                 [{-no results-}]
                 (CmmLit (CmmLabel mkDirty_MUT_VAR_Label))
-                [(CmmReg (CmmGlobal BaseReg), AddrHint), (mutv,AddrHint)]
+                [(baseExpr, AddrHint), (mutv,AddrHint)]
 
 --  #define sizzeofByteArrayzh(r,a) \
 --     r = ((StgArrBytes *)(a))->bytes
@@ -366,11 +370,6 @@ emitPrimOp _      [res] AddrToAnyOp [arg]
 emitPrimOp _      [res] AnyToAddrOp [arg]
    = emitAssign (CmmLocal res) arg
 
---  #define dataToTagzh(r,a)  r=(GET_TAG(((StgClosure *)a)->header.info))
---  Note: argument may be tagged!
-emitPrimOp dflags [res] DataToTagOp [arg]
-   = emitAssign (CmmLocal res) (getConstrTag dflags (cmmUntag dflags arg))
-
 {- Freezing arrays-of-ptrs requires changing an info table, for the
    benefit of the generational collector.  It needs to scavenge mutable
    objects, even if they are in old space.  When they become immutable,
@@ -378,20 +377,20 @@ emitPrimOp dflags [res] DataToTagOp [arg]
 
 --  #define unsafeFreezzeArrayzh(r,a)
 --      {
---        SET_INFO((StgClosure *)a,&stg_MUT_ARR_PTRS_FROZEN0_info);
+--        SET_INFO((StgClosure *)a,&stg_MUT_ARR_PTRS_FROZEN_DIRTY_info);
 --        r = a;
 --      }
 emitPrimOp _      [res] UnsafeFreezeArrayOp [arg]
    = emit $ catAGraphs
-   [ setInfo arg (CmmLit (CmmLabel mkMAP_FROZEN0_infoLabel)),
+   [ setInfo arg (CmmLit (CmmLabel mkMAP_FROZEN_DIRTY_infoLabel)),
      mkAssign (CmmLocal res) arg ]
 emitPrimOp _      [res] UnsafeFreezeArrayArrayOp [arg]
    = emit $ catAGraphs
-   [ setInfo arg (CmmLit (CmmLabel mkMAP_FROZEN0_infoLabel)),
+   [ setInfo arg (CmmLit (CmmLabel mkMAP_FROZEN_DIRTY_infoLabel)),
      mkAssign (CmmLocal res) arg ]
 emitPrimOp _      [res] UnsafeFreezeSmallArrayOp [arg]
    = emit $ catAGraphs
-   [ setInfo arg (CmmLit (CmmLabel mkSMAP_FROZEN0_infoLabel)),
+   [ setInfo arg (CmmLit (CmmLabel mkSMAP_FROZEN_DIRTY_infoLabel)),
      mkAssign (CmmLocal res) arg ]
 
 --  #define unsafeFreezzeByteArrayzh(r,a)       r=(a)
@@ -516,6 +515,40 @@ emitPrimOp dflags res ReadByteArrayOp_Word16           args = doIndexByteArrayOp
 emitPrimOp dflags res ReadByteArrayOp_Word32           args = doIndexByteArrayOp   (Just (mo_u_32ToWord dflags)) b32  res args
 emitPrimOp _      res ReadByteArrayOp_Word64           args = doIndexByteArrayOp   Nothing b64  res args
 
+-- IndexWord8ArrayAsXXX
+
+emitPrimOp dflags res IndexByteArrayOp_Word8AsChar      args = doIndexByteArrayOpAs   (Just (mo_u_8ToWord dflags)) b8 b8 res args
+emitPrimOp dflags res IndexByteArrayOp_Word8AsWideChar  args = doIndexByteArrayOpAs   (Just (mo_u_32ToWord dflags)) b32 b8 res args
+emitPrimOp dflags res IndexByteArrayOp_Word8AsInt       args = doIndexByteArrayOpAs   Nothing (bWord dflags) b8 res args
+emitPrimOp dflags res IndexByteArrayOp_Word8AsWord      args = doIndexByteArrayOpAs   Nothing (bWord dflags) b8 res args
+emitPrimOp dflags res IndexByteArrayOp_Word8AsAddr      args = doIndexByteArrayOpAs   Nothing (bWord dflags) b8 res args
+emitPrimOp _      res IndexByteArrayOp_Word8AsFloat     args = doIndexByteArrayOpAs   Nothing f32 b8 res args
+emitPrimOp _      res IndexByteArrayOp_Word8AsDouble    args = doIndexByteArrayOpAs   Nothing f64 b8 res args
+emitPrimOp dflags res IndexByteArrayOp_Word8AsStablePtr args = doIndexByteArrayOpAs   Nothing (bWord dflags) b8 res args
+emitPrimOp dflags res IndexByteArrayOp_Word8AsInt16     args = doIndexByteArrayOpAs   (Just (mo_s_16ToWord dflags)) b16 b8 res args
+emitPrimOp dflags res IndexByteArrayOp_Word8AsInt32     args = doIndexByteArrayOpAs   (Just (mo_s_32ToWord dflags)) b32 b8 res args
+emitPrimOp _      res IndexByteArrayOp_Word8AsInt64     args = doIndexByteArrayOpAs   Nothing b64 b8 res args
+emitPrimOp dflags res IndexByteArrayOp_Word8AsWord16    args = doIndexByteArrayOpAs   (Just (mo_u_16ToWord dflags)) b16 b8 res args
+emitPrimOp dflags res IndexByteArrayOp_Word8AsWord32    args = doIndexByteArrayOpAs   (Just (mo_u_32ToWord dflags)) b32 b8 res args
+emitPrimOp _      res IndexByteArrayOp_Word8AsWord64    args = doIndexByteArrayOpAs   Nothing b64 b8 res args
+
+-- ReadInt8ArrayAsXXX, identical to IndexInt8ArrayAsXXX
+
+emitPrimOp dflags res ReadByteArrayOp_Word8AsChar      args = doIndexByteArrayOpAs   (Just (mo_u_8ToWord dflags)) b8 b8 res args
+emitPrimOp dflags res ReadByteArrayOp_Word8AsWideChar  args = doIndexByteArrayOpAs   (Just (mo_u_32ToWord dflags)) b32 b8 res args
+emitPrimOp dflags res ReadByteArrayOp_Word8AsInt       args = doIndexByteArrayOpAs   Nothing (bWord dflags) b8 res args
+emitPrimOp dflags res ReadByteArrayOp_Word8AsWord      args = doIndexByteArrayOpAs   Nothing (bWord dflags) b8 res args
+emitPrimOp dflags res ReadByteArrayOp_Word8AsAddr      args = doIndexByteArrayOpAs   Nothing (bWord dflags) b8 res args
+emitPrimOp _      res ReadByteArrayOp_Word8AsFloat     args = doIndexByteArrayOpAs   Nothing f32 b8 res args
+emitPrimOp _      res ReadByteArrayOp_Word8AsDouble    args = doIndexByteArrayOpAs   Nothing f64 b8 res args
+emitPrimOp dflags res ReadByteArrayOp_Word8AsStablePtr args = doIndexByteArrayOpAs   Nothing (bWord dflags) b8 res args
+emitPrimOp dflags res ReadByteArrayOp_Word8AsInt16     args = doIndexByteArrayOpAs   (Just (mo_s_16ToWord dflags)) b16 b8 res args
+emitPrimOp dflags res ReadByteArrayOp_Word8AsInt32     args = doIndexByteArrayOpAs   (Just (mo_s_32ToWord dflags)) b32 b8 res args
+emitPrimOp _      res ReadByteArrayOp_Word8AsInt64     args = doIndexByteArrayOpAs   Nothing b64 b8 res args
+emitPrimOp dflags res ReadByteArrayOp_Word8AsWord16    args = doIndexByteArrayOpAs   (Just (mo_u_16ToWord dflags)) b16 b8 res args
+emitPrimOp dflags res ReadByteArrayOp_Word8AsWord32    args = doIndexByteArrayOpAs   (Just (mo_u_32ToWord dflags)) b32 b8 res args
+emitPrimOp _      res ReadByteArrayOp_Word8AsWord64    args = doIndexByteArrayOpAs   Nothing b64 b8 res args
+
 -- WriteXXXoffAddr
 
 emitPrimOp dflags res WriteOffAddrOp_Char             args = doWriteOffAddrOp (Just (mo_WordTo8 dflags))  b8 res args
@@ -553,6 +586,23 @@ emitPrimOp dflags res WriteByteArrayOp_Word8            args = doWriteByteArrayO
 emitPrimOp dflags res WriteByteArrayOp_Word16           args = doWriteByteArrayOp (Just (mo_WordTo16 dflags)) b16 res args
 emitPrimOp dflags res WriteByteArrayOp_Word32           args = doWriteByteArrayOp (Just (mo_WordTo32 dflags)) b32 res args
 emitPrimOp _      res WriteByteArrayOp_Word64           args = doWriteByteArrayOp Nothing b64 res args
+
+-- WriteInt8ArrayAsXXX
+
+emitPrimOp dflags res WriteByteArrayOp_Word8AsChar       args = doWriteByteArrayOp (Just (mo_WordTo8 dflags))  b8 res args
+emitPrimOp dflags res WriteByteArrayOp_Word8AsWideChar   args = doWriteByteArrayOp (Just (mo_WordTo32 dflags)) b8 res args
+emitPrimOp _      res WriteByteArrayOp_Word8AsInt        args = doWriteByteArrayOp Nothing b8 res args
+emitPrimOp _      res WriteByteArrayOp_Word8AsWord       args = doWriteByteArrayOp Nothing b8 res args
+emitPrimOp _      res WriteByteArrayOp_Word8AsAddr       args = doWriteByteArrayOp Nothing b8 res args
+emitPrimOp _      res WriteByteArrayOp_Word8AsFloat      args = doWriteByteArrayOp Nothing b8 res args
+emitPrimOp _      res WriteByteArrayOp_Word8AsDouble     args = doWriteByteArrayOp Nothing b8 res args
+emitPrimOp _      res WriteByteArrayOp_Word8AsStablePtr  args = doWriteByteArrayOp Nothing b8 res args
+emitPrimOp dflags res WriteByteArrayOp_Word8AsInt16      args = doWriteByteArrayOp (Just (mo_WordTo16 dflags)) b8 res args
+emitPrimOp dflags res WriteByteArrayOp_Word8AsInt32      args = doWriteByteArrayOp (Just (mo_WordTo32 dflags)) b8 res args
+emitPrimOp _      res WriteByteArrayOp_Word8AsInt64      args = doWriteByteArrayOp Nothing b8 res args
+emitPrimOp dflags res WriteByteArrayOp_Word8AsWord16     args = doWriteByteArrayOp (Just (mo_WordTo16 dflags)) b8 res args
+emitPrimOp dflags res WriteByteArrayOp_Word8AsWord32     args = doWriteByteArrayOp (Just (mo_WordTo32 dflags)) b8 res args
+emitPrimOp _      res WriteByteArrayOp_Word8AsWord64     args = doWriteByteArrayOp Nothing b8 res args
 
 -- Copying and setting byte arrays
 emitPrimOp _      [] CopyByteArrayOp [src,src_off,dst,dst_off,n] =
@@ -851,6 +901,11 @@ callishPrimOpSupported dflags op
                          || llvm      -> Left (MO_Add2       (wordWidth dflags))
                      | otherwise      -> Right genericWordAdd2Op
 
+      WordAddCOp     | (ncg && (x86ish
+                                || ppc))
+                         || llvm      -> Left (MO_AddWordC   (wordWidth dflags))
+                     | otherwise      -> Right genericWordAddCOp
+
       WordSubCOp     | (ncg && (x86ish
                                 || ppc))
                          || llvm      -> Left (MO_SubWordC   (wordWidth dflags))
@@ -987,17 +1042,64 @@ genericWordAdd2Op [res_h, res_l] [arg_x, arg_y]
                    (bottomHalf (CmmReg (CmmLocal r1))))]
 genericWordAdd2Op _ _ = panic "genericWordAdd2Op"
 
+-- | Implements branchless recovery of the carry flag @c@ by checking the
+-- leftmost bits of both inputs @a@ and @b@ and result @r = a + b@:
+--
+-- @
+--    c = a&b | (a|b)&~r
+-- @
+--
+-- https://brodowsky.it-sky.net/2015/04/02/how-to-recover-the-carry-bit/
+genericWordAddCOp :: GenericOp
+genericWordAddCOp [res_r, res_c] [aa, bb]
+ = do dflags <- getDynFlags
+      emit $ catAGraphs [
+        mkAssign (CmmLocal res_r) (CmmMachOp (mo_wordAdd dflags) [aa,bb]),
+        mkAssign (CmmLocal res_c) $
+          CmmMachOp (mo_wordUShr dflags) [
+            CmmMachOp (mo_wordOr dflags) [
+              CmmMachOp (mo_wordAnd dflags) [aa,bb],
+              CmmMachOp (mo_wordAnd dflags) [
+                CmmMachOp (mo_wordOr dflags) [aa,bb],
+                CmmMachOp (mo_wordNot dflags) [CmmReg (CmmLocal res_r)]
+              ]
+            ],
+            mkIntExpr dflags (wORD_SIZE_IN_BITS dflags - 1)
+          ]
+        ]
+genericWordAddCOp _ _ = panic "genericWordAddCOp"
+
+-- | Implements branchless recovery of the carry flag @c@ by checking the
+-- leftmost bits of both inputs @a@ and @b@ and result @r = a - b@:
+--
+-- @
+--    c = ~a&b | (~a|b)&r
+-- @
+--
+-- https://brodowsky.it-sky.net/2015/04/02/how-to-recover-the-carry-bit/
 genericWordSubCOp :: GenericOp
-genericWordSubCOp [res_r, res_c] [aa, bb] = do
-  dflags <- getDynFlags
-  emit $ catAGraphs
-    [ -- Put the result into 'res_r'.
-      mkAssign (CmmLocal res_r) $
-        CmmMachOp (mo_wordSub dflags) [aa, bb]
-      -- Set 'res_c' to 1 if 'bb > aa' and to 0 otherwise.
-    , mkAssign (CmmLocal res_c) $
-        CmmMachOp (mo_wordUGt dflags) [bb, aa]
-    ]
+genericWordSubCOp [res_r, res_c] [aa, bb]
+ = do dflags <- getDynFlags
+      emit $ catAGraphs [
+        mkAssign (CmmLocal res_r) (CmmMachOp (mo_wordSub dflags) [aa,bb]),
+        mkAssign (CmmLocal res_c) $
+          CmmMachOp (mo_wordUShr dflags) [
+            CmmMachOp (mo_wordOr dflags) [
+              CmmMachOp (mo_wordAnd dflags) [
+                CmmMachOp (mo_wordNot dflags) [aa],
+                bb
+              ],
+              CmmMachOp (mo_wordAnd dflags) [
+                CmmMachOp (mo_wordOr dflags) [
+                  CmmMachOp (mo_wordNot dflags) [aa],
+                  bb
+                ],
+                CmmReg (CmmLocal res_r)
+              ]
+            ],
+            mkIntExpr dflags (wORD_SIZE_IN_BITS dflags - 1)
+          ]
+        ]
 genericWordSubCOp _ _ = panic "genericWordSubCOp"
 
 genericIntAddCOp :: GenericOp
@@ -1730,7 +1832,7 @@ doNewByteArrayOp res_r n = do
 
     let hdr_size = fixedHdrSize dflags
 
-    base <- allocHeapClosure rep info_ptr curCCS
+    base <- allocHeapClosure rep info_ptr cccsExpr
                      [ (mkIntExpr dflags n,
                         hdr_size + oFFSET_StgArrBytes_bytes dflags)
                      ]
@@ -1821,10 +1923,9 @@ doCopyMutableByteArrayOp = emitCopyByteArray copy
     -- TODO: Optimize branch for common case of no aliasing.
     copy src dst dst_p src_p bytes = do
         dflags <- getDynFlags
-        [moveCall, cpyCall] <- forkAlts [
-            getCode $ emitMemmoveCall dst_p src_p bytes 1,
-            getCode $ emitMemcpyCall  dst_p src_p bytes 1
-            ]
+        (moveCall, cpyCall) <- forkAltPair
+            (getCode $ emitMemmoveCall dst_p src_p bytes 1)
+            (getCode $ emitMemcpyCall  dst_p src_p bytes 1)
         emit =<< mkCmmIfThenElse (cmmEqWord dflags src dst) moveCall cpyCall
 
 emitCopyByteArray :: (CmmExpr -> CmmExpr -> CmmExpr -> CmmExpr -> CmmExpr
@@ -1898,12 +1999,12 @@ doNewArrayOp res_r rep info payload n init = do
         (mkIntExpr dflags (nonHdrSize dflags rep))
         (zeroExpr dflags)
 
-    base <- allocHeapClosure rep info_ptr curCCS payload
+    base <- allocHeapClosure rep info_ptr cccsExpr payload
 
     arr <- CmmLocal `fmap` newTemp (bWord dflags)
     emit $ mkAssign arr base
 
-    -- Initialise all elements of the the array
+    -- Initialise all elements of the array
     p <- assignTemp $ cmmOffsetB dflags (CmmReg arr) (hdrSize dflags rep)
     for <- newBlockId
     emitLabel for
@@ -1965,12 +2066,11 @@ doCopyMutableArrayOp = emitCopyArray copy
     -- TODO: Optimize branch for common case of no aliasing.
     copy src dst dst_p src_p bytes = do
         dflags <- getDynFlags
-        [moveCall, cpyCall] <- forkAlts [
-            getCode $ emitMemmoveCall dst_p src_p (mkIntExpr dflags bytes)
-            (wORD_SIZE dflags),
-            getCode $ emitMemcpyCall  dst_p src_p (mkIntExpr dflags bytes)
-            (wORD_SIZE dflags)
-            ]
+        (moveCall, cpyCall) <- forkAltPair
+            (getCode $ emitMemmoveCall dst_p src_p (mkIntExpr dflags bytes)
+             (wORD_SIZE dflags))
+            (getCode $ emitMemcpyCall  dst_p src_p (mkIntExpr dflags bytes)
+             (wORD_SIZE dflags))
         emit =<< mkCmmIfThenElse (cmmEqWord dflags src dst) moveCall cpyCall
 
 emitCopyArray :: (CmmExpr -> CmmExpr -> CmmExpr -> CmmExpr -> ByteOff
@@ -2028,12 +2128,11 @@ doCopySmallMutableArrayOp = emitCopySmallArray copy
     -- TODO: Optimize branch for common case of no aliasing.
     copy src dst dst_p src_p bytes = do
         dflags <- getDynFlags
-        [moveCall, cpyCall] <- forkAlts
-            [ getCode $ emitMemmoveCall dst_p src_p (mkIntExpr dflags bytes)
-              (wORD_SIZE dflags)
-            , getCode $ emitMemcpyCall  dst_p src_p (mkIntExpr dflags bytes)
-              (wORD_SIZE dflags)
-            ]
+        (moveCall, cpyCall) <- forkAltPair
+            (getCode $ emitMemmoveCall dst_p src_p (mkIntExpr dflags bytes)
+             (wORD_SIZE dflags))
+            (getCode $ emitMemcpyCall  dst_p src_p (mkIntExpr dflags bytes)
+             (wORD_SIZE dflags))
         emit =<< mkCmmIfThenElse (cmmEqWord dflags src dst) moveCall cpyCall
 
 emitCopySmallArray :: (CmmExpr -> CmmExpr -> CmmExpr -> CmmExpr -> ByteOff
@@ -2080,7 +2179,7 @@ emitCloneArray info_p res_r src src_off n = do
 
     let hdr_size = fixedHdrSize dflags
 
-    base <- allocHeapClosure rep info_ptr curCCS
+    base <- allocHeapClosure rep info_ptr cccsExpr
                      [ (mkIntExpr dflags n,
                         hdr_size + oFFSET_StgMutArrPtrs_ptrs dflags)
                      , (mkIntExpr dflags (nonHdrSizeW rep),
@@ -2119,7 +2218,7 @@ emitCloneSmallArray info_p res_r src src_off n = do
 
     let hdr_size = fixedHdrSize dflags
 
-    base <- allocHeapClosure rep info_ptr curCCS
+    base <- allocHeapClosure rep info_ptr cccsExpr
                      [ (mkIntExpr dflags n,
                         hdr_size + oFFSET_StgSmallMutArrPtrs_ptrs dflags)
                      ]

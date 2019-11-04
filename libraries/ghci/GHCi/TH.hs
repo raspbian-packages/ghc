@@ -105,6 +105,7 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as LB
 import Data.Data
 import Data.Dynamic
+import Data.Either
 import Data.IORef
 import Data.Map (Map)
 import qualified Data.Map as M
@@ -169,13 +170,13 @@ instance TH.Quasi GHCiQ where
   qReport isError msg = ghcCmd (Report isError msg)
 
   -- See Note [TH recover with -fexternal-interpreter] in TcSplice
-  qRecover (GHCiQ h) (GHCiQ a) = GHCiQ $ \s -> (do
+  qRecover (GHCiQ h) a = GHCiQ $ \s -> mask $ \unmask -> do
     remoteTHCall (qsPipe s) StartRecover
-    (r, s') <- a s
-    remoteTHCall (qsPipe s) (EndRecover False)
-    return (r,s'))
-      `catch`
-       \GHCiQException{} -> remoteTHCall (qsPipe s) (EndRecover True) >> h s
+    e <- try $ unmask $ runGHCiQ (a <* ghcCmd FailIfErrs) s
+    remoteTHCall (qsPipe s) (EndRecover (isLeft e))
+    case e of
+      Left GHCiQException{} -> h s
+      Right r -> return r
   qLookupName isType occ = ghcCmd (LookupName isType occ)
   qReify name = ghcCmd (Reify name)
   qReifyFixity name = ghcCmd (ReifyFixity name)
@@ -195,8 +196,9 @@ instance TH.Quasi GHCiQ where
   qReifyConStrictness name = ghcCmd (ReifyConStrictness name)
   qLocation = fromMaybe noLoc . qsLocation <$> getState
   qAddDependentFile file = ghcCmd (AddDependentFile file)
+  qAddTempFile suffix = ghcCmd (AddTempFile suffix)
   qAddTopDecls decls = ghcCmd (AddTopDecls decls)
-  qAddForeignFile str lang = ghcCmd (AddForeignFile str lang)
+  qAddForeignFilePath lang fp = ghcCmd (AddForeignFilePath lang fp)
   qAddModFinalizer fin = GHCiQ (\s -> mkRemoteRef fin >>= return . (, s)) >>=
                          ghcCmd . AddModFinalizer
   qAddCorePlugin str = ghcCmd (AddCorePlugin str)

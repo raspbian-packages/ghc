@@ -1,6 +1,6 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE BangPatterns #-}
-#if __GLASGOW_HASKELL__ >= 703
+#if defined(__GLASGOW_HASKELL__)
 {-# LANGUAGE Safe #-}
 #endif
 
@@ -71,8 +71,8 @@
 -- The 'Map' type is shared between the lazy and strict modules, meaning that
 -- the same 'Map' value can be passed to functions in both modules. This means
 -- that the 'Functor', 'Traversable' and 'Data' instances are the same as for
--- the "Data.Map.Lazy" module, so if they are used on strict maps, the resulting
--- maps may contain suspended values (thunks).
+-- the "Data.Map.Lazy" module, so if they are used the resulting maps may contain
+-- suspended values (thunks).
 --
 --
 -- == Implementation
@@ -104,32 +104,35 @@ module Data.Map.Strict
     -- * Map type
     Map              -- instance Eq,Show,Read
 
-    -- * Operators
-    , (!), (!?), (\\)
-
-    -- * Query
-    , null
-    , size
-    , member
-    , notMember
-    , lookup
-    , findWithDefault
-    , lookupLT
-    , lookupGT
-    , lookupLE
-    , lookupGE
-
     -- * Construction
     , empty
     , singleton
+    , fromSet
 
-    -- ** Insertion
+    -- ** From Unordered Lists
+    , fromList
+    , fromListWith
+    , fromListWithKey
+
+    -- ** From Ascending Lists
+    , fromAscList
+    , fromAscListWith
+    , fromAscListWithKey
+    , fromDistinctAscList
+
+    -- ** From Descending Lists
+    , fromDescList
+    , fromDescListWith
+    , fromDescListWithKey
+    , fromDistinctDescList
+
+    -- * Insertion
     , insert
     , insertWith
     , insertWithKey
     , insertLookupWithKey
 
-    -- ** Delete\/Update
+    -- * Deletion\/Update
     , delete
     , adjust
     , adjustWithKey
@@ -138,6 +141,23 @@ module Data.Map.Strict
     , updateLookupWithKey
     , alter
     , alterF
+
+    -- * Query
+    -- ** Lookup
+    , lookup
+    , (!?)
+    , (!)
+    , findWithDefault
+    , member
+    , notMember
+    , lookupLT
+    , lookupGT
+    , lookupLE
+    , lookupGE
+
+    -- ** Size
+    , null
+    , size
 
     -- * Combine
 
@@ -150,6 +170,7 @@ module Data.Map.Strict
 
     -- ** Difference
     , difference
+    , (\\)
     , differenceWith
     , differenceWithKey
 
@@ -196,25 +217,13 @@ module Data.Map.Strict
     , keys
     , assocs
     , keysSet
-    , fromSet
 
     -- ** Lists
     , toList
-    , fromList
-    , fromListWith
-    , fromListWithKey
 
     -- ** Ordered lists
     , toAscList
     , toDescList
-    , fromAscList
-    , fromAscListWith
-    , fromAscListWithKey
-    , fromDistinctAscList
-    , fromDescList
-    , fromDescListWith
-    , fromDescListWithKey
-    , fromDistinctDescList
 
     -- * Filter
     , filter
@@ -270,8 +279,10 @@ module Data.Map.Strict
     , maxViewWithKey
 
     -- * Debugging
+#ifdef __GLASGOW_HASKELL__
     , showTree
     , showTreeWith
+#endif
     , valid
     ) where
 

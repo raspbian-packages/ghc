@@ -3,6 +3,8 @@ module Haddock.Backends.Hyperlinker.Parser (parse) where
 import Data.Either         ( isRight, isLeft )
 import Data.List           ( foldl', isPrefixOf, isSuffixOf )
 import Data.Maybe          ( maybeToList )
+import Data.Char           ( isSpace )
+import qualified Text.Read as R
 
 import GHC                 ( DynFlags, addSourceToTokens )
 import SrcLoc
@@ -24,8 +26,13 @@ import Haddock.Backends.Hyperlinker.Types as T
 -- (In reality, this only holds for input not containing '\r', '\t', '\f', '\v',
 -- characters, since GHC transforms those into ' ' and '\n')
 parse :: DynFlags -> FilePath -> String -> [T.Token]
-parse dflags fp s = ghcToks (processCPP dflags fp s)
-
+parse dflags fp = ghcToks . processCPP dflags fp . filterCRLF
+  where
+    -- Remove CRLFs from source
+    filterCRLF :: String -> String
+    filterCRLF ('\r':'\n':cs) = '\n' : filterCRLF cs
+    filterCRLF (c:cs) = c : filterCRLF cs
+    filterCRLF [] = []
 
 -- | Parse the source into tokens using the GHC lexer.
 --
@@ -104,12 +111,9 @@ isCPPline :: String -> Bool
 isCPPline = isPrefixOf "#" . dropWhile (`elem` " \t") . take 5
 
 
--- | Split a "line" off the front of a string, supporting newline escapes.
---
--- By "line", we understand: the shortest substring ending in a '\n' that is not
---
---   1. immediately preceded by a '\\'
---   2. not inside some (possibly nested) block comment
+-- | Split a "line" off the front of a string, hopefully without cutting tokens
+-- in half. I say "hopefully" because knowing what a token is requires lexing,
+-- yet lexing depends on this function.
 --
 -- All characters in the input are present in the output:
 --
@@ -117,17 +121,36 @@ isCPPline = isPrefixOf "#" . dropWhile (`elem` " \t") . take 5
 spanToNewline :: Int                 -- ^ open '{-'
               -> String              -- ^ input
               -> (String, String)
-spanToNewline _ [] = ([], [])
+
+-- Base case and space characters
+spanToNewline _ "" = ("", "")
+spanToNewline n ('\n':str) | n <= 0 = ("\n", str)
 spanToNewline n ('\n':str) | n <= 0 = ("\n", str)
 spanToNewline n ('\\':'\n':str) =
     let (str', rest) = spanToNewline n str
     in ('\\':'\n':str', rest)
+
+-- Block comments
 spanToNewline n ('{':'-':str) =
     let (str', rest) = spanToNewline (n+1) str
     in ('{':'-':str', rest)
 spanToNewline n ('-':'}':str) =
     let (str', rest) = spanToNewline (n-1) str
     in ('-':'}':str', rest)
+
+-- When not in a block comment, try to lex a Haskell token
+spanToNewline 0 str@(c:_) | ((lexed, str') : _) <- R.lex str, not (isSpace c) =
+    if all (== '-') lexed && length lexed >= 2
+      -- A Haskell line comment
+      then case span (/= '\n') str' of
+             (str'', '\n':rest) -> (lexed ++ str'' ++ "\n", rest)
+             (_, _) -> (str, "") 
+
+      -- An actual Haskell token
+      else let (str'', rest) = spanToNewline 0 str'
+           in (lexed ++ str'', rest)
+
+-- In all other cases, advance one character at a time
 spanToNewline n (c:str) =
     let (str', rest) = spanToNewline n str
     in (c:str', rest)
@@ -211,6 +234,7 @@ classify tok =
     ITqualified            -> TkKeyword
     ITthen                 -> TkKeyword
     ITtype                 -> TkKeyword
+    ITvia                  -> TkKeyword
     ITwhere                -> TkKeyword
 
     ITforall            {} -> TkKeyword
@@ -261,9 +285,6 @@ classify tok =
     IToptions_prag      {} -> TkPragma
     ITinclude_prag      {} -> TkPragma
     ITlanguage_prag        -> TkPragma
-    ITvect_prag         {} -> TkPragma
-    ITvect_scalar_prag  {} -> TkPragma
-    ITnovect_prag       {} -> TkPragma
     ITminimal_prag      {} -> TkPragma
     IToverlappable_prag {} -> TkPragma
     IToverlapping_prag  {} -> TkPragma
@@ -282,11 +303,11 @@ classify tok =
     ITrarrow            {} -> TkGlyph
     ITat                   -> TkGlyph
     ITtilde                -> TkGlyph
-    ITtildehsh             -> TkGlyph
     ITdarrow            {} -> TkGlyph
     ITminus                -> TkGlyph
     ITbang                 -> TkGlyph
     ITdot                  -> TkOperator
+    ITstar              {} -> TkOperator
     ITtypeApp              -> TkGlyph
 
     ITbiglam               -> TkGlyph
@@ -408,9 +429,6 @@ inPragma False tok =
     IToptions_prag      {} -> True
     ITinclude_prag      {} -> True
     ITlanguage_prag        -> True
-    ITvect_prag         {} -> True
-    ITvect_scalar_prag  {} -> True
-    ITnovect_prag       {} -> True
     ITminimal_prag      {} -> True
     IToverlappable_prag {} -> True
     IToverlapping_prag  {} -> True

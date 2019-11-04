@@ -6,6 +6,9 @@ dnl
 
 AC_INIT([The Glorious Glasgow Haskell Compilation System], [@ProjectVersion@], [glasgow-haskell-bugs@haskell.org], [ghc-AC_PACKAGE_VERSION])
 
+dnl See /configure.ac for rationale.
+AC_PREREQ([2.69])
+
 dnl--------------------------------------------------------------------
 dnl * Deal with arguments telling us gmp is somewhere odd
 dnl--------------------------------------------------------------------
@@ -184,6 +187,8 @@ dnl ** how to invoke `ar' and `ranlib'
 #
 FP_PROG_AR_SUPPORTS_ATFILE
 FP_PROG_AR_NEEDS_RANLIB
+RanlibCmd="$RANLIB"
+AC_SUBST([RanlibCmd])
 
 dnl ** Have libdw?
 dnl --------------------------------------------------------------

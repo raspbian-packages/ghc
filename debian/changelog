@@ -1,11 +1,84 @@
-ghc (8.4.4+dfsg1-3+rpi1) buster-staging; urgency=medium
+ghc (8.8.1+dfsg1+is+8.6.5+dfsg1-2+rpi1) bullseye-staging; urgency=medium
 
   [changes brought forward from 7.6.3-21+rpi1 by Peter Michael Green <plugwash@raspbian.org> at Sun, 19 Apr 2015 14:00:16 +0000]
   * Change compiler defaults for armv6
   [changed introduced in 7.10.3-2+rpi1 by Peter Michael Green]
   * Add call to dh_autoreconf_clean
 
- -- Raspbian forward porter <root@raspbian.org>  Thu, 27 Jun 2019 10:56:09 +0000
+ -- Raspbian forward porter <root@raspbian.org>  Mon, 04 Nov 2019 06:37:07 +0000
+
+ghc (8.8.1+dfsg1+is+8.6.5+dfsg1-2) unstable; urgency=medium
+
+  [ John Paul Adrian Glaubitz ]
+  * Enable workaround to avoid memory exhaustation on alpha
+  [ Gianfranco Costamagna ]
+  * Source-only reupload now that the bootstrap has ended
+
+ -- Gianfranco Costamagna <locutusofborg@debian.org>  Sat, 21 Sep 2019 12:06:31 +0200
+
+ghc (8.8.1+dfsg1+is+8.6.5+dfsg1-1) unstable; urgency=medium
+
+  [ John Paul Adrian Glaubitz ]
+  * Enable workaround to avoid memory exhaustation on m68k and sh4
+  [ Gianfranco Costamagna ]
+  * 8.8.1+dfsg1-1~exp4 was mistakenly targeted to unstable.
+    - use 8.6.5 repacked tarball to fix the issue
+
+ -- Gianfranco Costamagna <locutusofborg@debian.org>  Thu, 12 Sep 2019 08:25:57 +0200
+
+ghc (8.6.5+dfsg1-4) unstable; urgency=medium
+
+  [ John Paul Adrian Glaubitz ]
+  * debian/patches/powerpc-fix-64-bit-comparision.patch
+    - backport upstream patch to fix 64-bit comparision on powerpc
+
+  [ Aurelien Jarno ]
+  * build with -mxgot on mips64el
+
+  [ Ilias Tsitsimpis ]
+  * Use `ggc-min-expand=10` on mips64el and s390x
+  * Avoid virtual memory exhaustion on 32-bit unregisterised architectures
+    (Closes: #933968)
+
+ -- Ilias Tsitsimpis <iliastsi@debian.org>  Sat, 31 Aug 2019 18:01:40 +0300
+
+ghc (8.6.5+dfsg1-3) unstable; urgency=medium
+
+  [ Gianfranco Costamagna ]
+  * debian/patches/Disable-unboxed-arrays.patch
+    - upstream proposed workaround for BE build failures.
+  * use parallel=2 for s390x, mips, mipsel, mips64el builds
+
+  [ Clint Adams ]
+  * Patch from John Paul Adrian Glaubitz to set --host and --build for
+    cross-builds.  closes: #933306.
+
+ -- Gianfranco Costamagna <locutusofborg@debian.org>  Thu, 01 Aug 2019 12:56:23 +0200
+
+ghc (8.6.5+dfsg1-2) unstable; urgency=medium
+
+  [ Ilias Tsitsimpis ]
+  * Use ghc-8.4 as the bootstrap compiler and drop the
+    fix-build-using-unregisterized-v8.2 patch (Closes: #921579)
+  * Allow unregisterised ghc-8.4 to build newer GHC (Closes: #932941)
+  * Re-add upstream patches (which were lost during packaging of the latest
+    release) to support risc* platforms. Thanks to Aurelien Jarno for
+    reporting this (Closes: #933009)
+  * Backport upstream patch to fix a bug where an unregisterised GHC failed to
+    compile some libraries (e.g., gloss, juicypixels) on 64-bit architectures.
+  * Add powerpc to ld.bfd linker architectures (Closes: #913878)
+
+  [ Clint Adams ]
+  * Bump to Standards-Version 4.4.0.
+
+ -- Clint Adams <clint@debian.org>  Sun, 28 Jul 2019 16:51:48 -0400
+
+ghc (8.6.5+dfsg1-1) unstable; urgency=medium
+
+  [ Gianfranco Costamagna ]
+  * New upstream release
+
+ -- Clint Adams <clint@debian.org>  Tue, 23 Jul 2019 22:08:57 -0400
 
 ghc (8.4.4+dfsg1-3) unstable; urgency=medium
 

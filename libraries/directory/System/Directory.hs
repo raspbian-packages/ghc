@@ -1,6 +1,6 @@
 {-# LANGUAGE CPP #-}
 
-#if !(MIN_VERSION_base(4,8,0))
+#if !MIN_VERSION_base(4, 8, 0)
 -- In base-4.8.0 the Foreign module became Safe
 {-# LANGUAGE Trustworthy #-}
 #endif
@@ -19,7 +19,6 @@
 --
 -----------------------------------------------------------------------------
 
-#include <HsDirectoryConfig.h>
 module System.Directory
    (
     -- $intro
@@ -42,6 +41,8 @@ module System.Directory
     , getHomeDirectory
     , XdgDirectory(..)
     , getXdgDirectory
+    , XdgDirectoryList(..)
+    , getXdgDirectoryList
     , getAppUserDataDirectory
     , getUserDocumentsDirectory
     , getTemporaryDirectory
@@ -113,15 +114,20 @@ import Prelude ()
 import System.Directory.Internal
 import System.Directory.Internal.Prelude
 import System.FilePath
+  ( (<.>)
+  , (</>)
+  , addTrailingPathSeparator
+  , dropTrailingPathSeparator
+  , hasTrailingPathSeparator
+  , isAbsolute
+  , joinPath
+  , makeRelative
+  , normalise
+  , splitDirectories
+  , takeDirectory
+  )
 import Data.Time (UTCTime)
-import Data.Time.Clock.POSIX (POSIXTime, utcTimeToPOSIXSeconds)
-import qualified System.Directory.Internal.Config as Cfg
-#ifdef mingw32_HOST_OS
-import qualified System.Win32 as Win32
-#else
-import qualified GHC.Foreign as GHC
-import qualified System.Posix as Posix
-#endif
+import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
 
 {- $intro
 A directory contains a series of entries, each of which is a named
@@ -138,28 +144,6 @@ normally at least one absolute path to each file system object.  In
 some operating systems, it may also be possible to have paths which
 are relative to the current directory.
 -}
-
--- | A generator with side-effects.
-newtype ListT m a = ListT (m (Maybe (a, ListT m a)))
-
-listTHead :: Functor m => ListT m a -> m (Maybe a)
-listTHead (ListT m) = (fst <$>) <$> m
-
-listTToList :: Monad m => ListT m a -> m [a]
-listTToList (ListT m) = do
-  mx <- m
-  case mx of
-    Nothing -> return []
-    Just (x, m') -> do
-      xs <- listTToList m'
-      return (x : xs)
-
-andM :: Monad m => m Bool -> m Bool -> m Bool
-andM mx my = do
-  x <- mx
-  if x
-    then my
-    else return x
 
 -----------------------------------------------------------------------------
 -- Permissions
@@ -301,14 +285,7 @@ The path refers to an existing non-directory object.
 -}
 
 createDirectory :: FilePath -> IO ()
-createDirectory path = do
-#ifdef mingw32_HOST_OS
-  (`ioeSetFileName` path) `modifyIOError` do
-    path' <- toExtendedLengthPath <$> prependCurrentDirectory path
-    Win32.createDirectory path' Nothing
-#else
-  Posix.createDirectory path 0o777
-#endif
+createDirectory = createDirectoryInternal
 
 -- | @'createDirectoryIfMissing' parents dir@ creates a new directory
 -- @dir@ if it doesn\'t exist. If the first argument is 'True'
@@ -322,7 +299,7 @@ createDirectoryIfMissing create_parents path0
   where
     parents = reverse . scanl1 (</>) . splitDirectories . normalise
 
-    createDirs []         = return ()
+    createDirs []         = pure ()
     createDirs (dir:[])   = createDir dir ioError
     createDirs (dir:dirs) =
       createDir dir $ \_ -> do
@@ -332,7 +309,7 @@ createDirectoryIfMissing create_parents path0
     createDir dir notExistHandler = do
       r <- tryIOError (createDirectory dir)
       case r of
-        Right ()                   -> return ()
+        Right ()                   -> pure ()
         Left  e
           | isDoesNotExistError  e -> notExistHandler e
           -- createDirectory (and indeed POSIX mkdir) does not distinguish
@@ -352,7 +329,7 @@ createDirectoryIfMissing create_parents path0
          || isPermissionError    e -> do
               canIgnore <- pathIsDirectory dir
                              `catchIOError` \ _ ->
-                               return (isAlreadyExistsError e)
+                               pure (isAlreadyExistsError e)
               unless canIgnore (ioError e)
           | otherwise              -> ioError e
 
@@ -399,14 +376,7 @@ The operand refers to an existing non-directory object.
 -}
 
 removeDirectory :: FilePath -> IO ()
-removeDirectory path =
-#ifdef mingw32_HOST_OS
-  (`ioeSetFileName` path) `modifyIOError` do
-    path' <- toExtendedLengthPath <$> prependCurrentDirectory path
-    Win32.removeDirectory path'
-#else
-  Posix.removeDirectory path
-#endif
+removeDirectory = removePathInternal True
 
 -- | @'removeDirectoryRecursive' dir@ removes an existing directory /dir/
 -- together with its contents and subdirectories. Within this directory,
@@ -445,7 +415,7 @@ removeContentsRecursive :: FilePath -> IO ()
 removeContentsRecursive path =
   (`ioeAddLocation` "removeContentsRecursive") `modifyIOError` do
     cont <- listDirectory path
-    mapM_ removePathRecursive [path </> x | x <- cont]
+    traverse_ removePathRecursive [path </> x | x <- cont]
     removeDirectory path
 
 -- | Removes a file or directory at /path/ together with its contents and
@@ -469,7 +439,7 @@ removeContentsRecursive path =
 removePathForcibly :: FilePath -> IO ()
 removePathForcibly path =
   (`ioeAddLocation` "removePathForcibly") `modifyIOError` do
-    makeRemovable path `catchIOError` \ _ -> return ()
+    makeRemovable path `catchIOError` \ _ -> pure ()
     ignoreDoesNotExistError $ do
       m <- getSymbolicLinkMetadata path
       case fileTypeFromMetadata m of
@@ -483,9 +453,8 @@ removePathForcibly path =
   where
 
     ignoreDoesNotExistError :: IO () -> IO ()
-    ignoreDoesNotExistError action = do
-      _ <- tryIOErrorType isDoesNotExistError action
-      return ()
+    ignoreDoesNotExistError action =
+      () <$ tryIOErrorType isDoesNotExistError action
 
     makeRemovable :: FilePath -> IO ()
     makeRemovable p = do
@@ -493,23 +462,6 @@ removePathForcibly path =
       setPermissions path perms{ readable = True
                                , searchable = True
                                , writable = True }
-
-sequenceWithIOErrors_ :: [IO ()] -> IO ()
-sequenceWithIOErrors_ actions = go (Right ()) actions
-  where
-
-    go :: Either IOError () -> [IO ()] -> IO ()
-    go (Left e)   []       = ioError e
-    go (Right ()) []       = return ()
-    go s          (m : ms) = s `seq` do
-      r <- tryIOError m
-      go (thenEither s r) ms
-
-    -- equivalent to (*>) for Either, defined here to retain compatibility
-    -- with base prior to 4.3
-    thenEither :: Either b a -> Either b a -> Either b a
-    thenEither x@(Left _) _ = x
-    thenEither _          y = y
 
 {- |'removeFile' /file/ removes the directory entry for an existing file
 /file/, where /file/ is not itself a directory. The
@@ -546,14 +498,7 @@ The operand refers to an existing directory.
 -}
 
 removeFile :: FilePath -> IO ()
-removeFile path =
-#ifdef mingw32_HOST_OS
-  (`ioeSetFileName` path) `modifyIOError` do
-    path' <- toExtendedLengthPath <$> prependCurrentDirectory path
-    Win32.deleteFile path'
-#else
-  Posix.removeLink path
-#endif
+removeFile = removePathInternal False
 
 {- |@'renameDirectory' old new@ changes the name of an existing
 directory from /old/ to /new/.  If the /new/ directory
@@ -659,27 +604,26 @@ Either path refers to an existing directory.
 -}
 
 renameFile :: FilePath -> FilePath -> IO ()
-renameFile opath npath = (`ioeAddLocation` "renameFile") `modifyIOError` do
-   -- XXX the tests are not performed atomically with the rename
-   checkNotDir opath
-   renamePath opath npath
-     -- The underlying rename implementation can throw odd exceptions when the
-     -- destination is a directory.  For example, Windows typically throws a
-     -- permission error, while POSIX systems may throw a resource busy error
-     -- if one of the paths refers to the current directory.  In these cases,
-     -- we check if the destination is a directory and, if so, throw an
-     -- InappropriateType error.
-     `catchIOError` \ err -> do
-       checkNotDir npath
-       ioError err
-   where checkNotDir path = do
-           m <- tryIOError (getSymbolicLinkMetadata path)
-           case fileTypeFromMetadata <$> m of
-             Right Directory     -> errIsDir path
-             Right DirectoryLink -> errIsDir path
-             _                   -> return ()
-         errIsDir path = ioError . (`ioeSetErrorString` "is a directory") $
-                         mkIOError InappropriateType "" Nothing (Just path)
+renameFile opath npath =
+  (`ioeAddLocation` "renameFile") `modifyIOError` do
+    -- XXX the tests are not performed atomically with the rename
+    checkNotDir opath
+    renamePath opath npath
+      -- The underlying rename implementation can throw odd exceptions when the
+      -- destination is a directory.  For example, Windows typically throws a
+      -- permission error, while POSIX systems may throw a resource busy error
+      -- if one of the paths refers to the current directory.  In these cases,
+      -- we check if the destination is a directory and, if so, throw an
+      -- InappropriateType error.
+      `catchIOError` \ err -> do
+        checkNotDir npath
+        ioError err
+  where checkNotDir path = do
+          m <- tryIOError (getSymbolicLinkMetadata path)
+          case fileTypeIsDirectory . fileTypeFromMetadata <$> m of
+            Right True -> ioError . (`ioeSetErrorString` "is a directory") $
+                          mkIOError InappropriateType "" Nothing (Just path)
+            _          -> pure ()
 
 -- | Rename a file or directory.  If the destination path already exists, it
 -- is replaced atomically.  The destination path must not point to an existing
@@ -726,19 +670,9 @@ renameFile opath npath = (`ioeAddLocation` "renameFile") `modifyIOError` do
 renamePath :: FilePath                  -- ^ Old path
            -> FilePath                  -- ^ New path
            -> IO ()
-renamePath opath npath = (`ioeAddLocation` "renamePath") `modifyIOError` do
-#ifdef mingw32_HOST_OS
-   (`ioeSetFileName` opath) `modifyIOError` do
-     opath' <- toExtendedLengthPath <$> prependCurrentDirectory opath
-     npath' <- toExtendedLengthPath <$> prependCurrentDirectory npath
-#  if MIN_VERSION_Win32(2,6,0)
-     Win32.moveFileEx opath' (Just npath') Win32.mOVEFILE_REPLACE_EXISTING
-#  else
-     Win32.moveFileEx opath' npath' Win32.mOVEFILE_REPLACE_EXISTING
-#  endif
-#else
-   Posix.rename opath npath
-#endif
+renamePath opath npath =
+  (`ioeAddLocation` "renamePath") `modifyIOError` do
+    renamePathInternal opath npath
 
 -- | Copy a file with its permissions.  If the destination file already exists,
 -- it is replaced atomically.  Neither path may refer to an existing
@@ -751,20 +685,6 @@ copyFile fromFPath toFPath =
   (`ioeAddLocation` "copyFile") `modifyIOError` do
     atomicCopyFileContents fromFPath toFPath
       (ignoreIOExceptions . copyPermissions fromFPath)
-
-#ifndef mingw32_HOST_OS
--- | Truncate the destination file and then copy the contents of the source
--- file to the destination file.  If the destination file already exists, its
--- attributes shall remain unchanged.  Otherwise, its attributes are reset to
--- the defaults.
-copyFileContents :: FilePath            -- ^ Source filename
-                 -> FilePath            -- ^ Destination filename
-                 -> IO ()
-copyFileContents fromFPath toFPath =
-  (`ioeAddLocation` "copyFileContents") `modifyIOError` do
-    withBinaryFile toFPath WriteMode $ \ hTo ->
-      copyFileToHandle fromFPath hTo
-#endif
 
 -- | Copy the contents of a source file to a destination file, replacing the
 -- destination file atomically via 'withReplacementFile', resetting the
@@ -799,36 +719,7 @@ withReplacementFile path postAction action =
         hClose hTmp
         restore (postAction tmpFPath)
         renameFile tmpFPath path
-        return r
-
--- | Attempt to perform the given action, silencing any IO exception thrown by
--- it.
-ignoreIOExceptions :: IO () -> IO ()
-ignoreIOExceptions io = io `catchIOError` (\_ -> return ())
-
--- | Copy all data from a file to a handle.
-copyFileToHandle :: FilePath            -- ^ Source file
-                 -> Handle              -- ^ Destination handle
-                 -> IO ()
-copyFileToHandle fromFPath hTo =
-  (`ioeAddLocation` "copyFileToHandle") `modifyIOError` do
-    withBinaryFile fromFPath ReadMode $ \ hFrom ->
-      copyHandleData hFrom hTo
-
--- | Copy data from one handle to another until end of file.
-copyHandleData :: Handle                -- ^ Source handle
-               -> Handle                -- ^ Destination handle
-               -> IO ()
-copyHandleData hFrom hTo =
-  (`ioeAddLocation` "copyData") `modifyIOError` do
-    allocaBytes bufferSize go
-  where
-    bufferSize = 131072 -- 128 KiB, as coreutils `cp` uses as of May 2014 (see ioblksize.h)
-    go buffer = do
-      count <- hGetBuf hFrom buffer bufferSize
-      when (count > 0) $ do
-        hPutBuf hTo buffer count
-        go buffer
+        pure r
 
 -- | Copy a file with its associated metadata.  If the destination file
 -- already exists, it is overwritten.  There is no guarantee of atomicity in
@@ -852,54 +743,17 @@ copyFileWithMetadata :: FilePath        -- ^ Source file
                      -> FilePath        -- ^ Destination file
                      -> IO ()
 copyFileWithMetadata src dst =
-  (`ioeAddLocation` "copyFileWithMetadata") `modifyIOError` doCopy
-  where
-#ifdef mingw32_HOST_OS
-    doCopy = (`ioeSetFileName` src) `modifyIOError` do
-      src' <- toExtendedLengthPath <$> prependCurrentDirectory src
-      dst' <- toExtendedLengthPath <$> prependCurrentDirectory dst
-      Win32.copyFile src' dst' False
-#else
-    doCopy = do
-      st <- Posix.getFileStatus src
-      copyFileContents src dst
-      copyMetadataFromStatus st dst
-#endif
+  (`ioeAddLocation` "copyFileWithMetadata") `modifyIOError`
+    copyFileWithMetadataInternal copyPermissionsFromMetadata
+                                 copyTimesFromMetadata
+                                 src
+                                 dst
 
-#ifndef mingw32_HOST_OS
-copyMetadataFromStatus :: Posix.FileStatus -> FilePath -> IO ()
-copyMetadataFromStatus st dst = do
-  tryCopyOwnerAndGroupFromStatus st dst
-  copyPermissionsFromMetadata st dst
-  copyFileTimesFromStatus st dst
-#endif
-
-#ifndef mingw32_HOST_OS
-tryCopyOwnerAndGroupFromStatus :: Posix.FileStatus -> FilePath -> IO ()
-tryCopyOwnerAndGroupFromStatus st dst = do
-  ignoreIOExceptions (copyOwnerFromStatus st dst)
-  ignoreIOExceptions (copyGroupFromStatus st dst)
-#endif
-
-#ifndef mingw32_HOST_OS
-copyOwnerFromStatus :: Posix.FileStatus -> FilePath -> IO ()
-copyOwnerFromStatus st dst = do
-  Posix.setOwnerAndGroup dst (Posix.fileOwner st) (-1)
-#endif
-
-#ifndef mingw32_HOST_OS
-copyGroupFromStatus :: Posix.FileStatus -> FilePath -> IO ()
-copyGroupFromStatus st dst = do
-  Posix.setOwnerAndGroup dst (-1) (Posix.fileGroup st)
-#endif
-
-#ifndef mingw32_HOST_OS
-copyFileTimesFromStatus :: Posix.FileStatus -> FilePath -> IO ()
-copyFileTimesFromStatus st dst = do
+copyTimesFromMetadata :: Metadata -> FilePath -> IO ()
+copyTimesFromMetadata st dst = do
   let atime = accessTimeFromMetadata st
   let mtime = modificationTimeFromMetadata st
   setFileTimes dst (Just atime, Just mtime)
-#endif
 
 -- | Make a path absolute, 'normalise' the path, and remove as many
 -- indirections from it as possible.  Any trailing path separators are
@@ -966,35 +820,17 @@ copyFileTimesFromStatus st dst = do
 --
 canonicalizePath :: FilePath -> IO FilePath
 canonicalizePath = \ path ->
-  modifyIOError ((`ioeAddLocation` "canonicalizePath") .
-                 (`ioeSetFileName` path)) $
-  -- normalise does more stuff, like upper-casing the drive letter
-  dropTrailingPathSeparator . normalise <$>
-    (transform =<< prependCurrentDirectory path)
+  ((`ioeAddLocation` "canonicalizePath") .
+   (`ioeSetFileName` path)) `modifyIOError` do
+    -- normalise does more stuff, like upper-casing the drive letter
+    dropTrailingPathSeparator . normalise <$>
+      (canonicalizePathWith attemptRealpath =<< prependCurrentDirectory path)
   where
-
-#if defined(mingw32_HOST_OS)
-    transform = attemptRealpath getFinalPathName
-
-    simplify path =
-      (fromExtendedLengthPath <$>
-       Win32.getFullPathName (toExtendedLengthPath path))
-        `catchIOError` \ _ ->
-          return path
-#else
-    transform path = do
-      encoding <- getFileSystemEncoding
-      let realpath path' =
-            GHC.withCString encoding path'
-              (`withRealpath` GHC.peekCString encoding)
-      attemptRealpath realpath path
-
-    simplify = return
-#endif
 
     -- allow up to 64 cycles before giving up
     attemptRealpath realpath =
-      attemptRealpathWith (64 :: Int) Nothing realpath <=< simplify
+      attemptRealpathWith (64 :: Int) Nothing realpath
+      <=< canonicalizePathSimplify
 
     -- n is a counter to make sure we don't run into an infinite loop; we
     -- don't try to do any cycle detection here because an adversary could DoS
@@ -1002,7 +838,7 @@ canonicalizePath = \ path ->
     attemptRealpathWith n mFallback realpath path =
       case mFallback of
         -- too many indirections ... giving up.
-        Just fallback | n <= 0 -> return fallback
+        Just fallback | n <= 0 -> pure fallback
         -- either mFallback == Nothing (first attempt)
         --     or n > 0 (still have some attempts left)
         _ -> realpathPrefix (reverse (zip prefixes suffixes))
@@ -1016,7 +852,7 @@ canonicalizePath = \ path ->
         -- try to call realpath on the largest possible prefix
         realpathPrefix candidates =
           case candidates of
-            [] -> return path
+            [] -> pure path
             (prefix, suffix) : rest -> do
               exist <- doesPathExist prefix
               if not exist
@@ -1038,16 +874,17 @@ canonicalizePath = \ path ->
         -- (this is essentially the fix to #64)
         realpathFurther fallback p suffix =
           case splitDirectories suffix of
-            [] -> return fallback
+            [] -> pure fallback
             next : restSuffix -> do
               -- see if the 'next' segment is a symlink
               mTarget <- tryIOError (getSymbolicLinkTarget (p </> next))
               case mTarget of
-                Left _ -> return fallback
+                Left _ -> pure fallback
                 Right target -> do
                   -- if so, dereference it and restart the whole cycle
                   let mFallback' = Just (fromMaybe fallback mFallback)
-                  path' <- simplify (p </> target </> joinPath restSuffix)
+                  path' <- canonicalizePathSimplify
+                             (p </> target </> joinPath restSuffix)
                   attemptRealpathWith (n - 1) mFallback' realpath path'
 
 -- | Convert a path into an absolute path.  If the given path is relative, the
@@ -1063,9 +900,9 @@ canonicalizePath = \ path ->
 --
 makeAbsolute :: FilePath -> IO FilePath
 makeAbsolute path =
-  modifyIOError ((`ioeAddLocation` "makeAbsolute") .
-                 (`ioeSetFileName` path)) $
-  matchTrailingSeparator path . normalise <$> prependCurrentDirectory path
+  ((`ioeAddLocation` "makeAbsolute") .
+   (`ioeSetFileName` path)) `modifyIOError` do
+    matchTrailingSeparator path . normalise <$> prependCurrentDirectory path
 
 -- | Add or remove the trailing path separator in the second path so as to
 -- match its presence in the first path.
@@ -1082,8 +919,7 @@ matchTrailingSeparator path
 -- The operation may fail with the same exceptions as 'getCurrentDirectory'.
 makeRelativeToCurrentDirectory :: FilePath -> IO FilePath
 makeRelativeToCurrentDirectory x = do
-    cur <- getCurrentDirectory
-    return $ makeRelative cur x
+  (`makeRelative` x) <$> getCurrentDirectory
 
 -- | Given the name or path of an executable file, 'findExecutable' searches
 -- for such a file in a list of system-defined locations, which generally
@@ -1108,17 +944,9 @@ makeRelativeToCurrentDirectory x = do
 -- testing each file for executable permissions.  Details can be found in the
 -- documentation of 'findFileWith'.
 findExecutable :: String -> IO (Maybe FilePath)
-findExecutable binary = do
-#if defined(mingw32_HOST_OS)
-#  if MIN_VERSION_Win32(2,6,0)
-    Win32.searchPath Nothing binary (Just exeExtension)
-#  else
-    Win32.searchPath Nothing binary exeExtension
-# endif
-#else
-    path <- getPath
-    findFileWith isExecutable path (binary <.> exeExtension)
-#endif
+findExecutable binary =
+  listTHead
+    (findExecutablesLazyInternal findExecutablesInDirectoriesLazy binary)
 
 -- | Search for executable files in a list of system-defined locations, which
 -- generally includes @PATH@ and possibly more.
@@ -1133,22 +961,9 @@ findExecutable binary = do
 --
 -- @since 1.2.2.0
 findExecutables :: String -> IO [FilePath]
-findExecutables binary = do
-#if defined(mingw32_HOST_OS)
-    file <- findExecutable binary
-    return $ maybeToList file
-#else
-    path <- getPath
-    findExecutablesInDirectories path binary
-#endif
-
-#ifndef mingw32_HOST_OS
--- | Get the contents of the @PATH@ environment variable.
-getPath :: IO [FilePath]
-getPath = do
-    path <- getEnv "PATH"
-    return (splitSearchPath path)
-#endif
+findExecutables binary =
+  listTToList
+    (findExecutablesLazyInternal findExecutablesInDirectoriesLazy binary)
 
 -- | Given a name or path, 'findExecutable' appends the 'exeExtension' to the
 -- query and searches for executable files in the list of given search
@@ -1165,20 +980,22 @@ getPath = do
 -- @since 1.2.4.0
 findExecutablesInDirectories :: [FilePath] -> String -> IO [FilePath]
 findExecutablesInDirectories path binary =
-    findFilesWith isExecutable path (binary <.> exeExtension)
+  listTToList (findExecutablesInDirectoriesLazy path binary)
+
+findExecutablesInDirectoriesLazy :: [FilePath] -> String -> ListT IO FilePath
+findExecutablesInDirectoriesLazy path binary =
+  findFilesWithLazy isExecutable path (binary <.> exeExtension)
 
 -- | Test whether a file has executable permissions.
 isExecutable :: FilePath -> IO Bool
-isExecutable file = do
-    perms <- getPermissions file
-    return (executable perms)
+isExecutable file = executable <$> getPermissions file
 
 -- | Search through the given list of directories for the given file.
 --
 -- The behavior is equivalent to 'findFileWith', returning only the first
 -- occurrence.  Details can be found in the documentation of 'findFileWith'.
 findFile :: [FilePath] -> String -> IO (Maybe FilePath)
-findFile = findFileWith (\_ -> return True)
+findFile = findFileWith (\ _ -> pure True)
 
 -- | Search through the given list of directories for the given file and
 -- returns all paths where the given file exists.
@@ -1188,7 +1005,7 @@ findFile = findFileWith (\_ -> return True)
 --
 -- @since 1.2.1.0
 findFiles :: [FilePath] -> String -> IO [FilePath]
-findFiles = findFilesWith (\_ -> return True)
+findFiles = findFilesWith (\ _ -> pure True)
 
 -- | Search through a given list of directories for a file that has the given
 -- name and satisfies the given predicate and return the path of the first
@@ -1233,12 +1050,12 @@ findFilesWithLazy f dirs path
 
   where
 
-    find []       = return Nothing
+    find []       = pure Nothing
     find (d : ds) = do
       let p = d </> path
       found <- doesFileExist p `andM` f p
       if found
-        then return (Just (p, ListT (find ds)))
+        then pure (Just (p, ListT (find ds)))
         else find ds
 
 -- | Filename extension for executable files (including the dot if any)
@@ -1246,7 +1063,7 @@ findFilesWithLazy f dirs path
 --
 -- @since 1.2.4.0
 exeExtension :: String
-exeExtension = Cfg.exeExtension
+exeExtension = exeExtensionInternal
 
 -- | Similar to 'listDirectory', but always includes the special entries (@.@
 -- and @..@).  (This applies to Windows as well.)
@@ -1254,40 +1071,9 @@ exeExtension = Cfg.exeExtension
 -- The operation may fail with the same exceptions as 'listDirectory'.
 getDirectoryContents :: FilePath -> IO [FilePath]
 getDirectoryContents path =
-  modifyIOError ((`ioeSetFileName` path) .
-                 (`ioeAddLocation` "getDirectoryContents")) $ do
-#ifndef mingw32_HOST_OS
-    bracket
-      (Posix.openDirStream path)
-      Posix.closeDirStream
-      start
- where
-  start dirp =
-      loop id
-    where
-      loop acc = do
-        e <- Posix.readDirStream dirp
-        if null e
-          then return (acc [])
-          else loop (acc . (e:))
-#else
-  query <- toExtendedLengthPath <$> prependCurrentDirectory (path </> "*")
-  bracket
-     (Win32.findFirstFile query)
-     (\(h,_) -> Win32.findClose h)
-     (\(h,fdat) -> loop h fdat [])
-  where
-        -- we needn't worry about empty directories: adirectory always
-        -- has at least "." and ".." entries
-    loop :: Win32.HANDLE -> Win32.FindData -> [FilePath] -> IO [FilePath]
-    loop h fdat acc = do
-       filename <- Win32.getFindDataFileName fdat
-       more <- Win32.findNextFile h fdat
-       if more
-          then loop h fdat (filename:acc)
-          else return (filename:acc)
-                 -- no need to reverse, ordering is undefined
-#endif /* mingw32 */
+  ((`ioeSetFileName` path) .
+   (`ioeAddLocation` "getDirectoryContents")) `modifyIOError` do
+    getDirectoryContentsInternal path
 
 -- | @'listDirectory' dir@ returns a list of /all/ entries in /dir/ without
 -- the special entries (@.@ and @..@).
@@ -1321,9 +1107,43 @@ getDirectoryContents path =
 -- @since 1.2.5.0
 --
 listDirectory :: FilePath -> IO [FilePath]
-listDirectory path =
-  (filter f) <$> (getDirectoryContents path)
+listDirectory path = filter f <$> getDirectoryContents path
   where f filename = filename /= "." && filename /= ".."
+
+-- | Obtain the current working directory as an absolute path.
+--
+-- In a multithreaded program, the current working directory is a global state
+-- shared among all threads of the process.  Therefore, when performing
+-- filesystem operations from multiple threads, it is highly recommended to
+-- use absolute rather than relative paths (see: 'makeAbsolute').
+--
+-- The operation may fail with:
+--
+-- * 'HardwareFault'
+-- A physical I\/O error has occurred.
+-- @[EIO]@
+--
+-- * 'isDoesNotExistError' or 'NoSuchThing'
+-- There is no path referring to the working directory.
+-- @[EPERM, ENOENT, ESTALE...]@
+--
+-- * 'isPermissionError' or 'PermissionDenied'
+-- The process has insufficient privileges to perform the operation.
+-- @[EACCES]@
+--
+-- * 'ResourceExhausted'
+-- Insufficient resources are available to perform the operation.
+--
+-- * 'UnsupportedOperation'
+-- The operating system has no notion of current working directory.
+--
+getCurrentDirectory :: IO FilePath
+getCurrentDirectory =
+  (`ioeAddLocation` "getCurrentDirectory") `modifyIOError` do
+    specializeErrorString
+      "Current working directory no longer exists"
+      isDoesNotExistError
+      getCurrentDirectoryInternal
 
 -- | Change the working directory to the given path.
 --
@@ -1359,14 +1179,7 @@ listDirectory path =
 -- @[ENOTDIR]@
 --
 setCurrentDirectory :: FilePath -> IO ()
-setCurrentDirectory path = do
-#ifdef mingw32_HOST_OS
-  -- SetCurrentDirectory does not support long paths even with the \\?\ prefix
-  -- https://ghc.haskell.org/trac/ghc/ticket/13373#comment:6
-  Win32.setCurrentDirectory path
-#else
-  Posix.changeWorkingDirectory path
-#endif
+setCurrentDirectory = setCurrentDirectoryInternal
 
 -- | Run an 'IO' action with the given working directory and restore the
 -- original working directory afterwards, even if the given action fails due
@@ -1402,7 +1215,7 @@ doesPathExist :: FilePath -> IO Bool
 doesPathExist path = do
   (True <$ getFileMetadata path)
     `catchIOError` \ _ ->
-      return False
+      pure False
 
 {- |The operation 'doesDirectoryExist' returns 'True' if the argument file
 exists and is either a directory or a symbolic link to a directory,
@@ -1413,7 +1226,7 @@ doesDirectoryExist :: FilePath -> IO Bool
 doesDirectoryExist path = do
   pathIsDirectory path
     `catchIOError` \ _ ->
-      return False
+      pure False
 
 {- |The operation 'doesFileExist' returns 'True'
 if the argument file exists and is not a directory, and 'False' otherwise.
@@ -1423,15 +1236,12 @@ doesFileExist :: FilePath -> IO Bool
 doesFileExist path = do
   (not <$> pathIsDirectory path)
     `catchIOError` \ _ ->
-      return False
+      pure False
 
 pathIsDirectory :: FilePath -> IO Bool
-pathIsDirectory path = (`ioeAddLocation` "pathIsDirectory") `modifyIOError` do
-  m <- getFileMetadata path
-  case fileTypeFromMetadata m of
-    Directory     -> return True
-    DirectoryLink -> return True
-    _             -> return False
+pathIsDirectory path =
+  (`ioeAddLocation` "pathIsDirectory") `modifyIOError` do
+    fileTypeIsDirectory . fileTypeFromMetadata <$> getFileMetadata path
 
 -- | Create a /file/ symbolic link.  The target path can be either absolute or
 -- relative and need not refer to an existing file.  The order of arguments
@@ -1444,13 +1254,14 @@ pathIsDirectory path = (`ioeAddLocation` "pathIsDirectory") `modifyIOError` do
 -- intrinsic property of every symbolic link and cannot be changed without
 -- recreating the link.  A file symbolic link that actually points to a
 -- directory will fail to dereference and vice versa.  Moreover, creating
--- symbolic links on Windows requires privileges normally unavailable to users
+-- symbolic links on Windows may require privileges unavailable to users
 -- outside the Administrators group.  Portable programs that use symbolic
 -- links should take both into consideration.
 --
--- On Windows, the function is implemented using @CreateSymbolicLink@ with
--- @dwFlags@ set to zero.  On POSIX, the function uses @symlink@ and
--- is therefore atomic.
+-- On Windows, the function is implemented using @CreateSymbolicLink@.  Since
+-- 1.3.3.0, the @SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE@ flag is included
+-- if supported by the operating system.  On POSIX, the function uses @symlink@
+-- and is therefore atomic.
 --
 -- Windows-specific errors: This operation may fail with 'permissionErrorType'
 -- if the user lacks the privileges to create symbolic links.  It may also
@@ -1464,11 +1275,7 @@ createFileLink
   -> IO ()
 createFileLink target link =
   (`ioeAddLocation` "createFileLink") `modifyIOError` do
-#ifdef mingw32_HOST_OS
     createSymbolicLink False target link
-#else
-    Posix.createSymbolicLink target link
-#endif
 
 -- | Create a /directory/ symbolic link.  The target path can be either
 -- absolute or relative and need not refer to an existing directory.  The
@@ -1481,13 +1288,15 @@ createFileLink target link =
 -- intrinsic property of every symbolic link and cannot be changed without
 -- recreating the link.  A file symbolic link that actually points to a
 -- directory will fail to dereference and vice versa.  Moreover, creating
--- symbolic links on Windows requires privileges normally unavailable to users
+-- symbolic links on Windows may require privileges unavailable to users
 -- outside the Administrators group.  Portable programs that use symbolic
 -- links should take both into consideration.
 --
 -- On Windows, the function is implemented using @CreateSymbolicLink@ with
--- @dwFlags@ set to @SYMBOLIC_LINK_FLAG_DIRECTORY@.  On POSIX, this is an
--- alias for 'createFileLink' and is therefore atomic.
+-- @SYMBOLIC_LINK_FLAG_DIRECTORY@.  Since 1.3.3.0, the
+-- @SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE@ flag is also included if
+-- supported by the operating system.   On POSIX, this is an alias for
+-- 'createFileLink' and is therefore atomic.
 --
 -- Windows-specific errors: This operation may fail with 'permissionErrorType'
 -- if the user lacks the privileges to create symbolic links.  It may also
@@ -1501,11 +1310,7 @@ createDirectoryLink
   -> IO ()
 createDirectoryLink target link =
   (`ioeAddLocation` "createDirectoryLink") `modifyIOError` do
-#ifdef mingw32_HOST_OS
     createSymbolicLink True target link
-#else
-    createFileLink target link
-#endif
 
 -- | Remove an existing /directory/ symbolic link.
 --
@@ -1518,11 +1323,7 @@ createDirectoryLink target link =
 removeDirectoryLink :: FilePath -> IO ()
 removeDirectoryLink path =
   (`ioeAddLocation` "removeDirectoryLink") `modifyIOError` do
-#ifdef mingw32_HOST_OS
-    removeDirectory path
-#else
-    removeFile path
-#endif
+    removePathInternal linkToDirectoryIsDirectory path
 
 -- | Check whether the path refers to a symbolic link.  An exception is thrown
 -- if the path does not exist or is inaccessible.
@@ -1536,12 +1337,7 @@ pathIsSymbolicLink :: FilePath -> IO Bool
 pathIsSymbolicLink path =
   ((`ioeAddLocation` "pathIsSymbolicLink") .
    (`ioeSetFileName` path)) `modifyIOError` do
-    m <- getSymbolicLinkMetadata path
-    return $
-      case fileTypeFromMetadata m of
-        DirectoryLink -> True
-        SymbolicLink  -> True
-        _             -> False
+     fileTypeIsLink . fileTypeFromMetadata <$> getSymbolicLinkMetadata path
 
 {-# DEPRECATED isSymbolicLink "Use 'pathIsSymbolicLink' instead" #-}
 isSymbolicLink :: FilePath -> IO Bool
@@ -1563,23 +1359,7 @@ isSymbolicLink = pathIsSymbolicLink
 getSymbolicLinkTarget :: FilePath -> IO FilePath
 getSymbolicLinkTarget path =
   (`ioeAddLocation` "getSymbolicLinkTarget") `modifyIOError` do
-#ifdef mingw32_HOST_OS
     readSymbolicLink path
-#else
-    Posix.readSymbolicLink path
-#endif
-
-#ifdef mingw32_HOST_OS
--- | Open the handle of an existing file or directory.
-openFileHandle :: String -> Win32.AccessMode -> IO Win32.HANDLE
-openFileHandle path mode =
-  (`ioeSetFileName` path) `modifyIOError` do
-    path' <- toExtendedLengthPath <$> prependCurrentDirectory path
-    Win32.createFile path' mode maxShareMode Nothing
-                     Win32.oPEN_EXISTING flags Nothing
-  where flags =  Win32.fILE_ATTRIBUTE_NORMAL
-             .|. Win32.fILE_FLAG_BACKUP_SEMANTICS -- required for directories
-#endif
 
 -- | Obtain the time at which the file or directory was last accessed.
 --
@@ -1598,7 +1378,7 @@ openFileHandle path mode =
 --
 getAccessTime :: FilePath -> IO UTCTime
 getAccessTime path =
-  modifyIOError (`ioeAddLocation` "getAccessTime") $ do
+  (`ioeAddLocation` "getAccessTime") `modifyIOError` do
     accessTimeFromMetadata <$> getFileMetadata path
 
 -- | Obtain the time at which the file or directory was last modified.
@@ -1616,7 +1396,7 @@ getAccessTime path =
 --
 getModificationTime :: FilePath -> IO UTCTime
 getModificationTime path =
-  modifyIOError (`ioeAddLocation` "getModificationTime") $ do
+  (`ioeAddLocation` "getModificationTime") `modifyIOError` do
     modificationTimeFromMetadata <$> getFileMetadata path
 
 -- | Change the time at which the file or directory was last accessed.
@@ -1644,7 +1424,7 @@ getModificationTime path =
 --
 setAccessTime :: FilePath -> UTCTime -> IO ()
 setAccessTime path atime =
-  modifyIOError (`ioeAddLocation` "setAccessTime") $
+  (`ioeAddLocation` "setAccessTime") `modifyIOError` do
     setFileTimes path (Just atime, Nothing)
 
 -- | Change the time at which the file or directory was last modified.
@@ -1672,54 +1452,16 @@ setAccessTime path atime =
 --
 setModificationTime :: FilePath -> UTCTime -> IO ()
 setModificationTime path mtime =
-  modifyIOError (`ioeAddLocation` "setModificationTime") $
+  (`ioeAddLocation` "setModificationTime") `modifyIOError` do
     setFileTimes path (Nothing, Just mtime)
 
 setFileTimes :: FilePath -> (Maybe UTCTime, Maybe UTCTime) -> IO ()
 setFileTimes _ (Nothing, Nothing) = return ()
 setFileTimes path (atime, mtime) =
-  modifyIOError (`ioeAddLocation` "setFileTimes") .
-  modifyIOError (`ioeSetFileName` path) $
-    setTimes (utcTimeToPOSIXSeconds <$> atime, utcTimeToPOSIXSeconds <$> mtime)
-  where
-    path' = normalise path              -- handle empty paths
-
-    setTimes :: (Maybe POSIXTime, Maybe POSIXTime) -> IO ()
-#ifdef mingw32_HOST_OS
-    setTimes (atime', mtime') =
-      bracket (openFileHandle path' Win32.gENERIC_WRITE)
-              Win32.closeHandle $ \ handle ->
-      maybeWith with (posixToWindowsTime <$> atime') $ \ atime'' ->
-      maybeWith with (posixToWindowsTime <$> mtime') $ \ mtime'' ->
-      Win32.failIf_ not "" $
-        Win32.c_SetFileTime handle nullPtr atime'' mtime''
-#elif defined HAVE_UTIMENSAT
-    setTimes (atime', mtime') =
-      withFilePath path' $ \ path'' ->
-      withArray [ maybe utimeOmit toCTimeSpec atime'
-                , maybe utimeOmit toCTimeSpec mtime' ] $ \ times ->
-      throwErrnoPathIfMinus1_ "" path' $
-        c_utimensat c_AT_FDCWD path'' times 0
-#else
-    setTimes (Just atime', Just mtime') = setFileTimes' path' atime' mtime'
-    setTimes (atime', mtime') = do
-      m <- getFileMetadata path'
-      let atimeOld = accessTimeFromMetadata m
-      let mtimeOld = modificationTimeFromMetadata m
-      setFileTimes' path'
-        (fromMaybe (utcTimeToPOSIXSeconds atimeOld) atime')
-        (fromMaybe (utcTimeToPOSIXSeconds mtimeOld) mtime')
-
-    setFileTimes' :: FilePath -> POSIXTime -> POSIXTime -> IO ()
-# if MIN_VERSION_unix(2, 7, 0)
-    setFileTimes' = Posix.setFileTimesHiRes
-#  else
-    setFileTimes' pth atime' mtime' =
-      Posix.setFileTimes pth
-        (fromInteger (truncate atime'))
-        (fromInteger (truncate mtime'))
-# endif
-#endif
+  ((`ioeAddLocation` "setFileTimes") .
+   (`ioeSetFileName` path)) `modifyIOError` do
+    setTimes (normalise path)           -- handle empty paths
+             (utcTimeToPOSIXSeconds <$> atime, utcTimeToPOSIXSeconds <$> mtime)
 
 {- | Returns the current user's home directory.
 
@@ -1742,46 +1484,9 @@ The home directory for the current user does not exist, or
 cannot be found.
 -}
 getHomeDirectory :: IO FilePath
-getHomeDirectory = modifyIOError (`ioeAddLocation` "getHomeDirectory") get
-  where
-#if defined(mingw32_HOST_OS)
-    get = getFolderPath Win32.cSIDL_PROFILE `catchIOError` \ _ ->
-          getFolderPath Win32.cSIDL_WINDOWS
-    getFolderPath what = Win32.sHGetFolderPath nullPtr what nullPtr 0
-#else
-    get = getEnv "HOME"
-#endif
-
--- | Special directories for storing user-specific application data,
---   configuration, and cache files, as specified by the
---   <http://standards.freedesktop.org/basedir-spec/basedir-spec-latest.html XDG Base Directory Specification>.
---
---   Note: On Windows, 'XdgData' and 'XdgConfig' map to the same directory.
---
---   @since 1.2.3.0
-data XdgDirectory
-  = XdgData
-    -- ^ For data files (e.g. images).
-    --   Defaults to @~\/.local\/share@ and can be
-    --   overridden by the @XDG_DATA_HOME@ environment variable.
-    --   On Windows, it is @%APPDATA%@
-    --   (e.g. @C:\/Users\//\<user\>/\/AppData\/Roaming@).
-    --   Can be considered as the user-specific equivalent of @\/usr\/share@.
-  | XdgConfig
-    -- ^ For configuration files.
-    --   Defaults to @~\/.config@ and can be
-    --   overridden by the @XDG_CONFIG_HOME@ environment variable.
-    --   On Windows, it is @%APPDATA%@
-    --   (e.g. @C:\/Users\//\<user\>/\/AppData\/Roaming@).
-    --   Can be considered as the user-specific equivalent of @\/etc@.
-  | XdgCache
-    -- ^ For non-essential files (e.g. cache).
-    --   Defaults to @~\/.cache@ and can be
-    --   overridden by the @XDG_CACHE_HOME@ environment variable.
-    --   On Windows, it is @%LOCALAPPDATA%@
-    --   (e.g. @C:\/Users\//\<user\>/\/AppData\/Local@).
-    --   Can be considered as the user-specific equivalent of @\/var\/cache@.
-  deriving (Bounded, Enum, Eq, Ord, Read, Show)
+getHomeDirectory =
+  (`ioeAddLocation` "getHomeDirectory") `modifyIOError` do
+    getHomeDirectoryInternal
 
 -- | Obtain the paths to special directories for storing user-specific
 --   application data, configuration, and cache files, conforming to the
@@ -1806,35 +1511,14 @@ getXdgDirectory :: XdgDirectory         -- ^ which special directory
                                         --   path is returned
                 -> IO FilePath
 getXdgDirectory xdgDir suffix =
-  modifyIOError (`ioeAddLocation` "getXdgDirectory") $
-  normalise . (</> suffix) <$>
-  case xdgDir of
-    XdgData   -> get False "XDG_DATA_HOME"   ".local/share"
-    XdgConfig -> get False "XDG_CONFIG_HOME" ".config"
-    XdgCache  -> get True  "XDG_CACHE_HOME"  ".cache"
-  where
-#if defined(mingw32_HOST_OS)
-    get isLocal _ _ = Win32.sHGetFolderPath nullPtr which nullPtr 0
-      where which | isLocal   = win32_cSIDL_LOCAL_APPDATA
-                  | otherwise = Win32.cSIDL_APPDATA
-#else
-    get _ name fallback = do
-      env <- lookupEnv name
-      case env of
-        Nothing                     -> fallback'
-        Just path | isRelative path -> fallback'
-                  | otherwise       -> return path
-      where fallback' = (</> fallback) <$> getHomeDirectory
+  (`ioeAddLocation` "getXdgDirectory") `modifyIOError` do
+    normalise . (</> suffix) <$> getXdgDirectoryInternal getHomeDirectory xdgDir
 
--- | Return the value of an environment variable, or 'Nothing' if there is no
---   such value.  (Equivalent to "lookupEnv" from base-4.6.)
-lookupEnv :: String -> IO (Maybe String)
-lookupEnv name = do
-  env <- tryIOErrorType isDoesNotExistError (getEnv name)
-  case env of
-    Left  _     -> return Nothing
-    Right value -> return (Just value)
-#endif
+getXdgDirectoryList :: XdgDirectoryList -- ^ which special directory list
+                    -> IO [FilePath]
+getXdgDirectoryList xdgDirs =
+  (`ioeAddLocation` "getXdgDirectoryList") `modifyIOError` do
+    getXdgDirectoryListInternal xdgDirs
 
 -- | Obtain the path to a special directory for storing user-specific
 --   application data (traditional Unix location).  Newer applications may
@@ -1866,14 +1550,8 @@ getAppUserDataDirectory :: FilePath     -- ^ a relative path that is appended
                                         --   to the path
                         -> IO FilePath
 getAppUserDataDirectory appName = do
-  modifyIOError (`ioeAddLocation` "getAppUserDataDirectory") $ do
-#if defined(mingw32_HOST_OS)
-    s <- Win32.sHGetFolderPath nullPtr Win32.cSIDL_APPDATA nullPtr 0
-    return (s++'\\':appName)
-#else
-    path <- getEnv "HOME"
-    return (path++'/':'.':appName)
-#endif
+  (`ioeAddLocation` "getAppUserDataDirectory") `modifyIOError` do
+    getAppUserDataDirectoryInternal appName
 
 {- | Returns the current user's document directory.
 
@@ -1897,12 +1575,8 @@ cannot be found.
 -}
 getUserDocumentsDirectory :: IO FilePath
 getUserDocumentsDirectory = do
-  modifyIOError (`ioeAddLocation` "getUserDocumentsDirectory") $ do
-#if defined(mingw32_HOST_OS)
-    Win32.sHGetFolderPath nullPtr Win32.cSIDL_PERSONAL nullPtr 0
-#else
-    getEnv "HOME"
-#endif
+  (`ioeAddLocation` "getUserDocumentsDirectory") `modifyIOError` do
+    getUserDocumentsDirectoryInternal
 
 {- | Returns the current directory for temporary files.
 
@@ -1931,10 +1605,4 @@ The operating system has no notion of temporary directory.
 The function doesn\'t verify whether the path exists.
 -}
 getTemporaryDirectory :: IO FilePath
-getTemporaryDirectory =
-#if defined(mingw32_HOST_OS)
-  Win32.getTemporaryDirectory
-#else
-  getEnv "TMPDIR" `catchIOError` \ err ->
-  if isDoesNotExistError err then return "/tmp" else ioError err
-#endif
+getTemporaryDirectory = getTemporaryDirectoryInternal

@@ -39,6 +39,8 @@ the following:
 
 -  A ``data`` declaration,
 
+-  A ``pattern`` declaration,
+
 -  A ``newtype`` declaration,
 
 -  A ``type`` declaration
@@ -118,6 +120,15 @@ Constructors are documented like so: ::
 or like this: ::
 
     data T a b
+      = C1   -- ^ This is the documentation for the 'C1' constructor
+          a  -- ^ This is the documentation for the argument of type 'a'
+          b  -- ^ This is the documentation for the argument of type 'b'
+
+There is one edge case that is handled differently: only one ``-- ^``
+annotation occuring after the constructor and all its arguments is
+applied to the constructor, not its last argument: ::
+
+    data T a b
       = C1 a b  -- ^ This is the documentation for the 'C1' constructor
       | C2 a b  -- ^ This is the documentation for the 'C2' constructor
 
@@ -163,6 +174,9 @@ Individual arguments to a function may be documented like this: ::
     f  :: Int      -- ^ The 'Int' argument
        -> Float    -- ^ The 'Float' argument
        -> IO ()    -- ^ The return value
+
+Pattern synonyms and GADT-style data constructors also support this
+style of documentation.
 
 .. _module-description:
 
@@ -762,14 +776,14 @@ Special Characters
 ~~~~~~~~~~~~~~~~~~
 
 The following characters have special meanings in documentation
-comments: ``\\``, ``/``, ``'``, ``\```, ``"``, ``@``, ``<``, ``$``. To insert a
+comments: ``\``, ``/``, ``'``, `````, ``"``, ``@``, ``<``, ``$``, ``#``. To insert a
 literal occurrence of one of these special characters, precede it with a
-backslash (``\\``).
+backslash (``\``).
 
 Additionally, the character ``>`` has a special meaning at the beginning
 of a line, and the following characters have special meanings at the
 beginning of a paragraph: ``*``, ``-``. These characters can also be
-escaped using ``\\``.
+escaped using ``\``.
 
 Furthermore, the character sequence ``>>>`` has a special meaning at the
 beginning of a line. To escape it, just prefix the characters in the
@@ -845,9 +859,12 @@ Hyperlinked Identifiers
 ~~~~~~~~~~~~~~~~~~~~~~~
 
 Referring to a Haskell identifier, whether it be a type, class,
-constructor, or function, is done by surrounding it with single quotes: ::
+constructor, or function, is done by surrounding it with a combination
+of single quotes and backticks. For example: ::
 
     -- | This module defines the type 'T'.
+
+```T``` is also ok. ``'T``` and ```T'`` are accepted but less common.
 
 If there is an entity ``T`` in scope in the current module, then the
 documentation will hyperlink the reference in the text to the definition
@@ -875,14 +892,6 @@ Nothing special is needed to hyperlink identifiers which contain
 apostrophes themselves: to hyperlink ``foo'`` one would simply type
 ``'foo''``. To hyperlink identifiers written in infix form, simply put
 them in quotes as always: ``'`elem`'``.
-
-For compatibility with other systems, the following alternative form of
-markup is accepted [3]_: ```T'``.
-
-.. [3]
-   We chose not to use this as the primary markup for identifiers
-   because strictly speaking the ````` character should not be used as a
-   left quote, it is a grave accent.
 
 Emphasis, Bold and Monospaced Text
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

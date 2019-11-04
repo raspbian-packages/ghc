@@ -60,11 +60,15 @@ import           Distribution.Client.JobControl
 import           Distribution.Client.FetchUtils
 import           Distribution.Client.GlobalFlags (RepoContext)
 import qualified Distribution.Client.Tar as Tar
-import           Distribution.Client.Setup (filterConfigureFlags)
+import           Distribution.Client.Setup
+                   ( filterConfigureFlags, filterHaddockArgs
+                   , filterHaddockFlags )
 import           Distribution.Client.SourceFiles
 import           Distribution.Client.SrcDist (allPackageSourceFiles)
-import           Distribution.Client.Utils (removeExistingFile)
+import           Distribution.Client.Utils
+                   ( ProgressPhase(..), progressMessage, removeExistingFile )
 
+import           Distribution.Compat.Lens
 import           Distribution.Package hiding (InstalledPackageId, installedPackageId)
 import qualified Distribution.PackageDescription as PD
 import           Distribution.InstalledPackageInfo (InstalledPackageInfo)
@@ -72,15 +76,16 @@ import qualified Distribution.InstalledPackageInfo as Installed
 import           Distribution.Simple.BuildPaths (haddockDirName)
 import qualified Distribution.Simple.InstallDirs as InstallDirs
 import           Distribution.Types.BuildType
+import           Distribution.Types.PackageDescription.Lens (componentModules)
 import           Distribution.Simple.Program
 import qualified Distribution.Simple.Setup as Cabal
 import           Distribution.Simple.Command (CommandUI)
 import qualified Distribution.Simple.Register as Cabal
-import           Distribution.Simple.LocalBuildInfo (ComponentName)
+import           Distribution.Simple.LocalBuildInfo (ComponentName(..))
 import           Distribution.Simple.Compiler
                    ( Compiler, compilerId, PackageDB(..) )
 
-import           Distribution.Simple.Utils hiding (matchFileGlob)
+import           Distribution.Simple.Utils
 import           Distribution.Version
 import           Distribution.Verbosity
 import           Distribution.Text
@@ -96,6 +101,7 @@ import           Data.List (isPrefixOf)
 
 import           Control.Monad
 import           Control.Exception
+import           Data.Function (on)
 import           Data.Maybe
 
 import           System.FilePath
@@ -203,6 +209,11 @@ rebuildTargetsDryRun distDirLayout@DistDirLayout{..} shared =
           -- artifacts under the shared dist directory.
           dryRunLocalPkg pkg depsBuildStatus srcdir
 
+        Just (RemoteSourceRepoPackage _repo srcdir) ->
+          -- At this point, source repos are essentially the same as local
+          -- dirs, since we've already download them.
+          dryRunLocalPkg pkg depsBuildStatus srcdir
+
         -- The three tarball cases are handled the same as each other,
         -- though depending on the build style.
         Just (LocalTarballPackage    tarball) ->
@@ -249,7 +260,7 @@ rebuildTargetsDryRun distDirLayout@DistDirLayout{..} shared =
             return (BuildStatusUpToDate buildResult)
       where
         packageFileMonitor =
-          newPackageFileMonitor distDirLayout (elabDistDirParams shared pkg)
+          newPackageFileMonitor shared distDirLayout (elabDistDirParams shared pkg)
 
 
 -- | A specialised traversal over the packages in an install plan.
@@ -328,11 +339,20 @@ data PackageFileMonitor = PackageFileMonitor {
 --
 type BuildResultMisc = (DocsResult, TestsResult)
 
-newPackageFileMonitor :: DistDirLayout -> DistDirParams -> PackageFileMonitor
-newPackageFileMonitor DistDirLayout{distPackageCacheFile} dparams =
+newPackageFileMonitor :: ElaboratedSharedConfig
+                      -> DistDirLayout
+                      -> DistDirParams
+                      -> PackageFileMonitor
+newPackageFileMonitor shared
+                      DistDirLayout{distPackageCacheFile}
+                      dparams =
     PackageFileMonitor {
       pkgFileMonitorConfig =
-        newFileMonitor (distPackageCacheFile dparams "config"),
+        FileMonitor {
+          fileMonitorCacheFile = distPackageCacheFile dparams "config",
+          fileMonitorKeyValid = (==) `on` normaliseConfiguredPackage shared,
+          fileMonitorCheckIfOnlyValueChanged = False
+        },
 
       pkgFileMonitorBuild =
         FileMonitor {
@@ -366,11 +386,12 @@ packageFileMonitorKeyValues elab =
     --
     elab_config =
         elab {
-            elabBuildTargets  = [],
-            elabTestTargets   = [],
+            elabBuildTargets   = [],
+            elabTestTargets    = [],
             elabBenchTargets   = [],
-            elabReplTarget    = Nothing,
-            elabBuildHaddocks = False
+            elabReplTarget     = Nothing,
+            elabHaddockTargets = [],
+            elabBuildHaddocks  = False
         }
 
     -- The second part is the value used to guard the build step. So this is
@@ -919,32 +940,26 @@ buildAndInstallUnpackedPackage verbosity
     --TODO: [required feature] docs and tests
     --TODO: [required feature] sudo re-exec
 
-    let dispname = case elabPkgOrComp pkg of
-            ElabPackage _ -> display pkgid
-                ++ " (all, legacy fallback)"
-            ElabComponent comp -> display pkgid
-                ++ " (" ++ maybe "custom" display (compComponentName comp) ++ ")"
-
     -- Configure phase
-    when isParallelBuild $
-      notice verbosity $ "Configuring " ++ dispname ++ "..."
+    noticeProgress ProgressStarting
+
     annotateFailure mlogFile ConfigureFailed $
       setup' configureCommand configureFlags configureArgs
 
     -- Build phase
-    when isParallelBuild $
-      notice verbosity $ "Building " ++ dispname ++ "..."
+    noticeProgress ProgressBuilding
+
     annotateFailure mlogFile BuildFailed $
       setup buildCommand buildFlags
 
     -- Haddock phase
     whenHaddock $ do
-      when isParallelBuild $
-        notice verbosity $ "Generating " ++ dispname ++ " documentation..."
+      noticeProgress ProgressHaddock
       annotateFailureNoLog HaddocksFailed $
         setup haddockCommand haddockFlags
 
     -- Install phase
+    noticeProgress ProgressInstalling
     annotateFailure mlogFile InstallFailed $ do
 
       let copyPkgFiles tmpDir = do
@@ -1017,6 +1032,8 @@ buildAndInstallUnpackedPackage verbosity
     let docsResult  = DocsNotTried
         testsResult = TestsNotTried
 
+    noticeProgress ProgressCompleted
+
     return BuildResult {
        buildResultDocs    = docsResult,
        buildResultTests   = testsResult,
@@ -1028,17 +1045,26 @@ buildAndInstallUnpackedPackage verbosity
     uid    = installedUnitId rpkg
     compid = compilerId compiler
 
+    dispname = case elabPkgOrComp pkg of
+        ElabPackage _ -> display pkgid
+            ++ " (all, legacy fallback)"
+        ElabComponent comp -> display pkgid
+            ++ " (" ++ maybe "custom" display (compComponentName comp) ++ ")"
+
+    noticeProgress phase = when isParallelBuild $
+        progressMessage verbosity phase dispname
+
     isParallelBuild = buildSettingNumJobs >= 2
 
     whenHaddock action
-      | elabBuildHaddocks pkg = action
-      | otherwise             = return ()
+      | hasValidHaddockTargets pkg = action
+      | otherwise                  = return ()
 
     configureCommand = Cabal.configureCommand defaultProgramDb
     configureFlags v = flip filterConfigureFlags v $
                        setupHsConfigureFlags rpkg pkgshared
                                              verbosity builddir
-    configureArgs    = setupHsConfigureArgs pkg
+    configureArgs _  = setupHsConfigureArgs pkg
 
     buildCommand     = Cabal.buildCommand defaultProgramDb
     buildFlags   _   = setupHsBuildFlags pkg pkgshared verbosity builddir
@@ -1064,9 +1090,9 @@ buildAndInstallUnpackedPackage verbosity
                                          isParallelBuild cacheLock
 
     setup :: CommandUI flags -> (Version -> flags) -> IO ()
-    setup cmd flags = setup' cmd flags []
+    setup cmd flags = setup' cmd flags (const [])
 
-    setup' :: CommandUI flags -> (Version -> flags) -> [String] -> IO ()
+    setup' :: CommandUI flags -> (Version -> flags) -> (Version -> [String]) -> IO ()
     setup' cmd flags args =
       withLogging $ \mLogFileHandle ->
         setupWrapper
@@ -1095,6 +1121,27 @@ buildAndInstallUnpackedPackage verbosity
       case mlogFile of
         Nothing      -> action Nothing
         Just logFile -> withFile logFile AppendMode (action . Just)
+
+
+hasValidHaddockTargets :: ElaboratedConfiguredPackage -> Bool
+hasValidHaddockTargets ElaboratedConfiguredPackage{..}
+  | not elabBuildHaddocks = False
+  | otherwise             = any componentHasHaddocks components
+  where
+    components = elabBuildTargets ++ elabTestTargets ++ elabBenchTargets
+              ++ maybeToList elabReplTarget ++ elabHaddockTargets
+
+    componentHasHaddocks :: ComponentTarget -> Bool
+    componentHasHaddocks (ComponentTarget name _) =
+      case name of
+        CLibName      -> hasHaddocks
+        CSubLibName _ -> elabHaddockInternal    && hasHaddocks
+        CFLibName   _ -> elabHaddockForeignLibs && hasHaddocks
+        CExeName    _ -> elabHaddockExecutables && hasHaddocks
+        CTestName   _ -> elabHaddockTestSuites  && hasHaddocks
+        CBenchName  _ -> elabHaddockBenchmarks  && hasHaddocks
+      where
+        hasHaddocks = not (null (elabPkgDescription ^. componentModules name))
 
 
 buildInplaceUnpackedPackage :: Verbosity
@@ -1220,7 +1267,7 @@ buildInplaceUnpackedPackage verbosity
         -- Haddock phase
         whenHaddock $
           annotateFailureNoLog HaddocksFailed $ do
-            setup haddockCommand haddockFlags []
+            setup haddockCommand haddockFlags haddockArgs
             let haddockTarget = elabHaddockForHackage pkg
             when (haddockTarget == Cabal.ForHackage) $ do
               let dest = distDirectory </> name <.> "tar.gz"
@@ -1241,7 +1288,7 @@ buildInplaceUnpackedPackage verbosity
 
     isParallelBuild = buildSettingNumJobs >= 2
 
-    packageFileMonitor = newPackageFileMonitor distDirLayout dparams
+    packageFileMonitor = newPackageFileMonitor pkgshared distDirLayout dparams
 
     whenReConfigure action = case buildStatus of
       BuildStatusConfigure _ -> action
@@ -1267,8 +1314,8 @@ buildInplaceUnpackedPackage verbosity
       | otherwise                     = action
 
     whenHaddock action
-      | elabBuildHaddocks pkg = action
-      | otherwise            = return ()
+      | hasValidHaddockTargets pkg = action
+      | otherwise                  = return ()
 
     whenReRegister  action
       = case buildStatus of
@@ -1282,45 +1329,48 @@ buildInplaceUnpackedPackage verbosity
     configureFlags v = flip filterConfigureFlags v $
                        setupHsConfigureFlags rpkg pkgshared
                                              verbosity builddir
-    configureArgs    = setupHsConfigureArgs pkg
+    configureArgs _  = setupHsConfigureArgs pkg
 
     buildCommand     = Cabal.buildCommand defaultProgramDb
     buildFlags   _   = setupHsBuildFlags pkg pkgshared
                                          verbosity builddir
-    buildArgs        = setupHsBuildArgs  pkg
+    buildArgs     _  = setupHsBuildArgs  pkg
 
     testCommand      = Cabal.testCommand -- defaultProgramDb
     testFlags    _   = setupHsTestFlags pkg pkgshared
                                          verbosity builddir
-    testArgs         = setupHsTestArgs  pkg
+    testArgs      _  = setupHsTestArgs  pkg
 
     benchCommand     = Cabal.benchmarkCommand
     benchFlags    _  = setupHsBenchFlags pkg pkgshared
                                           verbosity builddir
-    benchArgs        = setupHsBenchArgs  pkg
+    benchArgs     _  = setupHsBenchArgs  pkg
 
     replCommand      = Cabal.replCommand defaultProgramDb
     replFlags _      = setupHsReplFlags pkg pkgshared
                                         verbosity builddir
-    replArgs         = setupHsReplArgs  pkg
+    replArgs _       = setupHsReplArgs  pkg
 
     haddockCommand   = Cabal.haddockCommand
-    haddockFlags _   = setupHsHaddockFlags pkg pkgshared
+    haddockFlags v   = flip filterHaddockFlags v $
+                       setupHsHaddockFlags pkg pkgshared
                                            verbosity builddir
+    haddockArgs    v = flip filterHaddockArgs v $
+                       setupHsHaddockArgs pkg
 
     scriptOptions    = setupHsScriptOptions rpkg plan pkgshared
                                             srcdir builddir
                                             isParallelBuild cacheLock
 
     setupInteractive :: CommandUI flags
-                     -> (Version -> flags) -> [String] -> IO ()
+                     -> (Version -> flags) -> (Version -> [String]) -> IO ()
     setupInteractive cmd flags args =
       setupWrapper verbosity
                    scriptOptions { isInteractive = True }
                    (Just (elabPkgDescription pkg))
                    cmd flags args
 
-    setup :: CommandUI flags -> (Version -> flags) -> [String] -> IO ()
+    setup :: CommandUI flags -> (Version -> flags) -> (Version -> [String]) -> IO ()
     setup cmd flags args =
       setupWrapper verbosity
                    scriptOptions
@@ -1335,7 +1385,7 @@ buildInplaceUnpackedPackage verbosity
                                 pkg pkgshared
                                 verbosity builddir
                                 pkgConfDest
-        setup Cabal.registerCommand registerFlags []
+        setup Cabal.registerCommand registerFlags (const [])
 
 withTempInstalledPackageInfoFile :: Verbosity -> FilePath
                                   -> (FilePath -> IO ())
@@ -1395,4 +1445,3 @@ annotateFailure mlogFile annotate action =
   where
     handler :: Exception e => e -> IO a
     handler = throwIO . BuildFailure mlogFile . annotate . toException
-

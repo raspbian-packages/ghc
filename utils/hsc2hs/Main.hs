@@ -29,7 +29,7 @@ import Foreign
 import Foreign.C.String
 #endif
 import System.Directory         ( doesFileExist, findExecutable )
-import System.Environment       ( getProgName, getArgs )
+import System.Environment       ( getProgName )
 import System.Exit              ( ExitCode(..), exitWith )
 import System.FilePath          ( normalise, splitFileName, splitExtension )
 import System.IO
@@ -46,6 +46,7 @@ import System.FilePath          ( takeDirectory, (</>) )
 #endif
 
 import Common
+import Compat.ResponseFile         ( getArgsWithResponseFiles )
 import CrossCodegen
 import DirectCodegen
 import Flags
@@ -74,7 +75,7 @@ main = do
     prog <- getProgramName
     let header = "Usage: "++prog++" [OPTIONS] INPUT.hsc [...]\n"
         usage = usageInfo header options
-    args <- getArgs
+    args <- getArgsWithResponseFiles
     let (fs, files, errs) = getOpt Permute options args
     let mode = foldl (.) id fs emptyMode
     case mode of
@@ -110,6 +111,7 @@ processFiles configM files usage = do
                      cKeepFiles    = cKeepFiles configM,
                      cNoCompile    = cNoCompile configM,
                      cCrossCompile = cCrossCompile configM,
+                     cViaAsm       = cViaAsm configM,
                      cCrossSafe    = cCrossSafe configM,
                      cColumn       = cColumn configM,
                      cVerbose      = cVerbose configM,

@@ -4098,7 +4098,7 @@ fi
 
 
 
-ac_config_files="$ac_config_files integer-gmp.buildinfo gmp/config.mk include/HsIntegerGmp.h"
+ac_config_files="$ac_config_files integer-gmp.buildinfo config.mk include/HsIntegerGmp.h"
 
 
 
@@ -4808,7 +4808,7 @@ for ac_config_target in $ac_config_targets
 do
   case $ac_config_target in
     "integer-gmp.buildinfo") CONFIG_FILES="$CONFIG_FILES integer-gmp.buildinfo" ;;
-    "gmp/config.mk") CONFIG_FILES="$CONFIG_FILES gmp/config.mk" ;;
+    "config.mk") CONFIG_FILES="$CONFIG_FILES config.mk" ;;
     "include/HsIntegerGmp.h") CONFIG_FILES="$CONFIG_FILES include/HsIntegerGmp.h" ;;
 
   *) as_fn_error $? "invalid argument: \`$ac_config_target'" "$LINENO" 5;;

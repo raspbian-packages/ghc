@@ -80,7 +80,7 @@ import Distribution.Client.Setup
          , ConfigFlags(..), configureCommand, filterConfigureFlags
          , ConfigExFlags(..), InstallFlags(..) )
 import Distribution.Client.Config
-         ( defaultCabalDir, defaultUserInstall )
+         ( getCabalDir, defaultUserInstall )
 import Distribution.Client.Sandbox.Timestamp
          ( withUpdateTimestamps )
 import Distribution.Client.Sandbox.Types
@@ -160,9 +160,9 @@ import Distribution.Simple.Utils as Utils
          , withTempDirectory )
 import Distribution.Client.Utils
          ( determineNumJobs, logDirChange, mergeBy, MergeResult(..)
-         , tryCanonicalizePath )
+         , tryCanonicalizePath, ProgressPhase(..), progressMessage )
 import Distribution.System
-         ( Platform, OS(Windows), buildOS )
+         ( Platform, OS(Windows), buildOS, buildPlatform )
 import Distribution.Text
          ( display )
 import Distribution.Verbosity as Verbosity
@@ -858,7 +858,7 @@ postInstallActions verbosity
 storeDetailedBuildReports :: Verbosity -> FilePath
                           -> [(BuildReports.BuildReport, Maybe Repo)] -> IO ()
 storeDetailedBuildReports verbosity logsDir reports = sequence_
-  [ do dotCabal <- defaultCabalDir
+  [ do dotCabal <- getCabalDir
        let logFileName = display (BuildReports.package report) <.> "log"
            logFile     = logsDir </> logFileName
            reportsDir  = dotCabal </> "reports" </> remoteRepoName remoteRepo
@@ -1197,7 +1197,7 @@ executeInstallPlan verbosity jobCtl keepGoing useLogFile plan0 installPkg =
     -- otherwise.
     printBuildResult :: PackageId -> UnitId -> BuildOutcome -> IO ()
     printBuildResult pkgid uid buildOutcome = case buildOutcome of
-        (Right _) -> notice verbosity $ "Installed " ++ display pkgid
+        (Right _) -> progressMessage verbosity ProgressCompleted (display pkgid)
         (Left _)  -> do
           notice verbosity $ "Failed to install " ++ display pkgid
           when (verbosity >= normal) $
@@ -1285,6 +1285,9 @@ installLocalPackage verbosity pkgid location distPref installPkg =
     LocalUnpackedPackage dir ->
       installPkg (Just dir)
 
+    RemoteSourceRepoPackage _repo dir ->
+      installPkg (Just dir)
+
     LocalTarballPackage tarballPath ->
       installLocalTarballPackage verbosity
         pkgid tarballPath distPref installPkg
@@ -1296,7 +1299,6 @@ installLocalPackage verbosity pkgid location distPref installPkg =
     RepoTarballPackage _ _ tarballPath ->
       installLocalTarballPackage verbosity
         pkgid tarballPath distPref installPkg
-
 
 installLocalTarballPackage
   :: Verbosity
@@ -1396,14 +1398,12 @@ installUnpackedPackage verbosity installLock numJobs
   logDirChange (maybe (const (return ())) appendFile mLogPath) workingDir $ do
     -- Configure phase
     onFailure ConfigureFailed $ do
-      when (numJobs > 1) $ notice verbosity $
-        "Configuring " ++ display pkgid ++ "..."
+      noticeProgress ProgressStarting
       setup configureCommand configureFlags mLogPath
 
     -- Build phase
       onFailure BuildFailed $ do
-        when (numJobs > 1) $ notice verbosity $
-          "Building " ++ display pkgid ++ "..."
+        noticeProgress ProgressBuilding
         setup buildCommand' buildFlags mLogPath
 
     -- Doc generation phase
@@ -1450,6 +1450,12 @@ installUnpackedPackage verbosity installLock numJobs
     uid              = installedUnitId rpkg
     cinfo            = compilerInfo comp
     buildCommand'    = buildCommand progdb
+    dispname         = display pkgid
+    isParallelBuild  = numJobs >= 2
+
+    noticeProgress phase = when isParallelBuild $
+        progressMessage verbosity phase dispname
+
     buildFlags   _   = emptyBuildFlags {
       buildDistPref  = configDistPref configFlags,
       buildVerbosity = toFlag verbosity'
@@ -1551,7 +1557,7 @@ installUnpackedPackage verbosity installLock numJobs
           scriptOptions { useLoggingHandle = logFileHandle
                         , useWorkingDir    = workingDir }
           (Just pkg)
-          cmd flags [])
+          cmd flags (const []))
 
 
 -- helper
@@ -1593,7 +1599,7 @@ withWin32SelfUpgrade verbosity uid configFlags cinfo platform pkg action = do
     (CompilerId compFlavor _) = compilerInfoId cinfo
 
     exeInstallPaths defaultDirs =
-      [ InstallDirs.bindir absoluteDirs </> exeName <.> exeExtension
+      [ InstallDirs.bindir absoluteDirs </> exeName <.> exeExtension buildPlatform
       | exe <- PackageDescription.executables pkg
       , PackageDescription.buildable (PackageDescription.buildInfo exe)
       , let exeName = prefix ++ display (PackageDescription.exeName exe) ++ suffix

@@ -1,5 +1,5 @@
 {-# LANGUAGE CPP #-}
-#if !defined(TESTING) && __GLASGOW_HASKELL__ >= 703
+#if !defined(TESTING) && defined(__GLASGOW_HASKELL__)
 {-# LANGUAGE Safe #-}
 #endif
 
@@ -14,26 +14,47 @@
 -- Maintainer  :  libraries@haskell.org
 -- Portability :  portable
 --
--- An efficient implementation of maps from integer keys to values
--- (dictionaries).
 --
--- API of this module is strict in the keys, but lazy in the values.
--- If you need value-strict maps, use "Data.IntMap.Strict" instead.
--- The 'IntMap' type itself is shared between the lazy and strict modules,
--- meaning that the same 'IntMap' value can be passed to functions in
--- both modules (although that is rarely needed).
+-- = Finite Int Maps (lazy interface)
 --
--- These modules are intended to be imported qualified, to avoid name
--- clashes with Prelude functions, e.g.
+-- The @'IntMap' v@ type represents a finite map (sometimes called a dictionary)
+-- from keys of type @Int@ to values of type @v@.
 --
--- >  import Data.IntMap.Lazy (IntMap)
--- >  import qualified Data.IntMap.Lazy as IntMap
+-- The functions in "Data.IntMap.Strict" are careful to force values before
+-- installing them in an 'IntMap'. This is usually more efficient in cases where
+-- laziness is not essential. The functions in this module do not do so.
+--
+-- For a walkthrough of the most commonly used functions see the
+-- <https://haskell-containers.readthedocs.io/en/latest/map.html maps introduction>.
+--
+-- This module is intended to be imported qualified, to avoid name clashes with
+-- Prelude functions:
+--
+-- > import Data.IntMap.Lazy (IntMap)
+-- > import qualified Data.IntMap.Lazy as IntMap
+--
+-- Note that the implementation is generally /left-biased/. Functions that take
+-- two maps as arguments and combine them, such as `union` and `intersection`,
+-- prefer the values in the first argument to those in the second.
+--
+--
+-- == Detailed performance information
+--
+-- The amortized running time is given for each operation, with /n/ referring to
+-- the number of entries in the map and /W/ referring to the number of bits in
+-- an 'Int' (32 or 64).
+--
+-- Benchmarks comparing "Data.IntMap.Lazy" with other dictionary
+-- implementations can be found at https://github.com/haskell-perf/dictionaries.
+--
+--
+-- == Implementation
 --
 -- The implementation is based on /big-endian patricia trees/.  This data
--- structure performs especially well on binary operations like 'union'
--- and 'intersection'.  However, my benchmarks show that it is also
--- (much) faster on insertions and deletions when compared to a generic
--- size-balanced map implementation (see "Data.Map").
+-- structure performs especially well on binary operations like 'union' and
+-- 'intersection'. Additionally, benchmarks show that it is also (much) faster
+-- on insertions and deletions when compared to a generic size-balanced map
+-- implementation (see "Data.Map").
 --
 --    * Chris Okasaki and Andy Gill,  \"/Fast Mergeable Integer Maps/\",
 --      Workshop on ML, September 1998, pages 77-86,
@@ -43,18 +64,9 @@
 --      Information Coded In Alphanumeric/\", Journal of the ACM, 15(4),
 --      October 1968, pages 514-534.
 --
--- Operation comments contain the operation time complexity in
--- the Big-O notation <http://en.wikipedia.org/wiki/Big_O_notation>.
--- Many operations have a worst-case complexity of /O(min(n,W))/.
--- This means that the operation can become linear in the number of
--- elements with a maximum of /W/ -- the number of bits in an 'Int'
--- (32 or 64).
 -----------------------------------------------------------------------------
 
 module Data.IntMap.Lazy (
-    -- * Strictness properties
-    -- $strictness
-
     -- * Map type
 #if !defined(TESTING)
     IntMap, Key          -- instance Eq,Show
@@ -62,32 +74,29 @@ module Data.IntMap.Lazy (
     IntMap(..), Key          -- instance Eq,Show
 #endif
 
-    -- * Operators
-    , (!), (!?), (\\)
-
-    -- * Query
-    , IM.null
-    , size
-    , member
-    , notMember
-    , IM.lookup
-    , findWithDefault
-    , lookupLT
-    , lookupGT
-    , lookupLE
-    , lookupGE
-
     -- * Construction
     , empty
     , singleton
+    , fromSet
 
-    -- ** Insertion
+    -- ** From Unordered Lists
+    , fromList
+    , fromListWith
+    , fromListWithKey
+
+    -- ** From Ascending Lists
+    , fromAscList
+    , fromAscListWith
+    , fromAscListWithKey
+    , fromDistinctAscList
+
+    -- * Insertion
     , insert
     , insertWith
     , insertWithKey
     , insertLookupWithKey
 
-    -- ** Delete\/Update
+    -- * Deletion\/Update
     , delete
     , adjust
     , adjustWithKey
@@ -96,6 +105,23 @@ module Data.IntMap.Lazy (
     , updateLookupWithKey
     , alter
     , alterF
+
+    -- * Query
+    -- ** Lookup
+    , IM.lookup
+    , (!?)
+    , (!)
+    , findWithDefault
+    , member
+    , notMember
+    , lookupLT
+    , lookupGT
+    , lookupLE
+    , lookupGE
+
+    -- ** Size
+    , IM.null
+    , size
 
     -- * Combine
 
@@ -108,6 +134,7 @@ module Data.IntMap.Lazy (
 
     -- ** Difference
     , difference
+    , (\\)
     , differenceWith
     , differenceWithKey
 
@@ -149,21 +176,13 @@ module Data.IntMap.Lazy (
     , keys
     , assocs
     , keysSet
-    , fromSet
 
     -- ** Lists
     , toList
-    , fromList
-    , fromListWith
-    , fromListWithKey
 
     -- ** Ordered lists
     , toAscList
     , toDescList
-    , fromAscList
-    , fromAscListWith
-    , fromAscListWithKey
-    , fromDistinctAscList
 
     -- * Filter
     , IM.filter
@@ -204,22 +223,14 @@ module Data.IntMap.Lazy (
     , minViewWithKey
     , maxViewWithKey
 
+#ifdef __GLASGOW_HASKELL__
     -- * Debugging
     , showTree
     , showTreeWith
+#endif
     ) where
 
 import Data.IntMap.Internal as IM hiding (showTree, showTreeWith)
+#ifdef __GLASGOW_HASKELL__
 import Data.IntMap.Internal.DeprecatedDebug
-
--- $strictness
---
--- This module satisfies the following strictness property:
---
--- * Key arguments are evaluated to WHNF
---
--- Here are some examples that illustrate the property:
---
--- > insertWith (\ new old -> old) undefined v m  ==  undefined
--- > insertWith (\ new old -> old) k undefined m  ==  OK
--- > delete undefined m  ==  undefined
+#endif

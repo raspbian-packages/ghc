@@ -2,9 +2,6 @@
 #if __GLASGOW_HASKELL__ >= 702
 {-# LANGUAGE Safe #-}
 #endif
-#if __GLASGOW_HASKELL__ >= 706
-{-# LANGUAGE PolyKinds #-}
-#endif
 #if __GLASGOW_HASKELL__ >= 710
 {-# LANGUAGE AutoDeriveTypeable #-}
 #endif
@@ -49,6 +46,9 @@ module Control.Monad.Trans.Reader (
 import Control.Monad.IO.Class
 import Control.Monad.Signatures
 import Control.Monad.Trans.Class
+#if MIN_VERSION_base(4,12,0)
+import Data.Functor.Contravariant
+#endif
 import Data.Functor.Identity
 
 import Control.Applicative
@@ -151,6 +151,10 @@ instance (Applicative m) => Applicative (ReaderT r m) where
     u <* v = ReaderT $ \ r -> runReaderT u r <* runReaderT v r
     {-# INLINE (<*) #-}
 #endif
+#if MIN_VERSION_base(4,10,0)
+    liftA2 f x y = ReaderT $ \ r -> liftA2 f (runReaderT x r) (runReaderT y r)
+    {-# INLINE liftA2 #-}
+#endif
 
 instance (Alternative m) => Alternative (ReaderT r m) where
     empty   = liftReaderT empty
@@ -173,8 +177,10 @@ instance (Monad m) => Monad (ReaderT r m) where
     m >> k = ReaderT $ \ r -> runReaderT m r >> runReaderT k r
 #endif
     {-# INLINE (>>) #-}
+#if !(MIN_VERSION_base(4,13,0))
     fail msg = lift (fail msg)
     {-# INLINE fail #-}
+#endif
 
 #if MIN_VERSION_base(4,9,0)
 instance (Fail.MonadFail m) => Fail.MonadFail (ReaderT r m) where
@@ -205,6 +211,12 @@ instance (MonadZip m) => MonadZip (ReaderT r m) where
     mzipWith f (ReaderT m) (ReaderT n) = ReaderT $ \ a ->
         mzipWith f (m a) (n a)
     {-# INLINE mzipWith #-}
+#endif
+
+#if MIN_VERSION_base(4,12,0)
+instance Contravariant m => Contravariant (ReaderT r m) where
+    contramap f = ReaderT . fmap (contramap f) . runReaderT
+    {-# INLINE contramap #-}
 #endif
 
 liftReaderT :: m a -> ReaderT r m a

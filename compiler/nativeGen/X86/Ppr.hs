@@ -73,12 +73,17 @@ import Data.Bits
 -- .subsections_via_symbols and -dead_strip can be found at
 -- <https://developer.apple.com/library/mac/documentation/DeveloperTools/Reference/Assembler/040-Assembler_Directives/asm_directives.html#//apple_ref/doc/uid/TP30000823-TPXREF101>
 
+pprProcAlignment :: SDoc
+pprProcAlignment = sdocWithDynFlags $ \dflags ->
+  (maybe empty pprAlign . cmmProcAlignment $ dflags)
+
 pprNatCmmDecl :: NatCmmDecl (Alignment, CmmStatics) Instr -> SDoc
 pprNatCmmDecl (CmmData section dats) =
   pprSectionAlign section $$ pprDatas dats
 
 pprNatCmmDecl proc@(CmmProc top_info lbl _ (ListGraph blocks)) =
   sdocWithDynFlags $ \dflags ->
+  pprProcAlignment $$
   case topInfoTable proc of
     Nothing ->
        case blocks of
@@ -86,6 +91,7 @@ pprNatCmmDecl proc@(CmmProc top_info lbl _ (ListGraph blocks)) =
            pprLabel lbl
          blocks -> -- special case for code without info table:
            pprSectionAlign (Section Text lbl) $$
+           pprProcAlignment $$
            pprLabel lbl $$ -- blocks guaranteed not null, so label needed
            vcat (map (pprBasicBlock top_info) blocks) $$
            (if debugLevel dflags > 0
@@ -95,6 +101,7 @@ pprNatCmmDecl proc@(CmmProc top_info lbl _ (ListGraph blocks)) =
     Just (Statics info_lbl _) ->
       sdocWithPlatform $ \platform ->
       pprSectionAlign (Section Text info_lbl) $$
+      pprProcAlignment $$
       (if platformHasSubsectionsViaSymbols platform
           then ppr (mkDeadStripPreventer info_lbl) <> char ':'
           else empty) $$
@@ -108,8 +115,6 @@ pprNatCmmDecl proc@(CmmProc top_info lbl _ (ListGraph blocks)) =
             <+> char '-'
             <+> ppr (mkDeadStripPreventer info_lbl)
        else empty) $$
-      (if debugLevel dflags > 0
-       then ppr (mkAsmTempEndLabel info_lbl) <> char ':' else empty) $$
       pprSizeDecl info_lbl
 
 -- | Output the ELF .size directive.
@@ -123,20 +128,23 @@ pprSizeDecl lbl
 pprBasicBlock :: LabelMap CmmStatics -> NatBasicBlock Instr -> SDoc
 pprBasicBlock info_env (BasicBlock blockid instrs)
   = sdocWithDynFlags $ \dflags ->
-    maybe_infotable $$
+    maybe_infotable dflags $
     pprLabel asmLbl $$
     vcat (map pprInstr instrs) $$
     (if debugLevel dflags > 0
      then ppr (mkAsmTempEndLabel asmLbl) <> char ':' else empty)
   where
     asmLbl = blockLbl blockid
-    maybe_infotable = case mapLookup blockid info_env of
-       Nothing   -> empty
-       Just (Statics info_lbl info) ->
+    maybe_infotable dflags c = case mapLookup blockid info_env of
+       Nothing -> c
+       Just (Statics infoLbl info) ->
            pprAlignForSection Text $$
            infoTableLoc $$
            vcat (map pprData info) $$
-           pprLabel info_lbl
+           pprLabel infoLbl $$
+           c $$
+           (if debugLevel dflags > 0
+            then ppr (mkAsmTempEndLabel infoLbl) <> char ':' else empty)
     -- Make sure the info table has the right .loc for the block
     -- coming right after it. See [Note: Info Offset]
     infoTableLoc = case instrs of
@@ -175,23 +183,44 @@ pprLabel lbl = pprGloblDecl lbl
             $$ pprTypeAndSizeDecl lbl
             $$ (ppr lbl <> char ':')
 
+{-
+Note [Pretty print ASCII when AsmCodeGen]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Previously, when generating assembly code, we created SDoc with
+`(ptext . sLit)` for every bytes in literal bytestring, then
+combine them using `hcat`.
+
+When handling literal bytestrings with millions of bytes,
+millions of SDoc would be created and to combine, leading to
+high memory usage.
+
+Now we escape the given bytestring to string directly and construct
+SDoc only once. This improvement could dramatically decrease the
+memory allocation from 4.7GB to 1.3GB when embedding a 3MB literal
+string in source code. See Trac #14741 for profiling results.
+-}
 
 pprASCII :: [Word8] -> SDoc
 pprASCII str
-  = hcat (map (do1 . fromIntegral) str)
+  -- Transform this given literal bytestring to escaped string and construct
+  -- the literal SDoc directly.
+  -- See Trac #14741
+  -- and Note [Pretty print ASCII when AsmCodeGen]
+  = ptext $ sLit $ foldr (\w s -> (do1 . fromIntegral) w ++ s) "" str
     where
-       do1 :: Int -> SDoc
-       do1 w | '\t' <- chr w = ptext (sLit "\\t")
-       do1 w | '\n' <- chr w = ptext (sLit "\\n")
-       do1 w | '"'  <- chr w = ptext (sLit "\\\"")
-       do1 w | '\\' <- chr w = ptext (sLit "\\\\")
-       do1 w | isPrint (chr w) = char (chr w)
-       do1 w | otherwise = char '\\' <> octal w
+       do1 :: Int -> String
+       do1 w | '\t' <- chr w = "\\t"
+             | '\n' <- chr w = "\\n"
+             | '"'  <- chr w = "\\\""
+             | '\\' <- chr w = "\\\\"
+             | isPrint (chr w) = [chr w]
+             | otherwise = '\\' : octal w
 
-       octal :: Int -> SDoc
-       octal w = int ((w `div` 64) `mod` 8)
-                  <> int ((w `div` 8) `mod` 8)
-                  <> int (w `mod` 8)
+       octal :: Int -> String
+       octal w = [ chr (ord '0' + (w `div` 64) `mod` 8)
+                 , chr (ord '0' + (w `div` 8) `mod` 8)
+                 , chr (ord '0' + w `mod` 8)
+                 ]
 
 pprAlign :: Int -> SDoc
 pprAlign bytes
@@ -508,7 +537,7 @@ pprDataItem' dflags lit
                   --
                   case lit of
                   -- A relative relocation:
-                  CmmLabelDiffOff _ _ _ ->
+                  CmmLabelDiffOff _ _ _ _ ->
                       [text "\t.long\t" <> pprImm imm,
                        text "\t.long\t0"]
                   _ ->

@@ -108,7 +108,6 @@ rnModIface hsc_env insts nsubst iface = do
         deps <- rnDependencies (mi_deps iface)
         -- TODO:
         -- mi_rules
-        -- mi_vect_info (LOW PRIORITY)
         return iface { mi_module = mod
                      , mi_sig_of = sig_of
                      , mi_insts = insts
@@ -619,7 +618,7 @@ rnIfaceBndrs = mapM rnIfaceBndr
 
 rnIfaceBndr :: Rename IfaceBndr
 rnIfaceBndr (IfaceIdBndr (fs, ty)) = IfaceIdBndr <$> ((,) fs <$> rnIfaceType ty)
-rnIfaceBndr (IfaceTvBndr tv_bndr) = IfaceIdBndr <$> rnIfaceTvBndr tv_bndr
+rnIfaceBndr (IfaceTvBndr tv_bndr) = IfaceTvBndr <$> rnIfaceTvBndr tv_bndr
 
 rnIfaceTvBndr :: Rename IfaceTvBndr
 rnIfaceTvBndr (fs, kind) = (,) fs <$> rnIfaceType kind

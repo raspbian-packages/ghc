@@ -19,6 +19,9 @@
 -- A monad transformer that combines 'ReaderT', 'WriterT' and 'StateT'.
 -- This version is strict; for a lazy version with the same interface,
 -- see "Control.Monad.Trans.RWS.Lazy".
+-- Although the output is built strictly, it is not possible to
+-- achieve constant space behaviour with this transformer: for that,
+-- use "Control.Monad.Trans.RWS.CPS" instead.
 -----------------------------------------------------------------------------
 
 module Control.Monad.Trans.RWS.Strict (
@@ -63,6 +66,9 @@ module Control.Monad.Trans.RWS.Strict (
 import Control.Monad.IO.Class
 import Control.Monad.Signatures
 import Control.Monad.Trans.Class
+#if MIN_VERSION_base(4,12,0)
+import Data.Functor.Contravariant
+#endif
 import Data.Functor.Identity
 
 import Control.Applicative
@@ -202,8 +208,10 @@ instance (Monoid w, Monad m) => Monad (RWST r w s m) where
         (b, s'',w') <- runRWST (k a) r s'
         return (b, s'', w `mappend` w')
     {-# INLINE (>>=) #-}
+#if !(MIN_VERSION_base(4,13,0))
     fail msg = RWST $ \ _ _ -> fail msg
     {-# INLINE fail #-}
+#endif
 
 #if MIN_VERSION_base(4,9,0)
 instance (Monoid w, Fail.MonadFail m) => Fail.MonadFail (RWST r w s m) where
@@ -230,6 +238,13 @@ instance (Monoid w) => MonadTrans (RWST r w s) where
 instance (Monoid w, MonadIO m) => MonadIO (RWST r w s m) where
     liftIO = lift . liftIO
     {-# INLINE liftIO #-}
+
+#if MIN_VERSION_base(4,12,0)
+instance Contravariant m => Contravariant (RWST r w s m) where
+    contramap f m = RWST $ \r s ->
+      contramap (\ (a, s', w) -> (f a, s', w)) $ runRWST m r s
+    {-# INLINE contramap #-}
+#endif
 
 -- ---------------------------------------------------------------------------
 -- Reader operations

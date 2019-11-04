@@ -33,7 +33,8 @@ import Distribution.Version
          , withinRange )
 import qualified Distribution.Backpack as Backpack
 import Distribution.Package
-         ( newSimpleUnitId, unsafeMkDefUnitId, ComponentId, PackageId, mkPackageName
+         ( newSimpleUnitId, unsafeMkDefUnitId, ComponentId
+         , PackageId, mkPackageName
          , PackageIdentifier(..), packageVersion, packageName )
 import Distribution.Types.Dependency
 import Distribution.PackageDescription
@@ -57,7 +58,8 @@ import Distribution.Simple.Program
          , getProgramSearchPath, getDbProgramOutput, runDbProgram, ghcProgram
          , ghcjsProgram )
 import Distribution.Simple.Program.Find
-         ( programSearchPathAsPATHVar, ProgramSearchPathEntry(ProgramSearchPathDir) )
+         ( programSearchPathAsPATHVar
+         , ProgramSearchPathEntry(ProgramSearchPathDir) )
 import Distribution.Simple.Program.Run
          ( getEffectiveEnvironment )
 import qualified Distribution.Simple.Program.Strip as Strip
@@ -73,7 +75,7 @@ import Distribution.Simple.PackageIndex (InstalledPackageIndex)
 import qualified Distribution.InstalledPackageInfo as IPI
 import Distribution.Client.Types
 import Distribution.Client.Config
-         ( defaultCabalDir )
+         ( getCabalDir )
 import Distribution.Client.IndexUtils
          ( getInstalledPackages )
 import Distribution.Client.JobControl
@@ -81,7 +83,8 @@ import Distribution.Client.JobControl
 import Distribution.Simple.Setup
          ( Flag(..) )
 import Distribution.Simple.Utils
-         ( die', debug, info, infoNoWrap, cabalVersion, tryFindPackageDesc, comparing
+         ( die', debug, info, infoNoWrap
+         , cabalVersion, tryFindPackageDesc, comparing
          , createDirectoryIfMissingVerbose, installExecutableFile
          , copyFileVerbose, rewriteFileEx )
 import Distribution.Client.Utils
@@ -389,7 +392,7 @@ verbosityHack ver args0
 runSetupCommand :: Verbosity -> Setup
                 -> CommandUI flags  -- ^ command definition
                 -> flags  -- ^ command flags
-                -> [String]  -- ^ extra command-line arguments
+                -> [String] -- ^ extra command-line arguments
                 -> IO ()
 runSetupCommand verbosity setup cmd flags extraArgs = do
   let args = commandName cmd : commandShowOptions cmd flags ++ extraArgs
@@ -403,11 +406,13 @@ setupWrapper :: Verbosity
              -> CommandUI flags
              -> (Version -> flags)
                 -- ^ produce command flags given the Cabal library version
-             -> [String]
+             -> (Version -> [String])
              -> IO ()
 setupWrapper verbosity options mpkg cmd flags extraArgs = do
   setup <- getSetup verbosity options mpkg
-  runSetupCommand verbosity setup cmd (flags $ setupVersion setup) extraArgs
+  runSetupCommand verbosity setup
+                  cmd (flags $ setupVersion setup)
+                      (extraArgs $ setupVersion setup)
 
 -- ------------------------------------------------------------
 -- * Internal SetupMethod
@@ -537,7 +542,7 @@ externalSetupMethod path verbosity options _ args = do
                   doInvoke
 
     moveOutOfTheWay tmpDir path' = do
-      let newPath = tmpDir </> "setup" <.> exeExtension
+      let newPath = tmpDir </> "setup" <.> exeExtension buildPlatform
       Win32.moveFile path' newPath
       return newPath
 
@@ -589,7 +594,7 @@ getExternalSetupMethod verbosity options pkg bt = do
   setupDir         = workingDir options </> useDistPref options </> "setup"
   setupVersionFile = setupDir   </> "setup" <.> "version"
   setupHs          = setupDir   </> "setup" <.> "hs"
-  setupProgFile    = setupDir   </> "setup" <.> exeExtension
+  setupProgFile    = setupDir   </> "setup" <.> exeExtension buildPlatform
   platform         = fromMaybe buildPlatform (usePlatform options)
 
   useCachedSetupExecutable = (bt == Simple || bt == Configure || bt == Make)
@@ -634,8 +639,8 @@ getExternalSetupMethod verbosity options pkg bt = do
             case savedVer of
               Just version | version `withinRange` useCabalVersion options
                 -> do updateSetupScript version bt
-                      -- Does the previously compiled setup executable still exist
-                      -- and is it up-to date?
+                      -- Does the previously compiled setup executable
+                      -- still exist and is it up-to date?
                       useExisting <- canUseExistingSetup version
                       if useExisting
                         then return (version, Nothing, options)
@@ -664,7 +669,8 @@ getExternalSetupMethod verbosity options pkg bt = do
                              ,SetupScriptOptions)
       installedVersion = do
         (comp,    progdb,  options')  <- configureCompiler options
-        (version, mipkgid, options'') <- installedCabalVersion options' comp progdb
+        (version, mipkgid, options'') <- installedCabalVersion options'
+                                         comp progdb
         updateSetupScript version bt
         writeSetupVersionFile version
         return (version, mipkgid, options'')
@@ -713,7 +719,8 @@ getExternalSetupMethod verbosity options pkg bt = do
     return (packageVersion pkg, Nothing, options')
   installedCabalVersion options' compiler progdb = do
     index <- maybeGetInstalledPackages options' compiler progdb
-    let cabalDep   = Dependency (mkPackageName "Cabal") (useCabalVersion options')
+    let cabalDep   = Dependency (mkPackageName "Cabal")
+                                (useCabalVersion options')
         options''  = options' { usePackageIndex = Just index }
     case PackageIndex.lookupDependency index cabalDep of
       []   -> die' verbosity $ "The package '" ++ display (packageName pkg)
@@ -775,14 +782,14 @@ getExternalSetupMethod verbosity options pkg bt = do
   cachedSetupDirAndProg :: SetupScriptOptions -> Version
                         -> IO (FilePath, FilePath)
   cachedSetupDirAndProg options' cabalLibVersion = do
-    cabalDir <- defaultCabalDir
+    cabalDir <- getCabalDir
     let setupCacheDir       = cabalDir </> "setup-exe-cache"
         cachedSetupProgFile = setupCacheDir
                               </> ("setup-" ++ buildTypeString ++ "-"
                                    ++ cabalVersionString ++ "-"
                                    ++ platformString ++ "-"
                                    ++ compilerVersionString)
-                              <.> exeExtension
+                              <.> exeExtension buildPlatform
     return (setupCacheDir, cachedSetupProgFile)
       where
         buildTypeString       = show bt
@@ -823,7 +830,7 @@ getExternalSetupMethod verbosity options pkg bt = do
               cachedSetupProgFile
     return cachedSetupProgFile
       where
-        criticalSection'      = maybe id criticalSection $ setupCacheLock options'
+        criticalSection' = maybe id criticalSection $ setupCacheLock options'
 
   -- | If the Setup.hs is out of date wrt the executable then recompile it.
   -- Currently this is GHC/GHCJS only. It should really be generalised.
@@ -860,16 +867,19 @@ getExternalSetupMethod verbosity options pkg bt = do
           selectedDeps | useDependenciesExclusive options'
                                    = useDependencies options'
                        | otherwise = useDependencies options' ++
-                                     if any (isCabalPkgId . snd) (useDependencies options')
+                                     if any (isCabalPkgId . snd)
+                                        (useDependencies options')
                                      then []
                                      else cabalDep
           addRenaming (ipid, _) =
             -- Assert 'DefUnitId' invariant
-            (Backpack.DefiniteUnitId (unsafeMkDefUnitId (newSimpleUnitId ipid)), defaultRenaming)
+            (Backpack.DefiniteUnitId (unsafeMkDefUnitId (newSimpleUnitId ipid))
+            ,defaultRenaming)
           cppMacrosFile = setupDir </> "setup_macros.h"
           ghcOptions = mempty {
               -- Respect -v0, but don't crank up verbosity on GHC if
-              -- Cabal verbosity is requested. For that, use --ghc-option=-v instead!
+              -- Cabal verbosity is requested. For that, use
+              -- --ghc-option=-v instead!
               ghcOptVerbosity       = Flag (min verbosity normal)
             , ghcOptMode            = Flag GhcModeMake
             , ghcOptInputFiles      = toNubListR [setupHs]
@@ -886,7 +896,7 @@ getExternalSetupMethod verbosity options pkg bt = do
             , ghcOptPackages        = toNubListR $ map addRenaming selectedDeps
             , ghcOptCppIncludes     = toNubListR [ cppMacrosFile
                                                  | useVersionMacros options' ]
-            , ghcOptExtra           = toNubListR extraOpts
+            , ghcOptExtra           = extraOpts
             }
       let ghcCmdLine = renderGhcOptions compiler platform ghcOptions
       when (useVersionMacros options') $
@@ -895,7 +905,8 @@ getExternalSetupMethod verbosity options pkg bt = do
       case useLoggingHandle options of
         Nothing          -> runDbProgram verbosity program progdb ghcCmdLine
 
-        -- If build logging is enabled, redirect compiler output to the log file.
+        -- If build logging is enabled, redirect compiler output to
+        -- the log file.
         (Just logHandle) -> do output <- getDbProgramOutput verbosity program
                                          progdb ghcCmdLine
                                hPutStr logHandle output

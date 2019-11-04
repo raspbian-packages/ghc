@@ -61,7 +61,6 @@ import Distribution.Simple.BuildTarget
 
 import qualified Distribution.Simple.GHC   as GHC
 import qualified Distribution.Simple.GHCJS as GHCJS
-import qualified Distribution.Simple.LHC   as LHC
 import qualified Distribution.Simple.UHC   as UHC
 import qualified Distribution.Simple.HaskellSuite as HaskellSuite
 import qualified Distribution.Simple.PackageIndex as Index
@@ -207,7 +206,6 @@ registerAll pkg lbi regFlags ipis
 
     writeRegisterScript =
       case compilerFlavor (compiler lbi) of
-        JHC -> notice verbosity "Registration scripts not needed for jhc"
         UHC -> notice verbosity "Registration scripts not needed for uhc"
         _   -> withHcPkg verbosity
                "Registration scripts are not implemented for this compiler"
@@ -257,7 +255,7 @@ abiHash :: Verbosity
         -> IO AbiHash
 abiHash verbosity pkg distPref lbi lib clbi =
     case compilerFlavor comp of
-     GHC | compilerVersion comp >= mkVersion [6,11] -> do
+     GHC -> do
             fmap mkAbiHash $ GHC.libAbiHash verbosity pkg lbi' lib clbi
      GHCJS -> do
             fmap mkAbiHash $ GHCJS.libAbiHash verbosity pkg lbi' lib clbi
@@ -297,7 +295,6 @@ createPackageDB verbosity comp progdb preferCompat dbPath =
     case compilerFlavor comp of
       GHC   -> HcPkg.init (GHC.hcPkgInfo   progdb) verbosity preferCompat dbPath
       GHCJS -> HcPkg.init (GHCJS.hcPkgInfo progdb) verbosity False dbPath
-      LHC   -> HcPkg.init (LHC.hcPkgInfo   progdb) verbosity False dbPath
       UHC   -> return ()
       HaskellSuite _ -> HaskellSuite.initPackageDB verbosity progdb dbPath
       _              -> die' verbosity $
@@ -335,7 +332,6 @@ withHcPkg verbosity name comp progdb f =
   case compilerFlavor comp of
     GHC   -> f (GHC.hcPkgInfo progdb)
     GHCJS -> f (GHCJS.hcPkgInfo progdb)
-    LHC   -> f (LHC.hcPkgInfo progdb)
     _     -> die' verbosity ("Distribution.Simple.Register." ++ name ++ ":\
                   \not implemented for this compiler")
 
@@ -350,13 +346,11 @@ registerPackage verbosity comp progdb packageDbs installedPkgInfo registerOption
   case compilerFlavor comp of
     GHC   -> GHC.registerPackage   verbosity progdb packageDbs installedPkgInfo registerOptions
     GHCJS -> GHCJS.registerPackage verbosity progdb packageDbs installedPkgInfo registerOptions
-    _ | HcPkg.registerMultiInstance registerOptions
-          -> die' verbosity "Registering multiple package instances is not yet supported for this compiler"
-    LHC   -> LHC.registerPackage   verbosity      progdb packageDbs installedPkgInfo registerOptions
-    UHC   -> UHC.registerPackage   verbosity comp progdb packageDbs installedPkgInfo
-    JHC   -> notice verbosity "Registering for jhc (nothing to do)"
     HaskellSuite {} ->
       HaskellSuite.registerPackage verbosity      progdb packageDbs installedPkgInfo
+    _ | HcPkg.registerMultiInstance registerOptions
+          -> die' verbosity "Registering multiple package instances is not yet supported for this compiler"
+    UHC   -> UHC.registerPackage   verbosity comp progdb packageDbs installedPkgInfo
     _    -> die' verbosity "Registering is not implemented for this compiler"
 
 writeHcPkgRegisterScript :: Verbosity
@@ -443,10 +437,11 @@ generalInstalledPackageInfo adjustRelIncDirs pkg abi_hash lib lbi clbi installDi
     IPI.includeDirs        = absinc ++ adjustRelIncDirs relinc,
     IPI.includes           = includes bi,
     IPI.depends            = depends,
-    IPI.abiDepends         = abi_depends,
+    IPI.abiDepends         = [], -- due to #5465
     IPI.ccOptions          = [], -- Note. NOT ccOptions bi!
                                  -- We don't want cc-options to be propagated
                                  -- to C compilations in other packages.
+    IPI.cxxOptions         = [], -- Also. NOT cxxOptions bi!
     IPI.ldOptions          = ldOptions bi,
     IPI.frameworks         = frameworks bi,
     IPI.frameworkDirs      = extraFrameworkDirs bi,
@@ -463,13 +458,6 @@ generalInstalledPackageInfo adjustRelIncDirs pkg abi_hash lib lbi clbi installDi
     --TODO: unclear what the root cause of the
     -- duplication is, but we nub it here for now:
     depends = ordNub $ map fst (componentPackageDeps clbi)
-    abi_depends = map add_abi depends
-    add_abi uid = IPI.AbiDependency uid abi
-      where
-        abi = case Index.lookupUnitId (installedPkgs lbi) uid of
-                Nothing -> error $
-                  "generalInstalledPackageInfo: missing IPI for " ++ display uid
-                Just ipi -> IPI.abiHash ipi
     (absinc, relinc) = partition isAbsolute (includeDirs bi)
     hasModules = not $ null (allLibModules lib clbi)
     comp = compiler lbi

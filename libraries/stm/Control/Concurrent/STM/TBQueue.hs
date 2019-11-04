@@ -1,8 +1,8 @@
-{-# OPTIONS_GHC -fno-warn-name-shadowing #-}
-{-# LANGUAGE CPP, DeriveDataTypeable #-}
+{-# LANGUAGE CPP                #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 
 #if __GLASGOW_HASKELL__ >= 701
-{-# LANGUAGE Trustworthy #-}
+{-# LANGUAGE Trustworthy        #-}
 #endif
 
 -----------------------------------------------------------------------------
@@ -39,24 +39,26 @@ module Control.Concurrent.STM.TBQueue (
         tryPeekTBQueue,
         writeTBQueue,
         unGetTBQueue,
+        lengthTBQueue,
         isEmptyTBQueue,
         isFullTBQueue,
   ) where
 
-import Data.Typeable
-import GHC.Conc
-
-#define _UPK_(x) {-# UNPACK #-} !(x)
+import           Data.Typeable   (Typeable)
+import           GHC.Conc        (STM, TVar, newTVar, newTVarIO, orElse,
+                                  readTVar, retry, writeTVar)
+import           Numeric.Natural (Natural)
+import           Prelude         hiding (read)
 
 -- | 'TBQueue' is an abstract type representing a bounded FIFO channel.
 --
 -- @since 2.4
 data TBQueue a
-   = TBQueue _UPK_(TVar Int)  -- CR:  read capacity
-             _UPK_(TVar [a])  -- R:   elements waiting to be read
-             _UPK_(TVar Int)  -- CW:  write capacity
-             _UPK_(TVar [a])  -- W:   elements written (head is most recent)
-             _UPK_(Int)       -- CAP: initial capacity
+   = TBQueue {-# UNPACK #-} !(TVar Natural) -- CR:  read capacity
+             {-# UNPACK #-} !(TVar [a])     -- R:   elements waiting to be read
+             {-# UNPACK #-} !(TVar Natural) -- CW:  write capacity
+             {-# UNPACK #-} !(TVar [a])     -- W:   elements written (head is most recent)
+                            !(Natural)      -- CAP: initial capacity
   deriving Typeable
 
 instance Eq (TBQueue a) where
@@ -76,8 +78,8 @@ instance Eq (TBQueue a) where
 --                 then CW := CR - 1; CR := 0
 --                 else **FULL**
 
--- |Build and returns a new instance of 'TBQueue'
-newTBQueue :: Int   -- ^ maximum number of elements the queue can hold
+-- | Builds and returns a new instance of 'TBQueue'.
+newTBQueue :: Natural   -- ^ maximum number of elements the queue can hold
            -> STM (TBQueue a)
 newTBQueue size = do
   read  <- newTVar []
@@ -90,7 +92,7 @@ newTBQueue size = do
 -- 'TBQueue's using 'System.IO.Unsafe.unsafePerformIO', because using
 -- 'atomically' inside 'System.IO.Unsafe.unsafePerformIO' isn't
 -- possible.
-newTBQueueIO :: Int -> IO (TBQueue a)
+newTBQueueIO :: Natural -> IO (TBQueue a)
 newTBQueueIO size = do
   read  <- newTVarIO []
   write <- newTVarIO []
@@ -102,11 +104,11 @@ newTBQueueIO size = do
 writeTBQueue :: TBQueue a -> a -> STM ()
 writeTBQueue (TBQueue rsize _read wsize write _size) a = do
   w <- readTVar wsize
-  if (w /= 0)
+  if (w > 0)
      then do writeTVar wsize $! w - 1
      else do
           r <- readTVar rsize
-          if (r /= 0)
+          if (r > 0)
              then do writeTVar rsize 0
                      writeTVar wsize $! r - 1
              else retry
@@ -189,6 +191,15 @@ unGetTBQueue (TBQueue rsize read wsize _write _size) a = do
              else retry
   xs <- readTVar read
   writeTVar read (a:xs)
+
+-- |Return the length of a 'TBQueue'.
+--
+-- @since 2.5.0.0
+lengthTBQueue :: TBQueue a -> STM Natural
+lengthTBQueue (TBQueue rsize _read wsize _write size) = do
+  r <- readTVar rsize
+  w <- readTVar wsize
+  return $! size - r - w
 
 -- |Returns 'True' if the supplied 'TBQueue' is empty.
 isEmptyTBQueue :: TBQueue a -> STM Bool

@@ -36,19 +36,25 @@ import Distribution.Types.ForeignLib
 import Distribution.Types.UnqualComponentName
 import Distribution.Types.ComponentLocalBuildInfo
 import Distribution.Types.ExecutableScope
+import Distribution.Types.LocalBuildInfo
+import Distribution.Types.TargetInfo
 import Distribution.Package
 import qualified Distribution.ModuleName as ModuleName
 import Distribution.PackageDescription as PD hiding (Flag)
 import Distribution.Simple.Compiler hiding (Flag)
+import Distribution.Simple.Glob
 import Distribution.Simple.Program.GHC
 import Distribution.Simple.Program.ResponseFile
 import Distribution.Simple.Program
 import Distribution.Simple.PreProcess
 import Distribution.Simple.Setup
 import Distribution.Simple.Build
+import Distribution.Simple.BuildTarget
 import Distribution.Simple.InstallDirs
 import Distribution.Simple.LocalBuildInfo hiding (substPathTemplate)
 import Distribution.Simple.BuildPaths
+import Distribution.Simple.Register
+import qualified Distribution.Simple.Program.HcPkg as HcPkg
 import qualified Distribution.Simple.PackageIndex as PackageIndex
 import qualified Distribution.InstalledPackageInfo as InstalledPackageInfo
 import Distribution.InstalledPackageInfo ( InstalledPackageInfo )
@@ -62,9 +68,10 @@ import Language.Haskell.Extension
 
 import Distribution.Compat.Semigroup (All (..), Any (..))
 
+import Control.Monad
 import Data.Either      ( rights )
 
-import System.Directory (doesFileExist)
+import System.Directory (getCurrentDirectory, doesDirectoryExist, doesFileExist)
 import System.FilePath  ( (</>), (<.>), normalise, isAbsolute )
 import System.IO        (hClose, hPutStrLn, hSetEncoding, utf8)
 
@@ -86,6 +93,8 @@ data HaddockArgs = HaddockArgs {
  -- ^ (Template for modules, template for symbols, template for lines).
  argLinkedSource :: Flag Bool,
  -- ^ Generate hyperlinked sources
+ argQuickJump :: Flag Bool,
+ -- ^ Generate quickjump index
  argCssFile :: Flag FilePath,
  -- ^ Optional custom CSS file.
  argContents :: Flag String,
@@ -93,8 +102,8 @@ data HaddockArgs = HaddockArgs {
  argVerbose :: Any,
  argOutput :: Flag [Output],
  -- ^ HTML or Hoogle doc or both? Required.
- argInterfaces :: [(FilePath, Maybe String)],
- -- ^ [(Interface file, URL to the HTML docs for links)].
+ argInterfaces :: [(FilePath, Maybe String, Maybe String)],
+ -- ^ [(Interface file, URL to the HTML docs and hyperlinked-source for links)].
  argOutputDir :: Directory,
  -- ^ Where to generate the documentation.
  argTitle :: Flag String,
@@ -144,6 +153,7 @@ haddock pkg_descr lbi suffixes flags' = do
         comp          = compiler lbi
         platform      = hostPlatform lbi
 
+        quickJmpFlag  = haddockQuickJump flags'
         flags = case haddockTarget of
           ForDevelopment -> flags'
           ForHackage -> flags'
@@ -152,6 +162,7 @@ haddock pkg_descr lbi suffixes flags' = do
             , haddockHtmlLocation = Flag (pkg_url ++ "/docs")
             , haddockContents     = Flag (toPathTemplate pkg_url)
             , haddockLinkedSource = Flag True
+            , haddockQuickJump    = Flag True
             }
         pkg_url       = "/package/$pkg-$version"
         flag f        = fromFlag $ f flags
@@ -168,9 +179,16 @@ haddock pkg_descr lbi suffixes flags' = do
         (orLaterVersion (mkVersion [2,0])) (withPrograms lbi)
 
     -- various sanity checks
-    when ( flag haddockHoogle
-           && version < mkVersion [2,2]) $
-         die' verbosity "haddock 2.0 and 2.1 do not support the --hoogle flag."
+    when (flag haddockHoogle && version < mkVersion [2,2]) $
+      die' verbosity "Haddock 2.0 and 2.1 do not support the --hoogle flag."
+
+
+    when (flag haddockQuickJump && version < mkVersion [2,19]) $ do
+      let msg = "Haddock prior to 2.19 does not support the --quickjump flag."
+          alt = "The generated documentation won't have the QuickJump feature."
+      if Flag True == quickJmpFlag
+        then die' verbosity msg
+        else warn verbosity (msg ++ "\n" ++ alt)
 
     haddockGhcVersionStr <- getProgramOutput verbosity haddockProg
                               ["--ghc-version"]
@@ -199,15 +217,37 @@ haddock pkg_descr lbi suffixes flags' = do
             , fromFlags (haddockTemplateEnv lbi (packageId pkg_descr)) flags
             , fromPackageDescription haddockTarget pkg_descr ]
 
-    withAllComponentsInBuildOrder pkg_descr lbi $ \component clbi -> do
+    targets <- readTargetInfos verbosity pkg_descr lbi (haddockArgs flags)
+
+    let
+      targets' =
+        case targets of
+          [] -> allTargetsInBuildOrder' pkg_descr lbi
+          _  -> targets
+
+    internalPackageDB <-
+      createInternalPackageDB verbosity lbi (flag haddockDistPref)
+
+    (\f -> foldM_ f (installedPkgs lbi) targets') $ \index target -> do
+
+      let component = targetComponent target
+          clbi      = targetCLBI target
+
       componentInitialBuildSteps (flag haddockDistPref) pkg_descr lbi clbi verbosity
-      preprocessComponent pkg_descr component lbi clbi False verbosity suffixes
+
+      let
+        lbi' = lbi {
+          withPackageDB = withPackageDB lbi ++ [internalPackageDB],
+          installedPkgs = index
+          }
+
+      preprocessComponent pkg_descr component lbi' clbi False verbosity suffixes
       let
         doExe com = case (compToExe com) of
           Just exe -> do
-            withTempDirectoryEx verbosity tmpFileOpts (buildDir lbi) "tmp" $
+            withTempDirectoryEx verbosity tmpFileOpts (buildDir lbi') "tmp" $
               \tmp -> do
-                exeArgs <- fromExecutable verbosity tmp lbi clbi htmlTemplate
+                exeArgs <- fromExecutable verbosity tmp lbi' clbi htmlTemplate
                              version exe
                 let exeArgs' = commonArgs `mappend` exeArgs
                 runHaddock verbosity tmpFileOpts comp platform
@@ -227,24 +267,50 @@ haddock pkg_descr lbi suffixes flags' = do
           withTempDirectoryEx verbosity tmpFileOpts (buildDir lbi) "tmp" $
             \tmp -> do
               smsg
-              libArgs <- fromLibrary verbosity tmp lbi clbi htmlTemplate
+              libArgs <- fromLibrary verbosity tmp lbi' clbi htmlTemplate
                            version lib
               let libArgs' = commonArgs `mappend` libArgs
               runHaddock verbosity tmpFileOpts comp platform haddockProg libArgs'
-        CFLib flib -> when (flag haddockForeignLibs) $ do
-          withTempDirectoryEx verbosity tmpFileOpts (buildDir lbi) "tmp" $
+
+              case libName lib of
+                Just _ -> do
+                  pwd <- getCurrentDirectory
+
+                  let
+                    ipi = inplaceInstalledPackageInfo
+                            pwd (flag haddockDistPref) pkg_descr
+                            (mkAbiHash "inplace") lib lbi' clbi
+
+                  debug verbosity $ "Registering inplace:\n"
+                    ++ (InstalledPackageInfo.showInstalledPackageInfo ipi)
+
+                  registerPackage verbosity (compiler lbi') (withPrograms lbi')
+                    (withPackageDB lbi') ipi
+                    HcPkg.defaultRegisterOptions {
+                      HcPkg.registerMultiInstance = True
+                    }
+
+                  return $ PackageIndex.insert ipi index
+                Nothing ->
+                  pure index
+
+        CFLib flib -> (when (flag haddockForeignLibs) $ do
+          withTempDirectoryEx verbosity tmpFileOpts (buildDir lbi') "tmp" $
             \tmp -> do
               smsg
-              flibArgs <- fromForeignLib verbosity tmp lbi clbi htmlTemplate
+              flibArgs <- fromForeignLib verbosity tmp lbi' clbi htmlTemplate
                             version flib
               let libArgs' = commonArgs `mappend` flibArgs
-              runHaddock verbosity tmpFileOpts comp platform haddockProg libArgs'
-        CExe   _ -> when (flag haddockExecutables) $ smsg >> doExe component
-        CTest  _ -> when (flag haddockTestSuites)  $ smsg >> doExe component
-        CBench _ -> when (flag haddockBenchmarks)  $ smsg >> doExe component
+              runHaddock verbosity tmpFileOpts comp platform haddockProg libArgs')
+
+          >> return index
+
+        CExe   _ -> (when (flag haddockExecutables) $ smsg >> doExe component) >> return index
+        CTest  _ -> (when (flag haddockTestSuites)  $ smsg >> doExe component) >> return index
+        CBench _ -> (when (flag haddockBenchmarks)  $ smsg >> doExe component) >> return index
 
     for_ (extraDocFiles pkg_descr) $ \ fpath -> do
-      files <- matchFileGlob fpath
+      files <- matchDirFileGlob verbosity (specVersion pkg_descr) "." fpath
       for_ files $ copyFileTo verbosity (unDir $ argOutputDir commonArgs)
 
 -- ------------------------------------------------------------------------------
@@ -261,6 +327,7 @@ fromFlags env flags =
                                          ,"src/%{MODULE/./-}.html#line-%{LINE}")
                                else NoFlag,
       argLinkedSource = haddockLinkedSource flags,
+      argQuickJump = haddockQuickJump flags,
       argCssFile = haddockCss flags,
       argContents = fmap (fromPathTemplate . substPathTemplate env)
                     (haddockContents flags),
@@ -273,7 +340,7 @@ fromFlags env flags =
                     os -> os,
       argOutputDir = maybe mempty Dir . flagToMaybe $ haddockDistPref flags,
 
-      argGhcOptions = mempty { ghcOptExtra = toNubListR ghcArgs }
+      argGhcOptions = mempty { ghcOptExtra = ghcArgs }
     }
     where
       ghcArgs = fromMaybe [] . lookup "ghc" . haddockProgramArgs $ flags
@@ -331,8 +398,7 @@ mkHaddockArgs verbosity tmp lbi clbi htmlTemplate haddockVersion inFiles bi = do
                          ghcOptFPic        = toFlag True,
                          ghcOptHiSuffix    = toFlag "dyn_hi",
                          ghcOptObjSuffix   = toFlag "dyn_o",
-                         ghcOptExtra       =
-                           toNubListR $ hcSharedOptions GHC bi
+                         ghcOptExtra       = hcSharedOptions GHC bi
 
                      }
     opts <- if withVanillaLib lbi
@@ -435,7 +501,7 @@ getGhcCppOpts :: Version
 getGhcCppOpts haddockVersion bi =
     mempty {
         ghcOptExtensions   = toNubListR [EnableExtension CPP | needsCpp],
-        ghcOptCppOptions   = toNubListR defines
+        ghcOptCppOptions   = defines
     }
   where
     needsCpp             = EnableExtension CPP `elem` usedExtensions bi
@@ -463,15 +529,19 @@ runHaddock :: Verbosity
               -> ConfiguredProgram
               -> HaddockArgs
               -> IO ()
-runHaddock verbosity tmpFileOpts comp platform haddockProg args = do
-  let haddockVersion = fromMaybe (error "unable to determine haddock version")
-                       (programVersion haddockProg)
-  renderArgs verbosity tmpFileOpts haddockVersion comp platform args $
-    \(flags,result)-> do
+runHaddock verbosity tmpFileOpts comp platform haddockProg args
+  | null (argTargets args) = warn verbosity $
+       "Haddocks are being requested, but there aren't any modules given "
+    ++ "to create documentation for."
+  | otherwise = do
+    let haddockVersion = fromMaybe (error "unable to determine haddock version")
+                        (programVersion haddockProg)
+    renderArgs verbosity tmpFileOpts haddockVersion comp platform args $
+      \(flags,result)-> do
 
-      runProgram verbosity haddockProg flags
+        runProgram verbosity haddockProg flags
 
-      notice verbosity $ "Documentation created: " ++ result
+        notice verbosity $ "Documentation created: " ++ result
 
 
 renderArgs :: Verbosity
@@ -531,6 +601,11 @@ renderPureArgs version comp platform args = concat
              . fromFlag . argPackageName $ args
         else []
 
+    , [ "--since-qual=external" | isVersion 2 20 ]
+
+    , [ "--quickjump" | isVersion 2 19
+                      , fromFlag . argQuickJump $ args ]
+
     , [ "--hyperlinked-source" | isVersion 2 17
                                , fromFlag . argLinkedSource $ args ]
 
@@ -573,9 +648,22 @@ renderPureArgs version comp platform args = concat
     , argTargets $ args
     ]
     where
-      renderInterfaces =
-        map (\(i,mh) -> "--read-interface=" ++
-          maybe "" (++",") mh ++ i)
+      renderInterfaces = map renderInterface
+
+      renderInterface :: (FilePath, Maybe FilePath, Maybe FilePath) -> String
+      renderInterface (i, html, hypsrc) = "--read-interface=" ++
+        (intercalate "," $ concat [ [ x | Just x <- [html] ]
+                                  , [ x | Just _ <- [html]
+                                        -- only render hypsrc path if html path
+                                        -- is given and hyperlinked-source is
+                                        -- enabled
+                                        , Just x <- [hypsrc]
+                                        , isVersion 2 17
+                                        , fromFlag . argLinkedSource $ args
+                                        ]
+                                  , [ i ]
+                                  ])
+
       bool a b c = if c then a else b
       isVersion major minor  = version >= mkVersion [major,minor]
       verbosityFlag
@@ -588,15 +676,39 @@ renderPureArgs version comp platform args = concat
 -- HTML paths, and an optional warning for packages with missing documentation.
 haddockPackagePaths :: [InstalledPackageInfo]
                     -> Maybe (InstalledPackageInfo -> FilePath)
-                    -> NoCallStackIO ([(FilePath, Maybe FilePath)], Maybe String)
+                    -> NoCallStackIO ([( FilePath        -- path to interface
+                                                         -- file
+
+                                       , Maybe FilePath  -- url to html
+                                                         -- documentation
+
+                                       , Maybe FilePath  -- url to hyperlinked
+                                                         -- source
+                                       )]
+                                     , Maybe String      -- warning about
+                                                         -- missing documentation
+                                     )
 haddockPackagePaths ipkgs mkHtmlPath = do
   interfaces <- sequenceA
     [ case interfaceAndHtmlPath ipkg of
         Nothing -> return (Left (packageId ipkg))
         Just (interface, html) -> do
+
+          (html', hypsrc') <-
+            case html of
+              Just htmlPath -> do
+                let hypSrcPath = htmlPath </> defaultHyperlinkedSourceDirectory
+                hypSrcExists <- doesDirectoryExist hypSrcPath
+                return $ ( Just (fixFileUrl htmlPath)
+                         , if hypSrcExists
+                           then Just (fixFileUrl hypSrcPath)
+                           else Nothing
+                         )
+              Nothing -> return (Nothing, Nothing)
+
           exists <- doesFileExist interface
           if exists
-            then return (Right (interface, html))
+            then return (Right (interface, html', hypsrc'))
             else return (Left pkgid)
     | ipkg <- ipkgs, let pkgid = packageId ipkg
     , pkgName pkgid `notElem` noHaddockWhitelist
@@ -620,21 +732,38 @@ haddockPackagePaths ipkgs mkHtmlPath = do
     interfaceAndHtmlPath pkg = do
       interface <- listToMaybe (InstalledPackageInfo.haddockInterfaces pkg)
       html <- case mkHtmlPath of
-        Nothing -> fmap fixFileUrl
-                        (listToMaybe (InstalledPackageInfo.haddockHTMLs pkg))
+        Nothing     -> listToMaybe (InstalledPackageInfo.haddockHTMLs pkg)
         Just mkPath -> Just (mkPath pkg)
       return (interface, if null html then Nothing else Just html)
-      where
-        -- The 'haddock-html' field in the hc-pkg output is often set as a
-        -- native path, but we need it as a URL. See #1064.
-        fixFileUrl f | isAbsolute f = "file://" ++ f
-                     | otherwise    = f
+
+    -- The 'haddock-html' field in the hc-pkg output is often set as a
+    -- native path, but we need it as a URL. See #1064. Also don't "fix"
+    -- the path if it is an interpolated one.
+    fixFileUrl f | Nothing <- mkHtmlPath
+                 , isAbsolute f = "file://" ++ f
+                 | otherwise    = f
+
+    -- 'src' is the default hyperlinked source directory ever since. It is
+    -- not possible to configure that directory in any way in haddock.
+    defaultHyperlinkedSourceDirectory = "src"
+
 
 haddockPackageFlags :: Verbosity
                     -> LocalBuildInfo
                     -> ComponentLocalBuildInfo
                     -> Maybe PathTemplate
-                    -> IO ([(FilePath, Maybe FilePath)], Maybe String)
+                    -> IO ([( FilePath        -- path to interface
+                                              -- file
+
+                            , Maybe FilePath  -- url to html
+                                              -- documentation
+
+                            , Maybe FilePath  -- url to hyperlinked
+                                              -- source
+                            )]
+                          , Maybe String      -- warning about
+                                              -- missing documentation
+                          )
 haddockPackageFlags verbosity lbi clbi htmlTemplate = do
   let allPkgs = installedPkgs lbi
       directDeps = map fst (componentPackageDeps clbi)
@@ -685,6 +814,11 @@ hscolour' onNoHsColour haddockTarget pkg_descr lbi suffixes flags =
   where
     go :: ConfiguredProgram -> IO ()
     go hscolourProg = do
+      warn verbosity $
+        "the 'cabal hscolour' command is deprecated in favour of 'cabal " ++
+        "haddock --hyperlink-source' and will be removed in the next major " ++
+        "release."
+
       setupMessage verbosity "Running hscolour for" (packageId pkg_descr)
       createDirectoryIfMissingVerbose verbosity True $
         hscolourPref haddockTarget distPref pkg_descr

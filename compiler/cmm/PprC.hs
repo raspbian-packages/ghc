@@ -379,14 +379,10 @@ pprExpr e = case e of
     CmmReg reg      -> pprCastReg reg
     CmmRegOff reg 0 -> pprCastReg reg
 
-    CmmRegOff reg i
-        | i < 0 && negate_ok -> pprRegOff (char '-') (-i)
-        | otherwise          -> pprRegOff (char '+') i
-      where
-        pprRegOff op i' = pprCastReg reg <> op <> int i'
-        negate_ok = negate (fromIntegral i :: Integer) <
-                    fromIntegral (maxBound::Int)
-                     -- overflow is undefined; see #7620
+    -- CmmRegOff is an alias of MO_Add
+    CmmRegOff reg i -> sdocWithDynFlags $ \dflags ->
+                       pprCastReg reg <> char '+' <>
+                       pprHexVal (fromIntegral i) (wordWidth dflags)
 
     CmmMachOp mop args -> pprMachOpApp mop args
 
@@ -495,7 +491,7 @@ pprLit lit = case lit of
     CmmHighStackMark   -> panic "PprC printing high stack mark"
     CmmLabel clbl      -> mkW_ <> pprCLabelAddr clbl
     CmmLabelOff clbl i -> mkW_ <> pprCLabelAddr clbl <> char '+' <> int i
-    CmmLabelDiffOff clbl1 _ i
+    CmmLabelDiffOff clbl1 _ i _   -- non-word widths not supported via C
         -- WARNING:
         --  * the lit must occur in the info table clbl2
         --  * clbl1 must be an SRT, a slow entry point or a large bitmap
@@ -506,7 +502,7 @@ pprLit lit = case lit of
 
 pprLit1 :: CmmLit -> SDoc
 pprLit1 lit@(CmmLabelOff _ _) = parens (pprLit lit)
-pprLit1 lit@(CmmLabelDiffOff _ _ _) = parens (pprLit lit)
+pprLit1 lit@(CmmLabelDiffOff _ _ _ _) = parens (pprLit lit)
 pprLit1 lit@(CmmFloat _ _)    = parens (pprLit lit)
 pprLit1 other = pprLit other
 
@@ -516,9 +512,12 @@ pprLit1 other = pprLit other
 pprStatics :: DynFlags -> [CmmStatic] -> [SDoc]
 pprStatics _ [] = []
 pprStatics dflags (CmmStaticLit (CmmFloat f W32) : rest)
-  -- floats are padded to a word by padLitToWord, see #1852
+  -- odd numbers of floats are padded to a word by mkVirtHeapOffsetsWithPadding
   | wORD_SIZE dflags == 8, CmmStaticLit (CmmInt 0 W32) : rest' <- rest
   = pprLit1 (floatToWord dflags f) : pprStatics dflags rest'
+  -- adjacent floats aren't padded but combined into a single word
+  | wORD_SIZE dflags == 8, CmmStaticLit (CmmFloat g W32) : rest' <- rest
+  = pprLit1 (floatPairToWord dflags f g) : pprStatics dflags rest'
   | wORD_SIZE dflags == 4
   = pprLit1 (floatToWord dflags f) : pprStatics dflags rest
   | otherwise
@@ -538,13 +537,29 @@ pprStatics dflags (CmmStaticLit (CmmInt i W64) : rest)
                             CmmStaticLit (CmmInt q W32) : rest)
   where r = i .&. 0xffffffff
         q = i `shiftR` 32
+pprStatics dflags (CmmStaticLit (CmmInt a W32) :
+                   CmmStaticLit (CmmInt b W32) : rest)
+  | wordWidth dflags == W64
+  = if wORDS_BIGENDIAN dflags
+    then pprStatics dflags (CmmStaticLit (CmmInt ((shiftL a 32) .|. b) W64) :
+                            rest)
+    else pprStatics dflags (CmmStaticLit (CmmInt ((shiftL b 32) .|. a) W64) :
+                            rest)
+pprStatics dflags (CmmStaticLit (CmmInt a W16) :
+                   CmmStaticLit (CmmInt b W16) : rest)
+  | wordWidth dflags == W32
+  = if wORDS_BIGENDIAN dflags
+    then pprStatics dflags (CmmStaticLit (CmmInt ((shiftL a 16) .|. b) W32) :
+                            rest)
+    else pprStatics dflags (CmmStaticLit (CmmInt ((shiftL b 16) .|. a) W32) :
+                            rest)
 pprStatics dflags (CmmStaticLit (CmmInt _ w) : _)
   | w /= wordWidth dflags
-  = panic "pprStatics: cannot emit a non-word-sized static literal"
+  = pprPanic "pprStatics: cannot emit a non-word-sized static literal" (ppr w)
 pprStatics dflags (CmmStaticLit lit : rest)
   = pprLit1 lit : pprStatics dflags rest
 pprStatics _ (other : _)
-  = pprPanic "pprWord" (pprStatic other)
+  = pprPanic "pprStatics: other" (pprStatic other)
 
 pprStatic :: CmmStatic -> SDoc
 pprStatic s = case s of
@@ -803,6 +818,7 @@ pprCallishMachOp_for_C mop
         MO_U_QuotRem  {} -> unsupported
         MO_U_QuotRem2 {} -> unsupported
         MO_Add2       {} -> unsupported
+        MO_AddWordC   {} -> unsupported
         MO_SubWordC   {} -> unsupported
         MO_AddIntC    {} -> unsupported
         MO_SubIntC    {} -> unsupported
@@ -1082,7 +1098,7 @@ te_BB block = mapM_ te_Stmt (blockToList mid) >> te_Stmt last
 te_Lit :: CmmLit -> TE ()
 te_Lit (CmmLabel l) = te_lbl l
 te_Lit (CmmLabelOff l _) = te_lbl l
-te_Lit (CmmLabelDiffOff l1 _ _) = te_lbl l1
+te_Lit (CmmLabelDiffOff l1 _ _ _) = te_lbl l1
 te_Lit _ = return ()
 
 te_Stmt :: CmmNode e x -> TE ()
@@ -1247,6 +1263,25 @@ floatToWord dflags r
     where wo | wordWidth dflags == W64
              , wORDS_BIGENDIAN dflags    = 32
              | otherwise                 = 0
+
+floatPairToWord :: DynFlags -> Rational -> Rational -> CmmLit
+floatPairToWord dflags r1 r2
+  = runST (do
+        arr <- newArray_ ((0::Int),1)
+        writeArray arr 0 (fromRational r1)
+        writeArray arr 1 (fromRational r2)
+        arr' <- castFloatToWord32Array arr
+        w32_1 <- readArray arr' 0
+        w32_2 <- readArray arr' 1
+        return (pprWord32Pair w32_1 w32_2)
+    )
+    where pprWord32Pair w32_1 w32_2
+              | wORDS_BIGENDIAN dflags =
+                  CmmInt ((shiftL i1 32) .|. i2) W64
+              | otherwise =
+                  CmmInt ((shiftL i2 32) .|. i1) W64
+              where i1 = toInteger w32_1
+                    i2 = toInteger w32_2
 
 doubleToWords :: DynFlags -> Rational -> [CmmLit]
 doubleToWords dflags r

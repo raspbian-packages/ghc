@@ -4,7 +4,7 @@
 #if __GLASGOW_HASKELL__
 {-# LANGUAGE DeriveDataTypeable, StandaloneDeriving #-}
 #endif
-#if !defined(TESTING) && __GLASGOW_HASKELL__ >= 703
+#if !defined(TESTING) && defined(__GLASGOW_HASKELL__)
 {-# LANGUAGE Trustworthy #-}
 #endif
 #if __GLASGOW_HASKELL__ >= 708
@@ -246,7 +246,6 @@ import Data.Foldable (Foldable (foldMap))
 import Data.Typeable
 import Control.DeepSeq (NFData(rnf))
 
-import Utils.Containers.Internal.StrictFold
 import Utils.Containers.Internal.StrictPair
 import Utils.Containers.Internal.PtrEquality
 
@@ -318,13 +317,10 @@ instance Foldable.Foldable Set where
             go (Bin 1 k _ _) = f k
             go (Bin _ k l r) = go l `mappend` (f k `mappend` go r)
     {-# INLINE foldMap #-}
-
-#if MIN_VERSION_base(4,6,0)
     foldl' = foldl'
     {-# INLINE foldl' #-}
     foldr' = foldr'
     {-# INLINE foldr' #-}
-#endif
 #if MIN_VERSION_base(4,8,0)
     length = size
     {-# INLINE length #-}
@@ -604,7 +600,7 @@ isProperSubsetOf s1 s2
 
 
 -- | /O(n+m)/. Is this a subset?
--- @(s1 `isSubsetOf` s2)@ tells whether @s1@ is a subset of @s2@.
+-- @(s1 \`isSubsetOf\` s2)@ tells whether @s1@ is a subset of @s2@.
 isSubsetOf :: Ord a => Set a -> Set a -> Bool
 isSubsetOf t1 t2
   = (size t1 <= size t2) && (isSubsetOfX t1 t2)
@@ -705,8 +701,8 @@ deleteMax Tip             = Tip
   Union.
 --------------------------------------------------------------------}
 -- | The union of a list of sets: (@'unions' == 'foldl' 'union' 'empty'@).
-unions :: Ord a => [Set a] -> Set a
-unions = foldlStrict union empty
+unions :: (Foldable f, Ord a) => f (Set a) -> Set a
+unions = Foldable.foldl' union empty
 #if __GLASGOW_HASKELL__
 {-# INLINABLE unions #-}
 #endif
@@ -715,8 +711,8 @@ unions = foldlStrict union empty
 -- equal elements are encountered.
 union :: Ord a => Set a -> Set a -> Set a
 union t1 Tip  = t1
-union t1 (Bin _ x Tip Tip) = insertR x t1
-union (Bin _ x Tip Tip) t2 = insert x t2
+union t1 (Bin 1 x _ _) = insertR x t1
+union (Bin 1 x _ _) t2 = insert x t2
 union Tip t2  = t2
 union t1@(Bin _ x l1 r1) t2 = case splitS x t2 of
   (l2 :*: r2)
@@ -973,7 +969,7 @@ fromList (x0 : xs0) | not_ordered x0 xs0 = fromList' (Bin 1 x0 Tip Tip) xs0
     not_ordered x (y : _) = x >= y
     {-# INLINE not_ordered #-}
 
-    fromList' t0 xs = foldlStrict ins t0 xs
+    fromList' t0 xs = Foldable.foldl' ins t0 xs
       where ins t x = insert x t
 
     go !_ t [] = t
@@ -1695,7 +1691,7 @@ splitRoot orig =
 -- | Calculate the power set of a set: the set of all its subsets.
 --
 -- @
--- t `member` powerSet s == t `isSubsetOf` s
+-- t ``member`` powerSet s == t ``isSubsetOf`` s
 -- @
 --
 -- Example:
@@ -1748,9 +1744,9 @@ instance Monoid (MergeSet a) where
   mappend (MergeSet xs) (MergeSet ys) = MergeSet (merge xs ys)
 #endif
 
--- | Calculate the disjoin union of two sets.
+-- | Calculate the disjoint union of two sets.
 --
--- @ disjointUnion xs ys = map Left xs `union` map Right ys @
+-- @ disjointUnion xs ys = map Left xs ``union`` map Right ys @
 --
 -- Example:
 --

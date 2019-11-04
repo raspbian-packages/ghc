@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE TypeFamilies #-}
 
 -- | Types used while planning how to build everything in a project.
@@ -11,6 +12,7 @@ module Distribution.Client.ProjectPlanning.Types (
 
     -- * Elaborated install plan types
     ElaboratedInstallPlan,
+    normaliseConfiguredPackage,
     ElaboratedConfiguredPackage(..),
 
     elabDistDirParams,
@@ -46,7 +48,11 @@ module Distribution.Client.ProjectPlanning.Types (
     showBenchComponentTarget,
     SubComponentTarget(..),
 
+    isSubLibComponentTarget,
+    isForeignLibComponentTarget,
+    isExeComponentTarget,
     isTestComponentTarget,
+    isBenchComponentTarget,
 
     -- * Setup script
     SetupScriptStyle(..),
@@ -79,7 +85,7 @@ import           Distribution.InstalledPackageInfo (InstalledPackageInfo)
 import           Distribution.Simple.Compiler
 import           Distribution.Simple.Build.PathsModule (pkgPathEnvVar)
 import qualified Distribution.Simple.BuildTarget as Cabal
-import           Distribution.Simple.Program.Db
+import           Distribution.Simple.Program
 import           Distribution.ModuleName (ModuleName)
 import           Distribution.Simple.LocalBuildInfo (ComponentName(..))
 import qualified Distribution.Simple.InstallDirs as InstallDirs
@@ -94,6 +100,7 @@ import           Distribution.Compat.Graph (IsNode(..))
 import           Distribution.Simple.Utils (ordNub)
 
 import           Data.Map (Map)
+import qualified Data.Map as Map
 import           Data.Maybe (catMaybes)
 import           Data.Set (Set)
 import qualified Data.ByteString.Lazy as LBS
@@ -141,7 +148,8 @@ data ElaboratedSharedConfig
        -- | The programs that the compiler configured (e.g. for GHC, the progs
        -- ghc & ghc-pkg). Once constructed, only the 'configuredPrograms' are
        -- used.
-       pkgConfigCompilerProgs :: ProgramDb
+       pkgConfigCompilerProgs :: ProgramDb,
+       pkgConfigReplOptions :: [String]
      }
   deriving (Show, Generic, Typeable)
   --TODO: [code cleanup] no Eq instance
@@ -273,6 +281,7 @@ data ElaboratedConfiguredPackage
        elabHaddockInternal       :: Bool,
        elabHaddockCss            :: Maybe FilePath,
        elabHaddockLinkedSource   :: Bool,
+       elabHaddockQuickJump      :: Bool,
        elabHaddockHscolourCss    :: Maybe FilePath,
        elabHaddockContents       :: Maybe PathTemplate,
 
@@ -293,6 +302,8 @@ data ElaboratedConfiguredPackage
        elabTestTargets           :: [ComponentTarget],
        elabBenchTargets          :: [ComponentTarget],
        elabReplTarget            :: Maybe ComponentTarget,
+       elabHaddockTargets        :: [ComponentTarget],
+
        elabBuildHaddocks         :: Bool,
 
        --pkgSourceDir ? -- currently passed in later because they can use temp locations
@@ -302,6 +313,29 @@ data ElaboratedConfiguredPackage
        elabPkgOrComp :: ElaboratedPackageOrComponent
    }
   deriving (Eq, Show, Generic, Typeable)
+
+normaliseConfiguredPackage :: ElaboratedSharedConfig
+                           -> ElaboratedConfiguredPackage
+                           -> ElaboratedConfiguredPackage
+normaliseConfiguredPackage ElaboratedSharedConfig{pkgConfigCompilerProgs} pkg =
+    pkg { elabProgramArgs = Map.mapMaybeWithKey lookupFilter (elabProgramArgs pkg) }
+  where
+    knownProgramDb = addKnownPrograms builtinPrograms pkgConfigCompilerProgs
+
+    pkgDesc :: PackageDescription
+    pkgDesc = elabPkgDescription pkg
+
+    removeEmpty :: [String] -> Maybe [String]
+    removeEmpty [] = Nothing
+    removeEmpty xs = Just xs
+
+    lookupFilter :: String -> [String] -> Maybe [String]
+    lookupFilter n args = removeEmpty $ case lookupKnownProgram n knownProgramDb of
+        Just p -> programNormaliseArgs p (getVersion p) pkgDesc args
+        Nothing -> args
+
+    getVersion :: Program -> Maybe Version
+    getVersion p = lookupProgram p knownProgramDb >>= programVersion
 
 -- | The package/component contains/is a library and so must be registered
 elabRequiresRegistration :: ElaboratedConfiguredPackage -> Bool
@@ -702,6 +736,22 @@ isTestComponentTarget _                                 = False
 showBenchComponentTarget :: PackageId -> ComponentTarget -> Maybe String
 showBenchComponentTarget _ (ComponentTarget (CBenchName n) _) = Just $ display n
 showBenchComponentTarget _ _ = Nothing
+
+isBenchComponentTarget :: ComponentTarget -> Bool
+isBenchComponentTarget (ComponentTarget (CBenchName _) _) = True
+isBenchComponentTarget _                                  = False
+
+isForeignLibComponentTarget :: ComponentTarget -> Bool
+isForeignLibComponentTarget (ComponentTarget (CFLibName _) _) = True
+isForeignLibComponentTarget _                                 = False
+
+isExeComponentTarget :: ComponentTarget -> Bool
+isExeComponentTarget (ComponentTarget (CExeName _) _ ) = True
+isExeComponentTarget _                                 = False
+
+isSubLibComponentTarget :: ComponentTarget -> Bool
+isSubLibComponentTarget (ComponentTarget (CSubLibName _) _) = True
+isSubLibComponentTarget _                                   = False
 
 ---------------------------
 -- Setup.hs script policy

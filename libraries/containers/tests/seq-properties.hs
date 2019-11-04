@@ -41,9 +41,7 @@ import Test.QuickCheck.Property
 import Test.QuickCheck.Function
 import Test.Framework
 import Test.Framework.Providers.QuickCheck2
-#if MIN_VERSION_base(4,4,0)
 import Control.Monad.Zip (MonadZip (..))
-#endif
 import Control.DeepSeq (deepseq)
 import Control.Monad.Fix (MonadFix (..))
 
@@ -54,9 +52,11 @@ main = defaultMain
        , testProperty "(<$)" prop_constmap
        , testProperty "foldr" prop_foldr
        , testProperty "foldr'" prop_foldr'
+       , testProperty "lazy foldr'" prop_lazyfoldr'
        , testProperty "foldr1" prop_foldr1
        , testProperty "foldl" prop_foldl
        , testProperty "foldl'" prop_foldl'
+       , testProperty "lazy foldl'" prop_lazyfoldl'
        , testProperty "foldl1" prop_foldl1
        , testProperty "(==)" prop_equals
        , testProperty "compare" prop_compare
@@ -95,8 +95,10 @@ main = defaultMain
        , testProperty "partition" prop_partition
        , testProperty "filter" prop_filter
        , testProperty "sort" prop_sort
+       , testProperty "sortStable" prop_sortStable
        , testProperty "sortBy" prop_sortBy
        , testProperty "sortOn" prop_sortOn
+       , testProperty "sortOnStable" prop_sortOnStable
        , testProperty "unstableSort" prop_unstableSort
        , testProperty "unstableSortBy" prop_unstableSortBy
        , testProperty "unstableSortOn" prop_unstableSortOn
@@ -131,11 +133,9 @@ main = defaultMain
        , testProperty "zipWith3" prop_zipWith3
        , testProperty "zip4" prop_zip4
        , testProperty "zipWith4" prop_zipWith4
-#if MIN_VERSION_base(4,4,0)
        , testProperty "mzip-naturality" prop_mzipNaturality
        , testProperty "mzip-preservation" prop_mzipPreservation
        , testProperty "munzip-lazy" prop_munzipLazy
-#endif
        , testProperty "<*>" prop_ap
        , testProperty "<*> NOINLINE" prop_ap_NOINLINE
        , testProperty "liftA2" prop_liftA2
@@ -306,6 +306,16 @@ prop_foldr' xs =
     f = (:)
     z = []
 
+prop_lazyfoldr' :: Seq () -> Property
+prop_lazyfoldr' xs =
+    not (null xs) ==>
+    foldr'
+        (\e _ ->
+              e)
+        (error "Data.Sequence.foldr': should be lazy in initial accumulator")
+        xs ===
+    ()
+
 prop_foldr1 :: Seq Int -> Property
 prop_foldr1 xs =
     not (null xs) ==> foldr1 f xs == Data.List.foldr1 f (toList xs)
@@ -324,6 +334,16 @@ prop_foldl' xs =
   where
     f = flip (:)
     z = []
+
+prop_lazyfoldl' :: Seq () -> Property
+prop_lazyfoldl' xs =
+    not (null xs) ==>
+    foldl'
+        (\_ e ->
+              e)
+        (error "Data.Sequence.foldl': should be lazy in initial accumulator")
+        xs ===
+    ()
 
 prop_foldl1 :: Seq Int -> Property
 prop_foldl1 xs =
@@ -538,6 +558,30 @@ prop_sort :: Seq OrdA -> Bool
 prop_sort xs =
     toList' (sort xs) ~= Data.List.sort (toList xs)
 
+data UnstableOrd = UnstableOrd
+    { ordKey :: OrdA
+    , _ignored :: A
+    } deriving (Show)
+
+instance Eq UnstableOrd where
+    x == y = compare x y == EQ
+
+instance Ord UnstableOrd where
+    compare (UnstableOrd x _) (UnstableOrd y _) = compare x y
+
+instance Arbitrary UnstableOrd where
+    arbitrary = liftA2 UnstableOrd arbitrary arbitrary
+    shrink (UnstableOrd x y) =
+        [ UnstableOrd x' y'
+        | (x',y') <- shrink (x, y) ]
+
+prop_sortStable :: Seq UnstableOrd -> Bool
+prop_sortStable xs =
+    (fmap . fmap) unignore (toList' (sort xs)) ~=
+    fmap unignore (Data.List.sort (toList xs))
+  where
+    unignore (UnstableOrd x y) = (x, y)
+
 prop_sortBy :: Seq (OrdA, B) -> Bool
 prop_sortBy xs =
     toList' (sortBy f xs) ~= Data.List.sortBy f (toList xs)
@@ -545,6 +589,16 @@ prop_sortBy xs =
 
 prop_sortOn :: Fun A OrdB -> Seq A -> Bool
 prop_sortOn (Fun _ f) xs =
+    toList' (sortOn f xs) ~= listSortOn f (toList xs)
+  where
+#if MIN_VERSION_base(4,8,0)
+    listSortOn = Data.List.sortOn
+#else
+    listSortOn k = Data.List.sortBy (compare `on` k)
+#endif
+
+prop_sortOnStable :: Fun A UnstableOrd -> Seq A -> Bool
+prop_sortOnStable (Fun _ f) xs =
     toList' (sortOn f xs) ~= listSortOn f (toList xs)
   where
 #if MIN_VERSION_base(4,8,0)
@@ -732,7 +786,6 @@ prop_zipWith4 xs ys zs ts =
     toList' (zipWith4 f xs ys zs ts) ~= Data.List.zipWith4 f (toList xs) (toList ys) (toList zs) (toList ts)
   where f = (,,,)
 
-#if MIN_VERSION_base(4,4,0)
 -- This comes straight from the MonadZip documentation
 prop_mzipNaturality :: Fun A C -> Fun B D -> Seq A -> Seq B -> Property
 prop_mzipNaturality f g sa sb =
@@ -759,7 +812,6 @@ prop_munzipLazy pairs = deepseq ((`seq` ()) <$> repaired) True
     firstPieces = fmap (fst . munzip) partialpairs
     repaired = mapWithIndex (\i s -> update i 10000 s) firstPieces
     err = error "munzip isn't lazy enough"
-#endif
 
 -- Applicative operations
 

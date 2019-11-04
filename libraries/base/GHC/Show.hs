@@ -165,6 +165,7 @@ appPrec1 = I# 11#       -- appPrec + 1
 -- Simple Instances
 --------------------------------------------------------------
 
+-- | @since 2.01
 deriving instance Show ()
 
 -- | @since 2.01
@@ -174,7 +175,10 @@ instance Show a => Show [a]  where
   {-# SPECIALISE instance Show [Int] #-}
   showsPrec _         = showList
 
+-- | @since 2.01
 deriving instance Show Bool
+
+-- | @since 2.01
 deriving instance Show Ordering
 
 -- | @since 2.01
@@ -199,7 +203,10 @@ showWord w# cs
                c# ->
                    showWord (w# `quotWord#` 10##) (C# c# : cs)
 
+-- | @since 2.01
 deriving instance Show a => Show (Maybe a)
+
+-- | @since 4.11.0.0
 deriving instance Show a => Show (NonEmpty a)
 
 -- | @since 2.01
@@ -219,6 +226,7 @@ instance Show Module where
 instance Show CallStack where
   showsPrec _ = shows . getCallStack
 
+-- | @since 4.9.0.0
 deriving instance Show SrcLoc
 
 --------------------------------------------------------------
@@ -471,6 +479,13 @@ instance Show Integer where
         | otherwise = integerToString n r
     showList = showList__ (showsPrec 0)
 
+-- | @since 4.8.0.0
+instance Show Natural where
+#if defined(MIN_VERSION_integer_gmp)
+    showsPrec p (NatS# w#) = showsPrec p (W# w#)
+#endif
+    showsPrec p i          = showsPrec p (naturalToInteger i)
+
 -- Divide and conquer implementation of string conversion
 integerToString :: Integer -> String -> String
 integerToString n0 cs0
@@ -581,7 +596,14 @@ instance Show KindRep where
       . showString " "
       . showsPrec 11 q
 
+-- | @since 4.11.0.0
 deriving instance Show RuntimeRep
+
+-- | @since 4.11.0.0
 deriving instance Show VecCount
+
+-- | @since 4.11.0.0
 deriving instance Show VecElem
+
+-- | @since 4.11.0.0
 deriving instance Show TypeLitSort

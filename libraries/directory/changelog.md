@@ -1,6 +1,31 @@
 Changelog for the [`directory`][1] package
 ==========================================
 
+## 1.3.3.0 (June 2018)
+
+  * Relax `unix` version bounds to support 2.8.
+
+  * Relax `Win32` version bounds to support 2.8.
+
+  * Use `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE` when creating symbolic
+    links on Windows, if possible.
+    ([#83](https://github.com/haskell/directory/issues/83))
+
+## 1.3.2.2 (April 2018)
+
+  * Relax `base` version bounds to support 4.12.
+
+## 1.3.2.1 (March 2018)
+
+  * Relax `Win32` version bounds to support 2.7.
+
+## 1.3.2.0 (January 2018)
+
+  * Relax `time` version bounds to support 1.9.
+
+  * Implement `getXdgDirectoryList` and `XdgDirectoryList`.
+    ([#78](https://github.com/haskell/directory/issues/78))
+
 ## 1.3.1.5 (October 2017)
 
   * Rename the internal header `windows.h` to avoid GHC#14312.

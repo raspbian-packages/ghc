@@ -1,4 +1,5 @@
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE NondecreasingIndentation #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE CPP #-}
@@ -11,6 +12,7 @@ module Test.Cabal.Prelude (
     module Test.Cabal.Run,
     module System.FilePath,
     module Control.Monad,
+    module Control.Monad.IO.Class,
     module Distribution.Version,
     module Distribution.Simple.Program,
 ) where
@@ -27,7 +29,7 @@ import Distribution.Simple.Program.Db
 import Distribution.Simple.Program
 import Distribution.System (OS(Windows,Linux,OSX), buildOS)
 import Distribution.Simple.Utils
-    ( withFileContents, tryFindPackageDesc )
+    ( withFileContents, withTempDirectory, tryFindPackageDesc )
 import Distribution.Simple.Configure
     ( getPersistBuildConfig )
 import Distribution.Version
@@ -36,6 +38,7 @@ import Distribution.Types.UnqualComponentName
 import Distribution.Types.LocalBuildInfo
 import Distribution.PackageDescription
 import Distribution.PackageDescription.Parsec
+import Distribution.Verbosity (normal)
 
 import Distribution.Compat.Stack
 
@@ -59,6 +62,7 @@ import System.Directory
 #ifndef mingw32_HOST_OS
 import Control.Monad.Catch ( bracket_ )
 import System.Posix.Files  ( createSymbolicLink )
+import System.Posix.Resource
 #endif
 
 ------------------------------------------------------------------------
@@ -113,7 +117,17 @@ setup :: String -> [String] -> TestM ()
 setup cmd args = void (setup' cmd args)
 
 setup' :: String -> [String] -> TestM Result
-setup' cmd args = do
+setup' = setup'' "."
+
+setup''
+  :: FilePath
+  -- ^ Subdirectory to find the @.cabal@ file in.
+  -> String
+  -- ^ Command name
+  -> [String]
+  -- ^ Arguments
+  -> TestM Result
+setup'' prefix cmd args = do
     env <- getTestEnv
     when ((cmd == "register" || cmd == "copy") && not (testHavePackageDb env)) $
         error "Cannot register/copy without using 'withPackageDb'"
@@ -147,9 +161,34 @@ setup' cmd args = do
     defaultRecordMode RecordMarked $ do
     recordHeader ["Setup", cmd]
     if testCabalInstallAsSetup env
-        then runProgramM cabalProgram full_args
+        then 
+            -- `cabal` and `Setup` no longer have the same interface.
+            -- A bit of fettling is required to hide this fact.
+            let 
+                legacyCmds = 
+                    [ "build"
+                    , "configure"
+                    , "repl"
+                    , "freeze"
+                    , "run"
+                    , "test"
+                    , "bench"
+                    , "haddock"
+                    , "exec"
+                    , "update"
+                    , "install"
+                    , "clean"
+                    , "register"
+                    , "copy"
+                    , "sdist"
+                    , "reconfigure"
+                    , "doctest"
+                    ]
+                (a:as) = full_args
+                full_args' = if a `elem` legacyCmds then ("v1-" ++ a) : as else a:as
+            in runProgramM cabalProgram full_args'
         else do
-            pdfile <- liftIO $ tryFindPackageDesc (testCurrentDir env)
+            pdfile <- liftIO $ tryFindPackageDesc (testCurrentDir env </> prefix)
             pdesc <- liftIO $ readGenericPackageDescription (testVerbosity env) pdfile
             if buildType (packageDescription pdesc) == Simple
                 then runM (testSetupPath env) full_args
@@ -158,7 +197,7 @@ setup' cmd args = do
                   r <- liftIO $ runghc (testScriptEnv env)
                                        (Just (testCurrentDir env))
                                        (testEnvironment env)
-                                       (testCurrentDir env </> "Setup.hs")
+                                       (testCurrentDir env </> prefix </> "Setup.hs")
                                        full_args
                   recordLog r
                   requireSuccess r
@@ -247,14 +286,15 @@ cabalG' global_args cmd args = do
     env <- getTestEnv
     -- Freeze writes out cabal.config to source directory, this is not
     -- overwritable
-    when (cmd `elem` ["freeze"]) requireHasSourceCopy
+    when (cmd == "v1-freeze") requireHasSourceCopy
     let extra_args
           -- Sandboxes manage dist dir
           | testHaveSandbox env
           = install_args
-          | cmd `elem` ["update", "outdated", "user-config", "manpage", "freeze"]
+          | cmd `elem` ["v1-update", "outdated", "user-config", "manpage", "v1-freeze", "check"]
           = [ ]
           -- new-build commands are affected by testCabalProjectFile
+          | cmd == "new-sdist" = [ "--project-file", testCabalProjectFile env ]
           | "new-" `isPrefixOf` cmd
           = [ "--builddir", testDistDir env
             , "--project-file", testCabalProjectFile env
@@ -263,8 +303,8 @@ cabalG' global_args cmd args = do
           = [ "--builddir", testDistDir env ] ++
             install_args
         install_args
-          | cmd == "install"
-         || cmd == "build" = [ "-j1" ]
+          | cmd == "v1-install"
+         || cmd == "v1-build" = [ "-j1" ]
           | otherwise = []
         extra_global_args
           | testHaveSandbox env
@@ -287,11 +327,11 @@ cabal_sandbox' :: String -> [String] -> TestM Result
 cabal_sandbox' cmd args = do
     env <- getTestEnv
     let cabal_args = [ "--sandbox-config-file", testSandboxConfigFile env
-                     , "sandbox", cmd
+                     , "v1-sandbox", cmd
                      , marked_verbose ]
                   ++ args
     defaultRecordMode RecordMarked $ do
-    recordHeader ["cabal", "sandbox", cmd]
+    recordHeader ["cabal", "v1-sandbox", cmd]
     cabal_raw' cabal_args
 
 cabal_raw' :: [String] -> TestM Result
@@ -477,7 +517,10 @@ src `archiveTo` dst = do
     -- TODO: Consider using the @tar@ library?
     let (src_parent, src_dir) = splitFileName src
     -- TODO: --format ustar, like createArchive?
-    tar ["-czf", dst, "-C", src_parent, src_dir]
+    -- --force-local is necessary for handling colons in Windows paths.
+    tar $ ["-czf", dst]
+       ++ ["--force-local" | buildOS == Windows]
+       ++ ["-C", src_parent, src_dir]
 
 infixr 4 `archiveTo`
 
@@ -509,10 +552,10 @@ withRepo repo_dir m = do
     hackageRepoTool "bootstrap" ["--keys", testKeysDir env, "--repo", testRepoDir env]
     -- 5. Wire it up in .cabal/config
     -- TODO: libify this
-    let package_cache = testHomeDir env </> ".cabal" </> "packages"
+    let package_cache = testCabalDir env </> "packages"
     liftIO $ appendFile (testUserCabalConfigFile env)
            $ unlines [ "repository test-local-repo"
-                     , "  url: file:" ++ testRepoDir env
+                     , "  url: " ++ repoUri env
                      , "  secure: True"
                      -- TODO: Hypothetically, we could stick in the
                      -- correct key here
@@ -523,10 +566,22 @@ withRepo repo_dir m = do
     -- fix that this can be removed)
     liftIO $ createDirectoryIfMissing True (package_cache </> "test-local-repo")
     -- 7. Update our local index
-    cabal "update" []
+    cabal "v1-update" []
     -- 8. Profit
     withReaderT (\env' -> env' { testHaveRepo = True }) m
     -- TODO: Arguably should undo everything when we're done...
+  where
+    -- Work around issue #5218 (incorrect conversions between Windows paths and
+    -- file URIs) by using a relative path on Windows.
+    repoUri env =
+      if buildOS == Windows
+      then let relPath = definitelyMakeRelative (testCurrentDir env)
+                                                (testRepoDir env)
+               convertSeparators = intercalate "/"
+                                 . map dropTrailingPathSeparator
+                                 . splitPath
+           in "file:" ++ convertSeparators relPath
+      else "file:" ++ testRepoDir env
 
 ------------------------------------------------------------------------
 -- * Subprocess run results
@@ -751,6 +806,19 @@ isOSX = return (buildOS == OSX)
 isLinux :: TestM Bool
 isLinux = return (buildOS == Linux)
 
+getOpenFilesLimit :: TestM (Maybe Integer)
+#ifdef mingw32_HOST_OS
+-- No MS-specified limit, was determined experimentally on Windows 10 Pro x64,
+-- matches other online reports from other versions of Windows.
+getOpenFilesLimit = return (Just 2048)
+#else
+getOpenFilesLimit = liftIO $ do
+    ResourceLimits { softLimit } <- getResourceLimit ResourceOpenFiles
+    case softLimit of
+        ResourceLimit n -> return (Just n)
+        _ -> return Nothing
+#endif
+
 hasCabalForGhc :: TestM Bool
 hasCabalForGhc = do
     env <- getTestEnv
@@ -832,6 +900,8 @@ ghc' args = do
 -- This requires the test repository to be a Git checkout, because
 -- we use the Git metadata to figure out what files to copy into the
 -- hermetic copy.
+--
+-- Also see 'withSourceCopyDir'.
 withSourceCopy :: TestM a -> TestM a
 withSourceCopy m = do
     env <- getTestEnv
@@ -843,6 +913,21 @@ withSourceCopy m = do
             liftIO $ createDirectoryIfMissing True (takeDirectory (dest </> f))
             liftIO $ copyFile (cwd </> f) (dest </> f)
     withReaderT (\nenv -> nenv { testHaveSourceCopy = True }) m
+
+-- | If a test needs to modify or write out source files, it's
+-- necessary to make a hermetic copy of the source files to operate
+-- on.  This function arranges for this to be done in a subdirectory
+-- with a given name, so that tests that are sensitive to the path
+-- that they're running in (e.g., autoconf tests) can run.
+--
+-- This requires the test repository to be a Git checkout, because
+-- we use the Git metadata to figure out what files to copy into the
+-- hermetic copy.
+--
+-- Also see 'withSourceCopy'.
+withSourceCopyDir :: FilePath -> TestM a -> TestM a
+withSourceCopyDir dir =
+  withReaderT (\nenv -> nenv { testSourceCopyRelativeDir = dir }) . withSourceCopy
 
 -- | Look up the 'InstalledPackageId' of a package name.
 getIPID :: String -> TestM String
@@ -927,3 +1012,14 @@ isTestFile f =
         ".test.hs"      -> True
         ".multitest.hs" -> True
         _               -> False
+
+-- | Work around issue #4515 (store paths exceeding the Windows path length
+-- limit) by creating a temporary directory for the new-build store. This
+-- function creates a directory immediately under the current drive on Windows.
+-- The directory must be passed to new- commands with --store-dir.
+withShorterPathForNewBuildStore :: (FilePath -> IO a) -> IO a
+withShorterPathForNewBuildStore test = do
+  tempDir <- if buildOS == Windows
+             then takeDrive `fmap` getCurrentDirectory
+             else getTemporaryDirectory
+  withTempDirectory normal tempDir "cabal-test-store" test

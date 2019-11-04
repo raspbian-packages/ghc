@@ -49,6 +49,7 @@ import PrimOp           ( PrimCall(..) )
 import UniqFM
 import SrcLoc           ( mkGeneralSrcSpan )
 
+import Data.List.NonEmpty (nonEmpty, toList)
 import Data.Maybe    (isJust, fromMaybe)
 import Control.Monad (liftM, ap)
 
@@ -130,15 +131,6 @@ import Control.Monad (liftM, ap)
 --
 -- The CafInfo has already been calculated during the CoreTidy pass.
 --
--- During CoreToStg, we then pin onto each binding and case expression, a
--- list of Ids which represents the "live" CAFs at that point.  The meaning
--- of "live" here is the same as for live variables, see above (which is
--- why it's convenient to collect CAF information here rather than elsewhere).
---
--- The later SRT pass takes these lists of Ids and uses them to construct
--- the actual nested SRTs, and replaces the lists of Ids with (offset,length)
--- pairs.
-
 -- Note [What is a non-escaping let]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 --
@@ -398,9 +390,10 @@ coreToStgExpr
 -- on these components, but it in turn is not scrutinised as the basis for any
 -- decisions.  Hence no black holes.
 
--- No LitInteger's should be left by the time this is called. CorePrep
--- should have converted them all to a real core representation.
-coreToStgExpr (Lit (LitInteger {})) = panic "coreToStgExpr: LitInteger"
+-- No LitInteger's or LitNatural's should be left by the time this is called.
+-- CorePrep should have converted them all to a real core representation.
+coreToStgExpr (Lit (LitNumber LitNumInteger _ _)) = panic "coreToStgExpr: LitInteger"
+coreToStgExpr (Lit (LitNumber LitNumNatural _ _)) = panic "coreToStgExpr: LitNatural"
 coreToStgExpr (Lit l)      = return (StgLit l, emptyFVInfo)
 coreToStgExpr (Var v)      = coreToStgApp Nothing v               [] []
 coreToStgExpr (Coercion _) = coreToStgApp Nothing coercionTokenId [] []
@@ -418,9 +411,10 @@ coreToStgExpr expr@(Lam _ _)
     extendVarEnvCts [ (a, LambdaBound) | a <- args' ] $ do
     (body, body_fvs) <- coreToStgExpr body
     let
-        fvs             = args' `minusFVBinders` body_fvs
-        result_expr | null args' = body
-                    | otherwise  = StgLam args' body
+        fvs         = args' `minusFVBinders` body_fvs
+        result_expr = case nonEmpty args' of
+          Nothing     -> body
+          Just args'' -> StgLam args'' body
 
     return (result_expr, fvs)
 
@@ -771,11 +765,10 @@ mkTopStgRhs :: DynFlags -> Module -> CollectedCCs
 mkTopStgRhs dflags this_mod ccs rhs_fvs bndr binder_info rhs
   | StgLam bndrs body <- rhs
   = -- StgLam can't have empty arguments, so not CAF
-    ASSERT(not (null bndrs))
     ( StgRhsClosure dontCareCCS binder_info
                     (getFVs rhs_fvs)
                     ReEntrant
-                    bndrs body
+                    (toList bndrs) body
     , ccs )
 
   | StgConApp con args _ <- unticked_rhs
@@ -806,7 +799,7 @@ mkTopStgRhs dflags this_mod ccs rhs_fvs bndr binder_info rhs
              | otherwise                      = Updatable
 
     -- CAF cost centres generated for -fcaf-all
-    caf_cc = mkAutoCC bndr modl CafCC
+    caf_cc = mkAutoCC bndr modl
     caf_ccs = mkSingletonCCS caf_cc
            -- careful: the binder might be :Main.main,
            -- which doesn't belong to module mod_name.
@@ -825,7 +818,7 @@ mkStgRhs rhs_fvs bndr binder_info rhs
   = StgRhsClosure currentCCS binder_info
                   (getFVs rhs_fvs)
                   ReEntrant
-                  bndrs body
+                  (toList bndrs) body
 
   | isJoinId bndr -- must be a nullary join point
   = ASSERT(idJoinArity bndr == 0)

@@ -22,6 +22,7 @@
 #include "Printer.h"
 #include "Capability.h"
 
+#include <fs_rts.h>
 #include <string.h>
 
 #if defined(DEBUG)
@@ -31,7 +32,11 @@
 /*
  * Profiling allocation arena.
  */
+#if defined(DEBUG)
+Arena *prof_arena;
+#else
 static Arena *prof_arena;
+#endif
 
 /*
  * Global variables used to assign unique IDs to cc's, ccs's, and
@@ -264,7 +269,7 @@ initProfilingLogFile(void)
         sprintf(prof_filename, "%s.prof", stem);
 
         /* open the log file */
-        if ((prof_file = fopen(prof_filename, "w")) == NULL) {
+        if ((prof_file = __rts_fopen(prof_filename, "w")) == NULL) {
             debugBelch("Can't open profiling report file %s\n", prof_filename);
             RtsFlags.CcFlags.doCostCentres = 0;
             // Retainer profiling (`-hr` or `-hr<cc> -h<x>`) writes to
@@ -281,7 +286,7 @@ initProfilingLogFile(void)
         sprintf(hp_filename, "%s.hp", stem);
 
         /* open the log file */
-        if ((hp_file = fopen(hp_filename, "w")) == NULL) {
+        if ((hp_file = __rts_fopen(hp_filename, "w")) == NULL) {
             debugBelch("Can't open profiling report file %s\n",
                        hp_filename);
             RtsFlags.ProfFlags.doHeapProfile = 0;

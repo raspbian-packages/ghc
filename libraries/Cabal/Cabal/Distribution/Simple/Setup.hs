@@ -60,6 +60,8 @@ module Distribution.Simple.Setup (
   buildOptions, haddockOptions, installDirsOptions,
   programDbOptions, programDbPaths',
   programConfigurationOptions, programConfigurationPaths',
+  programFlagsDescription,
+  replOptions,
   splitArgs,
 
   defaultDistPref, optionDistPref,
@@ -92,6 +94,7 @@ import Distribution.PackageDescription hiding (Flag)
 import Distribution.Simple.Command hiding (boolOpt, boolOpt')
 import qualified Distribution.Simple.Command as Command
 import Distribution.Simple.Compiler hiding (Flag)
+import Distribution.Simple.Flag
 import Distribution.Simple.Utils
 import Distribution.Simple.Program
 import Distribution.Simple.InstallDirs
@@ -110,94 +113,6 @@ import Data.Function (on)
 -- FIXME Not sure where this should live
 defaultDistPref :: FilePath
 defaultDistPref = "dist"
-
--- ------------------------------------------------------------
--- * Flag type
--- ------------------------------------------------------------
-
--- | All flags are monoids, they come in two flavours:
---
--- 1. list flags eg
---
--- > --ghc-option=foo --ghc-option=bar
---
--- gives us all the values ["foo", "bar"]
---
--- 2. singular value flags, eg:
---
--- > --enable-foo --disable-foo
---
--- gives us Just False
--- So this Flag type is for the latter singular kind of flag.
--- Its monoid instance gives us the behaviour where it starts out as
--- 'NoFlag' and later flags override earlier ones.
---
-data Flag a = Flag a | NoFlag deriving (Eq, Generic, Show, Read)
-
-instance Binary a => Binary (Flag a)
-
-instance Functor Flag where
-  fmap f (Flag x) = Flag (f x)
-  fmap _ NoFlag  = NoFlag
-
-instance Monoid (Flag a) where
-  mempty = NoFlag
-  mappend = (<>)
-
-instance Semigroup (Flag a) where
-  _ <> f@(Flag _) = f
-  f <> NoFlag     = f
-
-instance Bounded a => Bounded (Flag a) where
-  minBound = toFlag minBound
-  maxBound = toFlag maxBound
-
-instance Enum a => Enum (Flag a) where
-  fromEnum = fromEnum . fromFlag
-  toEnum   = toFlag   . toEnum
-  enumFrom (Flag a) = map toFlag . enumFrom $ a
-  enumFrom _        = []
-  enumFromThen (Flag a) (Flag b) = toFlag `map` enumFromThen a b
-  enumFromThen _        _        = []
-  enumFromTo   (Flag a) (Flag b) = toFlag `map` enumFromTo a b
-  enumFromTo   _        _        = []
-  enumFromThenTo (Flag a) (Flag b) (Flag c) = toFlag `map` enumFromThenTo a b c
-  enumFromThenTo _        _        _        = []
-
-toFlag :: a -> Flag a
-toFlag = Flag
-
-fromFlag :: WithCallStack (Flag a -> a)
-fromFlag (Flag x) = x
-fromFlag NoFlag   = error "fromFlag NoFlag. Use fromFlagOrDefault"
-
-fromFlagOrDefault :: a -> Flag a -> a
-fromFlagOrDefault _   (Flag x) = x
-fromFlagOrDefault def NoFlag   = def
-
-flagToMaybe :: Flag a -> Maybe a
-flagToMaybe (Flag x) = Just x
-flagToMaybe NoFlag   = Nothing
-
-flagToList :: Flag a -> [a]
-flagToList (Flag x) = [x]
-flagToList NoFlag   = []
-
-allFlags :: [Flag Bool] -> Flag Bool
-allFlags flags = if all (\f -> fromFlagOrDefault False f) flags
-                 then Flag True
-                 else NoFlag
-
-maybeToFlag :: Maybe a -> Flag a
-maybeToFlag Nothing  = NoFlag
-maybeToFlag (Just x) = Flag x
-
--- | Types that represent boolean flags.
-class BooleanFlag a where
-    asBool :: a -> Bool
-
-instance BooleanFlag Bool where
-  asBool = id
 
 -- ------------------------------------------------------------
 -- * Global flags
@@ -295,8 +210,7 @@ data ConfigFlags = ConfigFlags {
     configProgramArgs   :: [(String, [String])], -- ^user specified programs args
     configProgramPathExtra :: NubList FilePath,  -- ^Extend the $PATH
     configHcFlavor      :: Flag CompilerFlavor, -- ^The \"flavor\" of the
-                                                -- compiler, such as GHC or
-                                                -- JHC.
+                                                -- compiler, e.g. GHC.
     configHcPath        :: Flag FilePath, -- ^given compiler location
     configHcPkg         :: Flag FilePath, -- ^given hc-pkg location
     configVanillaLib    :: Flag Bool,     -- ^Enable vanilla library
@@ -521,8 +435,6 @@ configureOptions showOrParseArgs =
          configHcFlavor (\v flags -> flags { configHcFlavor = v })
          (choiceOpt [ (Flag GHC,   ("g", ["ghc"]),   "compile with GHC")
                     , (Flag GHCJS, ([] , ["ghcjs"]), "compile with GHCJS")
-                    , (Flag JHC,   ([] , ["jhc"]),   "compile with JHC")
-                    , (Flag LHC,   ([] , ["lhc"]),   "compile with LHC")
                     , (Flag UHC,   ([] , ["uhc"]),   "compile with UHC")
                     -- "haskell-suite" compiler id string will be replaced
                     -- by a more specific one during the configure stage
@@ -942,9 +854,9 @@ copyCommand = CommandUI
        ++ "Without the --destdir flag, configure determines location.\n"
   , commandNotes        = Just $ \pname ->
        "Examples:\n"
-        ++ "  " ++ pname ++ " build           "
+        ++ "  " ++ pname ++ " copy           "
         ++ "    All the components in the package\n"
-        ++ "  " ++ pname ++ " build foo       "
+        ++ "  " ++ pname ++ " copy foo       "
         ++ "    A component (i.e. lib, exe, test suite)"
   , commandUsage        = usageAlternatives "copy" $
       [ "[FLAGS]"
@@ -1310,7 +1222,8 @@ hscolourCommand = CommandUI
   , commandSynopsis     =
       "Generate HsColour colourised code, in HTML format."
   , commandDescription  = Just (\_ -> "Requires the hscolour program.\n")
-  , commandNotes        = Nothing
+  , commandNotes        = Just $ \_ ->
+      "Deprecated in favour of 'cabal haddock --hyperlink-source'."
   , commandUsage        = \pname ->
       "Usage: " ++ pname ++ " hscolour [FLAGS]\n"
   , commandDefaultFlags = defaultHscolourFlags
@@ -1465,12 +1378,14 @@ data HaddockFlags = HaddockFlags {
     haddockInternal     :: Flag Bool,
     haddockCss          :: Flag FilePath,
     haddockLinkedSource :: Flag Bool,
+    haddockQuickJump    :: Flag Bool,
     haddockHscolourCss  :: Flag FilePath,
     haddockContents     :: Flag PathTemplate,
     haddockDistPref     :: Flag FilePath,
     haddockKeepTempFiles:: Flag Bool,
     haddockVerbosity    :: Flag Verbosity,
-    haddockCabalFilePath :: Flag FilePath
+    haddockCabalFilePath :: Flag FilePath,
+    haddockArgs         :: [String]
   }
   deriving (Show, Generic)
 
@@ -1489,12 +1404,14 @@ defaultHaddockFlags  = HaddockFlags {
     haddockInternal     = Flag False,
     haddockCss          = NoFlag,
     haddockLinkedSource = Flag False,
+    haddockQuickJump    = Flag False,
     haddockHscolourCss  = NoFlag,
     haddockContents     = NoFlag,
     haddockDistPref     = NoFlag,
     haddockKeepTempFiles= Flag False,
     haddockVerbosity    = Flag normal,
-    haddockCabalFilePath = mempty
+    haddockCabalFilePath = mempty,
+    haddockArgs         = mempty
   }
 
 haddockCommand :: CommandUI HaddockFlags
@@ -1504,8 +1421,10 @@ haddockCommand = CommandUI
   , commandDescription  = Just $ \_ ->
       "Requires the program haddock, version 2.x.\n"
   , commandNotes        = Nothing
-  , commandUsage        = \pname ->
-      "Usage: " ++ pname ++ " haddock [FLAGS]\n"
+  , commandUsage        = usageAlternatives "haddock" $
+      [ "[FLAGS]"
+      , "COMPONENTS [FLAGS]"
+      ]
   , commandDefaultFlags = defaultHaddockFlags
   , commandOptions      = \showOrParseArgs ->
          haddockOptions showOrParseArgs
@@ -1598,9 +1517,14 @@ haddockOptions showOrParseArgs =
    haddockCss (\v flags -> flags { haddockCss = v })
    (reqArgFlag "PATH")
 
-  ,option "" ["hyperlink-source","hyperlink-sources"]
+  ,option "" ["hyperlink-source","hyperlink-sources","hyperlinked-source"]
    "Hyperlink the documentation to the source code"
    haddockLinkedSource (\v flags -> flags { haddockLinkedSource = v })
+   trueArg
+
+  ,option "" ["quickjump"]
+   "Generate an index for interactive documentation navigation"
+   haddockQuickJump (\v flags -> flags { haddockQuickJump = v })
    trueArg
 
   ,option "" ["hscolour-css"]
@@ -1785,7 +1709,8 @@ data ReplFlags = ReplFlags {
     replProgramArgs :: [(String, [String])],
     replDistPref    :: Flag FilePath,
     replVerbosity   :: Flag Verbosity,
-    replReload      :: Flag Bool
+    replReload      :: Flag Bool,
+    replReplOptions :: [String]
   }
   deriving (Show, Generic)
 
@@ -1795,7 +1720,8 @@ defaultReplFlags  = ReplFlags {
     replProgramArgs = [],
     replDistPref    = NoFlag,
     replVerbosity   = Flag normal,
-    replReload      = Flag False
+    replReload      = Flag False,
+    replReplOptions = []
   }
 
 instance Monoid ReplFlags where
@@ -1835,7 +1761,7 @@ replCommand progDb = CommandUI
       ++ "    The first component in the package\n"
       ++ "  " ++ pname ++ " repl foo       "
       ++ "    A named component (i.e. lib, exe, test suite)\n"
-      ++ "  " ++ pname ++ " repl --ghc-options=\"-lstdc++\""
+      ++ "  " ++ pname ++ " repl --repl-options=\"-lstdc++\""
       ++ "  Specifying flags for interpreter\n"
 --TODO: re-enable once we have support for module/file targets
 --        ++ "  " ++ pname ++ " repl Foo.Bar   "
@@ -1871,7 +1797,14 @@ replCommand progDb = CommandUI
               trueArg
             ]
           _ -> []
+     ++ map liftReplOption (replOptions showOrParseArgs)
   }
+  where
+    liftReplOption = liftOption replReplOptions (\v flags -> flags { replReplOptions = v })
+
+replOptions :: ShowOrParseArgs -> [OptionField [String]]
+replOptions _ = [ option [] ["repl-options"] "use this option for the repl" id
+              const (reqArg "FLAG" (succeedReadE (:[])) id) ]
 
 -- ------------------------------------------------------------
 -- * Test flags
