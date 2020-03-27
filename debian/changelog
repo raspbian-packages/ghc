@@ -1,11 +1,17 @@
-ghc (8.8.1+dfsg1+is+8.6.5+dfsg1-2+rpi1) bullseye-staging; urgency=medium
+ghc (8.8.1+dfsg1+is+8.6.5+dfsg1-3+rpi1) bullseye-staging; urgency=medium
 
   [changes brought forward from 7.6.3-21+rpi1 by Peter Michael Green <plugwash@raspbian.org> at Sun, 19 Apr 2015 14:00:16 +0000]
   * Change compiler defaults for armv6
   [changed introduced in 7.10.3-2+rpi1 by Peter Michael Green]
   * Add call to dh_autoreconf_clean
 
- -- Raspbian forward porter <root@raspbian.org>  Mon, 04 Nov 2019 06:37:07 +0000
+ -- Raspbian forward porter <root@raspbian.org>  Fri, 27 Mar 2020 16:35:29 +0000
+
+ghc (8.8.1+dfsg1+is+8.6.5+dfsg1-3) unstable; urgency=medium
+
+  * Switch to python3-sphinx; Closes: #943097
+
+ -- Sandro Tosi <morph@debian.org>  Mon, 23 Mar 2020 21:50:31 -0400
 
 ghc (8.8.1+dfsg1+is+8.6.5+dfsg1-2) unstable; urgency=medium
 
