@@ -47,11 +47,13 @@ module Distribution.Client.Dependency (
     setPreferenceDefault,
     setReorderGoals,
     setCountConflicts,
+    setMinimizeConflictSet,
     setIndependentGoals,
     setAvoidReinstalls,
     setShadowPkgs,
     setStrongFlags,
     setAllowBootLibInstalls,
+    setOnlyConstrained,
     setMaxBackjumps,
     setEnableBackjumping,
     setSolveExecutables,
@@ -102,7 +104,7 @@ import Distribution.Simple.Utils
          ( comparing )
 import Distribution.Simple.Setup
          ( asBool )
-import Distribution.Text
+import Distribution.Deprecated.Text
          ( display )
 import Distribution.Verbosity
          ( normal, Verbosity )
@@ -157,6 +159,7 @@ data DepResolverParams = DepResolverParams {
        depResolverSourcePkgIndex    :: PackageIndex.PackageIndex UnresolvedSourcePackage,
        depResolverReorderGoals      :: ReorderGoals,
        depResolverCountConflicts    :: CountConflicts,
+       depResolverMinimizeConflictSet :: MinimizeConflictSet,
        depResolverIndependentGoals  :: IndependentGoals,
        depResolverAvoidReinstalls   :: AvoidReinstalls,
        depResolverShadowPkgs        :: ShadowPkgs,
@@ -164,6 +167,10 @@ data DepResolverParams = DepResolverParams {
 
        -- | Whether to allow base and its dependencies to be installed.
        depResolverAllowBootLibInstalls :: AllowBootLibInstalls,
+
+       -- | Whether to only allow explicitly constrained packages plus
+       -- goals or to allow any package.
+       depResolverOnlyConstrained   :: OnlyConstrained,
 
        depResolverMaxBackjumps      :: Maybe Int,
        depResolverEnableBackjumping :: EnableBackjumping,
@@ -190,11 +197,13 @@ showDepResolverParams p =
   ++ "\nstrategy: "          ++ show (depResolverPreferenceDefault        p)
   ++ "\nreorder goals: "     ++ show (asBool (depResolverReorderGoals     p))
   ++ "\ncount conflicts: "   ++ show (asBool (depResolverCountConflicts   p))
+  ++ "\nminimize conflict set: " ++ show (asBool (depResolverMinimizeConflictSet p))
   ++ "\nindependent goals: " ++ show (asBool (depResolverIndependentGoals p))
   ++ "\navoid reinstalls: "  ++ show (asBool (depResolverAvoidReinstalls  p))
   ++ "\nshadow packages: "   ++ show (asBool (depResolverShadowPkgs       p))
   ++ "\nstrong flags: "      ++ show (asBool (depResolverStrongFlags      p))
   ++ "\nallow boot library installs: " ++ show (asBool (depResolverAllowBootLibInstalls p))
+  ++ "\nonly constrained packages: " ++ show (depResolverOnlyConstrained p)
   ++ "\nmax backjumps: "     ++ maybe "infinite" show
                                      (depResolverMaxBackjumps             p)
   where
@@ -245,11 +254,13 @@ basicDepResolverParams installedPkgIndex sourcePkgIndex =
        depResolverSourcePkgIndex    = sourcePkgIndex,
        depResolverReorderGoals      = ReorderGoals False,
        depResolverCountConflicts    = CountConflicts True,
+       depResolverMinimizeConflictSet = MinimizeConflictSet False,
        depResolverIndependentGoals  = IndependentGoals False,
        depResolverAvoidReinstalls   = AvoidReinstalls False,
        depResolverShadowPkgs        = ShadowPkgs False,
        depResolverStrongFlags       = StrongFlags False,
        depResolverAllowBootLibInstalls = AllowBootLibInstalls False,
+       depResolverOnlyConstrained   = OnlyConstrainedNone,
        depResolverMaxBackjumps      = Nothing,
        depResolverEnableBackjumping = EnableBackjumping True,
        depResolverSolveExecutables  = SolveExecutables True,
@@ -299,6 +310,12 @@ setCountConflicts count params =
       depResolverCountConflicts = count
     }
 
+setMinimizeConflictSet :: MinimizeConflictSet -> DepResolverParams -> DepResolverParams
+setMinimizeConflictSet minimize params =
+    params {
+      depResolverMinimizeConflictSet = minimize
+    }
+
 setIndependentGoals :: IndependentGoals -> DepResolverParams -> DepResolverParams
 setIndependentGoals indep params =
     params {
@@ -328,6 +345,12 @@ setAllowBootLibInstalls i params =
     params {
       depResolverAllowBootLibInstalls = i
     }
+
+setOnlyConstrained :: OnlyConstrained -> DepResolverParams -> DepResolverParams
+setOnlyConstrained i params =
+  params {
+    depResolverOnlyConstrained = i
+  }
 
 setMaxBackjumps :: Maybe Int -> DepResolverParams -> DepResolverParams
 setMaxBackjumps n params =
@@ -459,8 +482,8 @@ relaxPackageDeps _ rd gpd | not (isRelaxDeps rd) = gpd -- subsumed by no-op case
 relaxPackageDeps relKind RelaxDepsAll  gpd = PD.transformAllBuildDepends relaxAll gpd
   where
     relaxAll :: Dependency -> Dependency
-    relaxAll (Dependency pkgName verRange) =
-        Dependency pkgName (removeBound relKind RelaxDepModNone verRange)
+    relaxAll (Dependency pkgName verRange cs) =
+        Dependency pkgName (removeBound relKind RelaxDepModNone verRange) cs
 
 relaxPackageDeps relKind (RelaxDepsSome depsToRelax0) gpd =
   PD.transformAllBuildDepends relaxSome gpd
@@ -480,13 +503,13 @@ relaxPackageDeps relKind (RelaxDepsSome depsToRelax0) gpd =
           | otherwise         -> Nothing
 
     relaxSome :: Dependency -> Dependency
-    relaxSome d@(Dependency depName verRange)
+    relaxSome d@(Dependency depName verRange cs)
         | Just relMod <- Map.lookup RelaxDepSubjectAll depsToRelax =
             -- a '*'-subject acts absorbing, for consistency with
             -- the 'Semigroup RelaxDeps' instance
-            Dependency depName (removeBound relKind relMod verRange)
+            Dependency depName (removeBound relKind relMod verRange) cs
         | Just relMod <- Map.lookup (RelaxDepSubjectPkg depName) depsToRelax =
-            Dependency depName (removeBound relKind relMod verRange)
+            Dependency depName (removeBound relKind relMod verRange) cs
         | otherwise = d -- no-op
 
 -- | Internal helper for 'relaxPackageDeps'
@@ -612,7 +635,7 @@ basicInstallPolicy
 
 
 -- | The policy used by all the standard commands, install, fetch, freeze etc
--- (but not the new-build and related commands).
+-- (but not the v2-build and related commands).
 --
 -- It extends the 'basicInstallPolicy' with a policy on setup deps.
 --
@@ -632,7 +655,7 @@ standardInstallPolicy installedPkgIndex sourcePkgDb pkgSpecifiers
       mkDefaultSetupDeps :: UnresolvedSourcePackage -> Maybe [Dependency]
       mkDefaultSetupDeps srcpkg | affected        =
         Just [Dependency (mkPackageName "Cabal")
-              (orLaterVersion $ mkVersion [1,24])]
+              (orLaterVersion $ mkVersion [1,24]) (Set.singleton PD.LMainLibName)]
                                 | otherwise       = Nothing
         where
           gpkgdesc = packageDescription srcpkg
@@ -732,9 +755,8 @@ resolveDependencies platform comp pkgConfigDB solver params =
 
     Step (showDepResolverParams finalparams)
   $ fmap (validateSolverResult platform comp indGoals)
-  $ runSolver solver (SolverConfig reordGoals cntConflicts
-                      indGoals noReinstalls
-                      shadowing strFlags allowBootLibs maxBkjumps enableBj
+  $ runSolver solver (SolverConfig reordGoals cntConflicts minimize indGoals noReinstalls
+                      shadowing strFlags allowBootLibs onlyConstrained_ maxBkjumps enableBj
                       solveExes order verbosity (PruneAfterFirstSuccess False))
                      platform comp installedPkgIndex sourcePkgIndex
                      pkgConfigDB preferences constraints targets
@@ -747,11 +769,13 @@ resolveDependencies platform comp pkgConfigDB solver params =
       sourcePkgIndex
       reordGoals
       cntConflicts
+      minimize
       indGoals
       noReinstalls
       shadowing
       strFlags
       allowBootLibs
+      onlyConstrained_
       maxBkjumps
       enableBj
       solveExes
@@ -929,10 +953,10 @@ configuredPackageProblems platform cinfo
 
     packageSatisfiesDependency
       (PackageIdentifier name  version)
-      (Dependency        name' versionRange) = assert (name == name') $
+      (Dependency        name' versionRange _) = assert (name == name') $
         version `withinRange` versionRange
 
-    dependencyName (Dependency name _) = name
+    dependencyName (Dependency name _ _) = name
 
     mergedDeps :: [MergeResult Dependency PackageId]
     mergedDeps = mergeDeps requiredDeps (CD.flatDeps specifiedDeps)
@@ -991,9 +1015,10 @@ resolveWithoutDependencies :: DepResolverParams
                            -> Either [ResolveNoDepsError] [UnresolvedSourcePackage]
 resolveWithoutDependencies (DepResolverParams targets constraints
                               prefs defpref installedPkgIndex sourcePkgIndex
-                              _reorderGoals _countConflicts _indGoals _avoidReinstalls
-                              _shadowing _strFlags _maxBjumps _enableBj
-                              _solveExes _allowBootLibInstalls _order _verbosity) =
+                              _reorderGoals _countConflicts _minimizeConflictSet
+                              _indGoals _avoidReinstalls _shadowing _strFlags
+                              _maxBjumps _enableBj _solveExes
+                              _allowBootLibInstalls _onlyConstrained _order _verbosity) =
     collectEithers $ map selectPackage (Set.toList targets)
   where
     selectPackage :: PackageName -> Either ResolveNoDepsError UnresolvedSourcePackage
@@ -1004,9 +1029,9 @@ resolveWithoutDependencies (DepResolverParams targets constraints
       where
         -- Constraints
         requiredVersions = packageConstraints pkgname
-        pkgDependency    = Dependency pkgname requiredVersions
         choices          = PackageIndex.lookupDependency sourcePkgIndex
-                                                         pkgDependency
+                                                         pkgname
+                                                         requiredVersions
 
         -- Preferences
         PackagePreferences preferredVersions preferInstalled _

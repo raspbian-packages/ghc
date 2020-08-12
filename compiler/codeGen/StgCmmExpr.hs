@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE CPP, BangPatterns #-}
 
 -----------------------------------------------------------------------------
 --
@@ -32,7 +32,7 @@ import StgSyn
 
 import MkGraph
 import BlockId
-import Cmm
+import Cmm hiding ( succ )
 import CmmInfo
 import CoreSyn
 import DataCon
@@ -47,16 +47,18 @@ import Maybes
 import Util
 import FastString
 import Outputable
+import DynFlags
 
-import Control.Monad (unless,void)
-import Control.Arrow (first)
+import Control.Monad ( unless, void )
+import Control.Arrow ( first )
 import Data.Function ( on )
+import Data.List     ( partition )
 
 ------------------------------------------------------------------------
 --              cgExpr: the main function
 ------------------------------------------------------------------------
 
-cgExpr  :: StgExpr -> FCode ReturnKind
+cgExpr  :: CgStgExpr -> FCode ReturnKind
 
 cgExpr (StgApp fun args)     = cgIdApp fun args
 
@@ -81,8 +83,8 @@ cgExpr (StgTick t e)         = cgTick t >> cgExpr e
 cgExpr (StgLit lit)       = do cmm_lit <- cgLit lit
                                emitReturn [CmmLit cmm_lit]
 
-cgExpr (StgLet binds expr)             = do { cgBind binds;     cgExpr expr }
-cgExpr (StgLetNoEscape binds expr) =
+cgExpr (StgLet _ binds expr) = do { cgBind binds;     cgExpr expr }
+cgExpr (StgLetNoEscape _ binds expr) =
   do { u <- newUnique
      ; let join_id = mkBlockId u
      ; cgLneBinds join_id binds
@@ -114,7 +116,7 @@ bound only to stable things like stack locations..  The 'e' part will
 execute *next*, just like the scrutinee of a case. -}
 
 -------------------------
-cgLneBinds :: BlockId -> StgBinding -> FCode ()
+cgLneBinds :: BlockId -> CgStgBinding -> FCode ()
 cgLneBinds join_id (StgNonRec bndr rhs)
   = do  { local_cc <- saveCurrentCostCentre
                 -- See Note [Saving the current cost centre]
@@ -135,7 +137,7 @@ cgLetNoEscapeRhs
     :: BlockId          -- join point for successor of let-no-escape
     -> Maybe LocalReg   -- Saved cost centre
     -> Id
-    -> StgRhs
+    -> CgStgRhs
     -> FCode (CgIdInfo, FCode ())
 
 cgLetNoEscapeRhs join_id local_cc bndr rhs =
@@ -149,9 +151,9 @@ cgLetNoEscapeRhs join_id local_cc bndr rhs =
 cgLetNoEscapeRhsBody
     :: Maybe LocalReg   -- Saved cost centre
     -> Id
-    -> StgRhs
+    -> CgStgRhs
     -> FCode (CgIdInfo, FCode ())
-cgLetNoEscapeRhsBody local_cc bndr (StgRhsClosure cc _bi _ _upd args body)
+cgLetNoEscapeRhsBody local_cc bndr (StgRhsClosure _ cc _upd args body)
   = cgLetNoEscapeClosure bndr local_cc cc (nonVoidIds args) body
 cgLetNoEscapeRhsBody local_cc bndr (StgRhsCon cc con args)
   = cgLetNoEscapeClosure bndr local_cc cc []
@@ -168,7 +170,7 @@ cgLetNoEscapeClosure
         -> Maybe LocalReg       -- Slot for saved current cost centre
         -> CostCentreStack      -- XXX: *** NOT USED *** why not?
         -> [NonVoid Id]         -- Args (as in \ args -> body)
-        -> StgExpr              -- Body (as in above)
+        -> CgStgExpr            -- Body (as in above)
         -> FCode (CgIdInfo, FCode ())
 
 cgLetNoEscapeClosure bndr cc_slot _unused_cc args body
@@ -298,14 +300,14 @@ data GcPlan
                         -- of the case alternative(s) into the upstream check
 
 -------------------------------------
-cgCase :: StgExpr -> Id -> AltType -> [StgAlt] -> FCode ReturnKind
+cgCase :: CgStgExpr -> Id -> AltType -> [CgStgAlt] -> FCode ReturnKind
 
 cgCase (StgOpApp (StgPrimOp op) args _) bndr (AlgAlt tycon) alts
   | isEnumerationTyCon tycon -- Note [case on bool]
   = do { tag_expr <- do_enum_primop op args
 
        -- If the binder is not dead, convert the tag to a constructor
-       -- and assign it.
+       -- and assign it. See Note [Dead-binder optimisation]
        ; unless (isDeadBinder bndr) $ do
             { dflags <- getDynFlags
             ; tmp_reg <- bindArgToReg (NonVoid bndr)
@@ -385,6 +387,24 @@ Now the trouble is that 's' has VoidRep, and we do not bind void
 arguments in the environment; they don't live anywhere.  See the
 calls to nonVoidIds in various places.  So we must not look up
 's' in the environment.  Instead, just evaluate the RHS!  Simple.
+
+Note [Dead-binder optimisation]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A case-binder, or data-constructor argument, may be marked as dead,
+because we preserve occurrence-info on binders in CoreTidy (see
+CoreTidy.tidyIdBndr).
+
+If the binder is dead, we can sometimes eliminate a load.  While
+CmmSink will eliminate that load, it's very easy to kill it at source
+(giving CmmSink less work to do), and in any case CmmSink only runs
+with -O. Since the majority of case binders are dead, this
+optimisation probably still has a great benefit-cost ratio and we want
+to keep it for -O0. See also Phab:D5358.
+
+This probably also was the reason for occurrence hack in Phab:D5339 to
+exist, perhaps because the occurrence information preserved by
+'CoreTidy.tidyIdBndr' was insufficient.  But now that CmmSink does the
+job we deleted the hacks.
 -}
 
 cgCase (StgApp v []) _ (PrimAlt _) alts
@@ -547,7 +567,7 @@ maybeSaveCostCentre simple_scrut
 
 
 -----------------
-isSimpleScrut :: StgExpr -> AltType -> FCode Bool
+isSimpleScrut :: CgStgExpr -> AltType -> FCode Bool
 -- Simple scrutinee, does not block or allocate; hence safe to amalgamate
 -- heap usage from alternatives into the stuff before the case
 -- NB: if you get this wrong, and claim that the expression doesn't allocate
@@ -570,7 +590,7 @@ isSimpleOp (StgPrimOp op) stg_args                  = do
 isSimpleOp (StgPrimCallOp _) _                           = return False
 
 -----------------
-chooseReturnBndrs :: Id -> AltType -> [StgAlt] -> [NonVoid Id]
+chooseReturnBndrs :: Id -> AltType -> [CgStgAlt] -> [NonVoid Id]
 -- These are the binders of a case that are assigned by the evaluation of the
 -- scrutinee.
 -- They're non-void, see Note [Post-unarisation invariants] in UnariseStg.
@@ -591,7 +611,7 @@ chooseReturnBndrs _ _ _ = panic "chooseReturnBndrs"
                              -- MultiValAlt has only one alternative
 
 -------------------------------------
-cgAlts :: (GcPlan,ReturnKind) -> NonVoid Id -> AltType -> [StgAlt]
+cgAlts :: (GcPlan,ReturnKind) -> NonVoid Id -> AltType -> [CgStgAlt]
        -> FCode ReturnKind
 -- At this point the result of the case are in the binders
 cgAlts gc_plan _bndr PolyAlt [(_, _, rhs)]
@@ -621,28 +641,151 @@ cgAlts gc_plan bndr (AlgAlt tycon) alts
 
         ; (mb_deflt, branches) <- cgAlgAltRhss gc_plan bndr alts
 
-        ; let fam_sz   = tyConFamilySize tycon
-              bndr_reg = CmmLocal (idToReg dflags bndr)
+        ; let !fam_sz   = tyConFamilySize tycon
+              !bndr_reg = CmmLocal (idToReg dflags bndr)
+              !ptag_expr = cmmConstrTag1 dflags (CmmReg bndr_reg)
+              !branches' = first succ <$> branches
+              !maxpt = mAX_PTR_TAG dflags
+              (!via_ptr, !via_info) = partition ((< maxpt) . fst) branches'
+              !small = isSmallFamily dflags fam_sz
 
-                    -- Is the constructor tag in the node reg?
-        ; if isSmallFamily dflags fam_sz
-          then do
-                let   -- Yes, bndr_reg has constr. tag in ls bits
-                   tag_expr = cmmConstrTag1 dflags (CmmReg bndr_reg)
-                   branches' = [(tag+1,branch) | (tag,branch) <- branches]
-                emitSwitch tag_expr branches' mb_deflt 1 fam_sz
+                -- Is the constructor tag in the node reg?
+                -- See Note [Tagging big families]
+        ; if small || null via_info
+           then -- Yes, bndr_reg has constructor tag in ls bits
+               emitSwitch ptag_expr branches' mb_deflt 1
+                 (if small then fam_sz else maxpt)
 
-           else -- No, get tag from info table
-                let -- Note that ptr _always_ has tag 1
-                    -- when the family size is big enough
-                    untagged_ptr = cmmRegOffB bndr_reg (-1)
-                    tag_expr = getConstrTag dflags (untagged_ptr)
-                in emitSwitch tag_expr branches mb_deflt 0 (fam_sz - 1)
+           else -- No, the get exact tag from info table when mAX_PTR_TAG
+                -- See Note [Double switching for big families]
+              do
+                let !untagged_ptr = cmmUntag dflags (CmmReg bndr_reg)
+                    !itag_expr = getConstrTag dflags untagged_ptr
+                    !info0 = first pred <$> via_info
+                if null via_ptr then
+                  emitSwitch itag_expr info0 mb_deflt 0 (fam_sz - 1)
+                else do
+                  infos_lbl <- newBlockId
+                  infos_scp <- getTickScope
+
+                  let spillover = (maxpt, (mkBranch infos_lbl, infos_scp))
+
+                  (mb_shared_deflt, mb_shared_branch) <- case mb_deflt of
+                      (Just (stmts, scp)) ->
+                          do lbl <- newBlockId
+                             return ( Just (mkLabel lbl scp <*> stmts, scp)
+                                    , Just (mkBranch lbl, scp))
+                      _ -> return (Nothing, Nothing)
+                  -- Switch on pointer tag
+                  emitSwitch ptag_expr (spillover : via_ptr) mb_shared_deflt 1 maxpt
+                  join_lbl <- newBlockId
+                  emit (mkBranch join_lbl)
+                  -- Switch on info table tag
+                  emitLabel infos_lbl
+                  emitSwitch itag_expr info0 mb_shared_branch
+                    (maxpt - 1) (fam_sz - 1)
+                  emitLabel join_lbl
 
         ; return AssignedDirectly }
 
 cgAlts _ _ _ _ = panic "cgAlts"
         -- UbxTupAlt and PolyAlt have only one alternative
+
+-- Note [Double switching for big families]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+--
+-- An algebraic data type can have a n >= 0 summands
+-- (or alternatives), which are identified (labeled) by
+-- constructors. In memory they are kept apart by tags
+-- (see Note [Data constructor dynamic tags] in GHC.StgToCmm.Closure).
+-- Due to the characteristics of the platform that
+-- contribute to the alignment of memory objects, there
+-- is a natural limit of information about constructors
+-- that can be encoded in the pointer tag. When the mapping
+-- of constructors to the pointer tag range 1..mAX_PTR_TAG
+-- is not injective, then we have a "big data type", also
+-- called a "big (constructor) family" in the literature.
+-- Constructor tags residing in the info table are injective,
+-- but considerably more expensive to obtain, due to additional
+-- memory access(es).
+--
+-- When doing case analysis on a value of a "big data type"
+-- we need two nested switch statements to make up for the lack
+-- of injectivity of pointer tagging, also taking the info
+-- table tag into account. The exact mechanism is described next.
+--
+-- In the general case, switching on big family alternatives
+-- is done by two nested switch statements. According to
+-- Note [Tagging big families], the outer switch
+-- looks at the pointer tag and the inner dereferences the
+-- pointer and switches on the info table tag.
+--
+-- We can handle a simple case first, namely when none
+-- of the case alternatives mention a constructor having
+-- a pointer tag of 1..mAX_PTR_TAG-1. In this case we
+-- simply emit a switch on the info table tag.
+-- Note that the other simple case is when all mentioned
+-- alternatives lie in 1..mAX_PTR_TAG-1, in which case we can
+-- switch on the ptr tag only, just like in the small family case.
+--
+-- There is a single intricacy with a nested switch:
+-- Both should branch to the same default alternative, and as such
+-- avoid duplicate codegen of potentially heavy code. The outer
+-- switch generates the actual code with a prepended fresh label,
+-- while the inner one only generates a jump to that label.
+--
+-- For example, let's assume a 64-bit architecture, so that all
+-- heap objects are 8-byte aligned, and hence the address of a
+-- heap object ends in `000` (three zero bits).
+--
+-- Then consider the following data type
+--
+--   > data Big = T0 | T1 | T2 | T3 | T4 | T5 | T6 | T7 | T8
+--   Ptr tag:      1    2    3    4    5    6    7    7    7
+--   As bits:    001  010  011  100  101  110  111  111  111
+--   Info pointer tag (zero based):
+--                 0    1    2    3    4    5    6    7    8
+--
+-- Then     \case T2 -> True; T8 -> True; _ -> False
+-- will result in following code (slightly cleaned-up and
+-- commented -ddump-cmm-from-stg):
+{-
+           R1 = _sqI::P64;  -- scrutinee
+           if (R1 & 7 != 0) goto cqO; else goto cqP;
+       cqP: // global       -- enter
+           call (I64[R1])(R1) returns to cqO, args: 8, res: 8, upd: 8;
+       cqO: // global       -- already WHNF
+           _sqJ::P64 = R1;
+           _cqX::P64 = _sqJ::P64 & 7;  -- extract pointer tag
+           switch [1 .. 7] _cqX::P64 {
+               case 3 : goto cqW;
+               case 7 : goto cqR;
+               default: {goto cqS;}
+           }
+       cqR: // global
+           _cr2 = I32[I64[_sqJ::P64 & (-8)] - 4]; -- tag from info pointer
+           switch [6 .. 8] _cr2::I64 {
+               case 8 : goto cr1;
+               default: {goto cr0;}
+           }
+       cr1: // global
+           R1 = GHC.Types.True_closure+2;
+           call (P64[(old + 8)])(R1) args: 8, res: 0, upd: 8;
+       cr0: // global     -- technically necessary label
+           goto cqS;
+       cqW: // global
+           R1 = GHC.Types.True_closure+2;
+           call (P64[(old + 8)])(R1) args: 8, res: 0, upd: 8;
+       cqS: // global
+           R1 = GHC.Types.False_closure+1;
+           call (P64[(old + 8)])(R1) args: 8, res: 0, upd: 8;
+-}
+--
+-- For 32-bit systems we only have 2 tag bits in the pointers at our disposal,
+-- so the performance win is dubious, especially in face of the increased code
+-- size due to double switching. But we can take the viewpoint that 32-bit
+-- architectures are not relevant for performance any more, so this can be
+-- considered as moot.
 
 
 -- Note [alg-alt heap check]
@@ -665,8 +808,57 @@ cgAlts _ _ _ _ = panic "cgAlts"
 --   x = R1
 --   goto L1
 
+
+-- Note [Tagging big families]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+--
+-- Both the big and the small constructor families are tagged,
+-- that is, greater unions which overflow the tag space of TAG_BITS
+-- (i.e. 3 on 32 resp. 7 constructors on 64 bit archs).
+--
+-- For example, let's assume a 64-bit architecture, so that all
+-- heap objects are 8-byte aligned, and hence the address of a
+-- heap object ends in `000` (three zero bits).  Then consider
+-- > data Maybe a = Nothing | Just a
+-- > data Day a = Mon | Tue | Wed | Thu | Fri | Sat | Sun
+-- > data Grade = G1 | G2 | G3 | G4 | G5 | G6 | G7 | G8 | G9 | G10
+--
+-- Since `Grade` has more than 7 constructors, it counts as a
+-- "big data type" (also referred to as "big constructor family" in papers).
+-- On the other hand, `Maybe` and `Day` have 7 constructors or fewer, so they
+-- are "small data types".
+--
+-- Then
+--   * A pointer to an unevaluated thunk of type `Maybe Int`, `Day` or `Grade` will end in `000`
+--   * A tagged pointer to a `Nothing`, `Mon` or `G1` will end in `001`
+--   * A tagged pointer to a `Just x`, `Tue` or `G2`  will end in `010`
+--   * A tagged pointer to `Wed` or `G3` will end in `011`
+--       ...
+--   * A tagged pointer to `Sat` or `G6` will end in `110`
+--   * A tagged pointer to `Sun` or `G7` or `G8` or `G9` or `G10` will end in `111`
+--
+-- For big families we employ a mildly clever way of combining pointer and
+-- info-table tagging. We use 1..MAX_PTR_TAG-1 as pointer-resident tags where
+-- the tags in the pointer and the info table are in a one-to-one
+-- relation, whereas tag MAX_PTR_TAG is used as "spill over", signifying
+-- we have to fall back and get the precise constructor tag from the
+-- info-table.
+--
+-- Consequently we now cascade switches, because we have to check
+-- the pointer tag first, and when it is MAX_PTR_TAG, fetch the precise
+-- tag from the info table, and switch on that. The only technically
+-- tricky part is that the default case needs (logical) duplication.
+-- To do this we emit an extra label for it and branch to that from
+-- the second switch. This avoids duplicated codegen. See Trac #14373.
+-- See note [Double switching for big families] for the mechanics
+-- involved.
+--
+-- Also see note [Data constructor dynamic tags]
+-- and the wiki https://gitlab.haskell.org/ghc/ghc/wikis/commentary/rts/haskell-execution/pointer-tagging
+--
+
 -------------------
-cgAlgAltRhss :: (GcPlan,ReturnKind) -> NonVoid Id -> [StgAlt]
+cgAlgAltRhss :: (GcPlan,ReturnKind) -> NonVoid Id -> [CgStgAlt]
              -> FCode ( Maybe CmmAGraphScoped
                       , [(ConTagZ, CmmAGraphScoped)] )
 cgAlgAltRhss gc_plan bndr alts
@@ -686,13 +878,13 @@ cgAlgAltRhss gc_plan bndr alts
 
 
 -------------------
-cgAltRhss :: (GcPlan,ReturnKind) -> NonVoid Id -> [StgAlt]
+cgAltRhss :: (GcPlan,ReturnKind) -> NonVoid Id -> [CgStgAlt]
           -> FCode [(AltCon, CmmAGraphScoped)]
 cgAltRhss gc_plan bndr alts = do
   dflags <- getDynFlags
   let
     base_reg = idToReg dflags bndr
-    cg_alt :: StgAlt -> FCode (AltCon, CmmAGraphScoped)
+    cg_alt :: CgStgAlt -> FCode (AltCon, CmmAGraphScoped)
     cg_alt (con, bndrs, rhs)
       = getCodeScoped             $
         maybeAltHeapCheck gc_plan $

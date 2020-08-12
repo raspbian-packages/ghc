@@ -32,7 +32,9 @@ import PPC.Instr
 import PPC.Cond
 import PPC.Regs
 import CPrim
-import NCGMonad
+import NCGMonad   ( NatM, getNewRegNat, getNewLabelNat
+                  , getBlockIdNat, getPicBaseNat, getNewRegPairNat
+                  , getPicBaseMaybeNat )
 import Instruction
 import PIC
 import Format
@@ -463,7 +465,15 @@ getRegister' _ (CmmMachOp (MO_UU_Conv W8 W32) [CmmLoad mem _]) = do
     Amode addr addr_code <- getAmode D mem
     return (Any II32 (\dst -> addr_code `snocOL` LD II8 dst addr))
 
+getRegister' _ (CmmMachOp (MO_XX_Conv W8 W32) [CmmLoad mem _]) = do
+    Amode addr addr_code <- getAmode D mem
+    return (Any II32 (\dst -> addr_code `snocOL` LD II8 dst addr))
+
 getRegister' _ (CmmMachOp (MO_UU_Conv W8 W64) [CmmLoad mem _]) = do
+    Amode addr addr_code <- getAmode D mem
+    return (Any II64 (\dst -> addr_code `snocOL` LD II8 dst addr))
+
+getRegister' _ (CmmMachOp (MO_XX_Conv W8 W64) [CmmLoad mem _]) = do
     Amode addr addr_code <- getAmode D mem
     return (Any II64 (\dst -> addr_code `snocOL` LD II8 dst addr))
 
@@ -514,6 +524,8 @@ getRegister' dflags (CmmMachOp mop [x]) -- unary MachOps
       MO_UU_Conv from to
         | from >= to -> conversionNop (intFormat to) x
         | otherwise  -> clearLeft from to
+
+      MO_XX_Conv _ to -> conversionNop (intFormat to) x
 
       _ -> panic "PPC.CodeGen.getRegister: no match"
 
@@ -605,8 +617,8 @@ getRegister' _ (CmmMachOp mop [x, y]) -- dyadic PrimOps
       MO_S_Quot rep -> divCode rep True x y
       MO_U_Quot rep -> divCode rep False x y
 
-      MO_S_Rem rep -> remainderCode rep True x y
-      MO_U_Rem rep -> remainderCode rep False x y
+      MO_S_Rem rep -> remainder rep True x y
+      MO_U_Rem rep -> remainder rep False x y
 
       MO_And rep   -> case y of
         (CmmLit (CmmInt imm _)) | imm == -8 || imm == -4
@@ -629,6 +641,14 @@ getRegister' _ (CmmMachOp mop [x, y]) -- dyadic PrimOps
   where
     triv_float :: Width -> (Format -> Reg -> Reg -> Reg -> Instr) -> NatM Register
     triv_float width instr = trivialCodeNoImm (floatFormat width) instr x y
+
+    remainder :: Width -> Bool -> CmmExpr -> CmmExpr -> NatM Register
+    remainder rep sgn x y = do
+      let fmt = intFormat rep
+      tmp <- getNewRegNat fmt
+      code <- remainderCode rep sgn tmp x y
+      return (Any fmt code)
+
 
 getRegister' _ (CmmLit (CmmInt i rep))
   | Just imm <- makeImmediate rep True i
@@ -923,7 +943,7 @@ condIntCode' True cond W64 x y
                  , BCC LE cmp_lo Nothing
                  , CMPL II32 x_lo (RIReg y_lo)
                  , BCC ALWAYS end_lbl Nothing
-		 , NEWBLOCK cmp_lo
+                 , NEWBLOCK cmp_lo
                  , CMPL II32 y_lo (RIReg x_lo)
                  , BCC ALWAYS end_lbl Nothing
 
@@ -1035,7 +1055,7 @@ genJump tree
 
 genJump' :: CmmExpr -> GenCCallPlatform -> NatM InstrBlock
 
-genJump' tree (GCPLinux64ELF 1)
+genJump' tree (GCP64ELF 1)
   = do
         (target,code) <- getSomeReg tree
         return (code
@@ -1045,7 +1065,7 @@ genJump' tree (GCPLinux64ELF 1)
                `snocOL` LD II64 r11 (AddrRegImm target (ImmInt 16))
                `snocOL` BCTR [] Nothing)
 
-genJump' tree (GCPLinux64ELF 2)
+genJump' tree (GCP64ELF 2)
   = do
         (target,code) <- getSomeReg tree
         return (code
@@ -1097,6 +1117,8 @@ genCCall :: ForeignTarget      -- function to call
          -> [CmmFormal]        -- where to put the result
          -> [CmmActual]        -- arguments (of mixed type)
          -> NatM InstrBlock
+genCCall (PrimTarget MO_ReadBarrier) _ _
+ = return $ unitOL LWSYNC
 genCCall (PrimTarget MO_WriteBarrier) _ _
  = return $ unitOL LWSYNC
 
@@ -1334,14 +1356,8 @@ genCCall target dest_regs argsAndHints
         where divOp1 platform signed width [res_q, res_r] [arg_x, arg_y]
                 = do let reg_q = getRegisterReg platform (CmmLocal res_q)
                          reg_r = getRegisterReg platform (CmmLocal res_r)
-                         fmt   = intFormat width
-                     (x_reg, x_code) <- getSomeReg arg_x
-                     (y_reg, y_code) <- getSomeReg arg_y
-                     return $       y_code `appOL` x_code
-                            `appOL` toOL [ DIV fmt signed reg_q x_reg y_reg
-                                         , MULL fmt reg_r reg_q (RIReg y_reg)
-                                         , SUBF reg_r reg_r x_reg
-                                         ]
+                     remainderCode width signed reg_q arg_x arg_y
+                       <*> pure reg_r
 
               divOp1 _ _ _ _ _
                 = panic "genCCall: Wrong number of arguments for divOp1"
@@ -1553,18 +1569,17 @@ genCCall target dest_regs argsAndHints
                 = panic "genCall: Wrong number of arguments/results for fabs"
 
 -- TODO: replace 'Int' by an enum such as 'PPC_64ABI'
-data GenCCallPlatform = GCPLinux | GCPDarwin | GCPLinux64ELF !Int | GCPAIX
+data GenCCallPlatform = GCP32ELF | GCP64ELF !Int | GCPAIX
 
 platformToGCP :: Platform -> GenCCallPlatform
-platformToGCP platform = case platformOS platform of
-    OSLinux  -> case platformArch platform of
-        ArchPPC           -> GCPLinux
-        ArchPPC_64 ELF_V1 -> GCPLinux64ELF 1
-        ArchPPC_64 ELF_V2 -> GCPLinux64ELF 2
-        _ -> panic "PPC.CodeGen.platformToGCP: Unknown Linux"
-    OSAIX    -> GCPAIX
-    OSDarwin -> GCPDarwin
-    _ -> panic "PPC.CodeGen.platformToGCP: not defined for this OS"
+platformToGCP platform
+  = case platformOS platform of
+      OSAIX    -> GCPAIX
+      _ -> case platformArch platform of
+             ArchPPC           -> GCP32ELF
+             ArchPPC_64 ELF_V1 -> GCP64ELF 1
+             ArchPPC_64 ELF_V2 -> GCP64ELF 2
+             _ -> panic "platformToGCP: Not PowerPC"
 
 
 genCCall'
@@ -1575,64 +1590,60 @@ genCCall'
     -> [CmmActual]        -- arguments (of mixed type)
     -> NatM InstrBlock
 
-{-
-    The PowerPC calling convention for Darwin/Mac OS X
-    is described in Apple's document
-    "Inside Mac OS X - Mach-O Runtime Architecture".
-
+{- 
     PowerPC Linux uses the System V Release 4 Calling Convention
     for PowerPC. It is described in the
     "System V Application Binary Interface PowerPC Processor Supplement".
 
-    Both conventions are similar:
+    PowerPC 64 Linux uses the System V Release 4 Calling Convention for
+    64-bit PowerPC. It is specified in
+    "64-bit PowerPC ELF Application Binary Interface Supplement 1.9"
+    (PPC64 ELF v1.9).
+
+    PowerPC 64 Linux in little endian mode uses the "Power Architecture 64-Bit
+    ELF V2 ABI Specification -- OpenPOWER ABI for Linux Supplement"
+    (PPC64 ELF v2).
+
+    AIX follows the "PowerOpen ABI: Application Binary Interface Big-Endian
+    32-Bit Hardware Implementation"
+
+    All four conventions are similar:
     Parameters may be passed in general-purpose registers starting at r3, in
     floating point registers starting at f1, or on the stack.
 
     But there are substantial differences:
     * The number of registers used for parameter passing and the exact set of
       nonvolatile registers differs (see MachRegs.hs).
-    * On Darwin, stack space is always reserved for parameters, even if they are
-      passed in registers. The called routine may choose to save parameters from
-      registers to the corresponding space on the stack.
-    * On Darwin, a corresponding amount of GPRs is skipped when a floating point
-      parameter is passed in an FPR.
+    * On AIX and 64-bit ELF, stack space is always reserved for parameters,
+      even if they are passed in registers. The called routine may choose to
+      save parameters from registers to the corresponding space on the stack.
+    * On AIX and 64-bit ELF, a corresponding amount of GPRs is skipped when
+      a floating point parameter is passed in an FPR.
     * SysV insists on either passing I64 arguments on the stack, or in two GPRs,
       starting with an odd-numbered GPR. It may skip a GPR to achieve this.
-      Darwin just treats an I64 like two separate II32s (high word first).
+      AIX just treats an I64 likt two separate I32s (high word first).
     * I64 and FF64 arguments are 8-byte aligned on the stack for SysV, but only
-      4-byte aligned like everything else on Darwin.
+      4-byte aligned like everything else on AIX.
     * The SysV spec claims that FF32 is represented as FF64 on the stack. GCC on
       PowerPC Linux does not agree, so neither do we.
-
-    PowerPC 64 Linux uses the System V Release 4 Calling Convention for
-    64-bit PowerPC. It is specified in
-    "64-bit PowerPC ELF Application Binary Interface Supplement 1.9"
-    (PPC64 ELF v1.9).
-    PowerPC 64 Linux in little endian mode uses the "Power Architecture 64-Bit
-    ELF V2 ABI Specification -- OpenPOWER ABI for Linux Supplement"
-    (PPC64 ELF v2).
-    AIX follows the "PowerOpen ABI: Application Binary Interface Big-Endian
-    32-Bit Hardware Implementation"
 
     According to all conventions, the parameter area should be part of the
     caller's stack frame, allocated in the caller's prologue code (large enough
     to hold the parameter lists for all called routines). The NCG already
     uses the stack for register spilling, leaving 64 bytes free at the top.
-    If we need a larger parameter area than that, we just allocate a new stack
-    frame just before ccalling.
+    If we need a larger parameter area than that, we increase the size
+    of the stack frame just before ccalling.
 -}
 
 
 genCCall' dflags gcp target dest_regs args
-  = ASSERT(not $ any (`elem` [II16]) $ map cmmTypeFormat argReps)
-        -- we rely on argument promotion in the codeGen
-    do
+  = do
         (finalStack,passArgumentsCode,usedRegs) <- passArguments
-                                                        (zip args argReps)
-                                                        allArgRegs
-                                                        (allFPArgRegs platform)
-                                                        initialStackOffset
-                                                        (toOL []) []
+                                                   (zip3 args argReps argHints)
+                                                   allArgRegs
+                                                   (allFPArgRegs platform)
+                                                   initialStackOffset
+                                                   nilOL []
 
         (labelOrExpr, reduceToFF32) <- case target of
             ForeignTarget (CmmLit (CmmLabel lbl)) _ -> do
@@ -1655,7 +1666,7 @@ genCCall' dflags gcp target dest_regs args
             Right dyn -> do -- implement call through function pointer
                 (dynReg, dynCode) <- getSomeReg dyn
                 case gcp of
-                     GCPLinux64ELF 1 -> return ( dynCode
+                     GCP64ELF 1      -> return ( dynCode
                        `appOL`  codeBefore
                        `snocOL` ST spFormat toc (AddrRegImm sp (ImmInt 40))
                        `snocOL` LD II64 r11 (AddrRegImm dynReg (ImmInt 0))
@@ -1665,7 +1676,7 @@ genCCall' dflags gcp target dest_regs args
                        `snocOL` BCTRL usedRegs
                        `snocOL` LD spFormat toc (AddrRegImm sp (ImmInt 40))
                        `appOL`  codeAfter)
-                     GCPLinux64ELF 2 -> return ( dynCode
+                     GCP64ELF 2      -> return ( dynCode
                        `appOL`  codeBefore
                        `snocOL` ST spFormat toc (AddrRegImm sp (ImmInt 24))
                        `snocOL` MR r12 dynReg
@@ -1685,7 +1696,7 @@ genCCall' dflags gcp target dest_regs args
                        `snocOL` BCTRL usedRegs
                        `snocOL` LD spFormat toc (AddrRegImm sp (ImmInt 20))
                        `appOL`  codeAfter)
-                     _              -> return ( dynCode
+                     _               -> return ( dynCode
                        `snocOL` MTCTR dynReg
                        `appOL`  codeBefore
                        `snocOL` BCTRL usedRegs
@@ -1701,32 +1712,29 @@ genCCall' dflags gcp target dest_regs args
                 return ()
 
         initialStackOffset = case gcp of
-                             GCPAIX          -> 24
-                             GCPDarwin       -> 24
-                             GCPLinux        -> 8
-                             GCPLinux64ELF 1 -> 48
-                             GCPLinux64ELF 2 -> 32
+                             GCPAIX     -> 24
+                             GCP32ELF   -> 8
+                             GCP64ELF 1 -> 48
+                             GCP64ELF 2 -> 32
                              _ -> panic "genCall': unknown calling convention"
             -- size of linkage area + size of arguments, in bytes
         stackDelta finalStack = case gcp of
                                 GCPAIX ->
                                     roundTo 16 $ (24 +) $ max 32 $ sum $
                                     map (widthInBytes . typeWidth) argReps
-                                GCPDarwin ->
-                                    roundTo 16 $ (24 +) $ max 32 $ sum $
-                                    map (widthInBytes . typeWidth) argReps
-                                GCPLinux -> roundTo 16 finalStack
-                                GCPLinux64ELF 1 ->
+                                GCP32ELF -> roundTo 16 finalStack
+                                GCP64ELF 1 ->
                                     roundTo 16 $ (48 +) $ max 64 $ sum $
                                     map (roundTo 8 . widthInBytes . typeWidth)
                                         argReps
-                                GCPLinux64ELF 2 ->
+                                GCP64ELF 2 ->
                                     roundTo 16 $ (32 +) $ max 64 $ sum $
                                     map (roundTo 8 . widthInBytes . typeWidth)
                                         argReps
                                 _ -> panic "genCall': unknown calling conv."
 
         argReps = map (cmmExprType dflags) args
+        (argHints, _) = foreignTargetHints target
 
         roundTo a x | x `mod` a == 0 = x
                     | otherwise = x + a - (x `mod` a)
@@ -1753,16 +1761,17 @@ genCCall' dflags gcp target dest_regs args
         -- link editor replaces the NOP instruction with a load of the TOC
         -- from the stack to restore the TOC.
         maybeNOP = case gcp of
+           GCP32ELF        -> nilOL
            -- See Section 3.9.4 of OpenPower ABI
            GCPAIX          -> unitOL NOP
            -- See Section 3.5.11 of PPC64 ELF v1.9
-           GCPLinux64ELF 1 -> unitOL NOP
+           GCP64ELF 1      -> unitOL NOP
            -- See Section 2.3.6 of PPC64 ELF v2
-           GCPLinux64ELF 2 -> unitOL NOP
-           _               -> nilOL
+           GCP64ELF 2      -> unitOL NOP
+           _               -> panic "maybeNOP: Unknown PowerPC 64-bit ABI"
 
         passArguments [] _ _ stackOffset accumCode accumUsed = return (stackOffset, accumCode, accumUsed)
-        passArguments ((arg,arg_ty):args) gprs fprs stackOffset
+        passArguments ((arg,arg_ty,_):args) gprs fprs stackOffset
                accumCode accumUsed | isWord64 arg_ty
                                      && target32Bit (targetPlatform dflags) =
             do
@@ -1770,7 +1779,7 @@ genCCall' dflags gcp target dest_regs args
                 let vr_hi = getHiVRegFromLo vr_lo
 
                 case gcp of
-                    GCPAIX -> -- same as for Darwin
+                    GCPAIX ->
                         do let storeWord vr (gpr:_) _ = MR gpr vr
                                storeWord vr [] offset
                                    = ST II32 vr (AddrRegImm sp (ImmInt offset))
@@ -1782,19 +1791,7 @@ genCCall' dflags gcp target dest_regs args
                                                `snocOL` storeWord vr_hi gprs stackOffset
                                                `snocOL` storeWord vr_lo (drop 1 gprs) (stackOffset+4))
                                          ((take 2 gprs) ++ accumUsed)
-                    GCPDarwin ->
-                        do let storeWord vr (gpr:_) _ = MR gpr vr
-                               storeWord vr [] offset
-                                   = ST II32 vr (AddrRegImm sp (ImmInt offset))
-                           passArguments args
-                                         (drop 2 gprs)
-                                         fprs
-                                         (stackOffset+8)
-                                         (accumCode `appOL` code
-                                               `snocOL` storeWord vr_hi gprs stackOffset
-                                               `snocOL` storeWord vr_lo (drop 1 gprs) (stackOffset+4))
-                                         ((take 2 gprs) ++ accumUsed)
-                    GCPLinux ->
+                    GCP32ELF ->
                         do let stackOffset' = roundTo 8 stackOffset
                                stackCode = accumCode `appOL` code
                                    `snocOL` ST II32 vr_hi (AddrRegImm sp (ImmInt stackOffset'))
@@ -1814,24 +1811,23 @@ genCCall' dflags gcp target dest_regs args
                                _ -> -- only one or no regs left
                                    passArguments args [] fprs (stackOffset'+8)
                                                  stackCode accumUsed
-                    GCPLinux64ELF _ -> panic "passArguments: 32 bit code"
+                    GCP64ELF _ -> panic "passArguments: 32 bit code"
 
-        passArguments ((arg,rep):args) gprs fprs stackOffset accumCode accumUsed
+        passArguments ((arg,rep,hint):args) gprs fprs stackOffset accumCode accumUsed
             | reg : _ <- regs = do
-                register <- getRegister arg
+                register <- getRegister arg_pro
                 let code = case register of
                             Fixed _ freg fcode -> fcode `snocOL` MR reg freg
                             Any _ acode -> acode reg
                     stackOffsetRes = case gcp of
-                                     -- The Darwin ABI requires that we reserve
-                                     -- stack slots for register parameters
-                                     GCPDarwin -> stackOffset + stackBytes
-                                     -- ... so does the PowerOpen ABI.
+                                     -- The PowerOpen ABI requires that we
+                                     -- reserve stack slots for register
+                                     -- parameters
                                      GCPAIX    -> stackOffset + stackBytes
                                      -- ... the SysV ABI 32-bit doesn't.
-                                     GCPLinux -> stackOffset
+                                     GCP32ELF -> stackOffset
                                      -- ... but SysV ABI 64-bit does.
-                                     GCPLinux64ELF _ -> stackOffset + stackBytes
+                                     GCP64ELF _ -> stackOffset + stackBytes
                 passArguments args
                               (drop nGprs gprs)
                               (drop nFprs fprs)
@@ -1839,31 +1835,38 @@ genCCall' dflags gcp target dest_regs args
                               (accumCode `appOL` code)
                               (reg : accumUsed)
             | otherwise = do
-                (vr, code) <- getSomeReg arg
+                (vr, code) <- getSomeReg arg_pro
                 passArguments args
                               (drop nGprs gprs)
                               (drop nFprs fprs)
                               (stackOffset' + stackBytes)
-                              (accumCode `appOL` code `snocOL` ST (cmmTypeFormat rep) vr stackSlot)
+                              (accumCode `appOL` code
+                                         `snocOL` ST format_pro vr stackSlot)
                               accumUsed
             where
+                arg_pro
+                   | isBitsType rep = CmmMachOp (conv_op (typeWidth rep) (wordWidth dflags)) [arg]
+                   | otherwise      = arg
+                format_pro
+                   | isBitsType rep = intFormat (wordWidth dflags)
+                   | otherwise      = cmmTypeFormat rep
+                conv_op = case hint of
+                            SignedHint -> MO_SS_Conv
+                            _          -> MO_UU_Conv
+
                 stackOffset' = case gcp of
-                               GCPDarwin ->
-                                   -- stackOffset is at least 4-byte aligned
-                                   -- The Darwin ABI is happy with that.
-                                   stackOffset
                                GCPAIX ->
                                    -- The 32bit PowerOPEN ABI is happy with
-                                   -- 32bit-alignment as well...
+                                   -- 32bit-alignment ...
                                    stackOffset
-                               GCPLinux
+                               GCP32ELF
                                    -- ... the SysV ABI requires 8-byte
                                    -- alignment for doubles.
                                 | isFloatType rep && typeWidth rep == W64 ->
                                    roundTo 8 stackOffset
                                 | otherwise ->
                                    stackOffset
-                               GCPLinux64ELF _ ->
+                               GCP64ELF _ ->
                                    -- Everything on the stack is mapped to
                                    -- 8-byte aligned doublewords
                                    stackOffset
@@ -1874,7 +1877,7 @@ genCCall' dflags gcp target dest_regs args
                          -- "Single precision floating point values
                          -- are mapped to the second word in a single
                          -- doubleword"
-                         GCPLinux64ELF 1 -> stackOffset' + 4
+                         GCP64ELF 1      -> stackOffset' + 4
                          _               -> stackOffset'
                      | otherwise = stackOffset'
 
@@ -1901,19 +1904,7 @@ genCCall' dflags gcp target dest_regs args
                           FF64 -> (2, 1, 8, fprs)
                           II64 -> panic "genCCall' passArguments II64"
                           FF80 -> panic "genCCall' passArguments FF80"
-                      GCPDarwin ->
-                          case cmmTypeFormat rep of
-                          II8  -> (1, 0, 4, gprs)
-                          II16 -> (1, 0, 4, gprs)
-                          II32 -> (1, 0, 4, gprs)
-                          -- The Darwin ABI requires that we skip a
-                          -- corresponding number of GPRs when we use
-                          -- the FPRs.
-                          FF32 -> (1, 1, 4, fprs)
-                          FF64 -> (2, 1, 8, fprs)
-                          II64 -> panic "genCCall' passArguments II64"
-                          FF80 -> panic "genCCall' passArguments FF80"
-                      GCPLinux ->
+                      GCP32ELF ->
                           case cmmTypeFormat rep of
                           II8  -> (1, 0, 4, gprs)
                           II16 -> (1, 0, 4, gprs)
@@ -1923,7 +1914,7 @@ genCCall' dflags gcp target dest_regs args
                           FF64 -> (0, 1, 8, fprs)
                           II64 -> panic "genCCall' passArguments II64"
                           FF80 -> panic "genCCall' passArguments FF80"
-                      GCPLinux64ELF _ ->
+                      GCP64ELF _ ->
                           case cmmTypeFormat rep of
                           II8  -> (1, 0, 8, gprs)
                           II16 -> (1, 0, 8, gprs)
@@ -1979,6 +1970,10 @@ genCCall' dflags gcp target dest_regs args
                     MO_F32_Tanh  -> (fsLit "tanh", True)
                     MO_F32_Pwr   -> (fsLit "pow", True)
 
+                    MO_F32_Asinh -> (fsLit "asinh", True)
+                    MO_F32_Acosh -> (fsLit "acosh", True)
+                    MO_F32_Atanh -> (fsLit "atanh", True)
+
                     MO_F64_Exp   -> (fsLit "exp", False)
                     MO_F64_Log   -> (fsLit "log", False)
                     MO_F64_Sqrt  -> (fsLit "sqrt", False)
@@ -1996,6 +1991,10 @@ genCCall' dflags gcp target dest_regs args
                     MO_F64_Cosh  -> (fsLit "cosh", False)
                     MO_F64_Tanh  -> (fsLit "tanh", False)
                     MO_F64_Pwr   -> (fsLit "pow", False)
+
+                    MO_F64_Asinh -> (fsLit "asinh", False)
+                    MO_F64_Acosh -> (fsLit "acosh", False)
+                    MO_F64_Atanh -> (fsLit "atanh", False)
 
                     MO_UF_Conv w -> (fsLit $ word2FloatLabel w, False)
 
@@ -2024,6 +2023,7 @@ genCCall' dflags gcp target dest_regs args
                     MO_AddIntC {}    -> unsupported
                     MO_SubIntC {}    -> unsupported
                     MO_U_Mul2 {}     -> unsupported
+                    MO_ReadBarrier   -> unsupported
                     MO_WriteBarrier  -> unsupported
                     MO_Touch         -> unsupported
                     MO_Prefetch_Data _ -> unsupported
@@ -2297,19 +2297,20 @@ trivialUCode rep instr x = do
 -- it the hard way.
 -- The "sgn" parameter is the signedness for the division instruction
 
-remainderCode :: Width -> Bool -> CmmExpr -> CmmExpr -> NatM Register
-remainderCode rep sgn x y = do
+remainderCode :: Width -> Bool -> Reg -> CmmExpr -> CmmExpr
+               -> NatM (Reg -> InstrBlock)
+remainderCode rep sgn reg_q arg_x arg_y = do
   let op_len = max W32 rep
-      ins_fmt = intFormat op_len
+      fmt    = intFormat op_len
       extend = if sgn then extendSExpr else extendUExpr
-  (src1, code1) <- getSomeReg (extend rep op_len x)
-  (src2, code2) <- getSomeReg (extend rep op_len y)
-  let code dst = code1 `appOL` code2 `appOL` toOL [
-                 DIV ins_fmt sgn dst src1 src2,
-                 MULL ins_fmt dst dst (RIReg src2),
-                 SUBF dst dst src1
-                 ]
-  return (Any (intFormat rep) code)
+  (x_reg, x_code) <- getSomeReg (extend rep op_len arg_x)
+  (y_reg, y_code) <- getSomeReg (extend rep op_len arg_y)
+  return $ \reg_r -> y_code `appOL` x_code
+                     `appOL` toOL [ DIV fmt sgn reg_q x_reg y_reg
+                                  , MULL fmt reg_r reg_q (RIReg y_reg)
+                                  , SUBF reg_r reg_r x_reg
+                                  ]
+
 
 coerceInt2FP :: Width -> Width -> CmmExpr -> NatM Register
 coerceInt2FP fromRep toRep x = do

@@ -1,21 +1,26 @@
+{-# LANGUAGE OverloadedStrings #-}
 module Haddock.Backends.Hyperlinker.ParserSpec (main, spec) where
-
 
 import Test.Hspec
 import Test.QuickCheck
 
-import qualified GHC
+import GHC           ( runGhc, getSessionDynFlags )
+import DynFlags      ( DynFlags )
 import Control.Monad.IO.Class
+
+import Data.String     ( fromString )
+import Data.ByteString ( ByteString )
+import qualified Data.ByteString as BS 
 
 import Haddock (getGhcDirs)
 import Haddock.Backends.Hyperlinker.Parser
 import Haddock.Backends.Hyperlinker.Types
 
-withDynFlags :: (GHC.DynFlags -> IO ()) -> IO ()
+withDynFlags :: (DynFlags -> IO ()) -> IO ()
 withDynFlags cont = do
   libDir <- fmap snd (getGhcDirs [])
-  GHC.runGhc (Just libDir) $ do
-    dflags <- GHC.getSessionDynFlags
+  runGhc (Just libDir) $ do
+    dflags <- getSessionDynFlags
     liftIO $ cont dflags
 
 
@@ -54,10 +59,13 @@ parseSpec :: Spec
 parseSpec = around withDynFlags $ do
 
     it "is total" $ \dflags ->
-        property $ \src -> length (parse dflags "" src) `shouldSatisfy` (>= 0)
+        property $ \src -> length (parse dflags "" (fromString src)) `shouldSatisfy` (>= 0)
 
     it "retains file layout" $ \dflags ->
-        property $ \(NoGhcRewrite src) -> concatMap tkValue (parse dflags "" src) == src
+        property $ \(NoGhcRewrite src) ->
+          let orig = fromString src
+              lexed = BS.concat (map tkValue (parse dflags "" orig))
+          in lexed == orig 
 
     context "when parsing single-line comments" $ do
 
@@ -90,7 +98,7 @@ parseSpec = around withDynFlags $ do
     it "should recognize preprocessor directives" $ \dflags -> do
             shouldParseTo
                 "\n#define foo bar"
-                [TkSpace, TkCpp]
+                [TkCpp]
                 dflags
             shouldParseTo
                 "x # y"
@@ -137,7 +145,7 @@ parseSpec = around withDynFlags $ do
             dflags
 
         shouldParseTo
-            (unlines
+            (fromString $ unlines
                 [ "do"
                 , "    foo <- getLine"
                 , "    putStrLn foo"
@@ -148,5 +156,7 @@ parseSpec = around withDynFlags $ do
             ]
             dflags
   where
-    shouldParseTo :: String -> [TokenType] -> GHC.DynFlags -> Expectation
-    shouldParseTo str tokens dflags = map tkType (parse dflags "" str) `shouldBe` tokens
+    shouldParseTo :: ByteString -> [TokenType] -> DynFlags -> Expectation
+    shouldParseTo str tokens dflags = [ tkType tok
+                                      | tok <- parse dflags "" str
+                                      , not (BS.null (tkValue tok)) ] `shouldBe` tokens

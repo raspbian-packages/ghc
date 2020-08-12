@@ -34,7 +34,7 @@ TAR="${TAR:-tar}"
 GZIP_PROGRAM="${GZIP_PROGRAM:-gzip}"
 
 # The variable SCOPE_OF_INSTALLATION can be set on the command line to
-# use/install the libaries needed to build cabal-install to a custom package
+# use/install the libraries needed to build cabal-install to a custom package
 # database instead of the user or global package database.
 #
 # Example:
@@ -137,6 +137,9 @@ while [ "$#" -gt 0 ]; do
     "--no-doc")
       NO_DOCUMENTATION=1
       shift;;
+    "--no-install")
+      NO_INSTALL=1
+      shift;;
     "-j"|"--jobs")
         shift
         # check if there is another argument which doesn't start with - or --
@@ -221,8 +224,8 @@ NETWORK_URI_VER="2.6.1.0"; NETWORK_URI_VER_REGEXP="2\.6\.(0\.[2-9]|[1-9])"
                        # >= 2.6.0.2 && < 2.7
 NETWORK_VER="2.7.0.0"; NETWORK_VER_REGEXP="2\.[0-7]\."
                        # >= 2.0 && < 2.7
-CABAL_VER="2.4.0.1";   CABAL_VER_REGEXP="2\.4\.[0-9]"
-                       # >= 2.4 && < 2.5
+CABAL_VER="3.0.1.0";   CABAL_VER_REGEXP="3\.0\.[1-9]"
+                       # >= 3.0.1 && < 3.1
 TRANS_VER="0.5.5.0";   TRANS_VER_REGEXP="0\.[45]\."
                        # >= 0.2.* && < 0.6
 MTL_VER="2.2.2";       MTL_VER_REGEXP="[2]\."
@@ -257,14 +260,14 @@ EDIT_DISTANCE_VER="0.2.2.1"; EDIT_DISTANCE_VER_REGEXP="0\.2\.2\.?"
                        # 0.2.2.*
 ED25519_VER="0.0.5.0"; ED25519_VER_REGEXP="0\.0\.?"
                        # 0.0.*
-HACKAGE_SECURITY_VER="0.5.3.0"; HACKAGE_SECURITY_VER_REGEXP="0\.5\.((2\.[2-9]|[3-9])|3)"
-                       # >= 0.5.2 && < 0.6
+HACKAGE_SECURITY_VER="0.6.0.0"; HACKAGE_SECURITY_VER_REGEXP="0\.6\."
+                       # >= 0.7.0.0 && < 0.7
 TAR_VER="0.5.1.0";     TAR_VER_REGEXP="0\.5\.([1-9]|1[0-9]|0\.[3-9]|0\.1[0-9])\.?"
                        # >= 0.5.0.3  && < 0.6
 DIGEST_VER="0.0.1.2"; DIGEST_REGEXP="0\.0\.(1\.[2-9]|[2-9]\.?)"
                        # >= 0.0.1.2 && < 0.1
-ZIP_ARCHIVE_VER="0.3.3"; ZIP_ARCHIVE_REGEXP="0\.3\.[3-9]"
-                       # >= 0.3.3 && < 0.4
+LUKKO_VER="0.1.1";     LUKKO_VER_REGEXP="0\.1\.[1-9]"
+                       # >= 0.1.1 && <0.2
 
 HACKAGE_URL="https://hackage.haskell.org/package"
 
@@ -276,6 +279,7 @@ NO_DOCS_PACKAGES_VER_REGEXP="hackage-security-0\.5\.[0-9]+\.[0-9]+"
 echo "Checking installed packages for ghc-${GHC_VER}..."
 ${GHC_PKG} list --global ${SCOPE_OF_INSTALLATION} > ghc-pkg.list ||
   die "running '${GHC_PKG} list' failed"
+trap "rm ghc-pkg.list" EXIT
 
 # Will we need to install this package, or is a suitable version installed?
 need_pkg () {
@@ -297,11 +301,14 @@ info_pkg () {
 
   if need_pkg ${PKG} ${VER_MATCH}
   then
-    if [ -r "${PKG}-${VER}.tar.gz" ]
+    if [ -d "${PKG}-${VER}" ]
     then
-        echo "${PKG}-${VER} will be installed from local tarball."
+      echo "${PKG}-${VER} will be installed from local directory."
+    elif [ -r "${PKG}-${VER}.tar.gz" ]
+    then
+      echo "${PKG}-${VER} will be installed from local tarball."
     else
-        echo "${PKG}-${VER} will be downloaded and installed."
+      echo "${PKG}-${VER} will be downloaded and installed."
     fi
   else
     echo "${PKG} is already installed and the version is ok."
@@ -348,6 +355,8 @@ unpack_pkg () {
 }
 
 install_pkg () {
+  [ ${NO_INSTALL} ] && return 0
+
   PKG=$1
   VER=$2
 
@@ -397,14 +406,19 @@ do_pkg () {
   if need_pkg ${PKG} ${VER_MATCH}
   then
     echo
-    if [ -r "${PKG}-${VER}.tar.gz" ]
+    if [ -d "${PKG}-${VER}" ]
     then
-        echo "Using local tarball for ${PKG}-${VER}."
+      echo "Using local directory for ${PKG}-${VER}."
     else
+      if [ -r "${PKG}-${VER}.tar.gz" ]
+      then
+        echo "Using local tarball for ${PKG}-${VER}."
+      else
         echo "Downloading ${PKG}-${VER}..."
         fetch_pkg ${PKG} ${VER}
+      fi
+      unpack_pkg "${PKG}" "${VER}"
     fi
-    unpack_pkg "${PKG}" "${VER}"
     (cd "${PKG}-${VER}" && install_pkg ${PKG} ${VER})
   fi
 }
@@ -457,7 +471,7 @@ info_pkg "edit-distance" ${EDIT_DISTANCE_VER} ${EDIT_DISTANCE_VER_REGEXP}
 info_pkg "ed25519"           ${ED25519_VER}          ${ED25519_VER_REGEXP}
 info_pkg "tar"               ${TAR_VER}              ${TAR_VER_REGEXP}
 info_pkg "digest"            ${DIGEST_VER}           ${DIGEST_REGEXP}
-info_pkg "zip-archive"       ${ZIP_ARCHIVE_VER}      ${ZIP_ARCHIVE_REGEXP}
+info_pkg "lukko"        ${LUKKO_VER}   ${LUKKO_REGEXP}
 info_pkg "hackage-security"  ${HACKAGE_SECURITY_VER} \
     ${HACKAGE_SECURITY_VER_REGEXP}
 
@@ -495,18 +509,19 @@ do_pkg "edit-distance" ${EDIT_DISTANCE_VER} ${EDIT_DISTANCE_VER_REGEXP}
 do_pkg   "ed25519"           ${ED25519_VER}          ${ED25519_VER_REGEXP}
 do_pkg   "tar"               ${TAR_VER}              ${TAR_VER_REGEXP}
 do_pkg   "digest"            ${DIGEST_VER}           ${DIGEST_REGEXP}
-do_pkg   "zip-archive"       ${ZIP_ARCHIVE_VER}      ${ZIP_ARCHIVE_REGEXP}
+do_pkg   "lukko"       ${LUKKO_VER}      ${LUKKO_REGEXP}
 do_pkg   "hackage-security"  ${HACKAGE_SECURITY_VER} \
     ${HACKAGE_SECURITY_VER_REGEXP}
 
 
 install_pkg "cabal-install"
+[ ${NO_INSTALL} ] && exit 0
 
 # Use the newly built cabal to turn the prefix/package database into a
 # legit cabal sandbox. This works because 'cabal sandbox init' will
 # reuse the already existing package database and other files if they
 # are in the expected locations.
-[ ! -z "$SANDBOX" ] && $SANDBOX/bin/cabal sandbox init --sandbox $SANDBOX
+[ ! -z "$SANDBOX" ] && $SANDBOX/bin/cabal v1-sandbox init --sandbox $SANDBOX
 
 echo
 echo "==========================================="
@@ -525,12 +540,10 @@ then
     echo "By default cabal will install programs to $HOME/.cabal/bin"
     echo "If you do not want to add this directory to your PATH then you can"
     echo "change the setting in the config file, for example you could use:"
-    echo "symlink-bindir: $HOME/bin"
+    echo "installdir: $HOME/bin"
 else
     echo "Sorry, something went wrong."
     echo "The 'cabal' executable was not successfully installed into"
     echo "$CABAL_BIN/"
 fi
 echo
-
-rm ghc-pkg.list

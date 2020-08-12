@@ -79,8 +79,7 @@ import Distribution.InstalledPackageInfo (InstalledPackageInfo)
 import Distribution.Simple.Utils
 import Distribution.Utils.MapAccum
 import Distribution.System
-import Distribution.Text
-import Distribution.Types.ComponentName
+import Distribution.Pretty
 import Distribution.Verbosity as Verbosity
 import Distribution.Version
 import Distribution.Compat.Graph (IsNode(nodeKey))
@@ -157,8 +156,8 @@ registerAll pkg lbi regFlags ipis
       for_ ipis $ \installedPkgInfo ->
         -- Only print the public library's IPI
         when (packageId installedPkgInfo == packageId pkg
-              && IPI.sourceLibName installedPkgInfo == Nothing) $
-          putStrLn (display (IPI.installedUnitId installedPkgInfo))
+              && IPI.sourceLibName installedPkgInfo == LMainLibName) $
+          putStrLn (prettyShow (IPI.installedUnitId installedPkgInfo))
 
      -- Three different modes:
     case () of
@@ -167,14 +166,14 @@ registerAll pkg lbi regFlags ipis
        | otherwise             -> do
            for_ ipis $ \ipi -> do
                setupMessage' verbosity "Registering" (packageId pkg)
-                 (libraryComponentName (IPI.sourceLibName ipi))
+                 (CLibName (IPI.sourceLibName ipi))
                  (Just (IPI.instantiatedWith ipi))
                registerPackage verbosity (compiler lbi) (withPrograms lbi)
                                packageDbs ipi HcPkg.defaultRegisterOptions
 
   where
     modeGenerateRegFile = isJust (flagToMaybe (regGenPkgConf regFlags))
-    regFile             = fromMaybe (display (packageId pkg) <.> "conf")
+    regFile             = fromMaybe (prettyShow (packageId pkg) <.> "conf")
                                     (fromFlag (regGenPkgConf regFlags))
 
     modeGenerateRegScript = fromFlag (regGenScript regFlags)
@@ -201,7 +200,7 @@ registerAll pkg lbi regFlags ipis
                   where ys = take m xs
               number i = lpad (length (show num_ipis)) (show i)
           for_ (zip ([1..] :: [Int]) ipis) $ \(i, installedPkgInfo) ->
-            writeUTF8File (regFile </> (number i ++ "-" ++ display (IPI.installedUnitId installedPkgInfo)))
+            writeUTF8File (regFile </> (number i ++ "-" ++ prettyShow (IPI.installedUnitId installedPkgInfo)))
                           (IPI.showInstalledPackageInfo installedPkgInfo)
 
     writeRegisterScript =
@@ -447,7 +446,8 @@ generalInstalledPackageInfo adjustRelIncDirs pkg abi_hash lib lbi clbi installDi
     IPI.frameworkDirs      = extraFrameworkDirs bi,
     IPI.haddockInterfaces  = [haddockdir installDirs </> haddockName pkg],
     IPI.haddockHTMLs       = [htmldir installDirs],
-    IPI.pkgRoot            = Nothing
+    IPI.pkgRoot            = Nothing,
+    IPI.libVisibility      = libVisibility lib
   }
   where
     ghc84 = case compilerId $ compiler lbi of
@@ -500,7 +500,10 @@ inplaceInstalledPackageInfo inplaceDir distPref pkg abi_hash lib lbi clbi =
     generalInstalledPackageInfo adjustRelativeIncludeDirs
                                 pkg abi_hash lib lbi clbi installDirs
   where
-    adjustRelativeIncludeDirs = map (inplaceDir </>)
+    adjustRelativeIncludeDirs = concatMap $ \d ->
+      [ inplaceDir </> d                    -- local include-dir
+      , inplaceDir </> libTargetDir </> d   -- autogen include-dir
+      ]
     libTargetDir = componentBuildDir lbi clbi
     installDirs =
       (absoluteComponentInstallDirs pkg lbi (componentUnitId clbi) NoCopyDest) {
@@ -512,7 +515,7 @@ inplaceInstalledPackageInfo inplaceDir distPref pkg abi_hash lib lbi clbi =
         haddockdir = inplaceHtmldir
       }
     inplaceDocdir  = inplaceDir </> distPref </> "doc"
-    inplaceHtmldir = inplaceDocdir </> "html" </> display (packageName pkg)
+    inplaceHtmldir = inplaceDocdir </> "html" </> prettyShow (packageName pkg)
 
 
 -- | Construct 'InstalledPackageInfo' for the final install location of a

@@ -195,6 +195,7 @@ threadPaused(Capability *cap, StgTSO *tso)
     const StgRetInfoTable *info;
     const StgInfoTable *bh_info;
     const StgInfoTable *cur_bh_info USED_IF_THREADS;
+    const StgInfoTable *frame_info;
     StgClosure *bh;
     StgPtr stack_end;
     uint32_t words_to_squeeze = 0;
@@ -218,6 +219,8 @@ threadPaused(Capability *cap, StgTSO *tso)
 
     frame = (StgClosure *)tso->stackobj->sp;
 
+    // N.B. We know that the TSO is owned by the current capability so no
+    // memory barriers are needed here.
     while ((P_)frame < stack_end) {
         info = get_ret_itbl(frame);
 
@@ -226,7 +229,8 @@ threadPaused(Capability *cap, StgTSO *tso)
         case UPDATE_FRAME:
 
             // If we've already marked this frame, then stop here.
-            if (frame->header.info == (StgInfoTable *)&stg_marked_upd_frame_info) {
+            frame_info = frame->header.info;
+            if (frame_info == (StgInfoTable *)&stg_marked_upd_frame_info) {
                 if (prev_was_update_frame) {
                     words_to_squeeze += sizeofW(StgUpdateFrame);
                     weight += weight_pending;
@@ -305,13 +309,6 @@ threadPaused(Capability *cap, StgTSO *tso)
                 prev_was_update_frame = false;
                 continue;
             }
-
-            // We should never have made it here in the event of blackholes that
-            // we already own; they should have been marked when we blackholed
-            // them and consequently we should have stopped our stack walk
-            // above.
-            ASSERT(!((bh_info == &stg_BLACKHOLE_info)
-                     && (((StgInd*)bh)->indirectee == (StgClosure*)tso)));
 
             // zero out the slop so that the sanity checker can tell
             // where the next closure is.

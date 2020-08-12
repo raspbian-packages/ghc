@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, FlexibleInstances, UnboxedTuples, MagicHash #-}
+{-# LANGUAGE CPP, FlexibleInstances #-}
 {-# OPTIONS_GHC -fno-cse -fno-warn-orphans #-}
 -- -fno-cse is needed for GLOBAL_VAR's to behave properly
 
@@ -14,16 +14,19 @@ module GHCi.UI.Monad (
         GHCi(..), startGHCi,
         GHCiState(..), setGHCiState, getGHCiState, modifyGHCiState,
         GHCiOption(..), isOptionSet, setOption, unsetOption,
-        Command(..),
+        Command(..), CommandResult(..), cmdSuccess,
         PromptFunction,
         BreakLocation(..),
         TickArray,
         getDynFlags,
 
-        runStmt, runDecls, resume, timeIt, recordBreak, revertCAFs,
+        runStmt, runDecls, runDecls', resume, recordBreak, revertCAFs,
+        ActionStats(..), runAndPrintStats, runWithStats, printStats,
 
         printForUserNeverQualify, printForUserModInfo,
         printForUser, printForUserPartWay, prettyLocations,
+
+        compileGHCiExpr,
         initInterpBuffering,
         turnOffBuffering, turnOffBuffering_,
         flushInterpBuffers,
@@ -37,14 +40,18 @@ import qualified GHC
 import GhcMonad         hiding (liftIO)
 import Outputable       hiding (printForUser, printForUserPartWay)
 import qualified Outputable
+import OccName
 import DynFlags
 import FastString
 import HscTypes
 import SrcLoc
 import Module
+import RdrName (mkOrig)
+import PrelNames (gHC_GHCI_HELPERS)
 import GHCi
 import GHCi.RemoteTypes
-import HsSyn (ImportDecl, GhcPs)
+import HsSyn (ImportDecl, GhcPs, GhciLStmt, LHsDecl)
+import HsUtils
 import Util
 
 import Exception
@@ -91,6 +98,10 @@ data GHCiState = GHCiState
         last_command   :: Maybe Command,
             -- ^ @:@ at the GHCi prompt repeats the last command, so we
             -- remember it here
+        cmd_wrapper    :: InputT GHCi CommandResult -> InputT GHCi (Maybe Bool),
+            -- ^ The command wrapper is run for each command or statement.
+            -- The 'Bool' value denotes whether the command is successful and
+            -- 'Nothing' means to exit GHCi.
         cmdqueue       :: [String],
 
         remembered_ctx :: [InteractiveImport],
@@ -161,6 +172,21 @@ data Command
    , cmdCompletionFunc :: CompletionFunc GHCi
      -- ^ 'CompletionFunc' for arguments
    }
+
+data CommandResult
+   = CommandComplete
+   { cmdInput :: String
+   , cmdResult :: Either SomeException (Maybe Bool)
+   , cmdStats :: ActionStats
+   }
+   | CommandIncomplete
+     -- ^ Unterminated multiline command
+   deriving Show
+
+cmdSuccess :: Haskeline.MonadException m => CommandResult -> m (Maybe Bool)
+cmdSuccess CommandComplete{ cmdResult = Left e } = liftIO $ throwIO e
+cmdSuccess CommandComplete{ cmdResult = Right r } = return r
+cmdSuccess CommandIncomplete = return $ Just True
 
 type PromptFunction = [String]
                    -> Int
@@ -336,8 +362,8 @@ printForUserPartWay doc = do
   liftIO $ Outputable.printForUserPartWay dflags stdout (pprUserLength dflags) unqual doc
 
 -- | Run a single Haskell expression
-runStmt :: String -> GHC.SingleStep -> GHCi (Maybe GHC.ExecResult)
-runStmt expr step = do
+runStmt :: GhciLStmt GhcPs -> String -> GHC.SingleStep -> GHCi (Maybe GHC.ExecResult)
+runStmt stmt stmt_text step = do
   st <- getGHCiState
   GHC.handleSourceError (\e -> do GHC.printException e; return Nothing) $ do
     let opts = GHC.execOptions
@@ -346,7 +372,7 @@ runStmt expr step = do
                   , GHC.execSingleStep = step
                   , GHC.execWrap = \fhv -> EvalApp (EvalThis (evalWrapper st))
                                                    (EvalThis fhv) }
-    Just <$> GHC.execStmt expr opts
+    Just <$> GHC.execStmt' stmt stmt_text opts
 
 runDecls :: String -> GHCi (Maybe [GHC.Name])
 runDecls decls = do
@@ -360,6 +386,18 @@ runDecls decls = do
           r <- GHC.runDeclsWithLocation (progname st) (line_number st) decls
           return (Just r)
 
+runDecls' :: [LHsDecl GhcPs] -> GHCi (Maybe [GHC.Name])
+runDecls' decls = do
+  st <- getGHCiState
+  reifyGHCi $ \x ->
+    withProgName (progname st) $
+    withArgs (args st) $
+    reflectGHCi x $
+      GHC.handleSourceError
+        (\e -> do GHC.printException e;
+                  return Nothing)
+        (Just <$> GHC.runParsedDecls decls)
+
 resume :: (SrcSpan -> Bool) -> GHC.SingleStep -> GHCi GHC.ExecResult
 resume canLogSpan step = do
   st <- getGHCiState
@@ -372,22 +410,39 @@ resume canLogSpan step = do
 -- --------------------------------------------------------------------------
 -- timing & statistics
 
-timeIt :: (a -> Maybe Integer) -> InputT GHCi a -> InputT GHCi a
-timeIt getAllocs action
-  = do b <- lift $ isOptionSet ShowTiming
-       if not b
-          then action
-          else do time1   <- liftIO $ getCurrentTime
-                  a <- action
-                  let allocs = getAllocs a
-                  time2   <- liftIO $ getCurrentTime
-                  dflags  <- getDynFlags
-                  let period = time2 `diffUTCTime` time1
-                  liftIO $ printTimes dflags allocs (realToFrac period)
-                  return a
+data ActionStats = ActionStats
+  { actionAllocs :: Maybe Integer
+  , actionElapsedTime :: Double
+  } deriving Show
 
-printTimes :: DynFlags -> Maybe Integer -> Double -> IO ()
-printTimes dflags mallocs secs
+runAndPrintStats
+  :: (a -> Maybe Integer)
+  -> InputT GHCi a
+  -> InputT GHCi (ActionStats, Either SomeException a)
+runAndPrintStats getAllocs action = do
+  result <- runWithStats getAllocs action
+  case result of
+    (stats, Right{}) -> do
+      showTiming <- lift $ isOptionSet ShowTiming
+      when showTiming $ do
+        dflags  <- getDynFlags
+        liftIO $ printStats dflags stats
+    _ -> return ()
+  return result
+
+runWithStats
+  :: ExceptionMonad m
+  => (a -> Maybe Integer) -> m a -> m (ActionStats, Either SomeException a)
+runWithStats getAllocs action = do
+  t0 <- liftIO getCurrentTime
+  result <- gtry action
+  let allocs = either (const Nothing) getAllocs result
+  t1 <- liftIO getCurrentTime
+  let elapsedTime = realToFrac $ t1 `diffUTCTime` t0
+  return (ActionStats allocs elapsedTime, result)
+
+printStats :: DynFlags -> ActionStats -> IO ()
+printStats dflags ActionStats{actionAllocs = mallocs, actionElapsedTime = secs}
    = do let secs_str = showFFloat (Just 2) secs
         putStrLn (showSDoc dflags (
                  parens (text (secs_str "") <+> text "secs" <> comma <+>
@@ -422,13 +477,12 @@ foreign import ccall "revertCAFs" rts_revertCAFs  :: IO ()
 -- | Compile "hFlush stdout; hFlush stderr" once, so we can use it repeatedly
 initInterpBuffering :: Ghc (ForeignHValue, ForeignHValue)
 initInterpBuffering = do
-  nobuf <- compileGHCiExpr $
-   "do { System.IO.hSetBuffering System.IO.stdin System.IO.NoBuffering; " ++
-       " System.IO.hSetBuffering System.IO.stdout System.IO.NoBuffering; " ++
-       " System.IO.hSetBuffering System.IO.stderr System.IO.NoBuffering }"
-  flush <- compileGHCiExpr $
-   "do { System.IO.hFlush System.IO.stdout; " ++
-       " System.IO.hFlush System.IO.stderr }"
+  let mkHelperExpr :: OccName -> Ghc ForeignHValue
+      mkHelperExpr occ =
+        GHC.compileParsedExprRemote
+        $ GHC.nlHsVar $ RdrName.mkOrig gHC_GHCI_HELPERS occ
+  nobuf <- mkHelperExpr $ mkVarOcc "disableBuffering"
+  flush <- mkHelperExpr $ mkVarOcc "flushAll"
   return (nobuf, flush)
 
 -- | Invoke "hFlush stdout; hFlush stderr" in the interpreter
@@ -451,20 +505,29 @@ turnOffBuffering_ fhv = do
 
 mkEvalWrapper :: GhcMonad m => String -> [String] ->  m ForeignHValue
 mkEvalWrapper progname args =
-  compileGHCiExpr $
-    "\\m -> System.Environment.withProgName " ++ show progname ++
-    "(System.Environment.withArgs " ++ show args ++ " m)"
+  runInternal $ GHC.compileParsedExprRemote
+  $ evalWrapper `GHC.mkHsApp` nlHsString progname
+                `GHC.mkHsApp` nlList (map nlHsString args)
+  where
+    nlHsString = nlHsLit . mkHsString
+    evalWrapper =
+      GHC.nlHsVar $ RdrName.mkOrig gHC_GHCI_HELPERS (mkVarOcc "evalWrapper")
+
+-- | Run a 'GhcMonad' action to compile an expression for internal usage.
+runInternal :: GhcMonad m => m a -> m a
+runInternal =
+    withTempSession mkTempSession
+  where
+    mkTempSession hsc_env = hsc_env
+      { hsc_dflags = (hsc_dflags hsc_env)
+          -- RebindableSyntax can wreak havoc with GHCi in several ways
+          -- (see #13385 and #14342 for examples), so we take care to disable it
+          -- for the duration of running expressions that are internal to GHCi.
+          `xopt_unset` LangExt.RebindableSyntax
+          -- We heavily depend on -fimplicit-import-qualified to compile expr
+          -- with fully qualified names without imports.
+          `gopt_set` Opt_ImplicitImportQualified
+      }
 
 compileGHCiExpr :: GhcMonad m => String -> m ForeignHValue
-compileGHCiExpr expr = do
-  hsc_env <- getSession
-  let dflags = hsc_dflags hsc_env
-      -- RebindableSyntax can wreak havoc with GHCi in several ways
-      -- (see #13385 and #14342 for examples), so we take care to disable it
-      -- for the duration of running expressions that are internal to GHCi.
-      no_rb_hsc_env =
-        hsc_env { hsc_dflags = xopt_unset dflags LangExt.RebindableSyntax }
-  setSession no_rb_hsc_env
-  res <- GHC.compileExprRemote expr
-  setSession hsc_env
-  pure res
+compileGHCiExpr expr = runInternal $ GHC.compileExprRemote expr

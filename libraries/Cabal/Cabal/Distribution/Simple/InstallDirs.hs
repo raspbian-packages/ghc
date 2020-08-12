@@ -52,10 +52,11 @@ import Prelude ()
 import Distribution.Compat.Prelude
 
 import Distribution.Compat.Environment (lookupEnv)
+import Distribution.Pretty
 import Distribution.Package
 import Distribution.System
 import Distribution.Compiler
-import Distribution.Text
+import Distribution.Simple.InstallDirs.Internal
 
 import System.Directory (getAppUserDataDirectory)
 import System.FilePath
@@ -355,47 +356,15 @@ newtype PathTemplate = PathTemplate [PathComponent]
 
 instance Binary PathTemplate
 
-data PathComponent =
-       Ordinary FilePath
-     | Variable PathTemplateVariable
-     deriving (Eq, Ord, Generic)
-
-instance Binary PathComponent
-
-data PathTemplateVariable =
-       PrefixVar     -- ^ The @$prefix@ path variable
-     | BindirVar     -- ^ The @$bindir@ path variable
-     | LibdirVar     -- ^ The @$libdir@ path variable
-     | LibsubdirVar  -- ^ The @$libsubdir@ path variable
-     | DynlibdirVar  -- ^ The @$dynlibdir@ path variable
-     | DatadirVar    -- ^ The @$datadir@ path variable
-     | DatasubdirVar -- ^ The @$datasubdir@ path variable
-     | DocdirVar     -- ^ The @$docdir@ path variable
-     | HtmldirVar    -- ^ The @$htmldir@ path variable
-     | PkgNameVar    -- ^ The @$pkg@ package name path variable
-     | PkgVerVar     -- ^ The @$version@ package version path variable
-     | PkgIdVar      -- ^ The @$pkgid@ package Id path variable, eg @foo-1.0@
-     | LibNameVar    -- ^ The @$libname@ path variable
-     | CompilerVar   -- ^ The compiler name and version, eg @ghc-6.6.1@
-     | OSVar         -- ^ The operating system name, eg @windows@ or @linux@
-     | ArchVar       -- ^ The CPU architecture name, eg @i386@ or @x86_64@
-     | AbiVar        -- ^ The Compiler's ABI identifier, $arch-$os-$compiler-$abitag
-     | AbiTagVar     -- ^ The optional ABI tag for the compiler
-     | ExecutableNameVar -- ^ The executable name; used in shell wrappers
-     | TestSuiteNameVar   -- ^ The name of the test suite being run
-     | TestSuiteResultVar -- ^ The result of the test suite being run, eg
-                          -- @pass@, @fail@, or @error@.
-     | BenchmarkNameVar   -- ^ The name of the benchmark being run
-  deriving (Eq, Ord, Generic)
-
-instance Binary PathTemplateVariable
-
 type PathTemplateEnv = [(PathTemplateVariable, PathTemplate)]
 
 -- | Convert a 'FilePath' to a 'PathTemplate' including any template vars.
 --
 toPathTemplate :: FilePath -> PathTemplate
-toPathTemplate = PathTemplate . read -- TODO: eradicateNoParse
+toPathTemplate fp = PathTemplate
+    . fromMaybe (error $ "panic! toPathTemplate " ++ show fp)
+    . readMaybe -- TODO: eradicateNoParse
+    $ fp
 
 -- | Convert back to a path, any remaining vars are included
 --
@@ -430,29 +399,29 @@ initialPathTemplateEnv pkgId libname compiler platform =
 
 packageTemplateEnv :: PackageIdentifier -> UnitId -> PathTemplateEnv
 packageTemplateEnv pkgId uid =
-  [(PkgNameVar,  PathTemplate [Ordinary $ display (packageName pkgId)])
-  ,(PkgVerVar,   PathTemplate [Ordinary $ display (packageVersion pkgId)])
+  [(PkgNameVar,  PathTemplate [Ordinary $ prettyShow (packageName pkgId)])
+  ,(PkgVerVar,   PathTemplate [Ordinary $ prettyShow (packageVersion pkgId)])
   -- Invariant: uid is actually a HashedUnitId.  Hard to enforce because
   -- it's an API change.
-  ,(LibNameVar,  PathTemplate [Ordinary $ display uid])
-  ,(PkgIdVar,    PathTemplate [Ordinary $ display pkgId])
+  ,(LibNameVar,  PathTemplate [Ordinary $ prettyShow uid])
+  ,(PkgIdVar,    PathTemplate [Ordinary $ prettyShow pkgId])
   ]
 
 compilerTemplateEnv :: CompilerInfo -> PathTemplateEnv
 compilerTemplateEnv compiler =
-  [(CompilerVar, PathTemplate [Ordinary $ display (compilerInfoId compiler)])
+  [(CompilerVar, PathTemplate [Ordinary $ prettyShow (compilerInfoId compiler)])
   ]
 
 platformTemplateEnv :: Platform -> PathTemplateEnv
 platformTemplateEnv (Platform arch os) =
-  [(OSVar,       PathTemplate [Ordinary $ display os])
-  ,(ArchVar,     PathTemplate [Ordinary $ display arch])
+  [(OSVar,       PathTemplate [Ordinary $ prettyShow os])
+  ,(ArchVar,     PathTemplate [Ordinary $ prettyShow arch])
   ]
 
 abiTemplateEnv :: CompilerInfo -> Platform -> PathTemplateEnv
 abiTemplateEnv compiler (Platform arch os) =
-  [(AbiVar,      PathTemplate [Ordinary $ display arch ++ '-':display os ++
-                                          '-':display (compilerInfoId compiler) ++
+  [(AbiVar,      PathTemplate [Ordinary $ prettyShow arch ++ '-':prettyShow os ++
+                                          '-':prettyShow (compilerInfoId compiler) ++
                                           case compilerInfoAbiTag compiler of
                                             NoAbiTag   -> ""
                                             AbiTag tag -> '-':tag])
@@ -481,86 +450,6 @@ installDirsTemplateEnv dirs =
 -- and this gets parsed to the internal representation as a sequence of path
 -- spans which are either strings or variables, eg:
 -- PathTemplate [Variable PrefixVar, Ordinary "/bin" ]
-
-instance Show PathTemplateVariable where
-  show PrefixVar     = "prefix"
-  show LibNameVar    = "libname"
-  show BindirVar     = "bindir"
-  show LibdirVar     = "libdir"
-  show LibsubdirVar  = "libsubdir"
-  show DynlibdirVar  = "dynlibdir"
-  show DatadirVar    = "datadir"
-  show DatasubdirVar = "datasubdir"
-  show DocdirVar     = "docdir"
-  show HtmldirVar    = "htmldir"
-  show PkgNameVar    = "pkg"
-  show PkgVerVar     = "version"
-  show PkgIdVar      = "pkgid"
-  show CompilerVar   = "compiler"
-  show OSVar         = "os"
-  show ArchVar       = "arch"
-  show AbiTagVar     = "abitag"
-  show AbiVar        = "abi"
-  show ExecutableNameVar = "executablename"
-  show TestSuiteNameVar   = "test-suite"
-  show TestSuiteResultVar = "result"
-  show BenchmarkNameVar   = "benchmark"
-
-instance Read PathTemplateVariable where
-  readsPrec _ s =
-    take 1
-    [ (var, drop (length varStr) s)
-    | (varStr, var) <- vars
-    , varStr `isPrefixOf` s ]
-    -- NB: order matters! Longer strings first
-    where vars = [("prefix",     PrefixVar)
-                 ,("bindir",     BindirVar)
-                 ,("libdir",     LibdirVar)
-                 ,("libsubdir",  LibsubdirVar)
-                 ,("dynlibdir",  DynlibdirVar)
-                 ,("datadir",    DatadirVar)
-                 ,("datasubdir", DatasubdirVar)
-                 ,("docdir",     DocdirVar)
-                 ,("htmldir",    HtmldirVar)
-                 ,("pkgid",      PkgIdVar)
-                 ,("libname",    LibNameVar)
-                 ,("pkgkey",     LibNameVar) -- backwards compatibility
-                 ,("pkg",        PkgNameVar)
-                 ,("version",    PkgVerVar)
-                 ,("compiler",   CompilerVar)
-                 ,("os",         OSVar)
-                 ,("arch",       ArchVar)
-                 ,("abitag",     AbiTagVar)
-                 ,("abi",        AbiVar)
-                 ,("executablename", ExecutableNameVar)
-                 ,("test-suite", TestSuiteNameVar)
-                 ,("result", TestSuiteResultVar)
-                 ,("benchmark", BenchmarkNameVar)]
-
-instance Show PathComponent where
-  show (Ordinary path) = path
-  show (Variable var)  = '$':show var
-  showList = foldr (\x -> (shows x .)) id
-
-instance Read PathComponent where
-  -- for some reason we collapse multiple $ symbols here
-  readsPrec _ = lex0
-    where lex0 [] = []
-          lex0 ('$':'$':s') = lex0 ('$':s')
-          lex0 ('$':s') = case [ (Variable var, s'')
-                               | (var, s'') <- reads s' ] of
-                            [] -> lex1 "$" s'
-                            ok -> ok
-          lex0 s' = lex1 [] s'
-          lex1 ""  ""      = []
-          lex1 acc ""      = [(Ordinary (reverse acc), "")]
-          lex1 acc ('$':'$':s) = lex1 acc ('$':s)
-          lex1 acc ('$':s) = [(Ordinary (reverse acc), '$':s)]
-          lex1 acc (c:s)   = lex1 (c:acc) s
-  readList [] = [([],"")]
-  readList s  = [ (component:components, s'')
-                | (component, s') <- reads s
-                , (components, s'') <- readList s' ]
 
 instance Show PathTemplate where
   show (PathTemplate template) = show (show template)

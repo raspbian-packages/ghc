@@ -721,15 +721,6 @@ AC_DEFUN([FPTOOLS_SET_C_LD_FLAGS],
 
     esac
 
-    # If gcc knows about the stack protector, turn it off.
-    # Otherwise the stack-smash handler gets triggered.
-    echo 'int main(void) {return 0;}' > conftest.c
-    if $CC -c conftest.c -fno-stack-protector > /dev/null 2>&1
-    then
-        $2="$$2 -fno-stack-protector"
-    fi
-
-    rm -f conftest.c conftest.o
     AC_MSG_RESULT([done])
 ])
 
@@ -939,18 +930,22 @@ AS_IF([test "$fp_num1" $2 "$fp_num2"], [$4], [$5])[]dnl
 
 
 dnl
-dnl Check for Happy and version.
-dnl If there's no installed Happy, we look
-dnl for a happy source tree and point the build system at that instead.
+dnl Check for Happy and version:
+dnl
+dnl 1. Use happy specified in env var HAPPY
+dnl 2. Find happy in path
+dnl 3. Check happy version
+dnl
 dnl If you increase the minimum version requirement, please also update:
 dnl https://ghc.haskell.org/trac/ghc/wiki/Building/Preparation/Tools
 dnl
 AC_DEFUN([FPTOOLS_HAPPY],
-[AC_PATH_PROG(HappyCmd,happy,)
-
+[AC_PATH_PROG(HAPPY,[happy],)
+AC_SUBST(HappyCmd,$HAPPY)
 AC_CACHE_CHECK([for version of happy], fptools_cv_happy_version,
 changequote(, )dnl
-[if test x"$HappyCmd" != x; then
+[
+if test x"$HappyCmd" != x; then
    fptools_cv_happy_version=`"$HappyCmd" -v |
               grep 'Happy Version' | sed -e 's/Happy Version \([^ ]*\).*/\1/g'` ;
 else
@@ -969,13 +964,17 @@ AC_SUBST(HappyVersion)
 
 dnl
 dnl Check for Alex and version.
+dnl
+dnl 1. Use alex specified in env var ALEX
+dnl 2. Find alex in path
+dnl 3. Check alex version
+dnl
 dnl If you increase the minimum version requirement, please also update:
 dnl https://ghc.haskell.org/trac/ghc/wiki/Building/Preparation/Tools
 dnl
 AC_DEFUN([FPTOOLS_ALEX],
-[
-AC_PATH_PROG(AlexCmd,alex,)
-
+[AC_PATH_PROG(ALEX,[alex],)
+AC_SUBST(AlexCmd,$ALEX)
 AC_CACHE_CHECK([for version of alex], fptools_cv_alex_version,
 changequote(, )dnl
 [if test x"$AlexCmd" != x; then
@@ -986,16 +985,13 @@ else
 fi;
 changequote([, ])dnl
 ])
-FP_COMPARE_VERSIONS([$fptools_cv_alex_version],[-ge],[3.0],
-  [Alex3=YES],[Alex3=NO])
-if test ! -f compiler/cmm/CmmLex.hs || test ! -f compiler/parser/Lexer.hs
+if test ! -f compiler/parser/Lexer.hs
 then
-    FP_COMPARE_VERSIONS([$fptools_cv_alex_version],[-lt],[3.1.0],
-      [AC_MSG_ERROR([Alex version 3.1.0 or later is required to compile GHC.])])[]
+    FP_COMPARE_VERSIONS([$fptools_cv_alex_version],[-lt],[3.1.7],
+      [AC_MSG_ERROR([Alex version 3.1.7 or later is required to compile GHC.])])[]
 fi
 AlexVersion=$fptools_cv_alex_version;
 AC_SUBST(AlexVersion)
-AC_SUBST(Alex3)
 ])
 
 
@@ -1324,6 +1320,24 @@ AC_SUBST(GccIsClang)
 rm -f conftest.txt
 ])
 
+# FP_GCC_SUPPORTS__ATOMICS
+# ------------------------
+# Does gcc support the __atomic_* family of builtins?
+AC_DEFUN([FP_GCC_SUPPORTS__ATOMICS],
+[
+   AC_REQUIRE([AC_PROG_CC])
+   AC_MSG_CHECKING([whether GCC supports __atomic_ builtins])
+   echo 'int test(int *x) { int y; __atomic_load(x, &y, __ATOMIC_SEQ_CST); return y; }' > conftest.c
+   if $CC -c conftest.c > /dev/null 2>&1; then
+       CONF_GCC_SUPPORTS__ATOMICS=YES
+       AC_MSG_RESULT([yes])
+   else
+       CONF_GCC_SUPPORTS__ATOMICS=NO
+       AC_MSG_RESULT([no])
+   fi
+   rm -f conftest.c conftest.o
+])
+
 # FP_GCC_SUPPORTS_NO_PIE
 # ----------------------
 # Does gcc support the -no-pie option? If so we should pass it to gcc when
@@ -1546,7 +1560,7 @@ if test "$RELEASE" = "NO"; then
     if test -f VERSION_DATE; then
         PACKAGE_VERSION=${PACKAGE_VERSION}.`cat VERSION_DATE`
         AC_MSG_RESULT(given $PACKAGE_VERSION)
-    elif test -d .git; then
+    elif test -e .git; then
         changequote(, )dnl
         ver_posixtime=`git log -1 --pretty=format:%ct`
         ver_date=`perl -MPOSIX -e "print strftime('%Y%m%d', gmtime($ver_posixtime));"`
@@ -1797,8 +1811,22 @@ AC_DEFUN([FP_GMP],
       [directory containing gmp library])],
       [GMP_LIB_DIRS=$withval])
 
+  AC_ARG_WITH([intree-gmp],
+    [AC_HELP_STRING([--with-intree-gmp],
+      [force using the in-tree GMP])],
+      [GMP_FORCE_INTREE=YES],
+      [GMP_FORCE_INTREE=NO])
+
+  AC_ARG_WITH([gmp-framework-preferred],
+    [AC_HELP_STRING([--with-gmp-framework-preferred],
+      [on OSX, prefer the GMP framework to the gmp lib])],
+      [GMP_PREFER_FRAMEWORK=YES],
+      [GMP_PREFER_FRAMEWORK=NO])
+
   AC_SUBST(GMP_INCLUDE_DIRS)
   AC_SUBST(GMP_LIB_DIRS)
+  AC_SUBST(GMP_FORCE_INTREE)
+  AC_SUBST(GMP_PREFER_FRAMEWORK)
 ])# FP_GMP
 
 # FP_CURSES
@@ -2107,7 +2135,8 @@ AC_DEFUN([XCODE_VERSION],[
 # FIND_LLVM_PROG()
 # --------------------------------
 # Find where the llvm tools are. We have a special function to handle when they
-# are installed with a version suffix (e.g., llc-3.1).
+# are installed with a version suffix (e.g., llc-7, llc-7.0) and without (e.g.
+# llc).
 #
 # $1 = the variable to set
 # $2 = the command to look for
@@ -2115,7 +2144,7 @@ AC_DEFUN([XCODE_VERSION],[
 #
 AC_DEFUN([FIND_LLVM_PROG],[
     # Test for program with and without version name.
-    AC_CHECK_TOOLS([$1], [$2-$3 $2], [:])
+    AC_CHECK_TOOLS([$1], [$2-$3 $2-$3.0 $2], [:])
     if test "$$1" != ":"; then
         AC_MSG_CHECKING([$$1 is version $3])
         if test `$$1 --version | grep -c "version $3"` -gt 0 ; then
@@ -2427,7 +2456,11 @@ AC_DEFUN([FIND_LD],[
                    FP_CC_LINKER_FLAG_TRY(bfd, $2) ;;
               "GNU gold"*)
                    FP_CC_LINKER_FLAG_TRY(gold, $2)
-                   LD_NO_GOLD=ld
+                   if test "$cross_compiling" = "yes"; then
+                       AC_MSG_NOTICE([Using ld.gold and assuming that it is not affected by binutils issue 22266]);
+                   else
+                       LD_NO_GOLD=ld;
+                   fi
                    ;;
               "LLD"*)
                    FP_CC_LINKER_FLAG_TRY(lld, $2) ;;
@@ -2448,7 +2481,7 @@ AC_DEFUN([FIND_LD],[
         # Fallback
         AC_CHECK_TARGET_TOOL([LD], [ld])
         # This isn't entirely safe since $LD may have been discovered to be
-        $ ld.gold, but what else can we do?
+        # ld.gold, but what else can we do?
         if test "x$LD_NO_GOLD" = "x"; then LD_NO_GOLD=$LD; fi
     }
 

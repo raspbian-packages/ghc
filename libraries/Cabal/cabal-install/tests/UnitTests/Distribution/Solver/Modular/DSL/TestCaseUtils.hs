@@ -4,8 +4,10 @@ module UnitTests.Distribution.Solver.Modular.DSL.TestCaseUtils (
     SolverTest
   , SolverResult(..)
   , maxBackjumps
+  , minimizeConflictSet
   , independentGoals
   , allowBootLibInstalls
+  , onlyConstrained
   , disableBackjumping
   , disableSolveExecutables
   , goalOrder
@@ -52,6 +54,10 @@ import UnitTests.Options
 maxBackjumps :: Maybe Int -> SolverTest -> SolverTest
 maxBackjumps mbj test = test { testMaxBackjumps = mbj }
 
+minimizeConflictSet :: SolverTest -> SolverTest
+minimizeConflictSet test =
+    test { testMinimizeConflictSet = MinimizeConflictSet True }
+
 -- | Combinator to turn on --independent-goals behavior, i.e. solve
 -- for the goals as if we were solving for each goal independently.
 independentGoals :: SolverTest -> SolverTest
@@ -60,6 +66,10 @@ independentGoals test = test { testIndepGoals = IndependentGoals True }
 allowBootLibInstalls :: SolverTest -> SolverTest
 allowBootLibInstalls test =
     test { testAllowBootLibInstalls = AllowBootLibInstalls True }
+
+onlyConstrained :: SolverTest -> SolverTest
+onlyConstrained test =
+    test { testOnlyConstrained = OnlyConstrainedAll }
 
 disableBackjumping :: SolverTest -> SolverTest
 disableBackjumping test =
@@ -95,8 +105,10 @@ data SolverTest = SolverTest {
   , testTargets              :: [String]
   , testResult               :: SolverResult
   , testMaxBackjumps         :: Maybe Int
+  , testMinimizeConflictSet  :: MinimizeConflictSet
   , testIndepGoals           :: IndependentGoals
   , testAllowBootLibInstalls :: AllowBootLibInstalls
+  , testOnlyConstrained      :: OnlyConstrained
   , testEnableBackjumping    :: EnableBackjumping
   , testSolveExecutables     :: SolveExecutables
   , testGoalOrder            :: Maybe [ExampleVar]
@@ -189,8 +201,10 @@ mkTestExtLangPC exts langs pkgConfigDb db label targets result = SolverTest {
   , testTargets              = targets
   , testResult               = result
   , testMaxBackjumps         = Nothing
+  , testMinimizeConflictSet  = MinimizeConflictSet False
   , testIndepGoals           = IndependentGoals False
   , testAllowBootLibInstalls = AllowBootLibInstalls False
+  , testOnlyConstrained      = OnlyConstrainedNone
   , testEnableBackjumping    = EnableBackjumping True
   , testSolveExecutables     = SolveExecutables True
   , testGoalOrder            = Nothing
@@ -209,9 +223,10 @@ runTest SolverTest{..} = askOption $ \(OptionShowSolverLog showSolverLog) ->
     testCase testLabel $ do
       let progress = exResolve testDb testSupportedExts
                      testSupportedLangs testPkgConfigDb testTargets
-                     testMaxBackjumps (CountConflicts True) testIndepGoals
+                     testMaxBackjumps (CountConflicts True)
+                     testMinimizeConflictSet testIndepGoals
                      (ReorderGoals False) testAllowBootLibInstalls
-                     testEnableBackjumping testSolveExecutables
+                     testOnlyConstrained testEnableBackjumping testSolveExecutables
                      (sortGoals <$> testGoalOrder) testConstraints
                      testSoftConstraints testVerbosity testEnableAllTests
           printMsg msg = when showSolverLog $ putStrLn msg

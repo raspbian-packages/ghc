@@ -4,77 +4,98 @@ module Distribution.FieldGrammar.Pretty (
     prettyFieldGrammar,
     ) where
 
+import           Distribution.CabalSpecVersion
 import           Distribution.Compat.Lens
 import           Distribution.Compat.Newtype
 import           Distribution.Compat.Prelude
-import           Distribution.Pretty         (Pretty (..))
-import           Distribution.Simple.Utils   (fromUTF8BS)
+import           Distribution.Fields.Field     (FieldName)
+import           Distribution.Fields.Pretty    (PrettyField (..))
+import           Distribution.Pretty           (Pretty (..), showFreeText, showFreeTextV3)
+import           Distribution.Simple.Utils     (toUTF8BS)
 import           Prelude ()
-import           Text.PrettyPrint            (Doc)
-import qualified Text.PrettyPrint            as PP
+import           Text.PrettyPrint              (Doc)
+import qualified Text.PrettyPrint              as PP
 
 import Distribution.FieldGrammar.Class
-import Distribution.ParseUtils         (ppField)
 
 newtype PrettyFieldGrammar s a = PrettyFG
-    { fieldGrammarPretty :: s -> Doc
+    { fieldGrammarPretty :: CabalSpecVersion -> s -> [PrettyField ()]
     }
   deriving (Functor)
 
 instance Applicative (PrettyFieldGrammar s) where
-    pure _ = PrettyFG (\_ -> mempty)
-    PrettyFG f <*> PrettyFG x = PrettyFG (\s -> f s PP.$$ x s)
+    pure _ = PrettyFG (\_ _ -> mempty)
+    PrettyFG f <*> PrettyFG x = PrettyFG (\v s -> f v s <> x v s)
 
 -- | We can use 'PrettyFieldGrammar' to pp print the @s@.
 --
 -- /Note:/ there is not trailing @($+$ text "")@.
-prettyFieldGrammar :: PrettyFieldGrammar s a -> s -> Doc
-prettyFieldGrammar = fieldGrammarPretty
+prettyFieldGrammar :: CabalSpecVersion -> PrettyFieldGrammar s a -> s -> [PrettyField ()]
+prettyFieldGrammar = flip fieldGrammarPretty
 
 instance FieldGrammar PrettyFieldGrammar where
-    blurFieldGrammar f (PrettyFG pp) = PrettyFG (pp . aview f)
+    blurFieldGrammar f (PrettyFG pp) = PrettyFG (\v -> pp v . aview f)
 
-    uniqueFieldAla fn _pack l = PrettyFG $ \s ->
-        ppField (fromUTF8BS fn) (pretty (pack' _pack (aview l s)))
+    uniqueFieldAla fn _pack l = PrettyFG $ \_v s ->
+        ppField fn (pretty (pack' _pack (aview l s)))
 
     booleanFieldDef fn l def = PrettyFG pp
       where
-        pp s
+        pp _v s
             | b == def  = mempty
-            | otherwise = ppField (fromUTF8BS fn) (PP.text (show b))
+            | otherwise = ppField fn (PP.text (show b))
           where
             b = aview l s
 
     optionalFieldAla fn _pack l = PrettyFG pp
       where
-        pp s = case aview l s of
+        pp v s = case aview l s of
             Nothing -> mempty
-            Just a  -> ppField (fromUTF8BS fn) (pretty (pack' _pack a))
+            Just a  -> ppField fn (prettyVersioned v (pack' _pack a))
 
     optionalFieldDefAla fn _pack l def = PrettyFG pp
       where
-        pp s
+        pp v s
             | x == def  = mempty
-            | otherwise = ppField (fromUTF8BS fn) (pretty (pack' _pack x))
+            | otherwise = ppField fn (prettyVersioned v (pack' _pack x))
           where
             x = aview l s
 
+    freeTextField fn l = PrettyFG pp where
+        pp v s = maybe mempty (ppField fn . showFT) (aview l s) where
+            showFT | v >= CabalSpecV3_0 = showFreeTextV3
+                   | otherwise          = showFreeText
+
+    -- it's ok to just show, as showFreeText of empty string is empty.
+    freeTextFieldDef fn l = PrettyFG pp where
+        pp v s = ppField fn (showFT (aview l s)) where
+            showFT | v >= CabalSpecV3_0 = showFreeTextV3
+                   | otherwise          = showFreeText
+
     monoidalFieldAla fn _pack l = PrettyFG pp
       where
-        pp s = ppField  (fromUTF8BS fn) (pretty (pack' _pack (aview l s)))
+        pp v s = ppField fn (prettyVersioned v (pack' _pack (aview l s)))
 
-    prefixedFields _fnPfx l = PrettyFG (pp . aview l)
+    prefixedFields _fnPfx l = PrettyFG (\_ -> pp . aview l)
       where
-        pp xs = PP.vcat
-            -- always print the field, even its Doc is empty
+        pp xs =
+            -- always print the field, even its Doc is empty.
             -- i.e. don't use ppField
-            [ PP.text n <<>> PP.colon PP.<+> (PP.vcat $ map PP.text $ lines s)
+            [ PrettyField () (toUTF8BS n) $ PP.vcat $ map PP.text $ lines s
             | (n, s) <- xs
             -- fnPfx `isPrefixOf` n
             ]
 
     knownField _           = pure ()
-    deprecatedSince [] _ _ = PrettyFG (\_ -> mempty)
-    deprecatedSince _  _ x = x
+    deprecatedSince _ _ x  = x
+    -- TODO: as PrettyFieldGrammar isn't aware of cabal-version: we output the field
+    -- this doesn't affect roundtrip as `removedIn` fields cannot be parsed
+    -- so invalid documents can be only manually constructed.
+    removedIn _ _ x        = x
     availableSince _ _     = id
     hiddenField _          = PrettyFG (\_ -> mempty)
+
+ppField :: FieldName -> Doc -> [PrettyField ()]
+ppField name fielddoc
+    | PP.isEmpty fielddoc = []
+    | otherwise        = [ PrettyField () name fielddoc ]

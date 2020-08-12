@@ -67,7 +67,7 @@ import qualified Distribution.Simple.Configure as Configure
          ( getInstalledPackages, getInstalledPackagesMonitorFiles )
 import Distribution.Version
          ( Version, mkVersion, intersectVersionRanges )
-import Distribution.Text
+import Distribution.Deprecated.Text
          ( display, simpleParse )
 import Distribution.Simple.Utils
          ( die', warn, info )
@@ -198,7 +198,7 @@ getSourcePackages verbosity repoCtxt =
 -- it was at a particular time.
 --
 -- TODO: Enhance to allow specifying per-repo 'IndexState's and also
--- report back per-repo 'IndexStateInfo's (in order for @new-freeze@
+-- report back per-repo 'IndexStateInfo's (in order for @v2-freeze@
 -- to access it)
 getSourcePackagesAtIndexState :: Verbosity -> RepoContext -> Maybe IndexState
                            -> IO SourcePackageDb
@@ -275,7 +275,7 @@ getSourcePackagesAtIndexState verbosity repoCtxt mb_idxState = do
 
   let (pkgs, prefs) = mconcat pkgss
       prefs' = Map.fromListWith intersectVersionRanges
-                 [ (name, range) | Dependency name range <- prefs ]
+                 [ (name, range) | Dependency name range _ <- prefs ]
   _ <- evaluate pkgs
   _ <- evaluate prefs'
   return SourcePackageDb {
@@ -703,7 +703,7 @@ packageListFromCache verbosity mkPkg hnd Cache{..} = accum mempty [] mempty cach
       let srcpkg = mkPkg (BuildTreeRef refType (packageId pkg) pkg path blockno)
       accum srcpkgs (srcpkg:btrs) prefs entries
 
-    accum srcpkgs btrs prefs (CachePreference pref@(Dependency pn _) _ _ : entries) =
+    accum srcpkgs btrs prefs (CachePreference pref@(Dependency pn _ _) _ _ : entries) =
       accum srcpkgs btrs (Map.insert pn pref prefs) entries
 
     getEntryContent :: BlockNo -> IO ByteString
@@ -866,7 +866,7 @@ data IndexCacheEntry
     = CachePackageId PackageId !BlockNo !Timestamp
     | CachePreference Dependency !BlockNo !Timestamp
     | CacheBuildTreeRef !BuildTreeRefType !BlockNo
-      -- NB: CacheBuildTreeRef is irrelevant for 01-index & new-build
+      -- NB: CacheBuildTreeRef is irrelevant for 01-index & v2-build
   deriving (Eq,Generic)
 
 instance NFData IndexCacheEntry where

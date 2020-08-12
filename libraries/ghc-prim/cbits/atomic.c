@@ -1,3 +1,4 @@
+#if !defined(arm_HOST_ARCH)
 #include "Rts.h"
 
 // Fallbacks for atomic primops on byte arrays. The builtins used
@@ -360,6 +361,7 @@ hs_atomicread32(StgWord x)
 #endif
 }
 
+#if WORD_SIZE_IN_BITS == 64
 extern StgWord64 hs_atomicread64(StgWord x);
 StgWord64
 hs_atomicread64(StgWord x)
@@ -370,6 +372,7 @@ hs_atomicread64(StgWord x)
   return __sync_add_and_fetch((StgWord64 *) x, 0);
 #endif
 }
+#endif
 
 // AtomicWriteByteArrayOp_Int
 // Implies a full memory barrier (see compiler/prelude/primops.txt.pp)
@@ -408,6 +411,7 @@ hs_atomicwrite32(StgWord x, StgWord val)
 #endif
 }
 
+#if WORD_SIZE_IN_BITS == 64
 extern void hs_atomicwrite64(StgWord x, StgWord64 val);
 void
 hs_atomicwrite64(StgWord x, StgWord64 val)
@@ -418,3 +422,6 @@ hs_atomicwrite64(StgWord x, StgWord64 val)
   while (!__sync_bool_compare_and_swap((StgWord64 *) x, *(StgWord64 *) x, (StgWord64) val));
 #endif
 }
+#endif
+
+#endif

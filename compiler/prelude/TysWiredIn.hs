@@ -29,9 +29,9 @@ module TysWiredIn (
 
         -- * Ordering
         orderingTyCon,
-        ltDataCon, ltDataConId,
-        eqDataCon, eqDataConId,
-        gtDataCon, gtDataConId,
+        ordLTDataCon, ordLTDataConId,
+        ordEQDataCon, ordEQDataConId,
+        ordGTDataCon, ordGTDataConId,
         promotedLTDataCon, promotedEQDataCon, promotedGTDataCon,
 
         -- * Boxing primitive types
@@ -96,7 +96,8 @@ module TysWiredIn (
         liftedTypeKindTyConName,
 
         -- * Equality predicates
-        heqTyCon, heqClass, heqDataCon,
+        heqTyCon, heqTyConName, heqClass, heqDataCon,
+        eqTyCon, eqTyConName, eqClass, eqDataCon, eqTyCon_RDR,
         coercibleTyCon, coercibleTyConName, coercibleDataCon, coercibleClass,
 
         -- * RuntimeRep and friends
@@ -106,8 +107,10 @@ module TysWiredIn (
 
         vecRepDataConTyCon, tupleRepDataConTyCon, sumRepDataConTyCon,
 
-        liftedRepDataConTy, unliftedRepDataConTy, intRepDataConTy,
-        wordRepDataConTy, int64RepDataConTy, word64RepDataConTy, addrRepDataConTy,
+        liftedRepDataConTy, unliftedRepDataConTy, intRepDataConTy, int8RepDataConTy,
+        int16RepDataConTy, word16RepDataConTy,
+        wordRepDataConTy, int64RepDataConTy, word8RepDataConTy, word64RepDataConTy,
+        addrRepDataConTy,
         floatRepDataConTy, doubleRepDataConTy,
 
         vec2DataConTy, vec4DataConTy, vec8DataConTy, vec16DataConTy, vec32DataConTy,
@@ -218,6 +221,7 @@ wiredInTyCons = [ -- Units are not treated like other tuples, because then
                 , listTyCon
                 , maybeTyCon
                 , heqTyCon
+                , eqTyCon
                 , coercibleTyCon
                 , typeNatKindCon
                 , typeSymbolKindCon
@@ -246,9 +250,19 @@ mkWiredInIdName mod fs uniq id
 
 -- See Note [Kind-changing of (~) and Coercible]
 -- in libraries/ghc-prim/GHC/Types.hs
+eqTyConName, eqDataConName, eqSCSelIdName :: Name
+eqTyConName   = mkWiredInTyConName   UserSyntax gHC_TYPES (fsLit "~")   eqTyConKey   eqTyCon
+eqDataConName = mkWiredInDataConName UserSyntax gHC_TYPES (fsLit "Eq#") eqDataConKey eqDataCon
+eqSCSelIdName = mkWiredInIdName gHC_TYPES (fsLit "eq_sel") eqSCSelIdKey eqSCSelId
+
+eqTyCon_RDR :: RdrName
+eqTyCon_RDR = nameRdrName eqTyConName
+
+-- See Note [Kind-changing of (~) and Coercible]
+-- in libraries/ghc-prim/GHC/Types.hs
 heqTyConName, heqDataConName, heqSCSelIdName :: Name
 heqTyConName   = mkWiredInTyConName   UserSyntax gHC_TYPES (fsLit "~~")   heqTyConKey      heqTyCon
-heqDataConName = mkWiredInDataConName UserSyntax gHC_TYPES (fsLit "Eq#")  heqDataConKey heqDataCon
+heqDataConName = mkWiredInDataConName UserSyntax gHC_TYPES (fsLit "HEq#") heqDataConKey heqDataCon
 heqSCSelIdName = mkWiredInIdName gHC_TYPES (fsLit "heq_sel") heqSCSelIdKey heqSCSelId
 
 -- See Note [Kind-changing of (~) and Coercible] in libraries/ghc-prim/GHC/Types.hs
@@ -402,10 +416,20 @@ sumRepDataConName = mkWiredInDataConName UserSyntax gHC_TYPES (fsLit "SumRep") s
 runtimeRepSimpleDataConNames :: [Name]
 runtimeRepSimpleDataConNames
   = zipWith3Lazy mk_special_dc_name
-      [ fsLit "LiftedRep", fsLit "UnliftedRep"
+      [ fsLit "LiftedRep"
+      , fsLit "UnliftedRep"
       , fsLit "IntRep"
-      , fsLit "WordRep", fsLit "Int64Rep", fsLit "Word64Rep"
-      , fsLit "AddrRep", fsLit "FloatRep", fsLit "DoubleRep" ]
+      , fsLit "WordRep"
+      , fsLit "Int8Rep"
+      , fsLit "Int16Rep"
+      , fsLit "Int64Rep"
+      , fsLit "Word8Rep"
+      , fsLit "Word16Rep"
+      , fsLit "Word64Rep"
+      , fsLit "AddrRep"
+      , fsLit "FloatRep"
+      , fsLit "DoubleRep"
+      ]
       runtimeRepSimpleDataConKeys
       runtimeRepSimpleDataCons
 
@@ -477,8 +501,8 @@ pcDataCon n univs = pcDataConWithFixity False n univs
 pcDataConWithFixity :: Bool      -- ^ declared infix?
                     -> Name      -- ^ datacon name
                     -> [TyVar]   -- ^ univ tyvars
-                    -> [TyVar]   -- ^ ex tyvars
-                    -> [TyVar]   -- ^ user-written tyvars
+                    -> [TyCoVar] -- ^ ex tycovars
+                    -> [TyCoVar] -- ^ user-written tycovars
                     -> [Type]    -- ^ args
                     -> TyCon
                     -> DataCon
@@ -492,7 +516,7 @@ pcDataConWithFixity infx n = pcDataConWithFixity' infx n (dataConWorkerUnique (n
 -- one DataCon unique per pair of Ints.
 
 pcDataConWithFixity' :: Bool -> Name -> Unique -> RuntimeRepInfo
-                     -> [TyVar] -> [TyVar] -> [TyVar]
+                     -> [TyVar] -> [TyCoVar] -> [TyCoVar]
                      -> [Type] -> TyCon -> DataCon
 -- The Name should be in the DataName name space; it's the name
 -- of the DataCon itself.
@@ -512,7 +536,7 @@ pcDataConWithFixity' declared_infix dc_name wrk_key rri
                 (map (const no_bang) arg_tys)
                 []      -- No labelled fields
                 tyvars ex_tyvars
-                (mkTyVarBinders Specified user_tyvars)
+                (mkTyCoVarBinders Specified user_tyvars)
                 []      -- No equality spec
                 []      -- No theta
                 arg_tys (mkTyConApp tycon (mkTyVarTys tyvars))
@@ -576,7 +600,7 @@ constraintKind   = mkTyConApp constraintKindTyCon []
 mkFunKind :: Kind -> Kind -> Kind
 mkFunKind = mkFunTy
 
-mkForAllKind :: TyVar -> ArgFlag -> Kind -> Kind
+mkForAllKind :: TyCoVar -> ArgFlag -> Kind -> Kind
 mkForAllKind = mkForAllTy
 
 {-
@@ -678,6 +702,9 @@ isBuiltInOcc_maybe occ =
 
       -- equality tycon
       "~"    -> Just eqTyConName
+
+      -- function tycon
+      "->"   -> Just funTyConName
 
       -- boxed tuple data/tycon
       "()"    -> Just $ tup_name Boxed 0
@@ -1014,10 +1041,28 @@ mk_sum arity = (tycon, sum_cons)
 -- necessary because the functional-dependency coverage check looks
 -- through superclasses, and (~#) is handled in that check.
 
-heqTyCon, coercibleTyCon :: TyCon
-heqClass, coercibleClass :: Class
-heqDataCon, coercibleDataCon :: DataCon
-heqSCSelId, coercibleSCSelId :: Id
+eqTyCon,   heqTyCon,   coercibleTyCon   :: TyCon
+eqClass,   heqClass,   coercibleClass   :: Class
+eqDataCon, heqDataCon, coercibleDataCon :: DataCon
+eqSCSelId, heqSCSelId, coercibleSCSelId :: Id
+
+(eqTyCon, eqClass, eqDataCon, eqSCSelId)
+  = (tycon, klass, datacon, sc_sel_id)
+  where
+    tycon     = mkClassTyCon eqTyConName binders roles
+                             rhs klass
+                             (mkPrelTyConRepName eqTyConName)
+    klass     = mk_class tycon sc_pred sc_sel_id
+    datacon   = pcDataCon eqDataConName tvs [sc_pred] tycon
+
+    -- Kind: forall k. k -> k -> Constraint
+    binders   = mkTemplateTyConBinders [liftedTypeKind] (\[k] -> [k,k])
+    roles     = [Nominal, Nominal, Nominal]
+    rhs       = mkDataTyConRhs [datacon]
+
+    tvs@[k,a,b] = binderVars binders
+    sc_pred     = mkTyConApp eqPrimTyCon (mkTyVarTys [k,k,a,b])
+    sc_sel_id   = mkDictSelId eqSCSelIdName klass
 
 (heqTyCon, heqClass, heqDataCon, heqSCSelId)
   = (tycon, klass, datacon, sc_sel_id)
@@ -1029,7 +1074,7 @@ heqSCSelId, coercibleSCSelId :: Id
     datacon   = pcDataCon heqDataConName tvs [sc_pred] tycon
 
     -- Kind: forall k1 k2. k1 -> k2 -> Constraint
-    binders   = mkTemplateTyConBinders [liftedTypeKind, liftedTypeKind] (\ks -> ks)
+    binders   = mkTemplateTyConBinders [liftedTypeKind, liftedTypeKind] id
     roles     = [Nominal, Nominal, Nominal, Nominal]
     rhs       = mkDataTyConRhs [datacon]
 
@@ -1059,6 +1104,8 @@ mk_class :: TyCon -> PredType -> Id -> Class
 mk_class tycon sc_pred sc_sel_id
   = mkClass (tyConName tycon) (tyConTyVars tycon) [] [sc_pred] [sc_sel_id]
             [] [] (mkAnd []) tycon
+
+
 
 {- *********************************************************************
 *                                                                      *
@@ -1135,8 +1182,8 @@ runtimeRepSimpleDataCons :: [DataCon]
 liftedRepDataCon :: DataCon
 runtimeRepSimpleDataCons@(liftedRepDataCon : _)
   = zipWithLazy mk_runtime_rep_dc
-    [ LiftedRep, UnliftedRep, IntRep, WordRep, Int64Rep
-    , Word64Rep, AddrRep, FloatRep, DoubleRep ]
+    [ LiftedRep, UnliftedRep, IntRep, WordRep, Int8Rep, Int16Rep, Int64Rep
+    , Word8Rep, Word16Rep, Word64Rep, AddrRep, FloatRep, DoubleRep ]
     runtimeRepSimpleDataConNames
   where
     mk_runtime_rep_dc primrep name
@@ -1144,11 +1191,13 @@ runtimeRepSimpleDataCons@(liftedRepDataCon : _)
 
 -- See Note [Wiring in RuntimeRep]
 liftedRepDataConTy, unliftedRepDataConTy,
-  intRepDataConTy, wordRepDataConTy, int64RepDataConTy,
-  word64RepDataConTy, addrRepDataConTy, floatRepDataConTy, doubleRepDataConTy :: Type
+  intRepDataConTy, int8RepDataConTy, int16RepDataConTy, wordRepDataConTy, int64RepDataConTy,
+  word8RepDataConTy, word16RepDataConTy, word64RepDataConTy, addrRepDataConTy,
+  floatRepDataConTy, doubleRepDataConTy :: Type
 [liftedRepDataConTy, unliftedRepDataConTy,
-   intRepDataConTy, wordRepDataConTy, int64RepDataConTy,
-   word64RepDataConTy, addrRepDataConTy, floatRepDataConTy, doubleRepDataConTy]
+   intRepDataConTy, wordRepDataConTy, int8RepDataConTy, int16RepDataConTy, int64RepDataConTy,
+   word8RepDataConTy, word16RepDataConTy, word64RepDataConTy,
+   addrRepDataConTy, floatRepDataConTy, doubleRepDataConTy]
   = map (mkTyConTy . promoteDataCon) runtimeRepSimpleDataCons
 
 vecCountTyCon :: TyCon
@@ -1199,7 +1248,7 @@ liftedRepDataConTyCon = promoteDataCon liftedRepDataCon
 
 -- The type ('LiftedRep)
 liftedRepTy :: Type
-liftedRepTy = mkTyConTy liftedRepDataConTyCon
+liftedRepTy = liftedRepDataConTy
 
 {- *********************************************************************
 *                                                                      *
@@ -1368,17 +1417,17 @@ trueDataConId  = dataConWorkId trueDataCon
 
 orderingTyCon :: TyCon
 orderingTyCon = pcTyCon orderingTyConName Nothing
-                        [] [ltDataCon, eqDataCon, gtDataCon]
+                        [] [ordLTDataCon, ordEQDataCon, ordGTDataCon]
 
-ltDataCon, eqDataCon, gtDataCon :: DataCon
-ltDataCon = pcDataCon ltDataConName  [] [] orderingTyCon
-eqDataCon = pcDataCon eqDataConName  [] [] orderingTyCon
-gtDataCon = pcDataCon gtDataConName  [] [] orderingTyCon
+ordLTDataCon, ordEQDataCon, ordGTDataCon :: DataCon
+ordLTDataCon = pcDataCon ordLTDataConName  [] [] orderingTyCon
+ordEQDataCon = pcDataCon ordEQDataConName  [] [] orderingTyCon
+ordGTDataCon = pcDataCon ordGTDataConName  [] [] orderingTyCon
 
-ltDataConId, eqDataConId, gtDataConId :: Id
-ltDataConId = dataConWorkId ltDataCon
-eqDataConId = dataConWorkId eqDataCon
-gtDataConId = dataConWorkId gtDataCon
+ordLTDataConId, ordEQDataConId, ordGTDataConId :: Id
+ordLTDataConId = dataConWorkId ordLTDataCon
+ordEQDataConId = dataConWorkId ordEQDataCon
+ordGTDataConId = dataConWorkId ordGTDataCon
 
 {-
 ************************************************************************
@@ -1519,9 +1568,9 @@ promotedLTDataCon
   , promotedEQDataCon
   , promotedGTDataCon
   :: TyCon
-promotedLTDataCon     = promoteDataCon ltDataCon
-promotedEQDataCon     = promoteDataCon eqDataCon
-promotedGTDataCon     = promoteDataCon gtDataCon
+promotedLTDataCon     = promoteDataCon ordLTDataCon
+promotedEQDataCon     = promoteDataCon ordEQDataCon
+promotedGTDataCon     = promoteDataCon ordGTDataCon
 
 -- Promoted List
 promotedConsDataCon, promotedNilDataCon :: TyCon

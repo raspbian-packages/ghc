@@ -79,11 +79,16 @@ occurAnalysePgm this_mod active_unf active_rule imp_rules binds
     (final_usage, occ_anald_binds) = go init_env binds
     (_, occ_anald_glommed_binds)   = occAnalRecBind init_env TopLevel
                                                     imp_rule_edges
-                                                    (flattenBinds occ_anald_binds)
+                                                    (flattenBinds binds)
                                                     initial_uds
           -- It's crucial to re-analyse the glommed-together bindings
           -- so that we establish the right loop breakers. Otherwise
-          -- we can easily create an infinite loop (Trac #9583 is an example)
+          -- we can easily create an infinite loop (#9583 is an example)
+          --
+          -- Also crucial to re-analyse the /original/ bindings
+          -- in case the first pass accidentally discarded as dead code
+          -- a binding that was actually needed (albeit before its
+          -- definition site).  #17724 threw this up.
 
     initial_uds = addManyOccsSet emptyDetails
                             (rulesFreeVars imp_rules)
@@ -1307,7 +1312,7 @@ nodeScore env old_bndr new_bndr bind_rhs lb_deps
   = (0, 0, True)                   -- See Note [Self-recursion and loop breakers]
 
   | not (occ_unf_act env old_bndr) -- A binder whose inlining is inactive (e.g. has
-  = (0, 0, True)                   -- a NOINLINE pragam) makes a great loop breaker
+  = (0, 0, True)                   -- a NOINLINE pragma) makes a great loop breaker
 
   | exprIsTrivial rhs
   = mk_score 10  -- Practically certain to be inlined
@@ -2295,6 +2300,9 @@ Core Lint never expects to find an *occurrence* of an Id marked
 as Dead, so we must zap the OccInfo on cb before making the
 binding x = cb.  See Trac #5028.
 
+NB: the OccInfo on /occurrences/ really doesn't matter much; the simplifier
+doesn't use it. So this is only to satisfy the perhpas-over-picky Lint.
+
 Historical note [no-case-of-case]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 We *used* to suppress the binder-swap in case expressions when
@@ -2370,9 +2378,14 @@ mkAltEnv env@(OccEnv { occ_gbl_scrut = pe }) scrut case_bndr
       _               -> (env { occ_encl = OccVanilla }, Nothing)
 
   where
-    add_scrut v rhs = ( env { occ_encl = OccVanilla
-                            , occ_gbl_scrut = pe `extendVarSet` v }
-                      , Just (localise v, rhs) )
+    add_scrut v rhs
+      | isGlobalId v = (env { occ_encl = OccVanilla }, Nothing)
+      | otherwise    = ( env { occ_encl = OccVanilla
+                             , occ_gbl_scrut = pe `extendVarSet` v }
+                       , Just (localise v, rhs) )
+      -- ToDO: this isGlobalId stuff is a TEMPORARY FIX
+      --       to avoid the binder-swap for GlobalIds
+      --       See Trac #16346
 
     case_bndr' = Var (zapIdOccInfo case_bndr)
                    -- See Note [Zap case binders in proxy bindings]
@@ -2433,7 +2446,7 @@ andUDs = combineUsageDetailsWith addOccInfo
 orUDs  = combineUsageDetailsWith orOccInfo
 
 andUDsList :: [UsageDetails] -> UsageDetails
-andUDsList = foldl andUDs emptyDetails
+andUDsList = foldl' andUDs emptyDetails
 
 mkOneOcc :: OccEnv -> Id -> InterestingCxt -> JoinArity -> UsageDetails
 mkOneOcc env id int_cxt arity

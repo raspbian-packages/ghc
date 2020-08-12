@@ -45,13 +45,13 @@ import Distribution.Simple.Utils
          ( tryFindPackageDesc )
 import Distribution.System
          ( Platform )
-import Distribution.Text
+import Distribution.Deprecated.Text
          ( display )
 import Distribution.Verbosity
          ( Verbosity )
 import Distribution.Version
          ( Version, alterVersion
-         , LowerBound(..), UpperBound(..), VersionRange(..), asVersionIntervals
+         , LowerBound(..), UpperBound(..), VersionRange, asVersionIntervals
          , orLaterVersion, earlierVersion, intersectVersionRanges )
 import System.Directory
          ( getCurrentDirectory )
@@ -112,7 +112,7 @@ genBounds verbosity packageDBs repoCtxt comp platform progdb mSandboxPkgInfo
     let cinfo = compilerInfo comp
 
     cwd <- getCurrentDirectory
-    path <- tryFindPackageDesc cwd
+    path <- tryFindPackageDesc verbosity cwd
     gpd <- readGenericPackageDescription verbosity path
     -- NB: We don't enable tests or benchmarks, since often they
     -- don't really have useful bounds.
@@ -144,10 +144,10 @@ genBounds verbosity packageDBs repoCtxt comp platform progdb mSandboxPkgInfo
        traverse_ (putStrLn . (++",") . showBounds padTo) thePkgs
 
      depName :: Dependency -> String
-     depName (Dependency pn _) = unPackageName pn
+     depName (Dependency pn _ _) = unPackageName pn
 
      depVersion :: Dependency -> VersionRange
-     depVersion (Dependency _ vr) = vr
+     depVersion (Dependency _ vr _) = vr
 
 -- | The message printed when some dependencies are found to be lacking proper
 -- PVP-mandated bounds.

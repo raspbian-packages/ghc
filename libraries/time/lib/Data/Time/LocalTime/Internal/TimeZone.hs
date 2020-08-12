@@ -1,8 +1,5 @@
 {-# OPTIONS -fno-warn-unused-imports #-}
 {-# LANGUAGE ForeignFunctionInterface #-}
-#include "HsConfigure.h"
-
--- #hide
 module Data.Time.LocalTime.Internal.TimeZone
 (
     -- * Time zones
@@ -18,7 +15,7 @@ import Data.Time.Clock.System
 import Data.Time.Clock.POSIX
 import Data.Time.Clock.Internal.UTCTime
 
-#if __GLASGOW_HASKELL__ >= 709 || __GLASGOW_HASKELL__ < 702
+#if __GLASGOW_HASKELL__ >= 709
 import Foreign
 #else
 import Foreign.Safe
@@ -26,9 +23,7 @@ import Foreign.Safe
 import Foreign.C
 import Control.DeepSeq
 import Data.Typeable
-#if LANGUAGE_Rank2Types
 import Data.Data
-#endif
 
 -- | A TimeZone is a whole number of minutes offset from UTC, together with a name and a \"just for summer\" flag.
 data TimeZone = TimeZone {
@@ -38,13 +33,7 @@ data TimeZone = TimeZone {
     timeZoneSummerOnly :: Bool,
     -- | The name of the zone, typically a three- or four-letter acronym.
     timeZoneName :: String
-} deriving (Eq,Ord
-#if LANGUAGE_DeriveDataTypeable
-#if LANGUAGE_Rank2Types
-    ,Data, Typeable
-#endif
-#endif
-    )
+} deriving (Eq,Ord,Data, Typeable)
 
 instance NFData TimeZone where
     rnf (TimeZone m so n) = rnf m `seq` rnf so `seq` rnf n `seq` ()
@@ -57,22 +46,28 @@ minutesToTimeZone m = TimeZone m False ""
 hoursToTimeZone :: Int -> TimeZone
 hoursToTimeZone i = minutesToTimeZone (60 * i)
 
-showT :: PadOption -> Int -> String
-showT opt t = showPaddedNum opt ((div t 60) * 100 + (mod t 60))
+showT :: Bool -> PadOption -> Int -> String
+showT False opt t = showPaddedNum opt ((div t 60) * 100 + (mod t 60))
+showT True opt t = let
+    opt' = case opt of
+        NoPad -> NoPad
+        Pad i c -> Pad (max 0 $ i - 3) c
+    in showPaddedNum opt' (div t 60) ++ ":" ++ show2 (mod t 60)
 
-timeZoneOffsetString'' :: PadOption -> TimeZone -> String
-timeZoneOffsetString'' opt (TimeZone t _ _) | t < 0 = '-':(showT opt (negate t))
-timeZoneOffsetString'' opt (TimeZone t _ _) = '+':(showT opt t)
+timeZoneOffsetString'' :: Bool -> PadOption -> TimeZone -> String
+timeZoneOffsetString'' colon opt (TimeZone t _ _) | t < 0 = '-':(showT colon opt (negate t))
+timeZoneOffsetString'' colon opt (TimeZone t _ _) = '+':(showT colon opt t)
 
 -- | Text representing the offset of this timezone, such as \"-0800\" or \"+0400\" (like @%z@ in formatTime), with arbitrary padding.
 timeZoneOffsetString' :: Maybe Char -> TimeZone -> String
-timeZoneOffsetString' Nothing = timeZoneOffsetString'' NoPad
-timeZoneOffsetString' (Just c) = timeZoneOffsetString'' $ Pad 4 c
+timeZoneOffsetString' Nothing = timeZoneOffsetString'' False NoPad
+timeZoneOffsetString' (Just c) = timeZoneOffsetString'' False $ Pad 4 c
 
 -- | Text representing the offset of this timezone, such as \"-0800\" or \"+0400\" (like @%z@ in formatTime).
 timeZoneOffsetString :: TimeZone -> String
-timeZoneOffsetString = timeZoneOffsetString'' (Pad 4 '0')
+timeZoneOffsetString = timeZoneOffsetString'' False (Pad 4 '0')
 
+-- | This only shows the time zone name, or offset if the name is empty.
 instance Show TimeZone where
     show zone@(TimeZone _ _ "") = timeZoneOffsetString zone
     show (TimeZone _ _ name) = name

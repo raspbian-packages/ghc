@@ -26,12 +26,14 @@ import Distribution.Types.ComponentInclude
 import Distribution.Types.ComponentId
 import Distribution.Types.ComponentName
 import Distribution.Types.PackageId
+import Distribution.Types.PackageName.Magic
 import Distribution.Types.UnitId
 import Distribution.Compat.Graph (IsNode(..))
 import Distribution.Types.Module
 import Distribution.Types.MungedPackageId
 import Distribution.Types.MungedPackageName
 import Distribution.Types.Library
+import Distribution.Types.LibraryName
 
 import Distribution.ModuleName
 import Distribution.Package
@@ -43,9 +45,10 @@ import qualified Data.Traversable as T
 import Control.Monad
 import Text.PrettyPrint
 import qualified Data.Map as Map
+import qualified Data.Set as Set
 
 import Distribution.Version
-import Distribution.Text
+import Distribution.Pretty
 
 -- | A 'ReadyComponent' is one that we can actually generate build
 -- products for.  We have a ready component for the typecheck-only
@@ -134,15 +137,14 @@ rc_depends rc = ordNub $
                 (instc_includes instc)
               ++ instc_insts_deps instc
   where
-    toMungedPackageId :: Text id => ComponentInclude id rn -> MungedPackageId
+    toMungedPackageId :: Pretty id => ComponentInclude id rn -> MungedPackageId
     toMungedPackageId ci =
         computeCompatPackageId
             (ci_pkgid ci)
             (case ci_cname ci of
-                CLibName -> Nothing
-                CSubLibName uqn -> Just uqn
-                _ -> error $ display (rc_cid rc) ++
-                        " depends on non-library " ++ display (ci_id ci))
+                CLibName name -> name
+                _ -> error $ prettyShow (rc_cid rc) ++
+                        " depends on non-library " ++ prettyShow (ci_id ci))
 
 -- | Get the 'MungedPackageId' of a 'ReadyComponent' IF it is
 -- a library.
@@ -178,9 +180,9 @@ dispReadyComponent rc =
     hang (text (case rc_i rc of
                     Left  _ -> "indefinite"
                     Right _ -> "definite")
-            <+> disp (nodeKey rc)
+            <+> pretty (nodeKey rc)
             {- <+> dispModSubst (Map.fromList (lc_insts lc)) -} ) 4 $
-        vcat [ text "depends" <+> disp uid
+        vcat [ text "depends" <+> pretty uid
              | uid <- nodeNeighbors rc ]
 
 -- | The state of 'InstM'; a mapping from 'UnitId's to their
@@ -274,7 +276,7 @@ toReadyComponents pid_map subst0 comps
                             fmap rc_munged_id (join (Map.lookup dep_uid s)))]
                   where
                     err_pid = MungedPackageId
-                        (mkMungedPackageName "nonexistent-package-this-is-a-cabal-bug")
+                        (MungedPackageName nonExistentPackageThisIsCabalBug LMainLibName)
                         (mkVersion [0])
                 instc = InstantiatedComponent {
                             instc_insts = Map.toList insts,
@@ -336,11 +338,19 @@ toReadyComponents pid_map subst0 comps
     indefiniteComponent :: UnitId -> ComponentId -> InstM (Maybe ReadyComponent)
     indefiniteComponent uid cid
       | Just lc <- Map.lookup cid cmap = do
+            -- We're going to process includes, in case some of them
+            -- are fully definite even without any substitution.  We
+            -- want to build those too; see #5634.
+            inst_includes <- forM (lc_includes lc) $ \ci ->
+                if Set.null (openUnitIdFreeHoles (ci_id ci))
+                    then do uid' <- substUnitId Map.empty (ci_id ci)
+                            return $ ci { ci_ann_id = fmap (const (DefiniteUnitId uid')) (ci_ann_id ci) }
+                    else return ci
             exe_deps <- mapM (substExeDep Map.empty) (lc_exe_deps lc)
             let indefc = IndefiniteComponent {
                         indefc_requires = map fst (lc_insts lc),
                         indefc_provides = modShapeProvides (lc_shape lc),
-                        indefc_includes = lc_includes lc ++ lc_sig_includes lc
+                        indefc_includes = inst_includes ++ lc_sig_includes lc
                     }
             return $ Just ReadyComponent {
                     rc_ann_id       = (lc_ann_id lc) { ann_id = uid },
@@ -357,6 +367,7 @@ toReadyComponents pid_map subst0 comps
     ready_map = snd $ runInstM work Map.empty
 
     work
+        -- Top-level instantiation per subst0
         | not (Map.null subst0)
         , [lc] <- filter lc_public (Map.elems cmap)
         = do _ <- instantiateUnitId (lc_cid lc) subst0

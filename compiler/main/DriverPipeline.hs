@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, NamedFieldPuns, NondecreasingIndentation #-}
+{-# LANGUAGE CPP, NamedFieldPuns, NondecreasingIndentation, BangPatterns #-}
 {-# OPTIONS_GHC -fno-cse #-}
 -- -fno-cse is needed for GLOBAL_VAR's to behave properly
 
@@ -52,11 +52,11 @@ import DynFlags
 import Config
 import Panic
 import Util
-import StringBuffer     ( hGetStringBuffer )
+import StringBuffer     ( hGetStringBuffer, hPutStringBuffer )
 import BasicTypes       ( SuccessFlag(..) )
 import Maybes           ( expectJust )
 import SrcLoc
-import LlvmCodeGen      ( llvmFixupAsm )
+import LlvmCodeGen      ( llvmFixupAsm, llvmVersionList )
 import MonadUtils
 import Platform
 import TcRnTypes
@@ -64,6 +64,8 @@ import Hooks
 import qualified GHC.LanguageExtensions as LangExt
 import FileCleanup
 import Ar
+import Bag              ( unitBag )
+import FastString       ( mkFastString )
 
 import Exception
 import System.Directory
@@ -75,6 +77,8 @@ import Data.Maybe
 import Data.Version
 import Data.Either      ( partitionEithers )
 
+import Data.Time        ( UTCTime )
+
 -- ---------------------------------------------------------------------------
 -- Pre-process
 
@@ -85,17 +89,28 @@ import Data.Either      ( partitionEithers )
 -- of slurping in the OPTIONS pragmas
 
 preprocess :: HscEnv
-           -> (FilePath, Maybe Phase) -- ^ filename and starting phase
-           -> IO (DynFlags, FilePath)
-preprocess hsc_env (filename, mb_phase) =
-  ASSERT2(isJust mb_phase || isHaskellSrcFilename filename, text filename)
-  runPipeline anyHsc hsc_env (filename, fmap RealPhase mb_phase)
+           -> FilePath -- ^ input filename
+           -> Maybe InputFileBuffer
+           -- ^ optional buffer to use instead of reading the input file
+           -> Maybe Phase -- ^ starting phase
+           -> IO (Either ErrorMessages (DynFlags, FilePath))
+preprocess hsc_env input_fn mb_input_buf mb_phase =
+  handleSourceError (\err -> return (Left (srcErrorMessages err))) $
+  ghandle handler $
+  fmap Right $
+  ASSERT2(isJust mb_phase || isHaskellSrcFilename input_fn, text input_fn)
+  runPipeline anyHsc hsc_env (input_fn, mb_input_buf, fmap RealPhase mb_phase)
         Nothing
         -- We keep the processed file for the whole session to save on
         -- duplicated work in ghci.
         (Temporary TFL_GhcSession)
         Nothing{-no ModLocation-}
         []{-no foreign objects-}
+  where
+    srcspan = srcLocSpan $ mkSrcLoc (mkFastString input_fn) 1 1
+    handler (ProgramError msg) = return $ Left $ unitBag $
+        mkPlainErrMsg (hsc_dflags hsc_env) srcspan $ text msg
+    handler ex = throwGhcExceptionIO ex
 
 -- ---------------------------------------------------------------------------
 
@@ -184,6 +199,7 @@ compileOne' m_tc_result mHscMessage
             -- handled properly
             _ <- runPipeline StopLn hsc_env
                               (output_fn,
+                               Nothing,
                                Just (HscOut src_flavour
                                             mod_name HscUpdateSig))
                               (Just basename)
@@ -221,6 +237,7 @@ compileOne' m_tc_result mHscMessage
             -- We're in --make mode: finish the compilation pipeline.
             _ <- runPipeline StopLn hsc_env
                               (output_fn,
+                               Nothing,
                                Just (HscOut src_flavour mod_name (HscRecomp cgguts summary)))
                               (Just basename)
                               Persistent
@@ -256,16 +273,23 @@ compileOne' m_tc_result mHscMessage
                   then gopt_set dflags0 Opt_BuildDynamicToo
                   else dflags0
 
+       -- #16331 - when no "internal interpreter" is available but we
+       -- need to process some TemplateHaskell or QuasiQuotes, we automatically
+       -- turn on -fexternal-interpreter.
+       dflags2 = if not internalInterpreter && needsLinker
+                 then gopt_set dflags1 Opt_ExternalInterpreter
+                 else dflags1
+
        basename = dropExtension input_fn
 
        -- We add the directory in which the .hs files resides) to the import
        -- path.  This is needed when we try to compile the .hc file later, if it
        -- imports a _stub.h file that we created here.
        current_dir = takeDirectory basename
-       old_paths   = includePaths dflags1
-       prevailing_dflags = hsc_dflags hsc_env0
+       old_paths   = includePaths dflags2
+       !prevailing_dflags = hsc_dflags hsc_env0
        dflags =
-          dflags1 { includePaths = addQuoteInclude old_paths [current_dir]
+          dflags2 { includePaths = addQuoteInclude old_paths [current_dir]
                   , log_action = log_action prevailing_dflags }
                   -- use the prevailing log_action / log_finaliser,
                   -- not the one cached in the summary.  This is so
@@ -304,13 +328,14 @@ compileForeign :: HscEnv -> ForeignSrcLang -> FilePath -> IO FilePath
 compileForeign _ RawObject object_file = return object_file
 compileForeign hsc_env lang stub_c = do
         let phase = case lang of
-              LangC -> Cc
-              LangCxx -> Ccxx
-              LangObjc -> Cobjc
+              LangC      -> Cc
+              LangCxx    -> Ccxx
+              LangObjc   -> Cobjc
               LangObjcxx -> Cobjcxx
-              RawObject -> panic "compileForeign: should be unreachable"
+              LangAsm    -> As True -- allow CPP
+              RawObject  -> panic "compileForeign: should be unreachable"
         (_, stub_o) <- runPipeline StopLn hsc_env
-                       (stub_c, Just (RealPhase phase))
+                       (stub_c, Nothing, Just (RealPhase phase))
                        Nothing (Temporary TFL_GhcSession)
                        Nothing{-no ModLocation-}
                        []
@@ -332,7 +357,7 @@ compileEmptyStub dflags hsc_env basename location mod_name = do
   let src = text "int" <+> ppr (mkModule (thisPackage dflags) mod_name) <+> text "= 0;"
   writeFile empty_stub (showSDoc dflags (pprCode CStyle src))
   _ <- runPipeline StopLn hsc_env
-                  (empty_stub, Nothing)
+                  (empty_stub, Nothing, Nothing)
                   (Just basename)
                   Persistent
                   (Just location)
@@ -522,9 +547,10 @@ compileFile hsc_env stop_phase (src, mb_phase) = do
         stop_phase' = case stop_phase of
                         As _ | split -> SplitAs
                         _            -> stop_phase
-
    ( _, out_file) <- runPipeline stop_phase' hsc_env
-                            (src, fmap RealPhase mb_phase) Nothing output
+                            (src, Nothing, fmap RealPhase mb_phase)
+                            Nothing
+                            output
                             Nothing{-no ModLocation-} []
    return out_file
 
@@ -557,13 +583,15 @@ doLink dflags stop_phase o_files
 runPipeline
   :: Phase                      -- ^ When to stop
   -> HscEnv                     -- ^ Compilation environment
-  -> (FilePath,Maybe PhasePlus) -- ^ Input filename (and maybe -x suffix)
+  -> (FilePath, Maybe InputFileBuffer, Maybe PhasePlus)
+                                -- ^ Pipeline input file name, optional
+                                -- buffer and maybe -x suffix
   -> Maybe FilePath             -- ^ original basename (if different from ^^^)
   -> PipelineOutput             -- ^ Output filename
   -> Maybe ModLocation          -- ^ A ModLocation, if this is a Haskell module
   -> [FilePath]                 -- ^ foreign objects
   -> IO (DynFlags, FilePath)    -- ^ (final flags, output filename)
-runPipeline stop_phase hsc_env0 (input_fn, mb_phase)
+runPipeline stop_phase hsc_env0 (input_fn, mb_input_buf, mb_phase)
              mb_basename output maybe_loc foreign_os
 
     = do let
@@ -615,8 +643,22 @@ runPipeline stop_phase hsc_env0 (input_fn, mb_phase)
                                       ++ input_fn))
              HscOut {} -> return ()
 
+         -- Write input buffer to temp file if requested
+         input_fn' <- case (start_phase, mb_input_buf) of
+             (RealPhase real_start_phase, Just input_buf) -> do
+                 let suffix = phaseInputExt real_start_phase
+                 fn <- newTempName dflags TFL_CurrentModule suffix
+                 hdl <- openBinaryFile fn WriteMode
+                 -- Add a LINE pragma so reported source locations will
+                 -- mention the real input file, not this temp file.
+                 hPutStrLn hdl $ "{-# LINE 1 \""++ input_fn ++ "\"#-}"
+                 hPutStringBuffer hdl input_buf
+                 hClose hdl
+                 return fn
+             (_, _) -> return input_fn
+
          debugTraceMsg dflags 4 (text "Running the pipeline")
-         r <- runPipeline' start_phase hsc_env env input_fn
+         r <- runPipeline' start_phase hsc_env env input_fn'
                            maybe_loc foreign_os
 
          -- If we are compiling a Haskell module, and doing
@@ -630,7 +672,7 @@ runPipeline stop_phase hsc_env0 (input_fn, mb_phase)
                    (text "Running the pipeline again for -dynamic-too")
                let dflags' = dynamicTooMkDynamicDynFlags dflags
                hsc_env' <- newHscEnv dflags'
-               _ <- runPipeline' start_phase hsc_env' env input_fn
+               _ <- runPipeline' start_phase hsc_env' env input_fn'
                                  maybe_loc foreign_os
                return ()
          return r
@@ -762,6 +804,7 @@ getOutputFilename stop_phase output basename dflags next_phase maybe_location
           odir       = objectDir dflags
           osuf       = objectSuf dflags
           keep_hc    = gopt Opt_KeepHcFiles dflags
+          keep_hscpp = gopt Opt_KeepHscppFiles dflags
           keep_s     = gopt Opt_KeepSFiles dflags
           keep_bc    = gopt Opt_KeepLlvmFiles dflags
 
@@ -778,6 +821,7 @@ getOutputFilename stop_phase output basename dflags next_phase maybe_location
                        As _    | keep_s     -> True
                        LlvmOpt | keep_bc    -> True
                        HCc     | keep_hc    -> True
+                       HsPp _  | keep_hscpp -> True   -- See Trac #10869
                        _other               -> False
 
           suffix = myPhaseInputExt next_phase
@@ -1002,8 +1046,11 @@ runPhase (RealPhase (Hsc src_flavour)) input_fn dflags0
         (hspp_buf,mod_name,imps,src_imps) <- liftIO $ do
           do
             buf <- hGetStringBuffer input_fn
-            (src_imps,imps,L _ mod_name) <- getImports dflags buf input_fn (basename <.> suff)
-            return (Just buf, mod_name, imps, src_imps)
+            eimps <- getImports dflags buf input_fn (basename <.> suff)
+            case eimps of
+              Left errs -> throwErrors errs
+              Right (src_imps,imps,L _ mod_name) -> return
+                  (Just buf, mod_name, imps, src_imps)
 
   -- Take -o into account if present
   -- Very like -ohi, but we must *only* do this if we aren't linking
@@ -1014,6 +1061,7 @@ runPhase (RealPhase (Hsc src_flavour)) input_fn dflags0
 
         let o_file = ml_obj_file location -- The real object file
             hi_file = ml_hi_file location
+            hie_file = ml_hie_file location
             dest_file | writeInterfaceOnlyMode dflags
                             = hi_file
                       | otherwise
@@ -1021,7 +1069,7 @@ runPhase (RealPhase (Hsc src_flavour)) input_fn dflags0
 
   -- Figure out if the source has changed, for recompilation avoidance.
   --
-  -- Setting source_unchanged to True means that M.o seems
+  -- Setting source_unchanged to True means that M.o (or M.hie) seems
   -- to be up to date wrt M.hs; so no need to recompile unless imports have
   -- changed (which the compiler itself figures out).
   -- Setting source_unchanged to False tells the compiler that M.o is out of
@@ -1035,13 +1083,14 @@ runPhase (RealPhase (Hsc src_flavour)) input_fn dflags0
                 --      (b) we aren't going all the way to .o file (e.g. ghc -S)
              then return SourceModified
                 -- Otherwise look at file modification dates
-             else do dest_file_exists <- doesFileExist dest_file
-                     if not dest_file_exists
-                        then return SourceModified       -- Need to recompile
-                        else do t2 <- getModificationUTCTime dest_file
-                                if t2 > src_timestamp
-                                  then return SourceUnmodified
-                                  else return SourceModified
+             else do dest_file_mod <- sourceModified dest_file src_timestamp
+                     hie_file_mod <- if gopt Opt_WriteHie dflags
+                                        then sourceModified hie_file
+                                                            src_timestamp
+                                        else pure False
+                     if dest_file_mod || hie_file_mod
+                        then return SourceModified
+                        else return SourceUnmodified
 
         PipeState{hsc_env=hsc_env'} <- getPipeState
 
@@ -1060,6 +1109,7 @@ runPhase (RealPhase (Hsc src_flavour)) input_fn dflags0
                                         ms_obj_date  = Nothing,
                                         ms_parsed_mod   = Nothing,
                                         ms_iface_date   = Nothing,
+                                        ms_hie_date     = Nothing,
                                         ms_textual_imps = imps,
                                         ms_srcimps      = src_imps }
 
@@ -1143,9 +1193,6 @@ runPhase (RealPhase Cmm) input_fn dflags
 -----------------------------------------------------------------------------
 -- Cc phase
 
--- we don't support preprocessing .c files (with -E) now.  Doing so introduces
--- way too many hacks, and I can't say I've ever used it anyway.
-
 runPhase (RealPhase cc_phase) input_fn dflags
    | any (cc_phase `eqPhase`) [Cc, Ccxx, HCc, Cobjc, Cobjcxx]
    = do
@@ -1167,6 +1214,16 @@ runPhase (RealPhase cc_phase) input_fn dflags
               (includePathsQuote cmdline_include_paths)
         let include_paths = include_paths_quote ++ include_paths_global
 
+        -- pass -D or -optP to preprocessor when compiling foreign C files
+        -- (#16737). Doing it in this way is simpler and also enable the C
+        -- compiler to performs preprocessing and parsing in a single pass,
+        -- but it may introduce inconsistency if a different pgm_P is specified.
+        let more_preprocessor_opts = concat
+              [ ["-Xpreprocessor", i]
+              | not hcc
+              , i <- getOpts dflags opt_P
+              ]
+
         let gcc_extra_viac_flags = extraGccViaCFlags dflags
         let pic_c_flags = picCCOpts dflags
 
@@ -1176,7 +1233,7 @@ runPhase (RealPhase cc_phase) input_fn dflags
         -- hc code doesn't not #include any header files anyway, so these
         -- options aren't necessary.
         pkg_extra_cc_opts <- liftIO $
-          if cc_phase `eqPhase` HCc
+          if hcc
              then return []
              else getPackageExtraCcOpts dflags pkgs
 
@@ -1267,6 +1324,7 @@ runPhase (RealPhase cc_phase) input_fn dflags
                        ++ [ "-include", ghcVersionH ]
                        ++ framework_paths
                        ++ include_paths
+                       ++ more_preprocessor_opts
                        ++ pkg_extra_cc_opts
                        ))
 
@@ -1337,6 +1395,11 @@ runPhase (RealPhase (As with_cpp)) input_fn dflags
                        (local_includes ++ global_includes
                        -- See Note [-fPIC for assembler]
                        ++ map SysTools.Option pic_c_flags
+                       -- See Note [Produce big objects on Windows]
+                       ++ [ SysTools.Option "-Wa,-mbig-obj"
+                          | platformOS (targetPlatform dflags) == OSMinGW32
+                          , not $ target32Bit (targetPlatform dflags)
+                          ]
 
         -- We only support SparcV9 and better because V8 lacks an atomic CAS
         -- instruction so we have to make sure that the assembler accepts the
@@ -1627,8 +1690,9 @@ getLocation src_flavour mod_name = do
         location1 <- liftIO $ mkHomeModLocation2 dflags mod_name basename suff
 
         -- Boot-ify it if necessary
-        let location2 | HsBootFile <- src_flavour = addBootSuffixLocn location1
-                      | otherwise                 = location1
+        let location2
+              | HsBootFile <- src_flavour = addBootSuffixLocnOut location1
+              | otherwise                 = location1
 
 
         -- Take -ohi into account if present
@@ -2106,9 +2170,10 @@ doCpp dflags raw input_fn output_fn = do
 getBackendDefs :: DynFlags -> IO [String]
 getBackendDefs dflags | hscTarget dflags == HscLlvm = do
     llvmVer <- figureLlvmVersion dflags
-    return $ case llvmVer of
-               Just n -> [ "-D__GLASGOW_HASKELL_LLVM__=" ++ format n ]
-               _      -> []
+    return $ case fmap llvmVersionList llvmVer of
+               Just [m] -> [ "-D__GLASGOW_HASKELL_LLVM__=" ++ format (m,0) ]
+               Just (m:n:_) -> [ "-D__GLASGOW_HASKELL_LLVM__=" ++ format (m,n) ]
+               _ -> []
   where
     format (major, minor)
       | minor >= 100 = error "getBackendDefs: Unsupported minor version"
@@ -2149,6 +2214,32 @@ generateMacros prefix name version =
 -- ---------------------------------------------------------------------------
 -- join object files into a single relocatable object file, using ld -r
 
+{-
+Note [Produce big objects on Windows]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The Windows Portable Executable object format has a limit of 32k sections, which
+we tend to blow through pretty easily. Thankfully, there is a "big object"
+extension, which raises this limit to 2^32. However, it must be explicitly
+enabled in the toolchain:
+
+ * the assembler accepts the -mbig-obj flag, which causes it to produce a
+   bigobj-enabled COFF object.
+
+ * the linker accepts the --oformat pe-bigobj-x86-64 flag. Despite what the name
+   suggests, this tells the linker to produce a bigobj-enabled COFF object, no a
+   PE executable.
+
+We must enable bigobj output in a few places:
+
+ * When merging object files (DriverPipeline.joinObjectFiles)
+
+ * When assembling (DriverPipeline.runPhase (RealPhase As ...))
+
+Unfortunately the big object format is not supported on 32-bit targets so
+none of this can be used in that case.
+-}
+
 joinObjectFiles :: DynFlags -> [FilePath] -> FilePath -> IO ()
 joinObjectFiles dflags o_files output_fn = do
   let mySettings = settings dflags
@@ -2158,7 +2249,7 @@ joinObjectFiles dflags o_files output_fn = do
                        SysTools.Option "-nostdlib",
                        SysTools.Option "-Wl,-r"
                      ]
-                        -- See Note [No PIE while linking] in SysTools
+                        -- See Note [No PIE while linking] in DynFlags
                      ++ (if sGccSupportsNoPie mySettings
                           then [SysTools.Option "-no-pie"]
                           else [])
@@ -2177,6 +2268,11 @@ joinObjectFiles dflags o_files output_fn = do
                          && ldIsGnuLd
                             then [SysTools.Option "-Wl,-no-relax"]
                             else [])
+                        -- See Note [Produce big objects on Windows]
+                     ++ [ SysTools.Option "-Wl,--oformat,pe-bigobj-x86-64"
+                        | OSMinGW32 == osInfo
+                        , not $ target32Bit (targetPlatform dflags)
+                        ]
                      ++ map SysTools.Option ld_build_id
                      ++ [ SysTools.Option "-o",
                           SysTools.FileOption "" output_fn ]
@@ -2212,6 +2308,18 @@ writeInterfaceOnlyMode :: DynFlags -> Bool
 writeInterfaceOnlyMode dflags =
  gopt Opt_WriteInterface dflags &&
  HscNothing == hscTarget dflags
+
+-- | Figure out if a source file was modified after an output file (or if we
+-- anyways need to consider the source file modified since the output is gone).
+sourceModified :: FilePath -- ^ destination file we are looking for
+               -> UTCTime  -- ^ last time of modification of source file
+               -> IO Bool  -- ^ do we need to regenerate the output?
+sourceModified dest_file src_timestamp = do
+  dest_file_exists <- doesFileExist dest_file
+  if not dest_file_exists
+    then return True       -- Need to recompile
+     else do t2 <- getModificationUTCTime dest_file
+             return (t2 <= src_timestamp)
 
 -- | What phase to run after one of the backend code generators has run
 hscPostBackendPhase :: DynFlags -> HscSource -> HscTarget -> Phase

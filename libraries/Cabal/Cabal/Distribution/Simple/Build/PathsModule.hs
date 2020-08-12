@@ -15,7 +15,7 @@
 -- at runtime. This code should probably be split off into another module.
 --
 module Distribution.Simple.Build.PathsModule (
-    generate, pkgPathEnvVar
+    generatePathsModule, pkgPathEnvVar
   ) where
 
 import Prelude ()
@@ -28,7 +28,7 @@ import Distribution.PackageDescription
 import Distribution.Simple.LocalBuildInfo
 import Distribution.Simple.BuildPaths
 import Distribution.Simple.Utils
-import Distribution.Text
+import Distribution.Pretty
 import Distribution.Version
 
 import System.FilePath ( pathSeparator )
@@ -37,8 +37,8 @@ import System.FilePath ( pathSeparator )
 -- * Building Paths_<pkg>.hs
 -- ------------------------------------------------------------
 
-generate :: PackageDescription -> LocalBuildInfo -> ComponentLocalBuildInfo -> String
-generate pkg_descr lbi clbi =
+generatePathsModule :: PackageDescription -> LocalBuildInfo -> ComponentLocalBuildInfo -> String
+generatePathsModule pkg_descr lbi clbi =
    let pragmas =
             cpp_pragma
          ++ no_rebindable_syntax_pragma
@@ -80,7 +80,7 @@ generate pkg_descr lbi clbi =
 
        header =
         pragmas++
-        "module " ++ display paths_modulename ++ " (\n"++
+        "module " ++ prettyShow paths_modulename ++ " (\n"++
         "    version,\n"++
         "    getBinDir, getLibDir, getDynLibDir, getDataDir, getLibexecDir,\n"++
         "    getDataFileName, getSysconfDir\n"++
@@ -195,7 +195,8 @@ generate pkg_descr lbi clbi =
           datadir    = flat_datadir,
           libexecdir = flat_libexecdir,
           sysconfdir = flat_sysconfdir
-        } = absoluteComponentInstallDirs pkg_descr lbi cid NoCopyDest
+        } = absoluteInstallCommandDirs pkg_descr lbi cid NoCopyDest
+
         InstallDirs {
           bindir     = flat_bindirrel,
           libdir     = flat_libdirrel,
@@ -267,7 +268,7 @@ pkgPathEnvVar :: PackageDescription
 pkgPathEnvVar pkg_descr var =
     showPkgName (packageName pkg_descr) ++ "_" ++ var
     where
-        showPkgName = map fixchar . display
+        showPkgName = map fixchar . prettyShow
         fixchar '-' = '_'
         fixchar c   = c
 

@@ -2,13 +2,16 @@ module UnitTests.Distribution.Simple.Utils
     ( tests
     ) where
 
+import Distribution.Simple.BuildPaths ( exeExtension )
 import Distribution.Simple.Utils
+import Distribution.System ( buildPlatform )
 import Distribution.Verbosity
 
 import Data.IORef
 import System.Directory ( doesDirectoryExist, doesFileExist
                         , getTemporaryDirectory
                         , removeDirectoryRecursive, removeFile )
+import System.FilePath ( (<.>) )
 import System.IO (hClose, localeEncoding, hPutStrLn)
 import System.IO.Error
 import qualified Control.Exception as Exception
@@ -48,8 +51,8 @@ withTempDirRemovedTest = do
   withTempDirectory normal tempDir "foo" $ \dirPath -> do
     removeDirectoryRecursive dirPath
 
-rawSystemStdInOutTextDecodingTest :: Assertion
-rawSystemStdInOutTextDecodingTest
+rawSystemStdInOutTextDecodingTest :: FilePath -> Assertion
+rawSystemStdInOutTextDecodingTest ghcPath
     -- We can only get this exception when the locale encoding is UTF-8
     -- so skip the test if it's not.
     | show localeEncoding /= "UTF-8" = return ()
@@ -67,7 +70,7 @@ rawSystemStdInOutTextDecodingTest
 
       -- Compile
       (IODataText resOutput, resErrors, resExitCode) <- rawSystemStdInOut normal
-         "ghc" ["-o", filenameExe, filenameHs]
+         ghcPath ["-o", filenameExe, filenameHs]
          Nothing Nothing Nothing
          IODataModeText
       print (resOutput, resErrors, resExitCode)
@@ -84,10 +87,14 @@ rawSystemStdInOutTextDecodingTest
     Left err | isDoesNotExistError err -> Exception.throwIO err -- no ghc!
              | otherwise               -> return ()
 
+dropExeExtensionTest :: Assertion
+dropExeExtensionTest =
+  assertBool "dropExeExtension didn't drop exeExtension!" $
+    dropExeExtension ("foo" <.> exeExtension buildPlatform) == "foo"
 
 
-tests :: [TestTree]
-tests =
+tests :: FilePath -> [TestTree]
+tests ghcPath =
     [ testCase "withTempFile works as expected" $
       withTempFileTest
     , testCase "withTempFile can handle removed files" $
@@ -97,5 +104,7 @@ tests =
     , testCase "withTempDirectory can handle removed directories" $
       withTempDirRemovedTest
     , testCase "rawSystemStdInOut reports text decoding errors" $
-      rawSystemStdInOutTextDecodingTest
+      rawSystemStdInOutTextDecodingTest ghcPath
+    , testCase "dropExeExtension drops exe extension" $
+      dropExeExtensionTest
     ]

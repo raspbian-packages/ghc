@@ -32,14 +32,14 @@ import           Data.Time                  (UTCTime (..), fromGregorianValid,
 import           Data.Time.Clock.POSIX      (posixSecondsToUTCTime,
                                              utcTimeToPOSIXSeconds)
 import           Distribution.Compat.Binary
-import qualified Distribution.Compat.ReadP  as ReadP
-import           Distribution.Text
+import qualified Distribution.Deprecated.ReadP  as ReadP
+import           Distribution.Deprecated.Text
 import qualified Text.PrettyPrint           as Disp
 import           GHC.Generics (Generic)
 
 -- | UNIX timestamp (expressed in seconds since unix epoch, i.e. 1970).
 newtype Timestamp = TS Int64 -- Tar.EpochTime
-                  deriving (Eq,Ord,Enum,NFData,Show)
+                  deriving (Eq,Ord,Enum,NFData,Show,Generic)
 
 epochTimeToTimestamp :: Tar.EpochTime -> Maybe Timestamp
 epochTimeToTimestamp et

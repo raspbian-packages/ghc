@@ -394,7 +394,8 @@ mkDictSelRhs clas val_index
     dict_id        = mkTemplateLocal 1 pred
     arg_ids        = mkTemplateLocalsNum 2 arg_tys
 
-    rhs_body | new_tycon = unwrapNewTypeBody tycon (mkTyVarTys tyvars) (Var dict_id)
+    rhs_body | new_tycon = unwrapNewTypeBody tycon (mkTyVarTys tyvars)
+                                                   (Var dict_id)
              | otherwise = Case (Var dict_id) dict_id (idType the_arg_id)
                                 [(DataAlt data_con, arg_ids, varToCoreExpr the_arg_id)]
                                 -- varToCoreExpr needed for equality superclass selectors
@@ -472,7 +473,7 @@ mkDataConWorkId wkr_name data_con
                   `setUnfoldingInfo`      newtype_unf
                   `setLevityInfoWithType` wkr_ty
     id_arg1      = mkTemplateLocal 1 (head arg_tys)
-    res_ty_args  = mkTyVarTys univ_tvs
+    res_ty_args  = mkTyCoVarTys univ_tvs
     newtype_unf  = ASSERT2( isVanillaDataCon data_con &&
                             isSingleton arg_tys
                           , ppr data_con  )
@@ -485,7 +486,7 @@ dataConCPR :: DataCon -> DmdResult
 dataConCPR con
   | isDataTyCon tycon     -- Real data types only; that is,
                           -- not unboxed tuples or newtypes
-  , null (dataConExTyVars con)  -- No existentials
+  , null (dataConExTyCoVars con)  -- No existentials
   , wkr_arity > 0
   , wkr_arity <= mAX_CPR_SIZE
   = if is_prod then vanillaCprProdRes (dataConRepArity con)
@@ -595,7 +596,7 @@ mkDataConRep dflags fam_envs wrap_name mb_bangs data_con
                         | otherwise           = topDmd
 
              wrap_prag = alwaysInlinePragma `setInlinePragmaActivation`
-                         ActiveAfter NoSourceText 2
+                         activeAfterInitial
                          -- See Note [Activation for data constructor wrappers]
 
              -- The wrapper will usually be inlined (see wrap_unf), so its
@@ -616,6 +617,8 @@ mkDataConRep dflags fam_envs wrap_name mb_bangs data_con
                      , dcr_boxer   = mk_boxer boxers
                      , dcr_arg_tys = rep_tys
                      , dcr_stricts = rep_strs
+                       -- For newtypes, dcr_bangs is always [HsLazy].
+                       -- See Note [HsImplBangs for newtypes].
                      , dcr_bangs   = arg_ibangs }) }
 
   where
@@ -632,16 +635,21 @@ mkDataConRep dflags fam_envs wrap_name mb_bangs data_con
     orig_bangs   = dataConSrcBangs data_con
 
     wrap_arg_tys = theta ++ orig_arg_tys
-    wrap_arity   = length wrap_arg_tys
+    wrap_arity   = count isCoVar ex_tvs + length wrap_arg_tys
              -- The wrap_args are the arguments *other than* the eq_spec
              -- Because we are going to apply the eq_spec args manually in the
              -- wrapper
 
-    arg_ibangs =
-      case mb_bangs of
-        Nothing    -> zipWith (dataConSrcToImplBang dflags fam_envs)
-                              orig_arg_tys orig_bangs
-        Just bangs -> bangs
+    new_tycon = isNewTyCon tycon
+    arg_ibangs
+      | new_tycon
+      = ASSERT( isSingleton orig_arg_tys )
+        [HsLazy] -- See Note [HsImplBangs for newtypes]
+      | otherwise
+      = case mb_bangs of
+          Nothing    -> zipWith (dataConSrcToImplBang dflags fam_envs)
+                                orig_arg_tys orig_bangs
+          Just bangs -> bangs
 
     (rep_tys_w_strs, wrappers)
       = unzip (zipWith dataConArgRep all_arg_tys (ev_ibangs ++ arg_ibangs))
@@ -650,7 +658,7 @@ mkDataConRep dflags fam_envs wrap_name mb_bangs data_con
     (rep_tys, rep_strs) = unzip (concat rep_tys_w_strs)
 
     wrapper_reqd =
-        (not (isNewTyCon tycon)
+        (not new_tycon
                      -- (Most) newtypes have only a worker, with the exception
                      -- of some newtypes written with GADT syntax. See below.
          && (any isBanged (ev_ibangs ++ arg_ibangs)
@@ -673,8 +681,8 @@ mkDataConRep dflags fam_envs wrap_name mb_bangs data_con
     mk_boxer boxers = DCB (\ ty_args src_vars ->
                       do { let (ex_vars, term_vars) = splitAtList ex_tvs src_vars
                                subst1 = zipTvSubst univ_tvs ty_args
-                               subst2 = extendTvSubstList subst1 ex_tvs
-                                                          (mkTyVarTys ex_vars)
+                               subst2 = extendTCvSubstList subst1 ex_tvs
+                                                           (mkTyCoVarTys ex_vars)
                          ; (rep_ids, binds) <- go subst2 boxers term_vars
                          ; return (ex_vars ++ rep_ids, binds) } )
 
@@ -774,6 +782,29 @@ wrappers! After all, a newtype can also be written with GADT syntax:
 Again, this needs a wrapper data con to reorder the type variables. It does
 mean that this newtype constructor requires another level of indirection when
 being called, but the inliner should make swift work of that.
+
+Note [HsImplBangs for newtypes]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Most of the time, we use the dataConSrctoImplBang function to decide what
+strictness/unpackedness to use for the fields of a data type constructor. But
+there is an exception to this rule: newtype constructors. You might not think
+that newtypes would pose a challenge, since newtypes are seemingly forbidden
+from having strictness annotations in the first place. But consider this
+(from Trac #16141):
+
+  {-# LANGUAGE StrictData #-}
+  {-# OPTIONS_GHC -O #-}
+  newtype T a b where
+    MkT :: forall b a. Int -> T a b
+
+Because StrictData (plus optimization) is enabled, invoking
+dataConSrcToImplBang would sneak in and unpack the field of type Int to Int#!
+This would be disastrous, since the wrapper for `MkT` uses a coercion involving
+Int, not Int#.
+
+Bottom line: dataConSrcToImplBang should never be invoked for newtypes. In the
+case of a newtype constructor, we simply hardcode its dcr_bangs field to
+[HsLazy].
 -}
 
 -------------------------
@@ -781,7 +812,11 @@ newLocal :: Type -> UniqSM Var
 newLocal ty = do { uniq <- getUniqueM
                  ; return (mkSysLocalOrCoVar (fsLit "dt") uniq ty) }
 
--- | Unpack/Strictness decisions from source module
+-- | Unpack/Strictness decisions from source module.
+--
+-- This function should only ever be invoked for data constructor fields, and
+-- never on the field of a newtype constructor.
+-- See @Note [HsImplBangs for newtypes]@.
 dataConSrcToImplBang
    :: DynFlags
    -> FamInstEnvs
@@ -893,7 +928,8 @@ dataConArgUnpack arg_ty
       -- A recursive newtype might mean that
       -- 'arg_ty' is a newtype
   , let rep_tys = dataConInstArgTys con tc_args
-  = ASSERT( null (dataConExTyVars con) )  -- Note [Unpacking GADTs and existentials]
+  = ASSERT( null (dataConExTyCoVars con) )
+      -- Note [Unpacking GADTs and existentials]
     ( rep_tys `zip` dataConRepStrictness con
     ,( \ arg_id ->
        do { rep_ids <- mapM newLocal rep_tys
@@ -960,7 +996,8 @@ isUnpackableType dflags fam_envs ty
     unpackable_type ty
       | Just (tc, _) <- splitTyConApp_maybe ty
       , Just data_con <- tyConSingleAlgDataCon_maybe tc
-      , null (dataConExTyVars data_con)  -- See Note [Unpacking GADTs and existentials]
+      , null (dataConExTyCoVars data_con)
+          -- See Note [Unpacking GADTs and existentials]
       = Just data_con
       | otherwise
       = Nothing
@@ -976,7 +1013,7 @@ components, like
 And it'd be fine to unpack a product type with existential components
 too, but that would require a bit more plumbing, so currently we don't.
 
-So for now we require: null (dataConExTyVars data_con)
+So for now we require: null (dataConExTyCoVars data_con)
 See Trac #14978
 
 Note [Unpack one-wide fields]
@@ -1137,7 +1174,7 @@ mkFCallId dflags uniq fcall ty
            `setLevityInfoWithType` ty
 
     (bndrs, _) = tcSplitPiTys ty
-    arity      = count isAnonTyBinder bndrs
+    arity      = count isAnonTyCoBinder bndrs
     strict_sig = mkClosedStrictSig (replicate arity topDmd) topRes
     -- the call does not claim to be strict in its arguments, since they
     -- may be lifted (foreign import prim) and the called code doesn't
@@ -1218,7 +1255,7 @@ proxyName         = mkWiredInIdName gHC_PRIM  (fsLit "proxy#")         proxyHash
 lazyIdName, oneShotName, noinlineIdName :: Name
 lazyIdName        = mkWiredInIdName gHC_MAGIC (fsLit "lazy")           lazyIdKey          lazyId
 oneShotName       = mkWiredInIdName gHC_MAGIC (fsLit "oneShot")        oneShotKey         oneShotId
-noinlineIdName    = mkWiredInIdName gHC_MAGIC (fsLit "noinline") noinlineIdKey noinlineId
+noinlineIdName    = mkWiredInIdName gHC_MAGIC (fsLit "noinline")       noinlineIdKey      noinlineId
 
 ------------------------------------------------
 proxyHashId :: Id
@@ -1228,7 +1265,7 @@ proxyHashId
                     `setNeverLevPoly`  ty )
   where
     -- proxy# :: forall k (a:k). Proxy# k a
-    bndrs   = mkTemplateKiTyVars [liftedTypeKind] (\ks -> ks)
+    bndrs   = mkTemplateKiTyVars [liftedTypeKind] id
     [k,t]   = mkTyVarTys bndrs
     ty      = mkSpecForAllTys bndrs (mkProxyPrimTy k t)
 
@@ -1466,9 +1503,8 @@ a little bit of magic to optimize away 'noinline' after we are done
 running the simplifier.
 
 'noinline' needs to be wired-in because it gets inserted automatically
-when we serialize an expression to the interface format, and we DON'T
-want use its fingerprints.
-
+when we serialize an expression to the interface format. See
+Note [Inlining and hs-boot files] in ToIface
 
 Note [The oneShot function]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~

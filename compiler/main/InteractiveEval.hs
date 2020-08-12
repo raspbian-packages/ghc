@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, MagicHash, NondecreasingIndentation, UnboxedTuples,
+{-# LANGUAGE CPP, MagicHash, NondecreasingIndentation,
     RecordWildCards, BangPatterns #-}
 
 -- -----------------------------------------------------------------------------
@@ -11,8 +11,8 @@
 
 module InteractiveEval (
         Resume(..), History(..),
-        execStmt, ExecOptions(..), execOptions, ExecResult(..), resumeExec,
-        runDecls, runDeclsWithLocation,
+        execStmt, execStmt', ExecOptions(..), execOptions, ExecResult(..), resumeExec,
+        runDecls, runDeclsWithLocation, runParsedDecls,
         isStmt, hasImport, isImport, isDecl,
         parseImportDecl, SingleStep(..),
         abandon, abandonAll,
@@ -165,23 +165,40 @@ execStmt
   => String             -- ^ a statement (bind or expression)
   -> ExecOptions
   -> m ExecResult
-execStmt stmt ExecOptions{..} = do
+execStmt input exec_opts@ExecOptions{..} = do
+    hsc_env <- getSession
+
+    mb_stmt <-
+      liftIO $
+      runInteractiveHsc hsc_env $
+      hscParseStmtWithLocation execSourceFile execLineNumber input
+
+    case mb_stmt of
+      -- empty statement / comment
+      Nothing -> return (ExecComplete (Right []) 0)
+      Just stmt -> execStmt' stmt input exec_opts
+
+-- | Like `execStmt`, but takes a parsed statement as argument. Useful when
+-- doing preprocessing on the AST before execution, e.g. in GHCi (see
+-- GHCi.UI.runStmt).
+execStmt' :: GhcMonad m => GhciLStmt GhcPs -> String -> ExecOptions -> m ExecResult
+execStmt' stmt stmt_text ExecOptions{..} = do
     hsc_env <- getSession
 
     -- Turn off -fwarn-unused-local-binds when running a statement, to hide
     -- warnings about the implicit bindings we introduce.
+    -- (This is basically `mkInteractiveHscEnv hsc_env`, except we unset
+    -- -wwarn-unused-local-binds)
     let ic       = hsc_IC hsc_env -- use the interactive dflags
         idflags' = ic_dflags ic `wopt_unset` Opt_WarnUnusedLocalBinds
-        hsc_env' = hsc_env{ hsc_IC = ic{ ic_dflags = idflags' } }
+        hsc_env' = mkInteractiveHscEnv (hsc_env{ hsc_IC = ic{ ic_dflags = idflags' } })
 
-    -- compile to value (IO [HValue]), don't run
-    r <- liftIO $ hscStmtWithLocation hsc_env' stmt
-                    execSourceFile execLineNumber
+    r <- liftIO $ hscParsedStmt hsc_env' stmt
 
     case r of
-      -- empty statement / comment
-      Nothing -> return (ExecComplete (Right []) 0)
-
+      Nothing ->
+        -- empty statement / comment
+        return (ExecComplete (Right []) 0)
       Just (ids, hval, fix_env) -> do
         updateFixityEnv fix_env
 
@@ -195,9 +212,8 @@ execStmt stmt ExecOptions{..} = do
 
             size = ghciHistSize idflags'
 
-        handleRunStatus execSingleStep stmt bindings ids
+        handleRunStatus execSingleStep stmt_text bindings ids
                         status (emptyHistory size)
-
 
 runDecls :: GhcMonad m => String -> m [Name]
 runDecls = runDeclsWithLocation "<interactive>" 1
@@ -205,10 +221,18 @@ runDecls = runDeclsWithLocation "<interactive>" 1
 -- | Run some declarations and return any user-visible names that were brought
 -- into scope.
 runDeclsWithLocation :: GhcMonad m => String -> Int -> String -> m [Name]
-runDeclsWithLocation source linenumber expr =
-  do
+runDeclsWithLocation source line_num input = do
     hsc_env <- getSession
-    (tyThings, ic) <- liftIO $ hscDeclsWithLocation hsc_env expr source linenumber
+    decls <- liftIO (hscParseDeclsWithLocation hsc_env source line_num input)
+    runParsedDecls decls
+
+-- | Like `runDeclsWithLocation`, but takes parsed declarations as argument.
+-- Useful when doing preprocessing on the AST before execution, e.g. in GHCi
+-- (see GHCi.UI.runStmt).
+runParsedDecls :: GhcMonad m => [LHsDecl GhcPs] -> m [Name]
+runParsedDecls decls = do
+    hsc_env <- getSession
+    (tyThings, ic) <- liftIO (hscParsedDecls hsc_env decls)
 
     setSession $ hsc_env { hsc_IC = ic }
     hsc_env <- getSession
@@ -222,7 +246,7 @@ runDeclsWithLocation source linenumber expr =
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 We don't want to display internally-generated bindings to users.
 Things like the coercion axiom for newtypes. These bindings all get
-OccNames that users can't write, to avoid the possiblity of name
+OccNames that users can't write, to avoid the possibility of name
 clashes (in linker symbols).  That gives a convenient way to suppress
 them. The relevant predicate is OccName.isDerivedOccName.
 See Trac #11051 for more background and examples.
@@ -479,20 +503,17 @@ bindLocalsAtBreakpoint hsc_env apStack_fhv (Just BreakInfo{..}) = do
        breaks    = getModBreaks hmi
        info      = expectJust "bindLocalsAtBreakpoint2" $
                      IntMap.lookup breakInfo_number (modBreaks_breakInfo breaks)
-       vars      = cgb_vars info
+       mbVars    = cgb_vars info
        result_ty = cgb_resty info
        occs      = modBreaks_vars breaks ! breakInfo_number
        span      = modBreaks_locs breaks ! breakInfo_number
        decl      = intercalate "." $ modBreaks_decls breaks ! breakInfo_number
 
-           -- Filter out any unboxed ids;
+           -- Filter out any unboxed ids by changing them to Nothings;
            -- we can't bind these at the prompt
-       pointers = filter (\(id,_) -> isPointer id) vars
-       isPointer id | [rep] <- typePrimRep (idType id)
-                    , isGcPtrRep rep                   = True
-                    | otherwise                        = False
+       mbPointers = nullUnboxed <$> mbVars
 
-       (ids, offsets) = unzip pointers
+       (ids, offsets, occs') = syncOccs mbPointers occs
 
        free_tvs = tyCoVarsOfTypesList (result_ty:map idType ids)
 
@@ -508,11 +529,12 @@ bindLocalsAtBreakpoint hsc_env apStack_fhv (Just BreakInfo{..}) = do
 
    us <- mkSplitUniqSupply 'I'   -- Dodgy; will give the same uniques every time
    let tv_subst     = newTyVars us free_tvs
-       filtered_ids = [ id | (id, Just _hv) <- zip ids mb_hValues ]
+       (filtered_ids, occs'') = unzip         -- again, sync the occ-names
+          [ (id, occ) | (id, Just _hv, occ) <- zip3 ids mb_hValues occs' ]
        (_,tidy_tys) = tidyOpenTypes emptyTidyEnv $
                       map (substTy tv_subst . idType) filtered_ids
 
-   new_ids     <- zipWith3M mkNewId occs tidy_tys filtered_ids
+   new_ids     <- zipWith3M mkNewId occs'' tidy_tys filtered_ids
    result_name <- newInteractiveBinder hsc_env (mkVarOccFS result_fs) span
 
    let result_id = Id.mkVanillaGlobal result_name
@@ -548,6 +570,24 @@ bindLocalsAtBreakpoint hsc_env apStack_fhv (Just BreakInfo{..}) = do
                     | (tv, uniq) <- tvs `zip` uniqsFromSupply us
                     , let name = setNameUnique (tyVarName tv) uniq ]
 
+   isPointer id | [rep] <- typePrimRep (idType id)
+                , isGcPtrRep rep                   = True
+                | otherwise                        = False
+
+   -- Convert unboxed Id's to Nothings
+   nullUnboxed (Just (fv@(id, _)))
+     | isPointer id          = Just fv
+     | otherwise             = Nothing
+   nullUnboxed Nothing       = Nothing
+
+   -- See Note [Syncing breakpoint info]
+   syncOccs :: [Maybe (a,b)] -> [c] -> ([a], [b], [c])
+   syncOccs mbVs ocs = unzip3 $ catMaybes $ joinOccs mbVs ocs
+     where
+       joinOccs :: [Maybe (a,b)] -> [c] -> [Maybe (a,b,c)]
+       joinOccs = zipWith joinOcc
+       joinOcc mbV oc = (\(a,b) c -> (a,b,c)) <$> mbV <*> pure oc
+
 rttiEnvironment :: HscEnv -> IO HscEnv
 rttiEnvironment hsc_env@HscEnv{hsc_IC=ic} = do
    let tmp_ids = [id | AnId id <- ic_tythings ic]
@@ -576,9 +616,9 @@ rttiEnvironment hsc_env@HscEnv{hsc_IC=ic} = do
                                            ++ "improvement for a type")) hsc_env
                Just subst -> do
                  let dflags = hsc_dflags hsc_env
-                 when (dopt Opt_D_dump_rtti dflags) $
-                      printInfoForUser dflags alwaysQualify $
-                      fsep [text "RTTI Improvement for", ppr id, equals, ppr subst]
+                 dumpIfSet_dyn dflags Opt_D_dump_rtti "RTTI"
+                   (fsep [text "RTTI Improvement for", ppr id, equals,
+                          ppr subst])
 
                  let ic' = substInteractiveContext ic subst
                  return hsc_env{hsc_IC=ic'}
@@ -588,6 +628,35 @@ pushResume hsc_env resume = hsc_env { hsc_IC = ictxt1 }
   where
         ictxt0 = hsc_IC hsc_env
         ictxt1 = ictxt0 { ic_resume = resume : ic_resume ictxt0 }
+
+
+  {-
+  Note [Syncing breakpoint info]
+
+  To display the values of the free variables for a single breakpoint, the
+  function `compiler/main/InteractiveEval.hs:bindLocalsAtBreakpoint` pulls
+  out the information from the fields `modBreaks_breakInfo` and
+  `modBreaks_vars` of the `ModBreaks` data structure.
+  For a specific breakpoint this gives 2 lists of type `Id` (or `Var`)
+  and `OccName`.
+  They are used to create the Id's for the free variables and must be kept
+  in sync!
+
+  There are 3 situations where items are removed from the Id list
+  (or replaced with `Nothing`):
+  1.) If function `compiler/ghci/ByteCodeGen.hs:schemeER_wrk` (which creates
+      the Id list) doesn't find an Id in the ByteCode environement.
+  2.) If function `compiler/main/InteractiveEval.hs:bindLocalsAtBreakpoint`
+      filters out unboxed elements from the Id list, because GHCi cannot
+      yet handle them.
+  3.) If the GHCi interpreter doesn't find the reference to a free variable
+      of our breakpoint. This also happens in the function
+      bindLocalsAtBreakpoint.
+
+  If an element is removed from the Id list, then the corresponding element
+  must also be removed from the Occ list. Otherwise GHCi will confuse
+  variable names as in #8487.
+  -}
 
 -- -----------------------------------------------------------------------------
 -- Abandoning a resume context
@@ -996,20 +1065,22 @@ moduleIsBootOrNotObjectLinkable mod_summary = withSession $ \hsc_env ->
 -- RTTI primitives
 
 obtainTermFromVal :: HscEnv -> Int -> Bool -> Type -> a -> IO Term
-obtainTermFromVal hsc_env bound force ty x =
-              cvObtainTerm hsc_env bound force ty (unsafeCoerce# x)
+obtainTermFromVal hsc_env bound force ty x
+  | gopt Opt_ExternalInterpreter (hsc_dflags hsc_env)
+  = throwIO (InstallationError
+      "this operation requires -fno-external-interpreter")
+  | otherwise
+  = cvObtainTerm hsc_env bound force ty (unsafeCoerce# x)
 
 obtainTermFromId :: HscEnv -> Int -> Bool -> Id -> IO Term
 obtainTermFromId hsc_env bound force id =  do
-  let dflags = hsc_dflags hsc_env
-  hv <- Linker.getHValue hsc_env (varName id) >>= wormhole dflags
+  hv <- Linker.getHValue hsc_env (varName id)
   cvObtainTerm hsc_env bound force (idType id) hv
 
 -- Uses RTTI to reconstruct the type of an Id, making it less polymorphic
 reconstructType :: HscEnv -> Int -> Id -> IO (Maybe Type)
 reconstructType hsc_env bound id = do
-  let dflags = hsc_dflags hsc_env
-  hv <- Linker.getHValue hsc_env (varName id) >>= wormhole dflags
+  hv <- Linker.getHValue hsc_env (varName id)
   cvReconstructType hsc_env bound (idType id) hv
 
 mkRuntimeUnkTyVar :: Name -> Kind -> TyVar

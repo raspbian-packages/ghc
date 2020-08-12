@@ -11,6 +11,7 @@ files for imported data types.
 
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE ViewPatterns #-}
 
 module TcTyDecls(
         RolesInfo,
@@ -32,7 +33,7 @@ import GhcPrelude
 import TcRnMonad
 import TcEnv
 import TcBinds( tcValBinds, addTypecheckedBinds )
-import TyCoRep( Type(..), Coercion(..), UnivCoProvenance(..) )
+import TyCoRep( Type(..), Coercion(..), MCoercion(..), UnivCoProvenance(..) )
 import TcType
 import TysWiredIn( unitTy )
 import MkCore( rEC_SEL_ERROR_ID )
@@ -111,7 +112,11 @@ synonymTyConsOfType ty
      -- in the same recursive group.  Possibly this restriction will be
      -- lifted in the future but for now, this code is "just for completeness
      -- sake".
-     go_co (Refl _ ty)            = go ty
+     go_mco MRefl    = emptyNameEnv
+     go_mco (MCo co) = go_co co
+
+     go_co (Refl ty)              = go ty
+     go_co (GRefl _ ty mco)       = go ty `plusNameEnv` go_mco mco
      go_co (TyConAppCo _ tc cs)   = go_tc tc `plusNameEnv` go_co_s cs
      go_co (AppCo co co')         = go_co co `plusNameEnv` go_co co'
      go_co (ForAllCo _ co co')    = go_co co `plusNameEnv` go_co co'
@@ -125,7 +130,6 @@ synonymTyConsOfType ty
      go_co (NthCo _ _ co)         = go_co co
      go_co (LRCo _ co)            = go_co co
      go_co (InstCo co co')        = go_co co `plusNameEnv` go_co co'
-     go_co (CoherenceCo co co')   = go_co co `plusNameEnv` go_co co'
      go_co (KindCo co)            = go_co co
      go_co (SubCo co)             = go_co co
      go_co (AxiomRuleCo _ cs)     = go_co_s cs
@@ -221,8 +225,9 @@ checkSynCycles this_uid tcs tyclds = do
         mod = nameModule n
         ppr_decl tc =
           case lookupNameEnv lcl_decls n of
-            Just (L loc decl) -> ppr loc <> colon <+> ppr decl
-            Nothing -> ppr (getSrcSpan n) <> colon <+> ppr n <+> text "from external module"
+            Just (dL->L loc decl) -> ppr loc <> colon <+> ppr decl
+            Nothing -> ppr (getSrcSpan n) <> colon <+> ppr n
+                       <+> text "from external module"
          where
           n = tyConName tc
 
@@ -481,7 +486,7 @@ initialRoleEnv1 hsc_src annots_env tc
           -- is wrong, just ignore it. We check this in the validity check.
         role_annots
           = case lookupRoleAnnot annots_env name of
-              Just (L _ (RoleAnnotDecl _ _ annots))
+              Just (dL->L _ (RoleAnnotDecl _ _ annots))
                 | annots `lengthIs` num_exps -> map unLoc annots
               _                              -> replicate num_exps Nothing
         default_roles = build_default_roles argflags role_annots
@@ -825,12 +830,12 @@ when typechecking the [d| .. |] quote, and typecheck them later.
 
 tcRecSelBinds :: [(Id, LHsBind GhcRn)] -> TcM TcGblEnv
 tcRecSelBinds sel_bind_prs
-  = tcExtendGlobalValEnv [sel_id | L _ (IdSig _ sel_id) <- sigs] $
+  = tcExtendGlobalValEnv [sel_id | (dL->L _ (IdSig _ sel_id)) <- sigs] $
     do { (rec_sel_binds, tcg_env) <- discardWarnings $
                                      tcValBinds TopLevel binds sigs getGblEnv
        ; return (tcg_env `addTypecheckedBinds` map snd rec_sel_binds) }
   where
-    sigs = [ L loc (IdSig noExt sel_id)   | (sel_id, _) <- sel_bind_prs
+    sigs = [ cL loc (IdSig noExt sel_id)   | (sel_id, _) <- sel_bind_prs
                                           , let loc = getSrcSpan sel_id ]
     binds = [(NonRecursive, unitBag bind) | (_, bind) <- sel_bind_prs]
 
@@ -851,7 +856,7 @@ mkRecSelBind (tycon, fl)
 mkOneRecordSelector :: [ConLike] -> RecSelParent -> FieldLabel
                     -> (Id, LHsBind GhcRn)
 mkOneRecordSelector all_cons idDetails fl
-  = (sel_id, L loc sel_bind)
+  = (sel_id, cL loc sel_bind)
   where
     loc      = getSrcSpan sel_name
     lbl      = flLabel fl
@@ -889,17 +894,18 @@ mkOneRecordSelector all_cons idDetails fl
                                            [] unit_rhs]
              | otherwise =  map mk_match cons_w_field ++ deflt
     mk_match con = mkSimpleMatch (mkPrefixFunRhs sel_lname)
-                                 [L loc (mk_sel_pat con)]
-                                 (L loc (HsVar noExt (L loc field_var)))
-    mk_sel_pat con = ConPatIn (L loc (getName con)) (RecCon rec_fields)
+                                 [cL loc (mk_sel_pat con)]
+                                 (cL loc (HsVar noExt (cL loc field_var)))
+    mk_sel_pat con = ConPatIn (cL loc (getName con)) (RecCon rec_fields)
     rec_fields = HsRecFields { rec_flds = [rec_field], rec_dotdot = Nothing }
     rec_field  = noLoc (HsRecField
                         { hsRecFieldLbl
-                           = L loc (FieldOcc sel_name (L loc $ mkVarUnqual lbl))
+                           = cL loc (FieldOcc sel_name
+                                     (cL loc $ mkVarUnqual lbl))
                         , hsRecFieldArg
-                           = L loc (VarPat noExt (L loc field_var))
+                           = cL loc (VarPat noExt (cL loc field_var))
                         , hsRecPun = False })
-    sel_lname = L loc sel_name
+    sel_lname = cL loc sel_name
     field_var = mkInternalName (mkBuiltinUnique 1) (getOccName sel_name) loc
 
     -- Add catch-all default case unless the case is exhaustive
@@ -907,10 +913,10 @@ mkOneRecordSelector all_cons idDetails fl
     -- mentions this particular record selector
     deflt | all dealt_with all_cons = []
           | otherwise = [mkSimpleMatch CaseAlt
-                            [L loc (WildPat noExt)]
-                            (mkHsApp (L loc (HsVar noExt
-                                            (L loc (getName rEC_SEL_ERROR_ID))))
-                                     (L loc (HsLit noExt msg_lit)))]
+                            [cL loc (WildPat noExt)]
+                            (mkHsApp (cL loc (HsVar noExt
+                                         (cL loc (getName rEC_SEL_ERROR_ID))))
+                                     (cL loc (HsLit noExt msg_lit)))]
 
         -- Do not add a default case unless there are unmatched
         -- constructors.  We must take account of GADTs, else we

@@ -1,7 +1,89 @@
 -*-change-log-*-
 
+3.0.1.0 TBW December 2019
+	* Create store incoming directory
+	  ([#4130](https://github.com/haskell/cabal/issues/4130))
+	* `fetchRepoTarball` output is not marked
+	  ([#6385](https://github.com/haskell/cabal/pull/6385))
+	* Update `setupMinCabalVersionConstraint` for GHC-8.8
+	  ([#6217](https://github.com/haskell/cabal/pull/6217))
+	* Use `lukko` for file locking
+	  ([#6345](https://github.com/haskell/cabal/pull/6345))
+	* Use `hackage-security-0.6`
+	  ([#6388](https://github.com/haskell/cabal/pull/6388))
+	* Other dependency upgrades
+
+3.0.0.0 Mikhail Glushenkov <mikhail.glushenkov@gmail.com> August 2019
+	* `v2-haddock` fails on `haddock` failures (#5977)
+	* `v2-run` works when given `File.lhs` literate file. (#6134)
+	* Parse comma-separated lists for extra-prog-path, extra-lib-dirs, extra-framework-dirs,
+	  and extra-include-dirs as actual lists. (#5420)
+	* `v2-repl` no longer changes directory to a randomized temporary folder
+	  when used outside of a project. (#5544)
+	* `install-method` and `overwrite-policy` in `.cabal/config` now actually work. (#5942)
+	* `v2-install` now reports the error when a package fails to build. (#5641)
+	* `v2-install` now has a default when called in a project (#5978, #6014, #6092)
+	* '--write-ghc-environment-files' now defaults to 'never' (#4242)
+	* Fix `sdist`'s output when sent to stdout. (#5874)
+	* Allow a list of dependencies to be provided for `repl --build-depends`. (#5845)
+	* Legacy commands are now only accessible with the `v1-` prefixes, and the `v2-`
+	  commands are the new default. Accordingly, the next version of Cabal will be
+	  the start of the 3.x version series. (#5800)
+	* New solver flag: '--reject-unconstrained-dependencies'. (#2568)
+	* Ported old-style test options to the new-style commands (#5455).
+	* Improved error messages for cabal file parse errors. (#5710)
+	* Removed support for `.zip` format source distributions (#5755)
+	* Add "simple project" initialization option. (#5707)
+	* Add '--minimize-conflict-set' flag to try to improve the solver's
+	  error message, but with an increase in run time. (#5647)
+	* v2-test now succeeds when there are no test suites. (#5435)
+	* Add '--lib', '--exe', and '--libandexe' shorthands to init. (#5759)
+	* init now generates valid `Main.lhs` files. (#5577)
+	* Init improvements: add flag '--application-dir', and when creating
+	  a library also create a MyLib.hs module. (#5740)
+	* Add support for generating test-suite via cabal init. (#5761)
+	* Increase `max-backjumps` default from 2000 to 4000.
+	* Make v2-install/new-install-specific flags configurable in
+	  ~/.cabal/config
+	* Add --installdir and --install-method=copy flags to v2-install
+	  that make it possible to copy the executable instead of symlinking it
+	* --symlink-bindir no longer controls the symlinking directory of
+	  v2-install (installdir controls both symlinking and copying now)
+	* Default to non-interactive init.
+	* Add --test-wrapper that allows a prebuild script to set the test environment.
+	* Add filterTestFlags: filter test-wrapper for Cabal < 3.0.0.
+	* Cabal now only builds the minimum of a package for `v2-install` (#5754, #6091)
+
+2.4.1.0 Mikhail Glushenkov <mikhail.glushenkov@gmail.com> November 2018
+	* Add message to alert user to potential package casing errors. (#5635)
+	* new-clean no longer deletes dist-newstyle/src with `-s`. (#5699)
+	* 'new-install' now warns when failing to symlink an exe (#5602)
+	* Extend 'cabal init' support for 'cabal-version' selection (#5567)
+	* 'new-sdist' now generates tarballs with file modification
+	  times from a date in 2001. Using the Unix epoch caused
+	  problems on Windows. (#5596)
+	* Register monolithic packages installed into the store due to a
+	  build-tool dependency if they also happen to contain a buildable
+	  public lib. (#5379,#5604)
+	* Fixed a Windows bug where cabal-install tried to copy files
+	  after moving them (#5631).
+	* 'cabal v2-repl' now works for indefinite (in the Backpack sense) components. (#5619)
+	* Set data dir environment variable for tarballs and remote repos (#5469)
+	* Fix monolithic inplace build tool PATH (#5633)
+	* 'cabal init' now supports '-w'/'--with-compiler' flag (#4936, #5654)
+	* Fix ambiguous --builddir on new-install (#5652)
+	* Allow relative --storedir (#5662)
+	* Respect --dry on new-install (#5671)
+	* Warn when new-installing zero exes (#5666)
+	* Add 'pkg-cabal-sha256' field to plan.json (#5695)
+	* New v2-build flag: '--only-configure'. (#5578)
+	* Fixed a 'new-install' failure that manifested when it
+	  encountered remote source dependencies in a project. (#5643)
+	* New 'v2-[build,configure' flag: '--write-ghc-environment-files'
+	  to control the generation of .ghc.environment files. (#5711)
+
 2.4.0.0 Mikhail Glushenkov <mikhail.glushenkov@gmail.com> September 2018
-        * Bugfix: "cabal new-build --ghc-option '--bogus' --ghc-option '-O1'"
+	* Bugfix: "cabal new-build --ghc-option '--bogus' --ghc-option '-O1'"
 	  no longer ignores all arguments except the last one (#5512).
 	* Add the following option aliases for '-dir'-suffixed options:
 	  'storedir', 'logsdir', 'packagedir', 'sourcedir', 'outputdir' (#5484).
@@ -50,6 +132,9 @@
 	* Default changelog generated by 'cabal init' is now named
 	  'CHANGELOG.md' (#5441).
 	* Align output of 'new-build' command phases (#4040).
+	* Add suport for specifying remote VCS dependencies via new
+	  'source-repository-package' stanzas in 'cabal.project' files
+	  (#5351).
 
 2.2.0.0 Mikhail Glushenkov <mikhail.glushenkov@gmail.com> March 2018
 	* '--with-PROG' and '--PROG-options' are applied to all packages
@@ -117,8 +202,8 @@
 	* Paths_ autogen modules now compile when `RebindableSyntax` or
 	`OverloadedStrings` is used in `default-extensions`.
 	[stack#3789](https://github.com/commercialhaskell/stack/issues/3789)
-    * getDataDir` and other `Paths_autogen` functions now work correctly
-    when compiling a custom `Setup.hs` script using `new-build` (#5164).
+	* getDataDir` and other `Paths_autogen` functions now work correctly
+	when compiling a custom `Setup.hs` script using `new-build` (#5164).
 
 2.0.0.1 Mikhail Glushenkov <mikhail.glushenkov@gmail.com> December 2017
 	* Support for GHC's numeric -g debug levels (#4673).
@@ -432,7 +517,7 @@
 0.6.2 Duncan Coutts <duncan@haskell.org> Feb 2009
 	* The upgrade command has been disabled in this release
 	* The configure and install commands now have consistent behaviour
-	* Reduce the tendancy to re-install already existing packages
+	* Reduce the tendency to re-install already existing packages
 	* The --constraint= flag now works for the install command
 	* New --preference= flag for soft constraints / version preferences
 	* Improved bootstrap.sh script, smarter and better error checking

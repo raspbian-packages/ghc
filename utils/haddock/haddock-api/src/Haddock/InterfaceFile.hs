@@ -82,8 +82,8 @@ binaryInterfaceMagic = 0xD0Cface
 -- (2) set `binaryInterfaceVersionCompatibility` to [binaryInterfaceVersion]
 --
 binaryInterfaceVersion :: Word16
-#if (__GLASGOW_HASKELL__ >= 805) && (__GLASGOW_HASKELL__ < 807)
-binaryInterfaceVersion = 33
+#if (__GLASGOW_HASKELL__ >= 807) && (__GLASGOW_HASKELL__ < 809)
+binaryInterfaceVersion = 35
 
 binaryInterfaceVersionCompatibility :: [Word16]
 binaryInterfaceVersionCompatibility = [binaryInterfaceVersion]
@@ -190,8 +190,9 @@ readInterfaceFile :: forall m.
                      MonadIO m
                   => NameCacheAccessor m
                   -> FilePath
+                  -> Bool  -- ^ Disable version check. Can cause runtime crash.
                   -> m (Either String InterfaceFile)
-readInterfaceFile (get_name_cache, set_name_cache) filename = do
+readInterfaceFile (get_name_cache, set_name_cache) filename bypass_checks = do
   bh0 <- liftIO $ readBinMem filename
 
   magic   <- liftIO $ get bh0
@@ -200,7 +201,8 @@ readInterfaceFile (get_name_cache, set_name_cache) filename = do
   case () of
     _ | magic /= binaryInterfaceMagic -> return . Left $
       "Magic number mismatch: couldn't load interface file: " ++ filename
-      | version `notElem` binaryInterfaceVersionCompatibility -> return . Left $
+      | not bypass_checks
+      , (version `notElem` binaryInterfaceVersionCompatibility) -> return . Left $
       "Interface file is of wrong version: " ++ filename
       | otherwise -> with_name_cache $ \update_nc -> do
 
@@ -432,7 +434,7 @@ instance Binary Example where
         result <- get bh
         return (Example expression result)
 
-instance Binary Hyperlink where
+instance Binary a => Binary (Hyperlink a) where
     put_ bh (Hyperlink url label) = do
         put_ bh url
         put_ bh label
@@ -699,3 +701,28 @@ instance Binary DocName where
         name <- get bh
         return (Undocumented name)
       _ -> error "get DocName: Bad h"
+
+instance Binary n => Binary (Wrap n) where
+  put_ bh (Unadorned n) = do
+    putByte bh 0
+    put_ bh n
+  put_ bh (Parenthesized n) = do
+    putByte bh 1
+    put_ bh n
+  put_ bh (Backticked n) = do
+    putByte bh 2
+    put_ bh n
+
+  get bh = do
+    h <- getByte bh
+    case h of
+      0 -> do
+        name <- get bh
+        return (Unadorned name)
+      1 -> do
+        name <- get bh
+        return (Parenthesized name)
+      2 -> do
+        name <- get bh
+        return (Backticked name)
+      _ -> error "get Wrap: Bad h"

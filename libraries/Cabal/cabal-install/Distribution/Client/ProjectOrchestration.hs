@@ -41,6 +41,7 @@
 --
 module Distribution.Client.ProjectOrchestration (
     -- * Discovery phase: what is in the project?
+    CurrentCommand(..),
     establishProjectBaseContext,
     ProjectBaseContext(..),
     BuildTimeSettings(..),
@@ -98,6 +99,8 @@ module Distribution.Client.ProjectOrchestration (
 
 import Prelude ()
 import Distribution.Client.Compat.Prelude
+import Distribution.Compat.Directory
+         ( makeAbsolute )
 
 import           Distribution.Client.ProjectConfig
 import           Distribution.Client.ProjectPlanning
@@ -111,7 +114,8 @@ import           Distribution.Client.ProjectPlanOutput
 import           Distribution.Client.Types
                    ( GenericReadyPackage(..), UnresolvedSourcePackage
                    , PackageSpecifier(..)
-                   , SourcePackageDb(..) )
+                   , SourcePackageDb(..)
+                   , WriteGhcEnvironmentFilesPolicy(..) )
 import           Distribution.Solver.Types.PackageIndex
                    ( lookupPackageName )
 import qualified Distribution.Client.InstallPlan as InstallPlan
@@ -122,6 +126,8 @@ import           Distribution.Client.TargetSelector
 import           Distribution.Client.DistDirLayout
 import           Distribution.Client.Config (getCabalDir)
 import           Distribution.Client.Setup hiding (packageName)
+import           Distribution.Compiler
+                   ( CompilerFlavor(GHC) )
 import           Distribution.Types.ComponentName
                    ( componentNameString )
 import           Distribution.Types.UnqualComponentName
@@ -130,12 +136,13 @@ import           Distribution.Types.UnqualComponentName
 import           Distribution.Solver.Types.OptionalStanza
 
 import           Distribution.Package
-                   hiding (InstalledPackageId, installedPackageId)
 import           Distribution.PackageDescription
                    ( FlagAssignment, unFlagAssignment, showFlagValue
                    , diffFlagAssignment )
 import           Distribution.Simple.LocalBuildInfo
                    ( ComponentName(..), pkgComponents )
+import           Distribution.Simple.Flag
+                   ( fromFlagOrDefault )
 import qualified Distribution.Simple.Setup as Setup
 import           Distribution.Simple.Command (commandShowOptions)
 import           Distribution.Simple.Configure (computeEffectiveProfiling)
@@ -143,9 +150,12 @@ import           Distribution.Simple.Configure (computeEffectiveProfiling)
 import           Distribution.Simple.Utils
                    ( die', warn, notice, noticeNoWrap, debugNoWrap )
 import           Distribution.Verbosity
-import           Distribution.Text
+import           Distribution.Version
+                   ( mkVersion )
+import           Distribution.Pretty
+                   ( prettyShow )
 import           Distribution.Simple.Compiler
-                   ( showCompilerId
+                   ( compilerCompatVersion, showCompilerId
                    , OptimisationLevel(..))
 
 import qualified Data.Monoid as Mon
@@ -159,6 +169,11 @@ import           System.Posix.Signals (sigKILL, sigSEGV)
 #endif
 
 
+-- | Tracks what command is being executed, because we need to hide this somewhere
+-- for cases that need special handling (usually for error reporting).
+data CurrentCommand = InstallCommand | HaddockCommand | OtherCommand
+                    deriving (Show, Eq)
+
 -- | This holds the context of a project prior to solving: the content of the
 -- @cabal.project@ and all the local package @.cabal@ files.
 --
@@ -167,13 +182,15 @@ data ProjectBaseContext = ProjectBaseContext {
        cabalDirLayout :: CabalDirLayout,
        projectConfig  :: ProjectConfig,
        localPackages  :: [PackageSpecifier UnresolvedSourcePackage],
-       buildSettings  :: BuildTimeSettings
+       buildSettings  :: BuildTimeSettings,
+       currentCommand :: CurrentCommand
      }
 
 establishProjectBaseContext :: Verbosity
                             -> ProjectConfig
+                            -> CurrentCommand
                             -> IO ProjectBaseContext
-establishProjectBaseContext verbosity cliConfig = do
+establishProjectBaseContext verbosity cliConfig currentCommand = do
 
     cabalDir <- getCabalDir
     projectRoot <- either throwIO return =<<
@@ -196,8 +213,9 @@ establishProjectBaseContext verbosity cliConfig = do
         } = projectConfigShared projectConfig
 
         mlogsDir = Setup.flagToMaybe projectConfigLogsDir
-        mstoreDir = Setup.flagToMaybe projectConfigStoreDir
-        cabalDirLayout = mkCabalDirLayout cabalDir mstoreDir mlogsDir
+    mstoreDir <- sequenceA $ makeAbsolute
+                 <$> Setup.flagToMaybe projectConfigStoreDir
+    let cabalDirLayout = mkCabalDirLayout cabalDir mstoreDir mlogsDir
 
         buildSettings = resolveBuildTimeSettings
                           verbosity cabalDirLayout
@@ -208,7 +226,8 @@ establishProjectBaseContext verbosity cliConfig = do
       cabalDirLayout,
       projectConfig,
       localPackages,
-      buildSettings
+      buildSettings,
+      currentCommand
     }
   where
     mdistDirectory = Setup.flagToMaybe projectConfigDistDir
@@ -388,15 +407,31 @@ runProjectPostBuildPhase verbosity
                          pkgsBuildStatus
                          buildOutcomes
 
-    void $ writePlanGhcEnvironment (distProjectRootDirectory
-                                      distDirLayout)
-                                   elaboratedPlanOriginal
-                                   elaboratedShared
-                                   postBuildStatus
+    -- Write the .ghc.environment file (if allowed by the env file write policy).
+    let writeGhcEnvFilesPolicy =
+          projectConfigWriteGhcEnvironmentFilesPolicy . projectConfigShared
+          $ projectConfig
+
+        shouldWriteGhcEnvironment =
+          case fromFlagOrDefault NeverWriteGhcEnvironmentFiles
+               writeGhcEnvFilesPolicy
+          of
+            AlwaysWriteGhcEnvironmentFiles                -> True
+            NeverWriteGhcEnvironmentFiles                 -> False
+            WriteGhcEnvironmentFilesOnlyForGhc844AndNewer ->
+              let compiler         = pkgConfigCompiler elaboratedShared
+                  ghcCompatVersion = compilerCompatVersion GHC compiler
+              in maybe False (>= mkVersion [8,4,4]) ghcCompatVersion
+
+    when shouldWriteGhcEnvironment $
+      void $ writePlanGhcEnvironment (distProjectRootDirectory distDirLayout)
+                                     elaboratedPlanOriginal
+                                     elaboratedShared
+                                     postBuildStatus
 
     -- Finally if there were any build failures then report them and throw
     -- an exception to terminate the program
-    dieOnBuildFailures verbosity elaboratedPlanToExecute buildOutcomes
+    dieOnBuildFailures verbosity currentCommand elaboratedPlanToExecute buildOutcomes
 
     -- Note that it is a deliberate design choice that the 'buildTargets' is
     -- not passed to phase 1, and the various bits of input config is not
@@ -639,17 +674,19 @@ availableTargetIndexes installPlan = AvailableTargetIndexes{..}
                                   in (pname, cname'))
         availableTargetsByPackageIdAndComponentName
      where
-       unqualComponentName :: PackageName -> ComponentName -> UnqualComponentName
+       unqualComponentName ::
+         PackageName -> ComponentName -> UnqualComponentName
        unqualComponentName pkgname =
            fromMaybe (packageNameToUnqualComponentName pkgname)
          . componentNameString
 
     -- Add in all the empty packages. These do not appear in the
-    -- availableTargetsByComponent map, since that only contains components
-    -- so packages with no components are invisible from that perspective.
-    -- The empty packages need to be there for proper error reporting, so users
-    -- can select the empty package and then we can report that it is empty,
-    -- otherwise we falsely report there is no such package at all.
+    -- availableTargetsByComponent map, since that only contains
+    -- components, so packages with no components are invisible from
+    -- that perspective.  The empty packages need to be there for
+    -- proper error reporting, so users can select the empty package
+    -- and then we can report that it is empty, otherwise we falsely
+    -- report there is no such package at all.
     availableTargetsEmptyPackages =
       Map.fromList
         [ (packageId pkg, [])
@@ -659,9 +696,10 @@ availableTargetIndexes installPlan = AvailableTargetIndexes{..}
             ElabPackage   _ -> null (pkgComponents (elabPkgDescription pkg))
         ]
 
-    --TODO: [research required] what if the solution has multiple versions of this package?
-    --      e.g. due to setup deps or due to multiple independent sets of
-    --      packages being built (e.g. ghc + ghcjs in a project)
+    --TODO: [research required] what if the solution has multiple
+    --      versions of this package?
+    --      e.g. due to setup deps or due to multiple independent sets
+    --      of packages being built (e.g. ghc + ghcjs in a project)
 
 filterTargetsKind :: ComponentKind -> [AvailableTarget k] -> [AvailableTarget k]
 filterTargetsKind ckind = filterTargetsKindWith (== ckind)
@@ -734,12 +772,21 @@ selectComponentTargetBasic subtarget
 data TargetProblemCommon
    = TargetNotInProject                   PackageName
    | TargetAvailableInIndex               PackageName
-   | TargetComponentNotProjectLocal       PackageId ComponentName SubComponentTarget
-   | TargetComponentNotBuildable          PackageId ComponentName SubComponentTarget
-   | TargetOptionalStanzaDisabledByUser   PackageId ComponentName SubComponentTarget
-   | TargetOptionalStanzaDisabledBySolver PackageId ComponentName SubComponentTarget
-   | TargetProblemUnknownComponent        PackageName
-                                          (Either UnqualComponentName ComponentName)
+
+   | TargetComponentNotProjectLocal
+     PackageId ComponentName SubComponentTarget
+
+   | TargetComponentNotBuildable
+     PackageId ComponentName SubComponentTarget
+
+   | TargetOptionalStanzaDisabledByUser
+     PackageId ComponentName SubComponentTarget
+
+   | TargetOptionalStanzaDisabledBySolver
+     PackageId ComponentName SubComponentTarget
+
+   | TargetProblemUnknownComponent
+     PackageName (Either UnqualComponentName ComponentName)
 
     -- The target matching stuff only returns packages local to the project,
     -- so these lookups should never fail, but if 'resolveTargets' is called
@@ -785,7 +832,8 @@ printPlan verbosity
           ProjectBaseContext {
             buildSettings = BuildTimeSettings{buildSettingDryRun},
             projectConfig = ProjectConfig {
-              projectConfigLocalPackages = PackageConfig {packageConfigOptimization}
+              projectConfigLocalPackages =
+                  PackageConfig {packageConfigOptimization}
             }
           }
           ProjectBuildContext {
@@ -799,8 +847,9 @@ printPlan verbosity
 
   | otherwise
   = noticeNoWrap verbosity $ unlines $
-      (showBuildProfile ++ "In order, the following " ++ wouldWill ++ " be built" ++
-      ifNormal " (use -v for more details)" ++ ":")
+      (showBuildProfile ++ "In order, the following "
+       ++ wouldWill ++ " be built"
+       ++ ifNormal " (use -v for more details)" ++ ":")
     : map showPkgAndReason pkgs
 
   where
@@ -819,8 +868,8 @@ printPlan verbosity
     showPkgAndReason (ReadyPackage elab) =
       " - " ++
       (if verbosity >= deafening
-        then display (installedUnitId elab)
-        else display (packageId elab)
+        then prettyShow (installedUnitId elab)
+        else prettyShow (packageId elab)
         ) ++
       (case elabPkgOrComp elab of
           ElabPackage pkg -> showTargets elab ++ ifVerbose (showStanzas pkg)
@@ -833,17 +882,18 @@ printPlan verbosity
       " (" ++ showBuildStatus buildStatus ++ ")"
 
     showComp elab comp =
-        maybe "custom" display (compComponentName comp) ++
+        maybe "custom" prettyShow (compComponentName comp) ++
         if Map.null (elabInstantiatedWith elab)
             then ""
             else " with " ++
                 intercalate ", "
                     -- TODO: Abbreviate the UnitIds
-                    [ display k ++ "=" ++ display v
+                    [ prettyShow k ++ "=" ++ prettyShow v
                     | (k,v) <- Map.toList (elabInstantiatedWith elab) ]
 
     nonDefaultFlags :: ElaboratedConfiguredPackage -> FlagAssignment
-    nonDefaultFlags elab = elabFlagAssignment elab `diffFlagAssignment` elabFlagDefaults elab
+    nonDefaultFlags elab =
+      elabFlagAssignment elab `diffFlagAssignment` elabFlagDefaults elab
 
     showStanzas pkg = concat
                     $ [ " *test"
@@ -854,8 +904,10 @@ printPlan verbosity
     showTargets elab
       | null (elabBuildTargets elab) = ""
       | otherwise
-      = " (" ++ intercalate ", " [ showComponentTarget (packageId elab) t | t <- elabBuildTargets elab ]
-             ++ ")"
+      = " ("
+        ++ intercalate ", " [ showComponentTarget (packageId elab) t
+                            | t <- elabBuildTargets elab ]
+        ++ ")"
 
     showFlagAssignment :: FlagAssignment -> String
     showFlagAssignment = concatMap ((' ' :) . showFlagValue) . unFlagAssignment
@@ -872,8 +924,11 @@ printPlan verbosity
             -- rendering.
             nubFlag :: Eq a => a -> Setup.Flag a -> Setup.Flag a
             nubFlag x (Setup.Flag x') | x == x' = Setup.NoFlag
-            nubFlag _ f = f
-            (tryLibProfiling, tryExeProfiling) = computeEffectiveProfiling fullConfigureFlags
+            nubFlag _ f                         = f
+
+            (tryLibProfiling, tryExeProfiling) =
+              computeEffectiveProfiling fullConfigureFlags
+
             partialConfigureFlags
               = Mon.mempty {
                 configProf    =
@@ -907,10 +962,12 @@ printPlan verbosity
           BuildReasonEphemeralTargets -> "ephemeral targets"
       BuildStatusUpToDate {} -> "up to date" -- doesn't happen
 
-    showMonitorChangedReason (MonitoredFileChanged file) = "file " ++ file ++ " changed"
+    showMonitorChangedReason (MonitoredFileChanged file) =
+      "file " ++ file ++ " changed"
     showMonitorChangedReason (MonitoredValueChanged _)   = "value changed"
-    showMonitorChangedReason  MonitorFirstRun     = "first run"
-    showMonitorChangedReason  MonitorCorruptCache = "cannot read state cache"
+    showMonitorChangedReason  MonitorFirstRun            = "first run"
+    showMonitorChangedReason  MonitorCorruptCache        =
+      "cannot read state cache"
 
     showBuildProfile = "Build profile: " ++ unwords [
       "-w " ++ (showCompilerId . pkgConfigCompiler) elaboratedShared,
@@ -923,9 +980,9 @@ printPlan verbosity
 
 -- | If there are build failures then report them and throw an exception.
 --
-dieOnBuildFailures :: Verbosity
+dieOnBuildFailures :: Verbosity -> CurrentCommand
                    -> ElaboratedInstallPlan -> BuildOutcomes -> IO ()
-dieOnBuildFailures verbosity plan buildOutcomes
+dieOnBuildFailures verbosity currentCommand plan buildOutcomes
   | null failures = return ()
 
   | isSimpleCase  = exitFailure
@@ -973,12 +1030,16 @@ dieOnBuildFailures verbosity plan buildOutcomes
       ]
 
     dieIfNotHaddockFailure
+      | currentCommand == HaddockCommand            = die'
       | all isHaddockFailure failuresClassification = warn
       | otherwise                                   = die'
       where
-        isHaddockFailure (_, ShowBuildSummaryOnly   (HaddocksFailed _)  ) = True
-        isHaddockFailure (_, ShowBuildSummaryAndLog (HaddocksFailed _) _) = True
-        isHaddockFailure _                                                = False
+        isHaddockFailure
+          (_, ShowBuildSummaryOnly   (HaddocksFailed _)  ) = True
+        isHaddockFailure
+          (_, ShowBuildSummaryAndLog (HaddocksFailed _) _) = True
+        isHaddockFailure
+          _                                                = False
 
 
     classifyBuildFailure :: BuildFailure -> BuildFailurePresentation
@@ -998,10 +1059,10 @@ dieOnBuildFailures verbosity plan buildOutcomes
     -- context which package failed.
     --
     -- We generalise this rule as follows:
-    --  - if only one failure occurs, and it is in a single root package (ie a
-    --    package with nothing else depending on it)
-    --  - and that failure is of a kind that always reports enough detail
-    --    itself (e.g. ghc reporting errors on stdout)
+    --  - if only one failure occurs, and it is in a single root
+    --    package (i.e. a package with nothing else depending on it)
+    --  - and that failure is of a kind that always reports enough
+    --    detail itself (e.g. ghc reporting errors on stdout)
     --  - then we do not report additional error detail or context.
     --
     isSimpleCase
@@ -1009,6 +1070,7 @@ dieOnBuildFailures verbosity plan buildOutcomes
       , [pkg]              <- rootpkgs
       , installedUnitId pkg == pkgid
       , isFailureSelfExplanatory (buildFailureReason failure)
+      , currentCommand /= InstallCommand
       = True
       | otherwise
       = False
@@ -1053,8 +1115,8 @@ dieOnBuildFailures verbosity plan buildOutcomes
           BenchFailed     _ -> "Benchmarks failed for " ++ pkgstr
           InstallFailed   _ -> "Failed to build "  ++ pkgstr
           DependentFailed depid
-                            -> "Failed to build " ++ display (packageId pkg)
-                            ++ " because it depends on " ++ display depid
+                            -> "Failed to build " ++ prettyShow (packageId pkg)
+                            ++ " because it depends on " ++ prettyShow depid
                             ++ " which itself failed to build"
       where
         pkgstr = elabConfiguredName verbosity pkg
@@ -1062,21 +1124,25 @@ dieOnBuildFailures verbosity plan buildOutcomes
                    then renderDependencyOf (installedUnitId pkg)
                    else ""
 
-    renderFailureExtraDetail reason =
-      case reason of
-        ConfigureFailed _ -> " The failure occurred during the configure step."
-        InstallFailed   _ -> " The failure occurred during the final install step."
-        _                 -> ""
+    renderFailureExtraDetail (ConfigureFailed _) =
+      " The failure occurred during the configure step."
+    renderFailureExtraDetail (InstallFailed   _) =
+      " The failure occurred during the final install step."
+    renderFailureExtraDetail _                   =
+      ""
 
     renderDependencyOf pkgid =
       case ultimateDeps pkgid of
         []         -> ""
-        (p1:[])    -> " (which is required by " ++ elabPlanPackageName verbosity p1 ++ ")"
-        (p1:p2:[]) -> " (which is required by " ++ elabPlanPackageName verbosity p1
-                                     ++ " and " ++ elabPlanPackageName verbosity p2 ++ ")"
-        (p1:p2:_)  -> " (which is required by " ++ elabPlanPackageName verbosity p1
-                                        ++ ", " ++ elabPlanPackageName verbosity p2
-                                        ++ " and others)"
+        (p1:[])    ->
+          " (which is required by " ++ elabPlanPackageName verbosity p1 ++ ")"
+        (p1:p2:[]) ->
+          " (which is required by " ++ elabPlanPackageName verbosity p1
+          ++ " and " ++ elabPlanPackageName verbosity p2 ++ ")"
+        (p1:p2:_)  ->
+          " (which is required by " ++ elabPlanPackageName verbosity p1
+          ++ ", " ++ elabPlanPackageName verbosity p2
+          ++ " and others)"
 
     showException e = case fromException e of
       Just (ExitFailure 1) -> ""
@@ -1111,9 +1177,10 @@ dieOnBuildFailures verbosity plan buildOutcomes
          ++ " which may be because some part of it was killed "
          ++ "(i.e. SIGKILL). " ++ explanation
         where
-          explanation = "The typical reason for this is that there is not "
-                     ++ "enough memory available (e.g. the OS killed a process "
-                     ++ "using lots of memory)."
+          explanation =
+            "The typical reason for this is that there is not "
+            ++ "enough memory available (e.g. the OS killed a process "
+            ++ "using lots of memory)."
 #endif
       Just (ExitFailure n) ->
         " The build process terminated with exit code " ++ show n

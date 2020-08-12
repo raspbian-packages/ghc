@@ -15,9 +15,11 @@ import Distribution.Package
          ( packageId, PackageName, packageName )
 import Distribution.Types.ComponentName
          ( showComponentName )
+import Distribution.Types.LibraryName
+         ( LibraryName(..) )
 import Distribution.Solver.Types.OptionalStanza
          ( OptionalStanza(..) )
-import Distribution.Text
+import Distribution.Deprecated.Text
          ( display )
 
 import Data.Maybe (isNothing)
@@ -165,8 +167,8 @@ targetSelectorFilter  TargetComponent{}              = Nothing
 targetSelectorFilter  TargetComponentUnknown{}       = Nothing
 
 renderComponentName :: PackageName -> ComponentName -> String
-renderComponentName pkgname CLibName     = "library " ++ display pkgname
-renderComponentName _ (CSubLibName name) = "library " ++ display name
+renderComponentName pkgname (CLibName LMainLibName) = "library " ++ display pkgname
+renderComponentName _ (CLibName (LSubLibName name)) = "library " ++ display name
 renderComponentName _ (CFLibName   name) = "foreign library " ++ display name
 renderComponentName _ (CExeName    name) = "executable " ++ display name
 renderComponentName _ (CTestName   name) = "test suite " ++ display name
@@ -303,6 +305,8 @@ renderTargetProblemNoneEnabled verb targetSelector targets =
          ++ plural (listPlural targets') " is " " are "
          ++ "not available because the solver did not find a plan that "
          ++ "included the " ++ renderOptionalStanza Plural stanza
+         ++ ". Force the solver to enable this for all packages by adding the "
+         ++ "line 'tests: True' to the 'cabal.project.local' file."
         (TargetNotBuildable, _) ->
             renderListCommaAnd
               [ "the " ++ showComponentName availableTargetComponentName

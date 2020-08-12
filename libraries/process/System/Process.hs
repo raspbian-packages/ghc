@@ -54,12 +54,14 @@ module System.Process (
     -- $ctlc-handling
 
     -- * Process completion
+    -- ** Notes about @exec@ on Windows
+    -- $exec-on-windows
     waitForProcess,
     getProcessExitCode,
     terminateProcess,
     interruptProcessGroupOf,
 
-    -- Interprocess communication
+    -- * Interprocess communication
     createPipe,
     createPipeFd,
 
@@ -188,7 +190,7 @@ To create a pipe from which to read the output of @ls@:
 To also set the directory in which to run @ls@:
 
 >   (_, Just hout, _, _) <-
->       createProcess (proc "ls" []){ cwd = Just "\home\bob",
+>       createProcess (proc "ls" []){ cwd = Just "/home/bob",
 >                                     std_out = CreatePipe }
 
 Note that @Handle@s provided for @std_in@, @std_out@, or @std_err@ via the
@@ -394,6 +396,32 @@ processFailedException fun cmd args exit_code =
 -- For even more detail on this topic, see
 -- <http://www.cons.org/cracauer/sigint.html "Proper handling of SIGINT/SIGQUIT">.
 
+-- $exec-on-windows
+--
+-- Note that processes which use the POSIX @exec@ system call (e.g. @gcc@)
+-- require special care on Windows. Specifically, the @msvcrt@ C runtime used
+-- frequently on Windows emulates @exec@ in a non-POSIX compliant manner, where
+-- the caller will be terminated (with exit code 0) and execution will continue
+-- in a new process. As a result, on Windows it will appear as though a child
+-- process which has called @exec@ has terminated despite the fact that the
+-- process would still be running on a POSIX-compliant platform.
+--
+-- Since many programs do use @exec@, the @process@ library exposes the
+-- 'use_process_jobs' flag to make it possible to reliably detect when such a
+-- process completes. When this flag is set a 'ProcessHandle' will not be
+-- deemed to be \"finished\" until all processes spawned by it have
+-- terminated (except those spawned by the child with the
+-- @CREATE_BREAKAWAY_FROM_JOB@ @CreateProcess@ flag).
+--
+-- Note, however, that, because of platform limitations, the exit code returned
+-- by @waitForProcess@ and @getProcessExitCode@ cannot not be relied upon when
+-- the child uses @exec@, even when 'use_process_jobs' is used. Specifically,
+-- these functions will return the exit code of the *original child* (which
+-- always exits with code 0, since it called @exec@), not the exit code of the
+-- process which carried on with execution after @exec@. This is different from
+-- the behavior prescribed by POSIX but is the best approximation that can be
+-- realised under the restrictions of the Windows process model.
+
 -- -----------------------------------------------------------------------------
 
 -- | @readProcess@ forks an external process, reads its standard output
@@ -404,8 +432,8 @@ processFailedException fun cmd args exit_code =
 -- @readProcess@, the forked process will be terminated and @readProcess@ will
 -- wait (block) until the process has been terminated.
 --
--- Output is returned strictly, so this is not suitable for
--- interactive applications.
+-- Output is returned strictly, so this is not suitable for launching processes
+-- that require interaction over the standard file streams.
 --
 -- This function throws an 'IOError' if the process 'ExitCode' is
 -- anything other than 'ExitSuccess'. If instead you want to get the
@@ -436,7 +464,7 @@ readProcess cmd args = readCreateProcess $ proc cmd args
 -- | @readCreateProcess@ works exactly like 'readProcess' except that it
 -- lets you pass 'CreateProcess' giving better flexibility.
 --
--- >  > readCreateProcess (shell "pwd" { cwd = "/etc/" }) ""
+-- >  > readCreateProcess ((shell "pwd") { cwd = Just "/etc/" }) ""
 -- >  "/etc\n"
 --
 -- Note that @Handle@s provided for @std_in@ or @std_out@ via the CreateProcess
@@ -454,25 +482,30 @@ readCreateProcess cp input = do
                     std_out = CreatePipe
                   }
     (ex, output) <- withCreateProcess_ "readCreateProcess" cp_opts $
-      \(Just inh) (Just outh) _ ph -> do
+      \mb_inh mb_outh _ ph ->
+        case (mb_inh, mb_outh) of
+          (Just inh, Just outh) -> do
 
-        -- fork off a thread to start consuming the output
-        output  <- hGetContents outh
-        withForkWait (C.evaluate $ rnf output) $ \waitOut -> do
+            -- fork off a thread to start consuming the output
+            output  <- hGetContents outh
+            withForkWait (C.evaluate $ rnf output) $ \waitOut -> do
 
-          -- now write any input
-          unless (null input) $
-            ignoreSigPipe $ hPutStr inh input
-          -- hClose performs implicit hFlush, and thus may trigger a SIGPIPE
-          ignoreSigPipe $ hClose inh
+              -- now write any input
+              unless (null input) $
+                ignoreSigPipe $ hPutStr inh input
+              -- hClose performs implicit hFlush, and thus may trigger a SIGPIPE
+              ignoreSigPipe $ hClose inh
 
-          -- wait on the output
-          waitOut
-          hClose outh
+              -- wait on the output
+              waitOut
+              hClose outh
 
-        -- wait on the process
-        ex <- waitForProcess ph
-        return (ex, output)
+            -- wait on the process
+            ex <- waitForProcess ph
+            return (ex, output)
+
+          (Nothing,_) -> error "readCreateProcess: Failed to get a stdin handle."
+          (_,Nothing) -> error "readCreateProcess: Failed to get a stdout handle."
 
     case ex of
      ExitSuccess   -> return output
@@ -486,7 +519,7 @@ readCreateProcess cp input = do
              CreateProcess { cmdspec = RawCommand _ args' } -> args'
 
 
--- | @readProcessWithExitCode@ is like @readProcess@ but with two differences:
+-- | @readProcessWithExitCode@ is like 'readProcess' but with two differences:
 --
 --  * it returns the 'ExitCode' of the process, and does not throw any
 --    exception if the code is not 'ExitSuccess'.
@@ -523,32 +556,37 @@ readCreateProcessWithExitCode cp input = do
                     std_err = CreatePipe
                   }
     withCreateProcess_ "readCreateProcessWithExitCode" cp_opts $
-      \(Just inh) (Just outh) (Just errh) ph -> do
+      \mb_inh mb_outh mb_errh ph ->
+        case (mb_inh, mb_outh, mb_errh) of
+          (Just inh, Just outh, Just errh) -> do
 
-        out <- hGetContents outh
-        err <- hGetContents errh
+            out <- hGetContents outh
+            err <- hGetContents errh
 
-        -- fork off threads to start consuming stdout & stderr
-        withForkWait  (C.evaluate $ rnf out) $ \waitOut ->
-         withForkWait (C.evaluate $ rnf err) $ \waitErr -> do
+            -- fork off threads to start consuming stdout & stderr
+            withForkWait  (C.evaluate $ rnf out) $ \waitOut ->
+             withForkWait (C.evaluate $ rnf err) $ \waitErr -> do
 
-          -- now write any input
-          unless (null input) $
-            ignoreSigPipe $ hPutStr inh input
-          -- hClose performs implicit hFlush, and thus may trigger a SIGPIPE
-          ignoreSigPipe $ hClose inh
+              -- now write any input
+              unless (null input) $
+                ignoreSigPipe $ hPutStr inh input
+              -- hClose performs implicit hFlush, and thus may trigger a SIGPIPE
+              ignoreSigPipe $ hClose inh
 
-          -- wait on the output
-          waitOut
-          waitErr
+              -- wait on the output
+              waitOut
+              waitErr
 
-          hClose outh
-          hClose errh
+              hClose outh
+              hClose errh
 
-        -- wait on the process
-        ex <- waitForProcess ph
+            -- wait on the process
+            ex <- waitForProcess ph
+            return (ex, out, err)
 
-        return (ex, out, err)
+          (Nothing,_,_) -> error "readCreateProcessWithExitCode: Failed to get a stdin handle."
+          (_,Nothing,_) -> error "readCreateProcessWithExitCode: Failed to get a stdout handle."
+          (_,_,Nothing) -> error "readCreateProcessWithExitCode: Failed to get a stderr handle."
 
 -- | Fork a thread while doing something else, but kill it if there's an
 -- exception.
@@ -632,30 +670,36 @@ waitForProcess ph@(ProcessHandle _ delegating_ctlc _) = lockWaitpid $ do
   case p_ of
     ClosedHandle e -> return e
     OpenHandle h  -> do
-        e <- alloca $ \pret -> do
-          -- don't hold the MVar while we call c_waitForProcess...
-          throwErrnoIfMinus1Retry_ "waitForProcess" (allowInterrupt >> c_waitForProcess h pret)
-          modifyProcessHandle ph $ \p_' ->
-            case p_' of
-              ClosedHandle e  -> return (p_', e)
-              OpenExtHandle{} -> return (p_', ExitFailure (-1))
-              OpenHandle ph'  -> do
-                closePHANDLE ph'
-                code <- peek pret
-                let e = if (code == 0)
-                       then ExitSuccess
-                       else (ExitFailure (fromIntegral code))
-                return (ClosedHandle e, e)
-        when delegating_ctlc $
-          endDelegateControlC e
-        return e
+        -- don't hold the MVar while we call c_waitForProcess...
+        e <- waitForProcess' h
+        e' <- modifyProcessHandle ph $ \p_' ->
+          case p_' of
+            ClosedHandle e' -> return (p_', e')
+            OpenExtHandle{} -> fail "waitForProcess(OpenExtHandle): this cannot happen"
+            OpenHandle ph'  -> do
+              closePHANDLE ph'
+              when delegating_ctlc $
+                endDelegateControlC e
+              return (ClosedHandle e, e)
+        return e'
 #if defined(WINDOWS)
-    OpenExtHandle _ job iocp ->
-        maybe (ExitFailure (-1)) mkExitCode `fmap` waitForJobCompletion job iocp timeout_Infinite
-      where mkExitCode code | code == 0 = ExitSuccess
-                            | otherwise = ExitFailure $ fromIntegral code
+    OpenExtHandle h job -> do
+        -- First wait for completion of the job...
+        waitForJobCompletion job
+        e <- waitForProcess' h
+        e' <- modifyProcessHandle ph $ \p_' ->
+          case p_' of
+            ClosedHandle e' -> return (p_', e')
+            OpenHandle{}    -> fail "waitForProcess(OpenHandle): this cannot happen"
+            OpenExtHandle ph' job' -> do
+              closePHANDLE ph'
+              closePHANDLE job'
+              when delegating_ctlc $
+                endDelegateControlC e
+              return (ClosedHandle e, e)
+        return e'
 #else
-    OpenExtHandle _ _job _iocp ->
+    OpenExtHandle _ _job ->
         return $ ExitFailure (-1)
 #endif
   where
@@ -665,6 +709,17 @@ waitForProcess ph@(ProcessHandle _ delegating_ctlc _) = lockWaitpid $ do
     -- Cf. https://github.com/haskell/process/issues/46, and
     -- https://github.com/haskell/process/pull/58 for further discussion
     lockWaitpid m = withMVar (waitpidLock ph) $ \() -> m
+
+    waitForProcess' :: PHANDLE -> IO ExitCode
+    waitForProcess' h = alloca $ \pret -> do
+      throwErrnoIfMinus1Retry_ "waitForProcess" (allowInterrupt >> c_waitForProcess h pret)
+      mkExitCode <$> peek pret
+
+    mkExitCode :: CInt -> ExitCode
+    mkExitCode code
+      | code == 0 = ExitSuccess
+      | otherwise = ExitFailure (fromIntegral code)
+
 
 -- ----------------------------------------------------------------------------
 -- getProcessExitCode
@@ -705,7 +760,7 @@ getProcessExitCode ph@(ProcessHandle _ delegating_ctlc _) = tryLockWaitpid $ do
     where getHandle :: ProcessHandle__ -> Maybe PHANDLE
           getHandle (OpenHandle        h) = Just h
           getHandle (ClosedHandle      _) = Nothing
-          getHandle (OpenExtHandle h _ _) = Just h
+          getHandle (OpenExtHandle   h _) = Just h
 
           -- If somebody is currently holding the waitpid lock, we don't want to
           -- accidentally remove the pid from the process table.

@@ -26,7 +26,7 @@ module TcSplice(
      runMetaE, runMetaP, runMetaT, runMetaD, runQuasi,
      tcTopSpliceExpr, lookupThName_maybe,
      defaultRunMeta, runMeta', runRemoteModFinalizers,
-     finishTH
+     finishTH, runTopSplice
       ) where
 
 #include "HsVersions.h"
@@ -46,6 +46,7 @@ import SrcLoc
 import THNames
 import TcUnify
 import TcEnv
+import Coercion( etaExpandCoAxBranch )
 import FileCleanup ( newTempName, TempFileLifetime(..) )
 
 import Control.Monad
@@ -56,8 +57,7 @@ import GHCi
 import HscMain
         -- These imports are the reason that TcSplice
         -- is very high up the module hierarchy
-import FV
-import RnSplice( traceSplice, SpliceInfo(..) )
+import RnSplice( traceSplice, SpliceInfo(..))
 import RdrName
 import HscTypes
 import Convert
@@ -490,28 +490,49 @@ tcTopSplice expr res_ty
          -- making sure it has type Q (T res_ty)
          res_ty <- expTypeToType res_ty
        ; meta_exp_ty <- tcTExpTy res_ty
-       ; zonked_q_expr <- tcTopSpliceExpr Typed $
+       ; q_expr <- tcTopSpliceExpr Typed $
                           tcMonoExpr expr (mkCheckExpType meta_exp_ty)
+       ; lcl_env <- getLclEnv
+       ; let delayed_splice
+              = DelayedSplice lcl_env expr res_ty q_expr
+       ; return (HsSpliceE noExt (HsSplicedT delayed_splice))
 
-         -- See Note [Collecting modFinalizers in typed splices].
+       }
+
+
+-- This is called in the zonker
+-- See Note [Running typed splices in the zonker]
+runTopSplice :: DelayedSplice -> TcM (HsExpr GhcTc)
+runTopSplice (DelayedSplice lcl_env orig_expr res_ty q_expr)
+  = setLclEnv lcl_env $ do {
+         zonked_ty <- zonkTcType res_ty
+       ; zonked_q_expr <- zonkTopLExpr q_expr
+        -- See Note [Collecting modFinalizers in typed splices].
        ; modfinalizers_ref <- newTcRef []
          -- Run the expression
        ; expr2 <- setStage (RunSplice modfinalizers_ref) $
                     runMetaE zonked_q_expr
        ; mod_finalizers <- readTcRef modfinalizers_ref
        ; addModFinalizersWithLclEnv $ ThModFinalizers mod_finalizers
+       -- We use orig_expr here and not q_expr when tracing as a call to
+       -- unsafeTExpCoerce is added to the original expression by the
+       -- typechecker when typed quotes are type checked.
        ; traceSplice (SpliceInfo { spliceDescription = "expression"
                                  , spliceIsDecl      = False
-                                 , spliceSource      = Just expr
+                                 , spliceSource      = Just orig_expr
                                  , spliceGenerated   = ppr expr2 })
+        -- Rename and typecheck the spliced-in expression,
+        -- making sure it has type res_ty
+        -- These steps should never fail; this is a *typed* splice
+       ; (res, wcs) <-
+            captureConstraints $
+              addErrCtxt (spliceResultDoc zonked_q_expr) $ do
+                { (exp3, _fvs) <- rnLExpr expr2
+                ; tcMonoExpr exp3 (mkCheckExpType zonked_ty)}
+       ; ev <- simplifyTop wcs
+       ; return $ unLoc (mkHsDictLet (EvBinds ev) res)
+       }
 
-         -- Rename and typecheck the spliced-in expression,
-         -- making sure it has type res_ty
-         -- These steps should never fail; this is a *typed* splice
-       ; addErrCtxt (spliceResultDoc expr) $ do
-       { (exp3, _fvs) <- rnLExpr expr2
-       ; exp4 <- tcMonoExpr exp3 (mkCheckExpType res_ty)
-       ; return (unLoc exp4) } }
 
 {-
 ************************************************************************
@@ -526,7 +547,7 @@ spliceCtxtDoc splice
   = hang (text "In the Template Haskell splice")
          2 (pprSplice splice)
 
-spliceResultDoc :: LHsExpr GhcRn -> SDoc
+spliceResultDoc :: LHsExpr GhcTc -> SDoc
 spliceResultDoc expr
   = sep [ text "In the result of the splice:"
         , nest 2 (char '$' <> ppr expr)
@@ -558,7 +579,7 @@ tcTopSpliceExpr isTypedSplice tc_action
        ; const_binds     <- simplifyTop wanted
 
           -- Zonk it and tie the knot of dictionary bindings
-       ; zonkTopLExpr (mkHsDictLet (EvBinds const_binds) expr') }
+       ; return $ mkHsDictLet (EvBinds const_binds) expr' }
 
 {-
 ************************************************************************
@@ -577,7 +598,7 @@ runAnnotation target expr = do
     -- Check the instances we require live in another module (we want to execute it..)
     -- and check identifiers live in other modules using TH stage checks. tcSimplifyStagedExpr
     -- also resolves the LIE constraints to detect e.g. instance ambiguity
-    zonked_wrapped_expr' <- tcTopSpliceExpr Untyped $
+    zonked_wrapped_expr' <- zonkTopLExpr =<< tcTopSpliceExpr Untyped (
            do { (expr', expr_ty) <- tcInferRhoNC expr
                 -- We manually wrap the typechecked expression in a call to toAnnotationWrapper
                 -- By instantiating the call >here< it gets registered in the
@@ -588,7 +609,8 @@ runAnnotation target expr = do
                       = L loc (mkHsWrap wrapper
                                  (HsVar noExt (L loc to_annotation_wrapper_id)))
               ; return (L loc (HsApp noExt
-                                specialised_to_annotation_wrapper_expr expr')) }
+                                specialised_to_annotation_wrapper_expr expr'))
+                                })
 
     -- Run the appropriately wrapped expression to get the value of
     -- the annotation and its dictionaries. The return value is of
@@ -789,6 +811,58 @@ runMeta' show_code ppr_hs run_and_convert expr
         failWithTc msg
 
 {-
+Note [Running typed splices in the zonker]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+See #15471 for the full discussion.
+
+For many years typed splices were run immediately after they were type checked
+however, this is too early as it means to zonk some type variables before
+they can be unified with type variables in the surrounding context.
+
+For example,
+
+```
+module A where
+
+test_foo :: forall a . Q (TExp (a -> a))
+test_foo = [|| id ||]
+
+module B where
+
+import A
+
+qux = $$(test_foo)
+```
+
+We would expect `qux` to have inferred type `forall a . a -> a` but if
+we run the splices too early the unified variables are zonked to `Any`. The
+inferred type is the unusable `Any -> Any`.
+
+To run the splice, we must compile `test_foo` all the way to byte code.
+But at the moment when the type checker is looking at the splice, test_foo
+has type `Q (TExp (alpha -> alpha))` and we
+certainly can't compile code involving unification variables!
+
+We could default `alpha` to `Any` but then we infer `qux :: Any -> Any`
+which definitely is not what we want.  Moreover, if we had
+  qux = [$$(test_foo), (\x -> x +1::Int)]
+then `alpha` would have to be `Int`.
+
+Conclusion: we must defer taking decisions about `alpha` until the
+typechecker is done; and *then* we can run the splice.  It's fine to do it
+later, because we know it'll produce type-correct code.
+
+Deferring running the splice until later, in the zonker, means that the
+unification variables propagate upwards from the splice into the surrounding
+context and are unified correctly.
+
+This is implemented by storing the arguments we need for running the splice
+in a `DelayedSplice`. In the zonker, the arguments are passed to
+`TcSplice.runTopSplice` and the expression inserted into the AST as normal.
+
+
+
 Note [Exceptions in TH]
 ~~~~~~~~~~~~~~~~~~~~~~~
 Suppose we have something like this
@@ -895,7 +969,9 @@ instance TH.Quasi TcM where
       l <- getSrcSpanM
       let either_hval = convertToHsDecls l thds
       ds <- case either_hval of
-              Left exn -> pprPanic "qAddTopDecls: can't convert top-level declarations" exn
+              Left exn -> failWithTc $
+                hang (text "Error in a declaration passed to addTopDecls:")
+                   2 exn
               Right ds -> return ds
       mapM_ (checkTopDecl . unLoc) ds
       th_topdecls_var <- fmap tcg_th_topdecls getGblEnv
@@ -1176,8 +1252,7 @@ reifyInstances th_nm th_tys
         ; rdr_ty <- cvt loc (mkThAppTs (TH.ConT th_nm) th_tys)
           -- #9262 says to bring vars into scope, like in HsForAllTy case
           -- of rnHsTyKi
-        ; free_vars <- extractHsTyRdrTyVars rdr_ty
-        ; let tv_rdrs = freeKiTyVarsAllVars free_vars
+        ; let tv_rdrs = freeKiTyVarsAllVars (extractHsTyRdrTyVars rdr_ty)
           -- Rename  to HsType Name
         ; ((tv_names, rn_ty), _fvs)
             <- checkNoErrs $ -- If there are out-of-scope Names here, then we
@@ -1188,15 +1263,16 @@ reifyInstances th_nm th_tys
                do { (rn_ty, fvs) <- rnLHsType doc rdr_ty
                   ; return ((tv_names, rn_ty), fvs) }
         ; (_tvs, ty)
-            <- solveEqualities $
-               tcImplicitTKBndrs ReifySkol tv_names $
+            <- pushTcLevelM_   $
+               solveEqualities $ -- Avoid error cascade if there are unsolved
+               bindImplicitTKBndrs_Skol tv_names $
                fst <$> tcLHsType rn_ty
-        ; ty <- zonkTcTypeToType emptyZonkEnv ty
+        ; ty <- zonkTcTypeToType ty
                 -- Substitute out the meta type variables
                 -- In particular, the type might have kind
                 -- variables inside it (Trac #7477)
 
-        ; traceTc "reifyInstances" (ppr ty $$ ppr (typeKind ty))
+        ; traceTc "reifyInstances" (ppr ty $$ ppr (tcTypeKind ty))
         ; case splitTyConApp_maybe ty of   -- This expands any type synonyms
             Just (tc, tys)                 -- See Trac #7910
                | Just cls <- tyConClass_maybe tc
@@ -1390,16 +1466,18 @@ reifyThing thing = pprPanic "reifyThing" (pprTcTyThingCategory thing)
 
 -------------------------------------------
 reifyAxBranch :: TyCon -> CoAxBranch -> TcM TH.TySynEqn
-reifyAxBranch fam_tc (CoAxBranch { cab_lhs = lhs, cab_rhs = rhs })
+reifyAxBranch fam_tc (CoAxBranch { cab_tvs = tvs
+                                 , cab_lhs = lhs
+                                 , cab_rhs = rhs })
             -- remove kind patterns (#8884)
-  = do { let lhs_types_only = filterOutInvisibleTypes fam_tc lhs
+  = do { tvs' <- reifyTyVarsToMaybe tvs
+       ; let lhs_types_only = filterOutInvisibleTypes fam_tc lhs
        ; lhs' <- reifyTypes lhs_types_only
-       ; annot_th_lhs <- zipWith3M annotThType (mkIsPolyTvs fam_tvs)
+       ; annot_th_lhs <- zipWith3M annotThType (tyConArgsPolyKinded fam_tc)
                                    lhs_types_only lhs'
+       ; let lhs_type = mkThAppTs (TH.ConT $ reifyName fam_tc) annot_th_lhs
        ; rhs'  <- reifyType rhs
-       ; return (TH.TySynEqn annot_th_lhs rhs') }
-  where
-    fam_tvs = tyConVisibleTyVars fam_tc
+       ; return (TH.TySynEqn tvs' lhs_type rhs') }
 
 reifyTyCon :: TyCon -> TcM TH.Info
 reifyTyCon tc
@@ -1535,7 +1613,9 @@ reifyDataCon isGadtDataCon tys dc
                   return $ TH.NormalC name (dcdBangs `zip` r_arg_tys)
 
        ; let (ex_tvs', theta') | isGadtDataCon = (g_user_tvs, g_theta)
-                               | otherwise     = (ex_tvs, theta)
+                               | otherwise     = ASSERT( all isTyVar ex_tvs )
+                                                 -- no covars for haskell syntax
+                                                 (ex_tvs, theta)
              ret_con | null ex_tvs' && null theta' = return main_con
                      | otherwise                   = do
                          { cxt <- reifyCxt theta'
@@ -1584,13 +1664,17 @@ reifyClass cls
     (_, fds, theta, _, ats, op_stuff) = classExtraBigSig cls
     fds' = map reifyFunDep fds
     reify_op (op, def_meth)
-      = do { ty <- reifyType (idType op)
+      = do { let (_, _, ty) = tcSplitMethodTy (idType op)
+               -- Use tcSplitMethodTy to get rid of the extraneous class
+               -- variables and predicates at the beginning of op's type
+               -- (see #15551).
+           ; ty' <- reifyType ty
            ; let nm' = reifyName op
            ; case def_meth of
                 Just (_, GenericDM gdm_ty) ->
                   do { gdm_ty' <- reifyType gdm_ty
-                     ; return [TH.SigD nm' ty, TH.DefaultSigD nm' gdm_ty'] }
-                _ -> return [TH.SigD nm' ty] }
+                     ; return [TH.SigD nm' ty', TH.DefaultSigD nm' gdm_ty'] }
+                _ -> return [TH.SigD nm' ty'] }
 
     reifyAT :: ClassATItem -> TcM [TH.Dec]
     reifyAT (ATI tycon def) = do
@@ -1605,7 +1689,8 @@ reifyClass cls
 
     reifyDefImpl :: TH.Name -> [TH.Name] -> Type -> TcM TH.Dec
     reifyDefImpl n args ty =
-      TH.TySynInstD n . TH.TySynEqn (map TH.VarT args) <$> reifyType ty
+      TH.TySynInstD . TH.TySynEqn Nothing (mkThAppTs (TH.ConT n) (map TH.VarT args))
+                                  <$> reifyType ty
 
     tfNames :: TH.Dec -> (TH.Name, [TH.Name])
     tfNames (TH.OpenTypeFamilyD (TH.TypeFamilyHead n args _ _))
@@ -1620,36 +1705,129 @@ reifyClass cls
 -- | Annotate (with TH.SigT) a type if the first parameter is True
 -- and if the type contains a free variable.
 -- This is used to annotate type patterns for poly-kinded tyvars in
--- reifying class and type instances. See #8953 and th/T8953.
+-- reifying class and type instances.
+-- See @Note [Reified instances and explicit kind signatures]@.
 annotThType :: Bool   -- True <=> annotate
             -> TyCoRep.Type -> TH.Type -> TcM TH.Type
   -- tiny optimization: if the type is annotated, don't annotate again.
 annotThType _    _  th_ty@(TH.SigT {}) = return th_ty
 annotThType True ty th_ty
   | not $ isEmptyVarSet $ filterVarSet isTyVar $ tyCoVarsOfType ty
-  = do { let ki = typeKind ty
+  = do { let ki = tcTypeKind ty
        ; th_ki <- reifyKind ki
        ; return (TH.SigT th_ty th_ki) }
 annotThType _    _ th_ty = return th_ty
 
--- | For every type variable in the input,
--- report whether or not the tv is poly-kinded. This is used to eventually
--- feed into 'annotThType'.
-mkIsPolyTvs :: [TyVar] -> [Bool]
-mkIsPolyTvs = map is_poly_tv
+-- | For every argument type that a type constructor accepts,
+-- report whether or not the argument is poly-kinded. This is used to
+-- eventually feed into 'annotThType'.
+-- See @Note [Reified instances and explicit kind signatures]@.
+tyConArgsPolyKinded :: TyCon -> [Bool]
+tyConArgsPolyKinded tc =
+     map (is_poly_ty . tyVarKind)      tc_vis_tvs
+     -- See "Wrinkle: Oversaturated data family instances" in
+     -- @Note [Reified instances and explicit kind signatures]@
+  ++ map (is_poly_ty . tyCoBinderType) tc_res_kind_vis_bndrs -- (1) in Wrinkle
+  ++ repeat True                                             -- (2) in Wrinkle
   where
-    is_poly_tv tv = not $
+    is_poly_ty :: Type -> Bool
+    is_poly_ty ty = not $
                     isEmptyVarSet $
                     filterVarSet isTyVar $
-                    tyCoVarsOfType $
-                    tyVarKind tv
+                    tyCoVarsOfType ty
+
+    tc_vis_tvs :: [TyVar]
+    tc_vis_tvs = tyConVisibleTyVars tc
+
+    tc_res_kind_vis_bndrs :: [TyCoBinder]
+    tc_res_kind_vis_bndrs = filter isVisibleBinder $ fst $ splitPiTys $ tyConResKind tc
+
+{-
+Note [Reified instances and explicit kind signatures]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Reified class instances and type family instances often include extra kind
+information to disambiguate instances. Here is one such example that
+illustrates this (#8953):
+
+    type family Poly (a :: k) :: Type
+    type instance Poly (x :: Bool)    = Int
+    type instance Poly (x :: Maybe k) = Double
+
+If you're not careful, reifying these instances might yield this:
+
+    type instance Poly x = Int
+    type instance Poly x = Double
+
+To avoid this, we go through some care to annotate things with extra kind
+information. Some functions which accomplish this feat include:
+
+* annotThType: This annotates a type with a kind signature if the type contains
+  a free variable.
+* tyConArgsPolyKinded: This checks every argument that a type constructor can
+  accept and reports if the type of the argument is poly-kinded. This
+  information is ultimately fed into annotThType.
+
+-----
+-- Wrinkle: Oversaturated data family instances
+-----
+
+What constitutes an argument to a type constructor in the definition of
+tyConArgsPolyKinded? For most type constructors, it's simply the visible
+type variable binders (i.e., tyConVisibleTyVars). There is one corner case
+we must keep in mind, however: data family instances can appear oversaturated
+(#17296). For instance:
+
+    data family   Foo :: Type -> Type
+    data instance Foo x
+
+    data family Bar :: k
+    data family Bar x
+
+For these sorts of data family instances, tyConVisibleTyVars isn't enough,
+as they won't give you the kinds of the oversaturated arguments. We must
+also consult:
+
+1. The kinds of the arguments in the result kind (i.e., the tyConResKind).
+   This will tell us, e.g., the kind of `x` in `Foo x` above.
+2. If we go beyond the number of arguments in the result kind (like the
+   `x` in `Bar x`), then we conservatively assume that the argument's
+   kind is poly-kinded.
+
+-----
+-- Wrinkle: data family instances with return kinds
+-----
+
+Another squirrelly corner case is this:
+
+    data family Foo (a :: k)
+    data instance Foo :: Bool -> Type
+    data instance Foo :: Char -> Type
+
+If you're not careful, reifying these instances might yield this:
+
+    data instance Foo
+    data instance Foo
+
+We can fix this ambiguity by reifying the instances' explicit return kinds. We
+should only do this if necessary (see
+Note [When does a tycon application need an explicit kind signature?] in Type),
+but more importantly, we *only* do this if either of the following are true:
+
+1. The data family instance has no constructors.
+2. The data family instance is declared with GADT syntax.
+
+If neither of these are true, then reifying the return kind would yield
+something like this:
+
+    data instance (Bar a :: Type) = MkBar a
+
+Which is not valid syntax.
+-}
 
 ------------------------------
 reifyClassInstances :: Class -> [ClsInst] -> TcM [TH.Dec]
 reifyClassInstances cls insts
-  = mapM (reifyClassInstance (mkIsPolyTvs tvs)) insts
-  where
-    tvs = tyConVisibleTyVars (classTyCon cls)
+  = mapM (reifyClassInstance (tyConArgsPolyKinded (classTyCon cls))) insts
 
 reifyClassInstance :: [Bool]  -- True <=> the corresponding tv is poly-kinded
                               -- includes only *visible* tvs
@@ -1675,55 +1853,57 @@ reifyClassInstance is_poly_tvs i
 ------------------------------
 reifyFamilyInstances :: TyCon -> [FamInst] -> TcM [TH.Dec]
 reifyFamilyInstances fam_tc fam_insts
-  = mapM (reifyFamilyInstance (mkIsPolyTvs fam_tvs)) fam_insts
-  where
-    fam_tvs = tyConVisibleTyVars fam_tc
+  = mapM (reifyFamilyInstance (tyConArgsPolyKinded fam_tc)) fam_insts
 
 reifyFamilyInstance :: [Bool] -- True <=> the corresponding tv is poly-kinded
                               -- includes only *visible* tvs
                     -> FamInst -> TcM TH.Dec
-reifyFamilyInstance is_poly_tvs inst@(FamInst { fi_flavor = flavor
-                                              , fi_fam = fam
-                                              , fi_tvs = fam_tvs
-                                              , fi_tys = lhs
-                                              , fi_rhs = rhs })
+reifyFamilyInstance is_poly_tvs (FamInst { fi_flavor = flavor
+                                         , fi_axiom = ax
+                                         , fi_fam = fam })
+  | let fam_tc = coAxiomTyCon ax
+        branch = coAxiomSingleBranch ax
+  , CoAxBranch { cab_tvs = tvs, cab_lhs = lhs, cab_rhs = rhs } <- branch
   = case flavor of
       SynFamilyInst ->
                -- remove kind patterns (#8884)
-        do { let lhs_types_only = filterOutInvisibleTypes fam_tc lhs
+        do { th_tvs <- reifyTyVarsToMaybe tvs
+           ; let lhs_types_only = filterOutInvisibleTypes fam_tc lhs
            ; th_lhs <- reifyTypes lhs_types_only
            ; annot_th_lhs <- zipWith3M annotThType is_poly_tvs lhs_types_only
                                                    th_lhs
+           ; let lhs_type = mkThAppTs (TH.ConT $ reifyName fam) annot_th_lhs
            ; th_rhs <- reifyType rhs
-           ; return (TH.TySynInstD (reifyName fam)
-                                   (TH.TySynEqn annot_th_lhs th_rhs)) }
+           ; return (TH.TySynInstD (TH.TySynEqn th_tvs lhs_type th_rhs)) }
 
       DataFamilyInst rep_tc ->
-        do { let rep_tvs = tyConTyVars rep_tc
-                 fam' = reifyName fam
-
-                   -- eta-expand lhs types, because sometimes data/newtype
-                   -- instances are eta-reduced; See Trac #9692
-                   -- See Note [Eta reduction for data family axioms]
-                   -- in TcInstDcls
-                 (_rep_tc, rep_tc_args) = splitTyConApp rhs
-                 etad_tyvars            = dropList rep_tc_args rep_tvs
-                 etad_tys               = mkTyVarTys etad_tyvars
-                 eta_expanded_tvs = mkTyVarTys fam_tvs `chkAppend` etad_tys
-                 eta_expanded_lhs = lhs `chkAppend` etad_tys
-                 dataCons         = tyConDataCons rep_tc
-                 isGadt           = isGadtSyntaxTyCon rep_tc
-           ; cons <- mapM (reifyDataCon isGadt eta_expanded_tvs) dataCons
-           ; let types_only = filterOutInvisibleTypes fam_tc eta_expanded_lhs
+        do { let -- eta-expand lhs types, because sometimes data/newtype
+                 -- instances are eta-reduced; See Trac #9692
+                 -- See Note [Eta reduction for data families] in FamInstEnv
+                 (ee_tvs, ee_lhs, _) = etaExpandCoAxBranch branch
+                 fam'     = reifyName fam
+                 dataCons = tyConDataCons rep_tc
+                 isGadt   = isGadtSyntaxTyCon rep_tc
+           ; th_tvs <- reifyTyVarsToMaybe ee_tvs
+           ; cons <- mapM (reifyDataCon isGadt (mkTyVarTys ee_tvs)) dataCons
+           ; let types_only = filterOutInvisibleTypes fam_tc ee_lhs
            ; th_tys <- reifyTypes types_only
            ; annot_th_tys <- zipWith3M annotThType is_poly_tvs types_only th_tys
+           ; let lhs_type = mkThAppTs (TH.ConT fam') annot_th_tys
+           ; mb_sig <-
+               -- See "Wrinkle: data family instances with return kinds" in
+               -- Note [Reified instances and explicit kind signatures]
+               if (null cons || isGadtSyntaxTyCon rep_tc)
+                     && tyConAppNeedsKindSig False fam_tc (length ee_lhs)
+               then do { let full_kind = tcTypeKind (mkTyConApp fam_tc ee_lhs)
+                       ; th_full_kind <- reifyKind full_kind
+                       ; pure $ Just th_full_kind }
+               else pure Nothing
            ; return $
                if isNewTyCon rep_tc
-               then TH.NewtypeInstD [] fam' annot_th_tys Nothing (head cons) []
-               else TH.DataInstD    [] fam' annot_th_tys Nothing       cons  []
+               then TH.NewtypeInstD [] th_tvs lhs_type mb_sig (head cons) []
+               else TH.DataInstD    [] th_tvs lhs_type mb_sig       cons  []
            }
-  where
-    fam_tc = famInstTyCon inst
 
 ------------------------------
 reifyType :: TyCoRep.Type -> TcM TH.Type
@@ -1735,7 +1915,23 @@ reifyType ty@(ForAllTy {})  = reify_for_all ty
 reifyType (LitTy t)         = do { r <- reifyTyLit t; return (TH.LitT r) }
 reifyType (TyVarTy tv)      = return (TH.VarT (reifyName tv))
 reifyType (TyConApp tc tys) = reify_tc_app tc tys   -- Do not expand type synonyms here
-reifyType (AppTy t1 t2)     = do { [r1,r2] <- reifyTypes [t1,t2] ; return (r1 `TH.AppT` r2) }
+reifyType ty@(AppTy {})     = do
+  let (ty_head, ty_args) = splitAppTys ty
+  ty_head' <- reifyType ty_head
+  ty_args' <- reifyTypes (filter_out_invisible_args ty_head ty_args)
+  pure $ mkThAppTs ty_head' ty_args'
+  where
+    -- Make sure to filter out any invisible arguments. For instance, if you
+    -- reify the following:
+    --
+    --   newtype T (f :: forall a. a -> Type) = MkT (f Bool)
+    --
+    -- Then you should receive back `f Bool`, not `f Type Bool`, since the
+    -- `Type` argument is invisible (#15792).
+    filter_out_invisible_args :: Type -> [Type] -> [Type]
+    filter_out_invisible_args ty_head ty_args =
+      filterByList (map isVisibleArgFlag $ appTyArgFlags ty_head ty_args)
+                   ty_args
 reifyType ty@(FunTy t1 t2)
   | isPredTy t1 = reify_for_all ty  -- Types like ((?x::Int) => Char -> Char)
   | otherwise   = do { [r1,r2] <- reifyTypes [t1,t2] ; return (TH.ArrowT `TH.AppT` r1 `TH.AppT` r2) }
@@ -1776,7 +1972,7 @@ reifyKind :: Kind -> TcM TH.Kind
 reifyKind = reifyType
 
 reifyCxt :: [PredType] -> TcM [TH.Pred]
-reifyCxt   = mapM reifyPred
+reifyCxt   = mapM reifyType
 
 reifyFunDep :: ([TyVar], [TyVar]) -> TH.FunDep
 reifyFunDep (xs, ys) = TH.FunDep (map reifyName xs) (map reifyName ys)
@@ -1792,100 +1988,9 @@ reifyTyVars tvs = mapM reify_tv tvs
         kind = tyVarKind tv
         name = reifyName tv
 
-{-
-Note [Kind annotations on TyConApps]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A poly-kinded tycon sometimes needs a kind annotation to be unambiguous.
-For example:
-
-   type family F a :: k
-   type instance F Int  = (Proxy :: * -> *)
-   type instance F Bool = (Proxy :: (* -> *) -> *)
-
-It's hard to figure out where these annotations should appear, so we do this:
-Suppose we have a tycon application (T ty1 ... tyn). Assuming that T is not
-oversatured (more on this later), we can assume T's declaration is of the form
-T (tvb1 :: s1) ... (tvbn :: sn) :: p. If any kind variable that
-is free in p is not free in an injective position in tvb1 ... tvbn,
-then we put on a kind annotation, since we would not otherwise be able to infer
-the kind of the whole tycon application.
-
-The injective positions in a tyvar binder are the injective positions in the
-kind of its tyvar, provided the tyvar binder is either:
-
-* Anonymous. For example, in the promoted data constructor '(:):
-
-    '(:) :: forall a. a -> [a] -> [a]
-
-  The second and third tyvar binders (of kinds `a` and `[a]`) are both
-  anonymous, so if we had '(:) 'True '[], then the inferred kinds of 'True and
-  '[] would contribute to the inferred kind of '(:) 'True '[].
-* Has required visibility. For example, in the type family:
-
-    type family Wurble k (a :: k) :: k
-    Wurble :: forall k -> k -> k
-
-  The first tyvar binder (of kind `forall k`) has required visibility, so if
-  we had Wurble (Maybe a) Nothing, then the inferred kind of Maybe a would
-  contribute to the inferred kind of Wurble (Maybe a) Nothing.
-
-An injective position in a type is one that does not occur as an argument to
-a non-injective type constructor (e.g., non-injective type families). See
-injectiveVarsOfType.
-
-How can be sure that this is correct? That is, how can we be sure that in the
-event that we leave off a kind annotation, that one could infer the kind of the
-tycon application from its arguments? It's essentially a proof by induction: if
-we can infer the kinds of every subtree of a type, then the whole tycon
-application will have an inferrable kind--unless, of course, the remainder of
-the tycon application's kind has uninstantiated kind variables.
-
-An earlier implementation of this algorithm only checked if p contained any
-free variables. But this was unsatisfactory, since a datatype like this:
-
-  data Foo = Foo (Proxy '[False, True])
-
-Would be reified like this:
-
-  data Foo = Foo (Proxy ('(:) False ('(:) True ('[] :: [Bool])
-                                     :: [Bool]) :: [Bool]))
-
-Which has a rather excessive amount of kind annotations. With the current
-algorithm, we instead reify Foo to this:
-
-  data Foo = Foo (Proxy ('(:) False ('(:) True ('[] :: [Bool]))))
-
-Since in the case of '[], the kind p is [a], and there are no arguments in the
-kind of '[]. On the other hand, in the case of '(:) True '[], the kind p is
-(forall a. [a]), but a occurs free in the first and second arguments of the
-full kind of '(:), which is (forall a. a -> [a] -> [a]). (See Trac #14060.)
-
-What happens if T is oversaturated? That is, if T's kind has fewer than n
-arguments, in the case that the concrete application instantiates a result
-kind variable with an arrow kind? If we run out of arguments, we do not attach
-a kind annotation. This should be a rare case, indeed. Here is an example:
-
-   data T1 :: k1 -> k2 -> *
-   data T2 :: k1 -> k2 -> *
-
-   type family G (a :: k) :: k
-   type instance G T1 = T2
-
-   type instance F Char = (G T1 Bool :: (* -> *) -> *)   -- F from above
-
-Here G's kind is (forall k. k -> k), and the desugared RHS of that last
-instance of F is (G (* -> (* -> *) -> *) (T1 * (* -> *)) Bool). According to
-the algorithm above, there are 3 arguments to G so we should peel off 3
-arguments in G's kind. But G's kind has only two arguments. This is the
-rare special case, and we choose not to annotate the application of G with
-a kind signature. After all, we needn't do this, since that instance would
-be reified as:
-
-   type instance F Char = G (T1 :: * -> (* -> *) -> *) Bool
-
-So the kind of G isn't ambiguous anymore due to the explicit kind annotation
-on its argument. See #8953 and test th/T8953.
--}
+reifyTyVarsToMaybe :: [TyVar] -> TcM (Maybe [TH.TyVarBndr])
+reifyTyVarsToMaybe []  = pure Nothing
+reifyTyVarsToMaybe tys = Just <$> reifyTyVars tys
 
 reify_tc_app :: TyCon -> [Type.Type] -> TcM TH.Type
 reify_tc_app tc tys
@@ -1893,8 +1998,6 @@ reify_tc_app tc tys
        ; maybe_sig_t (mkThAppTs r_tc tys') }
   where
     arity       = tyConArity tc
-    tc_binders  = tyConBinders tc
-    tc_res_kind = tyConResKind tc
 
     r_tc | isUnboxedSumTyCon tc           = TH.UnboxedSumT (arity `div` 2)
          | isUnboxedTupleTyCon tc         = TH.UnboxedTupleT (arity `div` 2)
@@ -1915,34 +2018,19 @@ reify_tc_app tc tys
          | isPromotedDataCon tc           = TH.PromotedT (reifyName tc)
          | otherwise                      = TH.ConT (reifyName tc)
 
-    -- See Note [Kind annotations on TyConApps]
+    -- See Note [When does a tycon application need an explicit kind
+    -- signature?] in TyCoRep
     maybe_sig_t th_type
-      | needs_kind_sig
-      = do { let full_kind = typeKind (mkTyConApp tc tys)
+      | tyConAppNeedsKindSig
+          False -- We don't reify types using visible kind applications, so
+                -- don't count specified binders as contributing towards
+                -- injective positions in the kind of the tycon.
+          tc (length tys)
+      = do { let full_kind = tcTypeKind (mkTyConApp tc tys)
            ; th_full_kind <- reifyKind full_kind
            ; return (TH.SigT th_type th_full_kind) }
       | otherwise
       = return th_type
-
-    needs_kind_sig
-      | GT <- compareLength tys tc_binders
-      = False
-      | otherwise
-      = let (dropped_binders, remaining_binders)
-              = splitAtList  tys tc_binders
-            result_kind  = mkTyConKind remaining_binders tc_res_kind
-            result_vars  = tyCoVarsOfType result_kind
-            dropped_vars = fvVarSet $
-                           mapUnionFV injectiveVarsOfBinder dropped_binders
-
-        in not (subVarSet result_vars dropped_vars)
-
-reifyPred :: TyCoRep.PredType -> TcM TH.Pred
-reifyPred ty
-  -- We could reify the invisible parameter as a class but it seems
-  -- nicer to support them properly...
-  | isIPPred ty = noTH (sLit "implicit parameters") (ppr ty)
-  | otherwise   = reifyType ty
 
 ------------------------------
 reifyName :: NamedThing n => n -> TH.Name
@@ -2060,9 +2148,9 @@ reifyModule (TH.Module (TH.PkgName pkgString) (TH.ModName mString)) = do
 
 ------------------------------
 mkThAppTs :: TH.Type -> [TH.Type] -> TH.Type
-mkThAppTs fun_ty arg_tys = foldl TH.AppT fun_ty arg_tys
+mkThAppTs fun_ty arg_tys = foldl' TH.AppT fun_ty arg_tys
 
-noTH :: LitString -> SDoc -> TcM a
+noTH :: PtrString -> SDoc -> TcM a
 noTH s d = failWithTc (hsep [text "Can't represent" <+> ptext s <+>
                                 text "in Template Haskell:",
                              nest 2 d])

@@ -1,5 +1,7 @@
 packages: Cabal/ cabal-testsuite/ cabal-install/
 
+write-ghc-environment-files: never
+
 package Cabal
   ghc-options: -Werror -fno-ignore-asserts
 package cabal-testsuite

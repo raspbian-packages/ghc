@@ -24,16 +24,18 @@ TARGETS=(
     # Linux ARM
     "arm-unknown-linux-gnueabihf" "armv6-unknown-linux-gnueabihf" "armv6l-unknown-linux-gnueabihf"
     "armv7-unknown-linux-gnueabihf" "armv7a-unknown-linux-gnueabi" "armv7l-unknown-linux-gnueabihf"
+    "armv7l-unknown-linux-gnueabi"
     "aarch64-unknown-linux-gnu" "aarch64-unknown-linux"
     # Linux x86
     "i386-unknown-linux-gnu" "i386-unknown-linux" "x86_64-unknown-linux-gnu" "x86_64-unknown-linux"
     # Linux Android
-    "armv7-unknown-linux-androideabi" "aarch64-unknown-linux-android"
+    "x86_64-unknown-linux-android" "armv7-unknown-linux-androideabi" "aarch64-unknown-linux-android"
     # Linux ppc64le
     "powerpc64le-unknown-linux"
 
     # FreeBSD amd64
     "amd64-portbld-freebsd"
+    "x86_64-unknown-freebsd" # See #15718
 
     # QNX
     "arm-unknown-nto-qnx-eabi"
@@ -74,7 +76,7 @@ function get_cpu_and_attr() {
     done
 }
 
-# first marker to discrimiate the first line being outputted.
+# first marker to discriminate the first line being outputted.
 FST=1
 # a dummy file to use for the clang invocation.
 FILE=_____dummy.c

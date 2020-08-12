@@ -122,8 +122,8 @@ import System.FilePath
   , isAbsolute
   , joinPath
   , makeRelative
-  , normalise
   , splitDirectories
+  , splitSearchPath
   , takeDirectory
   )
 import Data.Time (UTCTime)
@@ -143,12 +143,31 @@ Each file system object is referenced by a /path/.  There is
 normally at least one absolute path to each file system object.  In
 some operating systems, it may also be possible to have paths which
 are relative to the current directory.
+
+Unless otherwise documented:
+
+* 'IO' operations in this package may throw any 'IOError'.  No other types of
+  exceptions shall be thrown.
+
+* The list of possible 'IOErrorType's in the API documentation is not
+  exhaustive.  The full list may vary by platform and/or evolve over time.
+
 -}
 
 -----------------------------------------------------------------------------
 -- Permissions
 
 {- $permissions
+
+directory offers a limited (and quirky) interface for reading and setting file
+and directory permissions; see 'getPermissions' and 'setPermissions' for a
+discussion of their limitations.  Because permissions are very difficult to
+implement portably across different platforms, users who wish to do more
+sophisticated things with permissions are advised to use other,
+platform-specific libraries instead.  For example, if you are only interested
+in permissions on POSIX-like platforms,
+<https://hackage.haskell.org/package/unix/docs/System-Posix-Files.html unix>
+offers much more flexibility.
 
  The 'Permissions' type is used to record whether certain operations are
  permissible on a file\/directory. 'getPermissions' and 'setPermissions'
@@ -204,7 +223,7 @@ setOwnerSearchable b p = p { searchable = b }
 getPermissions :: FilePath -> IO Permissions
 getPermissions path =
   (`ioeAddLocation` "getPermissions") `modifyIOError` do
-    getAccessPermissions path
+    getAccessPermissions (emptyToCurDir path)
 
 -- | Set the permissions of a file or directory.
 --
@@ -223,7 +242,7 @@ getPermissions path =
 setPermissions :: FilePath -> Permissions -> IO ()
 setPermissions path p =
   (`ioeAddLocation` "setPermissions") `modifyIOError` do
-    setAccessPermissions path p
+    setAccessPermissions (emptyToCurDir path) p
 
 -- | Copy the permissions of one file to another.  This reproduces the
 -- permissions more accurately than using 'getPermissions' followed by
@@ -253,32 +272,32 @@ allows.
 
 The operation may fail with:
 
-* 'isPermissionError' \/ 'PermissionDenied'
+* 'isPermissionError'
 The process has insufficient privileges to perform the operation.
 @[EROFS, EACCES]@
 
-* 'isAlreadyExistsError' \/ 'AlreadyExists'
+* 'isAlreadyExistsError'
 The operand refers to a directory that already exists.
 @ [EEXIST]@
 
-* 'HardwareFault'
+* @HardwareFault@
 A physical I\/O error has occurred.
 @[EIO]@
 
-* 'InvalidArgument'
+* @InvalidArgument@
 The operand is not a valid directory name.
 @[ENAMETOOLONG, ELOOP]@
 
-* 'NoSuchThing'
+* 'isDoesNotExistError'
 There is no path to the directory.
 @[ENOENT, ENOTDIR]@
 
-* 'ResourceExhausted'
+* 'System.IO.isFullError'
 Insufficient resources (virtual memory, process file descriptors,
 physical disk space, etc.) are available to perform the operation.
 @[EDQUOT, ENOSPC, ENOMEM, EMLINK]@
 
-* 'InappropriateType'
+* @InappropriateType@
 The path refers to an existing non-directory object.
 @[EEXIST]@
 
@@ -297,7 +316,7 @@ createDirectoryIfMissing create_parents path0
   | create_parents = createDirs (parents path0)
   | otherwise      = createDirs (take 1 (parents path0))
   where
-    parents = reverse . scanl1 (</>) . splitDirectories . normalise
+    parents = reverse . scanl1 (</>) . splitDirectories . simplify
 
     createDirs []         = pure ()
     createDirs (dir:[])   = createDir dir ioError
@@ -345,31 +364,31 @@ directory).
 
 The operation may fail with:
 
-* 'HardwareFault'
+* @HardwareFault@
 A physical I\/O error has occurred.
 @[EIO]@
 
-* 'InvalidArgument'
+* @InvalidArgument@
 The operand is not a valid directory name.
 @[ENAMETOOLONG, ELOOP]@
 
-* 'isDoesNotExistError' \/ 'NoSuchThing'
+* 'isDoesNotExistError'
 The directory does not exist.
 @[ENOENT, ENOTDIR]@
 
-* 'isPermissionError' \/ 'PermissionDenied'
+* 'isPermissionError'
 The process has insufficient privileges to perform the operation.
 @[EROFS, EACCES, EPERM]@
 
-* 'UnsatisfiedConstraints'
+* @UnsatisfiedConstraints@
 Implementation-dependent constraints are not satisfied.
 @[EBUSY, ENOTEMPTY, EEXIST]@
 
-* 'UnsupportedOperation'
+* @UnsupportedOperation@
 The implementation does not support removal in this situation.
 @[EINVAL]@
 
-* 'InappropriateType'
+* @InappropriateType@
 The operand refers to an existing non-directory object.
 @[ENOTDIR]@
 
@@ -396,7 +415,7 @@ removeDirectoryRecursive path =
         ioError (err `ioeSetErrorString` "not a directory")
   where err = mkIOError InappropriateType "" Nothing (Just path)
 
--- | @'removePathRecursive' path@ removes an existing file or directory at
+-- | @removePathRecursive path@ removes an existing file or directory at
 -- /path/ together with its contents and subdirectories. Symbolic links are
 -- removed without affecting their the targets.
 removePathRecursive :: FilePath -> IO ()
@@ -408,7 +427,7 @@ removePathRecursive path =
       DirectoryLink -> removeDirectory path
       _             -> removeFile path
 
--- | @'removeContentsRecursive' dir@ removes the contents of the directory
+-- | @removeContentsRecursive dir@ removes the contents of the directory
 -- /dir/ recursively. Symbolic links are removed without affecting their the
 -- targets.
 removeContentsRecursive :: FilePath -> IO ()
@@ -471,27 +490,27 @@ use by other processes).
 
 The operation may fail with:
 
-* 'HardwareFault'
+* @HardwareFault@
 A physical I\/O error has occurred.
 @[EIO]@
 
-* 'InvalidArgument'
+* @InvalidArgument@
 The operand is not a valid file name.
 @[ENAMETOOLONG, ELOOP]@
 
-* 'isDoesNotExistError' \/ 'NoSuchThing'
+* 'isDoesNotExistError'
 The file does not exist.
 @[ENOENT, ENOTDIR]@
 
-* 'isPermissionError' \/ 'PermissionDenied'
+* 'isPermissionError'
 The process has insufficient privileges to perform the operation.
 @[EROFS, EACCES, EPERM]@
 
-* 'UnsatisfiedConstraints'
+* @UnsatisfiedConstraints@
 Implementation-dependent constraints are not satisfied.
 @[EBUSY]@
 
-* 'InappropriateType'
+* @InappropriateType@
 The operand refers to an existing directory.
 @[EPERM, EINVAL]@
 
@@ -515,35 +534,35 @@ exists.
 
 The operation may fail with:
 
-* 'HardwareFault'
+* @HardwareFault@
 A physical I\/O error has occurred.
 @[EIO]@
 
-* 'InvalidArgument'
+* @InvalidArgument@
 Either operand is not a valid directory name.
 @[ENAMETOOLONG, ELOOP]@
 
-* 'isDoesNotExistError' \/ 'NoSuchThing'
+* 'isDoesNotExistError'
 The original directory does not exist, or there is no path to the target.
 @[ENOENT, ENOTDIR]@
 
-* 'isPermissionError' \/ 'PermissionDenied'
+* 'isPermissionError'
 The process has insufficient privileges to perform the operation.
 @[EROFS, EACCES, EPERM]@
 
-* 'ResourceExhausted'
+* 'System.IO.isFullError'
 Insufficient resources are available to perform the operation.
 @[EDQUOT, ENOSPC, ENOMEM, EMLINK]@
 
-* 'UnsatisfiedConstraints'
+* @UnsatisfiedConstraints@
 Implementation-dependent constraints are not satisfied.
 @[EBUSY, ENOTEMPTY, EEXIST]@
 
-* 'UnsupportedOperation'
+* @UnsupportedOperation@
 The implementation does not support renaming in this situation.
 @[EINVAL, EXDEV]@
 
-* 'InappropriateType'
+* @InappropriateType@
 Either path refers to an existing non-directory object.
 @[ENOTDIR, EISDIR]@
 
@@ -569,35 +588,35 @@ documented.
 
 The operation may fail with:
 
-* 'HardwareFault'
+* @HardwareFault@
 A physical I\/O error has occurred.
 @[EIO]@
 
-* 'InvalidArgument'
+* @InvalidArgument@
 Either operand is not a valid file name.
 @[ENAMETOOLONG, ELOOP]@
 
-* 'isDoesNotExistError' \/ 'NoSuchThing'
+* 'isDoesNotExistError'
 The original file does not exist, or there is no path to the target.
 @[ENOENT, ENOTDIR]@
 
-* 'isPermissionError' \/ 'PermissionDenied'
+* 'isPermissionError'
 The process has insufficient privileges to perform the operation.
 @[EROFS, EACCES, EPERM]@
 
-* 'ResourceExhausted'
+* 'System.IO.isFullError'
 Insufficient resources are available to perform the operation.
 @[EDQUOT, ENOSPC, ENOMEM, EMLINK]@
 
-* 'UnsatisfiedConstraints'
+* @UnsatisfiedConstraints@
 Implementation-dependent constraints are not satisfied.
 @[EBUSY]@
 
-* 'UnsupportedOperation'
+* @UnsupportedOperation@
 The implementation does not support renaming in this situation.
 @[EXDEV]@
 
-* 'InappropriateType'
+* @InappropriateType@
 Either path refers to an existing directory.
 @[ENOTDIR, EISDIR, EINVAL, EEXIST, ENOTEMPTY]@
 
@@ -633,35 +652,35 @@ renameFile opath npath =
 --
 -- The operation may fail with:
 --
--- * 'HardwareFault'
+-- * @HardwareFault@
 -- A physical I\/O error has occurred.
 -- @[EIO]@
 --
--- * 'InvalidArgument'
+-- * @InvalidArgument@
 -- Either operand is not a valid file name.
 -- @[ENAMETOOLONG, ELOOP]@
 --
--- * 'isDoesNotExistError' \/ 'NoSuchThing'
+-- * 'isDoesNotExistError'
 -- The original file does not exist, or there is no path to the target.
 -- @[ENOENT, ENOTDIR]@
 --
--- * 'isPermissionError' \/ 'PermissionDenied'
+-- * 'isPermissionError'
 -- The process has insufficient privileges to perform the operation.
 -- @[EROFS, EACCES, EPERM]@
 --
--- * 'ResourceExhausted'
+-- * 'System.IO.isFullError'
 -- Insufficient resources are available to perform the operation.
 -- @[EDQUOT, ENOSPC, ENOMEM, EMLINK]@
 --
--- * 'UnsatisfiedConstraints'
+-- * @UnsatisfiedConstraints@
 -- Implementation-dependent constraints are not satisfied.
 -- @[EBUSY]@
 --
--- * 'UnsupportedOperation'
+-- * @UnsupportedOperation@
 -- The implementation does not support renaming in this situation.
 -- @[EXDEV]@
 --
--- * 'InappropriateType'
+-- * @InappropriateType@
 -- Either the destination path refers to an existing directory, or one of the
 -- parent segments in the destination path is not a directory.
 -- @[ENOTDIR, EISDIR, EINVAL, EEXIST, ENOTEMPTY]@
@@ -687,7 +706,7 @@ copyFile fromFPath toFPath =
       (ignoreIOExceptions . copyPermissions fromFPath)
 
 -- | Copy the contents of a source file to a destination file, replacing the
--- destination file atomically via 'withReplacementFile', resetting the
+-- destination file atomically via @withReplacementFile@, resetting the
 -- attributes of the destination file to the defaults.
 atomicCopyFileContents :: FilePath            -- ^ Source filename
                        -> FilePath            -- ^ Destination filename
@@ -755,10 +774,10 @@ copyTimesFromMetadata st dst = do
   let mtime = modificationTimeFromMetadata st
   setFileTimes dst (Just atime, Just mtime)
 
--- | Make a path absolute, 'normalise' the path, and remove as many
--- indirections from it as possible.  Any trailing path separators are
--- discarded via 'dropTrailingPathSeparator'.  Additionally, on Windows the
--- letter case of the path is canonicalized.
+-- | Make a path absolute, normalize the path, and remove as many indirections
+-- from it as possible.  Any trailing path separators are discarded via
+-- 'dropTrailingPathSeparator'.  Additionally, on Windows the letter case of
+-- the path is canonicalized.
 --
 -- __Note__: This function is a very big hammer.  If you only need an absolute
 -- path, 'makeAbsolute' is sufficient for removing dependence on the current
@@ -769,7 +788,7 @@ copyTimesFromMetadata st dst = do
 -- not point to an existing file or directory.  Canonicalization is performed
 -- on the longest prefix of the path that points to an existing file or
 -- directory.  The remaining portion of the path that does not point to an
--- existing file or directory will still undergo 'normalise', but case
+-- existing file or directory will still be normalized, but case
 -- canonicalization and indirection removal are skipped as they are impossible
 -- to do on a nonexistent path.
 --
@@ -799,8 +818,8 @@ copyTimesFromMetadata st dst = do
 -- Windows @L\\..@ refers to @.@, whereas on other operating systems @L/..@
 -- refers to @R@.
 --
--- Similar to 'normalise', passing an empty path is equivalent to passing the
--- current directory.
+-- Similar to 'System.FilePath.normalise', passing an empty path is equivalent
+-- to passing the current directory.
 --
 -- @canonicalizePath@ can resolve at least 64 indirections in a single path,
 -- more than what is supported by most operating systems.  Therefore, it may
@@ -822,8 +841,8 @@ canonicalizePath :: FilePath -> IO FilePath
 canonicalizePath = \ path ->
   ((`ioeAddLocation` "canonicalizePath") .
    (`ioeSetFileName` path)) `modifyIOError` do
-    -- normalise does more stuff, like upper-casing the drive letter
-    dropTrailingPathSeparator . normalise <$>
+    -- simplify does more stuff, like upper-casing the drive letter
+    dropTrailingPathSeparator . simplify <$>
       (canonicalizePathWith attemptRealpath =<< prependCurrentDirectory path)
   where
 
@@ -888,10 +907,10 @@ canonicalizePath = \ path ->
                   attemptRealpathWith (n - 1) mFallback' realpath path'
 
 -- | Convert a path into an absolute path.  If the given path is relative, the
--- current directory is prepended and then the combined result is
--- 'normalise'd.  If the path is already absolute, the path is simply
--- 'normalise'd.  The function preserves the presence or absence of the
--- trailing path separator unless the path refers to the root directory @/@.
+-- current directory is prepended and then the combined result is normalized.
+-- If the path is already absolute, the path is simply normalized.  The
+-- function preserves the presence or absence of the trailing path separator
+-- unless the path refers to the root directory @/@.
 --
 -- If the path is already absolute, the operation never fails.  Otherwise, the
 -- operation may fail with the same exceptions as 'getCurrentDirectory'.
@@ -902,7 +921,7 @@ makeAbsolute :: FilePath -> IO FilePath
 makeAbsolute path =
   ((`ioeAddLocation` "makeAbsolute") .
    (`ioeSetFileName` path)) `modifyIOError` do
-    matchTrailingSeparator path . normalise <$> prependCurrentDirectory path
+    matchTrailingSeparator path . simplify <$> prependCurrentDirectory path
 
 -- | Add or remove the trailing path separator in the second path so as to
 -- match its presence in the first path.
@@ -928,9 +947,10 @@ makeRelativeToCurrentDirectory x = do
 -- give you the path to GHC.
 --
 -- The path returned by @'findExecutable' name@ corresponds to the program
--- that would be executed by 'System.Process.createProcess' when passed the
--- same string (as a @RawCommand@, not a @ShellCommand@), provided that @name@
--- is not a relative path with more than one segment.
+-- that would be executed by
+-- @<http://hackage.haskell.org/package/process/docs/System-Process.html#v:createProcess createProcess>@
+-- when passed the same string (as a @RawCommand@, not a @ShellCommand@),
+-- provided that @name@ is not a relative path with more than one segment.
 --
 -- On Windows, 'findExecutable' calls the Win32 function
 -- @<https://msdn.microsoft.com/en-us/library/aa365527.aspx SearchPath>@,
@@ -1080,27 +1100,27 @@ getDirectoryContents path =
 --
 -- The operation may fail with:
 --
--- * 'HardwareFault'
+-- * @HardwareFault@
 --   A physical I\/O error has occurred.
 --   @[EIO]@
 --
--- * 'InvalidArgument'
+-- * @InvalidArgument@
 --   The operand is not a valid directory name.
 --   @[ENAMETOOLONG, ELOOP]@
 --
--- * 'isDoesNotExistError' \/ 'NoSuchThing'
+-- * 'isDoesNotExistError'
 --   The directory does not exist.
 --   @[ENOENT, ENOTDIR]@
 --
--- * 'isPermissionError' \/ 'PermissionDenied'
+-- * 'isPermissionError'
 --   The process has insufficient privileges to perform the operation.
 --   @[EACCES]@
 --
--- * 'ResourceExhausted'
+-- * 'System.IO.isFullError'
 --   Insufficient resources are available to perform the operation.
 --   @[EMFILE, ENFILE]@
 --
--- * 'InappropriateType'
+-- * @InappropriateType@
 --   The path refers to an existing non-directory object.
 --   @[ENOTDIR]@
 --
@@ -1119,22 +1139,22 @@ listDirectory path = filter f <$> getDirectoryContents path
 --
 -- The operation may fail with:
 --
--- * 'HardwareFault'
+-- * @HardwareFault@
 -- A physical I\/O error has occurred.
 -- @[EIO]@
 --
--- * 'isDoesNotExistError' or 'NoSuchThing'
+-- * 'isDoesNotExistError'
 -- There is no path referring to the working directory.
 -- @[EPERM, ENOENT, ESTALE...]@
 --
--- * 'isPermissionError' or 'PermissionDenied'
+-- * 'isPermissionError'
 -- The process has insufficient privileges to perform the operation.
 -- @[EACCES]@
 --
--- * 'ResourceExhausted'
+-- * 'System.IO.isFullError'
 -- Insufficient resources are available to perform the operation.
 --
--- * 'UnsupportedOperation'
+-- * @UnsupportedOperation@
 -- The operating system has no notion of current working directory.
 --
 getCurrentDirectory :: IO FilePath
@@ -1154,27 +1174,27 @@ getCurrentDirectory =
 --
 -- The operation may fail with:
 --
--- * 'HardwareFault'
+-- * @HardwareFault@
 -- A physical I\/O error has occurred.
 -- @[EIO]@
 --
--- * 'InvalidArgument'
+-- * @InvalidArgument@
 -- The operand is not a valid directory name.
 -- @[ENAMETOOLONG, ELOOP]@
 --
--- * 'isDoesNotExistError' or 'NoSuchThing'
+-- * 'isDoesNotExistError'
 -- The directory does not exist.
 -- @[ENOENT, ENOTDIR]@
 --
--- * 'isPermissionError' or 'PermissionDenied'
+-- * 'isPermissionError'
 -- The process has insufficient privileges to perform the operation.
 -- @[EACCES]@
 --
--- * 'UnsupportedOperation'
+-- * @UnsupportedOperation@
 -- The operating system has no notion of current working directory, or the
 -- working directory cannot be dynamically changed.
 --
--- * 'InappropriateType'
+-- * @InappropriateType@
 -- The path refers to an existing non-directory object.
 -- @[ENOTDIR]@
 --
@@ -1325,12 +1345,20 @@ removeDirectoryLink path =
   (`ioeAddLocation` "removeDirectoryLink") `modifyIOError` do
     removePathInternal linkToDirectoryIsDirectory path
 
--- | Check whether the path refers to a symbolic link.  An exception is thrown
--- if the path does not exist or is inaccessible.
+-- | Check whether an existing @path@ is a symbolic link.  If @path@ is a
+-- regular file or directory, 'False' is returned.  If @path@ does not exist
+-- or is otherwise inaccessible, an exception is thrown (see below).
 --
 -- On Windows, this checks for @FILE_ATTRIBUTE_REPARSE_POINT@.  In addition to
 -- symbolic links, the function also returns true on junction points.  On
 -- POSIX systems, this checks for @S_IFLNK@.
+--
+-- The operation may fail with:
+--
+-- * 'isDoesNotExistError' if the symbolic link does not exist; or
+--
+-- * 'isPermissionError' if the user is not permitted to read the symbolic
+--   link.
 --
 -- @since 1.3.0.0
 pathIsSymbolicLink :: FilePath -> IO Bool
@@ -1349,7 +1377,7 @@ isSymbolicLink = pathIsSymbolicLink
 --
 -- On Windows systems, this calls @DeviceIoControl@ with
 -- @FSCTL_GET_REPARSE_POINT@.  In addition to symbolic links, the function
--- also works on junction points.  On POSIX systems, this calls `readlink`.
+-- also works on junction points.  On POSIX systems, this calls @readlink@.
 --
 -- Windows-specific errors: This operation may fail with
 -- 'illegalOperationErrorType' if the file system does not support symbolic
@@ -1379,7 +1407,7 @@ getSymbolicLinkTarget path =
 getAccessTime :: FilePath -> IO UTCTime
 getAccessTime path =
   (`ioeAddLocation` "getAccessTime") `modifyIOError` do
-    accessTimeFromMetadata <$> getFileMetadata path
+    accessTimeFromMetadata <$> getFileMetadata (emptyToCurDir path)
 
 -- | Obtain the time at which the file or directory was last modified.
 --
@@ -1397,7 +1425,7 @@ getAccessTime path =
 getModificationTime :: FilePath -> IO UTCTime
 getModificationTime path =
   (`ioeAddLocation` "getModificationTime") `modifyIOError` do
-    modificationTimeFromMetadata <$> getFileMetadata path
+    modificationTimeFromMetadata <$> getFileMetadata (emptyToCurDir path)
 
 -- | Change the time at which the file or directory was last accessed.
 --
@@ -1460,7 +1488,7 @@ setFileTimes _ (Nothing, Nothing) = return ()
 setFileTimes path (atime, mtime) =
   ((`ioeAddLocation` "setFileTimes") .
    (`ioeSetFileName` path)) `modifyIOError` do
-    setTimes (normalise path)           -- handle empty paths
+    setTimes (emptyToCurDir path)
              (utcTimeToPOSIXSeconds <$> atime, utcTimeToPOSIXSeconds <$> mtime)
 
 {- | Returns the current user's home directory.
@@ -1470,13 +1498,16 @@ but note that it isn't generally considered good practice to store
 application-specific data here; use 'getXdgDirectory' or
 'getAppUserDataDirectory' instead.
 
-On Unix, 'getHomeDirectory' returns the value of the @HOME@
-environment variable.  On Windows, the system is queried for a
-suitable path; a typical path might be @C:\/Users\//\<user\>/@.
+On Unix, 'getHomeDirectory' behaves as follows:
+
+* Returns $HOME env variable if set (including to an empty string).
+* Otherwise uses home directory returned by `getpwuid_r` using the UID of the current proccesses user. This basically reads the /etc/passwd file. An empty home directory field is considered valid.
+
+On Windows, the system is queried for a suitable path; a typical path might be @C:\/Users\//\<user\>/@.
 
 The operation may fail with:
 
-* 'UnsupportedOperation'
+* @UnsupportedOperation@
 The operating system has no notion of home directory.
 
 * 'isDoesNotExistError'
@@ -1494,15 +1525,22 @@ getHomeDirectory =
 --   Compared with 'getAppUserDataDirectory', this function provides a more
 --   fine-grained hierarchy as well as greater flexibility for the user.
 --
---   It also works on Windows, although in that case 'XdgData' and 'XdgConfig'
---   will map to the same directory.
+--   On Windows, 'XdgData' and 'XdgConfig' usually map to the same directory
+--   unless overridden.
+--
+--   Refer to the docs of 'XdgDirectory' for more details.
 --
 --   The second argument is usually the name of the application.  Since it
 --   will be integrated into the path, it must consist of valid path
---   characters.
+--   characters.  Note: if the second argument is an absolute path, it will
+--   just return the second argument.
 --
 --   Note: The directory may not actually exist, in which case you would need
 --   to create it with file mode @700@ (i.e. only accessible by the owner).
+--
+--   As of 1.3.5.0, the environment variable is ignored if set to a relative
+--   path, per revised XDG Base Directory Specification.  See
+--   <https://github.com/haskell/directory/issues/100 #100>.
 --
 --   @since 1.2.3.0
 getXdgDirectory :: XdgDirectory         -- ^ which special directory
@@ -1512,13 +1550,32 @@ getXdgDirectory :: XdgDirectory         -- ^ which special directory
                 -> IO FilePath
 getXdgDirectory xdgDir suffix =
   (`ioeAddLocation` "getXdgDirectory") `modifyIOError` do
-    normalise . (</> suffix) <$> getXdgDirectoryInternal getHomeDirectory xdgDir
+    simplify . (</> suffix) <$> do
+      env <- lookupEnv $ case xdgDir of
+        XdgData   -> "XDG_DATA_HOME"
+        XdgConfig -> "XDG_CONFIG_HOME"
+        XdgCache  -> "XDG_CACHE_HOME"
+      case env of
+        Just path | isAbsolute path -> pure path
+        _                           -> getXdgDirectoryFallback getHomeDirectory xdgDir
 
+-- | Similar to 'getXdgDirectory' but retrieves the entire list of XDG
+-- directories.
+--
+-- On Windows, 'XdgDataDirs' and 'XdgConfigDirs' usually map to the same list
+-- of directories unless overridden.
+--
+-- Refer to the docs of 'XdgDirectoryList' for more details.
 getXdgDirectoryList :: XdgDirectoryList -- ^ which special directory list
                     -> IO [FilePath]
 getXdgDirectoryList xdgDirs =
   (`ioeAddLocation` "getXdgDirectoryList") `modifyIOError` do
-    getXdgDirectoryListInternal xdgDirs
+    env <- lookupEnv $ case xdgDirs of
+      XdgDataDirs   -> "XDG_DATA_DIRS"
+      XdgConfigDirs -> "XDG_CONFIG_DIRS"
+    case env of
+      Nothing    -> getXdgDirectoryListFallback xdgDirs
+      Just paths -> pure (splitSearchPath paths)
 
 -- | Obtain the path to a special directory for storing user-specific
 --   application data (traditional Unix location).  Newer applications may
@@ -1538,7 +1595,7 @@ getXdgDirectoryList xdgDirs =
 --
 --   The operation may fail with:
 --
---   * 'UnsupportedOperation'
+--   * @UnsupportedOperation@
 --     The operating system has no notion of application-specific data
 --     directory.
 --
@@ -1566,7 +1623,7 @@ suitable path; a typical path might be @C:\/Users\//\<user\>/\/Documents@.
 
 The operation may fail with:
 
-* 'UnsupportedOperation'
+* @UnsupportedOperation@
 The operating system has no notion of document directory.
 
 * 'isDoesNotExistError'
@@ -1599,7 +1656,7 @@ The Windows directory
 
 The operation may fail with:
 
-* 'UnsupportedOperation'
+* @UnsupportedOperation@
 The operating system has no notion of temporary directory.
 
 The function doesn\'t verify whether the path exists.

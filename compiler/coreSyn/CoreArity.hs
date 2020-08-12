@@ -11,7 +11,7 @@
 -- | Arity and eta expansion
 module CoreArity (
         manifestArity, joinRhsArity, exprArity, typeArity,
-        exprEtaExpandArity, findRhsArity, CheapFun, etaExpand,
+        exprEtaExpandArity, findRhsArity, etaExpand,
         etaExpandToJoinPoint, etaExpandToJoinPointRule,
         exprBotStrictness_maybe
     ) where
@@ -598,7 +598,7 @@ The analysis is easy to achieve because exprEtaExpandArity takes an
 argument
      type CheapFun = CoreExpr -> Maybe Type -> Bool
 used to decide if an expression is cheap enough to push inside a
-lambda.  And exprIsCheap' in turn takes an argument
+lambda.  And exprIsCheapX in turn takes an argument
      type CheapAppFun = Id -> Int -> Bool
 which tells when an application is cheap. This makes it easy to
 write the analysis loop.
@@ -704,6 +704,28 @@ lambda wasn't one-shot we don't want to do this.
 
 So we combine the best of the two branches, on the (slightly dodgy)
 basis that if we know one branch is one-shot, then they all must be.
+
+Note [Arity trimming]
+~~~~~~~~~~~~~~~~~~~~~
+Consider ((\x y. blah) |> co), where co :: (Int->Int->Int) ~ (Int -> F a) , and
+F is some type family.
+
+Because of Note [exprArity invariant], item (2), we must return with arity at
+most 1, because typeArity (Int -> F a) = 1.  So we have to trim the result of
+calling arityType on (\x y. blah).  Failing to do so, and hence breaking the
+exprArity invariant, led to #5441.
+
+How to trim?  For ATop, it's easy.  But we must take great care with ABot.
+Suppose the expression was (\x y. error "urk"), we'll get (ABot 2).  We
+absolutely must not trim that to (ABot 1), because that claims that
+((\x y. error "urk") |> co) diverges when given one argument, which it
+absolutely does not. And Bad Things happen if we think something returns bottom
+when it doesn't (#16066).
+
+So, do not reduce the 'n' in (ABot n); rather, switch (conservatively) to ATop.
+
+Historical note: long ago, we unconditionally switched to ATop when we
+encountered a cast, but that is far too conservative: see #5475
 -}
 
 ---------------------------
@@ -722,7 +744,9 @@ arityType :: ArityEnv -> CoreExpr -> ArityType
 arityType env (Cast e co)
   = case arityType env e of
       ATop os -> ATop (take co_arity os)
-      ABot n  -> ABot (n `min` co_arity)
+      -- See Note [Arity trimming]
+      ABot n | co_arity < n -> ATop (replicate co_arity noOneShotInfo)
+             | otherwise    -> ABot n
   where
     co_arity = length (typeArity (pSnd (coercionKind co)))
     -- See Note [exprArity invariant] (2); must be true of
@@ -937,7 +961,7 @@ etaExpand n orig_expr
           -- See Note [Eta expansion and source notes]
           (expr', args) = collectArgs expr
           (ticks, expr'') = stripTicksTop tickishFloatable expr'
-          sexpr = foldl App expr'' args
+          sexpr = foldl' App expr'' args
           retick expr = foldr mkTick expr ticks
 
                                 -- Abstraction    Application
@@ -1033,15 +1057,32 @@ mkEtaWW orig_n orig_expr in_scope orig_ty
   where
     empty_subst = mkEmptyTCvSubst in_scope
 
+    go :: Arity              -- Number of value args to expand to
+       -> TCvSubst -> Type   -- We are really looking at subst(ty)
+       -> [EtaInfo]          -- Accumulating parameter
+       -> (InScopeSet, [EtaInfo])
     go n subst ty eis       -- See Note [exprArity invariant]
+
+       ----------- Done!  No more expansion needed
        | n == 0
        = (getTCvInScope subst, reverse eis)
 
-       | Just (tv,ty') <- splitForAllTy_maybe ty
-       , let (subst', tv') = Type.substTyVarBndr subst tv
+       ----------- Forall types  (forall a. ty)
+       | Just (tcv,ty') <- splitForAllTy_maybe ty
+       , let (subst', tcv') = Type.substVarBndr subst tcv
+       = let ((n_subst, n_tcv), n_n)
+               -- We want to have at least 'n' lambdas at the top.
+               -- If tcv is a tyvar, it corresponds to one Lambda (/\).
+               --   And we won't reduce n.
+               -- If tcv is a covar, we could eta-expand the expr with one
+               --   lambda \co:ty. e co. In this case we generate a new variable
+               --   of the coercion type, update the scope, and reduce n by 1.
+               | isTyVar tcv = ((subst', tcv'), n)
+               | otherwise   = (freshEtaId n subst' (varType tcv'), n-1)
            -- Avoid free vars of the original expression
-       = go n subst' ty' (EtaVar tv' : eis)
+         in go n_n n_subst ty' (EtaVar n_tcv : eis)
 
+       ----------- Function types  (t1 -> t2)
        | Just (arg_ty, res_ty) <- splitFunTy_maybe ty
        , not (isTypeLevPoly arg_ty)
           -- See Note [Levity polymorphism invariants] in CoreSyn
@@ -1051,14 +1092,19 @@ mkEtaWW orig_n orig_expr in_scope orig_ty
            -- Avoid free vars of the original expression
        = go (n-1) subst' res_ty (EtaVar eta_id' : eis)
 
+       ----------- Newtypes
+       -- Given this:
+       --      newtype T = MkT ([T] -> Int)
+       -- Consider eta-expanding this
+       --      eta_expand 1 e T
+       -- We want to get
+       --      coerce T (\x::[T] -> (coerce ([T]->Int) e) x)
        | Just (co, ty') <- topNormaliseNewType_maybe ty
-       =        -- Given this:
-                --      newtype T = MkT ([T] -> Int)
-                -- Consider eta-expanding this
-                --      eta_expand 1 e T
-                -- We want to get
-                --      coerce T (\x::[T] -> (coerce ([T]->Int) e) x)
-         go n subst ty' (pushCoercion co eis)
+       , let co' = Coercion.substCo subst co
+             -- Remember to apply the substitution to co (#16979)
+             -- (or we could have applied to ty, but then
+             --  we'd have had to zap it for the recursive call)
+       = go n subst ty' (pushCoercion co' eis)
 
        | otherwise       -- We have an expression of arity > 0,
                          -- but its type isn't a function, or a binder
@@ -1123,8 +1169,8 @@ etaBodyForJoinPoint need_args body
       = (reverse rev_bs, e)
     go n ty subst rev_bs e
       | Just (tv, res_ty) <- splitForAllTy_maybe ty
-      , let (subst', tv') = Type.substTyVarBndr subst tv
-      = go (n-1) res_ty subst' (tv' : rev_bs) (e `App` Type (mkTyVarTy tv'))
+      , let (subst', tv') = Type.substVarBndr subst tv
+      = go (n-1) res_ty subst' (tv' : rev_bs) (e `App` varToCoreExpr tv')
       | Just (arg_ty, res_ty) <- splitFunTy_maybe ty
       , let (subst', b) = freshEtaId n subst arg_ty
       = go (n-1) res_ty subst' (b : rev_bs) (e `App` Var b)

@@ -92,11 +92,7 @@ module Distribution.Simple.PackageIndex (
   dependencyInconsistencies,
   dependencyCycles,
   dependencyGraph,
-  moduleNameIndex,
-
-  -- * Backwards compatibility
-  deleteInstalledPackageId,
-  lookupInstalledPackageId,
+  moduleNameIndex
   ) where
 
 import Prelude ()
@@ -109,7 +105,7 @@ import Distribution.ModuleName
 import qualified Distribution.InstalledPackageInfo as IPI
 import Distribution.Version
 import Distribution.Simple.Utils
-import Distribution.Types.UnqualComponentName
+import Distribution.Types.LibraryName
 
 import Control.Exception (assert)
 import Data.Array ((!))
@@ -119,6 +115,8 @@ import Data.List as List ( groupBy,  deleteBy, deleteFirstsBy )
 import qualified Data.Tree  as Tree
 import Control.Monad
 import Distribution.Compat.Stack
+
+import qualified Prelude (foldr1)
 
 -- | The collection of information about packages from one or more 'PackageDB's.
 -- These packages generally should have an instance of 'PackageInstalled'
@@ -143,7 +141,7 @@ data PackageIndex a = PackageIndex {
   --
   -- FIXME: Clarify what "preference order" means. Check that this invariant is
   -- preserved. See #1463 for discussion.
-  packageIdIndex :: !(Map (PackageName, Maybe UnqualComponentName) (Map Version [a]))
+  packageIdIndex :: !(Map (PackageName, LibraryName) (Map Version [a]))
 
   } deriving (Eq, Generic, Show, Read)
 
@@ -158,7 +156,7 @@ instance Monoid (PackageIndex IPI.InstalledPackageInfo) where
   mappend = (<>)
   --save one mappend with empty in the common case:
   mconcat [] = mempty
-  mconcat xs = foldr1 mappend xs
+  mconcat xs = Prelude.foldr1 mappend xs
 
 instance Semigroup (PackageIndex IPI.InstalledPackageInfo) where
   (<>) = merge
@@ -195,7 +193,7 @@ invariant (PackageIndex pids pnames) =
 --
 
 mkPackageIndex :: WithCallStack (Map UnitId IPI.InstalledPackageInfo
-               -> Map (PackageName, Maybe UnqualComponentName)
+               -> Map (PackageName, LibraryName)
                       (Map Version [IPI.InstalledPackageInfo])
                -> InstalledPackageIndex)
 mkPackageIndex pids pnames = assert (invariant index) index
@@ -302,19 +300,13 @@ deleteUnitId ipkgid original@(PackageIndex pids pnames) =
         (\xs -> if null xs then Nothing else Just xs)
       . List.deleteBy (\_ pkg -> installedUnitId pkg == ipkgid) undefined
 
--- | Backwards compatibility wrapper for Cabal pre-1.24.
-{-# DEPRECATED deleteInstalledPackageId "Use deleteUnitId instead. This symbol will be removed in Cabal-3.0 (est. Oct 2018)." #-}
-deleteInstalledPackageId :: UnitId -> InstalledPackageIndex
-                         -> InstalledPackageIndex
-deleteInstalledPackageId = deleteUnitId
-
 -- | Removes all packages with this source 'PackageId' from the index.
 --
 deleteSourcePackageId :: PackageId -> InstalledPackageIndex
                       -> InstalledPackageIndex
 deleteSourcePackageId pkgid original@(PackageIndex pids pnames) =
   -- NB: Doesn't delete internal packages
-  case Map.lookup (packageName pkgid, Nothing) pnames of
+  case Map.lookup (packageName pkgid, LMainLibName) pnames of
     Nothing     -> original
     Just pvers  -> case Map.lookup (packageVersion pkgid) pvers of
       Nothing   -> original
@@ -323,7 +315,7 @@ deleteSourcePackageId pkgid original@(PackageIndex pids pnames) =
                      (deletePkgName pnames)
   where
     deletePkgName =
-      Map.update deletePkgVersion (packageName pkgid, Nothing)
+      Map.update deletePkgVersion (packageName pkgid, LMainLibName)
 
     deletePkgVersion =
         (\m -> if Map.null m then Nothing else Just m)
@@ -337,12 +329,12 @@ deleteSourcePackageId pkgid original@(PackageIndex pids pnames) =
 deletePackageName :: PackageName -> InstalledPackageIndex
                   -> InstalledPackageIndex
 deletePackageName name original@(PackageIndex pids pnames) =
-  case Map.lookup (name, Nothing) pnames of
+  case Map.lookup (name, LMainLibName) pnames of
     Nothing     -> original
     Just pvers  -> mkPackageIndex
                      (foldl' (flip (Map.delete . installedUnitId)) pids
                              (concat (Map.elems pvers)))
-                     (Map.delete (name, Nothing) pnames)
+                     (Map.delete (name, LMainLibName) pnames)
 
 {-
 -- | Removes all packages satisfying this dependency from the index.
@@ -370,7 +362,7 @@ allPackages = Map.elems . unitIdIndex
 allPackagesByName :: PackageIndex a -> [(PackageName, [a])]
 allPackagesByName index =
   [ (pkgname, concat (Map.elems pvers))
-  | ((pkgname, Nothing), pvers) <- Map.toList (packageIdIndex index) ]
+  | ((pkgname, LMainLibName), pvers) <- Map.toList (packageIdIndex index) ]
 
 -- | Get all the packages from the index.
 --
@@ -382,7 +374,7 @@ allPackagesBySourcePackageId :: HasUnitId a => PackageIndex a
                              -> [(PackageId, [a])]
 allPackagesBySourcePackageId index =
   [ (packageId ipkg, ipkgs)
-  | ((_, Nothing), pvers) <- Map.toList (packageIdIndex index)
+  | ((_, LMainLibName), pvers) <- Map.toList (packageIdIndex index)
   , ipkgs@(ipkg:_) <- Map.elems pvers ]
 
 -- | Get all the packages from the index.
@@ -391,7 +383,7 @@ allPackagesBySourcePackageId index =
 --
 -- This DOES include internal libraries.
 allPackagesBySourcePackageIdAndLibName :: HasUnitId a => PackageIndex a
-                             -> [((PackageId, Maybe UnqualComponentName), [a])]
+                             -> [((PackageId, LibraryName), [a])]
 allPackagesBySourcePackageIdAndLibName index =
   [ ((packageId ipkg, ln), ipkgs)
   | ((_, ln), pvers) <- Map.toList (packageIdIndex index)
@@ -418,13 +410,6 @@ lookupComponentId :: PackageIndex a -> ComponentId
 lookupComponentId index cid =
     Map.lookup (newSimpleUnitId cid) (unitIdIndex index)
 
--- | Backwards compatibility for Cabal pre-1.24.
-{-# DEPRECATED lookupInstalledPackageId "Use lookupUnitId instead. This symbol will be removed in Cabal-3.0 (est. Oct 2018)." #-}
-lookupInstalledPackageId :: PackageIndex a -> UnitId
-                         -> Maybe a
-lookupInstalledPackageId = lookupUnitId
-
-
 -- | Does a lookup by source package id (name & version).
 --
 -- There can be multiple installed packages with the same source 'PackageId'
@@ -434,7 +419,7 @@ lookupInstalledPackageId = lookupUnitId
 lookupSourcePackageId :: PackageIndex a -> PackageId -> [a]
 lookupSourcePackageId index pkgid =
   -- Do not lookup internal libraries
-  case Map.lookup (packageName pkgid, Nothing) (packageIdIndex index) of
+  case Map.lookup (packageName pkgid, LMainLibName) (packageIdIndex index) of
     Nothing     -> []
     Just pvers  -> case Map.lookup (packageVersion pkgid) pvers of
       Nothing   -> []
@@ -454,7 +439,7 @@ lookupPackageName :: PackageIndex a -> PackageName
                   -> [(Version, [a])]
 lookupPackageName index name =
   -- Do not match internal libraries
-  case Map.lookup (name, Nothing) (packageIdIndex index) of
+  case Map.lookup (name, LMainLibName) (packageIdIndex index) of
     Nothing     -> []
     Just pvers  -> Map.toList pvers
 
@@ -469,11 +454,11 @@ lookupPackageName index name =
 --
 -- INVARIANT: List of eligible 'IPI.InstalledPackageInfo' is non-empty.
 --
-lookupDependency :: InstalledPackageIndex -> Dependency
+lookupDependency :: InstalledPackageIndex -> PackageName -> VersionRange
                  -> [(Version, [IPI.InstalledPackageInfo])]
-lookupDependency index dep =
+lookupDependency index pn vr =
     -- Yes, a little bit of a misnomer here!
-    lookupInternalDependency index dep Nothing
+    lookupInternalDependency index pn vr LMainLibName
 
 -- | Does a lookup by source package name and a range of versions.
 --
@@ -482,10 +467,10 @@ lookupDependency index dep =
 --
 -- INVARIANT: List of eligible 'IPI.InstalledPackageInfo' is non-empty.
 --
-lookupInternalDependency :: InstalledPackageIndex -> Dependency
-                 -> Maybe UnqualComponentName
+lookupInternalDependency :: InstalledPackageIndex -> PackageName -> VersionRange
+                 -> LibraryName
                  -> [(Version, [IPI.InstalledPackageInfo])]
-lookupInternalDependency index (Dependency name versionRange) libn =
+lookupInternalDependency index name versionRange libn =
   case Map.lookup (name, libn) (packageIdIndex index) of
     Nothing    -> []
     Just pvers -> [ (ver, pkgs')
@@ -522,7 +507,7 @@ lookupInternalDependency index (Dependency name versionRange) libn =
 searchByName :: PackageIndex a -> String -> SearchResult [a]
 searchByName index name =
   -- Don't match internal packages
-  case [ pkgs | pkgs@((pname, Nothing),_) <- Map.toList (packageIdIndex index)
+  case [ pkgs | pkgs@((pname, LMainLibName),_) <- Map.toList (packageIdIndex index)
               , lowercase (unPackageName pname) == lname ] of
     []               -> None
     [(_,pvers)]      -> Unambiguous (concat (Map.elems pvers))
@@ -541,7 +526,7 @@ searchByNameSubstring :: PackageIndex a -> String -> [a]
 searchByNameSubstring index searchterm =
   [ pkg
   -- Don't match internal packages
-  | ((pname, Nothing), pvers) <- Map.toList (packageIdIndex index)
+  | ((pname, LMainLibName), pvers) <- Map.toList (packageIdIndex index)
   , lsearchterm `isInfixOf` lowercase (unPackageName pname)
   , pkgs <- Map.elems pvers
   , pkg <- pkgs ]
@@ -667,7 +652,7 @@ dependencyGraph index = (graph, vertex_to_pkg, id_to_vertex)
 
 -- | We maintain the invariant that, for any 'DepUniqueKey', there
 -- is only one instance of the package in our database.
-type DepUniqueKey = (PackageName, Maybe UnqualComponentName, Map ModuleName OpenModule)
+type DepUniqueKey = (PackageName, LibraryName, Map ModuleName OpenModule)
 
 -- | Given a package index where we assume we want to use all the packages
 -- (use 'dependencyClosure' if you need to get such a index subset) find out

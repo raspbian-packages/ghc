@@ -1,5 +1,5 @@
-{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE DeriveGeneric      #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Solver.Types.PkgConfigDb
@@ -20,33 +20,27 @@ module Distribution.Solver.Types.PkgConfigDb
     , getPkgConfigDbDirs
     ) where
 
-import Prelude ()
 import Distribution.Solver.Compat.Prelude
+import Prelude ()
 
-import Control.Exception (IOException, handle)
-import qualified Data.Map as M
-import Data.Version (parseVersion)
-import Text.ParserCombinators.ReadP (readP_to_S)
-import System.FilePath (splitSearchPath)
+import           Control.Exception (IOException, handle)
+import qualified Data.Map          as M
+import           System.FilePath   (splitSearchPath)
 
-import Distribution.Package
-    ( PkgconfigName, mkPkgconfigName )
-import Distribution.Verbosity
-    ( Verbosity )
-import Distribution.Version
-    ( Version, mkVersion', VersionRange, withinRange )
-
-import Distribution.Compat.Environment
-    ( lookupEnv )
+import Distribution.Compat.Environment          (lookupEnv)
+import Distribution.Package                     (PkgconfigName, mkPkgconfigName)
+import Distribution.Parsec
 import Distribution.Simple.Program
-    ( ProgramDb, pkgConfigProgram, getProgramOutput, requireProgram )
-import Distribution.Simple.Utils
-    ( info )
+       (ProgramDb, getProgramOutput, pkgConfigProgram, needProgram)
+import Distribution.Simple.Utils                (info)
+import Distribution.Types.PkgconfigVersion
+import Distribution.Types.PkgconfigVersionRange
+import Distribution.Verbosity                   (Verbosity)
 
 -- | The list of packages installed in the system visible to
 -- @pkg-config@. This is an opaque datatype, to be constructed with
 -- `readPkgConfigDb` and queried with `pkgConfigPkgPresent`.
-data PkgConfigDb =  PkgConfigDb (M.Map PkgconfigName (Maybe Version))
+data PkgConfigDb =  PkgConfigDb (M.Map PkgconfigName (Maybe PkgconfigVersion))
                  -- ^ If an entry is `Nothing`, this means that the
                  -- package seems to be present, but we don't know the
                  -- exact version (because parsing of the version
@@ -62,44 +56,44 @@ instance Binary PkgConfigDb
 -- information.
 readPkgConfigDb :: Verbosity -> ProgramDb -> IO PkgConfigDb
 readPkgConfigDb verbosity progdb = handle ioErrorHandler $ do
-  (pkgConfig, _) <- requireProgram verbosity pkgConfigProgram progdb
-  pkgList <- lines <$> getProgramOutput verbosity pkgConfig ["--list-all"]
-  -- The output of @pkg-config --list-all@ also includes a description
-  -- for each package, which we do not need.
-  let pkgNames = map (takeWhile (not . isSpace)) pkgList
-  pkgVersions <- lines <$> getProgramOutput verbosity pkgConfig
-                             ("--modversion" : pkgNames)
-  (return . pkgConfigDbFromList . zip pkgNames) pkgVersions
-      where
-        -- For when pkg-config invocation fails (possibly because of a
-        -- too long command line).
-        ioErrorHandler :: IOException -> IO PkgConfigDb
-        ioErrorHandler e = do
-          info verbosity ("Failed to query pkg-config, Cabal will continue"
-                          ++ " without solving for pkg-config constraints: "
-                          ++ show e)
-          return NoPkgConfigDb
+    mpkgConfig <- needProgram verbosity pkgConfigProgram progdb
+    case mpkgConfig of
+      Nothing             -> noPkgConfig "Cannot find pkg-config program"
+      Just (pkgConfig, _) -> do
+        pkgList <- lines <$> getProgramOutput verbosity pkgConfig ["--list-all"]
+        -- The output of @pkg-config --list-all@ also includes a description
+        -- for each package, which we do not need.
+        let pkgNames = map (takeWhile (not . isSpace)) pkgList
+        pkgVersions <- lines <$> getProgramOutput verbosity pkgConfig
+                                   ("--modversion" : pkgNames)
+        (return . pkgConfigDbFromList . zip pkgNames) pkgVersions
+  where
+    -- For when pkg-config invocation fails (possibly because of a
+    -- too long command line).
+    noPkgConfig extra = do
+        info verbosity ("Failed to query pkg-config, Cabal will continue"
+                        ++ " without solving for pkg-config constraints: "
+                        ++ extra)
+        return NoPkgConfigDb
+
+    ioErrorHandler :: IOException -> IO PkgConfigDb
+    ioErrorHandler e = noPkgConfig (show e)
 
 -- | Create a `PkgConfigDb` from a list of @(packageName, version)@ pairs.
 pkgConfigDbFromList :: [(String, String)] -> PkgConfigDb
 pkgConfigDbFromList pairs = (PkgConfigDb . M.fromList . map convert) pairs
     where
-      convert :: (String, String) -> (PkgconfigName, Maybe Version)
-      convert (n,vs) = (mkPkgconfigName n,
-                        case (reverse . readP_to_S parseVersion) vs of
-                          (v, "") : _ -> Just (mkVersion' v)
-                          _           -> Nothing -- Version not (fully)
-                                                 -- understood.
-                       )
+      convert :: (String, String) -> (PkgconfigName, Maybe PkgconfigVersion)
+      convert (n,vs) = (mkPkgconfigName n, simpleParsec vs)
 
 -- | Check whether a given package range is satisfiable in the given
 -- @pkg-config@ database.
-pkgConfigPkgIsPresent :: PkgConfigDb -> PkgconfigName -> VersionRange -> Bool
+pkgConfigPkgIsPresent :: PkgConfigDb -> PkgconfigName -> PkgconfigVersionRange -> Bool
 pkgConfigPkgIsPresent (PkgConfigDb db) pn vr =
     case M.lookup pn db of
       Nothing       -> False    -- Package not present in the DB.
       Just Nothing  -> True     -- Package present, but version unknown.
-      Just (Just v) -> withinRange v vr
+      Just (Just v) -> withinPkgconfigVersionRange v vr
 -- If we could not read the pkg-config database successfully we allow
 -- the check to succeed. The plan found by the solver may fail to be
 -- executed later on, but we have no grounds for rejecting the plan at
@@ -111,7 +105,7 @@ pkgConfigPkgIsPresent NoPkgConfigDb _ _ = True
 -- @Nothing@ indicates the package is not in the database, while
 -- @Just Nothing@ indicates that the package is in the database,
 -- but its version is not known.
-pkgConfigDbPkgVersion :: PkgConfigDb -> PkgconfigName -> Maybe (Maybe Version)
+pkgConfigDbPkgVersion :: PkgConfigDb -> PkgconfigName -> Maybe (Maybe PkgconfigVersion)
 pkgConfigDbPkgVersion (PkgConfigDb db) pn = M.lookup pn db
 -- NB: Since the solver allows solving to succeed if there is
 -- NoPkgConfigDb, we should report that we *guess* that there
@@ -145,10 +139,11 @@ getPkgConfigDbDirs verbosity progdb =
     -- > pkg-config --variable pc_path pkg-config
     --
     getDefPath = handle ioErrorHandler $ do
-      (pkgConfig, _) <- requireProgram verbosity pkgConfigProgram progdb
-      parseSearchPath <$>
-        getProgramOutput verbosity pkgConfig
-                         ["--variable", "pc_path", "pkg-config"]
+      mpkgConfig <- needProgram verbosity pkgConfigProgram progdb
+      case mpkgConfig of
+        Nothing -> return []
+        Just (pkgConfig, _) -> parseSearchPath <$>
+          getProgramOutput verbosity pkgConfig ["--variable", "pc_path", "pkg-config"]
 
     parseSearchPath str =
       case lines str of

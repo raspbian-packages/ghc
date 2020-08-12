@@ -2,7 +2,7 @@
 #if __GLASGOW_HASKELL__ >= 703
 {-# LANGUAGE Unsafe #-}
 #endif
-{-# OPTIONS_HADDOCK hide #-}
+{-# OPTIONS_HADDOCK not-home #-}
 -- |
 -- Copyright   : 2010-2011 Simon Meier, 2010 Jasper van der Jeugt
 -- License     : BSD3-style (see LICENSE)
@@ -272,7 +272,7 @@ eitherB (BP b1 io1) (BP b2 io2) =
 -- Unicode codepoints above 127 as follows.
 --
 -- @
---charASCIIDrop = 'condB' (< '\128') ('fromF' 'char7') 'emptyB'
+--charASCIIDrop = 'condB' (< \'\\128\') ('fromF' 'char7') 'emptyB'
 -- @
 {-# INLINE CONLIKE condB #-}
 condB :: (a -> Bool) -> BoundedPrim a -> BoundedPrim a -> BoundedPrim a

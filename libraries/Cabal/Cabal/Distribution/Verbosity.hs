@@ -53,26 +53,23 @@ import Prelude ()
 import Distribution.Compat.Prelude
 
 import Distribution.ReadE
-import Distribution.Compat.ReadP
 
 import Data.List (elemIndex)
 import Data.Set (Set)
+import Distribution.Parsec
+import Distribution.Verbosity.Internal
+
 import qualified Data.Set as Set
+import qualified Distribution.Compat.CharParsing as P
 
 data Verbosity = Verbosity {
     vLevel :: VerbosityLevel,
     vFlags :: Set VerbosityFlag,
     vQuiet :: Bool
-  } deriving (Generic)
+  } deriving (Generic, Show, Read)
 
 mkVerbosity :: VerbosityLevel -> Verbosity
 mkVerbosity l = Verbosity { vLevel = l, vFlags = Set.empty, vQuiet = False }
-
-instance Show Verbosity where
-    showsPrec n = showsPrec n . vLevel
-
-instance Read Verbosity where
-    readsPrec n s = map (\(x,y) -> (mkVerbosity x,y)) (readsPrec n s)
 
 instance Eq Verbosity where
     x == y = vLevel x == vLevel y
@@ -89,11 +86,6 @@ instance Bounded Verbosity where
     maxBound = mkVerbosity maxBound
 
 instance Binary Verbosity
-
-data VerbosityLevel = Silent | Normal | Verbose | Deafening
-    deriving (Generic, Show, Read, Eq, Ord, Enum, Bounded)
-
-instance Binary VerbosityLevel
 
 -- We shouldn't print /anything/ unless an error occurs in silent mode
 silent :: Verbosity
@@ -150,40 +142,57 @@ intToVerbosity 2 = Just (mkVerbosity Verbose)
 intToVerbosity 3 = Just (mkVerbosity Deafening)
 intToVerbosity _ = Nothing
 
-parseVerbosity :: ReadP r (Either Int Verbosity)
-parseVerbosity = parseIntVerbosity <++ parseStringVerbosity
+-- | Parser verbosity
+--
+-- >>> explicitEitherParsec parsecVerbosity "normal"
+-- Right (Right (Verbosity {vLevel = Normal, vFlags = fromList [], vQuiet = False}))
+--
+-- >>> explicitEitherParsec parsecVerbosity "normal+nowrap  "
+-- Right (Right (Verbosity {vLevel = Normal, vFlags = fromList [VNoWrap], vQuiet = False}))
+--
+-- >>> explicitEitherParsec parsecVerbosity "normal+nowrap +markoutput"
+-- Right (Right (Verbosity {vLevel = Normal, vFlags = fromList [VNoWrap,VMarkOutput], vQuiet = False}))
+--
+-- >>> explicitEitherParsec parsecVerbosity "normal +nowrap +markoutput"
+-- Right (Right (Verbosity {vLevel = Normal, vFlags = fromList [VNoWrap,VMarkOutput], vQuiet = False}))
+--
+-- >>> explicitEitherParsec parsecVerbosity "normal+nowrap+markoutput"
+-- Right (Right (Verbosity {vLevel = Normal, vFlags = fromList [VNoWrap,VMarkOutput], vQuiet = False}))
+--
+-- /Note:/ this parser will eat trailing spaces.
+--
+parsecVerbosity :: CabalParsing m => m (Either Int Verbosity)
+parsecVerbosity = parseIntVerbosity <|> parseStringVerbosity
   where
-    parseIntVerbosity = fmap Left (readS_to_P reads)
+    parseIntVerbosity = fmap Left P.integral
     parseStringVerbosity = fmap Right $ do
         level <- parseVerbosityLevel
-        _ <- skipSpaces
-        extras <- sepBy parseExtra skipSpaces
+        _ <- P.spaces
+        extras <- many (parseExtra <* P.spaces)
         return (foldr (.) id extras (mkVerbosity level))
-    parseVerbosityLevel = choice
-        [ string "silent" >> return Silent
-        , string "normal" >> return Normal
-        , string "verbose" >> return Verbose
-        , string "debug"  >> return Deafening
-        , string "deafening" >> return Deafening
+    parseVerbosityLevel = P.choice
+        [ P.string "silent" >> return Silent
+        , P.string "normal" >> return Normal
+        , P.string "verbose" >> return Verbose
+        , P.string "debug"  >> return Deafening
+        , P.string "deafening" >> return Deafening
         ]
-    parseExtra = char '+' >> choice
-        [ string "callsite"  >> return verboseCallSite
-        , string "callstack" >> return verboseCallStack
-        , string "nowrap"    >> return verboseNoWrap
-        , string "markoutput" >> return verboseMarkOutput
-        , string "timestamp" >> return verboseTimestamp
+    parseExtra = P.char '+' >> P.choice
+        [ P.string "callsite"  >> return verboseCallSite
+        , P.string "callstack" >> return verboseCallStack
+        , P.string "nowrap"    >> return verboseNoWrap
+        , P.string "markoutput" >> return verboseMarkOutput
+        , P.string "timestamp" >> return verboseTimestamp
         ]
 
 flagToVerbosity :: ReadE Verbosity
-flagToVerbosity = ReadE $ \s ->
-   case readP_to_S (parseVerbosity >>= \r -> eof >> return r) s of
-       [(Left i, "")] ->
-           case intToVerbosity i of
-               Just v -> Right v
-               Nothing -> Left ("Bad verbosity: " ++ show i ++
-                                     ". Valid values are 0..3")
-       [(Right v, "")] -> Right v
-       _ -> Left ("Can't parse verbosity " ++ s)
+flagToVerbosity = parsecToReadE id $ do
+    e <- parsecVerbosity
+    case e of
+       Right v -> return v
+       Left i -> case intToVerbosity i of
+           Just v  -> return v
+           Nothing -> fail $ "Bad verbosity: " ++ show i ++ ". Valid values are 0..3"
 
 showForCabal, showForGHC :: Verbosity -> String
 
@@ -207,16 +216,6 @@ showForCabal v
 showForGHC   v = maybe (error "unknown verbosity") show $
     elemIndex v [silent,normal,__,verbose,deafening]
         where __ = silent -- this will be always ignored by elemIndex
-
-data VerbosityFlag
-    = VCallStack
-    | VCallSite
-    | VNoWrap
-    | VMarkOutput
-    | VTimestamp
-    deriving (Generic, Show, Read, Eq, Ord, Enum, Bounded)
-
-instance Binary VerbosityFlag
 
 -- | Turn on verbose call-site printing when we log.
 verboseCallSite :: Verbosity -> Verbosity

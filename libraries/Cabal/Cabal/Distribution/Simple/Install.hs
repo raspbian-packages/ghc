@@ -56,8 +56,8 @@ import System.FilePath
          ( takeFileName, takeDirectory, (</>), isRelative )
 
 import Distribution.Verbosity
-import Distribution.Text
-         ( display )
+import Distribution.Pretty
+         ( prettyShow )
 
 -- |Perform the \"@.\/setup install@\" and \"@.\/setup copy@\"
 -- actions.  Move files into place based on the prefix argument.
@@ -97,21 +97,10 @@ copyPackage verbosity pkg_descr lbi distPref copydest = do
       -- per-component (data files and Haddock files.)
       InstallDirs {
          datadir    = dataPref,
-         -- NB: The situation with Haddock is a bit delicate.  On the
-         -- one hand, the easiest to understand Haddock documentation
-         -- path is pkgname-0.1, which means it's per-package (not
-         -- per-component).  But this means that it's impossible to
-         -- install Haddock documentation for internal libraries.  We'll
-         -- keep this constraint for now; this means you can't use
-         -- Cabal to Haddock internal libraries.  This does not seem
-         -- like a big problem.
          docdir     = docPref,
          htmldir    = htmlPref,
-         haddockdir = interfacePref}
-             -- Notice use of 'absoluteInstallDirs' (not the
-             -- per-component variant).  This means for non-library
-             -- packages we'll just pick a nondescriptive foo-0.1
-             = absoluteInstallDirs pkg_descr lbi copydest
+         haddockdir = interfacePref
+      } = absoluteInstallCommandDirs pkg_descr lbi (localUnitId lbi) copydest
 
   -- Install (package-global) data files
   installDataFiles verbosity pkg_descr dataPref
@@ -161,12 +150,12 @@ copyComponent verbosity pkg_descr lbi (CLib lib) clbi copydest = do
             libdir = libPref,
             dynlibdir = dynlibPref,
             includedir = incPref
-            } = absoluteComponentInstallDirs pkg_descr lbi (componentUnitId clbi) copydest
+            } = absoluteInstallCommandDirs pkg_descr lbi (componentUnitId clbi) copydest
         buildPref = componentBuildDir lbi clbi
 
     case libName lib of
-        Nothing -> noticeNoWrap verbosity ("Installing library in " ++ libPref)
-        Just n -> noticeNoWrap verbosity ("Installing internal library " ++ display n ++ " in " ++ libPref)
+        LMainLibName  -> noticeNoWrap verbosity ("Installing library in " ++ libPref)
+        LSubLibName n -> noticeNoWrap verbosity ("Installing internal library " ++ prettyShow n ++ " in " ++ libPref)
 
     -- install include files for all compilers - they may be needed to compile
     -- haskell files (using the CPP extension)
@@ -179,7 +168,7 @@ copyComponent verbosity pkg_descr lbi (CLib lib) clbi copydest = do
       HaskellSuite _ -> HaskellSuite.installLib
                                 verbosity lbi libPref dynlibPref buildPref pkg_descr lib clbi
       _ -> die' verbosity $ "installing with "
-              ++ display (compilerFlavor (compiler lbi))
+              ++ prettyShow (compilerFlavor (compiler lbi))
               ++ " is not implemented"
 
 copyComponent verbosity pkg_descr lbi (CFLib flib) clbi copydest = do
@@ -194,8 +183,9 @@ copyComponent verbosity pkg_descr lbi (CFLib flib) clbi copydest = do
 
     case compilerFlavor (compiler lbi) of
       GHC   -> GHC.installFLib   verbosity lbi flibPref buildPref pkg_descr flib
+      GHCJS -> GHCJS.installFLib verbosity lbi flibPref buildPref pkg_descr flib
       _ -> die' verbosity $ "installing foreign lib with "
-              ++ display (compilerFlavor (compiler lbi))
+              ++ prettyShow (compilerFlavor (compiler lbi))
               ++ " is not implemented"
 
 copyComponent verbosity pkg_descr lbi (CExe exe) clbi copydest = do
@@ -210,7 +200,7 @@ copyComponent verbosity pkg_descr lbi (CExe exe) clbi copydest = do
         progPrefixPref = substPathTemplate pkgid lbi uid (progPrefix lbi)
         progSuffixPref = substPathTemplate pkgid lbi uid (progSuffix lbi)
         progFix = (progPrefixPref, progSuffixPref)
-    noticeNoWrap verbosity ("Installing executable " ++ display (exeName exe)
+    noticeNoWrap verbosity ("Installing executable " ++ prettyShow (exeName exe)
                       ++ " in " ++ binPref)
     inPath <- isInSearchPath binPref
     when (not inPath) $
@@ -222,7 +212,7 @@ copyComponent verbosity pkg_descr lbi (CExe exe) clbi copydest = do
       UHC   -> return ()
       HaskellSuite {} -> return ()
       _ -> die' verbosity $ "installing with "
-              ++ display (compilerFlavor (compiler lbi))
+              ++ prettyShow (compilerFlavor (compiler lbi))
               ++ " is not implemented"
 
 -- Nothing to do for benchmark/testsuite
@@ -233,17 +223,17 @@ copyComponent _ _ _ (CTest _) _ _ = return ()
 --
 installDataFiles :: Verbosity -> PackageDescription -> FilePath -> IO ()
 installDataFiles verbosity pkg_descr destDataDir =
-  flip traverse_ (dataFiles pkg_descr) $ \ file -> do
+  flip traverse_ (dataFiles pkg_descr) $ \ glob -> do
     let srcDataDirRaw = dataDir pkg_descr
         srcDataDir = if null srcDataDirRaw
           then "."
           else srcDataDirRaw
-    files <- matchDirFileGlob verbosity (specVersion pkg_descr) srcDataDir file
-    let dir = takeDirectory file
-    createDirectoryIfMissingVerbose verbosity True (destDataDir </> dir)
-    sequence_ [ installOrdinaryFile verbosity (srcDataDir  </> file')
-                                              (destDataDir </> file')
-              | file' <- files ]
+    files <- matchDirFileGlob verbosity (specVersion pkg_descr) srcDataDir glob
+    for_ files $ \ file' -> do
+      let src = srcDataDir </> file'
+          dst = destDataDir </> file'
+      createDirectoryIfMissingVerbose verbosity True (takeDirectory dst)
+      installOrdinaryFile verbosity src dst
 
 -- | Install the files listed in install-includes for a library
 --

@@ -60,7 +60,7 @@
 module Distribution.Make (
         module Distribution.Package,
         License(..), Version,
-        defaultMain, defaultMainArgs, defaultMainNoRead
+        defaultMain, defaultMainArgs
   ) where
 
 import Prelude ()
@@ -70,7 +70,6 @@ import Distribution.Compat.Prelude
 import Distribution.Compat.Exception
 import Distribution.Package
 import Distribution.Simple.Program
-import Distribution.PackageDescription
 import Distribution.Simple.Setup
 import Distribution.Simple.Command
 
@@ -78,7 +77,7 @@ import Distribution.Simple.Utils
 
 import Distribution.License
 import Distribution.Version
-import Distribution.Text
+import Distribution.Pretty
 
 import System.Environment (getArgs, getProgName)
 import System.Exit
@@ -88,10 +87,6 @@ defaultMain = getArgs >>= defaultMainArgs
 
 defaultMainArgs :: [String] -> IO ()
 defaultMainArgs = defaultMainHelper
-
-{-# DEPRECATED defaultMainNoRead "it ignores its PackageDescription arg" #-}
-defaultMainNoRead :: PackageDescription -> IO ()
-defaultMainNoRead = const defaultMain
 
 defaultMainHelper :: [String] -> IO ()
 defaultMainHelper args =
@@ -114,9 +109,9 @@ defaultMainHelper args =
     printErrors errs = do
       putStr (intercalate "\n" errs)
       exitWith (ExitFailure 1)
-    printNumericVersion = putStrLn $ display cabalVersion
+    printNumericVersion = putStrLn $ prettyShow cabalVersion
     printVersion        = putStrLn $ "Cabal library version "
-                                  ++ display cabalVersion
+                                  ++ prettyShow cabalVersion
 
     progs = defaultProgramDb
     commands =

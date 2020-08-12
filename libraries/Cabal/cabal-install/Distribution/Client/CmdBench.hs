@@ -20,10 +20,10 @@ import Distribution.Client.Setup
          ( GlobalFlags, ConfigFlags(..), ConfigExFlags, InstallFlags )
 import qualified Distribution.Client.Setup as Client
 import Distribution.Simple.Setup
-         ( HaddockFlags, fromFlagOrDefault )
+         ( HaddockFlags, TestFlags, fromFlagOrDefault )
 import Distribution.Simple.Command
          ( CommandUI(..), usageAlternatives )
-import Distribution.Text
+import Distribution.Deprecated.Text
          ( display )
 import Distribution.Verbosity
          ( Verbosity, normal )
@@ -33,11 +33,11 @@ import Distribution.Simple.Utils
 import Control.Monad (when)
 
 
-benchCommand :: CommandUI (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
+benchCommand :: CommandUI (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags, TestFlags)
 benchCommand = Client.installCommand {
-  commandName         = "new-bench",
+  commandName         = "v2-bench",
   commandSynopsis     = "Run benchmarks",
-  commandUsage        = usageAlternatives "new-bench" [ "[TARGETS] [FLAGS]" ],
+  commandUsage        = usageAlternatives "v2-bench" [ "[TARGETS] [FLAGS]" ],
   commandDescription  = Just $ \_ -> wrapText $
         "Runs the specified benchmarks, first ensuring they are up to "
      ++ "date.\n\n"
@@ -53,13 +53,13 @@ benchCommand = Client.installCommand {
      ++ "'cabal.project.local' and other files.",
   commandNotes        = Just $ \pname ->
         "Examples:\n"
-     ++ "  " ++ pname ++ " new-bench\n"
+     ++ "  " ++ pname ++ " v2-bench\n"
      ++ "    Run all the benchmarks in the package in the current directory\n"
-     ++ "  " ++ pname ++ " new-bench pkgname\n"
+     ++ "  " ++ pname ++ " v2-bench pkgname\n"
      ++ "    Run all the benchmarks in the package named pkgname\n"
-     ++ "  " ++ pname ++ " new-bench cname\n"
+     ++ "  " ++ pname ++ " v2-bench cname\n"
      ++ "    Run the benchmark named cname\n"
-     ++ "  " ++ pname ++ " new-bench cname -O2\n"
+     ++ "  " ++ pname ++ " v2-bench cname -O2\n"
      ++ "    Run the benchmark built with '-O2' (including local libs used)\n\n"
 
      ++ cmdCommonHelpTextNewBuildBeta
@@ -73,12 +73,12 @@ benchCommand = Client.installCommand {
 -- For more details on how this works, see the module
 -- "Distribution.Client.ProjectOrchestration"
 --
-benchAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
+benchAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags, TestFlags)
             -> [String] -> GlobalFlags -> IO ()
-benchAction (configFlags, configExFlags, installFlags, haddockFlags)
+benchAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags)
             targetStrings globalFlags = do
 
-    baseCtx <- establishProjectBaseContext verbosity cliConfig
+    baseCtx <- establishProjectBaseContext verbosity cliConfig OtherCommand
 
     targetSelectors <- either (reportTargetSelectorProblems verbosity) return
                    =<< readTargetSelectors (localPackages baseCtx) (Just BenchKind) targetStrings
@@ -117,7 +117,9 @@ benchAction (configFlags, configExFlags, installFlags, haddockFlags)
     verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
     cliConfig = commandLineFlagsToProjectConfig
                   globalFlags configFlags configExFlags
-                  installFlags haddockFlags
+                  installFlags
+                  mempty -- ClientInstallFlags, not needed here
+                  haddockFlags testFlags
 
 -- | This defines what a 'TargetSelector' means for the @bench@ command.
 -- It selects the 'AvailableTarget's that the 'TargetSelector' refers to,

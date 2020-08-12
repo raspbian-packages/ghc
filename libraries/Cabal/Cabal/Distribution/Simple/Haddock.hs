@@ -32,12 +32,14 @@ import qualified Distribution.Simple.GHCJS as GHCJS
 
 -- local
 import Distribution.Backpack.DescribeUnitId
+import Distribution.Backpack (OpenModule)
 import Distribution.Types.ForeignLib
 import Distribution.Types.UnqualComponentName
 import Distribution.Types.ComponentLocalBuildInfo
 import Distribution.Types.ExecutableScope
 import Distribution.Types.LocalBuildInfo
 import Distribution.Types.TargetInfo
+import Distribution.Types.ExposedModule
 import Distribution.Package
 import qualified Distribution.ModuleName as ModuleName
 import Distribution.PackageDescription as PD hiding (Flag)
@@ -60,9 +62,11 @@ import qualified Distribution.InstalledPackageInfo as InstalledPackageInfo
 import Distribution.InstalledPackageInfo ( InstalledPackageInfo )
 import Distribution.Simple.Utils
 import Distribution.System
-import Distribution.Text
+import Distribution.Pretty
+import Distribution.Parsec (simpleParsec)
 import Distribution.Utils.NubList
 import Distribution.Version
+
 import Distribution.Verbosity
 import Language.Haskell.Extension
 
@@ -114,6 +118,8 @@ data HaddockArgs = HaddockArgs {
  -- ^ Additional flags to pass to GHC.
  argGhcLibDir :: Flag FilePath,
  -- ^ To find the correct GHC, required.
+ argReexports :: [OpenModule],
+ -- ^ Re-exported modules
  argTargets :: [FilePath]
  -- ^ Modules to process.
 } deriving Generic
@@ -192,7 +198,7 @@ haddock pkg_descr lbi suffixes flags' = do
 
     haddockGhcVersionStr <- getProgramOutput verbosity haddockProg
                               ["--ghc-version"]
-    case (simpleParse haddockGhcVersionStr, compilerCompatVersion GHC comp) of
+    case (simpleParsec haddockGhcVersionStr, compilerCompatVersion GHC comp) of
       (Nothing, _) -> die' verbosity "Could not get GHC version from Haddock"
       (_, Nothing) -> die' verbosity "Could not get GHC version from compiler"
       (Just haddockGhcVersion, Just ghcVersion)
@@ -200,8 +206,8 @@ haddock pkg_descr lbi suffixes flags' = do
         | otherwise -> die' verbosity $
                "Haddock's internal GHC version must match the configured "
             ++ "GHC version.\n"
-            ++ "The GHC version is " ++ display ghcVersion ++ " but "
-            ++ "haddock is using GHC version " ++ display haddockGhcVersion
+            ++ "The GHC version is " ++ prettyShow ghcVersion ++ " but "
+            ++ "haddock is using GHC version " ++ prettyShow haddockGhcVersion
 
     -- the tools match the requests, we can proceed
 
@@ -273,7 +279,9 @@ haddock pkg_descr lbi suffixes flags' = do
               runHaddock verbosity tmpFileOpts comp platform haddockProg libArgs'
 
               case libName lib of
-                Just _ -> do
+                LMainLibName ->
+                  pure index
+                LSubLibName _ -> do
                   pwd <- getCurrentDirectory
 
                   let
@@ -291,8 +299,6 @@ haddock pkg_descr lbi suffixes flags' = do
                     }
 
                   return $ PackageIndex.insert ipi index
-                Nothing ->
-                  pure index
 
         CFLib flib -> (when (flag haddockForeignLibs) $ do
           withTempDirectoryEx verbosity tmpFileOpts (buildDir lbi') "tmp" $
@@ -357,7 +363,7 @@ fromPackageDescription haddockTarget pkg_descr =
              }
       where
         desc = PD.description pkg_descr
-        showPkg = display (packageId pkg_descr)
+        showPkg = prettyShow (packageId pkg_descr)
         subtitle | null (synopsis pkg_descr) = ""
                  | otherwise                 = ": " ++ synopsis pkg_descr
 
@@ -408,10 +414,11 @@ mkHaddockArgs verbosity tmp lbi clbi htmlTemplate haddockVersion inFiles bi = do
             else die' verbosity $ "Must have vanilla or shared libraries "
                        ++ "enabled in order to run haddock"
 
-    return ifaceArgs {
-      argGhcOptions  = opts,
-      argTargets     = inFiles
-    }
+    return ifaceArgs
+      { argGhcOptions  = opts
+      , argTargets     = inFiles
+      , argReexports   = getReexports clbi
+      }
 
 fromLibrary :: Verbosity
             -> FilePath
@@ -494,6 +501,11 @@ getInterfaces verbosity lbi clbi htmlTemplate = do
     return $ mempty {
                  argInterfaces = packageFlags
                }
+
+getReexports :: ComponentLocalBuildInfo -> [OpenModule]
+getReexports LibComponentLocalBuildInfo {componentExposedModules = mods } =
+    mapMaybe exposedReexport mods
+getReexports _ = []
 
 getGhcCppOpts :: Version
               -> BuildInfo
@@ -585,7 +597,7 @@ renderArgs verbosity tmpFileOpts version comp platform args k = do
                               Hoogle -> pkgstr <.> "txt")
              $ arg argOutput
             where
-              pkgstr = display $ packageName pkgid
+              pkgstr = prettyShow $ packageName pkgid
               pkgid = arg argPackageName
       arg f = fromFlag $ f args
 
@@ -595,8 +607,8 @@ renderPureArgs version comp platform args = concat
       . fromFlag . argInterfaceFile $ args
 
     , if isVersion 2 16
-        then (\pkg -> [ "--package-name=" ++ display (pkgName pkg)
-                      , "--package-version="++display (pkgVersion pkg)
+        then (\pkg -> [ "--package-name=" ++ prettyShow (pkgName pkg)
+                      , "--package-version=" ++ prettyShow (pkgVersion pkg)
                       ])
              . fromFlag . argPackageName $ args
         else []
@@ -609,7 +621,7 @@ renderPureArgs version comp platform args = concat
     , [ "--hyperlinked-source" | isVersion 2 17
                                , fromFlag . argLinkedSource $ args ]
 
-    , (\(All b,xs) -> bool (map (("--hide=" ++). display) xs) [] b)
+    , (\(All b,xs) -> bool (map (("--hide=" ++) . prettyShow) xs) [] b)
                      . argHideModules $ args
 
     , bool ["--ignore-all-exports"] [] . getAny . argIgnoreExports $ args
@@ -644,6 +656,12 @@ renderPureArgs version comp platform args = concat
 
     , maybe [] (\l -> ["-B"++l]) $
       flagToMaybe (argGhcLibDir args) -- error if Nothing?
+
+      -- https://github.com/haskell/haddock/pull/547
+    , [ "--reexport=" ++ prettyShow r
+      | r <- argReexports args
+      , isVersion 2 19
+      ]
 
     , argTargets $ args
     ]
@@ -717,7 +735,7 @@ haddockPackagePaths ipkgs mkHtmlPath = do
   let missing = [ pkgid | Left pkgid <- interfaces ]
       warning = "The documentation for the following packages are not "
              ++ "installed. No links will be generated to these packages: "
-             ++ intercalate ", " (map display missing)
+             ++ intercalate ", " (map prettyShow missing)
       flags = rights interfaces
 
   return (flags, if null missing then Nothing else Just warning)

@@ -8,7 +8,7 @@ import Prelude ()
 import Distribution.Compat.Prelude
 import Distribution.Compat.Lens
 
-import Distribution.Compiler                  (CompilerFlavor)
+import Distribution.Compiler                  (PerCompilerFlavor)
 import Distribution.ModuleName                (ModuleName)
 import Distribution.Types.BuildInfo           (BuildInfo)
 import Distribution.Types.Dependency          (Dependency)
@@ -144,6 +144,10 @@ class HasBuildInfo a where
    extraLibFlavours = buildInfo . extraLibFlavours
    {-# INLINE extraLibFlavours #-}
 
+   extraDynLibFlavours :: Lens' a [String]
+   extraDynLibFlavours = buildInfo . extraDynLibFlavours
+   {-# INLINE extraDynLibFlavours #-}
+
    extraLibDirs :: Lens' a [String]
    extraLibDirs = buildInfo . extraLibDirs
    {-# INLINE extraLibDirs #-}
@@ -156,23 +160,27 @@ class HasBuildInfo a where
    includes = buildInfo . includes
    {-# INLINE includes #-}
 
+   autogenIncludes :: Lens' a [FilePath]
+   autogenIncludes = buildInfo . autogenIncludes
+   {-# INLINE autogenIncludes #-}
+
    installIncludes :: Lens' a [FilePath]
    installIncludes = buildInfo . installIncludes
    {-# INLINE installIncludes #-}
 
-   options :: Lens' a [(CompilerFlavor,[String])]
+   options :: Lens' a (PerCompilerFlavor [String])
    options = buildInfo . options
    {-# INLINE options #-}
 
-   profOptions :: Lens' a [(CompilerFlavor,[String])]
+   profOptions :: Lens' a (PerCompilerFlavor [String])
    profOptions = buildInfo . profOptions
    {-# INLINE profOptions #-}
 
-   sharedOptions :: Lens' a [(CompilerFlavor,[String])]
+   sharedOptions :: Lens' a (PerCompilerFlavor [String])
    sharedOptions = buildInfo . sharedOptions
    {-# INLINE sharedOptions #-}
 
-   staticOptions :: Lens' a [(CompilerFlavor,[String])]
+   staticOptions :: Lens' a (PerCompilerFlavor [String])
    staticOptions = buildInfo . staticOptions
    {-# INLINE staticOptions #-}
 
@@ -283,6 +291,9 @@ instance HasBuildInfo BuildInfo where
     extraLibFlavours f s = fmap (\x -> s { T.extraLibFlavours = x }) (f (T.extraLibFlavours s))
     {-# INLINE extraLibFlavours #-}
 
+    extraDynLibFlavours f s = fmap (\x -> s { T.extraDynLibFlavours = x}) (f (T.extraDynLibFlavours s))
+    {-# INLINE extraDynLibFlavours #-}
+
     extraLibDirs f s = fmap (\x -> s { T.extraLibDirs = x }) (f (T.extraLibDirs s))
     {-# INLINE extraLibDirs #-}
 
@@ -291,6 +302,9 @@ instance HasBuildInfo BuildInfo where
 
     includes f s = fmap (\x -> s { T.includes = x }) (f (T.includes s))
     {-# INLINE includes #-}
+
+    autogenIncludes f s = fmap (\x -> s { T.autogenIncludes = x }) (f (T.autogenIncludes s))
+    {-# INLINE autogenIncludes #-}
 
     installIncludes f s = fmap (\x -> s { T.installIncludes = x }) (f (T.installIncludes s))
     {-# INLINE installIncludes #-}

@@ -20,27 +20,21 @@
 module Haddock.Interface.Create (createInterface) where
 
 import Documentation.Haddock.Doc (metaDocAppend)
-import Documentation.Haddock.Utf8 as Utf8
 import Haddock.Types
 import Haddock.Options
 import Haddock.GhcUtils
 import Haddock.Utils
 import Haddock.Convert
 import Haddock.Interface.LexParseRn
-import Haddock.Backends.Hyperlinker.Types
-import Haddock.Backends.Hyperlinker.Ast as Hyperlinker
-import Haddock.Backends.Hyperlinker.Parser as Hyperlinker
 
 import Data.Bifunctor
 import Data.Bitraversable
-import qualified Data.ByteString as BS
 import qualified Data.Map as M
 import Data.Map (Map)
 import Data.List
 import Data.Maybe
 import Data.Ord
 import Control.Applicative
-import Control.Exception (evaluate)
 import Control.Monad
 import Data.Traversable
 
@@ -59,9 +53,8 @@ import Bag
 import RdrName
 import TcRnTypes
 import FastString ( unpackFS, fastStringToByteString)
-import BasicTypes ( StringLiteral(..), SourceText(..) )
+import BasicTypes ( StringLiteral(..), SourceText(..), PromotionFlag(..) )
 import qualified Outputable as O
-import HsDecls ( getConArgs )
 
 
 -- | Use a 'TypecheckedModule' to produce an 'Interface'.
@@ -85,13 +78,14 @@ createInterface tm flags modMap instIfaceMap = do
       !instances     = modInfoInstances mi
       !fam_instances = md_fam_insts md
       !exportedNames = modInfoExportsWithSelectors mi
-      (pkgNameFS, _) = modulePackageInfo dflags flags mdl
+      (pkgNameFS, _) = modulePackageInfo dflags flags (Just mdl)
       pkgName        = fmap (unpackFS . (\(PackageName n) -> n)) pkgNameFS
 
       (TcGblEnv { tcg_rdr_env = gre
                 , tcg_warns   = warnings
-                , tcg_exports = all_exports
+                , tcg_exports = all_exports0
                 }, md) = tm_internals_ tm
+      all_local_avails = gresToAvailInfo . filter isLocalGRE . globalRdrEnvElts $ gre
 
   -- The 'pkgName' is necessary to decide what package to mention in "@since"
   -- annotations. Not having it is not fatal though.
@@ -117,10 +111,10 @@ createInterface tm flags modMap instIfaceMap = do
 
   let declsWithDocs = topDecls group_
 
-      exports0 = fmap (reverse . map (first unLoc)) mayExports
-      exports
-        | OptIgnoreExports `elem` opts = Nothing
-        | otherwise = exports0
+      exports0 = fmap (map (first unLoc)) mayExports
+      (all_exports, exports)
+        | OptIgnoreExports `elem` opts = (all_local_avails, Nothing)
+        | otherwise = (all_exports0, exports0)
 
       unrestrictedImportedMods
         -- module re-exports are only possible with
@@ -132,8 +126,8 @@ createInterface tm flags modMap instIfaceMap = do
       fixMap = mkFixMap group_
       (decls, _) = unzip declsWithDocs
       localInsts = filter (nameIsLocalOrFrom sem_mdl)
-                        $  map getName instances
-                        ++ map getName fam_instances
+                        $  map getName fam_instances
+                        ++ map getName instances
       -- Locations of all TH splices
       splices = [ l | L l (SpliceD _ _) <- hsmodDecls hsm ]
 
@@ -170,8 +164,6 @@ createInterface tm flags modMap instIfaceMap = do
 
   modWarn <- liftErrMsg (moduleWarning dflags gre warnings)
 
-  tokenizedSrc <- mkMaybeTokenizedSrc dflags flags tm
-
   return $! Interface {
     ifaceMod               = mdl
   , ifaceIsSig             = is_sig
@@ -197,7 +189,8 @@ createInterface tm flags modMap instIfaceMap = do
   , ifaceRnOrphanInstances = [] -- Filled in `renameInterface`
   , ifaceHaddockCoverage   = coverage
   , ifaceWarningMap        = warningMap
-  , ifaceTokenizedSrc      = tokenizedSrc
+  , ifaceHieFile           = Just $ ml_hie_file $ ms_location ms
+  , ifaceDynFlags          = dflags
   }
 
 
@@ -899,7 +892,7 @@ hiDecl dflags t = do
     Nothing -> do
       liftErrMsg $ tell ["Warning: Not found in environment: " ++ pretty dflags t]
       return Nothing
-    Just x -> case tyThingToLHsDecl x of
+    Just x -> case tyThingToLHsDecl ShowRuntimeRep x of
       Left m -> liftErrMsg (tell [bugWarn m]) >> return Nothing
       Right (m, t') -> liftErrMsg (tell $ map bugWarn m)
                       >> return (Just $ noLoc t')
@@ -1077,8 +1070,8 @@ extractDecl declMap name decl
       TyClD _ d@DataDecl {} ->
         let (n, tyvar_tys) = (tcdName d, lHsQTyVarsToTypes (tyClDeclTyVars d))
         in if isDataConName name
-           then SigD noExt <$> extractPatternSyn name n tyvar_tys (dd_cons (tcdDataDefn d))
-           else SigD noExt <$> extractRecSel name n tyvar_tys (dd_cons (tcdDataDefn d))
+           then SigD noExt <$> extractPatternSyn name n (map HsValArg tyvar_tys) (dd_cons (tcdDataDefn d))
+           else SigD noExt <$> extractRecSel name n (map HsValArg tyvar_tys) (dd_cons (tcdDataDefn d))
       TyClD _ FamDecl {}
         | isValName name
         , Just (famInst:_) <- M.lookup name declMap
@@ -1113,10 +1106,11 @@ extractDecl declMap name decl
             in case matches of
               [d0] -> extractDecl declMap name (noLoc . InstD noExt $ DataFamInstD noExt d0)
               _ -> error "internal: extractDecl (ClsInstD)"
-      _ -> error "internal: extractDecl"
+      _ -> O.pprPanic "extractDecl" $
+        O.text "Unhandled decl for" O.<+> O.ppr name O.<> O.text ":"
+        O.$$ O.nest 4 (O.ppr decl)
 
-
-extractPatternSyn :: Name -> Name -> [LHsType GhcRn] -> [LConDecl GhcRn] -> LSig GhcRn
+extractPatternSyn :: Name -> Name -> [LHsTypeArg GhcRn] -> [LConDecl GhcRn] -> LSig GhcRn
 extractPatternSyn nm t tvs cons =
   case filter matches cons of
     [] -> error "extractPatternSyn: constructor pattern not found"
@@ -1144,9 +1138,13 @@ extractPatternSyn nm t tvs cons =
 
   data_ty con
     | ConDeclGADT{} <- con = con_res_ty con
-    | otherwise = foldl' (\x y -> noLoc (HsAppTy noExt x y)) (noLoc (HsTyVar noExt NotPromoted (noLoc t))) tvs
+    | otherwise = foldl' (\x y -> noLoc (mkAppTyArg x y)) (noLoc (HsTyVar noExt NotPromoted (noLoc t))) tvs
+                    where mkAppTyArg :: LHsType GhcRn -> LHsTypeArg GhcRn -> HsType GhcRn
+                          mkAppTyArg f (HsValArg ty) = HsAppTy noExt f ty
+                          mkAppTyArg f (HsTypeArg l ki) = HsAppKindTy l f ki
+                          mkAppTyArg f (HsArgPar _) = HsParTy noExt f
 
-extractRecSel :: Name -> Name -> [LHsType GhcRn] -> [LConDecl GhcRn]
+extractRecSel :: Name -> Name -> [LHsTypeArg GhcRn] -> [LConDecl GhcRn]
               -> LSig GhcRn
 extractRecSel _ _ _ [] = error "extractRecSel: selector not found"
 
@@ -1162,7 +1160,11 @@ extractRecSel nm t tvs (L _ con : rest) =
   data_ty
     -- ResTyGADT _ ty <- con_res con = ty
     | ConDeclGADT{} <- con = con_res_ty con
-    | otherwise = foldl' (\x y -> noLoc (HsAppTy noExt x y)) (noLoc (HsTyVar noExt NotPromoted (noLoc t))) tvs
+    | otherwise = foldl' (\x y -> noLoc (mkAppTyArg x y)) (noLoc (HsTyVar noExt NotPromoted (noLoc t))) tvs
+                   where mkAppTyArg :: LHsType GhcRn -> LHsTypeArg GhcRn -> HsType GhcRn
+                         mkAppTyArg f (HsValArg ty) = HsAppTy noExt f ty
+                         mkAppTyArg f (HsTypeArg l ki) = HsAppKindTy l f ki
+                         mkAppTyArg f (HsArgPar _) = HsParTy noExt f
 
 -- | Keep export items with docs.
 pruneExportItems :: [ExportItem GhcRn] -> [ExportItem GhcRn]
@@ -1191,34 +1193,6 @@ mkVisibleNames (_, _, _, instMap) exports opts
 seqList :: [a] -> ()
 seqList [] = ()
 seqList (x : xs) = x `seq` seqList xs
-
-mkMaybeTokenizedSrc :: DynFlags -> [Flag] -> TypecheckedModule
-                    -> ErrMsgGhc (Maybe [RichToken])
-mkMaybeTokenizedSrc dflags flags tm
-    | Flag_HyperlinkedSource `elem` flags = case renamedSource tm of
-        Just src -> do
-            tokens <- liftGhcToErrMsgGhc (liftIO (mkTokenizedSrc dflags summary src))
-            return $ Just tokens
-        Nothing -> do
-            liftErrMsg . tell . pure $ concat
-                [ "Warning: Cannot hyperlink module \""
-                , moduleNameString . ms_mod_name $ summary
-                , "\" because renamed source is not available"
-                ]
-            return Nothing
-    | otherwise = return Nothing
-  where
-    summary = pm_mod_summary . tm_parsed_module $ tm
-
-mkTokenizedSrc :: DynFlags -> ModSummary -> RenamedSource -> IO [RichToken]
-mkTokenizedSrc dflags ms src = do
-  -- make sure to read the whole file at once otherwise
-  -- we run out of file descriptors (see #495)
-  rawSrc <- BS.readFile (msHsFilePath ms) >>= evaluate
-  let tokens = Hyperlinker.parse dflags filepath (Utf8.decodeUtf8 rawSrc)
-  return $ Hyperlinker.enrich src tokens
-  where
-    filepath = msHsFilePath ms
 
 -- | Find a stand-alone documentation comment by its name.
 findNamedDoc :: String -> [HsDecl GhcRn] -> ErrMsgM (Maybe HsDocString)

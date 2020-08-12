@@ -27,14 +27,16 @@ module Documentation.Haddock.Parser (
 import           Control.Applicative
 import           Control.Arrow (first)
 import           Control.Monad
-import           Data.Char (chr, isUpper, isAlpha, isAlphaNum, isSpace)
-import           Data.List (intercalate, unfoldr, elemIndex, notElem)
+import           Data.Char (chr, isUpper, isAlpha, isSpace)
+import           Data.List (intercalate, unfoldr, elemIndex)
 import           Data.Maybe (fromMaybe, mapMaybe)
 import           Data.Monoid
 import qualified Data.Set as Set
 import           Documentation.Haddock.Doc
+import           Documentation.Haddock.Markup ( markup, plainMarkup )
 import           Documentation.Haddock.Parser.Monad
 import           Documentation.Haddock.Parser.Util
+import           Documentation.Haddock.Parser.Identifier
 import           Documentation.Haddock.Types
 import           Prelude hiding (takeWhile)
 import qualified Prelude as P
@@ -45,53 +47,26 @@ import           Text.Parsec (try)
 import qualified Data.Text as T
 import           Data.Text (Text)
 
-#if MIN_VERSION_base(4,9,0)
-import           Text.Read.Lex                      (isSymbolChar)
-#else
-import           Data.Char                          (GeneralCategory (..),
-                                                     generalCategory)
-#endif
 
 -- $setup
 -- >>> :set -XOverloadedStrings
 
-#if !MIN_VERSION_base(4,9,0)
--- inlined from base-4.10.0.0
-isSymbolChar :: Char -> Bool
-isSymbolChar c = not (isPuncChar c) && case generalCategory c of
-    MathSymbol           -> True
-    CurrencySymbol       -> True
-    ModifierSymbol       -> True
-    OtherSymbol          -> True
-    DashPunctuation      -> True
-    OtherPunctuation     -> c `notElem` ("'\"" :: String)
-    ConnectorPunctuation -> c /= '_'
-    _                    -> False
-  where
-    -- | The @special@ character class as defined in the Haskell Report.
-    isPuncChar :: Char -> Bool
-    isPuncChar = (`elem` (",;()[]{}`" :: String))
-#endif
-
--- | Identifier string surrounded with opening and closing quotes/backticks.
-type Identifier = (Char, String, Char)
-
 -- | Drops the quotes/backticks around all identifiers, as if they
 -- were valid but still 'String's.
 toRegular :: DocH mod Identifier -> DocH mod String
-toRegular = fmap (\(_, x, _) -> x)
+toRegular = fmap (\(Identifier _ _ x _) -> x)
 
 -- | Maps over 'DocIdentifier's over 'String' with potentially failing
 -- conversion using user-supplied function. If the conversion fails,
 -- the identifier is deemed to not be valid and is treated as a
 -- regular string.
-overIdentifier :: (String -> Maybe a)
+overIdentifier :: (Namespace -> String -> Maybe a)
                -> DocH mod Identifier
                -> DocH mod a
 overIdentifier f d = g d
   where
-    g (DocIdentifier (o, x, e)) = case f x of
-      Nothing -> DocString $ o : x ++ [e]
+    g (DocIdentifier (Identifier ns o x e)) = case f ns x of
+      Nothing -> DocString $ renderNs ns ++ [o] ++ x ++ [e]
       Just x' -> DocIdentifier x'
     g DocEmpty = DocEmpty
     g (DocAppend x x') = DocAppend (g x) (g x')
@@ -107,7 +82,7 @@ overIdentifier f d = g d
     g (DocOrderedList x) = DocOrderedList $ fmap g x
     g (DocDefList x) = DocDefList $ fmap (\(y, z) -> (g y, g z)) x
     g (DocCodeBlock x) = DocCodeBlock $ g x
-    g (DocHyperlink x) = DocHyperlink x
+    g (DocHyperlink (Hyperlink u x)) = DocHyperlink (Hyperlink u (fmap g x))
     g (DocPic x) = DocPic x
     g (DocMathInline x) = DocMathInline x
     g (DocMathDisplay x) = DocMathDisplay x
@@ -301,13 +276,20 @@ mathInline = DocMathInline . T.unpack
 -- >>> parseString "\\[\\int_{-\\infty}^{\\infty} e^{-x^2/2} = \\sqrt{2\\pi}\\]"
 -- DocMathDisplay "\\int_{-\\infty}^{\\infty} e^{-x^2/2} = \\sqrt{2\\pi}"
 mathDisplay :: Parser (DocH mod a)
-mathDisplay = DocMathDisplay . T.unpack 
+mathDisplay = DocMathDisplay . T.unpack
               <$> ("\\[" *> takeUntil "\\]")
 
-markdownImage :: Parser (DocH mod a)
-markdownImage = fromHyperlink <$> ("!" *> linkParser)
+-- | Markdown image parser. As per the commonmark reference recommendation, the
+-- description text for an image converted to its a plain string representation.
+--
+-- >>> parseString "![some /emphasis/ in a description](www.site.com)"
+-- DocPic (Picture "www.site.com" (Just "some emphasis in a description"))
+markdownImage :: Parser (DocH mod Identifier)
+markdownImage = DocPic . fromHyperlink <$> ("!" *> linkParser)
   where
-    fromHyperlink (Hyperlink url label) = DocPic (Picture url label)
+    fromHyperlink (Hyperlink u l) = Picture u (fmap (markup stringMarkup) l)
+    stringMarkup = plainMarkup (const "") renderIdent
+    renderIdent (Identifier ns l c r) = renderNs ns <> [l] <> c <> [r]
 
 -- | Paragraph parser, called by 'parseParas'.
 paragraph :: Parser (DocH mod Identifier)
@@ -360,32 +342,34 @@ table = do
     parseFirstRow :: Parser Text
     parseFirstRow = do
         skipHorizontalSpace
-        -- upper-left corner is +
-        c <- Parsec.char '+'
-        cs <- some (Parsec.char '-' <|> Parsec.char '+')
+        cs <- takeWhile (\c -> c == '-' || c == '+')
 
-        -- upper right corner is + too
-        guard (last cs == '+')
+        -- upper-left and upper-right corners are `+`
+        guard (T.length cs >= 2 &&
+               T.head cs == '+' &&
+               T.last cs == '+')
 
         -- trailing space
         skipHorizontalSpace
         _ <- Parsec.newline
 
-        return (T.cons c $ T.pack cs)
+        return cs
 
     parseRestRows :: Int -> Parser Text
     parseRestRows l = do
         skipHorizontalSpace
+        bs <- scan predicate l
 
-        c <- Parsec.char '|' <|> Parsec.char '+'
-        bs <- scan predicate (l - 2)
-        c2 <- Parsec.char '|' <|> Parsec.char '+'
+        -- Left and right edges are `|` or `+`
+        guard (T.length bs >= 2 &&
+               (T.head bs == '|' || T.head bs == '+') &&
+               (T.last bs == '|' || T.last bs == '+'))
 
         -- trailing space
         skipHorizontalSpace
         _ <- Parsec.newline
 
-        return (T.cons c (T.snoc bs c2))
+        return bs
       where
         predicate n c
             | n <= 0    = Nothing
@@ -662,7 +646,7 @@ nonSpace xs
 --  Doesn't discard the trailing newline.
 takeNonEmptyLine :: Parser Text
 takeNonEmptyLine = do
-    l <- takeWhile1 (Parsec.noneOf "\n") >>= nonSpace
+    l <- takeWhile1 (/= '\n') >>= nonSpace
     _ <- "\n"
     pure (l <> "\n")
 
@@ -732,7 +716,7 @@ nonEmptyLine :: Parser Text
 nonEmptyLine = try (mfilter (T.any (not . isSpace)) takeLine)
 
 takeLine :: Parser Text
-takeLine = try (takeWhile (Parsec.noneOf "\n") <* endOfLine)
+takeLine = try (takeWhile (/= '\n') <* endOfLine)
 
 endOfLine :: Parser ()
 endOfLine = void "\n" <|> Parsec.eof 
@@ -742,7 +726,7 @@ endOfLine = void "\n" <|> Parsec.eof
 -- >>> snd <$> parseOnly property "prop> hello world"
 -- Right (DocProperty "hello world")
 property :: Parser (DocH mod a)
-property = DocProperty . T.unpack . T.strip <$> ("prop>" *> takeWhile1 (Parsec.noneOf "\n"))
+property = DocProperty . T.unpack . T.strip <$> ("prop>" *> takeWhile1 (/= '\n'))
 
 -- |
 -- Paragraph level codeblock. Anything between the two delimiting \@ is parsed
@@ -782,22 +766,22 @@ codeblock =
           | isNewline && isSpace c = Just isNewline
           | otherwise = Just $ c == '\n'
 
-hyperlink :: Parser (DocH mod a)
+hyperlink :: Parser (DocH mod Identifier)
 hyperlink = choice' [ angleBracketLink, markdownLink, autoUrl ]
 
 angleBracketLink :: Parser (DocH mod a)
 angleBracketLink =
-    DocHyperlink . makeLabeled Hyperlink 
+    DocHyperlink . makeLabeled (\s -> Hyperlink s . fmap DocString)
     <$> disallowNewline ("<" *> takeUntil ">")
 
-markdownLink :: Parser (DocH mod a)
+markdownLink :: Parser (DocH mod Identifier)
 markdownLink = DocHyperlink <$> linkParser
 
-linkParser :: Parser Hyperlink
+linkParser :: Parser (Hyperlink (DocH mod Identifier))
 linkParser = flip Hyperlink <$> label <*> (whitespace *> url)
   where
-    label :: Parser (Maybe String)
-    label = Just . decode . T.strip <$> ("[" *> takeUntil "]")
+    label :: Parser (Maybe (DocH mod Identifier))
+    label = Just . parseParagraph . T.strip <$> ("[" *> takeUntil "]")
 
     whitespace :: Parser ()
     whitespace = skipHorizontalSpace <* optional ("\n" *> skipHorizontalSpace)
@@ -816,41 +800,17 @@ linkParser = flip Hyperlink <$> label <*> (whitespace *> url)
 autoUrl :: Parser (DocH mod a)
 autoUrl = mkLink <$> url
   where
-    url = mappend <$> choice' [ "http://", "https://", "ftp://"] <*> takeWhile1 (Parsec.satisfy (not . isSpace))
+    url = mappend <$> choice' [ "http://", "https://", "ftp://"] <*> takeWhile1 (not . isSpace)
     
     mkLink :: Text -> DocH mod a
     mkLink s = case T.unsnoc s of
       Just (xs,x) | x `elem` (",.!?" :: String) -> DocHyperlink (mkHyperlink xs) `docAppend` DocString [x]
       _ -> DocHyperlink (mkHyperlink s)
 
-    mkHyperlink :: Text -> Hyperlink
+    mkHyperlink :: Text -> Hyperlink (DocH mod a)
     mkHyperlink lnk = Hyperlink (T.unpack lnk) Nothing
 
 
-
--- | Parses strings between identifier delimiters. Consumes all input that it
--- deems to be valid in an identifier. Note that it simply blindly consumes
--- characters and does no actual validation itself.
-parseValid :: Parser String
-parseValid = p some
-  where
-    idChar = Parsec.satisfy (\c -> isAlphaNum c || isSymbolChar c || c == '_')
-
-    p p' = do
-      vs <- p' idChar
-      c <- peekChar'
-      case c of
-        '`' -> return vs
-        '\'' -> choice' [ (\x -> vs ++ "'" ++ x) <$> ("'" *> p many), return vs ]
-        _ -> fail "outofvalid"
-
--- | Parses identifiers with help of 'parseValid'. Asks GHC for
--- 'String' from the string it deems valid.
+-- | Parses identifiers with help of 'parseValid'.
 identifier :: Parser (DocH mod Identifier)
-identifier = do
-  o <- idDelim
-  vid <- parseValid
-  e <- idDelim
-  return $ DocIdentifier (o, vid, e)
-  where
-    idDelim = Parsec.satisfy (\c -> c == '\'' || c == '`')
+identifier = DocIdentifier <$> parseValid

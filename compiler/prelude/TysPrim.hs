@@ -20,6 +20,8 @@ module TysPrim(
 
         alphaTyVars, alphaTyVar, betaTyVar, gammaTyVar, deltaTyVar,
         alphaTys, alphaTy, betaTy, gammaTy, deltaTy,
+        alphaTyVarsUnliftedRep, alphaTyVarUnliftedRep,
+        alphaTysUnliftedRep, alphaTyUnliftedRep,
         runtimeRep1TyVar, runtimeRep2TyVar, runtimeRep1Ty, runtimeRep2Ty,
         openAlphaTy, openBetaTy, openAlphaTyVar, openBetaTyVar,
 
@@ -64,11 +66,17 @@ module TysPrim(
         weakPrimTyCon,                  mkWeakPrimTy,
         threadIdPrimTyCon,              threadIdPrimTy,
 
-        int32PrimTyCon,         int32PrimTy,
-        word32PrimTyCon,        word32PrimTy,
+        int8PrimTyCon,          int8PrimTy, int8PrimTyConName,
+        word8PrimTyCon,         word8PrimTy, word8PrimTyConName,
 
-        int64PrimTyCon,         int64PrimTy,
-        word64PrimTyCon,        word64PrimTy,
+        int16PrimTyCon,         int16PrimTy, int16PrimTyConName,
+        word16PrimTyCon,        word16PrimTy, word16PrimTyConName,
+
+        int32PrimTyCon,         int32PrimTy, int32PrimTyConName,
+        word32PrimTyCon,        word32PrimTy, word32PrimTyConName,
+
+        int64PrimTyCon,         int64PrimTy, int64PrimTyConName,
+        word64PrimTyCon,        word64PrimTy, word64PrimTyConName,
 
         eqPrimTyCon,            -- ty1 ~# ty2
         eqReprPrimTyCon,        -- ty1 ~R# ty2  (at role Representational)
@@ -85,8 +93,10 @@ import GhcPrelude
 import {-# SOURCE #-} TysWiredIn
   ( runtimeRepTy, unboxedTupleKind, liftedTypeKind
   , vecRepDataConTyCon, tupleRepDataConTyCon
-  , liftedRepDataConTy, unliftedRepDataConTy, intRepDataConTy
-  , wordRepDataConTy, int64RepDataConTy, word64RepDataConTy, addrRepDataConTy
+  , liftedRepDataConTy, unliftedRepDataConTy, intRepDataConTy, int8RepDataConTy
+  , int16RepDataConTy, word16RepDataConTy
+  , wordRepDataConTy, int64RepDataConTy, word8RepDataConTy, word64RepDataConTy
+  , addrRepDataConTy
   , floatRepDataConTy, doubleRepDataConTy
   , vec2DataConTy, vec4DataConTy, vec8DataConTy, vec16DataConTy, vec32DataConTy
   , vec64DataConTy
@@ -96,7 +106,7 @@ import {-# SOURCE #-} TysWiredIn
   , doubleElemRepDataConTy
   , mkPromotedListTy )
 
-import Var              ( TyVar, TyVarBndr(TvBndr), mkTyVar )
+import Var              ( TyVar, VarBndr(Bndr), mkTyVar )
 import Name
 import TyCon
 import SrcLoc
@@ -143,6 +153,8 @@ exposedPrimTyCons
     , doublePrimTyCon
     , floatPrimTyCon
     , intPrimTyCon
+    , int8PrimTyCon
+    , int16PrimTyCon
     , int32PrimTyCon
     , int64PrimTyCon
     , bcoPrimTyCon
@@ -163,6 +175,8 @@ exposedPrimTyCons
     , proxyPrimTyCon
     , threadIdPrimTyCon
     , wordPrimTyCon
+    , word8PrimTyCon
+    , word16PrimTyCon
     , word32PrimTyCon
     , word64PrimTyCon
 
@@ -186,12 +200,16 @@ mkBuiltInPrimTc fs unique tycon
                   BuiltInSyntax
 
 
-charPrimTyConName, intPrimTyConName, int32PrimTyConName, int64PrimTyConName, wordPrimTyConName, word32PrimTyConName, word64PrimTyConName, addrPrimTyConName, floatPrimTyConName, doublePrimTyConName, statePrimTyConName, proxyPrimTyConName, realWorldTyConName, arrayPrimTyConName, arrayArrayPrimTyConName, smallArrayPrimTyConName, byteArrayPrimTyConName, mutableArrayPrimTyConName, mutableByteArrayPrimTyConName, mutableArrayArrayPrimTyConName, smallMutableArrayPrimTyConName, mutVarPrimTyConName, mVarPrimTyConName, tVarPrimTyConName, stablePtrPrimTyConName, stableNamePrimTyConName, compactPrimTyConName, bcoPrimTyConName, weakPrimTyConName, threadIdPrimTyConName, eqPrimTyConName, eqReprPrimTyConName, eqPhantPrimTyConName, voidPrimTyConName :: Name
+charPrimTyConName, intPrimTyConName, int8PrimTyConName, int16PrimTyConName, int32PrimTyConName, int64PrimTyConName, wordPrimTyConName, word32PrimTyConName, word8PrimTyConName, word16PrimTyConName, word64PrimTyConName, addrPrimTyConName, floatPrimTyConName, doublePrimTyConName, statePrimTyConName, proxyPrimTyConName, realWorldTyConName, arrayPrimTyConName, arrayArrayPrimTyConName, smallArrayPrimTyConName, byteArrayPrimTyConName, mutableArrayPrimTyConName, mutableByteArrayPrimTyConName, mutableArrayArrayPrimTyConName, smallMutableArrayPrimTyConName, mutVarPrimTyConName, mVarPrimTyConName, tVarPrimTyConName, stablePtrPrimTyConName, stableNamePrimTyConName, compactPrimTyConName, bcoPrimTyConName, weakPrimTyConName, threadIdPrimTyConName, eqPrimTyConName, eqReprPrimTyConName, eqPhantPrimTyConName, voidPrimTyConName :: Name
 charPrimTyConName             = mkPrimTc (fsLit "Char#") charPrimTyConKey charPrimTyCon
 intPrimTyConName              = mkPrimTc (fsLit "Int#") intPrimTyConKey  intPrimTyCon
+int8PrimTyConName             = mkPrimTc (fsLit "Int8#") int8PrimTyConKey int8PrimTyCon
+int16PrimTyConName            = mkPrimTc (fsLit "Int16#") int16PrimTyConKey int16PrimTyCon
 int32PrimTyConName            = mkPrimTc (fsLit "Int32#") int32PrimTyConKey int32PrimTyCon
 int64PrimTyConName            = mkPrimTc (fsLit "Int64#") int64PrimTyConKey int64PrimTyCon
 wordPrimTyConName             = mkPrimTc (fsLit "Word#") wordPrimTyConKey wordPrimTyCon
+word8PrimTyConName            = mkPrimTc (fsLit "Word8#") word8PrimTyConKey word8PrimTyCon
+word16PrimTyConName           = mkPrimTc (fsLit "Word16#") word16PrimTyConKey word16PrimTyCon
 word32PrimTyConName           = mkPrimTc (fsLit "Word32#") word32PrimTyConKey word32PrimTyCon
 word64PrimTyConName           = mkPrimTc (fsLit "Word64#") word64PrimTyConKey word64PrimTyCon
 addrPrimTyConName             = mkPrimTc (fsLit "Addr#") addrPrimTyConKey addrPrimTyCon
@@ -237,12 +255,17 @@ mkTemplateKindVars :: [Kind] -> [TyVar]
 -- k0  with unique (mkAlphaTyVarUnique 0)
 -- k1  with unique (mkAlphaTyVarUnique 1)
 -- ... etc
+mkTemplateKindVars [kind]
+  = [mkTyVar (mk_tv_name 0 "k") kind]
+    -- Special case for one kind: just "k"
+
 mkTemplateKindVars kinds
-  = [ mkTyVar name kind
-    | (kind, u) <- kinds `zip` [0..]
-    , let occ = mkTyVarOccFS (mkFastString ('k' : show u))
-          name = mkInternalName (mkAlphaTyVarUnique u) occ noSrcSpan
-    ]
+  = [ mkTyVar (mk_tv_name u ('k' : show u)) kind
+    | (kind, u) <- kinds `zip` [0..] ]
+mk_tv_name :: Int -> String -> Name
+mk_tv_name u s = mkInternalName (mkAlphaTyVarUnique u)
+                                (mkTyVarOccFS (mkFastString s))
+                                noSrcSpan
 
 mkTemplateTyVarsFrom :: Int -> [Kind] -> [TyVar]
 -- a  with unique (mkAlphaTyVarUnique n)
@@ -257,9 +280,7 @@ mkTemplateTyVarsFrom n kinds
       let ch_ord = index + ord 'a'
           name_str | ch_ord <= ord 'z' = [chr ch_ord]
                    | otherwise         = 't':show index
-          uniq = mkAlphaTyVarUnique (index + n)
-          name = mkInternalName uniq occ noSrcSpan
-          occ  = mkTyVarOccFS (mkFastString name_str)
+          name = mk_tv_name (index + n) name_str
     ]
 
 mkTemplateTyVars :: [Kind] -> [TyVar]
@@ -315,6 +336,17 @@ alphaTys = mkTyVarTys alphaTyVars
 alphaTy, betaTy, gammaTy, deltaTy :: Type
 (alphaTy:betaTy:gammaTy:deltaTy:_) = alphaTys
 
+alphaTyVarsUnliftedRep :: [TyVar]
+alphaTyVarsUnliftedRep = mkTemplateTyVars $ repeat (tYPE unliftedRepDataConTy)
+
+alphaTyVarUnliftedRep :: TyVar
+(alphaTyVarUnliftedRep:_) = alphaTyVarsUnliftedRep
+
+alphaTysUnliftedRep :: [Type]
+alphaTysUnliftedRep = mkTyVarTys alphaTyVarsUnliftedRep
+alphaTyUnliftedRep :: Type
+(alphaTyUnliftedRep:_) = alphaTysUnliftedRep
+
 runtimeRep1TyVar, runtimeRep2TyVar :: TyVar
 (runtimeRep1TyVar : runtimeRep2TyVar : _)
   = drop 16 (mkTemplateTyVars (repeat runtimeRepTy))  -- selects 'q','r'
@@ -351,8 +383,8 @@ funTyConName = mkPrimTyConName (fsLit "->") funTyConKey funTyCon
 funTyCon :: TyCon
 funTyCon = mkFunTyCon funTyConName tc_bndrs tc_rep_nm
   where
-    tc_bndrs = [ TvBndr runtimeRep1TyVar (NamedTCB Inferred)
-               , TvBndr runtimeRep2TyVar (NamedTCB Inferred)
+    tc_bndrs = [ Bndr runtimeRep1TyVar (NamedTCB Inferred)
+               , Bndr runtimeRep2TyVar (NamedTCB Inferred)
                ]
                ++ mkTemplateAnonTyConBinders [ tYPE runtimeRep1Ty
                                              , tYPE runtimeRep2Ty
@@ -500,8 +532,12 @@ primRepToRuntimeRep rep = case rep of
   LiftedRep     -> liftedRepDataConTy
   UnliftedRep   -> unliftedRepDataConTy
   IntRep        -> intRepDataConTy
+  Int8Rep       -> int8RepDataConTy
+  Int16Rep      -> int16RepDataConTy
   WordRep       -> wordRepDataConTy
   Int64Rep      -> int64RepDataConTy
+  Word8Rep      -> word8RepDataConTy
+  Word16Rep     -> word16RepDataConTy
   Word64Rep     -> word64RepDataConTy
   AddrRep       -> addrRepDataConTy
   FloatRep      -> floatRepDataConTy
@@ -543,6 +579,16 @@ intPrimTy       = mkTyConTy intPrimTyCon
 intPrimTyCon :: TyCon
 intPrimTyCon    = pcPrimTyCon0 intPrimTyConName IntRep
 
+int8PrimTy :: Type
+int8PrimTy     = mkTyConTy int8PrimTyCon
+int8PrimTyCon :: TyCon
+int8PrimTyCon  = pcPrimTyCon0 int8PrimTyConName Int8Rep
+
+int16PrimTy :: Type
+int16PrimTy    = mkTyConTy int16PrimTyCon
+int16PrimTyCon :: TyCon
+int16PrimTyCon = pcPrimTyCon0 int16PrimTyConName Int16Rep
+
 int32PrimTy :: Type
 int32PrimTy     = mkTyConTy int32PrimTyCon
 int32PrimTyCon :: TyCon
@@ -557,6 +603,16 @@ wordPrimTy :: Type
 wordPrimTy      = mkTyConTy wordPrimTyCon
 wordPrimTyCon :: TyCon
 wordPrimTyCon   = pcPrimTyCon0 wordPrimTyConName WordRep
+
+word8PrimTy :: Type
+word8PrimTy     = mkTyConTy word8PrimTyCon
+word8PrimTyCon :: TyCon
+word8PrimTyCon  = pcPrimTyCon0 word8PrimTyConName Word8Rep
+
+word16PrimTy :: Type
+word16PrimTy    = mkTyConTy word16PrimTyCon
+word16PrimTyCon :: TyCon
+word16PrimTyCon = pcPrimTyCon0 word16PrimTyConName Word16Rep
 
 word32PrimTy :: Type
 word32PrimTy    = mkTyConTy word32PrimTyCon
@@ -598,8 +654,8 @@ GHC sports a veritable menagerie of equality types:
          class?    L/U                        TyCon
 -----------------------------------------------------------------------------------------
 ~#         T        U      hetero   nominal   eqPrimTyCon      GHC.Prim
-~~         C        L      hetero   nominal   hEqTyCon         GHC.Types
-~          C        L      homo     nominal   eqTyCon          Data.Type.Equality
+~~         C        L      hetero   nominal   heqTyCon         GHC.Types
+~          C        L      homo     nominal   eqTyCon          GHC.Types
 :~:        T        L      homo     nominal   (not built-in)   Data.Type.Equality
 :~~:       T        L      hetero   nominal   (not built-in)   Data.Type.Equality
 
@@ -642,6 +698,7 @@ This is (almost) an ordinary class, defined as if by
   class a ~# b => a ~~ b
   instance a ~# b => a ~~ b
 Here's what's unusual about it:
+
  * We can't actually declare it that way because we don't have syntax for ~#.
    And ~# isn't a constraint, so even if we could write it, it wouldn't kind
    check.
@@ -671,21 +728,23 @@ Within GHC, ~~ is called heqTyCon, and it is defined in TysWiredIn.
     --------------------------
     (~) :: forall k. k -> k -> Constraint
     --------------------------
-This is defined in Data.Type.Equality:
-  class a ~~ b => (a :: k) ~ (b :: k)
-  instance a ~~ b => a ~ b
-This is even more so an ordinary class than (~~), with the following exceptions:
- * Users cannot write instances of it.
+This is /exactly/ like (~~), except with a homogeneous kind.
+It is an almost-ordinary class defined as if by
+  class a ~# b => (a :: k) ~ (b :: k)
+  instance a ~# b => a ~ b
 
- * It is "naturally coherent". (See (~~).)
+ * All the bullets for (~~) apply
 
- * (~) is magical syntax, as ~ is a reserved symbol.
+ * In addition (~) is magical syntax, as ~ is a reserved symbol.
    It cannot be exported or imported.
 
- * It always terminates.
+Within GHC, ~ is called eqTyCon, and it is defined in TysWiredIn.
 
-Within GHC, ~ is called eqTyCon, and it is defined in PrelNames. Note that
-it is *not* wired in.
+Historical note: prior to July 18 (~) was defined as a
+  more-ordinary class with (~~) as a superclass.  But that made it
+  special in different ways; and the extra superclass selections to
+  get from (~) to (~#) via (~~) were tiresome.  Now it's defined
+  uniformly with (~~) and Coercible; much nicer.)
 
 
     --------------------------
@@ -799,7 +858,7 @@ proxyPrimTyCon :: TyCon
 proxyPrimTyCon = mkPrimTyCon proxyPrimTyConName binders res_kind [Nominal,Nominal]
   where
      -- Kind: forall k. k -> Void#
-     binders = mkTemplateTyConBinders [liftedTypeKind] (\ks-> ks)
+     binders = mkTemplateTyConBinders [liftedTypeKind] id
      res_kind = unboxedTupleKind []
 
 
@@ -815,7 +874,7 @@ eqPrimTyCon :: TyCon  -- The representation type for equality predicates
 eqPrimTyCon  = mkPrimTyCon eqPrimTyConName binders res_kind roles
   where
     -- Kind :: forall k1 k2. k1 -> k2 -> Void#
-    binders  = mkTemplateTyConBinders [liftedTypeKind, liftedTypeKind] (\ks -> ks)
+    binders  = mkTemplateTyConBinders [liftedTypeKind, liftedTypeKind] id
     res_kind = unboxedTupleKind []
     roles    = [Nominal, Nominal, Nominal, Nominal]
 
@@ -826,7 +885,7 @@ eqReprPrimTyCon :: TyCon   -- See Note [The equality types story]
 eqReprPrimTyCon = mkPrimTyCon eqReprPrimTyConName binders res_kind roles
   where
     -- Kind :: forall k1 k2. k1 -> k2 -> Void#
-    binders  = mkTemplateTyConBinders [liftedTypeKind, liftedTypeKind] (\ks -> ks)
+    binders  = mkTemplateTyConBinders [liftedTypeKind, liftedTypeKind] id
     res_kind = unboxedTupleKind []
     roles    = [Nominal, Nominal, Representational, Representational]
 
@@ -837,7 +896,7 @@ eqPhantPrimTyCon :: TyCon
 eqPhantPrimTyCon = mkPrimTyCon eqPhantPrimTyConName binders res_kind roles
   where
     -- Kind :: forall k1 k2. k1 -> k2 -> Void#
-    binders  = mkTemplateTyConBinders [liftedTypeKind, liftedTypeKind] (\ks -> ks)
+    binders  = mkTemplateTyConBinders [liftedTypeKind, liftedTypeKind] id
     res_kind = unboxedTupleKind []
     roles    = [Nominal, Nominal, Phantom, Phantom]
 
@@ -940,7 +999,7 @@ mkStablePtrPrimTy ty = TyConApp stablePtrPrimTyCon [ty]
 -}
 
 stableNamePrimTyCon :: TyCon
-stableNamePrimTyCon = pcPrimTyCon stableNamePrimTyConName [Representational] UnliftedRep
+stableNamePrimTyCon = pcPrimTyCon stableNamePrimTyConName [Phantom] UnliftedRep
 
 mkStableNamePrimTy :: Type -> Type
 mkStableNamePrimTy ty = TyConApp stableNamePrimTyCon [ty]

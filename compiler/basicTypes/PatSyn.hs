@@ -19,7 +19,7 @@ module PatSyn (
         patSynInstArgTys, patSynInstResTy, patSynFieldLabels,
         patSynFieldType,
 
-        tidyPatSynIds, pprPatSynType
+        updatePatSynIds, pprPatSynType
     ) where
 
 #include "HsVersions.h"
@@ -79,7 +79,7 @@ data PatSyn
 
         -- Result type
         psResultTy   :: Type,  -- Mentions only psUnivTyVars
-                                -- See Note [Pattern synonym result type]
+                               -- See Note [Pattern synonym result type]
 
         -- See Note [Matchers and builders for pattern synonyms]
         psMatcher     :: (Id, Bool),
@@ -339,10 +339,10 @@ instance Data.Data PatSyn where
 -- | Build a new pattern synonym
 mkPatSyn :: Name
          -> Bool                 -- ^ Is the pattern synonym declared infix?
-         -> ([TyVarBinder], ThetaType) -- ^ Universially-quantified type variables
-                                 --   and required dicts
-         -> ([TyVarBinder], ThetaType) -- ^ Existentially-quantified type variables
-                                 --   and provided dicts
+         -> ([TyVarBinder], ThetaType) -- ^ Universially-quantified type
+                                       -- variables and required dicts
+         -> ([TyVarBinder], ThetaType) -- ^ Existentially-quantified type
+                                       -- variables and provided dicts
          -> [Type]               -- ^ Original arguments
          -> Type                 -- ^ Original result type
          -> (Id, Bool)           -- ^ Name of matcher
@@ -417,8 +417,8 @@ patSynMatcher = psMatcher
 patSynBuilder :: PatSyn -> Maybe (Id, Bool)
 patSynBuilder = psBuilder
 
-tidyPatSynIds :: (Id -> Id) -> PatSyn -> PatSyn
-tidyPatSynIds tidy_fn ps@(MkPatSyn { psMatcher = matcher, psBuilder = builder })
+updatePatSynIds :: (Id -> Id) -> PatSyn -> PatSyn
+updatePatSynIds tidy_fn ps@(MkPatSyn { psMatcher = matcher, psBuilder = builder })
   = ps { psMatcher = tidy_pr matcher, psBuilder = fmap tidy_pr builder }
   where
     tidy_pr (id, dummy) = (tidy_fn id, dummy)

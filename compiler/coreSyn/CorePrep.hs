@@ -60,7 +60,7 @@ import Name             ( NamedThing(..), nameSrcSpan )
 import SrcLoc           ( SrcSpan(..), realSrcLocSpan, mkRealSrcLoc )
 import Data.Bits
 import MonadUtils       ( mapAccumLM )
-import Data.List        ( mapAccumL, foldl' )
+import Data.List        ( mapAccumL )
 import Control.Monad
 import CostCentre       ( CostCentre, ccFromThisModule )
 import qualified Data.Set as S
@@ -72,7 +72,7 @@ import qualified Data.Set as S
 
 The goal of this pass is to prepare for code generation.
 
-1.  Saturate constructor and primop applications.
+1.  Saturate constructor applications.
 
 2.  Convert to A-normal form; that is, function arguments
     are always variables.
@@ -684,7 +684,7 @@ cvtLitInteger :: DynFlags -> Id -> Maybe DataCon -> Integer -> CoreExpr
 -- See Note [Integer literals] in Literal
 cvtLitInteger dflags _ (Just sdatacon) i
   | inIntRange dflags i -- Special case for small integers
-    = mkConApp sdatacon [Lit (mkMachInt dflags i)]
+    = mkConApp sdatacon [Lit (mkLitInt dflags i)]
 
 cvtLitInteger dflags mk_integer _ i
     = mkApps (Var mk_integer) [isNonNegative, ints]
@@ -694,7 +694,7 @@ cvtLitInteger dflags mk_integer _ i
         f 0 = []
         f x = let low  = x .&. mask
                   high = x `shiftR` bits
-              in mkConApp intDataCon [Lit (mkMachInt dflags low)] : f high
+              in mkConApp intDataCon [Lit (mkLitInt dflags low)] : f high
         bits = 31
         mask = 2 ^ bits - 1
 
@@ -704,7 +704,7 @@ cvtLitNatural :: DynFlags -> Id -> Maybe DataCon -> Integer -> CoreExpr
 -- See Note [Natural literals] in Literal
 cvtLitNatural dflags _ (Just sdatacon) i
   | inWordRange dflags i -- Special case for small naturals
-    = mkConApp sdatacon [Lit (mkMachWord dflags i)]
+    = mkConApp sdatacon [Lit (mkLitWord dflags i)]
 
 cvtLitNatural dflags mk_natural _ i
     = mkApps (Var mk_natural) [words]
@@ -712,7 +712,7 @@ cvtLitNatural dflags mk_natural _ i
         f 0 = []
         f x = let low  = x .&. mask
                   high = x `shiftR` bits
-              in mkConApp wordDataCon [Lit (mkMachWord dflags low)] : f high
+              in mkConApp wordDataCon [Lit (mkLitWord dflags low)] : f high
         bits = 32
         mask = 2 ^ bits - 1
 
@@ -1064,8 +1064,21 @@ because that has different strictness.  Hence the use of 'allLazy'.
 -- Building the saturated syntax
 -- ---------------------------------------------------------------------------
 
-maybeSaturate deals with saturating primops and constructors
-The type is the type of the entire application
+Note [Eta expansion of hasNoBinding things in CorePrep]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+maybeSaturate deals with eta expanding to saturate things that can't deal with
+unsaturated applications (identified by 'hasNoBinding', currently just
+foreign calls and unboxed tuple/sum constructors).
+
+Note that eta expansion in CorePrep is very fragile due to the "prediction" of
+CAFfyness made by TidyPgm (see Note [CAFfyness inconsistencies due to eta
+expansion in CorePrep] in TidyPgm for details.  We previously saturated primop
+applications here as well but due to this fragility (see #16846) we now deal
+with this another way, as described in Note [Primop wrappers] in PrimOp.
+
+It's quite likely that eta expansion of constructor applications will
+eventually break in a similar way to how primops did. We really should
+eliminate this case as well.
 -}
 
 maybeSaturate :: Id -> CpeApp -> Int -> UniqSM CpeRhs
@@ -1128,6 +1141,7 @@ and now we do NOT want eta expansion to give
 
 Instead CoreArity.etaExpand gives
                 f = /\a -> \y -> let s = h 3 in g s y
+
 -}
 
 cpeEtaExpand :: Arity -> CpeRhs -> CpeRhs
@@ -1148,6 +1162,8 @@ get to a partial application:
     ==> case x of { p -> map f }
 -}
 
+-- When updating this function, make sure it lines up with
+-- CoreUtils.tryEtaReduce!
 tryEtaReducePrep :: [CoreBndr] -> CoreExpr -> Maybe CoreExpr
 tryEtaReducePrep bndrs expr@(App _ _)
   | ok_to_eta_reduce f
@@ -1167,25 +1183,14 @@ tryEtaReducePrep bndrs expr@(App _ _)
     ok bndr (Var arg) = bndr == arg
     ok _    _         = False
 
-          -- We can't eta reduce something which must be saturated.
+    -- We can't eta reduce something which must be saturated.
     ok_to_eta_reduce (Var f) = not (hasNoBinding f)
     ok_to_eta_reduce _       = False -- Safe. ToDo: generalise
 
-tryEtaReducePrep bndrs (Let bind@(NonRec _ r) body)
-  | not (any (`elemVarSet` fvs) bndrs)
-  = case tryEtaReducePrep bndrs body of
-        Just e -> Just (Let bind e)
-        Nothing -> Nothing
-  where
-    fvs = exprFreeVars r
 
--- NB: do not attempt to eta-reduce across ticks
--- Otherwise we risk reducing
---       \x. (Tick (Breakpoint {x}) f x)
---   ==> Tick (breakpoint {x}) f
--- which is bogus (Trac #17228)
--- tryEtaReducePrep bndrs (Tick tickish e)
---   = fmap (mkTick tickish) $ tryEtaReducePrep bndrs e
+tryEtaReducePrep bndrs (Tick tickish e)
+  | tickishFloatable tickish
+  = fmap (mkTick tickish) $ tryEtaReducePrep bndrs e
 
 tryEtaReducePrep _ _ = Nothing
 
@@ -1487,14 +1492,15 @@ lookupMkNaturalName dflags hsc_env
     = guardNaturalUse dflags $ liftM tyThingId $
       lookupGlobal hsc_env mkNaturalName
 
+-- See Note [The integer library] in PrelNames
 lookupIntegerSDataConName :: DynFlags -> HscEnv -> IO (Maybe DataCon)
-lookupIntegerSDataConName dflags hsc_env = case cIntegerLibraryType of
+lookupIntegerSDataConName dflags hsc_env = case integerLibrary dflags of
     IntegerGMP -> guardIntegerUse dflags $ liftM (Just . tyThingDataCon) $
                   lookupGlobal hsc_env integerSDataConName
     IntegerSimple -> return Nothing
 
 lookupNaturalSDataConName :: DynFlags -> HscEnv -> IO (Maybe DataCon)
-lookupNaturalSDataConName dflags hsc_env = case cIntegerLibraryType of
+lookupNaturalSDataConName dflags hsc_env = case integerLibrary dflags of
     IntegerGMP -> guardNaturalUse dflags $ liftM (Just . tyThingDataCon) $
                   lookupGlobal hsc_env naturalSDataConName
     IntegerSimple -> return Nothing

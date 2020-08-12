@@ -22,7 +22,7 @@
 #include "StgPrimFloat.h" // for __int_encodeFloat etc.
 #include "Proftimer.h"
 #include "GetEnv.h"
-#include "Stable.h"
+#include "StablePtr.h"
 #include "RtsSymbols.h"
 #include "RtsSymbolInfo.h"
 #include "Profiling.h"
@@ -190,9 +190,10 @@ int ocTryLoad( ObjectCode* oc );
  * small memory model on this architecture (see gcc docs,
  * -mcmodel=small).
  *
- * MAP_32BIT not available on OpenBSD/amd64
+ * MAP_32BIT not available on OpenBSD/amd64.
+ * Also, MAP_32BIT does not permit W|X mappings on Darwin (see #17353).
  */
-#if defined(x86_64_HOST_ARCH) && defined(MAP_32BIT)
+#if defined(x86_64_HOST_ARCH) && !defined(darwin_HOST_OS) && defined(MAP_32BIT)
 #define TRY_MAP_32BIT MAP_32BIT
 #else
 #define TRY_MAP_32BIT 0
@@ -483,7 +484,7 @@ initLinker_ (int retain_cafs)
 #   endif /* RTLD_DEFAULT */
 
     compileResult = regcomp(&re_invalid,
-           "(([^ \t()])+\\.so([^ \t:()])*):([ \t])*(invalid ELF header|file too short|invalid file format)",
+           "(([^ \t()])+\\.so([^ \t:()])*):([ \t])*(invalid ELF header|file too short|invalid file format|Exec format error)",
            REG_EXTENDED);
     if (compileResult != 0) {
         barf("Compiling re_invalid failed");
@@ -516,6 +517,9 @@ initLinker_ (int retain_cafs)
 
 void
 exitLinker( void ) {
+#if defined(OBJFORMAT_PEi386)
+   exitLinker_PEi386();
+#endif
 #if defined(OBJFORMAT_ELF) || defined(OBJFORMAT_MACHO)
    if (linker_init_done == 1) {
       regfree(&re_invalid);
@@ -1180,11 +1184,17 @@ void freeObjectCode (ObjectCode *oc)
                            oc->sections[i].mapped_size);
                     break;
                 case SECTION_M32:
+                    IF_DEBUG(sanity,
+                        memset(oc->sections[i].start,
+                            0x00, oc->sections[i].size));
                     m32_free(oc->sections[i].start,
                              oc->sections[i].size);
                     break;
 #endif
                 case SECTION_MALLOC:
+                    IF_DEBUG(sanity,
+                        memset(oc->sections[i].start,
+                            0x00, oc->sections[i].size));
                     stgFree(oc->sections[i].start);
                     break;
                 default:
@@ -1232,6 +1242,12 @@ void freeObjectCode (ObjectCode *oc)
 * Sets the initial status of a fresh ObjectCode
 */
 static void setOcInitialStatus(ObjectCode* oc) {
+    /* If a target has requested the ObjectCode not to be resolved then
+       honor this requests.  Usually this means the ObjectCode has not been
+       initialized and can't be.  */
+    if (oc->status == OBJECT_DONT_RESOLVE)
+      return;
+
     if (oc->archiveMemberName == NULL) {
         oc->status = OBJECT_NEEDED;
     } else {
@@ -1383,18 +1399,7 @@ preloadObjectFile (pathchar *path)
        return NULL;
    }
 
-#  if defined(mingw32_HOST_OS)
-
-        // TODO: We would like to use allocateExec here, but allocateExec
-        //       cannot currently allocate blocks large enough.
-    image = allocateImageAndTrampolines(path, "itself", f, fileSize,
-                                        HS_BOOL_FALSE);
-    if (image == NULL) {
-        fclose(f);
-        return NULL;
-    }
-
-#   elif defined(darwin_HOST_OS)
+#  if defined(darwin_HOST_OS)
 
     // In a Mach-O .o file, all sections can and will be misaligned
     // if the total size of the headers is not a multiple of the
@@ -1409,7 +1414,7 @@ preloadObjectFile (pathchar *path)
    image = stgMallocBytes(fileSize + misalignment, "loadObj(image)");
    image += misalignment;
 
-# else /* !defined(mingw32_HOST_OS) */
+# else /* !defined(darwin_HOST_OS) */
 
    image = stgMallocBytes(fileSize, "loadObj(image)");
 
@@ -1505,6 +1510,34 @@ HsInt loadOc (ObjectCode* oc)
        return r;
    }
 
+   /* Note [loadOc orderings]
+      ocAllocateSymbolsExtras has only two pre-requisites, it must run after
+      preloadObjectFile and ocVerify.   Neither have changed.   On most targets
+      allocating the extras is independent on parsing the section data, so the
+      order between these two never mattered.
+
+      On Windows, when we have an import library we (for now, as we don't honor
+      the lazy loading semantics of the library and instead GHCi is already
+      lazy) don't use the library after ocGetNames as it just populates the
+      symbol table.  Allocating space for jump tables in ocAllocateSymbolExtras
+      would just be a waste then as we'll be stopping further processing of the
+      library in the next few steps.  */
+
+   /* build the symbol list for this image */
+#  if defined(OBJFORMAT_ELF)
+   r = ocGetNames_ELF ( oc );
+#  elif defined(OBJFORMAT_PEi386)
+   r = ocGetNames_PEi386 ( oc );
+#  elif defined(OBJFORMAT_MACHO)
+   r = ocGetNames_MachO ( oc );
+#  else
+   barf("loadObj: no getNames method");
+#  endif
+   if (!r) {
+       IF_DEBUG(linker, debugBelch("loadOc: ocGetNames_* failed\n"));
+       return r;
+   }
+
 #if defined(NEED_SYMBOL_EXTRAS)
 #  if defined(OBJFORMAT_MACHO)
    r = ocAllocateSymbolExtras_MachO ( oc );
@@ -1524,21 +1557,6 @@ HsInt loadOc (ObjectCode* oc)
    ocAllocateSymbolExtras_PEi386 ( oc );
 #  endif
 #endif
-
-   /* build the symbol list for this image */
-#  if defined(OBJFORMAT_ELF)
-   r = ocGetNames_ELF ( oc );
-#  elif defined(OBJFORMAT_PEi386)
-   r = ocGetNames_PEi386 ( oc );
-#  elif defined(OBJFORMAT_MACHO)
-   r = ocGetNames_MachO ( oc );
-#  else
-   barf("loadObj: no getNames method");
-#  endif
-   if (!r) {
-       IF_DEBUG(linker, debugBelch("loadOc: ocGetNames_* failed\n"));
-       return r;
-   }
 
    /* loaded, but not resolved yet, ensure the OC is in a consistent state */
    setOcInitialStatus( oc );
@@ -1812,7 +1830,9 @@ addSection (Section *s, SectionKind kind, SectionAlloc alloc,
    s->mapped_start = mapped_start; /* start of mmap() block */
    s->mapped_size  = mapped_size;  /* size of mmap() block */
 
-   s->info = (struct SectionFormatInfo*)stgCallocBytes(1, sizeof *s->info,
+   if (!s->info)
+     s->info
+       = (struct SectionFormatInfo*)stgCallocBytes(1, sizeof *s->info,
                                             "addSection(SectionFormatInfo)");
 
    IF_DEBUG(linker,

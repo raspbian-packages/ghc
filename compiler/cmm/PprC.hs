@@ -649,6 +649,9 @@ pprMachOp_for_C mop = case mop of
         MO_SS_Conv from to | from == to -> empty
         MO_SS_Conv _from to -> parens (machRep_S_CType to)
 
+        MO_XX_Conv from to | from == to -> empty
+        MO_XX_Conv _from to -> parens (machRep_U_CType to)
+
         MO_FF_Conv from to | from == to -> empty
         MO_FF_Conv _from to -> parens (machRep_F_CType to)
 
@@ -778,6 +781,9 @@ pprCallishMachOp_for_C mop
         MO_F64_Tanh     -> text "tanh"
         MO_F64_Asin     -> text "asin"
         MO_F64_Acos     -> text "acos"
+        MO_F64_Atanh    -> text "atanh"
+        MO_F64_Asinh    -> text "asinh"
+        MO_F64_Acosh    -> text "acosh"
         MO_F64_Atan     -> text "atan"
         MO_F64_Log      -> text "log"
         MO_F64_Exp      -> text "exp"
@@ -793,10 +799,14 @@ pprCallishMachOp_for_C mop
         MO_F32_Asin     -> text "asinf"
         MO_F32_Acos     -> text "acosf"
         MO_F32_Atan     -> text "atanf"
+        MO_F32_Asinh    -> text "asinhf"
+        MO_F32_Acosh    -> text "acoshf"
+        MO_F32_Atanh    -> text "atanhf"
         MO_F32_Log      -> text "logf"
         MO_F32_Exp      -> text "expf"
         MO_F32_Sqrt     -> text "sqrtf"
         MO_F32_Fabs     -> text "fabsf"
+        MO_ReadBarrier  -> text "load_load_barrier"
         MO_WriteBarrier -> text "write_barrier"
         MO_Memcpy _     -> text "memcpy"
         MO_Memset _     -> text "memset"

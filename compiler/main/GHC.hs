@@ -1,5 +1,7 @@
 {-# LANGUAGE CPP, NondecreasingIndentation, ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections, NamedFieldPuns #-}
+{-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE TypeFamilies #-}
 
 -- -----------------------------------------------------------------------------
 --
@@ -78,6 +80,7 @@ module GHC (
         modInfoIsExportedName,
         modInfoLookupName,
         modInfoIface,
+        modInfoRdrEnv,
         modInfoSafe,
         lookupGlobalName,
         findGlobalAnns,
@@ -94,11 +97,11 @@ module GHC (
         -- * Interactive evaluation
 
         -- ** Executing statements
-        execStmt, ExecOptions(..), execOptions, ExecResult(..),
+        execStmt, execStmt', ExecOptions(..), execOptions, ExecResult(..),
         resumeExec,
 
         -- ** Adding new declarations
-        runDecls, runDeclsWithLocation,
+        runDecls, runDeclsWithLocation, runParsedDecls,
 
         -- ** Get/set the current context
         parseImportDecl,
@@ -250,6 +253,10 @@ module GHC (
 
         -- *** Deconstructing Located
         getLoc, unLoc,
+        getRealSrcSpan, unRealSrcSpan,
+
+        -- ** HasSrcSpan
+        HasSrcSpan(..), SrcSpanLess, dL, cL,
 
         -- *** Combining and comparing Located values
         eqLocated, cmpLocated, combineLocs, addCLoc,
@@ -291,7 +298,6 @@ import GhcPrelude hiding (init)
 import ByteCodeTypes
 import InteractiveEval
 import InteractiveEvalTypes
-import TcRnDriver       ( runTcInteractive )
 import GHCi
 import GHCi.RemoteTypes
 
@@ -327,6 +333,7 @@ import HscTypes
 import CmdLineParser
 import DynFlags hiding (WarnReason(..))
 import SysTools
+import SysTools.BaseDir
 import Annotations
 import Module
 import Panic
@@ -358,7 +365,6 @@ import Data.Set (Set)
 import qualified Data.Sequence as Seq
 import System.Directory ( doesFileExist )
 import Data.Maybe
-import Data.List        ( find )
 import Data.Time
 import Data.Typeable    ( Typeable )
 import Data.Word        ( Word8 )
@@ -495,8 +501,9 @@ withCleanupSession ghc = ghc `gfinally` cleanup
 initGhcMonad :: GhcMonad m => Maybe FilePath -> m ()
 initGhcMonad mb_top_dir
   = do { env <- liftIO $
-                do { mySettings <- initSysTools mb_top_dir
-                   ; myLlvmConfig <- initLlvmConfig mb_top_dir
+                do { top_dir <- findTopDir mb_top_dir
+                   ; mySettings <- initSysTools top_dir
+                   ; myLlvmConfig <- initLlvmConfig top_dir
                    ; dflags <- initDynFlags (defaultDynFlags mySettings myLlvmConfig)
                    ; checkBrokenTablesNextToCode dflags
                    ; setUnsafeGlobalDynFlags dflags
@@ -516,7 +523,7 @@ checkBrokenTablesNextToCode dflags
   = do { broken <- checkBrokenTablesNextToCode' dflags
        ; when broken
          $ do { _ <- liftIO $ throwIO $ mkApiErr dflags invalidLdErr
-              ; fail "unsupported linker"
+              ; liftIO $ fail "unsupported linker"
               }
        }
   where
@@ -675,6 +682,8 @@ checkNewDynFlags dflags = do
 
 checkNewInteractiveDynFlags :: MonadIO m => DynFlags -> m DynFlags
 checkNewInteractiveDynFlags dflags0 = do
+  -- We currently don't support use of StaticPointers in expressions entered on
+  -- the REPL. See #12356.
   dflags1 <-
       if xopt LangExt.StaticPointers dflags0
       then do liftIO $ printOrThrowWarnings dflags0 $ listToBag
@@ -1213,6 +1222,9 @@ modInfoLookupName minf name = withSession $ \hsc_env -> do
 modInfoIface :: ModuleInfo -> Maybe ModIface
 modInfoIface = minf_iface
 
+modInfoRdrEnv :: ModuleInfo -> Maybe GlobalRdrEnv
+modInfoRdrEnv = minf_rdr_env
+
 -- | Retrieve module safe haskell mode
 modInfoSafe :: ModuleInfo -> SafeHaskellMode
 modInfoSafe = minf_safe
@@ -1378,7 +1390,7 @@ getRichTokenStream mod = do
 addSourceToTokens :: RealSrcLoc -> StringBuffer -> [Located Token]
                   -> [(Located Token, String)]
 addSourceToTokens _ _ [] = []
-addSourceToTokens loc buf (t@(L span _) : ts)
+addSourceToTokens loc buf (t@(dL->L span _) : ts)
     = case span of
       UnhelpfulSpan _ -> (t,"") : addSourceToTokens loc buf ts
       RealSrcSpan s   -> (t,str) : addSourceToTokens newLoc newBuf ts
@@ -1404,7 +1416,7 @@ showRichTokenStream ts = go startLoc ts ""
           getFile (RealSrcSpan s : _) = srcSpanFile s
           startLoc = mkRealSrcLoc sourceFile 1 1
           go _ [] = id
-          go loc ((L span _, str):ts)
+          go loc ((dL->L span _, str):ts)
               = case span of
                 UnhelpfulSpan _ -> go loc ts
                 RealSrcSpan s

@@ -47,15 +47,11 @@ static StgBool loadFatArchive(char tmp[static 20], FILE* f, pathchar* path)
 #elif defined(x86_64_HOST_ARCH)
     const uint32_t mycputype = CPU_TYPE_X86_64;
     const uint32_t mycpusubtype = CPU_SUBTYPE_X86_64_ALL;
-#elif defined(powerpc_HOST_ARCH)
-    const uint32_t mycputype = CPU_TYPE_POWERPC;
-    const uint32_t mycpusubtype = CPU_SUBTYPE_POWERPC_ALL;
-#elif defined(powerpc64_HOST_ARCH)
-    const uint32_t mycputype = CPU_TYPE_POWERPC64;
-    const uint32_t mycpusubtype = CPU_SUBTYPE_POWERPC_ALL;
 #elif defined(aarch64_HOST_ARCH)
     const uint32_t mycputype = CPU_TYPE_ARM64;
     const uint32_t mycpusubtype = CPU_SUBTYPE_ARM64_ALL;
+#elif defined(powerpc_HOST_ARCH) || defined(powerpc64_HOST_ARCH)
+#error No Darwin support on PowerPC
 #else
 #error Unknown Darwin architecture
 #endif
@@ -490,12 +486,7 @@ static HsInt loadArchive_ (pathchar *path)
 
             DEBUG_LOG("Member is an object file...loading...\n");
 
-#if defined(mingw32_HOST_OS)
-            // TODO: We would like to use allocateExec here, but allocateExec
-            //       cannot currently allocate blocks large enough.
-            image = allocateImageAndTrampolines(path, fileName, f, memberSize,
-                                                isThin);
-#elif defined(darwin_HOST_OS) || defined(ios_HOST_OS)
+#if defined(darwin_HOST_OS) || defined(ios_HOST_OS)
             if (RTS_LINKER_USE_MMAP)
                 image = mmapForLinker(memberSize, MAP_ANONYMOUS, -1, 0);
             else {
@@ -506,7 +497,7 @@ static HsInt loadArchive_ (pathchar *path)
                 image += misalignment;
             }
 
-#else // not windows or darwin
+#else // not darwin
             image = stgMallocBytes(memberSize, "loadArchive(image)");
 #endif
             if (isThin) {

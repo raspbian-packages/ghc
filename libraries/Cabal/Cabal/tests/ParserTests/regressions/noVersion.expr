@@ -9,12 +9,14 @@ GenericPackageDescription
                                                `PackageName "bad-package"`
                                                (IntersectVersionRanges
                                                   (LaterVersion `mkVersion [1]`)
-                                                  (EarlierVersion `mkVersion [1]`))],
+                                                  (EarlierVersion `mkVersion [1]`))
+                                               (Set.fromList [LMainLibName])],
                       condTreeData = Library
                                        {exposedModules = [`ModuleName ["ElseIf"]`],
                                         libBuildInfo = BuildInfo
                                                          {asmOptions = [],
                                                           asmSources = [],
+                                                          autogenIncludes = [],
                                                           autogenModules = [],
                                                           buildToolDepends = [],
                                                           buildTools = [],
@@ -30,6 +32,7 @@ GenericPackageDescription
                                                           defaultExtensions = [],
                                                           defaultLanguage = Just Haskell2010,
                                                           extraBundledLibs = [],
+                                                          extraDynLibFlavours = [],
                                                           extraFrameworkDirs = [],
                                                           extraGHCiLibs = [],
                                                           extraLibDirs = [],
@@ -44,24 +47,27 @@ GenericPackageDescription
                                                           ldOptions = [],
                                                           mixins = [],
                                                           oldExtensions = [],
-                                                          options = [],
+                                                          options = PerCompilerFlavor [] [],
                                                           otherExtensions = [],
                                                           otherLanguages = [],
                                                           otherModules = [],
                                                           pkgconfigDepends = [],
-                                                          profOptions = [],
-                                                          sharedOptions = [],
-                                                          staticOptions = [],
+                                                          profOptions = PerCompilerFlavor [] [],
+                                                          sharedOptions = PerCompilerFlavor [] [],
+                                                          staticOptions = PerCompilerFlavor [] [],
                                                           targetBuildDepends = [Dependency
                                                                                   `PackageName "bad-package"`
                                                                                   (IntersectVersionRanges
                                                                                      (LaterVersion
                                                                                         `mkVersion [1]`)
                                                                                      (EarlierVersion
-                                                                                        `mkVersion [1]`))],
+                                                                                        `mkVersion [1]`))
+                                                                                  (Set.fromList
+                                                                                     [LMainLibName])],
                                                           virtualModules = []},
                                         libExposed = True,
-                                        libName = Nothing,
+                                        libName = LMainLibName,
+                                        libVisibility = LibraryVisibilityPublic,
                                         reexportedModules = [],
                                         signatures = []}},
    condSubLibraries = [],

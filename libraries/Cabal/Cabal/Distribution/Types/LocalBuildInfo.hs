@@ -46,11 +46,6 @@ module Distribution.Types.LocalBuildInfo (
     withAllTargetsInBuildOrder,
     neededTargetsInBuildOrder,
     withNeededTargetsInBuildOrder,
-
-    -- * Backwards compatibility.
-
-    componentsConfigs,
-    externalPackageDeps,
   ) where
 
 import Prelude ()
@@ -60,7 +55,6 @@ import Distribution.Types.PackageDescription
 import Distribution.Types.ComponentLocalBuildInfo
 import Distribution.Types.ComponentRequestedSpec
 import Distribution.Types.ComponentId
-import Distribution.Types.MungedPackageId
 import Distribution.Types.PackageId
 import Distribution.Types.UnitId
 import Distribution.Types.TargetInfo
@@ -73,8 +67,8 @@ import Distribution.PackageDescription
 import Distribution.Simple.Compiler
 import Distribution.Simple.PackageIndex
 import Distribution.Simple.Setup
-import Distribution.Text
 import Distribution.System
+import Distribution.Pretty
 
 import Distribution.Compat.Graph (Graph)
 import qualified Distribution.Compat.Graph as Graph
@@ -135,7 +129,7 @@ data LocalBuildInfo = LocalBuildInfo {
                 -- In principle, this is supposed to contain the
                 -- resolved package description, that does not contain
                 -- any conditionals.  However, it MAY NOT contain
-                -- the description wtih a 'HookedBuildInfo' applied
+                -- the description with a 'HookedBuildInfo' applied
                 -- to it; see 'HookedBuildInfo' for the whole sordid saga.
                 -- As much as possible, Cabal library should avoid using
                 -- this parameter.
@@ -146,6 +140,7 @@ data LocalBuildInfo = LocalBuildInfo {
         withSharedLib :: Bool,  -- ^Whether to build shared versions of libs.
         withStaticLib :: Bool,  -- ^Whether to build static versions of libs (with all other libs rolled in)
         withDynExe    :: Bool,  -- ^Whether to link executables dynamically
+        withFullyStaticExe :: Bool,  -- ^Whether to link executables fully statically
         withProfExe   :: Bool,  -- ^Whether to build executables for profiling.
         withProfLibDetail :: ProfDetailLevel, -- ^Level of automatic profile detail.
         withProfExeDetail :: ProfDetailLevel, -- ^Level of automatic profile detail.
@@ -176,10 +171,10 @@ instance Binary LocalBuildInfo
 -- on the package ID.
 localComponentId :: LocalBuildInfo -> ComponentId
 localComponentId lbi =
-    case componentNameCLBIs lbi CLibName of
+    case componentNameCLBIs lbi (CLibName LMainLibName) of
         [LibComponentLocalBuildInfo { componentComponentId = cid }]
           -> cid
-        _ -> mkComponentId (display (localPackage lbi))
+        _ -> mkComponentId (prettyShow (localPackage lbi))
 
 -- | Extract the 'PackageIdentifier' of a 'LocalBuildInfo'.
 -- This is a "safe" use of 'localPkgDescr'
@@ -191,7 +186,7 @@ localPackage lbi = package (localPkgDescr lbi)
 -- the package ID.
 localUnitId :: LocalBuildInfo -> UnitId
 localUnitId lbi =
-    case componentNameCLBIs lbi CLibName of
+    case componentNameCLBIs lbi (CLibName LMainLibName) of
         [LibComponentLocalBuildInfo { componentUnitId = uid }]
           -> uid
         _ -> mkLegacyUnitId $ localPackage lbi
@@ -201,10 +196,10 @@ localUnitId lbi =
 -- on the package ID.
 localCompatPackageKey :: LocalBuildInfo -> String
 localCompatPackageKey lbi =
-    case componentNameCLBIs lbi CLibName of
+    case componentNameCLBIs lbi (CLibName LMainLibName) of
         [LibComponentLocalBuildInfo { componentCompatPackageKey = pk }]
           -> pk
-        _ -> display (localPackage lbi)
+        _ -> prettyShow (localPackage lbi)
 
 -- | Convenience function to generate a default 'TargetInfo' from a
 -- 'ComponentLocalBuildInfo'.  The idea is to call this once, and then
@@ -267,7 +262,7 @@ withAllTargetsInBuildOrder' pkg_descr lbi f
 neededTargetsInBuildOrder' :: PackageDescription -> LocalBuildInfo -> [UnitId] -> [TargetInfo]
 neededTargetsInBuildOrder' pkg_descr lbi uids =
   case Graph.closure (componentGraph lbi) uids of
-    Nothing -> error $ "localBuildPlan: missing uids " ++ intercalate ", " (map display uids)
+    Nothing -> error $ "localBuildPlan: missing uids " ++ intercalate ", " (map prettyShow uids)
     Just clos -> map (mkTargetInfo pkg_descr lbi) (Graph.revTopSort (Graph.fromDistinctList clos))
 
 -- | Execute @f@ for every 'TargetInfo' needed to build @uid@s, respecting
@@ -305,32 +300,3 @@ neededTargetsInBuildOrder lbi = neededTargetsInBuildOrder' (localPkgDescr lbi) l
 
 withNeededTargetsInBuildOrder :: LocalBuildInfo -> [UnitId] -> (TargetInfo -> IO ()) -> IO ()
 withNeededTargetsInBuildOrder lbi = withNeededTargetsInBuildOrder' (localPkgDescr lbi) lbi
-
--------------------------------------------------------------------------------
--- Backwards compatibility
-
-{-# DEPRECATED componentsConfigs "Use 'componentGraph' instead; you can get a list of 'ComponentLocalBuildInfo' with 'Distribution.Compat.Graph.toList'. There's not a good way to get the list of 'ComponentName's the 'ComponentLocalBuildInfo' depends on because this query doesn't make sense; the graph is indexed by 'UnitId' not 'ComponentName'.  Given a 'UnitId' you can lookup the 'ComponentLocalBuildInfo' ('getCLBI') and then get the 'ComponentName' ('componentLocalName]). To be removed in Cabal 3.0" #-}
-componentsConfigs :: LocalBuildInfo -> [(ComponentName, ComponentLocalBuildInfo, [ComponentName])]
-componentsConfigs lbi =
-    [ (componentLocalName clbi,
-       clbi,
-       mapMaybe (fmap componentLocalName . flip Graph.lookup g)
-                (componentInternalDeps clbi))
-    | clbi <- Graph.toList g ]
-  where
-    g = componentGraph lbi
-
--- | External package dependencies for the package as a whole. This is the
--- union of the individual 'componentPackageDeps', less any internal deps.
-{-# DEPRECATED externalPackageDeps "You almost certainly don't want this function, which agglomerates the dependencies of ALL enabled components.  If you're using this to write out information on your dependencies, read off the dependencies directly from the actual component in question.  To be removed in Cabal 3.0" #-}
-externalPackageDeps :: LocalBuildInfo -> [(UnitId, MungedPackageId)]
-externalPackageDeps lbi =
-    -- TODO:  what about non-buildable components?
-    nub [ (ipkgid, pkgid)
-        | clbi            <- Graph.toList (componentGraph lbi)
-        , (ipkgid, pkgid) <- componentPackageDeps clbi
-        , not (internal ipkgid) ]
-  where
-    -- True if this dependency is an internal one (depends on the library
-    -- defined in the same package).
-    internal ipkgid = any ((==ipkgid) . componentUnitId) (Graph.toList (componentGraph lbi))

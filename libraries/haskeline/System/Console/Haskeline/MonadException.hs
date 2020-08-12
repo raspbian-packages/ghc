@@ -1,3 +1,4 @@
+{-# OPTIONS_GHC -fno-warn-warnings-deprecations #-}
 {- | This module redefines some of the functions in "Control.Exception" to
 work for more general monads built on top of 'IO'.
 -}
@@ -28,9 +29,6 @@ module System.Console.Haskeline.MonadException(
 
 import qualified Control.Exception as E
 import Control.Exception (Exception,SomeException)
-#if __GLASGOW_HASKELL__ < 705
-import Prelude hiding (catch)
-#endif
 import Control.Monad(liftM, join)
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Identity
@@ -41,7 +39,6 @@ import Control.Monad.Trans.List
 import Control.Monad.Trans.Maybe
 import Control.Monad.Trans.RWS
 import Control.Monad.Trans.Writer
-import Data.Monoid
 import Control.Concurrent(ThreadId)
 
 -- This approach is based on that of the monad-control package.

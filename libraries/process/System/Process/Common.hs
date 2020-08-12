@@ -74,7 +74,7 @@ data CreateProcess = CreateProcess{
   std_in       :: StdStream,               -- ^ How to determine stdin
   std_out      :: StdStream,               -- ^ How to determine stdout
   std_err      :: StdStream,               -- ^ How to determine stderr
-  close_fds    :: Bool,                    -- ^ Close all file descriptors except stdin, stdout and stderr in the new process (on Windows, only works if std_in, std_out, and std_err are all Inherit)
+  close_fds    :: Bool,                    -- ^ Close all file descriptors except stdin, stdout and stderr in the new process (on Windows, only works if std_in, std_out, and std_err are all Inherit). This implementation will call close an every fd from 3 to the maximum of open files, which can be slow for high maximum of open files.
   create_group :: Bool,                    -- ^ Create a new process group
   delegate_ctlc:: Bool,                    -- ^ Delegate control-C handling. Use this for interactive console processes to let them handle control-C themselves (see below for details).
                                            --
@@ -103,7 +103,7 @@ data CreateProcess = CreateProcess{
                                            --
                                            --   @since 1.4.0.0
   use_process_jobs :: Bool                 -- ^ On Windows systems this flag indicates that we should wait for the entire process tree
-                                           --   to finish before unblocking. On POSIX systems this flag is ignored.
+                                           --   to finish before unblocking. On POSIX systems this flag is ignored. See $exec-on-windows for details.
                                            --
                                            --   Default: @False@
                                            --
@@ -186,8 +186,13 @@ data StdStream
      completion. This requires two handles. A process job handle and
      a events handle to monitor.
 -}
-data ProcessHandle__ = OpenHandle PHANDLE
-                     | OpenExtHandle PHANDLE PHANDLE PHANDLE
+data ProcessHandle__ = OpenHandle { phdlProcessHandle :: PHANDLE }
+                     | OpenExtHandle { phdlProcessHandle :: PHANDLE
+                                     -- ^ the process
+                                     , phdlJobHandle     :: PHANDLE
+                                     -- ^ the job containing the process and
+                                     -- its subprocesses
+                                     }
                      | ClosedHandle ExitCode
 data ProcessHandle
   = ProcessHandle { phandle          :: !(MVar ProcessHandle__)

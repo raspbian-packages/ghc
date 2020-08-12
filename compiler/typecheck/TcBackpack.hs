@@ -65,7 +65,7 @@ import RnModIface
 import Util
 
 import Control.Monad
-import Data.List (find, foldl')
+import Data.List (find)
 
 import {-# SOURCE #-} TcRnDriver
 
@@ -208,7 +208,7 @@ check_inst sig_inst = do
            (tvs, theta, pred) }}
         origin = InstProvidedOrigin (tcg_semantic_mod tcg_env) sig_inst
     (skol_subst, tvs_skols) <- tcInstSkolTyVars tvs -- Skolemize
-    (cts, tclvl) <- pushTcLevelM $ do
+    (tclvl,cts) <- pushTcLevelM $ do
        wanted <- newWanted origin
                            (Just TypeLevel)
                            (substTy skol_subst pred)
@@ -582,7 +582,7 @@ mergeSignatures
                         -- signatures that are merged in, we will discover this
                         -- when we run exports_from_avail on the final merged
                         -- export list.
-                        (msgs, mb_r) <- tryTc $ do
+                        (mb_r, msgs) <- tryTc $ do
                             -- Suppose that we have written in a signature:
                             --  signature A ( module A ) where {- empty -}
                             -- If I am also inheriting a signature from a

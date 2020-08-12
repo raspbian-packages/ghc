@@ -19,6 +19,7 @@ module StringBuffer
          -- * Creation\/destruction
         hGetStringBuffer,
         hGetStringBufferBlock,
+        hPutStringBuffer,
         appendStringBuffers,
         stringToStringBuffer,
 
@@ -50,7 +51,7 @@ import GhcPrelude
 import Encoding
 import FastString
 import FastFunctions
-import Outputable
+import PlainPanic
 import Util
 
 import Data.Maybe
@@ -81,7 +82,7 @@ data StringBuffer
      cur :: {-# UNPACK #-} !Int         -- current pos
   }
   -- The buffer is assumed to be UTF-8 encoded, and furthermore
-  -- we add three '\0' bytes to the end as sentinels so that the
+  -- we add three @\'\\0\'@ bytes to the end as sentinels so that the
   -- decoder doesn't have to check for overflow at every single byte
   -- of a multibyte sequence.
 
@@ -120,6 +121,11 @@ hGetStringBufferBlock handle wanted
                 if r /= size
                    then ioError (userError $ "short read of file: "++show(r,size,size_i,handle))
                    else newUTF8StringBuffer buf ptr size
+
+hPutStringBuffer :: Handle -> StringBuffer -> IO ()
+hPutStringBuffer hdl (StringBuffer buf len cur)
+    = do withForeignPtr (plusForeignPtr buf cur) $ \ptr ->
+             hPutBuf hdl ptr len
 
 -- | Skip the byte-order mark if there is one (see #1744 and #6016),
 -- and return the new position of the handle in bytes.
@@ -187,7 +193,7 @@ stringToStringBuffer str =
 -- the remaining portion (analogous to 'Data.List.uncons').  __Warning:__ The
 -- behavior is undefined if the 'StringBuffer' is empty.  The result shares
 -- the same buffer as the original.  Similar to 'utf8DecodeChar', if the
--- character cannot be decoded as UTF-8, '\0' is returned.
+-- character cannot be decoded as UTF-8, @\'\\0\'@ is returned.
 {-# INLINE nextChar #-}
 nextChar :: StringBuffer -> (Char,StringBuffer)
 nextChar (StringBuffer buf len (I# cur#)) =
@@ -202,7 +208,7 @@ nextChar (StringBuffer buf len (I# cur#)) =
 -- | Return the first UTF-8 character of a nonempty 'StringBuffer' (analogous
 -- to 'Data.List.head').  __Warning:__ The behavior is undefined if the
 -- 'StringBuffer' is empty.  Similar to 'utf8DecodeChar', if the character
--- cannot be decoded as UTF-8, '\0' is returned.
+-- cannot be decoded as UTF-8, @\'\\0\'@ is returned.
 currentChar :: StringBuffer -> Char
 currentChar = fst . nextChar
 
@@ -285,7 +291,7 @@ skipToLine !line !len !op0 = go 1 op0
 
 -- | Decode the first @n@ bytes of a 'StringBuffer' as UTF-8 into a 'String'.
 -- Similar to 'utf8DecodeChar', if the character cannot be decoded as UTF-8,
--- they will be replaced with '\0'.
+-- they will be replaced with @\'\\0\'@.
 lexemeToString :: StringBuffer
                -> Int                   -- ^ @n@, the number of bytes
                -> String

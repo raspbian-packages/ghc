@@ -12,7 +12,8 @@ module LlvmCodeGen.Base (
         LiveGlobalRegs,
         LlvmUnresData, LlvmData, UnresLabel, UnresStatic,
 
-        LlvmVersion, supportedLlvmVersion, llvmVersionStr,
+        LlvmVersion, supportedLlvmVersion, llvmVersionSupported, parseLlvmVersion,
+        llvmVersionStr, llvmVersionList,
 
         LlvmM,
         runLlvm, liftStream, withClearVars, varLookup, varInsert,
@@ -58,6 +59,9 @@ import ErrUtils
 import qualified Stream
 
 import Control.Monad (ap)
+import Data.Char (isDigit)
+import Data.List (intercalate)
+import qualified Data.List.NonEmpty as NE
 
 -- ----------------------------------------------------------------------------
 -- * Some Data Types
@@ -175,15 +179,35 @@ llvmPtrBits dflags = widthInBits $ typeWidth $ gcWord dflags
 -- * Llvm Version
 --
 
--- | LLVM Version Number
-type LlvmVersion = (Int, Int)
+-- Newtype to avoid using the Eq instance!
+newtype LlvmVersion = LlvmVersion { llvmVersionNE :: NE.NonEmpty Int }
+
+parseLlvmVersion :: String -> Maybe LlvmVersion
+parseLlvmVersion =
+    fmap LlvmVersion . NE.nonEmpty . go [] . dropWhile (not . isDigit)
+  where
+    go vs s
+      | null ver_str
+      = reverse vs
+      | '.' : rest' <- rest
+      = go (read ver_str : vs) rest'
+      | otherwise
+      = reverse (read ver_str : vs)
+      where
+        (ver_str, rest) = span isDigit s
 
 -- | The LLVM Version that is currently supported.
 supportedLlvmVersion :: LlvmVersion
-supportedLlvmVersion = sUPPORTED_LLVM_VERSION
+supportedLlvmVersion = LlvmVersion (sUPPORTED_LLVM_VERSION NE.:| [])
+
+llvmVersionSupported :: LlvmVersion -> Bool
+llvmVersionSupported (LlvmVersion v) = NE.head v == sUPPORTED_LLVM_VERSION
 
 llvmVersionStr :: LlvmVersion -> String
-llvmVersionStr (major, minor) = show major ++ "." ++ show minor
+llvmVersionStr = intercalate "." . map show . llvmVersionList
+
+llvmVersionList :: LlvmVersion -> [Int]
+llvmVersionList = NE.toList . llvmVersionNE
 
 -- ----------------------------------------------------------------------------
 -- * Environment Handling
@@ -474,14 +498,13 @@ generateExternDecls = do
 -- @$def@ suffix, and generate the appropriate alias.
 aliasify :: LMGlobal -> LlvmM [LMGlobal]
 aliasify (LMGlobal var val) = do
-    let i8Ptr = LMPointer (LMInt 8)
-        LMGlobalVar lbl ty link sect align const = var
+    let LMGlobalVar lbl ty link sect align const = var
 
         defLbl = lbl `appendFS` fsLit "$def"
         defVar = LMGlobalVar defLbl ty Internal sect align const
 
         defPtrVar = LMGlobalVar defLbl (LMPointer ty) link Nothing Nothing const
-        aliasVar = LMGlobalVar lbl (LMPointer i8Ptr) link Nothing Nothing Alias
+        aliasVar = LMGlobalVar lbl i8Ptr link Nothing Nothing Alias
         aliasVal = LMBitc (LMStaticPointer defPtrVar) i8Ptr
 
     -- we need to mark the $def symbols as used so LLVM doesn't forget which

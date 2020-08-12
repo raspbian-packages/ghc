@@ -219,7 +219,7 @@ lazySetIdInfo = Var.lazySetIdInfo
 
 setIdInfo :: Id -> IdInfo -> Id
 setIdInfo id info = info `seq` (lazySetIdInfo id info)
-        -- Try to avoid spack leaks by seq'ing
+        -- Try to avoid space leaks by seq'ing
 
 modifyIdInfo :: HasDebugCallStack => (IdInfo -> IdInfo) -> Id -> Id
 modifyIdInfo fn id = setIdInfo id (fn (idInfo id))
@@ -267,20 +267,20 @@ mkVanillaGlobalWithInfo = mkGlobalId VanillaId
 -- | For an explanation of global vs. local 'Id's, see "Var#globalvslocal"
 mkLocalId :: Name -> Type -> Id
 mkLocalId name ty = mkLocalIdWithInfo name ty vanillaIdInfo
- -- It's tempting to ASSERT( not (isCoercionType ty) ), but don't. Sometimes,
+ -- It's tempting to ASSERT( not (isCoVarType ty) ), but don't. Sometimes,
  -- the type is a panic. (Search invented_id)
 
 -- | Make a local CoVar
 mkLocalCoVar :: Name -> Type -> CoVar
 mkLocalCoVar name ty
-  = ASSERT( isCoercionType ty )
+  = ASSERT( isCoVarType ty )
     Var.mkLocalVar CoVarId name ty vanillaIdInfo
 
 -- | Like 'mkLocalId', but checks the type to see if it should make a covar
 mkLocalIdOrCoVar :: Name -> Type -> Id
 mkLocalIdOrCoVar name ty
-  | isCoercionType ty = mkLocalCoVar name ty
-  | otherwise         = mkLocalId    name ty
+  | isCoVarType ty = mkLocalCoVar name ty
+  | otherwise      = mkLocalId    name ty
 
 -- | Make a local id, with the IdDetails set to CoVarId if the type indicates
 -- so.
@@ -288,8 +288,8 @@ mkLocalIdOrCoVarWithInfo :: Name -> Type -> IdInfo -> Id
 mkLocalIdOrCoVarWithInfo name ty info
   = Var.mkLocalVar details name ty info
   where
-    details | isCoercionType ty = CoVarId
-            | otherwise         = VanillaId
+    details | isCoVarType ty = CoVarId
+            | otherwise      = VanillaId
 
     -- proper ids only; no covars!
 mkLocalIdWithInfo :: Name -> Type -> IdInfo -> Id
@@ -311,7 +311,7 @@ mkExportedVanillaId name ty = Var.mkExportedLocalVar VanillaId name ty vanillaId
 -- | Create a system local 'Id'. These are local 'Id's (see "Var#globalvslocal")
 -- that are created by the compiler out of thin air
 mkSysLocal :: FastString -> Unique -> Type -> Id
-mkSysLocal fs uniq ty = ASSERT( not (isCoercionType ty) )
+mkSysLocal fs uniq ty = ASSERT( not (isCoVarType ty) )
                         mkLocalId (mkSystemVarName uniq fs) ty
 
 -- | Like 'mkSysLocal', but checks to see if we have a covar type
@@ -328,7 +328,7 @@ mkSysLocalOrCoVarM fs ty
 
 -- | Create a user local 'Id'. These are local 'Id's (see "Var#globalvslocal") with a name and location that the user might recognize
 mkUserLocal :: OccName -> Unique -> Type -> SrcSpan -> Id
-mkUserLocal occ uniq ty loc = ASSERT( not (isCoercionType ty) )
+mkUserLocal occ uniq ty loc = ASSERT( not (isCoVarType ty) )
                               mkLocalId (mkInternalName uniq occ loc) ty
 
 -- | Like 'mkUserLocal', but checks if we have a coercion type
@@ -511,9 +511,17 @@ hasNoBinding :: Id -> Bool
 -- Data constructor workers used to be things of this kind, but
 -- they aren't any more.  Instead, we inject a binding for
 -- them at the CorePrep stage.
+--
+-- 'PrimOpId's also used to be of this kind. See Note [Primop wrappers] in PrimOp.hs.
+-- for the history of this.
+--
+-- Note that CorePrep currently eta expands things no-binding things and this
+-- can cause quite subtle bugs. See Note [Eta expansion of hasNoBinding things
+-- in CorePrep] in CorePrep for details.
+--
 -- EXCEPT: unboxed tuples, which definitely have no binding
 hasNoBinding id = case Var.idDetails id of
-                        PrimOpId _       -> True        -- See Note [Primop wrappers]
+                        PrimOpId _       -> False   -- See Note [Primop wrappers] in PrimOp.hs
                         FCallId _        -> True
                         DataConWorkId dc -> isUnboxedTupleCon dc || isUnboxedSumCon dc
                         _                -> isCompulsoryUnfolding (idUnfolding id)
@@ -557,19 +565,6 @@ The easiest way to do this is for hasNoBinding to return True of all things
 that have compulsory unfolding.  A very Ids with a compulsory unfolding also
 have a binding, but it does not harm to say they don't here, and its a very
 simple way to fix Trac #14561.
-
-Note [Primop wrappers]
-~~~~~~~~~~~~~~~~~~~~~~
-Currently hasNoBinding claims that PrimOpIds don't have a curried
-function definition.  But actually they do, in GHC.PrimopWrappers,
-which is auto-generated from prelude/primops.txt.pp.  So actually, hasNoBinding
-could return 'False' for PrimOpIds.
-
-But we'd need to add something in CoreToStg to swizzle any unsaturated
-applications of GHC.Prim.plusInt# to GHC.PrimopWrappers.plusInt#.
-
-Nota Bene: GHC.PrimopWrappers is needed *regardless*, because it's
-used by GHCi, which does not implement primops direct at all.
 -}
 
 isDeadBinder :: Id -> Bool
@@ -585,7 +580,7 @@ isDeadBinder bndr | isId bndr = isDeadOcc (idOccInfo bndr)
 -}
 
 isEvVar :: Var -> Bool
-isEvVar var = isPredTy (varType var)
+isEvVar var = isEvVarType (varType var)
 
 isDictId :: Id -> Bool
 isDictId id = isDictTy (idType id)
@@ -897,9 +892,10 @@ zapStableUnfolding id
 {-
 Note [transferPolyIdInfo]
 ~~~~~~~~~~~~~~~~~~~~~~~~~
-This transfer is used in two places:
+This transfer is used in three places:
         FloatOut (long-distance let-floating)
         SimplUtils.abstractFloats (short-distance let-floating)
+        StgLiftLams (selectively lambda-lift local functions to top-level)
 
 Consider the short-distance let-floating:
 

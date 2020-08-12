@@ -1,6 +1,5 @@
 name:           directory
-version:        1.3.3.0
--- NOTE: Don't forget to update ./changelog.md
+version:        1.3.6.0
 license:        BSD3
 license-file:   LICENSE
 maintainer:     libraries@haskell.org
@@ -55,7 +54,7 @@ Library
     include-dirs: .
 
     build-depends:
-        base     >= 4.5 && < 4.13,
+        base     >= 4.5 && < 4.15,
         time     >= 1.4 && < 1.10,
         filepath >= 1.3 && < 1.5
     if os(windows)
@@ -97,6 +96,7 @@ test-suite test
         GetDirContents002
         GetFileSize
         GetHomeDirectory001
+        GetHomeDirectory002
         GetPermissions001
         LongPaths
         MakeAbsolute
@@ -107,6 +107,7 @@ test-suite test
         RenameFile001
         RenamePath
         Safe
+        Simplify
         T8482
         WithCurrentDirectory
         Xdg

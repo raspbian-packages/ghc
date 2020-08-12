@@ -26,14 +26,12 @@
 
 module Distribution.InstalledPackageInfo (
         InstalledPackageInfo(..),
-        installedPackageId,
         installedComponentId,
         installedOpenUnitId,
         sourceComponentName,
         requiredSignatures,
         ExposedModule(..),
         AbiDependency(..),
-        ParseResult(..), PError(..), PWarning,
         emptyInstalledPackageInfo,
         parseInstalledPackageInfo,
         showInstalledPackageInfo,
@@ -51,18 +49,13 @@ import Distribution.CabalSpecVersion         (cabalSpecLatest)
 import Distribution.FieldGrammar
 import Distribution.FieldGrammar.FieldDescrs
 import Distribution.ModuleName
-import Distribution.Package                  hiding (installedPackageId, installedUnitId)
-import Distribution.ParseUtils
+import Distribution.Package                  hiding (installedUnitId)
 import Distribution.Types.ComponentName
 import Distribution.Utils.Generic            (toUTF8BS)
 
-import qualified Data.Map                        as Map
-import qualified Distribution.Parsec.Common      as P
-import qualified Distribution.Parsec.Parser      as P
-import qualified Distribution.Parsec.ParseResult as P
-import qualified Text.Parsec.Error               as Parsec
-import qualified Text.Parsec.Pos                 as Parsec
-import qualified Text.PrettyPrint                as Disp
+import qualified Data.Map            as Map
+import qualified Distribution.Fields as P
+import qualified Text.PrettyPrint    as Disp
 
 import Distribution.Types.InstalledPackageInfo
 import Distribution.Types.InstalledPackageInfo.FieldGrammar
@@ -89,36 +82,29 @@ installedOpenUnitId ipi
 requiredSignatures :: InstalledPackageInfo -> Set ModuleName
 requiredSignatures ipi = openModuleSubstFreeHoles (Map.fromList (instantiatedWith ipi))
 
-{-# DEPRECATED installedPackageId "Use installedUnitId instead" #-}
--- | Backwards compatibility with Cabal pre-1.24.
---
--- This type synonym is slightly awful because in cabal-install
--- we define an 'InstalledPackageId' but it's a ComponentId,
--- not a UnitId!
-installedPackageId :: InstalledPackageInfo -> UnitId
-installedPackageId = installedUnitId
-
 -- -----------------------------------------------------------------------------
 -- Munging
 
 sourceComponentName :: InstalledPackageInfo -> ComponentName
-sourceComponentName ipi =
-    case sourceLibName ipi of
-        Nothing -> CLibName
-        Just qn -> CSubLibName qn
+sourceComponentName = CLibName . sourceLibName
 
 -- -----------------------------------------------------------------------------
 -- Parsing
 
-parseInstalledPackageInfo :: String -> ParseResult InstalledPackageInfo
+-- | Return either errors, or IPI with list of warnings
+--
+-- /Note:/ errors array /may/ be empty, but the parse is still failed (it's a bug though)
+parseInstalledPackageInfo
+    :: String
+    -> Either [String] ([String], InstalledPackageInfo)
 parseInstalledPackageInfo s = case P.readFields (toUTF8BS s) of
-    Left err -> ParseFailed (NoParse (show err) $ Parsec.sourceLine $ Parsec.errorPos err)
+    Left err -> Left [show err]
     Right fs -> case partitionFields fs of
         (fs', _) -> case P.runParseResult $ parseFieldGrammar cabalSpecLatest fs' ipiFieldGrammar of
-            (ws, Right x) -> ParseOk ws' x where
-                ws' = map (PWarning . P.showPWarning "") ws
-            (_,  Left (_, errs)) -> ParseFailed (NoParse errs' 0) where
-                errs' = intercalate "; " $ map (\(P.PError _ msg) -> msg) errs
+            (ws, Right x) -> Right (ws', x) where
+                ws' = map (P.showPWarning "") ws
+            (_,  Left (_, errs)) -> Left errs' where
+                errs' = map (P.showPError "") errs
 
 -- -----------------------------------------------------------------------------
 -- Pretty-printing
@@ -132,7 +118,7 @@ showInstalledPackageInfo ipi =
 
 -- | The variant of 'showInstalledPackageInfo' which outputs @pkgroot@ field too.
 showFullInstalledPackageInfo :: InstalledPackageInfo -> String
-showFullInstalledPackageInfo = Disp.render . (Disp.$+$ Disp.text "") . prettyFieldGrammar ipiFieldGrammar
+showFullInstalledPackageInfo = P.showFields (const []) . prettyFieldGrammar cabalSpecLatest ipiFieldGrammar
 
 -- |
 --
@@ -141,10 +127,15 @@ showFullInstalledPackageInfo = Disp.render . (Disp.$+$ Disp.text "") . prettyFie
 -- Just "maintainer: Tester"
 showInstalledPackageInfoField :: String -> Maybe (InstalledPackageInfo -> String)
 showInstalledPackageInfoField fn =
-    fmap (\g -> Disp.render . ppField fn . g) $ fieldDescrPretty ipiFieldGrammar fn
+    fmap (\g -> Disp.render . ppField fn . g) $ fieldDescrPretty ipiFieldGrammar (toUTF8BS fn)
 
 showSimpleInstalledPackageInfoField :: String -> Maybe (InstalledPackageInfo -> String)
 showSimpleInstalledPackageInfoField fn =
-    fmap (Disp.renderStyle myStyle .) $ fieldDescrPretty ipiFieldGrammar fn
+    fmap (Disp.renderStyle myStyle .) $ fieldDescrPretty ipiFieldGrammar (toUTF8BS fn)
   where
     myStyle = Disp.style { Disp.mode = Disp.LeftMode }
+
+ppField :: String -> Disp.Doc -> Disp.Doc
+ppField name fielddoc
+     | Disp.isEmpty fielddoc = mempty
+     | otherwise             = Disp.text name <<>> Disp.colon Disp.<+> fielddoc

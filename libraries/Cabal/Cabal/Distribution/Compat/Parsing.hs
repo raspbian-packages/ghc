@@ -26,7 +26,7 @@ module Distribution.Compat.Parsing
   , many     -- from Control.Applicative
   , sepBy
   , sepBy1
-  -- , sepByNonEmpty
+  , sepByNonEmpty
   , sepEndBy1
   -- , sepEndByNonEmpty
   , sepEndBy
@@ -59,7 +59,6 @@ import Control.Monad.Trans.Identity (IdentityT (..))
 import Data.Foldable (asum)
 
 import qualified Text.Parsec as Parsec
-import qualified Distribution.Compat.ReadP as ReadP
 
 -- | @choice ps@ tries to apply the parsers in the list @ps@ in order,
 -- until one of them succeeds. Returns the value of the succeeding
@@ -107,13 +106,11 @@ sepBy1 p sep = (:) <$> p <*> many (sep *> p)
 -- toList <$> sepByNonEmpty p sep
 {-# INLINE sepBy1 #-}
 
-{-
 -- | @sepByNonEmpty p sep@ parses /one/ or more occurrences of @p@, separated
 -- by @sep@. Returns a non-empty list of values returned by @p@.
 sepByNonEmpty :: Alternative m => m a -> m sep -> m (NonEmpty a)
 sepByNonEmpty p sep = (:|) <$> p <*> many (sep *> p)
 {-# INLINE sepByNonEmpty #-}
--}
 
 -- | @sepEndBy1 p sep@ parses /one/ or more occurrences of @p@,
 -- separated and optionally ended by @sep@. Returns a list of values
@@ -389,15 +386,3 @@ instance (Parsec.Stream s m t, Show t) => Parsing (Parsec.ParsecT s u m) where
   unexpected    = Parsec.unexpected
   eof           = Parsec.eof
   notFollowedBy = Parsec.notFollowedBy
-
-instance t ~ Char => Parsing (ReadP.Parser r t) where
-  try        = id
-  (<?>)      = const
-  skipMany   = ReadP.skipMany
-  skipSome   = ReadP.skipMany1
-  unexpected = const ReadP.pfail
-  eof        = ReadP.eof
-
-  -- TODO: we would like to have <++ here
-  notFollowedBy p = ((Just <$> p) ReadP.+++ pure Nothing)
-    >>= maybe (pure ()) (unexpected . show)

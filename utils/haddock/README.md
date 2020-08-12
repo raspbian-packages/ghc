@@ -1,4 +1,4 @@
-# Haddock, a Haskell Documentation Tool [![Build Status](https://travis-ci.org/haskell/haddock.svg?branch=ghc-8.6)](https://travis-ci.org/haskell/haddock)
+# Haddock, a Haskell Documentation Tool [![Build Status](https://travis-ci.org/haskell/haddock.svg?branch=ghc-head)](https://travis-ci.org/haskell/haddock)
 
 
 ## About haddock
@@ -57,9 +57,9 @@ and then proceed using your favourite build tool.
 #### Using [`cabal new-build`](http://cabal.readthedocs.io/en/latest/nix-local-build-overview.html)
 
 ```bash
-cabal new-build -w ghc-8.6.1
+cabal new-build -w ghc-head
 # build & run the test suite
-cabal new-test -w ghc-8.6.1 all
+cabal new-test -w ghc-head all
 ```
 
 #### Using Cabal sandboxes
@@ -82,9 +82,9 @@ cabal test
 
 ```bash
 stack init
-stack install
+stack build
 # run the test suite
-export HADDOCK_PATH="$HOME/.local/bin/haddock"
+export HADDOCK_PATH="$(stack exec which haddock)"
 stack test
 ```
 

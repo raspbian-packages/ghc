@@ -18,7 +18,7 @@
 -- @InstDecl@, @DefaultDecl@ and @ForeignDecl@.
 module HsDecls (
   -- * Toplevel declarations
-  HsDecl(..), LHsDecl, HsDataDefn(..), HsDeriving,
+  HsDecl(..), LHsDecl, HsDataDefn(..), HsDeriving, LHsFunDep,
   HsDerivingClause(..), LHsDerivingClause, NewOrData(..), newOrDataToFlavour,
 
   -- ** Class or type declarations
@@ -37,7 +37,8 @@ module HsDecls (
   -- ** Instance declarations
   InstDecl(..), LInstDecl, FamilyInfo(..),
   TyFamInstDecl(..), LTyFamInstDecl, instDeclDataFamInsts,
-  DataFamInstDecl(..), LDataFamInstDecl, pprDataFamInstFlavour, pprFamInstLHS,
+  DataFamInstDecl(..), LDataFamInstDecl,
+  pprDataFamInstFlavour, pprHsFamInstLHS,
   FamInstEqn, LFamInstEqn, FamEqn(..),
   TyFamInstEqn, LTyFamInstEqn, TyFamDefltEqn, LTyFamDefltEqn,
   HsTyPats,
@@ -48,7 +49,7 @@ module HsDecls (
   -- ** Deriving strategies
   DerivStrategy(..), LDerivStrategy, derivStrategyName,
   -- ** @RULE@ declarations
-  LRuleDecls,RuleDecls(..),RuleDecl(..), LRuleDecl, HsRuleRn(..),
+  LRuleDecls,RuleDecls(..),RuleDecl(..),LRuleDecl,HsRuleRn(..),
   RuleBndr(..),LRuleBndr,
   collectRuleBndrSigTys,
   flattenRuleDecls, pprFullRuleName,
@@ -528,8 +529,7 @@ data TyClDecl pass
                 tcdLName   :: Located (IdP pass),      -- ^ Name of the class
                 tcdTyVars  :: LHsQTyVars pass,         -- ^ Class type variables
                 tcdFixity  :: LexicalFixity, -- ^ Fixity used in the declaration
-                tcdFDs     :: [Located (FunDep (Located (IdP pass)))],
-                                                        -- ^ Functional deps
+                tcdFDs     :: [LHsFunDep pass],         -- ^ Functional deps
                 tcdSigs    :: [LSig pass],              -- ^ Methods' signatures
                 tcdMeths   :: LHsBinds pass,            -- ^ Default methods
                 tcdATs     :: [LFamilyDecl pass],       -- ^ Associated types;
@@ -545,6 +545,8 @@ data TyClDecl pass
 
         -- For details on above see note [Api annotations] in ApiAnnotation
   | XTyClDecl (XXTyClDecl pass)
+
+type LHsFunDep pass = Located (FunDep (Located (IdP pass)))
 
 data DataDeclRn = DataDeclRn
              { tcdDataCusk :: Bool    -- ^ does this have a CUSK?
@@ -676,7 +678,7 @@ countTyClDecls decls
    isNewTy _                                                      = False
 
 -- | Does this declaration have a complete, user-supplied kind signature?
--- See Note [Complete user-supplied kind signatures]
+-- See Note [CUSKs: complete user-supplied kind signatures]
 hsDeclHasCusk :: TyClDecl GhcRn -> Bool
 hsDeclHasCusk (FamDecl { tcdFam = fam_decl }) = famDeclHasCusk Nothing fam_decl
 hsDeclHasCusk (SynDecl { tcdTyVars = tyvars, tcdRhs = rhs })
@@ -700,7 +702,7 @@ instance (p ~ GhcPass pass, OutputableBndrId p) => Outputable (TyClDecl p) where
     ppr (SynDecl { tcdLName = ltycon, tcdTyVars = tyvars, tcdFixity = fixity
                  , tcdRhs = rhs })
       = hang (text "type" <+>
-              pp_vanilla_decl_head ltycon tyvars fixity [] <+> equals)
+              pp_vanilla_decl_head ltycon tyvars fixity noLHsContext <+> equals)
           4 (ppr rhs)
 
     ppr (DataDecl { tcdLName = ltycon, tcdTyVars = tyvars, tcdFixity = fixity
@@ -722,8 +724,9 @@ instance (p ~ GhcPass pass, OutputableBndrId p) => Outputable (TyClDecl p) where
                                      pprLHsBindsForUser methods sigs) ]
       where
         top_matter = text "class"
-                    <+> pp_vanilla_decl_head lclas tyvars fixity (unLoc context)
+                    <+> pp_vanilla_decl_head lclas tyvars fixity context
                     <+> pprFundeps (map unLoc fds)
+
     ppr (XTyClDecl x) = ppr x
 
 instance (p ~ GhcPass pass, OutputableBndrId p)
@@ -742,10 +745,10 @@ pp_vanilla_decl_head :: (OutputableBndrId (GhcPass p))
    => Located (IdP (GhcPass p))
    -> LHsQTyVars (GhcPass p)
    -> LexicalFixity
-   -> HsContext (GhcPass p)
+   -> LHsContext (GhcPass p)
    -> SDoc
 pp_vanilla_decl_head thing (HsQTvs { hsq_explicit = tyvars }) fixity context
- = hsep [pprHsContext context, pp_tyvars tyvars]
+ = hsep [pprLHsContext context, pp_tyvars tyvars]
   where
     pp_tyvars (varl:varsr)
       | fixity == Infix && length varsr > 1
@@ -774,34 +777,83 @@ pprTyClDeclFlavour (DataDecl { tcdDataDefn = XHsDataDefn x })
 pprTyClDeclFlavour (XTyClDecl x) = ppr x
 
 
-{- Note [Complete user-supplied kind signatures]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+{- Note [CUSKs: complete user-supplied kind signatures]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 We kind-check declarations differently if they have a complete, user-supplied
 kind signature (CUSK). This is because we can safely generalise a CUSKed
 declaration before checking all of the others, supporting polymorphic recursion.
 See ghc.haskell.org/trac/ghc/wiki/GhcKinds/KindInference#Proposednewstrategy
 and #9200 for lots of discussion of how we got here.
 
-A declaration has a CUSK if we can know its complete kind without doing any
-inference, at all. Here are the rules:
+PRINCIPLE:
+  a type declaration has a CUSK iff we could produce a separate kind signature
+  for it, just like a type signature for a function,
+  looking only at the header of the declaration.
 
- - A class or datatype is said to have a CUSK if and only if all of its type
-variables are annotated. Its result kind is, by construction, Constraint or *
-respectively.
+Examples:
+  * data T1 (a :: *->*) (b :: *) = ....
+    -- Has CUSK; equivalant to   T1 :: (*->*) -> * -> *
 
- - A type synonym has a CUSK if and only if all of its type variables and its
-RHS are annotated with kinds.
+ * data T2 a b = ...
+   -- No CUSK; we do not want to guess T2 :: * -> * -> *
+   -- because the full decl might be   data T a b = MkT (a b)
 
- - A closed type family is said to have a CUSK if and only if all of its type
-variables and its return type are annotated.
+  * data T3 (a :: k -> *) (b :: *) = ...
+    -- CUSK; equivalent to   T3 :: (k -> *) -> * -> *
+    -- We lexically generalise over k to get
+    --    T3 :: forall k. (k -> *) -> * -> *
+    -- The generalisation is here is purely lexical, just like
+    --    f3 :: a -> a
+    -- means
+    --    f3 :: forall a. a -> a
 
- - An open type family always has a CUSK -- unannotated type variables (and
-return type) default to *.
+  * data T4 (a :: j k) = ...
+     -- CUSK; equivalent to   T4 :: j k -> *
+     -- which we lexically generalise to  T4 :: forall j k. j k -> *
+     -- and then, if PolyKinds is on, we further generalise to
+     --   T4 :: forall kk (j :: kk -> *) (k :: kk). j k -> *
+     -- Again this is exactly like what happens as the term level
+     -- when you write
+     --    f4 :: forall a b. a b -> Int
 
- - A data definition with a top-level :: must explicitly bind all kind variables
-to the right of the ::. See test dependent/should_compile/KindLevels, which
-requires this case. (Naturally, any kind variable mentioned before the :: should
-not be bound after it.)
+NOTE THAT
+  * A CUSK does /not/ mean that everything about the kind signature is
+    fully specified by the user.  Look at T4 and f4: we had do do kind
+    inference to figure out the kind-quantification.  But in both cases
+    (T4 and f4) that inference is done looking /only/ at the header of T4
+    (or signature for f4), not at the definition thereof.
+
+  * The CUSK completely fixes the kind of the type constructor, forever.
+
+  * The precise rules, for each declaration form, for whethher a declaration
+    has a CUSK are given in the user manual section "Complete user-supplied
+    kind signatures and polymorphic recursion".  BUt they simply implement
+    PRINCIPLE above.
+
+  * Open type families are interesting:
+      type family T5 a b :: *
+    There simply /is/ no accompanying declaration, so that info is all
+    we'll ever get.  So we it has a CUSK by definition, and we default
+    any un-fixed kind variables to *.
+
+  * Associated types are a bit tricker:
+      class C6 a where
+         type family T6 a b :: *
+         op :: a Int -> Int
+    Here C6 does not have a CUSK (in fact we ultimately discover that
+    a :: * -> *).  And hence neither does T6, the associated family,
+    because we can't fix its kind until we have settled C6.  Another
+    way to say it: unlike a top-level, we /may/ discover more about
+    a's kind from C6's definition.
+
+  * A data definition with a top-level :: must explicitly bind all
+    kind variables to the right of the ::. See test
+    dependent/should_compile/KindLevels, which requires this
+    case. (Naturally, any kind variable mentioned before the :: should
+    not be bound after it.)
+
+    This last point is much more debatable than the others; see
+    Trac #15142 comment:22
 -}
 
 
@@ -1025,6 +1077,7 @@ data FamilyInfo pass
   | ClosedTypeFamily (Maybe [LTyFamInstEqn pass])
 
 -- | Does this family declaration have a complete, user-supplied kind signature?
+-- See Note [CUSKs: complete user-supplied kind signatures]
 famDeclHasCusk :: Maybe Bool
                    -- ^ if associated, does the enclosing class have a CUSK?
                -> FamilyDecl pass -> Bool
@@ -1058,7 +1111,7 @@ pprFamilyDecl top_level (FamilyDecl { fdInfo = info, fdLName = ltycon
                                     , fdResultSig = L _ result
                                     , fdInjectivityAnn = mb_inj })
   = vcat [ pprFlavour info <+> pp_top_level <+>
-           pp_vanilla_decl_head ltycon tyvars fixity [] <+>
+           pp_vanilla_decl_head ltycon tyvars fixity noLHsContext <+>
            pp_kind <+> pp_inj <+> pp_where
          , nest 2 $ pp_eqns ]
   where
@@ -1348,10 +1401,10 @@ hsConDeclTheta Nothing            = []
 hsConDeclTheta (Just (L _ theta)) = theta
 
 pp_data_defn :: (OutputableBndrId (GhcPass p))
-                  => (HsContext (GhcPass p) -> SDoc)   -- Printing the header
+                  => (LHsContext (GhcPass p) -> SDoc)   -- Printing the header
                   -> HsDataDefn (GhcPass p)
                   -> SDoc
-pp_data_defn pp_hdr (HsDataDefn { dd_ND = new_or_data, dd_ctxt = L _ context
+pp_data_defn pp_hdr (HsDataDefn { dd_ND = new_or_data, dd_ctxt = context
                                 , dd_cType = mb_ct
                                 , dd_kindSig = mb_sig
                                 , dd_cons = condecls, dd_derivs = derivings })
@@ -1402,7 +1455,7 @@ pprConDecl (ConDeclH98 { con_name = L _ con
                                    : map (pprHsType . unLoc) tys)
     ppr_details (RecCon fields)  = pprPrefixOcc con
                                  <+> pprConDeclFields (unLoc fields)
-    cxt = fromMaybe (noLoc []) mcxt
+    cxt = fromMaybe noLHsContext mcxt
 
 pprConDecl (ConDeclGADT { con_names = cons, con_qvars = qvars
                         , con_mb_cxt = mcxt, con_args = args
@@ -1415,7 +1468,7 @@ pprConDecl (ConDeclGADT { con_names = cons, con_qvars = qvars
     get_args (RecCon fields)  = [pprConDeclFields (unLoc fields)]
     get_args (InfixCon {})    = pprPanic "pprConDecl:GADT" (ppr cons)
 
-    cxt = fromMaybe (noLoc []) mcxt
+    cxt = fromMaybe noLHsContext mcxt
 
     ppr_arrow_chain (a:as) = sep (a : map (arrow <+>) as)
     ppr_arrow_chain []     = empty
@@ -1472,14 +1525,17 @@ type LTyFamInstEqn pass = Located (TyFamInstEqn pass)
 type LTyFamDefltEqn pass = Located (TyFamDefltEqn pass)
 
 -- | Haskell Type Patterns
-type HsTyPats pass = [LHsType pass]
+type HsTyPats pass = [LHsTypeArg pass]
 
 {- Note [Family instance declaration binders]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 For ordinary data/type family instances, the feqn_pats field of FamEqn stores
-the LHS type (and kind) patterns. These type patterns can of course contain
-type (and kind) variables, which are bound in the hsib_vars field of the
-HsImplicitBndrs in FamInstEqn. Note in particular
+the LHS type (and kind) patterns. Any type (and kind) variables contained
+in these type patterns are bound in the hsib_vars field of the HsImplicitBndrs
+in FamInstEqn depending on whether or not an explicit forall is present. In
+the case of an explicit forall, the hsib_vars only includes kind variables not
+bound in the forall. Otherwise, all type (and kind) variables are bound in
+the hsib_vars. In the latter case, note that in particular
 
 * The hsib_vars *includes* any anonymous wildcards.  For example
      type instance F a _ = a
@@ -1565,6 +1621,7 @@ data FamEqn pass pats rhs
   = FamEqn
        { feqn_ext    :: XCFamEqn pass pats rhs
        , feqn_tycon  :: Located (IdP pass)
+       , feqn_bndrs  :: Maybe [LHsTyVarBndr pass] -- ^ Optional quantified type vars
        , feqn_pats   :: pats
        , feqn_fixity :: LexicalFixity -- ^ Fixity used in the declaration
        , feqn_rhs    :: rhs
@@ -1649,11 +1706,12 @@ ppr_instance_keyword NotTopLevel = empty
 
 ppr_fam_inst_eqn :: (OutputableBndrId (GhcPass p))
                  => TyFamInstEqn (GhcPass p) -> SDoc
-ppr_fam_inst_eqn (HsIB { hsib_body = FamEqn { feqn_tycon  = tycon
+ppr_fam_inst_eqn (HsIB { hsib_body = FamEqn { feqn_tycon  = L _ tycon
+                                            , feqn_bndrs  = bndrs
                                             , feqn_pats   = pats
                                             , feqn_fixity = fixity
                                             , feqn_rhs    = rhs }})
-    = pprFamInstLHS tycon pats fixity [] Nothing <+> equals <+> ppr rhs
+    = pprHsFamInstLHS tycon bndrs pats fixity noLHsContext <+> equals <+> ppr rhs
 ppr_fam_inst_eqn (HsIB { hsib_body = XFamEqn x }) = ppr x
 ppr_fam_inst_eqn (XHsImplicitBndrs x) = ppr x
 
@@ -1663,7 +1721,7 @@ ppr_fam_deflt_eqn (L _ (FamEqn { feqn_tycon  = tycon
                                , feqn_pats   = tvs
                                , feqn_fixity = fixity
                                , feqn_rhs    = rhs }))
-    = text "type" <+> pp_vanilla_decl_head tycon tvs fixity []
+    = text "type" <+> pp_vanilla_decl_head tycon tvs fixity noLHsContext
                   <+> equals <+> ppr rhs
 ppr_fam_deflt_eqn (L _ (XFamEqn x)) = ppr x
 
@@ -1674,17 +1732,17 @@ instance (p ~ GhcPass pass, OutputableBndrId p)
 pprDataFamInstDecl :: (OutputableBndrId (GhcPass p))
                    => TopLevelFlag -> DataFamInstDecl (GhcPass p) -> SDoc
 pprDataFamInstDecl top_lvl (DataFamInstDecl { dfid_eqn = HsIB { hsib_body =
-                             FamEqn { feqn_tycon  = tycon
+                             FamEqn { feqn_tycon  = L _ tycon
+                                    , feqn_bndrs  = bndrs
                                     , feqn_pats   = pats
                                     , feqn_fixity = fixity
                                     , feqn_rhs    = defn }}})
   = pp_data_defn pp_hdr defn
   where
     pp_hdr ctxt = ppr_instance_keyword top_lvl
-              <+> pprFamInstLHS tycon pats fixity ctxt Nothing
-                    -- No need to pass an explicit kind signature to
-                    -- pprFamInstLHS here, since pp_data_defn already
-                    -- pretty-prints that. See #14817.
+              <+> pprHsFamInstLHS tycon bndrs pats fixity ctxt
+                  -- pp_data_defn pretty-prints the kind sig. See #14817.
+
 pprDataFamInstDecl _ (DataFamInstDecl (HsIB _ (XFamEqn x)))
   = ppr x
 pprDataFamInstDecl _ (DataFamInstDecl (XHsImplicitBndrs x))
@@ -1702,32 +1760,27 @@ pprDataFamInstFlavour (DataFamInstDecl (HsIB _ (XFamEqn x)))
 pprDataFamInstFlavour (DataFamInstDecl (XHsImplicitBndrs x))
   = ppr x
 
-pprFamInstLHS :: (OutputableBndrId (GhcPass p))
-   => Located (IdP (GhcPass p))
+pprHsFamInstLHS :: (OutputableBndrId (GhcPass p))
+   => IdP (GhcPass p)
+   -> Maybe [LHsTyVarBndr (GhcPass p)]
    -> HsTyPats (GhcPass p)
    -> LexicalFixity
-   -> HsContext (GhcPass p)
-   -> Maybe (LHsKind (GhcPass p))
+   -> LHsContext (GhcPass p)
    -> SDoc
-pprFamInstLHS thing typats fixity context mb_kind_sig
-                                              -- explicit type patterns
-   = hsep [ pprHsContext context, pp_pats typats, pp_kind_sig ]
+pprHsFamInstLHS thing bndrs typats fixity mb_ctxt
+   = hsep [ pprHsExplicitForAll bndrs
+          , pprLHsContext mb_ctxt
+          , pp_pats typats ]
    where
      pp_pats (patl:patr:pats)
        | Infix <- fixity
-       = let pp_op_app = hsep [ ppr patl, pprInfixOcc (unLoc thing), ppr patr ] in
+       = let pp_op_app = hsep [ ppr patl, pprInfixOcc thing, ppr patr ] in
          case pats of
            [] -> pp_op_app
            _  -> hsep (parens pp_op_app : map ppr pats)
 
-     pp_pats pats = hsep [ pprPrefixOcc (unLoc thing)
+     pp_pats pats = hsep [ pprPrefixOcc thing
                          , hsep (map ppr pats)]
-
-     pp_kind_sig
-       | Just k <- mb_kind_sig
-       = dcolon <+> ppr k
-       | otherwise
-       = empty
 
 instance (p ~ GhcPass pass, OutputableBndrId p)
        => Outputable (ClsInstDecl p) where
@@ -1797,10 +1850,10 @@ instDeclDataFamInsts inst_decls
 ************************************************************************
 -}
 
--- | Located Deriving Declaration
+-- | Located stand-alone 'deriving instance' declaration
 type LDerivDecl pass = Located (DerivDecl pass)
 
--- | Deriving Declaration
+-- | Stand-alone 'deriving instance' declaration
 data DerivDecl pass = DerivDecl
         { deriv_ext          :: XCDerivDecl pass
         , deriv_type         :: LHsSigWcType pass
@@ -2088,24 +2141,27 @@ type LRuleDecl pass = Located (RuleDecl pass)
 
 -- | Rule Declaration
 data RuleDecl pass
-  = HsRule                             -- Source rule
-        (XHsRule pass)         -- After renamer, free-vars from the LHS and RHS
-        (Located (SourceText,RuleName)) -- Rule name
-               -- Note [Pragma source text] in BasicTypes
-        Activation
-        [LRuleBndr pass]        -- Forall'd vars; after typechecking this
-                                --   includes tyvars
-        (Located (HsExpr pass)) -- LHS
-        (Located (HsExpr pass)) -- RHS
-        -- ^
-        --  - 'ApiAnnotation.AnnKeywordId' :
-        --           'ApiAnnotation.AnnOpen','ApiAnnotation.AnnTilde',
-        --           'ApiAnnotation.AnnVal',
-        --           'ApiAnnotation.AnnClose',
-        --           'ApiAnnotation.AnnForall','ApiAnnotation.AnnDot',
-        --           'ApiAnnotation.AnnEqual',
-
-        -- For details on above see note [Api annotations] in ApiAnnotation
+  = HsRule -- Source rule
+       { rd_ext  :: XHsRule pass
+           -- ^ After renamer, free-vars from the LHS and RHS
+       , rd_name :: Located (SourceText,RuleName)
+           -- ^ Note [Pragma source text] in BasicTypes
+       , rd_act  :: Activation
+       , rd_tyvs :: Maybe [LHsTyVarBndr (NoGhcTc pass)]
+           -- ^ Forall'd type vars
+       , rd_tmvs :: [LRuleBndr pass]
+           -- ^ Forall'd term vars, before typechecking; after typechecking
+           --    this includes all forall'd vars
+       , rd_lhs  :: Located (HsExpr pass)
+       , rd_rhs  :: Located (HsExpr pass)
+       }
+    -- ^
+    --  - 'ApiAnnotation.AnnKeywordId' :
+    --           'ApiAnnotation.AnnOpen','ApiAnnotation.AnnTilde',
+    --           'ApiAnnotation.AnnVal',
+    --           'ApiAnnotation.AnnClose',
+    --           'ApiAnnotation.AnnForall','ApiAnnotation.AnnDot',
+    --           'ApiAnnotation.AnnEqual',
   | XRuleDecl (XXRuleDecl pass)
 
 data HsRuleRn = HsRuleRn NameSet NameSet -- Free-vars from the LHS and RHS
@@ -2144,21 +2200,29 @@ collectRuleBndrSigTys bndrs = [ty | RuleBndrSig _ _ ty <- bndrs]
 pprFullRuleName :: Located (SourceText, RuleName) -> SDoc
 pprFullRuleName (L _ (st, n)) = pprWithSourceText st (doubleQuotes $ ftext n)
 
-instance (p ~ GhcPass pass, OutputableBndrId p)
-       => Outputable (RuleDecls p) where
-  ppr (HsRules _ st rules)
+instance (p ~ GhcPass pass, OutputableBndrId p) => Outputable (RuleDecls p) where
+  ppr (HsRules { rds_src = st
+               , rds_rules = rules })
     = pprWithSourceText st (text "{-# RULES")
           <+> vcat (punctuate semi (map ppr rules)) <+> text "#-}"
   ppr (XRuleDecls x) = ppr x
 
 instance (p ~ GhcPass pass, OutputableBndrId p) => Outputable (RuleDecl p) where
-  ppr (HsRule _ name act ns lhs rhs)
+  ppr (HsRule { rd_name = name
+              , rd_act  = act
+              , rd_tyvs = tys
+              , rd_tmvs = tms
+              , rd_lhs  = lhs
+              , rd_rhs  = rhs })
         = sep [pprFullRuleName name <+> ppr act,
-               nest 4 (pp_forall <+> pprExpr (unLoc lhs)),
+               nest 4 (pp_forall_ty tys <+> pp_forall_tm tys
+                                        <+> pprExpr (unLoc lhs)),
                nest 6 (equals <+> pprExpr (unLoc rhs)) ]
         where
-          pp_forall | null ns   = empty
-                    | otherwise = forAllLit <+> fsep (map ppr ns) <> dot
+          pp_forall_ty Nothing     = empty
+          pp_forall_ty (Just qtvs) = forAllLit <+> fsep (map ppr qtvs) <> dot
+          pp_forall_tm Nothing | null tms = empty
+          pp_forall_tm _ = forAllLit <+> fsep (map ppr tms) <> dot
   ppr (XRuleDecl x) = ppr x
 
 instance (p ~ GhcPass pass, OutputableBndrId p) => Outputable (RuleBndr p) where

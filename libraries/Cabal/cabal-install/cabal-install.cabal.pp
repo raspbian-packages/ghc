@@ -10,42 +10,44 @@ Cabal-Version:      >= 1.10
 -- To update this file, edit 'cabal-install.cabal.pp' and run
 -- 'make cabal-install-prod' in the project's root folder.
 Name:               cabal-install
-Version:            2.4.0.0
+Version:            3.0.1.0
 #
 # NOTE: when updating build-depends, don't forget to update version regexps in bootstrap.sh.
 #
 %def CABAL_BUILDDEPENDS
     build-depends:
-        async      >= 2.0      && < 3,
+        async      >= 2.0      && < 2.3,
         array      >= 0.4      && < 0.6,
-        base       >= 4.6      && < 5,
+        base       >= 4.8      && < 4.14,
         base16-bytestring >= 0.1.1 && < 0.2,
-        binary     >= 0.7      && < 0.9,
-        bytestring >= 0.10.2   && < 1,
-        Cabal      == 2.4.*,
-        containers >= 0.5      && < 0.7,
+        binary     >= 0.7.3    && < 0.9,
+        bytestring >= 0.10.6.0 && < 0.11,
+        Cabal      >= 3.0.1.0  && < 3.1,
+        containers >= 0.5.6.2  && < 0.7,
         cryptohash-sha256 >= 0.11 && < 0.12,
-        deepseq    >= 1.3      && < 1.5,
+        deepseq    >= 1.4.1.1  && < 1.5,
         directory  >= 1.2.2.0  && < 1.4,
         echo       >= 0.1.3    && < 0.2,
         edit-distance >= 0.2.2 && < 0.3,
-        filepath   >= 1.3      && < 1.5,
-        hashable   >= 1.0      && < 2,
+        filepath   >= 1.4.0.0  && < 1.5,
+        hashable   >= 1.0      && < 1.4,
         HTTP       >= 4000.1.5 && < 4000.4,
-        mtl        >= 2.0      && < 3,
+        mtl        >= 2.0      && < 2.3,
         network-uri >= 2.6.0.2 && < 2.7,
-        network    >= 2.6      && < 2.8,
+        network    >= 2.6      && < 3.2,
         pretty     >= 1.1      && < 1.2,
-        process    >= 1.1.0.2  && < 1.7,
+        process    >= 1.2.3.0  && < 1.7,
         random     >= 1        && < 1.2,
-        stm        >= 2.0      && < 3,
+        stm        >= 2.0      && < 2.6,
         tar        >= 0.5.0.3  && < 0.6,
-        time       >= 1.4      && < 1.10,
+        time       >= 1.5.0.1  && < 1.10,
         zlib       >= 0.5.3    && < 0.7,
-        hackage-security >= 0.5.2.2 && < 0.6,
+        hackage-security >= 0.6.0.0 && < 0.7,
         text       >= 1.2.3    && < 1.3,
-        zip-archive >= 0.3.2.5 && < 0.4,
         parsec     >= 3.1.13.0 && < 3.2
+
+    if !impl(ghc >= 8.0)
+        build-depends: fail        == 4.9.*
 
     if flag(native-dns)
       if os(windows)
@@ -57,6 +59,11 @@ Version:            2.4.0.0
       build-depends: Win32 >= 2 && < 3
     else
       build-depends: unix >= 2.5 && < 2.9
+
+    if flag(lukko)
+      build-depends: lukko >= 0.1 && <0.2
+    else
+      build-depends: base >= 4.10
 %enddef
 %def CABAL_COMPONENTCOMMON
     default-language: Haskell2010
@@ -64,7 +71,9 @@ Version:            2.4.0.0
     if impl(ghc >= 8.0)
         ghc-options: -Wcompat
                      -Wnoncanonical-monad-instances
-                     -Wnoncanonical-monadfail-instances
+      if impl(ghc < 8.8)
+        ghc-options: -Wnoncanonical-monadfail-instances
+
 %enddef
 %def CABAL_BUILDINFO
 %if CABAL_FLAG_LIB
@@ -72,6 +81,13 @@ Version:            2.4.0.0
 %else
     other-modules:
 %endif
+        -- this modules are moved from Cabal
+        -- they are needed for as long until cabal-install moves to parsec parser
+        Distribution.Deprecated.ParseUtils
+        Distribution.Deprecated.ReadP
+        Distribution.Deprecated.Text
+        Distribution.Deprecated.ViewAsFieldDescr
+
         Distribution.Client.BuildReports.Anonymous
         Distribution.Client.BuildReports.Storage
         Distribution.Client.BuildReports.Types
@@ -87,6 +103,7 @@ Version:            2.4.0.0
         Distribution.Client.CmdFreeze
         Distribution.Client.CmdHaddock
         Distribution.Client.CmdInstall
+        Distribution.Client.CmdInstall.ClientInstallFlags
         Distribution.Client.CmdRepl
         Distribution.Client.CmdRun
         Distribution.Client.CmdTest
@@ -94,7 +111,6 @@ Version:            2.4.0.0
         Distribution.Client.CmdSdist
         Distribution.Client.Compat.Directory
         Distribution.Client.Compat.ExecutablePath
-        Distribution.Client.Compat.FileLock
         Distribution.Client.Compat.FilePerms
         Distribution.Client.Compat.Prelude
         Distribution.Client.Compat.Process
@@ -169,6 +185,7 @@ Version:            2.4.0.0
         Distribution.Client.Utils
         Distribution.Client.Utils.Assertion
         Distribution.Client.Utils.Json
+        Distribution.Client.Utils.Parsec
         Distribution.Client.VCS
         Distribution.Client.Win32SelfUpgrade
         Distribution.Client.World
@@ -253,7 +270,7 @@ License:            BSD3
 License-File:       LICENSE
 Author:             Cabal Development Team (see AUTHORS file)
 Maintainer:         Cabal Development Team <cabal-devel@haskell.org>
-Copyright:          2003-2018, Cabal Development Team
+Copyright:          2003-2019, Cabal Development Team
 Category:           Distribution
 %if CABAL_FLAG_LIB
 Build-type:         Simple
@@ -262,7 +279,6 @@ Build-type:         Custom
 %endif
 Extra-Source-Files:
   README.md bash-completion/cabal bootstrap.sh changelog
-  tests/README.md
 
   -- Generated with 'make gen-extra-source-files'
   -- Do NOT edit this section manually; instead, run the script.
@@ -363,6 +379,11 @@ Flag debug-tracetree
   default:      False
   manual:       True
 
+Flag lukko
+  description:  Use @lukko@ for file-locking
+  default:      True
+  manual:       True
+
 %if CABAL_FLAG_LIB
 %else
 custom-setup
@@ -436,6 +457,7 @@ executable cabal
         UnitTests.Distribution.Client.ArbitraryInstances
         UnitTests.Distribution.Client.FileMonitor
         UnitTests.Distribution.Client.Get
+        UnitTests.Distribution.Client.GenericInstances
         UnitTests.Distribution.Client.GZipUtils
         UnitTests.Distribution.Client.Glob
         UnitTests.Distribution.Client.IndexUtils.Timestamp
@@ -447,6 +469,7 @@ executable cabal
         UnitTests.Distribution.Client.Store
         UnitTests.Distribution.Client.Tar
         UnitTests.Distribution.Client.Targets
+        UnitTests.Distribution.Client.TreeDiffInstances
         UnitTests.Distribution.Client.UserConfig
         UnitTests.Distribution.Client.VCS
         UnitTests.Distribution.Solver.Modular.Builder
@@ -462,7 +485,7 @@ executable cabal
 
     cpp-options: -DMONOLITHIC
     build-depends:
-        Cabal      == 2.4.*,
+        Cabal      == 3.0.*,
         cabal-install-solver-dsl,
         QuickCheck >= 2.8.2,
         array,
@@ -481,9 +504,10 @@ executable cabal
         random,
         tagged,
         tar,
-        tasty >= 1.1.0.3 && < 1.2,
+        tasty >= 1.2.3 && < 1.3,
         tasty-hunit >= 0.10,
         tasty-quickcheck,
+        tree-diff,
         time,
         zlib
 %endif
@@ -506,12 +530,14 @@ Test-Suite unit-tests
     UnitTests.Distribution.Client.Targets
     UnitTests.Distribution.Client.FileMonitor
     UnitTests.Distribution.Client.Get
+    UnitTests.Distribution.Client.GenericInstances
     UnitTests.Distribution.Client.Glob
     UnitTests.Distribution.Client.GZipUtils
     UnitTests.Distribution.Client.Sandbox
     UnitTests.Distribution.Client.Sandbox.Timestamp
     UnitTests.Distribution.Client.Store
     UnitTests.Distribution.Client.Tar
+    UnitTests.Distribution.Client.TreeDiffInstances
     UnitTests.Distribution.Client.UserConfig
     UnitTests.Distribution.Client.ProjectConfig
     UnitTests.Distribution.Client.JobControl
@@ -542,12 +568,13 @@ Test-Suite unit-tests
         tar,
         time,
         zlib,
-        network-uri,
+        network-uri < 2.6.2.0,
         network,
-        tasty >= 1.1.0.3 && < 1.2,
+        tasty >= 1.2.3 && <1.3,
         tasty-hunit >= 0.10,
         tasty-quickcheck,
         tagged,
+        tree-diff,
         QuickCheck >= 2.8.2
 
   ghc-options: -threaded
@@ -575,7 +602,7 @@ Test-Suite memory-usage-tests
         containers,
         deepseq,
         tagged,
-        tasty >= 1.1.0.3 && < 1.2,
+        tasty >= 1.2.3 && <1.3,
         tasty-hunit >= 0.10
 
   ghc-options: -threaded
@@ -604,7 +631,7 @@ Test-Suite solver-quickcheck
         hashable,
         random,
         tagged,
-        tasty >= 1.1.0.3 && <1.2,
+        tasty >= 1.2.3 && <1.3,
         tasty-quickcheck,
         QuickCheck >= 2.8.2,
         pretty-show >= 1.6.15
@@ -632,7 +659,7 @@ test-suite integration-tests2
         directory,
         edit-distance,
         filepath,
-        tasty >= 1.1.0.3 && < 1.2,
+        tasty >= 1.2.3 && <1.3,
         tasty-hunit >= 0.10,
         tagged
 

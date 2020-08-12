@@ -6,12 +6,19 @@ module GHCi.Leak
   ) where
 
 import Control.Monad
+import Data.Bits
+import DynFlags ( sTargetPlatform )
+import Foreign.Ptr (ptrToIntPtr, intPtrToPtr)
 import GHC
-import Outputable
+import GHC.Ptr (Ptr (..))
+import GHCi.Util
 import HscTypes
-import UniqDFM
+import Outputable
+import Platform (target32Bit)
+import Prelude
 import System.Mem
 import System.Mem.Weak
+import UniqDFM
 
 -- Checking for space leaks in GHCi. See #15111, and the
 -- -fghci-leak-check flag.
@@ -55,5 +62,14 @@ checkLeakIndicators dflags (LeakIndicators leakmods)  = do
  where
   report :: String -> Maybe a -> IO ()
   report _ Nothing = return ()
-  report msg (Just _) =
-    putStrLn ("-fghci-leak-check: " ++ msg ++ " is still alive!")
+  report msg (Just a) = do
+    addr <- anyToPtr a
+    putStrLn ("-fghci-leak-check: " ++ msg ++ " is still alive at " ++
+              show (maskTagBits addr))
+
+  tagBits
+    | target32Bit (sTargetPlatform (settings dflags)) = 2
+    | otherwise = 3
+
+  maskTagBits :: Ptr a -> Ptr a
+  maskTagBits p = intPtrToPtr (ptrToIntPtr p .&. complement (shiftL 1 tagBits - 1))

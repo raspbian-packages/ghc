@@ -4,7 +4,6 @@ module Distribution.FieldGrammar.Class (
     optionalField,
     optionalFieldDef,
     monoidalField,
-    deprecatedField',
     ) where
 
 import Distribution.Compat.Lens
@@ -13,10 +12,11 @@ import Prelude ()
 
 import Data.Functor.Identity (Identity (..))
 
-import Distribution.Compat.Newtype (Newtype)
-import Distribution.Parsec.Class   (Parsec)
-import Distribution.Parsec.Field
-import Distribution.Pretty         (Pretty)
+import Distribution.CabalSpecVersion (CabalSpecVersion)
+import Distribution.Compat.Newtype   (Newtype)
+import Distribution.Fields.Field
+import Distribution.Parsec           (Parsec)
+import Distribution.Pretty           (Pretty)
 
 -- | 'FieldGrammar' is parametrised by
 --
@@ -33,7 +33,7 @@ class FieldGrammar g where
 
     -- | Field which should be defined, exactly once.
     uniqueFieldAla
-        :: (Parsec b, Pretty b, Newtype b a)
+        :: (Parsec b, Pretty b, Newtype a b)
         => FieldName   -- ^ field name
         -> (a -> b)    -- ^ 'Newtype' pack
         -> ALens' s a  -- ^ lens into the field
@@ -48,7 +48,7 @@ class FieldGrammar g where
 
     -- | Optional field.
     optionalFieldAla
-        :: (Parsec b, Pretty b, Newtype b a)
+        :: (Parsec b, Pretty b, Newtype a b)
         => FieldName          -- ^ field name
         -> (a -> b)           -- ^ 'pack'
         -> ALens' s (Maybe a) -- ^ lens into the field
@@ -56,12 +56,30 @@ class FieldGrammar g where
 
     -- | Optional field with default value.
     optionalFieldDefAla
-        :: (Parsec b, Pretty b, Newtype b a, Eq a)
+        :: (Parsec b, Pretty b, Newtype a b, Eq a)
         => FieldName   -- ^ field name
         -> (a -> b)    -- ^ 'Newtype' pack
         -> ALens' s a  -- ^ @'Lens'' s a@: lens into the field
         -> a           -- ^ default value
         -> g s a
+
+    --  | Free text field is essentially 'optionalFieldDefAla` with @""@
+    --  as the default and "accept everything" parser.
+    --
+    -- @since 3.0.0.0
+    freeTextField
+        :: FieldName
+        -> ALens' s (Maybe String) -- ^ lens into the field
+        -> g s (Maybe String)
+
+    --  | Free text field is essentially 'optionalFieldDefAla` with @""@
+    --  as the default and "accept everything" parser.
+    --
+    -- @since 3.0.0.0
+    freeTextFieldDef
+        :: FieldName
+        -> ALens' s String -- ^ lens into the field
+        -> g s String
 
     -- | Monoidal field.
     --
@@ -70,7 +88,7 @@ class FieldGrammar g where
     -- /Note:/ 'optionalFieldAla' is a @monoidalField@ with 'Last' monoid.
     --
     monoidalFieldAla
-        :: (Parsec b, Pretty b, Monoid a, Newtype b a)
+        :: (Parsec b, Pretty b, Monoid a, Newtype a b)
         => FieldName   -- ^ field name
         -> (a -> b)    -- ^ 'pack'
         -> ALens' s a  -- ^ lens into the field
@@ -90,15 +108,22 @@ class FieldGrammar g where
 
     -- | Deprecated since
     deprecatedSince
-        :: [Int]   -- ^ version
-        -> String  -- ^ deprecation message
+        :: CabalSpecVersion   -- ^ version
+        -> String             -- ^ deprecation message
+        -> g s a
+        -> g s a
+
+    -- | Removed in. If we occur removed field, parsing fails.
+    removedIn
+        :: CabalSpecVersion   -- ^ version
+        -> String             -- ^ removal message
         -> g s a
         -> g s a
 
     -- | Annotate field with since spec-version.
     availableSince
-        :: [Int]  -- ^ spec version
-        -> a      -- ^ default value
+        :: CabalSpecVersion  -- ^ spec version
+        -> a                 -- ^ default value
         -> g s a
         -> g s a
 
@@ -134,14 +159,3 @@ monoidalField
     -> ALens' s a  -- ^ lens into the field
     -> g s a
 monoidalField fn = monoidalFieldAla fn Identity
-
--- | Deprecated field. If found, warning is issued.
---
--- /Note:/ also it's not pretty printed!
---
-deprecatedField'
-    :: FieldGrammar g
-    => String  -- ^ deprecation message
-    -> g s a
-    -> g s a
-deprecatedField' = deprecatedSince []

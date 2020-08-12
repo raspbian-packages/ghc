@@ -2,6 +2,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Distribution.Simple.Program.GHC (
     GhcOptions(..),
@@ -24,6 +25,7 @@ import Prelude ()
 import Distribution.Compat.Prelude
 
 import Distribution.Backpack
+import Distribution.Compat.Semigroup (First'(..), Last'(..), Option'(..))
 import Distribution.Simple.GHC.ImplInfo
 import Distribution.PackageDescription hiding (Flag)
 import Distribution.ModuleName
@@ -33,7 +35,7 @@ import Distribution.Simple.Flag
 import Distribution.Simple.Program.Types
 import Distribution.Simple.Program.Run
 import Distribution.System
-import Distribution.Text
+import Distribution.Pretty
 import Distribution.Types.ComponentId
 import Distribution.Verbosity
 import Distribution.Version
@@ -42,58 +44,73 @@ import Language.Haskell.Extension
 
 import Data.List (stripPrefix)
 import qualified Data.Map as Map
-import Data.Monoid (All(..), Any(..), Endo(..), First(..))
+import Data.Monoid (All(..), Any(..), Endo(..))
 import Data.Set (Set)
 import qualified Data.Set as Set
 
 normaliseGhcArgs :: Maybe Version -> PackageDescription -> [String] -> [String]
 normaliseGhcArgs (Just ghcVersion) PackageDescription{..} ghcArgs
    | ghcVersion `withinRange` supportedGHCVersions
-   = argumentFilters $ filter simpleFilters ghcArgs
+   = argumentFilters . filter simpleFilters . filterRtsOpts $ ghcArgs
   where
     supportedGHCVersions :: VersionRange
     supportedGHCVersions = intersectVersionRanges
         (orLaterVersion (mkVersion [8,0]))
-        (earlierVersion (mkVersion [8,5]))
+        (earlierVersion (mkVersion [8,9]))
 
     from :: Monoid m => [Int] -> m -> m
     from version flags
       | ghcVersion `withinRange` orLaterVersion (mkVersion version) = flags
       | otherwise = mempty
 
-    checkComponentWarnings :: (a -> BuildInfo) -> [a] -> All
-    checkComponentWarnings getInfo = foldMap $ checkComponent . getInfo
+    to :: Monoid m => [Int] -> m -> m
+    to version flags
+      | ghcVersion `withinRange` earlierVersion (mkVersion version) = flags
+      | otherwise = mempty
+
+    checkGhcFlags :: forall m . Monoid m => ([String] -> m) -> m
+    checkGhcFlags fun = mconcat
+        [ fun ghcArgs
+        , checkComponentFlags libBuildInfo pkgLibs
+        , checkComponentFlags buildInfo executables
+        , checkComponentFlags testBuildInfo testSuites
+        , checkComponentFlags benchmarkBuildInfo benchmarks
+        ]
       where
-        checkComponent :: BuildInfo -> All
-        checkComponent =
-          foldMap checkWarnings . filterGhcOptions . allBuildInfoOptions
+        pkgLibs = maybeToList library ++ subLibraries
 
-        allBuildInfoOptions :: BuildInfo -> [(CompilerFlavor, [String])]
-        allBuildInfoOptions =
-            mconcat [options, profOptions, sharedOptions, staticOptions]
+        checkComponentFlags :: (a -> BuildInfo) -> [a] -> m
+        checkComponentFlags getInfo = foldMap (checkComponent . getInfo)
+          where
+            checkComponent :: BuildInfo -> m
+            checkComponent = foldMap fun . filterGhcOptions . allGhcOptions
 
-        filterGhcOptions :: [(CompilerFlavor, [String])] -> [[String]]
-        filterGhcOptions l = [opts | (GHC, opts) <- l]
+            allGhcOptions :: BuildInfo -> [(CompilerFlavor, [String])]
+            allGhcOptions = foldMap (perCompilerFlavorToList .)
+                [options, profOptions, sharedOptions, staticOptions]
 
-    libs, exes, tests, benches :: All
-    libs = checkComponentWarnings libBuildInfo $
-                maybeToList library ++ subLibraries
-
-    exes = checkComponentWarnings buildInfo $ executables
-    tests = checkComponentWarnings testBuildInfo $ testSuites
-    benches = checkComponentWarnings benchmarkBuildInfo $ benchmarks
+            filterGhcOptions :: [(CompilerFlavor, [String])] -> [[String]]
+            filterGhcOptions l = [opts | (GHC, opts) <- l]
 
     safeToFilterWarnings :: Bool
-    safeToFilterWarnings = getAll $ mconcat
-        [checkWarnings ghcArgs, libs, exes, tests, benches]
-
-    checkWarnings :: [String] -> All
-    checkWarnings = All . Set.null . foldr alter Set.empty
+    safeToFilterWarnings = getAll $ checkGhcFlags checkWarnings
       where
+        checkWarnings :: [String] -> All
+        checkWarnings = All . Set.null . foldr alter Set.empty
+
         alter :: String -> Set String -> Set String
         alter flag = appEndo $ mconcat
             [ \s -> Endo $ if s == "-Werror" then Set.insert s else id
             , \s -> Endo $ if s == "-Wwarn" then const Set.empty else id
+            , \s -> from [8,6] . Endo $
+                    if s == "-Werror=compat"
+                    then Set.union compatWarningSet else id
+            , \s -> from [8,6] . Endo $
+                    if s == "-Wno-error=compat"
+                    then (`Set.difference` compatWarningSet) else id
+            , \s -> from [8,6] . Endo $
+                    if s == "-Wwarn=compat"
+                    then (`Set.difference` compatWarningSet) else id
             , from [8,4] $ markFlag "-Werror=" Set.insert
             , from [8,4] $ markFlag "-Wwarn=" Set.delete
             , from [8,4] $ markFlag "-Wno-error=" Set.delete
@@ -105,21 +122,21 @@ normaliseGhcArgs (Just ghcVersion) PackageDescription{..} ghcArgs
             -> String
             -> Endo (Set String)
         markFlag name update flag = Endo $ case stripPrefix name flag of
-            Just rest | not (null rest) -> update rest
+            Just rest | not (null rest) && rest /= "compat" -> update rest
             _ -> id
 
     flagArgumentFilter :: [String] -> [String] -> [String]
     flagArgumentFilter flags = go
       where
-        makeFilter :: String -> String -> First ([String] -> [String])
-        makeFilter flag arg = First $ filterRest <$> stripPrefix flag arg
+        makeFilter :: String -> String -> Option' (First' ([String] -> [String]))
+        makeFilter flag arg = Option' $ First' . filterRest <$> stripPrefix flag arg
           where
             filterRest leftOver = case dropEq leftOver of
                 [] -> drop 1
                 _ -> id
 
         checkFilter :: String -> Maybe ([String] -> [String])
-        checkFilter = getFirst . mconcat (map makeFilter flags)
+        checkFilter = fmap getFirst' . getOption' . foldMap makeFilter flags
 
         go :: [String] -> [String]
         go [] = []
@@ -128,7 +145,20 @@ normaliseGhcArgs (Just ghcVersion) PackageDescription{..} ghcArgs
             Nothing -> arg : go args
 
     argumentFilters :: [String] -> [String]
-    argumentFilters = flagArgumentFilter ["-ghci-script", "-H"]
+    argumentFilters = flagArgumentFilter
+        ["-ghci-script", "-H", "-interactive-print"]
+
+    filterRtsOpts :: [String] -> [String]
+    filterRtsOpts = go False
+      where
+        go :: Bool -> [String] -> [String]
+        go _ [] = []
+        go _ ("+RTS":opts) = go True opts
+        go _ ("-RTS":opts) = go False opts
+        go isRTSopts (opt:opts) = addOpt $ go isRTSopts opts
+          where
+            addOpt | isRTSopts = id
+                   | otherwise = (opt:)
 
     simpleFilters :: String -> Bool
     simpleFilters = not . getAny . mconcat
@@ -138,19 +168,41 @@ normaliseGhcArgs (Just ghcVersion) PackageDescription{..} ghcArgs
       , Any . isPrefixOf "-dno-suppress-"
       , flagIn $ invertibleFlagSet "-" ["ignore-dot-ghci"]
       , flagIn . invertibleFlagSet "-f" . mconcat $
-            [ [ "reverse-errors", "warn-unused-binds" ]
+            [ [ "reverse-errors", "warn-unused-binds", "break-on-error"
+              , "break-on-exception", "print-bind-result"
+              , "print-bind-contents", "print-evld-with-show"
+              , "implicit-import-qualified", "error-spans"
+              ]
+            , from [7,8]
+              [ "print-explicit-foralls" -- maybe also earlier, but GHC-7.6 doesn't have --show-options
+              , "print-explicit-kinds"
+              ]
+            , from [8,0]
+              [ "print-explicit-coercions"
+              , "print-explicit-runtime-reps"
+              , "print-equality-relations"
+              , "print-unicode-syntax"
+              , "print-expanded-synonyms"
+              , "print-potential-instances"
+              , "print-typechecker-elaboration"
+              ]
             , from [8,2]
                 [ "diagnostics-show-caret", "local-ghci-history"
                 , "show-warning-groups", "hide-source-paths"
                 , "show-hole-constraints"
                 ]
             , from [8,4] ["show-loaded-modules"]
+            , from [8,6] [ "ghci-leak-check", "no-it" ]
             ]
       , flagIn . invertibleFlagSet "-d" $ [ "ppr-case-as-let", "ppr-ticks" ]
       , isOptIntFlag
       , isIntFlag
       , if safeToFilterWarnings
            then isWarning <> (Any . ("-w"==))
+           else mempty
+      , from [8,6] $
+        if safeToFilterHoles
+           then isTypedHoleFlag
            else mempty
       ]
 
@@ -163,12 +215,12 @@ normaliseGhcArgs (Just ghcVersion) PackageDescription{..} ghcArgs
 
     simpleFlags :: Set String
     simpleFlags = Set.fromList . mconcat $
-      [ [ "-n", "-#include", "-Rghc-timing", "-dsuppress-all", "-dstg-stats"
+      [ [ "-n", "-#include", "-Rghc-timing", "-dstg-stats"
         , "-dth-dec-file", "-dsource-stats", "-dverbose-core2core"
         , "-dverbose-stg2stg", "-dcore-lint", "-dstg-lint", "-dcmm-lint"
         , "-dasm-lint", "-dannot-lint", "-dshow-passes", "-dfaststring-stats"
         , "-fno-max-relevant-binds", "-recomp", "-no-recomp", "-fforce-recomp"
-        , "-fno-force-recomp", "-interactive-print"
+        , "-fno-force-recomp"
         ]
 
       , from [8,2]
@@ -177,8 +229,10 @@ normaliseGhcArgs (Just ghcVersion) PackageDescription{..} ghcArgs
           , "-dppr-debug", "-dno-debug-output"
           ]
 
-      , from [8,4]
-          [ "-ddebug-output", "-fno-max-valid-substitutions" ]
+      , from [8,4] [ "-ddebug-output" ]
+      , from [8,4] $ to [8,6] [ "-fno-max-valid-substitutions" ]
+      , from [8,6] [ "-dhex-word-literals" ]
+      , from [8,8] [ "-fshow-docs-of-hole-fits", "-fno-show-docs-of-hole-fits" ]
       ]
 
     isOptIntFlag :: String -> Any
@@ -189,7 +243,7 @@ normaliseGhcArgs (Just ghcVersion) PackageDescription{..} ghcArgs
         [ [ "-fmax-relevant-binds", "-ddpr-user-length", "-ddpr-cols"
           , "-dtrace-level", "-fghci-hist-size" ]
         , from [8,2] ["-fmax-uncovered-patterns", "-fmax-errors"]
-        , from [8,4] ["-fmax-valid-substitutions"]
+        , from [8,4] $ to [8,6] ["-fmax-valid-substitutions"]
         ]
 
     dropIntFlag :: Bool -> String -> String -> Any
@@ -203,11 +257,6 @@ normaliseGhcArgs (Just ghcVersion) PackageDescription{..} ghcArgs
         parseInt :: String -> Maybe Int
         parseInt = readMaybe . dropEq
 
-        readMaybe :: Read a => String -> Maybe a
-        readMaybe s = case reads s of
-            [(x, "")] -> Just x
-            _ -> Nothing
-
     dropEq :: String -> String
     dropEq ('=':s) = s
     dropEq s = s
@@ -215,6 +264,41 @@ normaliseGhcArgs (Just ghcVersion) PackageDescription{..} ghcArgs
     invertibleFlagSet :: String -> [String] -> Set String
     invertibleFlagSet prefix flagNames =
       Set.fromList $ (++) <$> [prefix, prefix ++ "no-"] <*> flagNames
+
+    compatWarningSet :: Set String
+    compatWarningSet = Set.fromList $ mconcat
+        [ from [8,6]
+            [ "missing-monadfail-instances", "semigroup"
+            , "noncanonical-monoid-instances", "implicit-kind-vars" ]
+        ]
+
+    safeToFilterHoles :: Bool
+    safeToFilterHoles = getAll . checkGhcFlags $
+        All . fromMaybe True . fmap getLast' . getOption' . foldMap notDeferred
+      where
+        notDeferred :: String -> Option' (Last' Bool)
+        notDeferred "-fdefer-typed-holes" = Option' . Just . Last' $ False
+        notDeferred "-fno-defer-typed-holes" = Option' . Just . Last' $ True
+        notDeferred _ = Option' Nothing
+
+    isTypedHoleFlag :: String -> Any
+    isTypedHoleFlag = mconcat
+        [ flagIn . invertibleFlagSet "-f" $
+            [ "show-hole-constraints", "show-valid-substitutions"
+            , "show-valid-hole-fits", "sort-valid-hole-fits"
+            , "sort-by-size-hole-fits", "sort-by-subsumption-hole-fits"
+            , "abstract-refinement-hole-fits", "show-provenance-of-hole-fits"
+            , "show-hole-matches-of-hole-fits", "show-type-of-hole-fits"
+            , "show-type-app-of-hole-fits", "show-type-app-vars-of-hole-fits"
+            , "unclutter-valid-hole-fits"
+            ]
+        , flagIn . Set.fromList $
+            [ "-fno-max-valid-hole-fits", "-fno-max-refinement-hole-fits"
+            , "-fno-refinement-level-hole-fits" ]
+        , mconcat . map (dropIntFlag False) $
+            [ "-fmax-valid-hole-fits", "-fmax-refinement-hole-fits"
+            , "-frefinement-level-hole-fits" ]
+        ]
 
 normaliseGhcArgs _ _ args = args
 
@@ -342,6 +426,9 @@ data GhcOptions = GhcOptions {
 
   -- | Options to pass through to the C++ compiler.
   ghcOptCxxOptions     :: [String],
+
+  -- | Options to pass through to the Assembler.
+  ghcOptAsmOptions     :: [String],
 
   -- | Options to pass through to CPP; the @ghc -optP@ flag.
   ghcOptCppOptions    :: [String],
@@ -595,6 +682,7 @@ renderGhcOptions comp _platform@(Platform _arch os) opts
            | inc <- flags ghcOptCppIncludes ]
   , [ "-optc" ++ opt | opt <- ghcOptCcOptions opts]
   , [ "-optc" ++ opt | opt <- ghcOptCxxOptions opts]
+  , [ "-opta" ++ opt | opt <- ghcOptAsmOptions opts]
 
   -----------------
   -- Linker stuff
@@ -626,14 +714,14 @@ renderGhcOptions comp _platform@(Platform _arch os) opts
              , this_arg ]
              | this_arg <- flag ghcOptThisUnitId ]
 
-  , concat [ ["-this-component-id", display this_cid ]
+  , concat [ ["-this-component-id", prettyShow this_cid ]
            | this_cid <- flag ghcOptThisComponentId ]
 
   , if null (ghcOptInstantiatedWith opts)
         then []
         else "-instantiated-with"
-             : intercalate "," (map (\(n,m) -> display n ++ "="
-                                            ++ display m)
+             : intercalate "," (map (\(n,m) -> prettyShow n ++ "="
+                                            ++ prettyShow m)
                                     (ghcOptInstantiatedWith opts))
              : []
 
@@ -647,14 +735,14 @@ renderGhcOptions comp _platform@(Platform _arch os) opts
 
   , concat $ let space "" = ""
                  space xs = ' ' : xs
-             in [ ["-package-id", display ipkgid ++ space (display rns)]
+             in [ ["-package-id", prettyShow ipkgid ++ space (prettyShow rns)]
                 | (ipkgid,rns) <- flags ghcOptPackages ]
 
   ----------------------------
   -- Language and extensions
 
   , if supportsHaskell2010 implInfo
-    then [ "-X" ++ display lang | lang <- flag ghcOptLanguage ]
+    then [ "-X" ++ prettyShow lang | lang <- flag ghcOptLanguage ]
     else []
 
   , [ ext'
@@ -664,7 +752,7 @@ renderGhcOptions comp _platform@(Platform _arch os) opts
         Just Nothing    -> []
         Nothing         ->
             error $ "Distribution.Simple.Program.GHC.renderGhcOptions: "
-                  ++ display ext ++ " not present in ghcOptExtensionMap."
+                  ++ prettyShow ext ++ " not present in ghcOptExtensionMap."
     ]
 
   ----------------
@@ -676,7 +764,7 @@ renderGhcOptions comp _platform@(Platform _arch os) opts
   ---------------
   -- Inputs
 
-  , [ display modu | modu <- flags ghcOptInputModules ]
+  , [ prettyShow modu | modu <- flags ghcOptInputModules ]
   , flags ghcOptInputFiles
 
   , concat [ [ "-o",    out] | out <- flag ghcOptOutputFile ]

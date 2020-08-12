@@ -1,6 +1,37 @@
 Changelog for the [`directory`][1] package
 ==========================================
 
+## 1.3.6.0 (January 2020)
+
+  * On non-Windows platforms, `getHomeDirectory` will fall back to
+    `getpwuid_r` if `HOME` is not set.
+    ([#102](https://github.com/haskell/directory/issues/102))
+
+## 1.3.5.0 (December 2019)
+
+  * Revert change introduced in the version `1.3.3.2`: Non-absolute `XDG_*`
+    environment variables are ignored.  This behavior is according to
+    [*XDG Base Directory Specification* version 0.7](https://specifications.freedesktop.org/basedir-spec/0.7/ar01s02.html)
+    ([#100](https://github.com/haskell/directory/issues/100))
+
+## 1.3.4.0 (July 2019)
+
+  * `getXdgDirectory` and `getXdgDirectoryList` on Windows will now respect
+    the XDG environment variables if present.
+    ([#95](https://github.com/haskell/directory/issues/95))
+
+## 1.3.3.2 (January 2019)
+
+  * `getXdgDirectory` will no longer reject environment variables containing
+    relative paths.
+    ([#87](https://github.com/haskell/directory/issues/87))
+
+## 1.3.3.1 (August 2018)
+
+  * `doesDirectoryExist` and `doesPathExist` reject empty paths once again,
+    reversing an undocumented change introduced in 1.3.1.1.
+    ([#84](https://github.com/haskell/directory/issues/84))
+
 ## 1.3.3.0 (June 2018)
 
   * Relax `unix` version bounds to support 2.8.

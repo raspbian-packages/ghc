@@ -4,7 +4,8 @@ module CmmType
     , cInt
     , cmmBits, cmmFloat
     , typeWidth, cmmEqType, cmmEqType_ignoring_ptrhood
-    , isFloatType, isGcPtrType, isWord32, isWord64, isFloat64, isFloat32
+    , isFloatType, isGcPtrType, isBitsType
+    , isWord32, isWord64, isFloat64, isFloat32
 
     , Width(..)
     , widthInBits, widthInBytes, widthInLog, widthFromBytes
@@ -70,7 +71,7 @@ instance Outputable CmmCat where
 -- Why is CmmType stratified?  For native code generation,
 -- most of the time you just want to know what sort of register
 -- to put the thing in, and for this you need to know how
--- many bits thing has and whether it goes in a floating-point
+-- many bits thing has, and whether it goes in a floating-point
 -- register.  By contrast, the distinction between GcPtr and
 -- GcNonPtr is of interest to only a few parts of the code generator.
 
@@ -132,12 +133,15 @@ cInt :: DynFlags -> CmmType
 cInt dflags = cmmBits (cIntWidth  dflags)
 
 ------------ Predicates ----------------
-isFloatType, isGcPtrType :: CmmType -> Bool
+isFloatType, isGcPtrType, isBitsType :: CmmType -> Bool
 isFloatType (CmmType FloatCat    _) = True
 isFloatType _other                  = False
 
 isGcPtrType (CmmType GcPtrCat _) = True
 isGcPtrType _other               = False
+
+isBitsType (CmmType BitsCat _) = True
+isBitsType _                   = False
 
 isWord32, isWord64, isFloat32, isFloat64 :: CmmType -> Bool
 -- isWord64 is true of 64-bit non-floats (both gc-ptrs and otherwise)
@@ -173,7 +177,7 @@ data Width   = W8 | W16 | W32 | W64
 instance Outputable Width where
    ppr rep = ptext (mrStr rep)
 
-mrStr :: Width -> LitString
+mrStr :: Width -> PtrString
 mrStr W8   = sLit("W8")
 mrStr W16  = sLit("W16")
 mrStr W32  = sLit("W32")

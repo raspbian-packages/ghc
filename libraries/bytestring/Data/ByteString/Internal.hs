@@ -4,7 +4,7 @@
 #if __GLASGOW_HASKELL__ >= 703
 {-# LANGUAGE Unsafe #-}
 #endif
-{-# OPTIONS_HADDOCK hide #-}
+{-# OPTIONS_HADDOCK not-home #-}
 
 -- |
 -- Module      : Data.ByteString.Internal
@@ -91,7 +91,7 @@ import Foreign.C.Types          (CInt, CSize, CULong)
 
 import Foreign.C.String         (CString)
 
-#if MIN_VERSION_base(4,9,0)
+#if !(MIN_VERSION_base(4,11,0)) && MIN_VERSION_base(4,9,0)
 import Data.Semigroup           (Semigroup((<>)))
 #endif
 #if !(MIN_VERSION_base(4,8,0))
@@ -219,11 +219,11 @@ unsafePackLenChars len cs0 =
 -- | /O(n)/ Pack a null-terminated sequence of bytes, pointed to by an
 -- Addr\# (an arbitrary machine address assumed to point outside the
 -- garbage-collected heap) into a @ByteString@. A much faster way to
--- create an Addr\# is with an unboxed string literal, than to pack a
+-- create an 'Addr#' is with an unboxed string literal, than to pack a
 -- boxed string. A unboxed string literal is compiled to a static @char
 -- []@ by GHC. Establishing the length of the string requires a call to
--- @strlen(3)@, so the Addr# must point to a null-terminated buffer (as
--- is the case with "string"# literals in GHC). Use 'unsafePackAddressLen'
+-- @strlen(3)@, so the 'Addr#' must point to a null-terminated buffer (as
+-- is the case with @\"string\"\#@ literals in GHC). Use 'unsafePackAddressLen'
 -- if you know the length of the string statically.
 --
 -- An example:
@@ -231,10 +231,10 @@ unsafePackLenChars len cs0 =
 -- > literalFS = unsafePackAddress "literal"#
 --
 -- This function is /unsafe/. If you modify the buffer pointed to by the
--- original Addr# this modification will be reflected in the resulting
+-- original 'Addr#' this modification will be reflected in the resulting
 -- @ByteString@, breaking referential transparency.
 --
--- Note this also won't work if your Addr# has embedded '\0' characters in
+-- Note this also won't work if your 'Addr#' has embedded @\'\\0\'@ characters in
 -- the string, as @strlen@ will return too short a length.
 --
 unsafePackAddress :: Addr# -> IO ByteString

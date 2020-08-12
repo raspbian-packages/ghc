@@ -37,7 +37,7 @@ parseParas = overDoc Parse.toRegular . Parse.parseParas Nothing
 parseString :: String -> Doc String
 parseString = Parse.toRegular . Parse.parseString
 
-hyperlink :: String -> Maybe String -> Doc String
+hyperlink :: String -> Maybe (Doc String) -> Doc String
 hyperlink url = DocHyperlink . Hyperlink url
 
 main :: IO ()
@@ -112,7 +112,7 @@ spec = do
         "``" `shouldParseTo` "``"
 
       it "can parse an identifier in infix notation enclosed within backticks" $ do
-        "``infix``" `shouldParseTo` "`" <> DocIdentifier "infix" <> "`"
+        "``infix``" `shouldParseTo` DocIdentifier "`infix`"
 
       it "can parse identifiers containing a single quote" $ do
         "'don't'" `shouldParseTo` DocIdentifier "don't"
@@ -131,6 +131,19 @@ spec = do
 
       it "can parse an identifier that starts with an underscore" $ do
         "'_x'" `shouldParseTo` DocIdentifier "_x"
+
+      it "can parse value-namespaced identifiers" $ do
+        "v'foo'" `shouldParseTo` DocIdentifier "foo"
+
+      it "can parse type-namespaced identifiers" $ do
+        "t'foo'" `shouldParseTo` DocIdentifier "foo"
+
+      it "can parse parenthesized operators and backticked identifiers" $ do
+        "'(<|>)'" `shouldParseTo` DocIdentifier "(<|>)"
+        "'`elem`'" `shouldParseTo` DocIdentifier "`elem`"
+
+      it "can properly figure out the end of identifiers" $ do
+        "'DbModule'/'DbUnitId'" `shouldParseTo` DocIdentifier "DbModule" <> "/" <> DocIdentifier "DbUnitId"
 
     context "when parsing operators" $ do
       it "can parse an operator enclosed within single quotes" $ do
@@ -201,6 +214,10 @@ spec = do
         it "rejects whitespace in URL" $ do
           "[some label]( url)" `shouldParseTo`
             "[some label]( url)"
+
+        it "allows inline markup in the label" $ do
+          "[something /emphasized/](url)" `shouldParseTo`
+            hyperlink "url" (Just ("something " <> DocEmphasis "emphasized"))
 
         context "when URL is on a separate line" $ do
           it "allows URL to be on a separate line" $ do

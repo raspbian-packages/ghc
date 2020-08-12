@@ -1,37 +1,32 @@
 {-# LANGUAGE FlexibleInstances     #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE OverloadedStrings    , ScopedTypeVariables #-}
+{-# LANGUAGE OverloadedStrings     #-}
+{-# LANGUAGE ScopedTypeVariables   #-}
 {-# OPTIONS_GHC -Wall -Werror #-}
 module Distribution.Parsec.FieldLineStream (
     FieldLineStream (..),
-    fieldLinesToStream,
     fieldLineStreamFromString,
     fieldLineStreamFromBS,
+    fieldLineStreamEnd,
     ) where
 
 import Data.Bits
 import Data.ByteString             (ByteString)
 import Distribution.Compat.Prelude
-import Distribution.Parsec.Field   (FieldLine (..))
 import Distribution.Utils.Generic  (toUTF8BS)
 import Prelude ()
 
 import qualified Data.ByteString as BS
 import qualified Text.Parsec     as Parsec
 
--- | This is essentially a lazy bytestring, but chunks are glued with newline '\n'.
+-- | This is essentially a lazy bytestring, but chunks are glued with newline @\'\\n\'@.
 data FieldLineStream
     = FLSLast !ByteString
     | FLSCons {-# UNPACK #-} !ByteString FieldLineStream
   deriving Show
 
-fieldLinesToStream :: [FieldLine ann] -> FieldLineStream
-fieldLinesToStream []                    = end
-fieldLinesToStream [FieldLine _ bs]      = FLSLast bs
-fieldLinesToStream (FieldLine _ bs : fs) = FLSCons bs (fieldLinesToStream fs)
-
-end :: FieldLineStream
-end = FLSLast ""
+fieldLineStreamEnd :: FieldLineStream
+fieldLineStreamEnd = FLSLast mempty
 
 -- | Convert 'String' to 'FieldLineStream'.
 --
@@ -45,14 +40,14 @@ fieldLineStreamFromBS = FLSLast
 instance Monad m => Parsec.Stream FieldLineStream m Char where
     uncons (FLSLast bs) = return $ case BS.uncons bs of
         Nothing       -> Nothing
-        Just (c, bs') -> Just (unconsChar c bs' (\bs'' -> FLSLast bs'') end)
+        Just (c, bs') -> Just (unconsChar c bs' (\bs'' -> FLSLast bs'') fieldLineStreamEnd)
 
     uncons (FLSCons bs s) = return $ case BS.uncons bs of
         -- as lines are glued with '\n', we return '\n' here!
         Nothing -> Just ('\n', s)
         Just (c, bs') -> Just (unconsChar c bs' (\bs'' -> FLSCons bs'' s) s)
 
--- Bssed on implementation 'decodeStringUtf8'
+-- Based on implementation 'decodeStringUtf8'
 unconsChar :: forall a. Word8 -> ByteString -> (ByteString -> a) -> a -> (Char, a)
 unconsChar c0 bs0 f next
     | c0 <= 0x7F = (chr (fromIntegral c0), f bs0)

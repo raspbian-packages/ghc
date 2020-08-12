@@ -109,7 +109,11 @@ pprDatas :: CmmStatics -> SDoc
 pprDatas (Statics lbl dats) = vcat (pprLabel lbl : map pprData dats)
 
 pprData :: CmmStatic -> SDoc
-pprData (CmmString str)          = pprASCII str
+pprData (CmmString str)
+  = vcat (map do1 str) $$ do1 0
+    where
+       do1 :: Word8 -> SDoc
+       do1 w = text "\t.byte\t" <> int (fromIntegral w)
 pprData (CmmUninitialised bytes) = text ".skip " <> int bytes
 pprData (CmmStaticLit lit)       = pprDataItem lit
 
@@ -129,15 +133,6 @@ pprLabel :: CLabel -> SDoc
 pprLabel lbl = pprGloblDecl lbl
             $$ pprTypeAndSizeDecl lbl
             $$ (ppr lbl <> char ':')
-
-
-pprASCII :: [Word8] -> SDoc
-pprASCII str
-  = vcat (map do1 str) $$ do1 0
-    where
-       do1 :: Word8 -> SDoc
-       do1 w = text "\t.byte\t" <> int (fromIntegral w)
-
 
 -- -----------------------------------------------------------------------------
 -- pprInstr: print an 'Instr'
@@ -572,7 +567,7 @@ pprRI (RIImm r) = pprImm r
 
 
 -- | Pretty print a two reg instruction.
-pprFormatRegReg :: LitString -> Format -> Reg -> Reg -> SDoc
+pprFormatRegReg :: PtrString -> Format -> Reg -> Reg -> SDoc
 pprFormatRegReg name format reg1 reg2
   = hcat [
         char '\t',
@@ -589,7 +584,7 @@ pprFormatRegReg name format reg1 reg2
 
 
 -- | Pretty print a three reg instruction.
-pprFormatRegRegReg :: LitString -> Format -> Reg -> Reg -> Reg -> SDoc
+pprFormatRegRegReg :: PtrString -> Format -> Reg -> Reg -> Reg -> SDoc
 pprFormatRegRegReg name format reg1 reg2 reg3
   = hcat [
         char '\t',
@@ -607,7 +602,7 @@ pprFormatRegRegReg name format reg1 reg2 reg3
 
 
 -- | Pretty print an instruction of two regs and a ri.
-pprRegRIReg :: LitString -> Bool -> Reg -> RI -> Reg -> SDoc
+pprRegRIReg :: PtrString -> Bool -> Reg -> RI -> Reg -> SDoc
 pprRegRIReg name b reg1 ri reg2
   = hcat [
         char '\t',
@@ -621,7 +616,7 @@ pprRegRIReg name b reg1 ri reg2
     ]
 
 {-
-pprRIReg :: LitString -> Bool -> RI -> Reg -> SDoc
+pprRIReg :: PtrString -> Bool -> RI -> Reg -> SDoc
 pprRIReg name b ri reg1
   = hcat [
         char '\t',

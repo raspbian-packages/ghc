@@ -6,13 +6,14 @@
 
 {-# LANGUAGE CPP, ScopedTypeVariables #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE ViewPatterns #-}
 
 -- | Types for the per-module compiler
 module HscTypes (
         -- * compilation state
         HscEnv(..), hscEPS,
         FinderCache, FindResult(..), InstalledFindResult(..),
-        Target(..), TargetId(..), pprTarget, pprTargetId,
+        Target(..), TargetId(..), InputFileBuffer, pprTarget, pprTargetId,
         HscStatus(..),
         IServ(..),
 
@@ -22,7 +23,7 @@ module HscTypes (
         needsTemplateHaskellOrQQ, mgBootModules,
 
         -- * Hsc monad
-        Hsc(..), runHsc, runInteractiveHsc,
+        Hsc(..), runHsc, mkInteractiveHscEnv, runInteractiveHsc,
 
         -- * Information about modules
         ModDetails(..), emptyModDetails,
@@ -36,7 +37,7 @@ module HscTypes (
 
         -- * Information about the module being compiled
         -- (re-exported from DriverPhases)
-        HscSource(..), isHsBootOrSig, hscSourceString,
+        HscSource(..), isHsBootOrSig, isHsigFile, hscSourceString,
 
 
         -- * State relating to modules in this package
@@ -132,7 +133,7 @@ module HscTypes (
 
         -- * Compilation errors and warnings
         SourceError, GhcApiError, mkSrcErr, srcErrorMessages, mkApiErr,
-        throwOneError, handleSourceError,
+        throwErrors, throwOneError, handleSourceError,
         handleFlagWarnings, printOrThrowWarnings,
 
         -- * COMPLETE signature
@@ -174,13 +175,13 @@ import CoAxiom
 import ConLike
 import DataCon
 import PatSyn
-import PrelNames        ( gHC_PRIM, ioTyConName, printName, mkInteractiveModule
-                        , eqTyConName )
+import PrelNames        ( gHC_PRIM, ioTyConName, printName, mkInteractiveModule )
 import TysWiredIn
 import Packages hiding  ( Version(..) )
 import CmdLineParser
 import DynFlags
-import DriverPhases     ( Phase, HscSource(..), isHsBootOrSig, hscSourceString )
+import DriverPhases     ( Phase, HscSource(..), hscSourceString
+                        , isHsBootOrSig, isHsigFile )
 import BasicTypes
 import IfaceSyn
 import Maybes
@@ -204,7 +205,6 @@ import qualified GHC.LanguageExtensions as LangExt
 
 import Foreign
 import Control.Monad    ( guard, liftM, ap )
-import Data.Foldable    ( foldl' )
 import Data.IORef
 import Data.Time
 import Exception
@@ -253,13 +253,15 @@ runHsc hsc_env (Hsc hsc) = do
     printOrThrowWarnings (hsc_dflags hsc_env) w
     return a
 
+mkInteractiveHscEnv :: HscEnv -> HscEnv
+mkInteractiveHscEnv hsc_env = hsc_env{ hsc_dflags = interactive_dflags }
+  where
+    interactive_dflags = ic_dflags (hsc_IC hsc_env)
+
 runInteractiveHsc :: HscEnv -> Hsc a -> IO a
 -- A variant of runHsc that switches in the DynFlags from the
 -- InteractiveContext before running the Hsc computation.
-runInteractiveHsc hsc_env
-  = runHsc (hsc_env { hsc_dflags = interactive_dflags })
-  where
-    interactive_dflags = ic_dflags (hsc_IC hsc_env)
+runInteractiveHsc hsc_env = runHsc (mkInteractiveHscEnv hsc_env)
 
 -- -----------------------------------------------------------------------------
 -- Source Errors
@@ -275,6 +277,10 @@ srcErrorMessages (SourceError msgs) = msgs
 
 mkApiErr :: DynFlags -> SDoc -> GhcApiError
 mkApiErr dflags msg = GhcApiError (showSDoc dflags msg)
+
+-- | Throw some errors.
+throwErrors :: MonadIO io => ErrorMessages -> io a
+throwErrors = liftIO . throwIO . mkSrcErr
 
 throwOneError :: MonadIO m => ErrMsg -> m ab
 throwOneError err = liftIO $ throwIO $ mkSrcErr $ unitBag err
@@ -345,7 +351,7 @@ handleFlagWarnings dflags warns = do
       -- It would be nicer if warns :: [Located MsgDoc], but that
       -- has circular import problems.
       bag = listToBag [ mkPlainWarnMsg dflags loc (text warn)
-                      | Warn _ (L loc warn) <- warns' ]
+                      | Warn _ (dL->L loc warn) <- warns' ]
 
   printOrThrowWarnings dflags bag
 
@@ -497,8 +503,17 @@ data Target
   = Target {
       targetId           :: TargetId, -- ^ module or filename
       targetAllowObjCode :: Bool,     -- ^ object code allowed?
-      targetContents     :: Maybe (StringBuffer,UTCTime)
-                                        -- ^ in-memory text buffer?
+      targetContents     :: Maybe (InputFileBuffer, UTCTime)
+      -- ^ Optional in-memory buffer containing the source code GHC should
+      -- use for this target instead of reading it from disk.
+      --
+      -- Since GHC version 8.10 modules which require preprocessors such as
+      -- Literate Haskell or CPP to run are also supported.
+      --
+      -- If a corresponding source file does not exist on disk this will
+      -- result in a 'SourceError' exception if @targetId = TargetModule _@
+      -- is used. However together with @targetId = TargetFile _@ GHC will
+      -- not complain about the file missing.
     }
 
 data TargetId
@@ -510,6 +525,8 @@ data TargetId
         -- (which phase to start from).  Nothing indicates the starting phase
         -- should be determined from the suffix of the filename.
   deriving Eq
+
+type InputFileBuffer = StringBuffer
 
 pprTarget :: Target -> SDoc
 pprTarget (Target id obj _) =
@@ -1534,7 +1551,7 @@ It's exactly the same for type-family instances.  See Trac #7102
 -}
 
 -- | Interactive context, recording information about the state of the
--- context in which statements are executed in a GHC session.
+-- context in which statements are executed in a GHCi session.
 data InteractiveContext
   = InteractiveContext {
          ic_dflags     :: DynFlags,
@@ -1712,7 +1729,7 @@ icExtendGblRdrEnv env tythings
        | is_sub_bndr thing
        = env
        | otherwise
-       = foldl extendGlobalRdrEnv env1 (concatMap localGREsFromAvail avail)
+       = foldl' extendGlobalRdrEnv env1 (concatMap localGREsFromAvail avail)
        where
           env1  = shadowNames env (concatMap availNames avail)
           avail = tyThingAvailInfo thing
@@ -2016,8 +2033,8 @@ tyThingParent_maybe (AConLike cl) = case cl of
     RealDataCon dc  -> Just (ATyCon (dataConTyCon dc))
     PatSynCon{}     -> Nothing
 tyThingParent_maybe (ATyCon tc)   = case tyConAssoc_maybe tc of
-                                      Just cls -> Just (ATyCon (classTyCon cls))
-                                      Nothing  -> Nothing
+                                      Just tc -> Just (ATyCon tc)
+                                      Nothing -> Nothing
 tyThingParent_maybe (AnId id)     = case idDetails id of
                                       RecSelId { sel_tycon = RecSelData tc } ->
                                           Just (ATyCon tc)
@@ -2116,7 +2133,7 @@ extendTypeEnv :: TypeEnv -> TyThing -> TypeEnv
 extendTypeEnv env thing = extendNameEnv env (getName thing) thing
 
 extendTypeEnvList :: TypeEnv -> [TyThing] -> TypeEnv
-extendTypeEnvList env things = foldl extendTypeEnv env things
+extendTypeEnvList env things = foldl' extendTypeEnv env things
 
 extendTypeEnvWithIds :: TypeEnv -> [Id] -> TypeEnv
 extendTypeEnvWithIds env ids
@@ -2625,11 +2642,11 @@ interface file); so we give it 'noSrcLoc' then.  Later, when we find
 its binding site, we fix it up.
 -}
 
-updNameCache :: HscEnv
+updNameCache :: IORef NameCache
              -> (NameCache -> (NameCache, c))  -- The updating function
              -> IO c
-updNameCache hsc_env upd_fn
-  = atomicModifyIORef' (hsc_NC hsc_env) upd_fn
+updNameCache ncRef upd_fn
+  = atomicModifyIORef' ncRef upd_fn
 
 mkSOName :: Platform -> FilePath -> FilePath
 mkSOName platform root
@@ -2752,6 +2769,8 @@ data ModSummary
           -- ^ Timestamp of hi file, if we *only* are typechecking (it is
           -- 'Nothing' otherwise.
           -- See Note [Recompilation checking in -fno-code mode] and #9243
+        ms_hie_date   :: Maybe UTCTime,
+          -- ^ Timestamp of hie file, if we have one
         ms_srcimps      :: [(Maybe FastString, Located ModuleName)],
           -- ^ Source imports of the module
         ms_textual_imps :: [(Maybe FastString, Located ModuleName)],
@@ -2833,7 +2852,7 @@ showModMsg dflags target recomp mod_summary = showSDoc dflags $
 {-
 ************************************************************************
 *                                                                      *
-\subsection{Recmpilation}
+\subsection{Recompilation}
 *                                                                      *
 ************************************************************************
 -}
@@ -2920,6 +2939,7 @@ trustInfoToNum it
             Sf_Unsafe       -> 1
             Sf_Trustworthy  -> 2
             Sf_Safe         -> 3
+            Sf_Ignore       -> 0
 
 numToTrustInfo :: Word8 -> IfaceTrustInfo
 numToTrustInfo 0 = setSafeMode Sf_None
@@ -2933,6 +2953,7 @@ numToTrustInfo n = error $ "numToTrustInfo: bad input number! (" ++ show n ++ ")
 
 instance Outputable IfaceTrustInfo where
     ppr (TrustInfo Sf_None)          = text "none"
+    ppr (TrustInfo Sf_Ignore)        = text "none"
     ppr (TrustInfo Sf_Unsafe)        = text "unsafe"
     ppr (TrustInfo Sf_Trustworthy)   = text "trustworthy"
     ppr (TrustInfo Sf_Safe)          = text "safe"

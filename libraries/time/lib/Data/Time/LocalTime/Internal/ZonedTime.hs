@@ -1,7 +1,4 @@
 {-# OPTIONS -fno-warn-orphans #-}
-#include "HsConfigure.h"
-
--- #hide
 module Data.Time.LocalTime.Internal.ZonedTime
 (
     ZonedTime(..),utcToZonedTime,zonedTimeToUTC,getZonedTime,utcToLocalZonedTime
@@ -9,10 +6,7 @@ module Data.Time.LocalTime.Internal.ZonedTime
 
 import Control.DeepSeq
 import Data.Typeable
-#if LANGUAGE_Rank2Types
 import Data.Data
-#endif
-
 import Data.Time.Clock.Internal.UTCTime
 import Data.Time.Clock.POSIX
 import Data.Time.LocalTime.Internal.TimeZone
@@ -20,17 +14,15 @@ import Data.Time.LocalTime.Internal.LocalTime
 
 
 -- | A local time together with a time zone.
+--
+-- There is no 'Eq' instance for @ZonedTime@.
+-- If you want to compare local times, use 'zonedTimeToLocalTime'.
+-- If you want to compare absolute times, use 'zonedTimeToUTC'.
 data ZonedTime = ZonedTime {
     zonedTimeToLocalTime :: LocalTime,
     zonedTimeZone :: TimeZone
 }
-#if LANGUAGE_DeriveDataTypeable
-#if LANGUAGE_Rank2Types
-#if HAS_DataPico
     deriving (Data, Typeable)
-#endif
-#endif
-#endif
 
 instance NFData ZonedTime where
     rnf (ZonedTime lt z) = rnf lt `seq` rnf z `seq` ()

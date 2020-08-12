@@ -110,17 +110,16 @@ stuff.
 ************************************************************************
 -}
 
-initLlvmConfig :: Maybe String
-                -> IO LlvmConfig
-initLlvmConfig mbMinusB
+initLlvmConfig :: String
+               -> IO LlvmConfig
+initLlvmConfig top_dir
   = do
       targets <- readAndParse "llvm-targets" mkLlvmTarget
       passes <- readAndParse "llvm-passes" id
       return (targets, passes)
   where
     readAndParse name builder =
-      do top_dir <- findTopDir mbMinusB
-         let llvmConfigFile = top_dir </> name
+      do let llvmConfigFile = top_dir </> name
          llvmConfigStr <- readFile llvmConfigFile
          case maybeReadFuzzy llvmConfigStr of
            Just s -> return (fmap builder <$> s)
@@ -130,25 +129,24 @@ initLlvmConfig mbMinusB
     mkLlvmTarget (dl, cpu, attrs) = LlvmTarget dl cpu (words attrs)
 
 
-initSysTools :: Maybe String    -- Maybe TopDir path (without the '-B' prefix)
+initSysTools :: String          -- TopDir path
              -> IO Settings     -- Set all the mutable variables above, holding
                                 --      (a) the system programs
                                 --      (b) the package-config file
                                 --      (c) the GHC usage message
-initSysTools mbMinusB
-  = do top_dir <- findTopDir mbMinusB
-             -- see Note [topdir: How GHC finds its files]
+initSysTools top_dir
+  = do       -- see Note [topdir: How GHC finds its files]
              -- NB: top_dir is assumed to be in standard Unix
              -- format, '/' separated
        mtool_dir <- findToolDir top_dir
              -- see Note [tooldir: How GHC finds mingw and perl on Windows]
 
-       let settingsFile = top_dir </> "settings"
-           platformConstantsFile = top_dir </> "platformConstants"
-           installed :: FilePath -> FilePath
+       let installed :: FilePath -> FilePath
            installed file = top_dir </> file
            libexec :: FilePath -> FilePath
            libexec file = top_dir </> "bin" </> file
+           settingsFile = installed "settings"
+           platformConstantsFile = installed "platformConstants"
 
        settingsStr <- readFile settingsFile
        platformConstantsStr <- readFile platformConstantsFile

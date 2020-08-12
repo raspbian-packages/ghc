@@ -56,7 +56,7 @@ data DwarfInfo
                      , dwCompDir :: String
                      , dwLowLabel :: CLabel
                      , dwHighLabel :: CLabel
-                     , dwLineLabel :: LitString }
+                     , dwLineLabel :: PtrString }
   | DwarfSubprogram { dwChildren :: [DwarfInfo]
                     , dwName :: String
                     , dwLabel :: CLabel
@@ -229,7 +229,8 @@ pprDwarfARanges arngs unitU = sdocWithPlatform $ \plat ->
       -- entry is 8 bytes (32-bit platform) or 16 bytes (64-bit platform).
       -- pad such that first entry begins at multiple of entry size.
       pad n = vcat $ replicate n $ pprByte 0
-      initialLength = 8 + paddingSize + 2*2*wordSize
+      -- Fix for #17428
+      initialLength = 8 + paddingSize + (1 + length arngs) * 2 * wordSize
   in pprDwWord (ppr initialLength)
      $$ pprHalf 2
      $$ sectionOffset (ppr $ mkAsmTempLabel $ unitU)

@@ -33,6 +33,7 @@ module Haddock.Utils (
 
   -- * Miscellaneous utilities
   getProgramName, bye, die, dieMsg, noDieMsg, mapSnd, mapMaybeM, escapeStr,
+  writeUtf8File, withTempDir,
 
   -- * HTML cross reference mapping
   html_xrefs_ref, html_xrefs_ref',
@@ -48,7 +49,7 @@ module Haddock.Utils (
   MonadIO(..),
 
   -- * Logging
-  parseVerbosity,
+  parseVerbosity, Verbosity(..), silent, normal, verbose, deafening,
   out,
 
   -- * System tools
@@ -60,9 +61,10 @@ import Documentation.Haddock.Doc (emptyMetaDoc)
 import Haddock.Types
 import Haddock.GhcUtils
 
+import BasicTypes ( PromotionFlag(..) )
+import Exception (ExceptionMonad)
 import GHC
 import Name
-import HsTypes (extFieldOcc)
 import Outputable ( panic )
 
 import Control.Monad ( liftM )
@@ -75,11 +77,10 @@ import Data.List ( isSuffixOf )
 import Data.Maybe ( mapMaybe )
 import System.Environment ( getProgName )
 import System.Exit
-import System.IO ( hPutStr, stderr )
+import System.Directory ( createDirectory, removeDirectoryRecursive )
+import System.IO ( hPutStr, hSetEncoding, IOMode(..), stderr, utf8, withFile )
 import System.IO.Unsafe ( unsafePerformIO )
 import qualified System.FilePath.Posix as HtmlPath
-import Distribution.Verbosity
-import Distribution.ReadE
 
 #ifndef mingw32_HOST_OS
 import qualified System.Posix.Internals
@@ -92,10 +93,27 @@ import MonadUtils ( MonadIO(..) )
 -- * Logging
 --------------------------------------------------------------------------------
 
+data Verbosity = Silent | Normal | Verbose | Deafening
+  deriving (Eq, Ord, Enum, Bounded, Show)
 
+silent, normal, verbose, deafening :: Verbosity
+silent    = Silent
+normal    = Normal
+verbose   = Verbose
+deafening = Deafening
+
+-- | Parse out a verbosity level. Inspired from Cabal's verbosity parsing.
 parseVerbosity :: String -> Either String Verbosity
-parseVerbosity = runReadE flagToVerbosity
-
+parseVerbosity "0" = Right Silent
+parseVerbosity "1" = Right Normal
+parseVerbosity "2" = Right Silent
+parseVerbosity "3" = Right Deafening
+parseVerbosity "silent"    = return Silent
+parseVerbosity "normal"    = return Normal
+parseVerbosity "verbose"   = return Verbose
+parseVerbosity "debug"     = return Deafening
+parseVerbosity "deafening" = return Deafening
+parseVerbosity other = Left ("Can't parse verbosity " ++ other)
 
 -- | Print a message to stdout, if it is not too verbose
 out :: MonadIO m
@@ -395,6 +413,19 @@ isAlphaChar c    = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
 isDigitChar c    = c >= '0' && c <= '9'
 isAlphaNumChar c = isAlphaChar c || isDigitChar c
 
+-- | Utility to write output to UTF-8 encoded files.
+--
+-- The problem with 'writeFile' is that it picks up its 'TextEncoding' from
+-- 'getLocaleEncoding', and on some platforms (like Windows) this default
+-- encoding isn't enough for the characters we want to write.
+writeUtf8File :: FilePath -> String -> IO ()
+writeUtf8File filepath contents = withFile filepath WriteMode $ \h -> do
+    hSetEncoding h utf8
+    hPutStr h contents
+
+withTempDir :: (ExceptionMonad m) => FilePath -> m a -> m a
+withTempDir dir = gbracket_ (liftIO $ createDirectory dir)
+                            (liftIO $ removeDirectoryRecursive dir)
 
 -----------------------------------------------------------------------------
 -- * HTML cross references

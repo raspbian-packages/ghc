@@ -23,9 +23,9 @@ CABAL_CONSTRAINT := --constraint="Cabal == $(CABAL_DOTTED_VERSION)"
 # macros is triggered by `-hide-all-packages`, so we have to explicitly
 # enumerate all packages we need in scope.
 ifeq "$(Windows_Host)" "YES"
-CABAL_BUILD_DEPS := ghc-prim base array transformers time containers bytestring deepseq process pretty directory Win32
+CABAL_BUILD_DEPS := ghc-prim base array transformers time containers bytestring deepseq process pretty directory filepath Win32 template-haskell
 else
-CABAL_BUILD_DEPS := ghc-prim base array transformers time containers bytestring deepseq process pretty directory unix
+CABAL_BUILD_DEPS := ghc-prim base array transformers time containers bytestring deepseq process pretty directory filepath unix template-haskell
 endif
 
 ghc-cabal_DIST_BINARY_NAME = ghc-cabal$(exeext0)
@@ -37,15 +37,15 @@ $(ghc-cabal_INPLACE) : $(ghc-cabal_DIST_BINARY) | $$(dir $$@)/.
 	"$(CP)" $< $@
 
 # Minor hack, since we can't reuse the `hs-suffix-rules-srcdir` macro
-ifneq ($(wildcard libraries/Cabal/Cabal/Distribution/Parsec/Lexer.x),)
+ifneq ($(wildcard libraries/Cabal/Cabal/Distribution/Fields/Lexer.x),)
 # Lexer.x exists so we have to call Alex ourselves
-CABAL_LEXER_DEP := bootstrapping/Cabal/Distribution/Parsec/Lexer.hs
+CABAL_LEXER_DEP := bootstrapping/Cabal/Distribution/Fields/Lexer.hs
 
-bootstrapping/Cabal/Distribution/Parsec/Lexer.hs: libraries/Cabal/Cabal/Distribution/Parsec/Lexer.x
-	mkdir -p bootstrapping/Cabal/Distribution/Parsec
+bootstrapping/Cabal/Distribution/Fields/Lexer.hs: libraries/Cabal/Cabal/Distribution/Fields/Lexer.x
+	mkdir -p bootstrapping/Cabal/Distribution/Fields
 	$(call cmd,ALEX) $< -o $@
 else
-CABAL_LEXER_DEP := libraries/Cabal/Cabal/Distribution/Parsec/Lexer.hs
+CABAL_LEXER_DEP := libraries/Cabal/Cabal/Distribution/Fields/Lexer.hs
 endif
 
 $(ghc-cabal_DIST_BINARY): $(wildcard libraries/Cabal/Cabal/Distribution/*/*/*.hs)

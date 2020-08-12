@@ -146,6 +146,12 @@ def parse_ghci_cmd(env, sig, signode):
     # Reference name
     return name
 
+def parse_pragma(env, sig, signode):
+    idx = sig.split(' ')[0]
+    name = '{-# ' + sig + ' #-}'
+    signode += addnodes.desc_name(name, name)
+    return idx
+
 def parse_flag(env, sig, signode):
 
     # Break flag into name and args
@@ -220,6 +226,15 @@ def setup(app):
                         indextemplate='pair: %s; RTS option',
                         doc_field_types=[
                             Field('since', label='Introduced in GHC version', names=['since']),
+                        ])
+
+    app.add_object_type('pragma', 'pragma',
+                        objname='Haskell pragma',
+                        parse_node=parse_pragma,
+                        indextemplate='pair: %s; pragma',
+                        doc_field_types=[
+                            Field('since', label='Introduced in GHC version', names=['since']),
+                            Field('where', label='Allowed contexts', names=['where'])
                         ])
 
 def increase_python_stack():

@@ -419,8 +419,8 @@ else # CLEANING
 # Packages that are built by stage0. These packages are dependencies of
 # programs such as GHC and ghc-pkg, that we do not assume the stage0
 # compiler already has installed (or up-to-date enough).
-
-PACKAGES_STAGE0 = binary text transformers mtl parsec Cabal/Cabal hpc ghc-boot-th ghc-boot template-haskell ghc-heap ghci
+# Note that these must be given in topological order.
+PACKAGES_STAGE0 = binary transformers mtl hpc ghc-boot-th ghc-boot template-haskell text parsec Cabal/Cabal ghc-heap ghci
 ifeq "$(Windows_Host)" "NO"
 PACKAGES_STAGE0 += terminfo
 endif
@@ -432,7 +432,7 @@ PACKAGES_STAGE1 += filepath
 PACKAGES_STAGE1 += array
 PACKAGES_STAGE1 += deepseq
 PACKAGES_STAGE1 += bytestring
-PACKAGES_STAGE1 += containers
+PACKAGES_STAGE1 += containers/containers
 
 ifeq "$(Windows_Target)" "YES"
 PACKAGES_STAGE1 += Win32
@@ -447,17 +447,14 @@ PACKAGES_STAGE1 += process
 PACKAGES_STAGE1 += hpc
 PACKAGES_STAGE1 += pretty
 PACKAGES_STAGE1 += binary
-PACKAGES_STAGE1 += text
 PACKAGES_STAGE1 += transformers
 PACKAGES_STAGE1 += mtl
-PACKAGES_STAGE1 += parsec
-# temporary until Cabal switches to parsec mode by default
-libraries/Cabal/Cabal_dist-boot_CONFIGURE_OPTS += --flag parsec
-libraries/Cabal/Cabal_dist-install_CONFIGURE_OPTS += --flag parsec
-PACKAGES_STAGE1 += Cabal/Cabal
 PACKAGES_STAGE1 += ghc-boot-th
 PACKAGES_STAGE1 += ghc-boot
 PACKAGES_STAGE1 += template-haskell
+PACKAGES_STAGE1 += text
+PACKAGES_STAGE1 += parsec
+PACKAGES_STAGE1 += Cabal/Cabal
 PACKAGES_STAGE1 += ghc-compact
 PACKAGES_STAGE1 += ghc-heap
 
@@ -616,8 +613,10 @@ libraries/ghc-prim_dist-install_EXTRA_HADDOCK_SRCS = libraries/ghc-prim/dist-ins
 ifneq "$(CLEANING)" "YES"
 ifeq "$(INTEGER_LIBRARY)" "integer-gmp"
 libraries/base_dist-install_CONFIGURE_OPTS += --flags=integer-gmp
+compiler_stage2_CONFIGURE_OPTS += --flags=integer-gmp
 else ifeq "$(INTEGER_LIBRARY)" "integer-simple"
 libraries/base_dist-install_CONFIGURE_OPTS += --flags=integer-simple
+compiler_stage2_CONFIGURE_OPTS += --flags=integer-simple
 else
 $(error Unknown integer library: $(INTEGER_LIBRARY))
 endif
@@ -783,8 +782,11 @@ ifneq "$(BINDIST)" "YES"
 # Make sure we have all the GHCi libs by the time we've built
 # ghc-stage2.
 #
-GHCI_LIBS = $(foreach lib,$(PACKAGES_STAGE1),$(libraries/$(lib)_dist-install_GHCI_LIB)) \
-	    $(compiler_stage2_GHCI_LIB)
+GHCI_LIBS = \
+    $(foreach way,$(GhcLibWays),\
+        $(foreach lib,$(PACKAGES_STAGE1),\
+            $(libraries/$(lib)_dist-install_$(way)_GHCI_LIB)) \
+        $(compiler_stage2_$(way)_GHCI_LIB))
 
 ifeq "$(UseArchivesForGhci)" "NO"
 ghc/stage2/build/tmp/$(ghc_stage2_PROG) : $(GHCI_LIBS)
@@ -1229,6 +1231,7 @@ sdist-ghc-prep-tree :
 	$(call removeTrees,$(SRC_DIST_GHC_DIR)/libraries/stamp/)
 	$(call removeTrees,$(SRC_DIST_GHC_DIR)/compiler/stage[123])
 	$(call removeFiles,$(SRC_DIST_GHC_DIR)/mk/build.mk)
+	$(call removeFiles,$(SRC_DIST_GHC_DIR)/rts/rts.cabal)
 	for i in $(EXTRA_PACKAGES); do $(RM) $(RM_OPTS_REC) $(SRC_DIST_GHC_DIR)/libraries/$$i/; done
 	cd $(SRC_DIST_GHC_DIR) && "$(FIND)" $(SRC_DIST_GHC_DIRS) \( -name .git -o -name "autom4te*" -o -name "*~" -o -name "\#*" -o -name ".\#*" -o -name "log" -o -name "*-SAVE" -o -name "*.orig" -o -name "*.rej" \) -print | "$(XARGS)" $(XARGS_OPTS) "$(RM)" $(RM_OPTS_REC)
 

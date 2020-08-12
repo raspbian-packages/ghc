@@ -39,8 +39,10 @@ import Haddock.Version
 import Haddock.InterfaceFile
 import Haddock.Options
 import Haddock.Utils
+import Haddock.GhcUtils (modifySessionDynFlags, setOutputDir)
 
 import Control.Monad hiding (forM_)
+import Data.Bifunctor (second)
 import Data.Foldable (forM_, foldl')
 import Data.Traversable (for)
 import Data.List (isPrefixOf)
@@ -66,6 +68,8 @@ import qualified GHC.Paths as GhcPaths
 import Paths_haddock_api (getDataDir)
 import System.Directory (doesDirectoryExist)
 #endif
+import System.Directory (getTemporaryDirectory)
+import System.FilePath ((</>))
 
 import Text.ParserCombinators.ReadP (readP_to_S)
 import GHC hiding (verbosity)
@@ -76,7 +80,7 @@ import Packages
 import Panic (handleGhcException)
 import Module
 import FastString
-import qualified DynamicLoading
+import Outputable (defaultUserStyle)
 
 --------------------------------------------------------------------------------
 -- * Exception handling
@@ -161,18 +165,32 @@ haddockWithGhc ghc args = handleTopExceptions $ do
           Just "YES" -> return $ Flag_OptGhc "-dynamic-too" : flags
           _ -> return flags
 
+  -- bypass the interface version check
+  let noChecks = Flag_BypassInterfaceVersonCheck `elem` flags
+
+  -- Create a temporary directory and redirect GHC output there (unless user
+  -- requested otherwise).
+  --
+  -- Output dir needs to be set before calling 'depanal' since 'depanal' uses it
+  -- to compute output file names that are stored in the 'DynFlags' of the
+  -- resulting 'ModSummary's.
+  let withDir | Flag_NoTmpCompDir `elem` flags = id
+              | otherwise = withTempOutputDir
+
   unless (Flag_NoWarnings `elem` flags) $ do
     hypSrcWarnings flags
     forM_ (warnings args) $ \warning -> do
       hPutStrLn stderr warning
+    when noChecks $
+      hPutStrLn stderr noCheckWarning
 
-  ghc flags' $ do
+  ghc flags' $ withDir $ do
     dflags <- getDynFlags
 
     forM_ (optShowInterfaceFile flags) $ \path -> liftIO $ do
-      mIfaceFile <- readInterfaceFiles freshNameCache [(("", Nothing), path)]
+      mIfaceFile <- readInterfaceFiles freshNameCache [(("", Nothing), path)] noChecks
       forM_ mIfaceFile $ \(_, ifaceFile) -> do
-        putMsg dflags (renderJson (jsonInterfaceFile ifaceFile))
+        logOutput dflags (defaultUserStyle dflags) (renderJson (jsonInterfaceFile ifaceFile))
 
     if not (null files) then do
       (packages, ifaces, homeLinks) <- readPackagesAndProcessModules flags files
@@ -192,10 +210,19 @@ haddockWithGhc ghc args = handleTopExceptions $ do
         throwE "No input file(s)."
 
       -- Get packages supplied with --read-interface.
-      packages <- liftIO $ readInterfaceFiles freshNameCache (readIfaceArgs flags)
+      packages <- liftIO $ readInterfaceFiles freshNameCache (readIfaceArgs flags) noChecks
 
       -- Render even though there are no input files (usually contents/index).
       liftIO $ renderStep dflags flags sinceQual qual packages []
+
+-- | Run the GHC action using a temporary output directory
+withTempOutputDir :: Ghc a -> Ghc a
+withTempOutputDir action = do
+  tmp <- liftIO getTemporaryDirectory
+  x   <- liftIO getProcessID
+  let dir = tmp </> ".haddock-" ++ show x
+  modifySessionDynFlags (setOutputDir dir)
+  withTempDir dir action
 
 -- | Create warnings about potential misuse of -optghc
 warnings :: [String] -> [String]
@@ -203,6 +230,10 @@ warnings = map format . filter (isPrefixOf "-optghc")
   where
     format arg = concat ["Warning: `", arg, "' means `-o ", drop 2 arg, "', did you mean `-", arg, "'?"]
 
+-- | Create a warning about bypassing the interface version check
+noCheckWarning :: String
+noCheckWarning = "Warning: `--bypass-interface-version-check' can cause " ++
+                 "Haddock to crash when reading Haddock interface files."
 
 withGhc :: [Flag] -> Ghc a -> IO a
 withGhc flags action = do
@@ -212,15 +243,17 @@ withGhc flags action = do
   let handleSrcErrors action' = flip handleSourceError action' $ \err -> do
         printException err
         liftIO exitFailure
+      needHieFiles = Flag_HyperlinkedSource `elem` flags
 
-  withGhc' libDir (ghcFlags flags) (\_ -> handleSrcErrors action)
+  withGhc' libDir needHieFiles (ghcFlags flags) (\_ -> handleSrcErrors action)
 
 
 readPackagesAndProcessModules :: [Flag] -> [String]
                               -> Ghc ([(DocPaths, InterfaceFile)], [Interface], LinkEnv)
 readPackagesAndProcessModules flags files = do
     -- Get packages supplied with --read-interface.
-    packages <- readInterfaceFiles nameCacheFromGhc (readIfaceArgs flags)
+    let noChecks = Flag_BypassInterfaceVersonCheck `elem` flags
+    packages <- readInterfaceFiles nameCacheFromGhc (readIfaceArgs flags) noChecks
 
     -- Create the interfaces -- this is the core part of Haddock.
     let ifaceFiles = map snd packages
@@ -268,9 +301,9 @@ render dflags flags sinceQual qual ifaces installedIfaces extSrcMap = do
     allIfaces        = map toInstalledIface ifaces ++ installedIfaces
     allVisibleIfaces = [ i | i <- allIfaces, OptHide `notElem` instOptions i ]
 
-    pkgMod           = ifaceMod (head ifaces)
-    pkgKey           = moduleUnitId pkgMod
-    pkgStr           = Just (unitIdString pkgKey)
+    pkgMod           = fmap ifaceMod (listToMaybe ifaces)
+    pkgKey           = fmap moduleUnitId pkgMod
+    pkgStr           = fmap unitIdString pkgKey
     pkgNameVer       = modulePackageInfo dflags flags pkgMod
     pkgName          = fmap (unpackFS . (\(PackageName n) -> n)) (fst pkgNameVer)
     sincePkg         = case sinceQual of
@@ -289,16 +322,22 @@ render dflags flags sinceQual qual ifaces installedIfaces extSrcMap = do
 
     pkgSrcMap = Map.mapKeys moduleUnitId extSrcMap
     pkgSrcMap'
-      | Flag_HyperlinkedSource `elem` flags =
-          Map.insert pkgKey hypSrcModuleNameUrlFormat pkgSrcMap
-      | Just srcNameUrl <- srcEntity = Map.insert pkgKey srcNameUrl pkgSrcMap
+      | Flag_HyperlinkedSource `elem` flags
+      , Just k <- pkgKey
+      = Map.insert k hypSrcModuleNameUrlFormat pkgSrcMap
+      | Just srcNameUrl <- srcEntity
+      , Just k <- pkgKey
+      = Map.insert k srcNameUrl pkgSrcMap
       | otherwise = pkgSrcMap
 
     -- TODO: Get these from the interface files as with srcMap
     pkgSrcLMap'
-      | Flag_HyperlinkedSource `elem` flags =
-          Map.singleton pkgKey hypSrcModuleLineUrlFormat
-      | Just path <- srcLEntity = Map.singleton pkgKey path
+      | Flag_HyperlinkedSource `elem` flags
+      , Just k <- pkgKey
+      = Map.singleton k hypSrcModuleLineUrlFormat
+      | Just path <- srcLEntity
+      , Just k <- pkgKey
+      = Map.singleton k path
       | otherwise = Map.empty
 
     sourceUrls' = (srcBase, srcModule', pkgSrcMap', pkgSrcLMap')
@@ -375,7 +414,8 @@ render dflags flags sinceQual qual ifaces installedIfaces extSrcMap = do
                visibleIfaces odir
       _ -> putStrLn . unlines $
           [ "haddock: Unable to find a package providing module "
-            ++ moduleNameString (moduleName pkgMod) ++ ", skipping Hoogle."
+            ++ maybe "<no-mod>" (moduleNameString . moduleName) pkgMod
+            ++ ", skipping Hoogle."
           , ""
           , "         Perhaps try specifying the desired package explicitly"
             ++ " using the --package-name"
@@ -392,7 +432,7 @@ render dflags flags sinceQual qual ifaces installedIfaces extSrcMap = do
   when (Flag_HyperlinkedSource `elem` flags && not (null ifaces)) $ do
     withTiming (pure dflags') "ppHyperlinkedSource" (const ()) $ do
       _ <- {-# SCC ppHyperlinkedSource #-}
-           ppHyperlinkedSource odir libDir opt_source_css pretty srcMap ifaces
+           ppHyperlinkedSource (verbosity flags) odir libDir opt_source_css pretty srcMap ifaces
       return ()
 
 
@@ -404,13 +444,14 @@ render dflags flags sinceQual qual ifaces installedIfaces extSrcMap = do
 readInterfaceFiles :: MonadIO m
                    => NameCacheAccessor m
                    -> [(DocPaths, FilePath)]
+                   -> Bool
                    -> m [(DocPaths, InterfaceFile)]
-readInterfaceFiles name_cache_accessor pairs = do
+readInterfaceFiles name_cache_accessor pairs bypass_version_check = do
   catMaybes `liftM` mapM ({-# SCC readInterfaceFile #-} tryReadIface) pairs
   where
     -- try to read an interface, warn if we can't
     tryReadIface (paths, file) =
-      readInterfaceFile name_cache_accessor file >>= \case
+      readInterfaceFile name_cache_accessor file bypass_version_check >>= \case
         Left err -> liftIO $ do
           putStrLn ("Warning: Cannot read " ++ file ++ ":")
           putStrLn ("   " ++ err)
@@ -426,14 +467,10 @@ readInterfaceFiles name_cache_accessor pairs = do
 
 -- | Start a GHC session with the -haddock flag set. Also turn off
 -- compilation and linking. Then run the given 'Ghc' action.
-withGhc' :: String -> [String] -> (DynFlags -> Ghc a) -> IO a
-withGhc' libDir flags ghcActs = runGhc (Just libDir) $ do
-  dynflags  <- getSessionDynFlags
-  dynflags' <- parseGhcFlags (gopt_set dynflags Opt_Haddock) {
-    hscTarget = HscNothing,
-    ghcMode   = CompManager,
-    ghcLink   = NoLink
-    }
+withGhc' :: String -> Bool -> [String] -> (DynFlags -> Ghc a) -> IO a
+withGhc' libDir needHieFiles flags ghcActs = runGhc (Just libDir) $ do
+  dynflags' <- parseGhcFlags =<< getSessionDynFlags
+
   -- We disable pattern match warnings because than can be very
   -- expensive to check
   let dynflags'' = unsetPatternMatchWarnings $
@@ -443,10 +480,7 @@ withGhc' libDir flags ghcActs = runGhc (Just libDir) $ do
   -- that may need to be re-linked: Haddock doesn't do any
   -- dynamic or static linking at all!
   _ <- setSessionDynFlags dynflags''
-  hscenv <- GHC.getSession
-  dynflags''' <- liftIO (DynamicLoading.initializePlugins hscenv dynflags'')
-  _ <- setSessionDynFlags dynflags'''
-  ghcActs dynflags'''
+  ghcActs dynflags''
   where
 
     -- ignore sublists of flags that start with "+RTS" and end in "-RTS"
@@ -464,11 +498,19 @@ withGhc' libDir flags ghcActs = runGhc (Just libDir) $ do
     parseGhcFlags dynflags = do
       -- TODO: handle warnings?
 
-      let flags' = filterRtsFlags flags
-      (dynflags', rest, _) <- parseDynamicFlags dynflags (map noLoc flags')
+      let extra_opts | needHieFiles = [Opt_WriteHie, Opt_Haddock]
+                     | otherwise = [Opt_Haddock]
+          dynflags' = (foldl' gopt_set dynflags extra_opts)
+                        { hscTarget = HscNothing
+                        , ghcMode   = CompManager
+                        , ghcLink   = NoLink
+                        }
+          flags' = filterRtsFlags flags
+
+      (dynflags'', rest, _) <- parseDynamicFlags dynflags' (map noLoc flags')
       if not (null rest)
         then throwE ("Couldn't parse GHC options: " ++ unwords flags')
-        else return dynflags'
+        else return dynflags''
 
 unsetPatternMatchWarnings :: DynFlags -> DynFlags
 unsetPatternMatchWarnings dflags =
@@ -618,7 +660,7 @@ getPrologue dflags flags =
       h <- openFile filename ReadMode
       hSetEncoding h utf8
       str <- hGetContents h -- semi-closes the handle
-      return . Just $! parseParas dflags Nothing str
+      return . Just $! second (fmap rdrName) $ parseParas dflags Nothing str
     _ -> throwE "multiple -p/--prologue options"
 
 

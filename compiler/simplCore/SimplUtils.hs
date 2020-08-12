@@ -1112,8 +1112,8 @@ want PreInlineUnconditionally to second-guess it.  A live example is
 Trac #3736.
     c.f. Note [Stable unfoldings and postInlineUnconditionally]
 
-NB: if the pragama is INLINEABLE, then we don't want to behave int
-this special way -- an INLINEABLE pragam just says to GHC "inline this
+NB: if the pragma is INLINEABLE, then we don't want to behave in
+this special way -- an INLINEABLE pragma just says to GHC "inline this
 if you like".  But if there is a unique occurrence, we want to inline
 the stable unfolding, not the RHS.
 
@@ -1763,7 +1763,7 @@ abstractFloats dflags top_lvl main_tvs floats body
         rhs' = CoreSubst.substExpr (text "abstract_floats2") subst rhs
 
         -- tvs_here: see Note [Which type variables to abstract over]
-        tvs_here = toposortTyVars $
+        tvs_here = scopedSort $
                    filter (`elemVarSet` main_tv_set) $
                    closeOverKindsList $
                    exprSomeFreeVarsList isTyVar rhs'
@@ -1791,7 +1791,7 @@ abstractFloats dflags top_lvl main_tvs floats body
                 -- If you ever want to be more selective, remember this bizarre case too:
                 --      x::a = x
                 -- Here, we must abstract 'x' over 'a'.
-         tvs_here = toposortTyVars main_tvs
+         tvs_here = scopedSort main_tvs
 
     mk_poly1 :: [TyVar] -> Id -> SimplM (Id, CoreExpr)
     mk_poly1 tvs_here var

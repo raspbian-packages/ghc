@@ -21,7 +21,8 @@ module Distribution.Client.ProjectConfig.Types (
   ) where
 
 import Distribution.Client.Types
-         ( RemoteRepo, AllowNewer(..), AllowOlder(..) )
+         ( RemoteRepo, AllowNewer(..), AllowOlder(..)
+         , WriteGhcEnvironmentFilesPolicy )
 import Distribution.Client.Dependency.Types
          ( PreSolver )
 import Distribution.Client.Targets
@@ -32,12 +33,16 @@ import Distribution.Client.BuildReports.Types
 import Distribution.Client.IndexUtils.Timestamp
          ( IndexState )
 
+import Distribution.Client.CmdInstall.ClientInstallFlags
+         ( ClientInstallFlags(..) )
+
 import Distribution.Solver.Types.Settings
 import Distribution.Solver.Types.ConstraintSource
 
 import Distribution.Package
          ( PackageName, PackageId, UnitId )
-import Distribution.Types.Dependency
+import Distribution.Types.PackageVersionConstraint
+         ( PackageVersionConstraint )
 import Distribution.Version
          ( Version )
 import Distribution.System
@@ -48,7 +53,7 @@ import Distribution.Simple.Compiler
          ( Compiler, CompilerFlavor
          , OptimisationLevel(..), ProfDetailLevel, DebugInfoLevel(..) )
 import Distribution.Simple.Setup
-         ( Flag, HaddockTarget(..) )
+         ( Flag, HaddockTarget(..), TestShowDetails(..) )
 import Distribution.Simple.InstallDirs
          ( PathTemplate )
 import Distribution.Utils.NubList
@@ -105,7 +110,7 @@ data ProjectConfig
        projectPackagesRepo          :: [SourceRepo],
 
        -- | Packages in this project from hackage repositories.
-       projectPackagesNamed         :: [Dependency],
+       projectPackagesNamed         :: [PackageVersionConstraint],
 
        -- See respective types for an explanation of what these
        -- values are about:
@@ -147,7 +152,8 @@ data ProjectConfigBuildOnly
        projectConfigHttpTransport         :: Flag String,
        projectConfigIgnoreExpiry          :: Flag Bool,
        projectConfigCacheDir              :: Flag FilePath,
-       projectConfigLogsDir               :: Flag FilePath
+       projectConfigLogsDir               :: Flag FilePath,
+       projectConfigClientInstallFlags    :: ClientInstallFlags
      }
   deriving (Eq, Show, Generic)
 
@@ -181,16 +187,20 @@ data ProjectConfigShared
 
        -- solver configuration
        projectConfigConstraints       :: [(UserConstraint, ConstraintSource)],
-       projectConfigPreferences       :: [Dependency],
+       projectConfigPreferences       :: [PackageVersionConstraint],
        projectConfigCabalVersion      :: Flag Version,  --TODO: [required eventually] unused
        projectConfigSolver            :: Flag PreSolver,
        projectConfigAllowOlder        :: Maybe AllowOlder,
        projectConfigAllowNewer        :: Maybe AllowNewer,
+       projectConfigWriteGhcEnvironmentFilesPolicy
+                                      :: Flag WriteGhcEnvironmentFilesPolicy,
        projectConfigMaxBackjumps      :: Flag Int,
        projectConfigReorderGoals      :: Flag ReorderGoals,
        projectConfigCountConflicts    :: Flag CountConflicts,
+       projectConfigMinimizeConflictSet :: Flag MinimizeConflictSet,
        projectConfigStrongFlags       :: Flag StrongFlags,
        projectConfigAllowBootLibInstalls :: Flag AllowBootLibInstalls,
+       projectConfigOnlyConstrained   :: Flag OnlyConstrained,
        projectConfigPerComponent      :: Flag Bool,
        projectConfigIndependentGoals  :: Flag IndependentGoals,
 
@@ -236,6 +246,7 @@ data PackageConfig
        packageConfigSharedLib           :: Flag Bool,
        packageConfigStaticLib           :: Flag Bool,
        packageConfigDynExe              :: Flag Bool,
+       packageConfigFullyStaticExe      :: Flag Bool,
        packageConfigProf                :: Flag Bool, --TODO: [code cleanup] sort out
        packageConfigProfLib             :: Flag Bool, --      this duplication
        packageConfigProfExe             :: Flag Bool, --      and consistency
@@ -260,6 +271,7 @@ data PackageConfig
        packageConfigDebugInfo           :: Flag DebugInfoLevel,
        packageConfigRunTests            :: Flag Bool, --TODO: [required eventually] use this
        packageConfigDocumentation       :: Flag Bool, --TODO: [required eventually] use this
+       -- Haddock options
        packageConfigHaddockHoogle       :: Flag Bool, --TODO: [required eventually] use this
        packageConfigHaddockHtml         :: Flag Bool, --TODO: [required eventually] use this
        packageConfigHaddockHtmlLocation :: Flag String, --TODO: [required eventually] use this
@@ -273,7 +285,15 @@ data PackageConfig
        packageConfigHaddockQuickJump    :: Flag Bool, --TODO: [required eventually] use this
        packageConfigHaddockHscolourCss  :: Flag FilePath, --TODO: [required eventually] use this
        packageConfigHaddockContents     :: Flag PathTemplate, --TODO: [required eventually] use this
-       packageConfigHaddockForHackage   :: Flag HaddockTarget
+       packageConfigHaddockForHackage   :: Flag HaddockTarget,
+       -- Test options
+       packageConfigTestHumanLog        :: Flag PathTemplate,
+       packageConfigTestMachineLog      :: Flag PathTemplate,
+       packageConfigTestShowDetails     :: Flag TestShowDetails,
+       packageConfigTestKeepTix         :: Flag Bool,
+       packageConfigTestWrapper         :: Flag FilePath,
+       packageConfigTestFailWhenNoTestSuites :: Flag Bool,
+       packageConfigTestTestOptions     :: [PathTemplate]
      }
   deriving (Eq, Show, Generic)
 
@@ -360,7 +380,7 @@ data SolverSettings
        solverSettingRemoteRepos       :: [RemoteRepo],     -- ^ Available Hackage servers.
        solverSettingLocalRepos        :: [FilePath],
        solverSettingConstraints       :: [(UserConstraint, ConstraintSource)],
-       solverSettingPreferences       :: [Dependency],
+       solverSettingPreferences       :: [PackageVersionConstraint],
        solverSettingFlagAssignment    :: FlagAssignment, -- ^ For all local packages
        solverSettingFlagAssignments   :: Map PackageName FlagAssignment,
        solverSettingCabalVersion      :: Maybe Version,  --TODO: [required eventually] unused
@@ -370,8 +390,10 @@ data SolverSettings
        solverSettingMaxBackjumps      :: Maybe Int,
        solverSettingReorderGoals      :: ReorderGoals,
        solverSettingCountConflicts    :: CountConflicts,
+       solverSettingMinimizeConflictSet :: MinimizeConflictSet,
        solverSettingStrongFlags       :: StrongFlags,
        solverSettingAllowBootLibInstalls :: AllowBootLibInstalls,
+       solverSettingOnlyConstrained   :: OnlyConstrained,
        solverSettingIndexState        :: Maybe IndexState,
        solverSettingIndependentGoals  :: IndependentGoals
        -- Things that only make sense for manual mode, not --local mode

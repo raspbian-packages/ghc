@@ -15,7 +15,6 @@ import Control.Concurrent.STM
 import Control.Concurrent hiding (throwTo)
 import Data.Char(isPrint)
 import Data.Maybe(mapMaybe)
-import Control.Applicative
 import Control.Monad
 
 import System.Console.Haskeline.Key
@@ -166,9 +165,6 @@ getKeyEvent p = do
 data Coord = Coord {coordX, coordY :: Int}
                 deriving Show
 
-#if __GLASGOW_HASKELL__ < 711
-#let alignment t = "%lu", (unsigned long)offsetof(struct {char x__; t (y__); }, y__)
-#endif
 instance Storable Coord where
     sizeOf _ = (#size COORD)
     alignment _ = (#alignment COORD)

@@ -249,10 +249,11 @@ my_mmap (void *addr, W_ size, int operation)
     if (ret == MAP_FAILED) {
         return NULL;
     }
+#endif /* defined(darwin_HOST_OS) */
+
     // Map in committed pages rather than take a fault for each chunk.
     // Also arrange to include them in core-dump files.
     post_mmap_madvise(operation, size, ret);
-#endif /* defined(darwin_HOST_OS) */
 
     return ret;
 }
@@ -545,10 +546,12 @@ void *osReserveHeapMemory(void *startAddressPtr, W_ *len)
 
 #if defined(HAVE_SYS_RESOURCE_H) && defined(HAVE_SYS_TIME_H)
     struct rlimit limit;
+    /* rlim_t is signed on some platforms, including FreeBSD;
+     * explicitly cast to avoid sign compare error */
     if (!getrlimit(RLIMIT_AS, &limit)
         && limit.rlim_cur > 0
-        && *len > limit.rlim_cur) {
-        *len = limit.rlim_cur;
+        && *len > (W_) limit.rlim_cur) {
+        *len = (W_) limit.rlim_cur;
     }
 #endif
 

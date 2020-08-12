@@ -73,22 +73,18 @@ timed cabal update
 # Install executables if necessary
 # ---------------------------------------------------------------------
 
-#if ! command -v happy; then
-    timed cabal install $jobs happy
-#fi
+# TODO: we need v2-install -z
+(cd /tmp && timed cabal v2-install $jobs happy --overwrite-policy=always)
 
 # ---------------------------------------------------------------------
 # Setup our local project
 # ---------------------------------------------------------------------
 
 make cabal-install-monolithic
-cp cabal.project.travis cabal.project.local
-
-# hackage-repo-tool is a bit touchy to install on GHC 8.0, so instead we
-# do it via new-build.  See also cabal.project.travis.  The downside of
-# doing it this way is that the build product cannot be cached, but
-# hackage-repo-tool is a relatively small package so it's good.
-timed cabal unpack hackage-repo-tool-${HACKAGE_REPO_TOOL_VERSION}
+if [ "x$CABAL_LIB_ONLY" = "xYES" ]; then
+    cp cabal.project.libonly cabal.project
+fi
+cp cabal.project.local.travis cabal.project.local
 
 # ---------------------------------------------------------------------
 # Cabal
@@ -159,7 +155,8 @@ fi
 # test suites are baked into the cabal binary
 timed cabal new-build $jobs $CABAL_INSTALL_FLAGS cabal-install:cabal
 
-timed cabal new-build $jobs hackage-repo-tool
+# TODO: we need v2-install -z
+(cd /tmp && timed cabal new-install $jobs hackage-repo-tool --overwrite-policy=always)
 
 if [ "x$SKIP_TESTS" = "xYES" ]; then
    exit 1;
@@ -169,7 +166,7 @@ fi
 timed ${CABAL_INSTALL_EXE} update
 
 # Big tests
-(cd cabal-testsuite && timed ${CABAL_TESTSUITE_BDIR}/build/cabal-tests/cabal-tests --builddir=${CABAL_TESTSUITE_BDIR} -j3 --skip-setup-tests --with-cabal ${CABAL_INSTALL_EXE} --with-hackage-repo-tool ${HACKAGE_REPO_TOOL_BDIR}/build/hackage-repo-tool/hackage-repo-tool $TEST_OPTIONS) || exit $?
+(cd cabal-testsuite && timed ${CABAL_TESTSUITE_BDIR}/build/cabal-tests/cabal-tests --builddir=${CABAL_TESTSUITE_BDIR} -j3 --skip-setup-tests --with-cabal ${CABAL_INSTALL_EXE} --with-hackage-repo-tool hackage-repo-tool $TEST_OPTIONS) || exit $?
 
 # Cabal check
 # TODO: remove -main-is and re-enable me.
@@ -177,12 +174,12 @@ timed ${CABAL_INSTALL_EXE} update
 
 if [ "x$TEST_SOLVER_BENCHMARKS" = "xYES" ]; then
     timed cabal new-build $jobs solver-benchmarks:hackage-benchmark solver-benchmarks:unit-tests
-    timed ${SOLVER_BENCHMARKS_BDIR}/c/unit-tests/build/unit-tests/unit-tests $TEST_OPTIONS
+    timed ${SOLVER_BENCHMARKS_BDIR}/t/unit-tests/build/unit-tests/unit-tests $TEST_OPTIONS
 fi
 
 # Haddock
 # TODO: >= 8.4.3 would be nicer
-if [ "$TRAVIS_OS_NAME" = "linux" -a "$GHCVER" == "8.4.3" ]; then
+if [ "$TRAVIS_OS_NAME" = "linux" -a "$GHCVER" == "8.4.4" ]; then
     timed cabal new-haddock cabal-install
 fi
 

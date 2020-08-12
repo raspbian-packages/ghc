@@ -9,7 +9,7 @@ module Distribution.Client.CmdRun (
     -- * The @run@ CLI and action
     runCommand,
     runAction,
-    handleShebang,
+    handleShebang, validScript,
 
     -- * Internals exposed for testing
     TargetProblem(..),
@@ -29,17 +29,17 @@ import Distribution.Client.GlobalFlags
          ( defaultGlobalFlags )
 import qualified Distribution.Client.Setup as Client
 import Distribution.Simple.Setup
-         ( HaddockFlags, fromFlagOrDefault )
+         ( HaddockFlags, TestFlags, fromFlagOrDefault )
 import Distribution.Simple.Command
          ( CommandUI(..), usageAlternatives )
 import Distribution.Types.ComponentName
          ( showComponentName )
-import Distribution.Text
+import Distribution.Deprecated.Text
          ( display )
 import Distribution.Verbosity
          ( Verbosity, normal )
 import Distribution.Simple.Utils
-         ( wrapText, die', ordNub, info
+         ( wrapText, warn, die', ordNub, info
          , createTempDirectory, handleDoesNotExist )
 import Distribution.Client.CmdInstall
          ( establishDummyProjectBaseContext )
@@ -73,12 +73,10 @@ import Distribution.PackageDescription.FieldGrammar
          ( executableFieldGrammar )
 import Distribution.PackageDescription.PrettyPrint
          ( writeGenericPackageDescription )
-import Distribution.Parsec.Common
+import Distribution.Parsec
          ( Position(..) )
-import Distribution.Parsec.ParseResult
-         ( ParseResult, parseString, parseFatalFailure )
-import Distribution.Parsec.Parser
-         ( readFields )
+import Distribution.Fields
+         ( ParseResult, parseString, parseFatalFailure, readFields )
 import qualified Distribution.SPDX.License as SPDX
 import Distribution.Solver.Types.SourcePackage as SP
          ( SourcePackage(..) )
@@ -92,10 +90,10 @@ import Distribution.Types.GenericPackageDescription as GPD
          ( GenericPackageDescription(..), emptyGenericPackageDescription )
 import Distribution.Types.PackageDescription
          ( PackageDescription(..), emptyPackageDescription )
-import Distribution.Types.PackageId
-         ( PackageIdentifier(..) )
 import Distribution.Types.Version
-         ( mkVersion, version0 )
+         ( mkVersion )
+import Distribution.Types.PackageName.Magic
+         ( fakePackageId )
 import Language.Haskell.Extension
          ( Language(..) )
 
@@ -106,13 +104,14 @@ import qualified Text.Parsec as P
 import System.Directory
          ( getTemporaryDirectory, removeDirectoryRecursive, doesFileExist )
 import System.FilePath
-         ( (</>) )
+         ( (</>), isValid, isPathSeparator, takeExtension )
 
-runCommand :: CommandUI (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
+
+runCommand :: CommandUI (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags, TestFlags)
 runCommand = Client.installCommand {
-  commandName         = "new-run",
+  commandName         = "v2-run",
   commandSynopsis     = "Run an executable.",
-  commandUsage        = usageAlternatives "new-run"
+  commandUsage        = usageAlternatives "v2-run"
                           [ "[TARGET] [FLAGS] [-- EXECUTABLE_FLAGS]" ],
   commandDescription  = Just $ \pname -> wrapText $
         "Runs the specified executable-like component (an executable, a test, "
@@ -134,18 +133,18 @@ runCommand = Client.installCommand {
      ++ "'cabal.project.local' and other files.",
   commandNotes        = Just $ \pname ->
         "Examples:\n"
-     ++ "  " ++ pname ++ " new-run\n"
+     ++ "  " ++ pname ++ " v2-run\n"
      ++ "    Run the executable-like in the package in the current directory\n"
-     ++ "  " ++ pname ++ " new-run foo-tool\n"
+     ++ "  " ++ pname ++ " v2-run foo-tool\n"
      ++ "    Run the named executable-like (in any package in the project)\n"
-     ++ "  " ++ pname ++ " new-run pkgfoo:foo-tool\n"
+     ++ "  " ++ pname ++ " v2-run pkgfoo:foo-tool\n"
      ++ "    Run the executable-like 'foo-tool' in the package 'pkgfoo'\n"
-     ++ "  " ++ pname ++ " new-run foo -O2 -- dothing --fooflag\n"
+     ++ "  " ++ pname ++ " v2-run foo -O2 -- dothing --fooflag\n"
      ++ "    Build with '-O2' and run the program, passing it extra arguments.\n\n"
 
      ++ cmdCommonHelpTextNewBuildBeta
   }
- 
+
 -- | The @run@ command runs a specified executable-like component, building it
 -- first if necessary. The component can be either an executable, a test,
 -- or a benchmark. This is particularly useful for passing arguments to
@@ -154,28 +153,30 @@ runCommand = Client.installCommand {
 -- For more details on how this works, see the module
 -- "Distribution.Client.ProjectOrchestration"
 --
-runAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
+runAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags, TestFlags)
           -> [String] -> GlobalFlags -> IO ()
-runAction (configFlags, configExFlags, installFlags, haddockFlags)
+runAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags)
             targetStrings globalFlags = do
     globalTmp <- getTemporaryDirectory
     tempDir <- createTempDirectory globalTmp "cabal-repl."
-  
+
     let
-      with = 
-        establishProjectBaseContext verbosity cliConfig
-      without config = 
-        establishDummyProjectBaseContext verbosity (config <> cliConfig) tempDir []
+      with =
+        establishProjectBaseContext verbosity cliConfig OtherCommand
+      without config =
+        establishDummyProjectBaseContext verbosity (config <> cliConfig) tempDir [] OtherCommand
 
     baseCtx <- withProjectOrGlobalConfig verbosity globalConfigFlag with without
 
     let
       scriptOrError script err = do
         exists <- doesFileExist script
+        let pol | takeExtension script == ".lhs" = LiterateHaskell
+                | otherwise                      = PlainHaskell
         if exists
-          then BS.readFile script >>= handleScriptCase verbosity baseCtx tempDir
+          then BS.readFile script >>= handleScriptCase verbosity pol baseCtx tempDir
           else reportTargetSelectorProblems verbosity err
-        
+
     (baseCtx', targetSelectors) <-
       readTargetSelectors (localPackages baseCtx) (Just ExeKind) (take 1 targetStrings)
         >>= \case
@@ -187,7 +188,7 @@ runAction (configFlags, configExFlags, installFlags, haddockFlags)
             | TargetString1 script <- t   -> scriptOrError script err
           Left err   -> reportTargetSelectorProblems verbosity err
           Right sels -> return (baseCtx, sels)
-    
+
     buildCtx <-
       runProjectPreBuildPhase verbosity baseCtx' $ \elaboratedPlan -> do
 
@@ -286,20 +287,46 @@ runAction (configFlags, configExFlags, installFlags, haddockFlags)
       emptyProgramInvocation {
         progInvokePath  = exePath,
         progInvokeArgs  = args,
-        progInvokeEnv   = dataDirsEnvironmentForPlan elaboratedPlan
+        progInvokeEnv   = dataDirsEnvironmentForPlan
+                            (distDirLayout baseCtx)
+                            elaboratedPlan
       }
-    
+
     handleDoesNotExist () (removeDirectoryRecursive tempDir)
   where
     verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
     cliConfig = commandLineFlagsToProjectConfig
                   globalFlags configFlags configExFlags
-                  installFlags haddockFlags
+                  installFlags
+                  mempty -- ClientInstallFlags, not needed here
+                  haddockFlags testFlags
     globalConfigFlag = projectConfigConfigFile (projectConfigShared cliConfig)
 
-handleShebang :: String -> IO ()
-handleShebang script =
-  runAction (commandDefaultFlags runCommand) [script] defaultGlobalFlags
+-- | Used by the main CLI parser as heuristic to decide whether @cabal@ was
+-- invoked as a script interpreter, i.e. via
+--
+-- > #! /usr/bin/env cabal
+--
+-- or
+--
+-- > #! /usr/bin/cabal
+--
+-- As the first argument passed to `cabal` will be a filepath to the
+-- script to be interpreted.
+--
+-- See also 'handleShebang'
+validScript :: String -> IO Bool
+validScript script
+  | isValid script && any isPathSeparator script = doesFileExist script
+  | otherwise = return False
+
+-- | Handle @cabal@ invoked as script interpreter, see also 'validScript'
+--
+-- First argument is the 'FilePath' to the script to be executed; second
+-- argument is a list of arguments to be passed to the script.
+handleShebang :: FilePath -> [String] -> IO ()
+handleShebang script args =
+  runAction (commandDefaultFlags runCommand) (script:args) defaultGlobalFlags
 
 parseScriptBlock :: BS.ByteString -> ParseResult Executable
 parseScriptBlock str =
@@ -314,48 +341,84 @@ parseScriptBlock str =
 readScriptBlock :: Verbosity -> BS.ByteString -> IO Executable
 readScriptBlock verbosity = parseString parseScriptBlock verbosity "script block"
 
-readScriptBlockFromScript :: Verbosity -> BS.ByteString -> IO (Executable, BS.ByteString)
-readScriptBlockFromScript verbosity str = 
+readScriptBlockFromScript :: Verbosity -> PlainOrLiterate -> BS.ByteString -> IO (Executable, BS.ByteString)
+readScriptBlockFromScript verbosity pol str = do
+    str' <- case extractScriptBlock pol str of
+              Left e -> die' verbosity $ "Failed extracting script block: " ++ e
+              Right x -> return x
+    when (BS.all isSpace str') $ warn verbosity "Empty script block"
     (\x -> (x, noShebang)) <$> readScriptBlock verbosity str'
   where
-    start = "{- cabal:"
-    end   = "-}"
+    noShebang = BS.unlines . filter (not . BS.isPrefixOf "#!") . BS.lines $ str
 
-    str' = BS.unlines
-          . takeWhile (/= end)
-          . drop 1 . dropWhile (/= start)
-          $ lines'
-    
-    noShebang = BS.unlines 
-              . filter ((/= "#!") . BS.take 2)
-              $ lines'
+-- | Extract the first encountered script metadata block started end
+-- terminated by the tokens
+--
+-- * @{- cabal:@
+--
+-- * @-}@
+--
+-- appearing alone on lines (while tolerating trailing whitespace).
+-- These tokens are not part of the 'Right' result.
+--
+-- In case of missing or unterminated blocks a 'Left'-error is
+-- returned.
+extractScriptBlock :: PlainOrLiterate -> BS.ByteString -> Either String BS.ByteString
+extractScriptBlock _pol str = goPre (BS.lines str)
+  where
+    isStartMarker = (== startMarker) . stripTrailSpace
+    isEndMarker   = (== endMarker) . stripTrailSpace
 
-    lines' = BS.lines str
+    stripTrailSpace = fst . BS.spanEnd isSpace
 
-handleScriptCase :: Verbosity
-                 -> ProjectBaseContext
-                 -> FilePath
-                 -> BS.ByteString
-                 -> IO (ProjectBaseContext, [TargetSelector])
-handleScriptCase verbosity baseCtx tempDir scriptContents = do
-  (executable, contents') <- readScriptBlockFromScript verbosity scriptContents
-  
+    -- before start marker
+    goPre ls = case dropWhile (not . isStartMarker) ls of
+                 [] -> Left $ "`" ++ BS.unpack startMarker ++ "` start marker not found"
+                 (_:ls') -> goBody [] ls'
+
+    goBody _ [] = Left $ "`" ++ BS.unpack endMarker ++ "` end marker not found"
+    goBody acc (l:ls)
+      | isEndMarker l = Right $! BS.unlines $ reverse acc
+      | otherwise     = goBody (l:acc) ls
+
+    startMarker, endMarker :: BS.ByteString
+    startMarker = fromString "{- cabal:"
+    endMarker   = fromString "-}"
+
+data PlainOrLiterate
+    = PlainHaskell
+    | LiterateHaskell
+
+handleScriptCase
+  :: Verbosity
+  -> PlainOrLiterate
+  -> ProjectBaseContext
+  -> FilePath
+  -> BS.ByteString
+  -> IO (ProjectBaseContext, [TargetSelector])
+handleScriptCase verbosity pol baseCtx tempDir scriptContents = do
+  (executable, contents') <- readScriptBlockFromScript verbosity pol scriptContents
+
   -- We need to create a dummy package that lives in our dummy project.
   let
+    mainName = case pol of
+      PlainHaskell    -> "Main.hs"
+      LiterateHaskell -> "Main.lhs"
+
     sourcePackage = SourcePackage
-      { packageInfoId        = pkgId
-      , SP.packageDescription   = genericPackageDescription
-      , packageSource        = LocalUnpackedPackage tempDir
-      , packageDescrOverride = Nothing
+      { packageInfoId         = pkgId
+      , SP.packageDescription = genericPackageDescription
+      , packageSource         = LocalUnpackedPackage tempDir
+      , packageDescrOverride  = Nothing
       }
-    genericPackageDescription = emptyGenericPackageDescription 
+    genericPackageDescription  = emptyGenericPackageDescription
       { GPD.packageDescription = packageDescription
-      , condExecutables    = [("script", CondNode executable' targetBuildDepends [])]
+      , condExecutables        = [("script", CondNode executable' targetBuildDepends [])]
       }
     executable' = executable
-      { modulePath = "Main.hs"
-      , buildInfo = binfo 
-        { defaultLanguage = 
+      { modulePath = mainName
+      , buildInfo = binfo
+        { defaultLanguage =
           case defaultLanguage of
             just@(Just _) -> just
             Nothing       -> Just Haskell2010
@@ -367,13 +430,13 @@ handleScriptCase verbosity baseCtx tempDir scriptContents = do
       , specVersionRaw = Left (mkVersion [2, 2])
       , licenseRaw = Left SPDX.NONE
       }
-    pkgId = PackageIdentifier "fake-package" version0
+    pkgId = fakePackageId
 
   writeGenericPackageDescription (tempDir </> "fake-package.cabal") genericPackageDescription
-  BS.writeFile (tempDir </> "Main.hs") contents'
+  BS.writeFile (tempDir </> mainName) contents'
 
   let
-    baseCtx' = baseCtx 
+    baseCtx' = baseCtx
       { localPackages = localPackages baseCtx ++ [SpecificSourcePackage sourcePackage] }
     targetSelectors = [TargetPackage TargetExplicitNamed [pkgId] Nothing]
 

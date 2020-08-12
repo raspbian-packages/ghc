@@ -13,10 +13,11 @@ import System.Directory.Internal.Common
 import System.Directory.Internal.Config (exeExtension)
 import Data.Time (UTCTime)
 import Data.Time.Clock.POSIX (POSIXTime)
-import System.FilePath ((</>), isRelative, normalise, splitSearchPath)
+import System.FilePath ((</>), isRelative, splitSearchPath)
 import qualified Data.Time.Clock.POSIX as POSIXTime
 import qualified GHC.Foreign as GHC
 import qualified System.Posix as Posix
+import qualified System.Posix.User as PU
 
 createDirectoryInternal :: FilePath -> IO ()
 createDirectoryInternal path = Posix.createDirectory path 0o777
@@ -28,6 +29,10 @@ removePathInternal False = Posix.removeLink
 renamePathInternal :: FilePath -> FilePath -> IO ()
 renamePathInternal = Posix.rename
 
+-- | On POSIX, equivalent to 'simplifyPosix'.
+simplify :: FilePath -> FilePath
+simplify = simplifyPosix
+
 -- we use the 'free' from the standard library here since it's not entirely
 -- clear whether Haskell's 'free' corresponds to the same one
 foreign import ccall unsafe "free" c_free :: Ptr a -> IO ()
@@ -37,7 +42,9 @@ c_PATH_MAX :: Maybe Int
 c_PATH_MAX | c_PATH_MAX' > toInteger maxValue = Nothing
            | otherwise                        = Just (fromInteger c_PATH_MAX')
   where c_PATH_MAX' = (#const PATH_MAX)
-        maxValue    = maxBound `asTypeOf` case c_PATH_MAX of ~(Just x) -> x
+        maxValue = maxBound `asTypeInMaybe` c_PATH_MAX
+        asTypeInMaybe :: a -> Maybe a -> a
+        asTypeInMaybe = const
 #else
 c_PATH_MAX = Nothing
 #endif
@@ -96,8 +103,22 @@ getDirectoryContentsInternal path =
 getCurrentDirectoryInternal :: IO FilePath
 getCurrentDirectoryInternal = Posix.getWorkingDirectory
 
+-- | Convert a path into an absolute path.  If the given path is relative, the
+-- current directory is prepended and the path may or may not be simplified.
+-- If the path is already absolute, the path is returned unchanged.  The
+-- function preserves the presence or absence of the trailing path separator.
+--
+-- If the path is already absolute, the operation never fails.  Otherwise, the
+-- operation may throw exceptions.
+--
+-- Empty paths are treated as the current directory.
 prependCurrentDirectory :: FilePath -> IO FilePath
-prependCurrentDirectory = prependCurrentDirectoryWith getCurrentDirectoryInternal
+prependCurrentDirectory path
+  | isRelative path =
+    ((`ioeAddLocation` "prependCurrentDirectory") .
+     (`ioeSetFileName` path)) `modifyIOError` do
+      (</> path) <$> getCurrentDirectoryInternal
+  | otherwise = pure path
 
 setCurrentDirectoryInternal :: FilePath -> IO ()
 setCurrentDirectoryInternal = Posix.changeWorkingDirectory
@@ -113,13 +134,11 @@ readSymbolicLink = Posix.readSymbolicLink
 
 type Metadata = Posix.FileStatus
 
--- note: normalise is needed to handle empty paths
-
 getSymbolicLinkMetadata :: FilePath -> IO Metadata
-getSymbolicLinkMetadata = Posix.getSymbolicLinkStatus . normalise
+getSymbolicLinkMetadata = Posix.getSymbolicLinkStatus
 
 getFileMetadata :: FilePath -> IO Metadata
-getFileMetadata = Posix.getFileStatus . normalise
+getFileMetadata = Posix.getFileStatus
 
 fileTypeFromMetadata :: Metadata -> FileType
 fileTypeFromMetadata stat
@@ -262,35 +281,27 @@ setFileTimes' pth atime' mtime' =
 getPath :: IO [FilePath]
 getPath = splitSearchPath <$> getEnv "PATH"
 
+-- | $HOME is preferred, because the user has control over it. However, POSIX
+-- doesn't define it as a mandatory variable, so fall back to `getpwuid_r`.
 getHomeDirectoryInternal :: IO FilePath
-getHomeDirectoryInternal = getEnv "HOME"
+getHomeDirectoryInternal = do
+  e <- lookupEnv "HOME"
+  case e of
+       Just fp -> pure fp
+       Nothing -> PU.homeDirectory <$> (PU.getEffectiveUserID >>= PU.getUserEntryForID)
 
-getXdgDirectoryInternal :: IO FilePath -> XdgDirectory -> IO FilePath
-getXdgDirectoryInternal getHomeDirectory xdgDir = do
-  case xdgDir of
-    XdgData   -> get "XDG_DATA_HOME"   ".local/share"
-    XdgConfig -> get "XDG_CONFIG_HOME" ".config"
-    XdgCache  -> get "XDG_CACHE_HOME"  ".cache"
-  where
-    get name fallback = do
-      env <- lookupEnv name
-      case env of
-        Nothing                     -> fallback'
-        Just path | isRelative path -> fallback'
-                  | otherwise       -> pure path
-      where fallback' = (</> fallback) <$> getHomeDirectory
+getXdgDirectoryFallback :: IO FilePath -> XdgDirectory -> IO FilePath
+getXdgDirectoryFallback getHomeDirectory xdgDir = do
+  (<$> getHomeDirectory) $ flip (</>) $ case xdgDir of
+    XdgData   -> ".local/share"
+    XdgConfig -> ".config"
+    XdgCache  -> ".cache"
 
-getXdgDirectoryListInternal :: XdgDirectoryList -> IO [FilePath]
-getXdgDirectoryListInternal xdgDirs =
-  case xdgDirs of
-    XdgDataDirs   -> get "XDG_DATA_DIRS"   ["/usr/local/share/", "/usr/share/"]
-    XdgConfigDirs -> get "XDG_CONFIG_DIRS" ["/etc/xdg"]
-  where
-    get name fallback = do
-      env <- lookupEnv name
-      case env of
-        Nothing    -> pure fallback
-        Just paths -> pure (splitSearchPath paths)
+getXdgDirectoryListFallback :: XdgDirectoryList -> IO [FilePath]
+getXdgDirectoryListFallback xdgDirs =
+  pure $ case xdgDirs of
+    XdgDataDirs   -> ["/usr/local/share/", "/usr/share/"]
+    XdgConfigDirs -> ["/etc/xdg"]
 
 getAppUserDataDirectoryInternal :: FilePath -> IO FilePath
 getAppUserDataDirectoryInternal appName =

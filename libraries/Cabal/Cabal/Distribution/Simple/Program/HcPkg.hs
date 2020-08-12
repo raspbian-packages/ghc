@@ -45,12 +45,15 @@ module Distribution.Simple.Program.HcPkg (
 import Prelude ()
 import Distribution.Compat.Prelude hiding (init)
 
+import Data.Either (partitionEithers)
+
 import Distribution.InstalledPackageInfo
 import Distribution.Simple.Compiler
 import Distribution.Simple.Program.Types
 import Distribution.Simple.Program.Run
 import Distribution.Simple.Utils
-import Distribution.Text
+import Distribution.Parsec
+import Distribution.Pretty
 import Distribution.Types.ComponentId
 import Distribution.Types.PackageId
 import Distribution.Types.UnitId
@@ -173,7 +176,7 @@ writeRegistrationFileDirectly :: Verbosity
                               -> IO ()
 writeRegistrationFileDirectly verbosity hpi (SpecificPackageDB dir) pkgInfo
   | supportsDirDbs hpi
-  = do let pkgfile = dir </> display (installedUnitId pkgInfo) <.> "conf"
+  = do let pkgfile = dir </> prettyShow (installedUnitId pkgInfo) <.> "conf"
        writeUTF8File pkgfile (showInstalledPackageInfo pkgInfo)
 
   | otherwise
@@ -228,7 +231,7 @@ describe hpi verbosity packagedb pid = do
   case parsePackages output of
     Left ok -> return ok
     _       -> die' verbosity $ "failed to parse output of '"
-                  ++ programId (hcPkgProgram hpi) ++ " describe " ++ display pid ++ "'"
+                  ++ programId (hcPkgProgram hpi) ++ " describe " ++ prettyShow pid ++ "'"
 
 -- | Call @hc-pkg@ to hide a package.
 --
@@ -256,15 +259,11 @@ dump hpi verbosity packagedb = do
     _       -> die' verbosity $ "failed to parse output of '"
                   ++ programId (hcPkgProgram hpi) ++ " dump'"
 
-parsePackages :: String -> Either [InstalledPackageInfo] [PError]
+parsePackages :: String -> Either [InstalledPackageInfo] [String]
 parsePackages str =
-  let parsed = map parseInstalledPackageInfo (splitPkgs str)
-   in case [ msg | ParseFailed msg <- parsed ] of
-        []   -> Left [   setUnitId
-                       . maybe id mungePackagePaths (pkgRoot pkg)
-                       $ pkg
-                     | ParseOk _ pkg <- parsed ]
-        msgs -> Right msgs
+    case partitionEithers $ map parseInstalledPackageInfo (splitPkgs str) of
+        ([], ok)   -> Left [ setUnitId . maybe id mungePackagePaths (pkgRoot pkg) $ pkg | (_, pkg) <- ok ]
+        (msgss, _) -> Right (concat msgss)
 
 --TODO: this could be a lot faster. We're doing normaliseLineEndings twice
 -- and converting back and forth with lines/unlines.
@@ -330,7 +329,7 @@ setUnitId pkginfo@InstalledPackageInfo {
                       } | unUnitId uid == ""
                     = pkginfo {
                         installedUnitId = mkLegacyUnitId pid,
-                        installedComponentId_ = mkComponentId (display pid)
+                        installedComponentId_ = mkComponentId (prettyShow pid)
                       }
 setUnitId pkginfo = pkginfo
 
@@ -356,7 +355,7 @@ list hpi verbosity packagedb = do
                   ++ programId (hcPkgProgram hpi) ++ " list'"
 
   where
-    parsePackageIds = traverse simpleParse . words
+    parsePackageIds = traverse simpleParsec . words
 
 --------------------------
 -- The program invocations
@@ -399,7 +398,7 @@ unregisterInvocation :: HcPkgInfo -> Verbosity -> PackageDB -> PackageId
                      -> ProgramInvocation
 unregisterInvocation hpi verbosity packagedb pkgid =
   programInvocation (hcPkgProgram hpi) $
-       ["unregister", packageDbOpts hpi packagedb, display pkgid]
+       ["unregister", packageDbOpts hpi packagedb, prettyShow pkgid]
     ++ verbosityOpts hpi verbosity
 
 
@@ -415,14 +414,14 @@ exposeInvocation :: HcPkgInfo -> Verbosity -> PackageDB -> PackageId
                  -> ProgramInvocation
 exposeInvocation hpi verbosity packagedb pkgid =
   programInvocation (hcPkgProgram hpi) $
-       ["expose", packageDbOpts hpi packagedb, display pkgid]
+       ["expose", packageDbOpts hpi packagedb, prettyShow pkgid]
     ++ verbosityOpts hpi verbosity
 
 describeInvocation :: HcPkgInfo -> Verbosity -> PackageDBStack -> PackageId
                    -> ProgramInvocation
 describeInvocation hpi verbosity packagedbs pkgid =
   programInvocation (hcPkgProgram hpi) $
-       ["describe", display pkgid]
+       ["describe", prettyShow pkgid]
     ++ (if noPkgDbStack hpi
           then [packageDbOpts hpi (last packagedbs)]
           else packageDbStackOpts hpi packagedbs)
@@ -432,7 +431,7 @@ hideInvocation :: HcPkgInfo -> Verbosity -> PackageDB -> PackageId
                -> ProgramInvocation
 hideInvocation hpi verbosity packagedb pkgid =
   programInvocation (hcPkgProgram hpi) $
-       ["hide", packageDbOpts hpi packagedb, display pkgid]
+       ["hide", packageDbOpts hpi packagedb, prettyShow pkgid]
     ++ verbosityOpts hpi verbosity
 
 

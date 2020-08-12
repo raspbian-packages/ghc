@@ -152,6 +152,24 @@ tests = [
         , runTest $ allowBootLibInstalls $ mkTest dbBase "Install base with --allow-boot-library-installs" ["base"] $
                       solverSuccess [("base", 1), ("ghc-prim", 1), ("integer-gmp", 1), ("integer-simple", 1)]
         ]
+    , testGroup "reject-unconstrained" [
+          runTest $ onlyConstrained $ mkTest db12 "missing syb" ["E"] $
+            solverFailure (isInfixOf "not a user-provided goal")
+        , runTest $ onlyConstrained $ mkTest db12 "all goals" ["E", "syb"] $
+            solverSuccess [("E", 1), ("syb", 2)]
+        , runTest $ onlyConstrained $ mkTest db17 "backtracking" ["A", "B"] $
+            solverSuccess [("A", 2), ("B", 1)]
+        , runTest $ onlyConstrained $ mkTest db17 "failure message" ["A"] $
+            solverFailure $ isInfixOf $
+                  "Could not resolve dependencies:\n"
+               ++ "[__0] trying: A-3.0.0 (user goal)\n"
+               ++ "[__1] next goal: C (dependency of A)\n"
+               ++ "[__1] fail (not a user-provided goal nor mentioned as a constraint, "
+                      ++ "but reject-unconstrained-dependencies was set)\n"
+               ++ "[__1] fail (backjumping, conflict set: A, C)\n"
+               ++ "After searching the rest of the dependency tree exhaustively, "
+                      ++ "these were the goals I've had most trouble fulfilling: A, C, B"
+        ]
     , testGroup "Cycles" [
           runTest $ mkTest db14 "simpleCycle1"          ["A"]      anySolverFailure
         , runTest $ mkTest db14 "simpleCycle2"          ["A", "B"] anySolverFailure
@@ -427,6 +445,10 @@ tests = [
                 "Backjump limit reached (currently 1, change with --max-backjumps "
              ++ "or try to run with --reorder-goals).\n"
              ++ "Failed to generate a summarized dependency solver log due to low backjump limit."
+        , testMinimizeConflictSet
+              "minimize conflict set with --minimize-conflict-set"
+        , testNoMinimizeConflictSet
+              "show original conflict set with --no-minimize-conflict-set"
         ]
     ]
   where
@@ -456,7 +478,7 @@ db1 =
        ]
 
 -- In this example, we _can_ install C and D as independent goals, but we have
--- to pick two diferent versions for B (arbitrarily)
+-- to pick two different versions for B (arbitrarily)
 db2 :: ExampleDb
 db2 = [
     Right $ exAv "A" 1 []
@@ -852,7 +874,7 @@ db14 = [
 -- has a setup dependency on D, and D has a regular dependency on C-*. However,
 -- version C-1.0 is already available (perhaps it didn't have this setup dep).
 -- Thus, we should be able to break this cycle even if we are installing package
--- E, which explictly depends on C-2.0.
+-- E, which explicitly depends on C-2.0.
 db15 :: ExampleDb
 db15 = [
     -- First example (real cycle, no solution)
@@ -867,7 +889,7 @@ db15 = [
 
 -- | Detect a cycle between a package and its setup script.
 --
--- This type of cycle can easily occur when new-build adds default setup
+-- This type of cycle can easily occur when v2-build adds default setup
 -- dependencies to packages without custom-setup stanzas. For example, cabal
 -- adds 'time' as a setup dependency for 'time'. The solver should detect the
 -- cycle when it attempts to link the setup and non-setup instances of the
@@ -952,6 +974,20 @@ db16 = [
   , Right $ exAv "D" 1 []
   , Right $ exAv "D" 2 []
   , Right $ exAv "E" 1 []
+  ]
+
+
+-- Try to get the solver to backtrack while satisfying
+-- reject-unconstrained-dependencies: both the first and last versions of A
+-- require packages outside the closed set, so it will have to try the
+-- middle one.
+db17 :: ExampleDb
+db17 = [
+    Right $ exAv "A" 1 [ExAny "C"]
+  , Right $ exAv "A" 2 [ExAny "B"]
+  , Right $ exAv "A" 3 [ExAny "C"]
+  , Right $ exAv "B" 1 []
+  , Right $ exAv "C" 1 [ExAny "B"]
   ]
 
 -- | This test checks that when the solver discovers a constraint on a
@@ -1175,7 +1211,7 @@ testIndepGoals4 name =
 -- | Test the trace messages that we get when a package refers to an unknown pkg
 --
 -- TODO: Currently we don't actually test the trace messages, and this particular
--- test still suceeds. The trace can only be verified by hand.
+-- test still succeeds. The trace can only be verified by hand.
 db21 :: ExampleDb
 db21 = [
     Right $ exAv "A" 1 [ExAny "B"]
@@ -1382,6 +1418,80 @@ testSummarizedLog testName mbj expectedMsg =
       , Right $ exAv "B" 1 [ExAny "C"]
       , Right $ exAv "C" 1 []
       ]
+
+    goals :: [ExampleVar]
+    goals = [P QualNone pkg | pkg <- ["A", "B", "C", "D"]]
+
+dbMinimizeConflictSet :: ExampleDb
+dbMinimizeConflictSet = [
+    Right $ exAv "A" 3 [ExFix "B" 2, ExFix "C" 1, ExFix "D" 2]
+  , Right $ exAv "A" 2 [ExFix "B" 1, ExFix "C" 2, ExFix "D" 2]
+  , Right $ exAv "A" 1 [ExFix "B" 1, ExFix "C" 1, ExFix "D" 2]
+  , Right $ exAv "B" 1 []
+  , Right $ exAv "C" 1 []
+  , Right $ exAv "D" 1 []
+  ]
+
+-- | Test that the solver can find a minimal conflict set with
+-- --minimize-conflict-set. In the first run, the goal order causes the solver
+-- to find that A-3 conflicts with B, A-2 conflicts with C, and A-1 conflicts
+-- with D. The full log should show that the original final conflict set is
+-- {A, B, C, D}. Then the solver should be able to reduce the conflict set to
+-- {A, D}, since all versions of A conflict with D. The summarized log should
+-- only mention A and D.
+testMinimizeConflictSet :: String -> TestTree
+testMinimizeConflictSet testName =
+    runTest $ minimizeConflictSet $ goalOrder goals $ setVerbose $
+    mkTest dbMinimizeConflictSet testName ["A"] $
+    SolverResult checkFullLog (Left (== expectedMsg))
+  where
+    checkFullLog :: [String] -> Bool
+    checkFullLog = containsInOrder [
+        "[__0] fail (backjumping, conflict set: A, B, C, D)"
+      , "Found no solution after exhaustively searching the dependency tree. "
+         ++ "Rerunning the dependency solver to minimize the conflict set ({A, B, C, D})."
+      , "Trying to remove variable \"A\" from the conflict set."
+      , "Failed to remove \"A\" from the conflict set. Continuing with {A, B, C, D}."
+      , "Trying to remove variable \"B\" from the conflict set."
+      , "Successfully removed \"B\" from the conflict set. Continuing with {A, C, D}."
+      , "Trying to remove variable \"C\" from the conflict set."
+      , "Successfully removed \"C\" from the conflict set. Continuing with {A, D}."
+      , "Trying to remove variable \"D\" from the conflict set."
+      , "Failed to remove \"D\" from the conflict set. Continuing with {A, D}."
+      ]
+
+    expectedMsg =
+        "Could not resolve dependencies:\n"
+     ++ "[__0] trying: A-3.0.0 (user goal)\n"
+     ++ "[__1] next goal: D (dependency of A)\n"
+     ++ "[__1] rejecting: D-1.0.0 (conflict: A => D==2.0.0)\n"
+     ++ "[__1] fail (backjumping, conflict set: A, D)\n"
+     ++ "After searching the rest of the dependency tree exhaustively, these "
+          ++ "were the goals I've had most trouble fulfilling: A (7), D (6)"
+
+    goals :: [ExampleVar]
+    goals = [P QualNone pkg | pkg <- ["A", "B", "C", "D"]]
+
+-- | This test uses the same packages and goal order as testMinimizeConflictSet,
+-- but it doesn't set --minimize-conflict-set. The solver should print the
+-- original final conflict set and the conflict between A and B. It should also
+-- suggest rerunning with --minimize-conflict-set.
+testNoMinimizeConflictSet :: String -> TestTree
+testNoMinimizeConflictSet testName =
+    runTest $ goalOrder goals $ setVerbose $
+    mkTest dbMinimizeConflictSet testName ["A"] $
+    solverFailure (== expectedMsg)
+  where
+    expectedMsg =
+        "Could not resolve dependencies:\n"
+     ++ "[__0] trying: A-3.0.0 (user goal)\n"
+     ++ "[__1] next goal: B (dependency of A)\n"
+     ++ "[__1] rejecting: B-1.0.0 (conflict: A => B==2.0.0)\n"
+     ++ "[__1] fail (backjumping, conflict set: A, B)\n"
+     ++ "After searching the rest of the dependency tree exhaustively, "
+          ++ "these were the goals I've had most trouble fulfilling: "
+          ++ "A (7), B (2), C (2), D (2)\n"
+     ++ "Try running with --minimize-conflict-set to improve the error message."
 
     goals :: [ExampleVar]
     goals = [P QualNone pkg | pkg <- ["A", "B", "C", "D"]]
@@ -1668,3 +1778,12 @@ dbIssue3775 = [
     Right $ exAv "A" 2 [ExFix "warp" 1] `withExe` ExExe "warp" [ExAny "A"],
     Right $ exAv "B" 2 [ExAny "A", ExAny "warp"]
   ]
+
+-- | Returns true if the second list contains all elements of the first list, in
+-- order.
+containsInOrder :: Eq a => [a] -> [a] -> Bool
+containsInOrder []     _  = True
+containsInOrder _      [] = False
+containsInOrder (x:xs) (y:ys)
+  | x == y = containsInOrder xs ys
+  | otherwise = containsInOrder (x:xs) ys

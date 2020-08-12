@@ -13,7 +13,7 @@ dnl
 # see what flags are available. (Better yet, read the documentation!)
 #
 
-AC_INIT([The Glorious Glasgow Haskell Compilation System], [8.6.5], [glasgow-haskell-bugs@haskell.org], [ghc-AC_PACKAGE_VERSION])
+AC_INIT([The Glorious Glasgow Haskell Compilation System], [8.8.3], [glasgow-haskell-bugs@haskell.org], [ghc-AC_PACKAGE_VERSION])
 
 # Set this to YES for a released version, otherwise NO
 : ${RELEASE=YES}
@@ -87,14 +87,12 @@ dnl use either is considered a Feature.
 dnl ** What command to use to compile compiler sources ?
 dnl --------------------------------------------------------------
 
+AC_ARG_VAR(GHC,[Use as the path to GHC [default=autodetect]])
+AC_PATH_PROG([GHC], [ghc])
 AC_ARG_WITH([ghc],
-[AC_HELP_STRING([--with-ghc=ARG],
-  [Use ARG as the path to GHC  [default=autodetect]])],
-  [WithGhc="$withval"],
-  [if test "$GHC" = ""; then
-    AC_PATH_PROG([GHC], [ghc])
-  fi
-  WithGhc="$GHC"])
+        AS_HELP_STRING([--with-ghc=ARG], [Use ARG as the path to ghc (obsolete, use GHC=ARG instead) [default=autodetect]]),
+        AC_MSG_ERROR([--with-ghc=$withval is obsolete (use './configure GHC=$withval' or 'GHC=$withval ./configure' instead)]))
+AC_SUBST(WithGhc,$GHC)
 
 dnl ** Tell the make system which OS we are using
 dnl $OSTYPE is set by the operating system to "msys" or "cygwin" or something
@@ -132,11 +130,6 @@ AC_ARG_VAR(CC_STAGE0, [C compiler command (bootstrap)])
 if test "$WithGhc" != ""; then
   FPTOOLS_GHC_VERSION([GhcVersion], [GhcMajVersion], [GhcMinVersion], [GhcPatchLevel])dnl
 
-  # See #15281
-  if test "$GhcMajVersion" = "8" && test "$GhcMinVersion" = "2" && test "$GhcPatchLevel" = "1"; then
-     AC_MSG_ERROR([GHC 8.2.1 is known to be buggy and cannot bootstrap this GHC release (See Trac 15281); please use GHC 8.2.2 or later.])
-  fi
-
   if test "$GhcMajVersion" = "unknown" || test "$GhcMinVersion" = "unknown"; then
      AC_MSG_ERROR([Cannot determine the version of $WithGhc.  Is it really GHC?])
   fi
@@ -164,8 +157,8 @@ if test "$WithGhc" = ""
 then
     AC_MSG_ERROR([GHC is required.])
 fi
-FP_COMPARE_VERSIONS([$GhcVersion],[-lt],[8.2],
-    [AC_MSG_ERROR([GHC version 8.2 or later is required to compile GHC.])])
+FP_COMPARE_VERSIONS([$GhcVersion],[-lt],[8.4],
+    [AC_MSG_ERROR([GHC version 8.4 or later is required to compile GHC.])])
 
 if test `expr $GhcMinVersion % 2` = "1"
 then
@@ -175,7 +168,7 @@ then
      $WithGhc is a development snapshot of GHC, version $GhcVersion.
      Bootstrapping using this version of GHC is not supported, and may not
      work.  Use --enable-bootstrap-with-devel-snapshot to try it anyway,
-     or --with-ghc to specify a different GHC to use.])
+     or 'GHC=' to specify a different GHC to use.])
     fi
 fi
 
@@ -648,7 +641,7 @@ AC_SUBST([LibtoolCmd])
 # tools we are looking for. In the past, GHC supported a number of
 # versions of LLVM simultaneously, but that stopped working around
 # 3.5/3.6 release of LLVM.
-LlvmVersion=6.0
+LlvmVersion=9
 AC_SUBST([LlvmVersion])
 sUPPORTED_LLVM_VERSION=$(echo \($LlvmVersion\) | sed 's/\./,/')
 AC_DEFINE_UNQUOTED([sUPPORTED_LLVM_VERSION], ${sUPPORTED_LLVM_VERSION}, [The supported LLVM version number])
@@ -678,11 +671,11 @@ dnl --------------------------------------------------------------
 dnl ** Copy the files from the "fs" utility into the right folders.
 dnl --------------------------------------------------------------
 AC_MSG_NOTICE([Creating links for in-tree file handling routines.])
-ln -f -v utils/fs/fs.* utils/lndir/
-ln -f -v utils/fs/fs.* utils/unlit/
-ln -f -v utils/fs/fs.* rts/
-ln -f -v utils/fs/fs.h libraries/base/include/
-ln -f -v utils/fs/fs.c libraries/base/cbits/
+ln -f utils/fs/fs.* utils/lndir/
+ln -f utils/fs/fs.* utils/unlit/
+ln -f utils/fs/fs.* rts/
+ln -f utils/fs/fs.h libraries/base/include/
+ln -f utils/fs/fs.c libraries/base/cbits/
 AC_MSG_NOTICE([Routines in place. Packages can now be build normally.])
 
 dnl --------------------------------------------------------------
@@ -738,6 +731,11 @@ FP_GCC_VERSION
 
 dnl ** See whether gcc supports -no-pie
 FP_GCC_SUPPORTS_NO_PIE
+
+dnl ** Used to determine how to compile ghc-prim's atomics.c, used by
+dnl    unregisterised, Sparc, and PPC backends.
+FP_GCC_SUPPORTS__ATOMICS
+AC_DEFINE([HAVE_C11_ATOMICS], [$CONF_GCC_SUPPORTS__ATOMICS], [Does GCC support __atomic primitives?])
 
 FP_GCC_EXTRA_FLAGS
 
@@ -867,9 +865,13 @@ dnl ** check for ghc-pkg command
 FP_PROG_GHC_PKG
 
 dnl ** check for installed happy binary + version
+
+AC_ARG_VAR(HAPPY,[Use as the path to happy [default=autodetect]])
 FPTOOLS_HAPPY
 
 dnl ** check for installed alex binary + version
+
+AC_ARG_VAR(ALEX,[Use as the path to alex [default=autodetect]])
 FPTOOLS_ALEX
 
 dnl --------------------------------------------------
@@ -1221,16 +1223,7 @@ case ${TargetOS} in
         RtsLinkerUseMmap=1
         ;;
     darwin|ios|watchos|tvos)
-        # Don't use mmap on powerpc/darwin as the mmap there doesn't support
-        # reallocating. Reallocating is needed to allocate jump islands just
-        # after each object image. Jumps to these jump islands use relative
-        # branches which are limited to offsets that can be represented in
-        # 24-bits.
-        if test "$TargetArch" != "powerpc" ; then
-            RtsLinkerUseMmap=1
-        else
-            RtsLinkerUseMmap=0
-        fi
+        RtsLinkerUseMmap=1
         ;;
     *)
         # Windows (which doesn't have mmap) and everything else.
@@ -1247,10 +1240,13 @@ UseLibdw=NO
 USE_LIBDW=0
 AC_ARG_ENABLE(dwarf-unwind,
     [AC_HELP_STRING([--enable-dwarf-unwind],
-        [Enable DWARF unwinding support in the runtime system via elfutils' libdw [default=no]])],
-    [AC_CHECK_LIB(dw, dwfl_attach_state, [UseLibdw=YES], [UseLibdw=NO])],
-    [UseLibdw=NO]
-)
+        [Enable DWARF unwinding support in the runtime system via elfutils' libdw [default=no]])])
+if test "$enable_dwarf_unwind" = "yes" ; then
+  AC_CHECK_LIB(dw, dwfl_attach_state,
+      [UseLibdw=YES],
+      [AC_MSG_ERROR([Cannot find system libdw (required by --enable-dwarf-unwind)])])
+fi
+
 AC_SUBST(UseLibdw)
 if test $UseLibdw = "YES" ; then
 	USE_LIBDW=1
@@ -1295,8 +1291,14 @@ AC_SUBST(BUILD_MAN)
 AC_SUBST(BUILD_SPHINX_HTML)
 AC_SUBST(BUILD_SPHINX_PDF)
 
+dnl ** Determine library versions
+dnl The packages below should include all packages needed by
+dnl doc/users_guide/ghc_config.py.in.
 LIBRARY_VERSION(base)
 LIBRARY_VERSION(Cabal, Cabal/Cabal)
+LIBRARY_VERSION(template-haskell)
+LIBRARY_VERSION(parallel)
+LIBRARY_VERSION(array)
 LIBRARY_VERSION(ghc-prim)
 LIBRARY_VERSION(ghc-compact)
 LIBRARY_ghc_VERSION="$ProjectVersion"
@@ -1334,7 +1336,7 @@ checkMake380() {
 checkMake380 make
 checkMake380 gmake
 
-AC_CONFIG_FILES([mk/config.mk mk/install.mk mk/project.mk rts/rts.cabal compiler/ghc.cabal ghc/ghc-bin.cabal utils/runghc/runghc.cabal utils/gen-dll/gen-dll.cabal libraries/ghc-boot/ghc-boot.cabal libraries/ghc-boot-th/ghc-boot-th.cabal libraries/ghci/ghci.cabal libraries/ghc-heap/ghc-heap.cabal settings docs/users_guide/ghc_config.py docs/index.html libraries/prologue.txt distrib/configure.ac])
+AC_CONFIG_FILES([mk/config.mk mk/install.mk mk/project.mk rts/rts.cabal compiler/ghc.cabal ghc/ghc-bin.cabal utils/iserv/iserv.cabal utils/iserv-proxy/iserv-proxy.cabal utils/runghc/runghc.cabal utils/gen-dll/gen-dll.cabal libraries/ghc-boot/ghc-boot.cabal libraries/ghc-boot-th/ghc-boot-th.cabal libraries/ghci/ghci.cabal libraries/ghc-heap/ghc-heap.cabal libraries/libiserv/libiserv.cabal settings docs/users_guide/ghc_config.py docs/index.html libraries/prologue.txt distrib/configure.ac])
 AC_OUTPUT
 [
 if test "$print_make_warning" = "true"; then

@@ -1,3 +1,10 @@
+## Changes in version 1.8.0
+
+ * Support inline markup in markdown-style links (#875)
+
+ * Remove now unused `Documentation.Haddock.Utf8` module.
+   This module was anyways copied from the `utf8-string` package.
+
 ## Changes in version 1.7.0
 
  * Make `Documentation.Haddock.Parser.Monad` an internal module

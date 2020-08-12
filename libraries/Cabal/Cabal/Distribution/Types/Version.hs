@@ -10,25 +10,20 @@ module Distribution.Types.Version (
     alterVersion,
     version0,
 
-    -- ** Backwards compatibility
-    showVersion,
-
     -- * Internal
     validVersion,
+    versionDigitParser,
     ) where
 
 import Data.Bits                   (shiftL, shiftR, (.&.), (.|.))
 import Distribution.Compat.Prelude
 import Prelude ()
 
-import Distribution.CabalSpecVersion
-import Distribution.Parsec.Class
+import Distribution.Parsec
 import Distribution.Pretty
-import Distribution.Text
 
 import qualified Data.Version                    as Base
 import qualified Distribution.Compat.CharParsing as P
-import qualified Distribution.Compat.ReadP       as Parse
 import qualified Text.PrettyPrint                as Disp
 import qualified Text.Read                       as Read
 
@@ -97,39 +92,34 @@ instance Pretty Version where
                                 (map Disp.int $ versionNumbers ver))
 
 instance Parsec Version where
-    parsec = do
-        digit <- digitParser <$> askCabalSpecVersion
-        mkVersion <$> P.sepBy1 digit (P.char '.') <* tags
+    parsec = mkVersion <$> P.sepBy1 versionDigitParser (P.char '.') <* tags
       where
-        digitParser v
-            | v >= CabalSpecV2_0 = P.integral
-            | otherwise          = (some d >>= toNumber) P.<?> "non-leading-zero integral"
-          where
-            toNumber :: CabalParsing m => [Int] -> m Int
-            toNumber [0] = return 0
-            toNumber xs@(0:_) = do
-                parsecWarning PWTVersionLeadingZeros "Version digit with leading zero. Use cabal-version: 2.0 or later to write such versions. For more information see https://github.com/haskell/cabal/issues/5092"
-                return $ foldl' (\a b -> a * 10 + b) 0 xs
-            toNumber xs = return $ foldl' (\a b -> a * 10 + b) 0 xs
-
-            d :: P.CharParsing m => m Int
-            d = f <$> P.satisfyRange '0' '9'
-            f c = ord c - ord '0'
-
         tags = do
             ts <- many $ P.char '-' *> some (P.satisfy isAlphaNum)
             case ts of
                 []      -> pure ()
                 (_ : _) -> parsecWarning PWTVersionTag "version with tags"
 
-instance Text Version where
-  parse = do
-      branch <- Parse.sepBy1 parseNat (Parse.char '.')
-                -- allow but ignore tags:
-      _tags  <- Parse.many (Parse.char '-' >> Parse.munch1 isAlphaNum)
-      return (mkVersion branch)
-    where
-      parseNat = read `fmap` Parse.munch1 isDigit
+-- | An integral without leading zeroes.
+--
+-- @since 3.0
+versionDigitParser :: CabalParsing m => m Int
+versionDigitParser = (some d >>= toNumber) P.<?> "version digit (integral without leading zeroes)"
+  where
+    toNumber :: CabalParsing m => [Int] -> m Int
+    toNumber [0]   = return 0
+    toNumber (0:_) = P.unexpected "Version digit with leading zero"
+    toNumber xs
+        -- 10^9 = 1000000000
+        -- 2^30 = 1073741824
+        --
+        -- GHC Int is at least 32 bits, so 2^31-1 is the 'maxBound'.
+        | length xs > 9 = P.unexpected "At most 9 numbers are allowed per version number part"
+        | otherwise     = return $ foldl' (\a b -> a * 10 + b) 0 xs
+
+    d :: P.CharParsing m => m Int
+    d = f <$> P.satisfyRange '0' '9'
+    f c = ord c - ord '0'
 
 -- | Construct 'Version' from list of version number components.
 --
@@ -249,7 +239,3 @@ alterVersion f = mkVersion . f . versionNumbers
 -- internal helper
 validVersion :: Version -> Bool
 validVersion v = v /= nullVersion && all (>=0) (versionNumbers v)
-
-showVersion :: Version -> String
-showVersion = prettyShow
-{-# DEPRECATED showVersion "Use prettyShow. This function will be removed in Cabal-3.0 (estimated Oct 2018)" #-}

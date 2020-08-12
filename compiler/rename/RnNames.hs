@@ -63,13 +63,11 @@ import qualified GHC.LanguageExtensions as LangExt
 
 import Control.Monad
 import Data.Either      ( partitionEithers, isRight, rights )
--- import qualified Data.Foldable as Foldable
 import Data.Map         ( Map )
 import qualified Data.Map as Map
 import Data.Ord         ( comparing )
 import Data.List        ( partition, (\\), find, sortBy )
 import qualified Data.Set as S
--- import qualified Data.Set as Set
 import System.FilePath  ((</>))
 
 import System.IO
@@ -563,7 +561,7 @@ extendGlobalRdrEnvRn avails new_fixities
 
         ; rdr_env2 <- foldlM add_gre rdr_env1 new_gres
 
-        ; let fix_env' = foldl extend_fix_env fix_env new_gres
+        ; let fix_env' = foldl' extend_fix_env fix_env new_gres
               gbl_env' = gbl_env { tcg_rdr_env = rdr_env2, tcg_fix_env = fix_env' }
 
         ; traceRn "extendGlobalRdrEnvRn 2" (pprGlobalRdrEnv True rdr_env2)
@@ -900,10 +898,11 @@ filterImports iface decl_spec (Just (want_hiding, L l import_items))
                            else (name1, a2, Just p1)
         combine x y = pprPanic "filterImports/combine" (ppr x $$ ppr y)
 
-    lookup_name :: RdrName -> IELookupM (Name, AvailInfo, Maybe Name)
-    lookup_name rdr | isQual rdr              = failLookupWith (QualImportError rdr)
-                    | Just succ <- mb_success = return succ
-                    | otherwise               = failLookupWith BadImport
+    lookup_name :: IE GhcPs -> RdrName -> IELookupM (Name, AvailInfo, Maybe Name)
+    lookup_name ie rdr
+       | isQual rdr              = failLookupWith (QualImportError rdr)
+       | Just succ <- mb_success = return succ
+       | otherwise               = failLookupWith (BadImport ie)
       where
         mb_success = lookupOccEnv imp_occ_env (rdrNameOcc rdr)
 
@@ -920,8 +919,8 @@ filterImports iface decl_spec (Just (want_hiding, L l import_items))
               addWarn (Reason Opt_WarnDodgyImports) (dodgyImportWarn n)
             emit_warning MissingImportList = whenWOptM Opt_WarnMissingImportList $
               addWarn (Reason Opt_WarnMissingImportList) (missingImportListItem ieRdr)
-            emit_warning BadImportW = whenWOptM Opt_WarnDodgyImports $
-              addWarn (Reason Opt_WarnDodgyImports) (lookup_err_msg BadImport)
+            emit_warning (BadImportW ie) = whenWOptM Opt_WarnDodgyImports $
+              addWarn (Reason Opt_WarnDodgyImports) (lookup_err_msg (BadImport ie))
 
             run_lookup :: IELookupM a -> TcRn (Maybe a)
             run_lookup m = case m of
@@ -929,7 +928,7 @@ filterImports iface decl_spec (Just (want_hiding, L l import_items))
               Succeeded a -> return (Just a)
 
             lookup_err_msg err = case err of
-              BadImport -> badImportItemErr iface decl_spec ieRdr all_avails
+              BadImport ie  -> badImportItemErr iface decl_spec ie all_avails
               IllegalImport -> illegalImportItemErr
               QualImportError rdr -> qualImportItemErr rdr
 
@@ -948,12 +947,12 @@ filterImports iface decl_spec (Just (want_hiding, L l import_items))
     lookup_ie ie = handle_bad_import $ do
       case ie of
         IEVar _ (L l n) -> do
-            (name, avail, _) <- lookup_name $ ieWrappedName n
+            (name, avail, _) <- lookup_name ie $ ieWrappedName n
             return ([(IEVar noExt (L l (replaceWrappedName n name)),
                                                   trimAvail avail name)], [])
 
         IEThingAll _ (L l tc) -> do
-            (name, avail, mb_parent) <- lookup_name $ ieWrappedName tc
+            (name, avail, mb_parent) <- lookup_name ie $ ieWrappedName tc
             let warns = case avail of
                           Avail {}                     -- e.g. f(..)
                             -> [DodgyImport $ ieWrappedName tc]
@@ -983,20 +982,21 @@ filterImports iface decl_spec (Just (want_hiding, L l import_items))
                        -- Here the 'C' can be a data constructor
                        --  *or* a type/class, or even both
             -> let tc = ieWrappedName tc'
-                   tc_name = lookup_name tc
-                   dc_name = lookup_name (setRdrNameSpace tc srcDataName)
+                   tc_name = lookup_name ie tc
+                   dc_name = lookup_name ie (setRdrNameSpace tc srcDataName)
                in
                case catIELookupM [ tc_name, dc_name ] of
-                 []    -> failLookupWith BadImport
+                 []    -> failLookupWith (BadImport ie)
                  names -> return ([mkIEThingAbs tc' l name | name <- names], [])
             | otherwise
-            -> do nameAvail <- lookup_name (ieWrappedName tc')
+            -> do nameAvail <- lookup_name ie (ieWrappedName tc')
                   return ([mkIEThingAbs tc' l nameAvail]
                          , [])
 
-        IEThingWith _ (L l rdr_tc) wc rdr_ns' rdr_fs ->
+        IEThingWith xt ltc@(L l rdr_tc) wc rdr_ns rdr_fs ->
           ASSERT2(null rdr_fs, ppr rdr_fs) do
-           (name, avail, mb_parent) <- lookup_name (ieWrappedName rdr_tc)
+           (name, avail, mb_parent)
+               <- lookup_name (IEThingAbs noExt ltc) (ieWrappedName rdr_tc)
 
            let (ns,subflds) = case avail of
                                 AvailTC _ ns' subflds' -> (ns',subflds')
@@ -1008,10 +1008,15 @@ filterImports iface decl_spec (Just (want_hiding, L l import_items))
                                        -- See the AvailTC Invariant in Avail.hs
                             (n1:ns1) | n1 == name -> ns1
                                      | otherwise  -> ns
-               rdr_ns = map ieLWrappedName rdr_ns'
            case lookupChildren (map Left subnames ++ map Right subflds) rdr_ns of
-             Nothing                      -> failLookupWith BadImport
-             Just (childnames, childflds) ->
+
+             Failed rdrs -> failLookupWith (BadImport (IEThingWith xt ltc wc rdrs []))
+                                -- We are trying to import T( a,b,c,d ), and failed
+                                -- to find 'b' and 'd'.  So we make up an import item
+                                -- to report as failing, namely T( b, d ).
+                                -- c.f. Trac #15412
+
+             Succeeded (childnames, childflds) ->
                case mb_parent of
                  -- non-associated ty/cls
                  Nothing
@@ -1046,20 +1051,20 @@ filterImports iface decl_spec (Just (want_hiding, L l import_items))
              , AvailTC parent [n] [])
 
         handle_bad_import m = catchIELookup m $ \err -> case err of
-          BadImport | want_hiding -> return ([], [BadImportW])
-          _                       -> failLookupWith err
+          BadImport ie | want_hiding -> return ([], [BadImportW ie])
+          _                          -> failLookupWith err
 
 type IELookupM = MaybeErr IELookupError
 
 data IELookupWarning
-  = BadImportW
+  = BadImportW (IE GhcPs)
   | MissingImportList
   | DodgyImport RdrName
   -- NB. use the RdrName for reporting a "dodgy" import
 
 data IELookupError
   = QualImportError RdrName
-  | BadImport
+  | BadImport (IE GhcPs)
   | IllegalImport
 
 failLookupWith :: IELookupError -> IELookupM a
@@ -1087,8 +1092,8 @@ gresFromIE decl_spec (L loc ie, avail)
   = gresFromAvail prov_fn avail
   where
     is_explicit = case ie of
-                    IEThingAll _ (L _ name) -> \n -> n == ieWrappedName name
-                    _                       -> \_ -> True
+                    IEThingAll _ name -> \n -> n == lieWrappedName name
+                    _                 -> \_ -> True
     prov_fn name
       = Just (ImpSpec { is_decl = decl_spec, is_item = item_spec })
       where
@@ -1122,8 +1127,9 @@ mkChildEnv gres = foldr add emptyNameEnv gres
 findChildren :: NameEnv [a] -> Name -> [a]
 findChildren env n = lookupNameEnv env n `orElse` []
 
-lookupChildren :: [Either Name FieldLabel] -> [Located RdrName]
-               -> Maybe ([Located Name], [Located FieldLabel])
+lookupChildren :: [Either Name FieldLabel] -> [LIEWrappedName RdrName]
+               -> MaybeErr [LIEWrappedName RdrName]   -- The ones for which the lookup failed
+                           ([Located Name], [Located FieldLabel])
 -- (lookupChildren all_kids rdr_items) maps each rdr_item to its
 -- corresponding Name all_kids, if the former exists
 -- The matching is done by FastString, not OccName, so that
@@ -1132,17 +1138,27 @@ lookupChildren :: [Either Name FieldLabel] -> [Located RdrName]
 -- the RdrName for AssocTy may have a (bogus) DataName namespace
 -- (Really the rdr_items should be FastStrings in the first place.)
 lookupChildren all_kids rdr_items
-  = do xs <- mapM doOne rdr_items
-       return (fmap concat (partitionEithers xs))
+  | null fails
+  = Succeeded (fmap concat (partitionEithers oks))
+       -- This 'fmap concat' trickily applies concat to the /second/ component
+       -- of the pair, whose type is ([Located Name], [[Located FieldLabel]])
+  | otherwise
+  = Failed fails
   where
-    doOne (L l r) = case (lookupFsEnv kid_env . occNameFS . rdrNameOcc) r of
-      Just [Left n]            -> Just (Left (L l n))
-      Just rs | all isRight rs -> Just (Right (map (L l) (rights rs)))
-      _                        -> Nothing
+    mb_xs = map doOne rdr_items
+    fails = [ bad_rdr | Failed bad_rdr <- mb_xs ]
+    oks   = [ ok      | Succeeded ok   <- mb_xs ]
+    oks :: [Either (Located Name) [Located FieldLabel]]
+
+    doOne item@(L l r)
+       = case (lookupFsEnv kid_env . occNameFS . rdrNameOcc . ieWrappedName) r of
+           Just [Left n]            -> Succeeded (Left (L l n))
+           Just rs | all isRight rs -> Succeeded (Right (map (L l) (rights rs)))
+           _                        -> Failed    item
 
     -- See Note [Children for duplicate record fields]
     kid_env = extendFsEnvList_C (++) emptyFsEnv
-                      [(either (occNameFS . nameOccName) flLabel x, [x]) | x <- all_kids]
+              [(either (occNameFS . nameOccName) flLabel x, [x]) | x <- all_kids]
 
 
 
@@ -1199,44 +1215,11 @@ reportUnusedNames _export_decls gbl_env
     is_unused_local :: GlobalRdrElt -> Bool
     is_unused_local gre = isLocalGRE gre && isExternalName (gre_name gre)
 
-{-
-*********************************************************
-*                                                       *
-\subsection{Unused imports}
-*                                                       *
-*********************************************************
-
-This code finds which import declarations are unused.  The
-specification and implementation notes are here:
-  http://ghc.haskell.org/trac/ghc/wiki/Commentary/Compiler/UnusedImports
--}
-
-type ImportDeclUsage
-   = ( LImportDecl GhcRn   -- The import declaration
-     , [AvailInfo]        -- What *is* used (normalised)
-     , [Name] )       -- What is imported but *not* used
-
-warnUnusedImportDecls :: TcGblEnv -> RnM ()
-warnUnusedImportDecls gbl_env
-  = do { uses <- readMutVar (tcg_used_gres gbl_env)
-       ; let user_imports = filterOut (ideclImplicit . unLoc) (tcg_rn_imports gbl_env)
-                            -- This whole function deals only with *user* imports
-                            -- both for warning about unnecessary ones, and for
-                            -- deciding the minimal ones
-             rdr_env = tcg_rdr_env gbl_env
-             fld_env = mkFieldEnv rdr_env
-
-       ; let usage :: [ImportDeclUsage]
-             usage = findImportUsage user_imports uses
-
-       ; traceRn "warnUnusedImportDecls" $
-                       (vcat [ text "Uses:" <+> ppr uses
-                       , text "Import usage" <+> ppr usage])
-       ; whenWOptM Opt_WarnUnusedImports $
-         mapM_ (warnUnusedImport Opt_WarnUnusedImports fld_env) usage
-
-       ; whenGOptM Opt_D_dump_minimal_imports $
-         printMinimalImports usage }
+{- *********************************************************************
+*                                                                      *
+              Missing signatures
+*                                                                      *
+********************************************************************* -}
 
 -- | Warn the user about top level binders that lack type signatures.
 -- Called /after/ type inference, so that we can report the
@@ -1294,29 +1277,50 @@ warnMissingSignatures gbl_env
 
        ; add_sig_warns }
 
+
 {-
-Note [The ImportMap]
-~~~~~~~~~~~~~~~~~~~~
-The ImportMap is a short-lived intermediate data structure records, for
-each import declaration, what stuff brought into scope by that
-declaration is actually used in the module.
+*********************************************************
+*                                                       *
+\subsection{Unused imports}
+*                                                       *
+*********************************************************
 
-The SrcLoc is the location of the END of a particular 'import'
-declaration.  Why *END*?  Because we don't want to get confused
-by the implicit Prelude import. Consider (Trac #7476) the module
-    import Foo( foo )
-    main = print foo
-There is an implicit 'import Prelude(print)', and it gets a SrcSpan
-of line 1:1 (just the point, not a span). If we use the *START* of
-the SrcSpan to identify the import decl, we'll confuse the implicit
-import Prelude with the explicit 'import Foo'.  So we use the END.
-It's just a cheap hack; we could equally well use the Span too.
+This code finds which import declarations are unused.  The
+specification and implementation notes are here:
+  http://ghc.haskell.org/trac/ghc/wiki/Commentary/Compiler/UnusedImports
 
-The AvailInfos are the things imported from that decl (just a list,
-not normalised).
+See also Note [Choosing the best import declaration] in RdrName
 -}
 
-type ImportMap = Map SrcLoc [AvailInfo]  -- See [The ImportMap]
+type ImportDeclUsage
+   = ( LImportDecl GhcRn   -- The import declaration
+     , [GlobalRdrElt]      -- What *is* used (normalised)
+     , [Name] )            -- What is imported but *not* used
+
+warnUnusedImportDecls :: TcGblEnv -> RnM ()
+warnUnusedImportDecls gbl_env
+  = do { uses <- readMutVar (tcg_used_gres gbl_env)
+       ; let user_imports = filterOut
+                              (ideclImplicit . unLoc)
+                              (tcg_rn_imports gbl_env)
+                -- This whole function deals only with *user* imports
+                -- both for warning about unnecessary ones, and for
+                -- deciding the minimal ones
+             rdr_env = tcg_rdr_env gbl_env
+             fld_env = mkFieldEnv rdr_env
+
+       ; let usage :: [ImportDeclUsage]
+             usage = findImportUsage user_imports uses
+
+       ; traceRn "warnUnusedImportDecls" $
+                       (vcat [ text "Uses:" <+> ppr uses
+                             , text "Import usage" <+> ppr usage])
+
+       ; whenWOptM Opt_WarnUnusedImports $
+         mapM_ (warnUnusedImport Opt_WarnUnusedImports fld_env) usage
+
+       ; whenGOptM Opt_D_dump_minimal_imports $
+         printMinimalImports usage }
 
 findImportUsage :: [LImportDecl GhcRn]
                 -> [GlobalRdrElt]
@@ -1326,16 +1330,17 @@ findImportUsage imports used_gres
   = map unused_decl imports
   where
     import_usage :: ImportMap
-    import_usage
-      = foldr extendImportMap Map.empty used_gres
+    import_usage = mkImportMap used_gres
 
     unused_decl decl@(L loc (ImportDecl { ideclHiding = imps }))
-      = (decl, nubAvails used_avails, nameSetElemsStable unused_imps)
+      = (decl, used_gres, nameSetElemsStable unused_imps)
       where
-        used_avails = Map.lookup (srcSpanEnd loc) import_usage `orElse` []
-                      -- srcSpanEnd: see Note [The ImportMap]
-        used_names   = availsToNameSetWithSelectors used_avails
-        used_parents = mkNameSet [n | AvailTC n _ _ <- used_avails]
+        used_gres = Map.lookup (srcSpanEnd loc) import_usage
+                               -- srcSpanEnd: see Note [The ImportMap]
+                    `orElse` []
+
+        used_names   = mkNameSet (map      gre_name        used_gres)
+        used_parents = mkNameSet (mapMaybe greParent_maybe used_gres)
 
         unused_imps   -- Not trivial; see eg Trac #7454
           = case imps of
@@ -1344,19 +1349,16 @@ findImportUsage imports used_gres
               _other -> emptyNameSet -- No explicit import list => no unused-name list
 
         add_unused :: IE GhcRn -> NameSet -> NameSet
-        add_unused (IEVar _ (L _ n))      acc
-                                       = add_unused_name (ieWrappedName n) acc
-        add_unused (IEThingAbs _ (L _ n)) acc
-                                       = add_unused_name (ieWrappedName n) acc
-        add_unused (IEThingAll _ (L _ n)) acc
-                                       = add_unused_all  (ieWrappedName n) acc
-        add_unused (IEThingWith _ (L _ p) wc ns fs) acc =
-          add_wc_all (add_unused_with (ieWrappedName p) xs acc)
-          where xs = map (ieWrappedName . unLoc) ns
-                          ++ map (flSelector . unLoc) fs
+        add_unused (IEVar _ n)      acc = add_unused_name (lieWrappedName n) acc
+        add_unused (IEThingAbs _ n) acc = add_unused_name (lieWrappedName n) acc
+        add_unused (IEThingAll _ n) acc = add_unused_all  (lieWrappedName n) acc
+        add_unused (IEThingWith _ p wc ns fs) acc =
+          add_wc_all (add_unused_with pn xs acc)
+          where pn = lieWrappedName p
+                xs = map lieWrappedName ns ++ map (flSelector . unLoc) fs
                 add_wc_all = case wc of
                             NoIEWildcard -> id
-                            IEWildcard _ -> add_unused_all (ieWrappedName p)
+                            IEWildcard _ -> add_unused_all pn
         add_unused _ acc = acc
 
         add_unused_name n acc
@@ -1376,49 +1378,86 @@ findImportUsage imports used_gres
        -- Num is not itself mentioned.  Hence the two cases in add_unused_with.
     unused_decl (L _ (XImportDecl _)) = panic "unused_decl"
 
-extendImportMap :: GlobalRdrElt -> ImportMap -> ImportMap
+
+{- Note [The ImportMap]
+~~~~~~~~~~~~~~~~~~~~~~~
+The ImportMap is a short-lived intermediate data structure records, for
+each import declaration, what stuff brought into scope by that
+declaration is actually used in the module.
+
+The SrcLoc is the location of the END of a particular 'import'
+declaration.  Why *END*?  Because we don't want to get confused
+by the implicit Prelude import. Consider (Trac #7476) the module
+    import Foo( foo )
+    main = print foo
+There is an implicit 'import Prelude(print)', and it gets a SrcSpan
+of line 1:1 (just the point, not a span). If we use the *START* of
+the SrcSpan to identify the import decl, we'll confuse the implicit
+import Prelude with the explicit 'import Foo'.  So we use the END.
+It's just a cheap hack; we could equally well use the Span too.
+
+The [GlobalRdrElt] are the things imported from that decl.
+-}
+
+type ImportMap = Map SrcLoc [GlobalRdrElt]  -- See [The ImportMap]
+     -- If loc :-> gres, then
+     --   'loc' = the end loc of the bestImport of each GRE in 'gres'
+
+mkImportMap :: [GlobalRdrElt] -> ImportMap
 -- For each of a list of used GREs, find all the import decls that brought
 -- it into scope; choose one of them (bestImport), and record
 -- the RdrName in that import decl's entry in the ImportMap
-extendImportMap gre imp_map
-   = add_imp gre (bestImport (gre_imp gre)) imp_map
+mkImportMap gres
+  = foldr add_one Map.empty gres
   where
-    add_imp :: GlobalRdrElt -> ImportSpec -> ImportMap -> ImportMap
-    add_imp gre (ImpSpec { is_decl = imp_decl_spec }) imp_map
-      = Map.insertWith add decl_loc [avail] imp_map
-      where
-        add _ avails = avail : avails -- add is really just a specialised (++)
-        decl_loc = srcSpanEnd (is_dloc imp_decl_spec)
-                   -- For srcSpanEnd see Note [The ImportMap]
-        avail    = availFromGRE gre
+    add_one gre@(GRE { gre_imp = imp_specs }) imp_map
+       = Map.insertWith add decl_loc [gre] imp_map
+       where
+          best_imp_spec = bestImport imp_specs
+          decl_loc      = srcSpanEnd (is_dloc (is_decl best_imp_spec))
+                        -- For srcSpanEnd see Note [The ImportMap]
+          add _ gres = gre : gres
 
 warnUnusedImport :: WarningFlag -> NameEnv (FieldLabelString, Name)
                  -> ImportDeclUsage -> RnM ()
 warnUnusedImport flag fld_env (L loc decl, used, unused)
-  | Just (False,L _ []) <- ideclHiding decl
-                = return ()            -- Do not warn for 'import M()'
 
+  -- Do not warn for 'import M()'
+  | Just (False,L _ []) <- ideclHiding decl
+  = return ()
+
+  -- Note [Do not warn about Prelude hiding]
   | Just (True, L _ hides) <- ideclHiding decl
   , not (null hides)
   , pRELUDE_NAME == unLoc (ideclName decl)
-                = return ()            -- Note [Do not warn about Prelude hiding]
-  | null used   = addWarnAt (Reason flag) loc msg1 -- Nothing used; drop entire decl
-  | null unused = return ()            -- Everything imported is used; nop
-  | otherwise   = addWarnAt (Reason flag) loc msg2 -- Some imports are unused
+  = return ()
+
+  -- Nothing used; drop entire declaration
+  | null used
+  = addWarnAt (Reason flag) loc msg1
+
+  -- Everything imported is used; nop
+  | null unused
+  = return ()
+
+  -- Some imports are unused
+  | otherwise
+  = addWarnAt (Reason flag) loc  msg2
+
   where
-    msg1 = vcat [pp_herald <+> quotes pp_mod <+> pp_not_used,
-                 nest 2 (text "except perhaps to import instances from"
-                                   <+> quotes pp_mod),
-                 text "To import instances alone, use:"
+    msg1 = vcat [ pp_herald <+> quotes pp_mod <+> is_redundant
+                , nest 2 (text "except perhaps to import instances from"
+                                   <+> quotes pp_mod)
+                , text "To import instances alone, use:"
                                    <+> text "import" <+> pp_mod <> parens Outputable.empty ]
-    msg2 = sep [pp_herald <+> quotes sort_unused,
-                    text "from module" <+> quotes pp_mod <+> pp_not_used]
+    msg2 = sep [ pp_herald <+> quotes sort_unused
+               , text "from module" <+> quotes pp_mod <+> is_redundant]
     pp_herald  = text "The" <+> pp_qual <+> text "import of"
     pp_qual
       | ideclQualified decl = text "qualified"
       | otherwise           = Outputable.empty
-    pp_mod      = ppr (unLoc (ideclName decl))
-    pp_not_used = text "is redundant"
+    pp_mod       = ppr (unLoc (ideclName decl))
+    is_redundant = text "is redundant"
 
     -- In warning message, pretty-print identifiers unqualified unconditionally
     -- to improve the consistent for ambiguous/unambiguous identifiers.
@@ -1428,8 +1467,9 @@ warnUnusedImport flag fld_env (L loc decl, used, unused)
                                Nothing  -> pprNameUnqualified n
 
     -- Print unused names in a deterministic (lexicographic) order
+    sort_unused :: SDoc
     sort_unused = pprWithCommas ppr_possible_field $
-                    sortBy (comparing nameOccName) unused
+                  sortBy (comparing nameOccName) unused
 
 {-
 Note [Do not warn about Prelude hiding]
@@ -1457,7 +1497,7 @@ decls, and simply trim their import lists.  NB that
 getMinimalImports :: [ImportDeclUsage] -> RnM [LImportDecl GhcRn]
 getMinimalImports = mapM mk_minimal
   where
-    mk_minimal (L l decl, used, unused)
+    mk_minimal (L l decl, used_gres, unused)
       | null unused
       , Just (False, _) <- ideclHiding decl
       = return (L l decl)
@@ -1466,7 +1506,8 @@ getMinimalImports = mapM mk_minimal
                             , ideclSource  = is_boot
                             , ideclPkgQual = mb_pkg } = decl
            ; iface <- loadSrcInterface doc mod_name is_boot (fmap sl_fs mb_pkg)
-           ; let lies = map (L l) (concatMap (to_ie iface) used)
+           ; let used_avails = gresToAvailInfo used_gres
+                 lies = map (L l) (concatMap (to_ie iface) used_avails)
            ; return (L l (decl { ideclHiding = Just (False, L l lies) })) }
       where
         doc = text "Compute minimal imports for" <+> ppr decl

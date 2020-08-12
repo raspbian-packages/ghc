@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP, GADTs, NondecreasingIndentation #-}
+{-# LANGUAGE TupleSections #-}
 
 -- The default iteration limit is a bit too low for the definitions
 -- in this module.
@@ -20,6 +21,7 @@ module X86.CodeGen (
         cmmTopCodeGen,
         generateJumpTableForInstr,
         extractUnwindPoints,
+        invertCondBranches,
         InstrBlock
 )
 
@@ -35,14 +37,23 @@ import GhcPrelude
 import X86.Instr
 import X86.Cond
 import X86.Regs
+import X86.Ppr (  )
 import X86.RegInfo
+
+--TODO: Remove - Just for development/debugging
+import X86.Ppr()
+
 import CodeGen.Platform
 import CPrim
 import Debug            ( DebugBlock(..), UnwindPoint(..), UnwindTable
                         , UnwindExpr(UwReg), toUnwindExpr )
 import Instruction
 import PIC
-import NCGMonad
+import NCGMonad   ( NatM, getNewRegNat, getNewLabelNat, setDeltaNat
+                  , getDeltaNat, getBlockIdNat, getPicBaseNat, getNewRegPairNat
+                  , getPicBaseMaybeNat, getDebugBlock, getFileId
+                  , addImmediateSuccessorNat, updateCfgNat)
+import CFG
 import Format
 import Reg
 import Platform
@@ -56,7 +67,9 @@ import CmmUtils
 import CmmSwitch
 import Cmm
 import Hoopl.Block
+import Hoopl.Collections
 import Hoopl.Graph
+import Hoopl.Label
 import CLabel
 import CoreSyn          ( Tickish(..) )
 import SrcLoc           ( srcSpanFile, srcSpanStartLine, srcSpanStartCol )
@@ -119,6 +132,56 @@ cmmTopCodeGen (CmmProc info lab live graph) = do
 cmmTopCodeGen (CmmData sec dat) = do
   return [CmmData sec (1, dat)]  -- no translation, we just use CmmStatic
 
+{- Note [Verifying basic blocks]
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+   We want to guarantee a few things about the results
+   of instruction selection.
+
+   Namely that each basic blocks consists of:
+    * A (potentially empty) sequence of straight line instructions
+  followed by
+    * A (potentially empty) sequence of jump like instructions.
+
+    We can verify this by going through the instructions and
+    making sure that any non-jumpish instruction can't appear
+    after a jumpish instruction.
+
+    There are gotchas however:
+    * CALLs are strictly speaking control flow but here we care
+      not about them. Hence we treat them as regular instructions.
+
+      It's safe for them to appear inside a basic block
+      as (ignoring side effects inside the call) they will result in
+      straight line code.
+
+    * NEWBLOCK marks the start of a new basic block so can
+      be followed by any instructions.
+-}
+
+-- Verifying basic blocks is cheap, but not cheap enough to enable it unconditionally.
+verifyBasicBlock :: [Instr] -> ()
+verifyBasicBlock instrs
+  | debugIsOn     = go False instrs
+  | otherwise     = ()
+  where
+    go _     [] = ()
+    go atEnd (i:instr)
+        = case i of
+            -- Start a new basic block
+            NEWBLOCK {} -> go False instr
+            -- Calls are not viable block terminators
+            CALL {}     | atEnd -> faultyBlockWith i
+                        | not atEnd -> go atEnd instr
+            -- All instructions ok, check if we reached the end and continue.
+            _ | not atEnd -> go (isJumpishInstr i) instr
+              -- Only jumps allowed at the end of basic blocks.
+              | otherwise -> if isJumpishInstr i
+                                then go True instr
+                                else faultyBlockWith i
+    faultyBlockWith i
+        = pprPanic "Non control flow instructions after end of basic block."
+                   (ppr i <+> text "in:" $$ vcat (map ppr instrs))
 
 basicBlockCodeGen
         :: CmmBlock
@@ -137,9 +200,10 @@ basicBlockCodeGen block = do
             let line = srcSpanStartLine span; col = srcSpanStartCol span
             return $ unitOL $ LOCATION fileId line col name
     _ -> return nilOL
-  mid_instrs <- stmtsToInstrs stmts
-  tail_instrs <- stmtToInstrs tail
+  (mid_instrs,mid_bid) <- stmtsToInstrs id stmts
+  (tail_instrs,_) <- stmtToInstrs mid_bid tail
   let instrs = loc_instrs `appOL` mid_instrs `appOL` tail_instrs
+  return $! verifyBasicBlock (fromOL instrs)
   instrs' <- fold <$> traverse addSpUnwindings instrs
   -- code generation may introduce new basic block boundaries, which
   -- are indicated by the NEWBLOCK instruction.  We must split up the
@@ -169,62 +233,137 @@ addSpUnwindings instr@(DELTA d) = do
         else return (unitOL instr)
 addSpUnwindings instr = return $ unitOL instr
 
-stmtsToInstrs :: [CmmNode e x] -> NatM InstrBlock
-stmtsToInstrs stmts
-   = do instrss <- mapM stmtToInstrs stmts
-        return (concatOL instrss)
+{- Note [Keeping track of the current block]
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+When generating instructions for Cmm we sometimes require
+the current block for things like retry loops.
 
-stmtToInstrs :: CmmNode e x -> NatM InstrBlock
-stmtToInstrs stmt = do
+We also sometimes change the current block, if a MachOP
+results in branching control flow.
+
+Issues arise if we have two statements in the same block,
+which both depend on the current block id *and* change the
+basic block after them. This happens for atomic primops
+in the X86 backend where we want to update the CFG data structure
+when introducing new basic blocks.
+
+For example in #17334 we got this Cmm code:
+
+        c3Bf: // global
+            (_s3t1::I64) = call MO_AtomicRMW W64 AMO_And(_s3sQ::P64 + 88, 18);
+            (_s3t4::I64) = call MO_AtomicRMW W64 AMO_Or(_s3sQ::P64 + 88, 0);
+            _s3sT::I64 = _s3sV::I64;
+            goto c3B1;
+
+This resulted in two new basic blocks being inserted:
+
+        c3Bf:
+                movl $18,%vI_n3Bo
+                movq 88(%vI_s3sQ),%rax
+                jmp _n3Bp
+        n3Bp:
+                ...
+                cmpxchgq %vI_n3Bq,88(%vI_s3sQ)
+                jne _n3Bp
+                ...
+                jmp _n3Bs
+        n3Bs:
+                ...
+                cmpxchgq %vI_n3Bt,88(%vI_s3sQ)
+                jne _n3Bs
+                ...
+                jmp _c3B1
+        ...
+
+Based on the Cmm we called stmtToInstrs we translated both atomic operations under
+the assumption they would be placed into their Cmm basic block `c3Bf`.
+However for the retry loop we introduce new labels, so this is not the case
+for the second statement.
+This resulted in a desync between the explicit control flow graph
+we construct as a separate data type and the actual control flow graph in the code.
+
+Instead we now return the new basic block if a statement causes a change
+in the current block and use the block for all following statements.
+
+For this reason genCCall is also split into two parts.
+One for calls which *won't* change the basic blocks in
+which successive instructions will be placed.
+A different one for calls which *are* known to change the
+basic block.
+
+-}
+
+-- See Note [Keeping track of the current block] for why
+-- we pass the BlockId.
+stmtsToInstrs :: BlockId -- ^ Basic block these statement will start to be placed in.
+              -> [CmmNode O O] -- ^ Cmm Statement
+              -> NatM (InstrBlock, BlockId) -- ^ Resulting instruction
+stmtsToInstrs bid stmts =
+    go bid stmts nilOL
+  where
+    go bid  []        instrs = return (instrs,bid)
+    go bid (s:stmts)  instrs = do
+      (instrs',bid') <- stmtToInstrs bid s
+      -- If the statement introduced a new block, we use that one
+      let newBid = fromMaybe bid bid'
+      go newBid stmts (instrs `appOL` instrs')
+
+-- | `bid` refers to the current block and is used to update the CFG
+--   if new blocks are inserted in the control flow.
+-- See Note [Keeping track of the current block] for more details.
+stmtToInstrs :: BlockId -- ^ Basic block this statement will start to be placed in.
+             -> CmmNode e x
+             -> NatM (InstrBlock, Maybe BlockId)
+             -- ^ Instructions, and bid of new block if successive
+             -- statements are placed in a different basic block.
+stmtToInstrs bid stmt = do
   dflags <- getDynFlags
   is32Bit <- is32BitPlatform
   case stmt of
-    CmmComment s   -> return (unitOL (COMMENT s))
-    CmmTick {}     -> return nilOL
-
-    CmmUnwind regs -> do
-      let to_unwind_entry :: (GlobalReg, Maybe CmmExpr) -> UnwindTable
-          to_unwind_entry (reg, expr) = M.singleton reg (fmap toUnwindExpr expr)
-      case foldMap to_unwind_entry regs of
-        tbl | M.null tbl -> return nilOL
-            | otherwise  -> do
-                lbl <- mkAsmTempLabel <$> getUniqueM
-                return $ unitOL $ UNWIND lbl tbl
-
-    CmmAssign reg src
-      | isFloatType ty         -> assignReg_FltCode format reg src
-      | is32Bit && isWord64 ty -> assignReg_I64Code      reg src
-      | otherwise              -> assignReg_IntCode format reg src
-        where ty = cmmRegType dflags reg
-              format = cmmTypeFormat ty
-
-    CmmStore addr src
-      | isFloatType ty         -> assignMem_FltCode format addr src
-      | is32Bit && isWord64 ty -> assignMem_I64Code      addr src
-      | otherwise              -> assignMem_IntCode format addr src
-        where ty = cmmExprType dflags src
-              format = cmmTypeFormat ty
-
     CmmUnsafeForeignCall target result_regs args
-       -> genCCall dflags is32Bit target result_regs args
+       -> genCCall dflags is32Bit target result_regs args bid
 
-    CmmBranch id          -> genBranch id
+    _ -> (,Nothing) <$> case stmt of
+      CmmComment s   -> return (unitOL (COMMENT s))
+      CmmTick {}     -> return nilOL
 
-    --We try to arrange blocks such that the likely branch is the fallthrough
-    --in CmmContFlowOpt. So we can assume the condition is likely false here.
-    CmmCondBranch arg true false _ -> do
-      b1 <- genCondJump true arg
-      b2 <- genBranch false
-      return (b1 `appOL` b2)
-    CmmSwitch arg ids -> do dflags <- getDynFlags
-                            genSwitch dflags arg ids
-    CmmCall { cml_target = arg
-            , cml_args_regs = gregs } -> do
-                                dflags <- getDynFlags
-                                genJump arg (jumpRegs dflags gregs)
-    _ ->
-      panic "stmtToInstrs: statement should have been cps'd away"
+      CmmUnwind regs -> do
+        let to_unwind_entry :: (GlobalReg, Maybe CmmExpr) -> UnwindTable
+            to_unwind_entry (reg, expr) = M.singleton reg (fmap toUnwindExpr expr)
+        case foldMap to_unwind_entry regs of
+          tbl | M.null tbl -> return nilOL
+              | otherwise  -> do
+                  lbl <- mkAsmTempLabel <$> getUniqueM
+                  return $ unitOL $ UNWIND lbl tbl
+
+      CmmAssign reg src
+        | isFloatType ty         -> assignReg_FltCode format reg src
+        | is32Bit && isWord64 ty -> assignReg_I64Code      reg src
+        | otherwise              -> assignReg_IntCode format reg src
+          where ty = cmmRegType dflags reg
+                format = cmmTypeFormat ty
+
+      CmmStore addr src
+        | isFloatType ty         -> assignMem_FltCode format addr src
+        | is32Bit && isWord64 ty -> assignMem_I64Code      addr src
+        | otherwise              -> assignMem_IntCode format addr src
+          where ty = cmmExprType dflags src
+                format = cmmTypeFormat ty
+
+      CmmBranch id          -> return $ genBranch id
+
+      --We try to arrange blocks such that the likely branch is the fallthrough
+      --in CmmContFlowOpt. So we can assume the condition is likely false here.
+      CmmCondBranch arg true false _ -> genCondBranch bid true false arg
+      CmmSwitch arg ids -> do dflags <- getDynFlags
+                              genSwitch dflags arg ids
+      CmmCall { cml_target = arg
+              , cml_args_regs = gregs } -> do
+                                  dflags <- getDynFlags
+                                  genJump arg (jumpRegs dflags gregs)
+      _ ->
+        panic "stmtToInstrs: statement should have been cps'd away"
 
 
 jumpRegs :: DynFlags -> [GlobalReg] -> [Reg]
@@ -644,20 +783,27 @@ getRegister' dflags is32Bit (CmmMachOp mop [x]) = do -- unary MachOps
       -- Nop conversions
       MO_UU_Conv W32 W8  -> toI8Reg  W32 x
       MO_SS_Conv W32 W8  -> toI8Reg  W32 x
+      MO_XX_Conv W32 W8  -> toI8Reg  W32 x
       MO_UU_Conv W16 W8  -> toI8Reg  W16 x
       MO_SS_Conv W16 W8  -> toI8Reg  W16 x
+      MO_XX_Conv W16 W8  -> toI8Reg  W16 x
       MO_UU_Conv W32 W16 -> toI16Reg W32 x
       MO_SS_Conv W32 W16 -> toI16Reg W32 x
+      MO_XX_Conv W32 W16 -> toI16Reg W32 x
 
       MO_UU_Conv W64 W32 | not is32Bit -> conversionNop II64 x
       MO_SS_Conv W64 W32 | not is32Bit -> conversionNop II64 x
+      MO_XX_Conv W64 W32 | not is32Bit -> conversionNop II64 x
       MO_UU_Conv W64 W16 | not is32Bit -> toI16Reg W64 x
       MO_SS_Conv W64 W16 | not is32Bit -> toI16Reg W64 x
+      MO_XX_Conv W64 W16 | not is32Bit -> toI16Reg W64 x
       MO_UU_Conv W64 W8  | not is32Bit -> toI8Reg  W64 x
       MO_SS_Conv W64 W8  | not is32Bit -> toI8Reg  W64 x
+      MO_XX_Conv W64 W8  | not is32Bit -> toI8Reg  W64 x
 
       MO_UU_Conv rep1 rep2 | rep1 == rep2 -> conversionNop (intFormat rep1) x
       MO_SS_Conv rep1 rep2 | rep1 == rep2 -> conversionNop (intFormat rep1) x
+      MO_XX_Conv rep1 rep2 | rep1 == rep2 -> conversionNop (intFormat rep1) x
 
       -- widenings
       MO_UU_Conv W8  W32 -> integerExtend W8  W32 MOVZxL x
@@ -668,16 +814,32 @@ getRegister' dflags is32Bit (CmmMachOp mop [x]) = do -- unary MachOps
       MO_SS_Conv W16 W32 -> integerExtend W16 W32 MOVSxL x
       MO_SS_Conv W8  W16 -> integerExtend W8  W16 MOVSxL x
 
+      -- We don't care about the upper bits for MO_XX_Conv, so MOV is enough. However, on 32-bit we
+      -- have 8-bit registers only for a few registers (as opposed to x86-64 where every register
+      -- has 8-bit version). So for 32-bit code, we'll just zero-extend.
+      MO_XX_Conv W8  W32
+          | is32Bit   -> integerExtend W8 W32 MOVZxL x
+          | otherwise -> integerExtend W8 W32 MOV x
+      MO_XX_Conv W8  W16
+          | is32Bit   -> integerExtend W8 W16 MOVZxL x
+          | otherwise -> integerExtend W8 W16 MOV x
+      MO_XX_Conv W16 W32 -> integerExtend W16 W32 MOV x
+
       MO_UU_Conv W8  W64 | not is32Bit -> integerExtend W8  W64 MOVZxL x
       MO_UU_Conv W16 W64 | not is32Bit -> integerExtend W16 W64 MOVZxL x
       MO_UU_Conv W32 W64 | not is32Bit -> integerExtend W32 W64 MOVZxL x
       MO_SS_Conv W8  W64 | not is32Bit -> integerExtend W8  W64 MOVSxL x
       MO_SS_Conv W16 W64 | not is32Bit -> integerExtend W16 W64 MOVSxL x
       MO_SS_Conv W32 W64 | not is32Bit -> integerExtend W32 W64 MOVSxL x
-        -- for 32-to-64 bit zero extension, amd64 uses an ordinary movl.
-        -- However, we don't want the register allocator to throw it
-        -- away as an unnecessary reg-to-reg move, so we keep it in
-        -- the form of a movzl and print it as a movl later.
+      -- For 32-to-64 bit zero extension, amd64 uses an ordinary movl.
+      -- However, we don't want the register allocator to throw it
+      -- away as an unnecessary reg-to-reg move, so we keep it in
+      -- the form of a movzl and print it as a movl later.
+      -- This doesn't apply to MO_XX_Conv since in this case we don't care about
+      -- the upper bits. So we can just use MOV.
+      MO_XX_Conv W8  W64 | not is32Bit -> integerExtend W8  W64 MOV x
+      MO_XX_Conv W16 W64 | not is32Bit -> integerExtend W16 W64 MOV x
+      MO_XX_Conv W32 W64 | not is32Bit -> integerExtend W32 W64 MOV x
 
       MO_FF_Conv W32 W64
         | sse2      -> coerceFP2FP W64 x
@@ -750,8 +912,10 @@ getRegister' _ is32Bit (CmmMachOp mop [x, y]) = do -- dyadic MachOps
       MO_F_Ne _ -> condFltReg is32Bit NE  x y
       MO_F_Gt _ -> condFltReg is32Bit GTT x y
       MO_F_Ge _ -> condFltReg is32Bit GE  x y
-      MO_F_Lt _ -> condFltReg is32Bit LTT x y
-      MO_F_Le _ -> condFltReg is32Bit LE  x y
+      -- Invert comparison condition and swap operands
+      -- See Note [SSE Parity Checks]
+      MO_F_Lt _ -> condFltReg is32Bit GTT  y x
+      MO_F_Le _ -> condFltReg is32Bit GE   y x
 
       MO_Eq _   -> condIntReg EQQ x y
       MO_Ne _   -> condIntReg NE  x y
@@ -785,6 +949,7 @@ getRegister' _ is32Bit (CmmMachOp mop [x, y]) = do -- dyadic MachOps
 
       MO_S_MulMayOflo rep -> imulMayOflo rep x y
 
+      MO_Mul W8  -> imulW8 x y
       MO_Mul rep -> triv_op rep IMUL
       MO_And rep -> triv_op rep AND
       MO_Or  rep -> triv_op rep OR
@@ -819,6 +984,21 @@ getRegister' _ is32Bit (CmmMachOp mop [x, y]) = do -- dyadic MachOps
     --------------------
     triv_op width instr = trivialCode width op (Just op) x y
                         where op   = instr (intFormat width)
+
+    -- Special case for IMUL for bytes, since the result of IMULB will be in
+    -- %ax, the split to %dx/%edx/%rdx and %ax/%eax/%rax happens only for wider
+    -- values.
+    imulW8 :: CmmExpr -> CmmExpr -> NatM Register
+    imulW8 arg_a arg_b = do
+        (a_reg, a_code) <- getNonClobberedReg arg_a
+        b_code <- getAnyReg arg_b
+
+        let code = a_code `appOL` b_code eax `appOL`
+                   toOL [ IMUL2 format (OpReg a_reg) ]
+            format = intFormat W8
+
+        return (Fixed format eax code)
+
 
     imulMayOflo :: Width -> CmmExpr -> CmmExpr -> NatM Register
     imulMayOflo rep a b = do
@@ -914,6 +1094,18 @@ getRegister' _ is32Bit (CmmMachOp mop [x, y]) = do -- dyadic MachOps
         return (Any format code)
 
     ----------------------
+
+    -- See Note [DIV/IDIV for bytes]
+    div_code W8 signed quotient x y = do
+        let widen | signed    = MO_SS_Conv W8 W16
+                  | otherwise = MO_UU_Conv W8 W16
+        div_code
+            W16
+            signed
+            quotient
+            (CmmMachOp widen [x])
+            (CmmMachOp widen [y])
+
     div_code width signed quotient x y = do
            (y_op, y_code) <- getRegOrMem y -- cannot be clobbered
            x_code <- getAnyReg x
@@ -1365,15 +1557,17 @@ getCondCode (CmmMachOp mop [x, y])
       MO_F_Ne W32 -> condFltCode NE  x y
       MO_F_Gt W32 -> condFltCode GTT x y
       MO_F_Ge W32 -> condFltCode GE  x y
-      MO_F_Lt W32 -> condFltCode LTT x y
-      MO_F_Le W32 -> condFltCode LE  x y
+      -- Invert comparison condition and swap operands
+      -- See Note [SSE Parity Checks]
+      MO_F_Lt W32 -> condFltCode GTT  y x
+      MO_F_Le W32 -> condFltCode GE   y x
 
       MO_F_Eq W64 -> condFltCode EQQ x y
       MO_F_Ne W64 -> condFltCode NE  x y
       MO_F_Gt W64 -> condFltCode GTT x y
       MO_F_Ge W64 -> condFltCode GE  x y
-      MO_F_Lt W64 -> condFltCode LTT x y
-      MO_F_Le W64 -> condFltCode LE  x y
+      MO_F_Lt W64 -> condFltCode GTT y x
+      MO_F_Le W64 -> condFltCode GE  y x
 
       _ -> condIntCode (machOpToCond mop) x y
 
@@ -1618,13 +1812,13 @@ genJump expr regs = do
 -- -----------------------------------------------------------------------------
 --  Unconditional branches
 
-genBranch :: BlockId -> NatM InstrBlock
-genBranch = return . toOL . mkJumpInstr
+genBranch :: BlockId -> InstrBlock
+genBranch = toOL . mkJumpInstr
 
 
 
 -- -----------------------------------------------------------------------------
---  Conditional jumps
+--  Conditional jumps/branches
 
 {-
 Conditional jumps are always to local labels, so we can use branch
@@ -1635,19 +1829,24 @@ I386: First, we have to ensure that the condition
 codes are set according to the supplied comparison operation.
 -}
 
-genCondJump
-    :: BlockId      -- the branch target
+
+genCondBranch
+    :: BlockId      -- the source of the jump
+    -> BlockId      -- the true branch target
+    -> BlockId      -- the false branch target
     -> CmmExpr      -- the condition on which to branch
-    -> NatM InstrBlock
+    -> NatM InstrBlock -- Instructions
 
-genCondJump id expr = do
+genCondBranch bid id false expr = do
   is32Bit <- is32BitPlatform
-  genCondJump' is32Bit id expr
+  genCondBranch' is32Bit bid id false expr
 
-genCondJump' :: Bool -> BlockId -> CmmExpr -> NatM InstrBlock
+-- | We return the instructions generated.
+genCondBranch' :: Bool -> BlockId -> BlockId -> BlockId -> CmmExpr
+               -> NatM InstrBlock
 
 -- 64-bit integer comparisons on 32-bit
-genCondJump' is32Bit true (CmmMachOp mop [e1,e2])
+genCondBranch' is32Bit _bid true false (CmmMachOp mop [e1,e2])
   | is32Bit, Just W64 <- maybeIntComparison mop = do
   ChildCode64 code1 r1_lo <- iselExpr64 e1
   ChildCode64 code2 r2_lo <- iselExpr64 e2
@@ -1655,45 +1854,156 @@ genCondJump' is32Bit true (CmmMachOp mop [e1,e2])
       r2_hi = getHiVRegFromLo r2_lo
       cond = machOpToCond mop
       Just cond' = maybeFlipCond cond
-  false <- getBlockIdNat
-  return $ code1 `appOL` code2 `appOL` toOL [
-    CMP II32 (OpReg r2_hi) (OpReg r1_hi),
-    JXX cond true,
-    JXX cond' false,
-    CMP II32 (OpReg r2_lo) (OpReg r1_lo),
-    JXX cond true,
-    NEWBLOCK false ]
+  --TODO: Update CFG for x86
+  let code = code1 `appOL` code2 `appOL` toOL [
+        CMP II32 (OpReg r2_hi) (OpReg r1_hi),
+        JXX cond true,
+        JXX cond' false,
+        CMP II32 (OpReg r2_lo) (OpReg r1_lo),
+        JXX cond true] `appOL` genBranch false
+  return code
 
-genCondJump' _ id bool = do
+genCondBranch' _ bid id false bool = do
   CondCode is_float cond cond_code <- getCondCode bool
   use_sse2 <- sse2Enabled
   if not is_float || not use_sse2
     then
-        return (cond_code `snocOL` JXX cond id)
+        return (cond_code `snocOL` JXX cond id `appOL` genBranch false)
     else do
-        lbl <- getBlockIdNat
-
-        -- see comment with condFltReg
-        let code = case cond of
-                        NE  -> or_unordered
-                        GU  -> plain_test
-                        GEU -> plain_test
-                        _   -> and_ordered
+        -- See Note [SSE Parity Checks]
+        let jmpFalse = genBranch false
+            code
+                = case cond of
+                  NE  -> or_unordered
+                  GU  -> plain_test
+                  GEU -> plain_test
+                  -- Use ASSERT so we don't break releases if
+                  -- LTT/LE creep in somehow.
+                  LTT ->
+                    ASSERT2(False, ppr "Should have been turned into >")
+                    and_ordered
+                  LE  ->
+                    ASSERT2(False, ppr "Should have been turned into >=")
+                    and_ordered
+                  _   -> and_ordered
 
             plain_test = unitOL (
                   JXX cond id
-                )
+                ) `appOL` jmpFalse
             or_unordered = toOL [
                   JXX cond id,
                   JXX PARITY id
-                ]
+                ] `appOL` jmpFalse
             and_ordered = toOL [
-                  JXX PARITY lbl,
+                  JXX PARITY false,
                   JXX cond id,
-                  JXX ALWAYS lbl,
-                  NEWBLOCK lbl
+                  JXX ALWAYS false
                 ]
+        updateCfgNat (\cfg -> adjustEdgeWeight cfg (+3) bid false)
         return (cond_code `appOL` code)
+
+{-  Note [Introducing cfg edges inside basic blocks]
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    During instruction selection a statement `s`
+    in a block B with control of the sort: B -> C
+    will sometimes result in control
+    flow of the sort:
+
+            ┌ < ┐
+            v   ^
+      B ->  B1  ┴ -> C
+
+    as is the case for some atomic operations.
+
+    Now to keep the CFG in sync when introducing B1 we clearly
+    want to insert it between B and C. However there is
+    a catch when we have to deal with self loops.
+
+    We might start with code and a CFG of these forms:
+
+    loop:
+        stmt1               ┌ < ┐
+        ....                v   ^
+        stmtX              loop ┘
+        stmtY
+        ....
+        goto loop:
+
+    Now we introduce B1:
+                            ┌ ─ ─ ─ ─ ─┐
+        loop:               │   ┌ <  ┐ │
+        instrs              v   │    │ ^
+        ....               loop ┴ B1 ┴ ┘
+        instrsFromX
+        stmtY
+        goto loop:
+
+    This is simple, all outgoing edges from loop now simply
+    start from B1 instead and the code generator knows which
+    new edges it introduced for the self loop of B1.
+
+    Disaster strikes if the statement Y follows the same pattern.
+    If we apply the same rule that all outgoing edges change then
+    we end up with:
+
+        loop ─> B1 ─> B2 ┬─┐
+          │      │    └─<┤ │
+          │      └───<───┘ │
+          └───────<────────┘
+
+    This is problematic. The edge B1->B1 is modified as expected.
+    However the modification is wrong!
+
+    The assembly in this case looked like this:
+
+    _loop:
+        <instrs>
+    _B1:
+        ...
+        cmpxchgq ...
+        jne _B1
+        <instrs>
+        <end _B1>
+    _B2:
+        ...
+        cmpxchgq ...
+        jne _B2
+        <instrs>
+        jmp loop
+
+    There is no edge _B2 -> _B1 here. It's still a self loop onto _B1.
+
+    The problem here is that really B1 should be two basic blocks.
+    Otherwise we have control flow in the *middle* of a basic block.
+    A contradiction!
+
+    So to account for this we add yet another basic block marker:
+
+    _B:
+        <instrs>
+    _B1:
+        ...
+        cmpxchgq ...
+        jne _B1
+        jmp _B1'
+    _B1':
+        <instrs>
+        <end _B1>
+    _B2:
+        ...
+
+    Now when inserting B2 we will only look at the outgoing edges of B1' and
+    everything will work out nicely.
+
+    You might also wonder why we don't insert jumps at the end of _B1'. There is
+    no way another block ends up jumping to the labels _B1 or _B2 since they are
+    essentially invisible to other blocks. View them as control flow labels local
+    to the basic block if you'd like.
+
+    Not doing this ultimately caused (part 2 of) #17334.
+-}
+
 
 -- -----------------------------------------------------------------------------
 --  Generating C calls
@@ -1711,15 +2021,170 @@ genCCall
     -> ForeignTarget            -- function to call
     -> [CmmFormal]        -- where to put the result
     -> [CmmActual]        -- arguments (of mixed type)
+    -> BlockId      -- The block we are in
+    -> NatM (InstrBlock, Maybe BlockId)
+
+-- First we deal with cases which might introduce new blocks in the stream.
+
+genCCall dflags is32Bit (PrimTarget (MO_AtomicRMW width amop))
+                                           [dst] [addr, n] bid = do
+    use_sse2 <- sse2Enabled
+    Amode amode addr_code <-
+        if amop `elem` [AMO_Add, AMO_Sub]
+        then getAmode addr
+        else getSimpleAmode dflags is32Bit addr  -- See genCCall for MO_Cmpxchg
+    arg <- getNewRegNat format
+    arg_code <- getAnyReg n
+    let platform = targetPlatform dflags
+        dst_r    = getRegisterReg platform use_sse2 (CmmLocal dst)
+    (code, lbl) <- op_code dst_r arg amode
+    return (addr_code `appOL` arg_code arg `appOL` code, Just lbl)
+  where
+    -- Code for the operation
+    op_code :: Reg       -- Destination reg
+            -> Reg       -- Register containing argument
+            -> AddrMode  -- Address of location to mutate
+            -> NatM (OrdList Instr,BlockId) -- TODO: Return Maybe BlockId
+    op_code dst_r arg amode = case amop of
+        -- In the common case where dst_r is a virtual register the
+        -- final move should go away, because it's the last use of arg
+        -- and the first use of dst_r.
+        AMO_Add  -> return $ (toOL [ LOCK (XADD format (OpReg arg) (OpAddr amode))
+                                  , MOV format (OpReg arg) (OpReg dst_r)
+                                  ], bid)
+        AMO_Sub  -> return $ (toOL [ NEGI format (OpReg arg)
+                                  , LOCK (XADD format (OpReg arg) (OpAddr amode))
+                                  , MOV format (OpReg arg) (OpReg dst_r)
+                                  ], bid)
+        -- In these cases we need a new block id, and have to return it so
+        -- that later instruction selection can reference it.
+        AMO_And  -> cmpxchg_code (\ src dst -> unitOL $ AND format src dst)
+        AMO_Nand -> cmpxchg_code (\ src dst -> toOL [ AND format src dst
+                                                    , NOT format dst
+                                                    ])
+        AMO_Or   -> cmpxchg_code (\ src dst -> unitOL $ OR format src dst)
+        AMO_Xor  -> cmpxchg_code (\ src dst -> unitOL $ XOR format src dst)
+      where
+        -- Simulate operation that lacks a dedicated instruction using
+        -- cmpxchg.
+        cmpxchg_code :: (Operand -> Operand -> OrdList Instr)
+                     -> NatM (OrdList Instr, BlockId)
+        cmpxchg_code instrs = do
+            lbl1 <- getBlockIdNat
+            lbl2 <- getBlockIdNat
+            tmp <- getNewRegNat format
+
+            --Record inserted blocks
+            --  We turn A -> B into A -> A' -> A'' -> B
+            --  with a self loop on A'.
+            addImmediateSuccessorNat bid lbl1
+            addImmediateSuccessorNat lbl1 lbl2
+            updateCfgNat (addWeightEdge lbl1 lbl1 0)
+
+            return $ (toOL
+                [ MOV format (OpAddr amode) (OpReg eax)
+                , JXX ALWAYS lbl1
+                , NEWBLOCK lbl1
+                  -- Keep old value so we can return it:
+                , MOV format (OpReg eax) (OpReg dst_r)
+                , MOV format (OpReg eax) (OpReg tmp)
+                ]
+                `appOL` instrs (OpReg arg) (OpReg tmp) `appOL` toOL
+                [ LOCK (CMPXCHG format (OpReg tmp) (OpAddr amode))
+                , JXX NE lbl1
+                -- See Note [Introducing cfg edges inside basic blocks]
+                -- why this basic block is required.
+                , JXX ALWAYS lbl2
+                , NEWBLOCK lbl2
+                ],
+                lbl2)
+    format = intFormat width
+
+genCCall dflags is32Bit (PrimTarget (MO_Ctz width)) [dst] [src] bid
+  | is32Bit, width == W64 = do
+      ChildCode64 vcode rlo <- iselExpr64 src
+      use_sse2 <- sse2Enabled
+      let rhi     = getHiVRegFromLo rlo
+          dst_r   = getRegisterReg platform use_sse2 (CmmLocal dst)
+      lbl1 <- getBlockIdNat
+      lbl2 <- getBlockIdNat
+      let format = if width == W8 then II16 else intFormat width
+      tmp_r <- getNewRegNat format
+
+      -- New CFG Edges:
+      --  bid -> lbl2
+      --  bid -> lbl1 -> lbl2
+      --  We also changes edges originating at bid to start at lbl2 instead.
+      updateCfgNat (addWeightEdge bid lbl1 110 .
+                    addWeightEdge lbl1 lbl2 110 .
+                    addImmediateSuccessor bid lbl2)
+
+      -- The following instruction sequence corresponds to the pseudo-code
+      --
+      --  if (src) {
+      --    dst = src.lo32 ? BSF(src.lo32) : (BSF(src.hi32) + 32);
+      --  } else {
+      --    dst = 64;
+      --  }
+      let instrs = vcode `appOL` toOL
+               ([ MOV      II32 (OpReg rhi)         (OpReg tmp_r)
+                , OR       II32 (OpReg rlo)         (OpReg tmp_r)
+                , MOV      II32 (OpImm (ImmInt 64)) (OpReg dst_r)
+                , JXX EQQ    lbl2
+                , JXX ALWAYS lbl1
+
+                , NEWBLOCK   lbl1
+                , BSF     II32 (OpReg rhi)         dst_r
+                , ADD     II32 (OpImm (ImmInt 32)) (OpReg dst_r)
+                , BSF     II32 (OpReg rlo)         tmp_r
+                , CMOV NE II32 (OpReg tmp_r)       dst_r
+                , JXX ALWAYS lbl2
+
+                , NEWBLOCK   lbl2
+                ])
+      return (instrs, Just lbl2)
+
+  | otherwise = do
+    code_src <- getAnyReg src
+    use_sse2 <- sse2Enabled
+    let dst_r = getRegisterReg platform use_sse2 (CmmLocal dst)
+
+    -- The following insn sequence makes sure 'ctz 0' has a defined value.
+    -- starting with Haswell, one could use the TZCNT insn instead.
+    let format = if width == W8 then II16 else intFormat width
+    src_r <- getNewRegNat format
+    tmp_r <- getNewRegNat format
+    let instrs = code_src src_r `appOL` toOL
+              ([ MOVZxL  II8    (OpReg src_r) (OpReg src_r) | width == W8 ] ++
+              [ BSF     format (OpReg src_r) tmp_r
+              , MOV     II32   (OpImm (ImmInt bw)) (OpReg dst_r)
+              , CMOV NE format (OpReg tmp_r) dst_r
+              ]) -- NB: We don't need to zero-extend the result for the
+                  -- W8/W16 cases because the 'MOV' insn already
+                  -- took care of implicitly clearing the upper bits
+    return (instrs, Nothing)
+  where
+    bw = widthInBits width
+    platform = targetPlatform dflags
+
+genCCall dflags bits mop dst args bid = do
+  instr <- genCCall' dflags bits mop dst args bid
+  return (instr, Nothing)
+
+-- genCCall' handles cases not introducing new code blocks.
+genCCall'
+    :: DynFlags
+    -> Bool                     -- 32 bit platform?
+    -> ForeignTarget            -- function to call
+    -> [CmmFormal]        -- where to put the result
+    -> [CmmActual]        -- arguments (of mixed type)
+    -> BlockId      -- The block we are in
     -> NatM InstrBlock
 
--- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-
--- Unroll memcpy calls if the source and destination pointers are at
--- least DWORD aligned and the number of bytes to copy isn't too
+-- Unroll memcpy calls if the number of bytes to copy isn't too
 -- large.  Otherwise, call C's memcpy.
-genCCall dflags is32Bit (PrimTarget (MO_Memcpy align)) _
-         [dst, src, CmmLit (CmmInt n _)]
+genCCall' dflags is32Bit (PrimTarget (MO_Memcpy align)) _
+         [dst, src, CmmLit (CmmInt n _)] _
     | fromInteger insns <= maxInlineMemcpyInsns dflags && align .&. 3 == 0 = do
         code_dst <- getAnyReg dst
         dst_r <- getNewRegNat format
@@ -1765,10 +2230,11 @@ genCCall dflags is32Bit (PrimTarget (MO_Memcpy align)) _
         dst_addr = AddrBaseIndex (EABaseReg dst) EAIndexNone
                    (ImmInteger (n - i))
 
-genCCall dflags _ (PrimTarget (MO_Memset align)) _
+genCCall' dflags _ (PrimTarget (MO_Memset align)) _
          [dst,
           CmmLit (CmmInt c _),
           CmmLit (CmmInt n _)]
+         _
     | fromInteger insns <= maxInlineMemsetInsns dflags && align .&. 3 == 0 = do
         code_dst <- getAnyReg dst
         dst_r <- getNewRegNat format
@@ -1809,13 +2275,14 @@ genCCall dflags _ (PrimTarget (MO_Memset align)) _
         dst_addr = AddrBaseIndex (EABaseReg dst) EAIndexNone
                    (ImmInteger (n - i))
 
-genCCall _ _ (PrimTarget MO_WriteBarrier) _ _ = return nilOL
-        -- write barrier compiles to no code on x86/x86-64;
+genCCall' _ _ (PrimTarget MO_ReadBarrier) _ _ _  = return nilOL
+genCCall' _ _ (PrimTarget MO_WriteBarrier) _ _ _ = return nilOL
+        -- barriers compile to no code on x86/x86-64;
         -- we keep it this long in order to prevent earlier optimisations.
 
-genCCall _ _ (PrimTarget MO_Touch) _ _ = return nilOL
+genCCall' _ _ (PrimTarget MO_Touch) _ _ _ = return nilOL
 
-genCCall _ is32bit (PrimTarget (MO_Prefetch_Data n )) _  [src] =
+genCCall' _ is32bit (PrimTarget (MO_Prefetch_Data n )) _  [src] _ =
         case n of
             0 -> genPrefetch src $ PREFETCH NTA  format
             1 -> genPrefetch src $ PREFETCH Lvl2 format
@@ -1836,9 +2303,10 @@ genCCall _ is32bit (PrimTarget (MO_Prefetch_Data n )) _  [src] =
                               ((AddrBaseIndex (EABaseReg src_r )   EAIndexNone (ImmInt 0))))  ))
                   -- prefetch always takes an address
 
-genCCall dflags is32Bit (PrimTarget (MO_BSwap width)) [dst] [src] = do
+genCCall' dflags is32Bit (PrimTarget (MO_BSwap width)) [dst] [src] _ = do
     let platform = targetPlatform dflags
-    let dst_r = getRegisterReg platform False (CmmLocal dst)
+    use_sse2 <- sse2Enabled
+    let dst_r = getRegisterReg platform use_sse2 (CmmLocal dst)
     case width of
         W64 | is32Bit -> do
                ChildCode64 vcode rlo <- iselExpr64 src
@@ -1858,8 +2326,8 @@ genCCall dflags is32Bit (PrimTarget (MO_BSwap width)) [dst] [src] = do
   where
     format = intFormat width
 
-genCCall dflags is32Bit (PrimTarget (MO_PopCnt width)) dest_regs@[dst]
-         args@[src] = do
+genCCall' dflags is32Bit (PrimTarget (MO_PopCnt width)) dest_regs@[dst]
+         args@[src] bid = do
     sse4_2 <- sse4_2Enabled
     let platform = targetPlatform dflags
     if sse4_2
@@ -1884,20 +2352,21 @@ genCCall dflags is32Bit (PrimTarget (MO_PopCnt width)) dest_regs@[dst]
             let target = ForeignTarget targetExpr (ForeignConvention CCallConv
                                                            [NoHint] [NoHint]
                                                            CmmMayReturn)
-            genCCall dflags is32Bit target dest_regs args
+            genCCall' dflags is32Bit target dest_regs args bid
   where
     format = intFormat width
     lbl = mkCmmCodeLabel primUnitId (fsLit (popCntLabel width))
 
-genCCall dflags is32Bit (PrimTarget (MO_Pdep width)) dest_regs@[dst]
-         args@[src, mask] = do
+genCCall' dflags is32Bit (PrimTarget (MO_Pdep width)) dest_regs@[dst]
+         args@[src, mask] bid = do
     let platform = targetPlatform dflags
+    use_sse2 <- sse2Enabled
     if isBmi2Enabled dflags
         then do code_src  <- getAnyReg src
                 code_mask <- getAnyReg mask
                 src_r     <- getNewRegNat format
                 mask_r    <- getNewRegNat format
-                let dst_r = getRegisterReg platform False (CmmLocal dst)
+                let dst_r = getRegisterReg platform use_sse2 (CmmLocal dst)
                 return $ code_src src_r `appOL` code_mask mask_r `appOL`
                     (if width == W8 then
                          -- The PDEP instruction doesn't take a r/m8
@@ -1917,20 +2386,21 @@ genCCall dflags is32Bit (PrimTarget (MO_Pdep width)) dest_regs@[dst]
             let target = ForeignTarget targetExpr (ForeignConvention CCallConv
                                                            [NoHint] [NoHint]
                                                            CmmMayReturn)
-            genCCall dflags is32Bit target dest_regs args
+            genCCall' dflags is32Bit target dest_regs args bid
   where
     format = intFormat width
     lbl = mkCmmCodeLabel primUnitId (fsLit (pdepLabel width))
 
-genCCall dflags is32Bit (PrimTarget (MO_Pext width)) dest_regs@[dst]
-         args@[src, mask] = do
+genCCall' dflags is32Bit (PrimTarget (MO_Pext width)) dest_regs@[dst]
+         args@[src, mask] bid = do
     let platform = targetPlatform dflags
+    use_sse2 <- sse2Enabled
     if isBmi2Enabled dflags
         then do code_src  <- getAnyReg src
                 code_mask <- getAnyReg mask
                 src_r     <- getNewRegNat format
                 mask_r    <- getNewRegNat format
-                let dst_r = getRegisterReg platform False (CmmLocal dst)
+                let dst_r = getRegisterReg platform use_sse2 (CmmLocal dst)
                 return $ code_src src_r `appOL` code_mask mask_r `appOL`
                     (if width == W8 then
                          -- The PEXT instruction doesn't take a r/m8
@@ -1950,19 +2420,19 @@ genCCall dflags is32Bit (PrimTarget (MO_Pext width)) dest_regs@[dst]
             let target = ForeignTarget targetExpr (ForeignConvention CCallConv
                                                            [NoHint] [NoHint]
                                                            CmmMayReturn)
-            genCCall dflags is32Bit target dest_regs args
+            genCCall' dflags is32Bit target dest_regs args bid
   where
     format = intFormat width
     lbl = mkCmmCodeLabel primUnitId (fsLit (pextLabel width))
 
-genCCall dflags is32Bit (PrimTarget (MO_Clz width)) dest_regs@[dst] args@[src]
+genCCall' dflags is32Bit (PrimTarget (MO_Clz width)) dest_regs@[dst] args@[src] bid
   | is32Bit && width == W64 = do
     -- Fallback to `hs_clz64` on i386
     targetExpr <- cmmMakeDynamicReference dflags CallReference lbl
     let target = ForeignTarget targetExpr (ForeignConvention CCallConv
                                            [NoHint] [NoHint]
                                            CmmMayReturn)
-    genCCall dflags is32Bit target dest_regs args
+    genCCall' dflags is32Bit target dest_regs args bid
 
   | otherwise = do
     code_src <- getAnyReg src
@@ -1987,148 +2457,37 @@ genCCall dflags is32Bit (PrimTarget (MO_Clz width)) dest_regs@[dst] args@[src]
     format = if width == W8 then II16 else intFormat width
     lbl = mkCmmCodeLabel primUnitId (fsLit (clzLabel width))
 
-genCCall dflags is32Bit (PrimTarget (MO_Ctz width)) [dst] [src]
-  | is32Bit, width == W64 = do
-      ChildCode64 vcode rlo <- iselExpr64 src
-      let rhi     = getHiVRegFromLo rlo
-          dst_r   = getRegisterReg platform False (CmmLocal dst)
-      lbl1 <- getBlockIdNat
-      lbl2 <- getBlockIdNat
-      tmp_r <- getNewRegNat format
-
-      -- The following instruction sequence corresponds to the pseudo-code
-      --
-      --  if (src) {
-      --    dst = src.lo32 ? BSF(src.lo32) : (BSF(src.hi32) + 32);
-      --  } else {
-      --    dst = 64;
-      --  }
-      return $ vcode `appOL` toOL
-               ([ MOV      II32 (OpReg rhi)         (OpReg tmp_r)
-                , OR       II32 (OpReg rlo)         (OpReg tmp_r)
-                , MOV      II32 (OpImm (ImmInt 64)) (OpReg dst_r)
-                , JXX EQQ    lbl2
-                , JXX ALWAYS lbl1
-
-                , NEWBLOCK   lbl1
-                , BSF     II32 (OpReg rhi)         dst_r
-                , ADD     II32 (OpImm (ImmInt 32)) (OpReg dst_r)
-                , BSF     II32 (OpReg rlo)         tmp_r
-                , CMOV NE II32 (OpReg tmp_r)       dst_r
-                , JXX ALWAYS lbl2
-
-                , NEWBLOCK   lbl2
-                ])
-
-  | otherwise = do
-    code_src <- getAnyReg src
-    src_r <- getNewRegNat format
-    tmp_r <- getNewRegNat format
-    let dst_r = getRegisterReg platform False (CmmLocal dst)
-
-    -- The following insn sequence makes sure 'ctz 0' has a defined value.
-    -- starting with Haswell, one could use the TZCNT insn instead.
-    return $ code_src src_r `appOL` toOL
-             ([ MOVZxL  II8    (OpReg src_r) (OpReg src_r) | width == W8 ] ++
-              [ BSF     format (OpReg src_r) tmp_r
-              , MOV     II32   (OpImm (ImmInt bw)) (OpReg dst_r)
-              , CMOV NE format (OpReg tmp_r) dst_r
-              ]) -- NB: We don't need to zero-extend the result for the
-                 -- W8/W16 cases because the 'MOV' insn already
-                 -- took care of implicitly clearing the upper bits
-  where
-    bw = widthInBits width
-    platform = targetPlatform dflags
-    format = if width == W8 then II16 else intFormat width
-
-genCCall dflags is32Bit (PrimTarget (MO_UF_Conv width)) dest_regs args = do
+genCCall' dflags is32Bit (PrimTarget (MO_UF_Conv width)) dest_regs args bid = do
     targetExpr <- cmmMakeDynamicReference dflags
                   CallReference lbl
     let target = ForeignTarget targetExpr (ForeignConvention CCallConv
                                            [NoHint] [NoHint]
                                            CmmMayReturn)
-    genCCall dflags is32Bit target dest_regs args
+    genCCall' dflags is32Bit target dest_regs args bid
   where
     lbl = mkCmmCodeLabel primUnitId (fsLit (word2FloatLabel width))
 
-genCCall dflags is32Bit (PrimTarget (MO_AtomicRMW width amop)) [dst] [addr, n] = do
-    Amode amode addr_code <-
-        if amop `elem` [AMO_Add, AMO_Sub]
-        then getAmode addr
-        else getSimpleAmode dflags is32Bit addr  -- See genCCall for MO_Cmpxchg
-    arg <- getNewRegNat format
-    arg_code <- getAnyReg n
-    use_sse2 <- sse2Enabled
-    let platform = targetPlatform dflags
-        dst_r    = getRegisterReg platform use_sse2 (CmmLocal dst)
-    code <- op_code dst_r arg amode
-    return $ addr_code `appOL` arg_code arg `appOL` code
-  where
-    -- Code for the operation
-    op_code :: Reg       -- Destination reg
-            -> Reg       -- Register containing argument
-            -> AddrMode  -- Address of location to mutate
-            -> NatM (OrdList Instr)
-    op_code dst_r arg amode = case amop of
-        -- In the common case where dst_r is a virtual register the
-        -- final move should go away, because it's the last use of arg
-        -- and the first use of dst_r.
-        AMO_Add  -> return $ toOL [ LOCK (XADD format (OpReg arg) (OpAddr amode))
-                                  , MOV format (OpReg arg) (OpReg dst_r)
-                                  ]
-        AMO_Sub  -> return $ toOL [ NEGI format (OpReg arg)
-                                  , LOCK (XADD format (OpReg arg) (OpAddr amode))
-                                  , MOV format (OpReg arg) (OpReg dst_r)
-                                  ]
-        AMO_And  -> cmpxchg_code (\ src dst -> unitOL $ AND format src dst)
-        AMO_Nand -> cmpxchg_code (\ src dst -> toOL [ AND format src dst
-                                                    , NOT format dst
-                                                    ])
-        AMO_Or   -> cmpxchg_code (\ src dst -> unitOL $ OR format src dst)
-        AMO_Xor  -> cmpxchg_code (\ src dst -> unitOL $ XOR format src dst)
-      where
-        -- Simulate operation that lacks a dedicated instruction using
-        -- cmpxchg.
-        cmpxchg_code :: (Operand -> Operand -> OrdList Instr)
-                     -> NatM (OrdList Instr)
-        cmpxchg_code instrs = do
-            lbl <- getBlockIdNat
-            tmp <- getNewRegNat format
-            return $ toOL
-                [ MOV format (OpAddr amode) (OpReg eax)
-                , JXX ALWAYS lbl
-                , NEWBLOCK lbl
-                  -- Keep old value so we can return it:
-                , MOV format (OpReg eax) (OpReg dst_r)
-                , MOV format (OpReg eax) (OpReg tmp)
-                ]
-                `appOL` instrs (OpReg arg) (OpReg tmp) `appOL` toOL
-                [ LOCK (CMPXCHG format (OpReg tmp) (OpAddr amode))
-                , JXX NE lbl
-                ]
-
-    format = intFormat width
-
-genCCall dflags _ (PrimTarget (MO_AtomicRead width)) [dst] [addr] = do
+genCCall' dflags _ (PrimTarget (MO_AtomicRead width)) [dst] [addr] _ = do
   load_code <- intLoadCode (MOV (intFormat width)) addr
   let platform = targetPlatform dflags
   use_sse2 <- sse2Enabled
+
   return (load_code (getRegisterReg platform use_sse2 (CmmLocal dst)))
 
-genCCall _ _ (PrimTarget (MO_AtomicWrite width)) [] [addr, val] = do
+genCCall' _ _ (PrimTarget (MO_AtomicWrite width)) [] [addr, val] _ = do
     code <- assignMem_IntCode (intFormat width) addr val
     return $ code `snocOL` MFENCE
 
-genCCall dflags is32Bit (PrimTarget (MO_Cmpxchg width)) [dst] [addr, old, new] = do
+genCCall' dflags is32Bit (PrimTarget (MO_Cmpxchg width)) [dst] [addr, old, new] _ = do
     -- On x86 we don't have enough registers to use cmpxchg with a
     -- complicated addressing mode, so on that architecture we
     -- pre-compute the address first.
+    use_sse2 <- sse2Enabled
     Amode amode addr_code <- getSimpleAmode dflags is32Bit addr
     newval <- getNewRegNat format
     newval_code <- getAnyReg new
     oldval <- getNewRegNat format
     oldval_code <- getAnyReg old
-    use_sse2 <- sse2Enabled
     let platform = targetPlatform dflags
         dst_r    = getRegisterReg platform use_sse2 (CmmLocal dst)
         code     = toOL
@@ -2141,14 +2500,14 @@ genCCall dflags is32Bit (PrimTarget (MO_Cmpxchg width)) [dst] [addr, old, new] =
   where
     format = intFormat width
 
-genCCall _ is32Bit target dest_regs args = do
+genCCall' _ is32Bit target dest_regs args bid = do
   dflags <- getDynFlags
   let platform = targetPlatform dflags
       sse2     = isSse2Enabled dflags
   case (target, dest_regs) of
     -- void return type prim op
     (PrimTarget op, []) ->
-        outOfLineCmmOp op Nothing args
+        outOfLineCmmOp bid op Nothing args
     -- we only cope with a single result for foreign calls
     (PrimTarget op, [r])
       | sse2 -> case op of
@@ -2161,12 +2520,12 @@ genCCall _ is32Bit target dest_regs args = do
 
           MO_F32_Sqrt -> actuallyInlineSSE2Op (\fmt r -> SQRT fmt (OpReg r)) FF32 args
           MO_F64_Sqrt -> actuallyInlineSSE2Op (\fmt r -> SQRT fmt (OpReg r)) FF64 args
-          _other_op -> outOfLineCmmOp op (Just r) args
+          _other_op -> outOfLineCmmOp bid op (Just r) args
       | otherwise -> do
         l1 <- getNewLabelNat
         l2 <- getNewLabelNat
         if sse2
-          then outOfLineCmmOp op (Just r) args
+          then outOfLineCmmOp bid op (Just r) args
           else case op of
               MO_F32_Sqrt -> actuallyInlineFloatOp GSQRT FF32 args
               MO_F64_Sqrt -> actuallyInlineFloatOp GSQRT FF64 args
@@ -2180,7 +2539,7 @@ genCCall _ is32Bit target dest_regs args = do
               MO_F32_Tan  -> actuallyInlineFloatOp (\s -> GTAN s l1 l2) FF32 args
               MO_F64_Tan  -> actuallyInlineFloatOp (\s -> GTAN s l1 l2) FF64 args
 
-              _other_op   -> outOfLineCmmOp op (Just r) args
+              _other_op   -> outOfLineCmmOp bid op (Just r) args
 
        where
         actuallyInlineFloatOp = actuallyInlineFloatOp' False
@@ -2265,6 +2624,18 @@ genCCall _ is32Bit target dest_regs args = do
             = divOp platform signed width results (Just arg_x_high) arg_x_low arg_y
         divOp2 _ _ _ _ _
             = panic "genCCall: Wrong number of arguments for divOp2"
+
+        -- See Note [DIV/IDIV for bytes]
+        divOp platform signed W8 [res_q, res_r] m_arg_x_high arg_x_low arg_y =
+            let widen | signed = MO_SS_Conv W8 W16
+                      | otherwise = MO_UU_Conv W8 W16
+                arg_x_low_16 = CmmMachOp widen [arg_x_low]
+                arg_y_16 = CmmMachOp widen [arg_y]
+                m_arg_x_high_16 = (\p -> CmmMachOp widen [p]) <$> m_arg_x_high
+            in divOp
+                  platform signed W16 [res_q, res_r]
+                  m_arg_x_high_16 arg_x_low_16 arg_y_16
+
         divOp platform signed width [res_q, res_r]
               m_arg_x_high arg_x_low arg_y
             = do let format = intFormat width
@@ -2306,6 +2677,22 @@ genCCall _ is32Bit target dest_regs args = do
         addSubIntC _ _ _ _ _ _ _ _
             = panic "genCCall: Wrong number of arguments/results for addSubIntC"
 
+-- Note [DIV/IDIV for bytes]
+--
+-- IDIV reminder:
+--   Size    Dividend   Divisor   Quotient    Remainder
+--   byte    %ax         r/m8      %al          %ah
+--   word    %dx:%ax     r/m16     %ax          %dx
+--   dword   %edx:%eax   r/m32     %eax         %edx
+--   qword   %rdx:%rax   r/m64     %rax         %rdx
+--
+-- We do a special case for the byte division because the current
+-- codegen doesn't deal well with accessing %ah register (also,
+-- accessing %ah in 64-bit mode is complicated because it cannot be an
+-- operand of many instructions). So we just widen operands to 16 bits
+-- and get the results from %al, %dl. This is not optimal, but a few
+-- register moves are probably not a huge deal when doing division.
+
 genCCall32' :: DynFlags
             -> ForeignTarget            -- function to call
             -> [CmmFormal]        -- where to put the result
@@ -2318,7 +2705,7 @@ genCCall32' dflags target dest_regs args = do
             -- Align stack to 16n for calls, assuming a starting stack
             -- alignment of 16n - word_size on procedure entry. Which we
             -- maintiain. See Note [rts/StgCRun.c : Stack Alignment on X86]
-            sizes               = map (arg_size . cmmExprType dflags) (reverse args)
+            sizes               = map (arg_size_bytes . cmmExprType dflags) (reverse args)
             raw_arg_size        = sum sizes + wORD_SIZE dflags
             arg_pad_size        = (roundTo 16 $ raw_arg_size) - raw_arg_size
             tot_arg_size        = raw_arg_size + arg_pad_size - wORD_SIZE dflags
@@ -2409,8 +2796,9 @@ genCCall32' dflags target dest_regs args = do
                 assign_code dest_regs)
 
       where
-        arg_size :: CmmType -> Int  -- Width in bytes
-        arg_size ty = widthInBytes (typeWidth ty)
+        -- If the size is smaller than the word, we widen things (see maybePromoteCArg)
+        arg_size_bytes :: CmmType -> Int
+        arg_size_bytes ty = max (widthInBytes (typeWidth ty)) (widthInBytes (wordWidth dflags))
 
         roundTo a x | x `mod` a == 0 = x
                     | otherwise = x + a - (x `mod` a)
@@ -2449,6 +2837,10 @@ genCCall32' dflags target dest_regs args = do
                            )
 
           | otherwise = do
+            -- Arguments can be smaller than 32-bit, but we still use @PUSH
+            -- II32@ - the usual calling conventions expect integers to be
+            -- 4-byte aligned.
+            ASSERT((typeWidth arg_ty) <= W32) return ()
             (operand, code) <- getOperand arg
             delta <- getDeltaNat
             setDeltaNat (delta-size)
@@ -2458,7 +2850,7 @@ genCCall32' dflags target dest_regs args = do
 
           where
              arg_ty = cmmExprType dflags arg
-             size = arg_size arg_ty -- Byte size
+             size = arg_size_bytes arg_ty -- Byte size
 
 genCCall64' :: DynFlags
             -> ForeignTarget      -- function to call
@@ -2688,7 +3080,10 @@ genCCall64' dflags target dest_regs args = do
              push_args rest code'
 
            | otherwise = do
-             ASSERT(width == W64) return ()
+             -- Arguments can be smaller than 64-bit, but we still use @PUSH
+             -- II64@ - the usual calling conventions expect integers to be
+             -- 8-byte aligned.
+             ASSERT(width <= W64) return ()
              (arg_op, arg_code) <- getOperand arg
              delta <- getDeltaNat
              setDeltaNat (delta-arg_size)
@@ -2714,15 +3109,17 @@ maybePromoteCArg dflags wto arg
  where
    wfrom = cmmExprWidth dflags arg
 
-outOfLineCmmOp :: CallishMachOp -> Maybe CmmFormal -> [CmmActual] -> NatM InstrBlock
-outOfLineCmmOp mop res args
+outOfLineCmmOp :: BlockId -> CallishMachOp -> Maybe CmmFormal -> [CmmActual]
+               -> NatM InstrBlock
+outOfLineCmmOp bid mop res args
   = do
       dflags <- getDynFlags
       targetExpr <- cmmMakeDynamicReference dflags CallReference lbl
       let target = ForeignTarget targetExpr
                            (ForeignConvention CCallConv [] [] CmmMayReturn)
 
-      stmtToInstrs (CmmUnsafeForeignCall target (catMaybes [res]) args)
+      (instrs, _) <- stmtToInstrs bid (CmmUnsafeForeignCall target (catMaybes [res]) args)
+      return instrs
   where
         -- Assume we can call these functions directly, and that they're not in a dynamic library.
         -- TODO: Why is this ok? Under linux this code will be in libm.so
@@ -2747,6 +3144,10 @@ outOfLineCmmOp mop res args
               MO_F32_Tanh  -> fsLit "tanhf"
               MO_F32_Pwr   -> fsLit "powf"
 
+              MO_F32_Asinh -> fsLit "asinhf"
+              MO_F32_Acosh -> fsLit "acoshf"
+              MO_F32_Atanh -> fsLit "atanhf"
+
               MO_F64_Sqrt  -> fsLit "sqrt"
               MO_F64_Fabs  -> fsLit "fabs"
               MO_F64_Sin   -> fsLit "sin"
@@ -2763,6 +3164,10 @@ outOfLineCmmOp mop res args
               MO_F64_Cosh  -> fsLit "cosh"
               MO_F64_Tanh  -> fsLit "tanh"
               MO_F64_Pwr   -> fsLit "pow"
+
+              MO_F64_Asinh  -> fsLit "asinh"
+              MO_F64_Acosh  -> fsLit "acosh"
+              MO_F64_Atanh  -> fsLit "atanh"
 
               MO_Memcpy _  -> fsLit "memcpy"
               MO_Memset _  -> fsLit "memset"
@@ -2793,6 +3198,7 @@ outOfLineCmmOp mop res args
               MO_AddWordC {}   -> unsupported
               MO_SubWordC {}   -> unsupported
               MO_U_Mul2 {}     -> unsupported
+              MO_ReadBarrier   -> unsupported
               MO_WriteBarrier  -> unsupported
               MO_Touch         -> unsupported
               (MO_Prefetch_Data _ ) -> unsupported
@@ -2910,6 +3316,59 @@ condIntReg cond x y = do
   return (Any II32 code)
 
 
+-----------------------------------------------------------
+---          Note [SSE Parity Checks]                   ---
+-----------------------------------------------------------
+
+-- We have to worry about unordered operands (eg. comparisons
+-- against NaN).  If the operands are unordered, the comparison
+-- sets the parity flag, carry flag and zero flag.
+-- All comparisons are supposed to return false for unordered
+-- operands except for !=, which returns true.
+--
+-- Optimisation: we don't have to test the parity flag if we
+-- know the test has already excluded the unordered case: eg >
+-- and >= test for a zero carry flag, which can only occur for
+-- ordered operands.
+--
+-- By reversing comparisons we can avoid testing the parity
+-- for < and <= as well. If any of the arguments is an NaN we
+-- return false either way. If both arguments are valid then
+-- x <= y  <->  y >= x  holds. So it's safe to swap these.
+--
+-- We invert the condition inside getRegister'and  getCondCode
+-- which should cover all invertable cases.
+-- All other functions translating FP comparisons to assembly
+-- use these to two generate the comparison code.
+--
+-- As an example consider a simple check:
+--
+-- func :: Float -> Float -> Int
+-- func x y = if x < y then 1 else 0
+--
+-- Which in Cmm gives the floating point comparison.
+--
+--  if (%MO_F_Lt_W32(F1, F2)) goto c2gg; else goto c2gf;
+--
+-- We used to compile this to an assembly code block like this:
+-- _c2gh:
+--  ucomiss %xmm2,%xmm1
+--  jp _c2gf
+--  jb _c2gg
+--  jmp _c2gf
+--
+-- Where we have to introduce an explicit
+-- check for unordered results (using jmp parity):
+--
+-- We can avoid this by exchanging the arguments and inverting the direction
+-- of the comparison. This results in the sequence of:
+--
+--  ucomiss %xmm1,%xmm2
+--  ja _c2g2
+--  jmp _c2g1
+--
+-- Removing the jump reduces the pressure on the branch predidiction system
+-- and plays better with the uOP cache.
 
 condFltReg :: Bool -> Cond -> CmmExpr -> CmmExpr -> NatM Register
 condFltReg is32Bit cond x y = if_sse2 condFltReg_sse2 condFltReg_x87
@@ -2928,27 +3387,18 @@ condFltReg is32Bit cond x y = if_sse2 condFltReg_sse2 condFltReg_x87
     CondCode _ cond cond_code <- condFltCode cond x y
     tmp1 <- getNewRegNat (archWordFormat is32Bit)
     tmp2 <- getNewRegNat (archWordFormat is32Bit)
-    let
-        -- We have to worry about unordered operands (eg. comparisons
-        -- against NaN).  If the operands are unordered, the comparison
-        -- sets the parity flag, carry flag and zero flag.
-        -- All comparisons are supposed to return false for unordered
-        -- operands except for !=, which returns true.
-        --
-        -- Optimisation: we don't have to test the parity flag if we
-        -- know the test has already excluded the unordered case: eg >
-        -- and >= test for a zero carry flag, which can only occur for
-        -- ordered operands.
-        --
-        -- ToDo: by reversing comparisons we could avoid testing the
-        -- parity flag in more cases.
-
+    let -- See Note [SSE Parity Checks]
         code dst =
            cond_code `appOL`
              (case cond of
                 NE  -> or_unordered dst
                 GU  -> plain_test   dst
                 GEU -> plain_test   dst
+                -- Use ASSERT so we don't break releases if these creep in.
+                LTT -> ASSERT2(False, ppr "Should have been turned into >")
+                       and_ordered  dst
+                LE  -> ASSERT2(False, ppr "Should have been turned into >=")
+                       and_ordered  dst
                 _   -> and_ordered  dst)
 
         plain_test dst = toOL [
@@ -3238,3 +3688,59 @@ needLlvm :: NatM a
 needLlvm =
     sorry $ unlines ["The native code generator does not support vector"
                     ,"instructions. Please use -fllvm."]
+
+-- | This works on the invariant that all jumps in the given blocks are required.
+--   Starting from there we try to make a few more jumps redundant by reordering
+--   them.
+--   We depend on the information in the CFG to do so. Without a given CFG
+--   we do nothing.
+invertCondBranches :: Maybe CFG  -- ^ CFG if present
+                   -> LabelMap a -- ^ Blocks with info tables
+                   -> [NatBasicBlock Instr] -- ^ List of basic blocks
+                   -> [NatBasicBlock Instr]
+invertCondBranches Nothing _       bs = bs
+invertCondBranches (Just cfg) keep bs =
+    invert bs
+  where
+    invert :: [NatBasicBlock Instr] -> [NatBasicBlock Instr]
+    invert ((BasicBlock lbl1 ins@(_:_:_xs)):b2@(BasicBlock lbl2 _):bs)
+      | --pprTrace "Block" (ppr lbl1) True,
+        (jmp1,jmp2) <- last2 ins
+      , JXX cond1 target1 <- jmp1
+      , target1 == lbl2
+      --, pprTrace "CutChance" (ppr b1) True
+      , JXX ALWAYS target2 <- jmp2
+      -- We have enough information to check if we can perform the inversion
+      -- TODO: We could also check for the last asm instruction which sets
+      -- status flags instead. Which I suspect is worse in terms of compiler
+      -- performance, but might be applicable to more cases
+      , Just edgeInfo1 <- getEdgeInfo lbl1 target1 cfg
+      , Just edgeInfo2 <- getEdgeInfo lbl1 target2 cfg
+      -- Both jumps come from the same cmm statement
+      , transitionSource edgeInfo1 == transitionSource edgeInfo2
+      , CmmSource cmmCondBranch <- transitionSource edgeInfo1
+
+      --Int comparisons are invertable
+      , CmmCondBranch (CmmMachOp op _args) _ _ _ <- cmmCondBranch
+      , Just _ <- maybeIntComparison op
+      , Just invCond <- maybeInvertCond cond1
+
+      --Swap the last two jumps, invert the conditional jumps condition.
+      = let jumps =
+              case () of
+                -- We are free the eliminate the jmp. So we do so.
+                _ | not (mapMember target1 keep)
+                    -> [JXX invCond target2]
+                -- If the conditional target is unlikely we put the other
+                -- target at the front.
+                  | edgeWeight edgeInfo2 > edgeWeight edgeInfo1
+                    -> [JXX invCond target2, JXX ALWAYS target1]
+                -- Keep things as-is otherwise
+                  | otherwise
+                    -> [jmp1, jmp2]
+        in --pprTrace "Cutable" (ppr [jmp1,jmp2] <+> text "=>" <+> ppr jumps) $
+           (BasicBlock lbl1
+            (dropTail 2 ins ++ jumps))
+            : invert (b2:bs)
+    invert (b:bs) = b : invert bs
+    invert [] = []

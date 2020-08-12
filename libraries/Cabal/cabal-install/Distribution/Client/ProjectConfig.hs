@@ -1,4 +1,9 @@
-{-# LANGUAGE CPP, RecordWildCards, NamedFieldPuns, DeriveDataTypeable, LambdaCase #-}
+{-# LANGUAGE BangPatterns       #-}
+{-# LANGUAGE CPP                #-}
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE LambdaCase         #-}
+{-# LANGUAGE NamedFieldPuns     #-}
+{-# LANGUAGE RecordWildCards    #-}
 
 -- | Handling project configuration.
 --
@@ -74,6 +79,7 @@ import Distribution.Client.Config
 import Distribution.Client.HttpUtils
          ( HttpTransport, configureTransport, transportCheckHttps
          , downloadURI )
+import Distribution.Client.Utils.Parsec (renderParseError)
 
 import Distribution.Solver.Types.SourcePackage
 import Distribution.Solver.Types.Settings
@@ -82,17 +88,17 @@ import Distribution.Solver.Types.PackageConstraint
 
 import Distribution.Package
          ( PackageName, PackageId, packageId, UnitId )
-import Distribution.Types.Dependency
+import Distribution.Types.PackageVersionConstraint
+         ( PackageVersionConstraint(..) )
 import Distribution.System
          ( Platform )
 import Distribution.Types.GenericPackageDescription
          ( GenericPackageDescription )
 import Distribution.PackageDescription.Parsec
          ( parseGenericPackageDescription )
-import Distribution.Parsec.ParseResult
-         ( runParseResult )
-import Distribution.Parsec.Common as NewParser
-         ( PError, PWarning, showPWarning )
+import Distribution.Fields
+         ( runParseResult, PError, PWarning, showPWarning)
+import Distribution.Pretty ()
 import Distribution.Types.SourceRepo
          ( SourceRepo(..), RepoType(..), )
 import Distribution.Simple.Compiler
@@ -117,8 +123,8 @@ import Distribution.Verbosity
          ( Verbosity, modifyVerbosity, verbose )
 import Distribution.Version
          ( Version )
-import Distribution.Text
-import Distribution.ParseUtils as OldParser
+import Distribution.Deprecated.Text
+import qualified Distribution.Deprecated.ParseUtils as OldParser
          ( ParseResult(..), locatedErrorMsg, showPWarning )
 
 import qualified Codec.Archive.Tar       as Tar
@@ -130,8 +136,8 @@ import Control.Monad
 import Control.Monad.Trans (liftIO)
 import Control.Exception
 import Data.Either
-import qualified Data.ByteString      as BS
-import qualified Data.ByteString.Lazy as LBS
+import qualified Data.ByteString       as BS
+import qualified Data.ByteString.Lazy  as LBS
 import qualified Data.Map as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
@@ -154,10 +160,10 @@ import Network.URI
 -- 'PackageName'. This returns the configuration that applies to all local
 -- packages plus any package-specific configuration for this package.
 --
-lookupLocalPackageConfig :: (Semigroup a, Monoid a)
-                         => (PackageConfig -> a)
-                         -> ProjectConfig
-                         -> PackageName -> a
+lookupLocalPackageConfig
+  :: (Semigroup a, Monoid a)
+  => (PackageConfig -> a) -> ProjectConfig -> PackageName
+  -> a
 lookupLocalPackageConfig field ProjectConfig {
                            projectConfigLocalPackages,
                            projectConfigSpecificPackage
@@ -188,10 +194,10 @@ projectConfigWithBuilderRepoContext verbosity BuildTimeSettings{..} =
 -- that doesn't have an http transport. And that avoids having to have access
 -- to the 'BuildTimeSettings'
 --
-projectConfigWithSolverRepoContext :: Verbosity
-                                   -> ProjectConfigShared
-                                   -> ProjectConfigBuildOnly
-                                   -> (RepoContext -> IO a) -> IO a
+projectConfigWithSolverRepoContext
+  :: Verbosity -> ProjectConfigShared -> ProjectConfigBuildOnly
+  -> (RepoContext -> IO a)
+  -> IO a
 projectConfigWithSolverRepoContext verbosity
                                    ProjectConfigShared{..}
                                    ProjectConfigBuildOnly{..} =
@@ -199,8 +205,10 @@ projectConfigWithSolverRepoContext verbosity
       verbosity
       (fromNubList projectConfigRemoteRepos)
       (fromNubList projectConfigLocalRepos)
-      (fromFlagOrDefault (error "projectConfigWithSolverRepoContext: projectConfigCacheDir")
-                         projectConfigCacheDir)
+      (fromFlagOrDefault
+                   (error
+                    "projectConfigWithSolverRepoContext: projectConfigCacheDir")
+                   projectConfigCacheDir)
       (flagToMaybe projectConfigHttpTransport)
       (flagToMaybe projectConfigIgnoreExpiry)
       (fromNubList projectConfigProgPathExtra)
@@ -235,8 +243,10 @@ resolveSolverSettings ProjectConfig{
                                          | otherwise -> Just n
     solverSettingReorderGoals      = fromFlag projectConfigReorderGoals
     solverSettingCountConflicts    = fromFlag projectConfigCountConflicts
+    solverSettingMinimizeConflictSet = fromFlag projectConfigMinimizeConflictSet
     solverSettingStrongFlags       = fromFlag projectConfigStrongFlags
     solverSettingAllowBootLibInstalls = fromFlag projectConfigAllowBootLibInstalls
+    solverSettingOnlyConstrained   = fromFlag projectConfigOnlyConstrained
     solverSettingIndexState        = flagToMaybe projectConfigIndexState
     solverSettingIndependentGoals  = fromFlag projectConfigIndependentGoals
   --solverSettingShadowPkgs        = fromFlag projectConfigShadowPkgs
@@ -254,8 +264,10 @@ resolveSolverSettings ProjectConfig{
        projectConfigMaxBackjumps      = Flag defaultMaxBackjumps,
        projectConfigReorderGoals      = Flag (ReorderGoals False),
        projectConfigCountConflicts    = Flag (CountConflicts True),
+       projectConfigMinimizeConflictSet = Flag (MinimizeConflictSet False),
        projectConfigStrongFlags       = Flag (StrongFlags False),
        projectConfigAllowBootLibInstalls = Flag (AllowBootLibInstalls False),
+       projectConfigOnlyConstrained   = Flag OnlyConstrainedNone,
        projectConfigIndependentGoals  = Flag (IndependentGoals False)
      --projectConfigShadowPkgs        = Flag False,
      --projectConfigReinstall         = Flag False,
@@ -439,7 +451,7 @@ renderBadProjectRoot :: BadProjectRoot -> String
 renderBadProjectRoot (BadProjectRootExplicitFile projectFile) =
     "The given project file '" ++ projectFile ++ "' does not exist."
 
-withProjectOrGlobalConfig :: Verbosity 
+withProjectOrGlobalConfig :: Verbosity
                           -> Flag FilePath
                           -> IO a
                           -> (ProjectConfig -> IO a)
@@ -450,9 +462,9 @@ withProjectOrGlobalConfig verbosity globalConfigFlag with without = do
   let
     res' = catch with
       $ \case
-        (BadPackageLocations prov locs) 
+        (BadPackageLocations prov locs)
           | prov == Set.singleton Implicit
-          , let 
+          , let
             isGlobErr (BadLocGlobEmptyMatch _) = True
             isGlobErr _ = False
           , any isGlobErr locs ->
@@ -564,7 +576,7 @@ readProjectFile verbosity DistDirLayout{distProjectFile}
 -- For the moment this is implemented in terms of parsers for legacy
 -- configuration types, plus a conversion.
 --
-parseProjectConfig :: String -> ParseResult ProjectConfig
+parseProjectConfig :: String -> OldParser.ParseResult ProjectConfig
 parseProjectConfig content =
     convertLegacyProjectConfig <$>
       parseLegacyProjectConfig content
@@ -610,14 +622,14 @@ readGlobalConfig verbosity configFileFlag = do
     monitorFiles [monitorFileHashed configFile]
     return (convertLegacyGlobalConfig config)
 
-reportParseResult :: Verbosity -> String -> FilePath -> ParseResult a -> IO a
-reportParseResult verbosity _filetype filename (ParseOk warnings x) = do
+reportParseResult :: Verbosity -> String -> FilePath -> OldParser.ParseResult a -> IO a
+reportParseResult verbosity _filetype filename (OldParser.ParseOk warnings x) = do
     unless (null warnings) $
       let msg = unlines (map (OldParser.showPWarning filename) warnings)
        in warn verbosity msg
     return x
-reportParseResult verbosity filetype filename (ParseFailed err) =
-    let (line, msg) = locatedErrorMsg err
+reportParseResult verbosity filetype filename (OldParser.ParseFailed err) =
+    let (line, msg) = OldParser.locatedErrorMsg err
      in die' verbosity $ "Error parsing " ++ filetype ++ " " ++ filename
            ++ maybe "" (\n -> ':' : show n) line ++ ":\n" ++ msg
 
@@ -636,7 +648,7 @@ data ProjectPackageLocation =
    | ProjectPackageLocalTarball   FilePath
    | ProjectPackageRemoteTarball  URI
    | ProjectPackageRemoteRepo     SourceRepo
-   | ProjectPackageNamed          Dependency
+   | ProjectPackageNamed          PackageVersionConstraint
   deriving Show
 
 
@@ -990,7 +1002,7 @@ fetchAndReadSourcePackages verbosity distDirLayout
 
     let pkgsNamed =
           [ NamedPackage pkgname [PackagePropertyVersion verrange]
-          | ProjectPackageNamed (Dependency pkgname verrange) <- pkgLocations ]
+          | ProjectPackageNamed (PackageVersionConstraint pkgname verrange) <- pkgLocations ]
 
     return $ concat
       [ pkgsLocalDirectory
@@ -1216,16 +1228,33 @@ mkSpecificSourcePackage location pkg =
 
 -- | Errors reported upon failing to parse a @.cabal@ file.
 --
-data CabalFileParseError =
-     CabalFileParseError
-       FilePath
-       [PError]
-       (Maybe Version) -- We might discover the spec version the package needs
-       [PWarning]
-  deriving (Show, Typeable)
+data CabalFileParseError = CabalFileParseError
+    FilePath        -- ^ @.cabal@ file path
+    BS.ByteString   -- ^ @.cabal@ file contents
+    [PError]        -- ^ errors
+    (Maybe Version) -- ^ We might discover the spec version the package needs
+    [PWarning]      -- ^ warnings
+  deriving (Typeable)
+
+-- | Manual instance which skips file contentes
+instance Show CabalFileParseError where
+    showsPrec d (CabalFileParseError fp _ es mv ws) = showParen (d > 10)
+        $ showString "CabalFileParseError"
+        . showChar ' ' . showsPrec 11 fp
+        . showChar ' ' . showsPrec 11 ("" :: String)
+        . showChar ' ' . showsPrec 11 es
+        . showChar ' ' . showsPrec 11 mv
+        . showChar ' ' . showsPrec 11 ws
 
 instance Exception CabalFileParseError
+#if MIN_VERSION_base(4,8,0)
+  where
+  displayException = renderCabalFileParseError
+#endif
 
+renderCabalFileParseError :: CabalFileParseError -> String
+renderCabalFileParseError (CabalFileParseError filePath contents errors _ warnings) =
+    renderParseError filePath contents errors warnings
 
 -- | Wrapper for the @.cabal@ file parser. It reports warnings on higher
 -- verbosity levels and throws 'CabalFileParseError' on failure.
@@ -1242,12 +1271,12 @@ readSourcePackageCabalFile verbosity pkgfilename content =
         return pkg
 
       (warnings, Left (mspecVersion, errors)) ->
-        throwIO $ CabalFileParseError pkgfilename errors mspecVersion warnings
+        throwIO $ CabalFileParseError pkgfilename content errors mspecVersion warnings
   where
     formatWarnings warnings =
         "The package description file " ++ pkgfilename
      ++ " has warnings: "
-     ++ unlines (map (NewParser.showPWarning pkgfilename) warnings)
+     ++ unlines (map (showPWarning pkgfilename) warnings)
 
 
 -- | When looking for a package's @.cabal@ file we can find none, or several,

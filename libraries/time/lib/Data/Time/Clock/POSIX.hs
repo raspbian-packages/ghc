@@ -1,5 +1,20 @@
 -- | POSIX time, if you need to deal with timestamps and the like.
 -- Most people won't need this module.
+--
+-- You can use 'POSIXTime' to obtain integer/word timestamps. For example:
+--
+-- > import Data.Time
+-- > import Data.Time.Clock.POSIX
+-- > import Data.Int
+-- >
+-- > nanosSinceEpoch :: UTCTime -> Int64
+-- > nanosSinceEpoch =
+-- >     floor . (1e9 *) . nominalDiffTimeToSeconds . utcTimeToPOSIXSeconds
+-- >
+-- > main :: IO ()
+-- > main = do
+-- >     u <- getCurrentTime
+-- >     print $ nanosSinceEpoch u
 module Data.Time.Clock.POSIX
 (
     posixDayLength,POSIXTime,posixSecondsToUTCTime,utcTimeToPOSIXSeconds,getPOSIXTime,getCurrentTime,

@@ -43,7 +43,6 @@ module Haddock.Options (
 import qualified Data.Char as Char
 import           Data.Version
 import           Control.Applicative
-import           Distribution.Verbosity
 import           FastString
 import           GHC ( DynFlags, Module, moduleUnitId )
 import           Haddock.Types
@@ -84,6 +83,7 @@ data Flag
   | Flag_Version
   | Flag_CompatibleInterfaceVersions
   | Flag_InterfaceVersion
+  | Flag_BypassInterfaceVersonCheck
   | Flag_UseContents String
   | Flag_GenContents
   | Flag_UseIndex String
@@ -175,6 +175,8 @@ options backwardsCompat =
       "output compatible interface file versions and exit",
     Option []  ["interface-version"]  (NoArg Flag_InterfaceVersion)
       "output interface file version and exit",
+    Option []  ["bypass-interface-version-check"] (NoArg Flag_BypassInterfaceVersonCheck)
+      "bypass the interface file version check (dangerous)",
     Option ['v']  ["verbosity"]  (ReqArg Flag_Verbosity "VERBOSITY")
       "set verbosity level",
     Option [] ["use-contents"] (ReqArg Flag_UseContents "URL")
@@ -186,7 +188,7 @@ options backwardsCompat =
     Option [] ["gen-index"] (NoArg Flag_GenIndex)
       "generate an HTML index from specified\ninterfaces",
     Option [] ["ignore-all-exports"] (NoArg Flag_IgnoreAllExports)
-      "behave as if all modules have the\nignore-exports atribute",
+      "behave as if all modules have the\nignore-exports attribute",
     Option [] ["hide"] (ReqArg Flag_HideModule "MODULE")
       "behave as if MODULE has the hide attribute",
     Option [] ["show"] (ReqArg Flag_ShowModule "MODULE")
@@ -329,7 +331,7 @@ sinceQualification flags =
 verbosity :: [Flag] -> Verbosity
 verbosity flags =
   case [ str | Flag_Verbosity str <- flags ] of
-    []  -> normal
+    []  -> Normal
     x:_ -> case parseVerbosity x of
       Left e -> throwE e
       Right v -> v
@@ -371,9 +373,10 @@ modulePackageInfo :: DynFlags
                   -> [Flag] -- ^ Haddock flags are checked as they may contain
                             -- the package name or version provided by the user
                             -- which we prioritise
-                  -> Module
+                  -> Maybe Module
                   -> (Maybe PackageName, Maybe Data.Version.Version)
-modulePackageInfo dflags flags modu =
+modulePackageInfo _dflags _flags Nothing = (Nothing, Nothing)
+modulePackageInfo dflags flags (Just modu) =
   ( optPackageName flags    <|> fmap packageName pkgDb
   , optPackageVersion flags <|> fmap packageVersion pkgDb
   )

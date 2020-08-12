@@ -8,6 +8,7 @@ The Desugarer: turning HsSyn into Core.
 
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE ViewPatterns #-}
 
 module Desugar (
     -- * Desugaring operations
@@ -148,8 +149,7 @@ deSugar hsc_env
           keep_alive <- readIORef keep_var
         ; let (rules_for_locals, rules_for_imps) = partition isLocalRule all_rules
               final_prs = addExportFlagsAndRules target export_set keep_alive
-                                                 mod rules_for_locals
-                                                 (fromOL all_prs)
+                                                 rules_for_locals (fromOL all_prs)
 
               final_pgm = combineEvBinds ds_ev_binds final_prs
         -- Notice that we put the whole lot in a big Rec, even the foreign binds
@@ -168,7 +168,7 @@ deSugar hsc_env
 
         ; let used_names = mkUsedNames tcg_env
               pluginModules =
-                map lpModule (plugins (hsc_dflags hsc_env))
+                map lpModule (cachedPlugins (hsc_dflags hsc_env))
         ; deps <- mkDependencies (thisInstalledUnitId (hsc_dflags hsc_env))
                                  (map mi_module pluginModules) tcg_env
 
@@ -283,9 +283,9 @@ deSugarExpr hsc_env tc_expr = do {
 -}
 
 addExportFlagsAndRules
-    :: HscTarget -> NameSet -> NameSet -> Module -> [CoreRule]
+    :: HscTarget -> NameSet -> NameSet -> [CoreRule]
     -> [(Id, t)] -> [(Id, t)]
-addExportFlagsAndRules target exports keep_alive mod rules prs
+addExportFlagsAndRules target exports keep_alive rules prs
   = mapFst add_one prs
   where
     add_one bndr = add_rules name (add_export name bndr)
@@ -318,20 +318,10 @@ addExportFlagsAndRules target exports keep_alive mod rules prs
         -- simplification), and retain them all in the TypeEnv so they are
         -- available from the command line.
         --
-        -- Most of the time, this can be accomplished by use of
-        -- targetRetainsAllBindings, which returns True if the target is
-        -- HscInteractive. However, there are cases when one can use GHCi with
-        -- a target other than HscInteractive (e.g., with the -fobject-code
-        -- flag enabled, as in #12091). In such scenarios,
-        -- targetRetainsAllBindings can return False, so we must fall back on
-        -- isInteractiveModule to be doubly sure we export entities defined in
-        -- a GHCi session.
-        --
         -- isExternalName separates the user-defined top-level names from those
         -- introduced by the type checker.
     is_exported :: Name -> Bool
-    is_exported | targetRetainsAllBindings target
-                  || isInteractiveModule mod      = isExternalName
+    is_exported | targetRetainsAllBindings target = isExternalName
                 | otherwise                       = (`elemNameSet` exports)
 
 {-
@@ -379,9 +369,13 @@ Reason
 -}
 
 dsRule :: LRuleDecl GhcTc -> DsM (Maybe CoreRule)
-dsRule (L loc (HsRule _ name rule_act vars lhs rhs))
+dsRule (dL->L loc (HsRule { rd_name = name
+                          , rd_act  = rule_act
+                          , rd_tmvs = vars
+                          , rd_lhs  = lhs
+                          , rd_rhs  = rhs }))
   = putSrcSpanDs loc $
-    do  { let bndrs' = [var | L _ (RuleBndr _ (L _ var)) <- vars]
+    do  { let bndrs' = [var | (dL->L _ (RuleBndr _ (dL->L _ var))) <- vars]
 
         ; lhs' <- unsetGOptM Opt_EnableRewriteRules $
                   unsetWOptM Opt_WarnIdentities $
@@ -418,8 +412,8 @@ dsRule (L loc (HsRule _ name rule_act vars lhs rhs))
 
         ; return (Just rule)
         } } }
-dsRule (L _ (XRuleDecl _)) = panic "dsRule"
-
+dsRule (dL->L _ (XRuleDecl _)) = panic "dsRule"
+dsRule _ = panic "dsRule: Impossible Match" -- due to #15884
 
 warnRuleShadowing :: RuleName -> Activation -> Id -> [Id] -> DsM ()
 -- See Note [Rules and inlining/other rules]
@@ -497,7 +491,7 @@ switching off EnableRewriteRules.  See DsExpr.dsExplicitList.
 That keeps the desugaring of list comprehensions simple too.
 
 Nor do we want to warn of conversion identities on the LHS;
-the rule is precisly to optimise them:
+the rule is precisely to optimise them:
   {-# RULES "fromRational/id" fromRational = id :: Rational -> Rational #-}
 
 Note [Desugaring coerce as cast]

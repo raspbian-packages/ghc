@@ -28,7 +28,9 @@ import Distribution.Simple.Utils
 import Distribution.System
 import Distribution.TestSuite
 import Distribution.Verbosity
-import Distribution.Text
+import Distribution.Pretty
+
+import qualified Prelude (foldl1)
 
 -- | Logs all test results for a package, broken down first by test suite and
 -- then by test case.
@@ -128,7 +130,7 @@ testSuiteLogPath template pkg_descr lbi test_name result =
 summarizePackage :: Verbosity -> PackageLog -> IO Bool
 summarizePackage verbosity packageLog = do
     let counts = map (countTestResults . testLogs) $ testSuites packageLog
-        (passed, failed, errors) = foldl1 addTriple counts
+        (passed, failed, errors) = Prelude.foldl1 addTriple counts
         totalCases = passed + failed + errors
         passedSuites = length
                        $ filter (suitePassed . testLogs)
@@ -155,7 +157,7 @@ summarizeTest verbosity details t =
 -- output for certain verbosity or test filter levels.
 summarizeSuiteFinish :: TestSuiteLog -> String
 summarizeSuiteFinish testLog = unlines
-    [ "Test suite " ++ display (testSuiteName testLog) ++ ": " ++ resStr
+    [ "Test suite " ++ prettyShow (testSuiteName testLog) ++ ": " ++ resStr
     , "Test suite logged to: " ++ logFile testLog
     ]
     where resStr = map toUpper (resultString $ testLogs testLog)

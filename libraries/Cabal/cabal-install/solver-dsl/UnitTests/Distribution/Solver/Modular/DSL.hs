@@ -44,6 +44,7 @@ import Distribution.Solver.Compat.Prelude
 import Control.Arrow (second)
 import Data.Either (partitionEithers)
 import qualified Data.Map as Map
+import qualified Data.Set as Set
 
 -- Cabal
 import qualified Distribution.Compiler                  as C
@@ -56,6 +57,8 @@ import qualified Distribution.Types.ExeDependency       as C
 import qualified Distribution.Types.ForeignLib          as C
 import qualified Distribution.Types.LegacyExeDependency as C
 import qualified Distribution.Types.PkgconfigDependency as C
+import qualified Distribution.Types.PkgconfigVersion    as C
+import qualified Distribution.Types.PkgconfigVersionRange as C
 import qualified Distribution.Types.UnqualComponentName as C
 import qualified Distribution.Types.CondTree            as C
 import qualified Distribution.PackageDescription        as C
@@ -533,7 +536,7 @@ exAvSrcPkg ex =
                 , C.pkgconfigDepends = [ C.PkgconfigDependency n' v'
                                        | (n,v) <- pcpkgs
                                        , let n' = C.mkPkgconfigName n
-                                       , let v' = C.thisVersion (mkSimpleVersion v) ]
+                                       , let v' = C.PcThisVersion (mkSimplePkgconfigVersion v) ]
               }
       in C.CondNode {
              C.condTreeData        = bi -- Necessary for language extensions
@@ -545,7 +548,7 @@ exAvSrcPkg ex =
            }
 
     mkDirect :: (ExamplePkgName, C.VersionRange) -> C.Dependency
-    mkDirect (dep, vr) = C.Dependency (C.mkPackageName dep) vr
+    mkDirect (dep, vr) = C.Dependency (C.mkPackageName dep) vr (Set.singleton C.LMainLibName)
 
     mkFlagged :: (ExampleFlagName, Dependencies, Dependencies)
               -> DependencyComponent C.BuildInfo
@@ -586,6 +589,9 @@ exAvSrcPkg ex =
 
 mkSimpleVersion :: ExamplePkgVersion -> C.Version
 mkSimpleVersion n = C.mkVersion [n, 0, 0]
+
+mkSimplePkgconfigVersion :: ExamplePkgVersion -> C.PkgconfigVersion
+mkSimplePkgconfigVersion = C.versionToPkgconfigVersion . mkSimpleVersion
 
 mkVersionRange :: ExamplePkgVersion -> ExamplePkgVersion -> C.VersionRange
 mkVersionRange v1 v2 =
@@ -645,9 +651,11 @@ exResolve :: ExampleDb
           -> [ExamplePkgName]
           -> Maybe Int
           -> CountConflicts
+          -> MinimizeConflictSet
           -> IndependentGoals
           -> ReorderGoals
           -> AllowBootLibInstalls
+          -> OnlyConstrained
           -> EnableBackjumping
           -> SolveExecutables
           -> Maybe (Variable P.QPN -> Variable P.QPN -> Ordering)
@@ -656,8 +664,9 @@ exResolve :: ExampleDb
           -> C.Verbosity
           -> EnableAllTests
           -> Progress String String CI.SolverInstallPlan.SolverInstallPlan
-exResolve db exts langs pkgConfigDb targets mbj countConflicts indepGoals
-          reorder allowBootLibInstalls enableBj solveExes goalOrder constraints
+exResolve db exts langs pkgConfigDb targets mbj countConflicts
+          minimizeConflictSet indepGoals reorder allowBootLibInstalls
+          onlyConstrained enableBj solveExes goalOrder constraints
           prefs verbosity enableAllTests
     = resolveDependencies C.buildPlatform compiler pkgConfigDb Modular params
   where
@@ -682,10 +691,12 @@ exResolve db exts langs pkgConfigDb targets mbj countConflicts indepGoals
                    $ addConstraints (fmap toLpc enableTests)
                    $ addPreferences (fmap toPref prefs)
                    $ setCountConflicts countConflicts
+                   $ setMinimizeConflictSet minimizeConflictSet
                    $ setIndependentGoals indepGoals
                    $ setReorderGoals reorder
                    $ setMaxBackjumps mbj
                    $ setAllowBootLibInstalls allowBootLibInstalls
+                   $ setOnlyConstrained onlyConstrained
                    $ setEnableBackjumping enableBj
                    $ setSolveExecutables solveExes
                    $ setGoalOrder goalOrder

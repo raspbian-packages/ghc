@@ -161,11 +161,11 @@ setup'' prefix cmd args = do
     defaultRecordMode RecordMarked $ do
     recordHeader ["Setup", cmd]
     if testCabalInstallAsSetup env
-        then 
+        then
             -- `cabal` and `Setup` no longer have the same interface.
             -- A bit of fettling is required to hide this fact.
-            let 
-                legacyCmds = 
+            let
+                legacyCmds =
                     [ "build"
                     , "configure"
                     , "repl"
@@ -188,7 +188,8 @@ setup'' prefix cmd args = do
                 full_args' = if a `elem` legacyCmds then ("v1-" ++ a) : as else a:as
             in runProgramM cabalProgram full_args'
         else do
-            pdfile <- liftIO $ tryFindPackageDesc (testCurrentDir env </> prefix)
+            pdfile <- liftIO $ tryFindPackageDesc (testVerbosity env)
+                      (testCurrentDir env </> prefix)
             pdesc <- liftIO $ readGenericPackageDescription (testVerbosity env) pdfile
             if buildType (packageDescription pdesc) == Simple
                 then runM (testSetupPath env) full_args
@@ -294,8 +295,8 @@ cabalG' global_args cmd args = do
           | cmd `elem` ["v1-update", "outdated", "user-config", "manpage", "v1-freeze", "check"]
           = [ ]
           -- new-build commands are affected by testCabalProjectFile
-          | cmd == "new-sdist" = [ "--project-file", testCabalProjectFile env ]
-          | "new-" `isPrefixOf` cmd
+          | cmd == "v2-sdist" = [ "--project-file", testCabalProjectFile env ]
+          | "v2-" `isPrefixOf` cmd
           = [ "--builddir", testDistDir env
             , "--project-file", testCabalProjectFile env
             , "-j1" ]
@@ -354,9 +355,11 @@ withProjectFile fp m =
 withPlan :: TestM a -> TestM a
 withPlan m = do
     env0 <- getTestEnv
-    Just plan <- JSON.decode `fmap`
-                    liftIO (BSL.readFile (testDistDir env0 </> "cache" </> "plan.json"))
-    withReaderT (\env -> env { testPlan = Just plan }) m
+    let filepath = testDistDir env0 </> "cache" </> "plan.json"
+    mplan <- JSON.eitherDecode `fmap` liftIO (BSL.readFile filepath)
+    case mplan of
+        Left err   -> fail $ "withPlan: cannot decode plan " ++ err
+        Right plan -> withReaderT (\env -> env { testPlan = Just plan }) m
 
 -- | Run an executable from a package.  Requires 'withPlan' to have
 -- been run so that we can find the dist dir.
@@ -815,8 +818,8 @@ getOpenFilesLimit = return (Just 2048)
 getOpenFilesLimit = liftIO $ do
     ResourceLimits { softLimit } <- getResourceLimit ResourceOpenFiles
     case softLimit of
-        ResourceLimit n -> return (Just n)
-        _ -> return Nothing
+        ResourceLimit n | n >= 0 && n <= 4096 -> return (Just n)
+        _                                     -> return Nothing
 #endif
 
 hasCabalForGhc :: TestM Bool
@@ -827,9 +830,14 @@ hasCabalForGhc = do
         (testVerbosity env)
         ghcProgram
         (runnerProgramDb (testScriptEnv env))
+
     -- TODO: I guess, to be more robust what we should check for
     -- specifically is that the Cabal library we want to use
     -- will be picked up by the package db stack of ghc-program
+
+    -- liftIO $ putStrLn $ "ghc_program:        " ++ show ghc_program
+    -- liftIO $ putStrLn $ "runner_ghc_program: " ++ show runner_ghc_program
+
     return (programPath ghc_program == programPath runner_ghc_program)
 
 -- | If you want to use a Custom setup with new-build, it needs to

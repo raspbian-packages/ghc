@@ -1,6 +1,8 @@
 {-# LANGUAGE CPP, DeriveDataTypeable, DeriveFunctor, DeriveFoldable, DeriveTraversable, StandaloneDeriving, TypeFamilies, RecordWildCards #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE PartialTypeSignatures #-}
 {-# LANGUAGE UndecidableInstances #-} -- Note [Pass sensitive types]
+{-# LANGUAGE FlexibleInstances #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
 -----------------------------------------------------------------------------
@@ -28,23 +30,19 @@ module Haddock.Types (
 import Control.Exception
 import Control.Arrow hiding ((<+>))
 import Control.DeepSeq
+import Control.Monad (ap)
 import Control.Monad.IO.Class (MonadIO(..))
-import Data.Typeable
+import Data.Typeable (Typeable)
 import Data.Map (Map)
 import Data.Data (Data)
-import qualified Data.Map as Map
 import Documentation.Haddock.Types
-import BasicTypes (Fixity(..))
+import BasicTypes (Fixity(..), PromotionFlag(..))
 
-import GHC hiding (NoLink)
+import GHC
 import DynFlags (Language)
 import qualified GHC.LanguageExtensions as LangExt
 import OccName
-import Outputable
-import Control.Applicative (Applicative(..))
-import Control.Monad (ap)
-
-import Haddock.Backends.Hyperlinker.Types
+import Outputable hiding ((<>))
 
 -----------------------------------------------------------------------------
 -- * Convenient synonyms
@@ -143,7 +141,8 @@ data Interface = Interface
 
     -- | Tokenized source code of module (avaliable if Haddock is invoked with
     -- source generation flag).
-  , ifaceTokenizedSrc :: !(Maybe [RichToken])
+  , ifaceHieFile :: !(Maybe FilePath)
+  , ifaceDynFlags :: !DynFlags
   }
 
 type WarningMap = Map Name (Doc Name)
@@ -274,7 +273,7 @@ type DocForDecl name = (Documentation name, FnArgsDoc name)
 
 
 noDocForDecl :: DocForDecl name
-noDocForDecl = (Documentation Nothing Nothing, Map.empty)
+noDocForDecl = (Documentation Nothing Nothing, mempty)
 
 
 -----------------------------------------------------------------------------
@@ -284,6 +283,12 @@ noDocForDecl = (Documentation Nothing Nothing, Map.empty)
 
 -- | Type of environment used to cross-reference identifiers in the syntax.
 type LinkEnv = Map Name Module
+
+-- | An 'RdrName' tagged with some type/value namespace information.
+data NsRdrName = NsRdrName
+  { namespace :: !Namespace
+  , rdrName :: !RdrName
+  }
 
 -- | Extends 'Name' with cross-reference information.
 data DocName
@@ -329,7 +334,30 @@ instance SetName DocName where
     setName name' (Documented _ mdl) = Documented name' mdl
     setName name' (Undocumented _) = Undocumented name'
 
+-- | Adds extra "wrapper" information to a name.
+--
+-- This is to work around the fact that most name types in GHC ('Name', 'RdrName',
+-- 'OccName', ...) don't include backticks or parens.
+data Wrap n
+  = Unadorned { unwrap :: n  }     -- ^ don't do anything to the name
+  | Parenthesized { unwrap :: n }  -- ^ add parentheses around the name
+  | Backticked { unwrap :: n }     -- ^ add backticks around the name
+  deriving (Show, Functor, Foldable, Traversable)
 
+-- | Useful for debugging
+instance Outputable n => Outputable (Wrap n) where
+  ppr (Unadorned n)     = ppr n
+  ppr (Parenthesized n) = hcat [ char '(', ppr n, char ')' ]
+  ppr (Backticked n)    = hcat [ char '`', ppr n, char '`' ]
+
+showWrapped :: (a -> String) -> Wrap a -> String
+showWrapped f (Unadorned n) = f n
+showWrapped f (Parenthesized n) = "(" ++ f n ++ ")"
+showWrapped f (Backticked n) = "`" ++ f n ++ "`"
+
+instance HasOccName DocName where
+
+    occName = occName . getName
 
 -----------------------------------------------------------------------------
 -- * Instances
@@ -424,10 +452,10 @@ instance NamedThing name => NamedThing (InstOrigin name) where
 
 type LDoc id = Located (Doc id)
 
-type Doc id = DocH (ModuleName, OccName) id
-type MDoc id = MetaDoc (ModuleName, OccName) id
+type Doc id = DocH (Wrap (ModuleName, OccName)) (Wrap id)
+type MDoc id = MetaDoc (Wrap (ModuleName, OccName)) (Wrap id)
 
-type DocMarkup id a = DocMarkupH (ModuleName, OccName) id a
+type DocMarkup id a = DocMarkupH (Wrap (ModuleName, OccName)) id a
 
 instance (NFData a, NFData mod)
          => NFData (DocH mod a) where
@@ -467,7 +495,7 @@ instance NFData ModuleName where rnf x = seq x ()
 instance NFData id => NFData (Header id) where
   rnf (Header a b) = a `deepseq` b `deepseq` ()
 
-instance NFData Hyperlink where
+instance NFData id => NFData (Hyperlink id) where
   rnf (Hyperlink a b) = a `deepseq` b `deepseq` ()
 
 instance NFData Picture where
@@ -674,6 +702,7 @@ type instance XQualTy          DocNameI = NoExt
 type instance XTyVar           DocNameI = NoExt
 type instance XStarTy          DocNameI = NoExt
 type instance XAppTy           DocNameI = NoExt
+type instance XAppKindTy       DocNameI = NoExt
 type instance XFunTy           DocNameI = NoExt
 type instance XListTy          DocNameI = NoExt
 type instance XTupleTy         DocNameI = NoExt
@@ -689,7 +718,7 @@ type instance XRecTy           DocNameI = NoExt
 type instance XExplicitListTy  DocNameI = NoExt
 type instance XExplicitTupleTy DocNameI = NoExt
 type instance XTyLit           DocNameI = NoExt
-type instance XWildCardTy      DocNameI = HsWildCardInfo
+type instance XWildCardTy      DocNameI = NoExt
 type instance XXType           DocNameI = NewHsTypeX
 
 type instance XUserTyVar    DocNameI = NoExt
@@ -742,3 +771,19 @@ type instance XHsWC      DocNameI _ = NoExt
 type instance XHsQTvs        DocNameI = NoExt
 type instance XConDeclField  DocNameI = NoExt
 
+type instance XXPat DocNameI = Located (Pat DocNameI)
+
+type instance SrcSpanLess (LPat DocNameI) = Pat DocNameI
+instance HasSrcSpan (LPat DocNameI) where
+  -- NB: The following chooses the behaviour of the outer location
+  --     wrapper replacing the inner ones.
+  composeSrcSpan (L sp p) =  if sp == noSrcSpan
+                             then p
+                             else XPat (L sp (stripSrcSpanPat p))
+   -- NB: The following only returns the top-level location, if any.
+  decomposeSrcSpan (XPat (L sp p)) = L sp (stripSrcSpanPat p)
+  decomposeSrcSpan p               = L noSrcSpan  p
+
+stripSrcSpanPat :: LPat DocNameI -> Pat DocNameI
+stripSrcSpanPat (XPat (L _ p)) = stripSrcSpanPat p
+stripSrcSpanPat p              = p

@@ -46,7 +46,7 @@ module CoreSyn (
         exprToType, exprToCoercion_maybe,
         applyTypeToArg,
 
-        isValArg, isTypeArg, isTyCoArg, valArgCount, valBndrCount,
+        isValArg, isTypeArg, isCoArg, isTyCoArg, valArgCount, valBndrCount,
         isRuntimeArg, isRuntimeVar,
 
         -- * Tick-related functions
@@ -173,6 +173,7 @@ These data types are the heart of the compiler
 -- The language consists of the following elements:
 --
 -- *  Variables
+--    See Note [Variable occurrences in Core]
 --
 -- *  Primitive literals
 --
@@ -187,29 +188,10 @@ These data types are the heart of the compiler
 --    this corresponds to allocating a thunk for the things
 --    bound and then executing the sub-expression.
 --
---    #top_level_invariant#
---    #letrec_invariant#
---
---    The right hand sides of all top-level and recursive @let@s
---    /must/ be of lifted type (see "Type#type_classification" for
---    the meaning of /lifted/ vs. /unlifted/). There is one exception
---    to this rule, top-level @let@s are allowed to bind primitive
---    string literals, see Note [CoreSyn top-level string literals].
---
+--    See Note [CoreSyn letrec invariant]
 --    See Note [CoreSyn let/app invariant]
 --    See Note [Levity polymorphism invariants]
---
---    #type_let#
---    We allow a /non-recursive/ let to bind a type variable, thus:
---
---    > Let (NonRec tv (Type ty)) body
---
---    This can be very convenient for postponing type substitutions until
---    the next run of the simplifier.
---
---    At the moment, the rest of the compiler only deals with type-let
---    in a Let expression, rather than at top level.  We may want to revist
---    this choice.
+--    See Note [CoreSyn type and coercion invariant]
 --
 -- *  Case expression. Operationally this corresponds to evaluating
 --    the scrutinee (expression examined) to weak head normal form
@@ -371,13 +353,25 @@ PrelRules for the rationale for this restriction.
 
 -------------------------- CoreSyn INVARIANTS ---------------------------
 
-Note [CoreSyn top-level invariant]
+Note [Variable occurrences in Core]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-See #toplevel_invariant#
+Variable /occurrences/ are never CoVars, though /bindings/ can be.
+All CoVars appear in Coercions.
+
+For example
+  \(c :: Age~#Int) (d::Int). d |> (sym c)
+Here 'c' is a CoVar, which is lambda-bound, but it /occurs/ in
+a Coercion, (sym c).
 
 Note [CoreSyn letrec invariant]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-See #letrec_invariant#
+The right hand sides of all top-level and recursive @let@s
+/must/ be of lifted type (see "Type#type_classification" for
+the meaning of /lifted/ vs. /unlifted/).
+
+There is one exception to this rule, top-level @let@s are
+allowed to bind primitive string literals: see
+Note [CoreSyn top-level string literals].
 
 Note [CoreSyn top-level string literals]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -451,6 +445,30 @@ which will generate a @case@ if necessary
 The let/app invariant is initially enforced by mkCoreLet and mkCoreApp in
 coreSyn/MkCore.
 
+For discussion of some implications of the let/app invariant primops see
+Note [Checking versus non-checking primops] in PrimOp.
+
+Note [CoreSyn type and coercion invariant]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We allow a /non-recursive/, /non-top-level/ let to bind type and
+coercion variables.  These can be very convenient for postponing type
+substitutions until the next run of the simplifier.
+
+* A type variable binding must have a RHS of (Type ty)
+
+* A coercion variable binding must have a RHS of (Coercion co)
+
+  It is possible to have terms that return a coercion, but we use
+  case-binding for those; e.g.
+     case (eq_sel d) of (co :: a ~# b) -> blah
+  where eq_sel :: (a~b) -> (a~#b)
+
+  Or even even
+      case (df @Int) of (co :: a ~# b) -> blah
+  Which is very exotic, and I think never encountered; but see
+  Note [Equality superclasses in quantified constraints]
+  in TcCanonical
+
 Note [CoreSyn case invariants]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 See #case_invariants#
@@ -494,7 +512,7 @@ this exhaustive list can be empty!
   scrutinee is bound to raise an exception or diverge. When do we know
   this?  See Note [Bottoming expressions] in CoreUtils.
 
-* The possiblity of empty alternatives is one reason we need a type on
+* The possibility of empty alternatives is one reason we need a type on
   the case expression: if the alternatives are empty we can't get the
   type from the alternatives!
 
@@ -590,6 +608,8 @@ Join points must follow these invariants:
      same number of arguments, counting both types and values; we call this the
      "join arity" (to distinguish from regular arity, which only counts values).
 
+     See Note [Join points are less general than the paper]
+
   2. For join arity n, the right-hand side must begin with at least n lambdas.
      No ticks, no casts, just lambdas!  C.f. CoreUtils.joinRhsArity.
 
@@ -638,6 +658,26 @@ Invariant 4 is subtle; see Note [The polymorphism rule of join points].
 Core Lint will check these invariants, anticipating that any binder whose
 OccInfo is marked AlwaysTailCalled will become a join point as soon as the
 simplifier (or simpleOptPgm) runs.
+
+Note [Join points are less general than the paper]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In the paper "Compiling without continuations", this expression is
+perfectly valid:
+
+    join { j = \_ -> e }
+    in (case blah of       )
+       (  True  -> j void# ) arg
+       (  False -> blah    )
+
+assuming 'j' has arity 1.   Here the call to 'j' does not look like a
+tail call, but actually everything is fine. See Section 3, "Managing \Delta"
+in the paper.
+
+In GHC, however, we adopt a slightly more restrictive subset, in which
+join point calls must be tail calls.  I think we /could/ loosen it up, but
+in fact the simplifier ensures that we always get tail calls, and it makes
+the back end a bit easier I think.  Generally, just less to think about;
+nothing deeper than that.
 
 Note [The type of a join point]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1815,12 +1855,12 @@ mkVarApps :: Expr b -> [Var] -> Expr b
 -- use 'MkCore.mkCoreConApps' if possible
 mkConApp      :: DataCon -> [Arg b] -> Expr b
 
-mkApps    f args = foldl App                       f args
-mkCoApps  f args = foldl (\ e a -> App e (Coercion a)) f args
-mkVarApps f vars = foldl (\ e a -> App e (varToCoreExpr a)) f vars
+mkApps    f args = foldl' App                       f args
+mkCoApps  f args = foldl' (\ e a -> App e (Coercion a)) f args
+mkVarApps f vars = foldl' (\ e a -> App e (varToCoreExpr a)) f vars
 mkConApp con args = mkApps (Var (dataConWorkId con)) args
 
-mkTyApps  f args = foldl (\ e a -> App e (mkTyArg a)) f args
+mkTyApps  f args = foldl' (\ e a -> App e (mkTyArg a)) f args
 
 mkConApp2 :: DataCon -> [Type] -> [Var] -> Expr b
 mkConApp2 con tys arg_ids = Var (dataConWorkId con)
@@ -1839,8 +1879,8 @@ mkIntLit      :: DynFlags -> Integer -> Expr b
 -- If you want an expression of type @Int@ use 'MkCore.mkIntExpr'
 mkIntLitInt   :: DynFlags -> Int     -> Expr b
 
-mkIntLit    dflags n = Lit (mkMachInt dflags n)
-mkIntLitInt dflags n = Lit (mkMachInt dflags (toInteger n))
+mkIntLit    dflags n = Lit (mkLitInt dflags n)
+mkIntLitInt dflags n = Lit (mkLitInt dflags (toInteger n))
 
 -- | Create a machine word literal expression of type  @Word#@ from an @Integer@.
 -- If you want an expression of type @Word@ use 'MkCore.mkWordExpr'
@@ -1849,14 +1889,14 @@ mkWordLit     :: DynFlags -> Integer -> Expr b
 -- If you want an expression of type @Word@ use 'MkCore.mkWordExpr'
 mkWordLitWord :: DynFlags -> Word -> Expr b
 
-mkWordLit     dflags w = Lit (mkMachWord dflags w)
-mkWordLitWord dflags w = Lit (mkMachWord dflags (toInteger w))
+mkWordLit     dflags w = Lit (mkLitWord dflags w)
+mkWordLitWord dflags w = Lit (mkLitWord dflags (toInteger w))
 
 mkWord64LitWord64 :: Word64 -> Expr b
-mkWord64LitWord64 w = Lit (mkMachWord64 (toInteger w))
+mkWord64LitWord64 w = Lit (mkLitWord64 (toInteger w))
 
 mkInt64LitInt64 :: Int64 -> Expr b
-mkInt64LitInt64 w = Lit (mkMachInt64 (toInteger w))
+mkInt64LitInt64 w = Lit (mkLitInt64 (toInteger w))
 
 -- | Create a machine character literal expression of type @Char#@.
 -- If you want an expression of type @Char@ use 'MkCore.mkCharExpr'
@@ -1865,8 +1905,8 @@ mkCharLit :: Char -> Expr b
 -- If you want an expression of type @String@ use 'MkCore.mkStringExpr'
 mkStringLit :: String -> Expr b
 
-mkCharLit   c = Lit (mkMachChar c)
-mkStringLit s = Lit (mkMachString s)
+mkCharLit   c = Lit (mkLitChar c)
+mkStringLit s = Lit (mkLitString s)
 
 -- | Create a machine single precision literal expression of type @Float#@ from a @Rational@.
 -- If you want an expression of type @Float@ use 'MkCore.mkFloatExpr'
@@ -1875,8 +1915,8 @@ mkFloatLit :: Rational -> Expr b
 -- If you want an expression of type @Float@ use 'MkCore.mkFloatExpr'
 mkFloatLitFloat :: Float -> Expr b
 
-mkFloatLit      f = Lit (mkMachFloat f)
-mkFloatLitFloat f = Lit (mkMachFloat (toRational f))
+mkFloatLit      f = Lit (mkLitFloat f)
+mkFloatLitFloat f = Lit (mkLitFloat (toRational f))
 
 -- | Create a machine double precision literal expression of type @Double#@ from a @Rational@.
 -- If you want an expression of type @Double@ use 'MkCore.mkDoubleExpr'
@@ -1885,8 +1925,8 @@ mkDoubleLit :: Rational -> Expr b
 -- If you want an expression of type @Double@ use 'MkCore.mkDoubleExpr'
 mkDoubleLitDouble :: Double -> Expr b
 
-mkDoubleLit       d = Lit (mkMachDouble d)
-mkDoubleLitDouble d = Lit (mkMachDouble (toRational d))
+mkDoubleLit       d = Lit (mkLitDouble d)
+mkDoubleLitDouble d = Lit (mkLitDouble (toRational d))
 
 -- | Bind all supplied binding groups over an expression in a nested let expression. Assumes
 -- that the rhs satisfies the let/app invariant.  Prefer to use 'MkCore.mkCoreLets' if
@@ -2101,6 +2141,12 @@ isTyCoArg :: Expr b -> Bool
 isTyCoArg (Type {})     = True
 isTyCoArg (Coercion {}) = True
 isTyCoArg _             = False
+
+-- | Returns @True@ iff the expression is a 'Coercion'
+-- expression at its top level
+isCoArg :: Expr b -> Bool
+isCoArg (Coercion {}) = True
+isCoArg _             = False
 
 -- | Returns @True@ iff the expression is a 'Type' expression at its
 -- top level.  Note this does NOT include 'Coercion's.

@@ -12,7 +12,7 @@ module RnUnbound ( mkUnboundName
                  , WhereLooking(..)
                  , unboundName
                  , unboundNameX
-                 , perhapsForallMsg ) where
+                 , notInScopeErr ) where
 
 import GhcPrelude
 
@@ -23,13 +23,14 @@ import Name
 import Module
 import SrcLoc
 import Outputable
-import PrelNames ( mkUnboundName, forall_tv_RDR, isUnboundName )
+import PrelNames ( mkUnboundName, isUnboundName, getUnique)
 import Util
 import Maybes
 import DynFlags
 import FastString
 import Data.List
 import Data.Function ( on )
+import UniqDFM (udfmToList)
 
 {-
 ************************************************************************
@@ -60,26 +61,26 @@ unboundNameX :: WhereLooking -> RdrName -> SDoc -> RnM Name
 unboundNameX where_look rdr_name extra
   = do  { dflags <- getDynFlags
         ; let show_helpful_errors = gopt Opt_HelpfulErrors dflags
-              what = pprNonVarNameSpace (occNameSpace (rdrNameOcc rdr_name))
-              err = unknownNameErr what rdr_name $$ extra
+              err = notInScopeErr rdr_name $$ extra
         ; if not show_helpful_errors
           then addErr err
           else do { local_env  <- getLocalRdrEnv
                   ; global_env <- getGlobalRdrEnv
                   ; impInfo <- getImports
+                  ; currmod <- getModule
+                  ; hpt <- getHpt
                   ; let suggestions = unknownNameSuggestions_ where_look
-                                        dflags global_env local_env impInfo rdr_name
+                          dflags hpt currmod global_env local_env impInfo
+                          rdr_name
                   ; addErr (err $$ suggestions) }
         ; return (mkUnboundNameRdr rdr_name) }
 
-unknownNameErr :: SDoc -> RdrName -> SDoc
-unknownNameErr what rdr_name
-  = vcat [ hang (text "Not in scope:")
-              2 (what <+> quotes (ppr rdr_name))
-         , extra ]
+notInScopeErr :: RdrName -> SDoc
+notInScopeErr rdr_name
+  = hang (text "Not in scope:")
+       2 (what <+> quotes (ppr rdr_name))
   where
-    extra | rdr_name == forall_tv_RDR = perhapsForallMsg
-          | otherwise                 = Outputable.empty
+    what = pprNonVarNameSpace (occNameSpace (rdrNameOcc rdr_name))
 
 type HowInScope = Either SrcSpan ImpDeclSpec
      -- Left loc    =>  locally bound at loc
@@ -88,16 +89,20 @@ type HowInScope = Either SrcSpan ImpDeclSpec
 
 -- | Called from the typechecker (TcErrors) when we find an unbound variable
 unknownNameSuggestions :: DynFlags
+                       -> HomePackageTable -> Module
                        -> GlobalRdrEnv -> LocalRdrEnv -> ImportAvails
                        -> RdrName -> SDoc
 unknownNameSuggestions = unknownNameSuggestions_ WL_Any
 
 unknownNameSuggestions_ :: WhereLooking -> DynFlags
+                       -> HomePackageTable -> Module
                        -> GlobalRdrEnv -> LocalRdrEnv -> ImportAvails
                        -> RdrName -> SDoc
-unknownNameSuggestions_ where_look dflags global_env local_env imports tried_rdr_name =
+unknownNameSuggestions_ where_look dflags hpt curr_mod global_env local_env
+                          imports tried_rdr_name =
     similarNameSuggestions where_look dflags global_env local_env tried_rdr_name $$
-    importSuggestions where_look  imports tried_rdr_name $$
+    importSuggestions where_look global_env hpt
+                      curr_mod imports tried_rdr_name $$
     extensionSuggestions tried_rdr_name
 
 
@@ -157,26 +162,20 @@ similarNameSuggestions where_look dflags global_env
                         , let occ = nameOccName name
                         , correct_name_space occ]
 
-    gre_ok :: GlobalRdrElt -> Bool
-    gre_ok = case where_look of
-                   WL_LocalTop  -> isLocalGRE
-                   WL_LocalOnly -> const False
-                   _            -> const True
-
     global_possibilities :: GlobalRdrEnv -> [(RdrName, (RdrName, HowInScope))]
     global_possibilities global_env
       | tried_is_qual = [ (rdr_qual, (rdr_qual, how))
                         | gre <- globalRdrEnvElts global_env
-                        , gre_ok gre
+                        , isGreOk where_look gre
                         , let name = gre_name gre
                               occ  = nameOccName name
                         , correct_name_space occ
-                        , (mod, how) <- quals_in_scope gre
+                        , (mod, how) <- qualsInScope gre
                         , let rdr_qual = mkRdrQual mod occ ]
 
       | otherwise = [ (rdr_unqual, pair)
                     | gre <- globalRdrEnvElts global_env
-                    , gre_ok gre
+                    , isGreOk where_look gre
                     , let name = gre_name gre
                           occ  = nameOccName name
                           rdr_unqual = mkRdrUnqual occ
@@ -204,15 +203,6 @@ similarNameSuggestions where_look dflags global_env
                     | i <- is, let ispec = is_decl i
                     , not (is_qual ispec) ]
 
-    --------------------
-    quals_in_scope :: GlobalRdrElt -> [(ModuleName, HowInScope)]
-    -- Ones for which the qualified version is in scope
-    quals_in_scope (GRE { gre_name = n, gre_lcl = lcl, gre_imp = is })
-      | lcl = case nameModule_maybe n of
-                Nothing -> []
-                Just m  -> [(moduleName m, Left (nameSrcSpan n))]
-      | otherwise = [ (is_as ispec, Right ispec)
-                    | i <- is, let ispec = is_decl i ]
 
     --------------------
     quals_only :: GlobalRdrElt -> [(RdrName, HowInScope)]
@@ -222,12 +212,16 @@ similarNameSuggestions where_look dflags global_env
         | i <- is, let ispec = is_decl i, is_qual ispec ]
 
 -- | Generate helpful suggestions if a qualified name Mod.foo is not in scope.
-importSuggestions :: WhereLooking -> ImportAvails -> RdrName -> SDoc
-importSuggestions where_look imports rdr_name
+importSuggestions :: WhereLooking
+                  -> GlobalRdrEnv
+                  -> HomePackageTable -> Module
+                  -> ImportAvails -> RdrName -> SDoc
+importSuggestions where_look global_env hpt currMod imports rdr_name
   | WL_LocalOnly <- where_look                 = Outputable.empty
   | not (isQual rdr_name || isUnqual rdr_name) = Outputable.empty
   | null interesting_imports
   , Just name <- mod_name
+  , show_not_imported_line name
   = hsep
       [ text "No module named"
       , quotes (ppr name)
@@ -244,6 +238,7 @@ importSuggestions where_look imports rdr_name
       ]
   | is_qualified
   , null helpful_imports
+  , not (null interesting_imports)
   , mods <- map fst interesting_imports
   = hsep
       [ text "Neither"
@@ -329,6 +324,23 @@ importSuggestions where_look imports rdr_name
   (helpful_imports_hiding, helpful_imports_non_hiding)
     = partition (imv_is_hiding . snd) helpful_imports
 
+  -- See note [When to show/hide the module-not-imported line]
+  show_not_imported_line :: ModuleName -> Bool                    -- #15611
+  show_not_imported_line modnam
+      | modnam `elem` globMods                = False    -- #14225     -- 1
+      | moduleName currMod == modnam          = False                  -- 2.1
+      | is_last_loaded_mod modnam hpt_uniques = False                  -- 2.2
+      | otherwise                             = True
+    where
+      hpt_uniques = map fst (udfmToList hpt)
+      is_last_loaded_mod _ []         = False
+      is_last_loaded_mod modnam uniqs = last uniqs == getUnique modnam
+      globMods = nub [ mod
+                     | gre <- globalRdrEnvElts global_env
+                     , isGreOk where_look gre
+                     , (mod, _) <- qualsInScope gre
+                     ]
+
 extensionSuggestions :: RdrName -> SDoc
 extensionSuggestions rdrName
   | rdrName == mkUnqual varName (fsLit "mdo") ||
@@ -336,7 +348,34 @@ extensionSuggestions rdrName
       = text "Perhaps you meant to use RecursiveDo"
   | otherwise = Outputable.empty
 
-perhapsForallMsg :: SDoc
-perhapsForallMsg
-  = vcat [ text "Perhaps you intended to use ExplicitForAll or similar flag"
-         , text "to enable explicit-forall syntax: forall <tvs>. <type>"]
+qualsInScope :: GlobalRdrElt -> [(ModuleName, HowInScope)]
+-- Ones for which the qualified version is in scope
+qualsInScope GRE { gre_name = n, gre_lcl = lcl, gre_imp = is }
+      | lcl = case nameModule_maybe n of
+                Nothing -> []
+                Just m  -> [(moduleName m, Left (nameSrcSpan n))]
+      | otherwise = [ (is_as ispec, Right ispec)
+                    | i <- is, let ispec = is_decl i ]
+
+isGreOk :: WhereLooking -> GlobalRdrElt -> Bool
+isGreOk where_look = case where_look of
+                         WL_LocalTop  -> isLocalGRE
+                         WL_LocalOnly -> const False
+                         _            -> const True
+
+{- Note [When to show/hide the module-not-imported line]           -- #15611
+For the error message:
+    Not in scope X.Y
+    Module X does not export Y
+    No module named ‘X’ is imported:
+there are 2 cases, where we hide the last "no module is imported" line:
+1. If the module X has been imported.
+2. If the module X is the current module. There are 2 subcases:
+   2.1 If the unknown module name is in a input source file,
+       then we can use the getModule function to get the current module name.
+       (See test T15611a)
+   2.2 If the unknown module name has been entered by the user in GHCi,
+       then the getModule function returns something like "interactive:Ghci1",
+       and we have to check the current module in the last added entry of
+       the HomePackageTable. (See test T15611b)
+-}

@@ -32,6 +32,14 @@ Dumping out compiler intermediate structures
     output from :ghc-flag:`-ddump-simpl` will end up in
     :file:`{module}.dump-simpl`.
 
+.. ghc-flag:: -ddump-file-prefix=⟨str⟩
+    :shortdesc: Set the prefix of the filenames used for debugging output.
+    :type: dynamic
+
+    Set the prefix of the filenames used for debugging output. For example,
+    ``-ddump-file-prefix=Foo`` will cause the output from
+    :ghc-flag:`-ddump-simpl` to be dumped to :file:`Foo.dump-simpl`.
+
 .. ghc-flag:: -ddump-json
     :shortdesc: Dump error messages as JSON documents
     :type: dynamic
@@ -158,7 +166,9 @@ These flags dump various information from GHC's typechecker and renamer.
     :shortdesc: Dump typechecker output
     :type: dynamic
 
-    Dump typechecker output
+    Dump typechecker output. Note that this hides a great deal of detail by
+    default; you might consider using this with
+    :ghc-flag:`-fprint-typechecker-elaboration`.
 
 .. ghc-flag:: -ddump-tc-ast
     :shortdesc: Dump typechecker output as a syntax tree
@@ -213,7 +223,8 @@ subexpression elimination pass.
     Print a one-line summary of the size of the Core program at the end
     of the optimisation pipeline.
 
-.. ghc-flag:: -ddump-ds -ddump-ds-preopt
+.. ghc-flag:: -ddump-ds
+              -ddump-ds-preopt
     :shortdesc: Dump desugarer output.
     :type: dynamic
 
@@ -376,12 +387,14 @@ C-\\- representation
 These flags dump various phases of GHC's C-\\- pipeline.
 
 .. ghc-flag:: -ddump-cmm-verbose
-    :shortdesc: Show output from each C-\\- pipeline pass
+    :shortdesc: Show output from main C-\\- pipeline passes
     :type: dynamic
 
-    Dump output from all C-\\- pipeline stages. In case of
+    Dump output from main C-\\- pipeline stages. In case of
     ``.cmm`` compilation this also dumps the result of
-    file parsing.
+    file parsing. Not included are passes run by
+    the chosen backend. Currently only the NCG backends runs
+    additional passes ( :ghc-flag:`-ddump-opt-cmm` ).
 
     Cmm dumps don't include unreachable blocks since we print
     blocks in reverse post-order.
@@ -470,7 +483,13 @@ These flags dump various phases of GHC's C-\\- pipeline.
 
     Dump the result of the C-\\- pipeline processing
 
+.. ghc-flag:: -ddump-cfg-weights
+    :shortdesc: Dump the assumed weights of the CFG.
+    :type: dynamic
 
+    Dumps the CFG with weights used by the new block layout code.
+    Each CFG is dumped in dot format graph making it easy
+    to visualize them.
 
 LLVM code generator
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -538,7 +557,7 @@ assembler.
     :shortdesc: Dump final assembly
     :type: dynamic
 
-    Dump assembly language produced by the
+    Dump the final assembly produced by the native code generator.
 
 
 Miscellaneous backend dumps
@@ -552,13 +571,53 @@ These flags dump various bits of information from other backends.
 
     Dump byte-code objects (BCOs) produced for the GHC's byte-code interpreter.
 
+.. ghc-flag:: -ddump-rtti
+    :shortdesc: Trace runtime type inference
+    :type: dynamic
+
+    Trace runtime type inference done by various interpreter commands.
+
 .. ghc-flag:: -ddump-foreign
     :shortdesc: Dump ``foreign export`` stubs
     :type: dynamic
 
     Dump foreign export stubs.
 
+.. ghc-flag:: -ddump-ticked
+    :shortdesc: Dump the code instrumented by HPC (:ref:`hpc`).
+    :type: dynamic
 
+    Dump the code instrumented by HPC (:ref:`hpc`).
+
+.. ghc-flag:: -ddump-hpc
+    :shortdesc: An alias for :ghc-flag:`-ddump-ticked`.
+    :type: dynamic
+
+    An alias for :ghc-flag:`-ddump-ticked`.
+
+.. ghc-flag:: -ddump-mod-map
+    :shortdesc: Dump the state of the module mapping database.
+    :type: dynamic
+
+    Dump a mapping of modules to where they come from, and how:
+
+    - ``(hidden module)``: Module is hidden, and thus will never be available for
+      import.
+
+    - ``(unusable module)``: Module is unavailable because the package is unusable.
+
+    - ``(hidden package)``: This module is in someone's exported-modules list,
+      but that package is hidden.
+
+    - ``(exposed package)``: Module is available for import.
+
+    - ``(reexport by <PACKAGES>)``: This module is available from a reexport
+      of some set of exposed packages.
+
+    - ``(hidden reexport by <PACKAGES>)``: This module is available from a reexport
+      of some set of hidden packages.
+
+    - ``(package flag)``: This module export comes from a package flag.
 
 .. _formatting dumps:
 

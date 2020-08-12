@@ -14,7 +14,7 @@ module InstEnv (
         OverlapFlag(..), OverlapMode(..), setOverlapModeMaybe,
         ClsInst(..), DFunInstType, pprInstance, pprInstanceHdr, pprInstances,
         instanceHead, instanceSig, mkLocalInstance, mkImportedInstance,
-        instanceDFunId, tidyClsInstDFun, instanceRoughTcs,
+        instanceDFunId, updateClsInstDFun, instanceRoughTcs,
         fuzzyClsInstCmp, orphNamesOfClsInst,
 
         InstEnvs(..), VisibleOrphanModules, InstEnv,
@@ -199,8 +199,8 @@ being equal to
 instanceDFunId :: ClsInst -> DFunId
 instanceDFunId = is_dfun
 
-tidyClsInstDFun :: (DFunId -> DFunId) -> ClsInst -> ClsInst
-tidyClsInstDFun tidy_dfun ispec
+updateClsInstDFun :: (DFunId -> DFunId) -> ClsInst -> ClsInst
+updateClsInstDFun tidy_dfun ispec
   = ispec { is_dfun = tidy_dfun (is_dfun ispec) }
 
 instanceRoughTcs :: ClsInst -> [Maybe Name]
@@ -460,7 +460,7 @@ memberInstEnv inst_env ins_item@(ClsInst { is_cls_nm = cls_nm } ) =
     eqType (varType (is_dfun cls1)) (varType (is_dfun cls2))
 
 extendInstEnvList :: InstEnv -> [ClsInst] -> InstEnv
-extendInstEnvList inst_env ispecs = foldl extendInstEnv inst_env ispecs
+extendInstEnvList inst_env ispecs = foldl' extendInstEnv inst_env ispecs
 
 extendInstEnv :: InstEnv -> ClsInst -> InstEnv
 extendInstEnv inst_env ins_item@(ClsInst { is_cls_nm = cls_nm })

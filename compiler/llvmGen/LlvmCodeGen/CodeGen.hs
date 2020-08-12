@@ -38,7 +38,6 @@ import Util
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.Writer
 
-import Data.Semigroup   ( Semigroup )
 import qualified Data.Semigroup as Semigroup
 import Data.List ( nub )
 import Data.Maybe ( catMaybes )
@@ -170,17 +169,25 @@ barrier = do
     let s = Fence False SyncSeqCst
     return (unitOL s, [])
 
+-- | Insert a 'barrier', unless the target platform is in the provided list of
+--   exceptions (where no code will be emitted instead).
+barrierUnless :: [Arch] -> LlvmM StmtData
+barrierUnless exs = do
+    platform <- getLlvmPlatform
+    if platformArch platform `elem` exs
+        then return (nilOL, [])
+        else barrier
+
 -- | Foreign Calls
 genCall :: ForeignTarget -> [CmmFormal] -> [CmmActual]
               -> LlvmM StmtData
 
--- Write barrier needs to be handled specially as it is implemented as an LLVM
--- intrinsic function.
+-- Barriers need to be handled specially as they are implemented as LLVM
+-- intrinsic functions.
+genCall (PrimTarget MO_ReadBarrier) _ _ =
+    barrierUnless [ArchX86, ArchX86_64, ArchSPARC]
 genCall (PrimTarget MO_WriteBarrier) _ _ = do
-    platform <- getLlvmPlatform
-    if platformArch platform `elem` [ArchX86, ArchX86_64, ArchSPARC]
-       then return (nilOL, [])
-       else barrier
+    barrierUnless [ArchX86, ArchX86_64, ArchSPARC]
 
 genCall (PrimTarget MO_Touch) _ _
  = return (nilOL, [])
@@ -761,6 +768,10 @@ cmmPrimOpFunctions mop = do
     MO_F32_Cosh   -> fsLit "coshf"
     MO_F32_Tanh   -> fsLit "tanhf"
 
+    MO_F32_Asinh  -> fsLit "asinhf"
+    MO_F32_Acosh  -> fsLit "acoshf"
+    MO_F32_Atanh  -> fsLit "atanhf"
+
     MO_F64_Exp    -> fsLit "exp"
     MO_F64_Log    -> fsLit "log"
     MO_F64_Sqrt   -> fsLit "llvm.sqrt.f64"
@@ -778,6 +789,10 @@ cmmPrimOpFunctions mop = do
     MO_F64_Sinh   -> fsLit "sinh"
     MO_F64_Cosh   -> fsLit "cosh"
     MO_F64_Tanh   -> fsLit "tanh"
+
+    MO_F64_Asinh  -> fsLit "asinh"
+    MO_F64_Acosh  -> fsLit "acosh"
+    MO_F64_Atanh  -> fsLit "atanh"
 
     MO_Memcpy _   -> fsLit $ "llvm.memcpy."  ++ intrinTy1
     MO_Memmove _  -> fsLit $ "llvm.memmove." ++ intrinTy1
@@ -817,6 +832,7 @@ cmmPrimOpFunctions mop = do
     -- We support MO_U_Mul2 through ordinary LLVM mul instruction, see the
     -- appropriate case of genCall.
     MO_U_Mul2 {}     -> unsupported
+    MO_ReadBarrier   -> unsupported
     MO_WriteBarrier  -> unsupported
     MO_Touch         -> unsupported
     MO_UF_Conv _     -> unsupported
@@ -1188,6 +1204,9 @@ genMachOp _ op [x] = case op of
     MO_UU_Conv from to
         -> sameConv from (widthToLlvmInt to) LM_Trunc LM_Zext
 
+    MO_XX_Conv from to
+        -> sameConv from (widthToLlvmInt to) LM_Trunc LM_Zext
+
     MO_FF_Conv from to
         -> sameConv from (widthToLlvmFloat to) LM_Fptrunc LM_Fpext
 
@@ -1449,6 +1468,7 @@ genMachOp_slow opt op [x, y] = case op of
     MO_FS_Conv _ _ -> panicOp
     MO_SS_Conv _ _ -> panicOp
     MO_UU_Conv _ _ -> panicOp
+    MO_XX_Conv _ _ -> panicOp
     MO_FF_Conv _ _ -> panicOp
 
     MO_V_Insert  {} -> panicOp
@@ -1543,8 +1563,8 @@ genMachOp_slow opt op [x, y] = case op of
         panicOp = panic $ "LLVM.CodeGen.genMachOp_slow: unary op encountered"
                        ++ "with two arguments! (" ++ show op ++ ")"
 
--- More then two expression, invalid!
-genMachOp_slow _ _ _ = panic "genMachOp: More then 2 expressions in MachOp!"
+-- More than two expression, invalid!
+genMachOp_slow _ _ _ = panic "genMachOp: More than 2 expressions in MachOp!"
 
 
 -- | Handle CmmLoad expression.
@@ -1647,7 +1667,7 @@ getCmmReg (CmmLocal (LocalReg un _))
        dflags <- getDynFlags
        case exists of
          Just ety -> return (LMLocalVar un $ pLift ety)
-         Nothing  -> fail $ "getCmmReg: Cmm register " ++ showSDoc dflags (ppr un) ++ " was not allocated!"
+         Nothing  -> panic $ "getCmmReg: Cmm register " ++ showSDoc dflags (ppr un) ++ " was not allocated!"
            -- This should never happen, as every local variable should
            -- have been assigned a value at some point, triggering
            -- "funPrologue" to allocate it on the stack.
@@ -1657,7 +1677,7 @@ getCmmReg (CmmGlobal g)
        dflags <- getDynFlags
        if onStack
          then return (lmGlobalRegVar dflags g)
-         else fail $ "getCmmReg: Cmm register " ++ showSDoc dflags (ppr g) ++ " not stack-allocated!"
+         else panic $ "getCmmReg: Cmm register " ++ showSDoc dflags (ppr g) ++ " not stack-allocated!"
 
 -- | Return the value of a given register, as well as its type. Might
 -- need to be load from stack.

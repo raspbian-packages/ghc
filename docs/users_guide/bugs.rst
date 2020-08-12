@@ -42,6 +42,13 @@ Lexical syntax
    as a single qualified operator rather than the two lexemes ``M`` and
    ``.\``.
 
+-  ``forall`` is always a reserved keyword at the type level, contrary
+   to the Haskell Report, which allows type variables to be named ``forall``.
+   Note that this does not imply that GHC always enables the
+   :ghc-flag:`-XExplicitForAll` extension. Even without this extension enabled,
+   reserving ``forall`` as a keyword has significance. For instance, GHC will
+   not parse the type signature ``foo :: forall x``.
+
 .. _infelicities-syntax:
 
 Context-free syntax
@@ -170,6 +177,50 @@ same context. For example, this is fine: ::
 
       g :: Ord a => a -> Bool
       g y = (y <= y) || f True
+
+.. _infelicities-default-exports:
+
+Default Module headers with -main-is
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The Haskell2010 Report specifies in <https://www.haskell.org/onlinereport/haskell2010/haskellch5.html#x11-990005.1> that
+
+    "An abbreviated form of module, consisting only of the module body,
+     is permitted. If this is used, the header is assumed to be
+     `module Main(main) where`."
+
+GHC's ``-main-is`` option can be used to change the name of the top-level entry
+point from ``main`` to any other variable.  When compiling the main module and
+``-main-is`` has been used to rename the default entry point, GHC will also use
+the alternate name in the default export list.
+
+Consider the following program: ::
+
+    -- file: Main.hs
+    program :: IO ()
+    program = return ()
+
+GHC will successfully compile this module with
+``ghc -main-is Main.program Main.hs``, because the default export list
+will include ``program`` rather than ``main``, as the Haskell Report
+typically requires.
+
+This change only applies to the main module.  Other modules will still export
+``main`` from a default export list, regardless of the ``-main-is`` flag.
+This allows use of ``-main-is`` with existing modules that export ``main`` via
+a default export list, even when ``-main-is`` points to a different entry
+point, as in this example (compiled with ``-main-is MainWrapper.program``). ::
+
+    -- file MainWrapper.hs
+    module MainWrapper where
+    import Main
+
+    program :: IO ()
+    program = putStrLn "Redirecting..." >> main
+
+    -- file Main.hs
+    main :: IO ()
+    main = putStrLn "I am main."
 
 .. _infelicities-Modules:
 

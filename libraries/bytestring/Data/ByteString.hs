@@ -20,9 +20,9 @@
 -- Stability   : stable
 -- Portability : portable
 --
--- A time and space-efficient implementation of byte vectors using
+-- A time- and space-efficient implementation of byte vectors using
 -- packed Word8 arrays, suitable for high performance use, both in terms
--- of large data quantities, or high speed requirements. Byte vectors
+-- of large data quantities and high speed requirements. Byte vectors
 -- are encoded as strict 'Word8' arrays of bytes, held in a 'ForeignPtr',
 -- and can be passed between C and Haskell with little effort.
 --
@@ -322,8 +322,8 @@ singleton c = unsafeCreate 1 $ \p -> poke p c
 
 -- | /O(n)/ Convert a @['Word8']@ into a 'ByteString'.
 --
--- For applications with large numbers of string literals, pack can be a
--- bottleneck. In such cases, consider using packAddress (GHC only).
+-- For applications with large numbers of string literals, 'pack' can be a
+-- bottleneck. In such cases, consider using 'unsafePackAddress' (GHC only).
 pack :: [Word8] -> ByteString
 pack = packBytes
 
@@ -548,7 +548,7 @@ foldl1 f ps
     | otherwise = foldl f (unsafeHead ps) (unsafeTail ps)
 {-# INLINE foldl1 #-}
 
--- | 'foldl1\'' is like 'foldl1', but strict in the accumulator.
+-- | 'foldl1'' is like 'foldl1', but strict in the accumulator.
 -- An exception will be thrown in the case of an empty ByteString.
 foldl1' :: (Word8 -> Word8 -> Word8) -> ByteString -> Word8
 foldl1' f ps
@@ -565,7 +565,7 @@ foldr1 f ps
     | otherwise      = foldr f (unsafeLast ps) (unsafeInit ps)
 {-# INLINE foldr1 #-}
 
--- | 'foldr1\'' is a variant of 'foldr1', but is strict in the
+-- | 'foldr1'' is a variant of 'foldr1', but is strict in the
 -- accumulator.
 foldr1' :: (Word8 -> Word8 -> Word8) -> ByteString -> Word8
 foldr1' f ps
@@ -1413,7 +1413,7 @@ findSubstring pat src
 
 {-# DEPRECATED findSubstring "findSubstring is deprecated in favour of breakSubstring." #-}
 
--- | Find the indexes of all (possibly overlapping) occurances of a
+-- | Find the indexes of all (possibly overlapping) occurences of a
 -- substring in a string.
 --
 findSubstrings :: ByteString -- ^ String to search for.
@@ -1771,7 +1771,7 @@ illegalBufferSize handle fn sz =
 -- | Read a handle's entire contents strictly into a 'ByteString'.
 --
 -- This function reads chunks at a time, increasing the chunk size on each
--- read. The final string is then realloced to the appropriate size. For
+-- read. The final string is then reallocated to the appropriate size. For
 -- files > half of available memory, this may lead to memory exhaustion.
 -- Consider using 'readFile' in this case.
 --

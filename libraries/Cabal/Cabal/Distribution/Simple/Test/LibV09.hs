@@ -30,7 +30,7 @@ import Distribution.Simple.Test.Log
 import Distribution.Simple.Utils
 import Distribution.System
 import Distribution.TestSuite
-import Distribution.Text
+import Distribution.Pretty
 import Distribution.Verbosity
 
 import qualified Control.Exception as CE
@@ -99,9 +99,14 @@ runTest pkg_descr lbi clbi flags suite = do
                     cpath <- canonicalizePath $ LBI.componentBuildDir lbi clbi
                     return (addLibraryPath os (cpath : paths) shellEnv)
                   else return shellEnv
-                createProcessWithEnv verbosity cmd opts Nothing (Just shellEnv')
-                                     -- these handles are closed automatically
-                                     CreatePipe (UseHandle wOut) (UseHandle wOut)
+                case testWrapper flags of
+                  Flag path -> createProcessWithEnv verbosity path (cmd:opts) Nothing (Just shellEnv')
+                               -- these handles are closed automatically
+                               CreatePipe (UseHandle wOut) (UseHandle wOut)
+
+                  NoFlag -> createProcessWithEnv verbosity cmd opts Nothing (Just shellEnv')
+                            -- these handles are closed automatically
+                            CreatePipe (UseHandle wOut) (UseHandle wOut)
 
         hPutStr wIn $ show (tempLog, PD.testName suite)
         hClose wIn
@@ -123,7 +128,8 @@ runTest pkg_descr lbi clbi flags suite = do
                                  (unUnqualComponentName $ testSuiteName l) (testLogs l)
         -- Generate TestSuiteLog from executable exit code and a machine-
         -- readable test log
-        suiteLog <- fmap ((\l -> l { logFile = finalLogName l }) . read) -- TODO: eradicateNoParse
+        suiteLog <- fmap (\s -> (\l -> l { logFile = finalLogName l })
+                    . fromMaybe (error $ "panic! read @TestSuiteLog " ++ show s) $ readMaybe s) -- TODO: eradicateNoParse
                     $ readFile tempLog
 
         -- Write summary notice to log file indicating start of test suite
@@ -148,7 +154,7 @@ runTest pkg_descr lbi clbi flags suite = do
     notice verbosity $ summarizeSuiteFinish suiteLog
 
     when isCoverageEnabled $
-        markupTest verbosity lbi distPref (display $ PD.package pkg_descr) suite
+        markupTest verbosity lbi distPref (prettyShow $ PD.package pkg_descr) suite
 
     return suiteLog
   where
@@ -209,7 +215,7 @@ simpleTestStub :: ModuleName -> String
 simpleTestStub m = unlines
     [ "module Main ( main ) where"
     , "import Distribution.Simple.Test.LibV09 ( stubMain )"
-    , "import " ++ show (disp m) ++ " ( tests )"
+    , "import " ++ show (pretty m) ++ " ( tests )"
     , "main :: IO ()"
     , "main = stubMain tests"
     ]
@@ -219,7 +225,7 @@ simpleTestStub m = unlines
 -- of detectable errors when Cabal is compiled.
 stubMain :: IO [Test] -> IO ()
 stubMain tests = do
-    (f, n) <- fmap read getContents -- TODO: eradicateNoParse
+    (f, n) <- fmap (\s -> fromMaybe (error $ "panic! read " ++ show s) $ readMaybe s) getContents -- TODO: eradicateNoParse
     dir <- getCurrentDirectory
     results <- (tests >>= stubRunTests) `CE.catch` errHandler
     setCurrentDirectory dir

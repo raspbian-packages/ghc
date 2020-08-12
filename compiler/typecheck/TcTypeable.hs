@@ -19,6 +19,7 @@ import TyCoRep( Type(..), TyLit(..) )
 import TcEnv
 import TcEvidence ( mkWpTyApps )
 import TcRnMonad
+import TcTypeableValidity
 import HscTypes ( lookupId )
 import PrelNames
 import TysPrim ( primTyCons )
@@ -28,15 +29,13 @@ import TysWiredIn ( tupleTyCon, sumTyCon, runtimeRepTyCon
 import Name
 import Id
 import Type
-import Kind ( isTYPEApp )
 import TyCon
 import DataCon
-import Name ( getOccName )
 import Module
 import HsSyn
 import DynFlags
 import Bag
-import Var ( TyVarBndr(..) )
+import Var ( VarBndr(..) )
 import CoreMap
 import Constants
 import Fingerprint(Fingerprint(..), fingerprintString, fingerprintFingerprints)
@@ -45,7 +44,6 @@ import FastString ( FastString, mkFastString, fsLit )
 
 import Control.Monad.Trans.State
 import Control.Monad.Trans.Class (lift)
-import Data.Maybe ( isJust )
 import Data.Word( Word64 )
 
 {- Note [Grand plan for Typeable]
@@ -401,7 +399,7 @@ mkTyConRepBinds :: TypeableStuff -> TypeRepTodo
                 -> TypeableTyCon -> KindRepM (LHsBinds GhcTc)
 mkTyConRepBinds stuff@(Stuff {..}) todo (TypeableTyCon {..})
   = do -- Make a KindRep
-       let (bndrs, kind) = splitForAllTyVarBndrs (tyConKind tycon)
+       let (bndrs, kind) = splitForAllVarBndrs (tyConKind tycon)
        liftTc $ traceTc "mkTyConKindRepBinds"
                         (ppr tycon $$ ppr (tyConKind tycon) $$ ppr kind)
        let ctx = mkDeBruijnContext (map binderVar bndrs)
@@ -411,36 +409,6 @@ mkTyConRepBinds stuff@(Stuff {..}) todo (TypeableTyCon {..})
        let tycon_rep_rhs = mkTyConRepTyConRHS stuff todo tycon kind_rep
            tycon_rep_bind = mkVarBind tycon_rep_id tycon_rep_rhs
        return $ unitBag tycon_rep_bind
-
--- | Here is where we define the set of Typeable types. These exclude type
--- families and polytypes.
-tyConIsTypeable :: TyCon -> Bool
-tyConIsTypeable tc =
-       isJust (tyConRepName_maybe tc)
-    && typeIsTypeable (dropForAlls $ tyConKind tc)
-      -- Ensure that the kind of the TyCon, with its initial foralls removed,
-      -- is representable (e.g. has no higher-rank polymorphism or type
-      -- synonyms).
-
--- | Is a particular 'Type' representable by @Typeable@? Here we look for
--- polytypes and types containing casts (which may be, for instance, a type
--- family).
-typeIsTypeable :: Type -> Bool
--- We handle types of the form (TYPE rep) specifically to avoid
--- looping on (tyConIsTypeable RuntimeRep)
-typeIsTypeable ty
-  | Just ty' <- coreView ty         = typeIsTypeable ty'
-typeIsTypeable ty
-  | Just _ <- isTYPEApp ty          = True
-typeIsTypeable (TyVarTy _)          = True
-typeIsTypeable (AppTy a b)          = typeIsTypeable a && typeIsTypeable b
-typeIsTypeable (FunTy a b)          = typeIsTypeable a && typeIsTypeable b
-typeIsTypeable (TyConApp tc args)   = tyConIsTypeable tc
-                                   && all typeIsTypeable args
-typeIsTypeable (ForAllTy{})         = False
-typeIsTypeable (LitTy _)            = True
-typeIsTypeable (CastTy{})           = False
-typeIsTypeable (CoercionTy{})       = False
 
 -- | Maps kinds to 'KindRep' bindings. This binding may either be defined in
 -- some other module (in which case the @Maybe (LHsExpr Id@ will be 'Nothing')
@@ -550,11 +518,15 @@ mkKindRepRhs :: TypeableStuff
 mkKindRepRhs stuff@(Stuff {..}) in_scope = new_kind_rep
   where
     new_kind_rep k
-        -- We handle TYPE separately to make it clear to consumers
-        -- (e.g. serializers) that there is a loop here (as
-        -- TYPE :: RuntimeRep -> TYPE 'LiftedRep)
-      | Just rr <- isTYPEApp k
-      = return $ nlHsDataCon kindRepTYPEDataCon `nlHsApp` nlHsDataCon rr
+        -- We handle (TYPE LiftedRep) etc separately to make it
+        -- clear to consumers (e.g. serializers) that there is
+        -- a loop here (as TYPE :: RuntimeRep -> TYPE 'LiftedRep)
+      | not (tcIsConstraintKind k)    -- Typeable respects the Constraint/* distinction
+                                      -- so do not follow the special case here
+      , Just arg <- kindRep_maybe k
+      , Just (tc, []) <- splitTyConApp_maybe arg
+      , Just dc <- isPromotedDataCon_maybe tc
+      = return $ nlHsDataCon kindRepTYPEDataCon `nlHsApp` nlHsDataCon dc
 
     new_kind_rep (TyVarTy v)
       | Just idx <- lookupCME in_scope v
@@ -579,7 +551,7 @@ mkKindRepRhs stuff@(Stuff {..}) in_scope = new_kind_rep
       | otherwise
       = pprPanic "mkTyConKindRepBinds(TyConApp)" (ppr tc $$ ppr k)
 
-    new_kind_rep (ForAllTy (TvBndr var _) ty)
+    new_kind_rep (ForAllTy (Bndr var _) ty)
       = pprPanic "mkTyConKindRepBinds(ForAllTy)" (ppr var $$ ppr ty)
 
     new_kind_rep (FunTy t1 t2)

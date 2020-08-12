@@ -38,14 +38,16 @@ instance Monad Parser where
                         Success pos'' (out1++out2) imp'' b
                     Failure pos'' msg -> Failure pos'' msg
             Failure pos' msg -> Failure pos' msg
-    fail msg = Parser $ \pos _ -> Failure pos msg
+
+failp :: String -> Parser a
+failp msg = Parser $ \pos _ -> Failure pos msg
 
 instance Alternative Parser where
     empty = mzero
     (<|>) = mplus
 
 instance MonadPlus Parser where
-    mzero                     = fail "mzero"
+    mzero                     = failp "mzero"
     Parser m `mplus` Parser n =
         Parser $ \pos s -> case m pos s of
             success@(Success _ _ _ _) -> success
@@ -97,6 +99,9 @@ anyChar_ = do
 
 any2Chars_ :: Parser ()
 any2Chars_ = anyChar_ >> anyChar_
+
+any3Chars_ :: Parser ()
+any3Chars_ = anyChar_ >> anyChar_ >> anyChar_
 
 many :: Parser a -> Parser [a]
 many p = many1 p `mplus` return []
@@ -159,12 +164,59 @@ text = do
                 _ -> do
                     return () `fakeOutput` unescapeHashes symb
                     text
-        '\"':_    -> do anyChar_; hsString '\"'; text
-        '\'':_    -> do anyChar_; hsString '\''; text
-        '{':'-':_ -> do any2Chars_; linePragma `mplus`
-                                    columnPragma `mplus`
-                                    hsComment; text
-        _:_       -> do anyChar_; text
+        '\"':_        -> do anyChar_; hsString '\"'; text
+        -- See Note [Single Quotes]
+        '\'':'\\':_ -> do anyChar_; hsString '\''; text -- Case 1
+        '\'':_:'\'':_ -> do any3Chars_; text -- Case 2
+        '\'':d:_ | isSpace d -> do -- Case 3
+          any2Chars_
+          manySatisfy_ (\c' -> isSpace c')
+          manySatisfy_ (\c' -> isAlphaNum c' || c' == '_' || c' == '\'')
+          text
+        '\'':_ -> do -- Case 4
+          anyChar_
+          manySatisfy_ (\c' -> isAlphaNum c' || c' == '_' || c' == '\'')
+          text
+        '{':'-':_ -> do
+          any2Chars_
+          linePragma `mplus` columnPragma `mplus` hsComment
+          text
+        _:_           -> do anyChar_; text
+
+{- Note [Single Quotes]
+~~~~~~~~~~~~~~~~~~~~~~~
+hsc2hs performs some tricks to figure out if we are looking at character
+literal or a promoted data constructor. In order, the cases considered are:
+
+1. quote-backslash: An escape sequence character literal. Since these
+   escape sequences have several different possible lengths, hsc2hs relies
+   on hsString to consume everything after this until another single quote
+   is encountered. See Note [Handling escaped characters].
+2. quote-any-quote: A character literal. Consumes the triplet.
+3. quote-space: Here, the order of the patterns becomes important. This
+   case and the case below handle promoted data constructors. This one
+   is to handle data constructor that end in a quote. They have special
+   syntax for promotion that requires adding a leading space. After an
+   arbitrary number of initial space characters, consume
+   all alphanumeric characters and quotes, considering them part of the
+   identifier.
+4. quote: If nothing else matched, we assume we are dealing with a normal
+   promoted data constructor. Consume all alphanumeric characters and
+   quotes, considering them part of the identifier.
+
+Here are some lines of code for which at one of the described cases
+would be matched at some point:
+
+    data Foo = Foo' | Bar
+
+    main :: IO ()
+    main = do
+1>    putChar '\NUL'
+2>    putChar 'x'
+3>    let y = Proxy :: Proxy ' Foo'
+4>    let x = Proxy :: Proxy 'Bar
+      pure ()
+-}
 
 hsString :: Char -> Parser ()
 hsString quote = do
@@ -172,6 +224,7 @@ hsString quote = do
     case s of
         []               -> return ()
         c:_ | c == quote -> anyChar_
+        -- See Note [Handling escaped characters]
         '\\':c:_
             | isSpace c  -> do
                 anyChar_
@@ -180,6 +233,27 @@ hsString quote = do
                 hsString quote
             | otherwise  -> do any2Chars_; hsString quote
         _:_              -> do anyChar_; hsString quote
+
+{- Note [Handling escaped characters]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+There are several accepted escape codes for string and character literals.
+The function hsString handles all escape sequences that start with space
+in its first guard and all others in the otherwise guard. It only needs
+to consume two characters to handle these non-space-prefixed escape
+sequences correctly. Consider these examples:
+
+* Single Character: \t ->
+* Multiple Characters: \DEL -> EL
+* Decimal: \1789 -> 789
+* Hexadecimal: \xbeef -> beef
+* Octal: \o3576 -> 3576
+
+Crucially, none of these suffixes left after dropping the leading two
+characters ever contain single quote, double quote, or backslash.
+Consequently, these leftover characters will be matched by the
+final pattern match (_:_) in hsString since the call to any2Chars_
+is followed by recursing.
+-}
 
 hsComment :: Parser ()
 hsComment = do

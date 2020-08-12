@@ -103,7 +103,7 @@ checkStackFrame( StgPtr c )
 
     case UPDATE_FRAME:
       ASSERT(LOOKS_LIKE_CLOSURE_PTR(((StgUpdateFrame*)c)->updatee));
-    /* fallthrough */
+      FALLTHROUGH;
     case ATOMICALLY_FRAME:
     case CATCH_RETRY_FRAME:
     case CATCH_STM_FRAME:
@@ -172,7 +172,7 @@ checkStackChunk( StgPtr sp, StgPtr stack_end )
     while (p < stack_end) {
         p += checkStackFrame( p );
     }
-    // ASSERT( p == stack_end ); -- HWL
+    ASSERT( p == stack_end );
 }
 
 static void
@@ -233,6 +233,7 @@ checkClosure( const StgClosure* p )
     p = UNTAG_CONST_CLOSURE(p);
 
     info = p->header.info;
+    load_load_barrier();
 
     if (IS_FORWARDING_PTR(info)) {
         barf("checkClosure: found EVACUATED closure %d", info->type);
@@ -243,6 +244,7 @@ checkClosure( const StgClosure* p )
 #endif
 
     info = INFO_PTR_TO_STRUCT(info);
+    load_load_barrier();
 
     switch (info->type) {
 
@@ -564,6 +566,7 @@ checkTSO(StgTSO *tso)
 
     next = tso->_link;
     info = (const StgInfoTable*) tso->_link->header.info;
+    load_load_barrier();
 
     ASSERT(next == END_TSO_QUEUE ||
            info == &stg_MVAR_TSO_QUEUE_info ||

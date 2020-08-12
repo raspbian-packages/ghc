@@ -20,6 +20,7 @@ module TcSMonad (
     checkConstraintsTcS, checkTvConstraintsTcS,
 
     runTcPluginTcS, addUsedGRE, addUsedGREs,
+    matchGlobalInst, TcM.ClsInstResult(..),
 
     QCInst(..),
 
@@ -97,17 +98,17 @@ module TcSMonad (
     -- MetaTyVars
     newFlexiTcSTy, instFlexi, instFlexiX,
     cloneMetaTyVar, demoteUnfilledFmv,
-    tcInstType, tcInstSkolTyVarsX,
+    tcInstSkolTyVarsX,
 
     TcLevel,
     isFilledMetaTyVar_maybe, isFilledMetaTyVar,
     zonkTyCoVarsAndFV, zonkTcType, zonkTcTypes, zonkTcTyVar, zonkCo,
     zonkTyCoVarsAndFVList,
     zonkSimples, zonkWC,
-    zonkTcTyCoVarBndr,
+    zonkTyCoVarKind,
 
     -- References
-    newTcRef, readTcRef, updTcRef,
+    newTcRef, readTcRef, writeTcRef, updTcRef,
 
     -- Misc
     getDefaultInfo, getDynFlags, getGlobalRdrEnvTcS,
@@ -133,14 +134,15 @@ import FamInstEnv
 
 import qualified TcRnMonad as TcM
 import qualified TcMType as TcM
+import qualified ClsInst as TcM( matchGlobalInst, ClsInstResult(..) )
 import qualified TcEnv as TcM
-       ( checkWellStaged, topIdLvl, tcGetDefaultTys, tcLookupClass, tcLookupId )
+       ( checkWellStaged, tcGetDefaultTys, tcLookupClass, tcLookupId, topIdLvl )
 import PrelNames( heqTyConKey, eqTyConKey )
+import ClsInst( InstanceWhat(..) )
 import Kind
 import TcType
 import DynFlags
 import Type
-import TyCoRep( coHoleCoVar )
 import Coercion
 import Unify
 
@@ -172,7 +174,7 @@ import Control.Monad
 import qualified Control.Monad.Fail as MonadFail
 import MonadUtils
 import Data.IORef
-import Data.List ( foldl', partition, mapAccumL )
+import Data.List ( partition, mapAccumL )
 
 #if defined(DEBUG)
 import Digraph
@@ -363,12 +365,13 @@ selectNextWorkItem :: TcS (Maybe Ct)
 -- See Note [Prioritise equalities]
 selectNextWorkItem
   = do { wl_var <- getTcSWorkListRef
-       ; wl <- wrapTcS (TcM.readTcRef wl_var)
+       ; wl <- readTcRef wl_var
        ; case selectWorkItem wl of {
            Nothing -> return Nothing ;
            Just (ct, new_wl) ->
-    do { checkReductionDepth (ctLoc ct) (ctPred ct)
-       ; wrapTcS (TcM.writeTcRef wl_var new_wl)
+    do { -- checkReductionDepth (ctLoc ct) (ctPred ct)
+         -- This is done by TcInteract.chooseInstance
+       ; writeTcRef wl_var new_wl
        ; return (Just ct) } } }
 
 -- Pretty printing
@@ -2192,7 +2195,7 @@ are some wrinkles:
 Note [Let-bound skolems]
 ~~~~~~~~~~~~~~~~~~~~~~~~
 If   * the inert set contains a canonical Given CTyEqCan (a ~ ty)
-and  * 'a' is a skolem bound in this very implication, b
+and  * 'a' is a skolem bound in this very implication,
 
 then:
 a) The Given is pretty much a let-binding, like
@@ -2211,6 +2214,31 @@ For an example, see Trac #9211.
 See also TcUnify Note [Deeper level on the left] for how we ensure
 that the right variable is on the left of the equality when both are
 tyvars.
+
+You might wonder whether the skokem really needs to be bound "in the
+very same implication" as the equuality constraint.
+(c.f. Trac #15009) Consider this:
+
+  data S a where
+    MkS :: (a ~ Int) => S a
+
+  g :: forall a. S a -> a -> blah
+  g x y = let h = \z. ( z :: Int
+                      , case x of
+                           MkS -> [y,z])
+          in ...
+
+From the type signature for `g`, we get `y::a` .  Then when when we
+encounter the `\z`, we'll assign `z :: alpha[1]`, say.  Next, from the
+body of the lambda we'll get
+
+  [W] alpha[1] ~ Int                             -- From z::Int
+  [W] forall[2]. (a ~ Int) => [W] alpha[1] ~ a   -- From [y,z]
+
+Now, suppose we decide to float `alpha ~ a` out of the implication
+and then unify `alpha := a`.  Now we are stuck!  But if treat
+`alpha ~ Int` first, and unify `alpha := Int`, all is fine.
+But we absolutely cannot float that equality or we will get stuck.
 -}
 
 removeInertCts :: [Ct] -> InertCans -> InertCans
@@ -2583,7 +2611,9 @@ instance Applicative TcS where
   (<*>) = ap
 
 instance Monad TcS where
+#if !MIN_VERSION_base(4,13,0)
   fail = MonadFail.fail
+#endif
   m >>= k   = TcS (\ebs -> unTcS m ebs >>= \r -> unTcS (k r) ebs)
 
 instance MonadFail.MonadFail TcS where
@@ -2840,7 +2870,7 @@ checkTvConstraintsTcS skol_info skol_tvs (TcS thing_inside)
                          -- does not emit any work-list constraints
              new_tcs_env = tcs_env { tcs_worklist = wl_panic }
 
-       ; ((res, wanteds), new_tclvl) <- TcM.pushTcLevelM $
+       ; (new_tclvl, (res, wanteds)) <- TcM.pushTcLevelM $
                                         thing_inside new_tcs_env
 
        ; unless (null wanteds) $
@@ -2880,7 +2910,7 @@ checkConstraintsTcS skol_info skol_tvs given (TcS thing_inside)
                          -- does not emit any work-list constraints
              new_tcs_env = tcs_env { tcs_worklist = wl_panic }
 
-       ; ((res, wanteds), new_tclvl) <- TcM.pushTcLevelM $
+       ; (new_tclvl, (res, wanteds)) <- TcM.pushTcLevelM $
                                         thing_inside new_tcs_env
 
        ; ev_binds_var <- TcM.newTcEvBinds
@@ -2924,21 +2954,21 @@ getTcSWorkListRef :: TcS (IORef WorkList)
 getTcSWorkListRef = TcS (return . tcs_worklist)
 
 getTcSInerts :: TcS InertSet
-getTcSInerts = getTcSInertsRef >>= wrapTcS . (TcM.readTcRef)
+getTcSInerts = getTcSInertsRef >>= readTcRef
 
 setTcSInerts :: InertSet -> TcS ()
-setTcSInerts ics = do { r <- getTcSInertsRef; wrapTcS (TcM.writeTcRef r ics) }
+setTcSInerts ics = do { r <- getTcSInertsRef; writeTcRef r ics }
 
 getWorkListImplics :: TcS (Bag Implication)
 getWorkListImplics
   = do { wl_var <- getTcSWorkListRef
-       ; wl_curr <- wrapTcS (TcM.readTcRef wl_var)
+       ; wl_curr <- readTcRef wl_var
        ; return (wl_implics wl_curr) }
 
 updWorkListTcS :: (WorkList -> WorkList) -> TcS ()
 updWorkListTcS f
   = do { wl_var <- getTcSWorkListRef
-       ; wrapTcS (TcM.updTcRef wl_var f)}
+       ; updTcRef wl_var f }
 
 emitWorkNC :: [CtEvidence] -> TcS ()
 emitWorkNC evs
@@ -2957,6 +2987,9 @@ newTcRef x = wrapTcS (TcM.newTcRef x)
 
 readTcRef :: TcRef a -> TcS a
 readTcRef ref = wrapTcS (TcM.readTcRef ref)
+
+writeTcRef :: TcRef a -> a -> TcS ()
+writeTcRef ref val = wrapTcS (TcM.writeTcRef ref val)
 
 updTcRef :: TcRef a -> (a->a) -> TcS ()
 updTcRef ref upd_fn = wrapTcS (TcM.updTcRef ref upd_fn)
@@ -3040,27 +3073,30 @@ addUsedGRE warn_if_deprec gre = wrapTcS $ TcM.addUsedGRE warn_if_deprec gre
 -- Various smaller utilities [TODO, maybe will be absorbed in the instance matcher]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-checkWellStagedDFun :: PredType -> DFunId -> CtLoc -> TcS ()
-checkWellStagedDFun pred dfun_id loc
+checkWellStagedDFun :: CtLoc -> InstanceWhat -> PredType -> TcS ()
+-- Check that we do not try to use an instance before it is available.  E.g.
+--    instance Eq T where ...
+--    f x = $( ... (\(p::T) -> p == p)... )
+-- Here we can't use the equality function from the instance in the splice
+
+checkWellStagedDFun loc what pred
+  | TopLevInstance { iw_dfun_id = dfun_id } <- what
+  , let bind_lvl = TcM.topIdLvl dfun_id
+  , bind_lvl > impLevel
   = wrapTcS $ TcM.setCtLocM loc $
     do { use_stage <- TcM.getStage
        ; TcM.checkWellStaged pp_thing bind_lvl (thLevel use_stage) }
+
+  | otherwise
+  = return ()    -- Fast path for common case
   where
     pp_thing = text "instance for" <+> quotes (ppr pred)
-    bind_lvl = TcM.topIdLvl dfun_id
 
 pprEq :: TcType -> TcType -> SDoc
 pprEq ty1 ty2 = pprParendType ty1 <+> char '~' <+> pprParendType ty2
 
 isFilledMetaTyVar_maybe :: TcTyVar -> TcS (Maybe Type)
-isFilledMetaTyVar_maybe tv
- = case tcTyVarDetails tv of
-     MetaTv { mtv_ref = ref }
-        -> do { cts <- wrapTcS (TcM.readTcRef ref)
-              ; case cts of
-                  Indirect ty -> return (Just ty)
-                  Flexi       -> return Nothing }
-     _ -> return Nothing
+isFilledMetaTyVar_maybe tv = wrapTcS (TcM.isFilledMetaTyVar_maybe tv)
 
 isFilledMetaTyVar :: TcTyVar -> TcS Bool
 isFilledMetaTyVar tv = wrapTcS (TcM.isFilledMetaTyVar tv)
@@ -3089,8 +3125,8 @@ zonkSimples cts = wrapTcS (TcM.zonkSimples cts)
 zonkWC :: WantedConstraints -> TcS WantedConstraints
 zonkWC wc = wrapTcS (TcM.zonkWC wc)
 
-zonkTcTyCoVarBndr :: TcTyCoVar -> TcS TcTyCoVar
-zonkTcTyCoVarBndr tv = wrapTcS (TcM.zonkTcTyCoVarBndr tv)
+zonkTyCoVarKind :: TcTyCoVar -> TcS TcTyCoVar
+zonkTyCoVarKind tv = wrapTcS (TcM.zonkTyCoVarKind tv)
 
 {- *********************************************************************
 *                                                                      *
@@ -3185,7 +3221,7 @@ demoteUnfilledFmv fmv
 
 -----------------------------
 dischargeFunEq :: CtEvidence -> TcTyVar -> TcCoercion -> TcType -> TcS ()
--- (dischargeFunEqCan ev tv co ty)
+-- (dischargeFunEq tv co ty)
 --     Preconditions
 --       - ev :: F tys ~ tv   is a CFunEqCan
 --       - tv is a FlatMetaTv of FlatSkolTv
@@ -3265,12 +3301,12 @@ instFlexiHelper subst tv
        ; TcM.traceTc "instFlexi" (ppr ty')
        ; return (extendTvSubst subst tv ty') }
 
-tcInstType :: ([TyVar] -> TcM (TCvSubst, [TcTyVar]))
-                   -- ^ How to instantiate the type variables
-           -> Id   -- ^ Type to instantiate
-           -> TcS ([(Name, TcTyVar)], TcThetaType, TcType) -- ^ Result
-                -- (type vars, preds (incl equalities), rho)
-tcInstType inst_tyvars id = wrapTcS (TcM.tcInstType inst_tyvars id)
+matchGlobalInst :: DynFlags
+                -> Bool      -- True <=> caller is the short-cut solver
+                             -- See Note [Shortcut solving: overlap]
+                -> Class -> [Type] -> TcS TcM.ClsInstResult
+matchGlobalInst dflags short_cut cls tys
+  = wrapTcS (TcM.matchGlobalInst dflags short_cut cls tys)
 
 tcInstSkolTyVarsX :: TCvSubst -> [TyVar] -> TcS (TCvSubst, [TcTyVar])
 tcInstSkolTyVarsX subst tvs = wrapTcS $ TcM.tcInstSkolTyVarsX subst tvs
@@ -3298,12 +3334,12 @@ setEvBind ev_bind
 
 -- | Mark variables as used filling a coercion hole
 useVars :: CoVarSet -> TcS ()
-useVars vars
+useVars co_vars
   = do { ev_binds_var <- getTcEvBindsVar
        ; let ref = ebv_tcvs ev_binds_var
        ; wrapTcS $
          do { tcvs <- TcM.readTcRef ref
-            ; let tcvs' = tcvs `unionVarSet` vars
+            ; let tcvs' = tcvs `unionVarSet` co_vars
             ; TcM.writeTcRef ref tcvs' } }
 
 -- | Equalities only

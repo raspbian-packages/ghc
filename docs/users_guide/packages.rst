@@ -129,7 +129,7 @@ The GHC command line options that control packages are:
 
 .. ghc-flag:: -package ⟨pkg⟩
     :shortdesc: Expose package ⟨pkg⟩
-    :type: dynamic/ ``:set``
+    :type: dynamic
     :category:
 
     This option causes the installed package ⟨pkg⟩ to be exposed. The
@@ -181,7 +181,7 @@ The GHC command line options that control packages are:
 
 .. ghc-flag:: -package-id ⟨unit-id⟩
     :shortdesc: Expose package by id ⟨unit-id⟩
-    :type: dynamic/ ``:set``
+    :type: dynamic
     :category:
 
     Exposes a package like :ghc-flag:`-package ⟨pkg⟩`, but the package is named
@@ -209,7 +209,7 @@ The GHC command line options that control packages are:
 
 .. ghc-flag:: -hide-package ⟨pkg⟩
     :shortdesc: Hide package ⟨pkg⟩
-    :type: dynamic/ ``:set``
+    :type: dynamic
     :category:
 
     This option does the opposite of :ghc-flag:`-package ⟨pkg⟩`: it causes the
@@ -222,7 +222,7 @@ The GHC command line options that control packages are:
 
 .. ghc-flag:: -ignore-package ⟨pkg⟩
     :shortdesc: Ignore package ⟨pkg⟩
-    :type: dynamic/ ``:set``
+    :type: dynamic
     :category:
 
     Causes the compiler to behave as if package ⟨pkg⟩, and any packages
@@ -257,7 +257,7 @@ The GHC command line options that control packages are:
 
 .. ghc-flag:: -trust ⟨pkg⟩
     :shortdesc: Expose package ⟨pkg⟩ and set it to be trusted
-    :type: dynamic/ ``:set``
+    :type: dynamic
     :category:
     :noindex:
 
@@ -269,7 +269,7 @@ The GHC command line options that control packages are:
 
 .. ghc-flag:: -distrust ⟨pkg⟩
     :shortdesc: Expose package ⟨pkg⟩ and set it to be distrusted
-    :type: dynamic/ ``:set``
+    :type: dynamic
     :category:
     :noindex:
 
@@ -281,7 +281,7 @@ The GHC command line options that control packages are:
 
 .. ghc-flag:: -distrust-all-packages
     :shortdesc: Distrust all packages by default
-    :type: dynamic/ ``:set``
+    :type: dynamic
     :category:
     :noindex:
 
@@ -579,6 +579,12 @@ must be relative to the location of the package environment file.
 
     Use the package environment in ⟨file⟩, or in
     ``$HOME/.ghc/arch-os-version/environments/⟨name⟩``
+    If set to ``-`` no package environment is read.
+
+.. envvar:: GHC_ENVIRONMENT
+
+    Specifies the path to the package environment file to be used by GHC.
+    Overridden by the :ghc-flag:`-package-env ⟨file⟩|⟨name⟩` flag if set.
 
 In order, ``ghc`` will look for the package environment in the following
 locations:
@@ -588,11 +594,11 @@ locations:
 -  File ``$HOME/.ghc/arch-os-version/environments/name`` if you pass the
    option ``-package-env ⟨name⟩``.
 
--  File ⟨file⟩ if the environment variable ``GHC_ENVIRONMENT`` is set to
+-  File ⟨file⟩ if the environment variable :envvar:`GHC_ENVIRONMENT` is set to
    ⟨file⟩.
 
 -  File ``$HOME/.ghc/arch-os-version/environments/name`` if the
-   environment variable ``GHC_ENVIRONMENT`` is set to ⟨name⟩.
+   environment variable :envvar:`GHC_ENVIRONMENT` is set to ⟨name⟩.
 
 Additionally, unless ``-hide-all-packages`` is specified ``ghc`` will also
 look for the package environment in the following locations:
@@ -1056,7 +1062,7 @@ extra indirection).
 
    .. code-block:: sh
 
-       ghc -shared libHSfoo-1.0-ghcGHCVersion.so A.o B.o C.o
+       ghc -shared -dynamic -o libHSfoo-1.0-ghcGHCVersion.so A.o B.o C.o
 
    Using GHC's version number in the shared object name allows different
    library versions compiled by different GHC versions to be installed

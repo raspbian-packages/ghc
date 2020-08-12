@@ -66,7 +66,7 @@ module Data.ByteString.Char8 (
         null,                   -- :: ByteString -> Bool
         length,                 -- :: ByteString -> Int
 
-        -- * Transformating ByteStrings
+        -- * Transforming ByteStrings
         map,                    -- :: (Char -> Char) -> ByteString -> ByteString
         reverse,                -- :: ByteString -> ByteString
         intersperse,            -- :: Char -> ByteString -> ByteString
@@ -348,7 +348,7 @@ foldl :: (a -> Char -> a) -> a -> ByteString -> a
 foldl f = B.foldl (\a c -> f a (w2c c))
 {-# INLINE foldl #-}
 
--- | 'foldl\'' is like foldl, but strict in the accumulator.
+-- | 'foldl'' is like foldl, but strict in the accumulator.
 foldl' :: (a -> Char -> a) -> a -> ByteString -> a
 foldl' f = B.foldl' (\a c -> f a (w2c c))
 {-# INLINE foldl' #-}
@@ -360,7 +360,7 @@ foldr :: (Char -> a -> a) -> a -> ByteString -> a
 foldr f = B.foldr (\c a -> f (w2c c) a)
 {-# INLINE foldr #-}
 
--- | 'foldr\'' is a strict variant of foldr
+-- | 'foldr'' is a strict variant of foldr
 foldr' :: (Char -> a -> a) -> a -> ByteString -> a
 foldr' f = B.foldr' (\c a -> f (w2c c) a)
 {-# INLINE foldr' #-}
@@ -897,6 +897,8 @@ unwords = intercalate (singleton ' ')
 -- | readInt reads an Int from the beginning of the ByteString.  If there is no
 -- integer at the beginning of the string, it returns Nothing, otherwise
 -- it just returns the int read, and the rest of the string.
+--
+-- Note: This function will overflow the Int for large integers.
 readInt :: ByteString -> Maybe (Int, ByteString)
 readInt as
     | null as   = Nothing

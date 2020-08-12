@@ -28,8 +28,8 @@ import Distribution.ModuleName
 import Language.Haskell.Extension ( Language(..), Extension )
 
 import qualified Text.PrettyPrint as Disp
-import qualified Distribution.Compat.ReadP as Parse
-import Distribution.Text
+import qualified Distribution.Deprecated.ReadP as Parse
+import Distribution.Deprecated.Text
 
 import GHC.Generics ( Generic )
 
@@ -39,15 +39,16 @@ import GHC.Generics ( Generic )
 --   likely to want and/or that we are likely to be able to
 --   intelligently guess.
 data InitFlags =
-    InitFlags { nonInteractive :: Flag Bool
+    InitFlags { interactive    :: Flag Bool
               , quiet          :: Flag Bool
               , packageDir     :: Flag FilePath
               , noComments     :: Flag Bool
               , minimal        :: Flag Bool
+              , simpleProject  :: Flag Bool
 
               , packageName  :: Flag P.PackageName
               , version      :: Flag Version
-              , cabalVersion :: Flag VersionRange
+              , cabalVersion :: Flag Version
               , license      :: Flag License
               , author       :: Flag String
               , email        :: Flag String
@@ -65,9 +66,15 @@ data InitFlags =
               , otherModules   :: Maybe [ModuleName]
               , otherExts      :: Maybe [Extension]
 
-              , dependencies :: Maybe [P.Dependency]
-              , sourceDirs   :: Maybe [String]
-              , buildTools   :: Maybe [String]
+              , dependencies    :: Maybe [P.Dependency]
+              , applicationDirs :: Maybe [String]
+              , sourceDirs      :: Maybe [String]
+              , buildTools      :: Maybe [String]
+
+              , initializeTestSuite :: Flag Bool
+              , testDirs            :: Maybe [String]
+
+              , initHcPath    :: Flag FilePath
 
               , initVerbosity :: Flag Verbosity
               , overwrite     :: Flag Bool
@@ -79,7 +86,9 @@ data InitFlags =
   -- not Flag [foo].
 
 data BuildType = LibBuild | ExecBuild
+  deriving Eq
 
+-- The type of package to initialize.
 data PackageType = Library | Executable | LibraryAndExecutable
   deriving (Show, Read, Eq)
 
@@ -118,4 +127,3 @@ data Category
 instance Text Category where
   disp  = Disp.text . show
   parse = Parse.choice $ map (fmap read . Parse.string . show) [Codec .. ] -- TODO: eradicateNoParse
-

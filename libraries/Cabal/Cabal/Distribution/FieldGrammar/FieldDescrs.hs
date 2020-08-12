@@ -10,16 +10,17 @@ module Distribution.FieldGrammar.FieldDescrs (
 import Distribution.Compat.Prelude
 import Prelude ()
 
+import Data.List                   (dropWhileEnd)
 import Distribution.Compat.Lens    (aview, cloneLens)
 import Distribution.Compat.Newtype
 import Distribution.FieldGrammar
-import Distribution.Pretty         (pretty)
-import Distribution.Utils.Generic  (fromUTF8BS)
+import Distribution.Pretty         (pretty, showFreeText)
 
-import qualified Data.Map                   as Map
-import qualified Distribution.Parsec.Class  as P
-import qualified Distribution.Parsec.Field  as P
-import qualified Text.PrettyPrint           as Disp
+import qualified Data.Map                        as Map
+import qualified Distribution.Compat.CharParsing as C
+import qualified Distribution.Fields.Field       as P
+import qualified Distribution.Parsec             as P
+import qualified Text.PrettyPrint                as Disp
 
 -- strict pair
 data SP s = SP
@@ -28,7 +29,7 @@ data SP s = SP
     }
 
 -- | A collection field parsers and pretty-printers.
-newtype FieldDescrs s a = F { runF :: Map String (SP s) }
+newtype FieldDescrs s a = F { runF :: Map P.FieldName (SP s) }
   deriving (Functor)
 
 instance Applicative (FieldDescrs s) where
@@ -36,20 +37,20 @@ instance Applicative (FieldDescrs s) where
     f <*> x = F (mappend (runF f) (runF x))
 
 singletonF :: P.FieldName -> (s -> Disp.Doc) -> (forall m. P.CabalParsing m => s -> m s) -> FieldDescrs s a
-singletonF fn f g = F $ Map.singleton (fromUTF8BS fn) (SP f g)
+singletonF fn f g = F $ Map.singleton fn (SP f g)
 
 -- | Lookup a field value pretty-printer.
-fieldDescrPretty :: FieldDescrs s a -> String -> Maybe (s -> Disp.Doc)
+fieldDescrPretty :: FieldDescrs s a -> P.FieldName -> Maybe (s -> Disp.Doc)
 fieldDescrPretty (F m) fn = pPretty <$> Map.lookup fn m
 
 -- | Lookup a field value parser.
-fieldDescrParse :: P.CabalParsing m => FieldDescrs s a -> String -> Maybe (s -> m s)
+fieldDescrParse :: P.CabalParsing m => FieldDescrs s a -> P.FieldName -> Maybe (s -> m s)
 fieldDescrParse (F m) fn = pParse <$> Map.lookup fn m
 
 fieldDescrsToList
     :: P.CabalParsing m
     => FieldDescrs s a
-    -> [(String, s -> Disp.Doc, s -> m s)]
+    -> [(P.FieldName, s -> Disp.Doc, s -> m s)]
 fieldDescrsToList = map mk . Map.toList . runF where
     mk (name, SP ppr parse) = (name, ppr, parse)
 
@@ -75,6 +76,14 @@ instance FieldGrammar FieldDescrs where
         f s = pretty (pack' _pack (aview l s))
         g s = cloneLens l (const (unpack' _pack <$> P.parsec)) s
 
+    freeTextField fn l = singletonF fn f g where
+        f s = maybe mempty showFreeText (aview l s)
+        g s = cloneLens l (const (Just <$> parsecFreeText)) s
+
+    freeTextFieldDef fn l = singletonF fn f g where
+        f s = showFreeText (aview l s)
+        g s = cloneLens l (const parsecFreeText) s
+
     monoidalFieldAla fn _pack l = singletonF fn f g where
         f s = pretty (pack' _pack (aview l s))
         g s = cloneLens l (\x -> mappend x . unpack' _pack <$> P.parsec) s
@@ -82,5 +91,23 @@ instance FieldGrammar FieldDescrs where
     prefixedFields _fnPfx _l = F mempty
     knownField _           = pure ()
     deprecatedSince _  _ x = x
+    removedIn _ _ x        = x
     availableSince _ _     = id
     hiddenField _          = F mempty
+
+parsecFreeText :: P.CabalParsing m => m String
+parsecFreeText = dropDotLines <$ C.spaces <*> many C.anyChar
+  where
+    -- Example package with dot lines
+    -- http://hackage.haskell.org/package/copilot-cbmc-0.1/copilot-cbmc.cabal
+    dropDotLines "." = "."
+    dropDotLines x = intercalate "\n" . map dotToEmpty . lines $ x
+
+    dotToEmpty x | trim' x == "." = ""
+    dotToEmpty x                  = trim x
+
+    trim' :: String -> String
+    trim' = dropWhileEnd (`elem` (" \t" :: String))
+
+    trim :: String -> String
+    trim = dropWhile isSpace . dropWhileEnd isSpace

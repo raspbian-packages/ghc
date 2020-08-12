@@ -11,6 +11,37 @@
  *
  * ---------------------------------------------------------------------------*/
 
+/* ----------------------------------------------------------------------------
+   We have two main scavenge functions:
+
+   - scavenge_block(bdescr *bd)
+   - scavenge_one(StgPtr p)
+
+   As the names and parameters suggest, first one scavenges a whole block while
+   the second one only scavenges one object. This however is not the only
+   difference. scavenge_block scavenges all SRTs while scavenge_one only
+   scavenges SRTs of stacks. The reason is because scavenge_one is called in two
+   cases:
+
+   - When scavenging a mut_list
+   - When scavenging a large object
+
+   We don't have to scavenge SRTs when scavenging a mut_list, because we only
+   scavenge mut_lists in minor GCs, and static objects are only collected in
+   major GCs.
+
+   However, because scavenge_one is also used to scavenge large objects (which
+   are scavenged even in major GCs), we need to deal with SRTs of large
+   objects. We never allocate large FUNs and THUNKs, but we allocate large
+   STACKs (e.g. in threadStackOverflow), and stack frames can have SRTs. So
+   scavenge_one skips FUN and THUNK SRTs but scavenges stack frame SRTs.
+
+   In summary, in a major GC:
+
+   - scavenge_block() scavenges all SRTs
+   - scavenge_one() scavenges only stack frame SRTs
+   ------------------------------------------------------------------------- */
+
 #include "PosixSource.h"
 #include "Rts.h"
 
@@ -394,7 +425,7 @@ scavenge_block (bdescr *bd)
   // time around the loop.
   while (p < bd->free || (bd == ws->todo_bd && p < ws->todo_free)) {
 
-      ASSERT(bd->link == NULL);
+    ASSERT(bd->link == NULL);
     ASSERT(LOOKS_LIKE_CLOSURE_PTR(p));
     info = get_itbl((StgClosure *)p);
 
@@ -467,7 +498,7 @@ scavenge_block (bdescr *bd)
 
     case FUN_1_0:
         scavenge_fun_srt(info);
-        /* fallthrough */
+        FALLTHROUGH;
     case CONSTR_1_0:
         evacuate(&((StgClosure *)p)->payload[0]);
         p += sizeofW(StgHeader) + 1;
@@ -480,7 +511,7 @@ scavenge_block (bdescr *bd)
 
     case FUN_0_1:
         scavenge_fun_srt(info);
-        /* fallthrough */
+        FALLTHROUGH;
     case CONSTR_0_1:
         p += sizeofW(StgHeader) + 1;
         break;
@@ -492,7 +523,7 @@ scavenge_block (bdescr *bd)
 
     case FUN_0_2:
         scavenge_fun_srt(info);
-        /* fallthrough */
+        FALLTHROUGH;
     case CONSTR_0_2:
         p += sizeofW(StgHeader) + 2;
         break;
@@ -505,7 +536,7 @@ scavenge_block (bdescr *bd)
 
     case FUN_1_1:
         scavenge_fun_srt(info);
-        /* fallthrough */
+        FALLTHROUGH;
     case CONSTR_1_1:
         evacuate(&((StgClosure *)p)->payload[0]);
         p += sizeofW(StgHeader) + 2;
@@ -1543,6 +1574,7 @@ scavenge_mutable_list(bdescr *bd, generation *gen)
             ASSERT(LOOKS_LIKE_CLOSURE_PTR(p));
 
 #if defined(DEBUG)
+            const StgInfoTable *pinfo;
             switch (get_itbl((StgClosure *)p)->type) {
             case MUT_VAR_CLEAN:
                 // can happen due to concurrent writeMutVars
@@ -1562,9 +1594,10 @@ scavenge_mutable_list(bdescr *bd, generation *gen)
             case TREC_CHUNK:
                 mutlist_TREC_CHUNK++; break;
             case MUT_PRIM:
-                if (((StgClosure*)p)->header.info == &stg_TVAR_WATCH_QUEUE_info)
+                pinfo = ((StgClosure*)p)->header.info;
+                if (pinfo == &stg_TVAR_WATCH_QUEUE_info)
                     mutlist_TVAR_WATCH_QUEUE++;
-                else if (((StgClosure*)p)->header.info == &stg_TREC_HEADER_info)
+                else if (pinfo == &stg_TREC_HEADER_info)
                     mutlist_TREC_HEADER++;
                 else
                     mutlist_OTHERS++;
@@ -1707,7 +1740,7 @@ scavenge_static(void)
 
     case FUN_STATIC:
       scavenge_fun_srt(info);
-      /* fallthrough */
+      FALLTHROUGH;
 
       // a FUN_STATIC can also be an SRT, so it may have pointer
       // fields.  See Note [SRTs] in CmmBuildInfoTables, specifically

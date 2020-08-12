@@ -1,10 +1,9 @@
 {-# OPTIONS -fno-warn-unused-imports #-}
-#include "HsConfigure.h"
--- #hide
 module Data.Time.LocalTime.Internal.TimeOfDay
 (
     -- * Time of day
     TimeOfDay(..),midnight,midday,makeTimeOfDayValid,
+    timeToDaysAndTimeOfDay,daysAndTimeOfDayToTime,
     utcToLocalTimeOfDay,localToUTCTimeOfDay,
     timeToTimeOfDay,timeOfDayToTime,
     dayFractionToTimeOfDay,timeOfDayToDayFraction
@@ -13,10 +12,9 @@ module Data.Time.LocalTime.Internal.TimeOfDay
 import Control.DeepSeq
 import Data.Typeable
 import Data.Fixed
-#if LANGUAGE_Rank2Types
 import Data.Data
-#endif
 import Data.Time.Clock.Internal.DiffTime
+import Data.Time.Clock.Internal.NominalDiffTime
 import Data.Time.Calendar.Private
 import Data.Time.LocalTime.Internal.TimeZone
 
@@ -30,15 +28,7 @@ data TimeOfDay = TimeOfDay {
     -- | Note that 0 <= 'todSec' < 61, accomodating leap seconds.
     -- Any local minute may have a leap second, since leap seconds happen in all zones simultaneously
     todSec     :: Pico
-} deriving (Eq,Ord
-#if LANGUAGE_DeriveDataTypeable
-#if LANGUAGE_Rank2Types
-#if HAS_DataPico
-    ,Data, Typeable
-#endif
-#endif
-#endif
-    )
+} deriving (Eq,Ord,Data, Typeable)
 
 instance NFData TimeOfDay where
     rnf (TimeOfDay h m s) = rnf h `seq` rnf m `seq` s `seq` () -- FIXME: Data.Fixed had no NFData instances yet at time of writing
@@ -60,6 +50,20 @@ makeTimeOfDayValid h m s = do
     _ <- clipValid 0 59 m
     _ <- clipValid 0 60.999999999999 s
     return (TimeOfDay h m s)
+
+-- | Convert a period of time into a count of days and a time of day since midnight.
+-- The time of day will never have a leap second.
+timeToDaysAndTimeOfDay :: NominalDiffTime -> (Integer,TimeOfDay)
+timeToDaysAndTimeOfDay dt = let
+    s = realToFrac dt
+    (m,ms) = divMod' s 60
+    (h,hm) = divMod' m 60
+    (d,dh) = divMod' h 24
+    in (d,TimeOfDay dh hm ms)
+
+-- | Convert a count of days and a time of day since midnight into a period of time.
+daysAndTimeOfDayToTime :: Integer -> TimeOfDay -> NominalDiffTime
+daysAndTimeOfDayToTime d (TimeOfDay dh hm ms) = (+) (realToFrac ms) $ (*) 60 $ (+) (realToFrac hm) $ (*) 60 $ (+) (realToFrac dh) $ (*) 24 $ realToFrac d
 
 -- | Convert a time of day in UTC to a time of day in some timezone, together with a day adjustment.
 utcToLocalTimeOfDay :: TimeZone -> TimeOfDay -> (Integer,TimeOfDay)

@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP, NondecreasingIndentation, TupleSections, RecordWildCards #-}
+{-# LANGUAGE BangPatterns #-}
 {-# OPTIONS_GHC -fno-cse #-}
 -- -fno-cse is needed for GLOBAL_VAR's to behave properly
 
@@ -86,35 +87,45 @@ import Foreign (Ptr)
 The persistent linker state *must* match the actual state of the
 C dynamic linker at all times, so we keep it in a private global variable.
 
-The global IORef used for PersistentLinkerState actually contains another MVar.
-The reason for this is that we want to allow another loaded copy of the GHC
-library to side-effect the PLS and for those changes to be reflected here.
+The global IORef used for PersistentLinkerState actually contains another MVar,
+which in turn contains a Maybe PersistentLinkerState. The MVar serves to ensure
+mutual exclusion between multiple loaded copies of the GHC library. The Maybe
+may be Nothing to indicate that the linker has not yet been initialised.
 
 The PersistentLinkerState maps Names to actual closures (for
 interpreted code only), for use during linking.
 -}
 #if STAGE < 2
-GLOBAL_VAR_M(v_PersistentLinkerState, newMVar (panic "Dynamic linker not initialised"), MVar PersistentLinkerState)
-GLOBAL_VAR(v_InitLinkerDone, False, Bool) -- Set True when dynamic linker is initialised
+GLOBAL_VAR_M( v_PersistentLinkerState
+            , newMVar Nothing
+            , MVar (Maybe PersistentLinkerState))
 #else
 SHARED_GLOBAL_VAR_M( v_PersistentLinkerState
                    , getOrSetLibHSghcPersistentLinkerState
                    , "getOrSetLibHSghcPersistentLinkerState"
-                   , newMVar (panic "Dynamic linker not initialised")
-                   , MVar PersistentLinkerState)
--- Set True when dynamic linker is initialised
-SHARED_GLOBAL_VAR( v_InitLinkerDone
-                 , getOrSetLibHSghcInitLinkerDone
-                 , "getOrSetLibHSghcInitLinkerDone"
-                 , False
-                 , Bool)
+                   , newMVar Nothing
+                   , MVar (Maybe PersistentLinkerState))
 #endif
 
+uninitialised :: a
+uninitialised = panic "Dynamic linker not initialised"
+
 modifyPLS_ :: (PersistentLinkerState -> IO PersistentLinkerState) -> IO ()
-modifyPLS_ f = readIORef v_PersistentLinkerState >>= flip modifyMVar_ f
+modifyPLS_ f = readIORef v_PersistentLinkerState
+  >>= flip modifyMVar_ (fmap pure . f . fromMaybe uninitialised)
 
 modifyPLS :: (PersistentLinkerState -> IO (PersistentLinkerState, a)) -> IO a
-modifyPLS f = readIORef v_PersistentLinkerState >>= flip modifyMVar f
+modifyPLS f = readIORef v_PersistentLinkerState
+  >>= flip modifyMVar (fmapFst pure . f . fromMaybe uninitialised)
+  where fmapFst f = fmap (\(x, y) -> (f x, y))
+
+readPLS :: IO PersistentLinkerState
+readPLS = readIORef v_PersistentLinkerState
+  >>= fmap (fromMaybe uninitialised) . readMVar
+
+modifyMbPLS_
+  :: (Maybe PersistentLinkerState -> IO (Maybe PersistentLinkerState)) -> IO ()
+modifyMbPLS_ f = readIORef v_PersistentLinkerState >>= flip modifyMVar_ f
 
 data PersistentLinkerState
    = PersistentLinkerState {
@@ -169,10 +180,10 @@ extendLoadedPkgs pkgs =
 
 extendLinkEnv :: [(Name,ForeignHValue)] -> IO ()
 extendLinkEnv new_bindings =
-  modifyPLS_ $ \pls -> do
-    let ce = closure_env pls
-    let new_ce = extendClosureEnv ce new_bindings
-    return pls{ closure_env = new_ce }
+  modifyPLS_ $ \pls@PersistentLinkerState{..} -> do
+    let new_ce = extendClosureEnv closure_env new_bindings
+    return $! pls{ closure_env = new_ce }
+    -- strictness is important for not retaining old copies of the pls
 
 deleteFromLinkEnv :: [Name] -> IO ()
 deleteFromLinkEnv to_remove =
@@ -254,7 +265,7 @@ withExtendedLinkEnv new_env action
 -- | Display the persistent linker state.
 showLinkerState :: DynFlags -> IO ()
 showLinkerState dflags
-  = do pls <- readIORef v_PersistentLinkerState >>= readMVar
+  = do pls <- readPLS
        putLogMsg dflags NoReason SevDump noSrcSpan
           (defaultDumpStyle dflags)
                  (vcat [text "----- Linker state -----",
@@ -289,11 +300,10 @@ showLinkerState dflags
 --
 initDynLinker :: HscEnv -> IO ()
 initDynLinker hsc_env =
-  modifyPLS_ $ \pls0 -> do
-    done <- readIORef v_InitLinkerDone
-    if done then return pls0
-            else do writeIORef v_InitLinkerDone True
-                    reallyInitDynLinker hsc_env
+  modifyMbPLS_ $ \pls -> do
+    case pls of
+      Just  _ -> return pls
+      Nothing -> Just <$> reallyInitDynLinker hsc_env
 
 reallyInitDynLinker :: HscEnv -> IO PersistentLinkerState
 reallyInitDynLinker hsc_env = do
@@ -379,8 +389,10 @@ linkCmdLineLibs' hsc_env pls =
       all_paths_env <- addEnvPaths "LD_LIBRARY_PATH" all_paths
       pathCache <- mapM (addLibrarySearchPath hsc_env) all_paths_env
 
+      let merged_specs = mergeStaticObjects cmdline_lib_specs
       pls1 <- foldM (preloadLib hsc_env lib_paths framework_paths) pls
-                    cmdline_lib_specs
+                    merged_specs
+
       maybePutStr dflags "final link ... "
       ok <- resolveObjs hsc_env
 
@@ -391,6 +403,19 @@ linkCmdLineLibs' hsc_env pls =
       else throwGhcExceptionIO (ProgramError "linking extra libraries/objects failed")
 
       return pls1
+
+-- | Merge runs of consecutive of 'Objects'. This allows for resolution of
+-- cyclic symbol references when dynamically linking. Specifically, we link
+-- together all of the static objects into a single shared object, avoiding
+-- the issue we saw in #13786.
+mergeStaticObjects :: [LibrarySpec] -> [LibrarySpec]
+mergeStaticObjects specs = go [] specs
+  where
+    go :: [FilePath] -> [LibrarySpec] -> [LibrarySpec]
+    go accum (Objects objs : rest) = go (objs ++ accum) rest
+    go accum@(_:_) rest = Objects (reverse accum) : go [] rest
+    go [] (spec:rest) = spec : go [] rest
+    go [] [] = []
 
 {- Note [preload packages]
 
@@ -419,7 +444,7 @@ users?
 
 classifyLdInput :: DynFlags -> FilePath -> IO (Maybe LibrarySpec)
 classifyLdInput dflags f
-  | isObjectFilename platform f = return (Just (Object f))
+  | isObjectFilename platform f = return (Just (Objects [f]))
   | isDynLibFilename platform f = return (Just (DLLPath f))
   | otherwise          = do
         putLogMsg dflags NoReason SevInfo noSrcSpan
@@ -434,8 +459,8 @@ preloadLib
 preloadLib hsc_env lib_paths framework_paths pls lib_spec = do
   maybePutStr dflags ("Loading object " ++ showLS lib_spec ++ " ... ")
   case lib_spec of
-    Object static_ish -> do
-      (b, pls1) <- preload_static lib_paths static_ish
+    Objects static_ishs -> do
+      (b, pls1) <- preload_statics lib_paths static_ishs
       maybePutStrLn dflags (if b  then "done" else "not found")
       return pls1
 
@@ -494,13 +519,13 @@ preloadLib hsc_env lib_paths framework_paths pls lib_spec = do
                         intercalate "\n" (map ("   "++) paths)))
 
     -- Not interested in the paths in the static case.
-    preload_static _paths name
-       = do b <- doesFileExist name
+    preload_statics _paths names
+       = do b <- or <$> mapM doesFileExist names
             if not b then return (False, pls)
                      else if dynamicGhc
-                             then  do pls1 <- dynLoadObjs hsc_env pls [name]
+                             then  do pls1 <- dynLoadObjs hsc_env pls names
                                       return (True, pls1)
-                             else  do loadObj hsc_env name
+                             else  do mapM_ (loadObj hsc_env) names
                                       return (True, pls)
 
     preload_static_archive _paths name
@@ -1093,15 +1118,19 @@ unload_wkr :: HscEnv
 -- Does the core unload business
 -- (the wrapper blocks exceptions and deals with the PLS get and put)
 
-unload_wkr hsc_env keep_linkables pls = do
+unload_wkr hsc_env keep_linkables pls@PersistentLinkerState{..}  = do
+  -- NB. careful strictness here to avoid keeping the old PLS when
+  -- we're unloading some code.  -fghci-leak-check with the tests in
+  -- testsuite/ghci can detect space leaks here.
+
   let (objs_to_keep, bcos_to_keep) = partition isObjectLinkable keep_linkables
 
       discard keep l = not (linkableInSet l keep)
 
       (objs_to_unload, remaining_objs_loaded) =
-         partition (discard objs_to_keep) (objs_loaded pls)
+         partition (discard objs_to_keep) objs_loaded
       (bcos_to_unload, remaining_bcos_loaded) =
-         partition (discard bcos_to_keep) (bcos_loaded pls)
+         partition (discard bcos_to_keep) bcos_loaded
 
   mapM_ unloadObjs objs_to_unload
   mapM_ unloadObjs bcos_to_unload
@@ -1112,7 +1141,7 @@ unload_wkr hsc_env keep_linkables pls = do
                    filter (not . null . linkableObjs) bcos_to_unload))) $
     purgeLookupSymbolCache hsc_env
 
-  let bcos_retained = mkModuleSet $ map linkableModule remaining_bcos_loaded
+  let !bcos_retained = mkModuleSet $ map linkableModule remaining_bcos_loaded
 
       -- Note that we want to remove all *local*
       -- (i.e. non-isExternal) names too (these are the
@@ -1120,13 +1149,13 @@ unload_wkr hsc_env keep_linkables pls = do
       keep_name (n,_) = isExternalName n &&
                         nameModule n `elemModuleSet` bcos_retained
 
-      itbl_env'     = filterNameEnv keep_name (itbl_env pls)
-      closure_env'  = filterNameEnv keep_name (closure_env pls)
+      itbl_env'     = filterNameEnv keep_name itbl_env
+      closure_env'  = filterNameEnv keep_name closure_env
 
-      new_pls = pls { itbl_env = itbl_env',
-                      closure_env = closure_env',
-                      bcos_loaded = remaining_bcos_loaded,
-                      objs_loaded = remaining_objs_loaded }
+      !new_pls = pls { itbl_env = itbl_env',
+                       closure_env = closure_env',
+                       bcos_loaded = remaining_bcos_loaded,
+                       objs_loaded = remaining_objs_loaded }
 
   return new_pls
   where
@@ -1152,7 +1181,9 @@ unload_wkr hsc_env keep_linkables pls = do
   ********************************************************************* -}
 
 data LibrarySpec
-   = Object FilePath    -- Full path name of a .o file, including trailing .o
+   = Objects [FilePath] -- Full path names of set of .o files, including trailing .o
+                        -- We allow batched loading to ensure that cyclic symbol
+                        -- references can be resolved (see #13786).
                         -- For dynamic objects only, try to find the object
                         -- file in all the directories specified in
                         -- v_Library_paths before giving up.
@@ -1186,7 +1217,7 @@ partOfGHCi
                    ["base", "template-haskell", "editline"]
 
 showLS :: LibrarySpec -> String
-showLS (Object nm)    = "(static) " ++ nm
+showLS (Objects nms)  = "(static) [" ++ intercalate ", " nms ++ "]"
 showLS (Archive nm)   = "(static archive) " ++ nm
 showLS (DLL nm)       = "(dynamic) " ++ nm
 showLS (DLLPath nm)   = "(dynamic) " ++ nm
@@ -1248,8 +1279,9 @@ linkPackage hsc_env pkg
    = do
         let dflags    = hsc_dflags hsc_env
             platform  = targetPlatform dflags
-            dirs | interpreterDynamic dflags = Packages.libraryDynDirs pkg
-                 | otherwise                 = Packages.libraryDirs pkg
+            is_dyn = interpreterDynamic dflags
+            dirs | is_dyn    = Packages.libraryDynDirs pkg
+                 | otherwise = Packages.libraryDirs pkg
 
         let hs_libs   =  Packages.hsLibraries pkg
             -- The FFI GHCi import lib isn't needed as
@@ -1284,7 +1316,8 @@ linkPackage hsc_env pkg
         -- Complication: all the .so's must be loaded before any of the .o's.
         let known_dlls = [ dll  | DLLPath dll    <- classifieds ]
             dlls       = [ dll  | DLL dll        <- classifieds ]
-            objs       = [ obj  | Object obj     <- classifieds ]
+            objs       = [ obj  | Objects objs    <- classifieds
+                                , obj <- objs ]
             archs      = [ arch | Archive arch   <- classifieds ]
 
         -- Add directories to library search paths
@@ -1299,8 +1332,12 @@ linkPackage hsc_env pkg
         -- See comments with partOfGHCi
         when (packageName pkg `notElem` partOfGHCi) $ do
             loadFrameworks hsc_env platform pkg
-            mapM_ (load_dyn hsc_env)
-              (known_dlls ++ map (mkSOName platform) dlls)
+            -- See Note [Crash early load_dyn and locateLib]
+            -- Crash early if can't load any of `known_dlls`
+            mapM_ (load_dyn hsc_env True) known_dlls
+            -- For remaining `dlls` crash early only when there is surely
+            -- no package's DLL around ... (not is_dyn)
+            mapM_ (load_dyn hsc_env (not is_dyn) . mkSOName platform) dlls
 
         -- After loading all the DLLs, we can load the static objects.
         -- Ordering isn't important here, because we do one final link
@@ -1323,18 +1360,72 @@ linkPackage hsc_env pkg
                              ++ sourcePackageIdString pkg ++ "'"
                  in throwGhcExceptionIO (InstallationError errmsg)
 
+{-
+Note [Crash early load_dyn and locateLib]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+If a package is "normal" (exposes it's code from more than zero Haskell
+modules, unlike e.g. that in ghcilink004) and is built "dyn" way, then
+it has it's code compiled and linked into the DLL, which GHCi linker picks
+when loading the package's code (see the big comment in the beginning of
+`locateLib`).
+
+When loading DLLs, GHCi linker simply calls the system's `dlopen` or
+`LoadLibrary` APIs. This is quite different from the case when GHCi linker
+loads an object file or static library. When loading an object file or static
+library GHCi linker parses them and resolves all symbols "manually".
+These object file or static library may reference some external symbols
+defined in some external DLLs. And GHCi should know which these
+external DLLs are.
+
+But when GHCi loads a DLL, it's the *system* linker who manages all
+the necessary dependencies, and it is able to load this DLL not having
+any extra info. Thus we don't *have to* crash in this case even if we
+are unable to load any supposed dependencies explicitly.
+
+Suppose during GHCi session a client of the package wants to
+`foreign import` a symbol which isn't exposed by the package DLL, but
+is exposed by such an external (dependency) DLL.
+If the DLL isn't *explicitly* loaded because `load_dyn` failed to do
+this, then the client code eventually crashes because the GHCi linker
+isn't able to locate this symbol (GHCi linker maintains a list of
+explicitly loaded DLLs it looks into when trying to find a symbol).
+
+This is why we still should try to load all the dependency DLLs
+even though we know that the system linker loads them implicitly when
+loading the package DLL.
+
+Why we still keep the `crash_early` opportunity then not allowing such
+a permissive behaviour for any DLLs? Well, we, perhaps, improve a user
+experience in some cases slightly.
+
+But if it happens there exist other corner cases where our current
+usage of `crash_early` flag is overly restrictive, we may lift the
+restriction very easily.
+-}
+
 -- we have already searched the filesystem; the strings passed to load_dyn
 -- can be passed directly to loadDLL.  They are either fully-qualified
 -- ("/usr/lib/libfoo.so"), or unqualified ("libfoo.so").  In the latter case,
 -- loadDLL is going to search the system paths to find the library.
---
-load_dyn :: HscEnv -> FilePath -> IO ()
-load_dyn hsc_env dll = do
+load_dyn :: HscEnv -> Bool -> FilePath -> IO ()
+load_dyn hsc_env crash_early dll = do
   r <- loadDLL hsc_env dll
   case r of
     Nothing  -> return ()
-    Just err -> throwGhcExceptionIO (CmdLineError ("can't load .so/.DLL for: "
-                                                ++ dll ++ " (" ++ err ++ ")" ))
+    Just err ->
+      if crash_early
+        then cmdLineErrorIO err
+        else let dflags = hsc_dflags hsc_env in
+          when (wopt Opt_WarnMissedExtraSharedLib dflags)
+            $ putLogMsg dflags
+                (Reason Opt_WarnMissedExtraSharedLib) SevWarning
+                  noSrcSpan (defaultUserStyle dflags)(note err)
+  where
+    note err = vcat $ map text
+      [ err
+      , "It's OK if you don't want to use symbols from it directly."
+      , "(the package DLL is loaded by the system linker"
+      , " which manages dependencies by itself)." ]
 
 loadFrameworks :: HscEnv -> Platform -> PackageConfig -> IO ()
 loadFrameworks hsc_env platform pkg
@@ -1346,8 +1437,8 @@ loadFrameworks hsc_env platform pkg
     load fw = do  r <- loadFramework hsc_env fw_dirs fw
                   case r of
                     Nothing  -> return ()
-                    Just err -> throwGhcExceptionIO (CmdLineError ("can't load framework: "
-                                                        ++ fw ++ " (" ++ err ++ ")" ))
+                    Just err -> cmdLineErrorIO ("can't load framework: "
+                                                ++ fw ++ " (" ++ err ++ ")" )
 
 -- Try to find an object file for a given library in the given paths.
 -- If it isn't present, we assume that addDLL in the RTS can find it,
@@ -1396,13 +1487,8 @@ locateLib hsc_env is_hs lib_dirs gcc_dirs lib
     findDynObject `orElse`
     assumeDll
 
-  | loading_profiled_hs_libs -- only a libHSfoo_p.a archive will do.
-  = findArchive `orElse`
-    assumeDll
-
   | otherwise
-    -- HSfoo.o is the best, but only works for the normal way
-    -- libHSfoo.a is the backup option.
+    -- use HSfoo.{o,p_o} if it exists, otherwise fallback to libHSfoo{,_p}.a
   = findObject  `orElse`
     findArchive `orElse`
     assumeDll
@@ -1413,7 +1499,9 @@ locateLib hsc_env is_hs lib_dirs gcc_dirs lib
      gcc    = False
      user   = True
 
-     obj_file     = lib <.> "o"
+     obj_file
+       | is_hs && loading_profiled_hs_libs = lib <.> "p_o"
+       | otherwise = lib <.> "o"
      dyn_obj_file = lib <.> "dyn_o"
      arch_files = [ "lib" ++ lib ++ lib_tag <.> "a"
                   , lib <.> "a" -- native code has no lib_tag
@@ -1437,8 +1525,8 @@ locateLib hsc_env is_hs lib_dirs gcc_dirs lib
                              (ArchX86_64, OSSolaris2) -> "64" </> so_name
                              _ -> so_name
 
-     findObject    = liftM (fmap Object)  $ findFile dirs obj_file
-     findDynObject = liftM (fmap Object)  $ findFile dirs dyn_obj_file
+     findObject    = liftM (fmap $ Objects . (:[]))  $ findFile dirs obj_file
+     findDynObject = liftM (fmap $ Objects . (:[]))  $ findFile dirs dyn_obj_file
      findArchive   = let local name = liftM (fmap Archive) $ findFile dirs name
                      in  apply (map local arch_files)
      findHSDll     = liftM (fmap DLLPath) $ findFile dirs hs_dyn_lib_file
@@ -1486,7 +1574,8 @@ searchForLibUsingGcc dflags so dirs = do
                 l:_ -> l
    if (file == so)
       then return Nothing
-      else return (Just file)
+      else do b <- doesFileExist file -- file could be a folder (see #16063)
+              return (if b then Just file else Nothing)
 
 -- | Retrieve the list of search directory GCC and the System use to find
 --   libraries and components. See Note [Fork/Exec Windows].

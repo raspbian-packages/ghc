@@ -8,7 +8,7 @@ module Unify (
         tcMatchTy, tcMatchTyKi,
         tcMatchTys, tcMatchTyKis,
         tcMatchTyX, tcMatchTysX, tcMatchTyKisX,
-        ruleMatchTyKiX,
+        tcMatchTyX_BM, ruleMatchTyKiX,
 
         -- * Rough matching
         roughMatchTcs, instanceCantMatch,
@@ -84,7 +84,7 @@ How do you choose between them?
 1. If you know that the kinds of the two types are eqType, use
    the Ty variant. It is more efficient, as it does less work.
 
-2. If the kinds of variables in the  template type might mention type families,
+2. If the kinds of variables in the template type might mention type families,
    use the Ty variant (and do other work to make sure the kinds
    work out). These pure unification functions do a straightforward
    syntactic unification and do no complex reasoning about type
@@ -95,9 +95,9 @@ How do you choose between them?
    families in kinds in the TyKi variant. You just might get match
    failure even though a reducing a type family would lead to success.)
 
-3. Otherwise, if you're sure that the variable kinds to not mention
+3. Otherwise, if you're sure that the variable kinds do not mention
    type families and you're not already sure that the kind of the template
-   equals the kind of the target, then use the TyKi versio.n
+   equals the kind of the target, then use the TyKi version.
 -}
 
 -- | @tcMatchTy t1 t2@ produces a substitution (over fvs(t1))
@@ -115,11 +115,17 @@ How do you choose between them?
 tcMatchTy :: Type -> Type -> Maybe TCvSubst
 tcMatchTy ty1 ty2 = tcMatchTys [ty1] [ty2]
 
+tcMatchTyX_BM :: (TyVar -> BindFlag) -> TCvSubst
+              -> Type -> Type -> Maybe TCvSubst
+tcMatchTyX_BM bind_me subst ty1 ty2
+  = tc_match_tys_x bind_me False subst [ty1] [ty2]
+
 -- | Like 'tcMatchTy', but allows the kinds of the types to differ,
 -- and thus matches them as well.
 -- See also Note [tcMatchTy vs tcMatchTyKi]
 tcMatchTyKi :: Type -> Type -> Maybe TCvSubst
-tcMatchTyKi ty1 ty2 = tcMatchTyKis [ty1] [ty2]
+tcMatchTyKi ty1 ty2
+  = tc_match_tys (const BindMe) True [ty1] [ty2]
 
 -- | This is similar to 'tcMatchTy', but extends a substitution
 -- See also Note [tcMatchTy vs tcMatchTyKi]
@@ -127,7 +133,8 @@ tcMatchTyX :: TCvSubst            -- ^ Substitution to extend
            -> Type                -- ^ Template
            -> Type                -- ^ Target
            -> Maybe TCvSubst
-tcMatchTyX subst ty1 ty2 = tcMatchTysX subst [ty1] [ty2]
+tcMatchTyX subst ty1 ty2
+  = tc_match_tys_x (const BindMe) False subst [ty1] [ty2]
 
 -- | Like 'tcMatchTy' but over a list of types.
 -- See also Note [tcMatchTy vs tcMatchTyKi]
@@ -136,9 +143,7 @@ tcMatchTys :: [Type]         -- ^ Template
            -> Maybe TCvSubst -- ^ One-shot; in principle the template
                              -- variables could be free in the target
 tcMatchTys tys1 tys2
-  = tcMatchTysX (mkEmptyTCvSubst in_scope) tys1 tys2
-  where
-    in_scope = mkInScopeSet (tyCoVarsOfTypes tys1 `unionVarSet` tyCoVarsOfTypes tys2)
+  = tc_match_tys (const BindMe) False tys1 tys2
 
 -- | Like 'tcMatchTyKi' but over a list of types.
 -- See also Note [tcMatchTy vs tcMatchTyKi]
@@ -146,9 +151,7 @@ tcMatchTyKis :: [Type]         -- ^ Template
              -> [Type]         -- ^ Target
              -> Maybe TCvSubst -- ^ One-shot substitution
 tcMatchTyKis tys1 tys2
-  = tcMatchTyKisX (mkEmptyTCvSubst in_scope) tys1 tys2
-  where
-    in_scope = mkInScopeSet (tyCoVarsOfTypes tys1 `unionVarSet` tyCoVarsOfTypes tys2)
+  = tc_match_tys (const BindMe) True tys1 tys2
 
 -- | Like 'tcMatchTys', but extending a substitution
 -- See also Note [tcMatchTy vs tcMatchTyKi]
@@ -157,7 +160,7 @@ tcMatchTysX :: TCvSubst       -- ^ Substitution to extend
             -> [Type]         -- ^ Target
             -> Maybe TCvSubst -- ^ One-shot substitution
 tcMatchTysX subst tys1 tys2
-  = tc_match_tys_x False subst tys1 tys2
+  = tc_match_tys_x (const BindMe) False subst tys1 tys2
 
 -- | Like 'tcMatchTyKis', but extending a substitution
 -- See also Note [tcMatchTy vs tcMatchTyKi]
@@ -166,16 +169,28 @@ tcMatchTyKisX :: TCvSubst        -- ^ Substitution to extend
               -> [Type]          -- ^ Target
               -> Maybe TCvSubst  -- ^ One-shot substitution
 tcMatchTyKisX subst tys1 tys2
-  = tc_match_tys_x True subst tys1 tys2
+  = tc_match_tys_x (const BindMe) True subst tys1 tys2
+
+-- | Same as tc_match_tys_x, but starts with an empty substitution
+tc_match_tys :: (TyVar -> BindFlag)
+               -> Bool          -- ^ match kinds?
+               -> [Type]
+               -> [Type]
+               -> Maybe TCvSubst
+tc_match_tys bind_me match_kis tys1 tys2
+  = tc_match_tys_x bind_me match_kis (mkEmptyTCvSubst in_scope) tys1 tys2
+  where
+    in_scope = mkInScopeSet (tyCoVarsOfTypes tys1 `unionVarSet` tyCoVarsOfTypes tys2)
 
 -- | Worker for 'tcMatchTysX' and 'tcMatchTyKisX'
-tc_match_tys_x :: Bool          -- ^ match kinds?
+tc_match_tys_x :: (TyVar -> BindFlag)
+               -> Bool          -- ^ match kinds?
                -> TCvSubst
                -> [Type]
                -> [Type]
                -> Maybe TCvSubst
-tc_match_tys_x match_kis (TCvSubst in_scope tv_env cv_env) tys1 tys2
-  = case tc_unify_tys (const BindMe)
+tc_match_tys_x bind_me match_kis (TCvSubst in_scope tv_env cv_env) tys1 tys2
+  = case tc_unify_tys bind_me
                       False  -- Matching, not unifying
                       False  -- Not an injectivity check
                       match_kis
@@ -344,26 +359,6 @@ If we discover that two types unify if and only if a skolem variable is
 substituted, we can't properly unify the types. But, that skolem variable
 may later be instantiated with a unifyable type. So, we return maybeApart
 in these cases.
-
-Note [Lists of different lengths are MaybeApart]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-It is unusual to call tcUnifyTys or tcUnifyTysFG with lists of different
-lengths. The place where we know this can happen is from compatibleBranches in
-FamInstEnv, when checking data family instances. Data family instances may be
-eta-reduced; see Note [Eta reduction for data family axioms] in TcInstDcls.
-
-We wish to say that
-
-  D :: * -> * -> *
-  axDF1 :: D Int ~ DFInst1
-  axDF2 :: D Int Bool ~ DFInst2
-
-overlap. If we conclude that lists of different lengths are SurelyApart, then
-it will look like these do *not* overlap, causing disaster. See Trac #9371.
-
-In usages of tcUnifyTys outside of family instances, we always use tcUnifyTys,
-which can't tell the difference between MaybeApart and SurelyApart, so those
-usages won't notice this design choice.
 -}
 
 -- | Simple unification of two types; all type variables are bindable
@@ -501,7 +496,7 @@ tc_unify_tys :: (TyVar -> BindFlag)
 -- NB: It's tempting to ASSERT here that, if we're not matching kinds, then
 -- the kinds of the types should be the same. However, this doesn't work,
 -- as the types may be a dependent telescope, where later types have kinds
--- that mention variables occuring earlier in the list of types. Here's an
+-- that mention variables occurring earlier in the list of types. Here's an
 -- example (from typecheck/should_fail/T12709):
 --   template: [rep :: RuntimeRep,       a :: TYPE rep]
 --   target:   [LiftedRep :: RuntimeRep, Int :: TYPE LiftedRep]
@@ -638,11 +633,11 @@ niFixTCvSubst tenv
     not_fixpoint  = any in_domain range_tvs
     in_domain tv  = tv `elemVarEnv` tenv
 
-    free_tvs = toposortTyVars (filterOut in_domain range_tvs)
+    free_tvs = scopedSort (filterOut in_domain range_tvs)
 
     -- See Note [Finding the substitution fixpoint], Step 6
     init_in_scope = mkInScopeSet (fvVarSet range_fvs)
-    subst = foldl add_free_tv
+    subst = foldl' add_free_tv
                   (mkTvSubst init_in_scope tenv)
                   free_tvs
 
@@ -908,6 +903,17 @@ Note that
 * One better way is to ensure that type patterns (the template
   in the matching process) have no casts.  See Trac #14119.
 
+Note [Polykinded tycon applications]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Suppose  T :: forall k. Type -> K
+and we are unifying
+  ty1:  T @Type         Int       :: Type
+  ty2:  T @(Type->Type) Int Int   :: Type
+
+These two TyConApps have the same TyCon at the front but they
+(legitimately) have different numbers of arguments.  They
+are surelyApart, so we can report that without looking any
+further (see Trac #15704).
 -}
 
 -------------- unify_ty: the main workhorse -----------
@@ -995,8 +1001,8 @@ unify_ty env ty1 (AppTy ty2a ty2b) _kco
 
 unify_ty _ (LitTy x) (LitTy y) _kco | x == y = return ()
 
-unify_ty env (ForAllTy (TvBndr tv1 _) ty1) (ForAllTy (TvBndr tv2 _) ty2) kco
-  = do { unify_ty env (tyVarKind tv1) (tyVarKind tv2) (mkNomReflCo liftedTypeKind)
+unify_ty env (ForAllTy (Bndr tv1 _) ty1) (ForAllTy (Bndr tv2 _) ty2) kco
+  = do { unify_ty env (varType tv1) (varType tv2) (mkNomReflCo liftedTypeKind)
        ; let env' = umRnBndr2 env tv1 tv2
        ; unify_ty env' ty1 ty2 kco }
 
@@ -1044,7 +1050,9 @@ unify_tys env orig_xs orig_ys
       -- See Note [Kind coercions in Unify]
       = do { unify_ty env x y (mkNomReflCo $ typeKind x)
            ; go xs ys }
-    go _ _ = maybeApart  -- See Note [Lists of different lengths are MaybeApart]
+    go _ _ = surelyApart
+      -- Possibly different saturations of a polykinded tycon
+      -- See Note [Polykinded tycon applications]
 
 ---------------------------------
 uVar :: UMEnv
@@ -1207,7 +1215,9 @@ instance Applicative UM where
       (<*>)  = ap
 
 instance Monad UM where
+#if !MIN_VERSION_base(4,13,0)
   fail     = MonadFail.fail
+#endif
   m >>= k  = UM (\state ->
                   do { (state', v) <- unUM m state
                      ; unUM (k v) state' })
@@ -1318,7 +1328,7 @@ data MatchEnv = ME { me_tmpls :: TyVarSet
                    , me_env   :: RnEnv2 }
 
 -- | 'liftCoMatch' is sort of inverse to 'liftCoSubst'.  In particular, if
---   @liftCoMatch vars ty co == Just s@, then @listCoSubst s ty == co@,
+--   @liftCoMatch vars ty co == Just s@, then @liftCoSubst s ty == co@,
 --   where @==@ there means that the result of 'liftCoSubst' has the same
 --   type as the original co; but may be different under the hood.
 --   That is, it matches a type against a coercion of the same
@@ -1391,9 +1401,6 @@ ty_co_match menv subst ty co lkco rkco
     ty_co_match menv subst ty' co (substed_co_l `mkTransCo` lkco)
                                   (substed_co_r `mkTransCo` rkco)
 
-  | CoherenceCo co1 co2 <- co
-  = ty_co_match menv subst ty co1 (lkco `mkTransCo` mkSymCo co2) rkco
-
   | SymCo co' <- co
   = swapLiftCoEnv <$> ty_co_match menv (swapLiftCoEnv subst) ty co' rkco lkco
 
@@ -1408,7 +1415,7 @@ ty_co_match menv subst (TyVarTy tv1) co lkco rkco
   = if any (inRnEnvR rn_env) (tyCoVarsOfCoList co)
     then Nothing      -- occurs check failed
     else Just $ extendVarEnv subst tv1' $
-                castCoercionKind co (mkSymCo lkco) (mkSymCo rkco)
+                castCoercionKindI co (mkSymCo lkco) (mkSymCo rkco)
 
   | otherwise
   = Nothing
@@ -1441,9 +1448,10 @@ ty_co_match menv subst (FunTy ty1 ty2) co _lkco _rkco
   = let Pair lkcos rkcos = traverse (fmap mkNomReflCo . coercionKind) [co1,co2]
     in ty_co_match_args menv subst [ty1, ty2] [co1, co2] lkcos rkcos
 
-ty_co_match menv subst (ForAllTy (TvBndr tv1 _) ty1)
+ty_co_match menv subst (ForAllTy (Bndr tv1 _) ty1)
                        (ForAllCo tv2 kind_co2 co2)
                        lkco rkco
+  | isTyVar tv1 && isTyVar tv2
   = do { subst1 <- ty_co_match menv subst (tyVarKind tv1) kind_co2
                                ki_ki_co ki_ki_co
        ; let rn_env0 = me_env menv
@@ -1453,8 +1461,46 @@ ty_co_match menv subst (ForAllTy (TvBndr tv1 _) ty1)
   where
     ki_ki_co = mkNomReflCo liftedTypeKind
 
+-- ty_co_match menv subst (ForAllTy (Bndr cv1 _) ty1)
+--                        (ForAllCo cv2 kind_co2 co2)
+--                        lkco rkco
+--   | isCoVar cv1 && isCoVar cv2
+--   We seems not to have enough information for this case
+--   1. Given:
+--        cv1      :: (s1 :: k1) ~r (s2 :: k2)
+--        kind_co2 :: (s1' ~ s2') ~N (t1 ~ t2)
+--        eta1      = mkNthCo role 2 (downgradeRole r Nominal kind_co2)
+--                 :: s1' ~ t1
+--        eta2      = mkNthCo role 3 (downgradeRole r Nominal kind_co2)
+--                 :: s2' ~ t2
+--      Wanted:
+--        subst1 <- ty_co_match menv subst  s1 eta1 kco1 kco2
+--        subst2 <- ty_co_match menv subst1 s2 eta2 kco3 kco4
+--      Question: How do we get kcoi?
+--   2. Given:
+--        lkco :: <*>    -- See Note [Weird typing rule for ForAllTy] in Type
+--        rkco :: <*>
+--      Wanted:
+--        ty_co_match menv' subst2 ty1 co2 lkco' rkco'
+--      Question: How do we get lkco' and rkco'?
+
 ty_co_match _ subst (CoercionTy {}) _ _ _
   = Just subst -- don't inspect coercions
+
+ty_co_match menv subst ty (GRefl r t (MCo co)) lkco rkco
+  =  ty_co_match menv subst ty (GRefl r t MRefl) lkco (rkco `mkTransCo` mkSymCo co)
+
+ty_co_match menv subst ty co1 lkco rkco
+  | Just (CastTy t co, r) <- isReflCo_maybe co1
+  -- In @pushRefl@, pushing reflexive coercion inside CastTy will give us
+  -- t |> co ~ t ; <t> ; t ~ t |> co
+  -- But transitive coercions are not helpful. Therefore we deal
+  -- with it here: we do recursion on the smaller reflexive coercion,
+  -- while propagating the correct kind coercions.
+  = let kco' = mkSymCo co
+    in ty_co_match menv subst ty (mkReflCo r t) (lkco `mkTransCo` kco')
+                                                (rkco `mkTransCo` kco')
+
 
 ty_co_match menv subst ty co lkco rkco
   | Just co' <- pushRefl co = ty_co_match menv subst ty co' lkco rkco
@@ -1500,17 +1546,18 @@ ty_co_match_args menv subst (ty:tys) (arg:args) (lkco:lkcos) (rkco:rkcos)
 ty_co_match_args _    _     _        _          _ _ = Nothing
 
 pushRefl :: Coercion -> Maybe Coercion
-pushRefl (Refl Nominal (AppTy ty1 ty2))
-  = Just (AppCo (Refl Nominal ty1) (mkNomReflCo ty2))
-pushRefl (Refl r (FunTy ty1 ty2))
-  | Just rep1 <- getRuntimeRep_maybe ty1
-  , Just rep2 <- getRuntimeRep_maybe ty2
-  = Just (TyConAppCo r funTyCon [ mkReflCo r rep1, mkReflCo r rep2
-                                , mkReflCo r ty1,  mkReflCo r ty2 ])
-pushRefl (Refl r (TyConApp tc tys))
-  = Just (TyConAppCo r tc (zipWith mkReflCo (tyConRolesX r tc) tys))
-pushRefl (Refl r (ForAllTy (TvBndr tv _) ty))
-  = Just (mkHomoForAllCos_NoRefl [tv] (Refl r ty))
+pushRefl co =
+  case (isReflCo_maybe co) of
+    Just (AppTy ty1 ty2, Nominal)
+      -> Just (AppCo (mkReflCo Nominal ty1) (mkNomReflCo ty2))
+    Just (FunTy ty1 ty2, r)
+      | Just rep1 <- getRuntimeRep_maybe ty1
+      , Just rep2 <- getRuntimeRep_maybe ty2
+      ->  Just (TyConAppCo r funTyCon [ mkReflCo r rep1, mkReflCo r rep2
+                                       , mkReflCo r ty1,  mkReflCo r ty2 ])
+    Just (TyConApp tc tys, r)
+      -> Just (TyConAppCo r tc (zipWith mkReflCo (tyConRolesX r tc) tys))
+    Just (ForAllTy (Bndr tv _) ty, r)
+      -> Just (ForAllCo tv (mkNomReflCo (varType tv)) (mkReflCo r ty))
     -- NB: NoRefl variant. Otherwise, we get a loop!
-pushRefl (Refl r (CastTy ty co))  = Just (castCoercionKind (Refl r ty) co co)
-pushRefl _                        = Nothing
+    _ -> Nothing

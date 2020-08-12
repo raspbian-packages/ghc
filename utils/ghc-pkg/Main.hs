@@ -36,13 +36,13 @@ import qualified Data.Graph as Graph
 import qualified Distribution.ModuleName as ModuleName
 import Distribution.ModuleName (ModuleName)
 import Distribution.InstalledPackageInfo as Cabal
-import Distribution.Compat.ReadP hiding (get)
-import Distribution.ParseUtils
+import qualified Distribution.Parsec as Cabal
 import Distribution.Package hiding (installedUnitId)
 import Distribution.Text
 import Distribution.Version
 import Distribution.Backpack
 import Distribution.Types.UnqualComponentName
+import Distribution.Types.LibraryName
 import Distribution.Types.MungedPackageName
 import Distribution.Types.MungedPackageId
 import Distribution.Simple.Utils (fromUTF8BS, toUTF8BS, writeUTF8File, readUTF8File)
@@ -59,14 +59,14 @@ import System.Console.GetOpt
 import qualified Control.Exception as Exception
 import Data.Maybe
 
-import Data.Char ( isSpace, toLower )
+import Data.Char ( toLower )
 import Control.Monad
 import System.Directory ( doesDirectoryExist, getDirectoryContents,
                           doesFileExist, removeFile,
                           getCurrentDirectory )
 import System.Exit ( exitWith, ExitCode(..) )
 import System.Environment ( getArgs, getProgName, getEnv )
-#if defined(darwin_HOST_OS) || defined(linux_HOST_OS)
+#if defined(darwin_HOST_OS) || defined(linux_HOST_OS) || defined(mingw32_HOST_OS)
 import System.Environment ( getExecutablePath )
 #endif
 import System.IO
@@ -80,10 +80,6 @@ import qualified Data.Set as Set
 import qualified Data.Map as Map
 
 #if defined(mingw32_HOST_OS)
--- mingw32 needs these for getExecDir
-import Foreign
-import Foreign.C
-import System.Directory ( canonicalizePath )
 import GHC.ConsoleHandler
 #else
 import System.Posix hiding (fdToHandle)
@@ -161,6 +157,7 @@ data Flag
   | FlagNoUserDb
   | FlagVerbosity (Maybe String)
   | FlagUnitId
+  | FlagShowUnitIds
   deriving Eq
 
 flags :: [OptDescr Flag]
@@ -199,6 +196,8 @@ flags = [
         "output version information and exit",
   Option [] ["simple-output"] (NoArg FlagSimpleOutput)
         "print output in easy-to-parse format for some commands",
+  Option [] ["show-unit-ids"] (NoArg FlagShowUnitIds)
+        "print unit-ids instead of package identifiers",
   Option [] ["names-only"] (NoArg FlagNamesOnly)
         "only print package names, not versions; can only be used with list --simple-output",
   Option [] ["ignore-case"] (NoArg FlagIgnoreCase)
@@ -505,11 +504,11 @@ runit verbosity cli nonopts = do
     (_cmd:_) -> do
         die ("command-line syntax error\n" ++ shortUsage prog)
 
-parseCheck :: ReadP a a -> String -> String -> IO a
-parseCheck parser str what =
-  case [ x | (x,ys) <- readP_to_S parser str, all isSpace ys ] of
-    [x] -> return x
-    _ -> die ("cannot parse \'" ++ str ++ "\' as a " ++ what)
+parseCheck :: Cabal.Parsec a => String -> String -> IO a
+parseCheck str what =
+  case Cabal.eitherParsec str of
+    Left e  -> die ("cannot parse \'" ++ str ++ "\' as a " ++ what ++ ": " ++ e)
+    Right x -> pure x
 
 -- | Either an exact 'PackageIdentifier', or a glob for all packages
 -- matching 'PackageName'.
@@ -522,20 +521,14 @@ displayGlobPkgId (ExactPackageIdentifier pid) = display pid
 displayGlobPkgId (GlobPackageIdentifier pn) = display pn ++ "-*"
 
 readGlobPkgId :: String -> IO GlobPackageIdentifier
-readGlobPkgId str = parseCheck parseGlobPackageId str "package identifier"
-
-parseGlobPackageId :: ReadP r GlobPackageIdentifier
-parseGlobPackageId =
-  fmap ExactPackageIdentifier parse
-     +++
-  (do n <- parse
-      _ <- string "-*"
-      return (GlobPackageIdentifier n))
+readGlobPkgId str
+  | "-*" `isSuffixOf` str =
+    GlobPackageIdentifier <$> parseCheck (init (init str)) "package identifier (glob)"
+  | otherwise = ExactPackageIdentifier <$> parseCheck str "package identifier (exact)"
 
 readPackageArg :: AsPackageArg -> String -> IO PackageArg
-readPackageArg AsUnitId str =
-    parseCheck (IUId `fmap` parse) str "installed package id"
-readPackageArg AsDefault str = Id `fmap` readGlobPkgId str
+readPackageArg AsUnitId str = IUId <$> parseCheck str "installed package id"
+readPackageArg AsDefault str = Id <$> readGlobPkgId str
 
 -- -----------------------------------------------------------------------------
 -- Package databases
@@ -1164,13 +1157,11 @@ parsePackageInfo
         -> IO (InstalledPackageInfo, [ValidateWarning])
 parsePackageInfo str =
   case parseInstalledPackageInfo str of
-    ParseOk warnings ok -> return (mungePackageInfo ok, ws)
+    Right (warnings, ok) -> pure (mungePackageInfo ok, ws)
       where
-        ws = [ msg | PWarning msg <- warnings
+        ws = [ msg | msg <- warnings
                    , not ("Unrecognized field pkgroot" `isPrefixOf` msg) ]
-    ParseFailed err -> case locatedErrorMsg err of
-                           (Nothing, s) -> die s
-                           (Just l, s) -> die (show l ++ ": " ++ s)
+    Left err -> die (unlines err)
 
 mungePackageInfo :: InstalledPackageInfo -> InstalledPackageInfo
 mungePackageInfo ipi = ipi
@@ -1356,7 +1347,7 @@ convertPackageInfoToCacheFormat pkg =
        GhcPkg.packageName        = packageName pkg,
        GhcPkg.packageVersion     = Version.Version (versionNumbers (packageVersion pkg)) [],
        GhcPkg.sourceLibName      =
-         fmap (mkPackageName . unUnqualComponentName) (sourceLibName pkg),
+         fmap (mkPackageName . unUnqualComponentName) (libraryNameString $ sourceLibName pkg),
        GhcPkg.depends            = depends pkg,
        GhcPkg.abiDepends         = map (\(AbiDependency k v) -> (k,unAbiHash v)) (abiDepends pkg),
        GhcPkg.abiHash            = unAbiHash (abiHash pkg),
@@ -1592,9 +1583,11 @@ listPackages verbosity my_flags mPackageName mModuleName = do
 
 simplePackageList :: [Flag] -> [InstalledPackageInfo] -> IO ()
 simplePackageList my_flags pkgs = do
-   let showPkg = if FlagNamesOnly `elem` my_flags then display . mungedName
-                                                  else display
-       strs = map showPkg $ map mungedId pkgs
+   let showPkg :: InstalledPackageInfo -> String
+       showPkg | FlagShowUnitIds `elem` my_flags = display . installedUnitId
+               | FlagNamesOnly `elem` my_flags   = display . mungedName . mungedId
+               | otherwise                       = display . mungedId
+       strs = map showPkg pkgs
    when (not (null pkgs)) $
       hPutStrLn stdout $ concat $ intersperse " " strs
 
@@ -1739,17 +1732,20 @@ checkConsistency verbosity my_flags = do
       -- db, because we may need it to verify package deps.
 
   let simple_output = FlagSimpleOutput `elem` my_flags
+  let unitid_output = FlagShowUnitIds `elem` my_flags
 
   let pkgs = allPackagesInStack db_stack
 
+      checkPackage :: InstalledPackageInfo -> IO [InstalledPackageInfo]
       checkPackage p = do
          (_,es,ws) <- runValidate $ checkPackageConfig p verbosity db_stack
                                                        True True
          if null es
-            then do when (not simple_output) $ do
-                      _ <- reportValidateErrors verbosity [] ws "" Nothing
-                      return ()
-                    return []
+            then do
+              when (not simple_output) $ do
+                  _ <- reportValidateErrors verbosity [] ws "" Nothing
+                  return ()
+              return []
             else do
               when (not simple_output) $ do
                   reportError ("There are problems in package " ++ display (mungedId p) ++ ":")
@@ -1765,15 +1761,20 @@ checkConsistency verbosity my_flags = do
 
   let not_broken_pkgs = filterOut broken_pkgs pkgs
       (_, trans_broken_pkgs) = closure [] not_broken_pkgs
+
+      all_broken_pkgs :: [InstalledPackageInfo]
       all_broken_pkgs = broken_pkgs ++ trans_broken_pkgs
 
   when (not (null all_broken_pkgs)) $ do
     if simple_output
       then simplePackageList my_flags all_broken_pkgs
       else do
-       reportError ("\nThe following packages are broken, either because they have a problem\n"++
+        let disp :: InstalledPackageInfo -> String
+            disp | unitid_output = display . installedUnitId
+                 | otherwise     = display . mungedId
+        reportError ("\nThe following packages are broken, either because they have a problem\n"++
                 "listed above, or because they depend on a broken package.")
-       mapM_ (hPutStrLn stderr . display . mungedId) all_broken_pkgs
+        mapM_ (hPutStrLn stderr . disp) all_broken_pkgs
 
   when (not (null all_broken_pkgs)) $ exitWith (ExitFailure 1)
 
@@ -1834,7 +1835,7 @@ liftIO k = V (k >>= \a -> return (a,[],[]))
 reportValidateErrors :: Verbosity -> [ValidateError] -> [ValidateWarning]
                      -> String -> Maybe Force -> IO Bool
 reportValidateErrors verbosity es ws prefix mb_force = do
-  mapM_ (warn . (prefix++)) ws
+  when (verbosity >= Normal) $ mapM_ (warn . (prefix++)) ws
   oks <- mapM report es
   return (and oks)
   where
@@ -1908,10 +1909,9 @@ checkPackageConfig pkg verbosity db_stack
 checkPackageId :: InstalledPackageInfo -> Validate ()
 checkPackageId ipi =
   let str = display (mungedId ipi) in
-  case [ x :: MungedPackageId | (x,ys) <- readP_to_S parse str, all isSpace ys ] of
-    [_] -> return ()
-    []  -> verror CannotForce ("invalid package identifier: " ++ str)
-    _   -> verror CannotForce ("ambiguous package identifier: " ++ str)
+  case Cabal.eitherParsec str :: Either String MungedPackageId of
+    Left e -> verror CannotForce ("invalid package identifier: '" ++ str ++ "': " ++ e)
+    Right _ -> pure ()
 
 checkUnitId :: InstalledPackageInfo -> PackageDBStack -> Bool
                 -> Validate ()
@@ -2005,7 +2005,7 @@ checkDuplicateDepends deps
 checkHSLib :: Verbosity -> [String] -> String -> Validate ()
 checkHSLib _verbosity dirs lib = do
   let filenames = ["lib" ++ lib ++ ".a",
-                   "lib" ++ lib ++ ".p_a",
+                   "lib" ++ lib ++ "_p.a",
                    "lib" ++ lib ++ "-ghc" ++ Version.version ++ ".so",
                    "lib" ++ lib ++ "-ghc" ++ Version.version ++ ".dylib",
                             lib ++ "-ghc" ++ Version.version ++ ".dll"]
@@ -2196,55 +2196,8 @@ dieForcible s = die (s ++ " (use --force to override)")
 -- Cut and pasted from ghc/compiler/main/SysTools
 
 getLibDir :: IO (Maybe String)
-#if defined(mingw32_HOST_OS)
-subst :: Char -> Char -> String -> String
-subst a b ls = map (\ x -> if x == a then b else x) ls
 
-unDosifyPath :: FilePath -> FilePath
-unDosifyPath xs = subst '\\' '/' xs
-
-getLibDir = do base   <- getExecDir "/ghc-pkg.exe"
-               case base of
-                 Nothing    -> return Nothing
-                 Just base' -> do
-                    libdir <- canonicalizePath $ base' </> "../lib"
-                    exists <- doesDirectoryExist libdir
-                    if exists
-                       then return $ Just libdir
-                       else return Nothing
-
--- (getExecDir cmd) returns the directory in which the current
---                  executable, which should be called 'cmd', is running
--- So if the full path is /a/b/c/d/e, and you pass "d/e" as cmd,
--- you'll get "/a/b/c" back as the result
-getExecDir :: String -> IO (Maybe String)
-getExecDir cmd =
-    getExecPath >>= maybe (return Nothing) removeCmdSuffix
-    where initN n = reverse . drop n . reverse
-          removeCmdSuffix = return . Just . initN (length cmd) . unDosifyPath
-
-getExecPath :: IO (Maybe String)
-getExecPath = try_size 2048 -- plenty, PATH_MAX is 512 under Win32.
-  where
-    try_size size = allocaArray (fromIntegral size) $ \buf -> do
-        ret <- c_GetModuleFileName nullPtr buf size
-        case ret of
-          0 -> return Nothing
-          _ | ret < size -> fmap Just $ peekCWString buf
-            | otherwise  -> try_size (size * 2)
-
-foreign import WINDOWS_CCONV unsafe "windows.h GetModuleFileNameW"
-  c_GetModuleFileName :: Ptr () -> CWString -> Word32 -> IO Word32
-#elif defined(darwin_HOST_OS) || defined(linux_HOST_OS)
--- TODO: a) this is copy-pasta from SysTools.hs / getBaseDir. Why can't we reuse
---          this here? and parameterise getBaseDir over the executable (for
---          windows)?
---          Answer: we can not, because if we share `getBaseDir` via `ghc-boot`,
---                  that would add `base` as a dependency for windows.
---       b) why is the windows getBaseDir logic, not part of getExecutablePath?
---          it would be much wider available then and we could drop all the
---          custom logic?
---          Answer: yes this should happen. No one has found the time just yet.
+#if defined(mingw32_HOST_OS) || defined(darwin_HOST_OS) || defined(linux_HOST_OS)
 getLibDir = Just . (\p -> p </> "lib") . takeDirectory . takeDirectory <$> getExecutablePath
 #else
 getLibDir = return Nothing

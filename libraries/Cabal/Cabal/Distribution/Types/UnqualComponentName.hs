@@ -10,10 +10,8 @@ import Distribution.Compat.Prelude
 import Distribution.Utils.ShortText
 import Prelude ()
 
-import Distribution.Parsec.Class
-import Distribution.ParseUtils        (parsePackageName)
+import Distribution.Parsec
 import Distribution.Pretty
-import Distribution.Text
 import Distribution.Types.PackageName
 
 -- | An unqualified component name, for any kind of component.
@@ -58,9 +56,6 @@ instance Pretty UnqualComponentName where
 instance Parsec UnqualComponentName where
   parsec = mkUnqualComponentName <$> parsecUnqualComponentName
 
-instance Text UnqualComponentName where
-  parse = mkUnqualComponentName <$> parsePackageName
-
 instance NFData UnqualComponentName where
   rnf (UnqualComponentName pkg) = rnf pkg
 
@@ -71,6 +66,10 @@ instance NFData UnqualComponentName where
 --
 -- Useful in legacy situations where a package name may refer to an internal
 -- component, if one is defined with that name.
+--
+-- 2018-12-21: These "legacy" situations are not legacy.
+-- We can @build-depends@ on the internal library. However
+-- Now dependency contains @Set LibraryName@, and we should use that.
 --
 -- @since 2.0.0.2
 packageNameToUnqualComponentName :: PackageName -> UnqualComponentName

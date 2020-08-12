@@ -8,7 +8,7 @@ module Distribution.Solver.Modular.Message (
 import qualified Data.List as L
 import Prelude hiding (pi)
 
-import Distribution.Text -- from Cabal
+import Distribution.Pretty (prettyShow) -- from Cabal
 
 import Distribution.Solver.Modular.Dependency
 import Distribution.Solver.Modular.Flag
@@ -53,10 +53,8 @@ showMessages = go 0
         (atLevel l $ "rejecting: " ++ showQSNBool qsn b ++ showFR c fr) (go l ms)
     go !l (Step (Next (Goal (P _  ) gr)) (Step (TryP qpn' i) ms@(Step Enter (Step (Next _) _)))) =
         (atLevel l $ "trying: " ++ showQPNPOpt qpn' i ++ showGR gr) (go l ms)
-    go !l (Step (Next (Goal (P qpn) gr)) ms@(Step (Failure _c Backjump) _)) =
+    go !l (Step (Next (Goal (P qpn) gr)) (Step (Failure _c UnknownPackage) ms)) =
         (atLevel l $ "unknown package: " ++ showQPN qpn ++ showGR gr) $ go l ms
-    go !l (Step (Next (Goal (P qpn) gr)) (Step (Failure c fr) ms)) =
-        (atLevel l $ showPackageGoal qpn gr) $ (atLevel l $ showFailure c fr) (go l ms)
     -- standard display
     go !l (Step Enter                    ms) = go (l+1) ms
     go !l (Step Leave                    ms) = go (l-1) ms
@@ -104,9 +102,9 @@ showGR UserGoal            = " (user goal)"
 showGR (DependencyGoal dr) = " (dependency of " ++ showDependencyReason dr ++ ")"
 
 showFR :: ConflictSet -> FailReason -> String
-showFR _ (UnsupportedExtension ext)       = " (conflict: requires " ++ display ext ++ ")"
-showFR _ (UnsupportedLanguage lang)       = " (conflict: requires " ++ display lang ++ ")"
-showFR _ (MissingPkgconfigPackage pn vr)  = " (conflict: pkg-config package " ++ display pn ++ display vr ++ ", not found in the pkg-config database)"
+showFR _ (UnsupportedExtension ext)       = " (conflict: requires " ++ prettyShow ext ++ ")"
+showFR _ (UnsupportedLanguage lang)       = " (conflict: requires " ++ prettyShow lang ++ ")"
+showFR _ (MissingPkgconfigPackage pn vr)  = " (conflict: pkg-config package " ++ prettyShow pn ++ prettyShow vr ++ ", not found in the pkg-config database)"
 showFR _ (NewPackageDoesNotMatchExistingConstraint d) = " (conflict: " ++ showConflictingDep d ++ ")"
 showFR _ (ConflictingConstraints d1 d2)   = " (conflict: " ++ L.intercalate ", " (L.map showConflictingDep [d1, d2]) ++ ")"
 showFR _ (NewPackageIsMissingRequiredComponent comp dr) = " (does not contain " ++ showExposedComponent comp ++ ", which is required by " ++ showDependencyReason dr ++ ")"
@@ -115,9 +113,11 @@ showFR _ (PackageRequiresMissingComponent qpn comp) = " (requires " ++ showExpos
 showFR _ (PackageRequiresUnbuildableComponent qpn comp) = " (requires " ++ showExposedComponent comp ++ " from " ++ showQPN qpn ++ ", but the component is not buildable in the current environment)"
 showFR _ CannotInstall                    = " (only already installed instances can be used)"
 showFR _ CannotReinstall                  = " (avoiding to reinstall a package with same version but new dependencies)"
+showFR _ NotExplicit                      = " (not a user-provided goal nor mentioned as a constraint, but reject-unconstrained-dependencies was set)"
 showFR _ Shadowed                         = " (shadowed by another installed package with same version)"
 showFR _ Broken                           = " (package is broken)"
-showFR _ (GlobalConstraintVersion vr src) = " (" ++ constraintSource src ++ " requires " ++ display vr ++ ")"
+showFR _ UnknownPackage                   = " (unknown package)"
+showFR _ (GlobalConstraintVersion vr src) = " (" ++ constraintSource src ++ " requires " ++ prettyShow vr ++ ")"
 showFR _ (GlobalConstraintInstalled src)  = " (" ++ constraintSource src ++ " requires installed instance)"
 showFR _ (GlobalConstraintSource src)     = " (" ++ constraintSource src ++ " requires source instance)"
 showFR _ (GlobalConstraintFlag src)       = " (" ++ constraintSource src ++ " requires opposite flag selection)"
@@ -126,7 +126,7 @@ showFR c Backjump                         = " (backjumping, conflict set: " ++ s
 showFR _ MultipleInstances                = " (multiple instances)"
 showFR c (DependenciesNotLinked msg)      = " (dependencies not linked: " ++ msg ++ "; conflict set: " ++ showConflictSet c ++ ")"
 showFR c CyclicDependencies               = " (cyclic dependencies; conflict set: " ++ showConflictSet c ++ ")"
-showFR _ (UnsupportedSpecVer ver)         = " (unsupported spec-version " ++ display ver ++ ")"
+showFR _ (UnsupportedSpecVer ver)         = " (unsupported spec-version " ++ prettyShow ver ++ ")"
 -- The following are internal failures. They should not occur. In the
 -- interest of not crashing unnecessarily, we still just print an error
 -- message though.

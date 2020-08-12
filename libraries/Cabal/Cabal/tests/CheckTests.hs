@@ -5,12 +5,14 @@ module Main
 import Test.Tasty
 import Test.Tasty.Golden.Advanced (goldenTest)
 
-import Data.Algorithm.Diff                    (Diff (..), getGroupedDiff)
+import Data.Algorithm.Diff                    (PolyDiff (..), getGroupedDiff)
+import Distribution.Fields                    (runParseResult)
 import Distribution.PackageDescription.Check  (checkPackage)
 import Distribution.PackageDescription.Parsec (parseGenericPackageDescription)
-import Distribution.Parsec.Common             (showPError, showPWarning)
-import Distribution.Parsec.ParseResult        (runParseResult)
+import Distribution.Parsec
 import Distribution.Utils.Generic             (fromUTF8BS, toUTF8BS)
+import System.Directory                       (setCurrentDirectory)
+import System.Environment                     (getArgs, withArgs)
 import System.FilePath                        (replaceExtension, (</>))
 
 import qualified Data.ByteString       as BS
@@ -28,7 +30,6 @@ checkTests = testGroup "regressions"
     [ checkTest "nothing-unicode.cabal"
     , checkTest "haddock-api-2.18.1-check.cabal"
     , checkTest "issue-774.cabal"
-    , checkTest "MiniAgda.cabal"
     , checkTest "extensions-paths-5054.cabal"
     , checkTest "pre-1.6-glob.cabal"
     , checkTest "pre-2.4-globstar.cabal"
@@ -36,6 +37,7 @@ checkTests = testGroup "regressions"
     , checkTest "cc-options-with-optimization.cabal"
     , checkTest "cxx-options-with-optimization.cabal"
     , checkTest "ghc-option-j.cabal"
+    , checkTest "multiple-libs-2.cabal"
     ]
 
 checkTest :: FilePath -> TestTree
@@ -60,7 +62,13 @@ checkTest fp = cabalGoldenTest fp correct $ do
 -------------------------------------------------------------------------------
 
 main :: IO ()
-main = defaultMain tests
+main = do
+    args <- getArgs
+    case args of
+        ("--cwd" : cwd : args') -> do
+            setCurrentDirectory cwd
+            withArgs args' $ defaultMain tests
+        _ -> defaultMain tests
 
 cabalGoldenTest :: TestName -> FilePath -> IO BS.ByteString -> TestTree
 cabalGoldenTest name ref act = goldenTest name (BS.readFile ref) act cmp upd

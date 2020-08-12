@@ -3,7 +3,6 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE UnboxedTuples #-}
 {-# OPTIONS_GHC -optc-DNON_POSIX_SOURCE #-}
 --
 --  (c) The University of Glasgow 2002-2006
@@ -41,7 +40,6 @@ import Util
 -- Standard libraries
 import Data.Array.Unboxed
 import Foreign.Ptr
-import GHC.IO           ( IO(..) )
 import GHC.Exts
 
 {-

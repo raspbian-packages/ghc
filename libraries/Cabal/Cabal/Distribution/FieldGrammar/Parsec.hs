@@ -47,7 +47,7 @@
 -- is obviously invalid specification.
 --
 -- We can parse 'Fields' like we parse @aeson@ objects, yet we use
--- slighly higher-level API, so we can process unspecified fields,
+-- slightly higher-level API, so we can process unspecified fields,
 -- to report unknown fields and save custom @x-fields@.
 --
 module Distribution.FieldGrammar.Parsec (
@@ -61,6 +61,7 @@ module Distribution.FieldGrammar.Parsec (
     Section (..),
     runFieldParser,
     runFieldParser',
+    fieldLinesToStream,
     )  where
 
 import Data.List                   (dropWhileEnd)
@@ -72,18 +73,18 @@ import Distribution.Simple.Utils   (fromUTF8BS)
 import Prelude ()
 
 import qualified Data.ByteString   as BS
-import qualified Data.Set          as Set
 import qualified Data.Map.Strict   as Map
+import qualified Data.Set          as Set
 import qualified Text.Parsec       as P
 import qualified Text.Parsec.Error as P
 
 import Distribution.CabalSpecVersion
 import Distribution.FieldGrammar.Class
-import Distribution.Parsec.Class
-import Distribution.Parsec.Common
-import Distribution.Parsec.Field
+import Distribution.Fields.Field
+import Distribution.Fields.ParseResult
+import Distribution.Parsec
 import Distribution.Parsec.FieldLineStream
-import Distribution.Parsec.ParseResult
+import Distribution.Parsec.Position        (positionRow, positionCol)
 
 -------------------------------------------------------------------------------
 -- Auxiliary types
@@ -205,6 +206,34 @@ instance FieldGrammar ParsecFieldGrammar where
             | null fls  = pure def
             | otherwise = unpack' _pack <$> runFieldParser pos parsec v fls
 
+    freeTextField fn _ = ParsecFG (Set.singleton fn) Set.empty parser where
+        parser v fields = case Map.lookup fn fields of
+            Nothing  -> pure Nothing
+            Just []  -> pure Nothing
+            Just [x] -> parseOne v x
+            Just xs  -> do
+                warnMultipleSingularFields fn xs
+                last <$> traverse (parseOne v) xs
+
+        parseOne v (MkNamelessField pos fls)
+            | null fls           = pure Nothing
+            | v >= CabalSpecV3_0 = pure (Just (fieldlinesToFreeText3 pos fls))
+            | otherwise          = pure (Just (fieldlinesToFreeText fls))
+
+    freeTextFieldDef fn _ = ParsecFG (Set.singleton fn) Set.empty parser where
+        parser v fields = case Map.lookup fn fields of
+            Nothing  -> pure ""
+            Just []  -> pure ""
+            Just [x] -> parseOne v x
+            Just xs  -> do
+                warnMultipleSingularFields fn xs
+                last <$> traverse (parseOne v) xs
+
+        parseOne v (MkNamelessField pos fls)
+            | null fls           = pure ""
+            | v >= CabalSpecV3_0 = pure (fieldlinesToFreeText3 pos fls)
+            | otherwise          = pure (fieldlinesToFreeText fls)
+
     monoidalFieldAla fn _pack _extract = ParsecFG (Set.singleton fn) Set.empty parser
       where
         parser v fields = case Map.lookup fn fields of
@@ -231,28 +260,54 @@ instance FieldGrammar ParsecFieldGrammar where
     availableSince vs def (ParsecFG names prefixes parser) = ParsecFG names prefixes parser'
       where
         parser' v values
-            | cabalSpecSupports v vs = parser v values
+            | v >= vs = parser v values
             | otherwise = do
                 let unknownFields = Map.intersection values $ Map.fromSet (const ()) names
                 for_ (Map.toList unknownFields) $ \(name, fields) ->
                     for_ fields $ \(MkNamelessField pos _) ->
                         parseWarning pos PWTUnknownField $
-                            "The field " <> show name <> " is available since Cabal " ++ show vs
+                            "The field " <> show name <> " is available only since the Cabal specification version " ++ showCabalSpecVersion vs ++ ". This field will be ignored."
 
                 pure def
 
     -- todo we know about this field
-    deprecatedSince (_ : _) _ grammar = grammar -- pass on non-empty version
-    deprecatedSince _ msg (ParsecFG names prefixes parser) = ParsecFG names prefixes parser'
+    deprecatedSince vs msg (ParsecFG names prefixes parser) = ParsecFG names prefixes parser'
       where
-        parser' v values = do
-            let deprecatedFields = Map.intersection values $ Map.fromSet (const ()) names
-            for_ (Map.toList deprecatedFields) $ \(name, fields) ->
-                for_ fields $ \(MkNamelessField pos _) ->
-                    parseWarning pos PWTDeprecatedField $
-                        "The field " <> show name <> " is deprecated. " ++ msg
+        parser' v values
+            | v >= vs = do
+                let deprecatedFields = Map.intersection values $ Map.fromSet (const ()) names
+                for_ (Map.toList deprecatedFields) $ \(name, fields) ->
+                    for_ fields $ \(MkNamelessField pos _) ->
+                        parseWarning pos PWTDeprecatedField $
+                            "The field " <> show name <> " is deprecated in the Cabal specification version " ++ showCabalSpecVersion vs ++ ". " ++ msg
 
-            parser v values
+                parser v values
+
+            | otherwise = parser v values
+
+    removedIn vs msg (ParsecFG names prefixes parser) = ParsecFG names prefixes parser' where
+        parser' v values
+            | v >= vs = do
+                let msg' = if null msg then "" else ' ' : msg
+                let unknownFields = Map.intersection values $ Map.fromSet (const ()) names
+                let namePos =
+                      [ (name, pos)
+                      | (name, fields) <- Map.toList unknownFields
+                      , MkNamelessField pos _ <- fields
+                      ]
+
+                let makeMsg name = "The field " <> show name <> " is removed in the Cabal specification version " ++ showCabalSpecVersion vs ++ "." ++ msg'
+
+                case namePos of
+                    -- no fields => proceed (with empty values, to be sure)
+                    [] -> parser v mempty
+
+                    -- if there's single field: fail fatally with it
+                    ((name, pos) : rest) -> do
+                        for_ rest $ \(name', pos') -> parseFailure pos' $ makeMsg name'
+                        parseFatalFailure pos $ makeMsg name
+
+              | otherwise = parser v values
 
     knownField fn = ParsecFG (Set.singleton fn) Set.empty (\_ _ -> pure ())
 
@@ -262,36 +317,92 @@ instance FieldGrammar ParsecFieldGrammar where
 -- Parsec
 -------------------------------------------------------------------------------
 
-runFieldParser' :: Position -> ParsecParser a -> CabalSpecVersion -> FieldLineStream -> ParseResult a
-runFieldParser' (Position row col) p v str = case P.runParser p' [] "<field>" str of
+runFieldParser' :: [Position] -> ParsecParser a -> CabalSpecVersion -> FieldLineStream -> ParseResult a
+runFieldParser' inputPoss p v str = case P.runParser p' [] "<field>" str of
     Right (pok, ws) -> do
-        -- TODO: map pos
-        traverse_ (\(PWarning t pos w) -> parseWarning pos t w) ws
+        traverse_ (\(PWarning t pos w) -> parseWarning (mapPosition pos) t w) ws
         pure pok
     Left err        -> do
         let ppos = P.errorPos err
-        -- Positions start from 1:1, not 0:0
-        let epos = Position (row - 1 + P.sourceLine ppos) (col - 1 + P.sourceColumn ppos)
+        let epos = mapPosition $ Position (P.sourceLine ppos) (P.sourceColumn ppos)
+
         let msg = P.showErrorMessages
                 "or" "unknown parse error" "expecting" "unexpected" "end of input"
                 (P.errorMessages err)
-        let str' = unlines (filter (not . all isSpace) (fieldLineStreamToLines str))
-
-        parseFatalFailure epos $ msg ++ "\n" ++ "\n" ++ str'
+        parseFatalFailure epos $ msg ++ "\n"
   where
     p' = (,) <$ P.spaces <*> unPP p v <* P.spaces <* P.eof <*> P.getState
 
-fieldLineStreamToLines :: FieldLineStream -> [String]
-fieldLineStreamToLines (FLSLast bs)   = [ fromUTF8BS bs ]
-fieldLineStreamToLines (FLSCons bs s) = fromUTF8BS bs : fieldLineStreamToLines s
+    -- Positions start from 1:1, not 0:0
+    mapPosition (Position prow pcol) = go (prow - 1) inputPoss where
+        go _ []                            = zeroPos
+        go _ [Position row col]            = Position row (col + pcol - 1)
+        go n (Position row col:_) | n <= 0 = Position row (col + pcol - 1)
+        go n (_:ps)                        = go (n - 1) ps
 
 runFieldParser :: Position -> ParsecParser a -> CabalSpecVersion -> [FieldLine Position] -> ParseResult a
-runFieldParser pp p v ls = runFieldParser' pos p v (fieldLinesToStream ls)
+runFieldParser pp p v ls = runFieldParser' poss p v (fieldLinesToStream ls)
   where
-    -- TODO: make per line lookup
-    pos = case ls of
-        []                     -> pp
-        (FieldLine pos' _ : _) -> pos'
+    poss = map (\(FieldLine pos _) -> pos) ls ++ [pp] -- add "default" position
 
 fieldlinesToBS :: [FieldLine ann] -> BS.ByteString
 fieldlinesToBS = BS.intercalate "\n" . map (\(FieldLine _ bs) -> bs)
+
+-- Example package with dot lines
+-- http://hackage.haskell.org/package/copilot-cbmc-0.1/copilot-cbmc.cabal
+fieldlinesToFreeText :: [FieldLine ann] -> String
+fieldlinesToFreeText [FieldLine _ "."] = "."
+fieldlinesToFreeText fls               = intercalate "\n" (map go fls)
+  where
+    go (FieldLine _ bs)
+        | s == "." = ""
+        | otherwise = s
+      where
+        s = trim (fromUTF8BS bs)
+
+        trim :: String -> String
+        trim = dropWhile isSpace . dropWhileEnd isSpace
+
+fieldlinesToFreeText3 :: Position -> [FieldLine Position] -> String
+fieldlinesToFreeText3 _   []               = ""
+fieldlinesToFreeText3 _   [FieldLine _ bs] = fromUTF8BS bs
+fieldlinesToFreeText3 pos (FieldLine pos1 bs1 : fls2@(FieldLine pos2 _ : _))
+    -- if first line is on the same line with field name:
+    -- the indentation level is either
+    -- 1. the indentation of left most line in rest fields
+    -- 2. the indentation of the first line
+    -- whichever is leftmost
+    | positionRow pos == positionRow pos1 = concat
+        $ fromUTF8BS bs1
+        : mealy (mk mcol1) pos1 fls2
+
+    -- otherwise, also indent the first line
+    | otherwise = concat
+        $ replicate (positionCol pos1 - mcol2) ' '
+        : fromUTF8BS bs1
+        : mealy (mk mcol2) pos1 fls2
+
+  where
+    mcol1 = foldl' (\a b -> min a $ positionCol $ fieldLineAnn b) (min (positionCol pos1) (positionCol pos2)) fls2
+    mcol2 = foldl' (\a b -> min a $ positionCol $ fieldLineAnn b) (positionCol pos1) fls2
+
+    mk :: Int -> Position -> FieldLine Position -> (Position, String)
+    mk col p (FieldLine q bs) =
+        ( q
+        , replicate newlines '\n'
+          ++ replicate indent ' '
+          ++ fromUTF8BS bs
+        )
+      where
+        newlines = positionRow q - positionRow p
+        indent   = positionCol q - col
+
+mealy :: (s -> a -> (s, b)) -> s -> [a] -> [b]
+mealy f = go where
+    go _ [] = []
+    go s (x : xs) = let ~(s', y) = f s x in y : go s' xs
+
+fieldLinesToStream :: [FieldLine ann] -> FieldLineStream
+fieldLinesToStream []                    = fieldLineStreamEnd
+fieldLinesToStream [FieldLine _ bs]      = FLSLast bs
+fieldLinesToStream (FieldLine _ bs : fs) = FLSCons bs (fieldLinesToStream fs)

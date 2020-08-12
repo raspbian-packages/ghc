@@ -153,7 +153,7 @@ $1_$2_$3_MOST_HC_OPTS = \
 
 $1_$2_$3_MOST_DIR_HC_OPTS = \
  $$($1_$2_$3_MOST_HC_OPTS) \
- -odir $1/$2/build -hidir $1/$2/build -stubdir $1/$2/build
+ -outputdir $1/$2/build
 
 # NB. CONF_HC_OPTS_STAGE$4 has to be late enough to override $1_$2_HC_OPTS, so
 # that -O0 is effective (see #5484)
@@ -187,8 +187,8 @@ $1_$2_$3_ALL_LD_OPTS = \
  $$($1_$2_$3_LD_OPTS) \
  $$($1_$2_EXTRA_LD_OPTS) \
  $$(EXTRA_LD_OPTS) \
- $$(foreach o,$$(EXTRA_LD_LINKER_OPTS),-optl-Wl$$(comma)$$o) \
- $$(foreach o,$$(CONF_LD_LINKER_OPTS_STAGE$4),-optl-Wl$$(comma)$$o)
+ $$(foreach o,$$(EXTRA_LD_LINKER_OPTS),-Wl$$(comma)$$o) \
+ $$(foreach o,$$(CONF_LD_LINKER_OPTS_STAGE$4),-Wl$$(comma)$$o)
 
 # Options for passing to GHC when we use it for linking
 $1_$2_$3_GHC_LD_OPTS = \

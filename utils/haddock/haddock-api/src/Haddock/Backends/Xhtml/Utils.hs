@@ -22,6 +22,7 @@ module Haddock.Backends.Xhtml.Utils (
 
   braces, brackets, pabrackets, parens, parenList, ubxParenList, ubxSumList,
   arrow, comma, dcolon, dot, darrow, equals, forallSymbol, quote, promoQuote,
+  atSign,
 
   hsep, vcat,
 
@@ -183,15 +184,15 @@ ubxSumList = ubxparens . hsep . punctuate (toHtml " | ")
 
 
 ubxparens :: Html -> Html
-ubxparens h = toHtml "(#" +++ h +++ toHtml "#)"
+ubxparens h = toHtml "(#" <+> h <+> toHtml "#)"
 
 
-dcolon, arrow, darrow, forallSymbol :: Bool -> Html
+dcolon, arrow, darrow, forallSymbol, atSign :: Bool -> Html
 dcolon unicode = toHtml (if unicode then "∷" else "::")
 arrow  unicode = toHtml (if unicode then "→" else "->")
 darrow unicode = toHtml (if unicode then "⇒" else "=>")
 forallSymbol unicode = if unicode then toHtml "∀" else keyword "forall"
-
+atSign unicode = toHtml (if unicode then "@" else "@")
 
 dot :: Html
 dot = toHtml "."

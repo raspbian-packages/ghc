@@ -1,24 +1,21 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DeriveGeneric      #-}
 module Distribution.Types.MungedPackageId
   ( MungedPackageId(..)
   , computeCompatPackageId
   ) where
 
-import Prelude ()
 import Distribution.Compat.Prelude
+import Prelude ()
 
-import Distribution.Version
-         ( Version, nullVersion )
-
-import qualified Distribution.Compat.ReadP as Parse
-import qualified Text.PrettyPrint as Disp
-import Distribution.Compat.ReadP
-import Distribution.Text
-import Distribution.Types.PackageId
-import Distribution.Types.UnqualComponentName
+import Distribution.Parsec
+import Distribution.Pretty
+import Distribution.Types.LibraryName
 import Distribution.Types.MungedPackageName
+import Distribution.Types.PackageId
+import Distribution.Version                 (Version, nullVersion)
+
+import qualified Text.PrettyPrint as Disp
 
 -- | A simple pair of a 'MungedPackageName' and 'Version'. 'MungedPackageName' is to
 -- 'MungedPackageId' as 'PackageName' is to 'PackageId'. See 'MungedPackageName' for more
@@ -35,21 +32,51 @@ data MungedPackageId
 
 instance Binary MungedPackageId
 
-instance Text MungedPackageId where
-  disp (MungedPackageId n v)
-    | v == nullVersion = disp n -- if no version, don't show version.
-    | otherwise        = disp n <<>> Disp.char '-' <<>> disp v
+-- |
+--
+-- >>> prettyShow $ MungedPackageId (MungedPackageName "servant" LMainLibName) (mkVersion [1,2,3])
+-- "servant-1.2.3"
+--
+-- >>> prettyShow $ MungedPackageId (MungedPackageName "servant" (LSubLibName "lackey")) (mkVersion [0,1,2])
+-- "z-servant-z-lackey-0.1.2"
+--
+instance Pretty MungedPackageId where
+    pretty (MungedPackageId n v)
+        | v == nullVersion = pretty n -- if no version, don't show version.
+        | otherwise        = pretty n <<>> Disp.char '-' <<>> pretty v
 
-  parse = do
-    n <- parse
-    v <- (Parse.char '-' >> parse) <++ return nullVersion
-    return (MungedPackageId n v)
+-- |
+--
+-- >>> simpleParsec "foo-bar-0" :: Maybe MungedPackageId
+-- Just (MungedPackageId {mungedName = MungedPackageName (PackageName "foo-bar") LMainLibName, mungedVersion = mkVersion [0]})
+--
+-- >>> simpleParsec "foo-bar" :: Maybe MungedPackageId
+-- Just (MungedPackageId {mungedName = MungedPackageName (PackageName "foo-bar") LMainLibName, mungedVersion = mkVersion []})
+--
+-- >>> simpleParsec "z-foo-bar-z-baz-0" :: Maybe MungedPackageId
+-- Just (MungedPackageId {mungedName = MungedPackageName (PackageName "foo-bar") (LSubLibName (UnqualComponentName "baz")), mungedVersion = mkVersion [0]})
+--
+-- >>> simpleParsec "foo-bar-0-0" :: Maybe MungedPackageId
+-- Nothing
+--
+-- >>> simpleParsec "foo-bar.0" :: Maybe MungedPackageId
+-- Nothing
+--
+-- >>> simpleParsec "foo-bar.4-2" :: Maybe MungedPackageId
+-- Nothing
+--
+instance Parsec MungedPackageId where
+    parsec = do
+        PackageIdentifier pn v <- parsec
+        return $ MungedPackageId (decodeCompatPackageName pn) v
 
 instance NFData MungedPackageId where
     rnf (MungedPackageId name version) = rnf name `seq` rnf version
 
--- | See docs for 'Distribution.Types.MungedPackageName.computeCompatPackageId'. this
--- is a thin wrapper around that.
-computeCompatPackageId :: PackageId -> Maybe UnqualComponentName -> MungedPackageId
-computeCompatPackageId (PackageIdentifier pn vr) mb_uqn = MungedPackageId pn' vr
-  where pn' = computeCompatPackageName pn mb_uqn
+computeCompatPackageId :: PackageId -> LibraryName -> MungedPackageId
+computeCompatPackageId (PackageIdentifier pn vr) ln =
+    MungedPackageId (MungedPackageName pn ln) vr
+
+-- $setup
+-- >>> :seti -XOverloadedStrings
+-- >>> import Distribution.Types.Version

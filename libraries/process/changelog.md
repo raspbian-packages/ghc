@@ -1,5 +1,34 @@
 # Changelog for [`process` package](http://hackage.haskell.org/package/process)
 
+## 1.6.8.0 *February 2020*
+
+* Fix several bugs on Windows where use of process jobs would result
+  in the process being prematurely terminated. See
+  [#168](https://github.com/haskell/process/168).
+
+## 1.6.7.0 *November 2019*
+
+* Fix a race condition on Windows that happens when you use process jobs and one of
+  the child processes terminates but doesn't release its resources immediately.
+  Control returns to the caller too soon in this scenario. See [#159](https://github.com/haskell/process/pull/159)
+
+## 1.6.6.0 *October 2019*
+
+* Fix a potential privilege escalation issue (or, more precisely, privileges
+  not being dropped when this was the user's intent) where the groups of the
+  spawning process's user would be incorrectly retained due to a missing call to
+  `initgroups` [#149].
+* Bug fix: Prevent stripping undecodable bytes from environment variables
+  when in a non-unicode locale.
+  [#152](https://github.com/haskell/process/issues/152)
+* Expose `runInteractiveProcess_lock` in `System.Process.Internals`
+  [#154](https://github.com/haskell/process/pull/154)
+
+## 1.6.5.1 *June 2019*
+
+* Version bound bumps
+* Slightly nicer error messages for internal errors
+
 ## 1.6.5.0 *December 2018*
 
 * Bug fix: On Windows ignore ERROR_ACCESS_DENIED for TerminateProcess() if the process did terminate
@@ -10,7 +39,7 @@
 
 * Bug fix: Don't leak pipes on failure
   [#122](https://github.com/haskell/process/issues/122)
-* Expose `cleanupProcess` from `System.Process` 
+* Expose `cleanupProcess` from `System.Process`
   [#130](https://github.com/haskell/process/pull/130)
 * Drop support for GHC before 7.10.3
 

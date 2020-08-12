@@ -7,7 +7,7 @@ module Packages (
         module PackageConfig,
 
         -- * Reading the package config, and processing cmdline args
-        PackageState(preloadPackages, explicitPackages, requirementContext),
+        PackageState(preloadPackages, explicitPackages, moduleToPkgConfAll, requirementContext),
         PackageConfigMap,
         emptyPackageState,
         initPackages,
@@ -83,7 +83,7 @@ import Maybes
 
 import System.Environment ( getEnv )
 import FastString
-import ErrUtils         ( debugTraceMsg, MsgDoc, printInfoForUser )
+import ErrUtils         ( debugTraceMsg, MsgDoc, dumpIfSet_dyn )
 import Exception
 
 import System.Directory
@@ -96,7 +96,6 @@ import Data.List as List
 import Data.Map (Map)
 import Data.Set (Set)
 import Data.Monoid (First(..))
-import Data.Semigroup   ( Semigroup )
 import qualified Data.Semigroup as Semigroup
 import qualified Data.Map as Map
 import qualified Data.Map.Strict as MapStrict
@@ -418,7 +417,7 @@ searchPackageId dflags pid = filter ((pid ==) . sourcePackageId)
 extendPackageConfigMap
    :: PackageConfigMap -> [PackageConfig] -> PackageConfigMap
 extendPackageConfigMap (PackageConfigMap pkg_map closure) new_pkgs
-  = PackageConfigMap (foldl add pkg_map new_pkgs) closure
+  = PackageConfigMap (foldl' add pkg_map new_pkgs) closure
     -- We also add the expanded version of the packageConfigId, so that
     -- 'improveUnitId' can find it.
   where add pkg_map p = addToUDFM (addToUDFM pkg_map (expandedPackageConfigId p) p)
@@ -892,15 +891,28 @@ sortByPreference prec_map = sortBy (flip (compareByPreference prec_map))
 --
 -- Pursuant to #12518, we could change this policy to, for example, remove
 -- the version preference, meaning that we would always prefer the packages
--- in alter package database.
+-- in later package database.
 --
+-- Instead, we use that preference based policy only when one of the packages
+-- is integer-gmp and the other is integer-simple.
+-- This currently only happens when we're looking up which concrete
+-- package to use in place of @integer-wired-in@ and that two different
+-- package databases supply a different integer library. For more about
+-- the fake @integer-wired-in@ package, see Note [The integer library]
+-- in the @PrelNames@ module.
 compareByPreference
     :: PackagePrecedenceIndex
     -> PackageConfig
     -> PackageConfig
     -> Ordering
-compareByPreference prec_map pkg pkg' =
-    case comparing packageVersion pkg pkg' of
+compareByPreference prec_map pkg pkg'
+  | Just prec  <- Map.lookup (unitId pkg)  prec_map
+  , Just prec' <- Map.lookup (unitId pkg') prec_map
+  , differentIntegerPkgs pkg pkg'
+  = compare prec prec'
+
+  | otherwise
+  = case comparing packageVersion pkg pkg' of
         GT -> GT
         EQ | Just prec  <- Map.lookup (unitId pkg)  prec_map
            , Just prec' <- Map.lookup (unitId pkg') prec_map
@@ -910,6 +922,12 @@ compareByPreference prec_map pkg pkg' =
            | otherwise
            -> EQ
         LT -> LT
+
+  where isIntegerPkg p = packageNameString p `elem`
+          ["integer-simple", "integer-gmp"]
+        differentIntegerPkgs p p' =
+          isIntegerPkg p && isIntegerPkg p' &&
+          (packageName p /= packageName p')
 
 comparing :: Ord a => (t -> a) -> t -> t -> Ordering
 comparing f a b = f a `compare` f b
@@ -954,11 +972,14 @@ pprTrustFlag flag = case flag of
 
 -- -----------------------------------------------------------------------------
 -- Wired-in packages
+--
+-- See Note [Wired-in packages] in Module
 
-wired_in_pkgids :: [String]
-wired_in_pkgids = map unitIdString wiredInUnitIds
-
+type WiredInUnitId = String
 type WiredPackagesMap = Map WiredUnitId WiredUnitId
+
+wired_in_pkgids :: [WiredInUnitId]
+wired_in_pkgids = map unitIdString wiredInUnitIds
 
 findWiredInPackages
    :: DynFlags
@@ -970,12 +991,15 @@ findWiredInPackages
           WiredPackagesMap) -- map from unit id to wired identity
 
 findWiredInPackages dflags prec_map pkgs vis_map = do
-  --
   -- Now we must find our wired-in packages, and rename them to
-  -- their canonical names (eg. base-1.0 ==> base).
-  --
+  -- their canonical names (eg. base-1.0 ==> base), as described
+  -- in Note [Wired-in packages] in Module
   let
-        matches :: PackageConfig -> String -> Bool
+        matches :: PackageConfig -> WiredInUnitId -> Bool
+        pc `matches` pid
+            -- See Note [The integer library] in PrelNames
+            | pid == unitIdString integerUnitId
+            = packageNameString pc `elem` ["integer-gmp", "integer-simple"]
         pc `matches` pid = packageNameString pc == pid
 
         -- find which package corresponds to each wired-in package
@@ -995,8 +1019,8 @@ findWiredInPackages dflags prec_map pkgs vis_map = do
         -- this works even when there is no exposed wired in package
         -- available.
         --
-        findWiredInPackage :: [PackageConfig] -> String
-                           -> IO (Maybe PackageConfig)
+        findWiredInPackage :: [PackageConfig] -> WiredInUnitId
+                           -> IO (Maybe (WiredInUnitId, PackageConfig))
         findWiredInPackage pkgs wired_pkg =
            let all_ps = [ p | p <- pkgs, p `matches` wired_pkg ]
                all_exposed_ps =
@@ -1015,20 +1039,19 @@ findWiredInPackages dflags prec_map pkgs vis_map = do
                                  <> text " not found."
                           return Nothing
                 pick :: PackageConfig
-                     -> IO (Maybe PackageConfig)
+                     -> IO (Maybe (WiredInUnitId, PackageConfig))
                 pick pkg = do
                         debugTraceMsg dflags 2 $
                             text "wired-in package "
                                  <> text wired_pkg
                                  <> text " mapped to "
                                  <> ppr (unitId pkg)
-                        return (Just pkg)
+                        return (Just (wired_pkg, pkg))
 
 
   mb_wired_in_pkgs <- mapM (findWiredInPackage pkgs) wired_in_pkgids
   let
         wired_in_pkgs = catMaybes mb_wired_in_pkgs
-        wired_in_ids = mapMaybe definitePackageConfigId wired_in_pkgs
 
         -- this is old: we used to assume that if there were
         -- multiple versions of wired-in packages installed that
@@ -1044,18 +1067,17 @@ findWiredInPackages dflags prec_map pkgs vis_map = do
         -}
 
         wiredInMap :: Map WiredUnitId WiredUnitId
-        wiredInMap = foldl' add_mapping Map.empty pkgs
-          where add_mapping m pkg
-                  | Just key <- definitePackageConfigId pkg
-                  , key `elem` wired_in_ids
-                  = Map.insert key (DefUnitId (stringToInstalledUnitId (packageNameString pkg))) m
-                  | otherwise = m
+        wiredInMap = Map.fromList
+          [ (key, DefUnitId (stringToInstalledUnitId wiredInUnitId))
+          | (wiredInUnitId, pkg) <- wired_in_pkgs
+          , Just key <- pure $ definitePackageConfigId pkg
+          ]
 
         updateWiredInDependencies pkgs = map (upd_deps . upd_pkg) pkgs
           where upd_pkg pkg
                   | Just def_uid <- definitePackageConfigId pkg
-                  , def_uid `elem` wired_in_ids
-                  = let PackageName fs = packageName pkg
+                  , Just wiredInUnitId <- Map.lookup def_uid wiredInMap
+                  = let fs = installedUnitIdFS (unDefUnitId wiredInUnitId)
                     in pkg {
                       unitId = fsToInstalledUnitId fs,
                       componentId = ComponentId fs
@@ -1075,7 +1097,9 @@ findWiredInPackages dflags prec_map pkgs vis_map = do
 
 -- Helper functions for rewiring Module and UnitId.  These
 -- rewrite UnitIds of modules in wired-in packages to the form known to the
--- compiler. For instance, base-4.9.0.0 will be rewritten to just base, to match
+-- compiler, as described in Note [Wired-in packages] in Module.
+--
+-- For instance, base-4.9.0.0 will be rewritten to just base, to match
 -- what appears in PrelNames.
 
 upd_wired_in_mod :: WiredPackagesMap -> Module -> Module
@@ -1432,23 +1456,42 @@ mkPackageState dflags dbs preload0 = do
   let prelim_pkg_db = extendPackageConfigMap emptyPackageConfigMap pkgs1
 
   --
-  -- Calculate the initial set of packages, prior to any package flags.
-  -- This set contains the latest version of all valid (not unusable) packages,
-  -- or is empty if we have -hide-all-packages
+  -- Calculate the initial set of units from package databases, prior to any package flags.
   --
-  let preferLater pkg pkg' =
-        case compareByPreference prec_map pkg pkg' of
-            GT -> pkg
-            _  -> pkg'
-      calcInitial m pkg = addToUDFM_C preferLater m (fsPackageName pkg) pkg
-      initial = if gopt Opt_HideAllPackages dflags
+  -- Conceptually, we select the latest versions of all valid (not unusable) *packages*
+  -- (not units). This is empty if we have -hide-all-packages.
+  --
+  -- Then we create an initial visibility map with default visibilities for all
+  -- exposed, definite units which belong to the latest valid packages.
+  --
+  let preferLater unit unit' =
+        case compareByPreference prec_map unit unit' of
+            GT -> unit
+            _  -> unit'
+      addIfMorePreferable m unit = addToUDFM_C preferLater m (fsPackageName unit) unit
+      -- This is the set of maximally preferable packages. In fact, it is a set of
+      -- most preferable *units* keyed by package name, which act as stand-ins in 
+      -- for "a package in a database". We use units here because we don't have 
+      -- "a package in a database" as a type currently.
+      mostPreferablePackageReps = if gopt Opt_HideAllPackages dflags
                     then emptyUDFM
-                    else foldl' calcInitial emptyUDFM pkgs1
-      vis_map1 = foldUDFM (\p vm ->
+                    else foldl' addIfMorePreferable emptyUDFM pkgs1
+      -- When exposing units, we want to consider all of those in the most preferable
+      -- packages. We can implement that by looking for units that are equi-preferable
+      -- with the most preferable unit for package. Being equi-preferable means that
+      -- they must be in the same database, with the same version, and the same pacakge name.
+      --
+      -- We must take care to consider all these units and not just the most 
+      -- preferable one, otherwise we can end up with problems like #16228.
+      mostPreferable u =
+        case lookupUDFM mostPreferablePackageReps (fsPackageName u) of
+          Nothing -> False
+          Just u' -> compareByPreference prec_map u u' == EQ
+      vis_map1 = foldl' (\vm p ->
                             -- Note: we NEVER expose indefinite packages by
                             -- default, because it's almost assuredly not
                             -- what you want (no mix-in linking has occurred).
-                            if exposed p && unitIdIsDefinite (packageConfigId p)
+                            if exposed p && unitIdIsDefinite (packageConfigId p) && mostPreferable p
                                then Map.insert (packageConfigId p)
                                                UnitVisibility {
                                                  uv_expose_all = True,
@@ -1459,7 +1502,7 @@ mkPackageState dflags dbs preload0 = do
                                                }
                                                vm
                                else vm)
-                         Map.empty initial
+                         Map.empty pkgs1
 
   --
   -- Compute a visibility map according to the command-line flags (-package,
@@ -1520,7 +1563,7 @@ mkPackageState dflags dbs preload0 = do
   --
   let preload1 = Map.keys (Map.filter uv_explicit vis_map)
 
-  let pkgname_map = foldl add Map.empty pkgs2
+  let pkgname_map = foldl' add Map.empty pkgs2
         where add pn_map p
                 = Map.insert (packageName p) (componentId p) pn_map
 
@@ -1560,9 +1603,8 @@ mkPackageState dflags dbs preload0 = do
       mod_map2 = mkUnusableModuleToPkgConfAll unusable
       mod_map = Map.union mod_map1 mod_map2
 
-  when (dopt Opt_D_dump_mod_map dflags) $
-      printInfoForUser (dflags { pprCols = 200 })
-                       alwaysQualify (pprModuleMap mod_map)
+  dumpIfSet_dyn (dflags { pprCols = 200 }) Opt_D_dump_mod_map "Mod Map"
+    (pprModuleMap mod_map)
 
   -- Force pstate to avoid leaking the dflags0 passed to mkPackageState
   let !pstate = PackageState{

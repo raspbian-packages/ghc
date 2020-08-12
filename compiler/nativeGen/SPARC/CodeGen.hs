@@ -39,7 +39,7 @@ import SPARC.Regs
 import SPARC.Stack
 import Instruction
 import Format
-import NCGMonad
+import NCGMonad   ( NatM, getNewRegNat, getNewLabelNat )
 
 -- Our intermediate code:
 import BlockId
@@ -401,6 +401,8 @@ genCCall
 --
 -- In the SPARC case we don't need a barrier.
 --
+genCCall (PrimTarget MO_ReadBarrier) _ _
+ = return $ nilOL
 genCCall (PrimTarget MO_WriteBarrier) _ _
  = return $ nilOL
 
@@ -633,6 +635,10 @@ outOfLineMachOp_table mop
         MO_F32_Cosh   -> fsLit "coshf"
         MO_F32_Tanh   -> fsLit "tanhf"
 
+        MO_F32_Asinh  -> fsLit "asinhf"
+        MO_F32_Acosh  -> fsLit "acoshf"
+        MO_F32_Atanh  -> fsLit "atanhf"
+
         MO_F64_Exp    -> fsLit "exp"
         MO_F64_Log    -> fsLit "log"
         MO_F64_Sqrt   -> fsLit "sqrt"
@@ -650,6 +656,10 @@ outOfLineMachOp_table mop
         MO_F64_Sinh   -> fsLit "sinh"
         MO_F64_Cosh   -> fsLit "cosh"
         MO_F64_Tanh   -> fsLit "tanh"
+
+        MO_F64_Asinh  -> fsLit "asinh"
+        MO_F64_Acosh  -> fsLit "acosh"
+        MO_F64_Atanh  -> fsLit "atanh"
 
         MO_UF_Conv w -> fsLit $ word2FloatLabel w
 
@@ -678,6 +688,7 @@ outOfLineMachOp_table mop
         MO_AddIntC {}    -> unsupported
         MO_SubIntC {}    -> unsupported
         MO_U_Mul2 {}     -> unsupported
+        MO_ReadBarrier   -> unsupported
         MO_WriteBarrier  -> unsupported
         MO_Touch         -> unsupported
         (MO_Prefetch_Data _) -> unsupported

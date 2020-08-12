@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric      #-}
+{-# LANGUAGE RankNTypes         #-}
 
 module Distribution.Types.ModuleRenaming (
     ModuleRenaming(..),
@@ -8,19 +9,17 @@ module Distribution.Types.ModuleRenaming (
     isDefaultRenaming,
 ) where
 
+import Distribution.CabalSpecVersion
 import Distribution.Compat.Prelude hiding (empty)
 import Prelude ()
 
 import Distribution.ModuleName
-import Distribution.Parsec.Class
+import Distribution.Parsec
 import Distribution.Pretty
-import Distribution.Text
 
 import qualified Data.Map                   as Map
 import qualified Data.Set                   as Set
 import qualified Distribution.Compat.CharParsing as P
-import           Distribution.Compat.ReadP  ((<++))
-import qualified Distribution.Compat.ReadP  as Parse
 import           Text.PrettyPrint           (hsep, parens, punctuate, text, (<+>), comma)
 
 -- | Renaming applied to the modules provided by a package.
@@ -67,6 +66,8 @@ isDefaultRenaming :: ModuleRenaming -> Bool
 isDefaultRenaming DefaultRenaming = True
 isDefaultRenaming _ = False
 
+
+
 instance Binary ModuleRenaming where
 
 instance NFData ModuleRenaming where rnf = genericRnf
@@ -84,57 +85,49 @@ instance Pretty ModuleRenaming where
             | otherwise = pretty orig <+> text "as" <+> pretty new
 
 instance Parsec ModuleRenaming where
-    -- NB: try not necessary as the first token is obvious
-    parsec = P.choice [ parseRename, parseHiding, return DefaultRenaming ]
+    parsec = do
+        csv <- askCabalSpecVersion
+        if csv >= CabalSpecV3_0
+        then moduleRenamingParsec parensLax    lexemeParsec
+        else moduleRenamingParsec parensStrict parsec
       where
-        parseRename = do
-            rns <- P.between (P.char '(') (P.char ')') parseList
-            P.spaces
-            return (ModuleRenaming rns)
-        parseHiding = do
-            _ <- P.string "hiding"
-            P.spaces
-            hides <- P.between (P.char '(') (P.char ')')
-                        (P.sepBy parsec (P.char ',' >> P.spaces))
-            return (HidingRenaming hides)
-        parseList =
-            P.sepBy parseEntry (P.char ',' >> P.spaces)
-        parseEntry = do
-            orig <- parsec
-            P.spaces
-            P.option (orig, orig) $ do
-                _ <- P.string "as"
-                P.spaces
-                new <- parsec
-                P.spaces
-                return (orig, new)
+        -- For cabal spec versions < 3.0 white spaces were not skipped
+        -- after the '(' and ')' tokens in the mixin field. This
+        -- parser checks the cabal file version and does the correct
+        -- skipping of spaces.
+        parensLax    p = P.between (P.char '(' >> P.spaces)   (P.char ')' >> P.spaces)   p
+        parensStrict p = P.between (P.char '(' >> warnSpaces) (P.char ')') p
 
+        warnSpaces = P.optional $
+            P.space *> fail "space after parenthesis, use cabal-version: 3.0 or higher"
 
-
-instance Text ModuleRenaming where
-  parse = do fmap ModuleRenaming parseRns
-             <++ parseHidingRenaming
-             <++ return DefaultRenaming
-    where parseRns = do
-             rns <- Parse.between (Parse.char '(') (Parse.char ')') parseList
-             Parse.skipSpaces
-             return rns
-          parseHidingRenaming = do
-            _ <- Parse.string "hiding"
-            Parse.skipSpaces
-            hides <- Parse.between (Parse.char '(') (Parse.char ')')
-                        (Parse.sepBy parse (Parse.char ',' >> Parse.skipSpaces))
-            return (HidingRenaming hides)
-          parseList =
-            Parse.sepBy parseEntry (Parse.char ',' >> Parse.skipSpaces)
-          parseEntry :: Parse.ReadP r (ModuleName, ModuleName)
-          parseEntry = do
-            orig <- parse
-            Parse.skipSpaces
-            (do _ <- Parse.string "as"
-                Parse.skipSpaces
-                new <- parse
-                Parse.skipSpaces
-                return (orig, new)
-             <++
-                return (orig, orig))
+moduleRenamingParsec
+    :: CabalParsing m
+    => (forall a. m a -> m a)  -- ^ between parens
+    -> m ModuleName            -- ^ module name parser
+    -> m ModuleRenaming
+moduleRenamingParsec bp mn =
+    -- NB: try not necessary as the first token is obvious
+    P.choice [ parseRename, parseHiding, return DefaultRenaming ]
+  where
+    cma = P.char ',' >> P.spaces
+    parseRename = do
+        rns <- bp parseList
+        P.spaces
+        return (ModuleRenaming rns)
+    parseHiding = do
+        _ <- P.string "hiding"
+        P.spaces -- space isn't strictly required as next is an open paren
+        hides <- bp (P.sepBy mn cma)
+        return (HidingRenaming hides)
+    parseList =
+        P.sepBy parseEntry cma
+    parseEntry = do
+        orig <- parsec
+        P.spaces
+        P.option (orig, orig) $ do
+            _ <- P.string "as"
+            P.skipSpaces1 -- require space after "as"
+            new <- parsec
+            P.spaces
+            return (orig, new)

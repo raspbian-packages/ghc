@@ -15,14 +15,16 @@ import Test.Haddock.Xhtml
 checkConfig :: CheckConfig Xml
 checkConfig = CheckConfig
     { ccfgRead = parseXml
-    , ccfgClean = \_ -> strip
+    , ccfgClean = strip
     , ccfgDump = dumpXml
     , ccfgEqual = (==) `on` dumpXml
     }
   where
-    strip = stripAnchors' . stripLinks' . stripFooter
+    strip _ = stripAnchors' . stripLinks' . stripIds' . stripFooter
+    
     stripLinks' = stripLinksWhen $ \href -> "#local-" `isPrefixOf` href
     stripAnchors' = stripAnchorsWhen $ \name -> "local-" `isPrefixOf` name
+    stripIds' = stripIdsWhen $ \name -> "local-" `isPrefixOf` name
 
 
 dirConfig :: DirConfig

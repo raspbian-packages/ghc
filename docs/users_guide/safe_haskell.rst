@@ -206,6 +206,11 @@ run the plugin, it calls ``RIO.runRIO Danger.runMe`` within the ``IO``
 monad. The application is safe in the knowledge that the only ``IO`` to
 ensue will be to files whose paths were approved by the ``pathOK`` test.
 
+The Safe Haskell checks can be disabled for a module by passing the
+:ghc-flag:`-fno-safe-haskell` flag. This is useful in particular when compiling
+with source plugins as running a plugin marks the module as unsafe and can then
+cause downstream modules to fail the safety checks.
+
 .. _safe-language:
 
 Safe Language
@@ -582,7 +587,7 @@ trust property of packages:
 .. ghc-flag:: -trust ⟨pkg⟩
     :shortdesc: Expose package ⟨pkg⟩ and set it to be trusted. See
         :ref:`safe-haskell`.
-    :type: dynamic/ ``:set``
+    :type: dynamic
     :category: packages
 
     Exposes package ⟨pkg⟩ if it was hidden and considers it a
@@ -591,7 +596,7 @@ trust property of packages:
 .. ghc-flag:: -distrust ⟨pkg⟩
     :shortdesc: Expose package ⟨pkg⟩ and set it to be distrusted. See
         :ref:`safe-haskell`.
-    :type: dynamic/ ``:set``
+    :type: dynamic
     :category: packages
 
     Exposes package ⟨pkg⟩ if it was hidden and considers it
@@ -599,7 +604,7 @@ trust property of packages:
 
 .. ghc-flag:: -distrust-all-packages
     :shortdesc: Distrust all packages by default. See :ref:`safe-haskell`.
-    :type: dynamic/ ``:set``
+    :type: dynamic
     :category: packages
 
     Considers all packages distrusted unless they are
@@ -709,6 +714,18 @@ In summary, Safe Haskell consists of the following three language flags:
     - *Haskell Language* — Unrestricted
     - *Imported Modules* — Under control of module author which ones must be
       trusted.
+
+A flag to disable Safe Haskell checks:
+
+.. ghc-flag:: -fno-safe-haskell
+    :shortdesc: Disable :ref:`Safe Haskell <safe-haskell>`
+    :type: dynamic
+
+    This flag can be enabled to override any declared safety property of the
+    module (Safe, Unsafe, Trustworthy) so compilation proceeds as if none of
+    these flags were specified. This is particularly useful when compiling
+    using plugins, which usually results in the compiled modules being marked
+    as unsafe.
 
 And one general flag:
 

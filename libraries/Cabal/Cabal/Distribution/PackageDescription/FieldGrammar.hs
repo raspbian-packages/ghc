@@ -43,18 +43,20 @@ import Distribution.Compat.Lens
 import Distribution.Compat.Prelude
 import Prelude ()
 
-import Distribution.Compiler                  (CompilerFlavor (..))
+import Distribution.CabalSpecVersion
+import Distribution.Compiler                  (CompilerFlavor (..), PerCompilerFlavor (..))
 import Distribution.FieldGrammar
 import Distribution.ModuleName                (ModuleName)
 import Distribution.Package
 import Distribution.PackageDescription
-import Distribution.Parsec.Common
+import Distribution.Parsec
 import Distribution.Parsec.Newtypes
-import Distribution.Parsec.ParseResult
-import Distribution.Text                      (display)
+import Distribution.Fields
+import Distribution.Pretty                    (prettyShow)
 import Distribution.Types.ExecutableScope
 import Distribution.Types.ForeignLib
 import Distribution.Types.ForeignLibType
+import Distribution.Types.LibraryVisibility
 import Distribution.Types.UnqualComponentName
 import Distribution.Version                   (anyVersion)
 
@@ -74,18 +76,18 @@ packageDescriptionFieldGrammar = PackageDescription
     <*> blurFieldGrammar L.package packageIdentifierGrammar
     <*> optionalFieldDefAla "license"       SpecLicense                L.licenseRaw (Left SPDX.NONE)
     <*> licenseFilesGrammar
-    <*> optionalFieldDefAla "copyright"     FreeText                   L.copyright ""
-    <*> optionalFieldDefAla "maintainer"    FreeText                   L.maintainer ""
-    <*> optionalFieldDefAla "author"        FreeText                   L.author ""
-    <*> optionalFieldDefAla "stability"     FreeText                   L.stability ""
+    <*> freeTextFieldDef    "copyright"                                L.copyright
+    <*> freeTextFieldDef    "maintainer"                               L.maintainer
+    <*> freeTextFieldDef    "author"                                   L.author
+    <*> freeTextFieldDef    "stability"                                L.stability
     <*> monoidalFieldAla    "tested-with"   (alaList' FSep TestedWith) L.testedWith
-    <*> optionalFieldDefAla "homepage"      FreeText                   L.homepage ""
-    <*> optionalFieldDefAla "package-url"   FreeText                   L.pkgUrl ""
-    <*> optionalFieldDefAla "bug-reports"   FreeText                   L.bugReports ""
+    <*> freeTextFieldDef    "homepage"                                 L.homepage
+    <*> freeTextFieldDef    "package-url"                              L.pkgUrl
+    <*> freeTextFieldDef    "bug-reports"                              L.bugReports
     <*> pure [] -- source-repos are stanza
-    <*> optionalFieldDefAla "synopsis"      FreeText                   L.synopsis ""
-    <*> optionalFieldDefAla "description"   FreeText                   L.description ""
-    <*> optionalFieldDefAla "category"      FreeText                   L.category ""
+    <*> freeTextFieldDef    "synopsis"                                 L.synopsis
+    <*> freeTextFieldDef    "description"                              L.description
+    <*> freeTextFieldDef    "category"                                 L.category
     <*> prefixedFields      "x-"                                       L.customFieldsPD
     <*> optionalField       "build-type"                               L.buildTypeRaw
     <*> pure Nothing -- custom-setup
@@ -121,16 +123,27 @@ packageDescriptionFieldGrammar = PackageDescription
 
 libraryFieldGrammar
     :: (FieldGrammar g, Applicative (g Library), Applicative (g BuildInfo))
-    => Maybe UnqualComponentName -> g Library Library
+    => LibraryName
+    -> g Library Library
 libraryFieldGrammar n = Library n
     <$> monoidalFieldAla  "exposed-modules"    (alaList' VCat MQuoted) L.exposedModules
     <*> monoidalFieldAla  "reexported-modules" (alaList  CommaVCat)    L.reexportedModules
     <*> monoidalFieldAla  "signatures"         (alaList' VCat MQuoted) L.signatures
-        ^^^ availableSince [2,0] []
+        ^^^ availableSince CabalSpecV2_0 []
     <*> booleanFieldDef   "exposed"                                    L.libExposed True
+    <*> visibilityField
     <*> blurFieldGrammar L.libBuildInfo buildInfoFieldGrammar
-{-# SPECIALIZE libraryFieldGrammar :: Maybe UnqualComponentName -> ParsecFieldGrammar' Library #-}
-{-# SPECIALIZE libraryFieldGrammar :: Maybe UnqualComponentName -> PrettyFieldGrammar' Library #-}
+  where
+    visibilityField = case n of
+        -- nameless/"main" libraries are public
+        LMainLibName -> pure LibraryVisibilityPublic
+        -- named libraries have the field
+        LSubLibName _ ->
+            optionalFieldDef "visibility" L.libVisibility LibraryVisibilityPrivate
+            ^^^ availableSince CabalSpecV3_0 LibraryVisibilityPrivate
+
+{-# SPECIALIZE libraryFieldGrammar :: LibraryName -> ParsecFieldGrammar' Library #-}
+{-# SPECIALIZE libraryFieldGrammar :: LibraryName -> PrettyFieldGrammar' Library #-}
 
 -------------------------------------------------------------------------------
 -- Foreign library
@@ -160,7 +173,7 @@ executableFieldGrammar n = Executable n
     -- main-is is optional as conditional blocks don't have it
     <$> optionalFieldDefAla "main-is" FilePathNT L.modulePath ""
     <*> optionalFieldDef    "scope"              L.exeScope ExecutablePublic
-        ^^^ availableSince [2,0] ExecutablePublic
+        ^^^ availableSince CabalSpecV2_0 ExecutablePublic
     <*> blurFieldGrammar L.buildInfo buildInfoFieldGrammar
 {-# SPECIALIZE executableFieldGrammar :: UnqualComponentName -> ParsecFieldGrammar' Executable #-}
 {-# SPECIALIZE executableFieldGrammar :: UnqualComponentName -> PrettyFieldGrammar' Executable #-}
@@ -249,10 +262,10 @@ validateTestSuite pos stanza = case _testStanzaTestType stanza of
 
   where
     missingField name tt = "The '" ++ name ++ "' field is required for the "
-                        ++ display tt ++ " test suite type."
+                        ++ prettyShow tt ++ " test suite type."
 
     extraField   name tt = "The '" ++ name ++ "' field is not used for the '"
-                        ++ display tt ++ "' test suite type."
+                        ++ prettyShow tt ++ "' test suite type."
 
 unvalidateTestSuite :: TestSuite -> TestSuiteStanza
 unvalidateTestSuite t = TestSuiteStanza
@@ -337,10 +350,10 @@ validateBenchmark pos stanza = case _benchmarkStanzaBenchmarkType stanza of
 
   where
     missingField name tt = "The '" ++ name ++ "' field is required for the "
-                        ++ display tt ++ " benchmark type."
+                        ++ prettyShow tt ++ " benchmark type."
 
     extraField   name tt = "The '" ++ name ++ "' field is not used for the '"
-                        ++ display tt ++ "' benchmark type."
+                        ++ prettyShow tt ++ "' benchmark type."
 
 unvalidateBenchmark :: Benchmark -> BenchmarkStanza
 unvalidateBenchmark b = BenchmarkStanza
@@ -365,7 +378,10 @@ buildInfoFieldGrammar
 buildInfoFieldGrammar = BuildInfo
     <$> booleanFieldDef  "buildable"                                          L.buildable True
     <*> monoidalFieldAla "build-tools"          (alaList  CommaFSep)          L.buildTools
-        ^^^ deprecatedSince [2,0] "Please use 'build-tool-depends' field"
+        ^^^ deprecatedSince CabalSpecV2_0
+            "Please use 'build-tool-depends' field"
+        ^^^ removedIn CabalSpecV3_0
+            "Please use 'build-tool-depends' field."
     <*> monoidalFieldAla "build-tool-depends"   (alaList  CommaFSep)          L.buildToolDepends
         -- {- ^^^ availableSince [2,0] [] -}
         -- here, we explicitly want to recognise build-tool-depends for all Cabal files
@@ -374,47 +390,58 @@ buildInfoFieldGrammar = BuildInfo
         -- I.e. we don't want trigger unknown field warning
     <*> monoidalFieldAla "cpp-options"          (alaList' NoCommaFSep Token') L.cppOptions
     <*> monoidalFieldAla "asm-options"          (alaList' NoCommaFSep Token') L.asmOptions
+        ^^^ availableSince CabalSpecV3_0 []
     <*> monoidalFieldAla "cmm-options"          (alaList' NoCommaFSep Token') L.cmmOptions
+        ^^^ availableSince CabalSpecV3_0 []
     <*> monoidalFieldAla "cc-options"           (alaList' NoCommaFSep Token') L.ccOptions
     <*> monoidalFieldAla "cxx-options"          (alaList' NoCommaFSep Token') L.cxxOptions
-        ^^^ availableSince [2,1] [] -- TODO change to 2,2 when version is bumped
+        ^^^ availableSince CabalSpecV2_2 []
     <*> monoidalFieldAla "ld-options"           (alaList' NoCommaFSep Token') L.ldOptions
     <*> monoidalFieldAla "pkgconfig-depends"    (alaList  CommaFSep)          L.pkgconfigDepends
     <*> monoidalFieldAla "frameworks"           (alaList' FSep Token)         L.frameworks
     <*> monoidalFieldAla "extra-framework-dirs" (alaList' FSep FilePathNT)    L.extraFrameworkDirs
     <*> monoidalFieldAla "asm-sources"          (alaList' VCat FilePathNT)    L.asmSources
+        ^^^ availableSince CabalSpecV3_0 []
     <*> monoidalFieldAla "cmm-sources"          (alaList' VCat FilePathNT)    L.cmmSources
+        ^^^ availableSince CabalSpecV3_0 []
     <*> monoidalFieldAla "c-sources"            (alaList' VCat FilePathNT)    L.cSources
     <*> monoidalFieldAla "cxx-sources"          (alaList' VCat FilePathNT)    L.cxxSources
-        ^^^ availableSince [2,1] [] -- TODO change to 2,2 when version is bumped
+        ^^^ availableSince CabalSpecV2_2 []
     <*> monoidalFieldAla "js-sources"           (alaList' VCat FilePathNT)    L.jsSources
     <*> hsSourceDirsGrammar
     <*> monoidalFieldAla "other-modules"        (alaList' VCat MQuoted)       L.otherModules
     <*> monoidalFieldAla "virtual-modules"      (alaList' VCat MQuoted)       L.virtualModules
-        ^^^ availableSince [2,1] [] -- TODO change to 2,2 when version is bumped
+        ^^^ availableSince CabalSpecV2_2 []
     <*> monoidalFieldAla "autogen-modules"      (alaList' VCat MQuoted)       L.autogenModules
     <*> optionalFieldAla "default-language"     MQuoted                       L.defaultLanguage
     <*> monoidalFieldAla "other-languages"      (alaList' FSep MQuoted)       L.otherLanguages
     <*> monoidalFieldAla "default-extensions"   (alaList' FSep MQuoted)       L.defaultExtensions
     <*> monoidalFieldAla "other-extensions"     (alaList' FSep MQuoted)       L.otherExtensions
     <*> monoidalFieldAla "extensions"           (alaList' FSep MQuoted)       L.oldExtensions
-        ^^^ deprecatedSince [1,12] "Please use 'default-extensions' or 'other-extensions' fields."
+        ^^^ deprecatedSince CabalSpecV1_12
+            "Please use 'default-extensions' or 'other-extensions' fields."
+        ^^^ removedIn CabalSpecV3_0
+            "Please use 'default-extensions' or 'other-extensions' fields."
     <*> monoidalFieldAla "extra-libraries"      (alaList' VCat Token)         L.extraLibs
     <*> monoidalFieldAla "extra-ghci-libraries" (alaList' VCat Token)         L.extraGHCiLibs
     <*> monoidalFieldAla "extra-bundled-libraries" (alaList' VCat Token)      L.extraBundledLibs
     <*> monoidalFieldAla "extra-library-flavours" (alaList' VCat Token)       L.extraLibFlavours
+    <*> monoidalFieldAla "extra-dynamic-library-flavours" (alaList' VCat Token) L.extraDynLibFlavours
+        ^^^ availableSince CabalSpecV3_0 []
     <*> monoidalFieldAla "extra-lib-dirs"       (alaList' FSep FilePathNT)    L.extraLibDirs
     <*> monoidalFieldAla "include-dirs"         (alaList' FSep FilePathNT)    L.includeDirs
     <*> monoidalFieldAla "includes"             (alaList' FSep FilePathNT)    L.includes
+    <*> monoidalFieldAla "autogen-includes"     (alaList' FSep FilePathNT)    L.autogenIncludes
+        ^^^ availableSince CabalSpecV3_0 []
     <*> monoidalFieldAla "install-includes"     (alaList' FSep FilePathNT)    L.installIncludes
     <*> optionsFieldGrammar
     <*> profOptionsFieldGrammar
     <*> sharedOptionsFieldGrammar
-    <*> pure [] -- static-options ???
+    <*> pure mempty -- static-options ???
     <*> prefixedFields   "x-"                                                 L.customFieldsBI
     <*> monoidalFieldAla "build-depends"        (alaList  CommaVCat)          L.targetBuildDepends
     <*> monoidalFieldAla "mixins"               (alaList  CommaVCat)          L.mixins
-        ^^^ availableSince [2,0] []
+        ^^^ availableSince CabalSpecV2_0 []
 {-# SPECIALIZE buildInfoFieldGrammar :: ParsecFieldGrammar' BuildInfo #-}
 {-# SPECIALIZE buildInfoFieldGrammar :: PrettyFieldGrammar' BuildInfo #-}
 
@@ -423,13 +450,19 @@ hsSourceDirsGrammar
     => g BuildInfo [FilePath]
 hsSourceDirsGrammar = (++)
     <$> monoidalFieldAla "hs-source-dirs" (alaList' FSep FilePathNT) L.hsSourceDirs
-    <*> monoidalFieldAla "hs-source-dir"  (alaList' FSep FilePathNT) L.hsSourceDirs
-        ^^^ deprecatedField' "Please use 'hs-source-dirs'"
+    <*> monoidalFieldAla "hs-source-dir"  (alaList' FSep FilePathNT) wrongLens
+        --- https://github.com/haskell/cabal/commit/49e3cdae3bdf21b017ccd42e66670ca402e22b44
+        ^^^ deprecatedSince CabalSpecV1_2 "Please use 'hs-source-dirs'"
+        ^^^ removedIn CabalSpecV3_0 "Please use 'hs-source-dirs' field."
+  where
+    -- TODO: make pretty printer aware of CabalSpecVersion
+    wrongLens :: Functor f => LensLike' f BuildInfo [FilePath]
+    wrongLens f bi = (\fps -> set L.hsSourceDirs fps bi) <$> f []
 
 optionsFieldGrammar
     :: (FieldGrammar g, Applicative (g BuildInfo))
-    => g BuildInfo [(CompilerFlavor, [String])]
-optionsFieldGrammar = combine
+    => g BuildInfo (PerCompilerFlavor [String])
+optionsFieldGrammar = PerCompilerFlavor
     <$> monoidalFieldAla "ghc-options"   (alaList' NoCommaFSep Token') (extract GHC)
     <*> monoidalFieldAla "ghcjs-options" (alaList' NoCommaFSep Token') (extract GHCJS)
     -- NOTE: Hugs, NHC and JHC are not supported anymore, but these
@@ -442,51 +475,31 @@ optionsFieldGrammar = combine
     extract :: CompilerFlavor -> ALens' BuildInfo [String]
     extract flavor = L.options . lookupLens flavor
 
-    combine ghc ghcjs =
-        f GHC ghc ++ f GHCJS ghcjs
-      where
-        f _flavor []   = []
-        f  flavor opts = [(flavor, opts)]
-
 profOptionsFieldGrammar
     :: (FieldGrammar g, Applicative (g BuildInfo))
-    => g BuildInfo [(CompilerFlavor, [String])]
-profOptionsFieldGrammar = combine
+    => g BuildInfo (PerCompilerFlavor [String])
+profOptionsFieldGrammar = PerCompilerFlavor
     <$> monoidalFieldAla "ghc-prof-options"   (alaList' NoCommaFSep Token') (extract GHC)
     <*> monoidalFieldAla "ghcjs-prof-options" (alaList' NoCommaFSep Token') (extract GHCJS)
   where
     extract :: CompilerFlavor -> ALens' BuildInfo [String]
     extract flavor = L.profOptions . lookupLens flavor
 
-    combine ghc ghcjs = f GHC ghc ++ f GHCJS ghcjs
-      where
-        f _flavor []   = []
-        f  flavor opts = [(flavor, opts)]
-
 sharedOptionsFieldGrammar
     :: (FieldGrammar g, Applicative (g BuildInfo))
-    => g BuildInfo [(CompilerFlavor, [String])]
-sharedOptionsFieldGrammar = combine
+    => g BuildInfo (PerCompilerFlavor [String])
+sharedOptionsFieldGrammar = PerCompilerFlavor
     <$> monoidalFieldAla "ghc-shared-options"   (alaList' NoCommaFSep Token') (extract GHC)
     <*> monoidalFieldAla "ghcjs-shared-options" (alaList' NoCommaFSep Token') (extract GHCJS)
   where
     extract :: CompilerFlavor -> ALens' BuildInfo [String]
     extract flavor = L.sharedOptions . lookupLens flavor
 
-    combine ghc ghcjs = f GHC ghc ++ f GHCJS ghcjs
-      where
-        f _flavor []   = []
-        f  flavor opts = [(flavor, opts)]
-
-lookupLens :: (Functor f, Ord k) => k -> LensLike' f [(k, [v])] [v]
-lookupLens k f kvs = str kvs <$> f (gtr kvs)
-  where
-    gtr = fromMaybe [] . lookup k
-
-    str []            v = [(k, v)]
-    str (x@(k',_):xs) v
-        | k == k'       = (k, v) : xs
-        | otherwise     = x : str xs v
+lookupLens :: (Functor f, Monoid v) => CompilerFlavor -> LensLike' f (PerCompilerFlavor v) v
+lookupLens k f p@(PerCompilerFlavor ghc ghcjs)
+    | k == GHC   = (\n -> PerCompilerFlavor n ghcjs) <$> f ghc
+    | k == GHCJS = (\n -> PerCompilerFlavor ghc n) <$> f ghcjs
+    | otherwise  = p <$ f mempty
 
 -------------------------------------------------------------------------------
 -- Flag
@@ -496,7 +509,7 @@ flagFieldGrammar
     :: (FieldGrammar g, Applicative (g Flag))
     =>  FlagName -> g Flag Flag
 flagFieldGrammar name = MkFlag name
-    <$> optionalFieldDefAla "description" FreeText L.flagDescription ""
+    <$> freeTextFieldDef    "description"          L.flagDescription
     <*> booleanFieldDef     "default"              L.flagDefault     True
     <*> booleanFieldDef     "manual"               L.flagManual      False
 {-# SPECIALIZE flagFieldGrammar :: FlagName -> ParsecFieldGrammar' Flag #-}
@@ -511,7 +524,7 @@ sourceRepoFieldGrammar
     => RepoKind -> g SourceRepo SourceRepo
 sourceRepoFieldGrammar kind = SourceRepo kind
     <$> optionalField    "type"                L.repoType
-    <*> optionalFieldAla "location" FreeText   L.repoLocation
+    <*> freeTextField    "location"            L.repoLocation
     <*> optionalFieldAla "module"   Token      L.repoModule
     <*> optionalFieldAla "branch"   Token      L.repoBranch
     <*> optionalFieldAla "tag"      Token      L.repoTag

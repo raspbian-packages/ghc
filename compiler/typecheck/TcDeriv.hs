@@ -26,7 +26,7 @@ import TcValidity( allDistinctTyVars )
 import TcClassDcl( instDeclCtxt3, tcATDefault, tcMkDeclCtxt )
 import TcEnv
 import TcGenDeriv                       -- Deriv stuff
-import TcValidity
+import TcValidity( checkValidInstHead )
 import InstEnv
 import Inst
 import FamInstEnv
@@ -330,6 +330,9 @@ renameDeriv is_boot inst_infos bagBinds
     setXOptM LangExt.KindSignatures $
     -- Derived decls (for newtype-deriving) can use ScopedTypeVariables &
     -- KindSignatures
+    setXOptM LangExt.TypeApplications $
+    -- GND/DerivingVia uses TypeApplications in generated code
+    -- (See Note [Newtype-deriving instances] in TcGenDeriv)
     unsetXOptM LangExt.RebindableSyntax $
     -- See Note [Avoid RebindableSyntax when deriving]
     do  {
@@ -613,12 +616,13 @@ deriveStandalone (L loc (DerivDecl _ deriv_ty mbl_deriv_strat overlap_mode))
     addErrCtxt (standaloneCtxt deriv_ty)  $
     do { traceTc "Standalone deriving decl for" (ppr deriv_ty)
        ; let mb_deriv_strat = fmap unLoc mbl_deriv_strat
+             ctxt           = TcType.InstDeclCtxt True
        ; traceTc "Deriving strategy (standalone deriving)" $
            vcat [ppr mb_deriv_strat, ppr deriv_ty]
        ; (mb_deriv_strat', tvs', (deriv_ctxt', cls, inst_tys'))
-           <- tcDerivStrategy TcType.InstDeclCtxt mb_deriv_strat $ do
+           <- tcDerivStrategy mb_deriv_strat $ do
                 (tvs, deriv_ctxt, cls, inst_tys)
-                  <- tcStandaloneDerivInstType deriv_ty
+                  <- tcStandaloneDerivInstType ctxt deriv_ty
                 pure (tvs, (deriv_ctxt, cls, inst_tys))
        ; checkTc (not (null inst_tys')) derivingNullaryErr
        ; let inst_ty' = last inst_tys'
@@ -628,8 +632,8 @@ deriveStandalone (L loc (DerivDecl _ deriv_ty mbl_deriv_strat overlap_mode))
              -- Perform an additional unification with the kind of the `via`
              -- type and the result of the previous kind unification.
              Just (ViaStrategy via_ty) -> do
-               let via_kind     = typeKind via_ty
-                   inst_ty_kind = typeKind inst_ty'
+               let via_kind     = tcTypeKind via_ty
+                   inst_ty_kind = tcTypeKind inst_ty'
                    mb_match     = tcUnifyTy inst_ty_kind via_kind
 
                checkTc (isJust mb_match)
@@ -709,35 +713,31 @@ deriveStandalone (L _ (XDerivDecl _)) = panic "deriveStandalone"
 -- Note that this will never return @'InferContext' 'Nothing'@, as that can
 -- only happen with @deriving@ clauses.
 tcStandaloneDerivInstType
-  :: LHsSigWcType GhcRn
+  :: UserTypeCtxt -> LHsSigWcType GhcRn
   -> TcM ([TyVar], DerivContext, Class, [Type])
-tcStandaloneDerivInstType
-    (HsWC { hswc_body = deriv_ty@(HsIB { hsib_ext = HsIBRn
-                                                        { hsib_vars   = vars
-                                                        , hsib_closed = closed }
+tcStandaloneDerivInstType ctxt
+    (HsWC { hswc_body = deriv_ty@(HsIB { hsib_ext = vars
                                        , hsib_body   = deriv_ty_body })})
   | (tvs, theta, rho) <- splitLHsSigmaTy deriv_ty_body
   , L _ [wc_pred] <- theta
-  , L _ (HsWildCardTy (AnonWildCard (L wc_span _))) <- ignoreParens wc_pred
-  = do (deriv_tvs, _deriv_theta, deriv_cls, deriv_inst_tys)
-         <- tc_hs_cls_inst_ty $
-            HsIB { hsib_ext = HsIBRn { hsib_vars = vars
-                                     , hsib_closed = closed }
-                 , hsib_body
-                     = L (getLoc deriv_ty_body) $
-                       HsForAllTy { hst_bndrs = tvs
-                                  , hst_xforall = noExt
-                                  , hst_body  = rho }}
-       pure (deriv_tvs, InferContext (Just wc_span), deriv_cls, deriv_inst_tys)
+  , L wc_span (HsWildCardTy _) <- ignoreParens wc_pred
+  = do dfun_ty <- tcHsClsInstType ctxt $
+                  HsIB { hsib_ext = vars
+                       , hsib_body
+                           = L (getLoc deriv_ty_body) $
+                             HsForAllTy { hst_bndrs = tvs
+                                        , hst_xforall = noExt
+                                        , hst_body  = rho }}
+       let (tvs, _theta, cls, inst_tys) = tcSplitDFunTy dfun_ty
+       pure (tvs, InferContext (Just wc_span), cls, inst_tys)
   | otherwise
-  = do (deriv_tvs, deriv_theta, deriv_cls, deriv_inst_tys)
-         <- tc_hs_cls_inst_ty deriv_ty
-       pure (deriv_tvs, SupplyContext deriv_theta, deriv_cls, deriv_inst_tys)
-  where
-    tc_hs_cls_inst_ty = tcHsClsInstType TcType.InstDeclCtxt
-tcStandaloneDerivInstType (HsWC _ (XHsImplicitBndrs _))
+  = do dfun_ty <- tcHsClsInstType ctxt deriv_ty
+       let (tvs, theta, cls, inst_tys) = tcSplitDFunTy dfun_ty
+       pure (tvs, SupplyContext theta, cls, inst_tys)
+
+tcStandaloneDerivInstType _ (HsWC _ (XHsImplicitBndrs _))
   = panic "tcStandaloneDerivInstType"
-tcStandaloneDerivInstType (XHsWildCardBndrs _)
+tcStandaloneDerivInstType _ (XHsWildCardBndrs _)
   = panic "tcStandaloneDerivInstType"
 
 warnUselessTypeable :: TcM ()
@@ -749,7 +749,8 @@ warnUselessTypeable
 
 ------------------------------------------------------------------
 deriveTyData :: [TyVar] -> TyCon -> [Type]   -- LHS of data or data instance
-                                             --   Can be a data instance, hence [Type] args
+                    -- Can be a data instance, hence [Type] args
+                    -- and in that case the TyCon is the /family/ tycon
              -> Maybe (DerivStrategy GhcRn)  -- The optional deriving strategy
              -> LHsSigType GhcRn             -- The deriving predicate
              -> TcM (Maybe EarlyDerivSpec)
@@ -762,9 +763,6 @@ deriveTyData tvs tc tc_args mb_deriv_strat deriv_pred
   = setSrcSpan (getLoc (hsSigType deriv_pred)) $
     -- Use loc of the 'deriving' item
     do  { (mb_deriv_strat', deriv_tvs, (cls, cls_tys, cls_arg_kinds))
-                   -- Why not scopeTyVars? Because these are *TyVar*s, not TcTyVars.
-                   -- Their kinds are fully settled. No need to worry about skolem
-                   -- escape.
                 <- tcExtendTyVarEnv tvs $
                 -- Deriving preds may (now) mention
                 -- the type variables for the type constructor, hence tcExtendTyVarenv
@@ -774,7 +772,7 @@ deriveTyData tvs tc tc_args mb_deriv_strat deriv_pred
                 -- Typeable is special, because Typeable :: forall k. k -> Constraint
                 -- so the argument kind 'k' is not decomposable by splitKindFunTys
                 -- as is the case for all other derivable type classes
-                     tcDerivStrategy TcType.DerivClauseCtxt mb_deriv_strat $
+                     tcDerivStrategy mb_deriv_strat $
                      tcHsDeriv deriv_pred
 
         ; when (cls_arg_kinds `lengthIsNot` 1) $
@@ -789,10 +787,11 @@ deriveTyData tvs tc tc_args mb_deriv_strat deriv_pred
            -- we want to drop type variables from T so that (C d (T a)) is well-kinded
           let (arg_kinds, _)  = splitFunTys cls_arg_kind
               n_args_to_drop  = length arg_kinds
-              n_args_to_keep  = tyConArity tc - n_args_to_drop
+              n_args_to_keep  = length tc_args - n_args_to_drop
+                                -- See Note [tc_args and tycon arity]
               (tc_args_to_keep, args_to_drop)
                               = splitAt n_args_to_keep tc_args
-              inst_ty_kind    = typeKind (mkTyConApp tc tc_args_to_keep)
+              inst_ty_kind    = tcTypeKind (mkTyConApp tc tc_args_to_keep)
 
               -- Match up the kinds, and apply the resulting kind substitution
               -- to the types.  See Note [Unify kinds in deriving]
@@ -818,7 +817,7 @@ deriveTyData tvs tc tc_args mb_deriv_strat deriv_pred
                   final_tkvs      = tyCoVarsOfTypesWellScoped $
                                     final_cls_tys ++ final_tc_args
 
-        ; let tkvs = toposortTyVars $ fvVarList $
+        ; let tkvs = scopedSort $ fvVarList $
                      unionFV (tyCoFVsOfTypes tc_args_to_keep)
                              (FV.mkFVs deriv_tvs)
               Just kind_subst = mb_match
@@ -832,9 +831,9 @@ deriveTyData tvs tc tc_args mb_deriv_strat deriv_pred
               -- type and the result of the previous kind unification.
               Just (ViaStrategy via_ty) -> do
                 let final_via_ty   = via_ty
-                    final_via_kind = typeKind final_via_ty
+                    final_via_kind = tcTypeKind final_via_ty
                     final_inst_ty_kind
-                              = typeKind (mkTyConApp tc final_tc_args')
+                              = tcTypeKind (mkTyConApp tc final_tc_args')
                     via_match = tcUnifyTy final_inst_ty_kind final_via_kind
 
                 checkTc (isJust via_match)
@@ -894,7 +893,24 @@ deriveTyData tvs tc tc_args mb_deriv_strat deriv_pred
         ; return $ Just spec } }
 
 
-{-
+{- Note [tc_args and tycon arity]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+You might wonder if we could use (tyConArity tc) at this point, rather
+than (length tc_args).  But for data families the two can differ!  The
+tc and tc_args passed into 'deriveTyData' come from 'deriveClause' which
+in turn gets them from 'tyConFamInstSig_maybe' which in turn gets them
+from DataFamInstTyCon:
+
+| DataFamInstTyCon          -- See Note [Data type families]
+      (CoAxiom Unbranched)
+      TyCon   -- The family TyCon
+      [Type]  -- Argument types (mentions the tyConTyVars of this TyCon)
+              -- No shorter in length than the tyConTyVars of the family TyCon
+              -- How could it be longer? See [Arity of data families] in FamInstEnv
+
+Notice that the arg tys might not be the same as the family tycon arity
+(= length tyConTyVars).
+
 Note [Unify kinds in deriving]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Consider (Trac #8534)
@@ -1624,7 +1640,10 @@ mkNewTypeEqn
                      [ text "Both DeriveAnyClass and"
                        <+> text "GeneralizedNewtypeDeriving are enabled"
                      , text "Defaulting to the DeriveAnyClass strategy"
-                       <+> text "for instantiating" <+> ppr cls ]
+                       <+> text "for instantiating" <+> ppr cls
+                     , text "Use DerivingStrategies to pick"
+                       <+> text "a different strategy"
+                      ]
                  mk_originative_eqn DerivSpecAnyClass
                -- CanDeriveStock
                CanDeriveStock gen_fn -> mk_originative_eqn $

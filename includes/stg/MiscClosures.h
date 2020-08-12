@@ -116,22 +116,12 @@ RTS_ENTRY(stg_ARR_WORDS);
 RTS_ENTRY(stg_MUT_ARR_WORDS);
 RTS_ENTRY(stg_MUT_ARR_PTRS_CLEAN);
 RTS_ENTRY(stg_MUT_ARR_PTRS_DIRTY);
-#if __GLASGOW_HASKELL__ < 806
-RTS_ENTRY(stg_MUT_ARR_PTRS_FROZEN);
-RTS_ENTRY(stg_MUT_ARR_PTRS_FROZEN0);
-#else
 RTS_ENTRY(stg_MUT_ARR_PTRS_FROZEN_CLEAN);
 RTS_ENTRY(stg_MUT_ARR_PTRS_FROZEN_DIRTY);
-#endif
 RTS_ENTRY(stg_SMALL_MUT_ARR_PTRS_CLEAN);
 RTS_ENTRY(stg_SMALL_MUT_ARR_PTRS_DIRTY);
-#if __GLASGOW_HASKELL__ < 806
-RTS_ENTRY(stg_SMALL_MUT_ARR_PTRS_FROZEN);
-RTS_ENTRY(stg_SMALL_MUT_ARR_PTRS_FROZEN0);
-#else
 RTS_ENTRY(stg_SMALL_MUT_ARR_PTRS_FROZEN_CLEAN);
 RTS_ENTRY(stg_SMALL_MUT_ARR_PTRS_FROZEN_DIRTY);
-#endif
 RTS_ENTRY(stg_MUT_VAR_CLEAN);
 RTS_ENTRY(stg_MUT_VAR_DIRTY);
 RTS_ENTRY(stg_END_TSO_QUEUE);
@@ -400,7 +390,12 @@ RTS_FUN_DECL(stg_copySmallMutableArrayzh);
 RTS_FUN_DECL(stg_casSmallArrayzh);
 
 RTS_FUN_DECL(stg_newMutVarzh);
+#if __GLASGOW_HASKELL__ < 808
 RTS_FUN_DECL(stg_atomicModifyMutVarzh);
+#else
+RTS_FUN_DECL(stg_atomicModifyMutVar2zh);
+RTS_FUN_DECL(stg_atomicModifyMutVarzuzh);
+#endif
 RTS_FUN_DECL(stg_casMutVarzh);
 
 RTS_FUN_DECL(stg_isEmptyMVarzh);
@@ -488,6 +483,7 @@ RTS_FUN_DECL(stg_noDuplicatezh);
 RTS_FUN_DECL(stg_traceCcszh);
 RTS_FUN_DECL(stg_clearCCSzh);
 RTS_FUN_DECL(stg_traceEventzh);
+RTS_FUN_DECL(stg_traceBinaryEventzh);
 RTS_FUN_DECL(stg_traceMarkerzh);
 RTS_FUN_DECL(stg_getThreadAllocationCounterzh);
 RTS_FUN_DECL(stg_setThreadAllocationCounterzh);
@@ -522,19 +518,17 @@ extern StgWord RTS_VAR(atomic_modify_mutvar_mutex);
 // RtsFlags
 extern StgWord RTS_VAR(RtsFlags); // bogus type
 
-// Stable.c
+// StablePtr.c
 extern StgWord RTS_VAR(stable_ptr_table);
+
+// StableName.c
 extern StgWord RTS_VAR(stable_name_table);
 
 // Profiling.c
 extern unsigned int RTS_VAR(era);
 extern unsigned int RTS_VAR(entering_PAP);
-extern StgWord      RTS_VAR(CC_LIST);          /* registered CC list */
-extern StgWord      RTS_VAR(CCS_LIST);         /* registered CCS list */
 extern StgWord      CCS_OVERHEAD[];
 extern StgWord      CCS_SYSTEM[];
-extern unsigned int RTS_VAR(CC_ID);            /* global ids */
-extern unsigned int RTS_VAR(CCS_ID);
 
 // Calls to these rts functions are generated directly
 // by codegen (see compiler/codeGen/StgCmmProf.hs)

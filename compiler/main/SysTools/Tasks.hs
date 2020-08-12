@@ -15,14 +15,13 @@ import Outputable
 import Platform
 import Util
 
-import Data.Char
 import Data.List
 
 import System.IO
 import System.Process
 import GhcPrelude
 
-import LlvmCodeGen.Base (llvmVersionStr, supportedLlvmVersion)
+import LlvmCodeGen.Base (LlvmVersion, llvmVersionStr, supportedLlvmVersion, parseLlvmVersion)
 
 import SysTools.Process
 import SysTools.Info
@@ -62,7 +61,9 @@ runCc :: DynFlags -> [Option] -> IO ()
 runCc dflags args =   do
   let (p,args0) = pgm_c dflags
       args1 = map Option (getOpts dflags opt_c)
-      args2 = args0 ++ args1 ++ args
+      args2 = args0 ++ args ++ args1
+      -- We take care to pass -optc flags in args1 last to ensure that the
+      -- user can override flags passed by GHC. See #14452.
   mb_env <- getGccEnv args2
   runSomethingResponseFile dflags cc_filter "C Compiler" p args2 mb_env
  where
@@ -182,7 +183,7 @@ runClang dflags args = do
     )
 
 -- | Figure out which version of LLVM we are running this session
-figureLlvmVersion :: DynFlags -> IO (Maybe (Int, Int))
+figureLlvmVersion :: DynFlags -> IO (Maybe LlvmVersion)
 figureLlvmVersion dflags = do
   let (pgm,opts) = pgm_lc dflags
       args = filter notNull (map showOpt opts)
@@ -191,7 +192,7 @@ figureLlvmVersion dflags = do
       -- of the options they've specified. llc doesn't care what other
       -- options are specified when '-version' is used.
       args' = args ++ ["-version"]
-  ver <- catchIO (do
+  catchIO (do
               (pin, pout, perr, _) <- runInteractiveProcess pgm args'
                                               Nothing Nothing
               {- > llc -version
@@ -201,16 +202,12 @@ figureLlvmVersion dflags = do
               -}
               hSetBinaryMode pout False
               _     <- hGetLine pout
-              vline <- dropWhile (not . isDigit) `fmap` hGetLine pout
-              v     <- case span (/= '.') vline of
-                        ("",_)  -> fail "no digits!"
-                        (x,y) -> return (read x
-                                        , read $ takeWhile isDigit $ drop 1 y)
-
+              vline <- hGetLine pout
+              let mb_ver = parseLlvmVersion vline
               hClose pin
               hClose pout
               hClose perr
-              return $ Just v
+              return mb_ver
             )
             (\err -> do
                 debugTraceMsg dflags 2
@@ -222,7 +219,6 @@ figureLlvmVersion dflags = do
                           text ("Make sure you have installed LLVM " ++
                                 llvmVersionStr supportedLlvmVersion) ]
                 return Nothing)
-  return ver
 
 
 runLink :: DynFlags -> [Option] -> IO ()

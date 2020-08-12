@@ -1,6 +1,7 @@
+cabal-version: >=1.10
 name:          Cabal
-version:       2.4.0.1
-copyright:     2003-2018, Cabal Development Team (see AUTHORS file)
+version:       3.0.1.0
+copyright:     2003-2019, Cabal Development Team (see AUTHORS file)
 license:       BSD3
 license-file:  LICENSE
 author:        Cabal Development Team <cabal-devel@haskell.org>
@@ -16,7 +17,6 @@ description:
   The Haskell Cabal is part of a larger infrastructure for distributing,
   organizing, and cataloging Haskell libraries and tools.
 category:       Distribution
-cabal-version:  >=1.10
 build-type:     Simple
 -- If we use a new Cabal feature, this needs to be changed to Custom so
 -- we can bootstrap.
@@ -33,6 +33,10 @@ extra-source-files:
   -- Generated with 'make gen-extra-source-files'
   -- Do NOT edit this section manually; instead, run the script.
   -- BEGIN gen-extra-source-files
+  tests/ParserTests/errors/MiniAgda.cabal
+  tests/ParserTests/errors/MiniAgda.errors
+  tests/ParserTests/errors/big-version.cabal
+  tests/ParserTests/errors/big-version.errors
   tests/ParserTests/errors/common1.cabal
   tests/ParserTests/errors/common1.errors
   tests/ParserTests/errors/common2.cabal
@@ -49,20 +53,48 @@ extra-source-files:
   tests/ParserTests/errors/issue-5055-2.errors
   tests/ParserTests/errors/issue-5055.cabal
   tests/ParserTests/errors/issue-5055.errors
+  tests/ParserTests/errors/leading-comma-2.cabal
+  tests/ParserTests/errors/leading-comma-2.errors
+  tests/ParserTests/errors/leading-comma-2b.cabal
+  tests/ParserTests/errors/leading-comma-2b.errors
+  tests/ParserTests/errors/leading-comma-2c.cabal
+  tests/ParserTests/errors/leading-comma-2c.errors
   tests/ParserTests/errors/leading-comma.cabal
   tests/ParserTests/errors/leading-comma.errors
+  tests/ParserTests/errors/libpq1.cabal
+  tests/ParserTests/errors/libpq1.errors
+  tests/ParserTests/errors/libpq2.cabal
+  tests/ParserTests/errors/libpq2.errors
+  tests/ParserTests/errors/mixin-1.cabal
+  tests/ParserTests/errors/mixin-1.errors
+  tests/ParserTests/errors/mixin-2.cabal
+  tests/ParserTests/errors/mixin-2.errors
+  tests/ParserTests/errors/multiple-libs.cabal
+  tests/ParserTests/errors/multiple-libs.errors
   tests/ParserTests/errors/noVersion.cabal
   tests/ParserTests/errors/noVersion.errors
   tests/ParserTests/errors/noVersion2.cabal
   tests/ParserTests/errors/noVersion2.errors
   tests/ParserTests/errors/range-ge-wild.cabal
   tests/ParserTests/errors/range-ge-wild.errors
+  tests/ParserTests/errors/removed-fields.cabal
+  tests/ParserTests/errors/removed-fields.errors
   tests/ParserTests/errors/spdx-1.cabal
   tests/ParserTests/errors/spdx-1.errors
   tests/ParserTests/errors/spdx-2.cabal
   tests/ParserTests/errors/spdx-2.errors
   tests/ParserTests/errors/spdx-3.cabal
   tests/ParserTests/errors/spdx-3.errors
+  tests/ParserTests/errors/undefined-flag.cabal
+  tests/ParserTests/errors/undefined-flag.errors
+  tests/ParserTests/errors/version-sets-1.cabal
+  tests/ParserTests/errors/version-sets-1.errors
+  tests/ParserTests/errors/version-sets-2.cabal
+  tests/ParserTests/errors/version-sets-2.errors
+  tests/ParserTests/errors/version-sets-3.cabal
+  tests/ParserTests/errors/version-sets-3.errors
+  tests/ParserTests/errors/version-sets-4.cabal
+  tests/ParserTests/errors/version-sets-4.errors
   tests/ParserTests/ipi/Includes2.cabal
   tests/ParserTests/ipi/Includes2.expr
   tests/ParserTests/ipi/Includes2.format
@@ -75,21 +107,28 @@ extra-source-files:
   tests/ParserTests/ipi/transformers.cabal
   tests/ParserTests/ipi/transformers.expr
   tests/ParserTests/ipi/transformers.format
-  tests/ParserTests/regressions/MiniAgda.cabal
-  tests/ParserTests/regressions/MiniAgda.check
   tests/ParserTests/regressions/Octree-0.5.cabal
   tests/ParserTests/regressions/Octree-0.5.expr
   tests/ParserTests/regressions/Octree-0.5.format
   tests/ParserTests/regressions/bad-glob-syntax.cabal
   tests/ParserTests/regressions/bad-glob-syntax.check
+  tests/ParserTests/regressions/big-version.cabal
+  tests/ParserTests/regressions/big-version.expr
+  tests/ParserTests/regressions/big-version.format
   tests/ParserTests/regressions/cc-options-with-optimization.cabal
   tests/ParserTests/regressions/cc-options-with-optimization.check
+  tests/ParserTests/regressions/common-conditional.cabal
+  tests/ParserTests/regressions/common-conditional.expr
+  tests/ParserTests/regressions/common-conditional.format
   tests/ParserTests/regressions/common.cabal
   tests/ParserTests/regressions/common.expr
   tests/ParserTests/regressions/common.format
   tests/ParserTests/regressions/common2.cabal
   tests/ParserTests/regressions/common2.expr
   tests/ParserTests/regressions/common2.format
+  tests/ParserTests/regressions/common3.cabal
+  tests/ParserTests/regressions/common3.expr
+  tests/ParserTests/regressions/common3.format
   tests/ParserTests/regressions/cxx-options-with-optimization.cabal
   tests/ParserTests/regressions/cxx-options-with-optimization.check
   tests/ParserTests/regressions/elif.cabal
@@ -110,16 +149,59 @@ extra-source-files:
   tests/ParserTests/regressions/ghc-option-j.check
   tests/ParserTests/regressions/haddock-api-2.18.1-check.cabal
   tests/ParserTests/regressions/haddock-api-2.18.1-check.check
+  tests/ParserTests/regressions/hidden-main-lib.cabal
+  tests/ParserTests/regressions/hidden-main-lib.expr
+  tests/ParserTests/regressions/hidden-main-lib.format
+  tests/ParserTests/regressions/indentation.cabal
+  tests/ParserTests/regressions/indentation.expr
+  tests/ParserTests/regressions/indentation.format
+  tests/ParserTests/regressions/indentation2.cabal
+  tests/ParserTests/regressions/indentation2.expr
+  tests/ParserTests/regressions/indentation2.format
+  tests/ParserTests/regressions/indentation3.cabal
+  tests/ParserTests/regressions/indentation3.expr
+  tests/ParserTests/regressions/indentation3.format
   tests/ParserTests/regressions/issue-5055.cabal
   tests/ParserTests/regressions/issue-5055.expr
   tests/ParserTests/regressions/issue-5055.format
+  tests/ParserTests/regressions/issue-5846.cabal
+  tests/ParserTests/regressions/issue-5846.expr
+  tests/ParserTests/regressions/issue-5846.format
+  tests/ParserTests/regressions/issue-6083-pkg-pkg.cabal
+  tests/ParserTests/regressions/issue-6083-pkg-pkg.expr
+  tests/ParserTests/regressions/issue-6083-pkg-pkg.format
   tests/ParserTests/regressions/issue-774.cabal
   tests/ParserTests/regressions/issue-774.check
   tests/ParserTests/regressions/issue-774.expr
   tests/ParserTests/regressions/issue-774.format
+  tests/ParserTests/regressions/jaeger-flamegraph.cabal
+  tests/ParserTests/regressions/jaeger-flamegraph.expr
+  tests/ParserTests/regressions/jaeger-flamegraph.format
+  tests/ParserTests/regressions/leading-comma-2.cabal
+  tests/ParserTests/regressions/leading-comma-2.expr
+  tests/ParserTests/regressions/leading-comma-2.format
   tests/ParserTests/regressions/leading-comma.cabal
   tests/ParserTests/regressions/leading-comma.expr
   tests/ParserTests/regressions/leading-comma.format
+  tests/ParserTests/regressions/libpq1.cabal
+  tests/ParserTests/regressions/libpq1.expr
+  tests/ParserTests/regressions/libpq1.format
+  tests/ParserTests/regressions/libpq2.cabal
+  tests/ParserTests/regressions/libpq2.expr
+  tests/ParserTests/regressions/libpq2.format
+  tests/ParserTests/regressions/mixin-1.cabal
+  tests/ParserTests/regressions/mixin-1.expr
+  tests/ParserTests/regressions/mixin-1.format
+  tests/ParserTests/regressions/mixin-2.cabal
+  tests/ParserTests/regressions/mixin-2.expr
+  tests/ParserTests/regressions/mixin-2.format
+  tests/ParserTests/regressions/mixin-3.cabal
+  tests/ParserTests/regressions/mixin-3.expr
+  tests/ParserTests/regressions/mixin-3.format
+  tests/ParserTests/regressions/multiple-libs-2.cabal
+  tests/ParserTests/regressions/multiple-libs-2.check
+  tests/ParserTests/regressions/multiple-libs-2.expr
+  tests/ParserTests/regressions/multiple-libs-2.format
   tests/ParserTests/regressions/noVersion.cabal
   tests/ParserTests/regressions/noVersion.expr
   tests/ParserTests/regressions/noVersion.format
@@ -146,6 +228,9 @@ extra-source-files:
   tests/ParserTests/regressions/th-lift-instances.cabal
   tests/ParserTests/regressions/th-lift-instances.expr
   tests/ParserTests/regressions/th-lift-instances.format
+  tests/ParserTests/regressions/version-sets.cabal
+  tests/ParserTests/regressions/version-sets.expr
+  tests/ParserTests/regressions/version-sets.format
   tests/ParserTests/regressions/wl-pprint-indef.cabal
   tests/ParserTests/regressions/wl-pprint-indef.expr
   tests/ParserTests/regressions/wl-pprint-indef.format
@@ -166,6 +251,7 @@ extra-source-files:
   tests/ParserTests/warnings/unknownsection.cabal
   tests/ParserTests/warnings/utf8.cabal
   tests/ParserTests/warnings/versiontag.cabal
+  tests/cbits/rpmvercmp.c
   tests/hackage/check.sh
   tests/hackage/download.sh
   tests/hackage/unpack.sh
@@ -191,7 +277,7 @@ library
     filepath   >= 1.3.0.1  && < 1.5,
     pretty     >= 1.1.1    && < 1.2,
     process    >= 1.1.0.2  && < 1.7,
-    time       >= 1.4.0.1  && < 1.9
+    time       >= 1.4.0.1  && < 1.10
 
   if flag(bundled-binary-generic)
     build-depends: binary >= 0.5.1.1 && < 0.7
@@ -206,7 +292,13 @@ library
   ghc-options: -Wall -fno-ignore-asserts -fwarn-tabs
   if impl(ghc >= 8.0)
     ghc-options: -Wcompat -Wnoncanonical-monad-instances
-                 -Wnoncanonical-monadfail-instances
+    if impl(ghc <8.8)
+      ghc-options: -Wnoncanonical-monadfail-instances
+
+  if !impl(ghc >= 8.0)
+    -- at least one of lib:Cabal's dependency (i.e. `parsec`)
+    -- already depends on `fail` and `semigroups` transitively
+    build-depends: fail == 4.9.*, semigroups >= 0.18.3 && < 0.20
 
   exposed-modules:
     Distribution.Backpack
@@ -227,11 +319,12 @@ library
     Distribution.Compat.Directory
     Distribution.Compat.Environment
     Distribution.Compat.Exception
+    Distribution.Compat.FilePath
     Distribution.Compat.Graph
     Distribution.Compat.Internal.TempFile
     Distribution.Compat.Newtype
+    Distribution.Compat.ResponseFile
     Distribution.Compat.Prelude.Internal
-    Distribution.Compat.ReadP
     Distribution.Compat.Semigroup
     Distribution.Compat.Stack
     Distribution.Compat.Time
@@ -251,8 +344,6 @@ library
     Distribution.PackageDescription.Configuration
     Distribution.PackageDescription.PrettyPrint
     Distribution.PackageDescription.Utils
-    Distribution.ParseUtils
-    Distribution.PrettyUtils
     Distribution.ReadE
     Distribution.Simple
     Distribution.Simple.Bench
@@ -276,6 +367,7 @@ library
     Distribution.Simple.Hpc
     Distribution.Simple.Install
     Distribution.Simple.InstallDirs
+    Distribution.Simple.InstallDirs.Internal
     Distribution.Simple.LocalBuildInfo
     Distribution.Simple.PackageIndex
     Distribution.Simple.PreProcess
@@ -297,6 +389,7 @@ library
     Distribution.Simple.Program.Types
     Distribution.Simple.Register
     Distribution.Simple.Setup
+    Distribution.Simple.ShowBuildInfo
     Distribution.Simple.SrcDist
     Distribution.Simple.Test
     Distribution.Simple.Test.ExeV10
@@ -336,6 +429,7 @@ library
     Distribution.Types.Executable
     Distribution.Types.ExecutableScope
     Distribution.Types.Library
+    Distribution.Types.LibraryVisibility
     Distribution.Types.ForeignLib
     Distribution.Types.ForeignLibType
     Distribution.Types.ForeignLibOption
@@ -343,9 +437,13 @@ library
     Distribution.Types.ModuleReexport
     Distribution.Types.ModuleRenaming
     Distribution.Types.ComponentName
+    Distribution.Types.LibraryName
     Distribution.Types.MungedPackageName
     Distribution.Types.PackageName
+    Distribution.Types.PackageName.Magic
     Distribution.Types.PkgconfigName
+    Distribution.Types.PkgconfigVersion
+    Distribution.Types.PkgconfigVersionRange
     Distribution.Types.UnqualComponentName
     Distribution.Types.IncludeRenaming
     Distribution.Types.Mixin
@@ -366,12 +464,16 @@ library
     Distribution.Types.TargetInfo
     Distribution.Types.Version
     Distribution.Types.VersionRange
+    Distribution.Types.VersionRange.Internal
     Distribution.Types.VersionInterval
+    Distribution.Types.GivenComponent
+    Distribution.Types.PackageVersionConstraint
     Distribution.Utils.Generic
     Distribution.Utils.NubList
     Distribution.Utils.ShortText
     Distribution.Utils.Progress
     Distribution.Verbosity
+    Distribution.Verbosity.Internal
     Distribution.Version
     Language.Haskell.Extension
     Distribution.Compat.Binary
@@ -395,16 +497,20 @@ library
     Distribution.PackageDescription.FieldGrammar
     Distribution.PackageDescription.Parsec
     Distribution.PackageDescription.Quirks
-    Distribution.Parsec.Class
-    Distribution.Parsec.Common
-    Distribution.Parsec.ConfVar
-    Distribution.Parsec.Field
-    Distribution.Parsec.FieldLineStream
-    Distribution.Parsec.Lexer
-    Distribution.Parsec.LexerMonad
+    Distribution.Parsec
+    Distribution.Parsec.Error
     Distribution.Parsec.Newtypes
-    Distribution.Parsec.ParseResult
-    Distribution.Parsec.Parser
+    Distribution.Parsec.Position
+    Distribution.Parsec.Warning
+    Distribution.Parsec.FieldLineStream
+    Distribution.Fields
+    Distribution.Fields.ConfVar
+    Distribution.Fields.Field
+    Distribution.Fields.Lexer
+    Distribution.Fields.LexerMonad
+    Distribution.Fields.ParseResult
+    Distribution.Fields.Parser
+    Distribution.Fields.Pretty
 
   -- Lens functionality
   exposed-modules:
@@ -443,6 +549,7 @@ library
     Distribution.Simple.GHC.EnvironmentParser
     Distribution.Simple.GHC.Internal
     Distribution.Simple.GHC.ImplInfo
+    Distribution.Simple.Utils.Json
     Paths_Cabal
 
   if flag(bundled-binary-generic)
@@ -489,10 +596,10 @@ test-suite unit-tests
     Test.Laws
     Test.QuickCheck.Utils
     UnitTests.Distribution.Compat.CreatePipe
-    UnitTests.Distribution.Compat.ReadP
-    UnitTests.Distribution.Compat.Time
     UnitTests.Distribution.Compat.Graph
+    UnitTests.Distribution.Compat.Time
     UnitTests.Distribution.Simple.Glob
+    UnitTests.Distribution.Simple.Program.GHC
     UnitTests.Distribution.Simple.Program.Internal
     UnitTests.Distribution.Simple.Utils
     UnitTests.Distribution.SPDX
@@ -502,23 +609,26 @@ test-suite unit-tests
     UnitTests.Distribution.Utils.NubList
     UnitTests.Distribution.Utils.ShortText
     UnitTests.Distribution.Version
+    UnitTests.Distribution.PkgconfigVersion
   main-is: UnitTests.hs
   build-depends:
     array,
     base,
+    binary,
     bytestring,
     containers,
     directory,
     filepath,
     integer-logarithms >= 1.0.2 && <1.1,
-    tasty >= 1.1.0.3 && < 1.2,
+    tasty >= 1.2.3 && < 1.3,
     tasty-hunit,
     tasty-quickcheck,
     tagged,
     temporary,
     text,
     pretty,
-    QuickCheck >= 2.11.3 && < 2.12,
+    Diff >=0.4 && <0.5,
+    QuickCheck >= 2.13.2 && < 2.14,
     Cabal
   ghc-options: -Wall
   default-language: Haskell2010
@@ -529,21 +639,22 @@ test-suite parser-tests
   main-is: ParserTests.hs
   build-depends:
     base,
-    base-compat >=0.10.4 && <0.11,
+    base-compat >=0.11.0 && <0.12,
     bytestring,
+    directory,
     filepath,
-    tasty >= 1.1.0.3 && < 1.2,
+    tasty >= 1.2.3 && < 1.3,
     tasty-hunit,
     tasty-quickcheck,
     tasty-golden >=2.3.1.1 && <2.4,
-    Diff >=0.3.4 && <0.4,
+    Diff >=0.4 && <0.5,
     Cabal
   ghc-options: -Wall
   default-language: Haskell2010
 
   if impl(ghc >= 7.8)
     build-depends:
-      tree-diff      >= 0.0.1 && <0.1
+      tree-diff      >= 0.1 && <0.2
     other-modules:
       Instances.TreeDiff
       Instances.TreeDiff.Language
@@ -557,10 +668,11 @@ test-suite check-tests
   build-depends:
     base,
     bytestring,
+    directory,
     filepath,
-    tasty >= 1.1.0.3 && < 1.2,
+    tasty >= 1.2.3 && < 1.3,
     tasty-golden >=2.3.1.1 && <2.4,
-    Diff >=0.3.4 && <0.4,
+    Diff >=0.4 && <0.5,
     Cabal
   ghc-options: -Wall
   default-language: Haskell2010
@@ -600,14 +712,15 @@ test-suite hackage-tests
     filepath
 
   build-depends:
-    base-compat          >=0.10.4   && <0.11,
+    base-compat          >=0.11.0   && <0.12,
     base-orphans         >=0.6      && <0.9,
-    optparse-applicative >=0.13.2.0 && <0.15,
+    optparse-applicative >=0.13.2.0 && <0.16,
+    stm                  >=2.4.5.0  && <2.6,
     tar                  >=0.5.0.3  && <0.6
 
   if impl(ghc >= 7.8)
     build-depends:
-      tree-diff      >= 0.0.1 && <0.1
+      tree-diff      >= 0.1 && <0.2
     other-modules:
       Instances.TreeDiff
       Instances.TreeDiff.Language
@@ -616,4 +729,26 @@ test-suite hackage-tests
 
   ghc-options: -Wall -rtsopts -threaded
   default-extensions: CPP
+  default-language: Haskell2010
+
+test-suite rpmvercmp
+  type: exitcode-stdio-1.0
+  main-is: RPMVerCmp.hs
+
+  hs-source-dirs: tests
+  build-depends:
+    base,
+    Cabal,
+    bytestring
+
+  build-depends:
+    tasty >= 1.2.3 && < 1.3,
+    tasty-hunit,
+    tasty-quickcheck,
+    QuickCheck
+
+  c-sources: tests/cbits/rpmvercmp.c
+  cc-options: -Wall
+
+  ghc-options: -Wall
   default-language: Haskell2010

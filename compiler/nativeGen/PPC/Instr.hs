@@ -87,11 +87,21 @@ ppc_mkStackDeallocInstr platform amount
 
 ppc_mkStackAllocInstr' :: Platform -> Int -> [Instr]
 ppc_mkStackAllocInstr' platform amount
-  = case platformArch platform of
-    ArchPPC      -> [UPDATE_SP II32 (ImmInt amount)]
-    ArchPPC_64 _ -> [UPDATE_SP II64 (ImmInt amount)]
-    _            -> panic $ "ppc_mkStackAllocInstr' "
-                            ++ show (platformArch platform)
+  | fits16Bits amount
+  = [ LD fmt r0 (AddrRegImm sp zero)
+    , STU fmt r0 (AddrRegImm sp immAmount)
+    ]
+  | otherwise
+  = [ LD fmt r0 (AddrRegImm sp zero)
+    , ADDIS tmp sp (HA immAmount)
+    , ADD tmp tmp (RIImm (LO immAmount))
+    , STU fmt r0 (AddrRegReg sp tmp)
+    ]
+  where
+    fmt = intFormat $ widthFromBytes (platformWordSize platform)
+    zero = ImmInt 0
+    tmp = tmpReg platform
+    immAmount = ImmInt amount
 
 --
 -- See note [extra spill slots] in X86/Instr.hs
@@ -100,9 +110,9 @@ allocMoreStack
   :: Platform
   -> Int
   -> NatCmmDecl statics PPC.Instr.Instr
-  -> UniqSM (NatCmmDecl statics PPC.Instr.Instr)
+  -> UniqSM (NatCmmDecl statics PPC.Instr.Instr, [(BlockId,BlockId)])
 
-allocMoreStack _ _ top@(CmmData _ _) = return top
+allocMoreStack _ _ top@(CmmData _ _) = return (top,[])
 allocMoreStack platform slots (CmmProc info lbl live (ListGraph code)) = do
     let
         infos   = mapKeys info
@@ -121,8 +131,10 @@ allocMoreStack platform slots (CmmProc info lbl live (ListGraph code)) = do
         alloc   = mkStackAllocInstr   platform delta
         dealloc = mkStackDeallocInstr platform delta
 
+        retargetList = (zip entries (map mkBlockId uniqs))
+
         new_blockmap :: LabelMap BlockId
-        new_blockmap = mapFromList (zip entries (map mkBlockId uniqs))
+        new_blockmap = mapFromList retargetList
 
         insert_stack_insns (BasicBlock id insns)
             | Just new_blockid <- mapLookup id new_blockmap
@@ -156,7 +168,7 @@ allocMoreStack platform slots (CmmProc info lbl live (ListGraph code)) = do
             = concatMap insert_stack_insns code
 
     -- in
-    return (CmmProc info lbl live (ListGraph new_code))
+    return (CmmProc info lbl live (ListGraph new_code),retargetList)
 
 
 -- -----------------------------------------------------------------------------
@@ -287,8 +299,6 @@ data Instr
     | NOP                       -- no operation, PowerPC 64 bit
                                 -- needs this as place holder to
                                 -- reload TOC pointer
-    | UPDATE_SP Format Imm      -- expand/shrink spill area on C stack
-                                -- pseudo-instruction
 
 -- | Get the registers that are being used by this instruction.
 -- regUsage doesn't need to do any trickery for jumps and such.
@@ -368,7 +378,6 @@ ppc_regUsageOfInstr platform instr
     MFCR    reg             -> usage ([], [reg])
     MFLR    reg             -> usage ([], [reg])
     FETCHPC reg             -> usage ([], [reg])
-    UPDATE_SP _ _           -> usage ([], [sp])
     _                       -> noUsage
   where
     usage (src, dst) = RU (filter (interesting platform) src)
@@ -573,15 +582,13 @@ ppc_mkLoadInstr dflags reg delta slot
 stackFrameHeaderSize :: DynFlags -> Int
 stackFrameHeaderSize dflags
   = case platformOS platform of
-      OSLinux  -> case platformArch platform of
-                             -- header + parameter save area
-        ArchPPC           -> 64 -- TODO: check ABI spec
-        ArchPPC_64 ELF_V1 -> 48 + 8 * 8
-        ArchPPC_64 ELF_V2 -> 32 + 8 * 8
-        _ -> panic "PPC.stackFrameHeaderSize: Unknown Linux"
       OSAIX    -> 24 + 8 * 4
-      OSDarwin -> 64 -- TODO: check ABI spec
-      _ -> panic "PPC.stackFrameHeaderSize: not defined for this OS"
+      _ -> case platformArch platform of
+                             -- header + parameter save area
+             ArchPPC           -> 64 -- TODO: check ABI spec
+             ArchPPC_64 ELF_V1 -> 48 + 8 * 8
+             ArchPPC_64 ELF_V2 -> 32 + 8 * 8
+             _ -> panic "PPC.stackFrameHeaderSize: not defined for this OS"
      where platform = targetPlatform dflags
 
 -- | The maximum number of bytes required to spill a register. PPC32
@@ -600,8 +607,8 @@ maxSpillSlots dflags
 --     = 0 -- useful for testing allocMoreStack
 
 -- | The number of bytes that the stack pointer should be aligned
--- to. This is 16 both on PPC32 and PPC64 at least for Darwin, and
--- Linux (see ELF processor specific supplements).
+-- to. This is 16 both on PPC32 and PPC64 ELF (see ELF processor
+-- specific supplements).
 stackAlign :: Int
 stackAlign = 16
 

@@ -19,7 +19,6 @@ module Language.Haskell.Extension (
 
         Extension(..),
         KnownExtension(..),
-        knownExtensions,
         deprecatedExtensions,
         classifyExtension,
   ) where
@@ -29,12 +28,10 @@ import Distribution.Compat.Prelude
 
 import Data.Array (Array, accumArray, bounds, Ix(inRange), (!))
 
-import Distribution.Parsec.Class
+import Distribution.Parsec
 import Distribution.Pretty
-import Distribution.Text
 
 import qualified Distribution.Compat.CharParsing as P
-import qualified Distribution.Compat.ReadP as Parse
 import qualified Text.PrettyPrint as Disp
 
 -- ------------------------------------------------------------
@@ -73,11 +70,6 @@ instance Pretty Language where
 
 instance Parsec Language where
   parsec = classifyLanguage <$> P.munch1 isAlphaNum
-
-instance Text Language where
-  parse = do
-    lang <- Parse.munch1 isAlphaNum
-    return (classifyLanguage lang)
 
 classifyLanguage :: String -> Language
 classifyLanguage = \str -> case lookup str langTable of
@@ -315,6 +307,9 @@ data KnownExtension =
   --
   -- * <https://www.haskell.org/ghc/docs/latest/html/users_guide/glasgow_exts.html#ghc-flag--XGeneralizedNewtypeDeriving>
   | GeneralizedNewtypeDeriving
+
+  -- Synonym for GeneralizedNewtypeDeriving added in GHC 8.6.1.
+  | GeneralisedNewtypeDeriving
 
   -- | Enable the \"Trex\" extensible records system.
   --
@@ -782,7 +777,7 @@ data KnownExtension =
   -- to the type-level.
   | TypeInType
 
-  -- | Allow recursive (and therefore undecideable) super-class relationships.
+  -- | Allow recursive (and therefore undecidable) super-class relationships.
   | UndecidableSuperClasses
 
   -- | A temporary extension to help library authors check if their
@@ -803,6 +798,10 @@ data KnownExtension =
   -- /strategy/.
   | DerivingStrategies
 
+  -- | Enable deriving instances via types of the same runtime representation.
+  -- Implies 'DerivingStrategies'.
+  | DerivingVia
+
   -- | Enable the use of unboxed sum syntax.
   | UnboxedSums
 
@@ -821,16 +820,16 @@ data KnownExtension =
   -- | Have @*@ refer to @Type@.
   | StarIsType
 
+  -- | Liberalises deriving to provide instances for empty data types.
+  --
+  -- * <https://downloads.haskell.org/~ghc/latest/docs/html/users_guide/glasgow_exts.html#deriving-instances-for-empty-data-types>
+  | EmptyDataDeriving
+
   deriving (Generic, Show, Read, Eq, Ord, Enum, Bounded, Typeable, Data)
 
 instance Binary KnownExtension
 
 instance NFData KnownExtension where rnf = genericRnf
-
-{-# DEPRECATED knownExtensions
-   "KnownExtension is an instance of Enum and Bounded, use those instead. This symbol will be removed in Cabal-3.0 (est. Oct 2018)." #-}
-knownExtensions :: [KnownExtension]
-knownExtensions = [minBound..maxBound]
 
 -- | Extensions that have been deprecated, possibly paired with another
 -- extension that replaces it.
@@ -855,22 +854,8 @@ instance Pretty Extension where
 instance Parsec Extension where
   parsec = classifyExtension <$> P.munch1 isAlphaNum
 
-instance Text Extension where
-  parse = do
-    extension <- Parse.munch1 isAlphaNum
-    return (classifyExtension extension)
-
 instance Pretty KnownExtension where
   pretty ke = Disp.text (show ke)
-
-instance Text KnownExtension where
-  parse = do
-    extension <- Parse.munch1 isAlphaNum
-    case classifyKnownExtension extension of
-        Just ke ->
-            return ke
-        Nothing ->
-            fail ("Can't parse " ++ show extension ++ " as KnownExtension")
 
 classifyExtension :: String -> Extension
 classifyExtension string

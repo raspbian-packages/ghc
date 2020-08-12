@@ -70,7 +70,7 @@ import qualified GHC.Exts as Happy_GHC_Exts
 import Control.Applicative(Applicative(..))
 import Control.Monad (ap)
 
--- parser produced by Happy Version 1.19.9
+-- parser produced by Happy Version 1.19.11
 
 newtype HappyAbsSyn  = HappyAbsSyn HappyAny
 #if __GLASGOW_HASKELL__ >= 607
@@ -78,328 +78,382 @@ type HappyAny = Happy_GHC_Exts.Any
 #else
 type HappyAny = forall a . a
 #endif
+newtype HappyWrap4 = HappyWrap4 (CmmParse ())
 happyIn4 :: (CmmParse ()) -> (HappyAbsSyn )
-happyIn4 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn4 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap4 x)
 {-# INLINE happyIn4 #-}
-happyOut4 :: (HappyAbsSyn ) -> (CmmParse ())
+happyOut4 :: (HappyAbsSyn ) -> HappyWrap4
 happyOut4 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut4 #-}
+newtype HappyWrap5 = HappyWrap5 (CmmParse ())
 happyIn5 :: (CmmParse ()) -> (HappyAbsSyn )
-happyIn5 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn5 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap5 x)
 {-# INLINE happyIn5 #-}
-happyOut5 :: (HappyAbsSyn ) -> (CmmParse ())
+happyOut5 :: (HappyAbsSyn ) -> HappyWrap5
 happyOut5 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut5 #-}
+newtype HappyWrap6 = HappyWrap6 (CmmParse ())
 happyIn6 :: (CmmParse ()) -> (HappyAbsSyn )
-happyIn6 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn6 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap6 x)
 {-# INLINE happyIn6 #-}
-happyOut6 :: (HappyAbsSyn ) -> (CmmParse ())
+happyOut6 :: (HappyAbsSyn ) -> HappyWrap6
 happyOut6 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut6 #-}
+newtype HappyWrap7 = HappyWrap7 (CmmParse CLabel)
 happyIn7 :: (CmmParse CLabel) -> (HappyAbsSyn )
-happyIn7 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn7 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap7 x)
 {-# INLINE happyIn7 #-}
-happyOut7 :: (HappyAbsSyn ) -> (CmmParse CLabel)
+happyOut7 :: (HappyAbsSyn ) -> HappyWrap7
 happyOut7 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut7 #-}
+newtype HappyWrap8 = HappyWrap8 ([CmmParse [CmmStatic]])
 happyIn8 :: ([CmmParse [CmmStatic]]) -> (HappyAbsSyn )
-happyIn8 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn8 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap8 x)
 {-# INLINE happyIn8 #-}
-happyOut8 :: (HappyAbsSyn ) -> ([CmmParse [CmmStatic]])
+happyOut8 :: (HappyAbsSyn ) -> HappyWrap8
 happyOut8 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut8 #-}
+newtype HappyWrap9 = HappyWrap9 (CmmParse [CmmStatic])
 happyIn9 :: (CmmParse [CmmStatic]) -> (HappyAbsSyn )
-happyIn9 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn9 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap9 x)
 {-# INLINE happyIn9 #-}
-happyOut9 :: (HappyAbsSyn ) -> (CmmParse [CmmStatic])
+happyOut9 :: (HappyAbsSyn ) -> HappyWrap9
 happyOut9 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut9 #-}
+newtype HappyWrap10 = HappyWrap10 ([CmmParse CmmExpr])
 happyIn10 :: ([CmmParse CmmExpr]) -> (HappyAbsSyn )
-happyIn10 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn10 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap10 x)
 {-# INLINE happyIn10 #-}
-happyOut10 :: (HappyAbsSyn ) -> ([CmmParse CmmExpr])
+happyOut10 :: (HappyAbsSyn ) -> HappyWrap10
 happyOut10 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut10 #-}
+newtype HappyWrap11 = HappyWrap11 (CmmParse ())
 happyIn11 :: (CmmParse ()) -> (HappyAbsSyn )
-happyIn11 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn11 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap11 x)
 {-# INLINE happyIn11 #-}
-happyOut11 :: (HappyAbsSyn ) -> (CmmParse ())
+happyOut11 :: (HappyAbsSyn ) -> HappyWrap11
 happyOut11 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut11 #-}
+newtype HappyWrap12 = HappyWrap12 (Convention)
 happyIn12 :: (Convention) -> (HappyAbsSyn )
-happyIn12 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn12 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap12 x)
 {-# INLINE happyIn12 #-}
-happyOut12 :: (HappyAbsSyn ) -> (Convention)
+happyOut12 :: (HappyAbsSyn ) -> HappyWrap12
 happyOut12 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut12 #-}
+newtype HappyWrap13 = HappyWrap13 (CmmParse ())
 happyIn13 :: (CmmParse ()) -> (HappyAbsSyn )
-happyIn13 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn13 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap13 x)
 {-# INLINE happyIn13 #-}
-happyOut13 :: (HappyAbsSyn ) -> (CmmParse ())
+happyOut13 :: (HappyAbsSyn ) -> HappyWrap13
 happyOut13 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut13 #-}
+newtype HappyWrap14 = HappyWrap14 (CmmParse (CLabel, Maybe CmmInfoTable, [LocalReg]))
 happyIn14 :: (CmmParse (CLabel, Maybe CmmInfoTable, [LocalReg])) -> (HappyAbsSyn )
-happyIn14 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn14 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap14 x)
 {-# INLINE happyIn14 #-}
-happyOut14 :: (HappyAbsSyn ) -> (CmmParse (CLabel, Maybe CmmInfoTable, [LocalReg]))
+happyOut14 :: (HappyAbsSyn ) -> HappyWrap14
 happyOut14 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut14 #-}
+newtype HappyWrap15 = HappyWrap15 (CmmParse ())
 happyIn15 :: (CmmParse ()) -> (HappyAbsSyn )
-happyIn15 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn15 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap15 x)
 {-# INLINE happyIn15 #-}
-happyOut15 :: (HappyAbsSyn ) -> (CmmParse ())
+happyOut15 :: (HappyAbsSyn ) -> HappyWrap15
 happyOut15 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut15 #-}
+newtype HappyWrap16 = HappyWrap16 (CmmParse ())
 happyIn16 :: (CmmParse ()) -> (HappyAbsSyn )
-happyIn16 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn16 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap16 x)
 {-# INLINE happyIn16 #-}
-happyOut16 :: (HappyAbsSyn ) -> (CmmParse ())
+happyOut16 :: (HappyAbsSyn ) -> HappyWrap16
 happyOut16 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut16 #-}
+newtype HappyWrap17 = HappyWrap17 ([(FastString, CLabel)])
 happyIn17 :: ([(FastString, CLabel)]) -> (HappyAbsSyn )
-happyIn17 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn17 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap17 x)
 {-# INLINE happyIn17 #-}
-happyOut17 :: (HappyAbsSyn ) -> ([(FastString, CLabel)])
+happyOut17 :: (HappyAbsSyn ) -> HappyWrap17
 happyOut17 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut17 #-}
+newtype HappyWrap18 = HappyWrap18 ((FastString,  CLabel))
 happyIn18 :: ((FastString,  CLabel)) -> (HappyAbsSyn )
-happyIn18 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn18 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap18 x)
 {-# INLINE happyIn18 #-}
-happyOut18 :: (HappyAbsSyn ) -> ((FastString,  CLabel))
+happyOut18 :: (HappyAbsSyn ) -> HappyWrap18
 happyOut18 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut18 #-}
+newtype HappyWrap19 = HappyWrap19 ([FastString])
 happyIn19 :: ([FastString]) -> (HappyAbsSyn )
-happyIn19 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn19 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap19 x)
 {-# INLINE happyIn19 #-}
-happyOut19 :: (HappyAbsSyn ) -> ([FastString])
+happyOut19 :: (HappyAbsSyn ) -> HappyWrap19
 happyOut19 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut19 #-}
+newtype HappyWrap20 = HappyWrap20 (CmmParse ())
 happyIn20 :: (CmmParse ()) -> (HappyAbsSyn )
-happyIn20 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn20 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap20 x)
 {-# INLINE happyIn20 #-}
-happyOut20 :: (HappyAbsSyn ) -> (CmmParse ())
+happyOut20 :: (HappyAbsSyn ) -> HappyWrap20
 happyOut20 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut20 #-}
+newtype HappyWrap21 = HappyWrap21 (CmmParse [(GlobalReg, Maybe CmmExpr)])
 happyIn21 :: (CmmParse [(GlobalReg, Maybe CmmExpr)]) -> (HappyAbsSyn )
-happyIn21 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn21 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap21 x)
 {-# INLINE happyIn21 #-}
-happyOut21 :: (HappyAbsSyn ) -> (CmmParse [(GlobalReg, Maybe CmmExpr)])
+happyOut21 :: (HappyAbsSyn ) -> HappyWrap21
 happyOut21 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut21 #-}
+newtype HappyWrap22 = HappyWrap22 (CmmParse (Maybe CmmExpr))
 happyIn22 :: (CmmParse (Maybe CmmExpr)) -> (HappyAbsSyn )
-happyIn22 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn22 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap22 x)
 {-# INLINE happyIn22 #-}
-happyOut22 :: (HappyAbsSyn ) -> (CmmParse (Maybe CmmExpr))
+happyOut22 :: (HappyAbsSyn ) -> HappyWrap22
 happyOut22 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut22 #-}
+newtype HappyWrap23 = HappyWrap23 (CmmParse CmmExpr)
 happyIn23 :: (CmmParse CmmExpr) -> (HappyAbsSyn )
-happyIn23 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn23 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap23 x)
 {-# INLINE happyIn23 #-}
-happyOut23 :: (HappyAbsSyn ) -> (CmmParse CmmExpr)
+happyOut23 :: (HappyAbsSyn ) -> HappyWrap23
 happyOut23 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut23 #-}
+newtype HappyWrap24 = HappyWrap24 (CmmReturnInfo)
 happyIn24 :: (CmmReturnInfo) -> (HappyAbsSyn )
-happyIn24 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn24 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap24 x)
 {-# INLINE happyIn24 #-}
-happyOut24 :: (HappyAbsSyn ) -> (CmmReturnInfo)
+happyOut24 :: (HappyAbsSyn ) -> HappyWrap24
 happyOut24 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut24 #-}
+newtype HappyWrap25 = HappyWrap25 (CmmParse BoolExpr)
 happyIn25 :: (CmmParse BoolExpr) -> (HappyAbsSyn )
-happyIn25 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn25 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap25 x)
 {-# INLINE happyIn25 #-}
-happyOut25 :: (HappyAbsSyn ) -> (CmmParse BoolExpr)
+happyOut25 :: (HappyAbsSyn ) -> HappyWrap25
 happyOut25 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut25 #-}
+newtype HappyWrap26 = HappyWrap26 (CmmParse BoolExpr)
 happyIn26 :: (CmmParse BoolExpr) -> (HappyAbsSyn )
-happyIn26 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn26 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap26 x)
 {-# INLINE happyIn26 #-}
-happyOut26 :: (HappyAbsSyn ) -> (CmmParse BoolExpr)
+happyOut26 :: (HappyAbsSyn ) -> HappyWrap26
 happyOut26 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut26 #-}
+newtype HappyWrap27 = HappyWrap27 (Safety)
 happyIn27 :: (Safety) -> (HappyAbsSyn )
-happyIn27 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn27 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap27 x)
 {-# INLINE happyIn27 #-}
-happyOut27 :: (HappyAbsSyn ) -> (Safety)
+happyOut27 :: (HappyAbsSyn ) -> HappyWrap27
 happyOut27 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut27 #-}
+newtype HappyWrap28 = HappyWrap28 ([GlobalReg])
 happyIn28 :: ([GlobalReg]) -> (HappyAbsSyn )
-happyIn28 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn28 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap28 x)
 {-# INLINE happyIn28 #-}
-happyOut28 :: (HappyAbsSyn ) -> ([GlobalReg])
+happyOut28 :: (HappyAbsSyn ) -> HappyWrap28
 happyOut28 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut28 #-}
+newtype HappyWrap29 = HappyWrap29 ([GlobalReg])
 happyIn29 :: ([GlobalReg]) -> (HappyAbsSyn )
-happyIn29 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn29 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap29 x)
 {-# INLINE happyIn29 #-}
-happyOut29 :: (HappyAbsSyn ) -> ([GlobalReg])
+happyOut29 :: (HappyAbsSyn ) -> HappyWrap29
 happyOut29 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut29 #-}
+newtype HappyWrap30 = HappyWrap30 (Maybe (Integer,Integer))
 happyIn30 :: (Maybe (Integer,Integer)) -> (HappyAbsSyn )
-happyIn30 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn30 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap30 x)
 {-# INLINE happyIn30 #-}
-happyOut30 :: (HappyAbsSyn ) -> (Maybe (Integer,Integer))
+happyOut30 :: (HappyAbsSyn ) -> HappyWrap30
 happyOut30 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut30 #-}
+newtype HappyWrap31 = HappyWrap31 ([CmmParse ([Integer],Either BlockId (CmmParse ()))])
 happyIn31 :: ([CmmParse ([Integer],Either BlockId (CmmParse ()))]) -> (HappyAbsSyn )
-happyIn31 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn31 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap31 x)
 {-# INLINE happyIn31 #-}
-happyOut31 :: (HappyAbsSyn ) -> ([CmmParse ([Integer],Either BlockId (CmmParse ()))])
+happyOut31 :: (HappyAbsSyn ) -> HappyWrap31
 happyOut31 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut31 #-}
+newtype HappyWrap32 = HappyWrap32 (CmmParse ([Integer],Either BlockId (CmmParse ())))
 happyIn32 :: (CmmParse ([Integer],Either BlockId (CmmParse ()))) -> (HappyAbsSyn )
-happyIn32 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn32 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap32 x)
 {-# INLINE happyIn32 #-}
-happyOut32 :: (HappyAbsSyn ) -> (CmmParse ([Integer],Either BlockId (CmmParse ())))
+happyOut32 :: (HappyAbsSyn ) -> HappyWrap32
 happyOut32 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut32 #-}
+newtype HappyWrap33 = HappyWrap33 (CmmParse (Either BlockId (CmmParse ())))
 happyIn33 :: (CmmParse (Either BlockId (CmmParse ()))) -> (HappyAbsSyn )
-happyIn33 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn33 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap33 x)
 {-# INLINE happyIn33 #-}
-happyOut33 :: (HappyAbsSyn ) -> (CmmParse (Either BlockId (CmmParse ())))
+happyOut33 :: (HappyAbsSyn ) -> HappyWrap33
 happyOut33 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut33 #-}
+newtype HappyWrap34 = HappyWrap34 ([Integer])
 happyIn34 :: ([Integer]) -> (HappyAbsSyn )
-happyIn34 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn34 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap34 x)
 {-# INLINE happyIn34 #-}
-happyOut34 :: (HappyAbsSyn ) -> ([Integer])
+happyOut34 :: (HappyAbsSyn ) -> HappyWrap34
 happyOut34 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut34 #-}
+newtype HappyWrap35 = HappyWrap35 (Maybe (CmmParse ()))
 happyIn35 :: (Maybe (CmmParse ())) -> (HappyAbsSyn )
-happyIn35 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn35 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap35 x)
 {-# INLINE happyIn35 #-}
-happyOut35 :: (HappyAbsSyn ) -> (Maybe (CmmParse ()))
+happyOut35 :: (HappyAbsSyn ) -> HappyWrap35
 happyOut35 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut35 #-}
+newtype HappyWrap36 = HappyWrap36 (CmmParse ())
 happyIn36 :: (CmmParse ()) -> (HappyAbsSyn )
-happyIn36 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn36 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap36 x)
 {-# INLINE happyIn36 #-}
-happyOut36 :: (HappyAbsSyn ) -> (CmmParse ())
+happyOut36 :: (HappyAbsSyn ) -> HappyWrap36
 happyOut36 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut36 #-}
+newtype HappyWrap37 = HappyWrap37 (Maybe Bool)
 happyIn37 :: (Maybe Bool) -> (HappyAbsSyn )
-happyIn37 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn37 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap37 x)
 {-# INLINE happyIn37 #-}
-happyOut37 :: (HappyAbsSyn ) -> (Maybe Bool)
+happyOut37 :: (HappyAbsSyn ) -> HappyWrap37
 happyOut37 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut37 #-}
+newtype HappyWrap38 = HappyWrap38 (CmmParse CmmExpr)
 happyIn38 :: (CmmParse CmmExpr) -> (HappyAbsSyn )
-happyIn38 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn38 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap38 x)
 {-# INLINE happyIn38 #-}
-happyOut38 :: (HappyAbsSyn ) -> (CmmParse CmmExpr)
+happyOut38 :: (HappyAbsSyn ) -> HappyWrap38
 happyOut38 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut38 #-}
+newtype HappyWrap39 = HappyWrap39 (CmmParse CmmExpr)
 happyIn39 :: (CmmParse CmmExpr) -> (HappyAbsSyn )
-happyIn39 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn39 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap39 x)
 {-# INLINE happyIn39 #-}
-happyOut39 :: (HappyAbsSyn ) -> (CmmParse CmmExpr)
+happyOut39 :: (HappyAbsSyn ) -> HappyWrap39
 happyOut39 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut39 #-}
+newtype HappyWrap40 = HappyWrap40 (CmmType)
 happyIn40 :: (CmmType) -> (HappyAbsSyn )
-happyIn40 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn40 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap40 x)
 {-# INLINE happyIn40 #-}
-happyOut40 :: (HappyAbsSyn ) -> (CmmType)
+happyOut40 :: (HappyAbsSyn ) -> HappyWrap40
 happyOut40 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut40 #-}
+newtype HappyWrap41 = HappyWrap41 ([CmmParse (CmmExpr, ForeignHint)])
 happyIn41 :: ([CmmParse (CmmExpr, ForeignHint)]) -> (HappyAbsSyn )
-happyIn41 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn41 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap41 x)
 {-# INLINE happyIn41 #-}
-happyOut41 :: (HappyAbsSyn ) -> ([CmmParse (CmmExpr, ForeignHint)])
+happyOut41 :: (HappyAbsSyn ) -> HappyWrap41
 happyOut41 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut41 #-}
+newtype HappyWrap42 = HappyWrap42 ([CmmParse (CmmExpr, ForeignHint)])
 happyIn42 :: ([CmmParse (CmmExpr, ForeignHint)]) -> (HappyAbsSyn )
-happyIn42 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn42 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap42 x)
 {-# INLINE happyIn42 #-}
-happyOut42 :: (HappyAbsSyn ) -> ([CmmParse (CmmExpr, ForeignHint)])
+happyOut42 :: (HappyAbsSyn ) -> HappyWrap42
 happyOut42 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut42 #-}
+newtype HappyWrap43 = HappyWrap43 (CmmParse (CmmExpr, ForeignHint))
 happyIn43 :: (CmmParse (CmmExpr, ForeignHint)) -> (HappyAbsSyn )
-happyIn43 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn43 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap43 x)
 {-# INLINE happyIn43 #-}
-happyOut43 :: (HappyAbsSyn ) -> (CmmParse (CmmExpr, ForeignHint))
+happyOut43 :: (HappyAbsSyn ) -> HappyWrap43
 happyOut43 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut43 #-}
+newtype HappyWrap44 = HappyWrap44 ([CmmParse CmmExpr])
 happyIn44 :: ([CmmParse CmmExpr]) -> (HappyAbsSyn )
-happyIn44 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn44 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap44 x)
 {-# INLINE happyIn44 #-}
-happyOut44 :: (HappyAbsSyn ) -> ([CmmParse CmmExpr])
+happyOut44 :: (HappyAbsSyn ) -> HappyWrap44
 happyOut44 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut44 #-}
+newtype HappyWrap45 = HappyWrap45 ([CmmParse CmmExpr])
 happyIn45 :: ([CmmParse CmmExpr]) -> (HappyAbsSyn )
-happyIn45 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn45 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap45 x)
 {-# INLINE happyIn45 #-}
-happyOut45 :: (HappyAbsSyn ) -> ([CmmParse CmmExpr])
+happyOut45 :: (HappyAbsSyn ) -> HappyWrap45
 happyOut45 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut45 #-}
+newtype HappyWrap46 = HappyWrap46 (CmmParse CmmExpr)
 happyIn46 :: (CmmParse CmmExpr) -> (HappyAbsSyn )
-happyIn46 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn46 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap46 x)
 {-# INLINE happyIn46 #-}
-happyOut46 :: (HappyAbsSyn ) -> (CmmParse CmmExpr)
+happyOut46 :: (HappyAbsSyn ) -> HappyWrap46
 happyOut46 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut46 #-}
+newtype HappyWrap47 = HappyWrap47 ([CmmParse (LocalReg, ForeignHint)])
 happyIn47 :: ([CmmParse (LocalReg, ForeignHint)]) -> (HappyAbsSyn )
-happyIn47 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn47 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap47 x)
 {-# INLINE happyIn47 #-}
-happyOut47 :: (HappyAbsSyn ) -> ([CmmParse (LocalReg, ForeignHint)])
+happyOut47 :: (HappyAbsSyn ) -> HappyWrap47
 happyOut47 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut47 #-}
+newtype HappyWrap48 = HappyWrap48 ([CmmParse (LocalReg, ForeignHint)])
 happyIn48 :: ([CmmParse (LocalReg, ForeignHint)]) -> (HappyAbsSyn )
-happyIn48 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn48 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap48 x)
 {-# INLINE happyIn48 #-}
-happyOut48 :: (HappyAbsSyn ) -> ([CmmParse (LocalReg, ForeignHint)])
+happyOut48 :: (HappyAbsSyn ) -> HappyWrap48
 happyOut48 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut48 #-}
+newtype HappyWrap49 = HappyWrap49 (CmmParse (LocalReg, ForeignHint))
 happyIn49 :: (CmmParse (LocalReg, ForeignHint)) -> (HappyAbsSyn )
-happyIn49 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn49 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap49 x)
 {-# INLINE happyIn49 #-}
-happyOut49 :: (HappyAbsSyn ) -> (CmmParse (LocalReg, ForeignHint))
+happyOut49 :: (HappyAbsSyn ) -> HappyWrap49
 happyOut49 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut49 #-}
+newtype HappyWrap50 = HappyWrap50 (CmmParse LocalReg)
 happyIn50 :: (CmmParse LocalReg) -> (HappyAbsSyn )
-happyIn50 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn50 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap50 x)
 {-# INLINE happyIn50 #-}
-happyOut50 :: (HappyAbsSyn ) -> (CmmParse LocalReg)
+happyOut50 :: (HappyAbsSyn ) -> HappyWrap50
 happyOut50 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut50 #-}
+newtype HappyWrap51 = HappyWrap51 (CmmParse CmmReg)
 happyIn51 :: (CmmParse CmmReg) -> (HappyAbsSyn )
-happyIn51 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn51 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap51 x)
 {-# INLINE happyIn51 #-}
-happyOut51 :: (HappyAbsSyn ) -> (CmmParse CmmReg)
+happyOut51 :: (HappyAbsSyn ) -> HappyWrap51
 happyOut51 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut51 #-}
+newtype HappyWrap52 = HappyWrap52 (Maybe [CmmParse LocalReg])
 happyIn52 :: (Maybe [CmmParse LocalReg]) -> (HappyAbsSyn )
-happyIn52 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn52 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap52 x)
 {-# INLINE happyIn52 #-}
-happyOut52 :: (HappyAbsSyn ) -> (Maybe [CmmParse LocalReg])
+happyOut52 :: (HappyAbsSyn ) -> HappyWrap52
 happyOut52 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut52 #-}
+newtype HappyWrap53 = HappyWrap53 ([CmmParse LocalReg])
 happyIn53 :: ([CmmParse LocalReg]) -> (HappyAbsSyn )
-happyIn53 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn53 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap53 x)
 {-# INLINE happyIn53 #-}
-happyOut53 :: (HappyAbsSyn ) -> ([CmmParse LocalReg])
+happyOut53 :: (HappyAbsSyn ) -> HappyWrap53
 happyOut53 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut53 #-}
+newtype HappyWrap54 = HappyWrap54 ([CmmParse LocalReg])
 happyIn54 :: ([CmmParse LocalReg]) -> (HappyAbsSyn )
-happyIn54 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn54 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap54 x)
 {-# INLINE happyIn54 #-}
-happyOut54 :: (HappyAbsSyn ) -> ([CmmParse LocalReg])
+happyOut54 :: (HappyAbsSyn ) -> HappyWrap54
 happyOut54 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut54 #-}
+newtype HappyWrap55 = HappyWrap55 (CmmParse LocalReg)
 happyIn55 :: (CmmParse LocalReg) -> (HappyAbsSyn )
-happyIn55 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn55 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap55 x)
 {-# INLINE happyIn55 #-}
-happyOut55 :: (HappyAbsSyn ) -> (CmmParse LocalReg)
+happyOut55 :: (HappyAbsSyn ) -> HappyWrap55
 happyOut55 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut55 #-}
+newtype HappyWrap56 = HappyWrap56 (CmmType)
 happyIn56 :: (CmmType) -> (HappyAbsSyn )
-happyIn56 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn56 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap56 x)
 {-# INLINE happyIn56 #-}
-happyOut56 :: (HappyAbsSyn ) -> (CmmType)
+happyOut56 :: (HappyAbsSyn ) -> HappyWrap56
 happyOut56 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut56 #-}
+newtype HappyWrap57 = HappyWrap57 (CmmType)
 happyIn57 :: (CmmType) -> (HappyAbsSyn )
-happyIn57 x = Happy_GHC_Exts.unsafeCoerce# x
+happyIn57 x = Happy_GHC_Exts.unsafeCoerce# (HappyWrap57 x)
 {-# INLINE happyIn57 #-}
-happyOut57 :: (HappyAbsSyn ) -> (CmmType)
+happyOut57 :: (HappyAbsSyn ) -> HappyWrap57
 happyOut57 x = Happy_GHC_Exts.unsafeCoerce# x
 {-# INLINE happyOut57 #-}
 happyInTok :: (Located CmmToken) -> (HappyAbsSyn )
@@ -629,8 +683,8 @@ happyReduce_2 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Exts
 happyReduce_2 = happySpecReduce_2  0# happyReduction_2
 happyReduction_2 happy_x_2
 	happy_x_1
-	 =  case happyOut5 happy_x_1 of { happy_var_1 -> 
-	case happyOut4 happy_x_2 of { happy_var_2 -> 
+	 =  case happyOut5 happy_x_1 of { (HappyWrap5 happy_var_1) -> 
+	case happyOut4 happy_x_2 of { (HappyWrap4 happy_var_2) -> 
 	happyIn4
 		 (do happy_var_1; happy_var_2
 	)}}
@@ -638,7 +692,7 @@ happyReduction_2 happy_x_2
 happyReduce_3 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Exts.Int# -> Happy_IntList -> HappyStk (HappyAbsSyn ) -> PD (HappyAbsSyn )
 happyReduce_3 = happySpecReduce_1  1# happyReduction_3
 happyReduction_3 happy_x_1
-	 =  case happyOut11 happy_x_1 of { happy_var_1 -> 
+	 =  case happyOut11 happy_x_1 of { (HappyWrap11 happy_var_1) -> 
 	happyIn5
 		 (happy_var_1
 	)}
@@ -646,7 +700,7 @@ happyReduction_3 happy_x_1
 happyReduce_4 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Exts.Int# -> Happy_IntList -> HappyStk (HappyAbsSyn ) -> PD (HappyAbsSyn )
 happyReduce_4 = happySpecReduce_1  1# happyReduction_4
 happyReduction_4 happy_x_1
-	 =  case happyOut6 happy_x_1 of { happy_var_1 -> 
+	 =  case happyOut6 happy_x_1 of { (HappyWrap6 happy_var_1) -> 
 	happyIn5
 		 (happy_var_1
 	)}
@@ -654,7 +708,7 @@ happyReduction_4 happy_x_1
 happyReduce_5 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Exts.Int# -> Happy_IntList -> HappyStk (HappyAbsSyn ) -> PD (HappyAbsSyn )
 happyReduce_5 = happySpecReduce_1  1# happyReduction_5
 happyReduction_5 happy_x_1
-	 =  case happyOut16 happy_x_1 of { happy_var_1 -> 
+	 =  case happyOut16 happy_x_1 of { (HappyWrap16 happy_var_1) -> 
 	happyIn5
 		 (happy_var_1
 	)}
@@ -672,7 +726,7 @@ happyReduction_6 (happy_x_8 `HappyStk`
 	happyRest) tk
 	 = happyThen ((case happyOutTok happy_x_3 of { (L _ (CmmT_Name        happy_var_3)) -> 
 	case happyOutTok happy_x_5 of { (L _ (CmmT_Name        happy_var_5)) -> 
-	case happyOut10 happy_x_6 of { happy_var_6 -> 
+	case happyOut10 happy_x_6 of { (HappyWrap10 happy_var_6) -> 
 	( liftP . withThisPackage $ \pkg ->
                    do lits <- sequence happy_var_6;
                       staticClosure pkg happy_var_3 happy_var_5 (map getLit lits))}}})
@@ -688,8 +742,8 @@ happyReduction_7 (happy_x_6 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest)
 	 = case happyOutTok happy_x_2 of { (L _ (CmmT_String      happy_var_2)) -> 
-	case happyOut7 happy_x_4 of { happy_var_4 -> 
-	case happyOut8 happy_x_5 of { happy_var_5 -> 
+	case happyOut7 happy_x_4 of { (HappyWrap7 happy_var_4) -> 
+	case happyOut8 happy_x_5 of { (HappyWrap8 happy_var_5) -> 
 	happyIn6
 		 (do lbl <- happy_var_4;
                      ss <- sequence happy_var_5;
@@ -716,8 +770,8 @@ happyReduce_10 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Ext
 happyReduce_10 = happySpecReduce_2  4# happyReduction_10
 happyReduction_10 happy_x_2
 	happy_x_1
-	 =  case happyOut9 happy_x_1 of { happy_var_1 -> 
-	case happyOut8 happy_x_2 of { happy_var_2 -> 
+	 =  case happyOut9 happy_x_1 of { (HappyWrap9 happy_var_1) -> 
+	case happyOut8 happy_x_2 of { (HappyWrap8 happy_var_2) -> 
 	happyIn8
 		 (happy_var_1 : happy_var_2
 	)}}
@@ -727,7 +781,7 @@ happyReduce_11 = happySpecReduce_3  5# happyReduction_11
 happyReduction_11 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut38 happy_x_2 of { happy_var_2 -> 
+	 =  case happyOut38 happy_x_2 of { (HappyWrap38 happy_var_2) -> 
 	happyIn9
 		 (do e <- happy_var_2;
                              return [CmmStaticLit (getLit e)]
@@ -737,7 +791,7 @@ happyReduce_12 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Ext
 happyReduce_12 = happySpecReduce_2  5# happyReduction_12
 happyReduction_12 happy_x_2
 	happy_x_1
-	 =  case happyOut56 happy_x_1 of { happy_var_1 -> 
+	 =  case happyOut56 happy_x_1 of { (HappyWrap56 happy_var_1) -> 
 	happyIn9
 		 (return [CmmUninitialised
                                                         (widthInBytes (typeWidth happy_var_1))]
@@ -778,7 +832,7 @@ happyReduction_15 (happy_x_5 `HappyStk`
 	happy_x_2 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest)
-	 = case happyOut57 happy_x_1 of { happy_var_1 -> 
+	 = case happyOut57 happy_x_1 of { (HappyWrap57 happy_var_1) -> 
 	case happyOutTok happy_x_3 of { (L _ (CmmT_Int         happy_var_3)) -> 
 	happyIn9
 		 (return [CmmUninitialised 
@@ -795,7 +849,7 @@ happyReduction_16 (happy_x_5 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest)
 	 = case happyOutTok happy_x_3 of { (L _ (CmmT_Name        happy_var_3)) -> 
-	case happyOut10 happy_x_4 of { happy_var_4 -> 
+	case happyOut10 happy_x_4 of { (HappyWrap10 happy_var_4) -> 
 	happyIn9
 		 (do { lits <- sequence happy_var_4
                 ; dflags <- getDynFlags
@@ -817,8 +871,8 @@ happyReduce_18 = happySpecReduce_3  6# happyReduction_18
 happyReduction_18 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut38 happy_x_2 of { happy_var_2 -> 
-	case happyOut10 happy_x_3 of { happy_var_3 -> 
+	 =  case happyOut38 happy_x_2 of { (HappyWrap38 happy_var_2) -> 
+	case happyOut10 happy_x_3 of { (HappyWrap10 happy_var_3) -> 
 	happyIn10
 		 (happy_var_2 : happy_var_3
 	)}}
@@ -830,10 +884,10 @@ happyReduction_19 (happy_x_4 `HappyStk`
 	happy_x_2 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest)
-	 = case happyOut14 happy_x_1 of { happy_var_1 -> 
-	case happyOut12 happy_x_2 of { happy_var_2 -> 
-	case happyOut52 happy_x_3 of { happy_var_3 -> 
-	case happyOut13 happy_x_4 of { happy_var_4 -> 
+	 = case happyOut14 happy_x_1 of { (HappyWrap14 happy_var_1) -> 
+	case happyOut12 happy_x_2 of { (HappyWrap12 happy_var_2) -> 
+	case happyOut52 happy_x_3 of { (HappyWrap52 happy_var_3) -> 
+	case happyOut13 happy_x_4 of { (HappyWrap13 happy_var_4) -> 
 	happyIn11
 		 (do ((entry_ret_label, info, stk_formals, formals), agraph) <-
                        getCodeScoped $ loopDecls $ do {
@@ -875,7 +929,7 @@ happyReduction_23 happy_x_3
 	happy_x_2
 	happy_x_1
 	 =  case happyOutTok happy_x_1 of { happy_var_1 -> 
-	case happyOut15 happy_x_2 of { happy_var_2 -> 
+	case happyOut15 happy_x_2 of { (HappyWrap15 happy_var_2) -> 
 	case happyOutTok happy_x_3 of { happy_var_3 -> 
 	happyIn13
 		 (withSourceNote happy_var_1 happy_var_3 happy_var_2
@@ -1078,13 +1132,13 @@ happyReduction_30 (happy_x_8 `HappyStk`
 	happyRest) tk
 	 = happyThen ((case happyOutTok happy_x_3 of { (L _ (CmmT_Name        happy_var_3)) -> 
 	case happyOutTok happy_x_5 of { (L _ (CmmT_Int         happy_var_5)) -> 
-	case happyOut53 happy_x_7 of { happy_var_7 -> 
+	case happyOut53 happy_x_7 of { (HappyWrap53 happy_var_7) -> 
 	( liftP . withThisPackage $ \pkg ->
                    do dflags <- getDynFlags
                       live <- sequence happy_var_7
                       let prof = NoProfilingInfo
                           -- drop one for the info pointer
-                          bitmap = mkLiveness dflags (map Just (drop 1 live))
+                          bitmap = mkLiveness dflags (drop 1 live)
                           rep  = mkRTSRep (fromIntegral happy_var_5) $ mkStackRep bitmap
                       return (mkCmmRetLabel pkg happy_var_3,
                               Just $ CmmInfoTable { cit_lbl = mkCmmRetInfoLabel pkg happy_var_3
@@ -1103,8 +1157,8 @@ happyReduce_32 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Ext
 happyReduce_32 = happySpecReduce_2  11# happyReduction_32
 happyReduction_32 happy_x_2
 	happy_x_1
-	 =  case happyOut16 happy_x_1 of { happy_var_1 -> 
-	case happyOut15 happy_x_2 of { happy_var_2 -> 
+	 =  case happyOut16 happy_x_1 of { (HappyWrap16 happy_var_1) -> 
+	case happyOut15 happy_x_2 of { (HappyWrap15 happy_var_2) -> 
 	happyIn15
 		 (do happy_var_1; happy_var_2
 	)}}
@@ -1113,8 +1167,8 @@ happyReduce_33 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Ext
 happyReduce_33 = happySpecReduce_2  11# happyReduction_33
 happyReduction_33 happy_x_2
 	happy_x_1
-	 =  case happyOut20 happy_x_1 of { happy_var_1 -> 
-	case happyOut15 happy_x_2 of { happy_var_2 -> 
+	 =  case happyOut20 happy_x_1 of { (HappyWrap20 happy_var_1) -> 
+	case happyOut15 happy_x_2 of { (HappyWrap15 happy_var_2) -> 
 	happyIn15
 		 (do happy_var_1; happy_var_2
 	)}}
@@ -1124,8 +1178,8 @@ happyReduce_34 = happySpecReduce_3  12# happyReduction_34
 happyReduction_34 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut56 happy_x_1 of { happy_var_1 -> 
-	case happyOut19 happy_x_2 of { happy_var_2 -> 
+	 =  case happyOut56 happy_x_1 of { (HappyWrap56 happy_var_1) -> 
+	case happyOut19 happy_x_2 of { (HappyWrap19 happy_var_2) -> 
 	happyIn16
 		 (mapM_ (newLocal happy_var_1) happy_var_2
 	)}}
@@ -1135,7 +1189,7 @@ happyReduce_35 = happySpecReduce_3  12# happyReduction_35
 happyReduction_35 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut17 happy_x_2 of { happy_var_2 -> 
+	 =  case happyOut17 happy_x_2 of { (HappyWrap17 happy_var_2) -> 
 	happyIn16
 		 (mapM_ newImport happy_var_2
 	)}
@@ -1152,7 +1206,7 @@ happyReduction_36 happy_x_3
 happyReduce_37 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Exts.Int# -> Happy_IntList -> HappyStk (HappyAbsSyn ) -> PD (HappyAbsSyn )
 happyReduce_37 = happySpecReduce_1  13# happyReduction_37
 happyReduction_37 happy_x_1
-	 =  case happyOut18 happy_x_1 of { happy_var_1 -> 
+	 =  case happyOut18 happy_x_1 of { (HappyWrap18 happy_var_1) -> 
 	happyIn17
 		 ([happy_var_1]
 	)}
@@ -1162,8 +1216,8 @@ happyReduce_38 = happySpecReduce_3  13# happyReduction_38
 happyReduction_38 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut18 happy_x_1 of { happy_var_1 -> 
-	case happyOut17 happy_x_3 of { happy_var_3 -> 
+	 =  case happyOut18 happy_x_1 of { (HappyWrap18 happy_var_1) -> 
+	case happyOut17 happy_x_3 of { (HappyWrap17 happy_var_3) -> 
 	happyIn17
 		 (happy_var_1 : happy_var_3
 	)}}
@@ -1209,7 +1263,7 @@ happyReduction_43 happy_x_3
 	happy_x_2
 	happy_x_1
 	 =  case happyOutTok happy_x_1 of { (L _ (CmmT_Name        happy_var_1)) -> 
-	case happyOut19 happy_x_3 of { happy_var_3 -> 
+	case happyOut19 happy_x_3 of { (HappyWrap19 happy_var_3) -> 
 	happyIn19
 		 (happy_var_1 : happy_var_3
 	)}}
@@ -1237,9 +1291,9 @@ happyReduction_46 (happy_x_4 `HappyStk`
 	happy_x_2 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest)
-	 = case happyOut51 happy_x_1 of { happy_var_1 -> 
+	 = case happyOut51 happy_x_1 of { (HappyWrap51 happy_var_1) -> 
 	case happyOutTok happy_x_2 of { happy_var_2 -> 
-	case happyOut38 happy_x_3 of { happy_var_3 -> 
+	case happyOut38 happy_x_3 of { (HappyWrap38 happy_var_3) -> 
 	case happyOutTok happy_x_4 of { happy_var_4 -> 
 	happyIn20
 		 (do reg <- happy_var_1; e <- happy_var_3; withSourceNote happy_var_2 happy_var_4 (emitAssign reg e)
@@ -1255,10 +1309,10 @@ happyReduction_47 (happy_x_7 `HappyStk`
 	happy_x_2 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest)
-	 = case happyOut56 happy_x_1 of { happy_var_1 -> 
+	 = case happyOut56 happy_x_1 of { (HappyWrap56 happy_var_1) -> 
 	case happyOutTok happy_x_2 of { happy_var_2 -> 
-	case happyOut38 happy_x_3 of { happy_var_3 -> 
-	case happyOut38 happy_x_6 of { happy_var_6 -> 
+	case happyOut38 happy_x_3 of { (HappyWrap38 happy_var_3) -> 
+	case happyOut38 happy_x_6 of { (HappyWrap38 happy_var_6) -> 
 	case happyOutTok happy_x_7 of { happy_var_7 -> 
 	happyIn20
 		 (withSourceNote happy_var_2 happy_var_7 (doStore happy_var_1 happy_var_3 happy_var_6)
@@ -1277,12 +1331,12 @@ happyReduction_48 (happy_x_10 `HappyStk`
 	happy_x_2 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest) tk
-	 = happyThen ((case happyOut47 happy_x_1 of { happy_var_1 -> 
+	 = happyThen ((case happyOut47 happy_x_1 of { (HappyWrap47 happy_var_1) -> 
 	case happyOutTok happy_x_3 of { (L _ (CmmT_String      happy_var_3)) -> 
-	case happyOut23 happy_x_4 of { happy_var_4 -> 
-	case happyOut41 happy_x_6 of { happy_var_6 -> 
-	case happyOut27 happy_x_8 of { happy_var_8 -> 
-	case happyOut24 happy_x_9 of { happy_var_9 -> 
+	case happyOut23 happy_x_4 of { (HappyWrap23 happy_var_4) -> 
+	case happyOut41 happy_x_6 of { (HappyWrap41 happy_var_6) -> 
+	case happyOut27 happy_x_8 of { (HappyWrap27 happy_var_8) -> 
+	case happyOut24 happy_x_9 of { (HappyWrap24 happy_var_9) -> 
 	( foreignCall happy_var_3 happy_var_1 happy_var_4 happy_var_6 happy_var_8 happy_var_9)}}}}}})
 	) (\r -> happyReturn (happyIn20 r))
 
@@ -1297,9 +1351,9 @@ happyReduction_49 (happy_x_8 `HappyStk`
 	happy_x_2 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest) tk
-	 = happyThen ((case happyOut47 happy_x_1 of { happy_var_1 -> 
+	 = happyThen ((case happyOut47 happy_x_1 of { (HappyWrap47 happy_var_1) -> 
 	case happyOutTok happy_x_4 of { (L _ (CmmT_Name        happy_var_4)) -> 
-	case happyOut44 happy_x_6 of { happy_var_6 -> 
+	case happyOut44 happy_x_6 of { (HappyWrap44 happy_var_6) -> 
 	( primCall happy_var_1 happy_var_4 happy_var_6)}}})
 	) (\r -> happyReturn (happyIn20 r))
 
@@ -1312,7 +1366,7 @@ happyReduction_50 (happy_x_5 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest) tk
 	 = happyThen ((case happyOutTok happy_x_1 of { (L _ (CmmT_Name        happy_var_1)) -> 
-	case happyOut44 happy_x_3 of { happy_var_3 -> 
+	case happyOut44 happy_x_3 of { (HappyWrap44 happy_var_3) -> 
 	( stmtMacro happy_var_1 happy_var_3)}})
 	) (\r -> happyReturn (happyIn20 r))
 
@@ -1326,10 +1380,10 @@ happyReduction_51 (happy_x_7 `HappyStk`
 	happy_x_2 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest)
-	 = case happyOut30 happy_x_2 of { happy_var_2 -> 
-	case happyOut38 happy_x_3 of { happy_var_3 -> 
-	case happyOut31 happy_x_5 of { happy_var_5 -> 
-	case happyOut35 happy_x_6 of { happy_var_6 -> 
+	 = case happyOut30 happy_x_2 of { (HappyWrap30 happy_var_2) -> 
+	case happyOut38 happy_x_3 of { (HappyWrap38 happy_var_3) -> 
+	case happyOut31 happy_x_5 of { (HappyWrap31 happy_var_5) -> 
+	case happyOut35 happy_x_6 of { (HappyWrap35 happy_var_6) -> 
 	happyIn20
 		 (do as <- sequence happy_var_5; doSwitch happy_var_2 happy_var_3 as happy_var_6
 	) `HappyStk` happyRest}}}}
@@ -1352,7 +1406,7 @@ happyReduction_53 (happy_x_5 `HappyStk`
 	happy_x_2 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest)
-	 = case happyOut44 happy_x_3 of { happy_var_3 -> 
+	 = case happyOut44 happy_x_3 of { (HappyWrap44 happy_var_3) -> 
 	happyIn20
 		 (doReturn happy_var_3
 	) `HappyStk` happyRest}
@@ -1364,8 +1418,8 @@ happyReduction_54 (happy_x_4 `HappyStk`
 	happy_x_2 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest)
-	 = case happyOut38 happy_x_2 of { happy_var_2 -> 
-	case happyOut28 happy_x_3 of { happy_var_3 -> 
+	 = case happyOut38 happy_x_2 of { (HappyWrap38 happy_var_2) -> 
+	case happyOut28 happy_x_3 of { (HappyWrap28 happy_var_3) -> 
 	happyIn20
 		 (doRawJump happy_var_2 happy_var_3
 	) `HappyStk` happyRest}}
@@ -1379,8 +1433,8 @@ happyReduction_55 (happy_x_6 `HappyStk`
 	happy_x_2 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest)
-	 = case happyOut38 happy_x_2 of { happy_var_2 -> 
-	case happyOut44 happy_x_4 of { happy_var_4 -> 
+	 = case happyOut38 happy_x_2 of { (HappyWrap38 happy_var_2) -> 
+	case happyOut44 happy_x_4 of { (HappyWrap44 happy_var_4) -> 
 	happyIn20
 		 (doJumpWithStack happy_var_2 [] happy_var_4
 	) `HappyStk` happyRest}}
@@ -1397,9 +1451,9 @@ happyReduction_56 (happy_x_9 `HappyStk`
 	happy_x_2 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest)
-	 = case happyOut38 happy_x_2 of { happy_var_2 -> 
-	case happyOut44 happy_x_4 of { happy_var_4 -> 
-	case happyOut44 happy_x_7 of { happy_var_7 -> 
+	 = case happyOut38 happy_x_2 of { (HappyWrap38 happy_var_2) -> 
+	case happyOut44 happy_x_4 of { (HappyWrap44 happy_var_4) -> 
+	case happyOut44 happy_x_7 of { (HappyWrap44 happy_var_7) -> 
 	happyIn20
 		 (doJumpWithStack happy_var_2 happy_var_4 happy_var_7
 	) `HappyStk` happyRest}}}
@@ -1413,8 +1467,8 @@ happyReduction_57 (happy_x_6 `HappyStk`
 	happy_x_2 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest)
-	 = case happyOut38 happy_x_2 of { happy_var_2 -> 
-	case happyOut44 happy_x_4 of { happy_var_4 -> 
+	 = case happyOut38 happy_x_2 of { (HappyWrap38 happy_var_2) -> 
+	case happyOut44 happy_x_4 of { (HappyWrap44 happy_var_4) -> 
 	happyIn20
 		 (doCall happy_var_2 [] happy_var_4
 	) `HappyStk` happyRest}}
@@ -1432,9 +1486,9 @@ happyReduction_58 (happy_x_10 `HappyStk`
 	happy_x_2 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest)
-	 = case happyOut54 happy_x_2 of { happy_var_2 -> 
-	case happyOut38 happy_x_6 of { happy_var_6 -> 
-	case happyOut44 happy_x_8 of { happy_var_8 -> 
+	 = case happyOut54 happy_x_2 of { (HappyWrap54 happy_var_2) -> 
+	case happyOut38 happy_x_6 of { (HappyWrap38 happy_var_6) -> 
+	case happyOut44 happy_x_8 of { (HappyWrap44 happy_var_8) -> 
 	happyIn20
 		 (doCall happy_var_6 happy_var_2 happy_var_8
 	) `HappyStk` happyRest}}}
@@ -1447,8 +1501,8 @@ happyReduction_59 (happy_x_5 `HappyStk`
 	happy_x_2 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest)
-	 = case happyOut25 happy_x_2 of { happy_var_2 -> 
-	case happyOut37 happy_x_3 of { happy_var_3 -> 
+	 = case happyOut25 happy_x_2 of { (HappyWrap25 happy_var_2) -> 
+	case happyOut37 happy_x_3 of { (HappyWrap37 happy_var_3) -> 
 	case happyOutTok happy_x_5 of { (L _ (CmmT_Name        happy_var_5)) -> 
 	happyIn20
 		 (do l <- lookupLabel happy_var_5; cmmRawIf happy_var_2 l happy_var_3
@@ -1464,12 +1518,12 @@ happyReduction_60 (happy_x_7 `HappyStk`
 	happy_x_2 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest)
-	 = case happyOut25 happy_x_2 of { happy_var_2 -> 
-	case happyOut37 happy_x_3 of { happy_var_3 -> 
+	 = case happyOut25 happy_x_2 of { (HappyWrap25 happy_var_2) -> 
+	case happyOut37 happy_x_3 of { (HappyWrap37 happy_var_3) -> 
 	case happyOutTok happy_x_4 of { happy_var_4 -> 
-	case happyOut15 happy_x_5 of { happy_var_5 -> 
+	case happyOut15 happy_x_5 of { (HappyWrap15 happy_var_5) -> 
 	case happyOutTok happy_x_6 of { happy_var_6 -> 
-	case happyOut36 happy_x_7 of { happy_var_7 -> 
+	case happyOut36 happy_x_7 of { (HappyWrap36 happy_var_7) -> 
 	happyIn20
 		 (cmmIfThenElse happy_var_2 (withSourceNote happy_var_4 happy_var_6 happy_var_5) happy_var_7 happy_var_3
 	) `HappyStk` happyRest}}}}}}
@@ -1482,8 +1536,8 @@ happyReduction_61 (happy_x_5 `HappyStk`
 	happy_x_2 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest)
-	 = case happyOut44 happy_x_3 of { happy_var_3 -> 
-	case happyOut13 happy_x_5 of { happy_var_5 -> 
+	 = case happyOut44 happy_x_3 of { (HappyWrap44 happy_var_3) -> 
+	case happyOut13 happy_x_5 of { (HappyWrap13 happy_var_5) -> 
 	happyIn20
 		 (pushStackFrame happy_var_3 happy_var_5
 	) `HappyStk` happyRest}}
@@ -1496,9 +1550,9 @@ happyReduction_62 (happy_x_5 `HappyStk`
 	happy_x_2 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest)
-	 = case happyOut38 happy_x_2 of { happy_var_2 -> 
-	case happyOut51 happy_x_4 of { happy_var_4 -> 
-	case happyOut13 happy_x_5 of { happy_var_5 -> 
+	 = case happyOut38 happy_x_2 of { (HappyWrap38 happy_var_2) -> 
+	case happyOut51 happy_x_4 of { (HappyWrap51 happy_var_4) -> 
+	case happyOut13 happy_x_5 of { (HappyWrap13 happy_var_5) -> 
 	happyIn20
 		 (reserveStackFrame happy_var_2 happy_var_4 happy_var_5
 	) `HappyStk` happyRest}}}
@@ -1508,7 +1562,7 @@ happyReduce_63 = happySpecReduce_3  16# happyReduction_63
 happyReduction_63 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut21 happy_x_2 of { happy_var_2 -> 
+	 =  case happyOut21 happy_x_2 of { (HappyWrap21 happy_var_2) -> 
 	happyIn20
 		 (happy_var_2 >>= code . emitUnwind
 	)}
@@ -1522,8 +1576,8 @@ happyReduction_64 (happy_x_5 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest)
 	 = case happyOutTok happy_x_1 of { (L _ (CmmT_GlobalReg   happy_var_1)) -> 
-	case happyOut22 happy_x_3 of { happy_var_3 -> 
-	case happyOut21 happy_x_5 of { happy_var_5 -> 
+	case happyOut22 happy_x_3 of { (HappyWrap22 happy_var_3) -> 
+	case happyOut21 happy_x_5 of { (HappyWrap21 happy_var_5) -> 
 	happyIn21
 		 (do e <- happy_var_3; rest <- happy_var_5; return ((happy_var_1, e) : rest)
 	) `HappyStk` happyRest}}}
@@ -1534,7 +1588,7 @@ happyReduction_65 happy_x_3
 	happy_x_2
 	happy_x_1
 	 =  case happyOutTok happy_x_1 of { (L _ (CmmT_GlobalReg   happy_var_1)) -> 
-	case happyOut22 happy_x_3 of { happy_var_3 -> 
+	case happyOut22 happy_x_3 of { (HappyWrap22 happy_var_3) -> 
 	happyIn21
 		 (do e <- happy_var_3; return [(happy_var_1, e)]
 	)}}
@@ -1549,7 +1603,7 @@ happyReduction_66 happy_x_1
 happyReduce_67 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Exts.Int# -> Happy_IntList -> HappyStk (HappyAbsSyn ) -> PD (HappyAbsSyn )
 happyReduce_67 = happySpecReduce_1  18# happyReduction_67
 happyReduction_67 happy_x_1
-	 =  case happyOut38 happy_x_1 of { happy_var_1 -> 
+	 =  case happyOut38 happy_x_1 of { (HappyWrap38 happy_var_1) -> 
 	happyIn22
 		 (do e <- happy_var_1; return (Just e)
 	)}
@@ -1579,7 +1633,7 @@ happyReduction_70 happy_x_2
 happyReduce_71 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Exts.Int# -> Happy_IntList -> HappyStk (HappyAbsSyn ) -> PD (HappyAbsSyn )
 happyReduce_71 = happySpecReduce_1  21# happyReduction_71
 happyReduction_71 happy_x_1
-	 =  case happyOut26 happy_x_1 of { happy_var_1 -> 
+	 =  case happyOut26 happy_x_1 of { (HappyWrap26 happy_var_1) -> 
 	happyIn25
 		 (happy_var_1
 	)}
@@ -1587,7 +1641,7 @@ happyReduction_71 happy_x_1
 happyReduce_72 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Exts.Int# -> Happy_IntList -> HappyStk (HappyAbsSyn ) -> PD (HappyAbsSyn )
 happyReduce_72 = happySpecReduce_1  21# happyReduction_72
 happyReduction_72 happy_x_1
-	 =  case happyOut38 happy_x_1 of { happy_var_1 -> 
+	 =  case happyOut38 happy_x_1 of { (HappyWrap38 happy_var_1) -> 
 	happyIn25
 		 (do e <- happy_var_1; return (BoolTest e)
 	)}
@@ -1597,8 +1651,8 @@ happyReduce_73 = happySpecReduce_3  22# happyReduction_73
 happyReduction_73 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut25 happy_x_1 of { happy_var_1 -> 
-	case happyOut25 happy_x_3 of { happy_var_3 -> 
+	 =  case happyOut25 happy_x_1 of { (HappyWrap25 happy_var_1) -> 
+	case happyOut25 happy_x_3 of { (HappyWrap25 happy_var_3) -> 
 	happyIn26
 		 (do e1 <- happy_var_1; e2 <- happy_var_3; 
                                           return (BoolAnd e1 e2)
@@ -1609,8 +1663,8 @@ happyReduce_74 = happySpecReduce_3  22# happyReduction_74
 happyReduction_74 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut25 happy_x_1 of { happy_var_1 -> 
-	case happyOut25 happy_x_3 of { happy_var_3 -> 
+	 =  case happyOut25 happy_x_1 of { (HappyWrap25 happy_var_1) -> 
+	case happyOut25 happy_x_3 of { (HappyWrap25 happy_var_3) -> 
 	happyIn26
 		 (do e1 <- happy_var_1; e2 <- happy_var_3; 
                                           return (BoolOr e1 e2)
@@ -1620,7 +1674,7 @@ happyReduce_75 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Ext
 happyReduce_75 = happySpecReduce_2  22# happyReduction_75
 happyReduction_75 happy_x_2
 	happy_x_1
-	 =  case happyOut25 happy_x_2 of { happy_var_2 -> 
+	 =  case happyOut25 happy_x_2 of { (HappyWrap25 happy_var_2) -> 
 	happyIn26
 		 (do e <- happy_var_2; return (BoolNot e)
 	)}
@@ -1630,7 +1684,7 @@ happyReduce_76 = happySpecReduce_3  22# happyReduction_76
 happyReduction_76 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut26 happy_x_2 of { happy_var_2 -> 
+	 =  case happyOut26 happy_x_2 of { (HappyWrap26 happy_var_2) -> 
 	happyIn26
 		 (happy_var_2
 	)}
@@ -1672,7 +1726,7 @@ happyReduce_81 = happySpecReduce_3  24# happyReduction_81
 happyReduction_81 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut29 happy_x_2 of { happy_var_2 -> 
+	 =  case happyOut29 happy_x_2 of { (HappyWrap29 happy_var_2) -> 
 	happyIn28
 		 (happy_var_2
 	)}
@@ -1691,7 +1745,7 @@ happyReduction_83 happy_x_3
 	happy_x_2
 	happy_x_1
 	 =  case happyOutTok happy_x_1 of { (L _ (CmmT_GlobalReg   happy_var_1)) -> 
-	case happyOut29 happy_x_3 of { happy_var_3 -> 
+	case happyOut29 happy_x_3 of { (HappyWrap29 happy_var_3) -> 
 	happyIn29
 		 (happy_var_1 : happy_var_3
 	)}}
@@ -1726,8 +1780,8 @@ happyReduce_87 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Ext
 happyReduce_87 = happySpecReduce_2  27# happyReduction_87
 happyReduction_87 happy_x_2
 	happy_x_1
-	 =  case happyOut32 happy_x_1 of { happy_var_1 -> 
-	case happyOut31 happy_x_2 of { happy_var_2 -> 
+	 =  case happyOut32 happy_x_1 of { (HappyWrap32 happy_var_1) -> 
+	case happyOut31 happy_x_2 of { (HappyWrap31 happy_var_2) -> 
 	happyIn31
 		 (happy_var_1 : happy_var_2
 	)}}
@@ -1739,8 +1793,8 @@ happyReduction_88 (happy_x_4 `HappyStk`
 	happy_x_2 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest)
-	 = case happyOut34 happy_x_2 of { happy_var_2 -> 
-	case happyOut33 happy_x_4 of { happy_var_4 -> 
+	 = case happyOut34 happy_x_2 of { (HappyWrap34 happy_var_2) -> 
+	case happyOut33 happy_x_4 of { (HappyWrap33 happy_var_4) -> 
 	happyIn32
 		 (do b <- happy_var_4; return (happy_var_2, b)
 	) `HappyStk` happyRest}}
@@ -1751,7 +1805,7 @@ happyReduction_89 happy_x_3
 	happy_x_2
 	happy_x_1
 	 =  case happyOutTok happy_x_1 of { happy_var_1 -> 
-	case happyOut15 happy_x_2 of { happy_var_2 -> 
+	case happyOut15 happy_x_2 of { (HappyWrap15 happy_var_2) -> 
 	case happyOutTok happy_x_3 of { happy_var_3 -> 
 	happyIn33
 		 (return (Right (withSourceNote happy_var_1 happy_var_3 happy_var_2))
@@ -1781,7 +1835,7 @@ happyReduction_92 happy_x_3
 	happy_x_2
 	happy_x_1
 	 =  case happyOutTok happy_x_1 of { (L _ (CmmT_Int         happy_var_1)) -> 
-	case happyOut34 happy_x_3 of { happy_var_3 -> 
+	case happyOut34 happy_x_3 of { (HappyWrap34 happy_var_3) -> 
 	happyIn34
 		 (happy_var_1 : happy_var_3
 	)}}
@@ -1795,7 +1849,7 @@ happyReduction_93 (happy_x_5 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest)
 	 = case happyOutTok happy_x_3 of { happy_var_3 -> 
-	case happyOut15 happy_x_4 of { happy_var_4 -> 
+	case happyOut15 happy_x_4 of { (HappyWrap15 happy_var_4) -> 
 	case happyOutTok happy_x_5 of { happy_var_5 -> 
 	happyIn35
 		 (Just (withSourceNote happy_var_3 happy_var_5 happy_var_4)
@@ -1821,7 +1875,7 @@ happyReduction_96 (happy_x_4 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest)
 	 = case happyOutTok happy_x_2 of { happy_var_2 -> 
-	case happyOut15 happy_x_3 of { happy_var_3 -> 
+	case happyOut15 happy_x_3 of { (HappyWrap15 happy_var_3) -> 
 	case happyOutTok happy_x_4 of { happy_var_4 -> 
 	happyIn36
 		 (withSourceNote happy_var_2 happy_var_4 happy_var_3
@@ -1862,8 +1916,8 @@ happyReduce_100 = happySpecReduce_3  34# happyReduction_100
 happyReduction_100 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut38 happy_x_1 of { happy_var_1 -> 
-	case happyOut38 happy_x_3 of { happy_var_3 -> 
+	 =  case happyOut38 happy_x_1 of { (HappyWrap38 happy_var_1) -> 
+	case happyOut38 happy_x_3 of { (HappyWrap38 happy_var_3) -> 
 	happyIn38
 		 (mkMachOp MO_U_Quot [happy_var_1,happy_var_3]
 	)}}
@@ -1873,8 +1927,8 @@ happyReduce_101 = happySpecReduce_3  34# happyReduction_101
 happyReduction_101 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut38 happy_x_1 of { happy_var_1 -> 
-	case happyOut38 happy_x_3 of { happy_var_3 -> 
+	 =  case happyOut38 happy_x_1 of { (HappyWrap38 happy_var_1) -> 
+	case happyOut38 happy_x_3 of { (HappyWrap38 happy_var_3) -> 
 	happyIn38
 		 (mkMachOp MO_Mul [happy_var_1,happy_var_3]
 	)}}
@@ -1884,8 +1938,8 @@ happyReduce_102 = happySpecReduce_3  34# happyReduction_102
 happyReduction_102 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut38 happy_x_1 of { happy_var_1 -> 
-	case happyOut38 happy_x_3 of { happy_var_3 -> 
+	 =  case happyOut38 happy_x_1 of { (HappyWrap38 happy_var_1) -> 
+	case happyOut38 happy_x_3 of { (HappyWrap38 happy_var_3) -> 
 	happyIn38
 		 (mkMachOp MO_U_Rem [happy_var_1,happy_var_3]
 	)}}
@@ -1895,8 +1949,8 @@ happyReduce_103 = happySpecReduce_3  34# happyReduction_103
 happyReduction_103 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut38 happy_x_1 of { happy_var_1 -> 
-	case happyOut38 happy_x_3 of { happy_var_3 -> 
+	 =  case happyOut38 happy_x_1 of { (HappyWrap38 happy_var_1) -> 
+	case happyOut38 happy_x_3 of { (HappyWrap38 happy_var_3) -> 
 	happyIn38
 		 (mkMachOp MO_Sub [happy_var_1,happy_var_3]
 	)}}
@@ -1906,8 +1960,8 @@ happyReduce_104 = happySpecReduce_3  34# happyReduction_104
 happyReduction_104 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut38 happy_x_1 of { happy_var_1 -> 
-	case happyOut38 happy_x_3 of { happy_var_3 -> 
+	 =  case happyOut38 happy_x_1 of { (HappyWrap38 happy_var_1) -> 
+	case happyOut38 happy_x_3 of { (HappyWrap38 happy_var_3) -> 
 	happyIn38
 		 (mkMachOp MO_Add [happy_var_1,happy_var_3]
 	)}}
@@ -1917,8 +1971,8 @@ happyReduce_105 = happySpecReduce_3  34# happyReduction_105
 happyReduction_105 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut38 happy_x_1 of { happy_var_1 -> 
-	case happyOut38 happy_x_3 of { happy_var_3 -> 
+	 =  case happyOut38 happy_x_1 of { (HappyWrap38 happy_var_1) -> 
+	case happyOut38 happy_x_3 of { (HappyWrap38 happy_var_3) -> 
 	happyIn38
 		 (mkMachOp MO_U_Shr [happy_var_1,happy_var_3]
 	)}}
@@ -1928,8 +1982,8 @@ happyReduce_106 = happySpecReduce_3  34# happyReduction_106
 happyReduction_106 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut38 happy_x_1 of { happy_var_1 -> 
-	case happyOut38 happy_x_3 of { happy_var_3 -> 
+	 =  case happyOut38 happy_x_1 of { (HappyWrap38 happy_var_1) -> 
+	case happyOut38 happy_x_3 of { (HappyWrap38 happy_var_3) -> 
 	happyIn38
 		 (mkMachOp MO_Shl [happy_var_1,happy_var_3]
 	)}}
@@ -1939,8 +1993,8 @@ happyReduce_107 = happySpecReduce_3  34# happyReduction_107
 happyReduction_107 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut38 happy_x_1 of { happy_var_1 -> 
-	case happyOut38 happy_x_3 of { happy_var_3 -> 
+	 =  case happyOut38 happy_x_1 of { (HappyWrap38 happy_var_1) -> 
+	case happyOut38 happy_x_3 of { (HappyWrap38 happy_var_3) -> 
 	happyIn38
 		 (mkMachOp MO_And [happy_var_1,happy_var_3]
 	)}}
@@ -1950,8 +2004,8 @@ happyReduce_108 = happySpecReduce_3  34# happyReduction_108
 happyReduction_108 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut38 happy_x_1 of { happy_var_1 -> 
-	case happyOut38 happy_x_3 of { happy_var_3 -> 
+	 =  case happyOut38 happy_x_1 of { (HappyWrap38 happy_var_1) -> 
+	case happyOut38 happy_x_3 of { (HappyWrap38 happy_var_3) -> 
 	happyIn38
 		 (mkMachOp MO_Xor [happy_var_1,happy_var_3]
 	)}}
@@ -1961,8 +2015,8 @@ happyReduce_109 = happySpecReduce_3  34# happyReduction_109
 happyReduction_109 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut38 happy_x_1 of { happy_var_1 -> 
-	case happyOut38 happy_x_3 of { happy_var_3 -> 
+	 =  case happyOut38 happy_x_1 of { (HappyWrap38 happy_var_1) -> 
+	case happyOut38 happy_x_3 of { (HappyWrap38 happy_var_3) -> 
 	happyIn38
 		 (mkMachOp MO_Or [happy_var_1,happy_var_3]
 	)}}
@@ -1972,8 +2026,8 @@ happyReduce_110 = happySpecReduce_3  34# happyReduction_110
 happyReduction_110 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut38 happy_x_1 of { happy_var_1 -> 
-	case happyOut38 happy_x_3 of { happy_var_3 -> 
+	 =  case happyOut38 happy_x_1 of { (HappyWrap38 happy_var_1) -> 
+	case happyOut38 happy_x_3 of { (HappyWrap38 happy_var_3) -> 
 	happyIn38
 		 (mkMachOp MO_U_Ge [happy_var_1,happy_var_3]
 	)}}
@@ -1983,8 +2037,8 @@ happyReduce_111 = happySpecReduce_3  34# happyReduction_111
 happyReduction_111 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut38 happy_x_1 of { happy_var_1 -> 
-	case happyOut38 happy_x_3 of { happy_var_3 -> 
+	 =  case happyOut38 happy_x_1 of { (HappyWrap38 happy_var_1) -> 
+	case happyOut38 happy_x_3 of { (HappyWrap38 happy_var_3) -> 
 	happyIn38
 		 (mkMachOp MO_U_Gt [happy_var_1,happy_var_3]
 	)}}
@@ -1994,8 +2048,8 @@ happyReduce_112 = happySpecReduce_3  34# happyReduction_112
 happyReduction_112 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut38 happy_x_1 of { happy_var_1 -> 
-	case happyOut38 happy_x_3 of { happy_var_3 -> 
+	 =  case happyOut38 happy_x_1 of { (HappyWrap38 happy_var_1) -> 
+	case happyOut38 happy_x_3 of { (HappyWrap38 happy_var_3) -> 
 	happyIn38
 		 (mkMachOp MO_U_Le [happy_var_1,happy_var_3]
 	)}}
@@ -2005,8 +2059,8 @@ happyReduce_113 = happySpecReduce_3  34# happyReduction_113
 happyReduction_113 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut38 happy_x_1 of { happy_var_1 -> 
-	case happyOut38 happy_x_3 of { happy_var_3 -> 
+	 =  case happyOut38 happy_x_1 of { (HappyWrap38 happy_var_1) -> 
+	case happyOut38 happy_x_3 of { (HappyWrap38 happy_var_3) -> 
 	happyIn38
 		 (mkMachOp MO_U_Lt [happy_var_1,happy_var_3]
 	)}}
@@ -2016,8 +2070,8 @@ happyReduce_114 = happySpecReduce_3  34# happyReduction_114
 happyReduction_114 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut38 happy_x_1 of { happy_var_1 -> 
-	case happyOut38 happy_x_3 of { happy_var_3 -> 
+	 =  case happyOut38 happy_x_1 of { (HappyWrap38 happy_var_1) -> 
+	case happyOut38 happy_x_3 of { (HappyWrap38 happy_var_3) -> 
 	happyIn38
 		 (mkMachOp MO_Ne [happy_var_1,happy_var_3]
 	)}}
@@ -2027,8 +2081,8 @@ happyReduce_115 = happySpecReduce_3  34# happyReduction_115
 happyReduction_115 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut38 happy_x_1 of { happy_var_1 -> 
-	case happyOut38 happy_x_3 of { happy_var_3 -> 
+	 =  case happyOut38 happy_x_1 of { (HappyWrap38 happy_var_1) -> 
+	case happyOut38 happy_x_3 of { (HappyWrap38 happy_var_3) -> 
 	happyIn38
 		 (mkMachOp MO_Eq [happy_var_1,happy_var_3]
 	)}}
@@ -2037,7 +2091,7 @@ happyReduce_116 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Ex
 happyReduce_116 = happySpecReduce_2  34# happyReduction_116
 happyReduction_116 happy_x_2
 	happy_x_1
-	 =  case happyOut38 happy_x_2 of { happy_var_2 -> 
+	 =  case happyOut38 happy_x_2 of { (HappyWrap38 happy_var_2) -> 
 	happyIn38
 		 (mkMachOp MO_Not [happy_var_2]
 	)}
@@ -2046,7 +2100,7 @@ happyReduce_117 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Ex
 happyReduce_117 = happySpecReduce_2  34# happyReduction_117
 happyReduction_117 happy_x_2
 	happy_x_1
-	 =  case happyOut38 happy_x_2 of { happy_var_2 -> 
+	 =  case happyOut38 happy_x_2 of { (HappyWrap38 happy_var_2) -> 
 	happyIn38
 		 (mkMachOp MO_S_Neg [happy_var_2]
 	)}
@@ -2059,9 +2113,9 @@ happyReduction_118 (happy_x_5 `HappyStk`
 	happy_x_2 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest) tk
-	 = happyThen ((case happyOut39 happy_x_1 of { happy_var_1 -> 
+	 = happyThen ((case happyOut39 happy_x_1 of { (HappyWrap39 happy_var_1) -> 
 	case happyOutTok happy_x_3 of { (L _ (CmmT_Name        happy_var_3)) -> 
-	case happyOut39 happy_x_5 of { happy_var_5 -> 
+	case happyOut39 happy_x_5 of { (HappyWrap39 happy_var_5) -> 
 	( do { mo <- nameToMachOp happy_var_3 ;
                                                 return (mkMachOp mo [happy_var_1,happy_var_5]) })}}})
 	) (\r -> happyReturn (happyIn38 r))
@@ -2069,7 +2123,7 @@ happyReduction_118 (happy_x_5 `HappyStk`
 happyReduce_119 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Exts.Int# -> Happy_IntList -> HappyStk (HappyAbsSyn ) -> PD (HappyAbsSyn )
 happyReduce_119 = happySpecReduce_1  34# happyReduction_119
 happyReduction_119 happy_x_1
-	 =  case happyOut39 happy_x_1 of { happy_var_1 -> 
+	 =  case happyOut39 happy_x_1 of { (HappyWrap39 happy_var_1) -> 
 	happyIn38
 		 (happy_var_1
 	)}
@@ -2079,7 +2133,7 @@ happyReduce_120 = happySpecReduce_2  35# happyReduction_120
 happyReduction_120 happy_x_2
 	happy_x_1
 	 =  case happyOutTok happy_x_1 of { (L _ (CmmT_Int         happy_var_1)) -> 
-	case happyOut40 happy_x_2 of { happy_var_2 -> 
+	case happyOut40 happy_x_2 of { (HappyWrap40 happy_var_2) -> 
 	happyIn39
 		 (return (CmmLit (CmmInt happy_var_1 (typeWidth happy_var_2)))
 	)}}
@@ -2089,7 +2143,7 @@ happyReduce_121 = happySpecReduce_2  35# happyReduction_121
 happyReduction_121 happy_x_2
 	happy_x_1
 	 =  case happyOutTok happy_x_1 of { (L _ (CmmT_Float       happy_var_1)) -> 
-	case happyOut40 happy_x_2 of { happy_var_2 -> 
+	case happyOut40 happy_x_2 of { (HappyWrap40 happy_var_2) -> 
 	happyIn39
 		 (return (CmmLit (CmmFloat happy_var_1 (typeWidth happy_var_2)))
 	)}}
@@ -2106,7 +2160,7 @@ happyReduction_122 happy_x_1
 happyReduce_123 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Exts.Int# -> Happy_IntList -> HappyStk (HappyAbsSyn ) -> PD (HappyAbsSyn )
 happyReduce_123 = happySpecReduce_1  35# happyReduction_123
 happyReduction_123 happy_x_1
-	 =  case happyOut46 happy_x_1 of { happy_var_1 -> 
+	 =  case happyOut46 happy_x_1 of { (HappyWrap46 happy_var_1) -> 
 	happyIn39
 		 (happy_var_1
 	)}
@@ -2118,8 +2172,8 @@ happyReduction_124 (happy_x_4 `HappyStk`
 	happy_x_2 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest)
-	 = case happyOut56 happy_x_1 of { happy_var_1 -> 
-	case happyOut38 happy_x_3 of { happy_var_3 -> 
+	 = case happyOut56 happy_x_1 of { (HappyWrap56 happy_var_1) -> 
+	case happyOut38 happy_x_3 of { (HappyWrap38 happy_var_3) -> 
 	happyIn39
 		 (do e <- happy_var_3; return (CmmLoad e happy_var_1)
 	) `HappyStk` happyRest}}
@@ -2133,7 +2187,7 @@ happyReduction_125 (happy_x_5 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest) tk
 	 = happyThen ((case happyOutTok happy_x_2 of { (L _ (CmmT_Name        happy_var_2)) -> 
-	case happyOut44 happy_x_4 of { happy_var_4 -> 
+	case happyOut44 happy_x_4 of { (HappyWrap44 happy_var_4) -> 
 	( exprOp happy_var_2 happy_var_4)}})
 	) (\r -> happyReturn (happyIn39 r))
 
@@ -2142,7 +2196,7 @@ happyReduce_126 = happySpecReduce_3  35# happyReduction_126
 happyReduction_126 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut38 happy_x_2 of { happy_var_2 -> 
+	 =  case happyOut38 happy_x_2 of { (HappyWrap38 happy_var_2) -> 
 	happyIn39
 		 (happy_var_2
 	)}
@@ -2157,7 +2211,7 @@ happyReduce_128 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Ex
 happyReduce_128 = happySpecReduce_2  36# happyReduction_128
 happyReduction_128 happy_x_2
 	happy_x_1
-	 =  case happyOut56 happy_x_2 of { happy_var_2 -> 
+	 =  case happyOut56 happy_x_2 of { (HappyWrap56 happy_var_2) -> 
 	happyIn40
 		 (happy_var_2
 	)}
@@ -2171,7 +2225,7 @@ happyReduction_129  =  happyIn41
 happyReduce_130 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Exts.Int# -> Happy_IntList -> HappyStk (HappyAbsSyn ) -> PD (HappyAbsSyn )
 happyReduce_130 = happySpecReduce_1  37# happyReduction_130
 happyReduction_130 happy_x_1
-	 =  case happyOut42 happy_x_1 of { happy_var_1 -> 
+	 =  case happyOut42 happy_x_1 of { (HappyWrap42 happy_var_1) -> 
 	happyIn41
 		 (happy_var_1
 	)}
@@ -2179,7 +2233,7 @@ happyReduction_130 happy_x_1
 happyReduce_131 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Exts.Int# -> Happy_IntList -> HappyStk (HappyAbsSyn ) -> PD (HappyAbsSyn )
 happyReduce_131 = happySpecReduce_1  38# happyReduction_131
 happyReduction_131 happy_x_1
-	 =  case happyOut43 happy_x_1 of { happy_var_1 -> 
+	 =  case happyOut43 happy_x_1 of { (HappyWrap43 happy_var_1) -> 
 	happyIn42
 		 ([happy_var_1]
 	)}
@@ -2189,8 +2243,8 @@ happyReduce_132 = happySpecReduce_3  38# happyReduction_132
 happyReduction_132 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut43 happy_x_1 of { happy_var_1 -> 
-	case happyOut42 happy_x_3 of { happy_var_3 -> 
+	 =  case happyOut43 happy_x_1 of { (HappyWrap43 happy_var_1) -> 
+	case happyOut42 happy_x_3 of { (HappyWrap42 happy_var_3) -> 
 	happyIn42
 		 (happy_var_1 : happy_var_3
 	)}}
@@ -2198,7 +2252,7 @@ happyReduction_132 happy_x_3
 happyReduce_133 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Exts.Int# -> Happy_IntList -> HappyStk (HappyAbsSyn ) -> PD (HappyAbsSyn )
 happyReduce_133 = happySpecReduce_1  39# happyReduction_133
 happyReduction_133 happy_x_1
-	 =  case happyOut38 happy_x_1 of { happy_var_1 -> 
+	 =  case happyOut38 happy_x_1 of { (HappyWrap38 happy_var_1) -> 
 	happyIn43
 		 (do e <- happy_var_1;
                                              return (e, inferCmmHint e)
@@ -2209,7 +2263,7 @@ happyReduce_134 = happyMonadReduce 2# 39# happyReduction_134
 happyReduction_134 (happy_x_2 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest) tk
-	 = happyThen ((case happyOut38 happy_x_1 of { happy_var_1 -> 
+	 = happyThen ((case happyOut38 happy_x_1 of { (HappyWrap38 happy_var_1) -> 
 	case happyOutTok happy_x_2 of { (L _ (CmmT_String      happy_var_2)) -> 
 	( do h <- parseCmmHint happy_var_2;
                                               return $ do
@@ -2225,7 +2279,7 @@ happyReduction_135  =  happyIn44
 happyReduce_136 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Exts.Int# -> Happy_IntList -> HappyStk (HappyAbsSyn ) -> PD (HappyAbsSyn )
 happyReduce_136 = happySpecReduce_1  40# happyReduction_136
 happyReduction_136 happy_x_1
-	 =  case happyOut45 happy_x_1 of { happy_var_1 -> 
+	 =  case happyOut45 happy_x_1 of { (HappyWrap45 happy_var_1) -> 
 	happyIn44
 		 (happy_var_1
 	)}
@@ -2233,7 +2287,7 @@ happyReduction_136 happy_x_1
 happyReduce_137 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Exts.Int# -> Happy_IntList -> HappyStk (HappyAbsSyn ) -> PD (HappyAbsSyn )
 happyReduce_137 = happySpecReduce_1  41# happyReduction_137
 happyReduction_137 happy_x_1
-	 =  case happyOut38 happy_x_1 of { happy_var_1 -> 
+	 =  case happyOut38 happy_x_1 of { (HappyWrap38 happy_var_1) -> 
 	happyIn45
 		 ([ happy_var_1 ]
 	)}
@@ -2243,8 +2297,8 @@ happyReduce_138 = happySpecReduce_3  41# happyReduction_138
 happyReduction_138 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut38 happy_x_1 of { happy_var_1 -> 
-	case happyOut45 happy_x_3 of { happy_var_3 -> 
+	 =  case happyOut38 happy_x_1 of { (HappyWrap38 happy_var_1) -> 
+	case happyOut45 happy_x_3 of { (HappyWrap45 happy_var_3) -> 
 	happyIn45
 		 (happy_var_1 : happy_var_3
 	)}}
@@ -2278,7 +2332,7 @@ happyReduction_142 (happy_x_4 `HappyStk`
 	happy_x_2 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest)
-	 = case happyOut48 happy_x_2 of { happy_var_2 -> 
+	 = case happyOut48 happy_x_2 of { (HappyWrap48 happy_var_2) -> 
 	happyIn47
 		 (happy_var_2
 	) `HappyStk` happyRest}
@@ -2286,7 +2340,7 @@ happyReduction_142 (happy_x_4 `HappyStk`
 happyReduce_143 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Exts.Int# -> Happy_IntList -> HappyStk (HappyAbsSyn ) -> PD (HappyAbsSyn )
 happyReduce_143 = happySpecReduce_1  44# happyReduction_143
 happyReduction_143 happy_x_1
-	 =  case happyOut49 happy_x_1 of { happy_var_1 -> 
+	 =  case happyOut49 happy_x_1 of { (HappyWrap49 happy_var_1) -> 
 	happyIn48
 		 ([happy_var_1]
 	)}
@@ -2295,7 +2349,7 @@ happyReduce_144 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Ex
 happyReduce_144 = happySpecReduce_2  44# happyReduction_144
 happyReduction_144 happy_x_2
 	happy_x_1
-	 =  case happyOut49 happy_x_1 of { happy_var_1 -> 
+	 =  case happyOut49 happy_x_1 of { (HappyWrap49 happy_var_1) -> 
 	happyIn48
 		 ([happy_var_1]
 	)}
@@ -2305,8 +2359,8 @@ happyReduce_145 = happySpecReduce_3  44# happyReduction_145
 happyReduction_145 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut49 happy_x_1 of { happy_var_1 -> 
-	case happyOut48 happy_x_3 of { happy_var_3 -> 
+	 =  case happyOut49 happy_x_1 of { (HappyWrap49 happy_var_1) -> 
+	case happyOut48 happy_x_3 of { (HappyWrap48 happy_var_3) -> 
 	happyIn48
 		 (happy_var_1 : happy_var_3
 	)}}
@@ -2314,7 +2368,7 @@ happyReduction_145 happy_x_3
 happyReduce_146 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Exts.Int# -> Happy_IntList -> HappyStk (HappyAbsSyn ) -> PD (HappyAbsSyn )
 happyReduce_146 = happySpecReduce_1  45# happyReduction_146
 happyReduction_146 happy_x_1
-	 =  case happyOut50 happy_x_1 of { happy_var_1 -> 
+	 =  case happyOut50 happy_x_1 of { (HappyWrap50 happy_var_1) -> 
 	happyIn49
 		 (do e <- happy_var_1; return (e, (inferCmmHint (CmmReg (CmmLocal e))))
 	)}
@@ -2325,7 +2379,7 @@ happyReduction_147 (happy_x_2 `HappyStk`
 	happy_x_1 `HappyStk`
 	happyRest) tk
 	 = happyThen ((case happyOutTok happy_x_1 of { (L _ (CmmT_String      happy_var_1)) -> 
-	case happyOut50 happy_x_2 of { happy_var_2 -> 
+	case happyOut50 happy_x_2 of { (HappyWrap50 happy_var_2) -> 
 	( do h <- parseCmmHint happy_var_1;
                                       return $ do
                                          e <- happy_var_2; return (e,h))}})
@@ -2374,7 +2428,7 @@ happyReduce_152 = happySpecReduce_3  48# happyReduction_152
 happyReduction_152 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut53 happy_x_2 of { happy_var_2 -> 
+	 =  case happyOut53 happy_x_2 of { (HappyWrap53 happy_var_2) -> 
 	happyIn52
 		 (Just happy_var_2
 	)}
@@ -2388,7 +2442,7 @@ happyReduction_153  =  happyIn53
 happyReduce_154 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Exts.Int# -> Happy_IntList -> HappyStk (HappyAbsSyn ) -> PD (HappyAbsSyn )
 happyReduce_154 = happySpecReduce_1  49# happyReduction_154
 happyReduction_154 happy_x_1
-	 =  case happyOut54 happy_x_1 of { happy_var_1 -> 
+	 =  case happyOut54 happy_x_1 of { (HappyWrap54 happy_var_1) -> 
 	happyIn53
 		 (happy_var_1
 	)}
@@ -2397,7 +2451,7 @@ happyReduce_155 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Ex
 happyReduce_155 = happySpecReduce_2  50# happyReduction_155
 happyReduction_155 happy_x_2
 	happy_x_1
-	 =  case happyOut55 happy_x_1 of { happy_var_1 -> 
+	 =  case happyOut55 happy_x_1 of { (HappyWrap55 happy_var_1) -> 
 	happyIn54
 		 ([happy_var_1]
 	)}
@@ -2405,7 +2459,7 @@ happyReduction_155 happy_x_2
 happyReduce_156 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Exts.Int# -> Happy_IntList -> HappyStk (HappyAbsSyn ) -> PD (HappyAbsSyn )
 happyReduce_156 = happySpecReduce_1  50# happyReduction_156
 happyReduction_156 happy_x_1
-	 =  case happyOut55 happy_x_1 of { happy_var_1 -> 
+	 =  case happyOut55 happy_x_1 of { (HappyWrap55 happy_var_1) -> 
 	happyIn54
 		 ([happy_var_1]
 	)}
@@ -2415,8 +2469,8 @@ happyReduce_157 = happySpecReduce_3  50# happyReduction_157
 happyReduction_157 happy_x_3
 	happy_x_2
 	happy_x_1
-	 =  case happyOut55 happy_x_1 of { happy_var_1 -> 
-	case happyOut54 happy_x_3 of { happy_var_3 -> 
+	 =  case happyOut55 happy_x_1 of { (HappyWrap55 happy_var_1) -> 
+	case happyOut54 happy_x_3 of { (HappyWrap54 happy_var_3) -> 
 	happyIn54
 		 (happy_var_1 : happy_var_3
 	)}}
@@ -2425,7 +2479,7 @@ happyReduce_158 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Ex
 happyReduce_158 = happySpecReduce_2  51# happyReduction_158
 happyReduction_158 happy_x_2
 	happy_x_1
-	 =  case happyOut56 happy_x_1 of { happy_var_1 -> 
+	 =  case happyOut56 happy_x_1 of { (HappyWrap56 happy_var_1) -> 
 	case happyOutTok happy_x_2 of { (L _ (CmmT_Name        happy_var_2)) -> 
 	happyIn55
 		 (newLocal happy_var_1 happy_var_2
@@ -2441,7 +2495,7 @@ happyReduction_159 happy_x_1
 happyReduce_160 :: () => Happy_GHC_Exts.Int# -> Located CmmToken -> Happy_GHC_Exts.Int# -> Happy_IntList -> HappyStk (HappyAbsSyn ) -> PD (HappyAbsSyn )
 happyReduce_160 = happySpecReduce_1  52# happyReduction_160
 happyReduction_160 happy_x_1
-	 =  case happyOut57 happy_x_1 of { happy_var_1 -> 
+	 =  case happyOut57 happy_x_1 of { (HappyWrap57 happy_var_1) -> 
 	happyIn56
 		 (happy_var_1
 	)}
@@ -2615,7 +2669,7 @@ happyReturn1 = happyReturn
 happyError' :: () => ((Located CmmToken), [String]) -> PD a
 happyError' tk = (\(tokens, explist) -> happyError) tk
 cmmParse = happySomeParser where
- happySomeParser = happyThen (happyParse 0#) (\x -> happyReturn (happyOut4 x))
+ happySomeParser = happyThen (happyParse 0#) (\x -> happyReturn (let {(HappyWrap4 x') = happyOut4 x} in x'))
 
 happySeq = happyDoSeq
 
@@ -2759,6 +2813,7 @@ machOps = listToUFM $
 callishMachOps :: UniqFM ([CmmExpr] -> (CallishMachOp, [CmmExpr]))
 callishMachOps = listToUFM $
         map (\(x, y) -> (mkFastString x, y)) [
+        ( "read_barrier", (,) MO_ReadBarrier ),
         ( "write_barrier", (,) MO_WriteBarrier ),
         ( "memcpy", memcpyLikeTweakArgs MO_Memcpy ),
         ( "memset", memcpyLikeTweakArgs MO_Memset ),
@@ -3204,10 +3259,10 @@ parseCmmFile dflags filename = withTiming (pure dflags) (text "ParseCmm"<+>brack
 {-# LINE 1 "templates/GenericTemplate.hs" #-}
 {-# LINE 1 "<built-in>" #-}
 {-# LINE 1 "<command-line>" #-}
-{-# LINE 11 "<command-line>" #-}
-# 1 "/nix/store/sr4253np2gz2bpha4gn8gqlmiw604155-glibc-2.27-dev/include/stdc-predef.h" 1 3 4
+{-# LINE 10 "<command-line>" #-}
+# 1 "/usr/include/stdc-predef.h" 1 3 4
 
-# 17 "/nix/store/sr4253np2gz2bpha4gn8gqlmiw604155-glibc-2.27-dev/include/stdc-predef.h" 3 4
+# 17 "/usr/include/stdc-predef.h" 3 4
 
 
 
@@ -3253,9 +3308,9 @@ parseCmmFile dflags filename = withTiming (pure dflags) (text "ParseCmm"<+>brack
 
 
 
+{-# LINE 10 "<command-line>" #-}
+{-# LINE 1 "/opt/ghc/8.4.4/lib/ghc-8.4.4/include/ghcversion.h" #-}
 
-{-# LINE 11 "<command-line>" #-}
-{-# LINE 1 "/nix/store/d9syi687jirk386a9hgr96yqhw6mx243-ghc-8.4.4/lib/ghc-8.4.4/include/ghcversion.h" #-}
 
 
 
@@ -3270,190 +3325,7 @@ parseCmmFile dflags filename = withTiming (pure dflags) (text "ParseCmm"<+>brack
 
 
 
-
-{-# LINE 11 "<command-line>" #-}
-{-# LINE 1 "/build/ghc1606_0/ghc_2.h" #-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-{-# LINE 11 "<command-line>" #-}
+{-# LINE 10 "<command-line>" #-}
 {-# LINE 1 "templates/GenericTemplate.hs" #-}
 -- Id: GenericTemplate.hs,v 1.26 2005/01/14 14:47:22 simonmar Exp 
 

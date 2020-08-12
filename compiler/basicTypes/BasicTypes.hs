@@ -28,6 +28,7 @@ module BasicTypes(
 
         Alignment,
 
+        PromotionFlag(..), isPromoted,
         FunctionOrData(..),
 
         WarningTxt(..), pprWarningTxtForMsg, StringLiteral(..),
@@ -81,6 +82,7 @@ module BasicTypes(
 
         Activation(..), isActive, isActiveIn, competesWith,
         isNeverActive, isAlwaysActive, isEarlyActive,
+        activeAfterInitial, activeDuringFinal,
 
         RuleMatchInfo(..), isConLike, isFunLike,
         InlineSpec(..), noUserInlineSpec,
@@ -269,6 +271,24 @@ unSwap :: SwapFlag -> (a->a->b) -> a -> a -> b
 unSwap NotSwapped f a b = f a b
 unSwap IsSwapped  f a b = f b a
 
+
+{- *********************************************************************
+*                                                                      *
+           Promotion flag
+*                                                                      *
+********************************************************************* -}
+
+-- | Is a TyCon a promoted data constructor or just a normal type constructor?
+data PromotionFlag
+  = NotPromoted
+  | IsPromoted
+  deriving ( Eq, Data )
+
+isPromoted :: PromotionFlag -> Bool
+isPromoted IsPromoted  = True
+isPromoted NotPromoted = False
+
+
 {-
 ************************************************************************
 *                                                                      *
@@ -409,7 +429,7 @@ defaultFixity = Fixity NoSourceText maxPrecedence InfixL
 negateFixity, funTyFixity :: Fixity
 -- Wired-in fixities
 negateFixity = Fixity NoSourceText 6 InfixL  -- Fixity of unary negate
-funTyFixity  = Fixity NoSourceText 0 InfixR  -- Fixity of '->'
+funTyFixity  = Fixity NoSourceText (-1) InfixR  -- Fixity of '->', see #15235
 
 {-
 Consider
@@ -1142,6 +1162,15 @@ instance Outputable CompilerPhase where
    ppr (Phase n)    = int n
    ppr InitialPhase = text "InitialPhase"
 
+activeAfterInitial :: Activation
+-- Active in the first phase after the initial phase
+-- Currently we have just phases [2,1,0]
+activeAfterInitial = ActiveAfter NoSourceText 2
+
+activeDuringFinal :: Activation
+-- Active in the final simplification phase (which is repeated)
+activeDuringFinal = ActiveAfter NoSourceText 0
+
 -- See note [Pragma source text]
 data Activation = NeverActive
                 | AlwaysActive
@@ -1248,7 +1277,7 @@ The main effects of CONLIKE are:
     - The occurrence analyser (OccAnal) and simplifier (Simplify) treat
       CONLIKE thing like constructors, by ANF-ing them
 
-    - New function coreUtils.exprIsExpandable is like exprIsCheap, but
+    - New function CoreUtils.exprIsExpandable is like exprIsCheap, but
       additionally spots applications of CONLIKE functions
 
     - A CoreUnfolding has a field that caches exprIsExpandable
