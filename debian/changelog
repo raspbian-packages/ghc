@@ -1,11 +1,23 @@
-ghc (8.8.3-3+rpi1) bullseye-staging; urgency=medium
+ghc (8.8.4-1+rpi1) bullseye-staging; urgency=medium
 
   [changes brought forward from 7.6.3-21+rpi1 by Peter Michael Green <plugwash@raspbian.org> at Sun, 19 Apr 2015 14:00:16 +0000]
   * Change compiler defaults for armv6
   [changed introduced in 7.10.3-2+rpi1 by Peter Michael Green]
   * Add call to dh_autoreconf_clean
 
- -- Raspbian forward porter <root@raspbian.org>  Wed, 12 Aug 2020 23:11:38 +0000
+ -- Raspbian forward porter <root@raspbian.org>  Sat, 17 Oct 2020 14:42:05 +0000
+
+ghc (8.8.4-1) unstable; urgency=medium
+
+  * New upstream release
+  * Fix gen_contents_index to use ghc-pkg to parse the package database
+    (Closes: #966069)
+  * Use locally-installed MathJax.js when generating library docs
+    (Closes: #890627)
+  * Patch Haddock to remove hard-coded googleapis font URL (Closes: #963690)
+  * Backport upstream patch to fix FFI on unregisterised big endian machines
+
+ -- Ilias Tsitsimpis <iliastsi@debian.org>  Tue, 11 Aug 2020 17:12:43 +0300
 
 ghc (8.8.3-3) unstable; urgency=medium
 

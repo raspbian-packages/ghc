@@ -524,20 +524,43 @@ mkFExportCBits dflags c_nm maybe_target arg_htys res_hty is_IO_res_ty cc
          -- use that instead.  I hope the two coincide --SDM
     )
  where
+  platform = targetPlatform dflags
+
   -- list the arguments to the C function
   arg_info :: [(SDoc,           -- arg name
                 SDoc,           -- C type
                 Type,           -- Haskell type
                 CmmType)]       -- the CmmType
-  arg_info  = [ let stg_type = showStgType ty in
-                (arg_cname n stg_type,
+  arg_info  = [ let stg_type = showStgType ty
+                    cmm_type = typeCmmType dflags (getPrimTyOf ty)
+                    stack_type
+                      = if int_promote (typeTyCon ty)
+                        then text "HsWord"
+                        else stg_type
+                in
+                (arg_cname n stg_type stack_type,
                  stg_type,
                  ty,
-                 typeCmmType dflags (getPrimTyOf ty))
+                 cmm_type)
               | (ty,n) <- zip arg_htys [1::Int ..] ]
 
-  arg_cname n stg_ty
-        | libffi    = char '*' <> parens (stg_ty <> char '*') <>
+  int_promote ty_con
+    | ty_con `hasKey` int8TyConKey = True
+    | ty_con `hasKey` int16TyConKey = True
+    | ty_con `hasKey` int32TyConKey
+    , platformWordSize platform > 4
+    = True
+    | ty_con `hasKey` word8TyConKey = True
+    | ty_con `hasKey` word16TyConKey = True
+    | ty_con `hasKey` word32TyConKey
+    , platformWordSize platform > 4
+    = True
+    | otherwise = False
+
+
+  arg_cname n stg_ty stack_ty
+        | libffi    = parens (stg_ty) <> char '*' <>
+                      parens (stack_ty <> char '*') <>
                       text "args" <> brackets (int (n-1))
         | otherwise = text ('a':show n)
 

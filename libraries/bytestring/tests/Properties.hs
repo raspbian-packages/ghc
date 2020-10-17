@@ -1240,31 +1240,47 @@ prop_initsBB xs = inits xs == map P.unpack (P.inits (P.pack xs))
 
 prop_tailsBB xs = tails xs == map P.unpack (P.tails (P.pack xs))
 
-prop_findSubstringsBB s x l
-    = C.findSubstrings (C.pack p) (C.pack s) == naive_findSubstrings p s
+-- The correspondence between the test 'ByteString' and naive test 'String'
+-- must be injective, otherwise the ByteString may find matches at positions
+-- that don't match in the "corresponding" string.  To that end, we start
+-- with and pack a Word8 array, rather than a unicode String.
+--
+prop_findSubstringsBB :: [Word8] -> Int -> Int -> Bool
+prop_findSubstringsBB ws x l
+    = let bstr = P.pack ws
+          -- we look for some random substring of the test string
+          slice = C.take l $ C.drop x bstr
+          str = C.unpack bstr
+          substr = C.unpack slice
+      in C.findSubstrings slice bstr == naive_findSubstrings substr str
   where
-    _ = l :: Int
-    _ = x :: Int
-
-    -- we look for some random substring of the test string
-    p = take (model l) $ drop (model x) s
-
     -- naive reference implementation
+    -- Note, overlapping matches have been broken since 2015, so at this
+    -- point just test for the current behaviour.
     naive_findSubstrings :: String -> String -> [Int]
-    naive_findSubstrings p s = [x | x <- [0..length s], p `isPrefixOf` drop x s]
+    naive_findSubstrings p q
+        | null p    = [0..length q]
+        | otherwise = go 0 (length p) p (length q) q
+    go n !lp p !lq q =
+        if (lp > lq)
+        then []
+        else if p `isPrefixOf` q
+        then n : go (n + lp) lp p (lq - lp) (drop lp q)
+        else go (n + 1) lp p (lq - 1) (tail q)
 
-prop_findSubstringBB s x l
-    = C.findSubstring (C.pack p) (C.pack s) == naive_findSubstring p s
+-- See above re injective string -> bytestring correspondence.
+prop_findSubstringBB :: [Word8] -> Int -> Int -> Bool
+prop_findSubstringBB ws x l
+    = let bstr = P.pack ws
+          -- we look for some random substring of the test string
+          slice = C.take l $ C.drop x bstr
+          str = C.unpack bstr
+          substr = C.unpack slice
+      in C.findSubstring slice bstr == naive_findSubstring substr str
   where
-    _ = l :: Int
-    _ = x :: Int
-
-    -- we look for some random substring of the test string
-    p = take (model l) $ drop (model x) s
-
     -- naive reference implementation
     naive_findSubstring :: String -> String -> Maybe Int
-    naive_findSubstring p s = listToMaybe [x | x <- [0..length s], p `isPrefixOf` drop x s]
+    naive_findSubstring p q = listToMaybe [x | x <- [0..length q], p `isPrefixOf` drop x q]
 
 -- correspondance between break and breakSubstring
 prop_breakSubstringBB c l

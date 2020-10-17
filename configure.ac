@@ -13,7 +13,7 @@ dnl
 # see what flags are available. (Better yet, read the documentation!)
 #
 
-AC_INIT([The Glorious Glasgow Haskell Compilation System], [8.8.3], [glasgow-haskell-bugs@haskell.org], [ghc-AC_PACKAGE_VERSION])
+AC_INIT([The Glorious Glasgow Haskell Compilation System], [8.8.4], [glasgow-haskell-bugs@haskell.org], [ghc-AC_PACKAGE_VERSION])
 
 # Set this to YES for a released version, otherwise NO
 : ${RELEASE=YES}
@@ -127,6 +127,9 @@ dnl CC_STAGE0 is like the "previous" variable CC (inherited by CC_STAGE[123])
 dnl but instead used by stage0 for bootstrapping stage1
 AC_ARG_VAR(CC_STAGE0, [C compiler command (bootstrap)])
 
+dnl RTS ways supplied by the bootstrapping compiler.
+AC_ARG_VAR(RTS_WAYS_STAGE0, [RTS ways])
+
 if test "$WithGhc" != ""; then
   FPTOOLS_GHC_VERSION([GhcVersion], [GhcMajVersion], [GhcMinVersion], [GhcPatchLevel])dnl
 
@@ -150,6 +153,17 @@ if test "$WithGhc" != ""; then
   BOOTSTRAPPING_GHC_INFO_FIELD([AR_STAGE0],[ar command])
   BOOTSTRAPPING_GHC_INFO_FIELD([AR_OPTS_STAGE0],[ar flags])
   BOOTSTRAPPING_GHC_INFO_FIELD([ArSupportsAtFile_STAGE0],[ar supports at file])
+  BOOTSTRAPPING_GHC_INFO_FIELD([RTS_WAYS_STAGE0],[RTS ways])
+
+  dnl Check whether or not the bootstrapping GHC has a threaded RTS. This
+  dnl determines whether or not we can have a threaded stage 1.
+  dnl See Note [Linking ghc-bin against threaded stage0 RTS] in
+  dnl hadrian/src/Settings/Packages.hs for details.
+  if echo ${RTS_WAYS_STAGE0} | grep '.*thr.*' 2>&1 >/dev/null; then
+      AC_SUBST(GhcThreadedRts, YES)
+  else
+      AC_SUBST(GhcThreadedRts, NO)
+  fi
 fi
 
 dnl ** Must have GHC to build GHC
@@ -1259,11 +1273,22 @@ AC_DEFINE_UNQUOTED([USE_LIBDW], [$USE_LIBDW], [Set to 1 to use libdw])
 dnl ** Have libnuma?
 dnl --------------------------------------------------------------
 HaveLibNuma=0
-AC_CHECK_HEADERS([numa.h numaif.h])
+AC_ARG_ENABLE(numa,
+    [AC_HELP_STRING([--enable-numa],
+        [Enable NUMA memory policy and thread affinity support in the
+         runtime system via numactl's libnuma [default=auto]])])
 
-if test "$ac_cv_header_numa_h$ac_cv_header_numaif_h" = "yesyes" ; then
+if test "$enable_numa" != "no" ; then
+  AC_CHECK_HEADERS([numa.h numaif.h])
+
+  if test "$ac_cv_header_numa_h$ac_cv_header_numaif_h" = "yesyes" ; then
     AC_CHECK_LIB(numa, numa_available,HaveLibNuma=1)
+  fi
+  if test "$enable_numa:$HaveLibNuma" = "yes:0" ; then
+      AC_MSG_ERROR([Cannot find system libnuma (required by --enable-numa)])]
+  fi
 fi
+
 AC_DEFINE_UNQUOTED([HAVE_LIBNUMA], [$HaveLibNuma], [Define to 1 if you have libnuma])
 if test $HaveLibNuma = "1" ; then
   AC_SUBST([CabalHaveLibNuma],[True])
@@ -1361,6 +1386,7 @@ Configure completed successfully.
 echo "\
    Bootstrapping using   : $WithGhc
       which is version   : $GhcVersion
+      with threaded RTS? : $GhcThreadedRts
 "
 
 if test "x$CC_LLVM_BACKEND" = "x1"; then

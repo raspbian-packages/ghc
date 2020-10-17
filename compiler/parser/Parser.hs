@@ -88,7 +88,7 @@ import qualified GHC.Exts as Happy_GHC_Exts
 import Control.Applicative(Applicative(..))
 import Control.Monad (ap)
 
--- parser produced by Happy Version 1.19.11
+-- parser produced by Happy Version 1.19.12
 
 newtype HappyAbsSyn  = HappyAbsSyn HappyAny
 #if __GLASGOW_HASKELL__ >= 607
@@ -12512,78 +12512,7 @@ asl :: (HasSrcSpan a , HasSrcSpan b) => [a] -> b -> a -> P()
 asl [] (dL->L ls _) (dL->L l _) = addAnnotation l          AnnSemi ls
 asl (x:_xs) (dL->L ls _) _x = addAnnotation (getLoc x) AnnSemi ls
 {-# LINE 1 "templates/GenericTemplate.hs" #-}
-{-# LINE 1 "templates/GenericTemplate.hs" #-}
-{-# LINE 1 "<built-in>" #-}
-{-# LINE 1 "<command-line>" #-}
-{-# LINE 10 "<command-line>" #-}
-# 1 "/usr/include/stdc-predef.h" 1 3 4
-
-# 17 "/usr/include/stdc-predef.h" 3 4
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-{-# LINE 10 "<command-line>" #-}
-{-# LINE 1 "/opt/ghc/8.4.4/lib/ghc-8.4.4/include/ghcversion.h" #-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-{-# LINE 10 "<command-line>" #-}
-{-# LINE 1 "templates/GenericTemplate.hs" #-}
--- Id: GenericTemplate.hs,v 1.26 2005/01/14 14:47:22 simonmar Exp 
+-- $Id: GenericTemplate.hs,v 1.26 2005/01/14 14:47:22 simonmar Exp $
 
 
 
@@ -12607,7 +12536,24 @@ asl (x:_xs) (dL->L ls _) _x = addAnnotation (getLoc x) AnnSemi ls
 #define GTE(n,m) (n Happy_GHC_Exts.>=# m)
 #define EQ(n,m) (n Happy_GHC_Exts.==# m)
 #endif
-{-# LINE 43 "templates/GenericTemplate.hs" #-}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 data Happy_IntList = HappyCons Happy_GHC_Exts.Int# Happy_IntList
 
@@ -12617,11 +12563,38 @@ data Happy_IntList = HappyCons Happy_GHC_Exts.Int# Happy_IntList
 
 
 
-{-# LINE 65 "templates/GenericTemplate.hs" #-}
 
-{-# LINE 75 "templates/GenericTemplate.hs" #-}
 
-{-# LINE 84 "templates/GenericTemplate.hs" #-}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 infixr 9 `HappyStk`
 data HappyStk a = HappyStk a (HappyStk a)
@@ -12634,7 +12607,7 @@ happyParse start_state = happyNewToken start_state notHappyAtAll notHappyAtAll
 -----------------------------------------------------------------------------
 -- Accepting the parse
 
--- If the current token is 0#, it means we've just accepted a partial
+-- If the current token is ERROR_TOK, it means we've just accepted a partial
 -- parse (a %partial parser).  We must ignore the saved token on the top of
 -- the stack in this case.
 happyAccept 0# tk st sts (_ `HappyStk` ans `HappyStk` _) =
@@ -12649,24 +12622,19 @@ happyAccept j tk st sts (HappyStk ans _) =
 
 happyDoAction i tk st
         = {- nothing -}
-
-
           case action of
                 0#           -> {- nothing -}
                                      happyFail (happyExpListPerState ((Happy_GHC_Exts.I# (st)) :: Int)) i tk st
                 -1#          -> {- nothing -}
                                      happyAccept i tk st
                 n | LT(n,(0# :: Happy_GHC_Exts.Int#)) -> {- nothing -}
-
                                                    (happyReduceArr Happy_Data_Array.! rule) i tk st
                                                    where rule = (Happy_GHC_Exts.I# ((Happy_GHC_Exts.negateInt# ((n Happy_GHC_Exts.+# (1# :: Happy_GHC_Exts.Int#))))))
                 n                 -> {- nothing -}
-
-
                                      happyShift new_state i tk st
                                      where new_state = (n Happy_GHC_Exts.-# (1# :: Happy_GHC_Exts.Int#))
    where off    = happyAdjustOffset (indexShortOffAddr happyActOffsets st)
-         off_i  = (off Happy_GHC_Exts.+#  i)
+         off_i  = (off Happy_GHC_Exts.+# i)
          check  = if GTE(off_i,(0# :: Happy_GHC_Exts.Int#))
                   then EQ(indexShortOffAddr happyCheck off_i, i)
                   else False
@@ -12707,7 +12675,17 @@ data HappyAddr = HappyA# Happy_GHC_Exts.Addr#
 -----------------------------------------------------------------------------
 -- HappyState data type (not arrays)
 
-{-# LINE 180 "templates/GenericTemplate.hs" #-}
+
+
+
+
+
+
+
+
+
+
+
 
 -----------------------------------------------------------------------------
 -- Shifting a token
@@ -12769,7 +12747,7 @@ happyMonad2Reduce k nt fn j tk st sts stk =
          let drop_stk = happyDropStk k stk
 
              off = happyAdjustOffset (indexShortOffAddr happyGotoOffsets st1)
-             off_i = (off Happy_GHC_Exts.+#  nt)
+             off_i = (off Happy_GHC_Exts.+# nt)
              new_state = indexShortOffAddr happyTable off_i
 
 
@@ -12792,14 +12770,14 @@ happyGoto nt j tk st =
    {- nothing -}
    happyDoAction j tk new_state
    where off = happyAdjustOffset (indexShortOffAddr happyGotoOffsets st)
-         off_i = (off Happy_GHC_Exts.+#  nt)
+         off_i = (off Happy_GHC_Exts.+# nt)
          new_state = indexShortOffAddr happyTable off_i
 
 
 
 
 -----------------------------------------------------------------------------
--- Error recovery (0# is the error token)
+-- Error recovery (ERROR_TOK is the error token)
 
 -- parse error if we are in recovery and we fail again
 happyFail explist 0# tk old_st _ stk@(x `HappyStk` _) =
@@ -12812,17 +12790,17 @@ happyFail explist 0# tk old_st _ stk@(x `HappyStk` _) =
     for now --SDM
 
 -- discard a state
-happyFail  0# tk old_st (HappyCons ((action)) (sts)) 
+happyFail  ERROR_TOK tk old_st CONS(HAPPYSTATE(action),sts) 
                                                 (saved_tok `HappyStk` _ `HappyStk` stk) =
 --      trace ("discarding state, depth " ++ show (length stk))  $
-        happyDoAction 0# tk action sts ((saved_tok`HappyStk`stk))
+        DO_ACTION(action,ERROR_TOK,tk,sts,(saved_tok`HappyStk`stk))
 -}
 
 -- Enter error recovery: generate an error token,
 --                       save the old token and carry on.
 happyFail explist i tk (action) sts stk =
 --      trace "entering error recovery" $
-        happyDoAction 0# tk action sts ( (Happy_GHC_Exts.unsafeCoerce# (Happy_GHC_Exts.I# (i))) `HappyStk` stk)
+        happyDoAction 0# tk action sts ((Happy_GHC_Exts.unsafeCoerce# (Happy_GHC_Exts.I# (i))) `HappyStk` stk)
 
 -- Internal happy errors:
 

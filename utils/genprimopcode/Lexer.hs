@@ -18,11 +18,11 @@ import qualified ParserM as ParserM (input)
 #endif
 #if __GLASGOW_HASKELL__ >= 503
 import Data.Array
-import Data.Array.Base (unsafeAt)
 #else
 import Array
 #endif
 #if __GLASGOW_HASKELL__ >= 503
+import Data.Array.Base (unsafeAt)
 import GHC.Exts
 #else
 import GlaExts

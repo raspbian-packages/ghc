@@ -1,3 +1,33 @@
+## 0.68.7
+
+ - The C compiler is now assumed to be called `cc` instead of `gcc`
+   by default (#42)
+
+ - Fix race condition when using response files (#30)
+
+ - Add extra diagnostics when `hsc2hs` sub-process fails
+   and make TempFile creation fully atomic on Windows. See (#33)
+
+## 0.68.6
+
+ - Supports generation of response files to avoid system filepath
+   limits (#22, #23)
+
+ - Fix non-deterministic failures for response file handlings (#29)
+
+ - Temporary file removals on Windows are not a bit more reliable and should
+   throw less access denied errors.  See #25 and
+   ([#9775](https://gitlab.haskell.org/ghc/ghc/issues/9775))
+
+ - Accept a leading single quote for data constructor promotion (#13, #17)
+
+ - Support `MonadFail` / base-4.13
+
+ - Include template file as first header in hsc2hs generated C file (#28)
+
+ - On Windows define `__USE_MINGW_ANSI_STDIO` to 1 instead of 0 when not already
+   defined in standard template header.  This is a more modern default (#28)
+
 ## 0.68.5
 
  - Support response files regardless of which GHC `hsc2hs` was compiled
