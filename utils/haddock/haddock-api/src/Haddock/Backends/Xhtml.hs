@@ -127,13 +127,13 @@ headHtml docTitle themes mathjax_url =
     , thetitle << docTitle
     , styleSheet themes
     , thelink ! [ rel "stylesheet", thetype "text/css", href quickJumpCssFile] << noHtml
-    , thelink ! [ rel "stylesheet", thetype "text/css", href fontUrl] << noHtml
+    -- , thelink ! [ rel "stylesheet", thetype "text/css", href fontUrl] << noHtml
     , script ! [src haddockJsFile, emptyAttr "async", thetype "text/javascript"] << noHtml
     , script ! [thetype "text/x-mathjax-config"] << primHtml mjConf
     , script ! [src mjUrl, thetype "text/javascript"] << noHtml
     ]
   where
-    fontUrl = "https://fonts.googleapis.com/css?family=PT+Sans:400,400i,700"
+    -- fontUrl = "https://fonts.googleapis.com/css?family=PT+Sans:400,400i,700"
     mjUrl = fromMaybe "https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.5/MathJax.js?config=TeX-AMS-MML_HTMLorMML" mathjax_url
     mjConf = unwords [ "MathJax.Hub.Config({"
                      ,   "tex2jax: {"
