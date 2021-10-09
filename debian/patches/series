@@ -14,4 +14,6 @@ fix-32bit-atomic
 11f8eef5a9625c77f78a829406c446b615ed6168.patch
 haddock-remove-googleapis-fonts
 fix-big-endian-ffi
+newer-autoconf
+newer-sphinx
 autoconf-2.71.patch

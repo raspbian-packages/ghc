@@ -1,17 +1,24 @@
-ghc (8.8.4-2+rpi2) bookworm-staging; urgency=medium
-
-  * Add upstream patch to fix build with new autoconf.
-
- -- Peter Michael Green <plugwash@raspbian.org>  Thu, 30 Sep 2021 18:21:04 +0000
-
-ghc (8.8.4-2+rpi1) bullseye-staging; urgency=medium
+ghc (8.8.4-3+rpi1) bookworm-staging; urgency=medium
 
   [changes brought forward from 7.6.3-21+rpi1 by Peter Michael Green <plugwash@raspbian.org> at Sun, 19 Apr 2015 14:00:16 +0000]
   * Change compiler defaults for armv6
   [changed introduced in 7.10.3-2+rpi1 by Peter Michael Green]
   * Add call to dh_autoreconf_clean
 
- -- Raspbian forward porter <root@raspbian.org>  Sun, 27 Dec 2020 19:30:12 +0000
+  [changes brought forward from 8.8.4-2+rpi2 by Peter Michael Green <plugwash@raspbian.org> at Thu, 30 Sep 2021 18:21:04 +0000]
+  * Add upstream patch to fix build with new autoconf.
+
+ -- Raspbian forward porter <root@raspbian.org>  Sat, 09 Oct 2021 20:41:05 +0000
+
+ghc (8.8.4-3) unstable; urgency=medium
+
+  * Disable parallel install to fix races with missing directories
+    (Closes: #944493)
+  * Fix FTBFS with autoconf 2.71. Thanks to Matthias Klose for the patch
+    (Closes: #995036)
+  * Fix FTBFS with Sphinx 4.2.0 (Closes: #995429)
+
+ -- Ilias Tsitsimpis <iliastsi@debian.org>  Sun, 03 Oct 2021 14:27:00 +0300
 
 ghc (8.8.4-2) unstable; urgency=medium
 

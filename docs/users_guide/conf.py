@@ -77,13 +77,13 @@ htmlhelp_basename = 'GHCUsersGuide'
 latex_elements = {
     'inputenc': '',
     'utf8extra': '',
-    'preamble': '''
+    'preamble': r'''
 \usepackage{fontspec}
 \usepackage{makeidx}
 \setsansfont{DejaVu Sans}
 \setromanfont{DejaVu Serif}
 \setmonofont{DejaVu Sans Mono}
-\setlength{\\tymin}{45pt}
+\setlength{\tymin}{45pt}
 ''',
 }
 
