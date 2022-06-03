@@ -1,0 +1,643 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"
+><head
+  ><meta http-equiv="Content-Type" content="text/html; charset=UTF-8"
+     /><meta name="viewport" content="width=device-width, initial-scale=1"
+     /><title
+    >Bug548</title
+    ><link href="linuwial.css" rel="stylesheet" type="text/css" title="Linuwial"
+     /><link rel="stylesheet" type="text/css" href="quick-jump.css"
+     /><link rel="stylesheet" type="text/css" href="https://fonts.googleapis.com/css?family=PT+Sans:400,400i,700"
+     /><script src="haddock-bundle.min.js" async="async" type="text/javascript"
+    ></script
+    ><script type="text/x-mathjax-config"
+    >MathJax.Hub.Config({ tex2jax: { processClass: "mathjax", ignoreClass: ".*" } });</script
+    ><script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.5/MathJax.js?config=TeX-AMS-MML_HTMLorMML" type="text/javascript"
+    ></script
+    ></head
+  ><body
+  ><div id="package-header"
+    ><span class="caption empty"
+      >&nbsp;</span
+      ><ul class="links" id="page-menu"
+      ><li
+	><a href="index.html"
+	  >Contents</a
+	  ></li
+	><li
+	><a href="doc-index.html"
+	  >Index</a
+	  ></li
+	></ul
+      ></div
+    ><div id="content"
+    ><div id="module-header"
+      ><table class="info"
+	><tr
+	  ><th
+	    >Safe Haskell</th
+	    ><td
+	    >Safe-Inferred</td
+	    ></tr
+	  ><tr
+	  ><th
+	    >Language</th
+	    ><td
+	    >Haskell2010</td
+	    ></tr
+	  ></table
+	><p class="caption"
+	>Bug548</p
+	></div
+      ><div id="interface"
+      ><h1
+	>Documentation</h1
+	><div class="top"
+	><p class="src"
+	  ><span class="keyword"
+	    >newtype</span
+	    > <a id="t:WrappedArrow" class="def"
+	    >WrappedArrow</a
+	    > (a :: <a href="${pkgroot}/../../docs/html/libraries/base/Data-Kind.html#t:Type" title="Data.Kind"
+	    >Type</a
+	    > -&gt; <a href="${pkgroot}/../../docs/html/libraries/base/Data-Kind.html#t:Type" title="Data.Kind"
+	    >Type</a
+	    > -&gt; <a href="${pkgroot}/../../docs/html/libraries/base/Data-Kind.html#t:Type" title="Data.Kind"
+	    >Type</a
+	    >) b c <a href="#t:WrappedArrow" class="selflink"
+	    >#</a
+	    ></p
+	  ><div class="subs constructors"
+	  ><p class="caption"
+	    >Constructors</p
+	    ><table
+	    ><tr
+	      ><td class="src"
+		><a id="v:WrapArrow" class="def"
+		  >WrapArrow</a
+		  ></td
+		><td class="doc empty"
+		>&nbsp;</td
+		></tr
+	      ><tr
+	      ><td colspan="2"
+		><div class="subs fields"
+		  ><p class="caption"
+		    >Fields</p
+		    ><ul
+		    ><li
+		      ><dfn class="src"
+			><a id="v:unwrapArrow" class="def"
+			  >unwrapArrow</a
+			  > :: a b c</dfn
+			><div class="doc empty"
+			>&nbsp;</div
+			></li
+		      ></ul
+		    ></div
+		  ></td
+		></tr
+	      ></table
+	    ></div
+	  ><div class="subs instances"
+	  ><h4 class="instances details-toggle-control details-toggle" data-details-id="i:WrappedArrow"
+	    >Instances</h4
+	    ><details id="i:WrappedArrow" open="open"
+	    ><summary class="hide-when-js-enabled"
+	      >Instances details</summary
+	      ><table
+	      ><tr
+		><td class="src clearfix"
+		  ><span class="inst-left"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:id:WrappedArrow:Generic1:1"
+		      ></span
+		      > <a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#t:Generic1" title="GHC.Generics"
+		      >Generic1</a
+		      > (<a href="Bug548.html#t:WrappedArrow" title="Bug548"
+		      >WrappedArrow</a
+		      > a b :: <a href="${pkgroot}/../../docs/html/libraries/base/Data-Kind.html#t:Type" title="Data.Kind"
+		      >Type</a
+		      > -&gt; <a href="${pkgroot}/../../docs/html/libraries/base/Data-Kind.html#t:Type" title="Data.Kind"
+		      >Type</a
+		      >)</span
+		    ></td
+		  ><td class="doc empty"
+		  >&nbsp;</td
+		  ></tr
+		><tr
+		><td colspan="2"
+		  ><details id="i:id:WrappedArrow:Generic1:1"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="${pkgroot}/../../docs/html/libraries/base/Control-Applicative.html"
+			>Control.Applicative</a
+			></p
+		      > <div class="subs associated-types"
+		      ><p class="caption"
+			>Associated Types</p
+			><p class="src"
+			><span class="keyword"
+			  >type</span
+			  > <a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#t:Rep1" title="GHC.Generics"
+			  >Rep1</a
+			  > (<a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b) :: k -&gt; <a href="${pkgroot}/../../docs/html/libraries/base/Data-Kind.html#t:Type" title="Data.Kind"
+			  >Type</a
+			  > <a href="#t:Rep1" class="selflink"
+			  >#</a
+			  ></p
+			></div
+		      > <div class="subs methods"
+		      ><p class="caption"
+			>Methods</p
+			><p class="src"
+			><a href="#v:from1"
+			  >from1</a
+			  > :: <span class="keyword"
+			  >forall</span
+			  > (a0 :: k). <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b a0 -&gt; <a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#t:Rep1" title="GHC.Generics"
+			  >Rep1</a
+			  > (<a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b) a0 <a href="#v:from1" class="selflink"
+			  >#</a
+			  ></p
+			><p class="src"
+			><a href="#v:to1"
+			  >to1</a
+			  > :: <span class="keyword"
+			  >forall</span
+			  > (a0 :: k). <a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#t:Rep1" title="GHC.Generics"
+			  >Rep1</a
+			  > (<a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b) a0 -&gt; <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b a0 <a href="#v:to1" class="selflink"
+			  >#</a
+			  ></p
+			></div
+		      ></details
+		    ></td
+		  ></tr
+		><tr
+		><td class="src clearfix"
+		  ><span class="inst-left"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:id:WrappedArrow:Alternative:2"
+		      ></span
+		      > (<a href="${pkgroot}/../../docs/html/libraries/base/Control-Arrow.html#t:ArrowZero" title="Control.Arrow"
+		      >ArrowZero</a
+		      > a, <a href="${pkgroot}/../../docs/html/libraries/base/Control-Arrow.html#t:ArrowPlus" title="Control.Arrow"
+		      >ArrowPlus</a
+		      > a) =&gt; <a href="${pkgroot}/../../docs/html/libraries/base/Control-Applicative.html#t:Alternative" title="Control.Applicative"
+		      >Alternative</a
+		      > (<a href="Bug548.html#t:WrappedArrow" title="Bug548"
+		      >WrappedArrow</a
+		      > a b)</span
+		    ></td
+		  ><td class="doc"
+		  ><p
+		    ><em
+		      >Since: base-2.1</em
+		      ></p
+		    ></td
+		  ></tr
+		><tr
+		><td colspan="2"
+		  ><details id="i:id:WrappedArrow:Alternative:2"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="${pkgroot}/../../docs/html/libraries/base/Control-Applicative.html"
+			>Control.Applicative</a
+			></p
+		      > <div class="subs methods"
+		      ><p class="caption"
+			>Methods</p
+			><p class="src"
+			><a href="#v:empty"
+			  >empty</a
+			  > :: <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b a0 <a href="#v:empty" class="selflink"
+			  >#</a
+			  ></p
+			><p class="src"
+			><a href="#v:-60--124--62-"
+			  >(&lt;|&gt;)</a
+			  > :: <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b a0 -&gt; <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b a0 -&gt; <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b a0 <a href="#v:-60--124--62-" class="selflink"
+			  >#</a
+			  ></p
+			><p class="src"
+			><a href="#v:some"
+			  >some</a
+			  > :: <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b a0 -&gt; <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b [a0] <a href="#v:some" class="selflink"
+			  >#</a
+			  ></p
+			><p class="src"
+			><a href="#v:many"
+			  >many</a
+			  > :: <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b a0 -&gt; <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b [a0] <a href="#v:many" class="selflink"
+			  >#</a
+			  ></p
+			></div
+		      ></details
+		    ></td
+		  ></tr
+		><tr
+		><td class="src clearfix"
+		  ><span class="inst-left"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:id:WrappedArrow:Applicative:3"
+		      ></span
+		      > <a href="${pkgroot}/../../docs/html/libraries/base/Control-Arrow.html#t:Arrow" title="Control.Arrow"
+		      >Arrow</a
+		      > a =&gt; <a href="${pkgroot}/../../docs/html/libraries/base/Control-Applicative.html#t:Applicative" title="Control.Applicative"
+		      >Applicative</a
+		      > (<a href="Bug548.html#t:WrappedArrow" title="Bug548"
+		      >WrappedArrow</a
+		      > a b)</span
+		    ></td
+		  ><td class="doc"
+		  ><p
+		    ><em
+		      >Since: base-2.1</em
+		      ></p
+		    ></td
+		  ></tr
+		><tr
+		><td colspan="2"
+		  ><details id="i:id:WrappedArrow:Applicative:3"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="${pkgroot}/../../docs/html/libraries/base/Control-Applicative.html"
+			>Control.Applicative</a
+			></p
+		      > <div class="subs methods"
+		      ><p class="caption"
+			>Methods</p
+			><p class="src"
+			><a href="#v:pure"
+			  >pure</a
+			  > :: a0 -&gt; <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b a0 <a href="#v:pure" class="selflink"
+			  >#</a
+			  ></p
+			><p class="src"
+			><a href="#v:-60--42--62-"
+			  >(&lt;*&gt;)</a
+			  > :: <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b (a0 -&gt; b0) -&gt; <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b a0 -&gt; <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b b0 <a href="#v:-60--42--62-" class="selflink"
+			  >#</a
+			  ></p
+			><p class="src"
+			><a href="#v:liftA2"
+			  >liftA2</a
+			  > :: (a0 -&gt; b0 -&gt; c) -&gt; <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b a0 -&gt; <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b b0 -&gt; <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b c <a href="#v:liftA2" class="selflink"
+			  >#</a
+			  ></p
+			><p class="src"
+			><a href="#v:-42--62-"
+			  >(*&gt;)</a
+			  > :: <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b a0 -&gt; <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b b0 -&gt; <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b b0 <a href="#v:-42--62-" class="selflink"
+			  >#</a
+			  ></p
+			><p class="src"
+			><a href="#v:-60--42-"
+			  >(&lt;*)</a
+			  > :: <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b a0 -&gt; <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b b0 -&gt; <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b a0 <a href="#v:-60--42-" class="selflink"
+			  >#</a
+			  ></p
+			></div
+		      ></details
+		    ></td
+		  ></tr
+		><tr
+		><td class="src clearfix"
+		  ><span class="inst-left"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:id:WrappedArrow:Functor:4"
+		      ></span
+		      > <a href="${pkgroot}/../../docs/html/libraries/base/Control-Arrow.html#t:Arrow" title="Control.Arrow"
+		      >Arrow</a
+		      > a =&gt; <a href="${pkgroot}/../../docs/html/libraries/base/Data-Functor.html#t:Functor" title="Data.Functor"
+		      >Functor</a
+		      > (<a href="Bug548.html#t:WrappedArrow" title="Bug548"
+		      >WrappedArrow</a
+		      > a b)</span
+		    ></td
+		  ><td class="doc"
+		  ><p
+		    ><em
+		      >Since: base-2.1</em
+		      ></p
+		    ></td
+		  ></tr
+		><tr
+		><td colspan="2"
+		  ><details id="i:id:WrappedArrow:Functor:4"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="${pkgroot}/../../docs/html/libraries/base/Control-Applicative.html"
+			>Control.Applicative</a
+			></p
+		      > <div class="subs methods"
+		      ><p class="caption"
+			>Methods</p
+			><p class="src"
+			><a href="#v:fmap"
+			  >fmap</a
+			  > :: (a0 -&gt; b0) -&gt; <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b a0 -&gt; <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b b0 <a href="#v:fmap" class="selflink"
+			  >#</a
+			  ></p
+			><p class="src"
+			><a href="#v:-60--36-"
+			  >(&lt;$)</a
+			  > :: a0 -&gt; <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b b0 -&gt; <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b a0 <a href="#v:-60--36-" class="selflink"
+			  >#</a
+			  ></p
+			></div
+		      ></details
+		    ></td
+		  ></tr
+		><tr
+		><td class="src clearfix"
+		  ><span class="inst-left"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:id:WrappedArrow:Generic:5"
+		      ></span
+		      > <a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#t:Generic" title="GHC.Generics"
+		      >Generic</a
+		      > (<a href="Bug548.html#t:WrappedArrow" title="Bug548"
+		      >WrappedArrow</a
+		      > a b c)</span
+		    ></td
+		  ><td class="doc empty"
+		  >&nbsp;</td
+		  ></tr
+		><tr
+		><td colspan="2"
+		  ><details id="i:id:WrappedArrow:Generic:5"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="${pkgroot}/../../docs/html/libraries/base/Control-Applicative.html"
+			>Control.Applicative</a
+			></p
+		      > <div class="subs associated-types"
+		      ><p class="caption"
+			>Associated Types</p
+			><p class="src"
+			><span class="keyword"
+			  >type</span
+			  > <a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#t:Rep" title="GHC.Generics"
+			  >Rep</a
+			  > (<a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b c) :: <a href="${pkgroot}/../../docs/html/libraries/base/Data-Kind.html#t:Type" title="Data.Kind"
+			  >Type</a
+			  > -&gt; <a href="${pkgroot}/../../docs/html/libraries/base/Data-Kind.html#t:Type" title="Data.Kind"
+			  >Type</a
+			  > <a href="#t:Rep" class="selflink"
+			  >#</a
+			  ></p
+			></div
+		      > <div class="subs methods"
+		      ><p class="caption"
+			>Methods</p
+			><p class="src"
+			><a href="#v:from"
+			  >from</a
+			  > :: <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b c -&gt; <a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#t:Rep" title="GHC.Generics"
+			  >Rep</a
+			  > (<a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b c) x <a href="#v:from" class="selflink"
+			  >#</a
+			  ></p
+			><p class="src"
+			><a href="#v:to"
+			  >to</a
+			  > :: <a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#t:Rep" title="GHC.Generics"
+			  >Rep</a
+			  > (<a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b c) x -&gt; <a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			  >WrappedArrow</a
+			  > a b c <a href="#v:to" class="selflink"
+			  >#</a
+			  ></p
+			></div
+		      ></details
+		    ></td
+		  ></tr
+		><tr
+		><td class="src clearfix"
+		  ><span class="inst-left"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:id:WrappedArrow:Rep1:6"
+		      ></span
+		      > <span class="keyword"
+		      >type</span
+		      > <a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#t:Rep1" title="GHC.Generics"
+		      >Rep1</a
+		      > (<a href="Bug548.html#t:WrappedArrow" title="Bug548"
+		      >WrappedArrow</a
+		      > a b :: <a href="${pkgroot}/../../docs/html/libraries/base/Data-Kind.html#t:Type" title="Data.Kind"
+		      >Type</a
+		      > -&gt; <a href="${pkgroot}/../../docs/html/libraries/base/Data-Kind.html#t:Type" title="Data.Kind"
+		      >Type</a
+		      >)</span
+		    ></td
+		  ><td class="doc"
+		  ><p
+		    ><em
+		      >Since: base-4.7.0.0</em
+		      ></p
+		    ></td
+		  ></tr
+		><tr
+		><td colspan="2"
+		  ><details id="i:id:WrappedArrow:Rep1:6"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="${pkgroot}/../../docs/html/libraries/base/Control-Applicative.html"
+			>Control.Applicative</a
+			></p
+		      > <div class="src"
+		      ><span class="keyword"
+			>type</span
+			> <a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#t:Rep1" title="GHC.Generics"
+			>Rep1</a
+			> (<a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			>WrappedArrow</a
+			> a b :: <a href="${pkgroot}/../../docs/html/libraries/base/Data-Kind.html#t:Type" title="Data.Kind"
+			>Type</a
+			> -&gt; <a href="${pkgroot}/../../docs/html/libraries/base/Data-Kind.html#t:Type" title="Data.Kind"
+			>Type</a
+			>) = <a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#t:D1" title="GHC.Generics"
+			>D1</a
+			> ('<a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#v:MetaData" title="GHC.Generics"
+			>MetaData</a
+			> &quot;WrappedArrow&quot; &quot;Control.Applicative&quot; &quot;base&quot; '<a href="${pkgroot}/../../docs/html/libraries/base/Data-Bool.html#v:True" title="Data.Bool"
+			>True</a
+			>) (<a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#t:C1" title="GHC.Generics"
+			>C1</a
+			> ('<a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#v:MetaCons" title="GHC.Generics"
+			>MetaCons</a
+			> &quot;WrapArrow&quot; '<a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#v:PrefixI" title="GHC.Generics"
+			>PrefixI</a
+			> '<a href="${pkgroot}/../../docs/html/libraries/base/Data-Bool.html#v:True" title="Data.Bool"
+			>True</a
+			>) (<a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#t:S1" title="GHC.Generics"
+			>S1</a
+			> ('<a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#v:MetaSel" title="GHC.Generics"
+			>MetaSel</a
+			> ('<a href="${pkgroot}/../../docs/html/libraries/base/Data-Maybe.html#v:Just" title="Data.Maybe"
+			>Just</a
+			> &quot;unwrapArrow&quot;) '<a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#v:NoSourceUnpackedness" title="GHC.Generics"
+			>NoSourceUnpackedness</a
+			> '<a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#v:NoSourceStrictness" title="GHC.Generics"
+			>NoSourceStrictness</a
+			> '<a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#v:DecidedLazy" title="GHC.Generics"
+			>DecidedLazy</a
+			>) (<a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#t:Rec1" title="GHC.Generics"
+			>Rec1</a
+			> (a b))))</div
+		      ></details
+		    ></td
+		  ></tr
+		><tr
+		><td class="src clearfix"
+		  ><span class="inst-left"
+		    ><span class="instance details-toggle-control details-toggle" data-details-id="i:id:WrappedArrow:Rep:7"
+		      ></span
+		      > <span class="keyword"
+		      >type</span
+		      > <a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#t:Rep" title="GHC.Generics"
+		      >Rep</a
+		      > (<a href="Bug548.html#t:WrappedArrow" title="Bug548"
+		      >WrappedArrow</a
+		      > a b c)</span
+		    ></td
+		  ><td class="doc"
+		  ><p
+		    ><em
+		      >Since: base-4.7.0.0</em
+		      ></p
+		    ></td
+		  ></tr
+		><tr
+		><td colspan="2"
+		  ><details id="i:id:WrappedArrow:Rep:7"
+		    ><summary class="hide-when-js-enabled"
+		      >Instance details</summary
+		      ><p
+		      >Defined in <a href="${pkgroot}/../../docs/html/libraries/base/Control-Applicative.html"
+			>Control.Applicative</a
+			></p
+		      > <div class="src"
+		      ><span class="keyword"
+			>type</span
+			> <a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#t:Rep" title="GHC.Generics"
+			>Rep</a
+			> (<a href="Bug548.html#t:WrappedArrow" title="Bug548"
+			>WrappedArrow</a
+			> a b c) = <a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#t:D1" title="GHC.Generics"
+			>D1</a
+			> ('<a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#v:MetaData" title="GHC.Generics"
+			>MetaData</a
+			> &quot;WrappedArrow&quot; &quot;Control.Applicative&quot; &quot;base&quot; '<a href="${pkgroot}/../../docs/html/libraries/base/Data-Bool.html#v:True" title="Data.Bool"
+			>True</a
+			>) (<a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#t:C1" title="GHC.Generics"
+			>C1</a
+			> ('<a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#v:MetaCons" title="GHC.Generics"
+			>MetaCons</a
+			> &quot;WrapArrow&quot; '<a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#v:PrefixI" title="GHC.Generics"
+			>PrefixI</a
+			> '<a href="${pkgroot}/../../docs/html/libraries/base/Data-Bool.html#v:True" title="Data.Bool"
+			>True</a
+			>) (<a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#t:S1" title="GHC.Generics"
+			>S1</a
+			> ('<a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#v:MetaSel" title="GHC.Generics"
+			>MetaSel</a
+			> ('<a href="${pkgroot}/../../docs/html/libraries/base/Data-Maybe.html#v:Just" title="Data.Maybe"
+			>Just</a
+			> &quot;unwrapArrow&quot;) '<a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#v:NoSourceUnpackedness" title="GHC.Generics"
+			>NoSourceUnpackedness</a
+			> '<a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#v:NoSourceStrictness" title="GHC.Generics"
+			>NoSourceStrictness</a
+			> '<a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#v:DecidedLazy" title="GHC.Generics"
+			>DecidedLazy</a
+			>) (<a href="${pkgroot}/../../docs/html/libraries/base/GHC-Generics.html#t:Rec0" title="GHC.Generics"
+			>Rec0</a
+			> (a b c))))</div
+		      ></details
+		    ></td
+		  ></tr
+		></table
+	      ></details
+	    ></div
+	  ></div
+	></div
+      ></div
+    ><div id="footer"
+    ><p
+      >Produced by <a href="http://www.haskell.org/haddock/"
+	>Haddock</a
+	> version 2.25.0</p
+      ></div
+    ></body
+  ></html
+>
