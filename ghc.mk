@@ -802,7 +802,7 @@ endif
 ifeq "$(HADDOCK_DOCS)" "YES"
 libraries/dist-haddock/index.html: $(haddock_INPLACE) $(ALL_HADDOCK_FILES)
 ifeq "$(phase)" "final"
-$(eval $(call all-target,library_doc_index,libraries/dist-haddock/index.html))
+docs: libraries/dist-haddock/index.html
 endif
 INSTALL_LIBRARY_DOCS += libraries/dist-haddock/*
 endif
@@ -844,9 +844,9 @@ libraries/ghc-prim/dist-install/build/autogen/GHC/Prim.hs: \
 
 install: install_libs install_packages install_libexecs \
          install_bins install_libexec_scripts
-ifeq "$(HADDOCK_DOCS)" "YES"
-install: install_docs
-endif
+# ifeq "$(HADDOCK_DOCS)" "YES"
+# install: install_docs
+# endif
 
 define installLibsTo
 # $1 = libraries to install
