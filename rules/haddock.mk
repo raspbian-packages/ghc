@@ -34,7 +34,7 @@ endif
 haddock: html_$1
 
 ifeq "$$(HADDOCK_DOCS)" "YES"
-$(call all-target,$1_$2_haddock,html_$1)
+docs: html_$1
 endif
 
 .PHONY: html_$1
