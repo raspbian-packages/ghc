@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 module Distribution.Types.BuildType (
     BuildType(..),
@@ -27,7 +28,7 @@ data BuildType
                 deriving (Generic, Show, Read, Eq, Typeable, Data)
 
 instance Binary BuildType
-
+instance Structured BuildType
 instance NFData BuildType where rnf = genericRnf
 
 knownBuildTypes :: [BuildType]

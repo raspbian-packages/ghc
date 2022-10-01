@@ -1,5 +1,8 @@
-{-# LANGUAGE DeriveFunctor #-}
-{-# LANGUAGE RankNTypes    #-}
+{-# LANGUAGE DeriveFunctor         #-}
+{-# LANGUAGE FlexibleInstances     #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE RankNTypes            #-}
+{-# LANGUAGE UndecidableInstances  #-}
 module Distribution.FieldGrammar.FieldDescrs (
     FieldDescrs,
     fieldDescrPretty,
@@ -14,7 +17,7 @@ import Data.List                   (dropWhileEnd)
 import Distribution.Compat.Lens    (aview, cloneLens)
 import Distribution.Compat.Newtype
 import Distribution.FieldGrammar
-import Distribution.Pretty         (pretty, showFreeText)
+import Distribution.Pretty         (Pretty (..), showFreeText)
 
 import qualified Data.Map                        as Map
 import qualified Distribution.Compat.CharParsing as C
@@ -45,7 +48,7 @@ fieldDescrPretty (F m) fn = pPretty <$> Map.lookup fn m
 
 -- | Lookup a field value parser.
 fieldDescrParse :: P.CabalParsing m => FieldDescrs s a -> P.FieldName -> Maybe (s -> m s)
-fieldDescrParse (F m) fn = pParse <$> Map.lookup fn m
+fieldDescrParse (F m) fn = (\f -> pParse f) <$> Map.lookup fn m
 
 fieldDescrsToList
     :: P.CabalParsing m
@@ -55,7 +58,7 @@ fieldDescrsToList = map mk . Map.toList . runF where
     mk (name, SP ppr parse) = (name, ppr, parse)
 
 -- | /Note:/ default values are printed.
-instance FieldGrammar FieldDescrs where
+instance FieldGrammar ParsecPretty FieldDescrs where
     blurFieldGrammar l (F m) = F (fmap blur m) where
         blur (SP f g) = SP (f . aview l) (cloneLens l g)
 
@@ -84,6 +87,8 @@ instance FieldGrammar FieldDescrs where
         f s = showFreeText (aview l s)
         g s = cloneLens l (const parsecFreeText) s
 
+    freeTextFieldDefST = defaultFreeTextFieldDefST
+
     monoidalFieldAla fn _pack l = singletonF fn f g where
         f s = pretty (pack' _pack (aview l s))
         g s = cloneLens l (\x -> mappend x . unpack' _pack <$> P.parsec) s
@@ -111,3 +116,6 @@ parsecFreeText = dropDotLines <$ C.spaces <*> many C.anyChar
 
     trim :: String -> String
     trim = dropWhile isSpace . dropWhileEnd isSpace
+
+class    (P.Parsec a, Pretty a) => ParsecPretty a
+instance (P.Parsec a, Pretty a) => ParsecPretty a

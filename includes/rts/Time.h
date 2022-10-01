@@ -5,7 +5,7 @@
  * Time values in the RTS
  *
  * To understand the structure of the RTS headers, see the wiki:
- *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/SourceTree/Includes
+ *   https://gitlab.haskell.org/ghc/ghc/wikis/commentary/source-tree/includes
  *
  * --------------------------------------------------------------------------*/
 
@@ -33,6 +33,7 @@ typedef int64_t Time;
 
 #define SecondsToTime(t) ((Time)(t) * TIME_RESOLUTION)
 #define TimeToSeconds(t) ((t) / TIME_RESOLUTION)
+#define TimeToSecondsDbl(t) ((double)(t) / TIME_RESOLUTION)
 
 // Use instead of SecondsToTime() when we have a floating-point
 // seconds value, to avoid truncating it.

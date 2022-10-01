@@ -1,3 +1,4 @@
+{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE TypeFamilies #-}
 
@@ -18,8 +19,8 @@ import Distribution.Types.MungedPackageId
 import Distribution.Types.UnitId
 import Distribution.Types.ComponentName
 import Distribution.Types.MungedPackageName
+import Distribution.Types.ModuleRenaming
 
-import Distribution.PackageDescription
 import qualified Distribution.InstalledPackageInfo as Installed
 
 -- | The first five fields are common across all algebraic variants.
@@ -108,9 +109,10 @@ data ComponentLocalBuildInfo
     componentExeDeps :: [UnitId],
     componentInternalDeps :: [UnitId]
   }
-  deriving (Generic, Read, Show)
+  deriving (Generic, Read, Show, Typeable)
 
 instance Binary ComponentLocalBuildInfo
+instance Structured ComponentLocalBuildInfo
 
 instance IsNode ComponentLocalBuildInfo where
     type Key ComponentLocalBuildInfo = UnitId

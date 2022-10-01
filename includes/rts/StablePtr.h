@@ -7,7 +7,7 @@
  * Do not #include this file directly: #include "Rts.h" instead.
  *
  * To understand the structure of the RTS headers, see the wiki:
- *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/SourceTree/Includes
+ *   https://gitlab.haskell.org/ghc/ghc/wikis/commentary/source-tree/includes
  *
  * ---------------------------------------------------------------------------*/
 
@@ -31,5 +31,9 @@ extern DLL_IMPORT_RTS spEntry *stable_ptr_table;
 EXTERN_INLINE
 StgPtr deRefStablePtr(StgStablePtr sp)
 {
-    return stable_ptr_table[(StgWord)sp].addr;
+    // acquire load to ensure that we see the new SPT if it has been recently
+    // enlarged.
+    const spEntry *spt = ACQUIRE_LOAD(&stable_ptr_table);
+    // acquire load to ensure that the referenced object is visible.
+    return ACQUIRE_LOAD(&spt[(StgWord)sp].addr);
 }

@@ -1,6 +1,6 @@
 cabal-version: 3.0
 name: rts
-version: 1.0
+version: 1.0.2
 license: BSD-3-Clause
 maintainer: glasgow-haskell-users@haskell.org
 build-type: Simple
@@ -10,14 +10,18 @@ flag librt
   default: @CabalHaveLibrt@
 flag libdl
   default: @CabalHaveLibdl@
-flag ffi
-  default: @CabalHaveLibffi@
+flag use-system-libffi
+  default: @CabalUseSystemLibFFI@
+flag libffi-adjustors
+  default: @CabalLibffiAdjustors@
 flag need-pthread
   default: @CabalNeedLibpthread@
 flag libbfd
   default: @CabalHaveLibbfd@
 flag mingwex
   default: @CabalMingwex@
+flag need-atomic
+  default: @CabalNeedLibatomic@
 flag libdw
   default: @CabalHaveLibdw@
 flag libnuma
@@ -43,16 +47,26 @@ flag logging
   default: False
 flag dynamic
   default: False
+flag thread-sanitizer
+  description:
+    Enable checking for data races using the ThreadSanitizer (TSAN)
+    mechanism supported by GCC and Clang. See Note [ThreadSanitizer]
+    in @includes/rts/TSANUtils.h@.
+  default: False
 
 library
     -- rts is a wired in package and
     -- expects the unit-id to be
     -- set without version
     ghc-options: -this-unit-id rts
-    if os(windows)
-      extra-bundled-libraries: Cffi-6
-    else
-      extra-bundled-libraries: Cffi
+
+    -- If we are using an in-tree libffi then we must declare it as a bundled
+    -- library to ensure that Cabal installs it.
+    if !flag(use-system-libffi)
+      if os(windows)
+        extra-bundled-libraries: Cffi-6
+      else
+        extra-bundled-libraries: Cffi
 
     -- The make build system does something special in config.mk.in
     -- for generating profiled, debugged, etc builds of those
@@ -78,6 +92,11 @@ library
     if flag(dynamic)
       extra-dynamic-library-flavours: _thr
 
+    if flag(thread-sanitizer)
+      cc-options: -fsanitize=thread
+      ld-options: -fsanitize=thread
+      extra-libraries: tsan
+
     exposed: True
     exposed-modules:
     if flag(libm)
@@ -87,7 +106,7 @@ library
        extra-libraries: rt
     if flag(libdl)
        extra-libraries: dl
-    if flag(ffi)
+    if flag(use-system-libffi)
        extra-libraries: ffi
     if os(windows)
        extra-libraries:
@@ -97,9 +116,21 @@ library
           dbghelp
           -- for process information
           psapi
+       -- TODO: Hadrian will use this cabal file, so drop WINVER from Hadrian's configs.
+       -- Minimum supported Windows version.
+       -- These numbers can be found at:
+       --  https://msdn.microsoft.com/en-us/library/windows/desktop/aa383745(v=vs.85).aspx
+       -- If we're compiling on windows, enforce that we only support Windows 7+
+       -- Adding this here means it doesn't have to be done in individual .c files
+       -- and also centralizes the versioning.
+       cpp-options: -D_WIN32_WINNT=0x06010000
+       cc-options: -D_WIN32_WINNT=0x06010000
     if flag(need-pthread)
        -- for pthread_getthreadid_np, pthread_create, ...
        extra-libraries: pthread
+    if flag(need-atomic)
+       -- for sub-word-sized atomic operations (#19119)
+       extra-libraries: atomic
     if flag(libbfd)
        -- for debugging
        extra-libraries: bfd iberty
@@ -115,6 +146,7 @@ library
 
     include-dirs: build ../includes includes
                   includes/dist-derivedconstants/header @FFIIncludeDir@
+                  @LibdwIncludeDir@
     includes: Stg.h
     install-includes: Cmm.h HsFFI.h MachDeps.h Rts.h RtsAPI.h Stg.h
                       ghcautoconf.h ghcconfig.h ghcplatform.h ghcversion.h
@@ -122,6 +154,7 @@ library
                       DerivedConstants.h ffi.h ffitarget.h
                       -- ^ generated
                       rts/Adjustor.h
+                      rts/ExecPage.h
                       rts/BlockSignals.h
                       rts/Bytecodes.h
                       rts/Config.h
@@ -130,6 +163,7 @@ library
                       rts/EventLogWriter.h
                       rts/FileLock.h
                       rts/Flags.h
+                      rts/ForeignExports.h
                       rts/GetTime.h
                       rts/Globals.h
                       rts/Hpc.h
@@ -139,6 +173,7 @@ library
                       rts/Linker.h
                       rts/Main.h
                       rts/Messages.h
+                      rts/NonMoving.h
                       rts/OSThreads.h
                       rts/Parallel.h
                       rts/PrimFloat.h
@@ -153,6 +188,7 @@ library
                       rts/Ticky.h
                       rts/Time.h
                       rts/Timer.h
+                      rts/TSANUtils.h
                       rts/Types.h
                       rts/Utils.h
                       rts/prof/CCS.h
@@ -168,12 +204,11 @@ library
                       rts/storage/MBlock.h
                       rts/storage/TSO.h
                       stg/DLL.h
-                      stg/HaskellMachRegs.h
                       stg/MachRegs.h
+                      stg/MachRegsForHost.h
                       stg/MiscClosures.h
                       stg/Prim.h
                       stg/Regs.h
-                      stg/RtsMachRegs.h
                       stg/SMP.h
                       stg/Ticky.h
                       stg/Types.h
@@ -217,12 +252,13 @@ library
          "-Wl,-u,_base_GHCziIOziException_cannotCompactFunction_closure"
          "-Wl,-u,_base_GHCziIOziException_cannotCompactPinned_closure"
          "-Wl,-u,_base_GHCziIOziException_cannotCompactMutable_closure"
-         "-Wl,-u,_base_ControlziExceptionziBase_absentSumFieldError_closure"
+         "-Wl,-u,_base_GHCziIOPort_doubleReadException_closure"
          "-Wl,-u,_base_ControlziExceptionziBase_nonTermination_closure"
          "-Wl,-u,_base_ControlziExceptionziBase_nestedAtomically_closure"
          "-Wl,-u,_base_GHCziEventziThread_blockedOnBadFD_closure"
          "-Wl,-u,_base_GHCziConcziSync_runSparks_closure"
          "-Wl,-u,_base_GHCziConcziIO_ensureIOManagerIsRunning_closure"
+         "-Wl,-u,_base_GHCziConcziIO_interruptIOManager_closure"
          "-Wl,-u,_base_GHCziConcziIO_ioManagerCapabilitiesChanged_closure"
          "-Wl,-u,_base_GHCziConcziSignal_runHandlersPtr_closure"
          "-Wl,-u,_base_GHCziTopHandler_flushStdHandles_closure"
@@ -264,6 +300,10 @@ library
          "-Wl,-u,_hs_cmpxchg8"
          "-Wl,-u,_hs_cmpxchg16"
          "-Wl,-u,_hs_cmpxchg32"
+         "-Wl,-u,_hs_xchg8"
+         "-Wl,-u,_hs_xchg16"
+         "-Wl,-u,_hs_xchg32"
+         "-Wl,-u,_hs_xchg64"
          "-Wl,-u,_hs_atomicread8"
          "-Wl,-u,_hs_atomicread16"
          "-Wl,-u,_hs_atomicread32"
@@ -293,12 +333,13 @@ library
          "-Wl,-u,base_GHCziIOziException_cannotCompactFunction_closure"
          "-Wl,-u,base_GHCziIOziException_cannotCompactPinned_closure"
          "-Wl,-u,base_GHCziIOziException_cannotCompactMutable_closure"
-         "-Wl,-u,base_ControlziExceptionziBase_absentSumFieldError_closure"
+         "-Wl,-u,base_GHCziIOPort_doubleReadException_closure"
          "-Wl,-u,base_ControlziExceptionziBase_nonTermination_closure"
          "-Wl,-u,base_ControlziExceptionziBase_nestedAtomically_closure"
          "-Wl,-u,base_GHCziEventziThread_blockedOnBadFD_closure"
          "-Wl,-u,base_GHCziConcziSync_runSparks_closure"
          "-Wl,-u,base_GHCziConcziIO_ensureIOManagerIsRunning_closure"
+         "-Wl,-u,base_GHCziConcziIO_interruptIOManager_closure"
          "-Wl,-u,base_GHCziConcziIO_ioManagerCapabilitiesChanged_closure"
          "-Wl,-u,base_GHCziConcziSignal_runHandlersPtr_closure"
          "-Wl,-u,base_GHCziTopHandler_flushStdHandles_closure"
@@ -340,6 +381,10 @@ library
          "-Wl,-u,hs_cmpxchg8"
          "-Wl,-u,hs_cmpxchg16"
          "-Wl,-u,hs_cmpxchg32"
+         "-Wl,-u,hs_xchg8"
+         "-Wl,-u,hs_xchg16"
+         "-Wl,-u,hs_xchg32"
+         "-Wl,-u,hs_xchg64"
          "-Wl,-u,hs_atomicread8"
          "-Wl,-u,hs_atomicread16"
          "-Wl,-u,hs_atomicread32"
@@ -351,10 +396,23 @@ library
         -- This symbol is useful in gdb, but not referred to anywhere,
         -- so we need to force it to be included in the binary.
         ld-options: "-Wl,-u,findPtr"
+         -- This symbol is useful in gdb, but not referred to anywhere,
+         -- so we need to force it to be included in the binary.
+         "-Wl,-u,findPtr"
+
+    if os(windows)
+      if flag(leading-underscore)
+        ld-options:
+           "-Wl,-u,_base_GHCziEventziWindows_processRemoteCompletion_closure"
+      else
+        ld-options:
+           "-Wl,-u,base_GHCziEventziWindows_processRemoteCompletion_closure"
 
     if os(osx)
       ld-options: "-Wl,-search_paths_first"
-      if !arch(x86_64)
+                  -- See Note [fd_set_overflow]
+                  "-Wl,-U,___darwin_check_fd_set_overflow"
+      if !arch(x86_64) && !arch(aarch64)
          ld-options: -read_only_relocs warning
 
     cmm-sources: Apply.cmm
@@ -369,18 +427,37 @@ library
                  -- AutoApply is generated
                  AutoApply.cmm
 
-    if arch(i386) || arch(powerpc) || arch(powerpc64)
-       asm-sources: AdjustorAsm.S
-    if arch(powerpc) || arch(powerpc64) || arch(powerpc64le)
-       asm-sources: StgCRunAsm.S
+    -- Adjustor stuff
+    if flag(libffi-adjustors)
+      c-sources: adjustor/LibffiAdjustor.c
+    else
+      -- Use GHC's native adjustors
+      if arch(i386)
+        asm-sources: AdjustorAsm.S
+        c-sources: adjustor/Nativei386.c
+      if arch(x86_64)
+        c-sources: adjustor/NativeAmd64.c
+      if arch(ppc) || arch(ppc64)
+        asm-sources: AdjustorAsm.S
+        c-sources: adjustor/NativePowerPC.c
+      if arch(ia64)
+        c-sources: adjustor/NativeIA64.c
+      if arch(sparc)
+        c-sources: adjustor/NativeSparc.c
+
+    -- Use assembler STG entrypoint on archictures where it is used
+    if arch(ppc) || arch(ppc64) || arch(s390x) || arch(riscv64)
+      asm-sources: StgCRunAsm.S
 
     c-sources: Adjustor.c
+               ExecPage.c
                Arena.c
                Capability.c
                CheckUnload.c
                ClosureFlags.c
                Disassembler.c
                FileLock.c
+               ForeignExports.c
                Globals.c
                Hash.c
                Heap.c
@@ -417,6 +494,7 @@ library
                STM.c
                Schedule.c
                Sparks.c
+               SpinLock.c
                StableName.c
                StablePtr.c
                StaticPtrTable.c
@@ -431,6 +509,7 @@ library
                Timer.c
                TopHandler.c
                Trace.c
+               TraverseHeap.c
                WSDeque.c
                Weak.c
                eventlog/EventLog.c
@@ -446,6 +525,8 @@ library
                linker/LoadArchive.c
                linker/M32Alloc.c
                linker/MachO.c
+               linker/macho/plt.c
+               linker/macho/plt_aarch64.c
                linker/PEi386.c
                linker/SymbolExtras.c
                linker/elf_got.c
@@ -465,17 +546,28 @@ library
                sm/GCUtils.c
                sm/MBlock.c
                sm/MarkWeak.c
+               sm/NonMoving.c
+               sm/NonMovingCensus.c
+               sm/NonMovingMark.c
+               sm/NonMovingScav.c
+               sm/NonMovingShortcut.c
+               sm/NonMovingSweep.c
                sm/Sanity.c
                sm/Scav.c
                sm/Scav_thr.c
                sm/Storage.c
                sm/Sweep.c
-               xxhash.c
                fs.c
                -- I wish we had wildcards..., this would be:
                -- *.c hooks/**/*.c sm/**/*.c eventlog/**/*.c linker/**/*.c
+
+    extra-source-files:
+               -- This file needs to be in the package but shouldn't be compiled on its own.
+               xxhash.c
+
     if os(windows)
-       c-sources: win32/AsyncIO.c
+       c-sources: win32/AsyncMIO.c
+                  win32/AsyncWinIO.c
                   win32/AwaitEvent.c
                   win32/ConsoleHandler.c
                   win32/GetEnv.c
@@ -498,3 +590,43 @@ library
                   posix/Signals.c
                   posix/TTY.c
                   -- posix/*.c -- we do not want itimer
+
+-- Note [fd_set_overflow]
+-- ~~~~~~~~~~~~~~~~~~~~~~
+-- In this note is the very sad tale of __darwin_fd_set_overflow.
+-- The 8.10.5 release was broken because it was built in an environment
+-- where the libraries were provided by XCode 12.*, these libraries introduced
+-- a reference to __darwin_fd_set_overflow via the FD_SET macro which is used in
+-- Select.c. Unfortunately, this symbol is not available with XCode 11.* which
+-- led to a linker error when trying to link anything. This is almost certainly
+-- a bug in XCode but we still have to work around it.
+
+-- Undefined symbols for architecture x86_64:
+--  "___darwin_check_fd_set_overflow", referenced from:
+--      _awaitEvent in libHSrts.a(Select.o)
+-- ld: symbol(s) not found for architecture x86_64
+
+-- One way to fix this is to upgrade your version of xcode, but this would
+-- force the upgrade on users prematurely. Fortunately it also seems safe to pass
+-- the linker option "-Wl,-U,___darwin_check_fd_set_overflow" because the usage of
+-- the symbol is guarded by a guard to check if it's defined.
+
+-- __header_always_inline int
+-- __darwin_check_fd_set(int _a, const void *_b)
+-- {
+--    if ((uintptr_t)&__darwin_check_fd_set_overflow != (uintptr_t) 0) {
+--#if defined(_DARWIN_UNLIMITED_SELECT) || defined(_DARWIN_C_SOURCE)
+--        return __darwin_check_fd_set_overflow(_a, _b, 1);
+--#else
+--        return __darwin_check_fd_set_overflow(_a, _b, 0);
+--#endif
+--    } else {
+--        return 1;
+--    }
+--}
+
+-- Across the internet there are many other reports of this issue
+--  See: https://github.com/mono/mono/issues/19393
+--     , https://github.com/sitsofe/fio/commit/b6a1e63a1ff607692a3caf3c2db2c3d575ba2320
+
+-- The issue was originally reported in #19950

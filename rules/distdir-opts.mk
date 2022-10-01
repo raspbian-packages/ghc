@@ -5,8 +5,8 @@
 # This file is part of the GHC build system.
 #
 # To understand how the build system works and how to modify it, see
-#      http://ghc.haskell.org/trac/ghc/wiki/Building/Architecture
-#      http://ghc.haskell.org/trac/ghc/wiki/Building/Modifying
+#      https://gitlab.haskell.org/ghc/ghc/wikis/building/architecture
+#      https://gitlab.haskell.org/ghc/ghc/wikis/building/modifying
 #
 # -----------------------------------------------------------------------------
 
@@ -89,14 +89,6 @@ $1_$2_ALL_HAPPY_OPTS = \
  $$($1_$2_HAPPY_OPTS) \
  $$(EXTRA_HAPPY_OPTS)
 
-# We don't bother splitting the bootstrap packages (built with stage 0)
-ifeq "$$($1_$2_SplitObjs)" ""
-ifeq "$$(SplitObjs) $3" "YES 1"
-$1_$2_SplitObjs = YES
-else
-$1_$2_SplitObjs = NO
-endif
-endif
 # Disable split sections when building with stage0, it won't be supported yet
 # and it's probably not very relevant anyway (smaller stage1 ghc?).
 ifeq "$$($1_$2_SplitSections)" ""

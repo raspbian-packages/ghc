@@ -21,13 +21,12 @@ import Distribution.Client.InstallPlan
   ( GenericPlanPackage(..)
   , toGraph
   )
+import Distribution.Client.NixStyleOptions
+         ( NixStyleFlags (..), nixStyleOptions, defaultNixStyleFlags )
 import Distribution.Client.Setup
-  ( ConfigExFlags
-  , ConfigFlags(configVerbosity)
+  ( ConfigFlags(configVerbosity)
   , GlobalFlags
-  , InstallFlags
   )
-import qualified Distribution.Client.Setup as Client
 import Distribution.Client.ProjectOrchestration
   ( ProjectBuildContext(..)
   , runProjectPreBuildPhase
@@ -49,7 +48,7 @@ import Distribution.Client.ProjectPlanning
   , ElaboratedSharedConfig(..)
   )
 import Distribution.Simple.Command
-  ( CommandUI(..)
+  ( CommandUI(..), optionName
   )
 import Distribution.Simple.Program.Db
   ( modifyProgramSearchPath
@@ -73,30 +72,27 @@ import Distribution.Simple.Program.Types
 import Distribution.Simple.GHC
   ( getImplInfo
   , GhcImplInfo(supportsPkgEnvFiles) )
-import Distribution.Simple.Setup
-  ( HaddockFlags
-  , TestFlags
-  , fromFlagOrDefault
+import Distribution.Simple.Flag
+  ( fromFlagOrDefault
   )
 import Distribution.Simple.Utils
   ( die'
   , info
+  , createDirectoryIfMissingVerbose
   , withTempDirectory
   , wrapText
   )
 import Distribution.Verbosity
-  ( Verbosity
-  , normal
+  ( normal
   )
 
 import Prelude ()
 import Distribution.Client.Compat.Prelude
 
-import Data.Set (Set)
 import qualified Data.Set as S
 import qualified Data.Map as M
 
-execCommand :: CommandUI (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags, TestFlags)
+execCommand :: CommandUI (NixStyleFlags ())
 execCommand = CommandUI
   { commandName = "v2-exec"
   , commandSynopsis = "Give a command access to the store."
@@ -117,14 +113,13 @@ execCommand = CommandUI
     ++ " to choose an appropriate version of ghc and to include any"
     ++ " ghc-specific flags requested."
   , commandNotes = Nothing
-  , commandOptions = commandOptions Client.installCommand
-  , commandDefaultFlags = commandDefaultFlags Client.installCommand
+  , commandOptions      = filter (\o -> optionName o /= "ignore-project")
+                        . nixStyleOptions (const [])
+  , commandDefaultFlags = defaultNixStyleFlags ()
   }
 
-execAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags, TestFlags)
-           -> [String] -> GlobalFlags -> IO ()
-execAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags)
-           extraArgs globalFlags = do
+execAction :: NixStyleFlags () -> [String] -> GlobalFlags -> IO ()
+execAction flags@NixStyleFlags {..} extraArgs globalFlags = do
 
   baseCtx <- establishProjectBaseContext verbosity cliConfig OtherCommand
 
@@ -193,11 +188,8 @@ execAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags)
         runProgramInvocation verbosity invocation
   where
     verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
-    cliConfig = commandLineFlagsToProjectConfig
-                  globalFlags configFlags configExFlags
-                  installFlags
+    cliConfig = commandLineFlagsToProjectConfig globalFlags flags
                   mempty -- ClientInstallFlags, not needed here
-                  haddockFlags testFlags
     withOverrides env args program = program
       { programOverrideEnv = programOverrideEnv program ++ env
       , programDefaultArgs = programDefaultArgs program ++ args}
@@ -219,11 +211,8 @@ withTempEnvFile :: Verbosity
                 -> PostBuildProjectStatus
                 -> ([(String, Maybe String)] -> IO a)
                 -> IO a
-withTempEnvFile verbosity
-                baseCtx
-                buildCtx
-                buildStatus
-                action =
+withTempEnvFile verbosity baseCtx buildCtx buildStatus action = do
+  createDirectoryIfMissingVerbose verbosity True (distTempDirectory (distDirLayout baseCtx))
   withTempDirectory
    verbosity
    (distTempDirectory (distDirLayout baseCtx))

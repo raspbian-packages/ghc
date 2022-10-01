@@ -53,8 +53,8 @@ import Prelude hiding (abs)
 import Rules
 import QuickCheckUtils
 #if defined(HAVE_TEST_FRAMEWORK)
-import Test.Framework
-import Test.Framework.Providers.QuickCheck2
+import Test.Tasty
+import Test.Tasty.QuickCheck
 #else
 import TestFramework
 #endif
@@ -177,6 +177,7 @@ prop_dropWhileBP    = L.dropWhile            `eq2`  P.dropWhile
 prop_filterBP       = L.filter               `eq2`  P.filter
 prop_findBP         = L.find                 `eq2`  P.find
 prop_findIndexBP    = L.findIndex            `eq2`  ((fmap toInt64 .) . P.findIndex)
+prop_findIndexEndBP = L.findIndexEnd         `eq2`  ((fmap toInt64 .) . P.findIndexEnd)
 prop_findIndicesBP  = L.findIndices          `eq2`  ((fmap toInt64 .) . P.findIndices)
 prop_isPrefixOfBP   = L.isPrefixOf           `eq2`  P.isPrefixOf
 prop_stripPrefixBP  = L.stripPrefix          `eq2`  P.stripPrefix
@@ -194,6 +195,7 @@ prop_takeWhileBP    = L.takeWhile            `eq2`  P.takeWhile
 prop_elemBP         = L.elem                 `eq2`  P.elem
 prop_notElemBP      = L.notElem              `eq2`  P.notElem
 prop_elemIndexBP    = L.elemIndex            `eq2`  ((fmap toInt64 .) . P.elemIndex)
+prop_elemIndexEndBP = L.elemIndexEnd         `eq2`  ((fmap toInt64 .) . P.elemIndexEnd)
 prop_elemIndicesBP  = L.elemIndices          `eq2`  ((fmap toInt64 .) . P.elemIndices)
 prop_intersperseBP  = L.intersperse          `eq2`  P.intersperse
 prop_lengthBP       = L.length               `eq1`  (toInt64 . P.length)
@@ -364,6 +366,7 @@ prop_filterBL       = L.filter                `eq2` (filter    :: (W -> Bool ) -
 prop_findBL         = L.find                  `eq2` (find      :: (W -> Bool) -> [W] -> Maybe W)
 prop_findIndicesBL  = L.findIndices           `eq2` ((fmap toInt64 .) . findIndices:: (W -> Bool) -> [W] -> [Int64])
 prop_findIndexBL    = L.findIndex             `eq2` ((fmap toInt64 .) . findIndex :: (W -> Bool) -> [W] -> Maybe Int64)
+prop_findIndexEndBL = L.findIndexEnd          `eq2` ((fmap toInt64 .) . findIndexEnd :: (W -> Bool) -> [W] -> Maybe Int64)
 prop_isPrefixOfBL   = L.isPrefixOf            `eq2` (isPrefixOf:: [W] -> [W] -> Bool)
 prop_stripPrefixBL  = L.stripPrefix           `eq2` (stripPrefix:: [W] -> [W] -> Maybe [W])
 prop_isSuffixOfBL   = L.isSuffixOf            `eq2` (isSuffixOf:: [W] -> [W] -> Bool)
@@ -379,6 +382,7 @@ prop_takeWhileBL    = L.takeWhile             `eq2` (takeWhile :: (W -> Bool) ->
 prop_elemBL         = L.elem                  `eq2` (elem      :: W -> [W] -> Bool)
 prop_notElemBL      = L.notElem               `eq2` (notElem   :: W -> [W] -> Bool)
 prop_elemIndexBL    = L.elemIndex             `eq2` ((fmap toInt64 .) . elemIndex   :: W -> [W] -> Maybe Int64)
+prop_elemIndexEndBL = L.elemIndexEnd          `eq2` ((fmap toInt64 .) . elemIndexEnd:: W -> [W] -> Maybe Int64)
 prop_elemIndicesBL  = L.elemIndices           `eq2` ((fmap toInt64 .) . elemIndices :: W -> [W] -> [Int64])
 prop_linesBL        = D.lines                 `eq1` (lines     :: String -> [String])
 
@@ -472,6 +476,7 @@ prop_partitionPL  = P.partition `eq2`    (partition :: (W -> Bool ) -> [W] -> ([
 prop_partitionLL  = L.partition `eq2`    (partition :: (W -> Bool ) -> [W] -> ([W],[W]))
 prop_findPL       = P.find      `eq2`    (find      :: (W -> Bool) -> [W] -> Maybe W)
 prop_findIndexPL  = P.findIndex `eq2`    (findIndex :: (W -> Bool) -> [W] -> Maybe Int)
+prop_findIndexEndPL = P.findIndexEnd `eq2` (findIndexEnd :: (W -> Bool) -> [W] -> Maybe Int)
 prop_isPrefixOfPL = P.isPrefixOf`eq2`    (isPrefixOf:: [W] -> [W] -> Bool)
 prop_isSuffixOfPL = P.isSuffixOf`eq2`    (isSuffixOf:: [W] -> [W] -> Bool)
 prop_isInfixOfPL  = P.isInfixOf `eq2`    (isInfixOf:: [W] -> [W] -> Bool)
@@ -719,6 +724,8 @@ prop_splitAt i xs = --collect (i >= 0 && i < length xs) $
 
 prop_takeWhile f xs = L.takeWhile f (pack xs) == pack (takeWhile f xs)
 prop_dropWhile f xs = L.dropWhile f (pack xs) == pack (dropWhile f xs)
+prop_takeWhileEnd f = P.takeWhileEnd f `eq1` (P.reverse . P.takeWhile f . P.reverse)
+prop_dropWhileEnd f = P.dropWhileEnd f `eq1` (P.reverse . P.dropWhile f . P.reverse)
 
 prop_break f xs = L.break f (pack xs) ==
     let (a,b) = break f xs in (pack a, pack b)
@@ -792,6 +799,7 @@ prop_elemIndices xs c = elemIndices c xs == map fromIntegral (L.elemIndices c (p
 prop_count c xs = length (L.elemIndices c xs) == fromIntegral (L.count c xs)
 
 prop_findIndex xs f = (findIndex f xs) == fmap fromIntegral (L.findIndex f (pack xs))
+prop_findIndexEnd xs f = (findIndexEnd f xs) == fmap fromIntegral (L.findIndexEnd f (pack xs))
 prop_findIndicies xs f = (findIndices f xs) == map fromIntegral (L.findIndices f (pack xs))
 
 prop_elem    xs c = (c `elem` xs)    == (c `L.elem` (pack xs))
@@ -1161,6 +1169,8 @@ prop_elemIndicesBB xs c = elemIndices c xs == P.elemIndices c (P.pack xs)
 
 prop_findIndexBB xs a = (findIndex (==a) xs) == (P.findIndex (==a) (P.pack xs))
 
+prop_findIndexEndBB xs a = (findIndexEnd (==a) xs) == (P.findIndexEnd (==a) (P.pack xs))
+
 prop_findIndiciesBB xs c = (findIndices (==c) xs) == (P.findIndices (==c) (P.pack xs))
 
 -- example properties from QuickCheck.Batch
@@ -1182,6 +1192,8 @@ prop_intersperseBB c xs = (intersperse c xs) == (P.unpack $ P.intersperse c (P.p
 
 prop_maximumBB xs = (not (null xs)) ==> (maximum xs) == (P.maximum ( P.pack xs ))
 prop_minimumBB xs = (not (null xs)) ==> (minimum xs) == (P.minimum ( P.pack xs ))
+
+prop_strip = C.strip `eq1` (C.dropSpace . C.reverse . C.dropSpace . C.reverse)
 
 -- prop_dropSpaceBB xs    = dropWhile isSpace xs == C.unpack (C.dropSpace (C.pack xs))
 -- prop_dropSpaceEndBB xs = (C.reverse . (C.dropWhile isSpace) . C.reverse) (C.pack xs) ==
@@ -1221,7 +1233,7 @@ prop_unfoldrBB c =
     forAll arbitrarySizedIntegral $ \n ->
       (fst $ C.unfoldrN n fn c) == (C.pack $ take n $ unfoldr fn c)
   where
-    fn x = Just (x, chr (ord x + 1))
+    fn x = Just (x, if x == maxBound then x else succ x)
 
 prop_prefixBB xs ys = isPrefixOf xs ys == (P.pack xs `P.isPrefixOf` P.pack ys)
 prop_prefixLL xs ys = isPrefixOf xs ys == (L.pack xs `L.isPrefixOf` L.pack ys)
@@ -1548,81 +1560,73 @@ prop_fromForeignPtr x = (let (a,b,c) = (P.toForeignPtr x)
 
 prop_read_write_file_P x = unsafePerformIO $ do
     tid <- myThreadId
-    let f = "qc-test-"++show tid
-    bracket
-        (do P.writeFile f x)
-        (const $ do removeFile f)
-        (const $ do y <- P.readFile f
-                    return (x==y))
+    let f = "qc-test-" ++ show tid
+    P.writeFile f x
+    y <- P.readFile f
+    removeFile f
+    return (x == y)
 
 prop_read_write_file_C x = unsafePerformIO $ do
     tid <- myThreadId
-    let f = "qc-test-"++show tid
-    bracket
-        (do C.writeFile f x)
-        (const $ do removeFile f)
-        (const $ do y <- C.readFile f
-                    return (x==y))
+    let f = "qc-test-" ++ show tid
+    C.writeFile f x
+    y <- C.readFile f
+    removeFile f
+    return (x == y)
 
 prop_read_write_file_L x = unsafePerformIO $ do
     tid <- myThreadId
-    let f = "qc-test-"++show tid
-    bracket
-        (do L.writeFile f x)
-        (const $ do removeFile f)
-        (const $ do y <- L.readFile f
-                    return (x==y))
+    let f = "qc-test-" ++ show tid
+    L.writeFile f x
+    y <- L.readFile f
+    L.length y `seq` removeFile f
+    return (x == y)
 
 prop_read_write_file_D x = unsafePerformIO $ do
     tid <- myThreadId
-    let f = "qc-test-"++show tid
-    bracket
-        (do D.writeFile f x)
-        (const $ do removeFile f)
-        (const $ do y <- D.readFile f
-                    return (x==y))
+    let f = "qc-test-" ++ show tid
+    D.writeFile f x
+    y <- D.readFile f
+    D.length y `seq` removeFile f
+    return (x == y)
 
 ------------------------------------------------------------------------
 
 prop_append_file_P x y = unsafePerformIO $ do
     tid <- myThreadId
-    let f = "qc-test-"++show tid
-    bracket
-        (do P.writeFile f x
-            P.appendFile f y)
-        (const $ do removeFile f)
-        (const $ do z <- P.readFile f
-                    return (z==(x `P.append` y)))
+    let f = "qc-test-" ++ show tid
+    P.writeFile f x
+    P.appendFile f y
+    z <- P.readFile f
+    removeFile f
+    return (z == x `P.append` y)
 
 prop_append_file_C x y = unsafePerformIO $ do
     tid <- myThreadId
-    let f = "qc-test-"++show tid
-    bracket
-        (do C.writeFile f x
-            C.appendFile f y)
-        (const $ do removeFile f)
-        (const $ do z <- C.readFile f
-                    return (z==(x `C.append` y)))
+    let f = "qc-test-" ++ show tid
+    C.writeFile f x
+    C.appendFile f y
+    z <- C.readFile f
+    removeFile f
+    return (z == x `C.append` y)
 
 prop_append_file_L x y = unsafePerformIO $ do
     tid <- myThreadId
-    let f = "qc-test-"++show tid
-    bracket
-        (do L.writeFile f x
-            L.appendFile f y)
-        (const $ do removeFile f)
-        (const $ do z <- L.readFile f
-                    return (z==(x `L.append` y)))
+    let f = "qc-test-" ++ show tid
+    L.writeFile f x
+    L.appendFile f y
+    z <- L.readFile f
+    L.length z `seq` removeFile f
+    return (z == x `L.append` y)
 
 prop_append_file_D x y = unsafePerformIO $ do
     tid <- myThreadId
-    let f = "qc-test-"++show tid
-    bracket
-        (do D.writeFile f x
-            D.appendFile f y)
-        (const $ do removeFile f)
-        (const $ do z <- D.readFile f
-                    return (z==(x `D.append` y)))
+    let f = "qc-test-" ++ show tid
+    D.writeFile f x
+    D.appendFile f y
+    z <- D.readFile f
+    D.length z `seq` removeFile f
+    return (z == x `D.append` y)
 
 prop_packAddress = C.pack "this is a test"
             ==
@@ -1727,7 +1731,7 @@ short_tests =
 -- The entry point
 
 main :: IO ()
-main = defaultMainWithArgs tests ["-o 3"] -- timeout if a test runs for >3 secs
+main = defaultMain $ testGroup "All" tests
 
 --
 -- And now a list of all the properties to test.
@@ -1827,6 +1831,7 @@ bl_tests =
     , testProperty "filter"      prop_filterBL
     , testProperty "find"        prop_findBL
     , testProperty "findIndex"   prop_findIndexBL
+    , testProperty "findIndexEnd"prop_findIndexEndBL
     , testProperty "findIndices" prop_findIndicesBL
     , testProperty "foldl"       prop_foldlBL
     , testProperty "foldl'"      prop_foldlBL'
@@ -1878,6 +1883,7 @@ bl_tests =
     , testProperty "notElem"     prop_notElemBL
     , testProperty "lines"       prop_linesBL
     , testProperty "elemIndex"   prop_elemIndexBL
+    , testProperty "elemIndexEnd"prop_elemIndexEndBL
     , testProperty "elemIndices" prop_elemIndicesBL
     , testProperty "concatMap"   prop_concatMapBL
     ]
@@ -1963,6 +1969,7 @@ bp_tests =
     , testProperty "filter"      prop_filterBP
     , testProperty "find"        prop_findBP
     , testProperty "findIndex"   prop_findIndexBP
+    , testProperty "findIndexEnd"prop_findIndexEndBP
     , testProperty "findIndices" prop_findIndicesBP
     , testProperty "foldl"       prop_foldlBP
     , testProperty "foldl'"      prop_foldlBP'
@@ -2014,6 +2021,7 @@ bp_tests =
     , testProperty "elem"        prop_elemBP
     , testProperty "notElem"     prop_notElemBP
     , testProperty "elemIndex"   prop_elemIndexBP
+    , testProperty "elemIndexEnd"prop_elemIndexEndBP
     , testProperty "elemIndices" prop_elemIndicesBP
     , testProperty "intersperse" prop_intersperseBP
     , testProperty "concatMap"   prop_concatMapBP
@@ -2037,6 +2045,7 @@ pl_tests =
     , testProperty "partition"   prop_partitionLL
     , testProperty "find"        prop_findPL
     , testProperty "findIndex"   prop_findIndexPL
+    , testProperty "findIndexEnd"prop_findIndexEndPL
     , testProperty "findIndices" prop_findIndicesPL
     , testProperty "foldl"       prop_foldlPL
     , testProperty "foldl'"      prop_foldlPL'
@@ -2217,6 +2226,7 @@ bb_tests =
     , testProperty "elemIndex 1"    prop_elemIndex1BB
     , testProperty "elemIndex 2"    prop_elemIndex2BB
     , testProperty "findIndex"      prop_findIndexBB
+    , testProperty "findIndexEnd"   prop_findIndexEndBB
     , testProperty "findIndicies"   prop_findIndiciesBB
     , testProperty "elemIndices"    prop_elemIndicesBB
     , testProperty "find"           prop_findBB
@@ -2229,6 +2239,7 @@ bb_tests =
     , testProperty "intersperse"    prop_intersperseBB
     , testProperty "maximum"        prop_maximumBB
     , testProperty "minimum"        prop_minimumBB
+    , testProperty "strip"          prop_strip
 --  , testProperty "breakChar"      prop_breakCharBB
 --  , testProperty "spanChar 1"     prop_spanCharBB
 --  , testProperty "spanChar 2"     prop_spanChar_1BB
@@ -2400,6 +2411,8 @@ ll_tests =
     , testProperty "splitAt"            prop_drop1
     , testProperty "takeWhile"          prop_takeWhile
     , testProperty "dropWhile"          prop_dropWhile
+    , testProperty "takeWhileEnd"       prop_takeWhileEnd
+    , testProperty "dropWhileEnd"       prop_dropWhileEnd
     , testProperty "break"              prop_break
     , testProperty "span"               prop_span
     , testProperty "splitAt"            prop_splitAt
@@ -2422,6 +2435,7 @@ ll_tests =
     , testProperty "elemIndices"        prop_elemIndices
     , testProperty "count/elemIndices"  prop_count
     , testProperty "findIndex"          prop_findIndex
+    , testProperty "findIndexEnd"       prop_findIndexEnd
     , testProperty "findIndices"        prop_findIndicies
     , testProperty "find"               prop_find
     , testProperty "find/findIndex"     prop_find_findIndex
@@ -2440,4 +2454,12 @@ ll_tests =
     , testProperty "isSpace"            prop_isSpaceWord8
     ]
 
+findIndexEnd :: (a -> Bool) -> [a] -> Maybe Int
+findIndexEnd p = go . findIndices p
+  where
+    go [] = Nothing
+    go (k:[]) = Just k
+    go (k:ks) = go ks
 
+elemIndexEnd :: Eq a => a -> [a] -> Maybe Int
+elemIndexEnd = findIndexEnd . (==)

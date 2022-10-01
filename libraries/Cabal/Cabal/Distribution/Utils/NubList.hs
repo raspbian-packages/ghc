@@ -1,5 +1,6 @@
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE DeriveGeneric      #-}
+{-# LANGUAGE DeriveDataTypeable  #-}
+{-# LANGUAGE DeriveGeneric       #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 module Distribution.Utils.NubList
     ( NubList    -- opaque
     , toNubList  -- smart construtor
@@ -12,8 +13,8 @@ module Distribution.Utils.NubList
     , overNubListR
     ) where
 
-import Prelude ()
 import Distribution.Compat.Prelude
+import Prelude ()
 
 import Distribution.Simple.Utils
 
@@ -66,7 +67,7 @@ instance (Ord a, Read a) => Read (NubList a) where
 
 -- | Helper used by NubList/NubListR's Read instances.
 readNubList :: (Read a) => ([a] -> l a) -> R.ReadPrec (l a)
-readNubList toList = R.parens . R.prec 10 $ fmap toList R.readPrec
+readNubList listToL = R.parens . R.prec 10 $ fmap listToL R.readPrec
 
 -- | Binary instance for 'NubList a' is the same as for '[a]'. For 'put', we
 -- just pull off constructor and put the list. For 'get', we get the list and
@@ -74,6 +75,8 @@ readNubList toList = R.parens . R.prec 10 $ fmap toList R.readPrec
 instance (Ord a, Binary a) => Binary (NubList a) where
     put (NubList l) = put l
     get = fmap toNubList get
+
+instance Structured a => Structured (NubList a)
 
 -- | NubListR : A right-biased version of 'NubList'. That is @toNubListR
 -- ["-XNoFoo", "-XFoo", "-XNoFoo"]@ will result in @["-XFoo", "-XNoFoo"]@,

@@ -38,9 +38,8 @@ module Distribution.Client.ProjectBuilding (
     BuildFailureReason(..),
   ) where
 
-#if !MIN_VERSION_base(4,8,0)
-import Control.Applicative ((<$>))
-#endif
+import Distribution.Client.Compat.Prelude
+import Prelude ()
 
 import           Distribution.Client.PackageHash (renderPackageHashInputs)
 import           Distribution.Client.RebuildMonad
@@ -91,32 +90,21 @@ import           Distribution.Simple.Compiler
 
 import           Distribution.Simple.Utils
 import           Distribution.Version
-import           Distribution.Verbosity
-import           Distribution.Pretty
 import           Distribution.Compat.Graph (IsNode(..))
 
-import           Data.Map (Map)
+import qualified Data.List.NonEmpty as NE
 import qualified Data.Map as Map
-import           Data.Set (Set)
 import qualified Data.Set as Set
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
-import           Data.List (isPrefixOf)
 
-import           Control.Monad
-import           Control.Exception
-import           Data.Function (on)
-import           Data.Maybe
+import Control.Exception (Handler (..), SomeAsyncException, assert, catches, handle)
+import System.Directory  (canonicalizePath, createDirectoryIfMissing, doesDirectoryExist, doesFileExist, removeFile, renameDirectory)
+import System.FilePath   (dropDrive, makeRelative, normalise, takeDirectory, (<.>), (</>))
+import System.IO         (IOMode (AppendMode), withFile)
 
-import           System.FilePath
-import           System.IO
-import           System.Directory
+import Distribution.Compat.Directory (listDirectory)
 
-#if !MIN_VERSION_directory(1,2,5)
-listDirectory :: FilePath -> IO [FilePath]
-listDirectory path =
-  (filter f) <$> (getDirectoryContents path)
-  where f filename = filename /= "." && filename /= ".."
-#endif
 
 ------------------------------------------------------------------------------
 -- * Overall building strategy.
@@ -212,13 +200,8 @@ rebuildTargetsDryRun distDirLayout@DistDirLayout{..} shared =
           -- artifacts under the shared dist directory.
           dryRunLocalPkg pkg depsBuildStatus srcdir
 
-        Just (RemoteSourceRepoPackage _repo srcdir) ->
-          -- At this point, source repos are essentially the same as local
-          -- dirs, since we've already download them.
-          dryRunLocalPkg pkg depsBuildStatus srcdir
-
-        -- The three tarball cases are handled the same as each other,
-        -- though depending on the build style.
+        -- The rest cases are all tarball cases are,
+        -- and handled the same as each other though depending on the build style.
         Just (LocalTarballPackage    tarball) ->
           dryRunTarballPkg pkg depsBuildStatus tarball
 
@@ -227,6 +210,10 @@ rebuildTargetsDryRun distDirLayout@DistDirLayout{..} shared =
 
         Just (RepoTarballPackage _ _ tarball) ->
           dryRunTarballPkg pkg depsBuildStatus tarball
+
+        Just (RemoteSourceRepoPackage _repo tarball) ->
+          dryRunTarballPkg pkg depsBuildStatus tarball
+
 
     dryRunTarballPkg :: ElaboratedConfiguredPackage
                      -> [BuildStatus]
@@ -295,7 +282,7 @@ foldMInstallPlanDepOrder visit =
       -- we go in the right order so the results map has entries for all deps
       let depresults :: [b]
           depresults =
-            map (\ipkgid -> let Just result = Map.lookup ipkgid results
+            map (\ipkgid -> let result = Map.findWithDefault (error "foldMInstallPlanDepOrder") ipkgid results
                               in result)
                 (InstallPlan.depends pkg)
       result <- visit pkg depresults
@@ -590,7 +577,7 @@ rebuildTargets verbosity
 
     createDirectoryIfMissingVerbose verbosity True distBuildRootDirectory
     createDirectoryIfMissingVerbose verbosity True distTempDirectory
-    mapM_ (createPackageDBIfMissing verbosity compiler progdb) packageDBsToUse
+    traverse_ (createPackageDBIfMissing verbosity compiler progdb) packageDBsToUse
 
     -- Before traversing the install plan, pre-emptively find all packages that
     -- will need to be downloaded and start downloading them.
@@ -605,7 +592,7 @@ rebuildTargets verbosity
         handle (\(e :: BuildFailure) -> return (Left e)) $ fmap Right $
 
         let uid = installedUnitId pkg
-            Just pkgBuildStatus = Map.lookup uid pkgsBuildStatus in
+            pkgBuildStatus = Map.findWithDefault (error "rebuildTargets") uid pkgsBuildStatus in
 
         rebuildTarget
           verbosity
@@ -765,7 +752,7 @@ asyncDownloadPackages verbosity withRepoCtx installPlan pkgsBuildStatus body
       | InstallPlan.Configured elab
          <- InstallPlan.reverseTopologicalOrder installPlan
       , let uid = installedUnitId elab
-            Just pkgBuildStatus = Map.lookup uid pkgsBuildStatus
+            pkgBuildStatus = Map.findWithDefault (error "asyncDownloadPackages") uid pkgsBuildStatus
       , BuildStatusDownload <- [pkgBuildStatus]
       ]
 
@@ -1013,7 +1000,7 @@ buildAndInstallUnpackedPackage verbosity
               listFilesRecursive :: FilePath -> IO [FilePath]
               listFilesRecursive path = do
                 files <- fmap (path </>) <$> (listDirectory path)
-                allFiles <- forM files $ \file -> do
+                allFiles <- for files $ \file -> do
                   isDir <- doesDirectoryExist file
                   if isDir
                     then listFilesRecursive file
@@ -1235,7 +1222,7 @@ buildInplaceUnpackedPackage verbosity
                 execRebuild srcdir (needElaboratedConfiguredPackage pkg)
               listSdist =
                 fmap (map monitorFileHashed) $
-                    allPackageSourceFiles verbosity scriptOptions srcdir
+                    allPackageSourceFiles verbosity srcdir
               ifNullThen m m' = do xs <- m
                                    if null xs then m' else return xs
           monitors <- case PD.buildType (elabPkgDescription pkg) of
@@ -1447,11 +1434,10 @@ withTempInstalledPackageInfoFile verbosity tempdir action =
       ++ show perror
 
     readPkgConf pkgConfDir pkgConfFile = do
-      (warns, ipkg) <-
-        withUTF8FileContents (pkgConfDir </> pkgConfFile) $ \pkgConfStr ->
-        case Installed.parseInstalledPackageInfo pkgConfStr of
-          Left perrors -> pkgConfParseFailed $ unlines perrors
-          Right (warns, ipkg) -> return (warns, ipkg)
+      pkgConfStr <- BS.readFile (pkgConfDir </> pkgConfFile)
+      (warns, ipkg) <- case Installed.parseInstalledPackageInfo pkgConfStr of
+        Left perrors -> pkgConfParseFailed $ unlines $ NE.toList perrors
+        Right (warns, ipkg) -> return (warns, ipkg)
 
       unless (null warns) $
         warn verbosity $ unlines warns

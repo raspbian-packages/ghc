@@ -6,12 +6,11 @@ module Distribution.Client.Nix
        , inNixShell
        , nixInstantiate
        , nixShell
-       , nixShellIfSandboxed
        ) where
 
 import Distribution.Client.Compat.Prelude
 
-import Control.Exception (bracket, catch)
+import Control.Exception (bracket)
 import System.Directory
        ( canonicalizePath, createDirectoryIfMissing, doesDirectoryExist
        , doesFileExist, removeDirectoryRecursive, removeFile )
@@ -25,8 +24,6 @@ import System.Process (showCommandForUser)
 import Distribution.Compat.Environment
        ( lookupEnv, setEnv, unsetEnv )
 
-import Distribution.Verbosity
-
 import Distribution.Simple.Program
        ( Program(..), ProgramDb
        , addKnownProgram, configureProgram, emptyProgramDb, getDbProgramOutput
@@ -36,7 +33,6 @@ import Distribution.Simple.Utils (debug, existsAndIsMoreRecentThan)
 
 import Distribution.Client.Config (SavedConfig(..))
 import Distribution.Client.GlobalFlags (GlobalFlags(..))
-import Distribution.Client.Sandbox.Types (UseSandbox(..))
 
 
 configureOneProgram :: Verbosity -> Program -> IO ProgramDb
@@ -86,7 +82,7 @@ nixInstantiate
   -> GlobalFlags
   -> SavedConfig
   -> IO ()
-nixInstantiate verb dist force globalFlags config =
+nixInstantiate verb dist force' globalFlags config =
   findNixExpr globalFlags config >>= \case
     Nothing -> return ()
     Just shellNix -> do
@@ -98,7 +94,7 @@ nixInstantiate verb dist force globalFlags config =
       let timestamp = timestampPath dist shellNix
       upToDate <- existsAndIsMoreRecentThan timestamp shellNix
 
-      let ready = alreadyInShell || (instantiated && upToDate && not force)
+      let ready = alreadyInShell || (instantiated && upToDate && not force')
       unless ready $ do
 
         let prog = simpleProgram "nix-instantiate"
@@ -184,19 +180,3 @@ removeGCRoots verb dist = do
   when exists $ do
     debug verb ("removing Nix gcroots from " ++ tgt)
     removeDirectoryRecursive tgt
-
-
-nixShellIfSandboxed
-  :: Verbosity
-  -> FilePath
-  -> GlobalFlags
-  -> SavedConfig
-  -> UseSandbox
-  -> IO ()
-     -- ^ The action to perform inside a nix-shell. This is also the action
-     -- that will be performed immediately if Nix is disabled.
-  -> IO ()
-nixShellIfSandboxed verb dist globalFlags config useSandbox go =
-  case useSandbox of
-    NoSandbox -> go
-    UseSandbox _ -> nixShell verb dist globalFlags config go

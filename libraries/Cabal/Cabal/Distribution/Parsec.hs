@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns        #-}
 {-# LANGUAGE CPP                 #-}
 {-# LANGUAGE FlexibleContexts    #-}
 {-# LANGUAGE GADTs               #-}
@@ -9,10 +10,14 @@ module Distribution.Parsec (
     runParsecParser,
     runParsecParser',
     simpleParsec,
+    simpleParsecBS,
+    simpleParsec',
+    simpleParsecW',
     lexemeParsec,
     eitherParsec,
     explicitEitherParsec,
-    -- * CabalParsing and and diagnostics
+    explicitEitherParsec',
+    -- * CabalParsing and diagnostics
     CabalParsing (..),
     -- ** Warnings
     PWarnType (..),
@@ -34,26 +39,29 @@ module Distribution.Parsec (
     parsecQuoted,
     parsecMaybeQuoted,
     parsecCommaList,
+    parsecCommaNonEmpty,
     parsecLeadingCommaList,
+    parsecLeadingCommaNonEmpty,
     parsecOptCommaList,
     parsecLeadingOptCommaList,
     parsecStandard,
     parsecUnqualComponentName,
     ) where
 
+import Data.ByteString                     (ByteString)
 import Data.Char                           (digitToInt, intToDigit)
-import Data.Functor.Identity               (Identity (..))
 import Data.List                           (transpose)
 import Distribution.CabalSpecVersion
 import Distribution.Compat.Prelude
 import Distribution.Parsec.Error           (PError (..), showPError)
-import Distribution.Parsec.FieldLineStream (FieldLineStream, fieldLineStreamFromString)
+import Distribution.Parsec.FieldLineStream (FieldLineStream, fieldLineStreamFromBS, fieldLineStreamFromString)
 import Distribution.Parsec.Position        (Position (..), incPos, retPos, showPos, zeroPos)
 import Distribution.Parsec.Warning         (PWarnType (..), PWarning (..), showPWarning)
 import Numeric                             (showIntAtBase)
 import Prelude ()
 
 import qualified Distribution.Compat.CharParsing as P
+import qualified Distribution.Compat.DList       as DList
 import qualified Distribution.Compat.MonadFail   as Fail
 import qualified Text.Parsec                     as Parsec
 
@@ -172,6 +180,32 @@ simpleParsec
     . runParsecParser lexemeParsec "<simpleParsec>"
     . fieldLineStreamFromString
 
+-- | Like 'simpleParsec' but for 'ByteString'
+simpleParsecBS :: Parsec a => ByteString -> Maybe a
+simpleParsecBS
+    = either (const Nothing) Just
+    . runParsecParser lexemeParsec "<simpleParsec>"
+    . fieldLineStreamFromBS
+
+-- | Parse a 'String' with 'lexemeParsec' using specific 'CabalSpecVersion'.
+--
+-- @since 3.4.0.0
+simpleParsec' :: Parsec a => CabalSpecVersion -> String -> Maybe a
+simpleParsec' spec
+    = either (const Nothing) Just
+    . runParsecParser' spec lexemeParsec "<simpleParsec>"
+    . fieldLineStreamFromString
+
+-- | Parse a 'String' with 'lexemeParsec' using specific 'CabalSpecVersion'.
+-- Fail if there are any warnings.
+--
+-- @since 3.4.0.0
+simpleParsecW' :: Parsec a => CabalSpecVersion -> String -> Maybe a
+simpleParsecW' spec
+    = either (const Nothing) (\(x, ws) -> if null ws then Just x else Nothing)
+    . runParsecParser' spec ((,) <$> lexemeParsec <*> liftParsec Parsec.getState) "<simpleParsec>"
+    . fieldLineStreamFromString
+
 -- | Parse a 'String' with 'lexemeParsec'.
 eitherParsec :: Parsec a => String -> Either String a
 eitherParsec = explicitEitherParsec parsec
@@ -181,6 +215,17 @@ explicitEitherParsec :: ParsecParser a -> String -> Either String a
 explicitEitherParsec parser
     = either (Left . show) Right
     . runParsecParser (parser <* P.spaces) "<eitherParsec>"
+    . fieldLineStreamFromString
+
+-- | Parse a 'String' with given 'ParsecParser' and 'CabalSpecVersion'. Trailing whitespace is accepted.
+-- See 'explicitEitherParsec'.
+--
+-- @since 3.4.0.0
+--
+explicitEitherParsec' :: CabalSpecVersion -> ParsecParser a -> String -> Either String a
+explicitEitherParsec' spec parser
+    = either (Left . show) Right
+    . runParsecParser' spec (parser <* P.spaces) "<eitherParsec>"
     . fieldLineStreamFromString
 
 -- | Run 'ParsecParser' with 'cabalSpecLatest'.
@@ -249,6 +294,9 @@ parsecStandard f = do
 parsecCommaList :: CabalParsing m => m a -> m [a]
 parsecCommaList p = P.sepBy (p <* P.spaces) (P.char ',' *> P.spaces P.<?> "comma")
 
+parsecCommaNonEmpty :: CabalParsing m => m a -> m (NonEmpty a)
+parsecCommaNonEmpty p = P.sepByNonEmpty (p <* P.spaces) (P.char ',' *> P.spaces P.<?> "comma")
+
 -- | Like 'parsecCommaList' but accept leading or trailing comma.
 --
 -- @
@@ -260,8 +308,21 @@ parsecLeadingCommaList :: CabalParsing m => m a -> m [a]
 parsecLeadingCommaList p = do
     c <- P.optional comma
     case c of
-        Nothing -> P.sepEndBy1 lp comma <|> pure []
-        Just _  -> P.sepBy1 lp comma
+        Nothing -> toList <$> P.sepEndByNonEmpty lp comma <|> pure []
+        Just _  -> toList <$> P.sepByNonEmpty lp comma
+  where
+    lp = p <* P.spaces
+    comma = P.char ',' *> P.spaces P.<?> "comma"
+
+-- |
+--
+-- @since 3.4.0.0
+parsecLeadingCommaNonEmpty :: CabalParsing m => m a -> m (NonEmpty a)
+parsecLeadingCommaNonEmpty p = do
+    c <- P.optional comma
+    case c of
+        Nothing -> P.sepEndByNonEmpty lp comma
+        Just _  -> P.sepByNonEmpty lp comma
   where
     lp = p <* P.spaces
     comma = P.char ',' *> P.spaces P.<?> "comma"
@@ -269,7 +330,7 @@ parsecLeadingCommaList p = do
 parsecOptCommaList :: CabalParsing m => m a -> m [a]
 parsecOptCommaList p = P.sepBy (p <* P.spaces) (P.optional comma)
   where
-    comma = P.char ',' *>  P.spaces
+    comma = P.char ',' *> P.spaces
 
 -- | Like 'parsecOptCommaList' but
 --
@@ -290,7 +351,7 @@ parsecLeadingOptCommaList p = do
     c <- P.optional comma
     case c of
         Nothing -> sepEndBy1Start <|> pure []
-        Just _  -> P.sepBy1 lp comma
+        Just _  -> toList <$> P.sepByNonEmpty lp comma
   where
     lp = p <* P.spaces
     comma = P.char ',' *> P.spaces P.<?> "comma"
@@ -310,15 +371,65 @@ parsecQuoted = P.between (P.char '"') (P.char '"')
 parsecMaybeQuoted :: CabalParsing m => m a -> m a
 parsecMaybeQuoted p = parsecQuoted p <|> p
 
-parsecUnqualComponentName :: CabalParsing m => m String
-parsecUnqualComponentName = intercalate "-" <$> P.sepBy1 component (P.char '-')
-  where
-    component :: CabalParsing m => m String
-    component = do
-      cs <- P.munch1 isAlphaNum
-      if all isDigit cs
-        then fail "all digits in portion of unqualified component name"
-        else return cs
+parsecUnqualComponentName :: forall m. CabalParsing m => m String
+parsecUnqualComponentName = state0 DList.empty where
+    --
+    -- using @kleene@ package we can easily see that
+    -- we need only two states to recognize
+    -- unqual-component-name
+    --
+    -- Compare with declarative
+    -- 'Distribution.FieldGrammar.Described.reUnqualComponent'.
+    --
+    -- @
+    -- import Kleene
+    -- import Kleene.Internal.Pretty
+    -- import Algebra.Lattice
+    -- import Data.Char
+    --
+    -- import qualified Data.RangeSet.Map as RSet
+    --
+    -- main = do
+    --     -- this is an approximation, to get an idea.
+    --     let component :: RE Char
+    --         component = star alphaNum <> alpha <> star alphaNum
+    --
+    --         alphaNum = alpha \/ num
+    --         alpha    = unions $ map char ['a'..'z']
+    --         num      = unions $ map char ['0'..'9']
+    --
+    --         re :: RE Char
+    --         re = component <> star (char '-' <> component)
+    --
+    --     putPretty re
+    --     putPretty $ fromTM re
+    -- @
+
+    state0 :: DList.DList Char -> m String
+    state0 acc = do
+        c <- ch -- <|> fail ("Invalid component, after " ++ DList.toList acc)
+        case () of
+            _ | isDigit c    -> state0 (DList.snoc acc c)
+              | isAlphaNum c -> state1 (DList.snoc acc c)
+              | c == '-'     -> fail ("Empty component, after " ++ DList.toList acc)
+              | otherwise    -> fail ("Internal error, after " ++ DList.toList acc)
+
+    state1 :: DList.DList Char -> m String
+    state1 acc = state1' acc `alt` return (DList.toList acc)
+
+    state1' :: DList.DList Char -> m String
+    state1' acc = do
+        c <- ch
+        case () of
+            _ | isAlphaNum c -> state1 (DList.snoc acc c)
+              | c == '-'     -> state0 (DList.snoc acc c)
+              | otherwise    -> fail ("Internal error, after " ++ DList.toList acc)
+
+    ch :: m Char
+    !ch = P.satisfy (\c -> isAlphaNum c || c == '-')
+
+    alt :: m String -> m String -> m String
+    !alt = (<|>)
 
 stringLiteral :: forall m. P.CharParsing m => m String
 stringLiteral = lit where
@@ -380,7 +491,9 @@ escapeCode = (charEsc <|> charNum <|> charAscii <|> charControl) P.<?> "escape c
                                      nomore :: m ()
                                      nomore = P.notFollowedBy anyd <|> toomuch
 
-                                     (low, ex : high) = splitAt bd dps
+                                     (low, ex, high) = case splitAt bd dps of
+                                        (low', ex' : high') -> (low', ex', high')
+                                        (_, _)              -> error "escapeCode: Logic error"
                                   in ((:) <$> P.choice low <*> atMost (length bds) anyd) <* nomore
                                      <|> ((:) <$> ex <*> ([] <$ nomore <|> bounded'' dps bds))
                                      <|> if not (null bds)

@@ -16,11 +16,11 @@ import qualified Distribution.Simple.Setup as Setup
 import Distribution.Simple.Command
 import Distribution.Simple.Utils
     ( wrapText )
-import Distribution.Verbosity 
-    ( Verbosity, normal )
+import Distribution.Verbosity
+    ( normal )
 
 import Control.Exception
-    ( SomeException(..), try )
+    ( try )
 import qualified Data.Text as T
 
 -- Tweaked versions of code from Main.
@@ -39,7 +39,7 @@ wrapperAction command verbosityFlag distPrefFlag =
     let verbosity' = Setup.fromFlagOrDefault normal (verbosityFlag flags)
 
     load <- try (loadConfigOrSandboxConfig verbosity' globalFlags)
-    let config = either (\(SomeException _) -> mempty) snd load
+    let config = either (\(SomeException _) -> mempty) id load
     distPref <- findSavedDistPref config (distPrefFlag flags)
     let setupScriptOptions = defaultSetupScriptOptions { useDistPref = distPref }
 
@@ -50,7 +50,7 @@ wrapperAction command verbosityFlag distPrefFlag =
 
 --
 
-class HasVerbosity a where 
+class HasVerbosity a where
     verbosity :: a -> Verbosity
 
 instance HasVerbosity (Setup.Flag Verbosity) where
@@ -59,14 +59,17 @@ instance HasVerbosity (Setup.Flag Verbosity) where
 instance (HasVerbosity a) => HasVerbosity (a, b) where
     verbosity (a, _) = verbosity a
 
-instance (HasVerbosity b) => HasVerbosity (a, b, c) where
-    verbosity (_ , b, _) = verbosity b
+instance (HasVerbosity a) => HasVerbosity (a, b, c) where
+    verbosity (a , _, _) = verbosity a
 
 instance (HasVerbosity a) => HasVerbosity (a, b, c, d) where
     verbosity (a, _, _, _) = verbosity a
 
 instance (HasVerbosity a) => HasVerbosity (a, b, c, d, e) where
     verbosity (a, _, _, _, _) = verbosity a
+
+instance (HasVerbosity a) => HasVerbosity (a, b, c, d, e, f) where
+    verbosity (a, _, _, _, _, _) = verbosity a
 
 instance HasVerbosity Setup.BuildFlags where
     verbosity = verbosity . Setup.buildVerbosity
@@ -92,12 +95,6 @@ instance HasVerbosity Client.UpdateFlags where
 instance HasVerbosity Setup.CleanFlags where
     verbosity = verbosity . Setup.cleanVerbosity
 
-instance HasVerbosity Client.SDistFlags where
-    verbosity = verbosity . Client.sDistVerbosity
-
-instance HasVerbosity Client.SandboxFlags where
-    verbosity = verbosity . Client.sandboxVerbosity
-
 instance HasVerbosity Setup.DoctestFlags where
     verbosity = verbosity . Setup.doctestVerbosity
 
@@ -108,22 +105,22 @@ legacyNote cmd = wrapText $
     "The v1-" ++ cmd ++ " command is a part of the legacy v1 style of cabal usage.\n\n" ++
 
     "It is a legacy feature and will be removed in a future release of cabal-install." ++
-    " Please file a bug if you cannot replicate a working v1- use case with the new-style" ++
+    " Please file a bug if you cannot replicate a working v1- use case with the nix-style" ++
     " commands.\n\n" ++
 
-    "For more information, see: https://wiki.haskell.org/Cabal/NewBuild\n"
+    "For more information, see: https://cabal.readthedocs.io/en/latest/nix-local-build-overview.html"
 
 toLegacyCmd :: CommandSpec (globals -> IO action) -> [CommandSpec (globals -> IO action)]
 toLegacyCmd mkSpec = [toLegacy mkSpec]
-    where
-        toLegacy (CommandSpec origUi@CommandUI{..} action type') = CommandSpec legUi action type'
-            where
-                legUi = origUi
-                    { commandName = "v1-" ++ commandName
-                    , commandNotes = Just $ \pname -> case commandNotes of
-                        Just notes -> notes pname ++ "\n" ++ legacyNote commandName
-                        Nothing -> legacyNote commandName
-                    }
+  where
+    toLegacy (CommandSpec origUi@CommandUI{..} action type') = CommandSpec legUi action type'
+      where
+        legUi = origUi
+            { commandName = "v1-" ++ commandName
+            , commandNotes = Just $ \pname -> case commandNotes of
+                Just notes -> notes pname ++ "\n" ++ legacyNote commandName
+                Nothing -> legacyNote commandName
+            }
 
 legacyCmd :: (HasVerbosity flags) => CommandUI flags -> (flags -> [String] -> globals -> IO action) -> [CommandSpec (globals -> IO action)]
 legacyCmd ui action = toLegacyCmd (regularCmd ui action)
@@ -137,17 +134,17 @@ newCmd origUi@CommandUI{..} action = [cmd defaultUi, cmd newUi, cmd origUi]
         cmd ui = CommandSpec ui (flip commandAddAction action) NormalCommand
 
         newMsg = T.unpack . T.replace "v2-" "new-" . T.pack
-        newUi = origUi 
+        newUi = origUi
             { commandName = newMsg commandName
             , commandUsage = newMsg . commandUsage
             , commandDescription = (newMsg .) <$> commandDescription
-            , commandNotes = (newMsg .) <$> commandDescription
+            , commandNotes = (newMsg .) <$> commandNotes
             }
 
         defaultMsg = T.unpack . T.replace "v2-" "" . T.pack
-        defaultUi = origUi 
+        defaultUi = origUi
             { commandName = defaultMsg commandName
             , commandUsage = defaultMsg . commandUsage
             , commandDescription = (defaultMsg .) <$> commandDescription
-            , commandNotes = (defaultMsg .) <$> commandDescription
+            , commandNotes = (defaultMsg .) <$> commandNotes
             }

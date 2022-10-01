@@ -290,7 +290,7 @@ static StgWord app_ptrs_itbl[] = {
 };
 
 HsStablePtr rts_breakpoint_io_action; // points to the IO action which is executed on a breakpoint
-                                      // it is set in main/GHC.hs:runStmt
+                                      // it is set in compiler/GHC.hs:runStmt
 
 Capability *
 interpretBCO (Capability* cap)
@@ -427,7 +427,7 @@ eval_obj:
             // pointer to a FUN is tagged on the stack or elsewhere,
             // so we fix the tag here. (#13767)
             // For full details of the invariants on tagging, see
-            // https://ghc.haskell.org/trac/ghc/wiki/Commentary/Rts/HaskellExecution/PointerTagging
+            // https://gitlab.haskell.org/ghc/ghc/wikis/commentary/rts/haskell-execution/pointer-tagging
             tagged_obj =
                 newEmptyPAP(cap,
                             arity <= TAG_MASK
@@ -1423,11 +1423,11 @@ run_BCO:
         }
 
         case bci_ALLOC_AP: {
-            StgAP* ap;
             int n_payload = BCO_NEXT;
-            ap = (StgAP*)allocate(cap, AP_sizeW(n_payload));
+            StgAP *ap = (StgAP*)allocate(cap, AP_sizeW(n_payload));
             SpW(-1) = (W_)ap;
             ap->n_args = n_payload;
+            ap->arity = 0;
             // No write barrier is needed here as this is a new allocation
             // visible only from our stack
             SET_HDR(ap, &stg_AP_info, cap->r.rCCCS)
@@ -1436,11 +1436,11 @@ run_BCO:
         }
 
         case bci_ALLOC_AP_NOUPD: {
-            StgAP* ap;
             int n_payload = BCO_NEXT;
-            ap = (StgAP*)allocate(cap, AP_sizeW(n_payload));
+            StgAP *ap = (StgAP*)allocate(cap, AP_sizeW(n_payload));
             SpW(-1) = (W_)ap;
             ap->n_args = n_payload;
+            ap->arity = 0;
             // No write barrier is needed here as this is a new allocation
             // visible only from our stack
             SET_HDR(ap, &stg_AP_NOUPD_info, cap->r.rCCCS)

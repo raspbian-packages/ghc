@@ -20,7 +20,20 @@
 typedef struct {
   CostCentreStack *ccs;
   union {
-    struct _RetainerSet *rs;  /* Retainer Set */
+
+    union {
+      /* Accessor for the least significant bit of the entire union. Invariant:
+       * This must be at least as large as the largest field in this union for
+       * this to work. If you add more fields make sure you maintain this.
+       *
+       * See Note [Profiling heap traversal visited bit].
+       */
+      StgWord lsb;
+
+      /* Retainer Set */
+      struct _RetainerSet *rs;
+    } trav;
+
     StgWord ldvw;             /* Lag/Drag/Void Word */
   } hp;
 } StgProfHeader;
@@ -81,7 +94,7 @@ typedef struct StgClosure_ {
     struct StgClosure_ *payload[];
 } *StgClosurePtr; // StgClosure defined in rts/Types.h
 
-typedef struct {
+typedef struct StgThunk_ {
     StgThunkHeader  header;
     struct StgClosure_ *payload[];
 } StgThunk;
@@ -91,6 +104,12 @@ typedef struct {
     StgClosure *selectee;
 } StgSelector;
 
+/*
+   PAP payload contains pointers and non-pointers interleaved and we only have
+   one info table for PAPs (stg_PAP_info). To visit pointers in a PAP payload we
+   use the `fun`s bitmap. For a PAP with n_args arguments the first n_args bits
+   in the fun's bitmap tell us which payload locations contain pointers.
+*/
 typedef struct {
     StgHeader   header;
     StgHalfWord arity;          /* zero if it is an AP */
@@ -321,9 +340,9 @@ typedef struct StgTVarWatchQueue_ {
 
 typedef struct {
   StgHeader                  header;
-  StgClosure                *volatile current_value;
-  StgTVarWatchQueue         *volatile first_watch_queue_entry;
-  StgInt                     volatile num_updates;
+  StgClosure                *current_value; /* accessed via atomics */
+  StgTVarWatchQueue         *first_watch_queue_entry; /* accessed via atomics */
+  StgInt                     num_updates; /* accessed via atomics */
 } StgTVar;
 
 /* new_value == expected_value for read-only accesses */
@@ -467,4 +486,7 @@ typedef struct StgCompactNFData_ {
     StgClosure *result;
       // Used temporarily to store the result of compaction.  Doesn't need to be
       // a GC root.
+    struct StgCompactNFData_ *link;
+      // Used by compacting GC for linking CNFs with threaded hash tables. See
+      // Note [CNFs in compacting GC] in Compact.c for details.
 } StgCompactNFData;

@@ -27,16 +27,16 @@ import Distribution.Compat.Prelude
 import Distribution.Backpack
 import Distribution.Compat.Semigroup (First'(..), Last'(..), Option'(..))
 import Distribution.Simple.GHC.ImplInfo
-import Distribution.PackageDescription hiding (Flag)
+import Distribution.PackageDescription
 import Distribution.ModuleName
-import Distribution.Simple.Compiler hiding (Flag)
-import qualified Distribution.Simple.Compiler as Compiler (Flag)
+import Distribution.Simple.Compiler
 import Distribution.Simple.Flag
 import Distribution.Simple.Program.Types
 import Distribution.Simple.Program.Run
 import Distribution.System
 import Distribution.Pretty
 import Distribution.Types.ComponentId
+import Distribution.Types.ModuleRenaming
 import Distribution.Verbosity
 import Distribution.Version
 import Distribution.Utils.NubList
@@ -45,7 +45,6 @@ import Language.Haskell.Extension
 import Data.List (stripPrefix)
 import qualified Data.Map as Map
 import Data.Monoid (All(..), Any(..), Endo(..))
-import Data.Set (Set)
 import qualified Data.Set as Set
 
 normaliseGhcArgs :: Maybe Version -> PackageDescription -> [String] -> [String]
@@ -56,7 +55,7 @@ normaliseGhcArgs (Just ghcVersion) PackageDescription{..} ghcArgs
     supportedGHCVersions :: VersionRange
     supportedGHCVersions = intersectVersionRanges
         (orLaterVersion (mkVersion [8,0]))
-        (earlierVersion (mkVersion [8,9]))
+        (earlierVersion (mkVersion [9,1]))
 
     from :: Monoid m => [Int] -> m -> m
     from version flags
@@ -193,6 +192,11 @@ normaliseGhcArgs (Just ghcVersion) PackageDescription{..} ghcArgs
                 ]
             , from [8,4] ["show-loaded-modules"]
             , from [8,6] [ "ghci-leak-check", "no-it" ]
+            , from [8,10]
+                [ "defer-diagnostics"      -- affects printing of diagnostics
+                , "keep-going"             -- try harder, the build will still fail if it's erroneous
+                , "print-axiom-incomps"    -- print more debug info for closed type families
+                ]
             ]
       , flagIn . invertibleFlagSet "-d" $ [ "ppr-case-as-let", "ppr-ticks" ]
       , isOptIntFlag
@@ -233,6 +237,7 @@ normaliseGhcArgs (Just ghcVersion) PackageDescription{..} ghcArgs
       , from [8,4] $ to [8,6] [ "-fno-max-valid-substitutions" ]
       , from [8,6] [ "-dhex-word-literals" ]
       , from [8,8] [ "-fshow-docs-of-hole-fits", "-fno-show-docs-of-hole-fits" ]
+      , from [9,0] [ "-dlinear-core-lint" ]
       ]
 
     isOptIntFlag :: String -> Any
@@ -453,7 +458,7 @@ data GhcOptions = GhcOptions {
 
   -- | A GHC version-dependent mapping of extensions to flags. This must be
   -- set to be able to make use of the 'ghcOptExtensions'.
-  ghcOptExtensionMap    :: Map Extension (Maybe Compiler.Flag),
+  ghcOptExtensionMap    :: Map Extension (Maybe CompilerFlag),
 
   ----------------
   -- Compilation
@@ -681,7 +686,11 @@ renderGhcOptions comp _platform@(Platform _arch os) opts
   , concat [ [ "-optP-include", "-optP" ++ inc]
            | inc <- flags ghcOptCppIncludes ]
   , [ "-optc" ++ opt | opt <- ghcOptCcOptions opts]
-  , [ "-optc" ++ opt | opt <- ghcOptCxxOptions opts]
+  , -- C++ compiler options: GHC >= 8.10 requires -optcxx, older requires -optc
+    let cxxflag = case compilerCompatVersion GHC comp of
+                Just v | v >= mkVersion [8, 10] -> "-optcxx"
+                _ -> "-optc"
+    in [ cxxflag ++ opt | opt <- ghcOptCxxOptions opts]
   , [ "-opta" ++ opt | opt <- ghcOptAsmOptions opts]
 
   -----------------
@@ -764,8 +773,10 @@ renderGhcOptions comp _platform@(Platform _arch os) opts
   ---------------
   -- Inputs
 
-  , [ prettyShow modu | modu <- flags ghcOptInputModules ]
+  -- Specify the input file(s) first, so that in ghci the `main-is` module is
+  -- in scope instead of the first module defined in `other-modules`.
   , flags ghcOptInputFiles
+  , [ prettyShow modu | modu <- flags ghcOptInputModules ]
 
   , concat [ [ "-o",    out] | out <- flag ghcOptOutputFile ]
   , concat [ [ "-dyno", out] | out <- flag ghcOptOutputDynFile ]
@@ -806,7 +817,7 @@ packageDbArgsConf dbstack = case dbstack of
                   ++ show dbstack
 
 -- | GHC >= 7.6 uses the '-package-db' flag. See
--- https://ghc.haskell.org/trac/ghc/ticket/5977.
+-- https://gitlab.haskell.org/ghc/ghc/-/issues/5977.
 packageDbArgsDb :: PackageDBStack -> [String]
 -- special cases to make arguments prettier in common scenarios
 packageDbArgsDb dbstack = case dbstack of

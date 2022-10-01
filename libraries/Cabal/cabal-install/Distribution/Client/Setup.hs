@@ -21,17 +21,15 @@ module Distribution.Client.Setup
     , configureCommand, ConfigFlags(..), configureOptions, filterConfigureFlags
     , configPackageDB', configCompilerAux'
     , configureExCommand, ConfigExFlags(..), defaultConfigExFlags
-    , buildCommand, BuildFlags(..), BuildExFlags(..), SkipAddSourceDepsCheck(..)
+    , buildCommand, BuildFlags(..)
     , filterTestFlags
-    , replCommand, testCommand, benchmarkCommand, testOptions
+    , replCommand, testCommand, benchmarkCommand, testOptions, benchmarkOptions
                         , configureExOptions, reconfigureCommand
     , installCommand, InstallFlags(..), installOptions, defaultInstallFlags
     , filterHaddockArgs, filterHaddockFlags, haddockOptions
     , defaultSolver, defaultMaxBackjumps
-    , listCommand, ListFlags(..)
+    , listCommand, ListFlags(..), listNeedsCompiler
     , updateCommand, UpdateFlags(..), defaultUpdateFlags
-    , upgradeCommand
-    , uninstallCommand
     , infoCommand, InfoFlags(..)
     , fetchCommand, FetchFlags(..)
     , freezeCommand, FreezeFlags(..)
@@ -44,10 +42,7 @@ module Distribution.Client.Setup
     , reportCommand, ReportFlags(..)
     , runCommand
     , initCommand, initOptions, IT.InitFlags(..)
-    , sdistCommand, SDistFlags(..)
-    , win32SelfUpgradeCommand, Win32SelfUpgradeFlags(..)
     , actAsSetupCommand, ActAsSetupFlags(..)
-    , sandboxCommand, defaultSandboxLocation, SandboxFlags(..)
     , execCommand, ExecFlags(..), defaultExecFlags
     , userConfigCommand, UserConfigFlags(..)
     , manpageCommand
@@ -60,30 +55,26 @@ module Distribution.Client.Setup
     , parsePackageArgs
     , liftOptions
     , yesNoOpt
-    --TODO: stop exporting these:
-    , showRepo
-    , parseRepo
-    , readRepo
     ) where
 
 import Prelude ()
 import Distribution.Client.Compat.Prelude hiding (get)
 
-import Distribution.Deprecated.ReadP (readP_to_E)
+import Distribution.Client.Types.Credentials (Username (..), Password (..))
+import Distribution.Client.Types.Repo (RemoteRepo(..), LocalRepo (..))
+import Distribution.Client.Types.AllowNewer (AllowNewer(..), AllowOlder(..), RelaxDeps(..))
+import Distribution.Client.Types.WriteGhcEnvironmentFilesPolicy
 
-import Distribution.Client.Types
-         ( Username(..), Password(..), RemoteRepo(..)
-         , AllowNewer(..), AllowOlder(..), RelaxDeps(..)
-         , WriteGhcEnvironmentFilesPolicy(..)
-         )
 import Distribution.Client.BuildReports.Types
          ( ReportLevel(..) )
 import Distribution.Client.Dependency.Types
          ( PreSolver(..) )
-import Distribution.Client.IndexUtils.Timestamp
-         ( IndexState(..) )
+import Distribution.Client.IndexUtils.ActiveRepos
+         ( ActiveRepos )
+import Distribution.Client.IndexUtils.IndexState
+         ( TotalIndexState, headTotalIndexState )
 import qualified Distribution.Client.Init.Types as IT
-         ( InitFlags(..), PackageType(..) )
+         ( InitFlags(..), PackageType(..), defaultInitFlags )
 import Distribution.Client.Targets
          ( UserConstraint, readUserConstraint )
 import Distribution.Utils.NubList
@@ -99,14 +90,17 @@ import qualified Distribution.Simple.Command as Command
 import Distribution.Simple.Configure
        ( configCompilerAuxEx, interpretPackageDbFlags, computeEffectiveProfiling )
 import qualified Distribution.Simple.Setup as Cabal
+import Distribution.Simple.Flag
+         ( Flag(..), toFlag, flagToMaybe, flagToList, maybeToFlag
+         , flagElim, fromFlagOrDefault
+         )
 import Distribution.Simple.Setup
          ( ConfigFlags(..), BuildFlags(..), ReplFlags
-         , TestFlags, BenchmarkFlags(..)
-         , SDistFlags(..), HaddockFlags(..)
+         , TestFlags, BenchmarkFlags
+         , HaddockFlags(..)
          , CleanFlags(..), DoctestFlags(..)
          , CopyFlags(..), RegisterFlags(..)
          , readPackageDbList, showPackageDbList
-         , Flag(..), toFlag, flagToMaybe, flagToList, maybeToFlag
          , BooleanFlag(..), optionVerbosity
          , boolOpt, boolOpt', trueArg, falseArg
          , optionNumJobs )
@@ -114,10 +108,9 @@ import Distribution.Simple.InstallDirs
          ( PathTemplate, InstallDirs(..)
          , toPathTemplate, fromPathTemplate, combinePathTemplate )
 import Distribution.Version
-         ( Version, mkVersion, nullVersion, anyVersion, thisVersion )
+         ( Version, mkVersion )
 import Distribution.Package
-         ( PackageName, PackageIdentifier, packageName, packageVersion )
-import Distribution.Types.Dependency
+         ( PackageName )
 import Distribution.Types.GivenComponent
          ( GivenComponent(..) )
 import Distribution.Types.PackageVersionConstraint
@@ -127,30 +120,24 @@ import Distribution.Types.UnqualComponentName
 import Distribution.PackageDescription
          ( BuildType(..), RepoKind(..), LibraryName(..) )
 import Distribution.System ( Platform )
-import Distribution.Deprecated.Text
-         ( Text(..), display )
 import Distribution.ReadE
-         ( ReadE(..), succeedReadE )
-import qualified Distribution.Deprecated.ReadP as Parse
-         ( ReadP, char, munch1, pfail, sepBy1, (+++) )
-import Distribution.Deprecated.ParseUtils
-         ( readPToMaybe )
+         ( ReadE(..), succeedReadE, parsecToReadE )
+import qualified Distribution.Compat.CharParsing as P
 import Distribution.Verbosity
-         ( Verbosity, lessVerbose, normal, verboseNoFlags, verboseNoTimestamp )
+         ( lessVerbose, normal, verboseNoFlags, verboseNoTimestamp )
 import Distribution.Simple.Utils
-         ( wrapText, wrapLine )
+         ( wrapText )
 import Distribution.Client.GlobalFlags
          ( GlobalFlags(..), defaultGlobalFlags
          , RepoContext(..), withRepoContext
          )
+import Distribution.Client.ManpageFlags (ManpageFlags, defaultManpageFlags, manpageOptions)
+import Distribution.FieldGrammar.Newtypes (SpecVersion (..))
 
 import Data.List
          ( deleteFirstsBy )
-import qualified Data.Set as Set
 import System.FilePath
          ( (</>) )
-import Network.URI
-         ( parseAbsoluteURI, uriToString )
 
 globalCommand :: [Command action] -> CommandUI GlobalFlags
 globalCommand commands = CommandUI {
@@ -211,6 +198,7 @@ globalCommand commands = CommandUI {
           , "new-install"
           , "new-clean"
           , "new-sdist"
+          , "list-bin"
           -- v1 commands, stateful style
           , "v1-build"
           , "v1-configure"
@@ -229,7 +217,6 @@ globalCommand commands = CommandUI {
           , "v1-copy"
           , "v1-register"
           , "v1-reconfigure"
-          , "v1-sandbox"
           -- v2 commands, nix-style
           , "v2-build"
           , "v2-configure"
@@ -289,21 +276,7 @@ globalCommand commands = CommandUI {
         , addCmd "haddock"
         , addCmd "hscolour"
         , addCmd "exec"
-        , par
-        , startGroup "new-style projects (beta)"
-        , addCmd "new-build"
-        , addCmd "new-configure"
-        , addCmd "new-repl"
-        , addCmd "new-run"
-        , addCmd "new-test"
-        , addCmd "new-bench"
-        , addCmd "new-freeze"
-        , addCmd "new-haddock"
-        , addCmd "new-exec"
-        , addCmd "new-update"
-        , addCmd "new-install"
-        , addCmd "new-clean"
-        , addCmd "new-sdist"
+        , addCmd "list-bin"
         , par
         , startGroup "new-style projects (forwards-compatible aliases)"
         , addCmd "v2-build"
@@ -338,7 +311,6 @@ globalCommand commands = CommandUI {
         , addCmd "v1-copy"
         , addCmd "v1-register"
         , addCmd "v1-reconfigure"
-        , addCmd "v1-sandbox"
         ] ++ if null otherCmds then [] else par
                                            :startGroup "other"
                                            :[addCmd n | n <- otherCmds])
@@ -379,25 +351,10 @@ globalCommand commands = CommandUI {
          globalConfigFile (\v flags -> flags { globalConfigFile = v })
          (reqArgFlag "FILE")
 
-      ,option [] ["sandbox-config-file"]
-         "Set an alternate location for the sandbox config file (default: './cabal.sandbox.config')"
-         globalSandboxConfigFile (\v flags -> flags { globalSandboxConfigFile = v })
-         (reqArgFlag "FILE")
-
       ,option [] ["default-user-config"]
          "Set a location for a cabal.config file for projects without their own cabal.config freeze file."
          globalConstraintsFile (\v flags -> flags {globalConstraintsFile = v})
          (reqArgFlag "FILE")
-
-      ,option [] ["require-sandbox"]
-         "requiring the presence of a sandbox for sandbox-aware commands"
-         globalRequireSandbox (\v flags -> flags { globalRequireSandbox = v })
-         (boolOpt' ([], ["require-sandbox"]) ([], ["no-require-sandbox"]))
-
-      ,option [] ["ignore-sandbox"]
-         "Ignore any existing sandbox"
-         globalIgnoreSandbox (\v flags -> flags { globalIgnoreSandbox = v })
-         trueArg
 
       ,option [] ["ignore-expiry"]
          "Ignore expiry dates on signed metadata (use only in exceptional circumstances)"
@@ -412,6 +369,7 @@ globalCommand commands = CommandUI {
          "Nix integration: run commands through nix-shell if a 'shell.nix' file exists"
          globalNix (\v flags -> flags { globalNix = v })
          (boolOpt [] [])
+
       ]
 
     -- arguments we don't want shown in the help
@@ -420,17 +378,17 @@ globalCommand commands = CommandUI {
        option [] ["remote-repo"]
          "The name and url for a remote repository"
          globalRemoteRepos (\v flags -> flags { globalRemoteRepos = v })
-         (reqArg' "NAME:URL" (toNubList . maybeToList . readRepo) (map showRepo . fromNubList))
+         (reqArg' "NAME:URL" (toNubList . maybeToList . readRemoteRepo) (map showRemoteRepo . fromNubList))
+
+      ,option [] ["local-no-index-repo"]
+         "The name and a path for a local no-index repository"
+         globalLocalNoIndexRepos (\v flags -> flags { globalLocalNoIndexRepos = v })
+         (reqArg' "NAME:PATH" (toNubList . maybeToList . readLocalRepo) (map showLocalRepo . fromNubList))
 
       ,option [] ["remote-repo-cache"]
          "The location where downloads from all remote repos are cached"
          globalCacheDir (\v flags -> flags { globalCacheDir = v })
          (reqArgFlag "DIR")
-
-      ,option [] ["local-repo"]
-         "The location of a local repository"
-         globalLocalRepos (\v flags -> flags { globalLocalRepos = v })
-         (reqArg' "DIR" (\x -> toNubList [x]) fromNubList)
 
       ,option [] ["logs-dir", "logsdir"]
          "The location to put log files"
@@ -446,6 +404,13 @@ globalCommand commands = CommandUI {
          "The location of the nix-local-build store"
          globalStoreDir (\v flags -> flags { globalStoreDir = v })
          (reqArgFlag "DIR")
+
+      , option [] ["active-repositories"]
+         "The active package repositories"
+         globalActiveRepos (\v flags ->  flags { globalActiveRepos = v })
+         (reqArg "REPOS" (parsecToReadE (\err -> "Error parsing active-repositories: " ++ err)
+                                        (toFlag `fmap` parsec))
+                         (map prettyShow . flagToList))
       ]
 
 -- ------------------------------------------------------------
@@ -534,6 +499,8 @@ filterConfigureFlags flags cabalLibVersion
               convertToLegacyInternalDep (GivenComponent pn LMainLibName cid) =
                 Just $ GivenComponent pn LMainLibName cid
           in catMaybes $ convertToLegacyInternalDep <$> configDependencies flags
+        -- Cabal < 2.5 doesn't know about '--allow-depending-on-private-libs'.
+      , configAllowDependingOnPrivateLibs = NoFlag
         -- Cabal < 2.5 doesn't know about '--enable/disable-executable-static'.
       , configFullyStaticExe = NoFlag
       }
@@ -643,7 +610,7 @@ data ConfigExFlags = ConfigExFlags {
     configWriteGhcEnvironmentFilesPolicy
       :: Flag WriteGhcEnvironmentFilesPolicy
   }
-  deriving (Eq, Generic)
+  deriving (Eq, Show, Generic)
 
 defaultConfigExFlags :: ConfigExFlags
 defaultConfigExFlags = mempty { configSolver     = Flag defaultSolver }
@@ -670,23 +637,23 @@ configureExOptions _showOrParseArgs src =
       ("Select which version of the Cabal lib to use to build packages "
       ++ "(useful for testing).")
       configCabalVersion (\v flags -> flags { configCabalVersion = v })
-      (reqArg "VERSION" (readP_to_E ("Cannot parse cabal lib version: "++)
-                                    (fmap toFlag parse))
-                        (map display . flagToList))
+      (reqArg "VERSION" (parsecToReadE ("Cannot parse cabal lib version: "++)
+                                    (fmap toFlag parsec))
+                        (map prettyShow. flagToList))
   , option [] ["constraint"]
       "Specify constraints on a package (version, installed/source, flags)"
       configExConstraints (\v flags -> flags { configExConstraints = v })
       (reqArg "CONSTRAINT"
               ((\x -> [(x, src)]) `fmap` ReadE readUserConstraint)
-              (map $ display . fst))
+              (map $ prettyShow . fst))
 
   , option [] ["preference"]
       "Specify preferences (soft constraints) on the version of a package"
       configPreferences (\v flags -> flags { configPreferences = v })
       (reqArg "CONSTRAINT"
-              (readP_to_E (const "dependency expected")
-                          (fmap (\x -> [x]) parse))
-              (map display))
+              (parsecToReadE (const "dependency expected")
+                          (fmap (\x -> [x]) parsec))
+              (map prettyShow))
 
   , optionSolver configSolver (\v flags -> flags { configSolver = v })
 
@@ -695,7 +662,7 @@ configureExOptions _showOrParseArgs src =
     (fmap unAllowOlder . configAllowOlder)
     (\v flags -> flags { configAllowOlder = fmap AllowOlder v})
     (optArg "DEPS"
-     (readP_to_E ("Cannot parse the list of packages: " ++) relaxDepsParser)
+     (parsecToReadE ("Cannot parse the list of packages: " ++) relaxDepsParser)
      (Just RelaxDepsAll) relaxDepsPrinter)
 
   , option [] ["allow-newer"]
@@ -703,7 +670,7 @@ configureExOptions _showOrParseArgs src =
     (fmap unAllowNewer . configAllowNewer)
     (\v flags -> flags { configAllowNewer = fmap AllowNewer v})
     (optArg "DEPS"
-     (readP_to_E ("Cannot parse the list of packages: " ++) relaxDepsParser)
+     (parsecToReadE ("Cannot parse the list of packages: " ++) relaxDepsParser)
      (Just RelaxDepsAll) relaxDepsPrinter)
 
   , option [] ["write-ghc-environment-files"]
@@ -734,14 +701,14 @@ writeGhcEnvironmentFilesPolicyPrinter = \case
   NoFlag                                               -> []
 
 
-relaxDepsParser :: Parse.ReadP r (Maybe RelaxDeps)
+relaxDepsParser :: CabalParsing m => m (Maybe RelaxDeps)
 relaxDepsParser =
-  (Just . RelaxDepsSome) `fmap` Parse.sepBy1 parse (Parse.char ',')
+  (Just . RelaxDepsSome . toList) `fmap` P.sepByNonEmpty parsec (P.char ',')
 
 relaxDepsPrinter :: (Maybe RelaxDeps) -> [Maybe String]
 relaxDepsPrinter Nothing                     = []
 relaxDepsPrinter (Just RelaxDepsAll)         = [Nothing]
-relaxDepsPrinter (Just (RelaxDepsSome pkgs)) = map (Just . display) $ pkgs
+relaxDepsPrinter (Just (RelaxDepsSome pkgs)) = map (Just . prettyShow) $ pkgs
 
 
 instance Monoid ConfigExFlags where
@@ -777,39 +744,18 @@ reconfigureCommand
 -- * Build flags
 -- ------------------------------------------------------------
 
-data SkipAddSourceDepsCheck =
-  SkipAddSourceDepsCheck | DontSkipAddSourceDepsCheck
-  deriving Eq
-
-data BuildExFlags = BuildExFlags {
-  buildOnly     :: Flag SkipAddSourceDepsCheck
-} deriving Generic
-
-buildExOptions :: ShowOrParseArgs -> [OptionField BuildExFlags]
-buildExOptions _showOrParseArgs =
-  option [] ["only"]
-  "Don't reinstall add-source dependencies (sandbox-only)"
-  buildOnly (\v flags -> flags { buildOnly = v })
-  (noArg (Flag SkipAddSourceDepsCheck))
-
-  : []
-
-buildCommand :: CommandUI (BuildFlags, BuildExFlags)
+buildCommand :: CommandUI BuildFlags
 buildCommand = parent {
     commandName = "build",
     commandDescription  = Just $ \_ -> wrapText $
       "Components encompass executables, tests, and benchmarks.\n"
         ++ "\n"
         ++ "Affected by configuration options, see `v1-configure`.\n",
-    commandDefaultFlags = (commandDefaultFlags parent, mempty),
+    commandDefaultFlags = commandDefaultFlags parent,
     commandUsage        = usageAlternatives "v1-build" $
       [ "[FLAGS]", "COMPONENTS [FLAGS]" ],
-    commandOptions      =
-      \showOrParseArgs -> liftOptions fst setFst
-                          (commandOptions parent showOrParseArgs)
-                          ++
-                          liftOptions snd setSnd (buildExOptions showOrParseArgs)
-    , commandNotes        = Just $ \pname ->
+    commandOptions      = commandOptions parent
+    , commandNotes      = Just $ \pname ->
       "Examples:\n"
         ++ "  " ++ pname ++ " v1-build           "
         ++ "    All the components in the package\n"
@@ -818,17 +764,7 @@ buildCommand = parent {
         ++ Cabal.programFlagsDescription defaultProgramDb
   }
   where
-    setFst a (_,b) = (a,b)
-    setSnd b (a,_) = (a,b)
-
     parent = Cabal.buildCommand defaultProgramDb
-
-instance Monoid BuildExFlags where
-  mempty = gmempty
-  mappend = (<>)
-
-instance Semigroup BuildExFlags where
-  (<>) = gmappend
 
 -- ------------------------------------------------------------
 -- * Test flags
@@ -865,13 +801,12 @@ filterTestFlags flags cabalLibVersion
 -- * Repl command
 -- ------------------------------------------------------------
 
-replCommand :: CommandUI (ReplFlags, BuildExFlags)
+replCommand :: CommandUI ReplFlags
 replCommand = parent {
     commandName = "repl",
     commandDescription  = Just $ \pname -> wrapText $
          "If the current directory contains no package, ignores COMPONENT "
-      ++ "parameters and opens an interactive interpreter session; if a "
-      ++ "sandbox is present, its package database will be used.\n"
+      ++ "parameters and opens an interactive interpreter session;\n"
       ++ "\n"
       ++ "Otherwise, (re)configures with the given or default flags, and "
       ++ "loads the interpreter with the relevant modules. For executables, "
@@ -887,12 +822,8 @@ replCommand = parent {
       ++ "not (re)configure and you will have to specify the location of "
       ++ "other modules, if required.\n",
     commandUsage =  \pname -> "Usage: " ++ pname ++ " v1-repl [COMPONENT] [FLAGS]\n",
-    commandDefaultFlags = (commandDefaultFlags parent, mempty),
-    commandOptions      =
-      \showOrParseArgs -> liftOptions fst setFst
-                          (commandOptions parent showOrParseArgs)
-                          ++
-                          liftOptions snd setSnd (buildExOptions showOrParseArgs),
+    commandDefaultFlags = commandDefaultFlags parent,
+    commandOptions      = commandOptions parent,
     commandNotes        = Just $ \pname ->
       "Examples:\n"
     ++ "  " ++ pname ++ " v1-repl           "
@@ -903,16 +834,13 @@ replCommand = parent {
     ++ "  Specifying flags for interpreter\n"
   }
   where
-    setFst a (_,b) = (a,b)
-    setSnd b (a,_) = (a,b)
-
     parent = Cabal.replCommand defaultProgramDb
 
 -- ------------------------------------------------------------
 -- * Test command
 -- ------------------------------------------------------------
 
-testCommand :: CommandUI (TestFlags, BuildFlags, BuildExFlags)
+testCommand :: CommandUI (BuildFlags, TestFlags)
 testCommand = parent {
   commandName = "test",
   commandDescription  = Just $ \pname -> wrapText $
@@ -927,21 +855,17 @@ testCommand = parent {
       ++ " define actions to be executed before and after running tests.\n",
   commandUsage = usageAlternatives "v1-test"
       [ "[FLAGS]", "TESTCOMPONENTS [FLAGS]" ],
-  commandDefaultFlags = (commandDefaultFlags parent,
-                         Cabal.defaultBuildFlags, mempty),
+  commandDefaultFlags = (Cabal.defaultBuildFlags, commandDefaultFlags parent),
   commandOptions      =
     \showOrParseArgs -> liftOptions get1 set1
-                        (commandOptions parent showOrParseArgs)
-                        ++
-                        liftOptions get2 set2
                         (Cabal.buildOptions progDb showOrParseArgs)
                         ++
-                        liftOptions get3 set3 (buildExOptions showOrParseArgs)
+                        liftOptions get2 set2
+                        (commandOptions parent showOrParseArgs)
   }
   where
-    get1 (a,_,_) = a; set1 a (_,b,c) = (a,b,c)
-    get2 (_,b,_) = b; set2 b (a,_,c) = (a,b,c)
-    get3 (_,_,c) = c; set3 c (a,b,_) = (a,b,c)
+    get1 (a,_) = a; set1 a (_,b) = (a,b)
+    get2 (_,b) = b; set2 b (a,_) = (a,b)
 
     parent = Cabal.testCommand
     progDb = defaultProgramDb
@@ -950,7 +874,7 @@ testCommand = parent {
 -- * Bench command
 -- ------------------------------------------------------------
 
-benchmarkCommand :: CommandUI (BenchmarkFlags, BuildFlags, BuildExFlags)
+benchmarkCommand :: CommandUI (BuildFlags, BenchmarkFlags)
 benchmarkCommand = parent {
   commandName = "bench",
   commandUsage = usageAlternatives "v1-bench"
@@ -966,21 +890,17 @@ benchmarkCommand = parent {
       ++ "By defining UserHooks in a custom Setup.hs, the package can"
       ++ " define actions to be executed before and after running"
       ++ " benchmarks.\n",
-  commandDefaultFlags = (commandDefaultFlags parent,
-                         Cabal.defaultBuildFlags, mempty),
+  commandDefaultFlags = (Cabal.defaultBuildFlags, commandDefaultFlags parent),
   commandOptions      =
     \showOrParseArgs -> liftOptions get1 set1
-                        (commandOptions parent showOrParseArgs)
-                        ++
-                        liftOptions get2 set2
                         (Cabal.buildOptions progDb showOrParseArgs)
                         ++
-                        liftOptions get3 set3 (buildExOptions showOrParseArgs)
+                        liftOptions get2 set2
+                        (commandOptions parent showOrParseArgs)
   }
   where
-    get1 (a,_,_) = a; set1 a (_,b,c) = (a,b,c)
-    get2 (_,b,_) = b; set2 b (a,_,c) = (a,b,c)
-    get3 (_,_,c) = c; set3 c (a,b,_) = (a,b,c)
+    get1 (a,_) = a; set1 a (_,b) = (a,b)
+    get2 (_,b) = b; set2 b (a,_) = (a,b)
 
     parent = Cabal.benchmarkCommand
     progDb = defaultProgramDb
@@ -997,6 +917,7 @@ data FetchFlags = FetchFlags {
       fetchMaxBackjumps     :: Flag Int,
       fetchReorderGoals     :: Flag ReorderGoals,
       fetchCountConflicts   :: Flag CountConflicts,
+      fetchFineGrainedConflicts :: Flag FineGrainedConflicts,
       fetchMinimizeConflictSet :: Flag MinimizeConflictSet,
       fetchIndependentGoals :: Flag IndependentGoals,
       fetchShadowPkgs       :: Flag ShadowPkgs,
@@ -1017,6 +938,7 @@ defaultFetchFlags = FetchFlags {
     fetchMaxBackjumps     = Flag defaultMaxBackjumps,
     fetchReorderGoals     = Flag (ReorderGoals False),
     fetchCountConflicts   = Flag (CountConflicts True),
+    fetchFineGrainedConflicts = Flag (FineGrainedConflicts True),
     fetchMinimizeConflictSet = Flag (MinimizeConflictSet False),
     fetchIndependentGoals = Flag (IndependentGoals False),
     fetchShadowPkgs       = Flag (ShadowPkgs False),
@@ -1079,6 +1001,7 @@ fetchCommand = CommandUI {
                          fetchMaxBackjumps     (\v flags -> flags { fetchMaxBackjumps     = v })
                          fetchReorderGoals     (\v flags -> flags { fetchReorderGoals     = v })
                          fetchCountConflicts   (\v flags -> flags { fetchCountConflicts   = v })
+                         fetchFineGrainedConflicts (\v flags -> flags { fetchFineGrainedConflicts = v })
                          fetchMinimizeConflictSet (\v flags -> flags { fetchMinimizeConflictSet = v })
                          fetchIndependentGoals (\v flags -> flags { fetchIndependentGoals = v })
                          fetchShadowPkgs       (\v flags -> flags { fetchShadowPkgs       = v })
@@ -1100,6 +1023,7 @@ data FreezeFlags = FreezeFlags {
       freezeMaxBackjumps     :: Flag Int,
       freezeReorderGoals     :: Flag ReorderGoals,
       freezeCountConflicts   :: Flag CountConflicts,
+      freezeFineGrainedConflicts :: Flag FineGrainedConflicts,
       freezeMinimizeConflictSet :: Flag MinimizeConflictSet,
       freezeIndependentGoals :: Flag IndependentGoals,
       freezeShadowPkgs       :: Flag ShadowPkgs,
@@ -1118,6 +1042,7 @@ defaultFreezeFlags = FreezeFlags {
     freezeMaxBackjumps     = Flag defaultMaxBackjumps,
     freezeReorderGoals     = Flag (ReorderGoals False),
     freezeCountConflicts   = Flag (CountConflicts True),
+    freezeFineGrainedConflicts = Flag (FineGrainedConflicts True),
     freezeMinimizeConflictSet = Flag (MinimizeConflictSet False),
     freezeIndependentGoals = Flag (IndependentGoals False),
     freezeShadowPkgs       = Flag (ShadowPkgs False),
@@ -1171,6 +1096,7 @@ freezeCommand = CommandUI {
                          freezeMaxBackjumps     (\v flags -> flags { freezeMaxBackjumps     = v })
                          freezeReorderGoals     (\v flags -> flags { freezeReorderGoals     = v })
                          freezeCountConflicts   (\v flags -> flags { freezeCountConflicts   = v })
+                         freezeFineGrainedConflicts (\v flags -> flags { freezeFineGrainedConflicts = v })
                          freezeMinimizeConflictSet (\v flags -> flags { freezeMinimizeConflictSet = v })
                          freezeIndependentGoals (\v flags -> flags { freezeIndependentGoals = v })
                          freezeShadowPkgs       (\v flags -> flags { freezeShadowPkgs       = v })
@@ -1293,7 +1219,7 @@ outdatedCommand = CommandUI {
    ,option [] ["ignore"]
     "Packages to ignore"
     outdatedIgnore (\v flags -> flags { outdatedIgnore = v })
-    (reqArg "PKGS" pkgNameListParser (map display))
+    (reqArg "PKGS" pkgNameListParser (map prettyShow))
 
    ,option [] ["minor"]
     "Ignore major version bumps for these packages"
@@ -1309,14 +1235,14 @@ outdatedCommand = CommandUI {
     ignoreMajorVersionBumpsPrinter (Just IgnoreMajorVersionBumpsNone)= []
     ignoreMajorVersionBumpsPrinter (Just IgnoreMajorVersionBumpsAll) = [Nothing]
     ignoreMajorVersionBumpsPrinter (Just (IgnoreMajorVersionBumpsSome pkgs)) =
-      map (Just . display) $ pkgs
+      map (Just . prettyShow) $ pkgs
 
     ignoreMajorVersionBumpsParser  =
       (Just . IgnoreMajorVersionBumpsSome) `fmap` pkgNameListParser
 
-    pkgNameListParser = readP_to_E
+    pkgNameListParser = parsecToReadE
       ("Couldn't parse the list of package names: " ++)
-      (Parse.sepBy1 parse (Parse.char ','))
+      (fmap toList (P.sepByNonEmpty parsec (P.char ',')))
 
 -- ------------------------------------------------------------
 -- * Update command
@@ -1325,14 +1251,14 @@ outdatedCommand = CommandUI {
 data UpdateFlags
     = UpdateFlags {
         updateVerbosity  :: Flag Verbosity,
-        updateIndexState :: Flag IndexState
+        updateIndexState :: Flag TotalIndexState
     } deriving Generic
 
 defaultUpdateFlags :: UpdateFlags
 defaultUpdateFlags
     = UpdateFlags {
         updateVerbosity  = toFlag normal,
-        updateIndexState = toFlag IndexStateHead
+        updateIndexState = toFlag headTotalIndexState
     }
 
 updateCommand  :: CommandUI UpdateFlags
@@ -1354,28 +1280,18 @@ updateCommand = CommandUI {
            "Accepts unix-timestamps (e.g. '@1474732068'), ISO8601 UTC timestamps " ++
            "(e.g. '2016-09-24T17:47:48Z'), or 'HEAD' (default: 'HEAD').")
           updateIndexState (\v flags -> flags { updateIndexState = v })
-          (reqArg "STATE" (readP_to_E (const $ "index-state must be a  " ++
+          (reqArg "STATE" (parsecToReadE (const $ "index-state must be a  " ++
                                        "unix-timestamps (e.g. '@1474732068'), " ++
                                        "a ISO8601 UTC timestamp " ++
                                        "(e.g. '2016-09-24T17:47:48Z'), or 'HEAD'")
-                                      (toFlag `fmap` parse))
-                          (flagToList . fmap display))
+                                      (toFlag `fmap` parsec))
+                          (flagToList . fmap prettyShow))
     ]
   }
 
 -- ------------------------------------------------------------
 -- * Other commands
 -- ------------------------------------------------------------
-
-upgradeCommand  :: CommandUI (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags, TestFlags)
-upgradeCommand = configureCommand {
-    commandName         = "upgrade",
-    commandSynopsis     = "(command disabled, use install instead)",
-    commandDescription  = Nothing,
-    commandUsage        = usageFlagsOrPackages "upgrade",
-    commandDefaultFlags = (mempty, mempty, mempty, mempty, mempty),
-    commandOptions      = commandOptions installCommand
-  }
 
 cleanCommand :: CommandUI CleanFlags
 cleanCommand = Cabal.cleanCommand
@@ -1410,30 +1326,19 @@ formatCommand = CommandUI {
     commandOptions      = \_ -> []
   }
 
-uninstallCommand  :: CommandUI (Flag Verbosity)
-uninstallCommand = CommandUI {
-    commandName         = "uninstall",
-    commandSynopsis     = "Warn about 'uninstall' not being implemented.",
-    commandDescription  = Nothing,
-    commandNotes        = Nothing,
-    commandUsage        = usageAlternatives "uninstall" ["PACKAGES"],
-    commandDefaultFlags = toFlag normal,
-    commandOptions      = \_ -> []
-  }
-
-manpageCommand :: CommandUI (Flag Verbosity)
+manpageCommand :: CommandUI ManpageFlags
 manpageCommand = CommandUI {
-    commandName         = "manpage",
+    commandName         = "man",
     commandSynopsis     = "Outputs manpage source.",
     commandDescription  = Just $ \_ ->
       "Output manpage source to STDOUT.\n",
     commandNotes        = Nothing,
-    commandUsage        = usageFlags "manpage",
-    commandDefaultFlags = toFlag normal,
-    commandOptions      = \_ -> [optionVerbosity id const]
+    commandUsage        = usageFlags "man",
+    commandDefaultFlags = defaultManpageFlags,
+    commandOptions      = manpageOptions
   }
 
-runCommand :: CommandUI (BuildFlags, BuildExFlags)
+runCommand :: CommandUI BuildFlags
 runCommand = CommandUI {
     commandName         = "run",
     commandSynopsis     = "Builds and runs an executable.",
@@ -1453,17 +1358,9 @@ runCommand = CommandUI {
     commandUsage        = usageAlternatives "v1-run"
         ["[FLAGS] [EXECUTABLE] [-- EXECUTABLE_FLAGS]"],
     commandDefaultFlags = mempty,
-    commandOptions      =
-      \showOrParseArgs -> liftOptions fst setFst
-                          (commandOptions parent showOrParseArgs)
-                          ++
-                          liftOptions snd setSnd
-                          (buildExOptions showOrParseArgs)
+    commandOptions      = commandOptions parent
   }
   where
-    setFst a (_,b) = (a,b)
-    setSnd b (a,_) = (a,b)
-
     parent = Cabal.buildCommand defaultProgramDb
 
 -- ------------------------------------------------------------
@@ -1523,7 +1420,8 @@ instance Semigroup ReportFlags where
 data GetFlags = GetFlags {
     getDestDir          :: Flag FilePath,
     getPristine         :: Flag Bool,
-    getIndexState       :: Flag IndexState,
+    getIndexState       :: Flag TotalIndexState,
+    getActiveRepos      :: Flag ActiveRepos,
     getSourceRepository :: Flag (Maybe RepoKind),
     getVerbosity        :: Flag Verbosity
   } deriving Generic
@@ -1533,6 +1431,7 @@ defaultGetFlags = GetFlags {
     getDestDir          = mempty,
     getPristine         = mempty,
     getIndexState       = mempty,
+    getActiveRepos      = mempty,
     getSourceRepository = mempty,
     getVerbosity        = toFlag normal
    }
@@ -1565,8 +1464,8 @@ getCommand = CommandUI {
        ,option "s" ["source-repository"]
          "Copy the package's source repository (ie git clone, darcs get, etc as appropriate)."
          getSourceRepository (\v flags -> flags { getSourceRepository = v })
-        (optArg "[head|this|...]" (readP_to_E (const "invalid source-repository")
-                                              (fmap (toFlag . Just) parse))
+        (optArg "[head|this|...]" (parsecToReadE (const "invalid source-repository")
+                                              (fmap (toFlag . Just) parsec))
                                   (Flag Nothing)
                                   (map (fmap show) . flagToList))
 
@@ -1577,12 +1476,12 @@ getCommand = CommandUI {
            "This determines which package versions are available as well as " ++
            ".cabal file revision is selected (unless --pristine is used).")
           getIndexState (\v flags -> flags { getIndexState = v })
-          (reqArg "STATE" (readP_to_E (const $ "index-state must be a  " ++
+          (reqArg "STATE" (parsecToReadE (const $ "index-state must be a  " ++
                                        "unix-timestamps (e.g. '@1474732068'), " ++
                                        "a ISO8601 UTC timestamp " ++
                                        "(e.g. '2016-09-24T17:47:48Z'), or 'HEAD'")
-                                      (toFlag `fmap` parse))
-                          (flagToList . fmap display))
+                                      (toFlag `fmap` parsec))
+                          (flagToList . fmap prettyShow))
 
        , option [] ["pristine"]
            ("Unpack the original pristine tarball, rather than updating the "
@@ -1610,20 +1509,25 @@ instance Semigroup GetFlags where
 -- * List flags
 -- ------------------------------------------------------------
 
-data ListFlags = ListFlags {
-    listInstalled    :: Flag Bool,
-    listSimpleOutput :: Flag Bool,
-    listVerbosity    :: Flag Verbosity,
-    listPackageDBs   :: [Maybe PackageDB]
-  } deriving Generic
+data ListFlags = ListFlags
+    { listInstalled       :: Flag Bool
+    , listSimpleOutput    :: Flag Bool
+    , listCaseInsensitive :: Flag Bool
+    , listVerbosity       :: Flag Verbosity
+    , listPackageDBs      :: [Maybe PackageDB]
+    , listHcPath          :: Flag FilePath
+    }
+  deriving Generic
 
 defaultListFlags :: ListFlags
-defaultListFlags = ListFlags {
-    listInstalled    = Flag False,
-    listSimpleOutput = Flag False,
-    listVerbosity    = toFlag normal,
-    listPackageDBs   = []
-  }
+defaultListFlags = ListFlags
+    { listInstalled       = Flag False
+    , listSimpleOutput    = Flag False
+    , listCaseInsensitive = Flag True
+    , listVerbosity       = toFlag normal
+    , listPackageDBs      = []
+    , listHcPath          = mempty
+    }
 
 listCommand  :: CommandUI ListFlags
 listCommand = CommandUI {
@@ -1633,9 +1537,7 @@ listCommand = CommandUI {
          "List all packages, or all packages matching one of the search"
       ++ " strings.\n"
       ++ "\n"
-      ++ "If there is a sandbox in the current directory and "
-      ++ "config:ignore-sandbox is False, use the sandbox package database. "
-      ++ "Otherwise, use the package database specified with --package-db. "
+      ++ "Use the package database specified with --package-db. "
       ++ "If not specified, use the user package database.\n",
     commandNotes        = Just $ \pname ->
          "Examples:\n"
@@ -1644,31 +1546,47 @@ listCommand = CommandUI {
     commandUsage        = usageAlternatives "list" [ "[FLAGS]"
                                                    , "[FLAGS] STRINGS"],
     commandDefaultFlags = defaultListFlags,
-    commandOptions      = \_ -> [
-        optionVerbosity listVerbosity (\v flags -> flags { listVerbosity = v })
-
-        , option [] ["installed"]
-            "Only print installed packages"
-            listInstalled (\v flags -> flags { listInstalled = v })
-            trueArg
-
-        , option [] ["simple-output"]
-            "Print in a easy-to-parse format"
-            listSimpleOutput (\v flags -> flags { listSimpleOutput = v })
-            trueArg
-
-        , option "" ["package-db"]
-          (   "Append the given package database to the list of package"
-           ++ " databases used (to satisfy dependencies and register into)."
-           ++ " May be a specific file, 'global' or 'user'. The initial list"
-           ++ " is ['global'], ['global', 'user'], or ['global', $sandbox],"
-           ++ " depending on context. Use 'clear' to reset the list to empty."
-           ++ " See the user guide for details.")
-          listPackageDBs (\v flags -> flags { listPackageDBs = v })
-          (reqArg' "DB" readPackageDbList showPackageDbList)
-
-        ]
+    commandOptions      = const listOptions
   }
+
+listOptions :: [OptionField ListFlags]
+listOptions =
+    [ optionVerbosity listVerbosity (\v flags -> flags { listVerbosity = v })
+
+    , option [] ["installed"]
+        "Only print installed packages"
+        listInstalled (\v flags -> flags { listInstalled = v })
+        trueArg
+
+    , option [] ["simple-output"]
+        "Print in a easy-to-parse format"
+        listSimpleOutput (\v flags -> flags { listSimpleOutput = v })
+        trueArg
+    , option ['i'] ["ignore-case"]
+        "Ignore case destictions"
+        listCaseInsensitive (\v flags -> flags { listCaseInsensitive = v })
+        (boolOpt' (['i'], ["ignore-case"]) (['I'], ["strict-case"]))
+
+    , option "" ["package-db"]
+      (   "Append the given package database to the list of package"
+       ++ " databases used (to satisfy dependencies and register into)."
+       ++ " May be a specific file, 'global' or 'user'. The initial list"
+       ++ " is ['global'], ['global', 'user'],"
+       ++ " depending on context. Use 'clear' to reset the list to empty."
+       ++ " See the user guide for details.")
+      listPackageDBs (\v flags -> flags { listPackageDBs = v })
+      (reqArg' "DB" readPackageDbList showPackageDbList)
+
+    , option "w" ["with-compiler"]
+      "give the path to a particular compiler"
+      listHcPath (\v flags -> flags { listHcPath = v })
+      (reqArgFlag "PATH")
+    ]
+
+listNeedsCompiler :: ListFlags -> Bool
+listNeedsCompiler f =
+    flagElim False (const True) (listHcPath f)
+    || fromFlagOrDefault False (listInstalled f)
 
 instance Monoid ListFlags where
   mempty = gmempty
@@ -1697,9 +1615,7 @@ infoCommand = CommandUI {
     commandName         = "info",
     commandSynopsis     = "Display detailed information about a particular package.",
     commandDescription  = Just $ \_ -> wrapText $
-         "If there is a sandbox in the current directory and "
-      ++ "config:ignore-sandbox is False, use the sandbox package database. "
-      ++ "Otherwise, use the package database specified with --package-db. "
+      "Use the package database specified with --package-db. "
       ++ "If not specified, use the user package database.\n",
     commandNotes        = Nothing,
     commandUsage        = usageAlternatives "info" ["[FLAGS] PACKAGES"],
@@ -1711,7 +1627,7 @@ infoCommand = CommandUI {
           (   "Append the given package database to the list of package"
            ++ " databases used (to satisfy dependencies and register into)."
            ++ " May be a specific file, 'global' or 'user'. The initial list"
-           ++ " is ['global'], ['global', 'user'], or ['global', $sandbox],"
+           ++ " is ['global'], ['global', 'user'],"
            ++ " depending on context. Use 'clear' to reset the list to empty."
            ++ " See the user guide for details.")
           infoPackageDBs (\v flags -> flags { infoPackageDBs = v })
@@ -1741,6 +1657,7 @@ data InstallFlags = InstallFlags {
     installMaxBackjumps     :: Flag Int,
     installReorderGoals     :: Flag ReorderGoals,
     installCountConflicts   :: Flag CountConflicts,
+    installFineGrainedConflicts :: Flag FineGrainedConflicts,
     installMinimizeConflictSet :: Flag MinimizeConflictSet,
     installIndependentGoals :: Flag IndependentGoals,
     installShadowPkgs       :: Flag ShadowPkgs,
@@ -1753,7 +1670,7 @@ data InstallFlags = InstallFlags {
     installUpgradeDeps      :: Flag Bool,
     installOnly             :: Flag Bool,
     installOnlyDeps         :: Flag Bool,
-    installIndexState       :: Flag IndexState,
+    installIndexState       :: Flag TotalIndexState,
     installRootCmd          :: Flag String,
     installSummaryFile      :: NubList PathTemplate,
     installLogFile          :: Flag PathTemplate,
@@ -1767,17 +1684,9 @@ data InstallFlags = InstallFlags {
     installNumJobs          :: Flag (Maybe Int),
     installKeepGoing        :: Flag Bool,
     installRunTests         :: Flag Bool,
-    installOfflineMode      :: Flag Bool,
-    -- | The cabal project file name; defaults to @cabal.project@.
-    -- Th name itself denotes the cabal project file name, but it also
-    -- is the base of auxiliary project files, such as
-    -- @cabal.project.local@ and @cabal.project.freeze@ which are also
-    -- read and written out in some cases.  If the path is not found
-    -- in the current working directory, we will successively probe
-    -- relative to parent directories until this name is found.
-    installProjectFileName   :: Flag FilePath
+    installOfflineMode      :: Flag Bool
   }
-  deriving (Eq, Generic)
+  deriving (Eq, Show, Generic)
 
 instance Binary InstallFlags
 
@@ -1790,6 +1699,7 @@ defaultInstallFlags = InstallFlags {
     installMaxBackjumps    = Flag defaultMaxBackjumps,
     installReorderGoals    = Flag (ReorderGoals False),
     installCountConflicts  = Flag (CountConflicts True),
+    installFineGrainedConflicts = Flag (FineGrainedConflicts True),
     installMinimizeConflictSet = Flag (MinimizeConflictSet False),
     installIndependentGoals= Flag (IndependentGoals False),
     installShadowPkgs      = Flag (ShadowPkgs False),
@@ -1814,8 +1724,7 @@ defaultInstallFlags = InstallFlags {
     installNumJobs         = mempty,
     installKeepGoing       = Flag False,
     installRunTests        = mempty,
-    installOfflineMode     = Flag False,
-    installProjectFileName = mempty
+    installOfflineMode     = Flag False
   }
   where
     docIndexFile = toPathTemplate ("$datadir" </> "doc"
@@ -1828,9 +1737,11 @@ defaultSolver :: PreSolver
 defaultSolver = AlwaysModular
 
 allSolvers :: String
-allSolvers = intercalate ", " (map display ([minBound .. maxBound] :: [PreSolver]))
+allSolvers = intercalate ", " (map prettyShow ([minBound .. maxBound] :: [PreSolver]))
 
-installCommand :: CommandUI (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags, TestFlags)
+installCommand :: CommandUI ( ConfigFlags, ConfigExFlags, InstallFlags
+                            , HaddockFlags, TestFlags, BenchmarkFlags
+                            )
 installCommand = CommandUI {
   commandName         = "install",
   commandSynopsis     = "Install packages.",
@@ -1839,31 +1750,22 @@ installCommand = CommandUI {
                                                     ],
   commandDescription  = Just $ \_ -> wrapText $
         "Installs one or more packages. By default, the installed package"
-     ++ " will be registered in the user's package database or, if a sandbox"
-     ++ " is present in the current directory, inside the sandbox.\n"
+     ++ " will be registered in the user's package database."
      ++ "\n"
      ++ "If PACKAGES are specified, downloads and installs those packages."
      ++ " Otherwise, install the package in the current directory (and/or its"
      ++ " dependencies) (there must be exactly one .cabal file in the current"
      ++ " directory).\n"
      ++ "\n"
-     ++ "When using a sandbox, the flags for `v1-install` only affect the"
-     ++ " current command and have no effect on future commands. (To achieve"
-     ++ " that, `v1-configure` must be used.)\n"
-     ++ " In contrast, without a sandbox, the flags to `v1-install` are saved and"
+     ++ "The flags to `v1-install` are saved and"
      ++ " affect future commands such as `v1-build` and `v1-repl`. See the help for"
      ++ " `v1-configure` for a list of commands being affected.\n"
      ++ "\n"
-     ++ "Installed executables will by default (and without a sandbox)"
+     ++ "Installed executables will by default"
      ++ " be put into `~/.cabal/bin/`."
      ++ " If you want installed executable to be available globally, make"
      ++ " sure that the PATH environment variable contains that directory.\n"
-     ++ "When using a sandbox, executables will be put into"
-     ++ " `$SANDBOX/bin/` (by default: `./.cabal-sandbox/bin/`).\n"
-     ++ "\n"
-     ++ "When specifying --bindir, consider also specifying --datadir;"
-     ++ " this way the sandbox can be deleted and the executable should"
-     ++ " continue working as long as bindir and datadir are left untouched.",
+     ++ "\n",
   commandNotes        = Just $ \pname ->
         ( case commandNotes
                $ Cabal.configureCommand defaultProgramDb
@@ -1883,7 +1785,7 @@ installCommand = CommandUI {
      ++ "  " ++ (map (const ' ') pname)
                       ++ "                         "
      ++ "    Change installation destination\n",
-  commandDefaultFlags = (mempty, mempty, mempty, mempty, mempty),
+  commandDefaultFlags = (mempty, mempty, mempty, mempty, mempty, mempty),
   commandOptions      = \showOrParseArgs ->
        liftOptions get1 set1
        -- Note: [Hidden Flags]
@@ -1902,13 +1804,15 @@ installCommand = CommandUI {
                               installOptions     showOrParseArgs)
     ++ liftOptions get4 set4 (haddockOptions     showOrParseArgs)
     ++ liftOptions get5 set5 (testOptions        showOrParseArgs)
+    ++ liftOptions get6 set6 (benchmarkOptions   showOrParseArgs)
   }
   where
-    get1 (a,_,_,_,_) = a; set1 a (_,b,c,d,e) = (a,b,c,d,e)
-    get2 (_,b,_,_,_) = b; set2 b (a,_,c,d,e) = (a,b,c,d,e)
-    get3 (_,_,c,_,_) = c; set3 c (a,b,_,d,e) = (a,b,c,d,e)
-    get4 (_,_,_,d,_) = d; set4 d (a,b,c,_,e) = (a,b,c,d,e)
-    get5 (_,_,_,_,e) = e; set5 e (a,b,c,d,_) = (a,b,c,d,e)
+    get1 (a,_,_,_,_,_) = a; set1 a (_,b,c,d,e,f) = (a,b,c,d,e,f)
+    get2 (_,b,_,_,_,_) = b; set2 b (a,_,c,d,e,f) = (a,b,c,d,e,f)
+    get3 (_,_,c,_,_,_) = c; set3 c (a,b,_,d,e,f) = (a,b,c,d,e,f)
+    get4 (_,_,_,d,_,_) = d; set4 d (a,b,c,_,e,f) = (a,b,c,d,e,f)
+    get5 (_,_,_,_,e,_) = e; set5 e (a,b,c,d,_,f) = (a,b,c,d,e,f)
+    get6 (_,_,_,_,_,f) = f; set6 f (a,b,c,d,e,_) = (a,b,c,d,e,f)
 
 haddockCommand :: CommandUI HaddockFlags
 haddockCommand = Cabal.haddockCommand
@@ -1968,6 +1872,19 @@ testOptions showOrParseArgs
     prefixTest name | "test-" `isPrefixOf` name = name
                     | otherwise = "test-" ++ name
 
+benchmarkOptions :: ShowOrParseArgs -> [OptionField BenchmarkFlags]
+benchmarkOptions showOrParseArgs
+  = [ opt { optionName = prefixBenchmark name,
+            optionDescr = [ fmapOptFlags (\(_, lflags) -> ([], map prefixBenchmark lflags)) descr
+                          | descr <- optionDescr opt] }
+    | opt <- commandOptions Cabal.benchmarkCommand showOrParseArgs
+    , let name = optionName opt
+    , name `elem` ["benchmark-options", "benchmark-option"]
+    ]
+  where
+    prefixBenchmark name | "benchmark-" `isPrefixOf` name = name
+                         | otherwise = "benchmark-" ++ name
+
 fmapOptFlags :: (OptFlags -> OptFlags) -> OptDescr a -> OptDescr a
 fmapOptFlags modify (ReqArg d f p r w)    = ReqArg d (modify f) p r w
 fmapOptFlags modify (OptArg d f p r i w)  = OptArg d (modify f) p r i w
@@ -2003,6 +1920,7 @@ installOptions showOrParseArgs =
                         installMaxBackjumps     (\v flags -> flags { installMaxBackjumps     = v })
                         installReorderGoals     (\v flags -> flags { installReorderGoals     = v })
                         installCountConflicts   (\v flags -> flags { installCountConflicts   = v })
+                        installFineGrainedConflicts (\v flags -> flags { installFineGrainedConflicts = v })
                         installMinimizeConflictSet (\v flags -> flags { installMinimizeConflictSet = v })
                         installIndependentGoals (\v flags -> flags { installIndependentGoals = v })
                         installShadowPkgs       (\v flags -> flags { installShadowPkgs       = v })
@@ -2046,12 +1964,12 @@ installOptions showOrParseArgs =
            "Accepts unix-timestamps (e.g. '@1474732068'), ISO8601 UTC timestamps " ++
            "(e.g. '2016-09-24T17:47:48Z'), or 'HEAD' (default: 'HEAD').")
           installIndexState (\v flags -> flags { installIndexState = v })
-          (reqArg "STATE" (readP_to_E (const $ "index-state must be a  " ++
+          (reqArg "STATE" (parsecToReadE (const $ "index-state must be a  " ++
                                        "unix-timestamps (e.g. '@1474732068'), " ++
                                        "a ISO8601 UTC timestamp " ++
                                        "(e.g. '2016-09-24T17:47:48Z'), or 'HEAD'")
-                                      (toFlag `fmap` parse))
-                          (flagToList . fmap display))
+                                      (toFlag `fmap` parsec))
+                          (flagToList . fmap prettyShow))
 
       , option [] ["root-cmd"]
           "(No longer supported, do not use.)"
@@ -2077,10 +1995,10 @@ installOptions showOrParseArgs =
       , option [] ["remote-build-reporting"]
           "Generate build reports to send to a remote server (none, anonymous or detailed)."
           installBuildReports (\v flags -> flags { installBuildReports = v })
-          (reqArg "LEVEL" (readP_to_E (const $ "report level must be 'none', "
+          (reqArg "LEVEL" (parsecToReadE (const $ "report level must be 'none', "
                                             ++ "'anonymous' or 'detailed'")
-                                      (toFlag `fmap` parse))
-                          (flagToList . fmap display))
+                                      (toFlag `fmap` parsec))
+                          (flagToList . fmap prettyShow))
 
       , option [] ["report-planning-failure"]
           "Generate build reports when the dependency solver fails. This is used by the Hackage build bot."
@@ -2115,10 +2033,6 @@ installOptions showOrParseArgs =
           installOfflineMode (\v flags -> flags { installOfflineMode = v })
           (yesNoOpt showOrParseArgs)
 
-      , option [] ["project-file"]
-          "Set the name of the cabal.project file to search for in parent directories"
-          installProjectFileName (\v flags -> flags {installProjectFileName = v})
-          (reqArgFlag "FILE")
       ] ++ case showOrParseArgs of      -- TODO: remove when "cabal install"
                                         -- avoids
           ParseArgs ->
@@ -2170,7 +2084,7 @@ uploadCommand = CommandUI {
     commandDescription  = Nothing,
     commandNotes        = Just $ \_ ->
          "You can store your Hackage login in the ~/.cabal/config file\n"
-      ++ relevantConfigValuesText ["username", "password"],
+      ++ relevantConfigValuesText ["username", "password", "password-command"],
     commandUsage        = \pname ->
          "Usage: " ++ pname ++ " upload [FLAGS] TARFILES\n",
     commandDefaultFlags = defaultUploadFlags,
@@ -2221,12 +2135,6 @@ instance Semigroup UploadFlags where
 -- * Init flags
 -- ------------------------------------------------------------
 
-emptyInitFlags :: IT.InitFlags
-emptyInitFlags  = mempty
-
-defaultInitFlags :: IT.InitFlags
-defaultInitFlags  = emptyInitFlags { IT.initVerbosity = toFlag normal }
-
 initCommand :: CommandUI IT.InitFlags
 initCommand = CommandUI {
     commandName = "init",
@@ -2244,7 +2152,7 @@ initCommand = CommandUI {
     commandNotes = Nothing,
     commandUsage = \pname ->
          "Usage: " ++ pname ++ " init [FLAGS]\n",
-    commandDefaultFlags = defaultInitFlags,
+    commandDefaultFlags = IT.defaultInitFlags,
     commandOptions = initOptions
   }
 
@@ -2283,30 +2191,30 @@ initOptions _ =
   , option ['p'] ["package-name"]
     "Name of the Cabal package to create."
     IT.packageName (\v flags -> flags { IT.packageName = v })
-    (reqArg "PACKAGE" (readP_to_E ("Cannot parse package name: "++)
-                                  (toFlag `fmap` parse))
-                      (flagToList . fmap display))
+    (reqArg "PACKAGE" (parsecToReadE ("Cannot parse package name: "++)
+                                  (toFlag `fmap` parsec))
+                      (flagToList . fmap prettyShow))
 
   , option [] ["version"]
     "Initial version of the package."
     IT.version (\v flags -> flags { IT.version = v })
-    (reqArg "VERSION" (readP_to_E ("Cannot parse package version: "++)
-                                  (toFlag `fmap` parse))
-                      (flagToList . fmap display))
+    (reqArg "VERSION" (parsecToReadE ("Cannot parse package version: "++)
+                                  (toFlag `fmap` parsec))
+                      (flagToList . fmap prettyShow))
 
   , option [] ["cabal-version"]
     "Version of the Cabal specification."
     IT.cabalVersion (\v flags -> flags { IT.cabalVersion = v })
-    (reqArg "VERSION_RANGE" (readP_to_E ("Cannot parse Cabal specification version: "++)
-                                        (toFlag `fmap` parse))
-                            (flagToList . fmap display))
+    (reqArg "CABALSPECVERSION" (parsecToReadE ("Cannot parse Cabal specification version: "++)
+                                        (fmap (toFlag . getSpecVersion) parsec))
+                            (flagToList . fmap (prettyShow . SpecVersion)))
 
   , option ['l'] ["license"]
     "Project license."
     IT.license (\v flags -> flags { IT.license = v })
-    (reqArg "LICENSE" (readP_to_E ("Cannot parse license: "++)
-                                  (toFlag `fmap` parse))
-                      (flagToList . fmap display))
+    (reqArg "LICENSE" (parsecToReadE ("Cannot parse license: "++)
+                                  (toFlag `fmap` parsec))
+                      (flagToList . fmap prettyShow))
 
   , option ['a'] ["author"]
     "Name of the project's author."
@@ -2385,32 +2293,32 @@ initOptions _ =
     "Specify the default language."
     IT.language
     (\v flags -> flags { IT.language = v })
-    (reqArg "LANGUAGE" (readP_to_E ("Cannot parse language: "++)
-                                   (toFlag `fmap` parse))
-                      (flagToList . fmap display))
+    (reqArg "LANGUAGE" (parsecToReadE ("Cannot parse language: "++)
+                                   (toFlag `fmap` parsec))
+                      (flagToList . fmap prettyShow))
 
   , option ['o'] ["expose-module"]
     "Export a module from the package."
     IT.exposedModules
     (\v flags -> flags { IT.exposedModules = v })
-    (reqArg "MODULE" (readP_to_E ("Cannot parse module name: "++)
-                                 ((Just . (:[])) `fmap` parse))
-                     (maybe [] (fmap display)))
+    (reqArg "MODULE" (parsecToReadE ("Cannot parse module name: "++)
+                                 ((Just . (:[])) `fmap` parsec))
+                     (maybe [] (fmap prettyShow)))
 
   , option [] ["extension"]
     "Use a LANGUAGE extension (in the other-extensions field)."
     IT.otherExts
     (\v flags -> flags { IT.otherExts = v })
-    (reqArg "EXTENSION" (readP_to_E ("Cannot parse extension: "++)
-                                    ((Just . (:[])) `fmap` parse))
-                        (maybe [] (fmap display)))
+    (reqArg "EXTENSION" (parsecToReadE ("Cannot parse extension: "++)
+                                    ((Just . (:[])) `fmap` parsec))
+                        (maybe [] (fmap prettyShow)))
 
   , option ['d'] ["dependency"]
     "Package dependency."
     IT.dependencies (\v flags -> flags { IT.dependencies = v })
-    (reqArg "PACKAGE" (readP_to_E ("Cannot parse dependency: "++)
-                                  ((Just . (:[])) `fmap` parse))
-                      (maybe [] (fmap display)))
+    (reqArg "PACKAGE" (parsecToReadE ("Cannot parse dependency: "++)
+                                  ((Just . (:[])) `fmap` parsec))
+                      (maybe [] (fmap prettyShow)))
 
   , option [] ["application-dir"]
     "Directory containing package application executable."
@@ -2445,18 +2353,6 @@ initOptions _ =
 -- * SDist flags
 -- ------------------------------------------------------------
 
--- | Extra flags to @sdist@ beyond runghc Setup sdist
---
-sdistCommand :: CommandUI SDistFlags
-sdistCommand = Cabal.sdistCommand {
-    commandUsage        = \pname ->
-        "Usage: " ++ pname ++ " v1-sdist [FLAGS]\n",
-    commandDefaultFlags = (commandDefaultFlags Cabal.sdistCommand)
-  }
-
-
---
-
 doctestCommand :: CommandUI DoctestFlags
 doctestCommand = Cabal.doctestCommand
   { commandUsage = \pname ->  "Usage: " ++ pname ++ " v1-doctest [FLAGS]\n" }
@@ -2478,41 +2374,6 @@ copyCommand = Cabal.copyCommand
 registerCommand :: CommandUI RegisterFlags
 registerCommand = Cabal.registerCommand
  { commandUsage = \pname ->  "Usage: " ++ pname ++ " v1-register [FLAGS]\n" }
-
--- ------------------------------------------------------------
--- * Win32SelfUpgrade flags
--- ------------------------------------------------------------
-
-data Win32SelfUpgradeFlags = Win32SelfUpgradeFlags {
-  win32SelfUpgradeVerbosity :: Flag Verbosity
-} deriving Generic
-
-defaultWin32SelfUpgradeFlags :: Win32SelfUpgradeFlags
-defaultWin32SelfUpgradeFlags = Win32SelfUpgradeFlags {
-  win32SelfUpgradeVerbosity = toFlag normal
-}
-
-win32SelfUpgradeCommand :: CommandUI Win32SelfUpgradeFlags
-win32SelfUpgradeCommand = CommandUI {
-  commandName         = "win32selfupgrade",
-  commandSynopsis     = "Self-upgrade the executable on Windows",
-  commandDescription  = Nothing,
-  commandNotes        = Nothing,
-  commandUsage        = \pname ->
-    "Usage: " ++ pname ++ " win32selfupgrade PID PATH\n",
-  commandDefaultFlags = defaultWin32SelfUpgradeFlags,
-  commandOptions      = \_ ->
-      [optionVerbosity win32SelfUpgradeVerbosity
-       (\v flags -> flags { win32SelfUpgradeVerbosity = v})
-      ]
-}
-
-instance Monoid Win32SelfUpgradeFlags where
-  mempty = gmempty
-  mappend = (<>)
-
-instance Semigroup Win32SelfUpgradeFlags where
-  (<>) = gmappend
 
 -- ------------------------------------------------------------
 -- * ActAsSetup flags
@@ -2540,9 +2401,9 @@ actAsSetupCommand = CommandUI {
       [option "" ["build-type"]
          "Use the given build type."
          actAsSetupBuildType (\v flags -> flags { actAsSetupBuildType = v })
-         (reqArg "BUILD-TYPE" (readP_to_E ("Cannot parse build type: "++)
-                               (fmap toFlag parse))
-                              (map display . flagToList))
+         (reqArg "BUILD-TYPE" (parsecToReadE ("Cannot parse build type: "++)
+                               (fmap toFlag parsec))
+                              (map prettyShow . flagToList))
       ]
 }
 
@@ -2551,128 +2412,6 @@ instance Monoid ActAsSetupFlags where
   mappend = (<>)
 
 instance Semigroup ActAsSetupFlags where
-  (<>) = gmappend
-
--- ------------------------------------------------------------
--- * Sandbox-related flags
--- ------------------------------------------------------------
-
-data SandboxFlags = SandboxFlags {
-  sandboxVerbosity :: Flag Verbosity,
-  sandboxSnapshot  :: Flag Bool, -- FIXME: this should be an 'add-source'-only
-                                 -- flag.
-  sandboxLocation  :: Flag FilePath
-} deriving Generic
-
-defaultSandboxLocation :: FilePath
-defaultSandboxLocation = ".cabal-sandbox"
-
-defaultSandboxFlags :: SandboxFlags
-defaultSandboxFlags = SandboxFlags {
-  sandboxVerbosity = toFlag normal,
-  sandboxSnapshot  = toFlag False,
-  sandboxLocation  = toFlag defaultSandboxLocation
-  }
-
-sandboxCommand :: CommandUI SandboxFlags
-sandboxCommand = CommandUI {
-  commandName         = "sandbox",
-  commandSynopsis     = "Create/modify/delete a sandbox.",
-  commandDescription  = Just $ \pname -> concat
-    [ paragraph $ "Sandboxes are isolated package databases that can be used"
-      ++ " to prevent dependency conflicts that arise when many different"
-      ++ " packages are installed in the same database (i.e. the user's"
-      ++ " database in the home directory)."
-    , paragraph $ "A sandbox in the current directory (created by"
-      ++ " `v1-sandbox init`) will be used instead of the user's database for"
-      ++ " commands such as `v1-install` and `v1-build`. Note that (a directly"
-      ++ " invoked) GHC will not automatically be aware of sandboxes;"
-      ++ " only if called via appropriate " ++ pname
-      ++ " commands, e.g. `v1-repl`, `v1-build`, `v1-exec`."
-    , paragraph $ "Currently, " ++ pname ++ " will not search for a sandbox"
-      ++ " in folders above the current one, so cabal will not see the sandbox"
-      ++ " if you are in a subfolder of a sandbox."
-    , paragraph "Subcommands:"
-    , headLine "init:"
-    , indentParagraph $ "Initialize a sandbox in the current directory."
-      ++ " An existing package database will not be modified, but settings"
-      ++ " (such as the location of the database) can be modified this way."
-    , headLine "delete:"
-    , indentParagraph $ "Remove the sandbox; deleting all the packages"
-      ++ " installed inside."
-    , headLine "add-source:"
-    , indentParagraph $ "Make one or more local packages available in the"
-      ++ " sandbox. PATHS may be relative or absolute."
-      ++ " Typical usecase is when you need"
-      ++ " to make a (temporary) modification to a dependency: You download"
-      ++ " the package into a different directory, make the modification,"
-      ++ " and add that directory to the sandbox with `add-source`."
-    , indentParagraph $ "Unless given `--snapshot`, any add-source'd"
-      ++ " dependency that was modified since the last build will be"
-      ++ " re-installed automatically."
-    , headLine "delete-source:"
-    , indentParagraph $ "Remove an add-source dependency; however, this will"
-      ++ " not delete the package(s) that have been installed in the sandbox"
-      ++ " from this dependency. You can either unregister the package(s) via"
-      ++ " `" ++ pname ++ " v1-sandbox hc-pkg unregister` or re-create the"
-      ++ " sandbox (`v1-sandbox delete; v1-sandbox init`)."
-    , headLine "list-sources:"
-    , indentParagraph $ "List the directories of local packages made"
-      ++ " available via `" ++ pname ++ " v1-sandbox add-source`."
-    , headLine "hc-pkg:"
-    , indentParagraph $ "Similar to `ghc-pkg`, but for the sandbox package"
-      ++ " database. Can be used to list specific/all packages that are"
-      ++ " installed in the sandbox. For subcommands, see the help for"
-      ++ " ghc-pkg. Affected by the compiler version specified by `v1-configure`."
-    ],
-  commandNotes        = Just $ \pname ->
-       relevantConfigValuesText ["require-sandbox"
-                                ,"ignore-sandbox"]
-    ++ "\n"
-    ++ "Examples:\n"
-    ++ "  Set up a sandbox with one local dependency, located at ../foo:\n"
-    ++ "    " ++ pname ++ " v1-sandbox init\n"
-    ++ "    " ++ pname ++ " v1-sandbox add-source ../foo\n"
-    ++ "    " ++ pname ++ " v1-install --only-dependencies\n"
-    ++ "  Reset the sandbox:\n"
-    ++ "    " ++ pname ++ " v1-sandbox delete\n"
-    ++ "    " ++ pname ++ " v1-sandbox init\n"
-    ++ "    " ++ pname ++ " v1-install --only-dependencies\n"
-    ++ "  List the packages in the sandbox:\n"
-    ++ "    " ++ pname ++ " v1-sandbox hc-pkg list\n"
-    ++ "  Unregister the `broken` package from the sandbox:\n"
-    ++ "    " ++ pname ++ " v1-sandbox hc-pkg -- --force unregister broken\n",
-  commandUsage        = usageAlternatives "v1-sandbox"
-    [ "init          [FLAGS]"
-    , "delete        [FLAGS]"
-    , "add-source    [FLAGS] PATHS"
-    , "delete-source [FLAGS] PATHS"
-    , "list-sources  [FLAGS]"
-    , "hc-pkg        [FLAGS] [--] COMMAND [--] [ARGS]"
-    ],
-
-  commandDefaultFlags = defaultSandboxFlags,
-  commandOptions      = \_ ->
-    [ optionVerbosity sandboxVerbosity
-      (\v flags -> flags { sandboxVerbosity = v })
-
-    , option [] ["snapshot"]
-      "Take a snapshot instead of creating a link (only applies to 'add-source')"
-      sandboxSnapshot (\v flags -> flags { sandboxSnapshot = v })
-      trueArg
-
-    , option [] ["sandbox"]
-      "Sandbox location (default: './.cabal-sandbox')."
-      sandboxLocation (\v flags -> flags { sandboxLocation = v })
-      (reqArgFlag "DIR")
-    ]
-  }
-
-instance Monoid SandboxFlags where
-  mempty = gmempty
-  mappend = (<>)
-
-instance Semigroup SandboxFlags where
   (<>) = gmappend
 
 -- ------------------------------------------------------------
@@ -2825,16 +2564,17 @@ optionSolver :: (flags -> Flag PreSolver)
              -> OptionField flags
 optionSolver get set =
   option [] ["solver"]
-    ("Select dependency solver to use (default: " ++ display defaultSolver ++ "). Choices: " ++ allSolvers ++ ".")
+    ("Select dependency solver to use (default: " ++ prettyShow defaultSolver ++ "). Choices: " ++ allSolvers ++ ".")
     get set
-    (reqArg "SOLVER" (readP_to_E (const $ "solver must be one of: " ++ allSolvers)
-                                 (toFlag `fmap` parse))
-                     (flagToList . fmap display))
+    (reqArg "SOLVER" (parsecToReadE (const $ "solver must be one of: " ++ allSolvers)
+                                    (toFlag `fmap` parsec))
+                     (flagToList . fmap prettyShow))
 
 optionSolverFlags :: ShowOrParseArgs
                   -> (flags -> Flag Int   ) -> (Flag Int    -> flags -> flags)
                   -> (flags -> Flag ReorderGoals)     -> (Flag ReorderGoals     -> flags -> flags)
                   -> (flags -> Flag CountConflicts)   -> (Flag CountConflicts   -> flags -> flags)
+                  -> (flags -> Flag FineGrainedConflicts) -> (Flag FineGrainedConflicts -> flags -> flags)
                   -> (flags -> Flag MinimizeConflictSet) -> (Flag MinimizeConflictSet -> flags -> flags)
                   -> (flags -> Flag IndependentGoals) -> (Flag IndependentGoals -> flags -> flags)
                   -> (flags -> Flag ShadowPkgs)       -> (Flag ShadowPkgs       -> flags -> flags)
@@ -2843,12 +2583,12 @@ optionSolverFlags :: ShowOrParseArgs
                   -> (flags -> Flag OnlyConstrained)  -> (Flag OnlyConstrained  -> flags -> flags)
                   -> [OptionField flags]
 optionSolverFlags showOrParseArgs getmbj setmbj getrg setrg getcc setcc
-                  getmc setmc getig setig getsip setsip getstrfl setstrfl
-                  getib setib getoc setoc =
+                  getfgc setfgc getmc setmc getig setig getsip setsip
+                  getstrfl setstrfl getib setib getoc setoc =
   [ option [] ["max-backjumps"]
       ("Maximum number of backjumps allowed while solving (default: " ++ show defaultMaxBackjumps ++ "). Use a negative number to enable unlimited backtracking. Use 0 to disable backtracking completely.")
       getmbj setmbj
-      (reqArg "NUM" (readP_to_E ("Cannot parse number: "++) (fmap toFlag parse))
+      (reqArg "NUM" (parsecToReadE ("Cannot parse number: "++) (fmap toFlag P.signedIntegral))
                     (map show . flagToList))
   , option [] ["reorder-goals"]
       "Try to reorder goals according to certain heuristics. Slows things down on average, but may make backtracking faster for some packages."
@@ -2859,6 +2599,11 @@ optionSolverFlags showOrParseArgs getmbj setmbj getrg setrg getcc setcc
       "Try to speed up solving by preferring goals that are involved in a lot of conflicts (default)."
       (fmap asBool . getcc)
       (setcc . fmap CountConflicts)
+      (yesNoOpt showOrParseArgs)
+  , option [] ["fine-grained-conflicts"]
+      "Skip a version of a package if it does not resolve the conflicts encountered in the last version, as a solver optimization (default)."
+      (fmap asBool . getfgc)
+      (setfgc . fmap FineGrainedConflicts)
       (yesNoOpt showOrParseArgs)
   , option [] ["minimize-conflict-set"]
       ("When there is no solution, try to improve the error message by finding "
@@ -2892,17 +2637,12 @@ optionSolverFlags showOrParseArgs getmbj setmbj getrg setrg getcc setcc
       getoc
       setoc
       (reqArg "none|all"
-         (readP_to_E
+         (parsecToReadE
             (const "reject-unconstrained-dependencies must be 'none' or 'all'")
-            (toFlag `fmap` parse))
-         (flagToList . fmap display))
+            (toFlag `fmap` parsec))
+         (flagToList . fmap prettyShow))
 
   ]
-
-usageFlagsOrPackages :: String -> String -> String
-usageFlagsOrPackages name pname =
-     "Usage: " ++ pname ++ " " ++ name ++ " [FLAGS]\n"
-  ++ "   or: " ++ pname ++ " " ++ name ++ " [PACKAGES]\n"
 
 usagePackages :: String -> String -> String
 usagePackages name pname =
@@ -2913,70 +2653,29 @@ usageFlags name pname =
   "Usage: " ++ pname ++ " " ++ name ++ " [FLAGS]\n"
 
 --TODO: do we want to allow per-package flags?
-parsePackageArgs :: [String] -> Either String [Dependency]
-parsePackageArgs = parsePkgArgs []
-  where
-    parsePkgArgs ds [] = Right (reverse ds)
-    parsePkgArgs ds (arg:args) =
-      case readPToMaybe parseDependencyOrPackageId arg of
-        Just dep -> parsePkgArgs (dep:ds) args
-        Nothing  -> Left $
-         show arg ++ " is not valid syntax for a package name or"
-                  ++ " package dependency."
+parsePackageArgs :: [String] -> Either String [PackageVersionConstraint]
+parsePackageArgs = traverse p where
+    p arg = case eitherParsec arg of
+        Right pvc -> Right pvc
+        Left err  -> Left $
+          show arg ++ " is not valid syntax for a package name or"
+                   ++ " package dependency. " ++ err 
 
-parseDependencyOrPackageId :: Parse.ReadP r Dependency
-parseDependencyOrPackageId = parse Parse.+++ liftM pkgidToDependency parse
-  where
-    pkgidToDependency :: PackageIdentifier -> Dependency
-    pkgidToDependency p = case packageVersion p of
-      v | v == nullVersion -> Dependency (packageName p) anyVersion (Set.singleton LMainLibName)
-        | otherwise        -> Dependency (packageName p) (thisVersion v) (Set.singleton LMainLibName)
+showRemoteRepo :: RemoteRepo -> String
+showRemoteRepo = prettyShow
 
-showRepo :: RemoteRepo -> String
-showRepo repo = remoteRepoName repo ++ ":"
-             ++ uriToString id (remoteRepoURI repo) []
+readRemoteRepo :: String -> Maybe RemoteRepo
+readRemoteRepo = simpleParsec
 
-readRepo :: String -> Maybe RemoteRepo
-readRepo = readPToMaybe parseRepo
+showLocalRepo :: LocalRepo -> String
+showLocalRepo = prettyShow
 
-parseRepo :: Parse.ReadP r RemoteRepo
-parseRepo = do
-  name   <- Parse.munch1 (\c -> isAlphaNum c || c `elem` "_-.")
-  _      <- Parse.char ':'
-  uriStr <- Parse.munch1 (\c -> isAlphaNum c || c `elem` "+-=._/*()@'$:;&!?~")
-  uri    <- maybe Parse.pfail return (parseAbsoluteURI uriStr)
-  return RemoteRepo {
-    remoteRepoName           = name,
-    remoteRepoURI            = uri,
-    remoteRepoSecure         = Nothing,
-    remoteRepoRootKeys       = [],
-    remoteRepoKeyThreshold   = 0,
-    remoteRepoShouldTryHttps = False
-  }
+readLocalRepo :: String -> Maybe LocalRepo
+readLocalRepo = simpleParsec
 
 -- ------------------------------------------------------------
 -- * Helpers for Documentation
 -- ------------------------------------------------------------
-
-headLine :: String -> String
-headLine = unlines
-         . map unwords
-         . wrapLine 79
-         . words
-
-paragraph :: String -> String
-paragraph = (++"\n")
-          . unlines
-          . map unwords
-          . wrapLine 79
-          . words
-
-indentParagraph :: String -> String
-indentParagraph = unlines
-                . (flip (++)) [""]
-                . map (("  "++).unwords)
-                . wrapLine 77
-                . words
 
 relevantConfigValuesText :: [String] -> String
 relevantConfigValuesText vs =

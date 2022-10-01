@@ -27,6 +27,10 @@ void markScheduler (evac_fn evac, void *user);
 // Place a new thread on the run queue of the current Capability
 void scheduleThread (Capability *cap, StgTSO *tso);
 
+// Place a new thread on the run queue of the current Capability
+// at the front of the queue.
+void scheduleThreadNow (Capability *cap, StgTSO *tso);
+
 // Place a new thread on the run queue of a specified Capability
 // (cap is the currently owned Capability, cpu is the number of
 // the desired Capability).
@@ -51,6 +55,12 @@ StgWord findAtomicallyFrameHelper (Capability *cap, StgTSO *tso);
 
 /* Entry point for a new worker */
 void scheduleWorker (Capability *cap, Task *task);
+
+#if defined(THREADED_RTS)
+void stopAllCapabilitiesWith (Capability **pCap, Task *task, SyncType sync_type);
+void stopAllCapabilities (Capability **pCap, Task *task);
+void releaseAllCapabilities(uint32_t n, Capability *keep_cap, Task *task);
+#endif
 
 /* The state of the scheduler.  This is used to control the sequence
  * of events during shutdown.  See Note [shutdown] in Schedule.c.
@@ -89,7 +99,7 @@ extern volatile StgWord sched_state;
 
 /* Recent activity flag.
  * Locks required  : Transition from MAYBE_NO to INACTIVE
- * happens in the timer signal, so it is atomic.  Trnasition from
+ * happens in the timer signal, so it is atomic.  Transition from
  * INACTIVE to DONE_GC happens under sched_mutex.  No lock required
  * to set it to ACTIVITY_YES.
  */
@@ -170,14 +180,17 @@ pushOnRunQueue (Capability *cap, StgTSO *tso)
 INLINE_HEADER StgTSO *
 popRunQueue (Capability *cap)
 {
-    ASSERT(cap->n_run_queue != 0);
+    ASSERT(cap->n_run_queue > 0);
     StgTSO *t = cap->run_queue_hd;
     ASSERT(t != END_TSO_QUEUE);
     cap->run_queue_hd = t->_link;
-    if (t->_link != END_TSO_QUEUE) {
-        t->_link->block_info.prev = END_TSO_QUEUE;
+
+    StgTSO *link = RELAXED_LOAD(&t->_link);
+    if (link != END_TSO_QUEUE) {
+        link->block_info.prev = END_TSO_QUEUE;
     }
-    t->_link = END_TSO_QUEUE; // no write barrier req'd
+    RELAXED_STORE(&t->_link, END_TSO_QUEUE); // no write barrier req'd
+
     if (cap->run_queue_hd == END_TSO_QUEUE) {
         cap->run_queue_tl = END_TSO_QUEUE;
     }
@@ -220,12 +233,18 @@ emptyQueue (StgTSO *q)
 INLINE_HEADER bool
 emptyRunQueue(Capability *cap)
 {
+    // Can only be called by the task owning the capability.
+    TSAN_ANNOTATE_BENIGN_RACE(&cap->n_run_queue, "emptyRunQueue");
     return cap->n_run_queue == 0;
 }
 
 INLINE_HEADER void
 truncateRunQueue(Capability *cap)
 {
+    // Can only be called by the task owning the capability.
+    TSAN_ANNOTATE_BENIGN_RACE(&cap->run_queue_hd, "truncateRunQueue");
+    TSAN_ANNOTATE_BENIGN_RACE(&cap->run_queue_tl, "truncateRunQueue");
+    TSAN_ANNOTATE_BENIGN_RACE(&cap->n_run_queue, "truncateRunQueue");
     cap->run_queue_hd = END_TSO_QUEUE;
     cap->run_queue_tl = END_TSO_QUEUE;
     cap->n_run_queue = 0;

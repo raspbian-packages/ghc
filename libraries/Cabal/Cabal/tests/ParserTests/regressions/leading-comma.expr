@@ -6,31 +6,31 @@ GenericPackageDescription
                    CondNode
                      {condTreeComponents = [],
                       condTreeConstraints = [Dependency
-                                               `PackageName "base"`
-                                               AnyVersion
-                                               (Set.fromList [LMainLibName]),
+                                               (PackageName "base")
+                                               (OrLaterVersion (mkVersion [0]))
+                                               mainLibSet,
                                              Dependency
-                                               `PackageName "containers"`
-                                               AnyVersion
-                                               (Set.fromList [LMainLibName]),
+                                               (PackageName "containers")
+                                               (OrLaterVersion (mkVersion [0]))
+                                               mainLibSet,
                                              Dependency
-                                               `PackageName "deepseq"`
-                                               AnyVersion
-                                               (Set.fromList [LMainLibName]),
+                                               (PackageName "deepseq")
+                                               (OrLaterVersion (mkVersion [0]))
+                                               mainLibSet,
                                              Dependency
-                                               `PackageName "transformers"`
-                                               AnyVersion
-                                               (Set.fromList [LMainLibName]),
+                                               (PackageName "transformers")
+                                               (OrLaterVersion (mkVersion [0]))
+                                               mainLibSet,
                                              Dependency
-                                               `PackageName "filepath"`
-                                               AnyVersion
-                                               (Set.fromList [LMainLibName]),
+                                               (PackageName "filepath")
+                                               (OrLaterVersion (mkVersion [0]))
+                                               mainLibSet,
                                              Dependency
-                                               `PackageName "directory"`
-                                               AnyVersion
-                                               (Set.fromList [LMainLibName])],
+                                               (PackageName "directory")
+                                               (OrLaterVersion (mkVersion [0]))
+                                               mainLibSet],
                       condTreeData = Library
-                                       {exposedModules = [`ModuleName ["LeadingComma"]`],
+                                       {exposedModules = [ModuleName "LeadingComma"],
                                         libBuildInfo = BuildInfo
                                                          {asmOptions = [],
                                                           asmSources = [],
@@ -74,35 +74,47 @@ GenericPackageDescription
                                                           sharedOptions = PerCompilerFlavor [] [],
                                                           staticOptions = PerCompilerFlavor [] [],
                                                           targetBuildDepends = [Dependency
-                                                                                  `PackageName "base"`
-                                                                                  AnyVersion
-                                                                                  (Set.fromList
-                                                                                     [LMainLibName]),
+                                                                                  (PackageName
+                                                                                     "base")
+                                                                                  (OrLaterVersion
+                                                                                     (mkVersion
+                                                                                        [0]))
+                                                                                  mainLibSet,
                                                                                 Dependency
-                                                                                  `PackageName "containers"`
-                                                                                  AnyVersion
-                                                                                  (Set.fromList
-                                                                                     [LMainLibName]),
+                                                                                  (PackageName
+                                                                                     "containers")
+                                                                                  (OrLaterVersion
+                                                                                     (mkVersion
+                                                                                        [0]))
+                                                                                  mainLibSet,
                                                                                 Dependency
-                                                                                  `PackageName "deepseq"`
-                                                                                  AnyVersion
-                                                                                  (Set.fromList
-                                                                                     [LMainLibName]),
+                                                                                  (PackageName
+                                                                                     "deepseq")
+                                                                                  (OrLaterVersion
+                                                                                     (mkVersion
+                                                                                        [0]))
+                                                                                  mainLibSet,
                                                                                 Dependency
-                                                                                  `PackageName "transformers"`
-                                                                                  AnyVersion
-                                                                                  (Set.fromList
-                                                                                     [LMainLibName]),
+                                                                                  (PackageName
+                                                                                     "transformers")
+                                                                                  (OrLaterVersion
+                                                                                     (mkVersion
+                                                                                        [0]))
+                                                                                  mainLibSet,
                                                                                 Dependency
-                                                                                  `PackageName "filepath"`
-                                                                                  AnyVersion
-                                                                                  (Set.fromList
-                                                                                     [LMainLibName]),
+                                                                                  (PackageName
+                                                                                     "filepath")
+                                                                                  (OrLaterVersion
+                                                                                     (mkVersion
+                                                                                        [0]))
+                                                                                  mainLibSet,
                                                                                 Dependency
-                                                                                  `PackageName "directory"`
-                                                                                  AnyVersion
-                                                                                  (Set.fromList
-                                                                                     [LMainLibName])],
+                                                                                  (PackageName
+                                                                                     "directory")
+                                                                                  (OrLaterVersion
+                                                                                     (mkVersion
+                                                                                        [0]))
+                                                                                  mainLibSet],
                                                           virtualModules = []},
                                         libExposed = True,
                                         libName = LMainLibName,
@@ -112,6 +124,7 @@ GenericPackageDescription
    condSubLibraries = [],
    condTestSuites = [],
    genPackageFlags = [],
+   gpdScannedVersion = Nothing,
    packageDescription = PackageDescription
                           {author = "",
                            benchmarks = [],
@@ -120,7 +133,7 @@ GenericPackageDescription
                            category = "",
                            copyright = "",
                            customFieldsPD = [],
-                           dataDir = "",
+                           dataDir = ".",
                            dataFiles = [],
                            description = "",
                            executables = [],
@@ -134,12 +147,12 @@ GenericPackageDescription
                            licenseRaw = Left NONE,
                            maintainer = "",
                            package = PackageIdentifier
-                                       {pkgName = `PackageName "leading-comma"`,
-                                        pkgVersion = `mkVersion [0]`},
+                                       {pkgName = PackageName "leading-comma",
+                                        pkgVersion = mkVersion [0]},
                            pkgUrl = "",
                            setupBuildInfo = Nothing,
                            sourceRepos = [],
-                           specVersionRaw = Left `mkVersion [2,1]`,
+                           specVersion = CabalSpecV2_2,
                            stability = "",
                            subLibraries = [],
                            synopsis = "leading comma, trailing comma, or ordinary",

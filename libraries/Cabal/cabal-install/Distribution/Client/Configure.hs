@@ -24,6 +24,7 @@ module Distribution.Client.Configure (
 
 import Prelude ()
 import Distribution.Client.Compat.Prelude
+import Distribution.Utils.Generic (safeHead)
 
 import Distribution.Client.Dependency
 import qualified Distribution.Client.InstallPlan as InstallPlan
@@ -62,12 +63,10 @@ import Distribution.Simple.PackageIndex
          ( InstalledPackageIndex, lookupPackageName )
 import Distribution.Package
          ( Package(..), packageName, PackageId )
-import Distribution.Types.Dependency
-         ( thisPackageVersion )
 import Distribution.Types.GivenComponent
          ( GivenComponent(..) )
 import Distribution.Types.PackageVersionConstraint
-         ( PackageVersionConstraint(..) )
+         ( PackageVersionConstraint(..), thisPackageVersionConstraint )
 import qualified Distribution.PackageDescription as PkgDesc
 import Distribution.PackageDescription.Parsec
          ( readGenericPackageDescription )
@@ -81,9 +80,6 @@ import Distribution.Simple.Utils as Utils
          , defaultPackageDesc )
 import Distribution.System
          ( Platform )
-import Distribution.Deprecated.Text ( display )
-import Distribution.Verbosity as Verbosity
-         ( Verbosity )
 
 import System.FilePath ( (</>) )
 
@@ -242,7 +238,7 @@ configureSetupScript packageDBs
     maybeSetupBuildInfo :: Maybe PkgDesc.SetupBuildInfo
     maybeSetupBuildInfo = do
       ReadyPackage cpkg <- mpkg
-      let gpkg = packageDescription (confPkgSource cpkg)
+      let gpkg = srcpkgDescription (confPkgSource cpkg)
       PkgDesc.setupBuildInfo (PkgDesc.packageDescription gpkg)
 
     -- Was a default 'custom-setup' stanza added by 'cabal-install' itself? If
@@ -272,12 +268,12 @@ checkConfigExFlags :: Package pkg
                    -> ConfigExFlags
                    -> IO ()
 checkConfigExFlags verbosity installedPkgIndex sourcePkgIndex flags = do
-  unless (null unknownConstraints) $ warn verbosity $
-             "Constraint refers to an unknown package: "
-          ++ showConstraint (head unknownConstraints)
-  unless (null unknownPreferences) $ warn verbosity $
-             "Preference refers to an unknown package: "
-          ++ display (head unknownPreferences)
+  for_ (safeHead unknownConstraints) $ \h ->
+    warn verbosity $ "Constraint refers to an unknown package: "
+          ++ showConstraint h
+  for_ (safeHead unknownPreferences) $ \h ->
+    warn verbosity $ "Preference refers to an unknown package: "
+          ++ prettyShow h
   where
     unknownConstraints = filter (unknown . userConstraintPackageName . fst) $
                          configExConstraints flags
@@ -286,7 +282,7 @@ checkConfigExFlags verbosity installedPkgIndex sourcePkgIndex flags = do
     unknown pkg = null (lookupPackageName installedPkgIndex pkg)
                && not (elemByPackageName sourcePkgIndex pkg)
     showConstraint (uc, src) =
-        display uc ++ " (" ++ showConstraintSource src ++ ")"
+        prettyShow uc ++ " (" ++ showConstraintSource src ++ ")"
 
 -- | Make an 'InstallPlan' for the unpacked package in the current directory,
 -- and all its dependencies.
@@ -309,10 +305,10 @@ planLocalPackage verbosity comp platform configFlags configExFlags
 
   let -- We create a local package and ask to resolve a dependency on it
       localPkg = SourcePackage {
-        packageInfoId             = packageId pkg,
-        packageDescription        = pkg,
-        packageSource             = LocalUnpackedPackage ".",
-        packageDescrOverride      = Nothing
+        srcpkgPackageId          = packageId pkg,
+        srcpkgDescription        = pkg,
+        srcpkgSource             = LocalUnpackedPackage ".",
+        srcpkgDescrOverride      = Nothing
       }
 
       testsEnabled = fromFlagOrDefault False $ configTests configFlags
@@ -396,17 +392,17 @@ configurePackage verbosity platform comp scriptOptions configFlags
     scriptOptions (Just pkg) configureCommand configureFlags (const extraArgs)
 
   where
-    gpkg = packageDescription spkg
+    gpkg = srcpkgDescription spkg
     configureFlags   = filterConfigureFlags configFlags {
       configIPID = if isJust (flagToMaybe (configIPID configFlags))
                     -- Make sure cabal configure --ipid works.
                     then configIPID configFlags
-                    else toFlag (display ipid),
+                    else toFlag (prettyShow ipid),
       configConfigurationsFlags = flags,
       -- We generate the legacy constraints as well as the new style precise
       -- deps.  In the end only one set gets passed to Setup.hs configure,
       -- depending on the Cabal version we are talking to.
-      configConstraints  = [ thisPackageVersion srcid
+      configConstraints  = [ thisPackageVersionConstraint srcid
                            | ConfiguredId srcid (Just (PkgDesc.CLibName PkgDesc.LMainLibName)) _uid
                                <- CD.nonSetupDeps deps ],
       configDependencies = [ GivenComponent (packageName srcid) cname uid

@@ -12,13 +12,14 @@ import Prelude ()
 import Distribution.Compat.Prelude
 
 import Distribution.Package
-import Distribution.PackageDescription as PD hiding (Flag)
+import Distribution.PackageDescription
 import Distribution.Simple.BuildToolDepends
 import Distribution.Simple.LocalBuildInfo
 import Distribution.Types.ComponentRequestedSpec
-import Distribution.Types.UnqualComponentName
 import Distribution.Compat.Graph (Graph, Node(..))
 import qualified Distribution.Compat.Graph as Graph
+import qualified Distribution.Compat.NonEmptySet as NES
+import Distribution.Utils.Generic
 
 import Distribution.Pretty (pretty)
 import Text.PrettyPrint
@@ -62,20 +63,18 @@ mkComponentsGraph enabled pkg_descr =
   where
     -- The dependencies for the given component
     componentDeps component =
-      (CExeName <$> getAllInternalToolDependencies pkg_descr bi)
-
-      ++ [ if pkgname == packageName pkg_descr
-           then CLibName LMainLibName
-           else CLibName (LSubLibName toolname)
-         | Dependency pkgname _ _ <- targetBuildDepends bi
-         , let toolname = packageNameToUnqualComponentName pkgname
-         , toolname `elem` internalPkgDeps ]
+        toolDependencies ++ libDependencies
       where
         bi = componentBuildInfo component
-        internalPkgDeps = map (conv . libName) (allLibraries pkg_descr)
 
-        conv LMainLibName    = packageNameToUnqualComponentName $ packageName pkg_descr
-        conv (LSubLibName s) = s
+        toolDependencies = CExeName <$> getAllInternalToolDependencies pkg_descr bi
+
+        libDependencies = do
+            Dependency pkgname _ lns <- targetBuildDepends bi
+            guard (pkgname == packageName pkg_descr)
+
+            ln <- NES.toList lns
+            return (CLibName ln)
 
 -- | Given the package description and a 'PackageDescription' (used
 -- to determine if a package name is internal or not), sort the
@@ -89,9 +88,10 @@ componentsGraphToList =
     map (\(N c _ cs) -> (c, cs)) . Graph.revTopSort
 
 -- | Error message when there is a cycle; takes the SCC of components.
-componentCycleMsg :: [ComponentName] -> Doc
-componentCycleMsg cnames =
-    text $ "Components in the package depend on each other in a cyclic way:\n  "
-       ++ intercalate " depends on "
+componentCycleMsg :: PackageIdentifier -> [ComponentName] -> Doc
+componentCycleMsg pn cnames =
+    text "Components in the package" <+> pretty pn <+> text "depend on each other in a cyclic way:"
+    $$
+    text (intercalate " depends on "
             [ "'" ++ showComponentName cname ++ "'"
-            | cname <- cnames ++ [head cnames] ]
+            | cname <- cnames ++ maybeToList (safeHead cnames) ])

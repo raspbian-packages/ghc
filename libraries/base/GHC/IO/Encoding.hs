@@ -82,7 +82,7 @@ utf8_bom = UTF8.utf8_bom
 utf16  :: TextEncoding
 utf16 = UTF16.utf16
 
--- | The UTF-16 Unicode encoding (litte-endian)
+-- | The UTF-16 Unicode encoding (little-endian)
 utf16le  :: TextEncoding
 utf16le = UTF16.utf16le
 
@@ -95,7 +95,7 @@ utf16be = UTF16.utf16be
 utf32  :: TextEncoding
 utf32 = UTF32.utf32
 
--- | The UTF-32 Unicode encoding (litte-endian)
+-- | The UTF-32 Unicode encoding (little-endian)
 utf32le  :: TextEncoding
 utf32le = UTF32.utf32le
 
@@ -107,6 +107,7 @@ utf32be = UTF32.utf32be
 --
 -- @since 4.5.0.0
 getLocaleEncoding :: IO TextEncoding
+{-# NOINLINE getLocaleEncoding #-}
 
 -- | The Unicode encoding of the current locale, but allowing arbitrary
 -- undecodable bytes to be round-tripped through it.
@@ -120,6 +121,7 @@ getLocaleEncoding :: IO TextEncoding
 --
 -- @since 4.5.0.0
 getFileSystemEncoding :: IO TextEncoding
+{-# NOINLINE getFileSystemEncoding #-}
 
 -- | The Unicode encoding of the current locale, but where undecodable
 -- bytes are replaced with their closest visual match. Used for
@@ -127,9 +129,13 @@ getFileSystemEncoding :: IO TextEncoding
 --
 -- @since 4.5.0.0
 getForeignEncoding :: IO TextEncoding
+{-# NOINLINE getForeignEncoding #-}
 
 -- | @since 4.5.0.0
 setLocaleEncoding, setFileSystemEncoding, setForeignEncoding :: TextEncoding -> IO ()
+{-# NOINLINE setLocaleEncoding #-}
+{-# NOINLINE setFileSystemEncoding #-}
+{-# NOINLINE setForeignEncoding #-}
 
 (getLocaleEncoding, setLocaleEncoding)         = mkGlobal initLocaleEncoding
 (getFileSystemEncoding, setFileSystemEncoding) = mkGlobal initFileSystemEncoding
@@ -139,9 +145,13 @@ mkGlobal :: a -> (IO a, a -> IO ())
 mkGlobal x = unsafePerformIO $ do
     x_ref <- newIORef x
     return (readIORef x_ref, writeIORef x_ref)
+{-# NOINLINE mkGlobal #-}
 
 -- | @since 4.5.0.0
 initLocaleEncoding, initFileSystemEncoding, initForeignEncoding :: TextEncoding
+{-# NOINLINE initLocaleEncoding #-}
+-- N.B. initLocaleEncoding is exported for use in System.IO.localeEncoding.
+-- NOINLINE ensures that this result is shared.
 
 #if !defined(mingw32_HOST_OS)
 -- It is rather important that we don't just call Iconv.mkIconvEncoding here

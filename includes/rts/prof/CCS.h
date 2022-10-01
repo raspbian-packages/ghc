@@ -7,7 +7,7 @@
  * Do not #include this file directly: #include "Rts.h" instead.
  *
  * To understand the structure of the RTS headers, see the wiki:
- *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/SourceTree/Includes
+ *   https://gitlab.haskell.org/ghc/ghc/wikis/commentary/source-tree/includes
  *
  * ---------------------------------------------------------------------------*/
 
@@ -22,7 +22,7 @@
  * putting the 8-byte fields on an 8-byte boundary.  Padding can
  * vary between C compilers, and we don't take into account any
  * possible padding when generating CCS and CC decls in the code
- * generator (compiler/codeGen/StgCmmProf.hs).
+ * generator (GHC.StgToCmm.Prof).
  */
 
 typedef struct CostCentre_ {

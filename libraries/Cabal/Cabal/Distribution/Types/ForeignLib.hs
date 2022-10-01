@@ -30,8 +30,8 @@ import Distribution.Types.UnqualComponentName
 import Distribution.Version
 
 import qualified Distribution.Compat.CharParsing as P
-import qualified Text.PrettyPrint           as Disp
-import qualified Text.Read                  as Read
+import qualified Text.PrettyPrint                as Disp
+import qualified Text.Read                       as Read
 
 import qualified Distribution.Types.BuildInfo.Lens as L
 
@@ -82,7 +82,7 @@ instance Read LibVersionInfo where
         return (mkLibVersionInfo t)
 
 instance Binary LibVersionInfo
-
+instance Structured LibVersionInfo
 instance NFData LibVersionInfo where rnf = genericRnf
 
 instance Pretty LibVersionInfo where
@@ -135,7 +135,7 @@ instance L.HasBuildInfo ForeignLib where
     buildInfo f l = (\x -> l { foreignLibBuildInfo = x }) <$> f (foreignLibBuildInfo l)
 
 instance Binary ForeignLib
-
+instance Structured ForeignLib
 instance NFData ForeignLib where rnf = genericRnf
 
 instance Semigroup ForeignLib where

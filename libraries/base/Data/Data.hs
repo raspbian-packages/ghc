@@ -128,9 +128,12 @@ import GHC.List
 import GHC.Num
 import GHC.Read
 import GHC.Show
+import GHC.Tuple (Solo (..))
 import Text.Read( reads )
 
 -- Imports for the instances
+import Control.Applicative (WrappedArrow(..), WrappedMonad(..), ZipList(..))
+       -- So we can give them Data instances
 import Data.Functor.Identity -- So we can give Data instance for Identity
 import Data.Int              -- So we can give Data instance for Int8, ...
 import Data.Type.Coercion
@@ -192,7 +195,7 @@ immediate subterms.  In the definition of gmapQr, extra effort is
 needed. We use a higher-order accumulation trick to mediate between
 left-associative constructor application vs. right-associative binary
 operation (e.g., @(:)@).  When the query is meant to compute a value
-of type @r@, then the result type withing generic folding is @r -> r@.
+of type @r@, then the result type within generic folding is @r -> r@.
 So the result of folding is a function to which we finally pass the
 right unit.
 
@@ -1108,7 +1111,7 @@ ratioDataType = mkDataType "GHC.Real.Ratio" [ratioConstr]
 
 -- NB: This Data instance intentionally uses the (%) smart constructor instead
 -- of the internal (:%) constructor to preserve the invariant that a Ratio
--- value is reduced to normal form. See Trac #10011.
+-- value is reduced to normal form. See #10011.
 
 -- | @since 4.0.0.0
 instance (Data a, Integral a) => Data (Ratio a) where
@@ -1156,6 +1159,18 @@ instance Data a => Data [a] where
 
 ------------------------------------------------------------------------------
 
+-- | @since 4.14.0.0
+deriving instance (Typeable (a :: Type -> Type -> Type), Typeable b, Typeable c,
+                   Data (a b c))
+         => Data (WrappedArrow a b c)
+
+-- | @since 4.14.0.0
+deriving instance (Typeable (m :: Type -> Type), Typeable a, Data (m a))
+         => Data (WrappedMonad m a)
+
+-- | @since 4.14.0.0
+deriving instance Data a => Data (ZipList a)
+
 -- | @since 4.9.0.0
 deriving instance Data a => Data (NonEmpty a)
 
@@ -1170,6 +1185,9 @@ deriving instance (Data a, Data b) => Data (Either a b)
 
 -- | @since 4.0.0.0
 deriving instance Data ()
+
+-- | @since 4.15
+deriving instance Data a => Data (Solo a)
 
 -- | @since 4.0.0.0
 deriving instance (Data a, Data b) => Data (a,b)

@@ -30,6 +30,7 @@ module Distribution.Simple.Build (
 
 import Prelude ()
 import Distribution.Compat.Prelude
+import Distribution.Utils.Generic
 
 import Distribution.Types.ComponentLocalBuildInfo
 import Distribution.Types.ComponentRequestedSpec
@@ -40,8 +41,8 @@ import Distribution.Types.LibraryVisibility
 import Distribution.Types.LocalBuildInfo
 import Distribution.Types.MungedPackageId
 import Distribution.Types.MungedPackageName
+import Distribution.Types.ModuleRenaming
 import Distribution.Types.TargetInfo
-import Distribution.Types.UnqualComponentName
 
 import Distribution.Package
 import Distribution.Backpack
@@ -56,8 +57,8 @@ import Distribution.Simple.Build.Macros      (generateCabalMacrosHeader)
 import Distribution.Simple.Build.PathsModule (generatePathsModule)
 import qualified Distribution.Simple.Program.HcPkg as HcPkg
 
-import Distribution.Simple.Compiler hiding (Flag)
-import Distribution.PackageDescription hiding (Flag)
+import Distribution.Simple.Compiler
+import Distribution.PackageDescription
 import qualified Distribution.InstalledPackageInfo as IPI
 import Distribution.InstalledPackageInfo (InstalledPackageInfo)
 import qualified Distribution.ModuleName as ModuleName
@@ -80,6 +81,7 @@ import Distribution.Simple.Utils.Json
 import Distribution.System
 import Distribution.Pretty
 import Distribution.Verbosity
+import Distribution.Version (thisVersion)
 
 import Distribution.Compat.Graph (IsNode(..))
 
@@ -154,7 +156,9 @@ repl pkg_descr lbi flags suffixes args = do
 
   target <- readTargetInfos verbosity pkg_descr lbi args >>= \r -> case r of
     -- This seems DEEPLY questionable.
-    []       -> return (head (allTargetsInBuildOrder' pkg_descr lbi))
+    []       -> case allTargetsInBuildOrder' pkg_descr lbi of
+      (target:_) -> return target
+      []         -> die' verbosity $ "Failed to determine target."
     [target] -> return target
     _        -> die' verbosity $ "The 'repl' command does not support multiple targets at once."
   let componentsToBuild = neededTargetsInBuildOrder' pkg_descr lbi [nodeKey target]
@@ -180,7 +184,7 @@ repl pkg_descr lbi flags suffixes args = do
          componentInitialBuildSteps distPref pkg_descr lbi clbi verbosity
          buildComponent verbosity NoFlag
                         pkg_descr lbi' suffixes comp clbi distPref
-    | subtarget <- init componentsToBuild ]
+    | subtarget <- safeInit componentsToBuild ]
 
   -- REPL for target components
   let clbi = targetCLBI target
@@ -532,8 +536,9 @@ testSuiteLibV09AsLibAndExe pkg_descr
                 , componentCompatPackageKey = compat_key
                 , componentExposedModules = [IPI.ExposedModule m Nothing]
                 }
+    pkgName' = mkPackageName $ prettyShow compat_name
     pkg = pkg_descr {
-            package      = (package pkg_descr) { pkgName = mkPackageName $ prettyShow compat_name }
+            package      = (package pkg_descr) { pkgName = pkgName' }
           , executables  = []
           , testSuites   = []
           , subLibraries = [lib]
@@ -541,7 +546,10 @@ testSuiteLibV09AsLibAndExe pkg_descr
     ipi    = inplaceInstalledPackageInfo pwd distPref pkg (mkAbiHash "") lib lbi libClbi
     testDir = buildDir lbi </> stubName test
           </> stubName test ++ "-tmp"
-    testLibDep = thisPackageVersion $ package pkg
+    testLibDep = Dependency
+        pkgName'
+        (thisVersion $ pkgVersion $ package pkg_descr)
+        mainLibSet
     exe = Executable {
             exeName    = mkUnqualComponentName $ stubName test,
             modulePath = stubFilePath test,

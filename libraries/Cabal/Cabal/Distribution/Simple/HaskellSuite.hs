@@ -6,12 +6,10 @@ module Distribution.Simple.HaskellSuite where
 import Prelude ()
 import Distribution.Compat.Prelude
 
-import Data.Either (partitionEithers)
-
-import qualified Data.Map as Map (empty)
+import qualified Data.List.NonEmpty as NE
 
 import Distribution.Simple.Program
-import Distribution.Simple.Compiler as Compiler
+import Distribution.Simple.Compiler
 import Distribution.Simple.Utils
 import Distribution.Simple.BuildPaths
 import Distribution.Verbosity
@@ -24,7 +22,6 @@ import Distribution.Simple.PackageIndex as PackageIndex
 import Distribution.PackageDescription
 import Distribution.Simple.LocalBuildInfo
 import Distribution.System (Platform)
-import Distribution.Compat.Exception
 import Language.Haskell.Extension
 import Distribution.Simple.Program.Builtin
 
@@ -78,11 +75,11 @@ configure verbosity mbHcPath hcPkgPath progdb0 = do
       let
         comp = Compiler {
           compilerId             = CompilerId (HaskellSuite compName) compVersion,
-          compilerAbiTag         = Compiler.NoAbiTag,
+          compilerAbiTag         = NoAbiTag,
           compilerCompat         = [],
           compilerLanguages      = languages,
           compilerExtensions     = extensions,
-          compilerProperties     = Map.empty
+          compilerProperties     = mempty
         }
 
       return (comp, confdCompiler, progdb2)
@@ -91,21 +88,21 @@ hstoolVersion :: Verbosity -> FilePath -> IO (Maybe Version)
 hstoolVersion = findProgramVersion "--hspkg-version" id
 
 numericVersion :: Verbosity -> FilePath -> IO (Maybe Version)
-numericVersion = findProgramVersion "--compiler-version" (last . words)
+numericVersion = findProgramVersion "--compiler-version" (fromMaybe "" . safeLast . words)
 
 getCompilerVersion :: Verbosity -> ConfiguredProgram -> IO (String, Version)
 getCompilerVersion verbosity prog = do
   output <- rawSystemStdout verbosity (programPath prog) ["--compiler-version"]
   let
     parts = words output
-    name = concat $ init parts -- there shouldn't be any spaces in the name anyway
-    versionStr = last parts
+    name = concat $ safeInit parts -- there shouldn't be any spaces in the name anyway
+    versionStr = fromMaybe "" $ safeLast parts
   version <-
     maybe (die' verbosity "haskell-suite: couldn't determine compiler version") return $
       simpleParsec versionStr
   return (name, version)
 
-getExtensions :: Verbosity -> ConfiguredProgram -> IO [(Extension, Maybe Compiler.Flag)]
+getExtensions :: Verbosity -> ConfiguredProgram -> IO [(Extension, Maybe CompilerFlag)]
 getExtensions verbosity prog = do
   extStrs <-
     lines `fmap`
@@ -113,7 +110,7 @@ getExtensions verbosity prog = do
   return
     [ (ext, Just $ "-X" ++ prettyShow ext) | Just ext <- map simpleParsec extStrs ]
 
-getLanguages :: Verbosity -> ConfiguredProgram -> IO [(Language, Compiler.Flag)]
+getLanguages :: Verbosity -> ConfiguredProgram -> IO [(Language, CompilerFlag)]
 getLanguages verbosity prog = do
   langStrs <-
     lines `fmap`
@@ -137,9 +134,9 @@ getInstalledPackages verbosity packagedbs progdb =
 
   where
     parsePackages str =
-        case partitionEithers $ map parseInstalledPackageInfo (splitPkgs str) of
+        case partitionEithers $ map (parseInstalledPackageInfo . toUTF8BS) (splitPkgs str) of
             ([], ok)   -> Right [ pkg | (_, pkg) <- ok ]
-            (msgss, _) -> Left (concat msgss)
+            (msgss, _) -> Left (foldMap NE.toList msgss)
 
     splitPkgs :: String -> [String]
     splitPkgs = map unlines . splitWith ("---" ==) . lines
@@ -216,8 +213,8 @@ registerPackage verbosity progdb packageDbs installedPkgInfo = do
 
   runProgramInvocation verbosity $
     (programInvocation hspkg
-      ["update", packageDbOpt $ last packageDbs])
-      { progInvokeInput = Just $ showInstalledPackageInfo installedPkgInfo }
+      ["update", packageDbOpt $ registrationPackageDB packageDbs])
+      { progInvokeInput = Just $ IODataText $ showInstalledPackageInfo installedPkgInfo }
 
 initPackageDB :: Verbosity -> ProgramDb -> FilePath -> IO ()
 initPackageDB verbosity progdb dbPath =

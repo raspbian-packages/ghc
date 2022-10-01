@@ -33,12 +33,10 @@ import           Distribution.Compiler (CompilerId)
 import           Distribution.Simple.Utils
                    ( withTempDirectory, debug, info )
 import           Distribution.Verbosity
-import           Distribution.Deprecated.Text
+                   ( silent )
 
-import           Data.Set (Set)
 import qualified Data.Set as Set
 import           Control.Exception
-import           Control.Monad (forM_)
 import           System.FilePath
 import           System.Directory
 
@@ -204,7 +202,7 @@ newStoreEntry verbosity storeDirLayout@StoreDirLayout{..}
           then do
             info verbosity $
                 "Concurrent build race: abandoning build in favour of existing "
-             ++ "store entry " ++ display compid </> display unitid
+             ++ "store entry " ++ prettyShow compid </> prettyShow unitid
             return UseExistingStoreEntry
 
           -- If the entry does not exist then we won the race and can proceed.
@@ -215,13 +213,13 @@ newStoreEntry verbosity storeDirLayout@StoreDirLayout{..}
 
             -- Atomically rename the temp dir to the final store entry location.
             renameDirectory incomingEntryDir finalEntryDir
-            forM_ otherFiles $ \file -> do
+            for_ otherFiles $ \file -> do
               let finalStoreFile = storeDirectory compid </> makeRelative (incomingTmpDir </> (dropDrive (storeDirectory compid))) file
               createDirectoryIfMissing True (takeDirectory finalStoreFile)
               renameFile file finalStoreFile
 
             debug verbosity $
-              "Installed store entry " ++ display compid </> display unitid
+              "Installed store entry " ++ prettyShow compid </> prettyShow unitid
             return UseNewStoreEntry
   where
     finalEntryDir = storePackageDirectory compid unitid
@@ -250,7 +248,7 @@ withIncomingUnitIdLock verbosity StoreDirLayout{storeIncomingLock}
             gotLock <- fdTryLock fd ExclusiveLock
             unless gotLock  $ do
                 info verbosity $ "Waiting for file lock on store entry "
-                              ++ display compid </> display unitid
+                              ++ prettyShow compid </> prettyShow unitid
                 fdLock fd ExclusiveLock
             return fd
 
@@ -270,7 +268,7 @@ withIncomingUnitIdLock verbosity StoreDirLayout{storeIncomingLock}
       gotlock <- hTryLock h ExclusiveLock
       unless gotlock $ do
         info verbosity $ "Waiting for file lock on store entry "
-                      ++ display compid </> display unitid
+                      ++ prettyShow compid </> prettyShow unitid
         hLock h ExclusiveLock
       return h
 

@@ -33,10 +33,14 @@
 -- index, providing an interface very similar to the "Typeable" notion seen in
 -- previous releases. For the type-indexed interface, see "Type.Reflection".
 --
+-- Since GHC 7.10, all types automatically have 'Typeable' instances derived.
+-- This is in contrast to previous releases where 'Typeable' had to be
+-- explicitly derived using the @DeriveDataTypeable@ language extension.
+--
 -- Since GHC 7.8, 'Typeable' is poly-kinded. The changes required for this might
 -- break some old programs involving 'Typeable'. More details on this, including
 -- how to fix your code, can be found on the
--- <https://ghc.haskell.org/trac/ghc/wiki/GhcKinds/PolyTypeable PolyTypeable wiki page>
+-- <https://gitlab.haskell.org/ghc/ghc/wikis/ghc-kinds/poly-typeable PolyTypeable wiki page>
 --
 -----------------------------------------------------------------------------
 

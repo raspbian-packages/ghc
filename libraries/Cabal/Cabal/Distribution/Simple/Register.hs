@@ -23,7 +23,7 @@
 -- build multi-package systems.
 --
 -- This module does not delegate anything to the per-compiler modules but just
--- mixes it all in in this module, which is rather unsatisfactory. The script
+-- mixes it all in this module, which is rather unsatisfactory. The script
 -- generation and the unregister feature are not well used or tested.
 
 module Distribution.Simple.Register (
@@ -87,7 +87,6 @@ import Distribution.Compat.Graph (IsNode(nodeKey))
 import System.FilePath ((</>), (<.>), isAbsolute)
 import System.Directory
 
-import Data.List (partition)
 import qualified Data.ByteString.Lazy.Char8 as BS.Char8
 
 -- -----------------------------------------------------------------------------
@@ -300,7 +299,7 @@ createPackageDB verbosity comp progdb preferCompat dbPath =
                               "Distribution.Simple.Register.createPackageDB: "
                            ++ "not implemented for this compiler"
 
-doesPackageDBExist :: FilePath -> NoCallStackIO Bool
+doesPackageDBExist :: FilePath -> IO Bool
 doesPackageDBExist dbPath = do
     -- currently one impl for all compiler flavours, but could change if needed
     dir_exists <- doesDirectoryExist dbPath
@@ -308,7 +307,7 @@ doesPackageDBExist dbPath = do
         then return True
         else doesFileExist dbPath
 
-deletePackageDB :: FilePath -> NoCallStackIO ()
+deletePackageDB :: FilePath -> IO ()
 deletePackageDB dbPath = do
     -- currently one impl for all compiler flavours, but could change if needed
     dir_exists <- doesDirectoryExist dbPath

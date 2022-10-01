@@ -3,7 +3,7 @@ import Control.Monad.IO.Class
 import Data.Maybe
 import System.Directory
 -- Test for 'build-type: Configure' example from the setup manual.
-main = setupAndCabalTest $ do
+main = setupTest $ do
     hasAutoreconf <- liftIO $ fmap isJust $ findExecutable "autoreconf"
     skipUnless hasAutoreconf
     _ <- shell "autoreconf" ["-i"]

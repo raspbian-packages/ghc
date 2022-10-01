@@ -20,6 +20,7 @@
 #include "STM.h"        /* initSTM */
 #include "RtsSignals.h"
 #include "Weak.h"
+#include "ForeignExports.h"     /* processForeignExports */
 #include "Ticky.h"
 #include "StgRun.h"
 #include "Prelude.h"            /* fixupRTStoPreludeRefs */
@@ -31,6 +32,7 @@
 #include "StaticPtrTable.h"
 #include "Hash.h"
 #include "Profiling.h"
+#include "ProfHeap.h"
 #include "Timer.h"
 #include "Globals.h"
 #include "FileLock.h"
@@ -45,11 +47,13 @@
 #endif
 
 #if defined(mingw32_HOST_OS) && !defined(THREADED_RTS)
-#include "win32/AsyncIO.h"
+#include "win32/AsyncMIO.h"
+#include "win32/AsyncWinIO.h"
 #endif
 
 #if defined(mingw32_HOST_OS)
 #include <fenv.h>
+#include <windows.h>
 #else
 #include "posix/TTY.h"
 #endif
@@ -65,11 +69,16 @@
 static int hs_init_count = 0;
 static bool rts_shutdown = false;
 
+#if defined(mingw32_HOST_OS)
+/* Indicates CodePage to set program to after exit.  */
+static int64_t __codePage = 0;
+#endif
+
 static void flushStdHandles(void);
 
 /* -----------------------------------------------------------------------------
    Initialise floating point unit on x86 (currently disabled; See Note
-   [x86 Floating point precision] in compiler/nativeGen/X86/Instr.hs)
+   [x86 Floating point precision] in compiler/GHC/CmmToAsm/X86/Instr.hs)
    -------------------------------------------------------------------------- */
 
 #define X86_INIT_FPU 0
@@ -119,6 +128,46 @@ void fpreset(void) {
     _fpreset();
 }
 #endif
+
+/* Set the console's CodePage to UTF-8 if using the new I/O manager and the CP
+   is still the default one.  */
+static void
+initConsoleCP (void)
+{
+    /* Set the initial codepage to automatic.  */
+    __codePage = -1;
+
+    /* Check if the codepage is still the system default ANSI codepage.  */
+    if (GetConsoleCP () == GetOEMCP ()
+        && GetConsoleOutputCP () == GetOEMCP ()) {
+      if (!SetConsoleCP (CP_UTF8) || !SetConsoleOutputCP (CP_UTF8))
+        errorBelch ("Unable to set console CodePage, Unicode output may be "
+                    "garbled.\n");
+      else
+        IF_DEBUG (scheduler, debugBelch ("Codepage set to UTF-8.\n"));
+
+      /* Assign the codepage so we can restore it on exit.  */
+      __codePage = (int64_t)GetOEMCP ();
+    }
+}
+
+/* Restore the CodePage to what it was before we started.  If the CodePage was
+   already set then this call is a no-op.  */
+void
+hs_restoreConsoleCP (void)
+{
+    /* If we set the CP at startup, we should set it on exit.  */
+    if (__codePage == -1)
+      return;
+
+    UINT cp = (UINT)__codePage;
+    __codePage = -1;
+    if (SetConsoleCP (cp) && SetConsoleOutputCP (cp)) {
+      IF_DEBUG (scheduler, debugBelch ("Codepage restored to OEM.\n"));
+    } else {
+      IF_DEBUG (scheduler, debugBelch ("Unable to restore CodePage to OEM.\n"));
+    }
+}
 #endif
 
 /* -----------------------------------------------------------------------------
@@ -219,6 +268,12 @@ hs_init_ghc(int *argc, char **argv[], RtsConfig rts_config)
 #endif /* DEBUG */
     }
 
+    /* Initialize console Codepage.  */
+#if defined(mingw32_HOST_OS)
+   if (is_io_mng_native_p())
+      initConsoleCP();
+#endif
+
     /* Initialise the stats department, phase 1 */
     initStats1();
 
@@ -229,6 +284,13 @@ hs_init_ghc(int *argc, char **argv[], RtsConfig rts_config)
 
     /* Initialise libdw session pool */
     libdwPoolInit();
+
+    /* Start the "ticker" and profiling timer but don't start until the
+     * scheduler is up. However, the ticker itself needs to be initialized
+     * before the scheduler to ensure that the ticker mutex is initialized as
+     * moreCapabilities will attempt to acquire it.
+     */
+    initTimer();
 
     /* initialise scheduler data structures (needs to be done before
      * initStorage()).
@@ -274,19 +336,24 @@ hs_init_ghc(int *argc, char **argv[], RtsConfig rts_config)
     getStablePtr((StgPtr)cannotCompactPinned_closure);
     getStablePtr((StgPtr)cannotCompactMutable_closure);
     getStablePtr((StgPtr)nestedAtomically_closure);
-    getStablePtr((StgPtr)absentSumFieldError_closure);
-        // `Id` for this closure is marked as non-CAFFY,
-        // see Note [aBSENT_SUM_FIELD_ERROR_ID] in MkCore.
-
     getStablePtr((StgPtr)runSparks_closure);
     getStablePtr((StgPtr)ensureIOManagerIsRunning_closure);
+    getStablePtr((StgPtr)interruptIOManager_closure);
     getStablePtr((StgPtr)ioManagerCapabilitiesChanged_closure);
 #if !defined(mingw32_HOST_OS)
     getStablePtr((StgPtr)blockedOnBadFD_closure);
     getStablePtr((StgPtr)runHandlersPtr_closure);
+#else
+    getStablePtr((StgPtr)processRemoteCompletion_closure);
 #endif
 
-    // Initialize the top-level handler system
+    /*
+     * process any foreign exports which were registered while loading the
+     * image
+     * */
+    processForeignExports();
+
+    /* initialize the top-level handler system */
     initTopHandler();
 
     /* initialise the shared Typeable store */
@@ -300,10 +367,12 @@ hs_init_ghc(int *argc, char **argv[], RtsConfig rts_config)
     initThreadLabelTable();
 #endif
 
+#if defined(PROFILING)
     initProfiling();
+#endif
+    initHeapProfiling();
 
     /* start the virtual timer 'subsystem'. */
-    initTimer();
     startTimer();
 
 #if defined(RTS_USER_SIGNALS)
@@ -316,7 +385,10 @@ hs_init_ghc(int *argc, char **argv[], RtsConfig rts_config)
 #endif
 
 #if defined(mingw32_HOST_OS) && !defined(THREADED_RTS)
-    startupAsyncIO();
+   if (is_io_mng_native_p())
+      startupAsyncWinIO();
+    else
+      startupAsyncIO();
 #endif
 
     x86_init_fpu();
@@ -388,7 +460,8 @@ hs_exit_(bool wait_foreign)
     ioManagerDie();
 #endif
 
-    /* stop all running tasks */
+    /* stop all running tasks. This is also where we stop concurrent non-moving
+     * collection if it's running */
     exitScheduler(wait_foreign);
 
     /* run C finalizers for all active weak pointers */
@@ -469,8 +542,13 @@ hs_exit_(bool wait_foreign)
     reportCCSProfiling();
 #endif
 
+    endHeapProfiling();
+    freeHeapProfiling();
+
+#if defined(PROFILING)
     endProfiling();
     freeProfiling();
+#endif
 
 #if defined(PROFILING)
     // Originally, this was in report_ccs_profiling().  Now, retainer
@@ -492,11 +570,20 @@ hs_exit_(bool wait_foreign)
 #endif
 
 #if defined(mingw32_HOST_OS) && !defined(THREADED_RTS)
-    shutdownAsyncIO(wait_foreign);
+    if (is_io_mng_native_p())
+      shutdownAsyncWinIO(wait_foreign);
+    else
+      shutdownAsyncIO(wait_foreign);
 #endif
 
-    /* free hash table storage */
-    exitHashTable();
+    /* Restore the console Codepage.  */
+#if defined(mingw32_HOST_OS)
+   if (is_io_mng_native_p())
+      hs_restoreConsoleCP();
+#endif
+
+    /* tear down statistics subsystem */
+    stat_exit();
 
     // Finally, free all our storage.  However, we only free the heap
     // memory if we have waited for foreign calls to complete;

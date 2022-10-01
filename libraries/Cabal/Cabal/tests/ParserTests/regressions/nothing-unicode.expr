@@ -5,7 +5,7 @@ GenericPackageDescription
    condLibrary = Just
                    CondNode
                      {condTreeComponents = [CondBranch
-                                              {condBranchCondition = `CNot (Var (Flag (FlagName "\\28961")))`,
+                                              {condBranchCondition = `CNot (Var (PackageFlag (FlagName "\\28961")))`,
                                                condBranchIfFalse = Nothing,
                                                condBranchIfTrue = CondNode
                                                                     {condTreeComponents = [],
@@ -71,7 +71,7 @@ GenericPackageDescription
                                                                                        signatures = []}}}],
                       condTreeConstraints = [],
                       condTreeData = Library
-                                       {exposedModules = [`ModuleName ["\\937"]`],
+                                       {exposedModules = [ModuleName "\937"],
                                         libBuildInfo = BuildInfo
                                                          {asmOptions = [],
                                                           asmSources = [],
@@ -123,11 +123,12 @@ GenericPackageDescription
                                         signatures = []}},
    condSubLibraries = [],
    condTestSuites = [],
-   genPackageFlags = [MkFlag
+   genPackageFlags = [MkPackageFlag
                         {flagDefault = True,
                          flagDescription = "\28961",
                          flagManual = False,
-                         flagName = `FlagName "\\28961"`}],
+                         flagName = FlagName "\28961"}],
+   gpdScannedVersion = Nothing,
    packageDescription = PackageDescription
                           {author = "",
                            benchmarks = [],
@@ -136,7 +137,7 @@ GenericPackageDescription
                            category = "",
                            copyright = "",
                            customFieldsPD = [_×_ "x-\28961" "\28961"],
-                           dataDir = "",
+                           dataDir = ".",
                            dataFiles = [],
                            description = "",
                            executables = [],
@@ -150,8 +151,7 @@ GenericPackageDescription
                            licenseRaw = Left NONE,
                            maintainer = "",
                            package = PackageIdentifier
-                                       {pkgName = `PackageName "\\28961"`,
-                                        pkgVersion = `mkVersion [0]`},
+                                       {pkgName = PackageName "\28961", pkgVersion = mkVersion [0]},
                            pkgUrl = "",
                            setupBuildInfo = Nothing,
                            sourceRepos = [SourceRepo
@@ -161,8 +161,8 @@ GenericPackageDescription
                                              repoModule = Nothing,
                                              repoSubdir = Nothing,
                                              repoTag = Nothing,
-                                             repoType = Just Git}],
-                           specVersionRaw = Right (OrLaterVersion `mkVersion [1,10]`),
+                                             repoType = Just (KnownRepoType Git)}],
+                           specVersion = CabalSpecV1_10,
                            stability = "",
                            subLibraries = [],
                            synopsis = "The canonical non-package \28961",

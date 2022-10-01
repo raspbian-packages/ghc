@@ -54,7 +54,6 @@ import Distribution.Types.UnitId
 import Distribution.Utils.Base62
 
 import qualified Data.Map as Map
-import           Data.Set (Set)
 import qualified Data.Set as Set
 
 -----------------------------------------------------------------------
@@ -99,7 +98,7 @@ data OpenUnitId
 -- TODO: cache holes?
 
 instance Binary OpenUnitId
-
+instance Structured OpenUnitId 
 instance NFData OpenUnitId where
     rnf (IndefFullUnitId cid subst) = rnf cid `seq` rnf subst
     rnf (DefiniteUnitId uid) = rnf uid
@@ -118,7 +117,7 @@ instance Pretty OpenUnitId where
 --Right (DefiniteUnitId (DefUnitId {unDefUnitId = UnitId "foobar"}))
 --
 -- >>> eitherParsec "foo[Str=text-1.2.3:Data.Text.Text]" :: Either String OpenUnitId
--- Right (IndefFullUnitId (ComponentId "foo") (fromList [(ModuleName ["Str"],OpenModule (DefiniteUnitId (DefUnitId {unDefUnitId = UnitId "text-1.2.3"})) (ModuleName ["Data","Text","Text"]))]))
+-- Right (IndefFullUnitId (ComponentId "foo") (fromList [(ModuleName "Str",OpenModule (DefiniteUnitId (DefUnitId {unDefUnitId = UnitId "text-1.2.3"})) (ModuleName "Data.Text.Text"))]))
 --
 instance Parsec OpenUnitId where
     parsec = P.try parseOpenUnitId <|> fmap DefiniteUnitId parsec
@@ -166,6 +165,7 @@ data OpenModule
   deriving (Generic, Read, Show, Eq, Ord, Typeable, Data)
 
 instance Binary OpenModule
+instance Structured OpenModule
 
 instance NFData OpenModule where
     rnf (OpenModule uid mod_name) = rnf uid `seq` rnf mod_name
@@ -180,7 +180,7 @@ instance Pretty OpenModule where
 -- |
 --
 -- >>> eitherParsec "Includes2-0.1.0.0-inplace-mysql:Database.MySQL" :: Either String OpenModule
--- Right (OpenModule (DefiniteUnitId (DefUnitId {unDefUnitId = UnitId "Includes2-0.1.0.0-inplace-mysql"})) (ModuleName ["Database","MySQL"]))
+-- Right (OpenModule (DefiniteUnitId (DefUnitId {unDefUnitId = UnitId "Includes2-0.1.0.0-inplace-mysql"})) (ModuleName "Database.MySQL"))
 --
 instance Parsec OpenModule where
     parsec = parsecModuleVar <|> parsecOpenModule

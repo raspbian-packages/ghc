@@ -9,6 +9,11 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdio.h>
+#if defined(__x86_64__)
+#include <emmintrin.h>
+#include <xmmintrin.h>
+#endif
+
 #include "text_cbits.h"
 
 void _hs_text_memcpy(void *dest, size_t doff, const void *src, size_t soff,
@@ -82,6 +87,23 @@ _hs_text_decode_latin1(uint16_t *dest, const uint8_t *src,
   while (p != srcend && (uintptr_t)p & 0x3)
     *dest++ = *p++;
 
+#if defined(__x86_64__)
+  /* All the intrinsics used here are from SSE2,
+   * so every x86_64 CPU supports them.
+   */
+  const __m128i zeros = _mm_set1_epi32(0);
+  while (p < srcend - 7) {
+    /* Load 8 bytes of ASCII data */
+    const __m128i ascii = _mm_cvtsi64_si128(*((const uint64_t *)p));
+    /* Interleave with zeros */
+    const __m128i utf16 = _mm_unpacklo_epi8(ascii, zeros);
+    /* Store the resulting 16 bytes into destination */
+    _mm_storeu_si128((__m128i *)dest, utf16);
+
+    dest += 8;
+    p += 8;
+  }
+#else
   /* iterate over 32-bit aligned loads */
   while (p < srcend - 3) {
     const uint32_t w = *((const uint32_t *)p);
@@ -93,6 +115,7 @@ _hs_text_decode_latin1(uint16_t *dest, const uint8_t *src,
 
     p += 4;
   }
+#endif
 #endif
 
   /* handle unaligned suffix */
@@ -157,24 +180,40 @@ _hs_text_decode_utf8_int(uint16_t *const dest, size_t *destoff,
      */
 
     if (state == UTF8_ACCEPT) {
-      while (s < srcend - 4) {
-	codepoint = *((uint32_t *) s);
-	if ((codepoint & 0x80808080) != 0)
-	  break;
-	s += 4;
+#if defined(__x86_64__)
+      const __m128i zeros = _mm_set1_epi32(0);
+      while (s < srcend - 8) {
+        const uint64_t hopefully_eight_ascii_chars = *((uint64_t *) s);
+        if ((hopefully_eight_ascii_chars & 0x8080808080808080LL) != 0LL)
+          break;
+        s += 8;
 
-	/*
-	 * Tried 32-bit stores here, but the extra bit-twiddling
-	 * slowed the code down.
-	 */
-
-	*d++ = (uint16_t) (codepoint & 0xff);
-	*d++ = (uint16_t) ((codepoint >> 8) & 0xff);
-	*d++ = (uint16_t) ((codepoint >> 16) & 0xff);
-	*d++ = (uint16_t) ((codepoint >> 24) & 0xff);
+        /* Load 8 bytes of ASCII data */
+        const __m128i eight_ascii_chars = _mm_cvtsi64_si128(hopefully_eight_ascii_chars);
+        /* Interleave with zeros */
+        const __m128i eight_utf16_chars = _mm_unpacklo_epi8(eight_ascii_chars, zeros);
+        /* Store the resulting 16 bytes into destination */
+        _mm_storeu_si128((__m128i *)d, eight_utf16_chars);
+        d += 8;
       }
+#else  
+      while (s < srcend - 4) {
+        codepoint = *((uint32_t *) s);
+        if ((codepoint & 0x80808080) != 0)
+          break;
+        s += 4;
+        /*
+         * Tried 32-bit stores here, but the extra bit-twiddling
+         * slowed the code down.
+         */
+        *d++ = (uint16_t) (codepoint & 0xff);
+        *d++ = (uint16_t) ((codepoint >> 8) & 0xff);
+        *d++ = (uint16_t) ((codepoint >> 16) & 0xff);
+        *d++ = (uint16_t) ((codepoint >> 24) & 0xff);
+      }
+#endif
       last = s;
-    }
+    } /* end if (state == UTF8_ACCEPT) */
 #endif
 
     if (decode(&state, &codepoint, *s++) != UTF8_ACCEPT) {
@@ -237,29 +276,36 @@ _hs_text_encode_utf8(uint8_t **destp, const uint16_t *src, size_t srcoff,
 
  ascii:
 #if defined(__x86_64__)
-  while (srcend - src >= 4) {
-    uint64_t w = *((uint64_t *) src);
+  while (srcend - src >= 8) {
+    union { uint64_t halves[2]; __m128i whole; } eight_chars;
+    eight_chars.whole = _mm_loadu_si128((__m128i *) src);
 
+    const uint64_t w = eight_chars.halves[0];
     if (w & 0xFF80FF80FF80FF80ULL) {
       if (!(w & 0x000000000000FF80ULL)) {
-	*dest++ = w & 0xFFFF;
-	src++;
-	if (!(w & 0x00000000FF800000ULL)) {
-	  *dest++ = (w >> 16) & 0xFFFF;
-	  src++;
-	  if (!(w & 0x0000FF8000000000ULL)) {
-	    *dest++ = (w >> 32) & 0xFFFF;
-	    src++;
-	  }
-	}
+        *dest++ = w & 0xFFFF;
+        src++;
+        if (!(w & 0x00000000FF800000ULL)) {
+          *dest++ = (w >> 16) & 0xFFFF;
+          src++;
+          if (!(w & 0x0000FF8000000000ULL)) {
+            *dest++ = (w >> 32) & 0xFFFF;
+            src++;
+          }
+        }
       }
       break;
     }
-    *dest++ = w & 0xFFFF;
-    *dest++ = (w >> 16) & 0xFFFF;
-    *dest++ = (w >> 32) & 0xFFFF;
-    *dest++ = w >> 48;
-    src += 4;
+
+    if (eight_chars.halves[1] & 0xFF80FF80FF80FF80ULL) {
+      break;
+    }
+
+    const __m128i eight_ascii_chars = _mm_packus_epi16(eight_chars.whole, eight_chars.whole);
+    _mm_storel_epi64((__m128i *)dest, eight_ascii_chars);
+
+    dest += 8;
+    src += 8;
   }
 #endif
 

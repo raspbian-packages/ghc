@@ -1,3 +1,81 @@
+## 0.7.0 (*Jan 2021*)
+
+- Shipped with GHC 9.0.1
+
+- Add known-key `cstringLength#` to `GHC.CString`. This is just the
+  C function `strlen`, but a built-in rewrite rule allows GHC to
+  compute the result at compile time when the argument is known.
+  
+- In order to support unicode better the following functions in `GHC.CString`
+  gained UTF8 counterparts:
+
+        unpackAppendCStringUtf8# :: Addr# -> [Char] -> [Char]
+        unpackFoldrCStringUtf8# :: Addr# -> (Char -> a -> a) -> a -> a
+
+- `unpackFoldrCString*` variants can now inline in phase `[0]`.
+
+  If the folding function is known this allows for unboxing of the
+  Char argument resulting in much faster code.
+
+- Renamed the singleton tuple `GHC.Tuple.Unit` to `GHC.Tuple.Solo`.
+
+- Add primops for atomic exchange:
+
+        atomicExchangeAddrAddr# :: Addr# -> Addr# -> State# s -> (# State# s, Addr# #)
+        atomicExchangeWordAddr# :: Addr# -> Word# -> State# s -> (# State# s, Word# #)
+
+- Add primops for atomic compare and swap at a given `Addr#`:
+
+        atomicCasAddrAddr# :: Addr# -> Addr# -> Addr# -> State# s -> (# State# s, Addr# #)
+        atomicCasWordAddr# :: Addr# -> Word# -> Word# -> State# s -> (# State# s, Word# #)
+
+- Add an explicit fixity for `(~)` and `(~~)`: 
+
+        infix 4 ~, ~~
+
+- Introduce `keepAlive#` to replace `touch#` in controlling object lifetime without
+  the soundness issues of the latter (see
+  [#17760](https://gitlab.haskell.org/ghc/ghc/-/issues/17760)).
+
+## 0.6.1 (*March 2020*)
+
+- Shipped with GHC 8.10.1
+
+- Add primop for shrinking `SmallMutableArray#`
+  to `GHC.Prim`:
+
+        shrinkSmallMutableArray# :: SmallMutableArray# s a -> Int# -> State# s -> State# s
+
+  Note that `resizeSmallMutableArray#` is not included as
+  as primitive. It has been implemented in library space in
+  `GHC.Exts`. See the release notes of `base`.
+
+- Added to `GHC.Prim`:
+
+        closureSize# :: a -> Int#
+
+- Added to `GHC.Prim`:
+
+        bitReverse# :: Word# -> Word#
+        bitReverse8# :: Word# -> Word#
+        bitReverse16# :: Word# -> Word#
+        bitReverse32# :: Word# -> Word#
+        bitReverse64# :: Word# -> Word#
+
+  `bitReverse#` is a primop that, for a `Word` of 8, 16, 32 or 64 bits,
+  reverses the order of its bits e.g. `0b110001` becomes `0b100011`.
+  These primitives use optimized machine instructions when available.
+
+- Add Int# multiplication primop:
+
+      timesInt2# :: Int# -> Int# -> (# Int#, Int#, Int# #)
+
+   `timesInt2#` computes the multiplication of its two parameters and returns a
+   triple (isHighNeeded,high,low) where high and low are respectively the high
+   and low bits of the double-word result. isHighNeeded is a cheap way to test
+   if the high word is a sign-extension of the low word (isHighNeeded = 0#) or
+   not (isHighNeeded = 1#).
+
 ## 0.6.0
 
 - Shipped with GHC 8.8.1
@@ -6,7 +84,7 @@
 
         traceBinaryEvent# :: Addr# -> Int# -> State# s -> State# s
 
-## 0.5.3 (edit as necessary)
+## 0.5.3
 
 - Shipped with GHC 8.6.1
 

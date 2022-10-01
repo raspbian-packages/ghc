@@ -8,7 +8,6 @@
            , StandaloneDeriving
            , RankNTypes
   #-}
-{-# OPTIONS_GHC -Wno-missing-signatures #-}
 {-# OPTIONS_HADDOCK not-home #-}
 
 -----------------------------------------------------------------------------
@@ -33,6 +32,7 @@
 -- #not-home
 module GHC.Conc.Sync
         ( ThreadId(..)
+        , showThreadId
 
         -- * Forking and suchlike
         , forkIO
@@ -102,7 +102,7 @@ import Data.Maybe
 
 import GHC.Base
 import {-# SOURCE #-} GHC.IO.Handle ( hFlush )
-import {-# SOURCE #-} GHC.IO.Handle.FD ( stdout )
+import {-# SOURCE #-} GHC.IO.StdHandles ( stdout )
 import GHC.Int
 import GHC.IO
 import GHC.IO.Encoding.UTF8
@@ -113,9 +113,11 @@ import GHC.IORef
 import GHC.MVar
 import GHC.Ptr
 import GHC.Real         ( fromIntegral )
-import GHC.Show         ( Show(..), showString )
+import GHC.Show         ( Show(..), showParen, showString )
 import GHC.Stable       ( StablePtr(..) )
 import GHC.Weak
+
+import Unsafe.Coerce    ( unsafeCoerce# )
 
 infixr 0 `par`, `pseq`
 
@@ -145,35 +147,33 @@ This misfeature will hopefully be corrected at a later date.
 
 -- | @since 4.2.0.0
 instance Show ThreadId where
-   showsPrec d t =
+   showsPrec d t = showParen (d >= 11) $
         showString "ThreadId " .
         showsPrec d (getThreadId (id2TSO t))
+
+showThreadId :: ThreadId -> String
+showThreadId = show
 
 foreign import ccall unsafe "rts_getThreadId" getThreadId :: ThreadId# -> CInt
 
 id2TSO :: ThreadId -> ThreadId#
 id2TSO (ThreadId t) = t
 
+foreign import ccall unsafe "eq_thread" eq_thread :: ThreadId# -> ThreadId# -> CBool
+
 foreign import ccall unsafe "cmp_thread" cmp_thread :: ThreadId# -> ThreadId# -> CInt
 -- Returns -1, 0, 1
 
-cmpThread :: ThreadId -> ThreadId -> Ordering
-cmpThread t1 t2 =
-   case cmp_thread (id2TSO t1) (id2TSO t2) of
-      -1 -> LT
-      0  -> EQ
-      _  -> GT -- must be 1
-
 -- | @since 4.2.0.0
 instance Eq ThreadId where
-   t1 == t2 =
-      case t1 `cmpThread` t2 of
-         EQ -> True
-         _  -> False
+  ThreadId t1 == ThreadId t2 = eq_thread t1 t2 /= 0
 
 -- | @since 4.2.0.0
 instance Ord ThreadId where
-   compare = cmpThread
+  compare (ThreadId t1) (ThreadId t2) = case cmp_thread t1 t2 of
+    -1 -> LT
+    0  -> EQ
+    _  -> GT
 
 -- | Every thread has an allocation counter that tracks how much
 -- memory has been allocated by the thread.  The counter is
@@ -541,6 +541,8 @@ data BlockReason
         -- ^blocked in 'retry' in an STM transaction
   | BlockedOnForeignCall
         -- ^currently in a foreign call
+  | BlockedOnIOCompletion
+        -- ^currently blocked on an I/O Completion port
   | BlockedOnOther
         -- ^blocked on some other resource.  Without @-threaded@,
         -- I\/O and 'Control.Concurrent.threadDelay' show up as
@@ -579,6 +581,7 @@ threadStatus (ThreadId t) = IO $ \s ->
      mk_stat 11 = ThreadBlocked BlockedOnForeignCall
      mk_stat 12 = ThreadBlocked BlockedOnException
      mk_stat 14 = ThreadBlocked BlockedOnMVar -- possibly: BlockedOnMVarRead
+     mk_stat 15 = ThreadBlocked BlockedOnIOCompletion
      -- NB. these are hardcoded in rts/PrimOps.cmm
      mk_stat 16 = ThreadFinished
      mk_stat 17 = ThreadDied
@@ -626,6 +629,9 @@ data PrimMVar
 newStablePtrPrimMVar :: MVar () -> IO (StablePtr PrimMVar)
 newStablePtrPrimMVar (MVar m) = IO $ \s0 ->
   case makeStablePtr# (unsafeCoerce# m :: PrimMVar) s0 of
+    -- Coerce unlifted  m :: MVar# RealWorld ()
+    --     to lifted    PrimMVar
+    -- apparently because mkStablePtr is not levity-polymorphic
     (# s1, sp #) -> (# s1, StablePtr sp #)
 
 -----------------------------------------------------------------------------

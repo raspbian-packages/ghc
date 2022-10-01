@@ -1,3 +1,4 @@
+{-# LANGUAGE ScopedTypeVariables #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Client.List
@@ -13,6 +14,9 @@ module Distribution.Client.List (
   list, info
   ) where
 
+import Prelude ()
+import Distribution.Client.Compat.Prelude
+
 import Distribution.Package
          ( PackageName, Package(..), packageName
          , packageVersion, UnitId )
@@ -22,26 +26,23 @@ import Distribution.ModuleName (ModuleName)
 import Distribution.License (License)
 import qualified Distribution.InstalledPackageInfo as Installed
 import qualified Distribution.PackageDescription   as Source
+import qualified Distribution.Types.ModuleReexport as Source
 import Distribution.PackageDescription
-         ( Flag(..), unFlagName )
+         ( PackageFlag(..), unFlagName )
 import Distribution.PackageDescription.Configuration
          ( flattenPackageDescription )
-import Distribution.Pretty (pretty)
 
 import Distribution.Simple.Compiler
         ( Compiler, PackageDBStack )
 import Distribution.Simple.Program (ProgramDb)
 import Distribution.Simple.Utils
-        ( equating, comparing, die', notice )
-import Distribution.Simple.Setup (fromFlag)
+        ( equating, die', notice )
+import Distribution.Simple.Setup (fromFlag, fromFlagOrDefault)
 import Distribution.Simple.PackageIndex (InstalledPackageIndex)
 import qualified Distribution.Simple.PackageIndex as InstalledPackageIndex
 import Distribution.Version
          ( Version, mkVersion, versionNumbers, VersionRange, withinRange, anyVersion
          , intersectVersionRanges, simplifyVersionRange )
-import Distribution.Verbosity (Verbosity)
-import Distribution.Deprecated.Text
-         ( Text(disp), display )
 
 import qualified Distribution.SPDX as SPDX
 
@@ -63,60 +64,70 @@ import Distribution.Client.IndexUtils as IndexUtils
 import Distribution.Client.FetchUtils
          ( isFetched )
 
+import Data.Bits ((.|.))
 import Data.List
-         ( sortBy, groupBy, sort, nub, intersperse, maximumBy, partition )
+         ( maximumBy )
+import Data.List.NonEmpty (groupBy, nonEmpty)
+import qualified Data.List as L
 import Data.Maybe
-         ( listToMaybe, fromJust, fromMaybe, isJust, maybeToList )
+         ( fromJust )
 import qualified Data.Map as Map
 import Data.Tree as Tree
-import Control.Monad
-         ( MonadPlus(mplus), join )
 import Control.Exception
          ( assert )
-import Text.PrettyPrint as Disp
+import qualified Text.PrettyPrint as Disp
+import Text.PrettyPrint
+         ( lineLength, ribbonsPerLine, Doc, renderStyle, char
+         , nest, ($+$), text, vcat, style, parens, fsep)
 import System.Directory
          ( doesDirectoryExist )
+
+import Distribution.Utils.ShortText (ShortText)
+import qualified Distribution.Utils.ShortText as ShortText
+import qualified Text.Regex.Base as Regex
+import qualified Text.Regex.Posix.String as Regex
 
 
 -- | Return a list of packages matching given search strings.
 getPkgList :: Verbosity
            -> PackageDBStack
            -> RepoContext
-           -> Compiler
-           -> ProgramDb
+           -> Maybe (Compiler, ProgramDb)
            -> ListFlags
            -> [String]
            -> IO [PackageDisplayInfo]
-getPkgList verbosity packageDBs repoCtxt comp progdb listFlags pats = do
-    installedPkgIndex <- getInstalledPackages verbosity comp packageDBs progdb
+getPkgList verbosity packageDBs repoCtxt mcompprogdb listFlags pats = do
+    installedPkgIndex <- for mcompprogdb $ \(comp, progdb) ->
+        getInstalledPackages verbosity comp packageDBs progdb
     sourcePkgDb       <- getSourcePackages verbosity repoCtxt
+
+    regexps <- for pats $ \pat -> do
+        e <- Regex.compile compOption Regex.execBlank pat
+        case e of
+            Right r  -> return r
+            Left err -> die' verbosity $ "Failed to compile regex " ++ pat ++ ": " ++ snd err
+
     let sourcePkgIndex = packageIndex sourcePkgDb
         prefs name = fromMaybe anyVersion
                        (Map.lookup name (packagePreferences sourcePkgDb))
+
+        pkgsInfoMatching ::
+          [(PackageName, [Installed.InstalledPackageInfo], [UnresolvedSourcePackage])]
+        pkgsInfoMatching =
+          let matchingInstalled = maybe [] (matchingPackages InstalledPackageIndex.searchWithPredicate regexps) installedPkgIndex
+              matchingSource    = matchingPackages (\ idx n -> concatMap snd (PackageIndex.searchWithPredicate idx n)) regexps sourcePkgIndex
+          in mergePackages matchingInstalled matchingSource
 
         pkgsInfo ::
           [(PackageName, [Installed.InstalledPackageInfo], [UnresolvedSourcePackage])]
         pkgsInfo
             -- gather info for all packages
-          | null pats = mergePackages
-                        (InstalledPackageIndex.allPackages installedPkgIndex)
-                        (         PackageIndex.allPackages sourcePkgIndex)
+          | null regexps = mergePackages
+                           (maybe [] InstalledPackageIndex.allPackages installedPkgIndex)
+                           (         PackageIndex.allPackages          sourcePkgIndex)
 
             -- gather info for packages matching search term
           | otherwise = pkgsInfoMatching
-
-        pkgsInfoMatching ::
-          [(PackageName, [Installed.InstalledPackageInfo], [UnresolvedSourcePackage])]
-        pkgsInfoMatching =
-          let matchingInstalled = matchingPackages
-                                  InstalledPackageIndex.searchByNameSubstring
-                                  installedPkgIndex
-              matchingSource   = matchingPackages
-                                 (\ idx n ->
-                                   concatMap snd
-                                   (PackageIndex.searchByNameSubstring idx n))
-                                 sourcePkgIndex
-          in mergePackages matchingInstalled matchingSource
 
         matches :: [PackageDisplayInfo]
         matches = [ mergePackageInfo pref
@@ -127,28 +138,32 @@ getPkgList verbosity packageDBs repoCtxt comp progdb listFlags pats = do
                         selectedPkg = latestWithPref pref sourcePkgs ]
     return matches
   where
-    onlyInstalled = fromFlag (listInstalled listFlags)
-    matchingPackages search index =
+    onlyInstalled   = fromFlagOrDefault False (listInstalled listFlags)
+    caseInsensitive = fromFlagOrDefault True (listCaseInsensitive listFlags)
+
+    compOption | caseInsensitive = Regex.compExtended .|. Regex.compIgnoreCase
+               | otherwise       = Regex.compExtended
+
+    matchingPackages search regexps index =
       [ pkg
-      | pat <- pats
-      , pkg <- search index pat ]
+      | re <- regexps
+      , pkg <- search index (Regex.matchTest re) ]
 
 
 -- | Show information about packages.
 list :: Verbosity
      -> PackageDBStack
      -> RepoContext
-     -> Compiler
-     -> ProgramDb
+     -> Maybe (Compiler, ProgramDb)
      -> ListFlags
      -> [String]
      -> IO ()
-list verbosity packageDBs repos comp progdb listFlags pats = do
-    matches <- getPkgList verbosity packageDBs repos comp progdb listFlags pats
+list verbosity packageDBs repos mcompProgdb listFlags pats = do
+    matches <- getPkgList verbosity packageDBs repos mcompProgdb listFlags pats
 
     if simpleOutput
       then putStr $ unlines
-             [ display (pkgName pkg) ++ " " ++ display version
+             [ prettyShow (pkgName pkg) ++ " " ++ prettyShow version
              | pkg <- matches
              , version <- if onlyInstalled
                             then              installedVersions pkg
@@ -198,7 +213,7 @@ info verbosity packageDBs repoCtxt comp progdb
                        (fromFlag $ globalWorldFile globalFlags)
                        sourcePkgs' userTargets
 
-    pkgsinfo      <- sequence
+    pkgsinfo      <- sequenceA
                        [ do pkginfo <- either (die' verbosity) return $
                                          gatherPkgInfo prefs
                                            installedPkgIndex sourcePkgIndex
@@ -217,9 +232,9 @@ info verbosity packageDBs repoCtxt comp progdb
     gatherPkgInfo prefs installedPkgIndex sourcePkgIndex
       (NamedPackage name props)
       | null (selectedInstalledPkgs) && null (selectedSourcePkgs)
-      = Left $ "There is no available version of " ++ display name
+      = Left $ "There is no available version of " ++ prettyShow name
             ++ " that satisfies "
-            ++ display (simplifyVersionRange verConstraint)
+            ++ prettyShow (simplifyVersionRange verConstraint)
 
       | otherwise
       = Right $ mergePackageInfo pref installedPkgs
@@ -277,17 +292,17 @@ data PackageDisplayInfo = PackageDisplayInfo {
     installedVersions :: [Version],
     sourceVersions    :: [Version],
     preferredVersions :: VersionRange,
-    homepage          :: String,
-    bugReports        :: String,
-    sourceRepo        :: String,
-    synopsis          :: String,
-    description       :: String,
-    category          :: String,
+    homepage          :: ShortText,
+    bugReports        :: ShortText,
+    sourceRepo        :: String, -- TODO
+    synopsis          :: ShortText,
+    description       :: ShortText,
+    category          :: ShortText,
     license           :: Either SPDX.License License,
-    author            :: String,
-    maintainer        :: String,
+    author            :: ShortText,
+    maintainer        :: ShortText,
     dependencies      :: [ExtDependency],
-    flags             :: [Flag],
+    flags             :: [PackageFlag],
     hasLib            :: Bool,
     hasExe            :: Bool,
     executables       :: [UnqualComponentName],
@@ -304,38 +319,39 @@ data ExtDependency = SourceDependency Dependency
 showPackageSummaryInfo :: PackageDisplayInfo -> String
 showPackageSummaryInfo pkginfo =
   renderStyle (style {lineLength = 80, ribbonsPerLine = 1}) $
-     char '*' <+> disp (pkgName pkginfo)
+     char '*' <+> pretty (pkgName pkginfo)
      $+$
      (nest 4 $ vcat [
-       maybeShow (synopsis pkginfo) "Synopsis:" reflowParagraphs
+       maybeShowST (synopsis pkginfo) "Synopsis:" reflowParagraphs
      , text "Default available version:" <+>
        case selectedSourcePkg pkginfo of
          Nothing  -> text "[ Not available from any configured repository ]"
-         Just pkg -> disp (packageVersion pkg)
+         Just pkg -> pretty (packageVersion pkg)
      , text "Installed versions:" <+>
        case installedVersions pkginfo of
          []  | hasLib pkginfo -> text "[ Not installed ]"
              | otherwise      -> text "[ Unknown ]"
          versions             -> dispTopVersions 4
                                    (preferredVersions pkginfo) versions
-     , maybeShow (homepage pkginfo) "Homepage:" text
+     , maybeShowST (homepage pkginfo) "Homepage:" text
      , text "License: " <+> either pretty pretty (license pkginfo)
      ])
      $+$ text ""
   where
-    maybeShow [] _ _ = empty
-    maybeShow l  s f = text s <+> (f l)
+    maybeShowST l s f
+        | ShortText.null l = Disp.empty
+        | otherwise        = text s <+> f (ShortText.fromShortText l)
 
 showPackageDetailedInfo :: PackageDisplayInfo -> String
 showPackageDetailedInfo pkginfo =
   renderStyle (style {lineLength = 80, ribbonsPerLine = 1}) $
-   char '*' <+> disp (pkgName pkginfo)
-            Disp.<> maybe empty (\v -> char '-' Disp.<> disp v) (selectedVersion pkginfo)
-            <+> text (replicate (16 - length (display (pkgName pkginfo))) ' ')
-            Disp.<> parens pkgkind
+   char '*' <+> pretty (pkgName pkginfo)
+            <<>> maybe Disp.empty (\v -> char '-' Disp.<> pretty v) (selectedVersion pkginfo)
+            <+> text (replicate (16 - length (prettyShow (pkgName pkginfo))) ' ')
+            <<>> parens pkgkind
    $+$
    (nest 4 $ vcat [
-     entry "Synopsis"      synopsis     hideIfNull     reflowParagraphs
+     entryST "Synopsis"      synopsis     hideIfNull  reflowParagraphs
    , entry "Versions available" sourceVersions
            (altText null "[ Not available from server ]")
            (dispTopVersions 9 (preferredVersions pkginfo))
@@ -343,31 +359,33 @@ showPackageDetailedInfo pkginfo =
            (altText null (if hasLib pkginfo then "[ Not installed ]"
                                             else "[ Unknown ]"))
            (dispTopVersions 4 (preferredVersions pkginfo))
-   , entry "Homepage"      homepage     orNotSpecified text
-   , entry "Bug reports"   bugReports   orNotSpecified text
-   , entry "Description"   description  hideIfNull     reflowParagraphs
-   , entry "Category"      category     hideIfNull     text
+   , entryST "Homepage"      homepage     orNotSpecified text
+   , entryST "Bug reports"   bugReports   orNotSpecified text
+   , entryST "Description"   description  hideIfNull     reflowParagraphs
+   , entryST "Category"      category     hideIfNull     text
    , entry "License"       license      alwaysShow     (either pretty pretty)
-   , entry "Author"        author       hideIfNull     reflowLines
-   , entry "Maintainer"    maintainer   hideIfNull     reflowLines
+   , entryST "Author"        author       hideIfNull     reflowLines
+   , entryST "Maintainer"    maintainer   hideIfNull     reflowLines
    , entry "Source repo"   sourceRepo   orNotSpecified text
-   , entry "Executables"   executables  hideIfNull     (commaSep disp)
+   , entry "Executables"   executables  hideIfNull     (commaSep pretty)
    , entry "Flags"         flags        hideIfNull     (commaSep dispFlag)
    , entry "Dependencies"  dependencies hideIfNull     (commaSep dispExtDep)
    , entry "Documentation" haddockHtml  showIfInstalled text
    , entry "Cached"        haveTarball  alwaysShow     dispYesNo
-   , if not (hasLib pkginfo) then empty else
-     text "Modules:" $+$ nest 4 (vcat (map disp . sort . modules $ pkginfo))
+   , if not (hasLib pkginfo) then mempty else
+     text "Modules:" $+$ nest 4 (vcat (map pretty . sort . modules $ pkginfo))
    ])
    $+$ text ""
   where
     entry fname field cond format = case cond (field pkginfo) of
       Nothing           -> label <+> format (field pkginfo)
-      Just Nothing      -> empty
+      Just Nothing      -> mempty
       Just (Just other) -> label <+> text other
       where
         label   = text fname Disp.<> char ':' Disp.<> padding
         padding = text (replicate (13 - length fname ) ' ')
+
+    entryST fname field = entry fname (ShortText.fromShortText . field)
 
     normal      = Nothing
     hide        = Just Nothing
@@ -387,8 +405,8 @@ showPackageDetailedInfo pkginfo =
     dispYesNo True  = text "Yes"
     dispYesNo False = text "No"
 
-    dispExtDep (SourceDependency    dep) = disp dep
-    dispExtDep (InstalledDependency dep) = disp dep
+    dispExtDep (SourceDependency    dep) = pretty dep
+    dispExtDep (InstalledDependency dep) = pretty dep
 
     isInstalled = not (null (installedVersions pkginfo))
     hasExes = length (executables pkginfo) >= 2
@@ -398,7 +416,7 @@ showPackageDetailedInfo pkginfo =
             | hasLib pkginfo                   = text "library"
             | hasExes                          = text "programs"
             | hasExe pkginfo                   = text "program"
-            | otherwise                        = empty
+            | otherwise                        = mempty
 
 
 reflowParagraphs :: String -> Doc
@@ -407,7 +425,7 @@ reflowParagraphs =
   . intersperse (text "")                    -- re-insert blank lines
   . map (fsep . map text . concatMap words)  -- reflow paragraphs
   . filter (/= [""])
-  . groupBy (\x y -> "" `notElem` [x,y])     -- break on blank lines
+  . L.groupBy (\x y -> "" `notElem` [x,y])     -- break on blank lines
   . lines
 
 reflowLines :: String -> Doc
@@ -446,14 +464,14 @@ mergePackageInfo versionPref installedPkgs sourcePkgs selectedPkg showVer =
                            Installed.author     installed,
     homepage     = combine Source.homepage      source
                            Installed.homepage   installed,
-    bugReports   = maybe "" Source.bugReports source,
-    sourceRepo   = fromMaybe "" . join
+    bugReports   = maybe mempty Source.bugReports source,
+    sourceRepo   = fromMaybe mempty . join
                  . fmap (uncons Nothing Source.repoLocation
                        . sortBy (comparing Source.repoKind)
                        . Source.sourceRepos)
                  $ source,
                     --TODO: installed package info is missing synopsis
-    synopsis     = maybe "" Source.synopsis      source,
+    synopsis     = maybe mempty Source.synopsis      source,
     description  = combine Source.description    source
                            Installed.description installed,
     category     = combine Source.category       source
@@ -489,7 +507,7 @@ mergePackageInfo versionPref installedPkgs sourcePkgs selectedPkg showVer =
     sourceSelected
       | isJust selectedPkg = selectedPkg
       | otherwise          = latestWithPref versionPref sourcePkgs
-    sourceGeneric = fmap packageDescription sourceSelected
+    sourceGeneric = fmap srcpkgDescription sourceSelected
     source        = fmap flattenPackageDescription sourceGeneric
 
     uncons :: b -> (a -> b) -> [a] -> b
@@ -503,7 +521,7 @@ mergePackageInfo versionPref installedPkgs sourcePkgs selectedPkg showVer =
 --
 updateFileSystemPackageDetails :: PackageDisplayInfo -> IO PackageDisplayInfo
 updateFileSystemPackageDetails pkginfo = do
-  fetched   <- maybe (return False) (isFetched . packageSource)
+  fetched   <- maybe (return False) (isFetched . srcpkgSource)
                      (selectedSourcePkg pkginfo)
   docsExist <- doesDirectoryExist (haddockHtml pkginfo)
   return pkginfo {
@@ -539,14 +557,14 @@ mergePackages installedPkgs sourcePkgs =
     collect (OnlyInRight          (name,as)) = (name, [], as)
 
 groupOn :: Ord key => (a -> key) -> [a] -> [(key,[a])]
-groupOn key = map (\xs -> (key (head xs), xs))
+groupOn key = map (\xs -> (key (head xs), toList xs))
             . groupBy (equating key)
             . sortBy (comparing key)
 
 dispTopVersions :: Int -> VersionRange -> [Version] -> Doc
 dispTopVersions n pref vs =
          (Disp.fsep . Disp.punctuate (Disp.char ',')
-        . map (\ver -> if ispref ver then disp ver else parens (disp ver))
+        . map (\ver -> if ispref ver then pretty ver else parens (pretty ver))
         . sort . take n . interestingVersions ispref
         $ vs)
     <+> trailingMessage
@@ -577,9 +595,12 @@ interestingVersions pref =
     . reorderTree (\(Node (v,_) _) -> pref (mkVersion v))
     . reverseTree
     . mkTree
-    . map versionNumbers
+    . map (or0 . versionNumbers)
 
   where
+    or0 []     = 0 :| []
+    or0 (x:xs) = x :| xs
+
     swizzleTree = unfoldTree (spine [])
       where
         spine ts' (Node x [])     = (x, ts')
@@ -592,12 +613,17 @@ interestingVersions pref =
 
     reverseTree (Node x cs) = Node x (reverse (map reverseTree cs))
 
+    mkTree :: forall a. Eq a => [NonEmpty a] -> Tree ([a], Bool)
     mkTree xs = unfoldTree step (False, [], xs)
       where
+        step :: (Bool, [a], [NonEmpty a]) -> (([a], Bool), [(Bool, [a], [NonEmpty a])])
         step (node,ns,vs) =
           ( (reverse ns, node)
-          , [ (any null vs', n:ns, filter (not . null) vs')
-            | (n, vs') <- groups vs ]
+          , [ (any null vs', n:ns, mapMaybe nonEmpty (toList vs'))
+            | (n, vs') <- groups vs
+            ]
           )
-        groups = map (\g -> (head (head g), map tail g))
+
+        groups :: [NonEmpty a] -> [(a, NonEmpty [a])]
+        groups = map (\g -> (head (head g), fmap tail g))
                . groupBy (equating head)

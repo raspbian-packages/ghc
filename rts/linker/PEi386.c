@@ -105,7 +105,7 @@
       contain the name of the actual dll to load. This will be the only content
       of the section. In the symbol table, the last symbol will be the name
       used to refer to the dll in the relocation tables. This name will always
-      be in the format "symbol_name_iname", however when refered to, the format
+      be in the format "symbol_name_iname", however when referred to, the format
       "_head_symbol_name" is used.
 
       We record this symbol early on during GetNames and load the dll and use
@@ -185,8 +185,10 @@
 #include "RtsUtils.h"
 #include "RtsSymbolInfo.h"
 #include "GetEnv.h"
+#include "CheckUnload.h"
 #include "linker/PEi386.h"
 #include "linker/PEi386Types.h"
+#include "linker/SymbolExtras.h"
 #include "LinkerInternals.h"
 
 #include <windows.h>
@@ -275,6 +277,12 @@ const int default_alignment = 8;
 const int initHeapSizeMB    = 15;
 static HANDLE code_heap     = NULL;
 
+/* See Note [_iob_func symbol]
+   In order to emulate __iob_func the memory location needs to point the
+   location of the I/O structures in memory.  As such we need RODATA to contain
+   the pointer as a redirect.  Essentially it's a DATA DLL reference.  */
+const void* __rts_iob_func = (void*)&__acrt_iob_func;
+
 /* Low Fragmentation Heap, try to prevent heap from increasing in size when
    space can simply be reclaimed.  These are enums missing from mingw-w64's
    headers.  */
@@ -319,6 +327,11 @@ void initLinker_PEi386()
   HeapSetInformation(code_heap, HeapEnableTerminationOnCorruption,
                      &HeapInformation, sizeof(HeapInformation));
   HeapSetInformation(code_heap, HeapOptimizeResources, NULL, 0);
+
+  /* Register the cleanup routine as an exit handler,  this gives other exit handlers
+     a chance to run which may need linker information.  Exit handlers are ran in
+     reverse registration order so this needs to be before the linker loads anything.  */
+  atexit (exitLinker_PEi386);
 }
 
 void exitLinker_PEi386()
@@ -758,7 +771,7 @@ pathchar* findSystemLibrary_PEi386( pathchar* dll_name )
 HsPtr addLibrarySearchPath_PEi386(pathchar* dll_path)
 {
     HINSTANCE hDLL = LoadLibraryW(L"Kernel32.DLL");
-    LPAddDLLDirectory AddDllDirectory = (LPAddDLLDirectory)GetProcAddress((HMODULE)hDLL, "AddDllDirectory");
+    LPAddDLLDirectory AddDllDirectory = (LPAddDLLDirectory)(void*)GetProcAddress((HMODULE)hDLL, "AddDllDirectory");
 
     HsPtr result = NULL;
 
@@ -828,7 +841,7 @@ bool removeLibrarySearchPath_PEi386(HsPtr dll_path_index)
 
     if (dll_path_index != NULL) {
         HINSTANCE hDLL = LoadLibraryW(L"Kernel32.DLL");
-        LPRemoveDLLDirectory RemoveDllDirectory = (LPRemoveDLLDirectory)GetProcAddress((HMODULE)hDLL, "RemoveDllDirectory");
+        LPRemoveDLLDirectory RemoveDllDirectory = (LPRemoveDLLDirectory)(void*)GetProcAddress((HMODULE)hDLL, "RemoveDllDirectory");
 
         if (RemoveDllDirectory) {
             result = RemoveDllDirectory(dll_path_index);
@@ -1528,7 +1541,7 @@ ocGetNames_PEi386 ( ObjectCode* oc )
           }
           setImportSymbol (oc, sname);
 
-          /* Don't process this oc any futher. Just exit.  */
+          /* Don't process this oc any further. Just exit.  */
           oc->n_symbols = 0;
           oc->symbols   = NULL;
           stgFree (oc->image);
@@ -1586,7 +1599,7 @@ ocGetNames_PEi386 ( ObjectCode* oc )
           barf ("Could not allocate any heap memory from private heap.");
       }
 
-      ASSERT(section.size == 0 || section.info->virtualSize == 0);
+      CHECK(section.size == 0 || section.info->virtualSize == 0);
       sz = section.size;
       if (sz < section.info->virtualSize) sz = section.info->virtualSize;
 
@@ -1778,7 +1791,7 @@ ocGetNames_PEi386 ( ObjectCode* oc )
  * so simply set correct pointer here.
  */
 bool
-ocAllocateSymbolExtras_PEi386 ( ObjectCode* oc )
+ocAllocateExtras_PEi386 ( ObjectCode* oc )
 {
    /* If the ObjectCode was unloaded we don't need a trampoline, it's likely
       an import library so we're discarding it earlier.  */
@@ -1803,8 +1816,8 @@ makeSymbolExtra_PEi386( ObjectCode* oc, uint64_t index, size_t s, char* symbol )
     SymbolExtra *extra;
     curr_thunk = oc->first_symbol_extra + index;
     if (index >= oc->n_symbol_extras) {
-      IF_DEBUG(linker, debugBelch("makeSymbolExtra first:%d, num:%lu, member:%s, index:%llu\n", curr_thunk, oc->n_symbol_extras, oc->archiveMemberName, index));
-      barf("Can't allocate thunk for `%s' in `%" PATH_FMT "' with member `%s'", symbol, oc->fileName, oc->archiveMemberName);
+      IF_DEBUG(linker, debugBelch("makeSymbolExtra first:%d, num:%lu, member:%" PATH_FMT ", index:%llu\n", curr_thunk, oc->n_symbol_extras, oc->archiveMemberName, index));
+      barf("Can't allocate thunk for `%s' in `%" PATH_FMT "' with member `%" PATH_FMT "'", symbol, oc->fileName, oc->archiveMemberName);
     }
 
     extra = oc->symbol_extras + curr_thunk;
@@ -1819,6 +1832,8 @@ makeSymbolExtra_PEi386( ObjectCode* oc, uint64_t index, size_t s, char* symbol )
 
     return (size_t)extra->jumpIsland;
 }
+
+void ocProtectExtras(ObjectCode* oc STG_UNUSED) { }
 
 #endif /* x86_64_HOST_ARCH */
 
@@ -1885,7 +1900,7 @@ ocResolve_PEi386 ( ObjectCode* oc )
          } else {
             copyName ( getSymShortName (info, sym), oc, symbol,
                        sizeof(symbol)-1 );
-            S = (size_t) lookupSymbol_( (char*)symbol );
+            S = (size_t) lookupDependentSymbol( (char*)symbol, oc );
             if ((void*)S == NULL) {
                 errorBelch(" | %" PATH_FMT ": unknown symbol `%s'", oc->fileName, symbol);
                 releaseOcInfo (oc);
@@ -1943,13 +1958,15 @@ ocResolve_PEi386 ( ObjectCode* oc )
                {
                    uint64_t v;
                    v = S + A;
-                   if (v >> 32) {
+                   // N.B. in the case of the sign-extended relocations we must ensure that v
+                   // fits in a signed 32-bit value. See #15808.
+                   if (((int64_t) v > (int64_t) INT32_MAX) || ((int64_t) v < (int64_t) INT32_MIN)) {
                        copyName (getSymShortName (info, sym), oc,
                                  symbol, sizeof(symbol)-1);
                        S = makeSymbolExtra_PEi386(oc, symIndex, S, (char *)symbol);
                        /* And retry */
                        v = S + A;
-                       if (v >> 32) {
+                       if (((int64_t) v > (int64_t) INT32_MAX) || ((int64_t) v < (int64_t) INT32_MIN)) {
                            barf("IMAGE_REL_AMD64_ADDR32[NB]: High bits are set in %zx for %s",
                                 v, (char *)symbol);
                        }
@@ -1961,14 +1978,14 @@ ocResolve_PEi386 ( ObjectCode* oc )
                {
                    intptr_t v;
                    v = S + (int32_t)A - ((intptr_t)pP) - 4;
-                   if ((v > (intptr_t) INT32_MAX) || (v < (intptr_t) INT32_MIN)) {
+                   if ((v > (int64_t) INT32_MAX) || (v < (int64_t) INT32_MIN)) {
                        /* Make the trampoline then */
                        copyName (getSymShortName (info, sym),
                                  oc, symbol, sizeof(symbol)-1);
                        S = makeSymbolExtra_PEi386(oc, symIndex, S, (char *)symbol);
                        /* And retry */
                        v = S + (int32_t)A - ((intptr_t)pP) - 4;
-                       if ((v > (intptr_t) INT32_MAX) || (v < (intptr_t) INT32_MIN)) {
+                       if ((v > (int64_t) INT32_MAX) || (v < (int64_t) INT32_MIN)) {
                            barf("IMAGE_REL_AMD64_REL32: High bits are set in %zx for %s",
                                 v, (char *)symbol);
                        }
@@ -2020,7 +2037,7 @@ ocRunInit_PEi386 ( ObjectCode *oc )
   getProgEnvv(&envc, &envv);
 
   Section section = *oc->info->init;
-  ASSERT(SECTIONKIND_INIT_ARRAY == section.kind);
+  CHECK(SECTIONKIND_INIT_ARRAY == section.kind);
 
   uint8_t *init_startC = section.start;
   init_t *init_start   = (init_t*)init_startC;
@@ -2051,7 +2068,6 @@ SymbolAddr *lookupSymbol_PEi386(SymbolName *lbl)
         sym = lookupSymbolInDLLs(lbl);
         return sym; // might be NULL if not found
     } else {
-#if defined(mingw32_HOST_OS)
         // If Windows, perform initialization of uninitialized
         // Symbols from the C runtime which was loaded above.
         // We do this on lookup to prevent the hit when
@@ -2067,7 +2083,7 @@ SymbolAddr *lookupSymbol_PEi386(SymbolName *lbl)
         else if (pinfo && pinfo->owner && isSymbolImport (pinfo->owner, lbl))
         {
             /* See Note [BFD import library].  */
-            HINSTANCE dllInstance = (HINSTANCE)lookupSymbol(pinfo->value);
+            HINSTANCE dllInstance = (HINSTANCE)lookupDependentSymbol(pinfo->value, NULL);
             if (!dllInstance && pinfo->value)
                return pinfo->value;
 
@@ -2084,7 +2100,6 @@ SymbolAddr *lookupSymbol_PEi386(SymbolName *lbl)
             clearImportSymbol (pinfo->owner, lbl);
             return pinfo->value;
         }
-#endif
         return loadSymbol(lbl, pinfo);
     }
 }
@@ -2168,9 +2183,7 @@ resolveSymbolAddr_PEi386 (pathchar* buffer, int size,
                   wcscat (buffer, WSTR(" "));
                   if (oc->archiveMemberName)
                   {
-                      pathchar* name = mkPath (oc->archiveMemberName);
-                      wcscat (buffer, name);
-                      stgFree (name);
+                      wcscat (buffer, oc->archiveMemberName);
                   }
                   else
                   {

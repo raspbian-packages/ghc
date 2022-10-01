@@ -6,59 +6,59 @@ GenericPackageDescription
                    CondNode
                      {condTreeComponents = [],
                       condTreeConstraints = [Dependency
-                                               `PackageName "network"`
-                                               (MajorBoundVersion `mkVersion [0]`)
-                                               (Set.fromList [LMainLibName]),
+                                               (PackageName "network")
+                                               (MajorBoundVersion (mkVersion [0]))
+                                               mainLibSet,
                                              Dependency
-                                               `PackageName "base"`
-                                               (ThisVersion `mkVersion [1]`)
-                                               (Set.fromList [LMainLibName]),
+                                               (PackageName "base")
+                                               (ThisVersion (mkVersion [1]))
+                                               mainLibSet,
                                              Dependency
-                                               `PackageName "base"`
-                                               (ThisVersion `mkVersion [1]`)
-                                               (Set.fromList [LMainLibName]),
+                                               (PackageName "base")
+                                               (ThisVersion (mkVersion [1]))
+                                               mainLibSet,
                                              Dependency
-                                               `PackageName "base"`
+                                               (PackageName "base")
                                                (UnionVersionRanges
-                                                  (ThisVersion `mkVersion [1]`)
-                                                  (ThisVersion `mkVersion [2]`))
-                                               (Set.fromList [LMainLibName]),
+                                                  (ThisVersion (mkVersion [1]))
+                                                  (ThisVersion (mkVersion [2])))
+                                               mainLibSet,
                                              Dependency
-                                               `PackageName "base"`
-                                               (ThisVersion `mkVersion [1,2]`)
-                                               (Set.fromList [LMainLibName]),
+                                               (PackageName "base")
+                                               (ThisVersion (mkVersion [1, 2]))
+                                               mainLibSet,
                                              Dependency
-                                               `PackageName "base"`
+                                               (PackageName "base")
                                                (UnionVersionRanges
-                                                  (ThisVersion `mkVersion [1,2]`)
-                                                  (ThisVersion `mkVersion [3,4]`))
-                                               (Set.fromList [LMainLibName]),
+                                                  (ThisVersion (mkVersion [1, 2]))
+                                                  (ThisVersion (mkVersion [3, 4])))
+                                               mainLibSet,
                                              Dependency
-                                               `PackageName "ghc"`
+                                               (PackageName "ghc")
                                                (UnionVersionRanges
-                                                  (ThisVersion `mkVersion [8,6,3]`)
+                                                  (ThisVersion (mkVersion [8, 6, 3]))
                                                   (UnionVersionRanges
-                                                     (ThisVersion `mkVersion [8,4,4]`)
+                                                     (ThisVersion (mkVersion [8, 4, 4]))
                                                      (UnionVersionRanges
-                                                        (ThisVersion `mkVersion [8,2,2]`)
+                                                        (ThisVersion (mkVersion [8, 2, 2]))
                                                         (UnionVersionRanges
-                                                           (ThisVersion `mkVersion [8,0,2]`)
+                                                           (ThisVersion (mkVersion [8, 0, 2]))
                                                            (UnionVersionRanges
-                                                              (ThisVersion `mkVersion [7,10,3]`)
+                                                              (ThisVersion (mkVersion [7, 10, 3]))
                                                               (UnionVersionRanges
-                                                                 (ThisVersion `mkVersion [7,8,4]`)
+                                                                 (ThisVersion (mkVersion [7, 8, 4]))
                                                                  (UnionVersionRanges
                                                                     (ThisVersion
-                                                                       `mkVersion [7,6,3]`)
+                                                                       (mkVersion [7, 6, 3]))
                                                                     (ThisVersion
-                                                                       `mkVersion [7,4,2]`))))))))
-                                               (Set.fromList [LMainLibName]),
+                                                                       (mkVersion [7, 4, 2])))))))))
+                                               mainLibSet,
                                              Dependency
-                                               `PackageName "Cabal"`
+                                               (PackageName "Cabal")
                                                (UnionVersionRanges
-                                                  (MajorBoundVersion `mkVersion [2,4,1,1]`)
-                                                  (MajorBoundVersion `mkVersion [2,2,0,0]`))
-                                               (Set.fromList [LMainLibName])],
+                                                  (MajorBoundVersion (mkVersion [2, 4, 1, 1]))
+                                                  (MajorBoundVersion (mkVersion [2, 2, 0, 0])))
+                                               mainLibSet],
                       condTreeData = Library
                                        {exposedModules = [],
                                         libBuildInfo = BuildInfo
@@ -104,83 +104,123 @@ GenericPackageDescription
                                                           sharedOptions = PerCompilerFlavor [] [],
                                                           staticOptions = PerCompilerFlavor [] [],
                                                           targetBuildDepends = [Dependency
-                                                                                  `PackageName "network"`
+                                                                                  (PackageName
+                                                                                     "network")
                                                                                   (MajorBoundVersion
-                                                                                     `mkVersion [0]`)
-                                                                                  (Set.fromList
-                                                                                     [LMainLibName]),
+                                                                                     (mkVersion
+                                                                                        [0]))
+                                                                                  mainLibSet,
                                                                                 Dependency
-                                                                                  `PackageName "base"`
+                                                                                  (PackageName
+                                                                                     "base")
                                                                                   (ThisVersion
-                                                                                     `mkVersion [1]`)
-                                                                                  (Set.fromList
-                                                                                     [LMainLibName]),
+                                                                                     (mkVersion
+                                                                                        [1]))
+                                                                                  mainLibSet,
                                                                                 Dependency
-                                                                                  `PackageName "base"`
+                                                                                  (PackageName
+                                                                                     "base")
                                                                                   (ThisVersion
-                                                                                     `mkVersion [1]`)
-                                                                                  (Set.fromList
-                                                                                     [LMainLibName]),
+                                                                                     (mkVersion
+                                                                                        [1]))
+                                                                                  mainLibSet,
                                                                                 Dependency
-                                                                                  `PackageName "base"`
+                                                                                  (PackageName
+                                                                                     "base")
                                                                                   (UnionVersionRanges
                                                                                      (ThisVersion
-                                                                                        `mkVersion [1]`)
+                                                                                        (mkVersion
+                                                                                           [1]))
                                                                                      (ThisVersion
-                                                                                        `mkVersion [2]`))
-                                                                                  (Set.fromList
-                                                                                     [LMainLibName]),
+                                                                                        (mkVersion
+                                                                                           [2])))
+                                                                                  mainLibSet,
                                                                                 Dependency
-                                                                                  `PackageName "base"`
+                                                                                  (PackageName
+                                                                                     "base")
                                                                                   (ThisVersion
-                                                                                     `mkVersion [1,2]`)
-                                                                                  (Set.fromList
-                                                                                     [LMainLibName]),
+                                                                                     (mkVersion
+                                                                                        [1, 2]))
+                                                                                  mainLibSet,
                                                                                 Dependency
-                                                                                  `PackageName "base"`
+                                                                                  (PackageName
+                                                                                     "base")
                                                                                   (UnionVersionRanges
                                                                                      (ThisVersion
-                                                                                        `mkVersion [1,2]`)
+                                                                                        (mkVersion
+                                                                                           [1, 2]))
                                                                                      (ThisVersion
-                                                                                        `mkVersion [3,4]`))
-                                                                                  (Set.fromList
-                                                                                     [LMainLibName]),
+                                                                                        (mkVersion
+                                                                                           [3, 4])))
+                                                                                  mainLibSet,
                                                                                 Dependency
-                                                                                  `PackageName "ghc"`
+                                                                                  (PackageName
+                                                                                     "ghc")
                                                                                   (UnionVersionRanges
                                                                                      (ThisVersion
-                                                                                        `mkVersion [8,6,3]`)
+                                                                                        (mkVersion
+                                                                                           [8,
+                                                                                            6,
+                                                                                            3]))
                                                                                      (UnionVersionRanges
                                                                                         (ThisVersion
-                                                                                           `mkVersion [8,4,4]`)
+                                                                                           (mkVersion
+                                                                                              [8,
+                                                                                               4,
+                                                                                               4]))
                                                                                         (UnionVersionRanges
                                                                                            (ThisVersion
-                                                                                              `mkVersion [8,2,2]`)
+                                                                                              (mkVersion
+                                                                                                 [8,
+                                                                                                  2,
+                                                                                                  2]))
                                                                                            (UnionVersionRanges
                                                                                               (ThisVersion
-                                                                                                 `mkVersion [8,0,2]`)
+                                                                                                 (mkVersion
+                                                                                                    [8,
+                                                                                                     0,
+                                                                                                     2]))
                                                                                               (UnionVersionRanges
                                                                                                  (ThisVersion
-                                                                                                    `mkVersion [7,10,3]`)
+                                                                                                    (mkVersion
+                                                                                                       [7,
+                                                                                                        10,
+                                                                                                        3]))
                                                                                                  (UnionVersionRanges
                                                                                                     (ThisVersion
-                                                                                                       `mkVersion [7,8,4]`)
+                                                                                                       (mkVersion
+                                                                                                          [7,
+                                                                                                           8,
+                                                                                                           4]))
                                                                                                     (UnionVersionRanges
                                                                                                        (ThisVersion
-                                                                                                          `mkVersion [7,6,3]`)
+                                                                                                          (mkVersion
+                                                                                                             [7,
+                                                                                                              6,
+                                                                                                              3]))
                                                                                                        (ThisVersion
-                                                                                                          `mkVersion [7,4,2]`))))))))
-                                                                                  (Set.fromList
-                                                                                     [LMainLibName]),
+                                                                                                          (mkVersion
+                                                                                                             [7,
+                                                                                                              4,
+                                                                                                              2])))))))))
+                                                                                  mainLibSet,
                                                                                 Dependency
-                                                                                  `PackageName "Cabal"`
+                                                                                  (PackageName
+                                                                                     "Cabal")
                                                                                   (UnionVersionRanges
                                                                                      (MajorBoundVersion
-                                                                                        `mkVersion [2,4,1,1]`)
+                                                                                        (mkVersion
+                                                                                           [2,
+                                                                                            4,
+                                                                                            1,
+                                                                                            1]))
                                                                                      (MajorBoundVersion
-                                                                                        `mkVersion [2,2,0,0]`))
-                                                                                  (Set.fromList
-                                                                                     [LMainLibName])],
+                                                                                        (mkVersion
+                                                                                           [2,
+                                                                                            2,
+                                                                                            0,
+                                                                                            0])))
+                                                                                  mainLibSet],
                                                           virtualModules = []},
                                         libExposed = True,
                                         libName = LMainLibName,
@@ -190,6 +230,7 @@ GenericPackageDescription
    condSubLibraries = [],
    condTestSuites = [],
    genPackageFlags = [],
+   gpdScannedVersion = Nothing,
    packageDescription = PackageDescription
                           {author = "",
                            benchmarks = [],
@@ -198,7 +239,7 @@ GenericPackageDescription
                            category = "",
                            copyright = "",
                            customFieldsPD = [],
-                           dataDir = "",
+                           dataDir = ".",
                            dataFiles = [],
                            description = "",
                            executables = [],
@@ -212,12 +253,12 @@ GenericPackageDescription
                            licenseRaw = Left NONE,
                            maintainer = "",
                            package = PackageIdentifier
-                                       {pkgName = `PackageName "version-sets"`,
-                                        pkgVersion = `mkVersion [0]`},
+                                       {pkgName = PackageName "version-sets",
+                                        pkgVersion = mkVersion [0]},
                            pkgUrl = "",
                            setupBuildInfo = Nothing,
                            sourceRepos = [],
-                           specVersionRaw = Left `mkVersion [2,5]`,
+                           specVersion = CabalSpecV3_0,
                            stability = "",
                            subLibraries = [],
                            synopsis = "version set notation",
@@ -225,18 +266,18 @@ GenericPackageDescription
                            testedWith = [_×_
                                            GHC
                                            (UnionVersionRanges
-                                              (ThisVersion `mkVersion [8,6,3]`)
+                                              (ThisVersion (mkVersion [8, 6, 3]))
                                               (UnionVersionRanges
-                                                 (ThisVersion `mkVersion [8,4,4]`)
+                                                 (ThisVersion (mkVersion [8, 4, 4]))
                                                  (UnionVersionRanges
-                                                    (ThisVersion `mkVersion [8,2,2]`)
+                                                    (ThisVersion (mkVersion [8, 2, 2]))
                                                     (UnionVersionRanges
-                                                       (ThisVersion `mkVersion [8,0,2]`)
+                                                       (ThisVersion (mkVersion [8, 0, 2]))
                                                        (UnionVersionRanges
-                                                          (ThisVersion `mkVersion [7,10,3]`)
+                                                          (ThisVersion (mkVersion [7, 10, 3]))
                                                           (UnionVersionRanges
-                                                             (ThisVersion `mkVersion [7,8,4]`)
+                                                             (ThisVersion (mkVersion [7, 8, 4]))
                                                              (UnionVersionRanges
-                                                                (ThisVersion `mkVersion [7,6,3]`)
+                                                                (ThisVersion (mkVersion [7, 6, 3]))
                                                                 (ThisVersion
-                                                                   `mkVersion [7,4,2]`))))))))]}}
+                                                                   (mkVersion [7, 4, 2])))))))))]}}

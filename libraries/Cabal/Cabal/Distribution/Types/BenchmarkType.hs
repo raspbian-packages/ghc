@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric      #-}
+{-# LANGUAGE OverloadedStrings  #-}
 
 module Distribution.Types.BenchmarkType (
     BenchmarkType(..),
@@ -12,7 +13,7 @@ import Prelude ()
 import Distribution.Parsec
 import Distribution.Pretty
 import Distribution.Version
-import Text.PrettyPrint          (char, text)
+import Text.PrettyPrint     (char, text)
 
 -- | The \"benchmark-type\" field in the benchmark stanza.
 --
@@ -23,7 +24,7 @@ data BenchmarkType = BenchmarkTypeExe Version
     deriving (Generic, Show, Read, Eq, Typeable, Data)
 
 instance Binary BenchmarkType
-
+instance Structured BenchmarkType
 instance NFData BenchmarkType where rnf = genericRnf
 
 knownBenchmarkTypes :: [BenchmarkType]

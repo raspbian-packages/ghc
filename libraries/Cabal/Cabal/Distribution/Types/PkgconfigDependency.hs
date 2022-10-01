@@ -14,7 +14,6 @@ import Distribution.Parsec
 import Distribution.Pretty
 
 import qualified Distribution.Compat.CharParsing as P
-import           Text.PrettyPrint           ((<+>))
 
 -- | Describes a dependency on a pkg-config library
 --
@@ -25,11 +24,12 @@ data PkgconfigDependency = PkgconfigDependency
                          deriving (Generic, Read, Show, Eq, Typeable, Data)
 
 instance Binary PkgconfigDependency
+instance Structured PkgconfigDependency
 instance NFData PkgconfigDependency where rnf = genericRnf
 
 instance Pretty PkgconfigDependency where
-  pretty (PkgconfigDependency name ver) =
-    pretty name <+> pretty ver
+    pretty (PkgconfigDependency name PcAnyVersion) = pretty name
+    pretty (PkgconfigDependency name ver)          = pretty name <+> pretty ver
 
 instance Parsec PkgconfigDependency where
     parsec = do

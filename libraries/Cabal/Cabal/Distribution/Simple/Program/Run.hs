@@ -1,5 +1,6 @@
 {-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE GADTs            #-}
+{-# LANGUAGE RankNTypes       #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -22,23 +23,25 @@ module Distribution.Simple.Program.Run (
 
     runProgramInvocation,
     getProgramInvocationOutput,
+    getProgramInvocationLBS,
     getProgramInvocationOutputAndErrors,
 
     getEffectiveEnvironment,
   ) where
 
-import Prelude ()
 import Distribution.Compat.Prelude
+import Prelude ()
 
+import Distribution.Compat.Environment
 import Distribution.Simple.Program.Types
 import Distribution.Simple.Utils
+import Distribution.Utils.Generic
 import Distribution.Verbosity
-import Distribution.Compat.Environment
 
-import qualified Data.Map as Map
-import System.FilePath
-import System.Exit
-         ( ExitCode(..), exitWith )
+import System.FilePath (searchPathSeparator)
+
+import qualified Data.ByteString.Lazy as LBS
+import qualified Data.Map             as Map
 
 -- | Represents a specific invocation of a specific program.
 --
@@ -54,17 +57,18 @@ data ProgramInvocation = ProgramInvocation {
        -- Extra paths to add to PATH
        progInvokePathEnv :: [FilePath],
        progInvokeCwd   :: Maybe FilePath,
-       progInvokeInput :: Maybe String,
-       progInvokeInputEncoding  :: IOEncoding,
+       progInvokeInput :: Maybe IOData,
+       progInvokeInputEncoding  :: IOEncoding, -- ^ TODO: remove this, make user decide when constructing 'progInvokeInput'.
        progInvokeOutputEncoding :: IOEncoding
      }
 
 data IOEncoding = IOEncodingText   -- locale mode text
                 | IOEncodingUTF8   -- always utf8
 
-encodeToIOData :: IOEncoding -> String -> IOData
-encodeToIOData IOEncodingText = IODataText
-encodeToIOData IOEncodingUTF8 = IODataBinary . toUTF8LBS
+encodeToIOData :: IOEncoding -> IOData -> IOData
+encodeToIOData _              iod@(IODataBinary _) = iod
+encodeToIOData IOEncodingText iod@(IODataText _)   = iod
+encodeToIOData IOEncodingUTF8 (IODataText str)     = IODataBinary (toUTF8LBS str)
 
 emptyProgramInvocation :: ProgramInvocation
 emptyProgramInvocation =
@@ -155,36 +159,45 @@ getProgramInvocationOutput verbosity inv = do
       die' verbosity $ "'" ++ progInvokePath inv ++ "' exited with an error:\n" ++ errors
     return output
 
+getProgramInvocationLBS :: Verbosity -> ProgramInvocation -> IO LBS.ByteString
+getProgramInvocationLBS verbosity inv = do
+    (output, errors, exitCode) <- getProgramInvocationIODataAndErrors verbosity inv IODataModeBinary
+    when (exitCode /= ExitSuccess) $
+      die' verbosity $ "'" ++ progInvokePath inv ++ "' exited with an error:\n" ++ errors
+    return output
 
 getProgramInvocationOutputAndErrors :: Verbosity -> ProgramInvocation
                                     -> IO (String, String, ExitCode)
-getProgramInvocationOutputAndErrors verbosity
-  ProgramInvocation {
-    progInvokePath  = path,
-    progInvokeArgs  = args,
-    progInvokeEnv   = envOverrides,
-    progInvokePathEnv = extraPath,
-    progInvokeCwd   = mcwd,
-    progInvokeInput = minputStr,
-    progInvokeOutputEncoding = encoding
-  } = do
-    let mode = case encoding of IOEncodingUTF8 -> IODataModeBinary
-                                IOEncodingText -> IODataModeText
+getProgramInvocationOutputAndErrors verbosity inv = case progInvokeOutputEncoding inv of
+    IOEncodingText -> do
+        (output, errors, exitCode) <- getProgramInvocationIODataAndErrors verbosity inv IODataModeText
+        return (output, errors, exitCode)
+    IOEncodingUTF8 -> do
+        (output', errors, exitCode) <- getProgramInvocationIODataAndErrors verbosity inv IODataModeBinary
+        return (normaliseLineEndings (fromUTF8LBS output'), errors, exitCode)
 
-        decode (IODataBinary b) = normaliseLineEndings (fromUTF8LBS b)
-        decode (IODataText   s) = s
-
+getProgramInvocationIODataAndErrors
+    :: KnownIODataMode mode => Verbosity -> ProgramInvocation -> IODataMode mode
+    -> IO (mode, String, ExitCode)
+getProgramInvocationIODataAndErrors
+  verbosity
+  ProgramInvocation
+    { progInvokePath          = path
+    , progInvokeArgs          = args
+    , progInvokeEnv           = envOverrides
+    , progInvokePathEnv       = extraPath
+    , progInvokeCwd           = mcwd
+    , progInvokeInput         = minputStr
+    , progInvokeInputEncoding = encoding
+    }
+  mode = do
     pathOverride <- getExtraPathEnv envOverrides extraPath
     menv <- getEffectiveEnvironment (envOverrides ++ pathOverride)
-    (output, errors, exitCode) <- rawSystemStdInOut verbosity
-                                    path args
-                                    mcwd menv
-                                    input mode
-    return (decode output, errors, exitCode)
+    rawSystemStdInOut verbosity path args mcwd menv input mode
   where
     input = encodeToIOData encoding <$> minputStr
 
-getExtraPathEnv :: [(String, Maybe String)] -> [FilePath] -> NoCallStackIO [(String, Maybe String)]
+getExtraPathEnv :: [(String, Maybe String)] -> [FilePath] -> IO [(String, Maybe String)]
 getExtraPathEnv _ [] = return []
 getExtraPathEnv env extras = do
     mb_path <- case lookup "PATH" env of
@@ -201,7 +214,7 @@ getExtraPathEnv env extras = do
 -- precedence.
 --
 getEffectiveEnvironment :: [(String, Maybe String)]
-                        -> NoCallStackIO (Maybe [(String, String)])
+                        -> IO (Maybe [(String, String)])
 getEffectiveEnvironment []        = return Nothing
 getEffectiveEnvironment overrides =
     fmap (Just . Map.toList . apply overrides . Map.fromList) getEnvironment
@@ -243,13 +256,14 @@ multiStageProgramInvocation simple (initial, middle, final) args =
       chunkSize    = maxCommandLineSize - fixedArgSize
 
    in case splitChunks chunkSize args of
-        []     -> [ simple ]
+        []  -> [ simple ]
 
-        [c]    -> [ simple  `appendArgs` c ]
+        [c] -> [ simple  `appendArgs` c ]
 
-        (c:cs) -> [ initial `appendArgs` c ]
-               ++ [ middle  `appendArgs` c'| c' <- init cs ]
-               ++ [ final   `appendArgs` c'| let c' = last cs ]
+        (c:c2:cs) | (xs, x) <- unsnocNE (c2:|cs) ->
+             [ initial `appendArgs` c ]
+          ++ [ middle  `appendArgs` c'| c' <- xs ]
+          ++ [ final   `appendArgs` x ]
 
   where
     appendArgs :: ProgramInvocation -> [String] -> ProgramInvocation

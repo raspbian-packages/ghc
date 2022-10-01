@@ -58,7 +58,6 @@ module Data.Bits (
 #include "MachDeps.h"
 
 import Data.Maybe
-import GHC.Enum
 import GHC.Num
 import GHC.Base
 import GHC.Real
@@ -169,10 +168,14 @@ class Eq a => Bits a where
     -- | @x \`complementBit\` i@ is the same as @x \`xor\` bit i@
     complementBit     :: a -> Int -> a
 
-    -- | Return 'True' if the @n@th bit of the argument is 1
-    --
-    -- Can be implemented using `testBitDefault' if @a@ is also an
-    -- instance of 'Num'.
+    {-| @x \`testBit\` i@ is the same as @x .&. bit n /= 0@
+
+        In other words it returns True if the bit at offset @n
+        is set.
+
+        Can be implemented using `testBitDefault' if @a@ is also an
+        instance of 'Num'.
+        -}
     testBit           :: a -> Int -> Bool
 
     {-| Return the number of bits in the type of the argument.  The actual
@@ -438,6 +441,9 @@ instance Bits Int where
     {-# INLINE shift #-}
     {-# INLINE bit #-}
     {-# INLINE testBit #-}
+    -- We want popCnt# to be inlined in user code so that `ghc -msse4.2`
+    -- can compile it down to a popcnt instruction without an extra function call
+    {-# INLINE popCount #-}
 
     zeroBits = 0
 
@@ -478,19 +484,21 @@ instance Bits Int where
 instance FiniteBits Int where
     finiteBitSize _ = WORD_SIZE_IN_BITS
     countLeadingZeros  (I# x#) = I# (word2Int# (clz# (int2Word# x#)))
+    {-# INLINE countLeadingZeros #-}
     countTrailingZeros (I# x#) = I# (word2Int# (ctz# (int2Word# x#)))
+    {-# INLINE countTrailingZeros #-}
 
 -- | @since 2.01
 instance Bits Word where
     {-# INLINE shift #-}
     {-# INLINE bit #-}
     {-# INLINE testBit #-}
+    {-# INLINE popCount #-}
 
     (W# x#) .&.   (W# y#)    = W# (x# `and#` y#)
     (W# x#) .|.   (W# y#)    = W# (x# `or#`  y#)
     (W# x#) `xor` (W# y#)    = W# (x# `xor#` y#)
-    complement (W# x#)       = W# (x# `xor#` mb#)
-        where !(W# mb#) = maxBound
+    complement (W# x#)       = W# (not# x#)
     (W# x#) `shift` (I# i#)
         | isTrue# (i# >=# 0#)      = W# (x# `shiftL#` i#)
         | otherwise                = W# (x# `shiftRL#` negateInt# i#)
@@ -519,21 +527,31 @@ instance Bits Word where
 instance FiniteBits Word where
     finiteBitSize _ = WORD_SIZE_IN_BITS
     countLeadingZeros  (W# x#) = I# (word2Int# (clz# x#))
+    {-# INLINE countLeadingZeros #-}
     countTrailingZeros (W# x#) = I# (word2Int# (ctz# x#))
+    {-# INLINE countTrailingZeros #-}
 
 -- | @since 2.01
 instance Bits Integer where
-   (.&.) = andInteger
-   (.|.) = orInteger
-   xor = xorInteger
-   complement = complementInteger
-   shift x i@(I# i#) | i >= 0    = shiftLInteger x i#
-                     | otherwise = shiftRInteger x (negateInt# i#)
-   testBit x (I# i) = testBitInteger x i
-   zeroBits   = 0
+   (.&.)      = integerAnd
+   (.|.)      = integerOr
+   xor        = integerXor
+   complement = integerComplement
+   unsafeShiftR x i = integerShiftR x (fromIntegral i)
+   unsafeShiftL x i = integerShiftL x (fromIntegral i)
+   shiftR x i@(I# i#)
+      | isTrue# (i# >=# 0#) = unsafeShiftR x i
+      | otherwise           = overflowError
+   shiftL x i@(I# i#)
+      | isTrue# (i# >=# 0#) = unsafeShiftL x i
+      | otherwise           = overflowError
+   shift x i | i >= 0    = integerShiftL x (fromIntegral i)
+             | otherwise = integerShiftR x (fromIntegral (negate i))
+   testBit x i = integerTestBit x (fromIntegral i)
+   zeroBits    = integerZero
 
-   bit (I# i#) = bitInteger i#
-   popCount x  = I# (popCountInteger x)
+   bit (I# i)  = integerBit# (int2Word# i)
+   popCount x  = I# (integerPopCount# x)
 
    rotate x i = shift x i   -- since an Integer never wraps around
 
@@ -543,20 +561,28 @@ instance Bits Integer where
 
 -- | @since 4.8.0
 instance Bits Natural where
-   (.&.) = andNatural
-   (.|.) = orNatural
-   xor = xorNatural
-   complement _ = errorWithoutStackTrace
+   (.&.)         = naturalAnd
+   (.|.)         = naturalOr
+   xor           = naturalXor
+   complement _  = errorWithoutStackTrace
                     "Bits.complement: Natural complement undefined"
+   unsafeShiftR x i = naturalShiftR x (fromIntegral i)
+   unsafeShiftL x i = naturalShiftL x (fromIntegral i)
+   shiftR x i@(I# i#)
+      | isTrue# (i# >=# 0#) = unsafeShiftR x i
+      | otherwise           = overflowError
+   shiftL x i@(I# i#)
+      | isTrue# (i# >=# 0#) = unsafeShiftL x i
+      | otherwise           = overflowError
    shift x i
-     | i >= 0    = shiftLNatural x i
-     | otherwise = shiftRNatural x (negate i)
-   testBit x i   = testBitNatural x i
-   zeroBits      = wordToNaturalBase 0##
+     | i >= 0    = naturalShiftL x (fromIntegral i)
+     | otherwise = naturalShiftR x (fromIntegral (negate i))
+   testBit x i   = naturalTestBit x (fromIntegral i)
+   zeroBits      = naturalZero
    clearBit x i  = x `xor` (bit i .&. x)
 
-   bit (I# i#) = bitNatural i#
-   popCount x  = popCountNatural x
+   bit (I# i)  = naturalBit# (int2Word# i)
+   popCount x  = I# (word2Int# (naturalPopCount# x))
 
    rotate x i = shift x i   -- since an Natural never wraps around
 

@@ -1,21 +1,21 @@
 GenericPackageDescription
   {condBenchmarks = [],
    condExecutables = [_×_
-                        `UnqualComponentName "str-example"`
+                        (UnqualComponentName "str-example")
                         CondNode
                           {condTreeComponents = [],
                            condTreeConstraints = [Dependency
-                                                    `PackageName "base"`
-                                                    AnyVersion
-                                                    (Set.fromList [LMainLibName]),
+                                                    (PackageName "base")
+                                                    (OrLaterVersion (mkVersion [0]))
+                                                    mainLibSet,
                                                   Dependency
-                                                    `PackageName "str-string"`
-                                                    AnyVersion
-                                                    (Set.fromList [LMainLibName]),
+                                                    (PackageName "str-string")
+                                                    (OrLaterVersion (mkVersion [0]))
+                                                    mainLibSet,
                                                   Dependency
-                                                    `PackageName "str-bytestring"`
-                                                    AnyVersion
-                                                    (Set.fromList [LMainLibName])],
+                                                    (PackageName "str-bytestring")
+                                                    (OrLaterVersion (mkVersion [0]))
+                                                    mainLibSet],
                            condTreeData = Executable
                                             {buildInfo = BuildInfo
                                                            {asmOptions = [],
@@ -49,7 +49,15 @@ GenericPackageDescription
                                                             installIncludes = [],
                                                             jsSources = [],
                                                             ldOptions = [],
-                                                            mixins = [`Mixin {mixinPackageName = PackageName "str", mixinIncludeRenaming = IncludeRenaming {includeProvidesRn = HidingRenaming [ModuleName ["Foo"]], includeRequiresRn = DefaultRenaming}}`],
+                                                            mixins = [Mixin
+                                                                        {mixinIncludeRenaming = IncludeRenaming
+                                                                                                  {includeProvidesRn = HidingRenaming
+                                                                                                                         [ModuleName
+                                                                                                                            "Foo"],
+                                                                                                   includeRequiresRn = DefaultRenaming},
+                                                                         mixinLibraryName = LMainLibName,
+                                                                         mixinPackageName = PackageName
+                                                                                              "str"}],
                                                             oldExtensions = [],
                                                             options = PerCompilerFlavor [] [],
                                                             otherExtensions = [],
@@ -60,22 +68,28 @@ GenericPackageDescription
                                                             sharedOptions = PerCompilerFlavor [] [],
                                                             staticOptions = PerCompilerFlavor [] [],
                                                             targetBuildDepends = [Dependency
-                                                                                    `PackageName "base"`
-                                                                                    AnyVersion
-                                                                                    (Set.fromList
-                                                                                       [LMainLibName]),
+                                                                                    (PackageName
+                                                                                       "base")
+                                                                                    (OrLaterVersion
+                                                                                       (mkVersion
+                                                                                          [0]))
+                                                                                    mainLibSet,
                                                                                   Dependency
-                                                                                    `PackageName "str-string"`
-                                                                                    AnyVersion
-                                                                                    (Set.fromList
-                                                                                       [LMainLibName]),
+                                                                                    (PackageName
+                                                                                       "str-string")
+                                                                                    (OrLaterVersion
+                                                                                       (mkVersion
+                                                                                          [0]))
+                                                                                    mainLibSet,
                                                                                   Dependency
-                                                                                    `PackageName "str-bytestring"`
-                                                                                    AnyVersion
-                                                                                    (Set.fromList
-                                                                                       [LMainLibName])],
+                                                                                    (PackageName
+                                                                                       "str-bytestring")
+                                                                                    (OrLaterVersion
+                                                                                       (mkVersion
+                                                                                          [0]))
+                                                                                    mainLibSet],
                                                             virtualModules = []},
-                                             exeName = `UnqualComponentName "str-example"`,
+                                             exeName = UnqualComponentName "str-example",
                                              exeScope = ExecutablePublic,
                                              modulePath = "Main.hs"}}],
    condForeignLibs = [],
@@ -83,6 +97,7 @@ GenericPackageDescription
    condSubLibraries = [],
    condTestSuites = [],
    genPackageFlags = [],
+   gpdScannedVersion = Nothing,
    packageDescription = PackageDescription
                           {author = "",
                            benchmarks = [],
@@ -91,7 +106,7 @@ GenericPackageDescription
                            category = "",
                            copyright = "",
                            customFieldsPD = [],
-                           dataDir = "",
+                           dataDir = ".",
                            dataFiles = [],
                            description = "",
                            executables = [],
@@ -105,12 +120,11 @@ GenericPackageDescription
                            licenseRaw = Left NONE,
                            maintainer = "",
                            package = PackageIdentifier
-                                       {pkgName = `PackageName "mixin"`,
-                                        pkgVersion = `mkVersion [0]`},
+                                       {pkgName = PackageName "mixin", pkgVersion = mkVersion [0]},
                            pkgUrl = "",
                            setupBuildInfo = Nothing,
                            sourceRepos = [],
-                           specVersionRaw = Left `mkVersion [3,0]`,
+                           specVersion = CabalSpecV3_0,
                            stability = "",
                            subLibraries = [],
                            synopsis = "",

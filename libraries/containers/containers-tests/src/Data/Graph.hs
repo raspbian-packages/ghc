@@ -67,6 +67,7 @@ module Data.Graph (
     , dfs
     , dff
     , topSort
+    , reverseTopSort
     , components
     , scc
     , bcc
@@ -383,7 +384,7 @@ graphFromEdges' x = (a,b) where
 -- type @key@ labeled by values of type @node@ and produces a @Graph@-based
 -- representation of that list. The @Graph@ result represents the /shape/ of the
 -- graph, and the functions describe a) how to retrieve the label and adjacent
--- vertices of a given vertex, and b) how to retrive a vertex given a key.
+-- vertices of a given vertex, and b) how to retrieve a vertex given a key.
 --
 -- @(graph, nodeFromVertex, vertexFromKey) = graphFromEdges edgeList@
 --
@@ -616,6 +617,12 @@ postOrd g = postorderF (dff g) []
 -- precedes /j/ whenever /j/ is reachable from /i/ but not vice versa.
 topSort      :: Graph -> [Vertex]
 topSort       = reverse . postOrd
+
+-- | Reverse ordering of `topSort`.
+--
+-- @since 0.6.4
+reverseTopSort :: Graph -> [Vertex]
+reverseTopSort = postOrd
 
 ------------------------------------------------------------
 -- Algorithm 3: connected components

@@ -43,6 +43,7 @@ module Distribution.Client.ProjectOrchestration (
     -- * Discovery phase: what is in the project?
     CurrentCommand(..),
     establishProjectBaseContext,
+    establishProjectBaseContextWithRoot,
     ProjectBaseContext(..),
     BuildTimeSettings(..),
     commandLineFlagsToProjectConfig,
@@ -67,7 +68,6 @@ module Distribution.Client.ProjectOrchestration (
     ComponentKind(..),
     ComponentTarget(..),
     SubComponentTarget(..),
-    TargetProblemCommon(..),
     selectComponentTargetBasic,
     distinctTargetComponents,
     -- ** Utils for selecting targets
@@ -93,8 +93,9 @@ module Distribution.Client.ProjectOrchestration (
     runProjectPostBuildPhase,
     dieOnBuildFailures,
 
-    -- * Shared CLI utils
-    cmdCommonHelpTextNewBuildBeta,
+    -- * Dummy projects
+    establishDummyProjectBaseContext,
+    establishDummyDistDirLayout,
   ) where
 
 import Prelude ()
@@ -110,7 +111,10 @@ import qualified Distribution.Client.ProjectPlanning as ProjectPlanning
 import           Distribution.Client.ProjectPlanning.Types
 import           Distribution.Client.ProjectBuilding
 import           Distribution.Client.ProjectPlanOutput
+import           Distribution.Client.RebuildMonad ( runRebuild )
 
+import           Distribution.Client.TargetProblem
+                   ( TargetProblem (..) )
 import           Distribution.Client.Types
                    ( GenericReadyPackage(..), UnresolvedSourcePackage
                    , PackageSpecifier(..)
@@ -136,34 +140,29 @@ import           Distribution.Types.UnqualComponentName
 import           Distribution.Solver.Types.OptionalStanza
 
 import           Distribution.Package
-import           Distribution.PackageDescription
-                   ( FlagAssignment, unFlagAssignment, showFlagValue
-                   , diffFlagAssignment )
+import           Distribution.Types.Flag
+                   ( FlagAssignment, showFlagAssignment, diffFlagAssignment )
 import           Distribution.Simple.LocalBuildInfo
                    ( ComponentName(..), pkgComponents )
 import           Distribution.Simple.Flag
-                   ( fromFlagOrDefault )
+                   ( fromFlagOrDefault, flagToMaybe )
 import qualified Distribution.Simple.Setup as Setup
 import           Distribution.Simple.Command (commandShowOptions)
 import           Distribution.Simple.Configure (computeEffectiveProfiling)
 
 import           Distribution.Simple.Utils
-                   ( die', warn, notice, noticeNoWrap, debugNoWrap )
+                   ( die', warn, notice, noticeNoWrap, debugNoWrap, createDirectoryIfMissingVerbose )
 import           Distribution.Verbosity
 import           Distribution.Version
                    ( mkVersion )
-import           Distribution.Pretty
-                   ( prettyShow )
 import           Distribution.Simple.Compiler
                    ( compilerCompatVersion, showCompilerId
                    , OptimisationLevel(..))
 
-import qualified Data.Monoid as Mon
+import qualified Data.List.NonEmpty as NE
 import qualified Data.Set as Set
 import qualified Data.Map as Map
-import           Data.Either
-import           Control.Exception (Exception(..), throwIO, assert)
-import           System.Exit (ExitCode(..), exitFailure)
+import           Control.Exception (assert)
 #ifdef MIN_VERSION_unix
 import           System.Posix.Signals (sigKILL, sigSEGV)
 #endif
@@ -186,18 +185,29 @@ data ProjectBaseContext = ProjectBaseContext {
        currentCommand :: CurrentCommand
      }
 
-establishProjectBaseContext :: Verbosity
-                            -> ProjectConfig
-                            -> CurrentCommand
-                            -> IO ProjectBaseContext
+establishProjectBaseContext
+    :: Verbosity
+    -> ProjectConfig
+    -> CurrentCommand
+    -> IO ProjectBaseContext
 establishProjectBaseContext verbosity cliConfig currentCommand = do
+    projectRoot <- either throwIO return =<< findProjectRoot Nothing mprojectFile
+    establishProjectBaseContextWithRoot verbosity cliConfig projectRoot currentCommand
+  where
+    mprojectFile   = Setup.flagToMaybe projectConfigProjectFile
+    ProjectConfigShared { projectConfigProjectFile } = projectConfigShared cliConfig
 
+-- | Like 'establishProjectBaseContext' but doesn't search for project root.
+establishProjectBaseContextWithRoot
+    :: Verbosity
+    -> ProjectConfig
+    -> ProjectRoot
+    -> CurrentCommand
+    -> IO ProjectBaseContext
+establishProjectBaseContextWithRoot verbosity cliConfig projectRoot currentCommand = do
     cabalDir <- getCabalDir
-    projectRoot <- either throwIO return =<<
-                   findProjectRoot Nothing mprojectFile
 
-    let distDirLayout  = defaultDistDirLayout projectRoot
-                                              mdistDirectory
+    let distDirLayout  = defaultDistDirLayout projectRoot mdistDirectory
 
     (projectConfig, localPackages) <-
       rebuildProjectConfig verbosity
@@ -221,6 +231,10 @@ establishProjectBaseContext verbosity cliConfig currentCommand = do
                           verbosity cabalDirLayout
                           projectConfig
 
+    -- https://github.com/haskell/cabal/issues/6013
+    when (null (projectPackages projectConfig) && null (projectPackagesOptional projectConfig)) $
+        warn verbosity "There are no packages or optional-packages in the project"
+
     return ProjectBaseContext {
       distDirLayout,
       cabalDirLayout,
@@ -231,11 +245,7 @@ establishProjectBaseContext verbosity cliConfig currentCommand = do
     }
   where
     mdistDirectory = Setup.flagToMaybe projectConfigDistDir
-    mprojectFile   = Setup.flagToMaybe projectConfigProjectFile
-    ProjectConfigShared {
-      projectConfigDistDir,
-      projectConfigProjectFile
-    } = projectConfigShared cliConfig
+    ProjectConfigShared { projectConfigDistDir } = projectConfigShared cliConfig
 
 
 -- | This holds the context between the pre-build, build and post-build phases.
@@ -287,7 +297,7 @@ withInstallPlan
     -- everything in the project. This is independent of any specific targets
     -- the user has asked for.
     --
-    (elaboratedPlan, _, elaboratedShared) <-
+    (elaboratedPlan, _, elaboratedShared, _, _) <-
       rebuildInstallPlan verbosity
                          distDirLayout cabalDirLayout
                          projectConfig
@@ -312,7 +322,7 @@ runProjectPreBuildPhase
     -- everything in the project. This is independent of any specific targets
     -- the user has asked for.
     --
-    (elaboratedPlan, _, elaboratedShared) <-
+    (elaboratedPlan, _, elaboratedShared, _, _) <-
       rebuildInstallPlan verbosity
                          distDirLayout cabalDirLayout
                          projectConfig
@@ -500,18 +510,18 @@ type TargetsMap = Map UnitId [(ComponentTarget, [TargetSelector])]
 resolveTargets :: forall err.
                   (forall k. TargetSelector
                           -> [AvailableTarget k]
-                          -> Either err [k])
+                          -> Either (TargetProblem err) [k])
                -> (forall k. SubComponentTarget
                           -> AvailableTarget k
-                          -> Either err  k )
-               -> (TargetProblemCommon -> err)
+                          -> Either (TargetProblem err)  k )
                -> ElaboratedInstallPlan
                -> Maybe (SourcePackageDb)
                -> [TargetSelector]
-               -> Either [err] TargetsMap
-resolveTargets selectPackageTargets selectComponentTarget liftProblem
+               -> Either [TargetProblem err] TargetsMap
+resolveTargets selectPackageTargets selectComponentTarget
                installPlan mPkgDb =
       fmap mkTargetsMap
+    . either (Left . toList) Right
     . checkErrors
     . map (\ts -> (,) ts <$> checkTarget ts)
   where
@@ -526,7 +536,7 @@ resolveTargets selectPackageTargets selectComponentTarget liftProblem
 
     AvailableTargetIndexes{..} = availableTargetIndexes installPlan
 
-    checkTarget :: TargetSelector -> Either err [(UnitId, ComponentTarget)]
+    checkTarget :: TargetSelector -> Either (TargetProblem err) [(UnitId, ComponentTarget)]
 
     -- We can ask to build any whole package, project-local or a dependency
     checkTarget bt@(TargetPackage _ [pkgid] mkfilter)
@@ -536,10 +546,11 @@ resolveTargets selectPackageTargets selectComponentTarget liftProblem
       $ selectPackageTargets bt ats
 
       | otherwise
-      = Left (liftProblem (TargetProblemNoSuchPackage pkgid))
+      = Left (TargetProblemNoSuchPackage pkgid)
 
-    checkTarget (TargetPackage _ _ _)
-      = error "TODO: add support for multiple packages in a directory"
+    checkTarget (TargetPackage _ pkgids _)
+      = error ("TODO: add support for multiple packages in a directory.  Got\n"
+              ++ unlines (map prettyShow pkgids))
       -- For the moment this error cannot happen here, because it gets
       -- detected when the package config is being constructed. This case
       -- will need handling properly when we do add support.
@@ -562,10 +573,10 @@ resolveTargets selectPackageTargets selectComponentTarget liftProblem
       $ selectComponentTargets subtarget ats
 
       | Map.member pkgid availableTargetsByPackageId
-      = Left (liftProblem (TargetProblemNoSuchComponent pkgid cname))
+      = Left (TargetProblemNoSuchComponent pkgid cname)
 
       | otherwise
-      = Left (liftProblem (TargetProblemNoSuchPackage pkgid))
+      = Left (TargetProblemNoSuchPackage pkgid)
 
     checkTarget (TargetComponentUnknown pkgname ecname subtarget)
       | Just ats <- case ecname of
@@ -579,10 +590,10 @@ resolveTargets selectPackageTargets selectComponentTarget liftProblem
       $ selectComponentTargets subtarget ats
 
       | Map.member pkgname availableTargetsByPackageName
-      = Left (liftProblem (TargetProblemUnknownComponent pkgname ecname))
+      = Left (TargetProblemUnknownComponent pkgname ecname)
 
       | otherwise
-      = Left (liftProblem (TargetNotInProject pkgname))
+      = Left (TargetNotInProject pkgname)
 
     checkTarget bt@(TargetPackageNamed pkgname mkfilter)
       | Just ats <- fmap (maybe id filterTargetsKind mkfilter)
@@ -594,10 +605,10 @@ resolveTargets selectPackageTargets selectComponentTarget liftProblem
       | Just SourcePackageDb{ packageIndex } <- mPkgDb
       , let pkg = lookupPackageName packageIndex pkgname
       , not (null pkg)
-      = Left (liftProblem (TargetAvailableInIndex pkgname))
+      = Left (TargetAvailableInIndex pkgname)
 
       | otherwise
-      = Left (liftProblem (TargetNotInProject pkgname))
+      = Left (TargetNotInProject pkgname)
 
     componentTargets :: SubComponentTarget
                      -> [(b, ComponentName)]
@@ -607,14 +618,14 @@ resolveTargets selectPackageTargets selectComponentTarget liftProblem
 
     selectComponentTargets :: SubComponentTarget
                            -> [AvailableTarget k]
-                           -> Either err [k]
+                           -> Either (TargetProblem err) [k]
     selectComponentTargets subtarget =
-        either (Left . head) Right
+        either (Left . NE.head) Right
       . checkErrors
       . map (selectComponentTarget subtarget)
 
-    checkErrors :: [Either e a] -> Either [e] [a]
-    checkErrors = (\(es, xs) -> if null es then Right xs else Left es)
+    checkErrors :: [Either e a] -> Either (NonEmpty e) [a]
+    checkErrors = (\(es, xs) -> case es of { [] -> Right xs; (e:es') -> Left (e:|es') })
                 . partitionEithers
 
 
@@ -746,7 +757,7 @@ forgetTargetsDetail = map forgetTargetDetail
 --
 selectComponentTargetBasic :: SubComponentTarget
                            -> AvailableTarget k
-                           -> Either TargetProblemCommon k
+                           -> Either (TargetProblem a) k
 selectComponentTargetBasic subtarget
                            AvailableTarget {
                              availableTargetPackageId     = pkgid,
@@ -768,32 +779,6 @@ selectComponentTargetBasic subtarget
 
       TargetBuildable targetKey _ ->
         Right targetKey
-
-data TargetProblemCommon
-   = TargetNotInProject                   PackageName
-   | TargetAvailableInIndex               PackageName
-
-   | TargetComponentNotProjectLocal
-     PackageId ComponentName SubComponentTarget
-
-   | TargetComponentNotBuildable
-     PackageId ComponentName SubComponentTarget
-
-   | TargetOptionalStanzaDisabledByUser
-     PackageId ComponentName SubComponentTarget
-
-   | TargetOptionalStanzaDisabledBySolver
-     PackageId ComponentName SubComponentTarget
-
-   | TargetProblemUnknownComponent
-     PackageName (Either UnqualComponentName ComponentName)
-
-    -- The target matching stuff only returns packages local to the project,
-    -- so these lookups should never fail, but if 'resolveTargets' is called
-    -- directly then of course it can.
-   | TargetProblemNoSuchPackage           PackageId
-   | TargetProblemNoSuchComponent         PackageId ComponentName
-  deriving (Eq, Show)
 
 -- | Wrapper around 'ProjectPlanning.pruneInstallPlanToTargets' that adjusts
 -- for the extra unneeded info in the 'TargetsMap'.
@@ -865,21 +850,20 @@ printPlan verbosity
               | otherwise          = "will"
 
     showPkgAndReason :: ElaboratedReadyPackage -> String
-    showPkgAndReason (ReadyPackage elab) =
-      " - " ++
-      (if verbosity >= deafening
+    showPkgAndReason (ReadyPackage elab) = unwords $ filter (not . null) $
+      [ " -"
+      , if verbosity >= deafening
         then prettyShow (installedUnitId elab)
         else prettyShow (packageId elab)
-        ) ++
-      (case elabPkgOrComp elab of
+      , case elabPkgOrComp elab of
           ElabPackage pkg -> showTargets elab ++ ifVerbose (showStanzas pkg)
           ElabComponent comp ->
-            " (" ++ showComp elab comp ++ ")"
-            ) ++
-      showFlagAssignment (nonDefaultFlags elab) ++
-      showConfigureFlags elab ++
-      let buildStatus = pkgsBuildStatus Map.! installedUnitId elab in
-      " (" ++ showBuildStatus buildStatus ++ ")"
+            "(" ++ showComp elab comp ++ ")"
+      , showFlagAssignment (nonDefaultFlags elab)
+      , showConfigureFlags elab
+      , let buildStatus = pkgsBuildStatus Map.! installedUnitId elab
+        in "(" ++ showBuildStatus buildStatus ++ ")"
+      ]
 
     showComp elab comp =
         maybe "custom" prettyShow (compComponentName comp) ++
@@ -904,13 +888,10 @@ printPlan verbosity
     showTargets elab
       | null (elabBuildTargets elab) = ""
       | otherwise
-      = " ("
+      = "("
         ++ intercalate ", " [ showComponentTarget (packageId elab) t
                             | t <- elabBuildTargets elab ]
         ++ ")"
-
-    showFlagAssignment :: FlagAssignment -> String
-    showFlagAssignment = concatMap ((' ' :) . showFlagValue) . unFlagAssignment
 
     showConfigureFlags elab =
         let fullConfigureFlags
@@ -930,7 +911,7 @@ printPlan verbosity
               computeEffectiveProfiling fullConfigureFlags
 
             partialConfigureFlags
-              = Mon.mempty {
+              = mempty {
                 configProf    =
                     nubFlag False (configProf fullConfigureFlags),
                 configProfExe =
@@ -1209,15 +1190,66 @@ data BuildFailurePresentation =
        ShowBuildSummaryOnly   BuildFailureReason
      | ShowBuildSummaryAndLog BuildFailureReason FilePath
 
+-------------------------------------------------------------------------------
+-- Dummy projects
+-------------------------------------------------------------------------------
 
-cmdCommonHelpTextNewBuildBeta :: String
-cmdCommonHelpTextNewBuildBeta =
-    "Note: this command is part of the new project-based system (aka "
- ++ "nix-style\nlocal builds). These features are currently in beta. "
- ++ "Please see\n"
- ++ "http://cabal.readthedocs.io/en/latest/nix-local-build-overview.html "
- ++ "for\ndetails and advice on what you can expect to work. If you "
- ++ "encounter problems\nplease file issues at "
- ++ "https://github.com/haskell/cabal/issues and if you\nhave any time "
- ++ "to get involved and help with testing, fixing bugs etc then\nthat "
- ++ "is very much appreciated.\n"
+-- | Create a dummy project context, without a .cabal or a .cabal.project file
+-- (a place where to put a temporary dist directory is still needed)
+establishDummyProjectBaseContext
+  :: Verbosity
+  -> ProjectConfig
+  -> DistDirLayout
+     -- ^ Where to put the dist directory
+  -> [PackageSpecifier UnresolvedSourcePackage]
+     -- ^ The packages to be included in the project
+  -> CurrentCommand
+  -> IO ProjectBaseContext
+establishDummyProjectBaseContext verbosity cliConfig distDirLayout localPackages currentCommand = do
+    cabalDir <- getCabalDir
+
+    globalConfig <- runRebuild ""
+                  $ readGlobalConfig verbosity
+                  $ projectConfigConfigFile
+                  $ projectConfigShared cliConfig
+    let projectConfig = globalConfig <> cliConfig
+
+    let ProjectConfigBuildOnly {
+          projectConfigLogsDir
+        } = projectConfigBuildOnly projectConfig
+
+        ProjectConfigShared {
+          projectConfigStoreDir
+        } = projectConfigShared projectConfig
+
+        mlogsDir = flagToMaybe projectConfigLogsDir
+        mstoreDir = flagToMaybe projectConfigStoreDir
+        cabalDirLayout = mkCabalDirLayout cabalDir mstoreDir mlogsDir
+
+        buildSettings = resolveBuildTimeSettings
+                          verbosity cabalDirLayout
+                          projectConfig
+
+    return ProjectBaseContext {
+      distDirLayout,
+      cabalDirLayout,
+      projectConfig,
+      localPackages,
+      buildSettings,
+      currentCommand
+    }
+
+establishDummyDistDirLayout :: Verbosity -> ProjectConfig -> FilePath -> IO DistDirLayout
+establishDummyDistDirLayout verbosity cliConfig tmpDir = do
+    let distDirLayout = defaultDistDirLayout projectRoot mdistDirectory
+
+    -- Create the dist directories
+    createDirectoryIfMissingVerbose verbosity True $ distDirectory distDirLayout
+    createDirectoryIfMissingVerbose verbosity True $ distProjectCacheDirectory distDirLayout
+
+    return distDirLayout
+  where
+    mdistDirectory = flagToMaybe
+                   $ projectConfigDistDir
+                   $ projectConfigShared cliConfig
+    projectRoot = ProjectRootImplicit tmpDir

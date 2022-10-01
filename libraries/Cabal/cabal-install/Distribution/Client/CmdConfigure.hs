@@ -1,3 +1,4 @@
+{-# LANGUAGE RecordWildCards #-}
 -- | cabal-install CLI command: configure
 --
 module Distribution.Client.CmdConfigure (
@@ -5,30 +6,36 @@ module Distribution.Client.CmdConfigure (
     configureAction,
   ) where
 
+import Distribution.Client.Compat.Prelude
+import Prelude ()
+
 import System.Directory
-import Control.Monad
+import System.FilePath
 import qualified Data.Map as Map
 
 import Distribution.Client.ProjectOrchestration
 import Distribution.Client.ProjectConfig
          ( writeProjectLocalExtraConfig )
 
+import Distribution.Client.NixStyleOptions
+         ( NixStyleFlags (..), nixStyleOptions, defaultNixStyleFlags )
 import Distribution.Client.Setup
-         ( GlobalFlags, ConfigFlags(..), ConfigExFlags, InstallFlags )
-import Distribution.Simple.Setup
-         ( HaddockFlags, TestFlags, fromFlagOrDefault )
+         ( GlobalFlags, ConfigFlags(..) )
+import Distribution.Simple.Flag
+         ( fromFlagOrDefault )
 import Distribution.Verbosity
          ( normal )
 
 import Distribution.Simple.Command
-         ( CommandUI(..), usageAlternatives )
+         ( CommandUI(..), usageAlternatives, optionName )
 import Distribution.Simple.Utils
          ( wrapText, notice )
-import qualified Distribution.Client.Setup as Client
 
-configureCommand :: CommandUI (ConfigFlags, ConfigExFlags
-                              ,InstallFlags, HaddockFlags, TestFlags)
-configureCommand = Client.installCommand {
+import Distribution.Client.DistDirLayout
+         ( DistDirLayout(..) )
+
+configureCommand :: CommandUI (NixStyleFlags ())
+configureCommand = CommandUI {
   commandName         = "v2-configure",
   commandSynopsis     = "Add extra project configuration",
   commandUsage        = usageAlternatives "v2-configure" [ "[FLAGS]" ],
@@ -63,10 +70,12 @@ configureCommand = Client.installCommand {
      ++ "    program and check the resulting configuration works.\n"
      ++ "  " ++ pname ++ " v2-configure\n"
      ++ "    Reset the local configuration to empty and check the overall\n"
-     ++ "    project configuration works.\n\n"
+     ++ "    project configuration works.\n"
 
-     ++ cmdCommonHelpTextNewBuildBeta
-   }
+  , commandDefaultFlags = defaultNixStyleFlags ()
+  , commandOptions      = filter (\o -> optionName o /= "ignore-project")
+                        . nixStyleOptions (const [])
+  }
 
 -- | To a first approximation, the @configure@ just runs the first phase of
 -- the @build@ command where we bring the install plan up to date (thus
@@ -78,10 +87,8 @@ configureCommand = Client.installCommand {
 -- For more details on how this works, see the module
 -- "Distribution.Client.ProjectOrchestration"
 --
-configureAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags, TestFlags)
-                -> [String] -> GlobalFlags -> IO ()
-configureAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags)
-                _extraArgs globalFlags = do
+configureAction :: NixStyleFlags () -> [String] -> GlobalFlags -> IO ()
+configureAction flags@NixStyleFlags {..} _extraArgs globalFlags = do
     --TODO: deal with _extraArgs, since flags with wrong syntax end up there
 
     baseCtx <- establishProjectBaseContext verbosity cliConfig OtherCommand
@@ -89,10 +96,26 @@ configureAction (configFlags, configExFlags, installFlags, haddockFlags, testFla
     -- Write out the @cabal.project.local@ so it gets picked up by the
     -- planning phase. If old config exists, then print the contents
     -- before overwriting
-    exists <- doesFileExist "cabal.project.local"
+
+    let localFile = distProjectFile (distDirLayout baseCtx) "local"
+        -- | Chooses cabal.project.local~, or if it already exists
+        -- cabal.project.local~0, cabal.project.local~1 etc.
+        firstFreeBackup = firstFreeBackup' (0 :: Int)
+        firstFreeBackup' i = do
+          let backup = localFile <> "~" <> (if i <= 0 then "" else show (i - 1))
+          exists <- doesFileExist backup
+          if exists
+            then firstFreeBackup' (i + 1)
+            else return backup
+
+    -- If cabal.project.local already exists, back up to cabal.project.local~[n]
+    exists <- doesFileExist localFile
     when exists $ do
-        notice verbosity "'cabal.project.local' file already exists. Now overwriting it."
-        copyFile "cabal.project.local" "cabal.project.local~"
+        backup <- firstFreeBackup
+        notice verbosity $
+          quote (takeFileName localFile) <> " already exists, backing it up to "
+          <> quote (takeFileName backup) <> "."
+        copyFile localFile backup
     writeProjectLocalExtraConfig (distDirLayout baseCtx)
                                  cliConfig
 
@@ -119,9 +142,7 @@ configureAction (configFlags, configExFlags, installFlags, haddockFlags, testFla
     printPlan verbosity baseCtx' buildCtx
   where
     verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
-    cliConfig = commandLineFlagsToProjectConfig
-                  globalFlags configFlags configExFlags
-                  installFlags
+    cliConfig = commandLineFlagsToProjectConfig globalFlags flags
                   mempty -- ClientInstallFlags, not needed here
-                  haddockFlags testFlags
+    quote s = "'" <> s <> "'"
 

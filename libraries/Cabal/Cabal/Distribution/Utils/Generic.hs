@@ -64,13 +64,23 @@ module Distribution.Utils.Generic (
         ordNub,
         ordNubBy,
         ordNubRight,
+        safeHead,
         safeTail,
+        safeLast,
+        safeInit,
         unintersperse,
         wrapText,
         wrapLine,
         unfoldrM,
         spanMaybe,
         breakMaybe,
+        unsnoc,
+        unsnocNE,
+
+        -- * Triples
+        fstOf3,
+        sndOf3,
+        trdOf3,
 
         -- * FilePath stuff
         isAbsoluteOnAnyPlatform,
@@ -85,12 +95,9 @@ import Distribution.Utils.String
 import Data.Bits ((.&.), (.|.), shiftL)
 import Data.List
     ( isInfixOf )
-import Data.Ord
-    ( comparing )
-import qualified Data.ByteString.Lazy as BS
 import qualified Data.Set as Set
-
 import qualified Data.ByteString as SBS
+import qualified Data.ByteString.Lazy as LBS
 
 import System.Directory
     ( removeFile, renameFile )
@@ -138,7 +145,7 @@ wrapLine width = wrap 0 []
 -- The file is read lazily but if it is not fully consumed by the action then
 -- the remaining input is truncated and the file is closed.
 --
-withFileContents :: FilePath -> (String -> NoCallStackIO a) -> NoCallStackIO a
+withFileContents :: FilePath -> (String -> IO a) -> IO a
 withFileContents name action =
   withFile name ReadMode
            (\hnd -> hGetContents hnd >>= action)
@@ -151,14 +158,14 @@ withFileContents name action =
 -- On windows it is not possible to delete a file that is open by a process.
 -- This case will give an IO exception but the atomic property is not affected.
 --
-writeFileAtomic :: FilePath -> BS.ByteString -> NoCallStackIO ()
+writeFileAtomic :: FilePath -> LBS.ByteString -> IO ()
 writeFileAtomic targetPath content = do
   let (targetDir, targetFile) = splitFileName targetPath
   Exception.bracketOnError
     (openBinaryTempFileWithDefaultPermissions targetDir $ targetFile <.> "tmp")
     (\(tmpPath, handle) -> hClose handle >> removeFile tmpPath)
     (\(tmpPath, handle) -> do
-        BS.hPut handle content
+        LBS.hPut handle content
         hClose handle
         renameFile tmpPath targetPath)
 
@@ -176,10 +183,10 @@ fromUTF8BS = decodeStringUtf8 . SBS.unpack
 
 -- | Variant of 'fromUTF8BS' for lazy 'BS.ByteString's
 --
-fromUTF8LBS :: BS.ByteString -> String
-fromUTF8LBS = decodeStringUtf8 . BS.unpack
+fromUTF8LBS :: LBS.ByteString -> String
+fromUTF8LBS = decodeStringUtf8 . LBS.unpack
 
--- | Encode 'String' to to UTF8-encoded 'SBS.ByteString'
+-- | Encode 'String' to UTF8-encoded 'SBS.ByteString'
 --
 -- Code-points in the @U+D800@-@U+DFFF@ range will be encoded
 -- as the replacement character (i.e. @U+FFFD@).
@@ -189,8 +196,8 @@ toUTF8BS = SBS.pack . encodeStringUtf8
 
 -- | Variant of 'toUTF8BS' for lazy 'BS.ByteString's
 --
-toUTF8LBS :: String -> BS.ByteString
-toUTF8LBS = BS.pack . encodeStringUtf8
+toUTF8LBS :: String -> LBS.ByteString
+toUTF8LBS = LBS.pack . encodeStringUtf8
 
 -- | Check that strict 'ByteString' is valid UTF8. Returns 'Just offset' if it's not.
 validateUTF8 :: SBS.ByteString -> Maybe Int
@@ -242,8 +249,8 @@ ignoreBOM string            = string
 --
 -- Reads lazily using ordinary 'readFile'.
 --
-readUTF8File :: FilePath -> NoCallStackIO String
-readUTF8File f = (ignoreBOM . fromUTF8LBS) <$> BS.readFile f
+readUTF8File :: FilePath -> IO String
+readUTF8File f = (ignoreBOM . fromUTF8LBS) <$> LBS.readFile f
 
 -- | Reads a UTF8 encoded text file as a Unicode String
 --
@@ -252,14 +259,14 @@ readUTF8File f = (ignoreBOM . fromUTF8LBS) <$> BS.readFile f
 withUTF8FileContents :: FilePath -> (String -> IO a) -> IO a
 withUTF8FileContents name action =
   withBinaryFile name ReadMode
-    (\hnd -> BS.hGetContents hnd >>= action . ignoreBOM . fromUTF8LBS)
+    (\hnd -> LBS.hGetContents hnd >>= action . ignoreBOM . fromUTF8LBS)
 
 -- | Writes a Unicode String as a UTF8 encoded text file.
 --
 -- Uses 'writeFileAtomic', so provides the same guarantees.
 --
-writeUTF8File :: FilePath -> String -> NoCallStackIO ()
-writeUTF8File path = writeFileAtomic path . BS.pack . encodeStringUtf8
+writeUTF8File :: FilePath -> String -> IO ()
+writeUTF8File path = writeFileAtomic path . toUTF8LBS
 
 -- | Fix different systems silly line ending conventions
 normaliseLineEndings :: String -> String
@@ -280,11 +287,11 @@ normaliseLineEndings (  c :s)      =   c  : normaliseLineEndings s
 --
 -- Example:
 --
--- >>> tail $ Data.List.dropWhileEnd (<3) [undefined, 5, 4, 3, 2, 1]
+-- >>> safeTail $ Data.List.dropWhileEnd (<3) [undefined, 5, 4, 3, 2, 1]
 -- *** Exception: Prelude.undefined
 -- ...
 --
--- >>> tail $ dropWhileEndLE (<3) [undefined, 5, 4, 3, 2, 1]
+-- >>> safeTail $ dropWhileEndLE (<3) [undefined, 5, 4, 3, 2, 1]
 -- [5,4,3]
 --
 -- >>> take 3 $ Data.List.dropWhileEnd (<3) [5, 4, 3, 2, 1, undefined]
@@ -363,10 +370,34 @@ listUnionRight a b = ordNubRight (filter (`Set.notMember` bSet) a) ++ b
   where
     bSet = Set.fromList b
 
+-- | A total variant of 'head'.
+--
+-- @since 3.2.0.0
+safeHead :: [a] -> Maybe a
+safeHead []    = Nothing
+safeHead (x:_) = Just x
+
 -- | A total variant of 'tail'.
+--
+-- @since 3.2.0.0
 safeTail :: [a] -> [a]
 safeTail []     = []
 safeTail (_:xs) = xs
+
+-- | A total variant of 'last'.
+--
+-- @since 3.2.0.0
+safeLast :: [a] -> Maybe a
+safeLast []     = Nothing
+safeLast (x:xs) = Just (foldl (\_ a -> a) x xs)
+
+-- | A total variant of 'init'.
+--
+-- @since 3.2.0.0
+safeInit :: [a] -> [a]
+safeInit []     = []
+safeInit [_]    = []
+safeInit (x:xs) = x : safeInit xs
 
 equating :: Eq a => (b -> a) -> b -> b -> Bool
 equating p x y = p x == p y
@@ -454,6 +485,55 @@ unfoldrM f = go where
             Nothing      -> return []
             Just (a, b') -> liftM (a :) (go b')
 
+-- | The opposite of 'snoc', which is the reverse of 'cons'
+--
+-- Example:
+--
+-- >>> unsnoc [1, 2, 3]
+-- Just ([1,2],3)
+--
+-- >>> unsnoc []
+-- Nothing
+--
+-- @since 3.2.0.0
+--
+unsnoc :: [a] -> Maybe ([a], a)
+unsnoc []     = Nothing
+unsnoc (x:xs) = Just (unsnocNE (x :| xs))
+
+-- | Like 'unsnoc', but for 'NonEmpty' so without the 'Maybe'
+--
+-- Example:
+--
+-- >>> unsnocNE (1 :| [2, 3])
+-- ([1,2],3)
+--
+-- >>> unsnocNE (1 :| [])
+-- ([],1)
+--
+-- @since 3.2.0.0
+--
+unsnocNE :: NonEmpty a -> ([a], a)
+unsnocNE (x:|xs) = go x xs where
+    go y []     = ([], y)
+    go y (z:zs) = let ~(ws, w) = go z zs in (y : ws, w)
+
+-------------------------------------------------------------------------------
+-- Triples
+-------------------------------------------------------------------------------
+
+-- | @since 3.4.0.0
+fstOf3 :: (a,b,c) -> a
+fstOf3 (a,_,_) = a
+
+-- | @since 3.4.0.0
+sndOf3 :: (a,b,c) -> b
+sndOf3 (_,b,_) = b
+
+-- | @since 3.4.0.0
+trdOf3 :: (a,b,c) -> c
+trdOf3 (_,_,c) = c
+
 -- ------------------------------------------------------------
 -- * FilePath stuff
 -- ------------------------------------------------------------
@@ -480,6 +560,7 @@ unfoldrM f = go where
 isAbsoluteOnAnyPlatform :: FilePath -> Bool
 -- C:\\directory
 isAbsoluteOnAnyPlatform (drive:':':'\\':_) = isAlpha drive
+isAbsoluteOnAnyPlatform (drive:':':'/':_)  = isAlpha drive
 -- UNC
 isAbsoluteOnAnyPlatform ('\\':'\\':_) = True
 -- Posix root

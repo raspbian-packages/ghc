@@ -26,8 +26,8 @@ Divergence from Haskell 98 and Haskell 2010
 
 By default, GHC mainly aims to behave (mostly) like a Haskell 2010
 compiler, although you can tell it to try to behave like a particular
-version of the language with the :ghc-flag:`-XHaskell98` and
-:ghc-flag:`-XHaskell2010` flags. The known deviations from the standards are
+version of the language with the :extension:`Haskell98` and
+:extension:`Haskell2010` flags. The known deviations from the standards are
 described below. Unless otherwise stated, the deviation applies in Haskell 98,
 Haskell 2010 and the default modes.
 
@@ -45,9 +45,55 @@ Lexical syntax
 -  ``forall`` is always a reserved keyword at the type level, contrary
    to the Haskell Report, which allows type variables to be named ``forall``.
    Note that this does not imply that GHC always enables the
-   :ghc-flag:`-XExplicitForAll` extension. Even without this extension enabled,
+   :extension:`ExplicitForAll` extension. Even without this extension enabled,
    reserving ``forall`` as a keyword has significance. For instance, GHC will
    not parse the type signature ``foo :: forall x``.
+
+-  The ``(!)`` operator, when written in prefix form (preceded by whitespace
+   and not followed by whitespace, as in ``f !x = ...``), is interpreted as a
+   bang pattern, contrary to the Haskell Report, which prescribes to treat ``!``
+   as an operator regardless of surrounding whitespace. Note that this does not
+   imply that GHC always enables :extension:`BangPatterns`. Without the
+   extension, GHC will issue a parse error on ``f !x``, asking to enable the
+   extension.
+
+-  Irrefutable patterns must be written in prefix form::
+
+     f ~a ~b = ...    -- accepted by both GHC and the Haskell Report
+     f ~ a ~ b = ...  -- accepted by the Haskell Report but not GHC
+
+   When written in non-prefix form, ``(~)`` is treated by GHC as a regular
+   infix operator.
+
+   See `GHC Proposal #229 <https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0229-whitespace-bang-patterns.rst>`__
+   for the precise rules.
+
+-  Strictness annotations in data declarations must be written in prefix form::
+
+     data T = MkT !Int   -- accepted by both GHC and the Haskell Report
+     data T = MkT ! Int  -- accepted by the Haskell Report but not GHC
+
+   See `GHC Proposal #229 <https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0229-whitespace-bang-patterns.rst>`__
+   for the precise rules.
+
+-  As-patterns must not be surrounded by whitespace on either side::
+
+     f p@(x, y, z) = ...    -- accepted by both GHC and the Haskell Report
+
+     -- accepted by the Haskell Report but not GHC:
+     f p @ (x, y, z) = ...
+     f p @(x, y, z) = ...
+     f p@ (x, y, z) = ...
+
+   When surrounded by whitespace on both sides, ``(@)`` is treated by GHC as a
+   regular infix operator.
+
+   When preceded but not followed by whitespace, ``(@)`` is treated as a
+   visible type application.
+
+   See `GHC Proposal #229 <https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0229-whitespace-bang-patterns.rst>`__
+   for the precise rules.
+
 
 .. _infelicities-syntax:
 
@@ -68,8 +114,15 @@ Context-free syntax
                  ps <- mapM process args
                  mapM print ps
 
-   This behaviour is controlled by the ``NondecreasingIndentation``
+   This behaviour is controlled by the :extension:`NondecreasingIndentation`
    extension.
+
+.. extension:: NondecreasingIndentation
+    :shortdesc: Allow nested contexts to be at the same indentation level as
+      its enclosing context.
+
+    Allow nested contexts to be at the same indentation level as
+    its enclosing context.
 
 -  GHC doesn't do the fixity resolution in expressions during parsing as
    required by Haskell 98 (but not by Haskell 2010). For example,
@@ -277,7 +330,7 @@ Numbers, basic types, and built-in classes
 ``Read`` class methods
     The ``Read`` class has two extra methods, ``readPrec`` and
     ``readListPrec``, that are not found in the Haskell 2010 since they rely
-    on the ``ReadPrec`` data type, which requires the :ghc-flag:`-XRankNTypes`
+    on the ``ReadPrec`` data type, which requires the :extension:`RankNTypes`
     extension. GHC also derives ``Read`` instances by implementing ``readPrec``
     instead of ``readsPrec``, and relies on a default implementation of
     ``readsPrec`` that is defined in terms of ``readPrec``. GHC adds these two
@@ -311,14 +364,6 @@ Multiply-defined array elements not checked
 
 In ``Prelude`` support
 ^^^^^^^^^^^^^^^^^^^^^^
-
-Arbitrary-sized tuples
-    Tuples are currently limited to size 100. However, standard
-    instances for tuples (``Eq``, ``Ord``, ``Bounded``, ``Ix``, ``Read``,
-    and ``Show``) are available *only* up to 16-tuples.
-
-    This limitation is easily subvertible, so please ask if you get
-    stuck on it.
 
 ``splitAt`` semantics
     ``Data.List.splitAt`` is more strict than specified in the Report.
@@ -443,7 +488,7 @@ undefined or implementation specific in Haskell 98.
     architecture; in other words it holds 32 bits on a 32-bit machine,
     and 64-bits on a 64-bit machine.
 
-    Arithmetic on ``Int`` is unchecked for overflowoverflow\ ``Int``, so
+    Arithmetic on ``Int`` is unchecked for overflow\ ``Int``, so
     all operations on ``Int`` happen modulo 2\ :sup:`⟨n⟩` where ⟨n⟩ is
     the size in bits of the ``Int`` type.
 
@@ -481,13 +526,20 @@ Unchecked floating-point arithmetic
     .. index::
         single: floating-point exceptions.
 
+Large tuple support
+    The Haskell Report only requires implementations to provide tuple
+    types and their accompanying standard instances up to size 15. GHC
+    limits the size of tuple types to 62 and provides instances of
+    ``Eq``, ``Ord``, ``Bounded``, ``Read``, ``Show``, and ``Ix`` for
+    tuples up to size 15.
+
 .. _bugs:
 
 Known bugs or infelicities
 --------------------------
 
 The bug tracker lists bugs that have been reported in GHC but not yet
-fixed: see the `GHC Trac <http://ghc.haskell.org/trac/ghc/>`__. In
+fixed: see the `GHC issue tracker <https://gitlab.haskell.org/ghc/ghc/issues>`__. In
 addition to those, GHC also has the following known bugs or
 infelicities. These bugs are more permanent; it is unlikely that any of
 them will be fixed in the short term.
@@ -553,7 +605,7 @@ Bugs in GHC
          To increase the limit, use -fsimpl-tick-factor=N (default 100)
 
    with the panic being reported no matter how high a
-   :ghc-flag:`-fsimpl-tick-factor` you supply.
+   :ghc-flag:`-fsimpl-tick-factor <-fsimpl-tick-factor=⟨n⟩>` you supply.
 
    We have never found another class of programs, other than this
    contrived one, that makes GHC diverge, and fixing the problem would
@@ -585,7 +637,7 @@ Bugs in GHC
    libraries that come with GHC are probably built without this option,
    unless you built GHC yourself.
 
--  The :ghc-flag:`state hack <-fstate-hack>` optimization can result in
+-  The :ghc-flag:`state hack <-fno-state-hack>` optimization can result in
    non-obvious changes in evaluation ordering which may hide exceptions, even
    with :ghc-flag:`-fpedantic-bottoms` (see, e.g., :ghc-ticket:`7411`). For
    instance, ::

@@ -9,9 +9,12 @@ module Distribution.Solver.Modular.Solver
     , PruneAfterFirstSuccess(..)
     ) where
 
-import Data.Map as M
-import Data.List as L
-import Data.Set as S
+import Distribution.Solver.Compat.Prelude
+import Prelude ()
+
+import qualified Data.Map as M
+import qualified Data.List as L
+import qualified Data.Set as S
 import Distribution.Verbosity
 
 import Distribution.Compiler (CompilerInfo)
@@ -57,6 +60,7 @@ import Debug.Trace.Tree.Assoc (Assoc(..))
 data SolverConfig = SolverConfig {
   reorderGoals           :: ReorderGoals,
   countConflicts         :: CountConflicts,
+  fineGrainedConflicts   :: FineGrainedConflicts,
   minimizeConflictSet    :: MinimizeConflictSet,
   independentGoals       :: IndependentGoals,
   avoidReinstalls        :: AvoidReinstalls,
@@ -90,8 +94,8 @@ solve :: SolverConfig                         -- ^ solver parameters
       -> Index                                -- ^ all available packages as an index
       -> PkgConfigDb                          -- ^ available pkg-config pkgs
       -> (PN -> PackagePreferences)           -- ^ preferences
-      -> Map PN [LabeledPackageConstraint]    -- ^ global constraints
-      -> Set PN                               -- ^ global goals
+      -> M.Map PN [LabeledPackageConstraint]  -- ^ global constraints
+      -> S.Set PN                             -- ^ global goals
       -> RetryLog Message SolverFailure (Assignment, RevDepMap)
 solve sc cinfo idx pkgConfigDB userPrefs userConstraints userGoals =
   explorePhase     $
@@ -104,7 +108,9 @@ solve sc cinfo idx pkgConfigDB userPrefs userConstraints userGoals =
   where
     explorePhase     = backjumpAndExplore (maxBackjumps sc)
                                           (enableBackjumping sc)
+                                          (fineGrainedConflicts sc)
                                           (countConflicts sc)
+                                          idx
     detectCycles     = traceTree "cycles.json" id . detectCyclesPhase
     heuristicsPhase  =
       let heuristicsTree = traceTree "heuristics.json" id

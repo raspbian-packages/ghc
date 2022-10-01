@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE CPP          #-}
 -----------------------------------------------------------------------------
 -- | Separate module for HTTP actions, using a proxy server if one exists.
 -----------------------------------------------------------------------------
@@ -15,7 +16,8 @@ module Distribution.Client.HttpUtils (
   ) where
 
 import Prelude ()
-import Distribution.Client.Compat.Prelude
+import Distribution.Client.Compat.Prelude hiding (Proxy (..))
+import Distribution.Utils.Generic
 
 import Network.HTTP
          ( Request (..), Response (..), RequestMethod (..)
@@ -27,23 +29,13 @@ import Network.Browser
          ( browse, setOutHandler, setErrHandler, setProxy
          , setAuthorityGen, request, setAllowBasicAuth, setUserAgent )
 import qualified Control.Exception as Exception
-import Control.Exception
-         ( evaluate )
-import Control.DeepSeq
-         ( force )
-import Control.Monad
-         ( guard )
-import qualified Data.ByteString.Lazy.Char8 as BS
-import qualified Paths_cabal_install (version)
-import Distribution.Verbosity (Verbosity)
-import Distribution.Pretty (prettyShow)
 import Distribution.Simple.Utils
-         ( die', info, warn, debug, notice, writeFileAtomic
-         , copyFileVerbose,  withTempFile )
+         ( die', info, warn, debug, notice
+         , copyFileVerbose,  withTempFile, IOData (..) )
 import Distribution.Client.Utils
-         ( withTempFileName )
+         ( withTempFileName, cabalInstallVersion )
 import Distribution.Client.Types
-         ( RemoteRepo(..) )
+         ( unRepoName, RemoteRepo(..) )
 import Distribution.System
          ( buildOS, buildArch )
 import qualified System.FilePath.Posix as FilePath.Posix
@@ -70,9 +62,14 @@ import Distribution.Simple.Program.Run
          ( getProgramInvocationOutputAndErrors )
 import Numeric (showHex)
 import System.Random (randomRIO)
-import System.Exit (ExitCode(..))
-import Data.Version (showVersion)
 
+import qualified Crypto.Hash.SHA256         as SHA256
+import qualified Data.ByteString.Base16     as Base16
+import qualified Distribution.Compat.CharParsing as P
+import qualified Data.ByteString            as BS
+import qualified Data.ByteString.Char8      as BS8
+import qualified Data.ByteString.Lazy       as LBS
+import qualified Data.ByteString.Lazy.Char8 as LBS8
 
 ------------------------------------------------------------------------------
 -- Downloading a URI, given an HttpTransport
@@ -81,6 +78,12 @@ import Data.Version (showVersion)
 data DownloadResult = FileAlreadyInCache
                     | FileDownloaded FilePath
   deriving (Eq)
+
+data DownloadCheck
+    = Downloaded                           -- ^ already downloaded and sha256 matches
+    | CheckETag String                     -- ^ already downloaded and we have etag
+    | NeedsDownload (Maybe BS.ByteString)  -- ^ needs download with optional hash check
+  deriving Eq
 
 downloadURI :: HttpTransport
             -> Verbosity
@@ -95,13 +98,34 @@ downloadURI _transport verbosity uri path | uriScheme uri == "file:" = do
 
 downloadURI transport verbosity uri path = do
 
-    let etagPath = path <.> "etag"
-    targetExists   <- doesFileExist path
-    etagPathExists <- doesFileExist etagPath
-    -- In rare cases the target file doesn't exist, but the etag does.
-    etag <- if targetExists && etagPathExists
-              then Just <$> readFile etagPath
-              else return Nothing
+    targetExists <- doesFileExist path
+
+    downloadCheck <-
+      -- if we have uriFrag, then we expect there to be #sha256=...
+      if not (null uriFrag)
+      then case sha256parsed of
+        -- we know the hash, and target exists
+        Right expected | targetExists -> do
+          contents <- LBS.readFile path
+          let actual = SHA256.hashlazy contents
+          if expected == actual
+          then return Downloaded
+          else return (NeedsDownload (Just expected))
+
+        -- we known the hash, target doesn't exist
+        Right expected -> return (NeedsDownload (Just expected))
+
+        -- we failed to parse uriFragment
+        Left err -> die' verbosity $
+          "Cannot parse URI fragment " ++ uriFrag ++ " " ++ err
+
+      -- if there are no uri fragment, use ETag
+      else do
+        etagPathExists <- doesFileExist etagPath
+        -- In rare cases the target file doesn't exist, but the etag does.
+        if targetExists && etagPathExists
+        then return (CheckETag etagPath)
+        else return (NeedsDownload Nothing)
 
     -- Only use the external http transports if we actually have to
     -- (or have been told to do so)
@@ -113,12 +137,29 @@ downloadURI transport verbosity uri path = do
           | otherwise
           = transport
 
-    withTempFileName (takeDirectory path) (takeFileName path) $ \tmpFile -> do
+    case downloadCheck of
+      Downloaded         -> return FileAlreadyInCache
+      CheckETag etag     -> makeDownload transport' Nothing (Just etag)
+      NeedsDownload hash -> makeDownload transport' hash Nothing
+
+  where
+    makeDownload transport' sha256 etag = withTempFileName (takeDirectory path) (takeFileName path) $ \tmpFile -> do
       result <- getHttp transport' verbosity uri etag tmpFile []
 
       -- Only write the etag if we get a 200 response code.
       -- A 304 still sends us an etag header.
       case result of
+        -- if we have hash, we don't care about etag.
+        (200, _) | Just expected <- sha256 -> do
+          contents <- LBS.readFile tmpFile
+          let actual = SHA256.hashlazy contents
+          unless (actual == expected) $
+            die' verbosity $ unwords
+              [ "Failed to download", show uri
+              , ": SHA256 don't match; expected:", BS8.unpack (Base16.encode expected)
+              , "actual:", BS8.unpack (Base16.encode actual)
+              ]
+
         (200, Just newEtag) -> writeFile etagPath newEtag
         _ -> return ()
 
@@ -130,8 +171,24 @@ downloadURI transport verbosity uri path = do
         304 -> do
             notice verbosity "Skipping download: local and remote files match."
             return FileAlreadyInCache
-        errCode ->  die' verbosity $ "Failed to download " ++ show uri
+        errCode ->  die' verbosity $ "failed to download " ++ show uri
                        ++ " : HTTP code " ++ show errCode
+
+    etagPath = path <.> "etag"
+    uriFrag = uriFragment uri
+
+    sha256parsed :: Either String BS.ByteString
+    sha256parsed = explicitEitherParsec fragmentParser uriFrag
+
+    fragmentParser = do
+        _ <- P.string "#sha256="
+        str <- some P.hexDigit
+        let bs = Base16.decode (BS8.pack str)
+#if MIN_VERSION_base16_bytestring(1,0,0)
+        either fail return bs
+#else
+        return (fst bs)
+#endif
 
 ------------------------------------------------------------------------------
 -- Utilities for repo url management
@@ -141,8 +198,8 @@ remoteRepoCheckHttps :: Verbosity -> HttpTransport -> RemoteRepo -> IO ()
 remoteRepoCheckHttps verbosity transport repo
   | uriScheme (remoteRepoURI repo) == "https:"
   , not (transportSupportsHttps transport)
-              = die' verbosity $ "The remote repository '" ++ remoteRepoName repo
-                   ++ "' specifies a URL that " ++ requiresHttpsErrorMessage
+  = die' verbosity $ "The remote repository '" ++ unRepoName (remoteRepoName repo)
+    ++ "' specifies a URL that " ++ requiresHttpsErrorMessage
   | otherwise = return ()
 
 transportCheckHttps :: Verbosity -> HttpTransport -> URI -> IO ()
@@ -281,7 +338,7 @@ configureTransport verbosity extraPath (Just name) =
           Just prog -> snd <$> requireProgram verbosity prog baseProgDb
                        --      ^^ if it fails, it'll fail here
 
-        let Just transport = mkTrans progdb
+        let transport = fromMaybe (error "configureTransport: failed to make transport") $ mkTrans progdb
         return transport { transportManuallySelected = True }
 
       Nothing -> die' verbosity $ "Unknown HTTP transport specified: " ++ name
@@ -305,8 +362,8 @@ configureTransport verbosity extraPath Nothing = do
           [ (name, transport)
           | (name, _, _, mkTrans) <- supportedTransports
           , transport <- maybeToList (mkTrans progdb) ]
-        -- there's always one because the plain one is last and never fails
-    let (name, transport) = head availableTransports
+    let (name, transport) =
+         fromMaybe ("plain-http", plainHttpTransport) (safeHead availableTransports)
     debug verbosity $ "Selected http transport implementation: " ++ name
 
     return transport { transportManuallySelected = False }
@@ -350,7 +407,7 @@ curlTransport prog =
     addAuthConfig auth progInvocation = progInvocation
       { progInvokeInput = do
           (uname, passwd) <- auth
-          return $ unlines
+          return $ IODataText $ unlines
             [ "--digest"
             , "--user " ++ uname ++ ":" ++ passwd
             ]
@@ -462,7 +519,7 @@ wgetTransport prog =
         \responseFile responseHandle -> do
           hClose responseHandle
           (body, boundary) <- generateMultipartBody path
-          BS.hPut tmpHandle body
+          LBS.hPut tmpHandle body
           hClose tmpHandle
           let args = [ "--post-file=" ++ tmpFile
                      , "--user-agent=" ++ userAgent
@@ -507,7 +564,7 @@ wgetTransport prog =
         -- and sensitive data should not be passed via command line arguments.
         let
           invocation = (programInvocation prog ("--input-file=-" : args))
-            { progInvokeInput = Just (uriToString id uri "")
+            { progInvokeInput = Just $ IODataText $ uriToString id uri ""
             }
 
         -- wget returns its output on stderr rather than stdout
@@ -585,7 +642,7 @@ powershellTransport prog =
       withTempFile (takeDirectory path)
                    (takeFileName path) $ \tmpFile tmpHandle -> do
         (body, boundary) <- generateMultipartBody path
-        BS.hPut tmpHandle body
+        LBS.hPut tmpHandle body
         hClose tmpHandle
         fullPath <- canonicalizePath tmpFile
 
@@ -618,7 +675,7 @@ powershellTransport prog =
             ]
       debug verbosity script
       getProgramInvocationOutput verbosity (programInvocation prog args)
-        { progInvokeInput = Just (script ++ "\nExit(0);")
+        { progInvokeInput = Just $ IODataText $ script ++ "\nExit(0);"
         }
 
     escape = show
@@ -644,9 +701,11 @@ powershellTransport prog =
               HdrIfModifiedSince  -> "IfModifiedSince = "  ++ escape value
               HdrReferer          -> "Referer = "          ++ escape value
               HdrTransferEncoding -> "TransferEncoding = " ++ escape value
-              HdrRange            -> let (start, _:end) =
+              HdrRange            -> let (start, end) =
                                           if "bytes=" `isPrefixOf` value
-                                             then break (== '-') value'
+                                             then case break (== '-') value' of
+                                                 (start', '-':end') -> (start', end')
+                                                 _                  -> error $ "Could not decode range: " ++ value
                                              else error $ "Could not decode range: " ++ value
                                          value' = drop 6 value
                                      in "AddRange(\"bytes\", " ++ escape start ++ ", " ++ escape end ++ ");"
@@ -733,7 +792,7 @@ plainHttpTransport =
                   rqHeaders = [ Header HdrIfNoneMatch t
                               | t <- maybeToList etag ]
                            ++ reqHeaders,
-                  rqBody    = BS.empty
+                  rqBody    = LBS.empty
                 }
       (_, resp) <- cabalBrowse verbosity Nothing (request req)
       let code  = convertRspCode (rspCode resp)
@@ -749,7 +808,7 @@ plainHttpTransport =
       (body, boundary) <- generateMultipartBody path
       let headers = [ Header HdrContentType
                              ("multipart/form-data; boundary="++boundary)
-                    , Header HdrContentLength (show (BS.length body))
+                    , Header HdrContentLength (show (LBS8.length body))
                     , Header HdrAccept ("text/plain")
                     ]
           req = Request {
@@ -762,11 +821,11 @@ plainHttpTransport =
       return (convertRspCode (rspCode resp), rspErrorString resp)
 
     puthttpfile verbosity uri path auth headers = do
-      body <- BS.readFile path
+      body <- LBS8.readFile path
       let req = Request {
                   rqURI     = uri,
                   rqMethod  = PUT,
-                  rqHeaders = Header HdrContentLength (show (BS.length body))
+                  rqHeaders = Header HdrContentLength (show (LBS8.length body))
                             : Header HdrAccept "text/plain"
                             : headers,
                   rqBody    = body
@@ -780,7 +839,7 @@ plainHttpTransport =
       case lookupHeader HdrContentType (rspHeaders resp) of
         Just contenttype
            | takeWhile (/= ';') contenttype == "text/plain"
-          -> BS.unpack (rspBody resp)
+          -> LBS8.unpack (rspBody resp)
         _ -> rspReason resp
 
     cabalBrowse verbosity auth act = do
@@ -807,7 +866,7 @@ plainHttpTransport =
 --
 
 userAgent :: String
-userAgent = concat [ "cabal-install/", showVersion Paths_cabal_install.version
+userAgent = concat [ "cabal-install/", prettyShow cabalInstallVersion
                    , " (", prettyShow buildOS, "; ", prettyShow buildArch, ")"
                    ]
 
@@ -826,17 +885,17 @@ trim = f . f
 -- Multipart stuff partially taken from cgi package.
 --
 
-generateMultipartBody :: FilePath -> IO (BS.ByteString, String)
+generateMultipartBody :: FilePath -> IO (LBS.ByteString, String)
 generateMultipartBody path = do
-    content  <- BS.readFile path
+    content  <- LBS.readFile path
     boundary <- genBoundary
-    let !body = formatBody content (BS.pack boundary)
+    let !body = formatBody content (LBS8.pack boundary)
     return (body, boundary)
   where
     formatBody content boundary =
-        BS.concat $
+        LBS8.concat $
         [ crlf, dd, boundary, crlf ]
-     ++ [ BS.pack (show header) | header <- headers ]
+     ++ [ LBS8.pack (show header) | header <- headers ]
      ++ [ crlf
         , content
         , crlf, dd, boundary, dd, crlf ]
@@ -848,8 +907,8 @@ generateMultipartBody path = do
       , Header HdrContentType "application/x-gzip"
       ]
 
-    crlf = BS.pack "\r\n"
-    dd   = BS.pack "--"
+    crlf = LBS8.pack "\r\n"
+    dd   = LBS8.pack "--"
 
 genBoundary :: IO String
 genBoundary = do

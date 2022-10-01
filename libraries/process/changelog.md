@@ -1,5 +1,31 @@
 # Changelog for [`process` package](http://hackage.haskell.org/package/process)
 
+## 1.6.13.2 *July 2021*
+
+* `posix_spawn`: Don't attempt to `dup2` identical fds [#214](https://github.com/haskell/process/pull/214)
+
+## 1.6.13.1 *July 2021*
+
+* Patches for the previous release
+
+## 1.6.13.0 *July 2021*
+
+* Refactoring of POSIX process logic [#208](https://github.com/haskell/process/pull/208)
+
+## 1.6.12.0 *June 2021*
+
+* Add function `getCurrentPid` to get the currently executing process' ID [#205](https://github.com/haskell/process/pull/205)
+
+## 1.6.11.0 *January 2021*
+
+* Windows: Add support for new I/O manager in GHC 8.12[#177](https://github.com/haskell/process/pull/177)
+* Deprecate use of `createPipeFd` in favor of `createPipe`
+* Fix MVar re-entrant problem on Windows with `terminateProcess` and process jobs. See [#199](https://github.com/haskell/process/pull/199)
+
+## 1.6.10.0 *June 2020*
+
+* Give a usable buffer to `_pipe` on Windows [#182](https://github.com/haskell/process/pull/182)
+
 ## 1.6.9 *May 2020*
 
 * Windows: Fix buffer size of `QueryInformationJobObject` request [#176](https://github.com/haskell/process/pull/176/files)

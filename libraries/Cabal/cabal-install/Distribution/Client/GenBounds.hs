@@ -17,13 +17,12 @@ module Distribution.Client.GenBounds (
 
 import Prelude ()
 import Distribution.Client.Compat.Prelude
+import Distribution.Utils.Generic (safeLast)
 
 import Distribution.Client.Init
          ( incVersion )
 import Distribution.Client.Freeze
          ( getFreezePkgs )
-import Distribution.Client.Sandbox.Types
-         ( SandboxPackageInfo(..) )
 import Distribution.Client.Setup
          ( GlobalFlags(..), FreezeFlags(..), RepoContext )
 import Distribution.Package
@@ -45,10 +44,6 @@ import Distribution.Simple.Utils
          ( tryFindPackageDesc )
 import Distribution.System
          ( Platform )
-import Distribution.Deprecated.Text
-         ( display )
-import Distribution.Verbosity
-         ( Verbosity )
 import Distribution.Version
          ( Version, alterVersion
          , LowerBound(..), UpperBound(..), VersionRange, asVersionIntervals
@@ -59,9 +54,9 @@ import System.Directory
 -- | Does this version range have an upper bound?
 hasUpperBound :: VersionRange -> Bool
 hasUpperBound vr =
-    case asVersionIntervals vr of
-      [] -> False
-      is -> if snd (last is) == NoUpperBound then False else True
+    case safeLast (asVersionIntervals vr) of
+      Nothing -> False
+      Just l  -> if snd l == NoUpperBound then False else True
 
 -- | Given a version, return an API-compatible (according to PVP) version range.
 --
@@ -92,7 +87,7 @@ showBounds padTo p = unwords $
     showInterval (LowerBound _ _, NoUpperBound) =
       error "Error: expected upper bound...this should never happen!"
     showInterval (LowerBound l _, UpperBound u _) =
-      unwords [">=", display l, "&& <", display u]
+      unwords [">=", prettyShow l, "&& <", prettyShow u]
 
 -- | Entry point for the @gen-bounds@ command.
 genBounds
@@ -102,13 +97,10 @@ genBounds
     -> Compiler
     -> Platform
     -> ProgramDb
-    -> Maybe SandboxPackageInfo
     -> GlobalFlags
     -> FreezeFlags
     -> IO ()
-genBounds verbosity packageDBs repoCtxt comp platform progdb mSandboxPkgInfo
-      globalFlags freezeFlags = do
-
+genBounds verbosity packageDBs repoCtxt comp platform progdb globalFlags freezeFlags = do 
     let cinfo = compilerInfo comp
 
     cwd <- getCurrentDirectory
@@ -132,7 +124,7 @@ genBounds verbosity packageDBs repoCtxt comp platform progdb mSandboxPkgInfo
      go needBounds = do
        pkgs  <- getFreezePkgs
                   verbosity packageDBs repoCtxt comp platform progdb
-                  mSandboxPkgInfo globalFlags freezeFlags
+                  globalFlags freezeFlags
 
        putStrLn boundsNeededMsg
 

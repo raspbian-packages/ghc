@@ -1,17 +1,5 @@
 {-
 
-NOTA BENE: Do NOT use ($) anywhere in this module! The type of ($) is
-slightly magical (it can return unlifted types), and it is wired in.
-But, it is also *defined* in this module, with a non-magical type.
-GHC gets terribly confused (and *hangs*) if you try to use ($) in this
-module, because it has different types in different scenarios.
-
-This is not a problem in general, because the type ($), being wired in, is not
-written out to the interface file, so importing files don't get confused.
-The problem is only if ($) is used here. So don't!
-
----------------------------------------------
-
 The overall structure of the GHC Prelude is a bit tricky.
 
   a) We want to avoid "orphan modules", i.e. ones with instance
@@ -116,7 +104,7 @@ module GHC.Base
         module GHC.Magic,
         module GHC.Types,
         module GHC.Prim,        -- Re-export GHC.Prim and [boot] GHC.Err,
-                                -- to avoid lots of people having to
+        module GHC.Prim.Ext,    -- to avoid lots of people having to
         module GHC.Err,         -- import it explicitly
         module GHC.Maybe
   )
@@ -127,13 +115,13 @@ import GHC.Classes
 import GHC.CString
 import GHC.Magic
 import GHC.Prim
+import GHC.Prim.Ext
 import GHC.Err
 import GHC.Maybe
-import {-# SOURCE #-} GHC.IO (failIO,mplusIO)
+import {-# SOURCE #-} GHC.IO (mkUserError, mplusIO)
 
-import GHC.Tuple ()              -- Note [Depend on GHC.Tuple]
-import GHC.Integer ()            -- Note [Depend on GHC.Integer]
-import GHC.Natural ()            -- Note [Depend on GHC.Natural]
+import GHC.Tuple (Solo (..))     -- Note [Depend on GHC.Tuple]
+import GHC.Num.Integer ()        -- Note [Depend on GHC.Num.Integer]
 
 -- for 'class Semigroup'
 import {-# SOURCE #-} GHC.Real (Integral)
@@ -142,6 +130,9 @@ import {-# SOURCE #-} Data.Semigroup.Internal ( stimesDefault
                                               , stimesList
                                               , stimesIdempotentMonoid
                                               )
+
+-- $setup
+-- >>> import GHC.Num
 
 infixr 9  .
 infixr 5  ++
@@ -155,29 +146,32 @@ infixl 4 <*>, <*, *>, <**>
 default ()              -- Double isn't available yet
 
 {-
-Note [Depend on GHC.Integer]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The Integer type is special because TidyPgm uses
-GHC.Integer.Type.mkInteger to construct Integer literal values
-Currently it reads the interface file whether or not the current
-module *has* any Integer literals, so it's important that
-GHC.Integer.Type (in package integer-gmp or integer-simple) is
-compiled before any other module.  (There's a hack in GHC to disable
-this for packages ghc-prim, integer-gmp, integer-simple, which aren't
-allowed to contain any Integer literals.)
+Note [Depend on GHC.Num.Integer]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Likewise we implicitly need Integer when deriving things like Eq
-instances.
+The Integer type is special because GHC.Iface.Tidy uses constructors in
+GHC.Num.Integer to construct Integer literal values. Currently it reads the
+interface file whether or not the current module *has* any Integer literals, so
+it's important that GHC.Num.Integer is compiled before any other module.
+
+(There's a hack in GHC to disable this for packages ghc-prim and ghc-bignum
+which aren't allowed to contain any Integer literals.)
+
+Likewise we implicitly need Integer when deriving things like Eq instances.
 
 The danger is that if the build system doesn't know about the dependency
-on Integer, it'll compile some base module before GHC.Integer.Type,
+on Integer, it'll compile some base module before GHC.Num.Integer,
 resulting in:
-  Failed to load interface for ‘GHC.Integer.Type’
-    There are files missing in the ‘integer-gmp’ package,
+  Failed to load interface for ‘GHC.Num.Integer’
+    There are files missing in the ‘ghc-bignum’ package,
 
-Bottom line: we make GHC.Base depend on GHC.Integer; and everything
+Bottom line: we make GHC.Base depend on GHC.Num.Integer; and everything
 else either depends on GHC.Base, or does not have NoImplicitPrelude
 (and hence depends on Prelude).
+
+Note: this is only a problem with the make-based build system. Hadrian doesn't
+seem to interleave compilation of modules from separate packages and respects
+the dependency between `base` and `ghc-bignum`.
 
 Note [Depend on GHC.Tuple]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -186,9 +180,6 @@ GHC.Tuple, so we use the same rule as for Integer --- see Note [Depend on
 GHC.Integer] --- to explain this to the build system.  We make GHC.Base
 depend on GHC.Tuple, and everything else depends on GHC.Base or Prelude.
 
-Note [Depend on GHC.Natural]
-~~~~~~~~~~~~~~~~~~~~~~~~~~
-Similar to GHC.Integer.
 -}
 
 #if 0
@@ -220,6 +211,9 @@ infixr 6 <>
 -- @since 4.9.0.0
 class Semigroup a where
         -- | An associative operation.
+        --
+        -- >>> [1,2,3] <> [4,5,6]
+        -- [1,2,3,4,5,6]
         (<>) :: a -> a -> a
 
         -- | Reduce a non-empty list with '<>'
@@ -227,6 +221,9 @@ class Semigroup a where
         -- The default definition should be sufficient, but this can be
         -- overridden for efficiency.
         --
+        -- >>> import Data.List.NonEmpty (NonEmpty (..))
+        -- >>> sconcat $ "Hello" :| [" ", "Haskell", "!"]
+        -- "Hello Haskell!"
         sconcat :: NonEmpty a -> a
         sconcat (a :| as) = go a as where
           go b (c:cs) = b <> go c cs
@@ -239,9 +236,12 @@ class Semigroup a where
         -- will do so.
         --
         -- By making this a member of the class, idempotent semigroups
-        -- and monoids can upgrade this to execute in /O(1)/ by
+        -- and monoids can upgrade this to execute in \(\mathcal{O}(1)\) by
         -- picking @stimes = 'Data.Semigroup.stimesIdempotent'@ or @stimes =
         -- 'stimesIdempotentMonoid'@ respectively.
+        --
+        -- >>> stimes 4 [1]
+        -- [1,1,1,1]
         stimes :: Integral b => b -> a -> a
         stimes = stimesDefault
 
@@ -265,12 +265,18 @@ class Semigroup a where
 -- __NOTE__: 'Semigroup' is a superclass of 'Monoid' since /base-4.11.0.0/.
 class Semigroup a => Monoid a where
         -- | Identity of 'mappend'
+        --
+        -- >>> "Hello world" <> mempty
+        -- "Hello world"
         mempty  :: a
 
         -- | An associative operation
         --
         -- __NOTE__: This method is redundant and has the default
         -- implementation @'mappend' = ('<>')@ since /base-4.11.0.0/.
+        -- Should it be implemented manually, since 'mappend' is a synonym for
+        -- ('<>'), it is expected that the two functions are defined the same
+        -- way. In a future GHC release 'mappend' will be removed from 'Monoid'.
         mappend :: a -> a -> a
         mappend = (<>)
         {-# INLINE mappend #-}
@@ -280,8 +286,13 @@ class Semigroup a => Monoid a where
         -- For most types, the default definition for 'mconcat' will be
         -- used, but the function is included in the class definition so
         -- that an optimized version can be provided for specific types.
+        --
+        -- >>> mconcat ["Hello", " ", "Haskell", "!"]
+        -- "Hello Haskell!"
         mconcat :: [a] -> a
         mconcat = foldr mappend mempty
+        {-# INLINE mconcat #-}
+        -- INLINE in the hope of fusion with mconcat's argument (see !4890)
 
 -- | @since 4.9.0.0
 instance Semigroup [a] where
@@ -312,7 +323,7 @@ mechanism to define mconcat and the Applicative and Monad instances for lists.
 We mark them INLINE because the inliner is not generally too keen to inline
 build forms such as the ones these desugar to without our insistence.  Defining
 these using list comprehensions instead of foldr has an additional potential
-benefit, as described in compiler/deSugar/DsListComp.hs: if optimizations
+benefit, as described in compiler/GHC/HsToCore/ListComp.hs: if optimizations
 needed to make foldr/build forms efficient are turned off, we'll get reasonably
 efficient translations anyway.
 -}
@@ -341,6 +352,15 @@ instance Monoid () where
         -- Should it be strict?
         mempty        = ()
         mconcat _     = ()
+
+-- | @since 4.15
+instance Semigroup a => Semigroup (Solo a) where
+  Solo a <> Solo b = Solo (a <> b)
+  stimes n (Solo a) = Solo (stimes n a)
+
+-- | @since 4.15
+instance Monoid a => Monoid (Solo a) where
+  mempty = Solo mempty
 
 -- | @since 4.9.0.0
 instance (Semigroup a, Semigroup b) => Semigroup (a, b) where
@@ -416,6 +436,20 @@ instance Semigroup a => Semigroup (Maybe a) where
 instance Semigroup a => Monoid (Maybe a) where
     mempty = Nothing
 
+-- | @since 4.15
+instance Applicative Solo where
+  pure = Solo
+
+  -- Note: we really want to match strictly here. This lets us write,
+  -- for example,
+  --
+  -- forceSpine :: Foldable f => f a -> ()
+  -- forceSpine xs
+  --   | Solo r <- traverse_ Solo xs
+  --   = r
+  Solo f <*> Solo x = Solo (f x)
+  liftA2 f (Solo x) (Solo y) = Solo (f x y)
+
 -- | For tuples, the 'Monoid' constraint on @a@ determines
 -- how the first values merge.
 -- For example, 'String's concatenate:
@@ -429,9 +463,39 @@ instance Monoid a => Applicative ((,) a) where
     (u, f) <*> (v, x) = (u <> v, f x)
     liftA2 f (u, x) (v, y) = (u <> v, f x y)
 
+-- | @since 4.15
+instance Monad Solo where
+  Solo x >>= f = f x
+
 -- | @since 4.9.0.0
 instance Monoid a => Monad ((,) a) where
     (u, a) >>= k = case k a of (v, b) -> (u <> v, b)
+
+-- | @since 4.14.0.0
+instance Functor ((,,) a b) where
+    fmap f (a, b, c) = (a, b, f c)
+
+-- | @since 4.14.0.0
+instance (Monoid a, Monoid b) => Applicative ((,,) a b) where
+    pure x = (mempty, mempty, x)
+    (a, b, f) <*> (a', b', x) = (a <> a', b <> b', f x)
+
+-- | @since 4.14.0.0
+instance (Monoid a, Monoid b) => Monad ((,,) a b) where
+    (u, v, a) >>= k = case k a of (u', v', b) -> (u <> u', v <> v', b)
+
+-- | @since 4.14.0.0
+instance Functor ((,,,) a b c) where
+    fmap f (a, b, c, d) = (a, b, c, f d)
+
+-- | @since 4.14.0.0
+instance (Monoid a, Monoid b, Monoid c) => Applicative ((,,,) a b c) where
+    pure x = (mempty, mempty, mempty, x)
+    (a, b, c, f) <*> (a', b', c', x) = (a <> a', b <> b', c <> c', f x)
+
+-- | @since 4.14.0.0
+instance (Monoid a, Monoid b, Monoid c) => Monad ((,,,) a b c) where
+    (u, v, w, a) >>= k = case k a of (u', v', w', b) -> (u <> u', v <> v', w <> w', b)
 
 -- | @since 4.10.0.0
 instance Semigroup a => Semigroup (IO a) where
@@ -452,12 +516,61 @@ Note, that the second law follows from the free theorem of the type 'fmap' and
 the first law, so you need only check that the former condition holds.
 -}
 
-class  Functor f  where
+class Functor f where
+    -- | 'fmap' is used to apply a function of type @(a -> b)@ to a value of type @f a@,
+    -- where f is a functor, to produce a value of type @f b@.
+    -- Note that for any type constructor with more than one parameter (e.g., `Either`),
+    -- only the last type parameter can be modified with `fmap` (e.g., `b` in `Either a b`).
+    --
+    -- Some type constructors with two parameters or more have a @'Data.Bifunctor'@ instance that allows
+    -- both the last and the penultimate parameters to be mapped over.
+    -- ==== __Examples__
+    --
+    -- Convert from a @'Data.Maybe.Maybe' Int@ to a @Maybe String@
+    -- using 'Prelude.show':
+    --
+    -- >>> fmap show Nothing
+    -- Nothing
+    -- >>> fmap show (Just 3)
+    -- Just "3"
+    --
+    -- Convert from an @'Data.Either.Either' Int Int@ to an
+    -- @Either Int String@ using 'Prelude.show':
+    --
+    -- >>> fmap show (Left 17)
+    -- Left 17
+    -- >>> fmap show (Right 17)
+    -- Right "17"
+    --
+    -- Double each element of a list:
+    --
+    -- >>> fmap (*2) [1,2,3]
+    -- [2,4,6]
+    --
+    -- Apply 'Prelude.even' to the second element of a pair:
+    --
+    -- >>> fmap even (2,2)
+    -- (2,True)
+    --
+    -- It may seem surprising that the function is only applied to the last element of the tuple
+    -- compared to the list example above which applies it to every element in the list.
+    -- To understand, remember that tuples are type constructors with multiple type parameters:
+    -- a tuple of 3 elements `(a,b,c)` can also be written `(,,) a b c` and its `Functor` instance
+    -- is defined for `Functor ((,,) a b)` (i.e., only the third parameter is free to be mapped over
+    -- with `fmap`).
+    --
+    -- It explains why `fmap` can be used with tuples containing values of different types as in the
+    -- following example:
+    --
+    -- >>> fmap even ("hello", 1.0, 4)
+    -- ("hello",1.0,True)
+
     fmap        :: (a -> b) -> f a -> f b
 
     -- | Replace all locations in the input with the same value.
     -- The default definition is @'fmap' . 'const'@, but this may be
     -- overridden with a more efficient version.
+    --
     (<$)        :: a -> f b -> f a
     (<$)        =  fmap . const
 
@@ -519,7 +632,7 @@ class  Functor f  where
 --
 --   * @'pure' = 'return'@
 --
---   * @('<*>') = 'ap'@
+--   * @m1 '<*>' m2 = m1 '>>=' (\x1 -> m2 '>>=' (\x2 -> 'return' (x1 x2)))@
 --
 --   * @('*>') = ('>>')@
 --
@@ -534,6 +647,19 @@ class Functor f => Applicative f where
     --
     -- A few functors support an implementation of '<*>' that is more
     -- efficient than the default one.
+    --
+    -- ==== __Example__
+    -- Used in combination with @('<$>')@, @('<*>')@ can be used to build a record.
+    --
+    -- >>> data MyState = MyState {arg1 :: Foo, arg2 :: Bar, arg3 :: Baz}
+    --
+    -- >>> produceFoo :: Applicative f => f Foo
+    --
+    -- >>> produceBar :: Applicative f => f Bar
+    -- >>> produceBaz :: Applicative f => f Baz
+    --
+    -- >>> mkState :: Applicative f => f MyState
+    -- >>> mkState = MyState <$> produceFoo <*> produceBar <*> produceBaz
     (<*>) :: f (a -> b) -> f a -> f b
     (<*>) = liftA2 id
 
@@ -543,12 +669,42 @@ class Functor f => Applicative f where
     -- efficient than the default one. In particular, if 'fmap' is an
     -- expensive operation, it is likely better to use 'liftA2' than to
     -- 'fmap' over the structure and then use '<*>'.
+    --
+    -- This became a typeclass method in 4.10.0.0. Prior to that, it was
+    -- a function defined in terms of '<*>' and 'fmap'.
+    --
+    -- ==== __Example__
+    -- >>> liftA2 (,) (Just 3) (Just 5)
+    -- Just (3,5)
+
     liftA2 :: (a -> b -> c) -> f a -> f b -> f c
     liftA2 f x = (<*>) (fmap f x)
 
     -- | Sequence actions, discarding the value of the first argument.
+    --
+    -- ==== __Examples__
+    -- If used in conjunction with the Applicative instance for 'Maybe',
+    -- you can chain Maybe computations, with a possible "early return"
+    -- in case of 'Nothing'.
+    --
+    -- >>> Just 2 *> Just 3
+    -- Just 3
+    --
+    -- >>> Nothing *> Just 3
+    -- Nothing
+    --
+    -- Of course a more interesting use case would be to have effectful
+    -- computations instead of just returning pure values.
+    --
+    -- >>> import Data.Char
+    -- >>> import Text.ParserCombinators.ReadP
+    -- >>> let p = string "my name is " *> munch1 isAlpha <* eof
+    -- >>> readP_to_S p "my name is Simon"
+    -- [("Simon","")]
+
     (*>) :: f a -> f b -> f b
     a1 *> a2 = (id <$ a1) <*> a2
+
     -- This is essentially the same as liftA2 (flip const), but if the
     -- Functor instance has an optimized (<$), it may be better to use
     -- that instead. Before liftA2 became a method, this definition
@@ -559,22 +715,41 @@ class Functor f => Applicative f where
     -- liftA2, it would likely be better to define (*>) using liftA2.
 
     -- | Sequence actions, discarding the value of the second argument.
+    --
     (<*) :: f a -> f b -> f a
     (<*) = liftA2 const
 
 -- | A variant of '<*>' with the arguments reversed.
+--
 (<**>) :: Applicative f => f a -> f (a -> b) -> f b
 (<**>) = liftA2 (\a f -> f a)
 -- Don't use $ here, see the note at the top of the page
 
 -- | Lift a function to actions.
--- This function may be used as a value for `fmap` in a `Functor` instance.
+-- Equivalent to Functor's `fmap` but implemented using only `Applicative`'s methods:
+-- `liftA f a = pure f <*> a`
+--
+-- As such this function may be used to implement a `Functor` instance from an `Applicative` one.
+
+--
+-- ==== __Examples__
+-- Using the Applicative instance for Lists:
+--
+-- >>> liftA (+1) [1, 2]
+-- [2,3]
+--
+-- Or the Applicative instance for 'Maybe'
+--
+-- >>> liftA (+1) (Just 3)
+-- Just 4
+
 liftA :: Applicative f => (a -> b) -> f a -> f b
 liftA f a = pure f <*> a
 -- Caution: since this may be used for `fmap`, we can't use the obvious
 -- definition of liftA = fmap.
 
 -- | Lift a ternary function to actions.
+
 liftA3 :: Applicative f => (a -> b -> c -> d) -> f a -> f b -> f c -> f d
 liftA3 f a b c = liftA2 f a b <*> c
 
@@ -590,6 +765,14 @@ liftA3 f a b c = liftA2 f a b <*> c
 -- | The 'join' function is the conventional monad join operator. It
 -- is used to remove one level of monadic structure, projecting its
 -- bound argument into the outer level.
+--
+--
+-- \'@'join' bss@\' can be understood as the @do@ expression
+--
+-- @
+-- do bs <- bss
+--    bs
+-- @
 --
 -- ==== __Examples__
 --
@@ -636,7 +819,7 @@ Instances of 'Monad' should satisfy the following:
 Furthermore, the 'Monad' and 'Applicative' operations should relate as follows:
 
 * @'pure' = 'return'@
-* @('<*>') = 'ap'@
+* @m1 '<*>' m2 = m1 '>>=' (\x1 -> m2 '>>=' (\x2 -> 'return' (x1 x2)))@
 
 The above laws imply:
 
@@ -651,11 +834,25 @@ defined in the "Prelude" satisfy these laws.
 class Applicative m => Monad m where
     -- | Sequentially compose two actions, passing any value produced
     -- by the first as an argument to the second.
+    --
+    -- \'@as '>>=' bs@\' can be understood as the @do@ expression
+    --
+    -- @
+    -- do a <- as
+    --    bs a
+    -- @
     (>>=)       :: forall a b. m a -> (a -> m b) -> m b
 
     -- | Sequentially compose two actions, discarding any value produced
     -- by the first, like sequencing operators (such as the semicolon)
     -- in imperative languages.
+    --
+    -- \'@as '>>' bs@\' can be understood as the @do@ expression
+    --
+    -- @
+    -- do as
+    --    bs
+    -- @
     (>>)        :: forall a b. m a -> m b -> m b
     m >> k = m >>= \_ -> k -- See Note [Recursive bindings for Applicative/Monad]
     {-# INLINE (>>) #-}
@@ -806,7 +1003,7 @@ instance Functor ((->) r) where
     fmap = (.)
 
 -- | @since 2.01
-instance Applicative ((->) a) where
+instance Applicative ((->) r) where
     pure = const
     (<*>) f g x = f x (g x)
     liftA2 q f g x = q (f x) (g x)
@@ -814,6 +1011,15 @@ instance Applicative ((->) a) where
 -- | @since 2.01
 instance Monad ((->) r) where
     f >>= k = \ r -> k (f r) r
+
+-- | @since 4.15
+instance Functor Solo where
+  fmap f (Solo a) = Solo (f a)
+
+  -- Being strict in the `Solo` argument here seems most consistent
+  -- with the concept behind `Solo`: always strict in the wrapper and lazy
+  -- in the contents.
+  x <$ Solo _ = Solo x
 
 -- | @since 2.01
 instance Functor ((,) a) where
@@ -1080,15 +1286,14 @@ augment g xs = g (:) xs
 --              map
 ----------------------------------------------
 
--- | /O(n)/. 'map' @f xs@ is the list obtained by applying @f@ to each element
--- of @xs@, i.e.,
+-- | \(\mathcal{O}(n)\). 'map' @f xs@ is the list obtained by applying @f@ to
+-- each element of @xs@, i.e.,
 --
 -- > map f [x1, x2, ..., xn] == [f x1, f x2, ..., f xn]
 -- > map f [x1, x2, ...] == [f x1, f x2, ...]
 --
 -- >>> map (+1) [1, 2, 3]
---- [2,3,4]
-
+-- [2,3,4]
 map :: (a -> b) -> [a] -> [b]
 {-# NOINLINE [0] map #-}
   -- We want the RULEs "map" and "map/coerce" to fire first.
@@ -1149,7 +1354,7 @@ The rules for map work like this.
 --   http://research.microsoft.com/en-us/um/people/simonpj/papers/ext-f/coercible.pdf
 
 {-# RULES "map/coerce" [1] map coerce = coerce #-}
-
+-- See Note [Getting the map/coerce RULE to work] in CoreOpt
 
 ----------------------------------------------
 --              append
@@ -1189,6 +1394,7 @@ otherwise               =  True
 -- | A 'String' is a list of characters.  String constants in Haskell are values
 -- of type 'String'.
 --
+-- See "Data.List" for operations on lists.
 type String = [Char]
 
 unsafeChr :: Int -> Char
@@ -1206,7 +1412,7 @@ eqString (c1:cs1) (c2:cs2) = c1 == c2 && cs1 `eqString` cs2
 eqString _        _        = False
 
 {-# RULES "eqString" (==) = eqString #-}
--- eqString also has a BuiltInRule in PrelRules.hs:
+-- eqString also has a BuiltInRule in GHC.Core.Opt.ConstantFold:
 --      eqString (unpackCString# (Lit s1)) (unpackCString# (Lit s2)) = s1==s2
 
 
@@ -1368,6 +1574,13 @@ bindIO (IO m) k = IO (\ s -> case m s of (# new_s, a #) -> unIO (k a) new_s)
 thenIO :: IO a -> IO b -> IO b
 thenIO (IO m) k = IO (\ s -> case m s of (# new_s, _ #) -> unIO k new_s)
 
+-- Note that it is import that we do not SOURCE import this as
+-- its demand signature encodes knowledge of its bottoming
+-- behavior, which can expose useful simplifications. See
+-- #16588.
+failIO :: String -> IO a
+failIO s = IO (raiseIO# (mkUserError s))
+
 unIO :: IO a -> (State# RealWorld -> (# State# RealWorld, a #))
 unIO (IO a) = a
 
@@ -1465,7 +1678,13 @@ a `iShiftRL#` b | isTrue# (b >=# WORD_SIZE_IN_BITS#) = 0#
 "unpack-list"  [1]  forall a   . unpackFoldrCString# a (:) [] = unpackCString# a
 "unpack-append"     forall a n . unpackFoldrCString# a (:) n  = unpackAppendCString# a n
 
--- There's a built-in rule (in PrelRules.hs) for
+"unpack-utf8"       [~1] forall a   . unpackCStringUtf8# a             = build (unpackFoldrCStringUtf8# a)
+"unpack-list-utf8"  [1]  forall a   . unpackFoldrCStringUtf8# a (:) [] = unpackCStringUtf8# a
+"unpack-append-utf8"     forall a n . unpackFoldrCStringUtf8# a (:) n  = unpackAppendCStringUtf8# a n
+
+-- There's a built-in rule (in GHC.Core.Op.ConstantFold) for
 --      unpackFoldr "foo" c (unpackFoldr "baz" c n)  =  unpackFoldr "foobaz" c n
+
+-- See also the Note [String literals in GHC] in CString.hs
 
   #-}

@@ -47,7 +47,7 @@ module Distribution.Simple.Compiler (
         flagToDebugInfoLevel,
 
         -- * Support for language extensions
-        Flag,
+        CompilerFlag,
         languageToFlags,
         unsupportedLanguages,
         extensionsToFlags,
@@ -63,6 +63,7 @@ module Distribution.Simple.Compiler (
         backpackSupported,
         arResponseFilesSupported,
         libraryDynDirSupported,
+        libraryVisibilitySupported,
 
         -- * Support for profiling detail levels
         ProfDetailLevel(..),
@@ -80,7 +81,6 @@ import Distribution.Version
 import Language.Haskell.Extension
 import Distribution.Simple.Utils
 
-import Control.Monad (join)
 import qualified Data.Map as Map (lookup)
 import System.Directory (canonicalizePath)
 
@@ -93,9 +93,9 @@ data Compiler = Compiler {
         compilerCompat          :: [CompilerId],
         -- ^ Other implementations that this compiler claims to be
         -- compatible with.
-        compilerLanguages       :: [(Language, Flag)],
+        compilerLanguages       :: [(Language, CompilerFlag)],
         -- ^ Supported language standards.
-        compilerExtensions      :: [(Extension, Maybe Flag)],
+        compilerExtensions      :: [(Extension, Maybe CompilerFlag)],
         -- ^ Supported extensions.
         compilerProperties      :: Map String String
         -- ^ A key-value map for properties not covered by the above fields.
@@ -103,6 +103,7 @@ data Compiler = Compiler {
     deriving (Eq, Generic, Typeable, Show, Read)
 
 instance Binary Compiler
+instance Structured Compiler
 
 showCompilerId :: Compiler -> String
 showCompilerId = prettyShow . compilerId
@@ -171,9 +172,10 @@ compilerInfo c = CompilerInfo (compilerId c)
 data PackageDB = GlobalPackageDB
                | UserPackageDB
                | SpecificPackageDB FilePath
-    deriving (Eq, Generic, Ord, Show, Read)
+    deriving (Eq, Generic, Ord, Show, Read, Typeable)
 
 instance Binary PackageDB
+instance Structured PackageDB
 
 -- | We typically get packages from several databases, and stack them
 -- together. This type lets us be explicit about that stacking. For example
@@ -197,16 +199,17 @@ type PackageDBStack = [PackageDB]
 -- the top of the stack.
 --
 registrationPackageDB :: PackageDBStack -> PackageDB
-registrationPackageDB []  = error "internal error: empty package db set"
-registrationPackageDB dbs = last dbs
+registrationPackageDB dbs  = case safeLast dbs of
+  Nothing -> error "internal error: empty package db set"
+  Just p  -> p
 
 -- | Make package paths absolute
 
 
-absolutePackageDBPaths :: PackageDBStack -> NoCallStackIO PackageDBStack
+absolutePackageDBPaths :: PackageDBStack -> IO PackageDBStack
 absolutePackageDBPaths = traverse absolutePackageDBPath
 
-absolutePackageDBPath :: PackageDB -> NoCallStackIO PackageDB
+absolutePackageDBPath :: PackageDB -> IO PackageDB
 absolutePackageDBPath GlobalPackageDB        = return GlobalPackageDB
 absolutePackageDBPath UserPackageDB          = return UserPackageDB
 absolutePackageDBPath (SpecificPackageDB db) =
@@ -223,9 +226,10 @@ absolutePackageDBPath (SpecificPackageDB db) =
 data OptimisationLevel = NoOptimisation
                        | NormalOptimisation
                        | MaximumOptimisation
-    deriving (Bounded, Enum, Eq, Generic, Read, Show)
+    deriving (Bounded, Enum, Eq, Generic, Read, Show, Typeable)
 
 instance Binary OptimisationLevel
+instance Structured OptimisationLevel
 
 flagToOptimisationLevel :: Maybe String -> OptimisationLevel
 flagToOptimisationLevel Nothing  = NormalOptimisation
@@ -250,9 +254,10 @@ data DebugInfoLevel = NoDebugInfo
                     | MinimalDebugInfo
                     | NormalDebugInfo
                     | MaximalDebugInfo
-    deriving (Bounded, Enum, Eq, Generic, Read, Show)
+    deriving (Bounded, Enum, Eq, Generic, Read, Show, Typeable)
 
 instance Binary DebugInfoLevel
+instance Structured DebugInfoLevel
 
 flagToDebugInfoLevel :: Maybe String -> DebugInfoLevel
 flagToDebugInfoLevel Nothing  = NormalDebugInfo
@@ -274,12 +279,12 @@ unsupportedLanguages comp langs =
   [ lang | lang <- langs
          , isNothing (languageToFlag comp lang) ]
 
-languageToFlags :: Compiler -> Maybe Language -> [Flag]
+languageToFlags :: Compiler -> Maybe Language -> [CompilerFlag]
 languageToFlags comp = filter (not . null)
                      . catMaybes . map (languageToFlag comp)
                      . maybe [Haskell98] (\x->[x])
 
-languageToFlag :: Compiler -> Language -> Maybe Flag
+languageToFlag :: Compiler -> Language -> Maybe CompilerFlag
 languageToFlag comp ext = lookup ext (compilerLanguages comp)
 
 
@@ -289,16 +294,16 @@ unsupportedExtensions comp exts =
   [ ext | ext <- exts
         , isNothing (extensionToFlag' comp ext) ]
 
-type Flag = String
+type CompilerFlag = String
 
 -- |For the given compiler, return the flags for the supported extensions.
-extensionsToFlags :: Compiler -> [Extension] -> [Flag]
+extensionsToFlags :: Compiler -> [Extension] -> [CompilerFlag]
 extensionsToFlags comp = nub . filter (not . null)
                        . catMaybes . map (extensionToFlag comp)
 
 -- | Looks up the flag for a given extension, for a given compiler.
 -- Ignores the subtlety of extensions which lack associated flags.
-extensionToFlag :: Compiler -> Extension -> Maybe Flag
+extensionToFlag :: Compiler -> Extension -> Maybe CompilerFlag
 extensionToFlag comp ext = join (extensionToFlag' comp ext)
 
 -- | Looks up the flag for a given extension, for a given compiler.
@@ -310,7 +315,7 @@ extensionToFlag comp ext = join (extensionToFlag' comp ext)
 -- the inner layer indicates whether it has a flag.
 -- When building strings, it is often more convenient to use 'extensionToFlag',
 -- which ignores the difference.
-extensionToFlag' :: Compiler -> Extension -> Maybe (Maybe Flag)
+extensionToFlag' :: Compiler -> Extension -> Maybe (Maybe CompilerFlag)
 extensionToFlag' comp ext = lookup ext (compilerExtensions comp)
 
 -- | Does this compiler support parallel --make mode?
@@ -376,6 +381,15 @@ profilingSupported comp =
     GHCJS -> True
     _     -> False
 
+-- | Does this compiler support a package database entry with:
+-- "visibility"?
+libraryVisibilitySupported :: Compiler -> Bool
+libraryVisibilitySupported comp = case compilerFlavor comp of
+  GHC -> v >= mkVersion [8,8]
+  _   -> False
+ where
+  v = compilerVersion comp
+
 -- | Utility function for GHC only features
 ghcSupported :: String -> Compiler -> Bool
 ghcSupported key comp =
@@ -405,9 +419,10 @@ data ProfDetailLevel = ProfDetailNone
                      | ProfDetailToplevelFunctions
                      | ProfDetailAllFunctions
                      | ProfDetailOther String
-    deriving (Eq, Generic, Read, Show)
+    deriving (Eq, Generic, Read, Show, Typeable)
 
 instance Binary ProfDetailLevel
+instance Structured ProfDetailLevel
 
 flagToProfDetailLevel :: String -> ProfDetailLevel
 flagToProfDetailLevel "" = ProfDetailDefault

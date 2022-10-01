@@ -1,7 +1,8 @@
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE TypeOperators #-}
-{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE CPP              #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes       #-}
+{-# LANGUAGE Trustworthy      #-}
+{-# LANGUAGE TypeOperators    #-}
 
 #ifdef MIN_VERSION_base
 #define MINVER_base_411 MIN_VERSION_base(4,11,0)
@@ -33,18 +34,27 @@ module Distribution.Compat.Prelude (
     -- * Common type-classes
     Semigroup (..),
     gmappend, gmempty,
-    Typeable,
+    Typeable, TypeRep, typeRep,
     Data,
     Generic,
     NFData (..), genericRnf,
     Binary (..),
+    Structured,
     Alternative (..),
     MonadPlus (..),
     IsString (..),
 
     -- * Some types
-    IO, NoCallStackIO,
     Map,
+    Set,
+    NonEmptySet,
+    Identity (..),
+    Proxy (..),
+    Const (..),
+    Void,
+
+    -- * Data.Either
+    partitionEithers,
 
     -- * Data.Maybe
     catMaybes, mapMaybe,
@@ -58,9 +68,11 @@ module Distribution.Compat.Prelude (
     intercalate, intersperse,
     sort, sortBy,
     nub, nubBy,
+    partition,
 
     -- * Data.List.NonEmpty
     NonEmpty((:|)), foldl1, foldr1,
+    head, tail, last, init,
 
     -- * Data.Foldable
     Foldable, foldMap, foldr,
@@ -68,10 +80,17 @@ module Distribution.Compat.Prelude (
     find, foldl',
     traverse_, for_,
     any, all,
+    toList,
 
     -- * Data.Traversable
     Traversable, traverse, sequenceA,
     for,
+
+    -- * Data.Function
+    on,
+
+    -- * Data.Ord
+    comparing,
 
     -- * Control.Arrow
     first,
@@ -81,11 +100,26 @@ module Distribution.Compat.Prelude (
     unless, when,
     ap, void,
     foldM, filterM,
+    join, guard,
+
+    -- * Control.Exception
+    catch, throwIO, evaluate,
+    Exception (..), IOException, SomeException (..),
+#if !MINVER_base_48
+    displayException,
+#endif
+    tryIO, catchIO, catchExit,
+
+    -- * Control.DeepSeq
+    deepseq, force,
 
     -- * Data.Char
     isSpace, isDigit, isUpper, isAlpha, isAlphaNum,
     chr, ord,
     toLower, toUpper,
+
+    -- * Data.Void
+    absurd, vacuous,
 
     -- * Data.Word & Data.Int
     Word,
@@ -93,14 +127,22 @@ module Distribution.Compat.Prelude (
     Int8, Int16, Int32, Int64,
 
     -- * Text.PrettyPrint
-    (<<>>),
+    (<<>>), (Disp.<+>),
+
+    -- * System.Exit
+    ExitCode (..),
+    exitWith, exitSuccess, exitFailure,
 
     -- * Text.Read
     readMaybe,
+
+    -- * Debug.Trace (as deprecated functions)
+    trace, traceShow, traceShowId,
     ) where
+
 -- We also could hide few partial function
 import Prelude                       as BasePrelude hiding
-  ( IO, mapM, mapM_, sequence, null, length, foldr, any, all
+  ( mapM, mapM_, sequence, null, length, foldr, any, all, head, tail, last, init
   -- partial functions
   , read
   , foldr1, foldl1
@@ -117,49 +159,57 @@ import Prelude                       as BasePrelude hiding
 #endif
   )
 
+-- AMP
 #if !MINVER_base_48
 import Control.Applicative           (Applicative (..), (<$), (<$>))
+import Data.Foldable                 (toList)
 import Distribution.Compat.Semigroup (Monoid (..))
 #else
-import Data.Foldable                 (length, null)
+import Data.Foldable (Foldable (toList), length, null)
 #endif
 
-import Data.Foldable                 (Foldable (foldMap, foldr), find, foldl', for_, traverse_, any, all)
-import Data.Traversable              (Traversable (traverse, sequenceA), for)
+import Data.Foldable    (Foldable (foldMap, foldr), all, any, find, foldl', for_, traverse_)
+import Data.Traversable (Traversable (sequenceA, traverse), for)
+
 import qualified Data.Foldable
 
+-- Extra exports
 import Control.Applicative           (Alternative (..))
-import Control.DeepSeq               (NFData (..))
+import Control.Applicative           (Const (..))
+import Control.Arrow                 (first)
+import Control.DeepSeq               (NFData (..), deepseq, force)
+import Control.Exception             (Exception (..), IOException, SomeException (..), catch, evaluate, throwIO)
+import Control.Monad                 (MonadPlus (..), ap, filterM, foldM, guard, join, liftM, liftM2, unless, void, when)
+import Data.Char                     (chr, isAlpha, isAlphaNum, isDigit, isSpace, isUpper, ord, toLower, toUpper)
 import Data.Data                     (Data)
-import Data.Typeable                 (Typeable)
+import Data.Either                   (partitionEithers)
+import Data.Function                 (on)
+import Data.Functor.Identity         (Identity (..))
+import Data.Int                      (Int16, Int32, Int64, Int8)
+import Data.List                     (intercalate, intersperse, isPrefixOf, isSuffixOf, nub, nubBy, partition, sort, sortBy, unfoldr)
+import Data.List.NonEmpty            (NonEmpty ((:|)), head, init, last, tail)
+import Data.Map                      (Map)
+import Data.Maybe                    (catMaybes, fromMaybe, isJust, isNothing, listToMaybe, mapMaybe, maybeToList)
+import Data.Ord                      (comparing)
+import Data.Proxy                    (Proxy (..))
+import Data.Set                      (Set)
+import Data.String                   (IsString (..))
+import Data.Void                     (Void, absurd, vacuous)
+import Data.Word                     (Word, Word16, Word32, Word64, Word8)
 import Distribution.Compat.Binary    (Binary (..))
 import Distribution.Compat.Semigroup (Semigroup (..), gmappend, gmempty)
-import GHC.Generics                  (Generic, Rep(..),
-                                      V1, U1(U1), K1(unK1), M1(unM1),
-                                      (:*:)((:*:)), (:+:)(L1,R1))
-
-import Data.Map                      (Map)
-
-import Control.Arrow                 (first)
-import Control.Monad                 hiding (mapM)
-import Data.Char
-import Data.List                     (intercalate, intersperse, isPrefixOf,
-                                      isSuffixOf, nub, nubBy, sort, sortBy,
-                                      unfoldr)
-import Data.List.NonEmpty            (NonEmpty((:|)))
-import Data.Maybe
-import Data.String                   (IsString (..))
-import Data.Int
-import Data.Word
+import Distribution.Compat.Typeable  (TypeRep, Typeable, typeRep)
+import GHC.Generics                  ((:*:) ((:*:)), (:+:) (L1, R1), Generic, K1 (unK1), M1 (unM1), Rep (..), U1 (U1), V1)
+import System.Exit                   (ExitCode (..), exitFailure, exitSuccess, exitWith)
 import Text.Read                     (readMaybe)
 
 import qualified Text.PrettyPrint as Disp
 
-import qualified Prelude as OrigPrelude
-import Distribution.Compat.Stack
+import Distribution.Compat.Exception
+import Distribution.Compat.NonEmptySet (NonEmptySet)
+import Distribution.Utils.Structured   (Structured)
 
-type IO a = WithCallStack (OrigPrelude.IO a)
-type NoCallStackIO a = OrigPrelude.IO a
+import qualified Debug.Trace
 
 -- | New name for 'Text.PrettyPrint.<>'
 (<<>>) :: Disp.Doc -> Disp.Doc -> Disp.Doc
@@ -245,3 +295,22 @@ foldr1 = Data.Foldable.foldr1
 {-# INLINE foldl1 #-}
 foldl1 :: (a -> a -> a) -> NonEmpty a -> a
 foldl1 = Data.Foldable.foldl1
+
+-------------------------------------------------------------------------------
+-- Trace
+-------------------------------------------------------------------------------
+
+-- Functions from Debug.Trace
+-- but with DEPRECATED pragma, so -Werror will scream on them.
+
+trace :: String -> a -> a
+trace = Debug.Trace.trace
+{-# DEPRECATED trace "Don't leave me in the code" #-}
+
+traceShowId :: Show a => a -> a
+traceShowId x = Debug.Trace.traceShow x x
+{-# DEPRECATED traceShowId "Don't leave me in the code" #-}
+
+traceShow :: Show a => a -> b -> b
+traceShow = Debug.Trace.traceShow
+{-# DEPRECATED traceShow "Don't leave me in the code" #-}

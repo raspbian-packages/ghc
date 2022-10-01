@@ -7,7 +7,7 @@ license:        BSD3
 license-file:   LICENSE
 category:       GHC
 maintainer:     ghc-devs@haskell.org
-bug-reports:    https://ghc.haskell.org/trac/ghc/newticket
+bug-reports:    https://gitlab.haskell.org/ghc/ghc/issues/new
 synopsis:       The library supporting GHC's interactive interpreter
 description:
             This library offers interfaces which mediate interactions between the
@@ -48,7 +48,7 @@ library
         UnboxedTuples
 
     if flag(ghci)
-        CPP-Options: -DGHCI
+        CPP-Options: -DHAVE_INTERNAL_INTERPRETER
         exposed-modules:
             GHCi.Run
             GHCi.CreateBCO
@@ -71,8 +71,9 @@ library
         SizedSeq
 
     Build-Depends:
+        rts,
         array            == 0.5.*,
-        base             >= 4.8 && < 4.14,
+        base             >= 4.8 && < 4.16,
         binary           == 0.8.*,
         bytestring       == 0.10.*,
         containers       >= 0.5 && < 0.7,
@@ -81,7 +82,7 @@ library
         ghc-boot         == @ProjectVersionMunged@,
         ghc-boot-th      == @ProjectVersionMunged@,
         ghc-heap         == @ProjectVersionMunged@,
-        template-haskell == 2.15.*,
+        template-haskell == 2.17.*,
         transformers     == 0.5.*
 
     if !os(windows)

@@ -114,11 +114,7 @@ getClosureRaw x = do
 -- This is a hack to cover the bootstrap compiler using the old version of
 -- 'unpackClosure'. The new 'unpackClosure' return values are not merely
 -- a reordering, so using the old version would not work.
-#if MIN_VERSION_ghc_prim(0,5,3)
         (# iptr, dat, pointers #) -> do
-#else
-        (# iptr, pointers, dat #) -> do
-#endif
             let nelems = (I# (sizeofByteArray# dat)) `div` wORD_SIZE
                 end = fromIntegral nelems - 1
                 rawWds = [W# (indexWordArray# dat i) | I# i <- [0.. end] ]
@@ -126,7 +122,7 @@ getClosureRaw x = do
                 ptrList = amap' Box $ Array 0 (pelems - 1) pelems pointers
             pure (Ptr iptr, rawWds, ptrList)
 
--- From compiler/ghci/RtClosureInspect.hs
+-- From GHC.Runtime.Heap.Inspect
 amap' :: (t -> b) -> Array Int t -> [b]
 amap' f (Array i0 i _ arr#) = map g [0 .. i - i0]
     where g (I# i#) = case indexArray# arr# i# of
@@ -149,7 +145,7 @@ getClosure x = do
     case tipe itbl of
         t | t >= CONSTR && t <= CONSTR_NOCAF -> do
             (p, m, n) <- dataConNames iptr
-            if m == "ByteCodeInstr" && n == "BreakInfo"
+            if m == "GHC.ByteCode.Instr" && n == "BreakInfo"
               then pure $ UnsupportedClosure itbl
               else pure $ ConstrClosure itbl pts npts p m n
 
@@ -248,6 +244,12 @@ getClosure x = do
                         ++ "found " ++ show (length rawWds)
             pure $ MutArrClosure itbl (rawWds !! 0) (rawWds !! 1) pts
 
+        t | t >= SMALL_MUT_ARR_PTRS_CLEAN && t <= SMALL_MUT_ARR_PTRS_FROZEN_CLEAN -> do
+            unless (length rawWds >= 1) $
+                fail $ "Expected at least 1 word to SMALL_MUT_ARR_PTRS_* "
+                        ++ "found " ++ show (length rawWds)
+            pure $ SmallMutArrClosure itbl (rawWds !! 0) pts
+
         t | t == MUT_VAR_CLEAN || t == MUT_VAR_DIRTY ->
             pure $ MutVarClosure itbl (head pts)
 
@@ -264,6 +266,17 @@ getClosure x = do
 
         --  pure $ OtherClosure itbl pts wds
         --
+
+        WEAK ->
+            pure $ WeakClosure
+                { info = itbl
+                , cfinalizers = pts !! 0
+                , key = pts !! 1
+                , value = pts !! 2
+                , finalizer = pts !! 3
+                , link = pts !! 4
+                }
+
         _ ->
             pure $ UnsupportedClosure itbl
 

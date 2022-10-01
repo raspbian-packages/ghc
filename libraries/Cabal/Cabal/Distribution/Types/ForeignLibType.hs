@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 module Distribution.Types.ForeignLibType(
     ForeignLibType(..),
@@ -42,7 +43,7 @@ instance Parsec ForeignLibType where
       _               -> ForeignLibTypeUnknown
 
 instance Binary ForeignLibType
-
+instance Structured ForeignLibType
 instance NFData ForeignLibType where rnf = genericRnf
 
 instance Semigroup ForeignLibType where

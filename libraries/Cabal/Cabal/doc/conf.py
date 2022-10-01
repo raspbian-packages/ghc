@@ -13,7 +13,7 @@ import sphinx_rtd_theme
 sys.path.insert(0, os.path.abspath('.'))
 import cabaldomain
 
-version = "3.0.1.0"
+version = "3.4.0.0"
 
 extensions = ['sphinx.ext.extlinks', 'sphinx.ext.todo']
 
@@ -26,15 +26,15 @@ master_doc = 'index'
 extlinks = {
     'issue': ('https://github.com/haskell/cabal/issues/%s', '#'),
 
-    'ghc-wiki': ('http://ghc.haskell.org/trac/ghc/wiki/%s', ''),
-    'ghc-ticket': ('http://ghc.haskell.org/trac/ghc/ticket/%s', 'GHC #'),
+    'ghc-wiki': ('https://gitlab.haskell.org/ghc/ghc/-/wikis/%s', ''),
+    'ghc-ticket': ('https://gitlab.haskell.org/ghc/ghc/-/issues/%s', 'GHC #'),
 
     'hackage-pkg': ('http://hackage.haskell.org/package/%s', ''),
 }
 
 # General information about the project.
 project = u'Cabal'
-copyright = u'2003-2017, Cabal Team'
+copyright = u'2003-2020, Cabal Team'
 # N.B. version comes from ghc_config
 release = version  # The full version, including alpha/beta/rc tags.
 
@@ -90,13 +90,16 @@ html_context = {
 # Output file base name for HTML help builder.
 htmlhelp_basename = 'CabalUsersGuide'
 
+# MathJax to use SVG rendering by default
+mathjax_path = 'https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.5/latest.js?config=TeX-AMS-MML_SVG'
+
 
 # -- Options for LaTeX output ---------------------------------------------
 
 latex_elements = {
     'inputenc': '',
     'utf8extra': '',
-    'preamble': '''
+    'preamble': r'''
 \usepackage{fontspec}
 \usepackage{makeidx}
 \setsansfont{DejaVu Sans}
@@ -171,7 +174,7 @@ def parse_flag(env, sig, signode):
         name = parts[0]
         names.append(name)
         sig = sep + ' '.join(parts[1:])
-        sig = re.sub(ur'<([-a-zA-Z ]+)>', ur'⟨\1⟩', sig)
+        sig = re.sub(r'<([-a-zA-Z ]+)>', r'⟨\1⟩', sig)
         if i > 0:
             signode += addnodes.desc_name(', ', ', ')
         signode += addnodes.desc_name(name, name)

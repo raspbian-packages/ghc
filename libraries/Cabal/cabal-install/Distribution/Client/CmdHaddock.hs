@@ -1,4 +1,4 @@
-{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE RecordWildCards #-}
 
 -- | cabal-install CLI command: haddock
 --
@@ -8,32 +8,32 @@ module Distribution.Client.CmdHaddock (
     haddockAction,
 
     -- * Internals exposed for testing
-    TargetProblem(..),
     selectPackageTargets,
     selectComponentTarget
   ) where
 
+import Distribution.Client.Compat.Prelude
+import Prelude ()
+
 import Distribution.Client.ProjectOrchestration
 import Distribution.Client.CmdErrorMessages
-
+import Distribution.Client.TargetProblem
+         ( TargetProblem (..), TargetProblem' )
+import Distribution.Client.NixStyleOptions
+         ( NixStyleFlags (..), nixStyleOptions, defaultNixStyleFlags )
 import Distribution.Client.Setup
-         ( GlobalFlags, ConfigFlags(..), ConfigExFlags, InstallFlags )
-import qualified Distribution.Client.Setup as Client
+         ( GlobalFlags, ConfigFlags(..) )
 import Distribution.Simple.Setup
-         ( HaddockFlags(..), TestFlags, fromFlagOrDefault )
+         ( HaddockFlags(..), fromFlagOrDefault )
 import Distribution.Simple.Command
          ( CommandUI(..), usageAlternatives )
 import Distribution.Verbosity
-         ( Verbosity, normal )
+         ( normal )
 import Distribution.Simple.Utils
          ( wrapText, die' )
 
-import Control.Monad (when)
-
-
-haddockCommand :: CommandUI (ConfigFlags, ConfigExFlags, InstallFlags
-                            ,HaddockFlags, TestFlags)
-haddockCommand = Client.installCommand {
+haddockCommand :: CommandUI (NixStyleFlags ())
+haddockCommand = CommandUI {
   commandName         = "v2-haddock",
   commandSynopsis     = "Build Haddock documentation",
   commandUsage        = usageAlternatives "v2-haddock" [ "[FLAGS] TARGET" ],
@@ -57,10 +57,10 @@ haddockCommand = Client.installCommand {
   commandNotes        = Just $ \pname ->
         "Examples:\n"
      ++ "  " ++ pname ++ " v2-haddock pkgname"
-     ++ "    Build documentation for the package named pkgname\n\n"
-
-     ++ cmdCommonHelpTextNewBuildBeta
-   }
+     ++ "    Build documentation for the package named pkgname\n"
+  , commandOptions      = nixStyleOptions (const [])
+  , commandDefaultFlags = defaultNixStyleFlags ()
+  }
    --TODO: [nice to have] support haddock on specific components, not just
    -- whole packages and the silly --executables etc modifiers.
 
@@ -69,11 +69,8 @@ haddockCommand = Client.installCommand {
 -- For more details on how this works, see the module
 -- "Distribution.Client.ProjectOrchestration"
 --
-haddockAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags, TestFlags)
-                 -> [String] -> GlobalFlags -> IO ()
-haddockAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags)
-                targetStrings globalFlags = do
-
+haddockAction :: NixStyleFlags () -> [String] -> GlobalFlags -> IO ()
+haddockAction flags@NixStyleFlags {..} targetStrings globalFlags = do
     baseCtx <- establishProjectBaseContext verbosity cliConfig HaddockCommand
 
     targetSelectors <- either (reportTargetSelectorProblems verbosity) return
@@ -88,11 +85,10 @@ haddockAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags
 
               -- When we interpret the targets on the command line, interpret them as
               -- haddock targets
-            targets <- either (reportTargetProblems verbosity) return
+            targets <- either (reportBuildDocumentationTargetProblems verbosity) return
                      $ resolveTargets
                          (selectPackageTargets haddockFlags)
                          selectComponentTarget
-                         TargetProblemCommon
                          elaboratedPlan
                          Nothing
                          targetSelectors
@@ -109,11 +105,7 @@ haddockAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags
     runProjectPostBuildPhase verbosity baseCtx buildCtx buildOutcomes
   where
     verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
-    cliConfig = commandLineFlagsToProjectConfig
-                  globalFlags configFlags configExFlags
-                  installFlags
-                  mempty -- ClientInstallFlags, not needed here
-                  haddockFlags testFlags
+    cliConfig = commandLineFlagsToProjectConfig globalFlags flags mempty -- ClientInstallFlags, not needed here
 
 -- | This defines what a 'TargetSelector' means for the @haddock@ command.
 -- It selects the 'AvailableTarget's that the 'TargetSelector' refers to,
@@ -124,7 +116,7 @@ haddockAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags
 -- We do similarly for test-suites, benchmarks and foreign libs.
 --
 selectPackageTargets  :: HaddockFlags -> TargetSelector
-                      -> [AvailableTarget k] -> Either TargetProblem [k]
+                      -> [AvailableTarget k] -> Either TargetProblem' [k]
 selectPackageTargets haddockFlags targetSelector targets
 
     -- If there are any buildable targets then we select those
@@ -174,35 +166,9 @@ selectPackageTargets haddockFlags targetSelector targets
 -- etc.
 --
 selectComponentTarget :: SubComponentTarget
-                      -> AvailableTarget k -> Either TargetProblem k
-selectComponentTarget subtarget =
-    either (Left . TargetProblemCommon) Right
-  . selectComponentTargetBasic subtarget
+                      -> AvailableTarget k -> Either TargetProblem' k
+selectComponentTarget = selectComponentTargetBasic
 
-
--- | The various error conditions that can occur when matching a
--- 'TargetSelector' against 'AvailableTarget's for the @haddock@ command.
---
-data TargetProblem =
-     TargetProblemCommon       TargetProblemCommon
-
-     -- | The 'TargetSelector' matches targets but none are buildable
-   | TargetProblemNoneEnabled TargetSelector [AvailableTarget ()]
-
-     -- | There are no targets at all
-   | TargetProblemNoTargets   TargetSelector
-  deriving (Eq, Show)
-
-reportTargetProblems :: Verbosity -> [TargetProblem] -> IO a
-reportTargetProblems verbosity =
-    die' verbosity . unlines . map renderTargetProblem
-
-renderTargetProblem :: TargetProblem -> String
-renderTargetProblem (TargetProblemCommon problem) =
-    renderTargetProblemCommon "build documentation for" problem
-
-renderTargetProblem (TargetProblemNoneEnabled targetSelector targets) =
-    renderTargetProblemNoneEnabled "build documentation for" targetSelector targets
-
-renderTargetProblem(TargetProblemNoTargets targetSelector) =
-    renderTargetProblemNoTargets "build documentation for" targetSelector
+reportBuildDocumentationTargetProblems :: Verbosity -> [TargetProblem'] -> IO a
+reportBuildDocumentationTargetProblems verbosity problems =
+  reportTargetProblems verbosity "build documentation for" problems

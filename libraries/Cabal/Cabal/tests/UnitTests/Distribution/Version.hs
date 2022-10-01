@@ -1,6 +1,5 @@
 {-# LANGUAGE StandaloneDeriving, DeriveDataTypeable #-}
-{-# OPTIONS_GHC -fno-warn-orphans
-                -fno-warn-incomplete-patterns
+{-# OPTIONS_GHC -fno-warn-incomplete-patterns
                 -fno-warn-deprecations
                 -fno-warn-unused-binds #-} --FIXME
 module UnitTests.Distribution.Version (versionTests) where
@@ -12,19 +11,19 @@ import Distribution.Version
 import Distribution.Types.VersionRange.Internal
 import Distribution.Parsec (simpleParsec)
 import Distribution.Pretty
+import Distribution.Utils.Generic
 
 import Data.Typeable (typeOf)
 import Math.NumberTheory.Logarithms (intLog2)
-import Text.PrettyPrint as Disp (text, render, parens, hcat
-                                ,punctuate, int, char, (<+>))
+import Text.PrettyPrint as Disp (text, render, hcat
+                                ,punctuate, int, char)
 import Test.Tasty
 import Test.Tasty.QuickCheck
 import qualified Test.Laws as Laws
 
-import Test.QuickCheck.Utils
+import Test.QuickCheck.Instances.Cabal ()
 
 import Data.Maybe (fromJust)
-import Data.Function (on)
 
 versionTests :: [TestTree]
 versionTests =
@@ -130,24 +129,6 @@ versionTests =
 --     -- , property prop_parse_disp5
 --   ]
 
-instance Arbitrary Version where
-  arbitrary = do
-      branch <- smallListOf1 $
-                  frequency [(3, return 0)
-                            ,(3, return 1)
-                            ,(2, return 2)
-                            ,(2, return 3)
-                            ,(1, return 0xfffd)
-                            ,(1, return 0xfffe) -- max fitting into packed W64
-                            ,(1, return 0xffff)
-                            ,(1, return 0x10000)]
-      return (mkVersion branch)
-    where
-      smallListOf1 = adjustSize (\n -> min 6 (n `div` 3)) . listOf1
-
-  shrink ver = [ mkVersion ns | ns <- shrink (versionNumbers ver)
-                              , not (null ns) ]
-
 newtype VersionArb = VersionArb [Int]
                    deriving (Eq,Ord,Show)
 
@@ -168,45 +149,6 @@ instance Arbitrary VersionArb where
     , length xs' > 0
     , all (>=0) xs'
     ]
-
-instance Arbitrary VersionRange where
-  arbitrary = sized verRangeExp
-    where
-      verRangeExp n = frequency $
-        [ (2, return anyVersion)
-        , (1, liftM thisVersion arbitrary)
-        , (1, liftM laterVersion arbitrary)
-        , (1, liftM orLaterVersion arbitrary)
-        , (1, liftM orLaterVersion' arbitrary)
-        , (1, liftM earlierVersion arbitrary)
-        , (1, liftM orEarlierVersion arbitrary)
-        , (1, liftM orEarlierVersion' arbitrary)
-        , (1, liftM withinVersion arbitrary)
-        , (1, liftM majorBoundVersion arbitrary)
-        , (2, liftM VersionRangeParens arbitrary)
-        ] ++ if n == 0 then [] else
-        [ (2, liftM2 unionVersionRanges     verRangeExp2 verRangeExp2)
-        , (2, liftM2 intersectVersionRanges verRangeExp2 verRangeExp2)
-        ]
-        where
-          verRangeExp2 = verRangeExp (n `div` 2)
-
-      orLaterVersion'   v =
-        unionVersionRanges (LaterVersion v)   (ThisVersion v)
-      orEarlierVersion' v =
-        unionVersionRanges (EarlierVersion v) (ThisVersion v)
-
-  shrink AnyVersion                   = []
-  shrink (ThisVersion v)              = map ThisVersion (shrink v)
-  shrink (LaterVersion v)             = map LaterVersion (shrink v)
-  shrink (EarlierVersion v)           = map EarlierVersion (shrink v)
-  shrink (OrLaterVersion v)           = LaterVersion v : map OrLaterVersion (shrink v)
-  shrink (OrEarlierVersion v)         = EarlierVersion v : map OrEarlierVersion (shrink v)
-  shrink (WildcardVersion v)          = map WildcardVersion ( shrink v)
-  shrink (MajorBoundVersion v)        = map MajorBoundVersion (shrink v)
-  shrink (VersionRangeParens vr)      = vr : map VersionRangeParens (shrink vr)
-  shrink (UnionVersionRanges a b)     = a : b : map (uncurry UnionVersionRanges) (shrink (a, b))
-  shrink (IntersectVersionRanges a b) = a : b : map (uncurry IntersectVersionRanges) (shrink (a, b))
 
 ---------------------
 -- Version properties
@@ -312,12 +254,15 @@ prop_invertVersionRange vr v' =
      withinRange v' (invertVersionRange vr)
   == not (withinRange v' vr)
 
-prop_withinVersion :: Version -> Version -> Bool
+prop_withinVersion :: Version -> Version -> Property
 prop_withinVersion v v' =
-     withinRange v' (withinVersion v)
-  == (v' >= v && v' < upper v)
+    withinRange v' (withinVersion v)
+    ===
+    (v' >= v && v' < upper v)
   where
-    upper = alterVersion $ \numbers -> init numbers ++ [last numbers + 1]
+    upper = alterVersion $ \numbers -> case unsnoc numbers of
+      Nothing      -> []
+      Just (xs, x) -> xs ++ [x + 1]
 
 prop_foldVersionRange :: VersionRange -> Property
 prop_foldVersionRange range =
@@ -327,8 +272,6 @@ prop_foldVersionRange range =
                       unionVersionRanges intersectVersionRanges
                       range
   where
-    expandVR (WildcardVersion v) =
-        intersectVersionRanges (expandVR (orLaterVersion v)) (earlierVersion (wildcardUpperBound v))
     expandVR (MajorBoundVersion v) =
         intersectVersionRanges (expandVR (orLaterVersion v)) (earlierVersion (majorUpperBound v))
     expandVR (OrEarlierVersion v) =
@@ -339,10 +282,11 @@ prop_foldVersionRange range =
       UnionVersionRanges (expandVR v1) (expandVR v2)
     expandVR (IntersectVersionRanges v1 v2) =
       IntersectVersionRanges (expandVR v1) (expandVR v2)
-    expandVR (VersionRangeParens v) = expandVR v
     expandVR v = v
 
-    upper = alterVersion $ \numbers -> init numbers ++ [last numbers + 1]
+    upper = alterVersion $ \numbers -> case unsnoc numbers of
+      Nothing      -> []
+      Just (xs, x) -> xs ++ [x + 1]
 
 prop_isAnyVersion1 :: VersionRange -> Version -> Property
 prop_isAnyVersion1 range version =
@@ -362,11 +306,11 @@ prop_isNoVersion range version =
 prop_isSpecificVersion1 :: VersionRange -> NonEmptyList Version -> Property
 prop_isSpecificVersion1 range (NonEmpty versions) =
   isJust version && not (null versions') ==>
-    allEqual (fromJust version : versions')
+    allEqual (fromJust version) versions'
   where
-    version     = isSpecificVersion range
-    versions'   = filter (`withinRange` range) versions
-    allEqual xs = and (zipWith (==) xs (tail xs))
+    version       = isSpecificVersion range
+    versions'     = filter (`withinRange` range) versions
+    allEqual x xs = and (zipWith (==) (x:xs) xs)
 
 prop_isSpecificVersion2 :: VersionRange -> Property
 prop_isSpecificVersion2 range =
@@ -409,43 +353,6 @@ prop_simplifyVersionRange2'' r r' =
        simplifyVersionRange r == simplifyVersionRange r'
     || isNoVersion r
     || isNoVersion r'
-
---------------------
--- VersionIntervals
---
-
--- | Generating VersionIntervals
---
--- This is a tad tricky as VersionIntervals is an abstract type, so we first
--- make a local type for generating the internal representation. Then we check
--- that this lets us construct valid 'VersionIntervals'.
---
-
-instance Arbitrary VersionIntervals where
-  arbitrary = fmap mkVersionIntervals' arbitrary
-    where
-      mkVersionIntervals' :: [(Version, Bound)] -> VersionIntervals
-      mkVersionIntervals' = mkVersionIntervals . go version0
-        where
-          go :: Version -> [(Version, Bound)] -> [VersionInterval]
-          go _ [] = []
-          go v [(lv, lb)] =
-              [(LowerBound (addVersion lv v) lb, NoUpperBound)]
-          go v ((lv, lb) : (uv, ub) : rest) =
-              (LowerBound lv' lb, UpperBound uv' ub) : go uv' rest
-            where
-              lv' = addVersion v lv
-              uv' = addVersion lv' uv
-
-          addVersion :: Version -> Version -> Version
-          addVersion xs ys = mkVersion $  z (versionNumbers xs) (versionNumbers ys)
-            where
-              z [] ys' = ys'
-              z xs' [] = xs'
-              z (x : xs') (y : ys') = x + y : z xs' ys'
-
-instance Arbitrary Bound where
-  arbitrary = elements [ExclusiveBound, InclusiveBound]
 
 -- | Check that our VersionIntervals' arbitrary instance generates intervals
 -- that satisfies the invariant.
@@ -688,15 +595,7 @@ prop_parse_disp vr = counterexample (show (prettyShow vr')) $
 
 prop_parse_disp1 :: VersionRange -> Bool
 prop_parse_disp1 vr =
-    fmap stripParens (simpleParsec (prettyShow vr)) == Just (normaliseVersionRange vr)
-  where
-    stripParens :: VersionRange -> VersionRange
-    stripParens (VersionRangeParens v) = stripParens v
-    stripParens (UnionVersionRanges v1 v2) =
-      UnionVersionRanges (stripParens v1) (stripParens v2)
-    stripParens (IntersectVersionRanges v1 v2) =
-      IntersectVersionRanges (stripParens v1) (stripParens v2)
-    stripParens v = v
+    simpleParsec (prettyShow vr) == Just (normaliseVersionRange vr)
 
 prop_parse_disp2 :: VersionRange -> Property
 prop_parse_disp2 vr =
@@ -742,18 +641,14 @@ displayRaw =
 
     -- precedence:
     -- All the same as the usual pretty printer, except for the parens
-    alg AnyVersionF                     = Disp.text "-any"
     alg (ThisVersionF v)                = Disp.text "==" <<>> pretty v
     alg (LaterVersionF v)               = Disp.char '>'  <<>> pretty v
     alg (EarlierVersionF v)             = Disp.char '<'  <<>> pretty v
     alg (OrLaterVersionF v)             = Disp.text ">=" <<>> pretty v
     alg (OrEarlierVersionF v)           = Disp.text "<=" <<>> pretty v
-    alg (WildcardVersionF v)            = Disp.text "==" <<>> dispWild v
     alg (MajorBoundVersionF v)          = Disp.text "^>=" <<>> pretty v
     alg (UnionVersionRangesF r1 r2)     = r1 <+> Disp.text "||" <+> r2
     alg (IntersectVersionRangesF r1 r2) = r1 <+> Disp.text "&&" <+> r2
-    alg (VersionRangeParensF r)         = Disp.parens r -- parens
-
 
     dispWild v =
            Disp.hcat (Disp.punctuate (Disp.char '.')

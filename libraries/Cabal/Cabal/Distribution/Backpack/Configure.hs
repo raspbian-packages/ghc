@@ -27,14 +27,14 @@ import Distribution.Backpack.ReadyComponent
 import Distribution.Backpack.ComponentsGraph
 import Distribution.Backpack.Id
 
-import Distribution.Simple.Compiler hiding (Flag)
+import Distribution.Simple.Compiler
 import Distribution.Package
 import qualified Distribution.InstalledPackageInfo as Installed
 import Distribution.InstalledPackageInfo (InstalledPackageInfo
                                          ,emptyInstalledPackageInfo)
 import qualified Distribution.Simple.PackageIndex as PackageIndex
 import Distribution.Simple.PackageIndex (InstalledPackageIndex)
-import Distribution.PackageDescription as PD hiding (Flag)
+import Distribution.PackageDescription
 import Distribution.ModuleName
 import Distribution.Simple.Setup as Setup
 import Distribution.Simple.LocalBuildInfo
@@ -78,7 +78,7 @@ configureComponentLocalBuildInfos
     -- NB: In single component mode, this returns a *single* component.
     -- In this graph, the graph is NOT closed.
     graph0 <- case mkComponentsGraph enabled pkg_descr of
-                Left ccycle -> dieProgress (componentCycleMsg ccycle)
+                Left ccycle -> dieProgress (componentCycleMsg (package pkg_descr) ccycle)
                 Right g -> return (componentsGraphToList g)
     infoProgress $ hang (text "Source component graph:") 4
                         (dispComponentsWithDeps graph0)
@@ -162,7 +162,8 @@ toComponentLocalBuildInfos
                        . map Right
                        $ graph
         combined_graph = Graph.unionRight external_graph internal_graph
-        Just local_graph = Graph.closure combined_graph (map nodeKey graph)
+        local_graph = fromMaybe (error "toComponentLocalBuildInfos: closure returned Nothing")
+                    $ Graph.closure combined_graph (map nodeKey graph)
         -- The database of transitively reachable installed packages that the
         -- external components the package (as a whole) depends on.  This will be
         -- used in several ways:

@@ -57,8 +57,8 @@ import Distribution.Verbosity
 import qualified Distribution.Compat.CharParsing as P
 
 import Control.Monad ( msum )
-import Data.List ( stripPrefix, groupBy, partition )
-import Data.Either ( partitionEithers )
+import Data.List ( stripPrefix, groupBy )
+import qualified Data.List.NonEmpty as NE
 import System.FilePath as FilePath
          ( dropExtension, normalise, splitDirectories, joinPath, splitPath
          , hasTrailingPathSeparator )
@@ -153,7 +153,7 @@ readBuildTargets verbosity pkg targetStrs = do
 
     return btargets
 
-checkTargetExistsAsFile :: UserBuildTarget -> NoCallStackIO (UserBuildTarget, Bool)
+checkTargetExistsAsFile :: UserBuildTarget -> IO (UserBuildTarget, Bool)
 checkTargetExistsAsFile t = do
     fexists <- existsAsFile (fileComponentOfTarget t)
     return (t, fexists)
@@ -318,8 +318,9 @@ resolveBuildTarget pkg userTarget fexists =
 
   where
     classifyMatchErrors errs
-      | not (null expected) = let (things, got:_) = unzip expected in
-                              BuildTargetExpected userTarget things got
+      | Just expected' <- NE.nonEmpty expected
+                            = let (things, got:|_) = NE.unzip expected' in
+                              BuildTargetExpected userTarget (NE.toList things) got
       | not (null nosuch)   = BuildTargetNoSuch   userTarget nosuch
       | otherwise = error $ "resolveBuildTarget: internal error in matching"
       where
@@ -552,7 +553,7 @@ ex_cs =
 --
 
 data ComponentKind = LibKind | FLibKind | ExeKind | TestKind | BenchKind
-  deriving (Eq, Ord, Show)
+  deriving (Eq, Ord, Show, Enum, Bounded)
 
 componentKind :: ComponentName -> ComponentKind
 componentKind (CLibName   _) = LibKind

@@ -13,25 +13,25 @@ module GHCi.UI.Tags (
   createETagsFileCmd
 ) where
 
-import Exception
+import GHC.Utils.Exception
 import GHC
 import GHCi.UI.Monad
-import Outputable
+import GHC.Utils.Outputable
 
 -- ToDo: figure out whether we need these, and put something appropriate
 -- into the GHC API instead
-import Name (nameOccName)
-import OccName (pprOccName)
-import ConLike
-import MonadUtils
+import GHC.Types.Name (nameOccName)
+import GHC.Types.Name.Occurrence (pprOccName)
+import GHC.Core.ConLike
+import GHC.Utils.Monad
 
 import Control.Monad
 import Data.Function
 import Data.List
 import Data.Maybe
 import Data.Ord
-import DriverPhases
-import Panic
+import GHC.Driver.Phases
+import GHC.Utils.Panic
 import Prelude
 import System.Directory
 import System.IO
@@ -103,7 +103,7 @@ listModuleTags m = do
                      , let exported = GHC.modInfoIsExportedName mInfo name
                      , let kind = tyThing2TagKind tyThing
                      , let loc = srcSpanStart (nameSrcSpan name)
-                     , RealSrcLoc realLoc <- [loc]
+                     , RealSrcLoc realLoc _ <- [loc]
                      ]
 
   where

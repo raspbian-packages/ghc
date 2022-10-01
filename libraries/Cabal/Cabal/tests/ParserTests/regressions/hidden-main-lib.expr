@@ -6,11 +6,11 @@ GenericPackageDescription
                    CondNode
                      {condTreeComponents = [],
                       condTreeConstraints = [Dependency
-                                               `PackageName "base"`
-                                               AnyVersion
-                                               (Set.fromList [LMainLibName])],
+                                               (PackageName "base")
+                                               (OrLaterVersion (mkVersion [0]))
+                                               mainLibSet],
                       condTreeData = Library
-                                       {exposedModules = [`ModuleName ["ElseIf"]`],
+                                       {exposedModules = [ModuleName "ElseIf"],
                                         libBuildInfo = BuildInfo
                                                          {asmOptions = [],
                                                           asmSources = [],
@@ -54,10 +54,12 @@ GenericPackageDescription
                                                           sharedOptions = PerCompilerFlavor [] [],
                                                           staticOptions = PerCompilerFlavor [] [],
                                                           targetBuildDepends = [Dependency
-                                                                                  `PackageName "base"`
-                                                                                  AnyVersion
-                                                                                  (Set.fromList
-                                                                                     [LMainLibName])],
+                                                                                  (PackageName
+                                                                                     "base")
+                                                                                  (OrLaterVersion
+                                                                                     (mkVersion
+                                                                                        [0]))
+                                                                                  mainLibSet],
                                                           virtualModules = []},
                                         libExposed = True,
                                         libName = LMainLibName,
@@ -67,6 +69,7 @@ GenericPackageDescription
    condSubLibraries = [],
    condTestSuites = [],
    genPackageFlags = [],
+   gpdScannedVersion = Nothing,
    packageDescription = PackageDescription
                           {author = "",
                            benchmarks = [],
@@ -75,7 +78,7 @@ GenericPackageDescription
                            category = "",
                            copyright = "",
                            customFieldsPD = [],
-                           dataDir = "",
+                           dataDir = ".",
                            dataFiles = [],
                            description = "",
                            executables = [],
@@ -89,12 +92,12 @@ GenericPackageDescription
                            licenseRaw = Left NONE,
                            maintainer = "",
                            package = PackageIdentifier
-                                       {pkgName = `PackageName "hidden-main-lib"`,
-                                        pkgVersion = `mkVersion [0]`},
+                                       {pkgName = PackageName "hidden-main-lib",
+                                        pkgVersion = mkVersion [0]},
                            pkgUrl = "",
                            setupBuildInfo = Nothing,
                            sourceRepos = [],
-                           specVersionRaw = Left `mkVersion [2,5]`,
+                           specVersion = CabalSpecV3_0,
                            stability = "",
                            subLibraries = [],
                            synopsis = "main lib have to be visible",

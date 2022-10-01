@@ -1,3 +1,4 @@
+{-# LANGUAGE Safe #-}
 -- | contains a prettyprinter for the
 -- Template Haskell datatypes
 
@@ -123,7 +124,10 @@ isSymOcc n
 pprInfixExp :: Exp -> Doc
 pprInfixExp (VarE v) = pprName' Infix v
 pprInfixExp (ConE v) = pprName' Infix v
-pprInfixExp _        = text "<<Non-variable/constructor in infix context>>"
+pprInfixExp (UnboundVarE v) = pprName' Infix v
+-- This case will only ever be reached in exceptional circumstances.
+-- For example, when printing an error message in case of a malformed expression.
+pprInfixExp e = text "`" <> ppr e <> text "`"
 
 pprExp :: Precedence -> Exp -> Doc
 pprExp _ (VarE v)     = pprName' Applied v
@@ -150,8 +154,12 @@ pprExp i (LamE ps e) = parensIf (i > noPrec) $ char '\\' <> hsep (map (pprPat ap
                                            <+> text "->" <+> ppr e
 pprExp i (LamCaseE ms) = parensIf (i > noPrec)
                        $ text "\\case" $$ nest nestDepth (ppr ms)
-pprExp _ (TupE es) = parens (commaSep es)
-pprExp _ (UnboxedTupE es) = hashParens (commaSep es)
+pprExp i (TupE es)
+  | [Just e] <- es
+  = pprExp i (ConE (tupleDataName 1) `AppE` e)
+  | otherwise
+  = parens (commaSepWith (pprMaybeExp noPrec) es)
+pprExp _ (UnboxedTupE es) = hashParens (commaSepWith (pprMaybeExp noPrec) es)
 pprExp _ (UnboxedSumE e alt arity) = unboxedSumBars (ppr e) alt arity
 -- Nesting in Cond is to avoid potential problems in do statements
 pprExp i (CondE guard true false)
@@ -174,13 +182,19 @@ pprExp i (LetE ds_ e) = parensIf (i > noPrec) $ text "let" <+> pprDecs ds_
 pprExp i (CaseE e ms)
  = parensIf (i > noPrec) $ text "case" <+> ppr e <+> text "of"
                         $$ nest nestDepth (ppr ms)
-pprExp i (DoE ss_) = parensIf (i > noPrec) $ text "do" <+> pprStms ss_
+pprExp i (DoE m ss_) = parensIf (i > noPrec) $
+    pprQualifier m <> text "do" <+> pprStms ss_
   where
+    pprQualifier Nothing = empty
+    pprQualifier (Just modName) = text (modString modName) <> char '.'
     pprStms []  = empty
     pprStms [s] = ppr s
     pprStms ss  = braces (semiSep ss)
-pprExp i (MDoE ss_) = parensIf (i > noPrec) $ text "mdo" <+> pprStms ss_
+pprExp i (MDoE m ss_) = parensIf (i > noPrec) $
+    pprQualifier m <> text "mdo" <+> pprStms ss_
   where
+    pprQualifier Nothing = empty
+    pprQualifier (Just modName) = text (modString modName) <> char '.'
     pprStms []  = empty
     pprStms [s] = ppr s
     pprStms ss  = braces (semiSep ss)
@@ -268,6 +282,7 @@ pprLit _ (CharL c)       = text (show c)
 pprLit _ (CharPrimL c)   = text (show c) <> char '#'
 pprLit _ (StringL s)     = pprString s
 pprLit _ (StringPrimL s) = pprString (bytesToString s) <> char '#'
+pprLit _ (BytesPrimL {}) = pprString "<binary data>"
 pprLit i (RationalL rat) = parensIf (i > noPrec) $
                            integer (numerator rat) <+> char '/'
                               <+> integer (denominator rat)
@@ -287,7 +302,11 @@ instance Ppr Pat where
 pprPat :: Precedence -> Pat -> Doc
 pprPat i (LitP l)     = pprLit i l
 pprPat _ (VarP v)     = pprName' Applied v
-pprPat _ (TupP ps)    = parens (commaSep ps)
+pprPat i (TupP ps)
+  | [_] <- ps
+  = pprPat i (ConP (tupleDataName 1) ps)
+  | otherwise
+  = parens (commaSep ps)
 pprPat _ (UnboxedTupP ps) = hashParens (commaSep ps)
 pprPat _ (UnboxedSumP p alt arity) = unboxedSumBars (ppr p) alt arity
 pprPat i (ConP s ps)  = parensIf (i >= appPrec) $ pprName' Applied s
@@ -337,6 +356,7 @@ ppr_dec _ (InstanceD o ctxt i ds) =
         text "instance" <+> maybe empty ppr_overlap o <+> pprCxt ctxt <+> ppr i
                                   $$ where_clause ds
 ppr_dec _ (SigD f t)    = pprPrefixOcc f <+> dcolon <+> ppr t
+ppr_dec _ (KiSigD f k)  = text "type" <+> pprPrefixOcc f <+> dcolon <+> ppr k
 ppr_dec _ (ForeignD f)  = ppr f
 ppr_dec _ (InfixD fx n) = pprFixity n fx
 ppr_dec _ (PragmaD p)   = ppr p
@@ -497,7 +517,7 @@ ppr_tf_head (TypeFamilyHead tc tvs res inj)
     maybeInj | (Just inj') <- inj = ppr inj'
              | otherwise          = empty
 
-ppr_bndrs :: Maybe [TyVarBndr] -> Doc
+ppr_bndrs :: PprFlag flag => Maybe [TyVarBndr flag] -> Doc
 ppr_bndrs (Just bndrs) = text "forall" <+> sep (map ppr bndrs) <> text "."
 ppr_bndrs Nothing = empty
 
@@ -646,13 +666,24 @@ instance Ppr PatSynArgs where
 commaSepApplied :: [Name] -> Doc
 commaSepApplied = commaSepWith (pprName' Applied)
 
-pprForall :: [TyVarBndr] -> Cxt -> Doc
-pprForall tvs cxt
+pprForall :: [TyVarBndr Specificity] -> Cxt -> Doc
+pprForall = pprForall' ForallInvis
+
+pprForallVis :: [TyVarBndr ()] -> Cxt -> Doc
+pprForallVis = pprForall' ForallVis
+
+pprForall' :: PprFlag flag => ForallVisFlag -> [TyVarBndr flag] -> Cxt -> Doc
+pprForall' fvf tvs cxt
   -- even in the case without any tvs, there could be a non-empty
   -- context cxt (e.g., in the case of pattern synonyms, where there
   -- are multiple forall binders and contexts).
   | [] <- tvs = pprCxt cxt
-  | otherwise = text "forall" <+> hsep (map ppr tvs) <+> char '.' <+> pprCxt cxt
+  | otherwise = text "forall" <+> hsep (map ppr tvs)
+                              <+> separator <+> pprCxt cxt
+  where
+    separator = case fvf of
+                  ForallVis   -> text "->"
+                  ForallInvis -> char '.'
 
 pprRecFields :: [(Name, Strict, Type)] -> Type -> Doc
 pprRecFields vsts ty
@@ -726,14 +757,17 @@ pprParendType (VarT v)            = pprName' Applied v
 -- `Applied` is used here instead of `ppr` because of infix names (#13887)
 pprParendType (ConT c)            = pprName' Applied c
 pprParendType (TupleT 0)          = text "()"
+pprParendType (TupleT 1)          = pprParendType (ConT (tupleTypeName 1))
 pprParendType (TupleT n)          = parens (hcat (replicate (n-1) comma))
 pprParendType (UnboxedTupleT n)   = hashParens $ hcat $ replicate (n-1) comma
 pprParendType (UnboxedSumT arity) = hashParens $ hcat $ replicate (arity-1) bar
 pprParendType ArrowT              = parens (text "->")
+pprParendType MulArrowT           = text "FUN"
 pprParendType ListT               = text "[]"
 pprParendType (LitT l)            = pprTyLit l
 pprParendType (PromotedT c)       = text "'" <> pprName' Applied c
 pprParendType (PromotedTupleT 0)  = text "'()"
+pprParendType (PromotedTupleT 1)  = pprParendType (PromotedT (tupleDataName 1))
 pprParendType (PromotedTupleT n)  = quoteParens (hcat (replicate (n-1) comma))
 pprParendType PromotedNilT        = text "'[]"
 pprParendType PromotedConsT       = text "'(:)"
@@ -750,6 +784,7 @@ pprParendType tuple | (TupleT n, args) <- split tuple
 pprParendType (ImplicitParamT n t)= text ('?':n) <+> text "::" <+> ppr t
 pprParendType EqualityT           = text "(~)"
 pprParendType t@(ForallT {})      = parens (ppr t)
+pprParendType t@(ForallVisT {})   = parens (ppr t)
 pprParendType t@(AppT {})         = parens (ppr t)
 pprParendType t@(AppKindT {})     = parens (ppr t)
 
@@ -759,41 +794,66 @@ pprUInfixT t               = ppr t
 
 instance Ppr Type where
     ppr (ForallT tvars ctxt ty) = sep [pprForall tvars ctxt, ppr ty]
+    ppr (ForallVisT tvars ty)   = sep [pprForallVis tvars [], ppr ty]
     ppr ty = pprTyApp (split ty)
-       -- Works, in a degnerate way, for SigT, and puts parens round (ty :: kind)
+       -- Works, in a degenerate way, for SigT, and puts parens round (ty :: kind)
        -- See Note [Pretty-printing kind signatures]
 instance Ppr TypeArg where
-    ppr (TANormal ty) = ppr ty
-    ppr (TyArg ki) = char '@' <> ppr ki
+    ppr (TANormal ty) = parensIf (isStarT ty) (ppr ty)
+    ppr (TyArg ki) = char '@' <> parensIf (isStarT ki) (ppr ki)
 
 pprParendTypeArg :: TypeArg -> Doc
-pprParendTypeArg (TANormal ty) = pprParendType ty
-pprParendTypeArg (TyArg ki) = char '@' <> pprParendType ki
+pprParendTypeArg (TANormal ty) = parensIf (isStarT ty) (pprParendType ty)
+pprParendTypeArg (TyArg ki) = char '@' <> parensIf (isStarT ki) (pprParendType ki)
+
+isStarT :: Type -> Bool
+isStarT StarT = True
+isStarT _ = False
+
 {- Note [Pretty-printing kind signatures]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 GHC's parser only recognises a kind signature in a type when there are
 parens around it.  E.g. the parens are required here:
    f :: (Int :: *)
    type instance F Int = (Bool :: *)
-So we always print a SigT with parens (see Trac #10050). -}
+So we always print a SigT with parens (see #10050). -}
 
 pprTyApp :: (Type, [TypeArg]) -> Doc
+pprTyApp (MulArrowT, [TANormal (PromotedT c), TANormal arg1, TANormal arg2])
+  | c == oneName  = sep [pprFunArgType arg1 <+> text "%1 ->", ppr arg2]
+  | c == manyName = sep [pprFunArgType arg1 <+> text "->", ppr arg2]
+pprTyApp (MulArrowT, [TANormal argm, TANormal arg1, TANormal arg2]) =
+                     sep [pprFunArgType arg1 <+> text "%" <> ppr argm <+> text "->", ppr arg2]
 pprTyApp (ArrowT, [TANormal arg1, TANormal arg2]) = sep [pprFunArgType arg1 <+> text "->", ppr arg2]
 pprTyApp (EqualityT, [TANormal arg1, TANormal arg2]) =
     sep [pprFunArgType arg1 <+> text "~", ppr arg2]
 pprTyApp (ListT, [TANormal arg]) = brackets (ppr arg)
+pprTyApp (TupleT 1, args) = pprTyApp (ConT (tupleTypeName 1), args)
+pprTyApp (PromotedTupleT 1, args) = pprTyApp (PromotedT (tupleDataName 1), args)
 pprTyApp (TupleT n, args)
- | length args == n = parens (commaSep args)
+ | length args == n, Just args' <- traverse fromTANormal args
+ = parens (commaSep args')
 pprTyApp (PromotedTupleT n, args)
- | length args == n = quoteParens (commaSep args)
+ | length args == n, Just args' <- traverse fromTANormal args
+ = quoteParens (commaSep args')
 pprTyApp (fun, args) = pprParendType fun <+> sep (map pprParendTypeArg args)
+
+fromTANormal :: TypeArg -> Maybe Type
+fromTANormal (TANormal arg) = Just arg
+fromTANormal (TyArg _) = Nothing
 
 pprFunArgType :: Type -> Doc    -- Should really use a precedence argument
 -- Everything except forall and (->) binds more tightly than (->)
 pprFunArgType ty@(ForallT {})                 = parens (ppr ty)
+pprFunArgType ty@(ForallVisT {})              = parens (ppr ty)
+pprFunArgType ty@(((MulArrowT `AppT` _) `AppT` _) `AppT` _)  = parens (ppr ty)
 pprFunArgType ty@((ArrowT `AppT` _) `AppT` _) = parens (ppr ty)
 pprFunArgType ty@(SigT _ _)                   = parens (ppr ty)
 pprFunArgType ty                              = ppr ty
+
+data ForallVisFlag = ForallVis   -- forall a -> {...}
+                   | ForallInvis -- forall a.   {...}
+  deriving Show
 
 data TypeArg = TANormal Type
              | TyArg Kind
@@ -812,9 +872,21 @@ instance Ppr TyLit where
   ppr = pprTyLit
 
 ------------------------------
-instance Ppr TyVarBndr where
-    ppr (PlainTV nm)    = ppr nm
-    ppr (KindedTV nm k) = parens (ppr nm <+> dcolon <+> ppr k)
+class PprFlag flag where
+    pprTyVarBndr :: (TyVarBndr flag) -> Doc
+
+instance PprFlag () where
+    pprTyVarBndr (PlainTV nm ())    = ppr nm
+    pprTyVarBndr (KindedTV nm () k) = parens (ppr nm <+> dcolon <+> ppr k)
+
+instance PprFlag Specificity where
+    pprTyVarBndr (PlainTV nm SpecifiedSpec)    = ppr nm
+    pprTyVarBndr (PlainTV nm InferredSpec)     = braces (ppr nm)
+    pprTyVarBndr (KindedTV nm SpecifiedSpec k) = parens (ppr nm <+> dcolon <+> ppr k)
+    pprTyVarBndr (KindedTV nm InferredSpec  k) = braces (ppr nm <+> dcolon <+> ppr k)
+
+instance PprFlag flag => Ppr (TyVarBndr flag) where
+    ppr bndr = pprTyVarBndr bndr
 
 instance Ppr Role where
     ppr NominalR          = text "nominal"

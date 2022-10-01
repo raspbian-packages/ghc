@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP, RankNTypes, ScopedTypeVariables #-}
+{-# LANGUAGE BangPatterns #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 -----------------------------------------------------------------------------
 -- |
@@ -21,30 +22,29 @@ module Haddock.InterfaceFile (
 
 
 import Haddock.Types
-import Haddock.Utils hiding (out)
 
 import Control.Monad
+import Control.Monad.IO.Class ( MonadIO(..) )
 import Data.Array
 import Data.IORef
-import Data.List
+import Data.List (mapAccumR)
 import qualified Data.Map as Map
 import Data.Map (Map)
 import Data.Word
 
-import BinIface (getSymtabName, getDictFastString)
-import Binary
-import FastMutInt
-import FastString
+import GHC.Iface.Binary (getSymtabName, getDictFastString)
+import GHC.Utils.Binary
+import GHC.Data.FastMutInt
+import GHC.Data.FastString
 import GHC hiding (NoLink)
-import GhcMonad (withSession)
-import HscTypes
-import NameCache
-import IfaceEnv
-import Name
-import UniqFM
-import UniqSupply
-import Unique
-
+import GHC.Driver.Monad (withSession)
+import GHC.Driver.Types
+import GHC.Types.Name.Cache
+import GHC.Iface.Env
+import GHC.Types.Name
+import GHC.Types.Unique.FM
+import GHC.Types.Unique.Supply
+import GHC.Types.Unique
 
 data InterfaceFile = InterfaceFile {
   ifLinkEnv         :: LinkEnv,
@@ -58,16 +58,28 @@ ifModule if_ =
     [] -> error "empty InterfaceFile"
     iface:_ -> instMod iface
 
-ifUnitId :: InterfaceFile -> UnitId
+ifUnitId :: InterfaceFile -> Unit
 ifUnitId if_ =
   case ifInstalledIfaces if_ of
     [] -> error "empty InterfaceFile"
-    iface:_ -> moduleUnitId $ instMod iface
+    iface:_ -> moduleUnit $ instMod iface
 
 
 binaryInterfaceMagic :: Word32
 binaryInterfaceMagic = 0xD0Cface
 
+-- Note [The DocModule story]
+--
+-- Breaking changes to the DocH type result in Haddock being unable to read
+-- existing interfaces. This is especially painful for interfaces shipped
+-- with GHC distributions since there is no easy way to regenerate them!
+--
+-- PR #1315 introduced a breaking change to the DocModule constructor. To
+-- maintain backward compatibility we
+--
+-- Parse the old DocModule constructor format (tag 5) and parse the contained
+-- string into a proper ModLink structure. When writing interfaces we exclusively
+-- use the new DocModule format (tag 24)
 
 -- IMPORTANT: Since datatypes in the GHC API might change between major
 -- versions, and because we store GHC datatypes in our interface files, we need
@@ -82,11 +94,11 @@ binaryInterfaceMagic = 0xD0Cface
 -- (2) set `binaryInterfaceVersionCompatibility` to [binaryInterfaceVersion]
 --
 binaryInterfaceVersion :: Word16
-#if (__GLASGOW_HASKELL__ >= 807) && (__GLASGOW_HASKELL__ < 809)
-binaryInterfaceVersion = 35
+#if MIN_VERSION_ghc(9,0,0) && !MIN_VERSION_ghc(9,1,0)
+binaryInterfaceVersion = 38
 
 binaryInterfaceVersionCompatibility :: [Word16]
-binaryInterfaceVersionCompatibility = [binaryInterfaceVersion]
+binaryInterfaceVersionCompatibility = [37, binaryInterfaceVersion]
 #else
 #error Unsupported GHC version
 #endif
@@ -158,7 +170,7 @@ writeInterfaceFile filename iface = do
 type NameCacheAccessor m = (m NameCache, NameCache -> m ())
 
 
-nameCacheFromGhc :: forall m. (GhcMonad m, MonadIO m) => NameCacheAccessor m
+nameCacheFromGhc :: forall m. GhcMonad m => NameCacheAccessor m
 nameCacheFromGhc = ( read_from_session , write_to_session )
   where
     read_from_session = do
@@ -276,7 +288,7 @@ putName BinSymbolTable{
 
 data BinSymbolTable = BinSymbolTable {
         bin_symtab_next :: !FastMutInt, -- The next index to use
-        bin_symtab_map  :: !(IORef (UniqFM (Int,Name)))
+        bin_symtab_map  :: !(IORef (UniqFM Name (Int,Name)))
                                 -- indexed by Name
   }
 
@@ -286,24 +298,24 @@ putFastString BinDictionary { bin_dict_next = j_r,
                               bin_dict_map  = out_r}  bh f
   = do
     out <- readIORef out_r
-    let unique = getUnique f
-    case lookupUFM out unique of
+    let !unique = getUnique f
+    case lookupUFM_Directly out unique of
         Just (j, _)  -> put_ bh (fromIntegral j :: Word32)
         Nothing -> do
            j <- readFastMutInt j_r
            put_ bh (fromIntegral j :: Word32)
            writeFastMutInt j_r (j + 1)
-           writeIORef out_r $! addToUFM out unique (j, f)
+           writeIORef out_r $! addToUFM_Directly out unique (j, f)
 
 
 data BinDictionary = BinDictionary {
         bin_dict_next :: !FastMutInt, -- The next index to use
-        bin_dict_map  :: !(IORef (UniqFM (Int,FastString)))
+        bin_dict_map  :: !(IORef (UniqFM FastString (Int,FastString)))
                                 -- indexed by FastString
   }
 
 
-putSymbolTable :: BinHandle -> Int -> UniqFM (Int,Name) -> IO ()
+putSymbolTable :: BinHandle -> Int -> UniqFM Name (Int,Name) -> IO ()
 putSymbolTable bh next_off symtab = do
   put_ bh next_off
   let names = elems (array (0,next_off-1) (eltsUFM symtab))
@@ -319,7 +331,7 @@ getSymbolTable bh namecache = do
   return (namecache', arr)
 
 
-type OnDiskName = (UnitId, ModuleName, OccName)
+type OnDiskName = (Unit, ModuleName, OccName)
 
 
 fromOnDiskName
@@ -346,10 +358,10 @@ fromOnDiskName _ nc (pid, mod_name, occ) =
         }
 
 
-serialiseName :: BinHandle -> Name -> UniqFM (Int,Name) -> IO ()
+serialiseName :: BinHandle -> Name -> UniqFM Name (Int,Name) -> IO ()
 serialiseName bh name _ = do
   let modu = nameModule name
-  put_ bh (moduleUnitId modu, moduleName modu, nameOccName name)
+  put_ bh (moduleUnit modu, moduleName modu, nameOccName name)
 
 
 -------------------------------------------------------------------------------
@@ -443,6 +455,15 @@ instance Binary a => Binary (Hyperlink a) where
         label <- get bh
         return (Hyperlink url label)
 
+instance Binary a => Binary (ModLink a) where
+    put_ bh (ModLink m label) = do
+        put_ bh m
+        put_ bh label
+    get bh = do
+        m <- get bh
+        label <- get bh
+        return (ModLink m label)
+
 instance Binary Picture where
     put_ bh (Picture uri title) = do
         put_ bh uri
@@ -521,9 +542,6 @@ instance (Binary mod, Binary id) => Binary (DocH mod id) where
     put_ bh (DocIdentifier ae) = do
             putByte bh 4
             put_ bh ae
-    put_ bh (DocModule af) = do
-            putByte bh 5
-            put_ bh af
     put_ bh (DocEmphasis ag) = do
             putByte bh 6
             put_ bh ag
@@ -578,6 +596,10 @@ instance (Binary mod, Binary id) => Binary (DocH mod id) where
     put_ bh (DocTable x) = do
             putByte bh 23
             put_ bh x
+    -- See note [The DocModule story]
+    put_ bh (DocModule af) = do
+            putByte bh 24
+            put_ bh af
 
     get bh = do
             h <- getByte bh
@@ -597,9 +619,13 @@ instance (Binary mod, Binary id) => Binary (DocH mod id) where
               4 -> do
                     ae <- get bh
                     return (DocIdentifier ae)
+              -- See note [The DocModule story]
               5 -> do
                     af <- get bh
-                    return (DocModule af)
+                    return $ DocModule ModLink
+                      { modLinkName  = af
+                      , modLinkLabel = Nothing
+                      }
               6 -> do
                     ag <- get bh
                     return (DocEmphasis ag)
@@ -654,6 +680,10 @@ instance (Binary mod, Binary id) => Binary (DocH mod id) where
               23 -> do
                     x <- get bh
                     return (DocTable x)
+              -- See note [The DocModule story]
+              24 -> do
+                    af <- get bh
+                    return (DocModule af)
               _ -> error "invalid binary data found in the interface file"
 
 

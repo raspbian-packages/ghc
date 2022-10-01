@@ -28,43 +28,8 @@ def die(mesg):
     print_err(mesg)
     sys.exit(1)
 
-def check_for_url_rewrites():
-    if os.path.isdir('.git') and \
-       subprocess.check_output('git config remote.origin.url'.split()).find(b'github.com') != -1 and \
-       subprocess.call(['git', 'config', '--get-regexp', '^url.*github.com/.*/packages-.insteadOf']) != 0:
-        # If we cloned from github, make sure the url rewrites are set.
-        # Otherwise 'git submodule update --init' prints confusing errors.
-        die("""\
-            It seems you cloned this repository from GitHub. But your git config files
-            don't contain the url rewrites that are needed to make this work (GitHub
-            doesn't support '/' in repository names, so we use a different naming scheme
-            for the submodule repositories there).
-
-            Please run the following commands first:
-
-              git config --global url."git://github.com/ghc/packages-".insteadOf     git://github.com/ghc/packages/
-              git config --global url."http://github.com/ghc/packages-".insteadOf    http://github.com/ghc/packages/
-              git config --global url."https://github.com/ghc/packages-".insteadOf   https://github.com/ghc/packages/
-              git config --global url."ssh://git\@github.com/ghc/packages-".insteadOf ssh://git\@github.com/ghc/packages/
-              git config --global url."git\@github.com:/ghc/packages-".insteadOf      git\@github.com:/ghc/packages/
-
-            And then:
-
-              git submodule update --init
-              ./boot
-
-            Or start over, and clone the GHC repository from the haskell server:
-
-              git clone --recursive git@gitlab.haskell.org:ghc/ghc.git
-
-            For more information, see:
-              * https://ghc.haskell.org/trac/ghc/wiki/Newcomers or
-              * https://ghc.haskell.org/trac/ghc/wiki/Building/GettingTheSources#CloningfromGitHub
-        """)
-
 def check_boot_packages():
     # Check that we have all boot packages.
-    import re
     for l in open('packages', 'r'):
         if l.startswith('#'):
             continue
@@ -126,6 +91,9 @@ def boot_pkgs():
                 top = os.path.join(*['..'] * len(os.path.normpath(package).split(os.path.sep)))
 
                 ghc_mk = os.path.join(package, 'ghc.mk')
+                if os.path.exists(ghc_mk):
+                    print('Skipping %s which already exists' % ghc_mk)
+                    continue
                 print('Creating %s' % ghc_mk)
                 with open(ghc_mk, 'w') as f:
                     f.write(dedent(
@@ -194,10 +162,9 @@ def check_build_mk():
             than simply building it to use it.
 
             For information on creating a mk/build.mk file, please see:
-                http://ghc.haskell.org/trac/ghc/wiki/Building/Using#Buildconfiguration
+                https://gitlab.haskell.org/ghc/ghc/wikis/building/using#build-configuration
             """))
 
-check_for_url_rewrites()
 check_boot_packages()
 if not args.hadrian:
     boot_pkgs()

@@ -6,14 +6,13 @@ GenericPackageDescription
                    CondNode
                      {condTreeComponents = [],
                       condTreeConstraints = [Dependency
-                                               `PackageName "base"`
-                                               (VersionRangeParens
-                                                  (UnionVersionRanges
-                                                     (LaterVersion `mkVersion [4,4]`)
-                                                     (ThisVersion `mkVersion [4,4]`)))
-                                               (Set.fromList [LMainLibName])],
+                                               (PackageName "base")
+                                               (UnionVersionRanges
+                                                  (LaterVersion (mkVersion [4, 4]))
+                                                  (ThisVersion (mkVersion [4, 4])))
+                                               mainLibSet],
                       condTreeData = Library
-                                       {exposedModules = [`ModuleName ["Data","Encoding"]`],
+                                       {exposedModules = [ModuleName "Data.Encoding"],
                                         libBuildInfo = BuildInfo
                                                          {asmOptions = [],
                                                           asmSources = [],
@@ -63,15 +62,16 @@ GenericPackageDescription
                                                           sharedOptions = PerCompilerFlavor [] [],
                                                           staticOptions = PerCompilerFlavor [] [],
                                                           targetBuildDepends = [Dependency
-                                                                                  `PackageName "base"`
-                                                                                  (VersionRangeParens
-                                                                                     (UnionVersionRanges
-                                                                                        (LaterVersion
-                                                                                           `mkVersion [4,4]`)
-                                                                                        (ThisVersion
-                                                                                           `mkVersion [4,4]`)))
-                                                                                  (Set.fromList
-                                                                                     [LMainLibName])],
+                                                                                  (PackageName
+                                                                                     "base")
+                                                                                  (UnionVersionRanges
+                                                                                     (LaterVersion
+                                                                                        (mkVersion
+                                                                                           [4, 4]))
+                                                                                     (ThisVersion
+                                                                                        (mkVersion
+                                                                                           [4, 4])))
+                                                                                  mainLibSet],
                                                           virtualModules = []},
                                         libExposed = True,
                                         libName = LMainLibName,
@@ -81,6 +81,7 @@ GenericPackageDescription
    condSubLibraries = [],
    condTestSuites = [],
    genPackageFlags = [],
+   gpdScannedVersion = Nothing,
    packageDescription = PackageDescription
                           {author = "",
                            benchmarks = [],
@@ -89,7 +90,7 @@ GenericPackageDescription
                            category = "",
                            copyright = "",
                            customFieldsPD = [],
-                           dataDir = "",
+                           dataDir = ".",
                            dataFiles = [],
                            description = "",
                            executables = [],
@@ -103,22 +104,22 @@ GenericPackageDescription
                            licenseRaw = Left NONE,
                            maintainer = "",
                            package = PackageIdentifier
-                                       {pkgName = `PackageName "encoding"`,
-                                        pkgVersion = `mkVersion [0,8]`},
+                                       {pkgName = PackageName "encoding",
+                                        pkgVersion = mkVersion [0, 8]},
                            pkgUrl = "",
                            setupBuildInfo = Just
                                               SetupBuildInfo
                                                 {defaultSetupDepends = False,
                                                  setupDepends = [Dependency
-                                                                   `PackageName "base"`
-                                                                   (EarlierVersion `mkVersion [5]`)
-                                                                   (Set.fromList [LMainLibName]),
+                                                                   (PackageName "base")
+                                                                   (EarlierVersion (mkVersion [5]))
+                                                                   mainLibSet,
                                                                  Dependency
-                                                                   `PackageName "ghc-prim"`
-                                                                   AnyVersion
-                                                                   (Set.fromList [LMainLibName])]},
+                                                                   (PackageName "ghc-prim")
+                                                                   (OrLaterVersion (mkVersion [0]))
+                                                                   mainLibSet]},
                            sourceRepos = [],
-                           specVersionRaw = Right (OrLaterVersion `mkVersion [1,12]`),
+                           specVersion = CabalSpecV1_12,
                            stability = "",
                            subLibraries = [],
                            synopsis = "",

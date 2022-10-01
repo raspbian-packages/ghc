@@ -1,11 +1,15 @@
+-- WARNING: template-haskell.cabal is automatically generated from template-haskell.cabal.in by
+-- ../../configure.  Make sure you are editing template-haskell.cabal.in, not
+-- template-haskell.cabal.
+
 name:           template-haskell
-version:        2.15.0.0
+version:        2.17.0.0
 -- NOTE: Don't forget to update ./changelog.md
 license:        BSD3
 license-file:   LICENSE
 category:       Template Haskell
 maintainer:     libraries@haskell.org
-bug-reports:    http://ghc.haskell.org/trac/ghc/newticket?component=Template%20Haskell
+bug-reports:    https://gitlab.haskell.org/ghc/ghc/issues/new
 synopsis:       Support library for Template Haskell
 build-type:     Simple
 Cabal-Version:  >= 1.10
@@ -44,15 +48,16 @@ Library
         Language.Haskell.TH.Quote
         Language.Haskell.TH.Syntax
         Language.Haskell.TH.LanguageExtensions
-
+        Language.Haskell.TH.CodeDo
         Language.Haskell.TH.Lib.Internal
 
     other-modules:
         Language.Haskell.TH.Lib.Map
 
     build-depends:
-        base        >= 4.11 && < 4.14,
-        ghc-boot-th == 8.8.*,
+        base        >= 4.11 && < 4.16,
+        ghc-boot-th == 9.0.2,
+        ghc-prim,
         pretty      == 1.1.*
 
     ghc-options: -Wall

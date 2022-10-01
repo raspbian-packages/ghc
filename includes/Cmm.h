@@ -7,7 +7,7 @@
  * making .cmm code a bit less error-prone to write, and a bit easier
  * on the eye for the reader.
  *
- * For the syntax of .cmm files, see the parser in ghc/compiler/cmm/CmmParse.y.
+ * For the syntax of .cmm files, see the parser in ghc/compiler/GHC/Cmm/Parser.y.
  *
  * Accessing fields of structures defined in the RTS header files is
  * done via automatically-generated macros in DerivedConstants.h.  For
@@ -73,7 +73,7 @@
 
 /*
  * The RTS must sometimes UNTAG a pointer before dereferencing it.
- * See the wiki page Commentary/Rts/HaskellExecution/PointerTagging
+ * See the wiki page commentary/rts/haskell-execution/pointer-tagging
  */
 #define TAG_MASK ((1 << TAG_BITS) - 1)
 #define UNTAG(p) (p & ~TAG_MASK)
@@ -159,14 +159,19 @@
 #define BYTES_TO_WDS(n) ((n) / SIZEOF_W)
 #define ROUNDUP_BYTES_TO_WDS(n) (((n) + SIZEOF_W - 1) / SIZEOF_W)
 
-/* TO_W_(n) converts n to W_ type from a smaller type */
+/*
+ * TO_W_(n) and TO_ZXW_(n) convert n to W_ type from a smaller type,
+ * with and without sign extension respectively
+ */
 #if SIZEOF_W == 4
 #define TO_I64(x) %sx64(x)
 #define TO_W_(x) %sx32(x)
+#define TO_ZXW_(x) %zx32(x)
 #define HALF_W_(x) %lobits16(x)
 #elif SIZEOF_W == 8
 #define TO_I64(x) (x)
 #define TO_W_(x) %sx64(x)
+#define TO_ZXW_(x) %zx64(x)
 #define HALF_W_(x) %lobits32(x)
 #endif
 
@@ -353,7 +358,7 @@
  * Need MachRegs, because some of the RTS code is conditionally
  * compiled based on REG_R1, REG_R2, etc.
  */
-#include "stg/RtsMachRegs.h"
+#include "stg/MachRegsForHost.h"
 
 #include "rts/prof/LDV.h"
 
@@ -464,7 +469,7 @@
 // Version of GC_PRIM for use in low-level Cmm.  We can call
 // stg_gc_prim, because it takes one argument and therefore has a
 // platform-independent calling convention (Note [Syntax of .cmm
-// files] in CmmParse.y).
+// files] in GHC.Cmm.Parser).
 #define GC_PRIM_LL(fun)                         \
         R1 = fun;                               \
         jump stg_gc_prim [R1];
@@ -618,15 +623,18 @@
 #define mutArrPtrCardUp(i)   (((i) + mutArrCardMask) >> MUT_ARR_PTRS_CARD_BITS)
 #define mutArrPtrsCardWords(n) ROUNDUP_BYTES_TO_WDS(mutArrPtrCardUp(n))
 
-#if defined(PROFILING) || (!defined(THREADED_RTS) && defined(DEBUG))
+#if defined(PROFILING) || defined(DEBUG)
 #define OVERWRITING_CLOSURE_SIZE(c, size) foreign "C" overwritingClosureSize(c "ptr", size)
 #define OVERWRITING_CLOSURE(c) foreign "C" overwritingClosure(c "ptr")
-#define OVERWRITING_CLOSURE_OFS(c,n) foreign "C" overwritingClosureOfs(c "ptr", n)
+#define OVERWRITING_CLOSURE_MUTABLE(c, off) foreign "C" overwritingMutableClosureOfs(c "ptr", off)
 #else
 #define OVERWRITING_CLOSURE_SIZE(c, size) /* nothing */
 #define OVERWRITING_CLOSURE(c) /* nothing */
-#define OVERWRITING_CLOSURE_OFS(c,n) /* nothing */
+#define OVERWRITING_CLOSURE_MUTABLE(c, off) /* nothing */
 #endif
+
+#define IS_STACK_CLEAN(stack) \
+    ((TO_W_(StgStack_dirty(stack)) & STACK_DIRTY) == 0)
 
 // Memory barriers.
 // For discussion of how these are used to fence heap object
@@ -735,75 +743,6 @@
     TICK_BUMP_BY(ALLOC_RTS_tot,bytes)
 
 /* -----------------------------------------------------------------------------
-   Saving and restoring STG registers
-
-   STG registers must be saved around a C call, just in case the STG
-   register is mapped to a caller-saves machine register.  Normally we
-   don't need to worry about this the code generator has already
-   loaded any live STG registers into variables for us, but in
-   hand-written low-level Cmm code where we don't know which registers
-   are live, we might have to save them all.
-   -------------------------------------------------------------------------- */
-
-#define SAVE_STGREGS                            \
-    W_ r1, r2, r3,  r4,  r5,  r6,  r7,  r8;     \
-    F_ f1, f2, f3, f4, f5, f6;                  \
-    D_ d1, d2, d3, d4, d5, d6;                  \
-    L_ l1;                                      \
-                                                \
-    r1 = R1;                                    \
-    r2 = R2;                                    \
-    r3 = R3;                                    \
-    r4 = R4;                                    \
-    r5 = R5;                                    \
-    r6 = R6;                                    \
-    r7 = R7;                                    \
-    r8 = R8;                                    \
-                                                \
-    f1 = F1;                                    \
-    f2 = F2;                                    \
-    f3 = F3;                                    \
-    f4 = F4;                                    \
-    f5 = F5;                                    \
-    f6 = F6;                                    \
-                                                \
-    d1 = D1;                                    \
-    d2 = D2;                                    \
-    d3 = D3;                                    \
-    d4 = D4;                                    \
-    d5 = D5;                                    \
-    d6 = D6;                                    \
-                                                \
-    l1 = L1;
-
-
-#define RESTORE_STGREGS                         \
-    R1 = r1;                                    \
-    R2 = r2;                                    \
-    R3 = r3;                                    \
-    R4 = r4;                                    \
-    R5 = r5;                                    \
-    R6 = r6;                                    \
-    R7 = r7;                                    \
-    R8 = r8;                                    \
-                                                \
-    F1 = f1;                                    \
-    F2 = f2;                                    \
-    F3 = f3;                                    \
-    F4 = f4;                                    \
-    F5 = f5;                                    \
-    F6 = f6;                                    \
-                                                \
-    D1 = d1;                                    \
-    D2 = d2;                                    \
-    D3 = d3;                                    \
-    D4 = d4;                                    \
-    D5 = d5;                                    \
-    D6 = d6;                                    \
-                                                \
-    L1 = l1;
-
-/* -----------------------------------------------------------------------------
    Misc junk
    -------------------------------------------------------------------------- */
 
@@ -836,6 +775,7 @@
       __bd = Bdescr(__p);                                       \
       __gen = TO_W_(bdescr_gen_no(__bd));                       \
       if (__gen > 0) { recordMutableCap(__p, __gen); }
+
 
 /* -----------------------------------------------------------------------------
    Arrays
@@ -939,3 +879,25 @@
     prim %memcpy(dst_p, src_p, n * SIZEOF_W, SIZEOF_W);        \
                                                                \
     return (dst);
+
+
+//
+// Nonmoving write barrier helpers
+//
+// See Note [Update remembered set] in NonMovingMark.c.
+
+#if defined(THREADED_RTS)
+#define IF_NONMOVING_WRITE_BARRIER_ENABLED                     \
+    if (W_[nonmoving_write_barrier_enabled] != 0) (likely: False)
+#else
+// A similar measure is also taken in rts/NonMoving.h, but that isn't visible from C--
+#define IF_NONMOVING_WRITE_BARRIER_ENABLED                     \
+    if (0)
+#define nonmoving_write_barrier_enabled 0
+#endif
+
+// A useful helper for pushing a pointer to the update remembered set.
+#define updateRemembSetPushPtr(p)                                    \
+    IF_NONMOVING_WRITE_BARRIER_ENABLED {                             \
+      ccall updateRemembSetPushClosure_(BaseReg "ptr", p "ptr");     \
+    }

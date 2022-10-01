@@ -26,6 +26,8 @@ cabal-tests.log
 /cabal-install/Setup
 /cabal-install/source-file-list
 
+# Output of release and bootstrap
+_build
 
 # editor temp files
 
@@ -50,6 +52,7 @@ ctags
 
 # stack artifacts
 /.stack-work/
+stack.yaml.lock
 
 # Shake artifacts
 .shake*
@@ -60,3 +63,6 @@ register.sh
 
 # python artifacts from documentation builds
 *.pyc
+
+# macOS folder metadata
+.DS_Store

@@ -13,7 +13,7 @@
  * DerivedConstants.h by a C program (mkDerivedConstantsHdr).
  *
  * To understand the structure of the RTS headers, see the wiki:
- *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/SourceTree/Includes
+ *   https://gitlab.haskell.org/ghc/ghc/wikis/commentary/source-tree/includes
  *
  * -------------------------------------------------------------------------- */
 
@@ -22,9 +22,11 @@
 /* -----------------------------------------------------------------------------
    Minimum closure sizes
 
-   This is the minimum number of words in the payload of a
-   heap-allocated closure, so that the closure has enough room to be
-   overwritten with a forwarding pointer during garbage collection.
+   This is the minimum number of words in the payload of a heap-allocated
+   closure, so that the closure has two bits in the bitmap for mark-compact
+   collection.
+
+   See Note [Mark bits in mark-compact collector] in rts/sm/Compact.h
    -------------------------------------------------------------------------- */
 
 #define MIN_PAYLOAD_SIZE 1
@@ -59,7 +61,7 @@
  *   NB. This corresponds with the number of actual INTLIKE/CHARLIKE
  *   closures defined in rts/StgMiscClosures.cmm.
  */
-#define MAX_INTLIKE             16
+#define MAX_INTLIKE             255
 #define MIN_INTLIKE             (-16)
 
 #define MAX_CHARLIKE            255
@@ -254,7 +256,13 @@
    by tryWakeupThread() */
 #define ThreadMigrating     13
 
-/* WARNING WARNING top number is BlockedOnMVarRead 14, not 13!! */
+/* Lightweight non-deadlock checked version of MVar.  Used for the why_blocked
+   field of a TSO. Threads blocked for this reason are not forcibly release by
+   the GC, as we expect them to be unblocked in the future based on outstanding
+   IO events.  */
+#define BlockedOnIOCompletion  15
+
+/* Next number is 16.  */
 
 /*
  * These constants are returned to the scheduler by a thread that has

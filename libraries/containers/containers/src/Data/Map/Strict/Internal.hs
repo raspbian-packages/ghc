@@ -145,6 +145,9 @@ module Data.Map.Strict.Internal
     -- ** Disjoint
     , disjoint
 
+    -- ** Compose
+    , compose
+
     -- ** General combining function
     , SimpleWhenMissing
     , SimpleWhenMatched
@@ -332,6 +335,7 @@ import Data.Map.Internal
   , balance
   , balanceL
   , balanceR
+  , compose
   , elemAt
   , elems
   , empty
@@ -851,6 +855,8 @@ alter = go
 --
 -- Note: 'alterF' is a flipped version of the @at@ combinator from
 -- @Control.Lens.At@.
+--
+-- @since 0.5.8
 alterF :: (Functor f, Ord k)
        => (Maybe a -> f (Maybe a)) -> k -> Map k a -> f (Map k a)
 alterF f k m = atKeyImpl Strict k f m
@@ -1432,7 +1438,7 @@ mapAccumL f a (Bin sx kx x l r) =
       (a3,r') = mapAccumL f a2 r
   in x' `seq` (a3,Bin sx kx x' l' r')
 
--- | /O(n)/. The function 'mapAccumR' threads an accumulating
+-- | /O(n)/. The function 'mapAccumRWithKey' threads an accumulating
 -- argument through the map in descending order of keys.
 mapAccumRWithKey :: (a -> k -> b -> (a,c)) -> a -> Map k b -> (a,Map k c)
 mapAccumRWithKey _ a Tip = (a,Tip)

@@ -3,6 +3,7 @@
 
 module Documentation.Haddock.ParserSpec (main, spec) where
 
+import           Data.Char (isSpace)
 import           Data.String
 import qualified Documentation.Haddock.Parser as Parse
 import           Documentation.Haddock.Types
@@ -288,8 +289,10 @@ spec = do
       it "parses a single word anchor" $ do
         "#foo#" `shouldParseTo` DocAName "foo"
 
-      it "parses a multi word anchor" $ do
-        "#foo bar#" `shouldParseTo` DocAName "foo bar"
+      -- Spaces are not allowed:
+      -- https://www.w3.org/TR/html51/dom.html#the-id-attribute
+      it "doesn't parse a multi word anchor" $ do
+        "#foo bar#" `shouldParseTo` "#foo bar#"
 
       it "parses a unicode anchor" $ do
         "#灼眼のシャナ#" `shouldParseTo` DocAName "灼眼のシャナ"
@@ -303,6 +306,9 @@ spec = do
 
       it "does not accept empty anchors" $ do
         "##" `shouldParseTo` "##"
+
+      it "does not accept anchors containing spaces" $ do
+        "{-# LANGUAGE GADTs #-}" `shouldParseTo` "{-# LANGUAGE GADTs #-}"
 
     context "when parsing emphasised text" $ do
       it "emphasises a word on its own" $ do
@@ -397,20 +403,20 @@ spec = do
     context "when parsing module strings" $ do
       it "should parse a module on its own" $ do
         "\"Module\"" `shouldParseTo`
-          DocModule "Module"
+          DocModule (ModLink "Module" Nothing)
 
       it "should parse a module inline" $ do
         "This is a \"Module\"." `shouldParseTo`
-          "This is a " <> DocModule "Module" <> "."
+          "This is a " <> DocModule (ModLink "Module" Nothing) <> "."
 
       it "can accept a simple module name" $ do
-        "\"Hello\"" `shouldParseTo` DocModule "Hello"
+        "\"Hello\"" `shouldParseTo` DocModule (ModLink "Hello" Nothing)
 
       it "can accept a module name with dots" $ do
-        "\"Hello.World\"" `shouldParseTo` DocModule "Hello.World"
+        "\"Hello.World\"" `shouldParseTo` DocModule (ModLink "Hello.World" Nothing)
 
       it "can accept a module name with unicode" $ do
-        "\"Hello.Worldλ\"" `shouldParseTo` DocModule "Hello.Worldλ"
+        "\"Hello.Worldλ\"" `shouldParseTo` DocModule (ModLink "Hello.Worldλ" Nothing)
 
       it "parses a module name with a trailing dot as regular quoted string" $ do
         "\"Hello.\"" `shouldParseTo` "\"Hello.\""
@@ -422,16 +428,85 @@ spec = do
         "\"Hello&[{}(=*)+]!\"" `shouldParseTo` "\"Hello&[{}(=*)+]!\""
 
       it "accepts a module name with unicode" $ do
-        "\"Foo.Barλ\"" `shouldParseTo` DocModule "Foo.Barλ"
+        "\"Foo.Barλ\"" `shouldParseTo` DocModule (ModLink "Foo.Barλ" Nothing)
 
       it "treats empty module name as regular double quotes" $ do
         "\"\"" `shouldParseTo` "\"\""
 
       it "accepts anchor reference syntax as DocModule" $ do
-        "\"Foo#bar\"" `shouldParseTo` DocModule "Foo#bar"
+        "\"Foo#bar\"" `shouldParseTo` DocModule (ModLink "Foo#bar" Nothing)
+
+      it "accepts anchor with hyphen as DocModule" $ do
+        "\"Foo#bar-baz\"" `shouldParseTo` DocModule (ModLink "Foo#bar-baz" Nothing)
 
       it "accepts old anchor reference syntax as DocModule" $ do
-        "\"Foo\\#bar\"" `shouldParseTo` DocModule "Foo\\#bar"
+        "\"Foo\\#bar\"" `shouldParseTo` DocModule (ModLink "Foo\\#bar" Nothing)
+
+    context "when parsing labeled module links" $ do
+      it "parses a simple labeled module link" $ do
+        "[some label](\"Some.Module\")" `shouldParseTo`
+          DocModule (ModLink "Some.Module" (Just "some label"))
+
+      it "allows escaping in label" $ do
+        "[some\\] label](\"Some.Module\")" `shouldParseTo`
+          DocModule (ModLink "Some.Module" (Just "some] label"))
+
+      it "strips leading and trailing whitespace from label" $ do
+        "[  some label  ](\"Some.Module\")" `shouldParseTo`
+          DocModule (ModLink "Some.Module" (Just "some label"))
+
+      it "allows whitespace in module name link" $ do
+        "[some label]( \"Some.Module\"\t )" `shouldParseTo`
+          DocModule (ModLink "Some.Module" (Just "some label"))
+
+      it "allows inline markup in the label" $ do
+        "[something /emphasized/](\"Some.Module\")" `shouldParseTo`
+          DocModule (ModLink "Some.Module" (Just ("something " <> DocEmphasis "emphasized")))
+
+      it "should parse a labeled module on its own" $ do
+        "[label](\"Module\")" `shouldParseTo`
+          DocModule (ModLink "Module" (Just "label"))
+
+      it "should parse a labeled module inline" $ do
+        "This is a [label](\"Module\")." `shouldParseTo`
+          "This is a " <> DocModule (ModLink "Module" (Just "label")) <> "."
+
+      it "can accept a labeled module name with dots" $ do
+        "[label](\"Hello.World\")" `shouldParseTo` DocModule (ModLink "Hello.World" (Just "label"))
+
+      it "can accept a labeled module name with unicode" $ do
+        "[label](\"Hello.Worldλ\")" `shouldParseTo` DocModule (ModLink "Hello.Worldλ" (Just "label"))
+
+      it "parses a labeled module name with a trailing dot as a hyperlink" $ do
+        "[label](\"Hello.\")" `shouldParseTo`
+          hyperlink "\"Hello.\"" (Just "label")
+
+      it "parses a labeled module name with a space as a regular string" $ do
+        "[label](\"Hello World\")" `shouldParseTo` "[label](\"Hello World\")"
+
+      it "parses a module name with invalid characters as a hyperlink" $ do
+        "[label](\"Hello&[{}(=*+]!\")" `shouldParseTo`
+          hyperlink "\"Hello&[{}(=*+]!\"" (Just "label")
+
+      it "accepts a labeled module name with unicode" $ do
+        "[label](\"Foo.Barλ\")" `shouldParseTo`
+          DocModule (ModLink "Foo.Barλ" (Just "label"))
+
+      it "treats empty labeled module name as empty hyperlink" $ do
+        "[label](\"\")" `shouldParseTo`
+          hyperlink "\"\"" (Just "label")
+
+      it "accepts anchor reference syntax for labeled module name" $ do
+        "[label](\"Foo#bar\")" `shouldParseTo`
+          DocModule (ModLink "Foo#bar" (Just "label"))
+
+      it "accepts old anchor reference syntax for labeled module name" $ do
+        "[label](\"Foo\\#bar\")" `shouldParseTo`
+          DocModule (ModLink "Foo\\#bar" (Just "label"))
+
+      it "interprets empty label as a unlabeled module name" $ do
+        "[](\"Module.Name\")" `shouldParseTo`
+          "[](" <> DocModule (ModLink "Module.Name" Nothing) <> ")"
 
   describe "parseParas" $ do
     let infix 1 `shouldParseTo`
@@ -441,6 +516,10 @@ spec = do
     it "is total" $ do
       property $ \xs ->
         (length . show . parseParas) xs `shouldSatisfy` (> 0)
+
+    -- See <https://github.com/haskell/haddock/issues/1142>
+    it "doesn't crash on unicode whitespace" $ do
+      "\8197" `shouldParseTo` DocEmpty
 
     context "when parsing @since" $ do
       it "adds specified version to the result" $ do
@@ -470,7 +549,8 @@ spec = do
 
 
     context "when parsing text paragraphs" $ do
-      let filterSpecial = filter (`notElem` (".(=#-[*`\v\f\n\t\r\\\"'_/@<> " :: String))
+      let isSpecial c = isSpace c || c `elem` (".(=#-[*`\\\"'_/@<>" :: String)
+          filterSpecial = filter (not . isSpecial)
 
       it "parses an empty paragraph" $ do
         "" `shouldParseTo` DocEmpty

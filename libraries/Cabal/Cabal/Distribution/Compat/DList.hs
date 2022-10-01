@@ -12,6 +12,7 @@
 module Distribution.Compat.DList (
     DList,
     runDList,
+    empty,
     singleton,
     fromList,
     toList,
@@ -19,7 +20,7 @@ module Distribution.Compat.DList (
 ) where
 
 import Prelude ()
-import Distribution.Compat.Prelude
+import Distribution.Compat.Prelude hiding (toList, empty)
 
 -- | Difference list.
 newtype DList a = DList ([a] -> [a])
@@ -31,6 +32,10 @@ runDList (DList run) = run []
 singleton :: a -> DList a
 singleton a = DList (a:)
 
+-- | @since 3.4.0.0
+empty :: DList a
+empty = DList id
+
 fromList :: [a] -> DList a
 fromList as = DList (as ++)
 
@@ -41,7 +46,7 @@ snoc :: DList a -> a -> DList a
 snoc xs x = xs <> singleton x
 
 instance Monoid (DList a) where
-  mempty = DList id
+  mempty  = empty
   mappend = (<>)
 
 instance Semigroup (DList a) where

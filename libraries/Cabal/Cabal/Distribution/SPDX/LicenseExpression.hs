@@ -16,7 +16,6 @@ import Distribution.SPDX.LicenseId
 import Distribution.SPDX.LicenseListVersion
 import Distribution.SPDX.LicenseReference
 import Distribution.Utils.Generic           (isAsciiAlphaNum)
-import Text.PrettyPrint                     ((<+>))
 
 import qualified Distribution.Compat.CharParsing as P
 import qualified Text.PrettyPrint                as Disp
@@ -60,6 +59,8 @@ simpleLicenseExpression i = ELicense (ELicenseId i) Nothing
 
 instance Binary LicenseExpression
 instance Binary SimpleLicenseExpression
+instance Structured SimpleLicenseExpression
+instance Structured LicenseExpression
 
 instance Pretty LicenseExpression where
     pretty = go 0

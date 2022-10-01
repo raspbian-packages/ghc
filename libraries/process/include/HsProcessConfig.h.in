@@ -6,6 +6,21 @@
 /* The value of SIG_IGN. */
 #undef CONST_SIG_IGN
 
+/* Define to 1 if you have the declaration of `POSIX_SPAWN_SETPGROUP', and to
+   0 if you don't. */
+#undef HAVE_DECL_POSIX_SPAWN_SETPGROUP
+
+/* Define to 1 if you have the declaration of `POSIX_SPAWN_SETSID', and to 0
+   if you don't. */
+#undef HAVE_DECL_POSIX_SPAWN_SETSID
+
+/* Define to 1 if you have the declaration of `POSIX_SPAWN_SETSID_NP', and to
+   0 if you don't. */
+#undef HAVE_DECL_POSIX_SPAWN_SETSID_NP
+
+/* Define to 1 if you have the `execvpe' function. */
+#undef HAVE_EXECVPE
+
 /* Define to 1 if you have the <fcntl.h> header file. */
 #undef HAVE_FCNTL_H
 
@@ -15,8 +30,12 @@
 /* Define to 1 if you have the <inttypes.h> header file. */
 #undef HAVE_INTTYPES_H
 
-/* Define to 1 if you have the <memory.h> header file. */
-#undef HAVE_MEMORY_H
+/* Define to 1 if you have the `posix_spawnp' function. */
+#undef HAVE_POSIX_SPAWNP
+
+/* Define to 1 if you have the `posix_spawn_file_actions_addchdir' function.
+   */
+#undef HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCHDIR
 
 /* Define to 1 if you have the `setitimer' function. */
 #undef HAVE_SETITIMER
@@ -24,8 +43,14 @@
 /* Define to 1 if you have the <signal.h> header file. */
 #undef HAVE_SIGNAL_H
 
+/* Define to 1 if you have the <spawn.h> header file. */
+#undef HAVE_SPAWN_H
+
 /* Define to 1 if you have the <stdint.h> header file. */
 #undef HAVE_STDINT_H
+
+/* Define to 1 if you have the <stdio.h> header file. */
+#undef HAVE_STDIO_H
 
 /* Define to 1 if you have the <stdlib.h> header file. */
 #undef HAVE_STDLIB_H
@@ -81,10 +106,12 @@
 /* Define to the version of this package. */
 #undef PACKAGE_VERSION
 
-/* Define to 1 if you have the ANSI C header files. */
+/* Define to 1 if all of the C90 standard headers exist (not just the ones
+   required in a freestanding environment). This macro is provided for
+   backward compatibility; new code need not use it. */
 #undef STDC_HEADERS
 
-/* Define to `int' if <sys/types.h> does not define. */
+/* Define as a signed integer type capable of holding a process identifier. */
 #undef pid_t
 
 /* Define as `fork' if `vfork' does not work. */

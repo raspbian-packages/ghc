@@ -1,11 +1,13 @@
 Nix-style Local Builds
 ======================
 
+.. _nix-style-builds:
+
 Nix-style local builds are a new build system implementation inspired by Nix.
 The Nix-style local build system is commonly called "v2-build" for short
 after the ``cabal v2-*`` family of commands that control it. However, those
-names are only temporary until Nix-style local builds become the default.
-This is expected to happen soon. For those who do not wish to use the new
+names are only temporary now that Nix-style local builds have become the
+default. For those who do not wish to use the new
 functionality, the classic project style will not be removed immediately,
 but these legacy commands will require the usage of the ``v1-`` prefix as of
 Cabal 3.0 and will be removed in a future release. For a future-proof
@@ -16,7 +18,7 @@ until such a point as it is completely removed from Cabal.
 
 Nix-style local builds combine the best of non-sandboxed and sandboxed Cabal:
 
-1. Like sandboxed Cabal today, we build sets of independent local
+1. Like sandboxed Cabal previously, we build sets of independent local
    packages deterministically and independent of any global state.
    v2-build will never tell you that it can't build your package
    because it would result in a "dangerous reinstall." Given a

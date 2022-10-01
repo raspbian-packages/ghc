@@ -15,7 +15,8 @@ module Distribution.Fields.ParseResult (
     getCabalSpecVersion,
     setCabalSpecVersion,
     readAndParseFile,
-    parseString
+    parseString,
+    withoutWarnings,
     ) where
 
 import qualified Data.ByteString.Char8        as BS
@@ -42,21 +43,32 @@ newtype ParseResult a = PR
         -> r
     }
 
+-- Note: we have version here, as we could get any version.
 data PRState = PRState ![PWarning] ![PError] !(Maybe Version)
 
 emptyPRState :: PRState
 emptyPRState = PRState [] [] Nothing
 
+-- | Forget 'ParseResult's warnings.
+--
+-- @since 3.4.0.0
+withoutWarnings :: ParseResult a -> ParseResult a
+withoutWarnings m = PR $ \s failure success ->
+    unPR m s failure $ \ !s1 -> success (s1 `withWarningsOf` s)
+  where
+    withWarningsOf (PRState _ e v) (PRState w _ _) = PRState w e v
+
 -- | Destruct a 'ParseResult' into the emitted warnings and either
 -- a successful value or
 -- list of errors and possibly recovered a spec-version declaration.
-runParseResult :: ParseResult a -> ([PWarning], Either (Maybe Version, [PError]) a)
+runParseResult :: ParseResult a -> ([PWarning], Either (Maybe Version, NonEmpty PError) a)
 runParseResult pr = unPR pr emptyPRState failure success
   where
-    failure (PRState warns errs v)   = (warns, Left (v, errs))
-    success (PRState warns [] _)   x = (warns, Right x)
+    failure (PRState warns []         v)   = (warns, Left (v, PError zeroPos "panic" :| []))
+    failure (PRState warns (err:errs) v)   = (warns, Left (v, err :| errs)) where
+    success (PRState warns []         _)   x = (warns, Right x)
     -- If there are any errors, don't return the result
-    success (PRState warns errs v) _ = (warns, Left (v, errs))
+    success (PRState warns (err:errs) v) _ = (warns, Left (v, err :| errs))
 
 instance Functor ParseResult where
     fmap f (PR pr) = PR $ \ !s failure success ->

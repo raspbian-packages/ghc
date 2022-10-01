@@ -15,6 +15,8 @@ module Distribution.Client.CmdUpdate (
 import Prelude ()
 import Distribution.Client.Compat.Prelude
 
+import Distribution.Client.NixStyleOptions
+         ( NixStyleFlags (..), nixStyleOptions, defaultNixStyleFlags )
 import Distribution.Client.Compat.Directory
          ( setModificationTime )
 import Distribution.Client.ProjectOrchestration
@@ -23,8 +25,10 @@ import Distribution.Client.ProjectConfig
          , ProjectConfigShared(projectConfigConfigFile)
          , projectConfigWithSolverRepoContext
          , withProjectOrGlobalConfig )
+import Distribution.Client.ProjectFlags
+         ( ProjectFlags (..) )
 import Distribution.Client.Types
-         ( Repo(..), RemoteRepo(..), isRepoRemote )
+         ( Repo(..), RepoName (..), unRepoName, RemoteRepo(..), repoName )
 import Distribution.Client.HttpUtils
          ( DownloadResult(..) )
 import Distribution.Client.FetchUtils
@@ -32,46 +36,43 @@ import Distribution.Client.FetchUtils
 import Distribution.Client.JobControl
          ( newParallelJobControl, spawnJob, collectJob )
 import Distribution.Client.Setup
-         ( GlobalFlags, ConfigFlags(..), ConfigExFlags, InstallFlags
+         ( GlobalFlags, ConfigFlags(..)
          , UpdateFlags, defaultUpdateFlags
          , RepoContext(..) )
-import Distribution.Simple.Setup
-         ( HaddockFlags, TestFlags, fromFlagOrDefault )
+import Distribution.Simple.Flag
+         ( fromFlagOrDefault )
 import Distribution.Simple.Utils
          ( die', notice, wrapText, writeFileAtomic, noticeNoWrap )
 import Distribution.Verbosity
-         ( Verbosity, normal, lessVerbose )
+         ( normal, lessVerbose )
 import Distribution.Client.IndexUtils.Timestamp
+import Distribution.Client.IndexUtils.IndexState
 import Distribution.Client.IndexUtils
          ( updateRepoIndexCache, Index(..), writeIndexTimestamp
-         , currentIndexTimestamp, indexBaseName )
-import Distribution.Deprecated.Text
-         ( Text(..), display, simpleParse )
+         , currentIndexTimestamp, indexBaseName, updatePackageIndexCacheFile )
 
-import Data.Maybe (fromJust)
-import qualified Distribution.Deprecated.ReadP  as ReadP
-import qualified Text.PrettyPrint           as Disp
+import qualified Data.Maybe as Unsafe (fromJust)
+import qualified Distribution.Compat.CharParsing as P
+import qualified Text.PrettyPrint                as Disp
 
-import Control.Monad (mapM, mapM_)
 import qualified Data.ByteString.Lazy       as BS
 import Distribution.Client.GZipUtils (maybeDecompress)
 import System.FilePath ((<.>), dropExtension)
 import Data.Time (getCurrentTime)
 import Distribution.Simple.Command
          ( CommandUI(..), usageAlternatives )
-import qualified Distribution.Client.Setup as Client
 
 import qualified Hackage.Security.Client as Sec
 
-updateCommand :: CommandUI ( ConfigFlags, ConfigExFlags
-                           , InstallFlags, HaddockFlags, TestFlags )
-updateCommand = Client.installCommand {
-  commandName         = "v2-update",
-  commandSynopsis     = "Updates list of known packages.",
-  commandUsage        = usageAlternatives "v2-update" [ "[FLAGS] [REPOS]" ],
-  commandDescription  = Just $ \_ -> wrapText $
-        "For all known remote repositories, download the package list.",
-  commandNotes        = Just $ \pname ->
+updateCommand :: CommandUI (NixStyleFlags ())
+updateCommand = CommandUI
+  { commandName         = "v2-update"
+  , commandSynopsis     = "Updates list of known packages."
+  , commandUsage        = usageAlternatives "v2-update" [ "[FLAGS] [REPOS]" ]
+  , commandDescription  = Just $ \_ -> wrapText $
+          "For all known remote repositories, download the package list."
+
+  , commandNotes        = Just $ \pname ->
         "REPO has the format <repo-id>[,<index-state>] where index-state follows\n"
      ++ "the same format and syntax that is supported by the --index-state flag.\n\n"
      ++ "Examples:\n"
@@ -85,54 +86,48 @@ updateCommand = Client.installCommand {
      ++ "  " ++ pname ++ " new update hackage.haskell.org head.hackage\n"
      ++ "    Download hackage.haskell.org and head.hackage\n"
      ++ "    head.hackage must be a known repo-id. E.g. from\n"
-     ++ "    your cabal.project(.local) file.\n\n"
-     ++ "Note: this command is part of the new project-based system (aka "
-     ++ "nix-style\nlocal builds). These features are currently in beta. "
-     ++ "Please see\n"
-     ++ "http://cabal.readthedocs.io/en/latest/nix-local-build-overview.html "
-     ++ "for\ndetails and advice on what you can expect to work. If you "
-     ++ "encounter problems\nplease file issues at "
-     ++ "https://github.com/haskell/cabal/issues and if you\nhave any time "
-     ++ "to get involved and help with testing, fixing bugs etc then\nthat "
-     ++ "is very much appreciated.\n"
+     ++ "    your cabal.project(.local) file.\n"
+
+  , commandOptions      = nixStyleOptions $ const []
+  , commandDefaultFlags = defaultNixStyleFlags ()
   }
 
 data UpdateRequest = UpdateRequest
-  { _updateRequestRepoName :: String
-  , _updateRequestRepoState :: IndexState
+  { _updateRequestRepoName  :: RepoName
+  , _updateRequestRepoState :: RepoIndexState
   } deriving (Show)
 
-instance Text UpdateRequest where
-  disp (UpdateRequest n s) = Disp.text n Disp.<> Disp.char ',' Disp.<> disp s
-  parse = parseWithState ReadP.+++ parseHEAD
-    where parseWithState = do
-            name <- ReadP.many1 (ReadP.satisfy (\c -> c /= ','))
-            _ <- ReadP.char ','
-            state <- parse
-            return (UpdateRequest name state)
-          parseHEAD = do
-            name <- ReadP.manyTill (ReadP.satisfy (\c -> c /= ',')) ReadP.eof
-            return (UpdateRequest name IndexStateHead)
+instance Pretty UpdateRequest where
+    pretty (UpdateRequest n s) = pretty n <<>> Disp.comma <<>> pretty s
 
-updateAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags, TestFlags)
-             -> [String] -> GlobalFlags -> IO ()
-updateAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags)
-             extraArgs globalFlags = do
-  projectConfig <- withProjectOrGlobalConfig verbosity globalConfigFlag
+instance Parsec UpdateRequest where
+  parsec = do
+      name <- parsec
+      state <- P.char ',' *> parsec <|> pure IndexStateHead
+      return (UpdateRequest name state)
+
+updateAction :: NixStyleFlags () -> [String] -> GlobalFlags -> IO ()
+updateAction flags@NixStyleFlags {..} extraArgs globalFlags = do
+  let ignoreProject = flagIgnoreProject projectFlags
+
+  projectConfig <- withProjectOrGlobalConfig verbosity ignoreProject globalConfigFlag
     (projectConfig <$> establishProjectBaseContext verbosity cliConfig OtherCommand)
     (\globalConfig -> return $ globalConfig <> cliConfig)
 
   projectConfigWithSolverRepoContext verbosity
     (projectConfigShared projectConfig) (projectConfigBuildOnly projectConfig)
     $ \repoCtxt -> do
-    let repos       = filter isRepoRemote $ repoContextRepos repoCtxt
-        repoName    = remoteRepoName . repoRemote
+
+    let repos :: [Repo]
+        repos = repoContextRepos repoCtxt
+
         parseArg :: String -> IO UpdateRequest
-        parseArg s = case simpleParse s of
+        parseArg s = case simpleParsec s of
           Just r -> return r
           Nothing -> die' verbosity $
                      "'v2-update' unable to parse repo: \"" ++ s ++ "\""
-    updateRepoRequests <- mapM parseArg extraArgs
+
+    updateRepoRequests <- traverse parseArg extraArgs
 
     unless (null updateRepoRequests) $ do
       let remoteRepoNames = map repoName repos
@@ -140,49 +135,50 @@ updateAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags)
                             , not (r `elem` remoteRepoNames)]
       unless (null unknownRepos) $
         die' verbosity $ "'v2-update' repo(s): \""
-                         ++ intercalate "\", \"" unknownRepos
+                         ++ intercalate "\", \"" (map unRepoName unknownRepos)
                          ++ "\" can not be found in known remote repo(s): "
-                         ++ intercalate ", " remoteRepoNames
+                         ++ intercalate ", " (map unRepoName remoteRepoNames)
 
-    let reposToUpdate :: [(Repo, IndexState)]
+    let reposToUpdate :: [(Repo, RepoIndexState)]
         reposToUpdate = case updateRepoRequests of
           -- If we are not given any specific repository, update all
           -- repositories to HEAD.
           [] -> map (,IndexStateHead) repos
           updateRequests -> let repoMap = [(repoName r, r) | r <- repos]
-                                lookup' k = fromJust (lookup k repoMap)
+                                lookup' k = Unsafe.fromJust (lookup k repoMap)
                             in [ (lookup' name, state)
                                | (UpdateRequest name state) <- updateRequests ]
 
     case reposToUpdate of
-      [] -> return ()
+      [] ->
+        notice verbosity "No remote repositories configured"
       [(remoteRepo, _)] ->
         notice verbosity $ "Downloading the latest package list from "
-                        ++ repoName remoteRepo
+                        ++ unRepoName (repoName remoteRepo)
       _ -> notice verbosity . unlines
               $ "Downloading the latest package lists from: "
-              : map (("- " ++) . repoName . fst) reposToUpdate
+              : map (("- " ++) . unRepoName . repoName . fst) reposToUpdate
 
-    jobCtrl <- newParallelJobControl (length reposToUpdate)
-    mapM_ (spawnJob jobCtrl . updateRepo verbosity defaultUpdateFlags repoCtxt)
-      reposToUpdate
-    mapM_ (\_ -> collectJob jobCtrl) reposToUpdate
+    unless (null reposToUpdate) $ do
+      jobCtrl <- newParallelJobControl (length reposToUpdate)
+      traverse_ (spawnJob jobCtrl . updateRepo verbosity defaultUpdateFlags repoCtxt)
+        reposToUpdate
+      traverse_ (\_ -> collectJob jobCtrl) reposToUpdate
 
   where
     verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
-    cliConfig = commandLineFlagsToProjectConfig
-                  globalFlags configFlags configExFlags
-                  installFlags
-                  mempty -- ClientInstallFlags, not needed here
-                  haddockFlags testFlags
+    cliConfig = commandLineFlagsToProjectConfig globalFlags flags mempty -- ClientInstallFlags, not needed here
     globalConfigFlag = projectConfigConfigFile (projectConfigShared cliConfig)
 
-updateRepo :: Verbosity -> UpdateFlags -> RepoContext -> (Repo, IndexState)
+updateRepo :: Verbosity -> UpdateFlags -> RepoContext -> (Repo, RepoIndexState)
            -> IO ()
 updateRepo verbosity _updateFlags repoCtxt (repo, indexState) = do
   transport <- repoContextGetTransport repoCtxt
   case repo of
-    RepoLocal{..} -> return ()
+    RepoLocalNoIndex{} -> do
+      let index = RepoIndex repoCtxt repo
+      updatePackageIndexCacheFile verbosity index
+
     RepoRemote{..} -> do
       downloadResult <- downloadIndex transport verbosity
                         repoRemote repoLocalDir
@@ -205,19 +201,30 @@ updateRepo verbosity _updateFlags repoCtxt (repo, indexState) = do
               then Just `fmap` getCurrentTime
               else return Nothing
       updated <- Sec.uncheckClientErrors $ Sec.checkForUpdates repoSecure ce
+
+      let rname = remoteRepoName (repoRemote repo)
+
       -- Update cabal's internal index as well so that it's not out of sync
       -- (If all access to the cache goes through hackage-security this can go)
       case updated of
-        Sec.NoUpdates  ->
-          setModificationTime (indexBaseName repo <.> "tar")
-          =<< getCurrentTime
-        Sec.HasUpdates ->
+        Sec.NoUpdates  -> do
+          now <- getCurrentTime
+          setModificationTime (indexBaseName repo <.> "tar") now
+          noticeNoWrap verbosity $
+            "Package list of " ++ prettyShow rname ++
+            " is up to date at index-state " ++ prettyShow (IndexStateTime current_ts)
+
+        Sec.HasUpdates -> do
           updateRepoIndexCache verbosity index
-      -- TODO: This will print multiple times if there are multiple
-      -- repositories: main problem is we don't have a way of updating
-      -- a specific repo.  Once we implement that, update this.
-      when (current_ts /= nullTimestamp) $
-        noticeNoWrap verbosity $
-          "To revert to previous state run:\n" ++
-          "    cabal v2-update '" ++ remoteRepoName (repoRemote repo)
-          ++ "," ++ display current_ts ++ "'\n"
+          new_ts <- currentIndexTimestamp (lessVerbose verbosity) repoCtxt repo
+          noticeNoWrap verbosity $
+            "Updated package list of " ++ prettyShow rname ++
+            " to the index-state " ++ prettyShow (IndexStateTime new_ts)
+
+          -- TODO: This will print multiple times if there are multiple
+          -- repositories: main problem is we don't have a way of updating
+          -- a specific repo.  Once we implement that, update this.
+          when (current_ts /= nullTimestamp) $
+            noticeNoWrap verbosity $
+              "To revert to previous state run:\n" ++
+              "    cabal v2-update '" ++ prettyShow (UpdateRequest rname (IndexStateTime current_ts)) ++ "'\n"

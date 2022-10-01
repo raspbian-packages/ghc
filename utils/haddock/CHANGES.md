@@ -1,3 +1,37 @@
+## Changes in 2.25.1
+
+  * Better support for multiple packages (#1277)
+
+## Changes in 2.25.0
+
+ * Fix crash in `haddock-library` on unicode space (#1144)
+
+ * Disallow qualified uses of reserved identifiers (#1145)
+
+ * Disallow links in section headers (#1147)
+
+ * Prune docstrings that are never rendered (#1161)
+
+ * Don't warn about missing links in miminal sigs (#1161)
+
+ * Add support for custom section anchors (#1179)
+
+ * Adapt Haddock to LinearTypes language extension
+
+ * Adapt Haddock to QualifiedDo language extensions
+
+ * Allow scrolling in QuickJump search results (#1235)
+
+ * Parallel Haddock. Pass -jn (where n is the number of threads)
+   to typecheck modules in parallel (#1323)
+
+## Changes in 2.24.0
+
+ * Reify oversaturated data family instances correctly (#1103)
+
+ * Removed the majority of Haddock's possible `panic` routes through
+   the TTG refactor to make extension variants empty
+
 ## Changes in 2.23.0
 
  * "Linuwial" is the new default theme (#721, #782, #949)

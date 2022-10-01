@@ -20,7 +20,7 @@ import Distribution.Pretty
 import qualified Data.Map                   as Map
 import qualified Data.Set                   as Set
 import qualified Distribution.Compat.CharParsing as P
-import           Text.PrettyPrint           (hsep, parens, punctuate, text, (<+>), comma)
+import           Text.PrettyPrint           (hsep, parens, punctuate, text, comma)
 
 -- | Renaming applied to the modules provided by a package.
 -- The boolean indicates whether or not to also include all of the
@@ -69,6 +69,7 @@ isDefaultRenaming _ = False
 
 
 instance Binary ModuleRenaming where
+instance Structured ModuleRenaming where
 
 instance NFData ModuleRenaming where rnf = genericRnf
 

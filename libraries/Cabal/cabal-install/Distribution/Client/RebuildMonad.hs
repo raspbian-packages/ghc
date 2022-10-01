@@ -63,7 +63,6 @@ import Distribution.Client.Glob hiding (matchFileGlob)
 import qualified Distribution.Client.Glob as Glob (matchFileGlob)
 
 import Distribution.Simple.Utils (debug)
-import Distribution.Verbosity    (Verbosity)
 
 import qualified Data.Map.Strict as Map
 import Control.Monad.State as State
@@ -116,7 +115,7 @@ askRoot = Rebuild Reader.ask
 --
 -- Do not share 'FileMonitor's between different uses of 'rerunIfChanged'.
 --
-rerunIfChanged :: (Binary a, Binary b)
+rerunIfChanged :: (Binary a, Structured a, Binary b, Structured b)
                => Verbosity
                -> FileMonitor a b
                -> a

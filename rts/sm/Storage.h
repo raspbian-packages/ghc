@@ -17,6 +17,7 @@
    -------------------------------------------------------------------------- */
 
 void initStorage(void);
+void initGeneration(generation *gen, int g);
 void exitStorage(void);
 void freeStorage(bool free_heap);
 
@@ -46,8 +47,9 @@ extern Mutex sm_mutex;
    The write barrier for MVARs and TVARs
    -------------------------------------------------------------------------- */
 
-void dirty_MVAR(StgRegTable *reg, StgClosure *p);
-void dirty_TVAR(Capability *cap, StgTVar *p);
+void update_MVAR(StgRegTable *reg, StgClosure *p, StgClosure *old_val);
+void dirty_MVAR(StgRegTable *reg, StgClosure *p, StgClosure *old);
+void dirty_TVAR(Capability *cap, StgTVar *p, StgClosure *old);
 
 /* -----------------------------------------------------------------------------
    Nursery manipulation
@@ -70,8 +72,11 @@ bool     getNewNursery        (Capability *cap);
 INLINE_HEADER
 bool doYouWantToGC(Capability *cap)
 {
+    // This is necessarily approximate since otherwise we would need to take
+    // SM_LOCK to safely look at n_new_large_words.
+    TSAN_ANNOTATE_BENIGN_RACE(&g0->n_new_large_words, "doYouWantToGC(n_new_large_words)");
     return ((cap->r.rCurrentNursery->link == NULL && !getNewNursery(cap)) ||
-            g0->n_new_large_words >= large_alloc_lim);
+            RELAXED_LOAD(&g0->n_new_large_words) >= large_alloc_lim);
 }
 
 /* -----------------------------------------------------------------------------
@@ -89,11 +94,11 @@ INLINE_HEADER void finishedNurseryBlock (Capability *cap, bdescr *bd) {
 }
 
 INLINE_HEADER void newNurseryBlock (bdescr *bd) {
-    bd->free = bd->start;
+    RELAXED_STORE(&bd->free, bd->start);
 }
 
-void    updateNurseriesStats (void);
-StgWord calcTotalAllocated   (void);
+void     updateNurseriesStats (void);
+uint64_t calcTotalAllocated   (void);
 
 /* -----------------------------------------------------------------------------
    Stats 'n' DEBUG stuff

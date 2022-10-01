@@ -58,7 +58,7 @@
 --
 --    * Chris Okasaki and Andy Gill,  \"/Fast Mergeable Integer Maps/\",
 --      Workshop on ML, September 1998, pages 77-86,
---      <http://citeseer.ist.psu.edu/okasaki98fast.html>
+--      <http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.37.5452>
 --
 --    * D.R. Morrison, \"/PATRICIA -- Practical Algorithm To Retrieve
 --      Information Coded In Alphanumeric/\", Journal of the ACM, 15(4),
@@ -146,6 +146,9 @@ module Data.IntMap.Lazy (
     -- ** Disjoint
     , disjoint
 
+    -- ** Compose
+    , compose
+
     -- ** Universal combining function
     , mergeWithKey
 
@@ -154,6 +157,7 @@ module Data.IntMap.Lazy (
     , IM.map
     , mapWithKey
     , traverseWithKey
+    , traverseMaybeWithKey
     , mapAccum
     , mapAccumWithKey
     , mapAccumRWithKey

@@ -19,17 +19,14 @@
 module GHCi.BreakArray
     (
       BreakArray
-#ifdef GHCI
-          (BA) -- constructor is exported only for ByteCodeGen
+          (BA) -- constructor is exported only for GHC.CoreToByteCode
     , newBreakArray
     , getBreak
     , setBreakOn
     , setBreakOff
     , showBreakArray
-#endif
     ) where
 
-#ifdef GHCI
 import Prelude -- See note [Why do we import Prelude here?]
 import Control.Monad
 import Data.Word
@@ -116,6 +113,3 @@ readBA# array i = IO $ \s ->
 
 readBreakArray :: BreakArray -> Int -> IO Word8
 readBreakArray (BA array) (I# i) = readBA# array i
-#else
-data BreakArray
-#endif

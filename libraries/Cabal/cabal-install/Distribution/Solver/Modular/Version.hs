@@ -11,22 +11,25 @@ module Distribution.Solver.Modular.Version
     , (.||.)
     ) where
 
+import Distribution.Solver.Compat.Prelude
+import Prelude ()
+
 import qualified Distribution.Version as CV -- from Cabal
-import Distribution.Deprecated.Text -- from Cabal
+import Distribution.Pretty (prettyShow)
 
 -- | Preliminary type for versions.
 type Ver = CV.Version
 
 -- | String representation of a version.
 showVer :: Ver -> String
-showVer = display
+showVer = prettyShow
 
 -- | Version range. Consists of a lower and upper bound.
 type VR = CV.VersionRange
 
 -- | String representation of a version range.
 showVR :: VR -> String
-showVR = display
+showVR = prettyShow
 
 -- | Unconstrained version range.
 anyVR :: VR

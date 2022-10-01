@@ -3,7 +3,7 @@
 -- iserv.cabal.
 
 Name: iserv
-Version: 8.8.4
+Version: 9.0.2
 Copyright: XXX
 License: BSD3
 -- XXX License-File: LICENSE
@@ -39,8 +39,8 @@ Executable iserv
                    bytestring >= 0.10 && < 0.11,
                    containers >= 0.5 && < 0.7,
                    deepseq    >= 1.4 && < 1.5,
-                   ghci       == 8.8.4,
-                   libiserv   == 8.8.4
+                   ghci       == 9.0.2,
+                   libiserv   == 9.0.2
 
     if os(windows)
         Cpp-Options: -DWINDOWS

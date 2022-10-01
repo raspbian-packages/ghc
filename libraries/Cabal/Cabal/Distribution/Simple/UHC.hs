@@ -24,13 +24,12 @@ module Distribution.Simple.UHC (
 
 import Prelude ()
 import Distribution.Compat.Prelude
-import Data.Foldable (toList)
 
 import Distribution.InstalledPackageInfo
 import Distribution.Package hiding (installedUnitId)
 import Distribution.PackageDescription
 import Distribution.Simple.BuildPaths
-import Distribution.Simple.Compiler as C
+import Distribution.Simple.Compiler
 import Distribution.Simple.LocalBuildInfo
 import Distribution.Simple.PackageIndex
 import Distribution.Simple.Program
@@ -61,7 +60,7 @@ configure verbosity hcPath _hcPkgPath progdb = do
 
   let comp = Compiler {
                compilerId         =  CompilerId UHC uhcVersion,
-               compilerAbiTag     =  C.NoAbiTag,
+               compilerAbiTag     =  NoAbiTag,
                compilerCompat     =  [],
                compilerLanguages  =  uhcLanguages,
                compilerExtensions =  uhcLanguageExtensions,
@@ -70,11 +69,11 @@ configure verbosity hcPath _hcPkgPath progdb = do
       compPlatform = Nothing
   return (comp, compPlatform, progdb')
 
-uhcLanguages :: [(Language, C.Flag)]
+uhcLanguages :: [(Language, CompilerFlag)]
 uhcLanguages = [(Haskell98, "")]
 
 -- | The flags for the supported extensions.
-uhcLanguageExtensions :: [(Extension, Maybe C.Flag)]
+uhcLanguageExtensions :: [(Extension, Maybe CompilerFlag)]
 uhcLanguageExtensions =
     let doFlag (f, (enable, disable)) = [(EnableExtension  f, enable),
                                          (DisableExtension f, disable)]
@@ -117,11 +116,13 @@ getGlobalPackageDir :: Verbosity -> ProgramDb -> IO FilePath
 getGlobalPackageDir verbosity progdb = do
     output <- getDbProgramOutput verbosity
                 uhcProgram progdb ["--meta-pkgdir-system"]
-    -- call to "lines" necessary, because pkgdir contains an extra newline at the end
-    let [pkgdir] = lines output
+    -- we need to trim because pkgdir contains an extra newline at the end
+    let pkgdir = trimEnd output
     return pkgdir
+  where
+    trimEnd = reverse . dropWhile isSpace . reverse
 
-getUserPackageDir :: NoCallStackIO FilePath
+getUserPackageDir :: IO FilePath
 getUserPackageDir = do
     homeDir <- getHomeDirectory
     return $ homeDir </> ".cabal" </> "lib"  -- TODO: determine in some other way
@@ -150,7 +151,7 @@ installedPkgConfig = "installed-pkg-config"
 -- | Check if a certain dir contains a valid package. Currently, we are
 -- looking only for the presence of an installed package configuration.
 -- TODO: Actually make use of the information provided in the file.
-isPkgDir :: String -> String -> String -> NoCallStackIO Bool
+isPkgDir :: String -> String -> String -> IO Bool
 isPkgDir _ _   ('.' : _)  = return False  -- ignore files starting with a .
 isPkgDir c dir xs         = do
                               let candidate = dir </> uhcPackageDir xs c
@@ -278,7 +279,7 @@ registerPackage
   -> InstalledPackageInfo
   -> IO ()
 registerPackage verbosity comp progdb packageDbs installedPkgInfo = do
-    dbdir <- case last packageDbs of
+    dbdir <- case registrationPackageDB packageDbs of
       GlobalPackageDB       -> getGlobalPackageDir verbosity progdb
       UserPackageDB         -> getUserPackageDir
       SpecificPackageDB dir -> return dir

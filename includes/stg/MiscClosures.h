@@ -8,12 +8,12 @@
  * our Cmm code generator doesn't know how to generate local symbols
  * for the RTS bits (it assumes all RTS symbols are external).
  *
- * See wiki:Commentary/Compiler/Backends/PprC#Prototypes
+ * See wiki:commentary/compiler/backends/ppr-c#prototypes
  *
  * Do not #include this file directly: #include "Rts.h" instead.
  *
  * To understand the structure of the RTS headers, see the wiki:
- *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/SourceTree/Includes
+ *   https://gitlab.haskell.org/ghc/ghc/wikis/commentary/source-tree/includes
  *
  * --------------------------------------------------------------------------*/
 
@@ -72,7 +72,7 @@ RTS_RET(stg_restore_cccs_eval);
 // RTS_FUN(stg_interp_constr6_entry);
 // RTS_FUN(stg_interp_constr7_entry);
 //
-// This is referenced using the FFI in the compiler (ByteCodeItbls),
+// This is referenced using the FFI in the compiler (GHC.ByteCode.InfoTable),
 // so we can't give it the correct type here because the prototypes
 // would clash (FFI references are always declared with type StgWord[]
 // in the generated C code).
@@ -90,7 +90,6 @@ RTS_RET(stg_ctoi_V);
 RTS_RET(stg_apply_interp);
 
 RTS_ENTRY(stg_IND);
-RTS_ENTRY(stg_IND_direct);
 RTS_ENTRY(stg_IND_STATIC);
 RTS_ENTRY(stg_BLACKHOLE);
 RTS_ENTRY(stg_CAF_BLACKHOLE);
@@ -179,7 +178,7 @@ RTS_CLOSURE(stg_END_STM_WATCH_QUEUE_closure);
 RTS_CLOSURE(stg_END_STM_CHUNK_LIST_closure);
 RTS_CLOSURE(stg_NO_TREC_closure);
 
-RTS_ENTRY(stg_NO_FINALIZER_entry);
+RTS_ENTRY(stg_NO_FINALIZER);
 
 #if IN_STG_CODE
 extern DLL_IMPORT_RTS StgWordArray stg_CHARLIKE_closure;
@@ -243,7 +242,7 @@ RTS_THUNK(stg_ap_6_upd);
 RTS_THUNK(stg_ap_7_upd);
 
 /* standard application routines (see also utils/genapply,
- * and compiler/codeGen/StgCmmArgRep.hs).
+ * and GHC.StgToCmm.ArgRep).
  */
 RTS_RET(stg_ap_v);
 RTS_RET(stg_ap_f);
@@ -338,6 +337,10 @@ RTS_FUN_DECL(stg_block_stmwait);
 RTS_FUN_DECL(stg_block_throwto);
 RTS_RET(stg_block_throwto);
 
+RTS_FUN_DECL(stg_readIOPortzh);
+RTS_FUN_DECL(stg_writeIOPortzh);
+RTS_FUN_DECL(stg_newIOPortzh);
+
 /* Entry/exit points from StgStartup.cmm */
 
 RTS_RET(stg_stop_thread);
@@ -367,6 +370,7 @@ RTS_FUN_DECL(stg_isByteArrayPinnedzh);
 RTS_FUN_DECL(stg_isMutableByteArrayPinnedzh);
 RTS_FUN_DECL(stg_shrinkMutableByteArrayzh);
 RTS_FUN_DECL(stg_resizzeMutableByteArrayzh);
+RTS_FUN_DECL(stg_shrinkSmallMutableArrayzh);
 RTS_FUN_DECL(stg_casIntArrayzh);
 RTS_FUN_DECL(stg_newArrayzh);
 RTS_FUN_DECL(stg_newArrayArrayzh);
@@ -390,12 +394,8 @@ RTS_FUN_DECL(stg_copySmallMutableArrayzh);
 RTS_FUN_DECL(stg_casSmallArrayzh);
 
 RTS_FUN_DECL(stg_newMutVarzh);
-#if __GLASGOW_HASKELL__ < 808
-RTS_FUN_DECL(stg_atomicModifyMutVarzh);
-#else
 RTS_FUN_DECL(stg_atomicModifyMutVar2zh);
 RTS_FUN_DECL(stg_atomicModifyMutVarzuzh);
-#endif
 RTS_FUN_DECL(stg_casMutVarzh);
 
 RTS_FUN_DECL(stg_isEmptyMVarzh);
@@ -418,7 +418,11 @@ RTS_FUN_DECL(stg_asyncDoProczh);
 
 RTS_FUN_DECL(stg_catchzh);
 RTS_FUN_DECL(stg_raisezh);
+RTS_FUN_DECL(stg_raiseDivZZerozh);
+RTS_FUN_DECL(stg_raiseUnderflowzh);
+RTS_FUN_DECL(stg_raiseOverflowzh);
 RTS_FUN_DECL(stg_raiseIOzh);
+RTS_FUN_DECL(stg_paniczh);
 
 RTS_FUN_DECL(stg_makeStableNamezh);
 RTS_FUN_DECL(stg_makeStablePtrzh);
@@ -474,6 +478,7 @@ RTS_FUN_DECL(stg_readTVarIOzh);
 RTS_FUN_DECL(stg_writeTVarzh);
 
 RTS_FUN_DECL(stg_unpackClosurezh);
+RTS_FUN_DECL(stg_closureSizzezh);
 RTS_FUN_DECL(stg_getApStackValzh);
 RTS_FUN_DECL(stg_getSparkzh);
 RTS_FUN_DECL(stg_numSparkszh);
@@ -490,7 +495,7 @@ RTS_FUN_DECL(stg_setThreadAllocationCounterzh);
 
 
 /* Other misc stuff */
-// See wiki:Commentary/Compiler/Backends/PprC#Prototypes
+// See wiki:commentary/compiler/backends/ppr-c#prototypes
 
 #if IN_STG_CODE && !IN_STGCRUN
 
@@ -531,13 +536,13 @@ extern StgWord      CCS_OVERHEAD[];
 extern StgWord      CCS_SYSTEM[];
 
 // Calls to these rts functions are generated directly
-// by codegen (see compiler/codeGen/StgCmmProf.hs)
+// by codegen (see GHC.StgToCmm.Prof)
 // and don't require (don't emit) forward declarations.
 //
 // In unregisterised mode (when building via .hc files)
 // the calls are ordinary C calls. Functions must be in
 // scope and must match prototype assumed by
-//    'compiler/codeGen/StgCmmProf.hs'
+//    'GHC.StgToCmm.Prof'
 // as opposed to real prototype declared in
 //    'includes/rts/prof/CCS.h'
 void enterFunCCS (void *reg, void *ccsfn);
@@ -545,5 +550,12 @@ void * pushCostCentre (void *ccs, void *cc);
 
 // Capability.c
 extern unsigned int n_capabilities;
+
+/* -----------------------------------------------------------------------------
+   Nonmoving GC write barrier
+   -------------------------------------------------------------------------- */
+
+#include <rts/NonMoving.h>
+
 
 #endif

@@ -3,6 +3,7 @@
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE DeriveFoldable #-}
 {-# LANGUAGE DeriveTraversable #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Distribution.Types.CondTree (
     CondTree(..),
@@ -63,7 +64,7 @@ data CondTree v c a = CondNode
     deriving (Show, Eq, Typeable, Data, Generic, Functor, Foldable, Traversable)
 
 instance (Binary v, Binary c, Binary a) => Binary (CondTree v c a)
-
+instance (Structured v, Structured c, Structured a) => Structured (CondTree v c a)
 instance (NFData v, NFData c, NFData a) => NFData (CondTree v c a) where rnf = genericRnf
 
 -- | A 'CondBranch' represents a conditional branch, e.g., @if
@@ -79,13 +80,13 @@ data CondBranch v c a = CondBranch
 
 -- This instance is written by hand because GHC 8.0.1/8.0.2 infinite
 -- loops when trying to derive it with optimizations.  See
--- https://ghc.haskell.org/trac/ghc/ticket/13056
+-- https://gitlab.haskell.org/ghc/ghc/-/issues/13056
 instance Foldable (CondBranch v c) where
     foldMap f (CondBranch _ c Nothing) = foldMap f c
     foldMap f (CondBranch _ c (Just a)) = foldMap f c `mappend` foldMap f a
 
 instance (Binary v, Binary c, Binary a) => Binary (CondBranch v c a)
-
+instance (Structured v, Structured c, Structured a) => Structured (CondBranch v c a)
 instance (NFData v, NFData c, NFData a) => NFData (CondBranch v c a) where rnf = genericRnf
 
 condIfThen :: Condition v -> CondTree v c a -> CondBranch v c a
@@ -139,8 +140,9 @@ traverseCondBranchC f (CondBranch cnd t me) = CondBranch cnd
 
 -- | Extract the condition matched by the given predicate from a cond tree.
 --
--- We use this mainly for extracting buildable conditions (see the Note above),
--- but the function is in fact more general.
+-- We use this mainly for extracting buildable conditions (see the Note in
+-- Distribution.PackageDescription.Configuration), but the function is in fact
+-- more general.
 extractCondition :: Eq v => (a -> Bool) -> CondTree v c a -> Condition v
 extractCondition p = go
   where

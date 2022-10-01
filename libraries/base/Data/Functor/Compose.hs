@@ -1,8 +1,10 @@
-{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE PolyKinds #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE Trustworthy #-}
+{-# LANGUAGE TypeOperators #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Data.Functor.Compose
@@ -27,6 +29,7 @@ import Data.Functor.Classes
 import Control.Applicative
 import Data.Coerce (coerce)
 import Data.Data (Data)
+import Data.Type.Equality (TestEquality(..), (:~:)(..))
 import GHC.Generics (Generic, Generic1)
 import Text.Read (Read(..), readListDefault, readListPrecDefault)
 
@@ -97,6 +100,7 @@ instance (Show1 f, Show1 g, Show a) => Show (Compose f g a) where
 -- | @since 4.9.0.0
 instance (Functor f, Functor g) => Functor (Compose f g) where
     fmap f (Compose x) = Compose (fmap (fmap f) x)
+    a <$ (Compose x) = Compose (fmap (a <$) x)
 
 -- | @since 4.9.0.0
 instance (Foldable f, Foldable g) => Foldable (Compose f g) where
@@ -118,3 +122,12 @@ instance (Alternative f, Applicative g) => Alternative (Compose f g) where
     empty = Compose empty
     (<|>) = coerce ((<|>) :: f (g a) -> f (g a) -> f (g a))
       :: forall a . Compose f g a -> Compose f g a -> Compose f g a
+
+-- | The deduction (via generativity) that if @g x :~: g y@ then @x :~: y@.
+--
+-- @since 4.14.0.0
+instance (TestEquality f) => TestEquality (Compose f g) where
+  testEquality (Compose x) (Compose y) =
+    case testEquality x y of -- :: Maybe (g x :~: g y)
+      Just Refl -> Just Refl -- :: Maybe (x :~: y)
+      Nothing   -> Nothing

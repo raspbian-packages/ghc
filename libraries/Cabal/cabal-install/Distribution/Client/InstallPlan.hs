@@ -67,6 +67,10 @@ module Distribution.Client.InstallPlan (
   reverseDependencyClosure,
   ) where
 
+import Distribution.Client.Compat.Prelude hiding (toList, lookup, tail)
+import Prelude (tail)
+import Distribution.Compat.Stack (WithCallStack)
+
 import Distribution.Client.Types hiding (BuildOutcomes)
 import qualified Distribution.PackageDescription as PD
 import qualified Distribution.Simple.Configure as Configure
@@ -79,7 +83,7 @@ import Distribution.Package
          , HasUnitId(..), UnitId )
 import Distribution.Solver.Types.SolverPackage
 import Distribution.Client.JobControl
-import Distribution.Deprecated.Text
+import Distribution.Pretty (defaultStyle)
 import Text.PrettyPrint
 import qualified Distribution.Client.SolverInstallPlan as SolverInstallPlan
 import Distribution.Client.SolverInstallPlan (SolverInstallPlan)
@@ -90,30 +94,18 @@ import           Distribution.Solver.Types.SolverId
 import           Distribution.Solver.Types.InstSolverPackage
 
 import           Distribution.Utils.LogProgress
+import           Distribution.Utils.Structured (Structured (..), Structure(Nominal))
 
 -- TODO: Need this when we compute final UnitIds
 -- import qualified Distribution.Simple.Configure as Configure
 
-import Data.List
-         ( foldl', intercalate )
-import qualified Data.Foldable as Foldable (all)
-import Data.Maybe
-         ( fromMaybe, mapMaybe )
+import qualified Data.Foldable as Foldable (all, toList)
 import qualified Distribution.Compat.Graph as Graph
 import Distribution.Compat.Graph (Graph, IsNode(..))
-import Distribution.Compat.Binary (Binary(..))
-import GHC.Generics
-import Data.Typeable
-import Control.Monad
 import Control.Exception
          ( assert )
 import qualified Data.Map as Map
-import           Data.Map (Map)
 import qualified Data.Set as Set
-import           Data.Set (Set)
-
-import Prelude hiding (lookup)
-
 
 -- When cabal tries to install a number of packages, including all their
 -- dependencies it has a non-trivial problem to solve.
@@ -174,6 +166,11 @@ data GenericPlanPackage ipkg srcpkg
    | Installed   srcpkg
   deriving (Eq, Show, Generic)
 
+displayGenericPlanPackage :: (IsUnit ipkg, IsUnit srcpkg) => GenericPlanPackage ipkg srcpkg -> String
+displayGenericPlanPackage (PreExisting pkg) = "PreExisting " ++ prettyShow (nodeKey pkg)
+displayGenericPlanPackage (Configured pkg)  = "Configured " ++ prettyShow (nodeKey pkg)
+displayGenericPlanPackage (Installed pkg)   = "Installed " ++ prettyShow (nodeKey pkg)
+
 -- | Convenience combinator for destructing 'GenericPlanPackage'.
 -- This is handy because if you case manually, you have to handle
 -- 'Configured' and 'Installed' separately (where often you want
@@ -203,8 +200,8 @@ instance (IsNode ipkg, IsNode srcpkg, Key ipkg ~ UnitId, Key srcpkg ~ UnitId)
     nodeNeighbors (Configured  spkg) = nodeNeighbors spkg
     nodeNeighbors (Installed   spkg) = nodeNeighbors spkg
 
-instance (Binary ipkg, Binary srcpkg)
-      => Binary (GenericPlanPackage ipkg srcpkg)
+instance (Binary ipkg, Binary srcpkg) => Binary (GenericPlanPackage ipkg srcpkg)
+instance (Structured ipkg, Structured srcpkg) => Structured (GenericPlanPackage ipkg srcpkg)
 
 type PlanPackage = GenericPlanPackage
                    InstalledPackageInfo (ConfiguredPackage UnresolvedPkgLoc)
@@ -258,9 +255,15 @@ mkInstallPlan loc graph indepGoals =
       planIndepGoals = indepGoals
     }
 
-internalError :: String -> String -> a
+internalError :: WithCallStack (String -> String -> a)
 internalError loc msg = error $ "internal error in InstallPlan." ++ loc
                              ++ if null msg then "" else ": " ++ msg
+
+instance (Structured ipkg, Structured srcpkg) => Structured (GenericInstallPlan ipkg srcpkg) where
+    structure p = Nominal (typeRep p) 0 "GenericInstallPlan"
+        [ structure (Proxy :: Proxy ipkg)
+        , structure (Proxy :: Proxy srcpkg)
+        ]
 
 instance (IsNode ipkg, Key ipkg ~ UnitId, IsNode srcpkg, Key srcpkg ~ UnitId,
           Binary ipkg, Binary srcpkg)
@@ -268,22 +271,23 @@ instance (IsNode ipkg, Key ipkg ~ UnitId, IsNode srcpkg, Key srcpkg ~ UnitId,
     put GenericInstallPlan {
               planGraph      = graph,
               planIndepGoals = indepGoals
-        } = put (graph, indepGoals)
+        } = put graph >> put indepGoals
 
     get = do
-      (graph, indepGoals) <- get
+      graph <- get
+      indepGoals <- get
       return $! mkInstallPlan "(instance Binary)" graph indepGoals
 
 showPlanGraph :: (Package ipkg, Package srcpkg,
                   IsUnit ipkg, IsUnit srcpkg)
               => Graph (GenericPlanPackage ipkg srcpkg) -> String
 showPlanGraph graph = renderStyle defaultStyle $
-    vcat (map dispPlanPackage (Graph.toList graph))
+    vcat (map dispPlanPackage (Foldable.toList graph))
   where dispPlanPackage p =
             hang (hsep [ text (showPlanPackageTag p)
-                       , disp (packageId p)
-                       , parens (disp (nodeKey p))]) 2
-                 (vcat (map disp (nodeNeighbors p)))
+                       , pretty (packageId p)
+                       , parens (pretty (nodeKey p))]) 2
+                 (vcat (map pretty (nodeNeighbors p)))
 
 showInstallPlan :: (Package ipkg, Package srcpkg,
                     IsUnit ipkg, IsUnit srcpkg)
@@ -309,7 +313,7 @@ toGraph = planGraph
 
 toList :: GenericInstallPlan ipkg srcpkg
        -> [GenericPlanPackage ipkg srcpkg]
-toList = Graph.toList . planGraph
+toList = Foldable.toList . planGraph
 
 toMap :: GenericInstallPlan ipkg srcpkg
       -> Map UnitId (GenericPlanPackage ipkg srcpkg)
@@ -462,10 +466,10 @@ fromSolverInstallPlan f plan =
 
     mapDep _ ipiMap (PreExistingId _pid uid)
         | Just pkgs <- Map.lookup uid ipiMap = pkgs
-        | otherwise = error ("fromSolverInstallPlan: PreExistingId " ++ display uid)
+        | otherwise = error ("fromSolverInstallPlan: PreExistingId " ++ prettyShow uid)
     mapDep pidMap _ (PlannedId pid)
         | Just pkgs <- Map.lookup pid pidMap = pkgs
-        | otherwise = error ("fromSolverInstallPlan: PlannedId " ++ display pid)
+        | otherwise = error ("fromSolverInstallPlan: PlannedId " ++ prettyShow pid)
     -- This shouldn't happen, since mapDep should only be called
     -- on neighbor SolverId, which must have all been done already
     -- by the reverse top-sort (we assume the graph is not broken).
@@ -495,10 +499,10 @@ fromSolverInstallPlanWithProgress f plan = do
 
     mapDep _ ipiMap (PreExistingId _pid uid)
         | Just pkgs <- Map.lookup uid ipiMap = pkgs
-        | otherwise = error ("fromSolverInstallPlan: PreExistingId " ++ display uid)
+        | otherwise = error ("fromSolverInstallPlan: PreExistingId " ++ prettyShow uid)
     mapDep pidMap _ (PlannedId pid)
         | Just pkgs <- Map.lookup pid pidMap = pkgs
-        | otherwise = error ("fromSolverInstallPlan: PlannedId " ++ display pid)
+        | otherwise = error ("fromSolverInstallPlan: PlannedId " ++ prettyShow pid)
     -- This shouldn't happen, since mapDep should only be called
     -- on neighbor SolverId, which must have all been done already
     -- by the reverse top-sort (we assume the graph is not broken).
@@ -621,7 +625,7 @@ isInstalled _                = False
 -- and return any packages that are newly in the processing state (ie ready to
 -- process), along with the updated 'Processing' state.
 --
-completed :: (IsUnit ipkg, IsUnit srcpkg)
+completed :: forall ipkg srcpkg. (IsUnit ipkg, IsUnit srcpkg)
           => GenericInstallPlan ipkg srcpkg
           -> Processing -> UnitId
           -> ([GenericReadyPackage srcpkg], Processing)
@@ -646,8 +650,9 @@ completed plan (Processing processingSet completedSet failedSet) pkgid =
                             (map nodeKey newlyReady)
     processing'    = Processing processingSet' completedSet' failedSet
 
-    asReadyPackage (Configured pkg) = ReadyPackage pkg
-    asReadyPackage _ = internalError "completed" ""
+    asReadyPackage :: GenericPlanPackage ipkg srcpkg -> GenericReadyPackage srcpkg
+    asReadyPackage (Configured pkg)  = ReadyPackage pkg
+    asReadyPackage pkg = internalError "completed" $ "not in configured state: " ++ displayGenericPlanPackage pkg
 
 failed :: (IsUnit ipkg, IsUnit srcpkg)
        => GenericInstallPlan ipkg srcpkg
@@ -673,7 +678,7 @@ failed plan (Processing processingSet completedSet failedSet) pkgid =
     processing'    = Processing processingSet' completedSet failedSet'
 
     asConfiguredPackage (Configured pkg) = pkg
-    asConfiguredPackage _ = internalError "failed" "not in configured state"
+    asConfiguredPackage pkg = internalError "failed" $ "not in configured state: " ++ displayGenericPlanPackage pkg
 
 processingInvariant :: (IsUnit ipkg, IsUnit srcpkg)
                     => GenericInstallPlan ipkg srcpkg
@@ -891,17 +896,17 @@ data PlanProblem ipkg srcpkg =
 showPlanProblem :: (IsUnit ipkg, IsUnit srcpkg)
                 => PlanProblem ipkg srcpkg -> String
 showPlanProblem (PackageMissingDeps pkg missingDeps) =
-     "Package " ++ display (nodeKey pkg)
+     "Package " ++ prettyShow (nodeKey pkg)
   ++ " depends on the following packages which are missing from the plan: "
-  ++ intercalate ", " (map display missingDeps)
+  ++ intercalate ", " (map prettyShow missingDeps)
 
 showPlanProblem (PackageCycle cycleGroup) =
      "The following packages are involved in a dependency cycle "
-  ++ intercalate ", " (map (display . nodeKey) cycleGroup)
+  ++ intercalate ", " (map (prettyShow . nodeKey) cycleGroup)
 showPlanProblem (PackageStateInvalid pkg pkg') =
-     "Package " ++ display (nodeKey pkg)
+     "Package " ++ prettyShow (nodeKey pkg)
   ++ " is in the " ++ showPlanPackageTag pkg
-  ++ " state but it depends on package " ++ display (nodeKey pkg')
+  ++ " state but it depends on package " ++ prettyShow (nodeKey pkg')
   ++ " which is in the " ++ showPlanPackageTag pkg'
   ++ " state"
 
@@ -929,7 +934,7 @@ problems graph =
      --TODO: consider re-enabling this one, see SolverInstallPlan
 -}
   ++ [ PackageStateInvalid pkg pkg'
-     | pkg <- Graph.toList graph
+     | pkg <- Foldable.toList graph
      , Just pkg' <- map (flip Graph.lookup graph)
                     (nodeNeighbors pkg)
      , not (stateDependencyRelation pkg pkg') ]

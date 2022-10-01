@@ -3,13 +3,13 @@
 -- iserv-proxy.cabal.
 
 Name: iserv-proxy
-Version: 8.8.4
+Version: 9.0.2
 Copyright: XXX
 License: BSD3
 -- XXX License-File: LICENSE
 Author: XXX
 Maintainer: XXX
-Synopsis: iserv allows GHC to delegate Tempalte Haskell computations
+Synopsis: iserv allows GHC to delegate Template Haskell computations
 Description:
   GHC can be provided with a path to the iserv binary with
   @-pgmi=/path/to/iserv-bin@, and will in combination with
@@ -73,10 +73,10 @@ Executable iserv-proxy
                   base       >= 4   && < 5,
                   binary     >= 0.7 && < 0.9,
                   bytestring >= 0.10 && < 0.11,
-                  containers >= 0.5 && < 0.6,
+                  containers >= 0.5 && < 0.8,
                   deepseq    >= 1.4 && < 1.5,
                   directory  >= 1.3 && < 1.4,
                   network    >= 2.6,
                   filepath   >= 1.4 && < 1.5,
-                  ghci       == 8.8.4,
-                  libiserv   == 8.8.4
+                  ghci       == 9.0.2,
+                  libiserv   == 9.0.2

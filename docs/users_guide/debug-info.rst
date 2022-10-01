@@ -132,7 +132,7 @@ this point in the program,
     The reason ``gdb`` doesn't show this symbol name in the backtrace output is an
     infidelity in its interpretation of debug information, which assumes an
     invariant preserved in C but not Haskell programs. Unfortunately it is
-    necessary to work around this manually until this behivior is fixed
+    necessary to work around this manually until this behavior is fixed
     upstream.
 
 .. note::
@@ -145,9 +145,9 @@ this point in the program,
     other language-agnostic debugging tools, GHC is forced to heuristically
     choose one location from among this set.
 
-    For this reason we should be cautious when interpretting the source locations
+    For this reason we should be cautious when interpreting the source locations
     provided by GDB. While these locations will usually be in some sense
-    "correct", they aren't always useful. This is why profiling tools targetting
+    "correct", they aren't always useful. This is why profiling tools targeting
     Haskell should supplement the standard source location information with
     GHC-specific annotations (emitted with ``-g2``) when assigning costs.
 

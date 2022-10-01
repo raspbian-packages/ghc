@@ -1,3 +1,4 @@
+{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleContexts #-}
 -----------------------------------------------------------------------------
@@ -21,6 +22,7 @@ module Distribution.Simple.Flag (
   toFlag,
   fromFlag,
   fromFlagOrDefault,
+  flagElim,
   flagToMaybe,
   flagToList,
   maybeToFlag,
@@ -51,9 +53,10 @@ import Distribution.Compat.Stack
 -- Its monoid instance gives us the behaviour where it starts out as
 -- 'NoFlag' and later flags override earlier ones.
 --
-data Flag a = Flag a | NoFlag deriving (Eq, Generic, Show, Read)
+data Flag a = Flag a | NoFlag deriving (Eq, Generic, Show, Read, Typeable)
 
 instance Binary a => Binary (Flag a)
+instance Structured a => Structured (Flag a)
 
 instance Functor Flag where
   fmap f (Flag x) = Flag (f x)
@@ -102,6 +105,11 @@ fromFlagOrDefault def NoFlag   = def
 flagToMaybe :: Flag a -> Maybe a
 flagToMaybe (Flag x) = Just x
 flagToMaybe NoFlag   = Nothing
+
+-- | @since 3.4.0.0
+flagElim :: b -> (a -> b) -> Flag a -> b
+flagElim n _ NoFlag   = n
+flagElim _ f (Flag x) = f x
 
 flagToList :: Flag a -> [a]
 flagToList (Flag x) = [x]

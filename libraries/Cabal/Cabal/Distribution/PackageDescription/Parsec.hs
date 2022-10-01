@@ -35,11 +35,8 @@ module Distribution.PackageDescription.Parsec (
 import Distribution.Compat.Prelude
 import Prelude ()
 
-import Control.Applicative                           (Const (..))
-import Control.Monad                                 (guard)
 import Control.Monad.State.Strict                    (StateT, execStateT)
 import Control.Monad.Trans.Class                     (lift)
-import Data.List                                     (partition)
 import Distribution.CabalSpecVersion
 import Distribution.Compat.Lens
 import Distribution.FieldGrammar
@@ -50,40 +47,32 @@ import Distribution.Fields.LexerMonad                (LexWarning, toPWarnings)
 import Distribution.Fields.Parser
 import Distribution.Fields.ParseResult
 import Distribution.PackageDescription
-import Distribution.PackageDescription.Configuration (freeVars)
+import Distribution.PackageDescription.Configuration (freeVars, transformAllBuildInfos)
 import Distribution.PackageDescription.FieldGrammar
 import Distribution.PackageDescription.Quirks        (patchQuirks)
-import Distribution.Parsec                           (parsec, simpleParsec)
+import Distribution.Parsec                           (parsec, simpleParsecBS)
 import Distribution.Parsec.FieldLineStream           (fieldLineStreamFromBS)
-import Distribution.Parsec.Newtypes                  (CommaFSep, List, SpecVersion (..), Token)
 import Distribution.Parsec.Position                  (Position (..), zeroPos)
 import Distribution.Parsec.Warning                   (PWarnType (..))
 import Distribution.Pretty                           (prettyShow)
-import Distribution.Simple.Utils                     (fromUTF8BS)
-import Distribution.Types.CondTree
-import Distribution.Types.Dependency                 (Dependency)
-import Distribution.Types.ForeignLib
-import Distribution.Types.ForeignLibType             (knownForeignLibTypes)
-import Distribution.Types.GenericPackageDescription  (emptyGenericPackageDescription)
-import Distribution.Types.LibraryVisibility          (LibraryVisibility (..))
-import Distribution.Types.PackageDescription         (specVersion')
-import Distribution.Types.UnqualComponentName        (UnqualComponentName, mkUnqualComponentName)
+import Distribution.Simple.Utils                     (fromUTF8BS, toUTF8BS)
+import Distribution.Types.Mixin                      (Mixin (..), mkMixin)
 import Distribution.Utils.Generic                    (breakMaybe, unfoldrM, validateUTF8)
 import Distribution.Verbosity                        (Verbosity)
-import Distribution.Version
-       (LowerBound (..), Version, asVersionIntervals, mkVersion, orLaterVersion, version0,
-       versionNumbers)
+import Distribution.Version                          (Version, mkVersion, versionNumbers)
 
 import qualified Data.ByteString                                   as BS
 import qualified Data.ByteString.Char8                             as BS8
 import qualified Data.Map.Strict                                   as Map
 import qualified Data.Set                                          as Set
 import qualified Distribution.Compat.Newtype                       as Newtype
+import qualified Distribution.Compat.NonEmptySet                   as NES
 import qualified Distribution.Types.BuildInfo.Lens                 as L
 import qualified Distribution.Types.Executable.Lens                as L
 import qualified Distribution.Types.ForeignLib.Lens                as L
 import qualified Distribution.Types.GenericPackageDescription.Lens as L
 import qualified Distribution.Types.PackageDescription.Lens        as L
+import qualified Distribution.Types.SetupBuildInfo.Lens            as L
 import qualified Text.Parsec                                       as P
 
 -- ---------------------------------------------------------------
@@ -104,18 +93,21 @@ parseGenericPackageDescription :: BS.ByteString -> ParseResult GenericPackageDes
 parseGenericPackageDescription bs = do
     -- set scanned version
     setCabalSpecVersion ver
-    -- if we get too new version, fail right away
-    case ver of
-        Just v | v > mkVersion [3,0] -> parseFailure zeroPos
-            "Unsupported cabal-version. See https://github.com/haskell/cabal/issues/4899."
-        _ -> pure ()
 
-    case readFields' bs' of
+    csv <- case ver of
+        -- if we get too new version, fail right away
+        Just v -> case cabalSpecFromVersionDigits (versionNumbers v) of
+            Just csv -> return (Just csv)
+            Nothing  -> parseFatalFailure zeroPos $
+                "Unsupported cabal-version " ++ prettyShow v ++ ". See https://github.com/haskell/cabal/issues/4899."
+        _ -> pure Nothing
+
+    case readFields' bs'' of
         Right (fs, lexWarnings) -> do
             when patched $
                 parseWarning zeroPos PWTQuirkyCabalFile "Legacy cabal file"
             -- UTF8 is validated in a prepass step, afterwards parsing is lenient.
-            parseGenericPackageDescription' ver lexWarnings (validateUTF8 bs') fs
+            parseGenericPackageDescription' csv lexWarnings invalidUtf8 fs
         -- TODO: better marshalling of errors
         Left perr -> parseFatalFailure pos (show perr) where
             ppos = P.errorPos perr
@@ -123,6 +115,14 @@ parseGenericPackageDescription bs = do
   where
     (patched, bs') = patchQuirks bs
     ver = scanSpecVersion bs'
+
+    invalidUtf8 = validateUTF8 bs'
+
+    -- if there are invalid utf8 characters, we make the bytestring valid.
+    bs'' = case invalidUtf8 of
+        Nothing -> bs'
+        Just _  -> toUTF8BS (fromUTF8BS bs')
+
 
 -- | 'Maybe' variant of 'parseGenericPackageDescription'
 parseGenericPackageDescriptionMaybe :: BS.ByteString -> Maybe GenericPackageDescription
@@ -155,12 +155,12 @@ stateCommonStanzas f (SectionS gpd cs) = SectionS gpd <$> f cs
 -- * first we parse fields of PackageDescription
 -- * then we parse sections (libraries, executables, etc)
 parseGenericPackageDescription'
-    :: Maybe Version
+    :: Maybe CabalSpecVersion
     -> [LexWarning]
     -> Maybe Int
     -> [Field Position]
     -> ParseResult GenericPackageDescription
-parseGenericPackageDescription' cabalVerM lexWarnings utf8WarnPos fs = do
+parseGenericPackageDescription' scannedVer lexWarnings utf8WarnPos fs = do
     parseWarnings (toPWarnings lexWarnings)
     for_ utf8WarnPos $ \pos ->
         parseWarning zeroPos PWTUTF $ "UTF8 encoding problem at byte offset " ++ show pos
@@ -168,45 +168,53 @@ parseGenericPackageDescription' cabalVerM lexWarnings utf8WarnPos fs = do
     let (fields, sectionFields) = takeFields fs'
 
     -- cabal-version
-    cabalVer <- case cabalVerM of
+    specVer <- case scannedVer of
         Just v  -> return v
         Nothing -> case Map.lookup "cabal-version" fields >>= safeLast of
-            Nothing                        -> return version0
+            Nothing                        -> return CabalSpecV1_0
             Just (MkNamelessField pos fls) -> do
-                v <- specVersion' . Newtype.unpack' SpecVersion <$> runFieldParser pos parsec cabalSpecLatest fls
-                when (v >= mkVersion [2,1]) $ parseFailure pos $
+                -- version will be parsed twice, therefore we parse without warnings.
+                v <- withoutWarnings $
+                    Newtype.unpack' SpecVersion <$>
+                    -- Use version with || and && but before addition of ^>= and removal of -any
+                    runFieldParser pos parsec CabalSpecV1_24 fls
+
+                -- if it were at the beginning, scanner would found it
+                when (v >= CabalSpecV2_2) $ parseFailure pos $
                     "cabal-version should be at the beginning of the file starting with spec version 2.2. " ++
                     "See https://github.com/haskell/cabal/issues/4899"
 
                 return v
 
-    let specVer = cabalSpecFromVersionDigits (versionNumbers cabalVer)
-
-    -- reset cabal version
-    setCabalSpecVersion (Just cabalVer)
+    -- reset cabal version, it might not be set
+    let specVer' = mkVersion (cabalSpecToVersionDigits specVer)
+    setCabalSpecVersion (Just specVer')
 
     -- Package description
     pd <- parseFieldGrammar specVer fields packageDescriptionFieldGrammar
 
     -- Check that scanned and parsed versions match.
-    unless (cabalVer == specVersion pd) $ parseFailure zeroPos $
+    unless (specVer == specVersion pd) $ parseFailure zeroPos $
         "Scanned and parsed cabal-versions don't match " ++
-        prettyShow cabalVer ++ " /= " ++ prettyShow (specVersion pd)
+        prettyShow (SpecVersion specVer) ++ " /= " ++ prettyShow (SpecVersion (specVersion pd))
 
     maybeWarnCabalVersion syntax pd
 
     -- Sections
-    let gpd = emptyGenericPackageDescription & L.packageDescription .~ pd
+    let gpd = emptyGenericPackageDescription
+            & L.packageDescription .~ pd
     gpd1 <- view stateGpd <$> execStateT (goSections specVer sectionFields) (SectionS gpd Map.empty)
 
-    checkForUndefinedFlags gpd1
-    return gpd1
+    let gpd2 = postProcessInternalDeps specVer gpd1
+    checkForUndefinedFlags gpd2
+    checkForUndefinedCustomSetup gpd2
+    gpd2 `deepseq` return gpd2
   where
     safeLast :: [a] -> Maybe a
     safeLast = listToMaybe . reverse
 
-    newSyntaxVersion :: Version
-    newSyntaxVersion = mkVersion [1, 2]
+    newSyntaxVersion :: CabalSpecVersion
+    newSyntaxVersion = CabalSpecV1_2
 
     maybeWarnCabalVersion :: Syntax -> PackageDescription -> ParseResult ()
     maybeWarnCabalVersion syntax pkg
@@ -219,14 +227,8 @@ parseGenericPackageDescription' cabalVerM lexWarnings utf8WarnPos fs = do
       | syntax == OldSyntax && specVersion pkg >= newSyntaxVersion
       = parseWarning zeroPos PWTOldSyntax $
              "A package using 'cabal-version: "
-          ++ displaySpecVersion (specVersionRaw pkg)
+          ++ prettyShow (SpecVersion (specVersion pkg))
           ++ "' must use section syntax. See the Cabal user guide for details."
-      where
-        displaySpecVersion (Left version)       = prettyShow version
-        displaySpecVersion (Right versionRange) =
-          case asVersionIntervals versionRange of
-            [] {- impossible -}           -> prettyShow versionRange
-            ((LowerBound version _, _):_) -> prettyShow (orLaterVersion version)
 
     maybeWarnCabalVersion _ _ = return ()
 
@@ -673,9 +675,14 @@ onAllBranches p = go mempty
     goBranch acc (CondBranch _ t (Just e))  = go acc t && go acc e
 
 -------------------------------------------------------------------------------
--- Flag check
+-- Post parsing checks
 -------------------------------------------------------------------------------
 
+-- | Check that we 
+--
+-- * don't use undefined flags (very bad)
+-- * define flags which are unused (just bad)
+--
 checkForUndefinedFlags :: GenericPackageDescription -> ParseResult ()
 checkForUndefinedFlags gpd = do
     let definedFlags, usedFlags :: Set.Set FlagName
@@ -689,6 +696,104 @@ checkForUndefinedFlags gpd = do
   where
     f :: CondTree ConfVar c a -> Const (Set.Set FlagName) (CondTree ConfVar c a)
     f ct = Const (Set.fromList (freeVars ct))
+
+-- | Since @cabal-version: 1.24@ one can specify @custom-setup@.
+-- Let us require it.
+--
+checkForUndefinedCustomSetup :: GenericPackageDescription -> ParseResult ()
+checkForUndefinedCustomSetup gpd = do
+    let pd  = packageDescription gpd
+    let csv = specVersion pd
+
+    when (buildType pd == Custom && isNothing (setupBuildInfo pd)) $
+        when (csv >= CabalSpecV1_24) $ parseFailure zeroPos $
+            "Since cabal-version: 1.24 specifying custom-setup section is mandatory"
+
+-------------------------------------------------------------------------------
+-- Post processing of internal dependencies
+-------------------------------------------------------------------------------
+
+-- Note [Dependencies on sublibraries]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+--
+-- This is solution to https://github.com/haskell/cabal/issues/6083
+--
+-- Before 'cabal-version: 3.0' we didn't have a syntax specially
+-- for referring to internal libraries. Internal library names
+-- shadowed the outside ones.
+--
+-- Since 'cabal-version: 3.0' we have ability to write
+--
+--     build-depends: some-package:its-sub-lib >=1.2.3
+--
+-- This allows us to refer also to local packages by `this-package:sublib`.
+-- So since 'cabal-version: 3.4' to refer to *any*
+-- sublibrary we must use the two part syntax. Here's small table:
+--
+--                   | pre-3.4             |      3.4 and after            |
+-- ------------------|---------------------|-------------------------------|
+-- pkg-name          | may refer to sublib | always refers to external pkg |
+-- pkg-name:sublib   | refers to sublib    | refers to sublib              |
+-- pkg-name:pkg-name | may refer to sublib | always refers to external pkg |
+--
+-- In pre-3.4 case, if a package 'this-pkg' has a sublibrary 'pkg-name',
+-- all dependency definitions will refer to that sublirary.
+--
+-- In 3.4 and after case, 'pkg-name' will always refer to external package,
+-- and to use internal library you have to say 'this-pkg:pkg-name'.
+--
+-- In summary, In 3.4 and after, the internal names don't shadow,
+-- as there is an explicit syntax to refer to them,
+-- i.e. what you write is what you get;
+-- For pre-3.4 we post-process the file.
+--
+-- Similarly, we process mixins.
+-- See https://github.com/haskell/cabal/issues/6281
+--
+
+postProcessInternalDeps :: CabalSpecVersion -> GenericPackageDescription -> GenericPackageDescription
+postProcessInternalDeps specVer gpd
+    | specVer >= CabalSpecV3_4 = gpd
+    | otherwise                = transformAllBuildInfos transformBI transformSBI gpd
+  where
+    transformBI :: BuildInfo -> BuildInfo
+    transformBI
+        = over L.targetBuildDepends (concatMap transformD)
+        . over L.mixins (map transformM)
+
+    transformSBI :: SetupBuildInfo -> SetupBuildInfo
+    transformSBI = over L.setupDepends (concatMap transformD)
+
+    transformD :: Dependency -> [Dependency]
+    transformD (Dependency pn vr ln)
+        | uqn `Set.member` internalLibs
+        , LMainLibName `NES.member` ln
+        = case NES.delete LMainLibName ln of
+            Nothing  -> [dep]
+            Just ln' -> [dep, Dependency pn vr ln']
+      where
+        uqn = packageNameToUnqualComponentName pn
+        dep = Dependency thisPn vr (NES.singleton (LSubLibName uqn))
+
+    transformD d = [d]
+
+    transformM :: Mixin -> Mixin
+    transformM (Mixin pn LMainLibName incl)
+        | uqn `Set.member` internalLibs
+        = mkMixin thisPn (LSubLibName uqn) incl
+      where
+        uqn = packageNameToUnqualComponentName pn
+
+    transformM m = m
+
+    thisPn :: PackageName
+    thisPn = pkgName (package (packageDescription gpd))
+
+    internalLibs :: Set UnqualComponentName
+    internalLibs = Set.fromList
+        [ n
+        | (n, _) <- condSubLibraries gpd
+        ]
 
 -------------------------------------------------------------------------------
 -- Old syntax
@@ -822,6 +927,10 @@ parseHookedBuildInfo' lexWarnings fs = do
         | otherwise            = Nothing
     isExecutableField _ = Nothing
 
+-------------------------------------------------------------------------------
+-- Scan of spec version
+-------------------------------------------------------------------------------
+
 -- | Quickly scan new-style spec-version
 --
 -- A new-style spec-version declaration begins the .cabal file and
@@ -852,7 +961,7 @@ scanSpecVersion bs = do
     --
     -- This is currently more tolerant regarding leading 0 digits.
     --
-    ver <- simpleParsec (BS8.unpack vers)
+    ver <- simpleParsecBS vers
     guard $ case versionNumbers ver of
               [_,_]   -> True
               [_,_,_] -> True

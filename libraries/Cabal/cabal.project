@@ -1,10 +1,13 @@
-packages: Cabal/ cabal-testsuite/ cabal-install/ solver-benchmarks/
 packages: Cabal/ cabal-testsuite/
 packages: cabal-install/ solver-benchmarks/
 tests: True
 
--- Uncomment to allow picking up extra local unpacked deps:
---optional-packages: */
+packages: Cabal/Cabal-QuickCheck/
+packages: Cabal/Cabal-tree-diff/
+packages: Cabal/Cabal-described
+packages: cabal-benchmarks/
+
+optional-packages: ./vendored/*/*.cabal
 
 -- Remove after hackage-repo-tool release
 allow-newer:

@@ -31,47 +31,41 @@ module Distribution.PackageDescription.PrettyPrint (
 import Distribution.Compat.Prelude
 import Prelude ()
 
-import Distribution.Types.CondTree
-import Distribution.Types.Dependency
-import Distribution.Types.ForeignLib          (ForeignLib (foreignLibName))
-import Distribution.Types.LibraryName
-import Distribution.Types.UnqualComponentName
-
 import Distribution.CabalSpecVersion
 import Distribution.Fields.Pretty
+import Distribution.Compat.Lens
 import Distribution.PackageDescription
 import Distribution.Pretty
-import Distribution.Simple.Utils
-import Distribution.Types.Version (versionNumbers)
-
-import Distribution.FieldGrammar                    (PrettyFieldGrammar', prettyFieldGrammar)
+import Distribution.Simple.Utils (writeFileAtomic, writeUTF8File)
+import Distribution.Types.Mixin                      (Mixin (..), mkMixin)
+import Distribution.FieldGrammar                     (PrettyFieldGrammar', prettyFieldGrammar)
+import Distribution.PackageDescription.Configuration (transformAllBuildInfos)
 import Distribution.PackageDescription.FieldGrammar
-       (benchmarkFieldGrammar, buildInfoFieldGrammar, executableFieldGrammar, flagFieldGrammar,
-       foreignLibFieldGrammar, libraryFieldGrammar, packageDescriptionFieldGrammar,
-       setupBInfoFieldGrammar, sourceRepoFieldGrammar, testSuiteFieldGrammar)
+       (benchmarkFieldGrammar, buildInfoFieldGrammar, executableFieldGrammar, flagFieldGrammar, foreignLibFieldGrammar, libraryFieldGrammar,
+       packageDescriptionFieldGrammar, setupBInfoFieldGrammar, sourceRepoFieldGrammar, testSuiteFieldGrammar)
 
 import qualified Distribution.PackageDescription.FieldGrammar as FG
+import qualified Distribution.Types.BuildInfo.Lens                 as L
+import qualified Distribution.Types.SetupBuildInfo.Lens            as L
 
-import Text.PrettyPrint (Doc, char, hsep, parens, text, (<+>))
+import Text.PrettyPrint (Doc, char, hsep, parens, text)
 
-import qualified Data.ByteString.Lazy.Char8 as BS.Char8
+import qualified Data.ByteString.Lazy.Char8      as BS.Char8
+import qualified Distribution.Compat.NonEmptySet as NES
 
 -- | Writes a .cabal file from a generic package description
-writeGenericPackageDescription :: FilePath -> GenericPackageDescription -> NoCallStackIO ()
+writeGenericPackageDescription :: FilePath -> GenericPackageDescription -> IO ()
 writeGenericPackageDescription fpath pkg = writeUTF8File fpath (showGenericPackageDescription pkg)
 
 -- | Writes a generic package description to a string
 showGenericPackageDescription :: GenericPackageDescription -> String
 showGenericPackageDescription gpd = showFields (const []) $ ppGenericPackageDescription v gpd
   where
-    v = cabalSpecFromVersionDigits
-      $ versionNumbers
-      $ specVersion
-      $ packageDescription gpd
+    v = specVersion $ packageDescription gpd
 
 -- | Convert a generic package description to 'PrettyField's.
 ppGenericPackageDescription :: CabalSpecVersion -> GenericPackageDescription -> [PrettyField ()]
-ppGenericPackageDescription v gpd = concat
+ppGenericPackageDescription v gpd0 = concat
     [ ppPackageDescription v (packageDescription gpd)
     , ppSetupBInfo v (setupBuildInfo (packageDescription gpd))
     , ppGenPackageFlags v (genPackageFlags gpd)
@@ -82,6 +76,9 @@ ppGenericPackageDescription v gpd = concat
     , ppCondTestSuites v (condTestSuites gpd)
     , ppCondBenchmarks v (condBenchmarks gpd)
     ]
+  where
+    gpd = preProcessInternalDeps (specVersion (packageDescription gpd0)) gpd0
+
 
 ppPackageDescription :: CabalSpecVersion -> PackageDescription -> [PrettyField ()]
 ppPackageDescription v pd =
@@ -104,11 +101,11 @@ ppSetupBInfo v (Just sbi)
     | otherwise = pure $ PrettySection () "custom-setup" [] $
         prettyFieldGrammar v (setupBInfoFieldGrammar False) sbi
 
-ppGenPackageFlags :: CabalSpecVersion -> [Flag] -> [PrettyField ()]
+ppGenPackageFlags :: CabalSpecVersion -> [PackageFlag] -> [PrettyField ()]
 ppGenPackageFlags = map . ppFlag
 
-ppFlag :: CabalSpecVersion -> Flag -> PrettyField ()
-ppFlag v flag@(MkFlag name _ _ _)  = PrettySection () "flag" [ppFlagName name] $
+ppFlag :: CabalSpecVersion -> PackageFlag -> PrettyField ()
+ppFlag v flag@(MkPackageFlag name _ _ _)  = PrettySection () "flag" [ppFlagName name] $
     prettyFieldGrammar v (flagFieldGrammar name) flag
 
 ppCondTree2 :: CabalSpecVersion -> PrettyFieldGrammar' s -> CondTree ConfVar [Dependency] s -> [PrettyField ()]
@@ -126,17 +123,10 @@ ppCondTree2 v grammar = go
         thenDoc = go thenTree
 
     ppIf (CondBranch c thenTree (Just elseTree)) =
-          case (False, False) of
- --       case (isEmpty thenDoc, isEmpty elseDoc) of
-              (True,  True)  -> mempty
-              (False, True)  -> [ ppIfCondition c thenDoc ]
-              (True,  False) -> [ ppIfCondition (cNot c) elseDoc ]
-              (False, False) -> [ ppIfCondition c thenDoc
-                                , PrettySection () "else" [] elseDoc
-                                ]
-      where
-        thenDoc = go thenTree
-        elseDoc = go elseTree
+      -- See #6193
+      [ ppIfCondition c (go thenTree)
+      , PrettySection () "else" [] (go elseTree)
+      ]
 
 ppCondLibrary :: CabalSpecVersion -> Maybe (CondTree ConfVar [Dependency] Library) -> [PrettyField ()]
 ppCondLibrary _ Nothing = mempty
@@ -187,10 +177,10 @@ ppCondition (COr c1 c2)                  = parens (hsep [ppCondition c1, text "|
 ppCondition (CAnd c1 c2)                 = parens (hsep [ppCondition c1, text "&&"
                                                          <+> ppCondition c2])
 ppConfVar :: ConfVar -> Doc
-ppConfVar (OS os)                        = text "os"   <<>> parens (pretty os)
-ppConfVar (Arch arch)                    = text "arch" <<>> parens (pretty arch)
-ppConfVar (Flag name)                    = text "flag" <<>> parens (ppFlagName name)
-ppConfVar (Impl c v)                     = text "impl" <<>> parens (pretty c <+> pretty v)
+ppConfVar (OS os)            = text "os"   <<>> parens (pretty os)
+ppConfVar (Arch arch)        = text "arch" <<>> parens (pretty arch)
+ppConfVar (PackageFlag name) = text "flag" <<>> parens (ppFlagName name)
+ppConfVar (Impl c v)         = text "impl" <<>> parens (pretty c <+> pretty v)
 
 ppFlagName :: FlagName -> Doc
 ppFlagName                               = text . unFlagName
@@ -199,7 +189,7 @@ ppIfCondition :: Condition ConfVar -> [PrettyField ()] -> PrettyField ()
 ppIfCondition c = PrettySection () "if" [ppCondition c]
 
 -- | @since 2.0.0.2
-writePackageDescription :: FilePath -> PackageDescription -> NoCallStackIO ()
+writePackageDescription :: FilePath -> PackageDescription -> IO ()
 writePackageDescription fpath pkg = writeUTF8File fpath (showPackageDescription pkg)
 
 --TODO: make this use section syntax
@@ -212,6 +202,7 @@ showPackageDescription = showGenericPackageDescription . pdToGpd
 pdToGpd :: PackageDescription -> GenericPackageDescription
 pdToGpd pd = GenericPackageDescription
     { packageDescription = pd
+    , gpdScannedVersion  = Nothing
     , genPackageFlags    = []
     , condLibrary        = mkCondTree <$> library pd
     , condSubLibraries   = mkCondTreeL <$> subLibraries pd
@@ -231,8 +222,54 @@ pdToGpd pd = GenericPackageDescription
         -> a -> (UnqualComponentName, CondTree ConfVar [Dependency] a)
     mkCondTree' f x = (f x, CondNode x [] [])
 
+-------------------------------------------------------------------------------
+-- Internal libs
+-------------------------------------------------------------------------------
+
+-- See Note [Dependencies on sublibraries] in Distribution.PackageDescription.Parsec
+--
+preProcessInternalDeps :: CabalSpecVersion -> GenericPackageDescription -> GenericPackageDescription
+preProcessInternalDeps specVer gpd
+    | specVer >= CabalSpecV3_4 = gpd
+    | otherwise                = transformAllBuildInfos transformBI transformSBI gpd
+  where
+    transformBI :: BuildInfo -> BuildInfo
+    transformBI
+        = over L.targetBuildDepends (concatMap transformD)
+        . over L.mixins (map transformM)
+
+    transformSBI :: SetupBuildInfo -> SetupBuildInfo
+    transformSBI = over L.setupDepends (concatMap transformD)
+
+    transformD :: Dependency -> [Dependency]
+    transformD (Dependency pn vr ln)
+        | pn == thisPn
+        = if LMainLibName `NES.member` ln
+          then Dependency thisPn vr mainLibSet : sublibs
+          else sublibs
+      where
+        sublibs =
+            [ Dependency (unqualComponentNameToPackageName uqn) vr mainLibSet
+            | LSubLibName uqn <- NES.toList ln
+            ]
+
+    transformD d = [d]
+
+    transformM :: Mixin -> Mixin
+    transformM (Mixin pn (LSubLibName uqn) inc)
+        | pn == thisPn
+        = mkMixin (unqualComponentNameToPackageName uqn) LMainLibName inc
+    transformM m = m
+
+    thisPn :: PackageName
+    thisPn = pkgName (package (packageDescription gpd))
+
+-------------------------------------------------------------------------------
+-- HookedBuildInfo
+-------------------------------------------------------------------------------
+
 -- | @since 2.0.0.2
-writeHookedBuildInfo :: FilePath -> HookedBuildInfo -> NoCallStackIO ()
+writeHookedBuildInfo :: FilePath -> HookedBuildInfo -> IO ()
 writeHookedBuildInfo fpath = writeFileAtomic fpath . BS.Char8.pack
                              . showHookedBuildInfo
 

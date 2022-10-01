@@ -29,13 +29,14 @@ import Distribution.Utils.MapAccum
 
 import Distribution.Types.AnnotatedId
 import Distribution.Types.ComponentName
+import Distribution.Types.ModuleReexport
 import Distribution.Types.ModuleRenaming
 import Distribution.Types.IncludeRenaming
 import Distribution.Types.ComponentInclude
 import Distribution.Types.ComponentId
 import Distribution.Types.PackageId
 import Distribution.Package
-import Distribution.PackageDescription as PD hiding (Flag)
+import Distribution.PackageDescription
 import Distribution.ModuleName
 import Distribution.Simple.LocalBuildInfo
 import Distribution.Verbosity
@@ -43,11 +44,8 @@ import Distribution.Utils.LogProgress
 
 import qualified Data.Set as Set
 import qualified Data.Map as Map
-import Data.Traversable
-    ( mapM )
 import Distribution.Pretty (pretty)
-import Text.PrettyPrint
-import Data.Either
+import Text.PrettyPrint (Doc, hang, text, vcat, ($+$), hsep, quotes)
 
 -- | A linked component is a component that has been mix-in linked, at
 -- which point we have determined how all the dependencies of the
@@ -187,19 +185,19 @@ toLinkedComponent verbosity db this_pid pkg_map ConfiguredComponent {
                 m_u <- convertModule (OpenModule this_uid m)
                 return (Map.singleton m [WithSource (from m) m_u], Map.empty)
         -- Handle 'exposed-modules'
-        exposed_mod_shapes_u <- mapM (convertMod FromExposedModules) src_provs
+        exposed_mod_shapes_u <- traverse (convertMod FromExposedModules) src_provs
         -- Handle 'other-modules'
-        other_mod_shapes_u <- mapM (convertMod FromOtherModules) src_hidden
+        other_mod_shapes_u <- traverse (convertMod FromOtherModules) src_hidden
 
         -- Handle 'signatures'
         let convertReq :: ModuleName -> UnifyM s (ModuleScopeU s)
             convertReq req = do
                 req_u <- convertModule (OpenModuleVar req)
                 return (Map.empty, Map.singleton req [WithSource (FromSignatures req) req_u])
-        req_shapes_u <- mapM convertReq src_reqs
+        req_shapes_u <- traverse convertReq src_reqs
 
         -- Handle 'mixins'
-        (incl_shapes_u, all_includes_u) <- fmap unzip (mapM convertInclude unlinked_includes)
+        (incl_shapes_u, all_includes_u) <- fmap unzip (traverse convertInclude unlinked_includes)
 
         failIfErrs -- Prevent error cascade
         -- Mix-in link everything!  mixLink is the real workhorse.
@@ -208,7 +206,7 @@ toLinkedComponent verbosity db this_pid pkg_map ConfiguredComponent {
                           ++ req_shapes_u
                           ++ incl_shapes_u
 
-        -- src_reqs_u <- mapM convertReq src_reqs
+        -- src_reqs_u <- traverse convertReq src_reqs
         -- Read out all the final results by converting back
         -- into a pure representation.
         let convertIncludeU (ComponentInclude dep_aid rns i) = do
@@ -220,8 +218,8 @@ toLinkedComponent verbosity db this_pid pkg_map ConfiguredComponent {
                         })
         shape <- convertModuleScopeU shape_u
         let (includes_u, sig_includes_u) = partitionEithers all_includes_u
-        incls <- mapM convertIncludeU includes_u
-        sig_incls <- mapM convertIncludeU sig_includes_u
+        incls <- traverse convertIncludeU includes_u
+        sig_incls <- traverse convertIncludeU sig_includes_u
         return (shape, incls, sig_incls)
 
     let isNotLib (CLib _) = False

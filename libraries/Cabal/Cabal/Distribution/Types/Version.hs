@@ -81,6 +81,7 @@ instance Read Version where
         return (mkVersion v)
 
 instance Binary Version
+instance Structured Version
 
 instance NFData Version where
     rnf (PV0 _) = ()
@@ -92,7 +93,7 @@ instance Pretty Version where
                                 (map Disp.int $ versionNumbers ver))
 
 instance Parsec Version where
-    parsec = mkVersion <$> P.sepBy1 versionDigitParser (P.char '.') <* tags
+    parsec = mkVersion <$> toList <$> P.sepByNonEmpty versionDigitParser (P.char '.') <* tags
       where
         tags = do
             ts <- many $ P.char '-' *> some (P.satisfy isAlphaNum)

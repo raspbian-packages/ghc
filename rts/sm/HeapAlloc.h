@@ -17,7 +17,7 @@
    It needs to be FAST.
 
    See wiki commentary at
-     http://ghc.haskell.org/trac/ghc/wiki/Commentary/HeapAlloced
+     https://gitlab.haskell.org/ghc/ghc/wikis/commentary/heap-alloced
 
    Implementation of HEAP_ALLOCED
    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -192,7 +192,7 @@ StgBool HEAP_ALLOCED(const void *p)
 // updated atomically, but we need to place a lock around operations
 // that touch the MBlock map.
 INLINE_HEADER
-StgBool HEAP_ALLOCED_GC(void *p)
+StgBool HEAP_ALLOCED_GC(const void *p)
 {
     StgWord mblock;
     uint32_t entry_no;

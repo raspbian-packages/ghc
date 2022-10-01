@@ -7,7 +7,7 @@
  * Documentation on the architecture of the Garbage Collector can be
  * found in the online commentary:
  *
- *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/Rts/Storage/GC
+ *   https://gitlab.haskell.org/ghc/ghc/wikis/commentary/rts/storage/gc
  *
  * ---------------------------------------------------------------------------*/
 
@@ -77,15 +77,9 @@
 typedef enum { WeakPtrs, WeakThreads, WeakDone } WeakStage;
 static WeakStage weak_stage;
 
-// List of weak pointers whose key is dead
-StgWeak *dead_weak_ptr_list;
-
-// List of threads found to be unreachable
-StgTSO *resurrected_threads;
-
-static void    collectDeadWeakPtrs (generation *gen);
+static void    collectDeadWeakPtrs (generation *gen, StgWeak **dead_weak_ptr_list);
 static bool tidyWeakList (generation *gen);
-static bool resurrectUnreachableThreads (generation *gen);
+static bool resurrectUnreachableThreads (generation *gen, StgTSO **resurrected_threads);
 static void    tidyThreadList (generation *gen);
 
 void
@@ -100,12 +94,10 @@ initWeakForGC(void)
     }
 
     weak_stage = WeakThreads;
-    dead_weak_ptr_list = NULL;
-    resurrected_threads = END_TSO_QUEUE;
 }
 
 bool
-traverseWeakPtrList(void)
+traverseWeakPtrList(StgWeak **dead_weak_ptr_list, StgTSO **resurrected_threads)
 {
   bool flag = false;
 
@@ -140,7 +132,7 @@ traverseWeakPtrList(void)
 
       // Resurrect any threads which were unreachable
       for (g = 0; g <= N; g++) {
-          if (resurrectUnreachableThreads(&generations[g])) {
+          if (resurrectUnreachableThreads(&generations[g], resurrected_threads)) {
               flag = true;
           }
       }
@@ -175,7 +167,7 @@ traverseWeakPtrList(void)
        */
       if (flag == false) {
           for (g = 0; g <= N; g++) {
-              collectDeadWeakPtrs(&generations[g]);
+              collectDeadWeakPtrs(&generations[g], dead_weak_ptr_list);
           }
 
           weak_stage = WeakDone;  // *now* we're done,
@@ -190,7 +182,7 @@ traverseWeakPtrList(void)
   }
 }
 
-static void collectDeadWeakPtrs (generation *gen)
+static void collectDeadWeakPtrs (generation *gen, StgWeak **dead_weak_ptr_list)
 {
     StgWeak *w, *next_w;
     for (w = gen->old_weak_ptr_list; w != NULL; w = next_w) {
@@ -201,12 +193,12 @@ static void collectDeadWeakPtrs (generation *gen)
         }
         evacuate(&w->finalizer);
         next_w = w->link;
-        w->link = dead_weak_ptr_list;
-        dead_weak_ptr_list = w;
+        w->link = *dead_weak_ptr_list;
+        *dead_weak_ptr_list = w;
     }
 }
 
-static bool resurrectUnreachableThreads (generation *gen)
+static bool resurrectUnreachableThreads (generation *gen, StgTSO **resurrected_threads)
 {
     StgTSO *t, *tmp, *next;
     bool flag = false;
@@ -231,8 +223,8 @@ static bool resurrectUnreachableThreads (generation *gen)
         default:
             tmp = t;
             evacuate((StgClosure **)&tmp);
-            tmp->global_link = resurrected_threads;
-            resurrected_threads = tmp;
+            tmp->global_link = *resurrected_threads;
+            *resurrected_threads = tmp;
             flag = true;
         }
     }
@@ -422,14 +414,13 @@ markWeakPtrList ( void )
         StgWeak *w, **last_w;
 
         last_w = &gen->weak_ptr_list;
-        for (w = gen->weak_ptr_list; w != NULL; w = w->link) {
+        for (w = gen->weak_ptr_list; w != NULL; w = RELAXED_LOAD(&w->link)) {
             // w might be WEAK, EVACUATED, or DEAD_WEAK (actually CON_STATIC) here
 
 #if defined(DEBUG)
             {   // careful to do this assertion only reading the info ptr
                 // once, because during parallel GC it might change under our feet.
-                const StgInfoTable *info;
-                info = w->header.info;
+                const StgInfoTable *info = RELAXED_LOAD(&w->header.info);
                 ASSERT(IS_FORWARDING_PTR(info)
                        || info == &stg_DEAD_WEAK_info
                        || INFO_PTR_TO_STRUCT(info)->type == WEAK);

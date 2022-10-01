@@ -11,13 +11,12 @@ import Prelude ()
 import Distribution.Compat.Prelude
 
 import Distribution.Types.UnqualComponentName
-import Distribution.Simple.Compiler hiding (Flag)
-import Distribution.PackageDescription as PD hiding (Flag)
+import Distribution.Simple.Compiler
+import Distribution.PackageDescription
 import Distribution.Simple.Setup as Setup
 import qualified Distribution.Simple.InstallDirs as InstallDirs
 import Distribution.Simple.LocalBuildInfo
 import Distribution.Types.ComponentId
-import Distribution.Types.PackageId
 import Distribution.Types.UnitId
 import Distribution.Types.MungedPackageName
 import Distribution.Utils.Base62
@@ -125,8 +124,8 @@ computeCompatPackageKey
     -> UnitId
     -> String
 computeCompatPackageKey comp pkg_name pkg_version uid
-    | not (packageKeySupported comp) =
-        prettyShow pkg_name ++ "-" ++ prettyShow pkg_version
+    | not (packageKeySupported comp || unitIdSupported comp)
+    = prettyShow pkg_name ++ "-" ++ prettyShow pkg_version
     | not (unifiedIPIDRequired comp) =
         let str = unUnitId uid -- assume no Backpack support
             mb_verbatim_key

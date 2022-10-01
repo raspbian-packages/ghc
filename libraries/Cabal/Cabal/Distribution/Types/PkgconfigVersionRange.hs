@@ -18,6 +18,7 @@ import Distribution.Parsec
 import Distribution.Pretty
 import Distribution.Types.PkgconfigVersion
 import Distribution.Types.Version
+import Distribution.Types.VersionInterval
 import Distribution.Types.VersionRange
 
 import qualified Data.ByteString.Char8           as BS8
@@ -37,6 +38,7 @@ data PkgconfigVersionRange
   deriving (Generic, Read, Show, Eq, Typeable, Data)
 
 instance Binary PkgconfigVersionRange
+instance Structured PkgconfigVersionRange
 instance NFData PkgconfigVersionRange where rnf = genericRnf
 
 instance Pretty PkgconfigVersionRange where
@@ -68,7 +70,7 @@ instance Parsec PkgconfigVersionRange where
         csv <- askCabalSpecVersion
         if csv >= CabalSpecV3_0
         then pkgconfigParser
-        else versionRangeToPkgconfigVersionRange <$> versionRangeParser P.integral
+        else versionRangeToPkgconfigVersionRange <$> versionRangeParser P.integral csv
 
 -- "modern" parser of @pkg-config@ package versions.
 pkgconfigParser :: CabalParsing m => m PkgconfigVersionRange
@@ -85,7 +87,7 @@ pkgconfigParser = P.spaces >> expr where
     factor = parens expr <|> prim
 
     prim = do
-        op <- P.munch1 (`elem` "<>=^-") P.<?> "operator"
+        op <- P.munch1 isOpChar P.<?> "operator"
         case op of
             "-"  -> anyPkgconfigVersion <$ (P.string "any" *> P.spaces)
 
@@ -96,6 +98,14 @@ pkgconfigParser = P.spaces >> expr where
             "<=" -> afterOp PcOrEarlierVersion
 
             _ -> P.unexpected $ "Unknown version operator " ++ show op
+
+    -- https://gitlab.haskell.org/ghc/ghc/issues/17752
+    isOpChar '<' = True
+    isOpChar '=' = True
+    isOpChar '>' = True
+    isOpChar '^' = True
+    isOpChar '-' = True
+    isOpChar _   = False
 
     afterOp f = do
         P.spaces
@@ -133,10 +143,19 @@ versionToPkgconfigVersion :: Version -> PkgconfigVersion
 versionToPkgconfigVersion = PkgconfigVersion . BS8.pack . prettyShow
 
 versionRangeToPkgconfigVersionRange :: VersionRange -> PkgconfigVersionRange
-versionRangeToPkgconfigVersionRange = foldVersionRange
-    anyPkgconfigVersion
-    (PcThisVersion . versionToPkgconfigVersion)
-    (PcLaterVersion . versionToPkgconfigVersion)
-    (PcEarlierVersion . versionToPkgconfigVersion)
-    PcUnionVersionRanges
-    PcIntersectVersionRanges
+versionRangeToPkgconfigVersionRange vr
+    | isAnyVersion vr
+    = PcAnyVersion
+    | otherwise
+    = case asVersionIntervals vr of
+        []     -> PcEarlierVersion (PkgconfigVersion (BS8.pack "0"))
+        (i:is) -> foldl (\r j -> PcUnionVersionRanges r (conv j)) (conv i) is
+  where
+    conv (LowerBound v b, NoUpperBound)   = convL v b
+    conv (LowerBound v b, UpperBound u c) = PcIntersectVersionRanges (convL v b) (convU u c)
+
+    convL v ExclusiveBound = PcLaterVersion (versionToPkgconfigVersion v)
+    convL v InclusiveBound = PcOrLaterVersion (versionToPkgconfigVersion v)
+
+    convU v ExclusiveBound = PcEarlierVersion (versionToPkgconfigVersion v)
+    convU v InclusiveBound = PcOrEarlierVersion (versionToPkgconfigVersion v)

@@ -2,7 +2,7 @@
 {-# LANGUAGE DeriveGeneric              #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 module Distribution.Types.UnqualComponentName
-  ( UnqualComponentName, unUnqualComponentName, mkUnqualComponentName
+  ( UnqualComponentName, unUnqualComponentName, unUnqualComponentNameST, mkUnqualComponentName
   , packageNameToUnqualComponentName, unqualComponentNameToPackageName
   ) where
 
@@ -31,6 +31,10 @@ newtype UnqualComponentName = UnqualComponentName ShortText
 unUnqualComponentName :: UnqualComponentName -> String
 unUnqualComponentName (UnqualComponentName s) = fromShortText s
 
+-- | @since 3.4.0.0
+unUnqualComponentNameST :: UnqualComponentName -> ShortText
+unUnqualComponentNameST (UnqualComponentName s) = s
+
 -- | Construct a 'UnqualComponentName' from a 'String'
 --
 -- 'mkUnqualComponentName' is the inverse to 'unUnqualComponentName'
@@ -49,6 +53,7 @@ instance IsString UnqualComponentName where
   fromString = mkUnqualComponentName
 
 instance Binary UnqualComponentName
+instance Structured UnqualComponentName
 
 instance Pretty UnqualComponentName where
   pretty = showToken . unUnqualComponentName
@@ -73,7 +78,7 @@ instance NFData UnqualComponentName where
 --
 -- @since 2.0.0.2
 packageNameToUnqualComponentName :: PackageName -> UnqualComponentName
-packageNameToUnqualComponentName = mkUnqualComponentName . unPackageName
+packageNameToUnqualComponentName = UnqualComponentName . unPackageNameST
 
 -- | Converts an unqualified component name to a package name
 --
@@ -85,4 +90,4 @@ packageNameToUnqualComponentName = mkUnqualComponentName . unPackageName
 --
 -- @since 2.0.0.2
 unqualComponentNameToPackageName :: UnqualComponentName -> PackageName
-unqualComponentNameToPackageName = mkPackageName . unUnqualComponentName
+unqualComponentNameToPackageName = mkPackageNameST . unUnqualComponentNameST

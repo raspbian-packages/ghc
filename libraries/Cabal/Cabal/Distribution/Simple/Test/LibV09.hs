@@ -34,14 +34,14 @@ import Distribution.Pretty
 import Distribution.Verbosity
 
 import qualified Control.Exception as CE
+import qualified Data.ByteString.Lazy as LBS
 import System.Directory
     ( createDirectoryIfMissing, canonicalizePath
     , doesDirectoryExist, doesFileExist
     , getCurrentDirectory, removeDirectoryRecursive, removeFile
     , setCurrentDirectory )
-import System.Exit ( exitSuccess, exitWith, ExitCode(..) )
 import System.FilePath ( (</>), (<.>) )
-import System.IO ( hClose, hGetContents, hPutStr )
+import System.IO ( hClose, hPutStr )
 import System.Process (StdStream(..), waitForProcess)
 
 runTest :: PD.PackageDescription
@@ -79,6 +79,8 @@ runTest pkg_descr lbi clbi flags suite = do
 
     suiteLog <- CE.bracket openCabalTemp deleteIfExists $ \tempLog -> do
 
+        -- TODO: this setup is broken,
+        -- if the test output is too big, we will deadlock.
         (rOut, wOut) <- createPipe
 
         -- Run test executable
@@ -113,9 +115,9 @@ runTest pkg_descr lbi clbi flags suite = do
 
         -- Append contents of temporary log file to the final human-
         -- readable log file
-        logText <- hGetContents rOut
+        logText <- LBS.hGetContents rOut
         -- Force the IO manager to drain the test output pipe
-        length logText `seq` return ()
+        _ <- evaluate (force logText)
 
         exitcode <- waitForProcess process
         unless (exitcode == ExitSuccess) $ do
@@ -135,7 +137,7 @@ runTest pkg_descr lbi clbi flags suite = do
         -- Write summary notice to log file indicating start of test suite
         appendFile (logFile suiteLog) $ summarizeSuiteStart testName'
 
-        appendFile (logFile suiteLog) logText
+        LBS.appendFile (logFile suiteLog) logText
 
         -- Write end-of-suite summary notice to log file
         appendFile (logFile suiteLog) $ summarizeSuiteFinish suiteLog
@@ -146,7 +148,9 @@ runTest pkg_descr lbi clbi flags suite = do
             whenPrinting = when $ (details > Never)
                 && (not (suitePassed $ testLogs suiteLog) || details == Always)
                 && verbosity >= normal
-        whenPrinting $ putStr $ unlines $ lines logText
+        whenPrinting $ do
+            LBS.putStr logText
+            putChar '\n'
 
         return suiteLog
 
@@ -159,7 +163,7 @@ runTest pkg_descr lbi clbi flags suite = do
     return suiteLog
   where
     testName' = unUnqualComponentName $ PD.testName suite
-    
+
     deleteIfExists file = do
         exists <- doesFileExist file
         when exists $ removeFile file
@@ -203,11 +207,13 @@ writeSimpleTestStub :: PD.TestSuite -- ^ library 'TestSuite' for which a stub
                                     -- is being created
                     -> FilePath     -- ^ path to directory where stub source
                                     -- should be located
-                    -> NoCallStackIO ()
+                    -> IO ()
 writeSimpleTestStub t dir = do
     createDirectoryIfMissing True dir
     let filename = dir </> stubFilePath t
-        PD.TestSuiteLibV09 _ m = PD.testInterface t
+        m = case PD.testInterface t of
+            PD.TestSuiteLibV09 _  m' -> m'
+            _                        -> error "writeSimpleTestStub: invalid TestSuite passed"
     writeFile filename $ simpleTestStub m
 
 -- | Source code for library test suite stub executable
@@ -231,7 +237,7 @@ stubMain tests = do
     setCurrentDirectory dir
     stubWriteLog f n results
   where
-    errHandler :: CE.SomeException -> NoCallStackIO TestLogs
+    errHandler :: CE.SomeException -> IO TestLogs
     errHandler e = case CE.fromException e of
         Just CE.UserInterrupt -> CE.throwIO e
         _ -> return $ TestLog { testName = "Cabal test suite exception",
@@ -272,7 +278,7 @@ stubRunTests tests = do
 
 -- | From a test stub, write the 'TestSuiteLog' to temporary file for the calling
 -- Cabal process to read.
-stubWriteLog :: FilePath -> UnqualComponentName -> TestLogs -> NoCallStackIO ()
+stubWriteLog :: FilePath -> UnqualComponentName -> TestLogs -> IO ()
 stubWriteLog f n logs = do
     let testLog = TestSuiteLog { testSuiteName = n, testLogs = logs, logFile = f }
     writeFile (logFile testLog) $ show testLog

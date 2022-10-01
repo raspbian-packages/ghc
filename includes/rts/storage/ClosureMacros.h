@@ -46,13 +46,14 @@
    -------------------------------------------------------------------------- */
 
 INLINE_HEADER void SET_INFO(StgClosure *c, const StgInfoTable *info) {
-    c->header.info = info;
+    RELAXED_STORE(&c->header.info, info);
+}
+INLINE_HEADER void SET_INFO_RELEASE(StgClosure *c, const StgInfoTable *info) {
+    RELEASE_STORE(&c->header.info, info);
 }
 INLINE_HEADER const StgInfoTable *GET_INFO(StgClosure *c) {
-    return c->header.info;
+    return RELAXED_LOAD(&c->header.info);
 }
-
-#define GET_ENTRY(c)  (ENTRY_CODE(GET_INFO(c)))
 
 #if defined(TABLES_NEXT_TO_CODE)
 EXTERN_INLINE StgInfoTable *INFO_PTR_TO_STRUCT(const StgInfoTable *info);
@@ -83,28 +84,28 @@ INLINE_HEADER StgConInfoTable *itbl_to_con_itbl(const StgInfoTable *i) {return (
 EXTERN_INLINE const StgInfoTable *get_itbl(const StgClosure *c);
 EXTERN_INLINE const StgInfoTable *get_itbl(const StgClosure *c)
 {
-   return INFO_PTR_TO_STRUCT(c->header.info);
+    return INFO_PTR_TO_STRUCT(RELAXED_LOAD(&c->header.info));
 }
 
 EXTERN_INLINE const StgRetInfoTable *get_ret_itbl(const StgClosure *c);
 EXTERN_INLINE const StgRetInfoTable *get_ret_itbl(const StgClosure *c)
 {
-   return RET_INFO_PTR_TO_STRUCT(c->header.info);
+    return RET_INFO_PTR_TO_STRUCT(RELAXED_LOAD(&c->header.info));
 }
 
 INLINE_HEADER const StgFunInfoTable *get_fun_itbl(const StgClosure *c)
 {
-   return FUN_INFO_PTR_TO_STRUCT(c->header.info);
+    return FUN_INFO_PTR_TO_STRUCT(RELAXED_LOAD(&c->header.info));
 }
 
 INLINE_HEADER const StgThunkInfoTable *get_thunk_itbl(const StgClosure *c)
 {
-   return THUNK_INFO_PTR_TO_STRUCT(c->header.info);
+    return THUNK_INFO_PTR_TO_STRUCT(RELAXED_LOAD(&c->header.info));
 }
 
 INLINE_HEADER const StgConInfoTable *get_con_itbl(const StgClosure *c)
 {
-   return CON_INFO_PTR_TO_STRUCT((c)->header.info);
+    return CON_INFO_PTR_TO_STRUCT(RELAXED_LOAD(&c->header.info));
 }
 
 INLINE_HEADER StgHalfWord GET_TAG(const StgClosure *con)
@@ -117,49 +118,41 @@ INLINE_HEADER StgHalfWord GET_TAG(const StgClosure *con)
    -------------------------------------------------------------------------- */
 
 #if defined(PROFILING)
-#if defined(DEBUG_RETAINER)
 /*
-  For the sake of debugging, we take the safest way for the moment. Actually, this
-  is useful to check the sanity of heap before beginning retainer profiling.
-  flip is defined in RetainerProfile.c, and declared as extern in RetainerProfile.h.
-  Note: change those functions building Haskell objects from C datatypes, i.e.,
-  all rts_mk???() functions in RtsAPI.c, as well.
- */
-#define SET_PROF_HDR(c,ccs_)            \
-        ((c)->header.prof.ccs = ccs_, (c)->header.prof.hp.rs = (retainerSet *)((StgWord)NULL | flip))
-#else
-/*
-  For retainer profiling only: we do not have to set (c)->header.prof.hp.rs to
-  NULL | flip (flip is defined in RetainerProfile.c) because even when flip
-  is 1, rs is invalid and will be initialized to NULL | flip later when
-  the closure *c is visited.
- */
-/*
-#define SET_PROF_HDR(c,ccs_)            \
-        ((c)->header.prof.ccs = ccs_, (c)->header.prof.hp.rs = NULL)
- */
-/*
-  The following macro works for both retainer profiling and LDV profiling:
-  for retainer profiling, ldvTime remains 0, so rs fields are initialized to 0.
-  See the invariants on ldvTime.
+  The following macro works for both retainer profiling and LDV profiling. For
+ retainer profiling, 'era' remains 0, so by setting the 'ldvw' field we also set
+ 'rs' to zero.
+
+ Note that we don't have to bother handling the 'flip' bit properly[1] since the
+ retainer profiling code will just set 'rs' to NULL upon visiting a closure with
+ an invalid 'flip' bit anyways.
+
+ See Note [Profiling heap traversal visited bit] for details.
+
+ [1]: Technically we should set 'rs' to `NULL | flip`.
  */
 #define SET_PROF_HDR(c,ccs_)            \
         ((c)->header.prof.ccs = ccs_,   \
         LDV_RECORD_CREATE((c)))
-#endif /* DEBUG_RETAINER */
 #else
 #define SET_PROF_HDR(c,ccs)
 #endif
 
 #define SET_HDR(c,_info,ccs)                            \
    {                                                    \
-        (c)->header.info = _info;                       \
         SET_PROF_HDR((StgClosure *)(c),ccs);            \
+        RELAXED_STORE(&(c)->header.info, _info);        \
+   }
+
+#define SET_HDR_RELEASE(c,_info,ccs)                    \
+   {                                                    \
+        SET_PROF_HDR((StgClosure *)(c),ccs);            \
+        RELEASE_STORE(&(c)->header.info, _info);        \
    }
 
 #define SET_ARR_HDR(c,info,costCentreStack,n_bytes)     \
-   SET_HDR(c,info,costCentreStack);                     \
-   (c)->bytes = n_bytes;
+   (c)->bytes = n_bytes;                                \
+   SET_HDR(c,info,costCentreStack);
 
 // Use when changing a closure from one kind to another
 #define OVERWRITE_INFO(c, new_info)                             \
@@ -184,8 +177,8 @@ STATIC_LINK(const StgInfoTable *info, StgClosure *p)
     case IND_STATIC:
         return IND_STATIC_LINK(p);
     default:
-        return &(p)->payload[info->layout.payload.ptrs +
-                             info->layout.payload.nptrs];
+        return &p->payload[info->layout.payload.ptrs +
+                           info->layout.payload.nptrs];
     }
 }
 
@@ -267,8 +260,8 @@ INLINE_HEADER bool LOOKS_LIKE_INFO_PTR (StgWord p)
 
 INLINE_HEADER bool LOOKS_LIKE_CLOSURE_PTR (const void *p)
 {
-    return LOOKS_LIKE_INFO_PTR((StgWord)
-            (UNTAG_CONST_CLOSURE((const StgClosure *)(p)))->header.info);
+    const StgInfoTable *info = RELAXED_LOAD(&UNTAG_CONST_CLOSURE((const StgClosure *) (p))->header.info);
+    return LOOKS_LIKE_INFO_PTR((StgWord) info);
 }
 
 /* -----------------------------------------------------------------------------
@@ -488,74 +481,114 @@ INLINE_HEADER StgWord8 *mutArrPtrsCard (StgMutArrPtrs *a, W_ n)
    OVERWRITING_CLOSURE(p) on the old closure that is about to be
    overwritten.
 
-   Note [zeroing slop]
+   Note [zeroing slop when overwriting closures]
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-   In some scenarios we write zero words into "slop"; memory that is
-   left unoccupied after we overwrite a closure in the heap with a
-   smaller closure.
+   When we overwrite a closure in the heap with a smaller one, in some scenarios
+   we need to write zero words into "slop"; the memory that is left
+   unoccupied. See Note [slop on the heap]
 
    Zeroing slop is required for:
 
-    - full-heap sanity checks (DEBUG, and +RTS -DS)
-    - LDV profiling (PROFILING, and +RTS -hb)
+    - full-heap sanity checks (DEBUG, and +RTS -DS),
 
-   Zeroing slop must be disabled for:
+    - LDV profiling (PROFILING, and +RTS -hb) and
 
-    - THREADED_RTS with +RTS -N2 and greater, because we cannot
-      overwrite slop when another thread might be reading it.
+   However we can get into trouble if we're zeroing slop for ordinarily
+   immutable closures when using multiple threads, since there is nothing
+   preventing another thread from still being in the process of reading the
+   memory we're about to zero.
 
-   Hence, slop is zeroed when either:
+   Thus, with the THREADED RTS and +RTS -N2 or greater we must not zero
+   immutable closure's slop.
 
-    - PROFILING && era <= 0 (LDV is on)
-    - !THREADED_RTS && DEBUG
+   Hence, an immutable closure's slop is zeroed when either:
 
-   And additionally:
+    - PROFILING && era > 0 (LDV is on) or
+    - !THREADED && DEBUG
 
-    - LDV profiling and +RTS -N2 are incompatible
-    - full-heap sanity checks are disabled for THREADED_RTS
+   Additionally:
+
+    - LDV profiling and +RTS -N2 are incompatible,
+
+    - full-heap sanity checks are disabled for the THREADED RTS, at least when
+      they don't run right after GC when there is no slop.
+      See Note [heap sanity checking with SMP].
 
    -------------------------------------------------------------------------- */
 
-#if defined(PROFILING)
-#define ZERO_SLOP_FOR_LDV_PROF 1
+#if defined(PROFILING) || defined(DEBUG)
+#define OVERWRITING_CLOSURE(c) \
+    overwritingClosure(c)
+#define OVERWRITING_CLOSURE_SIZE(c, size) \
+    overwritingClosureSize(c, size)
+#define OVERWRITING_CLOSURE_MUTABLE(c, off) \
+    overwritingMutableClosureOfs(c, off)
 #else
-#define ZERO_SLOP_FOR_LDV_PROF 0
-#endif
-
-#if defined(DEBUG) && !defined(THREADED_RTS)
-#define ZERO_SLOP_FOR_SANITY_CHECK 1
-#else
-#define ZERO_SLOP_FOR_SANITY_CHECK 0
-#endif
-
-#if ZERO_SLOP_FOR_LDV_PROF || ZERO_SLOP_FOR_SANITY_CHECK
-#define OVERWRITING_CLOSURE(c) overwritingClosure(c)
-#define OVERWRITING_CLOSURE_OFS(c,n) overwritingClosureOfs(c,n)
-#else
-#define OVERWRITING_CLOSURE(c) /* nothing */
-#define OVERWRITING_CLOSURE_OFS(c,n) /* nothing */
+#define OVERWRITING_CLOSURE(c) \
+    do { (void) sizeof(c); } while(0)
+#define OVERWRITING_CLOSURE_SIZE(c, size) \
+    do { (void) sizeof(c); (void) sizeof(size); } while(0)
+#define OVERWRITING_CLOSURE_MUTABLE(c, off) \
+    do { (void) sizeof(c); (void) sizeof(off); } while(0)
 #endif
 
 #if defined(PROFILING)
 void LDV_recordDead (const StgClosure *c, uint32_t size);
+RTS_PRIVATE bool isInherentlyUsed ( StgHalfWord closure_type );
 #endif
 
-EXTERN_INLINE void overwritingClosure_ (StgClosure *p,
-                                        uint32_t offset /* in words */,
-                                        uint32_t size /* closure size, in words */,
-                                        bool prim /* Whether to call LDV_recordDead */
-                                        );
-EXTERN_INLINE void overwritingClosure_ (StgClosure *p, uint32_t offset, uint32_t size, bool prim USED_IF_PROFILING)
+EXTERN_INLINE void
+zeroSlop (
+    StgClosure *p,
+    uint32_t offset, /*< offset to start zeroing at, in words */
+    uint32_t size,   /*< total closure size, in words */
+    bool known_mutable /*< is this a closure who's slop we can always zero? */
+    );
+
+EXTERN_INLINE void
+zeroSlop (StgClosure *p, uint32_t offset, uint32_t size, bool known_mutable)
 {
-#if ZERO_SLOP_FOR_LDV_PROF && !ZERO_SLOP_FOR_SANITY_CHECK
-    // see Note [zeroing slop], also #8402
-    if (era <= 0) return;
-#endif
+    // see Note [zeroing slop when overwriting closures], also #8402
 
-    // For LDV profiling, we need to record the closure as dead
+    const bool want_to_zero_immutable_slop = false
+        // Sanity checking (-DS) is enabled
+        || RTS_DEREF(RtsFlags).DebugFlags.sanity
 #if defined(PROFILING)
-    if (!prim) { LDV_recordDead(p, size); };
+        // LDV profiler is enabled
+        || era > 0
 #endif
+        ;
+
+    const bool can_zero_immutable_slop =
+        // Only if we're running single threaded.
+        RTS_DEREF(RtsFlags).ParFlags.nCapabilities <= 1;
+
+    const bool zero_slop_immutable =
+        want_to_zero_immutable_slop && can_zero_immutable_slop;
+
+    const bool zero_slop_mutable =
+#if defined(PROFILING)
+        // Always zero mutable closure slop when profiling. We do this to cover
+        // the case of shrinking mutable arrays in pinned blocks for the heap
+        // profiler, see Note [skipping slop in the heap profiler]
+        //
+        // TODO: We could make this check more specific and only zero if the
+        // object is in a BF_PINNED bdescr here. Update Note [slop on the heap]
+        // and [zeroing slop when overwriting closures] if you change this.
+        true
+#else
+        zero_slop_immutable
+#endif
+        ;
+
+    const bool zero_slop =
+        // If we're not sure this is a mutable closure treat it like an
+        // immutable one.
+        known_mutable ? zero_slop_mutable : zero_slop_immutable;
+
+    if(!zero_slop)
+        return;
 
     for (uint32_t i = offset; i < size; i++) {
         ((StgWord *)p)[i] = 0;
@@ -565,27 +598,48 @@ EXTERN_INLINE void overwritingClosure_ (StgClosure *p, uint32_t offset, uint32_t
 EXTERN_INLINE void overwritingClosure (StgClosure *p);
 EXTERN_INLINE void overwritingClosure (StgClosure *p)
 {
-    overwritingClosure_(p, sizeofW(StgThunkHeader), closure_sizeW(p), false);
+    W_ size = closure_sizeW(p);
+#if defined(PROFILING)
+    if(era > 0 && !isInherentlyUsed(get_itbl(p)->type))
+        LDV_recordDead(p, size);
+#endif
+    zeroSlop(p, sizeofW(StgThunkHeader), size, /*known_mutable=*/false);
 }
 
 // Version of 'overwritingClosure' which overwrites only a suffix of a
 // closure.  The offset is expressed in words relative to 'p' and shall
 // be less than or equal to closure_sizeW(p), and usually at least as
 // large as the respective thunk header.
-//
-// Note: As this calls LDV_recordDead() you have to call LDV_RECORD()
-//       on the final state of the closure at the call-site
-EXTERN_INLINE void overwritingClosureOfs (StgClosure *p, uint32_t offset);
-EXTERN_INLINE void overwritingClosureOfs (StgClosure *p, uint32_t offset)
+EXTERN_INLINE void
+overwritingMutableClosureOfs (StgClosure *p, uint32_t offset);
+
+EXTERN_INLINE void
+overwritingMutableClosureOfs (StgClosure *p, uint32_t offset)
 {
-    // Set prim = true because only called on ARR_WORDS with the
-    // shrinkMutableByteArray# primop
-    overwritingClosure_(p, offset, closure_sizeW(p), true);
+    // Since overwritingClosureOfs is only ever called by:
+    //
+    //   - shrinkMutableByteArray# (ARR_WORDS) and
+    //
+    //   - shrinkSmallMutableArray# (SMALL_MUT_ARR_PTRS)
+    //
+    // we can safely omit the Ldv_recordDead call. Since these closures are
+    // considered inherenlty used we don't need to track their destruction.
+#if defined(PROFILING)
+    ASSERT(isInherentlyUsed(get_itbl(p)->type) == true);
+#endif
+    zeroSlop(p, offset, closure_sizeW(p), /*known_mutable=*/true);
 }
 
 // Version of 'overwritingClosure' which takes closure size as argument.
 EXTERN_INLINE void overwritingClosureSize (StgClosure *p, uint32_t size /* in words */);
 EXTERN_INLINE void overwritingClosureSize (StgClosure *p, uint32_t size)
 {
-    overwritingClosure_(p, sizeofW(StgThunkHeader), size, false);
+    // This function is only called from stg_AP_STACK so we can assume it's not
+    // inherently used.
+#if defined(PROFILING)
+    ASSERT(isInherentlyUsed(get_itbl(p)->type) == false);
+    if(era > 0)
+        LDV_recordDead(p, size);
+#endif
+    zeroSlop(p, sizeofW(StgThunkHeader), size, /*known_mutable=*/false);
 }

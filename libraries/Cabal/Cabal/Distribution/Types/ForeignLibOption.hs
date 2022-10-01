@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 module Distribution.Types.ForeignLibOption(
     ForeignLibOption(..)
@@ -34,5 +35,5 @@ instance Parsec ForeignLibOption where
       _            -> fail "unrecognized foreign-library option"
 
 instance Binary ForeignLibOption
-
+instance Structured ForeignLibOption
 instance NFData ForeignLibOption where rnf = genericRnf

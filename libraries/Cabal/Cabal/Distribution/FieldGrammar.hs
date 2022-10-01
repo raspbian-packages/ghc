@@ -25,6 +25,9 @@ module Distribution.FieldGrammar  (
     takeFields,
     runFieldParser,
     runFieldParser',
+    defaultFreeTextFieldDefST,
+    -- * Newtypes
+    module Distribution.FieldGrammar.Newtypes,
     )  where
 
 import Distribution.Compat.Prelude
@@ -33,10 +36,11 @@ import Prelude ()
 import qualified Data.Map.Strict as Map
 
 import Distribution.FieldGrammar.Class
+import Distribution.FieldGrammar.Newtypes
 import Distribution.FieldGrammar.Parsec
 import Distribution.FieldGrammar.Pretty
 import Distribution.Fields.Field
-import Distribution.Utils.Generic (spanMaybe)
+import Distribution.Utils.Generic         (spanMaybe)
 
 type ParsecFieldGrammar' a = ParsecFieldGrammar a a
 type PrettyFieldGrammar' a = PrettyFieldGrammar a a

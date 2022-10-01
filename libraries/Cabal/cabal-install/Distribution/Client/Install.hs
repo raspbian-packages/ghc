@@ -31,22 +31,12 @@ module Distribution.Client.Install (
 
 import Prelude ()
 import Distribution.Client.Compat.Prelude
+import Distribution.Utils.Generic(safeLast)
 
+import qualified Data.List.NonEmpty as NE
 import qualified Data.Map as Map
-import qualified Data.Set as S
 import Control.Exception as Exception
-         ( Exception(toException), bracket, catches
-         , Handler(Handler), handleJust, IOException, SomeException )
-#ifndef mingw32_HOST_OS
-import Control.Exception as Exception
-         ( Exception(fromException) )
-#endif
-import System.Exit
-         ( ExitCode(..) )
-import Distribution.Compat.Exception
-         ( catchIO, catchExit )
-import Control.Monad
-         ( forM_, mapM )
+         ( bracket, catches, Handler(Handler), handleJust )
 import System.Directory
          ( getTemporaryDirectory, doesDirectoryExist, doesFileExist,
            createDirectoryIfMissing, removeFile, renameDirectory,
@@ -82,22 +72,19 @@ import Distribution.Client.Setup
          , filterTestFlags )
 import Distribution.Client.Config
          ( getCabalDir, defaultUserInstall )
-import Distribution.Client.Sandbox.Timestamp
-         ( withUpdateTimestamps )
-import Distribution.Client.Sandbox.Types
-         ( SandboxPackageInfo(..), UseSandbox(..), isUseSandbox
-         , whenUsingSandbox )
 import Distribution.Client.Tar (extractTarGzFile)
 import Distribution.Client.Types as Source
 import Distribution.Client.BuildReports.Types
          ( ReportLevel(..) )
 import Distribution.Client.SetupWrapper
          ( setupWrapper, SetupScriptOptions(..), defaultSetupScriptOptions )
+import Distribution.Client.BuildReports.Anonymous (showBuildReport)
 import qualified Distribution.Client.BuildReports.Anonymous as BuildReports
 import qualified Distribution.Client.BuildReports.Storage as BuildReports
          ( storeAnonymous, storeLocal, fromInstallPlan, fromPlanningFailure )
 import qualified Distribution.Client.InstallSymlink as InstallSymlink
-         ( OverwritePolicy(..), symlinkBinaries )
+         ( symlinkBinaries )
+import Distribution.Client.Types.OverwritePolicy (OverwritePolicy (..))
 import qualified Distribution.Client.Win32SelfUpgrade as Win32SelfUpgrade
 import qualified Distribution.Client.World as World
 import qualified Distribution.InstalledPackageInfo as Installed
@@ -124,7 +111,7 @@ import Distribution.Simple.PackageIndex (InstalledPackageIndex)
 import Distribution.Simple.Setup
          ( haddockCommand, HaddockFlags(..)
          , buildCommand, BuildFlags(..), emptyBuildFlags
-         , TestFlags
+         , TestFlags, BenchmarkFlags
          , toFlag, fromFlag, fromFlagOrDefault, flagToMaybe, defaultDistPref )
 import qualified Distribution.Simple.Setup as Cabal
          ( Flag(..)
@@ -132,8 +119,7 @@ import qualified Distribution.Simple.Setup as Cabal
          , registerCommand, RegisterFlags(..), emptyRegisterFlags
          , testCommand, TestFlags(..) )
 import Distribution.Simple.Utils
-         ( createDirectoryIfMissingVerbose, comparing
-         , writeFileAtomic, withUTF8FileContents )
+         ( createDirectoryIfMissingVerbose, writeFileAtomic )
 import Distribution.Simple.InstallDirs as InstallDirs
          ( PathTemplate, fromPathTemplate, toPathTemplate, substPathTemplate
          , initialPathTemplateEnv, installDirsTemplateEnv )
@@ -144,18 +130,18 @@ import Distribution.Package
          , Package(..), HasMungedPackageId(..), HasUnitId(..)
          , UnitId )
 import Distribution.Types.Dependency
-         ( thisPackageVersion )
+         ( Dependency (..), mainLibSet )
 import Distribution.Types.GivenComponent
          ( GivenComponent(..) )
-import Distribution.Pretty ( prettyShow )  
 import Distribution.Types.PackageVersionConstraint
-         ( PackageVersionConstraint(..) )
+         ( PackageVersionConstraint(..), thisPackageVersionConstraint )
 import Distribution.Types.MungedPackageId
 import qualified Distribution.PackageDescription as PackageDescription
 import Distribution.PackageDescription
-         ( PackageDescription, GenericPackageDescription(..), Flag(..)
-         , FlagAssignment, mkFlagAssignment, unFlagAssignment
-         , showFlagValue, diffFlagAssignment, nullFlagAssignment )
+         ( PackageDescription, GenericPackageDescription(..) )
+import Distribution.Types.Flag
+         ( PackageFlag(..), FlagAssignment, mkFlagAssignment
+         , showFlagAssignment, diffFlagAssignment, nullFlagAssignment )
 import Distribution.PackageDescription.Configuration
          ( finalizePD )
 import Distribution.Version
@@ -165,12 +151,14 @@ import Distribution.Simple.Utils as Utils
          , withTempDirectory )
 import Distribution.Client.Utils
          ( determineNumJobs, logDirChange, mergeBy, MergeResult(..)
-         , tryCanonicalizePath, ProgressPhase(..), progressMessage )
+         , ProgressPhase(..), progressMessage )
 import Distribution.System
          ( Platform, OS(Windows), buildOS, buildPlatform )
 import Distribution.Verbosity as Verbosity
-         ( Verbosity, modifyVerbosity, normal, verbose )
+         ( modifyVerbosity, normal, verbose )
 import Distribution.Simple.BuildPaths ( exeExtension )
+
+import qualified Data.ByteString as BS
 
 --TODO:
 -- * assign flags to packages individually
@@ -197,19 +185,18 @@ install
   -> Compiler
   -> Platform
   -> ProgramDb
-  -> UseSandbox
-  -> Maybe SandboxPackageInfo
   -> GlobalFlags
   -> ConfigFlags
   -> ConfigExFlags
   -> InstallFlags
   -> HaddockFlags
   -> TestFlags
+  -> BenchmarkFlags
   -> [UserTarget]
   -> IO ()
-install verbosity packageDBs repos comp platform progdb useSandbox mSandboxPkgInfo
-  globalFlags configFlags configExFlags installFlags haddockFlags testFlags
-  userTargets0 = do
+install verbosity packageDBs repos comp platform progdb
+  globalFlags configFlags configExFlags installFlags
+  haddockFlags testFlags benchmarkFlags userTargets0 = do
 
     unless (installRootCmd installFlags == Cabal.NoFlag) $
         warn verbosity $ "--root-cmd is no longer supported, "
@@ -217,7 +204,6 @@ install verbosity packageDBs repos comp platform progdb useSandbox mSandboxPkgIn
         ++ " (if you didn't type --root-cmd, comment out root-cmd"
         ++ " in your ~/.cabal/config file)"
     let userOrSandbox = fromFlag (configUserInstall configFlags)
-                     || isUseSandbox useSandbox
     unless userOrSandbox $
         warn verbosity $ "the --global flag is deprecated -- "
         ++ "it is generally considered a bad idea to install packages "
@@ -235,18 +221,12 @@ install verbosity packageDBs repos comp platform progdb useSandbox mSandboxPkgIn
             processInstallPlan verbosity args installContext installPlan
   where
     args :: InstallArgs
-    args = (packageDBs, repos, comp, platform, progdb, useSandbox,
-            mSandboxPkgInfo, globalFlags, configFlags, configExFlags,
-            installFlags, haddockFlags, testFlags)
+    args = (packageDBs, repos, comp, platform, progdb,
+            globalFlags, configFlags, configExFlags,
+            installFlags, haddockFlags, testFlags, benchmarkFlags)
 
-    die'' message = die' verbosity (message ++ if isUseSandbox useSandbox
-                                   then installFailedInSandbox else [])
-    -- TODO: use a better error message, remove duplication.
-    installFailedInSandbox =
-      "\nNote: when using a sandbox, all packages are required to have "
-      ++ "consistent dependencies. "
-      ++ "Try reinstalling/unregistering the offending packages or "
-      ++ "recreating the sandbox."
+    die'' = die' verbosity
+
     logMsg message rest = debugNoWrap verbosity message >> rest
 
 -- TODO: Make InstallContext a proper data type with documented fields.
@@ -264,27 +244,26 @@ type InstallArgs = ( PackageDBStack
                    , Compiler
                    , Platform
                    , ProgramDb
-                   , UseSandbox
-                   , Maybe SandboxPackageInfo
                    , GlobalFlags
                    , ConfigFlags
                    , ConfigExFlags
                    , InstallFlags
                    , HaddockFlags
-                   , TestFlags )
+                   , TestFlags
+                   , BenchmarkFlags )
 
 -- | Make an install context given install arguments.
 makeInstallContext :: Verbosity -> InstallArgs -> Maybe [UserTarget]
                       -> IO InstallContext
 makeInstallContext verbosity
-  (packageDBs, repoCtxt, comp, _, progdb,_,_,
-   globalFlags, _, configExFlags, installFlags, _, _) mUserTargets = do
+  (packageDBs, repoCtxt, comp, _, progdb,
+   globalFlags, _, configExFlags, installFlags, _, _, _) mUserTargets = do
 
     let idxState = flagToMaybe (installIndexState installFlags)
 
-    installedPkgIndex <- getInstalledPackages verbosity comp packageDBs progdb
-    sourcePkgDb       <- getSourcePackagesAtIndexState verbosity repoCtxt idxState
-    pkgConfigDb       <- readPkgConfigDb      verbosity progdb
+    installedPkgIndex   <- getInstalledPackages verbosity comp packageDBs progdb
+    (sourcePkgDb, _, _) <- getSourcePackagesAtIndexState verbosity repoCtxt idxState Nothing
+    pkgConfigDb         <- readPkgConfigDb      verbosity progdb
 
     checkConfigExFlags verbosity installedPkgIndex
                        (packageIndex sourcePkgDb) configExFlags
@@ -315,16 +294,16 @@ makeInstallContext verbosity
 makeInstallPlan :: Verbosity -> InstallArgs -> InstallContext
                 -> IO (Progress String String SolverInstallPlan)
 makeInstallPlan verbosity
-  (_, _, comp, platform, _, _, mSandboxPkgInfo,
+  (_, _, comp, platform,_,
    _, configFlags, configExFlags, installFlags,
-   _, _)
+   _, _, _)
   (installedPkgIndex, sourcePkgDb, pkgConfigDb,
    _, pkgSpecifiers, _) = do
 
     solver <- chooseSolver verbosity (fromFlag (configSolver configExFlags))
               (compilerInfo comp)
     notice verbosity "Resolving dependencies..."
-    return $ planPackages verbosity comp platform mSandboxPkgInfo solver
+    return $ planPackages verbosity comp platform solver
           configFlags configExFlags installFlags
           installedPkgIndex sourcePkgDb pkgConfigDb pkgSpecifiers
 
@@ -333,7 +312,7 @@ processInstallPlan :: Verbosity -> InstallArgs -> InstallContext
                    -> SolverInstallPlan
                    -> IO ()
 processInstallPlan verbosity
-  args@(_,_, _, _, _, _, _, _, configFlags, _, installFlags, _, _)
+  args@(_,_, _, _, _, _, configFlags, _, installFlags, _, _, _)
   (installedPkgIndex, sourcePkgDb, _,
    userTargets, pkgSpecifiers, _) installPlan0 = do
 
@@ -356,7 +335,6 @@ processInstallPlan verbosity
 planPackages :: Verbosity
              -> Compiler
              -> Platform
-             -> Maybe SandboxPackageInfo
              -> Solver
              -> ConfigFlags
              -> ConfigExFlags
@@ -366,7 +344,7 @@ planPackages :: Verbosity
              -> PkgConfigDb
              -> [PackageSpecifier UnresolvedSourcePackage]
              -> Progress String String SolverInstallPlan
-planPackages verbosity comp platform mSandboxPkgInfo solver
+planPackages verbosity comp platform solver
              configFlags configExFlags installFlags
              installedPkgIndex sourcePkgDb pkgConfigDb pkgSpecifiers =
 
@@ -388,6 +366,8 @@ planPackages verbosity comp platform mSandboxPkgInfo solver
       . setReorderGoals reorderGoals
 
       . setCountConflicts countConflicts
+
+      . setFineGrainedConflicts fineGrainedConflicts
 
       . setMinimizeConflictSet minimizeConflictSet
 
@@ -437,8 +417,6 @@ planPackages verbosity comp platform mSandboxPkgInfo solver
             in LabeledPackageConstraint pc ConstraintSourceConfigFlagOrTarget
           | pkgSpecifier <- pkgSpecifiers ]
 
-      . maybe id applySandboxInstallPolicy mSandboxPkgInfo
-
       . (if reinstall then reinstallTargets else id)
 
         -- Don't solve for executables, the legacy install codepath
@@ -457,6 +435,7 @@ planPackages verbosity comp platform mSandboxPkgInfo solver
                        fromFlag (installReinstall         installFlags)
     reorderGoals     = fromFlag (installReorderGoals      installFlags)
     countConflicts   = fromFlag (installCountConflicts    installFlags)
+    fineGrainedConflicts = fromFlag (installFineGrainedConflicts installFlags)
     minimizeConflictSet = fromFlag (installMinimizeConflictSet installFlags)
     independentGoals = fromFlag (installIndependentGoals  installFlags)
     avoidReinstalls  = fromFlag (installAvoidReinstalls   installFlags)
@@ -593,8 +572,8 @@ checkPrintPlan verbosity installed installPlan sourcePkgDb
   when offline $ do
     let pkgs = [ confPkgSource cpkg
                | InstallPlan.Configured cpkg <- InstallPlan.toList installPlan ]
-    notFetched <- fmap (map packageInfoId)
-                  . filterM (fmap isNothing . checkFetched . packageSource)
+    notFetched <- fmap (map packageId)
+                  . filterM (fmap isNothing . checkFetched . srcpkgSource)
                   $ pkgs
     unless (null notFetched) $
       die' verbosity $ "Can't download packages in offline mode. "
@@ -676,50 +655,49 @@ printPlan dryRun verbosity plan sourcePkgDb = case plan of
     showPkg (pkg, _) = prettyShow (packageId pkg) ++
                        showLatest (pkg)
 
-    showPkgAndReason (ReadyPackage pkg', pr) = prettyShow (packageId pkg') ++
-          showLatest pkg' ++
-          showFlagAssignment (nonDefaultFlags pkg') ++
-          showStanzas (confPkgStanzas pkg') ++
-          showDep pkg' ++
-          case pr of
-            NewPackage     -> " (new package)"
-            NewVersion _   -> " (new version)"
-            Reinstall _ cs -> " (reinstall)" ++ case cs of
+    showPkgAndReason (ReadyPackage pkg', pr) = unwords
+        [ prettyShow (packageId pkg')
+        , showLatest pkg'
+        , showFlagAssignment (nonDefaultFlags pkg')
+        , showStanzas (confPkgStanzas pkg')
+        , showDep pkg'
+        , case pr of
+            NewPackage     -> "(new package)"
+            NewVersion _   -> "(new version)"
+            Reinstall _ cs -> "(reinstall)" ++ case cs of
                 []   -> ""
-                diff -> " (changes: "  ++ intercalate ", " (map change diff)
+                diff -> "(changes: "  ++ intercalate ", " (map change diff)
                         ++ ")"
+        ]
 
     showLatest :: Package srcpkg => srcpkg -> String
     showLatest pkg = case mLatestVersion of
         Just latestVersion ->
             if packageVersion pkg < latestVersion
-            then (" (latest: " ++ prettyShow latestVersion ++ ")")
+            then ("(latest: " ++ prettyShow latestVersion ++ ")")
             else ""
         Nothing -> ""
       where
         mLatestVersion :: Maybe Version
-        mLatestVersion = case SourcePackageIndex.lookupPackageName
-                                (packageIndex sourcePkgDb)
-                                (packageName pkg) of
-            [] -> Nothing
-            x -> Just $ packageVersion $ last x
+        mLatestVersion = fmap packageVersion $
+                         safeLast $
+                         SourcePackageIndex.lookupPackageName
+                           (packageIndex sourcePkgDb)
+                           (packageName pkg)
 
-    toFlagAssignment :: [Flag] -> FlagAssignment
+    toFlagAssignment :: [PackageFlag] -> FlagAssignment
     toFlagAssignment =  mkFlagAssignment . map (\ f -> (flagName f, flagDefault f))
 
     nonDefaultFlags :: ConfiguredPackage loc -> FlagAssignment
     nonDefaultFlags cpkg =
       let defaultAssignment =
             toFlagAssignment
-             (genPackageFlags (SourcePackage.packageDescription $
+             (genPackageFlags (SourcePackage.srcpkgDescription $
                                confPkgSource cpkg))
       in  confPkgFlags cpkg `diffFlagAssignment` defaultAssignment
 
     showStanzas :: [OptionalStanza] -> String
-    showStanzas = concatMap ((" *" ++) . showStanza)
-
-    showFlagAssignment :: FlagAssignment -> String
-    showFlagAssignment = concatMap ((' ' :) . showFlagValue) . unFlagAssignment
+    showStanzas = unwords . map (("*" ++) . showStanza)
 
     change (OnlyInLeft pkgid)        = prettyShow pkgid ++ " removed"
     change (InBoth     pkgid pkgid') = prettyShow pkgid ++ " -> "
@@ -753,8 +731,8 @@ printPlan dryRun verbosity plan sourcePkgDb = case plan of
 reportPlanningFailure :: Verbosity -> InstallArgs -> InstallContext -> String
                       -> IO ()
 reportPlanningFailure verbosity
-  (_, _, comp, platform, _, _, _
-  ,_, configFlags, _, installFlags, _, _)
+  (_, _, comp, platform, _
+  ,_, configFlags, _, installFlags, _, _, _)
   (_, sourcePkgDb, _, _, pkgSpecifiers, _)
   message = do
 
@@ -782,7 +760,7 @@ reportPlanningFailure verbosity
     -- Save solver log
     case logFile of
       Nothing -> return ()
-      Just template -> forM_ pkgids $ \pkgid ->
+      Just template -> for_ pkgids $ \pkgid ->
         let env = initialPathTemplateEnv pkgid dummyIpid
                     (compilerInfo comp) platform
             path = fromPathTemplate $ substPathTemplate env template
@@ -833,18 +811,15 @@ postInstallActions :: Verbosity
                    -> BuildOutcomes
                    -> IO ()
 postInstallActions verbosity
-  (packageDBs, _, comp, platform, progdb, useSandbox, mSandboxPkgInfo
-  ,globalFlags, configFlags, _, installFlags, _, _)
+  (packageDBs, _, comp, platform, progdb
+  ,globalFlags, configFlags, _, installFlags, _, _, _)
   targets installPlan buildOutcomes = do
-
-  updateSandboxTimestampsFile verbosity useSandbox mSandboxPkgInfo
-                              comp platform installPlan buildOutcomes
 
   unless oneShot $
     World.insert verbosity worldFile
       --FIXME: does not handle flags
-      [ World.WorldPkgInfo dep mempty
-      | UserTargetNamed dep <- targets ]
+      [ World.WorldPkgInfo (Dependency pn vr mainLibSet) mempty
+      | UserTargetNamed (PackageVersionConstraint pn vr) <- targets ]
 
   let buildReports = BuildReports.fromInstallPlan platform (compilerId comp)
                                                   installPlan buildOutcomes
@@ -857,7 +832,7 @@ postInstallActions verbosity
   when (reportingLevel == DetailedReports) $
     storeDetailedBuildReports verbosity logsDir buildReports
 
-  regenerateHaddockIndex verbosity packageDBs comp platform progdb useSandbox
+  regenerateHaddockIndex verbosity packageDBs comp platform progdb
                          configFlags installFlags buildOutcomes
 
   symlinkBinaries verbosity platform comp configFlags installFlags
@@ -877,13 +852,13 @@ storeDetailedBuildReports verbosity logsDir reports = sequence_
   [ do dotCabal <- getCabalDir
        let logFileName = prettyShow (BuildReports.package report) <.> "log"
            logFile     = logsDir </> logFileName
-           reportsDir  = dotCabal </> "reports" </> remoteRepoName remoteRepo
+           reportsDir  = dotCabal </> "reports" </> unRepoName (remoteRepoName remoteRepo)
            reportFile  = reportsDir </> logFileName
 
        handleMissingLogFile $ do
          buildLog <- readFile logFile
          createDirectoryIfMissing True reportsDir -- FIXME
-         writeFile reportFile (show (BuildReports.show report, buildLog))
+         writeFile reportFile (show (showBuildReport report, buildLog))
 
   | (report, Just repo) <- reports
   , Just remoteRepo <- [maybeRepoRemote repo]
@@ -910,12 +885,11 @@ regenerateHaddockIndex :: Verbosity
                        -> Compiler
                        -> Platform
                        -> ProgramDb
-                       -> UseSandbox
                        -> ConfigFlags
                        -> InstallFlags
                        -> BuildOutcomes
                        -> IO ()
-regenerateHaddockIndex verbosity packageDBs comp platform progdb useSandbox
+regenerateHaddockIndex verbosity packageDBs comp platform progdb
                        configFlags installFlags buildOutcomes
   | haddockIndexFileIsRequested && shouldRegenerateHaddockIndex = do
 
@@ -943,8 +917,7 @@ regenerateHaddockIndex verbosity packageDBs comp platform progdb useSandbox
     -- installed. Since the index can be only per-user or per-sandbox (see
     -- #1337), we don't do it for global installs or special cases where we're
     -- installing into a specific db.
-    shouldRegenerateHaddockIndex = (isUseSandbox useSandbox || normalUserInstall)
-                                && someDocsWereInstalled buildOutcomes
+    shouldRegenerateHaddockIndex = normalUserInstall && someDocsWereInstalled buildOutcomes
       where
         someDocsWereInstalled = any installedDocs . Map.elems
         installedDocs (Right (BuildResult DocsOk _ _)) = True
@@ -978,7 +951,7 @@ symlinkBinaries :: Verbosity
 symlinkBinaries verbosity platform comp configFlags installFlags
                 plan buildOutcomes = do
   failed <- InstallSymlink.symlinkBinaries platform comp
-                                           InstallSymlink.NeverOverwrite
+                                           NeverOverwrite
                                            configFlags installFlags
                                            plan buildOutcomes
   case failed of
@@ -1042,33 +1015,6 @@ printBuildFailures verbosity buildOutcomes =
     onExitFailure _               = ""
 #endif
 
-
--- | If we're working inside a sandbox and some add-source deps were installed,
--- update the timestamps of those deps.
-updateSandboxTimestampsFile :: Verbosity -> UseSandbox -> Maybe SandboxPackageInfo
-                            -> Compiler -> Platform
-                            -> InstallPlan
-                            -> BuildOutcomes
-                            -> IO ()
-updateSandboxTimestampsFile verbosity (UseSandbox sandboxDir)
-                            (Just (SandboxPackageInfo _ _ _ allAddSourceDeps))
-                            comp platform installPlan buildOutcomes =
-  withUpdateTimestamps verbosity sandboxDir (compilerId comp) platform $ \_ -> do
-    let allInstalled = [ pkg
-                       | InstallPlan.Configured pkg
-                            <- InstallPlan.toList installPlan
-                       , case InstallPlan.lookupBuildOutcome pkg buildOutcomes of
-                           Just (Right _success) -> True
-                           _                     -> False
-                       ]
-        allSrcPkgs   = [ confPkgSource cpkg | cpkg <- allInstalled ]
-        allPaths     = [ pth | LocalUnpackedPackage pth
-                            <- map packageSource allSrcPkgs]
-    allPathsCanonical <- mapM tryCanonicalizePath allPaths
-    return $! filter (`S.member` allAddSourceDeps) allPathsCanonical
-
-updateSandboxTimestampsFile _ _ _ _ _ _ _ = return ()
-
 -- ------------------------------------------------------------
 -- * Actually do the installations
 -- ------------------------------------------------------------
@@ -1087,15 +1033,11 @@ performInstallations :: Verbosity
                      -> InstallPlan
                      -> IO BuildOutcomes
 performInstallations verbosity
-  (packageDBs, repoCtxt, comp, platform, progdb, useSandbox, _,
-   globalFlags, configFlags, configExFlags, installFlags, haddockFlags, testFlags)
+  (packageDBs, repoCtxt, comp, platform, progdb,
+   globalFlags, configFlags, configExFlags, installFlags,
+   haddockFlags, testFlags, _)
   installedPkgIndex installPlan = do
 
-  -- With 'install -j' it can be a bit hard to tell whether a sandbox is used.
-  whenUsingSandbox useSandbox $ \sandboxDir ->
-    when parallelInstall $
-      notice verbosity $ "Notice: installing into a sandbox located at "
-                         ++ sandboxDir
   info verbosity $ "Number of threads used: " ++ (show numJobs) ++ "."
 
   jobControl   <- if parallelInstall then newParallelJobControl numJobs
@@ -1256,7 +1198,7 @@ installReadyPackage platform cinfo configFlags
     -- We generate the legacy constraints as well as the new style precise deps.
     -- In the end only one set gets passed to Setup.hs configure, depending on
     -- the Cabal version we are talking to.
-    configConstraints  = [ thisPackageVersion srcid
+    configConstraints  = [ thisPackageVersionConstraint srcid
                          | ConfiguredId
                              srcid
                              (Just
@@ -1462,7 +1404,7 @@ installUnpackedPackage verbosity installLock numJobs
             let packageDBs = interpretPackageDbFlags
                                 (fromFlag (configUserInstall configFlags))
                                 (configPackageDBs configFlags)
-            forM_ ipkgs' $ \ipkg' ->
+            for_ ipkgs' $ \ipkg' ->
                 registerPackage verbosity comp progdb
                                 packageDBs ipkg'
                                 defaultRegisterOptions
@@ -1539,21 +1481,21 @@ installUnpackedPackage verbosity installLock numJobs
           if is_dir
             -- Sort so that each prefix of the package
             -- configurations is well formed
-            then mapM (readPkgConf pkgConfDest) . sort . filter notHidden
+            then traverse (readPkgConf pkgConfDest) . sort . filter notHidden
                     =<< getDirectoryContents pkgConfDest
             else fmap (:[]) $ readPkgConf "." pkgConfDest
       else return []
 
     readPkgConf :: FilePath -> FilePath
                 -> IO Installed.InstalledPackageInfo
-    readPkgConf pkgConfDir pkgConfFile =
-      (withUTF8FileContents (pkgConfDir </> pkgConfFile) $ \pkgConfText ->
-        case Installed.parseInstalledPackageInfo pkgConfText of
-          Left perrors    -> pkgConfParseFailed $ unlines perrors
-          Right (warns, pkgConf) -> do
-            unless (null warns) $
-              warn verbosity $ unlines warns
-            return pkgConf)
+    readPkgConf pkgConfDir pkgConfFile = do
+      pkgConfText <- BS.readFile (pkgConfDir </> pkgConfFile)
+      case Installed.parseInstalledPackageInfo pkgConfText of
+        Left perrors    -> pkgConfParseFailed $ unlines $ NE.toList perrors
+        Right (warns, pkgConf) -> do
+          unless (null warns) $
+            warn verbosity $ unlines warns
+          return pkgConf
 
     pkgConfParseFailed :: String -> IO a
     pkgConfParseFailed perror =

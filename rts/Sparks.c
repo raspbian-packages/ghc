@@ -15,6 +15,7 @@
 #include "Prelude.h"
 #include "Sparks.h"
 #include "ThreadLabels.h"
+#include "sm/NonMovingMark.h"
 #include "sm/HeapAlloc.h"
 
 #if defined(THREADED_RTS)
@@ -86,12 +87,12 @@ newSpark (StgRegTable *reg, StgClosure *p)
  * -------------------------------------------------------------------------- */
 
 void
-pruneSparkQueue (Capability *cap)
+pruneSparkQueue (bool nonmovingMarkFinished, Capability *cap)
 {
     SparkPool *pool;
     StgClosurePtr spark, tmp, *elements;
     uint32_t n, pruned_sparks; // stats only
-    StgWord botInd,oldBotInd,currInd; // indices in array (always < size)
+    StgInt botInd,oldBotInd,currInd; // indices in array (always < size)
     const StgInfoTable *info;
 
     n = 0;
@@ -110,7 +111,6 @@ pruneSparkQueue (Capability *cap)
     // stealing is happening during GC.
     pool->bottom  -= pool->top & ~pool->moduloSize;
     pool->top     &= pool->moduloSize;
-    pool->topBound = pool->top;
 
     debugTrace(DEBUG_sparks,
                "markSparkQueue: current spark queue len=%ld; (hd=%ld; tl=%ld)",
@@ -196,7 +196,26 @@ pruneSparkQueue (Capability *cap)
                   traceEventSparkFizzle(cap);
               }
           } else if (HEAP_ALLOCED(spark)) {
-              if ((Bdescr((P_)spark)->flags & BF_EVACUATED)) {
+              bdescr *spark_bd = Bdescr((P_) spark);
+              bool is_alive = false;
+              if (nonmovingMarkFinished) {
+                  // See Note [Spark management under the nonmoving collector]
+                  // in NonMoving.c.
+                  // If we just concluded concurrent marking then we can rely
+                  // on the mark bitmap to reflect whether sparks living in the
+                  // non-moving heap have died.
+                  if (spark_bd->flags & BF_NONMOVING) {
+                      is_alive = nonmovingIsAlive(spark);
+                  } else {
+                      // The nonmoving collector doesn't collect anything
+                      // outside of the non-moving heap.
+                      is_alive = true;
+                  }
+              } else if (spark_bd->flags & (BF_EVACUATED | BF_NONMOVING)) {
+                  is_alive = true;
+              }
+
+              if (is_alive) {
                   if (closure_SHOULD_SPARK(spark)) {
                       elements[botInd] = spark; // keep entry (new address)
                       botInd++;
@@ -239,7 +258,6 @@ pruneSparkQueue (Capability *cap)
     ASSERT(currInd == oldBotInd);
 
     pool->top = oldBotInd; // where we started writing
-    pool->topBound = pool->top;
 
     pool->bottom = (oldBotInd <= botInd) ? botInd : (botInd + pool->size);
     // first free place we did not use (corrected by wraparound)

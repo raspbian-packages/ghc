@@ -21,12 +21,16 @@ import qualified UnitTests.Distribution.Simple.Program.GHC
 import qualified UnitTests.Distribution.Simple.Program.Internal
 import qualified UnitTests.Distribution.Simple.Utils
 import qualified UnitTests.Distribution.System
+import qualified UnitTests.Distribution.Utils.CharSet
 import qualified UnitTests.Distribution.Utils.Generic
 import qualified UnitTests.Distribution.Utils.NubList
 import qualified UnitTests.Distribution.Utils.ShortText
+import qualified UnitTests.Distribution.Utils.Structured
 import qualified UnitTests.Distribution.Version (versionTests)
 import qualified UnitTests.Distribution.PkgconfigVersion (pkgconfigVersionTests)
 import qualified UnitTests.Distribution.SPDX (spdxTests)
+import qualified UnitTests.Distribution.Described
+import qualified UnitTests.Distribution.CabalSpecVersion
 import qualified UnitTests.Distribution.Types.GenericPackageDescription
 
 tests :: Int -> TestTree
@@ -67,6 +71,10 @@ tests mtimeChangeCalibrated =
         UnitTests.Distribution.PkgconfigVersion.pkgconfigVersionTests
     , testGroup "Distribution.SPDX"
         UnitTests.Distribution.SPDX.spdxTests
+    , UnitTests.Distribution.Utils.CharSet.tests
+    , UnitTests.Distribution.Utils.Structured.tests
+    , UnitTests.Distribution.Described.tests
+    , UnitTests.Distribution.CabalSpecVersion.tests
     ]
 
 extraOptions :: [OptionDescription]

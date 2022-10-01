@@ -18,6 +18,8 @@
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE StandaloneKindSignatures #-}
+{-# LANGUAGE LinearTypes #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -80,9 +82,10 @@ module Data.Typeable.Internal (
     typeSymbolTypeRep, typeNatTypeRep,
   ) where
 
+import GHC.Prim ( FUN )
 import GHC.Base
 import qualified GHC.Arr as A
-import GHC.Types ( TYPE )
+import GHC.Types ( TYPE, Multiplicity (Many) )
 import Data.Type.Equality
 import GHC.List ( splitAt, foldl', elem )
 import GHC.Word
@@ -178,7 +181,8 @@ rnfTyCon (TyCon _ _ m n _ k) = rnfModule m `seq` rnfTrName n `seq` rnfKindRep k
 
 -- | A concrete representation of a (monomorphic) type.
 -- 'TypeRep' supports reasonably efficient equality.
-data TypeRep (a :: k) where
+type TypeRep :: k -> Type
+data TypeRep a where
     -- The TypeRep of Type. See Note [Kind caching], Wrinkle 2
     TrType :: TypeRep Type
     TrTyCon :: { -- See Note [TypeRep fingerprints]
@@ -207,18 +211,19 @@ data TypeRep (a :: k) where
                , trAppKind :: !(TypeRep k2) }   -- See Note [Kind caching]
             -> TypeRep (a b)
 
-    -- | @TrFun fpr a b@ represents a function type @a -> b@. We use this for
+    -- | @TrFun fpr m a b@ represents a function type @a # m -> b@. We use this for
     -- the sake of efficiency as functions are quite ubiquitous.
-    TrFun   :: forall (r1 :: RuntimeRep) (r2 :: RuntimeRep)
+    TrFun   :: forall (m :: Multiplicity) (r1 :: RuntimeRep) (r2 :: RuntimeRep)
                       (a :: TYPE r1) (b :: TYPE r2).
                { -- See Note [TypeRep fingerprints]
                  trFunFingerprint :: {-# UNPACK #-} !Fingerprint
 
                  -- The TypeRep represents a function from trFunArg to
                  -- trFunRes.
+               , trFunMul :: !(TypeRep m)
                , trFunArg :: !(TypeRep a)
                , trFunRes :: !(TypeRep b) }
-            -> TypeRep (a -> b)
+            -> TypeRep (FUN m a b)
 
 {- Note [TypeRep fingerprints]
    ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -306,7 +311,7 @@ instance Ord (TypeRep a) where
 
 -- | A non-indexed type representation.
 data SomeTypeRep where
-    SomeTypeRep :: forall k (a :: k). !(TypeRep a) -> SomeTypeRep
+    SomeTypeRep :: forall k (a :: k). !(TypeRep a) %1 -> SomeTypeRep
 
 instance Eq SomeTypeRep where
   SomeTypeRep a == SomeTypeRep b =
@@ -333,8 +338,8 @@ pattern Fun :: forall k (fun :: k). ()
             => TypeRep arg
             -> TypeRep res
             -> TypeRep fun
-pattern Fun arg res <- TrFun {trFunArg = arg, trFunRes = res}
-  where Fun arg res = mkTrFun arg res
+pattern Fun arg res <- TrFun {trFunArg = arg, trFunRes = res, trFunMul = (eqTypeRep trMany -> Just HRefl)}
+  where Fun arg res = mkTrFun trMany arg res
 
 -- | Observe the 'Fingerprint' of a type representation
 --
@@ -381,6 +386,9 @@ trTYPE = typeRep
 trLiftedRep :: TypeRep 'LiftedRep
 trLiftedRep = typeRep
 
+trMany :: TypeRep 'Many
+trMany = typeRep
+
 -- | Construct a representation for a type application that is
 -- NOT a saturated arrow type. This is not checked!
 
@@ -424,7 +432,7 @@ mkTrAppChecked rep@(TrApp {trAppFun = p, trAppArg = x :: TypeRep x})
   , Just (IsTYPE (ry :: TypeRep ry)) <- isTYPE (typeRepKind y)
   , Just HRefl <- withTypeable x $ withTypeable rx $ withTypeable ry
                   $ typeRep @((->) x :: TYPE ry -> Type) `eqTypeRep` rep
-  = mkTrFun x y
+  = mkTrFun trMany x y
 mkTrAppChecked a b = mkTrApp a b
 
 -- | A type application.
@@ -453,9 +461,9 @@ pattern App f x <- (splitApp -> IsApp f x)
 
 data AppOrCon (a :: k) where
     IsApp :: forall k k' (f :: k' -> k) (x :: k'). ()
-          => TypeRep f -> TypeRep x -> AppOrCon (f x)
+          => TypeRep f %1 -> TypeRep x %1 -> AppOrCon (f x)
     -- See Note [Con evidence]
-    IsCon :: IsApplication a ~ "" => TyCon -> [SomeTypeRep] -> AppOrCon a
+    IsCon :: IsApplication a ~ "" => TyCon %1 -> [SomeTypeRep] %1 -> AppOrCon a
 
 type family IsApplication (x :: k) :: Symbol where
   IsApplication (_ _) = "An error message about this unifying with \"\" "
@@ -563,15 +571,13 @@ typeRepTyCon (TrFun {})               = typeRepTyCon $ typeRep @(->)
 eqTypeRep :: forall k1 k2 (a :: k1) (b :: k2).
              TypeRep a -> TypeRep b -> Maybe (a :~~: b)
 eqTypeRep a b
-  | sameTypeRep a b = Just (unsafeCoerce# HRefl)
+  | sameTypeRep a b = Just (unsafeCoerce HRefl)
   | otherwise       = Nothing
 -- We want GHC to inline eqTypeRep to get rid of the Maybe
 -- in the usual case that it is scrutinized immediately. We
 -- split eqTypeRep into a worker and wrapper because otherwise
 -- it's much larger than anything we'd want to inline.
---
--- However, due to #16893 it is currently unsafe to do so, hence the NOINLINE.
-{-# NOINLINE eqTypeRep #-}
+{-# INLINABLE eqTypeRep #-}
 
 sameTypeRep :: forall k1 k2 (a :: k1) (b :: k2).
                TypeRep a -> TypeRep b -> Bool
@@ -616,7 +622,7 @@ instantiateKindRep vars = go
     go (KindRepApp f a)
       = SomeTypeRep $ mkTrApp (unsafeCoerceRep $ go f) (unsafeCoerceRep $ go a)
     go (KindRepFun a b)
-      = SomeTypeRep $ mkTrFun (unsafeCoerceRep $ go a) (unsafeCoerceRep $ go b)
+      = SomeTypeRep $ mkTrFun trMany (unsafeCoerceRep $ go a) (unsafeCoerceRep $ go b)
     go (KindRepTYPE LiftedRep) = SomeTypeRep TrType
     go (KindRepTYPE r) = unkindedTypeRep $ tYPE `kApp` runtimeRepTypeRep r
     go (KindRepTypeLitS sort s)
@@ -634,7 +640,7 @@ unkindedTypeRep (SomeKindedTypeRep x) = SomeTypeRep x
 
 data SomeKindedTypeRep k where
     SomeKindedTypeRep :: forall k (a :: k). TypeRep a
-                      -> SomeKindedTypeRep k
+                      %1 -> SomeKindedTypeRep k
 
 kApp :: SomeKindedTypeRep (k -> k')
      -> SomeKindedTypeRep k
@@ -668,10 +674,12 @@ runtimeRepTypeRep r =
       IntRep      -> rep @'IntRep
       Int8Rep     -> rep @'Int8Rep
       Int16Rep    -> rep @'Int16Rep
+      Int32Rep    -> rep @'Int32Rep
       Int64Rep    -> rep @'Int64Rep
       WordRep     -> rep @'WordRep
       Word8Rep    -> rep @'Word8Rep
       Word16Rep   -> rep @'Word16Rep
+      Word32Rep   -> rep @'Word32Rep
       Word64Rep   -> rep @'Word64Rep
       AddrRep     -> rep @'AddrRep
       FloatRep    -> rep @'FloatRep
@@ -710,19 +718,19 @@ vecElemTypeRep e =
     rep :: forall (a :: VecElem). Typeable a => SomeKindedTypeRep VecElem
     rep = kindedTypeRep @VecElem @a
 
-bareArrow :: forall (r1 :: RuntimeRep) (r2 :: RuntimeRep)
+bareArrow :: forall (m :: Multiplicity) (r1 :: RuntimeRep) (r2 :: RuntimeRep)
                     (a :: TYPE r1) (b :: TYPE r2). ()
-          => TypeRep (a -> b)
-          -> TypeRep ((->) :: TYPE r1 -> TYPE r2 -> Type)
-bareArrow (TrFun _ a b) =
-    mkTrCon funTyCon [SomeTypeRep rep1, SomeTypeRep rep2]
+          => TypeRep (FUN m a b)
+          -> TypeRep (FUN m :: TYPE r1 -> TYPE r2 -> Type)
+bareArrow (TrFun _ m a b) =
+    mkTrCon funTyCon [SomeTypeRep m, SomeTypeRep rep1, SomeTypeRep rep2]
   where
     rep1 = getRuntimeRep $ typeRepKind a :: TypeRep r1
     rep2 = getRuntimeRep $ typeRepKind b :: TypeRep r2
 bareArrow _ = error "Data.Typeable.Internal.bareArrow: impossible"
 
 data IsTYPE (a :: Type) where
-    IsTYPE :: forall (r :: RuntimeRep). TypeRep r -> IsTYPE (TYPE r)
+    IsTYPE :: forall (r :: RuntimeRep). TypeRep r %1 -> IsTYPE (TYPE r)
 
 -- | Is a type of the form @TYPE rep@?
 isTYPE :: TypeRep (a :: Type) -> Maybe (IsTYPE a)
@@ -814,8 +822,9 @@ splitApps = go []
       = (tc, xs)
     go xs (TrApp {trAppFun = f, trAppArg = x})
       = go (SomeTypeRep x : xs) f
-    go [] (TrFun {trFunArg = a, trFunRes = b})
-      = (funTyCon, [SomeTypeRep a, SomeTypeRep b])
+    go [] (TrFun {trFunArg = a, trFunRes = b, trFunMul = mul})
+      | Just HRefl <- eqTypeRep trMany mul = (funTyCon, [SomeTypeRep a, SomeTypeRep b])
+      | otherwise = errorWithoutStackTrace "Data.Typeable.Internal.splitApps: Only unrestricted functions are supported"
     go _  (TrFun {})
       = errorWithoutStackTrace "Data.Typeable.Internal.splitApps: Impossible 1"
     go [] TrType = (tyConTYPE, [SomeTypeRep trLiftedRep])
@@ -832,7 +841,7 @@ splitApps = go []
 -- appropriate module and constructor names.
 --
 -- The ticket to find a better way to deal with this is
--- Trac #14480.
+-- #14480.
 tyConTYPE :: TyCon
 tyConTYPE = mkTyCon (tyConPackage liftedRepTyCon) "GHC.Prim" "TYPE" 0
        (KindRepFun (KindRepTyConApp liftedRepTyCon []) (KindRepTYPE LiftedRep))
@@ -932,7 +941,7 @@ mkTyCon# pkg modl name n_kinds kind_rep
                                      (unpackCStringUtf8# name)
 
 -- it is extremely important that this fingerprint computation
--- remains in sync with that in TcTypeable to ensure that type
+-- remains in sync with that in GHC.Tc.Instance.Typeable to ensure that type
 -- equality is correct.
 
 -- | Exquisitely unsafe.
@@ -952,7 +961,7 @@ mkTyCon pkg modl name (I# n_kinds) kind_rep
     fingerprint :: Fingerprint
     fingerprint = mkTyConFingerprint pkg modl name
 
--- This must match the computation done in TcTypeable.mkTyConRepTyConRHS.
+-- This must match the computation done in GHC.Tc.Instance.Typeable.mkTyConRepTyConRHS.
 mkTyConFingerprint :: String -- ^ package name
                    -> String -- ^ module name
                    -> String -- ^ tycon name
@@ -981,7 +990,7 @@ mkTypeLitFromString :: TypeLitSort -> String -> SomeTypeRep
 mkTypeLitFromString TypeLitSymbol s =
     SomeTypeRep $ (typeLitTypeRep s tcSymbol :: TypeRep Symbol)
 mkTypeLitFromString TypeLitNat s =
-    SomeTypeRep $ (typeLitTypeRep s tcSymbol :: TypeRep Nat)
+    SomeTypeRep $ (typeLitTypeRep s tcNat :: TypeRep Nat)
 
 tcSymbol :: TyCon
 tcSymbol = typeRepTyCon (typeRep @Symbol)
@@ -995,14 +1004,16 @@ typeLitTypeRep :: forall k (a :: k). (Typeable k) =>
 typeLitTypeRep nm kind_tycon = mkTrCon (mkTypeLitTyCon nm kind_tycon) []
 
 -- | For compiler use.
-mkTrFun :: forall (r1 :: RuntimeRep) (r2 :: RuntimeRep)
+mkTrFun :: forall (m :: Multiplicity) (r1 :: RuntimeRep) (r2 :: RuntimeRep)
                   (a :: TYPE r1) (b :: TYPE r2).
-           TypeRep a -> TypeRep b -> TypeRep ((a -> b) :: Type)
-mkTrFun arg res = TrFun
+           TypeRep m -> TypeRep a -> TypeRep b -> TypeRep ((FUN m a b) :: Type)
+mkTrFun mul arg res = TrFun
     { trFunFingerprint = fpr
+    , trFunMul = mul
     , trFunArg = arg
     , trFunRes = res }
-  where fpr = fingerprintFingerprints [ typeRepFingerprint arg
+  where fpr = fingerprintFingerprints [ typeRepFingerprint mul
+                                      , typeRepFingerprint arg
                                       , typeRepFingerprint res]
 
 {- $kind_instantiation

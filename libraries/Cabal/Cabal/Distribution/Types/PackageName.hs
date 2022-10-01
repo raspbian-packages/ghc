@@ -2,7 +2,9 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
 module Distribution.Types.PackageName
-  ( PackageName, unPackageName, mkPackageName
+  ( PackageName
+  , unPackageName, mkPackageName
+  , unPackageNameST, mkPackageNameST
   ) where
 
 import Prelude ()
@@ -28,6 +30,10 @@ newtype PackageName = PackageName ShortText
 unPackageName :: PackageName -> String
 unPackageName (PackageName s) = fromShortText s
 
+-- | @since 3.4.0.0
+unPackageNameST :: PackageName -> ShortText
+unPackageNameST (PackageName s) = s
+
 -- | Construct a 'PackageName' from a 'String'
 --
 -- 'mkPackageName' is the inverse to 'unPackageName'
@@ -39,6 +45,15 @@ unPackageName (PackageName s) = fromShortText s
 mkPackageName :: String -> PackageName
 mkPackageName = PackageName . toShortText
 
+-- | Construct a 'PackageName' from a 'ShortText'
+--
+-- Note: No validations are performed to ensure that the resulting
+-- 'PackageName' is valid
+--
+-- @since 3.4.0.0
+mkPackageNameST :: ShortText -> PackageName
+mkPackageNameST = PackageName
+
 -- | 'mkPackageName'
 --
 -- @since 2.0.0.2
@@ -46,6 +61,7 @@ instance IsString PackageName where
   fromString = mkPackageName
 
 instance Binary PackageName
+instance Structured PackageName
 
 instance Pretty PackageName where
   pretty = Disp.text . unPackageName

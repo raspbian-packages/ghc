@@ -43,7 +43,7 @@ import System.Posix.Internals
 #include <sys/sysctl.h>
 #elif defined(mingw32_HOST_OS)
 import Control.Exception
-import Data.List
+import Data.List (isPrefixOf)
 import Data.Word
 import Foreign.C
 import Foreign.Marshal.Array
@@ -231,7 +231,7 @@ getFinalPath path = withCWString path $ \s ->
           | "\\\\?\\" `isPrefixOf` s = drop 4 s
           | otherwise                = s
 
-        -- see https://ghc.haskell.org/trac/ghc/ticket/14460
+        -- see https://gitlab.haskell.org/ghc/ghc/issues/14460
         rejectUNCPath s
           | "\\\\?\\UNC\\" `isPrefixOf` s = path
           | otherwise                     = s

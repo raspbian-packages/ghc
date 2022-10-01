@@ -1,16 +1,18 @@
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
 import Data.List
-import SrcLoc
+import Data.Data
+import GHC.Types.SrcLoc
 import GHC hiding (moduleName)
-import HsDumpAst
-import DynFlags
-import Outputable hiding (space)
+import GHC.Hs.Dump
+import GHC.Driver.Session
+import GHC.Utils.Outputable hiding (space)
 import System.Environment( getArgs )
 import System.Exit
 import System.FilePath
-
-import qualified Data.Map        as Map
 
 usage :: String
 usage = unlines
@@ -32,7 +34,8 @@ testOneFile libdir fileName = do
        p <- parseOneFile libdir fileName
        let
          origAst = showSDoc unsafeGlobalDynFlags
-                     $ showAstData BlankSrcSpan (pm_parsed_source p)
+                     $ showAstData BlankSrcSpan
+                     $ eraseLayoutInfo (pm_parsed_source p)
          pped    = pragmas ++ "\n" ++ pp (pm_parsed_source p)
          anns    = pm_annotations p
          pragmas = getPragmas anns
@@ -48,7 +51,8 @@ testOneFile libdir fileName = do
 
        let newAstStr :: String
            newAstStr = showSDoc unsafeGlobalDynFlags
-                         $ showAstData BlankSrcSpan (pm_parsed_source p')
+                         $ showAstData BlankSrcSpan
+                         $ eraseLayoutInfo (pm_parsed_source p')
        writeFile newAstFile newAstStr
 
        if origAst == newAstStr
@@ -93,13 +97,29 @@ getPragmas anns = pragmaStr
     tokComment (L _ (AnnLineComment  s)) = s
     tokComment _ = ""
 
-    comments = case Map.lookup noSrcSpan (snd anns) of
-      Nothing -> []
-      Just cl -> map tokComment $ sortLocated cl
+    comments = map tokComment $ sortRealLocated $ apiAnnRogueComments anns
     pragmas = filter (\c -> isPrefixOf "{-#" c ) comments
     pragmaStr = intercalate "\n" pragmas
 
 pp :: (Outputable a) => a -> String
 pp a = showPpr unsafeGlobalDynFlags a
 
+eraseLayoutInfo :: ParsedSource -> ParsedSource
+eraseLayoutInfo = everywhere go
+  where
+    go :: forall a. Typeable a => a -> a
+    go x =
+      case eqT @a @LayoutInfo of
+        Nothing -> x
+        Just Refl -> NoLayoutInfo
 
+-- ---------------------------------------------------------------------
+
+-- Copied from syb for the test
+
+everywhere :: (forall a. Data a => a -> a)
+           -> (forall a. Data a => a -> a)
+everywhere f = go
+  where
+    go :: forall a. Data a => a -> a
+    go = f . gmapT go

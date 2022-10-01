@@ -19,24 +19,24 @@ module Distribution.Client.Utils ( MergeResult(..)
                                  , tryFindPackageDesc
                                  , relaxEncodingErrors
                                  , ProgressPhase (..)
-                                 , progressMessage)
+                                 , progressMessage
+                                 , cabalInstallVersion)
        where
 
 import Prelude ()
 import Distribution.Client.Compat.Prelude
 
 import Distribution.Compat.Environment
-import Distribution.Compat.Exception   ( catchIO )
-import Distribution.Compat.Time ( getModTime )
+import Distribution.Compat.Time        ( getModTime )
 import Distribution.Simple.Setup       ( Flag(..) )
-import Distribution.Verbosity
+import Distribution.Version
 import Distribution.Simple.Utils       ( die', findPackageDesc, noticeNoWrap )
 import qualified Data.ByteString.Lazy as BS
 import Data.Bits
          ( (.|.), shiftL, shiftR )
 import System.FilePath
 import Control.Monad
-         ( mapM, mapM_, zipWithM_ )
+         ( zipWithM_ )
 import Data.List
          ( groupBy )
 import Foreign.C.Types ( CInt(..) )
@@ -59,6 +59,10 @@ import GHC.IO.Encoding.Failure
 #if defined(mingw32_HOST_OS) || MIN_VERSION_directory(1,2,3)
 import qualified System.Directory as Dir
 import qualified System.IO.Error as IOError
+#endif
+
+#ifndef __DOCTEST__
+import qualified Paths_cabal_install (version)
 #endif
 
 -- | Generic merging utility. For sorted input lists this is a full outer join.
@@ -143,8 +147,8 @@ withEnv k v m = do
 -- environment is a process-global concept.
 withEnvOverrides :: [(String, Maybe FilePath)] -> IO a -> IO a
 withEnvOverrides overrides m = do
-  mb_olds <- mapM lookupEnv envVars
-  mapM_ (uncurry update) overrides
+  mb_olds <- traverse lookupEnv envVars
+  traverse_ (uncurry update) overrides
   m `Exception.finally` zipWithM_ update envVars mb_olds
    where
     envVars :: [String]
@@ -356,3 +360,10 @@ progressMessage verbosity phase subject = do
         ProgressHaddock     -> "Haddock      "
         ProgressInstalling  -> "Installing   "
         ProgressCompleted   -> "Completed    "
+
+cabalInstallVersion :: Version
+#ifdef __DOCTEST__
+cabalInstallVersion = mkVersion [3,3]
+#else
+cabalInstallVersion = mkVersion' Paths_cabal_install.version
+#endif

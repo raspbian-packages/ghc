@@ -9,6 +9,8 @@ AC_INIT([The Glorious Glasgow Haskell Compilation System], [@ProjectVersion@], [
 dnl See /configure.ac for rationale.
 AC_PREREQ([2.69])
 
+AC_CONFIG_MACRO_DIRS([../m4])
+
 dnl--------------------------------------------------------------------
 dnl * Deal with arguments telling us gmp is somewhere odd
 dnl--------------------------------------------------------------------
@@ -18,14 +20,21 @@ FP_GMP
 dnl Various things from the source distribution configure
 bootstrap_target=@TargetPlatform@
 
-HaskellHaveRTSLinker=@HaskellHaveRTSLinker@
-AC_SUBST(HaskellHaveRTSLinker)
+TargetHasRTSLinker=@TargetHasRTSLinker@
+AC_SUBST(TargetHasRTSLinker)
 
 FFIIncludeDir=@FFIIncludeDir@
 FFILibDir=@FFILibDir@
 AC_SUBST(FFILibDir)
 AC_SUBST(FFIIncludeDir)
 
+LibdwIncludeDir=@LibdwIncludeDir@
+LibdwLibDir=@LibdwLibDir@
+AC_SUBST(LibdwLibDir)
+AC_SUBST(LibdwIncludeDir)
+
+UseLibffiForAdjustors=@UseLibffiForAdjustors@
+AC_SUBST(UseLibffiForAdjustors)
 
 # We have to run these unconditionally as FPTOOLS_SET_PLATFORM_VARS wants the
 # values it computes.
@@ -40,36 +49,22 @@ FP_FIND_ROOT
 
 # ToDo: if Stage1Only=YES, should be YES
 CrossCompiling=NO
-CrossCompilePrefix=""
+CrossCompilePrefix="@CrossCompilePrefix@"
 TargetPlatformFull="${target}"
+TablesNextToCode="@TablesNextToCode@"
 
 AC_SUBST(CrossCompiling)
 AC_SUBST(CrossCompilePrefix)
 AC_SUBST(TargetPlatformFull)
+AC_SUBST(TablesNextToCode)
 
 Unregisterised="@Unregisterised@"
 AC_SUBST(Unregisterised)
 
 #
-dnl ** Check Perl installation **
-#
-AC_PATH_PROG(PerlCmd,perl)
-if test -z "$PerlCmd"; then
-   echo "You must install perl before you can continue"
-   echo "Perhaps it is already installed, but not in your PATH?"
-   exit 1
-fi
-
-#
 dnl ** figure out how to do a BSD-ish install **
 #
 AC_PROG_INSTALL
-
-#
-dnl ** find `find`, used by get-win32-tarballs.sh (see #12502)
-#
-FP_PROG_FIND()
-export FIND
 
 #
 dnl ** how to do symlinks **
@@ -80,6 +75,9 @@ AC_PROG_LN_S()
 dnl ** Find the path to sed **
 #
 AC_PATH_PROG(SedCmd,gsed sed,sed)
+
+dnl ** check for Python for testsuite driver
+FIND_PYTHON
 
 XCODE_VERSION()
 
@@ -103,6 +101,7 @@ FP_SET_CFLAGS_C99([CC],[CONF_CC_OPTS_STAGE2],[CONF_CPP_OPTS_STAGE2])
 dnl ** Which ld to use?
 dnl --------------------------------------------------------------
 FIND_LD([$target],[GccUseLdOpt])
+FIND_MERGE_OBJECTS()
 CONF_GCC_LINKER_OPTS_STAGE1="$CONF_GCC_LINKER_OPTS_STAGE1 $GccUseLdOpt"
 CONF_GCC_LINKER_OPTS_STAGE2="$CONF_GCC_LINKER_OPTS_STAGE2 $GccUseLdOpt"
 LdCmd="$LD"
@@ -124,17 +123,20 @@ AC_SUBST([StripCmd])
 # tools we are looking for. In the past, GHC supported a number of
 # versions of LLVM simultaneously, but that stopped working around
 # 3.5/3.6 release of LLVM.
-LlvmVersion=@LlvmVersion@
+LlvmMinVersion=@LlvmMinVersion@
+LlvmMaxVersion=@LlvmMaxVersion@
 
 dnl ** Which LLVM llc to use?
 dnl --------------------------------------------------------------
-FIND_LLVM_PROG([LLC], [llc], [$LlvmVersion])
+AC_ARG_VAR(LLC,[Use as the path to LLVM's llc [default=autodetect]])
+FIND_LLVM_PROG([LLC], [llc], [$LlvmMinVersion], [$LlvmMaxVersion])
 LlcCmd="$LLC"
 AC_SUBST([LlcCmd])
 
 dnl ** Which LLVM opt to use?
 dnl --------------------------------------------------------------
-FIND_LLVM_PROG([OPT], [opt], [$LlvmVersion])
+AC_ARG_VAR(OPT,[Use as the path to LLVM's opt [default=autodetect]])
+FIND_LLVM_PROG([OPT], [opt], [$LlvmMinVersion], [$LlvmMaxVersion])
 OptCmd="$OPT"
 AC_SUBST([OptCmd])
 
@@ -167,7 +169,11 @@ dnl May need to use gcc to find platform details.
 dnl --------------------------------------------------------------
 FPTOOLS_SET_HASKELL_PLATFORM_VARS
 
-dnl TargetWordSize for settings.in
+dnl ** See whether cc supports --target=<triple> and set
+dnl CONF_CC_OPTS_STAGE[12] accordingly.
+FP_CC_SUPPORTS_TARGET
+
+dnl TargetWordSize for settings file
 AC_CHECK_SIZEOF(void *, 4)
 if test "x$ac_cv_sizeof_void_p" = "x0"; then
     AC_MSG_ERROR([Failed to determine machine word size. Does your toolchain actually work?])
@@ -182,6 +188,17 @@ fi
 TargetWordSize=$ac_cv_sizeof_void_p
 AC_SUBST(TargetWordSize)
 
+dnl TargetWordBigEndian for settings file
+AC_C_BIGENDIAN([TargetWordBigEndian=YES],[TargetWordBigEndian=NO])
+dnl Check that the toolchain we have is consistent with what the compiler expects
+if test "x$TargetWordBigEndian" != "x@TargetWordBigEndian@"; then
+    AC_MSG_ERROR([This binary distribution produces binaries for a target with
+                  a different byte order than your target toolchain.
+                  Are you sure your toolchain targets the intended target platform
+                  of this compiler?])
+fi
+AC_SUBST(TargetWordBigEndian)
+
 #
 dnl ** how to invoke `ar' and `ranlib'
 #
@@ -194,18 +211,19 @@ dnl ** Have libdw?
 dnl --------------------------------------------------------------
 dnl Check for a usable version of libdw/elfutils
 dnl Currently we need 0.158 or newer.
-BinDistNeedsLibdw=@UseLibdw@
-if test "x$BinDistNeedsLibdw" = "xYES" ; then
+UseLibdw=@UseLibdw@
+if test "x$UseLibdw" = "xYES" ; then
   AC_CHECK_LIB(dw, dwfl_attach_state,
     [UseLibdw=YES],
     [AC_MSG_ERROR([Binary distribution was built with libdw support but target system doesn't have supported libdw version (needs at least 0.158)])]
   )
 fi
+AC_SUBST(UseLibdw)
 
 FP_SETTINGS
 
 #
-AC_CONFIG_FILES(settings mk/config.mk mk/install.mk)
+AC_CONFIG_FILES(mk/config.mk mk/install.mk)
 AC_OUTPUT
 
 # We get caught by

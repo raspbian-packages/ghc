@@ -1,5 +1,6 @@
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE CPP               #-}
+{-# LANGUAGE FlexibleContexts  #-}
+{-# LANGUAGE OverloadedStrings #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Client.SetupWrapper
@@ -25,6 +26,7 @@ module Distribution.Client.SetupWrapper (
 import Prelude ()
 import Distribution.Client.Compat.Prelude
 
+import Distribution.CabalSpecVersion (cabalSpecMinimumLibraryVersion)
 import qualified Distribution.Make as Make
 import qualified Distribution.Simple as Simple
 import Distribution.Version
@@ -39,7 +41,8 @@ import Distribution.Package
 import Distribution.PackageDescription
          ( GenericPackageDescription(packageDescription)
          , PackageDescription(..), specVersion, buildType
-         , BuildType(..), defaultRenaming )
+         , BuildType(..) )
+import Distribution.Types.ModuleRenaming (defaultRenaming)
 import Distribution.PackageDescription.Parsec
          ( readGenericPackageDescription )
 import Distribution.Simple.Configure
@@ -81,11 +84,13 @@ import Distribution.Client.JobControl
          ( Lock, criticalSection )
 import Distribution.Simple.Setup
          ( Flag(..) )
+import Distribution.Utils.Generic
+         ( safeHead )
 import Distribution.Simple.Utils
          ( die', debug, info, infoNoWrap
-         , cabalVersion, tryFindPackageDesc, comparing
+         , cabalVersion, tryFindPackageDesc
          , createDirectoryIfMissingVerbose, installExecutableFile
-         , copyFileVerbose, rewriteFileEx )
+         , copyFileVerbose, rewriteFileEx, rewriteFileLBS )
 import Distribution.Client.Utils
          ( inDir, tryCanonicalizePath, withExtraPathEnv
          , existsAndIsMoreRecentThan, moreRecentFile, withEnv, withEnvOverrides
@@ -96,24 +101,22 @@ import Distribution.Client.Utils
 
 import Distribution.ReadE
 import Distribution.System ( Platform(..), buildPlatform )
-import Distribution.Deprecated.Text
-         ( display )
 import Distribution.Utils.NubList
          ( toNubListR )
 import Distribution.Verbosity
-import Distribution.Compat.Exception
-         ( catchIO )
 import Distribution.Compat.Stack
 
 import System.Directory    ( doesFileExist )
 import System.FilePath     ( (</>), (<.>) )
 import System.IO           ( Handle, hPutStr )
-import System.Exit         ( ExitCode(..), exitWith )
-import System.Process      ( createProcess, StdStream(..), proc, waitForProcess
+import Distribution.Compat.Process (createProcess)
+import System.Process      ( StdStream(..), proc, waitForProcess
                            , ProcessHandle )
 import qualified System.Process as Process
 import Data.List           ( foldl1' )
 import Distribution.Client.Compat.ExecutablePath  ( getExecutablePath )
+
+import qualified Data.ByteString.Lazy as BS
 
 #ifdef mingw32_HOST_OS
 import Distribution.Simple.Utils
@@ -299,7 +302,7 @@ getSetup verbosity options mpkg = do
   let options'    = options {
                       useCabalVersion = intersectVersionRanges
                                           (useCabalVersion options)
-                                          (orLaterVersion (specVersion pkg))
+                                          (orLaterVersion (mkVersion (cabalSpecMinimumLibraryVersion (specVersion pkg))))
                     }
       buildType'  = buildType pkg
   (version, method, options'') <-
@@ -462,6 +465,7 @@ runProcess' cmd args mb_cwd mb_env mb_stdin mb_stdout mb_stderr _delegate = do
     mbToStd :: Maybe Handle -> StdStream
     mbToStd Nothing = Inherit
     mbToStd (Just hdl) = UseHandle hdl
+
 -- ------------------------------------------------------------
 -- * Self-Exec SetupMethod
 -- ------------------------------------------------------------
@@ -469,7 +473,7 @@ runProcess' cmd args mb_cwd mb_env mb_stdin mb_stdout mb_stderr _delegate = do
 selfExecSetupMethod :: SetupRunner
 selfExecSetupMethod verbosity options bt args0 = do
   let args = ["act-as-setup",
-              "--build-type=" ++ display bt,
+              "--build-type=" ++ prettyShow bt,
               "--"] ++ args0
   info verbosity $ "Using self-exec internal setup method with build-type "
                  ++ show bt ++ " and args:\n  " ++ show args
@@ -562,7 +566,7 @@ getExternalSetupMethod verbosity options pkg bt = do
     ++ show (useDependenciesExclusive options)
   createDirectoryIfMissingVerbose verbosity True setupDir
   (cabalLibVersion, mCabalLibInstalledPkgId, options') <- cabalLibVersionToUse
-  debug verbosity $ "Using Cabal library version " ++ display cabalLibVersion
+  debug verbosity $ "Using Cabal library version " ++ prettyShow cabalLibVersion
   path <- if useCachedSetupExecutable
           then getCachedSetupExecutable options'
                cabalLibVersion mCabalLibInstalledPkgId
@@ -698,17 +702,15 @@ getExternalSetupMethod verbosity options pkg bt = do
       customSetupLhs  = workingDir options </> "Setup.lhs"
 
   updateSetupScript cabalLibVersion _ =
-    rewriteFileEx verbosity setupHs (buildTypeScript cabalLibVersion)
+    rewriteFileLBS verbosity setupHs (buildTypeScript cabalLibVersion)
 
-  buildTypeScript :: Version -> String
+  buildTypeScript :: Version -> BS.ByteString
   buildTypeScript cabalLibVersion = case bt of
-    Simple    -> "import Distribution.Simple; main = defaultMain\n"
-    Configure -> "import Distribution.Simple; main = defaultMainWithHooks "
-              ++ if cabalLibVersion >= mkVersion [1,3,10]
-                   then "autoconfUserHooks\n"
-                   else "defaultUserHooks\n"
-    Make      -> "import Distribution.Make; main = defaultMain\n"
-    Custom    -> error "buildTypeScript Custom"
+    Simple                                            -> "import Distribution.Simple; main = defaultMain\n"
+    Configure | cabalLibVersion >= mkVersion [1,3,10] -> "import Distribution.Simple; main = defaultMainWithHooks autoconfUserHooks\n"
+              | otherwise                             -> "import Distribution.Simple; main = defaultMainWithHooks defaultUserHooks\n"
+    Make                                              -> "import Distribution.Make; main = defaultMain\n"
+    Custom                                            -> error "buildTypeScript Custom"
 
   installedCabalVersion :: SetupScriptOptions -> Compiler -> ProgramDb
                         -> IO (Version, Maybe InstalledPackageId
@@ -722,11 +724,12 @@ getExternalSetupMethod verbosity options pkg bt = do
         cabalDepVersion = useCabalVersion options'
         options''       = options' { usePackageIndex = Just index }
     case PackageIndex.lookupDependency index cabalDepName cabalDepVersion of
-      []   -> die' verbosity $ "The package '" ++ display (packageName pkg)
+      []   -> die' verbosity $ "The package '" ++ prettyShow (packageName pkg)
                  ++ "' requires Cabal library version "
-                 ++ display (useCabalVersion options)
+                 ++ prettyShow (useCabalVersion options)
                  ++ " but no suitable version is installed."
-      pkgs -> let ipkginfo = head . snd . bestVersion fst $ pkgs
+      pkgs -> let ipkginfo = fromMaybe err $ safeHead . snd . bestVersion fst $ pkgs
+                  err = error "Distribution.Client.installedCabalVersion: empty version list"
               in return (packageVersion ipkginfo
                         ,Just . IPI.installedComponentId $ ipkginfo, options'')
 
@@ -792,11 +795,11 @@ getExternalSetupMethod verbosity options pkg bt = do
     return (setupCacheDir, cachedSetupProgFile)
       where
         buildTypeString       = show bt
-        cabalVersionString    = "Cabal-" ++ (display cabalLibVersion)
-        compilerVersionString = display $
+        cabalVersionString    = "Cabal-" ++ prettyShow cabalLibVersion
+        compilerVersionString = prettyShow $
                                 maybe buildCompilerId compilerId
                                   $ useCompiler options'
-        platformString        = display platform
+        platformString        = prettyShow platform
 
   -- | Look up the setup executable in the cache; update the cache if the setup
   -- executable is not found.
@@ -900,7 +903,7 @@ getExternalSetupMethod verbosity options pkg bt = do
       let ghcCmdLine = renderGhcOptions compiler platform ghcOptions
       when (useVersionMacros options') $
         rewriteFileEx verbosity cppMacrosFile
-            (generatePackageVersionMacros (map snd selectedDeps))
+          $ generatePackageVersionMacros (pkgVersion $ package pkg) (map snd selectedDeps)
       case useLoggingHandle options of
         Nothing          -> runDbProgram verbosity program progdb ghcCmdLine
 

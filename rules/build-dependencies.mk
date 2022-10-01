@@ -5,8 +5,8 @@
 # This file is part of the GHC build system.
 #
 # To understand how the build system works and how to modify it, see
-#      http://ghc.haskell.org/trac/ghc/wiki/Building/Architecture
-#      http://ghc.haskell.org/trac/ghc/wiki/Building/Modifying
+#      https://gitlab.haskell.org/ghc/ghc/wikis/building/architecture
+#      https://gitlab.haskell.org/ghc/ghc/wikis/building/modifying
 #
 # -----------------------------------------------------------------------------
 
@@ -30,7 +30,7 @@ ifneq "$$(NO_GENERATED_MAKEFILE_RULES)" "YES"
 
 # Some of the Haskell files (e.g. utils/hsc2hs/Main.hs) (directly or
 # indirectly) include the generated includes files.
-$$($1_$2_depfile_haskell) : $$(includes_H_CONFIG) $$(includes_H_PLATFORM)
+$$($1_$2_depfile_haskell) : $$(includes_$3_H_CONFIG) $$(includes_$3_H_PLATFORM)
 
 $$($1_$2_depfile_haskell) : $$($1_$2_HS_SRCS) $$($1_$2_HS_BOOT_SRCS) $$$$($1_$2_HC_MK_DEPEND_DEP) | $$$$(dir $$$$@)/.
 	$$(call removeFiles,$$@.tmp)
@@ -65,7 +65,7 @@ endif
              $$@.tmp2 > $$@
 # Some of the C files (directly or indirectly) include the generated
 # includes files.
-$$($1_$2_depfile_c_asm) : $$(includes_H_CONFIG) $$(includes_H_PLATFORM)
+$$($1_$2_depfile_c_asm) : $$(includes_$3_H_CONFIG) $$(includes_$3_H_PLATFORM)
 
 $$($1_$2_depfile_c_asm) : $$($1_$2_C_FILES_DEPS) $$($1_$2_S_FILES) $$($1_$2_CMM_FILES) | $$$$(dir $$$$@)/.
 	$$(call removeFiles,$$@.tmp)

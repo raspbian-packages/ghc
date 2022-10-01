@@ -11,6 +11,7 @@
 -- around, but we haven't got there yet:
 {-# OPTIONS_GHC -Wno-orphans #-}
 {-# OPTIONS_HADDOCK not-home #-}
+{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -30,6 +31,17 @@
 
 #include "ieee-flpt.h"
 #include "MachDeps.h"
+
+#if WORD_SIZE_IN_BITS == 32
+# define WSHIFT 5
+# define MMASK 31
+#elif WORD_SIZE_IN_BITS == 64
+# define WSHIFT 6
+# define MMASK 63
+#else
+# error unsupported WORD_SIZE_IN_BITS
+#endif
+
 
 module GHC.Float
    ( module GHC.Float
@@ -54,10 +66,12 @@ import GHC.Word
 import GHC.Arr
 import GHC.Float.RealFracMethods
 import GHC.Float.ConversionUtils
-import GHC.Integer.Logarithms ( integerLogBase# )
-import GHC.Integer.Logarithms.Internals
+import GHC.Num.BigNat
 
 infixr 8  **
+
+-- $setup
+-- >>> import Prelude
 
 ------------------------------------------------------------------------
 -- Standard numeric classes
@@ -237,7 +251,7 @@ class  (RealFrac a, Floating a) => RealFloat a  where
                                  -- to wrong results, hence we clamp the
                                  -- scaling parameter.
                                  -- If n + k would be larger than h,
-                                 -- n + clamp b k must be too, simliar
+                                 -- n + clamp b k must be too, similar
                                  -- for smaller than l - d.
                                  -- Add a little extra to keep clear
                                  -- from the boundary cases.
@@ -283,7 +297,7 @@ instance Num Float where
              | otherwise = x -- handles 0.0, (-0.0), and NaN
 
     {-# INLINE fromInteger #-}
-    fromInteger i = F# (floatFromInteger i)
+    fromInteger i = F# (integerToFloat# i)
 
 -- | @since 2.01
 instance  Real Float  where
@@ -291,12 +305,12 @@ instance  Real Float  where
         case decodeFloat_Int# x# of
           (# m#, e# #)
             | isTrue# (e# >=# 0#)                               ->
-                    (smallInteger m# `shiftLInteger` e#) :% 1
+                    (IS m# `integerShiftL#` int2Word# e#) :% 1
             | isTrue# ((int2Word# m# `and#` 1##) `eqWord#` 0##) ->
                     case elimZerosInt# m# (negateInt# e#) of
-                      (# n, d# #) -> n :% shiftLInteger 1 d#
+                      (# n, d# #) -> n :% integerShiftL# 1 (int2Word# d#)
             | otherwise                                         ->
-                    smallInteger m# :% shiftLInteger 1 (negateInt# e#)
+                    IS m# :% integerShiftL# 1 (int2Word# (negateInt# e#))
 
 -- | @since 2.01
 -- Note that due to the presence of @NaN@, not all elements of 'Float' have an
@@ -421,9 +435,9 @@ instance  RealFloat Float  where
     floatRange _        =  (FLT_MIN_EXP, FLT_MAX_EXP) -- ditto
 
     decodeFloat (F# f#) = case decodeFloat_Int# f# of
-                          (# i, e #) -> (smallInteger i, I# e)
+                          (# i, e #) -> (IS i, I# e)
 
-    encodeFloat i (I# e) = F# (encodeFloatInteger i e)
+    encodeFloat i (I# e) = F# (integerEncodeFloat# i e)
 
     exponent x          = case decodeFloat x of
                             (m,n) -> if m == 0 then 0 else n + floatDigits x
@@ -478,21 +492,21 @@ instance  Num Double  where
 
 
     {-# INLINE fromInteger #-}
-    fromInteger i = D# (doubleFromInteger i)
+    fromInteger i = D# (integerToDouble# i)
 
 
 -- | @since 2.01
 instance  Real Double  where
     toRational (D# x#)  =
-        case decodeDoubleInteger x# of
+        case integerDecodeDouble# x# of
           (# m, e# #)
             | isTrue# (e# >=# 0#)                                  ->
-                shiftLInteger m e# :% 1
-            | isTrue# ((integerToWord m `and#` 1##) `eqWord#` 0##) ->
+                integerShiftL# m (int2Word# e#) :% 1
+            | isTrue# ((integerToWord# m `and#` 1##) `eqWord#` 0##) ->
                 case elimZerosInteger m (negateInt# e#) of
-                    (# n, d# #) ->  n :% shiftLInteger 1 d#
+                    (# n, d# #) ->  n :% integerShiftL# 1 (int2Word# d#)
             | otherwise                                            ->
-                m :% shiftLInteger 1 (negateInt# e#)
+                m :% integerShiftL# 1 (int2Word# (negateInt# e#))
 
 -- | @since 2.01
 -- Note that due to the presence of @NaN@, not all elements of 'Double' have an
@@ -610,10 +624,10 @@ instance  RealFloat Double  where
     floatRange _        =  (DBL_MIN_EXP, DBL_MAX_EXP) -- ditto
 
     decodeFloat (D# x#)
-      = case decodeDoubleInteger x#   of
+      = case integerDecodeDouble# x#   of
           (# i, j #) -> (i, I# j)
 
-    encodeFloat i (I# j) = D# (encodeDoubleInteger i j)
+    encodeFloat i (I# j) = D# (integerEncodeDouble# i j)
 
     exponent x          = case decodeFloat x of
                             (m,n) -> if m == 0 then 0 else n + floatDigits x
@@ -994,7 +1008,9 @@ fromRat' x = r
         (minExp0, _) = floatRange r
         minExp = minExp0 - p            -- the real minimum exponent
         xMax   = toRational (expt b p)
-        p0 = (integerLogBase b (numerator x) - integerLogBase b (denominator x) - p) `max` minExp
+        ln     = I# (word2Int# (integerLogBase# b (numerator x)))
+        ld     = I# (word2Int# (integerLogBase# b (denominator x)))
+        p0     = (ln - ld - p) `max` minExp
         -- if x = n/d and ln = integerLogBase b n, ld = integerLogBase b d,
         -- then b^(ln-ld-1) < x < b^(ln-ld+1)
         f = if p0 < 0 then 1 :% expt b (-p0) else expt b p0 :% 1
@@ -1028,18 +1044,6 @@ maxExpt10 = 324
 expts10 :: Array Int Integer
 expts10 = array (minExpt,maxExpt10) [(n,10^n) | n <- [minExpt .. maxExpt10]]
 
--- Compute the (floor of the) log of i in base b.
--- Simplest way would be just divide i by b until it's smaller then b, but that would
--- be very slow!  We are just slightly more clever, except for base 2, where
--- we take advantage of the representation of Integers.
--- The general case could be improved by a lookup table for
--- approximating the result by integerLog2 i / integerLog2 b.
-integerLogBase :: Integer -> Integer -> Int
-integerLogBase b i
-   | i < b     = 0
-   | b == 2    = I# (integerLog2# i)
-   | otherwise = I# (integerLogBase# b i)
-
 {-
 Unfortunately, the old conversion code was awfully slow due to
 a) a slow integer logarithm
@@ -1060,10 +1064,10 @@ divisions as much as possible.
 fromRat'' :: RealFloat a => Int -> Int -> Integer -> Integer -> a
 -- Invariant: n and d strictly positive
 fromRat'' minEx@(I# me#) mantDigs@(I# md#) n d =
-    case integerLog2IsPowerOf2# d of
-      (# ld#, pw# #)
-        | isTrue# (pw# ==# 0#) ->
-          case integerLog2# n of
+    case integerIsPowerOf2# d of
+      (# | ldw# #) ->
+          let ld# = word2Int# ldw#
+          in case word2Int# (integerLog2# n) of
             ln# | isTrue# (ln# >=# (ld# +# me# -# 1#)) ->
                   -- this means n/d >= 2^(minEx-1), i.e. we are guaranteed to get
                   -- a normalised number, round to mantDigs bits
@@ -1094,12 +1098,12 @@ fromRat'' minEx@(I# me#) mantDigs@(I# md#) n d =
                                 _  -> encodeFloat (n' + 1) (minEx-mantDigs)
                          | isTrue# (ld'# ># (ln# +# 1#)) -> encodeFloat 0 0 -- result of shift < 0.5
                          | otherwise ->  -- first bit of n shifted to 0.5 place
-                           case integerLog2IsPowerOf2# n of
-                            (# _, 0# #) -> encodeFloat 0 0  -- round to even
-                            (# _, _ #)  -> encodeFloat 1 (minEx - mantDigs)
-        | otherwise ->
-          let ln = I# (integerLog2# n)
-              ld = I# ld#
+                           case integerIsPowerOf2# n of
+                            (#       |  _ #) -> encodeFloat 0 0  -- round to even
+                            (# (# #) |    #) -> encodeFloat 1 (minEx - mantDigs)
+      (# (# #) | #) ->
+          let ln = I# (word2Int# (integerLog2# n))
+              ld = I# (word2Int# (integerLog2# d))
               -- 2^(ln-ld-1) < n/d < 2^(ln-ld+1)
               p0 = max minEx (ln - ld)
               (n', d')
@@ -1121,6 +1125,46 @@ fromRat'' minEx@(I# me#) mantDigs@(I# md#) n d =
                                         then q else q+1
                                 GT -> q+1
           in  encodeFloat rdq p'
+
+-- Assumption: Integer and Int# are strictly positive, Int# is less
+-- than logBase 2 of Integer, otherwise havoc ensues.
+-- Used only for the numerator in fromRational when the denominator
+-- is a power of 2.
+-- The Int# argument is log2 n minus the number of bits in the mantissa
+-- of the target type, i.e. the index of the first non-integral bit in
+-- the quotient.
+--
+-- 0# means round down (towards zero)
+-- 1# means we have a half-integer, round to even
+-- 2# means round up (away from zero)
+roundingMode# :: Integer -> Int# -> Int#
+roundingMode# (IS i#) t =
+   let
+      k = int2Word# i# `and#` ((uncheckedShiftL# 2## t) `minusWord#` 1##)
+      c = uncheckedShiftL# 1## t
+   in if isTrue# (c `gtWord#` k)
+         then 0#
+         else if isTrue# (c `ltWord#` k)
+                 then 2#
+                 else 1#
+
+roundingMode# (IN bn) t = roundingMode# (IP bn) t -- dummy
+roundingMode# (IP bn) t =
+   let
+      j = word2Int# (int2Word# t `and#` MMASK##) -- index of relevant bit in word
+      k = uncheckedIShiftRA# t WSHIFT#           -- index of relevant word
+      r = bigNatIndex# bn k `and#` ((uncheckedShiftL# 2## j) `minusWord#` 1##)
+      c = uncheckedShiftL# 1## j
+      test i = if isTrue# (i <# 0#)
+                  then 1#
+                  else case bigNatIndex# bn i of
+                          0## -> test (i -# 1#)
+                          _   -> 2#
+   in if isTrue# (c `gtWord#` r)
+         then 0#
+         else if isTrue# (c `ltWord#` r)
+                 then 2#
+                 else test (k -# 1#)
 
 ------------------------------------------------------------------------
 -- Floating point numeric primops
@@ -1144,13 +1188,16 @@ geFloat     (F# x) (F# y) = isTrue# (geFloat# x y)
 ltFloat     (F# x) (F# y) = isTrue# (ltFloat# x y)
 leFloat     (F# x) (F# y) = isTrue# (leFloat# x y)
 
-expFloat, logFloat, sqrtFloat, fabsFloat :: Float -> Float
+expFloat, expm1Float :: Float -> Float
+logFloat, log1pFloat, sqrtFloat, fabsFloat :: Float -> Float
 sinFloat, cosFloat, tanFloat  :: Float -> Float
 asinFloat, acosFloat, atanFloat  :: Float -> Float
 sinhFloat, coshFloat, tanhFloat  :: Float -> Float
 asinhFloat, acoshFloat, atanhFloat  :: Float -> Float
 expFloat    (F# x) = F# (expFloat# x)
+expm1Float  (F# x) = F# (expm1Float# x)
 logFloat    (F# x) = F# (logFloat# x)
+log1pFloat  (F# x) = F# (log1pFloat# x)
 sqrtFloat   (F# x) = F# (sqrtFloat# x)
 fabsFloat   (F# x) = F# (fabsFloat# x)
 sinFloat    (F# x) = F# (sinFloat# x)
@@ -1193,13 +1240,16 @@ double2Float (D# x) = F# (double2Float# x)
 float2Double :: Float -> Double
 float2Double (F# x) = D# (float2Double# x)
 
-expDouble, logDouble, sqrtDouble, fabsDouble :: Double -> Double
+expDouble, expm1Double :: Double -> Double
+logDouble, log1pDouble, sqrtDouble, fabsDouble :: Double -> Double
 sinDouble, cosDouble, tanDouble  :: Double -> Double
 asinDouble, acosDouble, atanDouble  :: Double -> Double
 sinhDouble, coshDouble, tanhDouble  :: Double -> Double
 asinhDouble, acoshDouble, atanhDouble  :: Double -> Double
 expDouble    (D# x) = D# (expDouble# x)
+expm1Double  (D# x) = D# (expm1Double# x)
 logDouble    (D# x) = D# (logDouble# x)
+log1pDouble  (D# x) = D# (log1pDouble# x)
 sqrtDouble   (D# x) = D# (sqrtDouble# x)
 fabsDouble   (D# x) = D# (fabsDouble# x)
 sinDouble    (D# x) = D# (sinDouble# x)
@@ -1230,16 +1280,6 @@ foreign import ccall unsafe "isDoubleDenormalized" isDoubleDenormalized :: Doubl
 foreign import ccall unsafe "isDoubleNegativeZero" isDoubleNegativeZero :: Double -> Int
 foreign import ccall unsafe "isDoubleFinite" isDoubleFinite :: Double -> Int
 
-
-------------------------------------------------------------------------
--- libm imports for extended floating
-------------------------------------------------------------------------
-foreign import capi unsafe "math.h log1p" log1pDouble :: Double -> Double
-foreign import capi unsafe "math.h expm1" expm1Double :: Double -> Double
-foreign import capi unsafe "math.h log1pf" log1pFloat :: Float -> Float
-foreign import capi unsafe "math.h expm1f" expm1Float :: Float -> Float
-
-
 ------------------------------------------------------------------------
 -- Coercion rules
 ------------------------------------------------------------------------
@@ -1266,7 +1306,7 @@ word2Float (W# w) = F# (word2Float# w)
 {-
 Note [realToFrac int-to-float]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Don found that the RULES for realToFrac/Int->Double and simliarly
+Don found that the RULES for realToFrac/Int->Double and similarly
 Float made a huge difference to some stream-fusion programs.  Here's
 an example
 
@@ -1298,7 +1338,7 @@ And with the rule:
 The running time of the program goes from 120 seconds to 0.198 seconds
 with the native backend, and 0.143 seconds with the C backend.
 
-A few more details in Trac #2251, and the patch message
+A few more details in #2251, and the patch message
 "Add RULES for realToFrac from Int".
 -}
 
@@ -1328,7 +1368,7 @@ clamp bd k = max (-bd) (min bd k)
 Note [Casting from integral to floating point types]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 To implement something like `reinterpret_cast` from C++ to go from a
-floating-point type to an integral type one might niavely think that the
+floating-point type to an integral type one might naively think that the
 following should work:
 
       cast :: Float -> Word32
@@ -1391,7 +1431,7 @@ foreign import prim "stg_word64ToDoublezh"
 #endif
 
 
--- | @'castFloatToWord32' f@ does a bit-for-bit copy from a floating-point value
+-- | @'castFloatToWord64' f@ does a bit-for-bit copy from a floating-point value
 -- to an integral value.
 --
 -- @since 4.10.0.0

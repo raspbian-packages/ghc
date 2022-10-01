@@ -47,6 +47,7 @@ instance IsString PkgconfigName where
     fromString = mkPkgconfigName
 
 instance Binary PkgconfigName
+instance Structured PkgconfigName
 
 -- pkg-config allows versions and other letters in package names, eg
 -- "gtk+-2.0" is a valid pkg-config package _name_.  It then has a package
@@ -55,7 +56,13 @@ instance Pretty PkgconfigName where
   pretty = Disp.text . unPkgconfigName
 
 instance Parsec PkgconfigName where
-  parsec = mkPkgconfigName <$> P.munch1 (\c -> isAlphaNum c || c `elem` "+-._")
+    parsec = mkPkgconfigName <$> P.munch1 isNameChar where
+        -- https://gitlab.haskell.org/ghc/ghc/issues/17752
+        isNameChar '-' = True
+        isNameChar '_' = True
+        isNameChar '.' = True
+        isNameChar '+' = True
+        isNameChar c   = isAlphaNum c
 
 instance NFData PkgconfigName where
     rnf (PkgconfigName pkg) = rnf pkg

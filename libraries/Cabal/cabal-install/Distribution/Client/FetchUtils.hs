@@ -32,6 +32,9 @@ module Distribution.Client.FetchUtils (
     downloadIndex,
   ) where
 
+import Distribution.Client.Compat.Prelude
+import Prelude ()
+
 import Distribution.Client.Types
 import Distribution.Client.HttpUtils
          ( downloadURI, isOldHackageURI, DownloadResult(..)
@@ -41,19 +44,14 @@ import Distribution.Package
          ( PackageId, packageName, packageVersion )
 import Distribution.Simple.Utils
          ( notice, info, debug, die' )
-import Distribution.Deprecated.Text
-         ( display )
 import Distribution.Verbosity
-         ( Verbosity, verboseUnmarkOutput )
+         ( verboseUnmarkOutput )
 import Distribution.Client.GlobalFlags
          ( RepoContext(..) )
 import Distribution.Client.Utils
          ( ProgressPhase(..), progressMessage )
 
-import Data.Maybe
-import Data.Map (Map)
 import qualified Data.Map as Map
-import Control.Monad
 import Control.Exception
 import Control.Concurrent.Async
 import Control.Concurrent.MVar
@@ -84,7 +82,7 @@ isFetched loc = case loc of
     RemoteTarballPackage _uri local -> return (isJust local)
     RepoTarballPackage repo pkgid _ -> doesFileExist (packageFile repo pkgid)
     RemoteSourceRepoPackage _ local -> return (isJust local)
-    
+
 
 -- | Checks if the package has already been fetched (or does not need
 -- fetching) and if so returns evidence in the form of a 'PackageLocation'
@@ -101,8 +99,8 @@ checkFetched loc = case loc of
       return (Just $ RemoteTarballPackage uri file)
     RepoTarballPackage repo pkgid (Just file) ->
       return (Just $ RepoTarballPackage repo pkgid file)
-    RemoteSourceRepoPackage repo (Just dir) ->
-      return (Just $ RemoteSourceRepoPackage repo dir)
+    RemoteSourceRepoPackage repo (Just file) ->
+      return (Just $ RemoteSourceRepoPackage repo file)
 
     RemoteTarballPackage     _uri Nothing -> return Nothing
     RemoteSourceRepoPackage _repo Nothing -> return Nothing
@@ -165,18 +163,18 @@ fetchRepoTarball :: Verbosity -> RepoContext -> Repo -> PackageId -> IO FilePath
 fetchRepoTarball verbosity' repoCtxt repo pkgid = do
   fetched <- doesFileExist (packageFile repo pkgid)
   if fetched
-    then do info verbosity $ display pkgid ++ " has already been downloaded."
+    then do info verbosity $ prettyShow pkgid ++ " has already been downloaded."
             return (packageFile repo pkgid)
-    else do progressMessage verbosity ProgressDownloading (display pkgid)
+    else do progressMessage verbosity ProgressDownloading (prettyShow pkgid)
             res <- downloadRepoPackage
-            progressMessage verbosity ProgressDownloaded (display pkgid)
+            progressMessage verbosity ProgressDownloaded (prettyShow pkgid)
             return res
   where
     -- whether we download or not is non-deterministic
     verbosity = verboseUnmarkOutput verbosity'
 
     downloadRepoPackage = case repo of
-      RepoLocal{..} -> return (packageFile repo pkgid)
+      RepoLocalNoIndex{} -> return (packageFile repo pkgid)
 
       RepoRemote{..} -> do
         transport <- repoContextGetTransport repoCtxt
@@ -237,13 +235,15 @@ asyncFetchPackages :: Verbosity
 asyncFetchPackages verbosity repoCtxt pkglocs body = do
     --TODO: [nice to have] use parallel downloads?
 
-    asyncDownloadVars <- sequence [ do v <- newEmptyMVar
-                                       return (pkgloc, v)
-                                  | pkgloc <- pkglocs ]
+    asyncDownloadVars <- sequenceA
+        [ do v <- newEmptyMVar
+             return (pkgloc, v)
+        | pkgloc <- pkglocs
+        ]
 
     let fetchPackages :: IO ()
         fetchPackages =
-          forM_ asyncDownloadVars $ \(pkgloc, var) -> do
+          for_ asyncDownloadVars $ \(pkgloc, var) -> do
             -- Suppress marking here, because 'withAsync' means
             -- that we get nondeterministic interleaving
             result <- try $ fetchPackage (verboseUnmarkOutput verbosity)
@@ -285,16 +285,17 @@ waitAsyncFetchPackage verbosity downloadMap srcloc =
 --
 packageFile :: Repo -> PackageId -> FilePath
 packageFile repo pkgid = packageDir repo pkgid
-                     </> display pkgid
+                     </> prettyShow pkgid
                      <.> "tar.gz"
 
 -- | Generate the full path to the directory where the local cached copy of
 -- the tarball for a given @PackageIdentifer@ is stored.
 --
 packageDir :: Repo -> PackageId -> FilePath
+packageDir (RepoLocalNoIndex (LocalRepo _ dir _) _) _pkgid = dir
 packageDir repo pkgid = repoLocalDir repo
-                    </> display (packageName    pkgid)
-                    </> display (packageVersion pkgid)
+                    </> prettyShow (packageName    pkgid)
+                    </> prettyShow (packageVersion pkgid)
 
 -- | Generate the URI of the tarball for a given package.
 --
@@ -303,14 +304,14 @@ packageURI repo pkgid | isOldHackageURI (remoteRepoURI repo) =
   (remoteRepoURI repo) {
     uriPath = FilePath.Posix.joinPath
       [uriPath (remoteRepoURI repo)
-      ,display (packageName    pkgid)
-      ,display (packageVersion pkgid)
-      ,display pkgid <.> "tar.gz"]
+      ,prettyShow (packageName    pkgid)
+      ,prettyShow (packageVersion pkgid)
+      ,prettyShow pkgid <.> "tar.gz"]
   }
 packageURI repo pkgid =
   (remoteRepoURI repo) {
     uriPath = FilePath.Posix.joinPath
       [uriPath (remoteRepoURI repo)
       ,"package"
-      ,display pkgid <.> "tar.gz"]
+      ,prettyShow pkgid <.> "tar.gz"]
   }

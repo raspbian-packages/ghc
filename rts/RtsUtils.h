@@ -22,7 +22,7 @@ void *stgMallocBytes(size_t n, char *msg)
 
 void *stgReallocBytes(void *p, size_t n, char *msg);
 
-void *stgCallocBytes(size_t n, size_t m, char *msg)
+void *stgCallocBytes(size_t count, size_t size, char *msg)
      GNUC3_ATTRIBUTE(__malloc__);
 
 char *stgStrndup(const char *s, size_t n);
@@ -33,6 +33,7 @@ void stgFree(void* p);
  * Misc other utilities
  * -------------------------------------------------------------------------- */
 
+int rtsSleep(Time t);
 char *time_str(void);
 char *showStgWord64(StgWord64, char *, bool);
 

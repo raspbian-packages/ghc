@@ -10,14 +10,18 @@ GenericPackageDescription
                                                condBranchIfTrue = CondNode
                                                                     {condTreeComponents = [],
                                                                      condTreeConstraints = [Dependency
-                                                                                              `PackageName "tagged"`
+                                                                                              (PackageName
+                                                                                                 "tagged")
                                                                                               (IntersectVersionRanges
                                                                                                  (OrLaterVersion
-                                                                                                    `mkVersion [0,7]`)
+                                                                                                    (mkVersion
+                                                                                                       [0,
+                                                                                                        7]))
                                                                                                  (EarlierVersion
-                                                                                                    `mkVersion [0,9]`))
-                                                                                              (Set.fromList
-                                                                                                 [LMainLibName])],
+                                                                                                    (mkVersion
+                                                                                                       [0,
+                                                                                                        9])))
+                                                                                              mainLibSet],
                                                                      condTreeData = Library
                                                                                       {exposedModules = [],
                                                                                        libBuildInfo = BuildInfo
@@ -71,14 +75,18 @@ GenericPackageDescription
                                                                                                                            []
                                                                                                                            [],
                                                                                                          targetBuildDepends = [Dependency
-                                                                                                                                 `PackageName "tagged"`
+                                                                                                                                 (PackageName
+                                                                                                                                    "tagged")
                                                                                                                                  (IntersectVersionRanges
                                                                                                                                     (OrLaterVersion
-                                                                                                                                       `mkVersion [0,7]`)
+                                                                                                                                       (mkVersion
+                                                                                                                                          [0,
+                                                                                                                                           7]))
                                                                                                                                     (EarlierVersion
-                                                                                                                                       `mkVersion [0,9]`))
-                                                                                                                                 (Set.fromList
-                                                                                                                                    [LMainLibName])],
+                                                                                                                                       (mkVersion
+                                                                                                                                          [0,
+                                                                                                                                           9])))
+                                                                                                                                 mainLibSet],
                                                                                                          virtualModules = []},
                                                                                        libExposed = True,
                                                                                        libName = LMainLibName,
@@ -91,23 +99,31 @@ GenericPackageDescription
                                                condBranchIfTrue = CondNode
                                                                     {condTreeComponents = [],
                                                                      condTreeConstraints = [Dependency
-                                                                                              `PackageName "transformers-compat"`
+                                                                                              (PackageName
+                                                                                                 "transformers-compat")
                                                                                               (IntersectVersionRanges
                                                                                                  (OrLaterVersion
-                                                                                                    `mkVersion [0,3]`)
+                                                                                                    (mkVersion
+                                                                                                       [0,
+                                                                                                        3]))
                                                                                                  (EarlierVersion
-                                                                                                    `mkVersion [0,6]`))
-                                                                                              (Set.fromList
-                                                                                                 [LMainLibName]),
+                                                                                                    (mkVersion
+                                                                                                       [0,
+                                                                                                        6])))
+                                                                                              mainLibSet,
                                                                                             Dependency
-                                                                                              `PackageName "transformers"`
+                                                                                              (PackageName
+                                                                                                 "transformers")
                                                                                               (IntersectVersionRanges
                                                                                                  (OrLaterVersion
-                                                                                                    `mkVersion [0,3]`)
+                                                                                                    (mkVersion
+                                                                                                       [0,
+                                                                                                        3]))
                                                                                                  (EarlierVersion
-                                                                                                    `mkVersion [0,6]`))
-                                                                                              (Set.fromList
-                                                                                                 [LMainLibName])],
+                                                                                                    (mkVersion
+                                                                                                       [0,
+                                                                                                        6])))
+                                                                                              mainLibSet],
                                                                      condTreeData = Library
                                                                                       {exposedModules = [],
                                                                                        libBuildInfo = BuildInfo
@@ -161,23 +177,31 @@ GenericPackageDescription
                                                                                                                            []
                                                                                                                            [],
                                                                                                          targetBuildDepends = [Dependency
-                                                                                                                                 `PackageName "transformers-compat"`
+                                                                                                                                 (PackageName
+                                                                                                                                    "transformers-compat")
                                                                                                                                  (IntersectVersionRanges
                                                                                                                                     (OrLaterVersion
-                                                                                                                                       `mkVersion [0,3]`)
+                                                                                                                                       (mkVersion
+                                                                                                                                          [0,
+                                                                                                                                           3]))
                                                                                                                                     (EarlierVersion
-                                                                                                                                       `mkVersion [0,6]`))
-                                                                                                                                 (Set.fromList
-                                                                                                                                    [LMainLibName]),
+                                                                                                                                       (mkVersion
+                                                                                                                                          [0,
+                                                                                                                                           6])))
+                                                                                                                                 mainLibSet,
                                                                                                                                Dependency
-                                                                                                                                 `PackageName "transformers"`
+                                                                                                                                 (PackageName
+                                                                                                                                    "transformers")
                                                                                                                                  (IntersectVersionRanges
                                                                                                                                     (OrLaterVersion
-                                                                                                                                       `mkVersion [0,3]`)
+                                                                                                                                       (mkVersion
+                                                                                                                                          [0,
+                                                                                                                                           3]))
                                                                                                                                     (EarlierVersion
-                                                                                                                                       `mkVersion [0,6]`))
-                                                                                                                                 (Set.fromList
-                                                                                                                                    [LMainLibName])],
+                                                                                                                                       (mkVersion
+                                                                                                                                          [0,
+                                                                                                                                           6])))
+                                                                                                                                 mainLibSet],
                                                                                                          virtualModules = []},
                                                                                        libExposed = True,
                                                                                        libName = LMainLibName,
@@ -317,44 +341,44 @@ GenericPackageDescription
                                                                                        reexportedModules = [],
                                                                                        signatures = []}}}],
                       condTreeConstraints = [Dependency
-                                               `PackageName "base"`
+                                               (PackageName "base")
                                                (IntersectVersionRanges
-                                                  (OrLaterVersion `mkVersion [4,7]`)
-                                                  (EarlierVersion `mkVersion [5]`))
-                                               (Set.fromList [LMainLibName]),
+                                                  (OrLaterVersion (mkVersion [4, 7]))
+                                                  (EarlierVersion (mkVersion [5])))
+                                               mainLibSet,
                                              Dependency
-                                               `PackageName "template-haskell"`
+                                               (PackageName "template-haskell")
                                                (IntersectVersionRanges
-                                                  (OrLaterVersion `mkVersion [2,8]`)
-                                                  (EarlierVersion `mkVersion [2,13]`))
-                                               (Set.fromList [LMainLibName]),
+                                                  (OrLaterVersion (mkVersion [2, 8]))
+                                                  (EarlierVersion (mkVersion [2, 13])))
+                                               mainLibSet,
                                              Dependency
-                                               `PackageName "ghc-prim"`
+                                               (PackageName "ghc-prim")
                                                (IntersectVersionRanges
-                                                  (OrLaterVersion `mkVersion [0,3]`)
-                                                  (EarlierVersion `mkVersion [0,6]`))
-                                               (Set.fromList [LMainLibName]),
+                                                  (OrLaterVersion (mkVersion [0, 3]))
+                                                  (EarlierVersion (mkVersion [0, 6])))
+                                               mainLibSet,
                                              Dependency
-                                               `PackageName "deepseq"`
+                                               (PackageName "deepseq")
                                                (IntersectVersionRanges
-                                                  (OrLaterVersion `mkVersion [1,3]`)
-                                                  (EarlierVersion `mkVersion [1,5]`))
-                                               (Set.fromList [LMainLibName])],
+                                                  (OrLaterVersion (mkVersion [1, 3]))
+                                                  (EarlierVersion (mkVersion [1, 5])))
+                                               mainLibSet],
                       condTreeData = Library
-                                       {exposedModules = [`ModuleName ["Generics","SOP"]`,
-                                                          `ModuleName ["Generics","SOP","GGP"]`,
-                                                          `ModuleName ["Generics","SOP","TH"]`,
-                                                          `ModuleName ["Generics","SOP","Dict"]`,
-                                                          `ModuleName ["Generics","SOP","Type","Metadata"]`,
-                                                          `ModuleName ["Generics","SOP","BasicFunctors"]`,
-                                                          `ModuleName ["Generics","SOP","Classes"]`,
-                                                          `ModuleName ["Generics","SOP","Constraint"]`,
-                                                          `ModuleName ["Generics","SOP","Instances"]`,
-                                                          `ModuleName ["Generics","SOP","Metadata"]`,
-                                                          `ModuleName ["Generics","SOP","NP"]`,
-                                                          `ModuleName ["Generics","SOP","NS"]`,
-                                                          `ModuleName ["Generics","SOP","Universe"]`,
-                                                          `ModuleName ["Generics","SOP","Sing"]`],
+                                       {exposedModules = [ModuleName "Generics.SOP",
+                                                          ModuleName "Generics.SOP.GGP",
+                                                          ModuleName "Generics.SOP.TH",
+                                                          ModuleName "Generics.SOP.Dict",
+                                                          ModuleName "Generics.SOP.Type.Metadata",
+                                                          ModuleName "Generics.SOP.BasicFunctors",
+                                                          ModuleName "Generics.SOP.Classes",
+                                                          ModuleName "Generics.SOP.Constraint",
+                                                          ModuleName "Generics.SOP.Instances",
+                                                          ModuleName "Generics.SOP.Metadata",
+                                                          ModuleName "Generics.SOP.NP",
+                                                          ModuleName "Generics.SOP.NS",
+                                                          ModuleName "Generics.SOP.Universe",
+                                                          ModuleName "Generics.SOP.Sing"],
                                         libBuildInfo = BuildInfo
                                                          {asmOptions = [],
                                                           asmSources = [],
@@ -443,41 +467,50 @@ GenericPackageDescription
                                                           sharedOptions = PerCompilerFlavor [] [],
                                                           staticOptions = PerCompilerFlavor [] [],
                                                           targetBuildDepends = [Dependency
-                                                                                  `PackageName "base"`
+                                                                                  (PackageName
+                                                                                     "base")
                                                                                   (IntersectVersionRanges
                                                                                      (OrLaterVersion
-                                                                                        `mkVersion [4,7]`)
+                                                                                        (mkVersion
+                                                                                           [4, 7]))
                                                                                      (EarlierVersion
-                                                                                        `mkVersion [5]`))
-                                                                                  (Set.fromList
-                                                                                     [LMainLibName]),
+                                                                                        (mkVersion
+                                                                                           [5])))
+                                                                                  mainLibSet,
                                                                                 Dependency
-                                                                                  `PackageName "template-haskell"`
+                                                                                  (PackageName
+                                                                                     "template-haskell")
                                                                                   (IntersectVersionRanges
                                                                                      (OrLaterVersion
-                                                                                        `mkVersion [2,8]`)
+                                                                                        (mkVersion
+                                                                                           [2, 8]))
                                                                                      (EarlierVersion
-                                                                                        `mkVersion [2,13]`))
-                                                                                  (Set.fromList
-                                                                                     [LMainLibName]),
+                                                                                        (mkVersion
+                                                                                           [2,
+                                                                                            13])))
+                                                                                  mainLibSet,
                                                                                 Dependency
-                                                                                  `PackageName "ghc-prim"`
+                                                                                  (PackageName
+                                                                                     "ghc-prim")
                                                                                   (IntersectVersionRanges
                                                                                      (OrLaterVersion
-                                                                                        `mkVersion [0,3]`)
+                                                                                        (mkVersion
+                                                                                           [0, 3]))
                                                                                      (EarlierVersion
-                                                                                        `mkVersion [0,6]`))
-                                                                                  (Set.fromList
-                                                                                     [LMainLibName]),
+                                                                                        (mkVersion
+                                                                                           [0, 6])))
+                                                                                  mainLibSet,
                                                                                 Dependency
-                                                                                  `PackageName "deepseq"`
+                                                                                  (PackageName
+                                                                                     "deepseq")
                                                                                   (IntersectVersionRanges
                                                                                      (OrLaterVersion
-                                                                                        `mkVersion [1,3]`)
+                                                                                        (mkVersion
+                                                                                           [1, 3]))
                                                                                      (EarlierVersion
-                                                                                        `mkVersion [1,5]`))
-                                                                                  (Set.fromList
-                                                                                     [LMainLibName])],
+                                                                                        (mkVersion
+                                                                                           [1, 5])))
+                                                                                  mainLibSet],
                                                           virtualModules = []},
                                         libExposed = True,
                                         libName = LMainLibName,
@@ -486,19 +519,19 @@ GenericPackageDescription
                                         signatures = []}},
    condSubLibraries = [],
    condTestSuites = [_×_
-                       `UnqualComponentName "doctests"`
+                       (UnqualComponentName "doctests")
                        CondNode
                          {condTreeComponents = [],
                           condTreeConstraints = [Dependency
-                                                   `PackageName "base"`
-                                                   AnyVersion
-                                                   (Set.fromList [LMainLibName]),
+                                                   (PackageName "base")
+                                                   (OrLaterVersion (mkVersion [0]))
+                                                   mainLibSet,
                                                  Dependency
-                                                   `PackageName "doctest"`
+                                                   (PackageName "doctest")
                                                    (IntersectVersionRanges
-                                                      (OrLaterVersion `mkVersion [0,13]`)
-                                                      (EarlierVersion `mkVersion [0,14]`))
-                                                   (Set.fromList [LMainLibName])],
+                                                      (OrLaterVersion (mkVersion [0, 13]))
+                                                      (EarlierVersion (mkVersion [0, 14])))
+                                                   mainLibSet],
                           condTreeData = TestSuite
                                            {testBuildInfo = BuildInfo
                                                               {asmOptions = [],
@@ -550,37 +583,43 @@ GenericPackageDescription
                                                                staticOptions = PerCompilerFlavor
                                                                                  [] [],
                                                                targetBuildDepends = [Dependency
-                                                                                       `PackageName "base"`
-                                                                                       AnyVersion
-                                                                                       (Set.fromList
-                                                                                          [LMainLibName]),
+                                                                                       (PackageName
+                                                                                          "base")
+                                                                                       (OrLaterVersion
+                                                                                          (mkVersion
+                                                                                             [0]))
+                                                                                       mainLibSet,
                                                                                      Dependency
-                                                                                       `PackageName "doctest"`
+                                                                                       (PackageName
+                                                                                          "doctest")
                                                                                        (IntersectVersionRanges
                                                                                           (OrLaterVersion
-                                                                                             `mkVersion [0,13]`)
+                                                                                             (mkVersion
+                                                                                                [0,
+                                                                                                 13]))
                                                                                           (EarlierVersion
-                                                                                             `mkVersion [0,14]`))
-                                                                                       (Set.fromList
-                                                                                          [LMainLibName])],
+                                                                                             (mkVersion
+                                                                                                [0,
+                                                                                                 14])))
+                                                                                       mainLibSet],
                                                                virtualModules = []},
                                             testInterface = TestSuiteExeV10
-                                                              `mkVersion [1,0]` "doctests.hs",
-                                            testName = `UnqualComponentName ""`}},
+                                                              (mkVersion [1, 0]) "doctests.hs",
+                                            testName = UnqualComponentName ""}},
                      _×_
-                       `UnqualComponentName "generics-sop-examples"`
+                       (UnqualComponentName "generics-sop-examples")
                        CondNode
                          {condTreeComponents = [],
                           condTreeConstraints = [Dependency
-                                                   `PackageName "base"`
+                                                   (PackageName "base")
                                                    (IntersectVersionRanges
-                                                      (OrLaterVersion `mkVersion [4,6]`)
-                                                      (EarlierVersion `mkVersion [5]`))
-                                                   (Set.fromList [LMainLibName]),
+                                                      (OrLaterVersion (mkVersion [4, 6]))
+                                                      (EarlierVersion (mkVersion [5])))
+                                                   mainLibSet,
                                                  Dependency
-                                                   `PackageName "generics-sop"`
-                                                   AnyVersion
-                                                   (Set.fromList [LMainLibName])],
+                                                   (PackageName "generics-sop")
+                                                   (OrLaterVersion (mkVersion [0]))
+                                                   mainLibSet],
                           condTreeData = TestSuite
                                            {testBuildInfo = BuildInfo
                                                               {asmOptions = [],
@@ -620,7 +659,8 @@ GenericPackageDescription
                                                                            ["-Wall"] [],
                                                                otherExtensions = [],
                                                                otherLanguages = [],
-                                                               otherModules = [`ModuleName ["HTransExample"]`],
+                                                               otherModules = [ModuleName
+                                                                                 "HTransExample"],
                                                                pkgconfigDepends = [],
                                                                profOptions = PerCompilerFlavor
                                                                                [] [],
@@ -629,24 +669,30 @@ GenericPackageDescription
                                                                staticOptions = PerCompilerFlavor
                                                                                  [] [],
                                                                targetBuildDepends = [Dependency
-                                                                                       `PackageName "base"`
+                                                                                       (PackageName
+                                                                                          "base")
                                                                                        (IntersectVersionRanges
                                                                                           (OrLaterVersion
-                                                                                             `mkVersion [4,6]`)
+                                                                                             (mkVersion
+                                                                                                [4,
+                                                                                                 6]))
                                                                                           (EarlierVersion
-                                                                                             `mkVersion [5]`))
-                                                                                       (Set.fromList
-                                                                                          [LMainLibName]),
+                                                                                             (mkVersion
+                                                                                                [5])))
+                                                                                       mainLibSet,
                                                                                      Dependency
-                                                                                       `PackageName "generics-sop"`
-                                                                                       AnyVersion
-                                                                                       (Set.fromList
-                                                                                          [LMainLibName])],
+                                                                                       (PackageName
+                                                                                          "generics-sop")
+                                                                                       (OrLaterVersion
+                                                                                          (mkVersion
+                                                                                             [0]))
+                                                                                       mainLibSet],
                                                                virtualModules = []},
                                             testInterface = TestSuiteExeV10
-                                                              `mkVersion [1,0]` "Example.hs",
-                                            testName = `UnqualComponentName ""`}}],
+                                                              (mkVersion [1, 0]) "Example.hs",
+                                            testName = UnqualComponentName ""}}],
    genPackageFlags = [],
+   gpdScannedVersion = Nothing,
    packageDescription = PackageDescription
                           {author = "Edsko de Vries <edsko@well-typed.com>, Andres L\246h <andres@well-typed.com>",
                            benchmarks = [],
@@ -655,7 +701,7 @@ GenericPackageDescription
                            category = "Generics",
                            copyright = "",
                            customFieldsPD = [],
-                           dataDir = "",
+                           dataDir = ".",
                            dataFiles = [],
                            description = concat
                                            ["A library to support the definition of generic functions.\n",
@@ -695,28 +741,28 @@ GenericPackageDescription
                            licenseRaw = Right BSD3,
                            maintainer = "andres@well-typed.com",
                            package = PackageIdentifier
-                                       {pkgName = `PackageName "generics-sop"`,
-                                        pkgVersion = `mkVersion [0,3,1,0]`},
+                                       {pkgName = PackageName "generics-sop",
+                                        pkgVersion = mkVersion [0, 3, 1, 0]},
                            pkgUrl = "",
                            setupBuildInfo = Just
                                               SetupBuildInfo
                                                 {defaultSetupDepends = False,
                                                  setupDepends = [Dependency
-                                                                   `PackageName "base"`
-                                                                   AnyVersion
-                                                                   (Set.fromList [LMainLibName]),
+                                                                   (PackageName "base")
+                                                                   (OrLaterVersion (mkVersion [0]))
+                                                                   mainLibSet,
                                                                  Dependency
-                                                                   `PackageName "Cabal"`
-                                                                   AnyVersion
-                                                                   (Set.fromList [LMainLibName]),
+                                                                   (PackageName "Cabal")
+                                                                   (OrLaterVersion (mkVersion [0]))
+                                                                   mainLibSet,
                                                                  Dependency
-                                                                   `PackageName "cabal-doctest"`
+                                                                   (PackageName "cabal-doctest")
                                                                    (IntersectVersionRanges
                                                                       (OrLaterVersion
-                                                                         `mkVersion [1,0,2]`)
+                                                                         (mkVersion [1, 0, 2]))
                                                                       (EarlierVersion
-                                                                         `mkVersion [1,1]`))
-                                                                   (Set.fromList [LMainLibName])]},
+                                                                         (mkVersion [1, 1])))
+                                                                   mainLibSet]},
                            sourceRepos = [SourceRepo
                                             {repoBranch = Nothing,
                                              repoKind = RepoHead,
@@ -725,15 +771,19 @@ GenericPackageDescription
                                              repoModule = Nothing,
                                              repoSubdir = Nothing,
                                              repoTag = Nothing,
-                                             repoType = Just Git}],
-                           specVersionRaw = Right (OrLaterVersion `mkVersion [1,10]`),
+                                             repoType = Just (KnownRepoType Git)}],
+                           specVersion = CabalSpecV1_10,
                            stability = "",
                            subLibraries = [],
                            synopsis = "Generic Programming using True Sums of Products",
                            testSuites = [],
-                           testedWith = [_×_ GHC (ThisVersion `mkVersion [7,8,4]`),
-                                         _×_ GHC (ThisVersion `mkVersion [7,10,3]`),
-                                         _×_ GHC (ThisVersion `mkVersion [8,0,1]`),
-                                         _×_ GHC (ThisVersion `mkVersion [8,0,2]`),
-                                         _×_ GHC (ThisVersion `mkVersion [8,2,1]`),
-                                         _×_ GHC (WildcardVersion `mkVersion [8,3]`)]}}
+                           testedWith = [_×_ GHC (ThisVersion (mkVersion [7, 8, 4])),
+                                         _×_ GHC (ThisVersion (mkVersion [7, 10, 3])),
+                                         _×_ GHC (ThisVersion (mkVersion [8, 0, 1])),
+                                         _×_ GHC (ThisVersion (mkVersion [8, 0, 2])),
+                                         _×_ GHC (ThisVersion (mkVersion [8, 2, 1])),
+                                         _×_
+                                           GHC
+                                           (IntersectVersionRanges
+                                              (OrLaterVersion (mkVersion [8, 3]))
+                                              (EarlierVersion (mkVersion [8, 4])))]}}

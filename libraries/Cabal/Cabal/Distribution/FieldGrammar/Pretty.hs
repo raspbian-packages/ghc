@@ -1,4 +1,5 @@
-{-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE DeriveFunctor         #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 module Distribution.FieldGrammar.Pretty (
     PrettyFieldGrammar,
     prettyFieldGrammar,
@@ -33,7 +34,7 @@ instance Applicative (PrettyFieldGrammar s) where
 prettyFieldGrammar :: CabalSpecVersion -> PrettyFieldGrammar s a -> s -> [PrettyField ()]
 prettyFieldGrammar = flip fieldGrammarPretty
 
-instance FieldGrammar PrettyFieldGrammar where
+instance FieldGrammar Pretty PrettyFieldGrammar where
     blurFieldGrammar f (PrettyFG pp) = PrettyFG (\v -> pp v . aview f)
 
     uniqueFieldAla fn _pack l = PrettyFG $ \_v s ->
@@ -71,6 +72,8 @@ instance FieldGrammar PrettyFieldGrammar where
         pp v s = ppField fn (showFT (aview l s)) where
             showFT | v >= CabalSpecV3_0 = showFreeTextV3
                    | otherwise          = showFreeText
+
+    freeTextFieldDefST = defaultFreeTextFieldDefST
 
     monoidalFieldAla fn _pack l = PrettyFG pp
       where

@@ -2,23 +2,15 @@
 module Distribution.Client.Dependency.Types (
     PreSolver(..),
     Solver(..),
-
     PackagesPreferenceDefault(..),
-
   ) where
 
-import Data.Char
-         ( isAlpha, toLower )
+import Distribution.Client.Compat.Prelude
+import Prelude ()
 
-import qualified Distribution.Deprecated.ReadP as Parse
-         ( pfail, munch1 )
-import Distribution.Deprecated.Text
-         ( Text(..) )
+import Text.PrettyPrint (text)
 
-import Text.PrettyPrint
-         ( text )
-import GHC.Generics (Generic)
-import Distribution.Compat.Binary (Binary(..))
+import qualified Distribution.Compat.CharParsing as P
 
 
 -- | All the solvers that can be selected.
@@ -32,13 +24,18 @@ data Solver = Modular
 instance Binary PreSolver
 instance Binary Solver
 
-instance Text PreSolver where
-  disp AlwaysModular = text "modular"
-  parse = do
-    name <- Parse.munch1 isAlpha
-    case map toLower name of
-      "modular" -> return AlwaysModular
-      _         -> Parse.pfail
+instance Structured PreSolver
+instance Structured Solver
+
+instance Pretty PreSolver where
+    pretty AlwaysModular = text "modular"
+
+instance Parsec PreSolver where
+    parsec = do
+        name <- P.munch1 isAlpha
+        case map toLower name of
+            "modular" -> return AlwaysModular
+            _         -> P.unexpected $ "PreSolver: " ++ name
 
 -- | Global policy for all packages to say if we prefer package versions that
 -- are already installed locally or if we just prefer the latest available.

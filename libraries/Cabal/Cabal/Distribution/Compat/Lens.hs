@@ -50,8 +50,6 @@ module Distribution.Compat.Lens (
 import Prelude()
 import Distribution.Compat.Prelude
 
-import Control.Applicative (Const (..))
-import Data.Functor.Identity (Identity (..))
 import Control.Monad.State.Class (MonadState (..), gets, modify)
 
 import qualified Distribution.Compat.DList as DList

@@ -11,22 +11,27 @@ module Distribution.Solver.Types.Settings
     , OnlyConstrained(..)
     , EnableBackjumping(..)
     , CountConflicts(..)
+    , FineGrainedConflicts(..)
     , SolveExecutables(..)
     ) where
 
-import Distribution.Simple.Setup ( BooleanFlag(..) )
-import Distribution.Compat.Binary (Binary(..))
-import Distribution.Pretty ( Pretty(pretty) )
-import Distribution.Deprecated.Text ( Text(parse) )
-import GHC.Generics (Generic)
+import Distribution.Solver.Compat.Prelude
+import Prelude ()
 
-import qualified Distribution.Deprecated.ReadP as Parse
+import Distribution.Simple.Setup ( BooleanFlag(..) )
+import Distribution.Pretty ( Pretty(pretty) )
+import Distribution.Parsec ( Parsec(parsec) )
+
+import qualified Distribution.Compat.CharParsing as P
 import qualified Text.PrettyPrint as PP
 
 newtype ReorderGoals = ReorderGoals Bool
   deriving (BooleanFlag, Eq, Generic, Show)
 
 newtype CountConflicts = CountConflicts Bool
+  deriving (BooleanFlag, Eq, Generic, Show)
+
+newtype FineGrainedConflicts = FineGrainedConflicts Bool
   deriving (BooleanFlag, Eq, Generic, Show)
 
 newtype MinimizeConflictSet = MinimizeConflictSet Bool
@@ -62,6 +67,7 @@ newtype SolveExecutables = SolveExecutables Bool
 
 instance Binary ReorderGoals
 instance Binary CountConflicts
+instance Binary FineGrainedConflicts
 instance Binary IndependentGoals
 instance Binary MinimizeConflictSet
 instance Binary AvoidReinstalls
@@ -71,13 +77,25 @@ instance Binary AllowBootLibInstalls
 instance Binary OnlyConstrained
 instance Binary SolveExecutables
 
+instance Structured ReorderGoals
+instance Structured CountConflicts
+instance Structured FineGrainedConflicts
+instance Structured IndependentGoals
+instance Structured MinimizeConflictSet
+instance Structured AvoidReinstalls
+instance Structured ShadowPkgs
+instance Structured StrongFlags
+instance Structured AllowBootLibInstalls
+instance Structured OnlyConstrained
+instance Structured SolveExecutables
+
 instance Pretty OnlyConstrained where
-  pretty OnlyConstrainedAll = PP.text "all"
+  pretty OnlyConstrainedAll  = PP.text "all"
   pretty OnlyConstrainedNone = PP.text "none"
 
-instance Text OnlyConstrained where
-  parse = Parse.choice
-    [ Parse.string "all" >> return OnlyConstrainedAll
-    , Parse.string "none" >> return OnlyConstrainedNone
+instance Parsec OnlyConstrained where
+  parsec = P.choice
+    [ P.string "all"  >> return OnlyConstrainedAll
+    , P.string "none" >> return OnlyConstrainedNone
     ]
 

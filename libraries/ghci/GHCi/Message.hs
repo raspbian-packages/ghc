@@ -6,7 +6,7 @@
 -- Remote GHCi message types and serialization.
 --
 -- For details on Remote GHCi, see Note [Remote GHCi] in
--- compiler/ghci/GHCi.hs.
+-- compiler/GHC/Runtime/Interpreter.hs.
 --
 module GHCi.Message
   ( Message(..), Msg(..)
@@ -25,7 +25,7 @@ module GHCi.Message
 import Prelude -- See note [Why do we import Prelude here?]
 import GHCi.RemoteTypes
 import GHCi.FFI
-import GHCi.TH.Binary ()
+import GHCi.TH.Binary () -- For Binary instances
 import GHCi.BreakArray
 
 import GHC.LanguageExtensions
@@ -61,6 +61,7 @@ import System.IO.Error
 data Message a where
   -- | Exit the iserv process
   Shutdown :: Message ()
+  RtsRevertCAFs :: Message ()
 
   -- RTS Linker -------------------------------------------
 
@@ -82,7 +83,7 @@ data Message a where
   -- | Create a set of BCO objects, and return HValueRefs to them
   -- Note: Each ByteString contains a Binary-encoded [ResolvedBCO], not
   -- a ResolvedBCO. The list is to allow us to serialise the ResolvedBCOs
-  -- in parallel. See @createBCOs@ in compiler/ghci/GHCi.hsc.
+  -- in parallel. See @createBCOs@ in compiler/GHC/Runtime/Interpreter.hs.
   CreateBCOs :: [LB.ByteString] -> Message [HValueRef]
 
   -- | Release 'HValueRef's
@@ -103,11 +104,12 @@ data Message a where
 
   -- | Create an info table for a constructor
   MkConInfoTable
-   :: Int     -- ptr words
+   :: Bool    -- TABLES_NEXT_TO_CODE
+   -> Int     -- ptr words
    -> Int     -- non-ptr words
    -> Int     -- constr tag
    -> Int     -- pointer tag
-   -> [Word8] -- constructor desccription
+   -> ByteString -- constructor desccription
    -> Message (RemotePtr StgInfoTable)
 
   -- | Evaluate a statement
@@ -214,7 +216,12 @@ data Message a where
   -- | Evaluate something. This is used to support :force in GHCi.
   Seq
     :: HValueRef
-    -> Message (EvalResult ())
+    -> Message (EvalStatus ())
+
+  -- | Resume forcing a free variable in a breakpoint (#2950)
+  ResumeSeq
+    :: RemoteRef (ResumeContext ())
+    -> Message (EvalStatus ())
 
 deriving instance Show (Message a)
 
@@ -241,6 +248,7 @@ data THMessage a where
   LookupName :: Bool -> String -> THMessage (THResult (Maybe TH.Name))
   Reify :: TH.Name -> THMessage (THResult TH.Info)
   ReifyFixity :: TH.Name -> THMessage (THResult (Maybe TH.Fixity))
+  ReifyType :: TH.Name -> THMessage (THResult TH.Type)
   ReifyInstances :: TH.Name -> [TH.Type] -> THMessage (THResult [TH.Dec])
   ReifyRoles :: TH.Name -> THMessage (THResult [TH.Role])
   ReifyAnnotations :: TH.AnnLookup -> TypeRep
@@ -294,7 +302,9 @@ getTHMessage = do
     18 -> return (THMsg RunTHDone)
     19 -> THMsg <$> AddModFinalizer <$> get
     20 -> THMsg <$> (AddForeignFilePath <$> get <*> get)
-    _  -> THMsg <$> AddCorePlugin <$> get
+    21 -> THMsg <$> AddCorePlugin <$> get
+    22 -> THMsg <$> ReifyType <$> get
+    n -> error ("getTHMessage: unknown message " ++ show n)
 
 putTHMessage :: THMessage a -> Put
 putTHMessage m = case m of
@@ -320,6 +330,7 @@ putTHMessage m = case m of
   AddModFinalizer a           -> putWord8 19 >> put a
   AddForeignFilePath lang a   -> putWord8 20 >> put lang >> put a
   AddCorePlugin a             -> putWord8 21 >> put a
+  ReifyType a                 -> putWord8 22 >> put a
 
 
 data EvalOpts = EvalOpts
@@ -467,7 +478,7 @@ getMessage = do
       15 -> Msg <$> MallocStrings <$> get
       16 -> Msg <$> (PrepFFI <$> get <*> get <*> get)
       17 -> Msg <$> FreeFFI <$> get
-      18 -> Msg <$> (MkConInfoTable <$> get <*> get <*> get <*> get <*> get)
+      18 -> Msg <$> (MkConInfoTable <$> get <*> get <*> get <*> get <*> get <*> get)
       19 -> Msg <$> (EvalStmt <$> get <*> get)
       20 -> Msg <$> (ResumeStmt <$> get <*> get)
       21 -> Msg <$> (AbandonStmt <$> get)
@@ -485,7 +496,10 @@ getMessage = do
       33 -> Msg <$> (AddSptEntry <$> get <*> get)
       34 -> Msg <$> (RunTH <$> get <*> get <*> get <*> get)
       35 -> Msg <$> (GetClosure <$> get)
-      _  -> Msg <$> (Seq <$> get)
+      36 -> Msg <$> (Seq <$> get)
+      37 -> Msg <$> return RtsRevertCAFs
+      38 -> Msg <$> (ResumeSeq <$> get)
+      _  -> error $ "Unknown Message code " ++ (show b)
 
 putMessage :: Message a -> Put
 putMessage m = case m of
@@ -507,7 +521,7 @@ putMessage m = case m of
   MallocStrings bss           -> putWord8 15 >> put bss
   PrepFFI conv args res       -> putWord8 16 >> put conv >> put args >> put res
   FreeFFI p                   -> putWord8 17 >> put p
-  MkConInfoTable p n t pt d   -> putWord8 18 >> put p >> put n >> put t >> put pt >> put d
+  MkConInfoTable tc p n t pt d -> putWord8 18 >> put tc >> put p >> put n >> put t >> put pt >> put d
   EvalStmt opts val           -> putWord8 19 >> put opts >> put val
   ResumeStmt opts val         -> putWord8 20 >> put opts >> put val
   AbandonStmt val             -> putWord8 21 >> put val
@@ -526,6 +540,8 @@ putMessage m = case m of
   RunTH st q loc ty           -> putWord8 34 >> put st >> put q >> put loc >> put ty
   GetClosure a                -> putWord8 35 >> put a
   Seq a                       -> putWord8 36 >> put a
+  RtsRevertCAFs               -> putWord8 37
+  ResumeSeq a                 -> putWord8 38 >> put a
 
 -- -----------------------------------------------------------------------------
 -- Reading/writing messages

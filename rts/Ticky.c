@@ -25,7 +25,7 @@ StgEntCounter *ticky_entry_ctrs = NULL; /* root of list of them */
 /* We want Haskell code compiled with -ticky to be linkable with any
  * version of the RTS, so we have to make sure all the symbols that
  * ticky-compiled code may refer to are defined by every RTS. (#3439)
- * Hence the #ifdef is here, rather than up above.
+ * Hence the #if defined(is) here, rather than up above.
  */
 #if defined(TICKY_TICKY)
 
@@ -353,7 +353,7 @@ printRegisteredCounterInfo (FILE *tf)
     StgEntCounter *p;
 
     if ( ticky_entry_ctrs != NULL ) {
-      fprintf(tf,"\nThe following table is explained by http://ghc.haskell.org/trac/ghc/wiki/Debugging/TickyTicky\nAll allocation numbers are in bytes.\n");
+      fprintf(tf,"\nThe following table is explained by https://gitlab.haskell.org/ghc/ghc/wikis/debugging/ticky-ticky\nAll allocation numbers are in bytes.\n");
       fprintf(tf,"\n**************************************************\n\n");
     }
     fprintf(tf, "%11s%11s%11s  %-23s %s\n",

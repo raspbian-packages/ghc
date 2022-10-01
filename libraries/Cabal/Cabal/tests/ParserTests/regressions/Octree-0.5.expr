@@ -6,21 +6,21 @@ GenericPackageDescription
                    CondNode
                      {condTreeComponents = [],
                       condTreeConstraints = [Dependency
-                                               `PackageName "base"`
+                                               (PackageName "base")
                                                (IntersectVersionRanges
-                                                  (OrLaterVersion `mkVersion [4,0]`)
-                                                  (EarlierVersion `mkVersion [4,7]`))
-                                               (Set.fromList [LMainLibName]),
+                                                  (OrLaterVersion (mkVersion [4, 0]))
+                                                  (EarlierVersion (mkVersion [4, 7])))
+                                               mainLibSet,
                                              Dependency
-                                               `PackageName "AC-Vector"`
-                                               (OrLaterVersion `mkVersion [2,3,0]`)
-                                               (Set.fromList [LMainLibName]),
+                                               (PackageName "AC-Vector")
+                                               (OrLaterVersion (mkVersion [2, 3, 0]))
+                                               mainLibSet,
                                              Dependency
-                                               `PackageName "QuickCheck"`
-                                               (OrLaterVersion `mkVersion [2,4,0]`)
-                                               (Set.fromList [LMainLibName])],
+                                               (PackageName "QuickCheck")
+                                               (OrLaterVersion (mkVersion [2, 4, 0]))
+                                               mainLibSet],
                       condTreeData = Library
-                                       {exposedModules = [`ModuleName ["Data","Octree"]`],
+                                       {exposedModules = [ModuleName "Data.Octree"],
                                         libBuildInfo = BuildInfo
                                                          {asmOptions = [],
                                                           asmSources = [],
@@ -59,32 +59,37 @@ GenericPackageDescription
                                                           options = PerCompilerFlavor [] [],
                                                           otherExtensions = [],
                                                           otherLanguages = [],
-                                                          otherModules = [`ModuleName ["Data","Octree","Internal"]`],
+                                                          otherModules = [ModuleName
+                                                                            "Data.Octree.Internal"],
                                                           pkgconfigDepends = [],
                                                           profOptions = PerCompilerFlavor [] [],
                                                           sharedOptions = PerCompilerFlavor [] [],
                                                           staticOptions = PerCompilerFlavor [] [],
                                                           targetBuildDepends = [Dependency
-                                                                                  `PackageName "base"`
+                                                                                  (PackageName
+                                                                                     "base")
                                                                                   (IntersectVersionRanges
                                                                                      (OrLaterVersion
-                                                                                        `mkVersion [4,0]`)
+                                                                                        (mkVersion
+                                                                                           [4, 0]))
                                                                                      (EarlierVersion
-                                                                                        `mkVersion [4,7]`))
-                                                                                  (Set.fromList
-                                                                                     [LMainLibName]),
+                                                                                        (mkVersion
+                                                                                           [4, 7])))
+                                                                                  mainLibSet,
                                                                                 Dependency
-                                                                                  `PackageName "AC-Vector"`
+                                                                                  (PackageName
+                                                                                     "AC-Vector")
                                                                                   (OrLaterVersion
-                                                                                     `mkVersion [2,3,0]`)
-                                                                                  (Set.fromList
-                                                                                     [LMainLibName]),
+                                                                                     (mkVersion
+                                                                                        [2, 3, 0]))
+                                                                                  mainLibSet,
                                                                                 Dependency
-                                                                                  `PackageName "QuickCheck"`
+                                                                                  (PackageName
+                                                                                     "QuickCheck")
                                                                                   (OrLaterVersion
-                                                                                     `mkVersion [2,4,0]`)
-                                                                                  (Set.fromList
-                                                                                     [LMainLibName])],
+                                                                                     (mkVersion
+                                                                                        [2, 4, 0]))
+                                                                                  mainLibSet],
                                                           virtualModules = []},
                                         libExposed = True,
                                         libName = LMainLibName,
@@ -93,23 +98,23 @@ GenericPackageDescription
                                         signatures = []}},
    condSubLibraries = [],
    condTestSuites = [_×_
-                       `UnqualComponentName "test_Octree"`
+                       (UnqualComponentName "test_Octree")
                        CondNode
                          {condTreeComponents = [],
                           condTreeConstraints = [Dependency
-                                                   `PackageName "base"`
+                                                   (PackageName "base")
                                                    (IntersectVersionRanges
-                                                      (OrLaterVersion `mkVersion [4,0]`)
-                                                      (EarlierVersion `mkVersion [4,7]`))
-                                                   (Set.fromList [LMainLibName]),
+                                                      (OrLaterVersion (mkVersion [4, 0]))
+                                                      (EarlierVersion (mkVersion [4, 7])))
+                                                   mainLibSet,
                                                  Dependency
-                                                   `PackageName "AC-Vector"`
-                                                   (OrLaterVersion `mkVersion [2,3,0]`)
-                                                   (Set.fromList [LMainLibName]),
+                                                   (PackageName "AC-Vector")
+                                                   (OrLaterVersion (mkVersion [2, 3, 0]))
+                                                   mainLibSet,
                                                  Dependency
-                                                   `PackageName "QuickCheck"`
-                                                   (OrLaterVersion `mkVersion [2,4,0]`)
-                                                   (Set.fromList [LMainLibName])],
+                                                   (PackageName "QuickCheck")
+                                                   (OrLaterVersion (mkVersion [2, 4, 0]))
+                                                   mainLibSet],
                           condTreeData = TestSuite
                                            {testBuildInfo = BuildInfo
                                                               {asmOptions = [],
@@ -157,53 +162,63 @@ GenericPackageDescription
                                                                staticOptions = PerCompilerFlavor
                                                                                  [] [],
                                                                targetBuildDepends = [Dependency
-                                                                                       `PackageName "base"`
+                                                                                       (PackageName
+                                                                                          "base")
                                                                                        (IntersectVersionRanges
                                                                                           (OrLaterVersion
-                                                                                             `mkVersion [4,0]`)
+                                                                                             (mkVersion
+                                                                                                [4,
+                                                                                                 0]))
                                                                                           (EarlierVersion
-                                                                                             `mkVersion [4,7]`))
-                                                                                       (Set.fromList
-                                                                                          [LMainLibName]),
+                                                                                             (mkVersion
+                                                                                                [4,
+                                                                                                 7])))
+                                                                                       mainLibSet,
                                                                                      Dependency
-                                                                                       `PackageName "AC-Vector"`
+                                                                                       (PackageName
+                                                                                          "AC-Vector")
                                                                                        (OrLaterVersion
-                                                                                          `mkVersion [2,3,0]`)
-                                                                                       (Set.fromList
-                                                                                          [LMainLibName]),
+                                                                                          (mkVersion
+                                                                                             [2,
+                                                                                              3,
+                                                                                              0]))
+                                                                                       mainLibSet,
                                                                                      Dependency
-                                                                                       `PackageName "QuickCheck"`
+                                                                                       (PackageName
+                                                                                          "QuickCheck")
                                                                                        (OrLaterVersion
-                                                                                          `mkVersion [2,4,0]`)
-                                                                                       (Set.fromList
-                                                                                          [LMainLibName])],
+                                                                                          (mkVersion
+                                                                                             [2,
+                                                                                              4,
+                                                                                              0]))
+                                                                                       mainLibSet],
                                                                virtualModules = []},
                                             testInterface = TestSuiteExeV10
-                                                              `mkVersion [1,0]`
+                                                              (mkVersion [1, 0])
                                                               "tests/test_Octree.hs",
-                                            testName = `UnqualComponentName ""`}},
+                                            testName = UnqualComponentName ""}},
                      _×_
-                       `UnqualComponentName "readme"`
+                       (UnqualComponentName "readme")
                        CondNode
                          {condTreeComponents = [],
                           condTreeConstraints = [Dependency
-                                                   `PackageName "base"`
+                                                   (PackageName "base")
                                                    (IntersectVersionRanges
-                                                      (OrLaterVersion `mkVersion [4,0]`)
-                                                      (EarlierVersion `mkVersion [4,7]`))
-                                                   (Set.fromList [LMainLibName]),
+                                                      (OrLaterVersion (mkVersion [4, 0]))
+                                                      (EarlierVersion (mkVersion [4, 7])))
+                                                   mainLibSet,
                                                  Dependency
-                                                   `PackageName "AC-Vector"`
-                                                   (OrLaterVersion `mkVersion [2,3,0]`)
-                                                   (Set.fromList [LMainLibName]),
+                                                   (PackageName "AC-Vector")
+                                                   (OrLaterVersion (mkVersion [2, 3, 0]))
+                                                   mainLibSet,
                                                  Dependency
-                                                   `PackageName "QuickCheck"`
-                                                   (OrLaterVersion `mkVersion [2,4,0]`)
-                                                   (Set.fromList [LMainLibName]),
+                                                   (PackageName "QuickCheck")
+                                                   (OrLaterVersion (mkVersion [2, 4, 0]))
+                                                   mainLibSet,
                                                  Dependency
-                                                   `PackageName "markdown-unlit"`
-                                                   AnyVersion
-                                                   (Set.fromList [LMainLibName])],
+                                                   (PackageName "markdown-unlit")
+                                                   (OrLaterVersion (mkVersion [0]))
+                                                   mainLibSet],
                           condTreeData = TestSuite
                                            {testBuildInfo = BuildInfo
                                                               {asmOptions = [],
@@ -254,36 +269,49 @@ GenericPackageDescription
                                                                staticOptions = PerCompilerFlavor
                                                                                  [] [],
                                                                targetBuildDepends = [Dependency
-                                                                                       `PackageName "base"`
+                                                                                       (PackageName
+                                                                                          "base")
                                                                                        (IntersectVersionRanges
                                                                                           (OrLaterVersion
-                                                                                             `mkVersion [4,0]`)
+                                                                                             (mkVersion
+                                                                                                [4,
+                                                                                                 0]))
                                                                                           (EarlierVersion
-                                                                                             `mkVersion [4,7]`))
-                                                                                       (Set.fromList
-                                                                                          [LMainLibName]),
+                                                                                             (mkVersion
+                                                                                                [4,
+                                                                                                 7])))
+                                                                                       mainLibSet,
                                                                                      Dependency
-                                                                                       `PackageName "AC-Vector"`
+                                                                                       (PackageName
+                                                                                          "AC-Vector")
                                                                                        (OrLaterVersion
-                                                                                          `mkVersion [2,3,0]`)
-                                                                                       (Set.fromList
-                                                                                          [LMainLibName]),
+                                                                                          (mkVersion
+                                                                                             [2,
+                                                                                              3,
+                                                                                              0]))
+                                                                                       mainLibSet,
                                                                                      Dependency
-                                                                                       `PackageName "QuickCheck"`
+                                                                                       (PackageName
+                                                                                          "QuickCheck")
                                                                                        (OrLaterVersion
-                                                                                          `mkVersion [2,4,0]`)
-                                                                                       (Set.fromList
-                                                                                          [LMainLibName]),
+                                                                                          (mkVersion
+                                                                                             [2,
+                                                                                              4,
+                                                                                              0]))
+                                                                                       mainLibSet,
                                                                                      Dependency
-                                                                                       `PackageName "markdown-unlit"`
-                                                                                       AnyVersion
-                                                                                       (Set.fromList
-                                                                                          [LMainLibName])],
+                                                                                       (PackageName
+                                                                                          "markdown-unlit")
+                                                                                       (OrLaterVersion
+                                                                                          (mkVersion
+                                                                                             [0]))
+                                                                                       mainLibSet],
                                                                virtualModules = []},
                                             testInterface = TestSuiteExeV10
-                                                              `mkVersion [1,0]` "README.lhs",
-                                            testName = `UnqualComponentName ""`}}],
+                                                              (mkVersion [1, 0]) "README.lhs",
+                                            testName = UnqualComponentName ""}}],
    genPackageFlags = [],
+   gpdScannedVersion = Nothing,
    packageDescription = PackageDescription
                           {author = "Michal J. Gajda",
                            benchmarks = [],
@@ -292,7 +320,7 @@ GenericPackageDescription
                            category = "Data",
                            copyright = "Copyright by Michal J. Gajda '2012",
                            customFieldsPD = [],
-                           dataDir = "",
+                           dataDir = ".",
                            dataFiles = [],
                            description = "Octree data structure is relatively shallow data structure for space partitioning.",
                            executables = [],
@@ -306,8 +334,8 @@ GenericPackageDescription
                            licenseRaw = Right BSD3,
                            maintainer = "mjgajda@googlemail.com",
                            package = PackageIdentifier
-                                       {pkgName = `PackageName "Octree"`,
-                                        pkgVersion = `mkVersion [0,5]`},
+                                       {pkgName = PackageName "Octree",
+                                        pkgVersion = mkVersion [0, 5]},
                            pkgUrl = "http://hackage.haskell.org/package/octree",
                            setupBuildInfo = Nothing,
                            sourceRepos = [SourceRepo
@@ -317,13 +345,13 @@ GenericPackageDescription
                                              repoModule = Nothing,
                                              repoSubdir = Nothing,
                                              repoTag = Nothing,
-                                             repoType = Just Git}],
-                           specVersionRaw = Right (OrLaterVersion `mkVersion [1,8]`),
+                                             repoType = Just (KnownRepoType Git)}],
+                           specVersion = CabalSpecV1_8,
                            stability = "beta",
                            subLibraries = [],
                            synopsis = "Simple unbalanced Octree for storing data about 3D points",
                            testSuites = [],
-                           testedWith = [_×_ GHC (ThisVersion `mkVersion [7,0,4]`),
-                                         _×_ GHC (ThisVersion `mkVersion [7,4,1]`),
-                                         _×_ GHC (ThisVersion `mkVersion [7,4,2]`),
-                                         _×_ GHC (ThisVersion `mkVersion [7,6,0]`)]}}
+                           testedWith = [_×_ GHC (ThisVersion (mkVersion [7, 0, 4])),
+                                         _×_ GHC (ThisVersion (mkVersion [7, 4, 1])),
+                                         _×_ GHC (ThisVersion (mkVersion [7, 4, 2])),
+                                         _×_ GHC (ThisVersion (mkVersion [7, 6, 0]))]}}

@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric      #-}
+{-# LANGUAGE OverloadedStrings  #-}
 
 module Distribution.Types.LibraryVisibility(
     LibraryVisibility(..),
@@ -32,12 +33,14 @@ instance Pretty LibraryVisibility where
 instance Parsec LibraryVisibility where
   parsec = do
     name <- P.munch1 isAlpha
+    parsecWarning PWTExperimental "visibility is experimental feature (issue #5660)"
     case name of
       "public"  -> return LibraryVisibilityPublic
       "private" -> return LibraryVisibilityPrivate
       _         -> fail $ "Unknown visibility: " ++ name
 
 instance Binary LibraryVisibility
+instance Structured LibraryVisibility
 instance NFData LibraryVisibility where rnf = genericRnf
 
 instance Semigroup LibraryVisibility where

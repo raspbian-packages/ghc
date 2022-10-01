@@ -79,7 +79,7 @@ stgMallocBytes (size_t n, char *msg)
       rtsConfig.mallocFailHook((W_) n, msg);
       stg_exit(EXIT_INTERNAL_ERROR);
     }
-    IF_DEBUG(sanity, memset(space, 0xbb, n));
+    IF_DEBUG(zero_on_gc, memset(space, 0xbb, n));
     return space;
 }
 
@@ -97,13 +97,13 @@ stgReallocBytes (void *p, size_t n, char *msg)
 }
 
 void *
-stgCallocBytes (size_t n, size_t m, char *msg)
+stgCallocBytes (size_t count, size_t size, char *msg)
 {
     void *space;
 
-    if ((space = calloc(n, m)) == NULL) {
+    if ((space = calloc(count, size)) == NULL) {
       /* don't fflush(stdout); WORKAROUND bug in Linux glibc */
-      rtsConfig.mallocFailHook((W_) n*m, msg);
+      rtsConfig.mallocFailHook((W_) count*size, msg);
       stg_exit(EXIT_INTERNAL_ERROR);
     }
     return space;
@@ -150,6 +150,31 @@ reportHeapOverflow(void)
     /* don't fflush(stdout); WORKAROUND bug in Linux glibc */
     rtsConfig.outOfHeapHook(0/*unknown request size*/,
                             (W_)RtsFlags.GcFlags.maxHeapSize * BLOCK_SIZE);
+}
+
+/* -----------------------------------------------------------------------------
+   Sleep for the given period of time.
+   -------------------------------------------------------------------------- */
+
+/* Returns -1 on failure but handles EINTR internally. On Windows this will
+ * only have millisecond precision. */
+int rtsSleep(Time t)
+{
+#if defined(_WIN32)
+    // N.B. we can't use nanosleep on Windows as it would incur a pthreads
+    // dependency. See #18272.
+    Sleep(TimeToMS(t));
+    return 0;
+#else
+    struct timespec req;
+    req.tv_sec = TimeToSeconds(t);
+    req.tv_nsec = TimeToNS(t - req.tv_sec * TIME_RESOLUTION);
+    int ret;
+    do {
+        ret = nanosleep(&req, &req);
+    } while (ret == -1 && errno == EINTR);
+    return ret;
+#endif /* _WIN32 */
 }
 
 /* -----------------------------------------------------------------------------
@@ -304,9 +329,14 @@ void printRtsInfo(const RtsConfig rts_config) {
     mkRtsInfoPair("Target OS",               TargetOS);
     mkRtsInfoPair("Target vendor",           TargetVendor);
     mkRtsInfoPair("Word size",               TOSTRING(WORD_SIZE_IN_BITS));
+    // TODO(@Ericson2314) This is a joint property of the RTS and generated
+    // code. The compiler will soon be multi-target so it doesn't make sense to
+    // say the target is <ABI adj>, unless we are talking about the host
+    // platform of the compiler / ABI used by a compiler plugin. This is *not*
+    // that, so I think a rename is in order to avoid confusion.
     mkRtsInfoPair("Compiler unregisterised", GhcUnregisterised);
-    mkRtsInfoPair("Tables next to code",     GhcEnableTablesNextToCode);
-    mkRtsInfoPair("Flag -with-rtsopts",      /* See Trac #15261 */
+    mkRtsInfoPair("Tables next to code",     TablesNextToCode);
+    mkRtsInfoPair("Flag -with-rtsopts",      /* See #15261 */
         rts_config.rts_opts != NULL ? rts_config.rts_opts : "");
     printf(" ]\n");
 }

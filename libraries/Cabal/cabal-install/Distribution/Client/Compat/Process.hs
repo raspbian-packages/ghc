@@ -16,6 +16,8 @@ module Distribution.Client.Compat.Process (
   readProcessWithExitCode
 ) where
 
+import Prelude (FilePath, IO, String, return, (||))
+
 import           Control.Exception (catch, throw)
 import           System.Exit       (ExitCode (ExitFailure))
 import           System.IO.Error   (isDoesNotExistError, isPermissionError)
@@ -35,6 +37,9 @@ import qualified System.Process    as P
 --   exception.  This variant catches \"does not exist\" and
 --   \"permission denied\" exceptions and turns them into
 --   @ExitFailure@s.
+--
+-- TODO: this doesn't use 'Distrubution.Compat.Process'.
+--
 readProcessWithExitCode :: FilePath -> [String] -> String -> IO (ExitCode, String, String)
 readProcessWithExitCode cmd args input =
   P.readProcessWithExitCode cmd args input

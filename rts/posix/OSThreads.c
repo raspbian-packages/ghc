@@ -9,14 +9,23 @@
 
 #include "PosixSource.h"
 
+/* We've defined _POSIX_SOURCE via "PosixSource.h", and yet still use
+   some non-POSIX features.  With _POSIX_SOURCE defined, visibility of
+   non-POSIX extension prototypes requires _DARWIN_C_SOURCE on Mac OS X and
+   __BSD_VISIBLE on FreeBSD and DragonflyBSD.  Otherwise, for example, code
+   using pthread_setname_np(3) and variants will not compile.  We must
+   therefore define the additional macros that expose non-POSIX APIs early,
+   before any of the relevant system headers are included via "Rts.h".
+
+   An alternative approach could be to write portable wrappers or stubs for all
+   the non-posix functions in a C-module that does not include "PosixSource.h",
+   and then use only POSIX features and the portable wrapper functions in all
+   other C-modules. */
+#include "ghcconfig.h"
 #if defined(freebsd_HOST_OS) || defined(dragonfly_HOST_OS)
-/* Inclusion of system headers usually requires __BSD_VISIBLE on FreeBSD and
- * DragonflyBSD, because of some specific types, like u_char, u_int, etc. */
 #define __BSD_VISIBLE   1
 #endif
 #if defined(darwin_HOST_OS)
-/* Inclusion of system headers usually requires _DARWIN_C_SOURCE on Mac OS X
- * because of some specific types like u_char, u_int, etc. */
 #define _DARWIN_C_SOURCE 1
 #endif
 
@@ -30,7 +39,7 @@
 
 #if defined(HAVE_PTHREAD_H)
 #include <pthread.h>
-#if defined(freebsd_HOST_OS)
+#if defined(HAVE_PTHREAD_NP_H)
 #include <pthread_np.h>
 #endif
 #endif
@@ -137,8 +146,12 @@ createOSThread (OSThreadId* pId, char *name STG_UNUSED,
   int result = pthread_create(pId, NULL, startProc, param);
   if (!result) {
     pthread_detach(*pId);
-#if defined(HAVE_PTHREAD_SETNAME_NP)
+#if defined(HAVE_PTHREAD_SET_NAME_NP)
+    pthread_set_name_np(*pId, name);
+#elif defined(HAVE_PTHREAD_SETNAME_NP)
     pthread_setname_np(*pId, name);
+#elif defined(HAVE_PTHREAD_SETNAME_NP_DARWIN)
+    pthread_setname_np(name);
 #endif
   }
   return result;
@@ -240,29 +253,55 @@ forkOS_createThread ( HsStablePtr entry )
 
 void freeThreadingResources (void) { /* nothing */ }
 
+static uint32_t nproc_cache = 0;
+
+// Get the number of logical CPU cores available to us. Note that this is
+// different from the number of physical cores (see #14781).
 uint32_t
 getNumberOfProcessors (void)
 {
-    static uint32_t nproc = 0;
-
+    uint32_t nproc = RELAXED_LOAD(&nproc_cache);
     if (nproc == 0) {
-#if defined(HAVE_SYSCONF) && defined(_SC_NPROCESSORS_ONLN)
-        nproc = sysconf(_SC_NPROCESSORS_ONLN);
-#elif defined(HAVE_SYSCONF) && defined(_SC_NPROCESSORS_CONF)
-        nproc = sysconf(_SC_NPROCESSORS_CONF);
-#elif defined(darwin_HOST_OS)
+#if defined(HAVE_SCHED_GETAFFINITY)
+        cpu_set_t mask;
+        CPU_ZERO(&mask);
+        if (sched_getaffinity(0, sizeof(mask), &mask) == 0) {
+            for (int i = 0; i < CPU_SETSIZE; i++) {
+                if (CPU_ISSET(i, &mask))
+                    nproc++;
+            }
+            return nproc;
+        }
+#endif
+
+#if defined(darwin_HOST_OS)
         size_t size = sizeof(uint32_t);
-        if(sysctlbyname("hw.logicalcpu",&nproc,&size,NULL,0) != 0) {
+        if (sysctlbyname("machdep.cpu.thread_count",&nproc,&size,NULL,0) != 0) {
+            if (sysctlbyname("hw.logicalcpu",&nproc,&size,NULL,0) != 0) {
+                if (sysctlbyname("hw.ncpu",&nproc,&size,NULL,0) != 0)
+                    nproc = 1;
+            }
+        }
+#elif defined(freebsd_HOST_OS)
+        cpuset_t mask;
+        CPU_ZERO(&mask);
+        if(cpuset_getaffinity(CPU_LEVEL_CPUSET, CPU_WHICH_PID, -1, sizeof(mask), &mask) == 0) {
+            return CPU_COUNT(&mask);
+        } else {
+            size_t size = sizeof(uint32_t);
             if(sysctlbyname("hw.ncpu",&nproc,&size,NULL,0) != 0)
                 nproc = 1;
         }
-#elif defined(freebsd_HOST_OS)
-        size_t size = sizeof(uint32_t);
-        if(sysctlbyname("hw.ncpu",&nproc,&size,NULL,0) != 0)
-            nproc = 1;
+#elif defined(HAVE_SYSCONF) && defined(_SC_NPROCESSORS_ONLN)
+        // N.B. This is the number of physical processors.
+        nproc = sysconf(_SC_NPROCESSORS_ONLN);
+#elif defined(HAVE_SYSCONF) && defined(_SC_NPROCESSORS_CONF)
+        // N.B. This is the number of physical processors.
+        nproc = sysconf(_SC_NPROCESSORS_CONF);
 #else
         nproc = 1;
 #endif
+        RELAXED_STORE(&nproc_cache, nproc);
     }
 
     return nproc;
@@ -370,6 +409,15 @@ void
 interruptOSThread (OSThreadId id)
 {
     pthread_kill(id, SIGPIPE);
+}
+
+void
+joinOSThread (OSThreadId id)
+{
+    int ret = pthread_join(id, NULL);
+    if (ret != 0) {
+        sysErrorBelch("joinOSThread: error %d", ret);
+    }
 }
 
 KernelThreadId kernelThreadId (void)

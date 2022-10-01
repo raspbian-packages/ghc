@@ -5,8 +5,8 @@
 # This file is part of the GHC build system.
 #
 # To understand how the build system works and how to modify it, see
-#      http://ghc.haskell.org/trac/ghc/wiki/Building/Architecture
-#      http://ghc.haskell.org/trac/ghc/wiki/Building/Modifying
+#      https://gitlab.haskell.org/ghc/ghc/wikis/building/architecture
+#      https://gitlab.haskell.org/ghc/ghc/wikis/building/modifying
 #
 # -----------------------------------------------------------------------------
 
@@ -178,7 +178,7 @@ endif
 
 $$(foreach dir,$$($1_$2_HS_SRC_DIRS),\
   $$(eval $$(call hs-suffix-rules-srcdir,$1,$2,$$(dir))))
-$(call hs-suffix-way-rules,$1,$2,$$($1_$2_PROGRAM_WAY))
+$(call hs-suffix-way-rules,$1,$2,$$($1_$2_PROGRAM_WAY),$3)
 
 $(call c-objs,$1,$2,$$($1_$2_PROGRAM_WAY))
 $(call hs-objs,$1,$2,$$($1_$2_PROGRAM_WAY))
@@ -200,7 +200,7 @@ $1/$2/build/tmp/$$($1_$2_PROG) $1/$2/build/tmp/$$($1_$2_PROG).dll : \
     $$(foreach dep,$$($1_$2_TRANSITIVE_DEP_COMPONENT_IDS),\
         $$$$($$(dep)_dist-$(if $(filter 0,$3),boot,install)_PROGRAM_DEP_LIB))
 # Workaround: We use TRANSITIVE_DEP_COMPONENT_IDS here as a workaround for
-# Trac #12078.
+# #12078.
 
 $1_$2_PROG_NEEDS_C_WRAPPER = NO
 $1_$2_PROG_INPLACE = $$($1_$2_PROG)
@@ -230,7 +230,7 @@ endif
 
 $1/$2/build/tmp/$$($1_$2_PROG)-inplace-wrapper.c: driver/utils/dynwrapper.c | $$$$(dir $$$$@)/.
 	$$(call removeFiles,$$@)
-	echo '#include <Windows.h>' >> $$@
+	echo '#include <windows.h>' >> $$@
 	echo '#include "Rts.h"' >> $$@
 	echo 'LPTSTR path_dirs[] = {' >> $$@
 	$$(foreach d,$$($1_$2_DEP_LIB_REL_DIRS),$$(call make-command,echo '    TEXT("/../../$$d")$$(comma)' >> $$@))
@@ -243,7 +243,7 @@ $1/$2/build/tmp/$$($1_$2_PROG)-inplace-wrapper.c: driver/utils/dynwrapper.c | $$
 
 $1/$2/build/tmp/$$($1_$2_PROG)-wrapper.c: driver/utils/dynwrapper.c | $$$$(dir $$$$@)/.
 	$$(call removeFiles,$$@)
-	echo '#include <Windows.h>' >> $$@
+	echo '#include <windows.h>' >> $$@
 	echo '#include "Rts.h"' >> $$@
 	echo 'LPTSTR path_dirs[] = {' >> $$@
 	$$(foreach p,$$($1_$2_TRANSITIVE_DEP_COMPONENT_IDS),$$(call make-command,echo '    TEXT("/../lib/$$p")$$(comma)' >> $$@))

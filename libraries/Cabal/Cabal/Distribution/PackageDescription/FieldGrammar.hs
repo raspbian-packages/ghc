@@ -1,3 +1,4 @@
+{-# LANGUAGE ConstraintKinds   #-}
 {-# LANGUAGE OverloadedStrings #-}
 -- | 'GenericPackageDescription' Field descriptions
 module Distribution.PackageDescription.FieldGrammar (
@@ -24,6 +25,14 @@ module Distribution.PackageDescription.FieldGrammar (
     benchmarkFieldGrammar,
     validateBenchmark,
     unvalidateBenchmark,
+    -- * Field grammars
+    formatDependencyList,
+    formatExposedModules,
+    formatExtraSourceFiles,
+    formatHsSourceDirs,
+    formatMixinList,
+    formatOtherExtensions,
+    formatOtherModules,
     -- ** Lenses
     benchmarkStanzaBenchmarkType,
     benchmarkStanzaMainIs,
@@ -39,26 +48,24 @@ module Distribution.PackageDescription.FieldGrammar (
     buildInfoFieldGrammar,
     ) where
 
+
 import Distribution.Compat.Lens
 import Distribution.Compat.Prelude
+import Language.Haskell.Extension
 import Prelude ()
 
 import Distribution.CabalSpecVersion
 import Distribution.Compiler                  (CompilerFlavor (..), PerCompilerFlavor (..))
 import Distribution.FieldGrammar
+import Distribution.Fields
 import Distribution.ModuleName                (ModuleName)
 import Distribution.Package
 import Distribution.PackageDescription
 import Distribution.Parsec
-import Distribution.Parsec.Newtypes
-import Distribution.Fields
 import Distribution.Pretty                    (prettyShow)
-import Distribution.Types.ExecutableScope
-import Distribution.Types.ForeignLib
-import Distribution.Types.ForeignLibType
-import Distribution.Types.LibraryVisibility
-import Distribution.Types.UnqualComponentName
-import Distribution.Version                   (anyVersion)
+import Distribution.Types.ModuleReexport
+import Distribution.Types.Mixin               (Mixin)
+import Distribution.Version                   (Version, VersionRange)
 
 import qualified Distribution.SPDX as SPDX
 
@@ -69,25 +76,35 @@ import qualified Distribution.Types.Lens as L
 -------------------------------------------------------------------------------
 
 packageDescriptionFieldGrammar
-    :: (FieldGrammar g, Applicative (g PackageDescription), Applicative (g PackageIdentifier))
+    :: ( FieldGrammar c g, Applicative (g PackageDescription), Applicative (g PackageIdentifier)
+       , c (Identity BuildType)
+       , c (Identity PackageName)
+       , c (Identity Version)
+       , c (List FSep FilePathNT String)
+       , c (List FSep TestedWith (CompilerFlavor, VersionRange))
+       , c (List VCat FilePathNT String)
+       , c FilePathNT
+       , c SpecLicense
+       , c SpecVersion
+       )
     => g PackageDescription PackageDescription
 packageDescriptionFieldGrammar = PackageDescription
-    <$> optionalFieldDefAla "cabal-version" SpecVersion                L.specVersionRaw (Right anyVersion)
+    <$> optionalFieldDefAla "cabal-version" SpecVersion                L.specVersion CabalSpecV1_0
     <*> blurFieldGrammar L.package packageIdentifierGrammar
     <*> optionalFieldDefAla "license"       SpecLicense                L.licenseRaw (Left SPDX.NONE)
     <*> licenseFilesGrammar
-    <*> freeTextFieldDef    "copyright"                                L.copyright
-    <*> freeTextFieldDef    "maintainer"                               L.maintainer
-    <*> freeTextFieldDef    "author"                                   L.author
-    <*> freeTextFieldDef    "stability"                                L.stability
+    <*> freeTextFieldDefST  "copyright"                                L.copyright
+    <*> freeTextFieldDefST  "maintainer"                               L.maintainer
+    <*> freeTextFieldDefST  "author"                                   L.author
+    <*> freeTextFieldDefST  "stability"                                L.stability
     <*> monoidalFieldAla    "tested-with"   (alaList' FSep TestedWith) L.testedWith
-    <*> freeTextFieldDef    "homepage"                                 L.homepage
-    <*> freeTextFieldDef    "package-url"                              L.pkgUrl
-    <*> freeTextFieldDef    "bug-reports"                              L.bugReports
+    <*> freeTextFieldDefST  "homepage"                                 L.homepage
+    <*> freeTextFieldDefST  "package-url"                              L.pkgUrl
+    <*> freeTextFieldDefST   "bug-reports"                              L.bugReports
     <*> pure [] -- source-repos are stanza
-    <*> freeTextFieldDef    "synopsis"                                 L.synopsis
-    <*> freeTextFieldDef    "description"                              L.description
-    <*> freeTextFieldDef    "category"                                 L.category
+    <*> freeTextFieldDefST  "synopsis"                                 L.synopsis
+    <*> freeTextFieldDefST  "description"                              L.description
+    <*> freeTextFieldDefST  "category"                                 L.category
     <*> prefixedFields      "x-"                                       L.customFieldsPD
     <*> optionalField       "build-type"                               L.buildTypeRaw
     <*> pure Nothing -- custom-setup
@@ -100,8 +117,8 @@ packageDescriptionFieldGrammar = PackageDescription
     <*> pure []       -- benchmarks
     --  * Files
     <*> monoidalFieldAla    "data-files"         (alaList' VCat FilePathNT) L.dataFiles
-    <*> optionalFieldDefAla "data-dir"           FilePathNT                 L.dataDir ""
-    <*> monoidalFieldAla    "extra-source-files" (alaList' VCat FilePathNT) L.extraSrcFiles
+    <*> optionalFieldDefAla "data-dir"           FilePathNT                 L.dataDir "."
+    <*> monoidalFieldAla    "extra-source-files" formatExtraSourceFiles     L.extraSrcFiles
     <*> monoidalFieldAla    "extra-tmp-files"    (alaList' VCat FilePathNT) L.extraTmpFiles
     <*> monoidalFieldAla    "extra-doc-files"    (alaList' VCat FilePathNT) L.extraDocFiles
   where
@@ -122,11 +139,28 @@ packageDescriptionFieldGrammar = PackageDescription
 -------------------------------------------------------------------------------
 
 libraryFieldGrammar
-    :: (FieldGrammar g, Applicative (g Library), Applicative (g BuildInfo))
+    :: ( FieldGrammar c g, Applicative (g Library), Applicative (g BuildInfo)
+       , c (Identity LibraryVisibility)
+       , c (List CommaFSep (Identity ExeDependency) ExeDependency)
+       , c (List CommaFSep (Identity LegacyExeDependency) LegacyExeDependency)
+       , c (List CommaFSep (Identity PkgconfigDependency) PkgconfigDependency)
+       , c (List CommaVCat (Identity Dependency) Dependency)
+       , c (List CommaVCat (Identity Mixin) Mixin)
+       , c (List CommaVCat (Identity ModuleReexport) ModuleReexport)
+       , c (List FSep (MQuoted Extension) Extension)
+       , c (List FSep (MQuoted Language) Language)
+       , c (List FSep FilePathNT String)
+       , c (List FSep Token String)
+       , c (List NoCommaFSep Token' String)
+       , c (List VCat (MQuoted ModuleName) ModuleName)
+       , c (List VCat FilePathNT String)
+       , c (List VCat Token String)
+       , c (MQuoted Language)
+       ) 
     => LibraryName
     -> g Library Library
 libraryFieldGrammar n = Library n
-    <$> monoidalFieldAla  "exposed-modules"    (alaList' VCat MQuoted) L.exposedModules
+    <$> monoidalFieldAla  "exposed-modules"    formatExposedModules    L.exposedModules
     <*> monoidalFieldAla  "reexported-modules" (alaList  CommaVCat)    L.reexportedModules
     <*> monoidalFieldAla  "signatures"         (alaList' VCat MQuoted) L.signatures
         ^^^ availableSince CabalSpecV2_0 []
@@ -150,7 +184,25 @@ libraryFieldGrammar n = Library n
 -------------------------------------------------------------------------------
 
 foreignLibFieldGrammar
-    :: (FieldGrammar g, Applicative (g ForeignLib), Applicative (g BuildInfo))
+    :: ( FieldGrammar c g, Applicative (g ForeignLib), Applicative (g BuildInfo)
+       , c (Identity ForeignLibType)
+       , c (Identity LibVersionInfo)
+       , c (Identity Version)
+       , c (List CommaFSep (Identity ExeDependency) ExeDependency)
+       , c (List CommaFSep (Identity LegacyExeDependency) LegacyExeDependency)
+       , c (List CommaFSep (Identity PkgconfigDependency) PkgconfigDependency)
+       , c (List CommaVCat (Identity Dependency) Dependency)
+       , c (List CommaVCat (Identity Mixin) Mixin)
+       , c (List FSep (Identity ForeignLibOption) ForeignLibOption)
+       , c (List FSep (MQuoted Extension) Extension)
+       , c (List FSep (MQuoted Language) Language)
+       , c (List FSep FilePathNT String)
+       , c (List FSep Token String)
+       , c (List NoCommaFSep Token' String)
+       , c (List VCat (MQuoted ModuleName) ModuleName)
+       , c (List VCat FilePathNT String), c (List VCat Token String)
+       , c (MQuoted Language)
+       )
     => UnqualComponentName -> g ForeignLib ForeignLib
 foreignLibFieldGrammar n = ForeignLib n
     <$> optionalFieldDef "type"                                         L.foreignLibType ForeignLibTypeUnknown
@@ -167,7 +219,23 @@ foreignLibFieldGrammar n = ForeignLib n
 -------------------------------------------------------------------------------
 
 executableFieldGrammar
-    :: (FieldGrammar g, Applicative (g Executable), Applicative (g BuildInfo))
+    :: ( FieldGrammar c g, Applicative (g Executable), Applicative (g BuildInfo)
+       , c (Identity ExecutableScope),
+                       c (List CommaFSep (Identity ExeDependency) ExeDependency),
+                       c (List
+                            CommaFSep (Identity LegacyExeDependency) LegacyExeDependency),
+                       c (List
+                            CommaFSep (Identity PkgconfigDependency) PkgconfigDependency),
+                       c (List CommaVCat (Identity Dependency) Dependency),
+                       c (List CommaVCat (Identity Mixin) Mixin),
+                       c (List FSep (MQuoted Extension) Extension),
+                       c (List FSep (MQuoted Language) Language),
+                       c (List FSep FilePathNT String), c (List FSep Token String),
+                       c (List NoCommaFSep Token' String),
+                       c (List VCat (MQuoted ModuleName) ModuleName),
+                       c (List VCat FilePathNT String), c (List VCat Token String),
+                       c (MQuoted Language)
+       )
     => UnqualComponentName -> g Executable Executable
 executableFieldGrammar n = Executable n
     -- main-is is optional as conditional blocks don't have it
@@ -211,7 +279,24 @@ testStanzaBuildInfo f s = fmap (\x -> s { _testStanzaBuildInfo = x }) (f (_testS
 {-# INLINE testStanzaBuildInfo #-}
 
 testSuiteFieldGrammar
-    :: (FieldGrammar g, Applicative (g TestSuiteStanza), Applicative (g BuildInfo))
+    :: ( FieldGrammar c g, Applicative (g TestSuiteStanza), Applicative (g BuildInfo)
+       , c (Identity ModuleName)
+       , c (Identity TestType)
+       , c (List CommaFSep (Identity ExeDependency) ExeDependency)
+       , c (List CommaFSep (Identity LegacyExeDependency) LegacyExeDependency)
+       , c (List CommaFSep (Identity PkgconfigDependency) PkgconfigDependency)
+       , c (List CommaVCat (Identity Dependency) Dependency)
+       , c (List CommaVCat (Identity Mixin) Mixin)
+       , c (List FSep (MQuoted Extension) Extension)
+       , c (List FSep (MQuoted Language) Language)
+       , c (List FSep FilePathNT String)
+       , c (List FSep Token String)
+       , c (List NoCommaFSep Token' String)
+       , c (List VCat (MQuoted ModuleName) ModuleName)
+       , c (List VCat FilePathNT String)
+       , c (List VCat Token String)
+       , c (MQuoted Language)
+       )
     => g TestSuiteStanza TestSuiteStanza
 testSuiteFieldGrammar = TestSuiteStanza
     <$> optionalField    "type"                   testStanzaTestType
@@ -313,7 +398,24 @@ benchmarkStanzaBuildInfo f s = fmap (\x -> s { _benchmarkStanzaBuildInfo = x }) 
 {-# INLINE benchmarkStanzaBuildInfo #-}
 
 benchmarkFieldGrammar
-    :: (FieldGrammar g, Applicative (g BenchmarkStanza), Applicative (g BuildInfo))
+    :: ( FieldGrammar c g, Applicative (g BenchmarkStanza), Applicative (g BuildInfo)
+       , c (Identity BenchmarkType)
+       , c (Identity ModuleName)
+       , c (List CommaFSep (Identity ExeDependency) ExeDependency)
+       , c (List CommaFSep (Identity LegacyExeDependency) LegacyExeDependency)
+       , c (List CommaFSep (Identity PkgconfigDependency) PkgconfigDependency)
+       , c (List CommaVCat (Identity Dependency) Dependency)
+       , c (List CommaVCat (Identity Mixin) Mixin)
+       , c (List FSep (MQuoted Extension) Extension)
+       , c (List FSep (MQuoted Language) Language)
+       , c (List FSep FilePathNT String)
+       , c (List FSep Token String)
+       , c (List NoCommaFSep Token' String)
+       , c (List VCat (MQuoted ModuleName) ModuleName)
+       , c (List VCat FilePathNT String)
+       , c (List VCat Token String)
+       , c (MQuoted Language)
+       )
     => g BenchmarkStanza BenchmarkStanza
 benchmarkFieldGrammar = BenchmarkStanza
     <$> optionalField    "type"                        benchmarkStanzaBenchmarkType
@@ -373,7 +475,22 @@ unvalidateBenchmark b = BenchmarkStanza
 -------------------------------------------------------------------------------
 
 buildInfoFieldGrammar
-    :: (FieldGrammar g, Applicative (g BuildInfo))
+    :: ( FieldGrammar c g, Applicative (g BuildInfo)
+       , c (List CommaFSep (Identity ExeDependency) ExeDependency)
+       , c (List CommaFSep (Identity LegacyExeDependency) LegacyExeDependency)
+       , c (List CommaFSep (Identity PkgconfigDependency) PkgconfigDependency)
+       , c (List CommaVCat (Identity Dependency) Dependency)
+       , c (List CommaVCat (Identity Mixin) Mixin)
+       , c (List FSep (MQuoted Extension) Extension)
+       , c (List FSep (MQuoted Language) Language)
+       , c (List FSep FilePathNT String)
+       , c (List FSep Token String)
+       , c (List NoCommaFSep Token' String)
+       , c (List VCat (MQuoted ModuleName) ModuleName)
+       , c (List VCat FilePathNT String)
+       , c (List VCat Token String)
+       , c (MQuoted Language)
+       )
     => g BuildInfo BuildInfo
 buildInfoFieldGrammar = BuildInfo
     <$> booleanFieldDef  "buildable"                                          L.buildable True
@@ -409,14 +526,19 @@ buildInfoFieldGrammar = BuildInfo
         ^^^ availableSince CabalSpecV2_2 []
     <*> monoidalFieldAla "js-sources"           (alaList' VCat FilePathNT)    L.jsSources
     <*> hsSourceDirsGrammar
-    <*> monoidalFieldAla "other-modules"        (alaList' VCat MQuoted)       L.otherModules
+    <*> monoidalFieldAla "other-modules"        formatOtherModules            L.otherModules
     <*> monoidalFieldAla "virtual-modules"      (alaList' VCat MQuoted)       L.virtualModules
         ^^^ availableSince CabalSpecV2_2 []
     <*> monoidalFieldAla "autogen-modules"      (alaList' VCat MQuoted)       L.autogenModules
+        ^^^ availableSince CabalSpecV2_0 []
     <*> optionalFieldAla "default-language"     MQuoted                       L.defaultLanguage
+        ^^^ availableSince CabalSpecV1_10 Nothing
     <*> monoidalFieldAla "other-languages"      (alaList' FSep MQuoted)       L.otherLanguages
+        ^^^ availableSince CabalSpecV1_10 []
     <*> monoidalFieldAla "default-extensions"   (alaList' FSep MQuoted)       L.defaultExtensions
-    <*> monoidalFieldAla "other-extensions"     (alaList' FSep MQuoted)       L.otherExtensions
+        ^^^ availableSince CabalSpecV1_10 []
+    <*> monoidalFieldAla "other-extensions"     formatOtherExtensions         L.otherExtensions
+        ^^^ availableSinceWarn CabalSpecV1_10
     <*> monoidalFieldAla "extensions"           (alaList' FSep MQuoted)       L.oldExtensions
         ^^^ deprecatedSince CabalSpecV1_12
             "Please use 'default-extensions' or 'other-extensions' fields."
@@ -439,17 +561,17 @@ buildInfoFieldGrammar = BuildInfo
     <*> sharedOptionsFieldGrammar
     <*> pure mempty -- static-options ???
     <*> prefixedFields   "x-"                                                 L.customFieldsBI
-    <*> monoidalFieldAla "build-depends"        (alaList  CommaVCat)          L.targetBuildDepends
-    <*> monoidalFieldAla "mixins"               (alaList  CommaVCat)          L.mixins
+    <*> monoidalFieldAla "build-depends"        formatDependencyList          L.targetBuildDepends
+    <*> monoidalFieldAla "mixins"               formatMixinList               L.mixins
         ^^^ availableSince CabalSpecV2_0 []
 {-# SPECIALIZE buildInfoFieldGrammar :: ParsecFieldGrammar' BuildInfo #-}
 {-# SPECIALIZE buildInfoFieldGrammar :: PrettyFieldGrammar' BuildInfo #-}
 
 hsSourceDirsGrammar
-    :: (FieldGrammar g, Applicative (g BuildInfo))
+    :: (FieldGrammar c g, Applicative (g BuildInfo), c (List FSep FilePathNT FilePath))
     => g BuildInfo [FilePath]
 hsSourceDirsGrammar = (++)
-    <$> monoidalFieldAla "hs-source-dirs" (alaList' FSep FilePathNT) L.hsSourceDirs
+    <$> monoidalFieldAla "hs-source-dirs" formatHsSourceDirs L.hsSourceDirs
     <*> monoidalFieldAla "hs-source-dir"  (alaList' FSep FilePathNT) wrongLens
         --- https://github.com/haskell/cabal/commit/49e3cdae3bdf21b017ccd42e66670ca402e22b44
         ^^^ deprecatedSince CabalSpecV1_2 "Please use 'hs-source-dirs'"
@@ -460,7 +582,7 @@ hsSourceDirsGrammar = (++)
     wrongLens f bi = (\fps -> set L.hsSourceDirs fps bi) <$> f []
 
 optionsFieldGrammar
-    :: (FieldGrammar g, Applicative (g BuildInfo))
+    :: (FieldGrammar c g, Applicative (g BuildInfo), c (List NoCommaFSep Token' String))
     => g BuildInfo (PerCompilerFlavor [String])
 optionsFieldGrammar = PerCompilerFlavor
     <$> monoidalFieldAla "ghc-options"   (alaList' NoCommaFSep Token') (extract GHC)
@@ -476,7 +598,7 @@ optionsFieldGrammar = PerCompilerFlavor
     extract flavor = L.options . lookupLens flavor
 
 profOptionsFieldGrammar
-    :: (FieldGrammar g, Applicative (g BuildInfo))
+    :: (FieldGrammar c g, Applicative (g BuildInfo), c (List NoCommaFSep Token' String))
     => g BuildInfo (PerCompilerFlavor [String])
 profOptionsFieldGrammar = PerCompilerFlavor
     <$> monoidalFieldAla "ghc-prof-options"   (alaList' NoCommaFSep Token') (extract GHC)
@@ -486,7 +608,7 @@ profOptionsFieldGrammar = PerCompilerFlavor
     extract flavor = L.profOptions . lookupLens flavor
 
 sharedOptionsFieldGrammar
-    :: (FieldGrammar g, Applicative (g BuildInfo))
+    :: (FieldGrammar c g, Applicative (g BuildInfo), c (List NoCommaFSep Token' String))
     => g BuildInfo (PerCompilerFlavor [String])
 sharedOptionsFieldGrammar = PerCompilerFlavor
     <$> monoidalFieldAla "ghc-shared-options"   (alaList' NoCommaFSep Token') (extract GHC)
@@ -506,21 +628,21 @@ lookupLens k f p@(PerCompilerFlavor ghc ghcjs)
 -------------------------------------------------------------------------------
 
 flagFieldGrammar
-    :: (FieldGrammar g, Applicative (g Flag))
-    =>  FlagName -> g Flag Flag
-flagFieldGrammar name = MkFlag name
+    :: (FieldGrammar c g, Applicative (g PackageFlag))
+    =>  FlagName -> g PackageFlag PackageFlag
+flagFieldGrammar name = MkPackageFlag name
     <$> freeTextFieldDef    "description"          L.flagDescription
     <*> booleanFieldDef     "default"              L.flagDefault     True
     <*> booleanFieldDef     "manual"               L.flagManual      False
-{-# SPECIALIZE flagFieldGrammar :: FlagName -> ParsecFieldGrammar' Flag #-}
-{-# SPECIALIZE flagFieldGrammar :: FlagName -> PrettyFieldGrammar' Flag #-}
+{-# SPECIALIZE flagFieldGrammar :: FlagName -> ParsecFieldGrammar' PackageFlag #-}
+{-# SPECIALIZE flagFieldGrammar :: FlagName -> PrettyFieldGrammar' PackageFlag #-}
 
 -------------------------------------------------------------------------------
 -- SourceRepo
 -------------------------------------------------------------------------------
 
 sourceRepoFieldGrammar
-    :: (FieldGrammar g, Applicative (g SourceRepo))
+    :: (FieldGrammar c g, Applicative (g SourceRepo), c (Identity RepoType), c Token, c FilePathNT)
     => RepoKind -> g SourceRepo SourceRepo
 sourceRepoFieldGrammar kind = SourceRepo kind
     <$> optionalField    "type"                L.repoType
@@ -530,16 +652,41 @@ sourceRepoFieldGrammar kind = SourceRepo kind
     <*> optionalFieldAla "tag"      Token      L.repoTag
     <*> optionalFieldAla "subdir"   FilePathNT L.repoSubdir
 {-# SPECIALIZE sourceRepoFieldGrammar :: RepoKind -> ParsecFieldGrammar' SourceRepo #-}
-{-# SPECIALIZE sourceRepoFieldGrammar :: RepoKind ->PrettyFieldGrammar' SourceRepo #-}
+{-# SPECIALIZE sourceRepoFieldGrammar :: RepoKind -> PrettyFieldGrammar' SourceRepo #-}
 
 -------------------------------------------------------------------------------
 -- SetupBuildInfo
 -------------------------------------------------------------------------------
 
 setupBInfoFieldGrammar
-    :: (FieldGrammar g, Functor (g SetupBuildInfo))
+    :: (FieldGrammar c g, Functor (g SetupBuildInfo), c (List CommaVCat (Identity Dependency) Dependency))
     => Bool -> g SetupBuildInfo SetupBuildInfo
 setupBInfoFieldGrammar def = flip SetupBuildInfo def
     <$> monoidalFieldAla "setup-depends" (alaList CommaVCat) L.setupDepends
 {-# SPECIALIZE setupBInfoFieldGrammar :: Bool -> ParsecFieldGrammar' SetupBuildInfo #-}
-{-# SPECIALIZE setupBInfoFieldGrammar :: Bool ->PrettyFieldGrammar' SetupBuildInfo #-}
+{-# SPECIALIZE setupBInfoFieldGrammar :: Bool -> PrettyFieldGrammar' SetupBuildInfo #-}
+
+-------------------------------------------------------------------------------
+-- Define how field values should be formatted for 'pretty'.
+-------------------------------------------------------------------------------
+
+formatDependencyList :: [Dependency] -> List CommaVCat (Identity Dependency) Dependency
+formatDependencyList = alaList CommaVCat
+
+formatMixinList :: [Mixin] -> List CommaVCat (Identity Mixin) Mixin
+formatMixinList = alaList CommaVCat
+
+formatExtraSourceFiles :: [FilePath] -> List VCat FilePathNT FilePath
+formatExtraSourceFiles = alaList' VCat FilePathNT
+
+formatExposedModules :: [ModuleName] -> List VCat (MQuoted ModuleName) ModuleName
+formatExposedModules = alaList' VCat MQuoted
+
+formatHsSourceDirs :: [FilePath] -> List FSep FilePathNT FilePath
+formatHsSourceDirs = alaList' FSep FilePathNT
+
+formatOtherExtensions :: [Extension] -> List FSep (MQuoted Extension) Extension
+formatOtherExtensions = alaList' FSep MQuoted
+
+formatOtherModules :: [ModuleName] -> List VCat (MQuoted ModuleName) ModuleName
+formatOtherModules = alaList' VCat MQuoted

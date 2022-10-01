@@ -43,7 +43,6 @@ module Distribution.InstalledPackageInfo (
 import Distribution.Compat.Prelude
 import Prelude ()
 
-import Data.Set                              (Set)
 import Distribution.Backpack
 import Distribution.CabalSpecVersion         (cabalSpecLatest)
 import Distribution.FieldGrammar
@@ -53,6 +52,8 @@ import Distribution.Package                  hiding (installedUnitId)
 import Distribution.Types.ComponentName
 import Distribution.Utils.Generic            (toUTF8BS)
 
+import Data.ByteString (ByteString)
+
 import qualified Data.Map            as Map
 import qualified Distribution.Fields as P
 import qualified Text.PrettyPrint    as Disp
@@ -60,7 +61,8 @@ import qualified Text.PrettyPrint    as Disp
 import Distribution.Types.InstalledPackageInfo
 import Distribution.Types.InstalledPackageInfo.FieldGrammar
 
-
+-- $setup
+-- >>> :set -XOverloadedStrings
 
 installedComponentId :: InstalledPackageInfo -> ComponentId
 installedComponentId ipi =
@@ -92,19 +94,21 @@ sourceComponentName = CLibName . sourceLibName
 -- Parsing
 
 -- | Return either errors, or IPI with list of warnings
---
--- /Note:/ errors array /may/ be empty, but the parse is still failed (it's a bug though)
 parseInstalledPackageInfo
-    :: String
-    -> Either [String] ([String], InstalledPackageInfo)
-parseInstalledPackageInfo s = case P.readFields (toUTF8BS s) of
-    Left err -> Left [show err]
+    :: ByteString
+    -> Either (NonEmpty String) ([String], InstalledPackageInfo)
+parseInstalledPackageInfo s = case P.readFields s of
+    Left err -> Left (show err :| [])
     Right fs -> case partitionFields fs of
         (fs', _) -> case P.runParseResult $ parseFieldGrammar cabalSpecLatest fs' ipiFieldGrammar of
-            (ws, Right x) -> Right (ws', x) where
-                ws' = map (P.showPWarning "") ws
+            (ws, Right x) -> x `deepseq` Right (ws', x) where
+                ws' = [ P.showPWarning "" w
+                      | w@(P.PWarning wt _ _) <- ws
+                      -- filter out warnings about experimental features
+                      , wt /= P.PWTExperimental
+                      ]
             (_,  Left (_, errs)) -> Left errs' where
-                errs' = map (P.showPError "") errs
+                errs' = fmap (P.showPError "") errs
 
 -- -----------------------------------------------------------------------------
 -- Pretty-printing

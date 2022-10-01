@@ -14,8 +14,7 @@ import Distribution.Pretty
 import Distribution.Types.PackageName
 
 import qualified Distribution.Compat.CharParsing as P
-import           Text.PrettyPrint           ((<+>))
-import qualified Text.PrettyPrint           as Disp
+import qualified Text.PrettyPrint                as Disp
 
 -- -----------------------------------------------------------------------------
 -- Module re-exports
@@ -28,7 +27,7 @@ data ModuleReexport = ModuleReexport {
     deriving (Eq, Generic, Read, Show, Typeable, Data)
 
 instance Binary ModuleReexport
-
+instance Structured ModuleReexport
 instance NFData ModuleReexport where rnf = genericRnf
 
 instance Pretty ModuleReexport where

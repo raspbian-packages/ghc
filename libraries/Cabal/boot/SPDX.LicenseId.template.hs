@@ -5,6 +5,7 @@ module Distribution.SPDX.LicenseId (
     licenseId,
     licenseName,
     licenseIsOsiApproved,
+    licenseIsFsfLibre,
     mkLicenseId,
     licenseIdList,
     -- * Helpers
@@ -14,9 +15,11 @@ module Distribution.SPDX.LicenseId (
 import Distribution.Compat.Prelude
 import Prelude ()
 
+import Distribution.Compat.Lens (set)
 import Distribution.Pretty
 import Distribution.Parsec
 import Distribution.Utils.Generic (isAsciiAlphaNum)
+import Distribution.Utils.Structured (Structured (..), nominalStructure, typeVersion)
 import Distribution.SPDX.LicenseListVersion
 
 import qualified Data.Binary.Get as Binary
@@ -31,7 +34,7 @@ import qualified Text.PrettyPrint as Disp
 
 -- | SPDX License identifier
 data LicenseId
-{{{ licenseIds }}}
+{{ licenseIds }}
   deriving (Eq, Ord, Enum, Bounded, Show, Read, Typeable, Data, Generic)
 
 instance Binary LicenseId where
@@ -43,6 +46,10 @@ instance Binary LicenseId where
         if i > fromIntegral (fromEnum (maxBound :: LicenseId))
         then fail "Too large LicenseId tag"
         else return (toEnum (fromIntegral i))
+
+-- note: remember to bump version each time the definition changes
+instance Structured LicenseId where
+    structure p = set typeVersion 306 $ nominalStructure p
 
 instance Pretty LicenseId where
     pretty = Disp.text . licenseId
@@ -110,23 +117,40 @@ licenseIdMigrationMessage = go where
 
 -- | License SPDX identifier, e.g. @"BSD-3-Clause"@.
 licenseId :: LicenseId -> String
-{{#licenses}}
-licenseId {{licenseCon}} = {{{licenseId}}}
-{{/licenses}}
+{% for l in licenses %}
+licenseId {{l.constructor}} = {{l.id}}
+{% endfor %}
 
 -- | License name, e.g. @"GNU General Public License v2.0 only"@
 licenseName :: LicenseId -> String
-{{#licenses}}
-licenseName {{licenseCon}} = {{{licenseName}}}
-{{/licenses}}
+{% for l in licenses %}
+licenseName {{l.constructor}} = {{l.name}}
+{% endfor %}
 
 -- | Whether the license is approved by Open Source Initiative (OSI).
 --
 -- See <https://opensource.org/licenses/alphabetical>.
 licenseIsOsiApproved :: LicenseId -> Bool
-{{#licenses}}
-licenseIsOsiApproved {{licenseCon}} = {{#isOsiApproved}}True{{/isOsiApproved}}{{^isOsiApproved}}False{{/isOsiApproved}}
-{{/licenses}}
+{% for l in licenses %}
+{% if l.isOsiApproved %}
+licenseIsOsiApproved {{l.constructor}} = True
+{% endif %}
+{% endfor %}
+licenseIsOsiApproved _ = False
+
+-- | Whether the license is considered libre by Free Software Foundation (FSF).
+--
+-- See <https://www.gnu.org/licenses/license-list.en.html>
+--
+-- @since 3.4.0.0
+--
+licenseIsFsfLibre :: LicenseId -> Bool
+{% for l in licenses %}
+{% if l.isFsfLibre %}
+licenseIsFsfLibre {{l.constructor}} = True
+{% endif %}
+{% endfor %}
+licenseIsFsfLibre _ = False
 
 -------------------------------------------------------------------------------
 -- Creation
@@ -134,13 +158,16 @@ licenseIsOsiApproved {{licenseCon}} = {{#isOsiApproved}}True{{/isOsiApproved}}{{
 
 licenseIdList :: LicenseListVersion -> [LicenseId]
 licenseIdList LicenseListVersion_3_0 =
-{{{licenseList_3_0}}}
+{{licenseList_3_0}}
     ++ bulkOfLicenses
 licenseIdList LicenseListVersion_3_2 =
-{{{licenseList_3_2}}}
+{{licenseList_3_2}}
     ++ bulkOfLicenses
 licenseIdList LicenseListVersion_3_6 =
-{{{licenseList_3_6}}}
+{{licenseList_3_6}}
+    ++ bulkOfLicenses
+licenseIdList LicenseListVersion_3_9 =
+{{licenseList_3_9}}
     ++ bulkOfLicenses
 
 -- | Create a 'LicenseId' from a 'String'.
@@ -148,6 +175,7 @@ mkLicenseId :: LicenseListVersion -> String -> Maybe LicenseId
 mkLicenseId LicenseListVersion_3_0 s = Map.lookup s stringLookup_3_0
 mkLicenseId LicenseListVersion_3_2 s = Map.lookup s stringLookup_3_2
 mkLicenseId LicenseListVersion_3_6 s = Map.lookup s stringLookup_3_6
+mkLicenseId LicenseListVersion_3_9 s = Map.lookup s stringLookup_3_9
 
 stringLookup_3_0 :: Map String LicenseId
 stringLookup_3_0 = Map.fromList $ map (\i -> (licenseId i, i)) $
@@ -161,7 +189,11 @@ stringLookup_3_6 :: Map String LicenseId
 stringLookup_3_6 = Map.fromList $ map (\i -> (licenseId i, i)) $
     licenseIdList LicenseListVersion_3_6
 
+stringLookup_3_9 :: Map String LicenseId
+stringLookup_3_9 = Map.fromList $ map (\i -> (licenseId i, i)) $
+    licenseIdList LicenseListVersion_3_9
+
 --  | Licenses in all SPDX License lists
 bulkOfLicenses :: [LicenseId]
 bulkOfLicenses =
-{{{licenseList_all}}}
+{{licenseList_all}}

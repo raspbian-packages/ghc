@@ -1,3 +1,26 @@
+[0.10.12.1] – January 2021
+
+* [Replace `withForeignPtr` with `unsafeWithForeignPtr` where appropriate](https://github.com/haskell/bytestring/pull/333)
+
+[0.10.12.1]: https://github.com/haskell/bytestring/compare/0.10.12.0...0.10.12.1
+
+[0.10.12.0] – August 2020
+
+ * **Note:** There are several breaking changes planned to be included in v0.11.
+   Please ensure that your packages have appropriate upper bounds on bytestring,
+   in order to minimize avoidable breakage.
+ * [Add `takeWhileEnd` and `dropWhileEnd` to `Data.ByteString` and `Data.ByteString.Char8`, and add `dropSpace` and `strip` to `Data.ByteString.Char8`](https://github.com/haskell/bytestring/pull/121)
+ * [Add `findIndexEnd` to `Data.ByteString` and `Data.ByteString.Lazy`](https://github.com/haskell/bytestring/pull/155)
+ * [Add `partition` to `Data.ByteString.Char8` and `Data.ByteString.Lazy.Char8`](https://github.com/haskell/bytestring/pull/251)
+ * [Add `IsList` instances for strict and lazy `ByteString` and for `ShortByteString`](https://github.com/haskell/bytestring/pull/219)
+ * [Add `createUpToN'` and `unsafeCreateUpToN'` to `Data.ByteString.Internal`](https://github.com/haskell/bytestring/pull/245)
+ * [Add `boundedPrim` to `Data.ByteString.Builder.Prim.Internal` and deprecate `boudedPrim`](https://github.com/haskell/bytestring/pull/246)
+ * [Deprecate the `Data.ByteString.Lazy.Builder` and `Data.ByteString.Lazy.Builder.{ASCII,Extras}` modules](https://github.com/haskell/bytestring/pull/250)
+ * [Fix documented complexity of `Data.ByteString.Lazy.length`](https://github.com/haskell/bytestring/pull/255)
+ * [Assorted documentation fixes](https://github.com/haskell/bytestring/pull/248)
+
+[0.10.12.0]: https://github.com/haskell/bytestring/compare/0.10.10.1...0.10.12.0
+
 0.10.10.1 – June 2020
 
  * Fix off-by-one infinite loop in primMapByteStringBounded ([#203])

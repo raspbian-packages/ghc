@@ -34,17 +34,21 @@ module Distribution.Solver.Types.ComponentDeps (
   , libraryDeps
   , setupDeps
   , select
+  , components
   ) where
 
 import Prelude ()
 import Distribution.Types.UnqualComponentName
-import Distribution.Solver.Compat.Prelude hiding (empty,zip)
+import Distribution.Solver.Compat.Prelude hiding (empty,toList,zip)
 
 import qualified Data.Map as Map
 import Data.Foldable (fold)
 
+import Distribution.Pretty (Pretty (..))
 import qualified Distribution.Types.ComponentName as CN
 import qualified Distribution.Types.LibraryName as LN
+import qualified Text.PrettyPrint as PP
+
 
 {-------------------------------------------------------------------------------
   Types
@@ -62,6 +66,16 @@ data Component =
   deriving (Show, Eq, Ord, Generic)
 
 instance Binary Component
+instance Structured Component
+
+instance Pretty Component where
+    pretty ComponentLib        = PP.text "lib"
+    pretty (ComponentSubLib n) = PP.text "lib:" <<>> pretty n
+    pretty (ComponentFLib n)   = PP.text "flib:" <<>> pretty n
+    pretty (ComponentExe n)    = PP.text "exe:" <<>> pretty n
+    pretty (ComponentTest n)   = PP.text "test:" <<>> pretty n
+    pretty (ComponentBench n)  = PP.text "bench:" <<>> pretty n
+    pretty ComponentSetup      = PP.text "setup"
 
 -- | Dependency for a single component.
 type ComponentDep a = (Component, a)
@@ -89,6 +103,7 @@ instance Traversable ComponentDeps where
   traverse f = fmap ComponentDeps . traverse f . unComponentDeps
 
 instance Binary a => Binary (ComponentDeps a)
+instance Structured a => Structured (ComponentDeps a)
 
 componentNameToComponent :: CN.ComponentName -> Component
 componentNameToComponent (CN.CLibName  LN.LMainLibName)   = ComponentLib
@@ -176,6 +191,10 @@ libraryDeps :: Monoid a => ComponentDeps a -> a
 libraryDeps = select (\c -> case c of ComponentSubLib _ -> True
                                       ComponentLib -> True
                                       _ -> False)
+
+-- | List components
+components :: ComponentDeps a -> Set Component
+components = Map.keysSet . unComponentDeps
 
 -- | Setup dependencies.
 setupDeps :: Monoid a => ComponentDeps a -> a

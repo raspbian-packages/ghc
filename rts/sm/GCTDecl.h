@@ -5,7 +5,7 @@
  * Documentation on the architecture of the Garbage Collector can be
  * found in the online commentary:
  *
- *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/Rts/Storage/GC
+ *   https://gitlab.haskell.org/ghc/ghc/wikis/commentary/rts/storage/gc
  *
  * ---------------------------------------------------------------------------*/
 
@@ -52,11 +52,11 @@ extern StgWord8 the_gc_thread[];
 
 /* Now, llvm-gcc and some older Clang compilers do not support
    __thread. So we have to fallback to the extremely slow case,
-   unfortunately. Note: clang_CC_FLAVOR implies llvm_CC_FLAVOR.
+   unfortunately.
 
    Also, the iOS Clang compiler doesn't support __thread either for
    some bizarre reason, so there's not much we can do about that... */
-#if defined(llvm_CC_FLAVOR) && (CC_SUPPORTS_TLS == 0)
+#if defined(CC_LLVM_BACKEND) && (CC_SUPPORTS_TLS == 0)
 #define gct ((gc_thread *)(pthread_getspecific(gctKey)))
 #define SET_GCT(to) (pthread_setspecific(gctKey, to))
 #define DECLARE_GCT ThreadLocalKey gctKey;
@@ -66,7 +66,7 @@ extern StgWord8 the_gc_thread[];
 /* However, if we *are* using an LLVM based compiler with __thread
    support, then use that (since LLVM doesn't support global register
    variables.) */
-#elif defined(llvm_CC_FLAVOR) && (CC_SUPPORTS_TLS == 1)
+#elif defined(CC_LLVM_BACKEND) && (CC_SUPPORTS_TLS == 1)
 extern __thread gc_thread* gct;
 #define SET_GCT(to) gct = (to)
 #define DECLARE_GCT __thread gc_thread* gct;

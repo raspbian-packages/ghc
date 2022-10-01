@@ -1,20 +1,16 @@
-{-# LANGUAGE NamedFieldPuns, RecordWildCards #-}
+{-# LANGUAGE NamedFieldPuns, RecordWildCards, RankNTypes #-}
 module Distribution.Client.VCS (
     -- * VCS driver type
     VCS,
     vcsRepoType,
     vcsProgram,
     -- ** Type re-exports
-    SourceRepo,
     RepoType,
-    RepoKind,
     Program,
     ConfiguredProgram,
 
-    -- * Selecting amongst source repos
-    selectPackageSourceRepo,
-
     -- * Validating 'SourceRepo's and configuring VCS drivers
+    validatePDSourceRepo,
     validateSourceRepo,
     validateSourceRepos,
     SourceRepoProblem(..),
@@ -32,17 +28,19 @@ module Distribution.Client.VCS (
     vcsGit,
     vcsHg,
     vcsSvn,
+    vcsPijul,
   ) where
 
 import Prelude ()
 import Distribution.Client.Compat.Prelude
 
 import Distribution.Types.SourceRepo
-         ( SourceRepo(..), RepoType(..), RepoKind(..) )
+         ( RepoType(..), KnownRepoType (..) )
+import Distribution.Client.Types.SourceRepo (SourceRepoMaybe, SourceRepositoryPackage (..), srpToProxy)
 import Distribution.Client.RebuildMonad
          ( Rebuild, monitorFiles, MonitorFilePath, monitorDirectoryExistence )
 import Distribution.Verbosity as Verbosity
-         ( Verbosity, normal )
+         ( normal )
 import Distribution.Simple.Program
          ( Program(programFindVersion)
          , ConfiguredProgram(programVersion)
@@ -51,17 +49,12 @@ import Distribution.Simple.Program
          , emptyProgramDb, requireProgram )
 import Distribution.Version
          ( mkVersion )
+import qualified Distribution.PackageDescription as PD
 
-import Control.Monad
-         ( mapM_ )
 import Control.Monad.Trans
          ( liftIO )
 import qualified Data.Char as Char
 import qualified Data.Map  as Map
-import Data.Ord
-         ( comparing )
-import Data.Either
-         ( partitionEithers )
 import System.FilePath
          ( takeDirectory )
 import System.Directory
@@ -80,9 +73,9 @@ data VCS program = VCS {
 
        -- | The program invocation(s) to get\/clone a repository into a fresh
        -- local directory.
-       vcsCloneRepo :: Verbosity
+       vcsCloneRepo :: forall f. Verbosity
                     -> ConfiguredProgram
-                    -> SourceRepo
+                    -> SourceRepositoryPackage f
                     -> FilePath   -- Source URI
                     -> FilePath   -- Destination directory
                     -> [ProgramInvocation],
@@ -90,9 +83,9 @@ data VCS program = VCS {
        -- | The program invocation(s) to synchronise a whole set of /related/
        -- repositories with corresponding local directories. Also returns the
        -- files that the command depends on, for change monitoring.
-       vcsSyncRepos :: Verbosity
+       vcsSyncRepos :: forall f. Verbosity
                     -> ConfiguredProgram
-                    -> [(SourceRepo, FilePath)]
+                    -> [(SourceRepositoryPackage f, FilePath)]
                     -> IO [MonitorFilePath]
      }
 
@@ -101,37 +94,8 @@ data VCS program = VCS {
 -- * Selecting repos and drivers
 -- ------------------------------------------------------------
 
--- | Pick the 'SourceRepo' to use to get the package sources from.
---
--- Note that this does /not/ depend on what 'VCS' drivers we are able to
--- successfully configure. It is based only on the 'SourceRepo's declared
--- in the package, and optionally on a preferred 'RepoKind'.
---
-selectPackageSourceRepo :: Maybe RepoKind
-                        -> [SourceRepo]
-                        -> Maybe SourceRepo
-selectPackageSourceRepo preferredRepoKind =
-    listToMaybe
-    -- Sort repositories by kind, from This to Head to Unknown. Repositories
-    -- with equivalent kinds are selected based on the order they appear in
-    -- the Cabal description file.
-  . sortBy (comparing thisFirst)
-    -- If the user has specified the repo kind, filter out the repositories
-    -- they're not interested in.
-  . filter (\repo -> maybe True (repoKind repo ==) preferredRepoKind)
-  where
-    thisFirst :: SourceRepo -> Int
-    thisFirst r = case repoKind r of
-        RepoThis -> 0
-        RepoHead -> case repoTag r of
-            -- If the type is 'head' but the author specified a tag, they
-            -- probably meant to create a 'this' repository but screwed up.
-            Just _  -> 0
-            Nothing -> 1
-        RepoKindUnknown _ -> 2
-
 data SourceRepoProblem = SourceRepoRepoTypeUnspecified
-                       | SourceRepoRepoTypeUnsupported RepoType
+                       | SourceRepoRepoTypeUnsupported (SourceRepositoryPackage Proxy) RepoType
                        | SourceRepoLocationUnspecified
   deriving Show
 
@@ -140,25 +104,42 @@ data SourceRepoProblem = SourceRepoRepoTypeUnspecified
 --
 -- | It also returns the 'VCS' driver we should use to work with it.
 --
-validateSourceRepo :: SourceRepo
-                   -> Either SourceRepoProblem
-                             (SourceRepo, String, RepoType, VCS Program)
+validateSourceRepo
+    :: SourceRepositoryPackage f
+    -> Either SourceRepoProblem (SourceRepositoryPackage f, String, RepoType, VCS Program)
 validateSourceRepo = \repo -> do
-    rtype <- repoType repo               ?! SourceRepoRepoTypeUnspecified
-    vcs   <- Map.lookup rtype knownVCSs  ?! SourceRepoRepoTypeUnsupported rtype
-    uri   <- repoLocation repo           ?! SourceRepoLocationUnspecified
+    let rtype = srpType repo
+    vcs   <- Map.lookup rtype knownVCSs  ?! SourceRepoRepoTypeUnsupported (srpToProxy repo) rtype
+    let uri = srpLocation repo
     return (repo, uri, rtype, vcs)
   where
     a ?! e = maybe (Left e) Right a
+
+validatePDSourceRepo
+    :: PD.SourceRepo
+    -> Either SourceRepoProblem (SourceRepoMaybe, String, RepoType, VCS Program)
+validatePDSourceRepo repo = do
+    rtype <- PD.repoType repo      ?! SourceRepoRepoTypeUnspecified
+    uri   <- PD.repoLocation repo  ?! SourceRepoLocationUnspecified
+    validateSourceRepo SourceRepositoryPackage
+        { srpType     = rtype
+        , srpLocation = uri
+        , srpTag      = PD.repoTag repo
+        , srpBranch   = PD.repoBranch repo
+        , srpSubdir   = PD.repoSubdir repo
+        }
+  where
+    a ?! e = maybe (Left e) Right a
+
 
 
 -- | As 'validateSourceRepo' but for a bunch of 'SourceRepo's, and return
 -- things in a convenient form to pass to 'configureVCSs', or to report
 -- problems.
 --
-validateSourceRepos :: [SourceRepo]
-                    -> Either [(SourceRepo, SourceRepoProblem)]
-                              [(SourceRepo, String, RepoType, VCS Program)]
+validateSourceRepos :: [SourceRepositoryPackage f]
+                    -> Either [(SourceRepositoryPackage f, SourceRepoProblem)]
+                              [(SourceRepositoryPackage f, String, RepoType, VCS Program)]
 validateSourceRepos rs =
     case partitionEithers (map validateSourceRepo' rs) of
       (problems@(_:_), _) -> Left problems
@@ -193,18 +174,16 @@ configureVCSs verbosity = traverse (configureVCS verbosity)
 --
 -- Make sure to validate the 'SourceRepo' using 'validateSourceRepo' first.
 --
-cloneSourceRepo :: Verbosity
-                -> VCS ConfiguredProgram
-                -> SourceRepo -- ^ Must have 'repoLocation' filled.
-                -> FilePath   -- ^ Destination directory
-                -> IO ()
-cloneSourceRepo _ _ repo@SourceRepo{ repoLocation = Nothing } _ =
-    error $ "cloneSourceRepo: precondition violation, missing repoLocation: \""
-         ++ show repo ++ "\". Validate using validateSourceRepo first."
 
+cloneSourceRepo
+    :: Verbosity
+    -> VCS ConfiguredProgram
+    -> SourceRepositoryPackage f
+    -> [Char]
+    -> IO ()
 cloneSourceRepo verbosity vcs
-                repo@SourceRepo{ repoLocation = Just srcuri } destdir =
-    mapM_ (runProgramInvocation verbosity) invocations
+                repo@SourceRepositoryPackage{ srpLocation = srcuri } destdir =
+    traverse_ (runProgramInvocation verbosity) invocations
   where
     invocations = vcsCloneRepo vcs verbosity
                                (vcsProgram vcs) repo
@@ -228,7 +207,7 @@ cloneSourceRepo verbosity vcs
 --
 syncSourceRepos :: Verbosity
                 -> VCS ConfiguredProgram
-                -> [(SourceRepo, FilePath)]
+                -> [(SourceRepositoryPackage f, FilePath)]
                 -> Rebuild ()
 syncSourceRepos verbosity vcs repos = do
     files <- liftIO $ vcsSyncRepos vcs verbosity (vcsProgram vcs) repos
@@ -252,7 +231,7 @@ knownVCSs = Map.fromList [ (vcsRepoType vcs, vcs) | vcs <- vcss ]
 vcsBzr :: VCS Program
 vcsBzr =
     VCS {
-      vcsRepoType = Bazaar,
+      vcsRepoType = KnownRepoType Bazaar,
       vcsProgram  = bzrProgram,
       vcsCloneRepo,
       vcsSyncRepos
@@ -260,7 +239,7 @@ vcsBzr =
   where
     vcsCloneRepo :: Verbosity
                  -> ConfiguredProgram
-                 -> SourceRepo
+                 -> SourceRepositoryPackage f
                  -> FilePath
                  -> FilePath
                  -> [ProgramInvocation]
@@ -274,13 +253,13 @@ vcsBzr =
                               = "branch"
                   | otherwise = "get"
 
-        tagArgs = case repoTag repo of
+        tagArgs = case srpTag repo of
           Nothing  -> []
           Just tag -> ["-r", "tag:" ++ tag]
         verboseArg = [ "--quiet" | verbosity < Verbosity.normal ]
 
     vcsSyncRepos :: Verbosity -> ConfiguredProgram
-                 -> [(SourceRepo, FilePath)] -> IO [MonitorFilePath]
+                 -> [(SourceRepositoryPackage f, FilePath)] -> IO [MonitorFilePath]
     vcsSyncRepos _v _p _rs = fail "sync repo not yet supported for bzr"
 
 bzrProgram :: Program
@@ -298,7 +277,7 @@ bzrProgram = (simpleProgram "bzr") {
 vcsDarcs :: VCS Program
 vcsDarcs =
     VCS {
-      vcsRepoType = Darcs,
+      vcsRepoType = KnownRepoType Darcs,
       vcsProgram  = darcsProgram,
       vcsCloneRepo,
       vcsSyncRepos
@@ -306,7 +285,7 @@ vcsDarcs =
   where
     vcsCloneRepo :: Verbosity
                  -> ConfiguredProgram
-                 -> SourceRepo
+                 -> SourceRepositoryPackage f
                  -> FilePath
                  -> FilePath
                  -> [ProgramInvocation]
@@ -319,13 +298,13 @@ vcsDarcs =
         cloneCmd   | programVersion prog >= Just (mkVersion [2,8])
                                = "clone"
                    | otherwise = "get"
-        tagArgs    = case repoTag repo of
+        tagArgs    = case srpTag repo of
           Nothing  -> []
           Just tag -> ["-t", tag]
         verboseArg = [ "--quiet" | verbosity < Verbosity.normal ]
 
     vcsSyncRepos :: Verbosity -> ConfiguredProgram
-                 -> [(SourceRepo, FilePath)] -> IO [MonitorFilePath]
+                 -> [(SourceRepositoryPackage f, FilePath)] -> IO [MonitorFilePath]
     vcsSyncRepos _v _p _rs = fail "sync repo not yet supported for darcs"
 
 darcsProgram :: Program
@@ -343,7 +322,7 @@ darcsProgram = (simpleProgram "darcs") {
 vcsGit :: VCS Program
 vcsGit =
     VCS {
-      vcsRepoType = Git,
+      vcsRepoType = KnownRepoType Git,
       vcsProgram  = gitProgram,
       vcsCloneRepo,
       vcsSyncRepos
@@ -351,7 +330,7 @@ vcsGit =
   where
     vcsCloneRepo :: Verbosity
                  -> ConfiguredProgram
-                 -> SourceRepo
+                 -> SourceRepositoryPackage f
                  -> FilePath
                  -> FilePath
                  -> [ProgramInvocation]
@@ -361,11 +340,11 @@ vcsGit =
      ++ [ (programInvocation prog (checkoutArgs tag)) {
             progInvokeCwd = Just destdir
           }
-        | tag <- maybeToList (repoTag repo) ]
+        | tag <- maybeToList (srpTag repo) ]
       where
         cloneArgs  = ["clone", srcuri, destdir]
                      ++ branchArgs ++ verboseArg
-        branchArgs = case repoBranch repo of
+        branchArgs = case srpBranch repo of
           Just b  -> ["--branch", b]
           Nothing -> []
         checkoutArgs tag = "checkout" : verboseArg ++ [tag, "--"]
@@ -373,7 +352,7 @@ vcsGit =
 
     vcsSyncRepos :: Verbosity
                  -> ConfiguredProgram
-                 -> [(SourceRepo, FilePath)]
+                 -> [(SourceRepositoryPackage f, FilePath)]
                  -> IO [MonitorFilePath]
     vcsSyncRepos _ _ [] = return []
     vcsSyncRepos verbosity gitProg
@@ -383,10 +362,10 @@ vcsGit =
       sequence_
         [ vcsSyncRepo verbosity gitProg repo localDir (Just primaryLocalDir)
         | (repo, localDir) <- secondaryRepos ]
-      return [ monitorDirectoryExistence dir 
+      return [ monitorDirectoryExistence dir
              | dir <- (primaryLocalDir : map snd secondaryRepos) ]
 
-    vcsSyncRepo verbosity gitProg SourceRepo{..} localDir peer = do
+    vcsSyncRepo verbosity gitProg SourceRepositoryPackage{..} localDir peer = do
         exists <- doesDirectoryExist localDir
         if exists
           then git localDir                 ["fetch"]
@@ -404,10 +383,10 @@ vcsGit =
                            Nothing           -> []
                            Just peerLocalDir -> ["--reference", peerLocalDir]
                       ++ verboseArg
-                         where Just loc = repoLocation
+                         where loc = srpLocation
         checkoutArgs   = "checkout" : verboseArg ++ ["--detach", "--force"
                          , checkoutTarget, "--" ]
-        checkoutTarget = fromMaybe "HEAD" (repoBranch `mplus` repoTag)
+        checkoutTarget = fromMaybe "HEAD" (srpBranch `mplus` srpTag)
         verboseArg     = [ "--quiet" | verbosity < Verbosity.normal ]
 
 gitProgram :: Program
@@ -436,7 +415,7 @@ gitProgram = (simpleProgram "git") {
 vcsHg :: VCS Program
 vcsHg =
     VCS {
-      vcsRepoType = Mercurial,
+      vcsRepoType = KnownRepoType Mercurial,
       vcsProgram  = hgProgram,
       vcsCloneRepo,
       vcsSyncRepos
@@ -444,7 +423,7 @@ vcsHg =
   where
     vcsCloneRepo :: Verbosity
                  -> ConfiguredProgram
-                 -> SourceRepo
+                 -> SourceRepositoryPackage f
                  -> FilePath
                  -> FilePath
                  -> [ProgramInvocation]
@@ -453,17 +432,17 @@ vcsHg =
       where
         cloneArgs  = ["clone", srcuri, destdir]
                      ++ branchArgs ++ tagArgs ++ verboseArg
-        branchArgs = case repoBranch repo of
+        branchArgs = case srpBranch repo of
           Just b  -> ["--branch", b]
           Nothing -> []
-        tagArgs = case repoTag repo of
+        tagArgs = case srpTag repo of
           Just t  -> ["--rev", t]
           Nothing -> []
         verboseArg = [ "--quiet" | verbosity < Verbosity.normal ]
 
     vcsSyncRepos :: Verbosity
                  -> ConfiguredProgram
-                 -> [(SourceRepo, FilePath)]
+                 -> [(SourceRepositoryPackage f, FilePath)]
                  -> IO [MonitorFilePath]
     vcsSyncRepos _v _p _rs = fail "sync repo not yet supported for hg"
 
@@ -482,7 +461,7 @@ hgProgram = (simpleProgram "hg") {
 vcsSvn :: VCS Program
 vcsSvn =
     VCS {
-      vcsRepoType = SVN,
+      vcsRepoType = KnownRepoType SVN,
       vcsProgram  = svnProgram,
       vcsCloneRepo,
       vcsSyncRepos
@@ -490,7 +469,7 @@ vcsSvn =
   where
     vcsCloneRepo :: Verbosity
                  -> ConfiguredProgram
-                 -> SourceRepo
+                 -> SourceRepositoryPackage f
                  -> FilePath
                  -> FilePath
                  -> [ProgramInvocation]
@@ -503,7 +482,7 @@ vcsSvn =
 
     vcsSyncRepos :: Verbosity
                  -> ConfiguredProgram
-                 -> [(SourceRepo, FilePath)]
+                 -> [(SourceRepositoryPackage f, FilePath)]
                  -> IO [MonitorFilePath]
     vcsSyncRepos _v _p _rs = fail "sync repo not yet supported for svn"
 
@@ -516,3 +495,147 @@ svnProgram = (simpleProgram "svn") {
         _ -> ""
   }
 
+
+-- | VCS driver for Pijul.
+-- Documentation for Pijul can be found at <https://pijul.org/manual/introduction.html>
+--
+-- 2020-04-09 Oleg:
+--
+--    As far as I understand pijul, there are branches and "tags" in pijul,
+--    but there aren't a "commit hash" identifying an arbitrary state.
+--
+--    One can create `a pijul tag`, which will make a patch hash,
+--    which depends on everything currently in the repository.
+--    I guess if you try to apply that patch, you'll be forced to apply
+--    all the dependencies too. In other words, there are no named tags.
+--
+--    It's not clear to me whether there is an option to
+--    "apply this patch *and* all of its dependencies".
+--    And relatedly, whether how to make sure that there are no other
+--    patches applied.
+--
+--    With branches it's easier, as you can `pull` and `checkout` them,
+--    and they seem to be similar enough. Yet, pijul documentations says
+--
+--    > Note that the purpose of branches in Pijul is quite different from Git,
+--      since Git's "feature branches" can usually be implemented by just
+--      patches.
+--
+--    I guess it means that indeed instead of creating a branch and making PR
+--    in "GitHub" workflow, you'd just create a patch and offer it.
+--    You can do that with `git` too. Push (a branch with) commit to remote
+--    and ask other to cherry-pick that commit. Yet, in git identity of commit
+--    changes when it applied to other trees, where patches in pijul have
+--    will continue to have the same hash.
+--
+--    Unfortunately pijul doesn't talk about conflict resolution.
+--    It seems that you get something like:
+--
+--        % pijul status
+--        On branch merge
+--
+--        Unresolved conflicts:
+--          (fix conflicts and record the resolution with "pijul record ...")
+--
+--                foo
+--
+--        % cat foo
+--        first line
+--        >> >>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+--        branch BBB
+--        ================================
+--        branch AAA
+--        <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+--        last line
+--
+--    And then the `pijul dependencies` would draw you a graph like
+--
+--
+--                    ----->  foo on branch B ----->
+--    resolve confict                                  Initial patch
+--                    ----->  foo on branch A ----->
+--
+--    Which is seems reasonable.
+--
+--    So currently, pijul support is very experimental, and most likely
+--    won't work, even the basics are in place. Tests are also written
+--    but disabled, as the branching model differs from `git` one,
+--    for which tests are written.
+--
+vcsPijul :: VCS Program
+vcsPijul =
+    VCS {
+      vcsRepoType = KnownRepoType Pijul,
+      vcsProgram  = pijulProgram,
+      vcsCloneRepo,
+      vcsSyncRepos
+    }
+  where
+    vcsCloneRepo :: Verbosity -- ^ it seems that pijul does not have verbose flag
+                 -> ConfiguredProgram
+                 -> SourceRepositoryPackage f
+                 -> FilePath
+                 -> FilePath
+                 -> [ProgramInvocation]
+    vcsCloneRepo _verbosity prog repo srcuri destdir =
+        [ programInvocation prog cloneArgs ]
+        -- And if there's a tag, we have to do that in a second step:
+     ++ [ (programInvocation prog (checkoutArgs tag)) {
+            progInvokeCwd = Just destdir
+          }
+        | tag <- maybeToList (srpTag repo) ]
+      where
+        cloneArgs  = ["clone", srcuri, destdir]
+                     ++ branchArgs
+        branchArgs = case srpBranch repo of
+          Just b  -> ["--from-branch", b]
+          Nothing -> []
+        checkoutArgs tag = "checkout" : [tag] -- TODO: this probably doesn't work either
+
+    vcsSyncRepos :: Verbosity
+                 -> ConfiguredProgram
+                 -> [(SourceRepositoryPackage f, FilePath)]
+                 -> IO [MonitorFilePath]
+    vcsSyncRepos _ _ [] = return []
+    vcsSyncRepos verbosity pijulProg
+                 ((primaryRepo, primaryLocalDir) : secondaryRepos) = do
+
+      vcsSyncRepo verbosity pijulProg primaryRepo primaryLocalDir Nothing
+      sequence_
+        [ vcsSyncRepo verbosity pijulProg repo localDir (Just primaryLocalDir)
+        | (repo, localDir) <- secondaryRepos ]
+      return [ monitorDirectoryExistence dir
+             | dir <- (primaryLocalDir : map snd secondaryRepos) ]
+
+    vcsSyncRepo verbosity pijulProg SourceRepositoryPackage{..} localDir peer = do
+        exists <- doesDirectoryExist localDir
+        if exists
+        then pijul localDir                 ["pull"] -- TODO: this probably doesn't work.
+        else pijul (takeDirectory localDir) cloneArgs
+        pijul localDir checkoutArgs
+      where
+        pijul :: FilePath -> [String] -> IO ()
+        pijul cwd args = runProgramInvocation verbosity $
+                         (programInvocation pijulProg args) {
+                           progInvokeCwd = Just cwd
+                         }
+
+        cloneArgs      = ["clone", loc, localDir]
+                      ++ case peer of
+                           Nothing           -> []
+                           Just peerLocalDir -> [peerLocalDir]
+                         where loc = srpLocation
+        checkoutArgs   = "checkout" :  ["--force", checkoutTarget, "--" ]
+        checkoutTarget = fromMaybe "HEAD" (srpBranch `mplus` srpTag) -- TODO: this is definitely wrong.
+
+pijulProgram :: Program
+pijulProgram = (simpleProgram "pijul") {
+    programFindVersion = findProgramVersion "--version" $ \str ->
+      case words str of
+        -- "pijul 0.12.2
+        (_:ver:_) | all isTypical ver -> ver
+        _ -> ""
+  }
+  where
+    isNum     c = c >= '0' && c <= '9'
+    isTypical c = isNum c || c == '.'

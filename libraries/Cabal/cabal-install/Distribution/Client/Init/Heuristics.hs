@@ -22,8 +22,8 @@ module Distribution.Client.Init.Heuristics (
 
 import Prelude ()
 import Distribution.Client.Compat.Prelude
+import Distribution.Utils.Generic (safeHead, safeTail, safeLast)
 
-import Distribution.Parsec         (simpleParsec)
 import Distribution.Simple.Setup (Flag(..), flagToMaybe)
 import Distribution.ModuleName
     ( ModuleName, toFilePath )
@@ -37,14 +37,11 @@ import Language.Haskell.Extension ( Extension )
 import Distribution.Solver.Types.PackageIndex
     ( allPackagesByName )
 import Distribution.Solver.Types.SourcePackage
-    ( packageDescription )
+    ( srcpkgDescription )
 
 import Distribution.Client.Types ( SourcePackageDb(..) )
-import Control.Monad ( mapM )
-import Data.Char   ( isNumber, isLower )
-import Data.Either ( partitionEithers )
+import Data.Char   ( isLower )
 import Data.List   ( isInfixOf )
-import Data.Ord    ( comparing )
 import qualified Data.Set as Set ( fromList, toList )
 import System.Directory ( getCurrentDirectory, getDirectoryContents,
                           doesDirectoryExist, doesFileExist, getHomeDirectory, )
@@ -54,7 +51,8 @@ import System.FilePath ( takeExtension, takeBaseName, dropExtension,
 
 import Distribution.Client.Init.Types     ( InitFlags(..) )
 import Distribution.Client.Compat.Process ( readProcessWithExitCode )
-import System.Exit ( ExitCode(..) )
+
+import qualified Distribution.Utils.ShortText as ShortText
 
 -- | Return a list of candidate main files for this executable: top-level
 -- modules including the word 'Main' in the file name. The list is sorted in
@@ -86,7 +84,7 @@ guessMainFileCandidates flags = do
 
 -- | Guess the package name based on the given root directory.
 guessPackageName :: FilePath -> IO P.PackageName
-guessPackageName = liftM (P.mkPackageName . repair . last . splitDirectories)
+guessPackageName = liftM (P.mkPackageName . repair . fromMaybe "" . safeLast . splitDirectories)
                  . tryCanonicalizePath
   where
     -- Treat each span of non-alphanumeric characters as a hyphen. Each
@@ -101,8 +99,8 @@ guessPackageName = liftM (P.mkPackageName . repair . last . splitDirectories)
         x' -> let (c, r) = first repairComponent $ break (not . isAlphaNum) x'
               in c ++ repairRest r
       where
-        repairComponent c | all isNumber c = invalid c
-                          | otherwise      = valid c
+        repairComponent c | all isDigit c = invalid c
+                          | otherwise     = valid c
     repairRest = repair' id ('-' :)
 
 -- |Data type of source files found in the working directory
@@ -129,12 +127,12 @@ scanForModulesIn projectRoot srcRoot = scan srcRoot []
   where
     scan dir hierarchy = do
         entries <- getDirectoryContents (projectRoot </> dir)
-        (files, dirs) <- liftM partitionEithers (mapM (tagIsDir dir) entries)
+        (files, dirs) <- liftM partitionEithers (traverse (tagIsDir dir) entries)
         let modules = catMaybes [ guessModuleName hierarchy file
                                 | file <- files
-                                , isUpper (head file) ]
-        modules' <- mapM (findImportsAndExts projectRoot) modules
-        recMods <- mapM (scanRecursive dir hierarchy) dirs
+                                , maybe False isUpper (safeHead file) ]
+        modules' <- traverse (findImportsAndExts projectRoot) modules
+        recMods <- traverse (scanRecursive dir hierarchy) dirs
         return $ concat (modules' : recMods)
     tagIsDir parent entry = do
         isDir <- doesDirectoryExist (parent </> entry)
@@ -151,8 +149,8 @@ scanForModulesIn projectRoot srcRoot = scan srcRoot []
                       $ intercalate "." . reverse $ (unqualModName : hierarchy)
         ext           = case takeExtension entry of '.':e -> e; e -> e
     scanRecursive parent hierarchy entry
-      | isUpper (head entry) = scan (parent </> entry) (entry : hierarchy)
-      | isLower (head entry) && not (ignoreDir entry) =
+      | maybe False isUpper (safeHead entry) = scan (parent </> entry) (entry : hierarchy)
+      | maybe False isLower (safeHead entry) && not (ignoreDir entry) =
           scanForModulesIn projectRoot $ foldl (</>) srcRoot (reverse (entry : hierarchy))
       | otherwise = return []
     ignoreDir ('.':_)  = True
@@ -345,9 +343,9 @@ maybeReadFile f = do
 -- |Get list of categories used in Hackage. NOTE: Very slow, needs to be cached
 knownCategories :: SourcePackageDb -> [String]
 knownCategories (SourcePackageDb sourcePkgIndex _) = nubSet
-    [ cat | pkg <- map head (allPackagesByName sourcePkgIndex)
-          , let catList = (PD.category . PD.packageDescription . packageDescription) pkg
-          , cat <- splitString ',' catList
+    [ cat | pkg <- maybeToList . safeHead =<< (allPackagesByName sourcePkgIndex)
+          , let catList = (PD.category . PD.packageDescription . srcpkgDescription) pkg
+          , cat <- splitString ',' $ ShortText.fromShortText catList
     ]
 
 -- Parse name and email, from darcs pref files or environment variable
@@ -358,7 +356,7 @@ nameAndMail str
   | otherwise  = (Flag $ trim nameOrEmail, Flag mail)
   where
     (nameOrEmail,erest) = break (== '<') str
-    (mail,_)            = break (== '>') (tail erest)
+    (mail,_)            = break (== '>') (safeTail erest)
 
 trim :: String -> String
 trim = removeLeadingSpace . reverse . removeLeadingSpace . reverse

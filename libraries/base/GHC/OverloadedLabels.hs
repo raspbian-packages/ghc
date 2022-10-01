@@ -17,9 +17,9 @@
 -- Stability   :  internal
 -- Portability :  non-portable (GHC extensions)
 --
--- This module defines the 'IsLabel' class is used by the
+-- This module defines the 'IsLabel' class used by the
 -- @OverloadedLabels@ extension.  See the
--- <https://ghc.haskell.org/trac/ghc/wiki/Records/OverloadedRecordFields/OverloadedLabels wiki page>
+-- <https://gitlab.haskell.org/ghc/ghc/wikis/records/overloaded-record-fields/overloaded-labels wiki page>
 -- for more details.
 --
 -- When @OverloadedLabels@ is enabled, if GHC sees an occurrence of
@@ -42,7 +42,7 @@
 -- optional id for the 'fromLabel' function to use (if
 -- RebindableSyntax is enabled) .  The type-checker transforms it into
 -- a call to 'fromLabel'.  See Note [Type-checking overloaded labels]
--- in TcExpr for more details in how type-checking works.
+-- in GHC.Tc.Gen.Expr for more details in how type-checking works.
 
 module GHC.OverloadedLabels
        ( IsLabel(..)

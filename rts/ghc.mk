@@ -5,8 +5,8 @@
 # This file is part of the GHC build system.
 #
 # To understand how the build system works and how to modify it, see
-#      http://ghc.haskell.org/trac/ghc/wiki/Building/Architecture
-#      http://ghc.haskell.org/trac/ghc/wiki/Building/Modifying
+#      https://gitlab.haskell.org/ghc/ghc/wikis/building/architecture
+#      https://gitlab.haskell.org/ghc/ghc/wikis/building/modifying
 #
 # -----------------------------------------------------------------------------
 
@@ -17,15 +17,15 @@
 rts_dist_HC = $(GHC_STAGE1)
 
 rts_INSTALL_INFO = rts
-rts_VERSION = 1.0
+rts_VERSION = 1.0.2
 
 # Minimum supported Windows version.
 # These numbers can be found at:
 #  https://msdn.microsoft.com/en-us/library/windows/desktop/aa383745(v=vs.85).aspx
-# If we're compiling on windows, enforce that we only support Vista SP1+
+# If we're compiling on windows, enforce that we only support Windows 7+
 # Adding this here means it doesn't have to be done in individual .c files
 # and also centralizes the versioning.
-rts_WINVER = 0x06000100
+rts_WINVER = 0x06010000
 
 # merge GhcLibWays and GhcRTSWays but strip out duplicates
 rts_WAYS = $(GhcLibWays) $(filter-out $(GhcLibWays),$(GhcRTSWays))
@@ -37,7 +37,7 @@ $(eval $(call all-target,rts,$(ALL_RTS_LIBS)))
 # -----------------------------------------------------------------------------
 # Defining the sources
 
-ALL_DIRS = hooks sm eventlog linker
+ALL_DIRS = hooks sm eventlog linker linker/macho
 
 ifeq "$(TargetOS_CPP)" "mingw32"
 ALL_DIRS += win32
@@ -45,20 +45,43 @@ else
 ALL_DIRS += posix
 endif
 
-rts_C_SRCS := $(wildcard rts/*.c $(foreach dir,$(ALL_DIRS),rts/$(dir)/*.c))
+tmp_rts_C_SRCS := $(wildcard rts/*.c $(foreach dir,$(ALL_DIRS),rts/$(dir)/*.c))
+# We shouldn't include this file in the binary, it's a common function so
+# it will likely clash with something later. See #19948
+rts_C_SRCS = $(filter-out rts/xxhash.c, $(tmp_rts_C_SRCS))
 rts_C_HOOK_SRCS := $(wildcard rts/hooks/*.c)
 rts_CMM_SRCS := $(wildcard rts/*.cmm)
 
 # Don't compile .S files when bootstrapping a new arch
 ifneq "$(PORTING_HOST)" "YES"
-ifneq "$(findstring $(TargetArch_CPP), i386 powerpc powerpc64)" ""
-rts_S_SRCS += rts/AdjustorAsm.S
-endif
-# this matches substrings of powerpc64le, including "powerpc" and "powerpc64"
-ifneq "$(findstring $(TargetArch_CPP), powerpc64le)" ""
+
 # unregisterised builds use the mini interpreter
 ifneq "$(GhcUnregisterised)" "YES"
 rts_S_SRCS += rts/StgCRunAsm.S
+endif
+
+# select adjustor implementation. This much match the logic in rts.cabal.in.
+ifneq "$(CLEANING)" "YES"
+# N.B. we don't source config.mk when CLEANING=YES so none of the below
+# variables will be set. See #20166.
+ifeq "$(UseLibffiForAdjustors)" "YES"
+rts_C_SRCS += rts/adjustor/LibffiAdjustor.c
+else
+ifneq "$(findstring $(TargetArch_CPP), i386)" ""
+rts_S_SRCS += rts/AdjustorAsm.S
+rts_C_SRCS += rts/adjustor/Nativei386.c
+else
+ifneq "$(findstring $(TargetArch_CPP), x86_64)" ""
+rts_C_SRCS += rts/adjustor/NativeAmd64.c
+else
+ifneq "$(findstring $(TargetArch_CPP), powerpc64le powerpc)" ""
+rts_S_SRCS += rts/AdjustorAsm.S
+rts_C_SRCS += rts/adjustor/NativePowerPC.c
+else
+$(error Target architecture has no native adjustor implementation)
+endif
+endif
+endif
 endif
 endif
 endif
@@ -190,8 +213,12 @@ ifeq "$(NEED_DTRACE_PROBES_OBJ)" "YES"
 rts_$1_DTRACE_OBJS = rts/dist/build/RtsProbes.$$($1_osuf)
 
 $$(rts_$1_DTRACE_OBJS) : $$(rts_$1_OBJS)
-	$(DTRACE) -G -C $$(addprefix -I,$$(GHC_INCLUDE_DIRS)) -DDTRACE -s rts/RtsProbes.d -o \
-		$$@ $$(rts_$1_OBJS)
+	$(DTRACE) -G -C \
+		$$(addprefix -I,$$(GHC_INCLUDE_DIRS)) \
+		-I$$(BUILD_1_INCLUDE_DIR) \
+		-DDTRACE -s rts/RtsProbes.d \
+		-o $$@ \
+		$$(rts_$1_OBJS)
 endif
 endif
 
@@ -201,7 +228,7 @@ rts_dist_$1_CC_OPTS += -DRtsWay=\"rts_$1\"
 # Adding this here means it doesn't have to be done in individual .c files
 # and also centralizes the versioning.
 ifeq "$$(TargetOS_CPP)" "mingw32"
-rts_dist_$1_CC_OPTS += -DWINVER=$(rts_WINVER)
+rts_dist_$1_CC_OPTS += -D_WIN32_WINNT=$(rts_WINVER)
 endif
 
 ifneq "$$(UseSystemLibFFI)" "YES"
@@ -325,17 +352,16 @@ $(eval $(call distdir-opts,rts,dist,1))
 # We like plenty of warnings.
 WARNING_OPTS += -Wall
 WARNING_OPTS += -Wextra
-WARNING_OPTS += -Wstrict-prototypes 
-WARNING_OPTS += -Wmissing-prototypes 
+WARNING_OPTS += -Wstrict-prototypes
+WARNING_OPTS += -Wmissing-prototypes
 WARNING_OPTS += -Wmissing-declarations
 WARNING_OPTS += -Winline
 WARNING_OPTS += -Wpointer-arith
 WARNING_OPTS += -Wmissing-noreturn
 WARNING_OPTS += -Wnested-externs
 WARNING_OPTS += -Wredundant-decls
-ifeq "$(GccLT46)" "NO"
-WARNING_OPTS += -Wundef
-endif
+# Some gccs annoyingly enable this archaic specimen by default
+WARNING_OPTS += -Wno-aggregate-return
 
 # These ones are hard to avoid:
 #WARNING_OPTS += -Wconversion
@@ -343,7 +369,7 @@ endif
 #WARNING_OPTS += -Wshadow
 #WARNING_OPTS += -Wcast-qual
 
-# This one seems buggy on GCC 4.1.2, which is the only GCC version we 
+# This one seems buggy on GCC 4.1.2, which is the only GCC version we
 # have that can bootstrap the SPARC build. We end up with lots of supurious
 # warnings of the form "cast increases required alignment of target type".
 # Some legitimate warnings can be fixed by adding an intermediate cast to
@@ -352,7 +378,12 @@ endif
 # support for registerised builds on this arch. -- BL 2010/02/03
 # WARNING_OPTS += -Wcast-align
 
-STANDARD_OPTS += $(addprefix -I,$(GHC_INCLUDE_DIRS)) -Irts -Irts/dist/build
+STANDARD_OPTS += \
+	$(addprefix -I,$(GHC_INCLUDE_DIRS)) \
+	-I$(BUILD_1_INCLUDE_DIR) \
+	-Irts \
+	-Irts/dist/build
+
 # COMPILING_RTS is only used when building Win32 DLL support.
 STANDARD_OPTS += -DCOMPILING_RTS -DFS_NAMESPACE=rts
 
@@ -370,12 +401,8 @@ rts_CC_OPTS += -DNOSMP
 rts_HC_OPTS += -optc-DNOSMP
 endif
 
-ifeq "$(UseLibFFIForAdjustors)" "YES"
-rts_CC_OPTS += -DUSE_LIBFFI_FOR_ADJUSTORS
-endif
-
 # We *want* type-checking of hand-written cmm.
-rts_HC_OPTS += -dcmm-lint 
+rts_HC_OPTS += -dcmm-lint
 
 # -fno-strict-aliasing is required for the runtime, because we often
 # use a variety of types to represent closure pointers (StgPtr,
@@ -418,9 +445,9 @@ rts/RtsUtils_CC_OPTS += -DTargetOS=\"$(TargetOS_CPP)\"
 rts/RtsUtils_CC_OPTS += -DTargetVendor=\"$(TargetVendor_CPP)\"
 #
 rts/RtsUtils_CC_OPTS += -DGhcUnregisterised=\"$(GhcUnregisterised)\"
-rts/RtsUtils_CC_OPTS += -DGhcEnableTablesNextToCode=\"$(GhcEnableTablesNextToCode)\"
+rts/RtsUtils_CC_OPTS += -DTablesNextToCode=\"$(TablesNextToCode)\"
 #
-rts/xxhash_CC_OPTS += -O3 -ffast-math -ftree-vectorize
+rts/Hash_CC_OPTS += -O3
 
 # Compile various performance-critical pieces *without* -fPIC -dynamic
 # even when building a shared library.  If we don't do this, then the
@@ -483,19 +510,9 @@ endif
 # add CFLAGS for libffi
 ifeq "$(UseSystemLibFFI)" "YES"
 LIBFFI_CFLAGS = $(addprefix -I,$(FFIIncludeDir))
-else
-LIBFFI_CFLAGS =
-endif
-# ffi.h triggers prototype warnings, so disable them here:
-rts/Interpreter_CC_OPTS += -Wno-strict-prototypes $(LIBFFI_CFLAGS)
-rts/Adjustor_CC_OPTS    += -Wno-strict-prototypes $(LIBFFI_CFLAGS)
-rts/sm/Storage_CC_OPTS  += -Wno-strict-prototypes $(LIBFFI_CFLAGS)
-# ffi.h triggers undefined macro warnings on PowerPC, disable those:
-# this matches substrings of powerpc64le, including "powerpc" and "powerpc64"
-ifneq "$(findstring $(TargetArch_CPP), powerpc64le)" ""
-rts/Interpreter_CC_OPTS += -Wno-undef
-rts/Adjustor_CC_OPTS    += -Wno-undef
-rts/sm/Storage_CC_OPTS  += -Wno-undef
+rts/Interpreter_CC_OPTS += $(LIBFFI_CFLAGS)
+rts/Adjustor_CC_OPTS    += $(LIBFFI_CFLAGS)
+rts/sm/Storage_CC_OPTS  += $(LIBFFI_CFLAGS)
 endif
 
 # inlining warnings happen in Compact
@@ -504,18 +521,17 @@ rts/sm/Compact_CC_OPTS += -Wno-inline
 # emits warnings about call-clobbered registers on x86_64
 rts/StgCRun_CC_OPTS += -w
 
-rts/RetainerProfile_CC_OPTS += -w
 # On Windows:
 rts/win32/ConsoleHandler_CC_OPTS += -w
 rts/win32/ThrIOManager_CC_OPTS += -w
 # The above warning suppression flags are a temporary kludge.
 # While working on this module you are encouraged to remove it and fix
 # any warnings in the module. See
-#     http://ghc.haskell.org/trac/ghc/wiki/WorkingConventions#Warnings
+#     https://gitlab.haskell.org/ghc/ghc/wikis/working-conventions#Warnings
 # for details
 
 # Without this, thread_obj will not be inlined (at least on x86 with GCC 4.1.0)
-ifneq "$(CC_CLANG_BACKEND)" "1"
+ifneq "$(CcLlvmBackend)" "YES"
 rts/sm/Compact_CC_OPTS += -finline-limit=2500
 endif
 
@@ -539,6 +555,14 @@ rts_PACKAGE_CPP_OPTS += -DFFI_INCLUDE_DIR=
 rts_PACKAGE_CPP_OPTS += -DFFI_LIB_DIR=
 rts_PACKAGE_CPP_OPTS += '-DFFI_LIB="C$(LIBFFI_NAME)"'
 
+endif
+
+ifeq "$(UseLibdw)" "YES"
+rts_PACKAGE_CPP_OPTS += -DLIBDW_INCLUDE_DIR=$(LibdwIncludeDir)
+rts_PACKAGE_CPP_OPTS += -DLIBDW_LIB_DIR=$(LibdwLibDir)
+else
+rts_PACKAGE_CPP_OPTS += -DLIBDW_INCLUDE_DIR=
+rts_PACKAGE_CPP_OPTS += -DLIBDW_LIB_DIR=
 endif
 
 # -----------------------------------------------------------------------------
@@ -569,6 +593,10 @@ endif
 
 $(eval $(call dependencies,rts,dist,1))
 
+$(rts_dist_depfile_c_asm) : $(includes_dist_H_CONFIG)
+$(rts_dist_depfile_c_asm) : $(includes_dist_H_PLATFORM)
+$(rts_dist_depfile_c_asm) : $(includes_dist_H_VERSION)
+
 $(rts_dist_depfile_c_asm) : $(DTRACEPROBES_H)
 ifneq "$(UseSystemLibFFI)" "YES"
 $(rts_dist_depfile_c_asm) : $(libffi_HEADERS)
@@ -595,7 +623,7 @@ DTRACE_FLAGS = -x cpppath=$(CC)
 endif
 
 DTRACEPROBES_SRC = rts/RtsProbes.d
-$(DTRACEPROBES_H): $(DTRACEPROBES_SRC) includes/ghcplatform.h | $$(dir $$@)/.
+$(DTRACEPROBES_H): $(DTRACEPROBES_SRC) $(includes_1_H_PLATFORM) | $$(dir $$@)/.
 	"$(DTRACE)" $(filter -I%,$(rts_CC_OPTS)) -C $(DTRACE_FLAGS) -h -o $@ -s $<
 endif
 
@@ -611,9 +639,9 @@ ifeq "$(HaveLibMingwEx)" "YES"
 rts_PACKAGE_CPP_OPTS += -DHAVE_LIBMINGWEX
 endif
 
-$(eval $(call manual-package-config,rts))
+$(eval $(call manual-package-config,rts,1))
 
-rts/package.conf.inplace : $(includes_H_CONFIG) $(includes_H_PLATFORM)
+rts/dist/package.conf.inplace : $(includes_1_H_CONFIG) $(includes_1_H_PLATFORM) $(includes_1_H_VERSION)
 
 # -----------------------------------------------------------------------------
 # installing
@@ -639,4 +667,3 @@ install_libffi_headers :
 $(eval $(call clean-target,rts,dist,rts/dist))
 
 BINDIST_EXTRAS += rts/package.conf.in
-

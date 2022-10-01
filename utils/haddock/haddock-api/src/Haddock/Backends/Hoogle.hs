@@ -1,5 +1,6 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Haddock.Backends.Hoogle
@@ -17,20 +18,20 @@ module Haddock.Backends.Hoogle (
     ppHoogle
   ) where
 
-import BasicTypes ( OverlapFlag(..), OverlapMode(..), SourceText(..)
-                  , PromotionFlag(..) )
-import InstEnv (ClsInst(..))
+import GHC.Types.Basic ( OverlapFlag(..), OverlapMode(..), SourceText(..)
+                  , PromotionFlag(..), TopLevelFlag(..) )
+import GHC.Core.InstEnv (ClsInst(..))
 import Documentation.Haddock.Markup
 import Haddock.GhcUtils
 import Haddock.Types hiding (Version)
 import Haddock.Utils hiding (out)
 
 import GHC
-import Outputable
-import NameSet
+import GHC.Utils.Outputable as Outputable
+import GHC.Parser.Annotation (IsUnicodeSyntax(..))
 
 import Data.Char
-import Data.List
+import Data.List (intercalate, isPrefixOf)
 import Data.Maybe
 import Data.Version
 
@@ -77,17 +78,17 @@ dropHsDocTy = f
         f (HsBangTy x a b) = HsBangTy x a (g b)
         f (HsAppTy x a b) = HsAppTy x (g a) (g b)
         f (HsAppKindTy x a b) = HsAppKindTy x (g a) (g b)
-        f (HsFunTy x a b) = HsFunTy x (g a) (g b)
+        f (HsFunTy x w a b) = HsFunTy x w (g a) (g b)
         f (HsListTy x a) = HsListTy x (g a)
         f (HsTupleTy x a b) = HsTupleTy x a (map g b)
         f (HsOpTy x a b c) = HsOpTy x (g a) b (g c)
         f (HsParTy x a) = HsParTy x (g a)
         f (HsKindSig x a b) = HsKindSig x (g a) b
-        f (HsDocTy _ a _) = f $ unL a
+        f (HsDocTy _ a _) = f $ unLoc a
         f x = x
 
-outHsType :: (a ~ GhcPass p, OutputableBndrId a)
-          => DynFlags -> HsType a -> String
+outHsType :: (OutputableBndrId p)
+          => DynFlags -> HsType (GhcPass p) -> String
 outHsType dflags = out dflags . reparenType . dropHsDocTy
 
 
@@ -174,7 +175,7 @@ ppClass dflags decl subdocs =
             | null $ tcdATs decl = ""
             | otherwise = (" " ++) . showSDocUnqual dflags . whereWrapper $ concat
                 [ map pprTyFam (tcdATs decl)
-                , map (ppr . tyFamEqnToSyn . unLoc) (tcdATDefs decl)
+                , map (pprTyFamInstDecl NotTopLevel . unLoc) (tcdATDefs decl)
                 ]
 
         pprTyFam :: LFamilyDecl GhcRn -> SDoc
@@ -187,15 +188,6 @@ ppClass dflags decl subdocs =
             , rbrace
             ]
 
-        tyFamEqnToSyn :: TyFamDefltEqn GhcRn -> TyClDecl GhcRn
-        tyFamEqnToSyn tfe = SynDecl
-            { tcdLName  = feqn_tycon tfe
-            , tcdTyVars = feqn_pats tfe
-            , tcdFixity = feqn_fixity tfe
-            , tcdRhs    = feqn_rhs tfe
-            , tcdSExt   = emptyNameSet
-            }
-
 ppFam :: DynFlags -> FamilyDecl GhcRn -> [String]
 ppFam dflags decl@(FamilyDecl { fdInfo = info })
   = [out dflags decl']
@@ -205,7 +197,6 @@ ppFam dflags decl@(FamilyDecl { fdInfo = info })
               -- for Hoogle, so pretend it doesn't have any.
               ClosedTypeFamily{} -> decl { fdInfo = OpenTypeFamily }
               _                  -> decl
-ppFam _ XFamilyDecl {} = panic "ppFam"
 
 ppInstance :: DynFlags -> ClsInst -> [String]
 ppInstance dflags x =
@@ -225,7 +216,7 @@ ppSynonym dflags x = [out dflags x]
 ppData :: DynFlags -> TyClDecl GhcRn -> [(Name, DocForDecl Name)] -> [String]
 ppData dflags decl@(DataDecl { tcdDataDefn = defn }) subdocs
     = showData decl{ tcdDataDefn = defn { dd_cons=[],dd_derivs=noLoc [] }} :
-      concatMap (ppCtor dflags decl subdocs . unL) (dd_cons defn)
+      concatMap (ppCtor dflags decl subdocs . unLoc) (dd_cons defn)
     where
 
         -- GHC gives out "data Bar =", we want to delete the equals.
@@ -247,42 +238,40 @@ ppCtor dflags dat subdocs con@ConDeclH98 {}
   -- AZ:TODO get rid of the concatMap
    = concatMap (lookupCon dflags subdocs) [con_name con] ++ f (getConArgs con)
     where
-        f (PrefixCon args) = [typeSig name $ args ++ [resType]]
+        f (PrefixCon args) = [typeSig name $ (map hsScaledThing args) ++ [resType]]
         f (InfixCon a1 a2) = f $ PrefixCon [a1,a2]
-        f (RecCon (L _ recs)) = f (PrefixCon $ map cd_fld_type (map unLoc recs)) ++ concat
+        f (RecCon (L _ recs)) = f (PrefixCon $ map (hsLinear . cd_fld_type . unLoc) recs) ++ concat
                           [(concatMap (lookupCon dflags subdocs . noLoc . extFieldOcc . unLoc) (cd_fld_names r)) ++
                            [out dflags (map (extFieldOcc . unLoc) $ cd_fld_names r) `typeSig` [resType, cd_fld_type r]]
                           | r <- map unLoc recs]
 
-        funs = foldr1 (\x y -> reL $ HsFunTy NoExt x y)
-        apps = foldl1 (\x y -> reL $ HsAppTy NoExt x y)
+        funs = foldr1 (\x y -> reL $ HsFunTy noExtField (HsUnrestrictedArrow NormalSyntax) x y)
+        apps = foldl1 (\x y -> reL $ HsAppTy noExtField x y)
 
         typeSig nm flds = operator nm ++ " :: " ++ outHsType dflags (unL $ funs flds)
 
         -- We print the constructors as comma-separated list. See GHC
         -- docs for con_names on why it is a list to begin with.
-        name = commaSeparate dflags . map unL $ getConNames con
+        name = commaSeparate dflags . map unLoc $ getConNames con
 
-        resType = let c  = HsTyVar NoExt NotPromoted (noLoc (tcdName dat))
-                      as = map (tyVarBndr2Type . unLoc) (hsQTvExplicit $ tyClDeclTyVars dat)
-                  in apps (map noLoc (c : as))
+        tyVarArg (UserTyVar _ _ n) = HsTyVar noExtField NotPromoted n
+        tyVarArg (KindedTyVar _ _ n lty) = HsKindSig noExtField (reL (HsTyVar noExtField NotPromoted n)) lty
+        tyVarArg _ = panic "ppCtor"
 
-        tyVarBndr2Type :: HsTyVarBndr GhcRn -> HsType GhcRn
-        tyVarBndr2Type (UserTyVar _ n) = HsTyVar NoExt NotPromoted n
-        tyVarBndr2Type (KindedTyVar _ n k) = HsKindSig NoExt (noLoc (HsTyVar NoExt NotPromoted n)) k
-        tyVarBndr2Type (XTyVarBndr _) = panic "haddock:ppCtor"
+        resType = apps $ map reL $
+                        (HsTyVar noExtField NotPromoted (reL (tcdName dat))) :
+                        map (tyVarArg . unLoc) (hsQTvExplicit $ tyClDeclTyVars dat)
 
 ppCtor dflags _dat subdocs con@(ConDeclGADT { })
    = concatMap (lookupCon dflags subdocs) (getConNames con) ++ f
     where
         f = [typeSig name (getGADTConTypeG con)]
 
-        typeSig nm ty = operator nm ++ " :: " ++ outHsType dflags (unL ty)
-        name = out dflags $ map unL $ getConNames con
-ppCtor _ _ _ XConDecl {} = panic "haddock:ppCtor"
+        typeSig nm ty = operator nm ++ " :: " ++ outHsType dflags (unLoc ty)
+        name = out dflags $ map unLoc $ getConNames con
 
 ppFixity :: DynFlags -> (Name, Fixity) -> [String]
-ppFixity dflags (name, fixity) = [out dflags ((FixitySig noExt [noLoc name] fixity) :: FixitySig GhcRn)]
+ppFixity dflags (name, fixity) = [out dflags ((FixitySig noExtField [noLoc name] fixity) :: FixitySig GhcRn)]
 
 
 ---------------------------------------------------------------------
@@ -308,7 +297,7 @@ docWith dflags header d
 mkSubdoc :: DynFlags -> Located Name -> [(Name, DocForDecl Name)] -> [String] -> [String]
 mkSubdoc dflags n subdocs s = concatMap (ppDocumentation dflags) getDoc ++ s
  where
-   getDoc = maybe [] (return . fst) (lookup (unL n) subdocs)
+   getDoc = maybe [] (return . fst) (lookup (unLoc n) subdocs)
 
 data Tag = TagL Char [Tags] | TagP Tags | TagPre Tags | TagInline String Tags | Str String
            deriving Show
@@ -336,7 +325,7 @@ markupTag dflags = Markup {
   markupAppend               = (++),
   markupIdentifier           = box (TagInline "a") . str . out dflags,
   markupIdentifierUnchecked  = box (TagInline "a") . str . showWrapped (out dflags . snd),
-  markupModule               = box (TagInline "a") . str,
+  markupModule               = \(ModLink m label) -> box (TagInline "a") (fromMaybe (str m) label),
   markupWarning              = box (TagInline "i"),
   markupEmphasis             = box (TagInline "i"),
   markupBold                 = box (TagInline "b"),

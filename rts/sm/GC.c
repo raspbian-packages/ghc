@@ -7,7 +7,7 @@
  * Documentation on the architecture of the Garbage Collector can be
  * found in the online commentary:
  *
- *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/Rts/Storage/GC
+ *   https://gitlab.haskell.org/ghc/ghc/wikis/commentary/rts/storage/gc
  *
  * ---------------------------------------------------------------------------*/
 
@@ -51,10 +51,7 @@
 #include "CheckUnload.h"
 #include "CNF.h"
 #include "RtsFlags.h"
-
-#if defined(PROFILING)
-#include "RetainerProfile.h"
-#endif
+#include "NonMoving.h"
 
 #include <string.h> // for memset()
 #include <unistd.h>
@@ -100,6 +97,13 @@
  * See also: Note [STATIC_LINK fields] in Storage.h.
  */
 
+/* Hot GC globals
+ * ~~~~~~~~~~~~~~
+ * The globals below are quite hot during GC but read-only, initialized during
+ * the beginning of collection. It is important that they reside in the same
+ * cache-line to minimize unnecessary cache misses.
+ */
+
 /* N is the oldest generation being collected, where the generations
  * are numbered starting at 0.  A major GC (indicated by the major_gc
  * flag) is when we're collecting all generations.  We only attempt to
@@ -107,6 +111,8 @@
  */
 uint32_t N;
 bool major_gc;
+bool deadlock_detect_gc;
+bool unload_mark_needed;
 
 /* Data used for allocation area sizing.
  */
@@ -114,14 +120,8 @@ static W_ g0_pcnt_kept = 30; // percentage of g0 live at last minor GC
 
 /* Mut-list stats */
 #if defined(DEBUG)
-uint32_t mutlist_MUTVARS,
-    mutlist_MUTARRS,
-    mutlist_MVARS,
-    mutlist_TVAR,
-    mutlist_TVAR_WATCH_QUEUE,
-    mutlist_TREC_CHUNK,
-    mutlist_TREC_HEADER,
-    mutlist_OTHERS;
+// For lack of a better option we protect mutlist_scav_stats with oldest_gen->sync
+MutListScavStats mutlist_scav_stats;
 #endif
 
 /* Thread-local data for each GC thread
@@ -134,8 +134,22 @@ StgWord8 the_gc_thread[sizeof(gc_thread) + 64 * sizeof(gen_workspace)]
     ATTRIBUTE_ALIGNED(64);
 #endif
 
-// Number of threads running in *this* GC.  Affects how many
-// step->todos[] lists we have to look in to find work.
+/* Note [n_gc_threads]
+This is a global variable that originally tracked the number of threads
+participating in the current gc. It's meaing has diverged from this somewhate.
+In practise, it now takes one of the values {1, n_capabilities}. Don't be
+tricked into thinking this means garbage collections must have 1 or
+n_capabilities participating: idle capabilities (idle_cap[cap->no]) are included
+in the n_gc_thread count.
+
+Clearly this is in need of some tidying up, but for now we tread carefully. We
+check n_gc_threads > 1 to see whether we are in a parallel or sequential. We
+ensure n_gc_threads > 1 before iterating over gc_threads a la:
+
+for(i=0;i<n_gc_threads;++i) { foo(gc_thread[i]; )}
+
+Omitting this check has led to issues such as #19147.
+*/
 uint32_t n_gc_threads;
 
 // For stats:
@@ -163,7 +177,6 @@ static void mark_root               (void *user, StgClosure **root);
 static void prepare_collected_gen   (generation *gen);
 static void prepare_uncollected_gen (generation *gen);
 static void init_gc_thread          (gc_thread *t);
-static void resize_generations      (void);
 static void resize_nursery          (void);
 static void start_gc_threads        (void);
 static void scavenge_until_all_done (void);
@@ -187,6 +200,36 @@ bdescr *mark_stack_top_bd; // topmost block in the mark stack
 bdescr *mark_stack_bd;     // current block in the mark stack
 StgPtr mark_sp;            // pointer to the next unallocated mark stack entry
 
+
+/* -----------------------------------------------------------------------------
+   Statistics from mut_list scavenging
+   -------------------------------------------------------------------------- */
+
+#if defined(DEBUG)
+void
+zeroMutListScavStats(MutListScavStats *src)
+{
+    memset(src, 0, sizeof(MutListScavStats));
+}
+
+void
+addMutListScavStats(const MutListScavStats *src,
+                    MutListScavStats *dest)
+{
+#define ADD_STATS(field) dest->field += src->field;
+    ADD_STATS(n_MUTVAR);
+    ADD_STATS(n_MUTARR);
+    ADD_STATS(n_MVAR);
+    ADD_STATS(n_TVAR);
+    ADD_STATS(n_TREC_CHUNK);
+    ADD_STATS(n_TVAR_WATCH_QUEUE);
+    ADD_STATS(n_TREC_HEADER);
+    ADD_STATS(n_OTHERS);
+#undef ADD_STATS
+}
+#endif /* DEBUG */
+
+
 /* -----------------------------------------------------------------------------
    GarbageCollect: the main entry point to the garbage collector.
 
@@ -197,7 +240,8 @@ StgPtr mark_sp;            // pointer to the next unallocated mark stack entry
 
 void
 GarbageCollect (uint32_t collect_gen,
-                bool do_heap_census,
+                const bool do_heap_census,
+                const bool deadlock_detect,
                 uint32_t gc_type USED_IF_THREADS,
                 Capability *cap,
                 bool idle_cap[])
@@ -211,6 +255,14 @@ GarbageCollect (uint32_t collect_gen,
   gc_thread *saved_gct;
 #endif
   uint32_t g, n;
+  // The time we should report our heap census as occurring at, if necessary.
+  Time mut_time = 0;
+
+  if (do_heap_census) {
+      RTSStats stats;
+      getRTSStats(&stats);
+      mut_time = stats.mutator_cpu_ns;
+  }
 
   // necessary if we stole a callee-saves register for gct:
 #if defined(THREADED_RTS)
@@ -244,14 +296,7 @@ GarbageCollect (uint32_t collect_gen,
   stablePtrLock();
 
 #if defined(DEBUG)
-  mutlist_MUTVARS = 0;
-  mutlist_MUTARRS = 0;
-  mutlist_MVARS = 0;
-  mutlist_TVAR = 0;
-  mutlist_TVAR_WATCH_QUEUE = 0;
-  mutlist_TREC_CHUNK = 0;
-  mutlist_TREC_HEADER = 0;
-  mutlist_OTHERS = 0;
+  zeroMutListScavStats(&mutlist_scav_stats);
 #endif
 
   // attribute any costs to CCS_GC
@@ -267,10 +312,34 @@ GarbageCollect (uint32_t collect_gen,
   N = collect_gen;
   major_gc = (N == RtsFlags.GcFlags.generations-1);
 
-  if (major_gc) {
+  /* See Note [Deadlock detection under nonmoving collector]. */
+  deadlock_detect_gc = deadlock_detect;
+
+#if defined(THREADED_RTS)
+  if (major_gc && RtsFlags.GcFlags.useNonmoving && concurrent_coll_running) {
+      /* If there is already a concurrent major collection running then
+       * there is no benefit to starting another.
+       * TODO: Catch heap-size runaway.
+       */
+      N--;
+      collect_gen--;
+      major_gc = false;
+  }
+#endif
+
+  /* N.B. The nonmoving collector works a bit differently. See
+   * Note [Static objects under the nonmoving collector].
+   */
+  if (major_gc && !RtsFlags.GcFlags.useNonmoving) {
       prev_static_flag = static_flag;
       static_flag =
           static_flag == STATIC_FLAG_A ? STATIC_FLAG_B : STATIC_FLAG_A;
+  }
+
+  if (major_gc) {
+      unload_mark_needed = prepareUnloadCheck();
+  } else {
+      unload_mark_needed = false;
   }
 
 #if defined(THREADED_RTS)
@@ -281,7 +350,7 @@ GarbageCollect (uint32_t collect_gen,
       // lose locality by moving cached data into another CPU's cache
       // (this effect can be quite significant).
       //
-      // We could have a more complex way to deterimine whether to do
+      // We could have a more complex way to determine whether to do
       // work stealing or not, e.g. it might be a good idea to do it
       // if the heap is big.  For now, we just turn it on or off with
       // a flag.
@@ -416,15 +485,20 @@ GarbageCollect (uint32_t collect_gen,
    * Repeatedly scavenge all the areas we know about until there's no
    * more scavenging to be done.
    */
+
+  StgWeak *dead_weak_ptr_list = NULL;
+  StgTSO *resurrected_threads = END_TSO_QUEUE;
+
   for (;;)
   {
       scavenge_until_all_done();
+
       // The other threads are now stopped.  We might recurse back to
       // here, but from now on this is the only thread.
 
       // must be last...  invariant is that everything is fully
       // scavenged at this point.
-      if (traverseWeakPtrList()) { // returns true if evaced something
+      if (traverseWeakPtrList(&dead_weak_ptr_list, &resurrected_threads)) { // returns true if evaced something
           inc_running();
           continue;
       }
@@ -441,12 +515,12 @@ GarbageCollect (uint32_t collect_gen,
 #if defined(THREADED_RTS)
   if (n_gc_threads == 1) {
       for (n = 0; n < n_capabilities; n++) {
-          pruneSparkQueue(capabilities[n]);
+          pruneSparkQueue(false, capabilities[n]);
       }
   } else {
       for (n = 0; n < n_capabilities; n++) {
           if (n == cap->no || idle_cap[n]) {
-              pruneSparkQueue(capabilities[n]);
+              pruneSparkQueue(false, capabilities[n]);
          }
       }
   }
@@ -468,7 +542,9 @@ GarbageCollect (uint32_t collect_gen,
   // Finally: compact or sweep the oldest generation.
   if (major_gc && oldest_gen->mark) {
       if (oldest_gen->compact)
-          compact(gct->scavenged_static_objects);
+          compact(gct->scavenged_static_objects,
+                  &dead_weak_ptr_list,
+                  &resurrected_threads);
       else
           sweep(oldest_gen);
   }
@@ -488,45 +564,46 @@ GarbageCollect (uint32_t collect_gen,
       uint64_t par_balanced_copied_acc = 0;
       const gc_thread* thread;
 
-      for (i=0; i < n_gc_threads; i++) {
-          copied += gc_threads[i]->copied;
-      }
-      for (i=0; i < n_gc_threads; i++) {
-          thread = gc_threads[i];
-          if (n_gc_threads > 1) {
+      // see Note [n_gc_threads]
+      if (n_gc_threads > 1) {
+          for (i=0; i < n_gc_threads; i++) {
+              copied += RELAXED_LOAD(&gc_threads[i]->copied);
+          }
+          for (i=0; i < n_gc_threads; i++) {
+              thread = gc_threads[i];
               debugTrace(DEBUG_gc,"thread %d:", i);
               debugTrace(DEBUG_gc,"   copied           %ld",
-                         thread->copied * sizeof(W_));
+                         RELAXED_LOAD(&thread->copied) * sizeof(W_));
               debugTrace(DEBUG_gc,"   scanned          %ld",
-                         thread->scanned * sizeof(W_));
+                         RELAXED_LOAD(&thread->scanned) * sizeof(W_));
               debugTrace(DEBUG_gc,"   any_work         %ld",
-                         thread->any_work);
+                         RELAXED_LOAD(&thread->any_work));
               debugTrace(DEBUG_gc,"   no_work          %ld",
-                         thread->no_work);
+                         RELAXED_LOAD(&thread->no_work));
               debugTrace(DEBUG_gc,"   scav_find_work %ld",
-                         thread->scav_find_work);
+                         RELAXED_LOAD(&thread->scav_find_work));
 
 #if defined(THREADED_RTS) && defined(PROF_SPIN)
-              gc_spin_spin += thread->gc_spin.spin;
-              gc_spin_yield += thread->gc_spin.yield;
-              mut_spin_spin += thread->mut_spin.spin;
-              mut_spin_yield += thread->mut_spin.yield;
+              gc_spin_spin += RELAXED_LOAD(&thread->gc_spin.spin);
+              gc_spin_yield += RELAXED_LOAD(&thread->gc_spin.yield);
+              mut_spin_spin += RELAXED_LOAD(&thread->mut_spin.spin);
+              mut_spin_yield += RELAXED_LOAD(&thread->mut_spin.yield);
 #endif
 
-              any_work += thread->any_work;
-              no_work += thread->no_work;
-              scav_find_work += thread->scav_find_work;
+              any_work += RELAXED_LOAD(&thread->any_work);
+              no_work += RELAXED_LOAD(&thread->no_work);
+              scav_find_work += RELAXED_LOAD(&thread->scav_find_work);
 
-              par_max_copied = stg_max(gc_threads[i]->copied, par_max_copied);
+              par_max_copied = stg_max(RELAXED_LOAD(&thread->copied), par_max_copied);
               par_balanced_copied_acc +=
-                  stg_min(n_gc_threads * gc_threads[i]->copied, copied);
+                  stg_min(n_gc_threads * RELAXED_LOAD(&thread->copied), copied);
           }
-      }
-      if (n_gc_threads > 1) {
           // See Note [Work Balance] for an explanation of this computation
           par_balanced_copied =
               (par_balanced_copied_acc - copied + (n_gc_threads - 1) / 2) /
               (n_gc_threads - 1);
+      } else {
+          copied += gct->copied;
       }
   }
 
@@ -559,21 +636,25 @@ GarbageCollect (uint32_t collect_gen,
         debugTrace(DEBUG_gc,
                    "mut_list_size: %lu (%d vars, %d arrays, %d MVARs, %d TVARs, %d TVAR_WATCH_QUEUEs, %d TREC_CHUNKs, %d TREC_HEADERs, %d others)",
                    (unsigned long)(mut_list_size * sizeof(W_)),
-                   mutlist_MUTVARS, mutlist_MUTARRS, mutlist_MVARS,
-                   mutlist_TVAR, mutlist_TVAR_WATCH_QUEUE,
-                   mutlist_TREC_CHUNK, mutlist_TREC_HEADER,
-                   mutlist_OTHERS);
+                   mutlist_scav_stats.n_MUTVAR,
+                   mutlist_scav_stats.n_MUTARR,
+                   mutlist_scav_stats.n_MVAR,
+                   mutlist_scav_stats.n_TVAR,
+                   mutlist_scav_stats.n_TVAR_WATCH_QUEUE,
+                   mutlist_scav_stats.n_TREC_CHUNK,
+                   mutlist_scav_stats.n_TREC_HEADER,
+                   mutlist_scav_stats.n_OTHERS);
     }
 
     bdescr *next, *prev;
     gen = &generations[g];
 
     // for generations we collected...
-    if (g <= N) {
+    if (g <= N && !(RtsFlags.GcFlags.useNonmoving && gen == oldest_gen)) {
 
         /* free old memory and shift to-space into from-space for all
          * the collected generations (except the allocation area).  These
-         * freed blocks will probaby be quickly recycled.
+         * freed blocks will probably be quickly recycled.
          */
         if (gen->mark)
         {
@@ -623,7 +704,7 @@ GarbageCollect (uint32_t collect_gen,
             ASSERT(countBlocks(gen->blocks) == gen->n_blocks);
             ASSERT(countOccupied(gen->blocks) == gen->n_words);
         }
-        else // not copacted
+        else // not compacted
         {
             freeChain(gen->old_blocks);
         }
@@ -707,8 +788,57 @@ GarbageCollect (uint32_t collect_gen,
     }
   } // for all generations
 
-  // update the max size of older generations after a major GC
-  resize_generations();
+  // Flush the update remembered sets. See Note [Eager update remembered set
+  // flushing] in NonMovingMark.c
+  if (RtsFlags.GcFlags.useNonmoving) {
+      RELEASE_SM_LOCK;
+      for (n = 0; n < n_capabilities; n++) {
+          nonmovingAddUpdRemSetBlocks(&capabilities[n]->upd_rem_set.queue);
+      }
+      ACQUIRE_SM_LOCK;
+  }
+
+  // Mark and sweep the oldest generation.
+  // N.B. This can only happen after we've moved
+  // oldest_gen->scavenged_large_objects back to oldest_gen->large_objects.
+  ASSERT(oldest_gen->scavenged_large_objects == NULL);
+  if (RtsFlags.GcFlags.useNonmoving && major_gc) {
+      // All threads in non-moving heap should be found to be alive, because
+      // threads in the non-moving generation's list should live in the
+      // non-moving heap, and we consider non-moving objects alive during
+      // preparation.
+      ASSERT(oldest_gen->old_threads == END_TSO_QUEUE);
+      // For weaks, remember that we evacuated all weaks to the non-moving heap
+      // in markWeakPtrList(), and then moved the weak_ptr_list list to
+      // old_weak_ptr_list. We then moved weaks with live keys to the
+      // weak_ptr_list again. Then, in collectDeadWeakPtrs() we moved weaks in
+      // old_weak_ptr_list to dead_weak_ptr_list. So at this point
+      // old_weak_ptr_list should be empty.
+      ASSERT(oldest_gen->old_weak_ptr_list == NULL);
+
+      // we may need to take the lock to allocate mark queue blocks
+      RELEASE_SM_LOCK;
+      // dead_weak_ptr_list contains weak pointers with dead keys. Those need to
+      // be kept alive because we'll use them in finalizeSchedulers(). Similarly
+      // resurrected_threads are also going to be used in resurrectedThreads()
+      // so we need to mark those too.
+      // Note that in sequential case these lists will be appended with more
+      // weaks and threads found to be dead in mark.
+#if !defined(THREADED_RTS)
+      // In the non-threaded runtime this is the only time we push to the
+      // upd_rem_set
+      nonmovingAddUpdRemSetBlocks(&gct->cap->upd_rem_set.queue);
+#endif
+      nonmovingCollect(&dead_weak_ptr_list, &resurrected_threads);
+      ACQUIRE_SM_LOCK;
+  }
+
+  // Update the max size of older generations after a major GC:
+  // We can't resize here in the case of the concurrent collector since we
+  // don't yet know how much live data we have. This will be instead done
+  // once we finish marking.
+  if (major_gc && RtsFlags.GcFlags.generations > 1 && ! RtsFlags.GcFlags.useNonmoving)
+      resizeGenerations();
 
   // Free the mark stack.
   if (mark_stack_top_bd != NULL) {
@@ -730,9 +860,12 @@ GarbageCollect (uint32_t collect_gen,
 
   resetNurseries();
 
- // mark the garbage collected CAFs as dead
 #if defined(DEBUG)
-  if (major_gc) { gcCAFs(); }
+  // Mark the garbage collected CAFs as dead. Done in `nonmovingGcCafs()` when
+  // non-moving GC is enabled.
+  if (major_gc && !RtsFlags.GcFlags.useNonmoving) {
+      gcCAFs();
+  }
 #endif
 
   // Update the stable name hash table
@@ -743,17 +876,22 @@ GarbageCollect (uint32_t collect_gen,
   // hs_free_stable_ptr(), both of which access the StablePtr table.
   stablePtrUnlock();
 
-  // Must be after stablePtrUnlock(), because it might free stable ptrs.
-  if (major_gc) {
-      checkUnload (gct->scavenged_static_objects);
+  // Unload dynamically-loaded object code after a major GC.
+  // See Note [Object unloading] in CheckUnload.c for details.
+  //
+  // TODO: Similar to `nonmovingGcCafs` non-moving GC should have its own
+  // collector for these objects, but that's currently not implemented, so we
+  // simply don't unload object code when non-moving GC is enabled.
+  if (major_gc && !RtsFlags.GcFlags.useNonmoving) {
+      checkUnload();
   }
 
 #if defined(PROFILING)
-  // resetStaticObjectForRetainerProfiling() must be called before
+  // resetStaticObjectForProfiling() must be called before
   // zeroing below.
 
   // ToDo: fix the gct->scavenged_static_objects below
-  resetStaticObjectForRetainerProfiling(gct->scavenged_static_objects);
+  resetStaticObjectForProfiling(gct->scavenged_static_objects);
 #endif
 
   // Start any pending finalizers.  Must be after
@@ -765,8 +903,9 @@ GarbageCollect (uint32_t collect_gen,
   // check sanity after GC
   // before resurrectThreads(), because that might overwrite some
   // closures, which will cause problems with THREADED where we don't
-  // fill slop.
-  IF_DEBUG(sanity, checkSanity(true /* after GC */, major_gc));
+  // fill slop. If we are using the nonmoving collector then we can't claim to
+  // be *after* the major GC; it's now running concurrently.
+  IF_DEBUG(sanity, checkSanity(true /* after GC */, major_gc && !RtsFlags.GcFlags.useNonmoving));
 
   // If a heap census is due, we need to do it before
   // resurrectThreads(), for the same reason as checkSanity above:
@@ -775,7 +914,7 @@ GarbageCollect (uint32_t collect_gen,
   if (do_heap_census) {
       debugTrace(DEBUG_sched, "performing heap census");
       RELEASE_SM_LOCK;
-      heapCensus(gct->gc_start_cpu);
+      heapCensus(mut_time);
       ACQUIRE_SM_LOCK;
   }
 
@@ -803,7 +942,7 @@ GarbageCollect (uint32_t collect_gen,
       need_prealloc += arenaBlocks();
 #if defined(PROFILING)
       if (RtsFlags.ProfFlags.doHeapProfile == HEAP_BY_RETAINER) {
-          need_prealloc = retainerStackBlocks();
+          need_prealloc += retainerStackBlocks();
       }
 #endif
 
@@ -856,9 +995,11 @@ GarbageCollect (uint32_t collect_gen,
 #endif
 
   // ok, GC over: tell the stats department what happened.
+  stat_endGCWorker(cap, gct);
   stat_endGC(cap, gct, live_words, copied,
              live_blocks * BLOCK_SIZE_W - live_words /* slop */,
-             N, n_gc_threads, par_max_copied, par_balanced_copied,
+             N, n_gc_threads, gc_threads,
+             par_max_copied, par_balanced_copied,
              gc_spin_spin, gc_spin_yield, mut_spin_spin, mut_spin_yield,
              any_work, no_work, scav_find_work);
 
@@ -939,6 +1080,7 @@ new_gc_thread (uint32_t n, gc_thread *t)
         ws->todo_overflow = NULL;
         ws->n_todo_overflow = 0;
         ws->todo_large_objects = NULL;
+        ws->todo_seg = END_NONMOVING_TODO_LIST;
 
         ws->part_list = NULL;
         ws->n_part_blocks = 0;
@@ -1025,7 +1167,7 @@ inc_running (void)
 static StgWord
 dec_running (void)
 {
-    ASSERT(gc_running_threads != 0);
+    ASSERT(RELAXED_LOAD(&gc_running_threads) != 0);
     return atomic_dec(&gc_running_threads);
 }
 
@@ -1035,7 +1177,7 @@ any_work (void)
     int g;
     gen_workspace *ws;
 
-    gct->any_work++;
+    NONATOMIC_ADD(&gct->any_work, 1);
 
     write_barrier();
 
@@ -1068,7 +1210,7 @@ any_work (void)
     }
 #endif
 
-    gct->no_work++;
+    __atomic_fetch_add(&gct->no_work, 1, __ATOMIC_RELAXED);
 #if defined(THREADED_RTS)
     yieldThread();
 #endif
@@ -1109,7 +1251,7 @@ loop:
 
     debugTrace(DEBUG_gc, "%d GC threads still running", r);
 
-    while (gc_running_threads != 0) {
+    while (SEQ_CST_LOAD(&gc_running_threads) != 0) {
         // usleep(1);
         if (any_work()) {
             inc_running();
@@ -1137,6 +1279,7 @@ gcWorkerThread (Capability *cap)
 
     SET_GCT(gc_threads[cap->no]);
     gct->id = osThreadId();
+    stat_startGCWorker (cap, gct);
 
     // Wait until we're told to wake up
     RELEASE_SPIN_LOCK(&gct->mut_spin);
@@ -1145,7 +1288,7 @@ gcWorkerThread (Capability *cap)
     //    measurements more accurate on Linux, perhaps because it syncs
     //    the CPU time across the multiple cores.  Without this, CPU time
     //    is heavily skewed towards GC rather than MUT.
-    gct->wakeup = GC_THREAD_STANDING_BY;
+    SEQ_CST_STORE(&gct->wakeup, GC_THREAD_STANDING_BY);
     debugTrace(DEBUG_gc, "GC thread %d standing by...", gct->thread_index);
     ACQUIRE_SPIN_LOCK(&gct->gc_spin);
 
@@ -1167,14 +1310,18 @@ gcWorkerThread (Capability *cap)
     // non-deterministic whether a spark will be retained if it is
     // only reachable via weak pointers.  To fix this problem would
     // require another GC barrier, which is too high a price.
-    pruneSparkQueue(cap);
+    pruneSparkQueue(false, cap);
 #endif
 
     // Wait until we're told to continue
     RELEASE_SPIN_LOCK(&gct->gc_spin);
-    gct->wakeup = GC_THREAD_WAITING_TO_CONTINUE;
     debugTrace(DEBUG_gc, "GC thread %d waiting to continue...",
                gct->thread_index);
+    stat_endGCWorker (cap, gct);
+    // This must come *after* stat_endGCWorker since it serves to
+    // synchronize us with the GC leader, which will later aggregate the
+    // GC statistics.
+    SEQ_CST_STORE(&gct->wakeup, GC_THREAD_WAITING_TO_CONTINUE);
     ACQUIRE_SPIN_LOCK(&gct->mut_spin);
     debugTrace(DEBUG_gc, "GC thread %d on my way...", gct->thread_index);
 
@@ -1199,7 +1346,7 @@ waitForGcThreads (Capability *cap USED_IF_THREADS, bool idle_cap[])
     while(retry) {
         for (i=0; i < n_threads; i++) {
             if (i == me || idle_cap[i]) continue;
-            if (gc_threads[i]->wakeup != GC_THREAD_STANDING_BY) {
+            if (SEQ_CST_LOAD(&gc_threads[i]->wakeup) != GC_THREAD_STANDING_BY) {
                 prodCapability(capabilities[i], cap->running_task);
             }
         }
@@ -1209,7 +1356,7 @@ waitForGcThreads (Capability *cap USED_IF_THREADS, bool idle_cap[])
                 if (i == me || idle_cap[i]) continue;
                 write_barrier();
                 interruptCapability(capabilities[i]);
-                if (gc_threads[i]->wakeup != GC_THREAD_STANDING_BY) {
+                if (SEQ_CST_LOAD(&gc_threads[i]->wakeup) != GC_THREAD_STANDING_BY) {
                     retry = true;
                 }
             }
@@ -1266,10 +1413,10 @@ wakeup_gc_threads (uint32_t me USED_IF_THREADS,
         if (i == me || idle_cap[i]) continue;
         inc_running();
         debugTrace(DEBUG_gc, "waking up gc thread %d", i);
-        if (gc_threads[i]->wakeup != GC_THREAD_STANDING_BY)
+        if (SEQ_CST_LOAD(&gc_threads[i]->wakeup) != GC_THREAD_STANDING_BY)
             barf("wakeup_gc_threads");
 
-        gc_threads[i]->wakeup = GC_THREAD_RUNNING;
+        SEQ_CST_STORE(&gc_threads[i]->wakeup, GC_THREAD_RUNNING);
         ACQUIRE_SPIN_LOCK(&gc_threads[i]->mut_spin);
         RELEASE_SPIN_LOCK(&gc_threads[i]->gc_spin);
     }
@@ -1290,9 +1437,8 @@ shutdown_gc_threads (uint32_t me USED_IF_THREADS,
 
     for (i=0; i < n_gc_threads; i++) {
         if (i == me || idle_cap[i]) continue;
-        while (gc_threads[i]->wakeup != GC_THREAD_WAITING_TO_CONTINUE) {
+        while (SEQ_CST_LOAD(&gc_threads[i]->wakeup) != GC_THREAD_WAITING_TO_CONTINUE) {
             busy_wait_nop();
-            write_barrier();
         }
     }
 #endif
@@ -1307,15 +1453,27 @@ releaseGCThreads (Capability *cap USED_IF_THREADS, bool idle_cap[])
     uint32_t i;
     for (i=0; i < n_threads; i++) {
         if (i == me || idle_cap[i]) continue;
-        if (gc_threads[i]->wakeup != GC_THREAD_WAITING_TO_CONTINUE)
+        if (SEQ_CST_LOAD(&gc_threads[i]->wakeup) != GC_THREAD_WAITING_TO_CONTINUE)
             barf("releaseGCThreads");
 
-        gc_threads[i]->wakeup = GC_THREAD_INACTIVE;
+        SEQ_CST_STORE(&gc_threads[i]->wakeup, GC_THREAD_INACTIVE);
         ACQUIRE_SPIN_LOCK(&gc_threads[i]->gc_spin);
         RELEASE_SPIN_LOCK(&gc_threads[i]->mut_spin);
     }
 }
 #endif
+
+/* ----------------------------------------------------------------------------
+   Save the mutable lists in saved_mut_lists where it will be scavenged
+   during GC
+   ------------------------------------------------------------------------- */
+
+static void
+stash_mut_list (Capability *cap, uint32_t gen_no)
+{
+    cap->saved_mut_lists[gen_no] = cap->mut_lists[gen_no];
+    RELEASE_STORE(&cap->mut_lists[gen_no], allocBlockOnNode_sync(cap->node));
+}
 
 /* ----------------------------------------------------------------------------
    Initialise a generation that is to be collected
@@ -1328,15 +1486,23 @@ prepare_collected_gen (generation *gen)
     gen_workspace *ws;
     bdescr *bd, *next;
 
-    // Throw away the current mutable list.  Invariant: the mutable
-    // list always has at least one block; this means we can avoid a
-    // check for NULL in recordMutable().
     g = gen->no;
-    if (g != 0) {
+
+    if (RtsFlags.GcFlags.useNonmoving && g == oldest_gen->no) {
+        // Nonmoving heap's mutable list is always a root.
         for (i = 0; i < n_capabilities; i++) {
-            freeChain(capabilities[i]->mut_lists[g]);
-            capabilities[i]->mut_lists[g] =
-                allocBlockOnNode(capNoToNumaNode(i));
+            stash_mut_list(capabilities[i], g);
+        }
+    } else if (g != 0) {
+        // Otherwise throw away the current mutable list. Invariant: the
+        // mutable list always has at least one block; this means we can avoid
+        // a check for NULL in recordMutable().
+        for (i = 0; i < n_capabilities; i++) {
+            bdescr *old = RELAXED_LOAD(&capabilities[i]->mut_lists[g]);
+            freeChain(old);
+
+            bdescr *new = allocBlockOnNode(capNoToNumaNode(i));
+            RELAXED_STORE(&capabilities[i]->mut_lists[g], new);
         }
     }
 
@@ -1348,13 +1514,17 @@ prepare_collected_gen (generation *gen)
     gen->old_threads = gen->threads;
     gen->threads = END_TSO_QUEUE;
 
-    // deprecate the existing blocks
-    gen->old_blocks   = gen->blocks;
-    gen->n_old_blocks = gen->n_blocks;
-    gen->blocks       = NULL;
-    gen->n_blocks     = 0;
-    gen->n_words      = 0;
-    gen->live_estimate = 0;
+    // deprecate the existing blocks (except in the case of the nonmoving
+    // collector since these will be preserved in nonmovingCollect for the
+    // concurrent GC).
+    if (!(RtsFlags.GcFlags.useNonmoving && g == oldest_gen->no)) {
+        gen->old_blocks   = gen->blocks;
+        gen->n_old_blocks = gen->n_blocks;
+        gen->blocks       = NULL;
+        gen->n_blocks     = 0;
+        gen->n_words      = 0;
+        gen->live_estimate = 0;
+    }
 
     // initialise the large object queues.
     ASSERT(gen->scavenged_large_objects == NULL);
@@ -1448,18 +1618,6 @@ prepare_collected_gen (generation *gen)
     }
 }
 
-
-/* ----------------------------------------------------------------------------
-   Save the mutable lists in saved_mut_lists
-   ------------------------------------------------------------------------- */
-
-static void
-stash_mut_list (Capability *cap, uint32_t gen_no)
-{
-    cap->saved_mut_lists[gen_no] = cap->mut_lists[gen_no];
-    cap->mut_lists[gen_no] = allocBlockOnNode_sync(cap->node);
-}
-
 /* ----------------------------------------------------------------------------
    Initialise a generation that is *not* to be collected
    ------------------------------------------------------------------------- */
@@ -1528,31 +1686,52 @@ collect_gct_blocks (void)
 }
 
 /* -----------------------------------------------------------------------------
-   During mutation, any blocks that are filled by allocatePinned() are
-   stashed on the local pinned_object_blocks list, to avoid needing to
-   take a global lock.  Here we collect those blocks from the
-   cap->pinned_object_blocks lists and put them on the
-   main g0->large_object list.
+   During mutation, any blocks that are filled by allocatePinned() are stashed
+   on the local pinned_object_blocks list, to avoid needing to take a global
+   lock.  Here we collect those blocks from the cap->pinned_object_blocks lists
+   and put them on the g0->large_object or oldest_gen->large_objects.
+
+   How to decide which list to put them on?
+
+   - When non-moving heap is enabled and this is a major GC, we put them on
+     oldest_gen. This is because after preparation we really want no
+     old-to-young references, and we want to be able to reset mut_lists. For
+     this we need to promote every potentially live object to the oldest gen.
+
+   - Otherwise we put them on g0.
    -------------------------------------------------------------------------- */
 
 static void
 collect_pinned_object_blocks (void)
 {
-    uint32_t n;
-    bdescr *bd, *prev;
+    const bool use_nonmoving = RtsFlags.GcFlags.useNonmoving;
+    generation *const gen = (use_nonmoving && major_gc) ? oldest_gen : g0;
 
-    for (n = 0; n < n_capabilities; n++) {
-        prev = NULL;
-        for (bd = capabilities[n]->pinned_object_blocks; bd != NULL; bd = bd->link) {
-            prev = bd;
-        }
-        if (prev != NULL) {
-            prev->link = g0->large_objects;
-            if (g0->large_objects != NULL) {
-                g0->large_objects->u.back = prev;
+    for (uint32_t n = 0; n < n_capabilities; n++) {
+        bdescr *last = NULL;
+        if (use_nonmoving && gen == oldest_gen) {
+            // Mark objects as belonging to the nonmoving heap
+            for (bdescr *bd = RELAXED_LOAD(&capabilities[n]->pinned_object_blocks); bd != NULL; bd = bd->link) {
+                bd->flags |= BF_NONMOVING;
+                bd->gen = oldest_gen;
+                bd->gen_no = oldest_gen->no;
+                oldest_gen->n_large_words += bd->free - bd->start;
+                oldest_gen->n_large_blocks += bd->blocks;
+                last = bd;
             }
-            g0->large_objects = capabilities[n]->pinned_object_blocks;
-            capabilities[n]->pinned_object_blocks = 0;
+        } else {
+            for (bdescr *bd = capabilities[n]->pinned_object_blocks; bd != NULL; bd = bd->link) {
+                last = bd;
+            }
+        }
+
+        if (last != NULL) {
+            last->link = gen->large_objects;
+            if (gen->large_objects != NULL) {
+                gen->large_objects->u.back = last;
+            }
+            gen->large_objects = RELAXED_LOAD(&capabilities[n]->pinned_object_blocks);
+            RELAXED_STORE(&capabilities[n]->pinned_object_blocks, NULL);
         }
     }
 }
@@ -1611,98 +1790,100 @@ mark_root(void *user USED_IF_THREADS, StgClosure **root)
    percentage of the maximum heap size available to allocate into.
    ------------------------------------------------------------------------- */
 
-static void
-resize_generations (void)
+void
+resizeGenerations (void)
 {
     uint32_t g;
+    W_ live, size, min_alloc, words;
+    const W_ max  = RtsFlags.GcFlags.maxHeapSize;
+    const W_ gens = RtsFlags.GcFlags.generations;
 
-    if (major_gc && RtsFlags.GcFlags.generations > 1) {
-        W_ live, size, min_alloc, words;
-        const W_ max  = RtsFlags.GcFlags.maxHeapSize;
-        const W_ gens = RtsFlags.GcFlags.generations;
+    // live in the oldest generations
+    if (oldest_gen->live_estimate != 0) {
+        words = oldest_gen->live_estimate;
+    } else {
+        words = oldest_gen->n_words;
+    }
+    live = (words + BLOCK_SIZE_W - 1) / BLOCK_SIZE_W +
+        oldest_gen->n_large_blocks +
+        oldest_gen->n_compact_blocks;
 
-        // live in the oldest generations
-        if (oldest_gen->live_estimate != 0) {
-            words = oldest_gen->live_estimate;
+    // default max size for all generations except zero
+    size = stg_max(live * RtsFlags.GcFlags.oldGenFactor,
+                   RtsFlags.GcFlags.minOldGenSize);
+
+    if (RtsFlags.GcFlags.heapSizeSuggestionAuto) {
+        if (max > 0) {
+            RtsFlags.GcFlags.heapSizeSuggestion = stg_min(max, size);
         } else {
-            words = oldest_gen->n_words;
+            RtsFlags.GcFlags.heapSizeSuggestion = size;
         }
-        live = (words + BLOCK_SIZE_W - 1) / BLOCK_SIZE_W +
-            oldest_gen->n_large_blocks +
-            oldest_gen->n_compact_blocks;
+    }
 
-        // default max size for all generations except zero
-        size = stg_max(live * RtsFlags.GcFlags.oldGenFactor,
-                       RtsFlags.GcFlags.minOldGenSize);
+    // minimum size for generation zero
+    min_alloc = stg_max((RtsFlags.GcFlags.pcFreeHeap * max) / 200,
+                        RtsFlags.GcFlags.minAllocAreaSize
+                        * (W_)n_capabilities);
 
-        if (RtsFlags.GcFlags.heapSizeSuggestionAuto) {
-            if (max > 0) {
-                RtsFlags.GcFlags.heapSizeSuggestion = stg_min(max, size);
-            } else {
-                RtsFlags.GcFlags.heapSizeSuggestion = size;
-            }
-        }
-
-        // minimum size for generation zero
-        min_alloc = stg_max((RtsFlags.GcFlags.pcFreeHeap * max) / 200,
-                            RtsFlags.GcFlags.minAllocAreaSize
-                            * (W_)n_capabilities);
-
-        // Auto-enable compaction when the residency reaches a
-        // certain percentage of the maximum heap size (default: 30%).
-        if (RtsFlags.GcFlags.compact ||
-            (max > 0 &&
-             oldest_gen->n_blocks >
-             (RtsFlags.GcFlags.compactThreshold * max) / 100)) {
-            oldest_gen->mark = 1;
-            oldest_gen->compact = 1;
+    // Auto-enable compaction when the residency reaches a
+    // certain percentage of the maximum heap size (default: 30%).
+    // Except when non-moving GC is enabled.
+    if (!RtsFlags.GcFlags.useNonmoving &&
+        (RtsFlags.GcFlags.compact ||
+         (max > 0 &&
+          oldest_gen->n_blocks >
+          (RtsFlags.GcFlags.compactThreshold * max) / 100))) {
+        oldest_gen->mark = 1;
+        oldest_gen->compact = 1;
 //        debugBelch("compaction: on\n", live);
-        } else {
-            oldest_gen->mark = 0;
-            oldest_gen->compact = 0;
+    } else {
+        oldest_gen->mark = 0;
+        oldest_gen->compact = 0;
 //        debugBelch("compaction: off\n", live);
+    }
+
+    if (RtsFlags.GcFlags.sweep) {
+        oldest_gen->mark = 1;
+    }
+
+    // if we're going to go over the maximum heap size, reduce the
+    // size of the generations accordingly.  The calculation is
+    // different if compaction is turned on, because we don't need
+    // to double the space required to collect the old generation.
+    if (max != 0) {
+
+        // this test is necessary to ensure that the calculations
+        // below don't have any negative results - we're working
+        // with unsigned values here.
+        if (max < min_alloc) {
+            heapOverflow();
         }
 
-        if (RtsFlags.GcFlags.sweep) {
-            oldest_gen->mark = 1;
-        }
-
-        // if we're going to go over the maximum heap size, reduce the
-        // size of the generations accordingly.  The calculation is
-        // different if compaction is turned on, because we don't need
-        // to double the space required to collect the old generation.
-        if (max != 0) {
-
-            // this test is necessary to ensure that the calculations
-            // below don't have any negative results - we're working
-            // with unsigned values here.
-            if (max < min_alloc) {
-                heapOverflow();
+        if (oldest_gen->compact) {
+            if ( (size + (size - 1) * (gens - 2) * 2) + min_alloc > max ) {
+                size = (max - min_alloc) / ((gens - 1) * 2 - 1);
             }
-
-            if (oldest_gen->compact) {
-                if ( (size + (size - 1) * (gens - 2) * 2) + min_alloc > max ) {
-                    size = (max - min_alloc) / ((gens - 1) * 2 - 1);
-                }
-            } else {
-                if ( (size * (gens - 1) * 2) + min_alloc > max ) {
-                    size = (max - min_alloc) / ((gens - 1) * 2);
-                }
-            }
-
-            if (size < live) {
-                heapOverflow();
+        } else {
+            if ( (size * (gens - 1) * 2) + min_alloc > max ) {
+                size = (max - min_alloc) / ((gens - 1) * 2);
             }
         }
+
+        if (size < live) {
+            heapOverflow();
+        }
+    }
 
 #if 0
-        debugBelch("live: %d, min_alloc: %d, size : %d, max = %d\n", live,
-                   min_alloc, size, max);
+    debugBelch("live: %d, min_alloc: %d, size : %d, max = %d\n", live,
+               min_alloc, size, max);
+    debugBelch("resize_gen: n_blocks: %lu, n_large_block: %lu, n_compact_blocks: %lu\n",
+               oldest_gen->n_blocks, oldest_gen->n_large_blocks, oldest_gen->n_compact_blocks);
+    debugBelch("resize_gen: max_blocks: %lu -> %lu\n", oldest_gen->max_blocks, oldest_gen->n_blocks);
 #endif
 
-        for (g = 0; g < gens; g++) {
-            generations[g].max_blocks = size;
-        }
+    for (g = 0; g < gens; g++) {
+        generations[g].max_blocks = size;
     }
 }
 
@@ -1838,28 +2019,23 @@ resize_nursery (void)
 
 #if defined(DEBUG)
 
-static void gcCAFs(void)
+void gcCAFs(void)
 {
-    StgIndStatic *p, *prev;
+    uint32_t i = 0;
+    StgIndStatic *prev = NULL;
 
-    const StgInfoTable *info;
-    uint32_t i;
-
-    i = 0;
-    p = debug_caf_list;
-    prev = NULL;
-
-    for (p = debug_caf_list; p != (StgIndStatic*)END_OF_CAF_LIST;
-         p = (StgIndStatic*)p->saved_info) {
-
-        info = get_itbl((StgClosure*)p);
+    for (StgIndStatic *p = debug_caf_list;
+         p != (StgIndStatic*) END_OF_CAF_LIST;
+         p = (StgIndStatic*) p->saved_info)
+    {
+        const StgInfoTable *info = get_itbl((StgClosure*)p);
         ASSERT(info->type == IND_STATIC);
 
         // See Note [STATIC_LINK fields] in Storage.h
         // This condition identifies CAFs that have just been GC'd and
         // don't have static_link==3 which means they should be ignored.
         if ((((StgWord)(p->static_link)&STATIC_BITS) | prev_static_flag) != 3) {
-            debugTrace(DEBUG_gccafs, "CAF gc'd at 0x%p", p);
+            debugTrace(DEBUG_gccafs, "CAF gc'd at %p", p);
             SET_INFO((StgClosure*)p,&stg_GCD_CAF_info); // stub it
             if (prev == NULL) {
                 debug_caf_list = (StgIndStatic*)p->saved_info;

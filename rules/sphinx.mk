@@ -5,8 +5,8 @@
 # This file is part of the GHC build system.
 #
 # To understand how the build system works and how to modify it, see
-#      http://ghc.haskell.org/trac/ghc/wiki/Building/Architecture
-#      http://ghc.haskell.org/trac/ghc/wiki/Building/Modifying
+#      https://gitlab.haskell.org/ghc/ghc/wikis/building/architecture
+#      https://gitlab.haskell.org/ghc/ghc/wikis/building/modifying
 #
 # -----------------------------------------------------------------------------
 
@@ -30,7 +30,7 @@ $(call all-target,$1,)
 .PHONY: html_$1
 ifeq "$$(phase)" "final"
 ifeq "$$(BUILD_SPHINX_HTML)" "YES"
-$(call all-target,$1,html_$1)
+docs: html_$1
 INSTALL_HTML_DOC_DIRS += $1/build-html/$2
 endif
 endif
@@ -40,14 +40,14 @@ html : html_$1
 
 ifneq "$$(BINDIST)" "YES"
 $1/build-html/$2/index.html: $1/conf.py $$($1_RST_SOURCES)
-	$(SPHINXBUILD) -b html -d $1/.doctrees-html $(SPHINXOPTS) $1 $1/build-html/$2
+	$(SPHINXBUILD) -b html -d $1/.doctrees-html -w $1/.log -n $(SPHINXOPTS) $1 $1/build-html/$2
 endif
 
 
 .PHONY: pdf_$1
 ifeq "$$(phase)" "final"
 ifeq "$$(BUILD_SPHINX_PDF)" "YES"
-$(call all-target,$1,pdf_$1)
+docs: pdf_$1
 INSTALL_DOCS += $1/$2.pdf
 endif
 endif
@@ -62,13 +62,13 @@ ifneq "$$(BINDIST)" "YES"
 # besides the last to fail.
 
 $1/$2.pdf: $1/conf.py $$($1_RST_SOURCES)
-	$(SPHINXBUILD) -b latex -d $1/.doctrees-pdf $(SPHINXOPTS) $1 $1/build-pdf/$2
-	cd $1/build-pdf/$2 ; xelatex -halt-on-error $2.tex 2>/dev/null >/dev/null || true
-	cd $1/build-pdf/$2 ; xelatex -halt-on-error $2.tex 2>/dev/null >/dev/null || true
-	cd $1/build-pdf/$2 ; xelatex -halt-on-error $2.tex 2>/dev/null >/dev/null || true
-	cd $1/build-pdf/$2 ; makeindex $2.idx
-	cd $1/build-pdf/$2 ; xelatex -halt-on-error $2.tex 2>/dev/null >/dev/null || true
-	cd $1/build-pdf/$2 ; xelatex -halt-on-error $2.tex
+	$(SPHINXBUILD) -b latex -d $1/.doctrees-pdf -w $1/.log -n $(SPHINXOPTS) $1 $1/build-pdf/$2
+	cd $1/build-pdf/$2 ; $(XELATEX) -halt-on-error $2.tex 2>/dev/null >/dev/null || true
+	cd $1/build-pdf/$2 ; $(XELATEX) -halt-on-error $2.tex 2>/dev/null >/dev/null || true
+	cd $1/build-pdf/$2 ; $(XELATEX) -halt-on-error $2.tex 2>/dev/null >/dev/null || true
+	cd $1/build-pdf/$2 ; $(MAKEINDEX) $2.idx
+	cd $1/build-pdf/$2 ; $(XELATEX) -halt-on-error $2.tex 2>/dev/null >/dev/null || true
+	cd $1/build-pdf/$2 ; $(XELATEX) -halt-on-error $2.tex
 	cp $1/build-pdf/$2/$2.pdf $1/$2.pdf
 endif
 

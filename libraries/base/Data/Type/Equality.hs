@@ -12,6 +12,7 @@
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE DataKinds              #-}
 {-# LANGUAGE PolyKinds              #-}
+{-# LANGUAGE StandaloneKindSignatures #-}
 {-# LANGUAGE Trustworthy            #-}
 
 -----------------------------------------------------------------------------
@@ -61,7 +62,7 @@ infix 4 :~:, :~~:
 -- in the body of the pattern-match, the compiler knows that @a ~ b@.
 --
 -- @since 4.7.0.0
-data a :~: b where  -- See Note [The equality types story] in TysPrim
+data a :~: b where  -- See Note [The equality types story] in GHC.Builtin.Types.Prim
   Refl :: a :~: a
 
 -- with credit to Conal Elliott for 'ty', Erik Hesselink & Martijn van
@@ -122,7 +123,8 @@ deriving instance a ~ b => Bounded (a :~: b)
 -- inhabited by a terminating value if and only if @a@ is the same type as @b@.
 --
 -- @since 4.10.0.0
-data (a :: k1) :~~: (b :: k2) where
+type (:~~:) :: k1 -> k2 -> Type
+data a :~~: b where
    HRefl :: a :~~: a
 
 -- | @since 4.10.0.0
@@ -163,7 +165,8 @@ instance TestEquality ((:~~:) a) where
 infix 4 ==
 
 -- | A type family to compute Boolean equality.
-type family (a :: k) == (b :: k) :: Bool where
+type (==) :: k -> k -> Bool
+type family a == b where
   f a == g b = f == g && a == b
   a == a = 'True
   _ == _ = 'False

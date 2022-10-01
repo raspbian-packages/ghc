@@ -15,17 +15,21 @@ module Distribution.Client.Update
     ( update
     ) where
 
+import Distribution.Client.Compat.Prelude
+import Prelude ()
+
 import Distribution.Simple.Setup
          ( fromFlag )
 import Distribution.Client.Compat.Directory
          ( setModificationTime )
 import Distribution.Client.Types
-         ( Repo(..), RemoteRepo(..), maybeRepoRemote )
+         ( Repo(..), RepoName (..), RemoteRepo(..), maybeRepoRemote, unRepoName )
 import Distribution.Client.HttpUtils
          ( DownloadResult(..) )
 import Distribution.Client.FetchUtils
          ( downloadIndex )
 import Distribution.Client.IndexUtils.Timestamp
+import Distribution.Client.IndexUtils.IndexState
 import Distribution.Client.IndexUtils
          ( updateRepoIndexCache, Index(..), writeIndexTimestamp
          , currentIndexTimestamp, indexBaseName )
@@ -33,9 +37,7 @@ import Distribution.Client.JobControl
          ( newParallelJobControl, spawnJob, collectJob )
 import Distribution.Client.Setup
          ( RepoContext(..), UpdateFlags(..) )
-import Distribution.Deprecated.Text
-         ( display )
-import Distribution.Verbosity
+import Distribution.Verbosity (lessVerbose)
 
 import Distribution.Simple.Utils
          ( writeFileAtomic, warn, notice, noticeNoWrap )
@@ -43,9 +45,7 @@ import Distribution.Simple.Utils
 import qualified Data.ByteString.Lazy       as BS
 import Distribution.Client.GZipUtils (maybeDecompress)
 import System.FilePath ((<.>), dropExtension)
-import Data.Maybe (mapMaybe)
 import Data.Time (getCurrentTime)
-import Control.Monad
 
 import qualified Hackage.Security.Client as Sec
 
@@ -61,19 +61,19 @@ update verbosity updateFlags repoCtxt = do
     [] -> return ()
     [remoteRepo] ->
         notice verbosity $ "Downloading the latest package list from "
-                        ++ remoteRepoName remoteRepo
+                        ++ unRepoName (remoteRepoName remoteRepo)
     _ -> notice verbosity . unlines
             $ "Downloading the latest package lists from: "
-            : map (("- " ++) . remoteRepoName) remoteRepos
+            : map (("- " ++) . unRepoName . remoteRepoName) remoteRepos
   jobCtrl <- newParallelJobControl (length repos)
-  mapM_ (spawnJob jobCtrl . updateRepo verbosity updateFlags repoCtxt) repos
-  mapM_ (\_ -> collectJob jobCtrl) repos
+  traverse_ (spawnJob jobCtrl . updateRepo verbosity updateFlags repoCtxt) repos
+  traverse_ (\_ -> collectJob jobCtrl) repos
 
 updateRepo :: Verbosity -> UpdateFlags -> RepoContext -> Repo -> IO ()
 updateRepo verbosity updateFlags repoCtxt repo = do
   transport <- repoContextGetTransport repoCtxt
   case repo of
-    RepoLocal{..} -> return ()
+    RepoLocalNoIndex{} -> return ()
     RepoRemote{..} -> do
       downloadResult <- downloadIndex transport verbosity repoRemote repoLocalDir
       case downloadResult of
@@ -83,13 +83,20 @@ updateRepo verbosity updateFlags repoCtxt repo = do
           writeFileAtomic (dropExtension indexPath) . maybeDecompress
                                                   =<< BS.readFile indexPath
           updateRepoIndexCache verbosity (RepoIndex repoCtxt repo)
-    RepoSecure{} -> repoContextWithSecureRepo repoCtxt repo $ \repoSecure -> do
+    RepoSecure remote _ -> repoContextWithSecureRepo repoCtxt repo $ \repoSecure -> do
       let index = RepoIndex repoCtxt repo
       -- NB: This may be a nullTimestamp if we've never updated before
       current_ts <- currentIndexTimestamp (lessVerbose verbosity) repoCtxt repo
+
       -- NB: always update the timestamp, even if we didn't actually
       -- download anything
-      writeIndexTimestamp index (fromFlag (updateIndexState updateFlags))
+      let rname :: RepoName
+          rname = remoteRepoName remote
+
+      let repoIndexState :: RepoIndexState
+          repoIndexState = lookupIndexState rname (fromFlag (updateIndexState updateFlags))
+      writeIndexTimestamp index repoIndexState
+
       ce <- if repoContextIgnoreExpiry repoCtxt
               then Just `fmap` getCurrentTime
               else return Nothing
@@ -107,4 +114,4 @@ updateRepo verbosity updateFlags repoCtxt repo = do
       when (current_ts /= nullTimestamp) $
         noticeNoWrap verbosity $
           "To revert to previous state run:\n" ++
-          "    cabal update --index-state='" ++ display current_ts ++ "'\n"
+          "    cabal update --index-state='" ++ prettyShow current_ts ++ "'\n"

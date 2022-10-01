@@ -51,6 +51,7 @@ module Distribution.Simple.GHC (
         registerPackage,
         componentGhcOptions,
         componentCcGhcOptions,
+        getGhcAppDir,
         getLibDir,
         isDynamic,
         getGlobalPackageDB,
@@ -73,6 +74,7 @@ import Prelude ()
 import Distribution.Compat.Prelude
 
 import qualified Distribution.Simple.GHC.Internal as Internal
+import Distribution.CabalSpecVersion
 import Distribution.Simple.GHC.ImplInfo
 import Distribution.Simple.GHC.EnvironmentParser
 import Distribution.PackageDescription.Utils (cabalBug)
@@ -98,15 +100,11 @@ import qualified Distribution.Simple.Program.Strip as Strip
 import Distribution.Simple.Program.GHC
 import Distribution.Simple.Setup
 import qualified Distribution.Simple.Setup as Cabal
-import Distribution.Simple.Compiler hiding (Flag)
+import Distribution.Simple.Compiler
 import Distribution.Version
 import Distribution.System
 import Distribution.Verbosity
 import Distribution.Pretty
-import Distribution.Types.ForeignLib
-import Distribution.Types.ForeignLibType
-import Distribution.Types.ForeignLibOption
-import Distribution.Types.UnqualComponentName
 import Distribution.Utils.NubList
 import Language.Haskell.Extension
 
@@ -138,11 +136,12 @@ configure verbosity hcPath hcPkgPath conf0 = do
       (userMaybeSpecifyPath "ghc" hcPath conf0)
   let implInfo = ghcVersionImplInfo ghcVersion
 
-  -- Cabal currently supports ghc >= 7.0.1 && < 8.10
-  unless (ghcVersion < mkVersion [8,10]) $
+  -- Cabal currently supports ghc >= 7.0.1 && < 9.1
+  -- ... and the following odd development version
+  unless (ghcVersion < mkVersion [9,2]) $
     warn verbosity $
          "Unknown/unsupported 'ghc' version detected "
-      ++ "(Cabal " ++ prettyShow cabalVersion ++ " supports 'ghc' version < 8.10): "
+      ++ "(Cabal " ++ prettyShow cabalVersion ++ " supports 'ghc' version < 9.1): "
       ++ programPath ghcProg ++ " is version " ++ prettyShow ghcVersion
 
   -- This is slightly tricky, we have to configure ghc first, then we use the
@@ -182,7 +181,7 @@ configure verbosity hcPath hcPkgPath conf0 = do
 
   ghcInfo <- Internal.getGhcInfo verbosity implInfo ghcProg
   let ghcInfoMap = Map.fromList ghcInfo
-      extensions = -- workaround https://ghc.haskell.org/ticket/11214
+      extensions = -- workaround https://gitlab.haskell.org/ghc/ghc/-/issues/11214
                    filterExt JavaScriptFFI $
                    -- see 'filterExtTH' comment below
                    filterExtTH $ extensions0
@@ -317,7 +316,7 @@ guessRunghcFromGhcPath = guessToolFromGhcPath runghcProgram
 getGhcInfo :: Verbosity -> ConfiguredProgram -> IO [(String, String)]
 getGhcInfo verbosity ghcProg = Internal.getGhcInfo verbosity implInfo ghcProg
   where
-    Just version = programVersion ghcProg
+    version = fromMaybe (error "GHC.getGhcInfo: no ghc version") $ programVersion ghcProg
     implInfo = ghcVersionImplInfo version
 
 -- | Given a single package DB, return all installed packages.
@@ -363,7 +362,13 @@ toPackageIndex verbosity pkgss progdb = do
   return $! mconcat indices
 
   where
-    Just ghcProg = lookupProgram ghcProgram progdb
+    ghcProg = fromMaybe (error "GHC.toPackageIndex: no ghc program") $ lookupProgram ghcProgram progdb
+
+-- | Return the 'FilePath' to the GHC application data directory.
+--
+-- @since 3.4.0.0
+getGhcAppDir :: IO FilePath
+getGhcAppDir = getAppUserDataDirectory "ghc"
 
 getLibDir :: Verbosity -> LocalBuildInfo -> IO FilePath
 getLibDir verbosity lbi =
@@ -385,18 +390,18 @@ getGlobalPackageDB verbosity ghcProg =
 
 -- | Return the 'FilePath' to the per-user GHC package database.
 getUserPackageDB
-  :: Verbosity -> ConfiguredProgram -> Platform -> NoCallStackIO FilePath
+  :: Verbosity -> ConfiguredProgram -> Platform -> IO FilePath
 getUserPackageDB _verbosity ghcProg platform = do
     -- It's rather annoying that we have to reconstruct this, because ghc
     -- hides this information from us otherwise. But for certain use cases
     -- like change monitoring it really can't remain hidden.
-    appdir <- getAppUserDataDirectory "ghc"
+    appdir <- getGhcAppDir
     return (appdir </> platformAndVersion </> packageConfFileName)
   where
     platformAndVersion = Internal.ghcPlatformAndVersionString
                            platform ghcVersion
     packageConfFileName = "package.conf.d"
-    Just ghcVersion = programVersion ghcProg
+    ghcVersion = fromMaybe (error "GHC.getUserPackageDB: no ghc version") $ programVersion ghcProg
 
 checkPackageDbEnvVar :: Verbosity -> IO ()
 checkPackageDbEnvVar verbosity =
@@ -426,7 +431,7 @@ checkPackageDbStackPre76 verbosity rest
   die' verbosity $
         "With current ghc versions the global package db is always used "
      ++ "and must be listed first. This ghc limitation is lifted in GHC 7.6,"
-     ++ "see http://ghc.haskell.org/trac/ghc/ticket/5977"
+     ++ "see https://gitlab.haskell.org/ghc/ghc/-/issues/5977"
 checkPackageDbStackPre76 verbosity _ =
   die' verbosity $ "If the global package db is specified, it must be "
      ++ "specified first and cannot be specified multiple times"
@@ -475,7 +480,7 @@ getInstalledPackagesMonitorFiles verbosity platform progdb =
       if isFileStyle then return path
                      else return (path </> "package.cache")
 
-    Just ghcProg = lookupProgram ghcProgram progdb
+    ghcProg = fromMaybe (error "GHC.toPackageIndex: no ghc program") $ lookupProgram ghcProgram progdb
 
 
 -- -----------------------------------------------------------------------------
@@ -508,7 +513,7 @@ buildOrReplLib mReplFlags verbosity numJobs pkg_descr lbi lib clbi = do
         when (forceStatic || withStaticLib lbi)
       whenGHCiLib = when (withGHCiLib lbi)
       forRepl = maybe False (const True) mReplFlags
-      ifReplLib = when forRepl
+      whenReplLib = when forRepl
       replFlags = fromMaybe mempty mReplFlags
       comp = compiler lbi
       ghcVersion = compilerVersion comp
@@ -670,10 +675,6 @@ buildOrReplLib mReplFlags verbosity numJobs pkg_descr lbi lib clbi = do
            unless forRepl $ whenProfLib   (runGhcProgIfNeeded   profCxxOpts)
       | filename <- cxxSources libBi]
 
-  ifReplLib $ do
-    when (null (allLibModules lib clbi)) $ warn verbosity "No exposed modules"
-    ifReplLib (runGhcProg replOpts)
-
   -- build any C sources
   unless (not has_code || null (cSources libBi)) $ do
     info verbosity "Building C Sources..."
@@ -770,6 +771,9 @@ buildOrReplLib mReplFlags verbosity numJobs pkg_descr lbi lib clbi = do
   -- TODO: problem here is we need the .c files built first, so we can load them
   -- with ghci, but .c files can depend on .h files generated by ghc by ffi
   -- exports.
+  whenReplLib $ do
+    when (null (allLibModules lib clbi)) $ warn verbosity "No exposed modules"
+    runGhcProg replOpts
 
   -- link:
   when has_code . unless forRepl $ do
@@ -1139,23 +1143,25 @@ exeMainModuleName Executable{buildInfo = bnfo} =
 -- https://github.com/haskell/cabal/pull/4539#discussion_r118981753.
 decodeMainIsArg :: String -> Maybe ModuleName
 decodeMainIsArg arg
-  | not (null main_fn) && isLower (head main_fn)
+  | headOf main_fn isLower
                         -- The arg looked like "Foo.Bar.baz"
   = Just (ModuleName.fromString main_mod)
-  | isUpper (head arg)  -- The arg looked like "Foo" or "Foo.Bar"
+  | headOf arg isUpper  -- The arg looked like "Foo" or "Foo.Bar"
   = Just (ModuleName.fromString arg)
   | otherwise           -- The arg looked like "baz"
   = Nothing
   where
+    headOf :: String -> (Char -> Bool) -> Bool
+    headOf str pred' = any pred' (safeHead str)
+
     (main_mod, main_fn) = splitLongestPrefix arg (== '.')
 
     splitLongestPrefix :: String -> (Char -> Bool) -> (String,String)
     splitLongestPrefix str pred'
       | null r_pre = (str,           [])
-      | otherwise  = (reverse (tail r_pre), reverse r_suf)
-                           -- 'tail' drops the char satisfying 'pred'
+      | otherwise  = (reverse (safeTail r_pre), reverse r_suf)
+                           -- 'safeTail' drops the char satisfying 'pred'
       where (r_suf, r_pre) = break pred' (reverse str)
-
 
 -- | A collection of:
 --    * C input files
@@ -1173,7 +1179,7 @@ data BuildSources = BuildSources {
 
 -- | Locate and return the 'BuildSources' required to build and link.
 gbuildSources :: Verbosity
-              -> Version -- ^ specVersion
+              -> CabalSpecVersion
               -> FilePath
               -> GBuildMode
               -> IO BuildSources
@@ -1192,7 +1198,7 @@ gbuildSources verbosity specVer tmpDir bm =
 
       if isHaskell main
         then
-          if specVer < mkVersion [2] && (mainModName `elem` otherModNames)
+          if specVer < CabalSpecV2_0 && (mainModName `elem` otherModNames)
           then do
              -- The cabal manual clearly states that `other-modules` is
              -- intended for non-main modules.  However, there's at least one
@@ -1682,7 +1688,7 @@ extractRtsInfo lbi =
 
 -- | Returns True if the modification date of the given source file is newer than
 -- the object file we last compiled for it, or if no object file exists yet.
-checkNeedsRecompilation :: FilePath -> GhcOptions -> NoCallStackIO Bool
+checkNeedsRecompilation :: FilePath -> GhcOptions -> IO Bool
 checkNeedsRecompilation filename opts = filename `moreRecentFile` oname
     where oname = getObjectFileName filename opts
 
@@ -1698,7 +1704,7 @@ getObjectFileName filename opts = oname
 -- Calculates relative RPATHs when 'relocatable' is set.
 getRPaths :: LocalBuildInfo
           -> ComponentLocalBuildInfo -- ^ Component we are building
-          -> NoCallStackIO (NubListR FilePath)
+          -> IO (NubListR FilePath)
 getRPaths lbi clbi | supportRPaths hostOS = do
     libraryPaths <- depLibraryPaths False (relocatable lbi) lbi clbi
     let hostPref = case hostOS of
@@ -1939,7 +1945,7 @@ installLib verbosity lbi targetDir dynlibTargetDir _builtDir pkg lib clbi = do
     whenShared $ if
       -- The behavior for "extra-bundled-libraries" changed in version 2.5.0.
       -- See ghc issue #15837 and Cabal PR #5855.
-      | specVersion pkg < mkVersion [2,5] -> do
+      | specVersion pkg < CabalSpecV3_0 -> do
         sequence_ [ installShared builtDir dynlibTargetDir
               (mkGenericSharedLibName platform compiler_id (l ++ f))
           | l <- getHSLibraryName uid : extraBundledLibs (libBuildInfo lib)
@@ -2030,9 +2036,9 @@ hcPkgInfo progdb = HcPkg.HcPkgInfo
   , HcPkg.suppressFilesCheck   = v >= [6,6]
   }
   where
-    v               = versionNumbers ver
-    Just ghcPkgProg = lookupProgram ghcPkgProgram progdb
-    Just ver        = programVersion ghcPkgProg
+    v          = versionNumbers ver
+    ghcPkgProg = fromMaybe (error "GHC.hcPkgInfo: no ghc program") $ lookupProgram ghcPkgProgram progdb
+    ver        = fromMaybe (error "GHC.hcPkgInfo: no ghc version") $ programVersion ghcPkgProg
 
 registerPackage
   :: Verbosity
@@ -2049,10 +2055,10 @@ pkgRoot :: Verbosity -> LocalBuildInfo -> PackageDB -> IO FilePath
 pkgRoot verbosity lbi = pkgRoot'
    where
     pkgRoot' GlobalPackageDB =
-      let Just ghcProg = lookupProgram ghcProgram (withPrograms lbi)
+      let ghcProg = fromMaybe (error "GHC.pkgRoot: no ghc program") $ lookupProgram ghcProgram (withPrograms lbi)
       in  fmap takeDirectory (getGlobalPackageDB verbosity ghcProg)
     pkgRoot' UserPackageDB = do
-      appDir <- getAppUserDataDirectory "ghc"
+      appDir <- getGhcAppDir
       let ver      = compilerVersion (compiler lbi)
           subdir   = System.Info.arch ++ '-':System.Info.os
                      ++ '-':prettyShow ver

@@ -28,14 +28,14 @@ module Distribution.Simple.Glob (
 import Prelude ()
 import Distribution.Compat.Prelude
 
-import Control.Monad (guard)
-
+import Distribution.CabalSpecVersion
 import Distribution.Simple.Utils
 import Distribution.Verbosity
-import Distribution.Version
 
 import System.Directory (getDirectoryContents, doesDirectoryExist, doesFileExist)
 import System.FilePath (joinPath, splitExtensions, splitDirectories, takeFileName, (</>), (<.>))
+
+import qualified Data.List.NonEmpty as NE
 
 -- Note throughout that we use splitDirectories, not splitPath. On
 -- Posix, this makes no difference, but, because Windows accepts both
@@ -151,7 +151,7 @@ fileGlobMatchesSegments pat (seg : segs) = case pat of
     fileGlobMatchesSegments pat' segs
   GlobFinal final -> case final of
     FinalMatch Recursive multidot ext -> do
-      let (candidateBase, candidateExts) = splitExtensions (last $ seg:segs)
+      let (candidateBase, candidateExts) = splitExtensions (NE.last $ seg:|segs)
       guard (not (null candidateBase))
       checkExt multidot ext candidateExts
     FinalMatch NonRecursive multidot ext -> do
@@ -174,7 +174,7 @@ checkExt multidot ext candidate
       MultiDotEnabled -> Just (GlobMatch ())
   | otherwise = Nothing
 
-parseFileGlob :: Version -> FilePath -> Either GlobSyntaxError Glob
+parseFileGlob :: CabalSpecVersion -> FilePath -> Either GlobSyntaxError Glob
 parseFileGlob version filepath = case reverse (splitDirectories filepath) of
   [] ->
         Left EmptyGlob
@@ -198,14 +198,14 @@ parseFileGlob version filepath = case reverse (splitDirectories filepath) of
                      | otherwise           -> Right (FinalLit filename)
         foldM addStem (GlobFinal pat) segments
   where
-    allowGlob = version >= mkVersion [1,6]
-    allowGlobStar = version >= mkVersion [2,4]
+    allowGlob     = version >= CabalSpecV1_6
+    allowGlobStar = version >= CabalSpecV2_4
     addStem pat seg
       | '*' `elem` seg = Left StarInDirectory
       | otherwise      = Right (GlobStem seg pat)
     multidot
-      | version >= mkVersion [2,4] = MultiDotEnabled
-      | otherwise = MultiDotDisabled
+      | version >= CabalSpecV2_4 = MultiDotEnabled
+      | otherwise                = MultiDotDisabled
 
 -- | This will 'die'' when the glob matches no files, or if the glob
 -- refers to a missing directory, or if the glob fails to parse.
@@ -220,7 +220,7 @@ parseFileGlob version filepath = case reverse (splitDirectories filepath) of
 -- prefix.
 --
 -- The second 'FilePath' is the glob itself.
-matchDirFileGlob :: Verbosity -> Version -> FilePath -> FilePath -> IO [FilePath]
+matchDirFileGlob :: Verbosity -> CabalSpecVersion -> FilePath -> FilePath -> IO [FilePath]
 matchDirFileGlob verbosity version dir filepath = case parseFileGlob version filepath of
   Left err -> die' verbosity $ explainGlobSyntaxError filepath err
   Right glob -> do

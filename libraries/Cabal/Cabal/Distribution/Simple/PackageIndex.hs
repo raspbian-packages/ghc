@@ -1,3 +1,4 @@
+{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
@@ -76,6 +77,7 @@ module Distribution.Simple.PackageIndex (
   searchByName,
   SearchResult(..),
   searchByNameSubstring,
+  searchWithPredicate,
 
   -- ** Bulk queries
   allPackages,
@@ -112,6 +114,7 @@ import Data.Array ((!))
 import qualified Data.Array as Array
 import qualified Data.Graph as Graph
 import Data.List as List ( groupBy,  deleteBy, deleteFirstsBy )
+import qualified Data.List.NonEmpty as NE
 import qualified Data.Tree  as Tree
 import Control.Monad
 import Distribution.Compat.Stack
@@ -143,9 +146,10 @@ data PackageIndex a = PackageIndex {
   -- preserved. See #1463 for discussion.
   packageIdIndex :: !(Map (PackageName, LibraryName) (Map Version [a]))
 
-  } deriving (Eq, Generic, Show, Read)
+  } deriving (Eq, Generic, Show, Read, Typeable)
 
 instance Binary a => Binary (PackageIndex a)
+instance Structured a => Structured (PackageIndex a)
 
 -- | The default package index which contains 'InstalledPackageInfo'.  Normally
 -- use this.
@@ -210,20 +214,20 @@ mkPackageIndex pids pnames = assert (invariant index) index
 -- ones.
 --
 fromList :: [IPI.InstalledPackageInfo] -> InstalledPackageIndex
-fromList pkgs = mkPackageIndex pids pnames
+fromList pkgs = mkPackageIndex pids ((fmap . fmap) toList pnames)
   where
     pids      = Map.fromList [ (installedUnitId pkg, pkg) | pkg <- pkgs ]
     pnames    =
       Map.fromList
-        [ (liftM2 (,) packageName IPI.sourceLibName (head pkgsN), pvers)
-        | pkgsN <- groupBy (equating  (liftM2 (,) packageName IPI.sourceLibName))
+        [ (liftM2 (,) packageName IPI.sourceLibName (NE.head pkgsN), pvers)
+        | pkgsN <- NE.groupBy (equating  (liftM2 (,) packageName IPI.sourceLibName))
                  . sortBy  (comparing (liftM3 (,,) packageName IPI.sourceLibName packageVersion))
                  $ pkgs
         , let pvers =
                 Map.fromList
-                [ (packageVersion (head pkgsNV),
-                   nubBy (equating installedUnitId) (reverse pkgsNV))
-                | pkgsNV <- groupBy (equating packageVersion) pkgsN
+                [ (packageVersion (NE.head pkgsNV),
+                   NE.nubBy (equating installedUnitId) (NE.reverse pkgsNV))
+                | pkgsNV <- NE.groupBy (equating packageVersion) pkgsN
                 ]
         ]
 
@@ -524,14 +528,18 @@ data SearchResult a = None | Unambiguous a | Ambiguous [a]
 --
 searchByNameSubstring :: PackageIndex a -> String -> [a]
 searchByNameSubstring index searchterm =
+  searchWithPredicate index (\n -> lsearchterm `isInfixOf` lowercase n)
+  where lsearchterm = lowercase searchterm
+
+-- | @since 3.4.0.0
+searchWithPredicate :: PackageIndex a -> (String -> Bool) -> [a]
+searchWithPredicate index predicate =
   [ pkg
   -- Don't match internal packages
   | ((pname, LMainLibName), pvers) <- Map.toList (packageIdIndex index)
-  , lsearchterm `isInfixOf` lowercase (unPackageName pname)
+  , predicate (unPackageName pname)
   , pkgs <- Map.elems pvers
   , pkg <- pkgs ]
-  where lsearchterm = lowercase searchterm
-
 
 --
 -- * Special queries

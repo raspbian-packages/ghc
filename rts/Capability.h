@@ -5,7 +5,7 @@
  * Capabilities
  *
  * For details on the high-level design, see
- *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/Rts/Scheduler
+ *   https://gitlab.haskell.org/ghc/ghc/wikis/commentary/rts/scheduler
  *
  * A Capability holds all the state an OS thread/task needs to run
  * Haskell code: its STG registers, a pointer to its TSO, a nursery
@@ -23,6 +23,7 @@
 #include "sm/GC.h" // for evac_fn
 #include "Task.h"
 #include "Sparks.h"
+#include "sm/NonMovingMark.h" // for MarkQueue
 
 #include "BeginPrivate.h"
 
@@ -84,6 +85,9 @@ struct Capability_ {
     bdescr **mut_lists;
     bdescr **saved_mut_lists; // tmp use during GC
 
+    // The update remembered set for the non-moving collector
+    UpdRemSet upd_rem_set;
+
     // block for allocating pinned objects into
     bdescr *pinned_object_block;
     // full pinned object blocks allocated since the last GC
@@ -96,6 +100,8 @@ struct Capability_ {
 
     // Context switch flag.  When non-zero, this means: stop running
     // Haskell code, and switch threads.
+    //
+    // Does not require lock to read or write.
     int context_switch;
 
     // Interrupt flag.  Like the context_switch flag, this also
@@ -106,11 +112,13 @@ struct Capability_ {
     // The interrupt flag is always reset before we start running
     // Haskell code, unlike the context_switch flag which is only
     // reset after we have executed the context switch.
+    //
+    // Does not require lock to read or write.
     int interrupt;
 
     // Total words allocated by this cap since rts start
     // See Note [allocation accounting] in Storage.c
-    W_ total_allocated;
+    uint64_t total_allocated;
 
 #if defined(THREADED_RTS)
     // Worker Tasks waiting in the wings.  Singly-linked.
@@ -160,7 +168,9 @@ struct Capability_ {
 } // typedef Capability is defined in RtsAPI.h
   // We never want a Capability to overlap a cache line with anything
   // else, so round it up to a cache line size:
-#ifndef mingw32_HOST_OS
+#if defined(s390x_HOST_ARCH)
+  ATTRIBUTE_ALIGNED(256)
+#elif !defined(mingw32_HOST_OS)
   ATTRIBUTE_ALIGNED(64)
 #endif
   ;
@@ -172,10 +182,10 @@ struct Capability_ {
 #endif
 
 // These properties should be true when a Task is holding a Capability
-#define ASSERT_FULL_CAPABILITY_INVARIANTS(cap,task)                     \
-  ASSERT(cap->running_task != NULL && cap->running_task == task);       \
-  ASSERT(task->cap == cap);                                             \
-  ASSERT_PARTIAL_CAPABILITY_INVARIANTS(cap,task)
+#define ASSERT_FULL_CAPABILITY_INVARIANTS(_cap,_task)                   \
+  ASSERT(_cap->running_task != NULL && _cap->running_task == _task);    \
+  ASSERT(_task->cap == _cap);                                           \
+  ASSERT_PARTIAL_CAPABILITY_INVARIANTS(_cap,_task)
 
 // This assert requires cap->lock to be held, so it can't be part of
 // ASSERT_PARTIAL_CAPABILITY_INVARIANTS()
@@ -256,7 +266,8 @@ extern Capability **capabilities;
 typedef enum {
     SYNC_OTHER,
     SYNC_GC_SEQ,
-    SYNC_GC_PAR
+    SYNC_GC_PAR,
+    SYNC_FLUSH_UPD_REM_SET
 } SyncType;
 
 //
@@ -408,14 +419,16 @@ recordMutableCap (const StgClosure *p, Capability *cap, uint32_t gen)
     //    ASSERT(cap->running_task == myTask());
     // NO: assertion is violated by performPendingThrowTos()
     bd = cap->mut_lists[gen];
-    if (bd->free >= bd->start + BLOCK_SIZE_W) {
+    if (RELAXED_LOAD(&bd->free) >= bd->start + BLOCK_SIZE_W) {
         bdescr *new_bd;
         new_bd = allocBlockOnNode_lock(cap->node);
         new_bd->link = bd;
+        new_bd->free = new_bd->start;
         bd = new_bd;
         cap->mut_lists[gen] = bd;
     }
-    *bd->free++ = (StgWord)p;
+    RELAXED_STORE(bd->free, (StgWord) p);
+    NONATOMIC_ADD(&bd->free, 1);
 }
 
 EXTERN_INLINE void
@@ -449,29 +462,33 @@ stopCapability (Capability *cap)
     // It may not work - the thread might be updating HpLim itself
     // at the same time - so we also have the context_switch/interrupted
     // flags as a sticky way to tell the thread to stop.
-    cap->r.rHpLim = NULL;
+    TSAN_ANNOTATE_BENIGN_RACE(&cap->r.rHpLim, "stopCapability");
+    SEQ_CST_STORE(&cap->r.rHpLim, NULL);
 }
 
 INLINE_HEADER void
 interruptCapability (Capability *cap)
 {
     stopCapability(cap);
-    cap->interrupt = 1;
+    SEQ_CST_STORE(&cap->interrupt, true);
 }
 
 INLINE_HEADER void
 contextSwitchCapability (Capability *cap)
 {
     stopCapability(cap);
-    cap->context_switch = 1;
+    SEQ_CST_STORE(&cap->context_switch, true);
 }
 
 #if defined(THREADED_RTS)
 
 INLINE_HEADER bool emptyInbox(Capability *cap)
 {
-    return (cap->inbox == (Message*)END_TSO_QUEUE &&
-            cap->putMVars == NULL);
+    // This may race with writes to putMVars and inbox but this harmless for the
+    // intended uses of this function.
+    TSAN_ANNOTATE_BENIGN_RACE(&cap->putMVars, "emptyInbox(cap->putMVars)");
+    return (RELAXED_LOAD(&cap->inbox) == (Message*)END_TSO_QUEUE &&
+            RELAXED_LOAD(&cap->putMVars) == NULL);
 }
 
 #endif

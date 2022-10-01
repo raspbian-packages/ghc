@@ -2,6 +2,8 @@
 {-# LANGUAGE MagicHash, UnboxedTuples, TypeFamilies, DeriveDataTypeable,
              MultiParamTypeClasses, FlexibleInstances, NoImplicitPrelude #-}
 
+{-# OPTIONS_HADDOCK not-home #-}
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  GHC.Exts
@@ -28,7 +30,9 @@ module GHC.Exts
         maxTupleSize,
 
         -- * Primitive operations
+        FUN, -- See https://gitlab.haskell.org/ghc/ghc/issues/18302
         module GHC.Prim,
+        module GHC.Prim.Ext,
         shiftL#, shiftRL#, iShiftL#, iShiftRA#, iShiftRL#,
         uncheckedShiftL64#, uncheckedShiftRL64#,
         uncheckedIShiftL64#, uncheckedIShiftRA64#,
@@ -37,17 +41,33 @@ module GHC.Exts
         -- * Compat wrapper
         atomicModifyMutVar#,
 
+        -- * Resize functions
+        --
+        -- | Resizing arrays of boxed elements is currently handled in
+        -- library space (rather than being a primop) since there is not
+        -- an efficient way to grow arrays. However, resize operations
+        -- may become primops in a future release of GHC.
+        resizeSmallMutableArray#,
+
         -- * Fusion
         build, augment,
 
         -- * Overloaded string literals
         IsString(..),
 
+        -- * CString
+        unpackCString#,
+        unpackAppendCString#,
+        unpackFoldrCString#,
+        unpackCStringUtf8#,
+        unpackNBytes#,
+        cstringLength#,
+
         -- * Debugging
         breakpoint, breakpointCond,
 
         -- * Ids with special behaviour
-        lazy, inline, oneShot,
+        inline, noinline, lazy, oneShot, SPEC (..),
 
         -- * Running 'RealWorld' state thread
         runRW#,
@@ -58,6 +78,9 @@ module GHC.Exts
         --
         -- @since 4.7.0.0
         Data.Coerce.coerce, Data.Coerce.Coercible,
+
+        -- * Very unsafe coercion
+        unsafeCoerce#,
 
         -- * Equality
         type (~~),
@@ -89,6 +112,7 @@ module GHC.Exts
 
 import GHC.Prim hiding ( coerce, TYPE )
 import qualified GHC.Prim
+import qualified GHC.Prim.Ext
 import GHC.Base hiding ( coerce )
 import GHC.Word
 import GHC.Int
@@ -102,6 +126,9 @@ import Data.Data
 import Data.Ord
 import Data.Version ( Version(..), makeVersion )
 import qualified Debug.Trace
+import Unsafe.Coerce ( unsafeCoerce# ) -- just for re-export
+
+import Control.Applicative (ZipList(..))
 
 -- XXX This should really be in Data.Tuple, where the definitions are
 maxTupleSize :: Int
@@ -181,11 +208,12 @@ class IsList l where
   --   list of @Item l@
   fromList  :: [Item l] -> l
 
-  -- | The 'fromListN' function takes the input list's length as a hint. Its
-  --   behaviour should be equivalent to 'fromList'. The hint can be used to
-  --   construct the structure @l@ more efficiently compared to 'fromList'. If
-  --   the given hint does not equal to the input list's length the behaviour of
-  --   'fromListN' is not specified.
+  -- | The 'fromListN' function takes the input list's length and potentially
+  --   uses it to construct the structure @l@ more efficiently compared to 
+  --   'fromList'. If the given number does not equal to the input list's length 
+  --   the behaviour of 'fromListN' is not specified.
+  --
+  --   prop> fromListN (length xs) xs == fromList xs
   fromListN :: Int -> [Item l] -> l
   fromListN _ = fromList
 
@@ -198,6 +226,12 @@ instance IsList [a] where
   type (Item [a]) = a
   fromList = id
   toList = id
+
+-- | @since 4.15.0.0
+instance IsList (ZipList a) where
+  type Item (ZipList a) = a
+  fromList = ZipList
+  toList = getZipList
 
 -- | @since 4.9.0.0
 instance IsList (NonEmpty a) where
@@ -246,3 +280,34 @@ atomicModifyMutVar#
 atomicModifyMutVar# mv f s =
   case unsafeCoerce# (atomicModifyMutVar2# mv f s) of
     (# s', _, ~(_, res) #) -> (# s', res #)
+
+-- | Resize a mutable array to new specified size. The returned
+-- 'SmallMutableArray#' is either the original 'SmallMutableArray#'
+-- resized in-place or, if not possible, a newly allocated
+-- 'SmallMutableArray#' with the original content copied over.
+--
+-- To avoid undefined behaviour, the original 'SmallMutableArray#' shall
+-- not be accessed anymore after a 'resizeSmallMutableArray#' has been
+-- performed. Moreover, no reference to the old one should be kept in order
+-- to allow garbage collection of the original 'SmallMutableArray#'  in
+-- case a new 'SmallMutableArray#' had to be allocated.
+--
+-- @since 4.14.0.0
+resizeSmallMutableArray#
+  :: SmallMutableArray# s a -- ^ Array to resize
+  -> Int# -- ^ New size of array
+  -> a
+     -- ^ Newly created slots initialized to this element.
+     -- Only used when array is grown.
+  -> State# s
+  -> (# State# s, SmallMutableArray# s a #)
+resizeSmallMutableArray# arr0 szNew a s0 =
+  case getSizeofSmallMutableArray# arr0 s0 of
+    (# s1, szOld #) -> if isTrue# (szNew <# szOld)
+      then case shrinkSmallMutableArray# arr0 szNew s1 of
+        s2 -> (# s2, arr0 #)
+      else if isTrue# (szNew ># szOld)
+        then case newSmallArray# szNew a s1 of
+          (# s2, arr1 #) -> case copySmallMutableArray# arr0 0# arr1 0# szOld s2 of
+            s3 -> (# s3, arr1 #)
+        else (# s1, arr0 #)

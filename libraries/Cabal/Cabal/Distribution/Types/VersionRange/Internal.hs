@@ -4,6 +4,7 @@
 {-# LANGUAGE DeriveGeneric       #-}
 {-# LANGUAGE DeriveTraversable   #-}
 {-# LANGUAGE FlexibleContexts    #-}
+{-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
 -- | The only purpose of this module is to prevent the export of
@@ -30,6 +31,7 @@ module Distribution.Types.VersionRange.Internal
   , versionRangeParser
 
   , majorUpperBound
+  , wildcardUpperBound
   ) where
 
 import Distribution.Compat.Prelude
@@ -39,28 +41,25 @@ import Prelude ()
 import Distribution.CabalSpecVersion
 import Distribution.Parsec
 import Distribution.Pretty
-import Text.PrettyPrint              ((<+>))
+import Distribution.Utils.Generic    (unsnoc)
 
 import qualified Distribution.Compat.CharParsing as P
 import qualified Distribution.Compat.DList       as DList
 import qualified Text.PrettyPrint                as Disp
 
 data VersionRange
-  = AnyVersion
-  | ThisVersion            Version -- = version
+  = ThisVersion            Version -- = version
   | LaterVersion           Version -- > version  (NB. not >=)
   | OrLaterVersion         Version -- >= version
   | EarlierVersion         Version -- < version
   | OrEarlierVersion       Version -- <= version
-  | WildcardVersion        Version -- == ver.*   (same as >= ver && < ver+1)
   | MajorBoundVersion      Version -- @^>= ver@ (same as >= ver && < MAJ(ver)+1)
   | UnionVersionRanges     VersionRange VersionRange
   | IntersectVersionRanges VersionRange VersionRange
-  | VersionRangeParens     VersionRange -- just '(exp)' parentheses syntax
   deriving ( Data, Eq, Generic, Read, Show, Typeable )
 
 instance Binary VersionRange
-
+instance Structured VersionRange
 instance NFData VersionRange where rnf = genericRnf
 
 -- | The version range @-any@. That is, a version range containing all
@@ -69,18 +68,17 @@ instance NFData VersionRange where rnf = genericRnf
 -- > withinRange v anyVersion = True
 --
 anyVersion :: VersionRange
-anyVersion = AnyVersion
+anyVersion = OrLaterVersion (mkVersion [0])
 
 -- | The empty version range, that is a version range containing no versions.
 --
 -- This can be constructed using any unsatisfiable version range expression,
--- for example @> 1 && < 1@.
+-- for example @< 0@.
 --
 -- > withinRange v noVersion = False
 --
 noVersion :: VersionRange
-noVersion = IntersectVersionRanges (LaterVersion v) (EarlierVersion v)
-  where v = mkVersion [1]
+noVersion = EarlierVersion (mkVersion [0])
 
 -- | The version range @== v@
 --
@@ -150,7 +148,9 @@ intersectVersionRanges = IntersectVersionRanges
 -- >     upper (Version lower t) = Version (init lower ++ [last lower + 1]) t
 --
 withinVersion :: Version -> VersionRange
-withinVersion = WildcardVersion
+withinVersion v = intersectVersionRanges
+    (orLaterVersion v)
+    (earlierVersion (wildcardUpperBound v))
 
 -- | The version range @^>= v@.
 --
@@ -168,33 +168,27 @@ majorBoundVersion = MajorBoundVersion
 --
 -- @since 2.2
 data VersionRangeF a
-  = AnyVersionF
-  | ThisVersionF            Version -- = version
+  = ThisVersionF            Version -- = version
   | LaterVersionF           Version -- > version  (NB. not >=)
   | OrLaterVersionF         Version -- >= version
   | EarlierVersionF         Version -- < version
   | OrEarlierVersionF       Version -- <= version
-  | WildcardVersionF        Version -- == ver.*   (same as >= ver && < ver+1)
   | MajorBoundVersionF      Version -- @^>= ver@ (same as >= ver && < MAJ(ver)+1)
   | UnionVersionRangesF     a a
   | IntersectVersionRangesF a a
-  | VersionRangeParensF     a
   deriving ( Data, Eq, Generic, Read, Show, Typeable
            , Functor, Foldable, Traversable )
 
 -- | @since 2.2
 projectVersionRange :: VersionRange -> VersionRangeF VersionRange
-projectVersionRange AnyVersion                   = AnyVersionF
 projectVersionRange (ThisVersion v)              = ThisVersionF v
 projectVersionRange (LaterVersion v)             = LaterVersionF v
 projectVersionRange (OrLaterVersion v)           = OrLaterVersionF v
 projectVersionRange (EarlierVersion v)           = EarlierVersionF v
 projectVersionRange (OrEarlierVersion v)         = OrEarlierVersionF v
-projectVersionRange (WildcardVersion v)          = WildcardVersionF v
 projectVersionRange (MajorBoundVersion v)        = MajorBoundVersionF v
 projectVersionRange (UnionVersionRanges a b)     = UnionVersionRangesF a b
 projectVersionRange (IntersectVersionRanges a b) = IntersectVersionRangesF a b
-projectVersionRange (VersionRangeParens a)       = VersionRangeParensF a
 
 -- | Fold 'VersionRange'.
 --
@@ -204,17 +198,14 @@ cataVersionRange f = c where c = f . fmap c . projectVersionRange
 
 -- | @since 2.2
 embedVersionRange :: VersionRangeF VersionRange -> VersionRange
-embedVersionRange AnyVersionF                   = AnyVersion
 embedVersionRange (ThisVersionF v)              = ThisVersion v
 embedVersionRange (LaterVersionF v)             = LaterVersion v
 embedVersionRange (OrLaterVersionF v)           = OrLaterVersion v
 embedVersionRange (EarlierVersionF v)           = EarlierVersion v
 embedVersionRange (OrEarlierVersionF v)         = OrEarlierVersion v
-embedVersionRange (WildcardVersionF v)          = WildcardVersion v
 embedVersionRange (MajorBoundVersionF v)        = MajorBoundVersion v
 embedVersionRange (UnionVersionRangesF a b)     = UnionVersionRanges a b
 embedVersionRange (IntersectVersionRangesF a b) = IntersectVersionRanges a b
-embedVersionRange (VersionRangeParensF a)       = VersionRangeParens a
 
 -- | Unfold 'VersionRange'.
 --
@@ -234,34 +225,98 @@ hyloVersionRange f g = h where h = f . fmap h . g
 -- Parsec & Pretty
 -------------------------------------------------------------------------------
 
+-- |
+--
+-- >>> fmap pretty (simpleParsec' CabalSpecV1_6 "== 3.2.*" :: Maybe VersionRange)
+-- Just >=3.2 && <3.3
+--
+-- >>> fmap (prettyVersioned CabalSpecV1_6) (simpleParsec' CabalSpecV1_6 "== 3.2.*" :: Maybe VersionRange)
+-- Just ==3.2.*
+--
+-- >>> fmap pretty (simpleParsec' CabalSpecV1_6 "-any" :: Maybe VersionRange)
+-- Just >=0
+--
+-- >>> fmap (prettyVersioned CabalSpecV1_6) (simpleParsec' CabalSpecV1_6 "-any" :: Maybe VersionRange)
+-- Just >=0
+--
 instance Pretty VersionRange where
-    pretty = fst . cataVersionRange alg
-      where
-        alg AnyVersionF                     = (Disp.text "-any", 0 :: Int)
-        alg (ThisVersionF v)                = (Disp.text "==" <<>> pretty v, 0)
-        alg (LaterVersionF v)               = (Disp.char '>'  <<>> pretty v, 0)
-        alg (OrLaterVersionF v)             = (Disp.text ">=" <<>> pretty v, 0)
-        alg (EarlierVersionF v)             = (Disp.char '<'  <<>> pretty v, 0)
-        alg (OrEarlierVersionF v)           = (Disp.text "<=" <<>> pretty v, 0)
-        alg (WildcardVersionF v)            = (Disp.text "==" <<>> dispWild v, 0)
-        alg (MajorBoundVersionF v)          = (Disp.text "^>=" <<>> pretty v, 0)
-        alg (UnionVersionRangesF (r1, p1) (r2, p2)) =
-            (punct 1 p1 r1 <+> Disp.text "||" <+> punct 2 p2 r2 , 2)
-        alg (IntersectVersionRangesF (r1, p1) (r2, p2)) =
-            (punct 0 p1 r1 <+> Disp.text "&&" <+> punct 1 p2 r2 , 1)
-        alg (VersionRangeParensF (r, _))         =
-            (Disp.parens r, 0)
+    pretty = prettyVersioned cabalSpecLatest
 
-        dispWild ver =
-            Disp.hcat (Disp.punctuate (Disp.char '.')
-                        (map Disp.int $ versionNumbers ver))
-            <<>> Disp.text ".*"
+    prettyVersioned csv
+        | csv > CabalSpecV1_6 = prettyVersionRange
+        | otherwise           = prettyVersionRange16
 
-        punct p p' | p < p'    = Disp.parens
-                   | otherwise = id
+prettyVersionRange :: VersionRange -> Disp.Doc
+prettyVersionRange vr = cataVersionRange alg vr 0
+  where
+    alg :: VersionRangeF (Int -> Disp.Doc) -> Int -> Disp.Doc
+    alg (ThisVersionF v)                _ = Disp.text "=="  <<>> pretty v
+    alg (LaterVersionF v)               _ = Disp.text ">"   <<>> pretty v
+    alg (OrLaterVersionF v)             _ = Disp.text ">="  <<>> pretty v
+    alg (EarlierVersionF v)             _ = Disp.text "<"   <<>> pretty v
+    alg (OrEarlierVersionF v)           _ = Disp.text "<="  <<>> pretty v
+    alg (MajorBoundVersionF v)          _ = Disp.text "^>=" <<>> pretty v
+    alg (UnionVersionRangesF r1 r2)     d = parens (d > 0)
+        $ r1 1 <+> Disp.text "||" <+> r2 0
+    alg (IntersectVersionRangesF r1 r2) d = parens (d > 1)
+        $ r1 2 <+> Disp.text "&&" <+> r2 1
 
+    parens True  = Disp.parens
+    parens False = id
+
+-- | Don't use && and || operators. If possible.
+prettyVersionRange16 :: VersionRange -> Disp.Doc
+prettyVersionRange16 (IntersectVersionRanges (OrLaterVersion v) (EarlierVersion u))
+    | u == wildcardUpperBound v
+    = Disp.text "==" <<>> dispWild v
+  where
+    dispWild ver =
+        Disp.hcat (Disp.punctuate (Disp.char '.')
+                    (map Disp.int $ versionNumbers ver))
+        <<>> Disp.text ".*"
+
+prettyVersionRange16 vr = prettyVersionRange vr
+
+-- |
+--
+-- >>> simpleParsec "^>= 3.4" :: Maybe VersionRange
+-- Just (MajorBoundVersion (mkVersion [3,4]))
+--
+-- Small history:
+--
+-- @-any@ and @-none@ removed in 3.4
+-- Use @>=0@ and @<0@ instead.
+--
+-- >>> map (`simpleParsec'` "-none") [CabalSpecV3_0, CabalSpecV3_4] :: [Maybe VersionRange]
+-- [Just (EarlierVersion (mkVersion [0])),Nothing]
+--
+-- Set operations are introduced in 3.0
+--
+-- >>> map (`simpleParsec'` "^>= { 1.2 , 1.3 }") [CabalSpecV2_4, CabalSpecV3_0] :: [Maybe VersionRange]
+-- [Nothing,Just (UnionVersionRanges (MajorBoundVersion (mkVersion [1,2])) (MajorBoundVersion (mkVersion [1,3])))]
+--
+-- @^>=@ is introduced in 2.0
+--
+-- >>> map (`simpleParsec'` "^>=1.2") [CabalSpecV1_24, CabalSpecV2_0] :: [Maybe VersionRange]
+-- [Nothing,Just (MajorBoundVersion (mkVersion [1,2]))]
+--
+-- @-none@ is introduced in 1.22
+--
+-- >>> map (`simpleParsec'` "-none") [CabalSpecV1_20, CabalSpecV1_22] :: [Maybe VersionRange]
+-- [Nothing,Just (EarlierVersion (mkVersion [0]))]
+--
+-- Operators are introduced in 1.8. Issues only a warning.
+--
+-- >>> map (`simpleParsecW'` "== 1 || ==2") [CabalSpecV1_6, CabalSpecV1_8] :: [Maybe VersionRange]
+-- [Nothing,Just (UnionVersionRanges (ThisVersion (mkVersion [1])) (ThisVersion (mkVersion [2])))]
+--
+-- Wild-version ranges are introduced in 1.6. Issues only a warning.
+--
+-- >>> map (`simpleParsecW'` "== 1.2.*") [CabalSpecV1_4, CabalSpecV1_6] :: [Maybe VersionRange]
+-- [Nothing,Just (IntersectVersionRanges (OrLaterVersion (mkVersion [1,2])) (EarlierVersion (mkVersion [1,3])))]
+--
 instance Parsec VersionRange where
-    parsec = versionRangeParser versionDigitParser
+    parsec = askCabalSpecVersion >>= versionRangeParser versionDigitParser
 
 -- | 'VersionRange' parser parametrised by version digit parser
 --
@@ -270,13 +325,14 @@ instance Parsec VersionRange where
 --   versions, 'PkgConfigVersionRange'.
 --
 -- @since 3.0
-versionRangeParser :: forall m. CabalParsing m => m Int -> m VersionRange
-versionRangeParser digitParser = expr
+versionRangeParser :: forall m. CabalParsing m => m Int -> CabalSpecVersion -> m VersionRange
+versionRangeParser digitParser csv = expr
       where
         expr   = do P.spaces
                     t <- term
                     P.spaces
                     (do _  <- P.string "||"
+                        checkOp
                         P.spaces
                         e <- expr
                         return (unionVersionRanges t e)
@@ -285,6 +341,7 @@ versionRangeParser digitParser = expr
         term   = do f <- factor
                     P.spaces
                     (do _  <- P.string "&&"
+                        checkOp
                         P.spaces
                         t <- term
                         return (intersectVersionRanges f t)
@@ -293,13 +350,14 @@ versionRangeParser digitParser = expr
         factor = parens expr <|> prim
 
         prim = do
-            op <- P.munch1 (`elem` "<>=^-") P.<?> "operator"
+            op <- P.munch1 isOpChar P.<?> "operator"
             case op of
                 "-" -> anyVersion <$ P.string "any" <|> P.string "none" *> noVersion'
 
                 "==" -> do
                     P.spaces
                     (do (wild, v) <- verOrWild
+                        checkWild wild
                         pure $ (if wild then withinVersion else thisVersion) v
                      <|>
                      (verSet' thisVersion =<< verSet))
@@ -325,13 +383,42 @@ versionRangeParser digitParser = expr
                         ">"   -> pure $ laterVersion v
                         _ -> fail $ "Unknown version operator " ++ show op
 
-        -- Note: There are other features:
-        -- && and || since 1.8
-        -- x.y.* (wildcard) since 1.6
+        -- Cannot be warning
+        -- On 2020-03-16 there was around 27400 files on Hackage failing to parse due this
+        -- For example https://hackage.haskell.org/package/haxr-3000.0.0/haxr.cabal
+        --
+        checkOp = when (csv < CabalSpecV1_8) $
+            parsecWarning PWTVersionOperator $ unwords
+                [ "version operators used."
+                , "To use version operators the package needs to specify at least 'cabal-version: >= 1.8'."
+                ]
+
+        -- Cannot be warning
+        -- On 2020-03-16 there was 46 files on Hackage failing to parse due this
+        -- For example https://hackage.haskell.org/package/derive-0.1.2/derive.cabal
+        --
+        checkWild False = pure ()
+        checkWild True  = when (csv < CabalSpecV1_6) $
+            parsecWarning PWTVersionWildcard $ unwords
+                [ "Wildcard syntax used."
+                , "To use version wildcards the package needs to specify at least 'cabal-version: >= 1.6'."
+                ]
+
+        -- https://gitlab.haskell.org/ghc/ghc/issues/17752
+        isOpChar '<' = True
+        isOpChar '=' = True
+        isOpChar '>' = True
+        isOpChar '^' = True
+        isOpChar '-' = csv < CabalSpecV3_4
+        -- https://github.com/haskell/cabal/issues/6589
+        -- Unfortunately we have must not consume the dash,
+        -- as otherwise following parts may not be parsed.
+        --
+        -- i.e. we cannot fail here with good error.
+        isOpChar _   = False
 
         -- -none version range is available since 1.22
-        noVersion' = do
-            csv <- askCabalSpecVersion
+        noVersion' =
             if csv >= CabalSpecV1_22
             then pure noVersion
             else fail $ unwords
@@ -342,8 +429,7 @@ versionRangeParser digitParser = expr
                 ]
 
         -- ^>= is available since 2.0
-        majorBoundVersion' v = do
-            csv <- askCabalSpecVersion
+        majorBoundVersion' v =
             if csv >= CabalSpecV2_0
             then pure $ majorBoundVersion v
             else fail $ unwords
@@ -359,8 +445,7 @@ versionRangeParser digitParser = expr
             embed vr = embedVersionRange vr
 
         -- version set notation (e.g. "== { 0.0.1.0, 0.0.2.0, 0.1.0.0 }")
-        verSet' op vs = do
-            csv <- askCabalSpecVersion
+        verSet' op vs =
             if csv >= CabalSpecV3_0
             then pure $ foldr1 unionVersionRanges (fmap op vs)
             else fail $ unwords
@@ -381,7 +466,7 @@ versionRangeParser digitParser = expr
 
         -- a plain version without tags or wildcards
         verPlain :: CabalParsing m => m Version
-        verPlain = mkVersion <$> P.sepBy1 digitParser (P.char '.')
+        verPlain = mkVersion <$> toList <$> P.sepByNonEmpty digitParser (P.char '.')
 
         -- either wildcard or normal version
         verOrWild :: CabalParsing m => m (Bool, Version)
@@ -404,9 +489,10 @@ versionRangeParser digitParser = expr
         parens p = P.between
             ((P.char '(' P.<?> "opening paren") >> P.spaces)
             (P.char ')' >> P.spaces)
-            (do a <- p
+            $ do
+                a <- p
                 P.spaces
-                return (VersionRangeParens a))
+                return a
 
         tags :: CabalParsing m => m ()
         tags = do
@@ -431,3 +517,10 @@ majorUpperBound = alterVersion $ \numbers -> case numbers of
     []        -> [0,1] -- should not happen
     [m1]      -> [m1,1] -- e.g. version '1'
     (m1:m2:_) -> [m1,m2+1]
+
+-- | @since 2.2
+wildcardUpperBound :: Version -> Version
+wildcardUpperBound = alterVersion $
+    \lowerBound -> case unsnoc lowerBound of
+        Nothing      -> []
+        Just (xs, x) -> xs ++ [x + 1]

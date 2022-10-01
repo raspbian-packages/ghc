@@ -1,6 +1,7 @@
-{-# LANGUAGE DeriveFunctor       #-}
-{-# LANGUAGE OverloadedStrings   #-}
-{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE DeriveFunctor         #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE OverloadedStrings     #-}
+{-# LANGUAGE ScopedTypeVariables   #-}
 -- | This module provides a 'FieldGrammarParser', one way to parse
 -- @.cabal@ -like files.
 --
@@ -65,18 +66,18 @@ module Distribution.FieldGrammar.Parsec (
     )  where
 
 import Data.List                   (dropWhileEnd)
-import Data.Ord                    (comparing)
-import Data.Set                    (Set)
 import Distribution.Compat.Newtype
 import Distribution.Compat.Prelude
 import Distribution.Simple.Utils   (fromUTF8BS)
 import Prelude ()
 
-import qualified Data.ByteString   as BS
-import qualified Data.Map.Strict   as Map
-import qualified Data.Set          as Set
-import qualified Text.Parsec       as P
-import qualified Text.Parsec.Error as P
+import qualified Data.ByteString              as BS
+import qualified Data.List.NonEmpty           as NE
+import qualified Data.Map.Strict              as Map
+import qualified Data.Set                     as Set
+import qualified Distribution.Utils.ShortText as ShortText
+import qualified Text.Parsec                  as P
+import qualified Text.Parsec.Error            as P
 
 import Distribution.CabalSpecVersion
 import Distribution.FieldGrammar.Class
@@ -84,7 +85,7 @@ import Distribution.Fields.Field
 import Distribution.Fields.ParseResult
 import Distribution.Parsec
 import Distribution.Parsec.FieldLineStream
-import Distribution.Parsec.Position        (positionRow, positionCol)
+import Distribution.Parsec.Position        (positionCol, positionRow)
 
 -------------------------------------------------------------------------------
 -- Auxiliary types
@@ -150,18 +151,18 @@ warnMultipleSingularFields fn (x : xs) = do
     parseWarning pos PWTMultipleSingularField $
         "The field " <> show fn <> " is specified more than once at positions " ++ intercalate ", " (map showPos (pos : poss))
 
-instance FieldGrammar ParsecFieldGrammar where
+instance FieldGrammar Parsec ParsecFieldGrammar where
     blurFieldGrammar _ (ParsecFG s s' parser) = ParsecFG s s' parser
 
     uniqueFieldAla fn _pack _extract = ParsecFG (Set.singleton fn) Set.empty parser
       where
         parser v fields = case Map.lookup fn fields of
-            Nothing -> parseFatalFailure zeroPos $ show fn ++ " field missing"
-            Just [] -> parseFatalFailure zeroPos $ show fn ++ " field missing"
-            Just [x] -> parseOne v x
-            Just xs -> do
+            Nothing          -> parseFatalFailure zeroPos $ show fn ++ " field missing"
+            Just []          -> parseFatalFailure zeroPos $ show fn ++ " field missing"
+            Just [x]         -> parseOne v x
+            Just xs@(_:y:ys) -> do
                 warnMultipleSingularFields fn xs
-                last <$> traverse (parseOne v) xs
+                NE.last <$> traverse (parseOne v) (y:|ys)
 
         parseOne v (MkNamelessField pos fls) =
             unpack' _pack <$> runFieldParser pos parsec v fls
@@ -169,24 +170,24 @@ instance FieldGrammar ParsecFieldGrammar where
     booleanFieldDef fn _extract def = ParsecFG (Set.singleton fn) Set.empty parser
       where
         parser v fields = case Map.lookup fn fields of
-            Nothing  -> pure def
-            Just []  -> pure def
-            Just [x] -> parseOne v x
-            Just xs  -> do
+            Nothing          -> pure def
+            Just []          -> pure def
+            Just [x]         -> parseOne v x
+            Just xs@(_:y:ys) -> do
                 warnMultipleSingularFields fn xs
-                last <$> traverse (parseOne v) xs
+                NE.last <$> traverse (parseOne v) (y:|ys)
 
         parseOne v (MkNamelessField pos fls) = runFieldParser pos parsec v fls
 
     optionalFieldAla fn _pack _extract = ParsecFG (Set.singleton fn) Set.empty parser
       where
         parser v fields = case Map.lookup fn fields of
-            Nothing  -> pure Nothing
-            Just []  -> pure Nothing
-            Just [x] -> parseOne v x
-            Just xs  -> do
+            Nothing          -> pure Nothing
+            Just []          -> pure Nothing
+            Just [x]         -> parseOne v x
+            Just xs@(_:y:ys) -> do
                 warnMultipleSingularFields fn xs
-                last <$> traverse (parseOne v) xs
+                NE.last <$> traverse (parseOne v) (y:|ys)
 
         parseOne v (MkNamelessField pos fls)
             | null fls  = pure Nothing
@@ -195,12 +196,12 @@ instance FieldGrammar ParsecFieldGrammar where
     optionalFieldDefAla fn _pack _extract def = ParsecFG (Set.singleton fn) Set.empty parser
       where
         parser v fields = case Map.lookup fn fields of
-            Nothing  -> pure def
-            Just []  -> pure def
-            Just [x] -> parseOne v x
-            Just xs  -> do
+            Nothing          -> pure def
+            Just []          -> pure def
+            Just [x]         -> parseOne v x
+            Just xs@(_:y:ys) -> do
                 warnMultipleSingularFields fn xs
-                last <$> traverse (parseOne v) xs
+                NE.last <$> traverse (parseOne v) (y:|ys)
 
         parseOne v (MkNamelessField pos fls)
             | null fls  = pure def
@@ -208,12 +209,12 @@ instance FieldGrammar ParsecFieldGrammar where
 
     freeTextField fn _ = ParsecFG (Set.singleton fn) Set.empty parser where
         parser v fields = case Map.lookup fn fields of
-            Nothing  -> pure Nothing
-            Just []  -> pure Nothing
-            Just [x] -> parseOne v x
-            Just xs  -> do
+            Nothing          -> pure Nothing
+            Just []          -> pure Nothing
+            Just [x]         -> parseOne v x
+            Just xs@(_:y:ys) -> do
                 warnMultipleSingularFields fn xs
-                last <$> traverse (parseOne v) xs
+                NE.last <$> traverse (parseOne v) (y:|ys)
 
         parseOne v (MkNamelessField pos fls)
             | null fls           = pure Nothing
@@ -222,17 +223,33 @@ instance FieldGrammar ParsecFieldGrammar where
 
     freeTextFieldDef fn _ = ParsecFG (Set.singleton fn) Set.empty parser where
         parser v fields = case Map.lookup fn fields of
-            Nothing  -> pure ""
-            Just []  -> pure ""
-            Just [x] -> parseOne v x
-            Just xs  -> do
+            Nothing          -> pure ""
+            Just []          -> pure ""
+            Just [x]         -> parseOne v x
+            Just xs@(_:y:ys) -> do
                 warnMultipleSingularFields fn xs
-                last <$> traverse (parseOne v) xs
+                NE.last <$> traverse (parseOne v) (y:|ys)
 
         parseOne v (MkNamelessField pos fls)
             | null fls           = pure ""
             | v >= CabalSpecV3_0 = pure (fieldlinesToFreeText3 pos fls)
             | otherwise          = pure (fieldlinesToFreeText fls)
+
+    -- freeTextFieldDefST = defaultFreeTextFieldDefST
+    freeTextFieldDefST fn _ = ParsecFG (Set.singleton fn) Set.empty parser where
+        parser v fields = case Map.lookup fn fields of
+            Nothing          -> pure mempty
+            Just []          -> pure mempty
+            Just [x]         -> parseOne v x
+            Just xs@(_:y:ys) -> do
+                warnMultipleSingularFields fn xs
+                NE.last <$> traverse (parseOne v) (y:|ys)
+
+        parseOne v (MkNamelessField pos fls) = case fls of
+            []                     -> pure mempty
+            [FieldLine _  bs]      -> pure (ShortText.unsafeFromUTF8BS bs)
+            _ | v >= CabalSpecV3_0 -> pure (ShortText.toShortText $ fieldlinesToFreeText3 pos fls)
+              | otherwise          -> pure (ShortText.toShortText $ fieldlinesToFreeText fls)
 
     monoidalFieldAla fn _pack _extract = ParsecFG (Set.singleton fn) Set.empty parser
       where
@@ -269,6 +286,20 @@ instance FieldGrammar ParsecFieldGrammar where
                             "The field " <> show name <> " is available only since the Cabal specification version " ++ showCabalSpecVersion vs ++ ". This field will be ignored."
 
                 pure def
+
+    availableSinceWarn vs (ParsecFG names prefixes parser) = ParsecFG names prefixes parser'
+      where
+        parser' v values
+            | v >= vs = parser v values
+            | otherwise = do
+                let unknownFields = Map.intersection values $ Map.fromSet (const ()) names
+                for_ (Map.toList unknownFields) $ \(name, fields) ->
+                    for_ fields $ \(MkNamelessField pos _) ->
+                        parseWarning pos PWTUnknownField $
+                            "The field " <> show name <> " is available only since the Cabal specification version " ++ showCabalSpecVersion vs ++ "."
+
+                parser v values
+
 
     -- todo we know about this field
     deprecatedSince vs msg (ParsecFG names prefixes parser) = ParsecFG names prefixes parser'

@@ -1,6 +1,7 @@
-{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DeriveGeneric              #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE OverloadedStrings          #-}
+{-# LANGUAGE RecordWildCards            #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -17,25 +18,19 @@ module Distribution.Client.IndexUtils.Timestamp
     , timestampToUTCTime
     , utcTimeToTimestamp
     , maximumTimestamp
-
-    , IndexState(..)
     ) where
 
-import qualified Codec.Archive.Tar.Entry    as Tar
-import           Control.DeepSeq
-import           Control.Monad
-import           Data.Char                  (isDigit)
-import           Data.Int                   (Int64)
-import           Data.Time                  (UTCTime (..), fromGregorianValid,
-                                             makeTimeOfDayValid, showGregorian,
-                                             timeOfDayToTime, timeToTimeOfDay)
-import           Data.Time.Clock.POSIX      (posixSecondsToUTCTime,
-                                             utcTimeToPOSIXSeconds)
-import           Distribution.Compat.Binary
-import qualified Distribution.Deprecated.ReadP  as ReadP
-import           Distribution.Deprecated.Text
-import qualified Text.PrettyPrint           as Disp
-import           GHC.Generics (Generic)
+import Distribution.Client.Compat.Prelude
+
+-- read is needed for Text instance
+import Prelude (read)
+
+import Data.Time             (UTCTime (..), fromGregorianValid, makeTimeOfDayValid, showGregorian, timeOfDayToTime, timeToTimeOfDay)
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
+
+import qualified Codec.Archive.Tar.Entry         as Tar
+import qualified Distribution.Compat.CharParsing as P
+import qualified Text.PrettyPrint                as Disp
 
 -- | UNIX timestamp (expressed in seconds since unix epoch, i.e. 1970).
 newtype Timestamp = TS Int64 -- Tar.EpochTime
@@ -98,20 +93,21 @@ showTimestamp ts = case timestampToUTCTime ts of
   where
     showTOD = show . timeToTimeOfDay
 
-instance Binary Timestamp where
-    put (TS t) = put t
-    get = TS `fmap` get
+instance Binary Timestamp
+instance Structured Timestamp
 
-instance Text Timestamp where
-    disp = Disp.text . showTimestamp
+instance Pretty Timestamp where
+    pretty = Disp.text . showTimestamp
 
-    parse = parsePosix ReadP.+++ parseUTC
+instance Parsec Timestamp where
+    parsec = parsePosix <|> parseUTC
       where
         -- | Parses unix timestamps, e.g. @"\@1474626019"@
         parsePosix = do
-            _ <- ReadP.char '@'
-            t <- parseInteger
-            maybe ReadP.pfail return $ posixSecondsToTimestamp t
+            _ <- P.char '@'
+            t <- P.integral -- note, no negative timestamps
+            maybe (fail (show t ++ " is not representable as timestamp")) return $
+                posixSecondsToTimestamp t
 
         -- | Parses ISO8601/RFC3339-style UTC timestamps,
         -- e.g. @"2017-12-31T23:59:59Z"@
@@ -122,71 +118,44 @@ instance Text Timestamp where
             -- we want more control over the accepted formats.
 
             ye <- parseYear
-            _ <- ReadP.char '-'
+            _ <- P.char '-'
             mo   <- parseTwoDigits
-            _ <- ReadP.char '-'
+            _ <- P.char '-'
             da   <- parseTwoDigits
-            _ <- ReadP.char 'T'
+            _ <- P.char 'T'
 
-            utctDay <- maybe ReadP.pfail return $
+            utctDay <- maybe (fail (show (ye,mo,da) ++ " is not valid gregorian date")) return $
                        fromGregorianValid ye mo da
 
             ho   <- parseTwoDigits
-            _ <- ReadP.char ':'
+            _ <- P.char ':'
             mi   <- parseTwoDigits
-            _ <- ReadP.char ':'
+            _ <- P.char ':'
             se   <- parseTwoDigits
-            _ <- ReadP.char 'Z'
+            _ <- P.char 'Z'
 
-            utctDayTime <- maybe ReadP.pfail (return . timeOfDayToTime) $
+            utctDayTime <- maybe (fail (show (ho,mi,se) ++  " is not valid time of day")) (return . timeOfDayToTime) $
                            makeTimeOfDayValid ho mi (realToFrac (se::Int))
 
-            maybe ReadP.pfail return $ utcTimeToTimestamp (UTCTime{..})
+            let utc = UTCTime {..}
+
+            maybe (fail (show utc ++ " is not representable as timestamp")) return $ utcTimeToTimestamp utc
 
         parseTwoDigits = do
-            d1 <- ReadP.satisfy isDigit
-            d2 <- ReadP.satisfy isDigit
+            d1 <- P.satisfy isDigit
+            d2 <- P.satisfy isDigit
             return (read [d1,d2])
 
         -- A year must have at least 4 digits; e.g. "0097" is fine,
         -- while "97" is not c.f. RFC3339 which
         -- deprecates 2-digit years
         parseYear = do
-            sign <- ReadP.option ' ' (ReadP.char '-')
-            ds <- ReadP.munch1 isDigit
-            when (length ds < 4) ReadP.pfail
+            sign <- P.option ' ' (P.char '-')
+            ds <- P.munch1 isDigit
+            when (length ds < 4) $ fail "Year should have at least 4 digits"
             return (read (sign:ds))
-
-        parseInteger = do
-            sign <- ReadP.option ' ' (ReadP.char '-')
-            ds <- ReadP.munch1 isDigit
-            return (read (sign:ds) :: Integer)
 
 -- | Special timestamp value to be used when 'timestamp' is
 -- missing/unknown/invalid
 nullTimestamp :: Timestamp
 nullTimestamp = TS minBound
-
-----------------------------------------------------------------------------
--- defined here for now to avoid import cycles
-
--- | Specification of the state of a specific repo package index
-data IndexState = IndexStateHead -- ^ Use all available entries
-                | IndexStateTime !Timestamp -- ^ Use all entries that existed at
-                                            -- the specified time
-                deriving (Eq,Generic,Show)
-
-instance Binary IndexState
-instance NFData IndexState
-
-instance Text IndexState where
-    disp IndexStateHead = Disp.text "HEAD"
-    disp (IndexStateTime ts) = disp ts
-
-    parse = parseHead ReadP.+++ parseTime
-      where
-        parseHead = do
-            _ <- ReadP.string "HEAD"
-            return IndexStateHead
-
-        parseTime = IndexStateTime `fmap` parse

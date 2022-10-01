@@ -75,7 +75,7 @@ To see which packages are currently available, use the ``ghc-pkg list`` command:
         pretty-1.0.1.0
         process-1.0.1.1
         random-1.0.0.1
-        rts-1.0
+        rts-1.0.1
         syb-0.1.0.0
         template-haskell-2.4.0.0
         terminfo-0.3.1
@@ -965,27 +965,17 @@ Additionally, the following flags are accepted by ``ghc-pkg``:
 
     Output the ``ghc-pkg`` version number.
 
-``--ipid``
+``--ipid``, ``--unit-id``
     .. index::
        single: --ipid; ghc-pkg option
+       single: --unit-id; ghc-pkg option
 
-    Causes ``ghc-pkg`` to interpret arguments as installed package IDs
+    Causes ``ghc-pkg`` to interpret arguments as installed unit IDs
     (e.g., an identifier like
     ``unix-2.3.1.0-de7803f1a8cd88d2161b29b083c94240``). This is useful
     if providing just the package name and version are ambiguous (in old
     versions of GHC, this was guaranteed to be unique, but this
     invariant no longer necessarily holds).
-
-``--package-key``
-    .. index::
-       single: --package-key; ghc-pkg option
-
-    Causes ``ghc-pkg`` to interpret arguments as unit IDs (e.g., an
-    identifier like ``I5BErHzyOm07EBNpKBEeUv``). Package keys are used
-    to prefix symbol names GHC produces (e.g.,
-    ``6VWy06pWzzJq9evDvK2d4w6_DataziByteStringziInternal_unsafePackLenChars_info``),
-    so if you need to figure out what package a symbol belongs to, use
-    ``ghc-pkg`` with this flag.
 
 .. _building-packages:
 
@@ -1029,9 +1019,9 @@ extra indirection).
    ``HSfoo.o`` file that has been pre-linked. Loading the ``.o`` file is
    slightly quicker, but at the expense of having another copy of the
    compiled package. The rule of thumb is that if the modules of the
-   package were compiled with :ghc-flag:`-split-objs` then building the
+   package were compiled with :ghc-flag:`-split-sections` then building the
    ``HSfoo.o`` is worthwhile because it saves time when loading the
-   package into GHCi. Without :ghc-flag:`-split-objs`, there is not much
+   package into GHCi. Without :ghc-flag:`-split-sections`, there is not much
    difference in load time between the ``.o`` and ``.a`` libraries, so
    it is better to save the disk space and only keep the ``.a`` around.
    In a GHC distribution we provide ``.o`` files for most packages
@@ -1070,6 +1060,14 @@ extra indirection).
    the version number of GHC invoke ``ghc --numeric-version`` and use
    its output in place of ⟨GHCVersion⟩. See also :ref:`options-codegen`
    on how object files must be prepared for shared object linking.
+
+-  When building a shared library, care must be taken to ensure that the
+   resulting object is named appropriately. In particular, GHC expects the
+   name of a shared object to have the form ``libHS<unit id>-ghc<ghc
+   version>.<ext>`` where *unit id* is the unit ID given during compilation via
+   the :ghc-flag:`-this-unit-id ⟨unit-id⟩` flag, *ghc version* is the version of
+   GHC that produced/consumes the object and *ext* is the host system's usual
+   file extension for shared objects.
 
 To compile a module which is to be part of a new package, use the
 ``-package-name`` (to identify the name of the package) and
@@ -1339,8 +1337,6 @@ The allowed fields, with their types, are:
 
     ``libHSfoo.a``
         The name of the library on Unix and Windows (mingw) systems.
-        Note that we don't support building dynamic libraries of Haskell
-        code on Unix systems.
 
     ``HSfoo.dll``
         The name of the dynamic library on Windows systems (optional).

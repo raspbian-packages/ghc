@@ -6,7 +6,6 @@
 {-# LANGUAGE ViewPatterns      #-}
 module Distribution.Client.CmdSdist
     ( sdistCommand, sdistAction, packageToSdist
-    , SdistFlags(..), defaultSdistFlags
     , OutputFormat(..)) where
 
 import Prelude ()
@@ -15,12 +14,12 @@ import Distribution.Client.Compat.Prelude
 import Distribution.Client.CmdErrorMessages
     ( Plural(..), renderComponentKind )
 import Distribution.Client.ProjectOrchestration
-    ( ProjectBaseContext(..), CurrentCommand(..), establishProjectBaseContext )
+    ( ProjectBaseContext(..), CurrentCommand(..), establishProjectBaseContext, establishProjectBaseContextWithRoot)
+import Distribution.Client.NixStyleOptions
+         ( NixStyleFlags (..), defaultNixStyleFlags )
 import Distribution.Client.TargetSelector
     ( TargetSelector(..), ComponentKind
     , readTargetSelectors, reportTargetSelectorProblems )
-import Distribution.Client.RebuildMonad
-    ( runRebuild )
 import Distribution.Client.Setup
     ( GlobalFlags(..) )
 import Distribution.Solver.Types.SourcePackage
@@ -28,28 +27,32 @@ import Distribution.Solver.Types.SourcePackage
 import Distribution.Client.Types
     ( PackageSpecifier(..), PackageLocation(..), UnresolvedSourcePackage )
 import Distribution.Client.DistDirLayout
-    ( DistDirLayout(..), defaultDistDirLayout )
+    ( DistDirLayout(..), ProjectRoot (..) )
 import Distribution.Client.ProjectConfig
-    ( findProjectRoot, readProjectConfig )
+    ( ProjectConfig, withProjectOrGlobalConfig, commandLineFlagsToProjectConfig, projectConfigConfigFile, projectConfigShared )
+import Distribution.Client.ProjectFlags
+     ( ProjectFlags (..), defaultProjectFlags, projectFlagsOptions )
 
+import Distribution.Compat.Lens
+    ( _1, _2 )
 import Distribution.Package
     ( Package(packageId) )
 import Distribution.PackageDescription.Configuration
     ( flattenPackageDescription )
-import Distribution.Pretty
-    ( prettyShow )
 import Distribution.ReadE
     ( succeedReadE )
 import Distribution.Simple.Command
-    ( CommandUI(..), option, reqArg )
+    ( CommandUI(..), OptionField, option, reqArg, liftOptionL, ShowOrParseArgs )
 import Distribution.Simple.PreProcess
     ( knownSuffixHandlers )
 import Distribution.Simple.Setup
     ( Flag(..), toFlag, fromFlagOrDefault, flagToList, flagToMaybe
-    , optionVerbosity, optionDistPref, trueArg
+    , optionVerbosity, optionDistPref, trueArg, configVerbosity, configDistPref
     )
 import Distribution.Simple.SrcDist
     ( listPackageSources )
+import Distribution.Client.SrcDist
+    ( packageDirToSdist )
 import Distribution.Simple.Utils
     ( die', notice, withOutputMarker, wrapText )
 import Distribution.Types.ComponentName
@@ -57,33 +60,21 @@ import Distribution.Types.ComponentName
 import Distribution.Types.PackageName
     ( PackageName, unPackageName )
 import Distribution.Verbosity
-    ( Verbosity, normal )
+    ( normal )
 
-import qualified Codec.Archive.Tar       as Tar
-import qualified Codec.Archive.Tar.Entry as Tar
-import qualified Codec.Compression.GZip  as GZip
-import Control.Exception
-    ( throwIO )
-import Control.Monad.Trans
-    ( liftIO )
-import Control.Monad.State.Lazy
-    ( StateT, modify, gets, evalStateT )
-import Control.Monad.Writer.Lazy
-    ( WriterT, tell, execWriterT )
-import qualified Data.ByteString.Char8      as BS
 import qualified Data.ByteString.Lazy.Char8 as BSL
-import Data.Either
-    ( partitionEithers )
-import Data.List
-    ( sortOn )
-import qualified Data.Set as Set
 import System.Directory
-    ( getCurrentDirectory, setCurrentDirectory
-    , createDirectoryIfMissing, makeAbsolute )
+    ( getCurrentDirectory
+    , createDirectoryIfMissing, makeAbsolute
+    )
 import System.FilePath
-    ( (</>), (<.>), makeRelative, normalise, takeDirectory )
+    ( (</>), (<.>), makeRelative, normalise )
 
-sdistCommand :: CommandUI SdistFlags
+-------------------------------------------------------------------------------
+-- Command
+-------------------------------------------------------------------------------
+
+sdistCommand :: CommandUI (ProjectFlags, SdistFlags)
 sdistCommand = CommandUI
     { commandName = "v2-sdist"
     , commandSynopsis = "Generate a source distribution file (.tar.gz)."
@@ -92,36 +83,19 @@ sdistCommand = CommandUI
     , commandDescription  = Just $ \_ -> wrapText
         "Generates tarballs of project packages suitable for upload to Hackage."
     , commandNotes = Nothing
-    , commandDefaultFlags = defaultSdistFlags
+    , commandDefaultFlags = (defaultProjectFlags, defaultSdistFlags)
     , commandOptions = \showOrParseArgs ->
-        [ optionVerbosity
-            sdistVerbosity (\v flags -> flags { sdistVerbosity = v })
-        , optionDistPref
-            sdistDistDir (\dd flags -> flags { sdistDistDir = dd })
-            showOrParseArgs
-        , option [] ["project-file"]
-            "Set the name of the cabal.project file to search for in parent directories"
-            sdistProjectFile (\pf flags -> flags { sdistProjectFile = pf })
-            (reqArg "FILE" (succeedReadE Flag) flagToList)
-        , option ['l'] ["list-only"]
-            "Just list the sources, do not make a tarball"
-            sdistListSources (\v flags -> flags { sdistListSources = v })
-            trueArg
-        , option ['z'] ["null-sep"]
-            "Separate the source files with NUL bytes rather than newlines."
-            sdistNulSeparated (\v flags -> flags { sdistNulSeparated = v })
-            trueArg
-        , option ['o'] ["output-dir", "outputdir"]
-            "Choose the output directory of this command. '-' sends all output to stdout"
-            sdistOutputPath (\o flags -> flags { sdistOutputPath = o })
-            (reqArg "PATH" (succeedReadE Flag) flagToList)
-        ]
+        map (liftOptionL _1) (projectFlagsOptions showOrParseArgs) ++
+        map (liftOptionL _2) (sdistOptions showOrParseArgs)
     }
+
+-------------------------------------------------------------------------------
+-- Flags
+-------------------------------------------------------------------------------
 
 data SdistFlags = SdistFlags
     { sdistVerbosity     :: Flag Verbosity
     , sdistDistDir       :: Flag FilePath
-    , sdistProjectFile   :: Flag FilePath
     , sdistListSources   :: Flag Bool
     , sdistNulSeparated  :: Flag Bool
     , sdistOutputPath    :: Flag FilePath
@@ -131,40 +105,57 @@ defaultSdistFlags :: SdistFlags
 defaultSdistFlags = SdistFlags
     { sdistVerbosity     = toFlag normal
     , sdistDistDir       = mempty
-    , sdistProjectFile   = mempty
     , sdistListSources   = toFlag False
     , sdistNulSeparated  = toFlag False
     , sdistOutputPath    = mempty
     }
 
---
+sdistOptions :: ShowOrParseArgs -> [OptionField SdistFlags]
+sdistOptions showOrParseArgs =
+    [ optionVerbosity
+        sdistVerbosity (\v flags -> flags { sdistVerbosity = v })
+    , optionDistPref
+        sdistDistDir (\dd flags -> flags { sdistDistDir = dd })
+        showOrParseArgs
+    , option ['l'] ["list-only"]
+        "Just list the sources, do not make a tarball"
+        sdistListSources (\v flags -> flags { sdistListSources = v })
+        trueArg
+    , option [] ["null-sep"]
+        "Separate the source files with NUL bytes rather than newlines."
+        sdistNulSeparated (\v flags -> flags { sdistNulSeparated = v })
+        trueArg
+    , option ['o'] ["output-directory", "outputdir"]
+        "Choose the output directory of this command. '-' sends all output to stdout"
+        sdistOutputPath (\o flags -> flags { sdistOutputPath = o })
+        (reqArg "PATH" (succeedReadE Flag) flagToList)
+    ]
 
-sdistAction :: SdistFlags -> [String] -> GlobalFlags -> IO ()
-sdistAction SdistFlags{..} targetStrings globalFlags = do
-    let verbosity = fromFlagOrDefault normal sdistVerbosity
-        mDistDirectory = flagToMaybe sdistDistDir
-        mProjectFile = flagToMaybe sdistProjectFile
-        globalConfig = globalConfigFile globalFlags
-        listSources = fromFlagOrDefault False sdistListSources
-        nulSeparated = fromFlagOrDefault False sdistNulSeparated
-        mOutputPath = flagToMaybe sdistOutputPath
+-------------------------------------------------------------------------------
+-- Action
+-------------------------------------------------------------------------------
 
-    projectRoot <- either throwIO return =<< findProjectRoot Nothing mProjectFile
-    let distLayout = defaultDistDirLayout projectRoot mDistDirectory
-    dir <- getCurrentDirectory
-    projectConfig <- runRebuild dir $ readProjectConfig verbosity globalConfig distLayout
-    baseCtx <- establishProjectBaseContext verbosity projectConfig OtherCommand
+sdistAction :: (ProjectFlags, SdistFlags) -> [String] -> GlobalFlags -> IO ()
+sdistAction (ProjectFlags{..}, SdistFlags{..}) targetStrings globalFlags = do
+    (baseCtx, distDirLayout) <- withProjectOrGlobalConfig verbosity ignoreProject globalConfigFlag withProject withoutProject
+
     let localPkgs = localPackages baseCtx
 
     targetSelectors <- either (reportTargetSelectorProblems verbosity) return
         =<< readTargetSelectors localPkgs Nothing targetStrings
 
+    -- elaborate path, create target directory
     mOutputPath' <- case mOutputPath of
         Just "-"  -> return (Just "-")
-        Just path -> Just <$> makeAbsolute path
-        Nothing   -> return Nothing
+        Just path -> do
+            abspath <- makeAbsolute path
+            createDirectoryIfMissing True abspath
+            return (Just abspath)
+        Nothing   -> do
+            createDirectoryIfMissing True (distSdistDirectory distDirLayout)
+            return Nothing
 
-    let
+    let format :: OutputFormat
         format =
             if | listSources, nulSeparated -> SourceList '\0'
                | listSources               -> SourceList '\n'
@@ -180,9 +171,8 @@ sdistAction SdistFlags{..} targetStrings globalFlags = do
                 | otherwise   -> path </> prettyShow (packageId pkg) <.> ext
             Nothing
                 | listSources -> "-"
-                | otherwise   -> distSdistFile distLayout (packageId pkg)
+                | otherwise   -> distSdistFile distDirLayout (packageId pkg)
 
-    createDirectoryIfMissing True (distSdistDirectory distLayout)
 
     case reifyTargetSelectors localPkgs targetSelectors of
         Left errs -> die' verbosity . unlines . fmap renderTargetProblem $ errs
@@ -190,10 +180,37 @@ sdistAction SdistFlags{..} targetStrings globalFlags = do
             | length pkgs > 1, not listSources, Just "-" <- mOutputPath' ->
                 die' verbosity "Can't write multiple tarballs to standard output!"
             | otherwise ->
-                traverse_ (\pkg -> packageToSdist verbosity (distProjectRootDirectory distLayout) format (outputPath pkg) pkg) pkgs
+                traverse_ (\pkg -> packageToSdist verbosity (distProjectRootDirectory distDirLayout) format (outputPath pkg) pkg) pkgs
+  where
+    verbosity      = fromFlagOrDefault normal sdistVerbosity
+    listSources    = fromFlagOrDefault False sdistListSources
+    nulSeparated   = fromFlagOrDefault False sdistNulSeparated
+    mOutputPath    = flagToMaybe sdistOutputPath
+    ignoreProject  = flagIgnoreProject
 
-data IsExec = Exec | NoExec
-            deriving (Show, Eq)
+    prjConfig :: ProjectConfig
+    prjConfig = commandLineFlagsToProjectConfig
+        globalFlags
+        (defaultNixStyleFlags ())
+          { configFlags = (configFlags $ defaultNixStyleFlags ())
+            { configVerbosity = sdistVerbosity
+            , configDistPref = sdistDistDir
+            }
+          }
+        mempty
+
+    globalConfigFlag = projectConfigConfigFile (projectConfigShared prjConfig)
+
+    withProject :: IO (ProjectBaseContext, DistDirLayout)
+    withProject = do
+        baseCtx <- establishProjectBaseContext verbosity prjConfig OtherCommand
+        return (baseCtx, distDirLayout baseCtx)
+
+    withoutProject :: ProjectConfig -> IO (ProjectBaseContext, DistDirLayout)
+    withoutProject config = do
+        cwd <- getCurrentDirectory
+        baseCtx <- establishProjectBaseContextWithRoot verbosity (config <> prjConfig) (ProjectRootImplicit cwd) OtherCommand
+        return (baseCtx, distDirLayout baseCtx)
 
 data OutputFormat = SourceList Char
                   | TarGzArchive
@@ -202,9 +219,9 @@ data OutputFormat = SourceList Char
 packageToSdist :: Verbosity -> FilePath -> OutputFormat -> FilePath -> UnresolvedSourcePackage -> IO ()
 packageToSdist verbosity projectRootDir format outputFile pkg = do
     let death = die' verbosity ("The impossible happened: a local package isn't local" <> (show pkg))
-    dir0 <- case packageSource pkg of
+    dir0 <- case srcpkgSource pkg of
              LocalUnpackedPackage path             -> pure (Right path)
-             RemoteSourceRepoPackage _ (Just path) -> pure (Right path)
+             RemoteSourceRepoPackage _ (Just tgz)  -> pure (Left tgz)
              RemoteSourceRepoPackage {}            -> death
              LocalTarballPackage tgz               -> pure (Left tgz)
              RemoteTarballPackage _ (Just tgz)     -> pure (Left tgz)
@@ -212,83 +229,34 @@ packageToSdist verbosity projectRootDir format outputFile pkg = do
              RepoTarballPackage {}                 -> death
 
     let -- Write String to stdout or file, using the default TextEncoding.
-        write
-          | outputFile == "-" = putStr . withOutputMarker verbosity
-          | otherwise = writeFile outputFile
+        write str
+          | outputFile == "-" = putStr (withOutputMarker verbosity str)
+          | otherwise = do
+            writeFile outputFile str
+            notice verbosity $ "Wrote source list to " ++ outputFile ++ "\n"
         -- Write raw ByteString to stdout or file as it is, without encoding.
-        writeLBS
-          | outputFile == "-" = BSL.putStr
-          | otherwise = BSL.writeFile outputFile
+        writeLBS lbs
+          | outputFile == "-" = BSL.putStr lbs
+          | otherwise = do
+            BSL.writeFile outputFile lbs
+            notice verbosity $ "Wrote tarball sdist to " ++ outputFile ++ "\n"
 
     case dir0 of
       Left tgz -> do
         case format of
           TarGzArchive -> do
             writeLBS =<< BSL.readFile tgz
-            when (outputFile /= "-") $
-              notice verbosity $ "Wrote tarball sdist to " ++ outputFile ++ "\n"
           _ -> die' verbosity ("cannot convert tarball package to " ++ show format)
 
-      Right dir -> do
-        oldPwd <- getCurrentDirectory
-        setCurrentDirectory dir
+      Right dir -> case format of
+        SourceList nulSep -> do
+          files' <- listPackageSources verbosity dir (flattenPackageDescription $ srcpkgDescription pkg) knownSuffixHandlers
+          let files = nub $ sort $ map normalise files'
+          let prefix = makeRelative projectRootDir dir
+          write $ concat [prefix </> i ++ [nulSep] | i <- files]
 
-        let norm flag = fmap ((flag, ) . normalise)
-        (norm NoExec -> nonexec, norm Exec -> exec) <-
-           listPackageSources verbosity (flattenPackageDescription $ packageDescription pkg) knownSuffixHandlers
-
-        let files =  nub . sortOn snd $ nonexec ++ exec
-
-        case format of
-            SourceList nulSep -> do
-                let prefix = makeRelative projectRootDir dir
-                write $ concat [prefix </> i ++ [nulSep] | (_, i) <- files]
-                when (outputFile /= "-") $
-                    notice verbosity $ "Wrote source list to " ++ outputFile ++ "\n"
-            TarGzArchive -> do
-                let entriesM :: StateT (Set.Set FilePath) (WriterT [Tar.Entry] IO) ()
-                    entriesM = do
-                        let prefix = prettyShow (packageId pkg)
-                        modify (Set.insert prefix)
-                        case Tar.toTarPath True prefix of
-                            Left err -> liftIO $ die' verbosity ("Error packing sdist: " ++ err)
-                            Right path -> tell [Tar.directoryEntry path]
-
-                        for_ files $ \(perm, file) -> do
-                            let fileDir = takeDirectory (prefix </> file)
-                                perm' = case perm of
-                                    Exec -> Tar.executableFilePermissions
-                                    NoExec -> Tar.ordinaryFilePermissions
-                            needsEntry <- gets (Set.notMember fileDir)
-
-                            when needsEntry $ do
-                                modify (Set.insert fileDir)
-                                case Tar.toTarPath True fileDir of
-                                    Left err -> liftIO $ die' verbosity ("Error packing sdist: " ++ err)
-                                    Right path -> tell [Tar.directoryEntry path]
-
-                            contents <- liftIO . fmap BSL.fromStrict . BS.readFile $ file
-                            case Tar.toTarPath False (prefix </> file) of
-                                Left err -> liftIO $ die' verbosity ("Error packing sdist: " ++ err)
-                                Right path -> tell [(Tar.fileEntry path contents) { Tar.entryPermissions = perm' }]
-
-                entries <- execWriterT (evalStateT entriesM mempty)
-                let -- Pretend our GZip file is made on Unix.
-                    normalize bs = BSL.concat [pfx, "\x03", rest']
-                        where
-                            (pfx, rest) = BSL.splitAt 9 bs
-                            rest' = BSL.tail rest
-                    -- The Unix epoch, which is the default value, is
-                    -- unsuitable because it causes unpacking problems on
-                    -- Windows; we need a post-1980 date. One gigasecond
-                    -- after the epoch is during 2001-09-09, so that does
-                    -- nicely. See #5596.
-                    setModTime entry = entry { Tar.entryTime = 1000000000 }
-                writeLBS . normalize . GZip.compress . Tar.write $ fmap setModTime entries
-                when (outputFile /= "-") $
-                    notice verbosity $ "Wrote tarball sdist to " ++ outputFile ++ "\n"
-
-        setCurrentDirectory oldPwd
+        TarGzArchive -> do
+          packageDirToSdist verbosity (srcpkgDescription pkg) dir >>= writeLBS
 
 --
 

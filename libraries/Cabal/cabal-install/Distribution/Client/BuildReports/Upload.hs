@@ -7,6 +7,9 @@ module Distribution.Client.BuildReports.Upload
     , uploadReports
     ) where
 
+import Distribution.Client.Compat.Prelude
+import Prelude ()
+
 {-
 import Network.Browser
          ( BrowserAction, request, setAllowRedirects )
@@ -17,14 +20,10 @@ import Network.TCP (HandleStream)
 -}
 import Network.URI (URI, uriPath) --parseRelativeReference, relativeTo)
 
-import Control.Monad
-         ( forM_ )
 import System.FilePath.Posix
          ( (</>) )
 import qualified Distribution.Client.BuildReports.Anonymous as BuildReport
-import Distribution.Client.BuildReports.Anonymous (BuildReport)
-import Distribution.Deprecated.Text (display)
-import Distribution.Verbosity (Verbosity)
+import Distribution.Client.BuildReports.Anonymous (BuildReport, showBuildReport)
 import Distribution.Simple.Utils (die')
 import Distribution.Client.HttpUtils
 import Distribution.Client.Setup
@@ -35,7 +34,7 @@ type BuildLog = String
 
 uploadReports :: Verbosity -> RepoContext -> (String, String) -> URI -> [(BuildReport, Maybe BuildLog)] -> IO ()
 uploadReports verbosity repoCtxt auth uri reports = do
-  forM_ reports $ \(report, mbBuildLog) -> do
+  for_ reports $ \(report, mbBuildLog) -> do
      buildId <- postBuildReport verbosity repoCtxt auth uri report
      case mbBuildLog of
        Just buildLog -> putBuildLog verbosity repoCtxt auth buildId buildLog
@@ -43,9 +42,9 @@ uploadReports verbosity repoCtxt auth uri reports = do
 
 postBuildReport :: Verbosity -> RepoContext -> (String, String) -> URI -> BuildReport -> IO BuildReportId
 postBuildReport verbosity repoCtxt auth uri buildReport = do
-  let fullURI = uri { uriPath = "/package" </> display (BuildReport.package buildReport) </> "reports" }
+  let fullURI = uri { uriPath = "/package" </> prettyShow (BuildReport.package buildReport) </> "reports" }
   transport <- repoContextGetTransport repoCtxt
-  res <- postHttp transport verbosity fullURI (BuildReport.show buildReport) (Just auth)
+  res <- postHttp transport verbosity fullURI (showBuildReport buildReport) (Just auth)
   case res of
     (303, redir) -> return $ undefined redir --TODO parse redir
     _ -> die' verbosity "unrecognized response" -- give response
@@ -53,7 +52,7 @@ postBuildReport verbosity repoCtxt auth uri buildReport = do
 {-
   setAllowRedirects False
   (_, response) <- request Request {
-    rqURI     = uri { uriPath = "/package" </> display (BuildReport.package buildReport) </> "reports" },
+    rqURI     = uri { uriPath = "/package" </> prettyShow (BuildReport.package buildReport) </> "reports" },
     rqMethod  = POST,
     rqHeaders = [Header HdrContentType   ("text/plain"),
                  Header HdrContentLength (show (length body)),

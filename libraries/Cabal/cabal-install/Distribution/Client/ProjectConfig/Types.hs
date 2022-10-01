@@ -20,18 +20,24 @@ module Distribution.Client.ProjectConfig.Types (
     MapMappend(..),
   ) where
 
-import Distribution.Client.Types
-         ( RemoteRepo, AllowNewer(..), AllowOlder(..)
-         , WriteGhcEnvironmentFilesPolicy )
+import Distribution.Client.Compat.Prelude
+import Prelude ()
+
+import Distribution.Client.Types.Repo ( RemoteRepo, LocalRepo )
+import Distribution.Client.Types.AllowNewer ( AllowNewer(..), AllowOlder(..) )
+import Distribution.Client.Types.WriteGhcEnvironmentFilesPolicy ( WriteGhcEnvironmentFilesPolicy )
 import Distribution.Client.Dependency.Types
          ( PreSolver )
 import Distribution.Client.Targets
          ( UserConstraint )
 import Distribution.Client.BuildReports.Types
          ( ReportLevel(..) )
+import Distribution.Client.Types.SourceRepo (SourceRepoList)
 
-import Distribution.Client.IndexUtils.Timestamp
-         ( IndexState )
+import Distribution.Client.IndexUtils.IndexState
+         ( TotalIndexState )
+import Distribution.Client.IndexUtils.ActiveRepos
+         ( ActiveRepos )
 
 import Distribution.Client.CmdInstall.ClientInstallFlags
          ( ClientInstallFlags(..) )
@@ -48,7 +54,7 @@ import Distribution.Version
 import Distribution.System
          ( Platform )
 import Distribution.PackageDescription
-         ( FlagAssignment, SourceRepo(..) )
+         ( FlagAssignment )
 import Distribution.Simple.Compiler
          ( Compiler, CompilerFlavor
          , OptimisationLevel(..), ProfDetailLevel, DebugInfoLevel(..) )
@@ -58,17 +64,8 @@ import Distribution.Simple.InstallDirs
          ( PathTemplate )
 import Distribution.Utils.NubList
          ( NubList )
-import Distribution.Verbosity
-         ( Verbosity )
 
-import Data.Map (Map)
 import qualified Data.Map as Map
-import Data.Set (Set)
-import Distribution.Compat.Binary (Binary)
-import Distribution.Compat.Semigroup
-import GHC.Generics (Generic)
-import Data.Typeable
-
 
 -------------------------------
 -- Project config types
@@ -107,7 +104,7 @@ data ProjectConfig
        projectPackagesOptional      :: [String],
 
        -- | Packages in this project from remote source repositories.
-       projectPackagesRepo          :: [SourceRepo],
+       projectPackagesRepo          :: [SourceRepoList],
 
        -- | Packages in this project from hackage repositories.
        projectPackagesNamed         :: [PackageVersionConstraint],
@@ -166,6 +163,7 @@ data ProjectConfigShared
        projectConfigDistDir           :: Flag FilePath,
        projectConfigConfigFile        :: Flag FilePath,
        projectConfigProjectFile       :: Flag FilePath,
+       projectConfigIgnoreProject     :: Flag Bool,
        projectConfigHcFlavor          :: Flag CompilerFlavor,
        projectConfigHcPath            :: Flag FilePath,
        projectConfigHcPkg             :: Flag FilePath,
@@ -181,8 +179,9 @@ data ProjectConfigShared
 
        -- configuration used both by the solver and other phases
        projectConfigRemoteRepos       :: NubList RemoteRepo,     -- ^ Available Hackage servers.
-       projectConfigLocalRepos        :: NubList FilePath,
-       projectConfigIndexState        :: Flag IndexState,
+       projectConfigLocalNoIndexRepos :: NubList LocalRepo,
+       projectConfigActiveRepos       :: Flag ActiveRepos,
+       projectConfigIndexState        :: Flag TotalIndexState,
        projectConfigStoreDir          :: Flag FilePath,
 
        -- solver configuration
@@ -197,6 +196,7 @@ data ProjectConfigShared
        projectConfigMaxBackjumps      :: Flag Int,
        projectConfigReorderGoals      :: Flag ReorderGoals,
        projectConfigCountConflicts    :: Flag CountConflicts,
+       projectConfigFineGrainedConflicts :: Flag FineGrainedConflicts,
        projectConfigMinimizeConflictSet :: Flag MinimizeConflictSet,
        projectConfigStrongFlags       :: Flag StrongFlags,
        projectConfigAllowBootLibInstalls :: Flag AllowBootLibInstalls,
@@ -293,7 +293,9 @@ data PackageConfig
        packageConfigTestKeepTix         :: Flag Bool,
        packageConfigTestWrapper         :: Flag FilePath,
        packageConfigTestFailWhenNoTestSuites :: Flag Bool,
-       packageConfigTestTestOptions     :: [PathTemplate]
+       packageConfigTestTestOptions     :: [PathTemplate],
+       -- Benchmark options
+       packageConfigBenchmarkOptions    :: [PathTemplate]
      }
   deriving (Eq, Show, Generic)
 
@@ -303,11 +305,18 @@ instance Binary ProjectConfigShared
 instance Binary ProjectConfigProvenance
 instance Binary PackageConfig
 
+instance Structured ProjectConfig
+instance Structured ProjectConfigBuildOnly
+instance Structured ProjectConfigShared
+instance Structured ProjectConfigProvenance
+instance Structured PackageConfig
 
 -- | Newtype wrapper for 'Map' that provides a 'Monoid' instance that takes
 -- the last value rather than the first value for overlapping keys.
 newtype MapLast k v = MapLast { getMapLast :: Map k v }
   deriving (Eq, Show, Functor, Generic, Binary, Typeable)
+
+instance (Structured k, Structured v) => Structured (MapLast k v)
 
 instance Ord k => Monoid (MapLast k v) where
   mempty  = MapLast Map.empty
@@ -322,6 +331,8 @@ instance Ord k => Semigroup (MapLast k v) where
 -- 'mappend's values of overlapping keys rather than taking the first.
 newtype MapMappend k v = MapMappend { getMapMappend :: Map k v }
   deriving (Eq, Show, Functor, Generic, Binary, Typeable)
+
+instance (Structured k, Structured v) => Structured (MapMappend k v)
 
 instance (Semigroup v, Ord k) => Monoid (MapMappend k v) where
   mempty  = MapMappend Map.empty
@@ -378,7 +389,7 @@ instance Semigroup PackageConfig where
 data SolverSettings
    = SolverSettings {
        solverSettingRemoteRepos       :: [RemoteRepo],     -- ^ Available Hackage servers.
-       solverSettingLocalRepos        :: [FilePath],
+       solverSettingLocalNoIndexRepos :: [LocalRepo],
        solverSettingConstraints       :: [(UserConstraint, ConstraintSource)],
        solverSettingPreferences       :: [PackageVersionConstraint],
        solverSettingFlagAssignment    :: FlagAssignment, -- ^ For all local packages
@@ -390,11 +401,13 @@ data SolverSettings
        solverSettingMaxBackjumps      :: Maybe Int,
        solverSettingReorderGoals      :: ReorderGoals,
        solverSettingCountConflicts    :: CountConflicts,
+       solverSettingFineGrainedConflicts :: FineGrainedConflicts,
        solverSettingMinimizeConflictSet :: MinimizeConflictSet,
        solverSettingStrongFlags       :: StrongFlags,
        solverSettingAllowBootLibInstalls :: AllowBootLibInstalls,
        solverSettingOnlyConstrained   :: OnlyConstrained,
-       solverSettingIndexState        :: Maybe IndexState,
+       solverSettingIndexState        :: Maybe TotalIndexState,
+       solverSettingActiveRepos       :: Maybe ActiveRepos,
        solverSettingIndependentGoals  :: IndependentGoals
        -- Things that only make sense for manual mode, not --local mode
        -- too much control!
@@ -407,6 +420,7 @@ data SolverSettings
   deriving (Eq, Show, Generic, Typeable)
 
 instance Binary SolverSettings
+instance Structured SolverSettings
 
 
 -- | Resolved configuration for things that affect how we build and not the
@@ -436,7 +450,7 @@ data BuildTimeSettings
        buildSettingOfflineMode           :: Bool,
        buildSettingKeepTempFiles         :: Bool,
        buildSettingRemoteRepos           :: [RemoteRepo],
-       buildSettingLocalRepos            :: [FilePath],
+       buildSettingLocalNoIndexRepos     :: [LocalRepo],
        buildSettingCacheDir              :: FilePath,
        buildSettingHttpTransport         :: Maybe String,
        buildSettingIgnoreExpiry          :: Bool,

@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -23,7 +24,7 @@ module Language.Haskell.Extension (
         classifyExtension,
   ) where
 
-import Prelude ()
+import qualified Prelude (head)
 import Distribution.Compat.Prelude
 
 import Data.Array (Array, accumArray, bounds, Ix(inRange), (!))
@@ -58,6 +59,7 @@ data Language =
   deriving (Generic, Show, Read, Eq, Typeable, Data)
 
 instance Binary Language
+instance Structured Language
 
 instance NFData Language where rnf = genericRnf
 
@@ -109,6 +111,7 @@ data Extension =
   deriving (Generic, Show, Read, Eq, Ord, Typeable, Data)
 
 instance Binary Extension
+instance Structured Extension
 
 instance NFData Extension where rnf = genericRnf
 
@@ -825,9 +828,31 @@ data KnownExtension =
   -- * <https://downloads.haskell.org/~ghc/latest/docs/html/users_guide/glasgow_exts.html#deriving-instances-for-empty-data-types>
   | EmptyDataDeriving
 
+  -- | Enable detection of complete user-supplied kind signatures.
+  | CUSKs
+
+  -- | Allows the syntax @import M qualified@.
+  | ImportQualifiedPost
+
+  -- | Allow the use of standalone kind signatures.
+  | StandaloneKindSignatures
+
+  -- | Enable unlifted newtypes.
+  | UnliftedNewtypes
+
+  -- | Use whitespace to determine whether the minus sign stands for negation or subtraction.
+  | LexicalNegation
+
+  -- | Enable qualified do-notation desugaring.
+  | QualifiedDo
+
+  -- | Enable linear types.
+  | LinearTypes
+
   deriving (Generic, Show, Read, Eq, Ord, Enum, Bounded, Typeable, Data)
 
 instance Binary KnownExtension
+instance Structured KnownExtension
 
 instance NFData KnownExtension where rnf = genericRnf
 
@@ -889,6 +914,6 @@ classifyKnownExtension string@(c : _)
 knownExtensionTable :: Array Char [(String, KnownExtension)]
 knownExtensionTable =
   accumArray (flip (:)) [] ('A', 'Z')
-    [ (head str, (str, extension))
+    [ (Prelude.head str, (str, extension)) -- assume KnownExtension's Show returns a non-empty string
     | extension <- [toEnum 0 ..]
     , let str = show extension ]

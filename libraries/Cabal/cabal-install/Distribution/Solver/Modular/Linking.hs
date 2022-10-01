@@ -1,5 +1,8 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+
+-- TODO: remove this
+{-# OPTIONS -fno-warn-incomplete-uni-patterns #-}
 module Distribution.Solver.Modular.Linking (
     validateLinking
   ) where
@@ -10,9 +13,7 @@ import Distribution.Solver.Compat.Prelude hiding (get,put)
 import Control.Exception (assert)
 import Control.Monad.Reader
 import Control.Monad.State
-import Data.Function (on)
 import Data.Map ((!))
-import Data.Set (Set)
 import qualified Data.Map         as M
 import qualified Data.Set         as S
 import qualified Data.Traversable as T
@@ -29,7 +30,7 @@ import qualified Distribution.Solver.Modular.WeightedPSQ as W
 
 import Distribution.Solver.Types.OptionalStanza
 import Distribution.Solver.Types.PackagePath
-import Distribution.Types.GenericPackageDescription (unFlagName)
+import Distribution.Types.Flag (unFlagName)
 
 {-------------------------------------------------------------------------------
   Validation
@@ -249,7 +250,7 @@ linkDeps target = \deps -> do
         vs <- get
         let lg   = M.findWithDefault (lgSingleton qpn  Nothing) qpn  $ vsLinks vs
             lg'  = M.findWithDefault (lgSingleton qpn' Nothing) qpn' $ vsLinks vs
-        lg'' <- lift' $ lgMerge ((CS.union `on` dependencyReasonToCS) dr1 dr2) lg lg'
+        lg'' <- lift' $ lgMerge ((CS.union `on` dependencyReasonToConflictSet) dr1 dr2) lg lg'
         updateLinkGroup lg''
       (Flagged fn _ t f, ~(Flagged _ _ t' f')) -> do
         vs <- get
@@ -265,7 +266,7 @@ linkDeps target = \deps -> do
           Just False -> return () -- stanza not enabled; no new deps
     -- For extensions and language dependencies, there is nothing to do.
     -- No choice is involved, just checking, so there is nothing to link.
-    -- The same goes for for pkg-config constraints.
+    -- The same goes for pkg-config constraints.
       (Simple (LDep _ (Ext  _))   _, _) -> return ()
       (Simple (LDep _ (Lang _))   _, _) -> return ()
       (Simple (LDep _ (Pkg  _ _)) _, _) -> return ()

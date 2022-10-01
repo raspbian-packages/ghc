@@ -11,9 +11,11 @@ module Distribution.SPDX.LicenseExceptionId (
 import Distribution.Compat.Prelude
 import Prelude ()
 
+import Distribution.Compat.Lens (set)
 import Distribution.Pretty
 import Distribution.Parsec
 import Distribution.Utils.Generic (isAsciiAlphaNum)
+import Distribution.Utils.Structured (Structured (..), nominalStructure, typeVersion)
 import Distribution.SPDX.LicenseListVersion
 
 import qualified Data.Binary.Get as Binary
@@ -28,7 +30,7 @@ import qualified Text.PrettyPrint as Disp
 
 -- | SPDX License identifier
 data LicenseExceptionId
-{{{ licenseIds }}}
+{{ licenseIds }}
   deriving (Eq, Ord, Enum, Bounded, Show, Read, Typeable, Data, Generic)
 
 instance Binary LicenseExceptionId where
@@ -38,6 +40,10 @@ instance Binary LicenseExceptionId where
         if i > fromIntegral (fromEnum (maxBound :: LicenseExceptionId))
         then fail "Too large LicenseExceptionId tag"
         else return (toEnum (fromIntegral i))
+
+-- note: remember to bump version each time the definition changes
+instance Structured LicenseExceptionId where
+    structure p = set typeVersion 306 $ nominalStructure p
 
 instance Pretty LicenseExceptionId where
     pretty = Disp.text . licenseExceptionId
@@ -58,15 +64,15 @@ instance NFData LicenseExceptionId where
 
 -- | License SPDX identifier, e.g. @"BSD-3-Clause"@.
 licenseExceptionId :: LicenseExceptionId -> String
-{{#licenses}}
-licenseExceptionId {{licenseCon}} = {{{licenseId}}}
-{{/licenses}}
+{% for l in licenses %}
+licenseExceptionId {{l.constructor}} = {{l.id}}
+{% endfor %}
 
 -- | License name, e.g. @"GNU General Public License v2.0 only"@
 licenseExceptionName :: LicenseExceptionId -> String
-{{#licenses}}
-licenseExceptionName {{licenseCon}} = {{{licenseName}}}
-{{/licenses}}
+{% for l in licenses %}
+licenseExceptionName {{l.constructor}} = {{l.name}}
+{% endfor %}
 
 -------------------------------------------------------------------------------
 -- Creation
@@ -74,13 +80,16 @@ licenseExceptionName {{licenseCon}} = {{{licenseName}}}
 
 licenseExceptionIdList :: LicenseListVersion -> [LicenseExceptionId]
 licenseExceptionIdList LicenseListVersion_3_0 =
-{{{licenseList_3_0}}}
+{{licenseList_3_0}}
     ++ bulkOfLicenses
 licenseExceptionIdList LicenseListVersion_3_2 =
-{{{licenseList_3_2}}}
+{{licenseList_3_2}}
     ++ bulkOfLicenses
 licenseExceptionIdList LicenseListVersion_3_6 =
-{{{licenseList_3_6}}}
+{{licenseList_3_6}}
+    ++ bulkOfLicenses
+licenseExceptionIdList LicenseListVersion_3_9 =
+{{licenseList_3_9}}
     ++ bulkOfLicenses
 
 -- | Create a 'LicenseExceptionId' from a 'String'.
@@ -88,6 +97,7 @@ mkLicenseExceptionId :: LicenseListVersion -> String -> Maybe LicenseExceptionId
 mkLicenseExceptionId LicenseListVersion_3_0 s = Map.lookup s stringLookup_3_0
 mkLicenseExceptionId LicenseListVersion_3_2 s = Map.lookup s stringLookup_3_2
 mkLicenseExceptionId LicenseListVersion_3_6 s = Map.lookup s stringLookup_3_6
+mkLicenseExceptionId LicenseListVersion_3_9 s = Map.lookup s stringLookup_3_9
 
 stringLookup_3_0 :: Map String LicenseExceptionId
 stringLookup_3_0 = Map.fromList $ map (\i -> (licenseExceptionId i, i)) $
@@ -101,7 +111,11 @@ stringLookup_3_6 :: Map String LicenseExceptionId
 stringLookup_3_6 = Map.fromList $ map (\i -> (licenseExceptionId i, i)) $
     licenseExceptionIdList LicenseListVersion_3_6
 
+stringLookup_3_9 :: Map String LicenseExceptionId
+stringLookup_3_9 = Map.fromList $ map (\i -> (licenseExceptionId i, i)) $
+    licenseExceptionIdList LicenseListVersion_3_9
+
 --  | License exceptions in all SPDX License lists
 bulkOfLicenses :: [LicenseExceptionId]
 bulkOfLicenses =
-{{{licenseList_all}}}
+{{licenseList_all}}

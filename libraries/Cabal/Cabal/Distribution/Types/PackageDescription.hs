@@ -28,8 +28,6 @@
 
 module Distribution.Types.PackageDescription (
     PackageDescription(..),
-    specVersion,
-    specVersion',
     license,
     license',
     buildType,
@@ -84,10 +82,12 @@ import Distribution.Types.BuildType
 import Distribution.Types.SourceRepo
 import Distribution.Types.HookedBuildInfo
 
+import Distribution.CabalSpecVersion
 import Distribution.Compiler
 import Distribution.License
 import Distribution.Package
 import Distribution.Version
+import Distribution.Utils.ShortText
 
 import qualified Distribution.SPDX as SPDX
 
@@ -105,26 +105,22 @@ data PackageDescription
         -- the following are required by all packages:
 
         -- | The version of the Cabal spec that this package description uses.
-        -- For historical reasons this is specified with a version range but
-        -- only ranges of the form @>= v@ make sense. We are in the process of
-        -- transitioning to specifying just a single version, not a range.
-        -- See also 'specVersion'.
-        specVersionRaw :: Either Version VersionRange,
+        specVersion    :: CabalSpecVersion,
         package        :: PackageIdentifier,
         licenseRaw     :: Either SPDX.License License,
         licenseFiles   :: [FilePath],
-        copyright      :: String,
-        maintainer     :: String,
-        author         :: String,
-        stability      :: String,
+        copyright      :: !ShortText,
+        maintainer     :: !ShortText,
+        author         :: !ShortText,
+        stability      :: !ShortText,
         testedWith     :: [(CompilerFlavor,VersionRange)],
-        homepage       :: String,
-        pkgUrl         :: String,
-        bugReports     :: String,
+        homepage       :: !ShortText,
+        pkgUrl         :: !ShortText,
+        bugReports     :: !ShortText,
         sourceRepos    :: [SourceRepo],
-        synopsis       :: String, -- ^A one-line summary of this package
-        description    :: String, -- ^A more verbose description of this package
-        category       :: String,
+        synopsis       :: !ShortText, -- ^A one-line summary of this package
+        description    :: !ShortText, -- ^A more verbose description of this package
+        category       :: !ShortText,
         customFieldsPD :: [(String,String)], -- ^Custom fields starting
                                              -- with x-, stored in a
                                              -- simple assoc-list.
@@ -152,30 +148,12 @@ data PackageDescription
     deriving (Generic, Show, Read, Eq, Typeable, Data)
 
 instance Binary PackageDescription
+instance Structured PackageDescription
 
 instance NFData PackageDescription where rnf = genericRnf
 
 instance Package PackageDescription where
   packageId = package
-
--- | The version of the Cabal spec that this package should be interpreted
--- against.
---
--- Historically we used a version range but we are switching to using a single
--- version. Currently we accept either. This function converts into a single
--- version by ignoring upper bounds in the version range.
---
-specVersion :: PackageDescription -> Version
-specVersion = specVersion' . specVersionRaw
-
--- |
---
--- @since 2.2.0.0
-specVersion' :: Either Version VersionRange -> Version
-specVersion' (Left version) = version
-specVersion' (Right versionRange) = case asVersionIntervals versionRange of
-    []                            -> mkVersion [0]
-    ((LowerBound version _, _):_) -> version
 
 -- | The SPDX 'LicenseExpression' of the package.
 --
@@ -206,7 +184,7 @@ license' = either id licenseToSPDX
 -- @since 2.2
 buildType :: PackageDescription -> BuildType
 buildType pkg
-  | specVersion pkg >= mkVersion [2,1]
+  | specVersion pkg >= CabalSpecV2_2
     = fromMaybe newDefault (buildTypeRaw pkg)
   | otherwise -- cabal-version < 2.1
     = fromMaybe Custom (buildTypeRaw pkg)
@@ -221,20 +199,20 @@ emptyPackageDescription
                                                        nullVersion,
                       licenseRaw   = Right UnspecifiedLicense, -- TODO:
                       licenseFiles = [],
-                      specVersionRaw = Right anyVersion,
+                      specVersion  = CabalSpecV1_0,
                       buildTypeRaw = Nothing,
-                      copyright    = "",
-                      maintainer   = "",
-                      author       = "",
-                      stability    = "",
+                      copyright    = mempty,
+                      maintainer   = mempty,
+                      author       = mempty,
+                      stability    = mempty,
                       testedWith   = [],
-                      homepage     = "",
-                      pkgUrl       = "",
-                      bugReports   = "",
+                      homepage     = mempty,
+                      pkgUrl       = mempty,
+                      bugReports   = mempty,
                       sourceRepos  = [],
-                      synopsis     = "",
-                      description  = "",
-                      category     = "",
+                      synopsis     = mempty,
+                      description  = mempty,
+                      category     = mempty,
                       customFieldsPD = [],
                       setupBuildInfo = Nothing,
                       library      = Nothing,
@@ -244,7 +222,7 @@ emptyPackageDescription
                       testSuites   = [],
                       benchmarks   = [],
                       dataFiles    = [],
-                      dataDir      = "",
+                      dataDir      = ".",
                       extraSrcFiles = [],
                       extraTmpFiles = [],
                       extraDocFiles = []
@@ -473,6 +451,6 @@ instance L.HasBuildInfos PackageDescription where
         <*> (traverse . L.buildInfo) f x6 -- benchmarks
         <*> pure a20                      -- data files
         <*> pure a21                      -- data dir
-        <*> pure a22                      -- exta src files
+        <*> pure a22                      -- extra src files
         <*> pure a23                      -- extra temp files
         <*> pure a24                      -- extra doc files

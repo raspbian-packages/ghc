@@ -1,4 +1,5 @@
 {-# LANGUAGE ForeignFunctionInterface #-}
+{-# OPTIONS_GHC -fno-warn-deprecations #-}
 
 -- | Test decoding of UTF-8
 --
@@ -17,6 +18,7 @@
 module Benchmarks.DecodeUtf8
     ( initEnv
     , benchmark
+    , benchmarkASCII
     ) where
 
 import Foreign.C.Types
@@ -25,9 +27,8 @@ import Data.ByteString.Lazy.Internal (ByteString(..))
 import Foreign.Ptr (Ptr, plusPtr)
 import Foreign.ForeignPtr (withForeignPtr)
 import Data.Word (Word8)
-import qualified Criterion as C
-import Criterion (Benchmark, bgroup, nf, whnfIO)
-import qualified Codec.Binary.UTF8.Generic as U8
+import qualified Test.Tasty.Bench as C
+import Test.Tasty.Bench (Benchmark, bgroup, nf, whnfIO)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.Text as T
@@ -61,10 +62,17 @@ benchmark kind ~(bs, lbs) =
         , bench "Lazy" $ nf TL.decodeUtf8 lbs
         , bench "LazyLength" $ nf (TL.length . TL.decodeUtf8) lbs
         , bench "LazyInitLength" $ nf (TL.length . TL.init . TL.decodeUtf8) lbs
-        , bench "StrictStringUtf8" $ nf U8.toString bs
-        , bench "StrictStringUtf8Length" $ nf (length . U8.toString) bs
-        , bench "LazyStringUtf8" $ nf U8.toString lbs
-        , bench "LazyStringUtf8Length" $ nf (length . U8.toString) lbs
+        ]
+
+benchmarkASCII :: Env -> Benchmark
+benchmarkASCII ~(bs, lbs) =
+    bgroup "DecodeASCII"
+        [ C.bench "strict decodeUtf8" $ nf T.decodeUtf8 bs
+        , C.bench "strict decodeLatin1" $ nf T.decodeLatin1 bs
+        , C.bench "strict decodeASCII" $ nf T.decodeASCII bs
+        , C.bench "lazy decodeUtf8" $ nf TL.decodeUtf8 lbs
+        , C.bench "lazy decodeLatin1" $ nf TL.decodeLatin1 lbs
+        , C.bench "lazy decodeASCII" $ nf TL.decodeASCII lbs
         ]
 
 iconv :: B.ByteString -> IO CInt

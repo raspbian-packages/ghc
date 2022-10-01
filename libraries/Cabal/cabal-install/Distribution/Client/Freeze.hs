@@ -33,8 +33,6 @@ import Distribution.Client.Setup
 import Distribution.Client.Sandbox.PackageEnvironment
          ( loadUserConfig, pkgEnvSavedConfig, showPackageEnvironment,
            userPackageEnvironmentFile )
-import Distribution.Client.Sandbox.Types
-         ( SandboxPackageInfo(..) )
 
 import Distribution.Solver.Types.ConstraintSource
 import Distribution.Solver.Types.LabeledPackageConstraint
@@ -52,15 +50,10 @@ import Distribution.Simple.Program
 import Distribution.Simple.Setup
          ( fromFlag, fromFlagOrDefault, flagToMaybe )
 import Distribution.Simple.Utils
-         ( die', notice, debug, writeFileAtomic )
+         ( die', notice, debug, writeFileAtomic, toUTF8LBS)
 import Distribution.System
          ( Platform )
-import Distribution.Deprecated.Text
-         ( display )
-import Distribution.Verbosity
-         ( Verbosity )
 
-import qualified Data.ByteString.Lazy.Char8 as BS.Char8
 import Distribution.Version
          ( thisVersion )
 
@@ -77,15 +70,14 @@ freeze :: Verbosity
        -> Compiler
        -> Platform
        -> ProgramDb
-       -> Maybe SandboxPackageInfo
        -> GlobalFlags
        -> FreezeFlags
        -> IO ()
-freeze verbosity packageDBs repoCtxt comp platform progdb mSandboxPkgInfo
+freeze verbosity packageDBs repoCtxt comp platform progdb
       globalFlags freezeFlags = do
 
     pkgs  <- getFreezePkgs
-               verbosity packageDBs repoCtxt comp platform progdb mSandboxPkgInfo
+               verbosity packageDBs repoCtxt comp platform progdb
                globalFlags freezeFlags
 
     if null pkgs
@@ -109,11 +101,10 @@ getFreezePkgs :: Verbosity
               -> Compiler
               -> Platform
               -> ProgramDb
-              -> Maybe SandboxPackageInfo
               -> GlobalFlags
               -> FreezeFlags
               -> IO [SolverPlanPackage]
-getFreezePkgs verbosity packageDBs repoCtxt comp platform progdb mSandboxPkgInfo
+getFreezePkgs verbosity packageDBs repoCtxt comp platform progdb
       globalFlags freezeFlags = do
 
     installedPkgIndex <- getInstalledPackages verbosity comp packageDBs progdb
@@ -127,7 +118,7 @@ getFreezePkgs verbosity packageDBs repoCtxt comp platform progdb mSandboxPkgInfo
 
     sanityCheck pkgSpecifiers
     planPackages
-               verbosity comp platform mSandboxPkgInfo freezeFlags
+               verbosity comp platform freezeFlags
                installedPkgIndex sourcePkgDb pkgConfigDb pkgSpecifiers
   where
     sanityCheck pkgSpecifiers = do
@@ -141,14 +132,13 @@ getFreezePkgs verbosity packageDBs repoCtxt comp platform progdb mSandboxPkgInfo
 planPackages :: Verbosity
              -> Compiler
              -> Platform
-             -> Maybe SandboxPackageInfo
              -> FreezeFlags
              -> InstalledPackageIndex
              -> SourcePackageDb
              -> PkgConfigDb
              -> [PackageSpecifier UnresolvedSourcePackage]
              -> IO [SolverPlanPackage]
-planPackages verbosity comp platform mSandboxPkgInfo freezeFlags
+planPackages verbosity comp platform freezeFlags
              installedPkgIndex sourcePkgDb pkgConfigDb pkgSpecifiers = do
 
   solver <- chooseSolver verbosity
@@ -175,6 +165,8 @@ planPackages verbosity comp platform mSandboxPkgInfo freezeFlags
 
       . setCountConflicts countConflicts
 
+      . setFineGrainedConflicts fineGrainedConflicts
+
       . setMinimizeConflictSet minimizeConflictSet
 
       . setShadowPkgs shadowPkgs
@@ -194,8 +186,6 @@ planPackages verbosity comp platform mSandboxPkgInfo freezeFlags
             in LabeledPackageConstraint pc ConstraintSourceFreeze
           | pkgSpecifier <- pkgSpecifiers ]
 
-      . maybe id applySandboxInstallPolicy mSandboxPkgInfo
-
       $ standardInstallPolicy installedPkgIndex sourcePkgDb pkgSpecifiers
 
     logMsg message rest = debug verbosity message >> rest
@@ -207,6 +197,7 @@ planPackages verbosity comp platform mSandboxPkgInfo freezeFlags
 
     reorderGoals     = fromFlag (freezeReorderGoals     freezeFlags)
     countConflicts   = fromFlag (freezeCountConflicts   freezeFlags)
+    fineGrainedConflicts = fromFlag (freezeFineGrainedConflicts freezeFlags)
     minimizeConflictSet = fromFlag (freezeMinimizeConflictSet freezeFlags)
     independentGoals = fromFlag (freezeIndependentGoals freezeFlags)
     shadowPkgs       = fromFlag (freezeShadowPkgs       freezeFlags)
@@ -264,12 +255,12 @@ freezePackages verbosity globalFlags pkgs = do
             UserConstraint (UserQualified UserQualToplevel (packageName pkgId))
                            (PackagePropertyVersion $ thisVersion (packageVersion pkgId))
     createPkgEnv config = mempty { pkgEnvSavedConfig = config }
-    showPkgEnv = BS.Char8.pack . showPackageEnvironment
+    showPkgEnv = toUTF8LBS . showPackageEnvironment
 
 
 formatPkgs :: Package pkg => [pkg] -> [String]
 formatPkgs = map $ showPkg . packageId
   where
     showPkg pid = name pid ++ " == " ++ version pid
-    name = display . packageName
-    version = display . packageVersion
+    name = prettyShow . packageName
+    version = prettyShow . packageVersion

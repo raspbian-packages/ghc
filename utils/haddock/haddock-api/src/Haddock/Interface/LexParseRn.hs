@@ -1,5 +1,6 @@
 {-# OPTIONS_GHC -Wwarn #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ViewPatterns #-}
   -----------------------------------------------------------------------------
 -- |
@@ -22,20 +23,20 @@ module Haddock.Interface.LexParseRn
 import Control.Arrow
 import Control.Monad
 import Data.Functor (($>))
-import Data.List
+import Data.List (maximumBy, (\\))
 import Data.Ord
 import Documentation.Haddock.Doc (metaDocConcat)
-import DynFlags (languageExtensions)
+import GHC.Driver.Session (languageExtensions)
 import qualified GHC.LanguageExtensions as LangExt
 import GHC
 import Haddock.Interface.ParseModuleHeader
 import Haddock.Parser
 import Haddock.Types
-import Name
-import Outputable ( showPpr, showSDoc )
-import RdrName
-import RdrHsSyn (setRdrNameSpace)
-import EnumSet
+import GHC.Types.Name
+import GHC.Parser.PostProcess
+import GHC.Utils.Outputable ( showPpr, showSDoc )
+import GHC.Types.Name.Reader
+import GHC.Data.EnumSet as EnumSet
 
 processDocStrings :: DynFlags -> Maybe Package -> GlobalRdrEnv -> [HsDocString]
                   -> ErrMsgM (Maybe (MDoc Name))
@@ -148,7 +149,7 @@ rename dflags gre = rn
       DocDefList list -> DocDefList <$> traverse (\(a, b) -> (,) <$> rn a <*> rn b) list
       DocCodeBlock doc -> DocCodeBlock <$> rn doc
       DocIdentifierUnchecked x -> pure (DocIdentifierUnchecked x)
-      DocModule str -> pure (DocModule str)
+      DocModule (ModLink m l) -> DocModule . ModLink m <$> traverse rn l
       DocHyperlink (Hyperlink u l) -> DocHyperlink . Hyperlink u <$> traverse rn l
       DocPic str -> pure (DocPic str)
       DocMathInline str -> pure (DocMathInline str)

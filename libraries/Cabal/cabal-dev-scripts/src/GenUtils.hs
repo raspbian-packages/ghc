@@ -1,3 +1,4 @@
+{-# LANGUAGE DeriveGeneric     #-}
 {-# LANGUAGE DeriveFoldable      #-}
 {-# LANGUAGE DeriveFunctor       #-}
 {-# LANGUAGE DeriveTraversable   #-}
@@ -5,16 +6,17 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 module GenUtils where
 
-import Control.Lens
+import Control.Lens (each, ix, (%~), (&))
 import Data.Char    (toUpper)
 import Data.Maybe   (fromMaybe)
 import Data.Text    (Text)
+import GHC.Generics     (Generic)
 
+import qualified Zinza                as Z
 import qualified Data.Algorithm.Diff as Diff
 import qualified Data.Map            as Map
 import qualified Data.Set            as Set
 import qualified Data.Text           as T
-import qualified Data.Text.Lazy      as TL
 
 -------------------------------------------------------------------------------
 -- License List version
@@ -25,12 +27,14 @@ data SPDXLicenseListVersion
     = SPDXLicenseListVersion_3_0
     | SPDXLicenseListVersion_3_2
     | SPDXLicenseListVersion_3_6
+    | SPDXLicenseListVersion_3_9
   deriving (Eq, Ord, Show, Enum, Bounded)
 
 allVers :: Set.Set SPDXLicenseListVersion
 allVers =  Set.fromList [minBound .. maxBound]
 
 prettyVer :: SPDXLicenseListVersion -> Text
+prettyVer SPDXLicenseListVersion_3_9 = "SPDX License List 3.9"
 prettyVer SPDXLicenseListVersion_3_6 = "SPDX License List 3.6"
 prettyVer SPDXLicenseListVersion_3_2 = "SPDX License List 3.2"
 prettyVer SPDXLicenseListVersion_3_0 = "SPDX License List 3.0"
@@ -39,7 +43,7 @@ prettyVer SPDXLicenseListVersion_3_0 = "SPDX License List 3.0"
 -- Per version
 -------------------------------------------------------------------------------
 
-data PerV a = PerV a a a
+data PerV a = PerV a a a a
   deriving (Functor, Foldable, Traversable)
 
 -------------------------------------------------------------------------------
@@ -59,7 +63,7 @@ instance Ord OrdT where
 -- Commmons
 -------------------------------------------------------------------------------
 
-header :: TL.Text
+header :: String
 header = "-- This file is generated. See Makefile's spdx rule"
 
 -------------------------------------------------------------------------------
@@ -127,3 +131,37 @@ mkList (x:xs) =
     "    [ " <> x <> "\n"
     <> foldMap (\x' -> "    , " <> x' <> "\n") xs
     <> "    ]"
+
+-------------------------------------------------------------------------------
+-- Zinza inputs
+-------------------------------------------------------------------------------
+
+data Input = Input
+    { inputLicenseIds      :: Text
+    , inputLicenses        :: [InputLicense]
+    , inputLicenseList_all :: Text
+    , inputLicenseList_3_0 :: Text
+    , inputLicenseList_3_2 :: Text
+    , inputLicenseList_3_6 :: Text
+    , inputLicenseList_3_9 :: Text
+    }
+  deriving (Show, Generic)
+
+instance Z.Zinza Input where
+    toType    = Z.genericToTypeSFP
+    toValue   = Z.genericToValueSFP
+    fromValue = Z.genericFromValueSFP
+
+data InputLicense = InputLicense
+    { ilConstructor   :: Text
+    , ilId            :: Text
+    , ilName          :: Text
+    , ilIsOsiApproved :: Bool
+    , ilIsFsfLibre    :: Bool
+    }
+  deriving (Show, Generic)
+
+instance Z.Zinza InputLicense where
+    toType    = Z.genericToTypeSFP
+    toValue   = Z.genericToValueSFP
+    fromValue = Z.genericFromValueSFP

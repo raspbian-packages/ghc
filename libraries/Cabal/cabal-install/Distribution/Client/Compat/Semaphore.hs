@@ -7,11 +7,15 @@ module Distribution.Client.Compat.Semaphore
     , signalQSem
     ) where
 
+import Prelude (IO, return, Eq (..), Int, Bool (..), ($), ($!), Num (..), flip)
+
 import Control.Concurrent.STM (TVar, atomically, newTVar, readTVar, retry,
                                writeTVar)
 import Control.Exception (mask_, onException)
 import Control.Monad (join, unless)
 import Data.Typeable (Typeable)
+import Data.List.NonEmpty (NonEmpty (..))
+import qualified Data.List.NonEmpty as NE
 
 -- | 'QSem' is a quantity semaphore in which the resource is aqcuired
 -- and released in units of one. It provides guaranteed FIFO ordering
@@ -97,8 +101,8 @@ signalQSem s@(QSem q b1 b2) =
     checkwake2 [] = do
       writeTVar q 1
       return (return ())
-    checkwake2 ys = do
-      let (z:zs) = reverse ys
+    checkwake2 (y:ys) = do
+      let (z:|zs) = NE.reverse (y:|ys)
       writeTVar b1 zs
       writeTVar b2 []
       return (wake s z)

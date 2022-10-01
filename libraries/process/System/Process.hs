@@ -49,6 +49,7 @@ module System.Process (
     showCommandForUser,
     Pid,
     getPid,
+    getCurrentPid,
 
     -- ** Control-C handling on Unix
     -- $ctlc-handling
@@ -93,8 +94,9 @@ import System.IO
 import System.IO.Error (mkIOError, ioeSetErrorString)
 
 #if defined(WINDOWS)
-import System.Win32.Process (getProcessId, ProcessId)
+import System.Win32.Process (getProcessId, getCurrentProcessId, ProcessId)
 #else
+import System.Posix.Process (getProcessID)
 import System.Posix.Types (CPid (..))
 #endif
 
@@ -200,6 +202,13 @@ always the desired behavior. In cases where you would like to leave the
 instead. All created @Handle@s are initially in text mode; if you need them
 to be in binary mode then use 'hSetBinaryMode'.
 
+@/ph/@ contains a handle to the running process.  On Windows
+'use_process_jobs' can be set in CreateProcess in order to create a
+Win32 Job object to monitor a process tree's progress.  If it is set
+then that job is also returned inside @/ph/@.  @/ph/@ can be used to
+kill all running sub-processes.  This feature has been available since
+1.5.0.0.
+
 -}
 createProcess
   :: CreateProcess
@@ -249,10 +258,10 @@ withCreateProcess_ fun c action =
                      (\(m_in, m_out, m_err, ph) -> action m_in m_out m_err ph)
 
 -- | Cleans up the process.
--- 
--- This function is meant to be invoked from any application level cleanup 
+--
+-- This function is meant to be invoked from any application level cleanup
 -- handler. It terminates the process, and closes any 'CreatePipe' 'handle's.
--- 
+--
 -- @since 1.6.4.0
 cleanupProcess :: (Maybe Handle, Maybe Handle, Maybe Handle, ProcessHandle)
                -> IO ()
@@ -646,6 +655,24 @@ getPid (ProcessHandle mh _ _) = do
 
 
 -- ----------------------------------------------------------------------------
+-- getCurrentPid
+
+-- | Returns the PID (process ID) of the current process. On POSIX systems,
+-- this calls 'getProcessID' from "System.Posix.Process" in the @unix@ package.
+-- On Windows, this calls 'getCurrentProcessId' from "System.Win32.Process" in
+-- the @Win32@ package.
+--
+-- @since 1.6.12.0
+getCurrentPid :: IO Pid
+getCurrentPid =
+#ifdef WINDOWS
+    getCurrentProcessId
+#else
+    getProcessID
+#endif
+
+
+-- ----------------------------------------------------------------------------
 -- waitForProcess
 
 {- | Waits for the specified process to terminate, and returns its exit code.
@@ -653,6 +680,10 @@ getPid (ProcessHandle mh _ _) = do
 GHC Note: in order to call @waitForProcess@ without blocking all the
 other threads in the system, you must compile the program with
 @-threaded@.
+
+Note that it is safe to call @waitForProcess@ for the same process in multiple
+threads. When the process ends, threads blocking on this call will wake in
+FIFO order.
 
 (/Since: 1.2.0.0/) On Unix systems, a negative value @'ExitFailure' -/signum/@
 indicates that the child was terminated by signal @/signum/@.
@@ -806,7 +837,7 @@ terminateProcess ph = do
     case p_ of
       ClosedHandle  _ -> return ()
 #if defined(WINDOWS)
-      OpenExtHandle{} -> terminateJob ph 1 >> return ()
+      OpenExtHandle{} -> terminateJobUnsafe p_ 1 >> return ()
 #else
       OpenExtHandle{} -> error "terminateProcess with OpenExtHandle should not happen on POSIX."
 #endif

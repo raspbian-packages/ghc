@@ -60,7 +60,7 @@ import qualified Text.PrettyPrint as Disp
 -- are two situations where we need to do it.
 --
 -- For parsing OS and arch names in .cabal files we really want everyone to be
--- referring to the same or or arch by the same name. Variety is not a virtue
+-- referring to the same or arch by the same name. Variety is not a virtue
 -- in this case. We don't mind about case though.
 --
 -- For the System.Info.os\/arch different Haskell implementations use different
@@ -101,7 +101,7 @@ data OS = Linux | Windows | OSX        -- tier 1 desktop OSs
   deriving (Eq, Generic, Ord, Show, Read, Typeable, Data)
 
 instance Binary OS
-
+instance Structured OS
 instance NFData OS where rnf = genericRnf
 
 knownOSs :: [OS]
@@ -122,7 +122,8 @@ osAliases Permissive FreeBSD = ["kfreebsdgnu"]
 osAliases Compat     FreeBSD = ["kfreebsdgnu"]
 osAliases Permissive Solaris = ["solaris2"]
 osAliases Compat     Solaris = ["solaris2"]
-osAliases _          Android = ["linux-android"]
+osAliases Permissive Android = ["linux-android", "linux-androideabi", "linux-androideabihf"]
+osAliases Compat     Android = ["linux-android"]
 osAliases _          _       = []
 
 instance Pretty OS where
@@ -131,6 +132,8 @@ instance Pretty OS where
 
 instance Parsec OS where
   parsec = classifyOS Compat <$> parsecIdent
+
+
 
 classifyOS :: ClassificationStrictness -> String -> OS
 classifyOS strictness s =
@@ -169,7 +172,7 @@ data Arch = I386  | X86_64  | PPC  | PPC64 | Sparc
   deriving (Eq, Generic, Ord, Show, Read, Typeable, Data)
 
 instance Binary Arch
-
+instance Structured Arch
 instance NFData Arch where rnf = genericRnf
 
 knownArches :: [Arch]
@@ -217,7 +220,7 @@ data Platform = Platform Arch OS
   deriving (Eq, Generic, Ord, Show, Read, Typeable, Data)
 
 instance Binary Platform
-
+instance Structured Platform
 instance NFData Platform where rnf = genericRnf
 
 instance Pretty Platform where

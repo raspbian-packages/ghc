@@ -1,5 +1,131 @@
 # Changelog for [`base` package](http://hackage.haskell.org/package/base)
 
+## 4.15.1.0 *December 2021*
+
+  * Bundled with GHC 9.0.2
+
+  * Various documentation improvements and fixes
+
+  * `GHC.Event.Manager`: Don't use one-shot kqueue on macOS.
+  This reverts a commit that removed the workaround for a
+  [bug](https://gitlab.haskell.org/ghc/ghc/-/issues/7651) in the OSX
+  implementation of kqueue. It turns out the bug still affects modern
+  macOS versions, so we keep the workaround for now.
+
+  * Check the buffer size *before* calling the continuation in withEncodedCString (#20107)
+
+  * Pass -DLIBICONV_PLUG when building base library on FreeBSD (#19958)
+
+  * Detect underflow in fromIntegral/Int->Natural rule (#20066)
+
+  * Make unsafeDupablePerformIO have a lazy demand (#19181)
+
+  * fix bogus rewrite rule for "fromIntegral/Int->Natural" `fromIntegral =
+    naturalFromWord . fromIntegral` (#19345)
+
+  * Fix accidental unsoundness in Data.Typeable.Internal.mkTypeLitFromString (#19288)
+
+## 4.15.0.0 *January 2021*
+
+  * Bundled with GHC 9.0.1
+
+  * Add `Functor`, `Applicative`, `Monad`, `MonadFix`, `Foldable`, `Traversable`,
+    `Eq`, `Ord`, `Show`, `Read`, `Eq1`, `Ord1`, `Show1`, `Read1`, `Generic`,
+    `Generic1`, and `Data` instances for `GHC.Tuple.Solo`.
+
+  * `openFile` now calls the `open` system call with an `interruptible` FFI
+    call, ensuring that the call can be interrupted with `SIGINT` on POSIX
+    systems.
+
+  * Add `hGetContents'`, `getContents'`, and `readFile'` in `System.IO`:
+    Strict IO variants of `hGetContents`, `getContents`, and `readFile`.
+
+  * Add `singleton` function for `Data.List.NonEmpty`.
+
+  * The planned deprecation of `Data.Monoid.First` and `Data.Monoid.Last`
+    is scrapped due to difficulties with the suggested migration path.
+
+  * `Data.Semigroup.Option` and the accompanying `option` function are
+    deprecated and scheduled for removal in 4.16.
+
+  * Add `Generic` instances to `Fingerprint`, `GiveGCStats`, `GCFlags`,
+    `ConcFlags`, `DebugFlags`, `CCFlags`, `DoHeapProfile`, `ProfFlags`,
+    `DoTrace`, `TraceFlags`, `TickyFlags`, `ParFlags`, `RTSFlags`, `RTSStats`,
+    `GCStats`, `ByteOrder`, `GeneralCategory`, `SrcLoc`
+
+  * Add rules `unpackUtf8`, `unpack-listUtf8` and `unpack-appendUtf8` to `GHC.Base`.
+    They correspond to their ascii versions and hopefully make it easier
+    for libraries to handle utf8 encoded strings efficiently.
+
+  * An issue with list fusion and `elem` was fixed. `elem` applied to known
+    small lists will now compile to a simple case statement more often.
+
+  * Add `MonadFix` and `MonadZip` instances for `Complex`
+
+  * Add `Ix` instances for tuples of size 6 through 15
+
+  * Correct `Bounded` instance and remove `Enum` and `Integral` instances for
+    `Data.Ord.Down`.
+
+  * `Foreign.ForeignPtr.withForeignPtr` is now less aggressively optimised,
+    avoiding the soundness issue reported in
+    [#17760](https://gitlab.haskell.org/ghc/ghc/-/issues/17760) in exchange for
+    a small amount more allocation. If your application regresses significantly
+    *and* the continuation given to `withForeignPtr` will *not* provably
+    diverge then the previous optimisation behavior can be recovered by instead
+    using `GHC.ForeignPtr.unsafeWithForeignPtr`.
+
+## 4.14.1.0 *Jul 2020*
+
+  * Bundled with GHC 8.10.2
+
+  * Fix a precision issue in `log1mexp` (#17125)
+
+## 4.14.0.0 *Jan 2020*
+  * Bundled with GHC 8.10.1
+
+  * Add a `TestEquality` instance for the `Compose` newtype.
+
+  * `Data.Ord.Down` now has a field name, `getDown`
+
+  * Add `Bits`, `Bounded`, `Enum`, `FiniteBits`, `Floating`, `Fractional`,
+    `Integral`, `Ix`, `Real`, `RealFrac`, `RealFloat` and `Storable` instances
+    to `Data.Ord.Down`.
+
+  * Fix the `integer-gmp` variant of `isValidNatural`: Previously it would fail
+    to detect values `<= maxBound::Word` that were incorrectly encoded using
+    the `NatJ#` constructor.
+
+  * The type of `coerce` has been generalized. It is now runtime-representation
+    polymorphic:
+    `forall {r :: RuntimeRep} (a :: TYPE r) (b :: TYPE r). Coercible a b => a -> b`.
+    The type argument `r` is marked as `Inferred` to prevent it from
+    interfering with visible type application.
+
+  * Make `Fixed` and `HasResolution` poly-kinded.
+
+  * Add `HasResolution` instances for `Nat`s.
+
+  * Add `Functor`, `Applicative`, `Monad`, `Alternative`, `MonadPlus`,
+    `Generic` and `Generic1` instances to `Kleisli`
+
+  * `openTempFile` is now fully atomic and thread-safe on Windows.
+
+  * Add `isResourceVanishedError`, `resourceVanishedErrorType`, and
+    `isResourceVanishedErrorType` to `System.IO.Error`.
+
+  * Add newtypes for `CSocklen` (`socklen_t`) and `CNfds` (`nfds_t`) to
+    `System.Posix.Types`.
+
+  * Add `Functor`, `Applicative` and `Monad` instances to `(,,) a b`
+    and `(,,,) a b c`.
+
+  * Add `resizeSmallMutableArray#` to `GHC.Exts`.
+
+  * Add a `Data` instance to `WrappedArrow`, `WrappedMonad`, and `ZipList`.
+
+  * Add `IsList` instance for `ZipList`.
+
 ## 4.13.0.0 *July 2019*
   * Bundled with GHC 8.8.1
 
@@ -29,7 +155,7 @@
     `Word`, and `WordN` now throw an overflow exception for negative shift
     values (instead of being undefined behaviour).
 
-  * `scanr` no longer participates in list fusion (due #16943)
+  * `scanr` no longer crashes when passed a fusable, infinite list. (#16943)
 
 ## 4.12.0.0 *21 September 2018*
   * Bundled with GHC 8.6.1

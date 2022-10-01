@@ -7,18 +7,17 @@ module GHCi.Leak
 
 import Control.Monad
 import Data.Bits
-import DynFlags ( sTargetPlatform )
 import Foreign.Ptr (ptrToIntPtr, intPtrToPtr)
 import GHC
 import GHC.Ptr (Ptr (..))
 import GHCi.Util
-import HscTypes
-import Outputable
-import Platform (target32Bit)
+import GHC.Driver.Types
+import GHC.Utils.Outputable
+import GHC.Platform (target32Bit)
 import Prelude
 import System.Mem
 import System.Mem.Weak
-import UniqDFM
+import GHC.Types.Unique.DFM
 
 -- Checking for space leaks in GHCi. See #15111, and the
 -- -fghci-leak-check flag.
@@ -68,7 +67,7 @@ checkLeakIndicators dflags (LeakIndicators leakmods)  = do
               show (maskTagBits addr))
 
   tagBits
-    | target32Bit (sTargetPlatform (settings dflags)) = 2
+    | target32Bit (targetPlatform dflags) = 2
     | otherwise = 3
 
   maskTagBits :: Ptr a -> Ptr a

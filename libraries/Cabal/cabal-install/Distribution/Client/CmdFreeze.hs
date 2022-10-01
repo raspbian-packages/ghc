@@ -7,11 +7,17 @@ module Distribution.Client.CmdFreeze (
     freezeAction,
   ) where
 
+import Distribution.Client.Compat.Prelude
+import Prelude ()
+
+import Distribution.Client.NixStyleOptions
+         ( NixStyleFlags (..), nixStyleOptions, defaultNixStyleFlags )
 import Distribution.Client.ProjectOrchestration
 import Distribution.Client.ProjectPlanning
 import Distribution.Client.ProjectConfig
          ( ProjectConfig(..), ProjectConfigShared(..)
          , writeProjectLocalFreezeConfig )
+import Distribution.Client.IndexUtils (TotalIndexState, ActiveRepos, filterSkippedActiveRepos)
 import Distribution.Client.Targets
          ( UserQualifier(..), UserConstraintScope(..), UserConstraint(..) )
 import Distribution.Solver.Types.PackageConstraint
@@ -31,26 +37,22 @@ import Distribution.Version
 import Distribution.PackageDescription
          ( FlagAssignment, nullFlagAssignment )
 import Distribution.Client.Setup
-         ( GlobalFlags, ConfigFlags(..), ConfigExFlags, InstallFlags )
-import Distribution.Simple.Setup
-         ( HaddockFlags, TestFlags, fromFlagOrDefault )
+         ( GlobalFlags, ConfigFlags(..) )
+import Distribution.Simple.Flag
+         ( fromFlagOrDefault )
+import Distribution.Simple.Flag (Flag (..))
 import Distribution.Simple.Utils
          ( die', notice, wrapText )
 import Distribution.Verbosity
          ( normal )
 
-import Data.Monoid as Monoid
 import qualified Data.Map as Map
-import Data.Map (Map)
-import Control.Monad (unless)
 
 import Distribution.Simple.Command
          ( CommandUI(..), usageAlternatives )
-import qualified Distribution.Client.Setup as Client
 
-
-freezeCommand :: CommandUI (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags, TestFlags)
-freezeCommand = Client.installCommand {
+freezeCommand :: CommandUI (NixStyleFlags ())
+freezeCommand = CommandUI {
   commandName         = "v2-freeze",
   commandSynopsis     = "Freeze dependencies.",
   commandUsage        = usageAlternatives "v2-freeze" [ "[FLAGS]" ],
@@ -72,6 +74,7 @@ freezeCommand = Client.installCommand {
      ++ "solver flags such as '--constraint=\"pkg < 1.2\"' and once you have "
      ++ "a satisfactory solution to freeze it using the 'v2-freeze' command "
      ++ "with the same set of flags.",
+
   commandNotes        = Just $ \pname ->
         "Examples:\n"
      ++ "  " ++ pname ++ " v2-freeze\n"
@@ -79,17 +82,10 @@ freezeCommand = Client.installCommand {
      ++ "  " ++ pname ++ " v2-build --dry-run --constraint=\"aeson < 1\"\n"
      ++ "    Check what a solution with the given constraints would look like\n"
      ++ "  " ++ pname ++ " v2-freeze --constraint=\"aeson < 1\"\n"
-     ++ "    Freeze a solution using the given constraints\n\n"
+     ++ "    Freeze a solution using the given constraints\n"
 
-     ++ "Note: this command is part of the new project-based system (aka "
-     ++ "nix-style\nlocal builds). These features are currently in beta. "
-     ++ "Please see\n"
-     ++ "http://cabal.readthedocs.io/en/latest/nix-local-build-overview.html "
-     ++ "for\ndetails and advice on what you can expect to work. If you "
-     ++ "encounter problems\nplease file issues at "
-     ++ "https://github.com/haskell/cabal/issues and if you\nhave any time "
-     ++ "to get involved and help with testing, fixing bugs etc then\nthat "
-     ++ "is very much appreciated.\n"
+   , commandDefaultFlags = defaultNixStyleFlags ()
+   , commandOptions      = nixStyleOptions (const [])
    }
 
 -- | To a first approximation, the @freeze@ command runs the first phase of
@@ -99,10 +95,8 @@ freezeCommand = Client.installCommand {
 -- For more details on how this works, see the module
 -- "Distribution.Client.ProjectOrchestration"
 --
-freezeAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags, TestFlags)
-             -> [String] -> GlobalFlags -> IO ()
-freezeAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags)
-             extraArgs globalFlags = do
+freezeAction :: NixStyleFlags () -> [String] -> GlobalFlags -> IO ()
+freezeAction flags@NixStyleFlags {..} extraArgs globalFlags = do
 
     unless (null extraArgs) $
       die' verbosity $ "'freeze' doesn't take any extra arguments: "
@@ -115,38 +109,43 @@ freezeAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags)
       localPackages
     } <- establishProjectBaseContext verbosity cliConfig OtherCommand
 
-    (_, elaboratedPlan, _) <-
+    (_, elaboratedPlan, _, totalIndexState, activeRepos) <-
       rebuildInstallPlan verbosity
                          distDirLayout cabalDirLayout
                          projectConfig
                          localPackages
 
-    let freezeConfig = projectFreezeConfig elaboratedPlan
+    let freezeConfig = projectFreezeConfig elaboratedPlan totalIndexState activeRepos
     writeProjectLocalFreezeConfig distDirLayout freezeConfig
     notice verbosity $
       "Wrote freeze file: " ++ distProjectFile distDirLayout "freeze"
 
   where
     verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
-    cliConfig = commandLineFlagsToProjectConfig
-                  globalFlags configFlags configExFlags
-                  installFlags
+    cliConfig = commandLineFlagsToProjectConfig globalFlags flags
                   mempty -- ClientInstallFlags, not needed here
-                  haddockFlags testFlags
 
 
 
 -- | Given the install plan, produce a config value with constraints that
 -- freezes the versions of packages used in the plan.
 --
-projectFreezeConfig :: ElaboratedInstallPlan -> ProjectConfig
-projectFreezeConfig elaboratedPlan =
-    Monoid.mempty {
-      projectConfigShared = Monoid.mempty {
-        projectConfigConstraints =
+projectFreezeConfig
+    :: ElaboratedInstallPlan
+    -> TotalIndexState
+    -> ActiveRepos
+    -> ProjectConfig
+projectFreezeConfig elaboratedPlan totalIndexState activeRepos0 = mempty
+    { projectConfigShared = mempty
+        { projectConfigConstraints =
           concat (Map.elems (projectFreezeConstraints elaboratedPlan))
-      }
+        , projectConfigIndexState  = Flag totalIndexState
+        , projectConfigActiveRepos = Flag activeRepos
+        }
     }
+  where
+    activeRepos :: ActiveRepos
+    activeRepos = filterSkippedActiveRepos activeRepos0
 
 -- | Given the install plan, produce solver constraints that will ensure the
 -- solver picks the same solution again in future in different environments.

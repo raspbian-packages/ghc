@@ -18,8 +18,12 @@ module Distribution.Client.ProjectPlanOutput (
 import           Distribution.Client.ProjectPlanning.Types
 import           Distribution.Client.ProjectBuilding.Types
 import           Distribution.Client.DistDirLayout
-import           Distribution.Client.Types (Repo(..), RemoteRepo(..), PackageLocation(..), confInstId)
-import           Distribution.Client.PackageHash (showHashValue, hashValue)
+import           Distribution.Client.Types.Repo (Repo(..), RemoteRepo(..))
+import           Distribution.Client.Types.PackageLocation (PackageLocation(..))
+import           Distribution.Client.Types.ConfiguredId (confInstId)
+import           Distribution.Client.Types.SourceRepo (SourceRepoMaybe, SourceRepositoryPackage (..))
+import           Distribution.Client.HashValue (showHashValue, hashValue)
+import           Distribution.Client.Utils (cabalInstallVersion)
 
 import qualified Distribution.Client.InstallPlan as InstallPlan
 import qualified Distribution.Client.Utils.Json as J
@@ -40,19 +44,18 @@ import           Distribution.Simple.GHC
                    ( getImplInfo, GhcImplInfo(supportsPkgEnvFiles)
                    , GhcEnvironmentFileEntry(..), simpleGhcEnvironmentFile
                    , writeGhcEnvironmentFile )
-import           Distribution.Deprecated.Text
+import           Distribution.Simple.BuildPaths
+                   ( dllExtension, exeExtension )
 import qualified Distribution.Compat.Graph as Graph
 import           Distribution.Compat.Graph (Graph, Node)
 import qualified Distribution.Compat.Binary as Binary
 import           Distribution.Simple.Utils
 import           Distribution.Verbosity
-import qualified Paths_cabal_install as Our (version)
 
 import Prelude ()
 import Distribution.Client.Compat.Prelude
 
 import qualified Data.Map as Map
-import           Data.Set (Set)
 import qualified Data.Set as Set
 import qualified Data.ByteString.Lazy as BS
 import qualified Data.ByteString.Builder as BB
@@ -88,7 +91,7 @@ encodePlanAsJson :: DistDirLayout -> ElaboratedInstallPlan -> ElaboratedSharedCo
 encodePlanAsJson distDirLayout elaboratedInstallPlan elaboratedSharedConfig =
     --TODO: [nice to have] include all of the sharedPackageConfig and all of
     --      the parts of the elaboratedInstallPlan
-    J.object [ "cabal-version"     J..= jdisplay Our.version
+    J.object [ "cabal-version"     J..= jdisplay cabalInstallVersion
              , "cabal-lib-version" J..= jdisplay cabalVersion
              , "compiler-id"       J..= (J.String . showCompilerId . pkgConfigCompiler)
                                         elaboratedSharedConfig
@@ -97,7 +100,7 @@ encodePlanAsJson distDirLayout elaboratedInstallPlan elaboratedSharedConfig =
              , "install-plan"      J..= installPlanToJ elaboratedInstallPlan
              ]
   where
-    Platform arch os = pkgConfigPlatform elaboratedSharedConfig
+    plat@(Platform arch os) = pkgConfigPlatform elaboratedSharedConfig
 
     installPlanToJ :: ElaboratedInstallPlan -> [J.Value]
     installPlanToJ = map planPackageToJ . InstallPlan.toList
@@ -199,8 +202,8 @@ encodePlanAsJson distDirLayout elaboratedInstallPlan elaboratedSharedConfig =
       repoToJ :: Repo -> J.Value
       repoToJ repo =
         case repo of
-          RepoLocal{..} ->
-            J.object [ "type" J..= J.String "local-repo"
+          RepoLocalNoIndex{..} ->
+            J.object [ "type" J..= J.String "local-repo-no-index"
                      , "path" J..= J.String repoLocalDir
                      ]
           RepoRemote{..} ->
@@ -212,15 +215,14 @@ encodePlanAsJson distDirLayout elaboratedInstallPlan elaboratedSharedConfig =
                      , "uri"  J..= J.String (show (remoteRepoURI repoRemote))
                      ]
 
-      sourceRepoToJ :: PD.SourceRepo -> J.Value
-      sourceRepoToJ PD.SourceRepo{..} =
+      sourceRepoToJ :: SourceRepoMaybe -> J.Value
+      sourceRepoToJ SourceRepositoryPackage{..} =
         J.object $ filter ((/= J.Null) . snd) $
-          [ "type"     J..= fmap jdisplay repoType
-          , "location" J..= fmap J.String repoLocation
-          , "module"   J..= fmap J.String repoModule
-          , "branch"   J..= fmap J.String repoBranch
-          , "tag"      J..= fmap J.String repoTag
-          , "subdir"   J..= fmap J.String repoSubdir
+          [ "type"     J..= jdisplay srpType
+          , "location" J..= J.String srpLocation
+          , "branch"   J..= fmap J.String srpBranch
+          , "tag"      J..= fmap J.String srpTag
+          , "subdir"   J..= fmap J.String srpSubdir
           ]
 
       dist_dir = distBuildDirectory distDirLayout
@@ -230,33 +232,32 @@ encodePlanAsJson distDirLayout elaboratedInstallPlan elaboratedSharedConfig =
         ComponentDeps.ComponentExe s   -> bin_file' s
         ComponentDeps.ComponentTest s  -> bin_file' s
         ComponentDeps.ComponentBench s -> bin_file' s
+        ComponentDeps.ComponentFLib s  -> flib_file' s
         _ -> []
       bin_file' s =
         ["bin-file" J..= J.String bin]
        where
         bin = if elabBuildStyle elab == BuildInplaceOnly
-               then dist_dir </> "build" </> display s </> display s
-               else InstallDirs.bindir (elabInstallDirs elab) </> display s
+               then dist_dir </> "build" </> prettyShow s </> prettyShow s <.> exeExtension plat
+               else InstallDirs.bindir (elabInstallDirs elab) </> prettyShow s <.> exeExtension plat
 
-    -- TODO: maybe move this helper to "ComponentDeps" module?
-    --       Or maybe define a 'Text' instance?
+      flib_file' s =
+        ["bin-file" J..= J.String bin]
+       where
+        bin = if elabBuildStyle elab == BuildInplaceOnly
+               then dist_dir </> "build" </> prettyShow s </> ("lib" ++ prettyShow s) <.> dllExtension plat
+               else InstallDirs.bindir (elabInstallDirs elab) </> ("lib" ++ prettyShow s) <.> dllExtension plat
+
     comp2str :: ComponentDeps.Component -> String
-    comp2str c = case c of
-        ComponentDeps.ComponentLib     -> "lib"
-        ComponentDeps.ComponentSubLib s -> "lib:"   <> display s
-        ComponentDeps.ComponentFLib s  -> "flib:"  <> display s
-        ComponentDeps.ComponentExe s   -> "exe:"   <> display s
-        ComponentDeps.ComponentTest s  -> "test:"  <> display s
-        ComponentDeps.ComponentBench s -> "bench:" <> display s
-        ComponentDeps.ComponentSetup   -> "setup"
+    comp2str = prettyShow
 
     style2str :: Bool -> BuildStyle -> String
     style2str True  _                = "local"
     style2str False BuildInplaceOnly = "inplace"
     style2str False BuildAndInstall  = "global"
 
-    jdisplay :: Text a => a -> J.Value
-    jdisplay = J.String . display
+    jdisplay :: Pretty a => a -> J.Value
+    jdisplay = J.String . prettyShow
 
 
 -----------------------------------------------------------------------------
@@ -691,7 +692,7 @@ updatePostBuildProjectStatus verbosity distDirLayout
 
     return currentBuildStatus
   where
-    displayPackageIdSet = intercalate ", " . map display . Set.toList
+    displayPackageIdSet = intercalate ", " . map prettyShow . Set.toList
 
 -- | Helper for reading the cache file.
 --
@@ -835,7 +836,7 @@ argsEquivalentOfGhcEnvironmentFileGhc
                  selectGhcEnvironmentFilePackageDbs elaboratedInstallPlan
     -- TODO use proper flags? but packageDbArgsDb is private
     clearPackageDbStackFlag = ["-clear-package-db", "-global-package-db"]
-    packageIdFlag uid = ["-package-id", display uid]
+    packageIdFlag uid = ["-package-id", prettyShow uid]
 
 
 -- We're producing an environment for users to use in ghci, so of course

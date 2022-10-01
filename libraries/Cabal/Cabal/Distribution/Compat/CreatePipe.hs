@@ -4,7 +4,10 @@
 
 module Distribution.Compat.CreatePipe (createPipe) where
 
-import System.IO (Handle, hSetEncoding, localeEncoding)
+#if MIN_VERSION_process(1,2,1)
+import System.Process (createPipe)
+#else
+import System.IO (Handle, hSetBinaryMode)
 
 import Prelude ()
 import Distribution.Compat.Prelude
@@ -40,11 +43,11 @@ createPipe = do
         return (readfd, writefd)
     (do readh <- fdToHandle readfd ReadMode
         writeh <- fdToHandle writefd WriteMode
-        hSetEncoding readh localeEncoding
-        hSetEncoding writeh localeEncoding
+        hSetBinaryMode readh True
+        hSetBinaryMode writeh True
         return (readh, writeh)) `onException` (close readfd >> close writefd)
   where
-    fdToHandle :: CInt -> IOMode -> NoCallStackIO Handle
+    fdToHandle :: CInt -> IOMode -> IO Handle
     fdToHandle fd mode = do
         (fd', deviceType) <- mkFD fd mode (Just (Stream, 0, 0)) False False
         mkHandleFromFD fd' deviceType "" mode False Nothing
@@ -69,9 +72,10 @@ createPipe = do
     (readfd, writefd) <- Posix.createPipe
     readh <- fdToHandle readfd
     writeh <- fdToHandle writefd
-    hSetEncoding readh localeEncoding
-    hSetEncoding writeh localeEncoding
+    hSetBinaryMode readh True
+    hSetBinaryMode writeh True
     return (readh, writeh)
   where
     _ = callStack
+#endif
 #endif

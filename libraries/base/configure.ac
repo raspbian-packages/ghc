@@ -6,16 +6,12 @@ AC_CONFIG_SRCDIR([include/HsBase.h])
 
 AC_CONFIG_HEADERS([include/HsBaseConfig.h include/EventConfig.h])
 
-AC_CANONICAL_BUILD
-AC_CANONICAL_HOST
-AC_CANONICAL_TARGET
-
 AC_PROG_CC
 dnl make extensions visible to allow feature-tests to detect them lateron
 AC_USE_SYSTEM_EXTENSIONS
 
 AC_MSG_CHECKING(for WINDOWS platform)
-case $host in
+case $host_alias in
     *mingw32*|*mingw64*|*cygwin*|*msys*)
         WINDOWS=YES;;
     *)
@@ -26,18 +22,15 @@ AC_MSG_RESULT($WINDOWS)
 # do we have long longs?
 AC_CHECK_TYPES([long long])
 
-dnl ** check for full ANSI header (.h) files
-AC_HEADER_STDC
-
 # check for specific header (.h) files that we are interested in
-AC_CHECK_HEADERS([ctype.h errno.h fcntl.h inttypes.h limits.h signal.h sys/file.h sys/resource.h sys/select.h sys/stat.h sys/syscall.h sys/time.h sys/timeb.h sys/timers.h sys/times.h sys/types.h sys/utsname.h sys/wait.h termios.h time.h unistd.h utime.h windows.h winsock.h langinfo.h poll.h sys/epoll.h sys/event.h sys/eventfd.h])
+AC_CHECK_HEADERS([ctype.h errno.h fcntl.h inttypes.h limits.h signal.h sys/file.h sys/resource.h sys/select.h sys/stat.h sys/syscall.h sys/time.h sys/timeb.h sys/timers.h sys/times.h sys/types.h sys/utsname.h sys/wait.h termios.h time.h unistd.h utime.h windows.h winsock.h langinfo.h poll.h sys/epoll.h sys/event.h sys/eventfd.h sys/socket.h])
 
 # Enable large file support. Do this before testing the types ino_t, off_t, and
 # rlim_t, because it will affect the result of that test.
 AC_SYS_LARGEFILE
 
 dnl ** check for wide-char classifications
-dnl FreeBSD has an emtpy wctype.h, so test one of the affected
+dnl FreeBSD has an empty wctype.h, so test one of the affected
 dnl functions if it's really there.
 AC_CHECK_HEADERS([wctype.h], [AC_CHECK_FUNCS(iswspace)])
 
@@ -72,6 +65,9 @@ fi
 # Linux open file descriptor locks
 AC_CHECK_DECL([F_OFD_SETLK], [
   AC_DEFINE([HAVE_OFD_LOCKING], [1], [Define if you have open file descriptor lock support.])
+], [], [
+  #include <unistd.h>
+  #include <fcntl.h>
 ])
 
 # flock
@@ -101,13 +97,13 @@ dnl * Deal with arguments telling us iconv is somewhere odd
 dnl--------------------------------------------------------------------
 
 AC_ARG_WITH([iconv-includes],
-  [AC_HELP_STRING([--with-iconv-includes],
+  [AS_HELP_STRING([--with-iconv-includes],
     [directory containing iconv.h])],
     [ICONV_INCLUDE_DIRS=$withval; CPPFLAGS="-I$withval $CPPFLAGS"],
     [ICONV_INCLUDE_DIRS=])
 
 AC_ARG_WITH([iconv-libraries],
-  [AC_HELP_STRING([--with-iconv-libraries],
+  [AS_HELP_STRING([--with-iconv-libraries],
     [directory containing iconv library])],
     [ICONV_LIB_DIRS=$withval; LDFLAGS="-L$withval $LDFLAGS"],
     [ICONV_LIB_DIRS=])
@@ -168,6 +164,8 @@ FPTOOLS_CHECK_HTYPE(fsfilcnt_t)
 FPTOOLS_CHECK_HTYPE(id_t)
 FPTOOLS_CHECK_HTYPE(key_t)
 FPTOOLS_CHECK_HTYPE(timer_t)
+FPTOOLS_CHECK_HTYPE(socklen_t)
+FPTOOLS_CHECK_HTYPE(nfds_t)
 
 FPTOOLS_CHECK_HTYPE(intptr_t)
 FPTOOLS_CHECK_HTYPE(uintptr_t)
@@ -233,8 +231,6 @@ AS_IF([test "x$with_libcharset" != xno],
 
 fi
 
-# Hack - md5.h needs HsFFI.h.  Is there a better way to do this?
-CFLAGS="-I../.. -I../../../../includes $CFLAGS"
 dnl Calling AC_CHECK_TYPE(T) makes AC_CHECK_SIZEOF(T) abort on failure
 dnl instead of considering sizeof(T) as 0.
 AC_CHECK_TYPE([struct MD5Context], [], [AC_MSG_ERROR([internal error])], [#include "include/md5.h"])

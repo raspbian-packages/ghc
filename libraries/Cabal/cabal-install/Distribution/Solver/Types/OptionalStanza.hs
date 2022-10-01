@@ -6,12 +6,10 @@ module Distribution.Solver.Types.OptionalStanza
     , enableStanzas
     ) where
 
-import GHC.Generics (Generic)
-import Data.Typeable
-import Distribution.Compat.Binary (Binary(..))
+import Distribution.Solver.Compat.Prelude
+import Prelude ()
 import Distribution.Types.ComponentRequestedSpec
             (ComponentRequestedSpec(..), defaultComponentRequestedSpec)
-import Data.List (foldl')
 
 data OptionalStanza
     = TestStanzas
@@ -32,3 +30,4 @@ enableStanzas = foldl' addStanza defaultComponentRequestedSpec
     addStanza enabled BenchStanzas = enabled { benchmarksRequested = True }
 
 instance Binary OptionalStanza
+instance Structured OptionalStanza

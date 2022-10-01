@@ -12,7 +12,6 @@ module Distribution.Pretty (
     Separator,
     ) where
 
-import Data.Functor.Identity         (Identity (..))
 import Distribution.CabalSpecVersion
 import Distribution.Compat.Prelude
 import Prelude ()
@@ -24,6 +23,10 @@ class Pretty a where
 
     prettyVersioned :: CabalSpecVersion -> a -> PP.Doc
     prettyVersioned _ = pretty
+
+-- | @since 3.4.0.0
+instance Pretty PP.Doc where
+    pretty = id
 
 instance Pretty Bool where
     pretty = PP.text . show

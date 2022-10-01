@@ -10,10 +10,12 @@ GenericPackageDescription
                                                condBranchIfTrue = CondNode
                                                                     {condTreeComponents = [],
                                                                      condTreeConstraints = [Dependency
-                                                                                              `PackageName "unix"`
-                                                                                              AnyVersion
-                                                                                              (Set.fromList
-                                                                                                 [LMainLibName])],
+                                                                                              (PackageName
+                                                                                                 "unix")
+                                                                                              (OrLaterVersion
+                                                                                                 (mkVersion
+                                                                                                    [0]))
+                                                                                              mainLibSet],
                                                                      condTreeData = Library
                                                                                       {exposedModules = [],
                                                                                        libBuildInfo = BuildInfo
@@ -67,10 +69,12 @@ GenericPackageDescription
                                                                                                                            []
                                                                                                                            [],
                                                                                                          targetBuildDepends = [Dependency
-                                                                                                                                 `PackageName "unix"`
-                                                                                                                                 AnyVersion
-                                                                                                                                 (Set.fromList
-                                                                                                                                    [LMainLibName])],
+                                                                                                                                 (PackageName
+                                                                                                                                    "unix")
+                                                                                                                                 (OrLaterVersion
+                                                                                                                                    (mkVersion
+                                                                                                                                       [0]))
+                                                                                                                                 mainLibSet],
                                                                                                          virtualModules = []},
                                                                                        libExposed = True,
                                                                                        libName = LMainLibName,
@@ -79,7 +83,7 @@ GenericPackageDescription
                                                                                        signatures = []}}}],
                       condTreeConstraints = [],
                       condTreeData = Library
-                                       {exposedModules = [`ModuleName ["ElseIf"]`],
+                                       {exposedModules = [ModuleName "ElseIf"],
                                         libBuildInfo = BuildInfo
                                                          {asmOptions = [],
                                                           asmSources = [],
@@ -132,6 +136,7 @@ GenericPackageDescription
    condSubLibraries = [],
    condTestSuites = [],
    genPackageFlags = [],
+   gpdScannedVersion = Nothing,
    packageDescription = PackageDescription
                           {author = "",
                            benchmarks = [],
@@ -140,7 +145,7 @@ GenericPackageDescription
                            category = "",
                            copyright = "",
                            customFieldsPD = [],
-                           dataDir = "",
+                           dataDir = ".",
                            dataFiles = [],
                            description = "",
                            executables = [],
@@ -154,8 +159,7 @@ GenericPackageDescription
                            licenseRaw = Left NONE,
                            maintainer = "",
                            package = PackageIdentifier
-                                       {pkgName = `PackageName "elif"`,
-                                        pkgVersion = `mkVersion [0]`},
+                                       {pkgName = PackageName "elif", pkgVersion = mkVersion [0]},
                            pkgUrl = "",
                            setupBuildInfo = Nothing,
                            sourceRepos = [SourceRepo
@@ -165,8 +169,8 @@ GenericPackageDescription
                                              repoModule = Nothing,
                                              repoSubdir = Nothing,
                                              repoTag = Nothing,
-                                             repoType = Just Git}],
-                           specVersionRaw = Right (OrLaterVersion `mkVersion [1,10]`),
+                                             repoType = Just (KnownRepoType Git)}],
+                           specVersion = CabalSpecV1_10,
                            stability = "",
                            subLibraries = [],
                            synopsis = "The elif demo",

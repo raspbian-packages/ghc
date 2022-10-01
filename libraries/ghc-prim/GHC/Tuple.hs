@@ -28,8 +28,8 @@ data () = ()
 
 -- The desugarer uses 1-tuples,
 -- but "()" is already used up for 0-tuples
--- See Note [One-tuples] in TysWiredIn
-data Unit a = Unit a
+-- See Note [One-tuples] in GHC.Builtin.Types
+data Solo a = Solo a
 
 data (a,b) = (a,b)
 data (a,b,c) = (a,b,c)

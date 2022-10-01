@@ -5,13 +5,13 @@
 # This file is part of the GHC build system.
 #
 # To understand how the build system works and how to modify it, see
-#      http://ghc.haskell.org/trac/ghc/wiki/Building/Architecture
-#      http://ghc.haskell.org/trac/ghc/wiki/Building/Modifying
+#      https://gitlab.haskell.org/ghc/ghc/wikis/building/architecture
+#      https://gitlab.haskell.org/ghc/ghc/wikis/building/modifying
 #
 # -----------------------------------------------------------------------------
 
 
-define hs-suffix-way-rules  # args: $1 = dir,  $2 = distdir, $3 = way
+define hs-suffix-way-rules  # args: $1 = dir,  $2 = distdir, $3 = way, $4 = stage
 
 ifeq "$3 $$($1_$2_DYNAMIC_TOO)" "dyn YES"
 # We only want this rule to be used for Haskell sources, not for
@@ -106,7 +106,7 @@ else
 # [1] https://www.gnu.org/software/make/manual/make.html#Implicit-Rule-Search
 
 $$(foreach dir,$$($1_$2_HS_SRC_DIRS),\
-  $$(eval $$(call hs-suffix-way-rules-srcdir,$1,$2,$3,$$(dir))))
+  $$(eval $$(call hs-suffix-way-rules-srcdir,$1,$2,$3,$$(dir),$4)))
 
 
 ifneq "$$(BINDIST)" "YES"

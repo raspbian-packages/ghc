@@ -5,8 +5,8 @@
 # This file is part of the GHC build system.
 #
 # To understand how the build system works and how to modify it, see
-#      http://ghc.haskell.org/trac/ghc/wiki/Building/Architecture
-#      http://ghc.haskell.org/trac/ghc/wiki/Building/Modifying
+#      https://gitlab.haskell.org/ghc/ghc/wikis/building/architecture
+#      https://gitlab.haskell.org/ghc/ghc/wikis/building/modifying
 #
 # -----------------------------------------------------------------------------
 
@@ -22,10 +22,11 @@ CABAL_CONSTRAINT := --constraint="Cabal == $(CABAL_DOTTED_VERSION)"
 # generate MIN_VERSION_<pkgname>() CPP macros. The generation of those
 # macros is triggered by `-hide-all-packages`, so we have to explicitly
 # enumerate all packages we need in scope.
+CABAL_BUILD_DEPS := ghc-prim base binary array transformers time containers bytestring deepseq process pretty directory filepath template-haskell
 ifeq "$(Windows_Host)" "YES"
-CABAL_BUILD_DEPS := ghc-prim base array transformers time containers bytestring deepseq process pretty directory filepath Win32 template-haskell
+CABAL_BUILD_DEPS += Win32
 else
-CABAL_BUILD_DEPS := ghc-prim base array transformers time containers bytestring deepseq process pretty directory filepath unix template-haskell
+CABAL_BUILD_DEPS += unix
 endif
 
 ghc-cabal_DIST_BINARY_NAME = ghc-cabal$(exeext0)
@@ -52,17 +53,21 @@ $(ghc-cabal_DIST_BINARY): $(wildcard libraries/Cabal/Cabal/Distribution/*/*/*.hs
 $(ghc-cabal_DIST_BINARY): $(wildcard libraries/Cabal/Cabal/Distribution/*/*.hs)
 $(ghc-cabal_DIST_BINARY): $(wildcard libraries/Cabal/Cabal/Distribution/*.hs)
 
+# N.B. Compile with -O0 since this is not a performance-critical executable
+# and the Cabal takes nearly twice as long to build with -O1. See #16817.
 $(ghc-cabal_DIST_BINARY): $(CABAL_LEXER_DEP) utils/ghc-cabal/Main.hs $(TOUCH_DEP) | $$(dir $$@)/. bootstrapping/.
 	"$(GHC)" $(SRC_HC_OPTS) \
 	       $(addprefix -optc, $(SRC_CC_OPTS) $(CONF_CC_OPTS_STAGE0)) \
 	       $(addprefix -optl, $(SRC_LD_OPTS) $(CONF_GCC_LINKER_OPTS_STAGE0)) \
+		   -O0 \
+		   -XHaskell2010 \
 	       -hide-all-packages \
+	       -package-env - \
 	       $(addprefix -package , $(CABAL_BUILD_DEPS)) \
 	       --make utils/ghc-cabal/Main.hs -o $@ \
-	       -no-user-$(GHC_PACKAGE_DB_FLAG) \
+	       -no-user-package-db \
 	       -Wall -fno-warn-unused-imports -fno-warn-warnings-deprecations \
 	       -DCABAL_VERSION=$(CABAL_VERSION) \
-	       -DCABAL_PARSEC \
 	       -DBOOTSTRAPPING \
 	       -odir  bootstrapping \
 	       -hidir bootstrapping \
@@ -72,7 +77,7 @@ $(ghc-cabal_DIST_BINARY): $(CABAL_LEXER_DEP) utils/ghc-cabal/Main.hs $(TOUCH_DEP
 	       -ilibraries/filepath \
 	       -ilibraries/hpc \
 	       -ilibraries/mtl \
-	       -ilibraries/text \
+	       -ilibraries/text/src \
 	       libraries/text/cbits/cbits.c \
 	       -Ilibraries/text/include \
 	       -ilibraries/parsec/src \

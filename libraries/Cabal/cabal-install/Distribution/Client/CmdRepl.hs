@@ -12,7 +12,7 @@ module Distribution.Client.CmdRepl (
     replAction,
 
     -- * Internals exposed for testing
-    TargetProblem(..),
+    matchesMultipleProblem,
     selectPackageTargets,
     selectComponentTarget
   ) where
@@ -23,32 +23,39 @@ import Distribution.Client.Compat.Prelude
 import Distribution.Compat.Lens
 import qualified Distribution.Types.Lens as L
 
+import Distribution.Client.NixStyleOptions
+         ( NixStyleFlags (..), nixStyleOptions, defaultNixStyleFlags )
 import Distribution.Client.CmdErrorMessages
-import Distribution.Client.CmdInstall
-         ( establishDummyProjectBaseContext )
+         ( renderTargetSelector, showTargetSelector,
+           renderTargetProblem,
+           targetSelectorRefersToPkgs,
+           renderComponentKind, renderListCommaAnd, renderListSemiAnd,
+           componentKind, sortGroupOn, Plural(..) )
+import Distribution.Client.TargetProblem
+         ( TargetProblem(..) )
 import qualified Distribution.Client.InstallPlan as InstallPlan
 import Distribution.Client.ProjectBuilding
          ( rebuildTargetsDryRun, improveInstallPlanWithUpToDatePackages )
 import Distribution.Client.ProjectConfig
          ( ProjectConfig(..), withProjectOrGlobalConfig
-         , projectConfigConfigFile, readGlobalConfig )
+         , projectConfigConfigFile )
+import Distribution.Client.ProjectFlags
+         ( flagIgnoreProject )
 import Distribution.Client.ProjectOrchestration
-import Distribution.Client.ProjectPlanning 
+import Distribution.Client.ProjectPlanning
        ( ElaboratedSharedConfig(..), ElaboratedInstallPlan )
 import Distribution.Client.ProjectPlanning.Types
        ( elabOrderExeDependencies )
-import Distribution.Client.RebuildMonad
-         ( runRebuild )
 import Distribution.Client.Setup
-         ( GlobalFlags, ConfigFlags(..), ConfigExFlags, InstallFlags )
+         ( GlobalFlags, ConfigFlags(..) )
 import qualified Distribution.Client.Setup as Client
 import Distribution.Client.Types
          ( PackageLocation(..), PackageSpecifier(..), UnresolvedSourcePackage )
 import Distribution.Simple.Setup
-         ( HaddockFlags, TestFlags, fromFlagOrDefault, replOptions
-         , Flag(..), toFlag, trueArg, falseArg )
+         ( fromFlagOrDefault, replOptions
+         , Flag(..), toFlag, falseArg )
 import Distribution.Simple.Command
-         ( CommandUI(..), liftOption, usageAlternatives, option
+         ( CommandUI(..), liftOptionL, usageAlternatives, option
          , ShowOrParseArgs, OptionField, reqArg )
 import Distribution.Compiler
          ( CompilerFlavor(GHC) )
@@ -58,9 +65,7 @@ import Distribution.Package
          ( Package(..), packageName, UnitId, installedUnitId )
 import Distribution.PackageDescription.PrettyPrint
 import Distribution.Parsec
-         ( Parsec(..), parsecCommaList )
-import Distribution.Pretty
-         ( prettyShow )
+         ( parsecCommaList )
 import Distribution.ReadE
          ( ReadE, parsecToReadE )
 import qualified Distribution.SPDX.License as SPDX
@@ -73,11 +78,9 @@ import Distribution.Types.ComponentName
 import Distribution.Types.CondTree
          ( CondTree(..), traverseCondTreeC )
 import Distribution.Types.Dependency
-         ( Dependency(..) )
+         ( Dependency(..), mainLibSet )
 import Distribution.Types.GenericPackageDescription
          ( emptyGenericPackageDescription )
-import Distribution.Types.LibraryName
-         ( LibraryName(..) )
 import Distribution.Types.PackageDescription
          ( PackageDescription(..), emptyPackageDescription )
 import Distribution.Types.PackageName.Magic
@@ -88,14 +91,16 @@ import Distribution.Types.Version
          ( mkVersion )
 import Distribution.Types.VersionRange
          ( anyVersion )
-import Distribution.Deprecated.Text
-         ( display )
+import Distribution.Utils.Generic
+         ( safeHead )
 import Distribution.Verbosity
-         ( Verbosity, normal, lessVerbose )
+         ( normal, lessVerbose )
 import Distribution.Simple.Utils
          ( wrapText, die', debugNoWrap, ordNub, createTempDirectory, handleDoesNotExist )
 import Language.Haskell.Extension
          ( Language(..) )
+import Distribution.CabalSpecVersion
+         ( CabalSpecVersion (..) )
 
 import Data.List
          ( (\\) )
@@ -108,42 +113,36 @@ import System.FilePath
 
 type ReplFlags = [String]
 
-data EnvFlags = EnvFlags 
+data EnvFlags = EnvFlags
   { envPackages :: [Dependency]
   , envIncludeTransitive :: Flag Bool
-  , envIgnoreProject :: Flag Bool
   }
 
 defaultEnvFlags :: EnvFlags
 defaultEnvFlags = EnvFlags
   { envPackages = []
   , envIncludeTransitive = toFlag True
-  , envIgnoreProject = toFlag False
   }
 
 envOptions :: ShowOrParseArgs -> [OptionField EnvFlags]
 envOptions _ =
   [ option ['b'] ["build-depends"]
-    "Include an additional package in the environment presented to GHCi."
+    "Include additional packages in the environment presented to GHCi."
     envPackages (\p flags -> flags { envPackages = p ++ envPackages flags })
-    (reqArg "DEPENDENCY" dependencyReadE (fmap prettyShow :: [Dependency] -> [String]))
+    (reqArg "DEPENDENCIES" dependenciesReadE (fmap prettyShow :: [Dependency] -> [String]))
   , option [] ["no-transitive-deps"]
     "Don't automatically include transitive dependencies of requested packages."
     envIncludeTransitive (\p flags -> flags { envIncludeTransitive = p })
     falseArg
-  , option ['z'] ["ignore-project"]
-    "Only include explicitly specified packages (and 'base')."
-    envIgnoreProject (\p flags -> flags { envIgnoreProject = p })
-    trueArg
   ]
   where
-    dependencyReadE :: ReadE [Dependency]
-    dependencyReadE =
+    dependenciesReadE :: ReadE [Dependency]
+    dependenciesReadE =
       parsecToReadE
-        ("couldn't parse dependency: " ++)
+        ("couldn't parse dependencies: " ++)
         (parsecCommaList parsec)
 
-replCommand :: CommandUI (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags, TestFlags, ReplFlags, EnvFlags)
+replCommand :: CommandUI (NixStyleFlags (ReplFlags, EnvFlags))
 replCommand = Client.installCommand {
   commandName         = "v2-repl",
   commandSynopsis     = "Open an interactive session for the given component.",
@@ -178,30 +177,13 @@ replCommand = Client.installCommand {
         ++ "(or no componentif there is no project present)\n"
      ++ "  " ++ pname ++ " v2-repl --build-depends \"lens >= 4.15 && < 4.18\"\n"
      ++ "    add a version (constrained between 4.15 and 4.18) of the library 'lens' "
-        ++ "to the default component (or no component if there is no project present)\n"
+        ++ "to the default component (or no component if there is no project present)\n",
 
-     ++ cmdCommonHelpTextNewBuildBeta,
-  commandDefaultFlags = (configFlags,configExFlags,installFlags,haddockFlags,testFlags,[],defaultEnvFlags),
-  commandOptions = \showOrParseArgs ->
-        map liftOriginal (commandOptions Client.installCommand showOrParseArgs)
-        ++ map liftReplOpts (replOptions showOrParseArgs)
-        ++ map liftEnvOpts  (envOptions  showOrParseArgs)
-   }
-  where
-    (configFlags,configExFlags,installFlags,haddockFlags,testFlags) = commandDefaultFlags Client.installCommand
-
-    liftOriginal = liftOption projectOriginal updateOriginal
-    liftReplOpts = liftOption projectReplOpts updateReplOpts
-    liftEnvOpts  = liftOption projectEnvOpts  updateEnvOpts
-
-    projectOriginal            (a,b,c,d,e,_,_) = (a,b,c,d,e)
-    updateOriginal (a,b,c,d,e) (_,_,_,_,_,f,g) = (a,b,c,d,e,f,g)
-
-    projectReplOpts  (_,_,_,_,_,f,_) = f
-    updateReplOpts f (a,b,c,d,e,_,g) = (a,b,c,d,e,f,g)
-
-    projectEnvOpts  (_,_,_,_,_,_,g) = g
-    updateEnvOpts g (a,b,c,d,e,f,_) = (a,b,c,d,e,f,g)
+  commandDefaultFlags = defaultNixStyleFlags ([], defaultEnvFlags),
+  commandOptions = nixStyleOptions $ \showOrParseArgs ->
+    map (liftOptionL _1) (replOptions showOrParseArgs) ++
+    map (liftOptionL _2) (envOptions showOrParseArgs)
+  }
 
 -- | The @repl@ command is very much like @build@. It brings the install plan
 -- up to date, selects that part of the plan needed by the given or implicit
@@ -214,20 +196,14 @@ replCommand = Client.installCommand {
 -- For more details on how this works, see the module
 -- "Distribution.Client.ProjectOrchestration"
 --
-replAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags, TestFlags, ReplFlags, EnvFlags)
-           -> [String] -> GlobalFlags -> IO ()
-replAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags, replFlags, envFlags)
-           targetStrings globalFlags = do
+replAction :: NixStyleFlags (ReplFlags, EnvFlags) -> [String] -> GlobalFlags -> IO ()
+replAction flags@NixStyleFlags { extraFlags = (replFlags, envFlags), ..} targetStrings globalFlags = do
     let
-      ignoreProject = fromFlagOrDefault False (envIgnoreProject envFlags)
       with           = withProject    cliConfig             verbosity targetStrings
       without config = withoutProject (config <> cliConfig) verbosity targetStrings
-    
-    (baseCtx, targetSelectors, finalizer, replType) <- if ignoreProject
-      then do
-        globalConfig <- runRebuild "" $ readGlobalConfig verbosity globalConfigFlag
-        without globalConfig
-      else withProjectOrGlobalConfig verbosity globalConfigFlag with without
+
+    (baseCtx, targetSelectors, finalizer, replType) <-
+      withProjectOrGlobalConfig verbosity ignoreProject globalConfigFlag with without
 
     when (buildSettingOnlyDeps (buildSettings baseCtx)) $
       die' verbosity $ "The repl command does not support '--only-dependencies'. "
@@ -241,39 +217,40 @@ replAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags, r
         -- help us resolve the targets, but that isn't ideal for performance,
         -- especially in the no-project case.
         withInstallPlan (lessVerbose verbosity) baseCtx $ \elaboratedPlan _ -> do
+          -- targets should be non-empty map, but there's no NonEmptyMap yet.
           targets <- validatedTargets elaboratedPlan targetSelectors
-          
+
           let
-            (unitId, _) = head $ Map.toList targets
+            (unitId, _) = fromMaybe (error "panic: targets should be non-empty") $ safeHead $ Map.toList targets
             originalDeps = installedUnitId <$> InstallPlan.directDeps elaboratedPlan unitId
             oci = OriginalComponentInfo unitId originalDeps
-            Just pkgId = packageId <$> InstallPlan.lookup elaboratedPlan unitId 
+            pkgId = fromMaybe (error $ "cannot find " ++ prettyShow unitId) $ packageId <$> InstallPlan.lookup elaboratedPlan unitId
             baseCtx' = addDepsToProjectTarget (envPackages envFlags) pkgId baseCtx
 
           return (Just oci, baseCtx')
-          
-    -- Now, we run the solver again with the added packages. While the graph 
+
+    -- Now, we run the solver again with the added packages. While the graph
     -- won't actually reflect the addition of transitive dependencies,
     -- they're going to be available already and will be offered to the REPL
     -- and that's good enough.
     --
-    -- In addition, to avoid a *third* trip through the solver, we are 
+    -- In addition, to avoid a *third* trip through the solver, we are
     -- replicating the second half of 'runProjectPreBuildPhase' by hand
     -- here.
     (buildCtx, replFlags'') <- withInstallPlan verbosity baseCtx' $
       \elaboratedPlan elaboratedShared' -> do
         let ProjectBaseContext{..} = baseCtx'
-          
+
         -- Recalculate with updated project.
         targets <- validatedTargets elaboratedPlan targetSelectors
 
-        let 
+        let
           elaboratedPlan' = pruneInstallPlanToTargets
                               TargetActionRepl
                               targets
                               elaboratedPlan
           includeTransitive = fromFlagOrDefault True (envIncludeTransitive envFlags)
-        
+
         pkgsBuildStatus <- rebuildTargetsDryRun distDirLayout elaboratedShared'
                                           elaboratedPlan'
 
@@ -281,26 +258,26 @@ replAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags, r
                                 pkgsBuildStatus elaboratedPlan'
         debugNoWrap verbosity (InstallPlan.showInstallPlan elaboratedPlan'')
 
-        let 
-          buildCtx = ProjectBuildContext 
+        let
+          buildCtx = ProjectBuildContext
             { elaboratedPlanOriginal = elaboratedPlan
             , elaboratedPlanToExecute = elaboratedPlan''
             , elaboratedShared = elaboratedShared'
             , pkgsBuildStatus
             , targetsMap = targets
             }
-          
+
           ElaboratedSharedConfig { pkgConfigCompiler = compiler } = elaboratedShared'
-          
+
           -- First version of GHC where GHCi supported the flag we need.
           -- https://downloads.haskell.org/~ghc/7.6.1/docs/html/users_guide/release-7-6-1.html
           minGhciScriptVersion = mkVersion [7, 6]
 
-          replFlags' = case originalComponent of 
+          replFlags' = case originalComponent of
             Just oci -> generateReplFlags includeTransitive elaboratedPlan' oci
             Nothing  -> []
           replFlags'' = case replType of
-            GlobalRepl scriptPath 
+            GlobalRepl scriptPath
               | Just version <- compilerCompatVersion GHC compiler
               , version >= minGhciScriptVersion -> ("-ghci-script" ++ scriptPath) : replFlags'
             _                                   -> replFlags'
@@ -318,13 +295,10 @@ replAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags, r
     finalizer
   where
     verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
-    cliConfig = commandLineFlagsToProjectConfig
-                  globalFlags configFlags configExFlags
-                  installFlags
-                  mempty -- ClientInstallFlags, not needed here
-                  haddockFlags testFlags
+    ignoreProject = flagIgnoreProject projectFlags
+    cliConfig = commandLineFlagsToProjectConfig globalFlags flags mempty -- ClientInstallFlags, not needed here
     globalConfigFlag = projectConfigConfigFile (projectConfigShared cliConfig)
-    
+
     validatedTargets elaboratedPlan targetSelectors = do
       -- Interpret the targets on the command line as repl targets
       -- (as opposed to say build or haddock targets).
@@ -332,7 +306,6 @@ replAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags, r
           $ resolveTargets
               selectPackageTargets
               selectComponentTarget
-              TargetProblemCommon
               elaboratedPlan
               Nothing
               targetSelectors
@@ -342,7 +315,7 @@ replAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags, r
       -- same component, but not two that live in different components.
       when (Set.size (distinctTargetComponents targets) > 1) $
         reportTargetProblems verbosity
-          [TargetProblemMultipleTargets targets]
+          [multipleTargetsProblem targets]
 
       return targets
 
@@ -353,7 +326,7 @@ data OriginalComponentInfo = OriginalComponentInfo
   deriving (Show)
 
 -- | Tracks what type of GHCi instance we're creating.
-data ReplType = ProjectRepl 
+data ReplType = ProjectRepl
               | GlobalRepl FilePath -- ^ The 'FilePath' argument is path to a GHCi
                                     --   script responsible for changing to the
                                     --   correct directory. Only works on GHC geq
@@ -382,17 +355,17 @@ withoutProject config verbosity extraArgs = do
   -- We need to create a dummy package that lives in our dummy project.
   let
     sourcePackage = SourcePackage
-      { packageInfoId        = pkgId
-      , packageDescription   = genericPackageDescription
-      , packageSource        = LocalUnpackedPackage tempDir
-      , packageDescrOverride = Nothing
+      { srcpkgPackageId     = pkgId
+      , srcpkgDescription   = genericPackageDescription
+      , srcpkgSource        = LocalUnpackedPackage tempDir
+      , srcpkgDescrOverride = Nothing
       }
-    genericPackageDescription = emptyGenericPackageDescription 
+    genericPackageDescription = emptyGenericPackageDescription
       & L.packageDescription .~ packageDescription
       & L.condLibrary        .~ Just (CondNode library [baseDep] [])
     packageDescription = emptyPackageDescription
       { package = pkgId
-      , specVersionRaw = Left (mkVersion [2, 2])
+      , specVersion = CabalSpecV2_2
       , licenseRaw = Left SPDX.NONE
       }
     library = emptyLibrary { libBuildInfo = buildInfo }
@@ -400,20 +373,21 @@ withoutProject config verbosity extraArgs = do
       { targetBuildDepends = [baseDep]
       , defaultLanguage = Just Haskell2010
       }
-    baseDep = Dependency "base" anyVersion (Set.singleton LMainLibName)
+    baseDep = Dependency "base" anyVersion mainLibSet
     pkgId = fakePackageId
 
   writeGenericPackageDescription (tempDir </> "fake-package.cabal") genericPackageDescription
-  
+
   let ghciScriptPath = tempDir </> "setcwd.ghci"
   cwd <- getCurrentDirectory
   writeFile ghciScriptPath (":cd " ++ cwd)
 
-  baseCtx <- 
+  distDirLayout <- establishDummyDistDirLayout verbosity config tempDir
+  baseCtx <-
     establishDummyProjectBaseContext
       verbosity
       config
-      tempDir
+      distDirLayout
       [SpecificSourcePackage sourcePackage]
       OtherCommand
 
@@ -427,7 +401,7 @@ addDepsToProjectTarget :: [Dependency]
                        -> PackageId
                        -> ProjectBaseContext
                        -> ProjectBaseContext
-addDepsToProjectTarget deps pkgId ctx = 
+addDepsToProjectTarget deps pkgId ctx =
     (\p -> ctx { localPackages = p }) . fmap addDeps . localPackages $ ctx
   where
     addDeps :: PackageSpecifier UnresolvedSourcePackage
@@ -435,8 +409,8 @@ addDepsToProjectTarget deps pkgId ctx =
     addDeps (SpecificSourcePackage pkg)
       | packageId pkg /= pkgId = SpecificSourcePackage pkg
       | SourcePackage{..} <- pkg =
-        SpecificSourcePackage $ pkg { packageDescription = 
-          packageDescription & (\f -> L.allCondTrees $ traverseCondTreeC f)
+        SpecificSourcePackage $ pkg { srcpkgDescription =
+          srcpkgDescription & (\f -> L.allCondTrees $ traverseCondTreeC f)
                             %~ (deps ++)
         }
     addDeps spec = spec
@@ -445,8 +419,8 @@ generateReplFlags :: Bool -> ElaboratedInstallPlan -> OriginalComponentInfo -> R
 generateReplFlags includeTransitive elaboratedPlan OriginalComponentInfo{..} = flags
   where
     exeDeps :: [UnitId]
-    exeDeps = 
-      foldMap 
+    exeDeps =
+      foldMap
         (InstallPlan.foldPlanPackage (const []) elabOrderExeDependencies)
         (InstallPlan.dependencyClosure elaboratedPlan [ociUnitId])
 
@@ -475,7 +449,7 @@ generateReplFlags includeTransitive elaboratedPlan OriginalComponentInfo{..} = f
 -- multiple libs or exes.
 --
 selectPackageTargets  :: TargetSelector
-                      -> [AvailableTarget k] -> Either TargetProblem [k]
+                      -> [AvailableTarget k] -> Either ReplTargetProblem [k]
 selectPackageTargets targetSelector targets
 
     -- If there is exactly one buildable library then we select that
@@ -484,7 +458,7 @@ selectPackageTargets targetSelector targets
 
     -- but fail if there are multiple buildable libraries.
   | not (null targetsLibsBuildable)
-  = Left (TargetProblemMatchesMultiple targetSelector targetsLibsBuildable')
+  = Left (matchesMultipleProblem targetSelector targetsLibsBuildable')
 
     -- If there is exactly one buildable executable then we select that
   | [target] <- targetsExesBuildable
@@ -492,7 +466,7 @@ selectPackageTargets targetSelector targets
 
     -- but fail if there are multiple buildable executables.
   | not (null targetsExesBuildable)
-  = Left (TargetProblemMatchesMultiple targetSelector targetsExesBuildable')
+  = Left (matchesMultipleProblem targetSelector targetsExesBuildable')
 
     -- If there is exactly one other target then we select that
   | [target] <- targetsBuildable
@@ -500,7 +474,7 @@ selectPackageTargets targetSelector targets
 
     -- but fail if there are multiple such targets
   | not (null targetsBuildable)
-  = Left (TargetProblemMatchesMultiple targetSelector targetsBuildable')
+  = Left (matchesMultipleProblem targetSelector targetsBuildable')
 
     -- If there are targets but none are buildable then we report those
   | not (null targets)
@@ -537,40 +511,43 @@ selectPackageTargets targetSelector targets
 -- For the @repl@ command we just need the basic checks on being buildable etc.
 --
 selectComponentTarget :: SubComponentTarget
-                      -> AvailableTarget k -> Either TargetProblem k
-selectComponentTarget subtarget =
-    either (Left . TargetProblemCommon) Right
-  . selectComponentTargetBasic subtarget
+                      -> AvailableTarget k -> Either ReplTargetProblem k
+selectComponentTarget = selectComponentTargetBasic
 
+
+data ReplProblem
+  = TargetProblemMatchesMultiple TargetSelector [AvailableTarget ()]
+
+    -- | Multiple 'TargetSelector's match multiple targets
+  | TargetProblemMultipleTargets TargetsMap
+  deriving (Eq, Show)
 
 -- | The various error conditions that can occur when matching a
 -- 'TargetSelector' against 'AvailableTarget's for the @repl@ command.
 --
-data TargetProblem =
-     TargetProblemCommon       TargetProblemCommon
+type ReplTargetProblem = TargetProblem ReplProblem
 
-     -- | The 'TargetSelector' matches targets but none are buildable
-   | TargetProblemNoneEnabled TargetSelector [AvailableTarget ()]
+matchesMultipleProblem
+  :: TargetSelector
+  -> [AvailableTarget ()]
+  -> ReplTargetProblem
+matchesMultipleProblem targetSelector targetsExesBuildable =
+  CustomTargetProblem $ TargetProblemMatchesMultiple targetSelector targetsExesBuildable
 
-     -- | There are no targets at all
-   | TargetProblemNoTargets   TargetSelector
+multipleTargetsProblem
+  :: TargetsMap
+  -> ReplTargetProblem
+multipleTargetsProblem = CustomTargetProblem . TargetProblemMultipleTargets
 
-     -- | A single 'TargetSelector' matches multiple targets
-   | TargetProblemMatchesMultiple TargetSelector [AvailableTarget ()]
-
-     -- | Multiple 'TargetSelector's match multiple targets
-   | TargetProblemMultipleTargets TargetsMap
-  deriving (Eq, Show)
-
-reportTargetProblems :: Verbosity -> [TargetProblem] -> IO a
+reportTargetProblems :: Verbosity -> [TargetProblem ReplProblem] -> IO a
 reportTargetProblems verbosity =
-    die' verbosity . unlines . map renderTargetProblem
+    die' verbosity . unlines . map renderReplTargetProblem
 
-renderTargetProblem :: TargetProblem -> String
-renderTargetProblem (TargetProblemCommon problem) =
-    renderTargetProblemCommon "open a repl for" problem
+renderReplTargetProblem :: TargetProblem ReplProblem -> String
+renderReplTargetProblem = renderTargetProblem "open a repl for" renderReplProblem
 
-renderTargetProblem (TargetProblemMatchesMultiple targetSelector targets) =
+renderReplProblem :: ReplProblem -> String
+renderReplProblem (TargetProblemMatchesMultiple targetSelector targets) =
     "Cannot open a repl for multiple components at once. The target '"
  ++ showTargetSelector targetSelector ++ "' refers to "
  ++ renderTargetSelector targetSelector ++ " which "
@@ -578,7 +555,7 @@ renderTargetProblem (TargetProblemMatchesMultiple targetSelector targets) =
  ++ renderListSemiAnd
       [ "the " ++ renderComponentKind Plural ckind ++ " " ++
         renderListCommaAnd
-          [ maybe (display pkgname) display (componentNameString cname)
+          [ maybe (prettyShow pkgname) prettyShow (componentNameString cname)
           | t <- ts
           , let cname   = availableTargetComponentName t
                 pkgname = packageName (availableTargetPackageId t)
@@ -590,7 +567,7 @@ renderTargetProblem (TargetProblemMatchesMultiple targetSelector targets) =
     availableTargetComponentKind = componentKind
                                  . availableTargetComponentName
 
-renderTargetProblem (TargetProblemMultipleTargets selectorMap) =
+renderReplProblem (TargetProblemMultipleTargets selectorMap) =
     "Cannot open a repl for multiple components at once. The targets "
  ++ renderListCommaAnd
       [ "'" ++ showTargetSelector ts ++ "'"
@@ -598,16 +575,8 @@ renderTargetProblem (TargetProblemMultipleTargets selectorMap) =
  ++ " refer to different components."
  ++ ".\n\n" ++ explanationSingleComponentLimitation
 
-renderTargetProblem (TargetProblemNoneEnabled targetSelector targets) =
-    renderTargetProblemNoneEnabled "open a repl for" targetSelector targets
-
-renderTargetProblem (TargetProblemNoTargets targetSelector) =
-    renderTargetProblemNoTargets "open a repl for" targetSelector
-
-
 explanationSingleComponentLimitation :: String
 explanationSingleComponentLimitation =
     "The reason for this limitation is that current versions of ghci do not "
  ++ "support loading multiple components as source. Load just one component "
  ++ "and when you make changes to a dependent component then quit and reload."
-

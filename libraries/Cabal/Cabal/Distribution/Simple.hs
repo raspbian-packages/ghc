@@ -1,6 +1,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE CPP #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Simple
@@ -61,10 +62,10 @@ import Prelude ()
 import Distribution.Compat.Prelude
 
 -- local
-import Distribution.Simple.Compiler hiding (Flag)
+import Distribution.Simple.Compiler
 import Distribution.Simple.UserHooks
 import Distribution.Package
-import Distribution.PackageDescription hiding (Flag)
+import Distribution.PackageDescription
 import Distribution.PackageDescription.Configuration
 import Distribution.Simple.Program
 import Distribution.Simple.Program.Db
@@ -98,8 +99,11 @@ import Distribution.System (buildPlatform)
 import System.Environment (getArgs, getProgName)
 import System.Directory   (removeFile, doesFileExist
                           ,doesDirectoryExist, removeDirectoryRecursive)
-import System.Exit                          (exitWith,ExitCode(..))
-import System.FilePath                      (searchPathSeparator, takeDirectory, (</>), splitDirectories, dropDrive)
+import System.FilePath    (searchPathSeparator, takeDirectory, (</>),
+                           splitDirectories, dropDrive)
+#ifdef mingw32_HOST_OS
+import System.FilePath    (normalise, splitDrive)
+#endif
 import Distribution.Compat.ResponseFile (expandResponse)
 import Distribution.Compat.Directory        (makeAbsolute)
 import Distribution.Compat.Environment      (getEnvironment)
@@ -413,31 +417,12 @@ installAction hooks flags args = do
                  (getBuildConfig hooks verbosity distPref)
                  hooks flags' args
 
+-- Since Cabal-3.4 UserHooks are completely ignored
 sdistAction :: UserHooks -> SDistFlags -> Args -> IO ()
-sdistAction hooks flags _args = do
-    distPref <- findDistPrefOrDefault (sDistDistPref flags)
-    let pbi   = emptyHookedBuildInfo
-
-    mlbi <- maybeGetPersistBuildConfig distPref
-
-    -- NB: It would be TOTALLY WRONG to use the 'PackageDescription'
-    -- store in the 'LocalBuildInfo' for the rest of @sdist@, because
-    -- that would result in only the files that would be built
-    -- according to the user's configure being packaged up.
-    -- In fact, it is not obvious why we need to read the
-    -- 'LocalBuildInfo' in the first place, except that we want
-    -- to do some architecture-independent preprocessing which
-    -- needs to be configured.  This is totally awful, see
-    -- GH#130.
-
-    (_, ppd) <- confPkgDescr hooks verbosity Nothing
-
-    let pkg_descr0 = flattenPackageDescription ppd
-    sanityCheckHookedBuildInfo verbosity pkg_descr0 pbi
-    let pkg_descr = updatePackageDescription pbi pkg_descr0
-        mlbi' = fmap (\lbi -> lbi { localPkgDescr = pkg_descr }) mlbi
-
-    sdist pkg_descr mlbi' flags srcPref (allSuffixHandlers hooks)
+sdistAction _hooks flags _args = do
+    (_, ppd) <- confPkgDescr emptyUserHooks verbosity Nothing
+    let pkg_descr = flattenPackageDescription ppd
+    sdist pkg_descr flags srcPref knownSuffixHandlers
   where
     verbosity = fromFlag (sDistVerbosity flags)
 
@@ -524,9 +509,9 @@ sanityCheckHookedBuildInfo verbosity
       ++ "but the package does not have a library."
 
 sanityCheckHookedBuildInfo verbosity pkg_descr (_, hookExes)
-    | not (null nonExistant)
+    | exe1 : _ <- nonExistant
     = die' verbosity $ "The buildinfo contains info for an executable called '"
-      ++ prettyShow (head nonExistant) ++ "' but the package does not have a "
+      ++ prettyShow exe1 ++ "' but the package does not have a "
       ++ "executable with that name."
   where
     pkgExeNames  = nub (map exeName (executables pkg_descr))
@@ -606,7 +591,7 @@ clean pkg_descr flags = do
     traverse_ (writePersistBuildConfig distPref) maybeConfig
 
   where
-        removeFileOrDirectory :: FilePath -> NoCallStackIO ()
+        removeFileOrDirectory :: FilePath -> IO ()
         removeFileOrDirectory fname = do
             isDir <- doesDirectoryExist fname
             isFile <- doesFileExist fname
@@ -737,14 +722,16 @@ runConfigureScript verbosity backwardsCompatHack flags lbi = do
   -- TODO: We don't check for colons, tildes or leading dashes. We
   -- also should check the builddir's path, destdir, and all other
   -- paths as well.
-  let configureFile' = intercalate "/" $ splitDirectories configureFile
+  let configureFile' = toUnix configureFile
   for_ badAutoconfCharacters $ \(c, cname) ->
     when (c `elem` dropDrive configureFile') $
-      warn verbosity $
-           "The path to the './configure' script, '" ++ configureFile'
-        ++ "', contains the character '" ++ [c] ++ "' (" ++ cname ++ ")."
-        ++ " This may cause the script to fail with an obscure error, or for"
-        ++ " building the package to fail later."
+      warn verbosity $ concat
+        [ "The path to the './configure' script, '", configureFile'
+        , "', contains the character '", [c], "' (", cname, ")."
+        , " This may cause the script to fail with an obscure error, or for"
+        , " building the package to fail later."
+        ]
+
   let extraPath = fromNubList $ configProgramPathExtra flags
   let cflagsEnv = maybe (unwords ccFlags) (++ (" " ++ unwords ccFlags))
                   $ lookup "CFLAGS" env
@@ -766,39 +753,52 @@ runConfigureScript verbosity backwardsCompatHack flags lbi = do
                  (programInvocation (sh {programOverrideEnv = overEnv}) args')
                  { progInvokeCwd = Just (buildDir lbi) }
       Nothing -> die' verbosity notFoundMsg
-
   where
     args = configureArgs backwardsCompatHack flags
-
-    badAutoconfCharacters =
-      [ (' ', "space")
-      , ('\t', "tab")
-      , ('\n', "newline")
-      , ('\0', "null")
-      , ('"', "double quote")
-      , ('#', "hash")
-      , ('$', "dollar sign")
-      , ('&', "ampersand")
-      , ('\'', "single quote")
-      , ('(', "left bracket")
-      , (')', "right bracket")
-      , ('*', "star")
-      , (';', "semicolon")
-      , ('<', "less-than sign")
-      , ('=', "equals sign")
-      , ('>', "greater-than sign")
-      , ('?', "question mark")
-      , ('[', "left square bracket")
-      , ('\\', "backslash")
-      , ('`', "backtick")
-      , ('|', "pipe")
-      ]
 
     notFoundMsg = "The package has a './configure' script. "
                ++ "If you are on Windows, This requires a "
                ++ "Unix compatibility toolchain such as MinGW+MSYS or Cygwin. "
                ++ "If you are not on Windows, ensure that an 'sh' command "
                ++ "is discoverable in your path."
+
+-- | Convert Windows path to Unix ones
+toUnix :: String -> String
+#ifdef mingw32_HOST_OS
+toUnix s = let tmp = normalise s
+               (l, rest) = case splitDrive tmp of
+                             ([],  x) -> ("/"      , x)
+                             (h:_, x) -> ('/':h:"/", x)
+               parts = splitDirectories rest
+           in  l ++ intercalate "/" parts
+#else
+toUnix s = intercalate "/" $ splitDirectories s
+#endif
+
+badAutoconfCharacters :: [(Char, String)]
+badAutoconfCharacters =
+  [ (' ', "space")
+  , ('\t', "tab")
+  , ('\n', "newline")
+  , ('\0', "null")
+  , ('"', "double quote")
+  , ('#', "hash")
+  , ('$', "dollar sign")
+  , ('&', "ampersand")
+  , ('\'', "single quote")
+  , ('(', "left bracket")
+  , (')', "right bracket")
+  , ('*', "star")
+  , (';', "semicolon")
+  , ('<', "less-than sign")
+  , ('=', "equals sign")
+  , ('>', "greater-than sign")
+  , ('?', "question mark")
+  , ('[', "left square bracket")
+  , ('\\', "backslash")
+  , ('`', "backtick")
+  , ('|', "pipe")
+  ]
 
 getHookedBuildInfo :: Verbosity -> FilePath -> IO HookedBuildInfo
 getHookedBuildInfo verbosity build_dir = do

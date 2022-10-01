@@ -5,8 +5,8 @@
 # This file is part of the GHC build system.
 #
 # To understand how the build system works and how to modify it, see
-#      http://ghc.haskell.org/trac/ghc/wiki/Building/Architecture
-#      http://ghc.haskell.org/trac/ghc/wiki/Building/Modifying
+#      https://gitlab.haskell.org/ghc/ghc/wikis/building/architecture
+#      https://gitlab.haskell.org/ghc/ghc/wikis/building/modifying
 #
 # -----------------------------------------------------------------------------
 
@@ -16,7 +16,7 @@ $(call trace, build-package-way($1,$2,$3))
 $(call profStart, build-package-way($1,$2,$3))
 
 $(call distdir-way-opts,$1,$2,$3,$4)
-$(call hs-suffix-way-rules,$1,$2,$3)
+$(call hs-suffix-way-rules,$1,$2,$3,$4)
 
 $(call hs-objs,$1,$2,$3)
 
@@ -74,12 +74,7 @@ else # ifneq "$3" "dyn"
 # Build the ordinary .a library
 $$($1_$2_$3_LIB) : $$($1_$2_$3_ALL_OBJS)
 	$$(call removeFiles,$$@ $$@.contents)
-ifeq "$$($1_$2_SplitObjs)" "YES"
-	$$(FIND) $$(patsubst %.$$($3_osuf),%_$$($3_osuf)_split,$$($1_$2_$3_HS_OBJS)) -name '*.$$($3_osuf)' -print >> $$@.contents
-	echo $$($1_$2_$3_NON_HS_OBJS) >> $$@.contents
-else
 	echo $$($1_$2_$3_ALL_OBJS) >> $$@.contents
-endif
 ifeq "$$($1_$2_ArSupportsAtFile)" "YES"
 	$$(call cmd,$1_$2_AR) $$($1_$2_AR_OPTS) $$($1_$2_EXTRA_AR_ARGS) $$@ @$$@.contents
 else
@@ -112,6 +107,7 @@ endif
 endif
 
 # Build the GHCi library
+# See Note [Merging object files for GHCi] in GHC.Driver.Pipeline.
 ifneq "$(filter $3, v p)" ""
 $1_$2_$3_GHCI_LIB = $1/$2/build/HS$$($1_$2_COMPONENT_ID).$$($3_osuf)
 ifeq "$$($1_$2_BUILD_GHCI_LIB)" "YES"
@@ -121,11 +117,7 @@ BINDIST_LIBS += $$($1_$2_$3_GHCI_LIB)
 endif
 endif
 $$($1_$2_$3_GHCI_LIB) : $$($1_$2_$3_HS_OBJS) $$($1_$2_$3_CMM_OBJS) $$($1_$2_$3_C_OBJS) $$($1_$2_$3_S_OBJS) $$($1_$2_EXTRA_OBJS) $$($1_$2_LD_SCRIPT)
-	$$(call cmd,LD_NO_GOLD) $$(CONF_LD_LINKER_OPTS_STAGE$4) -r $$(if $$($1_$2_LD_SCRIPT),$$($1_$2_LD_SCRIPT_CMD) $$($1_$2_LD_SCRIPT)) -o $$@ $$(EXTRA_LD_LINKER_OPTS) $$($1_$2_$3_HS_OBJS) $$($1_$2_$3_CMM_OBJS) $$($1_$2_$3_C_OBJS) $$($1_$2_$3_S_OBJS) $$($1_$2_EXTRA_OBJS)
-# NB. LD_NO_GOLD above: see #14328 (symptoms: #14675,#14291). At least
-# some versions of ld.gold appear to have a bug that causes the
-# generated GHCi library to have some bogus relocations. Performance
-# isn't critical here, so we fall back to the ordinary ld.
+	$$(call cmd,MERGE_OBJS_STAGE$4) $(MERGE_OBJS_STAGE$4_FLAGS) $$(if $$($1_$2_LD_SCRIPT),$$($1_$2_LD_SCRIPT_CMD) $$($1_$2_LD_SCRIPT)) -o $$@ $$(EXTRA_LD_LINKER_OPTS) $$($1_$2_$3_HS_OBJS) $$($1_$2_$3_CMM_OBJS) $$($1_$2_$3_C_OBJS) $$($1_$2_$3_S_OBJS) $$($1_$2_EXTRA_OBJS)
 ifeq "$$($1_$2_BUILD_GHCI_LIB)" "YES"
 # Don't bother making ghci libs for bootstrapping packages
 ifneq "$4" "0"

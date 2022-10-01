@@ -1,4 +1,4 @@
-{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE RecordWildCards #-}
 
 -- | cabal-install CLI command: bench
 --
@@ -8,33 +8,38 @@ module Distribution.Client.CmdBench (
     benchAction,
 
     -- * Internals exposed for testing
-    TargetProblem(..),
+    componentNotBenchmarkProblem,
+    isSubComponentProblem,
+    noBenchmarksProblem,
     selectPackageTargets,
     selectComponentTarget
   ) where
 
+import Distribution.Client.Compat.Prelude
+import Prelude ()
+
 import Distribution.Client.ProjectOrchestration
 import Distribution.Client.CmdErrorMessages
-
+         ( renderTargetSelector, showTargetSelector, renderTargetProblem,
+           renderTargetProblemNoTargets, plural, targetSelectorPluralPkgs,
+           targetSelectorFilter )
+import Distribution.Client.TargetProblem
+         ( TargetProblem (..) )
+import Distribution.Client.NixStyleOptions
+         ( NixStyleFlags (..), nixStyleOptions, defaultNixStyleFlags )
 import Distribution.Client.Setup
-         ( GlobalFlags, ConfigFlags(..), ConfigExFlags, InstallFlags )
-import qualified Distribution.Client.Setup as Client
-import Distribution.Simple.Setup
-         ( HaddockFlags, TestFlags, fromFlagOrDefault )
+         ( GlobalFlags, ConfigFlags(..) )
+import Distribution.Simple.Flag
+         ( fromFlagOrDefault )
 import Distribution.Simple.Command
          ( CommandUI(..), usageAlternatives )
-import Distribution.Deprecated.Text
-         ( display )
 import Distribution.Verbosity
-         ( Verbosity, normal )
+         ( normal )
 import Distribution.Simple.Utils
          ( wrapText, die' )
 
-import Control.Monad (when)
-
-
-benchCommand :: CommandUI (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags, TestFlags)
-benchCommand = Client.installCommand {
+benchCommand :: CommandUI (NixStyleFlags ())
+benchCommand = CommandUI {
   commandName         = "v2-bench",
   commandSynopsis     = "Run benchmarks",
   commandUsage        = usageAlternatives "v2-bench" [ "[TARGETS] [FLAGS]" ],
@@ -60,9 +65,10 @@ benchCommand = Client.installCommand {
      ++ "  " ++ pname ++ " v2-bench cname\n"
      ++ "    Run the benchmark named cname\n"
      ++ "  " ++ pname ++ " v2-bench cname -O2\n"
-     ++ "    Run the benchmark built with '-O2' (including local libs used)\n\n"
+     ++ "    Run the benchmark built with '-O2' (including local libs used)\n"
 
-     ++ cmdCommonHelpTextNewBuildBeta
+   , commandDefaultFlags = defaultNixStyleFlags ()
+   , commandOptions      = nixStyleOptions (const [])
    }
 
 
@@ -73,10 +79,8 @@ benchCommand = Client.installCommand {
 -- For more details on how this works, see the module
 -- "Distribution.Client.ProjectOrchestration"
 --
-benchAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags, TestFlags)
-            -> [String] -> GlobalFlags -> IO ()
-benchAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags)
-            targetStrings globalFlags = do
+benchAction :: NixStyleFlags () -> [String] -> GlobalFlags -> IO ()
+benchAction flags@NixStyleFlags {..} targetStrings globalFlags = do
 
     baseCtx <- establishProjectBaseContext verbosity cliConfig OtherCommand
 
@@ -98,7 +102,6 @@ benchAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags)
                      $ resolveTargets
                          selectPackageTargets
                          selectComponentTarget
-                         TargetProblemCommon
                          elaboratedPlan
                          Nothing
                          targetSelectors
@@ -115,11 +118,8 @@ benchAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags)
     runProjectPostBuildPhase verbosity baseCtx buildCtx buildOutcomes
   where
     verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
-    cliConfig = commandLineFlagsToProjectConfig
-                  globalFlags configFlags configExFlags
-                  installFlags
+    cliConfig = commandLineFlagsToProjectConfig globalFlags flags 
                   mempty -- ClientInstallFlags, not needed here
-                  haddockFlags testFlags
 
 -- | This defines what a 'TargetSelector' means for the @bench@ command.
 -- It selects the 'AvailableTarget's that the 'TargetSelector' refers to,
@@ -129,7 +129,7 @@ benchAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags)
 -- or fail if there are no benchmarks or no buildable benchmarks.
 --
 selectPackageTargets :: TargetSelector
-                     -> [AvailableTarget k] -> Either TargetProblem [k]
+                     -> [AvailableTarget k] -> Either BenchTargetProblem [k]
 selectPackageTargets targetSelector targets
 
     -- If there are any buildable benchmark targets then we select those
@@ -142,7 +142,7 @@ selectPackageTargets targetSelector targets
 
     -- If there are no benchmarks but some other targets then we report that
   | not (null targets)
-  = Left (TargetProblemNoBenchmarks targetSelector)
+  = Left (noBenchmarksProblem targetSelector)
 
     -- If there are no targets at all then we report that
   | otherwise
@@ -164,34 +164,27 @@ selectPackageTargets targetSelector targets
 -- to the basic checks on being buildable etc.
 --
 selectComponentTarget :: SubComponentTarget
-                      -> AvailableTarget k -> Either TargetProblem k
+                      -> AvailableTarget k -> Either BenchTargetProblem k
 selectComponentTarget subtarget@WholeComponent t
   | CBenchName _ <- availableTargetComponentName t
-  = either (Left . TargetProblemCommon) return $
-           selectComponentTargetBasic subtarget t
+  = selectComponentTargetBasic subtarget t
   | otherwise
-  = Left (TargetProblemComponentNotBenchmark (availableTargetPackageId t)
-                                             (availableTargetComponentName t))
+  = Left (componentNotBenchmarkProblem
+           (availableTargetPackageId t)
+           (availableTargetComponentName t))
 
 selectComponentTarget subtarget t
-  = Left (TargetProblemIsSubComponent (availableTargetPackageId t)
-                                      (availableTargetComponentName t)
-                                       subtarget)
+  = Left (isSubComponentProblem
+           (availableTargetPackageId t)
+           (availableTargetComponentName t)
+           subtarget)
 
 -- | The various error conditions that can occur when matching a
 -- 'TargetSelector' against 'AvailableTarget's for the @bench@ command.
 --
-data TargetProblem =
-     TargetProblemCommon        TargetProblemCommon
-
-     -- | The 'TargetSelector' matches benchmarks but none are buildable
-   | TargetProblemNoneEnabled  TargetSelector [AvailableTarget ()]
-
-     -- | There are no targets at all
-   | TargetProblemNoTargets    TargetSelector
-
+data BenchProblem =
      -- | The 'TargetSelector' matches targets but no benchmarks
-   | TargetProblemNoBenchmarks TargetSelector
+     TargetProblemNoBenchmarks TargetSelector
 
      -- | The 'TargetSelector' refers to a component that is not a benchmark
    | TargetProblemComponentNotBenchmark PackageId ComponentName
@@ -200,25 +193,30 @@ data TargetProblem =
    | TargetProblemIsSubComponent   PackageId ComponentName SubComponentTarget
   deriving (Eq, Show)
 
-reportTargetProblems :: Verbosity -> [TargetProblem] -> IO a
+
+type BenchTargetProblem = TargetProblem BenchProblem
+
+noBenchmarksProblem :: TargetSelector -> TargetProblem BenchProblem
+noBenchmarksProblem = CustomTargetProblem . TargetProblemNoBenchmarks
+
+componentNotBenchmarkProblem :: PackageId -> ComponentName -> TargetProblem BenchProblem
+componentNotBenchmarkProblem pkgid name = CustomTargetProblem $
+  TargetProblemComponentNotBenchmark pkgid name
+
+isSubComponentProblem
+  :: PackageId
+  -> ComponentName
+  -> SubComponentTarget
+  -> TargetProblem BenchProblem
+isSubComponentProblem pkgid name subcomponent = CustomTargetProblem $
+    TargetProblemIsSubComponent pkgid name subcomponent
+
+reportTargetProblems :: Verbosity -> [BenchTargetProblem] -> IO a
 reportTargetProblems verbosity =
-    die' verbosity . unlines . map renderTargetProblem
+    die' verbosity . unlines . map renderBenchTargetProblem
 
-renderTargetProblem :: TargetProblem -> String
-renderTargetProblem (TargetProblemCommon problem) =
-    renderTargetProblemCommon "run" problem
-
-renderTargetProblem (TargetProblemNoneEnabled targetSelector targets) =
-    renderTargetProblemNoneEnabled "benchmark" targetSelector targets
-
-renderTargetProblem (TargetProblemNoBenchmarks targetSelector) =
-    "Cannot run benchmarks for the target '" ++ showTargetSelector targetSelector
- ++ "' which refers to " ++ renderTargetSelector targetSelector
- ++ " because "
- ++ plural (targetSelectorPluralPkgs targetSelector) "it does" "they do"
- ++ " not contain any benchmarks."
-
-renderTargetProblem (TargetProblemNoTargets targetSelector) =
+renderBenchTargetProblem :: BenchTargetProblem -> String
+renderBenchTargetProblem (TargetProblemNoTargets targetSelector) =
     case targetSelectorFilter targetSelector of
       Just kind | kind /= BenchKind
         -> "The bench command is for running benchmarks, but the target '"
@@ -226,16 +224,26 @@ renderTargetProblem (TargetProblemNoTargets targetSelector) =
            ++ renderTargetSelector targetSelector ++ "."
 
       _ -> renderTargetProblemNoTargets "benchmark" targetSelector
+renderBenchTargetProblem problem =
+    renderTargetProblem "benchmark" renderBenchProblem problem
 
-renderTargetProblem (TargetProblemComponentNotBenchmark pkgid cname) =
+renderBenchProblem :: BenchProblem -> String
+renderBenchProblem (TargetProblemNoBenchmarks targetSelector) =
+    "Cannot run benchmarks for the target '" ++ showTargetSelector targetSelector
+ ++ "' which refers to " ++ renderTargetSelector targetSelector
+ ++ " because "
+ ++ plural (targetSelectorPluralPkgs targetSelector) "it does" "they do"
+ ++ " not contain any benchmarks."
+
+renderBenchProblem (TargetProblemComponentNotBenchmark pkgid cname) =
     "The bench command is for running benchmarks, but the target '"
  ++ showTargetSelector targetSelector ++ "' refers to "
  ++ renderTargetSelector targetSelector ++ " from the package "
- ++ display pkgid ++ "."
+ ++ prettyShow pkgid ++ "."
   where
     targetSelector = TargetComponent pkgid cname WholeComponent
 
-renderTargetProblem (TargetProblemIsSubComponent pkgid cname subtarget) =
+renderBenchProblem (TargetProblemIsSubComponent pkgid cname subtarget) =
     "The bench command can only run benchmarks as a whole, "
  ++ "not files or modules within them, but the target '"
  ++ showTargetSelector targetSelector ++ "' refers to "

@@ -17,22 +17,21 @@ import Prelude ()
 import Distribution.Client.Compat.Prelude
 
 import Distribution.Client.Types
-         ( Repo(..), RemoteRepo(..) )
+         ( Repo(..), unRepoName, RemoteRepo(..), LocalRepo (..), localRepoCacheKey )
 import Distribution.Simple.Setup
          ( Flag(..), fromFlag, flagToMaybe )
 import Distribution.Utils.NubList
          ( NubList, fromNubList )
 import Distribution.Client.HttpUtils
          ( HttpTransport, configureTransport )
-import Distribution.Verbosity
-         ( Verbosity )
 import Distribution.Simple.Utils
-         ( info )
+         ( info, warn )
+
+import Distribution.Client.IndexUtils.ActiveRepos
+         ( ActiveRepos )
 
 import Control.Concurrent
          ( MVar, newMVar, modifyMVar )
-import Control.Exception
-         ( throwIO )
 import System.FilePath
          ( (</>) )
 import Network.URI
@@ -48,58 +47,57 @@ import qualified Hackage.Security.Client.Repository.Remote  as Sec.Remote
 import qualified Distribution.Client.Security.HTTP          as Sec.HTTP
 import qualified Distribution.Client.Security.DNS           as Sec.DNS
 
+import qualified System.FilePath.Posix as FilePath.Posix
+
 -- ------------------------------------------------------------
 -- * Global flags
 -- ------------------------------------------------------------
 
 -- | Flags that apply at the top level, not to any sub-command.
-data GlobalFlags = GlobalFlags {
-    globalVersion           :: Flag Bool,
-    globalNumericVersion    :: Flag Bool,
-    globalConfigFile        :: Flag FilePath,
-    globalSandboxConfigFile :: Flag FilePath,
-    globalConstraintsFile   :: Flag FilePath,
-    globalRemoteRepos       :: NubList RemoteRepo,     -- ^ Available Hackage servers.
-    globalCacheDir          :: Flag FilePath,
-    globalLocalRepos        :: NubList FilePath,
-    globalLogsDir           :: Flag FilePath,
-    globalWorldFile         :: Flag FilePath,
-    globalRequireSandbox    :: Flag Bool,
-    globalIgnoreSandbox     :: Flag Bool,
-    globalIgnoreExpiry      :: Flag Bool,    -- ^ Ignore security expiry dates
-    globalHttpTransport     :: Flag String,
-    globalNix               :: Flag Bool,  -- ^ Integrate with Nix
-    globalStoreDir          :: Flag FilePath,
-    globalProgPathExtra     :: NubList FilePath -- ^ Extra program path used for packagedb lookups in a global context (i.e. for http transports)
-  } deriving Generic
+
+data GlobalFlags = GlobalFlags
+    { globalVersion           :: Flag Bool
+    , globalNumericVersion    :: Flag Bool
+    , globalConfigFile        :: Flag FilePath
+    , globalConstraintsFile   :: Flag FilePath
+    , globalRemoteRepos       :: NubList RemoteRepo     -- ^ Available Hackage servers.
+    , globalCacheDir          :: Flag FilePath
+    , globalLocalNoIndexRepos :: NubList LocalRepo
+    , globalActiveRepos       :: Flag ActiveRepos
+    , globalLogsDir           :: Flag FilePath
+    , globalWorldFile         :: Flag FilePath
+    , globalIgnoreExpiry      :: Flag Bool    -- ^ Ignore security expiry dates
+    , globalHttpTransport     :: Flag String
+    , globalNix               :: Flag Bool  -- ^ Integrate with Nix
+    , globalStoreDir          :: Flag FilePath
+    , globalProgPathExtra     :: NubList FilePath -- ^ Extra program path used for packagedb lookups in a global context (i.e. for http transports)
+    } deriving Generic
 
 defaultGlobalFlags :: GlobalFlags
-defaultGlobalFlags  = GlobalFlags {
-    globalVersion           = Flag False,
-    globalNumericVersion    = Flag False,
-    globalConfigFile        = mempty,
-    globalSandboxConfigFile = mempty,
-    globalConstraintsFile   = mempty,
-    globalRemoteRepos       = mempty,
-    globalCacheDir          = mempty,
-    globalLocalRepos        = mempty,
-    globalLogsDir           = mempty,
-    globalWorldFile         = mempty,
-    globalRequireSandbox    = Flag False,
-    globalIgnoreSandbox     = Flag False,
-    globalIgnoreExpiry      = Flag False,
-    globalHttpTransport     = mempty,
-    globalNix               = Flag False,
-    globalStoreDir          = mempty,
-    globalProgPathExtra     = mempty
-  }
+defaultGlobalFlags  = GlobalFlags
+    { globalVersion           = Flag False
+    , globalNumericVersion    = Flag False
+    , globalConfigFile        = mempty
+    , globalConstraintsFile   = mempty
+    , globalRemoteRepos       = mempty
+    , globalCacheDir          = mempty
+    , globalLocalNoIndexRepos = mempty
+    , globalActiveRepos       = mempty
+    , globalLogsDir           = mempty
+    , globalWorldFile         = mempty
+    , globalIgnoreExpiry      = Flag False
+    , globalHttpTransport     = mempty
+    , globalNix               = Flag False
+    , globalStoreDir          = mempty
+    , globalProgPathExtra     = mempty
+    }
 
 instance Monoid GlobalFlags where
-  mempty = gmempty
-  mappend = (<>)
+    mempty = gmempty
+    mappend = (<>)
 
 instance Semigroup GlobalFlags where
-  (<>) = gmappend
+    (<>) = gmappend
 
 -- ------------------------------------------------------------
 -- * Repo context
@@ -141,20 +139,24 @@ withRepoContext :: Verbosity -> GlobalFlags -> (RepoContext -> IO a) -> IO a
 withRepoContext verbosity globalFlags =
     withRepoContext'
       verbosity
-      (fromNubList (globalRemoteRepos    globalFlags))
-      (fromNubList (globalLocalRepos     globalFlags))
-      (fromFlag    (globalCacheDir       globalFlags))
-      (flagToMaybe (globalHttpTransport  globalFlags))
-      (flagToMaybe (globalIgnoreExpiry   globalFlags))
-      (fromNubList (globalProgPathExtra globalFlags))
+      (fromNubList (globalRemoteRepos       globalFlags))
+      (fromNubList (globalLocalNoIndexRepos globalFlags))
+      (fromFlag    (globalCacheDir          globalFlags))
+      (flagToMaybe (globalHttpTransport     globalFlags))
+      (flagToMaybe (globalIgnoreExpiry      globalFlags))
+      (fromNubList (globalProgPathExtra     globalFlags))
 
-withRepoContext' :: Verbosity -> [RemoteRepo] -> [FilePath]
+withRepoContext' :: Verbosity -> [RemoteRepo] -> [LocalRepo]
                  -> FilePath  -> Maybe String -> Maybe Bool
                  -> [FilePath]
                  -> (RepoContext -> IO a)
                  -> IO a
-withRepoContext' verbosity remoteRepos localRepos
+withRepoContext' verbosity remoteRepos localNoIndexRepos
                  sharedCacheDir httpTransport ignoreExpiry extraPaths = \callback -> do
+    for_ localNoIndexRepos $ \local ->
+        unless (FilePath.Posix.isAbsolute (localRepoPath local)) $
+            warn verbosity $ "file+noindex " ++ unRepoName (localRepoName local) ++ " repository path is not absolute; this is fragile, and not recommended"
+
     transportRef <- newMVar Nothing
     let httpLib = Sec.HTTP.transportAdapter
                     verbosity
@@ -162,7 +164,7 @@ withRepoContext' verbosity remoteRepos localRepos
     initSecureRepos verbosity httpLib secureRemoteRepos $ \secureRepos' ->
       callback RepoContext {
           repoContextRepos          = allRemoteRepos
-                                   ++ map RepoLocal localRepos
+                                   ++ allLocalNoIndexRepos
         , repoContextGetTransport   = getTransport transportRef
         , repoContextWithSecureRepo = withSecureRepo secureRepos'
         , repoContextIgnoreExpiry   = fromMaybe False ignoreExpiry
@@ -170,11 +172,21 @@ withRepoContext' verbosity remoteRepos localRepos
   where
     secureRemoteRepos =
       [ (remote, cacheDir) | RepoSecure remote cacheDir <- allRemoteRepos ]
+
+    allRemoteRepos :: [Repo]
     allRemoteRepos =
       [ (if isSecure then RepoSecure else RepoRemote) remote cacheDir
       | remote <- remoteRepos
-      , let cacheDir = sharedCacheDir </> remoteRepoName remote
+      , let cacheDir = sharedCacheDir </> unRepoName (remoteRepoName remote)
             isSecure = remoteRepoSecure remote == Just True
+      ]
+
+    allLocalNoIndexRepos :: [Repo]
+    allLocalNoIndexRepos =
+      [ RepoLocalNoIndex local cacheDir
+      | local <- localNoIndexRepos
+      , let cacheDir | localRepoSharedCache local = sharedCacheDir </> localRepoCacheKey local
+                     | otherwise                  = localRepoPath local
       ]
 
     getTransport :: MVar (Maybe HttpTransport) -> IO HttpTransport

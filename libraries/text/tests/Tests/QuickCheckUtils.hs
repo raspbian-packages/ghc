@@ -26,6 +26,7 @@ module Tests.QuickCheckUtils
     , genDecodeErr
 
     , Stringy(..)
+    , unpack2
     , eq
     , eqP
 
@@ -34,7 +35,6 @@ module Tests.QuickCheckUtils
     , write_read
     ) where
 
-import Control.Applicative ((<$>))
 import Control.Arrow (first, (***))
 import Control.DeepSeq (NFData (..), deepseq)
 import Control.Exception (bracket)
@@ -49,6 +49,7 @@ import Test.QuickCheck.Monadic (assert, monadicIO, run)
 import Test.QuickCheck.Unicode (string)
 import Tests.Utils
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Lazy as BL
 import qualified Data.Text as T
 import qualified Data.Text.Encoding.Error as T
 import qualified Data.Text.Internal.Fusion as TF
@@ -58,13 +59,11 @@ import qualified Data.Text.Internal.Lazy.Fusion as TLF
 import qualified Data.Text.Lazy as TL
 import qualified System.IO as IO
 
-#if !MIN_VERSION_base(4,4,0)
-import Data.Int (Int64)
-import Data.Word (Word, Word64)
-#endif
-
 genUnicode :: IsString a => Gen a
 genUnicode = fromString <$> string
+
+genWord8 :: Gen Word8
+genWord8 = chooseAny
 
 instance Random I16 where
     randomR = integralRandomR
@@ -75,26 +74,22 @@ instance Arbitrary I16 where
     shrink        = shrinkIntegral
 
 instance Arbitrary B.ByteString where
-    arbitrary     = B.pack `fmap` arbitrary
+    arbitrary     = B.pack `fmap` listOf genWord8
     shrink        = map B.pack . shrink . B.unpack
 
-#if !MIN_VERSION_base(4,4,0)
-instance Random Int64 where
-    randomR = integralRandomR
-    random  = randomR (minBound,maxBound)
-
-instance Random Word where
-    randomR = integralRandomR
-    random  = randomR (minBound,maxBound)
-
-instance Random Word8 where
-    randomR = integralRandomR
-    random  = randomR (minBound,maxBound)
-
-instance Random Word64 where
-    randomR = integralRandomR
-    random  = randomR (minBound,maxBound)
-#endif
+instance Arbitrary BL.ByteString where
+    arbitrary = oneof
+      [ BL.fromChunks <$> arbitrary
+      -- so that a single utf8 code point could appear split over up to 4 chunks
+      , BL.fromChunks . map B.singleton <$> listOf genWord8
+      -- so that a code point with 4 byte long utf8 representation
+      -- could appear split over 3 non-singleton chunks
+      , (\a b c -> BL.fromChunks [a, b, c])
+        <$> arbitrary
+        <*> ((\a b -> B.pack [a, b]) <$> genWord8 <*> genWord8)
+        <*> arbitrary
+      ]
+    shrink xs = BL.fromChunks <$> shrink (BL.toChunks xs)
 
 -- For tests that have O(n^2) running times or input sizes, resize
 -- their inputs to the square root of the originals.
@@ -246,6 +241,9 @@ instance Stringy TL.Text where
     unpackS  = TL.unpack
     splitAtS = ((TL.lazyInvariant *** TL.lazyInvariant) .) .
                TL.splitAt . fromIntegral
+
+unpack2 :: (Stringy s) => (s,s) -> (String,String)
+unpack2 = unpackS *** unpackS
 
 -- Do two functions give the same answer?
 eq :: (Eq a, Show a) => (t -> a) -> (t -> a) -> t -> Bool

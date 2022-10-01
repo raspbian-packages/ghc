@@ -1,6 +1,6 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 
-module UnitTests where
+module Main where
 
 import Test.Tasty
 
@@ -13,11 +13,12 @@ import qualified UnitTests.Distribution.Solver.Modular.Builder
 import qualified UnitTests.Distribution.Solver.Modular.WeightedPSQ
 import qualified UnitTests.Distribution.Solver.Modular.Solver
 import qualified UnitTests.Distribution.Solver.Modular.RetryLog
+import qualified UnitTests.Distribution.Client.BuildReport
+import qualified UnitTests.Distribution.Client.Described
 import qualified UnitTests.Distribution.Client.FileMonitor
 import qualified UnitTests.Distribution.Client.Glob
 import qualified UnitTests.Distribution.Client.GZipUtils
-import qualified UnitTests.Distribution.Client.Sandbox
-import qualified UnitTests.Distribution.Client.Sandbox.Timestamp
+import qualified UnitTests.Distribution.Client.Init.FileCreators
 import qualified UnitTests.Distribution.Client.Store
 import qualified UnitTests.Distribution.Client.Tar
 import qualified UnitTests.Distribution.Client.Targets
@@ -54,10 +55,8 @@ tests mtimeChangeCalibrated =
         UnitTests.Distribution.Client.Glob.tests
   , testGroup "Distribution.Client.GZipUtils"
        UnitTests.Distribution.Client.GZipUtils.tests
-  , testGroup "Distribution.Client.Sandbox"
-       UnitTests.Distribution.Client.Sandbox.tests
-  , testGroup "Distribution.Client.Sandbox.Timestamp"
-       UnitTests.Distribution.Client.Sandbox.Timestamp.tests
+  , testGroup "Distribution.Client.Init.FileCreators"
+       UnitTests.Distribution.Client.Init.FileCreators.tests
   , testGroup "Distribution.Client.Store"
        UnitTests.Distribution.Client.Store.tests
   , testGroup "Distribution.Client.Tar"
@@ -78,6 +77,8 @@ tests mtimeChangeCalibrated =
        UnitTests.Distribution.Client.VCS.tests mtimeChange
   , testGroup "UnitTests.Distribution.Client.Get"
        UnitTests.Distribution.Client.Get.tests
+  , UnitTests.Distribution.Client.Described.tests
+  , UnitTests.Distribution.Client.BuildReport.tests
   ]
 
 main :: IO ()
@@ -93,4 +94,3 @@ main = do
   defaultMainWithIngredients
          (includingOptions extraOptions : defaultIngredients)
          (tests mtimeChange')
-

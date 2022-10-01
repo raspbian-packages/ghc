@@ -31,6 +31,12 @@ module GHC.Word (
     byteSwap32,
     byteSwap64,
 
+    -- * Bit reversal
+    bitReverse8,
+    bitReverse16,
+    bitReverse32,
+    bitReverse64,
+
     -- * Equality operators
     -- | See GHC.Classes#matching_overloaded_methods_in_rules
     eqWord, neWord, gtWord, geWord, ltWord, leWord,
@@ -51,7 +57,7 @@ import GHC.Base
 import GHC.Enum
 import GHC.Num
 import GHC.Real
-import GHC.Arr
+import GHC.Ix
 import GHC.Show
 
 ------------------------------------------------------------------------
@@ -106,7 +112,7 @@ instance Num Word8 where
     abs x                  = x
     signum 0               = 0
     signum _               = 1
-    fromInteger i          = W8# (narrow8Word# (integerToWord i))
+    fromInteger i          = W8# (narrow8Word# (integerToWord# i))
 
 -- | @since 2.01
 instance Real Word8 where
@@ -125,7 +131,11 @@ instance Enum Word8 where
                         = W8# (int2Word# i#)
         | otherwise     = toEnumError "Word8" i (minBound::Word8, maxBound::Word8)
     fromEnum (W8# x#)   = I# (word2Int# x#)
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINE enumFrom #-}
     enumFrom            = boundedEnumFrom
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINE enumFromThen #-}
     enumFromThen        = boundedEnumFromThen
 
 -- | @since 2.01
@@ -150,7 +160,7 @@ instance Integral Word8 where
     divMod  (W8# x#) y@(W8# y#)
         | y /= 0                  = (W8# (x# `quotWord#` y#), W8# (x# `remWord#` y#))
         | otherwise               = divZeroError
-    toInteger (W8# x#)            = smallInteger (word2Int# x#)
+    toInteger (W8# x#)            = IS (word2Int# x#)
 
 -- | @since 2.01
 instance Bounded Word8 where
@@ -168,6 +178,7 @@ instance Bits Word8 where
     {-# INLINE shift #-}
     {-# INLINE bit #-}
     {-# INLINE testBit #-}
+    {-# INLINE popCount #-}
 
     (W8# x#) .&.   (W8# y#)   = W8# (x# `and#` y#)
     (W8# x#) .|.   (W8# y#)   = W8# (x# `or#`  y#)
@@ -201,6 +212,8 @@ instance Bits Word8 where
 
 -- | @since 4.6.0.0
 instance FiniteBits Word8 where
+    {-# INLINE countLeadingZeros #-}
+    {-# INLINE countTrailingZeros #-}
     finiteBitSize _ = 8
     countLeadingZeros  (W8# x#) = I# (word2Int# (clz8# x#))
     countTrailingZeros (W8# x#) = I# (word2Int# (ctz8# x#))
@@ -294,7 +307,7 @@ instance Num Word16 where
     abs x                  = x
     signum 0               = 0
     signum _               = 1
-    fromInteger i          = W16# (narrow16Word# (integerToWord i))
+    fromInteger i          = W16# (narrow16Word# (integerToWord# i))
 
 -- | @since 2.01
 instance Real Word16 where
@@ -313,7 +326,11 @@ instance Enum Word16 where
                         = W16# (int2Word# i#)
         | otherwise     = toEnumError "Word16" i (minBound::Word16, maxBound::Word16)
     fromEnum (W16# x#)  = I# (word2Int# x#)
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINE enumFrom #-}
     enumFrom            = boundedEnumFrom
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINE enumFromThen #-}
     enumFromThen        = boundedEnumFromThen
 
 -- | @since 2.01
@@ -338,7 +355,7 @@ instance Integral Word16 where
     divMod  (W16# x#) y@(W16# y#)
         | y /= 0                    = (W16# (x# `quotWord#` y#), W16# (x# `remWord#` y#))
         | otherwise                 = divZeroError
-    toInteger (W16# x#)             = smallInteger (word2Int# x#)
+    toInteger (W16# x#)             = IS (word2Int# x#)
 
 -- | @since 2.01
 instance Bounded Word16 where
@@ -356,6 +373,7 @@ instance Bits Word16 where
     {-# INLINE shift #-}
     {-# INLINE bit #-}
     {-# INLINE testBit #-}
+    {-# INLINE popCount #-}
 
     (W16# x#) .&.   (W16# y#)  = W16# (x# `and#` y#)
     (W16# x#) .|.   (W16# y#)  = W16# (x# `or#`  y#)
@@ -389,11 +407,13 @@ instance Bits Word16 where
 
 -- | @since 4.6.0.0
 instance FiniteBits Word16 where
+    {-# INLINE countLeadingZeros #-}
+    {-# INLINE countTrailingZeros #-}
     finiteBitSize _ = 16
     countLeadingZeros  (W16# x#) = I# (word2Int# (clz16# x#))
     countTrailingZeros (W16# x#) = I# (word2Int# (ctz16# x#))
 
--- | Swap bytes in 'Word16'.
+-- | Reverse order of bytes in 'Word16'.
 --
 -- @since 4.7.0.0
 byteSwap16 :: Word16 -> Word16
@@ -521,7 +541,7 @@ instance Num Word32 where
     abs x                  = x
     signum 0               = 0
     signum _               = 1
-    fromInteger i          = W32# (narrow32Word# (integerToWord i))
+    fromInteger i          = W32# (narrow32Word# (integerToWord# i))
 
 -- | @since 2.01
 instance Enum Word32 where
@@ -549,7 +569,11 @@ instance Enum Word32 where
     enumFromThenTo      = integralEnumFromThenTo
 #else
     fromEnum (W32# x#)  = I# (word2Int# x#)
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINE enumFrom #-}
     enumFrom            = boundedEnumFrom
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINE enumFromThen #-}
     enumFromThen        = boundedEnumFromThen
 #endif
 
@@ -577,12 +601,12 @@ instance Integral Word32 where
         | otherwise                 = divZeroError
     toInteger (W32# x#)
 #if WORD_SIZE_IN_BITS == 32
-        | isTrue# (i# >=# 0#)       = smallInteger i#
-        | otherwise                 = wordToInteger x#
+        | isTrue# (i# >=# 0#)       = IS i#
+        | otherwise                 = integerFromWord# x#
         where
         !i# = word2Int# x#
 #else
-                                    = smallInteger (word2Int# x#)
+                                    = IS (word2Int# x#)
 #endif
 
 -- | @since 2.01
@@ -590,6 +614,7 @@ instance Bits Word32 where
     {-# INLINE shift #-}
     {-# INLINE bit #-}
     {-# INLINE testBit #-}
+    {-# INLINE popCount #-}
 
     (W32# x#) .&.   (W32# y#)  = W32# (x# `and#` y#)
     (W32# x#) .|.   (W32# y#)  = W32# (x# `or#`  y#)
@@ -623,6 +648,8 @@ instance Bits Word32 where
 
 -- | @since 4.6.0.0
 instance FiniteBits Word32 where
+    {-# INLINE countLeadingZeros #-}
+    {-# INLINE countTrailingZeros #-}
     finiteBitSize _ = 32
     countLeadingZeros  (W32# x#) = I# (word2Int# (clz32# x#))
     countTrailingZeros (W32# x#) = I# (word2Int# (ctz32# x#))
@@ -713,7 +740,7 @@ instance Num Word64 where
     abs x                  = x
     signum 0               = 0
     signum _               = 1
-    fromInteger i          = W64# (integerToWord64 i)
+    fromInteger i          = W64# (integerToWord64# i)
 
 -- | @since 2.01
 instance Enum Word64 where
@@ -730,9 +757,17 @@ instance Enum Word64 where
         | x <= fromIntegral (maxBound::Int)
                         = I# (word2Int# (word64ToWord# x#))
         | otherwise     = fromEnumError "Word64" x
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINE enumFrom #-}
     enumFrom            = integralEnumFrom
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINE enumFromThen #-}
     enumFromThen        = integralEnumFromThen
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINE enumFromTo #-}
     enumFromTo          = integralEnumFromTo
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINE enumFromThenTo #-}
     enumFromThenTo      = integralEnumFromThenTo
 
 -- | @since 2.01
@@ -755,13 +790,14 @@ instance Integral Word64 where
     divMod  (W64# x#) y@(W64# y#)
         | y /= 0                    = (W64# (x# `quotWord64#` y#), W64# (x# `remWord64#` y#))
         | otherwise                 = divZeroError
-    toInteger (W64# x#)             = word64ToInteger x#
+    toInteger (W64# x#)             = integerFromWord64# x#
 
 -- | @since 2.01
 instance Bits Word64 where
     {-# INLINE shift #-}
     {-# INLINE bit #-}
     {-# INLINE testBit #-}
+    {-# INLINE popCount #-}
 
     (W64# x#) .&.   (W64# y#)  = W64# (x# `and64#` y#)
     (W64# x#) .|.   (W64# y#)  = W64# (x# `or64#`  y#)
@@ -859,7 +895,7 @@ instance Num Word64 where
     abs x                  = x
     signum 0               = 0
     signum _               = 1
-    fromInteger i          = W64# (integerToWord i)
+    fromInteger i          = W64# (integerToWord# i)
 
 -- | @since 2.01
 instance Enum Word64 where
@@ -876,10 +912,52 @@ instance Enum Word64 where
         | x <= fromIntegral (maxBound::Int)
                         = I# (word2Int# x#)
         | otherwise     = fromEnumError "Word64" x
+
+#if WORD_SIZE_IN_BITS < 64
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINE enumFrom #-}
     enumFrom            = integralEnumFrom
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINE enumFromThen #-}
     enumFromThen        = integralEnumFromThen
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINE enumFromTo #-}
     enumFromTo          = integralEnumFromTo
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINE enumFromThenTo #-}
     enumFromThenTo      = integralEnumFromThenTo
+#else
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINABLE enumFrom #-}
+    enumFrom w
+        = map wordToWord64
+        $ enumFrom (word64ToWord w)
+
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINABLE enumFromThen #-}
+    enumFromThen w s
+        = map wordToWord64
+        $ enumFromThen (word64ToWord w) (word64ToWord s)
+
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINABLE enumFromTo #-}
+    enumFromTo w1 w2
+        = map wordToWord64
+        $ enumFromTo (word64ToWord w1) (word64ToWord w2)
+
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINABLE enumFromThenTo #-}
+    enumFromThenTo w1 s w2
+        = map wordToWord64
+        $ enumFromThenTo (word64ToWord w1) (word64ToWord s) (word64ToWord w2)
+
+word64ToWord :: Word64 -> Word
+word64ToWord (W64# w#) = (W# w#)
+
+wordToWord64 :: Word -> Word64
+wordToWord64 (W# w#) = (W64# w#)
+#endif
+
 
 -- | @since 2.01
 instance Integral Word64 where
@@ -904,8 +982,8 @@ instance Integral Word64 where
         | y /= 0                    = (W64# (x# `quotWord#` y#), W64# (x# `remWord#` y#))
         | otherwise                 = divZeroError
     toInteger (W64# x#)
-        | isTrue# (i# >=# 0#)       = smallInteger i#
-        | otherwise                 = wordToInteger x#
+        | isTrue# (i# >=# 0#)       = IS i#
+        | otherwise                 = integerFromWord# x#
         where
         !i# = word2Int# x#
 
@@ -914,6 +992,7 @@ instance Bits Word64 where
     {-# INLINE shift #-}
     {-# INLINE bit #-}
     {-# INLINE testBit #-}
+    {-# INLINE popCount #-}
 
     (W64# x#) .&.   (W64# y#)  = W64# (x# `and#` y#)
     (W64# x#) .|.   (W64# y#)  = W64# (x# `or#`  y#)
@@ -959,6 +1038,8 @@ uncheckedShiftRL64# = uncheckedShiftRL#
 
 -- | @since 4.6.0.0
 instance FiniteBits Word64 where
+    {-# INLINE countLeadingZeros #-}
+    {-# INLINE countTrailingZeros #-}
     finiteBitSize _ = 64
     countLeadingZeros  (W64# x#) = I# (word2Int# (clz64# x#))
     countTrailingZeros (W64# x#) = I# (word2Int# (ctz64# x#))
@@ -993,6 +1074,35 @@ byteSwap64 :: Word64 -> Word64
 byteSwap64 (W64# w#) = W64# (byteSwap# w#)
 #endif
 
+-- | Reverse the order of the bits in a 'Word8'.
+--
+-- @since 4.12.0.0
+bitReverse8 :: Word8 -> Word8
+bitReverse8 (W8# w#) = W8# (narrow8Word# (bitReverse8# w#))
+
+-- | Reverse the order of the bits in a 'Word16'.
+--
+-- @since 4.12.0.0
+bitReverse16 :: Word16 -> Word16
+bitReverse16 (W16# w#) = W16# (narrow16Word# (bitReverse16# w#))
+
+-- | Reverse the order of the bits in a 'Word32'.
+--
+-- @since 4.12.0.0
+bitReverse32 :: Word32 -> Word32
+bitReverse32 (W32# w#) = W32# (narrow32Word# (bitReverse32# w#))
+
+-- | Reverse the order of the bits in a 'Word64'.
+--
+-- @since 4.12.0.0
+#if WORD_SIZE_IN_BITS < 64
+bitReverse64 :: Word64 -> Word64
+bitReverse64 (W64# w#) = W64# (bitReverse64# w#)
+#else
+bitReverse64 :: Word64 -> Word64
+bitReverse64 (W64# w#) = W64# (bitReverse# w#)
+#endif
+
 -------------------------------------------------------------------------------
 
 {-# RULES
@@ -1006,11 +1116,11 @@ byteSwap64 (W64# w#) = W64# (byteSwap# w#)
 
 {-# RULES
 "fromIntegral/Word8->Natural"
-    fromIntegral = wordToNatural . (fromIntegral :: Word8  -> Word)
+    fromIntegral = naturalFromWord . (fromIntegral :: Word8  -> Word)
 "fromIntegral/Word16->Natural"
-    fromIntegral = wordToNatural . (fromIntegral :: Word16 -> Word)
+    fromIntegral = naturalFromWord . (fromIntegral :: Word16 -> Word)
 "fromIntegral/Word32->Natural"
-    fromIntegral = wordToNatural . (fromIntegral :: Word32 -> Word)
+    fromIntegral = naturalFromWord . (fromIntegral :: Word32 -> Word)
   #-}
 
 #if WORD_SIZE_IN_BITS == 64
@@ -1019,6 +1129,6 @@ byteSwap64 (W64# w#) = W64# (byteSwap# w#)
 "fromIntegral/Natural->Word64"
     fromIntegral = (fromIntegral :: Word -> Word64) . naturalToWord
 "fromIntegral/Word64->Natural"
-    fromIntegral = wordToNatural . (fromIntegral :: Word64 -> Word)
+    fromIntegral = naturalFromWord . (fromIntegral :: Word64 -> Word)
   #-}
 #endif

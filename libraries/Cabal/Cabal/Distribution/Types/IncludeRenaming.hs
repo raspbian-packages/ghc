@@ -15,7 +15,7 @@ import Distribution.Types.ModuleRenaming
 import qualified Distribution.Compat.CharParsing as P
 import           Distribution.Parsec
 import           Distribution.Pretty
-import           Text.PrettyPrint           (text, (<+>))
+import           Text.PrettyPrint           (text)
 import qualified Text.PrettyPrint           as Disp
 
 -- ---------------------------------------------------------------------------
@@ -30,6 +30,7 @@ data IncludeRenaming
     deriving (Show, Read, Eq, Ord, Typeable, Data, Generic)
 
 instance Binary IncludeRenaming
+instance Structured IncludeRenaming
 
 instance NFData IncludeRenaming where rnf = genericRnf
 
@@ -53,7 +54,7 @@ instance Parsec IncludeRenaming where
     parsec = do
         prov_rn <- parsec
         req_rn <- P.option defaultRenaming $ P.try $ do
-            P.spaces
+            P.spaces -- no need to be space
             _ <- P.string "requires"
             P.spaces
             parsec

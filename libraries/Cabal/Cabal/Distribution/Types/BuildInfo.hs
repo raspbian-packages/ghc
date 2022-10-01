@@ -82,13 +82,13 @@ data BuildInfo = BuildInfo {
                                        --   Example 2: a library that is being built by a foreing tool (e.g. rust)
                                        --              and copied and registered together with this library.  The
                                        --              logic on how this library is built will have to be encoded in a
-                                       --              custom Setup for now.  Oherwise cabal would need to lear how to
+                                       --              custom Setup for now.  Otherwise cabal would need to lear how to
                                        --              call arbitrary library builders.
         extraLibFlavours  :: [String], -- ^ Hidden Flag.  This set of strings, will be appended to all libraries when
                                        --   copying. E.g. [libHS<name>_<flavour> | flavour <- extraLibFlavours]. This
                                        --   should only be needed in very specific cases, e.g. the `rts` package, where
                                        --   there are multiple copies of slightly differently built libs.
-        extraDynLibFlavours :: [String], -- ^ Hidden Flag. This set of strings will be be appended to all /dynamic/
+        extraDynLibFlavours :: [String], -- ^ Hidden Flag. This set of strings will be appended to all /dynamic/
                                          --   libraries when copying. This is particularly useful with the `rts` package,
                                          --   where we want different dynamic flavours of the RTS library to be installed.
         extraLibDirs      :: [String],
@@ -109,7 +109,7 @@ data BuildInfo = BuildInfo {
     deriving (Generic, Show, Read, Eq, Typeable, Data)
 
 instance Binary BuildInfo
-
+instance Structured BuildInfo
 instance NFData BuildInfo where rnf = genericRnf
 
 instance Monoid BuildInfo where

@@ -101,7 +101,7 @@ instance Num Int8 where
     signum x | x > 0       = 1
     signum 0               = 0
     signum _               = -1
-    fromInteger i          = I8# (narrow8Int# (integerToInt i))
+    fromInteger i          = I8# (narrow8Int# (integerToInt# i))
 
 -- | @since 2.01
 instance Real Int8 where
@@ -120,7 +120,11 @@ instance Enum Int8 where
                         = I8# i#
         | otherwise     = toEnumError "Int8" i (minBound::Int8, maxBound::Int8)
     fromEnum (I8# x#)   = I# x#
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINE enumFrom #-}
     enumFrom            = boundedEnumFrom
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINE enumFromThen #-}
     enumFromThen        = boundedEnumFromThen
 
 -- | @since 2.01
@@ -155,7 +159,7 @@ instance Integral Int8 where
                                        (# d, m #) ->
                                            (I8# (narrow8Int# d),
                                             I8# (narrow8Int# m))
-    toInteger (I8# x#)               = smallInteger x#
+    toInteger (I8# x#)               = IS x#
 
 -- | @since 2.01
 instance Bounded Int8 where
@@ -177,11 +181,12 @@ instance Bits Int8 where
     {-# INLINE shift #-}
     {-# INLINE bit #-}
     {-# INLINE testBit #-}
+    {-# INLINE popCount #-}
 
-    (I8# x#) .&.   (I8# y#)   = I8# (word2Int# (int2Word# x# `and#` int2Word# y#))
-    (I8# x#) .|.   (I8# y#)   = I8# (word2Int# (int2Word# x# `or#`  int2Word# y#))
-    (I8# x#) `xor` (I8# y#)   = I8# (word2Int# (int2Word# x# `xor#` int2Word# y#))
-    complement (I8# x#)       = I8# (word2Int# (not# (int2Word# x#)))
+    (I8# x#) .&.   (I8# y#)   = I8# (x# `andI#` y#)
+    (I8# x#) .|.   (I8# y#)   = I8# (x# `orI#`  y#)
+    (I8# x#) `xor` (I8# y#)   = I8# (x# `xorI#` y#)
+    complement (I8# x#)       = I8# (notI# x#)
     (I8# x#) `shift` (I# i#)
         | isTrue# (i# >=# 0#) = I8# (narrow8Int# (x# `iShiftL#` i#))
         | otherwise           = I8# (x# `iShiftRA#` negateInt# i#)
@@ -211,6 +216,8 @@ instance Bits Int8 where
 
 -- | @since 4.6.0.0
 instance FiniteBits Int8 where
+    {-# INLINE countLeadingZeros #-}
+    {-# INLINE countTrailingZeros #-}
     finiteBitSize _ = 8
     countLeadingZeros  (I8# x#) = I# (word2Int# (clz8# (int2Word# x#)))
     countTrailingZeros (I8# x#) = I# (word2Int# (ctz8# (int2Word# x#)))
@@ -305,7 +312,7 @@ instance Num Int16 where
     signum x | x > 0       = 1
     signum 0               = 0
     signum _               = -1
-    fromInteger i          = I16# (narrow16Int# (integerToInt i))
+    fromInteger i          = I16# (narrow16Int# (integerToInt# i))
 
 -- | @since 2.01
 instance Real Int16 where
@@ -324,7 +331,11 @@ instance Enum Int16 where
                         = I16# i#
         | otherwise     = toEnumError "Int16" i (minBound::Int16, maxBound::Int16)
     fromEnum (I16# x#)  = I# x#
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINE enumFrom #-}
     enumFrom            = boundedEnumFrom
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINE enumFromThen #-}
     enumFromThen        = boundedEnumFromThen
 
 -- | @since 2.01
@@ -359,7 +370,7 @@ instance Integral Int16 where
                                        (# d, m #) ->
                                            (I16# (narrow16Int# d),
                                             I16# (narrow16Int# m))
-    toInteger (I16# x#)              = smallInteger x#
+    toInteger (I16# x#)              = IS x#
 
 -- | @since 2.01
 instance Bounded Int16 where
@@ -381,11 +392,12 @@ instance Bits Int16 where
     {-# INLINE shift #-}
     {-# INLINE bit #-}
     {-# INLINE testBit #-}
+    {-# INLINE popCount #-}
 
-    (I16# x#) .&.   (I16# y#)  = I16# (word2Int# (int2Word# x# `and#` int2Word# y#))
-    (I16# x#) .|.   (I16# y#)  = I16# (word2Int# (int2Word# x# `or#`  int2Word# y#))
-    (I16# x#) `xor` (I16# y#)  = I16# (word2Int# (int2Word# x# `xor#` int2Word# y#))
-    complement (I16# x#)       = I16# (word2Int# (not# (int2Word# x#)))
+    (I16# x#) .&.   (I16# y#)  = I16# (x# `andI#` y#)
+    (I16# x#) .|.   (I16# y#)  = I16# (x# `orI#`  y#)
+    (I16# x#) `xor` (I16# y#)  = I16# (x# `xorI#` y#)
+    complement (I16# x#)       = I16# (notI# x#)
     (I16# x#) `shift` (I# i#)
         | isTrue# (i# >=# 0#)  = I16# (narrow16Int# (x# `iShiftL#` i#))
         | otherwise            = I16# (x# `iShiftRA#` negateInt# i#)
@@ -415,6 +427,8 @@ instance Bits Int16 where
 
 -- | @since 4.6.0.0
 instance FiniteBits Int16 where
+    {-# INLINE countLeadingZeros #-}
+    {-# INLINE countTrailingZeros #-}
     finiteBitSize _ = 16
     countLeadingZeros  (I16# x#) = I# (word2Int# (clz16# (int2Word# x#)))
     countTrailingZeros (I16# x#) = I# (word2Int# (ctz16# (int2Word# x#)))
@@ -514,7 +528,7 @@ instance Num Int32 where
     signum x | x > 0       = 1
     signum 0               = 0
     signum _               = -1
-    fromInteger i          = I32# (narrow32Int# (integerToInt i))
+    fromInteger i          = I32# (narrow32Int# (integerToInt# i))
 
 -- | @since 2.01
 instance Enum Int32 where
@@ -533,7 +547,11 @@ instance Enum Int32 where
         | otherwise     = toEnumError "Int32" i (minBound::Int32, maxBound::Int32)
 #endif
     fromEnum (I32# x#)  = I# x#
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINE enumFrom #-}
     enumFrom            = boundedEnumFrom
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINE enumFromThen #-}
     enumFromThen        = boundedEnumFromThen
 
 -- | @since 2.01
@@ -576,7 +594,7 @@ instance Integral Int32 where
                                        (# d, m #) ->
                                            (I32# (narrow32Int# d),
                                             I32# (narrow32Int# m))
-    toInteger (I32# x#)              = smallInteger x#
+    toInteger (I32# x#)              = IS x#
 
 -- | @since 2.01
 instance Read Int32 where
@@ -587,11 +605,12 @@ instance Bits Int32 where
     {-# INLINE shift #-}
     {-# INLINE bit #-}
     {-# INLINE testBit #-}
+    {-# INLINE popCount #-}
 
-    (I32# x#) .&.   (I32# y#)  = I32# (word2Int# (int2Word# x# `and#` int2Word# y#))
-    (I32# x#) .|.   (I32# y#)  = I32# (word2Int# (int2Word# x# `or#`  int2Word# y#))
-    (I32# x#) `xor` (I32# y#)  = I32# (word2Int# (int2Word# x# `xor#` int2Word# y#))
-    complement (I32# x#)       = I32# (word2Int# (not# (int2Word# x#)))
+    (I32# x#) .&.   (I32# y#)  = I32# (x# `andI#` y#)
+    (I32# x#) .|.   (I32# y#)  = I32# (x# `orI#`  y#)
+    (I32# x#) `xor` (I32# y#)  = I32# (x# `xorI#` y#)
+    complement (I32# x#)       = I32# (notI# x#)
     (I32# x#) `shift` (I# i#)
         | isTrue# (i# >=# 0#)  = I32# (narrow32Int# (x# `iShiftL#` i#))
         | otherwise            = I32# (x# `iShiftRA#` negateInt# i#)
@@ -622,6 +641,8 @@ instance Bits Int32 where
 
 -- | @since 4.6.0.0
 instance FiniteBits Int32 where
+    {-# INLINE countLeadingZeros #-}
+    {-# INLINE countTrailingZeros #-}
     finiteBitSize _ = 32
     countLeadingZeros  (I32# x#) = I# (word2Int# (clz32# (int2Word# x#)))
     countTrailingZeros (I32# x#) = I# (word2Int# (ctz32# (int2Word# x#)))
@@ -734,7 +755,7 @@ instance Num Int64 where
     signum x | x > 0       = 1
     signum 0               = 0
     signum _               = -1
-    fromInteger i          = I64# (integerToInt64 i)
+    fromInteger i          = I64# (integerToInt64# i)
 
 -- | @since 2.01
 instance Enum Int64 where
@@ -749,9 +770,17 @@ instance Enum Int64 where
         | x >= fromIntegral (minBound::Int) && x <= fromIntegral (maxBound::Int)
                         = I# (int64ToInt# x#)
         | otherwise     = fromEnumError "Int64" x
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINE enumFrom #-}
     enumFrom            = integralEnumFrom
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINE enumFromThen #-}
     enumFromThen        = integralEnumFromThen
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINE enumFromTo #-}
     enumFromTo          = integralEnumFromTo
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINE enumFromThenTo #-}
     enumFromThenTo      = integralEnumFromThenTo
 
 -- | @since 2.01
@@ -790,7 +819,7 @@ instance Integral Int64 where
         | y == (-1) && x == minBound = (overflowError, 0)
         | otherwise                  = (I64# (x# `divInt64#` y#),
                                         I64# (x# `modInt64#` y#))
-    toInteger (I64# x)               = int64ToInteger x
+    toInteger (I64# x)               = integerFromInt64# x
 
 
 divInt64#, modInt64# :: Int64# -> Int64# -> Int64#
@@ -825,6 +854,7 @@ instance Bits Int64 where
     {-# INLINE shift #-}
     {-# INLINE bit #-}
     {-# INLINE testBit #-}
+    {-# INLINE popCount #-}
 
     (I64# x#) .&.   (I64# y#)  = I64# (word64ToInt64# (int64ToWord64# x# `and64#` int64ToWord64# y#))
     (I64# x#) .|.   (I64# y#)  = I64# (word64ToInt64# (int64ToWord64# x# `or64#`  int64ToWord64# y#))
@@ -938,7 +968,7 @@ instance Num Int64 where
     signum x | x > 0       = 1
     signum 0               = 0
     signum _               = -1
-    fromInteger i          = I64# (integerToInt i)
+    fromInteger i          = I64# (integerToInt# i)
 
 -- | @since 2.01
 instance Enum Int64 where
@@ -950,7 +980,11 @@ instance Enum Int64 where
         | otherwise     = predError "Int64"
     toEnum (I# i#)      = I64# i#
     fromEnum (I64# x#)  = I# x#
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINE enumFrom #-}
     enumFrom            = boundedEnumFrom
+    -- See Note [Stable Unfolding for list producers] in GHC.Enum
+    {-# INLINE enumFromThen #-}
     enumFromThen        = boundedEnumFromThen
 
 -- | @since 2.01
@@ -991,7 +1025,7 @@ instance Integral Int64 where
         | otherwise                  = case x# `divModInt#` y# of
                                        (# d, m #) ->
                                            (I64# d, I64# m)
-    toInteger (I64# x#)              = smallInteger x#
+    toInteger (I64# x#)              = IS x#
 
 -- | @since 2.01
 instance Read Int64 where
@@ -1002,11 +1036,12 @@ instance Bits Int64 where
     {-# INLINE shift #-}
     {-# INLINE bit #-}
     {-# INLINE testBit #-}
+    {-# INLINE popCount #-}
 
-    (I64# x#) .&.   (I64# y#)  = I64# (word2Int# (int2Word# x# `and#` int2Word# y#))
-    (I64# x#) .|.   (I64# y#)  = I64# (word2Int# (int2Word# x# `or#`  int2Word# y#))
-    (I64# x#) `xor` (I64# y#)  = I64# (word2Int# (int2Word# x# `xor#` int2Word# y#))
-    complement (I64# x#)       = I64# (word2Int# (int2Word# x# `xor#` int2Word# (-1#)))
+    (I64# x#) .&.   (I64# y#)  = I64# (x# `andI#` y#)
+    (I64# x#) .|.   (I64# y#)  = I64# (x# `orI#`  y#)
+    (I64# x#) `xor` (I64# y#)  = I64# (x# `xorI#` y#)
+    complement (I64# x#)       = I64# (notI# x#)
     (I64# x#) `shift` (I# i#)
         | isTrue# (i# >=# 0#)  = I64# (x# `iShiftL#` i#)
         | otherwise            = I64# (x# `iShiftRA#` negateInt# i#)
@@ -1078,6 +1113,8 @@ uncheckedIShiftRA64# = uncheckedIShiftRA#
 
 -- | @since 4.6.0.0
 instance FiniteBits Int64 where
+    {-# INLINE countLeadingZeros #-}
+    {-# INLINE countTrailingZeros #-}
     finiteBitSize _ = 64
 #if WORD_SIZE_IN_BITS < 64
     countLeadingZeros  (I64# x#) = I# (word2Int# (clz64# (int64ToWord64# x#)))
@@ -1106,36 +1143,36 @@ instance Ix Int64 where
 
 {-# RULES
 "fromIntegral/Natural->Int8"
-    fromIntegral = (fromIntegral :: Int -> Int8)    . naturalToInt
+    fromIntegral = (fromIntegral :: Int -> Int8)  . fromIntegral . naturalToWord
 "fromIntegral/Natural->Int16"
-    fromIntegral = (fromIntegral :: Int -> Int16)   . naturalToInt
+    fromIntegral = (fromIntegral :: Int -> Int16) . fromIntegral . naturalToWord
 "fromIntegral/Natural->Int32"
-    fromIntegral = (fromIntegral :: Int -> Int32)   . naturalToInt
+    fromIntegral = (fromIntegral :: Int -> Int32) . fromIntegral . naturalToWord
   #-}
 
 {-# RULES
 "fromIntegral/Int8->Natural"
-    fromIntegral = intToNatural  . (fromIntegral :: Int8  -> Int)
+    fromIntegral = naturalFromWord  . fromIntegral . (fromIntegral :: Int8  -> Int)
 "fromIntegral/Int16->Natural"
-    fromIntegral = intToNatural  . (fromIntegral :: Int16 -> Int)
+    fromIntegral = naturalFromWord  . fromIntegral . (fromIntegral :: Int16 -> Int)
 "fromIntegral/Int32->Natural"
-    fromIntegral = intToNatural  . (fromIntegral :: Int32 -> Int)
+    fromIntegral = naturalFromWord  . fromIntegral . (fromIntegral :: Int32 -> Int)
   #-}
 
 #if WORD_SIZE_IN_BITS == 64
 -- these RULES are valid for Word==Word64 & Int==Int64
 {-# RULES
 "fromIntegral/Natural->Int64"
-    fromIntegral = (fromIntegral :: Int -> Int64) . naturalToInt
+    fromIntegral = (fromIntegral :: Int -> Int64) . fromIntegral . naturalToWord
 "fromIntegral/Int64->Natural"
-    fromIntegral = intToNatural . (fromIntegral :: Int64 -> Int)
+    fromIntegral = naturalFromWord . fromIntegral . (fromIntegral :: Int64 -> Int)
   #-}
 #endif
 
 
 {- Note [Order of tests]
 ~~~~~~~~~~~~~~~~~~~~~~~~~
-(See Trac #3065, #5161.) Suppose we had a definition like:
+(See #3065, #5161.) Suppose we had a definition like:
 
     quot x y
      | y == 0                     = divZeroError

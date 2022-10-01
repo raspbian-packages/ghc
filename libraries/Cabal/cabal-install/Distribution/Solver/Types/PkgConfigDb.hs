@@ -23,7 +23,7 @@ module Distribution.Solver.Types.PkgConfigDb
 import Distribution.Solver.Compat.Prelude
 import Prelude ()
 
-import           Control.Exception (IOException, handle)
+import           Control.Exception (handle)
 import qualified Data.Map          as M
 import           System.FilePath   (splitSearchPath)
 
@@ -50,6 +50,7 @@ data PkgConfigDb =  PkgConfigDb (M.Map PkgconfigName (Maybe PkgconfigVersion))
      deriving (Show, Generic, Typeable)
 
 instance Binary PkgConfigDb
+instance Structured PkgConfigDb
 
 -- | Query pkg-config for the list of installed packages, together
 -- with their versions. Return a `PkgConfigDb` encapsulating this

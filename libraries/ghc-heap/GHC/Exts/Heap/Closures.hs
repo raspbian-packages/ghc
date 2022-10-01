@@ -13,6 +13,12 @@ module GHC.Exts.Heap.Closures (
     , GenClosure(..)
     , PrimType(..)
     , allClosures
+#if __GLASGOW_HASKELL__ >= 809
+    -- The closureSize# primop is unsupported on earlier GHC releases but we
+    -- build ghc-heap as a boot library so it must be buildable. Drop this once
+    -- we are guaranteed to bootstsrap with GHC >= 8.9.
+    , closureSize
+#endif
 
     -- * Boxes
     , Box(..)
@@ -64,9 +70,7 @@ instance Show Box where
        ptr  = W# (aToWord# a)
        tag  = ptr .&. fromIntegral tAG_MASK -- ((1 `shiftL` TAG_BITS) -1)
        addr = ptr - tag
-        -- want 0s prefixed to pad it out to a fixed length.
-       pad_out ls =
-          '0':'x':(replicate (2*wORD_SIZE - length ls) '0') ++ ls
+       pad_out ls = '0':'x':ls
 
 -- |This takes an arbitrary value and puts it into a box.
 -- Note that calls like
@@ -94,7 +98,7 @@ areBoxesEqual (Box a) (Box b) = case reallyUnsafePtrEqualityUpToTag# a b of
 type Closure = GenClosure Box
 
 -- | This is the representation of a Haskell value on the heap. It reflects
--- <http://ghc.haskell.org/trac/ghc/browser/includes/rts/storage/Closures.h>
+-- <https://gitlab.haskell.org/ghc/ghc/blob/master/includes/rts/storage/Closures.h>
 --
 -- The data type is parametrized by the type to store references in. Usually
 -- this is a 'Box' with the type synonym 'Closure'.
@@ -105,7 +109,7 @@ type Closure = GenClosure Box
 -- fields are the payload.
 --
 -- See
--- <https://ghc.haskell.org/trac/ghc/wiki/Commentary/Rts/Storage/HeapObjects>
+-- <https://gitlab.haskell.org/ghc/ghc/wikis/commentary/rts/storage/heap-objects>
 -- for more information.
 data GenClosure b
   = -- | A data constructor
@@ -215,8 +219,25 @@ data GenClosure b
         -- Card table ignored
         }
 
+    -- | A @SmallMutableArray#@
+    --
+    -- @since 8.10.1
+  | SmallMutArrClosure
+        { info       :: !StgInfoTable
+        , mccPtrs    :: !Word           -- ^ Number of pointers
+        , mccPayload :: ![b]            -- ^ Array payload
+        }
+
     -- | An @MVar#@, with a queue of thread state objects blocking on them
-  | MVarClosure
+    | MVarClosure
+    { info       :: !StgInfoTable
+    , queueHead  :: !b              -- ^ Pointer to head of queue
+    , queueTail  :: !b              -- ^ Pointer to tail of queue
+    , value      :: !b              -- ^ Pointer to closure
+    }
+
+    -- | An @IOPort#@, with a queue of thread state objects blocking on them
+  | IOPortClosure
         { info       :: !StgInfoTable
         , queueHead  :: !b              -- ^ Pointer to head of queue
         , queueTail  :: !b              -- ^ Pointer to tail of queue
@@ -236,6 +257,15 @@ data GenClosure b
         , blackHole  :: !b              -- ^ The blackhole closure
         , owner      :: !b              -- ^ The owning thread state object
         , queue      :: !b              -- ^ ??
+        }
+
+  | WeakClosure
+        { info        :: !StgInfoTable
+        , cfinalizers :: !b
+        , key         :: !b
+        , value       :: !b
+        , finalizer   :: !b
+        , link        :: !b -- ^ next weak pointer for the capability, can be NULL.
         }
 
     ------------------------------------------------------------
@@ -313,11 +343,23 @@ allClosures (APClosure {..}) = fun:payload
 allClosures (PAPClosure {..}) = fun:payload
 allClosures (APStackClosure {..}) = fun:payload
 allClosures (BCOClosure {..}) = [instrs,literals,bcoptrs]
-allClosures (ArrWordsClosure {..}) = []
+allClosures (ArrWordsClosure {}) = []
 allClosures (MutArrClosure {..}) = mccPayload
+allClosures (SmallMutArrClosure {..}) = mccPayload
 allClosures (MutVarClosure {..}) = [var]
 allClosures (MVarClosure {..}) = [queueHead,queueTail,value]
+allClosures (IOPortClosure {..}) = [queueHead,queueTail,value]
 allClosures (FunClosure {..}) = ptrArgs
 allClosures (BlockingQueueClosure {..}) = [link, blackHole, owner, queue]
+allClosures (WeakClosure {..}) = [cfinalizers, key, value, finalizer, link]
 allClosures (OtherClosure {..}) = hvalues
 allClosures _ = []
+
+#if __GLASGOW_HASKELL__ >= 809
+-- | Get the size of the top-level closure in words.
+-- Includes header and payload. Does not follow pointers.
+--
+-- @since 8.10.1
+closureSize :: Box -> Int
+closureSize (Box x) = I# (closureSize# x)
+#endif

@@ -1,18 +1,70 @@
+# 3.4.1.0 [Emily Pillmore](mailto:emilypi@cohomolo.gy) October 2021
+  * See https://github.com/haskell/cabal/blob/master/release-notes/Cabal-3.4.1.0.md
+
+# 3.4.0.0 [Oleg Grenrus](mailto:oleg.grnerus@iki.fi) February 2021
+  * See https://github.com/haskell/cabal/blob/master/release-notes/Cabal-3.4.0.0.md
+
+# 3.2.1.0 [Oleg Grenrus](mailto:oleg.grenris@iki.fi) October 2020
+  * Pass `cxx-options` with `-optcxx` for GHC >= 8.10
+  * Use process jobs when calling subprocesses
+  * Require custom-setup for `cabal-version: 1.24` and later
+  * Accept `linux-androideabi` as an alias for Android
+  * Fix ghci being launched before other sources are built
+  * Require cabal-versions >=1.25 to be exact
+
+# 3.2.0.0 [Herbert Valerio Riedel](mailto:hvr@gnu.org) April 2020
+  * Change free text `String` fields to use `ShortText` in package description
+    and installed packge info.
+  * Split `Distribution.Types.Flag` and `Distribution.Types.ConfVar`
+    `Distribution.Types.GenericPackageDescription`.
+  * Add GHC-8.10 support, including new extensions to
+    `Language.Haskell.Extension`.
+  * Use more `NonEmpty` instead of ordinary lists.
+  * Add `Distribution.Utils.Structured` for fingeprinting `Binary` blobs.
+  * Add `null`, `length` and `unsafeFromUTF8BS` to `Distribution.Utils.ShortText`.
+  * Refactor `Distribution.Utils.IOData` module.
+  * Rename `Distribution.Compat.MD5` to `Distribution.Utils.MD5`.
+  * Add `safeHead`, `safeTail`, `safeLast` to `Distribution.Utils.Generic`.
+  * Add `unsnoc` and `unsnocNE` to `Distribution.Utils.Generic`.
+  * Add `Set'` modifier to `Distribution.Parsec.Newtypes`.
+  * Add `Distribution.Compat.Async`.
+
+# 3.0.2.0 [Herbert Valerio Riedel](mailto:hvr@gnu.org) April 2020
+  * Disallow spaces around colon `:` in Dependency `build-depends` syntax
+    ([#6538](https://github.com/haskell/cabal/pull/6538)).
+  * Make `configure` accept any `pkg-config --modversion` output
+    ([#6541](https://github.com/haskell/cabal/pull/6541)).
+
+# 3.0.1.0 [Herbert Valerio Riedel](mailto:hvr@gnu.org) April 2020
+  * Add GHC-8.8 flags to `normaliseGhcFlags`
+    ([#6379](https://github.com/haskell/cabal/pull/6379)).
+    `Language.Haskell.Extension`
+  * Use more `NonEmpty` instead of ordinary lists
+  * Add `Distribution.Utils.Structured` for fingeprinting `Binary` blobs
+  * Add `null`, `length` and `unsafeFromUTF8BS` to `Distribution.Utils.ShortText`
+  * Refactor `Distribution.Utils.IOData` module
+  * Rename `Distribution.Compat.MD5` to `Distribution.Utils.MD5`
+  * Add `safeHead`, `safeTail`, `safeLast` to `Distribution.Utils.Generic`
+  * Add `unsnoc` and `unsnocNE` to `Distribution.Utils.Generic`
+  * Add `Set'` modifier to `Distribution.Parsec.Newtypes`
+  * Add `Distribution.Compat.Async`
+  * Add `Distribution.Compat.Process` with `enableProcessJobs`
+
 # 3.0.1.0 TBW
   * Add GHC-8.8 flags to normaliseGhcFlags
     ([#6379](https://github.com/haskell/cabal/pull/6379))
   * Typo fixes
-    ([#6372](https://github.com/haskell/cabal/pull/6372))
+    ([#6372](https://github.com/haskell/cabal/pull/6372)).
   * Limit version number parts to contain at most 9 digits
-    ([#6386](https://github.com/haskell/cabal/pull/6386)
+    ([#6386](https://github.com/haskell/cabal/pull/6386)).
   * Fix boundless sublibrary depedency parse failure
-    ([#5846](https://github.com/haskell/cabal/issues/5846))
+    ([#5846](https://github.com/haskell/cabal/issues/5846)).
   * `cabal check` verifies `cpp-options` more pedantically, allowing only
     options starting with `-D` and `-U`.
   * Don’t rebuild world when new ghc flags that affect how error
     messages are presented is specified.
   * Fix dropExeExtension behaviour on Windows
-    ([#6287](https://github.com/haskell/cabal/pull/6287)
+    ([#6287](https://github.com/haskell/cabal/pull/6287)).
 
 # 3.0.0.0 [Mikhail Glushenkov](mailto:mikhail.glushenkov@gmail.com) August 2019
   * The 3.0 migration guide gives advice on adapting Custom setup

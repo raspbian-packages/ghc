@@ -514,6 +514,7 @@ instance Applicative Seq where
 #if MIN_VERSION_base(4,10,0)
     liftA2 = liftA2Seq
 #endif
+    xs <* ys = beforeSeq xs ys
 
 apSeq :: Seq (a -> b) -> Seq a -> Seq b
 apSeq fs xs@(Seq xsFT) = case viewl fs of
@@ -530,7 +531,7 @@ apSeq fs xs@(Seq xsFT) = case viewl fs of
          RigidFull r@(Rigid s pr _m sf) -> Seq $
                Deep (s * length fs)
                     (fmap (fmap firstf) (nodeToDigit pr))
-                    (aptyMiddle (fmap firstf) (fmap lastf) fmap fs''FT r)
+                    (liftA2Middle (fmap firstf) (fmap lastf) fmap fs''FT r)
                     (fmap (fmap lastf) (nodeToDigit sf))
 {-# NOINLINE [1] apSeq #-}
 
@@ -590,7 +591,7 @@ liftA2Seq f xs ys@(Seq ysFT) = case viewl xs of
       RigidFull r@(Rigid s pr _m sf) -> Seq $
         Deep (s * length xs)
              (fmap (fmap (f firstx)) (nodeToDigit pr))
-             (aptyMiddle (fmap (f firstx)) (fmap (f lastx)) (lift_elem f) xs''FT r)
+             (liftA2Middle (fmap (f firstx)) (fmap (f lastx)) (lift_elem f) xs''FT r)
              (fmap (fmap (f lastx)) (nodeToDigit sf))
   where
     lift_elem :: (a -> b -> c) -> a -> Elem b -> Elem c
@@ -637,65 +638,128 @@ data Digit12 a = One12 a | Two12 a a
 -- digit of a 'Rigid' tree.
 type Digit23 a = Node a
 
--- | 'aptyMiddle' does most of the hard work of computing @fs<*>xs@.  It
+-- | 'liftA2Middle' does most of the hard work of computing @liftA2 f xs ys@.  It
 -- produces the center part of a finger tree, with a prefix corresponding to
--- the prefix of @xs@ and a suffix corresponding to the suffix of @xs@ omitted;
+-- the first element of @xs@ and a suffix corresponding to its last element omitted;
 -- the missing suffix and prefix are added by the caller.  For the recursive
 -- call, it squashes the prefix and the suffix into the center tree. Once it
 -- gets to the bottom, it turns the tree into a 2-3 tree, applies 'mapMulFT' to
 -- produce the main body, and glues all the pieces together.
 --
--- @map23@ itself is a bit horrifying because of the nested types involved. Its
+-- @f@ itself is a bit horrifying because of the nested types involved. Its
 -- job is to map over the *elements* of a 2-3 tree, rather than the subtrees.
 -- If we used a higher-order nested type with MPTC, we could probably use a
--- class, but as it is we have to build up @map23@ explicitly through the
+-- class, but as it is we have to build up @f@ explicitly through the
 -- recursion.
-aptyMiddle
-  :: (b -> c)
-     -> (b -> c)
-     -> (a -> b -> c)
-     -> FingerTree (Elem a)
-     -> Rigid b
-     -> FingerTree (Node c)
+--
+-- === Description of parameters
+--
+-- ==== Types
+--
+-- @a@ remains constant through recursive calls (in the @DeepTh@ case),
+-- while @b@ and @c@ do not: 'liftAMiddle' calls itself at types @Node b@ and
+-- @Node c@.
+--
+-- ==== Values
+--
+-- 'liftA2Middle' is used when the original @xs :: Sequence a@ has at
+-- least two elements, so it can be decomposed by taking off the first and last
+-- elements:
+--
+-- > xs = firstx <: midxs :> lastx
+--
+-- - the first two arguments @ffirstx, flastx :: b -> c@ are equal to
+--   @f firstx@ and @f lastx@, where @f :: a -> b -> c@ is the third argument.
+--   This ensures sharing when @f@ computes some data upon being partially
+--   applied to its first argument. The way @f@ gets accumulated also ensures
+--   sharing for the middle section.
+--
+-- - the fourth argument is the middle part @midxs@, always constant.
+--
+-- - the last argument, a tuple of type @Rigid b@, holds all the elements of
+--   @ys@, in three parts: a middle part around which the recursion is
+--   structured, surrounded by a prefix and a suffix that accumulate
+--   elements on the side as we walk down the middle.
+--
+-- === Invariants
+--
+-- > 1. Viewing the various trees as the lists they represent
+-- >    (the types of the toList functions are given a few paragraphs below):
+-- >
+-- >    toListFTN result
+-- >      =  (ffirstx                    <$> (toListThinN m ++ toListD sf))
+-- >      ++ (f      <$> toListFTE midxs <*> (toListD pr ++ toListThinN m ++ toListD sf))
+-- >      ++ (flastx                     <$> (toListD pr ++ toListThinN m))
+-- >
+-- > 2. s = size m + size pr + size sf
+-- >
+-- > 3. size (ffirstx y) = size (flastx y) = size (f x y) = size y
+-- >      for any (x :: a) (y :: b)
+--
+-- Projecting invariant 1 on sizes, using 2 and 3 to simplify, we have the
+-- following corollary.
+-- It is weaker than invariant 1, but it may be easier to keep track of.
+--
+-- > 1a. size result = s * (size midxs + 1) + size m
+--
+-- In invariant 1, the types of the auxiliary functions are as follows
+-- for reference:
+--
+-- > toListFTE   :: FingerTree (Elem a) -> [a]
+-- > toListFTN   :: FingerTree (Node c) -> [c]
+-- > toListThinN :: Thin (Node b) -> [b]
+-- > toListD     :: Digit12 b -> [b]
+liftA2Middle
+  :: (b -> c)              -- ^ @ffirstx@
+  -> (b -> c)              -- ^ @flastx@
+  -> (a -> b -> c)         -- ^ @f@
+  -> FingerTree (Elem a)   -- ^ @midxs@
+  -> Rigid b               -- ^ @Rigid s pr m sf@ (@pr@: prefix, @sf@: suffix)
+  -> FingerTree (Node c)
 
 -- Not at the bottom yet
 
-aptyMiddle firstf
-           lastf
-           map23
-           fs
-           (Rigid s pr (DeepTh sm prm mm sfm) sf)
-    = Deep (sm + s * (size fs + 1)) -- note: sm = s - size pr - size sf
-           (fmap (fmap firstf) (digit12ToDigit prm))
-           (aptyMiddle (fmap firstf)
-                       (fmap lastf)
-                       (fmap . map23)
-                       fs
-                       (Rigid s (squashL pr prm) mm (squashR sfm sf)))
-           (fmap (fmap lastf) (digit12ToDigit sfm))
+liftA2Middle
+    ffirstx
+    flastx
+    f
+    midxs
+    (Rigid s pr (DeepTh sm prm mm sfm) sf)
+    -- note: size (DeepTh sm pr mm sfm) = sm = size pr + size mm + size sfm
+    = Deep (sm + s * (size midxs + 1)) -- note: sm = s - size pr - size sf
+           (fmap (fmap ffirstx) (digit12ToDigit prm))
+           (liftA2Middle
+               (fmap ffirstx)
+               (fmap flastx)
+               (fmap . f)
+               midxs
+               (Rigid s (squashL pr prm) mm (squashR sfm sf)))
+           (fmap (fmap flastx) (digit12ToDigit sfm))
 
 -- At the bottom
 
-aptyMiddle firstf
-           lastf
-           map23
-           fs
-           (Rigid s pr EmptyTh sf)
-     = deep
-            (One (fmap firstf sf))
-            (mapMulFT s (\(Elem f) -> fmap (fmap (map23 f)) converted) fs)
-            (One (fmap lastf pr))
+liftA2Middle
+    ffirstx
+    flastx
+    f
+    midxs
+    (Rigid s pr EmptyTh sf)
+    = deep
+           (One (fmap ffirstx sf))
+           (mapMulFT s (\(Elem x) -> fmap (fmap (f x)) converted) midxs)
+           (One (fmap flastx pr))
    where converted = node2 pr sf
 
-aptyMiddle firstf
-           lastf
-           map23
-           fs
-           (Rigid s pr (SingleTh q) sf)
-     = deep
-            (Two (fmap firstf q) (fmap firstf sf))
-            (mapMulFT s (\(Elem f) -> fmap (fmap (map23 f)) converted) fs)
-            (Two (fmap lastf pr) (fmap lastf q))
+liftA2Middle
+    ffirstx
+    flastx
+    f
+    midxs
+    (Rigid s pr (SingleTh q) sf)
+    = deep
+           (Two (fmap ffirstx q) (fmap ffirstx sf))
+           (mapMulFT s (\(Elem x) -> fmap (fmap (f x)) converted) midxs)
+           (Two (fmap flastx pr) (fmap flastx q))
    where converted = node3 pr q sf
 
 digit12ToDigit :: Digit12 a -> Digit a
@@ -721,7 +785,7 @@ squashR (Two12 n1 n2) m = node3 n1 n2 m
 -- @Node(Node(Elem y))@. The multiplier argument serves to make the annotations
 -- match up properly.
 mapMulFT :: Int -> (a -> b) -> FingerTree a -> FingerTree b
-mapMulFT _ _ EmptyT = EmptyT
+mapMulFT !_ _ EmptyT = EmptyT
 mapMulFT _mul f (Single a) = Single (f a)
 mapMulFT mul f (Deep s pr m sf) = Deep (mul * s) (fmap f pr) (mapMulFT mul (mapMulNode mul f) m) (fmap f sf)
 
@@ -885,7 +949,11 @@ instance Read1 Seq where
 
 instance Monoid (Seq a) where
     mempty = empty
+#if MIN_VERSION_base(4,9,0)
+    mappend = (Semigroup.<>)
+#else
     mappend = (><)
+#endif
 
 #if MIN_VERSION_base(4,9,0)
 -- | @since 0.5.7
@@ -1375,6 +1443,240 @@ applicativeTree n !mSize m = case n of
     three = liftA3 Three m m m
     deepA = liftA3 (Deep (n * mSize))
     emptyTree = pure EmptyT
+
+data RCountMid a = RCountMid
+  !(Node a)  -- End of the first
+  !Int -- Number of units in the middle
+  !(Node a)  -- Beginning of the last
+
+{-
+We could generalize beforeSeq quite easily to
+
+  beforeSeq :: (a -> c) -> Seq a -> Seq b -> Seq c
+
+This would let us add a rewrite rule
+
+  fmap f xs <* ys  ==>  beforeSeq f xs ys
+
+We don't currently bother because I don't yet know of a practical use for (<*)
+for sequences; a rewrite rule to optimize it seems like extreme overkill.
+-}
+
+beforeSeq :: Seq a -> Seq b -> Seq a
+beforeSeq xs ys = replicateEach (length ys) xs
+
+-- | Replicate each element of a sequence the given number of times.
+--
+-- @replicateEach 3 [1,2] = [1,1,1,2,2,2]@
+-- @replicateEach n xs = xs >>= replicate n@
+replicateEach :: Int -> Seq a -> Seq a
+-- The main idea is that we construct a function that takes an element and
+-- produces a 2-3 tree representing that element replicated lenys times. We map
+-- that function over the sequence to (mostly) produce the desired fingertree. But
+-- if we *just* did that, we'd end up with a fingertree of 2-3 trees of the given
+-- size, not of elements. So we need to work our way down to the appropriate
+-- level by building the left side of the fingertree corresponding to the first
+-- 2-3 tree and the right side corresponding to the last one, along with the
+-- 2-3 trees corresponding to the right side of the first and the left side of
+-- the last.
+replicateEach lenys xs = case viewl xs of
+  EmptyL -> empty
+  firstx :< xs' -> case viewr xs' of
+    EmptyR -> replicate lenys firstx
+    Seq midxs :> lastx -> case lenys of
+      0 -> empty
+      1 -> xs
+      2 ->
+        Seq $ rep2EachFT fxE midxs lxE
+      3 ->
+        Seq $ rep3EachFT fxE midxs lxE
+      _ -> Seq $ case lenys `quotRem` 3 of  -- lenys > 3
+             (q,0) -> Deep (lenys * length xs) fd3
+               (repEachMiddle_ lift_elem (RCountMid fn3 (q - 2) ln3))
+               ld3
+                   where
+                    lift_elem a = let n3a = n3 a in (n3a, n3a, n3a)
+             (q,1) -> Deep (lenys * length xs) fd2
+               (repEachMiddle_ lift_elem (RCountMid fn2 (q - 1) ln2))
+               ld2
+                   where
+                    lift_elem a = let n2a = n2 a in (n2a, n3 a, n2a)
+             (q,_) -> Deep (lenys * length xs) fd3
+               (repEachMiddle_ lift_elem (RCountMid fn2 (q - 1) ln3))
+               ld2
+                   where
+                    lift_elem a = let n3a = n3 a in (n3a, n3a, n2 a)
+        where
+          repEachMiddle_ = repEachMiddle midxs lenys 3 fn3 ln3
+          fd2 = Two fxE fxE
+          fd3 = Three fxE fxE fxE
+          ld2 = Two lxE lxE
+          ld3 = Three lxE lxE lxE
+          fn2 = Node2 2 fxE fxE
+          fn3 = Node3 3 fxE fxE fxE
+          ln2 = Node2 2 lxE lxE
+          ln3 = Node3 3 lxE lxE lxE
+          n3 a = Node3 3 (Elem a) (Elem a) (Elem a)
+          n2 a = Node2 2 (Elem a) (Elem a)
+      where
+          fxE = Elem firstx
+          lxE = Elem lastx
+
+rep2EachFT :: Elem a -> FingerTree (Elem a) -> Elem a -> FingerTree (Elem a)
+rep2EachFT firstx xs lastx =
+                 Deep (size xs * 2 + 4)
+                      (Two firstx firstx)
+                      (mapMulFT 2 (\ex -> Node2 2 ex ex) xs)
+                      (Two lastx lastx)
+
+rep3EachFT :: Elem a -> FingerTree (Elem a) -> Elem a -> FingerTree (Elem a)
+rep3EachFT firstx xs lastx =
+                 Deep (size xs * 3 + 6)
+                      (Three firstx firstx firstx)
+                      (mapMulFT 3 (\ex -> Node3 3 ex ex ex) xs)
+                      (Three lastx lastx lastx)
+
+-- Invariants for repEachMiddle:
+--
+-- 1. midxs is constant: the middle bit in the original sequence (xs = (first <: Seq midxs :> last))
+-- 2. lenys is constant: the length of ys
+-- 3. firstx and pr repeat the same element: the first one in the original sequence xs
+-- 4. lastx  and sf repeat the same element: the last  one in the original sequence xs
+-- 5. sizec = size firstx = size lastx
+-- 6. lenys = deep_count * sizec + size pr + size pf
+-- 7. let (lft, fill, rght) = fill23 x, for any x:
+--      7a. All three sequences repeat the element x
+--      7b. size fill = sizec
+--      7c. size lft  = size sf
+--      7d. size rght = size pr
+-- 8. size result = deep_count * sizec + lenys * (size midxs + 1)
+repEachMiddle
+  :: FingerTree (Elem a)  -- midxs
+  -> Int                  -- lenys
+  -> Int                  -- sizec
+  -> Node c               -- firstx
+  -> Node c               -- lastx
+  -> (a -> (Node c, Node c, Node c))  -- fill23
+  -> RCountMid c          -- (RCountMid pr deep_count sf)
+  -> FingerTree (Node c)  -- result
+
+-- At the bottom
+
+repEachMiddle midxs lenys
+            !_sizec
+            _firstx
+            _lastx
+            fill23
+            (RCountMid pr 0 sf)
+     = Deep (lenys * (size midxs + 1))
+            (One pr)
+            (mapMulFT lenys fill23_final midxs)
+            (One sf)
+   where
+     -- fill23_final ::  Elem a -> Node (Node c)
+     fill23_final (Elem a) = case fill23 a of
+        -- See the note on lift_fill23 for an explanation of this
+        -- lazy pattern.
+        ~(lft, _fill, rght) -> Node2 (size pr + size sf) lft rght
+
+repEachMiddle midxs lenys
+            !sizec
+            firstx
+            lastx
+            fill23
+            (RCountMid pr 1 sf)
+     = Deep (sizec + lenys * (size midxs + 1))
+            (Two pr firstx)
+            (mapMulFT lenys fill23_final midxs)
+            (Two lastx sf)
+   where
+     -- fill23_final ::  Elem a -> Node (Node c)
+     fill23_final (Elem a) = case fill23 a of
+        -- See the note on lift_fill23 for an explanation of this
+        -- lazy pattern.
+        ~(lft, fill, rght) -> Node3 (size pr + size sf + sizec) lft fill rght
+
+-- Not at the bottom yet
+
+repEachMiddle midxs lenys
+            !sizec
+            firstx
+            lastx
+            fill23
+            (RCountMid pr deep_count sf)  -- deep_count > 1
+  = case deep_count `quotRem` 3 of
+      (q,0)
+       -> deep'
+        (Two firstx firstx)
+        (repEachMiddle_
+           (lift_fill23 TOT3 TOT2 fill23)
+           (RCountMid pr' (q - 1) sf'))
+        (One lastx)
+       where
+        pr' = node2 firstx pr
+        sf' = node3 lastx lastx sf
+      (q,1)
+       -> deep'
+        (Two firstx firstx)
+        (repEachMiddle_
+           (lift_fill23 TOT3 TOT3 fill23)
+           (RCountMid pr' (q - 1) sf'))
+        (Two lastx lastx)
+       where
+        pr' = node3 firstx firstx pr
+        sf' = node3 lastx lastx sf
+      (q,_) -- the remainder is 2
+       -> deep'
+        (One firstx)
+        (repEachMiddle_
+           (lift_fill23 TOT2 TOT2 fill23)
+           (RCountMid pr' q sf'))
+        (One lastx)
+       where
+        pr' = node2 firstx pr
+        sf' = node2 lastx sf
+
+  where
+    deep' = Deep (deep_count * sizec + lenys * (size midxs + 1))
+    repEachMiddle_ = repEachMiddle midxs lenys sizec' fn3 ln3
+    sizec' = 3 * sizec
+    fn3 = Node3 sizec' firstx firstx firstx
+    ln3 = Node3 sizec' lastx lastx lastx
+    spr = size pr
+    ssf = size sf
+    lift_fill23
+      :: TwoOrThree
+      -> TwoOrThree
+      -> (a -> (b, b, b))
+      -> a -> (Node b, Node b, Node b)
+    lift_fill23 !tl !tr f a = (lft', fill', rght')
+      where
+        -- We use a strict pattern match on the recursive call.  This means
+        -- that we build the 2-3 trees from the *bottom up* instead of from the
+        -- *top down*. We do it this way for two reasons:
+        --
+        -- 1. The trees are never very deep, so we don't get much locality
+        -- benefit from building them lazily.
+        --
+        -- 2. Building the trees lazily would require us to build four thunks
+        -- at each level of each tree, which seems just a bit pricy.
+        --
+        -- Does this break the incremental optimality? I don't believe it does.
+        -- As far as I can tell, each sequence operation that inspects one of
+        -- these trees either inspects only its root (to get its size for
+        -- indexing purposes) or descends all the way to the bottom. So we're
+        -- strict here, and lazy in the construction of
+        -- the root in fill23_final.
+        !(lft, fill, rght) = f a
+        !fill' = Node3 (3 * sizec) fill fill fill
+        !lft' = case tl of
+          TOT2 -> Node2 (ssf + sizec) lft fill
+          TOT3 -> Node3 (ssf + 2 * sizec) lft fill fill
+        !rght' = case tr of
+          TOT2 -> Node2 (spr + sizec) rght fill
+          TOT3 -> Node3 (spr + 2 * sizec) rght fill fill
+
+data TwoOrThree = TOT2 | TOT3
 
 ------------------------------------------------------------------------
 -- Construction

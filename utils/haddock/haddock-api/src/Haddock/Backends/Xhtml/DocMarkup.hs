@@ -19,7 +19,7 @@ module Haddock.Backends.Xhtml.DocMarkup (
   docElement, docSection, docSection_,
 ) where
 
-import Data.List
+import Data.List (intersperse)
 import Documentation.Haddock.Markup
 import Haddock.Backends.Xhtml.Names
 import Haddock.Backends.Xhtml.Utils
@@ -32,7 +32,7 @@ import Text.XHtml hiding ( name, p, quote )
 import Data.Maybe (fromMaybe)
 
 import GHC
-import Name
+import GHC.Types.Name
 
 
 parHtmlMarkup :: Qualification -> Bool
@@ -44,13 +44,14 @@ parHtmlMarkup qual insertAnchors ppId = Markup {
   markupAppend               = (+++),
   markupIdentifier           = thecode . ppId insertAnchors,
   markupIdentifierUnchecked  = thecode . ppUncheckedLink qual,
-  markupModule               = \m -> let (mdl,ref) = break (=='#') m
-                                         -- Accomodate for old style
-                                         -- foo\#bar anchors
-                                         mdl' = case reverse mdl of
-                                           '\\':_ -> init mdl
-                                           _ -> mdl
-                                     in ppModuleRef (mkModuleName mdl') ref,
+  markupModule               = \(ModLink m lbl) ->
+                                 let (mdl,ref) = break (=='#') m
+                                       -- Accomodate for old style
+                                       -- foo\#bar anchors
+                                     mdl' = case reverse mdl of
+                                              '\\':_ -> init mdl
+                                              _ -> mdl
+                                 in ppModuleRef lbl (mkModuleName mdl') ref,
   markupWarning              = thediv ! [theclass "warning"],
   markupEmphasis             = emphasize,
   markupBold                 = strong,
@@ -182,7 +183,7 @@ hackMarkup fmt' currPkg h' =
       UntouchedDoc d -> (markup fmt $ _doc d, [_meta d])
       CollapsingHeader (Header lvl titl) par n nm ->
         let id_ = makeAnchorId $ "ch:" ++ fromMaybe "noid:" nm ++ show n
-            col' = collapseControl id_ "caption"
+            col' = collapseControl id_ "subheading"
             summary = thesummary ! [ theclass "hide-when-js-enabled" ] << "Expand"
             instTable contents = collapseDetails id_ DetailsClosed (summary +++ contents)
             lvs = zip [1 .. ] [h1, h2, h3, h4, h5, h6]

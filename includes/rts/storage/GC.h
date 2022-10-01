@@ -170,10 +170,13 @@ extern generation * oldest_gen;
                                 Allocates memory from the nursery in
                                 the current Capability.
 
-   StgPtr allocatePinned(Capability *cap, W_ n)
+   StgPtr allocatePinned(Capability *cap, W_ n, W_ alignment, W_ align_off)
                                 Allocates a chunk of contiguous store
                                 n words long, which is at a fixed
-                                address (won't be moved by GC).
+                                address (won't be moved by GC). The
+                                word at the byte offset 'align_off'
+                                will be aligned to 'alignment', which
+                                must be a power of two.
                                 Returns a pointer to the first word.
                                 Always succeeds.
 
@@ -191,18 +194,13 @@ extern generation * oldest_gen;
 
 StgPtr  allocate          ( Capability *cap, W_ n );
 StgPtr  allocateMightFail ( Capability *cap, W_ n );
-StgPtr  allocatePinned    ( Capability *cap, W_ n );
+StgPtr  allocatePinned    ( Capability *cap, W_ n, W_ alignment, W_ align_off);
 
 /* memory allocator for executable memory */
 typedef void* AdjustorWritable;
 typedef void* AdjustorExecutable;
 
-AdjustorWritable allocateExec(W_ len, AdjustorExecutable *exec_addr);
 void flushExec(W_ len, AdjustorExecutable exec_addr);
-#if defined(ios_HOST_OS)
-AdjustorWritable execToWritable(AdjustorExecutable exec);
-#endif
-void             freeExec (AdjustorExecutable p);
 
 // Used by GC checks in external .cmm code:
 extern W_ large_alloc_lim;
@@ -227,6 +225,10 @@ void revertCAFs (void);
 // (preferably use RtsConfig.keep_cafs instead)
 void setKeepCAFs (void);
 
+// Let the runtime know that all the CAFs in high mem are not
+// to be retained. Useful in conjunction with loadNativeObj
+void setHighMemDynamic (void);
+
 /* -----------------------------------------------------------------------------
    This is the write barrier for MUT_VARs, a.k.a. IORefs.  A
    MUT_VAR_CLEAN object is not on the mutable list; a MUT_VAR_DIRTY
@@ -234,15 +236,23 @@ void setKeepCAFs (void);
    and is put on the mutable list.
    -------------------------------------------------------------------------- */
 
-void dirty_MUT_VAR(StgRegTable *reg, StgClosure *p);
+void dirty_MUT_VAR(StgRegTable *reg, StgMutVar *mv, StgClosure *old);
 
 /* set to disable CAF garbage collection in GHCi. */
 /* (needed when dynamic libraries are used). */
 extern bool keepCAFs;
 
+#include "rts/Flags.h"
+
 INLINE_HEADER void initBdescr(bdescr *bd, generation *gen, generation *dest)
 {
-    bd->gen     = gen;
-    bd->gen_no  = gen->no;
-    bd->dest_no = dest->no;
+    RELAXED_STORE(&bd->gen, gen);
+    RELAXED_STORE(&bd->gen_no, gen->no);
+    RELAXED_STORE(&bd->dest_no, dest->no);
+
+#if !IN_STG_CODE
+    /* See Note [RtsFlags is a pointer in STG code] */
+    ASSERT(gen->no < RtsFlags.GcFlags.generations);
+    ASSERT(dest->no < RtsFlags.GcFlags.generations);
+#endif
 }

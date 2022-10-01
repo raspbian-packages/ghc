@@ -1,3 +1,4 @@
+{-# LANGUAGE ConstraintKinds       #-}
 {-# LANGUAGE FlexibleInstances     #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings     #-}
@@ -19,11 +20,10 @@ import Distribution.License
 import Distribution.ModuleName
 import Distribution.Package
 import Distribution.Parsec
-import Distribution.Parsec.Newtypes
 import Distribution.Pretty
+import Distribution.Types.LibraryName
 import Distribution.Types.LibraryVisibility
 import Distribution.Types.MungedPackageName
-import Distribution.Types.LibraryName
 import Distribution.Types.UnqualComponentName
 import Distribution.Version
 
@@ -44,16 +44,33 @@ import qualified Distribution.Types.PackageId.Lens            as L
 -- 34886 KnownBranch
 --  8197 wild1_ixF0
 --
--- https://ghc.haskell.org/trac/ghc/ticket/13253 might be the cause.
+-- https://gitlab.haskell.org/ghc/ghc/-/issues/13253 might be the cause.
 --
 -- The workaround is to prevent GHC optimising the code:
-infixl 4 <+>
-(<+>) :: Applicative f => f (a -> b) -> f a -> f b
-f <+> x = f <*> x
-{-# NOINLINE (<+>) #-}
+infixl 4 <@>
+(<@>) :: Applicative f => f (a -> b) -> f a -> f b
+f <@> x = f <*> x
+{-# NOINLINE (<@>) #-}
 
 ipiFieldGrammar
-    :: (FieldGrammar g, Applicative (g InstalledPackageInfo), Applicative (g Basic))
+    :: ( FieldGrammar c g, Applicative (g InstalledPackageInfo), Applicative (g Basic)
+       , c (Identity AbiHash)
+       , c (Identity LibraryVisibility)
+       , c (Identity PackageName)
+       , c (Identity UnitId)
+       , c (Identity UnqualComponentName)
+       , c (List FSep (Identity AbiDependency) AbiDependency)
+       , c (List FSep (Identity UnitId) UnitId)
+       , c (List FSep (MQuoted ModuleName) ModuleName)
+       , c (List FSep FilePathNT String)
+       , c (List FSep Token String)
+       , c (MQuoted MungedPackageName)
+       , c (MQuoted Version)
+       , c CompatPackageKey
+       , c ExposedModules
+       , c InstWith
+       , c SpecLicenseLenient
+       )
     => g InstalledPackageInfo InstalledPackageInfo
 ipiFieldGrammar = mkInstalledPackageInfo
     -- Deprecated fields
@@ -61,47 +78,47 @@ ipiFieldGrammar = mkInstalledPackageInfo
         --- https://github.com/haskell/cabal/commit/40f3601e17024f07e0da8e64d3dd390177ce908b
         ^^^ deprecatedSince CabalSpecV1_22 "hugs isn't supported anymore"
     -- Very basic fields: name, version, package-name, lib-name and visibility
-    <+> blurFieldGrammar basic basicFieldGrammar
+    <@> blurFieldGrammar basic basicFieldGrammar
     -- Basic fields
-    <+> optionalFieldDef    "id"                                                 L.installedUnitId (mkUnitId "")
-    <+> optionalFieldDefAla "instantiated-with"    InstWith                      L.instantiatedWith []
-    <+> optionalFieldDefAla "key"                  CompatPackageKey              L.compatPackageKey ""
-    <+> optionalFieldDefAla "license"              SpecLicenseLenient            L.license (Left SPDX.NONE)
-    <+> freeTextFieldDef    "copyright"                                          L.copyright
-    <+> freeTextFieldDef    "maintainer"                                         L.maintainer
-    <+> freeTextFieldDef    "author"                                             L.author
-    <+> freeTextFieldDef    "stability"                                          L.stability
-    <+> freeTextFieldDef    "homepage"                                           L.homepage
-    <+> freeTextFieldDef    "package-url"                                        L.pkgUrl
-    <+> freeTextFieldDef    "synopsis"                                           L.synopsis
-    <+> freeTextFieldDef    "description"                                        L.description
-    <+> freeTextFieldDef    "category"                                           L.category
+    <@> optionalFieldDef    "id"                                                 L.installedUnitId (mkUnitId "")
+    <@> optionalFieldDefAla "instantiated-with"    InstWith                      L.instantiatedWith []
+    <@> optionalFieldDefAla "key"                  CompatPackageKey              L.compatPackageKey ""
+    <@> optionalFieldDefAla "license"              SpecLicenseLenient            L.license (Left SPDX.NONE)
+    <@> freeTextFieldDefST  "copyright"                                          L.copyright
+    <@> freeTextFieldDefST  "maintainer"                                         L.maintainer
+    <@> freeTextFieldDefST  "author"                                             L.author
+    <@> freeTextFieldDefST  "stability"                                          L.stability
+    <@> freeTextFieldDefST  "homepage"                                           L.homepage
+    <@> freeTextFieldDefST  "package-url"                                        L.pkgUrl
+    <@> freeTextFieldDefST  "synopsis"                                           L.synopsis
+    <@> freeTextFieldDefST  "description"                                        L.description
+    <@> freeTextFieldDefST  "category"                                           L.category
     -- Installed fields
-    <+> optionalFieldDef    "abi"                                                L.abiHash (mkAbiHash "")
-    <+> booleanFieldDef     "indefinite"                                         L.indefinite False
-    <+> booleanFieldDef     "exposed"                                            L.exposed False
-    <+> monoidalFieldAla    "exposed-modules"      ExposedModules                L.exposedModules
-    <+> monoidalFieldAla    "hidden-modules"       (alaList' FSep MQuoted)       L.hiddenModules
-    <+> booleanFieldDef     "trusted"                                            L.trusted False
-    <+> monoidalFieldAla    "import-dirs"          (alaList' FSep FilePathNT)    L.importDirs
-    <+> monoidalFieldAla    "library-dirs"         (alaList' FSep FilePathNT)    L.libraryDirs
-    <+> monoidalFieldAla    "dynamic-library-dirs" (alaList' FSep FilePathNT)    L.libraryDynDirs
-    <+> optionalFieldDefAla "data-dir"             FilePathNT                    L.dataDir ""
-    <+> monoidalFieldAla    "hs-libraries"         (alaList' FSep Token)         L.hsLibraries
-    <+> monoidalFieldAla    "extra-libraries"      (alaList' FSep Token)         L.extraLibraries
-    <+> monoidalFieldAla    "extra-ghci-libraries" (alaList' FSep Token)         L.extraGHCiLibraries
-    <+> monoidalFieldAla    "include-dirs"         (alaList' FSep FilePathNT)    L.includeDirs
-    <+> monoidalFieldAla    "includes"             (alaList' FSep FilePathNT)    L.includes
-    <+> monoidalFieldAla    "depends"              (alaList FSep)                L.depends
-    <+> monoidalFieldAla    "abi-depends"          (alaList FSep)                L.abiDepends
-    <+> monoidalFieldAla    "cc-options"           (alaList' FSep Token)         L.ccOptions
-    <+> monoidalFieldAla    "cxx-options"          (alaList' FSep Token)         L.cxxOptions
-    <+> monoidalFieldAla    "ld-options"           (alaList' FSep Token)         L.ldOptions
-    <+> monoidalFieldAla    "framework-dirs"       (alaList' FSep FilePathNT)    L.frameworkDirs
-    <+> monoidalFieldAla    "frameworks"           (alaList' FSep Token)         L.frameworks
-    <+> monoidalFieldAla    "haddock-interfaces"   (alaList' FSep FilePathNT)    L.haddockInterfaces
-    <+> monoidalFieldAla    "haddock-html"         (alaList' FSep FilePathNT)    L.haddockHTMLs
-    <+> optionalFieldAla    "pkgroot"              FilePathNT                    L.pkgRoot
+    <@> optionalFieldDef    "abi"                                                L.abiHash (mkAbiHash "")
+    <@> booleanFieldDef     "indefinite"                                         L.indefinite False
+    <@> booleanFieldDef     "exposed"                                            L.exposed False
+    <@> monoidalFieldAla    "exposed-modules"      ExposedModules                L.exposedModules
+    <@> monoidalFieldAla    "hidden-modules"       (alaList' FSep MQuoted)       L.hiddenModules
+    <@> booleanFieldDef     "trusted"                                            L.trusted False
+    <@> monoidalFieldAla    "import-dirs"          (alaList' FSep FilePathNT)    L.importDirs
+    <@> monoidalFieldAla    "library-dirs"         (alaList' FSep FilePathNT)    L.libraryDirs
+    <@> monoidalFieldAla    "dynamic-library-dirs" (alaList' FSep FilePathNT)    L.libraryDynDirs
+    <@> optionalFieldDefAla "data-dir"             FilePathNT                    L.dataDir ""
+    <@> monoidalFieldAla    "hs-libraries"         (alaList' FSep Token)         L.hsLibraries
+    <@> monoidalFieldAla    "extra-libraries"      (alaList' FSep Token)         L.extraLibraries
+    <@> monoidalFieldAla    "extra-ghci-libraries" (alaList' FSep Token)         L.extraGHCiLibraries
+    <@> monoidalFieldAla    "include-dirs"         (alaList' FSep FilePathNT)    L.includeDirs
+    <@> monoidalFieldAla    "includes"             (alaList' FSep FilePathNT)    L.includes
+    <@> monoidalFieldAla    "depends"              (alaList FSep)                L.depends
+    <@> monoidalFieldAla    "abi-depends"          (alaList FSep)                L.abiDepends
+    <@> monoidalFieldAla    "cc-options"           (alaList' FSep Token)         L.ccOptions
+    <@> monoidalFieldAla    "cxx-options"          (alaList' FSep Token)         L.cxxOptions
+    <@> monoidalFieldAla    "ld-options"           (alaList' FSep Token)         L.ldOptions
+    <@> monoidalFieldAla    "framework-dirs"       (alaList' FSep FilePathNT)    L.frameworkDirs
+    <@> monoidalFieldAla    "frameworks"           (alaList' FSep Token)         L.frameworks
+    <@> monoidalFieldAla    "haddock-interfaces"   (alaList' FSep FilePathNT)    L.haddockInterfaces
+    <@> monoidalFieldAla    "haddock-html"         (alaList' FSep FilePathNT)    L.haddockHTMLs
+    <@> optionalFieldAla    "pkgroot"              FilePathNT                    L.pkgRoot
   where
     mkInstalledPackageInfo _ Basic {..} = InstalledPackageInfo
         -- _basicPkgName is not used
@@ -180,7 +197,6 @@ instance Parsec ExposedModules where
 instance Pretty ExposedModules where
     pretty = showExposedModules . getExposedModules
 
-
 newtype CompatPackageKey = CompatPackageKey { getCompatPackageKey :: String }
 
 instance Newtype String CompatPackageKey
@@ -192,7 +208,6 @@ instance Parsec CompatPackageKey where
     parsec = CompatPackageKey <$> P.munch1 uid_char where
         uid_char c = Char.isAlphaNum c || c `elem` ("-_.=[],:<>+" :: String)
 
-
 newtype InstWith = InstWith { getInstWith :: [(ModuleName,OpenModule)] }
 
 instance Newtype  [(ModuleName, OpenModule)] InstWith
@@ -202,7 +217,6 @@ instance Pretty InstWith where
 
 instance Parsec InstWith where
     parsec = InstWith . Map.toList <$> parsecOpenModuleSubst
-
 
 -- | SPDX License expression or legacy license. Lenient parser, accepts either.
 newtype SpecLicenseLenient = SpecLicenseLenient { getSpecLicenseLenient :: Either SPDX.License License }
@@ -270,14 +284,20 @@ basicLibVisibility f b = (\x -> b { _basicLibVisibility = x }) <$>
 {-# INLINE basicLibVisibility #-}
 
 basicFieldGrammar
-    :: (FieldGrammar g, Applicative (g Basic))
+    :: ( FieldGrammar c g, Applicative (g Basic)
+       , c (Identity LibraryVisibility)
+       , c (Identity PackageName)
+       , c (Identity UnqualComponentName)
+       , c (MQuoted MungedPackageName)
+       , c (MQuoted Version)
+       )
     => g Basic Basic
 basicFieldGrammar = mkBasic
     <$> optionalFieldDefAla "name"          MQuoted  basicName (mungedPackageName emptyInstalledPackageInfo)
     <*> optionalFieldDefAla "version"       MQuoted  basicVersion nullVersion
     <*> optionalField       "package-name"           basicPkgName
     <*> optionalField       "lib-name"               basicLibName
-    <+> optionalFieldDef    "visibility"             basicLibVisibility LibraryVisibilityPrivate
+    <*> optionalFieldDef    "visibility"             basicLibVisibility LibraryVisibilityPrivate
   where
     mkBasic n v pn ln lv = Basic n v pn ln' lv'
       where

@@ -1,0 +1,34 @@
+libraries/containers/containers_dist-install_VERSION = 0.6.4.1
+libraries/containers/containers_dist-install_COMPONENT_ID = containers-0.6.4.1
+libraries/containers/containers_dist-install_MODULES = Data.Containers.ListUtils Data.IntMap Data.IntMap.Lazy Data.IntMap.Strict Data.IntMap.Strict.Internal Data.IntMap.Internal Data.IntMap.Internal.Debug Data.IntMap.Merge.Lazy Data.IntMap.Merge.Strict Data.IntSet.Internal Data.IntSet Data.Map Data.Map.Lazy Data.Map.Merge.Lazy Data.Map.Strict.Internal Data.Map.Strict Data.Map.Merge.Strict Data.Map.Internal Data.Map.Internal.Debug Data.Set.Internal Data.Set Data.Graph Data.Sequence Data.Sequence.Internal Data.Sequence.Internal.Sorting Data.Tree Utils.Containers.Internal.BitUtil Utils.Containers.Internal.BitQueue Utils.Containers.Internal.StrictPair Utils.Containers.Internal.State Utils.Containers.Internal.StrictMaybe Utils.Containers.Internal.PtrEquality Utils.Containers.Internal.Coercions Utils.Containers.Internal.TypeError Data.Map.Internal.DeprecatedShowTree Data.IntMap.Internal.DeprecatedDebug
+libraries/containers/containers_dist-install_HIDDEN_MODULES = Utils.Containers.Internal.State Utils.Containers.Internal.StrictMaybe Utils.Containers.Internal.PtrEquality Utils.Containers.Internal.Coercions Utils.Containers.Internal.TypeError Data.Map.Internal.DeprecatedShowTree Data.IntMap.Internal.DeprecatedDebug
+libraries/containers/containers_dist-install_SYNOPSIS =Assorted concrete container types
+libraries/containers/containers_dist-install_HS_SRC_DIRS = src
+libraries/containers/containers_dist-install_DEPS = array-0.5.4.0 base-4.15.1.0 deepseq-1.4.5.0
+libraries/containers/containers_dist-install_DEP_IPIDS = array-0.5.4.0 base-4.15.1.0 deepseq-1.4.5.0
+libraries/containers/containers_dist-install_DEP_NAMES = array base deepseq
+libraries/containers/containers_dist-install_DEP_COMPONENT_IDS = array-0.5.4.0 base-4.15.1.0 deepseq-1.4.5.0
+libraries/containers/containers_dist-install_TRANSITIVE_DEP_NAMES = deepseq array base ghc-bignum ghc-prim rts
+libraries/containers/containers_dist-install_TRANSITIVE_DEP_COMPONENT_IDS = deepseq-1.4.5.0 array-0.5.4.0 base-4.15.1.0 ghc-bignum-1.1 ghc-prim-0.7.0 rts
+libraries/containers/containers_dist-install_INCLUDE_DIRS = include dist-install/build/include
+libraries/containers/containers_dist-install_INCLUDES = 
+libraries/containers/containers_dist-install_INSTALL_INCLUDES = 
+libraries/containers/containers_dist-install_EXTRA_LIBRARIES = 
+libraries/containers/containers_dist-install_EXTRA_LIBDIRS = 
+libraries/containers/containers_dist-install_S_SRCS = 
+libraries/containers/containers_dist-install_C_SRCS  = 
+libraries/containers/containers_dist-install_CMM_SRCS = 
+libraries/containers/containers_dist-install_DATA_FILES = 
+libraries/containers/containers_dist-install_HC_OPTS = -O2 -Wall -XHaskell2010
+libraries/containers/containers_dist-install_CC_OPTS = 
+libraries/containers/containers_dist-install_CPP_OPTS = 
+libraries/containers/containers_dist-install_LD_OPTS = 
+libraries/containers/containers_dist-install_DEP_INCLUDE_DIRS_SINGLE_QUOTED = '/home/zubin/ghcs/hs-main/libraries/base/include' '/home/zubin/ghcs/hs-main/libraries/base/dist-install/build/include' '/home/zubin/ghcs/hs-main/libraries/base/dist-install/build/include' '/home/zubin/ghcs/hs-main/libraries/base/dist-install/build/dist-install/build/include' '/home/zubin/ghcs/hs-main/libraries/base/dist-install/build/include' '/home/zubin/ghcs/hs-main/libraries/base/dist-install/build/dist-install/build/include' '/home/zubin/ghcs/hs-main/libraries/base/dist-install/build/dist-install/build/include' '/home/zubin/ghcs/hs-main/libraries/base/dist-install/build/dist-install/build/dist-install/build/include' '/home/zubin/ghcs/hs-main/libraries/ghc-bignum/include/' '/home/zubin/ghcs/hs-main/libraries/ghc-bignum/dist-install/build/include/' '/home/zubin/ghcs/hs-main/libraries/ghc-bignum/dist-install/build/include/' '/home/zubin/ghcs/hs-main/libraries/ghc-bignum/dist-install/build/dist-install/build/include/' '/home/zubin/ghcs/hs-main/libraries/ghc-bignum/include' '/home/zubin/ghcs/hs-main/libraries/ghc-bignum/dist-install/build/include' '/home/zubin/ghcs/hs-main/libraries/ghc-bignum/dist-install/build/include' '/home/zubin/ghcs/hs-main/libraries/ghc-bignum/dist-install/build/dist-install/build/include' '/home/zubin/ghcs/hs-main/libraries/ghc-bignum/dist-install/build/include' '/home/zubin/ghcs/hs-main/libraries/ghc-bignum/dist-install/build/dist-install/build/include' '/home/zubin/ghcs/hs-main/libraries/ghc-bignum/dist-install/build/dist-install/build/include' '/home/zubin/ghcs/hs-main/libraries/ghc-bignum/dist-install/build/dist-install/build/dist-install/build/include' '/home/zubin/ghcs/hs-main/rts/dist/build' '/home/zubin/ghcs/hs-main/includes' '/home/zubin/ghcs/hs-main/includes/dist-derivedconstants/header' '/home/zubin/ghcs/hs-main/includes/dist-install/build'
+libraries/containers/containers_dist-install_DEP_CC_OPTS = 
+libraries/containers/containers_dist-install_DEP_LIB_DIRS_SEARCHPATH = /home/zubin/ghcs/hs-main/libraries/deepseq/dist-install/build:/home/zubin/ghcs/hs-main/libraries/array/dist-install/build:/home/zubin/ghcs/hs-main/libraries/base/dist-install/build:/home/zubin/ghcs/hs-main/libraries/ghc-bignum/dist-install/build:/home/zubin/ghcs/hs-main/libraries/ghc-prim/dist-install/build:/home/zubin/ghcs/hs-main/rts/dist/build
+libraries/containers/containers_dist-install_DEP_LIB_REL_DIRS = libraries/deepseq/dist-install/build libraries/array/dist-install/build libraries/base/dist-install/build libraries/ghc-bignum/dist-install/build libraries/ghc-prim/dist-install/build rts/dist/build
+libraries/containers/containers_dist-install_DEP_LIB_REL_DIRS_SEARCHPATH = libraries/deepseq/dist-install/build:libraries/array/dist-install/build:libraries/base/dist-install/build:libraries/ghc-bignum/dist-install/build:libraries/ghc-prim/dist-install/build:rts/dist/build
+libraries/containers/containers_dist-install_DEP_LD_OPTS = 
+libraries/containers/containers_dist-install_BUILD_GHCI_LIB = YES
+
+$(eval $(libraries/containers/containers_PACKAGE_MAGIC))

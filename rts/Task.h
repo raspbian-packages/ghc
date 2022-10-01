@@ -5,7 +5,7 @@
  * Tasks
  *
  * For details on the high-level design, see
- *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/Rts/Scheduler
+ *   https://gitlab.haskell.org/ghc/ghc/wikis/commentary/rts/scheduler
  *
  * -------------------------------------------------------------------------*/
 
@@ -16,8 +16,8 @@
 #include "BeginPrivate.h"
 
 /*
-   Definition of a Task
-   --------------------
+   Note [Definition of a Task]
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
    A task is an OSThread that runs Haskell code.  Every OSThread that
    runs inside the RTS, whether as a worker created by the RTS or via
@@ -33,8 +33,8 @@
    Haskell code simultaneously. A task relinquishes its Capability
    when it is asked to evaluate an external (C) call.
 
-   Ownership of Task
-   -----------------
+   Note [Ownership of Task]
+   ~~~~~~~~~~~~~~~~~~~~~~~~
 
    Task ownership is a little tricky.  The default situation is that
    the Task is an OS-thread-local structure that is owned by the OS
@@ -271,7 +271,7 @@ extern uint32_t peakWorkerCount;
 #if ((defined(linux_HOST_OS) && \
      (defined(i386_HOST_ARCH) || defined(x86_64_HOST_ARCH))) || \
     (defined(mingw32_HOST_OS) && __GNUC__ >= 4 && __GNUC_MINOR__ >= 4)) && \
-    (!defined(llvm_CC_FLAVOR))
+    (!defined(CC_LLVM_BACKEND))
 #define MYTASK_USE_TLV
 extern __thread Task *my_task;
 #else

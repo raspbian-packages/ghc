@@ -1,3 +1,20 @@
+### 1.2.5.0
+
+* [Support sized primitives from GHC 9.2](https://github.com/haskell/text/pull/305)
+* [Allow `template-haskell-2.18.0.0`](https://github.com/haskell/text/pull/320)
+* [Add `elem :: Char -> Text -> Bool` to `Data.Text` and `Data.Text.Lazy`](https://github.com/haskell/text/pull/274)
+* [Replace surrogate code points in `Data.Text.Internal.Builder.{singleton,fromString}`](https://github.com/haskell/text/pull/281)
+* [Use `unsafeWithForeignPtr` when available](https://github.com/haskell/text/pull/325)
+* [Use vectorized CPU instructions for decoding and encoding](https://github.com/haskell/text/pull/302)
+* [Regenerate case mapping in accordance to Unicode 13.0](https://github.com/haskell/text/pull/334)
+* [Fix UTF-8 decoding of lazy bytestrings](https://github.com/haskell/text/pull/333)
+
+### 1.2.4.1
+
+* Support `template-haskell-2.17.0.0`
+* Support `bytestring-0.11`
+* Add `take . drop` related RULE
+
 ### 1.2.4.0
 
 * Add TH `Lift` instances for `Data.Text.Text` and `Data.Text.Lazy.Text` (gh-232)

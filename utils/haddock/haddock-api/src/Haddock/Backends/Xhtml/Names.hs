@@ -28,9 +28,9 @@ import qualified Data.Map as M
 import Data.List ( stripPrefix )
 
 import GHC hiding (LexicalFixity(..))
-import Name
-import RdrName
-import FastString (unpackFS)
+import GHC.Types.Name
+import GHC.Types.Name.Reader
+import GHC.Data.FastString (unpackFS)
 
 
 -- | Indicator of how to render a 'DocName' into 'Html'
@@ -186,9 +186,12 @@ ppModule mdl = anchor ! [href (moduleUrl mdl)]
                << toHtml (moduleString mdl)
 
 
-ppModuleRef :: ModuleName -> String -> Html
-ppModuleRef mdl ref = anchor ! [href (moduleHtmlFile' mdl ++ ref)]
-                      << toHtml (moduleNameString mdl)
+ppModuleRef :: Maybe Html -> ModuleName -> String -> Html
+ppModuleRef Nothing mdl ref = anchor ! [href (moduleHtmlFile' mdl ++ ref)]
+                              << toHtml (moduleNameString mdl)
+ppModuleRef (Just lbl) mdl ref = anchor ! [href (moduleHtmlFile' mdl ++ ref)]
+                                 << lbl
+
     -- NB: The ref parameter already includes the '#'.
     -- This function is only called from markupModule expanding a
     -- DocModule, which doesn't seem to be ever be used.

@@ -14,6 +14,9 @@ module Distribution.Client.Fetch (
     fetch,
   ) where
 
+import Distribution.Client.Compat.Prelude
+import Prelude ()
+
 import Distribution.Client.Types
 import Distribution.Client.Targets
 import Distribution.Client.FetchUtils hiding (fetchPackage)
@@ -44,13 +47,6 @@ import Distribution.Simple.Utils
          ( die', notice, debug )
 import Distribution.System
          ( Platform )
-import Distribution.Deprecated.Text
-         ( display )
-import Distribution.Verbosity
-         ( Verbosity )
-
-import Control.Monad
-         ( filterM )
 
 -- ------------------------------------------------------------
 -- * The fetch command
@@ -84,7 +80,7 @@ fetch verbosity _ _ _ _ _ _ _ [] =
 fetch verbosity packageDBs repoCtxt comp platform progdb
       globalFlags fetchFlags userTargets = do
 
-    mapM_ (checkTarget verbosity) userTargets
+    traverse_ (checkTarget verbosity) userTargets
 
     installedPkgIndex <- getInstalledPackages verbosity comp packageDBs progdb
     sourcePkgDb       <- getSourcePackages    verbosity repoCtxt
@@ -99,7 +95,7 @@ fetch verbosity packageDBs repoCtxt comp platform progdb
                verbosity comp platform fetchFlags
                installedPkgIndex sourcePkgDb pkgConfigDb pkgSpecifiers
 
-    pkgs' <- filterM (fmap not . isFetched . packageSource) pkgs
+    pkgs' <- filterM (fmap not . isFetched . srcpkgSource) pkgs
     if null pkgs'
       --TODO: when we add support for remote tarballs then this message
       -- will need to be changed because for remote tarballs we fetch them
@@ -110,9 +106,9 @@ fetch verbosity packageDBs repoCtxt comp platform progdb
       else if dryRun
              then notice verbosity $ unlines $
                      "The following packages would be fetched:"
-                   : map (display . packageId) pkgs'
+                   : map (prettyShow . packageId) pkgs'
 
-             else mapM_ (fetchPackage verbosity repoCtxt . packageSource) pkgs'
+             else traverse_ (fetchPackage verbosity repoCtxt . srcpkgSource) pkgs'
 
   where
     dryRun = fromFlag (fetchDryRun fetchFlags)
@@ -162,6 +158,8 @@ planPackages verbosity comp platform fetchFlags
 
       . setCountConflicts countConflicts
 
+      . setFineGrainedConflicts fineGrainedConflicts
+
       . setMinimizeConflictSet minimizeConflictSet
 
       . setShadowPkgs shadowPkgs
@@ -199,6 +197,7 @@ planPackages verbosity comp platform fetchFlags
 
     reorderGoals     = fromFlag (fetchReorderGoals     fetchFlags)
     countConflicts   = fromFlag (fetchCountConflicts   fetchFlags)
+    fineGrainedConflicts = fromFlag (fetchFineGrainedConflicts fetchFlags)
     minimizeConflictSet = fromFlag (fetchMinimizeConflictSet fetchFlags)
     independentGoals = fromFlag (fetchIndependentGoals fetchFlags)
     shadowPkgs       = fromFlag (fetchShadowPkgs       fetchFlags)

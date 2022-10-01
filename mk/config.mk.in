@@ -14,7 +14,7 @@
 # 	- config.mk is auto-generated from config.mk.in by configure.
 #	  If you edit config.mk your changes will be spammed.
 #
-#	- Settings in this file may be overriden by giving replacement
+#	- Settings in this file may be overridden by giving replacement
 #	  definitions in build.mk.  See build.mk.sample for a good
 #	  starting point for a build.mk file.
 #
@@ -173,26 +173,13 @@ endif
 #
 GhcUnregisterised=@Unregisterised@
 
-# Build a compiler with a native code generator backend
-# (as well as a C backend)
-#
-# Target platforms supported:
-#   i386, powerpc, powerpc64, sparc
-#   IOS is not supported
-ArchSupportsNCG=$(strip $(patsubst $(TargetArch_CPP), YES, $(findstring $(TargetArch_CPP), i386 x86_64 powerpc powerpc64 powerpc64le sparc)))
-OsSupportsNCG=$(strip $(patsubst $(TargetOS_CPP), YES, $(patsubst ios,,$(TargetOS_CPP))))
-
-GhcWithNativeCodeGen := $(strip\
-    $(if $(filter YESYESNO,\
-		  $(OsSupportsNCG)$(ArchSupportsNCG)$(GhcUnregisterised)),YES,NO))
-
 # ArchSupportsSMP should be set iff there is support for that arch in
 # includes/stg/SMP.h
 ifeq "$(TargetArch_CPP)" "arm"
 # We don't support load/store barriers pre-ARMv7. See #10433.
 ArchSupportsSMP=$(if $(filter $(ARM_ISA),ARMv5 ARMv6),NO,YES)
 else
-ArchSupportsSMP=$(strip $(patsubst $(TargetArch_CPP), YES, $(findstring $(TargetArch_CPP), i386 x86_64 sparc powerpc powerpc64 powerpc64le aarch64)))
+ArchSupportsSMP=$(strip $(patsubst $(TargetArch_CPP), YES, $(findstring $(TargetArch_CPP), i386 x86_64 sparc powerpc powerpc64 powerpc64le s390x aarch64)))
 endif
 
 # The THREADED_RTS requires `BaseReg` to be in a register and the
@@ -212,27 +199,6 @@ ifeq "$(OsSupportsGHCi)$(ArchSupportsGHCi)" "YESYES"
 GhcWithInterpreter=YES
 else
 GhcWithInterpreter=$(if $(findstring YES,$(DYNAMIC_GHC_PROGRAMS)),YES,NO)
-endif
-
-# GhcEnableTablesNextToCode tells us whether the target architecture
-# supports placing info tables directly before the entry code
-# (see TABLES_NEXT_TO_CODE in the RTS).  Whether we actually compile for
-# TABLES_NEXT_TO_CODE depends on whether we're building unregisterised
-# code or not, which may be decided by options to the compiler later.
-ifneq "$(findstring $(TargetArch_CPP)X, ia64X powerpc64X powerpc64leX)" ""
-GhcEnableTablesNextToCode=NO
-else
-GhcEnableTablesNextToCode=YES
-endif
-
-# Whether to use libffi for adjustors (foreign import "wrapper") or
-# not.  If we have built-in support (rts/Adjustor.c) then we use that,
-# otherwise we fall back on libffi, which is slightly slower.
-ArchHasAdjustorSupport = $(if $(findstring $(TargetArch_CPP),i386 x86_64),YES,NO)
-ifeq "$(ArchHasAdjustorSupport)" "YES"
-UseLibFFIForAdjustors=NO
-else
-UseLibFFIForAdjustors=YES
 endif
 
 # On Windows we normally want to make a relocatable bindist, to we
@@ -255,8 +221,8 @@ ExtraMakefileSanityChecks = NO
 #------------------------------------------------------------------------------
 # Options for Libraries
 
-# Which directory (in libraries/) contains the integer library?
-INTEGER_LIBRARY=integer-gmp
+# Backend to use in ghc-bignum (gmp, native, etc.)
+BIGNUM_BACKEND=gmp
 
 # We build the libraries at least the "vanilla" way (way "v")
 # Technically we don't need the v way if DYNAMIC_GHC_PROGRAMS is YES,
@@ -330,39 +296,9 @@ GhcLibHcOpts=-O2 -haddock
 StripLibraries=NO
 
 # ----------------------------------------------------------------------------
-# Object-file splitting
-#
-# 	Set SplitObjs=YES or NO in your build.mk
-#
-#	Don't use -split-objs in in GhcLibHcOpts, because the build
-#		system needs to do other special magic if you are
-#		doing object-file splitting
-
-ArchSupportsSplitObjs=$(if $(filter \
-  $(TargetArch_CPP),i386 x86_64 powerpc sparc),YES,NO)#
-
-# We used to support splitting on Darwin, but there is no point, since Darwin
-# uses subsections via symbols
-OsSupportsSplitObjs=$(if $(filter $(TargetOS_CPP),\
-   mingw32 linux solaris2 freebsd dragonfly netbsd openbsd),YES,NO)
-SplitObjsBroken = @SplitObjsBroken@
-
-SupportsSplitObjs := $(if $(and $(filter YES,$(ArchSupportsSplitObjs)),\
-                                $(filter YES,$(OsSupportsSplitObjs)),\
-                                $(filter NO,$(SplitObjsBroken)),\
-                                $(filter YES,$(GhcWithNativeCodeGen))),YES,NO)
-
-# By default, enable SplitObjs for the libraries if this build supports it.
-# Unless SplitSections is enabled - then let that take precedence.
-SplitObjs = $(if $(and $(filter YES,$(SupportsSplitObjs)),\
-                       $(filter NO,$(SplitSections))),YES,NO)
-
-# ----------------------------------------------------------------------------
 # Section splitting
 #
-# Similar to -ffunction-sections -fdata-sections in GCC. Provides space saving
-# like SplitObjs, but doesn't require post-processing and splitting of object
-# files.
+# Similar to -ffunction-sections -fdata-sections in GCC.
 #
 # Set SplitSections=YES or NO in your build.mk to override the default.
 #
@@ -407,9 +343,15 @@ UseSystemLibFFI=@UseSystemLibFFI@
 FFILibDir=@FFILibDir@
 FFIIncludeDir=@FFIIncludeDir@
 
+UseLibffiForAdjustors=@UseLibffiForAdjustors@
+
+UseLibdw=@UseLibdw@
+LibdwLibDir=@LibdwLibDir@
+LibdwIncludeDir=@LibdwIncludeDir@
+
 # GHC needs arch-specific tweak at least in
 #     rts/Libdw.c:set_initial_registers()
-GhcRtsWithLibdw=$(strip $(if $(filter $(TargetArch_CPP),i386 x86_64),@UseLibdw@,NO))
+GhcRtsWithLibdw=$(strip $(if $(filter $(TargetArch_CPP),i386 x86_64 s390x),@UseLibdw@,NO))
 
 ################################################################################
 #
@@ -484,7 +426,8 @@ EXECUTABLE_FILE = chmod +x
 
 # $(GHC) points to installed version of the compiler.
 #
-# NOTE: Don't override $(GHC) in build.mk, use configure --with-ghc instead
+# NOTE: Don't override $(GHC) in build.mk, use
+# `./configure GHC=...` instead
 # (because the version numbers have to be calculated).
 
 GHC := @WithGhc@
@@ -518,7 +461,51 @@ else
 GhcCanonVersion = $(GhcMajVersion)$(GhcMinVersion)
 endif
 
-GHC_PACKAGE_DB_FLAG = @GHC_PACKAGE_DB_FLAG@
+#-----------------------------------------------------------------------------
+# Settings
+
+# We are in the process of moving the settings file from being entirely
+# generated by configure, to generated being by the build system. Many of these
+# might become redundant.
+# See Note [tooldir: How GHC finds mingw on Windows]
+
+GccExtraViaCOpts = @GccExtraViaCOpts@
+LdHasFilelist = @LdHasFilelist@
+ArArgs = @ArArgs@
+HaskellHostOs = @HaskellHostOs@
+HaskellHostArch = @HaskellHostArch@
+HaskellTargetOs = @HaskellTargetOs@
+HaskellTargetArch = @HaskellTargetArch@
+TargetWordSize = @TargetWordSize@
+TargetWordBigEndian = @TargetWordBigEndian@
+TargetHasGnuNonexecStack = @TargetHasGnuNonexecStack@
+TargetHasIdentDirective = @TargetHasIdentDirective@
+TargetHasSubsectionsViaSymbols = @TargetHasSubsectionsViaSymbols@
+TargetHasRTSLinker = @TargetHasRTSLinker@
+TablesNextToCode = @TablesNextToCode@
+
+SettingsCCompilerCommand = @SettingsCCompilerCommand@
+SettingsHaskellCPPCommand = @SettingsHaskellCPPCommand@
+SettingsHaskellCPPFlags = @SettingsHaskellCPPFlags@
+SettingsCCompilerFlags = @SettingsCCompilerFlags@
+SettingsCxxCompilerFlags = @SettingsCxxCompilerFlags@
+SettingsCCompilerLinkFlags = @SettingsCCompilerLinkFlags@
+SettingsCCompilerSupportsNoPie = @SettingsCCompilerSupportsNoPie@
+SettingsLdCommand = @SettingsLdCommand@
+SettingsLdFlags = @SettingsLdFlags@
+SettingsMergeObjectsCommand = @SettingsMergeObjectsCommand@
+SettingsMergeObjectsFlags = @SettingsMergeObjectsFlags@
+SettingsArCommand = @SettingsArCommand@
+SettingsOtoolCommand = @SettingsOtoolCommand@
+SettingsInstallNameToolCommand = @SettingsInstallNameToolCommand@
+SettingsRanlibCommand = @SettingsRanlibCommand@
+SettingsDllWrapCommand = @SettingsDllWrapCommand@
+SettingsWindresCommand = @SettingsWindresCommand@
+SettingsLibtoolCommand = @SettingsLibtoolCommand@
+SettingsTouchCommand = @SettingsTouchCommand@
+SettingsClangCommand = @SettingsClangCommand@
+SettingsLlcCommand = @SettingsLlcCommand@
+SettingsOptCommand = @SettingsOptCommand@
 
 #-----------------------------------------------------------------------------
 # C compiler
@@ -527,13 +514,12 @@ GHC_PACKAGE_DB_FLAG = @GHC_PACKAGE_DB_FLAG@
 # the flag CC=<blah> instead.  The reason is that the configure script
 # needs to know which gcc you're using in order to perform its tests.
 
-GccVersion            = @GccVersion@
-
 # TargetPlatformFull retains the string passed to configure so we have it in
 # the necessary format to pass to libffi's configure.
 TargetPlatformFull    = @TargetPlatformFull@
-GccLT46         = @GccLT46@
-GccIsClang      = @GccIsClang@
+
+# Do we have a C compiler using an LLVM back end?
+CcLlvmBackend   = @CcLlvmBackend@
 
 CC              = @CC@
 CC_STAGE0       = @CC_STAGE0@
@@ -552,6 +538,16 @@ LD_STAGE0       = @LD_STAGE0@
 LD_STAGE1       = $(LD)
 LD_STAGE2       = $(LD)
 LD_STAGE3       = $(LD)
+
+MERGE_OBJS_STAGE0 = @MergeObjsCmd@
+MERGE_OBJS_STAGE1 = @MergeObjsCmd@
+MERGE_OBJS_STAGE2 = @MergeObjsCmd@
+MERGE_OBJS_STAGE3 = @MergeObjsCmd@
+
+MERGE_OBJS_STAGE0_FLAGS = @MergeObjsArgs@
+MERGE_OBJS_STAGE1_FLAGS = @MergeObjsArgs@
+MERGE_OBJS_STAGE2_FLAGS = @MergeObjsArgs@
+MERGE_OBJS_STAGE3_FLAGS = @MergeObjsArgs@
 
 # Cross-compiling options
 # See Note [CrossCompiling vs Stage1Only]
@@ -589,7 +585,7 @@ INSTALL_GHC_STAGE= $(if $(filter YES,$(Stage1Only)),1,2)
 # 4 CrossCompiling=YES Stage1Only=NO
 #   Cross-compiling GHC itself. See [1].
 #
-# [1] https://ghc.haskell.org/trac/ghc/wiki/Building/CrossCompiling
+# [1] https://gitlab.haskell.org/ghc/ghc/wikis/building/cross-compiling
 
 # Note [Stage1Only vs stage=1]
 #
@@ -734,7 +730,6 @@ INSTALL			:= $(subst .././install-sh,$(TOP)/install-sh,$(INSTALL))
 
 LN_S			= @LN_S@
 MV			= mv
-PERL 			= @PerlCmd@
 PIC			= pic
 RANLIB_CMD = @RANLIB_CMD@
 REAL_RANLIB_CMD = @REAL_RANLIB_CMD@
@@ -745,7 +740,6 @@ HaveDtrace		= @HaveDtrace@
 USE_DTRACE = $(HaveDtrace)
 DTRACE			= @DtraceCmd@
 
-LD_NO_GOLD = @LdNoGoldCmd@
 LD = @LdCmd@
 NM = @NmCmd@
 AR = @ArCmd@
@@ -764,7 +758,7 @@ LdIsGNULd		= @LdIsGNULd@
 LdHasBuildId	        = @LdHasBuildId@
 
 # Set to YES if ld has the --no_compact_unwind flag. See #5019
-# and compiler/main/DriverPipeline.hs.
+# and GHC.Driver.Pipeline.
 LdHasNoCompactUnwind	= @LdHasNoCompactUnwind@
 
 # On MSYS, building with SplitObjs=YES fails with
@@ -838,6 +832,7 @@ BUILD_SPHINX_HTML        = @BUILD_SPHINX_HTML@
 BUILD_SPHINX_PDF         = @BUILD_SPHINX_PDF@
 SPHINXOPTS               = -D latex_paper_size=letter
 XELATEX                  = @XELATEX@
+MAKEINDEX                = @MAKEINDEX@
 
 #-----------------------------------------------------------------------------
 # 		FPtools support software
@@ -884,14 +879,6 @@ BUILD_EXTRA_PKGS = NO
 
 ################################################################################
 #
-#    Library configure arguments
-#
-################################################################################
-
-CONFIGURE_ARGS = @CONFIGURE_ARGS@
-
-################################################################################
-#
 #    To be passed to sub-builds
 #
 ################################################################################
@@ -919,6 +906,6 @@ endif
 # Note [Disable -O2 in unregisterised mode]
 # Disable -O2 optimization in unregisterised mode. Otherwise amount
 # of generated C code # makes things very slow to compile (~5 minutes
-# on core-i7 for 'compiler/hsSyn/HsExpr.hs') and sometimes not compile
-# at all: powerpc64 overflows TOC section on 'compiler/hsSyn/HsExpr.hs'
-#         ia64 overflows short data section on 'compiler/main/DynFlags.hs'
+# on core-i7 for 'compiler/GHC/Hs/Expr.hs') and sometimes not compile
+# at all: powerpc64 overflows TOC section on 'compiler/GHC/Hs/Expr.hs'
+#         ia64 overflows short data section on 'compiler/GHC/Driver/Session.hs'

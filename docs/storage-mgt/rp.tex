@@ -173,7 +173,6 @@ Installing the GHC is done as follows:
 \begin{code}
 ./fptools/mk    vi build.mk
     GhcHcOpts = -O -fasm -Rghc-timing
-    SplitObjs = NO
     GhcRtsHcOpts = 
     GhcRtsCcOpts = -g
     STRIP_CMD =:
@@ -205,7 +204,7 @@ ways of building executable programs from
 source files: normal way and profiling way. 
 We are concerned only about profiling way, and all the pieces of code 
 implementing profiling way are wrapped by the @PROFILING@ 
-pre-processing directive (as in @\#ifdef PROFILING@).
+pre-processing directive (as in @\#if defined(PROFILING)@).
 Therefore, all the additions and changes that we make to the source code 
 are assumed to be wrapped by the @PROFILING@ pre-processing 
 directive as well unless otherwise mentioned.}

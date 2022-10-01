@@ -260,6 +260,9 @@ Redirecting the compilation output(s)
     example, they would still be put in ``parse/Foo.hi``,
     ``parse/Bar.hi``, and ``gurgle/Bumble.hi``.
 
+    Please also note that when doing incremental compilation, this directory is
+    where GHC looks into to find object files from previous builds.
+
 .. ghc-flag:: -ohi ⟨file⟩
     :shortdesc: set the filename in which to put the interface
     :type: dynamic
@@ -288,6 +291,10 @@ Redirecting the compilation output(s)
     Redirects all generated interface files into ⟨dir⟩, instead of the
     default.
 
+    Please also note that when doing incremental compilation (by ``ghc --make``
+    or ``ghc -c``), this directory is where GHC looks into to find interface
+    files.
+
 .. ghc-flag:: -hiedir ⟨dir⟩
     :shortdesc: set directory for extended interface files
     :type: dynamic
@@ -295,6 +302,10 @@ Redirecting the compilation output(s)
 
     Redirects all generated extended interface files into ⟨dir⟩, instead of
     the default.
+
+    Please also note that when doing incremental compilation (by ``ghc --make``
+    or ``ghc -c``), this directory is where GHC looks into to find extended
+    interface files.
 
 .. ghc-flag:: -stubdir ⟨dir⟩
     :shortdesc: redirect FFI stub files
@@ -322,8 +333,8 @@ Redirecting the compilation output(s)
     :category:
 
     The ``-outputdir`` option is shorthand for the combination of
-    :ghc-flag:`-odir ⟨dir⟩`, :ghc-flag:`-hidir ⟨dir⟩`, :ghc-flag:`-stubdir
-    ⟨dir⟩` and :ghc-flag:`-dumpdir ⟨dir⟩`.
+    :ghc-flag:`-odir ⟨dir⟩`, :ghc-flag:`-hidir ⟨dir⟩`, :ghc-flag:`-hiedir ⟨dir⟩`, 
+    :ghc-flag:`-stubdir ⟨dir⟩` and :ghc-flag:`-dumpdir ⟨dir⟩`.
 
 .. ghc-flag:: -osuf ⟨suffix⟩
     :shortdesc: set the output file suffix
@@ -486,7 +497,7 @@ Redirecting temporary files
 
     If you have trouble because of running out of space in ``/tmp`` (or
     wherever your installation thinks temporary files should go), you
-    may use the :ghc-flag:`-tmpdir ⟨dir⟩` option option to specify an
+    may use the :ghc-flag:`-tmpdir ⟨dir⟩` option to specify an
     alternate directory. For example, ``-tmpdir .`` says to put temporary files
     in the current working directory.
 
@@ -575,7 +586,7 @@ The GHC API exposes functions for reading and writing these files.
     :type: dynamic
     :category: extended-interface-files
 
-    Writes out extended interface files alongisde regular enterface files.
+    Writes out extended interface files alongside regular interface files.
     Just like regular interface files, GHC has a recompilation check to detect
     out of date or missing extended interface files.
 
@@ -586,7 +597,7 @@ The GHC API exposes functions for reading and writing these files.
 
     Runs a series of sanity checks and lints on the extended interface files
     that are being written out. These include testing things properties such as
-    variables not occuring outside of their expected scopes.
+    variables not occurring outside of their expected scopes.
 
 The format in which GHC currently stores its typechecked AST, makes it costly
 to collect the types for some expressions nodes. For the sake of performance,
@@ -657,9 +668,7 @@ this time with the fingerprints on the things it needed last time
 are all the same it stops compiling early in the process saying
 “Compilation IS NOT required”. What a beautiful sight!
 
-You can read about `how all this
-works <http://ghc.haskell.org/trac/ghc/wiki/Commentary/Compiler/RecompilationAvoidance>`__
-in the GHC commentary.
+You can read about :ghc-wiki:`how all this works <commentary/compiler/recompilation-avoidance>` in the GHC commentary.
 
 .. _mutual-recursion:
 
@@ -1416,6 +1425,20 @@ generation are:
     imported by the home package module. This option is normally only
     used by the various system libraries.
 
+.. ghc-flag:: -include-cpp-deps
+    :shortdesc: Include preprocessor dependencies
+    :type: dynamic
+    :category:
+
+    Output preprocessor dependencies. This only has an effect when the CPP
+    language extension is enabled. These dependencies are files included with
+    the ``#include`` preprocessor directive (as well as transitive includes) and
+    implicitly included files such as standard c preprocessor headers and a GHC
+    version header. One exception to this is that GHC generates a temporary
+    header file (during compilation) containing package version macros. As this
+    is only a temporary file that GHC will always generate, it is not output as
+    a dependency.
+
 .. _orphan-modules:
 
 Orphan modules and instance declarations
@@ -1477,7 +1500,6 @@ module:
    instance* or at least one *orphan rule*.
 
 -  An instance declaration in a module ``M`` is an *orphan instance* if
-   orphan instance
 
    -  The class of the instance declaration is not declared in ``M``, and
 

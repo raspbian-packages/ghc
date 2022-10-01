@@ -18,7 +18,7 @@ module Control.Monad
     (
     -- * Functor and monad classes
 
-      Functor(fmap)
+      Functor(..)
     , Monad((>>=), (>>), return)
     , MonadFail(fail)
     , MonadPlus(mzero, mplus)
@@ -142,6 +142,13 @@ filterM p        = foldr (\ x -> liftA2 (\ flg -> if flg then (x:) else id) (p x
 infixr 1 <=<, >=>
 
 -- | Left-to-right composition of Kleisli arrows.
+--
+-- \'@(bs '>=>' cs) a@\' can be understood as the @do@ expression
+--
+-- @
+-- do b <- bs a
+--    cs b
+-- @
 (>=>)       :: Monad m => (a -> m b) -> (b -> m c) -> (a -> m c)
 f >=> g     = \x -> f x >>= g
 
@@ -179,6 +186,10 @@ f >=> g     = \x -> f x >>= g
 --     echo client = 'forever' $
 --       hGetLine client >>= hPutStrLn client
 -- @
+--
+-- Note that "forever" isn't necessarily non-terminating.
+-- If the action is in a @'MonadPlus'@ and short-circuits after some number of iterations.
+-- then @'forever'@ actually returns `mzero`, effectively short-circuiting its caller.
 forever     :: (Applicative f) => f a -> f b
 {-# INLINE forever #-}
 forever a   = let a' = a *> a' in a'
@@ -193,16 +204,22 @@ forever a   = let a' = a *> a' in a'
 -- data structures or a state monad.
 mapAndUnzipM      :: (Applicative m) => (a -> m (b,c)) -> [a] -> m ([b], [c])
 {-# INLINE mapAndUnzipM #-}
+-- Inline so that fusion with 'unzip' and 'traverse' has a chance to fire.
+-- See Note [Inline @unzipN@ functions] in GHC/OldList.hs.
 mapAndUnzipM f xs =  unzip <$> traverse f xs
 
 -- | The 'zipWithM' function generalizes 'zipWith' to arbitrary applicative functors.
 zipWithM          :: (Applicative m) => (a -> b -> m c) -> [a] -> [b] -> m [c]
 {-# INLINE zipWithM #-}
+-- Inline so that fusion with zipWith and sequenceA have a chance to fire
+-- See Note [Fusion for zipN/zipWithN] in List.hs]
 zipWithM f xs ys  =  sequenceA (zipWith f xs ys)
 
 -- | 'zipWithM_' is the extension of 'zipWithM' which ignores the final result.
 zipWithM_         :: (Applicative m) => (a -> b -> m c) -> [a] -> [b] -> m ()
 {-# INLINE zipWithM_ #-}
+-- Inline so that fusion with zipWith and sequenceA have a chance to fire
+-- See Note [Fusion for zipN/zipWithN] in List.hs]
 zipWithM_ f xs ys =  sequenceA_ (zipWith f xs ys)
 
 {- | The 'foldM' function is analogous to 'Data.Foldable.foldl', except that its result is
@@ -256,12 +273,18 @@ By contrast, the implementation below with a local loop makes it possible to
 inline the entire definition (as happens for foldr, for example) thereby
 specialising for the particular action.
 
-For further information, see this Trac comment, which includes side-by-side
-Core: https://ghc.haskell.org/trac/ghc/ticket/11795#comment:6
+For further information, see this issue comment, which includes side-by-side
+Core: https://gitlab.haskell.org/ghc/ghc/issues/11795#note_118976
 -}
 
--- | @'replicateM' n act@ performs the action @n@ times,
--- gathering the results.
+-- | @'replicateM' n act@ performs the action @act@ @n@ times,
+-- and then returns the list of results:
+--
+-- ==== __Examples__
+-- >>> replicateM 3 (putStrLn "a")
+-- a
+-- a
+-- a
 replicateM        :: (Applicative m) => Int -> m a -> m [a]
 {-# INLINABLE replicateM #-}
 {-# SPECIALISE replicateM :: Int -> IO a -> IO [a] #-}

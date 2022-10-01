@@ -26,12 +26,12 @@ Added directives
 
 .. rst:directive:: .. cabal::cfg-section
 
-   Describes a package.cabal section, such as library or exectuble.
+   Describes a package.cabal section, such as library or executable.
 
    All following `pkg-field` directives will add section name
    to their fields name for disambiguating duplicates.
 
-   You can reset the section disambguation with with `.. pkg-section:: None`.
+   You can reset the section disambiguation with `.. pkg-section:: None`.
 
 .. rst::role:: pkg-section
 
@@ -86,7 +86,7 @@ To be done:
   These should act in a way similar to `.. std::option` directive, but with
   extra meta. And should also end up in reference.
 
-  At least setup and 'new-build` subcommands should get special directvies
+  At least setup and 'new-build` subcommands should get special directives
 
 - Improve rendering of flags in `.. cfg-field::` directive. It should be
   possible without copy-pasting code from sphinx.directives.ObjectDescription
@@ -122,7 +122,7 @@ from sphinx import addnodes
 from sphinx.directives import ObjectDescription
 from sphinx.domains import ObjType, Domain, Index
 from sphinx.domains.std import StandardDomain
-from sphinx.locale import l_, _
+from sphinx.locale import _
 from sphinx.roles import XRefRole
 from sphinx.util.docfields import Field, DocFieldTransformer
 from sphinx.util.nodes import make_refnode
@@ -150,7 +150,7 @@ def parse_flag(env, sig, signode):
         name = parts[0]
         names.append(name)
         sig = sep + ' '.join(parts[1:])
-        sig = re.sub(ur'<([-a-zA-Z ]+)>', ur'⟨\1⟩', sig)
+        sig = re.sub(r'<([-a-zA-Z ]+)>', r'⟨\1⟩', sig)
         if i > 0:
             signode += addnodes.desc_name(', ', ', ')
         signode += addnodes.desc_name(name, name)
@@ -200,7 +200,7 @@ def find_section_title(parent):
         if isinstance(kid, nodes.title):
             return kid.astext(), section_id
 
-    print section_name, section_id
+    print(section_name, section_id)
     return section_name, section_id
 
 
@@ -323,7 +323,7 @@ class CabalObject(ObjectDescription):
 
     def get_index_entry(self, env, name):
         '''
-        Should return index entry and achor
+        Should return index entry and anchor
 
         By default uses indextemplate attribute to generate name and
         index entry by joining directive name, section and field name
@@ -813,10 +813,10 @@ class CabalDomain(Domain):
     name = 'cabal'
     label = 'Cabal'
     object_types = {
-        'pkg-section': ObjType(l_('pkg-section'), 'pkg-section'),
-        'pkg-field'  : ObjType(l_('pkg-field')  , 'pkg-field'  ),
-        'cfg-section': ObjType(l_('cfg-section'), 'cfg-section'),
-        'cfg-field'  : ObjType(l_('cfg-field')  , 'cfg-field' ),
+        'pkg-section': ObjType(_('pkg-section'), 'pkg-section'),
+        'pkg-field'  : ObjType(_('pkg-field')  , 'pkg-field'  ),
+        'cfg-section': ObjType(_('cfg-section'), 'cfg-section'),
+        'cfg-field'  : ObjType(_('cfg-field')  , 'cfg-field' ),
     }
     directives = {
         'pkg-section': CabalPackageSection,
@@ -853,9 +853,12 @@ class CabalDomain(Domain):
     def clear_doc(self, docname):
         for k in ['pkg-sections', 'pkg-fields', 'cfg-sections',
                   'cfg-fields', 'cfg-flags']:
+            to_del = []
             for name, (fn, _, _) in self.data[k].items():
                 if fn == docname:
-                    del self.data[k][name]
+                    to_del.append(name)
+            for name in to_del:
+                del self.data[k][name]
         try:
             del self.data['index-num'][docname]
         except KeyError:
@@ -910,5 +913,5 @@ class CabalLexer(lexer.RegexLexer):
 
 def setup(app):
     app.add_domain(CabalDomain)
-    app.add_lexer('cabal', CabalLexer())
+    app.add_lexer('cabal', CabalLexer)
 

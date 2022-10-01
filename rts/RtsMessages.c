@@ -114,7 +114,7 @@ vdebugBelch(const char*s, va_list ap)
 
 #define BUFSIZE 512
 
-#if defined (mingw32_HOST_OS)
+#if defined(mingw32_HOST_OS)
 static int
 isGUIApp(void)
 {
@@ -248,7 +248,7 @@ rtsSysErrorMsgFn(const char *s, va_list ap)
 
         r = vsnprintf(buf, BUFSIZE, s, ap);
         if (r > 0 && r < BUFSIZE) {
-            r = vsnprintf(buf+r, BUFSIZE-r, ": %s", syserr);
+            r = snprintf(buf+r, BUFSIZE-r, ": %s", syserr);
             MessageBox(NULL /* hWnd */,
                        buf,
                        prog_name,

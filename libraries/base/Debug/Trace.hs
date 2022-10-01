@@ -53,7 +53,7 @@ import GHC.IO.Encoding
 import GHC.Ptr
 import GHC.Show
 import GHC.Stack
-import Data.List
+import Data.List (null, partition)
 
 -- $setup
 -- >>> import Prelude
@@ -81,7 +81,7 @@ traceIO :: String -> IO ()
 traceIO msg = do
     withCString "%s\n" $ \cfmt -> do
      -- NB: debugBelch can't deal with null bytes, so filter them
-     -- out so we don't accidentally truncate the message.  See Trac #9395
+     -- out so we don't accidentally truncate the message.  See #9395
      let (nulls, msg') = partition (=='\0') msg
      withCString msg' $ \cmsg ->
       debugBelch cfmt cmsg
@@ -275,7 +275,7 @@ traceEventIO msg =
 -- When looking at a profile for the execution of a program we often want to
 -- be able to mark certain points or phases in the execution and see that
 -- visually in the profile.
-
+--
 -- For example, a program might have several distinct phases with different
 -- performance or resource behaviour in each phase. To properly interpret the
 -- profile graph we really want to see when each phase starts and ends.

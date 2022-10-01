@@ -3,10 +3,9 @@ Section: haskell
 Priority: optional
 Maintainer: Debian Haskell Group <pkg-haskell-maintainers@lists.alioth.debian.org>
 Uploaders:
- Joachim Breitner <nomeata@debian.org>,
  Clint Adams <clint@debian.org>,
  Ilias Tsitsimpis <iliastsi@debian.org>
-Standards-Version: 4.5.0
+Standards-Version: 4.6.1
 Rules-Requires-Root: no
 Build-Depends:
   debhelper-compat (= 12),
@@ -16,9 +15,9 @@ Build-Depends:
   pkg-config,
   ghc:native (>= 8.6),
   libgmp-dev,
-  llvm-11 [arm64 armel armhf],
+  llvm-13 [arm64 armel armhf],
   libffi-dev,
-  libncurses5-dev,
+  libncurses-dev,
   python3-sphinx <!cross>,
   dpkg-dev (>= 1.16.1.1)
 Build-Depends-Indep:
@@ -32,13 +31,13 @@ Vcs-Browser: https://salsa.debian.org/haskell-team/DHG_packages/tree/master/p/gh
 Package: ghc
 Architecture: any
 Depends:
-  llvm-11 [arm64 armel armhf],
+  llvm-13 [arm64 armel armhf],
   gcc,
   libgmp-dev,
   libffi-dev,
   libbsd-dev,
   libc6-dev,
-  libncurses5-dev,
+  libncurses-dev,
   ${shlibs:Depends},
   ${misc:Depends}
 Pre-Depends: dpkg (>= 1.16.1)
@@ -55,7 +54,7 @@ Replaces: ghc6 (<< 7), ghc-dynamic (<< 7.8), ghc-haddock (<< 7.10), ${conflictin
 Conflicts: ghc6 (<< 7), ghc-dynamic (<< 7.8)
 Breaks: cabal-install (<< 1.22), haskell-devscripts (<< 0.8.13),
  ghc-doc (<< 7.10), ghc-haddock (<< 7.10), ${conflicting-devs}
-Suggests: perl, ghc-prof, ghc-doc, haskell-doc, llvm-11
+Suggests: perl, ghc-prof, ghc-doc, haskell-doc, llvm-13
 Description: The Glasgow Haskell Compilation system
  The Glorious Glasgow Haskell Compilation system (GHC) is a compiler for
  Haskell.

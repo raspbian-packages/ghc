@@ -66,6 +66,7 @@ newtype UnitId = UnitId ShortText
   deriving (Generic, Read, Show, Eq, Ord, Typeable, Data, NFData)
 
 instance Binary UnitId
+instance Structured UnitId
 
 -- | The textual format for 'UnitId' coincides with the format
 -- GHC accepts for @-package-id@.
@@ -77,7 +78,13 @@ instance Pretty UnitId where
 -- GHC accepts for @-package-id@.
 --
 instance Parsec UnitId where
-    parsec = mkUnitId <$> P.munch1 (\c -> isAlphaNum c || c `elem` "-_.+")
+    parsec = mkUnitId <$> P.munch1 isUnitChar where
+        -- https://gitlab.haskell.org/ghc/ghc/issues/17752
+        isUnitChar '-' = True
+        isUnitChar '_' = True
+        isUnitChar '.' = True
+        isUnitChar '+' = True
+        isUnitChar c   = isAlphaNum c
 
 -- | If you need backwards compatibility, consider using 'display'
 -- instead, which is supported by all versions of Cabal.
@@ -113,6 +120,8 @@ getHSLibraryName uid = "HS" ++ prettyShow uid
 -- unfilled holes.
 newtype DefUnitId = DefUnitId { unDefUnitId :: UnitId }
   deriving (Generic, Read, Show, Eq, Ord, Typeable, Data, Binary, NFData, Pretty)
+
+instance Structured DefUnitId
 
 -- Workaround for a GHC 8.0.1 bug, see
 -- https://github.com/haskell/cabal/issues/4793#issuecomment-334258288

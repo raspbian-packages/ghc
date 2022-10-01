@@ -14,11 +14,13 @@ module Distribution.Solver.Modular.Validate (validateTree) where
 
 import Control.Applicative
 import Control.Monad.Reader hiding (sequence)
+import Data.Either (lefts)
 import Data.Function (on)
-import Data.List as L
-import Data.Set as S
 import Data.Traversable
 import Prelude hiding (sequence)
+
+import qualified Data.List as L
+import qualified Data.Set as S
 
 import Language.Haskell.Extension (Extension, Language)
 
@@ -37,6 +39,7 @@ import qualified Distribution.Solver.Modular.WeightedPSQ as W
 
 import Distribution.Solver.Types.PackagePath
 import Distribution.Solver.Types.PkgConfigDb (PkgConfigDb, pkgConfigPkgIsPresent)
+import Distribution.Types.LibraryName
 import Distribution.Types.PkgconfigVersionRange
 
 #ifdef DEBUG_CONFLICT_SETS
@@ -59,7 +62,7 @@ import GHC.Stack (CallStack)
 --       active constraints, we must check that they are consistent with
 --       the current state.
 --
--- We can actually merge (1) and (2) by saying the the current choice is
+-- We can actually merge (1) and (2) by saying the current choice is
 -- a new active constraint, fixing the choice.
 --
 -- If a test fails, we have detected an inconsistent state. We can
@@ -109,8 +112,9 @@ data ValidateState = VS {
   pa                  :: PreAssignment,
 
   -- Map from package name to the components that are provided by the chosen
-  -- instance of that package, and whether those components are buildable.
-  availableComponents :: Map QPN (Map ExposedComponent IsBuildable),
+  -- instance of that package, and whether those components are visible and
+  -- buildable.
+  availableComponents :: Map QPN (Map ExposedComponent ComponentInfo),
 
   -- Map from package name to the components that are required from that
   -- package.
@@ -226,7 +230,7 @@ validate = cata go
           let newDeps :: Either Conflict (PPreAssignment, Map QPN ComponentDependencyReasons)
               newDeps = do
                 nppa <- mnppa
-                rComps' <- extendRequiredComponents aComps rComps newactives
+                rComps' <- extendRequiredComponents qpn aComps rComps newactives
                 checkComponentsInNewPackage (M.findWithDefault M.empty qpn rComps) qpn comps
                 return (nppa, rComps')
           in case newDeps of
@@ -261,7 +265,7 @@ validate = cata go
       -- We now try to get the new active dependencies we might learn about because
       -- we have chosen a new flag.
       let newactives = extractNewDeps (F qfn) b npfa psa qdeps
-          mNewRequiredComps = extendRequiredComponents aComps rComps newactives
+          mNewRequiredComps = extendRequiredComponents qpn aComps rComps newactives
       -- As in the package case, we try to extend the partial assignment.
       let mnppa = extend extSupported langSupported pkgPresent newactives ppa
       case liftM2 (,) mnppa mNewRequiredComps of
@@ -291,7 +295,7 @@ validate = cata go
       -- We now try to get the new active dependencies we might learn about because
       -- we have chosen a new flag.
       let newactives = extractNewDeps (S qsn) b pfa npsa qdeps
-          mNewRequiredComps = extendRequiredComponents aComps rComps newactives
+          mNewRequiredComps = extendRequiredComponents qpn aComps rComps newactives
       -- As in the package case, we try to extend the partial assignment.
       let mnppa = extend extSupported langSupported pkgPresent newactives ppa
       case liftM2 (,) mnppa mNewRequiredComps of
@@ -300,30 +304,36 @@ validate = cata go
             local (\ s -> s { pa = PA nppa pfa npsa, requiredComponents = rComps' }) r
 
 -- | Check that a newly chosen package instance contains all components that
--- are required from that package so far. The components must also be buildable.
+-- are required from that package so far. The components must also be visible
+-- and buildable.
 checkComponentsInNewPackage :: ComponentDependencyReasons
                             -> QPN
-                            -> Map ExposedComponent IsBuildable
+                            -> Map ExposedComponent ComponentInfo
                             -> Either Conflict ()
 checkComponentsInNewPackage required qpn providedComps =
     case M.toList $ deleteKeys (M.keys providedComps) required of
       (missingComp, dr) : _ ->
           Left $ mkConflict missingComp dr NewPackageIsMissingRequiredComponent
       []                    ->
-          case M.toList $ deleteKeys buildableProvidedComps required of
-            (unbuildableComp, dr) : _ ->
-                Left $ mkConflict unbuildableComp dr NewPackageHasUnbuildableRequiredComponent
-            []                        -> Right ()
+          let failures = lefts
+                  [ case () of
+                      _ | compIsVisible compInfo == IsVisible False ->
+                          Left $ mkConflict comp dr NewPackageHasPrivateRequiredComponent
+                        | compIsBuildable compInfo == IsBuildable False ->
+                          Left $ mkConflict comp dr NewPackageHasUnbuildableRequiredComponent
+                        | otherwise -> Right ()
+                  | let merged = M.intersectionWith (,) required providedComps
+                  , (comp, (dr, compInfo)) <- M.toList merged ]
+          in case failures of
+               failure : _ -> Left failure
+               []          -> Right ()
   where
     mkConflict :: ExposedComponent
                -> DependencyReason QPN
                -> (ExposedComponent -> DependencyReason QPN -> FailReason)
                -> Conflict
     mkConflict comp dr mkFailure =
-        (CS.insert (P qpn) (dependencyReasonToCS dr), mkFailure comp dr)
-
-    buildableProvidedComps :: [ExposedComponent]
-    buildableProvidedComps = [comp | (comp, IsBuildable True) <- M.toList providedComps]
+        (CS.insert (P qpn) (dependencyReasonToConflictSet dr), mkFailure comp dr)
 
     deleteKeys :: Ord k => [k] -> Map k v -> Map k v
     deleteKeys ks m = L.foldr M.delete m ks
@@ -393,13 +403,13 @@ extend extSupported langSupported pkgPresent newactives ppa = foldM extendSingle
     extendSingle :: PPreAssignment -> LDep QPN -> Either Conflict PPreAssignment
     extendSingle a (LDep dr (Ext  ext ))  =
       if extSupported  ext  then Right a
-                            else Left (dependencyReasonToCS dr, UnsupportedExtension ext)
+                            else Left (dependencyReasonToConflictSet dr, UnsupportedExtension ext)
     extendSingle a (LDep dr (Lang lang))  =
       if langSupported lang then Right a
-                            else Left (dependencyReasonToCS dr, UnsupportedLanguage lang)
+                            else Left (dependencyReasonToConflictSet dr, UnsupportedLanguage lang)
     extendSingle a (LDep dr (Pkg pn vr))  =
       if pkgPresent pn vr then Right a
-                          else Left (dependencyReasonToCS dr, MissingPkgconfigPackage pn vr)
+                          else Left (dependencyReasonToConflictSet dr, MissingPkgconfigPackage pn vr)
     extendSingle a (LDep dr (Dep dep@(PkgComponent qpn _) ci)) =
       let mergedDep = M.findWithDefault (MergedDepConstrained []) qpn a
       in  case (\ x -> M.insert qpn x a) <$> merge mergedDep (PkgDep dr dep ci) of
@@ -410,13 +420,15 @@ extend extSupported langSupported pkgPresent newactives ppa = foldM extendSingle
 -- the solver chooses foo-2.0, it tries to add the constraint foo==2.0.
 --
 -- TODO: The new constraint is implemented as a dependency from foo to foo's
--- library. That isn't correct, because foo might only be needed as a build
+-- main library. That isn't correct, because foo might only be needed as a build
 -- tool dependency. The implemention may need to change when we support
 -- component-based dependency solving.
 extendWithPackageChoice :: PI QPN -> PPreAssignment -> Either Conflict PPreAssignment
 extendWithPackageChoice (PI qpn i) ppa =
   let mergedDep = M.findWithDefault (MergedDepConstrained []) qpn ppa
-      newChoice = PkgDep (DependencyReason qpn M.empty S.empty) (PkgComponent qpn ExposedLib) (Fixed i)
+      newChoice = PkgDep (DependencyReason qpn M.empty S.empty)
+                         (PkgComponent qpn (ExposedLib LMainLibName))
+                         (Fixed i)
   in  case (\ x -> M.insert qpn x ppa) <$> merge mergedDep newChoice of
         Left (c, (d, _d')) -> -- Don't include the package choice in the
                               -- FailReason, because it is redundant.
@@ -448,14 +460,14 @@ merge ::
 merge (MergedDepFixed comp1 vs1 i1) (PkgDep vs2 (PkgComponent p comp2) ci@(Fixed i2))
   | i1 == i2  = Right $ MergedDepFixed comp1 vs1 i1
   | otherwise =
-      Left ( (CS.union `on` dependencyReasonToCS) vs1 vs2
+      Left ( (CS.union `on` dependencyReasonToConflictSet) vs1 vs2
            , ( ConflictingDep vs1 (PkgComponent p comp1) (Fixed i1)
              , ConflictingDep vs2 (PkgComponent p comp2) ci ) )
 
 merge (MergedDepFixed comp1 vs1 i@(I v _)) (PkgDep vs2 (PkgComponent p comp2) ci@(Constrained vr))
   | checkVR vr v = Right $ MergedDepFixed comp1 vs1 i
   | otherwise    =
-      Left ( (CS.union `on` dependencyReasonToCS) vs1 vs2
+      Left ( createConflictSetForVersionConflict p v vs1 vr vs2
            , ( ConflictingDep vs1 (PkgComponent p comp1) (Fixed i)
              , ConflictingDep vs2 (PkgComponent p comp2) ci ) )
 
@@ -467,7 +479,7 @@ merge (MergedDepConstrained vrOrigins) (PkgDep vs2 (PkgComponent p comp2) ci@(Fi
     go ((vr, comp1, vs1) : vros)
        | checkVR vr v = go vros
        | otherwise    =
-           Left ( (CS.union `on` dependencyReasonToCS) vs1 vs2
+           Left ( createConflictSetForVersionConflict p v vs2 vr vs1
                 , ( ConflictingDep vs1 (PkgComponent p comp1) (Constrained vr)
                   , ConflictingDep vs2 (PkgComponent p comp2) ci ) )
 
@@ -479,31 +491,78 @@ merge (MergedDepConstrained vrOrigins) (PkgDep vs2 (PkgComponent _ comp2) (Const
     -- no negative performance impact.
     vrOrigins ++ [(vr, comp2, vs2)])
 
+-- | Creates a conflict set representing a conflict between a version constraint
+-- and the fixed version chosen for a package.
+createConflictSetForVersionConflict :: QPN
+                                    -> Ver
+                                    -> DependencyReason QPN
+                                    -> VR
+                                    -> DependencyReason QPN
+                                    -> ConflictSet
+createConflictSetForVersionConflict pkg
+                                    conflictingVersion
+                                    versionDR@(DependencyReason p1 _ _)
+                                    conflictingVersionRange
+                                    versionRangeDR@(DependencyReason p2 _ _) =
+  let hasFlagsOrStanzas (DependencyReason _ fs ss) = not (M.null fs) || not (S.null ss)
+  in
+    -- The solver currently only optimizes the case where there is a conflict
+    -- between the version chosen for a package and a version constraint that
+    -- is not under any flags or stanzas. Here is how we check for this case:
+    --
+    --   (1) Choosing a specific version for a package foo is implemented as
+    --       adding a dependency from foo to that version of foo (See
+    --       extendWithPackageChoice), so we check that the DependencyReason
+    --       contains the current package and no flag or stanza choices.
+    --
+    --   (2) We check that the DependencyReason for the version constraint also
+    --       contains no flag or stanza choices.
+    --
+    -- When these criteria are not met, we fall back to calling
+    -- dependencyReasonToConflictSet.
+    if p1 == pkg && not (hasFlagsOrStanzas versionDR) && not (hasFlagsOrStanzas versionRangeDR)
+    then let cs1 = dependencyReasonToConflictSetWithVersionConflict
+                   p2
+                   (CS.OrderedVersionRange conflictingVersionRange)
+                   versionDR
+             cs2 = dependencyReasonToConflictSetWithVersionConstraintConflict
+                   pkg conflictingVersion versionRangeDR
+         in cs1 `CS.union` cs2
+    else dependencyReasonToConflictSet versionRangeDR `CS.union` dependencyReasonToConflictSet versionDR
+
 -- | Takes a list of new dependencies and uses it to try to update the map of
 -- known component dependencies. It returns a failure when a new dependency
--- requires a component that is missing or unbuildable in a previously chosen
--- packages.
-extendRequiredComponents :: Map QPN (Map ExposedComponent IsBuildable)
+-- requires a component that is missing, private, or unbuildable in a previously
+-- chosen package.
+extendRequiredComponents :: QPN -- ^ package we extend
+                         -> Map QPN (Map ExposedComponent ComponentInfo)
                          -> Map QPN ComponentDependencyReasons
                          -> [LDep QPN]
                          -> Either Conflict (Map QPN ComponentDependencyReasons)
-extendRequiredComponents available = foldM extendSingle
+extendRequiredComponents eqpn available = foldM extendSingle
   where
     extendSingle :: Map QPN ComponentDependencyReasons
                  -> LDep QPN
                  -> Either Conflict (Map QPN ComponentDependencyReasons)
     extendSingle required (LDep dr (Dep (PkgComponent qpn comp) _)) =
       let compDeps = M.findWithDefault M.empty qpn required
+          success = Right $ M.insertWith M.union qpn (M.insert comp dr compDeps) required
       in -- Only check for the existence of the component if its package has
          -- already been chosen.
          case M.lookup qpn available of
-           Just comps
-             | M.notMember comp comps                ->
-                 Left $ mkConflict qpn comp dr PackageRequiresMissingComponent
-             | L.notElem comp (buildableComps comps) ->
-                 Left $ mkConflict qpn comp dr PackageRequiresUnbuildableComponent
-           _                                         ->
-                 Right $ M.insertWith M.union qpn (M.insert comp dr compDeps) required
+           Just comps ->
+               case M.lookup comp comps of
+                 Nothing ->
+                     Left $ mkConflict qpn comp dr PackageRequiresMissingComponent
+                 Just compInfo
+                   | compIsVisible compInfo == IsVisible False
+                   , eqpn /= qpn -- package components can depend on other components
+                   ->
+                     Left $ mkConflict qpn comp dr PackageRequiresPrivateComponent
+                   | compIsBuildable compInfo == IsBuildable False ->
+                     Left $ mkConflict qpn comp dr PackageRequiresUnbuildableComponent
+                   | otherwise -> success
+           Nothing    -> success
     extendSingle required _                                         = Right required
 
     mkConflict :: QPN
@@ -512,10 +571,7 @@ extendRequiredComponents available = foldM extendSingle
                -> (QPN -> ExposedComponent -> FailReason)
                -> Conflict
     mkConflict qpn comp dr mkFailure =
-      (CS.insert (P qpn) (dependencyReasonToCS dr), mkFailure qpn comp)
-
-    buildableComps :: Map comp IsBuildable -> [comp]
-    buildableComps comps = [comp | (comp, IsBuildable True) <- M.toList comps]
+      (CS.insert (P qpn) (dependencyReasonToConflictSet dr), mkFailure qpn comp)
 
 
 -- | Interface.

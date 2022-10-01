@@ -1,7 +1,7 @@
 .. _introduction-GHC:
 
-Introduction to GHC
-===================
+Introduction
+============
 
 This is a guide to using the Glasgow Haskell Compiler (GHC): an
 interactive and batch compilation system for the
@@ -49,7 +49,7 @@ Go to the `GHC home page <http://www.haskell.org/ghc/>`__ and follow the
 "download" link to download GHC for your platform.
 
 Alternatively, if you want to build GHC yourself, head on over to the
-:ghc-wiki:`GHC Building Guide <Building>` to find out how to get the sources,
+:ghc-wiki:`GHC Building Guide <building>` to find out how to get the sources,
 and build it on your system. Note that GHC itself is written in Haskell, so you
 will still need to install GHC in order to build it.
 
@@ -66,7 +66,7 @@ On the World-Wide Web, there are several URLs of likely interest:
 
 -  `GHC home page <http://www.haskell.org/ghc/>`__
 
--  `GHC Developers Home <http://ghc.haskell.org/trac/ghc/>`__ (developer
+-  `GHC Developers Home <https://gitlab.haskell.org/ghc/ghc>`__ (developer
    documentation, wiki, and bug tracker)
 
 We run the following mailing lists about GHC. We encourage you to join,
@@ -104,7 +104,7 @@ Reporting bugs in GHC
    single: reporting bugs
 
 Glasgow Haskell is a changing system so there are sure to be bugs in it.
-If you find one, please see :ghc-wiki:`this wiki page <ReportABug>` for
+If you find one, please see :ghc-wiki:`this wiki page <report-a-bug>` for
 information on how to report it.
 
 .. _version-numbering:
@@ -138,7 +138,7 @@ numbering GHC versions:
     `available for
     download <http://www.haskell.org/ghc/dist/stable/dist/>`__, and the
     latest sources are available from
-    :ghc-wiki:`the git repositories <Repositories>`.
+    :ghc-wiki:`the git repositories <repositories>`.
 
     Stable snapshot releases are named ``x.y.z.YYYYMMDD``. where
     ``YYYYMMDD`` is the date of the sources from which the snapshot was
@@ -149,7 +149,7 @@ numbering GHC versions:
     We may make snapshot releases of the HEAD `available for
     download <http://www.haskell.org/ghc/dist/current/dist/>`__, and the
     latest sources are available from
-    :ghc-wiki:`the git repositories <Repositories>`.
+    :ghc-wiki:`the git repositories <repositories>`.
 
     Unstable snapshot releases are named ``x.y.YYYYMMDD``. where
     ``YYYYMMDD`` is the date of the sources from which the snapshot was
@@ -169,4 +169,40 @@ with the ``--version`` flag (see :ref:`options-help`).
 
 The compiler version can be tested within compiled code with the
 ``MIN_VERSION_GLASGOW_HASKELL`` CPP macro (defined only when
-:ghc-flag:`-XCPP` is used). See :ref:`standard-cpp-macros` for details. 
+:extension:`CPP` is used). See :ref:`standard-cpp-macros` for details.
+
+.. _License:
+
+The Glasgow Haskell Compiler License
+------------------------------------
+
+Copyright 2002 - 2007, The University Court of the University of
+Glasgow. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+-  Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+
+-  Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+
+-  Neither name of the University nor the names of its contributors may
+   be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE UNIVERSITY COURT OF THE UNIVERSITY OF
+GLASGOW AND THE CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED
+WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN
+NO EVENT SHALL THE UNIVERSITY COURT OF THE UNIVERSITY OF GLASGOW OR THE
+CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

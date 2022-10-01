@@ -31,43 +31,36 @@ module Distribution.PackageDescription.Configuration (
     mapTreeConstrs,
     transformAllBuildInfos,
     transformAllBuildDepends,
+    transformAllBuildDependsN,
   ) where
 
-import Prelude ()
 import Distribution.Compat.Prelude
+import Prelude ()
 
 -- lens
-import qualified Distribution.Types.BuildInfo.Lens as L
+import qualified Distribution.Types.BuildInfo.Lens                 as L
 import qualified Distribution.Types.GenericPackageDescription.Lens as L
-import qualified Distribution.Types.PackageDescription.Lens as L
-import qualified Distribution.Types.SetupBuildInfo.Lens as L
+import qualified Distribution.Types.PackageDescription.Lens        as L
+import qualified Distribution.Types.SetupBuildInfo.Lens            as L
 
-import Distribution.PackageDescription
-import Distribution.PackageDescription.Utils
-import Distribution.Version
-import Distribution.Compiler
-import Distribution.System
-import Distribution.Parsec
-import Distribution.Pretty
-import Distribution.Compat.CharParsing hiding (char)
-import qualified Distribution.Compat.CharParsing as P
-import Distribution.Simple.Utils
-import Distribution.Compat.Lens
-import Distribution.Types.ComponentRequestedSpec
-import Distribution.Types.ForeignLib
-import Distribution.Types.Component
-import Distribution.Types.Dependency
-import Distribution.Types.PackageName
-import Distribution.Types.UnqualComponentName
-import Distribution.Types.CondTree
-import Distribution.Types.Condition
-import Distribution.Types.DependencyMap
+import           Distribution.Compat.CharParsing             hiding (char)
+import qualified Distribution.Compat.CharParsing             as P
+import           Distribution.Compat.Lens
+import           Distribution.Compiler
+import           Distribution.PackageDescription
+import           Distribution.PackageDescription.Utils
+import           Distribution.Parsec
+import           Distribution.Pretty
+import           Distribution.Simple.Utils
+import           Distribution.System
+import           Distribution.Types.Component
+import           Distribution.Types.ComponentRequestedSpec
+import           Distribution.Types.DependencyMap
+import           Distribution.Types.PackageVersionConstraint
+import           Distribution.Version
 
-import qualified Data.Map.Strict as Map.Strict
-import qualified Data.Map.Lazy   as Map
-import Data.Set ( Set )
-import qualified Data.Set as Set
-import Data.Tree ( Tree(Node) )
+import qualified Data.Map.Lazy as Map
+import           Data.Tree     (Tree (Node))
 
 ------------------------------------------------------------------------------
 
@@ -89,7 +82,7 @@ simplifyWithSysParams os arch cinfo cond = (cond', flags)
           Just compat -> Right (any matchImpl compat)
           where
             matchImpl (CompilerId c v) = comp == c && v `withinRange` vr
-    interp (Flag f) = Left f
+    interp (PackageFlag f) = Left f
 
 -- TODO: Add instances and check
 --
@@ -126,10 +119,10 @@ parseCondition = condOr
     boolLiteral   = fmap Lit  parsec
     archIdent     = fmap Arch parsec
     osIdent       = fmap OS   parsec
-    flagIdent     = fmap (Flag . mkFlagName . lowercase) (munch1 isIdentChar)
+    flagIdent     = fmap (PackageFlag . mkFlagName . lowercase) (munch1 isIdentChar)
     isIdentChar c = isAlphaNum c || c == '_' || c == '-'
     oper s        = sp >> string s >> sp
-    sp            = spaces 
+    sp            = spaces
     implIdent     = do i <- parsec
                        vr <- sp >> option anyVersion parsec
                        return $ Impl i vr
@@ -178,7 +171,7 @@ resolveWithFlags ::
   -> OS      -- ^ OS as returned by Distribution.System.buildOS
   -> Arch    -- ^ Arch as returned by Distribution.System.buildArch
   -> CompilerInfo  -- ^ Compiler information
-  -> [Dependency]  -- ^ Additional constraints
+  -> [PackageVersionConstraint]  -- ^ Additional constraints
   -> [CondTree ConfVar [Dependency] PDTagged]
   -> ([Dependency] -> DepTestRslt [Dependency])  -- ^ Dependency test function.
   -> Either [Dependency] (TargetSet PDTagged, FlagAssignment)
@@ -187,8 +180,6 @@ resolveWithFlags ::
 resolveWithFlags dom enabled os arch impl constrs trees checkDeps =
     either (Left . fromDepMapUnion) Right $ explore (build mempty dom)
   where
-    extraConstrs = toDepMap constrs
-
     -- simplify trees by (partially) evaluating all conditions and converting
     -- dependencies to dependency maps.
     simplifiedTrees :: [CondTree FlagName DependencyMap PDTagged]
@@ -207,7 +198,7 @@ resolveWithFlags dom enabled os arch impl constrs trees checkDeps =
     explore (Node flags ts) =
         let targetSet = TargetSet $ flip map simplifiedTrees $
                 -- apply additional constraints to all dependencies
-                first (`constrainBy` extraConstrs) .
+                first (`constrainBy` constrs) .
                 simplifyCondTree (env flags)
             deps = overallDependencies enabled targetSet
         in case checkDeps (fromDepMap deps) of
@@ -229,11 +220,7 @@ resolveWithFlags dom enabled os arch impl constrs trees checkDeps =
     mp :: Either DepMapUnion a -> Either DepMapUnion a -> Either DepMapUnion a
     mp m@(Right _) _           = m
     mp _           m@(Right _) = m
-    mp (Left xs)   (Left ys)   =
-        let union = Map.foldrWithKey (Map.Strict.insertWith combine)
-                    (unDepMapUnion xs) (unDepMapUnion ys)
-            combine x y = (\(vr, cs) -> (simplifyVersionRange vr,cs)) $ unionVersionRanges' x y
-        in union `seq` Left (DepMapUnion union)
+    mp (Left xs)   (Left ys)   = Left (xs <> ys)
 
     -- `mzero'
     mz :: Either DepMapUnion a
@@ -309,26 +296,29 @@ extractConditions f gpkg =
     ]
 
 
--- | A map of dependencies that combines version ranges using 'unionVersionRanges'.
-newtype DepMapUnion = DepMapUnion { unDepMapUnion :: Map PackageName (VersionRange, Set LibraryName) }
+-- | A map of package constraints that combines version ranges using 'unionVersionRanges'.
+newtype DepMapUnion = DepMapUnion { unDepMapUnion :: Map PackageName (VersionRange, NonEmptySet LibraryName) }
 
--- An union of versions should correspond to an intersection of the components.
--- The intersection may not be necessary.
-unionVersionRanges' :: (VersionRange, Set LibraryName)
-                    -> (VersionRange, Set LibraryName)
-                    -> (VersionRange, Set LibraryName)
-unionVersionRanges' (vra, csa) (vrb, csb) =
-  (unionVersionRanges vra vrb, Set.intersection csa csb)
+instance Semigroup DepMapUnion where
+    DepMapUnion x <> DepMapUnion y = DepMapUnion $
+        Map.unionWith unionVersionRanges' x y
+
+unionVersionRanges'
+    :: (VersionRange, NonEmptySet LibraryName)
+    -> (VersionRange, NonEmptySet LibraryName)
+    -> (VersionRange, NonEmptySet LibraryName)
+unionVersionRanges' (vr, cs) (vr', cs') = (unionVersionRanges vr vr', cs <> cs')
 
 toDepMapUnion :: [Dependency] -> DepMapUnion
 toDepMapUnion ds =
   DepMapUnion $ Map.fromListWith unionVersionRanges' [ (p,(vr,cs)) | Dependency p vr cs <- ds ]
 
+
 fromDepMapUnion :: DepMapUnion -> [Dependency]
 fromDepMapUnion m = [ Dependency p vr cs | (p,(vr,cs)) <- Map.toList (unDepMapUnion m) ]
 
 freeVars :: CondTree ConfVar c a  -> [FlagName]
-freeVars t = [ f | Flag f <- freeVars' t ]
+freeVars t = [ f | PackageFlag f <- freeVars' t ]
   where
     freeVars' (CondNode _ _ ifs) = concatMap compfv ifs
     compfv (CondBranch c ct mct) = condfv c ++ freeVars' ct ++ maybe [] freeVars' mct
@@ -439,7 +429,7 @@ finalizePD ::
                           -- True.
   -> Platform      -- ^ The 'Arch' and 'OS'
   -> CompilerInfo  -- ^ Compiler information
-  -> [Dependency]  -- ^ Additional constraints
+  -> [PackageVersionConstraint]  -- ^ Additional constraints
   -> GenericPackageDescription
   -> Either [Dependency]
             (PackageDescription, FlagAssignment)
@@ -447,7 +437,7 @@ finalizePD ::
              -- description along with the flag assignments chosen.
 finalizePD userflags enabled satisfyDep
         (Platform arch os) impl constraints
-        (GenericPackageDescription pkg flags mb_lib0 sub_libs0 flibs0 exes0 tests0 bms0) = do
+        (GenericPackageDescription pkg _ver flags mb_lib0 sub_libs0 flibs0 exes0 tests0 bms0) = do
   (targetSet, flagVals) <-
     resolveWithFlags flagChoices enabled os arch impl constraints condTrees check
   let
@@ -479,7 +469,7 @@ finalizePD userflags enabled satisfyDep
                 ++ map (\(name,tree) -> mapTreeData (SubComp name . CTest) tree) tests0
                 ++ map (\(name,tree) -> mapTreeData (SubComp name . CBench) tree) bms0
 
-    flagChoices    = map (\(MkFlag n _ d manual) -> (n, d2c manual n d)) flags
+    flagChoices    = map (\(MkPackageFlag n _ d manual) -> (n, d2c manual n d)) flags
     d2c manual n b = case lookupFlagAssignment n userflags of
                      Just val -> [val]
                      Nothing
@@ -516,7 +506,7 @@ resolveWithFlags [] Distribution.System.Linux Distribution.System.I386 (Distribu
 -- function.
 flattenPackageDescription :: GenericPackageDescription -> PackageDescription
 flattenPackageDescription
-  (GenericPackageDescription pkg _ mlib0 sub_libs0 flibs0 exes0 tests0 bms0) =
+  (GenericPackageDescription pkg _ _ mlib0 sub_libs0 flibs0 exes0 tests0 bms0) =
     pkg { library      = mlib
         , subLibraries = reverse sub_libs
         , foreignLibs  = reverse flibs
@@ -596,3 +586,14 @@ transformAllBuildDepends f =
   . over (L.packageDescription . L.setupBuildInfo . traverse . L.setupDepends . traverse) f
   -- cannot be point-free as normal because of higher rank
   . over (\f' -> L.allCondTrees $ traverseCondTreeC f') (map f)
+
+-- | Walk a 'GenericPackageDescription' and apply @f@ to all nested
+-- @build-depends@ fields.
+transformAllBuildDependsN :: ([Dependency] -> [Dependency])
+                          -> GenericPackageDescription
+                          -> GenericPackageDescription
+transformAllBuildDependsN f =
+  over (L.traverseBuildInfos . L.targetBuildDepends) f
+  . over (L.packageDescription . L.setupBuildInfo . traverse . L.setupDepends) f
+  -- cannot be point-free as normal because of higher rank
+  . over (\f' -> L.allCondTrees $ traverseCondTreeC f') f

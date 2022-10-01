@@ -21,11 +21,9 @@ module Distribution.Solver.Modular.Preference
 import Prelude ()
 import Distribution.Solver.Compat.Prelude
 
-import Data.Function (on)
 import qualified Data.List as L
 import qualified Data.Map as M
-import Control.Monad.Reader hiding (sequence)
-import Data.Traversable (sequence)
+import Control.Monad.Trans.Reader (Reader, runReader, ask, local)
 
 import Distribution.PackageDescription (lookupFlagAssignment, unFlagAssignment) -- from Cabal
 
@@ -343,7 +341,9 @@ onlyConstrained :: (PN -> Bool) -> Tree d QGoalReason -> Tree d QGoalReason
 onlyConstrained p = trav go
   where
     go (PChoiceF v@(Q _ pn) _ gr _) | not (p pn)
-      = FailF (varToConflictSet (P v) `CS.union` goalReasonToCS gr) NotExplicit
+      = FailF
+        (varToConflictSet (P v) `CS.union` goalReasonToConflictSetWithConflict v gr)
+        NotExplicit
     go x
       = x
 
@@ -460,7 +460,7 @@ enforceSingleInstanceRestriction = (`runReader` M.empty) . cata go
 
     -- We just verify package choices.
     go (PChoiceF qpn rdm gr cs) =
-      PChoice qpn rdm gr <$> sequence (W.mapWithKey (goP qpn) cs)
+      PChoice qpn rdm gr <$> sequenceA (W.mapWithKey (goP qpn) cs)
     go _otherwise =
       innM _otherwise
 

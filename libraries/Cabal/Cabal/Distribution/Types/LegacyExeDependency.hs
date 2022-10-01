@@ -9,10 +9,10 @@ import Prelude ()
 
 import Distribution.Parsec
 import Distribution.Pretty
-import Distribution.Version      (VersionRange, anyVersion)
+import Distribution.Version (VersionRange, anyVersion)
 
 import qualified Distribution.Compat.CharParsing as P
-import           Text.PrettyPrint           (text, (<+>))
+import qualified Text.PrettyPrint                as Disp
 
 -- | Describes a legacy `build-tools`-style dependency on an executable
 --
@@ -27,11 +27,12 @@ data LegacyExeDependency = LegacyExeDependency
                          deriving (Generic, Read, Show, Eq, Typeable, Data)
 
 instance Binary LegacyExeDependency
+instance Structured LegacyExeDependency
 instance NFData LegacyExeDependency where rnf = genericRnf
 
 instance Pretty LegacyExeDependency where
-  pretty (LegacyExeDependency name ver) =
-    text name <+> pretty ver
+    pretty (LegacyExeDependency name ver) =
+        Disp.text name <+> pretty ver
 
 instance Parsec LegacyExeDependency where
     parsec = do
@@ -40,7 +41,7 @@ instance Parsec LegacyExeDependency where
         verRange <- parsecMaybeQuoted parsec <|> pure anyVersion
         pure $ LegacyExeDependency name verRange
       where
-        nameP = intercalate "-" <$> P.sepBy1 component (P.char '-')
+        nameP = intercalate "-" <$> toList <$> P.sepByNonEmpty component (P.char '-')
         component = do
             cs <- P.munch1 (\c -> isAlphaNum c || c == '+' || c == '_')
             if all isDigit cs then fail "invalid component" else return cs

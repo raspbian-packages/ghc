@@ -39,6 +39,7 @@
 #include "Rts.h"
 
 #include "Ticker.h"
+#include "RtsUtils.h"
 #include "Proftimer.h"
 #include "Schedule.h"
 #include "posix/Clock.h"
@@ -62,6 +63,9 @@
 #include <string.h>
 
 #include <pthread.h>
+#if defined(HAVE_PTHREAD_NP_H)
+#include <pthread_np.h>
+#endif
 #include <unistd.h>
 #include <fcntl.h>
 
@@ -84,11 +88,11 @@ static Time itimer_interval = DEFAULT_TICK_INTERVAL;
 
 // Should we be firing ticks?
 // Writers to this must hold the mutex below.
-static volatile bool stopped = false;
+static bool stopped = false;
 
 // should the ticker thread exit?
 // This can be set without holding the mutex.
-static volatile bool exited = true;
+static bool exited = true;
 
 // Signaled when we want to (re)start the timer
 static Condition start_cond;
@@ -119,7 +123,9 @@ static void *itimer_thread_func(void *_handle_tick)
     }
 #endif
 
-    while (!exited) {
+    // Relaxed is sufficient: If we don't see that exited was set in one iteration we will
+    // see it next time.
+    while (!RELAXED_LOAD(&exited)) {
         if (USE_TIMERFD_FOR_ITIMER) {
             ssize_t r = read(timerfd, &nticks, sizeof(nticks));
             if ((r == 0) && (errno == 0)) {
@@ -135,13 +141,14 @@ static void *itimer_thread_func(void *_handle_tick)
                barf("Itimer: read(timerfd) failed with %s and returned %zd", strerror(errno), r);
             }
         } else {
-            if (usleep(TimeToUS(itimer_interval)) != 0 && errno != EINTR) {
-                sysErrorBelch("usleep(TimeToUS(itimer_interval) failed");
+            if (rtsSleep(itimer_interval) != 0) {
+                sysErrorBelch("ITimer: sleep failed: %s", strerror(errno));
             }
         }
 
         // first try a cheap test
-        if (stopped) {
+        TSAN_ANNOTATE_BENIGN_RACE(&stopped, "itimer_thread_func");
+        if (RELAXED_LOAD(&stopped)) {
             OS_ACQUIRE_LOCK(&mutex);
             // should we really stop?
             if (stopped) {
@@ -162,8 +169,13 @@ void
 initTicker (Time interval, TickProc handle_tick)
 {
     itimer_interval = interval;
-    stopped = false;
+    stopped = true;
     exited = false;
+#if defined(HAVE_SIGNAL_H)
+    sigset_t mask, omask;
+    int sigret;
+#endif
+    int ret;
 
     initCondition(&start_cond);
     initMutex(&mutex);
@@ -171,10 +183,35 @@ initTicker (Time interval, TickProc handle_tick)
     /*
      * We can't use the RTS's createOSThread here as we need to remain attached
      * to the thread we create so we can later join to it if requested
+     *
+     * On FreeBSD 12.2 pthread_set_name_np() is unconditionally declared in
+     * <pthread_np.h>, while pthread_setname_np() is conditionally declared in
+     * <pthread.h> when _POSIX_SOURCE is not defined, but we're including
+     * <PosixSource.h>, so must use pthread_set_name_np() instead.  See similar
+     * code in "rts/posix/OSThreads.c".
+     *
+     * Create the thread with all blockable signals blocked, leaving signal
+     * handling to the main and/or other threads.  This is especially useful in
+     * the non-threaded runtime, where applications might expect sigprocmask(2)
+     * to effectively block signals.
      */
-    if (! pthread_create(&thread, NULL, itimer_thread_func, (void*)handle_tick)) {
-#if defined(HAVE_PTHREAD_SETNAME_NP)
+#if defined(HAVE_SIGNAL_H)
+    sigfillset(&mask);
+    sigret = pthread_sigmask(SIG_SETMASK, &mask, &omask);
+#endif
+    ret = pthread_create(&thread, NULL, itimer_thread_func, (void*)handle_tick);
+#if defined(HAVE_SIGNAL_H)
+    if (sigret == 0)
+        pthread_sigmask(SIG_SETMASK, &omask, NULL);
+#endif
+
+    if (ret == 0) {
+#if defined(HAVE_PTHREAD_SET_NAME_NP)
+        pthread_set_name_np(thread, "ghc_ticker");
+#elif defined(HAVE_PTHREAD_SETNAME_NP)
         pthread_setname_np(thread, "ghc_ticker");
+#elif defined(HAVE_PTHREAD_SETNAME_NP_DARWIN)
+        pthread_setname_np("ghc_ticker");
 #endif
     } else {
         barf("Itimer: Failed to spawn thread: %s", strerror(errno));
@@ -185,7 +222,7 @@ void
 startTicker(void)
 {
     OS_ACQUIRE_LOCK(&mutex);
-    stopped = 0;
+    RELAXED_STORE(&stopped, false);
     signalCondition(&start_cond);
     OS_RELEASE_LOCK(&mutex);
 }
@@ -195,7 +232,7 @@ void
 stopTicker(void)
 {
     OS_ACQUIRE_LOCK(&mutex);
-    stopped = 1;
+    RELAXED_STORE(&stopped, true);
     OS_RELEASE_LOCK(&mutex);
 }
 
@@ -203,8 +240,8 @@ stopTicker(void)
 void
 exitTicker (bool wait)
 {
-    ASSERT(!exited);
-    exited = true;
+    ASSERT(!SEQ_CST_LOAD(&exited));
+    SEQ_CST_STORE(&exited, true);
     // ensure that ticker wakes up if stopped
     startTicker();
 

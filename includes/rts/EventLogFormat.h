@@ -9,65 +9,25 @@
  * of the format, and new tools will be able to understand old log
  * files.
  *
- * Each event has a specific format.  If you add new events, give them
- * new numbers: we never re-use old event numbers.
- *
- * - The format is endian-independent: all values are represented in
- *    bigendian order.
- *
- * - The format is extensible:
- *
- *    - The header describes each event type and its length.  Tools
- *      that don't recognise a particular event type can skip those events.
- *
- *    - There is room for extra information in the event type
- *      specification, which can be ignored by older tools.
- *
- *    - Events can have extra information added, but existing fields
- *      cannot be changed.  Tools should ignore extra fields at the
- *      end of the event record.
- *
- *    - Old event type ids are never re-used; just take a new identifier.
- *
- *
- * The format
- * ----------
- *
- * log : EVENT_HEADER_BEGIN
- *       EventType*
- *       EVENT_HEADER_END
- *       EVENT_DATA_BEGIN
- *       Event*
- *       EVENT_DATA_END
- *
- * EventType :
- *       EVENT_ET_BEGIN
- *       Word16         -- unique identifier for this event
- *       Int16          -- >=0  size of the event in bytes (minus the header)
- *                      -- -1   variable size
- *       Word32         -- length of the next field in bytes
- *       Word8*         -- string describing the event
- *       Word32         -- length of the next field in bytes
- *       Word8*         -- extra info (for future extensions)
- *       EVENT_ET_END
- *
- * Event :
- *       Word16         -- event_type
- *       Word64         -- time (nanosecs)
- *       [Word16]       -- length of the rest (for variable-sized events only)
- *       ... extra event-specific info ...
- *
+ * The canonical documentation for the event log format and record layouts is
+ * the "Eventlog encodings" section of the GHC User's Guide.
  *
  * To add a new event
  * ------------------
  *
  *  - In this file:
- *    - give it a new number, add a new #define EVENT_XXX below
+ *    - give it a new number, add a new #define EVENT_XXX
+ *      below. Do not reuse event ids from deprecated event types.
+ *
  *  - In EventLog.c
  *    - add it to the EventDesc array
  *    - emit the event type in initEventLogging()
  *    - emit the new event in postEvent_()
  *    - generate the event itself by calling postEvent() somewhere
+ *
+ *  - Describe the meaning and encoding of the event in the users guide
+ *    (docs/user_guide/eventlog-formats.rst)
+ *
  *  - In the Haskell code to parse the event log file:
  *    - add types and code to read the new event
  *
@@ -178,15 +138,28 @@
 #define EVENT_HEAP_PROF_SAMPLE_BEGIN       162
 #define EVENT_HEAP_PROF_SAMPLE_COST_CENTRE 163
 #define EVENT_HEAP_PROF_SAMPLE_STRING      164
+#define EVENT_HEAP_PROF_SAMPLE_END         165
+#define EVENT_HEAP_BIO_PROF_SAMPLE_BEGIN   166
+#define EVENT_PROF_SAMPLE_COST_CENTRE      167
+#define EVENT_PROF_BEGIN                   168
 
 #define EVENT_USER_BINARY_MSG              181
+
+#define EVENT_CONC_MARK_BEGIN              200
+#define EVENT_CONC_MARK_END                201
+#define EVENT_CONC_SYNC_BEGIN              202
+#define EVENT_CONC_SYNC_END                203
+#define EVENT_CONC_SWEEP_BEGIN             204
+#define EVENT_CONC_SWEEP_END               205
+#define EVENT_CONC_UPD_REM_SET_FLUSH       206
+#define EVENT_NONMOVING_HEAP_CENSUS        207
 
 /*
  * The highest event code +1 that ghc itself emits. Note that some event
  * ranges higher than this are reserved but not currently emitted by ghc.
  * This must match the size of the EventDesc[] array in EventLog.c
  */
-#define NUM_GHC_EVENT_TAGS        182
+#define NUM_GHC_EVENT_TAGS        208
 
 #if 0  /* DEPRECATED EVENTS: */
 /* we don't actually need to record the thread, it's implicit */

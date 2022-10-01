@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric      #-}
+{-# LANGUAGE OverloadedStrings  #-}
 
 module Distribution.Types.TestType (
     TestType(..),
@@ -12,7 +13,7 @@ import Prelude ()
 
 import Distribution.Parsec
 import Distribution.Pretty
-import Text.PrettyPrint          (char, text)
+import Text.PrettyPrint    (char, text)
 
 -- | The \"test-type\" field in the test suite stanza.
 --
@@ -22,6 +23,7 @@ data TestType = TestTypeExe Version     -- ^ \"type: exitcode-stdio-x.y\"
     deriving (Generic, Show, Read, Eq, Typeable, Data)
 
 instance Binary TestType
+instance Structured TestType
 
 instance NFData TestType where rnf = genericRnf
 

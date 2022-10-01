@@ -7,7 +7,7 @@ GenericPackageDescription
                      {condTreeComponents = [],
                       condTreeConstraints = [],
                       condTreeData = Library
-                                       {exposedModules = [`ModuleName ["Issue"]`],
+                                       {exposedModules = [ModuleName "Issue"],
                                         libBuildInfo = BuildInfo
                                                          {asmOptions = [],
                                                           asmSources = [],
@@ -65,6 +65,7 @@ GenericPackageDescription
    condSubLibraries = [],
    condTestSuites = [],
    genPackageFlags = [],
+   gpdScannedVersion = Nothing,
    packageDescription = PackageDescription
                           {author = "",
                            benchmarks = [],
@@ -73,7 +74,7 @@ GenericPackageDescription
                            category = "",
                            copyright = "",
                            customFieldsPD = [],
-                           dataDir = "",
+                           dataDir = ".",
                            dataFiles = [],
                            description = concat
                                            ["Here is some C code:\n",
@@ -94,12 +95,12 @@ GenericPackageDescription
                            licenseRaw = Left NONE,
                            maintainer = "",
                            package = PackageIdentifier
-                                       {pkgName = `PackageName "issue"`,
-                                        pkgVersion = `mkVersion [744]`},
+                                       {pkgName = PackageName "issue",
+                                        pkgVersion = mkVersion [744]},
                            pkgUrl = "",
                            setupBuildInfo = Nothing,
                            sourceRepos = [],
-                           specVersionRaw = Right (OrLaterVersion `mkVersion [1,12]`),
+                           specVersion = CabalSpecV1_12,
                            stability = "",
                            subLibraries = [],
                            synopsis = "Package description parser interprets curly braces in the description field",

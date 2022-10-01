@@ -1,21 +1,36 @@
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE CPP                #-}
 {-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DeriveGeneric      #-}
 
+-- | Compact representation of short 'Strings'
+--
+-- This module is designed to be import qualifeid
+--
+-- @
+-- import Distribution.Utils.ShortText (ShortText)
+-- import qualified Distribution.Utils.ShortText as ShortText
+-- @
 module Distribution.Utils.ShortText
     ( -- * 'ShortText' type
       ShortText
     , toShortText
     , fromShortText
+    , unsafeFromUTF8BS
+
+      -- * Operations
+    , null
+    , length
 
       -- * internal utilities
     , decodeStringUtf8
     , encodeStringUtf8
     ) where
 
+import Distribution.Compat.Prelude hiding (length, null)
 import Prelude ()
-import Distribution.Compat.Prelude
-import Distribution.Utils.String
+
+import Distribution.Utils.String     (decodeStringUtf8, encodeStringUtf8)
+import Distribution.Utils.Structured (Structured (..), nominalStructure)
 
 #if defined(MIN_VERSION_bytestring)
 # if MIN_VERSION_bytestring(0,10,4)
@@ -40,8 +55,13 @@ import Distribution.Utils.String
 #define MIN_VERSION_binary(x, y, z) 0
 #endif
 
+import qualified Data.ByteString as BS
+import qualified Data.List       as List
+
 #if HAVE_SHORTBYTESTRING
 import qualified Data.ByteString.Short as BS.Short
+#else
+import Distribution.Utils.Generic (fromUTF8BS)
 #endif
 
 -- | Construct 'ShortText' from 'String'
@@ -49,6 +69,16 @@ toShortText :: String -> ShortText
 
 -- | Convert 'ShortText' to 'String'
 fromShortText :: ShortText -> String
+
+-- | Convert from UTF-8 encoded strict 'ByteString'.
+--
+-- @since 3.2.0.0
+unsafeFromUTF8BS :: BS.ByteString -> ShortText
+
+-- | Text whether 'ShortText' is empty.
+--
+-- @since 3.2.0.0
+null :: ShortText -> Bool
 
 -- | Compact representation of short 'Strings'
 --
@@ -75,9 +105,14 @@ instance Binary ShortText where
     get = fmap (ST . BS.Short.toShort) get
 # endif
 
+
 toShortText = ST . BS.Short.pack . encodeStringUtf8
 
 fromShortText = decodeStringUtf8 . BS.Short.unpack . unST
+
+unsafeFromUTF8BS = ST . BS.Short.toShort
+
+null = BS.Short.null . unST
 #else
 newtype ShortText = ST { unST :: String }
                   deriving (Eq,Ord,Generic,Data,Typeable)
@@ -89,7 +124,13 @@ instance Binary ShortText where
 toShortText = ST
 
 fromShortText = unST
+
+unsafeFromUTF8BS = ST . fromUTF8BS
+
+null = List.null . unST
 #endif
+
+instance Structured ShortText where structure = nominalStructure
 
 instance NFData ShortText where
     rnf = rnf . unST
@@ -109,3 +150,10 @@ instance Monoid ShortText where
 
 instance IsString ShortText where
     fromString = toShortText
+
+-- | /O(n)/. Length in characters. /Slow/ as converts to string.
+--
+-- @since 3.2.0.0
+length :: ShortText -> Int
+length = List.length . fromShortText
+-- Note: avoid using it, we use it @cabal check@ implementation, where it's ok.

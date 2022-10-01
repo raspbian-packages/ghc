@@ -63,15 +63,12 @@ import qualified Distribution.Simple.Program.Strip as Strip
 import Distribution.Simple.Program.GHC
 import Distribution.Simple.Setup
 import qualified Distribution.Simple.Setup as Cabal
-import Distribution.Simple.Compiler hiding (Flag)
+import Distribution.Simple.Compiler
+import Distribution.CabalSpecVersion
 import Distribution.Version
 import Distribution.System
 import Distribution.Verbosity
 import Distribution.Pretty
-import Distribution.Types.ForeignLib
-import Distribution.Types.ForeignLibType
-import Distribution.Types.ForeignLibOption
-import Distribution.Types.UnqualComponentName
 import Distribution.Utils.NubList
 
 import Control.Monad (msum)
@@ -103,7 +100,7 @@ configure verbosity hcPath hcPkgPath conf0 = do
     warn verbosity $
          "Unknown/unsupported 'ghc' version detected "
       ++ "(Cabal " ++ prettyShow cabalVersion ++ " supports 'ghc' version < 8.8): "
-      ++ programPath ghcjsProg ++ " is is based on GHC version " ++
+      ++ programPath ghcjsProg ++ " is based on GHC version " ++
       prettyShow ghcjsGhcVersion
 
   let implInfo = ghcjsVersionImplInfo ghcjsVersion ghcjsGhcVersion
@@ -241,7 +238,7 @@ guessToolFromGhcjsPath tool ghcjsProg verbosity searchpath
 getGhcInfo :: Verbosity -> ConfiguredProgram -> IO [(String, String)]
 getGhcInfo verbosity ghcjsProg = Internal.getGhcInfo verbosity implInfo ghcjsProg
   where
-    Just version = programVersion ghcjsProg
+    version = fromMaybe (error "GHCJS.getGhcInfo: no version") $ programVersion ghcjsProg
     implInfo = ghcVersionImplInfo version
 
 -- | Given a single package DB, return all installed packages.
@@ -275,7 +272,7 @@ toPackageIndex verbosity pkgss progdb = do
   return $! (mconcat indices)
 
   where
-    Just ghcjsProg = lookupProgram ghcjsProgram progdb
+    ghcjsProg = fromMaybe (error "GHCJS.toPackageIndex no ghcjs program") $ lookupProgram ghcjsProgram progdb
 
 getLibDir :: Verbosity -> LocalBuildInfo -> IO FilePath
 getLibDir verbosity lbi =
@@ -296,7 +293,7 @@ getGlobalPackageDB verbosity ghcProg =
      getProgramOutput verbosity ghcProg ["--print-global-package-db"]
 
 -- | Return the 'FilePath' to the per-user GHC package database.
-getUserPackageDB :: Verbosity -> ConfiguredProgram -> Platform -> NoCallStackIO FilePath
+getUserPackageDB :: Verbosity -> ConfiguredProgram -> Platform -> IO FilePath
 getUserPackageDB _verbosity ghcjsProg platform = do
     -- It's rather annoying that we have to reconstruct this, because ghc
     -- hides this information from us otherwise. But for certain use cases
@@ -307,7 +304,7 @@ getUserPackageDB _verbosity ghcjsProg platform = do
     platformAndVersion = Internal.ghcPlatformAndVersionString
                            platform ghcjsVersion
     packageConfFileName = "package.conf.d"
-    Just ghcjsVersion = programVersion ghcjsProg
+    ghcjsVersion = fromMaybe (error "GHCJS.getUserPackageDB: no version") $ programVersion ghcjsProg
 
 checkPackageDbEnvVar :: Verbosity -> IO ()
 checkPackageDbEnvVar verbosity =
@@ -320,7 +317,7 @@ checkPackageDbStack verbosity rest
   | GlobalPackageDB `notElem` rest =
   die' verbosity $ "With current ghc versions the global package db is always used "
      ++ "and must be listed first. This ghc limitation may be lifted in "
-     ++ "future, see http://ghc.haskell.org/trac/ghc/ticket/5977"
+     ++ "future, see https://gitlab.haskell.org/ghc/ghc/-/issues/5977"
 checkPackageDbStack verbosity _ =
   die' verbosity $ "If the global package db is specified, it must be "
      ++ "specified first and cannot be specified multiple times"
@@ -360,7 +357,7 @@ getInstalledPackagesMonitorFiles verbosity platform progdb =
       if isFileStyle then return path
                      else return (path </> "package.cache")
 
-    Just ghcjsProg = lookupProgram ghcjsProgram progdb
+    ghcjsProg = fromMaybe (error "GHCJS.toPackageIndex no ghcjs program") $ lookupProgram ghcjsProgram progdb
 
 
 toJSLibName :: String -> String
@@ -926,21 +923,24 @@ exeMainModuleName Executable{buildInfo = bnfo} =
 -- https://github.com/haskell/cabal/pull/4539#discussion_r118981753.
 decodeMainIsArg :: String -> Maybe ModuleName
 decodeMainIsArg arg
-  | not (null main_fn) && isLower (head main_fn)
+  | headOf main_fn isLower
                         -- The arg looked like "Foo.Bar.baz"
   = Just (ModuleName.fromString main_mod)
-  | isUpper (head arg)  -- The arg looked like "Foo" or "Foo.Bar"
+  | headOf arg isUpper  -- The arg looked like "Foo" or "Foo.Bar"
   = Just (ModuleName.fromString arg)
   | otherwise           -- The arg looked like "baz"
   = Nothing
   where
+    headOf :: String -> (Char -> Bool) -> Bool
+    headOf str pred' = any pred' (safeHead str)
+
     (main_mod, main_fn) = splitLongestPrefix arg (== '.')
 
     splitLongestPrefix :: String -> (Char -> Bool) -> (String,String)
     splitLongestPrefix str pred'
       | null r_pre = (str,           [])
-      | otherwise  = (reverse (tail r_pre), reverse r_suf)
-                           -- 'tail' drops the char satisfying 'pred'
+      | otherwise  = (reverse (safeTail r_pre), reverse r_suf)
+                           -- 'safeTail' drops the char satisfying 'pred'
       where (r_suf, r_pre) = break pred' (reverse str)
 
 
@@ -960,7 +960,7 @@ data BuildSources = BuildSources {
 
 -- | Locate and return the 'BuildSources' required to build and link.
 gbuildSources :: Verbosity
-              -> Version -- ^ specVersion
+              -> CabalSpecVersion
               -> FilePath
               -> GBuildMode
               -> IO BuildSources
@@ -979,7 +979,7 @@ gbuildSources verbosity specVer tmpDir bm =
 
       if isHaskell main
         then
-          if specVer < mkVersion [2] && (mainModName `elem` otherModNames)
+          if specVer < CabalSpecV2_0 && (mainModName `elem` otherModNames)
           then do
              -- The cabal manual clearly states that `other-modules` is
              -- intended for non-main modules.  However, there's at least one
@@ -1461,7 +1461,7 @@ extractRtsInfo lbi =
 
 -- | Returns True if the modification date of the given source file is newer than
 -- the object file we last compiled for it, or if no object file exists yet.
-checkNeedsRecompilation :: FilePath -> GhcOptions -> NoCallStackIO Bool
+checkNeedsRecompilation :: FilePath -> GhcOptions -> IO Bool
 checkNeedsRecompilation filename opts = filename `moreRecentFile` oname
     where oname = getObjectFileName filename opts
 
@@ -1477,7 +1477,7 @@ getObjectFileName filename opts = oname
 -- Calculates relative RPATHs when 'relocatable' is set.
 getRPaths :: LocalBuildInfo
           -> ComponentLocalBuildInfo -- ^ Component we are building
-          -> NoCallStackIO (NubListR FilePath)
+          -> IO (NubListR FilePath)
 getRPaths lbi clbi | supportRPaths hostOS = do
     libraryPaths <- depLibraryPaths False (relocatable lbi) lbi clbi
     let hostPref = case hostOS of
@@ -1779,8 +1779,8 @@ hcPkgInfo progdb = HcPkg.HcPkgInfo { HcPkg.hcPkgProgram    = ghcjsPkgProg
                                    }
   where
     v7_10 = mkVersion [7,10]
-    Just ghcjsPkgProg = lookupProgram ghcjsPkgProgram progdb
-    Just ver          = programVersion ghcjsPkgProg
+    ghcjsPkgProg = fromMaybe (error "GHCJS.hcPkgInfo no ghcjs program") $ lookupProgram ghcjsPkgProgram progdb
+    ver          = fromMaybe (error "GHCJS.hcPkgInfo no ghcjs version") $ programVersion ghcjsPkgProg
 
 registerPackage
   :: Verbosity
@@ -1797,7 +1797,7 @@ pkgRoot :: Verbosity -> LocalBuildInfo -> PackageDB -> IO FilePath
 pkgRoot verbosity lbi = pkgRoot'
    where
     pkgRoot' GlobalPackageDB =
-      let Just ghcjsProg = lookupProgram ghcjsProgram (withPrograms lbi)
+      let ghcjsProg = fromMaybe (error "GHCJS.pkgRoot: no ghcjs program") $ lookupProgram ghcjsProgram (withPrograms lbi)
       in  fmap takeDirectory (getGlobalPackageDB verbosity ghcjsProg)
     pkgRoot' UserPackageDB = do
       appDir <- getAppUserDataDirectory "ghcjs"
@@ -1827,4 +1827,4 @@ runCmd progdb exe =
   )
   where
     script = exe <.> "jsexe" </> "all" <.> "js"
-    Just ghcjsProg = lookupProgram ghcjsProgram progdb
+    ghcjsProg = fromMaybe (error "GHCJS.runCmd: no ghcjs program") $ lookupProgram ghcjsProgram progdb

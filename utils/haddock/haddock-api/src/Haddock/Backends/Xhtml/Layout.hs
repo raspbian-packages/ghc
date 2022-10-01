@@ -50,9 +50,9 @@ import qualified Data.Map as Map
 import Text.XHtml hiding ( name, title, quote )
 import Data.Maybe (fromMaybe)
 
-import FastString            ( unpackFS )
+import GHC.Data.FastString ( unpackFS )
 import GHC
-import Name (nameOccName)
+import GHC.Types.Name (nameOccName)
 
 --------------------------------------------------------------------------------
 -- * Sections of the document
@@ -153,21 +153,21 @@ subTable pkg qual decls = Just $ table << aboves (concatMap subRow decls)
 
 -- | Sub table with source information (optional).
 subTableSrc :: Maybe Package -> Qualification -> LinksInfo -> Bool
-            -> [(SubDecl, Maybe Module, Located DocName)] -> Maybe Html
+            -> [(String, SubDecl, Maybe Module, Located DocName)] -> Maybe Html
 subTableSrc _ _ _ _ [] = Nothing
 subTableSrc pkg qual lnks splice decls = Just $ table << aboves (concatMap subRow decls)
   where
-    subRow ((decl, mdoc, subs), mdl, L loc dn) =
+    subRow (instanchor, (decl, mdoc, subs), mdl, L loc dn) =
       (td ! [theclass "src clearfix"] <<
         (thespan ! [theclass "inst-left"] << decl)
         <+> linkHtml loc mdl dn
       <->
-      docElement td << fmap (docToHtml Nothing pkg qual) mdoc
+      docElement td << fmap (docToHtml (Just instanchor) pkg qual) mdoc
       )
       : map (cell . (td <<)) subs
 
     linkHtml :: SrcSpan -> Maybe Module -> DocName -> Html
-    linkHtml loc@(RealSrcSpan _) mdl dn = links lnks loc splice mdl dn
+    linkHtml loc@(RealSrcSpan _ _) mdl dn = links lnks loc splice mdl dn
     linkHtml _ _ _ = noHtml
 
 subBlock :: [Html] -> Maybe Html
@@ -201,7 +201,7 @@ subEquations pkg qual = divSubDecls "equations" "Equations" . subTable pkg qual
 subInstances :: Maybe Package -> Qualification
              -> String -- ^ Class name, used for anchor generation
              -> LinksInfo -> Bool
-             -> [(SubDecl, Maybe Module, Located DocName)] -> Html
+             -> [(String, SubDecl, Maybe Module, Located DocName)] -> Html
 subInstances pkg qual nm lnks splice = maybe noHtml wrap . instTable
   where
     wrap contents = subSection (hdr +++ collapseDetails id_ DetailsOpen (summary +++ contents))
@@ -214,7 +214,7 @@ subInstances pkg qual nm lnks splice = maybe noHtml wrap . instTable
 
 subOrphanInstances :: Maybe Package -> Qualification
                    -> LinksInfo -> Bool
-                   -> [(SubDecl, Maybe Module, Located DocName)] -> Html
+                   -> [(String, SubDecl, Maybe Module, Located DocName)] -> Html
 subOrphanInstances pkg qual lnks splice  = maybe noHtml wrap . instTable
   where
     wrap = ((h1 << "Orphan instances") +++)
@@ -310,9 +310,9 @@ links ((_,_,sourceMap,lineMap), (_,_,maybe_wiki_url)) loc splice mdl' docName@(D
         -- 'mdl'' is a way of "overriding" the module. Without it, instances
         -- will point to the module defining the class/family, which is wrong.
         origMod = fromMaybe (nameModule n) mdl'
-        origPkg = moduleUnitId origMod
+        origPkg = moduleUnit origMod
 
         fname = case loc of
-          RealSrcSpan l -> unpackFS (srcSpanFile l)
+          RealSrcSpan l _ -> unpackFS (srcSpanFile l)
           UnhelpfulSpan _ -> error "links: UnhelpfulSpan"
 links _ _ _ _ _ = noHtml

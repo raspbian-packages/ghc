@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP #-}
+import Control.Applicative (Const(..))
 import Data.Bits ((.&.), popCount)
 import Data.Word (Word)
 import Data.IntSet
@@ -24,6 +25,8 @@ main = defaultMain [ testCase "lookupLT" test_lookupLT
                    , testProperty "prop_EmptyValid" prop_EmptyValid
                    , testProperty "prop_SingletonValid" prop_SingletonValid
                    , testProperty "prop_InsertIntoEmptyValid" prop_InsertIntoEmptyValid
+                   , testProperty "prop_instanceEqIntSet" prop_instanceEqIntSet
+                   , testProperty "prop_instanceOrdIntSet" prop_instanceOrdIntSet
                    , testProperty "prop_Single" prop_Single
                    , testProperty "prop_Member" prop_Member
                    , testProperty "prop_NotMember" prop_NotMember
@@ -69,6 +72,8 @@ main = defaultMain [ testCase "lookupLT" test_lookupLT
                    , testProperty "prop_partition" prop_partition
                    , testProperty "prop_filter" prop_filter
                    , testProperty "prop_bitcount" prop_bitcount
+                   , testProperty "prop_alterF_list" prop_alterF_list
+                   , testProperty "prop_alterF_const" prop_alterF_const
                    ]
 
 ----------------------------------------------------------------
@@ -140,6 +145,16 @@ prop_SingletonValid x =
 prop_InsertIntoEmptyValid :: Int -> Property
 prop_InsertIntoEmptyValid x =
     valid (insert x empty)
+
+{--------------------------------------------------------------------
+  Instances for Eq and Ord
+--------------------------------------------------------------------}
+
+prop_instanceEqIntSet :: IntSet -> IntSet -> Bool
+prop_instanceEqIntSet x y = (x == y) == (toAscList x == toAscList y)
+
+prop_instanceOrdIntSet :: IntSet -> IntSet -> Bool
+prop_instanceOrdIntSet x y = (compare x y) == (compare (toAscList x) (toAscList y))
 
 {--------------------------------------------------------------------
   Single, Member, Insert, Delete, Member, FromList
@@ -337,6 +352,21 @@ prop_foldL' s = foldl' (flip (:)) [] s == List.foldl' (flip (:)) [] (toList s)
 prop_map :: IntSet -> Bool
 prop_map s = map id s == s
 
+-- Note: we could generate an arbitrary strictly monotonic function by
+-- restricting f using @\x y -> x < y ==> f x < f y@
+-- but this will be inefficient given the probability of actually finding
+-- a function that meets the criteria.
+-- For now we settle on identity function and arbitrary linear functions
+-- f x = a*x + b (with a being positive).
+-- This might be insufficient to support any fancier implementation.
+prop_mapMonotonicId :: IntSet -> Property
+prop_mapMonotonicId s = mapMonotonic id s === map id s
+
+prop_mapMonotonicLinear :: Positive Int -> Int -> IntSet -> Property
+prop_mapMonotonicLinear (Positive a) b s = mapMonotonic f s === map f s
+  where
+    f x = a*x + b
+
 prop_maxView :: IntSet -> Bool
 prop_maxView s = case maxView s of
     Nothing -> null s
@@ -398,3 +428,21 @@ prop_bitcount a w = bitcount_orig a w == bitcount_new a w
       where go a 0 = a
             go a x = go (a + 1) (x .&. (x-1))
     bitcount_new a x = a + popCount x
+
+prop_alterF_list
+    :: Fun Bool [Bool]
+    -> Int
+    -> IntSet
+    -> Property
+prop_alterF_list f k s =
+        fmap toSet (alterF     (applyFun f) k s)
+    ===             Set.alterF (applyFun f) k (toSet s)
+
+prop_alterF_const
+    :: Fun Bool Bool
+    -> Int
+    -> IntSet
+    -> Property
+prop_alterF_const f k s =
+        getConst (alterF     (Const . applyFun f) k s        )
+    === getConst (Set.alterF (Const . applyFun f) k (toSet s))

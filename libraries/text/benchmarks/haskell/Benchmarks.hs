@@ -5,7 +5,7 @@ module Main
     ( main
     ) where
 
-import Criterion.Main (defaultMain, bgroup, env)
+import Test.Tasty.Bench (defaultMain, bgroup, env)
 import System.FilePath ((</>))
 import System.IO (IOMode (WriteMode), openFile, hSetEncoding, utf8)
 
@@ -17,6 +17,7 @@ import qualified Benchmarks.Equality as Equality
 import qualified Benchmarks.FileRead as FileRead
 import qualified Benchmarks.FoldLines as FoldLines
 import qualified Benchmarks.Mul as Mul
+import qualified Benchmarks.Multilang as Multilang
 import qualified Benchmarks.Pure as Pure
 import qualified Benchmarks.ReadNumbers as ReadNumbers
 import qualified Benchmarks.Replace as Replace
@@ -43,11 +44,14 @@ main = do
         , env (DecodeUtf8.initEnv (tf "ascii.txt")) (DecodeUtf8.benchmark "ascii")
         , env (DecodeUtf8.initEnv (tf "russian.txt")) (DecodeUtf8.benchmark  "russian")
         , env (DecodeUtf8.initEnv (tf "japanese.txt")) (DecodeUtf8.benchmark "japanese")
-        , EncodeUtf8.benchmark "επανάληψη 竺法蘭共譯"
+        , env (DecodeUtf8.initEnv (tf "ascii.txt")) (DecodeUtf8.benchmarkASCII)
+        , EncodeUtf8.benchmark "non-ASCII" "επανάληψη 竺法蘭共譯"
+        , EncodeUtf8.benchmark "ASCII" "lorem ipsum"
         , env (Equality.initEnv (tf "japanese.txt")) Equality.benchmark
         , FileRead.benchmark (tf "russian.txt")
         , FoldLines.benchmark (tf "russian.txt")
         , env Mul.initEnv Mul.benchmark
+        , Multilang.benchmark
         , env (Pure.initEnv (tf "tiny.txt")) (Pure.benchmark "tiny")
         , env (Pure.initEnv (tf "ascii-small.txt")) (Pure.benchmark "ascii-small")
         , env (Pure.initEnv (tf "ascii.txt")) (Pure.benchmark "ascii")
@@ -70,4 +74,4 @@ main = do
         ]
     where
     -- Location of a test file
-    tf = ("../tests/text-test-data" </>)
+    tf = ("benchmarks/text-test-data" </>)

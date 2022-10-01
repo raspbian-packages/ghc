@@ -26,6 +26,7 @@ import Distribution.Client.Types
 import Distribution.Solver.Types.PackageConstraint
 import Distribution.Solver.Types.PackageIndex
 import Distribution.Client.Sandbox.PackageEnvironment
+import Distribution.Utils.Generic
 
 import Distribution.Package                          (PackageName, packageVersion)
 import Distribution.PackageDescription               (allBuildDepends)
@@ -36,22 +37,21 @@ import Distribution.Simple.Setup
 import Distribution.Simple.Utils
        (die', notice, debug, tryFindPackageDesc)
 import Distribution.System                           (Platform)
-import Distribution.Deprecated.Text                             (display)
 import Distribution.Types.ComponentRequestedSpec
        (ComponentRequestedSpec(..))
 import Distribution.Types.Dependency
-       (Dependency(..), depPkgName, simplifyDependency)
-import Distribution.Verbosity                        (Verbosity, silent)
+       (Dependency(..))
+import Distribution.Verbosity                        (silent)
 import Distribution.Version
        (Version, VersionRange, LowerBound(..), UpperBound(..)
        ,asVersionIntervals, majorBoundVersion)
 import Distribution.PackageDescription.Parsec
        (readGenericPackageDescription)
+import Distribution.Types.PackageVersionConstraint
+       (PackageVersionConstraint (..), simplifyPackageVersionConstraint)
 
 import qualified Data.Set as S
 import System.Directory                              (getCurrentDirectory)
-import System.Exit                                   (exitFailure)
-import Control.Exception                             (throwIO)
 
 -- | Entry point for the 'outdated' command.
 outdated :: Verbosity -> OutdatedFlags -> RepoContext
@@ -90,7 +90,7 @@ outdated verbosity0 outdatedFlags repoContext comp platform = do
                then depsFromNewFreezeFile verbosity mprojectFile
                else depsFromPkgDesc verbosity comp platform
   debug verbosity $ "Dependencies loaded: "
-    ++ (intercalate ", " $ map display deps)
+    ++ (intercalate ", " $ map prettyShow deps)
   let outdatedDeps = listOutdated deps pkgIndex
                      (ListOutdatedSettings ignorePred minorPred)
   when (not quiet) $
@@ -101,25 +101,25 @@ outdated verbosity0 outdatedFlags repoContext comp platform = do
 
 -- | Print either the list of all outdated dependencies, or a message
 -- that there are none.
-showResult :: Verbosity -> [(Dependency,Version)] -> Bool -> IO ()
+showResult :: Verbosity -> [(PackageVersionConstraint,Version)] -> Bool -> IO ()
 showResult verbosity outdatedDeps simpleOutput =
   if (not . null $ outdatedDeps)
     then
     do when (not simpleOutput) $
          notice verbosity "Outdated dependencies:"
-       for_ outdatedDeps $ \(d@(Dependency pn _ _), v) ->
-         let outdatedDep = if simpleOutput then display pn
-                           else display d ++ " (latest: " ++ display v ++ ")"
+       for_ outdatedDeps $ \(d@(PackageVersionConstraint pn _), v) ->
+         let outdatedDep = if simpleOutput then prettyShow pn
+                           else prettyShow d ++ " (latest: " ++ prettyShow v ++ ")"
          in notice verbosity outdatedDep
     else notice verbosity "All dependencies are up to date."
 
 -- | Convert a list of 'UserConstraint's to a 'Dependency' list.
-userConstraintsToDependencies :: [UserConstraint] -> [Dependency]
+userConstraintsToDependencies :: [UserConstraint] -> [PackageVersionConstraint]
 userConstraintsToDependencies ucnstrs =
   mapMaybe (packageConstraintToDependency . userToPackageConstraint) ucnstrs
 
 -- | Read the list of dependencies from the freeze file.
-depsFromFreezeFile :: Verbosity -> IO [Dependency]
+depsFromFreezeFile :: Verbosity -> IO [PackageVersionConstraint]
 depsFromFreezeFile verbosity = do
   cwd        <- getCurrentDirectory
   userConfig <- loadUserConfig verbosity cwd Nothing
@@ -130,7 +130,7 @@ depsFromFreezeFile verbosity = do
   return deps
 
 -- | Read the list of dependencies from the new-style freeze file.
-depsFromNewFreezeFile :: Verbosity -> Maybe FilePath -> IO [Dependency]
+depsFromNewFreezeFile :: Verbosity -> Maybe FilePath -> IO [PackageVersionConstraint]
 depsFromNewFreezeFile verbosity mprojectFile = do
   projectRoot <- either throwIO return =<<
                  findProjectRoot Nothing mprojectFile
@@ -146,7 +146,7 @@ depsFromNewFreezeFile verbosity mprojectFile = do
   return deps
 
 -- | Read the list of dependencies from the package description.
-depsFromPkgDesc :: Verbosity -> Compiler  -> Platform -> IO [Dependency]
+depsFromPkgDesc :: Verbosity -> Compiler  -> Platform -> IO [PackageVersionConstraint]
 depsFromPkgDesc verbosity comp platform = do
   cwd  <- getCurrentDirectory
   path <- tryFindPackageDesc verbosity cwd
@@ -160,7 +160,9 @@ depsFromPkgDesc verbosity comp platform = do
       let bd = allBuildDepends pd
       debug verbosity
         "Reading the list of dependencies from the package description"
-      return bd
+      return $ map toPVC bd
+  where
+    toPVC (Dependency pn vr _) = PackageVersionConstraint pn vr
 
 -- | Various knobs for customising the behaviour of 'listOutdated'.
 data ListOutdatedSettings = ListOutdatedSettings {
@@ -171,16 +173,16 @@ data ListOutdatedSettings = ListOutdatedSettings {
   }
 
 -- | Find all outdated dependencies.
-listOutdated :: [Dependency]
+listOutdated :: [PackageVersionConstraint]
              -> PackageIndex UnresolvedSourcePackage
              -> ListOutdatedSettings
-             -> [(Dependency, Version)]
+             -> [(PackageVersionConstraint, Version)]
 listOutdated deps pkgIndex (ListOutdatedSettings ignorePred minorPred) =
-  mapMaybe isOutdated $ map simplifyDependency deps
+  mapMaybe isOutdated $ map simplifyPackageVersionConstraint deps
   where
-    isOutdated :: Dependency -> Maybe (Dependency, Version)
-    isOutdated dep@(Dependency pname vr _)
-      | ignorePred (depPkgName dep) = Nothing
+    isOutdated :: PackageVersionConstraint -> Maybe (PackageVersionConstraint, Version)
+    isOutdated dep@(PackageVersionConstraint pname vr)
+      | ignorePred pname = Nothing
       | otherwise                   =
           let this   = map packageVersion $ lookupDependency pkgIndex pname vr
               latest = lookupLatest dep
@@ -194,17 +196,18 @@ listOutdated deps pkgIndex (ListOutdatedSettings ignorePred minorPred) =
           latest' = maximum latest
       in if this' < latest' then Just latest' else Nothing
 
-    lookupLatest :: Dependency -> [Version]
-    lookupLatest dep@(Dependency pname vr _)
-      | minorPred (depPkgName dep) =
+    lookupLatest :: PackageVersionConstraint -> [Version]
+    lookupLatest (PackageVersionConstraint pname vr)
+      | minorPred pname =
         map packageVersion $ lookupDependency pkgIndex  pname (relaxMinor vr)
-      | otherwise                  =
-        map packageVersion $ lookupPackageName pkgIndex (depPkgName dep)
+      | otherwise =
+        map packageVersion $ lookupPackageName pkgIndex pname
 
     relaxMinor :: VersionRange -> VersionRange
     relaxMinor vr =
       let vis = asVersionIntervals vr
-          (LowerBound v0 _,upper) = last vis
-      in case upper of
-           NoUpperBound     -> vr
-           UpperBound _v1 _ -> majorBoundVersion v0
+      in maybe vr relax (safeLast vis)
+      where relax (LowerBound v0 _, upper) =
+              case upper of
+                NoUpperBound     -> vr
+                UpperBound _v1 _ -> majorBoundVersion v0

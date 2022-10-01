@@ -13,10 +13,10 @@ import Distribution.Pretty
 import Distribution.Types.ComponentName
 import Distribution.Types.PackageName
 import Distribution.Types.UnqualComponentName
-import Distribution.Version                   (VersionRange, anyVersion)
+import Distribution.Version                   (VersionRange, anyVersion, isAnyVersion)
 
 import qualified Distribution.Compat.CharParsing as P
-import           Text.PrettyPrint           (text, (<+>))
+import qualified Text.PrettyPrint as PP
 
 -- | Describes a dependency on an executable from a package
 --
@@ -27,18 +27,22 @@ data ExeDependency = ExeDependency
                      deriving (Generic, Read, Show, Eq, Typeable, Data)
 
 instance Binary ExeDependency
+instance Structured ExeDependency
 instance NFData ExeDependency where rnf = genericRnf
 
 instance Pretty ExeDependency where
   pretty (ExeDependency name exe ver) =
-    (pretty name <<>> text ":" <<>> pretty exe) <+> pretty ver
+      pretty name <<>> PP.colon <<>> pretty exe PP.<+> pver
+    where
+      pver | isAnyVersion ver = PP.empty
+           | otherwise        = pretty ver
 
 -- | 
 --
 -- Examples
 --
 -- >>> simpleParsec "happy:happy" :: Maybe ExeDependency
--- Just (ExeDependency (PackageName "happy") (UnqualComponentName "happy") AnyVersion)
+-- Just (ExeDependency (PackageName "happy") (UnqualComponentName "happy") (OrLaterVersion (mkVersion [0])))
 --
 -- >>> simpleParsec "happy:happy >= 1.19.12" :: Maybe ExeDependency
 -- Just (ExeDependency (PackageName "happy") (UnqualComponentName "happy") (OrLaterVersion (mkVersion [1,19,12])))

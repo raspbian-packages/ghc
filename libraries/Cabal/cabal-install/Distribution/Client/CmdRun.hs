@@ -12,40 +12,47 @@ module Distribution.Client.CmdRun (
     handleShebang, validScript,
 
     -- * Internals exposed for testing
-    TargetProblem(..),
+    matchesMultipleProblem,
+    noExesProblem,
     selectPackageTargets,
     selectComponentTarget
   ) where
 
 import Prelude ()
-import Distribution.Client.Compat.Prelude
+import Distribution.Client.Compat.Prelude hiding (toList)
 
 import Distribution.Client.ProjectOrchestration
 import Distribution.Client.CmdErrorMessages
+         ( renderTargetSelector, showTargetSelector,
+           renderTargetProblem,
+           renderTargetProblemNoTargets, plural, targetSelectorPluralPkgs,
+           targetSelectorFilter, renderListCommaAnd )
+import Distribution.Client.TargetProblem
+         ( TargetProblem (..) )
 
+import Distribution.Client.NixStyleOptions
+         ( NixStyleFlags (..), nixStyleOptions, defaultNixStyleFlags )
 import Distribution.Client.Setup
-         ( GlobalFlags(..), ConfigFlags(..), ConfigExFlags, InstallFlags )
+         ( GlobalFlags(..), ConfigFlags(..) )
 import Distribution.Client.GlobalFlags
          ( defaultGlobalFlags )
-import qualified Distribution.Client.Setup as Client
-import Distribution.Simple.Setup
-         ( HaddockFlags, TestFlags, fromFlagOrDefault )
+import Distribution.Simple.Flag
+         ( fromFlagOrDefault )
 import Distribution.Simple.Command
          ( CommandUI(..), usageAlternatives )
 import Distribution.Types.ComponentName
          ( showComponentName )
-import Distribution.Deprecated.Text
-         ( display )
+import Distribution.CabalSpecVersion (CabalSpecVersion (..), cabalSpecLatest)
 import Distribution.Verbosity
-         ( Verbosity, normal )
+         ( normal )
 import Distribution.Simple.Utils
          ( wrapText, warn, die', ordNub, info
          , createTempDirectory, handleDoesNotExist )
-import Distribution.Client.CmdInstall
-         ( establishDummyProjectBaseContext )
 import Distribution.Client.ProjectConfig
          ( ProjectConfig(..), ProjectConfigShared(..)
          , withProjectOrGlobalConfig )
+import Distribution.Client.ProjectFlags
+         ( flagIgnoreProject )
 import Distribution.Client.ProjectPlanning
          ( ElaboratedConfiguredPackage(..)
          , ElaboratedInstallPlan, binDirectoryFor )
@@ -63,8 +70,6 @@ import Distribution.Simple.Program.Run
 import Distribution.Types.UnitId
          ( UnitId )
 
-import Distribution.CabalSpecVersion
-         ( cabalSpecLatest )
 import Distribution.Client.Types
          ( PackageLocation(..), PackageSpecifier(..) )
 import Distribution.FieldGrammar
@@ -90,8 +95,6 @@ import Distribution.Types.GenericPackageDescription as GPD
          ( GenericPackageDescription(..), emptyGenericPackageDescription )
 import Distribution.Types.PackageDescription
          ( PackageDescription(..), emptyPackageDescription )
-import Distribution.Types.Version
-         ( mkVersion )
 import Distribution.Types.PackageName.Magic
          ( fakePackageId )
 import Language.Haskell.Extension
@@ -107,42 +110,43 @@ import System.FilePath
          ( (</>), isValid, isPathSeparator, takeExtension )
 
 
-runCommand :: CommandUI (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags, TestFlags)
-runCommand = Client.installCommand {
-  commandName         = "v2-run",
-  commandSynopsis     = "Run an executable.",
-  commandUsage        = usageAlternatives "v2-run"
-                          [ "[TARGET] [FLAGS] [-- EXECUTABLE_FLAGS]" ],
-  commandDescription  = Just $ \pname -> wrapText $
-        "Runs the specified executable-like component (an executable, a test, "
-     ++ "or a benchmark), first ensuring it is up to date.\n\n"
+runCommand :: CommandUI (NixStyleFlags ())
+runCommand = CommandUI
+  { commandName         = "v2-run"
+  , commandSynopsis     = "Run an executable."
+  , commandUsage        = usageAlternatives "v2-run"
+                          [ "[TARGET] [FLAGS] [-- EXECUTABLE_FLAGS]" ]
+  , commandDescription  = Just $ \pname -> wrapText $
+         "Runs the specified executable-like component (an executable, a test, "
+      ++ "or a benchmark), first ensuring it is up to date.\n\n"
 
-     ++ "Any executable-like component in any package in the project can be "
-     ++ "specified. A package can be specified if contains just one "
-     ++ "executable-like. The default is to use the package in the current "
-     ++ "directory if it contains just one executable-like.\n\n"
+      ++ "Any executable-like component in any package in the project can be "
+      ++ "specified. A package can be specified if contains just one "
+      ++ "executable-like. The default is to use the package in the current "
+      ++ "directory if it contains just one executable-like.\n\n"
 
-     ++ "Extra arguments can be passed to the program, but use '--' to "
-     ++ "separate arguments for the program from arguments for " ++ pname
-     ++ ". The executable is run in an environment where it can find its "
-     ++ "data files inplace in the build tree.\n\n"
+      ++ "Extra arguments can be passed to the program, but use '--' to "
+      ++ "separate arguments for the program from arguments for " ++ pname
+      ++ ". The executable is run in an environment where it can find its "
+      ++ "data files inplace in the build tree.\n\n"
 
-     ++ "Dependencies are built or rebuilt as necessary. Additional "
-     ++ "configuration flags can be specified on the command line and these "
-     ++ "extend the project configuration from the 'cabal.project', "
-     ++ "'cabal.project.local' and other files.",
-  commandNotes        = Just $ \pname ->
-        "Examples:\n"
-     ++ "  " ++ pname ++ " v2-run\n"
-     ++ "    Run the executable-like in the package in the current directory\n"
-     ++ "  " ++ pname ++ " v2-run foo-tool\n"
-     ++ "    Run the named executable-like (in any package in the project)\n"
-     ++ "  " ++ pname ++ " v2-run pkgfoo:foo-tool\n"
-     ++ "    Run the executable-like 'foo-tool' in the package 'pkgfoo'\n"
-     ++ "  " ++ pname ++ " v2-run foo -O2 -- dothing --fooflag\n"
-     ++ "    Build with '-O2' and run the program, passing it extra arguments.\n\n"
+      ++ "Dependencies are built or rebuilt as necessary. Additional "
+      ++ "configuration flags can be specified on the command line and these "
+      ++ "extend the project configuration from the 'cabal.project', "
+      ++ "'cabal.project.local' and other files."
+  , commandNotes        = Just $ \pname ->
+         "Examples:\n"
+      ++ "  " ++ pname ++ " v2-run\n"
+      ++ "    Run the executable-like in the package in the current directory\n"
+      ++ "  " ++ pname ++ " v2-run foo-tool\n"
+      ++ "    Run the named executable-like (in any package in the project)\n"
+      ++ "  " ++ pname ++ " v2-run pkgfoo:foo-tool\n"
+      ++ "    Run the executable-like 'foo-tool' in the package 'pkgfoo'\n"
+      ++ "  " ++ pname ++ " v2-run foo -O2 -- dothing --fooflag\n"
+      ++ "    Build with '-O2' and run the program, passing it extra arguments.\n"
 
-     ++ cmdCommonHelpTextNewBuildBeta
+  , commandDefaultFlags = defaultNixStyleFlags ()
+  , commandOptions      = nixStyleOptions (const [])
   }
 
 -- | The @run@ command runs a specified executable-like component, building it
@@ -153,20 +157,19 @@ runCommand = Client.installCommand {
 -- For more details on how this works, see the module
 -- "Distribution.Client.ProjectOrchestration"
 --
-runAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags, TestFlags)
-          -> [String] -> GlobalFlags -> IO ()
-runAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags)
-            targetStrings globalFlags = do
+runAction :: NixStyleFlags () -> [String] -> GlobalFlags -> IO ()
+runAction flags@NixStyleFlags {..} targetStrings globalFlags = do
     globalTmp <- getTemporaryDirectory
-    tempDir <- createTempDirectory globalTmp "cabal-repl."
+    tmpDir <- createTempDirectory globalTmp "cabal-repl."
 
     let
       with =
         establishProjectBaseContext verbosity cliConfig OtherCommand
-      without config =
-        establishDummyProjectBaseContext verbosity (config <> cliConfig) tempDir [] OtherCommand
+      without config = do
+        distDirLayout <- establishDummyDistDirLayout verbosity (config <> cliConfig) tmpDir
+        establishDummyProjectBaseContext verbosity (config <> cliConfig) distDirLayout [] OtherCommand
 
-    baseCtx <- withProjectOrGlobalConfig verbosity globalConfigFlag with without
+    baseCtx <- withProjectOrGlobalConfig verbosity ignoreProject globalConfigFlag with without
 
     let
       scriptOrError script err = do
@@ -174,7 +177,7 @@ runAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags)
         let pol | takeExtension script == ".lhs" = LiterateHaskell
                 | otherwise                      = PlainHaskell
         if exists
-          then BS.readFile script >>= handleScriptCase verbosity pol baseCtx tempDir
+          then BS.readFile script >>= handleScriptCase verbosity pol baseCtx tmpDir
           else reportTargetSelectorProblems verbosity err
 
     (baseCtx', targetSelectors) <-
@@ -204,7 +207,6 @@ runAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags)
                      $ resolveTargets
                          selectPackageTargets
                          selectComponentTarget
-                         TargetProblemCommon
                          elaboratedPlan
                          Nothing
                          targetSelectors
@@ -219,7 +221,7 @@ runAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags)
             _ <- singleExeOrElse
                    (reportTargetProblems
                       verbosity
-                      [TargetProblemMultipleTargets targets])
+                      [multipleTargetsProblem targets])
                    targets
 
             let elaboratedPlan' = pruneInstallPlanToTargets
@@ -265,17 +267,17 @@ runAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags)
       [] -> die' verbosity $ "Unknown executable "
                           ++ exeName
                           ++ " in package "
-                          ++ display selectedUnitId
+                          ++ prettyShow selectedUnitId
       [elabPkg] -> do
         info verbosity $ "Selecting "
-                       ++ display selectedUnitId
+                       ++ prettyShow selectedUnitId
                        ++ " to supply " ++ exeName
         return elabPkg
       elabPkgs -> die' verbosity
         $ "Multiple matching executables found matching "
         ++ exeName
         ++ ":\n"
-        ++ unlines (fmap (\p -> " - in package " ++ display (elabUnitId p)) elabPkgs)
+        ++ unlines (fmap (\p -> " - in package " ++ prettyShow (elabUnitId p)) elabPkgs)
     let exePath = binDirectoryFor (distDirLayout baseCtx)
                                   (elaboratedShared buildCtx)
                                   pkg
@@ -292,14 +294,11 @@ runAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags)
                             elaboratedPlan
       }
 
-    handleDoesNotExist () (removeDirectoryRecursive tempDir)
+    handleDoesNotExist () (removeDirectoryRecursive tmpDir)
   where
     verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
-    cliConfig = commandLineFlagsToProjectConfig
-                  globalFlags configFlags configExFlags
-                  installFlags
-                  mempty -- ClientInstallFlags, not needed here
-                  haddockFlags testFlags
+    ignoreProject = flagIgnoreProject projectFlags
+    cliConfig = commandLineFlagsToProjectConfig globalFlags flags mempty -- ClientInstallFlags, not needed here
     globalConfigFlag = projectConfigConfigFile (projectConfigShared cliConfig)
 
 -- | Used by the main CLI parser as heuristic to decide whether @cabal@ was
@@ -396,7 +395,7 @@ handleScriptCase
   -> FilePath
   -> BS.ByteString
   -> IO (ProjectBaseContext, [TargetSelector])
-handleScriptCase verbosity pol baseCtx tempDir scriptContents = do
+handleScriptCase verbosity pol baseCtx tmpDir scriptContents = do
   (executable, contents') <- readScriptBlockFromScript verbosity pol scriptContents
 
   -- We need to create a dummy package that lives in our dummy project.
@@ -406,10 +405,10 @@ handleScriptCase verbosity pol baseCtx tempDir scriptContents = do
       LiterateHaskell -> "Main.lhs"
 
     sourcePackage = SourcePackage
-      { packageInfoId         = pkgId
-      , SP.packageDescription = genericPackageDescription
-      , packageSource         = LocalUnpackedPackage tempDir
-      , packageDescrOverride  = Nothing
+      { srcpkgPackageId      = pkgId
+      , srcpkgDescription    = genericPackageDescription
+      , srcpkgSource         = LocalUnpackedPackage tmpDir
+      , srcpkgDescrOverride  = Nothing
       }
     genericPackageDescription  = emptyGenericPackageDescription
       { GPD.packageDescription = packageDescription
@@ -427,13 +426,13 @@ handleScriptCase verbosity pol baseCtx tempDir scriptContents = do
     binfo@BuildInfo{..} = buildInfo executable
     packageDescription = emptyPackageDescription
       { package = pkgId
-      , specVersionRaw = Left (mkVersion [2, 2])
+      , specVersion = CabalSpecV2_2
       , licenseRaw = Left SPDX.NONE
       }
     pkgId = fakePackageId
 
-  writeGenericPackageDescription (tempDir </> "fake-package.cabal") genericPackageDescription
-  BS.writeFile (tempDir </> mainName) contents'
+  writeGenericPackageDescription (tmpDir </> "fake-package.cabal") genericPackageDescription
+  BS.writeFile (tmpDir </> mainName) contents'
 
   let
     baseCtx' = baseCtx
@@ -473,7 +472,7 @@ matchingPackagesByUnitId uid =
 -- buildable. Fail if there are no or multiple buildable exe components.
 --
 selectPackageTargets :: TargetSelector
-                     -> [AvailableTarget k] -> Either TargetProblem [k]
+                     -> [AvailableTarget k] -> Either RunTargetProblem [k]
 selectPackageTargets targetSelector targets
 
     -- If there is exactly one buildable executable then we select that
@@ -482,7 +481,7 @@ selectPackageTargets targetSelector targets
 
     -- but fail if there are multiple buildable executables.
   | not (null targetsExesBuildable)
-  = Left (TargetProblemMatchesMultiple targetSelector targetsExesBuildable')
+  = Left (matchesMultipleProblem targetSelector targetsExesBuildable')
 
     -- If there are executables but none are buildable then we report those
   | not (null targetsExes)
@@ -490,7 +489,7 @@ selectPackageTargets targetSelector targets
 
     -- If there are no executables but some other targets then we report that
   | not (null targets)
-  = Left (TargetProblemNoExes targetSelector)
+  = Left (noExesProblem targetSelector)
 
     -- If there are no targets at all then we report that
   | otherwise
@@ -514,36 +513,28 @@ selectPackageTargets targetSelector targets
 -- to the basic checks on being buildable etc.
 --
 selectComponentTarget :: SubComponentTarget
-                      -> AvailableTarget k -> Either TargetProblem  k
+                      -> AvailableTarget k -> Either RunTargetProblem  k
 selectComponentTarget subtarget@WholeComponent t
   = case availableTargetComponentName t
     of CExeName _ -> component
        CTestName _ -> component
        CBenchName _ -> component
-       _ -> Left (TargetProblemComponentNotExe pkgid cname)
+       _ -> Left (componentNotExeProblem pkgid cname)
     where pkgid = availableTargetPackageId t
           cname = availableTargetComponentName t
-          component = either (Left . TargetProblemCommon) return $
-                        selectComponentTargetBasic subtarget t
+          component = selectComponentTargetBasic subtarget t
 
 selectComponentTarget subtarget t
-  = Left (TargetProblemIsSubComponent (availableTargetPackageId t)
-                                      (availableTargetComponentName t)
-                                       subtarget)
+  = Left (isSubComponentProblem (availableTargetPackageId t)
+           (availableTargetComponentName t)
+           subtarget)
 
 -- | The various error conditions that can occur when matching a
 -- 'TargetSelector' against 'AvailableTarget's for the @run@ command.
 --
-data TargetProblem =
-     TargetProblemCommon       TargetProblemCommon
-     -- | The 'TargetSelector' matches targets but none are buildable
-   | TargetProblemNoneEnabled TargetSelector [AvailableTarget ()]
-
-     -- | There are no targets at all
-   | TargetProblemNoTargets   TargetSelector
-
+data RunProblem =
      -- | The 'TargetSelector' matches targets but no executables
-   | TargetProblemNoExes      TargetSelector
+     TargetProblemNoExes      TargetSelector
 
      -- | A single 'TargetSelector' matches multiple targets
    | TargetProblemMatchesMultiple TargetSelector [AvailableTarget ()]
@@ -558,25 +549,36 @@ data TargetProblem =
    | TargetProblemIsSubComponent  PackageId ComponentName SubComponentTarget
   deriving (Eq, Show)
 
-reportTargetProblems :: Verbosity -> [TargetProblem] -> IO a
+type RunTargetProblem = TargetProblem RunProblem
+
+noExesProblem :: TargetSelector -> RunTargetProblem
+noExesProblem = CustomTargetProblem . TargetProblemNoExes
+
+matchesMultipleProblem :: TargetSelector -> [AvailableTarget ()] -> RunTargetProblem
+matchesMultipleProblem selector targets = CustomTargetProblem $
+    TargetProblemMatchesMultiple selector targets
+
+multipleTargetsProblem :: TargetsMap -> TargetProblem RunProblem
+multipleTargetsProblem = CustomTargetProblem . TargetProblemMultipleTargets
+
+componentNotExeProblem :: PackageId -> ComponentName -> TargetProblem RunProblem
+componentNotExeProblem pkgid name = CustomTargetProblem $
+    TargetProblemComponentNotExe pkgid name
+
+isSubComponentProblem
+  :: PackageId
+  -> ComponentName
+  -> SubComponentTarget
+  -> TargetProblem RunProblem
+isSubComponentProblem pkgid name subcomponent = CustomTargetProblem $
+    TargetProblemIsSubComponent pkgid name subcomponent
+
+reportTargetProblems :: Verbosity -> [RunTargetProblem] -> IO a
 reportTargetProblems verbosity =
-    die' verbosity . unlines . map renderTargetProblem
+    die' verbosity . unlines . map renderRunTargetProblem
 
-renderTargetProblem :: TargetProblem -> String
-renderTargetProblem (TargetProblemCommon problem) =
-    renderTargetProblemCommon "run" problem
-
-renderTargetProblem (TargetProblemNoneEnabled targetSelector targets) =
-    renderTargetProblemNoneEnabled "run" targetSelector targets
-
-renderTargetProblem (TargetProblemNoExes targetSelector) =
-    "Cannot run the target '" ++ showTargetSelector targetSelector
- ++ "' which refers to " ++ renderTargetSelector targetSelector
- ++ " because "
- ++ plural (targetSelectorPluralPkgs targetSelector) "it does" "they do"
- ++ " not contain any executables."
-
-renderTargetProblem (TargetProblemNoTargets targetSelector) =
+renderRunTargetProblem :: RunTargetProblem -> String
+renderRunTargetProblem (TargetProblemNoTargets targetSelector) =
     case targetSelectorFilter targetSelector of
       Just kind | kind /= ExeKind
         -> "The run command is for running executables, but the target '"
@@ -584,8 +586,11 @@ renderTargetProblem (TargetProblemNoTargets targetSelector) =
            ++ renderTargetSelector targetSelector ++ "."
 
       _ -> renderTargetProblemNoTargets "run" targetSelector
+renderRunTargetProblem problem =
+    renderTargetProblem "run" renderRunProblem problem
 
-renderTargetProblem (TargetProblemMatchesMultiple targetSelector targets) =
+renderRunProblem :: RunProblem -> String
+renderRunProblem (TargetProblemMatchesMultiple targetSelector targets) =
     "The run command is for running a single executable at once. The target '"
  ++ showTargetSelector targetSelector ++ "' refers to "
  ++ renderTargetSelector targetSelector ++ " which includes "
@@ -597,24 +602,31 @@ renderTargetProblem (TargetProblemMatchesMultiple targetSelector targets) =
                            [ExeKind, TestKind, BenchKind] )
  ++ "."
 
-renderTargetProblem (TargetProblemMultipleTargets selectorMap) =
+renderRunProblem (TargetProblemMultipleTargets selectorMap) =
     "The run command is for running a single executable at once. The targets "
  ++ renderListCommaAnd [ "'" ++ showTargetSelector ts ++ "'"
                        | ts <- ordNub (concatMap snd (concat (Map.elems selectorMap))) ]
  ++ " refer to different executables."
 
-renderTargetProblem (TargetProblemComponentNotExe pkgid cname) =
+renderRunProblem (TargetProblemComponentNotExe pkgid cname) =
     "The run command is for running executables, but the target '"
  ++ showTargetSelector targetSelector ++ "' refers to "
  ++ renderTargetSelector targetSelector ++ " from the package "
- ++ display pkgid ++ "."
+ ++ prettyShow pkgid ++ "."
   where
     targetSelector = TargetComponent pkgid cname WholeComponent
 
-renderTargetProblem (TargetProblemIsSubComponent pkgid cname subtarget) =
+renderRunProblem (TargetProblemIsSubComponent pkgid cname subtarget) =
     "The run command can only run an executable as a whole, "
  ++ "not files or modules within them, but the target '"
  ++ showTargetSelector targetSelector ++ "' refers to "
  ++ renderTargetSelector targetSelector ++ "."
   where
     targetSelector = TargetComponent pkgid cname subtarget
+
+renderRunProblem (TargetProblemNoExes targetSelector) =
+    "Cannot run the target '" ++ showTargetSelector targetSelector
+ ++ "' which refers to " ++ renderTargetSelector targetSelector
+ ++ " because "
+ ++ plural (targetSelectorPluralPkgs targetSelector) "it does" "they do"
+ ++ " not contain any executables."

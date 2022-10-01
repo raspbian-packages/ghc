@@ -1,3 +1,4 @@
+{-# LANGUAGE RecordWildCards #-}
 -- | cabal-install CLI command: build
 --
 module Distribution.Client.CmdBuild (
@@ -6,7 +7,6 @@ module Distribution.Client.CmdBuild (
     buildAction,
 
     -- * Internals exposed for testing
-    TargetProblem(..),
     selectPackageTargets,
     selectComponentTarget
   ) where
@@ -15,29 +15,26 @@ import Prelude ()
 import Distribution.Client.Compat.Prelude
 
 import Distribution.Client.ProjectOrchestration
+import Distribution.Client.TargetProblem
+         ( TargetProblem (..), TargetProblem' )
 import Distribution.Client.CmdErrorMessages
 
+import Distribution.Client.NixStyleOptions
+         ( NixStyleFlags (..), nixStyleOptions, defaultNixStyleFlags )
 import Distribution.Client.Setup
-         ( GlobalFlags, ConfigFlags(..), ConfigExFlags, InstallFlags
-         , liftOptions, yesNoOpt )
-import qualified Distribution.Client.Setup as Client
-import Distribution.Simple.Setup
-         ( HaddockFlags, TestFlags
-         , Flag(..), toFlag, fromFlag, fromFlagOrDefault )
+         ( GlobalFlags, ConfigFlags(..), yesNoOpt )
+import Distribution.Simple.Flag ( Flag(..), toFlag, fromFlag, fromFlagOrDefault )
 import Distribution.Simple.Command
-         ( CommandUI(..), usageAlternatives, option )
+         ( CommandUI(..), usageAlternatives, option, optionName )
 import Distribution.Verbosity
-         ( Verbosity, normal )
+         ( normal )
 import Distribution.Simple.Utils
          ( wrapText, die' )
 
 import qualified Data.Map as Map
 
 
-buildCommand ::
-  CommandUI
-  (BuildFlags, ( ConfigFlags, ConfigExFlags
-               , InstallFlags, HaddockFlags, TestFlags))
+buildCommand :: CommandUI (NixStyleFlags BuildFlags)
 buildCommand = CommandUI {
   commandName         = "v2-build",
   commandSynopsis     = "Compile targets within the project.",
@@ -67,25 +64,17 @@ buildCommand = CommandUI {
      ++ "    Build the component named cname in the project\n"
      ++ "  " ++ pname ++ " v2-build cname --enable-profiling\n"
      ++ "    Build the component in profiling mode "
-     ++ "(including dependencies as needed)\n\n"
+     ++ "(including dependencies as needed)\n"
 
-     ++ cmdCommonHelpTextNewBuildBeta,
-  commandDefaultFlags =
-      (defaultBuildFlags, commandDefaultFlags Client.installCommand),
-  commandOptions = \ showOrParseArgs ->
-      liftOptions snd setSnd
-          (commandOptions Client.installCommand showOrParseArgs) ++
-      liftOptions fst setFst
-          [ option [] ["only-configure"]
-              "Instead of performing a full build just run the configure step"
-              buildOnlyConfigure (\v flags -> flags { buildOnlyConfigure = v })
-              (yesNoOpt showOrParseArgs)
-          ]
+  , commandDefaultFlags = defaultNixStyleFlags defaultBuildFlags
+  , commandOptions      = filter (\o -> optionName o /= "ignore-project")
+                        . nixStyleOptions (\showOrParseArgs ->
+    [ option [] ["only-configure"]
+        "Instead of performing a full build just run the configure step"
+        buildOnlyConfigure (\v flags -> flags { buildOnlyConfigure = v })
+        (yesNoOpt showOrParseArgs)
+    ])
   }
-
-  where
-    setFst a (_,b) = (a,b)
-    setSnd b (a,_) = (a,b)
 
 data BuildFlags = BuildFlags
     { buildOnlyConfigure  :: Flag Bool
@@ -103,14 +92,8 @@ defaultBuildFlags = BuildFlags
 -- For more details on how this works, see the module
 -- "Distribution.Client.ProjectOrchestration"
 --
-buildAction ::
-  ( BuildFlags
-  , (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags, TestFlags))
-  -> [String] -> GlobalFlags -> IO ()
-buildAction
-  ( buildFlags
-  , (configFlags, configExFlags, installFlags, haddockFlags, testFlags))
-            targetStrings globalFlags = do
+buildAction :: NixStyleFlags BuildFlags -> [String] -> GlobalFlags -> IO ()
+buildAction flags@NixStyleFlags { extraFlags = buildFlags, ..} targetStrings globalFlags = do
     -- TODO: This flags defaults business is ugly
     let onlyConfigure = fromFlag (buildOnlyConfigure defaultBuildFlags
                                  <> buildOnlyConfigure buildFlags)
@@ -129,11 +112,10 @@ buildAction
 
             -- Interpret the targets on the command line as build targets
             -- (as opposed to say repl or haddock targets).
-            targets <- either (reportTargetProblems verbosity) return
+            targets <- either (reportBuildTargetProblems verbosity) return
                      $ resolveTargets
                          selectPackageTargets
                          selectComponentTarget
-                         TargetProblemCommon
                          elaboratedPlan
                          Nothing
                          targetSelectors
@@ -157,11 +139,8 @@ buildAction
     runProjectPostBuildPhase verbosity baseCtx buildCtx buildOutcomes
   where
     verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
-    cliConfig = commandLineFlagsToProjectConfig
-                  globalFlags configFlags configExFlags
-                  installFlags
+    cliConfig = commandLineFlagsToProjectConfig globalFlags flags
                   mempty -- ClientInstallFlags, not needed here
-                  haddockFlags testFlags
 
 -- | This defines what a 'TargetSelector' means for the @bench@ command.
 -- It selects the 'AvailableTarget's that the 'TargetSelector' refers to,
@@ -172,7 +151,7 @@ buildAction
 -- components
 --
 selectPackageTargets :: TargetSelector
-                     -> [AvailableTarget k] -> Either TargetProblem [k]
+                     -> [AvailableTarget k] -> Either TargetProblem' [k]
 selectPackageTargets targetSelector targets
 
     -- If there are any buildable targets then we select those
@@ -205,36 +184,12 @@ selectPackageTargets targetSelector targets
 -- For the @build@ command we just need the basic checks on being buildable etc.
 --
 selectComponentTarget :: SubComponentTarget
-                      -> AvailableTarget k -> Either TargetProblem k
-selectComponentTarget subtarget =
-    either (Left . TargetProblemCommon) Right
-  . selectComponentTargetBasic subtarget
+                      -> AvailableTarget k -> Either TargetProblem' k
+selectComponentTarget = selectComponentTargetBasic
 
-
--- | The various error conditions that can occur when matching a
--- 'TargetSelector' against 'AvailableTarget's for the @build@ command.
---
-data TargetProblem =
-     TargetProblemCommon       TargetProblemCommon
-
-     -- | The 'TargetSelector' matches targets but none are buildable
-   | TargetProblemNoneEnabled TargetSelector [AvailableTarget ()]
-
-     -- | There are no targets at all
-   | TargetProblemNoTargets   TargetSelector
-  deriving (Eq, Show)
-
-reportTargetProblems :: Verbosity -> [TargetProblem] -> IO a
-reportTargetProblems verbosity =
-    die' verbosity . unlines . map renderTargetProblem
-
-renderTargetProblem :: TargetProblem -> String
-renderTargetProblem (TargetProblemCommon problem) =
-    renderTargetProblemCommon "build" problem
-renderTargetProblem (TargetProblemNoneEnabled targetSelector targets) =
-    renderTargetProblemNoneEnabled "build" targetSelector targets
-renderTargetProblem(TargetProblemNoTargets targetSelector) =
-    renderTargetProblemNoTargets "build" targetSelector
+reportBuildTargetProblems :: Verbosity -> [TargetProblem'] -> IO a
+reportBuildTargetProblems verbosity problems =
+  reportTargetProblems verbosity "build" problems
 
 reportCannotPruneDependencies :: Verbosity -> CannotPruneDependencies -> IO a
 reportCannotPruneDependencies verbosity =

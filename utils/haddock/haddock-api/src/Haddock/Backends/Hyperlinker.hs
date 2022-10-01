@@ -18,14 +18,14 @@ import Data.Maybe
 import System.Directory
 import System.FilePath
 
-import HieTypes       ( HieFile(..), HieASTs(..), HieAST(..), NodeInfo(..) )
-import HieBin         ( readHieFile, hie_file_result)
+import GHC.Iface.Ext.Types  ( HieFile(..), HieASTs(..), HieAST(..), SourcedNodeInfo(..) )
+import GHC.Iface.Ext.Binary ( readHieFile, hie_file_result, NameCacheUpdater(..))
+import GHC.Types.SrcLoc     ( realSrcLocSpan, mkRealSrcLoc )
 import Data.Map as M
-import FastString     ( mkFastString )
-import Module         ( Module, moduleName )
-import NameCache      ( initNameCache )
-import SrcLoc         ( mkRealSrcLoc, realSrcLocSpan )
-import UniqSupply     ( mkSplitUniqSupply )
+import GHC.Data.FastString     ( mkFastString )
+import GHC.Unit.Module         ( Module, moduleName )
+import GHC.Types.Name.Cache    ( initNameCache )
+import GHC.Types.Unique.Supply ( mkSplitUniqSupply )
 
 
 -- | Generate hyperlinked source for given interfaces.
@@ -58,12 +58,14 @@ ppHyperlinkedModuleSource verbosity srcdir pretty srcs iface = case ifaceHieFile
     Just hfp -> do
         -- Parse the GHC-produced HIE file
         u <- mkSplitUniqSupply 'a'
+        let nc = (initNameCache u [])
+            ncu = NCU $ \f -> pure $ snd $ f nc
         HieFile { hie_hs_file = file
                 , hie_asts = HieASTs asts
                 , hie_types = types
                 , hie_hs_src = rawSrc
-                } <- (hie_file_result . fst)
-                 <$> (readHieFile (initNameCache u []) hfp)
+                } <- hie_file_result
+                 <$> (readHieFile ncu hfp)
 
         -- Get the AST and tokens corresponding to the source file we want
         let fileFs = mkFastString file
@@ -87,15 +89,10 @@ ppHyperlinkedModuleSource verbosity srcdir pretty srcs iface = case ifaceHieFile
     render' = render (Just srcCssFile) (Just highlightScript) srcs
     path = srcdir </> hypSrcModuleFile (ifaceMod iface)
 
-    emptyNodeInfo = NodeInfo
-      { nodeAnnotations = mempty
-      , nodeType = []
-      , nodeIdentifiers = mempty
-      }
     emptyHieAst fileFs = Node
-      { nodeInfo = emptyNodeInfo
-      , nodeSpan = realSrcLocSpan (mkRealSrcLoc fileFs 1 0)
+      { nodeSpan = realSrcLocSpan (mkRealSrcLoc fileFs 1 0)
       , nodeChildren = []
+      , sourcedNodeInfo = SourcedNodeInfo mempty
       }
 
 -- | Name of CSS file in output directory.

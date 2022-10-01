@@ -1,3 +1,4 @@
+{-# OPTIONS_GHC -fno-warn-incomplete-uni-patterns #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Client.Reporting
@@ -23,8 +24,11 @@ module Distribution.Client.BuildReports.Storage (
     fromPlanningFailure,
   ) where
 
+import Distribution.Client.Compat.Prelude
+import Prelude ()
+
+import Distribution.Client.BuildReports.Anonymous (BuildReport, showBuildReport, newBuildReport)
 import qualified Distribution.Client.BuildReports.Anonymous as BuildReport
-import Distribution.Client.BuildReports.Anonymous (BuildReport)
 
 import Distribution.Client.Types
 import qualified Distribution.Client.InstallPlan as InstallPlan
@@ -46,12 +50,11 @@ import Distribution.System
 import Distribution.Compiler
          ( CompilerId(..), CompilerInfo(..)  )
 import Distribution.Simple.Utils
-         ( comparing, equating )
+         ( equating )
 
-import Data.List
-         ( groupBy, sortBy )
-import Data.Maybe
-         ( mapMaybe )
+import Data.List.NonEmpty
+         ( groupBy )
+import qualified Data.List as L
 import System.FilePath
          ( (</>), takeDirectory )
 import System.Directory
@@ -66,16 +69,17 @@ storeAnonymous reports = sequence_
   -- the writes for each report are atomic (under 4k and flush at boundaries)
 
   where
-    format r = '\n' : BuildReport.show r ++ "\n"
+    format r = '\n' : showBuildReport r ++ "\n"
     separate :: [(BuildReport, Maybe Repo)]
              -> [(Repo, [BuildReport])]
     separate = map (\rs@((_,repo,_):_) -> (repo, [ r | (r,_,_) <- rs ]))
-             . map concat
-             . groupBy (equating (repoName . head))
-             . sortBy (comparing (repoName . head))
-             . groupBy (equating repoName)
+             . map (concatMap toList)
+             . L.groupBy (equating (repoName' . head))
+             . sortBy (comparing (repoName' . head))
+             . groupBy (equating repoName')
              . onlyRemote
-    repoName (_,_,rrepo) = remoteRepoName rrepo
+
+    repoName' (_,_,rrepo) = remoteRepoName rrepo
 
     onlyRemote :: [(BuildReport, Maybe Repo)]
                -> [(BuildReport, Repo, RemoteRepo)]
@@ -99,7 +103,7 @@ storeLocal cinfo templates reports platform = sequence_
   , let output = concatMap format reports'
   ]
   where
-    format r = '\n' : BuildReport.show r ++ "\n"
+    format r = '\n' : showBuildReport r ++ "\n"
 
     reportFileName template report =
         fromPathTemplate (substPathTemplate env template)
@@ -114,7 +118,7 @@ storeLocal cinfo templates reports platform = sequence_
                     platform
 
     groupByFileName = map (\grp@((filename,_):_) -> (filename, map snd grp))
-                    . groupBy (equating  fst)
+                    . L.groupBy (equating  fst)
                     . sortBy  (comparing fst)
 
 -- ------------------------------------------------------------
@@ -139,13 +143,13 @@ fromPlanPackage :: Platform -> CompilerId
 fromPlanPackage (Platform arch os) comp
                 (InstallPlan.Configured (ConfiguredPackage _ srcPkg flags _ deps))
                 (Just buildResult) =
-      Just ( BuildReport.new os arch comp
+      Just ( newBuildReport os arch comp
                              (packageId srcPkg) flags
                              (map packageId (CD.nonSetupDeps deps))
                              buildResult
            , extractRepo srcPkg)
   where
-    extractRepo (SourcePackage { packageSource = RepoTarballPackage repo _ _ })
+    extractRepo (SourcePackage { srcpkgSource = RepoTarballPackage repo _ _ })
                   = Just repo
     extractRepo _ = Nothing
 
@@ -155,5 +159,5 @@ fromPlanPackage _ _ _ _ = Nothing
 fromPlanningFailure :: Platform -> CompilerId
     -> [PackageId] -> FlagAssignment -> [(BuildReport, Maybe Repo)]
 fromPlanningFailure (Platform arch os) comp pkgids flags =
-  [ (BuildReport.new os arch comp pkgid flags [] (Left PlanningFailed), Nothing)
+  [ (newBuildReport os arch comp pkgid flags [] (Left PlanningFailed), Nothing)
   | pkgid <- pkgids ]

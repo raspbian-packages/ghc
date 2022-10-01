@@ -245,6 +245,7 @@ compactAllocateBlockInternal(Capability            *cap,
     initBdescr(head, g, g);
     head->flags = BF_COMPACT;
     for (block = head + 1, n_blocks --; n_blocks > 0; block++, n_blocks--) {
+        initBdescr(block, g, g);
         block->link = head;
         block->blocks = 0;
         block->flags = BF_COMPACT;
@@ -276,11 +277,15 @@ compactFree(StgCompactNFData *str)
     for ( ; block; block = next) {
         next = block->next;
         bd = Bdescr((StgPtr)block);
-        ASSERT((bd->flags & BF_EVACUATED) == 0);
+        ASSERT(RtsFlags.GcFlags.useNonmoving || ((bd->flags & BF_EVACUATED) == 0));
+            // When using the non-moving collector we leave compact object
+            // evacuated to the oldset gen as BF_EVACUATED to avoid evacuating
+            // objects in the non-moving heap.
         freeGroup(bd);
     }
 }
 
+#if defined(DEBUG)
 void
 compactMarkKnown(StgCompactNFData *str)
 {
@@ -319,7 +324,6 @@ countCompactBlocks(bdescr *outer)
     return count;
 }
 
-#if defined(DEBUG)
 // Like countCompactBlocks, but adjusts the size so each mblock is assumed to
 // only contain BLOCKS_PER_MBLOCK blocks.  Used in memInventory().
 StgWord
@@ -378,6 +382,7 @@ compactNew (Capability *cap, StgWord size)
     self->nursery = block;
     self->last = block;
     self->hash = NULL;
+    self->link = NULL;
 
     block->owner = self;
 

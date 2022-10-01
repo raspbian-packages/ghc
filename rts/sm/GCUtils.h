@@ -7,7 +7,7 @@
  * Documentation on the architecture of the Garbage Collector can be
  * found in the online commentary:
  *
- *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/Rts/Storage/GC
+ *   https://gitlab.haskell.org/ghc/ghc/wikis/commentary/rts/storage/gc
  *
  * --------------------------------------------------------------------------*/
 
@@ -67,7 +67,9 @@ recordMutableGen_GC (StgClosure *p, uint32_t gen_no)
         bd = new_bd;
         gct->mut_lists[gen_no] = bd;
     }
-    *bd->free++ = (StgWord)p;
+    *bd->free++ = (StgWord) p;
+    // N.B. we are allocating into our Capability-local mut_list, therefore
+    // we don't need an atomic increment.
 }
 
 #include "EndPrivate.h"

@@ -32,6 +32,7 @@ import Distribution.Solver.Types.ConstraintSource
 import Distribution.Solver.Types.Flag
 import Distribution.Solver.Types.PackagePath
 import Distribution.Types.PkgconfigVersionRange
+import Distribution.Types.UnitId (UnitId)
 import Language.Haskell.Extension (Extension, Language)
 
 type Weight = Double
@@ -102,14 +103,16 @@ data FailReason = UnsupportedExtension Extension
                 | NewPackageDoesNotMatchExistingConstraint ConflictingDep
                 | ConflictingConstraints ConflictingDep ConflictingDep
                 | NewPackageIsMissingRequiredComponent ExposedComponent (DependencyReason QPN)
+                | NewPackageHasPrivateRequiredComponent ExposedComponent (DependencyReason QPN)
                 | NewPackageHasUnbuildableRequiredComponent ExposedComponent (DependencyReason QPN)
                 | PackageRequiresMissingComponent QPN ExposedComponent
+                | PackageRequiresPrivateComponent QPN ExposedComponent
                 | PackageRequiresUnbuildableComponent QPN ExposedComponent
                 | CannotInstall
                 | CannotReinstall
                 | NotExplicit
                 | Shadowed
-                | Broken
+                | Broken UnitId
                 | UnknownPackage
                 | GlobalConstraintVersion VR ConstraintSource
                 | GlobalConstraintInstalled ConstraintSource

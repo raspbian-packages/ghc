@@ -21,6 +21,7 @@ module Distribution.Solver.Types.PackageIndex (
 
   -- * Updates
   merge,
+  override,
   insert,
   deletePackageName,
   deletePackageId,
@@ -39,6 +40,7 @@ module Distribution.Solver.Types.PackageIndex (
   searchByName,
   SearchResult(..),
   searchByNameSubstring,
+  searchWithPredicate,
 
   -- ** Bulk queries
   allPackages,
@@ -50,7 +52,8 @@ import Distribution.Solver.Compat.Prelude hiding (lookup)
 
 import Control.Exception (assert)
 import qualified Data.Map as Map
-import Data.List (groupBy, isInfixOf)
+import Data.List (isInfixOf)
+import qualified Data.List.NonEmpty as NE
 
 import Distribution.Package
          ( PackageName, unPackageName, PackageIdentifier(..)
@@ -58,7 +61,7 @@ import Distribution.Package
 import Distribution.Version
          ( VersionRange, withinRange )
 import Distribution.Simple.Utils
-         ( lowercase, comparing )
+         ( lowercase )
 
 import qualified Prelude (foldr1)
 
@@ -136,9 +139,9 @@ fromList pkgs = mkPackageIndex
   where
     fixBucket = -- out of groups of duplicates, later ones mask earlier ones
                 -- but Map.fromListWith (++) constructs groups in reverse order
-                map head
+                map NE.head
                 -- Eq instance for PackageIdentifier is wrong, so use Ord:
-              . groupBy (\a b -> EQ == comparing packageId a b)
+              . NE.groupBy (\a b -> EQ == comparing packageId a b)
                 -- relies on sortBy being a stable sort so we
                 -- can pick consistently among duplicates
               . sortBy (comparing packageId)
@@ -157,6 +160,7 @@ merge i1@(PackageIndex m1) i2@(PackageIndex m2) =
   assert (invariant i1 && invariant i2) $
     mkPackageIndex (Map.unionWith mergeBuckets m1 m2)
 
+
 -- | Elements in the second list mask those in the first.
 mergeBuckets :: Package pkg => [pkg] -> [pkg] -> [pkg]
 mergeBuckets []     ys     = ys
@@ -166,6 +170,16 @@ mergeBuckets xs@(x:xs') ys@(y:ys') =
         GT -> y : mergeBuckets xs  ys'
         EQ -> y : mergeBuckets xs' ys'
         LT -> x : mergeBuckets xs' ys
+
+-- | Override-merge oftwo indexes.
+--
+-- Packages from the second mask packages of the same exact name
+-- (case-sensitively) from the first.
+--
+override :: Package pkg => PackageIndex pkg -> PackageIndex pkg -> PackageIndex pkg
+override i1@(PackageIndex m1) i2@(PackageIndex m2) =
+  assert (invariant i1 && invariant i2) $
+    mkPackageIndex (Map.unionWith (\_l r -> r) m1 m2)
 
 -- | Inserts a single package into the index.
 --
@@ -311,9 +325,14 @@ data SearchResult a = None | Unambiguous a | Ambiguous [a]
 --
 searchByNameSubstring :: PackageIndex pkg
                       -> String -> [(PackageName, [pkg])]
-searchByNameSubstring (PackageIndex m) searchterm =
+searchByNameSubstring index searchterm =
+    searchWithPredicate index (\n -> lsearchterm `isInfixOf` lowercase n)
+  where lsearchterm = lowercase searchterm
+
+searchWithPredicate :: PackageIndex pkg
+                    -> (String -> Bool) -> [(PackageName, [pkg])]
+searchWithPredicate (PackageIndex m) predicate =
     [ pkgs
     | pkgs@(pname, _) <- Map.toList m
-    , lsearchterm `isInfixOf` lowercase (unPackageName pname) ]
-  where
-    lsearchterm = lowercase searchterm
+    , predicate (unPackageName pname)
+    ]
