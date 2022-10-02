@@ -1,3 +1,4 @@
+{-# LANGUAGE CApiFFI #-}
 {-# LANGUAGE Trustworthy #-}
 #if __GLASGOW_HASKELL__ >= 709
 {-# OPTIONS_GHC -fno-warn-trustworthy-safe #-}
@@ -81,10 +82,10 @@ data RTLDFlags
   | RTLD_LOCAL
     deriving (Show, Read)
 
-foreign import ccall unsafe "dlopen" c_dlopen :: CString -> CInt -> IO (Ptr ())
-foreign import ccall unsafe "dlsym"  c_dlsym  :: Ptr () -> CString -> IO (FunPtr a)
-foreign import ccall unsafe "dlerror" c_dlerror :: IO CString
-foreign import ccall unsafe "dlclose" c_dlclose :: (Ptr ()) -> IO CInt
+foreign import capi unsafe "dlfcn.h dlopen" c_dlopen :: CString -> CInt -> IO (Ptr ())
+foreign import capi unsafe "dlfcn.h dlsym"  c_dlsym  :: Ptr () -> CString -> IO (FunPtr a)
+foreign import capi unsafe "dlfcn.h dlerror" c_dlerror :: IO CString
+foreign import capi unsafe "dlfcn.h dlclose" c_dlclose :: (Ptr ()) -> IO CInt
 
 packRTLDFlags :: [RTLDFlags] -> CInt
 packRTLDFlags flags = foldl (\ s f -> (packRTLDFlag f) .|. s) 0 flags
