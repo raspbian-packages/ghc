@@ -1,3 +1,9 @@
+ghc (9.0.2-4+rpi2) bookworm-staging; urgency=medium
+
+  * Add build-conflicts on libllvm14
+
+ -- Peter Michael Green <plugwash@raspbian.org>  Tue, 04 Oct 2022 05:00:41 +0000
+
 ghc (9.0.2-4+rpi1) bookworm-staging; urgency=medium
 
   [changes brought forward from 7.6.3-21+rpi1 by Peter Michael Green <plugwash@raspbian.org> at Sun, 19 Apr 2015 14:00:16 +0000]
