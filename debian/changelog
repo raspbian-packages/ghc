@@ -1,3 +1,9 @@
+ghc (9.0.2-4+rpi3) bookworm-staging; urgency=medium
+
+  * Add build conflicts on libnuma1
+
+ -- Peter Michael Green <plugwash@raspbian.org>  Wed, 05 Oct 2022 13:33:13 +0000
+
 ghc (9.0.2-4+rpi2) bookworm-staging; urgency=medium
 
   * Add build-conflicts on libllvm14
