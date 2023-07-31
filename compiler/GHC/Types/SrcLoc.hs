@@ -72,6 +72,7 @@ module GHC.Types.SrcLoc (
         getBufPos,
         BufSpan(..),
         getBufSpan,
+        removeBufSpan,
 
         -- * Located
         Located,
@@ -396,6 +397,10 @@ data UnhelpfulSpanReason
   | UnhelpfulGenerated
   | UnhelpfulOther !FastString
   deriving (Eq, Show)
+
+removeBufSpan :: SrcSpan -> SrcSpan
+removeBufSpan (RealSrcSpan s _) = RealSrcSpan s Nothing
+removeBufSpan s = s
 
 {- Note [Why Maybe BufPos]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
