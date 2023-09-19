@@ -30,7 +30,7 @@ $(call all-target,$1,)
 .PHONY: html_$1
 ifeq "$$(phase)" "final"
 ifeq "$$(BUILD_SPHINX_HTML)" "YES"
-$(call all-target,$1,html_$1)
+docs: html_$1
 INSTALL_HTML_DOC_DIRS += $1/build-html/$2
 endif
 endif
@@ -47,7 +47,7 @@ endif
 .PHONY: pdf_$1
 ifeq "$$(phase)" "final"
 ifeq "$$(BUILD_SPHINX_PDF)" "YES"
-$(call all-target,$1,pdf_$1)
+docs: pdf_$1
 INSTALL_DOCS += $1/$2.pdf
 endif
 endif
