@@ -1286,12 +1286,11 @@ AC_LINK_IFELSE([
   AC_MSG_RESULT(no)
 )
 
+need_latomic=0
 AC_MSG_CHECKING(whether -latomic is needed for sub-word-sized atomic operations)
 AC_LINK_IFELSE([AC_LANG_PROGRAM([[unsigned char a;]], [[__atomic_fetch_or(&a, 1, __ATOMIC_RELAXED);]])],
     [
         AC_MSG_RESULT(no)
-        AC_SUBST([CabalNeedLibatomic],[False])
-        need_latomic=0
     ],
     [
         _save_LIBS=$LIBS
@@ -1299,18 +1298,46 @@ AC_LINK_IFELSE([AC_LANG_PROGRAM([[unsigned char a;]], [[__atomic_fetch_or(&a, 1,
         AC_LINK_IFELSE([AC_LANG_PROGRAM([[unsigned char a;]], [[__atomic_fetch_or(&a, 1, __ATOMIC_RELAXED);]])],
             [
                 AC_MSG_RESULT(yes)
-                AC_SUBST([CabalNeedLibatomic],[True])
                 need_latomic=1
             ],
             [
-                AC_SUBST([CabalNeedLibatomic],[False])
                 AC_MSG_ERROR([sub-word-sized atomic operations not available.])
-                need_latomic=0
             ])
         LIBS=$_save_LIBS
     ])
+AC_MSG_CHECKING(whether -latomic is needed for 64-bit atomic operations)
+AC_LINK_IFELSE([AC_LANG_PROGRAM(
+        [[
+        #include <inttypes.h>
+        uint64_t a;
+        ]], [[__atomic_fetch_or(&a, 1, __ATOMIC_RELAXED);]])],
+    [
+        AC_MSG_RESULT(no)
+    ],
+    [
+        _save_LIBS=$LIBS
+        LIBS="-latomic"
+        AC_LINK_IFELSE([AC_LANG_PROGRAM(
+                [[
+                #include <inttypes.h>
+                uint64_t a;
+                ]], [[__atomic_fetch_or(&a, 1, __ATOMIC_RELAXED);]])],
+            [
+                AC_MSG_RESULT(yes)
+                need_latomic=1
+            ],
+            [
+                AC_MSG_ERROR([64-bit atomic operations not available.])
+            ])
+        LIBS=$_save_LIBS
+    ])
+if test $need_latomic = 1; then
+    AC_SUBST([CabalNeedLibatomic],[True])
+else
+    AC_SUBST([CabalNeedLibatomic],[False])
+fi
 AC_DEFINE_UNQUOTED([NEED_ATOMIC_LIB], [$need_latomic],
-    [Define to 1 if we need -latomic for sub-word atomic operations.])
+    [Define to 1 if we need -latomic.])
 
 dnl ** check for eventfd which is needed by the I/O manager
 AC_CHECK_HEADERS([sys/eventfd.h])
