@@ -192,7 +192,7 @@ programPath context@Context {..} = do
     -- See: https://github.com/snowleopard/hadrian/issues/570
     -- Likewise for @iserv@ and @unlit@.
     name <- programName context
-    path <- if package `elem` [iserv, touchy, unlit]
+    path <- if package `elem` [touchy, unlit]
               then stageLibPath stage <&> (-/- "bin")
               else stageBinPath stage
     return $ path -/- name <.> exe
