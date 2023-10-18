@@ -145,7 +145,7 @@ headHtml docTitle themes mathjax_url base_url =
                 , thetype "text/css"
                 , href (withBaseURL base_url quickJumpCssFile) ]
              << noHtml
-    , thelink ! [ rel "stylesheet", thetype "text/css", href fontUrl] << noHtml
+    -- , thelink ! [ rel "stylesheet", thetype "text/css", href fontUrl] << noHtml
     , script ! [ src (withBaseURL base_url haddockJsFile)
                , emptyAttr "async"
                , thetype "text/javascript" ]
@@ -154,7 +154,7 @@ headHtml docTitle themes mathjax_url base_url =
     , script ! [src mjUrl, thetype "text/javascript"] << noHtml
     ]
   where
-    fontUrl = "https://fonts.googleapis.com/css?family=PT+Sans:400,400i,700"
+    -- fontUrl = "https://fonts.googleapis.com/css?family=PT+Sans:400,400i,700"
     mjUrl = fromMaybe "https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.5/MathJax.js?config=TeX-AMS-MML_HTMLorMML" mathjax_url
     mjConf = unwords [ "MathJax.Hub.Config({"
                      ,   "tex2jax: {"
