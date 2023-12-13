@@ -300,13 +300,11 @@ rtsPackageArgs = package rts ? do
           -- Set the namespace for the rts fs functions
           , arg $ "-DFS_NAMESPACE=rts"
           , arg $ "-DCOMPILING_RTS"
-          , notM targetSupportsSMP           ? arg "-DNOSMP"
           , way `elem` [debug, debugDynamic] ? pure [ "-DTICKY_TICKY"
                                                     , "-optc-DTICKY_TICKY"]
           , Profiling `wayUnit` way          ? arg "-DPROFILING"
           , Threaded  `wayUnit` way          ? arg "-DTHREADED_RTS"
-          , notM targetSupportsSMP           ? pure [ "-DNOSMP"
-                                                    , "-optc-DNOSMP" ]
+          , notM targetSupportsSMP           ? arg "-optc-DNOSMP"
           ]
 
     let cArgs = mconcat
@@ -324,6 +322,8 @@ rtsPackageArgs = package rts ? do
 
           , arg "-Irts"
           , arg $ "-I" ++ path
+
+          , notM targetSupportsSMP           ? arg "-DNOSMP"
 
           , Debug     `wayUnit` way          ? pure [ "-DDEBUG"
                                                     , "-fno-omit-frame-pointer"
