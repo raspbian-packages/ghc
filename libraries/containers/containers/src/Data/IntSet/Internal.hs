@@ -1,14 +1,14 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE PatternGuards #-}
-#if __GLASGOW_HASKELL__
-{-# LANGUAGE MagicHash, DeriveDataTypeable, StandaloneDeriving #-}
+#ifdef __GLASGOW_HASKELL__
+{-# LANGUAGE DeriveLift #-}
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TypeFamilies #-}
 #endif
 #if !defined(TESTING) && defined(__GLASGOW_HASKELL__)
 {-# LANGUAGE Trustworthy #-}
-#endif
-#if __GLASGOW_HASKELL__ >= 708
-{-# LANGUAGE TypeFamilies #-}
 #endif
 
 {-# OPTIONS_HADDOCK not-home #-}
@@ -56,9 +56,8 @@
 --      Workshop on ML, September 1998, pages 77-86,
 --      <http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.37.5452>
 --
---    * D.R. Morrison, \"/PATRICIA -- Practical Algorithm To Retrieve
---      Information Coded In Alphanumeric/\", Journal of the ACM, 15(4),
---      October 1968, pages 514-534.
+--    * D.R. Morrison, \"/PATRICIA -- Practical Algorithm To Retrieve Information Coded In Alphanumeric/\",
+--      Journal of the ACM, 15(4), October 1968, pages 514-534.
 --
 -- Additionally, this implementation places bitmaps in the leaves of the tree.
 -- Their size is the natural size of a machine word (32 or 64 bits) and greatly
@@ -66,9 +65,9 @@
 -- it is likely that many values lie close to each other. The asymptotics are
 -- not affected by this optimization.
 --
--- Many operations have a worst-case complexity of /O(min(n,W))/.
+-- Many operations have a worst-case complexity of \(O(\min(n,W))\).
 -- This means that the operation can become linear in the number of
--- elements with a maximum of /W/ -- the number of bits in an 'Int'
+-- elements with a maximum of \(W\) -- the number of bits in an 'Int'
 -- (32 or 64).
 --
 -- @since 0.5.9
@@ -137,6 +136,11 @@ module Data.IntSet.Internal (
     -- * Filter
     , filter
     , partition
+
+    , takeWhileAntitone
+    , dropWhileAntitone
+    , spanAntitone
+
     , split
     , splitMember
     , splitRoot
@@ -194,21 +198,14 @@ import Control.DeepSeq (NFData(rnf))
 import Data.Bits
 import qualified Data.List as List
 import Data.Maybe (fromMaybe)
-#if !MIN_VERSION_base(4,8,0)
-import Data.Monoid (Monoid(..))
-import Data.Word (Word)
-#endif
-#if MIN_VERSION_base(4,9,0)
 import Data.Semigroup (Semigroup(stimes))
-#endif
-#if !(MIN_VERSION_base(4,11,0)) && MIN_VERSION_base(4,9,0)
+#if !(MIN_VERSION_base(4,11,0))
 import Data.Semigroup (Semigroup((<>)))
 #endif
-#if MIN_VERSION_base(4,9,0)
 import Data.Semigroup (stimesIdempotentMonoid)
-#endif
-import Data.Typeable
-import Prelude hiding (filter, foldr, foldl, null, map)
+import Utils.Containers.Internal.Prelude hiding
+  (filter, foldr, foldl, null, map)
+import Prelude ()
 
 import Utils.Containers.Internal.BitUtil
 import Utils.Containers.Internal.StrictPair
@@ -221,14 +218,16 @@ import Text.Read
 
 #if __GLASGOW_HASKELL__
 import qualified GHC.Exts
+#  if !(WORD_SIZE_IN_BITS==64)
+import qualified GHC.Int
+#  endif
+import Language.Haskell.TH.Syntax (Lift)
+-- See Note [ Template Haskell Dependencies ]
+import Language.Haskell.TH ()
 #endif
 
 import qualified Data.Foldable as Foldable
-#if MIN_VERSION_base(4,8,0)
 import Data.Functor.Identity (Identity(..))
-#else
-import Data.Foldable (Foldable())
-#endif
 
 infixl 9 \\{-This comment teaches CPP correct behaviour -}
 
@@ -246,7 +245,7 @@ intFromNat w = fromIntegral w
 {--------------------------------------------------------------------
   Operators
 --------------------------------------------------------------------}
--- | /O(n+m)/. See 'difference'.
+-- | \(O(n+m)\). See 'difference'.
 (\\) :: IntSet -> IntSet -> IntSet
 m1 \\ m2 = difference m1 m2
 
@@ -281,19 +280,20 @@ type Mask   = Int
 type BitMap = Word
 type Key    = Int
 
+#ifdef __GLASGOW_HASKELL__
+-- | @since 0.6.6
+deriving instance Lift IntSet
+#endif
+
 instance Monoid IntSet where
     mempty  = empty
     mconcat = unions
-#if !(MIN_VERSION_base(4,9,0))
-    mappend = union
-#else
     mappend = (<>)
 
 -- | @since 0.5.7
 instance Semigroup IntSet where
     (<>)    = union
     stimes  = stimesIdempotentMonoid
-#endif
 
 #if __GLASGOW_HASKELL__
 
@@ -323,13 +323,13 @@ intSetDataType = mkDataType "Data.IntSet.Internal.IntSet" [fromListConstr]
 {--------------------------------------------------------------------
   Query
 --------------------------------------------------------------------}
--- | /O(1)/. Is the set empty?
+-- | \(O(1)\). Is the set empty?
 null :: IntSet -> Bool
 null Nil = True
 null _   = False
 {-# INLINE null #-}
 
--- | /O(n)/. Cardinality of the set.
+-- | \(O(n)\). Cardinality of the set.
 size :: IntSet -> Int
 size = go 0
   where
@@ -337,7 +337,7 @@ size = go 0
     go acc (Tip _ bm) = acc + bitcount 0 bm
     go acc Nil = acc
 
--- | /O(min(n,W))/. Is the value a member of the set?
+-- | \(O(\min(n,W))\). Is the value a member of the set?
 
 -- See Note: Local 'go' functions and capturing.
 member :: Key -> IntSet -> Bool
@@ -350,11 +350,11 @@ member !x = go
     go (Tip y bm) = prefixOf x == y && bitmapOf x .&. bm /= 0
     go Nil = False
 
--- | /O(min(n,W))/. Is the element not in the set?
+-- | \(O(\min(n,W))\). Is the element not in the set?
 notMember :: Key -> IntSet -> Bool
 notMember k = not . member k
 
--- | /O(log n)/. Find largest element smaller than the given one.
+-- | \(O(\min(n,W))\). Find largest element smaller than the given one.
 --
 -- > lookupLT 3 (fromList [3, 5]) == Nothing
 -- > lookupLT 5 (fromList [3, 5]) == Just 3
@@ -375,7 +375,7 @@ lookupLT !x t = case t of
     go def Nil = unsafeFindMax def
 
 
--- | /O(log n)/. Find smallest element greater than the given one.
+-- | \(O(\min(n,W))\). Find smallest element greater than the given one.
 --
 -- > lookupGT 4 (fromList [3, 5]) == Just 5
 -- > lookupGT 5 (fromList [3, 5]) == Nothing
@@ -396,7 +396,7 @@ lookupGT !x t = case t of
     go def Nil = unsafeFindMin def
 
 
--- | /O(log n)/. Find largest element smaller or equal to the given one.
+-- | \(O(\min(n,W))\). Find largest element smaller or equal to the given one.
 --
 -- > lookupLE 2 (fromList [3, 5]) == Nothing
 -- > lookupLE 4 (fromList [3, 5]) == Just 3
@@ -418,7 +418,7 @@ lookupLE !x t = case t of
     go def Nil = unsafeFindMax def
 
 
--- | /O(log n)/. Find smallest element greater or equal to the given one.
+-- | \(O(\min(n,W))\). Find smallest element greater or equal to the given one.
 --
 -- > lookupGE 3 (fromList [3, 5]) == Just 3
 -- > lookupGE 4 (fromList [3, 5]) == Just 5
@@ -458,13 +458,13 @@ unsafeFindMax (Bin _ _ _ r) = unsafeFindMax r
 {--------------------------------------------------------------------
   Construction
 --------------------------------------------------------------------}
--- | /O(1)/. The empty set.
+-- | \(O(1)\). The empty set.
 empty :: IntSet
 empty
   = Nil
 {-# INLINE empty #-}
 
--- | /O(1)/. A set of one element.
+-- | \(O(1)\). A set of one element.
 singleton :: Key -> IntSet
 singleton x
   = Tip (prefixOf x) (bitmapOf x)
@@ -473,7 +473,7 @@ singleton x
 {--------------------------------------------------------------------
   Insert
 --------------------------------------------------------------------}
--- | /O(min(n,W))/. Add a value to the set. There is no left- or right bias for
+-- | \(O(\min(n,W))\). Add a value to the set. There is no left- or right bias for
 -- IntSets.
 insert :: Key -> IntSet -> IntSet
 insert !x = insertBM (prefixOf x) (bitmapOf x)
@@ -489,7 +489,7 @@ insertBM kx bm t@(Tip kx' bm')
   | otherwise = link kx (Tip kx bm) kx' t
 insertBM kx bm Nil = Tip kx bm
 
--- | /O(min(n,W))/. Delete a value in the set. Returns the
+-- | \(O(\min(n,W))\). Delete a value in the set. Returns the
 -- original set when the value was not present.
 delete :: Key -> IntSet -> IntSet
 delete !x = deleteBM (prefixOf x) (bitmapOf x)
@@ -506,7 +506,7 @@ deleteBM kx bm t@(Tip kx' bm')
   | otherwise = t
 deleteBM _ _ Nil = Nil
 
--- | /O(min(n,W))/. @('alterF' f x s)@ can delete or insert @x@ in @s@ depending
+-- | \(O(\min(n,W))\). @('alterF' f x s)@ can delete or insert @x@ in @s@ depending
 -- on whether it is already present in @s@.
 --
 -- In short:
@@ -539,9 +539,7 @@ alterF f k s = fmap choose (f member_)
  #-}
 #endif
 
-#if MIN_VERSION_base(4,8,0)
 {-# SPECIALIZE alterF :: (Bool -> Identity Bool) -> Key -> IntSet -> Identity IntSet #-}
-#endif
 
 {--------------------------------------------------------------------
   Union
@@ -552,7 +550,7 @@ unions xs
   = Foldable.foldl' union empty xs
 
 
--- | /O(n+m)/. The union of two sets.
+-- | \(O(n+m)\). The union of two sets.
 union :: IntSet -> IntSet -> IntSet
 union t1@(Bin p1 m1 l1 r1) t2@(Bin p2 m2 l2 r2)
   | shorter m1 m2  = union1
@@ -577,7 +575,7 @@ union Nil t = t
 {--------------------------------------------------------------------
   Difference
 --------------------------------------------------------------------}
--- | /O(n+m)/. Difference between two sets.
+-- | \(O(n+m)\). Difference between two sets.
 difference :: IntSet -> IntSet -> IntSet
 difference t1@(Bin p1 m1 l1 r1) t2@(Bin p2 m2 l2 r2)
   | shorter m1 m2  = difference1
@@ -611,7 +609,7 @@ difference Nil _     = Nil
 {--------------------------------------------------------------------
   Intersection
 --------------------------------------------------------------------}
--- | /O(n+m)/. The intersection of two sets.
+-- | \(O(n+m)\). The intersection of two sets.
 intersection :: IntSet -> IntSet -> IntSet
 intersection t1@(Bin p1 m1 l1 r1) t2@(Bin p2 m2 l2 r2)
   | shorter m1 m2  = intersection1
@@ -650,7 +648,7 @@ intersection Nil _ = Nil
 {--------------------------------------------------------------------
   Subset
 --------------------------------------------------------------------}
--- | /O(n+m)/. Is this a proper subset? (ie. a subset but not equal).
+-- | \(O(n+m)\). Is this a proper subset? (ie. a subset but not equal).
 isProperSubsetOf :: IntSet -> IntSet -> Bool
 isProperSubsetOf t1 t2
   = case subsetCmp t1 t2 of
@@ -689,7 +687,7 @@ subsetCmp (Tip _ _) Nil = GT -- disjoint
 subsetCmp Nil Nil = EQ
 subsetCmp Nil _   = LT
 
--- | /O(n+m)/. Is this a subset?
+-- | \(O(n+m)\). Is this a subset?
 -- @(s1 \`isSubsetOf\` s2)@ tells whether @s1@ is a subset of @s2@.
 
 isSubsetOf :: IntSet -> IntSet -> Bool
@@ -711,7 +709,7 @@ isSubsetOf Nil _         = True
 {--------------------------------------------------------------------
   Disjoint
 --------------------------------------------------------------------}
--- | /O(n+m)/. Check whether two sets are disjoint (i.e. their intersection
+-- | \(O(n+m)\). Check whether two sets are disjoint (i.e. their intersection
 --   is empty).
 --
 -- > disjoint (fromList [2,4,6])   (fromList [1,3])     == True
@@ -759,7 +757,7 @@ disjoint Nil _ = True
 {--------------------------------------------------------------------
   Filter
 --------------------------------------------------------------------}
--- | /O(n)/. Filter all elements that satisfy some predicate.
+-- | \(O(n)\). Filter all elements that satisfy some predicate.
 filter :: (Key -> Bool) -> IntSet -> IntSet
 filter predicate t
   = case t of
@@ -772,7 +770,7 @@ filter predicate t
                          | otherwise           = bm
         {-# INLINE bitPred #-}
 
--- | /O(n)/. partition the set according to some predicate.
+-- | \(O(n)\). partition the set according to some predicate.
 partition :: (Key -> Bool) -> IntSet -> (IntSet,IntSet)
 partition predicate0 t0 = toPair $ go predicate0 t0
   where
@@ -790,8 +788,97 @@ partition predicate0 t0 = toPair $ go predicate0 t0
                              | otherwise           = bm
             {-# INLINE bitPred #-}
 
+-- | \(O(\min(n,W))\). Take while a predicate on the elements holds.
+-- The user is responsible for ensuring that for all @Int@s, @j \< k ==\> p j \>= p k@.
+-- See note at 'spanAntitone'.
+--
+-- @
+-- takeWhileAntitone p = 'fromDistinctAscList' . 'Data.List.takeWhile' p . 'toList'
+-- takeWhileAntitone p = 'filter' p
+-- @
+--
+-- @since 0.6.7
+takeWhileAntitone :: (Key -> Bool) -> IntSet -> IntSet
+takeWhileAntitone predicate t =
+  case t of
+    Bin p m l r
+      | m < 0 ->
+        if predicate 0 -- handle negative numbers.
+        then bin p m (go predicate l) r
+        else go predicate r
+    _ -> go predicate t
+  where
+    go predicate' (Bin p m l r)
+      | predicate' $! p+m = bin p m l (go predicate' r)
+      | otherwise         = go predicate' l
+    go predicate' (Tip kx bm) = tip kx (takeWhileAntitoneBits kx predicate' bm)
+    go _ Nil = Nil
 
--- | /O(min(n,W))/. The expression (@'split' x set@) is a pair @(set1,set2)@
+-- | \(O(\min(n,W))\). Drop while a predicate on the elements holds.
+-- The user is responsible for ensuring that for all @Int@s, @j \< k ==\> p j \>= p k@.
+-- See note at 'spanAntitone'.
+--
+-- @
+-- dropWhileAntitone p = 'fromDistinctAscList' . 'Data.List.dropWhile' p . 'toList'
+-- dropWhileAntitone p = 'filter' (not . p)
+-- @
+--
+-- @since 0.6.7
+dropWhileAntitone :: (Key -> Bool) -> IntSet -> IntSet
+dropWhileAntitone predicate t =
+  case t of
+    Bin p m l r
+      | m < 0 ->
+        if predicate 0 -- handle negative numbers.
+        then go predicate l
+        else bin p m l (go predicate r)
+    _ -> go predicate t
+  where
+    go predicate' (Bin p m l r)
+      | predicate' $! p+m = go predicate' r
+      | otherwise         = bin p m (go predicate' l) r
+    go predicate' (Tip kx bm) = tip kx (bm `xor` takeWhileAntitoneBits kx predicate' bm)
+    go _ Nil = Nil
+
+-- | \(O(\min(n,W))\). Divide a set at the point where a predicate on the elements stops holding.
+-- The user is responsible for ensuring that for all @Int@s, @j \< k ==\> p j \>= p k@.
+--
+-- @
+-- spanAntitone p xs = ('takeWhileAntitone' p xs, 'dropWhileAntitone' p xs)
+-- spanAntitone p xs = 'partition' p xs
+-- @
+--
+-- Note: if @p@ is not actually antitone, then @spanAntitone@ will split the set
+-- at some /unspecified/ point.
+--
+-- @since 0.6.7
+spanAntitone :: (Key -> Bool) -> IntSet -> (IntSet, IntSet)
+spanAntitone predicate t =
+  case t of
+    Bin p m l r
+      | m < 0 ->
+        if predicate 0 -- handle negative numbers.
+        then
+          case go predicate l of
+            (lt :*: gt) ->
+              let !lt' = bin p m lt r
+              in (lt', gt)
+        else
+          case go predicate r of
+            (lt :*: gt) ->
+              let !gt' = bin p m l gt
+              in (lt, gt')
+    _ -> case go predicate t of
+          (lt :*: gt) -> (lt, gt)
+  where
+    go predicate' (Bin p m l r)
+      | predicate' $! p+m = case go predicate' r of (lt :*: gt) -> bin p m l lt :*: gt
+      | otherwise         = case go predicate' l of (lt :*: gt) -> lt :*: bin p m gt r
+    go predicate' (Tip kx bm) = let bm' = takeWhileAntitoneBits kx predicate' bm
+                                in (tip kx bm' :*: tip kx (bm `xor` bm'))
+    go _ Nil = (Nil :*: Nil)
+
+-- | \(O(\min(n,W))\). The expression (@'split' x set@) is a pair @(set1,set2)@
 -- where @set1@ comprises the elements of @set@ less than @x@ and @set2@
 -- comprises the elements of @set@ greater than @x@.
 --
@@ -799,23 +886,26 @@ partition predicate0 t0 = toPair $ go predicate0 t0
 split :: Key -> IntSet -> (IntSet,IntSet)
 split x t =
   case t of
-      Bin _ m l r
-          | m < 0 -> if x >= 0  -- handle negative numbers.
-                     then case go x l of (lt :*: gt) -> let !lt' = union lt r
-                                                        in (lt', gt)
-                     else case go x r of (lt :*: gt) -> let !gt' = union gt l
-                                                        in (lt, gt')
-      _ -> case go x t of
+    Bin p m l r
+      | m < 0 ->
+        if x >= 0  -- handle negative numbers.
+        then
+          case go x l of
+            (lt :*: gt) ->
+              let !lt' = bin p m lt r
+              in (lt', gt)
+        else
+          case go x r of
+            (lt :*: gt) ->
+              let !gt' = bin p m l gt
+              in (lt, gt')
+    _ -> case go x t of
           (lt :*: gt) -> (lt, gt)
   where
     go !x' t'@(Bin p m l r)
-        | match x' p m = if zero x' m
-                         then case go x' l of
-                             (lt :*: gt) -> lt :*: union gt r
-                         else case go x' r of
-                             (lt :*: gt) -> union lt l :*: gt
-        | otherwise   = if x' < p then (Nil :*: t')
-                        else (t' :*: Nil)
+        | nomatch x' p m = if x' < p then (Nil :*: t') else (t' :*: Nil)
+        | zero x' m      = case go x' l of (lt :*: gt) -> lt :*: bin p m gt r
+        | otherwise      = case go x' r of (lt :*: gt) -> bin p m l lt :*: gt
     go x' t'@(Tip kx' bm)
         | kx' > x'          = (Nil :*: t')
           -- equivalent to kx' > prefixOf x'
@@ -825,27 +915,38 @@ split x t =
                   higherBitmap = complement (lowerBitmap + bitmapOf x')
     go _ Nil = (Nil :*: Nil)
 
--- | /O(min(n,W))/. Performs a 'split' but also returns whether the pivot
+-- | \(O(\min(n,W))\). Performs a 'split' but also returns whether the pivot
 -- element was found in the original set.
 splitMember :: Key -> IntSet -> (IntSet,Bool,IntSet)
 splitMember x t =
   case t of
-      Bin _ m l r | m < 0 -> if x >= 0
-                             then case go x l of
-                                 (lt, fnd, gt) -> let !lt' = union lt r
-                                                  in (lt', fnd, gt)
-                             else case go x r of
-                                 (lt, fnd, gt) -> let !gt' = union gt l
-                                                  in (lt, fnd, gt')
-      _ -> go x t
+    Bin p m l r
+      | m < 0 ->
+        if x >= 0 -- handle negative numbers.
+        then
+          case go x l of
+            (lt, fnd, gt) ->
+              let !lt' = bin p m lt r
+              in (lt', fnd, gt)
+        else
+          case go x r of
+            (lt, fnd, gt) ->
+              let !gt' = bin p m l gt
+              in (lt, fnd, gt')
+    _ -> go x t
   where
     go x' t'@(Bin p m l r)
-        | match x' p m = if zero x' m
-                         then case go x' l of
-                             (lt, fnd, gt) -> (lt, fnd, union gt r)
-                         else case go x' r of
-                             (lt, fnd, gt) -> (union lt l, fnd, gt)
-        | otherwise   = if x' < p then (Nil, False, t') else (t', False, Nil)
+        | nomatch x' p m = if x' < p then (Nil, False, t') else (t', False, Nil)
+        | zero x' m =
+          case go x' l of
+            (lt, fnd, gt) ->
+              let !gt' = bin p m gt r
+              in (lt, fnd, gt')
+        | otherwise =
+          case go x' r of
+            (lt, fnd, gt) ->
+              let !lt' = bin p m l lt
+              in (lt', fnd, gt)
     go x' t'@(Tip kx' bm)
         | kx' > x'          = (Nil, False, t')
           -- equivalent to kx' > prefixOf x'
@@ -863,7 +964,7 @@ splitMember x t =
   Min/Max
 ----------------------------------------------------------------------}
 
--- | /O(min(n,W))/. Retrieves the maximal key of the set, and the set
+-- | \(O(\min(n,W))\). Retrieves the maximal key of the set, and the set
 -- stripped of that element, or 'Nothing' if passed an empty set.
 maxView :: IntSet -> Maybe (Key, IntSet)
 maxView t =
@@ -875,7 +976,7 @@ maxView t =
     go (Tip kx bm) = case highestBitSet bm of bi -> (kx + bi, tip kx (bm .&. complement (bitmapOfSuffix bi)))
     go Nil = error "maxView Nil"
 
--- | /O(min(n,W))/. Retrieves the minimal key of the set, and the set
+-- | \(O(\min(n,W))\). Retrieves the minimal key of the set, and the set
 -- stripped of that element, or 'Nothing' if passed an empty set.
 minView :: IntSet -> Maybe (Key, IntSet)
 minView t =
@@ -887,20 +988,20 @@ minView t =
     go (Tip kx bm) = case lowestBitSet bm of bi -> (kx + bi, tip kx (bm .&. complement (bitmapOfSuffix bi)))
     go Nil = error "minView Nil"
 
--- | /O(min(n,W))/. Delete and find the minimal element.
+-- | \(O(\min(n,W))\). Delete and find the minimal element.
 --
 -- > deleteFindMin set = (findMin set, deleteMin set)
 deleteFindMin :: IntSet -> (Key, IntSet)
 deleteFindMin = fromMaybe (error "deleteFindMin: empty set has no minimal element") . minView
 
--- | /O(min(n,W))/. Delete and find the maximal element.
+-- | \(O(\min(n,W))\). Delete and find the maximal element.
 --
 -- > deleteFindMax set = (findMax set, deleteMax set)
 deleteFindMax :: IntSet -> (Key, IntSet)
 deleteFindMax = fromMaybe (error "deleteFindMax: empty set has no maximal element") . maxView
 
 
--- | /O(min(n,W))/. The minimal element of the set.
+-- | \(O(\min(n,W))\). The minimal element of the set.
 findMin :: IntSet -> Key
 findMin Nil = error "findMin: empty set has no minimal element"
 findMin (Tip kx bm) = kx + lowestBitSet bm
@@ -911,7 +1012,7 @@ findMin (Bin _ m l r)
           find (Bin _ _ l' _) = find l'
           find Nil            = error "findMin Nil"
 
--- | /O(min(n,W))/. The maximal element of a set.
+-- | \(O(\min(n,W))\). The maximal element of a set.
 findMax :: IntSet -> Key
 findMax Nil = error "findMax: empty set has no maximal element"
 findMax (Tip kx bm) = kx + highestBitSet bm
@@ -923,14 +1024,14 @@ findMax (Bin _ m l r)
           find Nil            = error "findMax Nil"
 
 
--- | /O(min(n,W))/. Delete the minimal element. Returns an empty set if the set is empty.
+-- | \(O(\min(n,W))\). Delete the minimal element. Returns an empty set if the set is empty.
 --
 -- Note that this is a change of behaviour for consistency with 'Data.Set.Set' &#8211;
 -- versions prior to 0.5 threw an error if the 'IntSet' was already empty.
 deleteMin :: IntSet -> IntSet
 deleteMin = maybe Nil snd . minView
 
--- | /O(min(n,W))/. Delete the maximal element. Returns an empty set if the set is empty.
+-- | \(O(\min(n,W))\). Delete the maximal element. Returns an empty set if the set is empty.
 --
 -- Note that this is a change of behaviour for consistency with 'Data.Set.Set' &#8211;
 -- versions prior to 0.5 threw an error if the 'IntSet' was already empty.
@@ -941,7 +1042,7 @@ deleteMax = maybe Nil snd . maxView
   Map
 ----------------------------------------------------------------------}
 
--- | /O(n*min(n,W))/.
+-- | \(O(n \min(n,W))\).
 -- @'map' f s@ is the set obtained by applying @f@ to each element of @s@.
 --
 -- It's worth noting that the size of the result may be smaller if,
@@ -950,7 +1051,7 @@ deleteMax = maybe Nil snd . maxView
 map :: (Key -> Key) -> IntSet -> IntSet
 map f = fromList . List.map f . toList
 
--- | /O(n)/. The
+-- | \(O(n)\). The
 --
 -- @'mapMonotonic' f s == 'map' f s@, but works only when @f@ is strictly increasing.
 -- /The precondition is not checked./
@@ -970,7 +1071,7 @@ mapMonotonic f = fromDistinctAscList . List.map f . toAscList
 {--------------------------------------------------------------------
   Fold
 --------------------------------------------------------------------}
--- | /O(n)/. Fold the elements in the set using the given right-associative
+-- | \(O(n)\). Fold the elements in the set using the given right-associative
 -- binary operator. This function is an equivalent of 'foldr' and is present
 -- for compatibility only.
 --
@@ -979,7 +1080,7 @@ fold :: (Key -> b -> b) -> b -> IntSet -> b
 fold = foldr
 {-# INLINE fold #-}
 
--- | /O(n)/. Fold the elements in the set using the given right-associative
+-- | \(O(n)\). Fold the elements in the set using the given right-associative
 -- binary operator, such that @'foldr' f z == 'Prelude.foldr' f z . 'toAscList'@.
 --
 -- For example,
@@ -996,7 +1097,7 @@ foldr f z = \t ->      -- Use lambda t to be inlinable with two arguments only.
     go z' (Bin _ _ l r) = go (go z' r) l
 {-# INLINE foldr #-}
 
--- | /O(n)/. A strict version of 'foldr'. Each application of the operator is
+-- | \(O(n)\). A strict version of 'foldr'. Each application of the operator is
 -- evaluated before using the result in the next application. This
 -- function is strict in the starting value.
 foldr' :: (Key -> b -> b) -> b -> IntSet -> b
@@ -1010,7 +1111,7 @@ foldr' f z = \t ->      -- Use lambda t to be inlinable with two arguments only.
     go z' (Bin _ _ l r) = go (go z' r) l
 {-# INLINE foldr' #-}
 
--- | /O(n)/. Fold the elements in the set using the given left-associative
+-- | \(O(n)\). Fold the elements in the set using the given left-associative
 -- binary operator, such that @'foldl' f z == 'Prelude.foldl' f z . 'toAscList'@.
 --
 -- For example,
@@ -1027,7 +1128,7 @@ foldl f z = \t ->      -- Use lambda t to be inlinable with two arguments only.
     go z' (Bin _ _ l r) = go (go z' l) r
 {-# INLINE foldl #-}
 
--- | /O(n)/. A strict version of 'foldl'. Each application of the operator is
+-- | \(O(n)\). A strict version of 'foldl'. Each application of the operator is
 -- evaluated before using the result in the next application. This
 -- function is strict in the starting value.
 foldl' :: (a -> Key -> a) -> a -> IntSet -> a
@@ -1044,7 +1145,7 @@ foldl' f z = \t ->      -- Use lambda t to be inlinable with two arguments only.
 {--------------------------------------------------------------------
   List variations
 --------------------------------------------------------------------}
--- | /O(n)/. An alias of 'toAscList'. The elements of a set in ascending order.
+-- | \(O(n)\). An alias of 'toAscList'. The elements of a set in ascending order.
 -- Subject to list fusion.
 elems :: IntSet -> [Key]
 elems
@@ -1053,7 +1154,8 @@ elems
 {--------------------------------------------------------------------
   Lists
 --------------------------------------------------------------------}
-#if __GLASGOW_HASKELL__ >= 708
+
+#ifdef __GLASGOW_HASKELL__
 -- | @since 0.5.6.2
 instance GHC.Exts.IsList IntSet where
   type Item IntSet = Key
@@ -1061,17 +1163,17 @@ instance GHC.Exts.IsList IntSet where
   toList   = toList
 #endif
 
--- | /O(n)/. Convert the set to a list of elements. Subject to list fusion.
+-- | \(O(n)\). Convert the set to a list of elements. Subject to list fusion.
 toList :: IntSet -> [Key]
 toList
   = toAscList
 
--- | /O(n)/. Convert the set to an ascending list of elements. Subject to list
+-- | \(O(n)\). Convert the set to an ascending list of elements. Subject to list
 -- fusion.
 toAscList :: IntSet -> [Key]
 toAscList = foldr (:) []
 
--- | /O(n)/. Convert the set to a descending list of elements. Subject to list
+-- | \(O(n)\). Convert the set to a descending list of elements. Subject to list
 -- fusion.
 toDescList :: IntSet -> [Key]
 toDescList = foldl (flip (:)) []
@@ -1106,26 +1208,26 @@ foldlFB = foldl
 #endif
 
 
--- | /O(n*min(n,W))/. Create a set from a list of integers.
+-- | \(O(n \min(n,W))\). Create a set from a list of integers.
 fromList :: [Key] -> IntSet
 fromList xs
   = Foldable.foldl' ins empty xs
   where
     ins t x  = insert x t
 
--- | /O(n)/. Build a set from an ascending list of elements.
+-- | \(O(n)\). Build a set from an ascending list of elements.
 -- /The precondition (input list is ascending) is not checked./
 fromAscList :: [Key] -> IntSet
 fromAscList = fromMonoList
 {-# NOINLINE fromAscList #-}
 
--- | /O(n)/. Build a set from an ascending list of distinct elements.
+-- | \(O(n)\). Build a set from an ascending list of distinct elements.
 -- /The precondition (input list is strictly ascending) is not checked./
 fromDistinctAscList :: [Key] -> IntSet
 fromDistinctAscList = fromAscList
 {-# INLINE fromDistinctAscList #-}
 
--- | /O(n)/. Build a set from a monotonic list of elements.
+-- | \(O(n)\). Build a set from a monotonic list of elements.
 --
 -- The precise conditions under which this function works are subtle:
 -- For any branch mask, keys with the same prefix w.r.t. the branch
@@ -1213,156 +1315,8 @@ nequal _   _   = True
 --------------------------------------------------------------------}
 
 instance Ord IntSet where
-  compare Nil Nil = EQ
-  compare Nil _ = LT
-  compare _ Nil = GT
-  compare t1@(Tip _ _) t2@(Tip _ _)
-    = orderingOf $ relateTipTip t1 t2
-  compare xs ys
-    | (xsNeg, xsNonNeg) <- splitSign xs
-    , (ysNeg, ysNonNeg) <- splitSign ys
-    = case relate xsNeg ysNeg of
-       Less -> LT
-       Prefix -> if null xsNonNeg then LT else GT
-       Equals -> orderingOf (relate xsNonNeg ysNonNeg)
-       FlipPrefix -> if null ysNonNeg then GT else LT
-       Greater -> GT
-
--- | detailed outcome of lexicographic comparison of lists.
--- w.r.t. Ordering, there are two extra cases,
--- since (++) is not monotonic w.r.t. lex. order on lists
--- (which is used by definition):
--- consider comparison of  (Bin [0,3,4] [ 6] ) to  (Bin [0,3] [7] )
--- where [0,3,4] > [0,3]  but [0,3,4,6] < [0,3,7].
-
-data Relation
-  = Less  -- ^ holds for [0,3,4] [0,3,5,1]
-  | Prefix -- ^ holds for [0,3,4] [0,3,4,5]
-  | Equals -- ^  holds for [0,3,4] [0,3,4]
-  | FlipPrefix -- ^ holds for [0,3,4] [0,3]
-  | Greater -- ^ holds for [0,3,4] [0,2,5]
-  deriving (Show, Eq)
-   
-orderingOf :: Relation -> Ordering
-{-# INLINE orderingOf #-}
-orderingOf r = case r of
-  Less -> LT
-  Prefix -> LT
-  Equals -> EQ
-  FlipPrefix -> GT
-  Greater -> GT
-
--- | precondition: each argument is non-mixed
-relate :: IntSet -> IntSet -> Relation
-relate Nil Nil = Equals
-relate Nil _t2 = Prefix
-relate _t1 Nil = FlipPrefix
-relate t1@Tip{} t2@Tip{} = relateTipTip t1 t2
-relate t1@(Bin _p1 m1 l1 r1) t2@(Bin _p2 m2 l2 r2)
-  | succUpperbound t1 <= lowerbound t2 = Less
-  | lowerbound t1 >= succUpperbound t2 = Greater
-  | otherwise = case compare (natFromInt m1) (natFromInt m2) of
-      GT -> combine_left (relate l1 t2)
-      EQ -> combine (relate l1 l2) (relate r1 r2)
-      LT -> combine_right (relate t1 l2)
-relate t1@(Bin _p1 m1 l1 _r1) t2@(Tip p2 _bm2)
-  | succUpperbound t1 <= lowerbound t2 = Less
-  | lowerbound t1 >= succUpperbound t2 = Greater
-  | 0 == (m1 .&. p2) = combine_left (relate l1 t2)
-  | otherwise = Less
-relate t1@(Tip p1 _bm1) t2@(Bin _p2 m2 l2 _r2)
-  | succUpperbound t1 <= lowerbound t2 = Less
-  | lowerbound t1 >= succUpperbound t2 = Greater
-  | 0 == (p1 .&. m2) = combine_right (relate t1 l2)
-  | otherwise = Greater
-
-relateTipTip :: IntSet -> IntSet -> Relation
-{-# INLINE relateTipTip #-}
-relateTipTip (Tip p1 bm1) (Tip p2 bm2) = case compare p1 p2 of
-  LT -> Less
-  EQ -> relateBM bm1 bm2
-  GT -> Greater
-relateTipTip _ _ = error "relateTipTip"
-
-relateBM :: BitMap -> BitMap -> Relation
-{-# inline relateBM #-}
-relateBM w1 w2 | w1 == w2 = Equals
-relateBM w1 w2 =
-  let delta = xor w1 w2
-      lowest_diff_mask = delta .&. complement (delta-1)
-      prefix = (complement lowest_diff_mask + 1)
-            .&. (complement lowest_diff_mask)
-  in  if 0 == lowest_diff_mask .&. w1
-      then if 0 == w1 .&. prefix
-           then Prefix else Greater
-      else if 0 == w2 .&. prefix
-           then FlipPrefix else Less
-
--- | This function has the property
--- relate t1@(Bin p m l1 r1) t2@(Bin p m l2 r2) = combine (relate l1 l2) (relate r1 r2)
--- It is important that `combine` is lazy in the second argument (achieved by inlining)
-combine :: Relation -> Relation -> Relation
-{-# inline combine #-}
-combine r eq = case r of
-      Less -> Less
-      Prefix -> Greater
-      Equals -> eq
-      FlipPrefix -> Less
-      Greater -> Greater
-
--- | This function has the property
--- relate t1@(Bin p1 m1 l1 r1) t2 = combine_left (relate l1 t2)
--- under the precondition that the range of l1 contains the range of t2,
--- and r1 is non-empty
-combine_left :: Relation -> Relation
-{-# inline combine_left #-}
-combine_left r = case r of
-      Less -> Less
-      Prefix -> Greater
-      Equals -> FlipPrefix
-      FlipPrefix -> FlipPrefix
-      Greater -> Greater
-
--- | This function has the property
--- relate t1 t2@(Bin p2 m2 l2 r2) = combine_right (relate t1 l2)
--- under the precondition that the range of t1 is included in the range of l2,
--- and r2 is non-empty
-combine_right :: Relation -> Relation
-{-# inline combine_right #-}
-combine_right r = case r of
-      Less -> Less
-      Prefix -> Prefix
-      Equals -> Prefix
-      FlipPrefix -> Less
-      Greater -> Greater
-
--- | shall only be applied to non-mixed non-Nil trees
-lowerbound :: IntSet -> Int
-{-# INLINE lowerbound #-}
-lowerbound Nil = error "lowerbound: Nil"
-lowerbound (Tip p _) = p
-lowerbound (Bin p _ _ _) = p
-
--- | this is one more than the actual upper bound (to save one operation)
--- shall only be applied to non-mixed non-Nil trees
-succUpperbound :: IntSet -> Int
-{-# INLINE succUpperbound #-}
-succUpperbound Nil = error "succUpperbound: Nil"
-succUpperbound (Tip p _) = p + wordSize 
-succUpperbound (Bin p m _ _) = p + shiftR m 1
-
--- | split a set into subsets of negative and non-negative elements
-splitSign :: IntSet -> (IntSet,IntSet)
-{-# INLINE splitSign #-}
-splitSign t@(Tip kx _)
-  | kx >= 0 = (Nil, t)
-  | otherwise = (t, Nil)
-splitSign t@(Bin p m l r)
-  -- m < 0 is the usual way to find out if we have positives and negatives (see findMax)
-  | m < 0 = (r, l)
-  | p < 0 = (t, Nil)
-  | otherwise = (Nil, t)
-splitSign Nil = (Nil, Nil)
+    compare s1 s2 = compare (toAscList s1) (toAscList s2)
+    -- tentative implementation. See if more efficient exists.
 
 {--------------------------------------------------------------------
   Show
@@ -1390,12 +1344,6 @@ instance Read IntSet where
 #endif
 
 {--------------------------------------------------------------------
-  Typeable
---------------------------------------------------------------------}
-
-INSTANCE_TYPEABLE0(IntSet)
-
-{--------------------------------------------------------------------
   NFData
 --------------------------------------------------------------------}
 
@@ -1407,14 +1355,14 @@ instance NFData IntSet where rnf x = seq x ()
 {--------------------------------------------------------------------
   Debugging
 --------------------------------------------------------------------}
--- | /O(n)/. Show the tree that implements the set. The tree is shown
+-- | \(O(n \min(n,W))\). Show the tree that implements the set. The tree is shown
 -- in a compressed, hanging format.
 showTree :: IntSet -> String
 showTree s
   = showTreeWith True False s
 
 
-{- | /O(n)/. The expression (@'showTreeWith' hang wide map@) shows
+{- | \(O(n \min(n,W))\). The expression (@'showTreeWith' hang wide map@) shows
  the tree that implements the set. If @hang@ is
  'True', a /hanging/ tree is shown otherwise a rotated tree is shown. If
  @wide@ is 'True', an extra wide version is shown.
@@ -1463,7 +1411,7 @@ showWide wide bars
 
 showsBars :: [String] -> ShowS
 showsBars [] = id
-showsBars bars = showString (concat (reverse (tail bars))) . showString node
+showsBars (_ : tl) = showString (concat (reverse tl)) . showString node
 
 showsBitMap :: Word -> ShowS
 showsBitMap = showString . showBitMap
@@ -1521,11 +1469,7 @@ tip kx bm = Tip kx bm
 ----------------------------------------------------------------------}
 
 suffixBitMask :: Int
-#if MIN_VERSION_base(4,7,0)
 suffixBitMask = finiteBitSize (undefined::Word) - 1
-#else
-suffixBitMask = bitSize (undefined::Word) - 1
-#endif
 {-# INLINE suffixBitMask #-}
 
 prefixBitMask :: Int
@@ -1609,6 +1553,7 @@ foldlBits :: Int -> (a -> Int -> a) -> a -> Nat -> a
 foldl'Bits :: Int -> (a -> Int -> a) -> a -> Nat -> a
 foldrBits :: Int -> (Int -> a -> a) -> a -> Nat -> a
 foldr'Bits :: Int -> (Int -> a -> a) -> a -> Nat -> a
+takeWhileAntitoneBits :: Int -> (Int -> Bool) -> Nat -> Nat
 
 {-# INLINE lowestBitSet #-}
 {-# INLINE highestBitSet #-}
@@ -1616,11 +1561,12 @@ foldr'Bits :: Int -> (Int -> a -> a) -> a -> Nat -> a
 {-# INLINE foldl'Bits #-}
 {-# INLINE foldrBits #-}
 {-# INLINE foldr'Bits #-}
+{-# INLINE takeWhileAntitoneBits #-}
 
 #if defined(__GLASGOW_HASKELL__) && (WORD_SIZE_IN_BITS==32 || WORD_SIZE_IN_BITS==64)
 indexOfTheOnlyBit :: Nat -> Int
 {-# INLINE indexOfTheOnlyBit #-}
-#if MIN_VERSION_base(4,8,0) && (WORD_SIZE_IN_BITS==64)
+#if WORD_SIZE_IN_BITS==64
 indexOfTheOnlyBit bitmask = countTrailingZeros bitmask
 
 lowestBitSet x = countTrailingZeros x
@@ -1642,7 +1588,7 @@ highestBitSet x = WORD_SIZE_IN_BITS - 1 - countLeadingZeros x
 ----------------------------------------------------------------------}
 
 indexOfTheOnlyBit bitmask =
-  GHC.Exts.I# (lsbArray `GHC.Exts.indexInt8OffAddr#` unboxInt (intFromNat ((bitmask * magic) `shiftRL` offset)))
+  fromIntegral (GHC.Int.I8# (lsbArray `GHC.Exts.indexInt8OffAddr#` unboxInt (intFromNat ((bitmask * magic) `shiftRL` offset))))
   where unboxInt (GHC.Exts.I# i) = i
 #if WORD_SIZE_IN_BITS==32
         magic = 0x077CB531
@@ -1713,6 +1659,27 @@ foldr'Bits prefix f z bitmap = go (revNat bitmap) z
           where !bitmask = lowestBitMask bm
                 !bi = indexOfTheOnlyBit bitmask
 
+takeWhileAntitoneBits prefix predicate bitmap =
+  -- Binary search for the first index where the predicate returns false, but skip a predicate
+  -- call if the high half of the current range is empty. This ensures
+  -- min (log2 WORD_SIZE_IN_BITS + 1) (popcount bitmap) predicate calls.
+  let next d h (n',b') =
+        if n' .&. h /= 0 && (predicate $! prefix+b'+d) then (n' `shiftRL` d, b'+d) else (n',b')
+      {-# INLINE next #-}
+      (_,b) = next 1  0x2 $
+              next 2  0xC $
+              next 4  0xF0 $
+              next 8  0xFF00 $
+              next 16 0xFFFF0000 $
+#if WORD_SIZE_IN_BITS==64
+              next 32 0xFFFFFFFF00000000 $
+#endif
+              (bitmap,0)
+      m = if b /= 0 || (bitmap .&. 0x1 /= 0 && predicate prefix)
+          then ((2 `shiftLL` b) - 1)
+          else ((1 `shiftLL` b) - 1)
+  in bitmap .&. m
+
 #else
 {----------------------------------------------------------------------
   In general case we use logarithmic implementation of
@@ -1764,6 +1731,11 @@ foldr'Bits prefix f z bm = let lb = lowestBitSet bm
         go bi n | n `testBit` 0 = f bi $! go (bi + 1) (n `shiftRL` 1)
                 | otherwise     =         go (bi + 1) (n `shiftRL` 1)
 
+takeWhileAntitoneBits prefix predicate = foldl'Bits prefix f 0 -- Does not use antitone property
+  where
+    f acc bi | predicate bi = acc .|. bitmapOf bi
+             | otherwise    = acc
+
 #endif
 
 
@@ -1771,7 +1743,7 @@ foldr'Bits prefix f z bm = let lb = lowestBitSet bm
   Utilities
 --------------------------------------------------------------------}
 
--- | /O(1)/.  Decompose a set into pieces based on the structure of the underlying
+-- | \(O(1)\).  Decompose a set into pieces based on the structure of the underlying
 -- tree.  This function is useful for consuming a set in parallel.
 --
 -- No guarantee is made as to the sizes of the pieces; an internal, but

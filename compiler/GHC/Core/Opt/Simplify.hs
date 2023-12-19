@@ -4,67 +4,76 @@
 \section[Simplify]{The main module of the simplifier}
 -}
 
-{-# LANGUAGE CPP #-}
+
+{-# LANGUAGE TypeFamilies #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-record-updates -Wno-incomplete-uni-patterns #-}
-module GHC.Core.Opt.Simplify ( simplTopBinds, simplExpr, simplRules ) where
-
-#include "HsVersions.h"
+module GHC.Core.Opt.Simplify ( simplTopBinds, simplExpr, simplImpRules ) where
 
 import GHC.Prelude
 
 import GHC.Platform
+
 import GHC.Driver.Session
+
+import GHC.Core
 import GHC.Core.Opt.Simplify.Monad
 import GHC.Core.Type hiding ( substTy, substTyVar, extendTvSubst, extendCvSubst )
 import GHC.Core.Opt.Simplify.Env
 import GHC.Core.Opt.Simplify.Utils
-import GHC.Core.Opt.OccurAnal ( occurAnalyseExpr )
-import GHC.Core.FamInstEnv ( FamInstEnv )
-import GHC.Types.Literal   ( litIsLifted ) --, mkLitInt ) -- temporalily commented out. See #8326
-import GHC.Types.Id
-import GHC.Types.Id.Make   ( seqId )
+import GHC.Core.Opt.OccurAnal ( occurAnalyseExpr, zapLambdaBndrs )
 import GHC.Core.Make       ( FloatBind, mkImpossibleExpr, castBottomExpr )
 import qualified GHC.Core.Make
-import GHC.Types.Id.Info
-import GHC.Types.Name           ( mkSystemVarName, isExternalName, getOccFS )
 import GHC.Core.Coercion hiding ( substCo, substCoVar )
+import GHC.Core.Reduction
 import GHC.Core.Coercion.Opt    ( optCoercion )
-import GHC.Core.FamInstEnv      ( topNormaliseType_maybe )
+import GHC.Core.FamInstEnv      ( FamInstEnv, topNormaliseType_maybe )
 import GHC.Core.DataCon
    ( DataCon, dataConWorkId, dataConRepStrictness
-   , dataConRepArgTys, isUnboxedTupleCon
+   , dataConRepArgTys, isUnboxedTupleDataCon
    , StrictnessMark (..) )
 import GHC.Core.Opt.Monad ( Tick(..), SimplMode(..) )
-import GHC.Core
-import GHC.Builtin.Types.Prim( realWorldStatePrimTy )
-import GHC.Builtin.Names( runRWKey )
-import GHC.Types.Demand ( StrictSig(..), Demand, dmdTypeDepth, isStrictDmd
-                        , mkClosedStrictSig, topDmd, seqDmd, botDiv )
-import GHC.Types.Cpr    ( mkCprSig, botCpr )
 import GHC.Core.Ppr     ( pprCoreExpr )
-import GHC.Types.Unique ( hasKey )
 import GHC.Core.Unfold
+import GHC.Core.Unfold.Make
 import GHC.Core.Utils
-import GHC.Core.Opt.Arity ( ArityType(..), arityTypeArity, isBotArityType
-                          , idArityType, etaExpandAT )
-import GHC.Core.SimpleOpt ( pushCoTyArg, pushCoValArg
-                          , joinPointBinding_maybe, joinPointBindings_maybe )
+import GHC.Core.Opt.Arity ( ArityType(..)
+                          , pushCoTyArg, pushCoValArg
+                          , etaExpandAT )
+import GHC.Core.SimpleOpt ( exprIsConApp_maybe, joinPointBinding_maybe, joinPointBindings_maybe )
 import GHC.Core.FVs     ( mkRuleInfo )
 import GHC.Core.Rules   ( lookupRule, getRules, initRuleOpts )
-import GHC.Types.Basic
-import GHC.Utils.Monad  ( mapAccumLM, liftIO )
-import GHC.Types.Var    ( isTyCoVar )
-import GHC.Data.Maybe   ( orElse, isNothing )
-import Control.Monad
-import GHC.Utils.Outputable
-import GHC.Data.FastString
-import GHC.Utils.Misc
-import GHC.Utils.Error
-import GHC.Unit.Module ( moduleName, pprModuleName )
 import GHC.Core.Multiplicity
-import GHC.Builtin.PrimOps ( PrimOp (SeqOp) )
 
+import GHC.Types.Literal   ( litIsLifted ) --, mkLitInt ) -- temporarily commented out. See #8326
+import GHC.Types.SourceText
+import GHC.Types.Id
+import GHC.Types.Id.Make   ( seqId )
+import GHC.Types.Id.Info
+import GHC.Types.Name   ( mkSystemVarName, isExternalName, getOccFS )
+import GHC.Types.Demand
+import GHC.Types.Cpr    ( mkCprSig, botCpr )
+import GHC.Types.Unique ( hasKey )
+import GHC.Types.Basic
+import GHC.Types.Tickish
+import GHC.Types.Var    ( isTyCoVar )
+import GHC.Builtin.PrimOps ( PrimOp (SeqOp) )
+import GHC.Builtin.Types.Prim( realWorldStatePrimTy )
+import GHC.Builtin.Names( runRWKey )
+
+import GHC.Data.Maybe   ( isNothing, orElse )
+import GHC.Data.FastString
+import GHC.Unit.Module ( moduleName, pprModuleName )
+import GHC.Utils.Misc
+import GHC.Utils.Outputable
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
+import GHC.Utils.Constants (debugIsOn)
+import GHC.Utils.Trace
+import GHC.Utils.Monad  ( mapAccumLM, liftIO )
+import GHC.Utils.Logger
+
+import Control.Monad
 
 {-
 The guts of the simplifier is in this module, but the driver loop for
@@ -161,6 +170,38 @@ It's quite convenient. This way we don't need to manipulate the substitution all
 the time: every update to a binder is automatically reflected to its bound
 occurrences.
 
+Note [Bangs in the Simplifier]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Both SimplFloats and SimplEnv do *not* generally benefit from making
+their fields strict. I don't know if this is because of good use of
+laziness or unintended side effects like closures capturing more variables
+after WW has run.
+
+But the end result is that we keep these lazy, but force them in some places
+where we know it's beneficial to the compiler.
+
+Similarly environments returned from functions aren't *always* beneficial to
+force. In some places they would never be demanded so forcing them early
+increases allocation. In other places they almost always get demanded so
+it's worthwhile to force them early.
+
+Would it be better to through every allocation of e.g. SimplEnv and decide
+wether or not to make this one strict? Absolutely! Would be a good use of
+someones time? Absolutely not! I made these strict that showed up during
+a profiled build or which I noticed while looking at core for one reason
+or another.
+
+The result sadly is that we end up with "random" bangs in the simplifier
+where we sometimes force e.g. the returned environment from a function and
+sometimes we don't for the same function. Depending on the context around
+the call. The treatment is also not very consistent. I only added bangs
+where I saw it making a difference either in the core or benchmarks. Some
+patterns where it would be beneficial aren't convered as a consequence as
+I neither have the time to go through all of the core and some cases are
+too small to show up in benchmarks.
+
+
+
 ************************************************************************
 *                                                                      *
 \subsection{Bindings}
@@ -175,8 +216,9 @@ simplTopBinds env0 binds0
                 -- so that if a rewrite rule has unexpectedly brought
                 -- anything into scope, then we don't get a complaint about that.
                 -- It's rather as if the top-level binders were imported.
-                -- See note [Glomming] in "GHC.Core.Opt.OccurAnal".
-        ; env1 <- {-#SCC "simplTopBinds-simplRecBndrs" #-} simplRecBndrs env0 (bindersOfBinds binds0)
+                -- See Note [Glomming] in "GHC.Core.Opt.OccurAnal".
+        -- See Note [Bangs in the Simplifier]
+        ; !env1 <- {-#SCC "simplTopBinds-simplRecBndrs" #-} simplRecBndrs env0 (bindersOfBinds binds0)
         ; (floats, env2) <- {-#SCC "simplTopBinds-simpl_binds" #-} simpl_binds env1 binds0
         ; freeTick SimplifierDone
         ; return (floats, env2) }
@@ -189,13 +231,16 @@ simplTopBinds env0 binds0
     simpl_binds env []           = return (emptyFloats env, env)
     simpl_binds env (bind:binds) = do { (float,  env1) <- simpl_bind env bind
                                       ; (floats, env2) <- simpl_binds env1 binds
-                                      ; return (float `addFloats` floats, env2) }
+                                      -- See Note [Bangs in the Simplifier]
+                                      ; let !floats1 = float `addFloats` floats
+                                      ; return (floats1, env2) }
 
     simpl_bind env (Rec pairs)
-      = simplRecBind env TopLevel Nothing pairs
+      = simplRecBind env (BC_Let TopLevel Recursive) pairs
     simpl_bind env (NonRec b r)
-      = do { (env', b') <- addBndrRules env b (lookupRecBndr env b) Nothing
-           ; simplRecOrTopPair env' TopLevel NonRecursive Nothing b b' r }
+      = do { let bind_cxt = BC_Let TopLevel NonRecursive
+           ; (env', b') <- addBndrRules env b (lookupRecBndr env b) bind_cxt
+           ; simplRecOrTopPair env' bind_cxt b b' r }
 
 {-
 ************************************************************************
@@ -208,24 +253,26 @@ simplRecBind is used for
         * recursive bindings only
 -}
 
-simplRecBind :: SimplEnv -> TopLevelFlag -> MaybeJoinCont
+simplRecBind :: SimplEnv -> BindContext
              -> [(InId, InExpr)]
              -> SimplM (SimplFloats, SimplEnv)
-simplRecBind env0 top_lvl mb_cont pairs0
-  = do  { (env_with_info, triples) <- mapAccumLM add_rules env0 pairs0
-        ; (rec_floats, env1) <- go env_with_info triples
-        ; return (mkRecFloats rec_floats, env1) }
+simplRecBind env0 bind_cxt pairs0
+  = do  { (env1, triples) <- mapAccumLM add_rules env0 pairs0
+        ; let new_bndrs = map sndOf3 triples
+        ; (rec_floats, env2) <- enterRecGroupRHSs env1 new_bndrs $ \env ->
+            go env triples
+        ; return (mkRecFloats rec_floats, env2) }
   where
     add_rules :: SimplEnv -> (InBndr,InExpr) -> SimplM (SimplEnv, (InBndr, OutBndr, InExpr))
         -- Add the (substituted) rules to the binder
     add_rules env (bndr, rhs)
-        = do { (env', bndr') <- addBndrRules env bndr (lookupRecBndr env bndr) mb_cont
+        = do { (env', bndr') <- addBndrRules env bndr (lookupRecBndr env bndr) bind_cxt
              ; return (env', (bndr, bndr', rhs)) }
 
     go env [] = return (emptyFloats env, env)
 
     go env ((old_bndr, new_bndr, rhs) : pairs)
-        = do { (float, env1) <- simplRecOrTopPair env top_lvl Recursive mb_cont
+        = do { (float, env1) <- simplRecOrTopPair env bind_cxt
                                                   old_bndr new_bndr rhs
              ; (floats, env2) <- go env1 pairs
              ; return (float `addFloats` floats, env2) }
@@ -239,39 +286,34 @@ It assumes the binder has already been simplified, but not its IdInfo.
 -}
 
 simplRecOrTopPair :: SimplEnv
-                  -> TopLevelFlag -> RecFlag -> MaybeJoinCont
+                  -> BindContext
                   -> InId -> OutBndr -> InExpr  -- Binder and rhs
                   -> SimplM (SimplFloats, SimplEnv)
 
-simplRecOrTopPair env top_lvl is_rec mb_cont old_bndr new_bndr rhs
-  | Just env' <- preInlineUnconditionally env top_lvl old_bndr rhs env
+simplRecOrTopPair env bind_cxt old_bndr new_bndr rhs
+  | Just env' <- preInlineUnconditionally env (bindContextLevel bind_cxt)
+                                          old_bndr rhs env
   = {-#SCC "simplRecOrTopPair-pre-inline-uncond" #-}
-    trace_bind "pre-inline-uncond" $
+    simplTrace env "SimplBindr:inline-uncond" (ppr old_bndr) $
     do { tick (PreInlineUnconditionally old_bndr)
        ; return ( emptyFloats env, env' ) }
 
-  | Just cont <- mb_cont
-  = {-#SCC "simplRecOrTopPair-join" #-}
-    ASSERT( isNotTopLevel top_lvl && isJoinId new_bndr )
-    trace_bind "join" $
-    simplJoinBind env cont old_bndr new_bndr rhs env
-
   | otherwise
-  = {-#SCC "simplRecOrTopPair-normal" #-}
-    trace_bind "normal" $
-    simplLazyBind env top_lvl is_rec old_bndr new_bndr rhs env
+  = case bind_cxt of
+      BC_Join cont  -> simplTrace env "SimplBind:join" (ppr old_bndr) $
+                       simplJoinBind env cont old_bndr new_bndr rhs env
 
+      BC_Let top_lvl is_rec -> simplTrace env "SimplBind:normal" (ppr old_bndr) $
+                               simplLazyBind env top_lvl is_rec old_bndr new_bndr rhs env
+
+simplTrace :: SimplEnv -> String -> SDoc -> a -> a
+simplTrace env herald doc thing_inside
+  | not (logHasDumpFlag logger Opt_D_verbose_core2core)
+  = thing_inside
+  | otherwise
+  = logTraceMsg logger herald doc thing_inside
   where
-    dflags = seDynFlags env
-
-    -- trace_bind emits a trace for each top-level binding, which
-    -- helps to locate the tracing for inlining and rule firing
-    trace_bind what thing_inside
-      | not (dopt Opt_D_verbose_core2core dflags)
-      = thing_inside
-      | otherwise
-      = traceAction dflags ("SimplBind " ++ what)
-         (ppr old_bndr) thing_inside
+    logger = seLogger env
 
 --------------------------
 simplLazyBind :: SimplEnv
@@ -282,14 +324,15 @@ simplLazyBind :: SimplEnv
                                         -- Ids only, no TyVars
               -> InExpr -> SimplEnv     -- The RHS and its environment
               -> SimplM (SimplFloats, SimplEnv)
+-- Precondition: the OutId is already in the InScopeSet of the incoming 'env'
 -- Precondition: not a JoinId
 -- Precondition: rhs obeys the let/app invariant
 -- NOT used for JoinIds
 simplLazyBind env top_lvl is_rec bndr bndr1 rhs rhs_se
-  = ASSERT( isId bndr )
-    ASSERT2( not (isJoinId bndr), ppr bndr )
+  = assert (isId bndr )
+    assertPpr (not (isJoinId bndr)) (ppr bndr) $
     -- pprTrace "simplLazyBind" ((ppr bndr <+> ppr bndr1) $$ ppr rhs $$ ppr (seIdSubst rhs_se)) $
-    do  { let   rhs_env     = rhs_se `setInScopeFromE` env
+    do  { let   !rhs_env     = rhs_se `setInScopeFromE` env -- See Note [Bangs in the Simplifier]
                 (tvs, body) = case collectTyAndValBinders rhs of
                                 (tvs, [], body)
                                   | surely_not_lam body -> (tvs, body)
@@ -305,7 +348,6 @@ simplLazyBind env top_lvl is_rec bndr bndr1 rhs rhs_se
                         --    f = /\a. \x. g a x
                         -- should eta-reduce.
 
-
         ; (body_env, tvs') <- {-#SCC "simplBinders" #-} simplBinders rhs_env tvs
                 -- See Note [Floating and type abstraction] in GHC.Core.Opt.Simplify.Utils
 
@@ -313,40 +355,32 @@ simplLazyBind env top_lvl is_rec bndr bndr1 rhs rhs_se
         ; let rhs_cont = mkRhsStop (substTy body_env (exprType body))
         ; (body_floats0, body0) <- {-#SCC "simplExprF" #-} simplExprF body_env body rhs_cont
 
-              -- Never float join-floats out of a non-join let-binding
-              -- So wrap the body in the join-floats right now
-              -- Hence: body_floats1 consists only of let-floats
-        ; let (body_floats1, body1) = wrapJoinFloatsX body_floats0 body0
-
         -- ANF-ise a constructor or PAP rhs
-        -- We get at most one float per argument here
-        ; (let_floats, bndr2, body2) <- {-#SCC "prepareBinding" #-}
-                                        prepareBinding env top_lvl bndr bndr1 body1
-        ; let body_floats2 = body_floats1 `addLetFloats` let_floats
+        ; (body_floats2, body2) <- {-#SCC "prepareBinding" #-}
+                                   prepareBinding env top_lvl is_rec
+                                                  False  -- Not strict; this is simplLazyBind
+                                                  bndr1 body_floats0 body0
+          -- Subtle point: we do not need or want tvs' in the InScope set
+          -- of body_floats2, so we pass in 'env' not 'body_env'.
+          -- Don't want: if tvs' are in-scope in the scope of this let-binding, we may do
+          -- more renaming than necessary => extra work (see !7777 and test T16577).
+          -- Don't need: we wrap tvs' around the RHS anyway.
 
-        ; (rhs_floats, rhs')
-            <-  if not (doFloatFromRhs top_lvl is_rec False body_floats2 body2)
-                then                    -- No floating, revert to body1
-                     {-#SCC "simplLazyBind-no-floating" #-}
-                     do { rhs' <- mkLam env tvs' (wrapFloats body_floats2 body1) rhs_cont
-                        ; return (emptyFloats env, rhs') }
-
-                else if null tvs then   -- Simple floating
+        ; (rhs_floats, body3)
+            <-  if isEmptyFloats body_floats2 || null tvs then   -- Simple floating
                      {-#SCC "simplLazyBind-simple-floating" #-}
-                     do { tick LetFloatFromLet
-                        ; return (body_floats2, body2) }
+                     return (body_floats2, body2)
 
-                else                    -- Do type-abstraction first
+                else -- Non-empty floats, and non-empty tyvars: do type-abstraction first
                      {-#SCC "simplLazyBind-type-abstraction-first" #-}
-                     do { tick LetFloatFromLet
-                        ; (poly_binds, body3) <- abstractFloats (seDynFlags env) top_lvl
+                     do { (poly_binds, body3) <- abstractFloats (seUnfoldingOpts env) top_lvl
                                                                 tvs' body_floats2 body2
                         ; let floats = foldl' extendFloats (emptyFloats env) poly_binds
-                        ; rhs' <- mkLam env tvs' body3 rhs_cont
-                        ; return (floats, rhs') }
+                        ; return (floats, body3) }
 
-        ; (bind_float, env2) <- completeBind (env `setInScopeFromF` rhs_floats)
-                                             top_lvl Nothing bndr bndr2 rhs'
+        ; let env' = env `setInScopeFromF` rhs_floats
+        ; rhs' <- mkLam env' tvs' body3 rhs_cont
+        ; (bind_float, env2) <- completeBind env' (BC_Let top_lvl is_rec) bndr bndr1 rhs'
         ; return (rhs_floats `addFloats` bind_float, env2) }
 
 --------------------------
@@ -360,7 +394,7 @@ simplJoinBind :: SimplEnv
 simplJoinBind env cont old_bndr new_bndr rhs rhs_se
   = do  { let rhs_env = rhs_se `setInScopeFromE` env
         ; rhs' <- simplJoinRhs rhs_env old_bndr rhs cont
-        ; completeBind env NotTopLevel (Just cont) old_bndr new_bndr rhs' }
+        ; completeBind env (BC_Join cont) old_bndr new_bndr rhs' }
 
 --------------------------
 simplNonRecX :: SimplEnv
@@ -373,7 +407,7 @@ simplNonRecX :: SimplEnv
 -- Precondition: rhs satisfies the let/app invariant
 
 simplNonRecX env bndr new_rhs
-  | ASSERT2( not (isJoinId bndr), ppr bndr )
+  | assertPpr (not (isJoinId bndr)) (ppr bndr) $
     isDeadBinder bndr   -- Not uncommon; e.g. case (a,b) of c { (p,q) -> p }
   = return (emptyFloats env, env)    --  Here c is dead, and we avoid
                                          --  creating the binding c = (a,b)
@@ -381,58 +415,54 @@ simplNonRecX env bndr new_rhs
   | Coercion co <- new_rhs
   = return (emptyFloats env, extendCvSubst env bndr co)
 
+  | exprIsTrivial new_rhs  -- Short-cut for let x = y in ...
+    -- This case would ultimately land in postInlineUnconditionally
+    -- but it seems not uncommon, and avoids a lot of faff to do it here
+  = return (emptyFloats env
+           , extendIdSubst env bndr (DoneEx new_rhs Nothing))
+
   | otherwise
-  = do  { (env', bndr') <- simplBinder env bndr
-        ; completeNonRecX NotTopLevel env' (isStrictId bndr) bndr bndr' new_rhs }
-                -- simplNonRecX is only used for NotTopLevel things
+  = do  { (env1, new_bndr)   <- simplBinder env bndr
+        ; let is_strict = isStrictId new_bndr
+              -- isStrictId: use new_bndr because the InId bndr might not have
+              -- a fixed runtime representation, which isStrictId doesn't expect
+              -- c.f. Note [Dark corner with representation polymorphism]
 
---------------------------
-completeNonRecX :: TopLevelFlag -> SimplEnv
-                -> Bool
-                -> InId                 -- Old binder; not a JoinId
-                -> OutId                -- New binder
-                -> OutExpr              -- Simplified RHS
-                -> SimplM (SimplFloats, SimplEnv)    -- The new binding is in the floats
--- Precondition: rhs satisfies the let/app invariant
---               See Note [Core let/app invariant] in GHC.Core
+        ; (rhs_floats, rhs1) <- prepareBinding env NotTopLevel NonRecursive is_strict
+                                               new_bndr (emptyFloats env) new_rhs
+              -- NB: it makes a surprisingly big difference (5% in compiler allocation
+              -- in T9630) to pass 'env' rather than 'env1'.  It's fine to pass 'env',
+              -- because this is simplNonRecX, so bndr is not in scope in the RHS.
 
-completeNonRecX top_lvl env is_strict old_bndr new_bndr new_rhs
-  = ASSERT2( not (isJoinId new_bndr), ppr new_bndr )
-    do  { (prepd_floats, new_bndr, new_rhs)
-              <- prepareBinding env top_lvl old_bndr new_bndr new_rhs
-        ; let floats = emptyFloats env `addLetFloats` prepd_floats
-        ; (rhs_floats, rhs2) <-
-                if doFloatFromRhs NotTopLevel NonRecursive is_strict floats new_rhs
-                then    -- Add the floats to the main env
-                     do { tick LetFloatFromLet
-                        ; return (floats, new_rhs) }
-                else    -- Do not float; wrap the floats around the RHS
-                     return (emptyFloats env, wrapFloats floats new_rhs)
+        ; (bind_float, env2) <- completeBind (env1 `setInScopeFromF` rhs_floats)
+                                             (BC_Let NotTopLevel NonRecursive)
+                                             bndr new_bndr rhs1
+              -- Must pass env1 to completeBind in case simplBinder had to clone,
+              -- and extended the substitution with [bndr :-> new_bndr]
 
-        ; (bind_float, env2) <- completeBind (env `setInScopeFromF` rhs_floats)
-                                             NotTopLevel Nothing
-                                             old_bndr new_bndr rhs2
         ; return (rhs_floats `addFloats` bind_float, env2) }
 
 
 {- *********************************************************************
 *                                                                      *
-           prepareBinding, prepareRhs, makeTrivial
+           Cast worker/wrapper
 *                                                                      *
 ************************************************************************
 
-Note [Cast worker/wrappers]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Note [Cast worker/wrapper]
+~~~~~~~~~~~~~~~~~~~~~~~~~~
 When we have a binding
    x = e |> co
 we want to do something very similar to worker/wrapper:
    $wx = e
    x = $wx |> co
 
-So now x can be inlined freely.  There's a chance that e will be a
-constructor application or function, or something like that, so moving
-the coercion to the usage site may well cancel the coercions and lead
-to further optimisation.  Example:
+We call this making a cast worker/wrapper in tryCastWorkerWrapper.
+
+The main motivaiton is that x can be inlined freely.  There's a chance
+that e will be a constructor application or function, or something
+like that, so moving the coercion to the usage site may well cancel
+the coercions and lead to further optimisation.  Example:
 
      data family T a :: *
      data instance T Int = T Int
@@ -445,39 +475,74 @@ to further optimisation.  Example:
           go n = case t of { T m -> go (n-m) }
                 -- This case should optimise
 
-We call this making a cast worker/wrapper, and it's done by prepareBinding.
+A second reason for doing cast worker/wrapper is that the worker/wrapper
+pass after strictness analysis can't deal with RHSs like
+     f = (\ a b c. blah) |> co
+Instead, it relies on cast worker/wrapper to get rid of the cast,
+leaving a simpler job for demand-analysis worker/wrapper.  See #19874.
 
-We need to be careful with inline/noinline pragmas:
-  rec { {-# NOINLINE f #-}
-        f = (...g...) |> co
-      ; g = ...f... }
-This is legitimate -- it tells GHC to use f as the loop breaker
-rather than g.  Now we do the cast thing, to get something like
-  rec { $wf = ...g...
-      ; f = $wf |> co
-      ; g = ...f... }
-Where should the NOINLINE pragma go?  If we leave it on f we'll get
-  rec { $wf = ...g...
-      ; {-# NOINLINE f #-}
-        f = $wf |> co
-      ; g = ...f... }
-and that is bad: the whole point is that we want to inline that
-cast!  We want to transfer the pagma to $wf:
-  rec { {-# NOINLINE $wf #-}
-        $wf = ...g...
-      ; f = $wf |> co
-      ; g = ...f... }
-It's exactly like worker/wrapper for strictness analysis:
+Wrinkles
+
+1. We must /not/ do cast w/w on
+     f = g |> co
+   otherwise it'll just keep repeating forever! You might think this
+   is avoided because the call to tryCastWorkerWrapper is guarded by
+   preInlineUnconditinally, but I'm worried that a loop-breaker or an
+   exported Id might say False to preInlineUnonditionally.
+
+2. We need to be careful with inline/noinline pragmas:
+       rec { {-# NOINLINE f #-}
+             f = (...g...) |> co
+           ; g = ...f... }
+   This is legitimate -- it tells GHC to use f as the loop breaker
+   rather than g.  Now we do the cast thing, to get something like
+       rec { $wf = ...g...
+           ; f = $wf |> co
+           ; g = ...f... }
+   Where should the NOINLINE pragma go?  If we leave it on f we'll get
+     rec { $wf = ...g...
+         ; {-# NOINLINE f #-}
+           f = $wf |> co
+         ; g = ...f... }
+   and that is bad: the whole point is that we want to inline that
+   cast!  We want to transfer the pagma to $wf:
+      rec { {-# NOINLINE $wf #-}
+            $wf = ...g...
+          ; f = $wf |> co
+          ; g = ...f... }
+   c.f. Note [Worker/wrapper for NOINLINE functions] in GHC.Core.Opt.WorkWrap.
+
+3. We should still do cast w/w even if `f` is INLINEABLE.  E.g.
+      {- f: Stable unfolding = <stable-big> -}
+      f = (\xy. <big-body>) |> co
+   Then we want to w/w to
+      {- $wf: Stable unfolding = <stable-big> |> sym co -}
+      $wf = \xy. <big-body>
+      f = $wf |> co
+   Notice that the stable unfolding moves to the worker!  Now demand analysis
+   will work fine on $wf, whereas it has trouble with the original f.
+   c.f. Note [Worker/wrapper for INLINABLE functions] in GHC.Core.Opt.WorkWrap.
+   This point also applies to strong loopbreakers with INLINE pragmas, see
+   wrinkle (4).
+
+4. We should /not/ do cast w/w for non-loop-breaker INLINE functions (hence
+   hasInlineUnfolding in tryCastWorkerWrapper, which responds False to
+   loop-breakers) because they'll definitely be inlined anyway, cast and
+   all. And if we do cast w/w for an INLINE function with arity zero, we get
+   something really silly: we inline that "worker" right back into the wrapper!
+   Worse than a no-op, because we have then lost the stable unfolding.
+
+All these wrinkles are exactly like worker/wrapper for strictness analysis:
   f is the wrapper and must inline like crazy
   $wf is the worker and must carry f's original pragma
-See Note [Worker-wrapper for NOINLINE functions] in
-GHC.Core.Opt.WorkWrap.
+See Note [Worker/wrapper for INLINABLE functions]
+and Note [Worker/wrapper for NOINLINE functions] in GHC.Core.Opt.WorkWrap.
 
-See #17673, #18093, #18078.
+See #17673, #18093, #18078, #19890.
 
 Note [Preserve strictness in cast w/w]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-In the Note [Cast worker/wrappers] transformation, keep the strictness info.
+In the Note [Cast worker/wrapper] transformation, keep the strictness info.
 Eg
         f = e `cast` co    -- f has strictness SSL
 When we transform to
@@ -486,65 +551,122 @@ When we transform to
 
 Its not wrong to drop it on the floor, but better to keep it.
 
-Note [Cast w/w: unlifted]
-~~~~~~~~~~~~~~~~~~~~~~~~~
-BUT don't do cast worker/wrapper if 'e' has an unlifted type.
-This *can* happen:
+Note [Preserve RuntimeRep info in cast w/w]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We must not do cast w/w when the presence of the coercion is needed in order
+to determine the runtime representation.
 
-     foo :: Int = (error (# Int,Int #) "urk")
-                  `cast` CoUnsafe (# Int,Int #) Int
+Example:
 
-If do the makeTrivial thing to the error call, we'll get
-    foo = case error (# Int,Int #) "urk" of v -> v `cast` ...
-But 'v' isn't in scope!
+  Suppose we have a type family:
 
-These strange casts can happen as a result of case-of-case
-        bar = case (case x of { T -> (# 2,3 #); F -> error "urk" }) of
-                (# p,q #) -> p+q
+    type F :: RuntimeRep
+    type family F where
+      F = LiftedRep
 
-NOTE: Nowadays we don't use casts for these error functions;
-instead, we use (case erorr ... of {}). So I'm not sure
-this Note makes much sense any more.
+  together with a type `ty :: TYPE F` and a top-level binding
+
+    a :: ty |> TYPE F[0]
+
+  The kind of `ty |> TYPE F[0]` is `LiftedRep`, so `a` is a top-level lazy binding.
+  However, were we to apply cast w/w, we would get:
+
+    b :: ty
+    b = ...
+
+    a :: ty |> TYPE F[0]
+    a = b `cast` GRefl (TYPE F[0])
+
+  Now we are in trouble because `ty :: TYPE F` does not have a known runtime
+  representation, because we need to be able to reduce the nullary type family
+  application `F` to find that out.
+
+Conclusion: only do cast w/w when doing so would not lose the RuntimeRep
+information. That is, when handling `Cast rhs co`, don't attempt cast w/w
+unless the kind of the type of rhs is concrete, in the sense of
+Note [Concrete types] in GHC.Tc.Utils.Concrete.
 -}
 
-prepareBinding :: SimplEnv -> TopLevelFlag
-               -> InId -> OutId -> OutExpr
-               -> SimplM (LetFloats, OutId, OutExpr)
+tryCastWorkerWrapper :: SimplEnv -> BindContext
+                     -> InId -> OccInfo
+                     -> OutId -> OutExpr
+                     -> SimplM (SimplFloats, SimplEnv)
+-- See Note [Cast worker/wrapper]
+tryCastWorkerWrapper env bind_cxt old_bndr occ_info bndr (Cast rhs co)
+  | BC_Let top_lvl is_rec <- bind_cxt  -- Not join points
+  , not (isDFunId bndr) -- nor DFuns; cast w/w is no help, and we can't transform
+                        --            a DFunUnfolding in mk_worker_unfolding
+  , not (exprIsTrivial rhs)        -- Not x = y |> co; Wrinkle 1
+  , not (hasInlineUnfolding info)  -- Not INLINE things: Wrinkle 4
+  , isConcrete (typeKind rhs_ty)   -- Don't peel off a cast if doing so would
+                                   -- lose the underlying runtime representation.
+                                   -- See Note [Preserve RuntimeRep info in cast w/w]
+  , not (isOpaquePragma (idInlinePragma old_bndr)) -- Not for OPAQUE bindings
+                                                   -- See Note [OPAQUE pragma]
+  = do  { uniq <- getUniqueM
+        ; let work_name = mkSystemVarName uniq occ_fs
+              work_id   = mkLocalIdWithInfo work_name Many rhs_ty worker_info
+              is_strict = isStrictId bndr
 
-prepareBinding env top_lvl old_bndr bndr rhs
-  | Cast rhs1 co <- rhs
-    -- Try for cast worker/wrapper
-    -- See Note [Cast worker/wrappers]
-  , not (isStableUnfolding (realIdUnfolding old_bndr))
-        -- Don't make a cast w/w if the thing is going to be inlined anyway
-  , not (exprIsTrivial rhs1)
-        -- Nor if the RHS is trivial; then again it'll be inlined
-  , let ty1 = coercionLKind co
-  , not (isUnliftedType ty1)
-        -- Not if rhs has an unlifted type; see Note [Cast w/w: unlifted]
-  = do { (floats, new_id) <- makeTrivialBinding (getMode env) top_lvl
-                                   (getOccFS bndr) worker_info rhs1 ty1
-       ; let bndr' = bndr `setInlinePragma` mkCastWrapperInlinePrag (idInlinePragma bndr)
-       ; return (floats, bndr', Cast (Var new_id) co) }
+        ; (rhs_floats, work_rhs) <- prepareBinding env top_lvl is_rec is_strict
+                                                   work_id (emptyFloats env) rhs
 
-  | otherwise
-  = do { (floats, rhs') <- prepareRhs (getMode env) top_lvl (getOccFS bndr) rhs
-       ; return (floats, bndr, rhs') }
- where
-   info = idInfo bndr
-   worker_info = vanillaIdInfo `setStrictnessInfo` strictnessInfo info
-                               `setCprInfo`        cprInfo info
-                               `setDemandInfo`     demandInfo info
-                               `setInlinePragInfo` inlinePragInfo info
-                               `setArityInfo`      arityInfo info
-          -- We do /not/ want to transfer OccInfo, Rules, Unfolding
-          -- Note [Preserve strictness in cast w/w]
+        ; work_unf <- mk_worker_unfolding top_lvl work_id work_rhs
+        ; let  work_id_w_unf = work_id `setIdUnfolding` work_unf
+               floats   = rhs_floats `addLetFloats`
+                          unitLetFloat (NonRec work_id_w_unf work_rhs)
+
+               triv_rhs = Cast (Var work_id_w_unf) co
+
+        ; if postInlineUnconditionally env bind_cxt bndr occ_info triv_rhs
+             -- Almost always True, because the RHS is trivial
+             -- In that case we want to eliminate the binding fast
+             -- We conservatively use postInlineUnconditionally so that we
+             -- check all the right things
+          then do { tick (PostInlineUnconditionally bndr)
+                  ; return ( floats
+                           , extendIdSubst (setInScopeFromF env floats) old_bndr $
+                             DoneEx triv_rhs Nothing ) }
+
+          else do { wrap_unf <- mkLetUnfolding (sm_uf_opts mode) top_lvl InlineRhs bndr triv_rhs
+                  ; let bndr' = bndr `setInlinePragma` mkCastWrapperInlinePrag (idInlinePragma bndr)
+                                `setIdUnfolding`  wrap_unf
+                        floats' = floats `extendFloats` NonRec bndr' triv_rhs
+                  ; return ( floats', setInScopeFromF env floats' ) } }
+  where
+    mode   = getMode env
+    occ_fs = getOccFS bndr
+    rhs_ty = coercionLKind co
+    info   = idInfo bndr
+
+    worker_info = vanillaIdInfo `setDmdSigInfo`     dmdSigInfo info
+                                `setCprSigInfo`     cprSigInfo info
+                                `setDemandInfo`     demandInfo info
+                                `setInlinePragInfo` inlinePragInfo info
+                                `setArityInfo`      arityInfo info
+           -- We do /not/ want to transfer OccInfo, Rules
+           -- Note [Preserve strictness in cast w/w]
+           -- and Wrinkle 2 of Note [Cast worker/wrapper]
+
+    ----------- Worker unfolding -----------
+    -- Stable case: if there is a stable unfolding we have to compose with (Sym co);
+    --   the next round of simplification will do the job
+    -- Non-stable case: use work_rhs
+    -- Wrinkle 3 of Note [Cast worker/wrapper]
+    mk_worker_unfolding top_lvl work_id work_rhs
+      = case realUnfoldingInfo info of -- NB: the real one, even for loop-breakers
+           unf@(CoreUnfolding { uf_tmpl = unf_rhs, uf_src = src })
+             | isStableSource src -> return (unf { uf_tmpl = mkCast unf_rhs (mkSymCo co) })
+           _ -> mkLetUnfolding (sm_uf_opts mode) top_lvl InlineRhs work_id work_rhs
+
+tryCastWorkerWrapper env _ _ _ bndr rhs  -- All other bindings
+  = return (mkFloatBind env (NonRec bndr rhs))
 
 mkCastWrapperInlinePrag :: InlinePragma -> InlinePragma
--- See Note [Cast wrappers]
+-- See Note [Cast worker/wrapper]
 mkCastWrapperInlinePrag (InlinePragma { inl_act = act, inl_rule = rule_info })
   = InlinePragma { inl_src    = SourceText "{-# INLINE"
-                 , inl_inline = NoUserInline -- See Note [Wrapper NoUserInline]
+                 , inl_inline = NoUserInlinePrag -- See Note [Wrapper NoUserInlinePrag]
                  , inl_sat    = Nothing      --     in GHC.Core.Opt.WorkWrap
                  , inl_act    = wrap_act     -- See Note [Wrapper activation]
                  , inl_rule   = rule_info }  --     in GHC.Core.Opt.WorkWrap
@@ -554,6 +676,52 @@ mkCastWrapperInlinePrag (InlinePragma { inl_act = act, inl_rule = rule_info })
     -- But simpler, because we don't need to disable during InitialPhase
     wrap_act | isNeverActive act = activateDuringFinal
              | otherwise         = act
+
+
+{- *********************************************************************
+*                                                                      *
+           prepareBinding, prepareRhs, makeTrivial
+*                                                                      *
+********************************************************************* -}
+
+prepareBinding :: SimplEnv -> TopLevelFlag -> RecFlag -> Bool
+               -> Id   -- Used only for its OccName; can be InId or OutId
+               -> SimplFloats -> OutExpr
+               -> SimplM (SimplFloats, OutExpr)
+-- In (prepareBinding ... bndr floats rhs), the binding is really just
+--    bndr = let floats in rhs
+-- Maybe we can ANF-ise this binding and float out; e.g.
+--    bndr = let a = f x in K a a (g x)
+-- we could float out to give
+--    a    = f x
+--    tmp  = g x
+--    bndr = K a a tmp
+-- That's what prepareBinding does
+-- Precondition: binder is not a JoinId
+prepareBinding env top_lvl is_rec strict_bind bndr rhs_floats rhs
+  = do { -- Never float join-floats out of a non-join let-binding (which this is)
+         -- So wrap the body in the join-floats right now
+         -- Hence: rhs_floats1 consists only of let-floats
+         let (rhs_floats1, rhs1) = wrapJoinFloatsX rhs_floats rhs
+
+         -- rhs_env: add to in-scope set the binders from rhs_floats
+         -- so that prepareRhs knows what is in scope in rhs
+       ; let rhs_env = env `setInScopeFromF` rhs_floats1
+
+       -- Now ANF-ise the remaining rhs
+       ; (anf_floats, rhs2) <- prepareRhs rhs_env top_lvl (getOccFS bndr) rhs1
+
+       -- Finally, decide whether or not to float
+       ; let all_floats = rhs_floats1 `addLetFloats` anf_floats
+       ; if doFloatFromRhs top_lvl is_rec strict_bind all_floats rhs2
+         then -- Float!
+              do { tick LetFloatFromLet
+                 ; return (all_floats, rhs2) }
+
+         else -- Abandon floating altogether; revert to original rhs
+              -- Since we have already built rhs1, we just need to add
+              -- rhs_floats1 to it
+              return (emptyFloats env, wrapFloats rhs_floats1 rhs1) }
 
 {- Note [prepareRhs]
 ~~~~~~~~~~~~~~~~~~~~
@@ -573,17 +741,17 @@ Here we want to make e1,e2 trivial and get
 That's what the 'go' loop in prepareRhs does
 -}
 
-prepareRhs :: SimplMode -> TopLevelFlag
+prepareRhs :: SimplEnv -> TopLevelFlag
            -> FastString    -- Base for any new variables
            -> OutExpr
            -> SimplM (LetFloats, OutExpr)
 -- Transforms a RHS into a better RHS by ANF'ing args
 -- for expandable RHSs: constructors and PAPs
 -- e.g        x = Just e
--- becomes    a = e
+-- becomes    a = e               -- 'a' is fresh
 --            x = Just a
 -- See Note [prepareRhs]
-prepareRhs mode top_lvl occ rhs0
+prepareRhs env top_lvl occ rhs0
   = do  { (_is_exp, floats, rhs1) <- go 0 rhs0
         ; return (floats, rhs1) }
   where
@@ -598,7 +766,7 @@ prepareRhs mode top_lvl occ rhs0
         = do { (is_exp, floats1, fun') <- go (n_val_args+1) fun
              ; case is_exp of
                 False -> return (False, emptyLetFloats, App fun arg)
-                True  -> do { (floats2, arg') <- makeTrivial mode top_lvl topDmd occ arg
+                True  -> do { (floats2, arg') <- makeTrivial env top_lvl topDmd occ arg
                             ; return (True, floats1 `addLetFlts` floats2, App fun' arg') } }
     go n_val_args (Var fun)
         = return (is_exp, emptyLetFloats, Var fun)
@@ -627,58 +795,64 @@ prepareRhs mode top_lvl occ rhs0
     go _ other
         = return (False, emptyLetFloats, other)
 
-makeTrivialArg :: SimplMode -> ArgSpec -> SimplM (LetFloats, ArgSpec)
-makeTrivialArg mode arg@(ValArg { as_arg = e, as_dmd = dmd })
-  = do { (floats, e') <- makeTrivial mode NotTopLevel dmd (fsLit "arg") e
+makeTrivialArg :: SimplEnv -> ArgSpec -> SimplM (LetFloats, ArgSpec)
+makeTrivialArg env arg@(ValArg { as_arg = e, as_dmd = dmd })
+  = do { (floats, e') <- makeTrivial env NotTopLevel dmd (fsLit "arg") e
        ; return (floats, arg { as_arg = e' }) }
 makeTrivialArg _ arg
   = return (emptyLetFloats, arg)  -- CastBy, TyArg
 
-makeTrivial :: SimplMode -> TopLevelFlag -> Demand
+makeTrivial :: SimplEnv -> TopLevelFlag -> Demand
             -> FastString  -- ^ A "friendly name" to build the new binder from
             -> OutExpr     -- ^ This expression satisfies the let/app invariant
             -> SimplM (LetFloats, OutExpr)
 -- Binds the expression to a variable, if it's not trivial, returning the variable
 -- For the Demand argument, see Note [Keeping demand info in StrictArg Plan A]
-makeTrivial mode top_lvl dmd occ_fs expr
+makeTrivial env top_lvl dmd occ_fs expr
   | exprIsTrivial expr                          -- Already trivial
   || not (bindingOk top_lvl expr expr_ty)       -- Cannot trivialise
                                                 --   See Note [Cannot trivialise]
   = return (emptyLetFloats, expr)
 
   | Cast expr' co <- expr
-  = do { (floats, triv_expr) <- makeTrivial mode top_lvl dmd occ_fs expr'
+  = do { (floats, triv_expr) <- makeTrivial env top_lvl dmd occ_fs expr'
        ; return (floats, Cast triv_expr co) }
 
   | otherwise
-  = do { (floats, new_id) <- makeTrivialBinding mode top_lvl occ_fs
+  = do { (floats, new_id) <- makeTrivialBinding env top_lvl occ_fs
                                                 id_info expr expr_ty
        ; return (floats, Var new_id) }
   where
     id_info = vanillaIdInfo `setDemandInfo` dmd
     expr_ty = exprType expr
 
-makeTrivialBinding :: SimplMode -> TopLevelFlag
+makeTrivialBinding :: SimplEnv -> TopLevelFlag
                    -> FastString  -- ^ a "friendly name" to build the new binder from
                    -> IdInfo
                    -> OutExpr     -- ^ This expression satisfies the let/app invariant
                    -> OutType     -- Type of the expression
                    -> SimplM (LetFloats, OutId)
-makeTrivialBinding mode top_lvl occ_fs info expr expr_ty
-  = do  { (floats, expr1) <- prepareRhs mode top_lvl occ_fs expr
+makeTrivialBinding env top_lvl occ_fs info expr expr_ty
+  = do  { (floats, expr1) <- prepareRhs env top_lvl occ_fs expr
         ; uniq <- getUniqueM
         ; let name = mkSystemVarName uniq occ_fs
               var  = mkLocalIdWithInfo name Many expr_ty info
 
         -- Now something very like completeBind,
         -- but without the postInlineUnconditionally part
-        ; (arity_type, expr2) <- tryEtaExpandRhs mode var expr1
-        ; unf <- mkLetUnfolding (sm_dflags mode) top_lvl InlineRhs var expr2
+        ; (arity_type, expr2) <- tryEtaExpandRhs env var expr1
+          -- Technically we should extend the in-scope set in 'env' with
+          -- the 'floats' from prepareRHS; but they are all fresh, so there is
+          -- no danger of introducing name shadowig in eta expansion
+
+        ; unf <- mkLetUnfolding (sm_uf_opts mode) top_lvl InlineRhs var expr2
 
         ; let final_id = addLetBndrInfo var arity_type unf
               bind     = NonRec final_id expr2
 
         ; return ( floats `addLetFlts` unitLetFloat bind, final_id ) }
+  where
+    mode = getMode env
 
 bindingOk :: TopLevelFlag -> CoreExpr -> Type -> Bool
 -- True iff we can have a binding of this expression at this level
@@ -730,6 +904,7 @@ It does the following:
   - tries PostInlineUnconditionally
   - add unfolding [this is the only place we add an unfolding]
   - add arity
+  - extend the InScopeSet of the SimplEnv
 
 It does *not* attempt to do let-to-case.  Why?  Because it is used for
   - top-level bindings (when let-to-case is impossible)
@@ -740,10 +915,10 @@ Nor does it do the atomic-argument thing
 -}
 
 completeBind :: SimplEnv
-             -> TopLevelFlag            -- Flag stuck into unfolding
-             -> MaybeJoinCont           -- Required only for join point
-             -> InId                    -- Old binder
-             -> OutId -> OutExpr        -- New binder and RHS
+             -> BindContext
+             -> InId           -- Old binder
+             -> OutId          -- New binder; can be a JoinId
+             -> OutExpr        -- New RHS
              -> SimplM (SimplFloats, SimplEnv)
 -- completeBind may choose to do its work
 --      * by extending the substitution (e.g. let x = y in ...)
@@ -751,49 +926,52 @@ completeBind :: SimplEnv
 --
 -- Binder /can/ be a JoinId
 -- Precondition: rhs obeys the let/app invariant
-completeBind env top_lvl mb_cont old_bndr new_bndr new_rhs
+completeBind env bind_cxt old_bndr new_bndr new_rhs
  | isCoVar old_bndr
  = case new_rhs of
      Coercion co -> return (emptyFloats env, extendCvSubst env old_bndr co)
      _           -> return (mkFloatBind env (NonRec new_bndr new_rhs))
 
  | otherwise
- = ASSERT( isId new_bndr )
+ = assert (isId new_bndr) $
    do { let old_info = idInfo old_bndr
-            old_unf  = unfoldingInfo old_info
+            old_unf  = realUnfoldingInfo old_info
             occ_info = occInfo old_info
 
          -- Do eta-expansion on the RHS of the binding
          -- See Note [Eta-expanding at let bindings] in GHC.Core.Opt.Simplify.Utils
-      ; (new_arity, final_rhs) <- tryEtaExpandRhs (getMode env) new_bndr new_rhs
+      ; (new_arity, eta_rhs) <- tryEtaExpandRhs env new_bndr new_rhs
 
         -- Simplify the unfolding
-      ; new_unfolding <- simplLetUnfolding env top_lvl mb_cont old_bndr
-                          final_rhs (idType new_bndr) new_arity old_unf
+      ; new_unfolding <- simplLetUnfolding env bind_cxt old_bndr
+                         eta_rhs (idType new_bndr) new_arity old_unf
 
-      ; let final_bndr = addLetBndrInfo new_bndr new_arity new_unfolding
+      ; let new_bndr_w_info = addLetBndrInfo new_bndr new_arity new_unfolding
         -- See Note [In-scope set as a substitution]
 
-      ; if postInlineUnconditionally env top_lvl final_bndr occ_info final_rhs
+      ; if postInlineUnconditionally env bind_cxt new_bndr_w_info occ_info eta_rhs
 
         then -- Inline and discard the binding
              do  { tick (PostInlineUnconditionally old_bndr)
-                 ; return ( emptyFloats env
+                 ; let unf_rhs = maybeUnfoldingTemplate new_unfolding `orElse` eta_rhs
+                          -- See Note [Use occ-anald RHS in postInlineUnconditionally]
+                 ; simplTrace env "PostInlineUnconditionally" (ppr new_bndr <+> ppr unf_rhs) $
+                   return ( emptyFloats env
                           , extendIdSubst env old_bndr $
-                            DoneEx final_rhs (isJoinId_maybe new_bndr)) }
+                            DoneEx unf_rhs (isJoinId_maybe new_bndr)) }
                 -- Use the substitution to make quite, quite sure that the
                 -- substitution will happen, since we are going to discard the binding
 
-        else -- Keep the binding
-             -- pprTrace "Binding" (ppr final_bndr <+> ppr new_unfolding) $
-             return (mkFloatBind env (NonRec final_bndr final_rhs)) }
+        else -- Keep the binding; do cast worker/wrapper
+             -- pprTrace "Binding" (ppr new_bndr <+> ppr new_unfolding) $
+             tryCastWorkerWrapper env bind_cxt old_bndr occ_info new_bndr_w_info eta_rhs }
 
 addLetBndrInfo :: OutId -> ArityType -> Unfolding -> OutId
 addLetBndrInfo new_bndr new_arity_type new_unf
   = new_bndr `setIdInfo` info5
   where
-    new_arity = arityTypeArity new_arity_type
-    is_bot    = isBotArityType new_arity_type
+    AT oss div = new_arity_type
+    new_arity  = length oss
 
     info1 = idInfo new_bndr `setArityInfo` new_arity
 
@@ -801,22 +979,17 @@ addLetBndrInfo new_bndr new_arity_type new_unf
     info2 = info1 `setUnfoldingInfo` new_unf
 
     -- Demand info: Note [Setting the demand info]
-    -- We also have to nuke demand info if for some reason
-    -- eta-expansion *reduces* the arity of the binding to less
-    -- than that of the strictness sig. This can happen: see Note [Arity decrease].
     info3 | isEvaldUnfolding new_unf
-            || (case strictnessInfo info2 of
-                  StrictSig dmd_ty -> new_arity < dmdTypeDepth dmd_ty)
           = zapDemandInfo info2 `orElse` info2
           | otherwise
           = info2
 
     -- Bottoming bindings: see Note [Bottoming bindings]
-    info4 | is_bot    = info3 `setStrictnessInfo` bot_sig
-                              `setCprInfo`        bot_cpr
-          | otherwise = info3
+    info4 | isDeadEndDiv div = info3 `setDmdSigInfo` bot_sig
+                                     `setCprSigInfo`        bot_cpr
+          | otherwise        = info3
 
-    bot_sig = mkClosedStrictSig (replicate new_arity topDmd) botDiv
+    bot_sig = mkClosedDmdSig (replicate new_arity topDmd) div
     bot_cpr = mkCprSig new_arity botCpr
 
      -- Zap call arity info. We have used it by now (via
@@ -825,31 +998,8 @@ addLetBndrInfo new_bndr new_arity_type new_unf
     info5 = zapCallArityInfo info4
 
 
-{- Note [Arity decrease]
-~~~~~~~~~~~~~~~~~~~~~~~~
-Generally speaking the arity of a binding should not decrease.  But it *can*
-legitimately happen because of RULES.  Eg
-        f = g @Int
-where g has arity 2, will have arity 2.  But if there's a rewrite rule
-        g @Int --> h
-where h has arity 1, then f's arity will decrease.  Here's a real-life example,
-which is in the output of Specialise:
-
-     Rec {
-        $dm {Arity 2} = \d.\x. op d
-        {-# RULES forall d. $dm Int d = $s$dm #-}
-
-        dInt = MkD .... opInt ...
-        opInt {Arity 1} = $dm dInt
-
-        $s$dm {Arity 0} = \x. op dInt }
-
-Here opInt has arity 1; but when we apply the rule its arity drops to 0.
-That's why Specialise goes to a little trouble to pin the right arity
-on specialised functions too.
-
-Note [Bottoming bindings]
-~~~~~~~~~~~~~~~~~~~~~~~~~
+{- Note [Bottoming bindings]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Suppose we have
    let x = error "urk"
    in ...(case x of <alts>)...
@@ -883,6 +1033,21 @@ This really happens.  Similarly
 After inlining f at some of its call sites the original binding may
 (for example) be no longer strictly demanded.
 The solution here is a bit ad hoc...
+
+Note [Use occ-anald RHS in postInlineUnconditionally]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Suppose we postInlineUnconditionally 'f in
+  let f = \x -> x True in ...(f blah)...
+then we'd like to inline the /occ-anald/ RHS for 'f'.  If we
+use the non-occ-anald version, we'll end up with a
+    ...(let x = blah in x True)...
+and hence an extra Simplifier iteration.
+
+We already /have/ the occ-anald version in the Unfolding for
+the Id.  Well, maybe not /quite/ always.  If the binder is Dead,
+postInlineUnconditionally will return True, but we may not have an
+unfolding because it's too big. Hence the belt-and-braces `orElse`
+in the defn of unf_rhs.  The Nothing case probably never happens.
 
 
 ************************************************************************
@@ -930,7 +1095,7 @@ might do the same again.
 -}
 
 simplExpr :: SimplEnv -> CoreExpr -> SimplM CoreExpr
-simplExpr env (Type ty)
+simplExpr !env (Type ty) -- See Note [Bangs in the Simplifier]
   = do { ty' <- simplType env ty  -- See Note [Avoiding space leaks in OutType]
        ; return (Type ty') }
 
@@ -948,7 +1113,7 @@ simplExprC :: SimplEnv
            -> SimplM OutExpr
         -- Simplify an expression, given a continuation
 simplExprC env expr cont
-  = -- pprTrace "simplExprC" (ppr expr $$ ppr cont {- $$ ppr (seIdSubst env) -} $$ ppr (seLetFloats env) ) $
+  = -- pprTrace "simplExprC" (ppr expr $$ ppr cont) $
     do  { (floats, expr') <- simplExprF env expr cont
         ; -- pprTrace "simplExprC ret" (ppr expr $$ ppr expr') $
           -- pprTrace "simplExprC ret3" (ppr (seInScope env')) $
@@ -961,7 +1126,7 @@ simplExprF :: SimplEnv
            -> SimplCont
            -> SimplM (SimplFloats, OutExpr)
 
-simplExprF env e cont
+simplExprF !env e !cont -- See Note [Bangs in the Simplifier]
   = {- pprTrace "simplExprF" (vcat
       [ ppr e
       , text "cont =" <+> ppr cont
@@ -1019,26 +1184,17 @@ simplExprF1 env (App fun arg) cont
 
 simplExprF1 env expr@(Lam {}) cont
   = {-#SCC "simplExprF1-Lam" #-}
-    simplLam env zapped_bndrs body cont
-        -- The main issue here is under-saturated lambdas
+    simplLam env (zapLambdaBndrs expr n_args) cont
+        -- zapLambdaBndrs: the issue here is under-saturated lambdas
         --   (\x1. \x2. e) arg1
         -- Here x1 might have "occurs-once" occ-info, because occ-info
         -- is computed assuming that a group of lambdas is applied
         -- all at once.  If there are too few args, we must zap the
         -- occ-info, UNLESS the remaining binders are one-shot
   where
-    (bndrs, body) = collectBinders expr
-    zapped_bndrs | need_to_zap = map zap bndrs
-                 | otherwise   = bndrs
-
-    need_to_zap = any zappable_bndr (drop n_args bndrs)
     n_args = countArgs cont
         -- NB: countArgs counts all the args (incl type args)
         -- and likewise drop counts all binders (incl type lambdas)
-
-    zappable_bndr b = isId b && not (isOneShotBndr b)
-    zap b | isTyVar b = b
-          | otherwise = zapLamIdInfo b
 
 simplExprF1 env (Case scrut bndr _ alts) cont
   = {-#SCC "simplExprF1-Case" #-}
@@ -1056,7 +1212,7 @@ simplExprF1 env (Let (Rec pairs) body) cont
 simplExprF1 env (Let (NonRec bndr rhs) body) cont
   | Type ty <- rhs    -- First deal with type lets (let a = Type ty in e)
   = {-#SCC "simplExprF1-NonRecLet-Type" #-}
-    ASSERT( isTyVar bndr )
+    assert (isTyVar bndr) $
     do { ty' <- simplType env ty
        ; simplExprF (extendTvSubst env bndr ty') body cont }
 
@@ -1064,7 +1220,7 @@ simplExprF1 env (Let (NonRec bndr rhs) body) cont
   = {-#SCC "simplNonRecJoinPoint" #-} simplNonRecJoinPoint env bndr' rhs' body cont
 
   | otherwise
-  = {-#SCC "simplNonRecE" #-} simplNonRecE env bndr (rhs, env) ([], body) cont
+  = {-#SCC "simplNonRecE" #-} simplNonRecE env bndr (rhs, env) body cont
 
 {- Note [Avoiding space leaks in OutType]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1148,8 +1304,8 @@ simplCoercionF env co cont
 
 simplCoercion :: SimplEnv -> InCoercion -> SimplM OutCoercion
 simplCoercion env co
-  = do { dflags <- getDynFlags
-       ; let opt_co = optCoercion dflags (getTCvSubst env) co
+  = do { opts <- getOptCoercionOpts
+       ; let opt_co = optCoercion opts (getTCvSubst env) co
        ; seqCo opt_co `seq` return opt_co }
 
 -----------------------------------
@@ -1157,7 +1313,7 @@ simplCoercion env co
 -- long as this is a non-scoping tick, to let case and application
 -- optimisations apply.
 
-simplTick :: SimplEnv -> Tickish Id -> InExpr -> SimplCont
+simplTick :: SimplEnv -> CoreTickish -> InExpr -> SimplCont
           -> SimplM (SimplFloats, OutExpr)
 simplTick env tickish expr cont
   -- A scoped tick turns into a continuation, so that we can spot
@@ -1218,7 +1374,7 @@ simplTick env tickish expr cont
          tickScrut e    = foldr mkTick e ticks
          -- Alternatives get annotated with all ticks that scope in some way,
          -- but we don't want to count entries.
-         tickAlt (c,bs,e) = (c,bs, foldr mkTick e ts_scope)
+         tickAlt (Alt c bs e) = Alt c bs (foldr mkTick e ts_scope)
          ts_scope         = map mkNoCount $
                             filter (not . (`tickishScopesLike` NoScope)) ticks
 
@@ -1241,7 +1397,7 @@ simplTick env tickish expr cont
 --    do { let (inc,outc) = splitCont cont
 --       ; (env', expr') <- simplExprF (zapFloats env) expr inc
 --       ; let tickish' = simplTickish env tickish
---       ; let wrap_float (b,rhs) = (zapIdStrictness (setIdArity b 0),
+--       ; let wrap_float (b,rhs) = (zapIdDmdSig (setIdArity b 0),
 --                                   mkTick (mkNoCount tickish') rhs)
 --              -- when wrapping a float with mkTick, we better zap the Id's
 --              -- strictness info and arity, because it might be wrong now.
@@ -1251,8 +1407,8 @@ simplTick env tickish expr cont
 
 
   simplTickish env tickish
-    | Breakpoint n ids <- tickish
-          = Breakpoint n (map (getDoneId . substId env) ids)
+    | Breakpoint ext n ids <- tickish
+          = Breakpoint ext n (map (getDoneId . substId env) ids)
     | otherwise = tickish
 
   -- Push type application and coercion inside a tick
@@ -1268,6 +1424,7 @@ simplTick env tickish expr cont
   getDoneId other = pprPanic "getDoneId" (ppr other)
 
 -- Note [case-of-scc-of-case]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~
 -- It's pretty important to be able to transform case-of-case when
 -- there's an SCC in the way.  For example, the following comes up
 -- in nofib/real/compress/Encode.hs:
@@ -1322,12 +1479,12 @@ rebuild env expr cont
 
       StrictArg { sc_fun = fun, sc_cont = cont, sc_fun_ty = fun_ty }
         -> rebuildCall env (addValArgTo fun expr fun_ty ) cont
-      StrictBind { sc_bndr = b, sc_bndrs = bs, sc_body = body
+      StrictBind { sc_bndr = b, sc_body = body
                  , sc_env = se, sc_cont = cont }
         -> do { (floats1, env') <- simplNonRecX (se `setInScopeFromE` env) b expr
                                   -- expr satisfies let/app since it started life
                                   -- in a call to simplNonRecE
-              ; (floats2, expr') <- simplLam env' bs body cont
+              ; (floats2, expr') <- simplLam env' body cont
               ; return (floats1 `addFloats` floats2, expr') }
 
       ApplyToTy  { sc_arg_ty = ty, sc_cont = cont}
@@ -1409,25 +1566,23 @@ simplCast env body co0 cont0
                                         -- type of the hole changes (#16312)
 
         -- (f |> co) e   ===>   (f (e |> co1)) |> co2
-        -- where   co :: (s1->s2) ~ (t1~t2)
+        -- where   co :: (s1->s2) ~ (t1->t2)
         --         co1 :: t1 ~ s1
         --         co2 :: s2 ~ t2
         addCoerce co cont@(ApplyToVal { sc_arg = arg, sc_env = arg_se
                                       , sc_dup = dup, sc_cont = tail })
-          | Just (co1, m_co2) <- pushCoValArg co
-          , let new_ty = coercionRKind co1
-          , not (isTypeLevPoly new_ty)  -- Without this check, we get a lev-poly arg
-                                        -- See Note [Levity polymorphism invariants] in GHC.Core
-                                        -- test: typecheck/should_run/EtaExpandLevPoly
+          | Just (m_co1, m_co2) <- pushCoValArg co
+          , fixed_rep m_co1
           = {-#SCC "addCoerce-pushCoValArg" #-}
             do { tail' <- addCoerceM m_co2 tail
-               ; if isReflCo co1
-                 then return (cont { sc_cont = tail'
-                                   , sc_hole_ty = coercionLKind co })
+               ; case m_co1 of {
+                   MRefl -> return (cont { sc_cont = tail'
+                                         , sc_hole_ty = coercionLKind co }) ;
                       -- Avoid simplifying if possible;
                       -- See Note [Avoiding exponential behaviour]
-                 else do
-               { (dup', arg_se', arg') <- simplArg env dup arg_se arg
+
+                   MCo co1 ->
+            do { (dup', arg_se', arg') <- simplArg env dup arg_se arg
                     -- When we build the ApplyTo we can't mix the OutCoercion
                     -- 'co' with the InExpr 'arg', so we simplify
                     -- to make it all consistent.  It's a bit messy.
@@ -1437,7 +1592,7 @@ simplCast env body co0 cont0
                                     , sc_env  = arg_se'
                                     , sc_dup  = dup'
                                     , sc_cont = tail'
-                                    , sc_hole_ty = coercionLKind co }) } }
+                                    , sc_hole_ty = coercionLKind co }) } } }
 
         addCoerce co cont
           | isReflexiveCo co = return cont  -- Having this at the end makes a huge
@@ -1445,14 +1600,25 @@ simplCast env body co0 cont0
                                             -- See Note [Optimising reflexivity]
           | otherwise        = return (CastIt co cont)
 
+        fixed_rep :: MCoercionR -> Bool
+        fixed_rep MRefl    = True
+        fixed_rep (MCo co) = typeHasFixedRuntimeRep $ coercionRKind co
+          -- Without this check, we can get an argument which does not
+          -- have a fixed runtime representation.
+          -- See Note [Representation polymorphism invariants] in GHC.Core
+          -- test: typecheck/should_run/EtaExpandLevPoly
+
 simplArg :: SimplEnv -> DupFlag -> StaticEnv -> CoreExpr
          -> SimplM (DupFlag, StaticEnv, OutExpr)
 simplArg env dup_flag arg_env arg
   | isSimplified dup_flag
   = return (dup_flag, arg_env, arg)
   | otherwise
-  = do { arg' <- simplExpr (arg_env `setInScopeFromE` env) arg
-       ; return (Simplified, zapSubstEnv arg_env, arg') }
+  = do { let arg_env' = arg_env `setInScopeFromE` env
+       ; arg' <- simplExpr arg_env'  arg
+       ; return (Simplified, zapSubstEnv arg_env', arg') }
+         -- Return a StaticEnv that includes the in-scope set from 'env',
+         -- because arg' may well mention those variables (#20639)
 
 {-
 ************************************************************************
@@ -1462,68 +1628,58 @@ simplArg env dup_flag arg_env arg
 ************************************************************************
 -}
 
-simplLam :: SimplEnv -> [InId] -> InExpr -> SimplCont
+simplLam :: SimplEnv -> InExpr -> SimplCont
          -> SimplM (SimplFloats, OutExpr)
 
-simplLam env [] body cont
-  = simplExprF env body cont
+simplLam env (Lam bndr body) cont = simpl_lam env bndr body cont
+simplLam env expr            cont = simplExprF env expr cont
 
-simplLam env (bndr:bndrs) body (ApplyToTy { sc_arg_ty = arg_ty, sc_cont = cont })
+simpl_lam :: SimplEnv -> InBndr -> InExpr -> SimplCont
+          -> SimplM (SimplFloats, OutExpr)
+
+-- Type beta-reduction
+simpl_lam env bndr body (ApplyToTy { sc_arg_ty = arg_ty, sc_cont = cont })
   = do { tick (BetaReduction bndr)
-       ; simplLam (extendTvSubst env bndr arg_ty) bndrs body cont }
+       ; simplLam (extendTvSubst env bndr arg_ty) body cont }
 
-simplLam env (bndr:bndrs) body (ApplyToVal { sc_arg = arg, sc_env = arg_se
-                                           , sc_cont = cont, sc_dup = dup })
+-- Value beta-reduction
+simpl_lam env bndr body (ApplyToVal { sc_arg = arg, sc_env = arg_se
+                                    , sc_cont = cont, sc_dup = dup })
   | isSimplified dup  -- Don't re-simplify if we've simplified it once
                       -- See Note [Avoiding exponential behaviour]
   = do  { tick (BetaReduction bndr)
-        ; (floats1, env') <- simplNonRecX env zapped_bndr arg
-        ; (floats2, expr') <- simplLam env' bndrs body cont
+        ; (floats1, env') <- simplNonRecX env bndr arg
+        ; (floats2, expr') <- simplLam env' body cont
         ; return (floats1 `addFloats` floats2, expr') }
 
   | otherwise
   = do  { tick (BetaReduction bndr)
-        ; simplNonRecE env zapped_bndr (arg, arg_se) (bndrs, body) cont }
-  where
-    zapped_bndr  -- See Note [Zap unfolding when beta-reducing]
-      | isId bndr = zapStableUnfolding bndr
-      | otherwise = bndr
+        ; simplNonRecE env bndr (arg, arg_se) body cont }
 
-      -- Discard a non-counting tick on a lambda.  This may change the
-      -- cost attribution slightly (moving the allocation of the
-      -- lambda elsewhere), but we don't care: optimisation changes
-      -- cost attribution all the time.
-simplLam env bndrs body (TickIt tickish cont)
+-- Discard a non-counting tick on a lambda.  This may change the
+-- cost attribution slightly (moving the allocation of the
+-- lambda elsewhere), but we don't care: optimisation changes
+-- cost attribution all the time.
+simpl_lam env bndr body (TickIt tickish cont)
   | not (tickishCounts tickish)
-  = simplLam env bndrs body cont
+  = simpl_lam env bndr body cont
 
-        -- Not enough args, so there are real lambdas left to put in the result
-simplLam env bndrs body cont
-  = do  { (env', bndrs') <- simplLamBndrs env bndrs
-        ; body' <- simplExpr env' body
-        ; new_lam <- mkLam env bndrs' body' cont
+-- Not enough args, so there are real lambdas left to put in the result
+simpl_lam env bndr body cont
+  = do  { let (inner_bndrs, inner_body) = collectBinders body
+        ; (env', bndrs') <- simplLamBndrs env (bndr:inner_bndrs)
+        ; body'   <- simplExpr env' inner_body
+        ; new_lam <- mkLam env' bndrs' body' cont
         ; rebuild env' new_lam cont }
 
 -------------
 simplLamBndr :: SimplEnv -> InBndr -> SimplM (SimplEnv, OutBndr)
--- Used for lambda binders.  These sometimes have unfoldings added by
--- the worker/wrapper pass that must be preserved, because they can't
--- be reconstructed from context.  For example:
---      f x = case x of (a,b) -> fw a b x
---      fw a b x{=(a,b)} = ...
--- The "{=(a,b)}" is an unfolding we can't reconstruct otherwise.
-simplLamBndr env bndr
-  | isId bndr && hasCoreUnfolding old_unf   -- Special case
-  = do { (env1, bndr1) <- simplBinder env bndr
-       ; unf'          <- simplStableUnfolding env1 NotTopLevel Nothing bndr
-                                      (idType bndr1) (idArityType bndr1) old_unf
-       ; let bndr2 = bndr1 `setIdUnfolding` unf'
-       ; return (modifyInScope env1 bndr2, bndr2) }
-
-  | otherwise
-  = simplBinder env bndr                -- Normal case
-  where
-    old_unf = idUnfolding bndr
+-- Historically this had a special case for when a lambda-binder
+-- could have a stable unfolding;
+-- see Historical Note [Case binders and join points]
+-- But now it is much simpler! We now only remove unfoldings.
+-- See Note [Never put `OtherCon` unfoldings on lambda binders]
+simplLamBndr env bndr = simplBinder env (zapIdUnfolding bndr)
 
 simplLamBndrs :: SimplEnv -> [InBndr] -> SimplM (SimplEnv, [OutBndr])
 simplLamBndrs env bndrs = mapAccumLM simplLamBndr env bndrs
@@ -1533,8 +1689,7 @@ simplNonRecE :: SimplEnv
              -> InId                    -- The binder, always an Id
                                         -- Never a join point
              -> (InExpr, SimplEnv)      -- Rhs of binding (or arg of lambda)
-             -> ([InBndr], InExpr)      -- Body of the let/lambda
-                                        --      \xs.e
+             -> InExpr                  -- Body of the let/lambda
              -> SimplCont
              -> SimplM (SimplFloats, OutExpr)
 
@@ -1542,43 +1697,39 @@ simplNonRecE :: SimplEnv
 --  * non-top-level non-recursive non-join-point lets in expressions
 --  * beta reduction
 --
--- simplNonRec env b (rhs, rhs_se) (bs, body) k
+-- simplNonRec env b (rhs, rhs_se) body k
 --   = let env in
---     cont< let b = rhs_se(rhs) in \bs.body >
+--     cont< let b = rhs_se(rhs) in body >
 --
 -- It deals with strict bindings, via the StrictBind continuation,
 -- which may abort the whole process
 --
 -- Precondition: rhs satisfies the let/app invariant
 --               Note [Core let/app invariant] in GHC.Core
---
--- The "body" of the binding comes as a pair of ([InId],InExpr)
--- representing a lambda; so we recurse back to simplLam
--- Why?  Because of the binder-occ-info-zapping done before
---       the call to simplLam in simplExprF (Lam ...)
 
-simplNonRecE env bndr (rhs, rhs_se) (bndrs, body) cont
-  | ASSERT( isId bndr && not (isJoinId bndr) ) True
+simplNonRecE env bndr (rhs, rhs_se) body cont
+  | assert (isId bndr && not (isJoinId bndr) ) True
   , Just env' <- preInlineUnconditionally env NotTopLevel bndr rhs rhs_se
   = do { tick (PreInlineUnconditionally bndr)
        ; -- pprTrace "preInlineUncond" (ppr bndr <+> ppr rhs) $
-         simplLam env' bndrs body cont }
+         simplLam env' body cont }
 
-  -- Deal with strict bindings
-  | isStrictId bndr          -- Includes coercions, and unlifted types
-  , sm_case_case (getMode env)
-  = simplExprF (rhs_se `setInScopeFromE` env) rhs
-               (StrictBind { sc_bndr = bndr, sc_bndrs = bndrs, sc_body = body
-                           , sc_env = env, sc_cont = cont, sc_dup = NoDup })
-
-  -- Deal with lazy bindings
   | otherwise
-  = ASSERT( not (isTyVar bndr) )
-    do { (env1, bndr1) <- simplNonRecBndr env bndr
-       ; (env2, bndr2) <- addBndrRules env1 bndr bndr1 Nothing
-       ; (floats1, env3) <- simplLazyBind env2 NotTopLevel NonRecursive bndr bndr2 rhs rhs_se
-       ; (floats2, expr') <- simplLam env3 bndrs body cont
-       ; return (floats1 `addFloats` floats2, expr') }
+  = do { (env1, bndr1) <- simplNonRecBndr env bndr
+
+       -- Deal with strict bindings
+       -- See Note [Dark corner with representation polymorphism]
+       ; if isStrictId bndr1 && sm_case_case (getMode env)
+         then simplExprF (rhs_se `setInScopeFromE` env) rhs
+                   (StrictBind { sc_bndr = bndr, sc_body = body
+                               , sc_env = env, sc_cont = cont, sc_dup = NoDup })
+
+       -- Deal with lazy bindings
+         else do
+       { (env2, bndr2)    <- addBndrRules env1 bndr bndr1 (BC_Let NotTopLevel NonRecursive)
+       ; (floats1, env3)  <- simplLazyBind env2 NotTopLevel NonRecursive bndr bndr2 rhs rhs_se
+       ; (floats2, expr') <- simplLam env3 body cont
+       ; return (floats1 `addFloats` floats2, expr') } }
 
 ------------------
 simplRecE :: SimplEnv
@@ -1589,23 +1740,43 @@ simplRecE :: SimplEnv
 
 -- simplRecE is used for
 --  * non-top-level recursive lets in expressions
+-- Precondition: not a join-point binding
 simplRecE env pairs body cont
   = do  { let bndrs = map fst pairs
-        ; MASSERT(all (not . isJoinId) bndrs)
+        ; massert (all (not . isJoinId) bndrs)
         ; env1 <- simplRecBndrs env bndrs
                 -- NB: bndrs' don't have unfoldings or rules
                 -- We add them as we go down
-        ; (floats1, env2) <- simplRecBind env1 NotTopLevel Nothing pairs
+        ; (floats1, env2)  <- simplRecBind env1 (BC_Let NotTopLevel Recursive) pairs
         ; (floats2, expr') <- simplExprF env2 body cont
         ; return (floats1 `addFloats` floats2, expr') }
 
-{- Note [Avoiding exponential behaviour]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+{- Note [Dark corner with representation polymorphism]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In `simplNonRecE`, the call to `isStrictId` will fail if the binder
+does not have a fixed runtime representation, e.g. if it is of kind (TYPE r).
+So we are careful to call `isStrictId` on the OutId, not the InId, in case we have
+     ((\(r::RuntimeRep) \(x::TYPE r). blah) Lifted arg)
+That will lead to `simplNonRecE env (x::TYPE r) arg`, and we can't tell
+if x is lifted or unlifted from that.
+
+We only get such redexes from the compulsory inlining of a wired-in,
+representation-polymorphic function like `rightSection` (see
+GHC.Types.Id.Make).  Mind you, SimpleOpt should probably have inlined
+such compulsory inlinings already, but belt and braces does no harm.
+
+Plus, it turns out that GHC.Driver.Main.hscCompileCoreExpr calls the
+Simplifier without first calling SimpleOpt, so anything involving
+GHCi or TH and operator sections will fall over if we don't take
+care here.
+
+Note [Avoiding exponential behaviour]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 One way in which we can get exponential behaviour is if we simplify a
 big expression, and the re-simplify it -- and then this happens in a
 deeply-nested way.  So we must be jolly careful about re-simplifying
-an expression.  That is why completeNonRecX does not try
-preInlineUnconditionally.
+an expression.  That is why simplNonRecX does not try
+preInlineUnconditionally (unlike simplNonRecE).
 
 Example:
   f BIG, where f has a RULE
@@ -1627,19 +1798,6 @@ simplify BIG True; maybe good things happen.  That is why
     - In rebuildCall we avoid simplifying arguments before we have to
       (see Note [Trying rewrite rules])
 
-
-Note [Zap unfolding when beta-reducing]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Lambda-bound variables can have stable unfoldings, such as
-   $j = \x. \b{Unf=Just x}. e
-See Note [Case binders and join points] below; the unfolding for lets
-us optimise e better.  However when we beta-reduce it we want to
-revert to using the actual value, otherwise we can end up in the
-stupid situation of
-          let x = blah in
-          let b{Unf=Just x} = y
-          in ...b...
-Here it'd be far better to drop the unfolding and use the actual RHS.
 
 ************************************************************************
 *                                                                      *
@@ -1669,16 +1827,11 @@ is a join point, and what 'cont' is, in a value of type MaybeJoinCont
 of a SpecConstr-generated RULE for a join point.
 -}
 
-type MaybeJoinCont = Maybe SimplCont
-  -- Nothing => Not a join point
-  -- Just k  => This is a join binding with continuation k
-  -- See Note [Rules and unfolding for join points]
-
 simplNonRecJoinPoint :: SimplEnv -> InId -> InExpr
                      -> InExpr -> SimplCont
                      -> SimplM (SimplFloats, OutExpr)
 simplNonRecJoinPoint env bndr rhs body cont
-  | ASSERT( isJoinId bndr ) True
+  | assert (isJoinId bndr ) True
   , Just env' <- preInlineUnconditionally env NotTopLevel bndr rhs env
   = do { tick (PreInlineUnconditionally bndr)
        ; simplExprF env' body cont }
@@ -1690,7 +1843,7 @@ simplNonRecJoinPoint env bndr rhs body cont
         ; let mult   = contHoleScaling cont
               res_ty = contResultType cont
         ; (env1, bndr1)    <- simplNonRecJoinBndr env bndr mult res_ty
-        ; (env2, bndr2)    <- addBndrRules env1 bndr bndr1 (Just cont)
+        ; (env2, bndr2)    <- addBndrRules env1 bndr bndr1 (BC_Join cont)
         ; (floats1, env3)  <- simplJoinBind env2 cont bndr bndr2 rhs env
         ; (floats2, body') <- simplExprF env3 body cont
         ; return (floats1 `addFloats` floats2, body') }
@@ -1708,7 +1861,7 @@ simplRecJoinPoint env pairs body cont
        ; env1 <- simplRecJoinBndrs env bndrs mult res_ty
                -- NB: bndrs' don't have unfoldings or rules
                -- We add them as we go down
-       ; (floats1, env2)  <- simplRecBind env1 NotTopLevel (Just cont) pairs
+       ; (floats1, env2)  <- simplRecBind env1 (BC_Join cont) pairs
        ; (floats2, body') <- simplExprF env2 body cont
        ; return (floats1 `addFloats` floats2, body') }
 
@@ -1840,25 +1993,35 @@ outside.  Surprisingly tricky!
 simplVar :: SimplEnv -> InVar -> SimplM OutExpr
 -- Look up an InVar in the environment
 simplVar env var
-  | isTyVar var = return (Type (substTyVar env var))
-  | isCoVar var = return (Coercion (substCoVar env var))
+  -- Why $! ? See Note [Bangs in the Simplifier]
+  | isTyVar var = return $! Type $! (substTyVar env var)
+  | isCoVar var = return $! Coercion $! (substCoVar env var)
   | otherwise
   = case substId env var of
-        ContEx tvs cvs ids e -> simplExpr (setSubstEnv env tvs cvs ids) e
+        ContEx tvs cvs ids e -> let env' = setSubstEnv env tvs cvs ids
+                                in simplExpr env' e
         DoneId var1          -> return (Var var1)
         DoneEx e _           -> return e
 
 simplIdF :: SimplEnv -> InId -> SimplCont -> SimplM (SimplFloats, OutExpr)
 simplIdF env var cont
   = case substId env var of
-      ContEx tvs cvs ids e -> simplExprF (setSubstEnv env tvs cvs ids) e cont
-                                -- Don't trim; haven't already simplified e,
-                                -- so the cont is not embodied in e
+      ContEx tvs cvs ids e ->
+          let env' = setSubstEnv env tvs cvs ids
+          in simplExprF env' e cont
+          -- Don't trim; haven't already simplified e,
+          -- so the cont is not embodied in e
 
-      DoneId var1 -> completeCall env var1 (trimJoinCont var (isJoinId_maybe var1) cont)
+      DoneId var1 ->
+          let cont' = trimJoinCont var (isJoinId_maybe var1) cont
+          in completeCall env var1 cont'
 
-      DoneEx e mb_join -> simplExprF (zapSubstEnv env) e (trimJoinCont var mb_join cont)
+      DoneEx e mb_join ->
+          let env' = zapSubstEnv env
+              cont' = trimJoinCont var mb_join cont
+          in simplExprF env' e cont'
               -- Note [zapSubstEnv]
+              -- ~~~~~~~~~~~~~~~~~~
               -- The template is already simplified, so don't re-substitute.
               -- This is VITAL.  Consider
               --      let x = e in
@@ -1873,41 +2036,44 @@ simplIdF env var cont
 
 completeCall :: SimplEnv -> OutId -> SimplCont -> SimplM (SimplFloats, OutExpr)
 completeCall env var cont
-  | Just expr <- callSiteInline dflags var active_unf
+  | Just expr <- callSiteInline logger uf_opts case_depth var active_unf
                                 lone_variable arg_infos interesting_cont
   -- Inline the variable's RHS
   = do { checkedTick (UnfoldingDone var)
        ; dump_inline expr cont
-       ; simplExprF (zapSubstEnv env) expr cont }
+       ; let env1 = zapSubstEnv env
+       ; simplExprF env1 expr cont }
 
   | otherwise
   -- Don't inline; instead rebuild the call
   = do { rule_base <- getSimplRules
-       ; let info = mkArgInfo env var (getRules rule_base var)
+       ; let rules = getRules rule_base var
+             info = mkArgInfo env var rules
                               n_val_args call_cont
        ; rebuildCall env info cont }
 
   where
-    dflags = seDynFlags env
+    uf_opts    = seUnfoldingOpts env
+    case_depth = seCaseDepth env
+    logger     = seLogger env
     (lone_variable, arg_infos, call_cont) = contArgs cont
     n_val_args       = length arg_infos
     interesting_cont = interestingCallContext env call_cont
     active_unf       = activeUnfolding (getMode env) var
 
     log_inlining doc
-      = liftIO $ dumpAction dflags
-           (mkDumpStyle alwaysQualify)
-           (dumpOptionsFromFlag Opt_D_dump_inlinings)
+      = liftIO $ logDumpFile logger (mkDumpStyle alwaysQualify)
+           Opt_D_dump_inlinings
            "" FormatText doc
 
     dump_inline unfolding cont
-      | not (dopt Opt_D_dump_inlinings dflags) = return ()
-      | not (dopt Opt_D_verbose_core2core dflags)
+      | not (logHasDumpFlag logger Opt_D_dump_inlinings) = return ()
+      | not (logHasDumpFlag logger Opt_D_verbose_core2core)
       = when (isExternalName (idName var)) $
             log_inlining $
                 sep [text "Inlining done:", nest 4 (ppr var)]
       | otherwise
-      = liftIO $ log_inlining $
+      = log_inlining $
            sep [text "Inlining done: " <> ppr var,
                 nest 4 (vcat [text "Inlined fn: " <+> nest 2 (ppr unfolding),
                               text "Cont:  " <+> ppr cont])]
@@ -1949,7 +2115,7 @@ rebuildCall env info@(ArgInfo { ai_fun = fun, ai_args = rev_args
   | nr_wanted == 0 || no_more_args
   , let info' = info { ai_rules = Nothing }
   = -- We've accumulated a simplified call in <fun,rev_args>
-    -- so try rewrite rules; see Note [RULEs apply to simplified arguments]
+    -- so try rewrite rules; see Note [RULES apply to simplified arguments]
     -- See also Note [Rules for recursive functions]
     do { mb_match <- tryRules env rules fun (reverse rev_args) cont
        ; case mb_match of
@@ -1978,19 +2144,32 @@ rebuildCall env (ArgInfo { ai_fun = fun_id, ai_args = rev_args })
             (ApplyToVal { sc_arg = arg, sc_env = arg_se
                         , sc_cont = cont, sc_hole_ty = fun_ty })
   | fun_id `hasKey` runRWKey
-  , not (contIsStop cont)  -- Don't fiddle around if the continuation is boring
   , [ TyArg {}, TyArg {} ] <- rev_args
-  = do { s <- newId (fsLit "s") Many realWorldStatePrimTy
-       ; let (m,_,_) = splitFunTy fun_ty
-             env'  = (arg_se `setInScopeFromE` env) `addNewInScopeIds` [s]
+  -- Do this even if (contIsStop cont)
+  -- See Note [No eta-expansion in runRW#]
+  = do { let arg_env = arg_se `setInScopeFromE` env
              ty'   = contResultType cont
-             cont' = ApplyToVal { sc_dup = Simplified, sc_arg = Var s
-                                , sc_env = env', sc_cont = cont
-                                , sc_hole_ty = mkVisFunTy m realWorldStatePrimTy ty' }
-                     -- cont' applies to s, then K
-       ; body' <- simplExprC env' arg cont'
-       ; let arg'  = Lam s body'
-             rr'   = getRuntimeRep ty'
+
+       -- If the argument is a literal lambda already, take a short cut
+       -- This isn't just efficiency; if we don't do this we get a beta-redex
+       -- every time, so the simplifier keeps doing more iterations.
+       ; arg' <- case arg of
+           Lam s body -> do { (env', s') <- simplBinder arg_env s
+                            ; body' <- simplExprC env' body cont
+                            ; return (Lam s' body') }
+                            -- Important: do not try to eta-expand this lambda
+                            -- See Note [No eta-expansion in runRW#]
+           _ -> do { s' <- newId (fsLit "s") Many realWorldStatePrimTy
+                   ; let (m,_,_) = splitFunTy fun_ty
+                         env'  = arg_env `addNewInScopeIds` [s']
+                         cont' = ApplyToVal { sc_dup = Simplified, sc_arg = Var s'
+                                            , sc_env = env', sc_cont = cont
+                                            , sc_hole_ty = mkVisFunTy m realWorldStatePrimTy ty' }
+                                -- cont' applies to s', then K
+                   ; body' <- simplExprC env' arg cont'
+                   ; return (Lam s' body') }
+
+       ; let rr'   = getRuntimeRep ty'
              call' = mkApps (Var fun_id) [mkTyArg rr', mkTyArg ty', arg']
        ; return (emptyFloats env, call') }
 
@@ -2097,6 +2276,19 @@ to get the effect that finding (error "foo") in a strict arg position will
 discard the entire application and replace it with (error "foo").  Getting
 all this at once is TOO HARD!
 
+Note [No eta-expansion in runRW#]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When we see `runRW# (\s. blah)` we must not attempt to eta-expand that
+lambda.  Why not?  Because
+* `blah` can mention join points bound outside the runRW#
+* eta-expansion uses arityType, and
+* `arityType` cannot cope with free join Ids:
+
+So the simplifier spots the literal lambda, and simplifies inside it.
+It's a very special lambda, because it is the one the OccAnal spots and
+allows join points bound /outside/ to be called /inside/.
+
+See Note [No free join points in arityType] in GHC.Core.Opt.Arity
 
 ************************************************************************
 *                                                                      *
@@ -2123,7 +2315,7 @@ tryRules env rules fn args call_cont
                 -- Takes   K -> e  into   tagK# -> e
                 -- where tagK# is the tag of constructor K
              enum_to_tag (DataAlt con, [], rhs)
-               = ASSERT( isEnumerationTyCon (dataConTyCon con) )
+               = assert (isEnumerationTyCon (dataConTyCon con) )
                 (LitAlt tag, [], rhs)
               where
                 tag = mkLitInt dflags (toInteger (dataConTag con - fIRST_TAG))
@@ -2160,6 +2352,7 @@ tryRules env rules fn args call_cont
   where
     ropts      = initRuleOpts dflags
     dflags     = seDynFlags env
+    logger     = seLogger env
     zapped_env = zapSubstEnv env  -- See Note [zapSubstEnv]
 
     printRuleModule rule
@@ -2168,8 +2361,8 @@ tryRules env rules fn args call_cont
                       (ruleModule rule))
 
     dump rule rule_rhs
-      | dopt Opt_D_dump_rule_rewrites dflags
-      = log_rule dflags Opt_D_dump_rule_rewrites "Rule fired" $ vcat
+      | logHasDumpFlag logger Opt_D_dump_rule_rewrites
+      = log_rule Opt_D_dump_rule_rewrites "Rule fired" $ vcat
           [ text "Rule:" <+> ftext (ruleName rule)
           , text "Module:" <+>  printRuleModule rule
           , text "Before:" <+> hang (ppr fn) 2 (sep (map ppr args))
@@ -2177,8 +2370,8 @@ tryRules env rules fn args call_cont
                                (sep $ map ppr $ drop (ruleArity rule) args)
           , text "Cont:  " <+> ppr call_cont ]
 
-      | dopt Opt_D_dump_rule_firings dflags
-      = log_rule dflags Opt_D_dump_rule_firings "Rule fired:" $
+      | logHasDumpFlag logger Opt_D_dump_rule_firings
+      = log_rule Opt_D_dump_rule_firings "Rule fired:" $
           ftext (ruleName rule)
             <+> printRuleModule rule
 
@@ -2186,22 +2379,20 @@ tryRules env rules fn args call_cont
       = return ()
 
     nodump
-      | dopt Opt_D_dump_rule_rewrites dflags
-      = liftIO $ do
-         touchDumpFile dflags (dumpOptionsFromFlag Opt_D_dump_rule_rewrites)
+      | logHasDumpFlag logger Opt_D_dump_rule_rewrites
+      = liftIO $
+          touchDumpFile logger Opt_D_dump_rule_rewrites
 
-      | dopt Opt_D_dump_rule_firings dflags
-      = liftIO $ do
-         touchDumpFile dflags (dumpOptionsFromFlag Opt_D_dump_rule_firings)
+      | logHasDumpFlag logger Opt_D_dump_rule_firings
+      = liftIO $
+          touchDumpFile logger Opt_D_dump_rule_firings
 
       | otherwise
       = return ()
 
-    log_rule dflags flag hdr details
-      = liftIO $ do
-         let sty = mkDumpStyle alwaysQualify
-         dumpAction dflags sty (dumpOptionsFromFlag flag) "" FormatText $
-           sep [text hdr, nest 4 details]
+    log_rule flag hdr details
+      = liftIO $ logDumpFile logger (mkDumpStyle alwaysQualify) flag "" FormatText
+               $ sep [text hdr, nest 4 details]
 
 trySeqRules :: SimplEnv
             -> OutExpr -> InExpr   -- Scrutinee and RHS
@@ -2430,13 +2621,6 @@ We treat the unlifted and lifted cases separately:
   we won't build a thunk because the let is strict.
   See also Note [Case-to-let for strictly-used binders]
 
-  NB: absentError satisfies exprIsHNF: see Note [aBSENT_ERROR_ID] in GHC.Core.Make.
-  We want to turn
-     case (absentError "foo") of r -> ...MkT r...
-  into
-     let r = absentError "foo" in ...MkT r...
-
-
 Note [Case-to-let for strictly-used binders]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 If we have this:
@@ -2473,7 +2657,7 @@ There have been various earlier versions of this patch:
 
     scrut_is_demanded_var :: CoreExpr -> Bool
     scrut_is_demanded_var (Cast s _) = scrut_is_demanded_var s
-    scrut_is_demanded_var (Var _)    = isStrictDmd (idDemandInfo case_bndr)
+    scrut_is_demanded_var (Var _)    = isStrUsedDmd (idDemandInfo case_bndr)
     scrut_is_demanded_var _          = False
 
   This only fired if the scrutinee was a /variable/, which seems
@@ -2554,6 +2738,27 @@ case b of { b' -> f b' }.
 We could try and be more clever (like maybe wfloats only contain
 let binders, so we could float them). But the need for the
 extra complication is not clear.
+
+Note [Do not duplicate constructor applications]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider this (#20125)
+   let x = (a,b)
+   in ...(case x of x' -> blah)...x...x...
+
+We want that `case` to vanish (since `x` is bound to a data con) leaving
+   let x = (a,b)
+   in ...(let x'=x in blah)...x..x...
+
+In rebuildCase, `exprIsConApp_maybe` will succeed on the scrutinee `x`,
+since is bound to (a,b).  But in eliminating the case, if the scrutinee
+is trivial, we want to bind the case-binder to the scrutinee, /not/ to
+the constructor application.  Hence the case_bndr_rhs in rebuildCase.
+
+This applies equally to a non-DEFAULT case alternative, say
+   let x = (a,b) in ...(case x of x' { (p,q) -> blah })...
+This variant is handled by bind_case_bndr in knownCon.
+
+We want to bind x' to x, and not to a duplicated (a,b)).
 -}
 
 ---------------------------------------------------------
@@ -2577,8 +2782,8 @@ rebuildCase env scrut case_bndr alts cont
   , not (litIsLifted lit)
   = do  { tick (KnownBranch case_bndr)
         ; case findAlt (LitAlt lit) alts of
-            Nothing           -> missingAlt env case_bndr alts cont
-            Just (_, bs, rhs) -> simple_rhs env [] scrut bs rhs }
+            Nothing             -> missingAlt env case_bndr alts cont
+            Just (Alt _ bs rhs) -> simple_rhs env [] scrut bs rhs }
 
   | Just (in_scope', wfloats, con, ty_args, other_args)
       <- exprIsConApp_maybe (getUnfoldingInRuleMatch env) scrut
@@ -2587,19 +2792,21 @@ rebuildCase env scrut case_bndr alts cont
   , let env0 = setInScopeSet env in_scope'
   = do  { tick (KnownBranch case_bndr)
         ; let scaled_wfloats = map scale_float wfloats
+              -- case_bndr_unf: see Note [Do not duplicate constructor applications]
+              case_bndr_rhs | exprIsTrivial scrut = scrut
+                            | otherwise           = con_app
+              con_app = Var (dataConWorkId con) `mkTyApps` ty_args
+                                                `mkApps`   other_args
         ; case findAlt (DataAlt con) alts of
-            Nothing  -> missingAlt env0 case_bndr alts cont
-            Just (DEFAULT, bs, rhs) -> let con_app = Var (dataConWorkId con)
-                                                 `mkTyApps` ty_args
-                                                 `mkApps`   other_args
-                                       in simple_rhs env0 scaled_wfloats con_app bs rhs
-            Just (_, bs, rhs)       -> knownCon env0 scrut scaled_wfloats con ty_args other_args
-                                                case_bndr bs rhs cont
+            Nothing                   -> missingAlt env0 case_bndr alts cont
+            Just (Alt DEFAULT bs rhs) -> simple_rhs env0 scaled_wfloats case_bndr_rhs bs rhs
+            Just (Alt _       bs rhs) -> knownCon env0 scrut scaled_wfloats con ty_args
+                                                  other_args case_bndr bs rhs cont
         }
   where
-    simple_rhs env wfloats scrut' bs rhs =
-      ASSERT( null bs )
-      do { (floats1, env') <- simplNonRecX env case_bndr scrut'
+    simple_rhs env wfloats case_bndr_rhs bs rhs =
+      assert (null bs) $
+      do { (floats1, env') <- simplNonRecX env case_bndr case_bndr_rhs
              -- scrut is a constructor application,
              -- hence satisfies let/app invariant
          ; (floats2, expr') <- simplExprF env' rhs cont
@@ -2641,7 +2848,7 @@ rebuildCase env scrut case_bndr alts cont
 --      2. Eliminate the case if scrutinee is evaluated
 --------------------------------------------------
 
-rebuildCase env scrut case_bndr alts@[(_, bndrs, rhs)] cont
+rebuildCase env scrut case_bndr alts@[Alt _ bndrs rhs] cont
   -- See if we can get rid of the case altogether
   -- See Note [Case elimination]
   -- mkCase made sure that if all the alternatives are equal,
@@ -2697,11 +2904,12 @@ doCaseToLet scrut case_bndr
   = isTyCoArg scrut        -- Note [Core type and coercion invariant]
 
   | isUnliftedType (idType case_bndr)
+    -- OK to call isUnliftedType: scrutinees always have a fixed RuntimeRep (see FRRCase)
   = exprOkForSpeculation scrut
 
   | otherwise  -- Scrut has a lifted type
   = exprIsHNF scrut
-    || isStrictDmd (idDemandInfo case_bndr)
+    || isStrUsedDmd (idDemandInfo case_bndr)
     -- See Note [Case-to-let for strictly-used binders]
 
 --------------------------------------------------
@@ -2715,9 +2923,11 @@ reallyRebuildCase env scrut case_bndr alts cont
        ; rebuild env case_expr cont }
 
   | otherwise
-  = do { (floats, cont') <- mkDupableCaseCont env alts cont
-       ; case_expr <- simplAlts (env `setInScopeFromF` floats)
-                                scrut (scaleIdBy holeScaling case_bndr) (scaleAltsBy holeScaling alts) cont'
+  = do { (floats, env', cont') <- mkDupableCaseCont env alts cont
+       ; case_expr <- simplAlts env' scrut
+                                (scaleIdBy holeScaling case_bndr)
+                                (scaleAltsBy holeScaling alts)
+                                cont'
        ; return (floats, case_expr) }
   where
     holeScaling = contHoleScaling cont
@@ -2855,12 +3065,14 @@ simplAlts env0 scrut case_bndr alts cont'
         ; (alt_env', scrut', case_bndr') <- improveSeq fam_envs env2 scrut
                                                        case_bndr case_bndr2 alts
 
-        ; (imposs_deflt_cons, in_alts) <- prepareAlts scrut' case_bndr' alts
+        ; (imposs_deflt_cons, in_alts) <- prepareAlts scrut' case_bndr alts
           -- NB: it's possible that the returned in_alts is empty: this is handled
           -- by the caller (rebuildCase) in the missingAlt function
+          -- NB: pass case_bndr::InId, not case_bndr' :: OutId, to prepareAlts
+          --     See Note [Shadowing in prepareAlts] in GHC.Core.Opt.Simplify.Utils
 
         ; alts' <- mapM (simplAlt alt_env' (Just scrut') imposs_deflt_cons case_bndr' cont') in_alts
-        ; -- pprTrace "simplAlts" (ppr case_bndr $$ ppr alts_ty $$ ppr alts_ty' $$ ppr alts $$ ppr cont') $
+--      ; pprTrace "simplAlts" (ppr case_bndr $$ ppr alts $$ ppr cont') $ return ()
 
         ; let alts_ty' = contResultType cont'
         -- See Note [Avoiding space leaks in OutType]
@@ -2873,8 +3085,8 @@ improveSeq :: (FamInstEnv, FamInstEnv) -> SimplEnv
            -> OutExpr -> InId -> OutId -> [InAlt]
            -> SimplM (SimplEnv, OutExpr, OutId)
 -- Note [Improving seq]
-improveSeq fam_envs env scrut case_bndr case_bndr1 [(DEFAULT,_,_)]
-  | Just (co, ty2) <- topNormaliseType_maybe fam_envs (idType case_bndr1)
+improveSeq fam_envs env scrut case_bndr case_bndr1 [Alt DEFAULT _ _]
+  | Just (Reduction co ty2) <- topNormaliseType_maybe fam_envs (idType case_bndr1)
   = do { case_bndr2 <- newId (fsLit "nt") Many ty2
         ; let rhs  = DoneEx (Var case_bndr2 `Cast` mkSymCo co) Nothing
               env2 = extendIdSubst env case_bndr rhs
@@ -2894,24 +3106,24 @@ simplAlt :: SimplEnv
          -> InAlt
          -> SimplM OutAlt
 
-simplAlt env _ imposs_deflt_cons case_bndr' cont' (DEFAULT, bndrs, rhs)
-  = ASSERT( null bndrs )
+simplAlt env _ imposs_deflt_cons case_bndr' cont' (Alt DEFAULT bndrs rhs)
+  = assert (null bndrs) $
     do  { let env' = addBinderUnfolding env case_bndr'
                                         (mkOtherCon imposs_deflt_cons)
                 -- Record the constructors that the case-binder *can't* be.
         ; rhs' <- simplExprC env' rhs cont'
-        ; return (DEFAULT, [], rhs') }
+        ; return (Alt DEFAULT [] rhs') }
 
-simplAlt env scrut' _ case_bndr' cont' (LitAlt lit, bndrs, rhs)
-  = ASSERT( null bndrs )
+simplAlt env scrut' _ case_bndr' cont' (Alt (LitAlt lit) bndrs rhs)
+  = assert (null bndrs) $
     do  { env' <- addAltUnfoldings env scrut' case_bndr' (Lit lit)
         ; rhs' <- simplExprC env' rhs cont'
-        ; return (LitAlt lit, [], rhs') }
+        ; return (Alt (LitAlt lit) [] rhs') }
 
-simplAlt env scrut' _ case_bndr' cont' (DataAlt con, vs, rhs)
+simplAlt env scrut' _ case_bndr' cont' (Alt (DataAlt con) vs rhs)
   = do  { -- See Note [Adding evaluatedness info to pattern-bound variables]
           let vs_with_evals = addEvals scrut' con vs
-        ; (env', vs') <- simplLamBndrs env vs_with_evals
+        ; (env', vs') <- simplBinders env vs_with_evals
 
                 -- Bind the case-binder to (con args)
         ; let inst_tys' = tyConAppArgs (idType case_bndr')
@@ -2920,7 +3132,7 @@ simplAlt env scrut' _ case_bndr' cont' (DataAlt con, vs, rhs)
 
         ; env'' <- addAltUnfoldings env' scrut' case_bndr' con_app
         ; rhs' <- simplExprC env'' rhs cont'
-        ; return (DataAlt con, vs', rhs') }
+        ; return (Alt (DataAlt con) vs' rhs') }
 
 {- Note [Adding evaluatedness info to pattern-bound variables]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2956,7 +3168,7 @@ addEvals :: Maybe OutExpr -> DataCon -> [Id] -> [Id]
 addEvals scrut con vs
   -- Deal with seq# applications
   | Just scr <- scrut
-  , isUnboxedTupleCon con
+  , isUnboxedTupleDataCon con
   , [s,x] <- vs
     -- Use stripNArgs rather than collectArgsTicks to avoid building
     -- a list of arguments only to throw it away immediately.
@@ -3007,14 +3219,17 @@ addAltUnfoldings env scrut case_bndr con_app
        ; traceSmpl "addAltUnf" (vcat [ppr case_bndr <+> ppr scrut, ppr con_app])
        ; return env2 }
   where
-    mk_simple_unf = mkSimpleUnfolding (seDynFlags env)
+    -- Force the opts, so that the whole SimplEnv isn't retained
+    !opts = seUnfoldingOpts env
+    mk_simple_unf = mkSimpleUnfolding opts
 
 addBinderUnfolding :: SimplEnv -> Id -> Unfolding -> SimplEnv
 addBinderUnfolding env bndr unf
   | debugIsOn, Just tmpl <- maybeUnfoldingTemplate unf
-  = WARN( not (eqType (idType bndr) (exprType tmpl)),
-          ppr bndr $$ ppr (idType bndr) $$ ppr tmpl $$ ppr (exprType tmpl) )
-    modifyInScope env (bndr `setIdUnfolding` unf)
+  = warnPprTrace (not (eqType (idType bndr) (exprType tmpl)))
+          "unfolding type mismatch"
+          (ppr bndr $$ ppr (idType bndr) $$ ppr tmpl $$ ppr (exprType tmpl)) $
+          modifyInScope env (bndr `setIdUnfolding` unf)
 
   | otherwise
   = modifyInScope env (bndr `setIdUnfolding` unf)
@@ -3034,11 +3249,11 @@ even though it'll be over-ridden in every case alternative with a more
 informative unfolding.  Why?  Because suppose a later, less clever, pass
 simply replaces all occurrences of the case binder with the binder itself;
 then Lint may complain about the let/app invariant.  Example
-    case e of b { DEFAULT -> let v = reallyUnsafePtrEq# b y in ....
+    case e of b { DEFAULT -> let v = reallyUnsafePtrEquality# b y in ....
                 ; K       -> blah }
 
 The let/app invariant requires that y is evaluated in the call to
-reallyUnsafePtrEq#, which it is.  But we still want that to be true if we
+reallyUnsafePtrEquality#, which it is.  But we still want that to be true if we
 propagate binders to occurrences.
 
 This showed up in #13027.
@@ -3110,7 +3325,7 @@ knownCon :: SimplEnv
 
 knownCon env scrut dc_floats dc dc_ty_args dc_args bndr bs rhs cont
   = do  { (floats1, env1)  <- bind_args env bs dc_args
-        ; (floats2, env2) <- bind_case_bndr env1
+        ; (floats2, env2)  <- bind_case_bndr env1
         ; (floats3, expr') <- simplExprF env2 rhs cont
         ; case dc_floats of
             [] ->
@@ -3127,15 +3342,15 @@ knownCon env scrut dc_floats dc dc_ty_args dc_args bndr bs rhs cont
     bind_args env' [] _  = return (emptyFloats env', env')
 
     bind_args env' (b:bs') (Type ty : args)
-      = ASSERT( isTyVar b )
+      = assert (isTyVar b )
         bind_args (extendTvSubst env' b ty) bs' args
 
     bind_args env' (b:bs') (Coercion co : args)
-      = ASSERT( isCoVar b )
+      = assert (isCoVar b )
         bind_args (extendCvSubst env' b co) bs' args
 
     bind_args env' (b:bs') (arg : args)
-      = ASSERT( isId b )
+      = assert (isId b) $
         do { let b' = zap_occ b
              -- Note that the binder might be "dead", because it doesn't
              -- occur in the RHS; and simplNonRecX may therefore discard
@@ -3161,6 +3376,7 @@ knownCon env scrut dc_floats dc dc_ty_args dc_args bndr bs rhs cont
       | isDeadBinder bndr   = return (emptyFloats env, env)
       | exprIsTrivial scrut = return (emptyFloats env
                                      , extendIdSubst env bndr (DoneEx scrut Nothing))
+                              -- See Note [Do not duplicate constructor applications]
       | otherwise           = do { dc_args <- mapM (simplVar env) bs
                                          -- dc_ty_args are already OutTypes,
                                          -- but bs are InBndrs
@@ -3178,7 +3394,7 @@ missingAlt :: SimplEnv -> Id -> [InAlt] -> SimplCont
                 -- it "sees" that the entire branch of an outer case is
                 -- inaccessible.  So we simply put an error case here instead.
 missingAlt env case_bndr _ cont
-  = WARN( True, text "missingAlt" <+> ppr case_bndr )
+  = warnPprTrace True "missingAlt" (ppr case_bndr) $
     -- See Note [Avoiding space leaks in OutType]
     let cont_ty = contResultType cont
     in seqType cont_ty `seq`
@@ -3225,10 +3441,15 @@ join points and inlining them away.  See #4930.
 
 --------------------
 mkDupableCaseCont :: SimplEnv -> [InAlt] -> SimplCont
-                  -> SimplM (SimplFloats, SimplCont)
+                  -> SimplM ( SimplFloats  -- Join points (if any)
+                            , SimplEnv     -- Use this for the alts
+                            , SimplCont)
 mkDupableCaseCont env alts cont
-  | altsWouldDup alts = mkDupableCont env cont
-  | otherwise         = return (emptyFloats env, cont)
+  | altsWouldDup alts = do { (floats, cont) <- mkDupableCont env cont
+                           ; let env' = bumpCaseDepth $
+                                        env `setInScopeFromF` floats
+                           ; return (floats, env', cont) }
+  | otherwise         = return (emptyFloats env, env, cont)
 
 altsWouldDup :: [InAlt] -> Bool -- True iff strictly > 1 non-bottom alternative
 altsWouldDup []  = False        -- See Note [Bottom alternatives]
@@ -3236,8 +3457,9 @@ altsWouldDup [_] = False
 altsWouldDup (alt:alts)
   | is_bot_alt alt = altsWouldDup alts
   | otherwise      = not (all is_bot_alt alts)
+    -- otherwise case: first alt is non-bot, so all the rest must be bot
   where
-    is_bot_alt (_,_,rhs) = exprIsDeadEnd rhs
+    is_bot_alt (Alt _ _ rhs) = exprIsDeadEnd rhs
 
 -------------------------
 mkDupableCont :: SimplEnv
@@ -3268,14 +3490,14 @@ mkDupableContWithDmds env dmds (TickIt t cont)
         ; return (floats, TickIt t cont') }
 
 mkDupableContWithDmds env _
-     (StrictBind { sc_bndr = bndr, sc_bndrs = bndrs
-                 , sc_body = body, sc_env = se, sc_cont = cont})
+     (StrictBind { sc_bndr = bndr, sc_body = body
+                 , sc_env = se, sc_cont = cont})
 -- See Note [Duplicating StrictBind]
 -- K[ let x = <> in b ]  -->   join j x = K[ b ]
 --                             j <>
   = do { let sb_env = se `setInScopeFromE` env
        ; (sb_env1, bndr')      <- simplBinder sb_env bndr
-       ; (floats1, join_inner) <- simplLam sb_env1 bndrs body cont
+       ; (floats1, join_inner) <- simplLam sb_env1 body cont
           -- No need to use mkDupableCont before simplLam; we
           -- use cont once here, and then share the result if necessary
 
@@ -3295,7 +3517,7 @@ mkDupableContWithDmds env _
        ; (floats1, cont')  <- mkDupableContWithDmds env dmds cont
                               -- Use the demands from the function to add the right
                               -- demand info on any bindings we make for further args
-       ; (floats_s, args') <- mapAndUnzipM (makeTrivialArg (getMode env))
+       ; (floats_s, args') <- mapAndUnzipM (makeTrivialArg env)
                                            (ai_args fun)
        ; return ( foldl' addLetFloats floats1 floats_s
                 , StrictArg { sc_fun = fun { ai_args = args' }
@@ -3337,11 +3559,11 @@ mkDupableContWithDmds env dmds
         --              let a = ...arg...
         --              in [...hole...] a
         -- NB: sc_dup /= OkToDup; that is caught earlier by contIsDupable
-    do  { let (dmd:_) = dmds   -- Never fails
-        ; (floats1, cont') <- mkDupableContWithDmds env dmds cont
+    do  { let (dmd:cont_dmds) = dmds   -- Never fails
+        ; (floats1, cont') <- mkDupableContWithDmds env cont_dmds cont
         ; let env' = env `setInScopeFromF` floats1
         ; (_, se', arg') <- simplArg env' dup se arg
-        ; (let_floats2, arg'') <- makeTrivial (getMode env) NotTopLevel dmd (fsLit "karg") arg'
+        ; (let_floats2, arg'') <- makeTrivial env NotTopLevel dmd (fsLit "karg") arg'
         ; let all_floats = floats1 `addLetFloats` let_floats2
         ; return ( all_floats
                  , ApplyToVal { sc_arg = arg''
@@ -3361,12 +3583,11 @@ mkDupableContWithDmds env _
         --              in case [...hole...] of { pi -> ji xij }
         -- NB: sc_dup /= OkToDup; that is caught earlier by contIsDupable
     do  { tick (CaseOfCase case_bndr)
-        ; (floats, alt_cont) <- mkDupableCaseCont env alts cont
+        ; (floats, alt_env, alt_cont) <- mkDupableCaseCont (se `setInScopeFromE` env) alts cont
                 -- NB: We call mkDupableCaseCont here to make cont duplicable
                 --     (if necessary, depending on the number of alts)
                 -- And this is important: see Note [Fusing case continuations]
 
-        ; let alt_env = se `setInScopeFromF` floats
         ; let cont_scaling = contHoleScaling cont
           -- See Note [Scaling in case-of-case]
         ; (alt_env', case_bndr') <- simplBinder alt_env (scaleIdBy cont_scaling case_bndr)
@@ -3401,7 +3622,7 @@ mkDupableStrictBind :: SimplEnv -> OutId -> OutExpr -> OutType
 mkDupableStrictBind env arg_bndr join_rhs res_ty
   | exprIsTrivial join_rhs   -- See point (2) of Note [Duplicating join points]
   = return (emptyFloats env
-           , StrictBind { sc_bndr = arg_bndr, sc_bndrs = []
+           , StrictBind { sc_bndr = arg_bndr
                         , sc_body = join_rhs
                         , sc_env  = zapSubstEnv env
                           -- See Note [StaticEnv invariant] in GHC.Core.Opt.Simplify.Utils
@@ -3426,52 +3647,59 @@ mkDupableStrictBind env arg_bndr join_rhs res_ty
 mkDupableAlt :: Platform -> OutId
              -> JoinFloats -> OutAlt
              -> SimplM (JoinFloats, OutAlt)
-mkDupableAlt _platform case_bndr jfloats (con, bndrs', rhs')
-  | exprIsTrivial rhs'   -- See point (2) of Note [Duplicating join points]
-  = return (jfloats, (con, bndrs', rhs'))
+mkDupableAlt _platform case_bndr jfloats (Alt con alt_bndrs alt_rhs_in)
+  | exprIsTrivial alt_rhs_in   -- See point (2) of Note [Duplicating join points]
+  = return (jfloats, Alt con alt_bndrs alt_rhs_in)
 
   | otherwise
-  = do  { let rhs_ty'  = exprType rhs'
-              scrut_ty = idType case_bndr
-              case_bndr_w_unf
-                = case con of
-                      DEFAULT    -> case_bndr
-                      DataAlt dc -> setIdUnfolding case_bndr unf
-                          where
-                                 -- See Note [Case binders and join points]
-                             unf = mkInlineUnfolding rhs
-                             rhs = mkConApp2 dc (tyConAppArgs scrut_ty) bndrs'
+  = do  { let rhs_ty'  = exprType alt_rhs_in
 
-                      LitAlt {} -> WARN( True, text "mkDupableAlt"
-                                                <+> ppr case_bndr <+> ppr con )
-                                   case_bndr
-                           -- The case binder is alive but trivial, so why has
-                           -- it not been substituted away?
+              bangs
+                | DataAlt c <- con
+                = dataConRepStrictness c
+                | otherwise = []
 
-              final_bndrs'
-                | isDeadBinder case_bndr = filter abstract_over bndrs'
-                | otherwise              = bndrs' ++ [case_bndr_w_unf]
+              abstracted_binders = abstract_binders alt_bndrs bangs
 
-              abstract_over bndr
-                  | isTyVar bndr = True -- Abstract over all type variables just in case
-                  | otherwise    = not (isDeadBinder bndr)
-                        -- The deadness info on the new Ids is preserved by simplBinders
-              final_args = varsToCoreExprs final_bndrs'
+              abstract_binders :: [Var] -> [StrictnessMark] -> [(Id,StrictnessMark)]
+              abstract_binders [] []
+                -- Abstract over the case binder too if it's used.
+                | isDeadBinder case_bndr  = []
+                | otherwise               = [(case_bndr,MarkedStrict)]
+              abstract_binders (alt_bndr:alt_bndrs) marks
+                -- Abstract over all type variables just in case
+                | isTyVar alt_bndr        = (alt_bndr,NotMarkedStrict) : abstract_binders alt_bndrs marks
+              abstract_binders (alt_bndr:alt_bndrs) (mark:marks)
+                -- The deadness info on the new Ids is preserved by simplBinders
+                -- We don't abstract over dead ids here.
+                | isDeadBinder alt_bndr   = abstract_binders alt_bndrs marks
+                | otherwise               = (alt_bndr,mark) : abstract_binders alt_bndrs marks
+              abstract_binders _ _ = pprPanic "abstrict_binders - failed to abstract" (ppr $ Alt con alt_bndrs alt_rhs_in)
+
+              filtered_binders = map fst abstracted_binders
+              -- We want to make any binder with an evaldUnfolding strict in the rhs.
+              -- See Note [Call-by-value for worker args] (which also applies to join points)
+              (rhs_with_seqs) = mkStrictFieldSeqs abstracted_binders alt_rhs_in
+
+              final_args = varsToCoreExprs filtered_binders
                            -- Note [Join point abstraction]
 
                 -- We make the lambdas into one-shot-lambdas.  The
                 -- join point is sure to be applied at most once, and doing so
                 -- prevents the body of the join point being floated out by
                 -- the full laziness pass
-              really_final_bndrs     = map one_shot final_bndrs'
+              final_bndrs     = map one_shot filtered_binders
               one_shot v | isId v    = setOneShotLambda v
                          | otherwise = v
-              join_rhs   = mkLams really_final_bndrs rhs'
 
-        ; join_bndr <- newJoinId final_bndrs' rhs_ty'
+              -- No lambda binder has an unfolding, but (currently) case binders can,
+              -- so we must zap them here.
+              join_rhs   = mkLams (map zapIdUnfolding final_bndrs) rhs_with_seqs
+
+        ; join_bndr <- newJoinId filtered_binders rhs_ty'
 
         ; let join_call = mkApps (Var join_bndr) final_args
-              alt'      = (con, bndrs', join_call)
+              alt'      = Alt con alt_bndrs join_call
 
         ; return ( jfloats `addJoinFlts` unitJoinFloat (NonRec join_bndr join_rhs)
                  , alt') }
@@ -3708,7 +3936,7 @@ Pushing the call inward (being careful not to duplicate E)
 
 and now the (&& a F) etc can optimise.  Moreover there might
 be a RULE for the function that can fire when it "sees" the
-particular case alterantive.
+particular case alternative.
 
 But Plan A can have terrible, terrible behaviour. Here is a classic
 case:
@@ -3832,25 +4060,26 @@ because we don't know its usage in each RHS separately
 ************************************************************************
 -}
 
-simplLetUnfolding :: SimplEnv-> TopLevelFlag
-                  -> MaybeJoinCont
+simplLetUnfolding :: SimplEnv
+                  -> BindContext
                   -> InId
                   -> OutExpr -> OutType -> ArityType
                   -> Unfolding -> SimplM Unfolding
-simplLetUnfolding env top_lvl cont_mb id new_rhs rhs_ty arity unf
+simplLetUnfolding env bind_cxt id new_rhs rhs_ty arity unf
   | isStableUnfolding unf
-  = simplStableUnfolding env top_lvl cont_mb id rhs_ty arity unf
+  = simplStableUnfolding env bind_cxt id rhs_ty arity unf
   | isExitJoinId id
   = return noUnfolding -- See Note [Do not inline exit join points] in GHC.Core.Opt.Exitify
   | otherwise
-  = mkLetUnfolding (seDynFlags env) top_lvl InlineRhs id new_rhs
+  = -- Otherwise, we end up retaining all the SimpleEnv
+    let !opts = seUnfoldingOpts env
+    in mkLetUnfolding opts (bindContextLevel bind_cxt) InlineRhs id new_rhs
 
 -------------------
-mkLetUnfolding :: DynFlags -> TopLevelFlag -> UnfoldingSource
+mkLetUnfolding :: UnfoldingOpts -> TopLevelFlag -> UnfoldingSource
                -> InId -> OutExpr -> SimplM Unfolding
-mkLetUnfolding !dflags top_lvl src id new_rhs
-  = is_bottoming `seq`  -- See Note [Force bottoming field]
-    return (mkUnfolding dflags src is_top_lvl is_bottoming new_rhs)
+mkLetUnfolding !uf_opts top_lvl src id new_rhs
+  = return (mkUnfolding uf_opts src is_top_lvl is_bottoming new_rhs Nothing)
             -- We make an  unfolding *even for loop-breakers*.
             -- Reason: (a) It might be useful to know that they are WHNF
             --         (b) In GHC.Iface.Tidy we currently assume that, if we want to
@@ -3865,15 +4094,14 @@ mkLetUnfolding !dflags top_lvl src id new_rhs
     !is_bottoming = isDeadEndId id
 
 -------------------
-simplStableUnfolding :: SimplEnv -> TopLevelFlag
-                     -> MaybeJoinCont  -- Just k => a join point with continuation k
+simplStableUnfolding :: SimplEnv -> BindContext
                      -> InId
                      -> OutType
                      -> ArityType      -- Used to eta expand, but only for non-join-points
                      -> Unfolding
                      ->SimplM Unfolding
 -- Note [Setting the new unfolding]
-simplStableUnfolding env top_lvl mb_cont id rhs_ty id_arity unf
+simplStableUnfolding env bind_cxt id rhs_ty id_arity unf
   = case unf of
       NoUnfolding   -> return unf
       BootUnfolding -> return unf
@@ -3886,11 +4114,11 @@ simplStableUnfolding env top_lvl mb_cont id rhs_ty id_arity unf
 
       CoreUnfolding { uf_tmpl = expr, uf_src = src, uf_guidance = guide }
         | isStableSource src
-        -> do { expr' <- case mb_cont of
-                           Just cont -> -- Binder is a join point
-                                        -- See Note [Rules and unfolding for join points]
-                                        simplJoinRhs unf_env id expr cont
-                           Nothing   -> -- Binder is not a join point
+        -> do { expr' <- case bind_cxt of
+                           BC_Join cont -> -- Binder is a join point
+                                           -- See Note [Rules and unfolding for join points]
+                                           simplJoinRhs unf_env id expr cont
+                           BC_Let {} -> -- Binder is not a join point
                                         do { expr' <- simplExprC unf_env expr (mkBoringStop rhs_ty)
                                            ; return (eta_expand expr') }
               ; case guide of
@@ -3918,20 +4146,21 @@ simplStableUnfolding env top_lvl mb_cont id rhs_ty id_arity unf
                         -- A test case is #4138
                         -- But retain a previous boring_ok of True; e.g. see
                         -- the way it is set in calcUnfoldingGuidanceWithArity
-                        in return (mkCoreUnfolding src is_top_lvl expr' guide')
+                        in return (mkCoreUnfolding src is_top_lvl expr' Nothing guide')
                             -- See Note [Top-level flag on inline rules] in GHC.Core.Unfold
 
                   _other              -- Happens for INLINABLE things
-                     -> mkLetUnfolding dflags top_lvl src id expr' }
+                     -> mkLetUnfolding uf_opts top_lvl src id expr' }
                 -- If the guidance is UnfIfGoodArgs, this is an INLINABLE
                 -- unfolding, and we need to make sure the guidance is kept up
                 -- to date with respect to any changes in the unfolding.
 
         | otherwise -> return noUnfolding   -- Discard unstable unfoldings
   where
-    dflags     = seDynFlags env
+    uf_opts    = seUnfoldingOpts env
     -- Forcing this can save about 0.5MB of max residency and the result
     -- is small and easy to compute so might as well force it.
+    top_lvl     = bindContextLevel bind_cxt
     !is_top_lvl = isTopLevel top_lvl
     act        = idInlineActivation id
     unf_env    = updMode (updModeForStableUnfoldings act) env
@@ -3941,7 +4170,7 @@ simplStableUnfolding env top_lvl mb_cont id rhs_ty id_arity unf
     eta_expand expr
       | not eta_on         = expr
       | exprIsTrivial expr = expr
-      | otherwise          = etaExpandAT id_arity expr
+      | otherwise          = etaExpandAT (getInScope env) id_arity expr
     eta_on = sm_eta_expand (getMode env)
 
 {- Note [Eta-expand stable unfoldings]
@@ -3965,12 +4194,17 @@ Generally, if we know that 'f' has arity N, it seems sensible to
 eta-expand the stable unfolding to arity N too. Simple and consistent.
 
 Wrinkles
+
+* See Note [Eta-expansion in stable unfoldings] in
+  GHC.Core.Opt.Simplify.Utils
+
 * Don't eta-expand a trivial expr, else each pass will eta-reduce it,
   and then eta-expand again. See Note [Do not eta-expand trivial expressions]
   in GHC.Core.Opt.Simplify.Utils.
+
 * Don't eta-expand join points; see Note [Do not eta-expand join points]
   in GHC.Core.Opt.Simplify.Utils.  We uphold this because the join-point
-  case (mb_cont = Just _) doesn't use eta_expand.
+  case (bind_cxt = BC_Join _) doesn't use eta_expand.
 
 Note [Force bottoming field]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -4011,37 +4245,43 @@ See Note [Forming Rec groups] in "GHC.Core.Opt.OccurAnal"
 -}
 
 addBndrRules :: SimplEnv -> InBndr -> OutBndr
-             -> MaybeJoinCont   -- Just k for a join point binder
-                                -- Nothing otherwise
+             -> BindContext
              -> SimplM (SimplEnv, OutBndr)
 -- Rules are added back into the bin
-addBndrRules env in_id out_id mb_cont
+addBndrRules env in_id out_id bind_cxt
   | null old_rules
   = return (env, out_id)
   | otherwise
-  = do { new_rules <- simplRules env (Just out_id) old_rules mb_cont
+  = do { new_rules <- simplRules env (Just out_id) old_rules bind_cxt
        ; let final_id  = out_id `setIdSpecialisation` mkRuleInfo new_rules
        ; return (modifyInScope env final_id, final_id) }
   where
     old_rules = ruleInfoRules (idSpecialisation in_id)
 
+simplImpRules :: SimplEnv -> [CoreRule] -> SimplM [CoreRule]
+-- Simplify local rules for imported Ids
+simplImpRules env rules
+  = simplRules env Nothing rules (BC_Let TopLevel NonRecursive)
+
 simplRules :: SimplEnv -> Maybe OutId -> [CoreRule]
-           -> MaybeJoinCont -> SimplM [CoreRule]
-simplRules env mb_new_id rules mb_cont
+           -> BindContext -> SimplM [CoreRule]
+simplRules env mb_new_id rules bind_cxt
   = mapM simpl_rule rules
   where
     simpl_rule rule@(BuiltinRule {})
       = return rule
 
     simpl_rule rule@(Rule { ru_bndrs = bndrs, ru_args = args
-                          , ru_fn = fn_name, ru_rhs = rhs })
+                          , ru_fn = fn_name, ru_rhs = rhs
+                          , ru_act = act })
       = do { (env', bndrs') <- simplBinders env bndrs
            ; let rhs_ty = substTy env' (exprType rhs)
-                 rhs_cont = case mb_cont of  -- See Note [Rules and unfolding for join points]
-                                Nothing   -> mkBoringStop rhs_ty
-                                Just cont -> ASSERT2( join_ok, bad_join_msg )
-                                             cont
-                 rule_env = updMode updModeForRules env'
+                 rhs_cont = case bind_cxt of  -- See Note [Rules and unfolding for join points]
+                                BC_Let {}    -> mkBoringStop rhs_ty
+                                BC_Join cont -> assertPpr join_ok bad_join_msg cont
+                 lhs_env = updMode updModeForRules env'
+                 rhs_env = updMode (updModeForStableUnfoldings act) env'
+                           -- See Note [Simplifying the RHS of a RULE]
                  fn_name' = case mb_new_id of
                               Just id -> idName id
                               Nothing -> fn_name
@@ -4056,9 +4296,22 @@ simplRules env mb_new_id rules mb_cont
                  bad_join_msg = vcat [ ppr mb_new_id, ppr rule
                                      , ppr (fmap isJoinId_maybe mb_new_id) ]
 
-           ; args' <- mapM (simplExpr rule_env) args
-           ; rhs'  <- simplExprC rule_env rhs rhs_cont
+           ; args' <- mapM (simplExpr lhs_env) args
+           ; rhs'  <- simplExprC rhs_env rhs rhs_cont
            ; return (rule { ru_bndrs = bndrs'
                           , ru_fn    = fn_name'
                           , ru_args  = args'
-                          , ru_rhs   = rhs' }) }
+                          , ru_rhs   = occurAnalyseExpr rhs' }) }
+                            -- Remember to occ-analyse, to drop dead code.
+                            -- See Note [OccInfo in unfoldings and rules] in GHC.Core
+
+{- Note [Simplifying the RHS of a RULE]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We can simplify the RHS of a RULE much as we do the RHS of a stable
+unfolding.  We used to use the much more conservative updModeForRules
+for the RHS as well as the LHS, but that seems more conservative
+than necesary.  Allowing some inlining might, for example, eliminate
+a binding.
+-}
+
+

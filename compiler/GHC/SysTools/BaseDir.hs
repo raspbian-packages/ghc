@@ -17,11 +17,9 @@ module GHC.SysTools.BaseDir
   , tryFindTopDir
   ) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
--- See note [Base Dir] for why some of this logic is shared with ghc-pkg.
+-- See Note [Base Dir] for why some of this logic is shared with ghc-pkg.
 import GHC.BaseDir
 
 import GHC.Utils.Panic
@@ -37,7 +35,6 @@ import System.Directory (doesDirectoryExist)
 {-
 Note [topdir: How GHC finds its files]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 GHC needs various support files (library packages, RTS etc), plus
 various auxiliary programs (cp, gcc, etc).  It starts by finding topdir,
 the root of GHC's support files
@@ -56,7 +53,7 @@ from topdir we can find package.conf, ghc-asm, etc.
 
 
 Note [tooldir: How GHC finds mingw on Windows]
-
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 GHC has some custom logic on Windows for finding the mingw
 toolchain and perl. Depending on whether GHC is built
 with the make build system or Hadrian, and on whether we're
@@ -102,7 +99,7 @@ make)
   set in `aclocal.m4`. This allows the rest of the build system to have access
   to these and other values determined by configure.
 
-  Based on this file, `includes/ghc.mk` when ran will produce the settings file
+  Based on this file, `rts/include/ghc.mk` when ran will produce the settings file
   by echoing the values into a the final file.  Coincidentally this is also
   where `ghcplatform.h` and `ghcversion.h` generated which contains information
   about the build platform and sets CPP for use by the entire build.
@@ -120,7 +117,7 @@ hadrian)
 
   The last part of this is the `generateSettings` in `src/Rules/Generate.hs`
   which produces the desired settings file out of Hadrian. This is the
-  equivalent to `includes/ghc.mk`.
+  equivalent to `rts/include/ghc.mk`.
 
 --
 
@@ -141,12 +138,16 @@ play nice with the system compiler instead.
 
 -- | Expand occurrences of the @$tooldir@ interpolation in a string
 -- on Windows, leave the string untouched otherwise.
-expandToolDir :: Maybe FilePath -> String -> String
-#if defined(mingw32_HOST_OS) && !defined(USE_INPLACE_MINGW_TOOLCHAIN)
-expandToolDir (Just tool_dir) s = expandPathVar "tooldir" tool_dir s
-expandToolDir Nothing         _ = panic "Could not determine $tooldir"
+expandToolDir
+  :: Bool -- ^ whether we are use the ambiant mingw toolchain
+  -> Maybe FilePath -- ^ tooldir
+  -> String -> String
+#if defined(mingw32_HOST_OS)
+expandToolDir False (Just tool_dir) s = expandPathVar "tooldir" tool_dir s
+expandToolDir False Nothing         _ = panic "Could not determine $tooldir"
+expandToolDir True  _               s = s
 #else
-expandToolDir _ s = s
+expandToolDir _ _ s = s
 #endif
 
 -- | Returns a Unix-format path pointing to TopDir.
@@ -182,20 +183,24 @@ tryFindTopDir Nothing
 -- tooldir can't be located, or returns @Just tooldirpath@.
 -- If the distro toolchain is being used we treat Windows the same as Linux
 findToolDir
-  :: FilePath -- ^ topdir
+  :: Bool -- ^ whether we are use the ambiant mingw toolchain
+  -> FilePath -- ^ topdir
   -> IO (Maybe FilePath)
-#if defined(mingw32_HOST_OS) && !defined(USE_INPLACE_MINGW_TOOLCHAIN)
-findToolDir top_dir = go 0 (top_dir </> "..")
+#if defined(mingw32_HOST_OS)
+findToolDir False top_dir = go 0 (top_dir </> "..") []
   where maxDepth = 3
-        go :: Int -> FilePath -> IO (Maybe FilePath)
-        go k path
+        go :: Int -> FilePath -> [FilePath] -> IO (Maybe FilePath)
+        go k path tried
           | k == maxDepth = throwGhcExceptionIO $
-              InstallationError "could not detect mingw toolchain"
+              InstallationError $ "could not detect mingw toolchain in the following paths: " ++ show tried
           | otherwise = do
-              oneLevel <- doesDirectoryExist (path </> "mingw")
+              let try = path </> "mingw"
+              let tried' = tried ++ [try]
+              oneLevel <- doesDirectoryExist try
               if oneLevel
                 then return (Just path)
-                else go (k+1) (path </> "..")
+                else go (k+1) (path </> "..") tried'
+findToolDir True _ = return Nothing
 #else
-findToolDir _ = return Nothing
+findToolDir _ _ = return Nothing
 #endif

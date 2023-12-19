@@ -5,7 +5,7 @@
 \section[Id]{@Ids@: Value and constructor identifiers}
 -}
 
-{-# LANGUAGE CPP #-}
+
 
 -- |
 -- #name_types#
@@ -46,6 +46,7 @@ module GHC.Types.Id (
         -- ** Taking an Id apart
         idName, idType, idMult, idScaledType, idUnique, idInfo, idDetails,
         recordSelectorTyCon,
+        recordSelectorTyCon_maybe,
 
         -- ** Modifying an Id
         setIdName, setIdUnique, GHC.Types.Id.setIdType, setIdMult,
@@ -55,7 +56,7 @@ module GHC.Types.Id (
         setIdInfo, lazySetIdInfo, modifyIdInfo, maybeModifyIdInfo,
         zapLamIdInfo, zapIdDemandInfo, zapIdUsageInfo, zapIdUsageEnvInfo,
         zapIdUsedOnceInfo, zapIdTailCallInfo,
-        zapFragileIdInfo, zapIdStrictness, zapStableUnfolding,
+        zapFragileIdInfo, zapIdDmdSig, zapStableUnfolding,
         transferPolyIdInfo, scaleIdBy, scaleVarBy,
 
         -- ** Predicates on Ids
@@ -65,6 +66,7 @@ module GHC.Types.Id (
         isRecordSelector, isNaughtyRecordSelector,
         isPatSynRecordSelector,
         isDataConRecordSelector,
+        isClassOpId,
         isClassOpId_maybe, isDFunId,
         isPrimOpId, isPrimOpId_maybe,
         isFCallId, isFCallId_maybe,
@@ -72,7 +74,7 @@ module GHC.Types.Id (
         isDataConWrapId, isDataConWrapId_maybe,
         isDataConId_maybe,
         idDataCon,
-        isConLikeId, isDeadEndId, idIsFrom,
+        isConLikeId, isWorkerLikeId, isDeadEndId, idIsFrom,
         hasNoBinding,
 
         -- ** Join variables
@@ -97,10 +99,10 @@ module GHC.Types.Id (
         idCafInfo, idLFInfo_maybe,
         idOneShotInfo, idStateHackOneShotInfo,
         idOccInfo,
-        isNeverLevPolyId,
+        isNeverRepPolyId,
 
         -- ** Writing 'IdInfo' fields
-        setIdUnfolding, setCaseBndrEvald,
+        setIdUnfolding, zapIdUnfolding, setCaseBndrEvald,
         setIdArity,
         setIdCallArity,
 
@@ -110,22 +112,25 @@ module GHC.Types.Id (
         setIdLFInfo,
 
         setIdDemandInfo,
-        setIdStrictness,
-        setIdCprInfo,
+        setIdDmdSig,
+        setIdCprSig,
+        setIdCbvMarks,
+        idCbvMarks_maybe,
+        idCbvMarkArity,
+        asWorkerLikeId, asNonWorkerLikeId,
 
         idDemandInfo,
-        idStrictness,
-        idCprInfo,
+        idDmdSig,
+        idCprSig,
 
+        idTagSig_maybe,
+        setIdTagSig
     ) where
-
-#include "HsVersions.h"
 
 import GHC.Prelude
 
-import GHC.Driver.Session
 import GHC.Core ( CoreRule, isStableUnfolding, evaldUnfolding,
-                 isCompulsoryUnfolding, Unfolding( NoUnfolding ) )
+                 isCompulsoryUnfolding, Unfolding( NoUnfolding ), isEvaldUnfolding, hasSomeUnfolding, noUnfolding )
 
 import GHC.Types.Id.Info
 import GHC.Types.Basic
@@ -152,12 +157,19 @@ import {-# SOURCE #-} GHC.Builtin.PrimOps (PrimOp)
 import GHC.Types.ForeignCall
 import GHC.Data.Maybe
 import GHC.Types.SrcLoc
-import GHC.Utils.Outputable
 import GHC.Types.Unique
+import GHC.Builtin.Uniques (mkBuiltinUnique)
 import GHC.Types.Unique.Supply
 import GHC.Data.FastString
-import GHC.Utils.Misc
 import GHC.Core.Multiplicity
+
+import GHC.Utils.Misc
+import GHC.Utils.Outputable
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
+import GHC.Utils.GlobalVars
+import GHC.Utils.Trace
+import GHC.Stg.InferTags.TagSig
 
 -- infixl so you can say (id `set` a `set` b)
 infixl  1 `setIdUnfolding`,
@@ -172,11 +184,12 @@ infixl  1 `setIdUnfolding`,
           `idCafInfo`,
 
           `setIdDemandInfo`,
-          `setIdStrictness`,
-          `setIdCprInfo`,
+          `setIdDmdSig`,
+          `setIdCprSig`,
 
           `asJoinId`,
-          `asJoinId_maybe`
+          `asJoinId_maybe`,
+          `setIdCbvMarks`
 
 {-
 ************************************************************************
@@ -232,7 +245,7 @@ localiseId :: Id -> Id
 -- Make an Id with the same unique and type as the
 -- incoming Id, but with an *Internal* Name and *LocalId* flavour
 localiseId id
-  | ASSERT( isId id ) isLocalId id && isInternalName name
+  | assert (isId id) $ isLocalId id && isInternalName name
   = id
   | otherwise
   = Var.mkLocalVar (idDetails id) (localiseName name) (Var.varMult id) (idType id) (idInfo id)
@@ -253,6 +266,11 @@ modifyIdInfo fn id = setIdInfo id (fn (idInfo id))
 maybeModifyIdInfo :: Maybe IdInfo -> Id -> Id
 maybeModifyIdInfo (Just new_info) id = lazySetIdInfo id new_info
 maybeModifyIdInfo Nothing         id = id
+
+-- maybeModifyIdInfo tries to avoid unnecessary thrashing
+maybeModifyIdDetails :: Maybe IdDetails  -> Id -> Id
+maybeModifyIdDetails (Just new_details) id = setIdDetails id new_details
+maybeModifyIdDetails Nothing         id = id
 
 {-
 ************************************************************************
@@ -291,19 +309,18 @@ mkVanillaGlobalWithInfo = mkGlobalId VanillaId
 
 -- | For an explanation of global vs. local 'Id's, see "GHC.Types.Var#globalvslocal"
 mkLocalId :: HasDebugCallStack => Name -> Mult -> Type -> Id
-mkLocalId name w ty = ASSERT( not (isCoVarType ty) )
-                      mkLocalIdWithInfo name w ty vanillaIdInfo
+mkLocalId name w ty = mkLocalIdWithInfo name w (assert (not (isCoVarType ty)) ty) vanillaIdInfo
 
 -- | Make a local CoVar
 mkLocalCoVar :: Name -> Type -> CoVar
 mkLocalCoVar name ty
-  = ASSERT( isCoVarType ty )
+  = assert (isCoVarType ty) $
     Var.mkLocalVar CoVarId name Many ty vanillaIdInfo
 
 -- | Like 'mkLocalId', but checks the type to see if it should make a covar
 mkLocalIdOrCoVar :: Name -> Mult -> Type -> Id
 mkLocalIdOrCoVar name w ty
-  -- We should ASSERT(eqType w Many) in the isCoVarType case.
+  -- We should assert (eqType w Many) in the isCoVarType case.
   -- However, currently this assertion does not hold.
   -- In tests with -fdefer-type-errors, such as T14584a,
   -- we create a linear 'case' where the scrutinee is a coercion
@@ -313,8 +330,8 @@ mkLocalIdOrCoVar name w ty
 
     -- proper ids only; no covars!
 mkLocalIdWithInfo :: HasDebugCallStack => Name -> Mult -> Type -> IdInfo -> Id
-mkLocalIdWithInfo name w ty info = ASSERT( not (isCoVarType ty) )
-                                   Var.mkLocalVar VanillaId name w ty info
+mkLocalIdWithInfo name w ty info =
+  Var.mkLocalVar VanillaId name w (assert (not (isCoVarType ty)) ty) info
         -- Note [Free type variables]
 
 -- | Create a local 'Id' that is marked as exported.
@@ -332,7 +349,7 @@ mkExportedVanillaId name ty = Var.mkExportedLocalVar VanillaId name ty vanillaId
 -- | Create a system local 'Id'. These are local 'Id's (see "Var#globalvslocal")
 -- that are created by the compiler out of thin air
 mkSysLocal :: FastString -> Unique -> Mult -> Type -> Id
-mkSysLocal fs uniq w ty = ASSERT( not (isCoVarType ty) )
+mkSysLocal fs uniq w ty = assert (not (isCoVarType ty)) $
                         mkLocalId (mkSystemVarName uniq fs) w ty
 
 -- | Like 'mkSysLocal', but checks to see if we have a covar type
@@ -349,7 +366,7 @@ mkSysLocalOrCoVarM fs w ty
 
 -- | Create a user local 'Id'. These are local 'Id's (see "GHC.Types.Var#globalvslocal") with a name and location that the user might recognize
 mkUserLocal :: OccName -> Unique -> Mult -> Type -> SrcSpan -> Id
-mkUserLocal occ uniq w ty loc = ASSERT( not (isCoVarType ty) )
+mkUserLocal occ uniq w ty loc = assert (not (isCoVarType ty)) $
                                 mkLocalId (mkInternalName uniq occ loc) w ty
 
 -- | Like 'mkUserLocal', but checks if we have a coercion type
@@ -433,10 +450,15 @@ That is what is happening in, say tidy_insts in GHC.Iface.Tidy.
 -- | If the 'Id' is that for a record selector, extract the 'sel_tycon'. Panic otherwise.
 recordSelectorTyCon :: Id -> RecSelParent
 recordSelectorTyCon id
-  = case Var.idDetails id of
-        RecSelId { sel_tycon = parent } -> parent
+  = case recordSelectorTyCon_maybe id of
+        Just parent -> parent
         _ -> panic "recordSelectorTyCon"
 
+recordSelectorTyCon_maybe :: Id -> Maybe RecSelParent
+recordSelectorTyCon_maybe id
+  = case Var.idDetails id of
+        RecSelId { sel_tycon = parent } -> Just parent
+        _ -> Nothing
 
 isRecordSelector        :: Id -> Bool
 isNaughtyRecordSelector :: Id -> Bool
@@ -447,6 +469,7 @@ isFCallId               :: Id -> Bool
 isDataConWorkId         :: Id -> Bool
 isDataConWrapId         :: Id -> Bool
 isDFunId                :: Id -> Bool
+isClassOpId             :: Id -> Bool
 
 isClassOpId_maybe       :: Id -> Maybe Class
 isPrimOpId_maybe        :: Id -> Maybe PrimOp
@@ -469,6 +492,10 @@ isPatSynRecordSelector id = case Var.idDetails id of
 isNaughtyRecordSelector id = case Var.idDetails id of
                         RecSelId { sel_naughty = n } -> n
                         _                               -> False
+
+isClassOpId id = case Var.idDetails id of
+                        ClassOpId _   -> True
+                        _other        -> False
 
 isClassOpId_maybe id = case Var.idDetails id of
                         ClassOpId cls -> Just cls
@@ -516,6 +543,15 @@ isDataConId_maybe id = case Var.idDetails id of
                          DataConWrapId con -> Just con
                          _                 -> Nothing
 
+-- | An Id for which we might require all callers to pass strict arguments properly tagged + evaluated.
+--
+-- See Note [CBV Function Ids]
+isWorkerLikeId :: Id -> Bool
+isWorkerLikeId id = case Var.idDetails id of
+  WorkerLikeId _  -> True
+  JoinId _ Just{}   -> True
+  _                 -> False
+
 isJoinId :: Var -> Bool
 -- It is convenient in GHC.Core.Opt.SetLevels.lvlMFE to apply isJoinId
 -- to the free vars of an expression, so it's convenient
@@ -526,11 +562,12 @@ isJoinId id
                 _         -> False
   | otherwise = False
 
+-- | Doesn't return strictness marks
 isJoinId_maybe :: Var -> Maybe JoinArity
 isJoinId_maybe id
- | isId id  = ASSERT2( isId id, ppr id )
+ | isId id  = assertPpr (isId id) (ppr id) $
               case Var.idDetails id of
-                JoinId arity -> Just arity
+                JoinId arity _marks -> Just arity
                 _            -> Nothing
  | otherwise = Nothing
 
@@ -551,9 +588,21 @@ hasNoBinding :: Id -> Bool
 hasNoBinding id = case Var.idDetails id of
                         PrimOpId _       -> True    -- See Note [Eta expanding primops] in GHC.Builtin.PrimOps
                         FCallId _        -> True
-                        DataConWorkId dc -> isUnboxedTupleCon dc || isUnboxedSumCon dc
-                        _                -> isCompulsoryUnfolding (idUnfolding id)
-                                            -- See Note [Levity-polymorphic Ids]
+                        DataConWorkId dc -> isUnboxedTupleDataCon dc || isUnboxedSumDataCon dc
+                        _                -> isCompulsoryUnfolding (realIdUnfolding id)
+  -- Note: this function must be very careful not to force
+  -- any of the fields that aren't the 'uf_src' field of
+  -- the 'Unfolding' of the 'Id'. This is because these fields are computed
+  -- in terms of the 'uf_tmpl' field, which is not available
+  -- until we have finished Core Lint for the unfolding, which calls 'hasNoBinding'
+  -- in 'checkCanEtaExpand'.
+  --
+  -- In particular, calling 'idUnfolding' rather than 'realIdUnfolding' here can
+  -- force the 'uf_tmpl' field, because 'trimUnfolding' forces the 'uf_is_value' field,
+  -- and this field is usually computed in terms of the 'uf_tmpl' field,
+  -- so we will force that as well.
+  --
+  -- See Note [Lazily checking Unfoldings] in GHC.IfaceToCore.
 
 isImplicitId :: Id -> Bool
 -- ^ 'isImplicitId' tells whether an 'Id's info is implied by other
@@ -575,26 +624,6 @@ isImplicitId id
 idIsFrom :: Module -> Id -> Bool
 idIsFrom mod id = nameIsLocalOrFrom mod (idName id)
 
-{- Note [Levity-polymorphic Ids]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Some levity-polymorphic Ids must be applied and inlined, not left
-un-saturated.  Example:
-  unsafeCoerceId :: forall r1 r2 (a::TYPE r1) (b::TYPE r2). a -> b
-
-This has a compulsory unfolding because we can't lambda-bind those
-arguments.  But the compulsory unfolding may leave levity-polymorphic
-lambdas if it is not applied to enough arguments; e.g. (#14561)
-  bad :: forall (a :: TYPE r). a -> a
-  bad = unsafeCoerce#
-
-The desugar has special magic to detect such cases: GHC.HsToCore.Expr.badUseOfLevPolyPrimop.
-And we want that magic to apply to levity-polymorphic compulsory-inline things.
-The easiest way to do this is for hasNoBinding to return True of all things
-that have compulsory unfolding.  Some Ids with a compulsory unfolding also
-have a binding, but it does not harm to say they don't here, and its a very
-simple way to fix #14561.
--}
-
 isDeadBinder :: Id -> Bool
 isDeadBinder bndr | isId bndr = isDeadOcc (idOccInfo bndr)
                   | otherwise = False   -- TyVars count as not dead
@@ -611,23 +640,34 @@ idJoinArity :: JoinId -> JoinArity
 idJoinArity id = isJoinId_maybe id `orElse` pprPanic "idJoinArity" (ppr id)
 
 asJoinId :: Id -> JoinArity -> JoinId
-asJoinId id arity = WARN(not (isLocalId id),
-                         text "global id being marked as join var:" <+> ppr id)
-                    WARN(not (is_vanilla_or_join id),
-                         ppr id <+> pprIdDetails (idDetails id))
-                    id `setIdDetails` JoinId arity
+asJoinId id arity = warnPprTrace (not (isLocalId id))
+                         "global id being marked as join var"  (ppr id) $
+                    warnPprTrace (not (is_vanilla_or_join id))
+                         "asJoinId"
+                         (ppr id <+> pprIdDetails (idDetails id)) $
+                    id `setIdDetails` JoinId arity (idCbvMarks_maybe id)
   where
     is_vanilla_or_join id = case Var.idDetails id of
                               VanillaId -> True
+                              -- Can workers become join ids? Yes!
+                              WorkerLikeId {} -> pprTraceDebug "asJoinId (call by value function)" (ppr id) True
                               JoinId {} -> True
                               _         -> False
 
 zapJoinId :: Id -> Id
 -- May be a regular id already
-zapJoinId jid | isJoinId jid = zapIdTailCallInfo (jid `setIdDetails` VanillaId)
+zapJoinId jid | isJoinId jid = zapIdTailCallInfo (newIdDetails `seq` jid `setIdDetails` newIdDetails)
                                  -- Core Lint may complain if still marked
                                  -- as AlwaysTailCalled
               | otherwise    = jid
+              where
+                newIdDetails = case idDetails jid of
+                  -- We treat join points as CBV functions. Even after they are floated out.
+                  -- See Note [Use CBV semantics only for join points and workers]
+                  JoinId _ (Just marks) -> WorkerLikeId marks
+                  JoinId _ Nothing      -> WorkerLikeId []
+                  _                     -> panic "zapJoinId: newIdDetails can only be used if Id was a join Id."
+
 
 asJoinId_maybe :: Id -> Maybe JoinArity -> Id
 asJoinId_maybe id (Just arity) = asJoinId id arity
@@ -655,6 +695,8 @@ idCallArity id = callArityInfo (idInfo id)
 setIdCallArity :: Id -> Arity -> Id
 setIdCallArity id arity = modifyIdInfo (`setCallArityInfo` arity) id
 
+-- | This function counts all arguments post-unarisation, which includes
+-- arguments with no runtime representation -- see Note [Unarisation and arity]
 idFunRepArity :: Id -> RepArity
 idFunRepArity x = countFunRepArgs (idArity x) (idType x)
 
@@ -662,24 +704,24 @@ idFunRepArity x = countFunRepArgs (idArity x) (idType x)
 -- See Note [Dead ends] in "GHC.Types.Demand".
 isDeadEndId :: Var -> Bool
 isDeadEndId v
-  | isId v    = isDeadEndSig (idStrictness v)
+  | isId v    = isDeadEndSig (idDmdSig v)
   | otherwise = False
 
--- | Accesses the 'Id''s 'strictnessInfo'.
-idStrictness :: Id -> StrictSig
-idStrictness id = strictnessInfo (idInfo id)
+-- | Accesses the 'Id''s 'dmdSigInfo'.
+idDmdSig :: Id -> DmdSig
+idDmdSig id = dmdSigInfo (idInfo id)
 
-setIdStrictness :: Id -> StrictSig -> Id
-setIdStrictness id sig = modifyIdInfo (`setStrictnessInfo` sig) id
+setIdDmdSig :: Id -> DmdSig -> Id
+setIdDmdSig id sig = modifyIdInfo (`setDmdSigInfo` sig) id
 
-idCprInfo :: Id -> CprSig
-idCprInfo id = cprInfo (idInfo id)
+idCprSig :: Id -> CprSig
+idCprSig id = cprSigInfo (idInfo id)
 
-setIdCprInfo :: Id -> CprSig -> Id
-setIdCprInfo id sig = modifyIdInfo (\info -> setCprInfo info sig) id
+setIdCprSig :: Id -> CprSig -> Id
+setIdCprSig id sig = modifyIdInfo (\info -> setCprSigInfo info sig) id
 
-zapIdStrictness :: Id -> Id
-zapIdStrictness id = modifyIdInfo (`setStrictnessInfo` nopSig) id
+zapIdDmdSig :: Id -> Id
+zapIdDmdSig id = modifyIdInfo (`setDmdSigInfo` nopSig) id
 
 -- | This predicate says whether the 'Id' has a strict demand placed on it or
 -- has a type such that it can always be evaluated strictly (i.e an
@@ -689,26 +731,28 @@ zapIdStrictness id = modifyIdInfo (`setStrictnessInfo` nopSig) id
 -- type, we still want @isStrictId id@ to be @True@.
 isStrictId :: Id -> Bool
 isStrictId id
-  = ASSERT2( isId id, text "isStrictId: not an id: " <+> ppr id )
-         not (isJoinId id) && (
-           (isStrictType (idType id)) ||
-           -- Take the best of both strictnesses - old and new
-           (isStrictDmd (idDemandInfo id))
-         )
+  | assertPpr (isId id) (text "isStrictId: not an id: " <+> ppr id) $
+    isJoinId id = False
+  | otherwise   = isStrictType (idType id) ||
+                  isStrUsedDmd (idDemandInfo id)
+                  -- Take the best of both strictnesses - old and new
 
-        ---------------------------------
-        -- UNFOLDING
+idTagSig_maybe :: Id -> Maybe TagSig
+idTagSig_maybe = tagSig . idInfo
+
+---------------------------------
+-- UNFOLDING
+
+-- | Returns the 'Id's unfolding, but does not expose the unfolding of a strong
+-- loop breaker. See 'unfoldingInfo'.
+--
+-- If you really want the unfolding of a strong loopbreaker, call 'realIdUnfolding'.
 idUnfolding :: Id -> Unfolding
--- Do not expose the unfolding of a loop breaker!
-idUnfolding id
-  | isStrongLoopBreaker (occInfo info) = NoUnfolding
-  | otherwise                          = unfoldingInfo info
-  where
-    info = idInfo id
+idUnfolding id = unfoldingInfo (idInfo id)
 
 realIdUnfolding :: Id -> Unfolding
--- Expose the unfolding if there is one, including for loop breakers
-realIdUnfolding id = unfoldingInfo (idInfo id)
+-- ^ Expose the unfolding if there is one, including for loop breakers
+realIdUnfolding id = realUnfoldingInfo (idInfo id)
 
 setIdUnfolding :: Id -> Unfolding -> Id
 setIdUnfolding id unfolding = modifyIdInfo (`setUnfoldingInfo` unfolding) id
@@ -719,6 +763,69 @@ idDemandInfo       id = demandInfo (idInfo id)
 setIdDemandInfo :: Id -> Demand -> Id
 setIdDemandInfo id dmd = modifyIdInfo (`setDemandInfo` dmd) id
 
+setIdTagSig :: Id -> TagSig -> Id
+setIdTagSig id sig = modifyIdInfo (`setTagSig` sig) id
+
+-- | If all marks are NotMarkedStrict we just set nothing.
+setIdCbvMarks :: Id -> [CbvMark] -> Id
+setIdCbvMarks id marks
+  | not (any isMarkedCbv marks) = id
+  | otherwise =
+      -- pprTrace "setMarks:" (ppr id <> text ":" <> ppr marks) $
+      case idDetails id of
+        -- good ol (likely worker) function
+        VanillaId ->      id `setIdDetails` (WorkerLikeId trimmedMarks)
+        JoinId arity _ -> id `setIdDetails` (JoinId arity (Just trimmedMarks))
+        -- Updating an existing call by value function.
+        WorkerLikeId _ -> id `setIdDetails` (WorkerLikeId trimmedMarks)
+        -- Do nothing for these
+        RecSelId{} -> id
+        DFunId{} -> id
+        _ -> pprTrace "setIdCbvMarks: Unable to set cbv marks for" (ppr id $$
+              text "marks:" <> ppr marks $$
+              text "idDetails:" <> ppr (idDetails id)) id
+
+    where
+      -- (Currently) no point in passing args beyond the arity unlifted.
+      -- We would have to eta expand all call sites to (length marks).
+      -- Perhaps that's sensible but for now be conservative.
+      -- Similarly we don't need any lazy marks at the end of the list.
+      -- This way the length of the list is always exactly number of arguments
+      -- that must be visible to CodeGen. See See Note [CBV Function Ids]
+      -- for more details.
+      trimmedMarks = dropWhileEndLE (not . isMarkedCbv) $ take (idArity id) marks
+
+idCbvMarks_maybe :: Id -> Maybe [CbvMark]
+idCbvMarks_maybe id = case idDetails id of
+  WorkerLikeId marks -> Just marks
+  JoinId _arity marks  -> marks
+  _                    -> Nothing
+
+-- Id must be called with at least this arity in order to allow arguments to
+-- be passed unlifted.
+idCbvMarkArity :: Id -> Arity
+idCbvMarkArity fn = maybe 0 length (idCbvMarks_maybe fn)
+
+-- | Remove any cbv marks on arguments from a given Id.
+asNonWorkerLikeId :: Id -> Id
+asNonWorkerLikeId id =
+  let details = case idDetails id of
+        WorkerLikeId{}      -> Just $ VanillaId
+        JoinId arity Just{}   -> Just $ JoinId arity Nothing
+        _                     -> Nothing
+  in maybeModifyIdDetails details id
+
+-- | Turn this id into a WorkerLikeId if possible.
+asWorkerLikeId :: Id -> Id
+asWorkerLikeId id =
+  let details = case idDetails id of
+        WorkerLikeId{}      -> Nothing
+        JoinId _arity Just{}  -> Nothing
+        JoinId arity Nothing  -> Just (JoinId arity (Just []))
+        VanillaId             -> Just $ WorkerLikeId []
+        _                     -> Nothing
+  in maybeModifyIdDetails details id
+
 setCaseBndrEvald :: StrictnessMark -> Id -> Id
 -- Used for variables bound by a case expressions, both the case-binder
 -- itself, and any pattern-bound variables that are argument of a
@@ -727,6 +834,12 @@ setCaseBndrEvald :: StrictnessMark -> Id -> Id
 setCaseBndrEvald str id
   | isMarkedStrict str = id `setIdUnfolding` evaldUnfolding
   | otherwise          = id
+
+-- | Similar to trimUnfolding, but also removes evaldness info.
+zapIdUnfolding :: Id -> Id
+zapIdUnfolding v
+  | isId v, hasSomeUnfolding (idUnfolding v) = setIdUnfolding v noUnfolding
+  | otherwise = v
 
         ---------------------------------
         -- SPECIALISATION
@@ -838,7 +951,7 @@ typeOneShot ty
 
 isStateHackType :: Type -> Bool
 isStateHackType ty
-  | hasNoStateHack unsafeGlobalDynFlags
+  | unsafeHasNoStateHack
   = False
   | otherwise
   = case tyConAppTyCon_maybe ty of
@@ -891,6 +1004,7 @@ updOneShotInfo id one_shot
 --      f = \x -> e
 -- If we change the one-shot-ness of x, f's type changes
 
+-- Replaces the id info if the zapper returns @Just idinfo@
 zapInfo :: (IdInfo -> Maybe IdInfo) -> Id -> Id
 zapInfo zapper id = maybeModifyIdInfo (zapper (idInfo id)) id
 
@@ -976,7 +1090,7 @@ transferPolyIdInfo :: Id        -- Original Id
                    -> Id        -- New Id
                    -> Id
 transferPolyIdInfo old_id abstract_wrt new_id
-  = modifyIdInfo transfer new_id
+  = modifyIdInfo transfer new_id `setIdCbvMarks` new_cbv_marks
   where
     arity_increase = count isId abstract_wrt    -- Arity increases by the
                                                 -- number of value binders
@@ -988,15 +1102,27 @@ transferPolyIdInfo old_id abstract_wrt new_id
     new_arity       = old_arity + arity_increase
     new_occ_info    = zapOccTailCallInfo old_occ_info
 
-    old_strictness  = strictnessInfo old_info
-    new_strictness  = prependArgsStrictSig arity_increase old_strictness
-    old_cpr         = cprInfo old_info
+    old_strictness  = dmdSigInfo old_info
+    new_strictness  = prependArgsDmdSig arity_increase old_strictness
+    old_cpr         = cprSigInfo old_info
 
+    old_cbv_marks   = fromMaybe (replicate old_arity NotMarkedCbv) (idCbvMarks_maybe old_id)
+    abstr_cbv_marks = mapMaybe getMark abstract_wrt
+    new_cbv_marks   = abstr_cbv_marks ++ old_cbv_marks
+
+    getMark v
+      | not (isId v)
+      = Nothing
+      | isId v
+      , isEvaldUnfolding (idUnfolding v)
+      , mightBeLiftedType (idType v)
+      = Just MarkedCbv
+      | otherwise = Just NotMarkedCbv
     transfer new_info = new_info `setArityInfo` new_arity
                                  `setInlinePragInfo` old_inline_prag
                                  `setOccInfo` new_occ_info
-                                 `setStrictnessInfo` new_strictness
-                                 `setCprInfo` old_cpr
+                                 `setDmdSigInfo` new_strictness
+                                 `setCprSigInfo` old_cpr
 
-isNeverLevPolyId :: Id -> Bool
-isNeverLevPolyId = isNeverLevPolyIdInfo . idInfo
+isNeverRepPolyId :: Id -> Bool
+isNeverRepPolyId = isNeverRepPolyIdInfo . idInfo

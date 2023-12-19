@@ -27,18 +27,16 @@ import qualified Prelude (map)
 import Data.List (nub,sort)
 import qualified Data.List as List
 import qualified Data.IntSet as IntSet
-import Test.Framework
-import Test.Framework.Providers.HUnit
-import Test.Framework.Providers.QuickCheck2
-import Test.HUnit hiding (Test, Testable)
-import Test.QuickCheck
-import Test.QuickCheck.Function (Fun(..), apply)
+import Test.Tasty
+import Test.Tasty.HUnit
+import Test.Tasty.QuickCheck
+import Test.QuickCheck.Function (apply)
 import Test.QuickCheck.Poly (A, B, C)
 
 default (Int)
 
 main :: IO ()
-main = defaultMain
+main = defaultMain $ testGroup "intmap-properties"
          [
                testCase "index"      test_index
              , testCase "index_lookup" test_index_lookup
@@ -133,10 +131,8 @@ main = defaultMain
              , testCase "maxView" test_maxView
              , testCase "minViewWithKey" test_minViewWithKey
              , testCase "maxViewWithKey" test_maxViewWithKey
-#if MIN_VERSION_base(4,8,0)
              , testCase "minimum" test_minimum
              , testCase "maximum" test_maximum
-#endif
              , testProperty "valid"                prop_valid
              , testProperty "empty valid"          prop_emptyValid
              , testProperty "insert to singleton"  prop_singleton
@@ -184,10 +180,14 @@ main = defaultMain
              , testProperty "deleteMax"            prop_deleteMaxModel
              , testProperty "filter"               prop_filter
              , testProperty "partition"            prop_partition
+             , testProperty "takeWhileAntitone"    prop_takeWhileAntitone
+             , testProperty "dropWhileAntitone"    prop_dropWhileAntitone
+             , testProperty "spanAntitone"         prop_spanAntitone
              , testProperty "map"                  prop_map
              , testProperty "fmap"                 prop_fmap
              , testProperty "mapkeys"              prop_mapkeys
              , testProperty "split"                prop_splitModel
+             , testProperty "splitLookup"          prop_splitLookup
              , testProperty "splitRoot"            prop_splitRoot
              , testProperty "foldr"                prop_foldr
              , testProperty "foldr'"               prop_foldr'
@@ -236,16 +236,6 @@ instance Arbitrary a => Arbitrary (NonEmptyIntMap a) where
 type UMap = IntMap ()
 type IMap = IntMap Int
 type SMap = IntMap String
-
-----------------------------------------------------------------
-
-tests :: [Test]
-tests = [ testGroup "Test Case" [
-             ]
-        , testGroup "Property Test" [
-             ]
-        ]
-
 
 ----------------------------------------------------------------
 -- Unit tests
@@ -307,12 +297,17 @@ test_notMember = do
 
 test_lookup :: Assertion
 test_lookup = do
-    employeeCurrency 1 @?= Just 1
-    employeeCurrency 2 @?= Nothing
+    employeeCurrency 1      @?= Just 1
+    employeeCurrency 2      @?= Just 2
+    employeeCurrency 3      @?= Just 3
+    employeeCurrency 4      @?= Just 4
+    employeeCurrency 5      @?= Nothing
+    employeeCurrency (2^10) @?= Just 42
+    employeeCurrency 6      @?= Nothing
   where
-    employeeDept = fromList([(1,2), (3,1)])
-    deptCountry = fromList([(1,1), (2,2)])
-    countryCurrency = fromList([(1, 2), (2, 1)])
+    employeeDept    = fromList [(1,2), (2, 14), (3, 10), (4, 18), (2^10, 100)]
+    deptCountry     = fromList [(1,1), (14, 14), (10, 10), (18, 18), (100, 100), (2,2)]
+    countryCurrency = fromList [(1, 2), (2, 1), (14, 2), (10, 3), (18, 4), (100, 42)]
     employeeCurrency :: Int -> Maybe Int
     employeeCurrency name = do
         dept <- lookup name employeeDept
@@ -1117,8 +1112,6 @@ test_maxViewWithKey = do
     maxViewWithKey (fromList [(5,"a"), (-3,"b")]) @?= Just ((5,"a"), singleton (-3) "b")
     maxViewWithKey (empty :: SMap) @?= Nothing
 
-
-#if MIN_VERSION_base(4,8,0)
 test_minimum :: Assertion
 test_minimum = do
     getOW (minimum testOrdMap) @?= "min"
@@ -1139,8 +1132,6 @@ data OrdWith a = OrdWith String a
 
 instance Ord a => Ord (OrdWith a) where
     OrdWith _ a1 <= OrdWith _ a2 = a1 <= a2
-#endif
-
 
 ----------------------------------------------------------------
 -- Valid IntMaps
@@ -1482,6 +1473,26 @@ prop_partition p ys = length ys > 0 ==>
       m === let (a,b) = (List.partition (apply p . snd) xs)
             in (fromList a, fromList b)
 
+prop_takeWhileAntitone :: Int -> [(Int, Int)] -> Property
+prop_takeWhileAntitone x ys =
+  let l = takeWhileAntitone (<x) (fromList ys)
+  in  valid l .&&.
+      l === fromList (List.filter ((<x) . fst) ys)
+
+prop_dropWhileAntitone :: Int -> [(Int, Int)] -> Property
+prop_dropWhileAntitone x ys =
+  let r = dropWhileAntitone (<x) (fromList ys)
+  in  valid r .&&.
+      r === fromList (List.filter ((>=x) . fst) ys)
+
+prop_spanAntitone :: Int -> [(Int, Int)] -> Property
+prop_spanAntitone x ys =
+  let (l, r) = spanAntitone (<x) (fromList ys)
+  in  valid l .&&.
+      valid r .&&.
+      l === fromList (List.filter ((<x) . fst) ys) .&&.
+      r === fromList (List.filter ((>=x) . fst) ys)
+
 prop_map :: Fun Int Int -> [(Int, Int)] -> Property
 prop_map f ys = length ys > 0 ==>
   let xs = List.nubBy ((==) `on` fst) ys
@@ -1508,6 +1519,16 @@ prop_splitModel n ys = length ys > 0 ==>
       valid r .&&.
       toAscList l === sort [(k, v) | (k,v) <- xs, k < n] .&&.
       toAscList r === sort [(k, v) | (k,v) <- xs, k > n]
+
+prop_splitLookup :: Int -> [(Int, Int)] -> Property
+prop_splitLookup n ys =
+    let xs = List.nubBy ((==) `on` fst) ys
+        (l, x, r) = splitLookup n (fromList xs)
+    in  valid l .&&.
+        valid r .&&.
+        x === List.lookup n xs .&&.
+        toAscList l === sort [(k, v) | (k,v) <- xs, k < n] .&&.
+        toAscList r === sort [(k, v) | (k,v) <- xs, k > n]
 
 prop_splitRoot :: IMap -> Bool
 prop_splitRoot s = loop ls && (s == unions ls)

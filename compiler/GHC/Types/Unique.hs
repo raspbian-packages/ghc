@@ -17,7 +17,8 @@ Some of the other hair in this code is to be able to use a
 Haskell).
 -}
 
-{-# LANGUAGE CPP, BangPatterns, MagicHash #-}
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE BangPatterns, MagicHash #-}
 
 module GHC.Types.Unique (
         -- * Main data types
@@ -33,60 +34,30 @@ module GHC.Types.Unique (
         getKey,
         mkUnique, unpkUnique,
         eqUnique, ltUnique,
-        incrUnique,
+        incrUnique, stepUnique,
 
         newTagUnique,
-        initTyVarUnique,
-        initExitJoinUnique,
         nonDetCmpUnique,
         isValidKnownKeyUnique,
-
-        -- ** Making built-in uniques
-
-        -- now all the built-in GHC.Types.Uniques (and functions to make them)
-        -- [the Oh-So-Wonderful Haskell module system wins again...]
-        mkAlphaTyVarUnique,
-        mkPrimOpIdUnique, mkPrimOpWrapperUnique,
-        mkPreludeMiscIdUnique, mkPreludeDataConUnique,
-        mkPreludeTyConUnique, mkPreludeClassUnique,
-        mkCoVarUnique,
-
-        mkVarOccUnique, mkDataOccUnique, mkTvOccUnique, mkTcOccUnique,
-        mkRegSingleUnique, mkRegPairUnique, mkRegClassUnique, mkRegSubUnique,
-        mkCostCentreUnique,
-
-        mkBuiltinUnique,
-        mkPseudoUniqueD,
-        mkPseudoUniqueE,
-        mkPseudoUniqueH,
-
-        -- ** Deriving uniques
-        -- *** From TyCon name uniques
-        tyConRepNameUnique,
-        -- *** From DataCon name uniques
-        dataConWorkerUnique, dataConTyRepNameUnique,
 
         -- ** Local uniques
         -- | These are exposed exclusively for use by 'GHC.Types.Var.Env.uniqAway', which
         -- has rather peculiar needs. See Note [Local uniques].
-        mkLocalUnique, minLocalUnique, maxLocalUnique
+        mkLocalUnique, minLocalUnique, maxLocalUnique,
     ) where
 
-#include "HsVersions.h"
 #include "Unique.h"
 
 import GHC.Prelude
 
-import GHC.Types.Basic
 import GHC.Data.FastString
 import GHC.Utils.Outputable
-import GHC.Utils.Misc
+import GHC.Utils.Panic.Plain
 
 -- just for implementing a fast [0,61) -> Char function
 import GHC.Exts (indexCharOffAddr#, Char(..), Int(..))
 
 import Data.Char        ( chr, ord )
-import Data.Bits
 
 {-
 ************************************************************************
@@ -95,8 +66,20 @@ import Data.Bits
 *                                                                      *
 ************************************************************************
 
-The @Chars@ are ``tag letters'' that identify the @UniqueSupply@.
-Fast comparison is everything on @Uniques@:
+Note [Uniques and masks]
+~~~~~~~~~~~~~~~~~~~~~~~~
+A `Unique` in GHC is a Word-sized value composed of two pieces:
+* A "mask", of width `UNIQUE_TAG_BITS`, in the high order bits
+* A number, of width `uNIQUE_BITS`, which fills up the remainder of the Word
+
+The mask is typically an ASCII character.  It is typically used to make it easier
+to distinguish uniques constructed by different parts of the compiler.
+There is a (potentially incomplete) list of unique masks used given in
+GHC.Builtin.Uniques. See Note [Uniques-prelude - Uniques for wired-in Prelude things]
+
+`mkUnique` constructs a `Unique` from its pieces
+  mkUnique :: Char -> Int -> Unique
+
 -}
 
 -- | Unique identifier.
@@ -158,8 +141,7 @@ uniqueMask = (1 `shiftL` uNIQUE_BITS) - 1
 -- and as long as the Char fits in 8 bits, which we assume anyway!
 
 mkUnique :: Char -> Int -> Unique       -- Builds a unique from pieces
--- NOT EXPORTED, so that we can see all the Chars that
---               are used in this one module
+-- EXPORTED and used only in GHC.Builtin.Uniques
 mkUnique c i
   = MkUnique (tag .|. bits)
   where
@@ -291,14 +273,7 @@ instance Uniquable Unique where
 showUnique :: Unique -> String
 showUnique uniq
   = case unpkUnique uniq of
-      (tag, u) -> finish_show tag u (iToBase62 u)
-
-finish_show :: Char -> Int -> String -> String
-finish_show 't' u _pp_u | u < 26
-  = -- Special case to make v common tyvars, t1, t2, ...
-    -- come out as a, b, ... (shorter, easier to read)
-    [chr (ord 'a' + u)]
-finish_show tag _ pp_u = tag : pp_u
+      (tag, u) -> tag : iToBase62 u
 
 pprUniqueAlways :: Unique -> SDoc
 -- The "always" means regardless of -dsuppress-uniques
@@ -328,7 +303,7 @@ Code stolen from Lennart.
 
 iToBase62 :: Int -> String
 iToBase62 n_
-  = ASSERT(n_ >= 0) go n_ ""
+  = assert (n_ >= 0) $ go n_ ""
   where
     go n cs | n < 62
             = let !c = chooseChar62 n in c : cs
@@ -340,109 +315,3 @@ iToBase62 n_
     {-# INLINE chooseChar62 #-}
     chooseChar62 (I# n) = C# (indexCharOffAddr# chars62 n)
     chars62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"#
-
-{-
-************************************************************************
-*                                                                      *
-\subsection[Uniques-prelude]{@Uniques@ for wired-in Prelude things}
-*                                                                      *
-************************************************************************
-
-Allocation of unique supply characters:
-        v,t,u : for renumbering value-, type- and usage- vars.
-        B:   builtin
-        C-E: pseudo uniques     (used in native-code generator)
-        X:   uniques from mkLocalUnique
-        _:   unifiable tyvars   (above)
-        0-9: prelude things below
-             (no numbers left any more..)
-        ::   (prelude) parallel array data constructors
-
-        other a-z: lower case chars for unique supplies.  Used so far:
-
-        d       desugarer
-        f       AbsC flattener
-        g       SimplStg
-        k       constraint tuple tycons
-        m       constraint tuple datacons
-        n       Native codegen
-        r       Hsc name cache
-        s       simplifier
-        z       anonymous sums
--}
-
-mkAlphaTyVarUnique     :: Int -> Unique
-mkPreludeClassUnique   :: Int -> Unique
-mkPreludeTyConUnique   :: Int -> Unique
-mkPreludeDataConUnique :: Arity -> Unique
-mkPrimOpIdUnique       :: Int -> Unique
--- See Note [Primop wrappers] in GHC.Builtin.PrimOps.
-mkPrimOpWrapperUnique  :: Int -> Unique
-mkPreludeMiscIdUnique  :: Int -> Unique
-mkCoVarUnique          :: Int -> Unique
-
-mkAlphaTyVarUnique   i = mkUnique '1' i
-mkCoVarUnique        i = mkUnique 'g' i
-mkPreludeClassUnique i = mkUnique '2' i
-
---------------------------------------------------
--- Wired-in type constructor keys occupy *two* slots:
---    * u: the TyCon itself
---    * u+1: the TyConRepName of the TyCon
-mkPreludeTyConUnique i                = mkUnique '3' (2*i)
-
-tyConRepNameUnique :: Unique -> Unique
-tyConRepNameUnique  u = incrUnique u
-
---------------------------------------------------
--- Wired-in data constructor keys occupy *three* slots:
---    * u: the DataCon itself
---    * u+1: its worker Id
---    * u+2: the TyConRepName of the promoted TyCon
--- Prelude data constructors are too simple to need wrappers.
-
-mkPreludeDataConUnique i              = mkUnique '6' (3*i)    -- Must be alphabetic
-
---------------------------------------------------
-dataConTyRepNameUnique, dataConWorkerUnique :: Unique -> Unique
-dataConWorkerUnique  u = incrUnique u
-dataConTyRepNameUnique u = stepUnique u 2
-
---------------------------------------------------
-mkPrimOpIdUnique op         = mkUnique '9' (2*op)
-mkPrimOpWrapperUnique op    = mkUnique '9' (2*op+1)
-mkPreludeMiscIdUnique  i    = mkUnique '0' i
-
--- The "tyvar uniques" print specially nicely: a, b, c, etc.
--- See pprUnique for details
-
-initTyVarUnique :: Unique
-initTyVarUnique = mkUnique 't' 0
-
-mkPseudoUniqueD, mkPseudoUniqueE, mkPseudoUniqueH,
-   mkBuiltinUnique :: Int -> Unique
-
-mkBuiltinUnique i = mkUnique 'B' i
-mkPseudoUniqueD i = mkUnique 'D' i -- used in NCG for getUnique on RealRegs
-mkPseudoUniqueE i = mkUnique 'E' i -- used in NCG spiller to create spill VirtualRegs
-mkPseudoUniqueH i = mkUnique 'H' i -- used in NCG spiller to create spill VirtualRegs
-
-mkRegSingleUnique, mkRegPairUnique, mkRegSubUnique, mkRegClassUnique :: Int -> Unique
-mkRegSingleUnique = mkUnique 'R'
-mkRegSubUnique    = mkUnique 'S'
-mkRegPairUnique   = mkUnique 'P'
-mkRegClassUnique  = mkUnique 'L'
-
-mkCostCentreUnique :: Int -> Unique
-mkCostCentreUnique = mkUnique 'C'
-
-mkVarOccUnique, mkDataOccUnique, mkTvOccUnique, mkTcOccUnique :: FastString -> Unique
--- See Note [The Unique of an OccName] in GHC.Types.Name.Occurrence
-mkVarOccUnique  fs = mkUnique 'i' (uniqueOfFS fs)
-mkDataOccUnique fs = mkUnique 'd' (uniqueOfFS fs)
-mkTvOccUnique   fs = mkUnique 'v' (uniqueOfFS fs)
-mkTcOccUnique   fs = mkUnique 'c' (uniqueOfFS fs)
-
-initExitJoinUnique :: Unique
-initExitJoinUnique = mkUnique 's' 0
-

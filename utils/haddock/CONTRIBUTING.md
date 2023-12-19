@@ -3,6 +3,10 @@
 Thank you for contributing to Haddock! Here is the information you will need in
 order to make your contribution
 
+## Code of Conduct
+
+We need you to read, acknowledge, and abide by our [Code of Conduct][CoC].
+
 ## Reporting issues
 
 Please open a ticket if you get an unexpected behaviour from Haddock!  
@@ -44,20 +48,17 @@ so that documentation built within GHC can benefit from it.
 
 #### Using `cabal`
 
-Building the `ghc-9.0` branch requires cabal `>= 3.4` and GHC `== 9.0`:
+Requires cabal `>= 3.4` and GHC `== 9.4`:
+
+You can install the latest build of GHC via ghcup using this command:
+
+```bash
+ghcup install ghc -u "https://gitlab.haskell.org/ghc/ghc/-/jobs/artifacts/master/raw/ghc-x86_64-deb9-linux-integer-simple.tar.xz?job=validate-x86_64-linux-deb9-integer-simple" head
+```
 
 ```bash
 cabal v2-build all --enable-tests
 cabal v2-test all
-```
-
-#### Using `stack`
-
-```bash
-stack init
-stack build
-export HADDOCK_PATH="$(stack exec which haddock)"
-stack test
 ```
 
 ### Updating golden testsuite outputs
@@ -74,4 +75,4 @@ cabal v2-test html-test latex-test hoogle-test hypsrc-test \
 
 
 [SSCCE]: http://sscce.org/
-
+[CoC]: ./CODE_OF_CONDUCT.md

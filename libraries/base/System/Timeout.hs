@@ -1,6 +1,5 @@
-{-# LANGUAGE Safe #-}
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE Safe #-}
 
 -------------------------------------------------------------------------------
 -- |
@@ -9,7 +8,7 @@
 -- License     :  BSD-style (see the file libraries/base/LICENSE)
 --
 -- Maintainer  :  libraries@haskell.org
--- Stability   :  experimental
+-- Stability   :  stable
 -- Portability :  non-portable
 --
 -- Attach a timeout event to arbitrary 'IO' computations.
@@ -30,6 +29,10 @@ import Control.Exception   (Exception(..), handleJust, bracket,
                             asyncExceptionToException,
                             asyncExceptionFromException)
 import Data.Unique         (Unique, newUnique)
+
+-- $setup
+-- >>> import Prelude
+-- >>> import Control.Concurrent (threadDelay)
 
 -- An internal type that is thrown as a dynamic exception to
 -- interrupt the running IO computation when the timeout has

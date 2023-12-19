@@ -1,10 +1,10 @@
-cabal-version:        2.0
+cabal-version:        3.0
 name:                 haddock-api
-version:              2.25.1
+version:              2.27.1
 synopsis:             A documentation-generation tool for Haskell libraries
 description:          Haddock is a documentation-generation tool for Haskell
                       libraries
-license:              BSD2
+license:              BSD-2-Clause
 license-file:         LICENSE
 author:               Simon Marlow, David Waern
 maintainer:           Alec Theriault <alec.theriault@gmail.com>, Alex Biehl <alexbiehl@gmail.com>, Simon Hengel <sol@typeful.net>, Mateusz Kowalczyk <fuuzetsu@fuuzetsu.co.uk>
@@ -13,7 +13,7 @@ bug-reports:          https://github.com/haskell/haddock/issues
 copyright:            (c) Simon Marlow, David Waern
 category:             Documentation
 build-type:           Simple
-tested-with:          GHC==9.0.*
+tested-with:          GHC==9.4.*
 
 extra-source-files:
   CHANGES.md
@@ -43,10 +43,10 @@ library
   default-language: Haskell2010
 
   -- this package typically supports only single major versions
-  build-depends: base            ^>= 4.15.0
-               , ghc             ^>= 9.0
+  build-depends: base            ^>= 4.16.0
+               , ghc             ^>= 9.4
                , ghc-paths       ^>= 0.1.0.9
-               , haddock-library ^>= 1.10.0
+               , haddock-library ^>= 1.11
                , xhtml           ^>= 3000.2.2
                , parsec          ^>= 3.1.13.0
 
@@ -180,12 +180,12 @@ test-suite spec
     Haddock.Backends.Hyperlinker.Parser
     Haddock.Backends.Hyperlinker.Types
 
-  build-depends: ghc             ^>= 9.0
+  build-depends: ghc             ^>= 9.4
                , ghc-paths       ^>= 0.1.0.12
-               , haddock-library ^>= 1.10.0
+               , haddock-library ^>= 1.11
                , xhtml           ^>= 3000.2.2
-               , hspec           >= 2.4.4 && < 2.8
-               , parsec       ^>= 3.1.13.0
+               , hspec           ^>= 2.9
+               , parsec          ^>= 3.1.13.0
                , QuickCheck      >= 2.11  && ^>= 2.14
 
   -- Versions for the dependencies below are transitively pinned by
@@ -200,11 +200,12 @@ test-suite spec
                , exceptions
                , filepath
                , ghc-boot
+               , ghc-boot-th
                , mtl
                , transformers
 
   build-tool-depends:
-    hspec-discover:hspec-discover >= 2.4.4 && < 2.8
+    hspec-discover:hspec-discover ^>= 2.9
 
 source-repository head
   type:     git

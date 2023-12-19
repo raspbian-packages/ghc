@@ -1,4 +1,3 @@
-{-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE EmptyCase #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
@@ -281,7 +280,7 @@ newtype Equivalence a = Equivalence { getEquivalence :: a -> a -> Bool }
       -- @
       -- (<>) :: Equivalence a -> Equivalence a -> Equivalence a
       -- Equivalence equiv <> Equivalence equiv' = Equivalence \a b ->
-      --   equiv a b && equiv a b
+      --   equiv a b && equiv' a b
       -- @
       Semigroup
     , -- | @'mempty'@ on equivalences always returns @True@. Without

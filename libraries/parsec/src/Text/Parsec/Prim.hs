@@ -53,6 +53,7 @@ module Text.Parsec.Prim
     , lookAhead
     , Stream(..)
     , tokens
+    , tokens'
     , try
     , token
     , tokenPrim
@@ -99,15 +100,15 @@ import qualified Data.Semigroup as Semigroup ( Semigroup(..) )
 import qualified Data.Monoid as Monoid ( Monoid(..) )
 
 import qualified Control.Applicative as Applicative ( Applicative(..), Alternative(..), liftA2 )
-import Control.Monad hiding (sequence)
-import Control.Monad.Trans
-import Control.Monad.Identity hiding (sequence)
+import Control.Monad (MonadPlus (..), ap, void, liftM)
+import Control.Monad.Trans (MonadTrans (lift), MonadIO (liftIO))
+import Control.Monad.Identity (Identity, runIdentity)
 import qualified Control.Monad.Fail as Fail
 
-import Control.Monad.Reader.Class
-import Control.Monad.State.Class
-import Control.Monad.Cont.Class
-import Control.Monad.Error.Class
+import Control.Monad.Reader.Class (MonadReader (..))
+import Control.Monad.State.Class (MonadState (..))
+import Control.Monad.Cont.Class (MonadCont (..))
+import Control.Monad.Error.Class (MonadError (..))
 
 import Text.Parsec.Pos
 import Text.Parsec.Error
@@ -149,7 +150,7 @@ newtype ParsecT s u m a
              }
 #if MIN_VERSION_base(4,7,0)
      deriving ( Typeable )
-     -- GHC 7.6 doesn't like deriving instances of Typeabl1 for types with
+     -- GHC 7.6 doesn't like deriving instances of Typeable for types with
      -- non-* type-arguments.
 #endif
 
@@ -318,9 +319,11 @@ parserBind m k
   = ParsecT $ \s cok cerr eok eerr ->
     let
         -- consumed-okay case for m
-        mcok x s err =
+        mcok x s err
+          | errorIsUnknown err = unParser (k x) s cok cerr cok cerr
+          | otherwise =
             let
-                 -- if (k x) consumes, those go straigt up
+                 -- if (k x) consumes, those go straight up
                  pcok = cok
                  pcerr = cerr
 
@@ -335,7 +338,9 @@ parserBind m k
             in  unParser (k x) s pcok pcerr peok peerr
 
         -- empty-ok case for m
-        meok x s err =
+        meok x s err
+          | errorIsUnknown err = unParser (k x) s cok cerr eok eerr
+          | otherwise =
             let
                 -- in these cases, (k x) can return as empty
                 pcok = cok
@@ -507,6 +512,46 @@ tokens showTokens nextposs tts@(tok:toks)
             Nothing                 -> cerr $ errEof
             Just (x,xs) | t == x    -> walk ts xs
                         | otherwise -> cerr $ errExpect x
+
+        ok rs = let pos' = nextposs pos tts
+                    s' = State rs pos' u
+                in cok tts s' (newErrorUnknown pos')
+    in do
+        sr <- uncons input
+        case sr of
+            Nothing         -> eerr $ errEof
+            Just (x,xs)
+                | tok == x  -> walk toks xs
+                | otherwise -> eerr $ errExpect x
+
+-- | Like 'tokens', but doesn't consume matching prefix.
+--
+-- @since 3.1.16.0
+tokens' :: (Stream s m t, Eq t)
+       => ([t] -> String)      -- Pretty print a list of tokens
+       -> (SourcePos -> [t] -> SourcePos)
+       -> [t]                  -- List of tokens to parse
+       -> ParsecT s u m [t]
+{-# INLINE tokens' #-}
+tokens' _ _ []
+    = ParsecT $ \s _ _ eok _ ->
+      eok [] s $ unknownError s
+tokens' showTokens nextposs tts@(tok:toks)
+    = ParsecT $ \(State input pos u) cok _cerr _eok eerr ->
+    let
+        errEof = (setErrorMessage (Expect (showTokens tts))
+                  (newErrorMessage (SysUnExpect "") pos))
+
+        errExpect x = (setErrorMessage (Expect (showTokens tts))
+                       (newErrorMessage (SysUnExpect (showTokens [x])) pos))
+
+        walk []     rs = ok rs
+        walk (t:ts) rs = do
+          sr <- uncons rs
+          case sr of
+            Nothing                 -> eerr $ errEof
+            Just (x,xs) | t == x    -> walk ts xs
+                        | otherwise -> eerr $ errExpect x
 
         ok rs = let pos' = nextposs pos tts
                     s' = State rs pos' u

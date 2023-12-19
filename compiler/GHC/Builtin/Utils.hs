@@ -3,7 +3,7 @@
 
 -}
 
-{-# LANGUAGE CPP #-}
+
 
 -- | The @GHC.Builtin.Utils@ interface to the compiler's prelude knowledge.
 --
@@ -31,11 +31,9 @@ module GHC.Builtin.Utils (
 
         -- * Miscellaneous
         wiredInIds, ghcPrimIds,
-        primOpRules, builtinRules,
 
         ghcPrimExports,
         ghcPrimDeclDocs,
-        primOpId,
 
         -- * Random other things
         maybeCharLikeCon, maybeIntLikeCon,
@@ -45,41 +43,44 @@ module GHC.Builtin.Utils (
 
     ) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
 import GHC.Builtin.Uniques
-import GHC.Types.Unique ( isValidKnownKeyUnique )
-
-import GHC.Core.ConLike ( ConLike(..) )
+import GHC.Builtin.PrimOps
+import GHC.Builtin.PrimOps.Ids
+import GHC.Builtin.Types
+import GHC.Builtin.Types.Literals ( typeNatTyCons )
+import GHC.Builtin.Types.Prim
 import GHC.Builtin.Names.TH ( templateHaskellNames )
 import GHC.Builtin.Names
-import GHC.Core.Opt.ConstantFold
-import GHC.Types.Avail
-import GHC.Builtin.PrimOps
+
+import GHC.Core.ConLike ( ConLike(..) )
 import GHC.Core.DataCon
-import GHC.Types.Basic
+import GHC.Core.Class
+import GHC.Core.TyCon
+
+import GHC.Types.Avail
 import GHC.Types.Id
 import GHC.Types.Name
 import GHC.Types.Name.Env
 import GHC.Types.Id.Make
-import GHC.Utils.Outputable
-import GHC.Builtin.Types.Prim
-import GHC.Builtin.Types
-import GHC.Driver.Types
-import GHC.Core.Class
-import GHC.Core.TyCon
 import GHC.Types.Unique.FM
+import GHC.Types.Unique.Map
+import GHC.Types.TyThing
+import GHC.Types.Unique ( isValidKnownKeyUnique )
+
+import GHC.Utils.Outputable
 import GHC.Utils.Misc as Utils
-import GHC.Builtin.Types.Literals ( typeNatTyCons )
+import GHC.Utils.Panic
+import GHC.Utils.Constants (debugIsOn)
 import GHC.Hs.Doc
+import GHC.Unit.Module.ModIface (IfaceExport)
+
+import GHC.Data.List.SetOps
 
 import Control.Applicative ((<|>))
 import Data.List        ( intercalate , find )
-import Data.Array
 import Data.Maybe
-import qualified Data.Map as Map
 
 {-
 ************************************************************************
@@ -125,19 +126,11 @@ knownKeyNames
   = all_names
   where
     all_names =
-      -- We exclude most tuples from this list—see
-      -- Note [Infinite families of known-key names] in GHC.Builtin.Names.
-      -- We make an exception for Solo (i.e., the boxed 1-tuple), since it does
-      -- not use special syntax like other tuples.
-      -- See Note [One-tuples] (Wrinkle: Make boxed one-tuple names have known keys)
-      -- in GHC.Builtin.Types.
-      tupleTyConName BoxedTuple 1 : tupleDataConName Boxed 1 :
-      concat [ wired_tycon_kk_names funTyCon
-             , concatMap wired_tycon_kk_names primTyCons
+      concat [ concatMap wired_tycon_kk_names primTyCons
              , concatMap wired_tycon_kk_names wiredInTyCons
              , concatMap wired_tycon_kk_names typeNatTyCons
              , map idName wiredInIds
-             , map (idName . primOpId) allThePrimOps
+             , map idName allThePrimOpIds
              , map (idName . primOpWrapperId) allThePrimOps
              , basicKnownKeyNames
              , templateHaskellNames
@@ -234,21 +227,7 @@ knownNamesInfo = unitNameEnv coercibleTyConName $
 We let a lot of "non-standard" values be visible, so that we can make
 sense of them in interface pragmas. It's cool, though they all have
 "non-standard" names, so they won't get past the parser in user code.
-
-************************************************************************
-*                                                                      *
-                PrimOpIds
-*                                                                      *
-************************************************************************
 -}
-
-primOpIds :: Array Int Id
--- A cache of the PrimOp Ids, indexed by PrimOp tag
-primOpIds = array (1,maxPrimOpTag) [ (primOpTag op, mkPrimOpId op)
-                                   | op <- allThePrimOps ]
-
-primOpId :: PrimOp -> Id
-primOpId op = primOpIds ! primOpTag op
 
 {-
 ************************************************************************
@@ -256,27 +235,24 @@ primOpId op = primOpIds ! primOpTag op
             Export lists for pseudo-modules (GHC.Prim)
 *                                                                      *
 ************************************************************************
-
-GHC.Prim "exports" all the primops and primitive types, some
-wired-in Ids.
 -}
 
 ghcPrimExports :: [IfaceExport]
 ghcPrimExports
  = map (avail . idName) ghcPrimIds ++
-   map (avail . idName . primOpId) allThePrimOps ++
-   [ AvailTC n [n] []
-   | tc <- funTyCon : exposedPrimTyCons, let n = tyConName tc  ]
+   map (avail . idName) allThePrimOpIds ++
+   [ availTC n [n] []
+   | tc <- exposedPrimTyCons, let n = tyConName tc  ]
 
-ghcPrimDeclDocs :: DeclDocMap
-ghcPrimDeclDocs = DeclDocMap $ Map.fromList $ mapMaybe findName primOpDocs
+ghcPrimDeclDocs :: Docs
+ghcPrimDeclDocs = emptyDocs { docs_decls = listToUniqMap $ mapMaybe findName primOpDocs }
   where
     names = map idName ghcPrimIds ++
-            map (idName . primOpId) allThePrimOps ++
-            map tyConName (funTyCon : exposedPrimTyCons)
+            map idName allThePrimOpIds ++
+            map tyConName exposedPrimTyCons
     findName (nameStr, doc)
       | Just name <- find ((nameStr ==) . getOccString) names
-      = Just (name, mkHsDocString doc)
+      = Just (name, [WithHsDocIdentifiers (mkGeneratedHsDocString doc) []])
       | otherwise = Nothing
 
 {-

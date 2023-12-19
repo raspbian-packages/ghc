@@ -23,6 +23,7 @@ of arguments of combining function.
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+
 {-# OPTIONS_GHC -Wall #-}
 
 module GHC.Types.Unique.FM (
@@ -34,6 +35,7 @@ module GHC.Types.Unique.FM (
         emptyUFM,
         unitUFM,
         unitDirectlyUFM,
+        zipToUFM,
         listToUFM,
         listToUFM_Directly,
         listToUFM_C,
@@ -55,12 +57,15 @@ module GHC.Types.Unique.FM (
         mergeUFM,
         plusMaybeUFM_C,
         plusUFMList,
+        sequenceUFMList,
         minusUFM,
+        minusUFM_C,
         intersectUFM,
         intersectUFM_C,
         disjointUFM,
         equalKeysUFM,
-        nonDetStrictFoldUFM, foldUFM, nonDetStrictFoldUFM_Directly,
+        nonDetStrictFoldUFM, foldUFM, nonDetStrictFoldUFM_DirectlyM,
+        nonDetStrictFoldUFM_Directly,
         anyUFM, allUFM, seqEltsUFM,
         mapUFM, mapUFM_Directly,
         mapMaybeUFM,
@@ -70,7 +75,7 @@ module GHC.Types.Unique.FM (
         isNullUFM,
         lookupUFM, lookupUFM_Directly,
         lookupWithDefaultUFM, lookupWithDefaultUFM_Directly,
-        nonDetEltsUFM, eltsUFM, nonDetKeysUFM,
+        nonDetEltsUFM, nonDetKeysUFM,
         ufmToSet_Directly,
         nonDetUFMToList, ufmToIntMap, unsafeIntMapToUFM,
         unsafeCastUFMKey,
@@ -81,8 +86,9 @@ import GHC.Prelude
 
 import GHC.Types.Unique ( Uniquable(..), Unique, getKey )
 import GHC.Utils.Outputable
-
+import GHC.Utils.Panic.Plain
 import qualified Data.IntMap as M
+import qualified Data.IntMap.Strict as MS
 import qualified Data.IntSet as S
 import Data.Data
 import qualified Data.Semigroup as Semi
@@ -115,6 +121,19 @@ unitUFM k v = UFM (M.singleton (getKey $ getUnique k) v)
 -- when you've got the Unique already
 unitDirectlyUFM :: Unique -> elt -> UniqFM key elt
 unitDirectlyUFM u v = UFM (M.singleton (getKey u) v)
+
+-- zipToUFM ks vs = listToUFM (zip ks vs)
+-- This function exists because it's a common case (#18535), and
+-- it's inefficient to first build a list of pairs, and then immediately
+-- take it apart. Astonishingly, fusing this one list away reduces total
+-- compiler allocation by more than 10% (in T12545, see !3935)
+-- Note that listToUFM (zip ks vs) performs similarly, but
+-- the explicit recursion avoids relying too much on fusion.
+zipToUFM :: Uniquable key => [key] -> [elt] -> UniqFM key elt
+zipToUFM ks vs = assert (length ks == length vs ) innerZip emptyUFM ks vs
+  where
+    innerZip ufm (k:kList) (v:vList) = innerZip (addToUFM ufm k v) kList vList
+    innerZip ufm _ _ = ufm
 
 listToUFM :: Uniquable key => [(key,elt)] -> UniqFM key elt
 listToUFM = foldl' (\m (k, v) -> addToUFM m k v) emptyUFM
@@ -214,12 +233,16 @@ plusUFM_C f (UFM x) (UFM y) = UFM (M.unionWith f x y)
 -- there is no entry in `m1` reps. `m2`. The domain is the union of
 -- the domains of `m1` and `m2`.
 --
+-- IMPORTANT NOTE: This function strictly applies the modification function
+-- and forces the result unlike most the other functions in this module.
+--
 -- Representative example:
 --
 -- @
 -- plusUFM_CD f {A: 1, B: 2} 23 {B: 3, C: 4} 42
 --    == {A: f 1 42, B: f 2 3, C: f 23 4 }
 -- @
+{-# INLINE plusUFM_CD #-}
 plusUFM_CD
   :: (elta -> eltb -> eltc)
   -> UniqFM key elta  -- map X
@@ -228,16 +251,19 @@ plusUFM_CD
   -> eltb         -- default for Y
   -> UniqFM key eltc
 plusUFM_CD f (UFM xm) dx (UFM ym) dy
-  = UFM $ M.mergeWithKey
+  = UFM $ MS.mergeWithKey
       (\_ x y -> Just (x `f` y))
-      (M.map (\x -> x `f` dy))
-      (M.map (\y -> dx `f` y))
+      (MS.map (\x -> x `f` dy))
+      (MS.map (\y -> dx `f` y))
       xm ym
 
 -- | `plusUFM_CD2 f m1 m2` merges the maps using `f` as the combining
 -- function. Unlike `plusUFM_CD`, a missing value is not defaulted: it is
 -- instead passed as `Nothing` to `f`. `f` can never have both its arguments
 -- be `Nothing`.
+--
+-- IMPORTANT NOTE: This function strictly applies the modification function
+-- and forces the result.
 --
 -- `plusUFM_CD2 f m1 m2` is the same as `plusUFM_CD f (mapUFM Just m1) Nothing
 -- (mapUFM Just m2) Nothing`.
@@ -247,10 +273,10 @@ plusUFM_CD2
   -> UniqFM key eltb  -- map Y
   -> UniqFM key eltc
 plusUFM_CD2 f (UFM xm) (UFM ym)
-  = UFM $ M.mergeWithKey
+  = UFM $ MS.mergeWithKey
       (\_ x y -> Just (Just x `f` Just y))
-      (M.map (\x -> Just x `f` Nothing))
-      (M.map (\y -> Nothing `f` Just y))
+      (MS.map (\x -> Just x `f` Nothing))
+      (MS.map (\y -> Nothing `f` Just y))
       xm ym
 
 mergeUFM
@@ -261,7 +287,7 @@ mergeUFM
   -> UniqFM key eltb
   -> UniqFM key eltc
 mergeUFM f g h (UFM xm) (UFM ym)
-  = UFM $ M.mergeWithKey
+  = UFM $ MS.mergeWithKey
       (\_ x y -> (x `f` y))
       (coerce g)
       (coerce h)
@@ -279,8 +305,25 @@ plusMaybeUFM_C f (UFM xm) (UFM ym)
 plusUFMList :: [UniqFM key elt] -> UniqFM key elt
 plusUFMList = foldl' plusUFM emptyUFM
 
+sequenceUFMList :: forall key elt. [UniqFM key elt] -> UniqFM key [elt]
+sequenceUFMList = foldr (plusUFM_CD2 cons) emptyUFM
+  where
+    cons :: Maybe elt -> Maybe [elt] -> [elt]
+    cons (Just x) (Just ys) = x : ys
+    cons Nothing  (Just ys) = ys
+    cons (Just x) Nothing   = [x]
+    cons Nothing  Nothing   = []
+
 minusUFM :: UniqFM key elt1 -> UniqFM key elt2 -> UniqFM key elt1
 minusUFM (UFM x) (UFM y) = UFM (M.difference x y)
+
+-- | @minusUFC_C f map1 map2@ returns @map1@, except that every mapping @key
+-- |-> value1@ in @map1@ that shares a key with a mapping @key |-> value2@ in
+-- @map2@ is altered by @f@: @value1@ is replaced by @f value1 value2@, where
+-- 'Just' means that the new value is used and 'Nothing' means that the mapping
+-- is deleted.
+minusUFM_C :: (elt1 -> elt2 -> Maybe elt1) -> UniqFM key elt1 -> UniqFM key elt2 -> UniqFM key elt1
+minusUFM_C f (UFM x) (UFM y) = UFM (M.differenceWith f x y)
 
 intersectUFM :: UniqFM key elt1 -> UniqFM key elt2 -> UniqFM key elt1
 intersectUFM (UFM x) (UFM y) = UFM (M.intersection x y)
@@ -340,9 +383,6 @@ lookupWithDefaultUFM (UFM m) v k = M.findWithDefault v (getKey $ getUnique k) m
 lookupWithDefaultUFM_Directly :: UniqFM key elt -> elt -> Unique -> elt
 lookupWithDefaultUFM_Directly (UFM m) v u = M.findWithDefault v (getKey u) m
 
-eltsUFM :: UniqFM key elt -> [elt]
-eltsUFM (UFM m) = M.elems m
-
 ufmToSet_Directly :: UniqFM key elt -> S.IntSet
 ufmToSet_Directly (UFM m) = M.keysSet m
 
@@ -352,11 +392,8 @@ anyUFM p (UFM m) = M.foldr ((||) . p) False m
 allUFM :: (elt -> Bool) -> UniqFM key elt -> Bool
 allUFM p (UFM m) = M.foldr ((&&) . p) True m
 
-seqEltsUFM :: ([elt] -> ()) -> UniqFM key elt -> ()
-seqEltsUFM seqList = seqList . nonDetEltsUFM
-  -- It's OK to use nonDetEltsUFM here because the type guarantees that
-  -- the only interesting thing this function can do is to force the
-  -- elements.
+seqEltsUFM :: (elt -> ()) -> UniqFM key elt -> ()
+seqEltsUFM seqElt = foldUFM (\v rest -> seqElt v `seq` rest) ()
 
 -- See Note [Deterministic UniqFM] to learn about nondeterminism.
 -- If you use this please provide a justification why it doesn't introduce
@@ -375,12 +412,22 @@ nonDetKeysUFM (UFM m) = map getUnique $ M.keys m
 -- nondeterminism.
 nonDetStrictFoldUFM :: (elt -> a -> a) -> a -> UniqFM key elt -> a
 nonDetStrictFoldUFM k z (UFM m) = M.foldl' (flip k) z m
+{-# INLINE nonDetStrictFoldUFM #-}
 
+-- | In essence foldM
 -- See Note [Deterministic UniqFM] to learn about nondeterminism.
 -- If you use this please provide a justification why it doesn't introduce
 -- nondeterminism.
+{-# INLINE nonDetStrictFoldUFM_DirectlyM #-} -- Allow specialization
+nonDetStrictFoldUFM_DirectlyM :: (Monad m) => (Unique -> b -> elt -> m b) -> b -> UniqFM key elt -> m b
+nonDetStrictFoldUFM_DirectlyM f z0 (UFM xs) = M.foldrWithKey c return xs z0
+  -- See Note [List fusion and continuations in 'c']
+  where c u x k z = f (getUnique u) z x >>= k
+        {-# INLINE c #-}
+
 nonDetStrictFoldUFM_Directly:: (Unique -> elt -> a -> a) -> a -> UniqFM key elt -> a
 nonDetStrictFoldUFM_Directly k z (UFM m) = M.foldlWithKey' (\z' i x -> k (getUnique i) x z') z m
+{-# INLINE nonDetStrictFoldUFM_Directly #-}
 
 -- See Note [Deterministic UniqFM] to learn about nondeterminism.
 -- If you use this please provide a justification why it doesn't introduce

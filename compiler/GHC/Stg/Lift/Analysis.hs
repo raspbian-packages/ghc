@@ -1,4 +1,3 @@
-{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE DataKinds #-}
 
@@ -21,13 +20,15 @@ module GHC.Stg.Lift.Analysis (
   ) where
 
 import GHC.Prelude
+
 import GHC.Platform
+import GHC.Platform.Profile
 
 import GHC.Types.Basic
 import GHC.Types.Demand
-import GHC.Driver.Session
 import GHC.Types.Id
 import GHC.Runtime.Heap.Layout ( WordOff )
+import GHC.Stg.Lift.Config
 import GHC.Stg.Syntax
 import qualified GHC.StgToCmm.ArgRep  as StgToCmm.ArgRep
 import qualified GHC.StgToCmm.Closure as StgToCmm.Closure
@@ -93,7 +94,7 @@ import Data.Maybe ( mapMaybe )
 --
 --   * 'ClosureSk', representing closure allocation.
 --   * 'RhsSk', representing a RHS of a binding and how many times it's called
---     by an appropriate 'DmdShell'.
+--     by an appropriate 'Card'.
 --   * 'AltSk', 'BothSk' and 'NilSk' for choice, sequence and empty element.
 --
 -- This abstraction is mostly so that the main analysis function 'closureGrowth'
@@ -114,15 +115,12 @@ type instance XRhsClosure  'LiftLams = DIdSet
 type instance XLet         'LiftLams = Skeleton
 type instance XLetNoEscape 'LiftLams = Skeleton
 
-freeVarsOfRhs :: (XRhsClosure pass ~ DIdSet) => GenStgRhs pass -> DIdSet
-freeVarsOfRhs (StgRhsCon _ _ args) = mkDVarSet [ id | StgVarArg id <- args ]
-freeVarsOfRhs (StgRhsClosure fvs _ _ _ _) = fvs
 
 -- | Captures details of the syntax tree relevant to the cost model, such as
 -- closures, multi-shot lambdas and case expressions.
 data Skeleton
   = ClosureSk !Id !DIdSet {- ^ free vars -} !Skeleton
-  | RhsSk !DmdShell {- ^ how often the RHS was entered -} !Skeleton
+  | RhsSk !Card {- ^ how often the RHS was entered -} !Skeleton
   | AltSk !Skeleton !Skeleton
   | BothSk !Skeleton !Skeleton
   | NilSk
@@ -137,7 +135,7 @@ altSk NilSk b = b
 altSk a NilSk = a
 altSk a b     = AltSk a b
 
-rhsSk :: DmdShell -> Skeleton -> Skeleton
+rhsSk :: Card -> Skeleton -> Skeleton
 rhsSk _        NilSk = NilSk
 rhsSk body_dmd skel  = RhsSk body_dmd skel
 
@@ -170,22 +168,12 @@ instance Outputable Skeleton where
     ]
   ppr (BothSk l r) = ppr l $$ ppr r
   ppr (ClosureSk f fvs body) = ppr f <+> ppr fvs $$ nest 2 (ppr body)
-  ppr (RhsSk body_dmd body) = hcat
-    [ text "λ["
-    , ppr str
-    , text ", "
-    , ppr use
-    , text "]. "
+  ppr (RhsSk card body) = hcat
+    [ lambda
+    , ppr card
+    , dot
     , ppr body
     ]
-    where
-      str
-        | isStrictDmd body_dmd = '1'
-        | otherwise = '0'
-      use
-        | isAbsDmd body_dmd = '0'
-        | isUsedOnce body_dmd = '1'
-        | otherwise = 'ω'
 
 instance Outputable BinderInfo where
   ppr = ppr . binderInfoBndr
@@ -219,8 +207,8 @@ tagSkeletonTopBind bind = bind'
 tagSkeletonExpr :: CgStgExpr -> (Skeleton, IdSet, LlStgExpr)
 tagSkeletonExpr (StgLit lit)
   = (NilSk, emptyVarSet, StgLit lit)
-tagSkeletonExpr (StgConApp con args tys)
-  = (NilSk, mkArgOccs args, StgConApp con args tys)
+tagSkeletonExpr (StgConApp con mn args tys)
+  = (NilSk, mkArgOccs args, StgConApp con mn args tys)
 tagSkeletonExpr (StgOpApp op args ty)
   = (NilSk, mkArgOccs args, StgOpApp op args ty)
 tagSkeletonExpr (StgApp f args)
@@ -231,7 +219,6 @@ tagSkeletonExpr (StgApp f args)
       -- argument occurrences, see "GHC.Stg.Lift.Analysis#arg_occs".
       | null args = unitVarSet f
       | otherwise = mkArgOccs args
-tagSkeletonExpr (StgLam _ _) = pprPanic "stgLiftLams" (text "StgLam")
 tagSkeletonExpr (StgCase scrut bndr ty alts)
   = (skel, arg_occs, StgCase scrut' bndr' ty alts')
   where
@@ -324,30 +311,30 @@ tagSkeletonBinding is_lne body_skel body_arg_occs (StgRec pairs)
         bndr' = BindsClosure bndr (bndr `elemVarSet` scope_occs)
 
 tagSkeletonRhs :: Id -> CgStgRhs -> (Skeleton, IdSet, LlStgRhs)
-tagSkeletonRhs _ (StgRhsCon ccs dc args)
-  = (NilSk, mkArgOccs args, StgRhsCon ccs dc args)
+tagSkeletonRhs _ (StgRhsCon ccs dc mn ts args)
+  = (NilSk, mkArgOccs args, StgRhsCon ccs dc mn ts args)
 tagSkeletonRhs bndr (StgRhsClosure fvs ccs upd bndrs body)
   = (rhs_skel, body_arg_occs, StgRhsClosure fvs ccs upd bndrs' body')
   where
     bndrs' = map BoringBinder bndrs
     (body_skel, body_arg_occs, body') = tagSkeletonExpr body
-    rhs_skel = rhsSk (rhsDmdShell bndr) body_skel
+    rhs_skel = rhsSk (rhsCard bndr) body_skel
 
 -- | How many times will the lambda body of the RHS bound to the given
 -- identifier be evaluated, relative to its defining context? This function
--- computes the answer in form of a 'DmdShell'.
-rhsDmdShell :: Id -> DmdShell
-rhsDmdShell bndr
-  | is_thunk = oneifyDmd ds
-  | otherwise = peelManyCalls (idArity bndr) cd
+-- computes the answer in form of a 'Card'.
+rhsCard :: Id -> Card
+rhsCard bndr
+  | is_thunk  = oneifyCard n
+  | otherwise = fst (peelManyCalls (idArity bndr) cd)
   where
     is_thunk = idArity bndr == 0
     -- Let's pray idDemandInfo is still OK after unarise...
-    (ds, cd) = toCleanDmd (idDemandInfo bndr)
+    n :* cd = idDemandInfo bndr
 
 tagSkeletonAlt :: CgStgAlt -> (Skeleton, IdSet, LlStgAlt)
-tagSkeletonAlt (con, bndrs, rhs)
-  = (alt_skel, arg_occs, (con, map BoringBinder bndrs, rhs'))
+tagSkeletonAlt old@GenStgAlt{alt_con=_, alt_bndrs=bndrs, alt_rhs=rhs}
+  = (alt_skel, arg_occs, old {alt_bndrs=fmap BoringBinder bndrs, alt_rhs=rhs'})
   where
     (alt_skel, alt_arg_occs, rhs') = tagSkeletonExpr rhs
     arg_occs = alt_arg_occs `delVarSetList` bndrs
@@ -355,7 +342,7 @@ tagSkeletonAlt (con, bndrs, rhs)
 -- | Combines several heuristics to decide whether to lambda-lift a given
 -- @let@-binding to top-level. See "GHC.Stg.Lift.Analysis#when" for details.
 goodToLift
-  :: DynFlags
+  :: StgLiftConfig
   -> TopLevelFlag
   -> RecFlag
   -> (DIdSet -> DIdSet) -- ^ An expander function, turning 'InId's into
@@ -365,7 +352,7 @@ goodToLift
   -> Maybe DIdSet       -- ^ @Just abs_ids@ <=> This binding is beneficial to
                         -- lift and @abs_ids@ are the variables it would
                         -- abstract over
-goodToLift dflags top_lvl rec_flag expander pairs scope = decide
+goodToLift cfg top_lvl rec_flag expander pairs scope = decide
   [ ("top-level", isTopLevel top_lvl) -- keep in sync with Note [When to lift]
   , ("memoized", any_memoized)
   , ("argument occurrences", arg_occs)
@@ -375,7 +362,8 @@ goodToLift dflags top_lvl rec_flag expander pairs scope = decide
   , ("args spill on stack", args_spill_on_stack)
   , ("increases allocation", inc_allocs)
   ] where
-      platform = targetPlatform dflags
+      profile  = c_targetProfile cfg
+      platform = profilePlatform profile
       decide deciders
         | not (fancy_or deciders)
         = llTrace "stgLiftLams:lifting"
@@ -443,7 +431,7 @@ goodToLift dflags top_lvl rec_flag expander pairs scope = decide
       -- idArity f > 0 ==> known
       known_fun id = idArity id > 0
       abstracts_known_local_fun
-        = not (liftLamsKnown dflags) && any known_fun (dVarSetElems abs_ids)
+        = not (c_liftLamsKnown cfg) && any known_fun (dVarSetElems abs_ids)
 
       -- Number of arguments of a RHS in the current binding group if we decide
       -- to lift it
@@ -453,8 +441,8 @@ goodToLift dflags top_lvl rec_flag expander pairs scope = decide
         . (dVarSetElems abs_ids ++)
         . rhsLambdaBndrs
       max_n_args
-        | isRec rec_flag = liftLamsRecArgs dflags
-        | otherwise      = liftLamsNonRecArgs dflags
+        | isRec rec_flag = c_liftLamsRecArgs cfg
+        | otherwise      = c_liftLamsNonRecArgs cfg
       -- We have 5 hardware registers on x86_64 to pass arguments in. Any excess
       -- args are passed on the stack, which means slow memory accesses
       args_spill_on_stack
@@ -472,7 +460,7 @@ goodToLift dflags top_lvl rec_flag expander pairs scope = decide
       -- GHC does not currently share closure environments, and we either lift
       -- the entire recursive binding group or none of it.
       closuresSize = sum $ flip map rhss $ \rhs ->
-        closureSize dflags
+        closureSize profile
         . dVarSetElems
         . expander
         . flip dVarSetMinusVarSet bndrs_set
@@ -485,14 +473,14 @@ rhsLambdaBndrs (StgRhsClosure _ _ _ bndrs _) = map binderInfoBndr bndrs
 
 -- | The size in words of a function closure closing over the given 'Id's,
 -- including the header.
-closureSize :: DynFlags -> [Id] -> WordOff
-closureSize dflags ids = words + sTD_HDR_SIZE dflags
+closureSize :: Profile -> [Id] -> WordOff
+closureSize profile ids = words + pc_STD_HDR_SIZE (platformConstants (profilePlatform profile))
   -- We go through sTD_HDR_SIZE rather than fixedHdrSizeW so that we don't
   -- optimise differently when profiling is enabled.
   where
     (words, _, _)
       -- Functions have a StdHeader (as opposed to ThunkHeader).
-      = StgToCmm.Layout.mkVirtHeapOffsets dflags StgToCmm.Layout.StdHeader
+      = StgToCmm.Layout.mkVirtHeapOffsets profile StgToCmm.Layout.StdHeader
       . StgToCmm.Closure.addIdReps
       . StgToCmm.Closure.nonVoidIds
       $ ids
@@ -504,7 +492,7 @@ closureSize dflags ids = words + sTD_HDR_SIZE dflags
 idClosureFootprint:: Platform -> Id -> WordOff
 idClosureFootprint platform
   = StgToCmm.ArgRep.argRepSizeW platform
-  . StgToCmm.ArgRep.idArgRep
+  . StgToCmm.ArgRep.idArgRep platform
 
 -- | @closureGrowth expander sizer f fvs@ computes the closure growth in words
 -- as a result of lifting @f@ to top-level. If there was any growing closure
@@ -547,7 +535,7 @@ closureGrowth expander sizer group abs_ids = go
         -- Lifting @f@ removes @f@ from the closure but adds all @newbies@
         cost = nonDetStrictFoldDVarSet (\id size -> sizer id + size) 0 newbies - n_occs
         -- Using a non-deterministic fold is OK here because addition is commutative.
-    go (RhsSk body_dmd body)
+    go (RhsSk n body)
       -- The conservative assumption would be that
       --   1. Every RHS with positive growth would be called multiple times,
       --      modulo thunks.
@@ -558,11 +546,11 @@ closureGrowth expander sizer group abs_ids = go
       -- considering information from the demand analyser, which provides us
       -- with conservative estimates on minimum and maximum evaluation
       -- cardinality. The @body_dmd@ part of 'RhsSk' is the result of
-      -- 'rhsDmdShell' and accurately captures the cardinality of the RHSs body
+      -- 'rhsCard' and accurately captures the cardinality of the RHSs body
       -- relative to its defining context.
-      | isAbsDmd body_dmd   = 0
-      | cg <= 0             = if isStrictDmd body_dmd then cg else 0
-      | isUsedOnce body_dmd = cg
-      | otherwise           = infinity
+      | isAbs n      = 0
+      | cg <= 0      = if isStrict n then cg else 0
+      | isUsedOnce n = cg
+      | otherwise    = infinity
       where
         cg = go body

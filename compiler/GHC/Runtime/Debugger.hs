@@ -1,5 +1,3 @@
-{-# LANGUAGE MagicHash #-}
-
 -----------------------------------------------------------------------------
 --
 -- GHCi Interactive debugging commands
@@ -16,32 +14,41 @@ module GHC.Runtime.Debugger (pprintClosureCommand, showTerm, pprTypeAndContents)
 
 import GHC.Prelude
 
-import GHC.Runtime.Linker
-import GHC.Runtime.Heap.Inspect
+import GHC
 
-import GHC.Runtime.Interpreter
-import GHCi.RemoteTypes
+import GHC.Driver.Session
+import GHC.Driver.Ppr
 import GHC.Driver.Monad
-import GHC.Driver.Types
-import GHC.Types.Id
+import GHC.Driver.Env
+
+import GHC.Linker.Loader
+
+import GHC.Runtime.Heap.Inspect
+import GHC.Runtime.Interpreter
+import GHC.Runtime.Context
+
 import GHC.Iface.Syntax ( showToHeader )
 import GHC.Iface.Env    ( newInteractiveBinder )
+import GHC.Core.Type
+
+import GHC.Utils.Outputable
+import GHC.Utils.Error
+import GHC.Utils.Monad
+import GHC.Utils.Exception
+import GHC.Utils.Logger
+
+import GHC.Types.Id
+import GHC.Types.Id.Make (ghcPrimIds)
 import GHC.Types.Name
 import GHC.Types.Var hiding ( varName )
 import GHC.Types.Var.Set
 import GHC.Types.Unique.Set
-import GHC.Core.Type
-import GHC
-import GHC.Utils.Outputable
-import GHC.Core.Ppr.TyThing
-import GHC.Utils.Error
-import GHC.Utils.Monad
-import GHC.Driver.Session
-import GHC.Utils.Exception
+import GHC.Types.TyThing.Ppr
+import GHC.Types.TyThing
 
 import Control.Monad
 import Control.Monad.Catch as MC
-import Data.List ( (\\) )
+import Data.List ( (\\), partition )
 import Data.Maybe
 import Data.IORef
 
@@ -54,24 +61,45 @@ pprintClosureCommand bindThings force str = do
                  mapM (\w -> GHC.parseName w >>=
                                 mapM GHC.lookupName)
                       (words str)
-  let ids = [id | AnId id <- tythings]
+
+  -- Sort out good and bad tythings for :print and friends
+  let (pprintables, unpprintables) = partition can_pprint tythings
 
   -- Obtain the terms and the recovered type information
+  let ids = [id | AnId id <- pprintables]
   (subst, terms) <- mapAccumLM go emptyTCvSubst ids
 
   -- Apply the substitutions obtained after recovering the types
   modifySession $ \hsc_env ->
     hsc_env{hsc_IC = substInteractiveContext (hsc_IC hsc_env) subst}
 
-  -- Finally, print the Terms
-  unqual  <- GHC.getPrintUnqual
+  -- Finally, print the Results
   docterms <- mapM showTerm terms
-  dflags <- getDynFlags
-  liftIO $ (printOutputForUser dflags unqual . vcat)
-           (zipWith (\id docterm -> ppr id <+> char '=' <+> docterm)
-                    ids
-                    docterms)
+  let sdocTerms = zipWith (\id docterm -> ppr id <+> char '=' <+> docterm)
+                          ids
+                          docterms
+  printSDocs $ (no_pprint <$> unpprintables) ++ sdocTerms
  where
+   -- Check whether a TyThing can be processed by :print and friends.
+   -- Take only Ids, exclude pseudoops, they don't have any HValues.
+   can_pprint :: TyThing -> Bool                              -- #19394
+   can_pprint (AnId x)
+       | x `notElem` ghcPrimIds = True
+       | otherwise              = False
+   can_pprint _                 = False
+
+   -- Create a short message for a TyThing, that cannot processed by :print
+   no_pprint :: TyThing -> SDoc
+   no_pprint tything = ppr tything <+>
+          text "is not eligible for the :print, :sprint or :force commands."
+
+   -- Helper to print out the results of :print and friends
+   printSDocs :: GhcMonad m => [SDoc] -> m ()
+   printSDocs sdocs = do
+      logger <- getLogger
+      unqual <- GHC.getPrintUnqual
+      liftIO $ printOutputForUser logger unqual $ vcat sdocs
+
    -- Do the obtainTerm--bindSuspensions-computeSubstitution dance
    go :: GhcMonad m => TCvSubst -> Id -> m (TCvSubst, Term)
    go subst id = do
@@ -89,9 +117,9 @@ pprintClosureCommand bindThings force str = do
        hsc_env <- getSession
        case (improveRTTIType hsc_env id_ty' reconstructed_type) of
          Nothing     -> return (subst, term')
-         Just subst' -> do { dflags <- GHC.getSessionDynFlags
+         Just subst' -> do { logger <- getLogger
                            ; liftIO $
-                               dumpIfSet_dyn dflags Opt_D_dump_rtti "RTTI"
+                               putDumpFileMaybe logger Opt_D_dump_rtti "RTTI"
                                  FormatText
                                  (fsep $ [text "RTTI Improvement for", ppr id,
                                   text "old substitution:" , ppr subst,
@@ -127,8 +155,8 @@ bindSuspensions t = do
       let ids = [ mkVanillaGlobal name ty
                 | (name,ty) <- zip names tys]
           new_ic = extendInteractiveContextWithIds ictxt ids
-          dl = hsc_dynLinker hsc_env
-      liftIO $ extendLinkEnv dl (zip names fhvs)
+          interp = hscInterp hsc_env
+      liftIO $ extendLoadedEnv interp (zip names fhvs)
       setSession hsc_env {hsc_IC = new_ic }
       return t'
      where
@@ -170,32 +198,36 @@ showTerm term = do
     if not (isFullyEvaluatedTerm t)
      then return Nothing
      else do
-        hsc_env <- getSession
-        dflags  <- GHC.getSessionDynFlags
-        do
-           (new_env, bname) <- bindToFreshName hsc_env ty "showme"
-           setSession new_env
-                      -- XXX: this tries to disable logging of errors
-                      -- does this still do what it is intended to do
-                      -- with the changed error handling and logging?
-           let noop_log _ _ _ _ _ = return ()
-               expr = "Prelude.return (Prelude.show " ++
+        let set_session = do
+                hsc_env <- getSession
+                (new_env, bname) <- bindToFreshName hsc_env ty "showme"
+                setSession new_env
+
+                -- this disables logging of errors
+                let noop_log _ _ _ _ = return ()
+                pushLogHookM (const noop_log)
+
+                return (hsc_env, bname)
+
+            reset_session (old_env,_) = setSession old_env
+
+        MC.bracket set_session reset_session $ \(_,bname) -> do
+           hsc_env <- getSession
+           dflags  <- GHC.getSessionDynFlags
+           let expr = "Prelude.return (Prelude.show " ++
                          showPpr dflags bname ++
                       ") :: Prelude.IO Prelude.String"
-               dl   = hsc_dynLinker hsc_env
-           GHC.setSessionDynFlags dflags{log_action=noop_log}
-           txt_ <- withExtendedLinkEnv dl
+               interp = hscInterp hsc_env
+           txt_ <- withExtendedLoadedEnv interp
                                        [(bname, fhv)]
                                        (GHC.compileExprRemote expr)
            let myprec = 10 -- application precedence. TODO Infix constructors
-           txt <- liftIO $ evalString hsc_env txt_
+           txt <- liftIO $ evalString interp txt_
            if not (null txt) then
              return $ Just $ cparen (prec >= myprec && needsParens txt)
                                     (text txt)
             else return Nothing
-         `MC.finally` do
-           setSession hsc_env
-           GHC.setSessionDynFlags dflags
+
   cPprShowable prec NewtypeWrap{ty=new_ty,wrapped_term=t} =
       cPprShowable prec t{ty=new_ty}
   cPprShowable _ _ = return Nothing

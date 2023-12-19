@@ -23,16 +23,27 @@ simplePackageTargets :: Rules ()
 simplePackageTargets = traverse_ simpleTarget targets
 
   where targets = [ (stage, target)
-                  | stage <- [minBound..maxBound]
+                  | stage <- allStages
                   , target <- knownPackages
                   ]
 
 simpleTarget :: (Stage, Package) -> Rules ()
 simpleTarget (stage, target) = do
+  root <- buildRootRules
+
   let tgt = intercalate ":" [stagestr, typ, pkgname]
   tgt ~> do
     p <- getTargetPath stage target
     need [ p ]
+    -- build the _build/ghc-stageN wrappers if this is the ghc package
+    if target == Packages.ghc
+      then need [ root -/- ("ghc-" <> stagestr) ]
+      else pure ()
+  when (stage == Stage1 && isLibrary target && target /= rts) $ do
+    let doc_tgt = intercalate ":" ["docs", pkgname]
+    doc_tgt ~> do
+      need . (:[]) =<< (pkgHaddockFile $ vanillaContext Stage1 target)
+
 
   where typ = if isLibrary target then "lib" else "exe"
         stagestr = stageString stage
@@ -47,10 +58,11 @@ getLibraryPath :: Stage -> Package -> Action FilePath
 getLibraryPath stage pkg = pkgConfFile (vanillaContext stage pkg)
 
 getProgramPath :: Stage -> Package -> Action FilePath
-getProgramPath Stage0 _ =
-  error ("Cannot build a stage 0 executable target: " ++
-         "it is the boot compiler's toolchain")
-getProgramPath stage pkg = programPath (vanillaContext (pred stage) pkg)
+getProgramPath stage pkg =
+  case stage of
+    (Stage0 GlobalLibs) -> error "Can't build executable in stageBoot"
+    (Stage0 InTreeLibs) -> programPath (vanillaContext stage0Boot pkg)
+    s -> programPath (vanillaContext (predStage s) pkg)
 
 
 -- | A phony @autocomplete@ rule that prints all valid setting keys

@@ -1,4 +1,8 @@
-{-# LANGUAGE BangPatterns, CPP #-}
+{-# LANGUAGE BangPatterns, DeriveFunctor #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE FlexibleContexts #-}
+
 
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 
@@ -23,16 +27,18 @@ import GHC.CmmToAsm.Reg.Liveness
 import GHC.CmmToAsm.Reg.Graph.Spill
 import GHC.CmmToAsm.Reg.Graph.SpillCost
 import GHC.CmmToAsm.Reg.Graph.TrivColorable
-import GHC.CmmToAsm.Instr
-import GHC.Platform.Reg.Class
-import GHC.Platform.Reg
 import GHC.CmmToAsm.Reg.Target
-import GHC.Platform
+import GHC.CmmToAsm.Instr
+import GHC.CmmToAsm.Types
 
-import GHC.Utils.Outputable
+import GHC.Platform
+import GHC.Platform.Reg
+import GHC.Platform.Reg.Class
+
 import GHC.Types.Unique.FM
 import GHC.Types.Unique.Set
-import GHC.Utils.Monad.State
+import GHC.Utils.Outputable
+import GHC.Utils.Monad.State.Strict
 
 -- | Holds interesting statistics from the register allocator.
 data RegAllocStats statics instr
@@ -112,15 +118,16 @@ data RegAllocStats statics instr
           -- | Target platform
         , raPlatform    :: !Platform
         }
+        deriving (Functor)
 
 
-instance (Outputable statics, Outputable instr)
+instance (OutputableP Platform statics, OutputableP Platform instr)
        => Outputable (RegAllocStats statics instr) where
 
  ppr (s@RegAllocStatsStart{})
     =      text "#  Start"
         $$ text "#  Native code with liveness information."
-        $$ ppr (raLiveCmm s)
+        $$ pdoc (raPlatform s) (raLiveCmm s)
         $$ text ""
         $$ text "#  Initial register conflict graph."
         $$ Color.dotGraph
@@ -135,7 +142,7 @@ instance (Outputable statics, Outputable instr)
            text "#  Spill"
 
         $$ text "#  Code with liveness information."
-        $$ ppr (raCode s)
+        $$ pdoc (raPlatform s) (raCode s)
         $$ text ""
 
         $$ (if (not $ isNullUFM $ raCoalesced s)
@@ -149,14 +156,14 @@ instance (Outputable statics, Outputable instr)
         $$ text ""
 
         $$ text "#  Code with spills inserted."
-        $$ ppr (raSpilled s)
+        $$ pdoc (raPlatform s) (raSpilled s)
 
 
  ppr (s@RegAllocStatsColored { raSRMs = (spills, reloads, moves) })
     =      text "#  Colored"
 
         $$ text "#  Code with liveness information."
-        $$ ppr (raCode s)
+        $$ pdoc (raPlatform s) (raCode s)
         $$ text ""
 
         $$ text "#  Register conflict graph (colored)."
@@ -175,19 +182,19 @@ instance (Outputable statics, Outputable instr)
                 else empty)
 
         $$ text "#  Native code after coalescings applied."
-        $$ ppr (raCodeCoalesced s)
+        $$ pdoc (raPlatform s) (raCodeCoalesced s)
         $$ text ""
 
         $$ text "#  Native code after register allocation."
-        $$ ppr (raPatched s)
+        $$ pdoc (raPlatform s) (raPatched s)
         $$ text ""
 
         $$ text "#  Clean out unneeded spill/reloads."
-        $$ ppr (raSpillClean s)
+        $$ pdoc (raPlatform s) (raSpillClean s)
         $$ text ""
 
         $$ text "#  Final code, after rewriting spill/rewrite pseudo instrs."
-        $$ ppr (raFinal s)
+        $$ pdoc (raPlatform s) (raFinal s)
         $$ text ""
         $$  text "#  Score:"
         $$ (text "#          spills  inserted: " <> int spills)

@@ -1,3 +1,8 @@
+
+{-# LANGUAGE PatternSynonyms #-}
+
+{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
+
 {-
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
 
@@ -50,9 +55,9 @@
 
   This can only work if @wild@ is an unrestricted binder. Indeed, even with the
   extended typing rule (in the linter) for case expressions, if
-       case x of wild # 1 { p -> e}
+       case x of wild % 1 { p -> e}
   is well-typed, then
-       case x of wild # 1 { p -> e[wild\x] }
+       case x of wild % 1 { p -> e[wild\x] }
   is only well-typed if @e[wild\x] = e@ (that is, if @wild@ is not used in @e@
   at all). In which case, it is, of course, pointless to do the substitution
   anyway. So for a linear binder (and really anything which isn't unrestricted),
@@ -60,9 +65,6 @@
   identity.
 -}
 
-{-# LANGUAGE CPP, MultiWayIf, PatternSynonyms #-}
-
-{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 module GHC.Core.Opt.SetLevels (
         setLevels,
 
@@ -73,8 +75,6 @@ module GHC.Core.Opt.SetLevels (
         incMinorLvl, ltMajLvl, ltLvl, isTopLvl
     ) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
 import GHC.Core
@@ -82,7 +82,6 @@ import GHC.Core.Opt.Monad ( FloatOutSwitches(..) )
 import GHC.Core.Utils   ( exprType, exprIsHNF
                         , exprOkForSpeculation
                         , exprIsTopLevelBindable
-                        , isExprLevPoly
                         , collectMakeStaticArgs
                         , mkLamTypes
                         )
@@ -90,6 +89,12 @@ import GHC.Core.Opt.Arity   ( exprBotStrictness_maybe )
 import GHC.Core.FVs     -- all of it
 import GHC.Core.Subst
 import GHC.Core.Make    ( sortQuantVars )
+import GHC.Core.Type    ( Type, splitTyConApp_maybe, tyCoVarsOfType
+                        , mightBeUnliftedType, closeOverKindsDSet
+                        , typeHasFixedRuntimeRep
+                        )
+import GHC.Core.Multiplicity     ( pattern Many )
+import GHC.Core.DataCon ( dataConOrigResTy )
 
 import GHC.Types.Id
 import GHC.Types.Id.Info
@@ -99,26 +104,30 @@ import GHC.Types.Unique.Set   ( nonDetStrictFoldUniqSet )
 import GHC.Types.Unique.DSet  ( getUniqDSet )
 import GHC.Types.Var.Env
 import GHC.Types.Literal      ( litIsTrivial )
-import GHC.Types.Demand       ( StrictSig, Demand, isStrictDmd, splitStrictSig, prependArgsStrictSig )
+import GHC.Types.Demand       ( DmdSig, Demand, isStrUsedDmd, splitDmdSig, prependArgsDmdSig )
 import GHC.Types.Cpr          ( mkCprSig, botCpr )
 import GHC.Types.Name         ( getOccName, mkSystemVarName )
 import GHC.Types.Name.Occurrence ( occNameString )
 import GHC.Types.Unique       ( hasKey )
-import GHC.Core.Type    ( Type, splitTyConApp_maybe, tyCoVarsOfType
-                        , mightBeUnliftedType, closeOverKindsDSet )
-import GHC.Core.Multiplicity     ( pattern Many )
+import GHC.Types.Tickish      ( tickishIsCode )
+import GHC.Types.Unique.Supply
+import GHC.Types.Unique.DFM
 import GHC.Types.Basic  ( Arity, RecFlag(..), isRec )
-import GHC.Core.DataCon ( dataConOrigResTy )
+
 import GHC.Builtin.Types
 import GHC.Builtin.Names      ( runRWKey )
-import GHC.Types.Unique.Supply
+
+import GHC.Data.FastString
+
+import GHC.Utils.FV
+import GHC.Utils.Monad  ( mapAccumLM )
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
-import GHC.Data.FastString
-import GHC.Types.Unique.DFM
-import GHC.Utils.FV
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
+import GHC.Utils.Trace
+
 import Data.Maybe
-import GHC.Utils.Monad  ( mapAccumLM )
 
 {-
 ************************************************************************
@@ -282,35 +291,35 @@ setLevels :: FloatOutSwitches
           -> [LevelledBind]
 
 setLevels float_lams binds us
-  = initLvl us (do_them init_env binds)
+  = initLvl us (do_them binds)
   where
-    init_env = initialEnv float_lams
+    env = initialEnv float_lams binds
 
-    do_them :: LevelEnv -> [CoreBind] -> LvlM [LevelledBind]
-    do_them _ [] = return []
-    do_them env (b:bs)
-      = do { (lvld_bind, env') <- lvlTopBind env b
-           ; lvld_binds <- do_them env' bs
+    do_them :: [CoreBind] -> LvlM [LevelledBind]
+    do_them [] = return []
+    do_them (b:bs)
+      = do { lvld_bind <- lvlTopBind env b
+           ; lvld_binds <- do_them bs
            ; return (lvld_bind : lvld_binds) }
 
-lvlTopBind :: LevelEnv -> Bind Id -> LvlM (LevelledBind, LevelEnv)
+lvlTopBind :: LevelEnv -> Bind Id -> LvlM LevelledBind
 lvlTopBind env (NonRec bndr rhs)
-  = do { rhs' <- lvl_top env NonRecursive bndr rhs
-       ; let (env', [bndr']) = substAndLvlBndrs NonRecursive env tOP_LEVEL [bndr]
-       ; return (NonRec bndr' rhs', env') }
+  = do { (bndr', rhs') <- lvl_top env NonRecursive bndr rhs
+       ; return (NonRec bndr' rhs') }
 
 lvlTopBind env (Rec pairs)
-  = do { let (env', bndrs') = substAndLvlBndrs Recursive env tOP_LEVEL
-                                               (map fst pairs)
-       ; rhss' <- mapM (\(b,r) -> lvl_top env' Recursive b r) pairs
-       ; return (Rec (bndrs' `zip` rhss'), env') }
+  = do { prs' <- mapM (\(b,r) -> lvl_top env Recursive b r) pairs
+       ; return (Rec prs') }
 
-lvl_top :: LevelEnv -> RecFlag -> Id -> CoreExpr -> LvlM LevelledExpr
+lvl_top :: LevelEnv -> RecFlag -> Id -> CoreExpr
+        -> LvlM (LevelledBndr, LevelledExpr)
+-- NB: 'env' has all the top-level binders in scope, so
+--     there is no need call substAndLvlBndrs here
 lvl_top env is_rec bndr rhs
-  = lvlRhs env is_rec
-           (isDeadEndId bndr)
-           Nothing  -- Not a join point
-           (freeVars rhs)
+  = do { rhs' <- lvlRhs env is_rec (isDeadEndId bndr)
+                                   Nothing  -- Not a join point
+                                   (freeVars rhs)
+       ; return (stayPut tOP_LEVEL bndr, rhs') }
 
 {-
 ************************************************************************
@@ -440,7 +449,7 @@ lvlApp env orig_expr ((_,AnnVar fn), args)
     arity      = idArity fn
 
     stricts :: [Demand]   -- True for strict /value/ arguments
-    stricts = case splitStrictSig (idStrictness fn) of
+    stricts = case splitDmdSig (idDmdSig fn) of
                 (arg_ds, _) | arg_ds `lengthExceeds` n_val_args
                             -> []
                             | otherwise
@@ -464,7 +473,7 @@ lvlApp env orig_expr ((_,AnnVar fn), args)
     lvl_arg :: [Demand] -> CoreExprWithFVs -> LvlM ([Demand], LevelledExpr)
     lvl_arg strs arg | (str1 : strs') <- strs
                      , is_val_arg arg
-                     = do { arg' <- lvlMFE env (isStrictDmd str1) arg
+                     = do { arg' <- lvlMFE env (isStrUsedDmd str1) arg
                           ; return (strs', arg') }
                      | otherwise
                      = do { arg' <- lvlMFE env False arg
@@ -486,7 +495,7 @@ lvlCase :: LevelEnv             -- Level of in-scope names/tyvars
         -> LvlM LevelledExpr    -- Result expression
 lvlCase env scrut_fvs scrut' case_bndr ty alts
   -- See Note [Floating single-alternative cases]
-  | [(con@(DataAlt {}), bs, body)] <- alts
+  | [AnnAlt con@(DataAlt {}) bs body] <- alts
   , exprIsHNF (deTagExpr scrut')  -- See Note [Check the output scrutinee for exprIsHNF]
   , not (isTopLvl dest_lvl)       -- Can't have top-level cases
   , not (floatTopLvlOnly env)     -- Can float anywhere
@@ -496,7 +505,7 @@ lvlCase env scrut_fvs scrut' case_bndr ty alts
     do { (env1, (case_bndr' : bs')) <- cloneCaseBndrs env dest_lvl (case_bndr : bs)
        ; let rhs_env = extendCaseBndrEnv env1 case_bndr scrut'
        ; body' <- lvlMFE rhs_env True body
-       ; let alt' = (con, map (stayPut dest_lvl) bs', body')
+       ; let alt' = Alt con (map (stayPut dest_lvl) bs') body'
        ; return (Case scrut' (TB case_bndr' (FloatMe dest_lvl)) ty' [alt']) }
 
   | otherwise     -- Stays put
@@ -511,9 +520,9 @@ lvlCase env scrut_fvs scrut' case_bndr ty alts
     dest_lvl = maxFvLevel (const True) env scrut_fvs
             -- Don't abstract over type variables, hence const True
 
-    lvl_alt alts_env (con, bs, rhs)
+    lvl_alt alts_env (AnnAlt con bs rhs)
       = do { rhs' <- lvlMFE new_env True rhs
-           ; return (con, bs', rhs') }
+           ; return (Alt con bs' rhs') }
       where
         (new_env, bs') = substAndLvlBndrs NonRecursive alts_env incd_lvl bs
 
@@ -660,9 +669,10 @@ lvlMFE env strict_ctxt ann_expr
          -- Only floating to the top level is allowed.
   || hasFreeJoin env fvs   -- If there is a free join, don't float
                            -- See Note [Free join points]
-  || isExprLevPoly expr
-         -- We can't let-bind levity polymorphic expressions
-         -- See Note [Levity polymorphism invariants] in GHC.Core
+  || not (typeHasFixedRuntimeRep (exprType expr))
+         -- We can't let-bind an expression if we don't know
+         -- how it will be represented at runtime.
+         -- See Note [Representation polymorphism invariants] in GHC.Core
   || notWorthFloating expr abs_vars
   || not float_me
   =     -- Don't float it out
@@ -696,13 +706,13 @@ lvlMFE env strict_ctxt ann_expr
        ; let l1r       = incMinorLvlFrom rhs_env
              float_rhs = mkLams abs_vars_w_lvls $
                          Case expr1 (stayPut l1r ubx_bndr) dc_res_ty
-                             [(DEFAULT, [], mkConApp dc [Var ubx_bndr])]
+                             [Alt DEFAULT [] (mkConApp dc [Var ubx_bndr])]
 
        ; var <- newLvlVar float_rhs Nothing is_mk_static
        ; let l1u      = incMinorLvlFrom env
              use_expr = Case (mkVarApps (Var var) abs_vars)
                              (stayPut l1u bx_bndr) expr_ty
-                             [(DataAlt dc, [stayPut l1u ubx_bndr], Var ubx_bndr)]
+                             [Alt (DataAlt dc) [stayPut l1u ubx_bndr] (Var ubx_bndr)]
        ; return (Let (NonRec (TB var (FloatMe dest_lvl)) float_rhs)
                      use_expr) }
 
@@ -816,7 +826,7 @@ Exammples:
      t = f (g True)
   If f is lazy, we /do/ float (g True) because then we can allocate
   the thunk statically rather than dynamically.  But if f is strict
-  we don't (see the use of idStrictness in lvlApp).  It's not clear
+  we don't (see the use of idDmdSig in lvlApp).  It's not clear
   if this test is worth the bother: it's only about CAFs!
 
 It's controlled by a flag (floatConsts), because doing this too
@@ -879,9 +889,8 @@ float a boxed version
 and replace the original (f x) with
    case (case y of I# r -> r) of r -> blah
 
-Being able to float unboxed expressions is sometimes important; see
-#12603.  I'm not sure how /often/ it is important, but it's
-not hard to achieve.
+Being able to float unboxed expressions is sometimes important; see #12603.
+I'm not sure how /often/ it is important, but it's not hard to achieve.
 
 We only do it for a fixed collection of types for which we have a
 convenient boxing constructor (see boxingDataCon_maybe).  In
@@ -1019,7 +1028,7 @@ answer.
 
 -}
 
-annotateBotStr :: Id -> Arity -> Maybe (Arity, StrictSig) -> Id
+annotateBotStr :: Id -> Arity -> Maybe (Arity, DmdSig) -> Id
 -- See Note [Bottoming floats] for why we want to add
 -- bottoming information right now
 --
@@ -1028,8 +1037,8 @@ annotateBotStr id n_extra mb_str
   = case mb_str of
       Nothing           -> id
       Just (arity, sig) -> id `setIdArity`      (arity + n_extra)
-                              `setIdStrictness` (prependArgsStrictSig n_extra sig)
-                              `setIdCprInfo`    mkCprSig (arity + n_extra) botCpr
+                              `setIdDmdSig` (prependArgsDmdSig n_extra sig)
+                              `setIdCprSig`    mkCprSig (arity + n_extra) botCpr
 
 notWorthFloating :: CoreExpr -> [Var] -> Bool
 -- Returns True if the expression would be replaced by
@@ -1047,7 +1056,7 @@ notWorthFloating e abs_vars
   = go e (count isId abs_vars)
   where
     go (Var {}) n    = n >= 0
-    go (Lit lit) n   = ASSERT( n==0 )
+    go (Lit lit) n   = assert (n==0) $
                        litIsTrivial lit   -- Note [Floating literals]
     go (Tick t e) n  = not (tickishIsCode t) && go e n
     go (Cast e _)  n = go e n
@@ -1546,9 +1555,9 @@ data LevelEnv
 
 {- Note [le_subst and le_env]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-We clone let- and case-bound variables so that they are still distinct
-when floated out; hence the le_subst/le_env.  (see point 3 of the
-module overview comment).  We also use these envs when making a
+We clone nested let- and case-bound variables so that they are still
+distinct when floated out; hence the le_subst/le_env.  (see point 3 of
+the module overview comment).  We also use these envs when making a
 variable polymorphic because we want to float it out past a big
 lambda.
 
@@ -1575,14 +1584,21 @@ The domain of the both envs is *pre-cloned* Ids, though
 The domain of the le_lvl_env is the *post-cloned* Ids
 -}
 
-initialEnv :: FloatOutSwitches -> LevelEnv
-initialEnv float_lams
-  = LE { le_switches = float_lams
-       , le_ctxt_lvl = tOP_LEVEL
+initialEnv :: FloatOutSwitches -> CoreProgram -> LevelEnv
+initialEnv float_lams binds
+  = LE { le_switches  = float_lams
+       , le_ctxt_lvl  = tOP_LEVEL
        , le_join_ceil = panic "initialEnv"
-       , le_lvl_env = emptyVarEnv
-       , le_subst = emptySubst
-       , le_env = emptyVarEnv }
+       , le_lvl_env   = emptyVarEnv
+       , le_subst     = mkEmptySubst in_scope_toplvl
+       , le_env       = emptyVarEnv }
+  where
+    in_scope_toplvl = emptyInScopeSet `extendInScopeSetList` bindersOfBinds binds
+      -- The Simplifier (see Note [Glomming] in GHC.Core.Opt.OccurAnal) and
+      -- the specialiser (see Note [Top level scope] in GHC.Core.Opt.Specialise)
+      -- may both produce top-level bindings where an early binding refers
+      -- to a later one.  So here we put all the top-level binders in scope before
+      -- we start, to satisfy the lookupIdSubst invariants (#20200 and #20294)
 
 addLvl :: Level -> VarEnv Level -> OutVar -> VarEnv Level
 addLvl dest_lvl env v' = extendVarEnv env v' dest_lvl
@@ -1685,9 +1701,9 @@ abstractVars dest_lvl (LE { le_subst = subst, le_lvl_env = lvl_env }) in_fvs
 
         -- We are going to lambda-abstract, so nuke any IdInfo,
         -- and add the tyvars of the Id (if necessary)
-    zap v | isId v = WARN( isStableUnfolding (idUnfolding v) ||
-                           not (isEmptyRuleInfo (idSpecialisation v)),
-                           text "absVarsOf: discarding info on" <+> ppr v )
+    zap v | isId v = warnPprTrace (isStableUnfolding (idUnfolding v) ||
+                           not (isEmptyRuleInfo (idSpecialisation v)))
+                           "absVarsOf: discarding info on" (ppr v) $
                      setIdInfo v vanillaIdInfo
           | otherwise = v
 
@@ -1703,7 +1719,7 @@ newPolyBndrs :: Level -> LevelEnv -> [OutVar] -> [InId]
 newPolyBndrs dest_lvl
              env@(LE { le_lvl_env = lvl_env, le_subst = subst, le_env = id_env })
              abs_vars bndrs
- = ASSERT( all (not . isCoVar) bndrs )   -- What would we add to the CoSubst in this case. No easy answer.
+ = assert (all (not . isCoVar) bndrs) $   -- What would we add to the CoSubst in this case. No easy answer.
    do { uniqs <- getUniquesM
       ; let new_bndrs = zipWith mk_poly_bndr bndrs uniqs
             bndr_prs  = bndrs `zip` new_bndrs
@@ -1802,7 +1818,7 @@ cloneLetVars is_rec
 add_id :: IdEnv ([Var], LevelledExpr) -> (Var, Var) -> IdEnv ([Var], LevelledExpr)
 add_id id_env (v, v1)
   | isTyVar v = delVarEnv    id_env v
-  | otherwise = extendVarEnv id_env v ([v1], ASSERT(not (isCoVar v1)) Var v1)
+  | otherwise = extendVarEnv id_env v ([v1], assert (not (isCoVar v1)) $ Var v1)
 
 {-
 Note [Zapping the demand info]

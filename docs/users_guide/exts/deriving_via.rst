@@ -13,9 +13,11 @@ Deriving via
     :since: 8.6.1
 
 This allows ``deriving`` a class instance for a type by specifying
-another type of equal runtime representation (such that there exists a
-``Coercible`` instance between the two: see :ref:`coercible`) that is
-already an instance of the that class.
+another type that is already an instance of that class.
+This only makes sense if the methods have identical runtime representations,
+in the sense that coerce (see The ``Coercible`` constraint) can convert
+the existing implementation into the desired implementation.
+The generated code will be rejected with a type error otherwise.
 
 :extension:`DerivingVia` is indicated by the use of the ``via``
 deriving strategy. ``via`` requires specifying another type (the ``via`` type)
@@ -105,7 +107,7 @@ The only restriction is that it is coercible with the
 original data type. This means there can be arbitrary nesting of newtypes,
 as in the following example: ::
 
-    newtype Kleisli m a b = (a -> m b)
+    newtype Kleisli m a b = Kleisli (a -> m b)
       deriving (Semigroup, Monoid)
         via (a -> App m b)
 

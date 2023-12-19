@@ -16,22 +16,20 @@
  *
  * --------------------------------------------------------------------------*/
 
-#include "PosixSource.h"
+#include "rts/PosixSource.h"
 #include "Rts.h"
 
 #include "Capability.h"
 #include "Schedule.h"
 #include "Sparks.h"
 #include "Trace.h"
+#include "eventlog/EventLog.h" // for flushLocalEventsBuf
 #include "sm/GC.h" // for gcWorkerThread()
 #include "STM.h"
 #include "RtsUtils.h"
 #include "sm/OSMem.h"
 #include "sm/BlockAlloc.h" // for countBlocks()
-
-#if !defined(mingw32_HOST_OS)
-#include "rts/IOManager.h" // for setIOManagerControlFd()
-#endif
+#include "IOManager.h"
 
 #include <string.h>
 
@@ -84,8 +82,8 @@ Capability * rts_unsafeGetMyCapability (void)
 STATIC_INLINE bool
 globalWorkToDo (void)
 {
-    return RELAXED_LOAD(&sched_state) >= SCHED_INTERRUPTING
-      || RELAXED_LOAD(&recent_activity) == ACTIVITY_INACTIVE; // need to check for deadlock
+    return getSchedState() >= SCHED_INTERRUPTING
+      || getRecentActivity() == ACTIVITY_INACTIVE; // need to check for deadlock
 }
 #endif
 
@@ -98,7 +96,8 @@ findSpark (Capability *cap)
   bool retry;
   uint32_t i = 0;
 
-  if (!emptyRunQueue(cap) || cap->n_returning_tasks != 0) {
+  // This is an approximate check so relaxed load is acceptable here.
+  if (!emptyRunQueue(cap) || RELAXED_LOAD(&cap->n_returning_tasks) != 0) {
       // If there are other threads, don't try to run any new
       // sparks: sparks might be speculative, we don't want to take
       // resources away from the main computation.
@@ -132,7 +131,7 @@ findSpark (Capability *cap)
           retry = true;
       }
 
-      if (n_capabilities == 1) { return NULL; } // makes no sense...
+      if (getNumCapabilities() == 1) { return NULL; } // makes no sense...
 
       debugTrace(DEBUG_sched,
                  "cap %d: Trying to steal work from other capabilities",
@@ -140,8 +139,8 @@ findSpark (Capability *cap)
 
       /* visit cap.s 0..n-1 in sequence until a theft succeeds. We could
       start at a random place instead of 0 as well.  */
-      for ( i=0 ; i < n_capabilities ; i++ ) {
-          robbed = capabilities[i];
+      for ( i=0 ; i < getNumCapabilities() ; i++ ) {
+          robbed = getCapability(i);
           if (cap == robbed)  // ourselves...
               continue;
 
@@ -183,8 +182,8 @@ anySparks (void)
 {
     uint32_t i;
 
-    for (i=0; i < n_capabilities; i++) {
-        if (!emptySparkPoolCap(capabilities[i])) {
+    for (i=0; i < getNumCapabilities(); i++) {
+        if (!emptySparkPoolCap(getCapability(i))) {
             return true;
         }
     }
@@ -295,6 +294,7 @@ initCapability (Capability *cap, uint32_t i)
     cap->saved_mut_lists = stgMallocBytes(sizeof(bdescr *) *
                                           RtsFlags.GcFlags.generations,
                                           "initCapability");
+    cap->current_segments = NULL;
 
 
     // At this point storage manager is not initialized yet, so this will be
@@ -315,6 +315,7 @@ initCapability (Capability *cap, uint32_t i)
     cap->interrupt = 0;
     cap->pinned_object_block = NULL;
     cap->pinned_object_blocks = NULL;
+    cap->pinned_object_empty = NULL;
 
 #if defined(PROFILING)
     cap->r.rCCCS = CCS_SYSTEM;
@@ -408,7 +409,7 @@ void initCapabilities (void)
     // a worker Task to each Capability, which will quickly put the
     // Capability on the free list when it finds nothing to do.
     for (i = 0; i < n_numa_nodes; i++) {
-        last_free_capability[i] = capabilities[0];
+        last_free_capability[i] = getCapability(0);
     }
 }
 
@@ -438,8 +439,9 @@ moreCapabilities (uint32_t from USED_IF_THREADS, uint32_t to USED_IF_THREADS)
             if (i < from) {
                 new_capabilities[i] = capabilities[i];
             } else {
-                new_capabilities[i] = stgMallocBytes(sizeof(Capability),
-                                                     "moreCapabilities");
+                new_capabilities[i] = stgMallocAlignedBytes(sizeof(Capability),
+                                                            CAPABILITY_ALIGNMENT,
+                                                            "moreCapabilities");
                 initCapability(new_capabilities[i], i);
             }
         }
@@ -465,16 +467,16 @@ moreCapabilities (uint32_t from USED_IF_THREADS, uint32_t to USED_IF_THREADS)
 void contextSwitchAllCapabilities(void)
 {
     uint32_t i;
-    for (i=0; i < n_capabilities; i++) {
-        contextSwitchCapability(capabilities[i]);
+    for (i=0; i < getNumCapabilities(); i++) {
+        contextSwitchCapability(getCapability(i));
     }
 }
 
 void interruptAllCapabilities(void)
 {
     uint32_t i;
-    for (i=0; i < n_capabilities; i++) {
-        interruptCapability(capabilities[i]);
+    for (i=0; i < getNumCapabilities(); i++) {
+        interruptCapability(getCapability(i));
     }
 }
 
@@ -582,7 +584,7 @@ releaseCapability_ (Capability* cap,
         // is interrupted, we only create a worker task if there
         // are threads that need to be completed.  If the system is
         // shutting down, we never create a new worker.
-        if (RELAXED_LOAD(&sched_state) < SCHED_SHUTTING_DOWN || !emptyRunQueue(cap)) {
+        if (getSchedState() < SCHED_SHUTTING_DOWN || !emptyRunQueue(cap)) {
             debugTrace(DEBUG_sched,
                        "starting new worker on capability %d", cap->no);
             startWorkerTask(cap);
@@ -660,7 +662,6 @@ enqueueWorker (Capability* cap USED_IF_THREADS)
 /*
  * Note [Benign data race due to work-pushing]
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
- *
  * #17276 points out a tricky data race (noticed by ThreadSanitizer) between
  * waitForWorkerCapability and schedulePushWork. In short, schedulePushWork
  * works as follows:
@@ -829,8 +830,7 @@ static Capability * find_capability_for_task(const Task * task)
 {
     if (task->preferred_capability != -1) {
         // Does the task have a preferred capability? If so, use it
-        return capabilities[task->preferred_capability %
-                            enabled_capabilities];
+        return getCapability(task->preferred_capability % enabled_capabilities);
     } else {
         // Try last_free_capability first
         Capability *cap = RELAXED_LOAD(&last_free_capability[task->node]);
@@ -847,8 +847,8 @@ static Capability * find_capability_for_task(const Task * task)
                   i += n_numa_nodes) {
                 // visits all the capabilities on this node, because
                 // cap[i]->node == i % n_numa_nodes
-                if (!RELAXED_LOAD(&capabilities[i]->running_task)) {
-                    return capabilities[i];
+                if (!RELAXED_LOAD(&getCapability(i)->running_task)) {
+                    return getCapability(i);
                 }
             }
 
@@ -947,7 +947,15 @@ void waitForCapability (Capability **pCap, Task *task)
 /* See Note [GC livelock] in Schedule.c for why we have gcAllowed
    and return the bool */
 bool /* Did we GC? */
-yieldCapability (Capability** pCap, Task *task, bool gcAllowed)
+yieldCapability
+    ( Capability** pCap     // [in/out] Task's owned capability. Set to the
+                            //          newly owned capability on return.
+                            //          Precondition:
+                            //              pCap != NULL
+                            //              && *pCap != NULL
+    , Task *task            // [in] This thread's task.
+    , bool gcAllowed
+    )
 {
     Capability *cap = *pCap;
 
@@ -972,6 +980,10 @@ yieldCapability (Capability** pCap, Task *task, bool gcAllowed)
 
             case SYNC_FLUSH_UPD_REM_SET:
                 debugTrace(DEBUG_nonmoving_gc, "Flushing update remembered set blocks...");
+                break;
+
+            case SYNC_FLUSH_EVENT_LOG:
+                /* N.B. the actual flushing is performed by flushEventLog */
                 break;
 
             default:
@@ -1027,7 +1039,6 @@ yieldCapability (Capability** pCap, Task *task, bool gcAllowed)
 /*
  * Note [migrated bound threads]
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
- *
  * There's a tricky case where:
  *    - cap A is running an unbound thread T1
  *    - there is a bound thread T2 at the head of the run queue on cap A
@@ -1048,7 +1059,6 @@ yieldCapability (Capability** pCap, Task *task, bool gcAllowed)
  *
  * Note [migrated bound threads 2]
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
- *
  * Second tricky case;
  *   - A bound Task becomes a GC thread
  *   - scheduleDoGC() migrates the thread belonging to this Task,
@@ -1146,7 +1156,7 @@ shutdownCapability (Capability *cap USED_IF_THREADS,
     // isn't safe, for one thing).
 
     for (i = 0; /* i < 50 */; i++) {
-        ASSERT(sched_state == SCHED_SHUTTING_DOWN);
+        ASSERT(getSchedState() == SCHED_SHUTTING_DOWN);
 
         debugTrace(DEBUG_sched,
                    "shutting down capability %d, attempt %d", cap->no, i);
@@ -1210,7 +1220,15 @@ shutdownCapability (Capability *cap USED_IF_THREADS,
             //
             // To reproduce this deadlock: run ffi002(threaded1)
             // repeatedly on a loaded machine.
-            ioManagerDie();
+            //
+            // FIXME: stopIOManager is not a per-capability action. It shuts
+            // down the I/O subsystem for all capabilities, but here we call
+            // it once per cap, so this is accidentally quadratic, but mainly
+            // it is confusing. Replace this with a per-capability stop, and
+            // perhaps make it synchronous so it works the first time and we
+            // don't have to come back and try again here.
+            //
+            stopIOManager();
             yieldThread();
             continue;
         }
@@ -1233,9 +1251,9 @@ void
 shutdownCapabilities(Task *task, bool safe)
 {
     uint32_t i;
-    for (i=0; i < n_capabilities; i++) {
+    for (i=0; i < getNumCapabilities(); i++) {
         ASSERT(task->incall->tso == NULL);
-        shutdownCapability(capabilities[i], task, safe);
+        shutdownCapability(getCapability(i), task, safe);
     }
 #if defined(THREADED_RTS)
     ASSERT(checkSparkCountInvariant());
@@ -1247,6 +1265,9 @@ freeCapability (Capability *cap)
 {
     stgFree(cap->mut_lists);
     stgFree(cap->saved_mut_lists);
+    if (cap->current_segments) {
+        stgFree(cap->current_segments);
+    }
 #if defined(THREADED_RTS)
     freeSparkPool(cap->sparks);
 #endif
@@ -1260,10 +1281,12 @@ freeCapabilities (void)
 {
 #if defined(THREADED_RTS)
     uint32_t i;
-    for (i=0; i < n_capabilities; i++) {
-        freeCapability(capabilities[i]);
-        if (capabilities[i] != &MainCapability)
-            stgFree(capabilities[i]);
+    for (i=0; i < getNumCapabilities(); i++) {
+        Capability *cap = getCapability(i);
+        freeCapability(cap);
+        if (cap != &MainCapability) {
+            stgFreeAligned(capabilities[i]);
+        }
     }
 #else
     freeCapability(&MainCapability);
@@ -1314,8 +1337,8 @@ void
 markCapabilities (evac_fn evac, void *user)
 {
     uint32_t n;
-    for (n = 0; n < n_capabilities; n++) {
-        markCapability(evac, user, capabilities[n], false);
+    for (n = 0; n < getNumCapabilities(); n++) {
+        markCapability(evac, user, getCapability(n), false);
     }
 }
 
@@ -1326,14 +1349,15 @@ bool checkSparkCountInvariant (void)
     StgWord64 remaining = 0;
     uint32_t i;
 
-    for (i = 0; i < n_capabilities; i++) {
-        sparks.created   += capabilities[i]->spark_stats.created;
-        sparks.dud       += capabilities[i]->spark_stats.dud;
-        sparks.overflowed+= capabilities[i]->spark_stats.overflowed;
-        sparks.converted += capabilities[i]->spark_stats.converted;
-        sparks.gcd       += capabilities[i]->spark_stats.gcd;
-        sparks.fizzled   += capabilities[i]->spark_stats.fizzled;
-        remaining        += sparkPoolSize(capabilities[i]->sparks);
+    for (i = 0; i < getNumCapabilities(); i++) {
+        Capability *cap = getCapability(i);
+        sparks.created   += cap->spark_stats.created;
+        sparks.dud       += cap->spark_stats.dud;
+        sparks.overflowed+= cap->spark_stats.overflowed;
+        sparks.converted += cap->spark_stats.converted;
+        sparks.gcd       += cap->spark_stats.gcd;
+        sparks.fizzled   += cap->spark_stats.fizzled;
+        remaining        += sparkPoolSize(cap->sparks);
     }
 
     /* The invariant is
@@ -1347,18 +1371,5 @@ bool checkSparkCountInvariant (void)
     return (sparks.created ==
               sparks.converted + remaining + sparks.gcd + sparks.fizzled);
 
-}
-#endif
-
-#if !defined(mingw32_HOST_OS)
-void
-setIOManagerControlFd(uint32_t cap_no USED_IF_THREADS, int fd USED_IF_THREADS) {
-#if defined(THREADED_RTS)
-    if (cap_no < n_capabilities) {
-        RELAXED_STORE(&capabilities[cap_no]->io_manager_control_wr_fd, fd);
-    } else {
-        errorBelch("warning: setIOManagerControlFd called with illegal capability number.");
-    }
-#endif
 }
 #endif

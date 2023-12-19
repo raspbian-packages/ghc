@@ -14,7 +14,7 @@
 # Building the RTS
 
 # We build the RTS with stage 1
-rts_dist_HC = $(GHC_STAGE1)
+rts_dist-install_HC = $(GHC_STAGE1)
 
 rts_INSTALL_INFO = rts
 rts_VERSION = 1.0.2
@@ -29,9 +29,9 @@ rts_WINVER = 0x06010000
 
 # merge GhcLibWays and GhcRTSWays but strip out duplicates
 rts_WAYS = $(GhcLibWays) $(filter-out $(GhcLibWays),$(GhcRTSWays))
-rts_dist_WAYS = $(rts_WAYS)
+rts_dist-install_WAYS = $(rts_WAYS)
 
-ALL_RTS_LIBS = $(foreach way,$(rts_WAYS),rts/dist/build/libHSrts$($(way)_libsuf))
+ALL_RTS_LIBS = $(foreach way,$(rts_WAYS),rts/dist-install/build/libHSrts$($(way)_libsuf))
 $(eval $(call all-target,rts,$(ALL_RTS_LIBS)))
 
 # -----------------------------------------------------------------------------
@@ -64,15 +64,22 @@ endif
 ifneq "$(CLEANING)" "YES"
 # N.B. we don't source config.mk when CLEANING=YES so none of the below
 # variables will be set. See #20166.
+rts_C_SRCS += rts/adjustor/AdjustorPool.c
 ifeq "$(UseLibffiForAdjustors)" "YES"
 rts_C_SRCS += rts/adjustor/LibffiAdjustor.c
 else
 ifneq "$(findstring $(TargetArch_CPP), i386)" ""
-rts_S_SRCS += rts/AdjustorAsm.S
+rts_S_SRCS += rts/adjustor/Nativei386Asm.S
 rts_C_SRCS += rts/adjustor/Nativei386.c
 else
 ifneq "$(findstring $(TargetArch_CPP), x86_64)" ""
+ifneq "$(findstring $(TargetOS_CPP), mingw32)" ""
+rts_S_SRCS += rts/adjustor/NativeAmd64MingwAsm.S
+rts_C_SRCS += rts/adjustor/NativeAmd64Mingw.c
+else
+rts_S_SRCS += rts/adjustor/NativeAmd64Asm.S
 rts_C_SRCS += rts/adjustor/NativeAmd64.c
+endif
 else
 ifneq "$(findstring $(TargetArch_CPP), powerpc64le powerpc)" ""
 rts_S_SRCS += rts/AdjustorAsm.S
@@ -90,7 +97,7 @@ ifeq "$(GhcUnregisterised)" "YES"
 GENAPPLY_OPTS = -u
 endif
 
-rts_AUTO_APPLY_CMM = rts/dist/build/AutoApply.cmm
+rts_AUTO_APPLY_CMM = rts/dist-install/build/AutoApply.cmm
 
 $(rts_AUTO_APPLY_CMM): $$(genapply_INPLACE)
 	"$(genapply_INPLACE)" >$@
@@ -99,14 +106,14 @@ $(rts_AUTO_APPLY_CMM): $$(genapply_INPLACE)
 rts_H_FILES := $(wildcard rts/*.h rts/*/*.h)
 
 ifeq "$(USE_DTRACE)" "YES"
-DTRACEPROBES_H = rts/dist/build/RtsProbes.h
+DTRACEPROBES_H = rts/dist-install/build/include/RtsProbes.h
 rts_H_FILES += $(DTRACEPROBES_H)
 endif
 
 # collect the -l and -L flags that we need to link the rts dyn lib.
 # Note that, as sed on OS X doesn't handle \+, we use [^ ][^ ]* rather
 # than [^ ]\+
-rts/dist/libs.depend : $$(ghc-pkg_INPLACE) | $$(dir $$@)/.
+rts/dist-install/libs.depend : $$(ghc-pkg_INPLACE) | $$(dir $$@)/.
 	"$(ghc-pkg_INPLACE)" --simple-output field rts extra-libraries \
 	  | sed -e 's/\([^ ][^ ]*\)/-l\1/g' > $@
 	"$(ghc-pkg_INPLACE)" --simple-output field rts library-dirs \
@@ -123,20 +130,20 @@ ifeq "$(TargetOS_CPP)" "mingw32"
 
 ALL_RTS_DEF_LIBNAMES 	= base ghc-prim
 ALL_RTS_DEF_LIBS	= \
-	rts/dist/build/win32/libHSbase.dll.a \
-	rts/dist/build/win32/libHSghc-prim.dll.a
+	rts/dist-install/build/win32/libHSbase.dll.a \
+	rts/dist-install/build/win32/libHSghc-prim.dll.a
 
 # -- import libs for the regular Haskell libraries
 define make-importlib-def # args $1 = lib name
-rts/dist/build/win32/libHS$1.def : rts/win32/libHS$1.def
+rts/dist-install/build/win32/libHS$1.def : rts/win32/libHS$1.def
 	cat rts/win32/libHS$1.def \
 		| sed "s/@LibVersion@/$$(libraries/$1_dist-install_VERSION)/" \
 		| sed "s/@ProjectVersion@/$$(ProjectVersion)/" \
-		> rts/dist/build/win32/libHS$1.def
+		> rts/dist-install/build/win32/libHS$1.def
 
-rts/dist/build/win32/libHS$1.dll.a : rts/dist/build/win32/libHS$1.def
-	"$$(DLLTOOL)" 	-d rts/dist/build/win32/libHS$1.def \
-			-l rts/dist/build/win32/libHS$1.dll.a
+rts/dist-install/build/win32/libHS$1.dll.a : rts/dist-install/build/win32/libHS$1.def
+	"$$(DLLTOOL)" 	-d rts/dist-install/build/win32/libHS$1.def \
+			-l rts/dist-install/build/win32/libHS$1.dll.a
 endef
 $(foreach lib,$(ALL_RTS_DEF_LIBNAMES),$(eval $(call make-importlib-def,$(lib))))
 endif
@@ -144,15 +151,15 @@ endif
 ifneq "$(BINDIST)" "YES"
 ifneq "$(UseSystemLibFFI)" "YES"
 ifeq "$(TargetOS_CPP)" "mingw32"
-rts/dist/build/$(LIBFFI_DLL): libffi/build/inst/bin/$(LIBFFI_DLL)
+rts/dist-install/build/$(LIBFFI_DLL): libffi/build/inst/bin/$(LIBFFI_DLL)
 	cp $< $@
 else
 # This is a little hacky. We don't know the SO version, so we only
 # depend on libffi.so, but copy libffi.so*
-rts/dist/build/lib$(LIBFFI_NAME)$(soext): libffi/build/inst/lib/lib$(LIBFFI_NAME)$(soext)
-	cp libffi/build/inst/lib/lib$(LIBFFI_NAME)$(soext)* rts/dist/build
+rts/dist-install/build/lib$(LIBFFI_NAME)$(soext): libffi/build/inst/lib/lib$(LIBFFI_NAME)$(soext)
+	cp libffi/build/inst/lib/lib$(LIBFFI_NAME)$(soext)* rts/dist-install/build
 ifeq "$(TargetOS_CPP)" "darwin"
-	install_name_tool -id @rpath/lib$(LIBFFI_NAME)$(soext) rts/dist/build/lib$(LIBFFI_NAME)$(soext)
+	install_name_tool -id @rpath/lib$(LIBFFI_NAME)$(soext) rts/dist-install/build/lib$(LIBFFI_NAME)$(soext)
 endif
 endif
 endif
@@ -171,76 +178,76 @@ define build-rts-way # args: $1 = way
 
 ifneq "$$(BINDIST)" "YES"
 
-rts_dist_$1_HC_OPTS := $$(GhcRtsHcOpts)
-rts_dist_$1_CC_OPTS := $$(GhcRtsCcOpts)
+rts_dist-install_$1_HC_OPTS := $$(GhcRtsHcOpts)
+rts_dist-install_$1_CC_OPTS := $$(GhcRtsCcOpts)
 
 # The per-way CC_OPTS
 ifneq "$$(findstring debug, $1)" ""
-rts_dist_$1_HC_OPTS += -O0
-rts_dist_$1_CC_OPTS += -fno-omit-frame-pointer -O0 -g3
+rts_dist-install_$1_HC_OPTS += -O0
+rts_dist-install_$1_CC_OPTS += -fno-omit-frame-pointer -O0 -g3
 # Useful to ensure that inline functions can be called within GDB but not
 # supported by clang
-#rts_dist_$1_CC_OPTS += -fkeep-inline-functions
+#rts_dist-install_$1_CC_OPTS += -fkeep-inline-functions
 endif
 
 ifneq "$$(findstring dyn, $1)" ""
 ifeq "$$(TargetOS_CPP)" "mingw32"
-rts_dist_$1_CC_OPTS += -DCOMPILING_WINDOWS_DLL
+rts_dist-install_$1_CC_OPTS += -DCOMPILING_WINDOWS_DLL
 endif
-rts_dist_$1_CC_OPTS += -DDYNAMIC
+rts_dist-install_$1_CC_OPTS += -DDYNAMIC
 endif
 
 
-$(call distdir-way-opts,rts,dist,$1,1) # 1 because the rts is built with stage1
-$(call c-suffix-rules,rts,dist,$1,YES)
-$(call cmm-suffix-rules,rts,dist,$1)
+$(call distdir-way-opts,rts,dist-install,$1,1) # 1 because the rts is built with stage1
+$(call c-suffix-rules,rts,dist-install,$1,YES)
+$(call cmm-suffix-rules,rts,dist-install,$1)
 
 rts_$1_LIB_FILE = libHSrts$$($1_libsuf)
-rts_$1_LIB = rts/dist/build/$$(rts_$1_LIB_FILE)
+rts_$1_LIB = rts/dist-install/build/$$(rts_$1_LIB_FILE)
 
-rts_$1_C_OBJS      = $$(patsubst rts/%.c,rts/dist/build/%.$$($1_osuf),$$(rts_C_SRCS)) $$(patsubst %.c,%.$$($1_osuf),$$(rts_$1_EXTRA_C_SRCS))
-rts_$1_C_HOOK_OBJS = $$(patsubst rts/hooks/%.c,rts/dist/build/hooks/%.$$($1_osuf),$$(rts_C_HOOK_SRCS))
-rts_$1_S_OBJS      = $$(patsubst rts/%.S,rts/dist/build/%.$$($1_osuf),$$(rts_S_SRCS))
-rts_$1_CMM_OBJS    = $$(patsubst rts/%.cmm,rts/dist/build/%.$$($1_osuf),$$(rts_CMM_SRCS)) $$(patsubst %.cmm,%.$$($1_osuf),$$(rts_AUTO_APPLY_CMM))
+rts_$1_C_OBJS      = $$(patsubst rts/%.c,rts/dist-install/build/%.$$($1_osuf),$$(rts_C_SRCS)) $$(patsubst %.c,%.$$($1_osuf),$$(rts_$1_EXTRA_C_SRCS))
+rts_$1_CXX_OBJS    = $$(patsubst rts/%.c,rts/dist-install/build/%.$$($1_osuf),$$(rts_CXX_SRCS))
+rts_$1_C_HOOK_OBJS = $$(patsubst rts/hooks/%.c,rts/dist-install/build/hooks/%.$$($1_osuf),$$(rts_C_HOOK_SRCS))
+rts_$1_S_OBJS      = $$(patsubst rts/%.S,rts/dist-install/build/%.$$($1_osuf),$$(rts_S_SRCS))
+rts_$1_CMM_OBJS    = $$(patsubst rts/%.cmm,rts/dist-install/build/%.$$($1_osuf),$$(rts_CMM_SRCS)) $$(patsubst %.cmm,%.$$($1_osuf),$$(rts_AUTO_APPLY_CMM))
 
-rts_$1_OBJS = $$(rts_$1_C_OBJS) $$(rts_$1_S_OBJS) $$(rts_$1_CMM_OBJS)
+rts_$1_OBJS = $$(rts_$1_C_OBJS) $$(rts_$1_CXX_OBJS) $$(rts_$1_S_OBJS) $$(rts_$1_CMM_OBJS)
 
 ifeq "$(USE_DTRACE)" "YES"
 ifeq "$(NEED_DTRACE_PROBES_OBJ)" "YES"
 # On Darwin we don't need to generate binary containing probes defined
 # in DTrace script, but DTrace on Solaris expects generation of binary
 # from the DTrace probes definitions
-rts_$1_DTRACE_OBJS = rts/dist/build/RtsProbes.$$($1_osuf)
+rts_$1_DTRACE_OBJS = rts/dist-install/build/RtsProbes.$$($1_osuf)
 
 $$(rts_$1_DTRACE_OBJS) : $$(rts_$1_OBJS)
 	$(DTRACE) -G -C \
-		$$(addprefix -I,$$(GHC_INCLUDE_DIRS)) \
-		-I$$(BUILD_1_INCLUDE_DIR) \
+		$$(addprefix -Irts/,$$(rts_dist-install_DIST_INCLUDE_DIRS)) \
 		-DDTRACE -s rts/RtsProbes.d \
 		-o $$@ \
 		$$(rts_$1_OBJS)
 endif
 endif
 
-rts_dist_$1_CC_OPTS += -DRtsWay=\"rts_$1\"
+rts_dist-install_$1_CC_OPTS += -DRtsWay=\"rts_$1\"
 
 # If we're compiling on windows, enforce that we only support XP+
 # Adding this here means it doesn't have to be done in individual .c files
 # and also centralizes the versioning.
 ifeq "$$(TargetOS_CPP)" "mingw32"
-rts_dist_$1_CC_OPTS += -D_WIN32_WINNT=$(rts_WINVER)
+rts_dist-install_$1_CC_OPTS += -D_WIN32_WINNT=$(rts_WINVER)
 endif
 
 ifneq "$$(UseSystemLibFFI)" "YES"
-rts_dist_FFI_SO = rts/dist/build/lib$$(LIBFFI_NAME)$$(soext)
+rts_dist-install_FFI_SO = rts/dist-install/build/lib$$(LIBFFI_NAME)$$(soext)
 else
-rts_dist_FFI_SO =
+rts_dist-install_FFI_SO =
 endif
 
 # Making a shared library for the RTS.
 ifneq "$$(findstring dyn, $1)" ""
 ifeq "$$(TargetOS_CPP)" "mingw32"
-$$(rts_$1_LIB) : $$(rts_$1_OBJS) $$(ALL_RTS_DEF_LIBS) rts/dist/libs.depend rts/dist/build/$$(LIBFFI_DLL)
+$$(rts_$1_LIB) : $$(rts_$1_OBJS) $$(ALL_RTS_DEF_LIBS) rts/dist-install/libs.depend rts/dist-install/build/$$(LIBFFI_DLL)
 	"$$(RM)" $$(RM_OPTS) $$@
 	# Call out to the shell script to decide how to build the dll.
 	# Making a shared library for the RTS.
@@ -255,15 +262,15 @@ $$(rts_$1_LIB) : $$(rts_$1_OBJS) $$(ALL_RTS_DEF_LIBS) rts/dist/libs.depend rts/d
 	# $$9  = create delay load import lib
 	# $$10 = SxS Name
 	# $$11 = SxS Version
-	$$(gen-dll_INPLACE) link "rts/dist/build" "rts/dist/build" "" "" "$$(ALL_RTS_DEF_LIBS)" "$$(rts_$1_OBJS)" "$$@" "$$(rts_dist_HC) -this-unit-id rts -no-hs-main -shared -dynamic -dynload deploy \
-         -no-auto-link-packages -Lrts/dist/build -l$$(LIBFFI_NAME) \
-         `cat rts/dist/libs.depend | tr '\n' ' '` \
-         $$(rts_dist_$1_GHC_LD_OPTS)" "NO" \
+	$$(gen-dll_INPLACE) link "rts/dist-install/build" "rts/dist-install/build" "" "" "$$(ALL_RTS_DEF_LIBS)" "$$(rts_$1_OBJS)" "$$@" "$$(rts_dist-install_HC) -this-unit-id rts -no-hs-main -shared -dynamic -dynload deploy \
+         -no-auto-link-packages -Lrts/dist-install/build -l$$(LIBFFI_NAME) \
+         `cat rts/dist-install/libs.depend | tr '\n' ' '` \
+         $$(rts_dist-install_$1_GHC_LD_OPTS)" "NO" \
          "$(rts_INSTALL_INFO)-$(subst dyn,,$(subst _dyn,,$(subst v,,$1)))" "$(ProjectVersion)"
 
 else
 ifneq "$$(UseSystemLibFFI)" "YES"
-LIBFFI_LIBS = -Lrts/dist/build -l$$(LIBFFI_NAME)
+LIBFFI_LIBS = -Lrts/dist-install/build -l$$(LIBFFI_NAME)
 ifeq "$$(TargetElf)" "YES"
 LIBFFI_LIBS += -optl-Wl,-rpath -optl-Wl,'$$$$ORIGIN' -optl-Wl,-zorigin
 endif
@@ -272,14 +279,14 @@ LIBFFI_LIBS += -optl-Wl,-rpath -optl-Wl,@loader_path
 endif
 
 else
-# flags will be taken care of in rts/dist/libs.depend
+# flags will be taken care of in rts/dist-install/libs.depend
 LIBFFI_LIBS =
 endif
-$$(rts_$1_LIB) : $$(rts_$1_OBJS) $$(rts_$1_DTRACE_OBJS) rts/dist/libs.depend $$(rts_dist_FFI_SO)
+$$(rts_$1_LIB) : $$(rts_$1_OBJS) $$(rts_$1_DTRACE_OBJS) rts/dist-install/libs.depend $$(rts_dist-install_FFI_SO)
 	"$$(RM)" $$(RM_OPTS) $$@
-	"$$(rts_dist_HC)" -this-unit-id rts -shared -dynamic -dynload deploy \
-	  -no-auto-link-packages $$(LIBFFI_LIBS) `cat rts/dist/libs.depend` $$(rts_$1_OBJS) \
-          $$(rts_dist_$1_GHC_LD_OPTS) \
+	"$$(rts_dist-install_HC)" -this-unit-id rts -shared -dynamic -dynload deploy \
+	  -no-auto-link-packages $$(LIBFFI_LIBS) `cat rts/dist-install/libs.depend` $$(rts_$1_OBJS) \
+          $$(rts_dist-install_$1_GHC_LD_OPTS) \
 	  $$(rts_$1_DTRACE_OBJS) -o $$@
 endif
 else
@@ -298,7 +305,7 @@ ifeq "$(NEED_DTRACE_PROBES_OBJ)" "YES"
 rts_$1_EXCLUDED_OBJS = $$(rts_$1_C_HOOK_OBJS)
 # The RTS object that gets generated to package up all of the runtime system
 # with the dtrace probe code.
-rts_$1_LINKED_OBJS = rts/dist/build/RTS.$$($1_osuf)
+rts_$1_LINKED_OBJS = rts/dist-install/build/RTS.$$($1_osuf)
 
 $$(rts_$1_LINKED_OBJS) : $$(rts_$1_OBJS) $$(rts_$1_DTRACE_OBJS) $$(rts_$1_C_HOOK_OBJS)
 	"$$(RM)" $$(RM_OPTS) $$@
@@ -330,8 +337,8 @@ $$(rts_$1_LIB) : $$(rts_$1_LINKED_OBJS)
 		$$(AR_OPTS_STAGE1) $$(EXTRA_AR_ARGS_STAGE1) $$@
 
 ifneq "$$(UseSystemLibFFI)" "YES"
-$$(rts_$1_LIB) : rts/dist/build/libC$$(LIBFFI_NAME)$$($1_libsuf)
-rts/dist/build/libC$$(LIBFFI_NAME)$$($1_libsuf): libffi/build/inst/lib/libffi.a
+$$(rts_$1_LIB) : rts/dist-install/build/libC$$(LIBFFI_NAME)$$($1_libsuf)
+rts/dist-install/build/libC$$(LIBFFI_NAME)$$($1_libsuf): libffi/build/inst/lib/libffi.a
 	cp $$< $$@
 endif
 
@@ -344,7 +351,7 @@ endef
 # And expand the above for each way:
 $(foreach way,$(rts_WAYS),$(eval $(call build-rts-way,$(way))))
 
-$(eval $(call distdir-opts,rts,dist,1))
+$(eval $(call distdir-opts,rts,dist-install,1))
 
 #-----------------------------------------------------------------------------
 # Flags for compiling every file
@@ -362,6 +369,7 @@ WARNING_OPTS += -Wnested-externs
 WARNING_OPTS += -Wredundant-decls
 # Some gccs annoyingly enable this archaic specimen by default
 WARNING_OPTS += -Wno-aggregate-return
+WARNING_OPTS += -Wno-unused-label
 
 # These ones are hard to avoid:
 #WARNING_OPTS += -Wconversion
@@ -378,23 +386,23 @@ WARNING_OPTS += -Wno-aggregate-return
 # support for registerised builds on this arch. -- BL 2010/02/03
 # WARNING_OPTS += -Wcast-align
 
-STANDARD_OPTS += \
-	$(addprefix -I,$(GHC_INCLUDE_DIRS)) \
-	-I$(BUILD_1_INCLUDE_DIR) \
-	-Irts \
-	-Irts/dist/build
+rts_INCLUDE_DIRS = \
+	$(addprefix include/,$(includes_INCLUDE_DIRS)) \
+	.
+
+rts_dist-install_INCLUDE_DIRS = \
+	$(addprefix include/,$(includes_dist-install_INCLUDE_DIRS))
 
 # COMPILING_RTS is only used when building Win32 DLL support.
-STANDARD_OPTS += -DCOMPILING_RTS -DFS_NAMESPACE=rts
+rts_CPP_OPTS += -DCOMPILING_RTS -DFS_NAMESPACE=rts
 
 # HC_OPTS is included in both .c and .cmm compilations, whereas CC_OPTS is
 # only included in .c compilations.  HC_OPTS included the WAY_* opts, which
 # must be included in both types of compilations.
 
 rts_CC_OPTS += $(WARNING_OPTS)
-rts_CC_OPTS += $(STANDARD_OPTS)
 
-rts_HC_OPTS += $(STANDARD_OPTS) -this-unit-id rts
+rts_HC_OPTS += -this-unit-id rts
 
 ifneq "$(GhcWithSMP)" "YES"
 rts_CC_OPTS += -DNOSMP
@@ -463,7 +471,7 @@ rts/Hash_CC_OPTS += -O3
 # This apparently doesn't work on OS X (Darwin) nor on Solaris.
 # On Darwin we get errors of the form
 #
-#  ld: absolute addressing (perhaps -mdynamic-no-pic) used in _stg_ap_0_fast from rts/dist/build/Apply.dyn_o not allowed in slidable image
+#  ld: absolute addressing (perhaps -mdynamic-no-pic) used in _stg_ap_0_fast from rts/dist-install/build/Apply.dyn_o not allowed in slidable image
 #
 # and lots of these warnings:
 #
@@ -473,7 +481,7 @@ rts/Hash_CC_OPTS += -O3
 #
 # Text relocation remains                         referenced
 #     against symbol                  offset      in file
-# .rodata (section)                   0x11        rts/dist/build/Apply.dyn_o
+# .rodata (section)                   0x11        rts/dist-install/build/Apply.dyn_o
 #   ...
 # ld: fatal: relocations remain against allocatable but non-writable sections
 # collect2: ld returned 1 exit status
@@ -503,7 +511,7 @@ rts/Updates_HC_OPTS += -fno-PIC -static
 rts/StgMiscClosures_HC_OPTS += -fno-PIC -static
 rts/PrimOps_HC_OPTS += -fno-PIC -static
 rts/Apply_HC_OPTS += -fno-PIC -static
-rts/dist/build/AutoApply_HC_OPTS += -fno-PIC -static
+rts/dist-install/build/AutoApply_HC_OPTS += -fno-PIC -static
 endif
 endif
 
@@ -569,37 +577,36 @@ endif
 # dependencies
 
 rts_WAYS_DASHED = $(subst $(space),,$(patsubst %,-%,$(strip $(rts_WAYS))))
-rts_dist_depfile_base = rts/dist/build/.depend$(rts_WAYS_DASHED)
+rts_dist-install_depfile_base = rts/dist-install/build/.depend$(rts_WAYS_DASHED)
 
-rts_dist_C_SRCS    = $(rts_C_SRCS) $(rts_thr_EXTRA_C_SRCS)
-rts_dist_S_SRCS    = $(rts_S_SRCS)
-rts_dist_CMM_SRCS  = $(rts_CMM_SRCS)
-rts_dist_C_FILES   = $(rts_dist_C_SRCS)
-rts_dist_S_FILES   = $(rts_dist_S_SRCS)
-rts_dist_CMM_FILES = $(rts_dist_CMM_SRCS)
+rts_dist-install_C_SRCS    = $(rts_C_SRCS) $(rts_thr_EXTRA_C_SRCS)
+rts_dist-install_S_SRCS    = $(rts_S_SRCS)
+rts_dist-install_CMM_SRCS  = $(rts_CMM_SRCS)
+rts_dist-install_C_FILES   = $(rts_dist-install_C_SRCS)
+rts_dist-install_CXX_FILES = $(rts_dist-install_CXX_SRCS)
+rts_dist-install_S_FILES   = $(rts_dist-install_S_SRCS)
+rts_dist-install_CMM_FILES = $(rts_dist-install_CMM_SRCS)
 
 # Hack: we define every way-related option here, so that we get (hopefully)
 # a superset of the dependencies.  To do this properly, we should generate
 # a different set of dependencies for each way.  Further hack: PROFILING an
 
 # TICKY_TICKY can't be used together, so we omit TICKY_TICKY for now.
-rts_dist_MKDEPENDC_OPTS += -DPROFILING -DTHREADED_RTS -DDEBUG
+rts_dist-install_MKDEPENDC_OPTS += -DPROFILING -DTHREADED_RTS -DDEBUG
 
 ifeq "$(USE_DTRACE)" "YES"
 
-rts_dist_MKDEPENDC_OPTS += -Irts/dist/build
+rts_dist-install_MKDEPENDC_OPTS += -Irts/dist-install/build
 
 endif
 
-$(eval $(call dependencies,rts,dist,1))
+$(eval $(call dependencies,rts,dist-install,1))
 
-$(rts_dist_depfile_c_asm) : $(includes_dist_H_CONFIG)
-$(rts_dist_depfile_c_asm) : $(includes_dist_H_PLATFORM)
-$(rts_dist_depfile_c_asm) : $(includes_dist_H_VERSION)
+$(rts_dist-install_depfile_c_asm) : $(includes_dist-install_H_FILES)
 
-$(rts_dist_depfile_c_asm) : $(DTRACEPROBES_H)
+$(rts_dist-install_depfile_c_asm) : $(DTRACEPROBES_H)
 ifneq "$(UseSystemLibFFI)" "YES"
-$(rts_dist_depfile_c_asm) : $(libffi_HEADERS)
+$(rts_dist-install_depfile_c_asm) : $(libffi_HEADERS)
 endif
 
 # -----------------------------------------------------------------------------
@@ -623,8 +630,8 @@ DTRACE_FLAGS = -x cpppath=$(CC)
 endif
 
 DTRACEPROBES_SRC = rts/RtsProbes.d
-$(DTRACEPROBES_H): $(DTRACEPROBES_SRC) $(includes_1_H_PLATFORM) | $$(dir $$@)/.
-	"$(DTRACE)" $(filter -I%,$(rts_CC_OPTS)) -C $(DTRACE_FLAGS) -h -o $@ -s $<
+$(DTRACEPROBES_H): $(DTRACEPROBES_SRC) $(includes_1_H_CONFIG) $(includes_1_H_PLATFORM) | $$(dir $$@)/.
+	"$(DTRACE)" $(filter -I%,$(rts_dist-install_DIST_CC_OPTS)) -C $(DTRACE_FLAGS) -h -o $@ -s $<
 endif
 
 # -----------------------------------------------------------------------------
@@ -639,17 +646,22 @@ ifeq "$(HaveLibMingwEx)" "YES"
 rts_PACKAGE_CPP_OPTS += -DHAVE_LIBMINGWEX
 endif
 
-$(eval $(call manual-package-config,rts,1))
+rts_dist-install_PACKAGE_CPP_OPTS = \
+	$(rts_PACKAGE_CPP_OPTS) \
+	$(addprefix -Irts/,$(rts_dist-install_DIST_INCLUDE_DIRS))
 
-rts/dist/package.conf.inplace : $(includes_1_H_CONFIG) $(includes_1_H_PLATFORM) $(includes_1_H_VERSION)
+$(eval $(call manual-package-config,rts,dist-install))
+
+rts/dist-install/package.conf.inplace : $(includes_dist-install_H_FILES)
+rts/dist-install/package.conf.install : $(includes_dist-install_H_FILES)
 
 # -----------------------------------------------------------------------------
 # installing
 
 RTS_INSTALL_LIBS += $(ALL_RTS_LIBS)
 ifneq "$(UseSystemLibFFI)" "YES"
-RTS_INSTALL_LIBS += $(wildcard rts/dist/build/lib$(LIBFFI_NAME)*$(soext)*)
-RTS_INSTALL_LIBS += $(foreach w,$(filter-out %dyn,$(rts_WAYS)),rts/dist/build/libC$(LIBFFI_NAME)$($w_libsuf))
+RTS_INSTALL_LIBS += $(wildcard rts/dist-install/build/lib$(LIBFFI_NAME)*$(soext)*)
+RTS_INSTALL_LIBS += $(foreach w,$(filter-out %dyn,$(rts_WAYS)),rts/dist-install/build/libC$(LIBFFI_NAME)$($w_libsuf))
 endif
 
 ifneq "$(UseSystemLibFFI)" "YES"
@@ -664,6 +676,6 @@ install_libffi_headers :
 # -----------------------------------------------------------------------------
 # cleaning
 
-$(eval $(call clean-target,rts,dist,rts/dist))
+$(eval $(call clean-target,rts,dist-install,rts/dist-install))
 
 BINDIST_EXTRAS += rts/package.conf.in

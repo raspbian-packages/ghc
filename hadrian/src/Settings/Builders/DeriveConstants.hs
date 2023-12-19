@@ -1,30 +1,31 @@
 module Settings.Builders.DeriveConstants (
-    deriveConstantsBuilderArgs, deriveConstantsPairs
+    deriveConstantsBuilderArgs
     ) where
 
 import Builder
+import Packages
 import Settings.Builders.Common
 
 deriveConstantsPairs :: [(String, String)]
 deriveConstantsPairs =
-  [ ("DerivedConstants.h", "--gen-header")
-  , ("GHCConstantsHaskellType.hs", "--gen-haskell-type")
-  , ("platformConstants", "--gen-haskell-value")
-  , ("GHCConstantsHaskellWrappers.hs", "--gen-haskell-wrappers")
-  , ("GHCConstantsHaskellExports.hs", "--gen-haskell-exports")
+  [ ("Constants.hs", "--gen-haskell-type")
+  , ("DerivedConstants.h", "--gen-header")
   ]
 
--- TODO: do we need to support `includes_CC_OPTS += -DDYNAMIC_BY_DEFAULT`?
 deriveConstantsBuilderArgs :: Args
 deriveConstantsBuilderArgs = builder DeriveConstants ? do
     cFlags <- includeCcArgs
     outs   <- getOutputs
-    let (outputFile, tempDir) = case outs of
-            [a, b] -> (a, b)
-            _      -> error $ "DeriveConstants: expected two outputs, got " ++ show outs
+    let (outputFile, mode, tempDir) = case outs of
+            [ofile, mode, tmpdir] -> (ofile,mode,tmpdir)
+            [ofile, tmpdir]
+               | Just mode <- lookup (takeFileName ofile) deriveConstantsPairs
+               -> (ofile, mode, tmpdir)
+               | otherwise
+               -> error $ "DeriveConstants: invalid output file, got " ++ show (takeFileName ofile)
+            _  -> error $ "DeriveConstants: unexpected outputs, got " ++ show outs
     mconcat
-        [ mconcat $ flip fmap deriveConstantsPairs $ \(fileName, flag) ->
-            output ("//" ++ fileName) ? arg flag
+        [ arg mode
         , arg "-o", arg outputFile
         , arg "--tmpdir", arg tempDir
         , arg "--gcc-program", arg =<< getBuilderPath (Cc CompileC Stage1)
@@ -37,13 +38,13 @@ deriveConstantsBuilderArgs = builder DeriveConstants ? do
 includeCcArgs :: Args
 includeCcArgs = do
     stage <- getStage
-    libPath <- expr $ stageLibPath stage
+    rtsPath <- expr $ rtsBuildPath stage
     mconcat [ cArgs
             , cWarnings
             , getSettingList $ ConfCcArgs Stage1
             , flag GhcUnregisterised ? arg "-DUSE_MINIINTERPRETER"
             , arg "-Irts"
-            , arg "-Iincludes"
-            , arg $ "-I" ++ libPath
+            , arg "-Irts/include"
+            , arg $ "-I" ++ rtsPath </> "include"
             , notM targetSupportsSMP ? arg "-DNOSMP"
             , arg "-fcommon" ]

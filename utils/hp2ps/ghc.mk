@@ -10,8 +10,6 @@
 #
 # -----------------------------------------------------------------------------
 
-utils/hp2ps_CC_OPTS += $(addprefix -I,$(GHC_INCLUDE_DIRS))
-
 # stage0
 utils/hp2ps_dist_C_SRCS          = AreaBelow.c Curves.c Error.c Main.c \
                                    Reorder.c TopTwenty.c AuxFile.c Deviation.c \

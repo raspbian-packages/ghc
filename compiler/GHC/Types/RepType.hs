@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP #-}
+
 {-# LANGUAGE FlexibleContexts #-}
 
 module GHC.Types.RepType
@@ -8,34 +8,55 @@ module GHC.Types.RepType
     unwrapType,
 
     -- * Predicates on types
-    isVoidTy,
+    isZeroBitTy,
 
     -- * Type representation for the code generator
     typePrimRep, typePrimRep1,
     runtimeRepPrimRep, typePrimRepArgs,
-    PrimRep(..), primRepToType,
-    countFunRepArgs, countConRepArgs, tyConPrimRep, tyConPrimRep1,
+    PrimRep(..), primRepToType, primRepToRuntimeRep,
+    countFunRepArgs, countConRepArgs, dataConRuntimeRepStrictness,
+    tyConPrimRep, tyConPrimRep1,
+    runtimeRepPrimRep_maybe, kindPrimRep_maybe, typePrimRep_maybe,
 
     -- * Unboxed sum representation type
     ubxSumRepType, layoutUbxSum, typeSlotTy, SlotTy (..),
-    slotPrimRep, primRepSlot
-  ) where
+    slotPrimRep, primRepSlot,
 
-#include "HsVersions.h"
+    -- * Is this type known to be data?
+    mightBeFunTy
+
+    ) where
 
 import GHC.Prelude
 
 import GHC.Types.Basic (Arity, RepArity)
 import GHC.Core.DataCon
-import GHC.Utils.Outputable
 import GHC.Builtin.Names
 import GHC.Core.Coercion
 import GHC.Core.TyCon
+import GHC.Core.TyCon.RecWalk
 import GHC.Core.TyCo.Rep
 import GHC.Core.Type
+import {-# SOURCE #-} GHC.Builtin.Types ( anyTypeOfKind
+  , vecRepDataConTyCon
+  , liftedRepTy, unliftedRepTy, zeroBitRepTy
+  , intRepDataConTy
+  , int8RepDataConTy, int16RepDataConTy, int32RepDataConTy, int64RepDataConTy
+  , wordRepDataConTy
+  , word16RepDataConTy, word8RepDataConTy, word32RepDataConTy, word64RepDataConTy
+  , addrRepDataConTy
+  , floatRepDataConTy, doubleRepDataConTy
+  , vec2DataConTy, vec4DataConTy, vec8DataConTy, vec16DataConTy, vec32DataConTy
+  , vec64DataConTy
+  , int8ElemRepDataConTy, int16ElemRepDataConTy, int32ElemRepDataConTy
+  , int64ElemRepDataConTy, word8ElemRepDataConTy, word16ElemRepDataConTy
+  , word32ElemRepDataConTy, word64ElemRepDataConTy, floatElemRepDataConTy
+  , doubleElemRepDataConTy )
+
 import GHC.Utils.Misc
-import GHC.Builtin.Types.Prim
-import {-# SOURCE #-} GHC.Builtin.Types ( anyTypeOfKind )
+import GHC.Utils.Outputable
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
 
 import Data.List (sort)
 import qualified Data.IntSet as IS
@@ -125,9 +146,42 @@ countConRepArgs dc = go (dataConRepArity dc) (dataConRepType dc)
       | otherwise
       = pprPanic "countConRepArgs: arity greater than type can handle" (ppr (n, ty, typePrimRep ty))
 
+dataConRuntimeRepStrictness :: HasDebugCallStack => DataCon -> [StrictnessMark]
+-- ^ Give the demands on the arguments of a
+-- Core constructor application (Con dc args) at runtime.
+-- Assumes the constructor is not levity polymorphic. For example
+-- unboxed tuples won't work.
+dataConRuntimeRepStrictness dc =
+
+  -- pprTrace "dataConRuntimeRepStrictness" (ppr dc $$ ppr (dataConRepArgTys dc)) $
+
+  let repMarks = dataConRepStrictness dc
+      repTys = map irrelevantMult $ dataConRepArgTys dc
+  in -- todo: assert dc != unboxedTuple/unboxedSum
+     go repMarks repTys []
+  where
+    go (mark:marks) (ty:types) out_marks
+      -- Zero-width argument, mark is irrelevant at runtime.
+      |  -- pprTrace "VoidTy" (ppr ty) $
+        (isZeroBitTy ty)
+      = go marks types out_marks
+      -- Single rep argument, e.g. Int
+      -- Keep mark as-is
+      | [_] <- reps
+      = go marks types (mark:out_marks)
+      -- Multi-rep argument, e.g. (# Int, Bool #) or (# Int | Bool #)
+      -- Make up one non-strict mark per runtime argument.
+      | otherwise -- TODO: Assert real_reps /= null
+      = go marks types ((replicate (length real_reps) NotMarkedStrict)++out_marks)
+      where
+        reps = typePrimRep ty
+        real_reps = filter (not . isVoidRep) $ reps
+    go [] [] out_marks = reverse out_marks
+    go _m _t _o = pprPanic "dataConRuntimeRepStrictness2" (ppr dc $$ ppr _m $$ ppr _t $$ ppr _o)
+
 -- | True if the type has zero width.
-isVoidTy :: Type -> Bool
-isVoidTy = null . typePrimRep
+isZeroBitTy :: HasDebugCallStack => Type -> Bool
+isZeroBitTy = null . typePrimRep
 
 
 {- **********************************************************************
@@ -191,7 +245,8 @@ ubxSumRepType constrs0
     in
       sumRep
 
-layoutUbxSum :: SortedSlotTys -- Layout of sum. Does not include tag.
+layoutUbxSum :: HasDebugCallStack
+             => SortedSlotTys -- Layout of sum. Does not include tag.
                               -- We assume that they are in increasing order
              -> [SlotTy]      -- Slot types of things we want to map to locations in the
                               -- sum layout
@@ -214,7 +269,8 @@ layoutUbxSum sum_slots0 arg_slots0 =
       | otherwise
       = findSlot arg (slot_idx + 1) slots useds
     findSlot _ _ [] _
-      = pprPanic "findSlot" (text "Can't find slot" $$ ppr sum_slots0 $$ ppr arg_slots0)
+      = pprPanic "findSlot" (text "Can't find slot" $$ text "sum_slots:" <> ppr sum_slots0
+                                                    $$ text "arg_slots:" <> ppr arg_slots0 )
 
 --------------------------------------------------------------------------------
 
@@ -232,7 +288,7 @@ layoutUbxSum sum_slots0 arg_slots0 =
 --
 -- TODO(michalt): We should probably introduce `SlotTy`s for 8-/16-/32-bit
 -- values, so that we can pack things more tightly.
-data SlotTy = PtrLiftedSlot | PtrUnliftedSlot | WordSlot | Word64Slot | FloatSlot | DoubleSlot
+data SlotTy = PtrLiftedSlot | PtrUnliftedSlot | WordSlot | Word64Slot | FloatSlot | DoubleSlot | VecSlot Int PrimElemRep
   deriving (Eq, Ord)
     -- Constructor order is important! If slot A could fit into slot B
     -- then slot A must occur first.  E.g.  FloatSlot before DoubleSlot
@@ -247,10 +303,11 @@ instance Outputable SlotTy where
   ppr WordSlot        = text "WordSlot"
   ppr DoubleSlot      = text "DoubleSlot"
   ppr FloatSlot       = text "FloatSlot"
+  ppr (VecSlot n e)   = text "VecSlot" <+> ppr n <+> ppr e
 
 typeSlotTy :: UnaryType -> Maybe SlotTy
 typeSlotTy ty
-  | isVoidTy ty
+  | isZeroBitTy ty
   = Nothing
   | otherwise
   = Just (primRepSlot (typePrimRep1 ty))
@@ -272,7 +329,7 @@ primRepSlot Word64Rep   = Word64Slot
 primRepSlot AddrRep     = WordSlot
 primRepSlot FloatRep    = FloatSlot
 primRepSlot DoubleRep   = DoubleSlot
-primRepSlot VecRep{}    = pprPanic "primRepSlot" (text "No slot for VecRep")
+primRepSlot (VecRep n e) = VecSlot n e
 
 slotPrimRep :: SlotTy -> PrimRep
 slotPrimRep PtrLiftedSlot   = LiftedRep
@@ -281,6 +338,7 @@ slotPrimRep Word64Slot      = Word64Rep
 slotPrimRep WordSlot        = WordRep
 slotPrimRep DoubleSlot      = DoubleRep
 slotPrimRep FloatSlot       = FloatRep
+slotPrimRep (VecSlot n e)   = VecRep n e
 
 -- | Returns the bigger type if one fits into the other. (commutative)
 --
@@ -293,18 +351,17 @@ fitsIn ty1 ty2
   = Just ty1
   | isWordSlot ty1 && isWordSlot ty2
   = Just (max ty1 ty2)
-  | isFloatSlot ty1 && isFloatSlot ty2
-  = Just (max ty1 ty2)
   | otherwise
   = Nothing
+  -- We used to share slots between Float/Double but currently we can't easily
+  -- covert between float/double in a way that is both work free and safe.
+  -- So we put them in different slots.
+  -- See Note [Casting slot arguments]
   where
     isWordSlot Word64Slot = True
     isWordSlot WordSlot   = True
     isWordSlot _          = False
 
-    isFloatSlot DoubleSlot = True
-    isFloatSlot FloatSlot  = True
-    isFloatSlot _          = False
 
 
 {- **********************************************************************
@@ -316,8 +373,8 @@ fitsIn ty1 ty2
 Note [RuntimeRep and PrimRep]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 This Note describes the relationship between GHC.Types.RuntimeRep
-(of levity-polymorphism fame) and GHC.Core.TyCon.PrimRep, as these types
-are closely related.
+(of levity/representation polymorphism fame) and GHC.Core.TyCon.PrimRep,
+as these types are closely related.
 
 A "primitive entity" is one that can be
  * stored in one register
@@ -337,7 +394,7 @@ needed and how many bits are required. The data type GHC.Core.TyCon.PrimRep
 enumerates all the possibilities.
 
 data PrimRep
-  = VoidRep
+  = VoidRep       -- See Note [VoidRep]
   | LiftedRep     -- ^ Lifted pointer
   | UnliftedRep   -- ^ Unlifted pointer
   | Int8Rep       -- ^ Signed, 8-bit value
@@ -362,10 +419,11 @@ but RuntimeRep has some extra cases:
 data RuntimeRep = VecRep VecCount VecElem   -- ^ a SIMD vector type
                 | TupleRep [RuntimeRep]     -- ^ An unboxed tuple of the given reps
                 | SumRep [RuntimeRep]       -- ^ An unboxed sum of the given reps
-                | LiftedRep       -- ^ lifted; represented by a pointer
-                | UnliftedRep     -- ^ unlifted; represented by a pointer
+                | BoxedRep Levity -- ^ boxed; represented by a pointer
                 | IntRep          -- ^ signed, word-sized value
                 ...etc...
+data Levity     = Lifted
+                | Unlifted
 
 It's all in 1-1 correspondence with PrimRep except for TupleRep and SumRep,
 which describe unboxed products and sums respectively. RuntimeRep is defined
@@ -374,6 +432,13 @@ GHC.Builtin.Types.runtimeRepTyCon. The unarisation pass, in GHC.Stg.Unarise, tra
 program, so that every variable has a type that has a PrimRep. For
 example, unarisation transforms our utup function above, to take two Int
 arguments instead of one (# Int, Int #) argument.
+
+Also, note that boxed types are represented slightly differently in RuntimeRep
+and PrimRep. PrimRep just has the nullary LiftedRep and UnliftedRep data
+constructors. RuntimeRep has a BoxedRep data constructor, which accepts a
+Levity. The subtle distinction is that since BoxedRep can accept a variable
+argument, RuntimeRep can talk about levity polymorphic types. PrimRep, by
+contrast, cannot.
 
 See also Note [Getting from RuntimeRep to PrimRep] and Note [VoidRep].
 
@@ -429,7 +494,8 @@ runtimeRepPrimRep works by using tyConRuntimeRepInfo. That function
 should be passed the TyCon produced by promoting one of the constructors
 of RuntimeRep into type-level data. The RuntimeRep promoted datacons are
 associated with a RuntimeRepInfo (stored directly in the PromotedDataCon
-constructor of TyCon). This pairing happens in GHC.Builtin.Types. A RuntimeRepInfo
+constructor of TyCon, field promDcRepInfo).
+This pairing happens in GHC.Builtin.Types. A RuntimeRepInfo
 usually(*) contains a function from [Type] to [PrimRep]: the [Type] are
 the arguments to the promoted datacon. These arguments are necessary
 for the TupleRep and SumRep constructors, so that this process can recur,
@@ -475,6 +541,14 @@ typePrimRep ty = kindPrimRep (text "typePrimRep" <+>
                               parens (ppr ty <+> dcolon <+> ppr (typeKind ty)))
                              (typeKind ty)
 
+-- | Discovers the primitive representation of a 'Type'. Returns
+-- a list of 'PrimRep': it's a list because of the possibility of
+-- no runtime representation (void) or multiple (unboxed tuple/sum)
+-- See also Note [Getting from RuntimeRep to PrimRep]
+-- Returns Nothing if rep can't be determined. Eg. levity polymorphic types.
+typePrimRep_maybe :: Type -> Maybe [PrimRep]
+typePrimRep_maybe ty = kindPrimRep_maybe (typeKind ty)
+
 -- | Like 'typePrimRep', but assumes that there is precisely one 'PrimRep' output;
 -- an empty list of PrimReps becomes a VoidRep.
 -- This assumption holds after unarise, see Note [Post-unarisation invariants].
@@ -513,13 +587,31 @@ kindPrimRep doc ki
   | Just ki' <- coreView ki
   = kindPrimRep doc ki'
 kindPrimRep doc (TyConApp typ [runtime_rep])
-  = ASSERT( typ `hasKey` tYPETyConKey )
+  = assert (typ `hasKey` tYPETyConKey) $
     runtimeRepPrimRep doc runtime_rep
 kindPrimRep doc ki
   = pprPanic "kindPrimRep" (ppr ki $$ doc)
 
+-- NB: We could implement the partial methods by calling into the maybe
+-- variants here. But then both would need to pass around the doc argument.
+
+-- | Take a kind (of shape @TYPE rr@) and produce the 'PrimRep's
+-- of values of types of this kind.
+-- See also Note [Getting from RuntimeRep to PrimRep]
+-- Returns Nothing if rep can't be determined. Eg. levity polymorphic types.
+kindPrimRep_maybe :: HasDebugCallStack => Kind -> Maybe [PrimRep]
+kindPrimRep_maybe ki
+  | Just ki' <- coreView ki
+  = kindPrimRep_maybe ki'
+kindPrimRep_maybe (TyConApp typ [runtime_rep])
+  = assert (typ `hasKey` tYPETyConKey) $
+    runtimeRepPrimRep_maybe runtime_rep
+kindPrimRep_maybe _ki
+  = Nothing
+
 -- | Take a type of kind RuntimeRep and extract the list of 'PrimRep' that
 -- it encodes. See also Note [Getting from RuntimeRep to PrimRep]
+-- The [PrimRep] is the final runtime representation /after/ unarisation
 runtimeRepPrimRep :: HasDebugCallStack => SDoc -> Type -> [PrimRep]
 runtimeRepPrimRep doc rr_ty
   | Just rr_ty' <- coreView rr_ty
@@ -530,8 +622,80 @@ runtimeRepPrimRep doc rr_ty
   | otherwise
   = pprPanic "runtimeRepPrimRep" (doc $$ ppr rr_ty)
 
+-- | Take a type of kind RuntimeRep and extract the list of 'PrimRep' that
+-- it encodes. See also Note [Getting from RuntimeRep to PrimRep]
+-- The [PrimRep] is the final runtime representation /after/ unarisation
+-- Returns Nothing if rep can't be determined. Eg. levity polymorphic types.
+runtimeRepPrimRep_maybe :: Type -> Maybe [PrimRep]
+runtimeRepPrimRep_maybe rr_ty
+  | Just rr_ty' <- coreView rr_ty
+  = runtimeRepPrimRep_maybe rr_ty'
+  | TyConApp rr_dc args <- rr_ty
+  , RuntimeRep fun <- tyConRuntimeRepInfo rr_dc
+  = Just $! fun args
+  | otherwise
+  = Nothing
+
+-- | Convert a 'PrimRep' to a 'Type' of kind RuntimeRep
+primRepToRuntimeRep :: PrimRep -> Type
+primRepToRuntimeRep rep = case rep of
+  VoidRep       -> zeroBitRepTy
+  LiftedRep     -> liftedRepTy
+  UnliftedRep   -> unliftedRepTy
+  IntRep        -> intRepDataConTy
+  Int8Rep       -> int8RepDataConTy
+  Int16Rep      -> int16RepDataConTy
+  Int32Rep      -> int32RepDataConTy
+  Int64Rep      -> int64RepDataConTy
+  WordRep       -> wordRepDataConTy
+  Word8Rep      -> word8RepDataConTy
+  Word16Rep     -> word16RepDataConTy
+  Word32Rep     -> word32RepDataConTy
+  Word64Rep     -> word64RepDataConTy
+  AddrRep       -> addrRepDataConTy
+  FloatRep      -> floatRepDataConTy
+  DoubleRep     -> doubleRepDataConTy
+  VecRep n elem -> TyConApp vecRepDataConTyCon [n', elem']
+    where
+      n' = case n of
+        2  -> vec2DataConTy
+        4  -> vec4DataConTy
+        8  -> vec8DataConTy
+        16 -> vec16DataConTy
+        32 -> vec32DataConTy
+        64 -> vec64DataConTy
+        _  -> pprPanic "Disallowed VecCount" (ppr n)
+
+      elem' = case elem of
+        Int8ElemRep   -> int8ElemRepDataConTy
+        Int16ElemRep  -> int16ElemRepDataConTy
+        Int32ElemRep  -> int32ElemRepDataConTy
+        Int64ElemRep  -> int64ElemRepDataConTy
+        Word8ElemRep  -> word8ElemRepDataConTy
+        Word16ElemRep -> word16ElemRepDataConTy
+        Word32ElemRep -> word32ElemRepDataConTy
+        Word64ElemRep -> word64ElemRepDataConTy
+        FloatElemRep  -> floatElemRepDataConTy
+        DoubleElemRep -> doubleElemRepDataConTy
+
 -- | Convert a PrimRep back to a Type. Used only in the unariser to give types
 -- to fresh Ids. Really, only the type's representation matters.
 -- See also Note [RuntimeRep and PrimRep]
 primRepToType :: PrimRep -> Type
-primRepToType = anyTypeOfKind . tYPE . primRepToRuntimeRep
+primRepToType = anyTypeOfKind . mkTYPEapp . primRepToRuntimeRep
+
+--------------
+mightBeFunTy :: Type -> Bool
+-- Return False only if we are *sure* it's a data type
+-- Look through newtypes etc as much as possible. Used to
+-- decide if we need to enter a closure via a slow call.
+--
+-- AK: It would be nice to figure out and document the difference
+-- between this and isFunTy at some point.
+mightBeFunTy ty
+  | [LiftedRep] <- typePrimRep ty
+  , Just tc <- tyConAppTyCon_maybe (unwrapType ty)
+  , isDataTyCon tc
+  = False
+  | otherwise
+  = True

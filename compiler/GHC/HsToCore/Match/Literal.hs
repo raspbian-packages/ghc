@@ -1,3 +1,11 @@
+
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE MultiWayIf          #-}
+{-# LANGUAGE TypeApplications    #-}
+{-# LANGUAGE AllowAmbiguousTypes #-}
+
+{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
+
 {-
 (c) The University of Glasgow 2006
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
@@ -5,11 +13,6 @@
 
 Pattern-matching literal patterns
 -}
-
-{-# LANGUAGE CPP, ScopedTypeVariables #-}
-{-# LANGUAGE ViewPatterns #-}
-
-{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 
 module GHC.HsToCore.Match.Literal
    ( dsLit, dsOverLit, hsLitKey
@@ -21,23 +24,24 @@ module GHC.HsToCore.Match.Literal
    )
 where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 import GHC.Platform
 
 import {-# SOURCE #-} GHC.HsToCore.Match ( match )
 import {-# SOURCE #-} GHC.HsToCore.Expr  ( dsExpr, dsSyntaxExpr )
 
+import GHC.HsToCore.Errors.Types
 import GHC.HsToCore.Monad
 import GHC.HsToCore.Utils
 
 import GHC.Hs
 
 import GHC.Types.Id
+import GHC.Types.SourceText
 import GHC.Core
 import GHC.Core.Make
 import GHC.Core.TyCon
+import GHC.Core.Reduction ( Reduction(..) )
 import GHC.Core.DataCon
 import GHC.Tc.Utils.Zonk ( shortCutLit )
 import GHC.Tc.Utils.TcType
@@ -48,13 +52,12 @@ import GHC.Builtin.Types
 import GHC.Builtin.Types.Prim
 import GHC.Types.Literal
 import GHC.Types.SrcLoc
-import Data.Ratio
 import GHC.Utils.Outputable as Outputable
-import GHC.Types.Basic
 import GHC.Driver.Session
 import GHC.Utils.Misc
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
 import GHC.Data.FastString
-import qualified GHC.LanguageExtensions as LangExt
 import GHC.Core.FamInstEnv ( FamInstEnvs, normaliseType )
 
 import Control.Monad
@@ -62,7 +65,7 @@ import Data.Int
 import Data.List.NonEmpty (NonEmpty(..))
 import qualified Data.List.NonEmpty as NEL
 import Data.Word
-import Data.Proxy
+import GHC.Real ( Ratio(..), numerator, denominator )
 
 {-
 ************************************************************************
@@ -96,35 +99,148 @@ dsLit l = do
     HsCharPrim   _ c -> return (Lit (LitChar c))
     HsIntPrim    _ i -> return (Lit (mkLitIntWrap platform i))
     HsWordPrim   _ w -> return (Lit (mkLitWordWrap platform w))
-    HsInt64Prim  _ i -> return (Lit (mkLitInt64Wrap platform i))
-    HsWord64Prim _ w -> return (Lit (mkLitWord64Wrap platform w))
-    HsFloatPrim  _ f -> return (Lit (LitFloat (fl_value f)))
-    HsDoublePrim _ d -> return (Lit (LitDouble (fl_value d)))
+    HsInt64Prim  _ i -> return (Lit (mkLitInt64Wrap i))
+    HsWord64Prim _ w -> return (Lit (mkLitWord64Wrap w))
+
+    -- This can be slow for very large literals. See Note [FractionalLit representation]
+    -- and #15646
+    HsFloatPrim  _ fl -> return (Lit (LitFloat (rationalFromFractionalLit fl)))
+    HsDoublePrim _ fl -> return (Lit (LitDouble (rationalFromFractionalLit fl)))
     HsChar _ c       -> return (mkCharExpr c)
     HsString _ str   -> mkStringExprFS str
-    HsInteger _ i _  -> return (mkIntegerExpr i)
+    HsInteger _ i _  -> return (mkIntegerExpr platform i)
     HsInt _ i        -> return (mkIntExpr platform (il_value i))
-    HsRat _ (FL _ _ val) ty -> do
-      return (mkCoreConApps ratio_data_con [Type integer_ty, num, denom])
-      where
-        num   = mkIntegerExpr (numerator val)
-        denom = mkIntegerExpr (denominator val)
+    HsRat _ fl ty    -> dsFractionalLitToRational fl ty
+
+{-
+Note [FractionalLit representation]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+There is a fun wrinkle to this, we used to simply compute the value
+for these literals and store it as `Rational`. While this might seem
+reasonable it meant typechecking literals of extremely large numbers
+wasn't possible. This happend for example in #15646.
+
+There a user would write in GHCi e.g. `:t 1e1234111111111111111111111`
+which would trip up the compiler. The reason being we would parse it as
+<Literal of value n>. Try to compute n, which would run out of memory
+for truly large numbers, or take far too long for merely large ones.
+
+To fix this we instead now store the significand and exponent of the
+literal instead. Depending on the size of the exponent we then defer
+the computation of the Rational value, potentially up to runtime of the
+program! There are still cases left were we might compute large rationals
+but it's a lot rarer then.
+
+The current state of affairs for large literals is:
+* Typechecking: Will produce a FractionalLit
+* Desugaring a large overloaded literal to Float/Double *is* done
+  at compile time. So can still fail. But this only matters for values too large
+  to be represented as float anyway.
+* Converting overloaded literals to a value of *Rational* is done at *runtime*.
+  If such a value is then demanded at runtime the program might hang or run out of
+  memory. But that is perhaps expected and acceptable.
+* TH might also evaluate the literal even when overloaded.
+  But there a user should be able to work around #15646 by
+  generating a call to `mkRationalBase10/2` for large literals instead.
+
+
+Note [FractionalLit representation]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+For fractional literals, like 1.3 or 0.79e22, we do /not/ represent
+them within the compiler as a Rational.  Doing so would force the
+compiler to compute a huge Rational for 2.3e300000000000, at compile
+time (#15646)!
+
+So instead we represent fractional literals as a FractionalLit,
+in which we record the significand and exponent separately.  Then
+we can compute the huge Rational at /runtime/, by emitting code
+for
+       mkRationalBase10 2.3 300000000000
+
+where mkRationalBase10 is defined in the library GHC.Real
+
+The moving parts are here:
+
+* Parsing, renaming, typechecking: use FractionalLit, in which the
+  significand and exponent are represented separately.
+
+* Desugaring.  Remember that a fractional literal like 54.4e20 has type
+     Fractional a => a
+
+  - For fractional literals whose type turns out to be Float/Double,
+    we desugar to a Float/Double literal at /compile time/.
+    This conversion can still fail. But this only matters for values
+    too large to be represented as float anyway.  See dsLit in
+    GHC.HsToCore.Match.Literal
+
+  - For fractional literals whose type turns out to be Rational, we
+    desugar the literal to a call of `mkRationalBase10` (etc for hex
+    literals), so that we only compute the Rational at /run time/.  If
+    this value is then demanded at runtime the program might hang or
+    run out of memory. But that is perhaps expected and acceptable.
+    See dsFractionalLitToRational in GHC.HsToCore.Match.Literal
+
+  - For fractional literals whose type isn't one of the above, we just
+    call the typeclass method `fromRational`.  But to do that we need
+    the rational to give to it, and we compute that at runtime, as
+    above.
+
+* Template Haskell definitions are also problematic. While the TH code
+  works as expected once it's spliced into a program it will compute the
+  value of the large literal.
+  But there a user should be able to work around #15646
+  by having their TH code generating a call to `mkRationalBase[10/2]` for
+  large literals  instead.
+
+-}
+
+-- | See Note [FractionalLit representation]
+dsFractionalLitToRational :: FractionalLit -> Type -> DsM CoreExpr
+dsFractionalLitToRational fl@FL{ fl_signi = signi, fl_exp = exp, fl_exp_base = base } ty
+  -- We compute "small" rationals here and now
+  | abs exp <= 100
+  = do
+    platform <- targetPlatform <$> getDynFlags
+    let !val   = rationalFromFractionalLit fl
+        !num   = mkIntegerExpr platform (numerator val)
+        !denom = mkIntegerExpr platform (denominator val)
         (ratio_data_con, integer_ty)
             = case tcSplitTyConApp ty of
-                    (tycon, [i_ty]) -> ASSERT(isIntegerTy i_ty && tycon `hasKey` ratioTyConKey)
+                    (tycon, [i_ty]) -> assert (isIntegerTy i_ty && tycon `hasKey` ratioTyConKey)
                                        (head (tyConDataCons tycon), i_ty)
                     x -> pprPanic "dsLit" (ppr x)
+    return $! (mkCoreConApps ratio_data_con [Type integer_ty, num, denom])
+  -- Large rationals will be computed at runtime.
+  | otherwise
+  = do
+      let mkRationalName = case base of
+                             Base2 -> mkRationalBase2Name
+                             Base10 -> mkRationalBase10Name
+      mkRational <- dsLookupGlobalId mkRationalName
+      litR <- dsRational signi
+      platform <- targetPlatform <$> getDynFlags
+      let litE = mkIntegerExpr platform exp
+      return (mkCoreApps (Var mkRational) [litR, litE])
+
+dsRational :: Rational -> DsM CoreExpr
+dsRational (n :% d) = do
+  platform <- targetPlatform <$> getDynFlags
+  dcn <- dsLookupDataCon ratioDataConName
+  let cn = mkIntegerExpr platform n
+  let dn = mkIntegerExpr platform d
+  return $ mkCoreConApps dcn [Type integerTy, cn, dn]
+
 
 dsOverLit :: HsOverLit GhcTc -> DsM CoreExpr
 -- ^ Post-typechecker, the 'HsExpr' field of an 'OverLit' contains
 -- (an expression for) the literal value itself.
-dsOverLit (OverLit { ol_val = val, ol_ext = OverLitTc rebindable ty
-                   , ol_witness = witness }) = do
+dsOverLit (OverLit { ol_val = val, ol_ext = OverLitTc rebindable witness ty }) = do
   dflags <- getDynFlags
   let platform = targetPlatform dflags
   case shortCutLit platform val ty of
     Just expr | not rebindable -> dsExpr expr        -- Note [Literal short cut]
     _                          -> dsExpr witness
+
 {-
 Note [Literal short cut]
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -151,10 +267,7 @@ warnAboutIdentities dflags conv_fn type_of_conv
   , idName conv_fn `elem` conversionNames
   , Just (_, arg_ty, res_ty) <- splitFunTy_maybe type_of_conv
   , arg_ty `eqType` res_ty  -- So we are converting  ty -> ty
-  = warnDs (Reason Opt_WarnIdentities)
-           (vcat [ text "Call of" <+> ppr conv_fn <+> dcolon <+> ppr type_of_conv
-                 , nest 2 $ text "can probably be omitted"
-           ])
+  = diagnosticDs (DsIdentitiesFound conv_fn type_of_conv)
 warnAboutIdentities _ _ _ = return ()
 
 conversionNames :: [Name]
@@ -191,72 +304,57 @@ warnAboutOverflowedLiterals
 warnAboutOverflowedLiterals dflags lit
  | wopt Opt_WarnOverflowedLiterals dflags
  , Just (i, tc) <- lit
- =  if      tc == intTyConName     then check i tc (Proxy :: Proxy Int)
-
+ = if
     -- These only show up via the 'HsOverLit' route
-    else if tc == int8TyConName    then check i tc (Proxy :: Proxy Int8)
-    else if tc == int16TyConName   then check i tc (Proxy :: Proxy Int16)
-    else if tc == int32TyConName   then check i tc (Proxy :: Proxy Int32)
-    else if tc == int64TyConName   then check i tc (Proxy :: Proxy Int64)
-    else if tc == wordTyConName    then check i tc (Proxy :: Proxy Word)
-    else if tc == word8TyConName   then check i tc (Proxy :: Proxy Word8)
-    else if tc == word16TyConName  then check i tc (Proxy :: Proxy Word16)
-    else if tc == word32TyConName  then check i tc (Proxy :: Proxy Word32)
-    else if tc == word64TyConName  then check i tc (Proxy :: Proxy Word64)
-    else if tc == naturalTyConName then checkPositive i tc
+    | tc == intTyConName        -> check i tc minInt         maxInt
+    | tc == wordTyConName       -> check i tc minWord        maxWord
+    | tc == int8TyConName       -> check i tc (min' @Int8)   (max' @Int8)
+    | tc == int16TyConName      -> check i tc (min' @Int16)  (max' @Int16)
+    | tc == int32TyConName      -> check i tc (min' @Int32)  (max' @Int32)
+    | tc == int64TyConName      -> check i tc (min' @Int64)  (max' @Int64)
+    | tc == word8TyConName      -> check i tc (min' @Word8)  (max' @Word8)
+    | tc == word16TyConName     -> check i tc (min' @Word16) (max' @Word16)
+    | tc == word32TyConName     -> check i tc (min' @Word32) (max' @Word32)
+    | tc == word64TyConName     -> check i tc (min' @Word64) (max' @Word64)
+    | tc == naturalTyConName    -> checkPositive i tc
 
     -- These only show up via the 'HsLit' route
-    else if tc == intPrimTyConName    then check i tc (Proxy :: Proxy Int)
-    else if tc == int8PrimTyConName   then check i tc (Proxy :: Proxy Int8)
-    else if tc == int32PrimTyConName  then check i tc (Proxy :: Proxy Int32)
-    else if tc == int64PrimTyConName  then check i tc (Proxy :: Proxy Int64)
-    else if tc == wordPrimTyConName   then check i tc (Proxy :: Proxy Word)
-    else if tc == word8PrimTyConName  then check i tc (Proxy :: Proxy Word8)
-    else if tc == word32PrimTyConName then check i tc (Proxy :: Proxy Word32)
-    else if tc == word64PrimTyConName then check i tc (Proxy :: Proxy Word64)
+    | tc == intPrimTyConName    -> check i tc minInt         maxInt
+    | tc == wordPrimTyConName   -> check i tc minWord        maxWord
+    | tc == int8PrimTyConName   -> check i tc (min' @Int8)   (max' @Int8)
+    | tc == int16PrimTyConName  -> check i tc (min' @Int16)  (max' @Int16)
+    | tc == int32PrimTyConName  -> check i tc (min' @Int32)  (max' @Int32)
+    | tc == int64PrimTyConName  -> check i tc (min' @Int64)  (max' @Int64)
+    | tc == word8PrimTyConName  -> check i tc (min' @Word8)  (max' @Word8)
+    | tc == word16PrimTyConName -> check i tc (min' @Word16) (max' @Word16)
+    | tc == word32PrimTyConName -> check i tc (min' @Word32) (max' @Word32)
+    | tc == word64PrimTyConName -> check i tc (min' @Word64) (max' @Word64)
 
-    else return ()
+    | otherwise -> return ()
 
   | otherwise = return ()
   where
+    -- use target Int/Word sizes! See #17336
+    platform          = targetPlatform dflags
+    (minInt,maxInt)   = (platformMinInt platform, platformMaxInt platform)
+    (minWord,maxWord) = (0,                       platformMaxWord platform)
+
+    min' :: forall a. (Integral a, Bounded a) => Integer
+    min' = fromIntegral (minBound :: a)
+
+    max' :: forall a. (Integral a, Bounded a) => Integer
+    max' = fromIntegral (maxBound :: a)
 
     checkPositive :: Integer -> Name -> DsM ()
     checkPositive i tc
-      = when (i < 0) $ do
-        warnDs (Reason Opt_WarnOverflowedLiterals)
-               (vcat [ text "Literal" <+> integer i
-                       <+> text "is negative but" <+> ppr tc
-                       <+> ptext (sLit "only supports positive numbers")
-                     ])
+      = when (i < 0) $
+        diagnosticDs (DsOverflowedLiterals i tc Nothing (negLiteralExtEnabled dflags))
 
-    check :: forall a. (Bounded a, Integral a) => Integer -> Name -> Proxy a -> DsM ()
-    check i tc _proxy
-      = when (i < minB || i > maxB) $ do
-        warnDs (Reason Opt_WarnOverflowedLiterals)
-               (vcat [ text "Literal" <+> integer i
-                       <+> text "is out of the" <+> ppr tc <+> ptext (sLit "range")
-                       <+> integer minB <> text ".." <> integer maxB
-                     , sug ])
+    check i tc minB maxB
+      = when (i < minB || i > maxB) $
+        diagnosticDs (DsOverflowedLiterals i tc bounds (negLiteralExtEnabled dflags))
       where
-        minB = toInteger (minBound :: a)
-        maxB = toInteger (maxBound :: a)
-        sug | minB == -i   -- Note [Suggest NegativeLiterals]
-            , i > 0
-            , not (xopt LangExt.NegativeLiterals dflags)
-            = text "If you are trying to write a large negative literal, use NegativeLiterals"
-            | otherwise = Outputable.empty
-
-{-
-Note [Suggest NegativeLiterals]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-If you write
-  x :: Int8
-  x = -128
-it'll parse as (negate 128), and overflow.  In this case, suggest NegativeLiterals.
-We get an erroneous suggestion for
-  x = 128
-but perhaps that does not matter too much.
--}
+        bounds = Just (MinBound minB, MaxBound maxB)
 
 warnAboutEmptyEnumerations :: FamInstEnvs -> DynFlags -> LHsExpr GhcTc
                            -> Maybe (LHsExpr GhcTc)
@@ -267,35 +365,46 @@ warnAboutEmptyEnumerations fam_envs dflags fromExpr mThnExpr toExpr
   | not $ wopt Opt_WarnEmptyEnumerations dflags
   = return ()
   -- Numeric Literals
-  | Just from_ty@(from,_) <- getLHsIntegralLit fromExpr
-  , Just (_, tc)          <- getNormalisedTyconName fam_envs from_ty
-  , Just mThn             <- traverse getLHsIntegralLit mThnExpr
-  , Just (to,_)           <- getLHsIntegralLit toExpr
-  , let check :: forall a. (Enum a, Num a) => Proxy a -> DsM ()
-        check _proxy
-          = when (null enumeration) raiseWarning
+  | Just from_ty@(from',_) <- getLHsIntegralLit fromExpr
+  , Just (_, tc)           <- getNormalisedTyconName fam_envs from_ty
+  , Just mThn'             <- traverse getLHsIntegralLit mThnExpr
+  , Just (to',_)           <- getLHsIntegralLit toExpr
+  = do
+      let
+        check :: forall a. (Integral a, Num a) => DsM ()
+        check = when (null enumeration) raiseWarning
           where
-            enumeration :: [a]
             enumeration = case mThn of
-                            Nothing      -> [fromInteger from                    .. fromInteger to]
-                            Just (thn,_) -> [fromInteger from, fromInteger thn   .. fromInteger to]
+              Nothing  -> [from      .. to]
+              Just thn -> [from, thn .. to]
+            wrap :: forall a. (Integral a, Num a) => Integer -> Integer
+            wrap i = toInteger (fromIntegral i :: a)
+            from = wrap @a from'
+            to   = wrap @a to'
+            mThn = fmap (wrap @a . fst) mThn'
 
-  = if      tc == intTyConName    then check (Proxy :: Proxy Int)
-    else if tc == int8TyConName   then check (Proxy :: Proxy Int8)
-    else if tc == int16TyConName  then check (Proxy :: Proxy Int16)
-    else if tc == int32TyConName  then check (Proxy :: Proxy Int32)
-    else if tc == int64TyConName  then check (Proxy :: Proxy Int64)
-    else if tc == wordTyConName   then check (Proxy :: Proxy Word)
-    else if tc == word8TyConName  then check (Proxy :: Proxy Word8)
-    else if tc == word16TyConName then check (Proxy :: Proxy Word16)
-    else if tc == word32TyConName then check (Proxy :: Proxy Word32)
-    else if tc == word64TyConName then check (Proxy :: Proxy Word64)
-    else if tc == integerTyConName then check (Proxy :: Proxy Integer)
-    else if tc == naturalTyConName then check (Proxy :: Proxy Integer)
-      -- We use 'Integer' because otherwise a negative 'Natural' literal
-      -- could cause a compile time crash (instead of a runtime one).
-      -- See the T10930b test case for an example of where this matters.
-    else return ()
+      platform <- targetPlatform <$> getDynFlags
+         -- Be careful to use target Int/Word sizes! cf #17336
+      if | tc == intTyConName     -> case platformWordSize platform of
+                                      PW4 -> check @Int32
+                                      PW8 -> check @Int64
+         | tc == wordTyConName    -> case platformWordSize platform of
+                                      PW4 -> check @Word32
+                                      PW8 -> check @Word64
+         | tc == int8TyConName    -> check @Int8
+         | tc == int16TyConName   -> check @Int16
+         | tc == int32TyConName   -> check @Int32
+         | tc == int64TyConName   -> check @Int64
+         | tc == word8TyConName   -> check @Word8
+         | tc == word16TyConName  -> check @Word16
+         | tc == word32TyConName  -> check @Word32
+         | tc == word64TyConName  -> check @Word64
+         | tc == integerTyConName -> check @Integer
+         | tc == naturalTyConName -> check @Integer
+            -- We use 'Integer' because otherwise a negative 'Natural' literal
+            -- could cause a compile time crash (instead of a runtime one).
+            -- See the T10930b test case for an example of where this matters.
+         | otherwise -> return ()
 
   -- Char literals (#18402)
   | Just fromChar <- getLHsCharLit fromExpr
@@ -308,22 +417,29 @@ warnAboutEmptyEnumerations fam_envs dflags fromExpr mThnExpr toExpr
 
   | otherwise = return ()
   where
-    raiseWarning = warnDs (Reason Opt_WarnEmptyEnumerations) (text "Enumeration is empty")
+    raiseWarning =
+      diagnosticDs DsEmptyEnumeration
 
 getLHsIntegralLit :: LHsExpr GhcTc -> Maybe (Integer, Type)
 -- ^ See if the expression is an 'Integral' literal.
--- Remember to look through automatically-added tick-boxes! (#8384)
-getLHsIntegralLit (L _ (HsPar _ e))            = getLHsIntegralLit e
-getLHsIntegralLit (L _ (HsTick _ _ e))         = getLHsIntegralLit e
-getLHsIntegralLit (L _ (HsBinTick _ _ _ e))    = getLHsIntegralLit e
-getLHsIntegralLit (L _ (HsOverLit _ over_lit)) = getIntegralLit over_lit
-getLHsIntegralLit (L _ (HsLit _ lit))          = getSimpleIntegralLit lit
-getLHsIntegralLit _ = Nothing
+getLHsIntegralLit (L _ e) = go e
+  where
+    go (HsPar _ _ e _)        = getLHsIntegralLit e
+    go (HsOverLit _ over_lit) = getIntegralLit over_lit
+    go (HsLit _ lit)          = getSimpleIntegralLit lit
+
+    -- Remember to look through automatically-added tick-boxes! (#8384)
+    go (XExpr (HsTick _ e))       = getLHsIntegralLit e
+    go (XExpr (HsBinTick _ _ e))  = getLHsIntegralLit e
+
+    -- The literal might be wrapped in a case with -XOverloadedLists
+    go (XExpr (WrapExpr (HsWrap _ e))) = go e
+    go _ = Nothing
 
 -- | If 'Integral', extract the value and type of the overloaded literal.
 -- See Note [Literals and the OverloadedLists extension]
 getIntegralLit :: HsOverLit GhcTc -> Maybe (Integer, Type)
-getIntegralLit (OverLit { ol_val = HsIntegral i, ol_ext = OverLitTc _ ty })
+getIntegralLit (OverLit { ol_val = HsIntegral i, ol_ext = OverLitTc { ol_type = ty } })
   = Just (il_value i, ty)
 getIntegralLit _ = Nothing
 
@@ -339,10 +455,10 @@ getSimpleIntegralLit _ = Nothing
 
 -- | Extract the Char if the expression is a Char literal.
 getLHsCharLit :: LHsExpr GhcTc -> Maybe Char
-getLHsCharLit (L _ (HsPar _ e))            = getLHsCharLit e
-getLHsCharLit (L _ (HsTick _ _ e))         = getLHsCharLit e
-getLHsCharLit (L _ (HsBinTick _ _ _ e))    = getLHsCharLit e
+getLHsCharLit (L _ (HsPar _ _ e _))        = getLHsCharLit e
 getLHsCharLit (L _ (HsLit _ (HsChar _ c))) = Just c
+getLHsCharLit (L _ (XExpr (HsTick _ e)))         = getLHsCharLit e
+getLHsCharLit (L _ (XExpr (HsBinTick _ _ e)))    = getLHsCharLit e
 getLHsCharLit _ = Nothing
 
 -- | Convert a pair (Integer, Type) to (Integer, Name) after eventually
@@ -354,7 +470,9 @@ getNormalisedTyconName fam_envs (i,ty)
     | otherwise = Nothing
   where
     normaliseNominal :: FamInstEnvs -> Type -> Type
-    normaliseNominal fam_envs ty = snd $ normaliseType fam_envs Nominal ty
+    normaliseNominal fam_envs ty
+      = reductionReducedType
+      $ normaliseType fam_envs Nominal ty
 
 -- | Convert a pair (Integer, Type) to (Integer, Name) without normalising
 -- the type
@@ -388,9 +506,9 @@ to convert it to the needed type `Word8`.
 
 tidyLitPat :: HsLit GhcTc -> Pat GhcTc
 -- Result has only the following HsLits:
---      HsIntPrim, HsWordPrim, HsCharPrim, HsFloatPrim
---      HsDoublePrim, HsStringPrim, HsString
---  * HsInteger, HsRat, HsInt can't show up in LitPats
+--      HsIntPrim, HsWordPrim, HsCharPrim, HsString
+--  * HsInteger, HsRat, HsInt, as well as HsStringPrim,
+--    HsFloatPrim and HsDoublePrim can't show up in LitPats
 --  * We get rid of HsChar right here
 tidyLitPat (HsChar src c) = unLoc (mkCharLitPat src c)
 tidyLitPat (HsString src s)
@@ -406,7 +524,7 @@ tidyLitPat lit = LitPat noExtField lit
 tidyNPat :: HsOverLit GhcTc -> Maybe (SyntaxExpr GhcTc) -> SyntaxExpr GhcTc
          -> Type
          -> Pat GhcTc
-tidyNPat (OverLit (OverLitTc False ty) val _) mb_neg _eq outer_ty
+tidyNPat (OverLit (OverLitTc False _ ty) val) mb_neg _eq outer_ty
         -- False: Take short cuts only if the literal is not using rebindable syntax
         --
         -- Once that is settled, look for cases where the type of the
@@ -436,7 +554,7 @@ tidyNPat (OverLit (OverLitTc False ty) val _) mb_neg _eq outer_ty
 
     mk_con_pat :: DataCon -> HsLit GhcTc -> Pat GhcTc
     mk_con_pat con lit
-      = unLoc (mkPrefixConPat con [noLoc $ LitPat noExtField lit] [])
+      = unLoc (mkPrefixConPat con [noLocA $ LitPat noExtField lit] [])
 
     mb_int_lit :: Maybe Integer
     mb_int_lit = case (mb_neg, val) of
@@ -450,7 +568,7 @@ tidyNPat (OverLit (OverLitTc False ty) val _) mb_neg _eq outer_ty
                    _ -> Nothing
 
 tidyNPat over_lit mb_neg eq outer_ty
-  = NPat outer_ty (noLoc over_lit) mb_neg eq
+  = NPat outer_ty (noLocA over_lit) mb_neg eq
 
 {-
 ************************************************************************
@@ -511,15 +629,17 @@ hsLitKey :: Platform -> HsLit GhcTc -> Literal
 -- In the case of the fixed-width numeric types, we need to wrap here
 -- because Literal has an invariant that the literal is in range, while
 -- HsLit does not.
-hsLitKey platform (HsIntPrim    _ i) = mkLitIntWrap  platform i
-hsLitKey platform (HsWordPrim   _ w) = mkLitWordWrap platform w
-hsLitKey platform (HsInt64Prim  _ i) = mkLitInt64Wrap  platform i
-hsLitKey platform (HsWord64Prim _ w) = mkLitWord64Wrap platform w
-hsLitKey _        (HsCharPrim   _ c) = mkLitChar            c
-hsLitKey _        (HsFloatPrim  _ f) = mkLitFloat           (fl_value f)
-hsLitKey _        (HsDoublePrim _ d) = mkLitDouble          (fl_value d)
-hsLitKey _        (HsString _ s)     = LitString (bytesFS s)
-hsLitKey _        l                  = pprPanic "hsLitKey" (ppr l)
+hsLitKey platform (HsIntPrim    _ i)  = mkLitIntWrap  platform i
+hsLitKey platform (HsWordPrim   _ w)  = mkLitWordWrap platform w
+hsLitKey _        (HsInt64Prim  _ i)  = mkLitInt64Wrap  i
+hsLitKey _        (HsWord64Prim _ w)  = mkLitWord64Wrap w
+hsLitKey _        (HsCharPrim   _ c)  = mkLitChar            c
+-- This following two can be slow. See Note [FractionalLit representation]
+hsLitKey _        (HsFloatPrim  _ fl) = mkLitFloat (rationalFromFractionalLit fl)
+hsLitKey _        (HsDoublePrim _ fl) = mkLitDouble (rationalFromFractionalLit fl)
+
+hsLitKey _        (HsString _ s)      = LitString (bytesFS s)
+hsLitKey _        l                   = pprPanic "hsLitKey" (ppr l)
 
 {-
 ************************************************************************

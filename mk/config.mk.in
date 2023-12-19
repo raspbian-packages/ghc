@@ -74,8 +74,8 @@ GhcStage2HcOpts=-O2 -haddock
 GhcStage3HcOpts=-O2 -haddock
 
 
-# Note [Stage number in build variables].
-#
+# Note [Stage number in build variables]
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # There are (unfortunately) two different naming schemes for build variables
 # specific to a certain stage.
 #
@@ -124,26 +124,6 @@ endif
 PlatformSupportsSharedLibs = $(if $(filter $(TARGETPLATFORM),\
     $(NoSharedLibsPlatformList)),NO,YES)
 
-# DYNAMIC_BY_DEFAULT says whether this compiler will default to
-# building dynamic executables, i.e. -dynamic is on.  We do this for
-# most platforms because it lets us use the system dynamic linker
-# instead of our own linker for GHCi.
-#
-# Currently this isn't possible on Windows, and we have not yet enabled
-# it on i386 while we consider the performance implications.
-#
-ifeq "$(TargetOS_CPP)" "mingw32"
-DYNAMIC_BY_DEFAULT = NO
-else ifeq "$(TargetArch_CPP)" "i386"
-DYNAMIC_BY_DEFAULT = NO
-else
-DYNAMIC_BY_DEFAULT = YES
-endif
-
-# For now, we unconditionally disable dynamic-by-default, as the
-# cabal-install's that are in the wild don't handle it properly.
-DYNAMIC_BY_DEFAULT = NO
-
 # If building both v and dyn ways, then use -dynamic-too to build them.
 # This makes the build faster.
 DYNAMIC_TOO = YES
@@ -174,12 +154,12 @@ endif
 GhcUnregisterised=@Unregisterised@
 
 # ArchSupportsSMP should be set iff there is support for that arch in
-# includes/stg/SMP.h
+# rts/include/stg/SMP.h
 ifeq "$(TargetArch_CPP)" "arm"
 # We don't support load/store barriers pre-ARMv7. See #10433.
 ArchSupportsSMP=$(if $(filter $(ARM_ISA),ARMv5 ARMv6),NO,YES)
 else
-ArchSupportsSMP=$(strip $(patsubst $(TargetArch_CPP), YES, $(findstring $(TargetArch_CPP), i386 x86_64 sparc powerpc powerpc64 powerpc64le s390x aarch64)))
+ArchSupportsSMP=$(strip $(patsubst $(TargetArch_CPP), YES, $(findstring $(TargetArch_CPP), i386 x86_64 sparc powerpc powerpc64 powerpc64le s390x aarch64 riscv64)))
 endif
 
 # The THREADED_RTS requires `BaseReg` to be in a register and the
@@ -247,31 +227,22 @@ BuildSharedLibs=$(strip $(if $(findstring dyn,$(GhcLibWays)),YES,NO))
 # make sense here:
 #
 #   thr           : threaded
-#   thr_p         : threaded + profiled + eventlog
-#   debug         : debugging + eventlog
-#   thr_debug     : debugging + threaded, + eventlog
-#   l             : eventlog
-#   p             : profiled + eventlog
-#   thr_l         : threaded + eventlog
+#   thr_p         : threaded + profiled
+#   debug         : debugging
+#   thr_debug     : debugging + threaded
+#   p             : profiled
 #
-# Note how there are a few cases which are handled specially (in packageHsLibs)
-# to reduce the number of distinct ways,
-#
-#   debug     implies  eventlog
-#   profiled  implies  eventlog
-#
-# This means, for instance, that there is no debug_l way.
-#
-GhcRTSWays=l
+# While the eventlog used to be enabled in only a subset of ways, we now always
+# enable it.
 
 # Usually want the debug version
-GhcRTSWays += debug
+GhcRTSWays = debug
 
 # We always have the threaded versions, but note that SMP support may be disabled
 # (see GhcWithSMP).
-GhcRTSWays += thr thr_debug thr_l
+GhcRTSWays += thr thr_debug
 GhcRTSWays += $(if $(findstring p, $(GhcLibWays)),thr_p,)
-GhcRTSWays += $(if $(findstring dyn, $(GhcLibWays)),dyn debug_dyn thr_dyn thr_debug_dyn l_dyn thr_l_dyn,)
+GhcRTSWays += $(if $(findstring dyn, $(GhcLibWays)),dyn debug_dyn thr_dyn thr_debug_dyn,)
 GhcRTSWays += $(if $(findstring p, $(GhcLibWays)),thr_debug_p debug_p,)
 
 # We can only build GHCi threaded if we have a threaded RTS:
@@ -387,7 +358,7 @@ BIN_DIST_TAR_COMP       = $(BIN_DIST_NAME)-$(TARGETPLATFORM).tar.$(TAR_COMP_EXT)
 # SRC_HC_OPTS is *not* for adding flags that are required to make your
 # build work.  Examples:
 #
-#  - instead of using -pgmc/-pgma-/-pgml, use the --with-gcc option to configure
+#  - instead of using -pgmc/-pgmcxx/-pgma-/-pgml, use the --with-gcc option to configure
 #
 #  - if you need -optc, -opta, or -optl flags, the CONF_CC_* and CONF_LD_*
 #    variables are more appropriate (set via configure)
@@ -482,9 +453,11 @@ TargetHasGnuNonexecStack = @TargetHasGnuNonexecStack@
 TargetHasIdentDirective = @TargetHasIdentDirective@
 TargetHasSubsectionsViaSymbols = @TargetHasSubsectionsViaSymbols@
 TargetHasRTSLinker = @TargetHasRTSLinker@
+TargetHasLibm = @TargetHasLibm@
 TablesNextToCode = @TablesNextToCode@
 
 SettingsCCompilerCommand = @SettingsCCompilerCommand@
+SettingsCxxCompilerCommand = @SettingsCxxCompilerCommand@
 SettingsHaskellCPPCommand = @SettingsHaskellCPPCommand@
 SettingsHaskellCPPFlags = @SettingsHaskellCPPFlags@
 SettingsCCompilerFlags = @SettingsCCompilerFlags@
@@ -506,6 +479,7 @@ SettingsTouchCommand = @SettingsTouchCommand@
 SettingsClangCommand = @SettingsClangCommand@
 SettingsLlcCommand = @SettingsLlcCommand@
 SettingsOptCommand = @SettingsOptCommand@
+SettingsUseDistroMINGW = @SettingsUseDistroMINGW@
 
 #-----------------------------------------------------------------------------
 # C compiler
@@ -569,7 +543,7 @@ CrossCompilePrefix    = $(if $(filter YES,$(Stage1Only)),@CrossCompilePrefix@,)
 INSTALL_GHC_STAGE= $(if $(filter YES,$(Stage1Only)),1,2)
 
 # Note [CrossCompiling vs Stage1Only]
-#
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # There are 4 possible settings:
 #
 # 1 CrossCompiling=NO Stage1Only=NO
@@ -588,7 +562,7 @@ INSTALL_GHC_STAGE= $(if $(filter YES,$(Stage1Only)),1,2)
 # [1] https://gitlab.haskell.org/ghc/ghc/wikis/building/cross-compiling
 
 # Note [Stage1Only vs stage=1]
-#
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Stage1Only=YES means:
 #   - don't build ghc-stage2 (the executable)
 #   - don't build utils that rely on ghc-stage2
@@ -670,21 +644,18 @@ SRC_HSC2HS_OPTS_STAGE0 += --cflag=-D$(HostArch_CPP)_HOST_ARCH --cflag=-D$(HostOS
 SRC_HSC2HS_OPTS_STAGE1 += --cflag=-D$(TargetArch_CPP)_HOST_ARCH --cflag=-D$(TargetOS_CPP)_HOST_OS
 SRC_HSC2HS_OPTS_STAGE2 += --cflag=-D$(TargetArch_CPP)_HOST_ARCH --cflag=-D$(TargetOS_CPP)_HOST_OS
 
-ifeq "$(TARGETPLATFORM)" "i386-unknown-mingw32"
-WINDRES = $(INPLACE_MINGW)/bin/windres
-else ifeq "$(TARGETPLATFORM)" "x86_64-unknown-mingw32"
-WINDRES = $(INPLACE_MINGW)/bin/windres
-endif
+WINDRES=@WindresCmd@
+
+#-----------------------------------------------------------------------------
+# Python for testsuite driver and code generators
+#
+PYTHON=@PythonCmd@
 
 #-----------------------------------------------------------------------------
 # Mingwex Library
 #
 HaveLibMingwEx	= @HaveLibMingwEx@
-ifeq "$(TARGETPLATFORM)" "i386-unknown-mingw32"
-DLLTOOL			= inplace/mingw/bin/dlltool.exe
-else ifeq "$(TARGETPLATFORM)" "x86_64-unknown-mingw32"
-DLLTOOL			= inplace/mingw/bin/dlltool.exe
-endif
+DLLTOOL			= @DlltoolCmd@
 
 #-----------------------------------------------------------------------------
 # Other standard (ha!) Unix utilities
@@ -692,6 +663,7 @@ endif
 AR			= @ArCmd@
 AR_OPTS			= @ArArgs@
 ArSupportsAtFile = @ArSupportsAtFile@
+ArSupportsDashL  = @ArSupportsDashL@
 
 AR_STAGE0 = @AR_STAGE0@
 AR_STAGE1 = $(AR)
@@ -904,8 +876,13 @@ GhcLibHcOpts=
 endif
 
 # Note [Disable -O2 in unregisterised mode]
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Disable -O2 optimization in unregisterised mode. Otherwise amount
 # of generated C code # makes things very slow to compile (~5 minutes
 # on core-i7 for 'compiler/GHC/Hs/Expr.hs') and sometimes not compile
 # at all: powerpc64 overflows TOC section on 'compiler/GHC/Hs/Expr.hs'
 #         ia64 overflows short data section on 'compiler/GHC/Driver/Session.hs'
+
+
+# See Note [Support for building ghc 9.4 with the make build system]
+CanBootWithMake = @CanBootWithMake@

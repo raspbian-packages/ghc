@@ -3,7 +3,7 @@
 -- template-haskell.cabal.
 
 name:           template-haskell
-version:        2.17.0.0
+version:        2.19.0.0
 -- NOTE: Don't forget to update ./changelog.md
 license:        BSD3
 license-file:   LICENSE
@@ -26,6 +26,14 @@ source-repository head
     type:     git
     location: https://gitlab.haskell.org/ghc/ghc.git
     subdir:   libraries/template-haskell
+
+
+-- We give the option to vendor filepath to avoid making filepath non-reinstallable..
+-- see #21738 for why we are doing this now and what the plan is for the future.
+Flag vendor-filepath
+    Description: Vendor the dependency on filepath
+    Default: False
+    Manual: True
 
 Library
     default-language: Haskell2010
@@ -55,10 +63,22 @@ Library
         Language.Haskell.TH.Lib.Map
 
     build-depends:
-        base        >= 4.11 && < 4.16,
+        base        >= 4.11 && < 4.18,
         ghc-boot-th == @ProjectVersionMunged@,
         ghc-prim,
         pretty      == 1.1.*
+
+    if flag(vendor-filepath)
+      other-modules:
+        System.FilePath
+        System.FilePath.Posix
+        System.FilePath.Windows
+      hs-source-dirs: ./vendored-filepath .
+      default-extensions:
+        ImplicitPrelude
+    else
+      build-depends: filepath
+      hs-source-dirs: .
 
     ghc-options: -Wall
 

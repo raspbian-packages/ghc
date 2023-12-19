@@ -33,20 +33,20 @@ tar -Jxf "$WINDOWS_BINDIST"
 mv ghc* windows
 cd inst/share/doc/ghc*/html/libraries
 
-# try extracting the make bindist docs and then the hadrian bindist docs
 mv ../../../../../../windows/doc/html/libraries/Win32-* . || \
-    mv ../../../../../../windows/docs/html/libraries/Win32 . || \
     die "failed to find the Win32 package documentation"
 
 sh gen_contents_index
 cd ..
-for i in haddock libraries users_guide
+for i in */
 do
-    tar -Jcf ../../../../../$i.html.tar.xz $i
+    dir=${i%*/}
+    tar -Jcf ../../../../../$dir.html.tar.xz $dir
 done
 mv index.html ../../../../..
 cd ..
-mv ./*.pdf ../../../..
+mv ./*.pdf ../../../.. || \
+    die "failed to find PDFs"
 cd ../../../..
 [ "$NO_CLEAN" -eq 0 ] && rm -r inst
 [ "$NO_CLEAN" -eq 0 ] && rm -r windows

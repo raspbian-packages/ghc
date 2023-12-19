@@ -28,14 +28,14 @@ static uint32_t* cpuGroupCumulativeCache = NULL;
 static uint8_t* cpuGroupDistCache = NULL;
 
 void
-yieldThread()
+yieldThread(void)
 {
   SwitchToThread();
   return;
 }
 
 void
-shutdownThread()
+shutdownThread(void)
 {
     ExitThread(0);
     barf("ExitThread() returned"); // avoid gcc warning
@@ -65,7 +65,7 @@ createOSThread (OSThreadId* pId, char *name STG_UNUSED,
 }
 
 OSThreadId
-osThreadId()
+osThreadId(void)
 {
   return GetCurrentThreadId();
 }
@@ -171,19 +171,19 @@ void freeThreadingResources (void)
 {
     if (cpuGroupCache)
     {
-        free(cpuGroupCache);
+        stgFree(cpuGroupCache);
         cpuGroupCache = NULL;
     }
 
     if (cpuGroupCumulativeCache)
     {
-        free(cpuGroupCumulativeCache);
+        stgFree(cpuGroupCumulativeCache);
         cpuGroupCumulativeCache = NULL;
     }
 
     if (cpuGroupDistCache)
     {
-        free(cpuGroupDistCache);
+        stgFree(cpuGroupDistCache);
         cpuGroupDistCache = NULL;
     }
 }
@@ -240,7 +240,7 @@ getProcessorsDistribution (void)
     if (!cpuGroupDistCache)
     {
         uint8_t n_groups = getNumberOfProcessorsGroups();
-        cpuGroupDistCache = malloc(n_groups * sizeof(uint8_t));
+        cpuGroupDistCache = stgMallocBytes(n_groups * sizeof(uint8_t), "getProcessorsDistribution");
         memset(cpuGroupDistCache, MAXIMUM_PROCESSORS, n_groups * sizeof(uint8_t));
 
         for (int i = 0; i < n_groups; i++)
@@ -265,7 +265,7 @@ getProcessorsCumulativeSum(void)
     if (!cpuGroupCumulativeCache)
     {
         uint8_t n_groups = getNumberOfProcessorsGroups();
-        cpuGroupCumulativeCache = malloc(n_groups * sizeof(uint32_t));
+        cpuGroupCumulativeCache = stgMallocBytes(n_groups * sizeof(uint32_t), "getProcessorsCumulativeSum");
         memset(cpuGroupCumulativeCache, 0, n_groups * sizeof(uint32_t));
 
 #if defined(x86_64_HOST_ARCH)
@@ -306,7 +306,7 @@ createProcessorGroupMap (void)
 
     uint32_t numProcs = getNumberOfProcessors();
 
-    cpuGroupCache = malloc(numProcs * sizeof(uint8_t));
+    cpuGroupCache = stgMallocBytes(numProcs * sizeof(uint8_t), "createProcessorGroupMap");
     /* For 32bit Windows and 64bit older than Windows 7, create a default mapping. */
     memset(cpuGroupCache, 0, numProcs * sizeof(uint8_t));
 
@@ -386,7 +386,7 @@ setThreadAffinity (uint32_t n, uint32_t m) // cap N of M
     ASSERT(n_groups      > 0);
     ASSERT(n_proc        > 0);
 
-    mask = malloc(n_groups * sizeof(DWORD_PTR));
+    mask = stgMallocBytes(n_groups * sizeof(DWORD_PTR), "setThreadAffinity");
     memset(mask, 0, n_groups * sizeof(DWORD_PTR));
 
     /* The mask for the individual groups are all 0 based
@@ -422,14 +422,14 @@ setThreadAffinity (uint32_t n, uint32_t m) // cap N of M
         {
             r = SetThreadAffinityMask(hThread, mask[i]);
             if (r == 0) {
-                free(mask);
+                stgFree(mask);
                 sysErrorBelch("SetThreadAffinity");
                 stg_exit(EXIT_FAILURE);
             }
         }
     }
 
-    free(mask);
+    stgFree(mask);
 }
 
 void
@@ -543,25 +543,38 @@ closeCondition( Condition* pCond STG_UNUSED)
   return;
 }
 
-bool
+void
 broadcastCondition ( Condition* pCond )
 {
   WakeAllConditionVariable(pCond);
-  return true;
 }
 
-bool
+void
 signalCondition ( Condition* pCond )
 {
   WakeConditionVariable(pCond);
-  return true;
+}
+
+void
+waitCondition ( Condition* pCond, Mutex* pMut )
+{
+  CHECK(SleepConditionVariableSRW(pCond, pMut, INFINITE, 0));
 }
 
 bool
-waitCondition ( Condition* pCond, Mutex* pMut )
+timedWaitCondition ( Condition* pCond, Mutex* pMut, Time timeout )
 {
-  SleepConditionVariableSRW(pCond, pMut, INFINITE, 0);
-  return true;
+  // If we pass a timeout of 0 SleepConditionVariableSRW will return immediately
+  // https://docs.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-sleepconditionvariablesrw
+  DWORD ms = (DWORD)stg_min(1, TimeToMS(timeout));
+  BOOL res = SleepConditionVariableSRW(pCond, pMut, ms, 0);
+  if (res) {
+    return true; // success
+  } else if (GetLastError() == ERROR_TIMEOUT) {
+    return false; // timeout
+  } else {
+    barf("timedWaitCondition: error %" FMT_Word, (StgWord) GetLastError());
+  }
 }
 
 void

@@ -1,3 +1,12 @@
+{-# LANGUAGE ConstraintKinds      #-}
+{-# LANGUAGE DataKinds            #-}
+{-# LANGUAGE DeriveDataTypeable   #-}
+{-# LANGUAGE FlexibleContexts     #-}
+{-# LANGUAGE LambdaCase           #-}
+{-# LANGUAGE TypeFamilies         #-}
+{-# LANGUAGE NamedFieldPuns       #-}
+{-# LANGUAGE UndecidableInstances #-}
+
 {-
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
 
@@ -10,21 +19,11 @@ being one that happens to be ideally suited to spineless tagless code
 generation.
 -}
 
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE UndecidableInstances #-}
-{-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE LambdaCase #-}
-
 module GHC.Stg.Syntax (
         StgArg(..),
 
         GenStgTopBinding(..), GenStgBinding(..), GenStgExpr(..), GenStgRhs(..),
-        GenStgAlt, AltType(..),
+        GenStgAlt(..), AltType(..),
 
         StgPass(..), BinderP, XRhsClosure, XLet, XLetNoEscape,
         NoExtFieldSilent, noExtFieldSilent,
@@ -32,11 +31,16 @@ module GHC.Stg.Syntax (
 
         UpdateFlag(..), isUpdatable,
 
+        ConstructorNumber(..),
+
         -- a set of synonyms for the vanilla parameterisation
         StgTopBinding, StgBinding, StgExpr, StgRhs, StgAlt,
 
         -- a set of synonyms for the code gen parameterisation
         CgStgTopBinding, CgStgBinding, CgStgExpr, CgStgRhs, CgStgAlt,
+
+        -- Same for taggedness
+        TgStgTopBinding, TgStgBinding, TgStgExpr, TgStgRhs, TgStgAlt,
 
         -- a set of synonyms for the lambda lifting parameterisation
         LlStgTopBinding, LlStgBinding, LlStgExpr, LlStgRhs, LlStgAlt,
@@ -49,34 +53,31 @@ module GHC.Stg.Syntax (
         StgOp(..),
 
         -- utils
-        stgRhsArity,
+        stgRhsArity, freeVarsOfRhs,
         isDllConApp,
         stgArgType,
-        stripStgTicksTop, stripStgTicksTopE,
         stgCaseBndrInScope,
-        bindersOf, bindersOfTop, bindersOfTopBinds,
 
         -- ppr
-        StgPprOpts(..), initStgPprOpts, panicStgPprOpts,
+        StgPprOpts(..),
+        panicStgPprOpts, shortStgPprOpts,
         pprStgArg, pprStgExpr, pprStgRhs, pprStgBinding,
         pprGenStgTopBinding, pprStgTopBinding,
         pprGenStgTopBindings, pprStgTopBindings
     ) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
-import GHC.Core     ( AltCon, Tickish )
+import GHC.Core     ( AltCon )
 import GHC.Types.CostCentre ( CostCentreStack )
 import Data.ByteString ( ByteString )
 import Data.Data   ( Data )
 import Data.List   ( intersperse )
 import GHC.Core.DataCon
-import GHC.Driver.Session
 import GHC.Types.ForeignCall ( ForeignCall )
 import GHC.Types.Id
 import GHC.Types.Name        ( isDynLinkName )
+import GHC.Types.Tickish     ( StgTickish )
 import GHC.Types.Var.Set
 import GHC.Types.Literal     ( Literal, literalType )
 import GHC.Unit.Module       ( Module )
@@ -86,10 +87,8 @@ import GHC.Core.Ppr( {- instances -} )
 import GHC.Builtin.PrimOps ( PrimOp, PrimCall )
 import GHC.Core.TyCon    ( PrimRep(..), TyCon )
 import GHC.Core.Type     ( Type )
-import GHC.Types.RepType ( typePrimRep1 )
-import GHC.Utils.Misc
-
-import Data.List.NonEmpty ( NonEmpty, toList )
+import GHC.Types.RepType ( typePrimRep1, typePrimRep )
+import GHC.Utils.Panic.Plain
 
 {-
 ************************************************************************
@@ -128,14 +127,19 @@ data StgArg
 -- | Does this constructor application refer to anything in a different
 -- *Windows* DLL?
 -- If so, we can't allocate it statically
-isDllConApp :: DynFlags -> Module -> DataCon -> [StgArg] -> Bool
-isDllConApp dflags this_mod con args
- | not (gopt Opt_ExternalDynamicRefs dflags) = False
+isDllConApp
+  :: Platform
+  -> Bool          -- is Opt_ExternalDynamicRefs enabled?
+  -> Module
+  -> DataCon
+  -> [StgArg]
+  -> Bool
+isDllConApp platform ext_dyn_refs this_mod con args
+ | not ext_dyn_refs    = False
  | platformOS platform == OSMinGW32
     = isDynLinkName platform this_mod (dataConName con) || any is_dll_arg args
  | otherwise = False
   where
-    platform = targetPlatform dflags
     -- NB: typePrimRep1 is legit because any free variables won't have
     -- unlifted type (there are no unlifted things at top level)
     is_dll_arg :: StgArg -> Bool
@@ -172,19 +176,6 @@ isAddrRep _           = False
 stgArgType :: StgArg -> Type
 stgArgType (StgVarArg v)   = idType v
 stgArgType (StgLitArg lit) = literalType lit
-
-
--- | Strip ticks of a given type from an STG expression.
-stripStgTicksTop :: (Tickish Id -> Bool) -> GenStgExpr p -> ([Tickish Id], GenStgExpr p)
-stripStgTicksTop p = go []
-   where go ts (StgTick t e) | p t = go (t:ts) e
-         go ts other               = (reverse ts, other)
-
--- | Strip ticks of a given type from an STG expression returning only the expression.
-stripStgTicksTopE :: (Tickish Id -> Bool) -> GenStgExpr p -> GenStgExpr p
-stripStgTicksTopE p = go
-   where go (StgTick t e) | p t = go e
-         go other               = other
 
 -- | Given an alt type and whether the program is unarised, return whether the
 -- case binder is in scope.
@@ -244,7 +235,8 @@ literals.
         -- StgConApp is vital for returning unboxed tuples or sums
         -- which can't be let-bound
   | StgConApp   DataCon
-                [StgArg] -- Saturated
+                ConstructorNumber
+                [StgArg] -- Saturated. (After Unarisation, [NonVoid StgArg])
                 [Type]   -- See Note [Types in StgConApp] in GHC.Stg.Unarise
 
   | StgOpApp    StgOp    -- Primitive op or foreign call
@@ -252,22 +244,6 @@ literals.
                 Type     -- Result type
                          -- We need to know this so that we can
                          -- assign result registers
-
-{-
-************************************************************************
-*                                                                      *
-StgLam
-*                                                                      *
-************************************************************************
-
-StgLam is used *only* during CoreToStg's work. Before CoreToStg has finished it
-encodes (\x -> e) as (let f = \x -> e in f) TODO: Encode this via an extension
-to GenStgExpr à la TTG.
--}
-
-  | StgLam
-        (NonEmpty (BinderP pass))
-        StgExpr    -- Body of lambda
 
 {-
 ************************************************************************
@@ -383,7 +359,7 @@ Finally for @hpc@ expressions we introduce a new STG construct.
 -}
 
   | StgTick
-    (Tickish Id)
+    StgTickish
     (GenStgExpr pass)       -- sub expression
 
 -- END of GenStgExpr
@@ -434,13 +410,9 @@ important):
                         -- from static closure.
         DataCon         -- Constructor. Never an unboxed tuple or sum, as those
                         -- are not allocated.
+        ConstructorNumber
+        [StgTickish]
         [StgArg]        -- Args
-
--- | Used as a data type index for the stgSyn AST
-data StgPass
-  = Vanilla
-  | LiftLams
-  | CodeGen
 
 -- | Like 'GHC.Hs.Extension.NoExtField', but with an 'Outputable' instance that
 -- returns 'empty'.
@@ -457,30 +429,15 @@ noExtFieldSilent = NoExtFieldSilent
 -- TODO: Maybe move this to GHC.Hs.Extension? I'm not sure about the
 -- implications on build time...
 
--- TODO: Do we really want to the extension point type families to have a closed
--- domain?
-type family BinderP (pass :: StgPass)
-type instance BinderP 'Vanilla = Id
-type instance BinderP 'CodeGen = Id
-
-type family XRhsClosure (pass :: StgPass)
-type instance XRhsClosure 'Vanilla = NoExtFieldSilent
--- | Code gen needs to track non-global free vars
-type instance XRhsClosure 'CodeGen = DIdSet
-
-type family XLet (pass :: StgPass)
-type instance XLet 'Vanilla = NoExtFieldSilent
-type instance XLet 'CodeGen = NoExtFieldSilent
-
-type family XLetNoEscape (pass :: StgPass)
-type instance XLetNoEscape 'Vanilla = NoExtFieldSilent
-type instance XLetNoEscape 'CodeGen = NoExtFieldSilent
-
 stgRhsArity :: StgRhs -> Int
 stgRhsArity (StgRhsClosure _ _ _ bndrs _)
-  = ASSERT( all isId bndrs ) length bndrs
+  = assert (all isId bndrs) $ length bndrs
   -- The arity never includes type parameters, but they should have gone by now
-stgRhsArity (StgRhsCon _ _ _) = 0
+stgRhsArity (StgRhsCon {}) = 0
+
+freeVarsOfRhs :: (XRhsClosure pass ~ DIdSet) => GenStgRhs pass -> DIdSet
+freeVarsOfRhs (StgRhsCon _ _ _ _ args) = mkDVarSet [ id | StgVarArg id <- args ]
+freeVarsOfRhs (StgRhsClosure fvs _ _ _ _) = fvs
 
 {-
 ************************************************************************
@@ -500,13 +457,14 @@ the TyCon from the constructors or literals (which are guaranteed to have the
 Real McCoy) rather than from the scrutinee type.
 -}
 
-type GenStgAlt pass
-  = (AltCon,          -- alts: data constructor,
-     [BinderP pass],  -- constructor's parameters,
-     GenStgExpr pass) -- ...right-hand side.
+data GenStgAlt pass = GenStgAlt
+  { alt_con          :: !AltCon            -- alts: data constructor,
+  , alt_bndrs        :: ![BinderP pass]    -- constructor's parameters,
+  , alt_rhs          :: !(GenStgExpr pass) -- right-hand side.
+  }
 
 data AltType
-  = PolyAlt             -- Polymorphic (a lifted type variable)
+  = PolyAlt             -- Polymorphic (a boxed type variable, lifted or unlifted)
   | MultiValAlt Int     -- Multi value of this arity (unboxed tuple or sum)
                         -- the arity could indeed be 1 for unary unboxed tuple
                         -- or enum-like unboxed sums
@@ -520,7 +478,31 @@ The Plain STG parameterisation
 *                                                                      *
 ************************************************************************
 
-This happens to be the only one we use at the moment.
+  Note [STG Extension points]
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  We now make use of extension points in STG for different passes which want
+  to associate information with AST nodes.
+
+  Currently the pipeline is roughly:
+
+  CoreToStg: Core -> Stg
+  StgSimpl: Stg -> Stg
+  CodeGen: Stg -> Cmm
+
+    As part of StgSimpl we run late lambda lifting (Ll).
+    Late lambda lift:
+    Stg -> FvStg -> LlStg -> Stg
+
+  CodeGen:
+    As part of CodeGen we run tag inference.
+    Tag Inference:
+      Stg -> Stg 'InferTaggedBinders` -> Stg
+
+    And at a last step we add the free Variables:
+      Stg -> CgStg
+
+  Which finally CgStg being used to generate Cmm.
+
 -}
 
 type StgTopBinding = GenStgTopBinding 'Vanilla
@@ -541,6 +523,12 @@ type CgStgExpr       = GenStgExpr       'CodeGen
 type CgStgRhs        = GenStgRhs        'CodeGen
 type CgStgAlt        = GenStgAlt        'CodeGen
 
+type TgStgTopBinding = GenStgTopBinding 'CodeGen
+type TgStgBinding    = GenStgBinding    'CodeGen
+type TgStgExpr       = GenStgExpr       'CodeGen
+type TgStgRhs        = GenStgRhs        'CodeGen
+type TgStgAlt        = GenStgAlt        'CodeGen
+
 {- Many passes apply a substitution, and it's very handy to have type
    synonyms to remind us whether or not the substitution has been applied.
    See GHC.Core for precedence in Core land
@@ -558,6 +546,79 @@ type OutStgArg        = StgArg
 type OutStgExpr       = StgExpr
 type OutStgRhs        = StgRhs
 type OutStgAlt        = StgAlt
+
+-- | When `-fdistinct-constructor-tables` is turned on then
+-- each usage of a constructor is given an unique number and
+-- an info table is generated for each different constructor.
+data ConstructorNumber =
+      NoNumber | Numbered Int
+
+instance Outputable ConstructorNumber where
+  ppr NoNumber = empty
+  ppr (Numbered n) = text "#" <> ppr n
+
+{-
+Note Stg Passes
+~~~~~~~~~~~~~~~
+Here is a short summary of the STG pipeline and where we use the different
+StgPass data type indexes:
+
+  1. CoreToStg.Prep performs several transformations that prepare the desugared
+     and simplified core to be converted to STG. One of these transformations is
+     making it so that value lambdas only exist as the RHS of a binding.
+     See Note [CorePrep Overview].
+
+  2. CoreToStg converts the prepared core to STG, specifically GenStg*
+     parameterised by 'Vanilla. See the GHC.CoreToStg Module.
+
+  3. Stg.Pipeline does a number of passes on the generated STG. One of these is
+     the lambda-lifting pass, which internally uses the 'LiftLams
+     parameterisation to store information for deciding whether or not to lift
+     each binding.
+     See Note [Late lambda lifting in STG].
+
+  4. Tag inference takes in 'Vanilla and produces 'InferTagged STG, while using
+     the InferTaggedBinders annotated AST internally.
+     See Note [Tag Inference].
+
+  5. Stg.FVs annotates closures with their free variables. To store these
+     annotations we use the 'CodeGen parameterisation.
+     See the GHC.Stg.FVs module.
+
+  6. The Module Stg.StgToCmm generates Cmm from the CodeGen annotated STG.
+-}
+
+
+-- | Used as a data type index for the stgSyn AST
+data StgPass
+  = Vanilla
+  | LiftLams -- ^ Use internally by the lambda lifting pass
+  | InferTaggedBinders -- ^ Tag inference information on binders.
+                       -- See Note [Tag inference passes] in GHC.Stg.InferTags
+  | InferTagged -- ^ Tag inference information put on relevant StgApp nodes
+                -- See Note [Tag inference passes] in GHC.Stg.InferTags
+  | CodeGen
+
+type family BinderP (pass :: StgPass)
+type instance BinderP 'Vanilla = Id
+type instance BinderP 'CodeGen = Id
+type instance BinderP 'InferTagged = Id
+
+type family XRhsClosure (pass :: StgPass)
+type instance XRhsClosure 'Vanilla = NoExtFieldSilent
+type instance XRhsClosure 'InferTagged = NoExtFieldSilent
+-- | Code gen needs to track non-global free vars
+type instance XRhsClosure 'CodeGen = DIdSet
+
+type family XLet (pass :: StgPass)
+type instance XLet 'Vanilla = NoExtFieldSilent
+type instance XLet 'InferTagged = NoExtFieldSilent
+type instance XLet 'CodeGen = NoExtFieldSilent
+
+type family XLetNoEscape (pass :: StgPass)
+type instance XLetNoEscape 'Vanilla = NoExtFieldSilent
+type instance XLetNoEscape 'InferTagged = NoExtFieldSilent
+type instance XLetNoEscape 'CodeGen = NoExtFieldSilent
 
 {-
 
@@ -613,25 +674,6 @@ data StgOp
 {-
 ************************************************************************
 *                                                                      *
-Utilities
-*                                                                      *
-************************************************************************
--}
-
-bindersOf :: BinderP a ~ Id => GenStgBinding a -> [Id]
-bindersOf (StgNonRec binder _) = [binder]
-bindersOf (StgRec pairs)       = [binder | (binder, _) <- pairs]
-
-bindersOfTop :: BinderP a ~ Id => GenStgTopBinding a -> [Id]
-bindersOfTop (StgTopLifted bind) = bindersOf bind
-bindersOfTop (StgTopStringLit binder _) = [binder]
-
-bindersOfTopBinds :: BinderP a ~ Id => [GenStgTopBinding a] -> [Id]
-bindersOfTopBinds = foldr ((++) . bindersOfTop) []
-
-{-
-************************************************************************
-*                                                                      *
 Pretty-printing
 *                                                                      *
 ************************************************************************
@@ -652,17 +694,18 @@ data StgPprOpts = StgPprOpts
    { stgSccEnabled :: !Bool -- ^ Enable cost-centres
    }
 
--- | Initialize STG pretty-printing options from DynFlags
-initStgPprOpts :: DynFlags -> StgPprOpts
-initStgPprOpts dflags = StgPprOpts
-   { stgSccEnabled = sccProfilingEnabled dflags
-   }
-
 -- | STG pretty-printing options used for panic messages
 panicStgPprOpts :: StgPprOpts
 panicStgPprOpts = StgPprOpts
    { stgSccEnabled = True
    }
+
+-- | STG pretty-printing options used for short messages
+shortStgPprOpts :: StgPprOpts
+shortStgPprOpts = StgPprOpts
+   { stgSccEnabled = False
+   }
+
 
 pprGenStgTopBinding
   :: OutputablePass pass => StgPprOpts -> GenStgTopBinding pass -> SDoc
@@ -681,39 +724,55 @@ pprGenStgBinding opts b = case b of
                              = hang (hsep [pprBndr LetBind bndr, equals])
                                     4 (pprStgRhs opts expr <> semi)
 
+instance OutputablePass pass => Outputable  (GenStgBinding pass) where
+  ppr = pprGenStgBinding panicStgPprOpts
+
 pprGenStgTopBindings :: (OutputablePass pass) => StgPprOpts -> [GenStgTopBinding pass] -> SDoc
 pprGenStgTopBindings opts binds
   = vcat $ intersperse blankLine (map (pprGenStgTopBinding opts) binds)
 
-pprStgBinding :: StgPprOpts -> StgBinding -> SDoc
+pprStgBinding :: OutputablePass pass => StgPprOpts -> GenStgBinding pass -> SDoc
 pprStgBinding = pprGenStgBinding
 
-pprStgTopBinding :: StgPprOpts -> StgTopBinding -> SDoc
+pprStgTopBinding :: OutputablePass pass => StgPprOpts -> GenStgTopBinding pass -> SDoc
 pprStgTopBinding = pprGenStgTopBinding
 
-pprStgTopBindings :: StgPprOpts -> [StgTopBinding] -> SDoc
+pprStgTopBindings :: OutputablePass pass => StgPprOpts -> [GenStgTopBinding pass] -> SDoc
 pprStgTopBindings = pprGenStgTopBindings
+
+pprIdWithRep :: Id -> SDoc
+pprIdWithRep v = ppr v <> pprTypeRep (idType v)
+
+pprTypeRep :: Type -> SDoc
+pprTypeRep ty =
+    ppUnlessOption sdocSuppressStgReps $
+    char ':' <> case typePrimRep ty of
+                  [r] -> ppr r
+                  r -> ppr r
+
 
 instance Outputable StgArg where
   ppr = pprStgArg
 
 pprStgArg :: StgArg -> SDoc
-pprStgArg (StgVarArg var) = ppr var
-pprStgArg (StgLitArg con) = ppr con
+pprStgArg (StgVarArg var) = pprIdWithRep var
+pprStgArg (StgLitArg con) = ppr con <> pprTypeRep (literalType con)
+
+instance OutputablePass pass => Outputable  (GenStgExpr pass) where
+  ppr = pprStgExpr panicStgPprOpts
 
 pprStgExpr :: OutputablePass pass => StgPprOpts -> GenStgExpr pass -> SDoc
 pprStgExpr opts e = case e of
                            -- special case
    StgLit lit           -> ppr lit
                            -- general case
-   StgApp func args     -> hang (ppr func) 4 (interppSP args)
-   StgConApp con args _ -> hsep [ ppr con, brackets (interppSP args) ]
+   StgApp func args
+      | null args
+      , Just sig <- idTagSig_maybe func
+      -> ppr func <> ppr sig
+      | otherwise -> hang (ppr func) 4 (interppSP args) -- TODO: Print taggedness
+   StgConApp con n args _ -> hsep [ ppr con, ppr n, brackets (interppSP args) ]
    StgOpApp op args _   -> hsep [ pprStgOp op, brackets (interppSP args)]
-   StgLam bndrs body    -> let ppr_list = brackets . fsep . punctuate comma
-                           in sep [ char '\\' <+> ppr_list (map (pprBndr LambdaBind) (toList bndrs))
-                                      <+> text "->"
-                                  , pprStgExpr opts body
-                                  ]
 
 -- special case: let v = <very specific thing>
 --               in
@@ -727,10 +786,10 @@ pprStgExpr opts e = case e of
    StgLet srt (StgNonRec bndr (StgRhsClosure cc bi free_vars upd_flag args rhs))
                         expr@(StgLet _ _))
    -> ($$)
-      (hang (hcat [text "let { ", ppr bndr, ptext (sLit " = "),
+      (hang (hcat [text "let { ", ppr bndr, text " = ",
                           ppr cc,
                           pp_binder_info bi,
-                          text " [", whenPprDebug (interppSP free_vars), ptext (sLit "] \\"),
+                          text " [", whenPprDebug (interppSP free_vars), text "] \\",
                           ppr upd_flag, text " [",
                           interppSP args, char ']'])
             8 (sep [hsep [ppr rhs, text "} in"]]))
@@ -756,9 +815,10 @@ pprStgExpr opts e = case e of
              , hang (text "} in ") 2 (pprStgExpr opts expr)
              ]
 
-   StgTick tickish expr -> sdocOption sdocSuppressTicks $ \case
+   StgTick _tickish expr -> sdocOption sdocSuppressTicks $ \case
       True  -> pprStgExpr opts expr
-      False -> sep [ ppr tickish, pprStgExpr opts expr ]
+      False -> pprStgExpr opts expr
+        -- XXX sep [ ppr tickish, pprStgExpr opts expr ]
 
    -- Don't indent for a single case alternative.
    StgCase expr bndr alt_type [alt]
@@ -788,17 +848,23 @@ pprStgExpr opts e = case e of
 
 
 pprStgAlt :: OutputablePass pass => StgPprOpts -> Bool -> GenStgAlt pass -> SDoc
-pprStgAlt opts indent (con, params, expr)
-  | indent    = hang altPattern 4 (pprStgExpr opts expr <> semi)
-  | otherwise = sep [altPattern, pprStgExpr opts expr <> semi]
+pprStgAlt opts indent GenStgAlt{alt_con, alt_bndrs, alt_rhs}
+  | indent    = hang altPattern 4 (pprStgExpr opts alt_rhs <> semi)
+  | otherwise = sep [altPattern, pprStgExpr opts alt_rhs <> semi]
     where
-      altPattern = (hsep [ppr con, sep (map (pprBndr CasePatBind) params), text "->"])
+      altPattern = hsep [ ppr alt_con
+                        , sep (map (pprBndr CasePatBind) alt_bndrs)
+                        , text "->"
+                        ]
 
 
 pprStgOp :: StgOp -> SDoc
 pprStgOp (StgPrimOp  op)   = ppr op
 pprStgOp (StgPrimCallOp op)= ppr op
 pprStgOp (StgFCallOp op _) = ppr op
+
+instance Outputable StgOp where
+  ppr = pprStgOp
 
 instance Outputable AltType where
   ppr PolyAlt         = text "Polymorphic"
@@ -815,5 +881,13 @@ pprStgRhs opts rhs = case rhs of
                     ])
               4 (pprStgExpr opts body)
 
-   StgRhsCon cc con args
-      -> hcat [ ppr cc, space, ppr con, text "! ", brackets (sep (map pprStgArg args))]
+   StgRhsCon cc con mid _ticks args
+      -> hcat [ ppr cc, space
+              , case mid of
+                  NoNumber -> empty
+                  Numbered n -> hcat [ppr n, space]
+              -- The bang indicates this is an StgRhsCon instead of an StgConApp.
+              , ppr con, text "! ", brackets (sep (map pprStgArg args))]
+
+instance OutputablePass pass => Outputable  (GenStgRhs pass) where
+  ppr = pprStgRhs panicStgPprOpts

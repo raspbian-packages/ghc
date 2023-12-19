@@ -24,6 +24,7 @@ module GHC.Cmm.MachOp
     , machOpMemcpyishAlign
 
     -- Atomic read-modify-write
+    , MemoryOrdering(..)
     , AtomicMachOp(..)
    )
 where
@@ -102,6 +103,8 @@ data MachOp
   | MO_Or    Width
   | MO_Xor   Width
   | MO_Not   Width
+
+  -- Shifts. The shift amount must be in [0,widthInBits).
   | MO_Shl   Width
   | MO_U_Shr Width      -- unsigned shift right
   | MO_S_Shr Width      -- signed shift right
@@ -338,9 +341,8 @@ isFloatComparison mop =
     MO_F_Lt {} -> True
     _other     -> False
 
--- -----------------------------------------------------------------------------
--- Inverting conditions
-
+-- Note [Inverting conditions]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 -- Sometimes it's useful to be able to invert the sense of a
 -- condition.  Not all conditional tests are invertible: in
 -- particular, floating point conditionals cannot be inverted, because
@@ -513,8 +515,11 @@ machOpArgReps platform op =
     MO_FS_Conv from _   -> [from]
     MO_FF_Conv from _   -> [from]
 
-    MO_V_Insert  l r    -> [typeWidth (vec l (cmmBits r)),r,wordWidth platform]
-    MO_V_Extract l r    -> [typeWidth (vec l (cmmBits r)),wordWidth platform]
+    MO_V_Insert   l r   -> [typeWidth (vec l (cmmBits r)),r, W32]
+    MO_V_Extract  l r   -> [typeWidth (vec l (cmmBits r)), W32]
+    MO_VF_Insert  l r   -> [typeWidth (vec l (cmmFloat r)),r,W32]
+    MO_VF_Extract l r   -> [typeWidth (vec l (cmmFloat r)),W32]
+      -- SIMD vector indices are always 32 bit
 
     MO_V_Add _ r        -> [r,r]
     MO_V_Sub _ r        -> [r,r]
@@ -526,9 +531,6 @@ machOpArgReps platform op =
 
     MO_VU_Quot _ r      -> [r,r]
     MO_VU_Rem  _ r      -> [r,r]
-
-    MO_VF_Insert  l r   -> [typeWidth (vec l (cmmFloat r)),r,wordWidth platform]
-    MO_VF_Extract l r   -> [typeWidth (vec l (cmmFloat r)),wordWidth platform]
 
     MO_VF_Add  _ r      -> [r,r]
     MO_VF_Sub  _ r      -> [r,r]
@@ -586,6 +588,41 @@ data CallishMachOp
   | MO_F32_Fabs
   | MO_F32_Sqrt
 
+  -- 64-bit int/word ops for when they exceed the native word size
+  -- (i.e. on 32-bit architectures)
+  | MO_I64_ToI
+  | MO_I64_FromI
+  | MO_W64_ToW
+  | MO_W64_FromW
+
+  | MO_x64_Neg
+  | MO_x64_Add
+  | MO_x64_Sub
+  | MO_x64_Mul
+  | MO_I64_Quot
+  | MO_I64_Rem
+  | MO_W64_Quot
+  | MO_W64_Rem
+
+  | MO_x64_And
+  | MO_x64_Or
+  | MO_x64_Xor
+  | MO_x64_Not
+  | MO_x64_Shl
+  | MO_I64_Shr
+  | MO_W64_Shr
+
+  | MO_x64_Eq
+  | MO_x64_Ne
+  | MO_I64_Ge
+  | MO_I64_Gt
+  | MO_I64_Le
+  | MO_I64_Lt
+  | MO_W64_Ge
+  | MO_W64_Gt
+  | MO_W64_Le
+  | MO_W64_Lt
+
   | MO_UF_Conv Width
 
   | MO_S_Mul2    Width
@@ -630,15 +667,33 @@ data CallishMachOp
   | MO_BSwap Width
   | MO_BRev Width
 
-  -- Atomic read-modify-write.
+  -- | Atomic read-modify-write. Arguments are @[dest, n]@.
   | MO_AtomicRMW Width AtomicMachOp
-  | MO_AtomicRead Width
-  | MO_AtomicWrite Width
+  -- | Atomic read. Arguments are @[addr]@.
+  | MO_AtomicRead Width MemoryOrdering
+  -- | Atomic write. Arguments are @[addr, value]@.
+  | MO_AtomicWrite Width MemoryOrdering
+  -- | Atomic compare-and-swap. Arguments are @[dest, expected, new]@.
+  -- Sequentially consistent.
+  -- Possible future refactoring: should this be an'MO_AtomicRMW' variant?
   | MO_Cmpxchg Width
-  -- Should be an AtomicRMW variant eventually.
-  -- Sequential consistent.
+  -- | Atomic swap. Arguments are @[dest, new]@
   | MO_Xchg Width
+
+  -- These rts provided functions are special: suspendThread releases the
+  -- capability, hence we mustn't sink any use of data stored in the capability
+  -- after this instruction.
+  | MO_SuspendThread
+  | MO_ResumeThread
   deriving (Eq, Show)
+
+-- | C11 memory ordering semantics.
+data MemoryOrdering
+  = MemOrderRelaxed  -- ^ relaxed ordering
+  | MemOrderAcquire  -- ^ acquire ordering
+  | MemOrderRelease  -- ^ release ordering
+  | MemOrderSeqCst   -- ^ sequentially consistent
+  deriving (Eq, Ord, Show)
 
 -- | The operation to perform atomically.
 data AtomicMachOp =
@@ -653,13 +708,16 @@ data AtomicMachOp =
 pprCallishMachOp :: CallishMachOp -> SDoc
 pprCallishMachOp mo = text (show mo)
 
+-- | Return (results_hints,args_hints)
 callishMachOpHints :: CallishMachOp -> ([ForeignHint], [ForeignHint])
 callishMachOpHints op = case op of
-  MO_Memcpy _  -> ([], [AddrHint,AddrHint,NoHint])
-  MO_Memset _  -> ([], [AddrHint,NoHint,NoHint])
-  MO_Memmove _ -> ([], [AddrHint,AddrHint,NoHint])
-  MO_Memcmp _  -> ([], [AddrHint, AddrHint, NoHint])
-  _            -> ([],[])
+  MO_Memcpy _      -> ([], [AddrHint,AddrHint,NoHint])
+  MO_Memset _      -> ([], [AddrHint,NoHint,NoHint])
+  MO_Memmove _     -> ([], [AddrHint,AddrHint,NoHint])
+  MO_Memcmp _      -> ([], [AddrHint, AddrHint, NoHint])
+  MO_SuspendThread -> ([AddrHint], [AddrHint,NoHint])
+  MO_ResumeThread  -> ([AddrHint], [AddrHint])
+  _                -> ([],[])
   -- empty lists indicate NoHint
 
 -- | The alignment of a 'memcpy'-ish operation.

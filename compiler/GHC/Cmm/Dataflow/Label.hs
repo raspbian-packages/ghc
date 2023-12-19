@@ -1,8 +1,8 @@
-{-# LANGUAGE DeriveFoldable #-}
-{-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE DeriveTraversable #-}
-{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE TypeFamilies #-}
 
 module GHC.Cmm.Dataflow.Label
     ( Label
@@ -42,6 +42,9 @@ instance Uniquable Label where
 
 instance Outputable Label where
   ppr label = ppr (getUnique label)
+
+instance OutputableP env Label where
+  pdoc _ l = ppr l
 
 -----------------------------------------------------------------------------
 -- LabelSet
@@ -128,6 +131,9 @@ instance Outputable LabelSet where
 instance Outputable a => Outputable (LabelMap a) where
   ppr = ppr . mapToList
 
+instance OutputableP env a => OutputableP env (LabelMap a) where
+  pdoc env = pdoc env . mapToList
+
 instance TrieMap LabelMap where
   type Key LabelMap = Label
   emptyTM = mapEmpty
@@ -135,6 +141,7 @@ instance TrieMap LabelMap where
   alterTM k f m = mapAlter f k m
   foldTM k m z = mapFoldr k z m
   mapTM f m = mapMap f m
+  filterTM f m = mapFilter f m
 
 -----------------------------------------------------------------------------
 -- FactBase

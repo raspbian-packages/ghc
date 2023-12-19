@@ -4,20 +4,20 @@
 \section[GHC.Core.Opt.Simplify.Monad]{The simplifier Monad}
 -}
 
-{-# LANGUAGE CPP #-}
+
 
 module GHC.Core.Opt.Simplify.Env (
         -- * The simplifier mode
-        setMode, getMode, updMode, seDynFlags,
+        setMode, getMode, updMode, seDynFlags, seUnfoldingOpts, seLogger,
 
         -- * Environments
         SimplEnv(..), pprSimplEnv,   -- Temp not abstract
         mkSimplEnv, extendIdSubst,
         extendTvSubst, extendCvSubst,
-        zapSubstEnv, setSubstEnv,
+        zapSubstEnv, setSubstEnv, bumpCaseDepth,
         getInScope, setInScopeFromE, setInScopeFromF,
         setInScopeSet, modifyInScope, addNewInScopeIds,
-        getSimplRules,
+        getSimplRules, enterRecGroupRHSs,
 
         -- * Substitution results
         SimplSR(..), mkContEx, substId, lookupRecBndr, refineFromInScope,
@@ -29,7 +29,7 @@ module GHC.Core.Opt.Simplify.Env (
         substCo, substCoVar,
 
         -- * Floats
-        SimplFloats(..), emptyFloats, mkRecFloats,
+        SimplFloats(..), emptyFloats, isEmptyFloats, mkRecFloats,
         mkFloatBind, addLetFloats, addJoinFloats, addFloats,
         extendFloats, wrapFloats,
         doFloatFromRhs, getTopFloatBinds,
@@ -43,8 +43,6 @@ module GHC.Core.Opt.Simplify.Env (
         wrapJoinFloats, wrapJoinFloatsX, unitJoinFloat, addJoinFlts
     ) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
 import GHC.Core.Opt.Simplify.Monad
@@ -52,10 +50,12 @@ import GHC.Core.Opt.Monad        ( SimplMode(..) )
 import GHC.Core
 import GHC.Core.Utils
 import GHC.Core.Multiplicity     ( scaleScaled )
+import GHC.Core.Unfold
 import GHC.Types.Var
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 import GHC.Data.OrdList
+import GHC.Data.Graph.UnVar
 import GHC.Types.Id as Id
 import GHC.Core.Make            ( mkWildValBinder )
 import GHC.Driver.Session       ( DynFlags )
@@ -68,7 +68,10 @@ import GHC.Core.Coercion hiding ( substCo, substCoVar, substCoVarBndr )
 import GHC.Types.Basic
 import GHC.Utils.Monad
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
 import GHC.Utils.Misc
+import GHC.Utils.Logger
 import GHC.Types.Unique.FM      ( pprUniqFM )
 
 import Data.List (mapAccumL)
@@ -87,12 +90,16 @@ data SimplEnv
      -- Static in the sense of lexically scoped,
      -- wrt the original expression
 
-        seMode      :: SimplMode
+        seMode      :: !SimplMode
 
         -- The current substitution
       , seTvSubst   :: TvSubstEnv      -- InTyVar |--> OutType
       , seCvSubst   :: CvSubstEnv      -- InCoVar |--> OutCoercion
       , seIdSubst   :: SimplIdSubst    -- InId    |--> OutExpr
+
+        -- | Fast OutVarSet tracking which recursive RHSs we are analysing.
+        -- See Note [Eta reduction in recursive RHSs] in GHC.Core.Opt.Arity.
+      , seRecIds :: !UnVarSet
 
      ----------- Dynamic part of the environment -----------
      -- Dynamic in the sense of describing the setup where
@@ -100,7 +107,9 @@ data SimplEnv
 
         -- The current set of in-scope variables
         -- They are all OutVars, and all bound in this module
-      , seInScope   :: InScopeSet       -- OutVars only
+      , seInScope   :: !InScopeSet       -- OutVars only
+
+      , seCaseDepth :: !Int  -- Depth of multi-branch case alternatives
     }
 
 data SimplFloats
@@ -134,6 +143,13 @@ emptyFloats env
   = SimplFloats { sfLetFloats  = emptyLetFloats
                 , sfJoinFloats = emptyJoinFloats
                 , sfInScope    = seInScope env }
+
+isEmptyFloats :: SimplFloats -> Bool
+-- Precondition: used only when sfJoinFloats is empty
+isEmptyFloats (SimplFloats { sfLetFloats  = LetFloats fs _
+                           , sfJoinFloats = js })
+  = assertPpr (isNilOL js) (ppr js ) $
+    isNilOL fs
 
 pprSimplEnv :: SimplEnv -> SDoc
 -- Used for debugging; selective
@@ -270,11 +286,13 @@ points we're substituting. -}
 
 mkSimplEnv :: SimplMode -> SimplEnv
 mkSimplEnv mode
-  = SimplEnv { seMode = mode
-             , seInScope = init_in_scope
-             , seTvSubst = emptyVarEnv
-             , seCvSubst = emptyVarEnv
-             , seIdSubst = emptyVarEnv }
+  = SimplEnv { seMode      = mode
+             , seInScope   = init_in_scope
+             , seTvSubst   = emptyVarEnv
+             , seCvSubst   = emptyVarEnv
+             , seIdSubst   = emptyVarEnv
+             , seRecIds    = emptyUnVarSet
+             , seCaseDepth = 0 }
         -- The top level "enclosing CC" is "SUBSUMED".
 
 init_in_scope :: InScopeSet
@@ -307,26 +325,40 @@ getMode env = seMode env
 seDynFlags :: SimplEnv -> DynFlags
 seDynFlags env = sm_dflags (seMode env)
 
+seLogger :: SimplEnv -> Logger
+seLogger env = sm_logger (seMode env)
+
+
+seUnfoldingOpts :: SimplEnv -> UnfoldingOpts
+seUnfoldingOpts env = sm_uf_opts (seMode env)
+
+
 setMode :: SimplMode -> SimplEnv -> SimplEnv
 setMode mode env = env { seMode = mode }
 
 updMode :: (SimplMode -> SimplMode) -> SimplEnv -> SimplEnv
-updMode upd env = env { seMode = upd (seMode env) }
+updMode upd env
+  = -- Avoid keeping env alive in case inlining fails.
+    let mode = upd $! (seMode env)
+    in env { seMode = mode }
+
+bumpCaseDepth :: SimplEnv -> SimplEnv
+bumpCaseDepth env = env { seCaseDepth = seCaseDepth env + 1 }
 
 ---------------------
 extendIdSubst :: SimplEnv -> Id -> SimplSR -> SimplEnv
 extendIdSubst env@(SimplEnv {seIdSubst = subst}) var res
-  = ASSERT2( isId var && not (isCoVar var), ppr var )
+  = assertPpr (isId var && not (isCoVar var)) (ppr var) $
     env { seIdSubst = extendVarEnv subst var res }
 
 extendTvSubst :: SimplEnv -> TyVar -> Type -> SimplEnv
 extendTvSubst env@(SimplEnv {seTvSubst = tsubst}) var res
-  = ASSERT2( isTyVar var, ppr var $$ ppr res )
+  = assertPpr (isTyVar var) (ppr var $$ ppr res) $
     env {seTvSubst = extendVarEnv tsubst var res}
 
 extendCvSubst :: SimplEnv -> CoVar -> Coercion -> SimplEnv
 extendCvSubst env@(SimplEnv {seCvSubst = csubst}) var co
-  = ASSERT( isCoVar var )
+  = assert (isCoVar var) $
     env {seCvSubst = extendVarEnv csubst var co}
 
 ---------------------
@@ -346,8 +378,12 @@ setInScopeFromF env floats = env { seInScope = sfInScope floats }
 addNewInScopeIds :: SimplEnv -> [CoreBndr] -> SimplEnv
         -- The new Ids are guaranteed to be freshly allocated
 addNewInScopeIds env@(SimplEnv { seInScope = in_scope, seIdSubst = id_subst }) vs
-  = env { seInScope = in_scope `extendInScopeSetList` vs,
-          seIdSubst = id_subst `delVarEnvList` vs }
+-- See Note [Bangs in the Simplifier]
+  = let !in_scope1 = in_scope `extendInScopeSetList` vs
+        !id_subst1 = id_subst `delVarEnvList` vs
+    in
+    env { seInScope = in_scope1,
+          seIdSubst = id_subst1 }
         -- Why delete?  Consider
         --      let x = a*b in (x, \x -> x+3)
         -- We add [x |-> a*b] to the substitution, but we must
@@ -360,6 +396,13 @@ modifyInScope :: SimplEnv -> CoreBndr -> SimplEnv
 -- which has more information
 modifyInScope env@(SimplEnv {seInScope = in_scope}) v
   = env {seInScope = extendInScopeSet in_scope v}
+
+enterRecGroupRHSs :: SimplEnv -> [OutBndr] -> (SimplEnv -> SimplM (r, SimplEnv))
+                  -> SimplM (r, SimplEnv)
+enterRecGroupRHSs env bndrs k = do
+  --pprTraceM "enterRecGroupRHSs" (ppr bndrs)
+  (r, env'') <- k env{seRecIds = extendUnVarSetList bndrs (seRecIds env)}
+  return (r, env''{seRecIds = seRecIds env})
 
 {- Note [Setting the right in-scope set]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -462,7 +505,7 @@ andFF FltLifted  flt        = flt
 
 doFloatFromRhs :: TopLevelFlag -> RecFlag -> Bool -> SimplFloats -> OutExpr -> Bool
 -- If you change this function look also at FloatIn.noFloatFromRhs
-doFloatFromRhs lvl rec str (SimplFloats { sfLetFloats = LetFloats fs ff }) rhs
+doFloatFromRhs lvl rec strict_bind (SimplFloats { sfLetFloats = LetFloats fs ff }) rhs
   =  not (isNilOL fs) && want_to_float && can_float
   where
      want_to_float = isTopLevel lvl || exprIsCheap rhs || exprIsExpandable rhs
@@ -470,7 +513,7 @@ doFloatFromRhs lvl rec str (SimplFloats { sfLetFloats = LetFloats fs ff }) rhs
      can_float = case ff of
                    FltLifted  -> True
                    FltOkSpec  -> isNotTopLevel lvl && isNonRec rec
-                   FltCareful -> isNotTopLevel lvl && isNonRec rec && str
+                   FltCareful -> isNotTopLevel lvl && isNonRec rec && strict_bind
 
 {-
 Note [Float when cheap or expandable]
@@ -492,7 +535,7 @@ emptyJoinFloats = nilOL
 
 unitLetFloat :: OutBind -> LetFloats
 -- This key function constructs a singleton float with the right form
-unitLetFloat bind = ASSERT(all (not . isJoinId) (bindersOf bind))
+unitLetFloat bind = assert (all (not . isJoinId) (bindersOf bind)) $
                     LetFloats (unitOL bind) (flag bind)
   where
     flag (Rec {})                = FltLifted
@@ -502,12 +545,14 @@ unitLetFloat bind = ASSERT(all (not . isJoinId) (bindersOf bind))
           -- String literals can be floated freely.
           -- See Note [Core top-level string literals] in GHC.Core.
       | exprOkForSpeculation rhs = FltOkSpec  -- Unlifted, and lifted but ok-for-spec (eg HNF)
-      | otherwise                = ASSERT2( not (isUnliftedType (idType bndr)), ppr bndr )
+      | otherwise                = assertPpr (not (isUnliftedType (idType bndr))) (ppr bndr)
+                                   -- NB: binders always have a fixed RuntimeRep, so calling
+                                   -- isUnliftedType is OK here
                                    FltCareful
       -- Unlifted binders can only be let-bound if exprOkForSpeculation holds
 
 unitJoinFloat :: OutBind -> JoinFloats
-unitJoinFloat bind = ASSERT(all isJoinId (bindersOf bind))
+unitJoinFloat bind = assert (all isJoinId (bindersOf bind)) $
                      unitOL bind
 
 mkFloatBind :: SimplEnv -> OutBind -> (SimplFloats, SimplEnv)
@@ -527,8 +572,8 @@ mkFloatBind env bind
       = SimplFloats { sfLetFloats  = unitLetFloat bind
                     , sfJoinFloats = emptyJoinFloats
                     , sfInScope    = in_scope' }
-
-    in_scope' = seInScope env `extendInScopeSetBind` bind
+    -- See Note [Bangs in the Simplifier]
+    !in_scope' = seInScope env `extendInScopeSetBind` bind
 
 extendFloats :: SimplFloats -> OutBind -> SimplFloats
 -- Add this binding to the floats, and extend the in-scope env too
@@ -553,10 +598,13 @@ addLetFloats :: SimplFloats -> LetFloats -> SimplFloats
 -- Add the let-floats for env2 to env1;
 -- *plus* the in-scope set for env2, which is bigger
 -- than that for env1
-addLetFloats floats let_floats@(LetFloats binds _)
+addLetFloats floats let_floats
   = floats { sfLetFloats = sfLetFloats floats `addLetFlts` let_floats
-           , sfInScope   = foldlOL extendInScopeSetBind
-                                   (sfInScope floats) binds }
+           , sfInScope   = sfInScope floats `extendInScopeFromLF` let_floats }
+
+extendInScopeFromLF :: InScopeSet -> LetFloats -> InScopeSet
+extendInScopeFromLF in_scope (LetFloats binds _)
+  = foldlOL extendInScopeSetBind in_scope binds
 
 addJoinFloats :: SimplFloats -> JoinFloats -> SimplFloats
 addJoinFloats floats join_floats
@@ -589,21 +637,21 @@ addJoinFlts :: JoinFloats -> JoinFloats -> JoinFloats
 addJoinFlts = appOL
 
 mkRecFloats :: SimplFloats -> SimplFloats
--- Flattens the floats from env2 into a single Rec group,
+-- Flattens the floats into a single Rec group,
 -- They must either all be lifted LetFloats or all JoinFloats
-mkRecFloats floats@(SimplFloats { sfLetFloats  = LetFloats bs ff
+mkRecFloats floats@(SimplFloats { sfLetFloats  = LetFloats bs _ff
                                 , sfJoinFloats = jbs
                                 , sfInScope    = in_scope })
-  = ASSERT2( case ff of { FltLifted -> True; _ -> False }, ppr (fromOL bs) )
-    ASSERT2( isNilOL bs || isNilOL jbs, ppr floats )
+  = assertPpr (isNilOL bs || isNilOL jbs) (ppr floats) $
     SimplFloats { sfLetFloats  = floats'
                 , sfJoinFloats = jfloats'
                 , sfInScope    = in_scope }
   where
-    floats'  | isNilOL bs  = emptyLetFloats
-             | otherwise   = unitLetFloat (Rec (flattenBinds (fromOL bs)))
-    jfloats' | isNilOL jbs = emptyJoinFloats
-             | otherwise   = unitJoinFloat (Rec (flattenBinds (fromOL jbs)))
+    -- See Note [Bangs in the Simplifier]
+    !floats'  | isNilOL bs  = emptyLetFloats
+              | otherwise   = unitLetFloat (Rec (flattenBinds (fromOL bs)))
+    !jfloats' | isNilOL jbs = emptyJoinFloats
+              | otherwise   = unitJoinFloat (Rec (flattenBinds (fromOL jbs)))
 
 wrapFloats :: SimplFloats -> OutExpr -> OutExpr
 -- Wrap the floats around the expression; they should all
@@ -630,15 +678,17 @@ wrapJoinFloats join_floats body
 getTopFloatBinds :: SimplFloats -> [CoreBind]
 getTopFloatBinds (SimplFloats { sfLetFloats  = lbs
                               , sfJoinFloats = jbs})
-  = ASSERT( isNilOL jbs )  -- Can't be any top-level join bindings
+  = assert (isNilOL jbs) $  -- Can't be any top-level join bindings
     letFloatBinds lbs
 
+{-# INLINE mapLetFloats #-}
 mapLetFloats :: LetFloats -> ((Id,CoreExpr) -> (Id,CoreExpr)) -> LetFloats
 mapLetFloats (LetFloats fs ff) fun
-   = LetFloats (mapOL app fs) ff
+   = LetFloats fs1 ff
    where
     app (NonRec b e) = case fun (b,e) of (b',e') -> NonRec b' e'
-    app (Rec bs)     = Rec (map fun bs)
+    app (Rec bs)     = Rec (strictMap fun bs)
+    !fs1 = (mapOL' app fs) -- See Note [Bangs in the Simplifier]
 
 {-
 ************************************************************************
@@ -677,7 +727,8 @@ refineFromInScope :: InScopeSet -> Var -> Var
 refineFromInScope in_scope v
   | isLocalId v = case lookupInScope in_scope v of
                   Just v' -> v'
-                  Nothing -> WARN( True, ppr v ) v  -- This is an error!
+                  Nothing -> pprPanic "refineFromInScope" (ppr in_scope $$ ppr v)
+                             -- c.f #19074 for a subtle place where this went wrong
   | otherwise = v
 
 lookupRecBndr :: SimplEnv -> InId -> OutId
@@ -731,7 +782,7 @@ See also Note [Scaling join point arguments].
 -}
 
 simplBinders :: SimplEnv -> [InBndr] -> SimplM (SimplEnv, [OutBndr])
-simplBinders  env bndrs = mapAccumLM simplBinder  env bndrs
+simplBinders  !env bndrs = mapAccumLM simplBinder  env bndrs
 
 -------------
 simplBinder :: SimplEnv -> InBndr -> SimplM (SimplEnv, OutBndr)
@@ -740,7 +791,7 @@ simplBinder :: SimplEnv -> InBndr -> SimplM (SimplEnv, OutBndr)
 -- Return with IdInfo already substituted, but (fragile) occurrence info zapped
 -- The substitution is extended only if the variable is cloned, because
 -- we *don't* need to use it to track occurrence info.
-simplBinder env bndr
+simplBinder !env bndr
   | isTyVar bndr  = do  { let (env', tv) = substTyVarBndr env bndr
                         ; seqTyVar tv `seq` return (env', tv) }
   | otherwise     = do  { let (env', id) = substIdBndr env bndr
@@ -749,16 +800,18 @@ simplBinder env bndr
 ---------------
 simplNonRecBndr :: SimplEnv -> InBndr -> SimplM (SimplEnv, OutBndr)
 -- A non-recursive let binder
-simplNonRecBndr env id
-  = do  { let (env1, id1) = substIdBndr env id
+simplNonRecBndr !env id
+  -- See Note [Bangs in the Simplifier]
+  = do  { let (!env1, id1) = substIdBndr env id
         ; seqId id1 `seq` return (env1, id1) }
 
 ---------------
 simplRecBndrs :: SimplEnv -> [InBndr] -> SimplM SimplEnv
 -- Recursive let binders
 simplRecBndrs env@(SimplEnv {}) ids
-  = ASSERT(all (not . isJoinId) ids)
-    do  { let (env1, ids1) = mapAccumL substIdBndr env ids
+  -- See Note [Bangs in the Simplifier]
+  = assert (all (not . isJoinId) ids) $
+    do  { let (!env1, ids1) = mapAccumL substIdBndr env ids
         ; seqIds ids1 `seq` return env1 }
 
 
@@ -793,34 +846,41 @@ substNonCoVarIdBndr
 --      all fragile info is zapped
 substNonCoVarIdBndr env id = subst_id_bndr env id (\x -> x)
 
+-- Inline to make the (OutId -> OutId) function a known call.
+-- This is especially important for `substNonCoVarIdBndr` which
+-- passes an identity lambda.
+{-# INLINE subst_id_bndr #-}
 subst_id_bndr :: SimplEnv
               -> InBndr    -- Env and binder to transform
               -> (OutId -> OutId)  -- Adjust the type
               -> (SimplEnv, OutBndr)
 subst_id_bndr env@(SimplEnv { seInScope = in_scope, seIdSubst = id_subst })
               old_id adjust_type
-  = ASSERT2( not (isCoVar old_id), ppr old_id )
-    (env { seInScope = in_scope `extendInScopeSet` new_id,
+  = assertPpr (not (isCoVar old_id)) (ppr old_id)
+    (env { seInScope = new_in_scope,
            seIdSubst = new_subst }, new_id)
-    -- It's important that both seInScope and seIdSubt are updated with
+    -- It's important that both seInScope and seIdSubst are updated with
     -- the new_id, /after/ applying adjust_type. That's why adjust_type
     -- is done here.  If we did adjust_type in simplJoinBndr (the only
     -- place that gives a non-identity adjust_type) we'd have to fiddle
     -- afresh with both seInScope and seIdSubst
   where
-    id1  = uniqAway in_scope old_id
-    id2  = substIdType env id1
-    id3  = zapFragileIdInfo id2       -- Zaps rules, worker-info, unfolding
+    -- See Note [Bangs in the Simplifier]
+    !id1  = uniqAway in_scope old_id
+    !id2  = substIdType env id1
+    !id3  = zapFragileIdInfo id2       -- Zaps rules, worker-info, unfolding
                                       -- and fragile OccInfo
-    new_id = adjust_type id3
+    !new_id = adjust_type id3
 
         -- Extend the substitution if the unique has changed,
         -- or there's some useful occurrence information
         -- See the notes with substTyVarBndr for the delSubstEnv
-    new_subst | new_id /= old_id
+    !new_subst | new_id /= old_id
               = extendVarEnv id_subst old_id (DoneId new_id)
               | otherwise
               = delVarEnv id_subst old_id
+
+    !new_in_scope = in_scope `extendInScopeSet` new_id
 
 ------------------------------------
 seqTyVar :: TyVar -> ()
@@ -839,31 +899,18 @@ seqIds (id:ids) = seqId id `seq` seqIds ids
 Note [Arity robustness]
 ~~~~~~~~~~~~~~~~~~~~~~~
 We *do* transfer the arity from the in_id of a let binding to the
-out_id.  This is important, so that the arity of an Id is visible in
-its own RHS.  For example:
-        f = \x. ....g (\y. f y)....
-We can eta-reduce the arg to g, because f is a value.  But that
-needs to be visible.
+out_id so that its arity is visible in its RHS. Examples:
 
-This interacts with the 'state hack' too:
-        f :: Bool -> IO Int
-        f = \x. case x of
-                  True  -> f y
-                  False -> \s -> ...
-Can we eta-expand f?  Only if we see that f has arity 1, and then we
-take advantage of the 'state hack' on the result of
-(f y) :: State# -> (State#, Int) to expand the arity one more.
-
-There is a disadvantage though.  Making the arity visible in the RHS
-allows us to eta-reduce
-        f = \x -> f x
-to
-        f = f
-which technically is not sound.   This is very much a corner case, so
-I'm not worried about it.  Another idea is to ensure that f's arity
-never decreases; its arity started as 1, and we should never eta-reduce
-below that.
-
+  * f = \x y. let g = \p q. f (p+q) in Just (...g..g...)
+    Here we want to give `g` arity 3 and eta-expand. `findRhsArity` will have a
+    hard time figuring that out when `f` only has arity 0 in its own RHS.
+  * f = \x y. ....(f `seq` blah)....
+    We want to drop the seq.
+  * f = \x. g (\y. f y)
+    You'd think we could eta-reduce `\y. f y` to `f` here. And indeed, that is true.
+    Unfortunately, it is not sound in general to eta-reduce in f's RHS.
+    Example: `f = \x. f x`. See Note [Eta reduction in recursive RHSs] for how
+    we prevent that.
 
 Note [Robust OccInfo]
 ~~~~~~~~~~~~~~~~~~~~~
@@ -897,7 +944,7 @@ simplRecJoinBndrs :: SimplEnv -> [InBndr]
 -- context being pushed inward may change types
 -- See Note [Return type for join points]
 simplRecJoinBndrs env@(SimplEnv {}) ids mult res_ty
-  = ASSERT(all isJoinId ids)
+  = assert (all isJoinId ids) $
     do  { let (env1, ids1) = mapAccumL (simplJoinBndr mult res_ty) env ids
         ; seqIds ids1 `seq` return env1 }
 
@@ -924,13 +971,13 @@ adjustJoinPointType :: Mult
 -- INVARIANT: If any of the first n binders are foralls, those tyvars
 -- cannot appear in the original result type. See isValidJoinPointType.
 adjustJoinPointType mult new_res_ty join_id
-  = ASSERT( isJoinId join_id )
+  = assert (isJoinId join_id) $
     setIdType join_id new_join_ty
   where
     orig_ar = idJoinArity join_id
     orig_ty = idType join_id
 
-    new_join_ty = go orig_ar orig_ty
+    new_join_ty = go orig_ar orig_ty :: Type
 
     go 0 _  = new_res_ty
     go n ty | Just (arg_bndr, res_ty) <- splitPiTy_maybe ty
@@ -939,7 +986,8 @@ adjustJoinPointType mult new_res_ty join_id
             | otherwise
             = pprPanic "adjustJoinPointType" (ppr orig_ar <+> ppr orig_ty)
 
-    scale_bndr (Anon af t) = Anon af (scaleScaled mult t)
+    -- See Note [Bangs in the Simplifier]
+    scale_bndr (Anon af t) = Anon af $! (scaleScaled mult t)
     scale_bndr b@(Named _) = b
 
 {- Note [Scaling join point arguments]

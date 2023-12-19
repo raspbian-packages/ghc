@@ -15,7 +15,7 @@
  *
  * ---------------------------------------------------------------------------*/
 
-#include "PosixSource.h"
+#include "rts/PosixSource.h"
 #include "Rts.h"
 
 #include "Storage.h"
@@ -26,6 +26,16 @@
 #include <string.h>
 
 static void  initMBlock(void *mblock, uint32_t node);
+
+/*
+ * By default the DEBUG RTS is built with block allocator assertions
+ * enabled. However, these are quite expensive and consequently it can
+ * sometimes be useful to disable them if debugging an issue known to be
+ * elsewhere
+ */
+#if defined(DEBUG)
+#define BLOCK_ALLOC_DEBUG
+#endif
 
 /* -----------------------------------------------------------------------------
 
@@ -234,7 +244,7 @@ initGroup(bdescr *head)
       last->link = head;
   }
 
-#if defined(DEBUG)
+#if defined(BLOCK_ALLOC_DEBUG)
   for (uint32_t i=0; i < head->blocks; i++) {
       head[i].flags = 0;
   }
@@ -568,7 +578,7 @@ allocAlignedGroupOnNode (uint32_t node, W_ n)
 
     ASSERT(slop_low_blocks + slop_high_blocks + n == num_blocks);
 
-#if defined(DEBUG)
+#if defined(BLOCK_ALLOC_DEBUG)
     checkFreeListSanity();
     W_ free_before = countFreeList();
 #endif
@@ -578,7 +588,7 @@ allocAlignedGroupOnNode (uint32_t node, W_ n)
         ASSERT(countBlocks(bd) == num_blocks - slop_low_blocks);
     }
 
-#if defined(DEBUG)
+#if defined(BLOCK_ALLOC_DEBUG)
     ASSERT(countFreeList() == free_before + slop_low_blocks);
     checkFreeListSanity();
 #endif
@@ -586,7 +596,7 @@ allocAlignedGroupOnNode (uint32_t node, W_ n)
     // At this point the bd should be aligned, but we may have slop on the high side
     ASSERT((uintptr_t)bd->start % group_size == 0);
 
-#if defined(DEBUG)
+#if defined(BLOCK_ALLOC_DEBUG)
     free_before = countFreeList();
 #endif
 
@@ -595,7 +605,7 @@ allocAlignedGroupOnNode (uint32_t node, W_ n)
         ASSERT(bd->blocks == n);
     }
 
-#if defined(DEBUG)
+#if defined(BLOCK_ALLOC_DEBUG)
     ASSERT(countFreeList() == free_before + slop_high_blocks);
     checkFreeListSanity();
 #endif
@@ -818,7 +828,7 @@ freeGroup(bdescr *p)
 
   ASSERT(RELAXED_LOAD(&p->free) != (P_)-1);
 
-#if defined(DEBUG)
+#if defined(BLOCK_ALLOC_DEBUG)
   for (uint32_t i=0; i < p->blocks; i++) {
       p[i].flags = 0;
   }
@@ -984,11 +994,22 @@ countAllocdBlocks(bdescr *bd)
     return n;
 }
 
-void returnMemoryToOS(uint32_t n /* megablocks */)
+// Returns the number of blocks which were able to be freed
+uint32_t returnMemoryToOS(uint32_t n /* megablocks */)
 {
     bdescr *bd;
     uint32_t node;
     StgWord size;
+    uint32_t init_n;
+    init_n = n;
+
+    // TODO: This is inefficient because this loop will essentially result in
+    // quadratic runtime behavior: for each call to `freeMBlocks`, the
+    // USE_LARGE_ADDRESS_SPACE implementation of it will walk the internal free
+    // list to insert it at the right position, and thus traverse all previously
+    // inserted values to get to it. We can do better though: both the internal
+    // free list and the `free_mblock_list` here are sorted, so one walk should
+    // be enough.
 
     // ToDo: not fair, we free all the memory starting with node 0.
     for (node = 0; n > 0 && node < n_numa_nodes; node++) {
@@ -1028,6 +1049,7 @@ void returnMemoryToOS(uint32_t n /* megablocks */)
                        n);
         }
     );
+    return (init_n - n);
 }
 
 /* -----------------------------------------------------------------------------

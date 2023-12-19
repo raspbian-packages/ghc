@@ -1,14 +1,13 @@
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE RecordWildCards   #-}
+{-# LANGUAGE TypeFamilies      #-}
+
 {-
 (c) The University of Glasgow 2006
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
 
 \section[Name]{@Name@: to transmit name info from renamer to typechecker}
 -}
-
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE PatternSynonyms #-}
 
 -- |
 -- #name_types#
@@ -57,6 +56,7 @@ module GHC.Types.Name (
         localiseName,
 
         nameSrcLoc, nameSrcSpan, pprNameDefnLoc, pprDefinedAt,
+        pprFullName, pprTickyName,
 
         -- ** Predicates on 'Name's
         isSystemName, isInternalName, isExternalName,
@@ -65,7 +65,7 @@ module GHC.Types.Name (
         isWiredInName, isWiredIn, isBuiltInSyntax,
         isHoleName,
         wiredInNameTyThing_maybe,
-        nameIsLocalOrFrom, nameIsHomePackage,
+        nameIsLocalOrFrom, nameIsExternalOrFrom, nameIsHomePackage,
         nameIsHomePackageImport, nameIsFromExternalPackage,
         stableNameCmp,
 
@@ -82,11 +82,12 @@ module GHC.Types.Name (
 
 import GHC.Prelude
 
-import {-# SOURCE #-} GHC.Core.TyCo.Rep( TyThing )
+import {-# SOURCE #-} GHC.Types.TyThing ( TyThing )
 
 import GHC.Platform
 import GHC.Types.Name.Occurrence
 import GHC.Unit.Module
+import GHC.Unit.Home
 import GHC.Types.SrcLoc
 import GHC.Types.Unique
 import GHC.Utils.Misc
@@ -94,6 +95,7 @@ import GHC.Data.Maybe
 import GHC.Utils.Binary
 import GHC.Data.FastString
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
 
 import Control.DeepSeq
 import Data.Data
@@ -108,16 +110,26 @@ import Data.Data
 
 -- | A unique, unambiguous name for something, containing information about where
 -- that thing originated.
-data Name = Name {
-                n_sort :: NameSort,     -- What sort of name it is
-                n_occ  :: !OccName,     -- Its occurrence name
-                n_uniq :: {-# UNPACK #-} !Unique,
-                n_loc  :: !SrcSpan      -- Definition site
-            }
+data Name = Name
+  { n_sort :: NameSort
+    -- ^ What sort of name it is
 
--- NOTE: we make the n_loc field strict to eliminate some potential
--- (and real!) space leaks, due to the fact that we don't look at
--- the SrcLoc in a Name all that often.
+  , n_occ  :: OccName
+    -- ^ Its occurrence name.
+    --
+    -- NOTE: kept lazy to allow known names to be known constructor applications
+    -- and to inline better. See Note [Fast comparison for built-in Names]
+
+  , n_uniq :: {-# UNPACK #-} !Unique
+    -- ^ Its unique.
+
+  , n_loc  :: !SrcSpan
+    -- ^ Definition site
+    --
+    -- NOTE: we make the n_loc field strict to eliminate some potential
+    -- (and real!) space leaks, due to the fact that we don't look at
+    -- the SrcLoc in a Name all that often.
+  }
 
 -- See Note [About the NameSorts]
 data NameSort
@@ -139,7 +151,7 @@ instance Outputable NameSort where
   ppr  System         = text "system"
 
 instance NFData Name where
-  rnf Name{..} = rnf n_sort
+  rnf Name{..} = rnf n_sort `seq` rnf n_occ `seq` n_uniq `seq` rnf n_loc
 
 instance NFData NameSort where
   rnf (External m) = rnf m
@@ -156,7 +168,38 @@ instance NFData NameSort where
 data BuiltInSyntax = BuiltInSyntax | UserSyntax
 
 {-
+Note [Fast comparison for built-in Names]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider this wired-in Name in GHC.Builtin.Names:
+
+   int8TyConName = tcQual gHC_INT  (fsLit "Int8")  int8TyConKey
+
+Ultimately this turns into something like:
+
+   int8TyConName = Name gHC_INT (mkOccName ..."Int8") int8TyConKey
+
+So a comparison like `x == int8TyConName` will turn into `getUnique x ==
+int8TyConKey`, nice and efficient.  But if the `n_occ` field is strict, that
+definition will look like:
+
+   int8TyCOnName = case (mkOccName..."Int8") of occ ->
+                   Name gHC_INT occ int8TyConKey
+
+and now the comparison will not optimise.  This matters even more when there are
+numerous comparisons (see #19386):
+
+if | tc == int8TyCon  -> ...
+   | tc == int16TyCon -> ...
+   ...etc...
+
+when we would like to get a single multi-branched case.
+
+TL;DR: we make the `n_occ` field lazy.
+-}
+
+{-
 Note [About the NameSorts]
+~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 1.  Initially, top-level Ids (including locally-defined ones) get External names,
     and all other local Ids get Internal names
@@ -286,6 +329,9 @@ nameModule_maybe (Name { n_sort = External mod})    = Just mod
 nameModule_maybe (Name { n_sort = WiredIn mod _ _}) = Just mod
 nameModule_maybe _                                  = Nothing
 
+is_interactive_or_from :: Module -> Module -> Bool
+is_interactive_or_from from mod = from == mod || isInteractiveModule mod
+
 nameIsLocalOrFrom :: Module -> Name -> Bool
 -- ^ Returns True if the name is
 --   (a) Internal
@@ -307,11 +353,18 @@ nameIsLocalOrFrom :: Module -> Name -> Bool
 -- each give rise to a fresh module (Ghci1, Ghci2, etc), but they all come
 -- from the magic 'interactive' package; and all the details are kept in the
 -- TcLclEnv, TcGblEnv, NOT in the HPT or EPT.
--- See Note [The interactive package] in "GHC.Driver.Types"
+-- See Note [The interactive package] in "GHC.Runtime.Context"
 
 nameIsLocalOrFrom from name
-  | Just mod <- nameModule_maybe name = from == mod || isInteractiveModule mod
+  | Just mod <- nameModule_maybe name = is_interactive_or_from from mod
   | otherwise                         = True
+
+nameIsExternalOrFrom :: Module -> Name -> Bool
+-- ^ Returns True if the name is external or from the 'interactive' package
+-- See documentation of `nameIsLocalOrFrom` function
+nameIsExternalOrFrom from name
+  | Just mod <- nameModule_maybe name = is_interactive_or_from from mod
+  | otherwise                         = False
 
 nameIsHomePackage :: Module -> Name -> Bool
 -- True if the Name is defined in module of this package
@@ -337,10 +390,10 @@ nameIsHomePackageImport this_mod
 
 -- | Returns True if the Name comes from some other package: neither this
 -- package nor the interactive package.
-nameIsFromExternalPackage :: Unit -> Name -> Bool
-nameIsFromExternalPackage this_unit name
+nameIsFromExternalPackage :: HomeUnit -> Name -> Bool
+nameIsFromExternalPackage home_unit name
   | Just mod <- nameModule_maybe name
-  , moduleUnit mod /= this_unit   -- Not the current unit
+  , notHomeModule home_unit mod   -- Not the current unit
   , not (isInteractiveModule mod) -- Not the 'interactive' package
   = True
   | otherwise
@@ -400,6 +453,7 @@ mkDerivedInternalName derive_occ uniq (Name { n_occ = occ, n_loc = loc })
 
 -- | Create a name which definitely originates in the given module
 mkExternalName :: Unique -> Module -> OccName -> SrcSpan -> Name
+{-# INLINE mkExternalName #-}
 -- WATCH OUT! External Names should be in the Name Cache
 -- (see Note [The Name Cache] in GHC.Iface.Env), so don't just call mkExternalName
 -- with some fresh unique without populating the Name Cache
@@ -409,6 +463,7 @@ mkExternalName uniq mod occ loc
 
 -- | Create a name which is actually defined by the compiler itself
 mkWiredInName :: Module -> OccName -> Unique -> TyThing -> BuiltInSyntax -> Name
+{-# INLINE mkWiredInName #-}
 mkWiredInName mod occ uniq thing built_in
   = Name { n_uniq = uniq,
            n_sort = WiredIn mod thing built_in,
@@ -509,11 +564,7 @@ instance Eq Name where
 
 -- For a deterministic lexicographic ordering, use `stableNameCmp`.
 instance Ord Name where
-    a <= b = case (a `compare` b) of { LT -> True;  EQ -> True;  GT -> False }
-    a <  b = case (a `compare` b) of { LT -> True;  EQ -> False; GT -> False }
-    a >= b = case (a `compare` b) of { LT -> False; EQ -> True;  GT -> True  }
-    a >  b = case (a `compare` b) of { LT -> False; EQ -> False; GT -> True  }
-    compare a b = cmpName a b
+    compare = cmpName
 
 instance Uniquable Name where
     getUnique = nameUnique
@@ -574,6 +625,31 @@ pprName (Name {n_sort = sort, n_uniq = uniq, n_occ = occ})
       System                  -> pprSystem   debug sty uniq occ
       Internal                -> pprInternal debug sty uniq occ
 
+-- | Print fully qualified name (with unit-id, module and unique)
+pprFullName :: Module -> Name -> SDoc
+pprFullName this_mod Name{n_sort = sort, n_uniq = uniq, n_occ = occ} =
+  let mod = case sort of
+        WiredIn  m _ _ -> m
+        External m     -> m
+        System         -> this_mod
+        Internal       -> this_mod
+      in ftext (unitIdFS (moduleUnitId mod))
+         <> colon    <> ftext (moduleNameFS $ moduleName mod)
+         <> dot      <> ftext (occNameFS occ)
+         <> char '_' <> pprUniqueAlways uniq
+
+
+-- | Print a ticky ticky styled name
+--
+-- Module argument is the module to use for internal and system names. When
+-- printing the name in a ticky profile, the module name is included even for
+-- local things. However, ticky uses the format "x (M)" rather than "M.x".
+-- Hence, this function provides a separation from normal styling.
+pprTickyName :: Module -> Name -> SDoc
+pprTickyName this_mod name
+  | isInternalName name = pprName name <+> parens (ppr this_mod)
+  | otherwise           = pprName name
+
 -- | Print the string of Name unqualifiedly directly.
 pprNameUnqualified :: Name -> SDoc
 pprNameUnqualified Name { n_occ = occ } = ppr_occ_name occ
@@ -623,7 +699,7 @@ pprSystem debug sty uniq occ
 
 pprModulePrefix :: PprStyle -> Module -> OccName -> SDoc
 -- Print the "M." part of a name, based on whether it's in scope or not
--- See Note [Printing original names] in GHC.Driver.Types
+-- See Note [Printing original names] in GHC.Types.Name.Ppr
 pprModulePrefix sty mod occ = ppUnlessOption sdocSuppressModulePrefixes $
     case qualName sty mod occ of              -- See Outputable.QualifyName:
       NameQual modname -> ppr modname <> dot       -- Name is in scope

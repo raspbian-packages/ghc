@@ -1,11 +1,15 @@
+
+{-# LANGUAGE DerivingStrategies         #-}
+{-# LANGUAGE ExistentialQuantification  #-}
+{-# LANGUAGE GADTs                      #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE PatternSynonyms            #-}
+
 {-
 (c) The University of Glasgow 2006-2012
 (c) The GRASP Project, Glasgow University, 1992-2002
 
 -}
-
-{-# LANGUAGE CPP, DeriveFunctor, ExistentialQuantification, GeneralizedNewtypeDeriving,
-             ViewPatterns #-}
 
 -- | Various types used during typechecking.
 --
@@ -30,6 +34,7 @@ module GHC.Tc.Types(
         setLclEnvLoc, getLclEnvLoc,
         IfGblEnv(..), IfLclEnv(..),
         tcVisibleOrphanMods,
+        RewriteEnv(..),
 
         -- Frontend types (shouldn't really be here)
         FrontendResult(..),
@@ -37,28 +42,25 @@ module GHC.Tc.Types(
         -- Renamer types
         ErrCtxt, RecFieldEnv, pushErrCtxt, pushErrCtxtSameOrigin,
         ImportAvails(..), emptyImportAvails, plusImportAvails,
-        WhereFrom(..), mkModDeps, modDepsElts,
+        WhereFrom(..), mkModDeps,
 
         -- Typechecker types
         TcTypeEnv, TcBinderStack, TcBinder(..),
-        TcTyThing(..), PromotionErr(..),
+        TcTyThing(..), tcTyThingTyCon_maybe,
+        PromotionErr(..),
         IdBindingInfo(..), ClosedTypeId, RhsNames,
         IsGroupClosed(..),
-        SelfBootInfo(..),
+        SelfBootInfo(..), bootExports,
         tcTyThingCategory, pprTcTyThingCategory,
         peCategory, pprPECategory,
-        CompleteMatch(..),
-
-        -- Desugaring types
-        DsM, DsLclEnv(..), DsGblEnv(..),
-        DsMetaEnv, DsMetaVal(..), CompleteMatchMap,
-        mkCompleteMatchMap, extendCompleteMatchMap,
+        CompleteMatch, CompleteMatches,
 
         -- Template Haskell
         ThStage(..), SpliceType(..), PendingStuff(..),
         topStage, topAnnStage, topSpliceStage,
         ThLevel, impLevel, outerLevel, thLevel,
-        ForeignSrcLang(..),
+        ForeignSrcLang(..), THDocs, DocLoc(..),
+        ThBindEnv,
 
         -- Arrows
         ArrowCtxt(..),
@@ -75,41 +77,58 @@ module GHC.Tc.Types(
         getPlatform,
 
         -- Constraint solver plugins
-        TcPlugin(..), TcPluginResult(..), TcPluginSolver,
-        TcPluginM, runTcPluginM, unsafeTcPluginTcM,
-        getEvBindsTcPluginM,
+        TcPlugin(..),
+        TcPluginSolveResult(TcPluginContradiction, TcPluginOk, ..),
+        TcPluginRewriteResult(..),
+        TcPluginSolver, TcPluginRewriter,
+        TcPluginM(runTcPluginM), unsafeTcPluginTcM,
+
+        -- Defaulting plugin
+        DefaultingPlugin(..), DefaultingProposal(..),
+        FillDefaulting, DefaultingPluginResult,
 
         -- Role annotations
         RoleAnnotEnv, emptyRoleAnnotEnv, mkRoleAnnotEnv,
         lookupRoleAnnot, getRoleAnnots,
 
         -- Linting
-        lintGblEnv
-  ) where
+        lintGblEnv,
 
-#include "HsVersions.h"
+        -- Diagnostics
+        TcRnMessage
+  ) where
 
 import GHC.Prelude
 import GHC.Platform
 
+import GHC.Driver.Env
+import GHC.Driver.Session
+import {-# SOURCE #-} GHC.Driver.Hooks
+
 import GHC.Hs
-import GHC.Driver.Types
+
+import GHC.Tc.Utils.TcType
+import GHC.Tc.Types.Constraint
+import GHC.Tc.Types.Origin
 import GHC.Tc.Types.Evidence
+import {-# SOURCE #-} GHC.Tc.Errors.Hole.FitTypes ( HoleFitPlugin )
+import GHC.Tc.Errors.Types
+
+import GHC.Core.Reduction ( Reduction(..) )
 import GHC.Core.Type
 import GHC.Core.TyCon  ( TyCon, tyConKind )
 import GHC.Core.PatSyn ( PatSyn )
 import GHC.Core.Lint   ( lintAxioms )
-import GHC.Types.Id         ( idType, idName )
-import GHC.Types.FieldLabel ( FieldLabel )
 import GHC.Core.UsageEnv
-import GHC.Tc.Utils.TcType
-import GHC.Tc.Types.Constraint
-import GHC.Tc.Types.Origin
-import GHC.Types.Annotations
 import GHC.Core.InstEnv
 import GHC.Core.FamInstEnv
-import {-# SOURCE #-} GHC.HsToCore.PmCheck.Types (Deltas)
-import GHC.Data.IOEnv
+import GHC.Core.Predicate
+
+import GHC.Types.Id         ( idType, idName )
+import GHC.Types.FieldLabel ( FieldLabel )
+import GHC.Types.Fixity.Env
+import GHC.Types.Annotations
+import GHC.Types.CompleteMatch
 import GHC.Types.Name.Reader
 import GHC.Types.Name
 import GHC.Types.Name.Env
@@ -117,26 +136,36 @@ import GHC.Types.Name.Set
 import GHC.Types.Avail
 import GHC.Types.Var
 import GHC.Types.Var.Env
-import GHC.Unit
+import GHC.Types.TypeEnv
+import GHC.Types.TyThing
+import GHC.Types.SourceFile
 import GHC.Types.SrcLoc
 import GHC.Types.Var.Set
-import GHC.Utils.Error
 import GHC.Types.Unique.FM
 import GHC.Types.Basic
+import GHC.Types.CostCentre.State
+import GHC.Types.HpcInfo
+
+import GHC.Data.IOEnv
 import GHC.Data.Bag
-import GHC.Driver.Session
-import GHC.Utils.Outputable
 import GHC.Data.List.SetOps
+
+import GHC.Unit
+import GHC.Unit.Module.Warnings
+import GHC.Unit.Module.Deps
+import GHC.Unit.Module.ModDetails
+
+import GHC.Utils.Error
+import GHC.Utils.Outputable
 import GHC.Utils.Fingerprint
 import GHC.Utils.Misc
-import GHC.Builtin.Names ( isUnboundName )
-import GHC.Types.CostCentre.State
+import GHC.Utils.Panic
+import GHC.Utils.Logger
 
-import Control.Monad (ap)
+import GHC.Builtin.Names ( isUnboundName )
+
 import Data.Set      ( Set )
 import qualified Data.Set as S
-
-import Data.List ( sort )
 import Data.Map ( Map )
 import Data.Dynamic  ( Dynamic )
 import Data.Typeable ( TypeRep )
@@ -144,9 +173,9 @@ import Data.Maybe    ( mapMaybe )
 import GHCi.Message
 import GHCi.RemoteTypes
 
-import {-# SOURCE #-} GHC.Tc.Errors.Hole.FitTypes ( HoleFitPlugin )
-
 import qualified Language.Haskell.TH as TH
+import GHC.Driver.Env.KnotVars
+import GHC.Linker.Types
 
 -- | A 'NameShape' is a substitution on 'Name's that can be used
 -- to refine the identities of a hole while we are renaming interfaces
@@ -192,7 +221,6 @@ type TcRn       = TcRnIf TcGblEnv TcLclEnv    -- Type inference
 type IfM lcl    = TcRnIf IfGblEnv lcl         -- Iface stuff
 type IfG        = IfM ()                      --    Top level
 type IfL        = IfM IfLclEnv                --    Nested
-type DsM        = TcRnIf DsGblEnv DsLclEnv    -- Desugaring
 
 -- TcRn is the type-checking and renaming monad: the main monad that
 -- most type-checking takes place in.  The global environment is
@@ -216,7 +244,7 @@ data Env gbl lcl
                              -- Includes all info about imported things
                              -- BangPattern is to fix leak, see #15111
 
-        env_um   :: !Char,   -- Mask for Uniques
+        env_um   :: {-# UNPACK #-} !Char,   -- Mask for Uniques
 
         env_gbl  :: gbl,     -- Info about things defined at the top level
                              -- of the module being compiled
@@ -227,8 +255,49 @@ data Env gbl lcl
 instance ContainsDynFlags (Env gbl lcl) where
     extractDynFlags env = hsc_dflags (env_top env)
 
+instance ContainsHooks (Env gbl lcl) where
+    extractHooks env = hsc_hooks (env_top env)
+
+instance ContainsLogger (Env gbl lcl) where
+    extractLogger env = hsc_logger (env_top env)
+
 instance ContainsModule gbl => ContainsModule (Env gbl lcl) where
     extractModule env = extractModule (env_gbl env)
+
+{-
+************************************************************************
+*                                                                      *
+*                            RewriteEnv
+*                     The rewriting environment
+*                                                                      *
+************************************************************************
+-}
+
+-- | A 'RewriteEnv' carries the necessary context for performing rewrites
+-- (i.e. type family reductions and following filled-in metavariables)
+-- in the solver.
+data RewriteEnv
+  = RE { re_loc     :: !CtLoc
+       -- ^ In which context are we rewriting?
+       --
+       -- Type-checking plugins might want to use this location information
+       -- when emitting new Wanted constraints when rewriting type family
+       -- applications. This ensures that such Wanted constraints will,
+       -- when unsolved, give rise to error messages with the
+       -- correct source location.
+
+       -- Within GHC, we use this field to keep track of reduction depth.
+       -- See Note [Rewriter CtLoc] in GHC.Tc.Solver.Rewrite.
+       , re_flavour :: !CtFlavour
+       , re_eq_rel  :: !EqRel
+       -- ^ At what role are we rewriting?
+       --
+       -- See Note [Rewriter EqRels] in GHC.Tc.Solver.Rewrite
+       , re_rewriters :: !(TcRef RewriterSet)  -- ^ See Note [Wanteds rewrite Wanteds]
+       }
+-- RewriteEnv is mostly used in @GHC.Tc.Solver.Rewrite@, but it is defined
+-- here so that it can also be passed to rewriting plugins.
+-- See the 'tcPluginRewrite' field of 'TcPlugin'.
 
 
 {-
@@ -251,7 +320,7 @@ data IfGblEnv
         -- We need the module name so we can test when it's appropriate
         -- to look in this env.
         -- See Note [Tying the knot] in GHC.IfaceToCore
-        if_rec_types :: Maybe (Module, IfG TypeEnv)
+        if_rec_types :: (KnotVars (IfG TypeEnv))
                 -- Allows a read effect, so it can be in a mutable
                 -- variable; c.f. handling the external package type env
                 -- Nothing => interactive stuff, no loops possible
@@ -264,7 +333,7 @@ data IfLclEnv
         -- it means M.f = \x -> x, where M is the if_mod
         -- NB: This is a semantic module, see
         -- Note [Identity versus semantic module]
-        if_mod :: Module,
+        if_mod :: !Module,
 
         -- Whether or not the IfaceDecl came from a boot
         -- file or not; we'll use this to choose between
@@ -294,58 +363,6 @@ data IfLclEnv
 {-
 ************************************************************************
 *                                                                      *
-                Desugarer monad
-*                                                                      *
-************************************************************************
-
-Now the mondo monad magic (yes, @DsM@ is a silly name)---carry around
-a @UniqueSupply@ and some annotations, which
-presumably include source-file location information:
--}
-
-data DsGblEnv
-        = DsGblEnv
-        { ds_mod          :: Module             -- For SCC profiling
-        , ds_fam_inst_env :: FamInstEnv         -- Like tcg_fam_inst_env
-        , ds_unqual  :: PrintUnqualified
-        , ds_msgs    :: IORef Messages          -- Warning messages
-        , ds_if_env  :: (IfGblEnv, IfLclEnv)    -- Used for looking up global,
-                                                -- possibly-imported things
-        , ds_complete_matches :: CompleteMatchMap
-           -- Additional complete pattern matches
-        , ds_cc_st   :: IORef CostCentreState
-           -- Tracking indices for cost centre annotations
-        }
-
-instance ContainsModule DsGblEnv where
-    extractModule = ds_mod
-
-data DsLclEnv = DsLclEnv {
-        dsl_meta    :: DsMetaEnv,        -- Template Haskell bindings
-        dsl_loc     :: RealSrcSpan,      -- To put in pattern-matching error msgs
-
-        -- See Note [Note [Type and Term Equality Propagation] in "GHC.HsToCore.PmCheck"
-        -- The set of reaching values Deltas is augmented as we walk inwards,
-        -- refined through each pattern match in turn
-        dsl_deltas  :: Deltas
-     }
-
--- Inside [| |] brackets, the desugarer looks
--- up variables in the DsMetaEnv
-type DsMetaEnv = NameEnv DsMetaVal
-
-data DsMetaVal
-   = DsBound Id         -- Bound by a pattern inside the [| |].
-                        -- Will be dynamically alpha renamed.
-                        -- The Id has type THSyntax.Var
-
-   | DsSplice (HsExpr GhcTc) -- These bindings are introduced by
-                             -- the PendingSplices on a HsBracketOut
-
-
-{-
-************************************************************************
-*                                                                      *
                 Global typechecker environment
 *                                                                      *
 ************************************************************************
@@ -355,7 +372,7 @@ data DsMetaVal
 -- module. Currently one always gets a 'FrontendTypecheck', since running the
 -- frontend involves typechecking a program. hs-sig merges are not handled here.
 --
--- This data type really should be in GHC.Driver.Types, but it needs
+-- This data type really should be in GHC.Driver.Env, but it needs
 -- to have a TcGblEnv which is only defined here.
 data FrontendResult
         = FrontendTypecheck TcGblEnv
@@ -425,7 +442,7 @@ data TcGblEnv
 
         tcg_fix_env   :: FixityEnv,     -- ^ Just for things in this module
         tcg_field_env :: RecFieldEnv,   -- ^ Just for things in this module
-                                        -- See Note [The interactive package] in "GHC.Driver.Types"
+                                        -- See Note [The interactive package] in "GHC.Runtime.Context"
 
         tcg_type_env :: TypeEnv,
           -- ^ Global type env for the module we are compiling now.  All
@@ -436,9 +453,9 @@ data TcGblEnv
           --  move to the global envt during zonking)
           --
           -- NB: for what "things in this module" means, see
-          -- Note [The interactive package] in "GHC.Driver.Types"
+          -- Note [The interactive package] in "GHC.Runtime.Context"
 
-        tcg_type_env_var :: TcRef TypeEnv,
+        tcg_type_env_var :: KnotVars (IORef TypeEnv),
                 -- Used only to initialise the interface-file
                 -- typechecker in initIfaceTcRn, so that it can see stuff
                 -- bound in this module when dealing with hi-boot recursions
@@ -506,6 +523,10 @@ data TcGblEnv
           --
           -- Splices disable recompilation avoidance (see #481)
 
+        tcg_th_needed_deps :: TcRef ([Linkable], PkgsLoaded),
+          -- ^ The set of runtime dependencies required by this module
+          -- See Note [Object File Dependencies]
+
         tcg_dfun_n  :: TcRef OccSet,
           -- ^ Allows us to choose unique DFun names.
 
@@ -517,7 +538,7 @@ data TcGblEnv
         -- The binds, rules and foreign-decl fields are collected
         -- initially in un-zonked form and are finally zonked in tcRnSrcDecls
 
-        tcg_rn_exports :: Maybe [(Located (IE GhcRn), Avails)],
+        tcg_rn_exports :: Maybe [(LIE GhcRn, Avails)],
                 -- Nothing <=> no explicit export list
                 -- Is always Nothing if we don't want to retain renamed
                 -- exports.
@@ -555,27 +576,32 @@ data TcGblEnv
         tcg_th_remote_state :: TcRef (Maybe (ForeignRef (IORef QState))),
         -- ^ Template Haskell state
 
+        tcg_th_docs   :: TcRef THDocs,
+        -- ^ Docs added in Template Haskell via @putDoc@.
+
         tcg_ev_binds  :: Bag EvBind,        -- Top-level evidence bindings
 
         -- Things defined in this module, or (in GHCi)
         -- in the declarations for a single GHCi command.
-        -- For the latter, see Note [The interactive package] in GHC.Driver.Types
+        -- For the latter, see Note [The interactive package] in
+        -- GHC.Runtime.Context
         tcg_tr_module :: Maybe Id,   -- Id for $trModule :: GHC.Unit.Module
                                              -- for which every module has a top-level defn
                                              -- except in GHCi in which case we have Nothing
         tcg_binds     :: LHsBinds GhcTc,     -- Value bindings in this module
         tcg_sigs      :: NameSet,            -- ...Top-level names that *lack* a signature
         tcg_imp_specs :: [LTcSpecPrag],      -- ...SPECIALISE prags for imported Ids
-        tcg_warns     :: Warnings,           -- ...Warnings and deprecations
+        tcg_warns     :: (Warnings GhcRn), -- ...Warnings and deprecations
         tcg_anns      :: [Annotation],       -- ...Annotations
         tcg_tcs       :: [TyCon],            -- ...TyCons and Classes
+        tcg_ksigs     :: NameSet,            -- ...Top-level TyCon names that *lack* a signature
         tcg_insts     :: [ClsInst],          -- ...Instances
         tcg_fam_insts :: [FamInst],          -- ...Family instances
         tcg_rules     :: [LRuleDecl GhcTc],  -- ...Rules
         tcg_fords     :: [LForeignDecl GhcTc], -- ...Foreign import & exports
         tcg_patsyns   :: [PatSyn],            -- ...Pattern synonyms
 
-        tcg_doc_hdr   :: Maybe LHsDocString, -- ^ Maybe Haddock header docs
+        tcg_doc_hdr   :: Maybe (LHsDoc GhcRn), -- ^ Maybe Haddock header docs
         tcg_hpc       :: !AnyHpcUsage,       -- ^ @True@ if any part of the
                                              --  prog uses hpc instrumentation.
            -- NB. BangPattern is to fix a leak, see #15111
@@ -587,13 +613,28 @@ data TcGblEnv
                                              -- function, if this module is
                                              -- the main module.
 
-        tcg_safeInfer :: TcRef (Bool, WarningMessages),
-        -- ^ Has the typechecker inferred this module as -XSafe (Safe Haskell)
+        tcg_safe_infer :: TcRef Bool,
+        -- ^ Has the typechecker inferred this module as -XSafe (Safe Haskell)?
         -- See Note [Safe Haskell Overlapping Instances Implementation],
         -- although this is used for more than just that failure case.
 
-        tcg_tc_plugins :: [TcPluginSolver],
-        -- ^ A list of user-defined plugins for the constraint solver.
+        tcg_safe_infer_reasons :: TcRef (Messages TcRnMessage),
+        -- ^ Unreported reasons why tcg_safe_infer is False.
+        -- INVARIANT: If this Messages is non-empty, then tcg_safe_infer is False.
+        -- It may be that tcg_safe_infer is False but this is empty, if no reasons
+        -- are supplied (#19714), or if those reasons have already been
+        -- reported by GHC.Driver.Main.markUnsafeInfer
+
+        tcg_tc_plugin_solvers :: [TcPluginSolver],
+        -- ^ A list of user-defined type-checking plugins for constraint solving.
+
+        tcg_tc_plugin_rewriters :: UniqFM TyCon [TcPluginRewriter],
+        -- ^ A collection of all the user-defined type-checking plugins for rewriting
+        -- type family applications, collated by their type family 'TyCon's.
+
+        tcg_defaulting_plugins :: [FillDefaulting],
+        -- ^ A list of user-defined plugins for type defaulting plugins.
+
         tcg_hf_plugins :: [HoleFitPlugin],
         -- ^ A list of user-defined plugins for hole fit suggestions.
 
@@ -603,10 +644,13 @@ data TcGblEnv
         tcg_static_wc :: TcRef WantedConstraints,
           -- ^ Wanted constraints of static forms.
         -- See Note [Constraints in static forms].
-        tcg_complete_matches :: [CompleteMatch],
+        tcg_complete_matches :: !CompleteMatches,
 
         -- ^ Tracking indices for cost centre annotations
-        tcg_cc_st   :: TcRef CostCentreState
+        tcg_cc_st   :: TcRef CostCentreState,
+
+        tcg_next_wrapper_num :: TcRef (ModuleEnv Int)
+        -- ^ See Note [Generating fresh names for FFI wrappers]
     }
 
 -- NB: topModIdentity, not topModSemantic!
@@ -657,6 +701,15 @@ data SelfBootInfo
        , sb_tcs :: NameSet }    -- defining these TyCons,
 -- What is sb_tcs used for?  See Note [Extra dependencies from .hs-boot files]
 -- in GHC.Rename.Module
+
+bootExports :: SelfBootInfo -> NameSet
+bootExports boot =
+  case boot of
+    NoSelfBoot -> emptyNameSet
+    SelfBoot { sb_mds = mds} ->
+      let exports = md_exports mds
+      in availsToNameSet exports
+
 
 
 {- Note [Tracking unused binding and imports]
@@ -718,6 +771,9 @@ We gather three sorts of usage information
           Coercible solver updates tcg_keep's TcRef whenever it
           encounters a use of `coerce` that crosses newtype boundaries.
 
+      (e) Record fields that are used to solve HasField constraints
+          (see Note [Unused name reporting and HasField] in GHC.Tc.Instance.Class)
+
       The tcg_keep field is used in two distinct ways:
 
       * Desugar.addExportFlagsAndRules.  Where things like (a-c) are locally
@@ -764,7 +820,7 @@ data TcLclEnv           -- Changes as we move inside an expression
             -- The ThBindEnv records the TH binding level of in-scope Names
             -- defined in this module (not imported)
             -- We can't put this info in the TypeEnv because it's needed
-            -- (and extended) in the renamer, for untyed splices
+            -- (and extended) in the renamer, for untyped splices
 
         tcl_arrow_ctxt :: ArrowCtxt,       -- Arrow-notation context
 
@@ -790,7 +846,7 @@ data TcLclEnv           -- Changes as we move inside an expression
                                       -- and for tidying types
 
         tcl_lie  :: TcRef WantedConstraints,    -- Place to accumulate type constraints
-        tcl_errs :: TcRef Messages              -- Place to accumulate errors
+        tcl_errs :: TcRef (Messages TcRnMessage)     -- Place to accumulate diagnostics
     }
 
 setLclEnvTcLevel :: TcLclEnv -> TcLevel -> TcLclEnv
@@ -805,7 +861,7 @@ setLclEnvLoc env loc = env { tcl_loc = loc }
 getLclEnvLoc :: TcLclEnv -> RealSrcSpan
 getLclEnvLoc = tcl_loc
 
-type ErrCtxt = (Bool, TidyEnv -> TcM (TidyEnv, MsgDoc))
+type ErrCtxt = (Bool, TidyEnv -> TcM (TidyEnv, SDoc))
         -- Monadic so that we have a chance
         -- to deal with bound type variables just before error
         -- message construction
@@ -1005,7 +1061,7 @@ thLevel (Brack s _)   = thLevel s + 1
 thLevel (RunSplice _) = panic "thLevel: called when running a splice"
                         -- See Note [RunSplice ThLevel].
 
-{- Node [RunSplice ThLevel]
+{- Note [RunSplice ThLevel]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 The 'RunSplice' stage is set when executing a splice, and only when running a
 splice. In particular it is not set when the splice is renamed or typechecked.
@@ -1085,6 +1141,12 @@ data TcTyThing
 
   | APromotionErr PromotionErr
 
+-- | Matches on either a global 'TyCon' or a 'TcTyCon'.
+tcTyThingTyCon_maybe :: TcTyThing -> Maybe TyCon
+tcTyThingTyCon_maybe (AGlobal (ATyCon tc)) = Just tc
+tcTyThingTyCon_maybe (ATcTyCon tc_tc)      = Just tc_tc
+tcTyThingTyCon_maybe _                     = Nothing
+
 data PromotionErr
   = TyConPE          -- TyCon used in a kind before we are ready
                      --     data T :: T -> * where ...
@@ -1102,7 +1164,6 @@ data PromotionErr
 
   | RecDataConPE     -- Data constructor in a recursive loop
                      -- See Note [Recursion and promoting data constructors] in GHC.Tc.TyCl
-  | NoDataKindsTC    -- -XDataKinds not enabled (for a tycon)
   | NoDataKindsDC    -- -XDataKinds not enabled (for a datacon)
 
 instance Outputable TcTyThing where     -- Debugging only
@@ -1123,7 +1184,7 @@ instance Outputable TcTyThing where     -- Debugging only
 -- b) to figure out when a nested binding can be generalised,
 --    in 'GHC.Tc.Gen.Bind.decideGeneralisationPlan'.
 --
-data IdBindingInfo -- See Note [Meaning of IdBindingInfo and ClosedTypeId]
+data IdBindingInfo -- See Note [Meaning of IdBindingInfo]
     = NotLetBound
     | ClosedLet
     | NonClosedLet
@@ -1134,7 +1195,7 @@ data IdBindingInfo -- See Note [Meaning of IdBindingInfo and ClosedTypeId]
 -- | IsGroupClosed describes a group of mutually-recursive bindings
 data IsGroupClosed
   = IsGroupClosed
-      (NameEnv RhsNames)  -- Free var info for the RHS of each binding in the goup
+      (NameEnv RhsNames)  -- Free var info for the RHS of each binding in the group
                           -- Used only for (static e) checks
 
       ClosedTypeId        -- True <=> all the free vars of the group are
@@ -1146,7 +1207,7 @@ type RhsNames = NameSet   -- Names of variables, mentioned on the RHS of
                           -- a definition, that are not Global or ClosedLet
 
 type ClosedTypeId = Bool
-  -- See Note [Meaning of IdBindingInfo and ClosedTypeId]
+  -- See Note [Meaning of IdBindingInfo]
 
 {- Note [Meaning of IdBindingInfo]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1297,7 +1358,6 @@ instance Outputable PromotionErr where
   ppr (ConstrainedDataConPE pred) = text "ConstrainedDataConPE"
                                       <+> parens (ppr pred)
   ppr RecDataConPE                = text "RecDataConPE"
-  ppr NoDataKindsTC               = text "NoDataKindsTC"
   ppr NoDataKindsDC               = text "NoDataKindsDC"
 
 --------------
@@ -1322,7 +1382,6 @@ peCategory PatSynPE               = "pattern synonym"
 peCategory FamDataConPE           = "data constructor"
 peCategory ConstrainedDataConPE{} = "data constructor"
 peCategory RecDataConPE           = "data constructor"
-peCategory NoDataKindsTC          = "type constructor"
 peCategory NoDataKindsDC          = "data constructor"
 
 {-
@@ -1333,92 +1392,35 @@ peCategory NoDataKindsDC          = "data constructor"
 ************************************************************************
 -}
 
--- | 'ImportAvails' summarises what was imported from where, irrespective of
--- whether the imported things are actually used or not.  It is used:
---
---  * when processing the export list,
---
---  * when constructing usage info for the interface file,
---
---  * to identify the list of directly imported modules for initialisation
---    purposes and for optimised overlap checking of family instances,
---
---  * when figuring out what things are really unused
---
-data ImportAvails
-   = ImportAvails {
-        imp_mods :: ImportedMods,
-          --      = ModuleEnv [ImportedModsVal],
-          -- ^ Domain is all directly-imported modules
-          --
-          -- See the documentation on ImportedModsVal in "GHC.Driver.Types" for the
-          -- meaning of the fields.
-          --
-          -- We need a full ModuleEnv rather than a ModuleNameEnv here,
-          -- because we might be importing modules of the same name from
-          -- different packages. (currently not the case, but might be in the
-          -- future).
 
-        imp_dep_mods :: ModuleNameEnv ModuleNameWithIsBoot,
-          -- ^ Home-package modules needed by the module being compiled
-          --
-          -- It doesn't matter whether any of these dependencies
-          -- are actually /used/ when compiling the module; they
-          -- are listed if they are below it at all.  For
-          -- example, suppose M imports A which imports X.  Then
-          -- compiling M might not need to consult X.hi, but X
-          -- is still listed in M's dependencies.
-
-        imp_dep_pkgs :: Set UnitId,
-          -- ^ Packages needed by the module being compiled, whether directly,
-          -- or via other modules in this package, or via modules imported
-          -- from other packages.
-
-        imp_trust_pkgs :: Set UnitId,
-          -- ^ This is strictly a subset of imp_dep_pkgs and records the
-          -- packages the current module needs to trust for Safe Haskell
-          -- compilation to succeed. A package is required to be trusted if
-          -- we are dependent on a trustworthy module in that package.
-          -- While perhaps making imp_dep_pkgs a tuple of (UnitId, Bool)
-          -- where True for the bool indicates the package is required to be
-          -- trusted is the more logical  design, doing so complicates a lot
-          -- of code not concerned with Safe Haskell.
-          -- See Note [Tracking Trust Transitively] in "GHC.Rename.Names"
-
-        imp_trust_own_pkg :: Bool,
-          -- ^ Do we require that our own package is trusted?
-          -- This is to handle efficiently the case where a Safe module imports
-          -- a Trustworthy module that resides in the same package as it.
-          -- See Note [Trust Own Package] in "GHC.Rename.Names"
-
-        imp_orphs :: [Module],
-          -- ^ Orphan modules below us in the import tree (and maybe including
-          -- us for imported modules)
-
-        imp_finsts :: [Module]
-          -- ^ Family instance modules below us in the import tree (and maybe
-          -- including us for imported modules)
-      }
-
-mkModDeps :: [ModuleNameWithIsBoot]
-          -> ModuleNameEnv ModuleNameWithIsBoot
-mkModDeps deps = foldl' add emptyUFM deps
+mkModDeps :: Set (UnitId, ModuleNameWithIsBoot)
+          -> InstalledModuleEnv ModuleNameWithIsBoot
+mkModDeps deps = S.foldl' add emptyInstalledModuleEnv deps
   where
-    add env elt = addToUFM env (gwib_mod elt) elt
+    add env (uid, elt) = extendInstalledModuleEnv env (mkModule uid (gwib_mod elt)) elt
 
-modDepsElts
-  :: ModuleNameEnv ModuleNameWithIsBoot
-  -> [ModuleNameWithIsBoot]
-modDepsElts = sort . nonDetEltsUFM
-  -- It's OK to use nonDetEltsUFM here because sorting by module names
-  -- restores determinism
+plusModDeps :: InstalledModuleEnv ModuleNameWithIsBoot
+            -> InstalledModuleEnv ModuleNameWithIsBoot
+            -> InstalledModuleEnv ModuleNameWithIsBoot
+plusModDeps = plusInstalledModuleEnv plus_mod_dep
+  where
+    plus_mod_dep r1@(GWIB { gwib_mod = m1, gwib_isBoot = boot1 })
+                 r2@(GWIB {gwib_mod = m2, gwib_isBoot = boot2})
+      | assertPpr (m1 == m2) ((ppr m1 <+> ppr m2) $$ (ppr (boot1 == IsBoot) <+> ppr (boot2 == IsBoot)))
+        boot1 == IsBoot = r2
+      | otherwise = r1
+      -- If either side can "see" a non-hi-boot interface, use that
+      -- Reusing existing tuples saves 10% of allocations on test
+      -- perf/compiler/MultiLayerModules
 
 emptyImportAvails :: ImportAvails
 emptyImportAvails = ImportAvails { imp_mods          = emptyModuleEnv,
-                                   imp_dep_mods      = emptyUFM,
-                                   imp_dep_pkgs      = S.empty,
+                                   imp_direct_dep_mods = emptyInstalledModuleEnv,
+                                   imp_dep_direct_pkgs = S.empty,
+                                   imp_sig_mods      = [],
                                    imp_trust_pkgs    = S.empty,
                                    imp_trust_own_pkg = False,
+                                   imp_boot_mods   = emptyInstalledModuleEnv,
                                    imp_orphs         = [],
                                    imp_finsts        = [] }
 
@@ -1430,29 +1432,28 @@ emptyImportAvails = ImportAvails { imp_mods          = emptyModuleEnv,
 plusImportAvails ::  ImportAvails ->  ImportAvails ->  ImportAvails
 plusImportAvails
   (ImportAvails { imp_mods = mods1,
-                  imp_dep_mods = dmods1, imp_dep_pkgs = dpkgs1,
+                  imp_direct_dep_mods = ddmods1,
+                  imp_dep_direct_pkgs = ddpkgs1,
+                  imp_boot_mods = srs1,
+                  imp_sig_mods = sig_mods1,
                   imp_trust_pkgs = tpkgs1, imp_trust_own_pkg = tself1,
                   imp_orphs = orphs1, imp_finsts = finsts1 })
   (ImportAvails { imp_mods = mods2,
-                  imp_dep_mods = dmods2, imp_dep_pkgs = dpkgs2,
+                  imp_direct_dep_mods = ddmods2,
+                  imp_dep_direct_pkgs = ddpkgs2,
+                  imp_boot_mods = srcs2,
+                  imp_sig_mods = sig_mods2,
                   imp_trust_pkgs = tpkgs2, imp_trust_own_pkg = tself2,
                   imp_orphs = orphs2, imp_finsts = finsts2 })
   = ImportAvails { imp_mods          = plusModuleEnv_C (++) mods1 mods2,
-                   imp_dep_mods      = plusUFM_C plus_mod_dep dmods1 dmods2,
-                   imp_dep_pkgs      = dpkgs1 `S.union` dpkgs2,
+                   imp_direct_dep_mods = ddmods1 `plusModDeps` ddmods2,
+                   imp_dep_direct_pkgs      = ddpkgs1 `S.union` ddpkgs2,
                    imp_trust_pkgs    = tpkgs1 `S.union` tpkgs2,
                    imp_trust_own_pkg = tself1 || tself2,
+                   imp_boot_mods   = srs1 `plusModDeps` srcs2,
+                   imp_sig_mods      = sig_mods1 `unionLists` sig_mods2,
                    imp_orphs         = orphs1 `unionLists` orphs2,
                    imp_finsts        = finsts1 `unionLists` finsts2 }
-  where
-    plus_mod_dep r1@(GWIB { gwib_mod = m1, gwib_isBoot = boot1 })
-                 r2@(GWIB {gwib_mod = m2, gwib_isBoot = boot2})
-      | ASSERT2( m1 == m2, (ppr m1 <+> ppr m2) $$ (ppr (boot1 == IsBoot) <+> ppr (boot2 == IsBoot)))
-        boot1 == IsBoot = r2
-      | otherwise = r1
-      -- If either side can "see" a non-hi-boot interface, use that
-      -- Reusing existing tuples saves 10% of allocations on test
-      -- perf/compiler/MultiLayerModules
 
 {-
 ************************************************************************
@@ -1667,65 +1668,160 @@ Constraint Solver Plugins
 -------------------------
 -}
 
-type TcPluginSolver = [Ct]    -- given
-                   -> [Ct]    -- derived
-                   -> [Ct]    -- wanted
-                   -> TcPluginM TcPluginResult
+-- | The @solve@ function of a type-checking plugin takes in Given
+-- and Wanted constraints, and should return a 'TcPluginSolveResult'
+-- indicating which Wanted constraints it could solve, or whether any are
+-- insoluble.
+type TcPluginSolver = EvBindsVar
+                   -> [Ct] -- ^ Givens
+                   -> [Ct] -- ^ Wanteds
+                   -> TcPluginM TcPluginSolveResult
 
-newtype TcPluginM a = TcPluginM (EvBindsVar -> TcM a) deriving (Functor)
+-- | For rewriting type family applications, a type-checking plugin provides
+-- a function of this type for each type family 'TyCon'.
+--
+-- The function is provided with the current set of Given constraints, together
+-- with the arguments to the type family.
+-- The type family application will always be fully saturated.
+type TcPluginRewriter
+  =  RewriteEnv -- ^ Rewriter environment
+  -> [Ct]       -- ^ Givens
+  -> [TcType]   -- ^ type family arguments
+  -> TcPluginM TcPluginRewriteResult
 
-instance Applicative TcPluginM where
-  pure x = TcPluginM (const $ pure x)
-  (<*>) = ap
-
-instance Monad TcPluginM where
-  TcPluginM m >>= k =
-    TcPluginM (\ ev -> do a <- m ev
-                          runTcPluginM (k a) ev)
-
-instance MonadFail TcPluginM where
-  fail x   = TcPluginM (const $ fail x)
-
-runTcPluginM :: TcPluginM a -> EvBindsVar -> TcM a
-runTcPluginM (TcPluginM m) = m
+-- | 'TcPluginM' is the monad in which type-checking plugins operate.
+newtype TcPluginM a = TcPluginM { runTcPluginM :: TcM a }
+  deriving newtype (Functor, Applicative, Monad, MonadFail)
 
 -- | This function provides an escape for direct access to
 -- the 'TcM` monad.  It should not be used lightly, and
 -- the provided 'TcPluginM' API should be favoured instead.
 unsafeTcPluginTcM :: TcM a -> TcPluginM a
-unsafeTcPluginTcM = TcPluginM . const
-
--- | Access the 'EvBindsVar' carried by the 'TcPluginM' during
--- constraint solving.  Returns 'Nothing' if invoked during
--- 'tcPluginInit' or 'tcPluginStop'.
-getEvBindsTcPluginM :: TcPluginM EvBindsVar
-getEvBindsTcPluginM = TcPluginM return
-
+unsafeTcPluginTcM = TcPluginM
 
 data TcPlugin = forall s. TcPlugin
-  { tcPluginInit  :: TcPluginM s
+  { tcPluginInit :: TcPluginM s
     -- ^ Initialize plugin, when entering type-checker.
 
   , tcPluginSolve :: s -> TcPluginSolver
     -- ^ Solve some constraints.
-    -- TODO: WRITE MORE DETAILS ON HOW THIS WORKS.
+    --
+    -- This function will be invoked at two points in the constraint solving
+    -- process: once to simplify Given constraints, and once to solve
+    -- Wanted constraints. In the first case (and only in the first case),
+    -- no Wanted constraints will be passed to the plugin.
+    --
+    -- The plugin can either return a contradiction,
+    -- or specify that it has solved some constraints (with evidence),
+    -- and possibly emit additional constraints. These returned constraints
+    -- must be Givens in the first case, and Wanteds in the second.
+    --
+    -- Use @ \\ _ _ _ _ _ -> pure $ TcPluginOK [] [] @ if your plugin
+    -- does not provide this functionality.
 
-  , tcPluginStop  :: s -> TcPluginM ()
+  , tcPluginRewrite :: s -> UniqFM TyCon TcPluginRewriter
+    -- ^ Rewrite saturated type family applications.
+    --
+    -- The plugin is expected to supply a mapping from type family names to
+    -- rewriting functions. For each type family 'TyCon', the plugin should
+    -- provide a function which takes in the given constraints and arguments
+    -- of a saturated type family application, and return a possible rewriting.
+    -- See 'TcPluginRewriter' for the expected shape of such a function.
+    --
+    -- Use @ \\ _ -> emptyUFM @ if your plugin does not provide this functionality.
+
+  , tcPluginStop :: s -> TcPluginM ()
    -- ^ Clean up after the plugin, when exiting the type-checker.
   }
 
-data TcPluginResult
-  = TcPluginContradiction [Ct]
-    -- ^ The plugin found a contradiction.
-    -- The returned constraints are removed from the inert set,
-    -- and recorded as insoluble.
+-- | The plugin found a contradiction.
+-- The returned constraints are removed from the inert set,
+-- and recorded as insoluble.
+--
+-- The returned list of constraints should never be empty.
+pattern TcPluginContradiction :: [Ct] -> TcPluginSolveResult
+pattern TcPluginContradiction insols
+  = TcPluginSolveResult
+  { tcPluginInsolubleCts = insols
+  , tcPluginSolvedCts    = []
+  , tcPluginNewCts       = [] }
 
-  | TcPluginOk [(EvTerm,Ct)] [Ct]
-    -- ^ The first field is for constraints that were solved.
-    -- These are removed from the inert set,
-    -- and the evidence for them is recorded.
-    -- The second field contains new work, that should be processed by
-    -- the constraint solver.
+-- | The plugin has not found any contradictions,
+--
+-- The first field is for constraints that were solved.
+-- The second field contains new work, that should be processed by
+-- the constraint solver.
+pattern TcPluginOk :: [(EvTerm, Ct)] -> [Ct] -> TcPluginSolveResult
+pattern TcPluginOk solved new
+  = TcPluginSolveResult
+  { tcPluginInsolubleCts = []
+  , tcPluginSolvedCts    = solved
+  , tcPluginNewCts       = new }
+
+-- | Result of running a solver plugin.
+data TcPluginSolveResult
+  = TcPluginSolveResult
+  { -- | Insoluble constraints found by the plugin.
+    --
+    -- These constraints will be added to the inert set,
+    -- and reported as insoluble to the user.
+    tcPluginInsolubleCts :: [Ct]
+    -- | Solved constraints, together with their evidence.
+    --
+    -- These are removed from the inert set, and the
+    -- evidence for them is recorded.
+  , tcPluginSolvedCts :: [(EvTerm, Ct)]
+    -- | New constraints that the plugin wishes to emit.
+    --
+    -- These will be added to the work list.
+  , tcPluginNewCts :: [Ct]
+  }
+
+data TcPluginRewriteResult
+  =
+  -- | The plugin does not rewrite the type family application.
+    TcPluginNoRewrite
+
+  -- | The plugin rewrites the type family application
+  -- providing a rewriting together with evidence: a 'Reduction',
+  -- which contains the rewritten type together with a 'Coercion'
+  -- whose right-hand-side type is the rewritten type.
+  --
+  -- The plugin can also emit additional Wanted constraints.
+  | TcPluginRewriteTo
+    { tcPluginReduction    :: !Reduction
+    , tcRewriterNewWanteds :: [Ct]
+    }
+
+-- | A collection of candidate default types for a type variable.
+data DefaultingProposal
+  = DefaultingProposal
+    { deProposalTyVar :: TcTyVar
+      -- ^ The type variable to default.
+    , deProposalCandidates :: [Type]
+      -- ^ Candidate types to default the type variable to.
+    , deProposalCts :: [Ct]
+      -- ^ The constraints against which defaults are checked.
+    }
+
+instance Outputable DefaultingProposal where
+  ppr p = text "DefaultingProposal"
+          <+> ppr (deProposalTyVar p)
+          <+> ppr (deProposalCandidates p)
+          <+> ppr (deProposalCts p)
+
+type DefaultingPluginResult = [DefaultingProposal]
+type FillDefaulting = WantedConstraints -> TcPluginM DefaultingPluginResult
+
+-- | A plugin for controlling defaulting.
+data DefaultingPlugin = forall s. DefaultingPlugin
+  { dePluginInit :: TcPluginM s
+    -- ^ Initialize plugin, when entering type-checker.
+  , dePluginRun :: s -> FillDefaulting
+    -- ^ Default some types
+  , dePluginStop :: s -> TcPluginM ()
+   -- ^ Clean up after the plugin, when exiting the type-checker.
+  }
 
 {- *********************************************************************
 *                                                                      *
@@ -1762,7 +1858,20 @@ getRoleAnnots bndrs role_env
 
 -- | Check the 'TcGblEnv' for consistency. Currently, only checks
 -- axioms, but should check other aspects, too.
-lintGblEnv :: DynFlags -> TcGblEnv -> (Bag SDoc, Bag SDoc)
-lintGblEnv dflags tcg_env = lintAxioms dflags axioms
+lintGblEnv :: Logger -> DynFlags -> TcGblEnv -> TcM ()
+lintGblEnv logger dflags tcg_env =
+  liftIO $ lintAxioms logger dflags (text "TcGblEnv axioms") axioms
   where
     axioms = typeEnvCoAxioms (tcg_type_env tcg_env)
+
+-- | This is a mirror of Template Haskell's DocLoc, but the TH names are
+-- resolved to GHC names.
+data DocLoc = DeclDoc Name
+            | ArgDoc Name Int
+            | InstDoc Name
+            | ModuleDoc
+  deriving (Eq, Ord)
+
+-- | The current collection of docs that Template Haskell has built up via
+-- putDoc.
+type THDocs = Map DocLoc (HsDoc GhcRn)

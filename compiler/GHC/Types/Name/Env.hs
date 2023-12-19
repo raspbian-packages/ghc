@@ -5,7 +5,7 @@
 \section[NameEnv]{@NameEnv@: name environments}
 -}
 
-{-# LANGUAGE CPP #-}
+
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
@@ -16,26 +16,30 @@ module GHC.Types.Name.Env (
         -- ** Manipulating these environments
         mkNameEnv, mkNameEnvWith,
         emptyNameEnv, isEmptyNameEnv,
-        unitNameEnv, nameEnvElts,
+        unitNameEnv, nonDetNameEnvElts,
         extendNameEnv_C, extendNameEnv_Acc, extendNameEnv,
         extendNameEnvList, extendNameEnvList_C,
         filterNameEnv, anyNameEnv,
         plusNameEnv, plusNameEnv_C, plusNameEnv_CD, plusNameEnv_CD2, alterNameEnv,
         lookupNameEnv, lookupNameEnv_NF, delFromNameEnv, delListFromNameEnv,
         elemNameEnv, mapNameEnv, disjointNameEnv,
+        seqEltsNameEnv,
 
         DNameEnv,
 
         emptyDNameEnv,
+        isEmptyDNameEnv,
         lookupDNameEnv,
         delFromDNameEnv, filterDNameEnv,
         mapDNameEnv,
         adjustDNameEnv, alterDNameEnv, extendDNameEnv,
+        eltsDNameEnv, extendDNameEnv_C,
+        plusDNameEnv_C,
+        foldDNameEnv,
+        nonDetStrictFoldDNameEnv,
         -- ** Dependency analysis
         depAnal
     ) where
-
-#include "HsVersions.h"
 
 import GHC.Prelude
 
@@ -99,7 +103,7 @@ emptyNameEnv       :: NameEnv a
 isEmptyNameEnv     :: NameEnv a -> Bool
 mkNameEnv          :: [(Name,a)] -> NameEnv a
 mkNameEnvWith      :: (a -> Name) -> [a] -> NameEnv a
-nameEnvElts        :: NameEnv a -> [a]
+nonDetNameEnvElts  :: NameEnv a -> [a]
 alterNameEnv       :: (Maybe a-> Maybe a) -> NameEnv a -> Name -> NameEnv a
 extendNameEnv_C    :: (a->a->a) -> NameEnv a -> Name -> a -> NameEnv a
 extendNameEnv_Acc  :: (a->b->b) -> (a->b) -> NameEnv b -> Name -> a -> NameEnv b
@@ -120,8 +124,9 @@ filterNameEnv      :: (elt -> Bool) -> NameEnv elt -> NameEnv elt
 anyNameEnv         :: (elt -> Bool) -> NameEnv elt -> Bool
 mapNameEnv         :: (elt1 -> elt2) -> NameEnv elt1 -> NameEnv elt2
 disjointNameEnv    :: NameEnv a -> NameEnv a -> Bool
+seqEltsNameEnv     :: (elt -> ()) -> NameEnv elt -> ()
 
-nameEnvElts x         = eltsUFM x
+nonDetNameEnvElts x         = nonDetEltsUFM x
 emptyNameEnv          = emptyUFM
 isEmptyNameEnv        = isNullUFM
 unitNameEnv x y       = unitUFM x y
@@ -134,6 +139,7 @@ mkNameEnvWith f       = mkNameEnv . map (\a -> (f a, a))
 elemNameEnv x y          = elemUFM x y
 plusNameEnv x y          = plusUFM x y
 plusNameEnv_C f x y      = plusUFM_C f x y
+{-# INLINE plusNameEnv_CD #-}
 plusNameEnv_CD f x d y b = plusUFM_CD f x d y b
 plusNameEnv_CD2 f x y    = plusUFM_CD2 f x y
 extendNameEnv_C f x y z  = addToUFM_C f x y z
@@ -145,6 +151,7 @@ delListFromNameEnv x y  = delListFromUFM x y
 filterNameEnv x y       = filterUFM x y
 anyNameEnv f x          = foldUFM ((||) . f) False x
 disjointNameEnv x y     = disjointUFM x y
+seqEltsNameEnv seqElt x = seqEltsUFM seqElt x
 
 lookupNameEnv_NF env n = expectJust "lookupNameEnv_NF" (lookupNameEnv env n)
 
@@ -156,6 +163,9 @@ type DNameEnv a = UniqDFM Name a
 
 emptyDNameEnv :: DNameEnv a
 emptyDNameEnv = emptyUDFM
+
+isEmptyDNameEnv :: DNameEnv a -> Bool
+isEmptyDNameEnv = isNullUDFM
 
 lookupDNameEnv :: DNameEnv a -> Name -> Maybe a
 lookupDNameEnv = lookupUDFM
@@ -177,3 +187,19 @@ alterDNameEnv = alterUDFM
 
 extendDNameEnv :: DNameEnv a -> Name -> a -> DNameEnv a
 extendDNameEnv = addToUDFM
+
+extendDNameEnv_C :: (a -> a -> a) -> DNameEnv a -> Name -> a -> DNameEnv a
+extendDNameEnv_C = addToUDFM_C
+
+eltsDNameEnv :: DNameEnv a -> [a]
+eltsDNameEnv = eltsUDFM
+
+foldDNameEnv :: (a -> b -> b) -> b -> DNameEnv a -> b
+foldDNameEnv = foldUDFM
+
+plusDNameEnv_C :: (elt -> elt -> elt) -> DNameEnv elt -> DNameEnv elt -> DNameEnv elt
+plusDNameEnv_C = plusUDFM_C
+
+nonDetStrictFoldDNameEnv :: (a -> b -> b) -> b -> DNameEnv a -> b
+nonDetStrictFoldDNameEnv = nonDetStrictFoldUDFM
+

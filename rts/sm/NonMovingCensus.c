@@ -21,10 +21,12 @@
 // stopped. In this case is safe to look at active and current segments so we can
 // also collect statistics on live words.
 static struct NonmovingAllocCensus
-nonmovingAllocatorCensus_(struct NonmovingAllocator *alloc, bool collect_live_words)
+nonmovingAllocatorCensus_(uint32_t alloc_idx, bool collect_live_words)
 {
-    struct NonmovingAllocCensus census = {0, 0, 0, 0};
+    struct NonmovingAllocCensus census = {collect_live_words, 0, 0, 0, 0};
+    struct NonmovingAllocator *alloc = &nonmovingHeap.allocators[alloc_idx];
 
+    // filled segments
     for (struct NonmovingSegment *seg = alloc->filled;
          seg != NULL;
          seg = seg->link)
@@ -40,6 +42,7 @@ nonmovingAllocatorCensus_(struct NonmovingAllocator *alloc, bool collect_live_wo
         }
     }
 
+    // active segments
     for (struct NonmovingSegment *seg = alloc->active;
          seg != NULL;
          seg = seg->link)
@@ -47,7 +50,7 @@ nonmovingAllocatorCensus_(struct NonmovingAllocator *alloc, bool collect_live_wo
         census.n_active_segs++;
         unsigned int n = nonmovingSegmentBlockCount(seg);
         for (unsigned int i=0; i < n; i++) {
-            if (nonmovingGetMark(seg, i)) {
+            if (nonmovingGetMark(seg, i) == nonmovingMarkEpoch) {
                 StgClosure *c = (StgClosure *) nonmovingSegmentGetBlock(seg, i);
                 if (collect_live_words)
                     census.n_live_words += closure_sizeW(c);
@@ -56,9 +59,11 @@ nonmovingAllocatorCensus_(struct NonmovingAllocator *alloc, bool collect_live_wo
         }
     }
 
-    for (unsigned int cap=0; cap < n_capabilities; cap++)
+    // current segments
+    for (unsigned int cap_n=0; cap_n < getNumCapabilities(); cap_n++)
     {
-        struct NonmovingSegment *seg = alloc->current[cap];
+        Capability *cap = getCapability(cap_n);
+        struct NonmovingSegment *seg = cap->current_segments[alloc_idx];
         unsigned int n = nonmovingSegmentBlockCount(seg);
         for (unsigned int i=0; i < n; i++) {
             if (nonmovingGetMark(seg, i)) {
@@ -76,52 +81,74 @@ nonmovingAllocatorCensus_(struct NonmovingAllocator *alloc, bool collect_live_wo
  * all blocks in nonmoving heap are valid closures.
  */
 struct NonmovingAllocCensus
-nonmovingAllocatorCensusWithWords(struct NonmovingAllocator *alloc)
+nonmovingAllocatorCensusWithWords(uint32_t alloc_idx)
 {
-    return nonmovingAllocatorCensus_(alloc, true);
+    return nonmovingAllocatorCensus_(alloc_idx, true);
 }
 
 struct NonmovingAllocCensus
-nonmovingAllocatorCensus(struct NonmovingAllocator *alloc)
+nonmovingAllocatorCensus(uint32_t alloc_idx)
 {
-    return nonmovingAllocatorCensus_(alloc, false);
+    return nonmovingAllocatorCensus_(alloc_idx, false);
 }
 
 
-void nonmovingPrintAllocatorCensus()
+static void print_alloc_census(int i, struct NonmovingAllocCensus census)
 {
-    if (!RtsFlags.GcFlags.useNonmoving)
-        return;
+    uint32_t blk_size = 1 << (i + NONMOVING_ALLOCA0);
+    int sz_min = 1 << (i + NONMOVING_ALLOCA0 - 1);
+    int sz_max = 1 << (i + NONMOVING_ALLOCA0);
+    (void) sz_min; (void) sz_max;
 
-    for (int i=0; i < NONMOVING_ALLOCA_CNT; i++) {
-        struct NonmovingAllocCensus census =
-            nonmovingAllocatorCensus(nonmovingHeap.allocators[i]);
-
-        uint32_t blk_size = 1 << (i + NONMOVING_ALLOCA0);
+    if (census.collected_live_words) {
         // We define occupancy as the fraction of space that is used for useful
         // data (that is, live and not slop).
         double occupancy = 100.0 * census.n_live_words * sizeof(W_)
             / (census.n_live_blocks * blk_size);
         if (census.n_live_blocks == 0) occupancy = 100;
         (void) occupancy; // silence warning if !DEBUG
-        debugTrace(DEBUG_nonmoving_gc, "Allocator %d (%d bytes - %d bytes): "
-                   "%d active segs, %d filled segs, %d live blocks, %d live words "
-                   "(%2.1f%% occupancy)",
-                   i, 1 << (i + NONMOVING_ALLOCA0 - 1), 1 << (i + NONMOVING_ALLOCA0),
-                   census.n_active_segs, census.n_filled_segs, census.n_live_blocks, census.n_live_words,
+        debugTrace(DEBUG_nonmoving_gc,
+                   "Allocator %d (%d bytes - %d bytes): "
+                   "%"PRIu32" active segs, %"PRIu32" filled segs, %"PRIu32" live blocks, "
+                   "%"PRIu32" live words (%2.1f%% occupancy)",
+                   i, sz_min, sz_max,
+                   census.n_active_segs,
+                   census.n_filled_segs,
+                   census.n_live_blocks,
+                   census.n_live_words,
                    occupancy);
+    } else {
+        debugTrace(DEBUG_nonmoving_gc,
+                   "Allocator %d (%d bytes - %d bytes): "
+                   "%"PRIu32" active segs, %"PRIu32" filled segs, %"PRIu32" live blocks",
+                   i, sz_min, sz_max,
+                   census.n_active_segs,
+                   census.n_filled_segs,
+                   census.n_live_blocks);
     }
 }
 
-void nonmovingTraceAllocatorCensus()
+void nonmovingPrintAllocatorCensus(bool collect_live_words)
+{
+    if (!RtsFlags.GcFlags.useNonmoving)
+        return;
+
+    for (int i=0; i < NONMOVING_ALLOCA_CNT; i++) {
+        struct NonmovingAllocCensus census =
+            nonmovingAllocatorCensus_(i, collect_live_words);
+
+        print_alloc_census(i, census);
+    }
+}
+
+void nonmovingTraceAllocatorCensus(void)
 {
 #if defined(TRACING)
     if (!RtsFlags.GcFlags.useNonmoving && !TRACE_nonmoving_gc)
         return;
 
     for (int i=0; i < NONMOVING_ALLOCA_CNT; i++) {
-        const struct NonmovingAllocCensus census =
-            nonmovingAllocatorCensus(nonmovingHeap.allocators[i]);
+        const struct NonmovingAllocCensus census = nonmovingAllocatorCensus(i);
         const uint32_t log_blk_size = i + NONMOVING_ALLOCA0;
         traceNonmovingHeapCensus(log_blk_size, &census);
     }

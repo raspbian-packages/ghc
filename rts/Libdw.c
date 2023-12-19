@@ -75,7 +75,7 @@ void libdwFree(LibdwSession *session) {
 }
 
 // Create a libdw session with DWARF information for all loaded modules
-LibdwSession *libdwInit() {
+LibdwSession *libdwInit(void) {
     LibdwSession *session = stgCallocBytes(1, sizeof(LibdwSession),
                                            "libdwInit");
     // Initialize ELF library
@@ -95,7 +95,7 @@ LibdwSession *libdwInit() {
     session->dwfl = dwfl_begin (&proc_callbacks);
     if (session->dwfl == NULL) {
         sysErrorBelch("dwfl_begin failed: %s", dwfl_errmsg(dwfl_errno()));
-        free(session);
+        stgFree(session);
         return NULL;
     }
 
@@ -122,7 +122,7 @@ LibdwSession *libdwInit() {
 
  fail:
     dwfl_end(session->dwfl);
-    free(session);
+    stgFree(session);
     return NULL;
 }
 
@@ -133,6 +133,11 @@ int libdwLookupLocation(LibdwSession *session, Location *frame,
     Dwfl_Module *mod = dwfl_addrmodule(session->dwfl, addr);
     if (mod == NULL)
         return 1;
+    // avoid unaligned pointer value
+    // Using &frame->object_file as argument to dwfl_module_info leads to
+    //
+    //   error: taking address of packed member of ‘struct Location_’ may result in an unaligned pointer value [-Werror=address-of-packed-member]
+    //
     void *object_file = &frame->object_file;
     dwfl_module_info(mod, NULL, NULL, NULL, NULL, NULL,
                      object_file, NULL);
@@ -189,7 +194,7 @@ int libdwForEachFrameOutwards(Backtrace *bt,
             if (res != 0) break;
         }
     }
-    free(chunks);
+    stgFree(chunks);
     return res;
 }
 

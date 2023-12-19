@@ -1,5 +1,7 @@
 {-# LANGUAGE Trustworthy #-}
 {-# LANGUAGE NoImplicitPrelude #-}
+{-# OPTIONS_HADDOCK print-explicit-runtime-reps #-}
+  -- Show the levity-polymorphic signature of '$'
 
 -----------------------------------------------------------------------------
 -- |
@@ -9,7 +11,7 @@
 -- License     :  BSD-style (see the LICENSE file in the distribution)
 --
 -- Maintainer  :  libraries@haskell.org
--- Stability   :  experimental
+-- Stability   :  stable
 -- Portability :  portable
 --
 -- Simple combinators working solely on and with functions.

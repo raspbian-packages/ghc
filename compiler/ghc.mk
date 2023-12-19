@@ -16,24 +16,8 @@
 # The 'echo' commands simply spit the values of various make variables
 # into Config.hs, whence they can be compiled and used by GHC itself
 
-# This is just to avoid generating a warning when generating deps
-# involving RtsFlags.h
-compiler_stage1_MKDEPENDC_OPTS = -DMAKING_GHC_BUILD_SYSTEM_DEPENDENCIES
-compiler_stage2_MKDEPENDC_OPTS = -DMAKING_GHC_BUILD_SYSTEM_DEPENDENCIES
-compiler_stage3_MKDEPENDC_OPTS = -DMAKING_GHC_BUILD_SYSTEM_DEPENDENCIES
-
 compiler_stage1_C_FILES_NODEPS = compiler/cbits/cutils.c
 
-# This package doesn't pass the Cabal checks because include-dirs
-# points outside the source directory. This isn't a real problem, so
-# we just skip the check.
-compiler_NO_CHECK = YES
-
-# We need to decrement the 1-indexed compiler stage to be the 0-indexed stage
-# we use everwhere else.
-dec1 = 0
-dec2 = 1
-dec3 = 2
 # TODO(@Ericson2314) Get rid of compiler-specific stage indices. I think the
 # argument was stage n ghc is used to build stage n everything else, but I
 # don't buy that argument.
@@ -41,15 +25,8 @@ dec3 = 2
 ifneq "$(BINDIST)" "YES"
 
 $(foreach n,1 2 3, \
-    $(eval compiler/stage$n/package-data.mk : $(includes_$(dec$n)_H_PLATFORM)) \
-    $(eval compiler/stage$n/package-data.mk : $(includes_$(dec$n)_H_CONFIG)) \
-  )
-
-$(foreach n,1 2 3, \
     $(eval compiler/stage$n/package-data.mk : compiler/stage$n/build/GHC/Settings/Config.hs) \
-    $(eval compiler/stage$n/build/PlatformConstants.o : $(includes_GHCCONSTANTS_HASKELL_TYPE)) \
-    $(eval compiler/stage$n/build/GHC/Driver/Session.o: $(includes_GHCCONSTANTS_HASKELL_EXPORTS)) \
-    $(eval compiler/stage$n/build/GHC/Driver/Session.o: $(includes_GHCCONSTANTS_HASKELL_WRAPPERS)) \
+    $(eval compiler/stage$n/build/GHC/Platform/Constants.o: compiler/stage$n/build/GHC/Platform/Constants.hs) \
   )
 endif
 
@@ -66,7 +43,6 @@ define compilerConfig
 compiler/stage$1/build/GHC/Settings/Config.hs : mk/config.mk mk/project.mk | $$$$(dir $$$$@)/.
 	$$(call removeFiles,$$@)
 	@echo 'Creating $$@ ... '
-	@echo '{-# LANGUAGE CPP #-}'                                        >> $$@
 	@echo 'module GHC.Settings.Config'                                  >> $$@
 	@echo '  ( module GHC.Version'                                      >> $$@
 	@echo '  , cBuildPlatformString'                                    >> $$@
@@ -95,11 +71,14 @@ compiler/stage$1/build/GHC/Settings/Config.hs : mk/config.mk mk/project.mk | $$$
 	@echo 'cStage                :: String'                             >> $$@
 	@echo 'cStage                = show ($1 :: Int)'                    >> $$@
 	@echo done.
+
+compiler/stage$1/build/GHC/Platform/Constants.hs : $$(deriveConstants_INPLACE) | $$$$(dir $$$$@)/.
+	$$< --gen-haskell-type -o $$@
 endef
 
-$(eval $(call compilerConfig,0))
 $(eval $(call compilerConfig,1))
 $(eval $(call compilerConfig,2))
+$(eval $(call compilerConfig,3))
 
 # ----------------------------------------------------------------------------
 #		Generate supporting stuff for GHC/Builtin/PrimOps.hs
@@ -129,12 +108,8 @@ PRIMOP_BITS_STAGE3 = $(addprefix compiler/stage3/build/,$(PRIMOP_BITS_NAMES))
 define preprocessCompilerFiles
 # $1 = compiler stage (build system stage + 1)
 compiler/stage$1/build/primops.txt: \
-		compiler/GHC/Builtin/primops.txt.pp \
-		$(includes_$(dec$1)_H_CONFIG) \
-		$(includes_$(dec$1)_H_PLATFORM)
-	$$(HS_CPP) -P $$(compiler_CPP_OPTS) \
-		-Icompiler/stage$1 \
-		-I$(BUILD_$(dec$1)_INCLUDE_DIR) \
+		compiler/GHC/Builtin/primops.txt.pp
+	$$(HS_CPP) -P \
 		-x c $$< | grep -v '^#pragma GCC' > $$@
 
 compiler/stage$1/build/primop-data-decl.hs-incl: compiler/stage$1/build/primops.txt $$$$(genprimopcode_INPLACE)
@@ -184,44 +159,13 @@ $(eval $(call preprocessCompilerFiles,3))
 # -----------------------------------------------------------------------------
 # Configuration
 
-compiler_stage1_CONFIGURE_OPTS += --flags=stage1
-compiler_stage2_CONFIGURE_OPTS += --flags=stage2
-compiler_stage3_CONFIGURE_OPTS += --flags=stage3
-
-ifeq "$(GhcThreaded)" "YES"
-# We pass THREADED_RTS to the stage2 C files so that cbits/genSym.c will bring
-# the threaded version of atomic_inc() into scope.
-compiler_stage2_CONFIGURE_OPTS += --ghc-option=-optc-DTHREADED_RTS
-endif
-
-# If the bootstrapping GHC supplies the threaded RTS, then we can have a
-# threaded stage 1 too.
-ifeq "$(GhcThreadedRts)" "YES"
-compiler_stage1_CONFIGURE_OPTS += --ghc-option=-optc-DTHREADED_RTS
-endif
-
 ifeq "$(GhcWithInterpreter)" "YES"
-compiler_stage2_CONFIGURE_OPTS += --flags=ghci
-
-# Should the debugger commands be enabled?
-ifeq "$(GhciWithDebugger)" "YES"
-compiler_stage2_CONFIGURE_OPTS += --ghc-option=-DDEBUGGER
-endif
+compiler_stage2_CONFIGURE_OPTS += --flags=internal-interpreter
 
 endif
 
 ifeq "$(TargetOS_CPP)" "openbsd"
 compiler_CONFIGURE_OPTS += --ld-options=-E
-endif
-
-ifeq "$(GhcUnregisterised)" "NO"
-else
-compiler_CONFIGURE_OPTS += --ghc-option=-DNO_REGS
-endif
-
-ifneq "$(GhcWithSMP)" "YES"
-compiler_CONFIGURE_OPTS += --ghc-option=-DNOSMP
-compiler_CONFIGURE_OPTS += --ghc-option=-optc-DNOSMP
 endif
 
 ifeq "$(WITH_TERMINFO)" "NO"
@@ -298,20 +242,6 @@ $(eval $(call build-package,compiler,stage1,0))
 $(eval $(call build-package,compiler,stage2,1))
 $(eval $(call build-package,compiler,stage3,2))
 
-# We only want to turn keepCAFs on if we will be loading dynamic
-# Haskell libraries with GHCi. We therefore filter the object file
-# out for non-dynamic ways.
-define keepCAFsForGHCiDynOnly
-# $1 = stage
-# $2 = way
-ifeq "$$(findstring dyn, $2)" ""
-compiler_stage$1_$2_C_OBJS := $$(filter-out %/keepCAFsForGHCi.$$($2_osuf),$$(compiler_stage$1_$2_C_OBJS))
-endif
-endef
-$(foreach w,$(compiler_stage1_WAYS),$(eval $(call keepCAFsForGHCiDynOnly,1,$w)))
-$(foreach w,$(compiler_stage2_WAYS),$(eval $(call keepCAFsForGHCiDynOnly,2,$w)))
-$(foreach w,$(compiler_stage3_WAYS),$(eval $(call keepCAFsForGHCiDynOnly,3,$w)))
-
 # after build-package, because that adds --enable-library-for-ghci
 # to compiler_stage*_CONFIGURE_OPTS:
 # We don't build the GHCi library for the ghc package. We can load it
@@ -323,16 +253,6 @@ compiler_stage2_CONFIGURE_OPTS += --disable-library-for-ghci
 compiler_stage3_CONFIGURE_OPTS += --disable-library-for-ghci
 
 # after build-package, because that sets compiler_stage1_HC_OPTS:
-
-compiler_CPP_OPTS += $(addprefix -I,$(GHC_INCLUDE_DIRS))
-$(foreach n,1 2 3,$(eval compiler_stage$n_CPP_OPTS += -I$(BUILD_$(dec$n)_INCLUDE_DIR)))
-compiler_CPP_OPTS += ${GhcCppOpts}
-
-# We add these paths to the Haskell compiler's #include search path list since
-# we must avoid #including files by paths relative to the source file as Hadrian
-# moves the build artifacts out of the source tree. See #8040.
-compiler_HC_OPTS += $(addprefix -I,$(GHC_INCLUDE_DIRS))
-$(foreach n,1 2 3,$(eval compiler_stage$n_HC_OPTS += -I$(BUILD_$(dec$n)_INCLUDE_DIR)))
 
 ifeq "$(V)" "0"
 compiler_stage1_HC_OPTS += $(filter-out -Rghc-timing,$(GhcHcOpts)) $(GhcStage1HcOpts)
@@ -346,16 +266,6 @@ endif
 
 ifneq "$(BINDIST)" "YES"
 
-$(compiler_stage1_depfile_haskell) : $(includes_0_H_CONFIG) $(includes_0_H_PLATFORM)
-$(compiler_stage2_depfile_haskell) : $(includes_1_H_CONFIG) $(includes_1_H_PLATFORM)
-$(compiler_stage3_depfile_haskell) : $(includes_2_H_CONFIG) $(includes_2_H_PLATFORM)
-
-COMPILER_INCLUDES_DEPS += $(includes_GHCCONSTANTS)
-COMPILER_INCLUDES_DEPS += $(includes_GHCCONSTANTS_HASKELL_TYPE)
-COMPILER_INCLUDES_DEPS += $(includes_GHCCONSTANTS_HASKELL_WRAPPERS)
-COMPILER_INCLUDES_DEPS += $(includes_GHCCONSTANTS_HASKELL_EXPORTS)
-COMPILER_INCLUDES_DEPS += $(includes_DERIVEDCONSTANTS)
-
 $(compiler_stage1_depfile_haskell) : $(COMPILER_INCLUDES_DEPS) $(PRIMOP_BITS_STAGE1)
 $(compiler_stage2_depfile_haskell) : $(COMPILER_INCLUDES_DEPS) $(PRIMOP_BITS_STAGE2)
 $(compiler_stage3_depfile_haskell) : $(COMPILER_INCLUDES_DEPS) $(PRIMOP_BITS_STAGE3)
@@ -366,14 +276,5 @@ $(foreach way,$(compiler_stage2_WAYS),\
       compiler/stage2/build/PrimOp.$($(way)_osuf)) : $(PRIMOP_BITS_STAGE2)
 $(foreach way,$(compiler_stage3_WAYS),\
       compiler/stage3/build/PrimOp.$($(way)_osuf)) : $(PRIMOP_BITS_STAGE3)
-
-
-# GHC itself doesn't know about the above dependencies, so we have to
-# switch off the recompilation checker for that module:
-compiler/prelude/PrimOp_HC_OPTS  += -fforce-recomp
-
-ifeq "$(DYNAMIC_GHC_PROGRAMS)" "YES"
-compiler/utils/Util_HC_OPTS += -DDYNAMIC_GHC_PROGRAMS
-endif
 
 endif

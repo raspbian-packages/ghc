@@ -1,9 +1,17 @@
-packages: Cabal/ cabal-testsuite/ cabal-install/ solver-benchmarks/
-tests: True
+packages: Cabal-syntax/
+packages: Cabal/
+packages: cabal-testsuite/
+packages: cabal-install/
+packages: solver-benchmarks/
 
-packages: Cabal/Cabal-QuickCheck/
-packages: Cabal/Cabal-tree-diff
-packages: Cabal/Cabal-described
+packages: cabal-install-solver/
+packages: Cabal-QuickCheck/
+packages: Cabal-tree-diff
+packages: Cabal-described
+packages: Cabal-tests
+packages: cabal-benchmarks
+
+tests: True
 
 -- avoiding extra dependencies
 constraints: rere -rere-cfg
@@ -11,6 +19,8 @@ constraints: these -assoc
 
 write-ghc-environment-files: never
 
+package Cabal-syntax
+  ghc-options: -Werror -fno-ignore-asserts
 package Cabal
   ghc-options: -Werror -fno-ignore-asserts
 package cabal-testsuite

@@ -22,7 +22,7 @@
 
 {-
 Note [Differences between libraries/pretty and compiler/GHC/Utils/Ppr.hs]
-
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 For historical reasons, there are two different copies of `Pretty` in the GHC
 source tree:
  * `libraries/pretty` is a submodule containing
@@ -71,7 +71,7 @@ module GHC.Utils.Ppr (
         -- * Constructing documents
 
         -- ** Converting values into documents
-        char, text, ftext, ptext, ztext, sizedText, zeroWidthText,
+        char, text, ftext, ptext, ztext, sizedText, zeroWidthText, emptyText,
         int, integer, float, double, rational, hex,
 
         -- ** Simple derived documents
@@ -309,6 +309,12 @@ text s = textBeside_ (Str s) (length s) Empty
     forall p n. text (unpackNBytes# p n) = ptext (PtrString (Ptr p) (I# n))
   #-}
 
+-- Empty strings are desugared into [] (not "unpackCString#..."), hence they are
+-- not matched by the text/str rule above.
+{-# RULES "text/[]"
+    text [] = emptyText
+  #-}
+
 ftext :: FastString -> Doc
 ftext s = textBeside_ (PStr s) (lengthFS s) Empty
 
@@ -326,6 +332,12 @@ sizedText l s = textBeside_ (Str s) l Empty
 -- such as a HTML or Latex tags
 zeroWidthText :: String -> Doc
 zeroWidthText = sizedText 0
+
+-- | Empty text (one line high but no width). (@emptyText = text ""@)
+emptyText :: Doc
+emptyText = sizedText 0 []
+  -- defined as a CAF. Sharing occurs especially via the text/[] rule above.
+  -- Every use of `text ""` in user code should be replaced with this.
 
 -- | The empty document, with no height and no width.
 -- 'empty' is the identity for '<>', '<+>', '$$' and '$+$', and anywhere
@@ -429,12 +441,12 @@ braces p       = char '{' <> p <> char '}'
 
 {-
 Note [Print Hexadecimal Literals]
-
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Relevant discussions:
  * Phabricator: https://phabricator.haskell.org/D4465
  * GHC Trac: https://gitlab.haskell.org/ghc/ghc/issues/14872
 
-There is a flag `-dword-hex-literals` that causes literals of
+There is a flag `-dhex-word-literals` that causes literals of
 type `Word#` or `Word64#` to be displayed in hexadecimal instead
 of decimal when dumping GHC core. It also affects the presentation
 of these in GHC's error messages. Additionally, the hexadecimal
@@ -917,15 +929,25 @@ data Style
           , ribbonsPerLine :: Float -- ^ Ratio of line length to ribbon length
           }
 
--- | The default style (@mode=PageMode, lineLength=100, ribbonsPerLine=1.5@).
+-- | The default style (@mode=PageMode False, lineLength=100, ribbonsPerLine=1.5@).
 style :: Style
-style = Style { lineLength = 100, ribbonsPerLine = 1.5, mode = PageMode }
+style = Style { lineLength = 100, ribbonsPerLine = 1.5, mode = PageMode False }
 
 -- | Rendering mode.
-data Mode = PageMode     -- ^ Normal
+data Mode = PageMode { asciiSpace :: Bool }    -- ^ Normal
           | ZigZagMode   -- ^ With zig-zag cuts
           | LeftMode     -- ^ No indentation, infinitely long lines
           | OneLineMode  -- ^ All on one line
+
+-- | Can we output an ascii space character for spaces?
+--   Mostly true, but not for e.g. UTF16
+--   See Note [putSpaces optimizations] for why we bother
+--   to track this.
+hasAsciiSpace :: Mode -> Bool
+hasAsciiSpace mode =
+  case mode of
+    PageMode asciiSpace -> asciiSpace
+    _ -> False
 
 -- | Render the @Doc@ to a String using the given @Style@.
 renderStyle :: Style -> Doc -> String
@@ -1034,6 +1056,20 @@ printDoc :: Mode -> Int -> Handle -> Doc -> IO ()
 -- printDoc adds a newline to the end
 printDoc mode cols hdl doc = printDoc_ mode cols hdl (doc $$ text "")
 
+{- Note [putSpaces optimizations]
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When using dump flags a lot of what we are dumping ends up being whitespace.
+This is especially true for Core/Stg dumps. Enough so that it's worth optimizing.
+
+Especially in the common case of writing to an UTF8 or similarly encoded file
+where space is equal to ascii space we use hPutBuf to write a preallocated
+buffer to the file. This avoids a fair bit of allocation.
+
+For other cases we fall back to the old and slow path for simplicity.
+
+-}
+
 printDoc_ :: Mode -> Int -> Handle -> Doc -> IO ()
 -- printDoc_ does not add a newline at the end, so that
 -- successive calls can output stuff on the same line
@@ -1051,9 +1087,27 @@ printDoc_ mode pprCols hdl doc
                           -- the I/O library's encoding layer. (#3398)
     put (ZStr s)   next = hPutFZS  hdl s >> next
     put (LStr s)   next = hPutPtrString hdl s >> next
-    put (RStr n c) next = hPutStr hdl (replicate n c) >> next
+    put (RStr n c) next
+      | c == ' '
+      = putSpaces n >> next
+      | otherwise
+      = hPutStr hdl (replicate n c) >> next
+    putSpaces n
+      -- If we use ascii spaces we are allowed to use hPutBuf
+      -- See Note [putSpaces optimizations]
+      | hasAsciiSpace mode
+      , n <= 100
+      = hPutBuf hdl (Ptr spaces') n
+      | hasAsciiSpace mode
+      , n > 100
+      = hPutBuf hdl (Ptr spaces') 100 >> putSpaces (n-100)
+
+      | otherwise = hPutStr hdl (replicate n ' ')
 
     done = return () -- hPutChar hdl '\n'
+    -- 100 spaces, so we avoid the allocation of replicate n ' '
+    spaces' = "                                                                                                    "#
+
 
   -- some versions of hPutBuf will barf if the length is zero
 hPutPtrString :: Handle -> PtrString -> IO ()

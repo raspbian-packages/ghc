@@ -1,4 +1,5 @@
 {-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE TupleSections #-}
 -- | Our extended FCode monad.
 
 -- We add a mapping from names to CmmExpr, to support local variable names in
@@ -32,12 +33,16 @@ module GHC.StgToCmm.ExtCode (
         emit, emitLabel, emitAssign, emitStore,
         getCode, getCodeR, getCodeScoped,
         emitOutOfLine,
-        withUpdFrameOff, getUpdFrameOff
+        withUpdFrameOff, getUpdFrameOff,
+        getProfile, getPlatform, getContext
 )
 
 where
 
 import GHC.Prelude
+
+import GHC.Platform
+import GHC.Platform.Profile
 
 import qualified GHC.StgToCmm.Monad as F
 import GHC.StgToCmm.Monad (FCode, newUnique)
@@ -47,7 +52,6 @@ import GHC.Cmm.CLabel
 import GHC.Cmm.Graph
 
 import GHC.Cmm.BlockId
-import GHC.Driver.Session
 import GHC.Data.FastString
 import GHC.Unit.Module
 import GHC.Types.Unique.FM
@@ -55,6 +59,7 @@ import GHC.Types.Unique
 import GHC.Types.Unique.Supply
 
 import Control.Monad (ap)
+import GHC.Utils.Outputable (SDocContext)
 
 -- | The environment contains variable definitions or blockids.
 data Named
@@ -97,10 +102,14 @@ instance MonadUnique CmmParse where
     u <- getUniqueM
     return (decls, u)
 
-instance HasDynFlags CmmParse where
-    getDynFlags = EC (\_ _ d -> do dflags <- getDynFlags
-                                   return (d, dflags))
+getProfile :: CmmParse Profile
+getProfile = EC (\_ _ d -> (d,) <$> F.getProfile)
 
+getPlatform :: CmmParse Platform
+getPlatform = EC (\_ _ d -> (d,) <$> F.getPlatform)
+
+getContext :: CmmParse SDocContext
+getContext = EC (\_ _ d -> (d,) <$> F.getContext)
 
 -- | Takes the variable declarations and imports from the monad
 --      and makes an environment, which is looped back into the computation.
@@ -114,7 +123,6 @@ loopDecls (EC fcode) =
         (_, a) <- F.fixC $ \ ~(decls, _) ->
           fcode c (addListToUFM e decls) globalDecls
         return (globalDecls, a)
-
 
 -- | Get the current environment from the monad.
 getEnv :: CmmParse Env
@@ -223,8 +231,12 @@ emitLabel = code . F.emitLabel
 emitAssign :: CmmReg  -> CmmExpr -> CmmParse ()
 emitAssign l r = code (F.emitAssign l r)
 
-emitStore :: CmmExpr  -> CmmExpr -> CmmParse ()
-emitStore l r = code (F.emitStore l r)
+emitStore :: Maybe MemoryOrdering -> CmmExpr  -> CmmExpr -> CmmParse ()
+emitStore (Just mem_ord) l r = do
+  platform <- getPlatform
+  let w = typeWidth $ cmmExprType platform r
+  emit $ mkUnsafeCall (PrimTarget $ MO_AtomicWrite w mem_ord) [] [l,r]
+emitStore Nothing l r = code (F.emitStore l r)
 
 getCode :: CmmParse a -> CmmParse CmmAGraph
 getCode (EC ec) = EC $ \c e s -> do

@@ -28,8 +28,6 @@ module GHC.Types.Name.Occurrence (
         -- * The 'NameSpace' type
         NameSpace, -- Abstract
 
-        nameSpacesRelated,
-
         -- ** Construction
         -- $real_vs_source_data_constructors
         tcName, clsName, tcClsName, dataName, varName,
@@ -52,6 +50,7 @@ module GHC.Types.Name.Occurrence (
         mkDFunOcc,
         setOccNameSpace,
         demoteOccName,
+        promoteOccName,
         HasOccName(..),
 
         -- ** Derived 'OccName's
@@ -82,16 +81,16 @@ module GHC.Types.Name.Occurrence (
         -- * The 'OccEnv' type
         OccEnv, emptyOccEnv, unitOccEnv, extendOccEnv, mapOccEnv,
         lookupOccEnv, mkOccEnv, mkOccEnv_C, extendOccEnvList, elemOccEnv,
-        occEnvElts, foldOccEnv, plusOccEnv, plusOccEnv_C, extendOccEnv_C,
+        nonDetOccEnvElts, foldOccEnv, plusOccEnv, plusOccEnv_C, extendOccEnv_C,
         extendOccEnv_Acc, filterOccEnv, delListFromOccEnv, delFromOccEnv,
-        alterOccEnv, pprOccEnv,
+        alterOccEnv, minusOccEnv, minusOccEnv_C, pprOccEnv,
 
         -- * The 'OccSet' type
         OccSet, emptyOccSet, unitOccSet, mkOccSet, extendOccSet,
         extendOccSetList,
         unionOccSets, unionManyOccSets, minusOccSet, elemOccSet,
         isEmptyOccSet, intersectOccSet,
-        filterOccSet,
+        filterOccSet, occSetToEnv,
 
         -- * Tidying up
         TidyOccEnv, emptyTidyOccEnv, initTidyOccEnv,
@@ -105,6 +104,7 @@ import GHC.Prelude
 
 import GHC.Utils.Misc
 import GHC.Types.Unique
+import GHC.Builtin.Uniques
 import GHC.Types.Unique.FM
 import GHC.Types.Unique.Set
 import GHC.Data.FastString
@@ -132,6 +132,7 @@ data NameSpace = VarName        -- Variables, including "real" data constructors
                deriving( Eq, Ord )
 
 -- Note [Data Constructors]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~
 -- see also: Note [Data Constructor Naming] in GHC.Core.DataCon
 --
 -- $real_vs_source_data_constructors
@@ -207,12 +208,20 @@ pprNameSpaceBrief TcClsName = text "tc"
 
 -- demoteNameSpace lowers the NameSpace if possible.  We can not know
 -- in advance, since a TvName can appear in an HsTyVar.
--- See Note [Demotion] in GHC.Rename.Env
+-- See Note [Demotion] in GHC.Rename.Env.
 demoteNameSpace :: NameSpace -> Maybe NameSpace
 demoteNameSpace VarName = Nothing
 demoteNameSpace DataName = Nothing
 demoteNameSpace TvName = Nothing
 demoteNameSpace TcClsName = Just DataName
+
+-- promoteNameSpace promotes the NameSpace as follows.
+-- See Note [Promotion] in GHC.Rename.Env.
+promoteNameSpace :: NameSpace -> Maybe NameSpace
+promoteNameSpace DataName = Just TcClsName
+promoteNameSpace VarName = Just TvName
+promoteNameSpace TcClsName = Nothing
+promoteNameSpace TvName = Nothing
 
 {-
 ************************************************************************
@@ -238,7 +247,7 @@ instance Eq OccName where
 instance Ord OccName where
         -- Compares lexicographically, *not* by Unique of the string
     compare (OccName sp1 s1) (OccName sp2 s2)
-        = (s1  `compare` s2) `thenCmp` (sp1 `compare` sp2)
+        = (s1  `lexicalCompareFS` s2) `thenCmp` (sp1 `compare` sp2)
 
 instance Data OccName where
   -- don't traverse?
@@ -335,24 +344,18 @@ mkClsOccFS :: FastString -> OccName
 mkClsOccFS = mkOccNameFS clsName
 
 -- demoteOccName lowers the Namespace of OccName.
--- see Note [Demotion]
+-- See Note [Demotion] in GHC.Rename.Env.
 demoteOccName :: OccName -> Maybe OccName
 demoteOccName (OccName space name) = do
   space' <- demoteNameSpace space
   return $ OccName space' name
 
--- Name spaces are related if there is a chance to mean the one when one writes
--- the other, i.e. variables <-> data constructors and type variables <-> type constructors
-nameSpacesRelated :: NameSpace -> NameSpace -> Bool
-nameSpacesRelated ns1 ns2 = ns1 == ns2 || otherNameSpace ns1 == ns2
-
-otherNameSpace :: NameSpace -> NameSpace
-otherNameSpace VarName = DataName
-otherNameSpace DataName = VarName
-otherNameSpace TvName = TcClsName
-otherNameSpace TcClsName = TvName
-
-
+-- promoteOccName promotes the NameSpace of OccName.
+-- See Note [Promotion] in GHC.Rename.Env.
+promoteOccName :: OccName -> Maybe OccName
+promoteOccName (OccName space name) = do
+  space' <- promoteNameSpace space
+  return $ OccName space' name
 
 {- | Other names in the compiler add additional information to an OccName.
 This class provides a consistent way to access the underlying OccName. -}
@@ -399,7 +402,7 @@ mkOccEnv     :: [(OccName,a)] -> OccEnv a
 mkOccEnv_C   :: (a -> a -> a) -> [(OccName,a)] -> OccEnv a
 elemOccEnv   :: OccName -> OccEnv a -> Bool
 foldOccEnv   :: (a -> b -> b) -> b -> OccEnv a -> b
-occEnvElts   :: OccEnv a -> [a]
+nonDetOccEnvElts   :: OccEnv a -> [a]
 extendOccEnv_C :: (a->a->a) -> OccEnv a -> OccName -> a -> OccEnv a
 extendOccEnv_Acc :: (a->b->b) -> (a->b) -> OccEnv b -> OccName -> a -> OccEnv b
 plusOccEnv     :: OccEnv a -> OccEnv a -> OccEnv a
@@ -409,6 +412,10 @@ delFromOccEnv      :: OccEnv a -> OccName -> OccEnv a
 delListFromOccEnv :: OccEnv a -> [OccName] -> OccEnv a
 filterOccEnv       :: (elt -> Bool) -> OccEnv elt -> OccEnv elt
 alterOccEnv        :: (Maybe elt -> Maybe elt) -> OccEnv elt -> OccName -> OccEnv elt
+minusOccEnv :: OccEnv a -> OccEnv b -> OccEnv a
+
+-- | Alters (replaces or removes) those elements of the map that are mentioned in the second map
+minusOccEnv_C :: (a -> b -> Maybe a) -> OccEnv a -> OccEnv b -> OccEnv a
 
 emptyOccEnv      = A emptyUFM
 unitOccEnv x y = A $ unitUFM x y
@@ -418,7 +425,7 @@ lookupOccEnv (A x) y = lookupUFM x y
 mkOccEnv     l    = A $ listToUFM l
 elemOccEnv x (A y)       = elemUFM x y
 foldOccEnv a b (A c)     = foldUFM a b c
-occEnvElts (A x)         = eltsUFM x
+nonDetOccEnvElts (A x)         = nonDetEltsUFM x
 plusOccEnv (A x) (A y)   = A $ plusUFM x y
 plusOccEnv_C f (A x) (A y)       = A $ plusUFM_C f x y
 extendOccEnv_C f (A x) y z   = A $ addToUFM_C f x y z
@@ -429,6 +436,8 @@ delFromOccEnv (A x) y    = A $ delFromUFM x y
 delListFromOccEnv (A x) y  = A $ delListFromUFM x y
 filterOccEnv x (A y)       = A $ filterUFM x y
 alterOccEnv fn (A y) k     = A $ alterUFM fn y k
+minusOccEnv (A x) (A y) = A $ minusUFM x y
+minusOccEnv_C fn (A x) (A y) = A $ minusUFM_C fn x y
 
 instance Outputable a => Outputable (OccEnv a) where
     ppr x = pprOccEnv ppr x
@@ -450,6 +459,8 @@ elemOccSet        :: OccName -> OccSet -> Bool
 isEmptyOccSet     :: OccSet -> Bool
 intersectOccSet   :: OccSet -> OccSet -> OccSet
 filterOccSet      :: (OccName -> Bool) -> OccSet -> OccSet
+-- | Converts an OccSet to an OccEnv (operationally the identity)
+occSetToEnv       :: OccSet -> OccEnv OccName
 
 emptyOccSet       = emptyUniqSet
 unitOccSet        = unitUniqSet
@@ -463,6 +474,7 @@ elemOccSet        = elementOfUniqSet
 isEmptyOccSet     = isEmptyUniqSet
 intersectOccSet   = intersectUniqSets
 filterOccSet      = filterUniqSet
+occSetToEnv       = A . getUniqSet
 
 {-
 ************************************************************************
@@ -629,7 +641,7 @@ mkNewTyCoOcc        = mk_simple_deriv tcName   "N:"   -- Coercion for newtypes
 mkInstTyCoOcc       = mk_simple_deriv tcName   "D:"   -- Coercion for type functions
 mkEqPredCoOcc       = mk_simple_deriv tcName   "$co"
 
--- Used in derived instances for the names of auxilary bindings.
+-- Used in derived instances for the names of auxiliary bindings.
 -- See Note [Auxiliary binders] in GHC.Tc.Deriv.Generate.
 mkCon2TagOcc        = mk_simple_deriv varName  "$con2tag_"
 mkTag2ConOcc        = mk_simple_deriv varName  "$tag2con_"
@@ -889,21 +901,21 @@ tidyOccName env occ@(OccName occ_sp fs)
 -}
 
 instance Binary NameSpace where
-    put_ bh VarName = do
+    put_ bh VarName =
             putByte bh 0
-    put_ bh DataName = do
+    put_ bh DataName =
             putByte bh 1
-    put_ bh TvName = do
+    put_ bh TvName =
             putByte bh 2
-    put_ bh TcClsName = do
+    put_ bh TcClsName =
             putByte bh 3
     get bh = do
             h <- getByte bh
             case h of
-              0 -> do return VarName
-              1 -> do return DataName
-              2 -> do return TvName
-              _ -> do return TcClsName
+              0 -> return VarName
+              1 -> return DataName
+              2 -> return TvName
+              _ -> return TcClsName
 
 instance Binary OccName where
     put_ bh (OccName aa ab) = do

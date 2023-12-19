@@ -2,7 +2,7 @@
   This module handles generation of position independent code and
   dynamic-linking related issues for the native code generator.
 
-  This depends both the architecture and OS, so we define it here
+  This depends on both the architecture and OS, so we define it here
   instead of in one of the architecture specific modules.
 
   Things outside this module which are related to this:
@@ -54,28 +54,22 @@ import qualified GHC.CmmToAsm.PPC.Regs  as PPC
 import qualified GHC.CmmToAsm.X86.Instr as X86
 
 import GHC.Platform
-import GHC.CmmToAsm.Instr
 import GHC.Platform.Reg
 import GHC.CmmToAsm.Monad
 import GHC.CmmToAsm.Config
+import GHC.CmmToAsm.Types
 
 
 import GHC.Cmm.Dataflow.Collections
 import GHC.Cmm
-import GHC.Cmm.CLabel           ( CLabel, ForeignLabelSource(..), pprCLabel,
-                          mkDynamicLinkerLabel, DynamicLinkerLabelInfo(..),
-                          dynamicLinkerLabelInfo, mkPicBaseLabel,
-                          labelDynamic, externallyVisibleCLabel )
-
-import GHC.Cmm.CLabel           ( mkForeignLabel )
-
+import GHC.Cmm.CLabel
+import GHC.Cmm.Utils (cmmLoadBWord)
 
 import GHC.Types.Basic
-import GHC.Unit.Module
 
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
 
-import GHC.Driver.Session
 import GHC.Data.FastString
 
 
@@ -101,11 +95,9 @@ data ReferenceKind
 
 class Monad m => CmmMakeDynamicReferenceM m where
     addImport :: CLabel -> m ()
-    getThisModule :: m Module
 
 instance CmmMakeDynamicReferenceM NatM where
     addImport = addImportNat
-    getThisModule = getThisModuleNat
 
 cmmMakeDynamicReference
   :: CmmMakeDynamicReferenceM m
@@ -119,13 +111,11 @@ cmmMakeDynamicReference config referenceKind lbl
   = return $ CmmLit $ CmmLabel lbl   -- already processed it, pass through
 
   | otherwise
-  = do this_mod <- getThisModule
-       let platform = ncgPlatform config
+  = do let platform = ncgPlatform config
        case howToAccessLabel
                 config
                 (platformArch platform)
                 (platformOS   platform)
-                this_mod
                 referenceKind lbl of
 
         AccessViaStub -> do
@@ -133,10 +123,19 @@ cmmMakeDynamicReference config referenceKind lbl
               addImport stub
               return $ CmmLit $ CmmLabel stub
 
+        -- GOT relative loads work differently on AArch64.  We don't do two
+        -- step loads. The got symbol is loaded directly, and not through an
+        -- additional load. Thus we do not need the CmmLoad decoration we have
+        -- on other platforms.
+        AccessViaSymbolPtr | ArchAArch64 <- platformArch platform -> do
+              let symbolPtr = mkDynamicLinkerLabel SymbolPtr lbl
+              addImport symbolPtr
+              return $ cmmMakePicReference config symbolPtr
+
         AccessViaSymbolPtr -> do
               let symbolPtr = mkDynamicLinkerLabel SymbolPtr lbl
               addImport symbolPtr
-              return $ CmmLoad (cmmMakePicReference config symbolPtr) (bWord platform)
+              return $ cmmLoadBWord platform (cmmMakePicReference config symbolPtr)
 
         AccessDirectly -> case referenceKind of
                 -- for data, we might have to make some calculations:
@@ -145,7 +144,6 @@ cmmMakeDynamicReference config referenceKind lbl
                 -- PC-relative branch and call instructions,
                 -- so just jump there if it's a call or a jump
               _ -> return $ CmmLit $ CmmLabel lbl
-
 
 -- -----------------------------------------------------------------------------
 -- Create a position independent reference to a label.
@@ -159,6 +157,11 @@ cmmMakePicReference config lbl
   -- Windows doesn't need PIC,
   -- everything gets relocated at runtime
   | OSMinGW32 <- platformOS platform
+  = CmmLit $ CmmLabel lbl
+
+  -- no pic base reg on AArch64, however indicate this symbol should go through
+  -- the global offset table (GOT).
+  | ArchAArch64 <- platformArch platform
   = CmmLit $ CmmLabel lbl
 
   | OSAIX <- platformOS platform
@@ -207,6 +210,13 @@ absoluteLabel lbl
 -- pointers, code stubs and GOT offsets look like is located in the
 -- module CLabel.
 
+-- | Helper to check whether the data resides in a DLL or not, see @labelDynamic@
+ncgLabelDynamic :: NCGConfig -> CLabel -> Bool
+ncgLabelDynamic config = labelDynamic (ncgThisModule config)
+                                      (ncgPlatform config)
+                                      (ncgExternalDynamicRefs config)
+
+
 -- We have to decide which labels need to be accessed
 -- indirectly or via a piece of stub code.
 data LabelAccessStyle
@@ -214,7 +224,7 @@ data LabelAccessStyle
         | AccessViaSymbolPtr
         | AccessDirectly
 
-howToAccessLabel :: NCGConfig -> Arch -> OS -> Module -> ReferenceKind -> CLabel -> LabelAccessStyle
+howToAccessLabel :: NCGConfig -> Arch -> OS -> ReferenceKind -> CLabel -> LabelAccessStyle
 
 -- Windows
 -- In Windows speak, a "module" is a set of objects linked into the
@@ -237,7 +247,7 @@ howToAccessLabel :: NCGConfig -> Arch -> OS -> Module -> ReferenceKind -> CLabel
 -- into the same .exe file. In this case we always access symbols directly,
 -- and never use __imp_SYMBOL.
 --
-howToAccessLabel config _ OSMinGW32 this_mod _ lbl
+howToAccessLabel config _arch OSMinGW32 _kind lbl
 
         -- Assume all symbols will be in the same PE, so just access them directly.
         | not (ncgExternalDynamicRefs config)
@@ -245,10 +255,24 @@ howToAccessLabel config _ OSMinGW32 this_mod _ lbl
 
         -- If the target symbol is in another PE we need to access it via the
         --      appropriate __imp_SYMBOL pointer.
-        | labelDynamic config this_mod lbl
+        | ncgLabelDynamic config lbl
         = AccessViaSymbolPtr
 
         -- Target symbol is in the same PE as the caller, so just access it directly.
+        | otherwise
+        = AccessDirectly
+
+-- On AArch64, relocations for JUMP and CALL will be emitted with 26bits, this
+-- is enough for ~64MB of range. Anything else will need to go through a veneer,
+-- which is the job of the linker to build.  We might only want to lookup
+-- Data References through the GOT.
+howToAccessLabel config ArchAArch64 _os _kind lbl
+        | not (ncgExternalDynamicRefs config)
+        = AccessDirectly
+
+        | ncgLabelDynamic config lbl
+        = AccessViaSymbolPtr
+
         | otherwise
         = AccessDirectly
 
@@ -261,53 +285,50 @@ howToAccessLabel config _ OSMinGW32 this_mod _ lbl
 -- It is always possible to access something indirectly,
 -- even when it's not necessary.
 --
-howToAccessLabel config arch OSDarwin this_mod DataReference lbl
+howToAccessLabel config arch OSDarwin DataReference lbl
         -- data access to a dynamic library goes via a symbol pointer
-        | labelDynamic config this_mod lbl
+        | ncgLabelDynamic config lbl
         = AccessViaSymbolPtr
 
         -- when generating PIC code, all cross-module data references must
         -- must go via a symbol pointer, too, because the assembler
         -- cannot generate code for a label difference where one
-        -- label is undefined. Doesn't apply t x86_64.
-        -- Unfortunately, we don't know whether it's cross-module,
-        -- so we do it for all externally visible labels.
-        -- This is a slight waste of time and space, but otherwise
-        -- we'd need to pass the current Module all the way in to
-        -- this function.
+        -- label is undefined. Doesn't apply to x86_64 (why?).
         | arch /= ArchX86_64
-        , ncgPIC config && externallyVisibleCLabel lbl
+        , not (isLocalCLabel (ncgThisModule config) lbl)
+        , ncgPIC config
+        , externallyVisibleCLabel lbl
         = AccessViaSymbolPtr
 
         | otherwise
         = AccessDirectly
 
-howToAccessLabel config arch OSDarwin this_mod JumpReference lbl
+howToAccessLabel config arch OSDarwin JumpReference lbl
         -- dyld code stubs don't work for tailcalls because the
         -- stack alignment is only right for regular calls.
         -- Therefore, we have to go via a symbol pointer:
-        | arch == ArchX86 || arch == ArchX86_64
-        , labelDynamic config this_mod lbl
+        | arch == ArchX86 || arch == ArchX86_64 || arch == ArchAArch64
+        , ncgLabelDynamic config lbl
         = AccessViaSymbolPtr
 
 
-howToAccessLabel config arch OSDarwin this_mod _ lbl
+howToAccessLabel config arch OSDarwin _kind lbl
         -- Code stubs are the usual method of choice for imported code;
         -- not needed on x86_64 because Apple's new linker, ld64, generates
-        -- them automatically.
+        -- them automatically, neither on Aarch64 (arm64).
         | arch /= ArchX86_64
-        , labelDynamic config this_mod lbl
+        , arch /= ArchAArch64
+        , ncgLabelDynamic config lbl
         = AccessViaStub
 
         | otherwise
         = AccessDirectly
 
-
 ----------------------------------------------------------------------------
 -- AIX
 
 -- quite simple (for now)
-howToAccessLabel _config _arch OSAIX _this_mod kind _lbl
+howToAccessLabel _config _arch OSAIX kind _lbl
         = case kind of
             DataReference -> AccessViaSymbolPtr
             CallReference -> AccessDirectly
@@ -324,7 +345,7 @@ howToAccessLabel _config _arch OSAIX _this_mod kind _lbl
 -- from position independent code. It is also required from the main program
 -- when dynamic libraries containing Haskell code are used.
 
-howToAccessLabel _ (ArchPPC_64 _) os _ kind _
+howToAccessLabel _config (ArchPPC_64 _) os kind _lbl
         | osElfTarget os
         = case kind of
           -- ELF PPC64 (powerpc64-linux), AIX, MacOS 9, BeOS/PPC
@@ -336,7 +357,7 @@ howToAccessLabel _ (ArchPPC_64 _) os _ kind _
           -- regular calls are handled by the runtime linker
           _             -> AccessDirectly
 
-howToAccessLabel config _ os _ _ _
+howToAccessLabel config _arch os _kind _lbl
         -- no PIC -> the dynamic linker does everything for us;
         --           if we don't dynamically link to Haskell code,
         --           it actually manages to do so without messing things up.
@@ -345,11 +366,11 @@ howToAccessLabel config _ os _ _ _
           not (ncgExternalDynamicRefs config)
         = AccessDirectly
 
-howToAccessLabel config arch os this_mod DataReference lbl
+howToAccessLabel config arch os DataReference lbl
         | osElfTarget os
         = case () of
             -- A dynamic label needs to be accessed via a symbol pointer.
-          _ | labelDynamic config this_mod lbl
+          _ | ncgLabelDynamic config lbl
             -> AccessViaSymbolPtr
 
             -- For PowerPC32 -fPIC, we have to access even static data
@@ -375,25 +396,26 @@ howToAccessLabel config arch os this_mod DataReference lbl
         -- (AccessDirectly, because we get an implicit symbol stub)
         -- and calling functions from PIC code on non-i386 platforms (via a symbol stub)
 
-howToAccessLabel config arch os this_mod CallReference lbl
+howToAccessLabel config arch os CallReference lbl
         | osElfTarget os
-        , labelDynamic config this_mod lbl && not (ncgPIC config)
+        , ncgLabelDynamic config lbl
+        , not (ncgPIC config)
         = AccessDirectly
 
         | osElfTarget os
         , arch /= ArchX86
-        , labelDynamic config this_mod lbl
+        , ncgLabelDynamic config lbl
         , ncgPIC config
         = AccessViaStub
 
-howToAccessLabel config _ os this_mod _ lbl
+howToAccessLabel config _arch os _kind lbl
         | osElfTarget os
-        = if labelDynamic config this_mod lbl
+        = if ncgLabelDynamic config lbl
             then AccessViaSymbolPtr
             else AccessDirectly
 
 -- all other platforms
-howToAccessLabel config _ _ _ _ _
+howToAccessLabel config _arch _os _kind _lbl
         | not (ncgPIC config)
         = AccessDirectly
 
@@ -573,21 +595,21 @@ pprGotDeclaration config = case (arch,os) of
 -- and one for non-PIC.
 --
 
-pprImportedSymbol :: DynFlags -> NCGConfig -> CLabel -> SDoc
-pprImportedSymbol dflags config importedLbl = case (arch,os) of
+pprImportedSymbol :: NCGConfig -> CLabel -> SDoc
+pprImportedSymbol config importedLbl = case (arch,os) of
    (ArchX86, OSDarwin)
         | Just (CodeStub, lbl) <- dynamicLinkerLabelInfo importedLbl
         -> if not pic
              then
               vcat [
                   text ".symbol_stub",
-                  text "L" <> pprCLabel dflags lbl <> ptext (sLit "$stub:"),
-                      text "\t.indirect_symbol" <+> pprCLabel dflags lbl,
-                      text "\tjmp *L" <> pprCLabel dflags lbl
+                  text "L" <> ppr_lbl lbl <> text "$stub:",
+                      text "\t.indirect_symbol" <+> ppr_lbl lbl,
+                      text "\tjmp *L" <> ppr_lbl lbl
                           <> text "$lazy_ptr",
-                  text "L" <> pprCLabel dflags lbl
+                  text "L" <> ppr_lbl lbl
                       <> text "$stub_binder:",
-                      text "\tpushl $L" <> pprCLabel dflags lbl
+                      text "\tpushl $L" <> ppr_lbl lbl
                           <> text "$lazy_ptr",
                       text "\tjmp dyld_stub_binding_helper"
               ]
@@ -595,16 +617,16 @@ pprImportedSymbol dflags config importedLbl = case (arch,os) of
               vcat [
                   text ".section __TEXT,__picsymbolstub2,"
                       <> text "symbol_stubs,pure_instructions,25",
-                  text "L" <> pprCLabel dflags lbl <> ptext (sLit "$stub:"),
-                      text "\t.indirect_symbol" <+> pprCLabel dflags lbl,
+                  text "L" <> ppr_lbl lbl <> text "$stub:",
+                      text "\t.indirect_symbol" <+> ppr_lbl lbl,
                       text "\tcall ___i686.get_pc_thunk.ax",
                   text "1:",
-                      text "\tmovl L" <> pprCLabel dflags lbl
+                      text "\tmovl L" <> ppr_lbl lbl
                           <> text "$lazy_ptr-1b(%eax),%edx",
                       text "\tjmp *%edx",
-                  text "L" <> pprCLabel dflags lbl
+                  text "L" <> ppr_lbl lbl
                       <> text "$stub_binder:",
-                      text "\tlea L" <> pprCLabel dflags lbl
+                      text "\tlea L" <> ppr_lbl lbl
                           <> text "$lazy_ptr-1b(%eax),%eax",
                       text "\tpushl %eax",
                       text "\tjmp dyld_stub_binding_helper"
@@ -612,22 +634,24 @@ pprImportedSymbol dflags config importedLbl = case (arch,os) of
            $+$ vcat [        text ".section __DATA, __la_sym_ptr"
                     <> (if pic then int 2 else int 3)
                     <> text ",lazy_symbol_pointers",
-                text "L" <> pprCLabel dflags lbl <> ptext (sLit "$lazy_ptr:"),
-                    text "\t.indirect_symbol" <+> pprCLabel dflags lbl,
-                    text "\t.long L" <> pprCLabel dflags lbl
+                text "L" <> ppr_lbl lbl <> text "$lazy_ptr:",
+                    text "\t.indirect_symbol" <+> ppr_lbl lbl,
+                    text "\t.long L" <> ppr_lbl lbl
                     <> text "$stub_binder"]
 
         | Just (SymbolPtr, lbl) <- dynamicLinkerLabelInfo importedLbl
         -> vcat [
                 text ".non_lazy_symbol_pointer",
-                char 'L' <> pprCLabel dflags lbl <> text "$non_lazy_ptr:",
-                text "\t.indirect_symbol" <+> pprCLabel dflags lbl,
+                char 'L' <> ppr_lbl lbl <> text "$non_lazy_ptr:",
+                text "\t.indirect_symbol" <+> ppr_lbl lbl,
                 text "\t.long\t0"]
 
         | otherwise
         -> empty
 
-   (_, OSDarwin) -> empty
+   (ArchAArch64, OSDarwin)
+        -> empty
+
 
 
    -- XCOFF / AIX
@@ -644,8 +668,8 @@ pprImportedSymbol dflags config importedLbl = case (arch,os) of
    (_, OSAIX) -> case dynamicLinkerLabelInfo importedLbl of
             Just (SymbolPtr, lbl)
               -> vcat [
-                   text "LC.." <> pprCLabel dflags lbl <> char ':',
-                   text "\t.long" <+> pprCLabel dflags lbl ]
+                   text "LC.." <> ppr_lbl lbl <> char ':',
+                   text "\t.long" <+> ppr_lbl lbl ]
             _ -> empty
 
    -- ELF / Linux
@@ -682,22 +706,22 @@ pprImportedSymbol dflags config importedLbl = case (arch,os) of
         -> case dynamicLinkerLabelInfo importedLbl of
             Just (SymbolPtr, lbl)
               -> vcat [
-                   text ".LC_" <> pprCLabel dflags lbl <> char ':',
-                   text "\t.quad" <+> pprCLabel dflags lbl ]
+                   text ".LC_" <> ppr_lbl lbl <> char ':',
+                   text "\t.quad" <+> ppr_lbl lbl ]
             _ -> empty
 
    _ | osElfTarget os
      -> case dynamicLinkerLabelInfo importedLbl of
             Just (SymbolPtr, lbl)
               -> let symbolSize = case ncgWordWidth config of
-                         W32 -> sLit "\t.long"
-                         W64 -> sLit "\t.quad"
+                         W32 -> text "\t.long"
+                         W64 -> text "\t.quad"
                          _ -> panic "Unknown wordRep in pprImportedSymbol"
 
                  in vcat [
                       text ".section \".got2\", \"aw\"",
-                      text ".LC_" <> pprCLabel dflags lbl <> char ':',
-                      ptext symbolSize <+> pprCLabel dflags lbl ]
+                      text ".LC_" <> ppr_lbl lbl <> char ':',
+                      symbolSize <+> ppr_lbl lbl ]
 
             -- PLT code stubs are generated automatically by the dynamic linker.
             _ -> empty
@@ -705,8 +729,9 @@ pprImportedSymbol dflags config importedLbl = case (arch,os) of
    _ -> panic "PIC.pprImportedSymbol: no match"
  where
    platform = ncgPlatform config
-   arch     = platformArch platform
-   os       = platformOS   platform
+   ppr_lbl  = pprCLabel     platform AsmStyle
+   arch     = platformArch  platform
+   os       = platformOS    platform
    pic      = ncgPIC config
 
 --------------------------------------------------------------------------------

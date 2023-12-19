@@ -1,5 +1,3 @@
-{-# LANGUAGE PatternSynonyms #-}
-
 module GHC.Core.Opt.Exitify ( exitifyProgram ) where
 
 {-
@@ -43,8 +41,8 @@ import GHC.Types.Id
 import GHC.Types.Id.Info
 import GHC.Core
 import GHC.Core.Utils
-import GHC.Utils.Monad.State
-import GHC.Types.Unique
+import GHC.Utils.Monad.State.Strict
+import GHC.Builtin.Uniques
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
 import GHC.Core.FVs
@@ -83,7 +81,7 @@ exitifyProgram binds = map goTopLvl binds
       = Case (go in_scope scrut) bndr ty (map go_alt alts)
       where
         in_scope1 = in_scope `extendInScopeSet` bndr
-        go_alt (dc, pats, rhs) = (dc, pats, go in_scope' rhs)
+        go_alt (Alt dc pats rhs) = Alt dc pats (go in_scope' rhs)
            where in_scope' = in_scope1 `extendInScopeSetList` pats
 
     go in_scope (Let (NonRec bndr rhs) body)
@@ -118,7 +116,7 @@ exitifyRec in_scope pairs
     -- Which are the recursive calls?
     recursive_calls = mkVarSet $ map fst pairs
 
-    (pairs',exits) = (`runState` []) $ do
+    (pairs',exits) = (`runState` []) $
         forM ann_pairs $ \(x,rhs) -> do
             -- go past the lambdas of the join point
             let (args, body) = collectNAnnBndrs (idJoinArity x) rhs
@@ -133,11 +131,11 @@ exitifyRec in_scope pairs
     -- variables bound on the way and lifts it out as a join point.
     --
     -- ExitifyM is a state monad to keep track of floated binds
-    go :: [Var]           -- ^ Variables that are in-scope here, but
+    go :: [Var]           -- Variables that are in-scope here, but
                           -- not in scope at the joinrec; that is,
                           -- we must potentially abstract over them.
                           -- Invariant: they are kept in dependency order
-       -> CoreExprWithFVs -- ^ Current expression in tail position
+       -> CoreExprWithFVs -- Current expression in tail position
        -> ExitifyM CoreExpr
 
     -- We first look at the expression (no matter what it shape is)
@@ -154,9 +152,9 @@ exitifyRec in_scope pairs
 
     -- Case right hand sides are in tail-call position
     go captured (_, AnnCase scrut bndr ty alts) = do
-        alts' <- forM alts $ \(dc, pats, rhs) -> do
+        alts' <- forM alts $ \(AnnAlt dc pats rhs) -> do
             rhs' <- go (captured ++ [bndr] ++ pats) rhs
-            return (dc, pats, rhs')
+            return (Alt dc pats rhs')
         return $ Case (deAnnotate scrut) bndr ty alts'
 
     go captured (_, AnnLet ann_bind body)
@@ -312,7 +310,7 @@ intersting.
 
 Expressions are interesting when they move an occurrence of a variable outside
 the recursive `go` that can benefit from being obviously called once, for example:
- * a local thunk that can then be inlined (see example in note [Exitification])
+ * a local thunk that can then be inlined (see example in Note [Exitification])
  * the parameter of a function, where the demand analyzer then can then
    see that it is called at most once, and hence improve the function’s
    strictness signature

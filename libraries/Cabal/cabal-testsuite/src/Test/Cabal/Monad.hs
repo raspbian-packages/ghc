@@ -6,6 +6,7 @@ module Test.Cabal.Monad (
     setupAndCabalTest,
     setupTest,
     cabalTest,
+    cabalTest',
     -- * The monad
     TestM,
     runTestM,
@@ -17,6 +18,7 @@ module Test.Cabal.Monad (
     gitProgram,
     cabalProgram,
     diffProgram,
+    python3Program,
     -- * The test environment
     TestEnv(..),
     getTestEnv,
@@ -39,22 +41,22 @@ module Test.Cabal.Monad (
     skip,
     skipIf,
     skipUnless,
-    skipExitCode,
     -- * Known broken tests
     expectedBroken,
     unexpectedSuccess,
-    expectedBrokenExitCode,
-    unexpectedSuccessExitCode,
     -- whenHasSharedLibraries,
     -- * Arguments (TODO: move me)
     CommonArgs(..),
     renderCommonArgs,
     commonArgParser,
+    -- * Version Constants
+    cabalVersionLibrary,
 ) where
 
 import Test.Cabal.Script
 import Test.Cabal.Plan
 import Test.Cabal.OutputNormalizer
+import Test.Cabal.TestCode
 
 import Distribution.Simple.Compiler
     ( PackageDBStack, PackageDB(..), compilerFlavor
@@ -64,9 +66,11 @@ import Distribution.Simple.Program.Db
 import Distribution.Simple.Program
 import Distribution.Simple.Configure
     ( configCompilerEx )
+import qualified Distribution.Simple.Utils as U (cabalVersion)
 import Distribution.Text
 
 import Distribution.Verbosity
+import Distribution.Version
 
 import Data.Monoid ((<>), mempty)
 import qualified Control.Exception as E
@@ -146,55 +150,44 @@ testArgParser = TestArgs
     <*> argument str ( metavar "FILE")
     <*> commonArgParser
 
-skip :: TestM ()
-skip = liftIO $ do
-    putStrLn "SKIP"
-    exitWith (ExitFailure skipExitCode)
+skip :: String -> TestM ()
+skip reason = liftIO $ do
+    putStrLn ("SKIP " ++ reason)
+    E.throwIO (TestCodeSkip reason)
 
-skipIf :: Bool -> TestM ()
-skipIf b = when b skip
+skipIf :: String -> Bool -> TestM ()
+skipIf reason b = when b (skip reason)
 
-skipUnless :: Bool -> TestM ()
-skipUnless b = unless b skip
+skipUnless :: String -> Bool -> TestM ()
+skipUnless reason b = unless b (skip reason)
 
 expectedBroken :: TestM ()
 expectedBroken = liftIO $ do
     putStrLn "EXPECTED FAIL"
-    exitWith (ExitFailure expectedBrokenExitCode)
+    E.throwIO TestCodeKnownFail
 
 unexpectedSuccess :: TestM ()
 unexpectedSuccess = liftIO $ do
     putStrLn "UNEXPECTED OK"
-    exitWith (ExitFailure unexpectedSuccessExitCode)
+    E.throwIO TestCodeUnexpectedOk
 
-skipExitCode :: Int
-skipExitCode = 64
-
-expectedBrokenExitCode :: Int
-expectedBrokenExitCode = 65
-
-unexpectedSuccessExitCode :: Int
-unexpectedSuccessExitCode = 66
-
-catchSkip :: IO a -> IO a -> IO a
-catchSkip m r = m `E.catch` \e ->
-                case e of
-                    ExitFailure c | c == skipExitCode
-                        -> r
-                    _ -> E.throwIO e
+trySkip :: IO a -> IO (Either String a)
+trySkip m = fmap Right m `E.catch` \e -> case e of
+    TestCodeSkip msg -> return (Left msg)
+    _                -> E.throwIO e
 
 setupAndCabalTest :: TestM () -> IO ()
 setupAndCabalTest m = do
-    r1 <- (setupTest m >> return False) `catchSkip` return True
-    r2 <- (cabalTest' "cabal" m >> return False) `catchSkip` return True
-    when (r1 && r2) $ do
-        putStrLn "SKIP"
-        exitWith (ExitFailure skipExitCode)
+    r1 <- trySkip (setupTest m)
+    r2 <- trySkip (cabalTest' "cabal" m)
+    case (r1, r2) of
+        (Left msg1, Left msg2) -> E.throwIO (TestCodeSkip (msg1 ++ "; " ++ msg2))
+        _                      -> return ()
 
 setupTest :: TestM () -> IO ()
 setupTest m = runTestM "" $ do
     env <- getTestEnv
-    skipIf (testSkipSetupTests env)
+    skipIf "setup test" (testSkipSetupTests env)
     m
 
 cabalTest :: TestM () -> IO ()
@@ -202,7 +195,7 @@ cabalTest = cabalTest' ""
 
 cabalTest' :: String -> TestM () -> IO ()
 cabalTest' mode m = runTestM mode $ do
-    skipUnless =<< isAvailableProgram cabalProgram
+    skipUnless "no cabal-install" =<< isAvailableProgram cabalProgram
     withReaderT (\nenv -> nenv { testCabalInstallAsSetup = True }) m
 
 type TestM = ReaderT TestEnv IO
@@ -223,6 +216,9 @@ cabalProgram = (simpleProgram "cabal") {
 diffProgram :: Program
 diffProgram = simpleProgram "diff"
 
+python3Program :: Program
+python3Program = simpleProgram "python3"
+
 -- | Run a test in the test monad according to program's arguments.
 runTestM :: String -> TestM a -> IO a
 runTestM mode m = withSystemTempDirectory "cabal-testsuite" $ \tmp_dir -> do
@@ -237,7 +233,7 @@ runTestM mode m = withSystemTempDirectory "cabal-testsuite" $ \tmp_dir -> do
     -- Add test suite specific programs
     let program_db0 =
             addKnownPrograms
-                ([gitProgram, hackageRepoToolProgram, cabalProgram, diffProgram] ++ builtinPrograms)
+                ([gitProgram, hackageRepoToolProgram, cabalProgram, diffProgram, python3Program] ++ builtinPrograms)
                 (runnerProgramDb senv)
     -- Reconfigure according to user flags
     let cargs = testCommonArgs args
@@ -411,6 +407,7 @@ mkNormalizerEnv = do
     list_out <- liftIO $ readProcess (programPath ghc_pkg_program)
                       ["list", "--global", "--simple-output"] ""
     tmpDir <- liftIO $ getTemporaryDirectory
+
     return NormalizerEnv {
         normalizerRoot
             = addTrailingPathSeparator (testSourceDir env),
@@ -423,8 +420,14 @@ mkNormalizerEnv = do
         normalizerKnownPackages
             = mapMaybe simpleParse (words list_out),
         normalizerPlatform
-            = testPlatform env
+            = testPlatform env,
+        normalizerCabalVersion
+            = cabalVersionLibrary
     }
+    where
+
+cabalVersionLibrary :: Version
+cabalVersionLibrary = U.cabalVersion
 
 requireProgramM :: Program -> TestM ConfiguredProgram
 requireProgramM program = do

@@ -6,7 +6,7 @@
 Desugaring foreign calls
 -}
 
-{-# LANGUAGE CPP #-}
+
 
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 
@@ -19,17 +19,14 @@ module GHC.HsToCore.Foreign.Call
    )
 where
 
-#include "HsVersions.h"
-
-
 import GHC.Prelude
-import GHC.Platform
 
 import GHC.Core
 
 import GHC.HsToCore.Monad
 import GHC.Core.Utils
 import GHC.Core.Make
+import GHC.Types.SourceText
 import GHC.Types.Id.Make
 import GHC.Types.ForeignCall
 import GHC.Core.DataCon
@@ -38,9 +35,7 @@ import GHC.HsToCore.Utils
 import GHC.Tc.Utils.TcType
 import GHC.Core.Type
 import GHC.Core.Multiplicity
-import GHC.Types.Id   ( Id )
 import GHC.Core.Coercion
-import GHC.Builtin.PrimOps
 import GHC.Builtin.Types.Prim
 import GHC.Core.TyCon
 import GHC.Builtin.Types
@@ -49,7 +44,8 @@ import GHC.Types.Literal
 import GHC.Builtin.Names
 import GHC.Driver.Session
 import GHC.Utils.Outputable
-import GHC.Utils.Misc
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
 
 import Data.Maybe
 
@@ -92,7 +88,7 @@ follows:
 
 dsCCall :: CLabelString -- C routine to invoke
         -> [CoreExpr]   -- Arguments (desugared)
-                        -- Precondition: none have levity-polymorphic types
+        -- Precondition: none have representation-polymorphic types
         -> Safety       -- Safety of the call
         -> Type         -- Type of the result: IO t
         -> DsM CoreExpr -- Result, of type ???
@@ -101,14 +97,13 @@ dsCCall lbl args may_gc result_ty
   = do (unboxed_args, arg_wrappers) <- mapAndUnzipM unboxArg args
        (ccall_result_ty, res_wrapper) <- boxResult result_ty
        uniq <- newUnique
-       dflags <- getDynFlags
        let
            target = StaticTarget NoSourceText lbl Nothing True
            the_fcall    = CCall (CCallSpec target CCallConv may_gc)
-           the_prim_app = mkFCall dflags uniq the_fcall unboxed_args ccall_result_ty
+           the_prim_app = mkFCall uniq the_fcall unboxed_args ccall_result_ty
        return (foldr ($) (res_wrapper the_prim_app) arg_wrappers)
 
-mkFCall :: DynFlags -> Unique -> ForeignCall
+mkFCall :: Unique -> ForeignCall
         -> [CoreExpr]     -- Args
         -> Type           -- Result type
         -> CoreExpr
@@ -121,17 +116,17 @@ mkFCall :: DynFlags -> Unique -> ForeignCall
 -- Here we build a ccall thus
 --      (ccallid::(forall a b.  StablePtr (a -> b) -> Addr -> Char -> IO Addr))
 --                      a b s x c
-mkFCall dflags uniq the_fcall val_args res_ty
-  = ASSERT( all isTyVar tyvars )  -- this must be true because the type is top-level
+mkFCall uniq the_fcall val_args res_ty
+  = assert (all isTyVar tyvars) $ -- this must be true because the type is top-level
     mkApps (mkVarApps (Var the_fcall_id) tyvars) val_args
   where
     arg_tys = map exprType val_args
     body_ty = (mkVisFunTysMany arg_tys res_ty)
     tyvars  = tyCoVarsOfTypeWellScoped body_ty
     ty      = mkInfForAllTys tyvars body_ty
-    the_fcall_id = mkFCallId dflags uniq the_fcall ty
+    the_fcall_id = mkFCallId uniq the_fcall ty
 
-unboxArg :: CoreExpr                    -- The supplied argument, not levity-polymorphic
+unboxArg :: CoreExpr                    -- The supplied argument, not representation-polymorphic
          -> DsM (CoreExpr,              -- To pass as the actual argument
                  CoreExpr -> CoreExpr   -- Wrapper to unbox the arg
                 )
@@ -139,7 +134,7 @@ unboxArg :: CoreExpr                    -- The supplied argument, not levity-pol
 --      (x#::Int#, \W. case x of I# x# -> W)
 -- where W is a CoreExpr that probably mentions x#
 
--- always returns a non-levity-polymorphic expression
+-- always returns a non-representation-polymorphic expression
 
 unboxArg arg
   -- Primitive types: nothing to unbox
@@ -160,17 +155,17 @@ unboxArg arg
               \ body -> Case (mkIfThenElse arg (mkIntLit platform 1) (mkIntLit platform 0))
                              prim_arg
                              (exprType body)
-                             [(DEFAULT,[],body)])
+                             [Alt DEFAULT [] body])
 
   -- Data types with a single constructor, which has a single, primitive-typed arg
   -- This deals with Int, Float etc; also Ptr, ForeignPtr
   | is_product_type && data_con_arity == 1
-  = ASSERT2(isUnliftedType data_con_arg_ty1, pprType arg_ty)
+  = assertPpr (isUnliftedType data_con_arg_ty1) (pprType arg_ty) $
                         -- Typechecker ensures this
     do case_bndr <- newSysLocalDs Many arg_ty
        prim_arg <- newSysLocalDs Many data_con_arg_ty1
        return (Var prim_arg,
-               \ body -> Case arg case_bndr (exprType body) [(DataAlt data_con,[prim_arg],body)]
+               \ body -> Case arg case_bndr (exprType body) [Alt (DataAlt data_con) [prim_arg] body]
               )
 
   -- Byte-arrays, both mutable and otherwise; hack warning
@@ -185,7 +180,7 @@ unboxArg arg
   = do case_bndr <- newSysLocalDs Many arg_ty
        vars@[_l_var, _r_var, arr_cts_var] <- newSysLocalsDs (map unrestricted data_con_arg_tys)
        return (Var arr_cts_var,
-               \ body -> Case arg case_bndr (exprType body) [(DataAlt data_con,vars,body)]
+               \ body -> Case arg case_bndr (exprType body) [Alt (DataAlt data_con) vars body]
               )
 
   | otherwise
@@ -228,17 +223,10 @@ boxResult result_ty
         -- another case, and a coercion.)
         -- The result is IO t, so wrap the result in an IO constructor
   = do  { res <- resultWrapper io_res_ty
-        ; let extra_result_tys
-                = case res of
-                     (Just ty,_)
-                       | isUnboxedTupleType ty
-                       -> let Just ls = tyConAppArgs_maybe ty in tail ls
-                     _ -> []
-
-              return_result state anss
+        ; let return_result state anss
                 = mkCoreUbxTup
-                    (realWorldStatePrimTy : io_res_ty : extra_result_tys)
-                    (state : anss)
+                    [realWorldStatePrimTy, io_res_ty]
+                    [state, anss]
 
         ; (ccall_res_ty, the_alt) <- mk_alt return_result res
 
@@ -270,35 +258,34 @@ boxResult result_ty
                                            [the_alt]
        return (realWorldStatePrimTy `mkVisFunTyMany` ccall_res_ty, wrap)
   where
-    return_result _ [ans] = ans
-    return_result _ _     = panic "return_result: expected single result"
+    return_result _ ans = ans
 
 
-mk_alt :: (Expr Var -> [Expr Var] -> Expr Var)
+mk_alt :: (Expr Var -> Expr Var -> Expr Var)
        -> (Maybe Type, Expr Var -> Expr Var)
-       -> DsM (Type, (AltCon, [Id], Expr Var))
+       -> DsM (Type, CoreAlt)
 mk_alt return_result (Nothing, wrap_result)
   = do -- The ccall returns ()
        state_id <- newSysLocalDs Many realWorldStatePrimTy
        let
              the_rhs = return_result (Var state_id)
-                                     [wrap_result (panic "boxResult")]
+                                     (wrap_result (panic "boxResult"))
 
              ccall_res_ty = mkTupleTy Unboxed [realWorldStatePrimTy]
-             the_alt      = (DataAlt (tupleDataCon Unboxed 1), [state_id], the_rhs)
+             the_alt      = Alt (DataAlt (tupleDataCon Unboxed 1)) [state_id] the_rhs
 
        return (ccall_res_ty, the_alt)
 
 mk_alt return_result (Just prim_res_ty, wrap_result)
   = -- The ccall returns a non-() value
-    ASSERT2( isPrimitiveType prim_res_ty, ppr prim_res_ty )
+    assertPpr (isPrimitiveType prim_res_ty) (ppr prim_res_ty) $
              -- True because resultWrapper ensures it is so
     do { result_id <- newSysLocalDs Many prim_res_ty
        ; state_id <- newSysLocalDs Many realWorldStatePrimTy
        ; let the_rhs = return_result (Var state_id)
-                                [wrap_result (Var result_id)]
+                                (wrap_result (Var result_id))
              ccall_res_ty = mkTupleTy Unboxed [realWorldStatePrimTy, prim_res_ty]
-             the_alt      = (DataAlt (tupleDataCon Unboxed 2), [state_id, result_id], the_rhs)
+             the_alt      = Alt (DataAlt (tupleDataCon Unboxed 2)) [state_id, result_id] the_rhs
        ; return (ccall_res_ty, the_alt) }
 
 
@@ -333,8 +320,8 @@ resultWrapper result_ty
        ; let platform = targetPlatform dflags
        ; let marshal_bool e
                = mkWildCase e (unrestricted intPrimTy) boolTy
-                   [ (DEFAULT                     ,[],Var trueDataConId )
-                   , (LitAlt (mkLitInt platform 0),[],Var falseDataConId)]
+                   [ Alt DEFAULT                        [] (Var trueDataConId )
+                   , Alt (LitAlt (mkLitInt platform 0)) [] (Var falseDataConId)]
        ; return (Just intPrimTy, marshal_bool) }
 
   -- Newtypes
@@ -344,45 +331,23 @@ resultWrapper result_ty
 
   -- The type might contain foralls (eg. for dummy type arguments,
   -- referring to 'Ptr a' is legal).
-  | Just (tyvar, rest) <- splitForAllTy_maybe result_ty
+  | Just (tyvar, rest) <- splitForAllTyCoVar_maybe result_ty
   = do { (maybe_ty, wrapper) <- resultWrapper rest
        ; return (maybe_ty, \e -> Lam tyvar (wrapper e)) }
 
   -- Data types with a single constructor, which has a single arg
   -- This includes types like Ptr and ForeignPtr
   | Just (tycon, tycon_arg_tys) <- maybe_tc_app
-  , Just data_con <- isDataProductTyCon_maybe tycon  -- One constructor, no existentials
+  , Just data_con <- tyConSingleAlgDataCon_maybe tycon  -- One constructor
+  , null (dataConExTyCoVars data_con)                   -- no existentials
   , [Scaled _ unwrapped_res_ty] <- dataConInstOrigArgTys data_con tycon_arg_tys  -- One argument
-  = do { dflags <- getDynFlags
-       ; let platform = targetPlatform dflags
-       ; (maybe_ty, wrapper) <- resultWrapper unwrapped_res_ty
-       ; let narrow_wrapper = maybeNarrow platform tycon
-             marshal_con e  = Var (dataConWrapId data_con)
+  = do { (maybe_ty, wrapper) <- resultWrapper unwrapped_res_ty
+       ; let marshal_con e  = Var (dataConWrapId data_con)
                               `mkTyApps` tycon_arg_tys
-                              `App` wrapper (narrow_wrapper e)
+                              `App` wrapper e
        ; return (maybe_ty, marshal_con) }
 
   | otherwise
   = pprPanic "resultWrapper" (ppr result_ty)
   where
     maybe_tc_app = splitTyConApp_maybe result_ty
-
--- When the result of a foreign call is smaller than the word size, we
--- need to sign- or zero-extend the result up to the word size.  The C
--- standard appears to say that this is the responsibility of the
--- caller, not the callee.
-
-maybeNarrow :: Platform -> TyCon -> (CoreExpr -> CoreExpr)
-maybeNarrow platform tycon
-  | tycon `hasKey` int8TyConKey   = \e -> App (Var (mkPrimOpId Narrow8IntOp)) e
-  | tycon `hasKey` int16TyConKey  = \e -> App (Var (mkPrimOpId Narrow16IntOp)) e
-  | tycon `hasKey` int32TyConKey
-  , platformWordSizeInBytes platform > 4
-  = \e -> App (Var (mkPrimOpId Narrow32IntOp)) e
-
-  | tycon `hasKey` word8TyConKey  = \e -> App (Var (mkPrimOpId Narrow8WordOp)) e
-  | tycon `hasKey` word16TyConKey = \e -> App (Var (mkPrimOpId Narrow16WordOp)) e
-  | tycon `hasKey` word32TyConKey
-  , platformWordSizeInBytes platform > 4
-  = \e -> App (Var (mkPrimOpId Narrow32WordOp)) e
-  | otherwise                     = id

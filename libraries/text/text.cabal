@@ -1,6 +1,6 @@
-cabal-version:  >= 1.10
+cabal-version:  2.2
 name:           text
-version:        1.2.5.0
+version:        2.0.2
 
 homepage:       https://github.com/haskell/text
 bug-reports:    https://github.com/haskell/text/issues
@@ -8,7 +8,7 @@ synopsis:       An efficient packed Unicode text type.
 description:
     .
     An efficient packed, immutable Unicode text type (both strict and
-    lazy), with a powerful loop fusion optimization framework.
+    lazy).
     .
     The 'Text' type represents Unicode character strings, in a time and
     space-efficient manner. This package provides text processing
@@ -37,35 +37,33 @@ description:
     the [text-icu package](https://hackage.haskell.org/package/text-icu)
     based on the well-respected and liberally
     licensed [ICU library](http://site.icu-project.org/).
-    .
-    == Internal Representation: UTF-16 vs. UTF-8
-    .
-    Currently the @text@ library uses UTF-16 as its internal representation
-    which is [neither a fixed-width nor always the most dense representation](http://utf8everywhere.org/)
-    for Unicode text. We're currently investigating the feasibility
-    of [changing Text's internal representation to UTF-8](https://github.com/text-utf8)
-    and if you need such a 'Text' type right now you might be interested in using the spin-off
-    packages <https://hackage.haskell.org/package/text-utf8 text-utf8> and
-    <https://hackage.haskell.org/package/text-short text-short>.
 
-
-license:        BSD2
+license:        BSD-2-Clause
 license-file:   LICENSE
 author:         Bryan O'Sullivan <bos@serpentine.com>
 maintainer:     Haskell Text Team <andrew.lelechenko@gmail.com>, Core Libraries Committee
-copyright:      2009-2011 Bryan O'Sullivan, 2008-2009 Tom Harper
+copyright:      2009-2011 Bryan O'Sullivan, 2008-2009 Tom Harper, 2021 Andrew Lelechenko
 category:       Data, Text
 build-type:     Simple
-tested-with:    GHC==9.0.1,
-                GHC==8.10.4, GHC==8.8.4, GHC==8.6.5, GHC==8.4.4,
-                GHC==8.2.2, GHC==8.0.2
+tested-with:
+    GHC == 8.2.2
+    GHC == 8.4.4
+    GHC == 8.6.5
+    GHC == 8.8.4
+    GHC == 8.10.7
+    GHC == 9.0.2
+    GHC == 9.2.4
+    GHC == 9.4.1
+
 extra-source-files:
     -- scripts/CaseFolding.txt
     -- scripts/SpecialCasing.txt
-    README.markdown
+    README.md
     changelog.md
-    include/*.h
     scripts/*.hs
+    simdutf/LICENSE-APACHE
+    simdutf/LICENSE-MIT
+    simdutf/simdutf.h
     tests/literal-rule-test.sh
     tests/LiteralRuleTest.hs
 
@@ -74,10 +72,69 @@ flag developer
   default: False
   manual: True
 
+flag simdutf
+  description: use simdutf library
+  default: True
+  manual: True
+
 library
-  c-sources:    cbits/cbits.c
-  include-dirs: include
+  c-sources:    cbits/is_ascii.c
+                cbits/measure_off.c
+                cbits/reverse.c
+                cbits/utils.c
   hs-source-dirs: src
+
+  if flag(simdutf)
+    include-dirs: simdutf
+    cxx-sources: simdutf/simdutf.cpp
+                 cbits/validate_utf8.cpp
+    cxx-options: -std=c++17
+    cpp-options: -DSIMDUTF
+    if impl(ghc >= 9.4)
+      build-depends: system-cxx-std-lib == 1.0
+    elif os(darwin) || os(freebsd)
+      extra-libraries: c++
+    elif os(openbsd)
+      extra-libraries: c++ c++abi pthread
+    elif os(windows)
+      -- GHC's Windows toolchain is based on clang/libc++ in GHC 9.4 and later
+      if impl(ghc < 9.3)
+        extra-libraries: stdc++
+      else
+        extra-libraries: c++ c++abi
+    elif os(linux)
+      extra-libraries: stdc++
+    else
+      -- This is supposed to be under arch(wasm32), but we can't do that yet
+      -- since cabal check would fail with unrecognized arch, see
+      -- https://github.com/haskell/cabal/pull/8096 for the fix.
+      -- TODO: when a new cabal release is out with that fix, bump cabal in CI
+      -- and add proper arch(wasm32) declaration here.
+      cpp-options: -DSIMDUTF_NO_THREADS
+      cxx-options: -fno-exceptions
+      extra-libraries: c++ c++abi
+
+  -- Certain version of GHC crash on Windows, when TemplateHaskell encounters C++.
+  -- https://gitlab.haskell.org/ghc/ghc/-/issues/19417
+  if flag(simdutf) && os(windows) && impl(ghc >= 8.8 && < 8.10.5 || == 9.0.1)
+    build-depends: base < 0
+
+  -- For GHC 8.2, 8.6.3 and 8.10.1 even TH + C crash Windows linker.
+  if os(windows) && impl(ghc >= 8.2 && < 8.4 || == 8.6.3 || == 8.10.1)
+    build-depends: base < 0
+
+  -- GHC 8.10 has linking issues (probably TH-related) on ARM.
+  if (arch(aarch64) || arch(arm)) && impl(ghc == 8.10.*)
+    build-depends: base < 0
+
+  -- Subword primitives in GHC 9.2.1 are broken on ARM platforms.
+  if (arch(aarch64) || arch(arm)) && impl(ghc == 9.2.1)
+    build-depends: base < 0
+
+  -- NetBSD + GHC 9.2.1 + TH + C++ does not work together.
+  -- https://gitlab.haskell.org/ghc/ghc/-/issues/22577
+  if flag(simdutf) && os(netbsd) && impl(ghc < 9.4)
+    build-depends: base < 0
 
   exposed-modules:
     Data.Text
@@ -93,12 +150,12 @@ library
     Data.Text.Internal.Builder.RealFloat.Functions
     Data.Text.Internal.ByteStringCompat
     Data.Text.Internal.PrimCompat
+    Data.Text.Internal.Encoding
     Data.Text.Internal.Encoding.Fusion
     Data.Text.Internal.Encoding.Fusion.Common
     Data.Text.Internal.Encoding.Utf16
     Data.Text.Internal.Encoding.Utf32
     Data.Text.Internal.Encoding.Utf8
-    Data.Text.Internal.Functions
     Data.Text.Internal.Fusion
     Data.Text.Internal.Fusion.CaseMapping
     Data.Text.Internal.Fusion.Common
@@ -112,9 +169,9 @@ library
     Data.Text.Internal.Private
     Data.Text.Internal.Read
     Data.Text.Internal.Search
+    Data.Text.Internal.StrictBuilder
     Data.Text.Internal.Unsafe
     Data.Text.Internal.Unsafe.Char
-    Data.Text.Internal.Unsafe.Shift
     Data.Text.Lazy
     Data.Text.Lazy.Builder
     Data.Text.Lazy.Builder.Int
@@ -131,17 +188,19 @@ library
 
   build-depends:
     array            >= 0.3 && < 0.6,
-    base             >= 4.9 && < 5,
+    base             >= 4.10 && < 5,
     binary           >= 0.5 && < 0.9,
     bytestring       >= 0.10.4 && < 0.12,
     deepseq          >= 1.1 && < 1.5,
-    ghc-prim         >= 0.2 && < 0.9,
-    template-haskell >= 2.5 && < 2.19
+    ghc-prim         >= 0.2 && < 0.11,
+    template-haskell >= 2.5 && < 2.21
 
   ghc-options: -Wall -fwarn-tabs -funbox-strict-fields -O2
   if flag(developer)
     ghc-options: -fno-ignore-asserts
     cpp-options: -DASSERTS
+    if impl(ghc >= 9.2.2)
+      ghc-options: -fcheck-prim-bounds
 
   default-language: Haskell2010
   default-extensions:
@@ -178,8 +237,6 @@ test-suite tests
   hs-source-dirs: tests
   main-is:        Tests.hs
   other-modules:
-    Tests.Inspection.Lazy
-    Tests.Inspection.Strict
     Tests.Lift
     Tests.Properties
     Tests.Properties.Basics
@@ -197,19 +254,23 @@ test-suite tests
     Tests.Utils
 
   build-depends:
-    QuickCheck >= 2.14.1 && < 2.15,
+    QuickCheck >= 2.12.6 && < 2.15,
     base <5,
     bytestring,
     deepseq,
     directory,
-    quickcheck-unicode >= 1.0.1.0,
-    random,
+    ghc-prim,
     tasty,
     tasty-hunit,
-    tasty-inspection-testing,
     tasty-quickcheck,
     template-haskell,
+    transformers,
     text
+
+  -- Plugin infrastructure does not work properly in 8.6.1, and
+  -- ghc-9.2.1 library depends on parsec, which causes a circular dependency.
+  if impl(ghc >= 8.2.1 && < 8.6 || >= 8.6.2 && < 9.2 || >= 9.2.2)
+    build-depends: tasty-inspection-testing
 
   default-language: Haskell2010
   default-extensions: NondecreasingIndentation
@@ -222,21 +283,19 @@ benchmark text-benchmarks
     ghc-options:  "-with-rtsopts=-A32m --nonmoving-gc"
   else
     ghc-options:  "-with-rtsopts=-A32m"
+  if impl(ghc >= 8.6)
+    ghc-options:  -fproc-alignment=64
 
   build-depends:  base,
-                  binary,
                   bytestring >= 0.10.4,
-                  bytestring-lexing >= 0.5.0,
                   containers,
                   deepseq,
+                  directory,
                   filepath,
-                  stringsearch,
                   tasty-bench >= 0.2,
                   text,
-                  transformers,
-                  vector
+                  transformers
 
-  c-sources:      benchmarks/cbits-bench/time_iconv.c
   hs-source-dirs: benchmarks/haskell
   main-is:        Benchmarks.hs
   other-modules:
@@ -247,7 +306,6 @@ benchmark text-benchmarks
     Benchmarks.Equality
     Benchmarks.FileRead
     Benchmarks.FoldLines
-    Benchmarks.Mul
     Benchmarks.Multilang
     Benchmarks.Programs.BigTable
     Benchmarks.Programs.Cut

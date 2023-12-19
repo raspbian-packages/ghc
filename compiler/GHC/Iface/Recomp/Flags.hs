@@ -10,14 +10,16 @@ module GHC.Iface.Recomp.Flags (
 
 import GHC.Prelude
 
-import GHC.Utils.Binary
 import GHC.Driver.Session
-import GHC.Driver.Types
+import GHC.Driver.Env
+
+import GHC.Utils.Binary
 import GHC.Unit.Module
 import GHC.Types.Name
+import GHC.Types.SafeHaskell
 import GHC.Utils.Fingerprint
 import GHC.Iface.Recomp.Binary
--- import GHC.Utils.Outputable
+import GHC.Core.Opt.CallerCC () -- for Binary instances
 
 import GHC.Data.EnumSet as EnumSet
 import System.FilePath (normalise)
@@ -26,26 +28,26 @@ import System.FilePath (normalise)
 -- the finger print on important fields in @DynFlags@ so that
 -- the recompilation checker can use this fingerprint.
 --
--- NB: The 'Module' parameter is the 'Module' recorded by the
--- *interface* file, not the actual 'Module' according to our
--- 'DynFlags'.
-fingerprintDynFlags :: DynFlags -> Module
+-- NB: The 'Module' parameter is the 'Module' recorded by the *interface*
+-- file, not the actual 'Module' according to our 'DynFlags'.
+fingerprintDynFlags :: HscEnv -> Module
                     -> (BinHandle -> Name -> IO ())
                     -> IO Fingerprint
 
-fingerprintDynFlags dflags@DynFlags{..} this_mod nameio =
-    let mainis   = if mainModIs == this_mod then Just mainFunIs else Nothing
+fingerprintDynFlags hsc_env this_mod nameio =
+    let dflags@DynFlags{..} = hsc_dflags hsc_env
+        mainis   = if mainModIs (hsc_HUE hsc_env) == this_mod then Just mainFunIs else Nothing
                       -- see #5878
-        -- pkgopts  = (homeUnit dflags, sort $ packageFlags dflags)
+        -- pkgopts  = (homeUnit home_unit, sort $ packageFlags dflags)
         safeHs   = setSafeMode safeHaskell
         -- oflags   = sort $ filter filterOFlags $ flags dflags
 
-        -- *all* the extension flags and the language
+        -- all the extension flags and the language
         lang = (fmap fromEnum language,
                 map fromEnum $ EnumSet.toList extensionFlags)
 
         -- avoid fingerprinting the absolute path to the directory of the source file
-        -- see note [Implicit include paths]
+        -- see Note [Implicit include paths]
         includePathsMinusImplicit = includePaths { includePathsQuoteImplicit = [] }
 
         -- -I, -D and -U flags affect CPP
@@ -63,9 +65,9 @@ fingerprintDynFlags dflags@DynFlags{..} this_mod nameio =
 
         -- Ticky
         ticky =
-          map (`gopt` dflags) [Opt_Ticky, Opt_Ticky_Allocd, Opt_Ticky_LNE, Opt_Ticky_Dyn_Thunk]
+          map (`gopt` dflags) [Opt_Ticky, Opt_Ticky_Allocd, Opt_Ticky_LNE, Opt_Ticky_Dyn_Thunk, Opt_Ticky_Tag]
 
-        flags = ((mainis, safeHs, lang, cpp), (paths, prof, ticky, debugLevel))
+        flags = ((mainis, safeHs, lang, cpp), (paths, prof, ticky, debugLevel, callerCcFilters))
 
     in -- pprTrace "flags" (ppr flags) $
        computeFingerprint nameio flags
@@ -106,7 +108,7 @@ fingerprintHpcFlags dflags@DynFlags{..} nameio =
 
 
 {- Note [path flags and recompilation]
-
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 There are several flags that we deliberately omit from the
 recompilation check; here we explain why.
 
@@ -137,7 +139,6 @@ The only path-related flag left is -hcsuf.
 
 {- Note [Ignoring some flag changes]
    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 Normally, --make tries to reuse only compilation products that are
 the same as those that would have been produced compiling from
 scratch. Sometimes, however, users would like to be more aggressive
@@ -156,7 +157,6 @@ options out of the flag hash, hashing them separately.
 
 {- Note [Repeated -optP hashing]
    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 We invoke fingerprintDynFlags for each compiled module to include
 the hash of relevant DynFlags in the resulting interface file.
 -optP (preprocessor) flags are part of that hash.

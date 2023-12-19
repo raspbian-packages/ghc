@@ -1,5 +1,6 @@
 {-# LANGUAGE CPP                 #-}
 {-# LANGUAGE LambdaCase          #-}
+{-# LANGUAGE NamedFieldPuns      #-}
 {-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE Rank2Types          #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -73,12 +74,14 @@ import Text.ParserCombinators.ReadP (readP_to_S)
 import GHC hiding (verbosity)
 import GHC.Settings.Config
 import GHC.Driver.Session hiding (projectVersion, verbosity)
-import GHC.Utils.Outputable (defaultUserStyle, withPprStyle)
+import GHC.Driver.Config.Logger (initLogFlags)
+import GHC.Driver.Env
 import GHC.Utils.Error
+import GHC.Utils.Logger
+import GHC.Types.Name.Cache
 import GHC.Unit
 import GHC.Utils.Panic (handleGhcException)
 import GHC.Data.FastString
-import qualified Debug.Trace as Debug
 
 --------------------------------------------------------------------------------
 -- * Exception handling
@@ -189,34 +192,44 @@ haddockWithGhc ghc args = handleTopExceptions $ do
 
   ghc flags' $ withDir $ do
     dflags <- getDynFlags
+    logger <- getLogger
+    unit_state <- hsc_units <$> getSession
 
     forM_ (optShowInterfaceFile flags) $ \path -> liftIO $ do
-      mIfaceFile <- readInterfaceFiles freshNameCache [(("", Nothing), path)] noChecks
-      forM_ mIfaceFile $ \(_, _, ifaceFile) -> do
-        logOutput dflags $ withPprStyle defaultUserStyle (renderJson (jsonInterfaceFile ifaceFile))
+      name_cache <- freshNameCache
+      mIfaceFile <- readInterfaceFiles name_cache [(("", Nothing), Visible, path)] noChecks
+      forM_ mIfaceFile $ \(_,_,_, ifaceFile) -> do
+        putMsg logger $ renderJson (jsonInterfaceFile ifaceFile)
 
     if not (null files) then do
       (packages, ifaces, homeLinks) <- readPackagesAndProcessModules flags files
+      let packageInfo = PackageInfo { piPackageName =
+                                        fromMaybe (PackageName mempty) (optPackageName flags)
+                                    , piPackageVersion =
+                                        fromMaybe (makeVersion []) (optPackageVersion flags)
+                                    }
 
       -- Dump an "interface file" (.haddock file), if requested.
       forM_ (optDumpInterfaceFile flags) $ \path -> liftIO $ do
         writeInterfaceFile path InterfaceFile {
             ifInstalledIfaces = map toInstalledIface ifaces
+          , ifPackageInfo     = packageInfo
           , ifLinkEnv         = homeLinks
           }
 
       -- Render the interfaces.
-      liftIO $ renderStep dflags flags sinceQual qual packages ifaces
+      liftIO $ renderStep logger dflags unit_state flags sinceQual qual packages ifaces
 
     else do
       when (any (`elem` [Flag_Html, Flag_Hoogle, Flag_LaTeX]) flags) $
         throwE "No input file(s)."
 
       -- Get packages supplied with --read-interface.
-      packages <- liftIO $ readInterfaceFiles freshNameCache (readIfaceArgs flags) noChecks
+      name_cache <- liftIO $ freshNameCache
+      packages <- liftIO $ readInterfaceFiles name_cache (readIfaceArgs flags) noChecks
 
       -- Render even though there are no input files (usually contents/index).
-      liftIO $ renderStep dflags flags sinceQual qual packages []
+      liftIO $ renderStep logger dflags unit_state flags sinceQual qual packages []
 
 -- | Run the GHC action using a temporary output directory
 withTempOutputDir :: Ghc a -> Ghc a
@@ -252,53 +265,59 @@ withGhc flags action = do
 
 
 readPackagesAndProcessModules :: [Flag] -> [String]
-                              -> Ghc ([(DocPaths, FilePath, InterfaceFile)], [Interface], LinkEnv)
+                              -> Ghc ([(DocPaths, Visibility, FilePath, InterfaceFile)], [Interface], LinkEnv)
 readPackagesAndProcessModules flags files = do
     -- Get packages supplied with --read-interface.
     let noChecks = Flag_BypassInterfaceVersonCheck `elem` flags
-    packages <- readInterfaceFiles nameCacheFromGhc (readIfaceArgs flags) noChecks
+    name_cache <- hsc_NC <$> getSession
+    packages <- liftIO $ readInterfaceFiles name_cache (readIfaceArgs flags) noChecks
 
     -- Create the interfaces -- this is the core part of Haddock.
-    let ifaceFiles = map (\(_, _, ifaceFile) -> ifaceFile) packages
+    let ifaceFiles = map (\(_, _, _, ifaceFile) -> ifaceFile) packages
     (ifaces, homeLinks) <- processModules (verbosity flags) files flags ifaceFiles
 
     return (packages, ifaces, homeLinks)
 
 
-renderStep :: DynFlags -> [Flag] -> SinceQual -> QualOption
-           -> [(DocPaths, FilePath, InterfaceFile)] -> [Interface] -> IO ()
-renderStep dflags flags sinceQual nameQual pkgs interfaces = do
-  updateHTMLXRefs (map (\(docPath, _ifaceFilePath, ifaceFile) ->
+renderStep :: Logger -> DynFlags -> UnitState -> [Flag] -> SinceQual -> QualOption
+           -> [(DocPaths, Visibility, FilePath, InterfaceFile)] -> [Interface] -> IO ()
+renderStep logger dflags unit_state flags sinceQual nameQual pkgs interfaces = do
+  updateHTMLXRefs (map (\(docPath, _ifaceFilePath, _showModules, ifaceFile) ->
                           ( case baseUrl flags of
                               Nothing  -> fst docPath
-                              Just url -> Debug.traceShowId $
-                                url </> packageName (unitState dflags) (ifUnitId ifaceFile)
+                              Just url -> url </> packageName (ifUnitId ifaceFile)
                           , ifaceFile)) pkgs)
   let
     installedIfaces =
-      concatMap
-        (\(_, ifaceFilePath, ifaceFile)
-          -> (ifaceFilePath,) <$> ifInstalledIfaces ifaceFile)
+      map
+        (\(_, showModules, ifaceFilePath, ifaceFile)
+          -> (ifaceFilePath, mkPackageInterfaces showModules ifaceFile))
         pkgs
     extSrcMap = Map.fromList $ do
-      ((_, Just path), _, ifile) <- pkgs
+      ((_, Just path), _, _, ifile) <- pkgs
       iface <- ifInstalledIfaces ifile
       return (instMod iface, path)
-  render dflags flags sinceQual nameQual interfaces installedIfaces extSrcMap
+  render logger dflags unit_state flags sinceQual nameQual interfaces installedIfaces extSrcMap
   where
     -- get package name from unit-id
-    packageName :: UnitState -> Unit -> String
-    packageName state unit =
-      case lookupUnit state unit of
+    packageName :: Unit -> String
+    packageName unit =
+      case lookupUnit unit_state unit of
         Nothing  -> show unit
         Just pkg -> unitPackageNameString pkg
 
 -- | Render the interfaces with whatever backend is specified in the flags.
-render :: DynFlags -> [Flag] -> SinceQual -> QualOption -> [Interface]
-       -> [(FilePath, InstalledInterface)] -> Map Module FilePath -> IO ()
-render dflags flags sinceQual qual ifaces installedIfaces extSrcMap = do
+render :: Logger -> DynFlags -> UnitState -> [Flag] -> SinceQual -> QualOption -> [Interface]
+       -> [(FilePath, PackageInterfaces)] -> Map Module FilePath -> IO ()
+render log' dflags unit_state flags sinceQual qual ifaces packages extSrcMap = do
 
   let
+    packageInfo = PackageInfo { piPackageName    = fromMaybe (PackageName mempty)
+                                                 $ optPackageName flags
+                              , piPackageVersion = fromMaybe (makeVersion [])
+                                                 $ optPackageVersion flags
+                              }
+
     title                = fromMaybe "" (optTitle flags)
     unicode              = Flag_UseUnicode `elem` flags
     pretty               = Flag_PrettyHtml `elem` flags
@@ -310,21 +329,44 @@ render dflags flags sinceQual qual ifaces installedIfaces extSrcMap = do
     opt_latex_style      = optLaTeXStyle     flags
     opt_source_css       = optSourceCssFile  flags
     opt_mathjax          = optMathjax        flags
-    pkgs                 = unitState dflags
     dflags'
       | unicode          = gopt_set dflags Opt_PrintUnicodeSyntax
       | otherwise        = dflags
+    logger               = setLogFlags log' (initLogFlags dflags')
 
     visibleIfaces    = [ i | i <- ifaces, OptHide `notElem` ifaceOptions i ]
 
-    -- /All/ visible interfaces including external package modules.
-    allIfaces        = map toInstalledIface ifaces ++ map snd installedIfaces
-    allVisibleIfaces = [ i | i <- allIfaces, OptHide `notElem` instOptions i ]
+    -- /All/ interfaces including external package modules, grouped by
+    -- interface file (package).
+    allPackages      :: [PackageInterfaces]
+    allPackages      = [PackageInterfaces
+                         { piPackageInfo = packageInfo
+                         , piVisibility  = Visible
+                         , piInstalledInterfaces  = map toInstalledIface ifaces
+                         }]
+                    ++ map snd packages
+
+    -- /All/ visible interfaces including external package modules, grouped by
+    -- interface file (package).
+    allVisiblePackages :: [PackageInterfaces]
+    allVisiblePackages = [ pinfo { piInstalledInterfaces =
+                                     filter (\i -> OptHide `notElem` instOptions i)
+                                            piInstalledInterfaces
+                                 }
+                         | pinfo@PackageInterfaces
+                             { piVisibility = Visible
+                             , piInstalledInterfaces
+                             } <- allPackages
+                         ]
+
+    -- /All/ installed interfaces.
+    allInstalledIfaces :: [InstalledInterface]
+    allInstalledIfaces = concatMap (piInstalledInterfaces . snd) packages
 
     pkgMod           = fmap ifaceMod (listToMaybe ifaces)
     pkgKey           = fmap moduleUnit pkgMod
     pkgStr           = fmap unitString pkgKey
-    pkgNameVer       = modulePackageInfo dflags flags pkgMod
+    pkgNameVer       = modulePackageInfo unit_state flags pkgMod
     pkgName          = fmap (unpackFS . (\(PackageName n) -> n)) (fst pkgNameVer)
     sincePkg         = case sinceQual of
                          External -> pkgName
@@ -363,13 +405,13 @@ render dflags flags sinceQual qual ifaces installedIfaces extSrcMap = do
     sourceUrls' = (srcBase, srcModule', pkgSrcMap', pkgSrcLMap')
 
     installedMap :: Map Module InstalledInterface
-    installedMap = Map.fromList [ (unwire (instMod iface), iface) | (_, iface) <- installedIfaces ]
+    installedMap = Map.fromList [ (unwire (instMod iface), iface) | iface <- allInstalledIfaces ]
 
     -- The user gives use base-4.9.0.0, but the InstalledInterface
     -- records the *wired in* identity base.  So untranslate it
     -- so that we can service the request.
     unwire :: Module -> Module
-    unwire m = m { moduleUnit = unwireUnit (unitState dflags) (moduleUnit m) }
+    unwire m = m { moduleUnit = unwireUnit unit_state (moduleUnit m) }
 
   reexportedIfaces <- concat `fmap` (for (reexportFlags flags) $ \mod_str -> do
     let warn = hPutStrLn stderr . ("Warning: " ++)
@@ -395,22 +437,22 @@ render dflags flags sinceQual qual ifaces installedIfaces extSrcMap = do
                   $ flags
 
   when (Flag_GenIndex `elem` flags) $ do
-    withTiming dflags' "ppHtmlIndex" (const ()) $ do
+    withTiming logger "ppHtmlIndex" (const ()) $ do
       _ <- {-# SCC ppHtmlIndex #-}
            ppHtmlIndex odir title pkgStr
                   themes opt_mathjax opt_contents_url sourceUrls' opt_wiki_urls
-                  allVisibleIfaces pretty
+                  (concatMap piInstalledInterfaces allVisiblePackages) pretty
       return ()
 
     unless withBaseURL $
       copyHtmlBits odir libDir themes withQuickjump
 
   when (Flag_GenContents `elem` flags) $ do
-    withTiming dflags' "ppHtmlContents" (const ()) $ do
+    withTiming logger "ppHtmlContents" (const ()) $ do
       _ <- {-# SCC ppHtmlContents #-}
-           ppHtmlContents pkgs odir title pkgStr
+           ppHtmlContents unit_state odir title pkgStr
                      themes opt_mathjax opt_index_url sourceUrls' opt_wiki_urls
-                     allVisibleIfaces True prologue pretty
+                     allVisiblePackages True prologue pretty
                      sincePkg (makeContentsQual qual)
       return ()
     copyHtmlBits odir libDir themes withQuickjump
@@ -419,16 +461,19 @@ render dflags flags sinceQual qual ifaces installedIfaces extSrcMap = do
             ppJsonIndex odir sourceUrls' opt_wiki_urls
                         unicode Nothing qual
                         ifaces
-                        (nub $ map fst installedIfaces)
+                        ( nub
+                        . map fst
+                        . filter ((== Visible) . piVisibility . snd)
+                        $ packages)
 
   when (Flag_Html `elem` flags) $ do
-    withTiming dflags' "ppHtml" (const ()) $ do
+    withTiming logger "ppHtml" (const ()) $ do
       _ <- {-# SCC ppHtml #-}
-           ppHtml pkgs title pkgStr visibleIfaces reexportedIfaces odir
+           ppHtml unit_state title pkgStr visibleIfaces reexportedIfaces odir
                   prologue
                   themes opt_mathjax sourceUrls' opt_wiki_urls opt_base_url
-                  opt_contents_url opt_index_url unicode sincePkg qual
-                  pretty withQuickjump
+                  opt_contents_url opt_index_url unicode sincePkg packageInfo
+                  qual pretty withQuickjump
       return ()
     unless withBaseURL $ do
       copyHtmlBits odir libDir themes withQuickjump
@@ -445,7 +490,7 @@ render dflags flags sinceQual qual ifaces installedIfaces extSrcMap = do
 
             pkgVer =
               fromMaybe (makeVersion []) mpkgVer
-          in ppHoogle dflags' pkgNameStr pkgVer title (fmap _doc prologue)
+          in ppHoogle dflags' unit_state pkgNameStr pkgVer title (fmap _doc prologue)
                visibleIfaces odir
       _ -> putStrLn . unlines $
           [ "haddock: Unable to find a package providing module "
@@ -458,14 +503,14 @@ render dflags flags sinceQual qual ifaces installedIfaces extSrcMap = do
           ]
 
   when (Flag_LaTeX `elem` flags) $ do
-    withTiming dflags' "ppLatex" (const ()) $ do
+    withTiming logger "ppLatex" (const ()) $ do
       _ <- {-# SCC ppLatex #-}
            ppLaTeX title pkgStr visibleIfaces odir (fmap _doc prologue) opt_latex_style
                    libDir
       return ()
 
   when (Flag_HyperlinkedSource `elem` flags && not (null ifaces)) $ do
-    withTiming dflags' "ppHyperlinkedSource" (const ()) $ do
+    withTiming logger "ppHyperlinkedSource" (const ()) $ do
       _ <- {-# SCC ppHyperlinkedSource #-}
            ppHyperlinkedSource (verbosity flags) odir libDir opt_source_css pretty srcMap ifaces
       return ()
@@ -476,23 +521,22 @@ render dflags flags sinceQual qual ifaces installedIfaces extSrcMap = do
 -------------------------------------------------------------------------------
 
 
-readInterfaceFiles :: MonadIO m
-                   => NameCacheAccessor m
-                   -> [(DocPaths, FilePath)]
+readInterfaceFiles :: NameCache
+                   -> [(DocPaths, Visibility, FilePath)]
                    -> Bool
-                   -> m [(DocPaths, FilePath, InterfaceFile)]
+                   -> IO [(DocPaths, Visibility, FilePath, InterfaceFile)]
 readInterfaceFiles name_cache_accessor pairs bypass_version_check = do
   catMaybes `liftM` mapM ({-# SCC readInterfaceFile #-} tryReadIface) pairs
   where
     -- try to read an interface, warn if we can't
-    tryReadIface (paths, file) =
+    tryReadIface (paths, vis, file) =
       readInterfaceFile name_cache_accessor file bypass_version_check >>= \case
-        Left err -> liftIO $ do
+        Left err -> do
           putStrLn ("Warning: Cannot read " ++ file ++ ":")
           putStrLn ("   " ++ err)
           putStrLn "Skipping this interface."
           return Nothing
-        Right f -> return (Just (paths, file, f))
+        Right f -> return (Just (paths, vis, file, f))
 
 
 -------------------------------------------------------------------------------
@@ -504,7 +548,8 @@ readInterfaceFiles name_cache_accessor pairs bypass_version_check = do
 -- compilation and linking. Then run the given 'Ghc' action.
 withGhc' :: String -> Bool -> [String] -> (DynFlags -> Ghc a) -> IO a
 withGhc' libDir needHieFiles flags ghcActs = runGhc (Just libDir) $ do
-  dynflags' <- parseGhcFlags =<< getSessionDynFlags
+  logger <- getLogger
+  dynflags' <- parseGhcFlags logger =<< getSessionDynFlags
 
   -- We disable pattern match warnings because than can be very
   -- expensive to check
@@ -528,20 +573,20 @@ withGhc' libDir needHieFiles flags ghcActs = runGhc (Just libDir) $ do
             go arg    func True = arg : func True
 
 
-    parseGhcFlags :: MonadIO m => DynFlags -> m DynFlags
-    parseGhcFlags dynflags = do
+    parseGhcFlags :: MonadIO m => Logger -> DynFlags -> m DynFlags
+    parseGhcFlags logger dynflags = do
       -- TODO: handle warnings?
 
       let extra_opts | needHieFiles = [Opt_WriteHie, Opt_Haddock]
                      | otherwise = [Opt_Haddock]
           dynflags' = (foldl' gopt_set dynflags extra_opts)
-                        { hscTarget = HscNothing
-                        , ghcMode   = CompManager
-                        , ghcLink   = NoLink
+                        { backend = NoBackend
+                        , ghcMode = CompManager
+                        , ghcLink = NoLink
                         }
           flags' = filterRtsFlags flags
 
-      (dynflags'', rest, _) <- parseDynamicFlags dynflags' (map noLoc flags')
+      (dynflags'', rest, _) <- parseDynamicFlags logger dynflags' (map noLoc flags')
       if not (null rest)
         then throwE ("Couldn't parse GHC options: " ++ unwords flags')
         else return dynflags''

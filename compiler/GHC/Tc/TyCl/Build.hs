@@ -3,7 +3,7 @@
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
 -}
 
-{-# LANGUAGE CPP #-}
+
 
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 
@@ -15,14 +15,11 @@ module GHC.Tc.TyCl.Build (
         newImplicitBinder, newTyConRepName
     ) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
 import GHC.Iface.Env
 import GHC.Core.FamInstEnv( FamInstEnvs, mkNewTypeCoAxiom )
-import GHC.Builtin.Types( isCTupleTyConName )
-import GHC.Builtin.Types.Prim ( voidPrimTy )
+import GHC.Builtin.Types( isCTupleTyConName, unboxedUnitTy )
 import GHC.Core.DataCon
 import GHC.Core.PatSyn
 import GHC.Types.Var
@@ -34,16 +31,16 @@ import GHC.Types.Id.Make
 import GHC.Core.Class
 import GHC.Core.TyCon
 import GHC.Core.Type
-import GHC.Types.Id
+import GHC.Types.SourceText
 import GHC.Tc.Utils.TcType
 import GHC.Core.Multiplicity
 
 import GHC.Types.SrcLoc( SrcSpan, noSrcSpan )
-import GHC.Driver.Session
 import GHC.Tc.Utils.Monad
 import GHC.Types.Unique.Supply
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
 
 
 mkNewTyConRhs :: Name -> TyCon -> DataCon -> TcRnIf m n AlgTyConRhs
@@ -54,11 +51,11 @@ mkNewTyConRhs tycon_name tycon con
   = do  { co_tycon_name <- newImplicitBinder tycon_name mkNewTyCoOcc
         ; let nt_ax = mkNewTypeCoAxiom co_tycon_name tycon etad_tvs etad_roles etad_rhs
         ; traceIf (text "mkNewTyConRhs" <+> ppr nt_ax)
-        ; return (NewTyCon { data_con    = con,
-                             nt_rhs      = rhs_ty,
-                             nt_etad_rhs = (etad_tvs, etad_rhs),
-                             nt_co       = nt_ax,
-                             nt_lev_poly = isKindLevPoly res_kind } ) }
+        ; return (NewTyCon { data_con     = con,
+                             nt_rhs       = rhs_ty,
+                             nt_etad_rhs  = (etad_tvs, etad_rhs),
+                             nt_co        = nt_ax,
+                             nt_fixed_rep = isFixedRuntimeRepKind res_kind } ) }
                              -- Coreview looks through newtypes with a Nothing
                              -- for nt_co, or uses explicit coercions otherwise
   where
@@ -79,6 +76,8 @@ mkNewTyConRhs tycon_name tycon con
         -- has a single argument (Foo a) that is a *type class*, so
         -- dataConInstOrigArgTys returns [].
 
+    -- Eta-reduce the newtype
+    -- See Note [Newtype eta] in GHC.Core.TyCon
     etad_tvs   :: [TyVar]  -- Matched lazily, so that mkNewTypeCo can
     etad_roles :: [Role]   -- return a TyCon without pulling on rhs_ty
     etad_rhs   :: Type     -- See Note [Tricky iface loop] in GHC.Iface.Load
@@ -89,21 +88,59 @@ mkNewTyConRhs tycon_name tycon con
                -> Type          -- Rhs type
                -> ([TyVar], [Role], Type)  -- Eta-reduced version
                                            -- (tyvars in normal order)
-    eta_reduce (a:as) (_:rs) ty | Just (fun, arg) <- splitAppTy_maybe ty,
-                                  Just tv <- getTyVar_maybe arg,
-                                  tv == a,
-                                  not (a `elemVarSet` tyCoVarsOfType fun)
-                                = eta_reduce as rs fun
-    eta_reduce tvs rs ty = (reverse tvs, reverse rs, ty)
+    eta_reduce (a:as) (_:rs) ty
+      | Just (fun, arg) <- splitAppTy_maybe ty
+      , Just tv <- getTyVar_maybe arg
+      , tv == a
+      , not (a `elemVarSet` tyCoVarsOfType fun)
+      , typeKind fun `eqType` typeKind (mkTyConApp tycon (mkTyVarTys $ reverse as))
+        -- Why this kind-check?  See Note [Newtype eta and homogeneous axioms]
+      = eta_reduce as rs fun
+    eta_reduce as rs ty = (reverse as, reverse rs, ty)
+
+{- Note [Newtype eta and homogeneous axioms]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When eta-reducing a newtype, we must be careful to make sure the axiom
+is homogeneous.  (That is, the two types related by the axiom must
+have the same kind.)  All known proofs of type safety for Core rely on
+the homogeneity of axioms, so let's not monkey with that.
+
+It is easy to mistakenly make an inhomogeneous axiom (#19739):
+  type T :: forall (a :: Type) -> Type
+  newtype T a = MkT (Proxy a)
+
+Can we eta-reduce, thus?
+  axT :: T ~ Proxy
+
+No!  Because
+   T     :: forall a -> Type
+   Proxy :: Type     -> Type
+
+This is inhomogeneous. Hence, we have an extra kind-check in eta_reduce,
+to make sure the reducts have the same kind. This is simple, although
+perhaps quadratic in complexity, if we eta-reduce many arguments (which
+seems vanishingly unlikely in practice).  But NB that the free-variable
+check, which immediately precedes the kind check, is also potentially
+quadratic.
+
+There are other ways we could do the check (discussion on #19739):
+
+* We could look at the sequence of binders on the newtype and on the
+  head of the representation type, and make sure the visibilities on
+  the binders match up. This is quite a bit more code, and the reasoning
+  is subtler.
+
+* We could, say, do the kind-check at the end and then backtrack until the
+  kinds match up. Hard to know whether that's more performant or not.
+-}
 
 ------------------------------------------------------
 buildDataCon :: FamInstEnvs
+            -> DataConBangOpts
             -> Name
             -> Bool                     -- Declared infix
             -> TyConRepName
             -> [HsSrcBang]
-            -> Maybe [HsImplBang]
-                -- See Note [Bangs on imported data constructors] in GHC.Types.Id.Make
            -> [FieldLabel]             -- Field labels
            -> [TyVar]                  -- Universals
            -> [TyCoVar]                -- Existentials
@@ -121,7 +158,7 @@ buildDataCon :: FamInstEnvs
 --   a) makes the worker Id
 --   b) makes the wrapper Id if necessary, including
 --      allocating its unique (hence monadic)
-buildDataCon fam_envs src_name declared_infix prom_info src_bangs impl_bangs
+buildDataCon fam_envs dc_bang_opts src_name declared_infix prom_info src_bangs
              field_lbls univ_tvs ex_tvs user_tvbs eq_spec ctxt arg_tys res_ty
              rep_tycon tag_map
   = do  { wrap_name <- newImplicitBinder src_name mkDataConWrapperOcc
@@ -132,7 +169,6 @@ buildDataCon fam_envs src_name declared_infix prom_info src_bangs impl_bangs
 
         ; traceIf (text "buildDataCon 1" <+> ppr src_name)
         ; us <- newUniqueSupply
-        ; dflags <- getDynFlags
         ; let stupid_ctxt = mkDataConStupidTheta rep_tycon (map scaledThing arg_tys) univ_tvs
               tag = lookupNameEnv_NF tag_map src_name
               -- See Note [Constructor tag allocation], fixes #14657
@@ -142,8 +178,7 @@ buildDataCon fam_envs src_name declared_infix prom_info src_bangs impl_bangs
                                    arg_tys res_ty NoRRI rep_tycon tag
                                    stupid_ctxt dc_wrk dc_rep
               dc_wrk = mkDataConWorkId work_name data_con
-              dc_rep = initUs_ us (mkDataConRep dflags fam_envs wrap_name
-                                                impl_bangs data_con)
+              dc_rep = initUs_ us (mkDataConRep dc_bang_opts fam_envs wrap_name data_con)
 
         ; traceIf (text "buildDataCon 2" <+> ppr src_name)
         ; return data_con }
@@ -153,6 +188,8 @@ buildDataCon fam_envs src_name declared_infix prom_info src_bangs impl_bangs
 -- the type variables mentioned in the arg_tys
 -- ToDo: Or functionally dependent on?
 --       This whole stupid theta thing is, well, stupid.
+--
+-- See Note [The stupid context] in GHC.Core.DataCon.
 mkDataConStupidTheta :: TyCon -> [Type] -> [TyVar] -> [PredType]
 mkDataConStupidTheta tycon arg_tys univ_tvs
   | null stupid_theta = []      -- The common case
@@ -170,38 +207,38 @@ mkDataConStupidTheta tycon arg_tys univ_tvs
 
 ------------------------------------------------------
 buildPatSyn :: Name -> Bool
-            -> (Id,Bool) -> Maybe (Id, Bool)
+            -> PatSynMatcher -> PatSynBuilder
             -> ([InvisTVBinder], ThetaType) -- ^ Univ and req
             -> ([InvisTVBinder], ThetaType) -- ^ Ex and prov
-            -> [Type]                       -- ^ Argument types
+            -> [FRRType]                    -- ^ Argument types
             -> Type                         -- ^ Result type
             -> [FieldLabel]                 -- ^ Field labels for
                                             --   a record pattern synonym
             -> PatSyn
-buildPatSyn src_name declared_infix matcher@(matcher_id,_) builder
+buildPatSyn src_name declared_infix matcher@(_, matcher_ty,_) builder
             (univ_tvs, req_theta) (ex_tvs, prov_theta) arg_tys
             pat_ty field_labels
   = -- The assertion checks that the matcher is
     -- compatible with the pattern synonym
-    ASSERT2((and [ univ_tvs `equalLength` univ_tvs1
-                 , ex_tvs `equalLength` ex_tvs1
-                 , pat_ty `eqType` substTy subst (scaledThing pat_ty1)
-                 , prov_theta `eqTypes` substTys subst prov_theta1
-                 , req_theta `eqTypes` substTys subst req_theta1
-                 , compareArgTys arg_tys (substTys subst (map scaledThing arg_tys1))
-                 ])
-            , (vcat [ ppr univ_tvs <+> twiddle <+> ppr univ_tvs1
+    assertPpr (and [ univ_tvs `equalLength` univ_tvs1
+                   , ex_tvs `equalLength` ex_tvs1
+                   , pat_ty `eqType` substTy subst (scaledThing pat_ty1)
+                   , prov_theta `eqTypes` substTys subst prov_theta1
+                   , req_theta `eqTypes` substTys subst req_theta1
+                   , compareArgTys arg_tys (substTys subst (map scaledThing arg_tys1))
+                   ])
+              (vcat [ ppr univ_tvs <+> twiddle <+> ppr univ_tvs1
                     , ppr ex_tvs <+> twiddle <+> ppr ex_tvs1
                     , ppr pat_ty <+> twiddle <+> ppr pat_ty1
                     , ppr prov_theta <+> twiddle <+> ppr prov_theta1
                     , ppr req_theta <+> twiddle <+> ppr req_theta1
-                    , ppr arg_tys <+> twiddle <+> ppr arg_tys1]))
+                    , ppr arg_tys <+> twiddle <+> ppr arg_tys1]) $
     mkPatSyn src_name declared_infix
              (univ_tvs, req_theta) (ex_tvs, prov_theta)
              arg_tys pat_ty
              matcher builder field_labels
   where
-    ((_:_:univ_tvs1), req_theta1, tau) = tcSplitSigmaTy $ idType matcher_id
+    ((_:_:univ_tvs1), req_theta1, tau) = tcSplitSigmaTy $ matcher_ty
     ([pat_ty1, cont_sigma, _], _)      = tcSplitFunTys tau
     (ex_tvs1, prov_theta1, cont_tau)   = tcSplitSigmaTy (scaledThing cont_sigma)
     (arg_tys1, _) = (tcSplitFunTys cont_tau)
@@ -209,11 +246,11 @@ buildPatSyn src_name declared_infix matcher@(matcher_id,_) builder
     subst = zipTvSubst (univ_tvs1 ++ ex_tvs1)
                        (mkTyVarTys (binderVars (univ_tvs ++ ex_tvs)))
 
-    -- For a nullary pattern synonym we add a single void argument to the
+    -- For a nullary pattern synonym we add a single (# #) argument to the
     -- matcher to preserve laziness in the case of unlifted types.
     -- See #12746
     compareArgTys :: [Type] -> [Type] -> Bool
-    compareArgTys [] [x] = x `eqType` voidPrimTy
+    compareArgTys [] [x] = x `eqType` unboxedUnitTy
     compareArgTys arg_tys matcher_arg_tys = arg_tys `eqTypes` matcher_arg_tys
 
 
@@ -253,7 +290,8 @@ buildClass tycon_name binders roles fds Nothing
         ; tc_rep_name  <- newTyConRepName tycon_name
         ; let univ_tvs = binderVars binders
               tycon = mkClassTyCon tycon_name binders roles
-                                   AbstractTyCon rec_clas tc_rep_name
+                                   AbstractTyCon
+                                   rec_clas tc_rep_name
               result = mkAbstractClass tycon_name univ_tvs fds tycon
         ; traceIf (text "buildClass" <+> ppr tycon)
         ; return result }
@@ -288,7 +326,7 @@ buildClass tycon_name binders roles fds
                 --       i.e. exactly one operation or superclass taken together
                 --   (b) that value is of lifted type (which they always are, because
                 --       we box equality superclasses)
-                -- See note [Class newtypes and equality predicates]
+                -- See Note [Class newtypes and equality predicates]
 
                 -- We treat the dictionary superclasses as ordinary arguments.
                 -- That means that in the case of
@@ -301,14 +339,15 @@ buildClass tycon_name binders roles fds
               rec_tycon  = classTyCon rec_clas
               univ_bndrs = tyConInvisTVBinders binders
               univ_tvs   = binderVars univ_bndrs
+              bang_opts  = FixedBangOpts (map (const HsLazy) args)
 
         ; rep_nm   <- newTyConRepName datacon_name
         ; dict_con <- buildDataCon (panic "buildClass: FamInstEnvs")
+                                   bang_opts
                                    datacon_name
                                    False        -- Not declared infix
                                    rep_nm
                                    (map (const no_bang) args)
-                                   (Just (map (const HsLazy) args))
                                    [{- No fields -}]
                                    univ_tvs
                                    [{- no existentials -}]

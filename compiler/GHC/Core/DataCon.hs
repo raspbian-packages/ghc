@@ -5,7 +5,7 @@
 \section[DataCon]{@DataCon@: Data Constructors}
 -}
 
-{-# LANGUAGE CPP, DeriveDataTypeable #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 
 module GHC.Core.DataCon (
         -- * Main data types
@@ -14,6 +14,7 @@ module GHC.Core.DataCon (
         HsSrcBang(..), HsImplBang(..),
         StrictnessMark(..),
         ConTag,
+        DataConEnv,
 
         -- ** Equality specs
         EqSpec, mkEqSpec, eqSpecTyVar, eqSpecType,
@@ -21,7 +22,7 @@ module GHC.Core.DataCon (
         substEqSpec, filterEqSpec,
 
         -- ** Field labels
-        FieldLbl(..), FieldLabel, FieldLabelString,
+        FieldLabel(..), FieldLabelString,
 
         -- ** Type construction
         mkDataCon, fIRST_TAG,
@@ -40,6 +41,7 @@ module GHC.Core.DataCon (
         dataConOtherTheta,
         dataConInstArgTys, dataConOrigArgTys, dataConOrigResTy,
         dataConInstOrigArgTys, dataConRepArgTys,
+        dataConInstUnivs,
         dataConFieldLabels, dataConFieldType, dataConFieldType_maybe,
         dataConSrcBangs,
         dataConSourceArity, dataConRepArity,
@@ -51,18 +53,17 @@ module GHC.Core.DataCon (
         splitDataProductType_maybe,
 
         -- ** Predicates on DataCons
-        isNullarySrcDataCon, isNullaryRepDataCon, isTupleDataCon, isUnboxedTupleCon,
-        isUnboxedSumCon,
-        isVanillaDataCon, classDataCon, dataConCannotMatch,
+        isNullarySrcDataCon, isNullaryRepDataCon,
+        isTupleDataCon, isBoxedTupleDataCon, isUnboxedTupleDataCon,
+        isUnboxedSumDataCon,
+        isVanillaDataCon, isNewDataCon, classDataCon, dataConCannotMatch,
         dataConUserTyVarsArePermuted,
-        isBanged, isMarkedStrict, eqHsBang, isSrcStrict, isSrcUnpacked,
+        isBanged, isMarkedStrict, cbvFromStrictMark, eqHsBang, isSrcStrict, isSrcUnpacked,
         specialPromotedDc,
 
         -- ** Promotion related functions
         promoteDataCon
     ) where
-
-#include "HsVersions.h"
 
 import GHC.Prelude
 
@@ -71,24 +72,31 @@ import GHC.Core.Type as Type
 import GHC.Core.Coercion
 import GHC.Core.Unify
 import GHC.Core.TyCon
+import GHC.Core.TyCo.Subst
 import GHC.Core.Multiplicity
+import {-# SOURCE #-} GHC.Types.TyThing
 import GHC.Types.FieldLabel
+import GHC.Types.SourceText
 import GHC.Core.Class
 import GHC.Types.Name
 import GHC.Builtin.Names
 import GHC.Core.Predicate
 import GHC.Types.Var
-import GHC.Utils.Outputable
-import GHC.Utils.Misc
+import GHC.Types.Var.Env
 import GHC.Types.Basic
 import GHC.Data.FastString
-import GHC.Unit
+import GHC.Unit.Types
+import GHC.Unit.Module.Name
 import GHC.Utils.Binary
+import GHC.Types.Unique.FM ( UniqFM )
 import GHC.Types.Unique.Set
-import GHC.Types.Unique( mkAlphaTyVarUnique )
+import GHC.Builtin.Uniques( mkAlphaTyVarUnique )
 
-import GHC.Driver.Session
-import GHC.LanguageExtensions as LangExt
+
+import GHC.Utils.Outputable
+import GHC.Utils.Misc
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Builder as BSB
@@ -98,8 +106,8 @@ import Data.Char
 import Data.List( find )
 
 {-
-Data constructor representation
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Note [Data constructor representation]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Consider the following Haskell data type declaration
 
         data T = T !Int ![Int]
@@ -193,11 +201,14 @@ Note [Data constructor workers and wrappers]
 * INVARIANT: the dictionary constructor for a class
              never has a wrapper.
 
+* See Note [Data Constructor Naming] for how the worker and wrapper
+  are named
+
 * Neither_ the worker _nor_ the wrapper take the dcStupidTheta dicts as arguments
 
 * The wrapper (if it exists) takes dcOrigArgTys as its arguments.
   The worker takes dataConRepArgTys as its arguments
-  If the worker is absent, dataConRepArgTys is the same as dcOrigArgTys
+  If the wrapper is absent, dataConRepArgTys is the same as dcOrigArgTys
 
 * The 'NoDataConRep' case of DataConRep is important. Not only is it
   efficient, but it also ensures that the wrapper is replaced by the
@@ -246,11 +257,20 @@ Data types can have a context:
 
         data (Eq a, Ord b) => T a b = T1 a b | T2 a
 
-and that makes the constructors have a context too
-(notice that T2's context is "thinned"):
+And that makes the constructors have a context too. A constructor's context
+isn't necessarily the same as the data type's context, however. Per the
+Haskell98 Report, the part of the datatype context that is used in a data
+constructor is the largest subset of the datatype context that constrains
+only the type variables free in the data constructor's field types. For
+example, here are the types of T1 and T2:
 
         T1 :: (Eq a, Ord b) => a -> b -> T a b
         T2 :: (Eq a) => a -> T a b
+
+Notice that T2's context is "thinned". Since its field is of type `a`, only
+the part of the datatype context that mentions `a`—that is, `Eq a`—is
+included in T2's context. On the other hand, T1's fields mention both `a`
+and `b`, so T1's context includes all of the datatype context.
 
 Furthermore, this context pops up when pattern matching
 (though GHC hasn't implemented this, but it is in H98, and
@@ -262,36 +282,49 @@ gets inferred type
 
 I say the context is "stupid" because the dictionaries passed
 are immediately discarded -- they do nothing and have no benefit.
+(See Note [Instantiating stupid theta] in GHC.Tc.Gen.Head.)
 It's a flaw in the language.
 
-        Up to now [March 2002] I have put this stupid context into the
-        type of the "wrapper" constructors functions, T1 and T2, but
-        that turned out to be jolly inconvenient for generics, and
-        record update, and other functions that build values of type T
-        (because they don't have suitable dictionaries available).
+GHC has made some efforts to correct this flaw. In GHC, datatype contexts
+are not available by default. Instead, one must explicitly opt in to them by
+using the DatatypeContexts extension. To discourage their use, GHC has
+deprecated DatatypeContexts.
 
-        So now I've taken the stupid context out.  I simply deal with
-        it separately in the type checker on occurrences of a
-        constructor, either in an expression or in a pattern.
+Some other notes about stupid contexts:
 
-        [May 2003: actually I think this decision could easily be
-        reversed now, and probably should be.  Generics could be
-        disabled for types with a stupid context; record updates now
-        (H98) needs the context too; etc.  It's an unforced change, so
-        I'm leaving it for now --- but it does seem odd that the
-        wrapper doesn't include the stupid context.]
+* Stupid contexts can interact badly with `deriving`. For instance, it's
+  unclear how to make this derived Functor instance typecheck:
 
-[July 04] With the advent of generalised data types, it's less obvious
-what the "stupid context" is.  Consider
-        C :: forall a. Ord a => a -> a -> T (Foo a)
-Does the C constructor in Core contain the Ord dictionary?  Yes, it must:
+    data Eq a => T a = MkT a
+      deriving Functor
 
-        f :: T b -> Ordering
-        f = /\b. \x:T b.
-            case x of
-                C a (d:Ord a) (p:a) (q:a) -> compare d p q
+  This is because the derived instance would need to look something like
+  `instance Functor T where ...`, but there is nowhere to mention the
+  requisite `Eq a` constraint. For this reason, GHC will throw an error if a
+  user attempts to derive an instance for Functor (or a Functor-like class)
+  where the last type variable is used in a datatype context. For Generic(1),
+  the requirements are even harsher, as stupid contexts are not allowed at all
+  in derived Generic(1) instances. (We could consider relaxing this requirement
+  somewhat, although no one has asked for this yet.)
 
-Note that (Foo a) might not be an instance of Ord.
+  Stupid contexts are permitted when deriving instances of non-Functor-like
+  classes, or when deriving instances of Functor-like classes where the last
+  type variable isn't mentioned in the stupid context. For example, the
+  following is permitted:
+
+    data Show a => T a = MkT deriving Eq
+
+  Note that because of the "thinning" behavior mentioned above, the generated
+  Eq instance should not mention `Show a`, as the type of MkT doesn't require
+  it. That is, the following should be generated (#20501):
+
+    instance Eq (T a) where
+      (MkT == MkT) = True
+
+* It's not obvious how stupid contexts should interact with GADTs. For this
+  reason, GHC disallows combining datatype contexts with GADT syntax. As a
+  result, dcStupidTheta is always empty for data types defined using GADT
+  syntax.
 
 ************************************************************************
 *                                                                      *
@@ -305,7 +338,7 @@ Note that (Foo a) might not be an instance of Ord.
 -- - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnOpen',
 --             'GHC.Parser.Annotation.AnnClose','GHC.Parser.Annotation.AnnComma'
 
--- For details on above see note [Api annotations] in GHC.Parser.Annotation
+-- For details on above see Note [exact print annotations] in GHC.Parser.Annotation
 data DataCon
   = MkData {
         dcName    :: Name,      -- This is the name of the *source data con*
@@ -409,7 +442,8 @@ data DataCon
                                         -- or, rather, a "thinned" version thereof
                 -- "Thinned", because the Report says
                 -- to eliminate any constraints that don't mention
-                -- tyvars free in the arg types for this constructor
+                -- tyvars free in the arg types for this constructor.
+                -- See Note [The stupid context].
                 --
                 -- INVARIANT: the free tyvars of dcStupidTheta are a subset of dcUnivTyVars
                 -- Reason: dcStupidTeta is gotten by thinning the stupid theta from the tycon
@@ -520,11 +554,21 @@ we can in Core. Consider having:
 
 Note [DataCon arities]
 ~~~~~~~~~~~~~~~~~~~~~~
-dcSourceArity does not take constraints into account,
-but dcRepArity does.  For example:
+A `DataCon`'s source arity and core representation arity may differ:
+`dcSourceArity` does not take constraints into account, but `dcRepArity` does.
+
+The additional arguments taken into account by `dcRepArity` include quantified
+dictionaries and coercion arguments, lifted and unlifted (despite the unlifted
+coercion arguments having a zero-width runtime representation).
+For example:
    MkT :: Ord a => a -> T a
     dcSourceArity = 1
     dcRepArity    = 2
+
+   MkU :: (b ~ '[]) => U b
+    dcSourceArity = 0
+    dcRepArity    = 1
+
 
 Note [DataCon user type variable binders]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -661,6 +705,8 @@ data DataConRep
 
     }
 
+type DataConEnv a = UniqFM DataCon a     -- Keyed by DataCon
+
 -------------------------
 
 -- | Haskell Source Bang
@@ -673,7 +719,7 @@ data DataConRep
 -- emit a warning (in checkValidDataCon) and treat it like
 -- @(HsSrcBang _ NoSrcUnpack SrcLazy)@
 data HsSrcBang =
-  HsSrcBang SourceText -- Note [Pragma source text] in GHC.Types.Basic
+  HsSrcBang SourceText -- Note [Pragma source text] in GHC.Types.SourceText
             SrcUnpackedness
             SrcStrictness
   deriving Data.Data
@@ -709,9 +755,10 @@ data SrcUnpackedness = SrcUnpack -- ^ {-# UNPACK #-} specified
 
 
 -------------------------
--- StrictnessMark is internal only, used to indicate strictness
+-- StrictnessMark is used to indicate strictness
 -- of the DataCon *worker* fields
 data StrictnessMark = MarkedStrict | NotMarkedStrict
+    deriving Eq
 
 -- | An 'EqSpec' is a tyvar/type pair representing an equality made in
 -- rejigging a GADT constructor
@@ -758,19 +805,36 @@ instance Outputable EqSpec where
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Notice that we do *not* say the worker Id is strict even if the data
 constructor is declared strict
-     e.g.    data T = MkT !(Int,Int)
-Why?  Because the *wrapper* $WMkT is strict (and its unfolding has case
-expressions that do the evals) but the *worker* MkT itself is not. If we
-pretend it is strict then when we see
-     case x of y -> MkT y
-the simplifier thinks that y is "sure to be evaluated" (because the worker MkT
-is strict) and drops the case.  No, the workerId MkT is not strict.
+     e.g.    data T = MkT ![Int] Bool
+Even though most often the evals are done by the *wrapper* $WMkT, there are
+situations in which tag inference will re-insert evals around the worker.
+So for all intents and purposes the *worker* MkT is strict, too!
 
-However, the worker does have StrictnessMarks.  When the simplifier sees a
-pattern
-     case e of MkT x -> ...
-it uses the dataConRepStrictness of MkT to mark x as evaluated; but that's
-fine... dataConRepStrictness comes from the data con not from the worker Id.
+Unfortunately, if we exposed accurate strictness of DataCon workers, we'd
+see the following transformation:
+
+  f xs = case xs of xs' { __DEFAULT -> ... case MkT xs b of x { __DEFAULT -> [x] } } -- DmdAnal: Strict in xs
+  ==> { drop-seq, binder swap on xs' }
+  f xs = case MkT xs b of x { __DEFAULT -> [x] } -- DmdAnal: Still strict in xs
+  ==> { case-to-let }
+  f xs = let x = MkT xs' b in [x] -- DmdAnal: No longer strict in xs!
+
+I.e., we are ironically losing strictness in `xs` by dropping the eval on `xs`
+and then doing case-to-let. The issue is that `exprIsHNF` currently says that
+every DataCon worker app is a value. The implicit assumption is that surrounding
+evals will have evaluated strict fields like `xs` before! But now that we had
+just dropped the eval on `xs`, that assumption is no longer valid.
+
+Long story short: By keeping the demand signature lazy, the Simplifier will not
+drop the eval on `xs` and using `exprIsHNF` to decide case-to-let and others
+remains sound.
+
+Similarly, during demand analysis in dmdTransformDataConSig, we bump up the
+field demand with `C_01`, *not* `C_11`, because the latter exposes too much
+strictness that will drop the eval on `xs` above.
+
+This issue is discussed at length in
+"Failed idea: no wrappers for strict data constructors" in #21497 and #22475.
 
 Note [Bangs on data constructor arguments]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -819,14 +883,40 @@ by MkId.mkDataConId) for two reasons:
 
         b) the constructor may store an unboxed version of a strict field.
 
-Here's an example illustrating both:
-        data Ord a => T a = MkT Int! a
+So whenever this module talks about the representation of a data constructor
+what it means is the DataCon with all Unpacking having been applied.
+We can think of this as the Core representation.
+
+Here's an example illustrating the Core representation:
+        data Ord a => T a = MkT Int! a Void#
 Here
-        T :: Ord a => Int -> a -> T a
+        T :: Ord a => Int -> a -> Void# -> T a
 but the rep type is
-        Trep :: Int# -> a -> T a
+        Trep :: Int# -> a -> Void# -> T a
 Actually, the unboxed part isn't implemented yet!
 
+Note that this representation is still *different* from runtime
+representation. (Which is what STG uses after unarise).
+
+This is how T would end up being used in STG post-unarise:
+
+  let x = T 1# y
+  in ...
+      case x of
+        T int a -> ...
+
+The Void# argument is dropped and the boxed int is replaced by an unboxed
+one. In essence we only generate binders for runtime relevant values.
+
+We also flatten out unboxed tuples in this process. See the unarise
+pass for details on how this is done. But as an example consider
+`data S = MkS Bool (# Bool | Char #)` which when matched on would
+result in an alternative with three binders like this
+
+    MkS bool tag tpl_field ->
+
+See Note [Translating unboxed sums to unboxed tuples] and Note [Unarisation]
+for the details of this transformation.
 
 
 ************************************************************************
@@ -882,6 +972,16 @@ instance Outputable StrictnessMark where
     ppr MarkedStrict    = text "!"
     ppr NotMarkedStrict = empty
 
+instance Binary StrictnessMark where
+    put_ bh NotMarkedStrict = putByte bh 0
+    put_ bh MarkedStrict    = putByte bh 1
+    get bh =
+      do h <- getByte bh
+         case h of
+           0 -> return NotMarkedStrict
+           1 -> return MarkedStrict
+           _ -> panic "Invalid binary format"
+
 instance Binary SrcStrictness where
     put_ bh SrcLazy     = putByte bh 0
     put_ bh SrcStrict   = putByte bh 1
@@ -931,6 +1031,11 @@ isSrcUnpacked _ = False
 isMarkedStrict :: StrictnessMark -> Bool
 isMarkedStrict NotMarkedStrict = False
 isMarkedStrict _               = True   -- All others are strict
+
+cbvFromStrictMark :: StrictnessMark -> CbvMark
+cbvFromStrictMark NotMarkedStrict = NotMarkedCbv
+cbvFromStrictMark MarkedStrict = MarkedCbv
+
 
 {- *********************************************************************
 *                                                                      *
@@ -1193,11 +1298,11 @@ dataConWrapId dc = case dcRep dc of
 -- the union of the 'dataConWorkId' and the 'dataConWrapId'
 dataConImplicitTyThings :: DataCon -> [TyThing]
 dataConImplicitTyThings (MkData { dcWorkId = work, dcRep = rep })
-  = [AnId work] ++ wrap_ids
+  = [mkAnId work] ++ wrap_ids
   where
     wrap_ids = case rep of
                  NoDataConRep               -> []
-                 DCR { dcr_wrap_id = wrap } -> [AnId wrap]
+                 DCR { dcr_wrap_id = wrap } -> [mkAnId wrap]
 
 -- | The labels for the fields of this particular 'DataCon'
 dataConFieldLabels :: DataCon -> [FieldLabel]
@@ -1227,9 +1332,10 @@ dataConSrcBangs = dcSrcBangs
 dataConSourceArity :: DataCon -> Arity
 dataConSourceArity (MkData { dcSourceArity = arity }) = arity
 
--- | Gives the number of actual fields in the /representation/ of the
--- data constructor. This may be more than appear in the source code;
--- the extra ones are the existentially quantified dictionaries
+-- | Gives the number of value arguments (including zero-width coercions)
+-- stored by the given `DataCon`'s worker in its Core representation. This may
+-- differ from the number of arguments that appear in the source code; see also
+-- Note [DataCon arities]
 dataConRepArity :: DataCon -> Arity
 dataConRepArity (MkData { dcRepArity = arity }) = arity
 
@@ -1238,8 +1344,14 @@ dataConRepArity (MkData { dcRepArity = arity }) = arity
 isNullarySrcDataCon :: DataCon -> Bool
 isNullarySrcDataCon dc = dataConSourceArity dc == 0
 
--- | Return whether there are any argument types for this 'DataCon's runtime representation type
--- See Note [DataCon arities]
+-- | Return whether this `DataCon`'s worker, in its Core representation, takes
+-- any value arguments.
+--
+-- In particular, remember that we include coercion arguments in the arity of
+-- the Core representation of the `DataCon` -- both lifted and unlifted
+-- coercions, despite the latter having zero-width runtime representation.
+--
+-- See also Note [DataCon arities].
 isNullaryRepDataCon :: DataCon -> Bool
 isNullaryRepDataCon dc = dataConRepArity dc == 0
 
@@ -1315,6 +1427,8 @@ dataConOrigResTy dc = dcOrigResTy dc
 -- | The \"stupid theta\" of the 'DataCon', such as @data Eq a@ in:
 --
 -- > data Eq a => T a = ...
+--
+-- See @Note [The stupid context]@.
 dataConStupidTheta :: DataCon -> ThetaType
 dataConStupidTheta dc = dcStupidTheta dc
 
@@ -1326,7 +1440,7 @@ MkT :: a %1 -> T a (with -XLinearTypes)
 or
 MkT :: a  -> T a (with -XNoLinearTypes)
 
-There are two different methods to retrieve a type of a datacon.
+There are three different methods to retrieve a type of a datacon.
 They differ in how linear fields are handled.
 
 1. dataConWrapperType:
@@ -1338,7 +1452,7 @@ The type of the constructor, with linear arrows replaced by unrestricted ones.
 Used when we don't want to introduce linear types to user (in holes
 and in types in hie used by haddock).
 
-3. dataConDisplayType (depends on DynFlags):
+3. dataConDisplayType (takes a boolean indicating if -XLinearTypes is enabled):
 The type we'd like to show in error messages, :info and -ddump-types.
 Ideally, it should reflect the type written by the user;
 the function returns a type with arrows that would be required
@@ -1376,18 +1490,22 @@ dataConWrapperType (MkData { dcUserTyVarBinders = user_tvbs,
     res_ty
 
 dataConNonlinearType :: DataCon -> Type
+-- Just like dataConWrapperType, but with the
+-- linearity on the arguments all zapped to Many
 dataConNonlinearType (MkData { dcUserTyVarBinders = user_tvbs,
                                dcOtherTheta = theta, dcOrigArgTys = arg_tys,
-                               dcOrigResTy = res_ty })
-  = let arg_tys' = map (\(Scaled w t) -> Scaled (case w of One -> Many; _ -> w) t) arg_tys
-    in mkInvisForAllTys user_tvbs $
-       mkInvisFunTysMany theta $
-       mkVisFunTys arg_tys' $
-       res_ty
+                               dcOrigResTy = res_ty,
+                               dcStupidTheta = stupid_theta })
+  = mkInvisForAllTys user_tvbs $
+    mkInvisFunTysMany (stupid_theta ++ theta) $
+    mkVisFunTys arg_tys' $
+    res_ty
+  where
+    arg_tys' = map (\(Scaled w t) -> Scaled (case w of One -> Many; _ -> w) t) arg_tys
 
-dataConDisplayType :: DynFlags -> DataCon -> Type
-dataConDisplayType dflags dc
-  = if xopt LangExt.LinearTypes dflags
+dataConDisplayType :: Bool -> DataCon -> Type
+dataConDisplayType show_linear_types dc
+  = if show_linear_types
     then dataConWrapperType dc
     else dataConNonlinearType dc
 
@@ -1403,9 +1521,9 @@ dataConInstArgTys :: DataCon    -- ^ A datacon with no existentials or equality 
                   -> [Scaled Type]
 dataConInstArgTys dc@(MkData {dcUnivTyVars = univ_tvs,
                               dcExTyCoVars = ex_tvs}) inst_tys
- = ASSERT2( univ_tvs `equalLength` inst_tys
-          , text "dataConInstArgTys" <+> ppr dc $$ ppr univ_tvs $$ ppr inst_tys)
-   ASSERT2( null ex_tvs, ppr dc )
+ = assertPpr (univ_tvs `equalLength` inst_tys)
+             (text "dataConInstArgTys" <+> ppr dc $$ ppr univ_tvs $$ ppr inst_tys) $
+   assertPpr (null ex_tvs) (ppr dc) $
    map (mapScaledType (substTyWith univ_tvs inst_tys)) (dataConRepArgTys dc)
 
 -- | Returns just the instantiated /value/ argument types of a 'DataCon',
@@ -1421,12 +1539,65 @@ dataConInstOrigArgTys
 dataConInstOrigArgTys dc@(MkData {dcOrigArgTys = arg_tys,
                                   dcUnivTyVars = univ_tvs,
                                   dcExTyCoVars = ex_tvs}) inst_tys
-  = ASSERT2( tyvars `equalLength` inst_tys
-           , text "dataConInstOrigArgTys" <+> ppr dc $$ ppr tyvars $$ ppr inst_tys )
+  = assertPpr (tyvars `equalLength` inst_tys)
+              (text "dataConInstOrigArgTys" <+> ppr dc $$ ppr tyvars $$ ppr inst_tys) $
     substScaledTys subst arg_tys
   where
     tyvars = univ_tvs ++ ex_tvs
     subst  = zipTCvSubst tyvars inst_tys
+
+-- | Given a data constructor @dc@ with /n/ universally quantified type
+-- variables @a_{1}@, @a_{2}@, ..., @a_{n}@, and given a list of argument
+-- types @dc_args@ of length /m/ where /m/ <= /n/, then:
+--
+-- @
+-- dataConInstUnivs dc dc_args
+-- @
+--
+-- Will return:
+--
+-- @
+-- [dc_arg_{1}, dc_arg_{2}, ..., dc_arg_{m}, a_{m+1}, ..., a_{n}]
+-- @
+--
+-- That is, return the list of universal type variables with
+-- @a_{1}@, @a_{2}@, ..., @a_{m}@ instantiated with
+-- @dc_arg_{1}@, @dc_arg_{2}@, ..., @dc_arg_{m}@. It is possible for @m@ to
+-- be less than @n@, in which case the remaining @n - m@ elements will simply
+-- be universal type variables (with their kinds possibly instantiated).
+--
+-- Examples:
+--
+-- * Given the data constructor @D :: forall a b. Foo a b@ and
+--   @dc_args@ @[Int, Bool]@, then @dataConInstUnivs D dc_args@ will return
+--   @[Int, Bool]@.
+--
+-- * Given the data constructor @D :: forall a b. Foo a b@ and
+--   @dc_args@ @[Int]@, then @@dataConInstUnivs D dc_args@ will return
+--   @[Int, b]@.
+--
+-- * Given the data constructor @E :: forall k (a :: k). Bar k a@ and
+--   @dc_args@ @[Type]@, then @@dataConInstUnivs D dc_args@ will return
+--   @[Type, (a :: Type)]@.
+--
+-- This is primarily used in @GHC.Tc.Deriv.*@ in service of instantiating data
+-- constructors' field types.
+-- See @Note [Instantiating field types in stock deriving]@ for a notable
+-- example of this.
+dataConInstUnivs :: DataCon -> [Type] -> [Type]
+dataConInstUnivs dc dc_args = chkAppend dc_args $ map mkTyVarTy dc_args_suffix
+  where
+    (dc_univs_prefix, dc_univs_suffix)
+                        = -- Assert that m <= n
+                          assertPpr (dc_args `leLength` dataConUnivTyVars dc)
+                                    (text "dataConInstUnivs"
+                                      <+> ppr dc_args
+                                      <+> ppr (dataConUnivTyVars dc)) $
+                          splitAt (length dc_args) $ dataConUnivTyVars dc
+    (_, dc_args_suffix) = substTyVarBndrs prefix_subst dc_univs_suffix
+    prefix_subst        = mkTvSubst prefix_in_scope prefix_env
+    prefix_in_scope     = mkInScopeSet $ tyCoVarsOfTypes dc_args
+    prefix_env          = zipTyEnv dc_univs_prefix dc_args
 
 -- | Returns the argument types of the wrapper, excluding all dictionary arguments
 -- and without substituting for any type variables
@@ -1446,7 +1617,7 @@ dataConRepArgTys (MkData { dcRep = rep
                          , dcOtherTheta = theta
                          , dcOrigArgTys = orig_arg_tys })
   = case rep of
-      NoDataConRep -> ASSERT( null eq_spec ) (map unrestricted theta) ++ orig_arg_tys
+      NoDataConRep -> assert (null eq_spec) $ (map unrestricted theta) ++ orig_arg_tys
       DCR { dcr_arg_tys = arg_tys } -> arg_tys
 
 -- | The string @package:module.name@ identifying a constructor, which is attached
@@ -1464,20 +1635,27 @@ dataConIdentity dc = LBS.toStrict $ BSB.toLazyByteString $ mconcat
        occNameFS $ nameOccName name
    ]
   where name = dataConName dc
-        mod  = ASSERT( isExternalName name ) nameModule name
+        mod  = assert (isExternalName name) $ nameModule name
 
 isTupleDataCon :: DataCon -> Bool
 isTupleDataCon (MkData {dcRepTyCon = tc}) = isTupleTyCon tc
 
-isUnboxedTupleCon :: DataCon -> Bool
-isUnboxedTupleCon (MkData {dcRepTyCon = tc}) = isUnboxedTupleTyCon tc
+isBoxedTupleDataCon :: DataCon -> Bool
+isBoxedTupleDataCon (MkData {dcRepTyCon = tc}) = isBoxedTupleTyCon tc
 
-isUnboxedSumCon :: DataCon -> Bool
-isUnboxedSumCon (MkData {dcRepTyCon = tc}) = isUnboxedSumTyCon tc
+isUnboxedTupleDataCon :: DataCon -> Bool
+isUnboxedTupleDataCon (MkData {dcRepTyCon = tc}) = isUnboxedTupleTyCon tc
+
+isUnboxedSumDataCon :: DataCon -> Bool
+isUnboxedSumDataCon (MkData {dcRepTyCon = tc}) = isUnboxedSumTyCon tc
 
 -- | Vanilla 'DataCon's are those that are nice boring Haskell 98 constructors
 isVanillaDataCon :: DataCon -> Bool
 isVanillaDataCon dc = dcVanilla dc
+
+-- | Is this the 'DataCon' of a newtype?
+isNewDataCon :: DataCon -> Bool
+isNewDataCon dc = isNewTyCon (dataConTyCon dc)
 
 -- | Should this DataCon be allowed in a type even without -XDataKinds?
 -- Currently, only Lifted & Unlifted
@@ -1486,7 +1664,7 @@ specialPromotedDc = isKindTyCon . dataConTyCon
 
 classDataCon :: Class -> DataCon
 classDataCon clas = case tyConDataCons (classTyCon clas) of
-                      (dict_constr:no_more) -> ASSERT( null no_more ) dict_constr
+                      (dict_constr:no_more) -> assert (null no_more) dict_constr
                       [] -> panic "classDataCon"
 
 dataConCannotMatch :: [Type] -> DataCon -> Bool
@@ -1554,15 +1732,13 @@ promoteDataCon (MkData { dcPromoted = tc }) = tc
 -- | Extract the type constructor, type argument, data constructor and it's
 -- /representation/ argument types from a type if it is a product type.
 --
--- Precisely, we return @Just@ for any type that is all of:
+-- Precisely, we return @Just@ for any data type that is all of:
 --
 --  * Concrete (i.e. constructors visible)
---
 --  * Single-constructor
+--  * ... which has no existentials
 --
---  * Not existentially quantified
---
--- Whether the type is a @data@ type or a @newtype@
+-- Whether the type is a @data@ type or a @newtype@.
 splitDataProductType_maybe
         :: Type                         -- ^ A product type, perhaps
         -> Maybe (TyCon,                -- The type constructor
@@ -1570,13 +1746,14 @@ splitDataProductType_maybe
                   DataCon,              -- The data constructor
                   [Scaled Type])        -- Its /representation/ arg types
 
-        -- Rejecting existentials is conservative.  Maybe some things
-        -- could be made to work with them, but I'm not going to sweat
-        -- it through till someone finds it's important.
+        -- Rejecting existentials means we don't have to worry about
+        -- freshening and substituting type variables
+        -- (See "GHC.Type.Id.Make.dataConArgUnpack")
 
 splitDataProductType_maybe ty
   | Just (tycon, ty_args) <- splitTyConApp_maybe ty
-  , Just con <- isDataProductTyCon_maybe tycon
+  , Just con <- tyConSingleDataCon_maybe tycon
+  , null (dataConExTyCoVars con) -- no existentials! See above
   = Just (tycon, ty_args, con, dataConInstArgTys con ty_args)
   | otherwise
   = Nothing

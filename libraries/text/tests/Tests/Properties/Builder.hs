@@ -2,7 +2,7 @@
 
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# OPTIONS_GHC -fno-enable-rewrite-rules -fno-warn-missing-signatures #-}
+{-# OPTIONS_GHC -fno-warn-missing-signatures #-}
 module Tests.Properties.Builder
     ( testBuilder
     ) where
@@ -14,7 +14,6 @@ import Test.QuickCheck
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.QuickCheck (testProperty)
 import Tests.QuickCheckUtils
-import Text.Show.Functions ()
 import qualified Data.List as L
 import qualified Data.Text.Lazy as TL
 import qualified Data.Text.Lazy.Builder as TB
@@ -23,13 +22,14 @@ import qualified Data.Text.Lazy.Builder.RealFloat as TB
 
 -- Builder.
 
-tb_singleton = id `eqP`
-               (unpackS . TB.toLazyText . mconcat . map TB.singleton)
-tb_fromText = L.concat `eq` (unpackS . TB.toLazyText . mconcat .
-                                   map (TB.fromText . packS))
+tb_singleton   = id `eqP` (unpackS . TB.toLazyText . mconcat . map TB.singleton)
+tb_fromString  = id `eq` (TL.unpack . TB.toLazyText . TB.fromString)
+tb_fromText    = id `eqP` (unpackS . TB.toLazyText . TB.fromText)
+tb_fromStrings = L.concat `eq` (TL.unpack . TB.toLazyText . mconcat . map TB.fromString)
+tb_fromTexts   = L.concat `eq` (unpackS . TB.toLazyText . mconcat . map (TB.fromText . packS))
 
 tb_associative s1 s2 s3 =
-    TB.toLazyText (b1 `mappend` (b2 `mappend` b3)) ==
+    TB.toLazyText (b1 `mappend` (b2 `mappend` b3)) ===
     TB.toLazyText ((b1 `mappend` b2) `mappend` b3)
   where b1 = TB.fromText (packS s1)
         b2 = TB.fromText (packS s2)
@@ -37,7 +37,7 @@ tb_associative s1 s2 s3 =
 
 -- Numeric builder stuff.
 
-tb_decimal :: (Integral a, Show a) => a -> Bool
+tb_decimal :: (Integral a, Show a) => a -> Property
 tb_decimal = (TB.toLazyText . TB.decimal) `eq` (TL.pack . show)
 
 tb_decimal_integer (a::Integer) = tb_decimal a
@@ -53,12 +53,12 @@ tb_decimal_word16 (a::Word16) = tb_decimal a
 tb_decimal_word32 (a::Word32) = tb_decimal a
 tb_decimal_word64 (a::Word64) = tb_decimal a
 
-tb_decimal_big_int (BigBounded (a::Int)) = tb_decimal a
-tb_decimal_big_int64 (BigBounded (a::Int64)) = tb_decimal a
-tb_decimal_big_word (BigBounded (a::Word)) = tb_decimal a
-tb_decimal_big_word64 (BigBounded (a::Word64)) = tb_decimal a
+tb_decimal_big_int (Large (a::Int)) = tb_decimal a
+tb_decimal_big_int64 (Large (a::Int64)) = tb_decimal a
+tb_decimal_big_word (Large (a::Word)) = tb_decimal a
+tb_decimal_big_word64 (Large (a::Word64)) = tb_decimal a
 
-tb_hex :: (Integral a, Show a) => a -> Bool
+tb_hex :: (Integral a, Show a) => a -> Property
 tb_hex = (TB.toLazyText . TB.hexadecimal) `eq` (TL.pack . flip showHex "")
 
 tb_hexadecimal_integer (a::Integer) = tb_hex a
@@ -73,7 +73,7 @@ tb_hexadecimal_word16 (a::Word16) = tb_hex a
 tb_hexadecimal_word32 (a::Word32) = tb_hex a
 tb_hexadecimal_word64 (a::Word64) = tb_hex a
 
-tb_realfloat :: (RealFloat a, Show a) => a -> Bool
+tb_realfloat :: (RealFloat a, Show a) => a -> Property
 tb_realfloat = (TB.toLazyText . TB.realFloat) `eq` (TL.pack . show)
 
 tb_realfloat_float (a::Float) = tb_realfloat a
@@ -103,8 +103,11 @@ tb_formatRealFloat_double (a::Double) = tb_formatRealFloat a
 testBuilder :: TestTree
 testBuilder =
   testGroup "builder" [
-    testProperty "tb_fromText" tb_fromText,
     testProperty "tb_singleton" tb_singleton,
+    testProperty "tb_fromString" tb_fromString,
+    testProperty "tb_fromText" tb_fromText,
+    testProperty "tb_fromStrings" tb_fromStrings,
+    testProperty "tb_fromTexts" tb_fromTexts,
     testProperty "tb_associative" tb_associative,
     testGroup "decimal" [
       testProperty "tb_decimal_int" tb_decimal_int,

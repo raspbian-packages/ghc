@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP #-}
+
 
 --------------------------------------------------------------------------------
 -- | Deal with Cmm registers
@@ -9,8 +9,6 @@ module GHC.CmmToLlvm.Regs (
         stgTBAA, baseN, stackN, heapN, rxN, topN, tbaa, getTBAA
     ) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
 import GHC.Llvm
@@ -18,7 +16,7 @@ import GHC.Llvm
 import GHC.Cmm.Expr
 import GHC.Platform
 import GHC.Data.FastString
-import GHC.Utils.Outputable ( panic )
+import GHC.Utils.Panic ( panic )
 import GHC.Types.Unique
 
 -- | Get the LlvmVar function variable storing the real register
@@ -50,12 +48,12 @@ lmGlobalReg platform suf reg
         VanillaReg 9 _ -> wordGlobal $ "R9" ++ suf
         VanillaReg 10 _ -> wordGlobal $ "R10" ++ suf
         SpLim          -> wordGlobal $ "SpLim" ++ suf
-        FloatReg 1     -> floatGlobal $"F1" ++ suf
-        FloatReg 2     -> floatGlobal $"F2" ++ suf
-        FloatReg 3     -> floatGlobal $"F3" ++ suf
-        FloatReg 4     -> floatGlobal $"F4" ++ suf
-        FloatReg 5     -> floatGlobal $"F5" ++ suf
-        FloatReg 6     -> floatGlobal $"F6" ++ suf
+        FloatReg 1     -> floatGlobal $ "F1" ++ suf
+        FloatReg 2     -> floatGlobal $ "F2" ++ suf
+        FloatReg 3     -> floatGlobal $ "F3" ++ suf
+        FloatReg 4     -> floatGlobal $ "F4" ++ suf
+        FloatReg 5     -> floatGlobal $ "F5" ++ suf
+        FloatReg 6     -> floatGlobal $ "F6" ++ suf
         DoubleReg 1    -> doubleGlobal $ "D1" ++ suf
         DoubleReg 2    -> doubleGlobal $ "D2" ++ suf
         DoubleReg 3    -> doubleGlobal $ "D3" ++ suf

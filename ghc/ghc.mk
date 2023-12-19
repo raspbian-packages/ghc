@@ -19,14 +19,9 @@ ghc_stage2_CONFIGURE_OPTS += --flags=stage2
 ghc_stage3_CONFIGURE_OPTS += --flags=stage3
 
 ifeq "$(GhcWithInterpreter)" "YES"
-ghc_stage2_CONFIGURE_OPTS += --flags=ghci
-ghc_stage3_CONFIGURE_OPTS += --flags=ghci
+ghc_stage2_CONFIGURE_OPTS += --flags=internal-interpreter
+ghc_stage3_CONFIGURE_OPTS += --flags=internal-interpreter
 endif
-
-# This package doesn't pass the Cabal checks because data-dir
-# points outside the source directory. This isn't a real problem, so
-# we just skip the check.
-ghc_NO_CHECK = YES
 
 ghc_stage1_MORE_HC_OPTS = $(GhcStage1HcOpts)
 ghc_stage2_MORE_HC_OPTS = $(GhcStage2HcOpts)
@@ -37,15 +32,6 @@ ghc_stage3_MORE_HC_OPTS = $(GhcStage3HcOpts)
 ghc_stage1_UseGhcForCC = YES
 ghc_stage2_UseGhcForCC = YES
 ghc_stage3_UseGhcForCC = YES
-
-ghc_stage1_C_FILES_NODEPS = ghc/hschooks.c
-
-ghc_stage2_MKDEPENDC_OPTS = -DMAKING_GHC_BUILD_SYSTEM_DEPENDENCIES
-ghc_stage3_MKDEPENDC_OPTS = -DMAKING_GHC_BUILD_SYSTEM_DEPENDENCIES
-
-ghc_stage1_MORE_HC_OPTS += -no-hs-main
-ghc_stage2_MORE_HC_OPTS += -no-hs-main
-ghc_stage3_MORE_HC_OPTS += -no-hs-main
 
 ifeq "$(GhcDebugged)" "YES"
 ghc_stage1_MORE_HC_OPTS += -debug
@@ -146,9 +132,6 @@ $(INPLACE_LIB)/llvm-targets : llvm-targets
 $(INPLACE_LIB)/llvm-passes : llvm-passes
 	"$(CP)" $< $@
 
-$(INPLACE_LIB)/platformConstants: $(includes_GHCCONSTANTS_HASKELL_VALUE)
-	"$(CP)" $< $@
-
 # The GHC programs need to depend on all the helper programs they might call,
 # and the settings files they use
 
@@ -156,7 +139,6 @@ GHC_DEPENDENCIES += $$(unlit_INPLACE)
 GHC_DEPENDENCIES += $(INPLACE_LIB)/settings
 GHC_DEPENDENCIES += $(INPLACE_LIB)/llvm-targets
 GHC_DEPENDENCIES += $(INPLACE_LIB)/llvm-passes
-GHC_DEPENDENCIES += $(INPLACE_LIB)/platformConstants
 
 $(GHC_STAGE1) : | $(GHC_DEPENDENCIES)
 $(GHC_STAGE2) : | $(GHC_DEPENDENCIES)

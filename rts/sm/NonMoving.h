@@ -17,27 +17,48 @@
 #include "BeginPrivate.h"
 
 // Segments
-#define NONMOVING_SEGMENT_BITS 15   // 2^15 = 32kByte
+#define NONMOVING_SEGMENT_BITS 15UL   // 2^15 = 32kByte
 // Mask to find base of segment
-#define NONMOVING_SEGMENT_MASK ((1 << NONMOVING_SEGMENT_BITS) - 1)
+#define NONMOVING_SEGMENT_MASK ((1UL << NONMOVING_SEGMENT_BITS) - 1)
 // In bytes
-#define NONMOVING_SEGMENT_SIZE (1 << NONMOVING_SEGMENT_BITS)
+#define NONMOVING_SEGMENT_SIZE (1UL << NONMOVING_SEGMENT_BITS)
 // In words
-#define NONMOVING_SEGMENT_SIZE_W ((1 << NONMOVING_SEGMENT_BITS) / SIZEOF_VOID_P)
+#define NONMOVING_SEGMENT_SIZE_W ((1UL << NONMOVING_SEGMENT_BITS) / SIZEOF_VOID_P)
 // In blocks
 #define NONMOVING_SEGMENT_BLOCKS (NONMOVING_SEGMENT_SIZE / BLOCK_SIZE)
 
-_Static_assert(NONMOVING_SEGMENT_SIZE % BLOCK_SIZE == 0,
-               "non-moving segment size must be multiple of block size");
+GHC_STATIC_ASSERT(NONMOVING_SEGMENT_SIZE % BLOCK_SIZE == 0, "non-moving segment size must be multiple of block size");
 
 // The index of a block within a segment
 typedef uint16_t nonmoving_block_idx;
 
+#if defined(DEBUG)
+#define TRACK_SEGMENT_STATE
+#endif
+
+#if defined(TRACK_SEGMENT_STATE)
+// The collector itself doesn't require each segment to know its state (this is
+// implied by what segment list it is on) however it can be very useful while
+// debugging to know this.
+enum NonmovingSegmentState {
+    FREE, CURRENT, ACTIVE, FILLED, FILLED_SWEEPING
+};
+
+#define SET_SEGMENT_STATE(seg, st) RELAXED_STORE(&(seg)->state, (st))
+#define ASSERT_SEGMENT_STATE(seg, st) ASSERT(RELAXED_LOAD(&(seg)->state) == (st))
+#else
+#define SET_SEGMENT_STATE(_seg,_st)
+#define ASSERT_SEGMENT_STATE(_seg, _st)
+#endif
+
 // A non-moving heap segment
 struct NonmovingSegment {
-    struct NonmovingSegment *link;     // for linking together segments into lists
+    struct NonmovingSegment *link;      // for linking together segments into lists
     struct NonmovingSegment *todo_link; // NULL when not in todo list
     nonmoving_block_idx next_free;      // index of the next unallocated block
+#if defined(TRACK_SEGMENT_STATE)
+    enum NonmovingSegmentState state;
+#endif
     uint8_t bitmap[];                   // liveness bitmap
     // After the liveness bitmap comes the data blocks. Note that we need to
     // ensure that the size of this struct (including the bitmap) is a multiple
@@ -64,8 +85,7 @@ struct NonmovingAllocator {
     struct NonmovingSegment *filled;
     struct NonmovingSegment *saved_filled;
     struct NonmovingSegment *active;
-    // indexed by capability number
-    struct NonmovingSegment *current[];
+    // N.B. Per-capabilty "current" segment lives in Capability
 };
 
 // first allocator is of size 2^NONMOVING_ALLOCA0 (in bytes)
@@ -79,7 +99,7 @@ struct NonmovingAllocator {
 #define NONMOVING_MAX_FREE 16
 
 struct NonmovingHeap {
-    struct NonmovingAllocator *allocators[NONMOVING_ALLOCA_CNT];
+    struct NonmovingAllocator allocators[NONMOVING_ALLOCA_CNT];
     // free segment list. This is a cache where we keep up to
     // NONMOVING_MAX_FREE segments to avoid thrashing the block allocator.
     // Note that segments in this list are still counted towards
@@ -100,10 +120,11 @@ struct NonmovingHeap {
 
 extern struct NonmovingHeap nonmovingHeap;
 
-extern memcount nonmoving_live_words;
+extern memcount nonmoving_segment_live_words;
 
 #if defined(THREADED_RTS)
 extern bool concurrent_coll_running;
+extern Mutex nonmoving_collection_mutex;
 #endif
 
 void nonmovingInit(void);
@@ -126,13 +147,10 @@ void nonmovingExit(void);
 //   directly, but in a pause.
 //
 void nonmovingCollect(StgWeak **dead_weaks,
-                       StgTSO **resurrected_threads);
+                      StgTSO **resurrected_threads,
+                      bool concurrent);
 
-void *nonmovingAllocate(Capability *cap, StgWord sz);
-void nonmovingAddCapabilities(uint32_t new_n_caps);
 void nonmovingPushFreeSegment(struct NonmovingSegment *seg);
-void nonmovingClearBitmap(struct NonmovingSegment *seg);
-
 
 INLINE_HEADER struct NonmovingSegmentInfo *nonmovingSegmentInfo(struct NonmovingSegment *seg) {
     return &Bdescr((StgPtr) seg)->nonmoving_segment;
@@ -146,9 +164,10 @@ INLINE_HEADER uint8_t nonmovingSegmentLogBlockSize(struct NonmovingSegment *seg)
 INLINE_HEADER void nonmovingPushActiveSegment(struct NonmovingSegment *seg)
 {
     struct NonmovingAllocator *alloc =
-        nonmovingHeap.allocators[nonmovingSegmentLogBlockSize(seg) - NONMOVING_ALLOCA0];
+        &nonmovingHeap.allocators[nonmovingSegmentLogBlockSize(seg) - NONMOVING_ALLOCA0];
+    SET_SEGMENT_STATE(seg, ACTIVE);
     while (true) {
-        struct NonmovingSegment *current_active = (struct NonmovingSegment*)VOLATILE_LOAD(&alloc->active);
+        struct NonmovingSegment *current_active = RELAXED_LOAD(&alloc->active);
         seg->link = current_active;
         if (cas((StgVolatilePtr) &alloc->active, (StgWord) current_active, (StgWord) seg) == (StgWord) current_active) {
             break;
@@ -160,10 +179,11 @@ INLINE_HEADER void nonmovingPushActiveSegment(struct NonmovingSegment *seg)
 INLINE_HEADER void nonmovingPushFilledSegment(struct NonmovingSegment *seg)
 {
     struct NonmovingAllocator *alloc =
-        nonmovingHeap.allocators[nonmovingSegmentLogBlockSize(seg) - NONMOVING_ALLOCA0];
+        &nonmovingHeap.allocators[nonmovingSegmentLogBlockSize(seg) - NONMOVING_ALLOCA0];
+    SET_SEGMENT_STATE(seg, FILLED);
     while (true) {
-        struct NonmovingSegment *current_filled = (struct NonmovingSegment*)VOLATILE_LOAD(&alloc->filled);
-        seg->link = current_filled;
+        struct NonmovingSegment *current_filled = (struct NonmovingSegment*) RELAXED_LOAD(&alloc->filled);
+        RELAXED_STORE(&seg->link, current_filled);
         if (cas((StgVolatilePtr) &alloc->filled, (StgWord) current_filled, (StgWord) seg) == (StgWord) current_filled) {
             break;
         }
@@ -234,15 +254,22 @@ INLINE_HEADER struct NonmovingSegment *nonmovingGetSegment_unchecked(StgPtr p)
     return (struct NonmovingSegment *) (((uintptr_t) p) & mask);
 }
 
+INLINE_HEADER bool nonmovingIsInSegment(StgPtr p)
+{
+    bdescr *bd = Bdescr(p);
+    return HEAP_ALLOCED_GC(p) &&
+        (bd->flags & BF_NONMOVING) &&
+        !(bd->flags & BF_LARGE);
+}
+
 INLINE_HEADER struct NonmovingSegment *nonmovingGetSegment(StgPtr p)
 {
-    ASSERT(HEAP_ALLOCED_GC(p) && (Bdescr(p)->flags & BF_NONMOVING));
+    ASSERT(nonmovingIsInSegment(p));
     return nonmovingGetSegment_unchecked(p);
 }
 
 INLINE_HEADER nonmoving_block_idx nonmovingGetBlockIdx(StgPtr p)
 {
-    ASSERT(HEAP_ALLOCED_GC(p) && (Bdescr(p)->flags & BF_NONMOVING));
     struct NonmovingSegment *seg = nonmovingGetSegment(p);
     ptrdiff_t blk0 = (ptrdiff_t)nonmovingSegmentGetBlock(seg, 0);
     ptrdiff_t offset = (ptrdiff_t)p - blk0;
@@ -254,12 +281,12 @@ extern uint8_t nonmovingMarkEpoch;
 
 INLINE_HEADER void nonmovingSetMark(struct NonmovingSegment *seg, nonmoving_block_idx i)
 {
-    seg->bitmap[i] = nonmovingMarkEpoch;
+    RELAXED_STORE(&seg->bitmap[i], nonmovingMarkEpoch);
 }
 
 INLINE_HEADER uint8_t nonmovingGetMark(struct NonmovingSegment *seg, nonmoving_block_idx i)
 {
-    return seg->bitmap[i];
+    return RELAXED_LOAD(&seg->bitmap[i]);
 }
 
 INLINE_HEADER void nonmovingSetClosureMark(StgPtr p)
@@ -267,20 +294,17 @@ INLINE_HEADER void nonmovingSetClosureMark(StgPtr p)
     nonmovingSetMark(nonmovingGetSegment(p), nonmovingGetBlockIdx(p));
 }
 
-// TODO: Audit the uses of these
+INLINE_HEADER uint8_t nonmovingGetClosureMark(StgPtr p)
+{
+    struct NonmovingSegment *seg = nonmovingGetSegment(p);
+    nonmoving_block_idx blk_idx = nonmovingGetBlockIdx(p);
+    return nonmovingGetMark(seg, blk_idx);
+}
+
 /* Was the given closure marked this major GC cycle? */
 INLINE_HEADER bool nonmovingClosureMarkedThisCycle(StgPtr p)
 {
-    struct NonmovingSegment *seg = nonmovingGetSegment(p);
-    nonmoving_block_idx blk_idx = nonmovingGetBlockIdx(p);
-    return nonmovingGetMark(seg, blk_idx) == nonmovingMarkEpoch;
-}
-
-INLINE_HEADER bool nonmovingClosureMarked(StgPtr p)
-{
-    struct NonmovingSegment *seg = nonmovingGetSegment(p);
-    nonmoving_block_idx blk_idx = nonmovingGetBlockIdx(p);
-    return nonmovingGetMark(seg, blk_idx) != 0;
+    return nonmovingGetClosureMark(p) == nonmovingMarkEpoch;
 }
 
 // Can be called during a major collection to determine whether a particular
@@ -314,10 +338,14 @@ INLINE_HEADER bool nonmovingClosureBeingSwept(StgClosure *p)
     }
 }
 
+// N.B. RtsFlags is defined as a pointer in STG code consequently this code
+// doesn't typecheck.
+#if !IN_STG_CODE
 INLINE_HEADER bool isNonmovingClosure(StgClosure *p)
 {
-    return !HEAP_ALLOCED_GC(p) || Bdescr((P_)p)->flags & BF_NONMOVING;
+    return RtsFlags.GcFlags.useNonmoving && (!HEAP_ALLOCED_GC(p) || Bdescr((P_)p)->flags & BF_NONMOVING);
 }
+#endif
 
 #if defined(DEBUG)
 

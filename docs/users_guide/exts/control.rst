@@ -17,6 +17,77 @@ Language extensions can be controlled (i.e. allowed or not) in two ways:
 -  Language extensions can also be enabled using the ``LANGUAGE`` pragma, thus
    ``{-# LANGUAGE TemplateHaskell #-}`` (see :ref:`language-pragma`).
 
+.. extension:: GHC2021
+    :shortdesc: Use GHC’s set of default language extensions from 2021
+
+    GHC blesses a number of extensions, beyond Haskell 2010, to be suitable to
+    turned on by default. These extensions are considered to be stable and
+    conservative.
+
+    ``GHC2021`` is used by GHC if neither ``Haskell98`` nor ``Haskell2010`` is
+    turned on explicitly. Since later versions of GHC may use a later
+    ``GHC20xx`` by default, users are advised to declare the language set
+    explicitly with ``-XGHC2021``.
+
+    Note that, because GHC2021 includes a number of non-standardized
+    extensions, the stability guarantees it provides are not quite as strong as
+    those provided by, e.g., :extension:`Haskell2010`. While GHC does take
+    pains to avoid changing the semantics of these extensions, changes may
+    still happen (e.g. the simplified subsumption change introduced in GHC 9.0
+    which caused GHC to reject some programs using :extension:`RankNTypes`).
+
+    The ``GHC2021`` language set comprises the following extensions:
+
+    .. hlist::
+
+     * :extension:`BangPatterns`
+     * :extension:`BinaryLiterals`
+     * :extension:`ConstrainedClassMethods`
+     * :extension:`ConstraintKinds`
+     * :extension:`DeriveDataTypeable`
+     * :extension:`DeriveFoldable`
+     * :extension:`DeriveFunctor`
+     * :extension:`DeriveGeneric`
+     * :extension:`DeriveLift`
+     * :extension:`DeriveTraversable`
+     * :extension:`DoAndIfThenElse`
+     * :extension:`EmptyCase`
+     * :extension:`EmptyDataDecls`
+     * :extension:`EmptyDataDeriving`
+     * :extension:`ExistentialQuantification`
+     * :extension:`ExplicitForAll`
+     * :extension:`FieldSelectors`
+     * :extension:`FlexibleContexts`
+     * :extension:`FlexibleInstances`
+     * :extension:`ForeignFunctionInterface`
+     * :extension:`GADTSyntax`
+     * :extension:`GeneralisedNewtypeDeriving`
+     * :extension:`HexFloatLiterals`
+     * :extension:`ImplicitPrelude`
+     * :extension:`ImportQualifiedPost`
+     * :extension:`InstanceSigs`
+     * :extension:`KindSignatures`
+     * :extension:`MonomorphismRestriction`
+     * :extension:`MultiParamTypeClasses`
+     * :extension:`NamedFieldPuns`
+     * :extension:`NamedWildCards`
+     * :extension:`NumericUnderscores`
+     * :extension:`PatternGuards`
+     * :extension:`PolyKinds`
+     * :extension:`PostfixOperators`
+     * :extension:`RankNTypes`
+     * :extension:`RelaxedPolyRec`
+     * :extension:`ScopedTypeVariables`
+     * :extension:`StandaloneDeriving`
+     * :extension:`StandaloneKindSignatures`
+     * :extension:`StarIsType`
+     * :extension:`TraditionalRecordSyntax`
+     * :extension:`TupleSections`
+     * :extension:`TypeApplications`
+     * :extension:`TypeOperators`
+     * :extension:`TypeSynonymInstances`
+
+
 .. extension:: Haskell2010
     :shortdesc: Use the Haskell 2010 language variant.
 
@@ -25,17 +96,18 @@ Language extensions can be controlled (i.e. allowed or not) in two ways:
 
     .. hlist::
 
-     * :extension:`ImplicitPrelude`
-     * :extension:`StarIsType`
      * :extension:`CUSKs`
-     * :extension:`MonomorphismRestriction`
      * :extension:`DatatypeContexts`
-     * :extension:`TraditionalRecordSyntax`
-     * :extension:`EmptyDataDecls`
-     * :extension:`ForeignFunctionInterface`
-     * :extension:`PatternGuards`
      * :extension:`DoAndIfThenElse`
+     * :extension:`EmptyDataDecls`
+     * :extension:`FieldSelectors`
+     * :extension:`ForeignFunctionInterface`
+     * :extension:`ImplicitPrelude`
+     * :extension:`MonomorphismRestriction`
+     * :extension:`PatternGuards`
      * :extension:`RelaxedPolyRec`
+     * :extension:`StarIsType`
+     * :extension:`TraditionalRecordSyntax`
 
 
 .. extension:: Haskell98
@@ -46,14 +118,15 @@ Language extensions can be controlled (i.e. allowed or not) in two ways:
 
     .. hlist::
 
-     * :extension:`ImplicitPrelude`
-     * :extension:`StarIsType`
      * :extension:`CUSKs`
+     * :extension:`DatatypeContexts`
+     * :extension:`FieldSelectors`
+     * :extension:`ImplicitPrelude`
      * :extension:`MonomorphismRestriction`
      * :extension:`NPlusKPatterns`
-     * :extension:`DatatypeContexts`
-     * :extension:`TraditionalRecordSyntax`
      * :extension:`NondecreasingIndentation`
+     * :extension:`StarIsType`
+     * :extension:`TraditionalRecordSyntax`
 
 
 

@@ -2,6 +2,8 @@
 -- Copyright (c) 2014 Joachim Breitner
 --
 
+{-# LANGUAGE BangPatterns #-}
+
 module GHC.Core.Opt.CallArity
     ( callArityAnalProgram
     , callArityRHS -- for testing
@@ -11,7 +13,6 @@ import GHC.Prelude
 
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
-import GHC.Driver.Session ( DynFlags )
 
 import GHC.Types.Basic
 import GHC.Core
@@ -35,7 +36,7 @@ import Control.Arrow ( first, second )
 Note [Call Arity: The goal]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The goal of this analysis is to find out if we can eta-expand a local function,
+The goal of this analysis is to find out if we can eta-expand a local function
 based on how it is being called. The motivating example is this code,
 which comes up when we implement foldl using foldr, and do list fusion:
 
@@ -67,11 +68,11 @@ What we want to know for a variable
 
 For every let-bound variable we'd like to know:
   1. A lower bound on the arity of all calls to the variable, and
-  2. whether the variable is being called at most once or possible multiple
+  2. whether the variable is being called at most once or possibly multiple
      times.
 
-It is always ok to lower the arity, or pretend that there are multiple calls.
-In particular, "Minimum arity 0 and possible called multiple times" is always
+It is always okay to lower the arity, or pretend that there are multiple calls.
+In particular, "Minimum arity 0 and possibly called multiple times" is always
 correct.
 
 
@@ -83,12 +84,12 @@ obtain bits of information:
 
  I.  The arity analysis:
      For every variable, whether it is absent, or called,
-     and if called, which what arity.
+     and if called, with what arity.
 
  II. The Co-Called analysis:
      For every two variables, whether there is a possibility that both are being
      called.
-     We obtain as a special case: For every variables, whether there is a
+     We obtain as a special case: For every variable, whether there is a
      possibility that it is being called twice.
 
 For efficiency reasons, we gather this information only for a set of
@@ -98,23 +99,23 @@ The two analysis are not completely independent, as a higher arity can improve
 the information about what variables are being called once or multiple times.
 
 Note [Analysis I: The arity analysis]
-------------------------------------
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The arity analysis is quite straight forward: The information about an
+The arity analysis is quite straightforward: The information about an
 expression is an
     VarEnv Arity
 where absent variables are bound to Nothing and otherwise to a lower bound to
 their arity.
 
 When we analyze an expression, we analyze it with a given context arity.
-Lambdas decrease and applications increase the incoming arity. Analysizing a
-variable will put that arity in the environment. In lets or cases all the
-results from the various subexpressions are lubed, which takes the point-wise
+Lambdas decrease and applications increase the incoming arity. Analysing a
+variable will put that arity in the environment. In `let`s or `case`s all the
+results from the various subexpressions are lub'd, which takes the point-wise
 minimum (considering Nothing an infinity).
 
 
 Note [Analysis II: The Co-Called analysis]
-------------------------------------------
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The second part is more sophisticated. For reasons explained below, it is not
 sufficient to simply know how often an expression evaluates a variable. Instead
@@ -169,7 +170,7 @@ The interesting cases of the analysis:
    Tricky.
    We assume that it is really mutually recursive, i.e. that every variable
    calls one of the others, and that this is strongly connected (otherwise we
-   return an over-approximation, so that's ok), see note [Recursion and fixpointing].
+   return an over-approximation, so that's ok), see Note [Recursion and fixpointing].
 
    Let V = {v₁,...vₙ}.
    Assume that the vs have been analysed with an incoming demand and
@@ -432,12 +433,12 @@ choice, and hence Call Arity sets the call arity for join points as well.
 
 -- Main entry point
 
-callArityAnalProgram :: DynFlags -> CoreProgram -> CoreProgram
-callArityAnalProgram _dflags binds = binds'
+callArityAnalProgram :: CoreProgram -> CoreProgram
+callArityAnalProgram binds = binds'
   where
     (_, binds') = callArityTopLvl [] emptyVarSet binds
 
--- See Note [Analysing top-level-binds]
+-- See Note [Analysing top-level binds]
 callArityTopLvl :: [Var] -> VarSet -> [CoreBind] -> (CallArityRes, [CoreBind])
 callArityTopLvl exported _ []
     = ( calledMultipleTimes $ (emptyUnVarGraph, mkVarEnv $ [(v, 0) | v <- exported])
@@ -524,8 +525,8 @@ callArityAnal arity int (Case scrut bndr ty alts)
       (final_ae, Case scrut' bndr ty alts')
   where
     (alt_aes, alts') = unzip $ map go alts
-    go (dc, bndrs, e) = let (ae, e') = callArityAnal arity int e
-                        in  (ae, (dc, bndrs, e'))
+    go (Alt dc bndrs e) = let (ae, e') = callArityAnal arity (int `delVarSetList` (bndr:bndrs)) e
+                          in  (ae, Alt dc bndrs e')
     alt_ae = lubRess alt_aes
     (scrut_ae, scrut') = callArityAnal 0 int scrut
     final_ae = scrut_ae `both` alt_ae
@@ -566,7 +567,7 @@ callArityBind boring_vars ae_body int (NonRec v rhs)
     --          (vcat [ppr v, ppr ae_body, ppr int, ppr ae_rhs, ppr safe_arity])
     (final_ae, NonRec v' rhs')
   where
-    is_thunk = not (exprIsCheap rhs) -- see note [What is a thunk]
+    is_thunk = not (exprIsCheap rhs) -- see Note [What is a thunk]
     -- If v is boring, we will not find it in ae_body, but always assume (0, False)
     boring = v `elemVarSet` boring_vars
 
@@ -636,7 +637,7 @@ callArityBind boring_vars ae_body int b@(Rec binds)
 
             | otherwise
             -- We previously analyzed this with a different arity (or not at all)
-            = let is_thunk = not (exprIsCheap rhs) -- see note [What is a thunk]
+            = let is_thunk = not (exprIsCheap rhs) -- see Note [What is a thunk]
 
                   safe_arity | is_thunk    = 0  -- See Note [Thunks in recursive groups]
                              | otherwise   = new_arity
@@ -704,7 +705,7 @@ trimArity v a = minimum [a, max_arity_by_type, max_arity_by_strsig]
         | isDeadEndDiv result_info = length demands
         | otherwise = a
 
-    (demands, result_info) = splitStrictSig (idStrictness v)
+    (demands, result_info) = splitDmdSig (idDmdSig v)
 
 ---------------------------------------
 -- Functions related to CallArityRes --
@@ -722,10 +723,10 @@ unitArityRes :: Var -> Arity -> CallArityRes
 unitArityRes v arity = (emptyUnVarGraph, unitVarEnv v arity)
 
 resDelList :: [Var] -> CallArityRes -> CallArityRes
-resDelList vs ae = foldr resDel ae vs
+resDelList vs ae = foldl' (flip resDel) ae vs
 
 resDel :: Var -> CallArityRes -> CallArityRes
-resDel v (g, ae) = (g `delNode` v, ae `delVarEnv` v)
+resDel v (!g, !ae) = (g `delNode` v, ae `delVarEnv` v)
 
 domRes :: CallArityRes -> UnVarSet
 domRes (_, ae) = varEnvDom ae

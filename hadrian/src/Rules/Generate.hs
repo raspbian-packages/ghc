@@ -4,20 +4,16 @@ module Rules.Generate (
     ghcPrimDependencies
     ) where
 
-import Data.Foldable (for_)
-
 import Base
 import qualified Context
 import Expression
-import Flavour
-import Hadrian.Oracles.TextFile (lookupValueOrError)
+import Hadrian.Oracles.TextFile (lookupSystemConfig)
 import Oracles.Flag
 import Oracles.ModuleFiles
 import Oracles.Setting
 import Packages
 import Rules.Libffi
 import Settings
-import Settings.Builders.DeriveConstants (deriveConstantsPairs)
 import Target
 import Utilities
 
@@ -40,22 +36,33 @@ ghcPrimDependencies = do
     path  <- expr $ buildPath (vanillaContext stage ghcPrim)
     return [path -/- "GHC/Prim.hs", path -/- "GHC/PrimopWrappers.hs"]
 
-derivedConstantsFiles :: [FilePath]
-derivedConstantsFiles =
-    [ "DerivedConstants.h"
-    , "GHCConstantsHaskellExports.hs"
-    , "GHCConstantsHaskellType.hs"
-    , "GHCConstantsHaskellWrappers.hs" ]
+rtsDependencies :: Expr [FilePath]
+rtsDependencies = do
+    stage   <- getStage
+    rtsPath <- expr (rtsBuildPath stage)
+    useSystemFfi <- expr (flag UseSystemFfi)
+
+    let headers =
+            [ "ghcautoconf.h", "ghcplatform.h"
+            , "DerivedConstants.h"
+            , "rts" -/- "EventTypes.h"
+            , "rts" -/- "EventLogConstants.h"
+            ]
+            ++ (if useSystemFfi then [] else libffiHeaderFiles)
+    pure $ ((rtsPath -/- "include") -/-) <$> headers
+
+genapplyDependencies :: Expr [FilePath]
+genapplyDependencies = do
+    stage   <- getStage
+    rtsPath <- expr (rtsBuildPath $ succStage stage)
+    ((stage /= Stage3) ?) $ pure $ ((rtsPath -/- "include") -/-) <$>
+        [ "ghcautoconf.h", "ghcplatform.h" ]
 
 compilerDependencies :: Expr [FilePath]
 compilerDependencies = do
     stage   <- getStage
     ghcPath <- expr $ buildPath (vanillaContext stage compiler)
-    rtsPath <- expr (rtsBuildPath stage)
-    libDir <- expr $ stageLibPath stage
-    mconcat [ return $ (libDir -/-) <$> derivedConstantsFiles
-            , notStage0 ? return ((rtsPath -/-) <$> libffiHeaderFiles)
-            , return $ fmap (ghcPath -/-)
+    pure $ (ghcPath -/-) <$>
                   [ "primop-can-fail.hs-incl"
                   , "primop-code-size.hs-incl"
                   , "primop-commutable.hs-incl"
@@ -71,20 +78,18 @@ compilerDependencies = do
                   , "primop-vector-tys-exports.hs-incl"
                   , "primop-vector-tys.hs-incl"
                   , "primop-vector-uniques.hs-incl"
-                  , "primop-docs.hs-incl" ] ]
+                  , "primop-docs.hs-incl"
+                  , "GHC/Platform/Constants.hs"
+                  , "GHC/Settings/Config.hs"
+                  ]
 
 generatedDependencies :: Expr [FilePath]
 generatedDependencies = do
-    stage    <- getStage
-    rtsPath  <- expr (rtsBuildPath stage)
-    includes <- expr $ includesDependencies stage
-    libDir <- expr $ stageLibPath stage
     mconcat [ package compiler ? compilerDependencies
             , package ghcPrim  ? ghcPrimDependencies
-            , package rts      ? return (fmap (rtsPath -/-) libffiHeaderFiles
-                ++ includes
-                ++ ((libDir -/-) <$> derivedConstantsFiles))
-            , stage0 ? return includes ]
+            , package rts      ? rtsDependencies
+            , package genapply ? genapplyDependencies
+            ]
 
 generate :: FilePath -> Context -> Expr String -> Action ()
 generate file context expr = do
@@ -111,6 +116,7 @@ generatePackageCode context@(Context stage pkg _) = do
 
     priority 2.0 $ do
         when (pkg == compiler) $ do
+            root -/- "**" -/- dir -/- "GHC/Platform/Constants.hs" %> genPlatformConstantsType context
             root -/- "**" -/- dir -/- "GHC/Settings/Config.hs" %> go generateConfigHs
             root -/- "**" -/- dir -/- "*.hs-incl" %> genPrimopCode context
         when (pkg == ghcPrim) $ do
@@ -122,22 +128,25 @@ generatePackageCode context@(Context stage pkg _) = do
 
     when (pkg == compiler) $ do
         root -/- primopsTxt stage %> \file -> do
-            includes <- includesDependencies stage
-            need $ [primopsSource] ++ includes
+            need $ [primopsSource]
             build $ target context HsCpp [primopsSource] [file]
 
     when (pkg == rts) $ do
         root -/- "**" -/- dir -/- "cmm/AutoApply.cmm" %> \file ->
             build $ target context GenApply [] [file]
-        -- TODO: This should be fixed properly, e.g. generated here on demand.
-        (root -/- "**" -/- dir -/- "DerivedConstants.h") <~ stageLibPath stage
-        (root -/- "**" -/- dir -/- "ghcautoconf.h") <~ stageLibPath stage
-        (root -/- "**" -/- dir -/- "ghcplatform.h") <~ stageLibPath stage
-        (root -/- "**" -/- dir -/- "ghcversion.h") <~ stageLibPath stage
- where
-    pattern <~ mdir = pattern %> \file -> do
-        dir <- mdir
-        copyFile (dir -/- takeFileName file) file
+        let go gen file = generate file (semiEmptyTarget stage) gen
+        root -/- "**" -/- dir -/- "include/ghcautoconf.h" %> go generateGhcAutoconfH
+        root -/- "**" -/- dir -/- "include/ghcplatform.h" %> go generateGhcPlatformH
+        root -/- "**" -/- dir -/- "include/DerivedConstants.h" %> genPlatformConstantsHeader context
+        root -/- "**" -/- dir -/- "include/rts/EventLogConstants.h" %> genEventTypes "--event-types-defines"
+        root -/- "**" -/- dir -/- "include/rts/EventTypes.h" %> genEventTypes "--event-types-array"
+
+genEventTypes :: String -> FilePath -> Action ()
+genEventTypes flag file = do
+    need ["rts" -/- "gen_event_types.py"]
+    runBuilder Python
+      ["rts" -/- "gen_event_types.py", flag, file]
+      [] []
 
 genPrimopCode :: Context -> FilePath -> Action ()
 genPrimopCode context@(Context stage _pkg _) file = do
@@ -145,10 +154,27 @@ genPrimopCode context@(Context stage _pkg _) file = do
     need [root -/- primopsTxt stage]
     build $ target context GenPrimopCode [root -/- primopsTxt stage] [file]
 
+genPlatformConstantsType :: Context -> FilePath -> Action ()
+genPlatformConstantsType context file = do
+    withTempDir $ \tmpdir ->
+      build $ target context DeriveConstants [] [file,tmpdir]
+
+genPlatformConstantsHeader :: Context -> FilePath -> Action ()
+genPlatformConstantsHeader context file = do
+    -- N.B. deriveConstants needs to compile programs which #include
+    -- PosixSource.h, which #include's ghcplatform.h. Fixes #18290.
+    let prefix = takeDirectory file
+    need
+        [ prefix -/- "ghcplatform.h"
+        , prefix -/- "ghcautoconf.h"
+        ]
+    withTempDir $ \tmpdir -> build $
+        target context DeriveConstants [] [file, tmpdir]
+
 copyRules :: Rules ()
 copyRules = do
     root <- buildRootRules
-    forM_ [Stage0 ..] $ \stage -> do
+    forM_ allStages $ \stage -> do
         let prefix = root -/- stageString stage -/- "lib"
 
             infixl 1 <~
@@ -160,10 +186,13 @@ copyRules = do
         prefix -/- "ghci-usage.txt"    <~ return "driver"
         prefix -/- "llvm-targets"      <~ return "."
         prefix -/- "llvm-passes"       <~ return "."
-        prefix -/- "template-hsc.h"    <~ return (pkgPath hsc2hs)
+        prefix -/- "template-hsc.h" <~ return (pkgPath hsc2hs -/- "data")
 
         prefix -/- "html/**"           <~ return "utils/haddock/haddock-api/resources"
         prefix -/- "latex/**"          <~ return "utils/haddock/haddock-api/resources"
+
+        root -/- relativePackageDbPath stage -/- systemCxxStdLibConf %> \file -> do
+            copyFile ("mk" -/- "system-cxx-std-lib-1.0.conf") file
 
 generateRules :: Rules ()
 generateRules = do
@@ -171,22 +200,13 @@ generateRules = do
 
     (root -/- "ghc-stage1") <~+ ghcWrapper Stage1
     (root -/- "ghc-stage2") <~+ ghcWrapper Stage2
+    (root -/- "ghc-stage3") <~+ ghcWrapper Stage3
 
-    forM_ [Stage0 ..] $ \stage -> do
+    forM_ allStages $ \stage -> do
         let prefix = root -/- stageString stage -/- "lib"
             go gen file = generate file (semiEmptyTarget stage) gen
-        (prefix -/- "ghcplatform.h") %> go generateGhcPlatformH
         (prefix -/- "settings") %> go generateSettings
-        (prefix -/- "ghcautoconf.h") %> go generateGhcAutoconfH
-        (prefix -/- "ghcversion.h") %> go generateGhcVersionH
-        -- TODO: simplify, get rid of fake rts context
-        for_ (fst <$> deriveConstantsPairs) $ \constantsFile ->
-            prefix -/- constantsFile %> \file -> do
-                -- N.B. deriveConstants needs to compile programs which #include
-                -- PosixSource.h, which #include's ghcplatform.h. Fixes #18290.
-                need [prefix -/- "ghcplatform.h"]
-                withTempDir $ \dir -> build $
-                    target (rtsContext stage) DeriveConstants [] [file, dir]
+
   where
     file <~+ gen = file %> \out -> generate out emptyTarget gen >> makeExecutable out
 
@@ -206,11 +226,11 @@ emptyTarget = vanillaContext (error "Rules.Generate.emptyTarget: unknown stage")
 -- | GHC wrapper scripts used for passing the path to the right package database
 -- when invoking in-tree GHC executables.
 ghcWrapper :: Stage -> Expr String
-ghcWrapper Stage0 = error "Stage0 GHC does not require a wrapper script to run."
+ghcWrapper (Stage0 {}) = error "Stage0 GHC does not require a wrapper script to run."
 ghcWrapper stage  = do
     dbPath  <- expr $ (</>) <$> topDirectory <*> packageDbPath stage
     ghcPath <- expr $ (</>) <$> topDirectory
-                            <*> programPath (vanillaContext (pred stage) ghc)
+                            <*> programPath (vanillaContext (predStage stage) ghc)
     return $ unwords $ map show $ [ ghcPath ]
                                ++ (if stage == Stage1
                                      then ["-no-global-package-db"
@@ -229,7 +249,7 @@ generateGhcPlatformH :: Expr String
 generateGhcPlatformH = do
     trackGenerateHs
     stage    <- getStage
-    let chooseSetting x y = getSetting $ if stage == Stage0 then x else y
+    let chooseSetting x y = getSetting $ case stage of { Stage0 {} -> x; _ -> y }
     buildPlatform  <- chooseSetting BuildPlatform HostPlatform
     buildArch      <- chooseSetting BuildArch     HostArch
     buildOs        <- chooseSetting BuildOs       HostOs
@@ -239,12 +259,9 @@ generateGhcPlatformH = do
     hostOs         <- chooseSetting HostOs        TargetOs
     hostVendor     <- chooseSetting HostVendor    TargetVendor
     ghcUnreg       <- getFlag    GhcUnregisterised
-    inplaceTools   <- getFlag    SystemDistroMINGW
     return . unlines $
         [ "#if !defined(__GHCPLATFORM_H__)"
         , "#define __GHCPLATFORM_H__"
-        , ""
-        , "#define GHC_STAGE " ++ show (fromEnum stage + 1)
         , ""
         , "#define BuildPlatform_TYPE  " ++ cppify buildPlatform
         , "#define HostPlatform_TYPE   " ++ cppify hostPlatform
@@ -269,8 +286,6 @@ generateGhcPlatformH = do
         , ""
         ]
         ++
-        [ "#define USE_INPLACE_MINGW_TOOLCHAIN 1" | inplaceTools ]
-        ++
         [ "#define UnregisterisedCompiler 1" | ghcUnreg ]
         ++
         [ ""
@@ -282,9 +297,10 @@ generateSettings :: Expr String
 generateSettings = do
     ctx <- getContext
     settings <- traverse sequence $
-        [ ("GCC extra via C opts", expr $ lookupValueOrError configFile "gcc-extra-via-c-opts")
+        [ ("GCC extra via C opts", expr $ lookupSystemConfig "gcc-extra-via-c-opts")
         , ("C compiler command", expr $ settingsFileSetting SettingsFileSetting_CCompilerCommand)
         , ("C compiler flags", expr $ settingsFileSetting SettingsFileSetting_CCompilerFlags)
+        , ("C++ compiler command", expr $ settingsFileSetting SettingsFileSetting_CxxCompilerCommand)
         , ("C++ compiler flags", expr $ settingsFileSetting SettingsFileSetting_CxxCompilerFlags)
         , ("C compiler link flags", expr $ settingsFileSetting SettingsFileSetting_CCompilerLinkFlags)
         , ("C compiler supports -no-pie", expr $ settingsFileSetting SettingsFileSetting_CCompilerSupportsNoPie)
@@ -292,15 +308,16 @@ generateSettings = do
         , ("Haskell CPP flags", expr $ settingsFileSetting SettingsFileSetting_HaskellCPPFlags)
         , ("ld command", expr $ settingsFileSetting SettingsFileSetting_LdCommand)
         , ("ld flags", expr $ settingsFileSetting SettingsFileSetting_LdFlags)
-        , ("ld supports compact unwind", expr $ lookupValueOrError configFile "ld-has-no-compact-unwind")
-        , ("ld supports build-id", expr $ lookupValueOrError configFile "ld-has-build-id")
-        , ("ld supports filelist", expr $ lookupValueOrError configFile "ld-has-filelist")
-        , ("ld is GNU ld", expr $ lookupValueOrError configFile "ld-is-gnu-ld")
+        , ("ld supports compact unwind", expr $ lookupSystemConfig "ld-has-no-compact-unwind")
+        , ("ld supports build-id", expr $ lookupSystemConfig "ld-has-build-id")
+        , ("ld supports filelist", expr $ lookupSystemConfig "ld-has-filelist")
+        , ("ld is GNU ld", expr $ lookupSystemConfig "ld-is-gnu-ld")
         , ("Merge objects command", expr $ settingsFileSetting SettingsFileSetting_MergeObjectsCommand)
         , ("Merge objects flags", expr $ settingsFileSetting SettingsFileSetting_MergeObjectsFlags)
         , ("ar command", expr $ settingsFileSetting SettingsFileSetting_ArCommand)
-        , ("ar flags", expr $ lookupValueOrError configFile "ar-args")
+        , ("ar flags", expr $ lookupSystemConfig "ar-args")
         , ("ar supports at file", expr $ yesNo <$> flag ArSupportsAtFile)
+        , ("ar supports -L", expr $ yesNo <$> flag ArSupportsDashL)
         , ("ranlib command", expr $ settingsFileSetting SettingsFileSetting_RanlibCommand)
         , ("otool command", expr $ settingsFileSetting SettingsFileSetting_OtoolCommand)
         , ("install_name_tool command", expr $ settingsFileSetting SettingsFileSetting_InstallNameToolCommand)
@@ -313,27 +330,26 @@ generateSettings = do
         , ("target platform string", getSetting TargetPlatform)
         , ("target os", getSetting TargetOsHaskell)
         , ("target arch", getSetting TargetArchHaskell)
-        , ("target word size", expr $ lookupValueOrError configFile "target-word-size")
-        , ("target word big endian", expr $ lookupValueOrError configFile "target-word-big-endian")
-        , ("target has GNU nonexec stack", expr $ lookupValueOrError configFile "target-has-gnu-nonexec-stack")
-        , ("target has .ident directive", expr $ lookupValueOrError configFile "target-has-ident-directive")
-        , ("target has subsections via symbols", expr $ lookupValueOrError configFile "target-has-subsections-via-symbols")
-        , ("target has RTS linker", expr $ lookupValueOrError configFile "target-has-rts-linker")
+        , ("target word size", expr $ lookupSystemConfig "target-word-size")
+        , ("target word big endian", expr $ lookupSystemConfig "target-word-big-endian")
+        , ("target has GNU nonexec stack", expr $ lookupSystemConfig "target-has-gnu-nonexec-stack")
+        , ("target has .ident directive", expr $ lookupSystemConfig "target-has-ident-directive")
+        , ("target has subsections via symbols", expr $ lookupSystemConfig "target-has-subsections-via-symbols")
+        , ("target has RTS linker", expr $ lookupSystemConfig "target-has-rts-linker")
+        , ("target has libm", expr $  lookupSystemConfig "target-has-libm")
         , ("Unregisterised", expr $ yesNo <$> flag GhcUnregisterised)
         , ("LLVM target", getSetting LlvmTarget)
         , ("LLVM llc command", expr $ settingsFileSetting SettingsFileSetting_LlcCommand)
         , ("LLVM opt command", expr $ settingsFileSetting SettingsFileSetting_OptCommand)
         , ("LLVM clang command", expr $ settingsFileSetting SettingsFileSetting_ClangCommand)
+        , ("Use inplace MinGW toolchain", expr $ settingsFileSetting SettingsFileSetting_DistroMinGW)
 
-        , ("BigNum backend", getBignumBackend)
         , ("Use interpreter", expr $ yesNo <$> ghcWithInterpreter)
         , ("Support SMP", expr $ yesNo <$> targetSupportsSMP)
         , ("RTS ways", unwords . map show <$> getRtsWays)
         , ("Tables next to code", expr $ yesNo <$> flag TablesNextToCode)
         , ("Leading underscore", expr $ yesNo <$> flag LeadingUnderscore)
         , ("Use LibFFI", expr $ yesNo <$> useLibffiForAdjustors)
-        , ("Use Threads", expr $ yesNo . ghcThreaded <$> flavour)
-        , ("Use Debugging", expr $ yesNo . ghcDebugged <$> flavour)
         , ("RTS expects libdw", yesNo <$> getFlag WithLibdw)
         ]
     let showTuple (k, v) = "(" ++ show k ++ ", " ++ show v ++ ")"
@@ -349,15 +365,14 @@ generateSettings = do
 generateConfigHs :: Expr String
 generateConfigHs = do
     stage <- getStage
-    let chooseSetting x y = getSetting $ if stage == Stage0 then x else y
+    let chooseSetting x y = getSetting $ case stage of { Stage0 {} -> x; _ -> y }
     buildPlatform <- chooseSetting BuildPlatform HostPlatform
     hostPlatform <- chooseSetting HostPlatform TargetPlatform
     trackGenerateHs
     cProjectName        <- getSetting ProjectName
     cBooterVersion      <- getSetting GhcVersion
     return $ unlines
-        [ "{-# LANGUAGE CPP #-}"
-        , "module GHC.Settings.Config"
+        [ "module GHC.Settings.Config"
         , "  ( module GHC.Version"
         , "  , cBuildPlatformString"
         , "  , cHostPlatformString"
@@ -383,14 +398,21 @@ generateConfigHs = do
         , "cBooterVersion        = " ++ show cBooterVersion
         , ""
         , "cStage                :: String"
-        , "cStage                = show (" ++ show (fromEnum stage + 1) ++ " :: Int)"
+        , "cStage                = show (" ++ stageString stage ++ " :: Int)"
         ]
+  where
+    stageString (Stage0 InTreeLibs) = "1"
+    stageString Stage1 = "2"
+    stageString Stage2 = "3"
+    stageString Stage3 = "4"
+    stageString (Stage0 GlobalLibs) = error "stageString: StageBoot"
+
 
 -- | Generate @ghcautoconf.h@ header.
 generateGhcAutoconfH :: Expr String
 generateGhcAutoconfH = do
     trackGenerateHs
-    configHContents  <- expr $ map undefinePackage <$> readFileLines configH
+    configHContents  <- expr $ mapMaybe undefinePackage <$> readFileLines configH
     return . unlines $
         [ "#if !defined(__GHCAUTOCONF_H__)"
         , "#define __GHCAUTOCONF_H__" ]
@@ -399,43 +421,12 @@ generateGhcAutoconfH = do
   where
     undefinePackage s
         | "#define PACKAGE_" `isPrefixOf` s
-            = "/* #undef " ++ takeWhile (/=' ') (drop 8 s) ++ " */"
-        | otherwise = s
-
--- | Generate @ghcversion.h@ header.
-generateGhcVersionH :: Expr String
-generateGhcVersionH = do
-    trackGenerateHs
-    fullVersion <- getSetting ProjectVersion
-    version     <- getSetting ProjectVersionInt
-    patchLevel1 <- getSetting ProjectPatchLevel1
-    patchLevel2 <- getSetting ProjectPatchLevel2
-    return . unlines $
-        [ "#if !defined(__GHCVERSION_H__)"
-        , "#define __GHCVERSION_H__"
-        , ""
-        , "#if !defined(__GLASGOW_HASKELL__)"
-        , "#define __GLASGOW_HASKELL__ " ++ version
-        , "#endif"
-        , "#if !defined(__GLASGOW_HASKELL_FULL_VERSION__)"
-        , "#define __GLASGOW_HASKELL_FULL_VERSION__ \"" ++ fullVersion ++ "\""
-        , "#endif"
-        , ""]
-        ++
-        [ "#define __GLASGOW_HASKELL_PATCHLEVEL1__ " ++ patchLevel1 | patchLevel1 /= "" ]
-        ++
-        [ "#define __GLASGOW_HASKELL_PATCHLEVEL2__ " ++ patchLevel2 | patchLevel2 /= "" ]
-        ++
-        [ ""
-        , "#define MIN_VERSION_GLASGOW_HASKELL(ma,mi,pl1,pl2) (\\"
-        , "   ((ma)*100+(mi)) <  __GLASGOW_HASKELL__ || \\"
-        , "   ((ma)*100+(mi)) == __GLASGOW_HASKELL__    \\"
-        , "          && (pl1) <  __GLASGOW_HASKELL_PATCHLEVEL1__ || \\"
-        , "   ((ma)*100+(mi)) == __GLASGOW_HASKELL__    \\"
-        , "          && (pl1) == __GLASGOW_HASKELL_PATCHLEVEL1__ \\"
-        , "          && (pl2) <= __GLASGOW_HASKELL_PATCHLEVEL2__ )"
-        , ""
-        , "#endif /* __GHCVERSION_H__ */" ]
+            = Just $ "/* #undef " ++ takeWhile (/=' ') (drop 8 s) ++ " */"
+        | "#define __GLASGOW_HASKELL" `isPrefixOf` s
+            = Nothing
+        | "/* REMOVE ME */" == s
+            = Nothing
+        | otherwise = Just s
 
 -- | Generate @Version.hs@ files.
 generateVersionHs :: Expr String
@@ -480,17 +471,14 @@ generatePlatformHostHs = do
     return $ unlines
         [ "module GHC.Platform.Host where"
         , ""
-        , "import GHC.Platform"
+        , "import GHC.Platform.ArchOS"
         , ""
-        , "cHostPlatformArch :: Arch"
-        , "cHostPlatformArch = " ++ cHostPlatformArch
+        , "hostPlatformArch :: Arch"
+        , "hostPlatformArch = " ++ cHostPlatformArch
         , ""
-        , "cHostPlatformOS   :: OS"
-        , "cHostPlatformOS   = " ++ cHostPlatformOS
+        , "hostPlatformOS   :: OS"
+        , "hostPlatformOS   = " ++ cHostPlatformOS
         , ""
-        , "cHostPlatformMini :: PlatformMini"
-        , "cHostPlatformMini = PlatformMini"
-        , "  { platformMini_arch = cHostPlatformArch"
-        , "  , platformMini_os = cHostPlatformOS"
-        , "  }"
+        , "hostPlatformArchOS :: ArchOS"
+        , "hostPlatformArchOS = ArchOS hostPlatformArch hostPlatformOS"
         ]

@@ -1,10 +1,12 @@
+{-# LANGUAGE CPP #-}
+
 {-
 (c) The University of Glasgow 2006
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
 
 -}
 
-{-# LANGUAGE CPP #-}
+
 
 -- | Set-like operations on lists
 --
@@ -16,19 +18,22 @@ module GHC.Data.List.SetOps (
         Assoc, assoc, assocMaybe, assocUsing, assocDefault, assocDefaultUsing,
 
         -- Duplicate handling
-        hasNoDups, removeDups, findDupsEq,
+        hasNoDups, removeDups, nubOrdBy, findDupsEq,
         equivClasses,
 
         -- Indexing
-        getNth
-   ) where
+        getNth,
 
-#include "HsVersions.h"
+        -- Membership
+        isIn, isn'tIn,
+   ) where
 
 import GHC.Prelude
 
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
 import GHC.Utils.Misc
+import GHC.Utils.Trace
 
 import qualified Data.List as L
 import qualified Data.List.NonEmpty as NE
@@ -36,7 +41,7 @@ import Data.List.NonEmpty (NonEmpty(..))
 import qualified Data.Set as S
 
 getNth :: Outputable a => [a] -> Int -> a
-getNth xs n = ASSERT2( xs `lengthExceeds` n, ppr n $$ ppr xs )
+getNth xs n = assertPpr (xs `lengthExceeds` n) (ppr n $$ ppr xs) $
              xs !! n
 
 {-
@@ -61,7 +66,7 @@ unionLists xs [y]
   | isIn "unionLists" y xs = xs
   | otherwise = y:xs
 unionLists xs ys
-  = WARN(lengthExceeds xs 100 || lengthExceeds ys 100, ppr xs $$ ppr ys)
+  = warnPprTrace (lengthExceeds xs 100 || lengthExceeds ys 100) "unionLists" (ppr xs $$ ppr ys) $
     [x | x <- xs, isn'tIn "unionLists" x ys] ++ ys
 
 -- | Calculate the set difference of two lists. This is
@@ -101,12 +106,13 @@ minusList xs ys = filter (`S.notMember` yss) xs
 Inefficient finite maps based on association lists and equality.
 -}
 
--- A finite mapping based on equality and association lists
+-- | A finite mapping based on equality and association lists.
 type Assoc a b = [(a,b)]
 
 assoc             :: (Eq a) => String -> Assoc a b -> a -> b
 assocDefault      :: (Eq a) => b -> Assoc a b -> a -> b
 assocUsing        :: (a -> a -> Bool) -> String -> Assoc a b -> a -> b
+-- | Lookup key, fail gracefully using Nothing if not found.
 assocMaybe        :: (Eq a) => Assoc a b -> a -> Maybe b
 assocDefaultUsing :: (a -> a -> Bool) -> b -> Assoc a b -> a -> b
 
@@ -154,6 +160,11 @@ equivClasses cmp items   = NE.groupBy eq (L.sortBy cmp items)
   where
     eq a b = case cmp a b of { EQ -> True; _ -> False }
 
+-- | Remove the duplicates from a list using the provided
+-- comparison function.
+--
+-- Returns the list without duplicates, and accumulates
+-- all the duplicates in the second component of its result.
 removeDups :: (a -> a -> Ordering) -- Comparison function
            -> [a]
            -> ([a],          -- List with no duplicates
@@ -170,8 +181,41 @@ removeDups cmp xs
     collect_dups dups_so_far (x :| [])     = (dups_so_far,      x)
     collect_dups dups_so_far dups@(x :| _) = (dups:dups_so_far, x)
 
+-- | Remove the duplicates from a list using the provided
+-- comparison function.
+nubOrdBy :: (a -> a -> Ordering) -> [a] -> [a]
+nubOrdBy cmp xs = fst (removeDups cmp xs)
+
 findDupsEq :: (a->a->Bool) -> [a] -> [NonEmpty a]
 findDupsEq _  [] = []
 findDupsEq eq (x:xs) | L.null eq_xs  = findDupsEq eq xs
                      | otherwise     = (x :| eq_xs) : findDupsEq eq neq_xs
     where (eq_xs, neq_xs) = L.partition (eq x) xs
+
+-- Debugging/specialising versions of \tr{elem} and \tr{notElem}
+
+# if !defined(DEBUG)
+isIn, isn'tIn :: Eq a => String -> a -> [a] -> Bool
+isIn    _msg x ys = x `elem` ys
+isn'tIn _msg x ys = x `notElem` ys
+
+# else /* DEBUG */
+isIn, isn'tIn :: (HasDebugCallStack, Eq a) => String -> a -> [a] -> Bool
+isIn msg x ys
+  = elem100 0 x ys
+  where
+    elem100 :: Eq a => Int -> a -> [a] -> Bool
+    elem100 _ _ [] = False
+    elem100 i x (y:ys)
+      | i > 100 = warnPprTrace True ("Over-long elem in " ++ msg) empty (x `elem` (y:ys))
+      | otherwise = x == y || elem100 (i + 1) x ys
+
+isn'tIn msg x ys
+  = notElem100 0 x ys
+  where
+    notElem100 :: Eq a => Int -> a -> [a] -> Bool
+    notElem100 _ _ [] =  True
+    notElem100 i x (y:ys)
+      | i > 100 = warnPprTrace True ("Over-long notElem in " ++ msg) empty (x `notElem` (y:ys))
+      | otherwise = x /= y && notElem100 (i + 1) x ys
+# endif /* DEBUG */

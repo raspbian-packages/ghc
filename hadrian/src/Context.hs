@@ -7,7 +7,8 @@ module Context (
 
     -- * Paths
     contextDir, buildPath, buildDir, pkgInplaceConfig, pkgSetupConfigFile,
-    pkgHaddockFile, pkgRegisteredLibraryFile, pkgLibraryFile, pkgGhciLibraryFile,
+    pkgHaddockFile, pkgRegisteredLibraryFile, pkgRegisteredLibraryFileName,
+    pkgLibraryFile, pkgGhciLibraryFile,
     pkgConfFile, objectPath, contextPath, getContextPath, libPath, distDir,
     haddockStatsFilesDir
     ) where
@@ -44,7 +45,7 @@ getWay = way <$> getContext
 getStagedSettingList :: (Stage -> SettingList) -> Args Context b
 getStagedSettingList f = getSettingList . f =<< getStage
 
--- | Path to the directory containg the final artifact in a given 'Context'.
+-- | Path to the directory containing the final artifact in a given 'Context'.
 libPath :: Context -> Action FilePath
 libPath Context {..} = buildRoot <&> (-/- (stageString stage -/- "lib"))
 
@@ -56,7 +57,7 @@ libPath Context {..} = buildRoot <&> (-/- (stageString stage -/- "lib"))
 distDir :: Stage -> Action FilePath
 distDir st = do
     let (os,arch) = case st of
-            Stage0 -> (HostOs , HostArch)
+            Stage0 {} -> (HostOs , HostArch)
             _      -> (TargetOs, TargetArch)
     version        <- ghcVersionStage st
     hostOs         <- cabalOsString <$> setting os
@@ -87,8 +88,8 @@ pkgSetupConfigFile context = contextPath context <&> (-/- "setup-config")
 pkgHaddockFile :: Context -> Action FilePath
 pkgHaddockFile Context {..} = do
     root <- buildRoot
-    let name = pkgName package
-    return $ root -/- "docs/html/libraries" -/- name -/- name <.> "haddock"
+    version <- pkgIdentifier package
+    return $ root -/- "doc/html/libraries" -/- version -/- pkgName package <.> "haddock"
 
 -- | Path to the registered ghc-pkg library file of a given 'Context', e.g.:
 -- @_build/stage1/lib/x86_64-linux-ghc-8.9.0/libHSarray-0.5.1.0-ghc8.9.0.so@
@@ -97,12 +98,18 @@ pkgRegisteredLibraryFile :: Context -> Action FilePath
 pkgRegisteredLibraryFile context@Context {..} = do
     libDir    <- libPath context
     pkgId     <- pkgIdentifier package
-    extension <- libsuf stage way
-    fileName  <- pkgFileName package "libHS" extension
+    fileName  <- pkgRegisteredLibraryFileName context
     distDir   <- distDir stage
     return $ if Dynamic `wayUnit` way
         then libDir -/- distDir -/- fileName
         else libDir -/- distDir -/- pkgId -/- fileName
+
+-- | Just the final filename portion of pkgRegisteredLibraryFile
+pkgRegisteredLibraryFileName :: Context -> Action FilePath
+pkgRegisteredLibraryFileName Context{..} = do
+    extension <- libsuf stage way
+    pkgFileName package "libHS" extension
+
 
 -- | Path to the library file of a given 'Context', e.g.:
 -- @_build/stage1/libraries/array/build/libHSarray-0.5.1.0.a@.

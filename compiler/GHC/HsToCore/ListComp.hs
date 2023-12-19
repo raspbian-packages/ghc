@@ -1,3 +1,6 @@
+
+{-# LANGUAGE TypeFamilies   #-}
+
 {-
 (c) The University of Glasgow 2006
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
@@ -6,20 +9,14 @@
 Desugaring list comprehensions, monad comprehensions and array comprehensions
 -}
 
-{-# LANGUAGE CPP, NamedFieldPuns #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE ViewPatterns #-}
-
 module GHC.HsToCore.ListComp ( dsListComp, dsMonadComp ) where
-
-#include "HsVersions.h"
 
 import GHC.Prelude
 
-import {-# SOURCE #-} GHC.HsToCore.Expr ( dsHandleMonadicFailure, dsExpr, dsLExpr, dsLExprNoLP, dsLocalBinds, dsSyntaxExpr )
+import {-# SOURCE #-} GHC.HsToCore.Expr ( dsExpr, dsLExpr, dsLocalBinds, dsSyntaxExpr )
 
 import GHC.Hs
-import GHC.Tc.Utils.Zonk
+import GHC.Hs.Syn.Type
 import GHC.Core
 import GHC.Core.Make
 
@@ -35,9 +32,10 @@ import GHC.HsToCore.Match
 import GHC.Builtin.Names
 import GHC.Types.SrcLoc
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
 import GHC.Tc.Utils.TcType
 import GHC.Data.List.SetOps( getNth )
-import GHC.Utils.Misc
 
 {-
 List comprehensions may be desugared in one of two ways: ``ordinary''
@@ -88,7 +86,7 @@ dsInnerListComp (ParStmtBlock _ stmts bndrs _)
              list_ty          = mkListTy bndrs_tuple_type
 
              -- really use original bndrs below!
-       ; expr <- dsListComp (stmts ++ [noLoc $ mkLastStmt (mkBigLHsVarTupId bndrs)]) list_ty
+       ; expr <- dsListComp (stmts ++ [noLocA $ mkLastStmt (mkBigLHsVarTupId bndrs)]) list_ty
 
        ; return (expr, bndrs_tuple_type) }
 
@@ -139,9 +137,6 @@ dsTransStmt (TransStmt { trS_form = form, trS_stmts = stmts, trS_bndrs = binderM
                 , Type to_bndrs_tup_ty
                 , Var unzip_fn'
                 , inner_list_expr' ]
-
-    dsNoLevPoly (tcFunResultTyN (length usingArgs') (exprType usingExpr'))
-      (text "In the result of a" <+> quotes (text "using") <+> text "function:" <+> ppr using)
 
     -- Build a pattern that ensures the consumer binds into the NEW binders,
     -- which hold lists rather than single values
@@ -222,7 +217,7 @@ deListComp [] _ = panic "deListComp"
 
 deListComp (LastStmt _ body _ _ : quals) list
   =     -- Figure 7.4, SLPJ, p 135, rule C above
-    ASSERT( null quals )
+    assert (null quals) $
     do { core_body <- dsLExpr body
        ; return (mkConsExpr (exprType core_body) core_body list) }
 
@@ -242,7 +237,7 @@ deListComp (stmt@(TransStmt {}) : quals) list = do
     deBindComp pat inner_list_expr quals list
 
 deListComp (BindStmt _ pat list1 : quals) core_list2 = do -- rule A' above
-    core_list1 <- dsLExprNoLP list1
+    core_list1 <- dsLExpr list1
     deBindComp pat core_list1 quals core_list2
 
 deListComp (ParStmt _ stmtss_w_bndrs _ _ : quals) list
@@ -280,8 +275,8 @@ deBindComp pat core_list1 quals core_list2 = do
     let res_ty = exprType core_list2
         h_ty   = u1_ty `mkVisFunTyMany` res_ty
 
-       -- no levity polymorphism here, as list comprehensions don't work
-       -- with RebindableSyntax. NB: These are *not* monad comps.
+       -- no representation polymorphism here, as list comprehensions
+       -- don't work with RebindableSyntax. NB: These are *not* monad comps.
     [h, u1, u2, u3] <- newSysLocalsDs $ map unrestricted [h_ty, u1_ty, u2_ty, u3_ty]
 
     -- the "fail" value ...
@@ -290,13 +285,13 @@ deBindComp pat core_list1 quals core_list2 = do
         letrec_body = App (Var h) core_list1
 
     rest_expr <- deListComp quals core_fail
-    core_match <- matchSimply (Var u2) (StmtCtxt ListComp) pat rest_expr core_fail
+    core_match <- matchSimply (Var u2) (StmtCtxt (HsDoStmt ListComp)) pat rest_expr core_fail
 
     let
         rhs = Lam u1 $
               Case (Var u1) u1 res_ty
-                   [(DataAlt nilDataCon,  [],       core_list2),
-                    (DataAlt consDataCon, [u2, u3], core_match)]
+                   [Alt (DataAlt nilDataCon)  []       core_list2
+                   ,Alt (DataAlt consDataCon) [u2, u3] core_match]
                         -- Increasing order of tag
 
     return (Let (Rec [(h, rhs)]) letrec_body)
@@ -329,8 +324,8 @@ dfListComp :: Id -> Id            -- 'c' and 'n'
 dfListComp _ _ [] = panic "dfListComp"
 
 dfListComp c_id n_id (LastStmt _ body _ _ : quals)
-  = ASSERT( null quals )
-    do { core_body <- dsLExprNoLP body
+  = assert (null quals) $
+    do { core_body <- dsLExpr body
        ; return (mkApps (Var c_id) [core_body, Var n_id]) }
 
         -- Non-last: must be a guard
@@ -378,7 +373,7 @@ dfBindComp c_id n_id (pat, core_list1) quals = do
     core_rest <- dfListComp c_id b quals
 
     -- build the pattern match
-    core_expr <- matchSimply (Var x) (StmtCtxt ListComp)
+    core_expr <- matchSimply (Var x) (StmtCtxt (HsDoStmt ListComp))
                 pat core_rest (Var b)
 
     -- now build the outermost foldr, and return
@@ -423,8 +418,8 @@ mkZipBind elt_tys = do
 
     mk_case (as, a', as') rest
           = Case (Var as) as elt_tuple_list_ty
-                  [(DataAlt nilDataCon,  [],        mkNilExpr elt_tuple_ty),
-                   (DataAlt consDataCon, [a', as'], rest)]
+                  [ Alt (DataAlt nilDataCon)  []        (mkNilExpr elt_tuple_ty)
+                  , Alt (DataAlt consDataCon) [a', as'] rest]
                         -- Increasing order of tag
 
 
@@ -479,13 +474,13 @@ dsMonadComp stmts = dsMcStmts stmts
 
 dsMcStmts :: [ExprLStmt GhcTc] -> DsM CoreExpr
 dsMcStmts []                      = panic "dsMcStmts"
-dsMcStmts ((L loc stmt) : lstmts) = putSrcSpanDs loc (dsMcStmt stmt lstmts)
+dsMcStmts ((L loc stmt) : lstmts) = putSrcSpanDsA loc (dsMcStmt stmt lstmts)
 
 ---------------
 dsMcStmt :: ExprStmt GhcTc -> [ExprLStmt GhcTc] -> DsM CoreExpr
 
 dsMcStmt (LastStmt _ body _ ret_op) stmts
-  = ASSERT( null stmts )
+  = assert (null stmts) $
     do { body' <- dsLExpr body
        ; dsSyntaxExpr ret_op [body'] }
 
@@ -551,7 +546,7 @@ dsMcStmt (TransStmt { trS_stmts = stmts, trS_bndrs = bndrs
        ; let tup_n_ty' = mkBigCoreVarTupTy to_bndrs
 
        ; body        <- dsMcStmts stmts_rest
-       ; n_tup_var'  <- newSysLocalDsNoLP Many n_tup_ty'
+       ; n_tup_var'  <- newSysLocalDs Many n_tup_ty'
        ; tup_n_var'  <- newSysLocalDs Many tup_n_ty'
        ; tup_n_expr' <- mkMcUnzipM form fmap_op n_tup_var' from_bndr_tys
        ; us          <- newUniqueSupply
@@ -616,9 +611,9 @@ dsMcBindStmt :: LPat GhcTc
 dsMcBindStmt pat rhs' bind_op fail_op res1_ty stmts
   = do  { body     <- dsMcStmts stmts
         ; var      <- selectSimpleMatchVarL Many pat
-        ; match <- matchSinglePatVar var (StmtCtxt (DoExpr Nothing)) pat
+        ; match <- matchSinglePatVar var Nothing (StmtCtxt (HsDoStmt (DoExpr Nothing))) pat
                                   res1_ty (cantFailMatchResult body)
-        ; match_code <- dsHandleMonadicFailure pat match fail_op
+        ; match_code <- dsHandleMonadicFailure MonadComp pat match fail_op
         ; dsSyntaxExpr bind_op [rhs', Lam var match_code] }
 
 -- Desugar nested monad comprehensions, for example in `then..` constructs
@@ -632,7 +627,7 @@ dsInnerMonadComp :: [ExprLStmt GhcTc]
                  -> DsM CoreExpr
 dsInnerMonadComp stmts bndrs ret_op
   = dsMcStmts (stmts ++
-                 [noLoc (LastStmt noExtField (mkBigLHsVarTupId bndrs) Nothing ret_op)])
+                 [noLocA (LastStmt noExtField (mkBigLHsVarTupId bndrs) Nothing ret_op)])
 
 
 -- The `unzip` function for `GroupStmt` in a monad comprehensions
@@ -649,7 +644,7 @@ dsInnerMonadComp stmts bndrs ret_op
 mkMcUnzipM :: TransForm
            -> HsExpr GhcTc      -- fmap
            -> Id                -- Of type n (a,b,c)
-           -> [Type]            -- [a,b,c]   (not levity-polymorphic)
+           -> [Type]            -- [a,b,c]   (not representation-polymorphic)
            -> DsM CoreExpr      -- Of type (n a, n b, n c)
 mkMcUnzipM ThenForm _ ys _
   = return (Var ys) -- No unzipping to do

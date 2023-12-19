@@ -56,7 +56,7 @@ is both quick to build and consistent with our testsuite:
 $ ./validate --build-only
 ```
 
-You can use the `./inplace/bin/ghc-stage2` binary to play with the
+You can use the `_validatebuild/stage1/bin/ghc` binary to play with the
 newly built compiler.
 
 Now, hack on your copy and rebuild (with `make`) as necessary.
@@ -108,7 +108,7 @@ provide plenty through a variety of means!
 ## IRC
 
 If you're an IRC user, be sure to drop by the official `#ghc` channel
-on [freenode](http://freenode.org). Many (but not all) of the
+on [Libera.Chat](https://libera.chat). Many (but not all) of the
 developers and committers are actively there during a variety of
 hours.
 

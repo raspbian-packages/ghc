@@ -85,6 +85,10 @@ import GHC.Base hiding ( mapM, sequence )
 import GHC.List ( zipWith, unzip )
 import GHC.Num  ( (-) )
 
+-- $setup
+-- >>> import Prelude
+-- >>> let safeDiv x y = guard (y /= 0) >> Just (x `div` y :: Int)
+
 -- -----------------------------------------------------------------------------
 -- Functions mandated by the Prelude
 
@@ -106,12 +110,11 @@ import GHC.Num  ( (-) )
 -- 'Nothing' when the denominator @y@ is zero and @'Just' (x \`div\`
 -- y)@ otherwise. For example:
 --
--- @
 -- >>> safeDiv 4 0
 -- Nothing
+--
 -- >>> safeDiv 4 2
 -- Just 2
--- @
 --
 -- A definition of @safeDiv@ using guards, but not 'guard':
 --
@@ -219,7 +222,7 @@ zipWithM f xs ys  =  sequenceA (zipWith f xs ys)
 zipWithM_         :: (Applicative m) => (a -> b -> m c) -> [a] -> [b] -> m ()
 {-# INLINE zipWithM_ #-}
 -- Inline so that fusion with zipWith and sequenceA have a chance to fire
--- See Note [Fusion for zipN/zipWithN] in List.hs]
+-- See Note [Fusion for zipN/zipWithN] in List.hs.
 zipWithM_ f xs ys =  sequenceA_ (zipWith f xs ys)
 
 {- | The 'foldM' function is analogous to 'Data.Foldable.foldl', except that its result is
@@ -259,7 +262,6 @@ foldM_ f a xs  = foldlM f a xs >> return ()
 {-
 Note [Worker/wrapper transform on replicateM/replicateM_]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 The implementations of replicateM and replicateM_ both leverage the
 worker/wrapper transform. The simpler implementation of replicateM_, as an
 example, would be:
@@ -281,10 +283,11 @@ Core: https://gitlab.haskell.org/ghc/ghc/issues/11795#note_118976
 -- and then returns the list of results:
 --
 -- ==== __Examples__
--- >>> replicateM 3 (putStrLn "a")
--- a
--- a
--- a
+--
+-- >>> import Control.Monad.State
+-- >>> runState (replicateM 3 $ state $ \s -> (s, s + 1)) 1
+-- ([1,2,3],4)
+--
 replicateM        :: (Applicative m) => Int -> m a -> m [a]
 {-# INLINABLE replicateM #-}
 {-# SPECIALISE replicateM :: Int -> IO a -> IO [a] #-}
@@ -297,6 +300,14 @@ replicateM cnt0 f =
         | otherwise = liftA2 (:) f (loop (cnt - 1))
 
 -- | Like 'replicateM', but discards the result.
+--
+-- ==== __Examples__
+--
+-- >>> replicateM_ 3 (putStrLn "a")
+-- a
+-- a
+-- a
+--
 replicateM_       :: (Applicative m) => Int -> m a -> m ()
 {-# INLINABLE replicateM_ #-}
 {-# SPECIALISE replicateM_ :: Int -> IO a -> IO () #-}
@@ -345,12 +356,11 @@ f <$!> m = do
 --
 -- An example using 'mfilter' with the 'Maybe' monad:
 --
--- @
 -- >>> mfilter odd (Just 1)
 -- Just 1
 -- >>> mfilter odd (Just 2)
 -- Nothing
--- @
+--
 mfilter :: (MonadPlus m) => (a -> Bool) -> m a -> m a
 {-# INLINABLE mfilter #-}
 mfilter p ma = do

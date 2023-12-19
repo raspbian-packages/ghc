@@ -6,18 +6,15 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE MagicHash #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 
 -- | Highly random utility functions
 --
 module GHC.Utils.Misc (
-        -- * Flags dependent on the compiler build
-        ghciSupported, debugIsOn,
-        isWindowsHost, isDarwinHost,
-
         -- * Miscellaneous higher-order functions
-        applyWhen, nTimes,
+        applyWhen, nTimes, const2,
 
         -- * General list processing
         zipEqual, zipWithEqual, zipWith3Equal, zipWith4Equal,
@@ -32,20 +29,19 @@ module GHC.Utils.Misc (
         mapFst, mapSnd, chkAppend,
         mapAndUnzip, mapAndUnzip3,
         filterOut, partitionWith,
+        mapAccumM,
 
-        dropWhileEndLE, spanEnd, last2, lastMaybe,
+        dropWhileEndLE, spanEnd, last2, lastMaybe, onJust,
 
-        foldl1', foldl2, count, countWhile, all2,
+        List.foldl1', foldl2, count, countWhile, all2,
 
         lengthExceeds, lengthIs, lengthIsNot,
         lengthAtLeast, lengthAtMost, lengthLessThan,
         listLengthCmp, atLength,
         equalLength, compareLength, leLength, ltLength,
 
-        isSingleton, only, GHC.Utils.Misc.singleton,
+        isSingleton, only, expectOnly, GHC.Utils.Misc.singleton,
         notNull, snocView,
-
-        isIn, isn'tIn,
 
         chunkList,
 
@@ -56,6 +52,10 @@ module GHC.Utils.Misc (
 
         mergeListsBy,
         isSortedBy,
+
+        -- Foldable generalised functions,
+
+        mapMaybe',
 
         -- * Tuples
         fstOf3, sndOf3, thdOf3,
@@ -69,7 +69,7 @@ module GHC.Utils.Misc (
         dropTail, capitalise,
 
         -- * Sorting
-        sortWith, minWith, nubSort, ordNub,
+        sortWith, minWith, nubSort, ordNub, ordNubOn,
 
         -- * Comparisons
         isEqual, eqListBy, eqMaybeBy,
@@ -84,30 +84,27 @@ module GHC.Utils.Misc (
         transitiveClosure,
 
         -- * Strictness
-        seqList, strictMap,
+        seqList, strictMap, strictZipWith, strictZipWith3,
 
         -- * Module names
         looksLikeModuleName,
         looksLikePackageName,
-
-        -- * Argument processing
-        getCmd, toCmdArgs, toArgs,
 
         -- * Integers
         exactLog2,
 
         -- * Floating point
         readRational,
+        readSignificandExponentPair,
         readHexRational,
+        readHexSignificandExponentPair,
 
         -- * IO-ish utilities
         doesDirNameExist,
         getModificationUTCTime,
         modificationTimeIfExists,
+        fileHashIfExists,
         withAtomicRename,
-
-        global, consIORef, globalM,
-        sharedGlobal, sharedGlobalM,
 
         -- * Filenames and paths
         Suffix,
@@ -128,23 +125,17 @@ module GHC.Utils.Misc (
         -- * Call stacks
         HasCallStack,
         HasDebugCallStack,
-
-        -- * Utils for flags
-        OverridingBool(..),
-        overrideWith,
     ) where
-
-#include "HsVersions.h"
 
 import GHC.Prelude
 
 import GHC.Utils.Exception
 import GHC.Utils.Panic.Plain
+import GHC.Utils.Constants
+import GHC.Utils.Fingerprint
 
 import Data.Data
-import Data.IORef       ( IORef, newIORef, atomicModifyIORef' )
-import System.IO.Unsafe ( unsafePerformIO )
-import Data.List        hiding (group)
+import qualified Data.List as List
 import Data.List.NonEmpty  ( NonEmpty(..) )
 
 import GHC.Exts
@@ -153,7 +144,6 @@ import GHC.Stack (HasCallStack)
 import Control.Applicative ( liftA2 )
 import Control.Monad    ( liftM, guard )
 import Control.Monad.IO.Class ( MonadIO, liftIO )
-import GHC.Conc.Sync ( sharedCAF )
 import System.IO.Error as IO ( isDoesNotExistError )
 import System.Directory ( doesDirectoryExist, getModificationTime, renameFile )
 import System.FilePath
@@ -163,63 +153,14 @@ import Data.Char        ( isUpper, isAlphaNum, isSpace, chr, ord, isDigit, toUpp
 import Data.Int
 import Data.Ratio       ( (%) )
 import Data.Ord         ( comparing )
-import Data.Bits
 import Data.Word
 import qualified Data.IntMap as IM
 import qualified Data.Set as Set
 
 import Data.Time
 
-#if defined(DEBUG)
-import {-# SOURCE #-} GHC.Utils.Outputable ( warnPprTrace, text )
-#endif
-
 infixr 9 `thenCmp`
 
-{-
-************************************************************************
-*                                                                      *
-\subsection{Is DEBUG on, are we on Windows, etc?}
-*                                                                      *
-************************************************************************
-
-These booleans are global constants, set by CPP flags.  They allow us to
-recompile a single module (this one) to change whether or not debug output
-appears. They sometimes let us avoid even running CPP elsewhere.
-
-It's important that the flags are literal constants (True/False). Then,
-with -0, tests of the flags in other modules will simplify to the correct
-branch of the conditional, thereby dropping debug code altogether when
-the flags are off.
--}
-
-ghciSupported :: Bool
-#if defined(HAVE_INTERNAL_INTERPRETER)
-ghciSupported = True
-#else
-ghciSupported = False
-#endif
-
-debugIsOn :: Bool
-#if defined(DEBUG)
-debugIsOn = True
-#else
-debugIsOn = False
-#endif
-
-isWindowsHost :: Bool
-#if defined(mingw32_HOST_OS)
-isWindowsHost = True
-#else
-isWindowsHost = False
-#endif
-
-isDarwinHost :: Bool
-#if defined(darwin_HOST_OS)
-isDarwinHost = True
-#else
-isDarwinHost = False
-#endif
 
 {-
 ************************************************************************
@@ -234,11 +175,14 @@ applyWhen :: Bool -> (a -> a) -> a -> a
 applyWhen True f x = f x
 applyWhen _    _ x = x
 
--- | A for loop: Compose a function with itself n times.  (nth rather than twice)
+-- | Apply a function @n@ times to a given value.
 nTimes :: Int -> (a -> a) -> (a -> a)
 nTimes 0 _ = id
 nTimes 1 f = f
 nTimes n f = f . nTimes (n-1) f
+
+const2 :: a -> b -> c -> a
+const2 x _ _ = x
 
 fstOf3   :: (a,b,c) -> a
 sndOf3   :: (a,b,c) -> b
@@ -284,9 +228,7 @@ secondM f (x, y) = (x,) <$> f y
 
 filterOut :: (a->Bool) -> [a] -> [a]
 -- ^ Like filter, only it reverses the sense of the test
-filterOut _ [] = []
-filterOut p (x:xs) | p x       = filterOut p xs
-                   | otherwise = x : filterOut p xs
+filterOut p = filter (not . p)
 
 partitionWith :: (a -> Either b c) -> [a] -> ([b], [c])
 -- ^ Uses a function to determine which of two output lists an input element should join
@@ -318,7 +260,7 @@ zipWith4Equal   :: String -> (a->b->c->d->e) -> [a]->[b]->[c]->[d]->[e]
 zipEqual      _ = zip
 zipWithEqual  _ = zipWith
 zipWith3Equal _ = zipWith3
-zipWith4Equal _ = zipWith4
+zipWith4Equal _ = List.zipWith4
 #else
 zipEqual _   []     []     = []
 zipEqual msg (a:as) (b:bs) = (a,b) : zipEqual msg as bs
@@ -554,10 +496,13 @@ isSingleton :: [a] -> Bool
 isSingleton [_] = True
 isSingleton _   = False
 
-notNull :: [a] -> Bool
-notNull [] = False
-notNull _  = True
+notNull :: Foldable f => f a -> Bool
+notNull = not . null
 
+-- | Utility function to go from a singleton list to it's element.
+--
+-- Wether or not the argument is a singleton list is only checked
+-- in debug builds.
 only :: [a] -> a
 #if defined(DEBUG)
 only [a] = a
@@ -566,33 +511,17 @@ only (a:_) = a
 #endif
 only _ = panic "Util: only"
 
--- Debugging/specialising versions of \tr{elem} and \tr{notElem}
-
-# if !defined(DEBUG)
-isIn, isn'tIn :: Eq a => String -> a -> [a] -> Bool
-isIn    _msg x ys = x `elem` ys
-isn'tIn _msg x ys = x `notElem` ys
-
-# else /* DEBUG */
-isIn, isn'tIn :: (HasDebugCallStack, Eq a) => String -> a -> [a] -> Bool
-isIn msg x ys
-  = elem100 0 x ys
-  where
-    elem100 :: Eq a => Int -> a -> [a] -> Bool
-    elem100 _ _ [] = False
-    elem100 i x (y:ys)
-      | i > 100 = WARN(True, text ("Over-long elem in " ++ msg)) (x `elem` (y:ys))
-      | otherwise = x == y || elem100 (i + 1) x ys
-
-isn'tIn msg x ys
-  = notElem100 0 x ys
-  where
-    notElem100 :: Eq a => Int -> a -> [a] -> Bool
-    notElem100 _ _ [] =  True
-    notElem100 i x (y:ys)
-      | i > 100 = WARN(True, text ("Over-long notElem in " ++ msg)) (x `notElem` (y:ys))
-      | otherwise = x /= y && notElem100 (i + 1) x ys
-# endif /* DEBUG */
+-- | Extract the single element of a list and panic with the given message if
+-- there are more elements or the list was empty.
+-- Like 'expectJust', but for lists.
+expectOnly :: HasCallStack => String -> [a] -> a
+{-# INLINE expectOnly #-}
+#if defined(DEBUG)
+expectOnly _   [a]   = a
+#else
+expectOnly _   (a:_) = a
+#endif
+expectOnly msg _     = panic ("expectOnly: " ++ msg)
 
 
 -- | Split a list into chunks of /n/ elements
@@ -612,6 +541,15 @@ mapLastM :: Functor f => (a -> f a) -> [a] -> f [a]
 mapLastM _ [] = panic "mapLastM: empty list"
 mapLastM f [x] = (\x' -> [x']) <$> f x
 mapLastM f (x:xs) = (x:) <$> mapLastM f xs
+
+mapAccumM :: (Monad m) => (r -> a -> m (r, b)) -> r -> [a] -> m (r, [b])
+mapAccumM f = go
+  where
+    go acc [] = pure (acc,[])
+    go acc (x:xs) = do
+      (acc',y) <- f acc x
+      (acc'',ys) <- go acc' xs
+      pure (acc'', y:ys)
 
 whenNonEmpty :: Applicative m => [a] -> (NonEmpty a -> m ()) -> m ()
 whenNonEmpty []     _ = pure ()
@@ -674,7 +612,7 @@ isSortedBy cmp = sorted
 -}
 
 minWith :: Ord b => (a -> b) -> [a] -> a
-minWith get_key xs = ASSERT( not (null xs) )
+minWith get_key xs = assert (not (null xs) )
                      head (sortWith get_key xs)
 
 nubSort :: Ord a => [a] -> [a]
@@ -683,13 +621,18 @@ nubSort = Set.toAscList . Set.fromList
 -- | Remove duplicates but keep elements in order.
 --   O(n * log n)
 ordNub :: Ord a => [a] -> [a]
-ordNub xs
+ordNub xs = ordNubOn id xs
+
+-- | Remove duplicates but keep elements in order.
+--   O(n * log n)
+ordNubOn :: Ord b => (a -> b) -> [a] -> [a]
+ordNubOn f xs
   = go Set.empty xs
   where
     go _ [] = []
     go s (x:xs)
-      | Set.member x s = go s xs
-      | otherwise = x : go (Set.insert x s) xs
+      | Set.member (f x) s = go s xs
+      | otherwise = x : go (Set.insert (f x) s) xs
 
 
 {-
@@ -774,17 +717,23 @@ dropList _  xs@[] = xs
 dropList (_:xs) (_:ys) = dropList xs ys
 
 
+-- | Given two lists xs and ys, return `splitAt (length xs) ys`.
 splitAtList :: [b] -> [a] -> ([a], [a])
-splitAtList [] xs     = ([], xs)
-splitAtList _ xs@[]   = (xs, xs)
-splitAtList (_:xs) (y:ys) = (y:ys', ys'')
-    where
-      (ys', ys'') = splitAtList xs ys
+splitAtList xs ys = go 0# xs ys
+   where
+      -- we are careful to avoid allocating when there are no leftover
+      -- arguments: in this case we can return "ys" directly (cf #18535)
+      --
+      -- We make `xs` strict because in the general case `ys` isn't `[]` so we
+      -- will have to evaluate `xs` anyway.
+      go _  !_     []     = (ys, [])             -- length ys <= length xs
+      go n  []     bs     = (take (I# n) ys, bs) -- = splitAt n ys
+      go n  (_:as) (_:bs) = go (n +# 1#) as bs
 
--- drop from the end of a list
+-- | drop from the end of a list
 dropTail :: Int -> [a] -> [a]
 -- Specification: dropTail n = reverse . drop n . reverse
--- Better implemention due to Joachim Breitner
+-- Better implementation due to Joachim Breitner
 -- http://www.joachim-breitner.de/blog/archives/600-On-taking-the-last-n-elements-of-a-list.html
 dropTail n xs
   = go (drop n xs) xs
@@ -818,13 +767,17 @@ spanEnd p l = go l [] [] l
 -- | Get the last two elements in a list. Partial!
 {-# INLINE last2 #-}
 last2 :: [a] -> (a,a)
-last2 = foldl' (\(_,x2) x -> (x2,x)) (partialError,partialError)
+last2 = List.foldl' (\(_,x2) x -> (x2,x)) (partialError,partialError)
   where
     partialError = panic "last2 - list length less than two"
 
 lastMaybe :: [a] -> Maybe a
 lastMaybe [] = Nothing
 lastMaybe xs = Just $ last xs
+
+-- | @onJust x m f@ applies f to the value inside the Just or returns the default.
+onJust :: b -> Maybe a -> (a->b) -> b
+onJust dflt = flip (maybe dflt)
 
 -- | Split a list into its last element and the initial part of the list.
 -- @snocView xs = Just (init xs, last xs)@ for non-empty lists.
@@ -947,7 +900,7 @@ restrictedDamerauLevenshteinDistance'
 restrictedDamerauLevenshteinDistance' _bv_dummy m n str1 str2
   | [] <- str1 = n
   | otherwise  = extractAnswer $
-                 foldl' (restrictedDamerauLevenshteinDistanceWorker
+                 List.foldl' (restrictedDamerauLevenshteinDistanceWorker
                              (matchVectors str1) top_bit_mask vector_mask)
                         (0, 0, m_ones, 0, m) str2
   where
@@ -986,7 +939,7 @@ sizedComplement :: Bits bv => bv -> bv -> bv
 sizedComplement vector_mask vect = vector_mask `xor` vect
 
 matchVectors :: (Bits bv, Num bv) => String -> IM.IntMap bv
-matchVectors = snd . foldl' go (0 :: Int, IM.empty)
+matchVectors = snd . List.foldl' go (0 :: Int, IM.empty)
   where
     go (ix, im) char = let ix' = ix + 1
                            im' = IM.insertWith (.|.) (ord char) (2 ^ ix) im
@@ -1019,11 +972,13 @@ fuzzyMatch key vals = fuzzyLookup key [(v,v) | v <- vals]
 -- returning a small number of ranked results
 fuzzyLookup :: String -> [(String,a)] -> [a]
 fuzzyLookup user_entered possibilites
-  = map fst $ take mAX_RESULTS $ sortBy (comparing snd)
-    [ (poss_val, distance) | (poss_str, poss_val) <- possibilites
-                       , let distance = restrictedDamerauLevenshteinDistance
-                                            poss_str user_entered
-                       , distance <= fuzzy_threshold ]
+  = map fst $ take mAX_RESULTS $ List.sortBy (comparing snd)
+    [ (poss_val, sort_key)
+    | (poss_str, poss_val) <- possibilites
+    , let distance = restrictedDamerauLevenshteinDistance poss_str user_entered
+    , distance <= fuzzy_threshold
+    , let sort_key = (distance, length poss_str, poss_str)
+    ]
   where
     -- Work out an appropriate match threshold:
     -- We report a candidate if its edit distance is <= the threshold,
@@ -1036,6 +991,10 @@ fuzzyLookup user_entered possibilites
     --     5         1
     --     6         2
     --
+    -- Candidates with the same distance are sorted by their length. We also
+    -- use the actual string as the third sorting criteria the sort key to get
+    -- deterministic output, even if the input may have depended on the uniques
+    -- in question
     fuzzy_threshold = truncate $ fromIntegral (length user_entered + 2) / (4 :: Rational)
     mAX_RESULTS = 3
 
@@ -1055,56 +1014,35 @@ seqList [] b = b
 seqList (x:xs) b = x `seq` seqList xs b
 
 strictMap :: (a -> b) -> [a] -> [b]
-strictMap _ [] = []
-strictMap f (x : xs) =
+strictMap _ []     = []
+strictMap f (x:xs) =
   let
     !x' = f x
     !xs' = strictMap f xs
   in
     x' : xs'
 
-{-
-************************************************************************
-*                                                                      *
-                        Globals and the RTS
-*                                                                      *
-************************************************************************
+strictZipWith :: (a -> b -> c) -> [a] -> [b] -> [c]
+strictZipWith _ []     _      = []
+strictZipWith _ _      []     = []
+strictZipWith f (x:xs) (y:ys) =
+  let
+    !x' = f x y
+    !xs' = strictZipWith f xs ys
+  in
+    x' : xs'
 
-When a plugin is loaded, it currently gets linked against a *newly
-loaded* copy of the GHC package. This would not be a problem, except
-that the new copy has its own mutable state that is not shared with
-that state that has already been initialized by the original GHC
-package.
+strictZipWith3 :: (a -> b -> c -> d) -> [a] -> [b] -> [c] -> [d]
+strictZipWith3 _ []     _      _      = []
+strictZipWith3 _ _      []     _      = []
+strictZipWith3 _ _      _      []     = []
+strictZipWith3 f (x:xs) (y:ys) (z:zs) =
+  let
+    !x' = f x y z
+    !xs' = strictZipWith3 f xs ys zs
+  in
+    x' : xs'
 
-(Note that if the GHC executable was dynamically linked this
-wouldn't be a problem, because we could share the GHC library it
-links to; this is only a problem if DYNAMIC_GHC_PROGRAMS=NO.)
-
-The solution is to make use of @sharedCAF@ through @sharedGlobal@
-for globals that are shared between multiple copies of ghc packages.
--}
-
--- Global variables:
-
-global :: a -> IORef a
-global a = unsafePerformIO (newIORef a)
-
-consIORef :: IORef [a] -> a -> IO ()
-consIORef var x = do
-  atomicModifyIORef' var (\xs -> (x:xs,()))
-
-globalM :: IO a -> IORef a
-globalM ma = unsafePerformIO (ma >>= newIORef)
-
--- Shared global variables:
-
-sharedGlobal :: a -> (Ptr (IORef a) -> IO (Ptr (IORef a))) -> IORef a
-sharedGlobal a get_or_set = unsafePerformIO $
-  newIORef a >>= flip sharedCAF get_or_set
-
-sharedGlobalM :: IO a -> (Ptr (IORef a) -> IO (Ptr (IORef a))) -> IORef a
-sharedGlobalM ma get_or_set = unsafePerformIO $
-  ma >>= newIORef >>= flip sharedCAF get_or_set
 
 -- Module names:
 
@@ -1120,67 +1058,6 @@ looksLikeModuleName (c:cs) = isUpper c && go cs
 looksLikePackageName :: String -> Bool
 looksLikePackageName = all (all isAlphaNum <&&> not . (all isDigit)) . split '-'
 
-{-
-Akin to @Prelude.words@, but acts like the Bourne shell, treating
-quoted strings as Haskell Strings, and also parses Haskell [String]
-syntax.
--}
-
-getCmd :: String -> Either String             -- Error
-                           (String, String) -- (Cmd, Rest)
-getCmd s = case break isSpace $ dropWhile isSpace s of
-           ([], _) -> Left ("Couldn't find command in " ++ show s)
-           res -> Right res
-
-toCmdArgs :: String -> Either String             -- Error
-                              (String, [String]) -- (Cmd, Args)
-toCmdArgs s = case getCmd s of
-              Left err -> Left err
-              Right (cmd, s') -> case toArgs s' of
-                                 Left err -> Left err
-                                 Right args -> Right (cmd, args)
-
-toArgs :: String -> Either String   -- Error
-                           [String] -- Args
-toArgs str
-    = case dropWhile isSpace str of
-      s@('[':_) -> case reads s of
-                   [(args, spaces)]
-                    | all isSpace spaces ->
-                       Right args
-                   _ ->
-                       Left ("Couldn't read " ++ show str ++ " as [String]")
-      s -> toArgs' s
- where
-  toArgs' :: String -> Either String [String]
-  -- Remove outer quotes:
-  -- > toArgs' "\"foo\" \"bar baz\""
-  -- Right ["foo", "bar baz"]
-  --
-  -- Keep inner quotes:
-  -- > toArgs' "-DFOO=\"bar baz\""
-  -- Right ["-DFOO=\"bar baz\""]
-  toArgs' s = case dropWhile isSpace s of
-              [] -> Right []
-              ('"' : _) -> do
-                    -- readAsString removes outer quotes
-                    (arg, rest) <- readAsString s
-                    (arg:) `fmap` toArgs' rest
-              s' -> case break (isSpace <||> (== '"')) s' of
-                    (argPart1, s''@('"':_)) -> do
-                        (argPart2, rest) <- readAsString s''
-                        -- show argPart2 to keep inner quotes
-                        ((argPart1 ++ show argPart2):) `fmap` toArgs' rest
-                    (arg, s'') -> (arg:) `fmap` toArgs' s''
-
-  readAsString :: String -> Either String (String, String)
-  readAsString s = case reads s of
-                [(arg, rest)]
-                    -- rest must either be [] or start with a space
-                    | all isSpace (take 1 rest) ->
-                    Right (arg, rest)
-                _ ->
-                    Left ("Couldn't read " ++ show s ++ " as String")
 -----------------------------------------------------------------------------
 -- Integers
 
@@ -1202,9 +1079,28 @@ exactLog2 x
 
 readRational__ :: ReadS Rational -- NB: doesn't handle leading "-"
 readRational__ r = do
+      ((i, e), t) <- readSignificandExponentPair__ r
+      return ((i%1)*10^^e, t)
+
+readRational :: String -> Rational -- NB: *does* handle a leading "-"
+readRational top_s
+  = case top_s of
+      '-' : xs -> negate (read_me xs)
+      xs       -> read_me xs
+  where
+    read_me s
+      = case (do { (x,"") <- readRational__ s ; return x }) of
+          [x] -> x
+          []  -> error ("readRational: no parse:"        ++ top_s)
+          _   -> error ("readRational: ambiguous parse:" ++ top_s)
+
+
+readSignificandExponentPair__ :: ReadS (Integer, Integer) -- NB: doesn't handle leading "-"
+readSignificandExponentPair__ r = do
      (n,d,s) <- readFix r
      (k,t)   <- readExp s
-     return ((n%1)*10^^(k-d), t)
+     let pair = (n, toInteger (k - d))
+     return (pair, t)
  where
      readFix r = do
         (ds,s)  <- lexDecDigits r
@@ -1238,23 +1134,31 @@ readRational__ r = do
                | p x       =  let (ys,zs) = span' p xs' in (x:ys,zs)
                | otherwise =  ([],xs)
 
-readRational :: String -> Rational -- NB: *does* handle a leading "-"
-readRational top_s
+-- | Parse a string into a significand and exponent.
+-- A trivial example might be:
+--   ghci> readSignificandExponentPair "1E2"
+--   (1,2)
+-- In a more complex case we might return a exponent different than that
+-- which the user wrote. This is needed in order to use a Integer significand.
+--   ghci> readSignificandExponentPair "-1.11E5"
+--   (-111,3)
+readSignificandExponentPair :: String -> (Integer, Integer) -- NB: *does* handle a leading "-"
+readSignificandExponentPair top_s
   = case top_s of
-      '-' : xs -> - (read_me xs)
+      '-' : xs -> let (i, e) = read_me xs in (-i, e)
       xs       -> read_me xs
   where
     read_me s
-      = case (do { (x,"") <- readRational__ s ; return x }) of
+      = case (do { (x,"") <- readSignificandExponentPair__ s ; return x }) of
           [x] -> x
-          []  -> error ("readRational: no parse:"        ++ top_s)
-          _   -> error ("readRational: ambiguous parse:" ++ top_s)
+          []  -> error ("readSignificandExponentPair: no parse:"        ++ top_s)
+          _   -> error ("readSignificandExponentPair: ambiguous parse:" ++ top_s)
 
 
 readHexRational :: String -> Rational
 readHexRational str =
   case str of
-    '-' : xs -> - (readMe xs)
+    '-' : xs -> negate (readMe xs)
     xs       -> readMe xs
   where
   readMe as =
@@ -1295,7 +1199,7 @@ readHexRational__ ('0' : x : rest)
              (ds,"") | not (null ds) -> Just (steps 10 0 ds)
              _ -> Nothing
 
-  steps base n ds = foldl' (step base) n ds
+  steps base n ds = List.foldl' (step base) n ds
   step  base n d  = base * n + fromIntegral (digitToInt d)
 
   span' _ xs@[]         =  (xs, xs)
@@ -1305,6 +1209,73 @@ readHexRational__ ('0' : x : rest)
             | otherwise =  ([],xs)
 
 readHexRational__ _ = Nothing
+
+-- | Parse a string into a significand and exponent according to
+-- the "Hexadecimal Floats in Haskell" proposal.
+-- A trivial example might be:
+--   ghci> readHexSignificandExponentPair "0x1p+1"
+--   (1,1)
+-- Behaves similar to readSignificandExponentPair but the base is 16
+-- and numbers are given in hexadecimal:
+--   ghci> readHexSignificandExponentPair "0xAp-4"
+--   (10,-4)
+--   ghci> readHexSignificandExponentPair "0x1.2p3"
+--   (18,-1)
+readHexSignificandExponentPair :: String -> (Integer, Integer)
+readHexSignificandExponentPair str =
+  case str of
+    '-' : xs -> let (i, e) = readMe xs in (-i, e)
+    xs       -> readMe xs
+  where
+  readMe as =
+    case readHexSignificandExponentPair__ as of
+      Just n -> n
+      _      -> error ("readHexSignificandExponentPair: no parse:" ++ str)
+
+
+readHexSignificandExponentPair__ :: String -> Maybe (Integer, Integer)
+readHexSignificandExponentPair__ ('0' : x : rest)
+  | x == 'X' || x == 'x' =
+  do let (front,rest2) = span' isHexDigit rest
+     guard (not (null front))
+     let frontNum = steps 16 0 front
+     case rest2 of
+       '.' : rest3 ->
+          do let (back,rest4) = span' isHexDigit rest3
+             guard (not (null back))
+             let backNum = steps 16 frontNum back
+                 exp1    = -4 * length back
+             case rest4 of
+               p : ps | isExp p -> fmap (mk backNum . (+ exp1)) (getExp ps)
+               _ -> return (mk backNum exp1)
+       p : ps | isExp p -> fmap (mk frontNum) (getExp ps)
+       _ -> Nothing
+
+  where
+  isExp p = p == 'p' || p == 'P'
+
+  getExp ('+' : ds) = dec ds
+  getExp ('-' : ds) = fmap negate (dec ds)
+  getExp ds         = dec ds
+
+  mk :: Integer -> Int -> (Integer, Integer)
+  mk n e = (n, fromIntegral e)
+
+  dec cs = case span' isDigit cs of
+             (ds,"") | not (null ds) -> Just (steps 10 0 ds)
+             _ -> Nothing
+
+  steps base n ds = foldl' (step base) n ds
+  step  base n d  = base * n + fromIntegral (digitToInt d)
+
+  span' _ xs@[]         =  (xs, xs)
+  span' p xs@(x:xs')
+            | x == '_'  = span' p xs'   -- skip "_"  (#14473)
+            | p x       =  let (ys,zs) = span' p xs' in (x:ys,zs)
+            | otherwise =  ([],xs)
+
+readHexSignificandExponentPair__ _ = Nothing
+
 
 -----------------------------------------------------------------------------
 -- Verify that the 'dirname' portion of a FilePath exists.
@@ -1322,8 +1293,18 @@ getModificationUTCTime = getModificationTime
 -- check existence & modification time at the same time
 
 modificationTimeIfExists :: FilePath -> IO (Maybe UTCTime)
-modificationTimeIfExists f = do
+modificationTimeIfExists f =
   (do t <- getModificationUTCTime f; return (Just t))
+        `catchIO` \e -> if isDoesNotExistError e
+                        then return Nothing
+                        else ioError e
+
+-- --------------------------------------------------------------
+-- check existence & hash at the same time
+
+fileHashIfExists :: FilePath -> IO (Maybe Fingerprint)
+fileHashIfExists f =
+  (do t <- getFileHash f; return (Just t))
         `catchIO` \e -> if isDoesNotExistError e
                         then return Nothing
                         else ioError e
@@ -1507,13 +1488,9 @@ type HasDebugCallStack = HasCallStack
 type HasDebugCallStack = (() :: Constraint)
 #endif
 
-data OverridingBool
-  = Auto
-  | Always
-  | Never
-  deriving Show
-
-overrideWith :: Bool -> OverridingBool -> Bool
-overrideWith b Auto   = b
-overrideWith _ Always = True
-overrideWith _ Never  = False
+mapMaybe' :: Foldable f => (a -> Maybe b) -> f a -> [b]
+mapMaybe' f = foldr g []
+  where
+    g x rest
+      | Just y <- f x = y : rest
+      | otherwise     = rest

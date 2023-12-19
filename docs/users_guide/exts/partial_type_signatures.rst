@@ -39,6 +39,9 @@ However, because GHC must *infer* the type when part of a type is left
 out, it is unable to use polymorphic recursion. The same restriction
 takes place when the type signature is omitted completely.
 
+A partial type signature als makes GHC generalise the binding even if
+:extension:`MonoLocalBinds` is on; see :ref:`mono-local-binds`.
+
 .. _pts-syntax:
 
 Syntax
@@ -151,6 +154,20 @@ Besides an extra-constraints wildcard (see
 :ref:`extra-constraints-wildcard`), only named wildcards can occur in
 the constraints, e.g. the ``_x`` in ``Show _x``.
 
+When :extension:`ScopedTypeVariables` is on, the named wildcards of a
+function signature scope over the function body just like
+explicitly-forall'd type variables (:ref:`scoped-type-variables`),
+even though there is no explicit forall.  For example: ::
+
+  f :: _a -> _a
+  f x = let g :: _a -> _a
+            g = ...
+        in ...
+
+Here the named wildcard ``_a`` scopes over the body of ``f``, thereby
+binding the occurrences of ``_a`` in the signature of ``g``.  All
+four occurrences stand for the same type.
+
 Named wildcards *should not be confused with type variables*. Even
 though syntactically similar, named wildcards can unify with monotypes
 as well as be generalised over (and behave as type variables).
@@ -224,7 +241,7 @@ extra-constraints wildcard is used to infer three extra constraints.
           arbitCs :: _ => a -> String
 
 An extra-constraints wildcard shouldn't prevent the programmer from
-already listing the constraints he knows or wants to annotate, e.g.
+already listing the constraints they know or want to annotate, e.g.
 
 ::
 

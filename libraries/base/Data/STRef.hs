@@ -7,7 +7,7 @@
 -- License     :  BSD-style (see the file libraries/base/LICENSE)
 --
 -- Maintainer  :  libraries@haskell.org
--- Stability   :  experimental
+-- Stability   :  stable
 -- Portability :  non-portable (uses Control.Monad.ST)
 --
 -- Mutable references in the (strict) ST monad.
@@ -26,6 +26,10 @@ module Data.STRef (
 
 import GHC.ST
 import GHC.STRef
+
+-- $setup
+-- >>> import Prelude
+-- >>> import Control.Monad.ST
 
 -- | Mutate the contents of an 'STRef'.
 --

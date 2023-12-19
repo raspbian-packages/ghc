@@ -36,13 +36,14 @@ files.
     cannot be changed.  Tools should ignore extra fields at the
     end of the event record.
 
-The event-log stream begins with a header describing the event types present in
-the file. The header is followed by the event records themselves, each of which
-consist of a 64-bit timestamp
+The event-log stream begins with a header describing the event types (``EventType``) present in
+the file. The header is followed by the event records (``Event``) themselves, each of which
+start with the event type id and a 64-bit timestamp:
 
 .. code-block:: none
 
-    log : EVENT_HEADER_BEGIN
+    EventLog :
+          EVENT_HEADER_BEGIN
           EventType*
           EVENT_HEADER_END
           EVENT_DATA_BEGIN
@@ -51,25 +52,25 @@ consist of a 64-bit timestamp
 
     EventType :
           EVENT_ET_BEGIN
-          Word16         -- unique identifier for this event
-          Int16          -- >=0  size of the event in bytes (minus the header)
+          Word16         -- event type id, unique identifier for this event
+          Int16          -- >=0  size of the event record in bytes (minus the event type id and timestamp fields)
                          -- -1   variable size
-          Word32         -- length of the next field in bytes
-          Word8*         -- string describing the event
-          Word32         -- length of the next field in bytes
+          Word32         -- size of the event description in bytes
+          Word8*         -- event description, UTF8 encoded string describing the event
+          Word32         -- size of the extra info in bytes
           Word8*         -- extra info (for future extensions)
           EVENT_ET_END
 
     Event :
-          Word16         -- event_type
-          Word64         -- time (nanosecs)
-          [Word16]       -- length of the rest (for variable-sized events only)
-          ... extra event-specific info ...
+          Word16         -- event type id, as included in the event log header
+          Word64         -- timestamp (nanoseconds)
+          [Word16]       -- length of the rest (optional, for variable-sized events only)
+          ... event specific info ...
 
 There are two classes of event types:
 
  - *Fixed size*: All event records of a fixed-sized type are of the same
-   length, given in the header event-log header.
+   length, the size given in the header event-log header.
 
  - *Variable size*: Each event record includes a length field.
 
@@ -204,11 +205,72 @@ Thread and scheduling events
    :field String: label
 
    The indicated thread has been given a label (e.g. with
-   :base-ref:`Control.Concurrent.setThreadLabel`).
+   :base-ref:`GHC.Conc.labelThread`).
 
+
+.. _gc-events:
 
 Garbage collector events
 ~~~~~~~~~~~~~~~~~~~~~~~~
+
+The following events mark various points of the lifecycle of a moving garbage
+collection.
+
+A typical garbage collection will look something like the following:
+
+1. A capability realizes that it needs a garbage collection (e.g. as a result
+   of running out of nursery) and requests a garbage collection.  This is
+   marked by :event-type:`REQUEST_SEQ_GC` or :event-type:`REQUEST_PAR_GC`.
+
+2. As other capabilities reach yield points and suspend execution they emit
+   :event-type:`STOP_THREAD` events.
+
+3. When all capabilities have suspended execution, collection will begin,
+   marked by a :event-type:`GC_START` event.
+
+4. As individual parallel GC threads commence with scavenging they will emit
+   :event-type:`GC_WORK` events.
+
+5. If a parallel GC thread runs out of work it will emit a
+   :event-type:`GC_IDLE` event. If it is later handed more work it will emit
+   another :event-type:`GC_WORK` event.
+
+6. Eventually when scavenging has finished a :event-type:`GC_DONE` event
+   will be emitted by each GC thread.
+
+7. A bit of book-keeping is performed.
+
+8. A :event-type:`GC_END` event will be emitted marking the end of the GC cycle.
+
+9. A :event-type:`HEAP_SIZE` event will be emitted giving the
+   current size of the heap, in bytes, calculated by how many megablocks
+   are allocated.
+
+10. A :event-type:`BLOCKS_SIZE` event will be emitted giving the
+    current size of the heap, in bytes, calculated by how many blocks
+    are allocated.
+
+11. A :event-type:`GC_STATS_GHC` event will be emitted
+    containing various details of the collection and heap state.
+
+12. In the case of a major collection, a
+    :event-type:`HEAP_LIVE` event will be emitted describing
+    the current size of the live on-heap data.
+
+13. In the case of the :ghc-flag:`-threaded` RTS, a
+    :event-type:`SPARK_COUNTERS` event will be emitted giving
+    details on how many sparks have been created, evaluated, and GC'd.
+
+14. As mutator threads resume execution they will emit :event-type:`RUN_THREAD`
+    events.
+
+15. A :event-type:`MEM_RETURN` event will be emitted containing details about
+    currently live mblocks, how many we think we need and whether we could return
+    excess to the OS.
+
+Note that in the case of the concurrent non-moving collector additional events
+will be emitted during the concurrent phase of collection. These are described
+in :ref:`nonmoving-gc-events`.
 
 .. event-type:: GC_START
 
@@ -267,13 +329,14 @@ Garbage collector events
    :field Word16: generation of collection
    :field Word64: bytes copied
    :field Word64: bytes of slop found
-   :field Word64: TODO
+   :field Word64: bytes of fragmentation, the difference between total mblock size
+                  and total block size. When all mblocks are full of full blocks,
+                  this number is 0.
    :field Word64: number of parallel garbage collection threads
    :field Word64: maximum number of bytes copied by any single collector thread
    :field Word64: total bytes copied by all collector threads
 
-   Report various information about the heap configuration. Typically produced
-   during RTS initialization..
+   Report various information about a major collection.
 
 .. event-type:: GC_GLOBAL_SYNC
 
@@ -281,6 +344,21 @@ Garbage collector events
    :length: fixed
 
    TODO
+
+.. event-type:: MEM_RETURN
+
+   :tag: 90
+   :length: fixed
+   :field CapSetId: heap capability set
+   :field Word32: currently allocated mblocks
+   :field Word32: the number of mblocks we would like to retain
+   :field Word32: the number of mblocks which we returned to the OS
+
+   Report information about currently allocation megablocks and attempts
+   made to return them to the operating system. If your heap is fragmented
+   then the current value will be greater than needed value but returned will
+   be less than the difference between the two.
+
 
 Heap events and statistics
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -301,7 +379,16 @@ Heap events and statistics
    :field CapSetId: heap capability set
    :field Word64: heap size in bytes
 
-   Report the heap size.
+   Report the heap size, calculated by the number of megablocks currently allocated.
+
+.. event-type:: BLOCKS_SIZE
+
+   :tag: 91
+   :length: fixed
+   :field CapSetId: heap capability set
+   :field Word64: heap size in bytes
+
+   Report the heap size, calculated by the number of blocks currently allocated.
 
 .. event-type:: HEAP_LIVE
 
@@ -434,7 +521,7 @@ Task events
    :length: fixed
    :field TaskId: task id
    :field CapNo: capability number
-   :field ThreadId: TODO
+   :field KernelThreadId: The thread-id of the kernel thread which created the task.
 
    Marks the creation of a task.
 
@@ -545,6 +632,24 @@ A variable-length packet produced once for each cost centre,
    :field Word8: flags:
 
      * bit 0: is the cost-centre a CAF?
+
+Info Table Provenance definitions
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A message which describes an approximate source position for
+info tables. See :ghc-flag:`-finfo-table-map` for more information.
+
+.. event-type:: IPE
+
+   :tag: 169
+   :length: fixed
+   :field Word64: info table address
+   :field String: table name
+   :field String: closure type
+   :field String: type
+   :field String: source position label
+   :field String: source position module
+   :field String: source position location
 
 
 Sample event types
@@ -685,6 +790,46 @@ These events mark various stages of the
 :rts-flag:`non-moving collection <--nonmoving-gc>` lifecycle. These are enabled
 with the ``+RTS -lg`` event-set.
 
+A typical non-moving collection cycle will look something like the following:
+
+1. The preparatory phase of collection will emit the usual events associated
+   with a moving collection. See :ref:`gc-events` for details.
+
+2. The concurrent write barrier is enabled and the concurrent mark thread is
+   started. From this point forward mutator threads may emit
+   :event-type:`CONC_UPD_REM_SET_FLUSH` events, indicating that they have
+   flushed their capability-local update remembered sets.
+
+3. Concurrent marking begins, denoted by a :event-type:`CONC_MARK_BEGIN` event.
+
+4. When the mark queue is depleted a :event-type:`CONC_MARK_END` is emitted.
+
+5. If necessary (e.g. due to weak pointer marking), the marking process will
+   continue, returning to step (3) above.
+
+6. When the collector has done as much concurrent marking as it can it will
+   enter the post-mark synchronization phase of collection, denoted by a
+   :event-type:`CONC_SYNC_BEGIN` event.
+
+7. Mutator threads will suspend execution and, if necessary, flush their update
+   remembered sets (indicated by :event-type:`CONC_UPD_REM_SET_FLUSH` events).
+
+8. The collector will do any final marking necessary (indicated by
+   :event-type:`CONC_MARK_BEGIN` and :event-type:`CONC_MARK_END` events).
+
+9. The collector will do a small amount of sweeping, disable the write barrier,
+   emit a :event-type:`CONC_SYNC_END` event, and allow mutators to resume
+
+10. The collector will begin the concurrent sweep phase, indicated by a
+    :event-type:`CONC_SWEEP_BEGIN` event.
+
+11. Once sweeping has concluded a :event-type:`CONC_SWEEP_END` event will be
+    emitted and the concurrent collector thread will terminate.
+
+12. A :event-type:`NONMOVING_HEAP_CENSUS` event will be emitted describing the
+    fragmentation state of the non-moving heap.
+
+
 .. event-type:: CONC_MARK_BEGIN
 
    :tag: 200
@@ -696,6 +841,7 @@ with the ``+RTS -lg`` event-set.
 
    :tag: 201
    :length: fixed
+   :field Word32: number of objects which were marked in this marking phase.
 
    Marks the end of marking by the concurrent collector.
 
@@ -742,8 +888,9 @@ with the ``+RTS -lg`` event-set.
 Non-moving heap census
 ~~~~~~~~~~~~~~~~~~~~~~
 
-The non-moving heap census events (enabled with the ``+RTS -ln`` event-set) are
-intended to provide insight into fragmentation of the non-moving heap.
+The non-moving heap census events (enabled with the :rts-flag:`+RTS -ln <-l ⟨flags⟩>`
+event-set) are intended to provide insight into fragmentation of the non-moving
+heap.
 
 .. event-type:: NONMOVING_HEAP_CENSUS
 
@@ -755,3 +902,43 @@ intended to provide insight into fragmentation of the non-moving heap.
    :field Word32: number of live blocks.
 
    Describes the occupancy of the *blk_sz* sub-heap.
+
+.. _ticky-event-format:
+
+Ticky counters
+~~~~~~~~~~~~~~
+
+Programs compiled with :ghc-flag:`-ticky` and :ghc-flag:`-eventlog` and invoked
+with :rts-flag:`+RTS -lT <-l ⟨flags⟩>` will emit periodic samples of the ticky
+entry counters to the eventlog.
+
+.. event-type:: TICKY_COUNTER_DEF
+
+   :tag: 210
+   :length: variable
+   :field Word64: counter ID
+   :field Word16: arity/field count
+   :field String: argument kinds. This is the same as the synonymous field in the
+     textual ticky summary.
+   :field String: counter name
+
+   Defines a ticky counter.
+
+.. event-type:: TICKY_COUNTER_BEGIN_SAMPLE
+
+   :tag: 212
+   :length: fixed
+
+   Denotes the beginning of an atomic set of ticky-ticky profiler counter samples.
+
+.. event-type:: TICKY_COUNTER_SAMPLE
+
+   :tag: 211
+   :length: fixed
+   :field Word64: counter ID
+   :field Word64: number of times closures of this type has been entered.
+   :field Word64: number of allocations (words)
+   :field Word64: number of times this has been allocated (words). Only
+     produced for modules compiled with :ghc-flag:`-ticky-allocd`.
+
+   Records the number of "ticks" recorded by a ticky-ticky counter single the last sample.

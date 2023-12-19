@@ -1,20 +1,22 @@
+
+{-# LANGUAGE FlexibleContexts    #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeFamilies        #-}
+
+{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
+
 {-
 (c) The University of Glasgow 2011
 
 -}
 
-{-# LANGUAGE CPP, ScopedTypeVariables, TupleSections #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE TypeFamilies #-}
-
-{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
-
 -- | The deriving code for the Generic class
 module GHC.Tc.Deriv.Generics
-   (canDoGenerics
+   ( canDoGenerics
    , canDoGenerics1
    , GenericKind(..)
    , gen_Generic_binds
+   , gen_Generic_fam_inst
    , get_gen1_constrained_tys
    )
 where
@@ -26,37 +28,39 @@ import GHC.Core.Type
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Deriv.Generate
 import GHC.Tc.Deriv.Functor
+import GHC.Tc.Errors.Types
 import GHC.Core.DataCon
 import GHC.Core.TyCon
 import GHC.Core.FamInstEnv ( FamInst, FamFlavor(..), mkSingleCoAxiom )
-import GHC.Core.Multiplicity
 import GHC.Tc.Instance.Family
 import GHC.Unit.Module ( moduleName, moduleNameFS
                         , moduleUnit, unitFS, getModule )
 import GHC.Iface.Env    ( newGlobalBinder )
 import GHC.Types.Name hiding ( varName )
 import GHC.Types.Name.Reader
+import GHC.Types.SourceText
+import GHC.Types.Fixity
 import GHC.Types.Basic
 import GHC.Builtin.Types.Prim
 import GHC.Builtin.Types
 import GHC.Builtin.Names
 import GHC.Tc.Utils.Env
 import GHC.Tc.Utils.Monad
-import GHC.Driver.Types
-import GHC.Utils.Error( Validity(..), andValid )
+import GHC.Driver.Session
+import GHC.Utils.Error( Validity'(..), andValid )
 import GHC.Types.SrcLoc
 import GHC.Data.Bag
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set (elemVarSet)
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
 import GHC.Data.FastString
 import GHC.Utils.Misc
 
 import Control.Monad (mplus)
 import Data.List (zip4, partition)
 import Data.Maybe (isJust)
-
-#include "HsVersions.h"
 
 {-
 ************************************************************************
@@ -73,11 +77,11 @@ For the generic representation we need to generate:
 \end{itemize}
 -}
 
-gen_Generic_binds :: GenericKind -> TyCon -> [Type]
-                 -> TcM (LHsBinds GhcPs, FamInst)
-gen_Generic_binds gk tc inst_tys = do
-  repTyInsts <- tc_mkRepFamInsts gk tc inst_tys
-  return (mkBindsRep gk tc, repTyInsts)
+gen_Generic_binds :: GenericKind -> SrcSpan -> DerivInstTys
+                  -> TcM (LHsBinds GhcPs, [LSig GhcPs])
+gen_Generic_binds gk loc dit = do
+  dflags <- getDynFlags
+  return $ mkBindsRep dflags gk loc dit
 
 {-
 ************************************************************************
@@ -87,10 +91,25 @@ gen_Generic_binds gk tc inst_tys = do
 ************************************************************************
 -}
 
+-- | Called by 'GHC.Tc.Deriv.Infer.inferConstraints'; generates a list of
+-- types, each of which must be a 'Functor' in order for the 'Generic1'
+-- instance to work. For instance, if we have:
+--
+-- @
+-- data Foo a = MkFoo Int a (Maybe a) (Either Int (Maybe a))
+-- @
+--
+-- Then @'get_gen1_constrained_tys' a (f (g a))@ would return @[Either Int]@,
+-- as a derived 'Generic1' instance would need to call 'fmap' at that type.
+-- Invoking @'get_gen1_constrained_tys' a@ on any of the other fields would
+-- return @[]@.
+--
+-- 'get_gen1_constrained_tys' is very similar in spirit to
+-- 'deepSubtypesContaining' in "GHC.Tc.Deriv.Functor". Just like with
+-- 'deepSubtypesContaining', it is important that the 'TyVar' argument come
+-- from 'dataConUnivTyVars'. (See #22167 for what goes wrong if 'tyConTyVars'
+-- is used.)
 get_gen1_constrained_tys :: TyVar -> Type -> [Type]
--- called by GHC.Tc.Deriv.Infer.inferConstraints; generates a list of
--- types, each of which must be a Functor in order for the Generic1 instance to
--- work.
 get_gen1_constrained_tys argVar
   = argTyFold argVar $ ArgTyAlg { ata_rec0 = const []
                                 , ata_par1 = [], ata_rec1 = const []
@@ -112,6 +131,7 @@ following constraints are satisfied.
       alpha-renaming).
 
   (b) D cannot have a "stupid context".
+      See Note [The stupid context] in GHC.Core.DataCon.
 
   (c) The right-hand side of D cannot include existential types, universally
       quantified types, or "exotic" unlifted types. An exotic unlifted type
@@ -140,7 +160,7 @@ following constraints are satisfied.
 
 -}
 
-canDoGenerics :: TyCon -> Validity
+canDoGenerics :: DerivInstTys -> Validity' [DeriveGenericsErrReason]
 -- canDoGenerics determines if Generic/Rep can be derived.
 --
 -- Check (a) from Note [Requirements for deriving Generic and Rep] is taken
@@ -148,18 +168,18 @@ canDoGenerics :: TyCon -> Validity
 --
 -- It returns IsValid if deriving is possible. It returns (NotValid reason)
 -- if not.
-canDoGenerics tc
+canDoGenerics dit@(DerivInstTys{dit_rep_tc = tc})
   = mergeErrors (
           -- Check (b) from Note [Requirements for deriving Generic and Rep].
               (if (not (null (tyConStupidTheta tc)))
-                then (NotValid (tc_name <+> text "must not have a datatype context"))
+                then (NotValid $ DerivErrGenericsMustNotHaveDatatypeContext tc_name)
                 else IsValid)
           -- See comment below
             : (map bad_con (tyConDataCons tc)))
   where
     -- The tc can be a representation tycon. When we want to display it to the
     -- user (in an error message) we should print its parent
-    tc_name = ppr $ case tyConFamInst_maybe tc of
+    tc_name = case tyConFamInst_maybe tc of
         Just (ptc, _) -> ptc
         _             -> tc
 
@@ -169,16 +189,16 @@ canDoGenerics tc
         -- then we can't build the embedding-projection pair, because
         -- it relies on instantiating *polymorphic* sum and product types
         -- at the argument types of the constructors
-    bad_con dc = if (any bad_arg_type (map scaledThing $ dataConOrigArgTys dc))
-                  then (NotValid (ppr dc <+> text
-                    "must not have exotic unlifted or polymorphic arguments"))
-                  else (if (not (isVanillaDataCon dc))
-                          then (NotValid (ppr dc <+> text "must be a vanilla data constructor"))
-                          else IsValid)
+    bad_con :: DataCon -> Validity' DeriveGenericsErrReason
+    bad_con dc = if any bad_arg_type (derivDataConInstArgTys dc dit)
+                  then NotValid $ DerivErrGenericsMustNotHaveExoticArgs dc
+                  else if not (isVanillaDataCon dc)
+                          then NotValid $ DerivErrGenericsMustBeVanillaDataCon dc
+                          else IsValid
 
         -- Nor can we do the job if it's an existential data constructor,
         -- Nor if the args are polymorphic types (I don't think)
-    bad_arg_type ty = (isUnliftedType ty && not (allowedUnliftedTy ty))
+    bad_arg_type ty = (mightBeUnliftedType ty && not (allowedUnliftedTy ty))
                       || not (isTauTy ty)
 
 -- Returns True the Type argument is an unlifted type which has a
@@ -188,19 +208,20 @@ canDoGenerics tc
 allowedUnliftedTy :: Type -> Bool
 allowedUnliftedTy = isJust . unboxedRepRDRs
 
-mergeErrors :: [Validity] -> Validity
+mergeErrors :: [Validity' a] -> Validity' [a]
 mergeErrors []             = IsValid
 mergeErrors (NotValid s:t) = case mergeErrors t of
-  IsValid     -> NotValid s
-  NotValid s' -> NotValid (s <> text ", and" $$ s')
+  IsValid     -> NotValid [s]
+  NotValid s' -> NotValid (s : s')
 mergeErrors (IsValid : t) = mergeErrors t
+  -- NotValid s' -> NotValid (s <> text ", and" $$ s')
 
 -- A datatype used only inside of canDoGenerics1. It's the result of analysing
 -- a type term.
 data Check_for_CanDoGenerics1 = CCDG1
   { _ccdg1_hasParam :: Bool       -- does the parameter of interest occurs in
                                   -- this type?
-  , _ccdg1_errors   :: Validity   -- errors generated by this type
+  , _ccdg1_errors   :: Validity' DeriveGenericsErrReason -- errors generated by this type
   }
 
 {-
@@ -235,32 +256,28 @@ explicitly, even though foldDataConArgs is also doing this internally.
 --
 -- It returns IsValid if deriving is possible. It returns (NotValid reason)
 -- if not.
-canDoGenerics1 :: TyCon -> Validity
-canDoGenerics1 rep_tc =
-  canDoGenerics rep_tc `andValid` additionalChecks
+canDoGenerics1 :: DerivInstTys -> Validity' [DeriveGenericsErrReason]
+canDoGenerics1 dit@(DerivInstTys{dit_rep_tc = rep_tc}) =
+  canDoGenerics dit `andValid` additionalChecks
   where
     additionalChecks
         -- check (d) from Note [Requirements for deriving Generic and Rep]
-      | null (tyConTyVars rep_tc) = NotValid $
-          text "Data type" <+> quotes (ppr rep_tc)
-      <+> text "must have some type parameters"
+      | null (tyConTyVars rep_tc) = NotValid [
+          DerivErrGenericsMustHaveSomeTypeParams rep_tc]
 
       | otherwise = mergeErrors $ concatMap check_con data_cons
 
     data_cons = tyConDataCons rep_tc
     check_con con = case check_vanilla con of
       j@(NotValid {}) -> [j]
-      IsValid -> _ccdg1_errors `map` foldDataConArgs (ft_check con) con
+      IsValid -> _ccdg1_errors `map` foldDataConArgs (ft_check con) con dit
 
-    bad :: DataCon -> SDoc -> SDoc
-    bad con msg = text "Constructor" <+> quotes (ppr con) <+> msg
-
-    check_vanilla :: DataCon -> Validity
+    check_vanilla :: DataCon -> Validity' DeriveGenericsErrReason
     check_vanilla con | isVanillaDataCon con = IsValid
-                      | otherwise            = NotValid (bad con existential)
+                      | otherwise            = NotValid $ DerivErrGenericsMustNotHaveExistentials con
 
-    bmzero      = CCDG1 False IsValid
-    bmbad con s = CCDG1 True $ NotValid $ bad con s
+    bmzero    = CCDG1 False IsValid
+    bmbad con = CCDG1 True $ NotValid (DerivErrGenericsWrongArgKind con)
     bmplus (CCDG1 b1 m1) (CCDG1 b2 m2) = CCDG1 (b1 || b2) (m1 `andValid` m2)
 
     -- check (e) from Note [Requirements for deriving Generic and Rep]
@@ -273,29 +290,24 @@ canDoGenerics1 rep_tc =
 
       -- (component_0,component_1,...,component_n)
       , ft_tup = \_ components -> if any _ccdg1_hasParam (init components)
-                                  then bmbad con wrong_arg
+                                  then bmbad con
                                   else foldr bmplus bmzero components
 
       -- (dom -> rng), where the head of ty is not a tuple tycon
       , ft_fun = \dom rng -> -- cf #8516
           if _ccdg1_hasParam dom
-          then bmbad con wrong_arg
+          then bmbad con
           else bmplus dom rng
 
       -- (ty arg), where head of ty is neither (->) nor a tuple constructor and
       -- the parameter of interest does not occur in ty
       , ft_ty_app = \_ _ arg -> arg
 
-      , ft_bad_app = bmbad con wrong_arg
+      , ft_bad_app = bmbad con
       , ft_forall  = \_ body -> body -- polytypes are handled elsewhere
       }
       where
         caseVar = CCDG1 True IsValid
-
-
-    existential = text "must not have existential arguments"
-    wrong_arg   = text "applies a type to an argument involving the last parameter"
-               $$ text "but the applied type is not of kind * -> *"
 
 {-
 ************************************************************************
@@ -312,30 +324,55 @@ type Alt = (LPat GhcPs, LHsExpr GhcPs)
 -- Generic1 (Gen1).
 data GenericKind = Gen0 | Gen1
 
--- as above, but with a payload of the TyCon's name for "the" parameter
-data GenericKind_ = Gen0_ | Gen1_ TyVar
-
--- as above, but using a single datacon's name for "the" parameter
+-- Like 'GenericKind', but with a payload of a datacon's last universally
+-- quantified 'TyVar' in the 'Generic1' case.
+--
+-- Note that for GADTs, the last TyVar's Name will be different in each data
+-- constructor, so it is not correct to simply use the last TyVar in
+-- 'tyConTyVars' in 'Gen1_DC'. (See #21185 for an example of what would happen
+-- if you tried.)
 data GenericKind_DC = Gen0_DC | Gen1_DC TyVar
 
-forgetArgVar :: GenericKind_DC -> GenericKind
-forgetArgVar Gen0_DC   = Gen0
-forgetArgVar Gen1_DC{} = Gen1
-
--- When working only within a single datacon, "the" parameter's name should
--- match that datacon's name for it.
-gk2gkDC :: GenericKind_ -> DataCon -> GenericKind_DC
-gk2gkDC Gen0_   _ = Gen0_DC
-gk2gkDC Gen1_{} d = Gen1_DC $ last $ dataConUnivTyVars d
+-- Construct a 'GenericKind_DC', retrieving the last universally quantified
+-- type variable of a 'DataCon' in the 'Generic1' case.
+gk2gkDC :: GenericKind -> DataCon -> [Type] -> GenericKind_DC
+gk2gkDC Gen0 _  _       = Gen0_DC
+gk2gkDC Gen1 dc tc_args = Gen1_DC $ assert (isTyVarTy last_dc_inst_univ)
+                                  $ getTyVar "gk2gkDC" last_dc_inst_univ
+  where
+    dc_inst_univs = dataConInstUnivs dc tc_args
+    last_dc_inst_univ = assert (not (null dc_inst_univs)) $
+                        last dc_inst_univs
 
 
 -- Bindings for the Generic instance
-mkBindsRep :: GenericKind -> TyCon -> LHsBinds GhcPs
-mkBindsRep gk tycon =
-    unitBag (mkRdrFunBind (L loc from01_RDR) [from_eqn])
-  `unionBags`
-    unitBag (mkRdrFunBind (L loc to01_RDR) [to_eqn])
+mkBindsRep :: DynFlags -> GenericKind -> SrcSpan -> DerivInstTys -> (LHsBinds GhcPs, [LSig GhcPs])
+mkBindsRep dflags gk loc dit@(DerivInstTys{dit_rep_tc = tycon}) = (binds, sigs)
       where
+        binds = unitBag (mkRdrFunBind (L loc' from01_RDR) [from_eqn])
+              `unionBags`
+                unitBag (mkRdrFunBind (L loc' to01_RDR) [to_eqn])
+
+        -- See Note [Generics performance tricks]
+        sigs = if     gopt Opt_InlineGenericsAggressively dflags
+                  || (gopt Opt_InlineGenerics dflags && inlining_useful)
+               then [inline1 from01_RDR, inline1 to01_RDR]
+               else []
+         where
+           inlining_useful
+             | cons <= 1  = True
+             | cons <= 4  = max_fields <= 5
+             | cons <= 8  = max_fields <= 2
+             | cons <= 16 = max_fields <= 1
+             | cons <= 24 = max_fields == 0
+             | otherwise  = False
+             where
+               cons       = length datacons
+               max_fields = maximum $ map dataConSourceArity datacons
+
+           inline1 f = L loc'' . InlineSig noAnn (L loc' f)
+                     $ alwaysInlinePragma { inl_act = ActiveAfter NoSourceText 1 }
+
         -- The topmost M1 (the datatype metadata) has the exact same type
         -- across all cases of a from/to definition, and can be factored out
         -- to save some allocations during typechecking.
@@ -346,7 +383,8 @@ mkBindsRep gk tycon =
 
         from_matches  = [mkHsCaseAlt pat rhs | (pat,rhs) <- from_alts]
         to_matches    = [mkHsCaseAlt pat rhs | (pat,rhs) <- to_alts  ]
-        loc           = srcLocSpan (getSrcLoc tycon)
+        loc'          = noAnnSrcSpan loc
+        loc''         = noAnnSrcSpan loc
         datacons      = tyConDataCons tycon
 
         (from01_RDR, to01_RDR) = case gk of
@@ -355,12 +393,7 @@ mkBindsRep gk tycon =
 
         -- Recurse over the sum first
         from_alts, to_alts :: [Alt]
-        (from_alts, to_alts) = mkSum gk_ (1 :: US) datacons
-          where gk_ = case gk of
-                  Gen0 -> Gen0_
-                  Gen1 -> ASSERT(tyvars `lengthAtLeast` 1)
-                          Gen1_ (last tyvars)
-                    where tyvars = tyConTyVars tycon
+        (from_alts, to_alts) = mkSum gk (1 :: US) dit datacons
 
 --------------------------------------------------------------------------------
 -- The type synonym instance and synonym
@@ -368,12 +401,17 @@ mkBindsRep gk tycon =
 --       type Rep_D a b = ...representation type for D ...
 --------------------------------------------------------------------------------
 
-tc_mkRepFamInsts :: GenericKind   -- Gen0 or Gen1
-                 -> TyCon         -- The type to generate representation for
-                 -> [Type]        -- The type(s) to which Generic(1) is applied
-                                  -- in the generated instance
-                 -> TcM FamInst   -- Generated representation0 coercion
-tc_mkRepFamInsts gk tycon inst_tys =
+gen_Generic_fam_inst :: GenericKind      -- Gen0 or Gen1
+                     -> (Name -> Fixity) -- Get the Fixity for a data constructor Name
+                     -> SrcSpan          -- The current source location
+                     -> DerivInstTys     -- Information about the type(s) to which
+                                         -- Generic(1) is applied in the generated
+                                         -- instance, including the data type's TyCon
+                     -> TcM FamInst      -- Generated representation0 coercion
+gen_Generic_fam_inst gk get_fixity loc
+       dit@(DerivInstTys{ dit_cls_tys = cls_tys
+                        , dit_tc = tc, dit_tc_args = tc_args
+                        , dit_rep_tc = tycon }) =
        -- Consider the example input tycon `D`, where data D a b = D_ a
        -- Also consider `R:DInt`, where { data family D x y :: * -> *
        --                               ; data instance D Int a b = D_ a }
@@ -381,8 +419,6 @@ tc_mkRepFamInsts gk tycon inst_tys =
        fam_tc <- case gk of
          Gen0 -> tcLookupTyCon repTyConName
          Gen1 -> tcLookupTyCon rep1TyConName
-
-     ; fam_envs <- tcGetFamInstEnvs
 
      ; let -- If the derived instance is
            --   instance Generic (Foo x)
@@ -393,58 +429,28 @@ tc_mkRepFamInsts gk tycon inst_tys =
            --   instance Generic1 (Bar x :: k -> *)
            -- then:
            --   `arg_k` = k, `inst_ty` = Bar x :: k -> *
-           (arg_ki, inst_ty) = case (gk, inst_tys) of
-             (Gen0, [inst_t])        -> (liftedTypeKind, inst_t)
-             (Gen1, [arg_k, inst_t]) -> (arg_k,          inst_t)
-             _ -> pprPanic "tc_mkRepFamInsts" (ppr inst_tys)
-
-     ; let mbFamInst         = tyConFamInst_maybe tycon
-           -- If we're examining a data family instance, we grab the parent
-           -- TyCon (ptc) and use it to determine the type arguments
-           -- (inst_args) for the data family *instance*'s type variables.
-           ptc               = maybe tycon fst mbFamInst
-           (_, inst_args, _) = tcLookupDataFamInst fam_envs ptc $ snd
-                                 $ tcSplitTyConApp inst_ty
-
-     ; let -- `tyvars` = [a,b]
-           (tyvars, gk_) = case gk of
-             Gen0 -> (all_tyvars, Gen0_)
-             Gen1 -> ASSERT(not $ null all_tyvars)
-                     (init all_tyvars, Gen1_ $ last all_tyvars)
-             where all_tyvars = tyConTyVars tycon
+           arg_ki = case (gk, cls_tys) of
+             (Gen0, [])      -> liftedTypeKind
+             (Gen1, [arg_k]) -> arg_k
+             _ -> pprPanic "gen_Generic_fam_insts" (ppr cls_tys)
+           inst_ty = mkTyConApp tc tc_args
+           inst_tys = cls_tys ++ [inst_ty]
 
        -- `repTy` = D1 ... (C1 ... (S1 ... (Rec0 a))) :: * -> *
-     ; repTy <- tc_mkRepTy gk_ tycon arg_ki
+     ; repTy <- tc_mkRepTy gk get_fixity dit arg_ki
 
        -- `rep_name` is a name we generate for the synonym
      ; mod <- getModule
-     ; loc <- getSrcSpanM
      ; let tc_occ  = nameOccName (tyConName tycon)
            rep_occ = case gk of Gen0 -> mkGenR tc_occ; Gen1 -> mkGen1R tc_occ
      ; rep_name <- newGlobalBinder mod rep_occ loc
 
-       -- We make sure to substitute the tyvars with their user-supplied
-       -- type arguments before generating the Rep/Rep1 instance, since some
-       -- of the tyvars might have been instantiated when deriving.
-       -- See Note [Generating a correctly typed Rep instance].
-     ; let (env_tyvars, env_inst_args)
-             = case gk_ of
-                 Gen0_ -> (tyvars, inst_args)
-                 Gen1_ last_tv
-                          -- See the "wrinkle" in
-                          -- Note [Generating a correctly typed Rep instance]
-                       -> ( last_tv : tyvars
-                          , anyTypeOfKind (tyVarKind last_tv) : inst_args )
-           env        = zipTyEnv env_tyvars env_inst_args
-           in_scope   = mkInScopeSet (tyCoVarsOfTypes inst_tys)
-           subst      = mkTvSubst in_scope env
-           repTy'     = substTyUnchecked  subst repTy
-           tcv'       = tyCoVarsOfTypeList inst_ty
-           (tv', cv') = partition isTyVar tcv'
-           tvs'       = scopedSort tv'
-           cvs'       = scopedSort cv'
-           axiom      = mkSingleCoAxiom Nominal rep_name tvs' [] cvs'
-                                        fam_tc inst_tys repTy'
+     ; let tcv      = tyCoVarsOfTypeList inst_ty
+           (tv, cv) = partition isTyVar tcv
+           tvs      = scopedSort tv
+           cvs      = scopedSort cv
+           axiom    = mkSingleCoAxiom Nominal rep_name tvs [] cvs
+                                      fam_tc inst_tys repTy
 
      ; newFamInst SynFamilyInst axiom  }
 
@@ -517,16 +523,19 @@ argTyFold argVar (ArgTyAlg {ata_rec0 = mkRec0,
             else mkComp phi `fmap` go beta -- It must be a composition.
 
 
-tc_mkRepTy ::  -- Gen0_ or Gen1_, for Rep or Rep1
-               GenericKind_
-              -- The type to generate representation for
-            -> TyCon
-              -- The kind of the representation type's argument
-              -- See Note [Handling kinds in a Rep instance]
+tc_mkRepTy ::  -- Gen0 or Gen1, for Rep or Rep1
+               GenericKind
+               -- Get the Fixity for a data constructor Name
+            -> (Name -> Fixity)
+               -- Information about the last type argument to Generic(1)
+            -> DerivInstTys
+               -- The kind of the representation type's argument
+               -- See Note [Handling kinds in a Rep instance]
             -> Kind
                -- Generated representation0 type
             -> TcM Type
-tc_mkRepTy gk_ tycon k =
+tc_mkRepTy gk get_fixity dit@(DerivInstTys{ dit_rep_tc = tycon
+                                          , dit_rep_tc_args = tycon_args }) k =
   do
     d1      <- tcLookupTyCon d1TyConName
     c1      <- tcLookupTyCon c1TyConName
@@ -566,8 +575,6 @@ tc_mkRepTy gk_ tycon k =
     pDStr      <- tcLookupPromDataCon decidedStrictDataConName
     pDUpk      <- tcLookupPromDataCon decidedUnpackDataConName
 
-    fix_env <- getFixityEnv
-
     let mkSum' a b = mkTyConApp plus  [k,a,b]
         mkProd a b = mkTyConApp times [k,a,b]
         mkRec0 a   = mkBoxTy uAddr uChar uDouble uFloat uInt uWord rec0 k a
@@ -576,8 +583,8 @@ tc_mkRepTy gk_ tycon k =
         mkD    a   = mkTyConApp d1 [ k, metaDataTy, sumP (tyConDataCons a) ]
         mkC      a = mkTyConApp c1 [ k
                                    , metaConsTy a
-                                   , prod (map scaledThing . dataConInstOrigArgTys a
-                                            . mkTyVarTys . tyConTyVars $ tycon)
+                                   , prod (gk2gkDC gk a tycon_args)
+                                          (derivDataConInstArgTys a dit)
                                           (dataConSrcBangs    a)
                                           (dataConImplBangs   a)
                                           (dataConFieldLabels a)]
@@ -586,28 +593,38 @@ tc_mkRepTy gk_ tycon k =
         -- Sums and products are done in the same way for both Rep and Rep1
         sumP l = foldBal mkSum' (mkTyConApp v1 [k]) . map mkC $ l
         -- The Bool is True if this constructor has labelled fields
-        prod :: [Type] -> [HsSrcBang] -> [HsImplBang] -> [FieldLabel] -> Type
-        prod l sb ib fl = foldBal mkProd (mkTyConApp u1 [k])
-                                  [ ASSERT(null fl || lengthExceeds fl j)
-                                    arg t sb' ib' (if null fl
-                                                      then Nothing
-                                                      else Just (fl !! j))
+        prod :: GenericKind_DC -> [Type] -> [HsSrcBang] -> [HsImplBang] -> [FieldLabel] -> Type
+        prod gk_ l sb ib fl = foldBal mkProd (mkTyConApp u1 [k])
+                                  [ assert (null fl || lengthExceeds fl j) $
+                                    arg gk_ t sb' ib' (if null fl
+                                                       then Nothing
+                                                       else Just (fl !! j))
                                   | (t,sb',ib',j) <- zip4 l sb ib [0..] ]
 
-        arg :: Type -> HsSrcBang -> HsImplBang -> Maybe FieldLabel -> Type
-        arg t (HsSrcBang _ su ss) ib fl = mkS fl su ss ib $ case gk_ of
+        arg :: GenericKind_DC -> Type -> HsSrcBang -> HsImplBang -> Maybe FieldLabel -> Type
+        arg gk_ t (HsSrcBang _ su ss) ib fl = mkS fl su ss ib $ case gk_ of
             -- Here we previously used Par0 if t was a type variable, but we
             -- realized that we can't always guarantee that we are wrapping-up
             -- all type variables in Par0. So we decided to stop using Par0
             -- altogether, and use Rec0 all the time.
-                      Gen0_        -> mkRec0 t
-                      Gen1_ argVar -> argPar argVar t
+                      Gen0_DC        -> mkRec0 t
+                      Gen1_DC argVar -> argPar argVar t
           where
             -- Builds argument representation for Rep1 (more complicated due to
             -- the presence of composition).
-            argPar argVar = argTyFold argVar $ ArgTyAlg
+            argPar argVar =
+              let -- If deriving Generic1, make sure to substitute the last
+                  -- type variable with Any in the generated Rep1 instance.
+                  -- This avoids issues like what is documented in the
+                  -- "wrinkle" section of
+                  -- Note [Generating a correctly typed Rep instance].
+                  env      = zipTyEnv [argVar] [anyTypeOfKind (tyVarKind argVar)]
+                  in_scope = mkInScopeSet (tyCoVarsOfTypes tycon_args)
+                  subst    = mkTvSubst in_scope env in
+
+              substTy subst . argTyFold argVar (ArgTyAlg
               {ata_rec0 = mkRec0, ata_par1 = mkPar1,
-               ata_rec1 = mkRec1, ata_comp = mkComp comp k}
+               ata_rec1 = mkRec1, ata_comp = mkComp comp k})
 
         tyConName_user = case tyConFamInst_maybe tycon of
                            Just (ptycon, _) -> tyConName ptycon
@@ -625,7 +642,7 @@ tc_mkRepTy gk_ tycon k =
         ctName = mkStrLitTy . occNameFS . nameOccName . dataConName
         ctFix c
             | dataConIsInfix c
-            = case lookupFixity fix_env (dataConName c) of
+            = case get_fixity (dataConName c) of
                    Fixity _ n InfixL -> buildFix n pLA
                    Fixity _ n InfixR -> buildFix n pRA
                    Fixity _ n InfixN -> buildFix n pNA
@@ -707,42 +724,45 @@ mkBoxTy uAddr uChar uDouble uFloat uInt uWord rec0 k ty
 -- Dealing with sums
 --------------------------------------------------------------------------------
 
-mkSum :: GenericKind_ -- Generic or Generic1?
-      -> US          -- Base for generating unique names
-      -> [DataCon]   -- The data constructors
-      -> ([Alt],     -- Alternatives for the T->Trep "from" function
-          [Alt])     -- Alternatives for the Trep->T "to" function
+mkSum :: GenericKind  -- Generic or Generic1?
+      -> US           -- Base for generating unique names
+      -> DerivInstTys -- Information about the last type argument to Generic(1)
+      -> [DataCon]    -- The data constructors
+      -> ([Alt],      -- Alternatives for the T->Trep "from" function
+          [Alt])      -- Alternatives for the Trep->T "to" function
 
 -- Datatype without any constructors
-mkSum _ _ [] = ([from_alt], [to_alt])
+mkSum _ _ _ [] = ([from_alt], [to_alt])
   where
     from_alt = (x_Pat, nlHsCase x_Expr [])
     to_alt   = (x_Pat, nlHsCase x_Expr [])
                -- These M1s are meta-information for the datatype
 
 -- Datatype with at least one constructor
-mkSum gk_ us datacons =
+mkSum gk us dit datacons =
   -- switch the payload of gk_ to be datacon-centric instead of tycon-centric
- unzip [ mk1Sum (gk2gkDC gk_ d) us i (length datacons) d
+ unzip [ mk1Sum gk us i (length datacons) dit d
            | (d,i) <- zip datacons [1..] ]
 
 -- Build the sum for a particular constructor
-mk1Sum :: GenericKind_DC -- Generic or Generic1?
-       -> US        -- Base for generating unique names
-       -> Int       -- The index of this constructor
-       -> Int       -- Total number of constructors
-       -> DataCon   -- The data constructor
-       -> (Alt,     -- Alternative for the T->Trep "from" function
-           Alt)     -- Alternative for the Trep->T "to" function
-mk1Sum gk_ us i n datacon = (from_alt, to_alt)
+mk1Sum :: GenericKind  -- Generic or Generic1?
+       -> US           -- Base for generating unique names
+       -> Int          -- The index of this constructor
+       -> Int          -- Total number of constructors
+       -> DerivInstTys -- Information about the last type argument to Generic(1)
+       -> DataCon      -- The data constructor
+       -> (Alt,        -- Alternative for the T->Trep "from" function
+           Alt)        -- Alternative for the Trep->T "to" function
+mk1Sum gk us i n dit@(DerivInstTys{dit_rep_tc_args = tc_args}) datacon
+  = (from_alt, to_alt)
   where
-    gk = forgetArgVar gk_
+    gk_ = gk2gkDC gk datacon tc_args
 
     -- Existentials already excluded
-    argTys = dataConOrigArgTys datacon
+    argTys = derivDataConInstArgTys datacon dit
     n_args = dataConSourceArity datacon
 
-    datacon_varTys = zip (map mkGenericLocal [us .. us+n_args-1]) (map scaledThing argTys)
+    datacon_varTys = zip (map mkGenericLocal [us .. us+n_args-1]) argTys
     datacon_vars = map fst datacon_varTys
 
     datacon_rdr  = getRdrName datacon
@@ -872,10 +892,17 @@ nlHsCompose x y = compose_RDR `nlHsApps` [x, y]
 
 -- | Variant of foldr for producing balanced lists
 foldBal :: (a -> a -> a) -> a -> [a] -> a
-foldBal _  x []  = x
-foldBal _  _ [y] = y
-foldBal op x l   = let (a,b) = splitAt (length l `div` 2) l
-                   in foldBal op x a `op` foldBal op x b
+{-# INLINE foldBal #-} -- inlined to produce specialised code for each op
+foldBal op0 x0 xs0 = fold_bal op0 x0 (length xs0) xs0
+  where
+    fold_bal op x !n xs = case xs of
+      []  -> x
+      [a] -> a
+      _   -> let !nl = n `div` 2
+                 !nr = n - nl
+                 (l,r) = splitAt nl xs
+             in fold_bal op x nl l
+                `op` fold_bal op x nr r
 
 {-
 Note [Generics and unlifted types]
@@ -893,59 +920,55 @@ details on why URec is implemented the way it is.
 Note [Generating a correctly typed Rep instance]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 tc_mkRepTy derives the RHS of the Rep(1) type family instance when deriving
-Generic(1). That is, it derives the ellipsis in the following:
+Generic(1). For example, given the following data declaration:
 
-    instance Generic Foo where
-      type Rep Foo = ...
+    data Foo a = MkFoo a
+      deriving stock Generic
 
-However, tc_mkRepTy only has knowledge of the *TyCon* of the type for which
-a Generic(1) instance is being derived, not the fully instantiated type. As a
-result, tc_mkRepTy builds the most generalized Rep(1) instance possible using
-the type variables it learns from the TyCon (i.e., it uses tyConTyVars). This
-can cause problems when the instance has instantiated type variables
-(see #11732). As an example:
+tc_mkRepTy would generate the `Rec0 a` portion of this instance:
 
-    data T a = MkT a
-    deriving instance Generic (T Int)
-    ==>
-    instance Generic (T Int) where
-      type Rep (T Int) = (... (Rec0 a)) -- wrong!
+    instance Generic (Foo a) where
+      type Rep (Foo a) = Rec0 a
+      ...
 
--XStandaloneDeriving is one way for the type variables to become instantiated.
-Another way is when Generic1 is being derived for a datatype with a visible
-kind binder, e.g.,
+(The full `Rep` instance is more complicated than this, but we have simplified
+it for presentation purposes.)
 
-   data P k (a :: k) = MkP k deriving Generic1
-   ==>
-   instance Generic1 (P *) where
-     type Rep1 (P *) = (... (Rec0 k)) -- wrong!
+`tc_mkRepTy` figures out the field types to use in the RHS by inspecting a
+DerivInstTys, which contains the instantiated field types for each data
+constructor. (See Note [Instantiating field types in stock deriving] for a
+description of how this works.) As a result, `tc_mkRepTy` "just works" even
+when dealing with StandaloneDeriving, such as in this example:
 
-See Note [Unify kinds in deriving] in GHC.Tc.Deriv.
+    deriving stock instance Generic (Foo Int)
+      ===>
+    instance Generic (Foo Int) where
+      type Rep (Foo Int) = Rec0 Int -- The `a` has been instantiated here
 
-In any such scenario, we must prevent a discrepancy between the LHS and RHS of
-a Rep(1) instance. To do so, we create a type variable substitution that maps
-the tyConTyVars of the TyCon to their counterparts in the fully instantiated
-type. (For example, using T above as example, you'd map a :-> Int.) We then
-apply the substitution to the RHS before generating the instance.
+A wrinkle in all of this: what happens when deriving a Generic1 instance where
+the last type variable appears in a type synonym that discards it? That is,
+what should happen in this example (taken from #15012)?
 
-A wrinkle in all of this: when forming the type variable substitution for
-Generic1 instances, we map the last type variable of the tycon to Any. Why?
-It's because of wily data types like this one (#15012):
+    type FakeOut a = Int
+    data T a = MkT (FakeOut a)
+      deriving Generic1
 
-   data T a = MkT (FakeOut a)
-   type FakeOut a = Int
-
-If we ignore a, then we'll produce the following Rep1 instance:
+MkT is a particularly wily data constructor. Although the last type variable
+`a` technically appears in `FakeOut a`, it's just a smokescreen, as `FakeOut a`
+simply expands to `Int`. As a result, `MkT` doesn't really *use* the last type
+variable. Therefore, T's `Rep` instance would use Rec0 to represent MkT's
+field. But we must be careful not to produce code like this:
 
    instance Generic1 T where
-     type Rep1 T = ... (Rec0 (FakeOut a))
+     type Rep1 T = Rec0 (FakeOut a)
      ...
 
-Oh no! Now we have `a` on the RHS, but it's completely unbound. Instead, we
-ensure that `a` is mapped to Any:
+Oh no! Now we have `a` on the RHS, but it's completely unbound. This can cause
+issues like what was observed in #15012. To avoid this, we ensure that `a` is
+instantiated to Any:
 
    instance Generic1 T where
-     type Rep1 T = ... (Rec0 (FakeOut Any))
+     type Rep1 T = Rec0 (FakeOut Any)
      ...
 
 And now all is good.
@@ -1037,4 +1060,48 @@ factor it out reduce the typechecker's burden:
 
 A simple change, but one that pays off, since it goes turns an O(n) amount of
 coercions to an O(1) amount.
+
+Note [Generics performance tricks]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Generics-based algorithms tend to rely on GHC optimizing away the intermediate
+representation for optimal performance. However, the default unfolding threshold
+is usually too small for GHC to do that.
+
+The recommended approach thus far was to increase unfolding threshold, but this
+makes GHC inline more aggressively in general, whereas it should only be more
+aggresive with generics-based code.
+
+The solution is to use a heuristic that'll annotate Generic class methods with
+INLINE[1] pragmas (the explicit phase is used to give users phase control as
+they can annotate their functions with INLINE[2] or INLINE[0] if appropriate).
+
+The current heuristic was chosen by looking at how annotating Generic methods
+INLINE[1] helps with optimal code generation for several types of generic
+algorithms:
+
+* Round trip through the generic representation.
+
+* Generation of NFData instances.
+
+* Generation of field lenses.
+
+The experimentation was done by picking data types having N constructors with M
+fields each and using their derived Generic instances to generate code with the
+above algorithms.
+
+The results are threshold values for N and M (contained in
+`mkBindsRep.inlining_useful`) for which inlining is beneficial, i.e. it usually
+leads to performance improvements at both compile time (the simplifier has to do
+more work, but then there's much less code left for subsequent phases to work
+with) and run time (the generic representation of a data type is optimized
+away).
+
+The T11068 test case, which includes the algorithms mentioned above, tests that
+the generic representations of several data types optimize away using the
+threshold values in `mkBindsRep.inlining_useful`.
+
+If one uses threshold values higher what is found in
+`mkBindsRep.inlining_useful`, then annotating Generic class methods with INLINE
+pragmas tends to be at best useless and at worst lead to code size blowup
+without runtime performance improvements.
 -}

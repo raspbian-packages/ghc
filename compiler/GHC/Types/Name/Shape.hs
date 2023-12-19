@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP #-}
+
 
 module GHC.Types.Name.Shape
    ( NameShape(..)
@@ -11,22 +11,23 @@ module GHC.Types.Name.Shape
    )
 where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
-import GHC.Utils.Outputable
-import GHC.Driver.Types
+import GHC.Driver.Env
+
 import GHC.Unit.Module
+
 import GHC.Types.Unique.FM
 import GHC.Types.Avail
 import GHC.Types.FieldLabel
-
 import GHC.Types.Name
 import GHC.Types.Name.Env
+
 import GHC.Tc.Utils.Monad
-import GHC.Utils.Misc
 import GHC.Iface.Env
+
+import GHC.Utils.Outputable
+import GHC.Utils.Panic.Plain
 
 import Control.Monad
 
@@ -179,19 +180,24 @@ substName env n | Just n' <- lookupNameEnv env n = n'
 -- for type constructors, where it is sufficient to substitute the 'availName'
 -- to induce a substitution on 'availNames'.
 substNameAvailInfo :: HscEnv -> ShNameSubst -> AvailInfo -> IO AvailInfo
-substNameAvailInfo _ env (Avail n) = return (Avail (substName env n))
-substNameAvailInfo hsc_env env (AvailTC n ns fs) =
+substNameAvailInfo _ env (Avail (NormalGreName n)) = return (Avail (NormalGreName (substName env n)))
+substNameAvailInfo _ env (Avail (FieldGreName fl)) =
+    return (Avail (FieldGreName fl { flSelector = substName env (flSelector fl) }))
+substNameAvailInfo hsc_env env (AvailTC n ns) =
     let mb_mod = fmap nameModule (lookupNameEnv env n)
-    in AvailTC (substName env n)
-        <$> mapM (initIfaceLoad hsc_env . setNameModule mb_mod) ns
-        <*> mapM (setNameFieldSelector hsc_env mb_mod) fs
+    in AvailTC (substName env n) <$> mapM (setNameGreName hsc_env mb_mod) ns
+
+setNameGreName :: HscEnv -> Maybe Module -> GreName -> IO GreName
+setNameGreName hsc_env mb_mod gname = case gname of
+    NormalGreName n -> NormalGreName <$> initIfaceLoad hsc_env (setNameModule mb_mod n)
+    FieldGreName fl -> FieldGreName  <$> setNameFieldSelector hsc_env mb_mod fl
 
 -- | Set the 'Module' of a 'FieldSelector'
 setNameFieldSelector :: HscEnv -> Maybe Module -> FieldLabel -> IO FieldLabel
 setNameFieldSelector _ Nothing f = return f
-setNameFieldSelector hsc_env mb_mod (FieldLabel l b sel) = do
+setNameFieldSelector hsc_env mb_mod (FieldLabel l b has_sel sel) = do
     sel' <- initIfaceLoad hsc_env $ setNameModule mb_mod sel
-    return (FieldLabel l b sel')
+    return (FieldLabel l b has_sel sel')
 
 {-
 ************************************************************************
@@ -206,7 +212,7 @@ setNameFieldSelector hsc_env mb_mod (FieldLabel l b sel) = do
 mergeAvails :: [AvailInfo] -> [AvailInfo] -> [AvailInfo]
 mergeAvails as1 as2 =
     let mkNE as = mkNameEnv [(availName a, a) | a <- as]
-    in nameEnvElts (plusNameEnv_C plusAvail (mkNE as1) (mkNE as2))
+    in nonDetNameEnvElts (plusNameEnv_C plusAvail (mkNE as1) (mkNE as2))
 
 {-
 ************************************************************************
@@ -224,15 +230,15 @@ uAvailInfos flexi as1 as2 = -- pprTrace "uAvailInfos" (ppr as1 $$ ppr as2) $
                                  n <- availNames a
                                  return (nameOccName n, a)
     in foldM (\subst (a1, a2) -> uAvailInfo flexi subst a1 a2) emptyNameEnv
-             (eltsUFM (intersectUFM_C (,) (mkOE as1) (mkOE as2)))
+             (nonDetEltsUFM (intersectUFM_C (,) (mkOE as1) (mkOE as2)))
              -- Edward: I have to say, this is pretty clever.
 
 -- | Unify two 'AvailInfo's, given an existing substitution @subst@,
 -- with only name holes from @flexi@ unifiable (all other name holes rigid.)
 uAvailInfo :: ModuleName -> ShNameSubst -> AvailInfo -> AvailInfo
            -> Either SDoc ShNameSubst
-uAvailInfo flexi subst (Avail n1) (Avail n2) = uName flexi subst n1 n2
-uAvailInfo flexi subst (AvailTC n1 _ _) (AvailTC n2 _ _) = uName flexi subst n1 n2
+uAvailInfo flexi subst (Avail (NormalGreName n1)) (Avail (NormalGreName n2)) = uName flexi subst n1 n2
+uAvailInfo flexi subst (AvailTC n1 _) (AvailTC n2 _) = uName flexi subst n1 n2
 uAvailInfo _ _ a1 a2 = Left $ text "While merging export lists, could not combine"
                            <+> ppr a1 <+> text "with" <+> ppr a2
                            <+> parens (text "one is a type, the other is a plain identifier")
@@ -259,11 +265,11 @@ uName flexi subst n1 n2
 uHoleName :: ModuleName -> ShNameSubst -> Name {- hole name -} -> Name
           -> Either SDoc ShNameSubst
 uHoleName flexi subst h n =
-    ASSERT( isHoleName h )
+    assert (isHoleName h) $
     case lookupNameEnv subst h of
         Just n' -> uName flexi subst n' n
                 -- Do a quick check if the other name is substituted.
         Nothing | Just n' <- lookupNameEnv subst n ->
-                    ASSERT( isHoleName n ) uName flexi subst h n'
+                    assert (isHoleName n) $ uName flexi subst h n'
                 | otherwise ->
                     Right (extendNameEnv subst h n)

@@ -26,13 +26,13 @@ import qualified Data.Set    as Set
 import qualified Text.Parsec as Parsec
 
 docRoot :: FilePath
-docRoot = "docs"
+docRoot = "doc"
 
 htmlRoot :: FilePath
 htmlRoot = docRoot -/- "html"
 
 pdfRoot :: FilePath
-pdfRoot = docRoot -/- "pdfs"
+pdfRoot = docRoot
 
 infoRoot :: FilePath
 infoRoot = docRoot -/- "info"
@@ -41,7 +41,7 @@ archiveRoot :: FilePath
 archiveRoot = docRoot -/- "archives"
 
 manPageBuildPath :: FilePath
-manPageBuildPath = "docs/users_guide/build-man/ghc.1"
+manPageBuildPath = docRoot -/- "users_guide/build-man/ghc.1"
 
 -- TODO: Get rid of this hack.
 docContext :: Context
@@ -127,6 +127,21 @@ checkSphinxWarnings :: FilePath  -- ^ output directory
                     -> Action ()
 checkSphinxWarnings out = do
     log <- liftIO $ readFile (out -/- ".log")
+    when ("Inline literal start-string without end-string." `isInfixOf` log)
+      $ fail $ unlines
+        [ "Syntax error found in Sphinx log. "
+        , ""
+        , "This likely means that you have forgotten a \\ after inline code block. For instance,"
+        , "you might have written:"
+        , ""
+        , "    are not allowed to contain nested ``forall``s."
+        , ""
+        , "Whereas you need to write:"
+        , ""
+        , "    are not allowed to contain nested ``forall``\\s."
+        , ""
+        ]
+
     when ("reference target not found" `isInfixOf` log)
       $ fail "Undefined reference targets found in Sphinx log."
 
@@ -234,7 +249,7 @@ buildPackageDocumentation = do
         vanillaSrcs <- hsSources context
         let srcs = vanillaSrcs `union` generatedSrcs
 
-        need $ srcs ++ haddocks
+        need $ srcs ++ (map snd haddocks)
 
         -- Build Haddock documentation
         -- TODO: Pass the correct way from Rules via Context.
@@ -261,11 +276,11 @@ parsePkgDocTarget root = do
   _ <- Parsec.string root *> Parsec.optional (Parsec.char '/')
   _ <- Parsec.string (htmlRoot ++ "/")
   _ <- Parsec.string "libraries/"
-  pkgname <- Parsec.manyTill Parsec.anyChar (Parsec.char '/')
+  (pkgname, _) <- parsePkgId <* Parsec.char '/'
   Parsec.choice
     [ Parsec.try (Parsec.string "haddock-prologue.txt")
         *> pure (HaddockPrologue pkgname)
-    , Parsec.string (pkgname <.> "haddock")
+    , Parsec.string (pkgname <.> "haddock") -- Same as before
         *> pure (DotHaddock pkgname)
     ]
 
@@ -349,8 +364,8 @@ buildManPage = do
             copyFileUntracked (dir -/- "ghc.1") file
 
 -- | Find the Haddock files for the dependencies of the current library.
-haddockDependencies :: Context -> Action [FilePath]
+haddockDependencies :: Context -> Action [(Package, FilePath)]
 haddockDependencies context = do
     depNames <- interpretInContext context (getContextData depNames)
-    sequence [ pkgHaddockFile $ vanillaContext Stage1 depPkg
+    sequence [ (,) <$> pure depPkg <*> (pkgHaddockFile $ vanillaContext Stage1 depPkg)
              | Just depPkg <- map findPackageByName depNames, depPkg /= rts ]

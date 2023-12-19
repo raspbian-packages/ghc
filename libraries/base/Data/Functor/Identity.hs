@@ -1,6 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE DeriveTraversable #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE Trustworthy #-}
@@ -13,7 +11,7 @@
 -- License     :  BSD-style (see the file LICENSE)
 --
 -- Maintainer  :  ross@soi.city.ac.uk
--- Stability   :  experimental
+-- Stability   :  stable
 -- Portability :  portable
 --
 -- The identity functor and monad.

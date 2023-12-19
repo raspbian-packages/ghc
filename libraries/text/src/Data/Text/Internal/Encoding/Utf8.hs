@@ -5,6 +5,7 @@
 -- Copyright   : (c) 2008, 2009 Tom Harper,
 --               (c) 2009, 2010 Bryan O'Sullivan,
 --               (c) 2009 Duncan Coutts
+--               (c) 2021 Andrew Lelechenko
 --
 -- License     : BSD-style
 -- Maintainer  : bos@serpentine.com
@@ -17,9 +18,10 @@
 --
 -- Basic UTF-8 validation and character manipulation.
 module Data.Text.Internal.Encoding.Utf8
-    (
+    ( utf8Length
+    , utf8LengthByLeader
     -- Decomposition
-      ord2
+    , ord2
     , ord3
     , ord4
     -- Construction
@@ -31,11 +33,23 @@ module Data.Text.Internal.Encoding.Utf8
     , validate2
     , validate3
     , validate4
+    -- * Naive decoding
+    , DecoderState(..)
+    , utf8AcceptState
+    , utf8RejectState
+    , updateDecoderState
+    , DecoderResult(..)
+    , CodePoint(..)
+    , utf8DecodeStart
+    , utf8DecodeContinue
     ) where
 
-import Data.Bits ((.&.))
-import Data.Text.Internal.Unsafe.Char (ord)
-import Data.Text.Internal.Unsafe.Shift (shiftR)
+#if defined(ASSERTS)
+import Control.Exception (assert)
+import GHC.Stack (HasCallStack)
+#endif
+import Data.Bits (Bits(..), FiniteBits(..))
+import Data.Char (ord, chr)
 import GHC.Exts
 import GHC.Word (Word8(..))
 
@@ -53,34 +67,79 @@ between :: Word8                -- ^ byte to check
 between x y z = x >= y && x <= z
 {-# INLINE between #-}
 
-ord2 :: Char -> (Word8,Word8)
+-- This is a branchless version of
+-- utf8Length c
+--   | ord c < 0x80    = 1
+--   | ord c < 0x800   = 2
+--   | ord c < 0x10000 = 3
+--   | otherwise       = 4
+-- Implementation suggested by Alex Mason.
+
+-- | @since 2.0
+utf8Length :: Char -> Int
+utf8Length (C# c) = I# ((1# +# geChar# c (chr# 0x80#)) +# (geChar# c (chr# 0x800#) +# geChar# c (chr# 0x10000#)))
+{-# INLINE utf8Length #-}
+
+-- This is a branchless version of
+-- utf8LengthByLeader w
+--   | w < 0x80  = 1
+--   | w < 0xE0  = 2
+--   | w < 0xF0  = 3
+--   | otherwise = 4
+--
+-- c `xor` I# (c# <=# 0#) is a branchless equivalent of c `max` 1.
+-- It is crucial to write c# <=# 0# and not c# ==# 0#, otherwise
+-- GHC is tempted to "optimize" by introduction of branches.
+
+-- | @since 2.0
+utf8LengthByLeader :: Word8 -> Int
+utf8LengthByLeader w = c `xor` I# (c# <=# 0#)
+  where
+    !c@(I# c#) = countLeadingZeros (complement w)
+{-# INLINE utf8LengthByLeader #-}
+
+ord2 ::
+#if defined(ASSERTS)
+  HasCallStack =>
+#endif
+  Char -> (Word8,Word8)
 ord2 c =
-    -- ord2 is used only in test suite to construct a deliberately invalid ByteString,
-    -- actually violating the assertion, so it is commented out
-    -- assert (n >= 0x80 && n <= 0x07ff)
+#if defined(ASSERTS)
+    assert (n >= 0x80 && n <= 0x07ff)
+#endif
     (x1,x2)
     where
       n  = ord c
       x1 = intToWord8 $ (n `shiftR` 6) + 0xC0
       x2 = intToWord8 $ (n .&. 0x3F)   + 0x80
+{-# INLINE ord2 #-}
 
-ord3 :: Char -> (Word8,Word8,Word8)
+ord3 ::
+#if defined(ASSERTS)
+  HasCallStack =>
+#endif
+  Char -> (Word8,Word8,Word8)
 ord3 c =
-    -- ord3 is used only in test suite to construct a deliberately invalid ByteString,
-    -- actually violating the assertion, so it is commented out
-    -- assert (n >= 0x0800 && n <= 0xffff)
+#if defined(ASSERTS)
+    assert (n >= 0x0800 && n <= 0xffff)
+#endif
     (x1,x2,x3)
     where
       n  = ord c
       x1 = intToWord8 $ (n `shiftR` 12) + 0xE0
       x2 = intToWord8 $ ((n `shiftR` 6) .&. 0x3F) + 0x80
       x3 = intToWord8 $ (n .&. 0x3F) + 0x80
+{-# INLINE ord3 #-}
 
-ord4 :: Char -> (Word8,Word8,Word8,Word8)
+ord4 ::
+#if defined(ASSERTS)
+  HasCallStack =>
+#endif
+  Char -> (Word8,Word8,Word8,Word8)
 ord4 c =
-    -- ord4 is used only in test suite to construct a deliberately invalid ByteString,
-    -- actually violating the assertion, so it is commented out
-    -- assert (n >= 0x10000)
+#if defined(ASSERTS)
+    assert (n >= 0x10000)
+#endif
     (x1,x2,x3,x4)
     where
       n  = ord c
@@ -88,6 +147,7 @@ ord4 c =
       x2 = intToWord8 $ ((n `shiftR` 12) .&. 0x3F) + 0x80
       x3 = intToWord8 $ ((n `shiftR` 6) .&. 0x3F) + 0x80
       x4 = intToWord8 $ (n .&. 0x3F) + 0x80
+{-# INLINE ord4 #-}
 
 chr2 :: Word8 -> Word8 -> Char
 chr2 (W8# x1#) (W8# x2#) = C# (chr# (z1# +# z2#))
@@ -109,7 +169,7 @@ chr3 (W8# x1#) (W8# x2#) (W8# x3#) = C# (chr# (z1# +# z2# +# z3#))
       !z3# = y3# -# 0x80#
 {-# INLINE chr3 #-}
 
-chr4             :: Word8 -> Word8 -> Word8 -> Word8 -> Char
+chr4 :: Word8 -> Word8 -> Word8 -> Word8 -> Char
 chr4 (W8# x1#) (W8# x2#) (W8# x3#) (W8# x4#) =
     C# (chr# (z1# +# z2# +# z3# +# z4#))
     where
@@ -167,3 +227,72 @@ validate4 x1 x2 x3 x4 = validate4_1 || validate4_2 || validate4_3
 
 intToWord8 :: Int -> Word8
 intToWord8 = fromIntegral
+
+word8ToInt :: Word8 -> Int
+word8ToInt = fromIntegral
+
+-------------------------------------------------------------------------------
+-- Naive UTF8 decoder.
+-- See http://bjoern.hoehrmann.de/utf-8/decoder/dfa/ for the explanation of the state machine.
+
+newtype ByteClass = ByteClass Word8
+
+byteToClass :: Word8 -> ByteClass
+byteToClass n = ByteClass (W8# el#)
+  where
+    !(I# n#) = word8ToInt n
+    el# = indexWord8OffAddr# table# n#
+
+    table# :: Addr#
+    table# = "\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\SOH\SOH\SOH\SOH\SOH\SOH\SOH\SOH\SOH\SOH\SOH\SOH\SOH\SOH\SOH\SOH\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\a\a\a\a\a\a\a\a\a\a\a\a\a\a\a\a\a\a\a\a\a\a\a\a\a\a\a\a\a\a\a\a\b\b\STX\STX\STX\STX\STX\STX\STX\STX\STX\STX\STX\STX\STX\STX\STX\STX\STX\STX\STX\STX\STX\STX\STX\STX\STX\STX\STX\STX\STX\STX\n\ETX\ETX\ETX\ETX\ETX\ETX\ETX\ETX\ETX\ETX\ETX\ETX\EOT\ETX\ETX\v\ACK\ACK\ACK\ENQ\b\b\b\b\b\b\b\b\b\b\b"#
+
+newtype DecoderState = DecoderState Word8
+  deriving (Eq, Show)
+
+utf8AcceptState :: DecoderState
+utf8AcceptState = DecoderState 0
+
+utf8RejectState :: DecoderState
+utf8RejectState = DecoderState 12
+
+updateState :: ByteClass -> DecoderState -> DecoderState
+updateState (ByteClass c) (DecoderState s) = DecoderState (W8# el#)
+  where
+    !(I# n#) = word8ToInt (c + s)
+    el# = indexWord8OffAddr# table# n#
+
+    table# :: Addr#
+    table# = "\NUL\f\CAN$<`T\f\f\f0H\f\f\f\f\f\f\f\f\f\f\f\f\f\NUL\f\f\f\f\f\NUL\f\NUL\f\f\f\CAN\f\f\f\f\f\CAN\f\CAN\f\f\f\f\f\f\f\f\f\CAN\f\f\f\f\f\CAN\f\f\f\f\f\f\f\CAN\f\f\f\f\f\f\f\f\f$\f$\f\f\f$\f\f\f\f\f$\f$\f\f\f$\f\f\f\f\f\f\f\f\f\f"#
+
+updateDecoderState :: Word8 -> DecoderState -> DecoderState
+updateDecoderState b s = updateState (byteToClass b) s
+
+newtype CodePoint = CodePoint Int
+
+-- | @since 2.0
+data DecoderResult
+  = Accept !Char
+  | Incomplete !DecoderState !CodePoint
+  | Reject
+
+-- | @since 2.0
+utf8DecodeStart :: Word8 -> DecoderResult
+utf8DecodeStart !w
+  | st == utf8AcceptState = Accept (chr (word8ToInt w))
+  | st == utf8RejectState = Reject
+  | otherwise             = Incomplete st (CodePoint cp)
+  where
+    cl@(ByteClass cl') = byteToClass w
+    st = updateState cl utf8AcceptState
+    cp = word8ToInt $ (0xff `unsafeShiftR` word8ToInt cl') .&. w
+
+-- | @since 2.0
+utf8DecodeContinue :: Word8 -> DecoderState -> CodePoint -> DecoderResult
+utf8DecodeContinue !w !st (CodePoint !cp)
+  | st' == utf8AcceptState = Accept (chr cp')
+  | st' == utf8RejectState = Reject
+  | otherwise              = Incomplete st' (CodePoint cp')
+  where
+    cl  = byteToClass w
+    st' = updateState cl st
+    cp' = (cp `shiftL` 6) .|. word8ToInt (w .&. 0x3f)

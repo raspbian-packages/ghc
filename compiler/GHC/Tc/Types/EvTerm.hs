@@ -6,30 +6,33 @@ where
 
 import GHC.Prelude
 
-import GHC.Data.FastString
+import GHC.Driver.Session
+
+import GHC.Tc.Types.Evidence
+
+import GHC.Unit
+
+import GHC.Builtin.Names
+import GHC.Builtin.Types ( unitTy )
+
 import GHC.Core.Type
 import GHC.Core
 import GHC.Core.Make
-import GHC.Types.Literal ( Literal(..) )
-import GHC.Tc.Types.Evidence
-import GHC.Driver.Types
-import GHC.Driver.Session
-import GHC.Types.Name
-import GHC.Unit
 import GHC.Core.Utils
-import GHC.Builtin.Names
+
 import GHC.Types.SrcLoc
+import GHC.Types.TyThing
 
 -- Used with Opt_DeferTypeErrors
 -- See Note [Deferring coercion errors to runtime]
 -- in GHC.Tc.Solver
-evDelayedError :: Type -> FastString -> EvTerm
+evDelayedError :: Type -> String -> EvTerm
 evDelayedError ty msg
   = EvExpr $
-    Var errorId `mkTyApps` [getRuntimeRep ty, ty] `mkApps` [litMsg]
-  where
-    errorId = tYPE_ERROR_ID
-    litMsg  = Lit (LitString (bytesFS msg))
+    let fail_expr = mkRuntimeErrorApp tYPE_ERROR_ID unitTy msg
+    in mkWildCase fail_expr (unrestricted unitTy) ty []
+       -- See Note [Incompleteness and linearity] in GHC.HsToCore.Utils
+       -- c.f. mkErrorAppDs in GHC.HsToCore.Utils
 
 -- Dictionary for CallStack implicit parameters
 evCallStack :: (MonadThings m, HasModule m, HasDynFlags m) =>
@@ -67,5 +70,5 @@ evCallStack cs = do
         return (pushCS nameExpr locExpr (Cast tm ip_co))
 
   case cs of
-    EvCsPushCall name loc tm -> mkPush (occNameFS $ getOccName name) loc tm
-    EvCsEmpty -> return emptyCS
+    EvCsPushCall fs loc tm -> mkPush fs loc tm
+    EvCsEmpty              -> return emptyCS

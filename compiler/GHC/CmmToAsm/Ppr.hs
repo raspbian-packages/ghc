@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE MagicHash #-}
 
 -----------------------------------------------------------------------------
@@ -9,10 +10,8 @@
 -----------------------------------------------------------------------------
 
 module GHC.CmmToAsm.Ppr (
-        castFloatToWord8Array,
-        castDoubleToWord8Array,
-        floatToBytes,
         doubleToBytes,
+        floatToBytes,
         pprASCII,
         pprString,
         pprFileEmbed,
@@ -27,70 +26,62 @@ import GHC.Utils.Asm
 import GHC.Cmm.CLabel
 import GHC.Cmm
 import GHC.CmmToAsm.Config
-import GHC.Data.FastString
-import GHC.Utils.Outputable
+import GHC.Utils.Outputable as SDoc
+import qualified GHC.Utils.Ppr as Pretty
+import GHC.Utils.Panic
 import GHC.Platform
 
 import qualified Data.Array.Unsafe as U ( castSTUArray )
 import Data.Array.ST
 
 import Control.Monad.ST
-
 import Data.Word
-import Data.Bits
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import GHC.Exts
 import GHC.Word
 
-
+#if !MIN_VERSION_base(4,16,0)
+word8ToWord# :: Word# -> Word#
+word8ToWord# w = w
+{-# INLINE word8ToWord# #-}
+#endif
 
 -- -----------------------------------------------------------------------------
 -- Converting floating-point literals to integrals for printing
 
-castFloatToWord8Array :: STUArray s Int Float -> ST s (STUArray s Int Word8)
-castFloatToWord8Array = U.castSTUArray
+-- | Get bytes of a Float representation
+floatToBytes :: Float -> [Word8]
+floatToBytes f = runST $ do
+  arr <- newArray_ ((0::Int),3)
+  writeArray arr 0 f
+  let cast :: STUArray s Int Float -> ST s (STUArray s Int Word8)
+      cast = U.castSTUArray
+  arr <- cast arr
+  i0 <- readArray arr 0
+  i1 <- readArray arr 1
+  i2 <- readArray arr 2
+  i3 <- readArray arr 3
+  return [i0,i1,i2,i3]
 
-castDoubleToWord8Array :: STUArray s Int Double -> ST s (STUArray s Int Word8)
-castDoubleToWord8Array = U.castSTUArray
+-- | Get bytes of a Double representation
+doubleToBytes :: Double -> [Word8]
+doubleToBytes d = runST $ do
+  arr <- newArray_ ((0::Int),7)
+  writeArray arr 0 d
+  let cast :: STUArray s Int Double -> ST s (STUArray s Int Word8)
+      cast = U.castSTUArray
+  arr <- cast arr
+  i0 <- readArray arr 0
+  i1 <- readArray arr 1
+  i2 <- readArray arr 2
+  i3 <- readArray arr 3
+  i4 <- readArray arr 4
+  i5 <- readArray arr 5
+  i6 <- readArray arr 6
+  i7 <- readArray arr 7
+  return [i0,i1,i2,i3,i4,i5,i6,i7]
 
--- floatToBytes and doubleToBytes convert to the host's byte
--- order.  Providing that we're not cross-compiling for a
--- target with the opposite endianness, this should work ok
--- on all targets.
-
--- ToDo: this stuff is very similar to the shenanigans in PprAbs,
--- could they be merged?
-
-floatToBytes :: Float -> [Int]
-floatToBytes f
-   = runST (do
-        arr <- newArray_ ((0::Int),3)
-        writeArray arr 0 f
-        arr <- castFloatToWord8Array arr
-        i0 <- readArray arr 0
-        i1 <- readArray arr 1
-        i2 <- readArray arr 2
-        i3 <- readArray arr 3
-        return (map fromIntegral [i0,i1,i2,i3])
-     )
-
-doubleToBytes :: Double -> [Int]
-doubleToBytes d
-   = runST (do
-        arr <- newArray_ ((0::Int),7)
-        writeArray arr 0 d
-        arr <- castDoubleToWord8Array arr
-        i0 <- readArray arr 0
-        i1 <- readArray arr 1
-        i2 <- readArray arr 2
-        i3 <- readArray arr 3
-        i4 <- readArray arr 4
-        i5 <- readArray arr 5
-        i6 <- readArray arr 6
-        i7 <- readArray arr 7
-        return (map fromIntegral [i0,i1,i2,i3,i4,i5,i6,i7])
-     )
 
 -- ---------------------------------------------------------------------------
 -- Printing ASCII strings.
@@ -104,28 +95,34 @@ pprASCII str
   -- the literal SDoc directly.
   -- See #14741
   -- and Note [Pretty print ASCII when AsmCodeGen]
-  = text $ BS.foldr (\w s -> do1 w ++ s) "" str
+  --
+  -- We work with a `Doc` instead of an `SDoc` because there is no need to carry
+  -- an `SDocContext` that we don't use. It leads to nicer (STG) code.
+  = docToSDoc (BS.foldr f Pretty.empty str)
     where
-       do1 :: Word8 -> String
-       do1 w | 0x09 == w = "\\t"
-             | 0x0A == w = "\\n"
-             | 0x22 == w = "\\\""
-             | 0x5C == w = "\\\\"
+       f :: Word8 -> Pretty.Doc -> Pretty.Doc
+       f w s = do1 w Pretty.<> s
+
+       do1 :: Word8 -> Pretty.Doc
+       do1 w | 0x09 == w = Pretty.text "\\t"
+             | 0x0A == w = Pretty.text "\\n"
+             | 0x22 == w = Pretty.text "\\\""
+             | 0x5C == w = Pretty.text "\\\\"
                -- ASCII printable characters range
-             | w >= 0x20 && w <= 0x7E = [chr' w]
-             | otherwise = '\\' : octal w
+             | w >= 0x20 && w <= 0x7E = Pretty.char (chr' w)
+             | otherwise = Pretty.sizedText 4 xs
+                where
+                 !xs = [ '\\', x0, x1, x2] -- octal
+                 !x0 = chr' (ord0 + (w `unsafeShiftR` 6) .&. 0x07)
+                 !x1 = chr' (ord0 + (w `unsafeShiftR` 3) .&. 0x07)
+                 !x2 = chr' (ord0 + w .&. 0x07)
+                 !ord0 = 0x30 -- = ord '0'
 
        -- we know that the Chars we create are in the ASCII range
        -- so we bypass the check in "chr"
        chr' :: Word8 -> Char
-       chr' (W8# w#) = C# (chr# (word2Int# w#))
+       chr' (W8# w#) = C# (chr# (word2Int# (word8ToWord# w#)))
 
-       octal :: Word8 -> String
-       octal w = [ chr' (ord0 + (w `unsafeShiftR` 6) .&. 0x07)
-                 , chr' (ord0 + (w `unsafeShiftR` 3) .&. 0x07)
-                 , chr' (ord0 + w .&. 0x07)
-                 ]
-       ord0 = 0x30 -- = ord '0'
 
 -- | Emit a ".string" directive
 pprString :: ByteString -> SDoc
@@ -201,37 +198,47 @@ pprSectionHeader config (Section t suffix) =
  case platformOS (ncgPlatform config) of
    OSAIX     -> pprXcoffSectionHeader t
    OSDarwin  -> pprDarwinSectionHeader t
-   OSMinGW32 -> pprGNUSectionHeader config (char '$') t suffix
-   _         -> pprGNUSectionHeader config (char '.') t suffix
+   _         -> pprGNUSectionHeader config t suffix
 
-pprGNUSectionHeader :: NCGConfig -> SDoc -> SectionType -> CLabel -> SDoc
-pprGNUSectionHeader config sep t suffix =
-  text ".section " <> ptext header <> subsection <> flags
+pprGNUSectionHeader :: NCGConfig -> SectionType -> CLabel -> SDoc
+pprGNUSectionHeader config t suffix =
+  hcat [text ".section ", header, subsection, flags]
   where
+    sep
+      | OSMinGW32 <- platformOS platform = char '$'
+      | otherwise                        = char '.'
     platform      = ncgPlatform config
     splitSections = ncgSplitSections config
     subsection
-      | splitSections = sep <> ppr suffix
+      | splitSections = sep <> pdoc platform suffix
       | otherwise     = empty
     header = case t of
-      Text -> sLit ".text"
-      Data -> sLit ".data"
+      Text -> text ".text"
+      Data -> text ".data"
       ReadOnlyData  | OSMinGW32 <- platformOS platform
-                                -> sLit ".rdata"
-                    | otherwise -> sLit ".rodata"
+                                -> text ".rdata"
+                    | otherwise -> text ".rodata"
       RelocatableReadOnlyData | OSMinGW32 <- platformOS platform
                                 -- Concept does not exist on Windows,
                                 -- So map these to R/O data.
-                                          -> sLit ".rdata$rel.ro"
-                              | otherwise -> sLit ".data.rel.ro"
-      UninitialisedData -> sLit ".bss"
+                                          -> text ".rdata$rel.ro"
+                              | otherwise -> text ".data.rel.ro"
+      UninitialisedData -> text ".bss"
       ReadOnlyData16 | OSMinGW32 <- platformOS platform
-                                 -> sLit ".rdata$cst16"
-                     | otherwise -> sLit ".rodata.cst16"
+                                 -> text ".rdata$cst16"
+                     | otherwise -> text ".rodata.cst16"
+      InitArray
+        | OSMinGW32 <- platformOS platform
+                    -> text ".ctors"
+        | otherwise -> text ".init_array"
+      FiniArray
+        | OSMinGW32 <- platformOS platform
+                    -> text ".dtors"
+        | otherwise -> text ".fini_array"
       CString
         | OSMinGW32 <- platformOS platform
-                    -> sLit ".rdata"
-        | otherwise -> sLit ".rodata.str"
+                    -> text ".rdata"
+        | otherwise -> text ".rodata.str"
       OtherSection _ ->
         panic "PprBase.pprGNUSectionHeader: unknown section type"
     flags = case t of
@@ -244,26 +251,25 @@ pprGNUSectionHeader config sep t suffix =
 -- XCOFF doesn't support relocating label-differences, so we place all
 -- RO sections into .text[PR] sections
 pprXcoffSectionHeader :: SectionType -> SDoc
-pprXcoffSectionHeader t = text $ case t of
-     Text                    -> ".csect .text[PR]"
-     Data                    -> ".csect .data[RW]"
-     ReadOnlyData            -> ".csect .text[PR] # ReadOnlyData"
-     RelocatableReadOnlyData -> ".csect .text[PR] # RelocatableReadOnlyData"
-     ReadOnlyData16          -> ".csect .text[PR] # ReadOnlyData16"
-     CString                 -> ".csect .text[PR] # CString"
-     UninitialisedData       -> ".csect .data[BS]"
-     OtherSection _          ->
-       panic "PprBase.pprXcoffSectionHeader: unknown section type"
+pprXcoffSectionHeader t = case t of
+  Text                    -> text ".csect .text[PR]"
+  Data                    -> text ".csect .data[RW]"
+  ReadOnlyData            -> text ".csect .text[PR] # ReadOnlyData"
+  RelocatableReadOnlyData -> text ".csect .text[PR] # RelocatableReadOnlyData"
+  ReadOnlyData16          -> text ".csect .text[PR] # ReadOnlyData16"
+  CString                 -> text ".csect .text[PR] # CString"
+  UninitialisedData       -> text ".csect .data[BS]"
+  _                       -> panic "pprXcoffSectionHeader: unknown section type"
 
 pprDarwinSectionHeader :: SectionType -> SDoc
-pprDarwinSectionHeader t =
-  ptext $ case t of
-     Text -> sLit ".text"
-     Data -> sLit ".data"
-     ReadOnlyData -> sLit ".const"
-     RelocatableReadOnlyData -> sLit ".const_data"
-     UninitialisedData -> sLit ".data"
-     ReadOnlyData16 -> sLit ".const"
-     CString -> sLit ".section\t__TEXT,__cstring,cstring_literals"
-     OtherSection _ ->
-       panic "PprBase.pprDarwinSectionHeader: unknown section type"
+pprDarwinSectionHeader t = case t of
+  Text                    -> text ".text"
+  Data                    -> text ".data"
+  ReadOnlyData            -> text ".const"
+  RelocatableReadOnlyData -> text ".const_data"
+  UninitialisedData       -> text ".data"
+  ReadOnlyData16          -> text ".const"
+  InitArray               -> text ".section\t__DATA,__mod_init_func,mod_init_funcs"
+  FiniArray               -> panic "pprDarwinSectionHeader: fini not supported"
+  CString                 -> text ".section\t__TEXT,__cstring,cstring_literals"
+  OtherSection _          -> panic "pprDarwinSectionHeader: unknown section type"

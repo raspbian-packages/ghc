@@ -12,7 +12,7 @@ AC_USE_SYSTEM_EXTENSIONS
 
 AC_MSG_CHECKING(for WINDOWS platform)
 case $host_alias in
-    *mingw32*|*mingw64*|*cygwin*|*msys*)
+    *mingw32*|*mingw64*|*cygwin*|*msys*|*windows*)
         WINDOWS=YES;;
     *)
         WINDOWS=NO;;
@@ -38,11 +38,15 @@ AC_CHECK_FUNCS([lstat])
 AC_CHECK_LIB([rt], [clock_gettime])
 AC_CHECK_FUNCS([clock_gettime])
 AC_CHECK_FUNCS([getclock getrusage times])
-AC_CHECK_FUNCS([_chsize ftruncate])
-
-AC_CHECK_FUNCS([epoll_ctl eventfd kevent kevent64 kqueue poll])
+AC_CHECK_FUNCS([_chsize_s ftruncate])
 
 # event-related fun
+# The line below already defines HAVE_KQUEUE and HAVE_POLL, so technically some of the
+# subsequent portions that redefine them could be skipped. However, we keep those portions
+# to keep kqueue/poll in line with HAVE_EPOLL and possible other additions in the future. You
+# should be aware of this peculiarity if you try to simulate not having kqueue or poll by
+# moving away header files (see also https://gitlab.haskell.org/ghc/ghc/-/issues/9283)
+AC_CHECK_FUNCS([epoll_ctl eventfd kevent kevent64 kqueue poll])
 
 if test "$ac_cv_header_sys_epoll_h" = yes && test "$ac_cv_func_epoll_ctl" = yes; then
   AC_DEFINE([HAVE_EPOLL], [1], [Define if you have epoll support.])
@@ -184,6 +188,8 @@ FP_CHECK_CONSTS([SIGINT], [
 
 dnl ** can we open files in binary mode?
 FP_CHECK_CONST([O_BINARY], [#include <fcntl.h>], [0])
+
+FP_CHECK_ENVIRON
 
 # We don't use iconv or libcharset on Windows, but if configure finds
 # them then it can cause problems. So we don't even try looking if

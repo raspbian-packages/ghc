@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 
@@ -6,43 +5,52 @@ module GHC.Tc.Instance.Class (
      matchGlobalInst,
      ClsInstResult(..),
      InstanceWhat(..), safeOverlap, instanceReturnsDictCon,
-     AssocInstInfo(..), isNotAssociated
+     AssocInstInfo(..), isNotAssociated,
   ) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
+
+import GHC.Driver.Session
+
+import GHC.Core.TyCo.Rep
 
 import GHC.Tc.Utils.Env
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Utils.TcType
-import GHC.Tc.Utils.Instantiate( tcInstType )
+import GHC.Tc.Utils.Instantiate(instDFunType, tcInstType)
 import GHC.Tc.Instance.Typeable
 import GHC.Tc.Utils.TcMType
 import GHC.Tc.Types.Evidence
-import GHC.Core.Predicate
-import GHC.Rename.Env( addUsedGRE )
-import GHC.Types.Name.Reader( lookupGRE_FieldLabel )
-import GHC.Core.InstEnv
-import GHC.Tc.Utils.Instantiate( instDFunType )
 import GHC.Tc.Instance.Family( tcGetFamInstEnvs, tcInstNewTyCon_maybe, tcLookupDataFamInst )
+import GHC.Rename.Env( addUsedGRE )
 
 import GHC.Builtin.Types
-import GHC.Builtin.Types.Prim( eqPrimTyCon, eqReprPrimTyCon )
+import GHC.Builtin.Types.Prim
 import GHC.Builtin.Names
 
-import GHC.Types.Id
-import GHC.Core.Type
-import GHC.Core.Make ( mkStringExprFS, mkNaturalExpr )
-
+import GHC.Types.Name.Reader( lookupGRE_FieldLabel, greMangledName )
+import GHC.Types.SafeHaskell
 import GHC.Types.Name   ( Name, pprDefinedAt )
 import GHC.Types.Var.Env ( VarEnv )
+import GHC.Types.Id
+import GHC.Types.Var
+
+import GHC.Core.Predicate
+import GHC.Core.InstEnv
+import GHC.Core.Type
+import GHC.Core.Make ( mkCharExpr, mkNaturalExpr, mkStringExprFS, mkCoreLams )
 import GHC.Core.DataCon
 import GHC.Core.TyCon
 import GHC.Core.Class
-import GHC.Driver.Session
+
+import GHC.Core ( Expr(Var, App, Cast, Let), Bind (NonRec) )
+import GHC.Types.Basic
+
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
 import GHC.Utils.Misc( splitAtList, fstOf3 )
+import GHC.Data.FastString
+
 import Data.Maybe
 
 {- *******************************************************************
@@ -93,13 +101,22 @@ data ClsInstResult
 
   | NotSure      -- Multiple matches and/or one or more unifiers
 
-data InstanceWhat
-  = BuiltinInstance
-  | BuiltinEqInstance   -- A built-in "equality instance"; see the
-                        -- GHC.Tc.Solver.Monad Note [Solved dictionaries]
-  | LocalInstance
-  | TopLevInstance { iw_dfun_id   :: DFunId
-                   , iw_safe_over :: SafeOverlapping }
+data InstanceWhat  -- How did we solve this constraint?
+  = BuiltinEqInstance    -- Built-in solver for (t1 ~ t2), (t1 ~~ t2), Coercible t1 t2
+                         -- See GHC.Tc.Solver.InertSet Note [Solved dictionaries]
+
+  | BuiltinTypeableInstance TyCon   -- Built-in solver for Typeable (T t1 .. tn)
+                         -- See Note [Well-staged instance evidence]
+
+  | BuiltinInstance      -- Built-in solver for (C t1 .. tn) where C is
+                         --   KnownNat, .. etc (classes with no top-level evidence)
+
+  | LocalInstance        -- Solved by a quantified constraint
+                         -- See GHC.Tc.Solver.InertSet Note [Solved dictionaries]
+
+  | TopLevInstance       -- Solved by a top-level instance decl
+      { iw_dfun_id   :: DFunId
+      , iw_safe_over :: SafeOverlapping }
 
 instance Outputable ClsInstResult where
   ppr NoInstance = text "NoInstance"
@@ -110,6 +127,7 @@ instance Outputable ClsInstResult where
 
 instance Outputable InstanceWhat where
   ppr BuiltinInstance   = text "a built-in instance"
+  ppr BuiltinTypeableInstance {} = text "a built-in typeable instance"
   ppr BuiltinEqInstance = text "a built-in equality instance"
   ppr LocalInstance     = text "a locally-quantified instance"
   ppr (TopLevInstance { iw_dfun_id = dfun })
@@ -121,9 +139,10 @@ safeOverlap (TopLevInstance { iw_safe_over = so }) = so
 safeOverlap _                                      = True
 
 instanceReturnsDictCon :: InstanceWhat -> Bool
--- See Note [Solved dictionaries] in GHC.Tc.Solver.Monad
+-- See Note [Solved dictionaries] in GHC.Tc.Solver.InertSet
 instanceReturnsDictCon (TopLevInstance {}) = True
 instanceReturnsDictCon BuiltinInstance     = True
+instanceReturnsDictCon BuiltinTypeableInstance {} = True
 instanceReturnsDictCon BuiltinEqInstance   = False
 instanceReturnsDictCon LocalInstance       = False
 
@@ -136,8 +155,11 @@ matchGlobalInst dflags short_cut clas tys
   = matchKnownNat    dflags short_cut clas tys
   | cls_name == knownSymbolClassName
   = matchKnownSymbol dflags short_cut clas tys
+  | cls_name == knownCharClassName
+  = matchKnownChar dflags short_cut clas tys
   | isCTupleClass clas                = matchCTuple          clas tys
   | cls_name == typeableClassName     = matchTypeable        clas tys
+  | cls_name == withDictClassName     = matchWithDict             tys
   | clas `hasKey` heqTyConKey         = matchHeteroEquality       tys
   | clas `hasKey` eqTyConKey          = matchHomoEquality         tys
   | clas `hasKey` coercibleTyConKey   = matchCoercible            tys
@@ -167,12 +189,12 @@ matchInstEnv dflags short_cut_solver clas tys
         ; case (matches, unify, safeHaskFail) of
 
             -- Nothing matches
-            ([], [], _)
+            ([], NoUnifiers, _)
                 -> do { traceTc "matchClass not matching" (ppr pred)
                       ; return NoInstance }
 
             -- A single match (& no safe haskell failure)
-            ([(ispec, inst_tys)], [], False)
+            ([(ispec, inst_tys)], NoUnifiers, False)
                 | short_cut_solver      -- Called from the short-cut solver
                 , isOverlappable ispec
                 -- If the instance has OVERLAPPABLE or OVERLAPS or INCOHERENT
@@ -296,7 +318,7 @@ a more convenient function, defined in terms of `natSing`:
 
 The reason we don't use this directly in the class is that it is simpler
 and more efficient to pass around a Natural rather than an entire function,
-especially when the `KnowNat` evidence is packaged up in an existential.
+especially when the `KnownNat` evidence is packaged up in an existential.
 
 The story for kind `Symbol` is analogous:
   * class KnownSymbol
@@ -354,8 +376,8 @@ matchKnownNat :: DynFlags
               -> Bool      -- True <=> caller is the short-cut solver
                            -- See Note [Shortcut solving: overlap]
               -> Class -> [Type] -> TcM ClsInstResult
-matchKnownNat _ _ clas [ty]     -- clas = KnownNat
-  | Just n <- isNumLitTy ty  = makeLitDict clas ty (mkNaturalExpr n)
+matchKnownNat dflags _ clas [ty]     -- clas = KnownNat
+  | Just n <- isNumLitTy ty  = makeLitDict clas ty (mkNaturalExpr (targetPlatform dflags) n)
 matchKnownNat df sc clas tys = matchInstEnv df sc clas tys
  -- See Note [Fabricating Evidence for Literals in Backpack] for why
  -- this lookup into the instance environment is required.
@@ -369,6 +391,16 @@ matchKnownSymbol _ _ clas [ty]  -- clas = KnownSymbol
         et <- mkStringExprFS s
         makeLitDict clas ty et
 matchKnownSymbol df sc clas tys = matchInstEnv df sc clas tys
+ -- See Note [Fabricating Evidence for Literals in Backpack] for why
+ -- this lookup into the instance environment is required.
+
+matchKnownChar :: DynFlags
+                 -> Bool      -- True <=> caller is the short-cut solver
+                              -- See Note [Shortcut solving: overlap]
+                 -> Class -> [Type] -> TcM ClsInstResult
+matchKnownChar _ _ clas [ty]  -- clas = KnownChar
+  | Just s <- isCharLitTy ty = makeLitDict clas ty (mkCharExpr s)
+matchKnownChar df sc clas tys = matchInstEnv df sc clas tys
  -- See Note [Fabricating Evidence for Literals in Backpack] for why
  -- this lookup into the instance environment is required.
 
@@ -404,6 +436,182 @@ makeLitDict clas ty et
 
 {- ********************************************************************
 *                                                                     *
+                   Class lookup for WithDict
+*                                                                     *
+***********************************************************************-}
+
+-- See Note [withDict]
+matchWithDict :: [Type] -> TcM ClsInstResult
+matchWithDict [cls, mty]
+    -- Check that cls is a class constraint `C t_1 ... t_n`, where
+    -- `dict_tc = C` and `dict_args = t_1 ... t_n`.
+  | Just (dict_tc, dict_args) <- tcSplitTyConApp_maybe cls
+    -- Check that C is a class of the form
+    -- `class C a_1 ... a_n where op :: meth_ty`
+    -- and in that case let
+    -- co :: C t1 ..tn ~R# inst_meth_ty
+  , Just (inst_meth_ty, co) <- tcInstNewTyCon_maybe dict_tc dict_args
+  = do { sv <- mkSysLocalM (fsLit "withDict_s") Many mty
+       ; k  <- mkSysLocalM (fsLit "withDict_k") Many (mkInvisFunTyMany cls openAlphaTy)
+
+       ; let evWithDict_type = mkSpecForAllTys [runtimeRep1TyVar, openAlphaTyVar] $
+                               mkVisFunTysMany [mty, mkInvisFunTyMany cls openAlphaTy] openAlphaTy
+
+       ; wd_id <- mkSysLocalM (fsLit "withDict_wd") Many evWithDict_type
+       ; let wd_id' = wd_id `setInlinePragma` neverInlinePragma
+               -- Inlining withDict can cause the specialiser to incorrectly common up
+               -- distinct evidence terms. See (WD6) in Note [withDict].
+
+       -- Given co2 : mty ~N# inst_meth_ty, construct the method of
+       -- the WithDict dictionary:
+       -- \@(r : RuntimeRep) @(a :: TYPE r) (sv : mty) (k :: cls => a) -> k (sv |> (sub co; sym co2))
+       ; let evWithDict co2 =
+               let wd_rhs = mkCoreLams [ runtimeRep1TyVar, openAlphaTyVar, sv, k ] $
+                            Var k `App` Cast (Var sv) (mkTcTransCo (mkTcSubCo co2) (mkTcSymCo co))
+               in Let (NonRec wd_id' wd_rhs) (Var wd_id')
+         -- Why a Let?  See (WD6) in Note [withDict]
+
+       ; tc <- tcLookupTyCon withDictClassName
+       ; let Just withdict_data_con
+                 = tyConSingleDataCon_maybe tc    -- "Data constructor"
+                                                  -- for WithDict
+             mk_ev [c] = evDataConApp withdict_data_con
+                            [cls, mty] [evWithDict (evTermCoercion (EvExpr c))]
+             mk_ev e   = pprPanic "matchWithDict" (ppr e)
+
+       ; return $ OneInst { cir_new_theta = [mkPrimEqPred mty inst_meth_ty]
+                          , cir_mk_ev     = mk_ev
+                          , cir_what      = BuiltinInstance }
+       }
+
+matchWithDict _
+  = return NoInstance
+
+{-
+Note [withDict]
+~~~~~~~~~~~~~~~
+The class `WithDict` is defined as:
+
+    class WithDict cls meth where
+        withDict :: forall {rr :: RuntimeRep} (r :: TYPE rr). meth -> (cls => r) -> r
+
+This class is special, like `Typeable`: GHC automatically solves
+for instances of `WithDict`, users cannot write their own.
+
+It is used to implement a primitive that we cannot define in Haskell
+but we can write in Core.
+
+`WithDict` is used to create dictionaries for classes with a single method.
+Consider a class like this:
+
+   class C a where
+     f :: T a
+
+We can use `withDict` to cast values of type `T a` into dictionaries for `C a`.
+To do this, we can define a function like this in the library:
+
+  withT :: T a -> (C a => b) -> b
+  withT t k = withDict @(C a) @(T a) t k
+
+Here:
+
+* The `cls` in `withDict` is instantiated to `C a`.
+
+* The `meth` in `withDict` is instantiated to `T a`.
+  The definition of `T` itself is irrelevant, only that `C a` is a class
+  with a single method of type `T a`.
+
+* The `r` in `withDict` is instantiated to `b`.
+
+For any single-method class C:
+   class C a1 .. an where op :: meth_ty
+
+The solver will solve the constraint `WithDict (C t1 .. tn) mty`
+as if the following instance declaration existed:
+
+instance (mty ~# inst_meth_ty) => WithDict (C t1..tn) mty where
+  withDict = \@{rr} @(r :: TYPE rr) (sv :: mty) (k :: C t1..tn => r) ->
+    k (sv |> (sub co2; sym co))
+
+That is, it matches on the first (constraint) argument of C; if C is
+a single-method class, the instance "fires" and emits an equality
+constraint `mty ~ inst_meth_ty`, where `inst_meth_ty` is `meth_ty[ti/ai]`.
+The coercion `co2` witnesses the equality `mty ~ inst_meth_ty`.
+
+The coercion `co` is a newtype coercion that coerces from `C t1 ... tn`
+to `inst_meth_ty`.
+This coercion is guaranteed to exist by virtue of the fact that
+C is a class with exactly one method and no superclasses, so it
+is treated like a newtype when compiled to Core.
+
+The condition that `C` is a single-method class is implemented in the
+guards of matchWithDict's definition.
+If the conditions are not held, the rewriting will not fire,
+and we'll report an unsolved constraint.
+
+Some further observations about `withDict`:
+
+(WD1) The `cls` in the type of withDict must be explicitly instantiated with
+      visible type application, as invoking `withDict` would be ambiguous
+      otherwise.
+
+      For examples of how `withDict` is used in the `base` library, see `withSNat`
+      in GHC.TypeNats, as well as `withSChar` and `withSSymbol` in GHC.TypeLits.
+
+(WD2) The `r` is representation-polymorphic, to support things like
+      `withTypeable` in `Data.Typeable.Internal`.
+
+(WD3) As an alternative to `withDict`, one could define functions like `withT`
+      above in terms of `unsafeCoerce`. This is more error-prone, however.
+
+(WD4) In order to define things like `reifySymbol` below:
+
+        reifySymbol :: forall r. String -> (forall (n :: Symbol). KnownSymbol n => r) -> r
+
+      `withDict` needs to be instantiated with `Any`, like so:
+
+        reifySymbol n k = withDict @(KnownSymbol Any) @String @r n (k @Any)
+
+      The use of `Any` is explained in Note [NOINLINE someNatVal] in
+      base:GHC.TypeNats.
+
+(WD5) In earlier implementations, `withDict` was implemented as an identifier
+      with special handling during either constant-folding or desugaring.
+      The current approach is more robust, previously the type of `withDict`
+      did not have a type-class constraint and was overly polymorphic.
+      See #19915.
+
+(WD6) In fact we desugar `withDict @(C t_1 ... t_n) @mty @{rr} @r` to
+
+         let wd = \sv k -> k (sv |> co)
+             {-# NOINLINE wd #-}
+         in wd
+
+      The local `let` and NOINLINE pragma ensure that the type-class specialiser
+      doesn't wrongly common up distinct evidence terms. This is super important!
+      Suppose we have calls
+          withDict A k
+          withDict B k
+      where k1, k2 :: C T -> blah.  If we inline those withDict calls we'll get
+          k (A |> co1)
+          k (B |> co2)
+      and the Specialiser will assume that those arguments (of type `C T`) are
+      the same, will specialise `k` for that type, and will call the same,
+      specialised function from both call sites.  #21575 is a concrete case in point.
+
+      Solution: never inline `withDict`. Note that it is not sufficient to delay
+      inlining until after the specialiser (that is, until Phase 2), because if
+      we inline withDict in module A but import it in module B, the specialiser
+      will try to common up the two distinct evidence terms.
+      See test case T21575b.
+
+      This solution is unsatisfactory, as it imposes a performance overhead
+      on uses of withDict.
+
+-}
+
+{- ********************************************************************
+*                                                                     *
                    Class lookup for Typeable
 *                                                                     *
 ***********************************************************************-}
@@ -417,8 +625,9 @@ matchTypeable clas [k,t]  -- clas = Typeable
   | isJust (tcSplitPredFunTy_maybe t) = return NoInstance   -- Qualified type
 
   -- Now cases that do work
-  | k `eqType` typeNatKind                 = doTyLit knownNatClassName         t
+  | k `eqType` naturalTy                   = doTyLit knownNatClassName         t
   | k `eqType` typeSymbolKind              = doTyLit knownSymbolClassName      t
+  | k `eqType` charTy                      = doTyLit knownCharClassName        t
   | tcIsConstraintKind t                   = doTyConApp clas t constraintKindTyCon []
   | Just (mult,arg,ret) <- splitFunTy_maybe t   = doFunTy    clas t mult arg ret
   | Just (tc, ks) <- splitTyConApp_maybe t -- See Note [Typeable (T a b c)]
@@ -446,9 +655,10 @@ doFunTy clas ty mult arg_ty ret_ty
 doTyConApp :: Class -> Type -> TyCon -> [Kind] -> TcM ClsInstResult
 doTyConApp clas ty tc kind_args
   | tyConIsTypeable tc
-  = return $ OneInst { cir_new_theta = (map (mk_typeable_pred clas) kind_args)
-                     , cir_mk_ev     = mk_ev
-                     , cir_what      = BuiltinInstance }
+  = do
+     return $ OneInst { cir_new_theta = (map (mk_typeable_pred clas) kind_args)
+                      , cir_mk_ev     = mk_ev
+                      , cir_what      = BuiltinTypeableInstance tc }
   | otherwise
   = return NoInstance
   where
@@ -547,7 +757,7 @@ have this instance, implemented here by doTyLit:
       instance KnownNat n => Typeable (n :: Nat) where
          typeRep = typeNatTypeRep @n
 where
-   Data.Typeable.Internals.typeNatTypeRep :: KnownNat a => TypeRep a
+   Data.Typeable.Internal.typeNatTypeRep :: KnownNat a => TypeRep a
 
 Ultimately typeNatTypeRep uses 'natSing' from KnownNat to get a
 runtime value 'n'; it turns it into a string with 'show' and uses
@@ -592,7 +802,6 @@ matchCoercible args@[k, t1, t2]
   where
     args' = [k, k, t1, t2]
 matchCoercible args = pprPanic "matchLiftedCoercible" (ppr args)
-
 
 {- ********************************************************************
 *                                                                     *
@@ -654,6 +863,20 @@ may be solved by a user-supplied HasField instance.  Similarly, if we
 encounter a HasField constraint where the field is not a literal
 string, or does not belong to the type, then we fall back on the
 normal constraint solver behaviour.
+
+
+Note [Unused name reporting and HasField]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When a HasField constraint is solved by the type-checker, we must record a use
+of the corresponding field name, as otherwise it might be reported as unused.
+See #19213.  We need to call keepAlive to add the name to the tcg_keep set,
+which accumulates names used by the constraint solver, as described by
+Note [Tracking unused binding and imports] in GHC.Tc.Types.
+
+We need to call addUsedGRE as well because there may be a deprecation warning on
+the field, which will be reported by addUsedGRE.  But calling addUsedGRE without
+keepAlive is not enough, because the field might be defined locally, and
+addUsedGRE extends tcg_used_gres with imported GREs only.
 -}
 
 -- See Note [HasField instances]
@@ -703,7 +926,9 @@ matchHasField dflags short_cut clas tys
                      -- cannot have an existentially quantified type), and
                      -- it must not be higher-rank.
                    ; if not (isNaughtyRecordSelector sel_id) && isTauTy sel_ty
-                     then do { addUsedGRE True gre
+                     then do { -- See Note [Unused name reporting and HasField]
+                               addUsedGRE True gre
+                             ; keepAlive (greMangledName gre)
                              ; return OneInst { cir_new_theta = theta
                                               , cir_mk_ev     = mk_ev
                                               , cir_what      = BuiltinInstance } }

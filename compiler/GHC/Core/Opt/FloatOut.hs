@@ -6,7 +6,7 @@
 ``Long-distance'' floating of bindings towards the top level.
 -}
 
-{-# LANGUAGE CPP #-}
+
 
 module GHC.Core.Opt.FloatOut ( floatOutwards ) where
 
@@ -19,21 +19,21 @@ import GHC.Core.Opt.Arity ( exprArity, etaExpand )
 import GHC.Core.Opt.Monad ( FloatOutSwitches(..) )
 
 import GHC.Driver.Session
-import GHC.Utils.Error   ( dumpIfSet_dyn, DumpFormat (..) )
+import GHC.Utils.Logger
 import GHC.Types.Id      ( Id, idArity, idType, isDeadEndId,
                            isJoinId, isJoinId_maybe )
+import GHC.Types.Tickish
 import GHC.Core.Opt.SetLevels
 import GHC.Types.Unique.Supply ( UniqSupply )
 import GHC.Data.Bag
 import GHC.Utils.Misc
 import GHC.Data.Maybe
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
 import GHC.Core.Type
 import qualified Data.IntMap as M
 
 import Data.List        ( partition )
-
-#include "HsVersions.h"
 
 {-
         -----------------
@@ -162,24 +162,24 @@ Without floating, we're stuck with three loops instead of one.
 ************************************************************************
 -}
 
-floatOutwards :: FloatOutSwitches
-              -> DynFlags
+floatOutwards :: Logger
+              -> FloatOutSwitches
               -> UniqSupply
               -> CoreProgram -> IO CoreProgram
 
-floatOutwards float_sws dflags us pgm
+floatOutwards logger float_sws us pgm
   = do {
         let { annotated_w_levels = setLevels float_sws pgm us ;
               (fss, binds_s')    = unzip (map floatTopBind annotated_w_levels)
             } ;
 
-        dumpIfSet_dyn dflags Opt_D_verbose_core2core "Levels added:"
+        putDumpFileMaybe logger Opt_D_verbose_core2core "Levels added:"
                   FormatCore
                   (vcat (map ppr annotated_w_levels));
 
         let { (tlets, ntlets, lams) = get_stats (sum_stats fss) };
 
-        dumpIfSet_dyn dflags Opt_D_dump_simpl_stats "FloatOut stats:"
+        putDumpFileMaybe logger Opt_D_dump_simpl_stats "FloatOut stats:"
                 FormatText
                 (hcat [ int tlets,  text " Lets floated to top level; ",
                         int ntlets, text " Lets floated elsewhere; from ",
@@ -269,6 +269,8 @@ splitRecFloats fs
   = go [] [] (bagToList fs)
   where
     go ul_prs prs (FloatLet (NonRec b r) : fs) | isUnliftedType (idType b)
+                                               -- NB: isUnliftedType is OK here as binders always
+                                               -- have a fixed RuntimeRep.
                                                , not (isJoinId b)
                                                = go ((b,r):ul_prs) prs fs
                                                | otherwise
@@ -280,7 +282,7 @@ splitRecFloats fs
                                                    -- non-rec
 
 installUnderLambdas :: Bag FloatBind -> CoreExpr -> CoreExpr
--- Note [Floating out of Rec rhss]
+-- See Note [Floating out of Rec rhss]
 installUnderLambdas floats e
   | isEmptyBag floats = e
   | otherwise         = go e
@@ -374,7 +376,6 @@ floatBody lvl arg       -- Used rec rhss, and case-alternative rhss
 
 {- Note [Floating past breakpoints]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 We used to disallow floating out of breakpoint ticks (see #10052). However, I
 think this is too restrictive.
 
@@ -428,7 +429,7 @@ floatExpr (Tick tickish expr)
     in
     (fs, annotated_defns, Tick tickish expr') }
 
-  -- Note [Floating past breakpoints]
+  -- See Note [Floating past breakpoints]
   | Breakpoint{} <- tickish
   = case (floatExpr expr)    of { (fs, floating_defns, expr') ->
     (fs, floating_defns, Tick tickish expr') }
@@ -467,7 +468,7 @@ floatExpr (Let bind body)
 floatExpr (Case scrut (TB case_bndr case_spec) ty alts)
   = case case_spec of
       FloatMe dest_lvl  -- Case expression moves
-        | [(con@(DataAlt {}), bndrs, rhs)] <- alts
+        | [Alt con@(DataAlt {}) bndrs rhs] <- alts
         -> case atJoinCeiling $ floatExpr scrut of { (fse, fde, scrut') ->
            case                 floatExpr rhs   of { (fsb, fdb, rhs') ->
            let
@@ -484,9 +485,9 @@ floatExpr (Case scrut (TB case_bndr case_spec) ty alts)
            (add_stats fse fsa, fda `plusFloats` fde, Case scrut' case_bndr ty alts')
            }}
   where
-    float_alt bind_lvl (con, bs, rhs)
+    float_alt bind_lvl (Alt con bs rhs)
         = case (floatBody bind_lvl rhs) of { (fs, rhs_floats, rhs') ->
-          (fs, rhs_floats, (con, [b | TB b _ <- bs], rhs')) }
+          (fs, rhs_floats, Alt con [b | TB b _ <- bs] rhs') }
 
 floatRhs :: CoreBndr
          -> LevelledExpr
@@ -626,8 +627,8 @@ instance Outputable FloatBinds where
 
 flattenTopFloats :: FloatBinds -> Bag CoreBind
 flattenTopFloats (FB tops ceils defs)
-  = ASSERT2( isEmptyBag (flattenMajor defs), ppr defs )
-    ASSERT2( isEmptyBag ceils, ppr ceils )
+  = assertPpr (isEmptyBag (flattenMajor defs)) (ppr defs) $
+    assertPpr (isEmptyBag ceils) (ppr ceils)
     tops
 
 addTopFloatPairs :: Bag CoreBind -> [(Id,CoreExpr)] -> [(Id,CoreExpr)]
@@ -736,7 +737,7 @@ atJoinCeiling (fs, floats, expr')
   where
     (floats', ceils) = partitionAtJoinCeiling floats
 
-wrapTick :: Tickish Id -> FloatBinds -> FloatBinds
+wrapTick :: CoreTickish -> FloatBinds -> FloatBinds
 wrapTick t (FB tops ceils defns)
   = FB (mapBag wrap_bind tops) (wrap_defns ceils)
        (M.map (M.map wrap_defns) defns)

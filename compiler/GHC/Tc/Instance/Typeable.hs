@@ -3,31 +3,30 @@
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1999
 -}
 
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE RecordWildCards #-}
+
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TypeFamilies #-}
 
 module GHC.Tc.Instance.Typeable(mkTypeableBinds, tyConIsTypeable) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 import GHC.Platform
 
-import GHC.Types.Basic ( Boxity(..), neverInlinePragma, SourceText(..) )
+import GHC.Types.Basic ( Boxity(..), neverInlinePragma )
+import GHC.Types.SourceText ( SourceText(..) )
 import GHC.Iface.Env( newGlobalBinder )
 import GHC.Core.TyCo.Rep( Type(..), TyLit(..) )
 import GHC.Tc.Utils.Env
 import GHC.Tc.Types.Evidence ( mkWpTyApps )
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Utils.TcType
-import GHC.Driver.Types ( lookupId )
+import GHC.Types.TyThing ( lookupId )
 import GHC.Builtin.Names
 import GHC.Builtin.Types.Prim ( primTyCons )
 import GHC.Builtin.Types
                   ( tupleTyCon, sumTyCon, runtimeRepTyCon
-                  , vecCountTyCon, vecElemTyCon
+                  , levityTyCon, vecCountTyCon, vecElemTyCon
                   , nilDataCon, consDataCon )
 import GHC.Types.Name
 import GHC.Types.Id
@@ -39,16 +38,16 @@ import GHC.Hs
 import GHC.Driver.Session
 import GHC.Data.Bag
 import GHC.Types.Var ( VarBndr(..) )
-import GHC.Core.Map
+import GHC.Core.Map.Type
 import GHC.Settings.Constants
 import GHC.Utils.Fingerprint(Fingerprint(..), fingerprintString, fingerprintFingerprints)
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
 import GHC.Data.FastString ( FastString, mkFastString, fsLit )
 
-import Control.Monad.Trans.State
+import Control.Monad.Trans.State.Strict
 import Control.Monad.Trans.Class (lift)
 import Data.Maybe ( isJust )
-import Data.Word( Word64 )
 
 {- Note [Grand plan for Typeable]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -173,7 +172,7 @@ mkTypeableBinds
        } } }
   where
     needs_typeable_binds tc
-      | tc `elem` [runtimeRepTyCon, vecCountTyCon, vecElemTyCon]
+      | tc `elem` ghcTypesTypeableTyCons
       = False
       | otherwise =
           isAlgTyCon tc
@@ -334,7 +333,14 @@ mkPrimTypeableTodos
                      -- Build TypeRepTodos for types in GHC.Prim
                    ; todo2 <- todoForTyCons gHC_PRIM ghc_prim_module_id
                                             ghcPrimTypeableTyCons
-                   ; return ( gbl_env' , [todo1, todo2])
+                   ; tcg_env <- getGblEnv
+                   ; let mod_id = case tcg_tr_module tcg_env of  -- Should be set by now
+                                   Just mod_id -> mod_id
+                                   Nothing     -> pprPanic "tcMkTypeableBinds" empty
+
+                   ; todo3 <- todoForTyCons gHC_TYPES mod_id ghcTypesTypeableTyCons
+
+                   ; return ( gbl_env' , [todo1, todo2, todo3])
                    }
            else do gbl_env <- getGblEnv
                    return (gbl_env, [])
@@ -349,11 +355,17 @@ mkPrimTypeableTodos
 -- Note [Built-in syntax and the OrigNameCache] in "GHC.Iface.Env" for more.
 ghcPrimTypeableTyCons :: [TyCon]
 ghcPrimTypeableTyCons = concat
-    [ [ runtimeRepTyCon, vecCountTyCon, vecElemTyCon, funTyCon ]
-    , map (tupleTyCon Unboxed) [0..mAX_TUPLE_SIZE]
+    [ map (tupleTyCon Unboxed) [0..mAX_TUPLE_SIZE]
     , map sumTyCon [2..mAX_SUM_SIZE]
     , primTyCons
     ]
+
+-- | These are types which are defined in GHC.Types but are needed in order to
+-- typecheck the other generated bindings, therefore to avoid ordering issues we
+-- generate them up-front along with the bindings from GHC.Prim.
+ghcTypesTypeableTyCons :: [TyCon]
+ghcTypesTypeableTyCons = [ runtimeRepTyCon, levityTyCon
+                         , vecCountTyCon, vecElemTyCon ]
 
 data TypeableStuff
     = Stuff { platform       :: Platform        -- ^ Target platform
@@ -369,6 +381,7 @@ data TypeableStuff
             , kindRepTYPEDataCon     :: DataCon
             , kindRepTypeLitSDataCon :: DataCon
             , typeLitSymbolDataCon   :: DataCon
+            , typeLitCharDataCon     :: DataCon
             , typeLitNatDataCon      :: DataCon
             }
 
@@ -386,6 +399,7 @@ collect_stuff = do
     kindRepTypeLitSDataCon <- tcLookupDataCon kindRepTypeLitSDataConName
     typeLitSymbolDataCon   <- tcLookupDataCon typeLitSymbolDataConName
     typeLitNatDataCon      <- tcLookupDataCon typeLitNatDataConName
+    typeLitCharDataCon     <- tcLookupDataCon typeLitCharDataConName
     trNameLit              <- mkTrNameLit
     return Stuff {..}
 
@@ -405,7 +419,7 @@ mkTyConRepBinds :: TypeableStuff -> TypeRepTodo
                 -> TypeableTyCon -> KindRepM (LHsBinds GhcTc)
 mkTyConRepBinds stuff todo (TypeableTyCon {..})
   = do -- Make a KindRep
-       let (bndrs, kind) = splitForAllVarBndrs (tyConKind tycon)
+       let (bndrs, kind) = splitForAllTyCoVarBinders (tyConKind tycon)
        liftTc $ traceTc "mkTyConKindRepBinds"
                         (ppr tycon $$ ppr (tyConKind tycon) $$ ppr kind)
        let ctx = mkDeBruijnContext (map binderVar bndrs)
@@ -553,9 +567,9 @@ mkKindRepRhs :: TypeableStuff
              -> CmEnv       -- ^ in-scope kind variables
              -> Kind        -- ^ the kind we want a 'KindRep' for
              -> KindRepM (LHsExpr GhcTc) -- ^ RHS expression
-mkKindRepRhs stuff@(Stuff {..}) in_scope = new_kind_rep
+mkKindRepRhs stuff@(Stuff {..}) in_scope = new_kind_rep_shortcut
   where
-    new_kind_rep k
+    new_kind_rep_shortcut k
         -- We handle (TYPE LiftedRep) etc separately to make it
         -- clear to consumers (e.g. serializers) that there is
         -- a loop here (as TYPE :: RuntimeRep -> TYPE 'LiftedRep)
@@ -563,9 +577,20 @@ mkKindRepRhs stuff@(Stuff {..}) in_scope = new_kind_rep
               -- Typeable respects the Constraint/Type distinction
               -- so do not follow the special case here
       , Just arg <- kindRep_maybe k
-      , Just (tc, []) <- splitTyConApp_maybe arg
-      , Just dc <- isPromotedDataCon_maybe tc
-      = return $ nlHsDataCon kindRepTYPEDataCon `nlHsApp` nlHsDataCon dc
+      = case splitTyConApp_maybe arg of
+          Just (tc, [])
+            | Just dc <- isPromotedDataCon_maybe tc
+              -> return $ nlHsDataCon kindRepTYPEDataCon `nlHsApp` nlHsDataCon dc
+
+          Just (rep, [levArg])
+            | Just dcRep <- isPromotedDataCon_maybe rep
+            , Just (lev, []) <- splitTyConApp_maybe levArg
+            , Just dcLev <- isPromotedDataCon_maybe lev
+              -> return $ nlHsDataCon kindRepTYPEDataCon `nlHsApp` (nlHsDataCon dcRep `nlHsApp` nlHsDataCon dcLev)
+
+          _   -> new_kind_rep k
+      | otherwise = new_kind_rep k
+
 
     new_kind_rep (TyVarTy v)
       | Just idx <- lookupCME in_scope v
@@ -609,6 +634,11 @@ mkKindRepRhs stuff@(Stuff {..}) in_scope = new_kind_rep
                  `nlHsApp` nlHsDataCon typeLitSymbolDataCon
                  `nlHsApp` nlHsLit (mkHsStringPrimLit $ mkFastString $ show s)
 
+    new_kind_rep (LitTy (CharTyLit c))
+      = return $ nlHsDataCon kindRepTypeLitSDataCon
+                 `nlHsApp` nlHsDataCon typeLitCharDataCon
+                 `nlHsApp` nlHsLit (mkHsCharPrimLit c)
+
     -- See Note [Typeable instances for casted types]
     new_kind_rep (CastTy ty co)
       = pprPanic "mkTyConKindRepBinds.go(cast)" (ppr ty $$ ppr co)
@@ -623,11 +653,11 @@ mkTyConRepTyConRHS :: TypeableStuff -> TypeRepTodo
                    -> LHsExpr GhcTc
 mkTyConRepTyConRHS (Stuff {..}) todo tycon kind_rep
   =           nlHsDataCon trTyConDataCon
-    `nlHsApp` nlHsLit (word64 platform high)
-    `nlHsApp` nlHsLit (word64 platform low)
+    `nlHsApp` nlHsLit (HsWord64Prim NoSourceText (toInteger high))
+    `nlHsApp` nlHsLit (HsWord64Prim NoSourceText (toInteger low))
     `nlHsApp` mod_rep_expr todo
     `nlHsApp` trNameLit (mkFastString tycon_str)
-    `nlHsApp` nlHsLit (int n_kind_vars)
+    `nlHsApp` nlHsLit (HsIntPrim NoSourceText (toInteger n_kind_vars))
     `nlHsApp` kind_rep
   where
     n_kind_vars = length $ filter isNamedTyConBinder (tyConBinders tycon)
@@ -641,14 +671,6 @@ mkTyConRepTyConRHS (Stuff {..}) todo tycon kind_rep
                                                    , mod_fingerprint todo
                                                    , fingerprintString tycon_str
                                                    ]
-
-    int :: Int -> HsLit GhcTc
-    int n = HsIntPrim (SourceText $ show n) (toInteger n)
-
-word64 :: Platform -> Word64 -> HsLit GhcTc
-word64 platform n = case platformWordSize platform of
-   PW4 -> HsWord64Prim NoSourceText (toInteger n)
-   PW8 -> HsWordPrim   NoSourceText (toInteger n)
 
 {-
 Note [Representing TyCon kinds: KindRep]

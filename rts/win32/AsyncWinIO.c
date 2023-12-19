@@ -9,7 +9,8 @@
  */
 
 #include "Rts.h"
-#include <rts/IOManager.h>
+#include <rts/IOInterface.h>
+#include "ThrIOManager.h"
 #include "AsyncWinIO.h"
 #include "Prelude.h"
 #include "Capability.h"
@@ -23,6 +24,7 @@
 #include <stdio.h>
 
 /* Note [Non-Threaded WINIO design]
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
    Compared to Async MIO, Async WINIO does all of the heavy processing at the
    Haskell side of things.  The same code as the threaded WINIO is re-used for
    the Non-threaded version.  Of course since we are in a non-threaded rts we
@@ -121,10 +123,8 @@
    See also Note [WINIO Manager design].
 
 
+  Note [Notifying the RTS/Haskell of completed events]
   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    Note [Notifying the RTS/Haskell of completed events]
-  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
   The C side runner can't directly create a haskell thread.
   With the current API of the haskell runtime this would be terrible
   unsound. In particular the GC assumes no heap objects are generated,
@@ -136,19 +136,17 @@
   ensures there is only one OS thread at a time making use of the haskell
   heap.
 
+  Note [Non-Threaded IO Manager startup sequence]
   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    Note [Non-Threaded IO Manager startup sequence]
-  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
   Under the new IO Manager we run a bit of initialization under
   hs_init(). The first call into actual IO manager code is a
   invocation of startupAsyncWinIO();
 
   There we initialize IO manager locale variables and.
   * call ioManagerStart()
-  * Creat a thread to execute "runner"
+  * Create a thread to execute "runner"
 
-  We never truely shut down the IO Manager. While this means we
+  We never truly shut down the IO Manager. While this means we
   might block forever on the IOPort if the IO Manager is no longer
   needed we consider this cheap compared to the complexity of
   properly handling pausing and resuming of the manager.
@@ -273,6 +271,7 @@ void shutdownAsyncWinIO(bool wait_threads)
           WaitForSingleObject (workerThread, INFINITE);
         }
       completionPortHandle = INVALID_HANDLE_VALUE;
+      CloseHandle (workerThread);
       workerThread = NULL;
       workerThreadId = 0;
       free (entries);
@@ -283,7 +282,7 @@ void shutdownAsyncWinIO(bool wait_threads)
   ioManagerDie ();
 }
 
-/* Register the I/O completetion port handle PORT that the I/O manager will be
+/* Register the I/O completion port handle PORT that the I/O manager will be
    monitoring.  All handles are expected to be associated with this handle.  */
 void registerIOCPHandle (HANDLE port)
 {
@@ -364,7 +363,7 @@ void registerAlertableWait (bool has_timeout, DWORD mssec)
   ReleaseSRWLockExclusive (&wio_runner_lock);
 
   /* Since we call registerAlertableWait only after
-     processing I/O requests it's always desireable to wake
+     processing I/O requests it's always desirable to wake
      up the runner here.  */
   WakeConditionVariable (&wakeEvent);
 
@@ -436,7 +435,7 @@ static void notifyScheduler(uint32_t num) {
     processRemoteCompletion queued.
     IO runner thread blocked until processRemoteCompletion has run.
     */
-bool queueIOThread()
+bool queueIOThread(void)
 {
   bool result = false;
 #if !defined(THREADED_RTS)

@@ -4,6 +4,7 @@
  * (c) sof, 2002-2003.
  */
 #include "Rts.h"
+#include "RtsUtils.h"
 #include "WorkQueue.h"
 #include <stdbool.h>
 #include <stdio.h>
@@ -39,14 +40,9 @@ newSemaphore(int initCount, int max)
  *
  */
 WorkQueue*
-NewWorkQueue()
+NewWorkQueue(void)
 {
-  WorkQueue* wq = (WorkQueue*)malloc(sizeof(WorkQueue));
-
-  if (!wq) {
-    queue_error("NewWorkQueue", "malloc() failed");
-    return wq;
-  }
+  WorkQueue* wq = (WorkQueue*)stgMallocBytes(sizeof(WorkQueue), "NewWorkQueue");
 
   memset(wq, 0, sizeof *wq);
 
@@ -72,7 +68,7 @@ FreeWorkQueue ( WorkQueue* pq )
   /* Free any remaining work items. */
   for (i = 0; i < WORKQUEUE_SIZE; i++) {
     if (pq->items[i] != NULL) {
-      free(pq->items[i]);
+      stgFree(pq->items[i]);
     }
   }
 
@@ -86,7 +82,7 @@ FreeWorkQueue ( WorkQueue* pq )
     CloseHandle(pq->roomAvailable);
   }
   OS_CLOSE_LOCK(&pq->queueLock);
-  free(pq);
+  stgFree(pq);
   return;
 }
 

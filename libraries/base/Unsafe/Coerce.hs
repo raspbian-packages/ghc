@@ -3,9 +3,14 @@
 -- Note [Implementing unsafeCoerce]
 {-# OPTIONS_GHC -fno-strictness #-}
 
-{-# LANGUAGE Unsafe, NoImplicitPrelude, MagicHash, GADTs, TypeApplications,
-             ScopedTypeVariables, TypeOperators, KindSignatures, PolyKinds,
-             StandaloneKindSignatures, DataKinds #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE NoImplicitPrelude #-}
+{-# LANGUAGE PolyKinds #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE Unsafe #-}
 
 module Unsafe.Coerce
   ( unsafeCoerce, unsafeCoerceUnlifted, unsafeCoerceAddr
@@ -16,9 +21,6 @@ module Unsafe.Coerce
 
 import GHC.Arr (amap) -- For amap/unsafeCoerce rule
 import GHC.Base
-import GHC.Num.Integer () -- See Note [Depend on GHC.Num.Integer] in GHC.Base
-
-import GHC.Types
 
 {- Note [Implementing unsafeCoerce]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -162,14 +164,20 @@ several ways
 
 (U7) We add a built-in RULE
        unsafeEqualityProof k t t  ==>  UnsafeRefl (Refl t)
-     to simplify the ase when the two tpyes are equal.
+     to simplify the case when the two types are equal.
 
 (U8) The is a super-magic RULE in GHC.base
          map coerce = coerce
-     (see Note [Getting the map/coerce RULE to work] in CoreOpt)
+     (see Note [Getting the map/coerce RULE to work] in GHC.Core.SimpleOpt)
      But it's all about turning coerce into a cast, and unsafeCoerce
      no longer does that.  So we need a separate map/unsafeCoerce
      RULE, in this module.
+
+     Adding these RULES means we must delay inlinine unsafeCoerce
+     until the RULES have had a chance to fire; hence the INLINE[1]
+     pragma on unsafeCoerce.  (Side note: this has the coincidental
+     benefit of making the unsafeCoerce-based version of the `reflection`
+     library work -- see #21575.)
 
 There are yet more wrinkles
 
@@ -185,7 +193,7 @@ There are yet more wrinkles
 
      and similarly for unsafeCoerceAddr, unsafeCoerceInt, etc.
 
-(U10) We also want a levity-polymorphic unsafeCoerce#:
+(U10) We also want a representation-polymorphic unsafeCoerce#:
 
        unsafeCoerce# :: forall (r1 :: RuntimeRep) (r2 :: RuntimeRep)
                         (a :: TYPE r1) (b :: TYPE r2).
@@ -232,6 +240,9 @@ unsafeEqualityProof = case unsafeEqualityProof @a @b of UnsafeRefl -> UnsafeRefl
 --   case unsafeEqualityProof of UnsafeRefl -> case blah of ...
 --
 -- which is definitely better.
+--
+-- Why delay inlining to Phase 1?  Because of the RULES for map/unsafeCoerce;
+-- see (U8) in Note [Implementing unsafeCoerce]
 
 -- | Coerce a value from one type to another, bypassing the type-checker.
 --
@@ -263,15 +274,19 @@ unsafeEqualityProof = case unsafeEqualityProof @a @b of UnsafeRefl -> UnsafeRefl
 --      (which have different kinds!) because it's really just a newtype.
 --      Note: there is /no guarantee, at all/ that this behavior will be supported
 --      into perpetuity.
+--
+--
+--   For safe zero-cost coercions you can instead use the 'Data.Coerce.coerce' function from
+--   "Data.Coerce".
 unsafeCoerce :: forall (a :: Type) (b :: Type) . a -> b
 unsafeCoerce x = case unsafeEqualityProof @a @b of UnsafeRefl -> x
 
-unsafeCoerceUnlifted :: forall (a :: TYPE 'UnliftedRep) (b :: TYPE 'UnliftedRep) . a -> b
--- Kind-homogeneous, but levity monomorphic (TYPE UnliftedRep)
+unsafeCoerceUnlifted :: forall (a :: TYPE ('BoxedRep 'Unlifted)) (b :: TYPE ('BoxedRep 'Unlifted)) . a -> b
+-- Kind-homogeneous, but representation-monomorphic (TYPE UnliftedRep)
 unsafeCoerceUnlifted x = case unsafeEqualityProof @a @b of UnsafeRefl -> x
 
 unsafeCoerceAddr :: forall (a :: TYPE 'AddrRep) (b :: TYPE 'AddrRep) . a -> b
--- Kind-homogeneous, but levity monomorphic (TYPE AddrRep)
+-- Kind-homogeneous, but representation-monomorphic (TYPE AddrRep)
 unsafeCoerceAddr x = case unsafeEqualityProof @a @b of UnsafeRefl -> x
 
 -- | Highly, terribly dangerous coercion from one representation type
@@ -282,7 +297,7 @@ unsafeCoerce# :: forall (r1 :: RuntimeRep) (r2 :: RuntimeRep)
                         (a :: TYPE r1) (b :: TYPE r2).
                  a -> b
 unsafeCoerce# = error "GHC internal error: unsafeCoerce# not unfolded"
--- See (U10) of Note [Implementing unsafeCorece]
+-- See (U10) of Note [Implementing unsafeCoerce]
 -- The RHS is updated by Desugar.patchMagicDefns
 -- See Desugar Note [Wiring in unsafeCoerce#]
 

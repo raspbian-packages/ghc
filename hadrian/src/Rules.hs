@@ -12,8 +12,8 @@ import qualified Oracles.Flavour
 import qualified Oracles.ModuleFiles
 import Packages
 import qualified Rules.BinaryDist
+import qualified Rules.CabalReinstall
 import qualified Rules.Compile
-import qualified Rules.Configure
 import qualified Rules.Dependencies
 import qualified Rules.Documentation
 import qualified Rules.Generate
@@ -30,34 +30,30 @@ import Settings.Program (programContext)
 import Target
 import UserSettings
 
-
-allStages :: [Stage]
-allStages = [minBound .. maxBound]
-
 -- | This rule calls 'need' on all top-level build targets that Hadrian builds
 -- by default, respecting the 'finalStage' flag.
 topLevelTargets :: Rules ()
 topLevelTargets = action $ do
     verbosity <- getVerbosity
-    forM_ [ Stage1 ..] $ \stage -> do
-      when (verbosity >= Loud) $ do
+    forM_ [ Stage1, Stage2, Stage3] $ \stage -> do
+      when (verbosity >= Verbose) $ do
         (libraries, programs) <- partition isLibrary <$> stagePackages stage
         libNames <- mapM (name stage) libraries
         pgmNames <- mapM (name stage) programs
         let stageHeader t ps =
               "| Building " ++ show stage ++ " "
                             ++ t ++ ": " ++ intercalate ", " ps
-        putNormal . unlines $
+        putInfo . unlines $
             [ stageHeader "libraries" libNames
             , stageHeader "programs" pgmNames ]
-    let buildStages = [ s | s <- [Stage0 ..], s < finalStage ]
+    let buildStages = [ s | s <- allStages, s < finalStage ]
     targets <- concatForM buildStages $ \stage -> do
         packages <- stagePackages stage
         mapM (path stage) packages
 
     -- Why we need wrappers: https://gitlab.haskell.org/ghc/ghc/issues/16534.
     root <- buildRoot
-    let wrappers = [ root -/- ("ghc-" ++ stageString s) | s <- [Stage1 ..]
+    let wrappers = [ root -/- ("ghc-" ++ stageString s) | s <- [Stage1, Stage2, Stage3]
                                                         , s < finalStage ]
     need (targets ++ wrappers)
   where
@@ -106,8 +102,8 @@ packageRules = do
     -- classic concurrent read exclusive write (CREW) conflict.
     let maxConcurrentReaders = 1000
     packageDb <- newResource "package-db" maxConcurrentReaders
-    let readPackageDb  = [(packageDb, 1)]
-        writePackageDb = [(packageDb, maxConcurrentReaders)]
+    let readPackageDb  = [(packageDb, 1)]                    -- this is correct: take 1 slot to read
+        writePackageDb = [(packageDb, maxConcurrentReaders)] -- and all the slots to write
 
     Rules.Compile.compilePackage readPackageDb
     Rules.Dependencies.buildPackageDependencies readPackageDb
@@ -115,7 +111,7 @@ packageRules = do
     Rules.Program.buildProgramRules readPackageDb
     Rules.Register.configurePackageRules
 
-    forM_ [Stage0 ..] (Rules.Register.registerPackageRules writePackageDb)
+    forM_ allStages (Rules.Register.registerPackageRules writePackageDb)
 
     -- TODO: Can we get rid of this enumeration of contexts? Since we iterate
     --       over it to generate all 4 types of rules below, all the time, we
@@ -130,7 +126,6 @@ packageRules = do
 buildRules :: Rules ()
 buildRules = do
     Rules.BinaryDist.bindistRules
-    Rules.Configure.configureRules
     Rules.Generate.copyRules
     Rules.Generate.generateRules
     Rules.Gmp.gmpRules
@@ -138,6 +133,7 @@ buildRules = do
     Rules.Library.libraryRules
     Rules.Rts.rtsRules
     packageRules
+    Rules.CabalReinstall.cabalBuildRules
 
 oracleRules :: Rules ()
 oracleRules = do

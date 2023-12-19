@@ -1,12 +1,11 @@
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE TypeFamilies #-}
+
 -- |
 -- Statistics for per-module compilations
 --
 -- (c) The GRASP/AQUA Project, Glasgow University, 1993-1998
 --
-
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE ViewPatterns #-}
 
 module GHC.Hs.Stats ( ppSourceStats ) where
 
@@ -14,9 +13,11 @@ import GHC.Prelude
 
 import GHC.Data.Bag
 import GHC.Hs
-import GHC.Utils.Outputable
 import GHC.Types.SrcLoc
+
+import GHC.Utils.Outputable
 import GHC.Utils.Misc
+import GHC.Utils.Panic
 
 import Data.Char
 
@@ -136,7 +137,7 @@ ppSourceStats short (L _ (HsModule{ hsmodExports = exports, hsmodImports = impor
 
     data_info (DataDecl { tcdDataDefn = HsDataDefn
                                           { dd_cons = cs
-                                          , dd_derivs = L _ derivs}})
+                                          , dd_derivs = derivs}})
         = ( length cs
           , foldl' (\s dc -> length (deriv_clause_tys $ unLoc dc) + s)
                    0 derivs )

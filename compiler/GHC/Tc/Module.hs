@@ -1,21 +1,20 @@
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE NondecreasingIndentation #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE TupleSections #-}
+
+{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
+
 {-
 (c) The University of Glasgow 2006
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
 
 -}
-
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE NondecreasingIndentation #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE ViewPatterns #-}
-{-# LANGUAGE MultiWayIf #-}
-
-{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 
 -- | Typechecking a whole module
 --
@@ -28,6 +27,8 @@ module GHC.Tc.Module (
         tcRnDeclsi,
         isGHCiMonad,
         runTcInteractive,    -- Used by GHC API clients (#8878)
+        withTcPlugins,       -- Used by GHC API clients (#20499)
+        withHoleFitPlugins,  -- Used by GHC API clients (#20499)
         tcRnLookupName,
         tcRnGetInfo,
         tcRnModule, tcRnModuleTcRnM,
@@ -51,104 +52,136 @@ module GHC.Tc.Module (
 
 import GHC.Prelude
 
+import GHC.Driver.Env
+import GHC.Driver.Plugins
+import GHC.Driver.Session
+import GHC.Driver.Config.Diagnostic
+
+import GHC.Tc.Errors.Hole.FitTypes ( HoleFitPluginR (..) )
+import GHC.Tc.Errors.Types
 import {-# SOURCE #-} GHC.Tc.Gen.Splice ( finishTH, runRemoteModFinalizers )
-import GHC.Rename.Splice ( rnTopSpliceDecls, traceSplice, SpliceInfo(..) )
-import GHC.Iface.Env     ( externaliseName )
 import GHC.Tc.Gen.HsType
 import GHC.Tc.Validity( checkValidType )
 import GHC.Tc.Gen.Match
 import GHC.Tc.Utils.Unify( checkConstraints, tcSubTypeSigma )
-import GHC.Rename.HsType
-import GHC.Rename.Expr
-import GHC.Rename.Utils  ( HsDocContext(..) )
-import GHC.Rename.Fixity ( lookupFixityRn )
-import GHC.Builtin.Types ( unitTy, mkListTy )
-import GHC.Driver.Plugins
-import GHC.Driver.Session
-import GHC.Hs
-import GHC.Iface.Syntax   ( ShowSub(..), showToHeader )
-import GHC.Iface.Type     ( ShowForAllFlag(..) )
-import GHC.Core.PatSyn    ( pprPatSynType )
-import GHC.Core.Predicate ( classMethodTy )
-import GHC.Builtin.Names
-import GHC.Builtin.Utils
-import GHC.Types.Name.Reader
 import GHC.Tc.Utils.Zonk
 import GHC.Tc.Gen.Expr
+import GHC.Tc.Gen.App( tcInferSigma )
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Gen.Export
 import GHC.Tc.Types.Evidence
 import GHC.Tc.Types.Constraint
 import GHC.Tc.Types.Origin
-import qualified GHC.Data.BooleanFormula as BF
-import GHC.Core.Ppr.TyThing ( pprTyThingInContext )
-import GHC.Core.FVs         ( orphNamesOfFamInst )
 import GHC.Tc.Instance.Family
-import GHC.Core.InstEnv
-import GHC.Core.FamInstEnv
-   ( FamInst, pprFamInst, famInstsRepTyCons
-   , famInstEnvElts, extendFamInstEnvList, normaliseType )
 import GHC.Tc.Gen.Annotation
 import GHC.Tc.Gen.Bind
-import GHC.Iface.Make   ( coAxiomToIfaceDecl )
-import GHC.Parser.Header       ( mkPrelImports )
 import GHC.Tc.Gen.Default
 import GHC.Tc.Utils.Env
 import GHC.Tc.Gen.Rule
 import GHC.Tc.Gen.Foreign
 import GHC.Tc.TyCl.Instance
-import GHC.IfaceToCore
 import GHC.Tc.Utils.TcMType
 import GHC.Tc.Utils.TcType
+import GHC.Tc.Utils.Instantiate (tcGetInsts)
 import GHC.Tc.Solver
 import GHC.Tc.TyCl
 import GHC.Tc.Instance.Typeable ( mkTypeableBinds )
 import GHC.Tc.Utils.Backpack
-import GHC.Iface.Load
+
+import GHC.Rename.Splice ( rnTopSpliceDecls, traceSplice, SpliceInfo(..) )
+import GHC.Rename.HsType
+import GHC.Rename.Expr
+import GHC.Rename.Fixity ( lookupFixityRn )
 import GHC.Rename.Names
 import GHC.Rename.Env
 import GHC.Rename.Module
+import GHC.Rename.Doc
+
+import GHC.Iface.Syntax   ( ShowSub(..), showToHeader )
+import GHC.Iface.Type     ( ShowForAllFlag(..) )
+import GHC.Iface.Env     ( externaliseName )
+import GHC.Iface.Make   ( coAxiomToIfaceDecl )
+import GHC.Iface.Load
+
+import GHC.Builtin.Types ( unitTy, mkListTy )
+import GHC.Builtin.Names
+import GHC.Builtin.Utils
+
+import GHC.Hs
+import GHC.Hs.Dump
+
+import GHC.Core.PatSyn    ( pprPatSynType )
+import GHC.Core.Predicate ( classMethodTy )
+import GHC.Core.FVs         ( orphNamesOfFamInst )
+import GHC.Core.InstEnv
+import GHC.Core.TyCon
+import GHC.Core.ConLike
+import GHC.Core.DataCon
+import GHC.Core.Type
+import GHC.Core.Class
+import GHC.Core.Coercion.Axiom
+import GHC.Core.Reduction ( Reduction(..) )
+import GHC.Core.Unify( RoughMatchTc(..) )
+import GHC.Core.FamInstEnv
+   ( FamInst, pprFamInst, famInstsRepTyCons
+   , famInstEnvElts, extendFamInstEnvList, normaliseType )
+
+import GHC.Parser.Header       ( mkPrelImports )
+
+import GHC.IfaceToCore
+
+import GHC.Runtime.Context
+
 import GHC.Utils.Error
+import GHC.Utils.Outputable as Outputable
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
+import GHC.Utils.Misc
+import GHC.Utils.Logger
+
+import GHC.Types.Error
+import GHC.Types.Name.Reader
+import GHC.Types.Fixity.Env
 import GHC.Types.Id as Id
 import GHC.Types.Id.Info( IdDetails(..) )
 import GHC.Types.Var.Env
-import GHC.Unit.Module
+import GHC.Types.TypeEnv
 import GHC.Types.Unique.FM
 import GHC.Types.Name
 import GHC.Types.Name.Env
 import GHC.Types.Name.Set
 import GHC.Types.Avail
-import GHC.Core.TyCon
-import GHC.Types.SrcLoc
-import GHC.Driver.Types
-import GHC.Data.List.SetOps
-import GHC.Utils.Outputable as Outputable
-import GHC.Core.ConLike
-import GHC.Core.DataCon
-import GHC.Core.Type
-import GHC.Core.Class
 import GHC.Types.Basic hiding( SuccessFlag(..) )
-import GHC.Core.Coercion.Axiom
 import GHC.Types.Annotations
-import Data.List ( sortBy, sort )
-import Data.Ord
+import GHC.Types.SrcLoc
+import GHC.Types.SourceFile
+import GHC.Types.TyThing.Ppr ( pprTyThingInContext )
+import GHC.Types.PkgQual
+import qualified GHC.LanguageExtensions as LangExt
+
+import GHC.Unit.External
+import GHC.Unit.Types
+import GHC.Unit.State
+import GHC.Unit.Home
+import GHC.Unit.Module
+import GHC.Unit.Module.Warnings
+import GHC.Unit.Module.ModSummary
+import GHC.Unit.Module.ModIface
+import GHC.Unit.Module.ModDetails
+import GHC.Unit.Module.Deps
+
 import GHC.Data.FastString
 import GHC.Data.Maybe
-import GHC.Utils.Misc
+import GHC.Data.List.SetOps
 import GHC.Data.Bag
-import GHC.Tc.Utils.Instantiate (tcGetInsts)
-import qualified GHC.LanguageExtensions as LangExt
-import Data.Data ( Data )
-import GHC.Hs.Dump
-import qualified Data.Set as S
+import qualified GHC.Data.BooleanFormula as BF
 
+import Data.List ( sortBy, sort )
+import Data.Ord
+import Data.Data ( Data )
+import qualified Data.Set as S
 import Control.DeepSeq
 import Control.Monad
-
-import GHC.Tc.Errors.Hole.FitTypes ( HoleFitPluginR (..) )
-
-
-#include "HsVersions.h"
 
 {-
 ************************************************************************
@@ -163,37 +196,38 @@ tcRnModule :: HscEnv
            -> ModSummary
            -> Bool              -- True <=> save renamed syntax
            -> HsParsedModule
-           -> IO (Messages, Maybe TcGblEnv)
+           -> IO (Messages TcRnMessage, Maybe TcGblEnv)
 
 tcRnModule hsc_env mod_sum save_rn_syntax
    parsedModule@HsParsedModule {hpm_module= L loc this_module}
  | RealSrcSpan real_loc _ <- loc
- = withTiming dflags
+ = withTiming logger
               (text "Renamer/typechecker"<+>brackets (ppr this_mod))
               (const ()) $
    initTc hsc_env hsc_src save_rn_syntax this_mod real_loc $
-          withTcPlugins hsc_env $ withHoleFitPlugins hsc_env $
+          withTcPlugins hsc_env $
+          withDefaultingPlugins hsc_env $
+          withHoleFitPlugins hsc_env $
 
           tcRnModuleTcRnM hsc_env mod_sum parsedModule pair
 
   | otherwise
-  = return ((emptyBag, unitBag err_msg), Nothing)
+  = return (err_msg `addMessage` emptyMessages, Nothing)
 
   where
     hsc_src = ms_hsc_src mod_sum
-    dflags = hsc_dflags hsc_env
-    err_msg = mkPlainErrMsg (hsc_dflags hsc_env) loc $
-              text "Module does not have a RealSrcSpan:" <+> ppr this_mod
-
-    this_pkg = homeUnit (hsc_dflags hsc_env)
+    logger  = hsc_logger hsc_env
+    home_unit = hsc_home_unit hsc_env
+    err_msg = mkPlainErrorMsgEnvelope loc $
+              TcRnModMissingRealSrcSpan this_mod
 
     pair :: (Module, SrcSpan)
     pair@(this_mod,_)
       | Just (L mod_loc mod) <- hsmodName this_module
-      = (mkModule this_pkg mod, mod_loc)
+      = (mkHomeModule home_unit mod, locA mod_loc)
 
       | otherwise   -- 'module M where' is omitted
-      = (mAIN, srcLocSpan (srcSpanStart loc))
+      = (mkHomeModule home_unit mAIN_NAME, srcLocSpan (srcSpanStart loc))
 
 
 
@@ -208,7 +242,7 @@ tcRnModuleTcRnM :: HscEnv
 tcRnModuleTcRnM hsc_env mod_sum
                 (HsParsedModule {
                    hpm_module =
-                      (L loc (HsModule _ maybe_mod export_ies
+                      (L loc (HsModule _ _ maybe_mod export_ies
                                        import_decls local_decls mod_deprec
                                        maybe_doc_hdr)),
                    hpm_src_files = src_files
@@ -230,13 +264,15 @@ tcRnModuleTcRnM hsc_env mod_sum
         ; let { prel_imports = mkPrelImports (moduleName this_mod) prel_imp_loc
                                implicit_prelude import_decls }
 
-        ; whenWOptM Opt_WarnImplicitPrelude $
-             when (notNull prel_imports) $
-                addWarn (Reason Opt_WarnImplicitPrelude) (implicitPreludeWarn)
+        ; when (notNull prel_imports) $ do
+            let msg = TcRnUnknownMessage $
+                        mkPlainDiagnostic (WarningWithFlag Opt_WarnImplicitPrelude) noHints (implicitPreludeWarn)
+            addDiagnostic msg
 
         ; -- TODO This is a little skeevy; maybe handle a bit more directly
           let { simplifyImport (L _ idecl) =
-                  ( fmap sl_fs (ideclPkgQual idecl) , ideclName idecl)
+                  ( renameRawPkgQual (hsc_unit_env hsc_env) (unLoc $ ideclName idecl) (ideclPkgQual idecl)
+                  , reLoc $ ideclName idecl)
               }
         ; raw_sig_imports <- liftIO
                              $ findExtraSigImports hsc_env hsc_src
@@ -245,24 +281,35 @@ tcRnModuleTcRnM hsc_env mod_sum
                              $ implicitRequirements hsc_env
                                 (map simplifyImport (prel_imports
                                                      ++ import_decls))
-        ; let { mkImport (Nothing, L _ mod_name) = noLoc
+        ; let { mkImport mod_name = noLocA
                 $ (simpleImportDecl mod_name)
-                  { ideclHiding = Just (False, noLoc [])}
-              ; mkImport _ = panic "mkImport" }
-        ; let { all_imports = prel_imports ++ import_decls
-                       ++ map mkImport (raw_sig_imports ++ raw_req_imports) }
+                  { ideclHiding = Just (False, noLocA [])}}
+        ; let { withReason t imps = map (,text t) imps }
+        ; let { all_imports = withReason "is implicitly imported" prel_imports
+                  ++ withReason "is directly imported" import_decls
+                  ++ withReason "is an extra sig import" (map mkImport raw_sig_imports)
+                  ++ withReason "is an implicit req import" (map mkImport raw_req_imports) }
         ; -- OK now finally rename the imports
           tcg_env <- {-# SCC "tcRnImports" #-}
                      tcRnImports hsc_env all_imports
 
+        -- Put a version of the header without identifier info into the tcg_env
+        -- Make sure to do this before 'tcRnSrcDecls', because we need the
+        -- module header when we're splicing TH, since it can be accessed via
+        -- 'getDoc'.
+        -- We will rename it properly after renaming everything else so that
+        -- haddock can link the identifiers
+        ; tcg_env <- return (tcg_env
+                              { tcg_doc_hdr = fmap (\(WithHsDocIdentifiers str _) -> WithHsDocIdentifiers str [])
+                                                                                 <$> maybe_doc_hdr })
         ; -- If the whole module is warned about or deprecated
           -- (via mod_deprec) record that in tcg_warns. If we do thereby add
           -- a WarnAll, it will override any subsequent deprecations added to tcg_warns
-          let { tcg_env1 = case mod_deprec of
-                             Just (L _ txt) ->
-                               tcg_env {tcg_warns = WarnAll txt}
-                             Nothing            -> tcg_env
-              }
+        ; tcg_env1 <- case mod_deprec of
+                             Just (L _ txt) -> do { txt' <- rnWarningTxt txt
+                                                  ; pure $ tcg_env {tcg_warns = WarnAll txt'}
+                                                  }
+                             Nothing            -> pure tcg_env
         ; setGblEnv tcg_env1
           $ do { -- Rename and type check the declarations
                  traceRn "rn1a" empty
@@ -279,11 +326,7 @@ tcRnModuleTcRnM hsc_env mod_sum
                                  tcRnSrcDecls explicit_mod_hdr export_ies local_decls
 
                ; whenM (goptM Opt_DoCoreLinting) $
-                 do { let (warns, errs) = lintGblEnv (hsc_dflags hsc_env) tcg_env
-                    ; mapBagM_ (addWarn NoReason) warns
-                    ; mapBagM_ addErr errs
-                    ; failIfErrsM }  -- if we have a lint error, we're only
-                                     -- going to get in deeper trouble by proceeding
+                 lintGblEnv (hsc_logger hsc_env) (hsc_dflags hsc_env) tcg_env
 
                ; setGblEnv tcg_env
                  $ do { -- Compare hi-boot iface (if any) with the real thing
@@ -296,21 +339,22 @@ tcRnModuleTcRnM hsc_env mod_sum
                         -- because the latter might add new bindings for
                         -- boot_dfuns, which may be mentioned in imported
                         -- unfoldings.
-
-                        -- Don't need to rename the Haddock documentation,
-                        -- it's not parsed by GHC anymore.
-                        tcg_env <- return (tcg_env
-                                           { tcg_doc_hdr = maybe_doc_hdr })
                       ; -- Report unused names
                         -- Do this /after/ typeinference, so that when reporting
                         -- a function with no type signature we can give the
                         -- inferred type
-                        reportUnusedNames tcg_env hsc_src
+                      ; reportUnusedNames tcg_env hsc_src
+
+                      -- Rename the module header properly after we have renamed everything else
+                      ; maybe_doc_hdr <- traverse rnLHsDoc maybe_doc_hdr;
+                      ; tcg_env <- return (tcg_env
+                                            { tcg_doc_hdr = maybe_doc_hdr })
+
                       ; -- add extra source files to tcg_dependent_files
                         addDependentFiles src_files
                         -- Ensure plugins run with the same tcg_env that we pass in
                       ; setGblEnv tcg_env
-                        $ do { tcg_env <- runTypecheckerPlugin mod_sum hsc_env tcg_env
+                        $ do { tcg_env <- runTypecheckerPlugin mod_sum tcg_env
                              ; -- Dump output and return
                                tcDump tcg_env
                              ; return tcg_env
@@ -332,32 +376,31 @@ implicitPreludeWarn
 ************************************************************************
 -}
 
-tcRnImports :: HscEnv -> [LImportDecl GhcPs] -> TcM TcGblEnv
+tcRnImports :: HscEnv -> [(LImportDecl GhcPs, SDoc)] -> TcM TcGblEnv
 tcRnImports hsc_env import_decls
   = do  { (rn_imports, rdr_env, imports, hpc_info) <- rnImports import_decls ;
 
         ; this_mod <- getModule
-        ; let { dep_mods :: ModuleNameEnv ModuleNameWithIsBoot
-              ; dep_mods = imp_dep_mods imports
-
-                -- We want instance declarations from all home-package
+        ; gbl_env <- getGblEnv
+        ; let { -- We want instance declarations from all home-package
                 -- modules below this one, including boot modules, except
                 -- ourselves.  The 'except ourselves' is so that we don't
                 -- get the instances from this module's hs-boot file.  This
                 -- filtering also ensures that we don't see instances from
                 -- modules batch (@--make@) compiled before this one, but
                 -- which are not below this one.
-              ; want_instances :: ModuleName -> Bool
-              ; want_instances mod = mod `elemUFM` dep_mods
-                                   && mod /= moduleName this_mod
-              ; (home_insts, home_fam_insts) = hptInstances hsc_env
-                                                            want_instances
+              ; (home_insts, home_fam_insts) =
+
+                    hptInstancesBelow hsc_env (homeUnitId $ hsc_home_unit hsc_env) (GWIB (moduleName this_mod)(hscSourceToIsBoot (tcg_src gbl_env)))
+
               } ;
 
                 -- Record boot-file info in the EPS, so that it's
                 -- visible to loadHiBootInterface in tcRnSrcDecls,
                 -- and any other incrementally-performed imports
-        ; updateEps_ (\eps -> eps { eps_is_boot = dep_mods }) ;
+              ; when (isOneShot (ghcMode (hsc_dflags hsc_env))) $ do {
+                  updateEps_ $ \eps  -> eps { eps_is_boot = imp_boot_mods imports }
+               }
 
                 -- Update the gbl env
         ; updGblEnv ( \ gbl ->
@@ -365,13 +408,13 @@ tcRnImports hsc_env import_decls
               tcg_rdr_env      = tcg_rdr_env gbl `plusGlobalRdrEnv` rdr_env,
               tcg_imports      = tcg_imports gbl `plusImportAvails` imports,
               tcg_rn_imports   = rn_imports,
-              tcg_inst_env     = extendInstEnvList (tcg_inst_env gbl) home_insts,
+              tcg_inst_env     = tcg_inst_env gbl `unionInstEnv` home_insts,
               tcg_fam_inst_env = extendFamInstEnvList (tcg_fam_inst_env gbl)
                                                       home_fam_insts,
               tcg_hpc          = hpc_info
             }) $ do {
 
-        ; traceRn "rn1" (ppr (imp_dep_mods imports))
+        ; traceRn "rn1" (ppr (imp_direct_dep_mods imports))
                 -- Fail if there are any errors so far
                 -- The error printing (if needed) takes advantage
                 -- of the tcg_env we have now set
@@ -410,7 +453,7 @@ tcRnImports hsc_env import_decls
 -}
 
 tcRnSrcDecls :: Bool  -- False => no 'module M(..) where' header at all
-             -> Maybe (Located [LIE GhcPs])
+             -> Maybe (LocatedL [LIE GhcPs])
              -> [LHsDecl GhcPs]               -- Declarations
              -> TcM TcGblEnv
 tcRnSrcDecls explicit_mod_hdr export_ies decls
@@ -428,7 +471,7 @@ tcRnSrcDecls explicit_mod_hdr export_ies decls
       --  * the local env exposes the local Ids to simplifyTop,
       --    so that we get better error messages (monomorphism restriction)
       ; new_ev_binds <- {-# SCC "simplifyTop" #-}
-                        setEnvs (tcg_env, tcl_env) $
+                        restoreEnvs (tcg_env, tcl_env) $
                         do { lie_main <- checkMainType tcg_env
                            ; simplifyTop (lie `andWC` lie_main) }
 
@@ -437,6 +480,9 @@ tcRnSrcDecls explicit_mod_hdr export_ies decls
                    mkTypeableBinds
 
       ; traceTc "Tc9" empty
+      ; failIfErrsM    -- Stop now if if there have been errors
+                       -- Continuing is a waste of time; and we may get debug
+                       -- warnings when zonking about strangely-typed TyCons!
 
         -- Zonk the final code.  This must be done last.
         -- Even simplifyTop may do some unification.
@@ -469,18 +515,22 @@ tcRnSrcDecls explicit_mod_hdr export_ies decls
       --------- Deal with the exports ----------
       -- Can't be done earlier, because the export list must "see"
       -- the declarations created by the finalizers
-      ; tcg_env <- setEnvs (tcg_env, tcl_env) $
+      ; tcg_env <- restoreEnvs (tcg_env, tcl_env) $
                    rnExports explicit_mod_hdr export_ies
 
       --------- Emit the ':Main.main = runMainIO main' declaration ----------
       -- Do this /after/ rnExports, so that it can consult
       -- the tcg_exports created by rnExports
       ; (tcg_env, main_ev_binds)
-           <- setEnvs (tcg_env, tcl_env) $
+           <- restoreEnvs (tcg_env, tcl_env) $
               do { (tcg_env, lie) <- captureTopConstraints $
                                      checkMain explicit_mod_hdr export_ies
                  ; ev_binds <- simplifyTop lie
                  ; return (tcg_env, ev_binds) }
+
+      ; failIfErrsM    -- Stop now if if there have been errors
+                       -- Continuing is a waste of time; and we may get debug
+                       -- warnings when zonking about strangely-typed TyCons!
 
       ---------- Final zonking ---------------
       -- Zonk the new bindings arising from running the finalisers,
@@ -516,10 +566,7 @@ zonkTcGblEnv ev_binds tcg_env@(TcGblEnv { tcg_binds     = binds
   = {-# SCC "zonkTopDecls" #-}
     setGblEnv tcg_env $ -- This sets the GlobalRdrEnv which is used when rendering
                         --   error messages during zonking (notably levity errors)
-    do { failIfErrsM    -- Don't zonk if there have been errors
-                        -- It's a waste of time; and we may get debug warnings
-                        -- about strangely-typed TyCons!
-       ; let all_ev_binds = cur_ev_binds `unionBags` ev_binds
+    do { let all_ev_binds = cur_ev_binds `unionBags` ev_binds
        ; zonkTopDecls all_ev_binds binds rules imp_specs fords }
 
 -- | Runs TH finalizers and renames and typechecks the top-level declarations
@@ -533,7 +580,7 @@ run_th_modfinalizers = do
   else do
     writeTcRef th_modfinalizers_var []
     let run_finalizer (lcl_env, f) =
-            setLclEnv lcl_env (runRemoteModFinalizers f)
+            restoreLclEnv lcl_env (runRemoteModFinalizers f)
 
     (_, lie_th) <- captureTopConstraints $
                    mapM_ run_finalizer th_modfinalizers
@@ -542,7 +589,7 @@ run_th_modfinalizers = do
       -- we have to run tc_rn_src_decls to get them
     (tcg_env, tcl_env, lie_top_decls) <- tc_rn_src_decls []
 
-    setEnvs (tcg_env, tcl_env) $ do
+    restoreEnvs (tcg_env, tcl_env) $ do
       -- Subsequent rounds of finalizers run after any new constraints are
       -- simplified, or some types might not be complete when using reify
       -- (see #12777).
@@ -580,8 +627,8 @@ tc_rn_src_decls ds
                     ; case th_group_tail of
                         { Nothing -> return ()
                         ; Just (SpliceDecl _ (L loc _) _, _) ->
-                            setSrcSpan loc
-                            $ addErr (text
+                            setSrcSpanA loc
+                            $ addErr (TcRnUnknownMessage $ mkPlainError noHints $ text
                                 ("Declaration splices are not "
                                   ++ "permitted inside top-level "
                                   ++ "declarations added with addTopDecls"))
@@ -609,7 +656,7 @@ tc_rn_src_decls ds
                                       tcTopSrcDecls rn_decls
 
         -- If there is no splice, we're nearly done
-      ; setEnvs (tcg_env, tcl_env) $
+      ; restoreEnvs (tcg_env, tcl_env) $
         case group_tail of
           { Nothing -> return (tcg_env, tcl_env, lie1)
 
@@ -671,7 +718,7 @@ tcRnHsBootDecls hsc_src decls
 
                 -- Typecheck type/class/instance decls
         ; traceTc "Tc2 (boot)" empty
-        ; (tcg_env, inst_infos, _deriv_binds)
+        ; (tcg_env, inst_infos, _deriv_binds, _th_bndrs)
              <- tcTyClsInstDecls tycl_decls deriv_decls val_binds
         ; setGblEnv tcg_env     $ do {
 
@@ -701,9 +748,10 @@ tcRnHsBootDecls hsc_src decls
    }}}
    ; traceTc "boot" (ppr lie); return gbl_env }
 
-badBootDecl :: HscSource -> String -> Located decl -> TcM ()
+badBootDecl :: HscSource -> String -> LocatedA decl -> TcM ()
 badBootDecl hsc_src what (L loc _)
-  = addErrAt loc (char 'A' <+> text what
+  = addErrAt (locA loc) $ TcRnUnknownMessage $ mkPlainError noHints $
+    (char 'A' <+> text what
       <+> text "declaration is not (currently) allowed in a"
       <+> (case hsc_src of
             HsBootFile -> text "hs-boot"
@@ -839,9 +887,6 @@ checkHiBootIface'
 
     check_export boot_avail     -- boot_avail is exported by the boot iface
       | name `elem` boot_dfun_names = return ()
-      | isWiredInName name          = return () -- No checking for wired-in names.  In particular,
-                                                -- 'error' is handled by a rather gross hack
-                                                -- (see comments in GHC.Err.hs-boot)
 
         -- Check that the actual module exports the same thing
       | not (null missing_names)
@@ -948,7 +993,7 @@ checkBootDeclM is_boot boot_thing real_thing
 checkBootDecl :: Bool -> TyThing -> TyThing -> Maybe SDoc
 
 checkBootDecl _ (AnId id1) (AnId id2)
-  = ASSERT(id1 == id2)
+  = assert (id1 == id2) $
     check (idType id1 `eqType` idType id2)
           (text "The two types are different")
 
@@ -1088,7 +1133,7 @@ checkBootTyCon is_boot tc1 tc2
   | Just syn_rhs1 <- synTyConRhs_maybe tc1
   , Just syn_rhs2 <- synTyConRhs_maybe tc2
   , Just env <- eqVarBndrs emptyRnEnv2 (tyConTyVars tc1) (tyConTyVars tc2)
-  = ASSERT(tc1 == tc2)
+  = assert (tc1 == tc2) $
     checkRoles roles1 roles2 `andThenCheck`
     check (eqTypeX env syn_rhs1 syn_rhs2) empty   -- nothing interesting to say
   -- This allows abstract 'data T a' to be implemented using 'type T = ...'
@@ -1118,7 +1163,7 @@ checkBootTyCon is_boot tc1 tc2
 
   | Just fam_flav1 <- famTyConFlav_maybe tc1
   , Just fam_flav2 <- famTyConFlav_maybe tc2
-  = ASSERT(tc1 == tc2)
+  = assert (tc1 == tc2) $
     let eqFamFlav OpenSynFamilyTyCon   OpenSynFamilyTyCon = True
         eqFamFlav (DataFamilyTyCon {}) (DataFamilyTyCon {}) = True
         -- This case only happens for hsig merging:
@@ -1144,7 +1189,7 @@ checkBootTyCon is_boot tc1 tc2
 
   | isAlgTyCon tc1 && isAlgTyCon tc2
   , Just env <- eqVarBndrs emptyRnEnv2 (tyConTyVars tc1) (tyConTyVars tc2)
-  = ASSERT(tc1 == tc2)
+  = assert (tc1 == tc2) $
     checkRoles roles1 roles2 `andThenCheck`
     check (eqListBy (eqTypeX env)
                      (tyConStupidTheta tc1) (tyConStupidTheta tc2))
@@ -1239,7 +1284,7 @@ checkBootTyCon is_boot tc1 tc2
     --
     -- See also 'HowAbstract' and Note [Skolem abstract data].
 
-    -- | Given @type T tvs = ty@, where @ty@ decomposes into @tc2' args@,
+    -- Given @type T tvs = ty@, where @ty@ decomposes into @tc2' args@,
     -- check that this synonym is an acceptable implementation of @tc1@.
     -- See Note [Synonyms implement abstract data]
     checkSynAbsData :: [TyVar] -> Type -> TyCon -> [Type] -> Maybe SDoc
@@ -1253,7 +1298,7 @@ checkBootTyCon is_boot tc1 tc2
                 `andThenCheck`
         -- Don't report roles errors unless the type synonym is nullary
         checkUnless (not (null tvs)) $
-            ASSERT( null roles2 )
+            assert (null roles2) $
             -- If we have something like:
             --
             --  signature H where
@@ -1275,7 +1320,7 @@ checkBootTyCon is_boot tc1 tc2
                     Nothing -> Just roles_msg
 -}
 
-    eqAlgRhs _ AbstractTyCon _rhs2
+    eqAlgRhs _ (AbstractTyCon {}) _rhs2
       = checkSuccess -- rhs2 is guaranteed to be injective, since it's an AlgTyCon
     eqAlgRhs _  tc1@DataTyCon{} tc2@DataTyCon{} =
         checkListBy eqCon (data_cons tc1) (data_cons tc2) (text "constructors")
@@ -1332,24 +1377,27 @@ emptyRnEnv2 :: RnEnv2
 emptyRnEnv2 = mkRnEnv2 emptyInScopeSet
 
 ----------------
-missingBootThing :: Bool -> Name -> String -> SDoc
+missingBootThing :: Bool -> Name -> String -> TcRnMessage
 missingBootThing is_boot name what
-  = quotes (ppr name) <+> text "is exported by the"
+  = TcRnUnknownMessage $ mkPlainError noHints $
+    quotes (ppr name) <+> text "is exported by the"
     <+> (if is_boot then text "hs-boot" else text "hsig")
     <+> text "file, but not"
     <+> text what <+> text "the module"
 
-badReexportedBootThing :: Bool -> Name -> Name -> SDoc
+badReexportedBootThing :: Bool -> Name -> Name -> TcRnMessage
 badReexportedBootThing is_boot name name'
-  = withUserStyle alwaysQualify AllTheWay $ vcat
+  = TcRnUnknownMessage $ mkPlainError noHints $
+    withUserStyle alwaysQualify AllTheWay $ vcat
         [ text "The" <+> (if is_boot then text "hs-boot" else text "hsig")
            <+> text "file (re)exports" <+> quotes (ppr name)
         , text "but the implementing module exports a different identifier" <+> quotes (ppr name')
         ]
 
-bootMisMatch :: Bool -> SDoc -> TyThing -> TyThing -> SDoc
+bootMisMatch :: Bool -> SDoc -> TyThing -> TyThing -> TcRnMessage
 bootMisMatch is_boot extra_info real_thing boot_thing
-  = pprBootMisMatch is_boot extra_info real_thing real_doc boot_doc
+  = TcRnUnknownMessage $ mkPlainError noHints $
+    pprBootMisMatch is_boot extra_info real_thing real_doc boot_doc
   where
     to_doc
       = pprTyThingInContext $ showToHeader { ss_forall =
@@ -1377,9 +1425,10 @@ bootMisMatch is_boot extra_info real_thing boot_thing
             extra_info
           ]
 
-instMisMatch :: DFunId -> SDoc
+instMisMatch :: DFunId -> TcRnMessage
 instMisMatch dfun
-  = hang (text "instance" <+> ppr (idType dfun))
+  = TcRnUnknownMessage $ mkPlainError noHints $
+    hang (text "instance" <+> ppr (idType dfun))
        2 (text "is defined in the hs-boot file, but not in the module itself")
 
 {-
@@ -1428,9 +1477,11 @@ tcTopSrcDecls (HsGroup { hs_tyclds = tycl_decls,
                 -- Source-language instances, including derivings,
                 -- and import the supporting declarations
         traceTc "Tc3" empty ;
-        (tcg_env, inst_infos, XValBindsLR (NValBinds deriv_binds deriv_sigs))
+        (tcg_env, inst_infos, th_bndrs,
+         XValBindsLR (NValBinds deriv_binds deriv_sigs))
             <- tcTyClsInstDecls tycl_decls deriv_decls val_binds ;
 
+        updLclEnv (\tcl_env -> tcl_env { tcl_th_bndrs = th_bndrs `plusNameEnv` tcl_th_bndrs tcl_env }) $
         setGblEnv tcg_env       $ do {
 
                 -- Generate Applicative/Monad proposal (AMP) warnings
@@ -1457,14 +1508,14 @@ tcTopSrcDecls (HsGroup { hs_tyclds = tycl_decls,
                 -- the bindings produced in a Data instance.)
         traceTc "Tc5" empty ;
         tc_envs <- tcTopBinds val_binds val_sigs;
-        setEnvs tc_envs $ do {
+        restoreEnvs tc_envs $ do {
 
                 -- Now GHC-generated derived bindings, generics, and selectors
                 -- Do not generate warnings from compiler-generated code;
                 -- hence the use of discardWarnings
         tc_envs@(tcg_env, tcl_env)
             <- discardWarnings (tcTopBinds deriv_binds deriv_sigs) ;
-        setEnvs tc_envs $ do {  -- Environment doesn't change now
+        restoreEnvs tc_envs $ do {  -- Environment doesn't change now
 
                 -- Second pass over class and instance declarations,
                 -- now using the kind-checked decls
@@ -1487,10 +1538,10 @@ tcTopSrcDecls (HsGroup { hs_tyclds = tycl_decls,
                           foe_binds
 
             ; fo_gres = fi_gres `unionBags` foe_gres
-            ; fo_fvs = foldr (\gre fvs -> fvs `addOneFV` gre_name gre)
+            ; fo_fvs = foldr (\gre fvs -> fvs `addOneFV` greMangledName gre)
                                 emptyFVs fo_gres
 
-            ; sig_names = mkNameSet (collectHsValBinders hs_val_binds)
+            ; sig_names = mkNameSet (collectHsValBinders CollNoDictBinders hs_val_binds)
                           `minusNameSet` getTypeSigNames val_sigs
 
                 -- Extend the GblEnv with the (as yet un-zonked)
@@ -1516,10 +1567,13 @@ tcTopSrcDecls _ = panic "tcTopSrcDecls: ValBindsIn"
 
 tcSemigroupWarnings :: TcM ()
 tcSemigroupWarnings = do
-    traceTc "tcSemigroupWarnings" empty
-    let warnFlag = Opt_WarnSemigroup
-    tcPreludeClashWarn warnFlag sappendName
-    tcMissingParentClassWarn warnFlag monoidClassName semigroupClassName
+    mod <- getModule
+    -- ghc-prim doesn't depend on base
+    unless (moduleUnit mod == primUnit) $ do
+      traceTc "tcSemigroupWarnings" empty
+      let warnFlag = Opt_WarnSemigroup
+      tcPreludeClashWarn warnFlag sappendName
+      tcMissingParentClassWarn warnFlag monoidClassName semigroupClassName
 
 
 -- | Warn on local definitions of names that would clash with future Prelude
@@ -1545,18 +1599,18 @@ tcPreludeClashWarn warnFlag name = do
     -- Continue only the name is imported from Prelude
     ; when (importedViaPrelude name rnImports) $ do
       -- Handle 2.-4.
-    { rdrElts <- fmap (concat . occEnvElts . tcg_rdr_env) getGblEnv
+    { rdrElts <- fmap (concat . nonDetOccEnvElts . tcg_rdr_env) getGblEnv
 
     ; let clashes :: GlobalRdrElt -> Bool
           clashes x = isLocalDef && nameClashes && isNotInProperModule
             where
               isLocalDef = gre_lcl x == True
               -- Names are identical ...
-              nameClashes = nameOccName (gre_name x) == nameOccName name
+              nameClashes = nameOccName (greMangledName x) == nameOccName name
               -- ... but not the actual definitions, because we don't want to
               -- warn about a bad definition of e.g. <> in Data.Semigroup, which
               -- is the (only) proper place where this should be defined
-              isNotInProperModule = gre_name x /= name
+              isNotInProperModule = greMangledName x /= name
 
           -- List of all offending definitions
           clashingElts :: [GlobalRdrElt]
@@ -1565,9 +1619,11 @@ tcPreludeClashWarn warnFlag name = do
     ; traceTc "tcPreludeClashWarn/prelude_functions"
                 (hang (ppr name) 4 (sep [ppr clashingElts]))
 
-    ; let warn_msg x = addWarnAt (Reason warnFlag) (nameSrcSpan (gre_name x)) (hsep
+    ; let warn_msg x = addDiagnosticAt (nameSrcSpan (greMangledName x)) $
+            TcRnUnknownMessage $
+            mkPlainDiagnostic (WarningWithFlag warnFlag) noHints $ (hsep
               [ text "Local definition of"
-              , (quotes . ppr . nameOccName . gre_name) x
+              , (quotes . ppr . nameOccName . greMangledName) x
               , text "clashes with a future Prelude name." ]
               $$
               text "This will become an error in a future release." )
@@ -1659,9 +1715,9 @@ tcMissingParentClassWarn warnFlag isName shouldName
        }}
   where
     -- Check whether the desired superclass exists in a given environment.
-    checkShouldInst :: Class   -- ^ Class of existing instance
-                    -> Class   -- ^ Class there should be an instance of
-                    -> ClsInst -- ^ Existing instance
+    checkShouldInst :: Class   -- Class of existing instance
+                    -> Class   -- Class there should be an instance of
+                    -> ClsInst -- Existing instance
                     -> TcM ()
     checkShouldInst isClass shouldClass isInst
       = do { instEnv <- tcGetInstEnvs
@@ -1675,8 +1731,9 @@ tcMissingParentClassWarn warnFlag isName shouldName
            -- "<location>: Warning: <type> is an instance of <is> but not
            -- <should>" e.g. "Foo is an instance of Monad but not Applicative"
            ; let instLoc = srcLocSpan . nameSrcLoc $ getName isInst
-                 warnMsg (Just name:_) =
-                      addWarnAt (Reason warnFlag) instLoc $
+                 warnMsg (RM_KnownTc name:_) =
+                      addDiagnosticAt instLoc $
+                        TcRnUnknownMessage $ mkPlainDiagnostic (WarningWithFlag warnFlag) noHints $
                            hsep [ (quotes . ppr . nameOccName) name
                                 , text "is an instance of"
                                 , (ppr . nameOccName . className) isClass
@@ -1687,7 +1744,7 @@ tcMissingParentClassWarn warnFlag isName shouldName
                            hsep [ text "This will become an error in"
                                 , text "a future release." ]
                  warnMsg _ = pure ()
-           ; when (null shouldInsts && null instanceMatches) $
+           ; when (nullUnifiers shouldInsts && null instanceMatches) $
                   warnMsg (is_tcs isInst)
            }
 
@@ -1705,13 +1762,14 @@ tcTyClsInstDecls :: [TyClGroup GhcRn]
                          [InstInfo GhcRn],    -- Source-code instance decls to
                                               -- process; contains all dfuns for
                                               -- this module
+                          ThBindEnv,          -- TH binding levels
                           HsValBinds GhcRn)   -- Supporting bindings for derived
                                               -- instances
 
 tcTyClsInstDecls tycl_decls deriv_decls binds
  = tcAddDataFamConPlaceholders (tycl_decls >>= group_instds) $
    tcAddPatSynPlaceholders (getPatSynBinds binds) $
-   do { (tcg_env, inst_info, deriv_info)
+   do { (tcg_env, inst_info, deriv_info, th_bndrs)
           <- tcTyAndClassDecls tycl_decls ;
       ; setGblEnv tcg_env $ do {
           -- With the @TyClDecl@s and @InstDecl@s checked we're ready to
@@ -1725,7 +1783,7 @@ tcTyClsInstDecls tycl_decls deriv_decls binds
               <- tcInstDeclsDeriv deriv_info deriv_decls
           ; setGblEnv tcg_env' $ do {
                 failIfErrsM
-              ; pure (tcg_env', inst_info' ++ inst_info, val_binds)
+              ; pure ( tcg_env', inst_info' ++ inst_info, th_bndrs, val_binds )
       }}}
 
 {- *********************************************************************
@@ -1741,38 +1799,45 @@ checkMainType :: TcGblEnv -> TcRn WantedConstraints
 -- If not, do nothing
 -- See Note [Dealing with main]
 checkMainType tcg_env
-  = do { dflags <- getDynFlags
-       ; if tcg_mod tcg_env /= mainModIs dflags
+  = do { hsc_env <- getTopEnv
+       ; if tcg_mod tcg_env /= mainModIs (hsc_HUE hsc_env)
          then return emptyWC else
 
     do { rdr_env <- getGlobalRdrEnv
-       ; let main_occ  = getMainOcc dflags
+       ; let dflags    = hsc_dflags hsc_env
+             main_occ  = getMainOcc dflags
              main_gres = lookupGlobalRdrEnv rdr_env main_occ
        ; case filter isLocalGRE main_gres of {
             []         -> return emptyWC ;
             (_:_:_)    -> return emptyWC ;
             [main_gre] ->
 
-    do { let main_name = gre_name main_gre
-             ctxt      = FunSigCtxt main_name False
+    do { let main_name = greMangledName main_gre
+             ctxt      = FunSigCtxt main_name NoRRC
        ; main_id   <- tcLookupId main_name
        ; (io_ty,_) <- getIOType
+       ; let main_ty   = idType main_id
+             eq_orig   = TypeEqOrigin { uo_actual   = main_ty
+                                      , uo_expected = io_ty
+                                      , uo_thing    = Nothing
+                                      , uo_visible  = True }
        ; (_, lie)  <- captureTopConstraints       $
                       setMainCtxt main_name io_ty $
-                      tcSubTypeSigma ctxt (idType main_id) io_ty
+                      tcSubTypeSigma eq_orig ctxt main_ty io_ty
        ; return lie } } } }
 
 checkMain :: Bool  -- False => no 'module M(..) where' header at all
-          -> Maybe (Located [LIE GhcPs])  -- Export specs of Main module
+          -> Maybe (LocatedL [LIE GhcPs])  -- Export specs of Main module
           -> TcM TcGblEnv
 -- If we are in module Main, check that 'main' is exported,
 -- and generate the runMainIO binding that calls it
 -- See Note [Dealing with main]
 checkMain explicit_mod_hdr export_ies
- = do { dflags <- getDynFlags
+ = do { hsc_env  <- getTopEnv
       ; tcg_env <- getGblEnv
 
-      ; let main_mod    = mainModIs dflags
+      ; let dflags      = hsc_dflags hsc_env
+            main_mod    = mainModIs (hsc_HUE hsc_env)
             main_occ    = getMainOcc dflags
 
             exported_mains :: [Name]
@@ -1790,7 +1855,7 @@ checkMain explicit_mod_hdr export_ies
               generateMainBinding tcg_env main_name
 
            | otherwise
-           -> ASSERT( null exported_mains )
+           -> assert (null exported_mains) $
               -- A fully-checked export list can't contain more
               -- than one function with the same OccName
               do { complain_no_main dflags main_mod main_occ
@@ -1806,7 +1871,8 @@ checkMain explicit_mod_hdr export_ies
         -- in other modes, add error message and go on with typechecking.
 
     noMainMsg main_mod main_occ
-      = text "The" <+> ppMainFn main_occ
+      = TcRnUnknownMessage $ mkPlainError noHints $
+            text "The" <+> ppMainFn main_occ
         <+> text "is not" <+> text defOrExp <+> text "module"
         <+> quotes (ppr main_mod)
 
@@ -1843,11 +1909,11 @@ generateMainBinding tcg_env main_name = do
     { traceTc "checkMain found" (ppr main_name)
     ; (io_ty, res_ty) <- getIOType
     ; let loc = getSrcSpan main_name
-          main_expr_rn = L loc (HsVar noExtField (L loc main_name))
+          main_expr_rn = L (noAnnSrcSpan loc) (HsVar noExtField (L (noAnnSrcSpan loc) main_name))
     ; (ev_binds, main_expr) <- setMainCtxt main_name io_ty $
                                tcCheckMonoExpr main_expr_rn io_ty
 
-            -- See Note [Root-main Id]
+            -- See Note [Root-main id]
             -- Construct the binding
             --      :Main.main :: IO res_ty = runMainIO res_ty main
     ; run_main_id <- tcLookupId runMainIOName
@@ -1886,7 +1952,7 @@ setMainCtxt main_name io_ty thing_inside
     checkConstraints skol_info [] []  $  -- Builds an implication if necessary
     thing_inside                         -- e.g. with -fdefer-type-errors
   where
-    skol_info = SigSkol (FunSigCtxt main_name False) io_ty []
+    skol_info = SigSkol (FunSigCtxt main_name NoRRC) io_ty []
     main_ctxt = text "When checking the type of the"
                 <+> ppMainFn (nameOccName main_name)
 
@@ -1897,7 +1963,7 @@ the moving parts:
 
 * The flag -main-is=M.foo allows you to set the main module to 'M',
   and the main function to 'foo'.  We access them through
-      mainModIs  :: DynFlags -> Module   -- returns M
+      mainModIs  :: HscEnv -> Module     -- returns M
       getMainOcc :: DynFlags -> OccName  -- returns foo
   Of course usually M = Main, and foo = main.
 
@@ -1982,16 +2048,17 @@ get two defns for 'main' in the interface file!
 *********************************************************
 -}
 
-runTcInteractive :: HscEnv -> TcRn a -> IO (Messages, Maybe a)
+runTcInteractive :: HscEnv -> TcRn a -> IO (Messages TcRnMessage, Maybe a)
 -- Initialise the tcg_inst_env with instances from all home modules.
 -- This mimics the more selective call to hptInstances in tcRnImports
 runTcInteractive hsc_env thing_inside
-  = initTcInteractive hsc_env $ withTcPlugins hsc_env $ withHoleFitPlugins hsc_env $
+  = initTcInteractive hsc_env $ withTcPlugins hsc_env $
+    withDefaultingPlugins hsc_env $ withHoleFitPlugins hsc_env $
     do { traceTc "setInteractiveContext" $
             vcat [ text "ic_tythings:" <+> vcat (map ppr (ic_tythings icxt))
-                 , text "ic_insts:" <+> vcat (map (pprBndr LetBind . instanceDFunId) ic_insts)
-                 , text "ic_rn_gbl_env (LocalDef)" <+>
-                      vcat (map ppr [ local_gres | gres <- occEnvElts (ic_rn_gbl_env icxt)
+                 , text "ic_insts:" <+> vcat (map (pprBndr LetBind . instanceDFunId) (instEnvElts ic_insts))
+                 , text "icReaderEnv (LocalDef)" <+>
+                      vcat (map ppr [ local_gres | gres <- nonDetOccEnvElts (icReaderEnv icxt)
                                                  , let local_gres = filter isLocalGRE gres
                                                  , not (null local_gres) ]) ]
 
@@ -2002,41 +2069,36 @@ runTcInteractive hsc_env thing_inside
 
        ; !orphs <- fmap (force . concat) . forM (ic_imports icxt) $ \i ->
             case i of                   -- force above: see #15111
-                IIModule n -> getOrphans n Nothing
-                IIDecl i ->
-                  let mb_pkg = sl_fs <$> ideclPkgQual i in
-                  getOrphans (unLoc (ideclName i)) mb_pkg
+                IIModule n -> getOrphans n NoPkgQual
+                IIDecl i   -> getOrphans (unLoc (ideclName i))
+                                         (renameRawPkgQual (hsc_unit_env hsc_env) (unLoc $ ideclName i) (ideclPkgQual i))
 
-       ; let imports = emptyImportAvails {
-                            imp_orphs = orphs
-                        }
+       ; let imports = emptyImportAvails { imp_orphs = orphs }
 
-       ; (gbl_env, lcl_env) <- getEnvs
-       ; let gbl_env' = gbl_env {
-                           tcg_rdr_env      = ic_rn_gbl_env icxt
-                         , tcg_type_env     = type_env
-                         , tcg_inst_env     = extendInstEnvList
-                                               (extendInstEnvList (tcg_inst_env gbl_env) ic_insts)
-                                               home_insts
-                         , tcg_fam_inst_env = extendFamInstEnvList
+             upd_envs (gbl_env, lcl_env) = (gbl_env', lcl_env')
+               where
+                 gbl_env' = gbl_env { tcg_rdr_env      = icReaderEnv icxt
+                                    , tcg_type_env     = type_env
+
+                                    , tcg_inst_env     = tcg_inst_env gbl_env `unionInstEnv` ic_insts `unionInstEnv` home_insts
+                                    , tcg_fam_inst_env = extendFamInstEnvList
                                                (extendFamInstEnvList (tcg_fam_inst_env gbl_env)
                                                                      ic_finsts)
                                                home_fam_insts
-                         , tcg_field_env    = mkNameEnv con_fields
-                              -- setting tcg_field_env is necessary
-                              -- to make RecordWildCards work (test: ghci049)
-                         , tcg_fix_env      = ic_fix_env icxt
-                         , tcg_default      = ic_default icxt
-                              -- must calculate imp_orphs of the ImportAvails
-                              -- so that instance visibility is done correctly
-                         , tcg_imports      = imports
-                         }
+                                    , tcg_field_env    = mkNameEnv con_fields
+                                         -- setting tcg_field_env is necessary
+                                         -- to make RecordWildCards work (test: ghci049)
+                                    , tcg_fix_env      = ic_fix_env icxt
+                                    , tcg_default      = ic_default icxt
+                                         -- must calculate imp_orphs of the ImportAvails
+                                         -- so that instance visibility is done correctly
+                                    , tcg_imports      = imports }
 
-             lcl_env' = tcExtendLocalTypeEnv lcl_env lcl_ids
+                 lcl_env' = tcExtendLocalTypeEnv lcl_env lcl_ids
 
-       ; setEnvs (gbl_env', lcl_env') thing_inside }
+       ; updEnvs upd_envs thing_inside }
   where
-    (home_insts, home_fam_insts) = hptInstances hsc_env (\_ -> True)
+    (home_insts, home_fam_insts) = hptAllInstances hsc_env
 
     icxt                     = hsc_IC hsc_env
     (ic_insts, ic_finsts)    = ic_instances icxt
@@ -2055,7 +2117,7 @@ runTcInteractive hsc_env thing_inside
       = Right thing
 
     type_env1 = mkTypeEnvWithImplicits top_ty_things
-    type_env  = extendTypeEnvWithIds type_env1 (map instanceDFunId ic_insts)
+    type_env  = extendTypeEnvWithIds type_env1 (map instanceDFunId (instEnvElts ic_insts))
                 -- Putting the dfuns in the type_env
                 -- is just to keep Core Lint happy
 
@@ -2098,7 +2160,7 @@ We don't bother with the tcl_th_bndrs environment either.
 -- The returned TypecheckedHsExpr is of type IO [ () ], a list of the bound
 -- values, coerced to ().
 tcRnStmt :: HscEnv -> GhciLStmt GhcPs
-         -> IO (Messages, Maybe ([Id], LHsExpr GhcTc, FixityEnv))
+         -> IO (Messages TcRnMessage, Maybe ([Id], LHsExpr GhcTc, FixityEnv))
 tcRnStmt hsc_env rdr_stmt
   = runTcInteractive hsc_env $ do {
 
@@ -2107,36 +2169,18 @@ tcRnStmt hsc_env rdr_stmt
     zonked_expr <- zonkTopLExpr tc_expr ;
     zonked_ids  <- zonkTopBndrs bound_ids ;
 
-    failIfErrsM ;  -- we can't do the next step if there are levity polymorphism errors
+    failIfErrsM ;  -- we can't do the next step if there are
+                   -- representation polymorphism errors
                    -- test case: ghci/scripts/T13202{,a}
 
         -- None of the Ids should be of unboxed type, because we
         -- cast them all to HValues in the end!
-    mapM_ bad_unboxed (filter (isUnliftedType . idType) zonked_ids) ;
+    mapM_ bad_unboxed (filter (mightBeUnliftedType . idType) zonked_ids) ;
 
     traceTc "tcs 1" empty ;
     this_mod <- getModule ;
     global_ids <- mapM (externaliseAndTidyId this_mod) zonked_ids ;
-        -- Note [Interactively-bound Ids in GHCi] in GHC.Driver.Types
-
-{- ---------------------------------------------
-   At one stage I removed any shadowed bindings from the type_env;
-   they are inaccessible but might, I suppose, cause a space leak if we leave them there.
-   However, with Template Haskell they aren't necessarily inaccessible.  Consider this
-   GHCi session
-         Prelude> let f n = n * 2 :: Int
-         Prelude> fName <- runQ [| f |]
-         Prelude> $(return $ AppE fName (LitE (IntegerL 7)))
-         14
-         Prelude> let f n = n * 3 :: Int
-         Prelude> $(return $ AppE fName (LitE (IntegerL 7)))
-   In the last line we use 'fName', which resolves to the *first* 'f'
-   in scope. If we delete it from the type env, GHCi crashes because
-   it doesn't expect that.
-
-   Hence this code is commented out
-
--------------------------------------------------- -}
+        -- Note [Interactively-bound Ids in GHCi] in GHC.Driver.Env
 
     traceOptTcRn Opt_D_dump_tc
         (vcat [text "Bound Ids" <+> pprWithCommas ppr global_ids,
@@ -2145,7 +2189,8 @@ tcRnStmt hsc_env rdr_stmt
     return (global_ids, zonked_expr, fix_env)
     }
   where
-    bad_unboxed id = addErr (sep [text "GHCi can't bind a variable of unlifted type:",
+    bad_unboxed id = addErr $ TcRnUnknownMessage $ mkPlainError noHints $
+      (sep [text "GHCi can't bind a variable of unlifted type:",
                                   nest 2 (pprPrefixOcc id <+> dcolon <+> ppr (idType id))])
 
 {-
@@ -2188,7 +2233,7 @@ runPlans (p:ps) = tryTcDiscardingErrs (runPlans ps) p
 --
 -- By 'lift' and 'environment we mean that the code is changed to
 -- execute properly in an IO monad. See Note [Interactively-bound Ids
--- in GHCi] in GHC.Driver.Types for more details. We do this lifting by trying
+-- in GHCi] in GHC.Driver.Env for more details. We do this lifting by trying
 -- different ways ('plans') of lifting the code into the IO monad and
 -- type checking each plan until one succeeds.
 tcUserStmt :: GhciLStmt GhcPs -> TcM (PlanResult, FixityEnv)
@@ -2196,23 +2241,27 @@ tcUserStmt :: GhciLStmt GhcPs -> TcM (PlanResult, FixityEnv)
 -- An expression typed at the prompt is treated very specially
 tcUserStmt (L loc (BodyStmt _ expr _ _))
   = do  { (rn_expr, fvs) <- checkNoErrs (rnLExpr expr)
+
+        ; dumpOptTcRn Opt_D_dump_rn_ast "Renamer" FormatHaskell
+            (showAstData NoBlankSrcSpan NoBlankEpAnnotations rn_expr)
                -- Don't try to typecheck if the renamer fails!
         ; ghciStep <- getGhciStepIO
         ; uniq <- newUnique
+        ; let loc' = noAnnSrcSpan $ locA loc
         ; interPrintName <- getInteractivePrintName
-        ; let fresh_it  = itName uniq loc
-              matches   = [mkMatch (mkPrefixFunRhs (L loc fresh_it)) [] rn_expr
-                                   (noLoc emptyLocalBinds)]
+        ; let fresh_it  = itName uniq (locA loc)
+              matches   = [mkMatch (mkPrefixFunRhs (L loc' fresh_it)) [] rn_expr
+                                   emptyLocalBinds]
               -- [it = expr]
               the_bind  = L loc $ (mkTopFunBind FromSource
-                                     (L loc fresh_it) matches)
+                                     (L loc' fresh_it) matches)
                                          { fun_ext = fvs }
               -- Care here!  In GHCi the expression might have
               -- free variables, and they in turn may have free type variables
               -- (if we are at a breakpoint, say).  We must put those free vars
 
               -- [let it = expr]
-              let_stmt  = L loc $ LetStmt noExtField $ noLoc $ HsValBinds noExtField
+              let_stmt  = L loc $ LetStmt noAnn $ HsValBinds noAnn
                            $ XValBindsLR
                                (NValBinds [(NonRecursive,unitBag the_bind)] [])
 
@@ -2222,7 +2271,7 @@ tcUserStmt (L loc (BodyStmt _ expr _ _))
                                           { xbsrn_bindOp = mkRnSyntaxExpr bindIOName
                                           , xbsrn_failOp = Nothing
                                           })
-                                       (L loc (VarPat noExtField (L loc fresh_it)))
+                                       (L loc (VarPat noExtField (L loc' fresh_it)))
                                        (nlHsApp ghciStep rn_expr)
 
               -- [; print it]
@@ -2291,6 +2340,9 @@ tcUserStmt (L loc (BodyStmt _ expr _ _))
                                  then no_it_plans
                                  else it_plans
 
+        ; dumpOptTcRn Opt_D_dump_tc_ast "Typechecker AST" FormatHaskell
+              (showAstData NoBlankSrcSpan NoBlankEpAnnotations plan)
+
         ; fix_env <- getFixityEnv
         ; return (plan, fix_env) }
 
@@ -2344,7 +2396,7 @@ But for naked expressions, you will have
 
 tcUserStmt rdr_stmt@(L loc _)
   = do { (([rn_stmt], fix_env), fvs) <- checkNoErrs $
-           rnStmts GhciStmtCtxt rnLExpr [rdr_stmt] $ \_ -> do
+           rnStmts (HsDoStmt GhciStmtCtxt) rnExpr [rdr_stmt] $ \_ -> do
              fix_env <- getFixityEnv
              return (fix_env, emptyFVs)
             -- Don't try to typecheck if the renamer fails!
@@ -2360,8 +2412,8 @@ tcUserStmt rdr_stmt@(L loc _)
        ; opt_pr_flag <- goptM Opt_PrintBindResult
        ; let print_result_plan
                | opt_pr_flag                         -- The flag says "print result"
-               , [v] <- collectLStmtBinders gi_stmt  -- One binder
-                           =  [mk_print_result_plan gi_stmt v]
+               , [v] <- collectLStmtBinders CollNoDictBinders gi_stmt  -- One binder
+               = [mk_print_result_plan gi_stmt v]
                | otherwise = []
 
         -- The plans are:
@@ -2409,9 +2461,9 @@ tcGhciStmts stmts
       ; ret_id  <- tcLookupId returnIOName             -- return @ IO
       ; let ret_ty      = mkListTy unitTy
             io_ret_ty   = mkTyConApp ioTyCon [ret_ty]
-            tc_io_stmts = tcStmtsAndThen GhciStmtCtxt tcDoStmt stmts
+            tc_io_stmts = tcStmtsAndThen (HsDoStmt GhciStmtCtxt) tcDoStmt stmts
                                          (mkCheckExpType io_ret_ty)
-            names = collectLStmtsBinders stmts
+            names = collectLStmtsBinders CollNoDictBinders stmts
 
         -- OK, we're ready to typecheck the stmts
       ; traceTc "GHC.Tc.Module.tcGhciStmts: tc stmts" empty
@@ -2429,8 +2481,8 @@ tcGhciStmts stmts
 
       ; traceTc "GHC.Tc.Module.tcGhciStmts: done" empty
 
-      -- rec_expr is the expression
-      --      returnIO @ [()] [unsafeCoerce# () x, ..,  unsafeCorece# () z]
+      -- ret_expr is the expression
+      --      returnIO @[()] [unsafeCoerce# () x, ..,  unsafeCoerce# () z]
       --
       -- Despite the inconvenience of building the type applications etc,
       -- this *has* to be done in type-annotated post-typecheck form
@@ -2446,17 +2498,17 @@ tcGhciStmts stmts
            -- Note [Implementing unsafeCoerce] in base:Unsafe.Coerce
 
       ; let ret_expr = nlHsApp (nlHsTyApp ret_id [ret_ty]) $
-                       noLoc $ ExplicitList unitTy Nothing $
+                       noLocA $ ExplicitList unitTy $
                        map mk_item ids
 
             mk_item id = unsafe_coerce_id `nlHsTyApp` [ getRuntimeRep (idType id)
                                                       , getRuntimeRep unitTy
                                                       , idType id, unitTy]
                                           `nlHsApp` nlHsVar id
-            stmts = tc_stmts ++ [noLoc (mkLastStmt ret_expr)]
+            stmts = tc_stmts ++ [noLocA (mkLastStmt ret_expr)]
 
       ; return (ids, mkHsDictLet (EvBinds const_binds) $
-                     noLoc (HsDo io_ret_ty GhciStmtCtxt (noLoc stmts)))
+                     noLocA (HsDo io_ret_ty GhciStmtCtxt (noLocA stmts)))
     }
 
 -- | Generate a typed ghciStepIO expression (ghciStep :: Ty a -> IO a)
@@ -2464,48 +2516,48 @@ getGhciStepIO :: TcM (LHsExpr GhcRn)
 getGhciStepIO = do
     ghciTy <- getGHCiMonad
     a_tv <- newName (mkTyVarOccFS (fsLit "a"))
-    let ghciM   = nlHsAppTy (nlHsTyVar ghciTy) (nlHsTyVar a_tv)
-        ioM     = nlHsAppTy (nlHsTyVar ioTyConName) (nlHsTyVar a_tv)
+    let ghciM   = nlHsAppTy (nlHsTyVar NotPromoted ghciTy) (nlHsTyVar NotPromoted a_tv)
+        ioM     = nlHsAppTy (nlHsTyVar NotPromoted ioTyConName) (nlHsTyVar NotPromoted a_tv)
 
-        step_ty = noLoc $ HsForAllTy
-                     { hst_tele = mkHsForAllInvisTele
-                                  [noLoc $ UserTyVar noExtField SpecifiedSpec (noLoc a_tv)]
-                     , hst_xforall = noExtField
-                     , hst_body  = nlHsFunTy ghciM ioM }
+        step_ty :: LHsSigType GhcRn
+        step_ty = noLocA $ HsSig
+                     { sig_bndrs = HsOuterImplicit{hso_ximplicit = [a_tv]}
+                     , sig_ext = noExtField
+                     , sig_body = nlHsFunTy ghciM ioM }
 
         stepTy :: LHsSigWcType GhcRn
-        stepTy = mkEmptyWildCardBndrs (mkEmptyImplicitBndrs step_ty)
+        stepTy = mkEmptyWildCardBndrs step_ty
 
-    return (noLoc $ ExprWithTySig noExtField (nlHsVar ghciStepIoMName) stepTy)
+    return (noLocA $ ExprWithTySig noExtField (nlHsVar ghciStepIoMName) stepTy)
 
-isGHCiMonad :: HscEnv -> String -> IO (Messages, Maybe Name)
+isGHCiMonad :: HscEnv -> String -> IO (Messages TcRnMessage, Maybe Name)
 isGHCiMonad hsc_env ty
   = runTcInteractive hsc_env $ do
         rdrEnv <- getGlobalRdrEnv
         let occIO = lookupOccEnv rdrEnv (mkOccName tcName ty)
         case occIO of
             Just [n] -> do
-                let name = gre_name n
+                let name = greMangledName n
                 ghciClass <- tcLookupClass ghciIoClassName
                 userTyCon <- tcLookupTyCon name
                 let userTy = mkTyConApp userTyCon []
                 _ <- tcLookupInstance ghciClass [userTy]
                 return name
 
-            Just _  -> failWithTc $ text "Ambiguous type!"
-            Nothing -> failWithTc $ text ("Can't find type:" ++ ty)
+            Just _  -> failWithTc $ TcRnUnknownMessage $ mkPlainError noHints $ text "Ambiguous type!"
+            Nothing -> failWithTc $ TcRnUnknownMessage $ mkPlainError noHints $ text ("Can't find type:" ++ ty)
 
 -- | How should we infer a type? See Note [TcRnExprMode]
-data TcRnExprMode = TM_Inst    -- ^ Instantiate the type fully (:type)
-                  | TM_NoInst  -- ^ Do not instantiate the type (:type +v)
-                  | TM_Default -- ^ Default the type eagerly (:type +d)
+data TcRnExprMode = TM_Inst     -- ^ Instantiate inferred quantifiers only (:type)
+                  | TM_Default  -- ^ Instantiate all quantifiers,
+                                --   and do eager defaulting (:type +d)
 
 -- | tcRnExpr just finds the type of an expression
 --   for :type
 tcRnExpr :: HscEnv
          -> TcRnExprMode
          -> LHsExpr GhcPs
-         -> IO (Messages, Maybe Type)
+         -> IO (Messages TcRnMessage, Maybe Type)
 tcRnExpr hsc_env mode rdr_expr
   = runTcInteractive hsc_env $
     do {
@@ -2513,18 +2565,18 @@ tcRnExpr hsc_env mode rdr_expr
     (rn_expr, _fvs) <- rnLExpr rdr_expr ;
     failIfErrsM ;
 
-        -- Now typecheck the expression, and generalise its type
-        -- it might have a rank-2 type (e.g. :t runST)
-    uniq <- newUnique ;
-    let { fresh_it  = itName uniq (getLoc rdr_expr) } ;
-    ((tclvl, (_tc_expr, res_ty)), lie)
+    -- Typecheck the expression
+    ((tclvl, res_ty), lie)
           <- captureTopConstraints $
              pushTcLevelM          $
-             tc_infer rn_expr ;
+             tcInferSigma inst rn_expr ;
 
     -- Generalise
-    (qtvs, dicts, _, residual, _)
-         <- simplifyInfer tclvl infer_mode
+    uniq <- newUnique ;
+    let { fresh_it = itName uniq (getLocA rdr_expr) } ;
+    ((qtvs, dicts, _, _), residual)
+         <- captureConstraints $
+            simplifyInfer tclvl infer_mode
                           []    {- No sig vars -}
                           [(fresh_it, res_ty)]
                           lie ;
@@ -2537,23 +2589,17 @@ tcRnExpr hsc_env mode rdr_expr
                         mkPhiTy (map idType dicts) res_ty } ;
     ty <- zonkTcType all_expr_ty ;
 
-    -- We normalise type families, so that the type of an expression is the
-    -- same as of a bound expression (GHC.Tc.Gen.Bind.mkInferredPolyId). See Trac
-    -- #10321 for further discussion.
+    -- See Note [Normalising the type in :type]
     fam_envs <- tcGetFamInstEnvs ;
-    -- normaliseType returns a coercion which we discard, so the Role is
-    -- irrelevant
-    return (snd (normaliseType fam_envs Nominal ty))
-    }
+    let { normalised_type = reductionReducedType $ normaliseType fam_envs Nominal ty
+          -- normaliseType returns a coercion which we discard, so the Role is irrelevant.
+        ; final_type = if isSigmaTy res_ty then ty else normalised_type } ;
+    return final_type }
   where
-    tc_infer expr | inst      = tcInferRho expr
-                  | otherwise = tcInferSigma expr
-                  -- tcInferSigma: see Note [Implementing :type]
-
+    -- Optionally instantiate the type of the expression
     -- See Note [TcRnExprMode]
     (inst, infer_mode, perhaps_disable_default_warnings) = case mode of
-      TM_Inst    -> (True,  NoRestrictions, id)
-      TM_NoInst  -> (False, NoRestrictions, id)
+      TM_Inst    -> (False, NoRestrictions,  id)
       TM_Default -> (True,  EagerDefaulting, unsetWOptM Opt_WarnTypeDefaults)
 
 {- Note [Implementing :type]
@@ -2573,18 +2619,43 @@ and not        forall {b}. Int -> b -> Int
 
 Solution: use tcInferSigma, which in turn uses tcInferApp, which
 has a special case for application chains.
+
+Note [Normalising the type in :type]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In :t <expr> we usually normalise the type (to simplify type functions)
+before displaying the result.  Reason (see #10321): otherwise we may show
+types like
+    <expr> :: Vec (1+2) Int
+rather than the simpler
+    <expr> :: Vec 3 Int
+In GHC.Tc.Gen.Bind.mkInferredPolyId we normalise for a very similar reason.
+
+However this normalisation is less helpful when <expr> is just
+an identifier, whose user-written type happens to contain type-function
+applications.  E.g. (#20974)
+    test :: F [Monad, A, B] m => m ()
+where F is a type family.  If we say `:t test`, we'd prefer to see
+the type family un-expanded.
+
+We adopt the following ad-hoc solution: if the type inferred for <expr>
+(before generalisation, namely res_ty) is a SigmaType (i.e. is not
+fully instantiated) then do not normalise; otherwise normalise.
+This is not ideal; for example, suppose  x :: F Int.  Then
+  :t x
+would be normalised because `F Int` is not a SigmaType.  But
+anything here is ad-hoc, and it's a user-sought improvement.
 -}
 
 --------------------------
 tcRnImportDecls :: HscEnv
                 -> [LImportDecl GhcPs]
-                -> IO (Messages, Maybe GlobalRdrEnv)
+                -> IO (Messages TcRnMessage, Maybe GlobalRdrEnv)
 -- Find the new chunk of GlobalRdrEnv created by this list of import
 -- decls.  In contract tcRnImports *extends* the TcGblEnv.
 tcRnImportDecls hsc_env import_decls
  =  runTcInteractive hsc_env $
     do { gbl_env <- updGblEnv zap_rdr_env $
-                    tcRnImports hsc_env import_decls
+                    tcRnImports hsc_env $ map (,text "is directly imported") import_decls
        ; return (tcg_rdr_env gbl_env) }
   where
     zap_rdr_env gbl_env = gbl_env { tcg_rdr_env = emptyGlobalRdrEnv }
@@ -2594,7 +2665,7 @@ tcRnType :: HscEnv
          -> ZonkFlexi
          -> Bool        -- Normalise the returned type
          -> LHsType GhcPs
-         -> IO (Messages, Maybe (Type, Kind))
+         -> IO (Messages TcRnMessage, Maybe (Type, Kind))
 tcRnType hsc_env flexi normalise rdr_type
   = runTcInteractive hsc_env $
     setXOptM LangExt.PolyKinds $   -- See Note [Kind-generalise in tcRnType]
@@ -2610,62 +2681,55 @@ tcRnType hsc_env flexi normalise rdr_type
         -- It can have any rank or kind
         -- First bring into scope any wildcards
        ; traceTc "tcRnType" (vcat [ppr wcs, ppr rn_type])
-       ; (ty, kind) <- pushTcLevelM_         $
-                        -- must push level to satisfy level precondition of
-                        -- kindGeneralize, below
-                       solveEqualities       $
-                       tcNamedWildCardBinders wcs $ \ wcs' ->
-                       do { mapM_ emitNamedTypeHole wcs'
-                          ; tcInferLHsTypeUnsaturated rn_type }
+       ; ((ty, kind), wanted)
+               <- captureTopConstraints $
+                  pushTcLevelM_         $
+                  bindNamedWildCardBinders wcs $ \ wcs' ->
+                  do { mapM_ emitNamedTypeHole wcs'
+                     ; tcInferLHsTypeUnsaturated rn_type }
+
+       -- Since all the wanteds are equalities, the returned bindings will be empty
+       ; empty_binds <- simplifyTop wanted
+       ; massertPpr (isEmptyBag empty_binds) (ppr empty_binds)
 
        -- Do kind generalisation; see Note [Kind-generalise in tcRnType]
-       ; kvs <- kindGeneralizeAll kind
-       ; e <- mkEmptyZonkEnv flexi
+       ; kvs <- kindGeneralizeAll unkSkol kind
 
+       ; e <- mkEmptyZonkEnv flexi
        ; ty  <- zonkTcTypeToTypeX e ty
 
        -- Do validity checking on type
        ; checkValidType (GhciCtxt True) ty
 
-       ; ty' <- if normalise
-                then do { fam_envs <- tcGetFamInstEnvs
-                        ; let (_, ty')
-                                = normaliseType fam_envs Nominal ty
-                        ; return ty' }
-                else return ty ;
+       -- Optionally (:k vs :k!) normalise the type. Does two things:
+       --   normaliseType: expand type-family applications
+       --   expandTypeSynonyms: expand type synonyms (#18828)
+       ; fam_envs <- tcGetFamInstEnvs
+       ; let ty' | normalise = expandTypeSynonyms $ reductionReducedType $
+                               normaliseType fam_envs Nominal ty
+                 | otherwise = ty
 
        ; return (ty', mkInfForAllTys kvs (tcTypeKind ty')) }
+
 
 {- Note [TcRnExprMode]
 ~~~~~~~~~~~~~~~~~~~~~~
 How should we infer a type when a user asks for the type of an expression e
-at the GHCi prompt? We offer 3 different possibilities, described below. Each
-considers this example, with -fprint-explicit-foralls enabled:
-
-  foo :: forall a f b. (Show a, Num b, Foldable f) => a -> f b -> String
-  :type{,-spec,-def} foo @Int
+at the GHCi prompt? We offer 2 different possibilities, described below. Each
+considers this example, with -fprint-explicit-foralls enabled.  See also
+https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0179-printing-foralls.rst
 
 :type / TM_Inst
 
-  In this mode, we report the type that would be inferred if a variable
-  were assigned to expression e, without applying the monomorphism restriction.
-  This means we instantiate the type and then regeneralize, as discussed
-  in #11376.
+  In this mode, we report the type obained by instantiating only the
+  /inferred/ quantifiers of e's type, solving constraints, and
+  re-generalising, as discussed in #11376.
 
+  > :type reverse
+  reverse :: forall a. [a] -> [a]
+
+  -- foo :: forall a f b. (Show a, Num b, Foldable f) => a -> f b -> String
   > :type foo @Int
-  forall {b} {f :: * -> *}. (Foldable f, Num b) => Int -> f b -> String
-
-  Note that the variables and constraints are reordered here, because this
-  is possible during regeneralization. Also note that the variables are
-  reported as Inferred instead of Specified.
-
-:type +v / TM_NoInst
-
-  This mode is for the benefit of users using TypeApplications. It does no
-  instantiation whatsoever, sometimes meaning that class constraints are not
-  solved.
-
-  > :type +v foo @Int
   forall f b. (Show Int, Num b, Foldable f) => Int -> f b -> String
 
   Note that Show Int is still reported, because the solver never got a chance
@@ -2673,12 +2737,17 @@ considers this example, with -fprint-explicit-foralls enabled:
 
 :type +d / TM_Default
 
-  This mode is for the benefit of users who wish to see instantiations of
-  generalized types, and in particular to instantiate Foldable and Traversable.
-  In this mode, any type variable that can be defaulted is defaulted. Because
-  GHCi uses -XExtendedDefaultRules, this means that Foldable and Traversable are
+  This mode is for the benefit of users who wish to see instantiations
+  of generalized types, and in particular to instantiate Foldable and
+  Traversable.  In this mode, all type variables (inferred or
+  specified) are instantiated.  Because GHCi uses
+  -XExtendedDefaultRules, this means that Foldable and Traversable are
   defaulted.
 
+  > :type +d reverse
+  reverse :: forall {a}. [a] -> [a]
+
+  -- foo :: forall a f b. (Show a, Num b, Foldable f) => a -> f b -> String
   > :type +d foo @Int
   Int -> [Integer] -> String
 
@@ -2693,6 +2762,10 @@ considers this example, with -fprint-explicit-foralls enabled:
   type in the defaulting list that is both Num and Monoid. (If this list is
   modified to include an element that is both Num and Monoid, the defaulting
   would succeed, of course.)
+
+  Note that the variables and constraints are reordered here, because this
+  is possible during regeneralization. Also note that the variables are
+  reported as Inferred instead of Specified.
 
 Note [Kind-generalise in tcRnType]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2726,7 +2799,7 @@ tcRnDeclsi exists to allow class, data, and other declarations in GHCi.
 
 tcRnDeclsi :: HscEnv
            -> [LHsDecl GhcPs]
-           -> IO (Messages, Maybe TcGblEnv)
+           -> IO (Messages TcRnMessage, Maybe TcGblEnv)
 tcRnDeclsi hsc_env local_decls
   = runTcInteractive hsc_env $
     tcRnSrcDecls False Nothing local_decls
@@ -2751,27 +2824,28 @@ externaliseAndTidyId this_mod id
 -- a package module with an interface on disk.  If neither of these is
 -- true, then the result will be an error indicating the interface
 -- could not be found.
-getModuleInterface :: HscEnv -> Module -> IO (Messages, Maybe ModIface)
+getModuleInterface :: HscEnv -> Module -> IO (Messages TcRnMessage, Maybe ModIface)
 getModuleInterface hsc_env mod
   = runTcInteractive hsc_env $
     loadModuleInterface (text "getModuleInterface") mod
 
-tcRnLookupRdrName :: HscEnv -> Located RdrName
-                  -> IO (Messages, Maybe [Name])
+tcRnLookupRdrName :: HscEnv -> LocatedN RdrName
+                  -> IO (Messages TcRnMessage, Maybe [Name])
 -- ^ Find all the Names that this RdrName could mean, in GHCi
 tcRnLookupRdrName hsc_env (L loc rdr_name)
   = runTcInteractive hsc_env $
-    setSrcSpan loc           $
+    setSrcSpanA loc          $
     do {   -- If the identifier is a constructor (begins with an
            -- upper-case letter), then we need to consider both
            -- constructor and type class identifiers.
          let rdr_names = dataTcOccs rdr_name
        ; names_s <- mapM lookupInfoOccRn rdr_names
        ; let names = concat names_s
-       ; when (null names) (addErrTc (text "Not in scope:" <+> quotes (ppr rdr_name)))
+       ; when (null names) (addErrTc $ TcRnUnknownMessage $ mkPlainError noHints $
+           (text "Not in scope:" <+> quotes (ppr rdr_name)))
        ; return names }
 
-tcRnLookupName :: HscEnv -> Name -> IO (Messages, Maybe TyThing)
+tcRnLookupName :: HscEnv -> Name -> IO (Messages TcRnMessage, Maybe TyThing)
 tcRnLookupName hsc_env name
   = runTcInteractive hsc_env $
     tcRnLookupName' name
@@ -2790,7 +2864,7 @@ tcRnLookupName' name = do
 
 tcRnGetInfo :: HscEnv
             -> Name
-            -> IO ( Messages
+            -> IO ( Messages TcRnMessage
                   , Maybe (TyThing, Fixity, [ClsInst], [FamInst], SDoc))
 
 -- Used to implement :info in GHCi
@@ -2852,15 +2926,15 @@ loadUnqualIfaces :: HscEnv -> InteractiveContext -> TcM ()
 -- This is so that we can accurately report the instances for
 -- something
 loadUnqualIfaces hsc_env ictxt
-  = initIfaceTcRn $ do
+  = initIfaceTcRn $
     mapM_ (loadSysInterface doc) (moduleSetElts (mkModuleSet unqual_mods))
   where
-    this_pkg = homeUnit (hsc_dflags hsc_env)
+    home_unit = hsc_home_unit hsc_env
 
     unqual_mods = [ nameModule name
-                  | gre <- globalRdrEnvElts (ic_rn_gbl_env ictxt)
-                  , let name = gre_name gre
-                  , nameIsFromExternalPackage this_pkg name
+                  | gre <- globalRdrEnvElts (icReaderEnv ictxt)
+                  , let name = greMangledName gre
+                  , nameIsFromExternalPackage home_unit name
                   , isTcOcc (nameOccName name)   -- Types and classes only
                   , unQualOK gre ]               -- In scope unqualified
     doc = text "Need interface for module whose export(s) are in scope unqualified"
@@ -2882,12 +2956,13 @@ rnDump rn = dumpOptTcRn Opt_D_dump_rn "Renamer" FormatHaskell (ppr rn)
 
 tcDump :: TcGblEnv -> TcRn ()
 tcDump env
- = do { dflags <- getDynFlags ;
+ = do { unit_state <- hsc_units <$> getTopEnv ;
+        logger <- getLogger ;
 
         -- Dump short output if -ddump-types or -ddump-tc
-        when (dopt Opt_D_dump_types dflags || dopt Opt_D_dump_tc dflags)
-          (dumpTcRn True (dumpOptionsFromFlag Opt_D_dump_types)
-            "" FormatText short_dump) ;
+        when (logHasDumpFlag logger Opt_D_dump_types || logHasDumpFlag logger Opt_D_dump_tc)
+          (dumpTcRn True Opt_D_dump_types
+            "" FormatText (pprWithUnitState unit_state short_dump)) ;
 
         -- Dump bindings if -ddump-tc
         dumpOptTcRn Opt_D_dump_tc "Typechecker" FormatHaskell full_dump;
@@ -2900,7 +2975,7 @@ tcDump env
     full_dump  = pprLHsBinds (tcg_binds env)
         -- NB: foreign x-d's have undefined's in their types;
         --     hence can't show the tc_fords
-    ast_dump = showAstData NoBlankSrcSpan (tcg_binds env)
+    ast_dump = showAstData NoBlankSrcSpan NoBlankEpAnnotations (tcg_binds env)
 
 -- It's unpleasant having both pprModGuts and pprModDetails here
 pprTcGblEnv :: TcGblEnv -> SDoc
@@ -2918,9 +2993,9 @@ pprTcGblEnv (TcGblEnv { tcg_type_env  = type_env,
          , ppr_fam_insts fam_insts
          , ppr_rules rules
          , text "Dependent modules:" <+>
-                pprUFM (imp_dep_mods imports) (ppr . sort)
+                (ppr . sort . installedModuleEnvElts $ imp_direct_dep_mods imports)
          , text "Dependent packages:" <+>
-                ppr (S.toList $ imp_dep_pkgs imports)]
+                ppr (S.toList $ imp_dep_direct_pkgs imports)]
                 -- The use of sort is just to reduce unnecessary
                 -- wobbling in testsuite output
 
@@ -2941,6 +3016,7 @@ ppr_types debug type_env
       | otherwise = hasTopUserName id
                     && case idDetails id of
                          VanillaId    -> True
+                         WorkerLikeId{} -> True
                          RecSelId {}  -> True
                          ClassOpId {} -> True
                          FCallId {}   -> True
@@ -2990,8 +3066,8 @@ ppr_datacons debug type_env
   = ppr_things "DATA CONSTRUCTORS" ppr_dc wanted_dcs
       -- The filter gets rid of class data constructors
   where
-    ppr_dc dc = sdocWithDynFlags (\dflags ->
-                ppr dc <+> dcolon <+> ppr (dataConDisplayType dflags dc))
+    ppr_dc dc = sdocOption sdocLinearTypes (\show_linear_types ->
+                ppr dc <+> dcolon <+> ppr (dataConDisplayType show_linear_types dc))
     all_dcs    = typeEnvDataCons type_env
     wanted_dcs | debug     = all_dcs
                | otherwise = filterOut is_cls_dc all_dcs
@@ -3036,58 +3112,73 @@ Type Checker Plugins
 
 withTcPlugins :: HscEnv -> TcM a -> TcM a
 withTcPlugins hsc_env m =
-  do let plugins = getTcPlugins (hsc_dflags hsc_env)
-     case plugins of
-       [] -> m  -- Common fast case
-       _  -> do ev_binds_var <- newTcEvBinds
-                (solvers,stops) <- unzip `fmap` mapM (startPlugin ev_binds_var) plugins
-                -- This ensures that tcPluginStop is called even if a type
+    case catMaybes $ mapPlugins (hsc_plugins hsc_env) tcPlugin of
+       []      -> m  -- Common fast case
+       plugins -> do
+                (solvers, rewriters, stops) <-
+                  unzip3 `fmap` mapM start_plugin plugins
+                let
+                  rewritersUniqFM :: UniqFM TyCon [TcPluginRewriter]
+                  !rewritersUniqFM = sequenceUFMList rewriters
+                -- The following ensures that tcPluginStop is called even if a type
                 -- error occurs during compilation (Fix of #10078)
-                eitherRes <- tryM $ do
-                  updGblEnv (\e -> e { tcg_tc_plugins = solvers }) m
-                mapM_ (flip runTcPluginM ev_binds_var) stops
+                eitherRes <- tryM $
+                  updGblEnv (\e -> e { tcg_tc_plugin_solvers   = solvers
+                                     , tcg_tc_plugin_rewriters = rewritersUniqFM }) m
+                mapM_ runTcPluginM stops
                 case eitherRes of
                   Left _ -> failM
                   Right res -> return res
   where
-  startPlugin ev_binds_var (TcPlugin start solve stop) =
-    do s <- runTcPluginM start ev_binds_var
-       return (solve s, stop s)
+  start_plugin (TcPlugin start solve rewrite stop) =
+    do s <- runTcPluginM start
+       return (solve s, rewrite s, stop s)
 
-getTcPlugins :: DynFlags -> [GHC.Tc.Utils.Monad.TcPlugin]
-getTcPlugins dflags = catMaybes $ mapPlugins dflags (\p args -> tcPlugin p args)
-
+withDefaultingPlugins :: HscEnv -> TcM a -> TcM a
+withDefaultingPlugins hsc_env m =
+  do case catMaybes $ mapPlugins (hsc_plugins hsc_env) defaultingPlugin of
+       [] -> m  -- Common fast case
+       plugins  -> do (plugins,stops) <- mapAndUnzipM start_plugin plugins
+                      -- This ensures that dePluginStop is called even if a type
+                      -- error occurs during compilation
+                      eitherRes <- tryM $ do
+                        updGblEnv (\e -> e { tcg_defaulting_plugins = plugins }) m
+                      mapM_ runTcPluginM stops
+                      case eitherRes of
+                        Left _ -> failM
+                        Right res -> return res
+  where
+  start_plugin (DefaultingPlugin start fill stop) =
+    do s <- runTcPluginM start
+       return (fill s, stop s)
 
 withHoleFitPlugins :: HscEnv -> TcM a -> TcM a
 withHoleFitPlugins hsc_env m =
-  case (getHfPlugins (hsc_dflags hsc_env)) of
+  case catMaybes $ mapPlugins (hsc_plugins hsc_env) holeFitPlugin of
     [] -> m  -- Common fast case
-    plugins -> do (plugins,stops) <- unzip `fmap` mapM startPlugin plugins
+    plugins -> do (plugins,stops) <- mapAndUnzipM start_plugin plugins
                   -- This ensures that hfPluginStop is called even if a type
                   -- error occurs during compilation.
-                  eitherRes <- tryM $ do
+                  eitherRes <- tryM $
                     updGblEnv (\e -> e { tcg_hf_plugins = plugins }) m
                   sequence_ stops
                   case eitherRes of
                     Left _ -> failM
                     Right res -> return res
   where
-    startPlugin (HoleFitPluginR init plugin stop) =
+    start_plugin (HoleFitPluginR init plugin stop) =
       do ref <- init
          return (plugin ref, stop ref)
-
-getHfPlugins :: DynFlags -> [HoleFitPluginR]
-getHfPlugins dflags =
-  catMaybes $ mapPlugins dflags (\p args -> holeFitPlugin p args)
 
 
 runRenamerPlugin :: TcGblEnv
                  -> HsGroup GhcRn
                  -> TcM (TcGblEnv, HsGroup GhcRn)
 runRenamerPlugin gbl_env hs_group = do
-    dflags <- getDynFlags
-    withPlugins dflags
-      (\p opts (e, g) -> ( mark_plugin_unsafe dflags >> renamedResultAction p opts e g))
+    hsc_env <- getTopEnv
+    withPlugins (hsc_plugins hsc_env)
+      (\p opts (e, g) -> ( mark_plugin_unsafe (hsc_dflags hsc_env)
+                            >> renamedResultAction p opts e g))
       (gbl_env, hs_group)
 
 
@@ -3096,7 +3187,7 @@ runRenamerPlugin gbl_env hs_group = do
 -- exception/signal an error.
 type RenamedStuff =
         (Maybe (HsGroup GhcRn, [LImportDecl GhcRn], Maybe [(LIE GhcRn, Avails)],
-                Maybe LHsDocString))
+                Maybe (LHsDoc GhcRn)))
 
 -- | Extract the renamed information from TcGblEnv.
 getRenamedStuff :: TcGblEnv -> RenamedStuff
@@ -3105,11 +3196,11 @@ getRenamedStuff tc_result
                     , tcg_rn_exports tc_result, tcg_doc_hdr tc_result ) )
          (tcg_rn_decls tc_result)
 
-runTypecheckerPlugin :: ModSummary -> HscEnv -> TcGblEnv -> TcM TcGblEnv
-runTypecheckerPlugin sum hsc_env gbl_env = do
-    let dflags = hsc_dflags hsc_env
-    withPlugins dflags
-      (\p opts env -> mark_plugin_unsafe dflags
+runTypecheckerPlugin :: ModSummary -> TcGblEnv -> TcM TcGblEnv
+runTypecheckerPlugin sum gbl_env = do
+    hsc_env <- getTopEnv
+    withPlugins (hsc_plugins hsc_env)
+      (\p opts env -> mark_plugin_unsafe (hsc_dflags hsc_env)
                         >> typeCheckResultAction p opts sum env)
       gbl_env
 
@@ -3117,6 +3208,7 @@ mark_plugin_unsafe :: DynFlags -> TcM ()
 mark_plugin_unsafe dflags = unless (gopt Opt_PluginTrustworthy dflags) $
   recordUnsafeInfer pluginUnsafe
   where
-    unsafeText = "Use of plugins makes the module unsafe"
-    pluginUnsafe = unitBag ( mkPlainWarnMsg dflags noSrcSpan
-                                   (Outputable.text unsafeText) )
+    !diag_opts = initDiagOpts dflags
+    pluginUnsafe =
+      singleMessage $
+      mkPlainMsgEnvelope diag_opts noSrcSpan TcRnUnsafeDueToPlugin

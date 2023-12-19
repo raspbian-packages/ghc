@@ -41,7 +41,7 @@ update_selector_chain(
 ) {
     ASSERT(val != NULL);
 
-    // Make sure we don't introduce non-moving-to-moving pointers here.
+    // Make sure we don't introduce nonmoving-to-moving pointers here.
     ASSERT(isNonmovingClosure(val));
 
     // This case we can't handle because we don't know info ptr of the closure
@@ -153,7 +153,8 @@ selectee_changed:
     // Selectee is a non-moving object, mark it.
     markQueuePushClosure(queue, selectee, NULL);
 
-    const StgInfoTable *selectee_info_tbl = get_itbl(selectee);
+    // This may synchronize with the release in updateWithIndirection.
+    const StgInfoTable *selectee_info_tbl = get_itbl_acquire(selectee);
     switch (selectee_info_tbl->type) {
         case WHITEHOLE: {
             // Probably a loop. Abort.

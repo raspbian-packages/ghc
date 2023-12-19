@@ -1,13 +1,19 @@
-{-# LANGUAGE MagicHash, RecordWildCards, GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE RecordWildCards            #-}
 --
 --  (c) The University of Glasgow 2002-2006
 --
 
 -- | Bytecode assembler types
 module GHC.ByteCode.Types
-  ( CompiledByteCode(..), seqCompiledByteCode, FFIInfo(..)
+  ( CompiledByteCode(..), seqCompiledByteCode
+  , FFIInfo(..)
+  , RegBitmap(..)
+  , NativeCallType(..), NativeCallInfo(..), voidTupleReturnInfo, voidPrimCallInfo
+  , ByteOff(..), WordOff(..)
   , UnlinkedBCO(..), BCOPtr(..), BCONPtr(..)
   , ItblEnv, ItblPtr(..)
+  , AddrEnv, AddrPtr(..)
   , CgBreakInfo(..)
   , ModBreaks (..), BreakIndex, emptyModBreaks
   , CCostCentre
@@ -16,13 +22,11 @@ module GHC.ByteCode.Types
 import GHC.Prelude
 
 import GHC.Data.FastString
-import GHC.Types.Id
+import GHC.Data.SizedSeq
 import GHC.Types.Name
 import GHC.Types.Name.Env
 import GHC.Utils.Outputable
 import GHC.Builtin.PrimOps
-import SizedSeq
-import GHC.Core.Type
 import GHC.Types.SrcLoc
 import GHCi.BreakArray
 import GHCi.RemoteTypes
@@ -35,9 +39,10 @@ import Data.Array.Base  ( UArray(..) )
 import Data.ByteString (ByteString)
 import Data.IntMap (IntMap)
 import qualified Data.IntMap as IntMap
-import Data.Maybe (catMaybes)
-import GHC.Exts.Heap
+import qualified GHC.Exts.Heap as Heap
 import GHC.Stack.CCS
+import GHC.Cmm.Expr ( GlobalRegSet, emptyRegSet, regSetToList )
+import GHC.Iface.Syntax
 
 -- -----------------------------------------------------------------------------
 -- Compiled Byte Code
@@ -46,7 +51,7 @@ data CompiledByteCode = CompiledByteCode
   { bc_bcos   :: [UnlinkedBCO]  -- Bunch of interpretable bindings
   , bc_itbls  :: ItblEnv        -- A mapping from DataCons to their itbls
   , bc_ffis   :: [FFIInfo]      -- ffi blocks we allocated
-  , bc_strs   :: [RemotePtr ()] -- malloc'd strings
+  , bc_strs   :: AddrEnv        -- malloc'd top-level strings
   , bc_breaks :: Maybe ModBreaks -- breakpoint info (Nothing if we're not
                                  -- creating breakpoints, for some reason)
   }
@@ -62,17 +67,78 @@ instance Outputable CompiledByteCode where
 seqCompiledByteCode :: CompiledByteCode -> ()
 seqCompiledByteCode CompiledByteCode{..} =
   rnf bc_bcos `seq`
-  rnf (nameEnvElts bc_itbls) `seq`
+  seqEltsNameEnv rnf bc_itbls `seq`
   rnf bc_ffis `seq`
-  rnf bc_strs `seq`
+  seqEltsNameEnv rnf bc_strs `seq`
   rnf (fmap seqModBreaks bc_breaks)
 
+newtype ByteOff = ByteOff Int
+    deriving (Enum, Eq, Show, Integral, Num, Ord, Real, Outputable)
+
+newtype WordOff = WordOff Int
+    deriving (Enum, Eq, Show, Integral, Num, Ord, Real, Outputable)
+
+newtype RegBitmap = RegBitmap { unRegBitmap :: Word32 }
+    deriving (Enum, Eq, Show, Integral, Num, Ord, Real, Bits, FiniteBits, Outputable)
+
+{- Note [GHCi TupleInfo]
+~~~~~~~~~~~~~~~~~~~~~~~~
+   This contains the data we need for passing unboxed tuples between
+   bytecode and native code
+
+   In general we closely follow the native calling convention that
+   GHC uses for unboxed tuples, but we don't use any registers in
+   bytecode. All tuple elements are expanded to use a full register
+   or a full word on the stack.
+
+   The position of tuple elements that are returned on the stack in
+   the native calling convention is unchanged when returning the same
+   tuple in bytecode.
+
+   The order of the remaining elements is determined by the register in
+   which they would have been returned, rather than by their position in
+   the tuple in the Haskell source code. This makes jumping between bytecode
+   and native code easier: A map of live registers is enough to convert the
+   tuple.
+
+   See GHC.StgToByteCode.layoutTuple for more details.
+-}
+
+data NativeCallType = NativePrimCall
+                    | NativeTupleReturn
+  deriving (Eq)
+
+data NativeCallInfo = NativeCallInfo
+  { nativeCallType           :: !NativeCallType
+  , nativeCallSize           :: !WordOff   -- total size of arguments in words
+  , nativeCallRegs           :: !GlobalRegSet
+  , nativeCallStackSpillSize :: !WordOff {- words spilled on the stack by
+                                            GHCs native calling convention -}
+  }
+
+instance Outputable NativeCallInfo where
+  ppr NativeCallInfo{..} = text "<arg_size" <+> ppr nativeCallSize <+>
+                           text "stack" <+> ppr nativeCallStackSpillSize <+>
+                           text "regs"  <+>
+                           ppr (map (text . show) $ regSetToList nativeCallRegs) <>
+                           char '>'
+
+
+voidTupleReturnInfo :: NativeCallInfo
+voidTupleReturnInfo = NativeCallInfo NativeTupleReturn 0 emptyRegSet 0
+
+voidPrimCallInfo :: NativeCallInfo
+voidPrimCallInfo = NativeCallInfo NativePrimCall 0 emptyRegSet 0
+
 type ItblEnv = NameEnv (Name, ItblPtr)
+type AddrEnv = NameEnv (Name, AddrPtr)
         -- We need the Name in the range so we know which
         -- elements to filter out when unloading a module
 
-newtype ItblPtr = ItblPtr (RemotePtr StgInfoTable)
+newtype ItblPtr = ItblPtr (RemotePtr Heap.StgInfoTable)
   deriving (Show, NFData)
+newtype AddrPtr = AddrPtr (RemotePtr ())
+  deriving (NFData)
 
 data UnlinkedBCO
    = UnlinkedBCO {
@@ -103,24 +169,34 @@ data BCONPtr
   = BCONPtrWord  {-# UNPACK #-} !Word
   | BCONPtrLbl   !FastString
   | BCONPtrItbl  !Name
+  -- | A reference to a top-level string literal; see
+  -- Note [Generating code for top-level string literal bindings] in GHC.StgToByteCode.
+  | BCONPtrAddr  !Name
+  -- | Only used internally in the assembler in an intermediate representation;
+  -- should never appear in a fully-assembled UnlinkedBCO.
+  -- Also see Note [Allocating string literals] in GHC.ByteCode.Asm.
   | BCONPtrStr   !ByteString
 
 instance NFData BCONPtr where
   rnf x = x `seq` ()
 
 -- | Information about a breakpoint that we know at code-generation time
+-- In order to be used, this needs to be hydrated relative to the current HscEnv by
+-- 'hydrateCgBreakInfo'. Everything here can be fully forced and that's critical for
+-- preventing space leaks (see #22530)
 data CgBreakInfo
    = CgBreakInfo
-   { cgb_vars   :: [Maybe (Id,Word16)]
-   , cgb_resty  :: Type
+   { cgb_tyvars :: ![IfaceTvBndr] -- ^ Type variables in scope at the breakpoint
+   , cgb_vars   :: ![Maybe (IfaceIdBndr, Word16)]
+   , cgb_resty  :: !IfaceType
    }
 -- See Note [Syncing breakpoint info] in GHC.Runtime.Eval
 
--- Not a real NFData instance because we can't rnf Id or Type
 seqCgBreakInfo :: CgBreakInfo -> ()
 seqCgBreakInfo CgBreakInfo{..} =
-  rnf (map snd (catMaybes (cgb_vars))) `seq`
-  seqType cgb_resty
+    rnf cgb_tyvars `seq`
+    rnf cgb_vars `seq`
+    rnf cgb_resty
 
 instance Outputable UnlinkedBCO where
    ppr (UnlinkedBCO nm _arity _insns _bitmap lits ptrs)

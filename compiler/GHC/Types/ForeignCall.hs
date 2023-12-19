@@ -23,8 +23,9 @@ import GHC.Prelude
 import GHC.Data.FastString
 import GHC.Utils.Binary
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
 import GHC.Unit.Module
-import GHC.Types.Basic ( SourceText, pprWithSourceText )
+import GHC.Types.SourceText ( SourceText, pprWithSourceText )
 
 import Data.Char
 import Data.Data
@@ -70,7 +71,7 @@ data Safety
                       --     * No blocking
                       --     * No precise exceptions
                       --
-  deriving ( Eq, Show, Data )
+  deriving ( Eq, Show, Data, Enum )
         -- Show used just for Show Lex.Token, I think
 
 instance Outputable Safety where
@@ -98,7 +99,7 @@ playInterruptible _ = False
 data CExportSpec
   = CExportStatic               -- foreign export ccall foo :: ty
         SourceText              -- of the CLabelString.
-                                -- See note [Pragma source text] in GHC.Types.Basic
+                                -- See Note [Pragma source text] in GHC.Types.SourceText
         CLabelString            -- C Name of exported function
         CCallConv
   deriving Data
@@ -116,7 +117,7 @@ data CCallTarget
   -- An "unboxed" ccall# to named function in a particular package.
   = StaticTarget
         SourceText                -- of the CLabelString.
-                                  -- See note [Pragma source text] in GHC.Types.Basic
+                                  -- See Note [Pragma source text] in GHC.Types.SourceText
         CLabelString                    -- C-land name of label.
 
         (Maybe Unit)                    -- What package the function is in.
@@ -152,9 +153,14 @@ stdcall:        Caller allocates parameters, callee deallocates.
 See: http://www.programmersheaven.com/2/Calling-conventions
 -}
 
--- any changes here should be replicated in  the CallConv type in template haskell
-data CCallConv = CCallConv | CApiConv | StdCallConv | PrimCallConv | JavaScriptCallConv
-  deriving (Eq, Data)
+-- any changes here should be replicated in the CallConv type in template haskell
+data CCallConv
+  = CCallConv
+  | CApiConv
+  | StdCallConv
+  | PrimCallConv
+  | JavaScriptCallConv
+  deriving (Eq, Data, Enum)
 
 instance Outputable CCallConv where
   ppr StdCallConv = text "stdcall"
@@ -227,7 +233,7 @@ instance Outputable CCallSpec where
         = text "__ffi_dyn_ccall" <> gc_suf <+> text "\"\""
 
 -- The filename for a C header file
--- Note [Pragma source text] in GHC.Types.Basic
+-- Note [Pragma source text] in GHC.Types.SourceText
 data Header = Header SourceText FastString
     deriving (Eq, Data)
 
@@ -240,8 +246,8 @@ instance Outputable Header where
 --        'GHC.Parser.Annotation.AnnHeader','GHC.Parser.Annotation.AnnVal',
 --        'GHC.Parser.Annotation.AnnClose' @'\#-}'@,
 
--- For details on above see note [Api annotations] in "GHC.Parser.Annotation"
-data CType = CType SourceText -- Note [Pragma source text] in GHC.Types.Basic
+-- For details on above see Note [exact print annotations] in "GHC.Parser.Annotation"
+data CType = CType SourceText -- Note [Pragma source text] in GHC.Types.SourceText
                    (Maybe Header) -- header to include for this type
                    (SourceText,FastString) -- the type itself
     deriving (Eq, Data)
@@ -267,18 +273,18 @@ instance Binary ForeignCall where
     get bh = do aa <- get bh; return (CCall aa)
 
 instance Binary Safety where
-    put_ bh PlaySafe = do
+    put_ bh PlaySafe =
             putByte bh 0
-    put_ bh PlayInterruptible = do
+    put_ bh PlayInterruptible =
             putByte bh 1
-    put_ bh PlayRisky = do
+    put_ bh PlayRisky =
             putByte bh 2
     get bh = do
             h <- getByte bh
             case h of
-              0 -> do return PlaySafe
-              1 -> do return PlayInterruptible
-              _ -> do return PlayRisky
+              0 -> return PlaySafe
+              1 -> return PlayInterruptible
+              _ -> return PlayRisky
 
 instance Binary CExportSpec where
     put_ bh (CExportStatic ss aa ab) = do
@@ -309,7 +315,7 @@ instance Binary CCallTarget where
             put_ bh aa
             put_ bh ab
             put_ bh ac
-    put_ bh DynamicTarget = do
+    put_ bh DynamicTarget =
             putByte bh 1
     get bh = do
             h <- getByte bh
@@ -319,27 +325,27 @@ instance Binary CCallTarget where
                       ab <- get bh
                       ac <- get bh
                       return (StaticTarget ss aa ab ac)
-              _ -> do return DynamicTarget
+              _ -> return DynamicTarget
 
 instance Binary CCallConv where
-    put_ bh CCallConv = do
+    put_ bh CCallConv =
             putByte bh 0
-    put_ bh StdCallConv = do
+    put_ bh StdCallConv =
             putByte bh 1
-    put_ bh PrimCallConv = do
+    put_ bh PrimCallConv =
             putByte bh 2
-    put_ bh CApiConv = do
+    put_ bh CApiConv =
             putByte bh 3
-    put_ bh JavaScriptCallConv = do
+    put_ bh JavaScriptCallConv =
             putByte bh 4
     get bh = do
             h <- getByte bh
             case h of
-              0 -> do return CCallConv
-              1 -> do return StdCallConv
-              2 -> do return PrimCallConv
-              3 -> do return CApiConv
-              _ -> do return JavaScriptCallConv
+              0 -> return CCallConv
+              1 -> return StdCallConv
+              2 -> return PrimCallConv
+              3 -> return CApiConv
+              _ -> return JavaScriptCallConv
 
 instance Binary CType where
     put_ bh (CType s mh fs) = do put_ bh s

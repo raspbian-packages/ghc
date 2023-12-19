@@ -1,7 +1,7 @@
 -- | Tests for readers
 
 {-# LANGUAGE OverloadedStrings, ScopedTypeVariables #-}
-{-# OPTIONS_GHC -fno-enable-rewrite-rules -fno-warn-missing-signatures #-}
+{-# OPTIONS_GHC -fno-warn-missing-signatures #-}
 module Tests.Properties.Read
     ( testRead
     ) where
@@ -12,7 +12,6 @@ import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.QuickCheck (testProperty)
 import Test.QuickCheck
 import Tests.QuickCheckUtils ()
-import Text.Show.Functions ()
 import qualified Data.Text as T
 import qualified Data.Text.Lazy as TL
 import qualified Data.Text.Lazy.Read as TL
@@ -41,14 +40,14 @@ isFloaty c = c `elem` ("+-.0123456789eE" :: String)
 
 t_read_rational p tol (n::Double) s =
     case p (T.pack (show n) `T.append` t) of
-      Left _err     -> False
-      Right (n',t') -> t == t' && abs (n-n') <= tol
+      Left err      -> counterexample err $ property False
+      Right (n',t') -> t === t' .&&. property (abs (n-n') <= tol)
     where t = T.dropWhile isFloaty s
 
 tl_read_rational p tol (n::Double) s =
     case p (TL.pack (show n) `TL.append` t) of
-      Left _err     -> False
-      Right (n',t') -> t == t' && abs (n-n') <= tol
+      Left err      -> counterexample err $ property False
+      Right (n',t') -> t === t' .&&. property (abs (n-n') <= tol)
     where t = TL.dropWhile isFloaty s
 
 t_double = t_read_rational T.double 1e-13

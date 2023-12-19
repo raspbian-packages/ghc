@@ -30,7 +30,7 @@ import Text.ParserCombinators.ReadP (ReadP)
 import Data.Char (isAlphaNum)
 
 -- | A ModuleName is essentially a simple string, e.g. @Data.List@.
-newtype ModuleName = ModuleName FastString
+newtype ModuleName = ModuleName FastString deriving Show
 
 instance Uniquable ModuleName where
   getUnique (ModuleName nm) = getUnique nm
@@ -59,7 +59,7 @@ instance NFData ModuleName where
 
 stableModuleNameCmp :: ModuleName -> ModuleName -> Ordering
 -- ^ Compares module names lexically, rather than by their 'Unique's
-stableModuleNameCmp n1 n2 = moduleNameFS n1 `compare` moduleNameFS n2
+stableModuleNameCmp n1 n2 = moduleNameFS n1 `lexicalCompareFS` moduleNameFS n2
 
 pprModuleName :: ModuleName -> SDoc
 pprModuleName (ModuleName nm) =

@@ -34,10 +34,6 @@ import GHC.Num.BigNat
 import GHC.Num.Natural
 import qualified GHC.Num.Backend as Backend
 
-#if WORD_SIZE_IN_BITS < 64
-import GHC.IntWord64
-#endif
-
 default ()
 
 -- | Arbitrary precision integers. In contrast with fixed-size integral types
@@ -133,7 +129,7 @@ integerToBigNatClamp# :: Integer -> BigNat#
 integerToBigNatClamp# (IP x) = x
 integerToBigNatClamp# (IS x)
    | isTrue# (x >=# 0#)     = bigNatFromWord# (int2Word# x)
-integerToBigNatClamp# _     = bigNatZero# void#
+integerToBigNatClamp# _     = bigNatZero# (# #)
 
 -- | Create an Integer from an Int#
 integerFromInt# :: Int# -> Integer
@@ -198,7 +194,7 @@ integerToWord !i = W# (integerToWord# i)
 integerFromNatural :: Natural -> Integer
 {-# NOINLINE integerFromNatural #-}
 integerFromNatural (NS x) = integerFromWord# x
-integerFromNatural (NB x) = integerFromBigNat# x
+integerFromNatural (NB x) = IP x
 
 -- | Convert a list of Word into an Integer
 integerFromWordList :: Bool -> [Word] -> Integer
@@ -286,7 +282,6 @@ integerGe !x !y = isTrue# (integerGe# x y)
 
 -- | Equal predicate.
 integerEq# :: Integer -> Integer -> Bool#
-{-# NOINLINE integerEq# #-}
 integerEq# (IS x) (IS y) = x ==# y
 integerEq# (IN x) (IN y) = bigNatEq# x y
 integerEq# (IP x) (IP y) = bigNatEq# x y
@@ -294,7 +289,6 @@ integerEq# _       _     = 0#
 
 -- | Not-equal predicate.
 integerNe# :: Integer -> Integer -> Bool#
-{-# NOINLINE integerNe# #-}
 integerNe# (IS x) (IS y) = x /=# y
 integerNe# (IN x) (IN y) = bigNatNe# x y
 integerNe# (IP x) (IP y) = bigNatNe# x y
@@ -302,31 +296,27 @@ integerNe# _       _     = 1#
 
 -- | Greater predicate.
 integerGt# :: Integer -> Integer -> Bool#
-{-# NOINLINE integerGt# #-}
-integerGt# (IS x) (IS y)                   = x ># y
-integerGt# x y | GT <- integerCompare' x y = 1#
-integerGt# _ _                             = 0#
+integerGt# (IS x) (IS y)                  = x ># y
+integerGt# x y | GT <- integerCompare x y = 1#
+integerGt# _ _                            = 0#
 
 -- | Lower-or-equal predicate.
 integerLe# :: Integer -> Integer -> Bool#
-{-# NOINLINE integerLe# #-}
-integerLe# (IS x) (IS y)                   = x <=# y
-integerLe# x y | GT <- integerCompare' x y = 0#
-integerLe# _ _                             = 1#
+integerLe# (IS x) (IS y)                  = x <=# y
+integerLe# x y | GT <- integerCompare x y = 0#
+integerLe# _ _                            = 1#
 
 -- | Lower predicate.
 integerLt# :: Integer -> Integer -> Bool#
-{-# NOINLINE integerLt# #-}
-integerLt# (IS x) (IS y)                   = x <# y
-integerLt# x y | LT <- integerCompare' x y = 1#
-integerLt# _ _                             = 0#
+integerLt# (IS x) (IS y)                  = x <# y
+integerLt# x y | LT <- integerCompare x y = 1#
+integerLt# _ _                            = 0#
 
 -- | Greater-or-equal predicate.
 integerGe# :: Integer -> Integer -> Bool#
-{-# NOINLINE integerGe# #-}
-integerGe# (IS x) (IS y)                   = x >=# y
-integerGe# x y | LT <- integerCompare' x y = 0#
-integerGe# _ _                             = 1#
+integerGe# (IS x) (IS y)                  = x >=# y
+integerGe# x y | LT <- integerCompare x y = 0#
+integerGe# _ _                            = 1#
 
 instance Eq Integer where
    (==) = integerEq
@@ -334,20 +324,16 @@ instance Eq Integer where
 
 -- | Compare two Integer
 integerCompare :: Integer -> Integer -> Ordering
-{-# NOINLINE integerCompare #-}
-integerCompare = integerCompare'
-
-integerCompare' :: Integer -> Integer -> Ordering
-{-# INLINE integerCompare' #-}
-integerCompare' (IS x) (IS y) = compareInt# x y
-integerCompare' (IP x) (IP y) = bigNatCompare x y
-integerCompare' (IN x) (IN y) = bigNatCompare y x
-integerCompare' (IS _) (IP _) = LT
-integerCompare' (IS _) (IN _) = GT
-integerCompare' (IP _) (IS _) = GT
-integerCompare' (IN _) (IS _) = LT
-integerCompare' (IP _) (IN _) = GT
-integerCompare' (IN _) (IP _) = LT
+{-# INLINEABLE integerCompare #-}
+integerCompare (IS x) (IS y) = compareInt# x y
+integerCompare (IP x) (IP y) = bigNatCompare x y
+integerCompare (IN x) (IN y) = bigNatCompare y x
+integerCompare (IS _) (IP _) = LT
+integerCompare (IS _) (IN _) = GT
+integerCompare (IP _) (IS _) = GT
+integerCompare (IN _) (IS _) = LT
+integerCompare (IP _) (IN _) = GT
+integerCompare (IN _) (IP _) = LT
 
 instance Ord Integer where
    compare = integerCompare
@@ -528,13 +514,11 @@ integerAbs n@(IS i)
 -- | Return @-1@, @0@, and @1@ depending on whether argument is
 -- negative, zero, or positive, respectively
 integerSignum :: Integer -> Integer
-{-# NOINLINE integerSignum #-}
 integerSignum !j = IS (integerSignum# j)
 
 -- | Return @-1#@, @0#@, and @1#@ depending on whether argument is
 -- negative, zero, or positive, respectively
 integerSignum# :: Integer -> Int#
-{-# NOINLINE integerSignum# #-}
 integerSignum# (IN _)  = -1#
 integerSignum# (IS i#) = sgnI# i#
 integerSignum# (IP _ ) =  1#
@@ -577,7 +561,7 @@ integerTestBit# (IN x) i
    | isTrue# (iw >=# n)
    = 1#
    -- if all the limbs j with j < iw are null, then we have to consider the
-   -- carry of the 2's complement convertion. Otherwise we just have to return
+   -- carry of the 2's complement conversion. Otherwise we just have to return
    -- the inverse of the bit test
    | allZ iw = testBitW# (xi `minusWord#` 1##) ib ==# 0#
    | True    = testBitW# xi ib ==# 0#
@@ -653,7 +637,7 @@ integerOr a b = case a of
                IS -1# -> IS -1#
                IS  y  -> IS (orI# x y)
                IP  y
-                  | isTrue# (x >=# 0#) -> integerFromBigNat# (bigNatOrWord# y (int2Word# x))
+                  | isTrue# (x >=# 0#) -> IP (bigNatOrWord# y (int2Word# x))
                   | True               -> integerFromBigNatNeg#
                                              (bigNatAddWord#
                                                 (bigNatAndNot -- use De Morgan's laws
@@ -676,7 +660,7 @@ integerOr a b = case a of
                                                 1##)
    IP  x  -> case b of
                IS _ -> integerOr b a
-               IP y -> integerFromBigNat# (bigNatOr x y)
+               IP y -> IP (bigNatOr x y)
                IN y -> integerFromBigNatNeg#
                         (bigNatAddWord#
                            (bigNatAndNot -- use De Morgan's laws
@@ -1014,14 +998,12 @@ integerIsPowerOf2# (IS i)
 integerIsPowerOf2# (IN _) = (# (# #) | #)
 integerIsPowerOf2# (IP w) = bigNatIsPowerOf2# w
 
-#if WORD_SIZE_IN_BITS == 32
-
--- | Convert an Int64# into an Integer on 32-bit architectures
+-- | Convert an Int64# into an Integer
 integerFromInt64# :: Int64# -> Integer
 {-# NOINLINE integerFromInt64# #-}
-integerFromInt64# !i
-  | isTrue# ((i `leInt64#` intToInt64#  0x7FFFFFFF#)
-      &&# (i `geInt64#` intToInt64# -0x80000000#))
+integerFromInt64# i
+  | isTrue# ((i `leInt64#` intToInt64#  INT_MAXBOUND#)
+      &&# (i `geInt64#` intToInt64# INT_MINBOUND#))
   = IS (int64ToInt# i)
 
   | isTrue# (i `geInt64#` intToInt64# 0#)
@@ -1030,36 +1012,28 @@ integerFromInt64# !i
   | True
   = IN (bigNatFromWord64# (int64ToWord64# (negateInt64# i)))
 
--- | Convert a Word64# into an Integer on 32-bit architectures
+-- | Convert a Word64# into an Integer
 integerFromWord64# :: Word64# -> Integer
 {-# NOINLINE integerFromWord64# #-}
 integerFromWord64# !w
-  | isTrue# (w `leWord64#` wordToWord64# 0x7FFFFFFF##)
+  | isTrue# (w `leWord64#` wordToWord64# INT_MAXBOUND##)
   = IS (int64ToInt# (word64ToInt64# w))
   | True
   = IP (bigNatFromWord64# w)
 
--- | Convert an Integer into an Int64# on 32-bit architectures
+-- | Convert an Integer into an Int64#
 integerToInt64# :: Integer -> Int64#
 {-# NOINLINE integerToInt64# #-}
 integerToInt64# (IS i) = intToInt64# i
 integerToInt64# (IP b) = word64ToInt64# (bigNatToWord64# b)
 integerToInt64# (IN b) = negateInt64# (word64ToInt64# (bigNatToWord64# b))
 
--- | Convert an Integer into a Word64# on 32-bit architectures
+-- | Convert an Integer into a Word64#
 integerToWord64# :: Integer -> Word64#
 {-# NOINLINE integerToWord64# #-}
 integerToWord64# (IS i) = int64ToWord64# (intToInt64# i)
 integerToWord64# (IP b) = bigNatToWord64# b
 integerToWord64# (IN b) = int64ToWord64# (negateInt64# (word64ToInt64# (bigNatToWord64# b)))
-
-#else
-
--- | Convert an Int64# into an Integer on 64-bit architectures
-integerFromInt64# :: Int# -> Integer
-integerFromInt64# !x = IS x
-
-#endif
 
 ----------------------------------------------------------------------------
 -- Conversions to/from floating point
@@ -1084,22 +1058,11 @@ integerEncodeDouble# (IN b) e  = negateDouble# (bigNatEncodeDouble# b e)
 integerEncodeDouble :: Integer -> Int -> Double
 integerEncodeDouble !m (I# e)  = D# (integerEncodeDouble# m e)
 
--- | Encode an Integer (mantissa) into a Double#
-integerToDouble# :: Integer -> Double#
-{-# NOINLINE integerToDouble# #-}
-integerToDouble# !i = integerEncodeDouble# i 0#
-
--- | Encode an Integer (mantissa) into a Float#
-integerToFloat# :: Integer -> Float#
-{-# NOINLINE integerToFloat# #-}
-integerToFloat# !i = integerEncodeFloat# i 0#
-
 -- | Encode (# Integer mantissa, Int# exponent #) into a Float#
 --
 -- TODO: Not sure if it's worth to write 'Float' optimized versions here
 integerEncodeFloat# :: Integer -> Int# -> Float#
 {-# NOINLINE integerEncodeFloat# #-}
-integerEncodeFloat# !m 0# = double2Float# (integerToDouble# m)
 integerEncodeFloat# !m e  = double2Float# (integerEncodeDouble# m e)
 
 -- | Compute the number of digits of the Integer (without the sign) in the given base.
@@ -1284,3 +1247,271 @@ integerPowMod# !b !e !m
 
      -- e > 0 by cases above
    | True = (# Backend.integer_powmod b (integerToNatural e) m | #)
+
+
+{-
+Note [Optimising conversions between numeric types]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Converting between numeric types is very common in Haskell codes.  Suppose that
+we have N inter-convertible numeric types (Word, Word8, Word32, Int, etc.).
+
+- We don't want to have to use one conversion function per pair of types as that
+would require N^2 functions: wordToWord8, wordToInt, word8ToWord32...
+
+- The following kind of class would allow us to have a single conversion
+function but at the price of N^2 instances and of the use of
+MultiParamTypeClasses extension.
+
+    class Convert a b where
+      convert :: a -> b
+
+So what we do instead is that we use the Integer type (signed, unbounded) as a
+passthrough type to perform every conversion. Hence we only need to define two
+functions per numeric type:
+
+  class Integral a where
+    toInteger :: a -> Integer
+
+  class Num a where
+    fromInteger :: Integer -> a
+
+These classes have a single parameter and can be derived automatically (e.g. for
+newtypes). So we don't even have to define 2*N instances. For example, all the
+instances for the types in Foreign.C.Types (CChar, CShort, CInt, CUInt, etc.)
+are automatically derived from the instances for Word, Int, Word8, Word16, etc.
+
+Finally we can define a generic conversion function:
+
+  -- in the Prelude
+  fromIntegral :: (Integral a, Num b) => a -> b
+  fromIntegral = fromInteger . toInteger
+
+Efficient conversions
+~~~~~~~~~~~~~~~~~~~~~
+
+An issue with this approach is that performance might be terrible. E.g.
+converting an Int into a Word, which is a no-op at the machine level, becomes
+costly when performed via `fromIntegral` or any similar function because an
+intermediate Integer has to be allocated in the heap to perform the conversion.
+
+A solution is to bless one particular `fromIntegral`-like function and to use
+rewrite rules to replace it with a more efficient function when both types are
+known. This is what was done in the past, see next section. We use another
+approach nowadays:
+
+Notice that the set of primitive operations to convert from and to Integer and
+Natural is pretty small:
+
+  - Natural <-> Word#/BigNat#
+  - Integer <-> Int#/Word#/Natural/BigNat# (+ Int64#/Word64# on 32-bit arch)
+
+For example, we have the following primitives:
+  - integerToWord#   :: Integer -> Word#
+  - integerFromWord# :: Word# -> Integer
+  - integerToInt#    :: Integer -> Int#
+  - ...
+
+Compared to optimising `fromIntegral :: (Integral a, Num b) => a -> b` where `a`
+and `b` are arbitrary, we only have to write rewrite rules for the concrete
+types that can be converted from and to Natural/Integer. All the other ones
+necessarily pass through these concrete types!
+
+For example we have the following rules:
+    integerToWord# (integerFromWord# x) ===> x
+    integerToInt# (integerFromWord# x)  ===> word2Int# x
+
+But we don't need rules to handle conversion from/to e.g. Word32# because there
+is no Word32#-to-Integer primitive: Word32# must be converted into something
+else first (e.g. Word#) for which we have rules.
+
+We rely on inlining of fromInteger/toInteger and on other transformations (e.g.
+float-in) to make these rules likely to fire. It seems to work well in practice.
+
+Example 1: converting an Int into a Word
+
+  fromIntegral @Int @Word x
+
+  ===> {inline fromIntegral}
+  fromInteger @Word (toInteger @Int x)
+
+  ===> {inline fromInteger and toInteger}
+  W# (integerToWord# (case x of { I# x# -> IS x# }))
+
+  ===> {float-in}
+  case x of { I# x# -> W# (integerToWord# (IS x#)) }
+
+  ===> {rewrite rule for "integerToWord# . IS"}
+  case x of { I# x# -> W# (int2Word# x#) }
+
+
+Example 2: converting an Int8 into a Word32
+
+  fromIntegral @Int8 @Word32 x
+
+  ===> {inline fromIntegral}
+  fromInteger @Word32 (toInteger @Int8 x)
+
+  ===> {inline fromInteger and toInteger}
+  W32# (wordToWord32# (integerToWord# (case x of { I8# x# -> IS (int8ToInt# x#) })))
+
+  ===> {float-in}
+  case x of { I8# x# -> W32# (wordToWord32# (integerToWord# (IS (int8ToInt# x#)))) }
+
+  ===> {rewrite rule for "integerToWord# . IS"}
+  case x of { I8# x# -> W32# (wordToWord32# (int2Word# (int8ToInt# x#))) }
+
+  Notice that in the resulting expression the value passes through types Int#
+  and Word# with native machine word size: it is first sign-extended from Int8#
+  to Int#, then cast into Word#, and finally truncated into Word32#. These are
+  all very cheap operations that are performed in registers without allocating
+  anything in the heap.
+
+
+
+Historical fromIntegral optimisations
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+In the past, `fromIntegral` function in the Prelude was special because many
+rewrite rules were mentioning it explicitly. For example to replace a call to
+`fromIntegral :: Int -> Word`, which allocates an intermediate Integer, with a
+call to `intToWord`, which is a no-op when compiled into machine code. Nowadays
+`fromIntegral` isn't a special function anymore and we just INLINE it (see above).
+
+- first `fromIntegral` was specialized (SPECIALIZE pragma). However it would
+need N^2 pragmas to cover every case and it wouldn't cover user defined numeric
+types which don't belong to base.
+
+- `-fwarn-identities` enables a warning to detect useless conversions via
+fromIntegral (since 0656c72a8f):
+
+  > fromIntegral (1 :: Int) :: Int
+
+  <interactive>:3:21: warning: [-Widentities]
+      Call of fromIntegral :: Int -> Int
+        can probably be omitted
+
+
+- many rules were added (e.g. in e0c787c10f) to perform float-in transformations
+explicitly (to allow more fromIntegral rules to fire) and to replace some
+fromIntegral calls with faster operations:
+
+    "fromIntegral/Int8->Int8" fromIntegral = id :: Int8 -> Int8
+    "fromIntegral/a->Int8"    fromIntegral = \x -> case fromIntegral x of I# x# -> I8# (intToInt8# x#)
+    "fromIntegral/Int8->a"    fromIntegral = \(I8# x#) -> fromIntegral (I# x#)
+
+It worked but there were still some issues with this approach:
+
+1. These rules only work for `fromIntegral`. If we wanted to define our own
+   similar function (e.g. using other type-classes), we would also have to redefine
+   all the rules to get similar performance.
+
+2. `fromIntegral` had to be marked `NOINLINE [1]`:
+    - NOINLINE to allow rules to match
+    - [1] to allow inlining in later phases to avoid incurring a function call
+      overhead for such a trivial operation
+
+   Users of the function had to be careful because a simple helper without an
+   INLINE pragma like:
+
+      toInt :: Integral a => a -> Int
+      toInt = fromIntegral
+
+   had the following unfolding:
+
+      toInt = integerToInt . toInteger
+
+   which doesn't mention `fromIntegral` anymore. Hence `fromIntegral` rules
+   wouldn't fire for codes using `toInt` while they would if they had used
+   `fromIntegral` directly!
+   For this reason, a bunch of rules for bignum primitives as we have now were
+   already present to handle these cases.
+
+3. These rewrite rules were tedious to write and error-prone (cf #19345).
+
+For these reasons, it is simpler to not consider fromIntegral special at all and
+to only rely on rewrite rules for bignum functions.
+
+-}
+
+-- See Note [Optimising conversions between numeric types]
+{-# RULES
+"Word# -> Natural -> Integer"
+  forall x. integerFromNatural (NS x) = integerFromWord# x
+
+"BigNat# -> Natural -> Integer"
+  forall x. integerFromNatural (NB x) = IP x
+
+"Int# -> Integer -> Int#"
+  forall x. integerToInt# (IS x) = x
+
+"Word# -> Integer -> Word#"
+  forall x. integerToWord# (integerFromWord# x) = x
+
+"Natural -> Integer -> Natural (wrap)"
+  forall x. integerToNatural (integerFromNatural x) = x
+
+"Natural -> Integer -> Natural (throw)"
+  forall x. integerToNaturalThrow (integerFromNatural x) = x
+
+"Natural -> Integer -> Natural (clamp)"
+  forall x. integerToNaturalClamp (integerFromNatural x) = x
+
+"Natural -> Integer -> Word#"
+  forall x. integerToWord# (integerFromNatural x) = naturalToWord# x
+
+"Int# -> Integer -> Word#"
+  forall x. integerToWord# (IS x) = int2Word# x
+
+"Word# -> Integer -> Int#"
+  forall x. integerToInt# (integerFromWord# x) = word2Int# x
+
+"Word# -> Integer -> Natural (wrap)"
+  forall x. integerToNatural (integerFromWord# x) = NS x
+
+"Word# -> Integer -> Natural (throw)"
+  forall x. integerToNaturalThrow (integerFromWord# x) = NS x
+
+"Word# -> Integer -> Natural (clamp)"
+  forall x. integerToNaturalClamp (integerFromWord# x) = NS x
+
+#-}
+
+{-# RULES
+
+"Int64# -> Integer -> Int64#"
+  forall x. integerToInt64# (integerFromInt64# x) = x
+
+"Word64# -> Integer -> Word64#"
+  forall x. integerToWord64# (integerFromWord64# x) = x
+
+"Int64# -> Integer -> Word64#"
+  forall x. integerToWord64# (integerFromInt64# x) = int64ToWord64# x
+
+"Word64# -> Integer -> Int64#"
+  forall x. integerToInt64# (integerFromWord64# x) = word64ToInt64# x
+
+"Word# -> Integer -> Word64#"
+  forall x. integerToWord64# (integerFromWord# x) = wordToWord64# x
+
+"Word64# -> Integer -> Word#"
+  forall x. integerToWord# (integerFromWord64# x) = word64ToWord# x
+
+"Int# -> Integer -> Int64#"
+  forall x. integerToInt64# (IS x) = intToInt64# x
+
+"Int64# -> Integer -> Int#"
+  forall x. integerToInt# (integerFromInt64# x) = int64ToInt# x
+
+"Int# -> Integer -> Word64#"
+  forall x. integerToWord64# (IS x) = int64ToWord64# (intToInt64# x)
+
+"Int64# -> Integer -> Word#"
+  forall x. integerToWord# (integerFromInt64# x) = int2Word# (int64ToInt# x)
+
+"Word# -> Integer -> Int64#"
+  forall x. integerToInt64# (integerFromWord# x) = word64ToInt64# (wordToWord64# x)
+
+"Word64# -> Integer -> Int#"
+  forall x. integerToInt# (integerFromWord64# x) = word2Int# (word64ToWord# x)
+
+#-}

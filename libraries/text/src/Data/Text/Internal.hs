@@ -1,4 +1,8 @@
-{-# LANGUAGE CPP, DeriveDataTypeable, UnboxedTuples #-}
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE UnboxedTuples #-}
 {-# OPTIONS_HADDOCK not-home #-}
 
 -- |
@@ -33,6 +37,7 @@ module Data.Text.Internal
     -- * Code that must be here for accessibility
     , empty
     , empty_
+    , append
     -- * Utilities
     , firstf
     -- * Checked multiplication
@@ -41,23 +46,26 @@ module Data.Text.Internal
     , mul64
     -- * Debugging
     , showText
+    -- * Conversions
+    , pack
     ) where
 
 #if defined(ASSERTS)
 import Control.Exception (assert)
 import GHC.Stack (HasCallStack)
 #endif
+import Control.Monad.ST (ST, runST)
 import Data.Bits
 import Data.Int (Int32, Int64)
-import Data.Text.Internal.Unsafe.Char (ord)
+import Data.Text.Internal.Unsafe.Char (ord, unsafeWrite)
 import Data.Typeable (Typeable)
 import qualified Data.Text.Array as A
 
 -- | A space efficient, packed, unboxed Unicode text type.
 data Text = Text
-    {-# UNPACK #-} !A.Array          -- payload (Word16 elements)
-    {-# UNPACK #-} !Int              -- offset (units of Word16, not Char)
-    {-# UNPACK #-} !Int              -- length (units of Word16, not Char)
+    {-# UNPACK #-} !A.Array -- ^ bytearray encoded as UTF-8
+    {-# UNPACK #-} !Int     -- ^ offset in bytes (not in Char!), pointing to a start of UTF-8 sequence
+    {-# UNPACK #-} !Int     -- ^ length in bytes (not in Char!), pointing to an end of UTF-8 sequence
     deriving (Typeable)
 
 -- | Smart constructor.
@@ -65,13 +73,16 @@ text_ ::
 #if defined(ASSERTS)
   HasCallStack =>
 #endif
-  A.Array -> Int -> Int -> Text
+     A.Array -- ^ bytearray encoded as UTF-8
+  -> Int     -- ^ offset in bytes (not in Char!), pointing to a start of UTF-8 sequence
+  -> Int     -- ^ length in bytes (not in Char!), pointing to an end of UTF-8 sequence
+  -> Text
 text_ arr off len =
 #if defined(ASSERTS)
   let c    = A.unsafeIndex arr off
   in assert (len >= 0) .
      assert (off >= 0) .
-     assert (len == 0 || c < 0xDC00 || c > 0xDFFF) $
+     assert (len == 0 || c < 0x80 || c >= 0xC0) $
 #endif
      Text arr off len
 {-# INLINE text_ #-}
@@ -86,13 +97,34 @@ empty_ :: Text
 empty_ = Text A.empty 0 0
 {-# NOINLINE empty_ #-}
 
+-- | /O(n)/ Appends one 'Text' to the other by copying both of them
+-- into a new 'Text'.
+append :: Text -> Text -> Text
+append a@(Text arr1 off1 len1) b@(Text arr2 off2 len2)
+    | len1 == 0 = b
+    | len2 == 0 = a
+    | len > 0   = Text (A.run x) 0 len
+    | otherwise = error $ "Data.Text.append: size overflow"
+    where
+      len = len1+len2
+      x :: ST s (A.MArray s)
+      x = do
+        arr <- A.new len
+        A.copyI len1 arr 0 arr1 off1
+        A.copyI len2 arr len1 arr2 off2
+        return arr
+{-# NOINLINE append #-}
+
 -- | Construct a 'Text' without invisibly pinning its byte array in
 -- memory if its length has dwindled to zero.
 text ::
 #if defined(ASSERTS)
   HasCallStack =>
 #endif
-  A.Array -> Int -> Int -> Text
+     A.Array -- ^ bytearray encoded as UTF-8
+  -> Int     -- ^ offset in bytes (not in Char!), pointing to a start of UTF-8 sequence
+  -> Int     -- ^ length in bytes (not in Char!), pointing to an end of UTF-8 sequence
+  -> Text
 text arr off len | len == 0  = empty
                  | otherwise = text_ arr off len
 {-# INLINE text #-}
@@ -109,7 +141,7 @@ showText (Text arr off len) =
 
 -- | Map a 'Char' to a 'Text'-safe value.
 --
--- UTF-16 surrogate code points are not included in the set of Unicode
+-- Unicode 'Data.Char.Surrogate' code points are not included in the set of Unicode
 -- scalar values, but are unfortunately admitted as valid 'Char'
 -- values by Haskell.  They cannot be represented in a 'Text'.  This
 -- function remaps those code points to the Unicode replacement
@@ -191,19 +223,53 @@ int64ToInt32 = fromIntegral
 
 -- $internals
 --
--- Internally, the 'Text' type is represented as an array of 'Word16'
--- UTF-16 code units. The offset and length fields in the constructor
+-- Internally, the 'Text' type is represented as an array of 'Word8'
+-- UTF-8 code units. The offset and length fields in the constructor
 -- are in these units, /not/ units of 'Char'.
 --
 -- Invariants that all functions must maintain:
 --
--- * Since the 'Text' type uses UTF-16 internally, it cannot represent
+-- * Since the 'Text' type uses UTF-8 internally, it cannot represent
 --   characters in the reserved surrogate code point range U+D800 to
 --   U+DFFF. To maintain this invariant, the 'safe' function maps
 --   'Char' values in this range to the replacement character (U+FFFD,
 --   \'&#xfffd;\').
 --
--- * A leading (or \"high\") surrogate code unit (0xD800–0xDBFF) must
---   always be followed by a trailing (or \"low\") surrogate code unit
---   (0xDC00-0xDFFF). A trailing surrogate code unit must always be
---   preceded by a leading surrogate code unit.
+-- * Offset and length must point to a valid UTF-8 sequence of bytes.
+--   Violation of this may cause memory access violation and divergence.
+
+-- -----------------------------------------------------------------------------
+-- * Conversion to/from 'Text'
+
+-- | /O(n)/ Convert a 'String' into a 'Text'.
+-- Performs replacement on invalid scalar values, so @'Data.Text.unpack' . 'pack'@ is not 'id':
+--
+-- >>> Data.Text.unpack (pack "\55555")
+-- "\65533"
+pack :: String -> Text
+pack xs = runST $ do
+  -- It's tempting to allocate a buffer of 4 * length xs bytes,
+  -- but not only it's wasteful for predominantly ASCII arguments,
+  -- the computation of length xs would force allocation of the entire xs at once.
+  let dstLen = 64
+  dst <- A.new dstLen
+  outer dst dstLen 0 xs
+  where
+    outer :: forall s. A.MArray s -> Int -> Int -> String -> ST s Text
+    outer !dst !dstLen = inner
+      where
+        inner !dstOff [] = do
+          A.shrinkM dst dstOff
+          arr <- A.unsafeFreeze dst
+          return (Text arr 0 dstOff)
+        inner !dstOff ccs@(c : cs)
+          -- Each 'Char' takes up to 4 bytes
+          | dstOff + 4 > dstLen = do
+            -- Double size of the buffer
+            let !dstLen' = dstLen * 2
+            dst' <- A.resizeM dst dstLen'
+            outer dst' dstLen' dstOff ccs
+          | otherwise = do
+            d <- unsafeWrite dst dstOff (safe c)
+            inner (dstOff + d) cs
+{-# NOINLINE [0] pack #-}

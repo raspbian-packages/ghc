@@ -1,41 +1,194 @@
 # Changelog for [`base` package](http://hackage.haskell.org/package/base)
 
-## 4.15.1.0 *December 2021*
+## 4.17.2.0 *August 2023*
 
-  * Bundled with GHC 9.0.2
+   * Restore `mingwex` dependency on Windows (#23309).
 
-  * Various documentation improvements and fixes
+   * Fix an incorrect CPP guard on `darwin_HOST_OS`.
 
-  * `GHC.Event.Manager`: Don't use one-shot kqueue on macOS.
-  This reverts a commit that removed the workaround for a
-  [bug](https://gitlab.haskell.org/ghc/ghc/-/issues/7651) in the OSX
-  implementation of kqueue. It turns out the bug still affects modern
-  macOS versions, so we keep the workaround for now.
+## 4.17.1.0 *April 2023*
 
-  * Check the buffer size *before* calling the continuation in withEncodedCString (#20107)
+   * Remove `mingwex` dependency on Windows (#22166).
 
-  * Pass -DLIBICONV_PLUG when building base library on FreeBSD (#19958)
+   * Fix inconsistency with decoding terminal input on Windows (#21488).
 
-  * Detect underflow in fromIntegral/Int->Natural rule (#20066)
+## 4.17.0.0 *August 2022*
 
-  * Make unsafeDupablePerformIO have a lazy demand (#19181)
+  * Add explicitly bidirectional `pattern TypeRep` to `Type.Reflection`.
 
-  * fix bogus rewrite rule for "fromIntegral/Int->Natural" `fromIntegral =
-    naturalFromWord . fromIntegral` (#19345)
+  * Add `Generically` and `Generically1` to `GHC.Generics` for deriving generic
+    instances with `DerivingVia`. `Generically` instances include `Semigroup` and
+    `Monoid`. `Generically1` instances: `Functor`, `Applicative`, `Alternative`,
+    `Eq1` and `Ord1`.
 
-  * Fix accidental unsoundness in Data.Typeable.Internal.mkTypeLitFromString (#19288)
+  * Introduce `GHC.ExecutablePath.executablePath`, which is more robust than
+    `getExecutablePath` in cases when the executable has been deleted.
 
-## 4.15.0.0 *January 2021*
+  * Add `Data.Array.Byte` module, providing boxed `ByteArray#` and `MutableByteArray#` wrappers.
 
-  * Bundled with GHC 9.0.1
+  * `fromEnum` for `Natural` now throws an error for any number that cannot be
+    repesented exactly by an `Int` (#20291).
+
+  * `returnA` is defined as `Control.Category.id` instead of `arr id`.
+
+  * Added symbolic synonyms for `xor` and shift operators to `Data.Bits`:
+
+    - `.^.` (`xor`),
+    - `.>>.` and `!>>.` (`shiftR` and `unsafeShiftR`),
+    - `.<<.` and `!<<.` (`shiftL` and `unsafeShiftL`).
+
+    These new operators have the same fixity as the originals.
+
+  * `GHC.Exts` now re-exports `Multiplicity` and `MultMul`.
+
+  * A large number of partial functions in `Data.List` and `Data.List.NonEmpty` now
+    have an HasCallStack constraint. Hopefully providing better error messages in case
+    they are used in unexpected ways.
+
+  * Fix the `Ord1` instance for `Data.Ord.Down` to reverse sort order.
+
+  * Any Haskell type that wraps a C pointer type has been changed from
+    `Ptr ()` to `CUIntPtr`. For typical glibc based platforms, the
+    affected type is `CTimer`.
+
+  * Remove instances of `MonadFail` for the `ST` monad (lazy and strict) as per
+    the [Core Libraries proposal](https://github.com/haskell/core-libraries-committee/issues/33).
+    A [migration guide](https://github.com/haskell/core-libraries-committee/blob/main/guides/no-monadfail-st-inst.md)
+    is available.
+
+  * Re-export `augment` and `build` function from `GHC.List`
+
+  * Re-export the `IsList` typeclass from the new `GHC.IsList` module.
+
+  * There's a new special function ``withDict`` in ``GHC.Exts``: ::
+
+        withDict :: forall {rr :: RuntimeRep} cls meth (r :: TYPE rr). WithDict cls meth => meth -> (cls => r) -> r
+
+    where ``cls`` must be a class containing exactly one method, whose type
+    must be ``meth``.
+
+    This function converts ``meth`` to a type class dictionary.
+    It removes the need for ``unsafeCoerce`` in implementation of reflection
+    libraries. It should be used with care, because it can introduce
+    incoherent instances.
+
+    For example, the ``withTypeable`` function from the
+    ``Type.Reflection`` module can now be defined as: ::
+
+          withTypeable :: forall k (a :: k) rep (r :: TYPE rep). ()
+                       => TypeRep a -> (Typeable a => r) -> r
+          withTypeable rep k = withDict @(Typeable a) rep k
+
+    Note that the explicit type application is required, as the call to
+    ``withDict`` would be ambiguous otherwise.
+
+    This replaces the old ``GHC.Exts.magicDict``, which required
+    an intermediate data type and was less reliable.
+
+  * `Data.Word.Word64` and `Data.Int.Int64` are now always represented by
+    `Word64#` and `Int64#`, respectively. Previously on 32-bit platforms these
+    were rather represented by `Word#` and `Int#`. See GHC #11953.
+
+  * Add `GHC.TypeError` module to contain functionality related to custom type
+    errors. `TypeError` is re-exported from `GHC.TypeLits` for backwards
+    compatibility.
+
+## 4.16.3.0 *May 2022*
+
+  * Shipped with GHC 9.2.4
+
+  * winio: make consoleReadNonBlocking not wait for any events at all.
+
+  * winio: Add support to console handles to handleToHANDLE
+
+## 4.16.2.0 *May 2022*
+
+  * Shipped with GHC 9.2.2
+
+  * Export GHC.Event.Internal on Windows (#21245)
+
+  # Documentation Fixes
+
+## 4.16.1.0 *Feb 2022*
+
+  * Shipped with GHC 9.2.2
+
+  * The following Foreign C types now have an instance of `Ix`:
+    CChar, CSChar, CUChar, CShort, CUShort, CInt, CUInt, CLong, CULong,
+    CPtrdiff, CSize, CWchar, CSigAtomic, CLLong, CULLong, CBool, CIntPtr, CUIntPtr,
+    CIntMax, CUIntMax.
+
+## 4.16.0.0 *Nov 2021*
+
+  * The unary tuple type, `Solo`, is now exported by `Data.Tuple`.
+
+  * Add a `Typeable` constraint to `fromStaticPtr` in the class `GHC.StaticPtr.IsStatic`.
+
+  * Make it possible to promote `Natural`s and remove the separate `Nat` kind.
+    For backwards compatibility, `Nat` is now a type synonym for `Natural`.
+    As a consequence, one must enable `TypeSynonymInstances`
+    in order to define instances for `Nat`. Also, different instances for `Nat` and `Natural`
+    won't typecheck anymore.
+
+  * Add `Data.Type.Ord` as a module for type-level comparison operations.  The
+    `(<=?)` type operator from `GHC.TypeNats`, previously kind-specific to
+    `Nat`, is now kind-polymorphic and governed by the `Compare` type family in
+    `Data.Type.Ord`.  Note that this means GHC will no longer deduce `0 <= n`
+    for all `n` any more.
+
+  * Add `cmpNat`, `cmpSymbol`, and `cmpChar` to `GHC.TypeNats` and `GHC.TypeLits`.
+
+  * Add `CmpChar`, `ConsSymbol`, `UnconsSymbol`, `CharToNat`, and `NatToChar`
+    type families to `GHC.TypeLits`.
+
+  * Add the `KnownChar` class, `charVal` and `charVal'` to `GHC.TypeLits`.
+
+  * Add `Semigroup` and `Monoid` instances for `Data.Functor.Product` and
+    `Data.Functor.Compose`.
 
   * Add `Functor`, `Applicative`, `Monad`, `MonadFix`, `Foldable`, `Traversable`,
     `Eq`, `Ord`, `Show`, `Read`, `Eq1`, `Ord1`, `Show1`, `Read1`, `Generic`,
     `Generic1`, and `Data` instances for `GHC.Tuple.Solo`.
 
+  * Add `Eq1`, `Read1` and `Show1` instances for `Complex`;
+    add `Eq1/2`, `Ord1/2`, `Show1/2` and `Read1/2` instances for 3 and 4-tuples.
+
+  * Remove `Data.Semigroup.Option` and the accompanying `option` function.
+
+  * Make `allocaBytesAligned` and `alloca` throw an IOError when the
+    alignment is not a power-of-two. The underlying primop
+    `newAlignedPinnedByteArray#` actually always assumed this but we didn't
+    document this fact in the user facing API until now.
+
+    `Generic1`, and `Data` instances for `GHC.Tuple.Solo`.
+
+  * Under POSIX, `System.IO.openFile` will no longer leak a file descriptor if it
+    is interrupted by an asynchronous exception (#19114, #19115).
+
+  * Additionally export `asum` from `Control.Applicative`
+
+  * `fromInteger :: Integer -> Float/Double` now consistently round to the
+    nearest value, with ties to even.
+
+  * Comparison constraints in `Data.Type.Ord` (e.g. `<=`) now use the new
+    `GHC.TypeError.Assert` type family instead of type equality with `~`.
+
+  * Additions to `Data.Bits`:
+
+    - Newtypes `And`, `Ior`, `Xor` and `Iff` which wrap their argument,
+      and whose `Semigroup` instances are defined using `(.&.)`, `(.|.)`, `xor`
+      and ```\x y -> complement (x `xor` y)```, respectively.
+
+    - `oneBits :: FiniteBits a => a`, `oneBits = complement zeroBits`.
+
+## 4.15.0.0 *Feb 2021*
+
   * `openFile` now calls the `open` system call with an `interruptible` FFI
     call, ensuring that the call can be interrupted with `SIGINT` on POSIX
     systems.
+
+  * Make `openFile` more tolerant of asynchronous exceptions: more care taken
+    to release the file descriptor and the read/write lock (#18832)
 
   * Add `hGetContents'`, `getContents'`, and `readFile'` in `System.IO`:
     Strict IO variants of `hGetContents`, `getContents`, and `readFile`.
@@ -67,6 +220,9 @@
   * Correct `Bounded` instance and remove `Enum` and `Integral` instances for
     `Data.Ord.Down`.
 
+  * `catMaybes` is now implemented using `mapMaybe`, so that it is both a "good
+    consumer" and "good producer" for list-fusion (#18574)
+
   * `Foreign.ForeignPtr.withForeignPtr` is now less aggressively optimised,
     avoiding the soundness issue reported in
     [#17760](https://gitlab.haskell.org/ghc/ghc/-/issues/17760) in exchange for
@@ -75,11 +231,11 @@
     diverge then the previous optimisation behavior can be recovered by instead
     using `GHC.ForeignPtr.unsafeWithForeignPtr`.
 
-## 4.14.1.0 *Jul 2020*
+  * Correct `Bounded` instance and remove `Enum` and `Integral` instances for
+    `Data.Ord.Down`.
 
-  * Bundled with GHC 8.10.2
-
-  * Fix a precision issue in `log1mexp` (#17125)
+  * `Data.Foldable` methods `maximum{,By}`, `minimum{,By}`, `product` and `sum`
+    are now stricter by default, as well as in the class implementation for List.
 
 ## 4.14.0.0 *Jan 2020*
   * Bundled with GHC 8.10.1

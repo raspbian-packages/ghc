@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP #-}
+
 
 -- | Run-time settings
 module GHC.Settings
@@ -6,28 +6,29 @@ module GHC.Settings
   , ToolSettings (..)
   , FileSettings (..)
   , GhcNameVersion (..)
-  , PlatformConstants (..)
   , Platform (..)
   , PlatformMisc (..)
-  , PlatformMini (..)
   -- * Accessors
+  , dynLibSuffix
   , sProgramName
   , sProjectVersion
   , sGhcUsagePath
   , sGhciUsagePath
   , sToolDir
   , sTopDir
-  , sTmpDir
   , sGlobalPackageDatabasePath
   , sLdSupportsCompactUnwind
   , sLdSupportsBuildId
   , sLdSupportsFilelist
   , sLdIsGnuLd
   , sGccSupportsNoPie
+  , sUseInplaceMinGW
+  , sArSupportsDashL
   , sPgm_L
   , sPgm_P
   , sPgm_F
   , sPgm_c
+  , sPgm_cxx
   , sPgm_a
   , sPgm_l
   , sPgm_lm
@@ -60,12 +61,7 @@ module GHC.Settings
   , sExtraGccViaCFlags
   , sTargetPlatformString
   , sGhcWithInterpreter
-  , sGhcWithSMP
-  , sGhcRTSWays
   , sLibFFI
-  , sGhcThreaded
-  , sGhcDebugged
-  , sGhcRtsWithLibdw
   ) where
 
 import GHC.Prelude
@@ -80,7 +76,6 @@ data Settings = Settings
   , sTargetPlatform    :: Platform       -- Filled in by SysTools
   , sToolSettings      :: {-# UNPACK #-} !ToolSettings
   , sPlatformMisc      :: {-# UNPACK #-} !PlatformMisc
-  , sPlatformConstants :: PlatformConstants
 
   -- You shouldn't need to look things up in rawSettings directly.
   -- They should have their own fields instead.
@@ -97,15 +92,21 @@ data ToolSettings = ToolSettings
   , toolSettings_ldSupportsFilelist      :: Bool
   , toolSettings_ldIsGnuLd               :: Bool
   , toolSettings_ccSupportsNoPie         :: Bool
+  , toolSettings_useInplaceMinGW         :: Bool
+  , toolSettings_arSupportsDashL         :: Bool
 
   -- commands for particular phases
   , toolSettings_pgm_L       :: String
   , toolSettings_pgm_P       :: (String, [Option])
   , toolSettings_pgm_F       :: String
   , toolSettings_pgm_c       :: String
+  , toolSettings_pgm_cxx     :: String
   , toolSettings_pgm_a       :: (String, [Option])
   , toolSettings_pgm_l       :: (String, [Option])
-  , toolSettings_pgm_lm      :: (String, [Option])
+  , toolSettings_pgm_lm      :: Maybe (String, [Option])
+    -- ^ N.B. On Windows we don't have a linker which supports object
+    -- merging, hence the 'Maybe'. See Note [Object merging] in
+    -- "GHC.Driver.Pipeline.Execute" for details.
   , toolSettings_pgm_dll     :: (String, [Option])
   , toolSettings_pgm_T       :: String
   , toolSettings_pgm_windres :: String
@@ -155,7 +156,6 @@ data FileSettings = FileSettings
   , fileSettings_ghciUsagePath         :: FilePath       -- ditto
   , fileSettings_toolDir               :: Maybe FilePath -- ditto
   , fileSettings_topDir                :: FilePath       -- ditto
-  , fileSettings_tmpDir                :: String      -- no trailing '/'
   , fileSettings_globalPackageDatabase :: FilePath
   }
 
@@ -166,9 +166,9 @@ data GhcNameVersion = GhcNameVersion
   , ghcNameVersion_projectVersion :: String
   }
 
--- Produced by deriveConstants
--- Provides PlatformConstants datatype
-#include "GHCConstantsHaskellType.hs"
+-- | Dynamic library suffix
+dynLibSuffix :: GhcNameVersion -> String
+dynLibSuffix (GhcNameVersion name ver) = '-':name ++ ver
 
 -----------------------------------------------------------------------------
 -- Accessessors from 'Settings'
@@ -186,8 +186,6 @@ sToolDir             :: Settings -> Maybe FilePath
 sToolDir = fileSettings_toolDir . sFileSettings
 sTopDir              :: Settings -> FilePath
 sTopDir = fileSettings_topDir . sFileSettings
-sTmpDir              :: Settings -> String
-sTmpDir = fileSettings_tmpDir . sFileSettings
 sGlobalPackageDatabasePath :: Settings -> FilePath
 sGlobalPackageDatabasePath = fileSettings_globalPackageDatabase . sFileSettings
 
@@ -201,6 +199,10 @@ sLdIsGnuLd :: Settings -> Bool
 sLdIsGnuLd = toolSettings_ldIsGnuLd . sToolSettings
 sGccSupportsNoPie :: Settings -> Bool
 sGccSupportsNoPie = toolSettings_ccSupportsNoPie . sToolSettings
+sUseInplaceMinGW :: Settings -> Bool
+sUseInplaceMinGW = toolSettings_useInplaceMinGW . sToolSettings
+sArSupportsDashL :: Settings -> Bool
+sArSupportsDashL = toolSettings_arSupportsDashL . sToolSettings
 
 sPgm_L :: Settings -> String
 sPgm_L = toolSettings_pgm_L . sToolSettings
@@ -210,11 +212,13 @@ sPgm_F :: Settings -> String
 sPgm_F = toolSettings_pgm_F . sToolSettings
 sPgm_c :: Settings -> String
 sPgm_c = toolSettings_pgm_c . sToolSettings
+sPgm_cxx :: Settings -> String
+sPgm_cxx = toolSettings_pgm_cxx . sToolSettings
 sPgm_a :: Settings -> (String, [Option])
 sPgm_a = toolSettings_pgm_a . sToolSettings
 sPgm_l :: Settings -> (String, [Option])
 sPgm_l = toolSettings_pgm_l . sToolSettings
-sPgm_lm :: Settings -> (String, [Option])
+sPgm_lm :: Settings -> Maybe (String, [Option])
 sPgm_lm = toolSettings_pgm_lm . sToolSettings
 sPgm_dll :: Settings -> (String, [Option])
 sPgm_dll = toolSettings_pgm_dll . sToolSettings
@@ -276,15 +280,5 @@ sTargetPlatformString :: Settings -> String
 sTargetPlatformString = platformMisc_targetPlatformString . sPlatformMisc
 sGhcWithInterpreter :: Settings -> Bool
 sGhcWithInterpreter = platformMisc_ghcWithInterpreter . sPlatformMisc
-sGhcWithSMP :: Settings -> Bool
-sGhcWithSMP = platformMisc_ghcWithSMP . sPlatformMisc
-sGhcRTSWays :: Settings -> String
-sGhcRTSWays = platformMisc_ghcRTSWays . sPlatformMisc
 sLibFFI :: Settings -> Bool
 sLibFFI = platformMisc_libFFI . sPlatformMisc
-sGhcThreaded :: Settings -> Bool
-sGhcThreaded = platformMisc_ghcThreaded . sPlatformMisc
-sGhcDebugged :: Settings -> Bool
-sGhcDebugged = platformMisc_ghcDebugged . sPlatformMisc
-sGhcRtsWithLibdw :: Settings -> Bool
-sGhcRtsWithLibdw = platformMisc_ghcRtsWithLibdw . sPlatformMisc

@@ -1,4 +1,7 @@
-{-# LANGUAGE CPP, DeriveFunctor #-}
+{-# LANGUAGE DataKinds #-}
+
+{-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE TypeFamilies #-}
 
 --
 -- (c) The GRASP/AQUA Project, Glasgow University, 1993-1998
@@ -13,45 +16,54 @@
 
 module GHC.CoreToStg ( coreToStg ) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
+
+import GHC.Driver.Session
+import GHC.Driver.Config.Stg.Debug
 
 import GHC.Core
 import GHC.Core.Utils   ( exprType, findDefault, isJoinBind
                         , exprIsTickedString_maybe )
 import GHC.Core.Opt.Arity   ( manifestArity )
-import GHC.Stg.Syntax
-
 import GHC.Core.Type
-import GHC.Types.RepType
 import GHC.Core.TyCon
+import GHC.Core.DataCon
+
+import GHC.Stg.Syntax
+import GHC.Stg.Debug
+import GHC.Stg.Utils
+
+import GHC.Types.RepType
 import GHC.Types.Id.Make ( coercionTokenId )
 import GHC.Types.Id
 import GHC.Types.Id.Info
-import GHC.Core.DataCon
 import GHC.Types.CostCentre
+import GHC.Types.Tickish
 import GHC.Types.Var.Env
-import GHC.Unit.Module
 import GHC.Types.Name   ( isExternalName, nameModule_maybe )
 import GHC.Types.Basic  ( Arity )
-import GHC.Builtin.Types ( unboxedUnitDataCon, unitDataConId )
 import GHC.Types.Literal
-import GHC.Utils.Outputable
-import GHC.Utils.Monad
-import GHC.Data.FastString
-import GHC.Utils.Misc
-import GHC.Driver.Session
-import GHC.Driver.Ways
 import GHC.Types.ForeignCall
-import GHC.Types.Demand    ( isUsedOnce )
-import GHC.Builtin.PrimOps ( PrimCall(..) )
+import GHC.Types.IPE
+import GHC.Types.Demand    ( isUsedOnceDmd )
 import GHC.Types.SrcLoc    ( mkGeneralSrcSpan )
 
-import Data.List.NonEmpty (nonEmpty, toList)
-import Data.Maybe    (fromMaybe)
+import GHC.Unit.Module
+import GHC.Builtin.Types ( unboxedUnitDataCon )
+import GHC.Data.FastString
+import GHC.Platform.Ways
+import GHC.Builtin.PrimOps ( PrimCall(..) )
+
+import GHC.Utils.Outputable
+import GHC.Utils.Monad
+import GHC.Utils.Misc (HasDebugCallStack)
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
+import GHC.Utils.Trace
+
 import Control.Monad (ap)
-import qualified Data.Set as Set
+import Data.Maybe (fromMaybe)
+import Data.Tuple (swap)
 
 -- Note [Live vs free]
 -- ~~~~~~~~~~~~~~~~~~~
@@ -223,15 +235,22 @@ import qualified Data.Set as Set
 -- Setting variable info: top-level, binds, RHSs
 -- --------------------------------------------------------------
 
-coreToStg :: DynFlags -> Module -> CoreProgram
-          -> ([StgTopBinding], CollectedCCs)
-coreToStg dflags this_mod pgm
-  = (pgm', final_ccs)
+
+coreToStg :: DynFlags -> Module -> ModLocation -> CoreProgram
+          -> ([StgTopBinding], InfoTableProvMap, CollectedCCs)
+coreToStg dflags this_mod ml pgm
+  = (pgm'', denv, final_ccs)
   where
     (_, (local_ccs, local_cc_stacks), pgm')
       = coreTopBindsToStg dflags this_mod emptyVarEnv emptyCollectedCCs pgm
 
-    prof = WayProf `Set.member` ways dflags
+    -- See Note [Mapping Info Tables to Source Positions]
+    (!pgm'', !denv) =
+        if gopt Opt_InfoTableMap dflags
+          then collectDebugInformation (initStgDebugOpts dflags) ml pgm'
+          else (pgm', emptyInfoTableProvMap)
+
+    prof = ways dflags `hasWay` WayProf
 
     final_ccs
       | prof && gopt Opt_AutoSccsOnIndividualCafs dflags
@@ -297,7 +316,7 @@ coreTopBindToStg dflags this_mod env ccs (NonRec id rhs)
     (env', ccs', bind)
 
 coreTopBindToStg dflags this_mod env ccs (Rec pairs)
-  = ASSERT( not (null pairs) )
+  = assert (not (null pairs)) $
     let
         binders = map fst pairs
 
@@ -307,14 +326,10 @@ coreTopBindToStg dflags this_mod env ccs (Rec pairs)
 
         -- generate StgTopBindings and CAF cost centres created for CAFs
         (ccs', stg_rhss)
-          = initCts dflags env' $ do
-               mapAccumLM (\ccs rhs -> do
-                            (rhs', ccs') <-
-                              coreToTopStgRhs dflags ccs this_mod rhs
-                            return (ccs', rhs'))
-                          ccs
-                          pairs
-
+          = initCts dflags env' $
+              mapAccumLM (\ccs rhs -> swap <$> coreToTopStgRhs dflags ccs this_mod rhs)
+                         ccs
+                         pairs
         bind = StgTopLifted $ StgRec (zip binders stg_rhss)
     in
     (env', ccs', bind)
@@ -327,14 +342,14 @@ coreToTopStgRhs
         -> CtsM (StgRhs, CollectedCCs)
 
 coreToTopStgRhs dflags ccs this_mod (bndr, rhs)
-  = do { new_rhs <- coreToStgExpr rhs
+  = do { new_rhs <- coreToPreStgRhs rhs
 
        ; let (stg_rhs, ccs') =
                mkTopStgRhs dflags this_mod ccs bndr new_rhs
              stg_arity =
                stgRhsArity stg_rhs
 
-       ; return (ASSERT2( arity_ok stg_arity, mk_arity_msg stg_arity) stg_rhs,
+       ; return (assertPpr (arity_ok stg_arity) (mk_arity_msg stg_arity) stg_rhs,
                  ccs') }
   where
         -- It's vital that the arity on a top-level Id matches
@@ -360,8 +375,12 @@ coreToTopStgRhs dflags ccs this_mod (bndr, rhs)
 -- Expressions
 -- ---------------------------------------------------------------------------
 
+-- coreToStgExpr panics if the input expression is a value lambda. CorePrep
+-- ensures that value lambdas only exist as the RHS of bindings, which we
+-- handle with the function coreToPreStgRhs.
+
 coreToStgExpr
-        :: CoreExpr
+        :: HasDebugCallStack => CoreExpr
         -> CtsM StgExpr
 
 -- The second and third components can be derived in a simple bottom up pass, not
@@ -370,47 +389,40 @@ coreToStgExpr
 -- on these components, but it in turn is not scrutinised as the basis for any
 -- decisions.  Hence no black holes.
 
--- No LitInteger's or LitNatural's should be left by the time this is called.
+-- No bignum literal should be left by the time this is called.
 -- CorePrep should have converted them all to a real core representation.
-coreToStgExpr (Lit (LitNumber LitNumInteger _)) = panic "coreToStgExpr: LitInteger"
-coreToStgExpr (Lit (LitNumber LitNumNatural _)) = panic "coreToStgExpr: LitNatural"
-coreToStgExpr (Lit l)      = return (StgLit l)
-coreToStgExpr (App (Lit LitRubbish) _some_unlifted_type)
-  -- We lower 'LitRubbish' to @()@ here, which is much easier than doing it in
-  -- a STG to Cmm pass.
-  = coreToStgExpr (Var unitDataConId)
+coreToStgExpr (Lit (LitNumber LitNumBigNat _))  = panic "coreToStgExpr: LitNumBigNat"
+coreToStgExpr (Lit l)                           = return (StgLit l)
 coreToStgExpr (Var v) = coreToStgApp v [] []
 coreToStgExpr (Coercion _)
   -- See Note [Coercion tokens]
   = coreToStgApp coercionTokenId [] []
 
 coreToStgExpr expr@(App _ _)
-  = coreToStgApp f args ticks
-  where
-    (f, args, ticks) = myCollectArgs expr
+  = case app_head of
+      Var f -> coreToStgApp f args ticks -- Regular application
+      Lit l | isLitRubbish l             -- If there is LitRubbish at the head,
+            -> return (StgLit l)         --    discard the arguments
 
+      _     -> pprPanic "coreToStgExpr - Invalid app head:" (ppr expr)
+    where
+      (app_head, args, ticks) = myCollectArgs expr
 coreToStgExpr expr@(Lam _ _)
   = let
         (args, body) = myCollectBinders expr
-        args'        = filterStgBinders args
     in
-    extendVarEnvCts [ (a, LambdaBound) | a <- args' ] $ do
-    body' <- coreToStgExpr body
-    let
-        result_expr = case nonEmpty args' of
-          Nothing     -> body'
-          Just args'' -> StgLam args'' body'
+    case filterStgBinders args of
 
-    return result_expr
+      [] -> coreToStgExpr body
+
+      _ -> pprPanic "coretoStgExpr" $
+        text "Unexpected value lambda:" $$ ppr expr
 
 coreToStgExpr (Tick tick expr)
-  = do case tick of
-         HpcTick{}    -> return ()
-         ProfNote{}   -> return ()
-         SourceNote{} -> return ()
-         Breakpoint{} -> panic "coreToStgExpr: breakpoint should not happen"
-       expr2 <- coreToStgExpr expr
-       return (StgTick tick expr2)
+  = do
+       let !stg_tick = coreToStgTick (exprType expr) tick
+       !expr2 <- coreToStgExpr expr
+       return (StgTick stg_tick expr2)
 
 coreToStgExpr (Cast expr _)
   = coreToStgExpr expr
@@ -444,27 +456,29 @@ coreToStgExpr (Case scrut bndr _ alts)
        ; alts2 <- extendVarEnvCts [(bndr, LambdaBound)] (mapM vars_alt alts)
        ; return (StgCase scrut2 bndr (mkStgAltType bndr alts) alts2) }
   where
-    vars_alt :: (AltCon, [Var], CoreExpr) -> CtsM (AltCon, [Var], StgExpr)
-    vars_alt (con, binders, rhs)
+    vars_alt :: CoreAlt -> CtsM StgAlt
+    vars_alt (Alt con binders rhs)
       | DataAlt c <- con, c == unboxedUnitDataCon
       = -- This case is a bit smelly.
         -- See Note [Nullary unboxed tuple] in GHC.Core.Type
         -- where a nullary tuple is mapped to (State# World#)
-        ASSERT( null binders )
+        assert (null binders) $
         do { rhs2 <- coreToStgExpr rhs
-           ; return (DEFAULT, [], rhs2)  }
+           ; return GenStgAlt{alt_con=DEFAULT,alt_bndrs=mempty,alt_rhs=rhs2}
+           }
       | otherwise
       = let     -- Remove type variables
             binders' = filterStgBinders binders
         in
         extendVarEnvCts [(b, LambdaBound) | b <- binders'] $ do
         rhs2 <- coreToStgExpr rhs
-        return (con, binders', rhs2)
+        return $! GenStgAlt{ alt_con   = con
+                           , alt_bndrs = binders'
+                           , alt_rhs   = rhs2
+                           }
 
-coreToStgExpr (Let bind body) = do
-    coreToStgLet bind body
-
-coreToStgExpr e = pprPanic "coreToStgExpr" (ppr e)
+coreToStgExpr (Let bind body) = coreToStgLet bind body
+coreToStgExpr e               = pprPanic "coreToStgExpr" (ppr e)
 
 mkStgAltType :: Id -> [CoreAlt] -> AltType
 mkStgAltType bndr alts
@@ -473,15 +487,15 @@ mkStgAltType bndr alts
 
   | otherwise
   = case prim_reps of
-      [LiftedRep] -> case tyConAppTyCon_maybe (unwrapType bndr_ty) of
-        Just tc
-          | isAbstractTyCon tc -> look_for_better_tycon
-          | isAlgTyCon tc      -> AlgAlt tc
-          | otherwise          -> ASSERT2( _is_poly_alt_tycon tc, ppr tc )
-                                  PolyAlt
-        Nothing                -> PolyAlt
-      [unlifted] -> PrimAlt unlifted
-      not_unary  -> MultiValAlt (length not_unary)
+      [rep] | isGcPtrRep rep ->
+        case tyConAppTyCon_maybe (unwrapType bndr_ty) of
+          Just tc
+            | isAbstractTyCon tc -> look_for_better_tycon
+            | isAlgTyCon tc      -> AlgAlt tc
+            | otherwise          -> assertPpr (_is_poly_alt_tycon tc) (ppr tc) PolyAlt
+          Nothing                -> PolyAlt
+      [non_gcd] -> PrimAlt non_gcd
+      not_unary -> MultiValAlt (length not_unary)
   where
    bndr_ty   = idType bndr
    prim_reps = typePrimRep bndr_ty
@@ -498,10 +512,10 @@ mkStgAltType bndr alts
    -- grabbing the one from a constructor alternative
    -- if one exists.
    look_for_better_tycon
-        | ((DataAlt con, _, _) : _) <- data_alts =
+        | ((Alt (DataAlt con) _ _) : _) <- data_alts =
                 AlgAlt (dataConTyCon con)
         | otherwise =
-                ASSERT(null data_alts)
+                assert (null data_alts)
                 PolyAlt
         where
                 (data_alts, _deflt) = findDefault alts
@@ -512,7 +526,7 @@ mkStgAltType bndr alts
 
 coreToStgApp :: Id            -- Function
              -> [CoreArg]     -- Arguments
-             -> [Tickish Id]  -- Debug ticks
+             -> [CoreTickish] -- Debug ticks
              -> CtsM StgExpr
 coreToStgApp f args ticks = do
     (args', ticks') <- coreToStgArgs args
@@ -534,29 +548,30 @@ coreToStgApp f args ticks = do
         res_ty = exprType (mkApps (Var f) args)
         app = case idDetails f of
                 DataConWorkId dc
-                  | saturated    -> StgConApp dc args'
+                  | saturated    -> StgConApp dc NoNumber args'
                                       (dropRuntimeRepArgs (fromMaybe [] (tyConAppArgs_maybe res_ty)))
 
                 -- Some primitive operator that might be implemented as a library call.
                 -- As noted by Note [Eta expanding primops] in GHC.Builtin.PrimOps
                 -- we require that primop applications be saturated.
-                PrimOpId op      -> ASSERT( saturated )
+                PrimOpId op      -> assert saturated $
                                     StgOpApp (StgPrimOp op) args' res_ty
 
                 -- A call to some primitive Cmm function.
                 FCallId (CCall (CCallSpec (StaticTarget _ lbl (Just pkgId) True)
                                           PrimCallConv _))
-                                 -> ASSERT( saturated )
+                                 -> assert saturated $
                                     StgOpApp (StgPrimCallOp (PrimCall lbl pkgId)) args' res_ty
 
                 -- A regular foreign call.
-                FCallId call     -> ASSERT( saturated )
+                FCallId call     -> assert saturated $
                                     StgOpApp (StgFCallOp call (idType f)) args' res_ty
 
                 TickBoxOpId {}   -> pprPanic "coreToStg TickBox" $ ppr (f,args')
                 _other           -> StgApp f args'
 
-        tapp = foldr StgTick app (ticks ++ ticks')
+        add_tick !t !e = StgTick t e
+        tapp = foldr add_tick app (map (coreToStgTick res_ty) ticks ++ ticks')
 
     -- Forcing these fixes a leak in the code generator, noticed while
     -- profiling for trac #4367
@@ -567,7 +582,7 @@ coreToStgApp f args ticks = do
 -- This is the guy that turns applications into A-normal form
 -- ---------------------------------------------------------------------------
 
-coreToStgArgs :: [CoreArg] -> CtsM ([StgArg], [Tickish Id])
+coreToStgArgs :: [CoreArg] -> CtsM ([StgArg], [StgTickish])
 coreToStgArgs []
   = return ([], [])
 
@@ -580,9 +595,10 @@ coreToStgArgs (Coercion _ : args) -- Coercion argument; See Note [Coercion token
        ; return (StgVarArg coercionTokenId : args', ts) }
 
 coreToStgArgs (Tick t e : args)
-  = ASSERT( not (tickishIsCode t) )
+  = assert (not (tickishIsCode t)) $
     do { (args', ts) <- coreToStgArgs (e : args)
-       ; return (args', t:ts) }
+       ; let !t' = coreToStgTick (exprType e) t
+       ; return (args', t':ts) }
 
 coreToStgArgs (arg : args) = do         -- Non-type argument
     (stg_args, ticks) <- coreToStgArgs args
@@ -591,7 +607,7 @@ coreToStgArgs (arg : args) = do         -- Non-type argument
         (aticks, arg'') = stripStgTicksTop tickishFloatable arg'
         stg_arg = case arg'' of
                        StgApp v []        -> StgVarArg v
-                       StgConApp con [] _ -> StgVarArg (dataConWorkId con)
+                       StgConApp con _ [] _ -> StgVarArg (dataConWorkId con)
                        StgLit lit         -> StgLitArg lit
                        _                  -> pprPanic "coreToStgArgs" (ppr arg)
 
@@ -611,9 +627,16 @@ coreToStgArgs (arg : args) = do         -- Non-type argument
         stg_arg_rep = typePrimRep (stgArgType stg_arg)
         bad_args = not (primRepsCompatible platform arg_rep stg_arg_rep)
 
-    WARN( bad_args, text "Dangerous-looking argument. Probable cause: bad unsafeCoerce#" $$ ppr arg )
+    warnPprTrace bad_args "Dangerous-looking argument. Probable cause: bad unsafeCoerce#" (ppr arg) $
      return (stg_arg : stg_args, ticks ++ aticks)
 
+coreToStgTick :: Type -- type of the ticked expression
+              -> CoreTickish
+              -> StgTickish
+coreToStgTick _ty (HpcTick m i)           = HpcTick m i
+coreToStgTick _ty (SourceNote span nm)    = SourceNote span nm
+coreToStgTick _ty (ProfNote cc cnt scope) = ProfNote cc cnt scope
+coreToStgTick !ty (Breakpoint _ bid fvs)  = Breakpoint ty bid fvs
 
 -- ---------------------------------------------------------------------------
 -- The magic for lets:
@@ -671,30 +694,49 @@ coreToStgRhs :: (Id,CoreExpr)
              -> CtsM StgRhs
 
 coreToStgRhs (bndr, rhs) = do
-    new_rhs <- coreToStgExpr rhs
+    new_rhs <- coreToPreStgRhs rhs
     return (mkStgRhs bndr new_rhs)
+
+-- Represents the RHS of a binding for use with mk(Top)StgRhs.
+data PreStgRhs = PreStgRhs [Id] StgExpr -- The [Id] is empty for thunks
+
+-- Convert the RHS of a binding from Core to STG. This is a wrapper around
+-- coreToStgExpr that can handle value lambdas.
+coreToPreStgRhs :: HasDebugCallStack => CoreExpr -> CtsM PreStgRhs
+coreToPreStgRhs (Cast expr _) = coreToPreStgRhs expr
+coreToPreStgRhs expr@(Lam _ _) =
+    let
+        (args, body) = myCollectBinders expr
+        args'        = filterStgBinders args
+    in
+        extendVarEnvCts [ (a, LambdaBound) | a <- args' ] $ do
+          body' <- coreToStgExpr body
+          return (PreStgRhs args' body')
+coreToPreStgRhs expr = PreStgRhs [] <$> coreToStgExpr expr
 
 -- Generate a top-level RHS. Any new cost centres generated for CAFs will be
 -- appended to `CollectedCCs` argument.
 mkTopStgRhs :: DynFlags -> Module -> CollectedCCs
-            -> Id -> StgExpr -> (StgRhs, CollectedCCs)
+            -> Id -> PreStgRhs -> (StgRhs, CollectedCCs)
 
-mkTopStgRhs dflags this_mod ccs bndr rhs
-  | StgLam bndrs body <- rhs
-  = -- StgLam can't have empty arguments, so not CAF
+mkTopStgRhs dflags this_mod ccs bndr (PreStgRhs bndrs rhs)
+  | not (null bndrs)
+  = -- The list of arguments is non-empty, so not CAF
     ( StgRhsClosure noExtFieldSilent
                     dontCareCCS
                     ReEntrant
-                    (toList bndrs) body
+                    bndrs rhs
     , ccs )
 
-  | StgConApp con args _ <- unticked_rhs
+  -- After this point we know that `bndrs` is empty,
+  -- so this is not a function binding
+  | StgConApp con mn args _ <- unticked_rhs
   , -- Dynamic StgConApps are updatable
-    not (isDllConApp dflags this_mod con args)
+    not (isDllConApp (targetPlatform dflags) (gopt Opt_ExternalDynamicRefs dflags) this_mod con args)
   = -- CorePrep does this right, but just to make sure
-    ASSERT2( not (isUnboxedTupleCon con || isUnboxedSumCon con)
-           , ppr bndr $$ ppr con $$ ppr args)
-    ( StgRhsCon dontCareCCS con args, ccs )
+    assertPpr (not (isUnboxedTupleDataCon con || isUnboxedSumDataCon con))
+              (ppr bndr $$ ppr con $$ ppr args)
+    ( StgRhsCon dontCareCCS con mn ticks args, ccs )
 
   -- Otherwise it's a CAF, see Note [Cost-centre initialization plan].
   | gopt Opt_AutoSccsOnIndividualCafs dflags
@@ -710,10 +752,10 @@ mkTopStgRhs dflags this_mod ccs bndr rhs
     , ccs )
 
   where
-    unticked_rhs = stripStgTicksTopE (not . tickishIsCode) rhs
+    (ticks, unticked_rhs) = stripStgTicksTop (not . tickishIsCode) rhs
 
-    upd_flag | isUsedOnce (idDemandInfo bndr) = SingleEntry
-             | otherwise                      = Updatable
+    upd_flag | isUsedOnceDmd (idDemandInfo bndr) = SingleEntry
+             | otherwise                         = Updatable
 
     -- CAF cost centres generated for -fcaf-all
     caf_cc = mkAutoCC bndr modl
@@ -729,33 +771,37 @@ mkTopStgRhs dflags this_mod ccs bndr rhs
 
 -- Generate a non-top-level RHS. Cost-centre is always currentCCS,
 -- see Note [Cost-centre initialization plan].
-mkStgRhs :: Id -> StgExpr -> StgRhs
-mkStgRhs bndr rhs
-  | StgLam bndrs body <- rhs
+mkStgRhs :: Id -> PreStgRhs -> StgRhs
+mkStgRhs bndr (PreStgRhs bndrs rhs)
+  | not (null bndrs)
   = StgRhsClosure noExtFieldSilent
                   currentCCS
                   ReEntrant
-                  (toList bndrs) body
+                  bndrs rhs
 
-  | isJoinId bndr -- must be a nullary join point
-  = ASSERT(idJoinArity bndr == 0)
+  -- After this point we know that `bndrs` is empty,
+  -- so this is not a function binding
+
+  | isJoinId bndr -- Must be a nullary join point
+  = -- It might have /type/ arguments (T18328),
+    -- so its JoinArity might be >0
     StgRhsClosure noExtFieldSilent
                   currentCCS
                   ReEntrant -- ignored for LNE
                   [] rhs
 
-  | StgConApp con args _ <- unticked_rhs
-  = StgRhsCon currentCCS con args
+  | StgConApp con mn args _ <- unticked_rhs
+  = StgRhsCon currentCCS con mn ticks args
 
   | otherwise
   = StgRhsClosure noExtFieldSilent
                   currentCCS
                   upd_flag [] rhs
   where
-    unticked_rhs = stripStgTicksTopE (not . tickishIsCode) rhs
+    (ticks, unticked_rhs) = stripStgTicksTop (not . tickishIsCode) rhs
 
-    upd_flag | isUsedOnce (idDemandInfo bndr) = SingleEntry
-             | otherwise                      = Updatable
+    upd_flag | isUsedOnceDmd (idDemandInfo bndr) = SingleEntry
+             | otherwise                         = Updatable
 
   {-
     SDM: disabled.  Eval/Apply can't handle functions with arity zero very
@@ -893,7 +939,7 @@ lookupVarCts v = CtsM $ \_ env -> lookupBinding env v
 lookupBinding :: IdEnv HowBound -> Id -> HowBound
 lookupBinding env v = case lookupVarEnv env v of
                         Just xx -> xx
-                        Nothing -> ASSERT2( isGlobalId v, ppr v ) ImportBound
+                        Nothing -> assertPpr (isGlobalId v) (ppr v) ImportBound
 
 getAllCAFsCC :: Module -> (CostCentre, CostCentreStack)
 getAllCAFsCC this_mod =
@@ -917,26 +963,41 @@ myCollectBinders expr
     go bs (Cast e _)         = go bs e
     go bs e                  = (reverse bs, e)
 
--- | Precondition: argument expression is an 'App', and there is a 'Var' at the
--- head of the 'App' chain.
-myCollectArgs :: CoreExpr -> (Id, [CoreArg], [Tickish Id])
+-- | If the argument expression is (potential chain of) 'App', return the head
+-- of the app chain, and collect ticks/args along the chain.
+myCollectArgs :: HasDebugCallStack => CoreExpr -> (CoreExpr, [CoreArg], [CoreTickish])
 myCollectArgs expr
   = go expr [] []
   where
-    go (Var v)          as ts = (v, as, ts)
+    go h@(Var _v)       as ts = (h, as, ts)
     go (App f a)        as ts = go f (a:as) ts
-    go (Tick t e)       as ts = ASSERT( all isTypeArg as )
+    go (Tick t e)       as ts = assertPpr (not (tickishIsCode t) || all isTypeArg as)
+                                          (ppr e $$ ppr as $$ ppr ts) $
+                                -- See Note [Ticks in applications]
                                 go e as (t:ts) -- ticks can appear in type apps
     go (Cast e _)       as ts = go e as ts
     go (Lam b e)        as ts
        | isTyVar b            = go e as ts -- Note [Collect args]
-    go _                _  _  = pprPanic "CoreToStg.myCollectArgs" (ppr expr)
+    go e                as ts = (e, as, ts)
 
--- Note [Collect args]
--- ~~~~~~~~~~~~~~~~~~~
---
--- This big-lambda case occurred following a rather obscure eta expansion.
--- It all seems a bit yukky to me.
+{- Note [Collect args]
+~~~~~~~~~~~~~~~~~~~~~~
+This big-lambda case occurred following a rather obscure eta expansion.
+It all seems a bit yukky to me.
+
+Note [Ticks in applications]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We can get an application like
+   (tick t f) True False
+via inlining in the CorePrep pass; see Note [Inlining in CorePrep]
+in GHC.CoreToStg.Prep.  The tick does not satisfy tickishIsCode;
+the inlining-in-CorePrep happens for cpExprIsTrivial which tests
+tickishIsCode.
+
+So we test the same thing here, pushing any non-code ticks to
+the top (they don't generate any code, after all).  This showed
+up in the fallout from fixing #19360.
+-}
 
 stgArity :: Id -> HowBound -> Arity
 stgArity _ (LetBound _ arity) = arity

@@ -474,7 +474,7 @@ void osCommitMemory (void *at, W_ size)
     void *temp;
     temp = VirtualAlloc(at, size, MEM_COMMIT, PAGE_READWRITE);
     if (temp == NULL) {
-        sysErrorBelch("osCommitMemory: VirtualAlloc MEM_COMMIT failed");
+        sysErrorBelch("osCommitMemory: VirtualAlloc MEM_COMMIT failed to commit %" FMT_Word " bytes of memory  (error code: %lu)", size, GetLastError());
         stg_exit(EXIT_HEAPOVERFLOW);
     }
 }
@@ -547,6 +547,7 @@ void osBindMBlocksToNode(
         void* temp;
         if (RtsFlags.GcFlags.numa) {
             /* Note [base memory]
+               ~~~~~~~~~~~~~~~~~~
                I would like to use addr here to specify the base
                memory of allocation. The problem is that the address
                we are requesting is too high. I can't figure out if it's

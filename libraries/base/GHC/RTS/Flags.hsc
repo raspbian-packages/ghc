@@ -1,6 +1,5 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE NoImplicitPrelude #-}
-{-# LANGUAGE RecordWildCards   #-}
 
 -- | Accessors to GHC RTS flags.
 -- Descriptions of flags can be seen in
@@ -132,6 +131,7 @@ data GCFlags = GCFlags
     , heapSizeSuggestion    :: Word32
     , heapSizeSuggestionAuto :: Bool
     , oldGenFactor          :: Double
+    , returnDecayFactor     :: Double
     , pcFreeHeap            :: Double
     , generations           :: Word32
     , squeezeUpdFrames      :: Bool
@@ -257,6 +257,7 @@ data DoHeapProfile
     | HeapByRetainer
     | HeapByLDV
     | HeapByClosureType
+    | HeapByInfoTable
     deriving ( Show -- ^ @since 4.8.0.0
              , Generic -- ^ @since 4.15.0.0
              )
@@ -271,6 +272,7 @@ instance Enum DoHeapProfile where
     fromEnum HeapByRetainer    = #{const HEAP_BY_RETAINER}
     fromEnum HeapByLDV         = #{const HEAP_BY_LDV}
     fromEnum HeapByClosureType = #{const HEAP_BY_CLOSURE_TYPE}
+    fromEnum HeapByInfoTable   = #{const HEAP_BY_INFO_TABLE}
 
     toEnum #{const NO_HEAP_PROFILING}    = NoHeapProfiling
     toEnum #{const HEAP_BY_CCS}          = HeapByCCS
@@ -280,6 +282,7 @@ instance Enum DoHeapProfile where
     toEnum #{const HEAP_BY_RETAINER}     = HeapByRetainer
     toEnum #{const HEAP_BY_LDV}          = HeapByLDV
     toEnum #{const HEAP_BY_CLOSURE_TYPE} = HeapByClosureType
+    toEnum #{const HEAP_BY_INFO_TABLE}   = HeapByInfoTable
     toEnum e = errorWithoutStackTrace ("invalid enum for DoHeapProfile: " ++ show e)
 
 -- | Parameters of the cost-center profiler
@@ -289,7 +292,7 @@ data ProfFlags = ProfFlags
     { doHeapProfile            :: DoHeapProfile
     , heapProfileInterval      :: RtsTime -- ^ time between samples
     , heapProfileIntervalTicks :: Word    -- ^ ticks between samples (derived)
-    , includeTSOs              :: Bool
+    , startHeapProfileAtStartup :: Bool
     , showCCSOnException       :: Bool
     , maxRetainerSetSize       :: Word
     , ccsLength                :: Word
@@ -392,7 +395,7 @@ data RTSFlags = RTSFlags
 foreign import ccall "&RtsFlags" rtsFlagsPtr :: Ptr RTSFlags
 
 getRTSFlags :: IO RTSFlags
-getRTSFlags = do
+getRTSFlags =
   RTSFlags <$> getGCFlags
            <*> getConcFlags
            <*> getMiscFlags
@@ -433,6 +436,7 @@ getGCFlags = do
           <*> (toBool <$>
                 (#{peek GC_FLAGS, heapSizeSuggestionAuto} ptr :: IO CBool))
           <*> #{peek GC_FLAGS, oldGenFactor} ptr
+          <*> #{peek GC_FLAGS, returnDecayFactor} ptr
           <*> #{peek GC_FLAGS, pcFreeHeap} ptr
           <*> #{peek GC_FLAGS, generations} ptr
           <*> (toBool <$>
@@ -586,7 +590,7 @@ getProfFlags = do
             <*> #{peek PROFILING_FLAGS, heapProfileInterval} ptr
             <*> #{peek PROFILING_FLAGS, heapProfileIntervalTicks} ptr
             <*> (toBool <$>
-                  (#{peek PROFILING_FLAGS, includeTSOs} ptr :: IO CBool))
+                  (#{peek PROFILING_FLAGS, startHeapProfileAtStartup} ptr :: IO CBool))
             <*> (toBool <$>
                   (#{peek PROFILING_FLAGS, showCCSOnException} ptr :: IO CBool))
             <*> #{peek PROFILING_FLAGS, maxRetainerSetSize} ptr

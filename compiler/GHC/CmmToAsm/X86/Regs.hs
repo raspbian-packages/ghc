@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP #-}
+
 
 module GHC.CmmToAsm.X86.Regs (
         -- squeese functions for the graph allocator
@@ -47,8 +47,6 @@ module GHC.CmmToAsm.X86.Regs (
 
 where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
 import GHC.Platform.Regs
@@ -58,6 +56,7 @@ import GHC.Platform.Reg.Class
 import GHC.Cmm
 import GHC.Cmm.CLabel           ( CLabel )
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
 import GHC.Platform
 
 import qualified Data.Array as A
@@ -97,16 +96,11 @@ realRegSqueeze cls rr
                         | regNo < firstxmm -> 1
                         | otherwise     -> 0
 
-                RealRegPair{}           -> 0
-
         RcDouble
          -> case rr of
                 RealRegSingle regNo
                         | regNo >= firstxmm  -> 1
                         | otherwise     -> 0
-
-                RealRegPair{}           -> 0
-
 
         _other -> 0
 
@@ -250,7 +244,6 @@ classOfRealReg platform reg
             | i <= lastint platform -> RcInteger
             | i <= lastxmm platform -> RcDouble
             | otherwise             -> panic "X86.Reg.classOfRealReg registerSingle too high"
-        _   -> panic "X86.Regs.classOfRealReg: RegPairs on this arch"
 
 -- | Get the name of the register with this number.
 -- NOTE: fixme, we dont track which "way" the XMM registers are used
@@ -389,9 +382,9 @@ callClobberedRegs platform
  | target32Bit platform = [eax,ecx,edx] ++ map regSingle (floatregnos platform)
  | platformOS platform == OSMinGW32
    = [rax,rcx,rdx,r8,r9,r10,r11]
-   -- Only xmm0-5 are caller-saves registers on 64bit windows.
-   -- ( https://docs.microsoft.com/en-us/cpp/build/register-usage )
-   -- For details check the Win64 ABI.
+   -- Only xmm0-5 are caller-saves registers on 64-bit windows.
+   -- For details check the Win64 ABI:
+   -- https://docs.microsoft.com/en-us/cpp/build/x64-software-conventions
    ++ map xmm [0  .. 5]
  | otherwise
     -- all xmm regs are caller-saves

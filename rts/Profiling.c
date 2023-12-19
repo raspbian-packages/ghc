@@ -8,7 +8,7 @@
 
 #if defined(PROFILING)
 
-#include "PosixSource.h"
+#include "rts/PosixSource.h"
 #include "Rts.h"
 
 #include "RtsUtils.h"
@@ -153,8 +153,8 @@ void initProfiling (void)
     /* for the benefit of allocate()... */
     {
         uint32_t n;
-        for (n=0; n < n_capabilities; n++) {
-            capabilities[n]->r.rCCCS = CCS_SYSTEM;
+        for (n=0; n < getNumCapabilities(); n++) {
+            getCapability(n)->r.rCCCS = CCS_SYSTEM;
         }
     }
 
@@ -201,7 +201,7 @@ void initProfiling (void)
         initTimeProfiling();
     }
 
-    dumpCostCentresToEventLog();
+    traceInitEvent(dumpCostCentresToEventLog);
 }
 
 

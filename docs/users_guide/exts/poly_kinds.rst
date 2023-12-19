@@ -77,7 +77,7 @@ run to completion, their results indeed have the types assigned. It makes no
 claim about programs that do not finish in a finite amount of time.
 
 To learn more about this decision and the design of GHC under the hood
-please see the `paper <http://www.seas.upenn.edu/~sweirich/papers/fckinds.pdf>`__
+please see the `paper <https://www.seas.upenn.edu/~sweirich/papers/fckinds.pdf>`__
 introducing this kind system to GHC/Haskell.
 
 Principles of kind inference
@@ -130,7 +130,44 @@ This rule has occasionally-surprising consequences (see
 The kind-polymorphism from the class declaration makes ``D1``
 kind-polymorphic, but not so ``D2``; and similarly ``F1``, ``F2``.
 
+Kind inference in type signatures
+---------------------------------
+
+When kind-checking a type, GHC considers only what is written in that
+type when figuring out how to generalise the type's kind.
+
+For example,
+consider these definitions (with :extension:`ScopedTypeVariables`): ::
+
+  data Proxy a    -- Proxy :: forall k. k -> Type
+  p :: forall a. Proxy a
+  p = Proxy :: Proxy (a :: Type)
+
+GHC reports an error, saying that the kind of ``a`` should be a kind variable
+``k``, not ``Type``. This is because, by looking at the type signature
+``forall a. Proxy a``, GHC assumes ``a``'s kind should be generalised, not
+restricted to be ``Type``. The function definition is then rejected for being
+more specific than its type signature.
+
+.. _explicit-kind-quantification:
+
+Explicit kind quantification
+----------------------------
+
+Enabled by :extension:`PolyKinds`, GHC supports explicit kind quantification,
+as in these examples: ::
+
+  data Proxy :: forall k. k -> Type
+  f :: (forall k (a :: k). Proxy a -> ()) -> Int
+
+Note that the second example has a ``forall`` that binds both a kind ``k`` and
+a type variable ``a`` of kind ``k``. In general, there is no limit to how
+deeply nested this sort of dependency can work. However, the dependency must
+be well-scoped: ``forall (a :: k) k. ...`` is an error.
+
+
 .. _inferring-variable-order:
+
 
 Inferring the order of variables in a type/class declaration
 ------------------------------------------------------------
@@ -281,7 +318,7 @@ signature" for a type constructor? These are the forms:
 
        {-# LANGUAGE UnliftedNewtypes #-}
        newtype N1 where                 -- No; missing kind signature
-       newtype N2 :: TYPE 'IntRep where -- Yes; kind signature present
+       newtype N2 :: TYPE IntRep where  -- Yes; kind signature present
        newtype N3 (a :: Type) where     -- No; missing kind signature
        newtype N4 :: k -> Type where    -- No; `k` is not explicitly quantified
        newtype N5 :: forall (k :: Type). k -> Type where -- Yes; good signature
@@ -400,6 +437,37 @@ parameters::
 Note that ``F0``, ``F1``, ``F2``, ``FD1``, and ``FD2`` all have identical
 standalone kind signatures. The arity is inferred from the type family header.
 
+The kind variables bound by an outermost ``forall`` in a standalone kind
+signature scope only over the kind in that signature. Unlike term-level type
+signatures (see :ref:`decl-type-sigs`), the outermost kind variables do *not*
+scope over the corresponding declaration. For example, given this class
+declaration: ::
+
+    class C (a :: k) where
+      m :: Proxy k -> Proxy a -> String
+
+The following would *not* be an equivalent definition of ``C``: ::
+
+    type C :: forall k. k -> Constraint
+    class C a where
+      m :: Proxy k -> Proxy a -> String
+
+Because the ``k`` from the standalone kind signature does not scope over
+``C``'s definition, the ``k`` in ``m``'s type signature is no longer the kind
+of ``a``, but rather a completely distinct kind. It's as if you had written
+this: ::
+
+    type C :: forall k. k -> Constraint
+    class C (a :: kindOfA) where
+      m :: forall k. Proxy k -> Proxy (a :: kindOfA) -> String
+
+To avoid this issue, ``C``'s definition must be given an inline kind annotation
+like so: ::
+
+    type C :: forall k. k -> Constraint
+    class C (a :: k) where
+      m :: Proxy k -> Proxy a -> String
+
 Standalone kind signatures and declaration headers
 --------------------------------------------------
 
@@ -490,41 +558,92 @@ This also applies to GADT-style data instances: ::
       --   • In the data instance declaration for ‘T’
 
 
-Kind inference in closed type families
---------------------------------------
+Kind inference in data type declarations
+----------------------------------------
 
-Although all open type families are considered to have a complete
-user-supplied kind signature, we can relax this condition for closed
-type families, where we have equations on which to perform kind
-inference. GHC will infer kinds for the arguments and result types of a
-closed type family.
+Consider the declaration ::
 
-GHC supports *kind-indexed* type families, where the family matches both
-on the kind and type. GHC will *not* infer this behaviour without a
-complete user-supplied kind signature, as doing so would sometimes infer
-non-principal types. Indeed, we can see kind-indexing as a form
-of polymorphic recursion, where a type is used at a kind other than
-its most general in its own definition.
+  data T1 f a = MkT1 (f a)
+  data T2 f a where
+    MkT2 :: f a -> T f a
 
-For example: ::
+In both cases GHC looks at the data constructor declarations to
+give constraints on the kind of ``T``, yielding ::
 
-    type family F1 a where
-      F1 True  = False
-      F1 False = True
-      F1 x     = x
-    -- F1 fails to compile: kind-indexing is not inferred
+  T1, T2 :: forall k. (k -> Type) -> k -> Type
 
-    type family F2 (a :: k) where
-      F2 True  = False
-      F2 False = True
-      F2 x     = x
-    -- F2 fails to compile: no complete signature
+Consider the type ::
 
-    type family F3 (a :: k) :: k where
-      F3 True  = False
-      F3 False = True
-      F3 x     = x
-    -- OK
+  type G :: forall k. k -> Type
+  data G (a :: k) where
+    GInt    :: G Int
+    GMaybe  :: G Maybe
+
+This datatype ``G`` is GADT-like in both its kind and its type. Suppose you
+have ``g :: G a``, where ``a :: k``. Then pattern matching to discover that
+``g`` is in fact ``GMaybe`` tells you both that ``k ~ (Type -> Type)`` and
+``a ~ Maybe``. The definition for ``G`` requires that :extension:`PolyKinds`
+be in effect, but pattern-matching on ``G`` requires no extension beyond
+:extension:`GADTs`. That this works is actually a straightforward extension
+of regular GADTs and a consequence of the fact that kinds and types are the
+same.
+
+Note that the datatype ``G`` is used at different kinds in its body, and
+therefore that kind-indexed GADTs use a form of polymorphic recursion.
+It is thus only possible to use this feature if you have provided a
+complete user-supplied kind signature (CUSK)
+for the datatype (:ref:`complete-kind-signatures`), or a standalone
+kind signature (:ref:`standalone-kind-signatures`);
+in the case of ``G`` we both.
+If you wish to see the kind indexing explicitly, you can do so by enabling :ghc-flag:`-fprint-explicit-kinds` and querying ``G`` with GHCi's :ghci-cmd:`:info` command: ::
+
+  > :set -fprint-explicit-kinds
+  > :info G
+  type role G nominal nominal
+  type G :: forall k. k -> Type
+  data G @k a where
+    GInt   :: G @Type Int
+    GMaybe :: G @(Type -> Type) Maybe
+
+where you can see the GADT-like nature of the two constructors.
+
+.. _kind-inference-data-family-instances:
+
+Kind inference for data/newtype instance declarations
+-----------------------------------------------------
+
+Consider these declarations ::
+
+   data family T :: forall k. (k->Type) -> k -> Type
+
+   data instance T p q where
+      MkT :: forall r. r Int -> T r Int
+
+Here ``T`` has an invisible kind argument; and perhaps it is instantiated
+to ``Type`` in the instance, thus::
+
+   data instance T @Type (p :: Type->Type) (q :: Type) where
+      MkT :: forall r. r Int -> T r Int
+
+Or perhaps we intended the specialisation to be in the GADT data
+constructor, thus::
+
+   data instance T @k (p :: k->Type) (q :: k) where
+      MkT :: forall r. r Int -> T @Type r Int
+
+It gets more complicated if there are multiple constructors.  In
+general, there is no principled way to tell which type specialisation
+comes from the data instance, and which from the individual GADT data
+constructors.
+
+So GHC implements this rule: in data/newtype instance declararations
+(unlike ordinary data/newtype declarations) we do *not* look at the
+constructor declarations when inferring the shape of the instance
+header.  The principle is that *the instantiation of the data instance
+should be apparent from the header alone*.  This principle makes the
+program easier to understand, and avoids the swamp of complexity
+indicated above.
+
 
 Kind inference in class instance declarations
 ---------------------------------------------
@@ -555,43 +674,8 @@ infrastructure, and it's not clear the payoff is worth it. If you want
 to restrict ``b``\ 's kind in the instance above, just use a kind
 signature in the instance head.
 
-Kind inference in type signatures
----------------------------------
-
-When kind-checking a type, GHC considers only what is written in that
-type when figuring out how to generalise the type's kind.
-
-For example,
-consider these definitions (with :extension:`ScopedTypeVariables`): ::
-
-  data Proxy a    -- Proxy :: forall k. k -> Type
-  p :: forall a. Proxy a
-  p = Proxy :: Proxy (a :: Type)
-
-GHC reports an error, saying that the kind of ``a`` should be a kind variable
-``k``, not ``Type``. This is because, by looking at the type signature
-``forall a. Proxy a``, GHC assumes ``a``'s kind should be generalised, not
-restricted to be ``Type``. The function definition is then rejected for being
-more specific than its type signature.
-
-.. _explicit-kind-quantification:
-
-Explicit kind quantification
-----------------------------
-
-Enabled by :extension:`PolyKinds`, GHC supports explicit kind quantification,
-as in these examples: ::
-
-  data Proxy :: forall k. k -> Type
-  f :: (forall k (a :: k). Proxy a -> ()) -> Int
-
-Note that the second example has a ``forall`` that binds both a kind ``k`` and
-a type variable ``a`` of kind ``k``. In general, there is no limit to how
-deeply nested this sort of dependency can work. However, the dependency must
-be well-scoped: ``forall (a :: k) k. ...`` is an error.
-
-Implicit quantification in type synonyms and type family instances
-------------------------------------------------------------------
+Kind inference in type synonyms and type family instances
+---------------------------------------------------------
 
 Consider the scoping rules for type synonyms and type family instances, such as
 these::
@@ -627,37 +711,37 @@ would become a *visible* parameter::
 Note that we only look at the *outermost* kind signature to decide which
 variables to quantify implicitly. As a counter-example, consider ``M1``: ::
 
-  type M1 = 'Just ('Nothing :: Maybe k)    -- rejected: k not in scope
+  type M1 = Just (Nothing :: Maybe k)    -- rejected: k not in scope
 
-Here, the kind signature is hidden inside ``'Just``, and there is no outermost
+Here, the kind signature is hidden inside ``Just``, and there is no outermost
 kind signature. We can fix this example by providing an outermost kind signature: ::
 
-  type M2 = 'Just ('Nothing :: Maybe k) :: Maybe (Maybe k)
+  type M2 = Just (Nothing :: Maybe k) :: Maybe (Maybe k)
 
 Here, ``k`` is brought into scope by ``:: Maybe (Maybe k)``.
 
 A kind signature is considered to be outermost regardless of redundant
 parentheses: ::
 
-  type P =    'Nothing :: Maybe a    -- accepted
-  type P = ((('Nothing :: Maybe a))) -- accepted
+  type P =    Nothing :: Maybe a    -- accepted
+  type P = (((Nothing :: Maybe a))) -- accepted
 
 Closed type family instances are subject to the same rules: ::
 
   type family F where
-    F = 'Nothing :: Maybe k            -- accepted
+    F = Nothing :: Maybe k            -- accepted
 
   type family F where
-    F = 'Just ('Nothing :: Maybe k)    -- rejected: k not in scope
+    F = Just (Nothing :: Maybe k)     -- rejected: k not in scope
 
   type family F where
-    F = 'Just ('Nothing :: Maybe k) :: Maybe (Maybe k)  -- accepted
+    F = Just (Nothing :: Maybe k) :: Maybe (Maybe k)  -- accepted
 
   type family F :: Maybe (Maybe k) where
-    F = 'Just ('Nothing :: Maybe k)    -- rejected: k not in scope
+    F = Just (Nothing :: Maybe k)     -- rejected: k not in scope
 
   type family F :: Maybe (Maybe k) where
-    F @k = 'Just ('Nothing :: Maybe k) -- accepted
+    F @k = Just (Nothing :: Maybe k)  -- accepted
 
 Kind variables can also be quantified in *visible* positions. Consider the
 following two examples: ::
@@ -706,29 +790,44 @@ kinds. Consequently, visible dependent quantifiers are rejected in any context
 that is unambiguously the type of a term. They are also rejected in the types
 of data constructors.
 
-Kind-indexed GADTs
-------------------
+Kind inference in closed type families
+--------------------------------------
 
-Consider the type ::
+Although all open type families are considered to have a complete
+user-supplied kind signature (:ref:`complete-kind-signatures`),
+we can relax this condition for closed
+type families, where we have equations on which to perform kind
+inference. GHC will infer kinds for the arguments and result types of a
+closed type family.
 
-  data G (a :: k) where
-    GInt    :: G Int
-    GMaybe  :: G Maybe
+GHC supports *kind-indexed* type families, where the family matches both
+on the kind and type. GHC will *not* infer this behaviour without a
+complete user-supplied kind signature or standalone kind
+signature (see :ref:`standalone-kind-signatures`),
+because doing so would sometimes infer
+non-principal types. Indeed, we can see kind-indexing as a form
+of polymorphic recursion, where a type is used at a kind other than
+its most general in its own definition.
 
-This datatype ``G`` is GADT-like in both its kind and its type. Suppose you
-have ``g :: G a``, where ``a :: k``. Then pattern matching to discover that
-``g`` is in fact ``GMaybe`` tells you both that ``k ~ (Type -> Type)`` and
-``a ~ Maybe``. The definition for ``G`` requires that :extension:`PolyKinds`
-be in effect, but pattern-matching on ``G`` requires no extension beyond
-:extension:`GADTs`. That this works is actually a straightforward extension
-of regular GADTs and a consequence of the fact that kinds and types are the
-same.
+For example: ::
 
-Note that the datatype ``G`` is used at different kinds in its body, and
-therefore that kind-indexed GADTs use a form of polymorphic recursion.
-It is thus only possible to use this feature if you have provided a
-complete user-supplied kind signature
-for the datatype (:ref:`complete-kind-signatures`).
+    type family F1 a where
+      F1 True  = False
+      F1 False = True
+      F1 x     = x
+    -- F1 fails to compile: kind-indexing is not inferred
+
+    type family F2 (a :: k) where
+      F2 True  = False
+      F2 False = True
+      F2 x     = x
+    -- F2 fails to compile: no complete signature
+
+    type family F3 (a :: k) :: k where
+      F3 True  = False
+      F3 False = True
+      F3 x     = x
+    -- OK
 
 Higher-rank kinds
 -----------------
@@ -768,47 +867,6 @@ To allow for such an instance, we would have to define ``(:~~:)`` as follows::
 In this redefinition, we give an explicit kind for ``(:~~:)``, deferring the choice
 of ``k2`` until after the first argument (``a``) has been given. With this declaration
 for ``(:~~:)``, the instance for ``HTestEquality`` is accepted.
-
-Another difference between higher-rank kinds and types can be found in their
-treatment of inferred and user-specified type variables. Consider the following
-program: ::
-
-  newtype Foo (f :: forall k. k -> Type) = MkFoo (f Int)
-  data Proxy a = Proxy
-
-  foo :: Foo Proxy
-  foo = MkFoo Proxy
-
-The kind of ``Foo``'s parameter is ``forall k. k -> Type``, but the kind of
-``Proxy`` is ``forall {k}. k -> Type``, where ``{k}`` denotes that the kind
-variable ``k`` is to be inferred, not specified by the user. (See
-:ref:`visible-type-application` for more discussion on the inferred-specified
-distinction). GHC does not consider ``forall k. k -> Type`` and
-``forall {k}. k -> Type`` to be equal at the kind level, and thus rejects
-``Foo Proxy`` as ill-kinded.
-
-Constraints in kinds
---------------------
-
-As kinds and types are the same, kinds can (with :extension:`TypeInType`)
-contain type constraints. However, only equality constraints are supported.
-
-Here is an example of a constrained kind: ::
-
-  type family IsTypeLit a where
-    IsTypeLit Nat    = 'True
-    IsTypeLit Symbol = 'True
-    IsTypeLit a      = 'False
-
-  data T :: forall a. (IsTypeLit a ~ 'True) => a -> Type where
-    MkNat    :: T 42
-    MkSymbol :: T "Don't panic!"
-
-The declarations above are accepted. However, if we add ``MkOther :: T Int``,
-we get an error that the equality constraint is not satisfied; ``Int`` is
-not a type literal. Note that explicitly quantifying with ``forall a`` is
-necessary in order for ``T`` to typecheck
-(see :ref:`complete-kind-signatures`).
 
 The kind ``Type``
 -----------------
@@ -899,16 +957,16 @@ Here is an example of this in action: ::
 
   -- separate module having imported the first
   {-# LANGUAGE NoPolyKinds, DataKinds #-}
-  z = Proxy :: Proxy 'MkCompose
+  z = Proxy :: Proxy MkCompose
 
-In the last line, we use the promoted constructor ``'MkCompose``, which has
+In the last line, we use the promoted constructor ``MkCompose``, which has
 kind ::
 
   forall (a :: Type) (b :: Type) (f :: b -> Type) (g :: a -> b) (x :: a).
     f (g x) -> Compose f g x
 
 Now we must infer a type for ``z``. To do so without generalising over kind
-variables, we must default the kind variables of ``'MkCompose``. We can easily
+variables, we must default the kind variables of ``MkCompose``. We can easily
 default ``a`` and ``b`` to ``Type``, but ``f`` and ``g`` would be ill-kinded if
 defaulted. The definition for ``z`` is thus an error.
 
@@ -933,7 +991,7 @@ in GADT-syntax (see :extension:`GADTSyntax`). For example::
 
 There are a number of restrictions around these *return kinds*. The text below
 considers :extension:`UnliftedNewtypes` and data families (enabled by :extension:`TypeFamilies`).
-The discussion also assumes familiarity with :ref:`levity polymorphism <runtime-rep>`.
+The discussion also assumes familiarity with :ref:`representation polymorphism <runtime-rep>`.
 
 1. ``data`` and ``data instance`` declarations must have return kinds that
    end in ``TYPE LiftedRep``. (Recall that ``Type`` is just a synonym for
@@ -997,5 +1055,6 @@ Examples::
 .. index::
    single: TYPE
    single: levity polymorphism
+   single: representation polymorphism
 
 

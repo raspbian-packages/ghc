@@ -6,12 +6,10 @@
 Utility functions on @Core@ syntax
 -}
 
-{-# LANGUAGE CPP #-}
-
 -- | Commonly useful utilities for manipulating the Core language
 module GHC.Core.Utils (
         -- * Constructing expressions
-        mkCast,
+        mkCast, mkCastMCo, mkPiMCo,
         mkTick, mkTicks, mkTickNoHNF, tickHNFArgs,
         bindNonRec, needsCaseBinding,
         mkAltExpr, mkDefaultCase, mkSingleAltCase,
@@ -25,29 +23,28 @@ module GHC.Core.Utils (
         -- * Properties of expressions
         exprType, coreAltType, coreAltsType, mkLamType, mkLamTypes,
         mkFunctionType,
-        isExprLevPoly,
         exprIsDupable, exprIsTrivial, getIdFromTrivialExpr, exprIsDeadEnd,
         getIdFromTrivialExpr_maybe,
         exprIsCheap, exprIsExpandable, exprIsCheapX, CheapAppFun,
-        exprIsHNF, exprOkForSpeculation, exprOkForSideEffects, exprIsWorkFree,
-        exprIsConLike,
-        isCheapApp, isExpandableApp,
+        exprIsHNF, exprOkForSpeculation, exprOkForSideEffects, exprOkForSpecEval,
+        exprIsWorkFree, exprIsConLike,
+        isCheapApp, isExpandableApp, isSaturatedConApp,
         exprIsTickedString, exprIsTickedString_maybe,
         exprIsTopLevelBindable,
         altsAreExhaustive,
 
         -- * Equality
         cheapEqExpr, cheapEqExpr', eqExpr,
-        diffExpr, diffBinds,
+        diffBinds,
 
-        -- * Eta reduction
-        tryEtaReduce,
+        -- * Lambdas and eta reduction
+        tryEtaReduce, canEtaReduceToArity,
 
         -- * Manipulating data constructors and types
-        exprToType, exprToCoercion_maybe,
-        applyTypeToArgs, applyTypeToArg,
+        exprToType,
+        applyTypeToArgs,
         dataConRepInstPat, dataConRepFSInstPat,
-        isEmptyTy,
+        isEmptyTy, normSplitTyConApp_maybe,
 
         -- * Working with ticks
         stripTicksTop, stripTicksTopE, stripTicksTopT,
@@ -59,6 +56,9 @@ module GHC.Core.Utils (
         -- * Join points
         isJoinBind,
 
+        -- * Tag inference
+        mkStrictFieldSeqs, shouldStrictifyIdForCbv, shouldUseCbvForId,
+
         -- * unsafeEqualityProof
         isUnsafeEqualityProof,
 
@@ -66,48 +66,61 @@ module GHC.Core.Utils (
         dumpIdInfoOfProgram
     ) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 import GHC.Platform
 
 import GHC.Core
-import GHC.Builtin.Names ( makeStaticName, unsafeEqualityProofName )
 import GHC.Core.Ppr
 import GHC.Core.FVs( exprFreeVars )
+import GHC.Core.DataCon
+import GHC.Core.Type as Type
+import GHC.Core.FamInstEnv
+import GHC.Core.Predicate
+import GHC.Core.TyCo.Rep( TyCoBinder(..), TyBinder )
+import GHC.Core.Coercion
+import GHC.Core.Reduction
+import GHC.Core.TyCon
+import GHC.Core.Multiplicity
+import GHC.Core.Map.Expr ( eqCoreExpr )
+
+import GHC.Builtin.Names ( makeStaticName, unsafeEqualityProofIdKey )
+import GHC.Builtin.PrimOps
+
+import GHC.Data.Graph.UnVar
 import GHC.Types.Var
 import GHC.Types.SrcLoc
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 import GHC.Types.Name
 import GHC.Types.Literal
-import GHC.Core.DataCon
-import GHC.Builtin.PrimOps
+import GHC.Types.Tickish
 import GHC.Types.Id
 import GHC.Types.Id.Info
-import GHC.Builtin.Names( absentErrorIdKey )
-import GHC.Core.Type as Type
-import GHC.Core.Predicate
-import GHC.Core.TyCo.Rep( TyCoBinder(..), TyBinder )
-import GHC.Core.Coercion
-import GHC.Core.TyCon
-import GHC.Core.Multiplicity
+import GHC.Types.Basic( Arity, Levity(..)
+                       )
 import GHC.Types.Unique
-import GHC.Utils.Outputable
-import GHC.Builtin.Types.Prim
+import GHC.Types.Unique.Set
+
 import GHC.Data.FastString
 import GHC.Data.Maybe
 import GHC.Data.List.SetOps( minusList )
-import GHC.Types.Basic     ( Arity )
-import GHC.Utils.Misc
 import GHC.Data.Pair
+import GHC.Data.OrdList
+
+import GHC.Utils.Constants (debugIsOn)
+import GHC.Utils.Outputable
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
+import GHC.Utils.Misc
+import GHC.Utils.Trace
+
 import Data.ByteString     ( ByteString )
 import Data.Function       ( on )
-import Data.List
+import Data.List           ( sort, sortBy, partition, zipWith4, mapAccumL )
 import Data.Ord            ( comparing )
-import GHC.Data.OrdList
 import qualified Data.Set as Set
-import GHC.Types.Unique.Set
+import GHC.Types.RepType (isZeroBitTy)
+import GHC.Types.Demand (isStrictDmd, isAbsDmd, isDeadEndAppSig)
 
 {-
 ************************************************************************
@@ -117,7 +130,7 @@ import GHC.Types.Unique.Set
 ************************************************************************
 -}
 
-exprType :: CoreExpr -> Type
+exprType :: HasDebugCallStack => CoreExpr -> Type
 -- ^ Recover the type of a well-typed Core expression. Fails when
 -- applied to the actual 'GHC.Core.Type' expression as it cannot
 -- really be said to have a type
@@ -134,13 +147,13 @@ exprType (Tick _ e)          = exprType e
 exprType (Lam binder expr)   = mkLamType binder (exprType expr)
 exprType e@(App _ _)
   = case collectArgs e of
-        (fun, args) -> applyTypeToArgs e (exprType fun) args
+        (fun, args) -> applyTypeToArgs (pprCoreExpr e) (exprType fun) args
 
-exprType other = pprTrace "exprType" (pprCoreExpr other) alphaTy
+exprType other = pprPanic "exprType" (pprCoreExpr other)
 
 coreAltType :: CoreAlt -> Type
 -- ^ Returns the type of the alternatives right hand side
-coreAltType alt@(_,bs,rhs)
+coreAltType alt@(Alt _ bs rhs)
   = case occCheckExpand bs rhs_ty of
       -- Note [Existential variables and silly type synonyms]
       Just ty -> ty
@@ -151,9 +164,9 @@ coreAltType alt@(_,bs,rhs)
 coreAltsType :: [CoreAlt] -> Type
 -- ^ Returns the type of the first alternative, which should be the same as for all alternatives
 coreAltsType (alt:_) = coreAltType alt
-coreAltsType []      = panic "corAltsType"
+coreAltsType []      = panic "coreAltsType"
 
-mkLamType  :: Var -> Type -> Type
+mkLamType  :: HasDebugCallStack => Var -> Type -> Type
 -- ^ Makes a @(->)@ type or an implicit forall type, depending
 -- on whether it is given a type variable or a term variable.
 -- This is used, for example, when producing the type of a lambda.
@@ -177,52 +190,13 @@ mkFunctionType :: Mult -> Type -> Type -> Type
 -- See GHC.Types.Var Note [AnonArgFlag]
 mkFunctionType mult arg_ty res_ty
    | isPredTy arg_ty -- See GHC.Types.Var Note [AnonArgFlag]
-   = ASSERT(eqType mult Many)
+   = assert (eqType mult Many) $
      mkInvisFunTy mult arg_ty res_ty
 
    | otherwise
    = mkVisFunTy mult arg_ty res_ty
 
 mkLamTypes vs ty = foldr mkLamType ty vs
-
--- | Is this expression levity polymorphic? This should be the
--- same as saying (isKindLevPoly . typeKind . exprType) but
--- much faster.
-isExprLevPoly :: CoreExpr -> Bool
-isExprLevPoly = go
-  where
-   go (Var _)                      = False  -- no levity-polymorphic binders
-   go (Lit _)                      = False  -- no levity-polymorphic literals
-   go e@(App f _) | not (go_app f) = False
-                  | otherwise      = check_type e
-   go (Lam _ _)                    = False
-   go (Let _ e)                    = go e
-   go e@(Case {})                  = check_type e -- checking type is fast
-   go e@(Cast {})                  = check_type e
-   go (Tick _ e)                   = go e
-   go e@(Type {})                  = pprPanic "isExprLevPoly ty" (ppr e)
-   go (Coercion {})                = False  -- this case can happen in GHC.Core.Opt.SetLevels
-
-   check_type = isTypeLevPoly . exprType  -- slow approach
-
-      -- if the function is a variable (common case), check its
-      -- levityInfo. This might mean we don't need to look up and compute
-      -- on the type. Spec of these functions: return False if there is
-      -- no possibility, ever, of this expression becoming levity polymorphic,
-      -- no matter what it's applied to; return True otherwise.
-      -- returning True is always safe. See also Note [Levity info] in
-      -- IdInfo
-   go_app (Var id)        = not (isNeverLevPolyId id)
-   go_app (Lit _)         = False
-   go_app (App f _)       = go_app f
-   go_app (Lam _ e)       = go_app e
-   go_app (Let _ e)       = go_app e
-   go_app (Case _ _ ty _) = resultIsLevPoly ty
-   go_app (Cast _ co)     = resultIsLevPoly (coercionRKind co)
-   go_app (Tick _ e)      = go_app e
-   go_app e@(Type {})     = pprPanic "isExprLevPoly app ty" (ppr e)
-   go_app e@(Coercion {}) = pprPanic "isExprLevPoly app co" (ppr e)
-
 
 {-
 Note [Type bindings]
@@ -261,11 +235,11 @@ Various possibilities suggest themselves:
 Note that there might be existentially quantified coercion variables, too.
 -}
 
--- Not defined with applyTypeToArg because you can't print from GHC.Core.
-applyTypeToArgs :: CoreExpr -> Type -> [CoreExpr] -> Type
--- ^ A more efficient version of 'applyTypeToArg' when we have several arguments.
+applyTypeToArgs :: HasDebugCallStack => SDoc -> Type -> [CoreExpr] -> Type
+-- ^ Determines the type resulting from applying an expression with given type
+--- to given argument expressions.
 -- The first argument is just for debugging, and gives some context
-applyTypeToArgs e op_ty args
+applyTypeToArgs pp_e op_ty args
   = go op_ty args
   where
     go op_ty []                   = op_ty
@@ -284,27 +258,35 @@ applyTypeToArgs e op_ty args
     go_ty_args op_ty rev_tys args
        = go (piResultTys op_ty (reverse rev_tys)) args
 
-    panic_msg as = vcat [ text "Expression:" <+> pprCoreExpr e
-                     , text "Type:" <+> ppr op_ty
-                     , text "Args:" <+> ppr args
-                     , text "Args':" <+> ppr as ]
+    panic_msg as = vcat [ text "Expression:" <+> pp_e
+                        , text "Type:" <+> ppr op_ty
+                        , text "Args:" <+> ppr args
+                        , text "Args':" <+> ppr as ]
+
+mkCastMCo :: CoreExpr -> MCoercionR -> CoreExpr
+mkCastMCo e MRefl    = e
+mkCastMCo e (MCo co) = Cast e co
+  -- We are careful to use (MCo co) only when co is not reflexive
+  -- Hence (Cast e co) rather than (mkCast e co)
+
+mkPiMCo :: Var -> MCoercionR -> MCoercionR
+mkPiMCo _  MRefl   = MRefl
+mkPiMCo v (MCo co) = MCo (mkPiCo Representational v co)
 
 
-{-
-************************************************************************
+{- *********************************************************************
 *                                                                      *
-\subsection{Attaching notes}
+             Casts
 *                                                                      *
-************************************************************************
--}
+********************************************************************* -}
 
 -- | Wrap the given expression in the coercion safely, dropping
 -- identity coercions and coalescing nested coercions
 mkCast :: CoreExpr -> CoercionR -> CoreExpr
 mkCast e co
-  | ASSERT2( coercionRole co == Representational
-           , text "coercion" <+> ppr co <+> ptext (sLit "passed to mkCast")
-             <+> ppr e <+> text "has wrong role" <+> ppr (coercionRole co) )
+  | assertPpr (coercionRole co == Representational)
+              (text "coercion" <+> ppr co <+> text "passed to mkCast"
+               <+> ppr e <+> text "has wrong role" <+> ppr (coercionRole co)) $
     isReflCo co
   = e
 
@@ -316,12 +298,13 @@ mkCast (Coercion e_co) co
   = Coercion (mkCoCast e_co co)
 
 mkCast (Cast expr co2) co
-  = WARN(let { from_ty = coercionLKind co;
-               to_ty2  = coercionRKind co2 } in
-            not (from_ty `eqType` to_ty2),
-             vcat ([ text "expr:" <+> ppr expr
+  = warnPprTrace (let { from_ty = coercionLKind co;
+                        to_ty2  = coercionRKind co2 } in
+                     not (from_ty `eqType` to_ty2))
+             "mkCast"
+             (vcat ([ text "expr:" <+> ppr expr
                    , text "co2:" <+> ppr co2
-                   , text "co:" <+> ppr co ]) )
+                   , text "co:" <+> ppr co ])) $
     mkCast expr (mkTransCo co2 co)
 
 mkCast (Tick t expr) co
@@ -329,25 +312,32 @@ mkCast (Tick t expr) co
 
 mkCast expr co
   = let from_ty = coercionLKind co in
-    WARN( not (from_ty `eqType` exprType expr),
-          text "Trying to coerce" <+> text "(" <> ppr expr
+    warnPprTrace (not (from_ty `eqType` exprType expr))
+          "Trying to coerce" (text "(" <> ppr expr
           $$ text "::" <+> ppr (exprType expr) <> text ")"
           $$ ppr co $$ ppr (coercionType co)
-          $$ callStackDoc )
+          $$ callStackDoc) $
     (Cast expr co)
+
+
+{- *********************************************************************
+*                                                                      *
+             Attaching ticks
+*                                                                      *
+********************************************************************* -}
 
 -- | Wraps the given expression in the source annotation, dropping the
 -- annotation if possible.
-mkTick :: Tickish Id -> CoreExpr -> CoreExpr
+mkTick :: CoreTickish -> CoreExpr -> CoreExpr
 mkTick t orig_expr = mkTick' id id orig_expr
  where
   -- Some ticks (cost-centres) can be split in two, with the
   -- non-counting part having laxer placement properties.
   canSplit = tickishCanSplit t && tickishPlace (mkNoCount t) /= tickishPlace t
 
-  mkTick' :: (CoreExpr -> CoreExpr) -- ^ apply after adding tick (float through)
-          -> (CoreExpr -> CoreExpr) -- ^ apply before adding tick (float with)
-          -> CoreExpr               -- ^ current expression
+  mkTick' :: (CoreExpr -> CoreExpr) -- apply after adding tick (float through)
+          -> (CoreExpr -> CoreExpr) -- apply before adding tick (float with)
+          -> CoreExpr               -- current expression
           -> CoreExpr
   mkTick' top rest expr = case expr of
 
@@ -423,7 +413,7 @@ mkTick t orig_expr = mkTick' id id orig_expr
     -- Catch-all: Annotate where we stand
     _any -> top $ Tick t $ rest expr
 
-mkTicks :: [Tickish Id] -> CoreExpr -> CoreExpr
+mkTicks :: [CoreTickish] -> CoreExpr -> CoreExpr
 mkTicks ticks expr = foldr mkTick expr ticks
 
 isSaturatedConApp :: CoreExpr -> Bool
@@ -434,13 +424,13 @@ isSaturatedConApp e = go e []
         go (Cast f _) as = go f as
         go _ _ = False
 
-mkTickNoHNF :: Tickish Id -> CoreExpr -> CoreExpr
+mkTickNoHNF :: CoreTickish -> CoreExpr -> CoreExpr
 mkTickNoHNF t e
   | exprIsHNF e = tickHNFArgs t e
   | otherwise   = mkTick t e
 
 -- push a tick into the arguments of a HNF (call or constructor app)
-tickHNFArgs :: Tickish Id -> CoreExpr -> CoreExpr
+tickHNFArgs :: CoreTickish -> CoreExpr -> CoreExpr
 tickHNFArgs t e = push t e
  where
   push t (App f (Type u)) = App (push t f) (Type u)
@@ -448,28 +438,28 @@ tickHNFArgs t e = push t e
   push _t e = e
 
 -- | Strip ticks satisfying a predicate from top of an expression
-stripTicksTop :: (Tickish Id -> Bool) -> Expr b -> ([Tickish Id], Expr b)
+stripTicksTop :: (CoreTickish -> Bool) -> Expr b -> ([CoreTickish], Expr b)
 stripTicksTop p = go []
   where go ts (Tick t e) | p t = go (t:ts) e
         go ts other            = (reverse ts, other)
 
 -- | Strip ticks satisfying a predicate from top of an expression,
 -- returning the remaining expression
-stripTicksTopE :: (Tickish Id -> Bool) -> Expr b -> Expr b
+stripTicksTopE :: (CoreTickish -> Bool) -> Expr b -> Expr b
 stripTicksTopE p = go
   where go (Tick t e) | p t = go e
         go other            = other
 
 -- | Strip ticks satisfying a predicate from top of an expression,
 -- returning the ticks
-stripTicksTopT :: (Tickish Id -> Bool) -> Expr b -> [Tickish Id]
+stripTicksTopT :: (CoreTickish -> Bool) -> Expr b -> [CoreTickish]
 stripTicksTopT p = go []
   where go ts (Tick t e) | p t = go (t:ts) e
         go ts _                = ts
 
 -- | Completely strip ticks satisfying a predicate from an
 -- expression. Note this is O(n) in the size of the expression!
-stripTicksE :: (Tickish Id -> Bool) -> Expr b -> Expr b
+stripTicksE :: (CoreTickish -> Bool) -> Expr b -> Expr b
 stripTicksE p expr = go expr
   where go (App e a)        = App (go e) (go a)
         go (Lam b e)        = Lam b (go e)
@@ -483,9 +473,9 @@ stripTicksE p expr = go expr
         go_bs (NonRec b e)  = NonRec b (go e)
         go_bs (Rec bs)      = Rec (map go_b bs)
         go_b (b, e)         = (b, go e)
-        go_a (c,bs,e)       = (c,bs, go e)
+        go_a (Alt c bs e)   = Alt c bs (go e)
 
-stripTicksT :: (Tickish Id -> Bool) -> Expr b -> [Tickish Id]
+stripTicksT :: (CoreTickish -> Bool) -> Expr b -> [CoreTickish]
 stripTicksT p expr = fromOL $ go expr
   where go (App e a)        = go e `appOL` go a
         go (Lam _ e)        = go e
@@ -499,7 +489,7 @@ stripTicksT p expr = fromOL $ go expr
         go_bs (NonRec _ e)  = go e
         go_bs (Rec bs)      = concatOL (map go_b bs)
         go_b (_, e)         = go e
-        go_a (_, _, e)      = go e
+        go_a (Alt _ _ e)    = go e
 
 {-
 ************************************************************************
@@ -538,7 +528,8 @@ bindNonRec bndr rhs body
 -- | Tests whether we have to use a @case@ rather than @let@ binding for this expression
 -- as per the invariants of 'CoreExpr': see "GHC.Core#let_app_invariant"
 needsCaseBinding :: Type -> CoreExpr -> Bool
-needsCaseBinding ty rhs = isUnliftedType ty && not (exprOkForSpeculation rhs)
+needsCaseBinding ty rhs =
+  mightBeUnliftedType ty && not (exprOkForSpeculation rhs)
         -- Make a case expression instead of a let
         -- These can arise either from the desugarer,
         -- or from beta reductions: (\x.e) (x +# y)
@@ -559,7 +550,7 @@ mkAltExpr DEFAULT _ _ = panic "mkAltExpr DEFAULT"
 mkDefaultCase :: CoreExpr -> Id -> CoreExpr -> CoreExpr
 -- Make (case x of y { DEFAULT -> e }
 mkDefaultCase scrut case_bndr body
-  = Case scrut case_bndr (exprType body) [(DEFAULT, [], body)]
+  = Case scrut case_bndr (exprType body) [Alt DEFAULT [] body]
 
 mkSingleAltCase :: CoreExpr -> Id -> AltCon -> [Var] -> CoreExpr -> CoreExpr
 -- Use this function if possible, when building a case,
@@ -567,7 +558,7 @@ mkSingleAltCase :: CoreExpr -> Id -> AltCon -> [Var] -> CoreExpr -> CoreExpr
 -- doesn't mention variables bound by the case
 -- See Note [Care with the type of a case expression]
 mkSingleAltCase scrut case_bndr con bndrs body
-  = Case scrut case_bndr case_ty [(con,bndrs,body)]
+  = Case scrut case_bndr case_ty [Alt con bndrs body]
   where
     body_ty = exprType body
 
@@ -601,7 +592,7 @@ which allows only (Coercion co) on the RHS.
 
 ************************************************************************
 *                                                                      *
-               Operations oer case alternatives
+               Operations over case alternatives
 *                                                                      *
 ************************************************************************
 
@@ -610,34 +601,34 @@ This makes it easy to find, though it makes matching marginally harder.
 -}
 
 -- | Extract the default case alternative
-findDefault :: [(AltCon, [a], b)] -> ([(AltCon, [a], b)], Maybe b)
-findDefault ((DEFAULT,args,rhs) : alts) = ASSERT( null args ) (alts, Just rhs)
-findDefault alts                        =                     (alts, Nothing)
+findDefault :: [Alt b] -> ([Alt b], Maybe (Expr b))
+findDefault (Alt DEFAULT args rhs : alts) = assert (null args) (alts, Just rhs)
+findDefault alts                          =                    (alts, Nothing)
 
-addDefault :: [(AltCon, [a], b)] -> Maybe b -> [(AltCon, [a], b)]
+addDefault :: [Alt b] -> Maybe (Expr b) -> [Alt b]
 addDefault alts Nothing    = alts
-addDefault alts (Just rhs) = (DEFAULT, [], rhs) : alts
+addDefault alts (Just rhs) = Alt DEFAULT [] rhs : alts
 
-isDefaultAlt :: (AltCon, a, b) -> Bool
-isDefaultAlt (DEFAULT, _, _) = True
-isDefaultAlt _               = False
+isDefaultAlt :: Alt b -> Bool
+isDefaultAlt (Alt DEFAULT _ _) = True
+isDefaultAlt _                 = False
 
 -- | Find the case alternative corresponding to a particular
 -- constructor: panics if no such constructor exists
-findAlt :: AltCon -> [(AltCon, a, b)] -> Maybe (AltCon, a, b)
+findAlt :: AltCon -> [Alt b] -> Maybe (Alt b)
     -- A "Nothing" result *is* legitimate
     -- See Note [Unreachable code]
 findAlt con alts
   = case alts of
-        (deflt@(DEFAULT,_,_):alts) -> go alts (Just deflt)
-        _                          -> go alts Nothing
+        (deflt@(Alt DEFAULT _ _):alts) -> go alts (Just deflt)
+        _                              -> go alts Nothing
   where
     go []                     deflt = deflt
-    go (alt@(con1,_,_) : alts) deflt
+    go (alt@(Alt con1 _ _) : alts) deflt
       = case con `cmpAltCon` con1 of
           LT -> deflt   -- Missed it already; the alts are in increasing order
           EQ -> Just alt
-          GT -> ASSERT( not (con1 == DEFAULT) ) go alts deflt
+          GT -> assert (not (con1 == DEFAULT)) $ go alts deflt
 
 {- Note [Unreachable code]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -670,7 +661,7 @@ filters down the matching alternatives in GHC.Core.Opt.Simplify.rebuildCase.
 -}
 
 ---------------------------------
-mergeAlts :: [(AltCon, a, b)] -> [(AltCon, a, b)] -> [(AltCon, a, b)]
+mergeAlts :: [Alt a] -> [Alt a] -> [Alt a]
 -- ^ Merge alternatives preserving order; alternatives in
 -- the first argument shadow ones in the second
 mergeAlts [] as2 = as2
@@ -692,15 +683,15 @@ trimConArgs :: AltCon -> [CoreArg] -> [CoreArg]
 -- We want to drop the leading type argument of the scrutinee
 -- leaving the arguments to match against the pattern
 
-trimConArgs DEFAULT      args = ASSERT( null args ) []
-trimConArgs (LitAlt _)   args = ASSERT( null args ) []
+trimConArgs DEFAULT      args = assert (null args) []
+trimConArgs (LitAlt _)   args = assert (null args) []
 trimConArgs (DataAlt dc) args = dropList (dataConUnivTyVars dc) args
 
 filterAlts :: TyCon                -- ^ Type constructor of scrutinee's type (used to prune possibilities)
            -> [Type]               -- ^ And its type arguments
            -> [AltCon]             -- ^ 'imposs_cons': constructors known to be impossible due to the form of the scrutinee
-           -> [(AltCon, [Var], a)] -- ^ Alternatives
-           -> ([AltCon], [(AltCon, [Var], a)])
+           -> [Alt b] -- ^ Alternatives
+           -> ([AltCon], [Alt b])
              -- Returns:
              --  1. Constructors that will never be encountered by the
              --     *default* case (if any).  A superset of imposs_cons
@@ -720,7 +711,7 @@ filterAlts _tycon inst_tys imposs_cons alts
   = (imposs_deflt_cons, addDefault trimmed_alts maybe_deflt)
   where
     (alts_wo_default, maybe_deflt) = findDefault alts
-    alt_cons = [con | (con,_,_) <- alts_wo_default]
+    alt_cons = [con | Alt con _ _ <- alts_wo_default]
 
     trimmed_alts = filterOut (impossible_alt inst_tys) alts_wo_default
 
@@ -731,10 +722,10 @@ filterAlts _tycon inst_tys imposs_cons alts
          --   EITHER by the context,
          --   OR by a non-DEFAULT branch in this case expression.
 
-    impossible_alt :: [Type] -> (AltCon, a, b) -> Bool
-    impossible_alt _ (con, _, _) | con `Set.member` imposs_cons_set = True
-    impossible_alt inst_tys (DataAlt con, _, _) = dataConCannotMatch inst_tys con
-    impossible_alt _  _                         = False
+    impossible_alt :: [Type] -> Alt b -> Bool
+    impossible_alt _ (Alt con _ _) | con `Set.member` imposs_cons_set = True
+    impossible_alt inst_tys (Alt (DataAlt con) _ _) = dataConCannotMatch inst_tys con
+    impossible_alt _  _                             = False
 
 -- | Refine the default alternative to a 'DataAlt', if there is a unique way to do so.
 -- See Note [Refine DEFAULT case alternatives]
@@ -746,7 +737,7 @@ refineDefaultAlt :: [Unique]          -- ^ Uniques for constructing new binders
                  -> [CoreAlt]
                  -> (Bool, [CoreAlt]) -- ^ 'True', if a default alt was replaced with a 'DataAlt'
 refineDefaultAlt us mult tycon tys imposs_deflt_cons all_alts
-  | (DEFAULT,_,rhs) : rest_alts <- all_alts
+  | Alt DEFAULT _ rhs : rest_alts <- all_alts
   , isAlgTyCon tycon            -- It's a data type, tuple, or unboxed tuples.
   , not (isNewTyCon tycon)      -- We can have a newtype, if we are just doing an eval:
                                 --      case x of { DEFAULT -> e }
@@ -763,7 +754,7 @@ refineDefaultAlt us mult tycon tys imposs_deflt_cons all_alts
        []    -> (False, rest_alts)
 
        -- It matches exactly one constructor, so fill it in:
-       [con] -> (True, mergeAlts rest_alts [(DataAlt con, ex_tvs ++ arg_ids, rhs)])
+       [con] -> (True, mergeAlts rest_alts [Alt (DataAlt con) (ex_tvs ++ arg_ids) rhs])
                        -- We need the mergeAlts to keep the alternatives in the right order
              where
                 (ex_tvs, arg_ids) = dataConRepInstPat us mult con tys
@@ -946,25 +937,25 @@ combineIdenticalAlts :: [AltCon]    -- Constructors that cannot match DEFAULT
                          [CoreAlt]) -- New alternatives
 -- See Note [Combine identical alternatives]
 -- True <=> we did some combining, result is a single DEFAULT alternative
-combineIdenticalAlts imposs_deflt_cons ((con1,bndrs1,rhs1) : rest_alts)
+combineIdenticalAlts imposs_deflt_cons (Alt con1 bndrs1 rhs1 : rest_alts)
   | all isDeadBinder bndrs1    -- Remember the default
   , not (null elim_rest) -- alternative comes first
   = (True, imposs_deflt_cons', deflt_alt : filtered_rest)
   where
     (elim_rest, filtered_rest) = partition identical_to_alt1 rest_alts
-    deflt_alt = (DEFAULT, [], mkTicks (concat tickss) rhs1)
+    deflt_alt = Alt DEFAULT [] (mkTicks (concat tickss) rhs1)
 
      -- See Note [Care with impossible-constructors when combining alternatives]
     imposs_deflt_cons' = imposs_deflt_cons `minusList` elim_cons
-    elim_cons = elim_con1 ++ map fstOf3 elim_rest
+    elim_cons = elim_con1 ++ map (\(Alt con _ _) -> con) elim_rest
     elim_con1 = case con1 of     -- Don't forget con1!
                   DEFAULT -> []  -- See Note [
                   _       -> [con1]
 
     cheapEqTicked e1 e2 = cheapEqExpr' tickishFloatable e1 e2
-    identical_to_alt1 (_con,bndrs,rhs)
+    identical_to_alt1 (Alt _con bndrs rhs)
       = all isDeadBinder bndrs && rhs `cheapEqTicked` rhs1
-    tickss = map (stripTicksT tickishFloatable . thdOf3) elim_rest
+    tickss = map (\(Alt _ _ rhs) -> stripTicksT tickishFloatable rhs) elim_rest
 
 combineIdenticalAlts imposs_cons alts
   = (False, imposs_cons, alts)
@@ -975,7 +966,7 @@ scaleAltsBy :: Mult -> [CoreAlt] -> [CoreAlt]
 scaleAltsBy w alts = map scaleAlt alts
   where
     scaleAlt :: CoreAlt -> CoreAlt
-    scaleAlt (con, bndrs, rhs) = (con, map scaleBndr bndrs, rhs)
+    scaleAlt (Alt con bndrs rhs) = Alt con (map scaleBndr bndrs) rhs
 
     scaleBndr :: CoreBndr -> CoreBndr
     scaleBndr b = scaleVarBy w b
@@ -1099,7 +1090,7 @@ exprIsDeadEnd e
   | otherwise
   = go 0 e
   where
-    go n (Var v)                 = isDeadEndId v &&  n >= idArity v
+    go n (Var v)                 = isDeadEndAppSig (idDmdSig v) n
     go n (App e a) | isTypeArg a = go n e
                    | otherwise   = go (n+1) e
     go n (Tick _ e)              = go n e
@@ -1235,12 +1226,12 @@ there is only dictionary selection (no construction) involved
 Note [exprIsCheap]
 ~~~~~~~~~~~~~~~~~~
 
-See also Note [Interaction of exprIsCheap and lone variables] in GHC.Core.Unfold
+See also Note [Interaction of exprIsWorkFree and lone variables] in GHC.Core.Unfold
 
 @exprIsCheap@ looks at a Core expression and returns \tr{True} if
 it is obviously in weak head normal form, or is cheap to get to WHNF.
-[Note that that's not the same as exprIsDupable; an expression might be
-big, and hence not dupable, but still cheap.]
+Note that that's not the same as exprIsDupable; an expression might be
+big, and hence not dupable, but still cheap.
 
 By ``cheap'' we mean a computation we're willing to:
         push inside a lambda, or
@@ -1298,12 +1289,15 @@ in this (which it previously was):
 
 --------------------
 exprIsWorkFree :: CoreExpr -> Bool   -- See Note [exprIsWorkFree]
-exprIsWorkFree = exprIsCheapX isWorkFreeApp
+exprIsWorkFree e = exprIsCheapX isWorkFreeApp e
 
 exprIsCheap :: CoreExpr -> Bool
-exprIsCheap = exprIsCheapX isCheapApp
+exprIsCheap e = exprIsCheapX isCheapApp e
 
 exprIsCheapX :: CheapAppFun -> CoreExpr -> Bool
+{-# INLINE exprIsCheapX #-}
+-- allow specialization of exprIsCheap and exprIsWorkFree
+-- instead of having an unknown call to ok_app
 exprIsCheapX ok_app e
   = ok e
   where
@@ -1316,7 +1310,7 @@ exprIsCheapX ok_app e
     go _ (Coercion {})                = True
     go n (Cast e _)                   = go n e
     go n (Case scrut _ _ alts)        = ok scrut &&
-                                        and [ go n rhs | (_,_,rhs) <- alts ]
+                                        and [ go n rhs | Alt _ _ rhs <- alts ]
     go n (Tick t e) | tickishCounts t = False
                     | otherwise       = go n e
     go n (Lam x e)  | isRuntimeVar x  = n==0 || go (n-1) e
@@ -1509,7 +1503,7 @@ Note [Expandable overloadings]
 Suppose the user wrote this
    {-# RULE  forall x. foo (negate x) = h x #-}
    f x = ....(foo (negate x))....
-He'd expect the rule to fire. But since negate is overloaded, we might
+They'd expect the rule to fire. But since negate is overloaded, we might
 get this:
     f = \d -> let n = negate d in \x -> ...foo (n x)...
 So we treat the application of a function (negate in this case) to a
@@ -1570,52 +1564,73 @@ it's applied only to dictionaries.
 -- side effects, and can't diverge or raise an exception.
 
 exprOkForSpeculation, exprOkForSideEffects :: CoreExpr -> Bool
-exprOkForSpeculation = expr_ok primOpOkForSpeculation
-exprOkForSideEffects = expr_ok primOpOkForSideEffects
+exprOkForSpeculation = expr_ok fun_always_ok primOpOkForSpeculation
+exprOkForSideEffects = expr_ok fun_always_ok primOpOkForSideEffects
 
-expr_ok :: (PrimOp -> Bool) -> CoreExpr -> Bool
-expr_ok _ (Lit _)      = True
-expr_ok _ (Type _)     = True
-expr_ok _ (Coercion _) = True
+fun_always_ok :: Id -> Bool
+fun_always_ok _ = True
 
-expr_ok primop_ok (Var v)    = app_ok primop_ok v []
-expr_ok primop_ok (Cast e _) = expr_ok primop_ok e
-expr_ok primop_ok (Lam b e)
-                 | isTyVar b = expr_ok primop_ok  e
+-- | A special version of 'exprOkForSpeculation' used during
+-- Note [Speculative evaluation]. When the predicate arg `fun_ok` returns False
+-- for `b`, then `b` is never considered ok-for-spec.
+exprOkForSpecEval :: (Id -> Bool) -> CoreExpr -> Bool
+exprOkForSpecEval fun_ok = expr_ok fun_ok primOpOkForSpeculation
+
+expr_ok :: (Id -> Bool) -> (PrimOp -> Bool) -> CoreExpr -> Bool
+expr_ok _ _ (Lit _)      = True
+expr_ok _ _ (Type _)     = True
+expr_ok _ _ (Coercion _) = True
+
+expr_ok fun_ok primop_ok (Var v)    = app_ok fun_ok primop_ok v []
+expr_ok fun_ok primop_ok (Cast e _) = expr_ok fun_ok primop_ok e
+expr_ok fun_ok primop_ok (Lam b e)
+                 | isTyVar b = expr_ok fun_ok primop_ok  e
                  | otherwise = True
 
 -- Tick annotations that *tick* cannot be speculated, because these
 -- are meant to identify whether or not (and how often) the particular
 -- source expression was evaluated at runtime.
-expr_ok primop_ok (Tick tickish e)
+expr_ok fun_ok primop_ok (Tick tickish e)
    | tickishCounts tickish = False
-   | otherwise             = expr_ok primop_ok e
+   | otherwise             = expr_ok fun_ok primop_ok e
 
-expr_ok _ (Let {}) = False
+expr_ok _ _ (Let {}) = False
   -- Lets can be stacked deeply, so just give up.
   -- In any case, the argument of exprOkForSpeculation is
   -- usually in a strict context, so any lets will have been
   -- floated away.
 
-expr_ok primop_ok (Case scrut bndr _ alts)
+expr_ok fun_ok primop_ok (Case scrut bndr _ alts)
   =  -- See Note [exprOkForSpeculation: case expressions]
-     expr_ok primop_ok scrut
+     expr_ok fun_ok primop_ok scrut
   && isUnliftedType (idType bndr)
-  && all (\(_,_,rhs) -> expr_ok primop_ok rhs) alts
+      -- OK to call isUnliftedType: binders always have a fixed RuntimeRep
+  && all (\(Alt _ _ rhs) -> expr_ok fun_ok primop_ok rhs) alts
   && altsAreExhaustive alts
 
-expr_ok primop_ok other_expr
+expr_ok fun_ok primop_ok other_expr
   | (expr, args) <- collectArgs other_expr
   = case stripTicksTopE (not . tickishCounts) expr of
-        Var f   -> app_ok primop_ok f args
+        Var f ->
+           app_ok fun_ok primop_ok f args
+
         -- 'LitRubbish' is the only literal that can occur in the head of an
         -- application and will not be matched by the above case (Var /= Lit).
-        Lit lit -> ASSERT( lit == rubbishLit ) True
-        _       -> False
+        -- See Note [How a rubbish literal can be the head of an application]
+        -- in GHC.Types.Literal
+        Lit lit | debugIsOn, not (isLitRubbish lit)
+                 -> pprPanic "Non-rubbish lit in app head" (ppr lit)
+                 | otherwise
+                 -> True
+
+        _ -> False
 
 -----------------------------
-app_ok :: (PrimOp -> Bool) -> Id -> [CoreExpr] -> Bool
-app_ok primop_ok fun args
+app_ok :: (Id -> Bool) -> (PrimOp -> Bool) -> Id -> [CoreExpr] -> Bool
+app_ok fun_ok primop_ok fun args
+  | not (fun_ok fun)
+  = False -- This code path is only taken for Note [Speculative evaluation]
+  | otherwise
   = case idDetails fun of
       DFunId new_type ->  not new_type
          -- DFuns terminate, unless the dict is implemented
@@ -1627,9 +1642,9 @@ app_ok primop_ok fun args
                 -- to take the arguments into account
 
       PrimOpId op
-        | isDivOp op
+        | primOpIsDiv op
         , [arg1, Lit lit] <- args
-        -> not (isZeroLit lit) && expr_ok primop_ok arg1
+        -> not (isZeroLit lit) && expr_ok fun_ok primop_ok arg1
               -- Special case for dividing operations that fail
               -- In general they are NOT ok-for-speculation
               -- (which primop_ok will catch), but they ARE OK
@@ -1648,21 +1663,37 @@ app_ok primop_ok fun args
         -> primop_ok op  -- Check the primop itself
         && and (zipWith primop_arg_ok arg_tys args)  -- Check the arguments
 
-      _other -> isUnliftedType (idType fun)          -- c.f. the Var case of exprIsHNF
-             || idArity fun > n_val_args             -- Partial apps
+      _  -- Unlifted types
+         -- c.f. the Var case of exprIsHNF
+         | Just Unlifted <- typeLevity_maybe (idType fun)
+         -> assertPpr (n_val_args == 0) (ppr fun $$ ppr args)
+            True  -- Our only unlifted types are Int# etc, so will have
+                  -- no value args.  The assert is just to check this.
+                  -- If we added unlifted function types this would change,
+                  -- and we'd need to actually test n_val_args == 0.
+
+         -- Partial applications
+         | idArity fun > n_val_args -> True
+
+         -- Functions that terminate fast without raising exceptions etc
+         -- See Note [Discarding unnecessary unsafeEqualityProofs]
+         | fun `hasKey` unsafeEqualityProofIdKey -> True
+
+         | otherwise -> False
              -- NB: even in the nullary case, do /not/ check
              --     for evaluated-ness of the fun;
              --     see Note [exprOkForSpeculation and evaluated variables]
-             where
-               n_val_args = valArgCount args
   where
+    n_val_args   = valArgCount args
     (arg_tys, _) = splitPiTys (idType fun)
 
     primop_arg_ok :: TyBinder -> CoreExpr -> Bool
     primop_arg_ok (Named _) _ = True   -- A type argument
     primop_arg_ok (Anon _ ty) arg      -- A term argument
-       | isUnliftedType (scaledThing ty) = expr_ok primop_ok arg
-       | otherwise         = True  -- See Note [Primops with lifted arguments]
+       | Just Lifted <- typeLevity_maybe (scaledThing ty)
+       = True -- See Note [Primops with lifted arguments]
+       | otherwise
+       = expr_ok fun_ok primop_ok arg
 
 -----------------------------
 altsAreExhaustive :: [Alt b] -> Bool
@@ -1670,7 +1701,7 @@ altsAreExhaustive :: [Alt b] -> Bool
 -- False <=> they may or may not be
 altsAreExhaustive []
   = False    -- Should not happen
-altsAreExhaustive ((con1,_,_) : alts)
+altsAreExhaustive (Alt con1 _ _ : alts)
   = case con1 of
       DEFAULT   -> True
       LitAlt {} -> False
@@ -1679,19 +1710,6 @@ altsAreExhaustive ((con1,_,_) : alts)
       -- enumerate all constructors, notably in a GADT match, but
       -- we behave conservatively here -- I don't think it's important
       -- enough to deserve special treatment
-
--- | True of dyadic operators that can fail only if the second arg is zero!
-isDivOp :: PrimOp -> Bool
--- This function probably belongs in GHC.Builtin.PrimOps, or even in
--- an automagically generated file.. but it's such a
--- special case I thought I'd leave it here for now.
-isDivOp IntQuotOp        = True
-isDivOp IntRemOp         = True
-isDivOp WordQuotOp       = True
-isDivOp WordRemOp        = True
-isDivOp FloatDivOp       = True
-isDivOp DoubleDivOp      = True
-isDivOp _                = False
 
 {- Note [exprOkForSpeculation: case expressions]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1786,7 +1804,7 @@ points do the job nicely.
 Note [Primops with lifted arguments]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Is this ok-for-speculation (see #13027)?
-   reallyUnsafePtrEq# a b
+   reallyUnsafePtrEquality# a b
 Well, yes.  The primop accepts lifted arguments and does not
 evaluate them.  Indeed, in general primops are, well, primitive
 and do not perform evaluation.
@@ -1840,6 +1858,20 @@ False (always) for DataToTagOp and SeqOp.
 
 Note that exprIsHNF /can/ and does take advantage of evaluated-ness;
 it doesn't have the trickiness of the let/app invariant to worry about.
+
+Note [Discarding unnecessary unsafeEqualityProofs]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In #20143 we found
+   case unsafeEqualityProof @t1 @t2 of UnsafeRefl cv[dead] -> blah
+where 'blah' didn't mention 'cv'.  We'd like to discard this
+redundant use of unsafeEqualityProof, via GHC.Core.Opt.Simplify.rebuildCase.
+To do this we need to know
+  (a) that cv is unused (done by OccAnal), and
+  (b) that unsafeEqualityProof terminates rapidly without side effects.
+
+At the moment we check that explicitly here in exprOkForSideEffects,
+but one might imagine a more systematic check in future.
+
 
 ************************************************************************
 *                                                                      *
@@ -1906,8 +1938,12 @@ exprIsHNFlike is_con is_con_unf = is_hnf_like
         -- We don't look through loop breakers here, which is a bit conservative
         -- but otherwise I worry that if an Id's unfolding is just itself,
         -- we could get an infinite loop
+      || ( typeLevity_maybe (idType v) == Just Unlifted )
+        -- Unlifted binders are always evaluated (#20140)
 
-    is_hnf_like (Lit _)          = True
+    is_hnf_like (Lit l)          = not (isLitRubbish l)
+        -- Regarding a LitRubbish as ConLike leads to unproductive inlining in
+        -- WWRec, see #20035
     is_hnf_like (Type _)         = True       -- Types are honorary Values;
                                               -- we don't mind copying them
     is_hnf_like (Coercion _)     = True       -- Same for coercions
@@ -1936,13 +1972,10 @@ exprIsHNFlike is_con is_con_unf = is_hnf_like
     id_app_is_value id n_val_args
        = is_con id
        || idArity id > n_val_args
-       || id `hasKey` absentErrorIdKey  -- See Note [aBSENT_ERROR_ID] in GHC.Core.Make
-                      -- absentError behaves like an honorary data constructor
-
 
 {-
 Note [exprIsHNF Tick]
-
+~~~~~~~~~~~~~~~~~~~~~
 We can discard source annotations on HNFs as long as they aren't
 tick-like:
 
@@ -1963,8 +1996,9 @@ exprIsTopLevelBindable :: CoreExpr -> Type -> Bool
 --   see Note [Core top-level string literals] in "GHC.Core"
 exprIsTopLevelBindable expr ty
   = not (mightBeUnliftedType ty)
-    -- Note that 'expr' may be levity polymorphic here consequently we must use
-    -- 'mightBeUnliftedType' rather than 'isUnliftedType' as the latter would panic.
+    -- Note that 'expr' may not have a fixed runtime representation here,
+    -- consequently we must use 'mightBeUnliftedType' rather than 'isUnliftedType',
+    -- as the latter would panic.
   || exprIsTickedString expr
 
 -- | Check if the expression is zero or more Ticks wrapped around a literal
@@ -2034,7 +2068,7 @@ dataConInstPat :: [FastString]          -- A long enough list of FSs to use for 
 --  where the double-primed variables are created with the FastStrings and
 --  Uniques given as fss and us
 dataConInstPat fss uniqs mult con inst_tys
-  = ASSERT( univ_tvs `equalLength` inst_tys )
+  = assert (univ_tvs `equalLength` inst_tys) $
     (ex_bndrs, arg_ids)
   where
     univ_tvs = dataConUnivTyVars con
@@ -2102,7 +2136,7 @@ cheapEqExpr :: Expr b -> Expr b -> Bool
 cheapEqExpr = cheapEqExpr' (const False)
 
 -- | Cheap expression equality test, can ignore ticks by type.
-cheapEqExpr' :: (Tickish Id -> Bool) -> Expr b -> Expr b -> Bool
+cheapEqExpr' :: (CoreTickish -> Bool) -> Expr b -> Expr b -> Bool
 {-# INLINE cheapEqExpr' #-}
 cheapEqExpr' ignoreTick e1 e2
   = go e1 e2
@@ -2124,52 +2158,83 @@ cheapEqExpr' ignoreTick e1 e2
 
 eqExpr :: InScopeSet -> CoreExpr -> CoreExpr -> Bool
 -- Compares for equality, modulo alpha
-eqExpr in_scope e1 e2
-  = go (mkRnEnv2 in_scope) e1 e2
-  where
-    go env (Var v1) (Var v2)
-      | rnOccL env v1 == rnOccR env v2
-      = True
+-- TODO: remove eqExpr once GHC 9.4 is released
+eqExpr _ = eqCoreExpr
+{-# DEPRECATED eqExpr "Use 'GHC.Core.Map.Expr.eqCoreExpr', 'eqExpr' will be removed in GHC 9.6" #-}
 
-    go _   (Lit lit1)    (Lit lit2)      = lit1 == lit2
-    go env (Type t1)    (Type t2)        = eqTypeX env t1 t2
-    go env (Coercion co1) (Coercion co2) = eqCoercionX env co1 co2
-    go env (Cast e1 co1) (Cast e2 co2) = eqCoercionX env co1 co2 && go env e1 e2
-    go env (App f1 a1)   (App f2 a2)   = go env f1 f2 && go env a1 a2
-    go env (Tick n1 e1)  (Tick n2 e2)  = eqTickish env n1 n2 && go env e1 e2
-
-    go env (Lam b1 e1)  (Lam b2 e2)
-      =  eqTypeX env (varType b1) (varType b2)   -- False for Id/TyVar combination
-      && go (rnBndr2 env b1 b2) e1 e2
-
-    go env (Let (NonRec v1 r1) e1) (Let (NonRec v2 r2) e2)
-      =  go env r1 r2  -- No need to check binder types, since RHSs match
-      && go (rnBndr2 env v1 v2) e1 e2
-
-    go env (Let (Rec ps1) e1) (Let (Rec ps2) e2)
-      = equalLength ps1 ps2
-      && all2 (go env') rs1 rs2 && go env' e1 e2
-      where
-        (bs1,rs1) = unzip ps1
-        (bs2,rs2) = unzip ps2
-        env' = rnBndrs2 env bs1 bs2
-
-    go env (Case e1 b1 t1 a1) (Case e2 b2 t2 a2)
-      | null a1   -- See Note [Empty case alternatives] in GHC.Data.TrieMap
-      = null a2 && go env e1 e2 && eqTypeX env t1 t2
-      | otherwise
-      =  go env e1 e2 && all2 (go_alt (rnBndr2 env b1 b2)) a1 a2
-
-    go _ _ _ = False
-
-    -----------
-    go_alt env (c1, bs1, e1) (c2, bs2, e2)
-      = c1 == c2 && go (rnBndrs2 env bs1 bs2) e1 e2
-
-eqTickish :: RnEnv2 -> Tickish Id -> Tickish Id -> Bool
-eqTickish env (Breakpoint lid lids) (Breakpoint rid rids)
-      = lid == rid  &&  map (rnOccL env) lids == map (rnOccR env) rids
+-- Used by diffBinds, which is itself only used in GHC.Core.Lint.lintAnnots
+eqTickish :: RnEnv2 -> CoreTickish -> CoreTickish -> Bool
+eqTickish env (Breakpoint lext lid lids) (Breakpoint rext rid rids)
+      = lid == rid &&
+        map (rnOccL env) lids == map (rnOccR env) rids &&
+        lext == rext
 eqTickish _ l r = l == r
+
+-- | Finds differences between core bindings, see @diffExpr@.
+--
+-- The main problem here is that while we expect the binds to have the
+-- same order in both lists, this is not guaranteed. To do this
+-- properly we'd either have to do some sort of unification or check
+-- all possible mappings, which would be seriously expensive. So
+-- instead we simply match single bindings as far as we can. This
+-- leaves us just with mutually recursive and/or mismatching bindings,
+-- which we then speculatively match by ordering them. It's by no means
+-- perfect, but gets the job done well enough.
+--
+-- Only used in GHC.Core.Lint.lintAnnots
+diffBinds :: Bool -> RnEnv2 -> [(Var, CoreExpr)] -> [(Var, CoreExpr)]
+          -> ([SDoc], RnEnv2)
+diffBinds top env binds1 = go (length binds1) env binds1
+ where go _    env []     []
+          = ([], env)
+       go fuel env binds1 binds2
+          -- No binds left to compare? Bail out early.
+          | null binds1 || null binds2
+          = (warn env binds1 binds2, env)
+          -- Iterated over all binds without finding a match? Then
+          -- try speculatively matching binders by order.
+          | fuel == 0
+          = if not $ env `inRnEnvL` fst (head binds1)
+            then let env' = uncurry (rnBndrs2 env) $ unzip $
+                            zip (sort $ map fst binds1) (sort $ map fst binds2)
+                 in go (length binds1) env' binds1 binds2
+            -- If we have already tried that, give up
+            else (warn env binds1 binds2, env)
+       go fuel env ((bndr1,expr1):binds1) binds2
+          | let matchExpr (bndr,expr) =
+                  (isTyVar bndr || not top || null (diffIdInfo env bndr bndr1)) &&
+                  null (diffExpr top (rnBndr2 env bndr1 bndr) expr1 expr)
+
+          , (binds2l, (bndr2,_):binds2r) <- break matchExpr binds2
+          = go (length binds1) (rnBndr2 env bndr1 bndr2)
+                binds1 (binds2l ++ binds2r)
+          | otherwise -- No match, so push back (FIXME O(n^2))
+          = go (fuel-1) env (binds1++[(bndr1,expr1)]) binds2
+       go _ _ _ _ = panic "diffBinds: impossible" -- GHC isn't smart enough
+
+       -- We have tried everything, but couldn't find a good match. So
+       -- now we just return the comparison results when we pair up
+       -- the binds in a pseudo-random order.
+       warn env binds1 binds2 =
+         concatMap (uncurry (diffBind env)) (zip binds1' binds2') ++
+         unmatched "unmatched left-hand:" (drop l binds1') ++
+         unmatched "unmatched right-hand:" (drop l binds2')
+        where binds1' = sortBy (comparing fst) binds1
+              binds2' = sortBy (comparing fst) binds2
+              l = min (length binds1') (length binds2')
+       unmatched _   [] = []
+       unmatched txt bs = [text txt $$ ppr (Rec bs)]
+       diffBind env (bndr1,expr1) (bndr2,expr2)
+         | ds@(_:_) <- diffExpr top env expr1 expr2
+         = locBind "in binding" bndr1 bndr2 ds
+         -- Special case for TyVar, which we checked were bound to the same types in
+         -- diffExpr, but don't have any IdInfo we would panic if called diffIdInfo.
+         -- These let-bound types are created temporarily by the simplifier but inlined
+         -- immediately.
+         | isTyVar bndr1 && isTyVar bndr2
+         = []
+         | otherwise
+         = diffIdInfo env bndr1 bndr2
 
 -- | Finds differences between core expressions, modulo alpha and
 -- renaming. Setting @top@ means that the @IdInfo@ of bindings will be
@@ -2206,68 +2271,11 @@ diffExpr top env (Case e1 b1 t1 a1) (Case e2 b2 t2 a2)
     -- See Note [Empty case alternatives] in GHC.Data.TrieMap
   = diffExpr top env e1 e2 ++ concat (zipWith diffAlt a1 a2)
   where env' = rnBndr2 env b1 b2
-        diffAlt (c1, bs1, e1) (c2, bs2, e2)
+        diffAlt (Alt c1 bs1 e1) (Alt c2 bs2 e2)
           | c1 /= c2  = [text "alt-cons " <> ppr c1 <> text " /= " <> ppr c2]
           | otherwise = diffExpr top (rnBndrs2 env' bs1 bs2) e1 e2
 diffExpr _  _ e1 e2
   = [fsep [ppr e1, text "/=", ppr e2]]
-
--- | Finds differences between core bindings, see @diffExpr@.
---
--- The main problem here is that while we expect the binds to have the
--- same order in both lists, this is not guaranteed. To do this
--- properly we'd either have to do some sort of unification or check
--- all possible mappings, which would be seriously expensive. So
--- instead we simply match single bindings as far as we can. This
--- leaves us just with mutually recursive and/or mismatching bindings,
--- which we then speculatively match by ordering them. It's by no means
--- perfect, but gets the job done well enough.
-diffBinds :: Bool -> RnEnv2 -> [(Var, CoreExpr)] -> [(Var, CoreExpr)]
-          -> ([SDoc], RnEnv2)
-diffBinds top env binds1 = go (length binds1) env binds1
- where go _    env []     []
-          = ([], env)
-       go fuel env binds1 binds2
-          -- No binds left to compare? Bail out early.
-          | null binds1 || null binds2
-          = (warn env binds1 binds2, env)
-          -- Iterated over all binds without finding a match? Then
-          -- try speculatively matching binders by order.
-          | fuel == 0
-          = if not $ env `inRnEnvL` fst (head binds1)
-            then let env' = uncurry (rnBndrs2 env) $ unzip $
-                            zip (sort $ map fst binds1) (sort $ map fst binds2)
-                 in go (length binds1) env' binds1 binds2
-            -- If we have already tried that, give up
-            else (warn env binds1 binds2, env)
-       go fuel env ((bndr1,expr1):binds1) binds2
-          | let matchExpr (bndr,expr) =
-                  (not top || null (diffIdInfo env bndr bndr1)) &&
-                  null (diffExpr top (rnBndr2 env bndr1 bndr) expr1 expr)
-          , (binds2l, (bndr2,_):binds2r) <- break matchExpr binds2
-          = go (length binds1) (rnBndr2 env bndr1 bndr2)
-                binds1 (binds2l ++ binds2r)
-          | otherwise -- No match, so push back (FIXME O(n^2))
-          = go (fuel-1) env (binds1++[(bndr1,expr1)]) binds2
-       go _ _ _ _ = panic "diffBinds: impossible" -- GHC isn't smart enough
-
-       -- We have tried everything, but couldn't find a good match. So
-       -- now we just return the comparison results when we pair up
-       -- the binds in a pseudo-random order.
-       warn env binds1 binds2 =
-         concatMap (uncurry (diffBind env)) (zip binds1' binds2') ++
-         unmatched "unmatched left-hand:" (drop l binds1') ++
-         unmatched "unmatched right-hand:" (drop l binds2')
-        where binds1' = sortBy (comparing fst) binds1
-              binds2' = sortBy (comparing fst) binds2
-              l = min (length binds1') (length binds2')
-       unmatched _   [] = []
-       unmatched txt bs = [text txt $$ ppr (Rec bs)]
-       diffBind env (bndr1,expr1) (bndr2,expr2)
-         | ds@(_:_) <- diffExpr top env expr1 expr2
-         = locBind "in binding" bndr1 bndr2 ds
-         | otherwise
-         = diffIdInfo env bndr1 bndr2
 
 -- | Find differences in @IdInfo@. We will especially check whether
 -- the unfoldings match, if present (see @diffUnfold@).
@@ -2282,7 +2290,7 @@ diffIdInfo env bndr1 bndr2
     && callArityInfo info1 == callArityInfo info2
     && levityInfo info1 == levityInfo info2
   = locBind "in unfolding of" bndr1 bndr2 $
-    diffUnfold env (unfoldingInfo info1) (unfoldingInfo info2)
+    diffUnfold env (realUnfoldingInfo info1) (realUnfoldingInfo info2)
   | otherwise
   = locBind "in Id info of" bndr1 bndr2
     [fsep [pprBndr LetBind bndr1, text "/=", pprBndr LetBind bndr2]]
@@ -2300,10 +2308,9 @@ diffUnfold env (DFunUnfolding bs1 c1 a1)
   | c1 == c2 && equalLength bs1 bs2
   = concatMap (uncurry (diffExpr False env')) (zip a1 a2)
   where env' = rnBndrs2 env bs1 bs2
-diffUnfold env (CoreUnfolding t1 _ _ v1 cl1 wf1 x1 g1)
-               (CoreUnfolding t2 _ _ v2 cl2 wf2 x2 g2)
-  | v1 == v2 && cl1 == cl2
-    && wf1 == wf2 && x1 == x2 && g1 == g2
+diffUnfold env (CoreUnfolding t1 _ _ c1 g1)
+               (CoreUnfolding t2 _ _ c2 g2)
+  | c1 == c2 && g1 == g2
   = diffExpr False env t1 t2
 diffUnfold _   uf1 uf2
   = [fsep [ppr uf1, text "/=", ppr uf2]]
@@ -2361,7 +2368,9 @@ There are some particularly delicate points here:
   The above is correct, but eta-reducing g would yield g=f, the linter will
   complain that g and f don't have the same type.
 
-* Note [Arity care]: we need to be careful if we just look at f's
+* Note [Arity care]
+  ~~~~~~~~~~~~~~~~~
+  We need to be careful if we just look at f's
   arity. Currently (Dec07), f's arity is visible in its own RHS (see
   Note [Arity robustness] in GHC.Core.Opt.Simplify.Env) so we must *not* trust the
   arity when checking that 'f' is a value.  Otherwise we will
@@ -2419,8 +2428,8 @@ need to address that here.
 
 -- When updating this function, make sure to update
 -- CorePrep.tryEtaReducePrep as well!
-tryEtaReduce :: [Var] -> CoreExpr -> Maybe CoreExpr
-tryEtaReduce bndrs body
+tryEtaReduce :: UnVarSet -> [Var] -> CoreExpr -> Maybe CoreExpr
+tryEtaReduce rec_ids bndrs body
   = go (reverse bndrs) body (mkRepReflCo (exprType body))
   where
     incoming_arity = count isId bndrs
@@ -2459,12 +2468,15 @@ tryEtaReduce bndrs body
     ok_fun _fun                = False
 
     ---------------
-    ok_fun_id fun = fun_arity fun >= incoming_arity
-
+    ok_fun_id fun =
+      -- Don't eta-reduce in fun in its own recursive RHSs
+      not (fun `elemUnVarSet` rec_ids) &&            -- criterion (R)
+      -- There are arguments to reduce...
+      fun_arity fun >= incoming_arity &&
+      -- ... and the function can be eta reduced to arity 0
+      canEtaReduceToArity fun 0 0
     ---------------
     fun_arity fun             -- See Note [Arity care]
-       | isLocalId fun
-       , isStrongLoopBreaker (idOccInfo fun) = 0
        | arity > 0                           = arity
        | isEvaldUnfolding (idUnfolding fun)  = 1
             -- See Note [Eta reduction of an eval'd function]
@@ -2482,7 +2494,7 @@ tryEtaReduce bndrs body
            -> Type             -- Type of the function to which the argument is applied
            -> Maybe (Coercion  -- Of type (arg_t -> t1 ~  bndr_t -> t2)
                                --   (and similarly for tyvars, coercion args)
-                    , [Tickish Var])
+                    , [CoreTickish])
     -- See Note [Eta reduction with casted arguments]
     ok_arg bndr (Type ty) co _
        | Just tv <- getTyVar_maybe ty
@@ -2492,8 +2504,7 @@ tryEtaReduce bndrs body
        , let mult = idMult bndr
        , Just (fun_mult, _, _) <- splitFunTy_maybe fun_ty
        , mult `eqType` fun_mult -- There is no change in multiplicity, otherwise we must abort
-       = let reflCo = mkRepReflCo (idType bndr)
-         in Just (mkFunCo Representational (multToCo mult) reflCo co, [])
+       = Just (mkFunResCo Representational (idScaledType bndr) co, [])
     ok_arg bndr (Cast e co_arg) co fun_ty
        | (ticks, Var v) <- stripTicksTop tickishFloatable e
        , Just (fun_mult, _, _) <- splitFunTy_maybe fun_ty
@@ -2507,6 +2518,28 @@ tryEtaReduce bndrs body
        = Just (co', t:ticks)
 
     ok_arg _ _ _ _ = Nothing
+
+-- | Can we eta-reduce the given function to the specified arity?
+-- See Note [Eta reduction conditions].
+canEtaReduceToArity :: Id -> JoinArity -> Arity -> Bool
+canEtaReduceToArity fun dest_join_arity dest_arity =
+  not $
+        hasNoBinding fun
+       -- Don't undersaturate functions with no binding.
+
+    ||  ( isJoinId fun && dest_join_arity < idJoinArity fun )
+       -- Don't undersaturate join points.
+       -- See Note [Invariants on join points] in GHC.Core, and #20599
+
+    || ( dest_arity < idCbvMarkArity fun )
+       -- Don't undersaturate StrictWorkerIds.
+       -- See Note [CBV Function Ids]  in GHC.CoreToStg.Prep.
+
+    ||  isLinearType (idType fun)
+       -- Don't perform eta reduction on linear types.
+       -- If `f :: A %1-> B` and `g :: A -> B`,
+       -- then `g x = f x` is OK but `g = f` is not.
+       -- See Note [Eta reduction conditions].
 
 {-
 Note [Eta reduction of an eval'd function]
@@ -2522,9 +2555,9 @@ to the rule that
 we can eta-reduce    \x. f x  ===>  f
 
 This turned up in #7542.
+-}
 
-
-************************************************************************
+{- *********************************************************************
 *                                                                      *
 \subsection{Determining non-updatable right-hand-sides}
 *                                                                      *
@@ -2564,6 +2597,17 @@ isEmptyTy ty
     | otherwise
     = False
 
+-- | If @normSplitTyConApp_maybe _ ty = Just (tc, tys, co)@
+-- then @ty |> co = tc tys@. It's 'splitTyConApp_maybe', but looks through
+-- coercions via 'topNormaliseType_maybe'. Hence the \"norm\" prefix.
+normSplitTyConApp_maybe :: FamInstEnvs -> Type -> Maybe (TyCon, [Type], Coercion)
+normSplitTyConApp_maybe fam_envs ty
+  | let Reduction co ty1 = topNormaliseType_maybe fam_envs ty
+                           `orElse` (mkReflRedn Representational ty)
+  , Just (tc, tc_args) <- splitTyConApp_maybe ty1
+  = Just (tc, tc_args, co)
+normSplitTyConApp_maybe _ _ = Nothing
+
 {-
 *****************************************************
 *
@@ -2597,15 +2641,257 @@ isJoinBind (NonRec b _)       = isJoinId b
 isJoinBind (Rec ((b, _) : _)) = isJoinId b
 isJoinBind _                  = False
 
-dumpIdInfoOfProgram :: (IdInfo -> SDoc) -> CoreProgram -> SDoc
-dumpIdInfoOfProgram ppr_id_info binds = vcat (map printId ids)
+dumpIdInfoOfProgram :: Bool -> (IdInfo -> SDoc) -> CoreProgram -> SDoc
+dumpIdInfoOfProgram dump_locals ppr_id_info binds = vcat (map printId ids)
   where
   ids = sortBy (stableNameCmp `on` getName) (concatMap getIds binds)
   getIds (NonRec i _) = [ i ]
   getIds (Rec bs)     = map fst bs
-  printId id | isExportedId id = ppr id <> colon <+> (ppr_id_info (idInfo id))
+  -- By default only include full info for exported ids, unless we run in the verbose
+  -- pprDebug mode.
+  printId id | isExportedId id || dump_locals = ppr id <> colon <+> (ppr_id_info (idInfo id))
              | otherwise       = empty
 
+{-
+************************************************************************
+*                                                                      *
+\subsection{Tag inference things}
+*                                                                      *
+************************************************************************
+-}
+
+{- Note [Call-by-value for worker args]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+If we unbox a constructor with strict fields we want to
+preserve the information that some of the arguments came
+out of strict fields and therefore should be already properly
+tagged, however we can't express this directly in core.
+
+Instead what we do is generate a worker like this:
+
+  data T = MkT A !B
+
+  foo = case T of MkT a b -> $wfoo a b
+
+  $wfoo a b = case b of b' -> rhs[b/b']
+
+This makes the worker strict in b causing us to use a more efficient
+calling convention for `b` where the caller needs to ensure `b` is
+properly tagged and evaluated before it's passed to $wfoo. See Note [CBV Function Ids].
+
+Usually the argument will be known to be properly tagged at the call site so there is
+no additional work for the caller and the worker can be more efficient since it can
+assume the presence of a tag.
+
+This is especially true for recursive functions like this:
+    -- myPred expect it's argument properly tagged
+    myPred !x = ...
+
+    loop :: MyPair -> Int
+    loop (MyPair !x !y) =
+        case x of
+            A -> 1
+            B -> 2
+            _ -> loop (MyPair (myPred x) (myPred y))
+
+Here we would ordinarily not be strict in y after unboxing.
+However if we pass it as a regular argument then this means on
+every iteration of loop we will incur an extra seq on y before
+we can pass it to `myPred` which isn't great! That is in STG after
+tag inference we get:
+
+    Rec {
+    Find.$wloop [InlPrag=[2], Occ=LoopBreaker]
+      :: Find.MyEnum -> Find.MyEnum -> GHC.Prim.Int#
+    [GblId[StrictWorker([!, ~])],
+    Arity=2,
+    Str=<1L><ML>,
+    Unf=OtherCon []] =
+        {} \r [x y]
+            case x<TagProper> of x' [Occ=Once1] {
+              __DEFAULT ->
+                  case y of y' [Occ=Once1] {
+                  __DEFAULT ->
+                  case Find.$wmyPred y' of pred_y [Occ=Once1] {
+                  __DEFAULT ->
+                  case Find.$wmyPred x' of pred_x [Occ=Once1] {
+                  __DEFAULT -> Find.$wloop pred_x pred_y;
+                  };
+                  };
+              Find.A -> 1#;
+              Find.B -> 2#;
+            };
+    end Rec }
+
+Here comes the tricky part: If we make $wloop strict in both x/y and we get:
+
+    Rec {
+    Find.$wloop [InlPrag=[2], Occ=LoopBreaker]
+      :: Find.MyEnum -> Find.MyEnum -> GHC.Prim.Int#
+    [GblId[StrictWorker([!, !])],
+    Arity=2,
+    Str=<1L><!L>,
+    Unf=OtherCon []] =
+        {} \r [x y]
+            case y<TagProper> of y' [Occ=Once1] { __DEFAULT ->
+            case x<TagProper> of x' [Occ=Once1] {
+              __DEFAULT ->
+                  case Find.$wmyPred y' of pred_y [Occ=Once1] {
+                  __DEFAULT ->
+                  case Find.$wmyPred x' of pred_x [Occ=Once1] {
+                  __DEFAULT -> Find.$wloop pred_x pred_y;
+                  };
+                  };
+              Find.A -> 1#;
+              Find.B -> 2#;
+            };
+    end Rec }
+
+Here both x and y are known to be tagged in the function body since we pass strict worker args using unlifted cbv.
+This means the seqs on x and y both become no-ops and compared to the first version the seq on `y` disappears at runtime.
+
+The downside is that the caller of $wfoo potentially has to evaluate `y` once if we can't prove it isn't already evaluated.
+But y coming out of a strict field is in WHNF so safe to evaluated. And most of the time it will be properly tagged+evaluated
+already at the call site because of the Strict Field Invariant! See Note [Strict Field Invariant] for more in this.
+This makes GHC itself around 1% faster despite doing slightly more work! So this is generally quite good.
+
+We only apply this when we think there is a benefit in doing so however. There are a number of cases in which
+it would be useless to insert an extra seq. ShouldStrictifyIdForCbv tries to identify these to avoid churn in the
+simplifier. See Note [Which Ids should be strictified] for details on this.
+-}
+mkStrictFieldSeqs :: [(Id,StrictnessMark)] -> CoreExpr -> (CoreExpr)
+mkStrictFieldSeqs args rhs =
+  foldr addEval rhs args
+    where
+      case_ty = exprType rhs
+      addEval :: (Id,StrictnessMark) -> (CoreExpr) -> (CoreExpr)
+      addEval (arg_id,arg_cbv) (rhs)
+        -- Argument representing strict field.
+        | isMarkedStrict arg_cbv
+        , shouldStrictifyIdForCbv arg_id
+        -- Make sure to remove unfoldings here to avoid the simplifier dropping those for OtherCon[] unfoldings.
+        = Case (Var $! zapIdUnfolding arg_id) arg_id case_ty ([Alt DEFAULT [] rhs])
+        -- Normal argument
+        | otherwise = do
+          rhs
+
+{- Note [Which Ids should be strictified]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+For some arguments we would like to convince GHC to pass them call by value.
+One way to achieve this is described in see Note [Call-by-value for worker args].
+
+We separate the concerns of "should we pass this argument using cbv" and
+"should we do so by making the rhs strict in this argument".
+This note deals with the second part.
+
+There are multiple reasons why we might not want to insert a seq in the rhs to
+strictify a functions argument:
+
+1) The argument doesn't exist at runtime.
+
+For zero width types (like Types) there is no benefit as we don't operate on them
+at runtime at all. This includes things like void#, coercions and state tokens.
+
+2) The argument is a unlifted type.
+
+If the argument is a unlifted type the calling convention already is explicitly
+cbv. This means inserting a seq on this argument wouldn't do anything as the seq
+would be a no-op *and* it wouldn't affect the calling convention.
+
+3) The argument is absent.
+
+If the argument is absent in the body there is no advantage to it being passed as
+cbv to the function. The function won't ever look at it so we don't safe any work.
+
+This mostly happens for join point. For example we might have:
+
+    data T = MkT ![Int] [Char]
+    f t = case t of MkT xs{strict} ys-> snd (xs,ys)
+
+and abstract the case alternative to:
+
+    f t = join j1 = \xs ys -> snd (xs,ys)
+          in case t of MkT xs{strict} ys-> j1 xs xy
+
+While we "use" xs inside `j1` it's not used inside the function `snd` we pass it to.
+In short a absent demand means neither our RHS, nor any function we pass the argument
+to will inspect it. So there is no work to be saved by forcing `xs` early.
+
+NB: There is an edge case where if we rebox we *can* end up seqing an absent value.
+Note [Absent fillers] has an example of this. However this is so rare it's not worth
+caring about here.
+
+4) The argument is already strict.
+
+Consider this code:
+
+    data T = MkT ![Int]
+    f t = case t of MkT xs{strict} -> reverse xs
+
+The `xs{strict}` indicates that `xs` is used strictly by the `reverse xs`.
+If we do a w/w split, and add the extra eval on `xs`, we'll get
+
+    $wf xs =
+        case xs of xs1 ->
+            let t = MkT xs1 in
+            case t of MkT xs2 -> reverse xs2
+
+That's not wrong; but the w/w body will simplify to
+
+    $wf xs = case xs of xs1 -> reverse xs1
+
+and now we'll drop the `case xs` because `xs1` is used strictly in its scope.
+Adding that eval was a waste of time.  So don't add it for strictly-demanded Ids.
+
+5) Functions
+
+Functions are tricky (see Note [TagInfo of functions] in InferTags).
+But the gist of it even if we make a higher order function argument strict
+we can't avoid the tag check when it's used later in the body.
+So there is no benefit.
+
+-}
+-- | Do we expect there to be any benefit if we make this var strict
+-- in order for it to get treated as as cbv argument?
+-- See Note [Which Ids should be strictified]
+-- See Note [CBV Function Ids] for more background.
+shouldStrictifyIdForCbv :: Var -> Bool
+shouldStrictifyIdForCbv = wantCbvForId False
+
+-- Like shouldStrictifyIdForCbv but also wants to use cbv for strict args.
+shouldUseCbvForId :: Var -> Bool
+shouldUseCbvForId = wantCbvForId True
+
+-- When we strictify we want to skip strict args otherwise the logic is the same
+-- as for shouldUseCbvForId so we common up the logic here.
+-- Basically returns true if it would be benefitial for runtime to pass this argument
+-- as CBV independent of weither or not it's correct. E.g. it might return true for lazy args
+-- we are not allowed to force.
+wantCbvForId :: Bool -> Var -> Bool
+wantCbvForId cbv_for_strict v
+  -- Must be a runtime var.
+  -- See Note [Which Ids should be strictified] point 1)
+  | isId v
+  , not $ isZeroBitTy ty
+  -- Unlifted things don't need special measures to be treated as cbv
+  -- See Note [Which Ids should be strictified] point 2)
+  , mightBeLiftedType ty
+  -- Functions sometimes get a zero tag so we can't eliminate the tag check.
+  -- See Note [TagInfo of functions] in InferTags.
+  -- See Note [Which Ids should be strictified] point 5)
+  , not $ isFunTy ty
+  -- If the var is strict already a seq is redundant.
+  -- See Note [Which Ids should be strictified] point 4)
+  , not (isStrictDmd dmd) || cbv_for_strict
+  -- If the var is absent a seq is almost always useless.
+  -- See Note [Which Ids should be strictified] point 3)
+  , not (isAbsDmd dmd)
+  = True
+  | otherwise
+  = False
+  where
+    ty = idType v
+    dmd = idDemandInfo v
 
 {- *********************************************************************
 *                                                                      *
@@ -2618,7 +2904,6 @@ isUnsafeEqualityProof :: CoreExpr -> Bool
 -- Note [Implementing unsafeCoerce] in base:Unsafe.Coerce
 isUnsafeEqualityProof e
   | Var v `App` Type _ `App` Type _ `App` Type _ <- e
-  = idName v == unsafeEqualityProofName
+  = v `hasKey` unsafeEqualityProofIdKey
   | otherwise
   = False
-

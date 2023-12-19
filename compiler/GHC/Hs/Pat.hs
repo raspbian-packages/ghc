@@ -1,3 +1,16 @@
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE UndecidableInstances #-} -- Wrinkle in Note [Trees That Grow]
+                                      -- in module Language.Haskell.Syntax.Extension
+
+{-# OPTIONS_GHC -Wno-orphans #-} -- Outputable
 
 {-
 (c) The University of Glasgow 2006
@@ -6,32 +19,16 @@
 \section[PatSyntax]{Abstract Haskell syntax---patterns}
 -}
 
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE DeriveFunctor #-}
-{-# LANGUAGE DeriveFoldable #-}
-{-# LANGUAGE DeriveTraversable #-}
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE StandaloneDeriving #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE UndecidableInstances #-} -- Wrinkle in Note [Trees That Grow]
-                                      -- in module GHC.Hs.Extension
-{-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE ViewPatterns      #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications #-}
-{-# LANGUAGE LambdaCase #-}
-
 module GHC.Hs.Pat (
         Pat(..), LPat,
+        EpAnnSumPat(..),
         ConPatTc (..),
-        CoPat (..),
-        ListPatTc(..),
         ConLikeP,
+        HsPatExpansion(..),
+        XXPatGhcTc(..),
 
         HsConPatDetails, hsConPatArgs,
-        HsRecFields(..), HsRecField'(..), LHsRecField',
+        HsRecFields(..), HsFieldBind(..), LHsFieldBind,
         HsRecField, LHsRecField,
         HsRecUpdField, LHsRecUpdField,
         hsRecFields, hsRecFieldSel, hsRecFieldId, hsRecFieldsArgs,
@@ -42,25 +39,32 @@ module GHC.Hs.Pat (
         isSimplePat,
         looksLazyPatBind,
         isBangedLPat,
-        patNeedsParens, parenthesizePat,
+        gParPat, patNeedsParens, parenthesizePat,
         isIrrefutableHsPat,
 
         collectEvVarsPat, collectEvVarsPats,
 
-        pprParendLPat, pprConArgs
+        pprParendLPat, pprConArgs,
+        pprLPat
     ) where
 
 import GHC.Prelude
 
-import {-# SOURCE #-} GHC.Hs.Expr (SyntaxExpr, LHsExpr, HsSplice, pprLExpr, pprSplice)
+import Language.Haskell.Syntax.Pat
+import Language.Haskell.Syntax.Expr ( HsExpr )
+
+import {-# SOURCE #-} GHC.Hs.Expr (pprLExpr, pprSplice)
 
 -- friends:
 import GHC.Hs.Binds
 import GHC.Hs.Lit
+import Language.Haskell.Syntax.Extension
+import GHC.Parser.Annotation
 import GHC.Hs.Extension
 import GHC.Hs.Type
 import GHC.Tc.Types.Evidence
 import GHC.Types.Basic
+import GHC.Types.SourceText
 -- others:
 import GHC.Core.Ppr ( {- instance OutputableBndr TyVar -} )
 import GHC.Builtin.Types
@@ -77,257 +81,134 @@ import GHC.Data.Maybe
 import GHC.Types.Name (Name)
 import GHC.Driver.Session
 import qualified GHC.LanguageExtensions as LangExt
--- libraries:
-import Data.Data hiding (TyCon,Fixity)
+import Data.Data
 
-type LPat p = XRec p Pat
-
--- | Pattern
---
--- - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnBang'
-
--- For details on above see note [Api annotations] in GHC.Parser.Annotation
-data Pat p
-  =     ------------ Simple patterns ---------------
-    WildPat     (XWildPat p)        -- ^ Wildcard Pattern
-        -- The sole reason for a type on a WildPat is to
-        -- support hsPatType :: Pat Id -> Type
-
-       -- AZ:TODO above comment needs to be updated
-  | VarPat      (XVarPat p)
-                (Located (IdP p))  -- ^ Variable Pattern
-
-                             -- See Note [Located RdrNames] in GHC.Hs.Expr
-  | LazyPat     (XLazyPat p)
-                (LPat p)                -- ^ Lazy Pattern
-    -- ^ - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnTilde'
-
-    -- For details on above see note [Api annotations] in GHC.Parser.Annotation
-
-  | AsPat       (XAsPat p)
-                (Located (IdP p)) (LPat p)    -- ^ As pattern
-    -- ^ - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnAt'
-
-    -- For details on above see note [Api annotations] in GHC.Parser.Annotation
-
-  | ParPat      (XParPat p)
-                (LPat p)                -- ^ Parenthesised pattern
-                                        -- See Note [Parens in HsSyn] in GHC.Hs.Expr
-    -- ^ - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnOpen' @'('@,
-    --                                    'GHC.Parser.Annotation.AnnClose' @')'@
-
-    -- For details on above see note [Api annotations] in GHC.Parser.Annotation
-  | BangPat     (XBangPat p)
-                (LPat p)                -- ^ Bang pattern
-    -- ^ - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnBang'
-
-    -- For details on above see note [Api annotations] in GHC.Parser.Annotation
-
-        ------------ Lists, tuples, arrays ---------------
-  | ListPat     (XListPat p)
-                [LPat p]
-                   -- For OverloadedLists a Just (ty,fn) gives
-                   -- overall type of the pattern, and the toList
--- function to convert the scrutinee to a list value
-
-    -- ^ Syntactic List
-    --
-    -- - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnOpen' @'['@,
-    --                                    'GHC.Parser.Annotation.AnnClose' @']'@
-
-    -- For details on above see note [Api annotations] in GHC.Parser.Annotation
-
-  | TuplePat    (XTuplePat p)
-                  -- after typechecking, holds the types of the tuple components
-                [LPat p]         -- Tuple sub-patterns
-                Boxity           -- UnitPat is TuplePat []
-        -- You might think that the post typechecking Type was redundant,
-        -- because we can get the pattern type by getting the types of the
-        -- sub-patterns.
-        -- But it's essential
-        --      data T a where
-        --        T1 :: Int -> T Int
-        --      f :: (T a, a) -> Int
-        --      f (T1 x, z) = z
-        -- When desugaring, we must generate
-        --      f = /\a. \v::a.  case v of (t::T a, w::a) ->
-        --                       case t of (T1 (x::Int)) ->
-        -- Note the (w::a), NOT (w::Int), because we have not yet
-        -- refined 'a' to Int.  So we must know that the second component
-        -- of the tuple is of type 'a' not Int.  See selectMatchVar
-        -- (June 14: I'm not sure this comment is right; the sub-patterns
-        --           will be wrapped in CoPats, no?)
-    -- ^ Tuple sub-patterns
-    --
-    -- - 'GHC.Parser.Annotation.AnnKeywordId' :
-    --            'GHC.Parser.Annotation.AnnOpen' @'('@ or @'(#'@,
-    --            'GHC.Parser.Annotation.AnnClose' @')'@ or  @'#)'@
-
-  | SumPat      (XSumPat p)        -- after typechecker, types of the alternative
-                (LPat p)           -- Sum sub-pattern
-                ConTag             -- Alternative (one-based)
-                Arity              -- Arity (INVARIANT: ≥ 2)
-    -- ^ Anonymous sum pattern
-    --
-    -- - 'GHC.Parser.Annotation.AnnKeywordId' :
-    --            'GHC.Parser.Annotation.AnnOpen' @'(#'@,
-    --            'GHC.Parser.Annotation.AnnClose' @'#)'@
-
-    -- For details on above see note [Api annotations] in GHC.Parser.Annotation
-
-        ------------ Constructor patterns ---------------
-  | ConPat {
-        pat_con_ext :: XConPat p,
-        pat_con     :: Located (ConLikeP p),
-        pat_args    :: HsConPatDetails p
-    }
-    -- ^ Constructor Pattern
-
-        ------------ View patterns ---------------
-  -- | - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnRarrow'
-
-  -- For details on above see note [Api annotations] in GHC.Parser.Annotation
-  | ViewPat       (XViewPat p)     -- The overall type of the pattern
-                                   -- (= the argument type of the view function)
-                                   -- for hsPatType.
-                  (LHsExpr p)
-                  (LPat p)
-    -- ^ View Pattern
-
-        ------------ Pattern splices ---------------
-  -- | - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnOpen' @'$('@
-  --        'GHC.Parser.Annotation.AnnClose' @')'@
-
-  -- For details on above see note [Api annotations] in GHC.Parser.Annotation
-  | SplicePat       (XSplicePat p)
-                    (HsSplice p)    -- ^ Splice Pattern (Includes quasi-quotes)
-
-        ------------ Literal and n+k patterns ---------------
-  | LitPat          (XLitPat p)
-                    (HsLit p)           -- ^ Literal Pattern
-                                        -- Used for *non-overloaded* literal patterns:
-                                        -- Int#, Char#, Int, Char, String, etc.
-
-  | NPat                -- Natural Pattern
-                        -- Used for all overloaded literals,
-                        -- including overloaded strings with -XOverloadedStrings
-                    (XNPat p)            -- Overall type of pattern. Might be
-                                         -- different than the literal's type
-                                         -- if (==) or negate changes the type
-                    (Located (HsOverLit p))     -- ALWAYS positive
-                    (Maybe (SyntaxExpr p)) -- Just (Name of 'negate') for
-                                           -- negative patterns, Nothing
-                                           -- otherwise
-                    (SyntaxExpr p)       -- Equality checker, of type t->t->Bool
-
-  -- ^ Natural Pattern
-  --
-  -- - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnVal' @'+'@
-
-  -- For details on above see note [Api annotations] in GHC.Parser.Annotation
-  | NPlusKPat       (XNPlusKPat p)           -- Type of overall pattern
-                    (Located (IdP p))        -- n+k pattern
-                    (Located (HsOverLit p))  -- It'll always be an HsIntegral
-                    (HsOverLit p)            -- See Note [NPlusK patterns] in GHC.Tc.Gen.Pat
-                     -- NB: This could be (PostTc ...), but that induced a
-                     -- a new hs-boot file. Not worth it.
-
-                    (SyntaxExpr p)   -- (>=) function, of type t1->t2->Bool
-                    (SyntaxExpr p)   -- Name of '-' (see GHC.Rename.Env.lookupSyntax)
-  -- ^ n+k pattern
-
-        ------------ Pattern type signatures ---------------
-  -- | - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnDcolon'
-
-  -- For details on above see note [Api annotations] in GHC.Parser.Annotation
-  | SigPat          (XSigPat p)             -- After typechecker: Type
-                    (LPat p)                -- Pattern with a type signature
-                    (HsPatSigType (NoGhcTc p)) --  Signature can bind both
-                                               --  kind and type vars
-
-    -- ^ Pattern with a type signature
-
-  -- | Trees that Grow extension point for new constructors
-  | XPat
-      !(XXPat p)
-
-
--- ---------------------------------------------------------------------
-
-data ListPatTc
-  = ListPatTc
-      Type                             -- The type of the elements
-      (Maybe (Type, SyntaxExpr GhcTc)) -- For rebindable syntax
 
 type instance XWildPat GhcPs = NoExtField
 type instance XWildPat GhcRn = NoExtField
 type instance XWildPat GhcTc = Type
 
 type instance XVarPat  (GhcPass _) = NoExtField
-type instance XLazyPat (GhcPass _) = NoExtField
-type instance XAsPat   (GhcPass _) = NoExtField
-type instance XParPat  (GhcPass _) = NoExtField
-type instance XBangPat (GhcPass _) = NoExtField
 
--- Note: XListPat cannot be extended when using GHC 8.0.2 as the bootstrap
--- compiler, as it triggers https://gitlab.haskell.org/ghc/ghc/issues/14396 for
--- `SyntaxExpr`
-type instance XListPat GhcPs = NoExtField
-type instance XListPat GhcRn = Maybe (SyntaxExpr GhcRn)
-type instance XListPat GhcTc = ListPatTc
+type instance XLazyPat GhcPs = EpAnn [AddEpAnn] -- For '~'
+type instance XLazyPat GhcRn = NoExtField
+type instance XLazyPat GhcTc = NoExtField
 
-type instance XTuplePat GhcPs = NoExtField
+type instance XAsPat   GhcPs = EpAnn [AddEpAnn] -- For '@'
+type instance XAsPat   GhcRn = NoExtField
+type instance XAsPat   GhcTc = NoExtField
+
+type instance XParPat (GhcPass _) = EpAnnCO
+
+type instance XBangPat GhcPs = EpAnn [AddEpAnn] -- For '!'
+type instance XBangPat GhcRn = NoExtField
+type instance XBangPat GhcTc = NoExtField
+
+type instance XListPat GhcPs = EpAnn AnnList
+  -- After parsing, ListPat can refer to a built-in Haskell list pattern
+  -- or an overloaded list pattern.
+type instance XListPat GhcRn = NoExtField
+  -- Built-in list patterns only.
+  -- After renaming, overloaded list patterns are expanded to view patterns.
+  -- See Note [Desugaring overloaded list patterns]
+type instance XListPat GhcTc = Type
+  -- List element type, for use in hsPatType.
+
+type instance XTuplePat GhcPs = EpAnn [AddEpAnn]
 type instance XTuplePat GhcRn = NoExtField
 type instance XTuplePat GhcTc = [Type]
 
-type instance XConPat GhcPs = NoExtField
-type instance XConPat GhcRn = NoExtField
-type instance XConPat GhcTc = ConPatTc
-
-type instance XSumPat GhcPs = NoExtField
+type instance XSumPat GhcPs = EpAnn EpAnnSumPat
 type instance XSumPat GhcRn = NoExtField
 type instance XSumPat GhcTc = [Type]
 
-type instance XViewPat GhcPs = NoExtField
-type instance XViewPat GhcRn = NoExtField
-type instance XViewPat GhcTc = Type
+type instance XConPat GhcPs = EpAnn [AddEpAnn]
+type instance XConPat GhcRn = NoExtField
+type instance XConPat GhcTc = ConPatTc
 
-type instance XSplicePat (GhcPass _) = NoExtField
+type instance XViewPat GhcPs = EpAnn [AddEpAnn]
+type instance XViewPat GhcRn = Maybe (HsExpr GhcRn)
+  -- The @HsExpr GhcRn@ gives an inverse to the view function.
+  -- This is used for overloaded lists in particular.
+  -- See Note [Invertible view patterns] in GHC.Tc.TyCl.PatSyn.
+
+type instance XViewPat GhcTc = Type
+  -- Overall type of the pattern
+  -- (= the argument type of the view function), for hsPatType.
+
+type instance XSplicePat GhcPs = NoExtField
+type instance XSplicePat GhcRn = NoExtField
+type instance XSplicePat GhcTc = DataConCantHappen
+
 type instance XLitPat    (GhcPass _) = NoExtField
 
-type instance XNPat GhcPs = NoExtField
-type instance XNPat GhcRn = NoExtField
+type instance XNPat GhcPs = EpAnn [AddEpAnn]
+type instance XNPat GhcRn = EpAnn [AddEpAnn]
 type instance XNPat GhcTc = Type
 
-type instance XNPlusKPat GhcPs = NoExtField
+type instance XNPlusKPat GhcPs = EpAnn EpaLocation -- Of the "+"
 type instance XNPlusKPat GhcRn = NoExtField
 type instance XNPlusKPat GhcTc = Type
 
-type instance XSigPat GhcPs = NoExtField
+type instance XSigPat GhcPs = EpAnn [AddEpAnn]
 type instance XSigPat GhcRn = NoExtField
 type instance XSigPat GhcTc = Type
 
-type instance XXPat GhcPs = NoExtCon
-type instance XXPat GhcRn = NoExtCon
-type instance XXPat GhcTc = CoPat
-  -- After typechecking, we add one extra constructor: CoPat
-
-type family ConLikeP x
+type instance XXPat GhcPs = DataConCantHappen
+type instance XXPat GhcRn = HsPatExpansion (Pat GhcRn) (Pat GhcRn)
+  -- Original pattern and its desugaring/expansion.
+  -- See Note [Rebindable syntax and HsExpansion].
+type instance XXPat GhcTc = XXPatGhcTc
+  -- After typechecking, we add extra constructors: CoPat and HsExpansion.
+  -- HsExpansion allows us to handle RebindableSyntax in pattern position:
+  -- see "XXExpr GhcTc" for the counterpart in expressions.
 
 type instance ConLikeP GhcPs = RdrName -- IdP GhcPs
-type instance ConLikeP GhcRn = Name -- IdP GhcRn
+type instance ConLikeP GhcRn = Name    -- IdP GhcRn
 type instance ConLikeP GhcTc = ConLike
+
+type instance XHsFieldBind _ = EpAnn [AddEpAnn]
 
 -- ---------------------------------------------------------------------
 
+-- API Annotations types
 
--- | Haskell Constructor Pattern Details
-type HsConPatDetails p = HsConDetails (LPat p) (HsRecFields p (LPat p))
+data EpAnnSumPat = EpAnnSumPat
+      { sumPatParens      :: [AddEpAnn]
+      , sumPatVbarsBefore :: [EpaLocation]
+      , sumPatVbarsAfter  :: [EpaLocation]
+      } deriving Data
 
-hsConPatArgs :: HsConPatDetails p -> [LPat p]
-hsConPatArgs (PrefixCon ps)   = ps
-hsConPatArgs (RecCon fs)      = map (hsRecFieldArg . unLoc) (rec_flds fs)
-hsConPatArgs (InfixCon p1 p2) = [p1,p2]
+-- ---------------------------------------------------------------------
+
+-- | Extension constructor for Pat, added after typechecking.
+data XXPatGhcTc
+  = -- | Coercion Pattern (translation only)
+    --
+    -- During desugaring a (CoPat co pat) turns into a cast with 'co' on the
+    -- scrutinee, followed by a match on 'pat'.
+    CoPat
+      { -- | Coercion Pattern
+        -- If co :: t1 ~ t2, p :: t2,
+        -- then (CoPat co p) :: t1
+        co_cpt_wrap :: HsWrapper
+
+      , -- | Why not LPat?  Ans: existing locn will do
+        co_pat_inner :: Pat GhcTc
+
+      , -- | Type of whole pattern, t1
+        co_pat_ty :: Type
+      }
+  -- | Pattern expansion: original pattern, and desugared pattern,
+  -- for RebindableSyntax and other overloaded syntax such as OverloadedLists.
+  -- See Note [Rebindable syntax and HsExpansion].
+  | ExpansionPat (Pat GhcRn) (Pat GhcTc)
+
+
+-- See Note [Rebindable syntax and HsExpansion].
+data HsPatExpansion a b
+  = HsPatExpanded a b
+  deriving Data
 
 -- | This is the extension field for ConPat, added after typechecking
 -- It adds quite a few extra fields, to support elaboration of pattern matching.
@@ -351,158 +232,23 @@ data ConPatTc
     , -- | Bindings involving those dictionaries
       cpt_binds :: TcEvBinds
 
-    , -- ^ Extra wrapper to pass to the matcher
+    , -- | Extra wrapper to pass to the matcher
       -- Only relevant for pattern-synonyms;
       --   ignored for data cons
       cpt_wrap  :: HsWrapper
     }
 
--- | Coercion Pattern (translation only)
---
--- During desugaring a (CoPat co pat) turns into a cast with 'co' on the
--- scrutinee, followed by a match on 'pat'.
-data CoPat
-  = CoPat
-    { -- | Coercion Pattern
-      -- If co :: t1 ~ t2, p :: t2,
-      -- then (CoPat co p) :: t1
-      co_cpt_wrap :: HsWrapper
-
-    , -- | Why not LPat?  Ans: existing locn will do
-      co_pat_inner :: Pat GhcTc
-
-    , -- | Type of whole pattern, t1
-      co_pat_ty :: Type
-    }
-
--- | Haskell Record Fields
---
--- HsRecFields is used only for patterns and expressions (not data type
--- declarations)
-data HsRecFields p arg         -- A bunch of record fields
-                                --      { x = 3, y = True }
-        -- Used for both expressions and patterns
-  = HsRecFields { rec_flds   :: [LHsRecField p arg],
-                  rec_dotdot :: Maybe (Located Int) }  -- Note [DotDot fields]
-  deriving (Functor, Foldable, Traversable)
-
-
--- Note [DotDot fields]
--- ~~~~~~~~~~~~~~~~~~~~
--- The rec_dotdot field means this:
---   Nothing => the normal case
---   Just n  => the group uses ".." notation,
---
--- In the latter case:
---
---   *before* renamer: rec_flds are exactly the n user-written fields
---
---   *after* renamer:  rec_flds includes *all* fields, with
---                     the first 'n' being the user-written ones
---                     and the remainder being 'filled in' implicitly
-
--- | Located Haskell Record Field
-type LHsRecField' p arg = Located (HsRecField' p arg)
-
--- | Located Haskell Record Field
-type LHsRecField  p arg = Located (HsRecField  p arg)
-
--- | Located Haskell Record Update Field
-type LHsRecUpdField p   = Located (HsRecUpdField p)
-
--- | Haskell Record Field
-type HsRecField    p arg = HsRecField' (FieldOcc p) arg
-
--- | Haskell Record Update Field
-type HsRecUpdField p     = HsRecField' (AmbiguousFieldOcc p) (LHsExpr p)
-
--- | Haskell Record Field
---
--- - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnEqual',
---
--- For details on above see note [Api annotations] in GHC.Parser.Annotation
-data HsRecField' id arg = HsRecField {
-        hsRecFieldLbl :: Located id,
-        hsRecFieldArg :: arg,           -- ^ Filled in by renamer when punning
-        hsRecPun      :: Bool           -- ^ Note [Punning]
-  } deriving (Data, Functor, Foldable, Traversable)
-
-
--- Note [Punning]
--- ~~~~~~~~~~~~~~
--- If you write T { x, y = v+1 }, the HsRecFields will be
---      HsRecField x x True ...
---      HsRecField y (v+1) False ...
--- That is, for "punned" field x is expanded (in the renamer)
--- to x=x; but with a punning flag so we can detect it later
--- (e.g. when pretty printing)
---
--- If the original field was qualified, we un-qualify it, thus
---    T { A.x } means T { A.x = x }
-
-
--- Note [HsRecField and HsRecUpdField]
--- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
--- A HsRecField (used for record construction and pattern matching)
--- contains an unambiguous occurrence of a field (i.e. a FieldOcc).
--- We can't just store the Name, because thanks to
--- DuplicateRecordFields this may not correspond to the label the user
--- wrote.
---
--- A HsRecUpdField (used for record update) contains a potentially
--- ambiguous occurrence of a field (an AmbiguousFieldOcc).  The
--- renamer will fill in the selector function if it can, but if the
--- selector is ambiguous the renamer will defer to the typechecker.
--- After the typechecker, a unique selector will have been determined.
---
--- The renamer produces an Unambiguous result if it can, rather than
--- just doing the lookup in the typechecker, so that completely
--- unambiguous updates can be represented by 'GHC.HsToCore.Quote.repUpdFields'.
---
--- For example, suppose we have:
---
---     data S = MkS { x :: Int }
---     data T = MkT { x :: Int }
---
---     f z = (z { x = 3 }) :: S
---
--- The parsed HsRecUpdField corresponding to the record update will have:
---
---     hsRecFieldLbl = Unambiguous "x" noExtField :: AmbiguousFieldOcc RdrName
---
--- After the renamer, this will become:
---
---     hsRecFieldLbl = Ambiguous   "x" noExtField :: AmbiguousFieldOcc Name
---
--- (note that the Unambiguous constructor is not type-correct here).
--- The typechecker will determine the particular selector:
---
---     hsRecFieldLbl = Unambiguous "x" $sel:x:MkS  :: AmbiguousFieldOcc Id
---
--- See also Note [Disambiguating record fields] in GHC.Tc.Gen.Expr.
-
-hsRecFields :: HsRecFields p arg -> [XCFieldOcc p]
-hsRecFields rbinds = map (unLoc . hsRecFieldSel . unLoc) (rec_flds rbinds)
-
--- Probably won't typecheck at once, things have changed :/
-hsRecFieldsArgs :: HsRecFields p arg -> [arg]
-hsRecFieldsArgs rbinds = map (hsRecFieldArg . unLoc) (rec_flds rbinds)
-
-hsRecFieldSel :: HsRecField pass arg -> Located (XCFieldOcc pass)
-hsRecFieldSel = fmap extFieldOcc . hsRecFieldLbl
-
-hsRecFieldId :: HsRecField GhcTc arg -> Located Id
+hsRecFieldId :: HsRecField GhcTc arg -> Id
 hsRecFieldId = hsRecFieldSel
 
 hsRecUpdFieldRdr :: HsRecUpdField (GhcPass p) -> Located RdrName
-hsRecUpdFieldRdr = fmap rdrNameAmbiguousFieldOcc . hsRecFieldLbl
+hsRecUpdFieldRdr = fmap rdrNameAmbiguousFieldOcc . reLoc . hfbLHS
 
-hsRecUpdFieldId :: HsRecField' (AmbiguousFieldOcc GhcTc) arg -> Located Id
-hsRecUpdFieldId = fmap extFieldOcc . hsRecUpdFieldOcc
+hsRecUpdFieldId :: HsFieldBind (LAmbiguousFieldOcc GhcTc) arg -> Located Id
+hsRecUpdFieldId = fmap foExt . reLoc . hsRecUpdFieldOcc
 
-hsRecUpdFieldOcc :: HsRecField' (AmbiguousFieldOcc GhcTc) arg -> LFieldOcc GhcTc
-hsRecUpdFieldOcc = fmap unambiguousFieldOcc . hsRecFieldLbl
+hsRecUpdFieldOcc :: HsFieldBind (LAmbiguousFieldOcc GhcTc) arg -> LFieldOcc GhcTc
+hsRecUpdFieldOcc = fmap unambiguousFieldOcc . hfbLHS
 
 
 {-
@@ -515,6 +261,13 @@ hsRecUpdFieldOcc = fmap unambiguousFieldOcc . hsRecFieldLbl
 
 instance OutputableBndrId p => Outputable (Pat (GhcPass p)) where
     ppr = pprPat
+
+-- See Note [Rebindable syntax and HsExpansion].
+instance (Outputable a, Outputable b) => Outputable (HsPatExpansion a b) where
+  ppr (HsPatExpanded a b) = ifPprDebug (vcat [ppr a, ppr b]) (ppr a)
+
+pprLPat :: (OutputableBndrId p) => LPat (GhcPass p) -> SDoc
+pprLPat (L _ e) = pprPat e
 
 -- | Print with type info if -dppr-debug is on
 pprPatBndr :: OutputableBndr name => name -> SDoc
@@ -539,8 +292,7 @@ pprParendPat p pat = sdocOption sdocPrintTypecheckerElaboration $ \ print_tc_ela
   where
     need_parens print_tc_elab pat
       | GhcTc <- ghcPass @p
-      , XPat ext <- pat
-      , CoPat {} <- ext
+      , XPat (CoPat {}) <- pat
       = print_tc_elab
 
       | otherwise
@@ -558,17 +310,17 @@ pprPat (BangPat _ pat)          = char '!' <> pprParendLPat appPrec pat
 pprPat (AsPat _ name pat)       = hcat [pprPrefixOcc (unLoc name), char '@',
                                         pprParendLPat appPrec pat]
 pprPat (ViewPat _ expr pat)     = hcat [pprLExpr expr, text " -> ", ppr pat]
-pprPat (ParPat _ pat)           = parens (ppr pat)
+pprPat (ParPat _ _ pat _)      = parens (ppr pat)
 pprPat (LitPat _ s)             = ppr s
 pprPat (NPat _ l Nothing  _)    = ppr l
 pprPat (NPat _ l (Just _) _)    = char '-' <> ppr l
-pprPat (NPlusKPat _ n k _ _ _)  = hcat [ppr n, char '+', ppr k]
+pprPat (NPlusKPat _ n k _ _ _)  = hcat [ppr_n, char '+', ppr k]
+  where ppr_n = case ghcPass @p of
+                  GhcPs -> ppr n
+                  GhcRn -> ppr n
+                  GhcTc -> ppr n
 pprPat (SplicePat _ splice)     = pprSplice splice
-pprPat (SigPat _ pat ty)        = ppr pat <+> dcolon <+> ppr_ty
-  where ppr_ty = case ghcPass @p of
-                   GhcPs -> ppr ty
-                   GhcRn -> ppr ty
-                   GhcTc -> ppr ty
+pprPat (SigPat _ pat ty)        = ppr pat <+> dcolon <+> ppr ty
 pprPat (ListPat _ pats)         = brackets (interpp'SP pats)
 pprPat (TuplePat _ pats bx)
     -- Special-case unary boxed tuples so that they are pretty-printed as
@@ -600,44 +352,35 @@ pprPat (ConPat { pat_con = con
                        , cpt_dicts = dicts
                        , cpt_binds = binds
                        } = ext
+
 pprPat (XPat ext) = case ghcPass @p of
 #if __GLASGOW_HASKELL__ < 811
-  GhcPs -> noExtCon ext
-  GhcRn -> noExtCon ext
+  GhcPs -> dataConCantHappen ext
 #endif
-  GhcTc -> pprHsWrapper co $ \parens ->
-      if parens
-      then pprParendPat appPrec pat
-      else pprPat pat
-    where CoPat co pat _ = ext
+  GhcRn -> case ext of
+    HsPatExpanded orig _ -> pprPat orig
+  GhcTc -> case ext of
+    CoPat co pat _ ->
+      pprHsWrapper co $ \parens ->
+        if parens
+        then pprParendPat appPrec pat
+        else pprPat pat
+    ExpansionPat orig _ -> pprPat orig
 
-pprUserCon :: (OutputableBndr con, OutputableBndrId p)
+pprUserCon :: (OutputableBndr con, OutputableBndrId p,
+                     Outputable (Anno (IdGhcP p)))
            => con -> HsConPatDetails (GhcPass p) -> SDoc
 pprUserCon c (InfixCon p1 p2) = ppr p1 <+> pprInfixOcc c <+> ppr p2
 pprUserCon c details          = pprPrefixOcc c <+> pprConArgs details
 
-pprConArgs :: (OutputableBndrId p)
+pprConArgs :: (OutputableBndrId p,
+                     Outputable (Anno (IdGhcP p)))
            => HsConPatDetails (GhcPass p) -> SDoc
-pprConArgs (PrefixCon pats) = fsep (map (pprParendLPat appPrec) pats)
-pprConArgs (InfixCon p1 p2) = sep [ pprParendLPat appPrec p1
-                                  , pprParendLPat appPrec p2 ]
-pprConArgs (RecCon rpats)   = ppr rpats
-
-instance (Outputable arg)
-      => Outputable (HsRecFields p arg) where
-  ppr (HsRecFields { rec_flds = flds, rec_dotdot = Nothing })
-        = braces (fsep (punctuate comma (map ppr flds)))
-  ppr (HsRecFields { rec_flds = flds, rec_dotdot = Just (unLoc -> n) })
-        = braces (fsep (punctuate comma (map ppr (take n flds) ++ [dotdot])))
-        where
-          dotdot = text ".." <+> whenPprDebug (ppr (drop n flds))
-
-instance (Outputable p, Outputable arg)
-      => Outputable (HsRecField' p arg) where
-  ppr (HsRecField { hsRecFieldLbl = f, hsRecFieldArg = arg,
-                    hsRecPun = pun })
-    = ppr f <+> (ppUnless pun $ equals <+> ppr arg)
-
+pprConArgs (PrefixCon ts pats) = fsep (pprTyArgs ts : map (pprParendLPat appPrec) pats)
+  where pprTyArgs tyargs = fsep (map (\ty -> char '@' <> ppr ty) tyargs)
+pprConArgs (InfixCon p1 p2)    = sep [ pprParendLPat appPrec p1
+                                     , pprParendLPat appPrec p2 ]
+pprConArgs (RecCon rpats)      = ppr rpats
 
 {-
 ************************************************************************
@@ -651,23 +394,23 @@ mkPrefixConPat :: DataCon ->
                   [LPat GhcTc] -> [Type] -> LPat GhcTc
 -- Make a vanilla Prefix constructor pattern
 mkPrefixConPat dc pats tys
-  = noLoc $ ConPat { pat_con = noLoc (RealDataCon dc)
-                   , pat_args = PrefixCon pats
-                   , pat_con_ext = ConPatTc
-                     { cpt_tvs = []
-                     , cpt_dicts = []
-                     , cpt_binds = emptyTcEvBinds
-                     , cpt_arg_tys = tys
-                     , cpt_wrap = idHsWrapper
-                     }
-                   }
+  = noLocA $ ConPat { pat_con = noLocA (RealDataCon dc)
+                    , pat_args = PrefixCon [] pats
+                    , pat_con_ext = ConPatTc
+                      { cpt_tvs = []
+                      , cpt_dicts = []
+                      , cpt_binds = emptyTcEvBinds
+                      , cpt_arg_tys = tys
+                      , cpt_wrap = idHsWrapper
+                      }
+                    }
 
 mkNilPat :: Type -> LPat GhcTc
 mkNilPat ty = mkPrefixConPat nilDataCon [] [ty]
 
 mkCharLitPat :: SourceText -> Char -> LPat GhcTc
 mkCharLitPat src c = mkPrefixConPat charDataCon
-                          [noLoc $ LitPat noExtField (HsCharPrim src c)] []
+                          [noLocA $ LitPat noExtField (HsCharPrim src c)] []
 
 {-
 ************************************************************************
@@ -705,11 +448,11 @@ isBangedLPat :: LPat (GhcPass p) -> Bool
 isBangedLPat = isBangedPat . unLoc
 
 isBangedPat :: Pat (GhcPass p) -> Bool
-isBangedPat (ParPat _ p) = isBangedLPat p
+isBangedPat (ParPat _ _ p _) = isBangedLPat p
 isBangedPat (BangPat {}) = True
 isBangedPat _            = False
 
-looksLazyPatBind :: HsBind (GhcPass p) -> Bool
+looksLazyPatBind :: HsBind GhcTc -> Bool
 -- Returns True of anything *except*
 --     a StrictHsBind (as above) or
 --     a VarPat
@@ -717,7 +460,7 @@ looksLazyPatBind :: HsBind (GhcPass p) -> Bool
 -- Looks through AbsBinds
 looksLazyPatBind (PatBind { pat_lhs = p })
   = looksLazyLPat p
-looksLazyPatBind (AbsBinds { abs_binds = binds })
+looksLazyPatBind (XHsBindsLR (AbsBinds { abs_binds = binds }))
   = anyBag (looksLazyPatBind . unLoc) binds
 looksLazyPatBind _
   = False
@@ -726,8 +469,8 @@ looksLazyLPat :: LPat (GhcPass p) -> Bool
 looksLazyLPat = looksLazyPat . unLoc
 
 looksLazyPat :: Pat (GhcPass p) -> Bool
-looksLazyPat (ParPat _ p)  = looksLazyLPat p
-looksLazyPat (AsPat _ _ p) = looksLazyLPat p
+looksLazyPat (ParPat _ _ p _)  = looksLazyLPat p
+looksLazyPat (AsPat _ _ p)     = looksLazyLPat p
 looksLazyPat (BangPat {})  = False
 looksLazyPat (VarPat {})   = False
 looksLazyPat (WildPat {})  = False
@@ -793,7 +536,7 @@ isIrrefutableHsPat' is_strict = goL
       = isIrrefutableHsPat' False p'
       | otherwise          = True
     go (BangPat _ pat)     = goL pat
-    go (ParPat _ pat)      = goL pat
+    go (ParPat _ _ pat _)  = goL pat
     go (AsPat _ _ pat)     = goL pat
     go (ViewPat _ _ pat)   = goL pat
     go (SigPat _ pat _)    = goL pat
@@ -812,8 +555,6 @@ isIrrefutableHsPat' is_strict = goL
          L _ (PatSynCon _pat)  -> False -- Conservative
          L _ (RealDataCon con) ->
            isJust (tyConSingleDataCon_maybe (dataConTyCon con))
-           -- NB: tyConSingleDataCon_maybe, *not* isProductTyCon, because
-           -- the latter is false of existentials. See #4439
            && all goL (hsConPatArgs details)
     go (LitPat {})         = False
     go (NPat {})           = False
@@ -825,11 +566,13 @@ isIrrefutableHsPat' is_strict = goL
 
     go (XPat ext)          = case ghcPass @p of
 #if __GLASGOW_HASKELL__ < 811
-      GhcPs -> noExtCon ext
-      GhcRn -> noExtCon ext
+      GhcPs -> dataConCantHappen ext
 #endif
-      GhcTc -> go pat
-        where CoPat _ pat _ = ext
+      GhcRn -> case ext of
+        HsPatExpanded _ pat -> go pat
+      GhcTc -> case ext of
+        CoPat _ pat _ -> go pat
+        ExpansionPat _ pat -> go pat
 
 -- | Is the pattern any of combination of:
 --
@@ -840,7 +583,7 @@ isIrrefutableHsPat' is_strict = goL
 -- - x (variable)
 isSimplePat :: LPat (GhcPass x) -> Maybe (IdP (GhcPass x))
 isSimplePat p = case unLoc p of
-  ParPat _ x -> isSimplePat x
+  ParPat _ _ x _ -> isSimplePat x
   SigPat _ x _ -> isSimplePat x
   LazyPat _ x -> isSimplePat x
   BangPat _ x -> isSimplePat x
@@ -873,27 +616,40 @@ is the only thing that could possibly be matched!
 -- | @'patNeedsParens' p pat@ returns 'True' if the pattern @pat@ needs
 -- parentheses under precedence @p@.
 patNeedsParens :: forall p. IsPass p => PprPrec -> Pat (GhcPass p) -> Bool
-patNeedsParens p = go
+patNeedsParens p = go @p
   where
-    go :: Pat (GhcPass p) -> Bool
+    -- Remark: go needs to be polymorphic, as we call it recursively
+    -- at a different GhcPass (see the case for GhcTc XPat below).
+    go :: forall q. IsPass q => Pat (GhcPass q) -> Bool
     go (NPlusKPat {})    = p > opPrec
     go (SplicePat {})    = False
-    go (ConPat { pat_args = ds})
+    go (ConPat { pat_args = ds })
                          = conPatNeedsParens p ds
     go (SigPat {})       = p >= sigPrec
     go (ViewPat {})      = True
-    go (XPat ext)        = case ghcPass @p of
-      GhcPs -> noExtCon ext
-      GhcRn -> noExtCon ext
-      GhcTc -> go inner
-        where CoPat _ inner _ = ext
+    go (XPat ext)        = case ghcPass @q of
+#if __GLASGOW_HASKELL__ < 901
+      GhcPs -> dataConCantHappen ext
+#endif
+      GhcRn -> case ext of
+        HsPatExpanded orig _ -> go orig
+      GhcTc -> case ext of
+        CoPat _ inner _ -> go inner
+        ExpansionPat orig _ -> go orig
+          --                   ^^^^^^^
+          -- NB: recursive call of go at a different GhcPass.
     go (WildPat {})      = False
     go (VarPat {})       = False
     go (LazyPat {})      = False
     go (BangPat {})      = False
     go (ParPat {})       = False
     go (AsPat {})        = False
-    go (TuplePat {})     = False
+    -- Special-case unary boxed tuple applications so that they are
+    -- parenthesized as `Identity (Solo x)`, not `Identity Solo x` (#18612)
+    -- See Note [One-tuples] in GHC.Builtin.Types
+    go (TuplePat _ [_] Boxed)
+                         = p >= appPrec
+    go (TuplePat{})      = False
     go (SumPat {})       = False
     go (ListPat {})      = False
     go (LitPat _ l)      = hsLitNeedsParens p l
@@ -901,12 +657,17 @@ patNeedsParens p = go
 
 -- | @'conPatNeedsParens' p cp@ returns 'True' if the constructor patterns @cp@
 -- needs parentheses under precedence @p@.
-conPatNeedsParens :: PprPrec -> HsConDetails a b -> Bool
+conPatNeedsParens :: PprPrec -> HsConDetails t a b -> Bool
 conPatNeedsParens p = go
   where
-    go (PrefixCon args) = p >= appPrec && not (null args)
-    go (InfixCon {})    = p >= opPrec
-    go (RecCon {})      = False
+    go (PrefixCon ts args) = p >= appPrec && (not (null args) || not (null ts))
+    go (InfixCon {})       = p >= opPrec -- type args should be empty in this case
+    go (RecCon {})         = False
+
+
+-- | Parenthesize a pattern without token information
+gParPat :: LPat (GhcPass pass) -> Pat (GhcPass pass)
+gParPat p = ParPat noAnn noHsTok p noHsTok
 
 -- | @'parenthesizePat' p pat@ checks if @'patNeedsParens' p pat@ is true, and
 -- if so, surrounds @pat@ with a 'ParPat'. Otherwise, it simply returns @pat@.
@@ -915,7 +676,7 @@ parenthesizePat :: IsPass p
                 -> LPat (GhcPass p)
                 -> LPat (GhcPass p)
 parenthesizePat p lpat@(L loc pat)
-  | patNeedsParens p pat = L loc (ParPat noExtField lpat)
+  | patNeedsParens p pat = L loc (gParPat lpat)
   | otherwise            = lpat
 
 {-
@@ -934,7 +695,7 @@ collectEvVarsPat pat =
   case pat of
     LazyPat _ p      -> collectEvVarsLPat p
     AsPat _ _ p      -> collectEvVarsLPat p
-    ParPat  _ p      -> collectEvVarsLPat p
+    ParPat  _ _ p _  -> collectEvVarsLPat p
     BangPat _ p      -> collectEvVarsLPat p
     ListPat _ ps     -> unionManyBags $ map collectEvVarsLPat ps
     TuplePat _ ps _  -> unionManyBags $ map collectEvVarsLPat ps
@@ -950,5 +711,20 @@ collectEvVarsPat pat =
                                    $ map collectEvVarsLPat
                                    $ hsConPatArgs args
     SigPat  _ p _    -> collectEvVarsLPat p
-    XPat (CoPat _ p _) -> collectEvVarsPat  p
+    XPat ext -> case ext of
+      CoPat _ p _      -> collectEvVarsPat p
+      ExpansionPat _ p -> collectEvVarsPat p
     _other_pat       -> emptyBag
+
+{-
+************************************************************************
+*                                                                      *
+\subsection{Anno instances}
+*                                                                      *
+************************************************************************
+-}
+
+type instance Anno (Pat (GhcPass p)) = SrcSpanAnnA
+type instance Anno (HsOverLit (GhcPass p)) = SrcAnn NoEpAnns
+type instance Anno ConLike = SrcSpanAnnN
+type instance Anno (HsFieldBind lhs rhs) = SrcSpanAnnA

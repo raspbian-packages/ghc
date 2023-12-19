@@ -111,6 +111,11 @@ typedef struct {
     MarkQueue queue;
 } UpdRemSet;
 
+// How much marking work we are allowed to perform
+// See Note [Sync phase marking budget] in NonMoving.c
+typedef int64_t MarkBudget;
+#define UNLIMITED_MARK_BUDGET INT64_MIN
+
 // Number of blocks to allocate for a mark queue
 #define MARK_QUEUE_BLOCKS 16
 
@@ -121,6 +126,11 @@ extern bdescr *nonmoving_large_objects, *nonmoving_marked_large_objects,
               *nonmoving_compact_objects, *nonmoving_marked_compact_objects;
 extern memcount n_nonmoving_large_blocks, n_nonmoving_marked_large_blocks,
                 n_nonmoving_compact_blocks, n_nonmoving_marked_compact_blocks;
+
+// The size of live large/compact objects in words.
+// Only updated at the end of nonmoving GC.
+extern memcount nonmoving_large_words,
+                nonmoving_compact_words;
 
 extern StgTSO *nonmoving_old_threads;
 extern StgWeak *nonmoving_old_weak_ptr_list;
@@ -135,14 +145,14 @@ extern MarkQueue *current_mark_queue;
 extern bdescr *upd_rem_set_block_list;
 
 
-void nonmovingMarkInitUpdRemSet(void);
+void nonmovingMarkInit(void);
 
-void init_upd_rem_set(UpdRemSet *rset);
-void reset_upd_rem_set(UpdRemSet *rset);
+void nonmovingInitUpdRemSet(UpdRemSet *rset);
 void updateRemembSetPushClosure(Capability *cap, StgClosure *p);
 void updateRemembSetPushThunk(Capability *cap, StgThunk *p);
 void updateRemembSetPushTSO(Capability *cap, StgTSO *tso);
 void updateRemembSetPushStack(Capability *cap, StgStack *stack);
+void updateRemembSetPushMessageThrowTo(Capability *cap, MessageThrowTo *m);
 
 #if defined(THREADED_RTS)
 void nonmovingFlushCapUpdRemSetBlocks(Capability *cap);
@@ -155,8 +165,13 @@ void markQueueAddRoot(MarkQueue* q, StgClosure** root);
 
 void initMarkQueue(MarkQueue *queue);
 void freeMarkQueue(MarkQueue *queue);
-void nonmovingMark(struct MarkQueue_ *restrict queue);
+void nonmovingMark(MarkBudget *budget, struct MarkQueue_ *queue);
+INLINE_HEADER void nonmovingMarkUnlimitedBudget(struct MarkQueue_ *queue) {
+    MarkBudget budget = UNLIMITED_MARK_BUDGET;
+    nonmovingMark(&budget, queue);
+}
 
+void nonmovingMarkWeakPtrList(struct MarkQueue_ *queue);
 bool nonmovingTidyWeaks(struct MarkQueue_ *queue);
 void nonmovingTidyThreads(void);
 void nonmovingMarkDeadWeaks(struct MarkQueue_ *queue, StgWeak **dead_weak_ptr_list);
@@ -164,7 +179,7 @@ void nonmovingResurrectThreads(struct MarkQueue_ *queue, StgTSO **resurrected_th
 bool nonmovingIsAlive(StgClosure *p);
 void nonmovingMarkDeadWeak(struct MarkQueue_ *queue, StgWeak *w);
 void nonmovingMarkLiveWeak(struct MarkQueue_ *queue, StgWeak *w);
-void nonmovingAddUpdRemSetBlocks(struct MarkQueue_ *rset);
+void nonmovingAddUpdRemSetBlocks(UpdRemSet *rset);
 
 void markQueuePush(MarkQueue *q, const MarkQueueEnt *ent);
 void markQueuePushClosureGC(MarkQueue *q, StgClosure *p);

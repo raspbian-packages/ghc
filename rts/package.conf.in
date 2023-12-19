@@ -18,9 +18,9 @@ hidden-modules:
 import-dirs:
 
 #if defined(INSTALLING)
-library-dirs:           LIB_DIR"/rts" FFI_LIB_DIR LIBDW_LIB_DIR
+library-dirs:           LIB_DIR FFI_LIB_DIR LIBDW_LIB_DIR
 #else /* !INSTALLING */
-library-dirs:           TOP"/rts/dist/build" FFI_LIB_DIR LIBDW_LIB_DIR
+library-dirs:           TOP"/rts/dist-install/build" FFI_LIB_DIR LIBDW_LIB_DIR
 #endif
 
 hs-libraries:   "HSrts" FFI_LIB
@@ -70,15 +70,13 @@ extra-libraries:
 #if defined(INSTALLING)
 include-dirs:           INCLUDE_DIR FFI_INCLUDE_DIR
 #else /* !INSTALLING */
-include-dirs:           TOP"/rts/dist/build"
-                        TOP"/includes"
-                        TOP"/includes/dist-derivedconstants/header"
+include-dirs:           TOP"/rts/include"
+                        TOP"/rts/dist-install/build/include"
                         FFI_INCLUDE_DIR
                         LIBDW_INCLUDE_DIR
-                        TOP"/includes/dist-install/build"
 #endif
 
-includes:               Stg.h
+includes:               Rts.h
 cc-options:
 
 ld-options:
@@ -173,9 +171,7 @@ ld-options:
          , "-Wl,-u,_hs_cmpxchg8"
          , "-Wl,-u,_hs_cmpxchg16"
          , "-Wl,-u,_hs_cmpxchg32"
-#if WORD_SIZE_IN_BITS == 64
          , "-Wl,-u,_hs_cmpxchg64"
-#endif
          , "-Wl,-u,_hs_xchg8"
          , "-Wl,-u,_hs_xchg16"
          , "-Wl,-u,_hs_xchg32"
@@ -197,6 +193,7 @@ ld-options:
            * so we need to force it to be included in the binary. */
          , "-Wl,-u,_findPtr"
 #endif
+         , "-Wl,-u,_base_GHCziStackziCloneStack_StackSnapshot_closure"
 #else
            "-Wl,-u,base_GHCziTopHandler_runIO_closure"
          , "-Wl,-u,base_GHCziTopHandler_runNonIO_closure"
@@ -287,9 +284,7 @@ ld-options:
          , "-Wl,-u,hs_cmpxchg8"
          , "-Wl,-u,hs_cmpxchg16"
          , "-Wl,-u,hs_cmpxchg32"
-#if WORD_SIZE_IN_BITS == 64
          , "-Wl,-u,hs_cmpxchg64"
-#endif
          , "-Wl,-u,hs_xchg8"
          , "-Wl,-u,hs_xchg16"
          , "-Wl,-u,hs_xchg32"
@@ -311,14 +306,19 @@ ld-options:
            * so we need to force it to be included in the binary. */
          , "-Wl,-u,findPtr"
 #endif
+         , "-Wl,-u,base_GHCziStackziCloneStack_StackSnapshot_closure"
 #endif
 
 /*  Pick up static libraries in preference over dynamic if in earlier search
  *  path.  This is important to use the static gmp in preference on Mac OS.
  *  The used option is specific to the Darwin linker.
  */
+/*
+ * See Note [fd_set_overflow]
+*/
 #if defined(darwin_HOST_OS)
          , "-Wl,-search_paths_first"
+         , "-Wl,-U,___darwin_check_fd_set_overflow"
 #endif
 
 #if defined(darwin_HOST_OS) && !defined(x86_64_HOST_ARCH) && !defined(aarch64_HOST_ARCH)

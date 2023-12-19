@@ -11,7 +11,6 @@ module GHC.Builtin.Types.Literals
   , typeNatAddTyCon
   , typeNatMulTyCon
   , typeNatExpTyCon
-  , typeNatLeqTyCon
   , typeNatSubTyCon
   , typeNatDivTyCon
   , typeNatModTyCon
@@ -19,6 +18,11 @@ module GHC.Builtin.Types.Literals
   , typeNatCmpTyCon
   , typeSymbolCmpTyCon
   , typeSymbolAppendTyCon
+  , typeCharCmpTyCon
+  , typeConsSymbolTyCon
+  , typeUnconsSymbolTyCon
+  , typeCharToNatTyCon
+  , typeNatToCharTyCon
   ) where
 
 import GHC.Prelude
@@ -32,15 +36,17 @@ import GHC.Core.Coercion ( Role(..) )
 import GHC.Tc.Types.Constraint ( Xi )
 import GHC.Core.Coercion.Axiom ( CoAxiomRule(..), BuiltInSynFamily(..), TypeEqn )
 import GHC.Types.Name          ( Name, BuiltInSyntax(..) )
+import GHC.Types.Unique.FM
 import GHC.Builtin.Types
 import GHC.Builtin.Types.Prim  ( mkTemplateAnonTyConBinders )
 import GHC.Builtin.Names
                   ( gHC_TYPELITS
+                  , gHC_TYPELITS_INTERNAL
                   , gHC_TYPENATS
+                  , gHC_TYPENATS_INTERNAL
                   , typeNatAddTyFamNameKey
                   , typeNatMulTyFamNameKey
                   , typeNatExpTyFamNameKey
-                  , typeNatLeqTyFamNameKey
                   , typeNatSubTyFamNameKey
                   , typeNatDivTyFamNameKey
                   , typeNatModTyFamNameKey
@@ -48,18 +54,22 @@ import GHC.Builtin.Names
                   , typeNatCmpTyFamNameKey
                   , typeSymbolCmpTyFamNameKey
                   , typeSymbolAppendFamNameKey
+                  , typeCharCmpTyFamNameKey
+                  , typeConsSymbolTyFamNameKey
+                  , typeUnconsSymbolTyFamNameKey
+                  , typeCharToNatTyFamNameKey
+                  , typeNatToCharTyFamNameKey
                   )
 import GHC.Data.FastString
-import qualified Data.Map as Map
-import Data.Maybe ( isJust )
 import Control.Monad ( guard )
 import Data.List  ( isPrefixOf, isSuffixOf )
+import qualified Data.Char as Char
 
 {-
 Note [Type-level literals]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
-There are currently two forms of type-level literals: natural numbers, and
-symbols (even though this module is named GHC.Builtin.Types.Literals, it covers both).
+There are currently three forms of type-level literals: natural numbers, symbols, and
+characters.
 
 Type-level literals are supported by CoAxiomRules (conditional axioms), which
 power the built-in type families (see Note [Adding built-in type families]).
@@ -140,7 +150,6 @@ typeNatTyCons =
   [ typeNatAddTyCon
   , typeNatMulTyCon
   , typeNatExpTyCon
-  , typeNatLeqTyCon
   , typeNatSubTyCon
   , typeNatDivTyCon
   , typeNatModTyCon
@@ -148,6 +157,11 @@ typeNatTyCons =
   , typeNatCmpTyCon
   , typeSymbolCmpTyCon
   , typeSymbolAppendTyCon
+  , typeCharCmpTyCon
+  , typeConsSymbolTyCon
+  , typeUnconsSymbolTyCon
+  , typeCharToNatTyCon
+  , typeNatToCharTyCon
   ]
 
 typeNatAddTyCon :: TyCon
@@ -205,10 +219,6 @@ typeNatModTyCon = mkTypeNatFunTyCon2 name
   name = mkWiredInTyConName UserSyntax gHC_TYPENATS (fsLit "Mod")
             typeNatModTyFamNameKey typeNatModTyCon
 
-
-
-
-
 typeNatExpTyCon :: TyCon
 typeNatExpTyCon = mkTypeNatFunTyCon2 name
   BuiltInSynFamily
@@ -233,29 +243,10 @@ typeNatLogTyCon = mkTypeNatFunTyCon1 name
 
 
 
-typeNatLeqTyCon :: TyCon
-typeNatLeqTyCon =
-  mkFamilyTyCon name
-    (mkTemplateAnonTyConBinders [ typeNatKind, typeNatKind ])
-    boolTy
-    Nothing
-    (BuiltInSynFamTyCon ops)
-    Nothing
-    NotInjective
-
-  where
-  name = mkWiredInTyConName UserSyntax gHC_TYPENATS (fsLit "<=?")
-                typeNatLeqTyFamNameKey typeNatLeqTyCon
-  ops = BuiltInSynFamily
-    { sfMatchFam      = matchFamLeq
-    , sfInteractTop   = interactTopLeq
-    , sfInteractInert = interactInertLeq
-    }
-
 typeNatCmpTyCon :: TyCon
 typeNatCmpTyCon =
   mkFamilyTyCon name
-    (mkTemplateAnonTyConBinders [ typeNatKind, typeNatKind ])
+    (mkTemplateAnonTyConBinders [ naturalTy, naturalTy ])
     orderingKind
     Nothing
     (BuiltInSynFamTyCon ops)
@@ -263,7 +254,7 @@ typeNatCmpTyCon =
     NotInjective
 
   where
-  name = mkWiredInTyConName UserSyntax gHC_TYPENATS (fsLit "CmpNat")
+  name = mkWiredInTyConName UserSyntax gHC_TYPENATS_INTERNAL (fsLit "CmpNat")
                 typeNatCmpTyFamNameKey typeNatCmpTyCon
   ops = BuiltInSynFamily
     { sfMatchFam      = matchFamCmpNat
@@ -282,7 +273,7 @@ typeSymbolCmpTyCon =
     NotInjective
 
   where
-  name = mkWiredInTyConName UserSyntax gHC_TYPELITS (fsLit "CmpSymbol")
+  name = mkWiredInTyConName UserSyntax gHC_TYPELITS_INTERNAL (fsLit "CmpSymbol")
                 typeSymbolCmpTyFamNameKey typeSymbolCmpTyCon
   ops = BuiltInSynFamily
     { sfMatchFam      = matchFamCmpSymbol
@@ -301,26 +292,96 @@ typeSymbolAppendTyCon = mkTypeSymbolFunTyCon2 name
   name = mkWiredInTyConName UserSyntax gHC_TYPELITS (fsLit "AppendSymbol")
                 typeSymbolAppendFamNameKey typeSymbolAppendTyCon
 
+typeConsSymbolTyCon :: TyCon
+typeConsSymbolTyCon =
+  mkFamilyTyCon name
+    (mkTemplateAnonTyConBinders [ charTy, typeSymbolKind ])
+    typeSymbolKind
+    Nothing
+    (BuiltInSynFamTyCon ops)
+    Nothing
+    (Injective [True, True])
+  where
+  name = mkWiredInTyConName UserSyntax gHC_TYPELITS (fsLit "ConsSymbol")
+                  typeConsSymbolTyFamNameKey typeConsSymbolTyCon
+  ops = BuiltInSynFamily
+      { sfMatchFam      = matchFamConsSymbol
+      , sfInteractTop   = interactTopConsSymbol
+      , sfInteractInert = interactInertConsSymbol
+      }
 
+typeUnconsSymbolTyCon :: TyCon
+typeUnconsSymbolTyCon =
+  mkFamilyTyCon name
+    (mkTemplateAnonTyConBinders [ typeSymbolKind ])
+    (mkMaybeTy charSymbolPairKind)
+    Nothing
+    (BuiltInSynFamTyCon ops)
+    Nothing
+    (Injective [True])
+  where
+  name = mkWiredInTyConName UserSyntax gHC_TYPELITS (fsLit "UnconsSymbol")
+                  typeUnconsSymbolTyFamNameKey typeUnconsSymbolTyCon
+  ops = BuiltInSynFamily
+      { sfMatchFam      = matchFamUnconsSymbol
+      , sfInteractTop   = interactTopUnconsSymbol
+      , sfInteractInert = interactInertUnconsSymbol
+      }
+
+typeCharToNatTyCon :: TyCon
+typeCharToNatTyCon =
+  mkFamilyTyCon name
+    (mkTemplateAnonTyConBinders [ charTy ])
+    naturalTy
+    Nothing
+    (BuiltInSynFamTyCon ops)
+    Nothing
+    (Injective [True])
+  where
+  name = mkWiredInTyConName UserSyntax gHC_TYPELITS (fsLit "CharToNat")
+                  typeCharToNatTyFamNameKey typeCharToNatTyCon
+  ops = BuiltInSynFamily
+      { sfMatchFam      = matchFamCharToNat
+      , sfInteractTop   = interactTopCharToNat
+      , sfInteractInert = \_ _ _ _ -> []
+      }
+
+
+typeNatToCharTyCon :: TyCon
+typeNatToCharTyCon =
+  mkFamilyTyCon name
+    (mkTemplateAnonTyConBinders [ naturalTy ])
+    charTy
+    Nothing
+    (BuiltInSynFamTyCon ops)
+    Nothing
+    (Injective [True])
+  where
+  name = mkWiredInTyConName UserSyntax gHC_TYPELITS (fsLit "NatToChar")
+                  typeNatToCharTyFamNameKey typeNatToCharTyCon
+  ops = BuiltInSynFamily
+      { sfMatchFam      = matchFamNatToChar
+      , sfInteractTop   = interactTopNatToChar
+      , sfInteractInert = \_ _ _ _ -> []
+      }
 
 -- Make a unary built-in constructor of kind: Nat -> Nat
 mkTypeNatFunTyCon1 :: Name -> BuiltInSynFamily -> TyCon
 mkTypeNatFunTyCon1 op tcb =
   mkFamilyTyCon op
-    (mkTemplateAnonTyConBinders [ typeNatKind ])
-    typeNatKind
+    (mkTemplateAnonTyConBinders [ naturalTy ])
+    naturalTy
     Nothing
     (BuiltInSynFamTyCon tcb)
     Nothing
     NotInjective
 
-
 -- Make a binary built-in constructor of kind: Nat -> Nat -> Nat
 mkTypeNatFunTyCon2 :: Name -> BuiltInSynFamily -> TyCon
 mkTypeNatFunTyCon2 op tcb =
   mkFamilyTyCon op
-    (mkTemplateAnonTyConBinders [ typeNatKind, typeNatKind ])
-    typeNatKind
+    (mkTemplateAnonTyConBinders [ naturalTy, naturalTy ])
+    naturalTy
     Nothing
     (BuiltInSynFamTyCon tcb)
     Nothing
@@ -337,7 +398,6 @@ mkTypeSymbolFunTyCon2 op tcb =
     Nothing
     NotInjective
 
-
 {-------------------------------------------------------------------------------
 Built-in rules axioms
 -------------------------------------------------------------------------------}
@@ -348,10 +408,13 @@ Built-in rules axioms
 axAddDef
   , axMulDef
   , axExpDef
-  , axLeqDef
   , axCmpNatDef
   , axCmpSymbolDef
   , axAppendSymbolDef
+  , axConsSymbolDef
+  , axUnconsSymbolDef
+  , axCharToNatDef
+  , axNatToCharDef
   , axAdd0L
   , axAdd0R
   , axMul0L
@@ -361,10 +424,8 @@ axAddDef
   , axExp1L
   , axExp0R
   , axExp1R
-  , axLeqRefl
   , axCmpNatRefl
   , axCmpSymbolRefl
-  , axLeq0L
   , axSubDef
   , axSub0R
   , axAppendSymbol0R
@@ -376,19 +437,16 @@ axAddDef
   , axLogDef
   :: CoAxiomRule
 
-axAddDef = mkBinAxiom "AddDef" typeNatAddTyCon $
+axAddDef = mkBinAxiom "AddDef" typeNatAddTyCon isNumLitTy isNumLitTy $
               \x y -> Just $ num (x + y)
 
-axMulDef = mkBinAxiom "MulDef" typeNatMulTyCon $
+axMulDef = mkBinAxiom "MulDef" typeNatMulTyCon isNumLitTy isNumLitTy $
               \x y -> Just $ num (x * y)
 
-axExpDef = mkBinAxiom "ExpDef" typeNatExpTyCon $
+axExpDef = mkBinAxiom "ExpDef" typeNatExpTyCon isNumLitTy isNumLitTy $
               \x y -> Just $ num (x ^ y)
 
-axLeqDef = mkBinAxiom "LeqDef" typeNatLeqTyCon $
-              \x y -> Just $ bool (x <= y)
-
-axCmpNatDef   = mkBinAxiom "CmpNatDef" typeNatCmpTyCon
+axCmpNatDef   = mkBinAxiom "CmpNatDef" typeNatCmpTyCon isNumLitTy isNumLitTy
               $ \x y -> Just $ ordering (compare x y)
 
 axCmpSymbolDef =
@@ -401,7 +459,7 @@ axCmpSymbolDef =
            s2' <- isStrLitTy s2
            t2' <- isStrLitTy t2
            return (mkTyConApp typeSymbolCmpTyCon [s1,t1] ===
-                   ordering (compare s2' t2')) }
+                   ordering (lexicalCompareFS s2' t2')) }
 
 axAppendSymbolDef = CoAxiomRule
     { coaxrName      = fsLit "AppendSymbolDef"
@@ -415,18 +473,35 @@ axAppendSymbolDef = CoAxiomRule
            return (mkTyConApp typeSymbolAppendTyCon [s1, t1] === z)
     }
 
-axSubDef = mkBinAxiom "SubDef" typeNatSubTyCon $
+axConsSymbolDef =
+  mkBinAxiom "ConsSymbolDef" typeConsSymbolTyCon isCharLitTy isStrLitTy $
+    \c str -> Just $ mkStrLitTy (consFS c str)
+
+axUnconsSymbolDef =
+  mkUnAxiom "UnconsSymbolDef" typeUnconsSymbolTyCon isStrLitTy $
+    \str -> Just $
+      mkPromotedMaybeTy charSymbolPairKind (fmap reifyCharSymbolPairTy (unconsFS str))
+
+axCharToNatDef =
+  mkUnAxiom "CharToNatDef" typeCharToNatTyCon isCharLitTy $
+    \c -> Just $ num (charToInteger c)
+
+axNatToCharDef =
+  mkUnAxiom "NatToCharDef" typeNatToCharTyCon isNumLitTy $
+    \n -> fmap mkCharLitTy (integerToChar n)
+
+axSubDef = mkBinAxiom "SubDef" typeNatSubTyCon isNumLitTy isNumLitTy $
               \x y -> fmap num (minus x y)
 
-axDivDef = mkBinAxiom "DivDef" typeNatDivTyCon $
+axDivDef = mkBinAxiom "DivDef" typeNatDivTyCon isNumLitTy isNumLitTy $
               \x y -> do guard (y /= 0)
                          return (num (div x y))
 
-axModDef = mkBinAxiom "ModDef" typeNatModTyCon $
+axModDef = mkBinAxiom "ModDef" typeNatModTyCon isNumLitTy isNumLitTy $
               \x y -> do guard (y /= 0)
                          return (num (mod x y))
 
-axLogDef = mkUnAxiom "LogDef" typeNatLogTyCon $
+axLogDef = mkUnAxiom "LogDef" typeNatLogTyCon isNumLitTy $
               \x -> do (a,_) <- genLog x 2
                        return (num a)
 
@@ -443,12 +518,10 @@ axMod1      = mkAxiom1 "Mod1"     $ \(Pair s _) -> (tMod s (num 1) === num 0)
 axExp1L     = mkAxiom1 "Exp1L"    $ \(Pair s _) -> (num 1 .^. s) === num 1
 axExp0R     = mkAxiom1 "Exp0R"    $ \(Pair s _) -> (s .^. num 0) === num 1
 axExp1R     = mkAxiom1 "Exp1R"    $ \(Pair s t) -> (s .^. num 1) === t
-axLeqRefl   = mkAxiom1 "LeqRefl"  $ \(Pair s _) -> (s <== s) === bool True
 axCmpNatRefl    = mkAxiom1 "CmpNatRefl"
                 $ \(Pair s _) -> (cmpNat s s) === ordering EQ
 axCmpSymbolRefl = mkAxiom1 "CmpSymbolRefl"
                 $ \(Pair s _) -> (cmpSymbol s s) === ordering EQ
-axLeq0L     = mkAxiom1 "Leq0L"    $ \(Pair s _) -> (num 0 <== s) === bool True
 axAppendSymbol0R  = mkAxiom1 "Concat0R"
             $ \(Pair s t) -> (mkStrLitTy nilFS `appendSymbol` s) === t
 axAppendSymbol0L  = mkAxiom1 "Concat0L"
@@ -457,15 +530,19 @@ axAppendSymbol0L  = mkAxiom1 "Concat0L"
 -- The list of built-in type family axioms that GHC uses.
 -- If you define new axioms, make sure to include them in this list.
 -- See Note [Adding built-in type families]
-typeNatCoAxiomRules :: Map.Map FastString CoAxiomRule
-typeNatCoAxiomRules = Map.fromList $ map (\x -> (coaxrName x, x))
+typeNatCoAxiomRules :: UniqFM FastString CoAxiomRule
+typeNatCoAxiomRules = listToUFM $ map (\x -> (coaxrName x, x))
   [ axAddDef
   , axMulDef
   , axExpDef
-  , axLeqDef
   , axCmpNatDef
   , axCmpSymbolDef
+  , axCmpCharDef
   , axAppendSymbolDef
+  , axConsSymbolDef
+  , axUnconsSymbolDef
+  , axCharToNatDef
+  , axNatToCharDef
   , axAdd0L
   , axAdd0R
   , axMul0L
@@ -475,10 +552,9 @@ typeNatCoAxiomRules = Map.fromList $ map (\x -> (coaxrName x, x))
   , axExp1L
   , axExp0R
   , axExp1R
-  , axLeqRefl
   , axCmpNatRefl
   , axCmpSymbolRefl
-  , axLeq0L
+  , axCmpCharRefl
   , axSubDef
   , axSub0R
   , axAppendSymbol0R
@@ -514,9 +590,6 @@ tMod s t = mkTyConApp typeNatModTyCon [s,t]
 (.^.) :: Type -> Type -> Type
 s .^. t = mkTyConApp typeNatExpTyCon [s,t]
 
-(<==) :: Type -> Type -> Type
-s <== t = mkTyConApp typeNatLeqTyCon [s,t]
-
 cmpNat :: Type -> Type -> Type
 cmpNat s t = mkTyConApp typeNatCmpTyCon [s,t]
 
@@ -532,17 +605,11 @@ x === y = Pair x y
 num :: Integer -> Type
 num = mkNumLitTy
 
-bool :: Bool -> Type
-bool b = if b then mkTyConApp promotedTrueDataCon []
-              else mkTyConApp promotedFalseDataCon []
+charSymbolPair :: Type -> Type -> Type
+charSymbolPair = mkPromotedPairTy charTy typeSymbolKind
 
-isBoolLitTy :: Type -> Maybe Bool
-isBoolLitTy tc =
-  do (tc,[]) <- splitTyConApp_maybe tc
-     case () of
-       _ | tc == promotedFalseDataCon -> return False
-         | tc == promotedTrueDataCon  -> return True
-         | otherwise                   -> Nothing
+charSymbolPairKind :: Kind
+charSymbolPairKind = mkTyConApp pairTyCon [charTy, typeSymbolKind]
 
 orderingKind :: Kind
 orderingKind = mkTyConApp orderingTyCon []
@@ -568,39 +635,36 @@ known p x = case isNumLitTy x of
               Just a  -> p a
               Nothing -> False
 
-
-mkUnAxiom :: String -> TyCon -> (Integer -> Maybe Type) -> CoAxiomRule
-mkUnAxiom str tc f =
+mkUnAxiom :: String -> TyCon -> (Type -> Maybe a) -> (a -> Maybe Type) -> CoAxiomRule
+mkUnAxiom str tc isReqTy f =
   CoAxiomRule
     { coaxrName      = fsLit str
     , coaxrAsmpRoles = [Nominal]
     , coaxrRole      = Nominal
     , coaxrProves    = \cs ->
         do [Pair s1 s2] <- return cs
-           s2' <- isNumLitTy s2
+           s2' <- isReqTy s2
            z   <- f s2'
            return (mkTyConApp tc [s1] === z)
     }
 
-
-
 -- For the definitional axioms
 mkBinAxiom :: String -> TyCon ->
-              (Integer -> Integer -> Maybe Type) -> CoAxiomRule
-mkBinAxiom str tc f =
+              (Type -> Maybe a) ->
+              (Type -> Maybe b) ->
+              (a -> b -> Maybe Type) -> CoAxiomRule
+mkBinAxiom str tc isReqTy1 isReqTy2 f =
   CoAxiomRule
     { coaxrName      = fsLit str
     , coaxrAsmpRoles = [Nominal, Nominal]
     , coaxrRole      = Nominal
     , coaxrProves    = \cs ->
         do [Pair s1 s2, Pair t1 t2] <- return cs
-           s2' <- isNumLitTy s2
-           t2' <- isNumLitTy t2
+           s2' <- isReqTy1 s2
+           t2' <- isReqTy2 t2
            z   <- f s2' t2'
            return (mkTyConApp tc [s1,t1] === z)
     }
-
-
 
 mkAxiom1 :: String -> (TypeEqn -> TypeEqn) -> CoAxiomRule
 mkAxiom1 str f =
@@ -664,8 +728,6 @@ matchFamMod [s,t]
         mbY = isNumLitTy t
 matchFamMod _ = Nothing
 
-
-
 matchFamExp :: [Type] -> Maybe (CoAxiomRule, [Type], Type)
 matchFamExp [s,t]
   | Just 0 <- mbY = Just (axExp0R, [s], num 1)
@@ -684,16 +746,6 @@ matchFamLog [s]
 matchFamLog _ = Nothing
 
 
-matchFamLeq :: [Type] -> Maybe (CoAxiomRule, [Type], Type)
-matchFamLeq [s,t]
-  | Just 0 <- mbX = Just (axLeq0L, [t], bool True)
-  | Just x <- mbX, Just y <- mbY =
-    Just (axLeqDef, [s,t], bool (x <= y))
-  | tcEqType s t  = Just (axLeqRefl, [s], bool True)
-  where mbX = isNumLitTy s
-        mbY = isNumLitTy t
-matchFamLeq _ = Nothing
-
 matchFamCmpNat :: [Type] -> Maybe (CoAxiomRule, [Type], Type)
 matchFamCmpNat [s,t]
   | Just x <- mbX, Just y <- mbY =
@@ -706,7 +758,7 @@ matchFamCmpNat _ = Nothing
 matchFamCmpSymbol :: [Type] -> Maybe (CoAxiomRule, [Type], Type)
 matchFamCmpSymbol [s,t]
   | Just x <- mbX, Just y <- mbY =
-    Just (axCmpSymbolDef, [s,t], ordering (compare x y))
+    Just (axCmpSymbolDef, [s,t], ordering (lexicalCompareFS x y))
   | tcEqType s t = Just (axCmpSymbolRefl, [s], ordering EQ)
   where mbX = isStrLitTy s
         mbY = isStrLitTy t
@@ -722,6 +774,50 @@ matchFamAppendSymbol [s,t]
   mbX = isStrLitTy s
   mbY = isStrLitTy t
 matchFamAppendSymbol _ = Nothing
+
+matchFamConsSymbol :: [Type] -> Maybe (CoAxiomRule, [Type], Type)
+matchFamConsSymbol [s,t]
+  | Just x <- mbX, Just y <- mbY =
+    Just (axConsSymbolDef, [s,t], mkStrLitTy (consFS x y))
+  where
+  mbX = isCharLitTy s
+  mbY = isStrLitTy t
+matchFamConsSymbol _ = Nothing
+
+reifyCharSymbolPairTy :: (Char, FastString) -> Type
+reifyCharSymbolPairTy (c, s) = charSymbolPair (mkCharLitTy c) (mkStrLitTy s)
+
+matchFamUnconsSymbol :: [Type] -> Maybe (CoAxiomRule, [Type], Type)
+matchFamUnconsSymbol [s]
+  | Just x <- mbX =
+    Just (axUnconsSymbolDef, [s]
+         , mkPromotedMaybeTy charSymbolPairKind (fmap reifyCharSymbolPairTy (unconsFS x)))
+  where
+  mbX = isStrLitTy s
+matchFamUnconsSymbol _ = Nothing
+
+matchFamCharToNat :: [Type] -> Maybe (CoAxiomRule, [Type], Type)
+matchFamCharToNat [c]
+  | Just c' <- isCharLitTy c, n <- charToInteger c'
+  = Just (axCharToNatDef, [c], mkNumLitTy n)
+  | otherwise = Nothing
+matchFamCharToNat _ = Nothing
+
+matchFamNatToChar :: [Type] -> Maybe (CoAxiomRule, [Type], Type)
+matchFamNatToChar [n]
+  | Just n' <- isNumLitTy n, Just c <- integerToChar n'
+  = Just (axNatToCharDef, [n], mkCharLitTy c)
+  | otherwise = Nothing
+matchFamNatToChar _ = Nothing
+
+charToInteger :: Char -> Integer
+charToInteger c = fromIntegral (Char.ord c)
+
+integerToChar :: Integer -> Maybe Char
+integerToChar n | inBounds = Just (Char.chr (fromInteger n))
+  where inBounds = n >= charToInteger minBound &&
+                   n <= charToInteger maxBound
+integerToChar _ = Nothing
 
 {-------------------------------------------------------------------------------
 Interact with axioms
@@ -813,14 +909,6 @@ interactTopLog _ _ = []   -- I can't think of anything...
 
 
 
-interactTopLeq :: [Xi] -> Xi -> [Pair Type]
-interactTopLeq [s,t] r
-  | Just 0 <- mbY, Just True <- mbZ = [ s === num 0 ]                     -- (s <= 0) => (s ~ 0)
-  where
-  mbY = isNumLitTy t
-  mbZ = isBoolLitTy r
-interactTopLeq _ _ = []
-
 interactTopCmpNat :: [Xi] -> Xi -> [Pair Type]
 interactTopCmpNat [s,t] r
   | Just EQ <- isOrderingLitTy r = [ s === t ]
@@ -851,6 +939,47 @@ interactTopAppendSymbol [s,t] r
   mbZ = isStrLitTy r
 
 interactTopAppendSymbol _ _ = []
+
+interactTopConsSymbol :: [Xi] -> Xi -> [Pair Type]
+interactTopConsSymbol [s,t] r
+  -- ConsSymbol a b ~ "blah" => (a ~ 'b', b ~ "lah")
+  | Just fs <- isStrLitTy r
+  , Just (x, xs) <- unconsFS fs =
+    [ s === mkCharLitTy x, t === mkStrLitTy xs ]
+
+interactTopConsSymbol _ _ = []
+
+interactTopUnconsSymbol :: [Xi] -> Xi -> [Pair Type]
+interactTopUnconsSymbol [s] r
+  -- (UnconsSymbol b ~ Nothing) => (b ~ "")
+  | Just Nothing <- mbX =
+    [ s === mkStrLitTy nilFS ]
+  -- (UnconsSymbol b ~ Just ('f',"oobar")) => (b ~ "foobar")
+  | Just (Just r) <- mbX
+  , Just (c, str) <- isPromotedPairType r
+  , Just chr <- isCharLitTy c
+  , Just str1 <- isStrLitTy str =
+    [ s === (mkStrLitTy $ consFS chr str1) ]
+
+  where
+  mbX = isPromotedMaybeTy r
+
+interactTopUnconsSymbol _ _ = []
+
+interactTopCharToNat :: [Xi] -> Xi -> [Pair Type]
+interactTopCharToNat [s] r
+  -- (CharToNat c ~ 122) => (c ~ 'z')
+  | Just n <- isNumLitTy r
+  , Just c <- integerToChar n
+  = [ s === mkCharLitTy c ]
+interactTopCharToNat _ _ = []
+
+interactTopNatToChar :: [Xi] -> Xi -> [Pair Type]
+interactTopNatToChar [s] r
+  -- (NatToChar n ~ 'z') => (n ~ 122)
+  | Just c <- isCharLitTy r
+  = [ s === mkNumLitTy (charToInteger c) ]
+interactTopNatToChar _ _ = []
 
 {-------------------------------------------------------------------------------
 Interaction with inerts
@@ -896,18 +1025,6 @@ interactInertLog :: [Xi] -> Xi -> [Xi] -> Xi -> [Pair Type]
 interactInertLog _ _ _ _ = []
 
 
-interactInertLeq :: [Xi] -> Xi -> [Xi] -> Xi -> [Pair Type]
-interactInertLeq [x1,y1] z1 [x2,y2] z2
-  | bothTrue && tcEqType x1 y2 && tcEqType y1 x2 = [ x1 === y1 ]
-  | bothTrue && tcEqType y1 x2                 = [ (x1 <== y2) === bool True ]
-  | bothTrue && tcEqType y2 x1                 = [ (x2 <== y1) === bool True ]
-  where bothTrue = isJust $ do True <- isBoolLitTy z1
-                               True <- isBoolLitTy z2
-                               return ()
-
-interactInertLeq _ _ _ _ = []
-
-
 interactInertAppendSymbol :: [Xi] -> Xi -> [Xi] -> Xi -> [Pair Type]
 interactInertAppendSymbol [x1,y1] z1 [x2,y2] z2
   | sameZ && tcEqType x1 x2         = [ y1 === y2 ]
@@ -915,6 +1032,17 @@ interactInertAppendSymbol [x1,y1] z1 [x2,y2] z2
   where sameZ = tcEqType z1 z2
 interactInertAppendSymbol _ _ _ _ = []
 
+
+interactInertConsSymbol :: [Xi] -> Xi -> [Xi] -> Xi -> [Pair Type]
+interactInertConsSymbol [x1, y1] z1 [x2, y2] z2
+  | sameZ         = [ x1 === x2, y1 === y2 ]
+  where sameZ = tcEqType z1 z2
+interactInertConsSymbol _ _ _ _ = []
+
+interactInertUnconsSymbol :: [Xi] -> Xi -> [Xi] -> Xi -> [Pair Type]
+interactInertUnconsSymbol [x1] z1 [x2] z2
+  | tcEqType z1 z2 = [ x1 === x2 ]
+interactInertUnconsSymbol _ _ _ _ = []
 
 
 {- -----------------------------------------------------------------------------
@@ -989,3 +1117,47 @@ genLog x base = Just (exactLoop 0 x)
   underLoop s i
     | i < base  = s
     | otherwise = let s1 = s + 1 in s1 `seq` underLoop s1 (div i base)
+
+-----------------------------------------------------------------------------
+
+typeCharCmpTyCon :: TyCon
+typeCharCmpTyCon =
+  mkFamilyTyCon name
+    (mkTemplateAnonTyConBinders [ charTy, charTy ])
+    orderingKind
+    Nothing
+    (BuiltInSynFamTyCon ops)
+    Nothing
+    NotInjective
+  where
+  name = mkWiredInTyConName UserSyntax gHC_TYPELITS_INTERNAL (fsLit "CmpChar")
+                  typeCharCmpTyFamNameKey typeCharCmpTyCon
+  ops = BuiltInSynFamily
+      { sfMatchFam      = matchFamCmpChar
+      , sfInteractTop   = interactTopCmpChar
+      , sfInteractInert = \_ _ _ _ -> []
+      }
+
+interactTopCmpChar :: [Xi] -> Xi -> [Pair Type]
+interactTopCmpChar [s,t] r
+  | Just EQ <- isOrderingLitTy r = [ s === t ]
+interactTopCmpChar _ _ = []
+
+cmpChar :: Type -> Type -> Type
+cmpChar s t = mkTyConApp typeCharCmpTyCon [s,t]
+
+axCmpCharDef, axCmpCharRefl :: CoAxiomRule
+axCmpCharDef =
+  mkBinAxiom "CmpCharDef" typeCharCmpTyCon isCharLitTy isCharLitTy $
+    \chr1 chr2 -> Just $ ordering $ compare chr1 chr2
+axCmpCharRefl = mkAxiom1 "CmpCharRefl"
+  $ \(Pair s _) -> (cmpChar s s) === ordering EQ
+
+matchFamCmpChar :: [Type] -> Maybe (CoAxiomRule, [Type], Type)
+matchFamCmpChar [s,t]
+  | Just x <- mbX, Just y <- mbY =
+    Just (axCmpCharDef, [s,t], ordering (compare x y))
+  | tcEqType s t = Just (axCmpCharRefl, [s], ordering EQ)
+  where mbX = isCharLitTy s
+        mbY = isCharLitTy t
+matchFamCmpChar _ = Nothing

@@ -1,7 +1,18 @@
-{-# LANGUAGE ViewPatterns #-}
-module GHC.Core.UsageEnv (UsageEnv, addUsage, scaleUsage, zeroUE,
-                          lookupUE, scaleUE, deleteUE, addUE, Usage(..), unitUE,
-                          bottomUE, supUE, supUEs) where
+module GHC.Core.UsageEnv
+  ( Usage(..)
+  , UsageEnv
+  , addUE
+  , addUsage
+  , bottomUE
+  , deleteUE
+  , lookupUE
+  , scaleUE
+  , scaleUsage
+  , supUE
+  , supUEs
+  , unitUE
+  , zeroUE
+  ) where
 
 import Data.Foldable
 import GHC.Prelude
@@ -9,6 +20,7 @@ import GHC.Core.Multiplicity
 import GHC.Types.Name
 import GHC.Types.Name.Env
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
 
 --
 -- * Usage environments
@@ -40,7 +52,7 @@ scaleUsage x   Bottom     = MUsage x
 scaleUsage x   (MUsage y) = MUsage $ mkMultMul x y
 
 -- For now, we use extra multiplicity Bottom for empty case.
-data UsageEnv = UsageEnv (NameEnv Mult) Bool
+data UsageEnv = UsageEnv !(NameEnv Mult) Bool
 
 unitUE :: NamedThing n => n -> Mult -> UsageEnv
 unitUE x w = UsageEnv (unitNameEnv (getName x) w) False

@@ -2,7 +2,7 @@
  * PowerPC architecture adjustor thunk logic.
  * ---------------------------------------------------------------------------*/
 
-#include "PosixSource.h"
+#include "rts/PosixSource.h"
 #include "Rts.h"
 
 #include "RtsUtils.h"
@@ -52,6 +52,8 @@ typedef struct AdjustorStub {
 
 #endif /* !(defined(powerpc_HOST_ARCH) && defined(linux_HOST_OS)) */
 #endif /* defined(powerpc_HOST_ARCH) || defined(powerpc64_HOST_ARCH) */
+
+void initAdjustors(void) { }
 
 void*
 createAdjustor(int cconv, StgStablePtr hptr,
@@ -151,6 +153,9 @@ createAdjustor(int cconv, StgStablePtr hptr,
                     // allocate space for at most 4 insns per parameter
                     // plus 14 more instructions.
         ExecPage *page = allocateExecPage();
+        if (page == NULL) {
+            barf("createAdjustor: failed to allocate executable page\n");
+        }
         unsigned *code = adjustor;
 
         *code++ = 0x48000008; // b *+8
@@ -303,6 +308,9 @@ createAdjustor(int cconv, StgStablePtr hptr,
         adjustorStub = stgMallocBytes(sizeof(AdjustorStub), "createAdjustor");
 #else
         ExecPage *page = allocateExecPage();
+        if (page == NULL) {
+            barf("createAdjustor: failed to allocate executable page\n");
+        }
         adjustorStub = (AdjustorStub *) page;
 #endif /* defined(FUNDESCS) */
         adjustor = adjustorStub;

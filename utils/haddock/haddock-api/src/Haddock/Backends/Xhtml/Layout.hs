@@ -15,7 +15,7 @@ module Haddock.Backends.Xhtml.Layout (
 
   divPackageHeader, divContent, divModuleHeader, divFooter,
   divTableOfContents, divDescription, divSynopsis, divInterface,
-  divIndex, divAlphabet, divModuleList, divContentsList,
+  divIndex, divAlphabet, divPackageList, divModuleList,  divContentsList,
 
   sectionName,
   nonEmptySectionName,
@@ -51,7 +51,7 @@ import Text.XHtml hiding ( name, title, quote )
 import Data.Maybe (fromMaybe)
 
 import GHC.Data.FastString ( unpackFS )
-import GHC
+import GHC hiding (anchor)
 import GHC.Types.Name (nameOccName)
 
 --------------------------------------------------------------------------------
@@ -81,7 +81,7 @@ nonEmptySectionName c
 
 divPackageHeader, divContent, divModuleHeader, divFooter,
   divTableOfContents, divDescription, divSynopsis, divInterface,
-  divIndex, divAlphabet, divModuleList, divContentsList
+  divIndex, divAlphabet, divPackageList, divModuleList, divContentsList
     :: Html -> Html
 
 divPackageHeader    = sectionDiv "package-header"
@@ -96,6 +96,7 @@ divInterface        = sectionDiv "interface"
 divIndex            = sectionDiv "index"
 divAlphabet         = sectionDiv "alphabet"
 divModuleList       = sectionDiv "module-list"
+divPackageList      = sectionDiv "module-list"
 
 
 --------------------------------------------------------------------------------
@@ -153,16 +154,16 @@ subTable pkg qual decls = Just $ table << aboves (concatMap subRow decls)
 
 -- | Sub table with source information (optional).
 subTableSrc :: Maybe Package -> Qualification -> LinksInfo -> Bool
-            -> [(String, SubDecl, Maybe Module, Located DocName)] -> Maybe Html
+            -> [(SubDecl, Maybe Module, Located DocName)] -> Maybe Html
 subTableSrc _ _ _ _ [] = Nothing
 subTableSrc pkg qual lnks splice decls = Just $ table << aboves (concatMap subRow decls)
   where
-    subRow (instanchor, (decl, mdoc, subs), mdl, L loc dn) =
+    subRow ((decl, mdoc, subs), mdl, L loc dn) =
       (td ! [theclass "src clearfix"] <<
         (thespan ! [theclass "inst-left"] << decl)
         <+> linkHtml loc mdl dn
       <->
-      docElement td << fmap (docToHtml (Just instanchor) pkg qual) mdoc
+      docElement td << fmap (docToHtml Nothing pkg qual) mdoc
       )
       : map (cell . (td <<)) subs
 
@@ -201,7 +202,7 @@ subEquations pkg qual = divSubDecls "equations" "Equations" . subTable pkg qual
 subInstances :: Maybe Package -> Qualification
              -> String -- ^ Class name, used for anchor generation
              -> LinksInfo -> Bool
-             -> [(String, SubDecl, Maybe Module, Located DocName)] -> Html
+             -> [(SubDecl, Maybe Module, Located DocName)] -> Html
 subInstances pkg qual nm lnks splice = maybe noHtml wrap . instTable
   where
     wrap contents = subSection (hdr +++ collapseDetails id_ DetailsOpen (summary +++ contents))
@@ -214,12 +215,12 @@ subInstances pkg qual nm lnks splice = maybe noHtml wrap . instTable
 
 subOrphanInstances :: Maybe Package -> Qualification
                    -> LinksInfo -> Bool
-                   -> [(String, SubDecl, Maybe Module, Located DocName)] -> Html
+                   -> [(SubDecl, Maybe Module, Located DocName)] -> Html
 subOrphanInstances pkg qual lnks splice  = maybe noHtml wrap . instTable
   where
     wrap = ((h1 << "Orphan instances") +++)
     instTable = fmap (thediv ! [ identifier ("section." ++ id_) ] <<) . subTableSrc pkg qual lnks splice
-    id_ = makeAnchorId $ "orphans"
+    id_ = makeAnchorId "orphans"
 
 
 subInstHead :: String -- ^ Instance unique id (for anchor generation)

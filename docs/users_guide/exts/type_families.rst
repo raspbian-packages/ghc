@@ -46,7 +46,7 @@ The instances of data families can be data types and newtypes.
 Type families are enabled by the language extension :extension:`TypeFamilies`. Additional
 information on the use of type families in GHC is available on `the
 Haskell wiki page on type
-families <http://www.haskell.org/haskellwiki/GHC/Indexed_types>`__.
+families <https://www.haskell.org/haskellwiki/GHC/Indexed_types>`__.
 
 .. [AssocDataTypes2005]
     “`Associated Types with Class
@@ -544,11 +544,6 @@ However see :ref:`ghci-decls` for the overlap rules in GHCi.
 Decidability of type synonym instances
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. extension:: UndecidableInstances
-    :noindex:
-
-    Relax restrictions on the decidability of type synonym family instances.
-
 In order to guarantee that type inference in the presence of type
 families is decidable, we need to place a number of additional restrictions
 on the formation of type instance declarations (c.f., Definition 5
@@ -577,9 +572,55 @@ as ``a ~ [F a]``, where a recursive occurrence of a type variable is
 underneath a family application and data constructor application - see
 the above mentioned paper for details.
 
-If the option :extension:`UndecidableInstances` is passed to the compiler, the
-above restrictions are not enforced and it is on the programmer to ensure
-termination of the normalisation of type families during type inference.
+If the option :extension:`UndecidableInstances` is passed to the compiler
+(see :ref:`undecidable-instances`), the above restrictions are not enforced
+and it is on the programmer to ensure termination of the normalisation
+of type families during type inference.
+
+Reducing type family applications
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. ghc-flag:: -ffamily-application-cache
+    :shortdesc: Use a cache when reducing type family applications
+    :type: dynamic
+    :reverse: -fno-family-application-cache
+    :category:
+
+    The flag :ghc-flag:`-ffamily-application-cache` (on by default) instructs
+    GHC to use a cache when reducing type family applications. In most cases,
+    this will speed up compilation. The use of this flag will not affect
+    runtime behaviour.
+
+When GHC encounters a type family application (like ``F Int a``) in a program,
+it must often reduce it in order to complete type checking. Here is a simple
+example::
+
+  type family F a where
+    F Int            = Bool
+    F (Maybe Double) = Char
+
+  g :: F Int -> Bool
+  g = not
+
+Despite the fact that ``g``\'s type mentions ``F Int``, GHC must recognize that
+``g``\'s argument really has type ``Bool``. This is done by *reducing* ``F Int``
+to become ``Bool``. Sometimes, there is not enough information to reduce a type
+family application; we say such an application is *stuck*. Continuing this example,
+an occurrence of ``F (Maybe a)`` (for some type variable ``a``) would be stuck, as
+no equation applies.
+
+During type checking, GHC uses heuristics to determine which type family application
+to reduce next; there is no predictable ordering among different type family applications.
+The non-determinism rarely matters in practice. In most programs, type family reduction
+terminates, and so these choices are immaterial. However, if a type family application
+does not terminate, it is possible that type-checking may unpredictably diverge. (GHC
+will always take the same path for a given source program, but small changes in that
+source program may induce GHC to take a different path. Compiling a given, unchanged
+source program is still deterministic.)
+
+In order to speed up type family reduction, GHC normally uses a cache, remembering what
+type family applications it has previously reduced. This feature can be disabled with
+:ghc-flag:`-fno-family-application-cache`.
 
 .. _type-wildcards-lhs:
 
@@ -900,7 +941,7 @@ Import and export
 -----------------
 
 The rules for export lists (Haskell Report `Section
-5.2 <http://www.haskell.org/onlinereport/modules.html#sect5.2>`__) need
+5.2 <https://www.haskell.org/onlinereport/modules.html#sect5.2>`__) need
 adjustment for type families:
 
 -  The form ``T(..)``, where ``T`` is a data family, names the family
@@ -1117,7 +1158,7 @@ extension.  This extension implies ``-XTypeFamilies``.
 
 For full details on injective type families refer to Haskell Symposium
 2015 paper `Injective type families for
-Haskell <http://ics.p.lodz.pl/~stolarek/_media/pl:research:stolarek_peyton-jones_eisenberg_injectivity_extended.pdf>`__.
+Haskell <https://ics.p.lodz.pl/~stolarek/_media/pl:research:stolarek_peyton-jones_eisenberg_injectivity_extended.pdf>`__.
 
 .. _injective-ty-fams-syntax:
 

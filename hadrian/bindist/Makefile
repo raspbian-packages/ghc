@@ -1,7 +1,6 @@
 MAKEFLAGS += --no-builtin-rules
 .SUFFIXES:
 
-include mk/install.mk
 include mk/config.mk
 
 .PHONY: default
@@ -16,64 +15,45 @@ default:
 # TODO : find if a better function exists
 eq=$(and $(findstring $(1),$(2)),$(findstring $(2),$(1)))
 
-define installscript
-# $1 = package name
-# $2 = wrapper path
-# $3 = bindir
-# $4 = ghcbindir
-# $5 = Executable binary path
-# $6 = Library Directory
-# $7 = Docs Directory
-# $8 = Includes Directory
-# We are installing wrappers to programs by searching corresponding
-# wrappers. If wrapper is not found, we are attaching the common wrapper
-# to it. This implementation is a bit hacky and depends on consistency
-# of program names. For hadrian build this will work as programs have a
-# consistent naming procedure.
-	if [ -L wrappers/$1 ]; then echo "$1 is a symlink"; fi
-	@if [ -L wrappers/$1 ]; then \
-		cp -RP wrappers/$1 $2; \
-	else								 \
-		rm -f '$2' && 		 \
-		$(CREATE_SCRIPT) '$2' && \
-		echo "#!$(SHELL)" >>  '$2'  && \
-		echo "exedir=\"$4\"" >> '$2'  && \
-		echo "exeprog=\"$1\"" >> '$2'  && \
-		echo "executablename=\"$5\"" >> '$2'  && \
-		echo "bindir=\"$3\"" >> '$2'  && \
-		echo "libdir=\"$6\"" >> '$2'  && \
-		echo "docdir=\"$7\"" >> '$2'  && \
-		echo "includedir=\"$8\"" >> '$2'  && \
-		echo "" >> '$2'  && \
-		cat wrappers/$1 >> '$2'  && \
-		$(EXECUTABLE_FILE) '$2' ; \
-	fi
-	@echo "$1 installed to $2"
-endef
+# the following is the work around suggested by @carter in #17418 during install
+# time.  This should help us with code signing issues by removing extended
+# attributes from all files.
+ifeq "$(Darwin_Host)" "YES"
+XATTR ?= /usr/bin/xattr
+endif
 
+# patchpackageconf
+#
 # Hacky function to patch up the 'haddock-interfaces' and 'haddock-html'
 # fields in the package .conf files
-define patchpackageconf
 #
 # $1 = package name (ex: 'bytestring')
 # $2 = path to .conf file
 # $3 = Docs Directory
 # $4 = (relative) path from $${pkgroot} to docs directory ($3)
+# $5 = package name and version (ex: bytestring-0.13)
 #
-# We fix the paths to haddock files by using the relative path from the pkgroot
-# to the doc files.
-	cat '$2' | sed 's|haddock-interfaces.*|haddock-interfaces: "$${pkgroot}/$4/html/libraries/$1/$1.haddock"|' \
-	         | sed 's|haddock-html.*|haddock-html: "$${pkgroot}/$4/html/libraries/$1"|' \
-		 | sed 's|    $${pkgroot}/../../docs/html/.*||' \
+define patchpackageconf \
+	# We fix the paths to haddock files by using the relative path from the pkgroot
+	# to the doc files.
+	cat '$2' | sed 's|haddock-interfaces.*|haddock-interfaces: "$${pkgroot}/$4/html/libraries/$5/$1.haddock"|' \
+	         | sed 's|haddock-html.*|haddock-html: "$${pkgroot}/$4/html/libraries/$5"|' \
+		 | sed 's|    $${pkgroot}/../../doc/html/.*||' \
 	       > '$2.copy'
-# The rts package doesn't actually supply haddocks, so we stop advertising them
-# altogether.
+	# The rts package doesn't actually supply haddocks, so we stop advertising them
+	# altogether.
 	((echo "$1" | grep rts) && (cat '$2.copy' | sed 's|haddock-.*||' > '$2.copy.copy')) || (cat '$2.copy' > '$2.copy.copy')
-# We finally replace the original file.
+	# We finally replace the original file.
 	mv '$2.copy.copy' '$2'
+	# Fix the mode, in case umask is set
+	chmod 644 '$2'
 endef
 
 # QUESTION : should we use shell commands?
+
+
+show:
+	@echo '$(VALUE)="$($(VALUE))"'
 
 
 .PHONY: install
@@ -84,8 +64,8 @@ else
 install_bin: install_bin_libdir install_wrappers
 endif
 
-install: install_bin install_lib install_includes
-install: install_docs update_package_db
+install: install_bin install_lib
+install: install_man install_docs update_package_db
 
 ActualBinsDir=${ghclibdir}/bin
 ifeq "$(TargetOS_CPP)" "mingw32"
@@ -97,10 +77,11 @@ WrapperBinsDir=${bindir}
 
 # N.B. this is duplicated from includes/ghc.mk.
 lib/settings :
-	$(call removeFiles,$@)
+	@rm -f $@
 	@echo '[("GCC extra via C opts", "$(GccExtraViaCOpts)")' >> $@
 	@echo ',("C compiler command", "$(SettingsCCompilerCommand)")' >> $@
 	@echo ',("C compiler flags", "$(SettingsCCompilerFlags)")' >> $@
+	@echo ',("C++ compiler command", "$(SettingsCxxCompilerCommand)")' >> $@
 	@echo ',("C++ compiler flags", "$(SettingsCxxCompilerFlags)")' >> $@
 	@echo ',("C compiler link flags", "$(SettingsCCompilerLinkFlags)")' >> $@
 	@echo ',("C compiler supports -no-pie", "$(SettingsCCompilerSupportsNoPie)")' >> $@
@@ -117,6 +98,7 @@ lib/settings :
 	@echo ',("ar command", "$(SettingsArCommand)")' >> $@
 	@echo ',("ar flags", "$(ArArgs)")' >> $@
 	@echo ',("ar supports at file", "$(ArSupportsAtFile)")' >> $@
+	@echo ',("ar supports -L", "$(ArSupportsDashL)")' >> $@
 	@echo ',("ranlib command", "$(SettingsRanlibCommand)")' >> $@
 	@echo ',("otool command", "$(SettingsOtoolCommand)")' >> $@
 	@echo ',("install_name_tool command", "$(SettingsInstallNameToolCommand)")' >> $@
@@ -135,86 +117,125 @@ lib/settings :
 	@echo ',("target has .ident directive", "$(TargetHasIdentDirective)")' >> $@
 	@echo ',("target has subsections via symbols", "$(TargetHasSubsectionsViaSymbols)")' >> $@
 	@echo ',("target has RTS linker", "$(TargetHasRTSLinker)")' >> $@
+	@echo ',("target has libm", "$(TargetHasLibm)")' >> $@
 	@echo ',("Unregisterised", "$(GhcUnregisterised)")' >> $@
 	@echo ',("LLVM target", "$(LLVMTarget_CPP)")' >> $@
 	@echo ',("LLVM llc command", "$(SettingsLlcCommand)")' >> $@
 	@echo ',("LLVM opt command", "$(SettingsOptCommand)")' >> $@
 	@echo ',("LLVM clang command", "$(SettingsClangCommand)")' >> $@
+	@echo ',("Use inplace MinGW toolchain", "$(SettingsUseDistroMINGW)")' >> $@
 	@echo
-	@echo ',("bignum backend", "$(BIGNUM_BACKEND)")' >> $@
 	@echo ',("Use interpreter", "$(GhcWithInterpreter)")' >> $@
 	@echo ',("Support SMP", "$(GhcWithSMP)")' >> $@
 	@echo ',("RTS ways", "$(GhcRTSWays)")' >> $@
 	@echo ',("Tables next to code", "$(TablesNextToCode)")' >> $@
 	@echo ',("Leading underscore", "$(LeadingUnderscore)")' >> $@
 	@echo ',("Use LibFFI", "$(UseLibffiForAdjustors)")' >> $@
-# Note that GhcThreaded just reflects the Makefile variable setting. In
-# particular, the stage1 compiler is never actually compiled with -threaded, but
-# it will nevertheless have cGhcThreaded = True. The "+RTS --info" output will
-# show what RTS GHC is really using.
-	@echo ",(\"Use Threads\", \"$(GhcThreaded)\")" >> $@
-	@echo ",(\"Use Debugging\", \"$(GhcDebugged)\")" >> $@
-	@echo ",(\"RTS expects libdw\", \"$(GhcRtsWithLibdw)\")" >> $@
+	@echo ',("RTS expects libdw", "$(GhcRtsWithLibdw)")' >> $@
 	@echo "]" >> $@
-
-
 
 # We need to install binaries relative to libraries.
 BINARIES = $(wildcard ./bin/*)
 install_bin_libdir:
-	@echo "Copying binaries to $(ActualBinsDir)"
-	$(INSTALL_DIR) "$(ActualBinsDir)"
+	@echo "Copying binaries to $(DESTDIR)$(ActualBinsDir)"
+	$(INSTALL_DIR) "$(DESTDIR)$(ActualBinsDir)"
 	for i in $(BINARIES); do \
-		cp -R $$i "$(ActualBinsDir)"; \
+		if test -L "$$i"; then \
+			cp -RP "$$i" "$(DESTDIR)$(ActualBinsDir)"; \
+		else \
+			$(INSTALL_PROGRAM) "$$i" "$(DESTDIR)$(ActualBinsDir)"; \
+		fi; \
 	done
+	# Work around #17418 on Darwin
+	if [ -e "${XATTR}" ]; then \
+		"${XATTR}" -c -r "$(DESTDIR)$(ActualBinsDir)"; \
+	fi
 
 install_bin_direct:
-	@echo "Copying binaries to $(WrapperBinsDir)"
-	$(INSTALL_DIR) "$(WrapperBinsDir)"
-	cp ./bin/* "$(WrapperBinsDir)/"
+	@echo "Copying binaries to $(DESTDIR)$(WrapperBinsDir)"
+	$(INSTALL_DIR) "$(DESTDIR)$(WrapperBinsDir)"
+	$(INSTALL_PROGRAM) ./bin/* "$(DESTDIR)$(WrapperBinsDir)/"
 
-LIBRARIES = $(wildcard ./lib/*)
 install_lib: lib/settings
-	@echo "Copying libraries to $(ActualLibsDir)"
-	$(INSTALL_DIR) "$(ActualLibsDir)"
-	for i in $(LIBRARIES); do \
-		cp -R $$i "$(ActualLibsDir)/"; \
-	done
-
-INCLUDES = $(wildcard ./include/*)
-install_includes:
-	@echo "Copying include files to $(includedir)"
-	$(INSTALL_DIR) "$(includedir)"
-	for i in $(INCLUDES); do \
-		cp -R $$i "$(includedir)/"; \
-	done
-
-DOCS = $(wildcard ./docs/*)
-install_docs:
-	@echo "Copying docs to $(docdir)"
-	$(INSTALL_DIR) "$(docdir)"
+	@echo "Copying libraries to $(DESTDIR)$(ActualLibsDir)"
+	$(INSTALL_DIR) "$(DESTDIR)$(ActualLibsDir)"
+	
+	@dest="$(DESTDIR)$(ActualLibsDir)"; \
+	cd lib; \
+	for i in `$(FIND) . -type f`; do \
+		$(INSTALL_DIR) "$$dest/`dirname $$i`" ; \
+		case $$i in \
+		  *.a) \
+		    $(INSTALL_DATA) $$i "$$dest/`dirname $$i`" ; \
+		    $(RANLIB_CMD) "$$dest"/$$i ;; \
+		  *.dll) \
+		    $(INSTALL_PROGRAM) $$i "$$dest/`dirname $$i`" ; \
+		    $(STRIP_CMD) "$$dest"/$$i ;; \
+		  *.so) \
+		    $(INSTALL_SHLIB) $$i "$$dest/`dirname $$i`" ;; \
+		  *.dylib) \
+		    $(INSTALL_SHLIB) $$i "$$dest/`dirname $$i`" ;; \
+		  *) \
+		    $(INSTALL_DATA) $$i "$$dest/`dirname $$i`" ;; \
+		esac; \
+	done; \
+	chmod ugo+rx "$$dest"/bin/*
 	for i in $(DOCS); do \
-		cp -R $$i "$(docdir)/"; \
+		cp -R $$i "$(DESTDIR)$(docdir)/"; \
 	done
+	# Work around #17418 on Darwin
+	if [ -e "${XATTR}" ]; then \
+		"${XATTR}" -c -r "$(DESTDIR)$(ActualLibsDir)"; \
+	fi
 
-BINARY_NAMES=$(shell ls ./wrappers/)
+install_docs:
+	@echo "Copying docs to $(DESTDIR)$(docdir)"
+	$(INSTALL_DIR) "$(DESTDIR)$(docdir)"
+
+	if [ -d doc ]; then \
+		cd doc; $(FIND) . -type f -exec sh -c \
+			'$(INSTALL_DIR) "$(DESTDIR)$(docdir)/`dirname $$1`" && $(INSTALL_DATA) "$$1" "$(DESTDIR)$(docdir)/`dirname $$1`"' \
+			sh '{}' ';'; \
+	fi
+
+	if [ -d docs-utils ]; then \
+		$(INSTALL_DIR) "$(DESTDIR)$(docdir)/html/libraries/"; \
+		$(INSTALL_DATA) docs-utils/prologue.txt "$(DESTDIR)$(docdir)/html/libraries/"; \
+		$(INSTALL_SCRIPT) docs-utils/gen_contents_index "$(DESTDIR)$(docdir)/html/libraries/"; \
+	fi
+
+MAN_SECTION := 1
+MAN_PAGES := doc/users_guide/build-man/ghc.1
+
+.PHONY: install_man
+install_man:
+	if [ -f $(MAN_PAGES) ]; then \
+		$(INSTALL_DIR) "$(DESTDIR)$(mandir)"; \
+		$(INSTALL_DIR) "$(DESTDIR)$(mandir)/man$(MAN_SECTION)"; \
+		$(INSTALL_MAN) $(INSTALL_OPTS) $(MAN_PAGES) "$(DESTDIR)$(mandir)/man$(MAN_SECTION)"; \
+	fi
+
+export SHELL
 install_wrappers: install_bin_libdir
 	@echo "Installing wrapper scripts"
-	$(INSTALL_DIR) "$(WrapperBinsDir)"
-	$(foreach p, $(BINARY_NAMES),\
-		$(call installscript,$p,$(WrapperBinsDir)/$p,$(WrapperBinsDir),$(ActualBinsDir),$(ActualBinsDir)/$p,$(ActualLibsDir),$(docdir),$(includedir)))
+	$(INSTALL_DIR) "$(DESTDIR)$(WrapperBinsDir)"
+	for p in `cd wrappers; $(FIND) . ! -type d`; do \
+	    mk/install_script.sh "$$p" "$(DESTDIR)/$(WrapperBinsDir)/$$p" "$(WrapperBinsDir)" "$(ActualBinsDir)" "$(ActualBinsDir)/$$p" "$(ActualLibsDir)" "$(docdir)" "$(includedir)"; \
+	done
 
-PKG_CONFS = $(shell find "$(ActualLibsDir)/package.conf.d" -name '*.conf' | sed 's:   :xxx:g')
+PKG_CONFS = $(shell find "$(DESTDIR)$(ActualLibsDir)/package.conf.d" -name '*.conf' | sed "s:   :\0xxx\0:g")
 update_package_db: install_bin install_lib
-	@echo "$(PKG_CONFS)"
+	@echo "Installing C++ standard library virtual package"
+	$(INSTALL_DATA) mk/system-cxx-std-lib-1.0.conf "$(DESTDIR)$(ActualLibsDir)/package.conf.d"
 	@echo "Updating the package DB"
 	$(foreach p, $(PKG_CONFS),\
-		$(call patchpackageconf,$(shell echo $(notdir $p) | sed 's/-\([0-9]*[0-9]\.\)*conf//g'),$(shell echo "$p" | sed 's:xxx:   :g'),$(docdir),$(shell mk/relpath.sh "$(ActualLibsDir)" "$(docdir)")))
-	'$(WrapperBinsDir)/$(CrossCompilePrefix)ghc-pkg' recache
+		$(call patchpackageconf,$(shell echo $(notdir $p) | sed 's/-\([0-9]*[0-9]\.\)*conf//g'),$(shell echo "$p" | sed 's:\0xxx\0:   :g'),$(docdir),$(shell realpath -z --relative-to="$(ActualLibsDir)" "$(docdir)"),$(shell echo $(notdir $p) | sed 's/.conf//g')))
+	'$(DESTDIR)$(ActualBinsDir)/$(CrossCompilePrefix)ghc-pkg' --global-package-db "$(DESTDIR)$(ActualLibsDir)/package.conf.d" recache
 
 install_mingw:
 	@echo "Installing MingGW"
-	$(INSTALL_DIR) "$(prefix)/mingw"
-	cp -R ./mingw "$(prefix)"
+	$(INSTALL_DIR) "$(DESTDIR)$(prefix)/mingw"
+	cp -Rp ./mingw "$(DESTDIR)$(prefix)"
+
 # END INSTALL
 # ----------------------------------------------------------------------

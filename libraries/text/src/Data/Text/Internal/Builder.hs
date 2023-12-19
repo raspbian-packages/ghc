@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns, CPP, Rank2Types #-}
+{-# LANGUAGE BangPatterns, CPP, RankNTypes #-}
 {-# OPTIONS_HADDOCK not-home #-}
 
 -----------------------------------------------------------------------------
@@ -108,6 +108,11 @@ instance Monoid Builder where
    mconcat = foldr mappend Data.Monoid.mempty
    {-# INLINE mconcat #-}
 
+-- | Performs replacement on invalid scalar values:
+--
+-- >>> :set -XOverloadedStrings
+-- >>> "\55555" :: Builder
+-- "\65533"
 instance String.IsString Builder where
     fromString = fromString
     {-# INLINE fromString #-}
@@ -140,7 +145,7 @@ singleton ::
   HasCallStack =>
 #endif
   Char -> Builder
-singleton c = writeAtMost 2 $ \ marr o -> unsafeWrite marr o (safe c)
+singleton c = writeAtMost 4 $ \ marr o -> unsafeWrite marr o (safe c)
 {-# INLINE singleton #-}
 
 ------------------------------------------------------------------------
@@ -168,7 +173,7 @@ copyLimit = 128
 fromText :: S.Text -> Builder
 fromText t@(Text arr off l)
     | S.null t       = empty
-    | l <= copyLimit = writeN l $ \marr o -> A.copyI marr o arr off (l+o)
+    | l <= copyLimit = writeN l $ \marr o -> A.copyI l marr o arr off
     | otherwise      = flush `append` mapBuilder (t :)
 {-# INLINE [1] fromText #-}
 
@@ -181,11 +186,18 @@ fromText t@(Text arr off l)
 --
 --  * @'toLazyText' ('fromString' s) = 'L.fromChunks' [S.pack s]@
 --
+-- Performs replacement on invalid scalar values:
+--
+-- >>> fromString "\55555"
+-- "\65533"
+--
+-- @since 1.2.0.0
 fromString :: String -> Builder
 fromString str = Builder $ \k (Buffer p0 o0 u0 l0) ->
     let loop !marr !o !u !l [] = k (Buffer marr o u l)
         loop marr o u l s@(c:cs)
-            | l <= 1 = do
+            | l <= 3 = do
+                A.shrinkM marr (o + u)
                 arr <- A.unsafeFreeze marr
                 let !t = Text arr o u
                 marr' <- A.new chunkSize

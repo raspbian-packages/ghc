@@ -5,23 +5,28 @@
 
 -}
 {-# LANGUAGE DeriveFunctor #-}
-
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE UnboxedSums #-}
+{-# LANGUAGE UnboxedTuples #-}
 
 -- | Provide trees (of instructions), so that lists of instructions can be
 -- appended in linear time.
 module GHC.Data.OrdList (
-        OrdList,
+        OrdList, pattern NilOL, pattern ConsOL, pattern SnocOL,
         nilOL, isNilOL, unitOL, appOL, consOL, snocOL, concatOL, lastOL,
         headOL,
-        mapOL, fromOL, toOL, foldrOL, foldlOL, reverseOL, fromOLReverse,
+        mapOL, mapOL', fromOL, toOL, foldrOL, foldlOL, reverseOL, fromOLReverse,
         strictlyEqOL, strictlyOrdOL
 ) where
 
 import GHC.Prelude
 import Data.Foldable
 
+import GHC.Utils.Misc (strictMap)
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
 
 import qualified Data.Semigroup as Semigroup
 
@@ -78,6 +83,50 @@ snocOL as   b    = Snoc as b
 consOL a    bs   = Cons a bs
 concatOL aas = foldr appOL None aas
 
+pattern NilOL :: OrdList a
+pattern NilOL <- (isNilOL -> True) where
+  NilOL = None
+
+-- | An unboxed 'Maybe' type with two unboxed fields in the 'Just' case.
+-- Useful for defining 'viewCons' and 'viewSnoc' without overhead.
+type VMaybe a b = (# (# a, b #) | (# #) #)
+pattern VJust :: a -> b -> VMaybe a b
+pattern VJust a b = (# (# a, b #) | #)
+pattern VNothing :: VMaybe a b
+pattern VNothing = (# | (# #) #)
+{-# COMPLETE VJust, VNothing #-}
+
+pattern ConsOL :: a -> OrdList a -> OrdList a
+pattern ConsOL x xs <- (viewCons -> VJust x xs) where
+  ConsOL x xs = consOL x xs
+{-# COMPLETE NilOL, ConsOL #-}
+viewCons :: OrdList a -> VMaybe a (OrdList a)
+viewCons (One a)       = VJust a NilOL
+viewCons (Cons a as) = VJust a as
+viewCons (Snoc as a) = case viewCons as of
+  VJust a' as' -> VJust a' (Snoc as' a)
+  VNothing     -> VJust a NilOL
+viewCons (Two as1 as2) = case viewCons as1 of
+  VJust a' as1' -> VJust a' (Two as1' as2)
+  VNothing      -> viewCons as2
+viewCons _ = VNothing
+
+pattern SnocOL :: OrdList a -> a -> OrdList a
+pattern SnocOL xs x <- (viewSnoc -> VJust xs x) where
+  SnocOL xs x = snocOL xs x
+{-# COMPLETE NilOL, SnocOL #-}
+viewSnoc :: OrdList a -> VMaybe (OrdList a) a
+viewSnoc (One a)       = VJust NilOL a
+viewSnoc (Many (reverse -> a:as)) = VJust (Many (reverse as)) a
+viewSnoc (Snoc as a) = VJust as a
+viewSnoc (Cons a as) = case viewSnoc as of
+  VJust as' a' -> VJust (Cons a as') a'
+  VNothing     -> VJust NilOL a
+viewSnoc (Two as1 as2) = case viewSnoc as2 of
+  VJust as2' a' -> VJust (Two as1 as2') a'
+  VNothing      -> viewSnoc as1
+viewSnoc _ = VNothing
+
 headOL None        = panic "headOL"
 headOL (One a)     = a
 headOL (Many as)   = head as
@@ -130,6 +179,20 @@ fromOLReverse a = go a []
 
 mapOL :: (a -> b) -> OrdList a -> OrdList b
 mapOL = fmap
+
+mapOL' :: (a->b) -> OrdList a -> OrdList b
+mapOL' _ None        = None
+mapOL' f (One x)     = One $! f x
+mapOL' f (Cons x xs) = let !x1 = f x
+                           !xs1 = mapOL' f xs
+                       in Cons x1 xs1
+mapOL' f (Snoc xs x) = let !x1 = f x
+                           !xs1 = mapOL' f xs
+                       in Snoc xs1 x1
+mapOL' f (Two b1 b2) = let !b1' = mapOL' f b1
+                           !b2' = mapOL' f b2
+                       in Two b1' b2'
+mapOL' f (Many xs)   = Many $! strictMap f xs
 
 foldrOL :: (a->b->b) -> b -> OrdList a -> b
 foldrOL _ z None        = z
@@ -188,5 +251,3 @@ strictlyOrdOL (Two a1 a2) (Two b1 b2) =
 strictlyOrdOL (Two _ _)    _          = LT
 strictlyOrdOL (Many as)   (Many bs)   = compare as bs
 strictlyOrdOL (Many _ )   _           = GT
-
-

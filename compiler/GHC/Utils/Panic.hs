@@ -4,34 +4,54 @@
 
 -}
 
-{-# LANGUAGE CPP, ScopedTypeVariables, LambdaCase #-}
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE ScopedTypeVariables, LambdaCase #-}
 
 -- | Defines basic functions for printing error messages.
 --
 -- It's hard to put these functions anywhere else without causing
 -- some unnecessary loops in the module dependency graph.
-module GHC.Utils.Panic (
-     GhcException(..), showGhcException,
-     throwGhcException, throwGhcExceptionIO,
-     handleGhcException,
-     GHC.Utils.Panic.Plain.progName,
-     pgmError,
+module GHC.Utils.Panic
+   ( GhcException(..)
+   , showGhcException
+   , showGhcExceptionUnsafe
+   , throwGhcException
+   , throwGhcExceptionIO
+   , handleGhcException
 
-     panic, sorry, assertPanic, trace,
-     panicDoc, sorryDoc, pgmErrorDoc,
+   , pgmError
+   , panic
+   , pprPanic
+   , assertPanic
+   , assertPprPanic
+   , assertPpr
+   , assertPprM
+   , massertPpr
+   , sorry
+   , panicDoc
+   , sorryDoc
+   , pgmErrorDoc
+   , cmdLineError
+   , cmdLineErrorIO
+   , callStackDoc
+   , prettyCallStackDoc
 
-     cmdLineError, cmdLineErrorIO,
-
-     Exception.Exception(..), showException, safeShowException,
-     try, tryMost, throwTo,
-
-     withSignalHandlers,
-) where
+   , Exception.Exception(..)
+   , showException
+   , safeShowException
+   , try
+   , tryMost
+   , throwTo
+   , withSignalHandlers
+   )
+where
 
 import GHC.Prelude
+import GHC.Stack
 
-import {-# SOURCE #-} GHC.Utils.Outputable (SDoc, showSDocUnsafe)
+import GHC.Utils.Outputable
 import GHC.Utils.Panic.Plain
+import GHC.Utils.Constants
 
 import GHC.Utils.Exception as Exception
 
@@ -39,7 +59,6 @@ import Control.Monad.IO.Class
 import qualified Control.Monad.Catch as MC
 import Control.Concurrent
 import Data.Typeable      ( cast )
-import Debug.Trace        ( trace )
 import System.IO.Unsafe
 
 #if !defined(mingw32_HOST_OS)
@@ -105,9 +124,7 @@ instance Exception GhcException where
     | otherwise = Nothing
 
 instance Show GhcException where
-  showsPrec _ e@(ProgramError _) = showGhcException e
-  showsPrec _ e@(CmdLineError _) = showString "<command line>: " . showGhcException e
-  showsPrec _ e = showString progName . showString ": " . showGhcException e
+  showsPrec _ e = showGhcExceptionUnsafe e
 
 -- | Show an exception as a string.
 showException :: Exception e => e -> String
@@ -128,12 +145,14 @@ safeShowException e = do
 
 -- | Append a description of the given exception to this string.
 --
--- Note that this uses 'GHC.Driver.Session.unsafeGlobalDynFlags', which may have some
--- uninitialized fields if invoked before 'GHC.initGhcMonad' has been called.
--- If the error message to be printed includes a pretty-printer document
--- which forces one of these fields this call may bottom.
-showGhcException :: GhcException -> ShowS
-showGhcException = showPlainGhcException . \case
+-- Note that this uses 'defaultSDocContext', which doesn't use the options
+-- set by the user via DynFlags.
+showGhcExceptionUnsafe :: GhcException -> ShowS
+showGhcExceptionUnsafe = showGhcException defaultSDocContext
+
+-- | Append a description of the given exception to this string.
+showGhcException :: SDocContext -> GhcException -> ShowS
+showGhcException ctx = showPlainGhcException . \case
   Signal n -> PlainSignal n
   UsageError str -> PlainUsageError str
   CmdLineError str -> PlainCmdLineError str
@@ -143,11 +162,11 @@ showGhcException = showPlainGhcException . \case
   ProgramError str -> PlainProgramError str
 
   PprPanic str sdoc -> PlainPanic $
-      concat [str, "\n\n", showSDocUnsafe sdoc]
+      concat [str, "\n\n", renderWithContext ctx sdoc]
   PprSorry str sdoc -> PlainProgramError $
-      concat [str, "\n\n", showSDocUnsafe sdoc]
+      concat [str, "\n\n", renderWithContext ctx sdoc]
   PprProgramError str sdoc -> PlainProgramError $
-      concat [str, "\n\n", showSDocUnsafe sdoc]
+      concat [str, "\n\n", renderWithContext ctx sdoc]
 
 throwGhcException :: GhcException -> a
 throwGhcException = Exception.throw
@@ -158,9 +177,20 @@ throwGhcExceptionIO = Exception.throwIO
 handleGhcException :: ExceptionMonad m => (GhcException -> m a) -> m a -> m a
 handleGhcException = MC.handle
 
-panicDoc, sorryDoc, pgmErrorDoc :: String -> SDoc -> a
-panicDoc    x doc = throwGhcException (PprPanic        x doc)
-sorryDoc    x doc = throwGhcException (PprSorry        x doc)
+-- | Throw an exception saying "bug in GHC" with a callstack
+pprPanic :: HasCallStack => String -> SDoc -> a
+pprPanic s doc = panicDoc s (doc $$ callStackDoc)
+
+-- | Throw an exception saying "bug in GHC"
+panicDoc :: String -> SDoc -> a
+panicDoc x doc = throwGhcException (PprPanic x doc)
+
+-- | Throw an exception saying "this isn't finished yet"
+sorryDoc :: String -> SDoc -> a
+sorryDoc x doc = throwGhcException (PprSorry x doc)
+
+-- | Throw an exception saying "bug in pgm being compiled" (used for unusual program errors)
+pgmErrorDoc :: String -> SDoc -> a
 pgmErrorDoc x doc = throwGhcException (PprProgramError x doc)
 
 -- | Like try, but pass through UserInterrupt and Panic exceptions.
@@ -258,3 +288,32 @@ withSignalHandlers act = do
 
   mayInstallHandlers
   act `MC.finally` mayUninstallHandlers
+
+callStackDoc :: HasCallStack => SDoc
+callStackDoc = prettyCallStackDoc callStack
+
+prettyCallStackDoc :: CallStack -> SDoc
+prettyCallStackDoc cs =
+    hang (text "Call stack:")
+       4 (vcat $ map text $ lines (prettyCallStack cs))
+
+-- | Panic with an assertion failure, recording the given file and
+-- line number. Should typically be accessed with the ASSERT family of macros
+assertPprPanic :: HasCallStack => SDoc -> a
+assertPprPanic msg = withFrozenCallStack (pprPanic "ASSERT failed!" msg)
+
+
+assertPpr :: HasCallStack => Bool -> SDoc -> a -> a
+{-# INLINE assertPpr #-}
+assertPpr cond msg a =
+  if debugIsOn && not cond
+    then withFrozenCallStack (assertPprPanic msg)
+    else a
+
+massertPpr :: (HasCallStack, Applicative m) => Bool -> SDoc -> m ()
+{-# INLINE massertPpr #-}
+massertPpr cond msg = withFrozenCallStack (assertPpr cond msg (pure ()))
+
+assertPprM :: (HasCallStack, Monad m) => m Bool -> SDoc -> m ()
+{-# INLINE assertPprM #-}
+assertPprM mcond msg = withFrozenCallStack (mcond >>= \cond -> massertPpr cond msg)

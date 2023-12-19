@@ -30,7 +30,7 @@ $(call all-target,$1,)
 .PHONY: html_$1
 ifeq "$$(phase)" "final"
 ifeq "$$(BUILD_SPHINX_HTML)" "YES"
-docs: html_$1
+$(call all-target,$1,html_$1)
 INSTALL_HTML_DOC_DIRS += $1/build-html/$2
 endif
 endif
@@ -47,7 +47,7 @@ endif
 .PHONY: pdf_$1
 ifeq "$$(phase)" "final"
 ifeq "$$(BUILD_SPHINX_PDF)" "YES"
-docs: pdf_$1
+$(call all-target,$1,pdf_$1)
 INSTALL_DOCS += $1/$2.pdf
 endif
 endif
@@ -66,7 +66,7 @@ $1/$2.pdf: $1/conf.py $$($1_RST_SOURCES)
 	cd $1/build-pdf/$2 ; $(XELATEX) -halt-on-error $2.tex 2>/dev/null >/dev/null || true
 	cd $1/build-pdf/$2 ; $(XELATEX) -halt-on-error $2.tex 2>/dev/null >/dev/null || true
 	cd $1/build-pdf/$2 ; $(XELATEX) -halt-on-error $2.tex 2>/dev/null >/dev/null || true
-	cd $1/build-pdf/$2 ; $(MAKEINDEX) $2.idx
+	cd $1/build-pdf/$2 ; $(MAKEINDEX) -s python.ist $2.idx
 	cd $1/build-pdf/$2 ; $(XELATEX) -halt-on-error $2.tex 2>/dev/null >/dev/null || true
 	cd $1/build-pdf/$2 ; $(XELATEX) -halt-on-error $2.tex
 	cp $1/build-pdf/$2/$2.pdf $1/$2.pdf

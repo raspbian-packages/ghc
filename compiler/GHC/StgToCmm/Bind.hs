@@ -14,8 +14,17 @@ module GHC.StgToCmm.Bind (
   ) where
 
 import GHC.Prelude hiding ((<*>))
-import GHC.Platform
 
+import GHC.Core          ( AltCon(..) )
+import GHC.Runtime.Heap.Layout
+import GHC.Unit.Module
+
+import GHC.Stg.Syntax
+
+import GHC.Platform
+import GHC.Platform.Profile
+
+import GHC.StgToCmm.Config
 import GHC.StgToCmm.Expr
 import GHC.StgToCmm.Monad
 import GHC.StgToCmm.Env
@@ -23,6 +32,7 @@ import GHC.StgToCmm.DataCon
 import GHC.StgToCmm.Heap
 import GHC.StgToCmm.Prof (ldvEnterClosure, enterCostCentreFun, enterCostCentreThunk,
                    initUpdFrameProf)
+import GHC.StgToCmm.TagCheck
 import GHC.StgToCmm.Ticky
 import GHC.StgToCmm.Layout
 import GHC.StgToCmm.Utils
@@ -30,26 +40,27 @@ import GHC.StgToCmm.Closure
 import GHC.StgToCmm.Foreign    (emitPrimCall)
 
 import GHC.Cmm.Graph
-import GHC.Core          ( AltCon(..), tickishIsCode )
 import GHC.Cmm.BlockId
-import GHC.Runtime.Heap.Layout
 import GHC.Cmm
 import GHC.Cmm.Info
 import GHC.Cmm.Utils
 import GHC.Cmm.CLabel
-import GHC.Stg.Syntax
+
+import GHC.Stg.Utils
 import GHC.Types.CostCentre
 import GHC.Types.Id
 import GHC.Types.Id.Info
 import GHC.Types.Name
-import GHC.Unit.Module
-import GHC.Data.List.SetOps
-import GHC.Utils.Misc
 import GHC.Types.Var.Set
 import GHC.Types.Basic
+import GHC.Types.Tickish ( tickishIsCode )
+
+import GHC.Utils.Misc
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
+
 import GHC.Data.FastString
-import GHC.Driver.Session
+import GHC.Data.List.SetOps
 
 import Control.Monad
 
@@ -60,7 +71,7 @@ import Control.Monad
 -- For closures bound at top level, allocate in static space.
 -- They should have no free variables.
 
-cgTopRhsClosure :: DynFlags
+cgTopRhsClosure :: Platform
                 -> RecFlag              -- member of a recursive group?
                 -> Id
                 -> CostCentreStack      -- Optional cost centre annotation
@@ -69,12 +80,11 @@ cgTopRhsClosure :: DynFlags
                 -> CgStgExpr
                 -> (CgIdInfo, FCode ())
 
-cgTopRhsClosure dflags rec id ccs upd_flag args body =
-  let platform      = targetPlatform dflags
-      closure_label = mkLocalClosureLabel (idName id) (idCafInfo id)
-      cg_id_info    = litIdInfo dflags id lf_info (CmmLabel closure_label)
+cgTopRhsClosure platform rec id ccs upd_flag args body =
+  let closure_label = mkClosureLabel (idName id) (idCafInfo id)
+      cg_id_info    = litIdInfo platform id lf_info (CmmLabel closure_label)
       lf_info       = mkClosureLFInfo platform id TopLevel [] upd_flag args
-  in (cg_id_info, gen_code dflags lf_info closure_label)
+  in (cg_id_info, gen_code lf_info closure_label)
   where
   -- special case for a indirection (f = g).  We create an IND_STATIC
   -- closure pointing directly to the indirectee.  This is exactly
@@ -82,24 +92,25 @@ cgTopRhsClosure dflags rec id ccs upd_flag args body =
   -- shortcutting the whole process, and generating a lot less code
   -- (#7308). Eventually the IND_STATIC closure will be eliminated
   -- by assembly '.equiv' directives, where possible (#15155).
-  -- See note [emit-time elimination of static indirections] in "GHC.Cmm.CLabel".
+  -- See Note [emit-time elimination of static indirections] in "GHC.Cmm.CLabel".
   --
   -- Note: we omit the optimisation when this binding is part of a
   -- recursive group, because the optimisation would inhibit the black
   -- hole detection from working in that case.  Test
   -- concurrent/should_run/4030 fails, for instance.
   --
-  gen_code _ _ closure_label
+  gen_code _ closure_label
     | StgApp f [] <- body, null args, isNonRec rec
     = do
          cg_info <- getCgIdInfo f
          emitDataCon closure_label indStaticInfoTable ccs [unLit (idInfoToAmode cg_info)]
 
-  gen_code dflags lf_info _closure_label
-   = do { let name = idName id
+  gen_code lf_info _closure_label
+   = do { profile <- getProfile
+        ; let name = idName id
         ; mod_name <- getModuleName
-        ; let descr         = closureDescription dflags mod_name name
-              closure_info  = mkClosureInfo dflags True id lf_info 0 0 descr
+        ; let descr         = closureDescription mod_name name
+              closure_info  = mkClosureInfo profile True id lf_info 0 0 descr
 
         -- We don't generate the static closure here, because we might
         -- want to add references to static closures to it later.  The
@@ -108,7 +119,7 @@ cgTopRhsClosure dflags rec id ccs upd_flag args body =
 
         ; let fv_details :: [(NonVoid Id, ByteOff)]
               header = if isLFThunk lf_info then ThunkHeader else StdHeader
-              (_, _, fv_details) = mkVirtHeapOffsets dflags header []
+              (_, _, fv_details) = mkVirtHeapOffsets profile header []
         -- Don't drop the non-void args until the closure info has been made
         ; forkClosureBody (closureCodeBody True id closure_info ccs
                                 args body fv_details)
@@ -138,7 +149,7 @@ cgBind (StgRec pairs)
         ;  emit (catAGraphs inits <*> body) }
 
 {- Note [cgBind rec]
-
+   ~~~~~~~~~~~~~~~~~
    Recursive let-bindings are tricky.
    Consider the following pseudocode:
 
@@ -200,22 +211,29 @@ cgRhs :: Id
                                   -- (see above)
                )
 
-cgRhs id (StgRhsCon cc con args)
-  = withNewTickyCounterCon (idName id) con $
-    buildDynCon id True cc con (assertNonVoidStgArgs args)
+cgRhs id (StgRhsCon cc con mn _ts args)
+  = withNewTickyCounterCon id con mn $
+    buildDynCon id mn True cc con (assertNonVoidStgArgs args)
       -- con args are always non-void,
       -- see Note [Post-unarisation invariants] in GHC.Stg.Unarise
 
 {- See Note [GC recovery] in "GHC.StgToCmm.Closure" -}
 cgRhs id (StgRhsClosure fvs cc upd_flag args body)
-  = do dflags <- getDynFlags
-       mkRhsClosure dflags id cc (nonVoidIds (dVarSetElems fvs)) upd_flag args body
+  = do
+    checkFunctionArgTags (text "TagCheck Failed: Rhs of" <> ppr id) id args
+    profile <- getProfile
+    check_tags <- stgToCmmDoTagCheck <$> getStgToCmmConfig
+    use_std_ap_thunk <- stgToCmmTickyAP <$> getStgToCmmConfig
+    mkRhsClosure profile use_std_ap_thunk check_tags id cc (nonVoidIds (dVarSetElems fvs)) upd_flag args body
 
 ------------------------------------------------------------------------
 --              Non-constructor right hand sides
 ------------------------------------------------------------------------
 
-mkRhsClosure :: DynFlags -> Id -> CostCentreStack
+mkRhsClosure :: Profile
+             -> Bool                            -- Omit AP Thunks to improve profiling
+             -> Bool                            -- Lint tag inference checks
+             -> Id -> CostCentreStack
              -> [NonVoid Id]                    -- Free vars
              -> UpdateFlag
              -> [Id]                            -- Args
@@ -257,8 +275,8 @@ for semi-obvious reasons.
 
 -}
 
----------- Note [Selectors] ------------------
-mkRhsClosure    dflags bndr _cc
+---------- See Note [Selectors] ------------------
+mkRhsClosure    profile _ _check_tags bndr _cc
                 [NonVoid the_fv]                -- Just one free var
                 upd_flag                -- Updatable thunk
                 []                      -- A thunk
@@ -267,19 +285,21 @@ mkRhsClosure    dflags bndr _cc
   , StgCase (StgApp scrutinee [{-no args-}])
          _   -- ignore bndr
          (AlgAlt _)
-         [(DataAlt _, params, sel_expr)] <- strip expr
+         [GenStgAlt{ alt_con   = DataAlt _
+                   , alt_bndrs = params
+                   , alt_rhs   = sel_expr}] <- strip expr
   , StgApp selectee [{-no args-}] <- strip sel_expr
   , the_fv == scrutinee                -- Scrutinee is the only free variable
 
-  , let (_, _, params_w_offsets) = mkVirtConstrOffsets dflags (addIdReps (assertNonVoidIds params))
+  , let (_, _, params_w_offsets) = mkVirtConstrOffsets profile (addIdReps (assertNonVoidIds params))
                                    -- pattern binders are always non-void,
                                    -- see Note [Post-unarisation invariants] in GHC.Stg.Unarise
   , Just the_offset <- assocMaybe params_w_offsets (NonVoid selectee)
 
-  , let offset_into_int = bytesToWordsRoundUp (targetPlatform dflags) the_offset
-                          - fixedHdrSizeW dflags
-  , offset_into_int <= mAX_SPEC_SELECTEE_SIZE dflags -- Offset is small enough
-  = -- NOT TRUE: ASSERT(is_single_constructor)
+  , let offset_into_int = bytesToWordsRoundUp (profilePlatform profile) the_offset
+                          - fixedHdrSizeW profile
+  , offset_into_int <= pc_MAX_SPEC_SELECTEE_SIZE (profileConstants profile) -- Offset is small enough
+  = -- NOT TRUE: assert (is_single_constructor)
     -- The simplifier may have statically determined that the single alternative
     -- is the only possible case and eliminated the others, even if there are
     -- other constructors in the datatype.  It's still ok to make a selector
@@ -290,8 +310,8 @@ mkRhsClosure    dflags bndr _cc
     let lf_info = mkSelectorLFInfo bndr offset_into_int (isUpdatable upd_flag)
     in cgRhsStdThunk bndr lf_info [StgVarArg the_fv]
 
----------- Note [Ap thunks] ------------------
-mkRhsClosure    dflags bndr _cc
+---------- See Note [Ap thunks] ------------------
+mkRhsClosure    profile use_std_ap check_tags bndr _cc
                 fvs
                 upd_flag
                 []                      -- No args; a thunk
@@ -300,20 +320,21 @@ mkRhsClosure    dflags bndr _cc
   -- We are looking for an "ApThunk"; see data con ApThunk in GHC.StgToCmm.Closure
   -- of form (x1 x2 .... xn), where all the xi are locals (not top-level)
   -- So the xi will all be free variables
-  | args `lengthIs` (n_fvs-1)  -- This happens only if the fun_id and
+  | use_std_ap
+  , args `lengthIs` (n_fvs-1)  -- This happens only if the fun_id and
                                -- args are all distinct local variables
                                -- The "-1" is for fun_id
     -- Missed opportunity:   (f x x) is not detected
   , all (isGcPtrRep . idPrimRep . fromNonVoid) fvs
   , isUpdatable upd_flag
-  , n_fvs <= mAX_SPEC_AP_SIZE dflags
-  , not (sccProfilingEnabled dflags)
+  , n_fvs <= pc_MAX_SPEC_AP_SIZE (profileConstants profile)
+  , not (profileIsProfiling profile)
                          -- not when profiling: we don't want to
                          -- lose information about this particular
                          -- thunk (e.g. its type) (#949)
   , idArity fun_id == unknownArity -- don't spoil a known call
-
           -- Ha! an Ap thunk
+  , not check_tags -- See Note [Tag inference debugging]
   = cgRhsStdThunk bndr lf_info payload
 
   where
@@ -324,12 +345,11 @@ mkRhsClosure    dflags bndr _cc
     payload = StgVarArg fun_id : args
 
 ---------- Default case ------------------
-mkRhsClosure dflags bndr cc fvs upd_flag args body
-  = do  { let lf_info = mkClosureLFInfo platform bndr NotTopLevel fvs upd_flag args
+mkRhsClosure profile _use_ap _check_tags bndr cc fvs upd_flag args body
+  = do  { let lf_info = mkClosureLFInfo (profilePlatform profile) bndr NotTopLevel fvs upd_flag args
         ; (id_info, reg) <- rhsIdInfo bndr lf_info
         ; return (id_info, gen_code lf_info reg) }
  where
- platform = targetPlatform dflags
  gen_code lf_info reg
   = do  {       -- LAY OUT THE OBJECT
         -- If the binder is itself a free variable, then don't store
@@ -341,15 +361,18 @@ mkRhsClosure dflags bndr cc fvs upd_flag args body
         -- Node points to it...
         ; let   reduced_fvs = filter (NonVoid bndr /=) fvs
 
+        ; profile <- getProfile
+        ; let platform = profilePlatform profile
+
         -- MAKE CLOSURE INFO FOR THIS CLOSURE
         ; mod_name <- getModuleName
         ; let   name  = idName bndr
-                descr = closureDescription dflags mod_name name
+                descr = closureDescription mod_name name
                 fv_details :: [(NonVoid Id, ByteOff)]
                 header = if isLFThunk lf_info then ThunkHeader else StdHeader
                 (tot_wds, ptr_wds, fv_details)
-                   = mkVirtHeapOffsets dflags header (addIdReps reduced_fvs)
-                closure_info = mkClosureInfo dflags False       -- Not static
+                   = mkVirtHeapOffsets profile header (addIdReps reduced_fvs)
+                closure_info = mkClosureInfo profile False       -- Not static
                                              bndr lf_info tot_wds ptr_wds
                                              descr
 
@@ -371,7 +394,7 @@ mkRhsClosure dflags bndr cc fvs upd_flag args body
                                          (map toVarArg fv_details)
 
         -- RETURN
-        ; return (mkRhsInit dflags reg lf_info hp_plus_n) }
+        ; return (mkRhsInit platform reg lf_info hp_plus_n) }
 
 -------------------------
 cgRhsStdThunk
@@ -386,18 +409,20 @@ cgRhsStdThunk bndr lf_info payload
        }
  where
  gen_code reg  -- AHA!  A STANDARD-FORM THUNK
-  = withNewTickyCounterStdThunk (lfUpdatable lf_info) (idName bndr) $
+  = withNewTickyCounterStdThunk (lfUpdatable lf_info) (bndr) payload $
     do
   {     -- LAY OUT THE OBJECT
     mod_name <- getModuleName
-  ; dflags <- getDynFlags
-  ; let header = if isLFThunk lf_info then ThunkHeader else StdHeader
+  ; profile  <- getProfile
+  ; platform <- getPlatform
+  ; let
+        header = if isLFThunk lf_info then ThunkHeader else StdHeader
         (tot_wds, ptr_wds, payload_w_offsets)
-            = mkVirtHeapOffsets dflags header
+            = mkVirtHeapOffsets profile header
                 (addArgReps (nonVoidStgArgs payload))
 
-        descr = closureDescription dflags mod_name (idName bndr)
-        closure_info = mkClosureInfo dflags False       -- Not static
+        descr = closureDescription mod_name (idName bndr)
+        closure_info = mkClosureInfo profile False       -- Not static
                                      bndr lf_info tot_wds ptr_wds
                                      descr
 
@@ -411,7 +436,7 @@ cgRhsStdThunk bndr lf_info payload
                                    use_cc blame_cc payload_w_offsets
 
         -- RETURN
-  ; return (mkRhsInit dflags reg lf_info hp_plus_n) }
+  ; return (mkRhsInit platform reg lf_info hp_plus_n) }
 
 
 mkClosureLFInfo :: Platform
@@ -456,7 +481,8 @@ closureCodeBody top_lvl bndr cl_info cc [] body fv_details
   = withNewTickyCounterThunk
         (isStaticClosure cl_info)
         (closureUpdReqd cl_info)
-        (closureName cl_info) $
+        (closureName cl_info)
+        (map fst fv_details) $
     emitClosureProcAndInfoTable top_lvl bndr lf_info info_tbl [] $
       \(_, node, _) -> thunkCode cl_info fv_details cc node body
    where
@@ -468,7 +494,7 @@ closureCodeBody top_lvl bndr cl_info cc args@(arg0:_) body fv_details
         arity = length args
     in
     -- See Note [OneShotInfo overview] in GHC.Types.Basic.
-    withNewTickyCounterFun (isOneShotBndr arg0) (closureName cl_info)
+    withNewTickyCounterFun (isOneShotBndr arg0) (closureName cl_info) (map fst fv_details)
         nv_args $ do {
 
         ; let
@@ -480,9 +506,9 @@ closureCodeBody top_lvl bndr cl_info cc args@(arg0:_) body fv_details
             \(_offset, node, arg_regs) -> do
                 -- Emit slow-entry code (for entering a closure through a PAP)
                 { mkSlowEntryCode bndr cl_info arg_regs
-                ; dflags <- getDynFlags
+                ; profile <- getProfile
                 ; platform <- getPlatform
-                ; let node_points = nodeMustPointToIt dflags lf_info
+                ; let node_points = nodeMustPointToIt profile lf_info
                       node' = if node_points then Just node else Nothing
                 ; loop_header_id <- newBlockId
                 -- Extend reader monad with information that
@@ -499,11 +525,12 @@ closureCodeBody top_lvl bndr cl_info cc args@(arg0:_) body fv_details
                 ; enterCostCentreFun cc
                     (CmmMachOp (mo_wordSub platform)
                          [ CmmReg (CmmLocal node) -- See [NodeReg clobbered with loopification]
-                         , mkIntExpr platform (funTag dflags cl_info) ])
+                         , mkIntExpr platform (funTag platform cl_info) ])
                 ; fv_bindings <- mapM bind_fv fv_details
                 -- Load free vars out of closure *after*
                 -- heap check, to reduce live vars over check
                 ; when node_points $ load_fvs node lf_info fv_bindings
+                ; checkFunctionArgTags (text "TagCheck failed - Argument to local function:" <> ppr bndr) bndr (map fromNonVoid nv_args)
                 ; void $ cgExpr body
                 }}}
 
@@ -511,7 +538,6 @@ closureCodeBody top_lvl bndr cl_info cc args@(arg0:_) body fv_details
 
 -- Note [NodeReg clobbered with loopification]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
---
 -- Previously we used to pass nodeReg (aka R1) here. With profiling, upon
 -- entering a closure, enterFunCCS was called with R1 passed to it. But since R1
 -- may get clobbered inside the body of a closure, and since a self-recursive
@@ -528,9 +554,8 @@ bind_fv (id, off) = do { reg <- rebindToReg id; return (reg, off) }
 
 load_fvs :: LocalReg -> LambdaFormInfo -> [(LocalReg, ByteOff)] -> FCode ()
 load_fvs node lf_info = mapM_ (\ (reg, off) ->
-   do dflags <- getDynFlags
-      platform <- getPlatform
-      let tag = lfDynTag dflags lf_info
+   do platform <- getPlatform
+      let tag = lfDynTag platform lf_info
       emit $ mkTaggedObjectLoad platform reg node off tag)
 
 -----------------------------------------
@@ -548,16 +573,18 @@ mkSlowEntryCode :: Id -> ClosureInfo -> [LocalReg] -> FCode ()
 -- Here, we emit the slow-entry code.
 mkSlowEntryCode bndr cl_info arg_regs -- function closure is already in `Node'
   | Just (_, ArgGen _) <- closureFunInfo cl_info
-  = do dflags <- getDynFlags
-       platform <- getPlatform
+  = do cfg       <- getStgToCmmConfig
+       upd_frame <- getUpdFrameOff
        let node = idToReg platform (NonVoid bndr)
-           slow_lbl = closureSlowEntryLabel  cl_info
+           profile  = stgToCmmProfile  cfg
+           platform = stgToCmmPlatform cfg
+           slow_lbl = closureSlowEntryLabel  platform cl_info
            fast_lbl = closureLocalEntryLabel platform cl_info
            -- mkDirectJump does not clobber `Node' containing function closure
-           jump = mkJump dflags NativeNodeCall
+           jump = mkJump profile NativeNodeCall
                                 (mkLblExpr fast_lbl)
                                 (map (CmmReg . CmmLocal) (node : arg_regs))
-                                (initUpdFrameOff platform)
+                                upd_frame
        tscope <- getTickScope
        emitProcWithConvention Slow Nothing slow_lbl
          (node : arg_regs) (jump, tscope)
@@ -567,8 +594,8 @@ mkSlowEntryCode bndr cl_info arg_regs -- function closure is already in `Node'
 thunkCode :: ClosureInfo -> [(NonVoid Id, ByteOff)] -> CostCentreStack
           -> LocalReg -> CgStgExpr -> FCode ()
 thunkCode cl_info fv_details _cc node body
-  = do { dflags <- getDynFlags
-       ; let node_points = nodeMustPointToIt dflags (closureLFInfo cl_info)
+  = do { profile <- getProfile
+       ; let node_points = nodeMustPointToIt profile (closureLFInfo cl_info)
              node'       = if node_points then Just node else Nothing
         ; ldvEnterClosure cl_info (CmmLocal node) -- NB: Node always points when profiling
 
@@ -605,8 +632,10 @@ blackHoleIt node_reg
 
 emitBlackHoleCode :: CmmExpr -> FCode ()
 emitBlackHoleCode node = do
-  dflags <- getDynFlags
-  let platform = targetPlatform dflags
+  cfg <- getStgToCmmConfig
+  let profile     = stgToCmmProfile  cfg
+      platform    = stgToCmmPlatform cfg
+      is_eager_bh = stgToCmmEagerBlackHole cfg
 
   -- Eager blackholing is normally disabled, but can be turned on with
   -- -feager-blackholing.  When it is on, we replace the info pointer
@@ -626,15 +655,14 @@ emitBlackHoleCode node = do
   -- Note the eager-blackholing check is here rather than in blackHoleOnEntry,
   -- because emitBlackHoleCode is called from GHC.Cmm.Parser.
 
-  let  eager_blackholing =  not (sccProfilingEnabled dflags)
-                         && gopt Opt_EagerBlackHoling dflags
+  let  eager_blackholing =  not (profileIsProfiling profile) && is_eager_bh
              -- Profiling needs slop filling (to support LDV
              -- profiling), so currently eager blackholing doesn't
              -- work with profiling.
 
   when eager_blackholing $ do
     whenUpdRemSetEnabled $ emitUpdRemSetPushThunk node
-    emitStore (cmmOffsetW platform node (fixedHdrSizeW dflags)) currentTSOExpr
+    emitStore (cmmOffsetW platform node (fixedHdrSizeW profile)) currentTSOExpr
     -- See Note [Heap memory barriers] in SMP.h.
     emitPrimCall [] MO_WriteBarrier []
     emitStore node (CmmReg (CmmGlobal EagerBlackholeInfo))
@@ -652,11 +680,11 @@ setupUpdate closure_info node body
       then do tickyUpdateFrameOmitted; body
       else do
           tickyPushUpdateFrame
-          dflags <- getDynFlags
+          cfg <- getStgToCmmConfig
           let
-              bh = blackHoleOnEntry closure_info &&
-                   not (sccProfilingEnabled dflags) &&
-                   gopt Opt_EagerBlackHoling dflags
+              bh = blackHoleOnEntry closure_info
+                && not (stgToCmmSCCProfiling cfg)
+                && stgToCmmEagerBlackHole cfg
 
               lbl | bh        = mkBHUpdInfoLabel
                   | otherwise = mkUpdInfoLabel
@@ -684,20 +712,21 @@ pushUpdateFrame :: CLabel -> CmmExpr -> FCode () -> FCode ()
 pushUpdateFrame lbl updatee body
   = do
        updfr  <- getUpdFrameOff
-       dflags <- getDynFlags
+       profile <- getProfile
        let
-           hdr         = fixedHdrSize dflags
-           frame       = updfr + hdr + sIZEOF_StgUpdateFrame_NoHdr dflags
+           hdr         = fixedHdrSize profile
+           frame       = updfr + hdr + pc_SIZEOF_StgUpdateFrame_NoHdr (profileConstants profile)
        --
-       emitUpdateFrame dflags (CmmStackSlot Old frame) lbl updatee
+       emitUpdateFrame (CmmStackSlot Old frame) lbl updatee
        withUpdFrameOff frame body
 
-emitUpdateFrame :: DynFlags -> CmmExpr -> CLabel -> CmmExpr -> FCode ()
-emitUpdateFrame dflags frame lbl updatee = do
+emitUpdateFrame :: CmmExpr -> CLabel -> CmmExpr -> FCode ()
+emitUpdateFrame frame lbl updatee = do
+  profile <- getProfile
   let
-           hdr         = fixedHdrSize dflags
-           off_updatee = hdr + oFFSET_StgUpdateFrame_updatee dflags
-           platform    = targetPlatform dflags
+           hdr         = fixedHdrSize profile
+           off_updatee = hdr + pc_OFFSET_StgUpdateFrame_updatee (platformConstants platform)
+           platform    = profilePlatform profile
   --
   emitStore frame (mkLblExpr lbl)
   emitStore (cmmOffset platform frame off_updatee) updatee
@@ -713,12 +742,13 @@ link_caf :: LocalReg           -- pointer to the closure
 -- This function returns the address of the black hole, so it can be
 -- updated with the new value when available.
 link_caf node = do
-  { dflags <- getDynFlags
+  { cfg <- getStgToCmmConfig
         -- Call the RTS function newCAF, returning the newly-allocated
         -- blackhole indirection closure
   ; let newCAF_lbl = mkForeignLabel (fsLit "newCAF") Nothing
                                     ForeignLabelInExternalPackage IsFunction
-  ; let platform = targetPlatform dflags
+  ; let profile  = stgToCmmProfile cfg
+  ; let platform = profilePlatform profile
   ; bh <- newTemp (bWord platform)
   ; emitRtsCallGen [(bh,AddrHint)] newCAF_lbl
       [ (baseExpr,  AddrHint),
@@ -727,11 +757,13 @@ link_caf node = do
 
   -- see Note [atomic CAF entry] in rts/sm/Storage.c
   ; updfr  <- getUpdFrameOff
-  ; let target = entryCode platform (closureInfoPtr dflags (CmmReg (CmmLocal node)))
+  ; let align_check = stgToCmmAlignCheck cfg
+  ; let target      = entryCode platform
+                        (closureInfoPtr platform align_check (CmmReg (CmmLocal node)))
   ; emit =<< mkCmmIfThen
       (cmmEqWord platform (CmmReg (CmmLocal bh)) (zeroExpr platform))
         -- re-enter the CAF
-       (mkJump dflags NativeNodeCall target [] updfr)
+       (mkJump profile NativeNodeCall target [] updfr)
 
   ; return (CmmReg (CmmLocal bh)) }
 
@@ -743,16 +775,12 @@ link_caf node = do
 -- name of the data constructor itself.  Otherwise it is determined by
 -- @closureDescription@ from the let binding information.
 
-closureDescription :: DynFlags
-           -> Module            -- Module
-                   -> Name              -- Id of closure binding
-                   -> String
+closureDescription
+   :: Module            -- Module
+   -> Name              -- Id of closure binding
+   -> String
         -- Not called for StgRhsCon which have global info tables built in
         -- CgConTbls.hs with a description generated from the data constructor
-closureDescription dflags mod_name name
-  = showSDocDump dflags (char '<' <>
-                    (if isExternalName name
-                      then ppr name -- ppr will include the module name prefix
-                      else pprModule mod_name <> char '.' <> ppr name) <>
-                    char '>')
-   -- showSDocDump, because we want to see the unique on the Name.
+closureDescription mod_name name
+  = renderWithContext defaultSDocContext
+    (char '<' <> pprFullName mod_name name <> char '>')

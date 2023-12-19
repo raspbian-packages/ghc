@@ -90,7 +90,7 @@ therefore constructors appear to have regular function types.
 
 ::
 
-    mkList :: [a] -> [MkT1 a]
+    mkList :: [a] -> [T1 a]
     mkList xs = map MkT1 xs
 
 Hence the linearity of type constructors is invisible when
@@ -101,12 +101,23 @@ Whether a data constructor field is linear or not can be customized using the GA
 ::
 
     data T2 a b c where
-        MkT2 :: a -> b %1 -> c %1 -> T2 a b  -- Note unrestricted arrow in the first argument
+        MkT2 :: a -> b %1 -> c %1 -> T2 a b c -- Note unrestricted arrow in the first argument
 
 the value ``MkT2 x y z`` can be constructed only if ``x`` is
 unrestricted. On the other hand, a linear function which is matching
 on ``MkT2 x y z`` must consume ``y`` and ``z`` exactly once, but there
 is no restriction on ``x``.
+
+It is also possible to define a multiplicity-polymorphic field:
+
+::
+
+    data T3 a m where
+        MkT3 :: a %m -> T3 a m
+
+While linear fields are generalized (``MkT1 :: forall {m} a. a %m -> T1 a``
+in the previous example), multiplicity-polymorphic fields are not;
+it is not possible to directly use ``MkT3`` as a function ``a -> T3 a One``.
 
 If :extension:`LinearTypes` is disabled, all fields are considered to be linear
 fields, including GADT fields defined with the ``->`` arrow.
@@ -120,7 +131,7 @@ an error.
 Printing multiplicity-polymorphic types
 ---------------------------------------
 If :extension:`LinearTypes` is disabled, multiplicity variables in types are defaulted
-to ``Many`` when printing, in the same manner as described in :ref:`printing-levity-polymorphic-types`.
+to ``Many`` when printing, in the same manner as described in :ref:`printing-representation-polymorphic-types`.
 In other words, without :extension:`LinearTypes`, multiplicity-polymorphic functions
 ``a %m -> b`` are printed as normal Haskell2010 functions ``a -> b``. This allows
 existing libraries to be generalized to linear types in a backwards-compatible
@@ -141,11 +152,14 @@ missing pieces.
 
 - Multiplicity polymorphism is incomplete and experimental. You may
   have success using it, or you may not. Expect it to be really unreliable.
+  (Multiplicity multiplication is not supported yet.)
 - There is currently no support for multiplicity annotations such as
   ``x :: a %p``, ``\(x :: a %p) -> ...``.
-- All ``case``, ``let`` and ``where`` statements consume their
-  right-hand side, or scrutiny, ``Many`` times. That is, the following
-  will not type check:
+- A ``case`` expression may consume its scrutinee ``One`` time,
+  or ``Many`` times. But the inference is still experimental, and may
+  over-eagerly guess that it ought to consume the scrutinee ``Many`` times.
+- All ``let`` and ``where`` statements consume their right hand side
+  ``Many`` times. That is, the following will not type check:
 
   ::
 
@@ -154,8 +168,7 @@ missing pieces.
 
       f :: A %1 -> C
       f x =
-        case g x of
-          (y, z) -> h y z
+        let (y, z) = g x in h y z
 
   This can be worked around by defining extra functions which are
   specified to be linear, such as:

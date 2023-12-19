@@ -1,7 +1,11 @@
--- (c) The University of Glasgow 2012
+{-# LANGUAGE DataKinds           #-}
+{-# LANGUAGE DeriveDataTypeable  #-}
+{-# LANGUAGE GADTs               #-}
+{-# LANGUAGE KindSignatures      #-}
+{-# LANGUAGE RoleAnnotations     #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
-{-# LANGUAGE CPP, DataKinds, DeriveDataTypeable, GADTs, KindSignatures,
-             ScopedTypeVariables, StandaloneDeriving, RoleAnnotations #-}
+-- (c) The University of Glasgow 2012
 
 -- | Module for coercion axioms, used to represent type family instances
 -- and newtypes
@@ -32,7 +36,7 @@ module GHC.Core.Coercion.Axiom (
 import GHC.Prelude
 
 import {-# SOURCE #-} GHC.Core.TyCo.Rep ( Type )
-import {-# SOURCE #-} GHC.Core.TyCo.Ppr ( pprType )
+import {-# SOURCE #-} GHC.Core.TyCo.Ppr ( pprType, pprTyVar )
 import {-# SOURCE #-} GHC.Core.TyCon    ( TyCon )
 import GHC.Utils.Outputable
 import GHC.Data.FastString
@@ -41,6 +45,8 @@ import GHC.Types.Unique
 import GHC.Types.Var
 import GHC.Utils.Misc
 import GHC.Utils.Binary
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
 import GHC.Data.Pair
 import GHC.Types.Basic
 import Data.Typeable ( Typeable )
@@ -48,8 +54,6 @@ import GHC.Types.SrcLoc
 import qualified Data.Data as Data
 import Data.Array
 import Data.List ( mapAccumL )
-
-#include "HsVersions.h"
 
 {-
 Note [Coercion axiom branches]
@@ -137,7 +141,7 @@ newtype Branches (br :: BranchFlag)
 type role Branches nominal
 
 manyBranches :: [CoAxBranch] -> Branches Branched
-manyBranches brs = ASSERT( snd bnds >= fst bnds )
+manyBranches brs = assert (snd bnds >= fst bnds )
                    MkBranches (listArray bnds brs)
   where
     bnds = (0, length brs - 1)
@@ -149,7 +153,7 @@ toBranched :: Branches br -> Branches Branched
 toBranched = MkBranches . unMkBranches
 
 toUnbranched :: Branches br -> Branches Unbranched
-toUnbranched (MkBranches arr) = ASSERT( bounds arr == (0,0) )
+toUnbranched (MkBranches arr) = assert (bounds arr == (0,0) )
                                 MkBranches arr
 
 fromBranches :: Branches br -> [CoAxBranch]
@@ -271,7 +275,6 @@ coAxiomArity ax index
   = length tvs + length cvs
   where
     CoAxBranch { cab_tvs = tvs, cab_cvs = cvs } = coAxiomNthBranch ax index
-
 coAxiomName :: CoAxiom br -> Name
 coAxiomName = co_ax_name
 
@@ -319,7 +322,7 @@ isImplicitCoAxiom = co_ax_implicit
 coAxBranchIncomps :: CoAxBranch -> [CoAxBranch]
 coAxBranchIncomps = cab_incomps
 
--- See Note [Compatibility checking] in GHC.Core.FamInstEnv
+-- See Note [Compatibility] in GHC.Core.FamInstEnv
 placeHolderIncomps :: [CoAxBranch]
 placeHolderIncomps = panic "placeHolderIncomps"
 
@@ -327,7 +330,7 @@ placeHolderIncomps = panic "placeHolderIncomps"
 Note [CoAxBranch type variables]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 In the case of a CoAxBranch of an associated type-family instance,
-we use the *same* type variables (where possible) as the
+we use the *same* type variables in cab_tvs (where possible) as the
 enclosing class or instance.  Consider
 
   instance C Int [z] where
@@ -337,8 +340,11 @@ In the CoAxBranch in the instance decl (F Int [z]) we use the
 same 'z', so that it's easy to check that that type is the same
 as that in the instance header.
 
-So, unlike FamInsts, there is no expectation that the cab_tvs
-are fresh wrt each other, or any other CoAxBranch.
+However, I believe that the cab_tvs of any CoAxBranch are distinct
+from the cab_tvs of other CoAxBranches in the same CoAxiom.  This is
+important when checking for compatiblity and apartness; e.g. see
+GHC.Core.FamInstEnv.compatibleBranches.  (The story seems a bit wobbly
+here, but it seems to work.)
 
 Note [CoAxBranch roles]
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -379,7 +385,7 @@ giving rise to the FamInstBranch.
 
 Note [Implicit axioms]
 ~~~~~~~~~~~~~~~~~~~~~~
-See also Note [Implicit TyThings] in GHC.Driver.Types
+See also Note [Implicit TyThings] in GHC.Types.TyThing
 * A CoAxiom arising from data/type family instances is not "implicit".
   That is, it has its own IfaceAxiom declaration in an interface file
 
@@ -451,7 +457,14 @@ See also:
   type; but it too is eta-reduced.
 * Note [Implementing eta reduction for data families] in "GHC.Tc.TyCl.Instance". This
   describes the implementation details of this eta reduction happen.
+* Note [RoughMap and rm_empty] for how this complicates the RoughMap implementation slightly.
 -}
+
+{- *********************************************************************
+*                                                                      *
+              Instances, especially pretty-printing
+*                                                                      *
+********************************************************************* -}
 
 instance Eq (CoAxiom br) where
     a == b = getUnique a == getUnique b
@@ -459,9 +472,6 @@ instance Eq (CoAxiom br) where
 
 instance Uniquable (CoAxiom br) where
     getUnique = co_ax_unique
-
-instance Outputable (CoAxiom br) where
-    ppr = ppr . getName
 
 instance NamedThing (CoAxiom br) where
     getName = co_ax_name
@@ -472,13 +482,22 @@ instance Typeable br => Data.Data (CoAxiom br) where
     gunfold _ _  = error "gunfold"
     dataTypeOf _ = mkNoRepType "CoAxiom"
 
+instance Outputable (CoAxiom br) where
+  -- You may want GHC.Core.Coercion.pprCoAxiom instead
+  ppr = ppr . getName
+
 instance Outputable CoAxBranch where
-  ppr (CoAxBranch { cab_loc = loc
-                  , cab_lhs = lhs
-                  , cab_rhs = rhs }) =
-    text "CoAxBranch" <+> parens (ppr loc) <> colon
-      <+> brackets (fsep (punctuate comma (map pprType lhs)))
-      <+> text "=>" <+> pprType rhs
+  -- This instance doesn't know the name of the type family
+  -- If possible, use GHC.Core.Coercion.pprCoAxBranch instead
+  ppr (CoAxBranch { cab_tvs = tvs, cab_cvs = cvs
+                  , cab_lhs = lhs_tys, cab_rhs = rhs, cab_incomps = incomps })
+    = text "CoAxBranch" <+> braces payload
+    where
+      payload = hang (text "forall" <+> pprWithCommas pprTyVar (tvs ++ cvs) <> dot)
+                   2 (vcat [ text "<tycon>" <+> sep (map pprType lhs_tys)
+                           , nest 2 (text "=" <+> ppr rhs)
+                           , ppUnless (null incomps) $
+                             text "incomps:" <+> vcat (map ppr incomps) ])
 
 {-
 ************************************************************************
@@ -567,7 +586,9 @@ instance Eq CoAxiomRule where
   x == y = coaxrName x == coaxrName y
 
 instance Ord CoAxiomRule where
-  compare x y = compare (coaxrName x) (coaxrName y)
+  -- we compare lexically to avoid non-deterministic output when sets of rules
+  -- are printed
+  compare x y = lexicalCompareFS (coaxrName x) (coaxrName y)
 
 instance Outputable CoAxiomRule where
   ppr = ppr . coaxrName
@@ -576,9 +597,21 @@ instance Outputable CoAxiomRule where
 -- Type checking of built-in families
 data BuiltInSynFamily = BuiltInSynFamily
   { sfMatchFam      :: [Type] -> Maybe (CoAxiomRule, [Type], Type)
+    -- Does this reduce on the given arguments?
+    -- If it does, returns (CoAxiomRule, types to instantiate the rule at, rhs type)
+    -- That is: mkAxiomRuleCo coax (zipWith mkReflCo (coaxrAsmpRoles coax) ts)
+    --              :: F tys ~r rhs,
+    -- where the r in the output is coaxrRole of the rule. It is up to the
+    -- caller to ensure that this role is appropriate.
+
   , sfInteractTop   :: [Type] -> Type -> [TypeEqn]
+    -- If given these type arguments and RHS, returns the equalities that
+    -- are guaranteed to hold.
+
   , sfInteractInert :: [Type] -> Type ->
                        [Type] -> Type -> [TypeEqn]
+    -- If given one set of arguments and result, and another set of arguments
+    -- and result, returns the equalities that are guaranteed to hold.
   }
 
 -- Provides default implementations that do nothing.

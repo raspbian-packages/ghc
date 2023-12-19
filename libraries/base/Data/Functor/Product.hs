@@ -9,7 +9,7 @@
 -- License     :  BSD-style (see the file LICENSE)
 --
 -- Maintainer  :  libraries@haskell.org
--- Stability   :  experimental
+-- Stability   :  stable
 -- Portability :  portable
 --
 -- Products, lifted to functors.
@@ -124,3 +124,11 @@ instance (MonadFix f, MonadFix g) => MonadFix (Product f g) where
 -- | @since 4.9.0.0
 instance (MonadZip f, MonadZip g) => MonadZip (Product f g) where
     mzipWith f (Pair x1 y1) (Pair x2 y2) = Pair (mzipWith f x1 x2) (mzipWith f y1 y2)
+
+-- | @since 4.16.0.0
+instance (Semigroup (f a), Semigroup (g a)) => Semigroup (Product f g a) where
+    Pair x1 y1 <> Pair x2 y2 = Pair (x1 <> x2) (y1 <> y2)
+
+-- | @since 4.16.0.0
+instance (Monoid (f a), Monoid (g a)) => Monoid (Product f g a) where
+    mempty = Pair mempty mempty

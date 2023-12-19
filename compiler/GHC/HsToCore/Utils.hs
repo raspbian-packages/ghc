@@ -1,3 +1,7 @@
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE TypeFamilies #-}
+
 {-
 (c) The University of Glasgow 2006
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
@@ -7,12 +11,6 @@ Utilities for desugaring
 
 This module exports some utility functions of no great interest.
 -}
-
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE ViewPatterns #-}
 
 -- | Utility functions for constructing Core syntax, principally for desugaring
 module GHC.HsToCore.Utils (
@@ -24,12 +22,14 @@ module GHC.HsToCore.Utils (
         extractMatchResult, combineMatchResults,
         adjustMatchResultDs,
         shareFailureHandler,
+        dsHandleMonadicFailure,
         mkCoLetMatchResult, mkViewMatchResult, mkGuardedMatchResult,
         matchCanFail, mkEvalMatchResult,
         mkCoPrimCaseMatchResult, mkCoAlgCaseMatchResult, mkCoSynCaseMatchResult,
         wrapBind, wrapBinds,
 
         mkErrorAppDs, mkCoreAppDs, mkCoreAppsDs, mkCastDs,
+        mkFailExpr,
 
         seqVar,
 
@@ -44,15 +44,13 @@ module GHC.HsToCore.Utils (
         isTrueLHsExpr
     ) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
 import {-# SOURCE #-} GHC.HsToCore.Match ( matchSimply )
-import {-# SOURCE #-} GHC.HsToCore.Expr  ( dsLExpr )
+import {-# SOURCE #-} GHC.HsToCore.Expr  ( dsLExpr, dsSyntaxExpr )
 
 import GHC.Hs
-import GHC.Tc.Utils.Zonk
+import GHC.Hs.Syn.Type
 import GHC.Tc.Utils.TcType( tcSplitTyConApp )
 import GHC.Core
 import GHC.HsToCore.Monad
@@ -67,7 +65,6 @@ import GHC.Core.DataCon
 import GHC.Core.PatSyn
 import GHC.Core.Type
 import GHC.Core.Coercion
-import GHC.Builtin.Types.Prim
 import GHC.Builtin.Types
 import GHC.Types.Basic
 import GHC.Core.ConLike
@@ -77,9 +74,13 @@ import GHC.Unit.Module
 import GHC.Builtin.Names
 import GHC.Types.Name( isInternalName )
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
 import GHC.Types.SrcLoc
+import GHC.Types.Tickish
 import GHC.Utils.Misc
 import GHC.Driver.Session
+import GHC.Driver.Ppr
 import GHC.Data.FastString
 import qualified GHC.LanguageExtensions as LangExt
 
@@ -130,10 +131,10 @@ selectMatchVars ps = mapM (uncurry selectMatchVar) ps
 
 selectMatchVar :: Mult -> Pat GhcTc -> DsM Id
 -- Postcondition: the returned Id has an Internal Name
-selectMatchVar w (BangPat _ pat) = selectMatchVar w (unLoc pat)
-selectMatchVar w (LazyPat _ pat) = selectMatchVar w (unLoc pat)
-selectMatchVar w (ParPat _ pat)  = selectMatchVar w (unLoc pat)
-selectMatchVar _w (VarPat _ var)  = return (localiseId (unLoc var))
+selectMatchVar w (BangPat _ pat)    = selectMatchVar w (unLoc pat)
+selectMatchVar w (LazyPat _ pat)    = selectMatchVar w (unLoc pat)
+selectMatchVar w (ParPat _ _ pat _) = selectMatchVar w (unLoc pat)
+selectMatchVar _w (VarPat _ var)    = return (localiseId (unLoc var))
                                   -- Note [Localise pattern binders]
                                   --
                                   -- Remark: when the pattern is a variable (or
@@ -141,8 +142,8 @@ selectMatchVar _w (VarPat _ var)  = return (localiseId (unLoc var))
                                   -- multiplicity stored within the variable
                                   -- itself. It's easier to pull it from the
                                   -- variable, so we ignore the multiplicity.
-selectMatchVar _w (AsPat _ var _) = ASSERT( isManyDataConTy _w ) (return (unLoc var))
-selectMatchVar w other_pat     = newSysLocalDsNoLP w (hsPatType other_pat)
+selectMatchVar _w (AsPat _ var _) = assert (isManyDataConTy _w ) (return (unLoc var))
+selectMatchVar w other_pat        = newSysLocalDs w (hsPatType other_pat)
 
 {- Note [Localise pattern binders]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -181,7 +182,7 @@ In fact, even GHC.Core.Subst.simplOptExpr will do this, and simpleOptExpr
 runs on the output of the desugarer, so all is well by the end of
 the desugaring pass.
 
-See also Note [MatchIds] in GHC.HsToCore.Match
+See also Note [Match Ids] in GHC.HsToCore.Match
 
 ************************************************************************
 *                                                                      *
@@ -195,7 +196,7 @@ worthy of a type synonym and a few handy functions.
 -}
 
 firstPat :: EquationInfo -> Pat GhcTc
-firstPat eqn = ASSERT( notNull (eqn_pats eqn) ) head (eqn_pats eqn)
+firstPat eqn = assert (notNull (eqn_pats eqn)) $ head (eqn_pats eqn)
 
 shiftEqns :: Functor f => f EquationInfo -> f EquationInfo
 -- Drop the first pattern in each equation
@@ -260,7 +261,7 @@ mkViewMatchResult var' viewExpr = fmap $ mkCoreLet $ NonRec var' viewExpr
 
 mkEvalMatchResult :: Id -> Type -> MatchResult CoreExpr -> MatchResult CoreExpr
 mkEvalMatchResult var ty = fmap $ \e ->
-  Case (Var var) var ty [(DEFAULT, [], e)]
+  Case (Var var) var ty [Alt DEFAULT [] e]
 
 mkGuardedMatchResult :: CoreExpr -> MatchResult CoreExpr -> MatchResult CoreExpr
 mkGuardedMatchResult pred_expr mr = MR_Fallible $ \fail -> do
@@ -276,13 +277,13 @@ mkCoPrimCaseMatchResult var ty match_alts
   where
     mk_case fail = do
         alts <- mapM (mk_alt fail) sorted_alts
-        return (Case (Var var) var ty ((DEFAULT, [], fail) : alts))
+        return (Case (Var var) var ty (Alt DEFAULT [] fail : alts))
 
     sorted_alts = sortWith fst match_alts       -- Right order for a Case
     mk_alt fail (lit, mr)
-       = ASSERT( not (litIsLifted lit) )
+       = assert (not (litIsLifted lit)) $
          do body <- runMatchResult fail mr
-            return (LitAlt lit, [], body)
+            return (Alt (LitAlt lit) [] body)
 
 data CaseAlt a = MkCaseAlt{ alt_pat :: a,
                             alt_bndrs :: [Var],
@@ -296,7 +297,7 @@ mkCoAlgCaseMatchResult
   -> MatchResult CoreExpr
 mkCoAlgCaseMatchResult var ty match_alts
   | isNewtype  -- Newtype case; use a let
-  = ASSERT( null match_alts_tail && null (tail arg_ids1) )
+  = assert (null match_alts_tail && null (tail arg_ids1)) $
     mkCoLetMatchResult (NonRec arg_id1 newtype_rhs) match_result1
 
   | otherwise
@@ -310,7 +311,7 @@ mkCoAlgCaseMatchResult var ty match_alts
     alt1@MkCaseAlt{ alt_bndrs = arg_ids1, alt_result = match_result1 } :| match_alts_tail
       = match_alts
     -- Stuff for newtype
-    arg_id1       = ASSERT( notNull arg_ids1 ) head arg_ids1
+    arg_id1       = assert (notNull arg_ids1) $ head arg_ids1
     var_ty        = idType var
     (tc, ty_args) = tcSplitTyConApp var_ty      -- Don't look through newtypes
                                                 -- (not that splitTyConApp does, these days)
@@ -321,8 +322,9 @@ mkCoSynCaseMatchResult var ty alt = MR_Fallible $ mkPatSynCase var ty alt
 
 mkPatSynCase :: Id -> Type -> CaseAlt PatSyn -> CoreExpr -> DsM CoreExpr
 mkPatSynCase var ty alt fail = do
+    matcher_id <- dsLookupGlobalId matcher_name
     matcher <- dsLExpr $ mkLHsWrap wrapper $
-                         nlHsTyApp matcher [getRuntimeRep ty, ty]
+                         nlHsTyApp matcher_id [getRuntimeRep ty, ty]
     cont <- mkCoreLams bndrs <$> runMatchResult fail match_result
     return $ mkCoreAppsDs (text "patsyn" <+> ppr var) matcher [Var var, ensure_unstrict cont, Lam voidArgId fail]
   where
@@ -330,7 +332,7 @@ mkPatSynCase var ty alt fail = do
                alt_bndrs = bndrs,
                alt_wrapper = wrapper,
                alt_result = match_result} = alt
-    (matcher, needs_void_lam) = patSynMatcher psyn
+    (matcher_name, _, needs_void_lam) = patSynMatcher psyn
 
     -- See Note [Matchers and builders for pattern synonyms] in GHC.Core.PatSyn
     -- on these extra Void# arguments
@@ -366,7 +368,7 @@ mkDataConCase var ty alts@(alt1 :| _)
                      , alt_result = match_result } =
       flip adjustMatchResultDs match_result $ \body -> do
         case dataConBoxer con of
-          Nothing -> return (DataAlt con, args, body)
+          Nothing -> return (Alt (DataAlt con) args body)
           Just (DCB boxer) -> do
             us <- newUniqueSupply
             let (rep_ids, binds) = initUs_ us (boxer ty_args args)
@@ -374,12 +376,12 @@ mkDataConCase var ty alts@(alt1 :| _)
               -- Upholds the invariant that the binders of a case expression
               -- must be scaled by the case multiplicity. See Note [Case
               -- expression invariants] in CoreSyn.
-            return (DataAlt con, rep_ids', mkLets binds body)
+            return (Alt (DataAlt con) rep_ids' (mkLets binds body))
 
     mk_default :: MatchResult (Maybe CoreAlt)
     mk_default
       | exhaustive_case = MR_Infallible $ return Nothing
-      | otherwise       = MR_Fallible $ \fail -> return $ Just (DEFAULT, [], fail)
+      | otherwise       = MR_Fallible $ \fail -> return $ Just (Alt DEFAULT [] fail)
 
     mentioned_constructors = mkUniqSet $ map alt_pat sorted_alts
     un_mentioned_constructors
@@ -402,11 +404,59 @@ mkErrorAppDs :: Id              -- The error function
 mkErrorAppDs err_id ty msg = do
     src_loc <- getSrcSpanDs
     dflags <- getDynFlags
-    let
-        full_msg = showSDoc dflags (hcat [ppr src_loc, vbar, msg])
-        core_msg = Lit (mkLitString full_msg)
-        -- mkLitString returns a result of type String#
-    return (mkApps (Var err_id) [Type (getRuntimeRep ty), Type ty, core_msg])
+    let full_msg = showSDoc dflags (hcat [ppr src_loc, vbar, msg])
+        fail_expr = mkRuntimeErrorApp err_id unitTy full_msg
+    return $ mkWildCase fail_expr (unrestricted unitTy) ty []
+    -- See Note [Incompleteness and linearity]
+
+{-
+Note [Incompleteness and linearity]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The default branch of an incomplete pattern match is compiled to a call
+to 'error'.
+Because of linearity, we wrap it with an empty case. Example:
+
+f :: a %1 -> Bool -> a
+f x True = False
+
+Adding 'f x False = error "Non-exhaustive pattern..."' would violate
+the linearity of x.
+Instead, we use 'f x False = case error "Non-exhausive pattern..." :: () of {}'.
+This case expression accounts for linear variables by assigning bottom usage
+(See Note [Bottom as a usage] in GHC.Core.Multiplicity).
+This is done in mkErrorAppDs, called from mkFailExpr.
+We use '()' instead of the original return type ('a' in this case)
+because there might be representation polymorphism, e.g. in
+
+g :: forall (a :: TYPE r). (() -> a) %1 -> Bool -> a
+g x True = x ()
+
+adding 'g x False = case error "Non-exhaustive pattern" :: a of {}'
+would create an illegal representation-polymorphic case binder.
+This is important for pattern synonym matchers, which often look like this 'g'.
+
+Similarly, a hole
+h :: a %1 -> a
+h x = _
+is desugared to 'case error "Hole" :: () of {}'. Test: LinearHole.
+
+Instead of () we could use Data.Void.Void, but that would require
+moving Void to GHC.Types: partial pattern matching is used in modules
+that are compiled before Data.Void.
+We can use () even though it has a constructor, because
+Note [Case expression invariants] point 4 in GHC.Core is satisfied
+when the scrutinee is bottoming.
+
+You might wonder if this change slows down compilation, but the
+performance testsuite did not show up any regressions.
+
+For uniformity, calls to 'error' in both cases are wrapped even if -XLinearTypes
+is disabled.
+-}
+
+mkFailExpr :: HsMatchContext GhcRn -> Type -> DsM CoreExpr
+mkFailExpr ctxt ty
+  = mkErrorAppDs pAT_ERROR_ID ty (matchContextErrString ctxt)
 
 {-
 'mkCoreAppDs' and 'mkCoreAppsDs' handle the special-case desugaring of 'seq'.
@@ -453,7 +503,7 @@ There are a few subtleties in the desugaring of `seq`:
           I# _ -> ...case b of {True -> fst x; False -> 0}...
 
     We can try to avoid doing this by ensuring that the binder-swap in the
-    case happens, so we get his at an early stage:
+    case happens, so we get this at an early stage:
        case chp of chp2 { I# -> ...chp2... }
     But this is fragile.  The real culprit is the source program.  Perhaps we
     should have said explicitly
@@ -475,27 +525,34 @@ There are a few subtleties in the desugaring of `seq`:
 
  3. (as described in #2409)
 
-    The isLocalId ensures that we don't turn
+    The isInternalName ensures that we don't turn
             True `seq` e
     into
             case True of True { ... }
     which stupidly tries to bind the datacon 'True'.
 -}
 
--- NB: Make sure the argument is not levity polymorphic
+-- NB: Make sure the argument is not representation-polymorphic
 mkCoreAppDs  :: SDoc -> CoreExpr -> CoreExpr -> CoreExpr
 mkCoreAppDs _ (Var f `App` Type _r `App` Type ty1 `App` Type ty2 `App` arg1) arg2
   | f `hasKey` seqIdKey            -- Note [Desugaring seq], points (1) and (2)
-  = Case arg1 case_bndr ty2 [(DEFAULT,[],arg2)]
+  = Case arg1 case_bndr ty2 [Alt DEFAULT [] arg2]
   where
     case_bndr = case arg1 of
                    Var v1 | isInternalName (idName v1)
                           -> v1        -- Note [Desugaring seq], points (2) and (3)
                    _      -> mkWildValBinder Many ty1
 
+mkCoreAppDs _ (Var f `App` Type _r) arg
+  | f `hasKey` noinlineIdKey   -- See Note [noinlineId magic] in GHC.Types.Id.Make
+  , (fun, args) <- collectArgs arg
+  , not (null args)
+  = (Var f `App` Type (exprType fun) `App` fun)
+    `mkCoreApps` args
+
 mkCoreAppDs s fun arg = mkCoreApp s fun arg  -- The rest is done in GHC.Core.Make
 
--- NB: No argument can be levity polymorphic
+-- NB: No argument can be representation-polymorphic
 mkCoreAppsDs :: SDoc -> CoreExpr -> [CoreExpr] -> CoreExpr
 mkCoreAppsDs s fun args = foldl' (mkCoreAppDs s) fun args
 
@@ -552,6 +609,7 @@ There are two cases.
 ------ Special case (B) -------
   For a pattern that is essentially just a tuple:
       * A product type, so cannot fail
+      * Boxed, so that it can be matched lazily
       * Only one level, so that
           - generating multiple matches is fine
           - seq'ing it evaluates the same as matching it
@@ -667,9 +725,9 @@ work out well:
 -}
 -- Remark: pattern selectors only occur in unrestricted patterns so we are free
 -- to select Many as the multiplicity of every let-expression introduced.
-mkSelectorBinds :: [[Tickish Id]] -- ^ ticks to add, possibly
-                -> LPat GhcTc     -- ^ The pattern
-                -> CoreExpr       -- ^ Expression to which the pattern is bound
+mkSelectorBinds :: [[CoreTickish]] -- ^ ticks to add, possibly
+                -> LPat GhcTc      -- ^ The pattern
+                -> CoreExpr        -- ^ Expression to which the pattern is bound
                 -> DsM (Id,[(Id,CoreExpr)])
                 -- ^ Id the rhs is bound to, for desugaring strict
                 -- binds (see Note [Desugar Strict binds] in "GHC.HsToCore.Binds")
@@ -681,7 +739,7 @@ mkSelectorBinds ticks pat val_expr
 
   | is_flat_prod_lpat pat'           -- Special case (B)
   = do { let pat_ty = hsLPatType pat'
-       ; val_var <- newSysLocalDsNoLP Many pat_ty
+       ; val_var <- newSysLocalDs Many pat_ty
 
        ; let mk_bind tick bndr_var
                -- (mk_bind sv bv)  generates  bv = case sv of { pat -> bv }
@@ -714,7 +772,7 @@ mkSelectorBinds ticks pat val_expr
            -- Strip the bangs before looking for case (A) or (B)
            -- The incoming pattern may well have a bang on it
 
-    binders = collectPatBinders pat'
+    binders = collectPatBinders CollNoDictBinders pat'
     ticks'  = ticks ++ repeat []
 
     local_binders = map localiseId binders      -- See Note [Localise pattern binders]
@@ -723,20 +781,23 @@ mkSelectorBinds ticks pat val_expr
 
 strip_bangs :: LPat (GhcPass p) -> LPat (GhcPass p)
 -- Remove outermost bangs and parens
-strip_bangs (L _ (ParPat _ p))  = strip_bangs p
+strip_bangs (L _ (ParPat _ _ p _))  = strip_bangs p
 strip_bangs (L _ (BangPat _ p)) = strip_bangs p
 strip_bangs lp                  = lp
 
 is_flat_prod_lpat :: LPat GhcTc -> Bool
+-- Pattern is equivalent to a flat, boxed, lifted tuple
 is_flat_prod_lpat = is_flat_prod_pat . unLoc
 
 is_flat_prod_pat :: Pat GhcTc -> Bool
-is_flat_prod_pat (ParPat _ p)          = is_flat_prod_lpat p
+is_flat_prod_pat (ParPat _ _ p _)      = is_flat_prod_lpat p
 is_flat_prod_pat (TuplePat _ ps Boxed) = all is_triv_lpat ps
 is_flat_prod_pat (ConPat { pat_con  = L _ pcon
                          , pat_args = ps})
   | RealDataCon con <- pcon
-  , isProductTyCon (dataConTyCon con)
+  , let tc = dataConTyCon con
+  , Just _ <- tyConSingleDataCon_maybe tc
+  , isLiftedAlgTyCon tc
   = all is_triv_lpat (hsConPatArgs ps)
 is_flat_prod_pat _ = False
 
@@ -746,7 +807,7 @@ is_triv_lpat = is_triv_pat . unLoc
 is_triv_pat :: Pat (GhcPass p) -> Bool
 is_triv_pat (VarPat {})  = True
 is_triv_pat (WildPat{})  = True
-is_triv_pat (ParPat _ p) = is_triv_lpat p
+is_triv_pat (ParPat _ _ p _) = is_triv_lpat p
 is_triv_pat _            = False
 
 
@@ -759,7 +820,7 @@ is_triv_pat _            = False
 ********************************************************************* -}
 
 mkLHsPatTup :: [LPat GhcTc] -> LPat GhcTc
-mkLHsPatTup []     = noLoc $ mkVanillaTuplePat [] Boxed
+mkLHsPatTup []     = noLocA $ mkVanillaTuplePat [] Boxed
 mkLHsPatTup [lpat] = lpat
 mkLHsPatTup lpats  = L (getLoc (head lpats)) $
                      mkVanillaTuplePat lpats Boxed
@@ -773,7 +834,7 @@ mkBigLHsVarTupId :: [Id] -> LHsExpr GhcTc
 mkBigLHsVarTupId ids = mkBigLHsTupId (map nlHsVar ids)
 
 mkBigLHsTupId :: [LHsExpr GhcTc] -> LHsExpr GhcTc
-mkBigLHsTupId = mkChunkified mkLHsTupleExpr
+mkBigLHsTupId = mkChunkified (\e -> mkLHsTupleExpr e noExtField)
 
 -- The Big equivalents for the source tuple patterns
 mkBigLHsVarPatTupId :: [Id] -> LPat GhcTc
@@ -853,8 +914,8 @@ mkFailurePair :: CoreExpr       -- Result type of the whole case expression
                       CoreExpr) -- Fail variable applied to realWorld#
 -- See Note [Failure thunks and CPR]
 mkFailurePair expr
-  = do { fail_fun_var <- newFailLocalDs Many (voidPrimTy `mkVisFunTyMany` ty)
-       ; fail_fun_arg <- newSysLocalDs Many voidPrimTy
+  = do { fail_fun_var <- newFailLocalDs Many (unboxedUnitTy `mkVisFunTyMany` ty)
+       ; fail_fun_arg <- newSysLocalDs Many unboxedUnitTy
        ; let real_arg = setOneShotLambda fail_fun_arg
        ; return (NonRec fail_fun_var (Lam real_arg expr),
                  App (Var fail_fun_var) (Var voidPrimId)) }
@@ -896,15 +957,41 @@ entered at most once.  Adding a dummy 'realWorld' token argument makes
 it clear that sharing is not an issue.  And that in turn makes it more
 CPR-friendly.  This matters a lot: if you don't get it right, you lose
 the tail call property.  For example, see #3403.
+-}
 
+dsHandleMonadicFailure :: HsDoFlavour -> LPat GhcTc -> MatchResult CoreExpr -> FailOperator GhcTc -> DsM CoreExpr
+    -- In a do expression, pattern-match failure just calls
+    -- the monadic 'fail' rather than throwing an exception
+dsHandleMonadicFailure ctx pat match m_fail_op =
+  case shareFailureHandler match of
+    MR_Infallible body -> body
+    MR_Fallible body -> do
+      fail_op <- case m_fail_op of
+        -- Note that (non-monadic) list comprehension, pattern guards, etc could
+        -- have fallible bindings without an explicit failure op, but this is
+        -- handled elsewhere. See Note [Failing pattern matches in Stmts] the
+        -- breakdown of regular and special binds.
+        Nothing -> pprPanic "missing fail op" $
+          text "Pattern match:" <+> ppr pat <+>
+          text "is failable, and fail_expr was left unset"
+        Just fail_op -> pure fail_op
+      dflags <- getDynFlags
+      fail_msg <- mkStringExpr (mk_fail_msg dflags ctx pat)
+      fail_expr <- dsSyntaxExpr fail_op [fail_msg]
+      body fail_expr
 
-************************************************************************
+mk_fail_msg :: DynFlags -> HsDoFlavour -> LocatedA e -> String
+mk_fail_msg dflags ctx pat
+  = showPpr dflags $ text "Pattern match failure in" <+> pprHsDoFlavour ctx
+                   <+> text "at" <+> ppr (getLocA pat)
+
+{- *********************************************************************
 *                                                                      *
               Ticks
 *                                                                      *
 ********************************************************************* -}
 
-mkOptTickBox :: [Tickish Id] -> CoreExpr -> CoreExpr
+mkOptTickBox :: [CoreTickish] -> CoreExpr -> CoreExpr
 mkOptTickBox = flip (foldr Tick)
 
 mkBinaryTickBox :: Int -> Int -> CoreExpr -> DsM CoreExpr
@@ -919,8 +1006,8 @@ mkBinaryTickBox ixT ixF e = do
            trueBox  = Tick (HpcTick this_mod ixT) (Var trueDataConId)
        --
        return $ Case e bndr1 boolTy
-                       [ (DataAlt falseDataCon, [], falseBox)
-                       , (DataAlt trueDataCon,  [], trueBox)
+                       [ Alt (DataAlt falseDataCon) [] falseBox
+                       , Alt (DataAlt trueDataCon)  [] trueBox
                        ]
 
 
@@ -970,7 +1057,7 @@ decideBangHood dflags lpat
   where
     go lp@(L l p)
       = case p of
-           ParPat x p    -> L l (ParPat x (go p))
+           ParPat x lpar p rpar -> L l (ParPat x lpar (go p) rpar)
            LazyPat _ lp' -> lp'
            BangPat _ _   -> lp
            _             -> L l (BangPat noExtField lp)
@@ -988,19 +1075,19 @@ isTrueLHsExpr (L _ (HsVar _ (L _ v)))
      || v `hasKey` getUnique trueDataConId
                                               = Just return
         -- trueDataConId doesn't have the same unique as trueDataCon
-isTrueLHsExpr (L _ (HsConLikeOut _ con))
+isTrueLHsExpr (L _ (XExpr (ConLikeTc con _ _)))
   | con `hasKey` getUnique trueDataCon = Just return
-isTrueLHsExpr (L _ (HsTick _ tickish e))
+isTrueLHsExpr (L _ (XExpr (HsTick tickish e)))
     | Just ticks <- isTrueLHsExpr e
     = Just (\x -> do wrapped <- ticks x
                      return (Tick tickish wrapped))
    -- This encodes that the result is constant True for Hpc tick purposes;
    -- which is specifically what isTrueLHsExpr is trying to find out.
-isTrueLHsExpr (L _ (HsBinTick _ ixT _ e))
+isTrueLHsExpr (L _ (XExpr (HsBinTick ixT _ e)))
     | Just ticks <- isTrueLHsExpr e
     = Just (\x -> do e <- ticks x
                      this_mod <- getModule
                      return (Tick (HpcTick this_mod ixT) e))
 
-isTrueLHsExpr (L _ (HsPar _ e))   = isTrueLHsExpr e
-isTrueLHsExpr _                   = Nothing
+isTrueLHsExpr (L _ (HsPar _ _ e _)) = isTrueLHsExpr e
+isTrueLHsExpr _                     = Nothing

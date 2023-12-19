@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE MultiWayIf #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module     : Hadrian.Haskell.Cabal.Parse
@@ -22,7 +23,11 @@ import qualified Distribution.ModuleName                       as C
 import qualified Distribution.Package                          as C
 import qualified Distribution.PackageDescription               as C
 import qualified Distribution.PackageDescription.Configuration as C
+#if MIN_VERSION_Cabal(3,8,0)
+import qualified Distribution.Simple.PackageDescription        as C
+#else
 import qualified Distribution.PackageDescription.Parsec        as C
+#endif
 import qualified Distribution.Simple.Compiler                  as C
 import qualified Distribution.Simple.Program.Db                as C
 import qualified Distribution.Simple                           as C
@@ -32,15 +37,17 @@ import qualified Distribution.Simple.Program.Types             as C
 import qualified Distribution.Simple.Configure                 as C (getPersistBuildConfig)
 import qualified Distribution.Simple.Build                     as C
 import qualified Distribution.Types.ComponentLocalBuildInfo    as C
-import qualified Distribution.Types.ComponentRequestedSpec     as C
 import qualified Distribution.InstalledPackageInfo             as Installed
 import qualified Distribution.Simple.PackageIndex              as C
 import qualified Distribution.Text                             as C
 import qualified Distribution.Types.LocalBuildInfo             as C
-import qualified Distribution.Types.CondTree                   as C
 import qualified Distribution.Types.MungedPackageId            as C
-#if MIN_VERSION_Cabal(3,2,0)
+#if MIN_VERSION_Cabal(3,5,0)
+import qualified Distribution.Utils.Path                       as C
+#endif
 import qualified Distribution.Utils.ShortText                  as C
+#if !MIN_VERSION_Cabal(3,4,0)
+import qualified Distribution.Types.CondTree                   as C
 #endif
 import qualified Distribution.Verbosity                        as C
 import Hadrian.Expression
@@ -74,8 +81,8 @@ parsePackageData pkg = do
         deps    = nubOrd sorted \\ [name]
         depPkgs = catMaybes $ map findPackageByName deps
     return $ PackageData name version
-                         (shortTextToString (C.synopsis pd))
-                         (shortTextToString (C.description pd))
+                         (C.fromShortText (C.synopsis pd))
+                         (C.fromShortText (C.description pd))
                          depPkgs gpd
   where
     -- Collect an overapproximation of dependencies by ignoring conditionals
@@ -84,14 +91,6 @@ parsePackageData pkg = do
     collectDeps (Just (C.CondNode _ deps ifs)) = deps ++ concatMap f ifs
       where
         f (C.CondBranch _ t mt) = collectDeps (Just t) ++ collectDeps mt
-
-#if MIN_VERSION_Cabal(3,2,0)
-    shortTextToString :: C.ShortText -> String
-    shortTextToString = C.fromShortText
-#else
-    shortTextToString :: String -> String
-    shortTextToString = id
-#endif
 
 -- | Parse the package identifier from a Cabal file.
 parseCabalPkgId :: FilePath -> IO String
@@ -160,9 +159,9 @@ configurePackage context@Context {..} = do
     trackArgsHash (target context (Cabal Flags stage) [] [])
     trackArgsHash (target context (Cabal Setup stage) [] [])
     verbosity   <- getVerbosity
-    let v = if verbosity >= Loud then "-v3" else "-v0"
+    let v = if verbosity >= Diagnostic then "-v3" else "-v0"
         argList' = argList ++ ["--flags=" ++ unwords flagList, v]
-    when (verbosity >= Loud) $
+    when (verbosity >= Verbose) $
         putProgressInfo $ "| Package " ++ quote (pkgName package) ++ " configuration flags: " ++ unwords argList'
     traced "cabal-configure" $
         C.defaultMainWithHooksNoReadArgs hooks gpd argList'
@@ -183,7 +182,7 @@ copyPackage context@Context {..} = do
     ctxPath   <- Context.contextPath context
     pkgDbPath <- packageDbPath stage
     verbosity <- getVerbosity
-    let v = if verbosity >= Loud then "-v3" else "-v0"
+    let v = if verbosity >= Diagnostic then "-v3" else "-v0"
     traced "cabal-copy" $
         C.defaultMainWithHooksNoReadArgs C.autoconfUserHooks gpd
             [ "copy", "--builddir", ctxPath, "--target-package-db", pkgDbPath, v ]
@@ -195,47 +194,23 @@ registerPackage context@Context {..} = do
     ctxPath <- Context.contextPath context
     gpd <- pkgGenericDescription package
     verbosity <- getVerbosity
-    let v = if verbosity >= Loud then "-v3" else "-v0"
+    let v = if verbosity >= Diagnostic then "-v3" else "-v0"
     traced "cabal-register" $
         C.defaultMainWithHooksNoReadArgs C.autoconfUserHooks gpd
             [ "register", "--builddir", ctxPath, v ]
+-- | What type of file is Main
+data MainSourceType = HsMain | CppMain | CMain
 
 -- | Parse the 'ContextData' of a given 'Context'.
 resolveContextData :: Context -> Action ContextData
 resolveContextData context@Context {..} = do
-    -- TODO: This is conceptually wrong!
-    -- We should use the gpd, the flagAssignment and compiler, hostPlatform, and
-    -- other information from the lbi. And then compute the finalised PD (flags,
-    -- satisfiable dependencies, platform, compiler info, deps, gpd).
-    --
-    -- let (Right (pd,_)) = C.finalizePackageDescription flags (const True) platform (compilerInfo compiler) [] gpd
-    --
-    -- However when using the new-build path's this might change.
-
-    -- Read the package description from the Cabal file
-    gpd <- genericPackageDescription <$> readPackageData package
-
-    -- Configure the package with the GHC for this stage
-    (compiler, platform) <- configurePackageGHC package stage
-
-    flagList <- interpret (target context (Cabal Flags stage) [] []) =<< args <$> flavour
-    let flags = foldr addFlag mempty flagList
-          where
-            addFlag :: String -> C.FlagAssignment -> C.FlagAssignment
-            addFlag ('-':name) = C.insertFlagAssignment (C.mkFlagName name) False
-            addFlag ('+':name) = C.insertFlagAssignment (C.mkFlagName name) True
-            addFlag name       = C.insertFlagAssignment (C.mkFlagName name) True
-
-    let (Right (pd,_)) = C.finalizePD flags C.defaultComponentRequestedSpec
-                         (const True) platform (C.compilerInfo compiler) [] gpd
-
     cPath <- Context.contextPath context
     lbi <- liftIO $ C.getPersistBuildConfig cPath
 
     -- Note: the @cPath@ is ignored. The path that's used is the 'buildDir' path
     -- from the local build info @lbi@.
     pdi <- liftIO $ getHookedBuildInfo [pkgPath package, cPath -/- "build"]
-    let pd'  = C.updatePackageDescription pdi pd
+    let pd'  = C.updatePackageDescription pdi (C.localPkgDescr lbi)
         lbi' = lbi { C.localPkgDescr = pd' }
 
     -- TODO: Get rid of deprecated 'externalPackageDeps' and drop -Wno-deprecations
@@ -273,15 +248,26 @@ resolveContextData context@Context {..} = do
             -- @library-dirs@ here.
             _ -> error "No (or multiple) GHC rts package is registered!"
 
-        (buildInfo, modules, mainIs) = biModules pd'
+        (buildInfo, modules, mainIs) = biModules (C.localPkgDescr lbi')
 
-      in return $ ContextData
+        classifyMain :: FilePath -> MainSourceType
+        classifyMain fp
+          | takeExtension fp `elem` [".hs", ".lhs"] = HsMain
+          | takeExtension fp `elem` [".cpp", ".cxx", ".c++"]= CppMain
+          | otherwise = CMain
+
+        main_src = fmap (first C.display) mainIs
+        cdata = ContextData
           { dependencies    = deps
           , componentId     = C.localCompatPackageKey lbi'
-          , mainIs          = fmap (first C.display) mainIs
+          , mainIs          = main_src
           , modules         = map C.display modules
           , otherModules    = map C.display $ C.otherModules buildInfo
-          , srcDirs         = C.hsSourceDirs buildInfo
+          , srcDirs         =
+#if MIN_VERSION_Cabal(3,5,0)
+                              map C.getSymbolicPath
+#endif
+                                  (C.hsSourceDirs buildInfo)
           , depIds          = depIds
           , depNames        = map (C.display . C.mungedName . snd) extDeps
           , includeDirs     = C.includeDirs     buildInfo
@@ -290,7 +276,8 @@ resolveContextData context@Context {..} = do
           , extraLibs       = C.extraLibs       buildInfo
           , extraLibDirs    = C.extraLibDirs    buildInfo
           , asmSrcs         = C.asmSources      buildInfo
-          , cSrcs           = C.cSources        buildInfo
+          , cSrcs           = C.cSources        buildInfo ++ [ ms | Just (_,ms) <- pure main_src, CMain   <- pure (classifyMain ms)]
+          , cxxSrcs         = C.cxxSources      buildInfo ++ [ ms | Just (_,ms) <- pure main_src, CppMain <- pure (classifyMain ms)]
           , cmmSrcs         = C.cmmSources      buildInfo
           , hcOpts          = C.programDefaultArgs ghcProg
               ++ C.hcOptions C.GHC buildInfo
@@ -299,6 +286,7 @@ resolveContextData context@Context {..} = do
               ++ C.programOverrideArgs ghcProg
           , asmOpts            = C.asmOptions buildInfo
           , ccOpts             = C.ccOptions  buildInfo
+          , cxxOpts            = C.cxxOptions buildInfo
           , cmmOpts            = C.cmmOptions buildInfo
           , cppOpts            = C.cppOptions buildInfo
           , ldOpts             = C.ldOptions  buildInfo
@@ -308,6 +296,8 @@ resolveContextData context@Context {..} = do
           , buildGhciLib       = C.withGHCiLib lbi'
           , frameworks         = C.frameworks buildInfo
           , packageDescription = pd' }
+
+      in return cdata
 
 -- | Build autogenerated files @autogen/cabal_macros.h@ and @autogen/Paths_*.hs@.
 buildAutogenFiles :: Context -> Action ()

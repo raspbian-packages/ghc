@@ -85,27 +85,13 @@ import Data.Typeable
 -- If 'hClose' fails for any reason, any further operations (apart from
 -- 'hClose') on the handle will still fail as if @hdl@ had been successfully
 -- closed.
-
+--
+-- 'hClose' is an /interruptible operation/ in the sense described in
+-- "Control.Exception". If 'hClose' is interrupted by an asynchronous
+-- exception in the process of flushing its buffers, then the I/O device
+-- (e.g., file) will be closed anyway.
 hClose :: Handle -> IO ()
-hClose h@(FileHandle _ m)     = do
-  mb_exc <- hClose' h m
-  hClose_maybethrow mb_exc h
-hClose h@(DuplexHandle _ r w) = do
-  excs <- mapM (hClose' h) [r,w]
-  hClose_maybethrow (listToMaybe (catMaybes excs)) h
-
-hClose_maybethrow :: Maybe SomeException -> Handle -> IO ()
-hClose_maybethrow Nothing  h = return ()
-hClose_maybethrow (Just e) h = hClose_rethrow e h
-
-hClose_rethrow :: SomeException -> Handle -> IO ()
-hClose_rethrow e h =
-  case fromException e of
-    Just ioe -> ioError (augmentIOError ioe "hClose" h)
-    Nothing  -> throwIO e
-
-hClose' :: Handle -> MVar Handle__ -> IO (Maybe SomeException)
-hClose' h m = withHandle' "hClose" h m $ hClose_help
+hClose = hClose_impl
 
 -----------------------------------------------------------------------------
 -- Detecting and changing the size of a file
@@ -266,7 +252,7 @@ hSetBuffering handle mode =
 -- the encoding.
 --
 hSetEncoding :: Handle -> TextEncoding -> IO ()
-hSetEncoding hdl encoding = do
+hSetEncoding hdl encoding =
   withAllHandles__ "hSetEncoding" hdl $ \h_@Handle__{..} -> do
     flushCharBuffer h_
     closeTextCodecs h_
@@ -577,9 +563,16 @@ hGetEcho handle = do
          _            -> IODevice.getEcho haDevice
 
 -- | Is the handle connected to a terminal?
-
+--
+-- On Windows the result of 'hIsTerminalDevide' might be misleading,
+-- because non-native terminals, such as MinTTY used in MSYS and Cygwin environments,
+-- are implemented via redirection.
+-- Use @System.Win32.Types.withHandleToHANDLE System.Win32.MinTTY.isMinTTYHandle@
+-- to recognise it. Also consider @ansi-terminal@ package for crossplatform terminal
+-- support.
+--
 hIsTerminalDevice :: Handle -> IO Bool
-hIsTerminalDevice handle = do
+hIsTerminalDevice handle =
     withHandle_ "hIsTerminalDevice" handle $ \ Handle__{..} -> do
      case haType of
        ClosedHandle -> ioe_closedHandle
@@ -641,7 +634,7 @@ hSetNewlineMode handle NewlineMode{ inputNL=i, outputNL=o } =
 -- before the handle is duplicated.
 
 hDuplicate :: Handle -> IO Handle
-hDuplicate h@(FileHandle path m) = do
+hDuplicate h@(FileHandle path m) =
   withHandle_' "hDuplicate" h m $ \h_ ->
       dupHandle path h Nothing h_ (Just handleFinalizer)
 hDuplicate h@(DuplexHandle path r w) = do
@@ -667,7 +660,7 @@ dupHandle filepath h other_side h_@Handle__{..} mb_finalizer = do
        new_dev <- IODevice.dup haDevice
        dupHandle_ new_dev filepath other_side h_ mb_finalizer
     Just r  ->
-       withHandle_' "dupHandle" h r $ \Handle__{haDevice=dev} -> do
+       withHandle_' "dupHandle" h r $ \Handle__{haDevice=dev} ->
          dupHandle_ dev filepath other_side h_ mb_finalizer
 
 dupHandle_ :: (RawIO dev, IODevice dev, BufferedIO dev, Typeable dev) => dev
@@ -697,19 +690,19 @@ This can be used to retarget the standard Handles, for example:
 -}
 
 hDuplicateTo :: Handle -> Handle -> IO ()
-hDuplicateTo h1@(FileHandle path m1) h2@(FileHandle _ m2)  = do
+hDuplicateTo h1@(FileHandle path m1) h2@(FileHandle _ m2) =
  withHandle__' "hDuplicateTo" h2 m2 $ \h2_ -> do
    try $ flushWriteBuffer h2_
-   withHandle_' "hDuplicateTo" h1 m1 $ \h1_ -> do
+   withHandle_' "hDuplicateTo" h1 m1 $ \h1_ ->
      dupHandleTo path h1 Nothing h2_ h1_ (Just handleFinalizer)
 hDuplicateTo h1@(DuplexHandle path r1 w1) h2@(DuplexHandle _ r2 w2)  = do
  withHandle__' "hDuplicateTo" h2 w2  $ \w2_ -> do
    try $ flushWriteBuffer w2_
-   withHandle_' "hDuplicateTo" h1 w1 $ \w1_ -> do
+   withHandle_' "hDuplicateTo" h1 w1 $ \w1_ ->
      dupHandleTo path h1 Nothing w2_ w1_ (Just handleFinalizer)
  withHandle__' "hDuplicateTo" h2 r2  $ \r2_ -> do
    try $ flushWriteBuffer r2_
-   withHandle_' "hDuplicateTo" h1 r1 $ \r1_ -> do
+   withHandle_' "hDuplicateTo" h1 r1 $ \r1_ ->
      dupHandleTo path h1 (Just w1) r2_ r1_ Nothing
 hDuplicateTo h1 _ =
   ioe_dupHandlesNotCompatible h1

@@ -2,11 +2,13 @@
     UnliftedFFITypes #-}
 {-# LANGUAGE Trustworthy #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 -- |
 -- Module      : Data.Text.Encoding
 -- Copyright   : (c) 2009, 2010, 2011 Bryan O'Sullivan,
 --               (c) 2009 Duncan Coutts,
 --               (c) 2008, 2009 Tom Harper
+--               (c) 2021 Andrew Lelechenko
 --
 -- License     : BSD-style
 -- Maintainer  : bos@serpentine.com
@@ -22,29 +24,48 @@ module Data.Text.Encoding
     (
     -- * Decoding ByteStrings to Text
     -- $strict
-      decodeASCII
-    , decodeLatin1
-    , decodeUtf8
-    , decodeUtf16LE
-    , decodeUtf16BE
-    , decodeUtf32LE
-    , decodeUtf32BE
 
-    -- ** Catchable failure
+    -- ** Total Functions #total#
+    -- $total
+      decodeLatin1
+    , decodeASCIIPrefix
+    , decodeUtf8Lenient
     , decodeUtf8'
+    , decodeASCII'
 
-    -- ** Controllable error handling
+    -- *** Controllable error handling
     , decodeUtf8With
     , decodeUtf16LEWith
     , decodeUtf16BEWith
     , decodeUtf32LEWith
     , decodeUtf32BEWith
 
-    -- ** Stream oriented decoding
+    -- *** Stream oriented decoding
     -- $stream
-    , streamDecodeUtf8
     , streamDecodeUtf8With
     , Decoding(..)
+
+    -- *** Incremental UTF-8 decoding
+    -- $incremental
+    , decodeUtf8Chunk
+    , decodeUtf8More
+    , Utf8State
+    , startUtf8State
+    , StrictBuilder
+    , strictBuilderToText
+    , textToStrictBuilder
+
+    -- ** Partial Functions
+    -- $partial
+    , decodeASCII
+    , decodeUtf8
+    , decodeUtf16LE
+    , decodeUtf16BE
+    , decodeUtf32LE
+    , decodeUtf32BE
+
+    -- *** Stream oriented decoding
+    , streamDecodeUtf8
 
     -- * Encoding Text to ByteStrings
     , encodeUtf8
@@ -56,44 +77,47 @@ module Data.Text.Encoding
     -- * Encoding Text using ByteString Builders
     , encodeUtf8Builder
     , encodeUtf8BuilderEscaped
+
+    -- * ByteString validation
+    -- $validation
+    , validateUtf8Chunk
+    , validateUtf8More
     ) where
 
-import Control.Monad.ST.Unsafe (unsafeIOToST, unsafeSTToIO)
-
-import Control.Exception (evaluate, try, throwIO, ErrorCall(ErrorCall))
+import Control.Exception (evaluate, try)
 import Control.Monad.ST (runST)
-import Data.Bits ((.&.))
-import Data.ByteString as B
-import qualified Data.ByteString.Internal as B
-import Data.Foldable (traverse_)
-import Data.Text.Encoding.Error (OnDecodeError, UnicodeException, strictDecode)
-import Data.Text.Internal (Text(..), safe, text)
-import Data.Text.Internal.Functions
-import Data.Text.Internal.Private (runText)
-import Data.Text.Internal.Unsafe.Char (ord, unsafeWrite)
-import Data.Text.Internal.Unsafe.Shift (shiftR)
-import Data.Text.Show ()
+import Control.Monad.ST.Unsafe (unsafeIOToST, unsafeSTToIO)
+import Data.Bits (shiftR, (.&.))
+import Data.Word (Word8)
+import Foreign.C.Types (CSize(..))
+import Foreign.Ptr (Ptr, minusPtr, plusPtr)
+import Foreign.Storable (poke, peekByteOff)
+import GHC.Exts (byteArrayContents#, unsafeCoerce#)
+import GHC.ForeignPtr (ForeignPtr(..), ForeignPtrContents(PlainPtr))
+import Data.ByteString (ByteString)
+import Data.Text.Encoding.Error (OnDecodeError, UnicodeException, strictDecode, lenientDecode)
+import Data.Text.Internal (Text(..), empty)
+import Data.Text.Internal.ByteStringCompat (withBS)
+import Data.Text.Internal.Encoding
+import Data.Text.Internal.Unsafe (unsafeWithForeignPtr)
 import Data.Text.Unsafe (unsafeDupablePerformIO)
-import Data.Word (Word8, Word16, Word32)
-import Foreign.C.Types (CSize(CSize))
-import Foreign.Marshal.Utils (with)
-import Foreign.Ptr (Ptr, minusPtr, nullPtr, plusPtr)
-import Foreign.Storable (Storable, peek, poke)
-import GHC.Base (ByteArray#, MutableByteArray#)
+import Data.Text.Show ()
+import qualified Data.ByteString as B
+import qualified Data.ByteString.Internal as B
 import qualified Data.ByteString.Builder as B
 import qualified Data.ByteString.Builder.Internal as B hiding (empty, append)
 import qualified Data.ByteString.Builder.Prim as BP
 import qualified Data.ByteString.Builder.Prim.Internal as BP
+import qualified Data.ByteString.Short.Internal as SBS
 import qualified Data.Text.Array as A
 import qualified Data.Text.Internal.Encoding.Fusion as E
-import qualified Data.Text.Internal.Encoding.Utf16 as U16
 import qualified Data.Text.Internal.Fusion as F
-import Data.Text.Internal.ByteStringCompat
 #if defined(ASSERTS)
 import GHC.Stack (HasCallStack)
 #endif
 
-#include "text_cbits.h"
+-- $validation
+-- These functions are for validating 'ByteString's as encoded text.
 
 -- $strict
 --
@@ -108,105 +132,115 @@ import GHC.Stack (HasCallStack)
 -- 'decodeUtf8With' allows the programmer to determine what to do on a
 -- decoding error.
 
--- | /Deprecated/.  Decode a 'ByteString' containing 7-bit ASCII
--- encoded text.
+-- $total
+--
+-- These functions facilitate total decoding and should be preferred
+-- over their partial counterparts.
+
+-- $partial
+--
+-- These functions are partial and should only be used with great caution
+-- (preferably not at all). See "Data.Text.Encoding#g:total" for better
+-- solutions.
+
+-- | Decode a 'ByteString' containing ASCII text.
+--
+-- This is a total function which returns a pair of the longest ASCII prefix
+-- as 'Text', and the remaining suffix as 'ByteString'.
+--
+-- Important note: the pair is lazy. This lets you check for errors by testing
+-- whether the second component is empty, without forcing the first component
+-- (which does a copy).
+-- To drop references to the input bytestring, force the prefix
+-- (using 'seq' or @BangPatterns@) and drop references to the suffix.
+--
+-- === Properties
+--
+-- - If @(prefix, suffix) = decodeAsciiPrefix s@, then @'encodeUtf8' prefix <> suffix = s@.
+-- - Either @suffix@ is empty, or @'B.head' suffix > 127@.
+--
+-- @since 2.0.2
+decodeASCIIPrefix :: ByteString -> (Text, ByteString)
+decodeASCIIPrefix bs = if B.null bs
+  then (empty, B.empty)
+  else
+    let len = asciiPrefixLength bs
+        prefix =
+          let !(SBS.SBS arr) = SBS.toShort (B.take len bs) in
+          Text (A.ByteArray arr) 0 len
+        suffix = B.drop len bs in
+    (prefix, suffix)
+{-# INLINE decodeASCIIPrefix #-}
+
+-- | Length of the longest ASCII prefix.
+asciiPrefixLength :: ByteString -> Int
+asciiPrefixLength bs = unsafeDupablePerformIO $ withBS bs $ \ fp len ->
+  unsafeWithForeignPtr fp $ \src -> do
+    fromIntegral <$> c_is_ascii src (src `plusPtr` len)
+
+-- | Decode a 'ByteString' containing 7-bit ASCII encoded text.
+--
+-- This is a total function which returns either the 'ByteString' converted to a
+-- 'Text' containing ASCII text, or 'Nothing'.
+--
+-- Use 'decodeASCIIPrefix' to retain the longest ASCII prefix for an invalid
+-- input instead of discarding it.
+--
+-- @since 2.0.2
+decodeASCII' :: ByteString -> Maybe Text
+decodeASCII' bs =
+  let (prefix, suffix) = decodeASCIIPrefix bs in
+  if B.null suffix then Just prefix else Nothing
+{-# INLINE decodeASCII' #-}
+
+-- | Decode a 'ByteString' containing 7-bit ASCII encoded text.
+--
+-- This is a partial function: it checks that input does not contain
+-- anything except ASCII and copies buffer or throws an error otherwise.
 decodeASCII :: ByteString -> Text
-decodeASCII = decodeUtf8
-{-# DEPRECATED decodeASCII "Use decodeUtf8 instead" #-}
+decodeASCII bs =
+  let (prefix, suffix) = decodeASCIIPrefix bs in
+  case B.uncons suffix of
+    Nothing -> prefix
+    Just (word, _) ->
+      let !errPos = B.length bs - B.length suffix in
+      error $ "decodeASCII: detected non-ASCII codepoint " ++ show word ++ " at position " ++ show errPos
 
 -- | Decode a 'ByteString' containing Latin-1 (aka ISO-8859-1) encoded text.
 --
 -- 'decodeLatin1' is semantically equivalent to
 --  @Data.Text.pack . Data.ByteString.Char8.unpack@
+--
+-- This is a total function. However, bear in mind that decoding Latin-1 (non-ASCII)
+-- characters to UTf-8 requires actual work and is not just buffer copying.
+--
 decodeLatin1 ::
 #if defined(ASSERTS)
   HasCallStack =>
 #endif
   ByteString -> Text
-decodeLatin1 bs = withBS bs aux where
-  aux fp len = text a 0 len
-   where
-    a = A.run (A.new len >>= unsafeIOToST . go)
-    go dest = unsafeWithForeignPtr fp $ \ptr -> do
-      c_decode_latin1 (A.maBA dest) ptr (ptr `plusPtr` len)
-      return dest
+decodeLatin1 bs = withBS bs $ \fp len -> runST $ do
+  dst <- A.new (2 * len)
+  let inner srcOff dstOff = if srcOff >= len then return dstOff else do
+        asciiPrefixLen <- fmap fromIntegral $ unsafeIOToST $ unsafeWithForeignPtr fp $ \src ->
+          c_is_ascii (src `plusPtr` srcOff) (src `plusPtr` len)
+        if asciiPrefixLen == 0
+        then do
+          byte <- unsafeIOToST $ unsafeWithForeignPtr fp $ \src -> peekByteOff src srcOff
+          A.unsafeWrite dst dstOff (0xC0 + (byte `shiftR` 6))
+          A.unsafeWrite dst (dstOff + 1) (0x80 + (byte .&. 0x3F))
+          inner (srcOff + 1) (dstOff + 2)
+        else do
+          unsafeIOToST $ unsafeWithForeignPtr fp $ \src ->
+            unsafeSTToIO $ A.copyFromPointer dst dstOff (src `plusPtr` srcOff) asciiPrefixLen
+          inner (srcOff + asciiPrefixLen) (dstOff + asciiPrefixLen)
+  actualLen <- inner 0 0
+  dst' <- A.resizeM dst actualLen
+  arr <- A.unsafeFreeze dst'
+  return $ Text arr 0 actualLen
 
--- | Decode a 'ByteString' containing UTF-8 encoded text.
---
--- __NOTE__: The replacement character returned by 'OnDecodeError'
--- MUST be within the BMP plane; surrogate code points will
--- automatically be remapped to the replacement char @U+FFFD@
--- (/since 0.11.3.0/), whereas code points beyond the BMP will throw an
--- 'error' (/since 1.2.3.1/); For earlier versions of @text@ using
--- those unsupported code points would result in undefined behavior.
-decodeUtf8With ::
-#if defined(ASSERTS)
-  HasCallStack =>
-#endif
-  OnDecodeError -> ByteString -> Text
-decodeUtf8With onErr bs = withBS bs aux
- where
-  aux fp len = runText $ \done -> do
-    let go dest = unsafeWithForeignPtr fp $ \ptr ->
-          with (0::CSize) $ \destOffPtr -> do
-            let end = ptr `plusPtr` len
-                loop curPtr = do
-                  curPtr' <- c_decode_utf8 (A.maBA dest) destOffPtr curPtr end
-                  if curPtr' == end
-                    then do
-                      n <- peek destOffPtr
-                      unsafeSTToIO (done dest (cSizeToInt n))
-                    else do
-                      x <- peek curPtr'
-                      case onErr desc (Just x) of
-                        Nothing -> loop $ curPtr' `plusPtr` 1
-                        Just c
-                          | c > '\xFFFF' -> throwUnsupportedReplChar
-                          | otherwise -> do
-                              destOff <- peek destOffPtr
-                              w <- unsafeSTToIO $
-                                   unsafeWrite dest (cSizeToInt destOff)
-                                               (safe c)
-                              poke destOffPtr (destOff + intToCSize w)
-                              loop $ curPtr' `plusPtr` 1
-            loop ptr
-    (unsafeIOToST . go) =<< A.new len
-   where
-    desc = "Data.Text.Internal.Encoding.decodeUtf8: Invalid UTF-8 stream"
-
-    throwUnsupportedReplChar = throwIO $
-      ErrorCall "decodeUtf8With: non-BMP replacement characters not supported"
-  -- TODO: The code currently assumes that the transcoded UTF-16
-  -- stream is at most twice as long (in bytes) as the input UTF-8
-  -- stream. To justify this assumption one has to assume that the
-  -- error handler replacement character also satisfies this
-  -- invariant, by emitting at most one UTF16 code unit.
-  --
-  -- One easy way to support the full range of code-points for
-  -- replacement characters in the error handler is to simply change
-  -- the (over-)allocation to `A.new (2*len)` and then shrink back the
-  -- `ByteArray#` to the real size (recent GHCs have a cheap
-  -- `ByteArray#` resize-primop for that which allow the GC to reclaim
-  -- the overallocation). However, this would require 4 times as much
-  -- (temporary) storage as the original UTF-8 required.
-  --
-  -- Another strategy would be to optimistically assume that
-  -- replacement characters are within the BMP, and if the case of a
-  -- non-BMP replacement occurs reallocate the target buffer (or throw
-  -- an exception, and fallback to a pessimistic codepath, like e.g.
-  -- `decodeUtf8With onErr bs = F.unstream (E.streamUtf8 onErr bs)`)
-  --
-  -- Alternatively, `OnDecodeError` could become a datastructure which
-  -- statically encodes the replacement-character range,
-  -- e.g. something isomorphic to
-  --
-  --   Either (... -> Maybe Word16) (... -> Maybe Char)
-  --
-  -- And allow to statically switch between the BMP/non-BMP
-  -- replacement-character codepaths. There's multiple ways to address
-  -- this with different tradeoffs; but ideally we should optimise for
-  -- the optimistic/error-free case.
-{- INLINE[0] decodeUtf8With #-}
+foreign import ccall unsafe "_hs_text_is_ascii" c_is_ascii
+    :: Ptr Word8 -> Ptr Word8 -> IO CSize
 
 -- $stream
 --
@@ -264,7 +298,7 @@ decodeUtf8With onErr bs = withBS bs aux
 -- | A stream oriented decoding result.
 --
 -- @since 1.0.0.0
-data Decoding = Some Text ByteString (ByteString -> Decoding)
+data Decoding = Some !Text !ByteString (ByteString -> Decoding)
 
 instance Show Decoding where
     showsPrec d (Some t bs _) = showParen (d > prec) $
@@ -272,9 +306,6 @@ instance Show Decoding where
                                 showChar ' ' . showsPrec prec' bs .
                                 showString " _"
       where prec = 10; prec' = prec + 1
-
-newtype CodePoint = CodePoint Word32 deriving (Eq, Show, Num, Storable)
-newtype DecoderState = DecoderState Word32 deriving (Eq, Show, Num, Storable)
 
 -- | Decode, in a stream oriented way, a 'ByteString' containing UTF-8
 -- encoded text that is known to be valid.
@@ -301,69 +332,25 @@ streamDecodeUtf8With ::
   HasCallStack =>
 #endif
   OnDecodeError -> ByteString -> Decoding
-streamDecodeUtf8With onErr = decodeChunk B.empty 0 0
- where
-  -- We create a slightly larger than necessary buffer to accommodate a
-  -- potential surrogate pair started in the last buffer (@undecoded0@), or
-  -- replacement characters for each byte in @undecoded0@ if the
-  -- sequence turns out to be invalid. There can be up to three bytes there,
-  -- hence we allocate @len+3@ 16-bit words.
-  decodeChunk :: ByteString -> CodePoint -> DecoderState -> ByteString
-              -> Decoding
-  decodeChunk undecoded0 codepoint0 state0 bs = withBS bs aux where
-    aux fp len = runST $ (unsafeIOToST . decodeChunkToBuffer) =<< A.new (len+3)
-       where
-        decodeChunkToBuffer :: A.MArray s -> IO Decoding
-        decodeChunkToBuffer dest = unsafeWithForeignPtr fp $ \ptr ->
-          with (0::CSize) $ \destOffPtr ->
-          with codepoint0 $ \codepointPtr ->
-          with state0 $ \statePtr ->
-          with nullPtr $ \curPtrPtr ->
-            let end = ptr `plusPtr` len
-                loop curPtr = do
-                  prevState <- peek statePtr
-                  poke curPtrPtr curPtr
-                  lastPtr <- c_decode_utf8_with_state (A.maBA dest) destOffPtr
-                             curPtrPtr end codepointPtr statePtr
-                  state <- peek statePtr
-                  case state of
-                    UTF8_REJECT -> do
-                      -- We encountered an encoding error
-                      poke statePtr 0
-                      let skipByte x = case onErr desc (Just x) of
-                            Nothing -> return ()
-                            Just c -> do
-                              destOff <- peek destOffPtr
-                              w <- unsafeSTToIO $
-                                   unsafeWrite dest (cSizeToInt destOff) (safe c)
-                              poke destOffPtr (destOff + intToCSize w)
-                      if ptr == lastPtr && prevState /= UTF8_ACCEPT then do
-                        -- If we can't complete the sequence @undecoded0@ from
-                        -- the previous chunk, we invalidate the bytes from
-                        -- @undecoded0@ and retry decoding the current chunk from
-                        -- the initial state.
-                        traverse_ skipByte (B.unpack undecoded0 )
-                        loop lastPtr
-                      else do
-                        peek lastPtr >>= skipByte
-                        loop (lastPtr `plusPtr` 1)
+streamDecodeUtf8With onErr = loop startUtf8State
+  where
+    loop s chunk =
+      let (builder, undecoded, s') = decodeUtf8With2 onErr invalidUtf8Msg s chunk
+      in Some (strictBuilderToText builder) undecoded (loop s')
 
-                    _ -> do
-                      -- We encountered the end of the buffer while decoding
-                      n <- peek destOffPtr
-                      codepoint <- peek codepointPtr
-                      chunkText <- unsafeSTToIO $ do
-                          arr <- A.unsafeFreeze dest
-                          return $! text arr 0 (cSizeToInt n)
-                      let left = lastPtr `minusPtr` ptr
-                          !undecoded = case state of
-                            UTF8_ACCEPT -> B.empty
-                            _ | left == 0 && prevState /= UTF8_ACCEPT -> B.append undecoded0 bs
-                              | otherwise -> B.drop left bs
-                      return $ Some chunkText undecoded
-                               (decodeChunk undecoded codepoint state)
-            in loop ptr
-  desc = "Data.Text.Internal.Encoding.streamDecodeUtf8With: Invalid UTF-8 stream"
+-- | Decode a 'ByteString' containing UTF-8 encoded text.
+--
+-- Surrogate code points in replacement character returned by 'OnDecodeError'
+-- will be automatically remapped to the replacement char @U+FFFD@.
+decodeUtf8With ::
+#if defined(ASSERTS)
+  HasCallStack =>
+#endif
+  OnDecodeError -> ByteString -> Text
+decodeUtf8With onErr = decodeUtf8With1 onErr invalidUtf8Msg
+
+invalidUtf8Msg :: String
+invalidUtf8Msg = "Data.Text.Encoding: Invalid UTF-8 stream"
 
 -- | Decode a 'ByteString' containing UTF-8 encoded text that is known
 -- to be valid.
@@ -372,11 +359,13 @@ streamDecodeUtf8With onErr = decodeChunk B.empty 0 0
 -- thrown that cannot be caught in pure code.  For more control over
 -- the handling of invalid data, use 'decodeUtf8'' or
 -- 'decodeUtf8With'.
+--
+-- This is a partial function: it checks that input is a well-formed
+-- UTF-8 sequence and copies buffer or throws an error otherwise.
+--
 decodeUtf8 :: ByteString -> Text
 decodeUtf8 = decodeUtf8With strictDecode
 {-# INLINE[0] decodeUtf8 #-}
-{-# RULES "STREAM stream/decodeUtf8 fusion" [1]
-    forall bs. F.stream (decodeUtf8 bs) = E.streamUtf8 strictDecode bs #-}
 
 -- | Decode a 'ByteString' containing UTF-8 encoded text.
 --
@@ -390,11 +379,48 @@ decodeUtf8' ::
 decodeUtf8' = unsafeDupablePerformIO . try . evaluate . decodeUtf8With strictDecode
 {-# INLINE decodeUtf8' #-}
 
+-- | Decode a 'ByteString' containing UTF-8 encoded text.
+--
+-- Any invalid input bytes will be replaced with the Unicode replacement
+-- character U+FFFD.
+decodeUtf8Lenient :: ByteString -> Text
+decodeUtf8Lenient = decodeUtf8With lenientDecode
+
 -- | Encode text to a ByteString 'B.Builder' using UTF-8 encoding.
 --
 -- @since 1.1.0.0
 encodeUtf8Builder :: Text -> B.Builder
-encodeUtf8Builder = encodeUtf8BuilderEscaped (BP.liftFixedToBounded BP.word8)
+encodeUtf8Builder =
+    -- manual eta-expansion to ensure inlining works as expected
+    \txt -> B.builder (step txt)
+  where
+    step txt@(Text arr off len) !k br@(B.BufferRange op ope)
+      -- Ensure that the common case is not recursive and therefore yields
+      -- better code.
+      | op' <= ope = do
+          unsafeSTToIO $ A.copyToPointer arr off op len
+          k (B.BufferRange op' ope)
+      | otherwise = textCopyStep txt k br
+      where
+        op' = op `plusPtr` len
+{-# INLINE encodeUtf8Builder #-}
+
+textCopyStep :: Text -> B.BuildStep a -> B.BuildStep a
+textCopyStep (Text arr off len) k =
+    go off (off + len)
+  where
+    go !ip !ipe (B.BufferRange op ope)
+      | inpRemaining <= outRemaining = do
+          unsafeSTToIO $ A.copyToPointer arr ip op inpRemaining
+          let !br = B.BufferRange (op `plusPtr` inpRemaining) ope
+          k br
+      | otherwise = do
+          unsafeSTToIO $ A.copyToPointer arr ip op outRemaining
+          let !ip' = ip + outRemaining
+          return $ B.bufferFull 1 ope (go ip' ipe)
+      where
+        outRemaining = ope `minusPtr` op
+        inpRemaining = ipe - ip
 
 -- | Encode text using UTF-8 encoding and escape the ASCII characters using
 -- a 'BP.BoundedPrim'.
@@ -425,56 +451,31 @@ encodeUtf8BuilderEscaped be =
           -- is smaller than 8, as this will save on divisions.
           | otherwise        = return $ B.bufferFull bound op0 (outerLoop i0)
           where
-            outRemaining = (ope `minusPtr` op0) `div` bound
+            outRemaining = (ope `minusPtr` op0) `quot` bound
             inpRemaining = iend - i0
 
             goPartial !iendTmp = go i0 op0
               where
                 go !i !op
-                  | i < iendTmp = case A.unsafeIndex arr i of
-                      w | w <= 0x7F -> do
-                            BP.runB be (word16ToWord8 w) op >>= go (i + 1)
-                        | w <= 0x7FF -> do
-                            poke8 @Word16 0 $ (w `shiftR` 6) + 0xC0
-                            poke8 @Word16 1 $ (w .&. 0x3f) + 0x80
-                            go (i + 1) (op `plusPtr` 2)
-                        | 0xD800 <= w && w <= 0xDBFF -> do
-                            let c = ord $ U16.chr2 w (A.unsafeIndex arr (i+1))
-                            poke8 @Int 0 $ (c `shiftR` 18) + 0xF0
-                            poke8 @Int 1 $ ((c `shiftR` 12) .&. 0x3F) + 0x80
-                            poke8 @Int 2 $ ((c `shiftR` 6) .&. 0x3F) + 0x80
-                            poke8 @Int 3 $ (c .&. 0x3F) + 0x80
-                            go (i + 2) (op `plusPtr` 4)
-                        | otherwise -> do
-                            poke8 @Word16 0 $ (w `shiftR` 12) + 0xE0
-                            poke8 @Word16 1 $ ((w `shiftR` 6) .&. 0x3F) + 0x80
-                            poke8 @Word16 2 $ (w .&. 0x3F) + 0x80
-                            go (i + 1) (op `plusPtr` 3)
-                  | otherwise =
-                      outerLoop i (B.BufferRange op ope)
-                  where
-                    -- Take care, a is either Word16 or Int above
-                    poke8 :: Integral a => Int -> a -> IO ()
-                    poke8 j v = poke (op `plusPtr` j) (fromIntegral v :: Word8)
+                  | i < iendTmp = do
+                    let w = A.unsafeIndex arr i
+                    if w < 0x80
+                      then BP.runB be w op >>= go (i + 1)
+                      else poke op w >> go (i + 1) (op `plusPtr` 1)
+                  | otherwise = outerLoop i (B.BufferRange op ope)
 
 -- | Encode text using UTF-8 encoding.
 encodeUtf8 :: Text -> ByteString
 encodeUtf8 (Text arr off len)
   | len == 0  = B.empty
+  -- It would be easier to use Data.ByteString.Short.fromShort and slice later,
+  -- but this is undesirable when len is significantly smaller than length arr.
   | otherwise = unsafeDupablePerformIO $ do
-  fp <- B.mallocByteString (len*3) -- see https://github.com/haskell/text/issues/194 for why len*3 is enough
-  unsafeWithForeignPtr fp $ \ptr ->
-    with ptr $ \destPtr -> do
-      c_encode_utf8 destPtr (A.aBA arr) (intToCSize off) (intToCSize len)
-      newDest <- peek destPtr
-      let utf8len = newDest `minusPtr` ptr
-      if utf8len >= len `shiftR` 1
-        then return (mkBS fp utf8len)
-        else do
-          fp' <- B.mallocByteString utf8len
-          unsafeWithForeignPtr fp' $ \ptr' -> do
-            B.memcpy ptr' ptr utf8len
-            return (mkBS fp' utf8len)
+    marr@(A.MutableByteArray mba) <- unsafeSTToIO $ A.newPinned len
+    unsafeSTToIO $ A.copyI len marr 0 arr off
+    let fp = ForeignPtr (byteArrayContents# (unsafeCoerce# mba))
+                        (PlainPtr mba)
+    pure $ B.fromForeignPtr fp 0 len
 
 -- | Decode text from little endian UTF-16 encoding.
 decodeUtf16LEWith :: OnDecodeError -> ByteString -> Text
@@ -552,26 +553,17 @@ encodeUtf32BE :: Text -> ByteString
 encodeUtf32BE txt = E.unstream (E.restreamUtf32BE (F.stream txt))
 {-# INLINE encodeUtf32BE #-}
 
-cSizeToInt :: CSize -> Int
-cSizeToInt = fromIntegral
-
-intToCSize :: Int -> CSize
-intToCSize = fromIntegral
-
-word16ToWord8 :: Word16 -> Word8
-word16ToWord8 = fromIntegral
-
-foreign import ccall unsafe "_hs_text_decode_utf8" c_decode_utf8
-    :: MutableByteArray# s -> Ptr CSize
-    -> Ptr Word8 -> Ptr Word8 -> IO (Ptr Word8)
-
-foreign import ccall unsafe "_hs_text_decode_utf8_state" c_decode_utf8_with_state
-    :: MutableByteArray# s -> Ptr CSize
-    -> Ptr (Ptr Word8) -> Ptr Word8
-    -> Ptr CodePoint -> Ptr DecoderState -> IO (Ptr Word8)
-
-foreign import ccall unsafe "_hs_text_decode_latin1" c_decode_latin1
-    :: MutableByteArray# s -> Ptr Word8 -> Ptr Word8 -> IO ()
-
-foreign import ccall unsafe "_hs_text_encode_utf8" c_encode_utf8
-    :: Ptr (Ptr Word8) -> ByteArray# -> CSize -> CSize -> IO ()
+-- $incremental
+-- The functions 'decodeUtf8Chunk' and 'decodeUtf8More' provide more
+-- control for error-handling and streaming.
+--
+-- - Those functions return an UTF-8 prefix of the given 'ByteString' up to the next error.
+--   For example this lets you insert or delete arbitrary text, or do some
+--   stateful operations before resuming, such as keeping track of error locations.
+--   In contrast, the older stream-oriented interface only lets you substitute
+--   a single fixed 'Char' for each invalid byte in 'OnDecodeError'.
+-- - That prefix is encoded as a 'StrictBuilder', so you can accumulate chunks
+--   before doing the copying work to construct a 'Text', or you can
+--   output decoded fragments immediately as a lazy 'Data.Text.Lazy.Text'.
+--
+-- For even lower-level primitives, see 'validateUtf8Chunk' and 'validateUtf8More'.

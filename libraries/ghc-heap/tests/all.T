@@ -36,3 +36,21 @@ test('closure_size_noopt',
      ],
      compile_and_run, [''])
 
+test('tso_and_stack_closures',
+     [extra_files(['create_tso.c','create_tso.h','TestUtils.hs']),
+      only_ways(['profthreaded']),
+      ignore_stdout,
+      ignore_stderr
+     ],
+     multi_compile_and_run, ['tso_and_stack_closures', [('create_tso.c','')], ''])
+
+test('parse_tso_flags',
+     [extra_files(['TestUtils.hs']),
+      only_ways(['normal']),
+      ignore_stdout,
+      ignore_stderr
+     ],
+     compile_and_run, [''])
+test('T21622',
+     only_ways(['normal']),
+     compile_and_run, [''])

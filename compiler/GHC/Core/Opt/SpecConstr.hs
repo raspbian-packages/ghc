@@ -10,7 +10,7 @@ ToDo [Oct 2013]
 \section[SpecConstr]{Specialise over constructors}
 -}
 
-{-# LANGUAGE CPP #-}
+
 
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 
@@ -19,51 +19,62 @@ module GHC.Core.Opt.SpecConstr(
         SpecConstrAnnotation(..)
     ) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
+
+import GHC.Driver.Session ( DynFlags(..), GeneralFlag( Opt_SpecConstrKeen )
+                          , gopt, hasPprDebug )
 
 import GHC.Core
 import GHC.Core.Subst
 import GHC.Core.Utils
-import GHC.Core.Unfold  ( couldBeSmallEnoughToInline )
+import GHC.Core.Unfold
 import GHC.Core.FVs     ( exprsFreeVarsList )
 import GHC.Core.Opt.Monad
-import GHC.Types.Literal ( litIsLifted )
-import GHC.Driver.Types ( ModGuts(..) )
-import GHC.Core.Opt.WorkWrap.Utils ( isWorkerSmallEnough, mkWorkerArgs )
+import GHC.Core.Opt.WorkWrap.Utils
 import GHC.Core.DataCon
 import GHC.Core.Coercion hiding( substCo )
 import GHC.Core.Rules
 import GHC.Core.Type     hiding ( substTy )
-import GHC.Core.TyCon   ( tyConName )
+import GHC.Core.TyCon   (TyCon, tyConUnique, tyConName )
 import GHC.Core.Multiplicity
-import GHC.Types.Id
 import GHC.Core.Ppr     ( pprParendExpr )
 import GHC.Core.Make    ( mkImpossibleExpr )
+
+import GHC.Unit.Module
+import GHC.Unit.Module.ModGuts
+
+import GHC.Types.Literal ( litIsLifted )
+import GHC.Types.Id
+import GHC.Types.Id.Make ( voidArgId, voidPrimId )
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 import GHC.Types.Name
+import GHC.Types.Tickish
 import GHC.Types.Basic
-import GHC.Driver.Session ( DynFlags(..), GeneralFlag( Opt_SpecConstrKeen )
-                          , gopt, hasPprDebug )
-import GHC.Data.Maybe     ( orElse, catMaybes, isJust, isNothing )
 import GHC.Types.Demand
 import GHC.Types.Cpr
-import GHC.Serialized   ( deserializeWithData )
-import GHC.Utils.Misc
-import GHC.Data.Pair
 import GHC.Types.Unique.Supply
-import GHC.Utils.Outputable
-import GHC.Data.FastString
 import GHC.Types.Unique.FM
+
+import GHC.Data.Maybe     ( orElse, catMaybes, isJust, isNothing )
+import GHC.Data.Pair
+import GHC.Data.FastString
+
+import GHC.Utils.Misc
+import GHC.Utils.Outputable
+import GHC.Utils.Panic.Plain
+import GHC.Utils.Panic
+import GHC.Utils.Constants (debugIsOn)
 import GHC.Utils.Monad
-import Control.Monad    ( zipWithM )
-import Data.List
-import GHC.Builtin.Names ( specTyConName )
-import GHC.Unit.Module
-import GHC.Core.TyCon ( TyCon )
+import GHC.Utils.Trace
+
+import GHC.Builtin.Names ( specTyConKey )
+
 import GHC.Exts( SpecConstrAnnotation(..) )
+import GHC.Serialized   ( deserializeWithData )
+
+import Control.Monad    ( zipWithM )
+import Data.List (nubBy, sortBy, partition, dropWhileEnd, mapAccumL )
 import Data.Ord( comparing )
 
 {-
@@ -616,6 +627,13 @@ regardless of size; and then we needed a way to turn that *off*.  Now
 that we have ForceSpecConstr, this NoSpecConstr is probably redundant.
 (Used only for PArray, TODO: remove?)
 
+Note [SpecConstr and strict fields]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We treat strict fields in SpecConstr the same way we do in W/W.
+That is we make the specialized function strict in arguments
+representing strict fields. See Note [Call-by-value for worker args]
+for why we do this.
+
 -----------------------------------------------------
                 Stuff not yet handled
 -----------------------------------------------------
@@ -705,6 +723,7 @@ specConstrProgram guts
       us     <- getUniqueSupplyM
       (_, annos) <- getFirstAnnotations deserializeWithData guts
       this_mod <- getModule
+      -- pprTraceM "specConstrInput" (ppr $ mg_binds guts)
       let binds' = reverse $ fst $ initUs us $ do
                     -- Note [Top-level recursive groups]
                     (env, binds) <- goEnv (initScEnv dflags this_mod annos)
@@ -813,6 +832,7 @@ the function is applied to a data constructor.
 -}
 
 data ScEnv = SCE { sc_dflags    :: DynFlags,
+                   sc_uf_opts   :: !UnfoldingOpts, -- ^ Unfolding options
                    sc_module    :: !Module,
                    sc_size      :: Maybe Int,   -- Size threshold
                                                 -- Nothing => no limit
@@ -867,6 +887,7 @@ instance Outputable Value where
 initScEnv :: DynFlags -> Module -> UniqFM Name SpecConstrAnnotation -> ScEnv
 initScEnv dflags this_mod anns
   = SCE { sc_dflags      = dflags,
+          sc_uf_opts     = unfoldingOpts dflags,
           sc_module      = this_mod,
           sc_size        = specConstrThreshold dflags,
           sc_count       = specConstrCount     dflags,
@@ -908,7 +929,8 @@ zapScSubst env = env { sc_subst = zapSubstEnv (sc_subst env) }
 
 extendScInScope :: ScEnv -> [Var] -> ScEnv
         -- Bring the quantified variables into scope
-extendScInScope env qvars = env { sc_subst = extendInScopeList (sc_subst env) qvars }
+extendScInScope env qvars
+  = env { sc_subst = extendSubstInScopeList (sc_subst env) qvars }
 
         -- Extend the substitution
 extendScSubst :: ScEnv -> Var -> OutExpr -> ScEnv
@@ -942,10 +964,13 @@ extendRecBndrs env bndrs  = (env { sc_subst = subst' }, bndrs')
                       where
                         (subst', bndrs') = substRecBndrs (sc_subst env) bndrs
 
+extendBndrs :: ScEnv -> [Var] -> (ScEnv, [Var])
+extendBndrs env bndrs = mapAccumL extendBndr env bndrs
+
 extendBndr :: ScEnv -> Var -> (ScEnv, Var)
-extendBndr  env bndr  = (env { sc_subst = subst' }, bndr')
-                      where
-                        (subst', bndr') = substBndr (sc_subst env) bndr
+extendBndr env bndr  = (env { sc_subst = subst' }, bndr')
+                     where
+                       (subst', bndr') = substBndr (sc_subst env) bndr
 
 extendValEnv :: ScEnv -> Id -> Maybe Value -> ScEnv
 extendValEnv env _  Nothing   = env
@@ -1004,7 +1029,6 @@ decreaseSpecCount env n_specs
 ignoreType    :: ScEnv -> Type   -> Bool
 ignoreDataCon  :: ScEnv -> DataCon -> Bool
 forceSpecBndr :: ScEnv -> Var    -> Bool
-forceSpecBndr env var = forceSpecFunTy env . snd . splitForAllTys . varType $ var
 
 ignoreDataCon env dc = ignoreTyCon env (dataConTyCon dc)
 
@@ -1017,6 +1041,8 @@ ignoreTyCon :: ScEnv -> TyCon -> Bool
 ignoreTyCon env tycon
   = lookupUFM (sc_annotations env) (tyConName tycon) == Just NoSpecConstr
 
+forceSpecBndr env var = forceSpecFunTy env . snd . splitForAllTyCoVars . varType $ var
+
 forceSpecFunTy :: ScEnv -> Type -> Bool
 forceSpecFunTy env = any (forceSpecArgTy env) . map scaledThing . fst . splitFunTys
 
@@ -1027,7 +1053,7 @@ forceSpecArgTy env ty
 forceSpecArgTy env ty
   | Just (tycon, tys) <- splitTyConApp_maybe ty
   , tycon /= funTyCon
-      = tyConName tycon == specTyConName
+      = tyConUnique tycon == specTyConKey
         || lookupUFM (sc_annotations env) (tyConName tycon) == Just ForceSpecConstr
         || any (forceSpecArgTy env) tys
 
@@ -1097,11 +1123,14 @@ data Call = Call Id [CoreArg] ValueEnv
         -- The arguments of the call, together with the
         -- env giving the constructor bindings at the call site
         -- We keep the function mainly for debug output
+        --
+        -- The call is not necessarily saturated; we just put
+        -- in however many args are visible at the call site
 
 instance Outputable ScUsage where
   ppr (SCU { scu_calls = calls, scu_occs = occs })
-    = text "SCU" <+> braces (sep [ ptext (sLit "calls =") <+> ppr calls
-                                         , text "occs =" <+> ppr occs ])
+    = text "SCU" <+> braces (sep [ text "calls =" <+> ppr calls
+                                 , text "occs =" <+> ppr occs ])
 
 instance Outputable Call where
   ppr (Call fn args _) = ppr fn <+> fsep (map pprParendExpr args)
@@ -1111,14 +1140,6 @@ nullUsage = SCU { scu_calls = emptyVarEnv, scu_occs = emptyVarEnv }
 
 combineCalls :: CallEnv -> CallEnv -> CallEnv
 combineCalls = plusVarEnv_C (++)
-  where
---    plus cs ds | length res > 1
---               = pprTrace "combineCalls" (vcat [ text "cs:" <+> ppr cs
---                                               , text "ds:" <+> ppr ds])
---                 res
---               | otherwise = res
---       where
---          res = cs ++ ds
 
 combineUsage :: ScUsage -> ScUsage -> ScUsage
 combineUsage u1 u2 = SCU { scu_calls = combineCalls (scu_calls u1) (scu_calls u2),
@@ -1139,10 +1160,8 @@ data ArgOcc = NoOcc     -- Doesn't occur at all; or a type argument
             | ScrutOcc  -- See Note [ScrutOcc]
                  (DataConEnv [ArgOcc])   -- How the sub-components are used
 
-type DataConEnv a = UniqFM DataCon a     -- Keyed by DataCon
-
-{- Note  [ScrutOcc]
-~~~~~~~~~~~~~~~~~~~
+{- Note [ScrutOcc]
+~~~~~~~~~~~~~~~~~~
 An occurrence of ScrutOcc indicates that the thing, or a `cast` version of the thing,
 is *only* taken apart or applied.
 
@@ -1236,8 +1255,8 @@ scExpr' env (Case scrut b ty alts)
         }
   where
     sc_con_app con args scrut'  -- Known constructor; simplify
-     = do { let (_, bs, rhs) = findAlt con alts
-                                  `orElse` (DEFAULT, [], mkImpossibleExpr ty)
+     = do { let Alt _ bs rhs = findAlt con alts
+                                  `orElse` Alt DEFAULT [] (mkImpossibleExpr ty)
                 alt_env'     = extendScSubstList env ((b,scrut') : bs `zip` trimConArgs con args)
           ; scExpr alt_env' rhs }
 
@@ -1257,7 +1276,7 @@ scExpr' env (Case scrut b ty alts)
           ; return (foldr combineUsage scrut_usg' alt_usgs,
                     Case scrut' b' (scSubstTy env ty) alts') }
 
-    sc_alt env scrut' b' (con,bs,rhs)
+    sc_alt env scrut' b' (Alt con bs rhs)
      = do { let (env1, bs1) = extendBndrsWith RecArg env bs
                 (env2, bs2) = extendCaseBndrs env1 scrut' b' con bs1
           ; (usg, rhs') <- scExpr env2 rhs
@@ -1265,7 +1284,7 @@ scExpr' env (Case scrut b ty alts)
                 scrut_occ = case con of
                                DataAlt dc -> ScrutOcc (unitUFM dc arg_occs)
                                _          -> ScrutOcc emptyUFM
-          ; return (usg', b_occ `combineOcc` scrut_occ, (con, bs2, rhs')) }
+          ; return (usg', b_occ `combineOcc` scrut_occ, Alt con bs2 rhs') }
 
 scExpr' env (Let (NonRec bndr rhs) body)
   | isTyVar bndr        -- Type-lets may be created by doBeta
@@ -1276,7 +1295,7 @@ scExpr' env (Let (NonRec bndr rhs) body)
         ; rhs_info  <- scRecRhs env (bndr',rhs)
 
         ; let body_env2 = extendHowBound body_env [bndr'] RecFun
-                           -- Note [Local let bindings]
+                           -- See Note [Local let bindings]
               rhs'      = ri_new_rhs rhs_info
               body_env3 = extendValEnv body_env2 bndr' (isValue (sc_vals env) rhs')
 
@@ -1286,9 +1305,14 @@ scExpr' env (Let (NonRec bndr rhs) body)
           -- the parent function (see Note [Forcing specialisation])
         ; (spec_usg, specs) <- specNonRec env body_usg rhs_info
 
+        -- Specialized + original binding
+        ; let spec_bnds = mkLets [NonRec b r | (b,r) <- ruleInfoBinds rhs_info specs] body'
+        -- ; pprTraceM "spec_bnds" $ (ppr spec_bnds)
+
         ; return (body_usg { scu_calls = scu_calls body_usg `delVarEnv` bndr' }
                     `combineUsage` spec_usg,  -- Note [spec_usg includes rhs_usg]
-                  mkLets [NonRec b r | (b,r) <- ruleInfoBinds rhs_info specs] body')
+                  spec_bnds
+                  )
         }
 
 
@@ -1339,7 +1363,7 @@ harmful.  I'm not sure.
 scApp :: ScEnv -> (InExpr, [InExpr]) -> UniqSM (ScUsage, CoreExpr)
 
 scApp env (Var fn, args)        -- Function is a variable
-  = ASSERT( not (null args) )
+  = assert (not (null args)) $
     do  { args_w_usgs <- mapM (scExpr env) args
         ; let (arg_usgs, args') = unzip args_w_usgs
               arg_usg = combineUsages arg_usgs
@@ -1402,16 +1426,10 @@ scTopBindEnv env (NonRec bndr rhs)
 ----------------------
 scTopBind :: ScEnv -> ScUsage -> CoreBind -> UniqSM (ScUsage, CoreBind)
 
-{-
-scTopBind _ usage _
-  | pprTrace "scTopBind_usage" (ppr (scu_calls usage)) False
-  = error "false"
--}
-
 scTopBind env body_usage (Rec prs)
   | Just threshold <- sc_size env
   , not force_spec
-  , not (all (couldBeSmallEnoughToInline (sc_dflags env) threshold) rhss)
+  , not (all (couldBeSmallEnoughToInline (sc_uf_opts env) threshold) rhss)
                 -- No specialisation
   = -- pprTrace "scTopBind: nospec" (ppr bndrs) $
     do  { (rhs_usgs, rhss')   <- mapAndUnzipM (scExpr env) rhss
@@ -1606,15 +1624,16 @@ specialise env bind_calls (RI { ri_fn = fn, ri_lam_bndrs = arg_bndrs
   = -- pprTrace "specialise bot" (ppr fn) $
     return (nullUsage, spec_info)
 
-  | isNeverActive (idInlineActivation fn) -- See Note [Transfer activation]
-    || null arg_bndrs                     -- Only specialise functions
-  = -- pprTrace "specialise inactive" (ppr fn) $
-    case mb_unspec of    -- Behave as if there was a single, boring call
-      Just rhs_usg -> return (rhs_usg, spec_info { si_mb_unspec = Nothing })
-                         -- See Note [spec_usg includes rhs_usg]
-      Nothing      -> return (nullUsage, spec_info)
-
-  | Just all_calls <- lookupVarEnv bind_calls fn
+  | not (isNeverActive (idInlineActivation fn))
+      -- See Note [Transfer activation]
+      --
+      --
+      -- Don't specialise OPAQUE things, see Note [OPAQUE pragma].
+      -- Since OPAQUE things are always never-active (see
+      -- GHC.Parser.PostProcess.mkOpaquePragma) this guard never fires for
+      -- OPAQUE things.
+  , not (null arg_bndrs)                         -- Only specialise functions
+  , Just all_calls <- lookupVarEnv bind_calls fn -- Some calls to it
   = -- pprTrace "specialise entry {" (ppr fn <+> ppr all_calls) $
     do  { (boring_call, new_pats) <- callsToNewPats env fn spec_info arg_occs all_calls
 
@@ -1653,10 +1672,13 @@ specialise env bind_calls (RI { ri_fn = fn, ri_lam_bndrs = arg_bndrs
                                 , si_n_specs = spec_count + n_pats
                                 , si_mb_unspec = mb_unspec' }) }
 
-  | otherwise  -- No new seeds, so return nullUsage
-  = return (nullUsage, spec_info)
-
-
+  | otherwise  -- No calls, inactive, or not a function
+               -- Behave as if there was a single, boring call
+  = -- pprTrace "specialise inactive" (ppr fn $$ ppr mb_unspec) $
+    case mb_unspec of    -- Behave as if there was a single, boring call
+      Just rhs_usg -> return (rhs_usg, spec_info { si_mb_unspec = Nothing })
+                         -- See Note [spec_usg includes rhs_usg]
+      Nothing      -> return (nullUsage, spec_info)
 
 
 ---------------------
@@ -1689,99 +1711,232 @@ spec_one :: ScEnv
             f (b,c) ((:) (a,(b,c)) (x,v) hw) = f_spec b c v hw
 -}
 
-spec_one env fn arg_bndrs body (call_pat@(qvars, pats), rule_number)
+spec_one env fn arg_bndrs body (call_pat, rule_number)
+  | CP { cp_qvars = qvars, cp_args = pats, cp_strict_args = cbv_args } <- call_pat
   = do  { spec_uniq <- getUniqueM
-        ; let spec_env   = extendScSubstList (extendScInScope env qvars)
-                                             (arg_bndrs `zip` pats)
-              fn_name    = idName fn
-              fn_loc     = nameSrcSpan fn_name
-              fn_occ     = nameOccName fn_name
-              spec_occ   = mkSpecOcc fn_occ
+        ; let env1 = extendScSubstList (extendScInScope env qvars)
+                                       (arg_bndrs `zip` pats)
+              (body_env, extra_bndrs) = extendBndrs env1 (dropList pats arg_bndrs)
+              -- Remember, there may be fewer pats than arg_bndrs
+              -- See Note [SpecConstr call patterns]
+              -- extra_bndrs will then be arguments in the specialized version
+              -- which are *not* applied to arguments immediately at the call sites.
+              -- e.g. let f x y = ... in map (f True) xs
+              -- will result in y becoming an extra_bndr
+
+              fn_name  = idName fn
+              fn_loc   = nameSrcSpan fn_name
+              fn_occ   = nameOccName fn_name
+              spec_occ = mkSpecOcc fn_occ
               -- We use fn_occ rather than fn in the rule_name string
               -- as we don't want the uniq to end up in the rule, and
               -- hence in the ABI, as that can cause spurious ABI
               -- changes (#4012).
               rule_name  = mkFastString ("SC:" ++ occNameString fn_occ ++ show rule_number)
               spec_name  = mkInternalName spec_uniq spec_occ fn_loc
---      ; pprTrace "{spec_one" (ppr (sc_count env) <+> ppr fn
---                              <+> ppr pats <+> text "-->" <+> ppr spec_name) $
---        return ()
 
         -- Specialise the body
-        ; (spec_usg, spec_body) <- scExpr spec_env body
+        -- ; pprTraceM "body_subst_for" $ ppr (spec_occ) $$ ppr (sc_subst body_env)
+        ; (spec_usg, spec_body) <- scExpr body_env body
 
---      ; pprTrace "done spec_one}" (ppr fn) $
+--      ; pprTrace "done spec_one }" (ppr fn $$ ppr (scu_calls spec_usg)) $
 --        return ()
 
                 -- And build the results
-        ; let (spec_lam_args, spec_call_args) = mkWorkerArgs (sc_dflags env)
-                                                             qvars body_ty
-                -- Usual w/w hack to avoid generating
-                -- a spec_rhs of unlifted type and no args
+        ; let spec_body_ty = exprType spec_body
+              (spec_lam_args, spec_call_args, spec_sig)
+                  = calcSpecInfo fn arg_bndrs call_pat extra_bndrs
 
-              spec_lam_args_str = handOutStrictnessInformation (fst (splitStrictSig spec_str)) spec_lam_args
-                -- Annotate the variables with the strictness information from
-                -- the function (see Note [Strictness information in worker binders])
-
-              spec_join_arity | isJoinId fn = Just (length spec_lam_args)
+              spec_arity = count isId spec_lam_args
+              spec_join_arity | isJoinId fn = Just (length spec_call_args)
                               | otherwise   = Nothing
-              spec_id    = mkLocalId spec_name Many
-                                     (mkLamTypes spec_lam_args body_ty)
+              spec_id    = asWorkerLikeId $
+                           mkLocalId spec_name Many
+                                     (mkLamTypes spec_lam_args spec_body_ty)
                              -- See Note [Transfer strictness]
-                             `setIdStrictness` spec_str
-                             `setIdCprInfo` topCprSig
-                             `setIdArity` count isId spec_lam_args
+                             `setIdDmdSig`    spec_sig
+                             `setIdCprSig`    topCprSig
+                             `setIdArity`     spec_arity
                              `asJoinId_maybe` spec_join_arity
-              spec_str   = calcSpecStrictness fn spec_lam_args pats
 
-
-                -- Conditionally use result of new worker-wrapper transform
-              spec_rhs   = mkLams spec_lam_args_str spec_body
-              body_ty    = exprType spec_body
-              rule_rhs   = mkVarApps (Var spec_id) spec_call_args
+        -- Conditionally use result of new worker-wrapper transform
+              spec_rhs = mkLams spec_lam_args (mkSeqs cbv_args spec_body_ty spec_body)
+              rule_rhs = mkVarApps (Var spec_id) spec_call_args
               inline_act = idInlineActivation fn
-              this_mod   = sc_module spec_env
+              this_mod   = sc_module env
               rule       = mkRule this_mod True {- Auto -} True {- Local -}
                                   rule_name inline_act fn_name qvars pats rule_rhs
                            -- See Note [Transfer activation]
+
+        -- ; pprTrace "spec_one {" (vcat [ text "function:" <+> ppr fn <+> ppr (idUnique fn)
+        --                               , text "sc_count:" <+> ppr (sc_count env)
+        --                               , text "pats:" <+> ppr pats
+        --                               , text "call_pat:" <+> ppr call_pat
+        --                               , text "-->" <+> ppr spec_name
+        --                               , text "bndrs" <+> ppr arg_bndrs
+        --                               , text "extra_bndrs" <+> ppr extra_bndrs
+        --                               , text "spec_lam_args" <+> ppr spec_lam_args
+        --                               , text "spec_call_args" <+> ppr spec_call_args
+        --                               , text "rule_rhs" <+> ppr rule_rhs
+        --                               , text "adds_void_worker_arg" <+> ppr adds_void_worker_arg
+        --                               , text "body" <+> ppr body
+        --                               , text "spec_rhs" <+> ppr spec_rhs
+        --                               , text "how_bound" <+> ppr (sc_how_bound env) ]) $
+        --   return ()
         ; return (spec_usg, OS { os_pat = call_pat, os_rule = rule
                                , os_id = spec_id
                                , os_rhs = spec_rhs }) }
 
+-- See Note [SpecConstr and strict fields]
+mkSeqs :: [Var] -> Type -> CoreExpr -> CoreExpr
+mkSeqs seqees res_ty rhs =
+  foldr addEval rhs seqees
+    where
+      addEval :: Var -> CoreExpr -> CoreExpr
+      addEval arg_id rhs
+        -- Argument representing strict field and it's worth passing via cbv
+        | shouldStrictifyIdForCbv arg_id
+        = Case (Var arg_id) arg_id res_ty ([Alt DEFAULT [] rhs])
+        | otherwise
+        = rhs
 
--- See Note [Strictness information in worker binders]
-handOutStrictnessInformation :: [Demand] -> [Var] -> [Var]
-handOutStrictnessInformation = go
-  where
-    go _ [] = []
-    go [] vs = vs
-    go (d:dmds) (v:vs) | isId v = setIdDemandInfo v d : go dmds vs
-    go dmds (v:vs) = v : go dmds vs
 
-calcSpecStrictness :: Id                     -- The original function
-                   -> [Var] -> [CoreExpr]    -- Call pattern
-                   -> StrictSig              -- Strictness of specialised thing
+{- Note [SpecConstr void argument insertion]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider a function
+    f :: Bool -> forall t. blah
+    f start @t = e
+We want to specialize for a partially applied call `f True`.
+See also Note [SpecConstr call patterns], second Wrinkle.
+Naively we would expect to get
+    $sf :: forall t. blah
+    $sf @t = $se
+    RULE: f True = $sf
+The specialized function only takes a single type argument so we add a
+void argument to prevent it from turning into a thunk. See Note
+[Protecting the last value argument] for details why. Normally we
+would add the void argument after the type argument giving us:
+
+    $sf :: forall t. Void# -> bla
+    $sf @t void = $se
+    RULE: f True = $sf void# (wrong)
+
+But if you look closely this wouldn't typecheck!  If we substitute `f
+True` with `$sf void#` we expect the type argument to be applied first
+but we apply void# first.  The easiest fix seems to be just to add the
+void argument to the front of the arguments.  Now we get:
+
+    $sf :: Void# -> forall t. bla
+    $sf void @t = $se
+    RULE: f True = $sf void#
+
+And now we can substitute `f True` with `$sf void#` with everything working out nicely!
+
+More precisely, in `calcSpecInfo`
+(i)  we need the void arg to /precede/ the `extra_bndrs`, but
+(ii) it must still /follow/ `qvar_bndrs`.
+
+Example to illustrate (ii):
+  f :: forall r (a :: TYPE r). Bool -> a
+  f = /\r. /\(a::TYPE r). \b. body
+
+  {- Specialise for f _ _ True -}
+
+  $sf :: forall r (a :: TYPE r). Void# -> a
+  $sf = /\r. /\(a::TYPE r). \v. body[True/b]
+  RULE: forall r (a :: TYPE r). f @r @a True = $sf @r @a void#
+
+The void argument must follow the foralls, lest the forall be
+ill-kinded.  See Note [Worker/wrapper needs to add void arg last] in
+GHC.Core.Opt.WorkWrap.Utils.
+
+Note [generaliseDictPats]
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider these two rules (#21831, item 2):
+  RULE "SPEC:foo"  forall d1 d2. foo @Int @Integer d1 d2 = $sfoo1
+  RULE "SC:foo"    forall a. foo @Int @a $fNumInteger = $sfoo2 @a
+The former comes from the type class specialiser, the latter from SpecConstr.
+Note that $fNumInteger is a top-level binding for Num Integer.
+
+The trouble is that neither is more general than the other.  In a call
+   (foo @Int @Integer $fNumInteger d)
+it isn't clear which rule to fire.
+
+The trouble is that the SpecConstr rule fires on a /specific/ dict, $fNumInteger,
+but actually /could/ fire regardless.  That is, it could be
+  RULE "SC:foo"    forall a d. foo @Int @a d = $sfoo2 @a
+
+Now, it is clear that SPEC:foo is more specific.  But GHC can't tell
+that, because SpecConstr doesn't know that dictionary arguments are
+singleton types!  So generaliseDictPats teaches it this fact.  It
+spots such patterns (using typeDeterminesValue), and quantifies over
+the dictionary.  Now we get
+
+  RULE "SC:foo"    forall a d. foo @Int @a d = $sfoo2 @a
+
+And /now/ "SPEC:foo" is clearly more specific: we can instantiate the new
+"SC:foo" to match the (prefix of) "SPEC:foo".
+-}
+
+calcSpecInfo :: Id           -- The original function
+             -> [InVar]      -- Lambda binders of original RHS
+             -> CallPat      -- Call pattern
+             -> [Var]        -- Extra bndrs
+             -> ( [Var]           -- Demand-decorated lambda binders
+                                  --   for RHS of specialised function
+                , [Var]           -- Args for call site
+                , DmdSig )        -- Strictness of specialised thing
+-- Calculate bits of IdInfo for the specialised function
 -- See Note [Transfer strictness]
-calcSpecStrictness fn qvars pats
-  = mkClosedStrictSig spec_dmds div
+-- See Note [Strictness information in worker binders]
+calcSpecInfo fn arg_bndrs (CP { cp_qvars = qvars, cp_args = pats }) extra_bndrs
+  = ( spec_lam_bndrs_w_dmds
+    , spec_call_args
+    , zapDmdEnvSig (DmdSig (dt{dt_args = spec_fn_dmds})) )
   where
-    spec_dmds = [ lookupVarEnv dmd_env qv `orElse` topDmd | qv <- qvars, isId qv ]
-    StrictSig (DmdType _ dmds div) = idStrictness fn
+    DmdSig dt@DmdType{dt_args=fn_dmds} = idDmdSig fn
+    spec_fn_dmds = [idDemandInfo b | b <- spec_lam_bndrs_w_dmds, isId b]
 
-    dmd_env = go emptyVarEnv dmds pats
+    val_pats   = filterOut isTypeArg pats
+                 -- Value args at call sites, used to determine how many demands to drop
+                 -- from the original functions demand and for setting up arg_dmd_env.
+    arg_dmd_env = go emptyVarEnv fn_dmds val_pats
+    qvar_dmds  = [ lookupVarEnv arg_dmd_env qv `orElse` topDmd | qv <- qvars, isId qv ]
+    extra_dmds = dropList val_pats fn_dmds
 
-    go :: DmdEnv -> [Demand] -> [CoreExpr] -> DmdEnv
-    go env ds (Type {} : pats)     = go env ds pats
-    go env ds (Coercion {} : pats) = go env ds pats
+    -- Annotate the variables with the strictness information from
+    -- the function (see Note [Strictness information in worker binders])
+    qvars_w_dmds          = set_dmds qvars       qvar_dmds
+    extras_w_dmds         = set_dmds extra_bndrs extra_dmds
+    spec_lam_bndrs_w_dmds = final_qvars_w_dmds ++ extras_w_dmds
+
+    (final_qvars_w_dmds, spec_call_args)
+       | needsVoidWorkerArg fn arg_bndrs (qvars ++ extra_bndrs)
+         -- Usual w/w hack to avoid generating
+         -- a spec_rhs of unlifted or ill-kinded type and no args.
+         -- See Note [SpecConstr void argument insertion]
+       = ( qvars_w_dmds ++ [voidArgId], qvars ++ [voidPrimId] )
+       | otherwise
+       = ( qvars_w_dmds,                qvars )
+
+    set_dmds :: [Var] -> [Demand] -> [Var]
+    set_dmds [] _   = []
+    set_dmds vs  [] = vs  -- Run out of demands
+    set_dmds (v:vs) ds@(d:ds') | isTyVar v = v                   : set_dmds vs ds
+                               | otherwise = setIdDemandInfo v d : set_dmds vs ds'
+
+    go :: VarEnv Demand -> [Demand] -> [CoreExpr] -> VarEnv Demand
+    -- We've filtered out all the type patterns already
     go env (d:ds) (pat : pats)     = go (go_one env d pat) ds pats
     go env _      _                = env
 
-    go_one :: DmdEnv -> Demand -> CoreExpr -> DmdEnv
-    go_one env d   (Var v) = extendVarEnv_C bothDmd env v d
-    go_one env d e
-           | Just ds <- splitProdDmd_maybe d  -- NB: d does not have to be strict
-           , (Var _, args) <- collectArgs e = go env ds args
-    go_one env _         _ = env
+    go_one :: VarEnv Demand -> Demand -> CoreExpr -> VarEnv Demand
+    go_one env d          (Var v) = extendVarEnv_C plusDmd env v d
+    go_one env (_n :* cd) e -- NB: _n does not have to be strict
+      | (Var _, args) <- collectArgs e
+      , Just (_b, ds) <- viewProd (length args) cd -- TODO: We may want to look at boxity _b, though...
+      = go env ds args
+    go_one env _  _ = env
 
 {-
 Note [spec_usg includes rhs_usg]
@@ -1789,8 +1944,8 @@ Note [spec_usg includes rhs_usg]
 In calls to 'specialise', the returned ScUsage must include the rhs_usg in
 the passed-in SpecInfo, unless there are no calls at all to the function.
 
-The caller can, indeed must, assume this.  He should not combine in rhs_usg
-himself, or he'll get rhs_usg twice -- and that can lead to an exponential
+The caller can, indeed must, assume this.  They should not combine in rhs_usg
+themselves, or they'll get rhs_usg twice -- and that can lead to an exponential
 blowup of duplicates in the CallEnv.  This is what gave rise to the massive
 performance loss in #8852.
 
@@ -1839,12 +1994,12 @@ The function calcSpecStrictness performs the calculation.
 
 Note [Strictness information in worker binders]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 After having calculated the strictness annotation for the worker (see Note
 [Transfer strictness] above), we also want to have this information attached to
 the worker’s arguments, for the benefit of later passes. The function
 handOutStrictnessInformation decomposes the strictness annotation calculated by
 calcSpecStrictness and attaches them to the variables.
+
 
 ************************************************************************
 *                                                                      *
@@ -1873,19 +2028,39 @@ See # 5458.  Yuk.
 Note [SpecConstr call patterns]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 A "call patterns" that we collect is going to become the LHS of a RULE.
-It's important that it doesn't have
-     e |> Refl
-or
-    e |> g1 |> g2
-because both of these will be optimised by Simplify.simplRule. In the
-former case such optimisation benign, because the rule will match more
-terms; but in the latter we may lose a binding of 'g1' or 'g2', and
-end up with a rule LHS that doesn't bind the template variables
-(#10602).
 
-The simplifier eliminates such things, but SpecConstr itself constructs
-new terms by substituting.  So the 'mkCast' in the Cast case of scExpr
-is very important!
+Wrinkles:
+
+* The list of argument patterns, cp_args, is no longer than the
+  visible lambdas of the binding, ri_arg_occs.  This is done via
+  the zipWithM in callToPats.
+
+* The list of argument patterns can certainly be shorter than the
+  lambdas in the function definition (under-saturated).  For example
+      f x y = case x of { True -> e1; False -> e2 }
+      ....map (f True) e...
+  We want to specialise `f` for `f True`.
+
+* In fact we deliberately shrink the list of argument patterns,
+  cp_args, by trimming off all the boring ones at the end (see
+  `dropWhileEnd is_boring` in callToPats).  Since the RULE only
+  applies when it is saturated, this shrinking makes the RULE more
+  applicable.  But it does mean that the argument patterns do not
+  necessarily saturate the lambdas of the function.
+
+* It's important that the pattern arguments do not look like
+     e |> Refl
+  or
+    e |> g1 |> g2
+  because both of these will be optimised by Simplify.simplRule. In the
+  former case such optimisation benign, because the rule will match more
+  terms; but in the latter we may lose a binding of 'g1' or 'g2', and
+  end up with a rule LHS that doesn't bind the template variables
+  (#10602).
+
+  The simplifier eliminates such things, but SpecConstr itself constructs
+  new terms by substituting.  So the 'mkCast' in the Cast case of scExpr
+  is very important!
 
 Note [Choosing patterns]
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1914,7 +2089,7 @@ Consider (#14270) a call like
     in ... f (K @(a |> co)) ...
 
 where 'co' is a coercion variable not in scope at f's definition site.
-If we aren't caereful we'll get
+If we aren't careful we'll get
 
     let $sf a co = e (K @(a |> co))
         RULE "SC:f" forall a co.  f (K @(a |> co)) = $sf a co
@@ -1970,8 +2145,16 @@ alternative would be to discard calls that mention coercion variables
 only in kind-casts, but I'm doing the simple thing for now.
 -}
 
-type CallPat = ([Var], [CoreExpr])      -- Quantified variables and arguments
-                                        -- See Note [SpecConstr call patterns]
+data CallPat = CP { cp_qvars :: [Var]           -- Quantified variables
+                  , cp_args  :: [CoreExpr]      -- Arguments
+                  , cp_strict_args :: [Var] }   -- Arguments we want to pass unlifted even if they are boxed
+     -- See Note [SpecConstr call patterns]
+
+instance Outputable CallPat where
+  ppr (CP { cp_qvars = qvars, cp_args = args, cp_strict_args =  strict })
+    = text "CP" <> braces (sep [ text "cp_qvars =" <+> ppr qvars <> comma
+                               , text "cp_args =" <+> ppr args
+                               , text "cp_strict_args = " <> ppr strict ])
 
 callsToNewPats :: ScEnv -> Id
                -> SpecInfo
@@ -1997,34 +2180,40 @@ callsToNewPats env fn spec_info@(SI { si_specs = done_specs }) bndr_occs calls
 
               -- Remove ones that have too many worker variables
               small_pats = filterOut too_big non_dups
-              too_big (vars,args) = not (isWorkerSmallEnough (sc_dflags env) (valArgCount args) vars)
+              max_args = maxWorkerArgs (sc_dflags env)
+              too_big (CP { cp_qvars = vars, cp_args = args })
+                = not (isWorkerSmallEnough max_args (valArgCount args) vars)
                   -- We are about to construct w/w pair in 'spec_one'.
                   -- Omit specialisation leading to high arity workers.
                   -- See Note [Limit w/w arity] in GHC.Core.Opt.WorkWrap.Utils
 
                 -- Discard specialisations if there are too many of them
-              trimmed_pats = trim_pats env fn spec_info small_pats
+              (pats_were_discarded, trimmed_pats) = trim_pats env fn spec_info small_pats
 
 --        ; pprTrace "callsToPats" (vcat [ text "calls to" <+> ppr fn <> colon <+> ppr calls
 --                                       , text "done_specs:" <+> ppr (map os_pat done_specs)
 --                                       , text "good_pats:" <+> ppr good_pats ]) $
 --          return ()
 
-        ; return (have_boring_call, trimmed_pats) }
+        ; return (have_boring_call || pats_were_discarded, trimmed_pats) }
+          -- If any of the calls does not give rise to a specialisation, either
+          -- because it is boring, or because there are too many specialisations,
+          -- return a flag to say so, so that we know to keep the original function.
 
 
-trim_pats :: ScEnv -> Id -> SpecInfo -> [CallPat] -> [CallPat]
+trim_pats :: ScEnv -> Id -> SpecInfo -> [CallPat] -> (Bool, [CallPat])
+-- True <=> some patterns were discarded
 -- See Note [Choosing patterns]
 trim_pats env fn (SI { si_n_specs = done_spec_count }) pats
   | sc_force env
     || isNothing mb_scc
     || n_remaining >= n_pats
   = -- pprTrace "trim_pats: no-trim" (ppr (sc_force env) $$ ppr mb_scc $$ ppr n_remaining $$ ppr n_pats)
-    pats          -- No need to trim
+    (False, pats)          -- No need to trim
 
   | otherwise
   = emit_trace $  -- Need to trim, so keep the best ones
-    take n_remaining sorted_pats
+    (True, take n_remaining sorted_pats)
 
   where
     n_pats         = length pats
@@ -2043,7 +2232,8 @@ trim_pats env fn (SI { si_n_specs = done_spec_count }) pats
     pat_cons :: CallPat -> Int
     -- How many data constructors of literals are in
     -- the pattern.  More data-cons => less general
-    pat_cons (qs, ps) = foldr ((+) . n_cons) 0 ps
+    pat_cons (CP { cp_qvars = qs, cp_args = ps })
+       = foldr ((+) . n_cons) 0 ps
        where
           q_set = mkVarSet qs
           n_cons (Var v) | v `elemVarSet` q_set = 0
@@ -2074,12 +2264,21 @@ callToPats :: ScEnv -> [ArgOcc] -> Call -> UniqSM (Maybe CallPat)
         --      Type variables come first, since they may scope
         --      over the following term variables
         -- The [CoreExpr] are the argument patterns for the rule
-callToPats env bndr_occs call@(Call _ args con_env)
-  | args `ltLength` bndr_occs      -- Check saturated
-  = return Nothing
-  | otherwise
+callToPats env bndr_occs call@(Call fn args con_env)
   = do  { let in_scope = substInScope (sc_subst env)
-        ; (interesting, pats) <- argsToPats env in_scope con_env args bndr_occs
+
+        ; arg_tripples <- zipWith3M (argToPat env in_scope con_env) args bndr_occs (map (const NotMarkedStrict) args)
+                   -- This zip trims the args to be no longer than
+                   -- the lambdas in the function definition (bndr_occs)
+
+          -- Drop boring patterns from the end
+          -- See Note [SpecConstr call patterns]
+        ; let arg_tripples' | isJoinId fn = arg_tripples
+                            | otherwise   = dropWhileEnd is_boring arg_tripples
+              is_boring (interesting, _,_) = not interesting
+              (interesting_s, pats, cbv_ids) = unzip3 arg_tripples'
+              interesting           = or interesting_s
+
         ; let pat_fvs = exprsFreeVarsList pats
                 -- To get determinism we need the list of free variables in
                 -- deterministic order. Otherwise we end up creating
@@ -2109,18 +2308,25 @@ callToPats env bndr_occs call@(Call _ args con_env)
               bad_covars :: CoVarSet
               bad_covars = mapUnionVarSet get_bad_covars pats
               get_bad_covars :: CoreArg -> CoVarSet
-              get_bad_covars (Type ty)
-                = filterVarSet (\v -> isId v && not (is_in_scope v)) $
-                  tyCoVarsOfType ty
-              get_bad_covars _
-                = emptyVarSet
+              get_bad_covars (Type ty) = filterVarSet bad_covar (tyCoVarsOfType ty)
+              get_bad_covars _         = emptyVarSet
+              bad_covar v = isId v && not (is_in_scope v)
 
         ; -- pprTrace "callToPats"  (ppr args $$ ppr bndr_occs) $
-          WARN( not (isEmptyVarSet bad_covars)
-              , text "SpecConstr: bad covars:" <+> ppr bad_covars
-                $$ ppr call )
+          warnPprTrace (not (isEmptyVarSet bad_covars))
+              "SpecConstr: bad covars"
+              (ppr bad_covars $$ ppr call) $
           if interesting && isEmptyVarSet bad_covars
-          then return (Just (qvars', pats))
+          then do
+              -- pprTraceM "callToPatsOut" (
+              --         text "fn:" <+> ppr fn $$
+              --         text "args:" <+> ppr args $$
+              --         text "in_scope:" <+> ppr in_scope $$
+              --         -- text "in_scope:" <+> ppr in_scope $$
+              --         text "pat_fvs:" <+> ppr pat_fvs
+              --       )
+              --   ppr (CP { cp_qvars = qvars', cp_args = pats })) >>
+              return (Just (CP { cp_qvars = qvars', cp_args = pats, cp_strict_args = concat cbv_ids }))
           else return Nothing }
 
     -- argToPat takes an actual argument, and returns an abstracted
@@ -2134,7 +2340,9 @@ argToPat :: ScEnv
          -> ValueEnv                    -- ValueEnv at the call site
          -> CoreArg                     -- A call arg (or component thereof)
          -> ArgOcc
-         -> UniqSM (Bool, CoreArg)
+         -> StrictnessMark              -- Tells us if this argument is a strict field of a data constructor
+                                        -- See Note [SpecConstr and strict fields]
+         -> UniqSM (Bool, CoreArg, [Id])
 
 -- Returns (interesting, pat),
 -- where pat is the pattern derived from the argument
@@ -2146,11 +2354,25 @@ argToPat :: ScEnv
 --              lvl7         --> (True, lvl7)      if lvl7 is bound
 --                                                 somewhere further out
 
-argToPat _env _in_scope _val_env arg@(Type {}) _arg_occ
-  = return (False, arg)
+argToPat env in_scope val_env arg arg_occ arg_str
+  = do
+    -- pprTraceM "argToPatIn" (ppr arg)
+    !res <- argToPat1 env in_scope val_env arg arg_occ arg_str
+    -- pprTraceM "argToPatOut" (ppr res)
+    return res
 
-argToPat env in_scope val_env (Tick _ arg) arg_occ
-  = argToPat env in_scope val_env arg arg_occ
+argToPat1 :: ScEnv
+  -> InScopeSet
+  -> ValueEnv
+  -> Expr CoreBndr
+  -> ArgOcc
+  -> StrictnessMark
+  -> UniqSM (Bool, Expr CoreBndr, [Id])
+argToPat1 _env _in_scope _val_env arg@(Type {}) _arg_occ _arg_str
+  = return (False, arg, [])
+
+argToPat1 env in_scope val_env (Tick _ arg) arg_occ arg_str
+  = argToPat env in_scope val_env arg arg_occ arg_str
         -- Note [Tick annotations in call patterns]
         -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         -- Ignore Notes.  In particular, we want to ignore any InlineMe notes
@@ -2158,8 +2380,8 @@ argToPat env in_scope val_env (Tick _ arg) arg_occ
         -- ride roughshod over them all for now.
         --- See Note [Tick annotations in RULE matching] in GHC.Core.Rules
 
-argToPat env in_scope val_env (Let _ arg) arg_occ
-  = argToPat env in_scope val_env arg arg_occ
+argToPat1 env in_scope val_env (Let _ arg) arg_occ arg_str
+  = argToPat env in_scope val_env arg arg_occ arg_str
         -- See Note [Matching lets] in "GHC.Core.Rules"
         -- Look through let expressions
         -- e.g.         f (let v = rhs in (v,w))
@@ -2172,17 +2394,17 @@ argToPat env in_scope val_env (Case scrut _ _ [(_, _, rhs)]) arg_occ
   = argToPat env in_scope val_env rhs arg_occ
 -}
 
-argToPat env in_scope val_env (Cast arg co) arg_occ
+argToPat1 env in_scope val_env (Cast arg co) arg_occ arg_str
   | not (ignoreType env ty2)
-  = do  { (interesting, arg') <- argToPat env in_scope val_env arg arg_occ
+  = do  { (interesting, arg', strict_args) <- argToPat env in_scope val_env arg arg_occ arg_str
         ; if not interesting then
-                wildCardPat ty2
+                wildCardPat ty2 arg_str
           else do
         { -- Make a wild-card pattern for the coercion
           uniq <- getUniqueM
         ; let co_name = mkSysTvName uniq (fsLit "sg")
               co_var  = mkCoVar co_name (mkCoercionType Representational ty1 ty2)
-        ; return (interesting, Cast arg' (mkCoVarCo co_var)) } }
+        ; return (interesting, Cast arg' (mkCoVarCo co_var), strict_args) } }
   where
     Pair ty1 ty2 = coercionKind co
 
@@ -2202,35 +2424,66 @@ argToPat in_scope val_env arg arg_occ
 
   -- Check for a constructor application
   -- NB: this *precedes* the Var case, so that we catch nullary constrs
-argToPat env in_scope val_env arg arg_occ
+argToPat1 env in_scope val_env arg arg_occ _arg_str
   | Just (ConVal (DataAlt dc) args) <- isValue val_env arg
   , not (ignoreDataCon env dc)        -- See Note [NoSpecConstr]
   , Just arg_occs <- mb_scrut dc
-  = do  { let (ty_args, rest_args) = splitAtList (dataConUnivTyVars dc) args
-        ; (_, args') <- argsToPats env in_scope val_env rest_args arg_occs
-        ; return (True,
-                  mkConApp dc (ty_args ++ args')) }
+  = do { let (ty_args, rest_args) = splitAtList (dataConUnivTyVars dc) args
+             con_str, matched_str :: [StrictnessMark]
+             -- con_str corrresponds 1-1 with the /value/ arguments
+             -- matched_str corresponds 1-1 with /all/ arguments
+             con_str = dataConRepStrictness dc
+             matched_str = match_vals con_str rest_args
+      --  ; pprTraceM "bangs" (ppr (length rest_args == length con_str) $$
+      --       ppr dc $$
+      --       ppr con_str $$
+      --       ppr rest_args $$
+      --       ppr (map isTypeArg rest_args))
+       ; prs <- zipWith3M (argToPat env in_scope val_env) rest_args arg_occs matched_str
+       ; let args' = map sndOf3 prs :: [CoreArg]
+       ; assertPpr (length con_str == length (filter isRuntimeArg rest_args))
+            ( ppr con_str $$ ppr rest_args $$
+              ppr (length con_str) $$ ppr (length rest_args)
+            ) $ return ()
+       ; return (True, mkConApp dc (ty_args ++ args'), concat (map thdOf3 prs)) }
   where
     mb_scrut dc = case arg_occ of
-                    ScrutOcc bs | Just occs <- lookupUFM bs dc
-                                -> Just (occs)  -- See Note [Reboxing]
-                    _other      | sc_force env || sc_keen env
-                                -> Just (repeat UnkOcc)
-                                | otherwise
-                                -> Nothing
+                ScrutOcc bs | Just occs <- lookupUFM bs dc
+                            -> Just (occs)  -- See Note [Reboxing]
+                _other      | sc_force env || sc_keen env
+                            -> Just (repeat UnkOcc)
+                            | otherwise
+                            -> Nothing
+    match_vals bangs (arg:args)
+      | isTypeArg arg
+      = NotMarkedStrict : match_vals bangs args
+      | (b:bs) <- bangs
+      = b : match_vals bs args
+    match_vals [] [] = []
+    match_vals as bs =
+        pprPanic "spec-constr:argToPat - Bangs don't match value arguments"
+            (text "arg:" <> ppr arg $$
+             text "remaining args:" <> ppr as $$
+             text "remaining bangs:" <> ppr bs)
 
   -- Check if the argument is a variable that
   --    (a) is used in an interesting way in the function body
+  ---       i.e. ScrutOcc. UnkOcc and NoOcc are not interesting
+  --        (NoOcc means we could drop the argument, but that's the
+  --         business of absence analysis, not SpecConstr.)
   --    (b) we know what its value is
   -- In that case it counts as "interesting"
-argToPat env in_scope val_env (Var v) arg_occ
-  | sc_force env || case arg_occ of { UnkOcc -> False; _other -> True }, -- (a)
-    is_value,                                                            -- (b)
+argToPat1 env in_scope val_env (Var v) arg_occ arg_str
+  | sc_force env || case arg_occ of { ScrutOcc {} -> True
+                                    ; UnkOcc      -> False
+                                    ; NoOcc       -> False } -- (a)
+  , is_value                                                 -- (b)
        -- Ignoring sc_keen here to avoid gratuitously incurring Note [Reboxing]
        -- So sc_keen focused just on f (I# x), where we have freshly-allocated
        -- box that we can eliminate in the caller
-    not (ignoreType env (varType v))
-  = return (True, Var v)
+  , not (ignoreType env (varType v))
+  -- See Note [SpecConstr and strict fields]
+  = return (True, Var v, if isMarkedStrict arg_str then [v] else mempty)
   where
     is_value
         | isLocalId v = v `elemInScopeSet` in_scope
@@ -2259,22 +2512,15 @@ argToPat env in_scope val_env (Var v) arg_occ
 
   -- The default case: make a wild-card
   -- We use this for coercions too
-argToPat _env _in_scope _val_env arg _arg_occ
-  = wildCardPat (exprType arg)
+argToPat1 _env _in_scope _val_env arg _arg_occ arg_str
+  = wildCardPat (exprType arg) arg_str
 
-wildCardPat :: Type -> UniqSM (Bool, CoreArg)
-wildCardPat ty
-  = do { uniq <- getUniqueM
-       ; let id = mkSysLocalOrCoVar (fsLit "sc") uniq Many ty
-       ; return (False, varToCoreExpr id) }
-
-argsToPats :: ScEnv -> InScopeSet -> ValueEnv
-           -> [CoreArg] -> [ArgOcc]  -- Should be same length
-           -> UniqSM (Bool, [CoreArg])
-argsToPats env in_scope val_env args occs
-  = do { stuff <- zipWithM (argToPat env in_scope val_env) args occs
-       ; let (interesting_s, args') = unzip stuff
-       ; return (or interesting_s, args') }
+-- | wildCardPats are always boring
+wildCardPat :: Type -> StrictnessMark -> UniqSM (Bool, CoreArg, [Id])
+wildCardPat ty str
+  = do { id <- mkSysLocalOrCoVarM (fsLit "sc") Many ty
+       -- ; pprTraceM "wildCardPat" (ppr id' <+> ppr (idUnfolding id'))
+       ; return (False, varToCoreExpr id, if isMarkedStrict str then [id] else []) }
 
 isValue :: ValueEnv -> CoreExpr -> Maybe Value
 isValue _env (Lit lit)
@@ -2326,9 +2572,11 @@ valueIsWorkFree LambdaVal       = True
 valueIsWorkFree (ConVal _ args) = all exprIsWorkFree args
 
 samePat :: CallPat -> CallPat -> Bool
-samePat (vs1, as1) (vs2, as2)
+samePat (CP { cp_qvars = vs1, cp_args = as1 })
+        (CP { cp_qvars = vs2, cp_args = as2 })
   = all2 same as1 as2
   where
+    -- If the args are the same, their strictness marks will be too so we don't compare those.
     same (Var v1) (Var v2)
         | v1 `elem` vs1 = v2 `elem` vs2
         | v2 `elem` vs2 = False
@@ -2344,7 +2592,7 @@ samePat (vs1, as1) (vs2, as2)
     same e1 (Tick _ e2) = same e1 e2
     same e1 (Cast e2 _) = same e1 e2
 
-    same e1 e2 = WARN( bad e1 || bad e2, ppr e1 $$ ppr e2)
+    same e1 e2 = warnPprTrace (bad e1 || bad e2) "samePat" (ppr e1 $$ ppr e2) $
                  False  -- Let, lambda, case should not occur
     bad (Case {}) = True
     bad (Let {})  = True

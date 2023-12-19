@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP #-}
+
 
 -- | Implements a selective lambda lifter, running late in the optimisation
 -- pipeline.
@@ -11,24 +11,24 @@ module GHC.Stg.Lift
    (
     -- * Late lambda lifting in STG
     -- $note
+   StgLiftConfig (..),
    stgLiftLams
    )
 where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
 import GHC.Types.Basic
-import GHC.Driver.Session
 import GHC.Types.Id
 import GHC.Stg.FVs ( annBindingFreeVars )
+import GHC.Stg.Lift.Config
 import GHC.Stg.Lift.Analysis
 import GHC.Stg.Lift.Monad
 import GHC.Stg.Syntax
-import GHC.Utils.Outputable
+import GHC.Unit.Module (Module)
 import GHC.Types.Unique.Supply
-import GHC.Utils.Misc
+import GHC.Utils.Outputable
+import GHC.Utils.Panic
 import GHC.Types.Var.Set
 import Control.Monad ( when )
 import Data.Maybe ( isNothing )
@@ -126,17 +126,17 @@ import Data.Maybe ( isNothing )
 --
 -- (Mostly) textbook instance of the lambda lifting transformation, selecting
 -- which bindings to lambda lift by consulting 'goodToLift'.
-stgLiftLams :: DynFlags -> UniqSupply -> [InStgTopBinding] -> [OutStgTopBinding]
-stgLiftLams dflags us = runLiftM dflags us . foldr liftTopLvl (pure ())
+stgLiftLams :: Module -> StgLiftConfig -> UniqSupply -> [InStgTopBinding] -> [OutStgTopBinding]
+stgLiftLams this_mod cfg us = runLiftM cfg us . foldr (liftTopLvl this_mod) (pure ())
 
-liftTopLvl :: InStgTopBinding -> LiftM () -> LiftM ()
-liftTopLvl (StgTopStringLit bndr lit) rest = withSubstBndr bndr $ \bndr' -> do
+liftTopLvl :: Module -> InStgTopBinding -> LiftM () -> LiftM ()
+liftTopLvl _ (StgTopStringLit bndr lit) rest = withSubstBndr bndr $ \bndr' -> do
   addTopStringLit bndr' lit
   rest
-liftTopLvl (StgTopLifted bind) rest = do
+liftTopLvl this_mod (StgTopLifted bind) rest = do
   let is_rec = isRec $ fst $ decomposeStgBinding bind
   when is_rec startBindingGroup
-  let bind_w_fvs = annBindingFreeVars bind
+  let bind_w_fvs = annBindingFreeVars this_mod bind
   withLiftedBind TopLevel (tagSkeletonTopBind bind_w_fvs) NilSk $ \mb_bind' -> do
     -- We signal lifting of a binding through returning Nothing.
     -- Should never happen for a top-level binding, though, since we are already
@@ -169,8 +169,8 @@ withLiftedBindPairs top rec pairs scope k = do
   let (infos, rhss) = unzip pairs
   let bndrs = map binderInfoBndr infos
   expander <- liftedIdsExpander
-  dflags <- getDynFlags
-  case goodToLift dflags top rec expander pairs scope of
+  cfg <- getConfig
+  case goodToLift cfg top rec expander pairs scope of
     -- @abs_ids@ is the set of all variables that need to become parameters.
     Just abs_ids -> withLiftedBndrs abs_ids bndrs $ \bndrs' -> do
       -- Within this block, all binders in @bndrs@ will be noted as lifted, so
@@ -198,14 +198,16 @@ liftRhs
   -- as lambda binders, discarding all free vars.
   -> LlStgRhs
   -> LiftM OutStgRhs
-liftRhs mb_former_fvs rhs@(StgRhsCon ccs con args)
-  = ASSERT2(isNothing mb_former_fvs, text "Should never lift a constructor" $$ pprStgRhs panicStgPprOpts rhs)
-    StgRhsCon ccs con <$> traverse liftArgs args
-liftRhs Nothing (StgRhsClosure _ ccs upd infos body) = do
+liftRhs mb_former_fvs rhs@(StgRhsCon ccs con mn ts args)
+  = assertPpr (isNothing mb_former_fvs)
+              (text "Should never lift a constructor"
+               $$ pprStgRhs panicStgPprOpts rhs) $
+    StgRhsCon ccs con mn ts <$> traverse liftArgs args
+liftRhs Nothing (StgRhsClosure _ ccs upd infos body) =
   -- This RHS wasn't lifted.
   withSubstBndrs (map binderInfoBndr infos) $ \bndrs' ->
     StgRhsClosure noExtFieldSilent ccs upd bndrs' <$> liftExpr body
-liftRhs (Just former_fvs) (StgRhsClosure _ ccs upd infos body) = do
+liftRhs (Just former_fvs) (StgRhsClosure _ ccs upd infos body) =
   -- This RHS was lifted. Insert extra binders for @former_fvs@.
   withSubstBndrs (map binderInfoBndr infos) $ \bndrs' -> do
     let bndrs'' = dVarSetElems former_fvs ++ bndrs'
@@ -214,7 +216,7 @@ liftRhs (Just former_fvs) (StgRhsClosure _ ccs upd infos body) = do
 liftArgs :: InStgArg -> LiftM OutStgArg
 liftArgs a@(StgLitArg _) = pure a
 liftArgs (StgVarArg occ) = do
-  ASSERTM2( not <$> isLifted occ, text "StgArgs should never be lifted" $$ ppr occ )
+  assertPprM (not <$> isLifted occ) (text "StgArgs should never be lifted" $$ ppr occ)
   StgVarArg <$> substOcc occ
 
 liftExpr :: LlStgExpr -> LiftM OutStgExpr
@@ -226,9 +228,8 @@ liftExpr (StgApp f args) = do
   fvs' <- formerFreeVars f
   let top_lvl_args = map StgVarArg fvs' ++ args'
   pure (StgApp f' top_lvl_args)
-liftExpr (StgConApp con args tys) = StgConApp con <$> traverse liftArgs args <*> pure tys
+liftExpr (StgConApp con mn args tys) = StgConApp con mn <$> traverse liftArgs args <*> pure tys
 liftExpr (StgOpApp op args ty) = StgOpApp op <$> traverse liftArgs args <*> pure ty
-liftExpr (StgLam _ _) = pprPanic "stgLiftLams" (text "StgLam")
 liftExpr (StgCase scrut info ty alts) = do
   scrut' <- liftExpr scrut
   withSubstBndr (binderInfoBndr info) $ \bndr' -> do
@@ -248,5 +249,7 @@ liftExpr (StgLetNoEscape scope bind body)
         Just bind' -> pure (StgLetNoEscape noExtFieldSilent bind' body')
 
 liftAlt :: LlStgAlt -> LiftM OutStgAlt
-liftAlt (con, infos, rhs) = withSubstBndrs (map binderInfoBndr infos) $ \bndrs' ->
-  (,,) con bndrs' <$> liftExpr rhs
+liftAlt alt@GenStgAlt{alt_con=_, alt_bndrs=infos, alt_rhs=rhs} =
+  withSubstBndrs (map binderInfoBndr infos) $ \bndrs' ->
+    do !rhs' <- liftExpr rhs
+       return $! alt {alt_bndrs = bndrs', alt_rhs = rhs'}

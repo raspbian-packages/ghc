@@ -5,12 +5,9 @@ module Main where
 
 import Control.DeepSeq (rnf)
 import Control.Exception (evaluate)
-import Gauge (bench, defaultMain, whnf)
+import Test.Tasty.Bench (bench, defaultMain, whnf)
 import Data.List (foldl')
 import Data.Monoid (Sum(..))
-#if !MIN_VERSION_base(4,8,0)
-import Data.Foldable (foldMap)
-#endif
 import qualified Data.IntSet as IS
 -- benchmarks for "instance Ord IntSet"
 -- uses IntSet as keys of maps, and elements of sets
@@ -22,7 +19,8 @@ main = do
     let s = IS.fromAscList elems :: IS.IntSet
         s_even = IS.fromAscList elems_even :: IS.IntSet
         s_odd = IS.fromAscList elems_odd :: IS.IntSet
-    evaluate $ rnf [s, s_even, s_odd]
+        s_sparse = IS.fromAscList elems_sparse :: IS.IntSet
+    evaluate $ rnf [s, s_even, s_odd, s_sparse]
     defaultMain
         [ bench "member" $ whnf (member elems) s
         , bench "insert" $ whnf (ins elems) IS.empty
@@ -50,11 +48,20 @@ main = do
           $ whnf (num_transitions . det 2 0) $ hard_nfa    1 16
         , bench "instanceOrd:sparse" -- many Bin, each Tip is singleton
           $ whnf (num_transitions . det 2 0) $ hard_nfa 1111 16
+        , bench "spanAntitone:dense" $ whnf (IS.spanAntitone (<elem_mid)) s
+        , bench "spanAntitone:sparse" $ whnf (IS.spanAntitone (<elem_sparse_mid)) s_sparse
+        , bench "split:dense" $ whnf (IS.split elem_mid) s
+        , bench "split:sparse" $ whnf (IS.split elem_sparse_mid) s_sparse
+        , bench "splitMember:dense" $ whnf (IS.splitMember elem_mid) s
+        , bench "splitMember:sparse" $ whnf (IS.splitMember elem_sparse_mid) s_sparse
         ]
   where
     elems = [1..2^12]
     elems_even = [2,4..2^12]
     elems_odd = [1,3..2^12]
+    elem_mid = 2^11 + 31 -- falls in the middle of a packed Tip bitmask (assuming 64-bit words)
+    elems_sparse = map (*64) elems -- when built into a map, each Tip is a singleton
+    elem_sparse_mid = 2^11 * 64
 
 member :: [Int] -> IS.IntSet -> Int
 member xs s = foldl' (\n x -> if IS.member x s then n + 1 else n) 0 xs

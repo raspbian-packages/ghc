@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, MagicHash #-}
+
 
 -- | Dynamically lookup up values from modules and loading them.
 module GHC.Runtime.Loader (
@@ -21,72 +21,88 @@ module GHC.Runtime.Loader (
     ) where
 
 import GHC.Prelude
-import GHC.Driver.Session
 
-import GHC.Runtime.Linker      ( linkModule, getHValue )
-import GHC.Runtime.Interpreter ( wormhole, withInterp )
-import GHC.Runtime.Interpreter.Types
-import GHC.Types.SrcLoc        ( noSrcSpan )
-import GHC.Driver.Finder       ( findPluginModule, cannotFindModule )
-import GHC.Tc.Utils.Monad      ( initTcInteractive, initIfaceTcRn )
-import GHC.Iface.Load          ( loadPluginInterface )
-import GHC.Types.Name.Reader   ( RdrName, ImportSpec(..), ImpDeclSpec(..)
-                               , ImpItemSpec(..), mkGlobalRdrEnv, lookupGRE_RdrName
-                               , gre_name, mkRdrQual )
-import GHC.Types.Name.Occurrence ( OccName, mkVarOcc )
-import GHC.Rename.Names ( gresFromAvails )
+import GHC.Driver.Session
+import GHC.Driver.Ppr
+import GHC.Driver.Hooks
 import GHC.Driver.Plugins
+
+import GHC.Linker.Loader       ( loadModule, loadName )
+import GHC.Runtime.Interpreter ( wormhole )
+import GHC.Runtime.Interpreter.Types
+
+import GHC.Tc.Utils.Monad      ( initTcInteractive, initIfaceTcRn )
+import GHC.Iface.Load          ( loadPluginInterface, cannotFindModule )
+import GHC.Rename.Names ( gresFromAvails )
 import GHC.Builtin.Names ( pluginTyConName, frontendPluginTyConName )
 
-import GHC.Driver.Types
+import GHC.Driver.Env
 import GHCi.RemoteTypes  ( HValue )
 import GHC.Core.Type     ( Type, eqType, mkTyConTy )
-import GHC.Core.TyCo.Ppr ( pprTyThingCategory )
 import GHC.Core.TyCon    ( TyCon )
+
+import GHC.Types.SrcLoc        ( noSrcSpan )
 import GHC.Types.Name    ( Name, nameModule_maybe )
 import GHC.Types.Id      ( idType )
+import GHC.Types.TyThing
+import GHC.Types.Name.Occurrence ( OccName, mkVarOcc )
+import GHC.Types.Name.Reader   ( RdrName, ImportSpec(..), ImpDeclSpec(..)
+                               , ImpItemSpec(..), mkGlobalRdrEnv, lookupGRE_RdrName
+                               , greMangledName, mkRdrQual )
+
+import GHC.Unit.Finder         ( findPluginModule, FindResult(..) )
+import GHC.Driver.Config.Finder ( initFinderOpts )
 import GHC.Unit.Module   ( Module, ModuleName )
+import GHC.Unit.Module.ModIface
+import GHC.Unit.Env
+
 import GHC.Utils.Panic
-import GHC.Data.FastString
+import GHC.Utils.Logger
 import GHC.Utils.Error
 import GHC.Utils.Outputable
 import GHC.Utils.Exception
-import GHC.Driver.Hooks
 
 import Control.Monad     ( unless )
 import Data.Maybe        ( mapMaybe )
 import Unsafe.Coerce     ( unsafeCoerce )
+import GHC.Linker.Types
+import GHC.Types.Unique.DFM
+import Data.List (unzip4)
 
 -- | Loads the plugins specified in the pluginModNames field of the dynamic
 -- flags. Should be called after command line arguments are parsed, but before
 -- actual compilation starts. Idempotent operation. Should be re-called if
 -- pluginModNames or pluginModNameOpts changes.
-initializePlugins :: HscEnv -> DynFlags -> IO DynFlags
-initializePlugins hsc_env df
-  | map lpModuleName (cachedPlugins df)
-         == pluginModNames df -- plugins not changed
-     && all (\p -> paArguments (lpPlugin p)
-                       == argumentsForPlugin p (pluginModNameOpts df))
-            (cachedPlugins df) -- arguments not changed
-  = return df -- no need to reload plugins
+initializePlugins :: HscEnv -> IO HscEnv
+initializePlugins hsc_env
+    -- plugins not changed
+  | loaded_plugins <- loadedPlugins (hsc_plugins hsc_env)
+  , map lpModuleName loaded_plugins == reverse (pluginModNames dflags)
+   -- arguments not changed
+  , all same_args loaded_plugins
+  = return hsc_env -- no need to reload plugins FIXME: doesn't take static plugins into account
   | otherwise
-  = do loadedPlugins <- loadPlugins (hsc_env { hsc_dflags = df })
-       let df' = df { cachedPlugins = loadedPlugins }
-       df'' <- withPlugins df' runDflagsPlugin df'
-       return df''
+  = do (loaded_plugins, links, pkgs) <- loadPlugins hsc_env
+       let plugins' = (hsc_plugins hsc_env) { loadedPlugins = loaded_plugins, loadedPluginDeps = (links, pkgs) }
+       let hsc_env' = hsc_env { hsc_plugins = plugins' }
+       withPlugins (hsc_plugins hsc_env') driverPlugin hsc_env'
+  where
+    plugin_args = pluginModNameOpts dflags
+    same_args p = paArguments (lpPlugin p) == argumentsForPlugin p plugin_args
+    argumentsForPlugin p = map snd . filter ((== lpModuleName p) . fst)
+    dflags = hsc_dflags hsc_env
 
-  where argumentsForPlugin p = map snd . filter ((== lpModuleName p) . fst)
-        runDflagsPlugin p opts dynflags = dynflagsPlugin p opts dynflags
-
-loadPlugins :: HscEnv -> IO [LoadedPlugin]
+loadPlugins :: HscEnv -> IO ([LoadedPlugin], [Linkable], PkgsLoaded)
 loadPlugins hsc_env
   = do { unless (null to_load) $
            checkExternalInterpreter hsc_env
-       ; plugins <- mapM loadPlugin to_load
-       ; return $ zipWith attachOptions to_load plugins }
+       ; plugins_with_deps <- mapM loadPlugin to_load
+       ; let (plugins, ifaces, links, pkgs) = unzip4 plugins_with_deps
+       ; return (zipWith attachOptions to_load (zip plugins ifaces), concat links, foldl' plusUDFM emptyUDFM pkgs)
+       }
   where
     dflags  = hsc_dflags hsc_env
-    to_load = pluginModNames dflags
+    to_load = reverse $ pluginModNames dflags
 
     attachOptions mod_nm (plug, mod) =
         LoadedPlugin (PluginWithArgs plug (reverse options)) mod
@@ -96,21 +112,22 @@ loadPlugins hsc_env
     loadPlugin = loadPlugin' (mkVarOcc "plugin") pluginTyConName hsc_env
 
 
-loadFrontendPlugin :: HscEnv -> ModuleName -> IO FrontendPlugin
+loadFrontendPlugin :: HscEnv -> ModuleName -> IO (FrontendPlugin, [Linkable], PkgsLoaded)
 loadFrontendPlugin hsc_env mod_name = do
     checkExternalInterpreter hsc_env
-    fst <$> loadPlugin' (mkVarOcc "frontendPlugin") frontendPluginTyConName
-                hsc_env mod_name
+    (plugin, _iface, links, pkgs)
+      <- loadPlugin' (mkVarOcc "frontendPlugin") frontendPluginTyConName
+           hsc_env mod_name
+    return (plugin, links, pkgs)
 
 -- #14335
 checkExternalInterpreter :: HscEnv -> IO ()
-checkExternalInterpreter hsc_env
-  | Just (ExternalInterp {}) <- hsc_interp hsc_env
-  = throwIO (InstallationError "Plugins require -fno-external-interpreter")
-  | otherwise
-  = pure ()
+checkExternalInterpreter hsc_env = case interpInstance <$> hsc_interp hsc_env of
+  Just (ExternalInterp {})
+    -> throwIO (InstallationError "Plugins require -fno-external-interpreter")
+  _ -> pure ()
 
-loadPlugin' :: OccName -> Name -> HscEnv -> ModuleName -> IO (a, ModIface)
+loadPlugin' :: OccName -> Name -> HscEnv -> ModuleName -> IO (a, ModIface, [Linkable], PkgsLoaded)
 loadPlugin' occ_name plugin_name hsc_env mod_name
   = do { let plugin_rdr_name = mkRdrQual mod_name occ_name
              dflags = hsc_dflags hsc_env
@@ -125,14 +142,18 @@ loadPlugin' occ_name plugin_name hsc_env mod_name
             Just (name, mod_iface) ->
 
      do { plugin_tycon <- forceLoadTyCon hsc_env plugin_name
-        ; mb_plugin <- getValueSafely hsc_env name (mkTyConTy plugin_tycon)
-        ; case mb_plugin of
-            Nothing ->
-                throwGhcExceptionIO (CmdLineError $ showSDoc dflags $ hsep
+        ; eith_plugin <- getValueSafely hsc_env name (mkTyConTy plugin_tycon)
+        ; case eith_plugin of
+            Left actual_type ->
+                throwGhcExceptionIO (CmdLineError $
+                    showSDocForUser dflags (ue_units (hsc_unit_env hsc_env))
+                      alwaysQualify $ hsep
                           [ text "The value", ppr name
+                          , text "with type", ppr actual_type
                           , text "did not have the type"
-                          , ppr pluginTyConName, text "as required"])
-            Just plugin -> return (plugin, mod_iface) } } }
+                          , text "GHC.Plugins.Plugin"
+                          , text "as required"])
+            Right (plugin, links, pkgs) -> return (plugin, mod_iface, links, pkgs) } } }
 
 
 -- | Force the interfaces for the given modules to be loaded. The 'SDoc' parameter is used
@@ -160,7 +181,7 @@ forceLoadTyCon :: HscEnv -> Name -> IO TyCon
 forceLoadTyCon hsc_env con_name = do
     forceLoadNameModuleInterface hsc_env (text "contains a name used in an invocation of loadTyConTy") con_name
 
-    mb_con_thing <- lookupTypeHscEnv hsc_env con_name
+    mb_con_thing <- lookupType hsc_env con_name
     case mb_con_thing of
         Nothing -> throwCmdLineErrorS dflags $ missingTyThingError con_name
         Just (ATyCon tycon) -> return tycon
@@ -170,29 +191,33 @@ forceLoadTyCon hsc_env con_name = do
 -- | Loads the value corresponding to a 'Name' if that value has the given 'Type'. This only provides limited safety
 -- in that it is up to the user to ensure that that type corresponds to the type you try to use the return value at!
 --
--- If the value found was not of the correct type, returns @Nothing@. Any other condition results in an exception:
+-- If the value found was not of the correct type, returns @Left <actual_type>@. Any other condition results in an exception:
 --
 -- * If we could not load the names module
 -- * If the thing being loaded is not a value
 -- * If the Name does not exist in the module
 -- * If the link failed
 
-getValueSafely :: HscEnv -> Name -> Type -> IO (Maybe a)
+getValueSafely :: HscEnv -> Name -> Type -> IO (Either Type (a, [Linkable], PkgsLoaded))
 getValueSafely hsc_env val_name expected_type = do
-  mb_hval <- lookupHook getValueSafelyHook getHValueSafely dflags hsc_env val_name expected_type
-  case mb_hval of
-    Nothing   -> return Nothing
-    Just hval -> do
-      value <- lessUnsafeCoerce dflags "getValueSafely" hval
-      return (Just value)
+  eith_hval <- case getValueSafelyHook hooks of
+    Nothing -> getHValueSafely interp hsc_env val_name expected_type
+    Just h  -> h                      hsc_env val_name expected_type
+  case eith_hval of
+    Left actual_type -> return (Left actual_type)
+    Right (hval, links, pkgs) -> do
+      value <- lessUnsafeCoerce logger "getValueSafely" hval
+      return (Right (value, links, pkgs))
   where
-    dflags = hsc_dflags hsc_env
+    interp = hscInterp hsc_env
+    logger = hsc_logger hsc_env
+    hooks  = hsc_hooks hsc_env
 
-getHValueSafely :: HscEnv -> Name -> Type -> IO (Maybe HValue)
-getHValueSafely hsc_env val_name expected_type = do
+getHValueSafely :: Interp -> HscEnv -> Name -> Type -> IO (Either Type (HValue, [Linkable], PkgsLoaded))
+getHValueSafely interp hsc_env val_name expected_type = do
     forceLoadNameModuleInterface hsc_env (text "contains a name used in an invocation of getHValueSafely") val_name
     -- Now look up the names for the value and type constructor in the type environment
-    mb_val_thing <- lookupTypeHscEnv hsc_env val_name
+    mb_val_thing <- lookupType hsc_env val_name
     case mb_val_thing of
         Nothing -> throwCmdLineErrorS dflags $ missingTyThingError val_name
         Just (AnId id) -> do
@@ -202,13 +227,16 @@ getHValueSafely hsc_env val_name expected_type = do
              then do
                 -- Link in the module that contains the value, if it has such a module
                 case nameModule_maybe val_name of
-                    Just mod -> do linkModule hsc_env mod
+                    Just mod -> do loadModule interp hsc_env mod
                                    return ()
                     Nothing ->  return ()
                 -- Find the value that we just linked in and cast it given that we have proved it's type
-                hval <- withInterp hsc_env $ \interp -> getHValue hsc_env val_name >>= wormhole interp
-                return (Just hval)
-             else return Nothing
+                hval <- do
+                  (v, links, pkgs) <- loadName interp hsc_env val_name
+                  hv <- wormhole interp v
+                  return (hv, links, pkgs)
+                return (Right hval)
+             else return (Left (idType id))
         Just val_thing -> throwCmdLineErrorS dflags $ wrongTyThingError val_name val_thing
    where dflags = hsc_dflags hsc_env
 
@@ -218,12 +246,12 @@ getHValueSafely hsc_env val_name expected_type = do
 --
 -- 2) Wrap it in some debug messages at verbosity 3 or higher so we can see what happened
 --    if it /does/ segfault
-lessUnsafeCoerce :: DynFlags -> String -> a -> IO b
-lessUnsafeCoerce dflags context what = do
-    debugTraceMsg dflags 3 $ (text "Coercing a value in") <+> (text context) <>
-                             (text "...")
+lessUnsafeCoerce :: Logger -> String -> a -> IO b
+lessUnsafeCoerce logger context what = do
+    debugTraceMsg logger 3 $
+        (text "Coercing a value in") <+> (text context) <> (text "...")
     output <- evaluate (unsafeCoerce what)
-    debugTraceMsg dflags 3 (text "Successfully evaluated coercion")
+    debugTraceMsg logger 3 (text "Successfully evaluated coercion")
     return output
 
 
@@ -244,8 +272,14 @@ lessUnsafeCoerce dflags context what = do
 lookupRdrNameInModuleForPlugins :: HscEnv -> ModuleName -> RdrName
                                 -> IO (Maybe (Name, ModIface))
 lookupRdrNameInModuleForPlugins hsc_env mod_name rdr_name = do
+    let dflags     = hsc_dflags hsc_env
+    let fopts      = initFinderOpts dflags
+    let fc         = hsc_FC hsc_env
+    let unit_env   = hsc_unit_env hsc_env
+    let unit_state = ue_units unit_env
+    let mhome_unit = hsc_home_unit_maybe hsc_env
     -- First find the unit the module resides in by searching exposed units and home modules
-    found_module <- findPluginModule hsc_env mod_name
+    found_module <- findPluginModule fc fopts unit_state mhome_unit mod_name
     case found_module of
         Found _ mod -> do
             -- Find the exports of the module
@@ -260,21 +294,20 @@ lookupRdrNameInModuleForPlugins hsc_env mod_name rdr_name = do
                         imp_spec = ImpSpec decl_spec ImpAll
                         env = mkGlobalRdrEnv (gresFromAvails (Just imp_spec) (mi_exports iface))
                     case lookupGRE_RdrName rdr_name env of
-                        [gre] -> return (Just (gre_name gre, iface))
+                        [gre] -> return (Just (greMangledName gre, iface))
                         []    -> return Nothing
                         _     -> panic "lookupRdrNameInModule"
 
                 Nothing -> throwCmdLineErrorS dflags $ hsep [text "Could not determine the exports of the module", ppr mod_name]
-        err -> throwCmdLineErrorS dflags $ cannotFindModule dflags mod_name err
+        err -> throwCmdLineErrorS dflags $ cannotFindModule hsc_env mod_name err
   where
-    dflags = hsc_dflags hsc_env
     doc = text "contains a name used in an invocation of lookupRdrNameInModule"
 
 wrongTyThingError :: Name -> TyThing -> SDoc
-wrongTyThingError name got_thing = hsep [text "The name", ppr name, ptext (sLit "is not that of a value but rather a"), pprTyThingCategory got_thing]
+wrongTyThingError name got_thing = hsep [text "The name", ppr name, text "is not that of a value but rather a", pprTyThingCategory got_thing]
 
 missingTyThingError :: Name -> SDoc
-missingTyThingError name = hsep [text "The name", ppr name, ptext (sLit "is not in the type environment: are you sure it exists?")]
+missingTyThingError name = hsep [text "The name", ppr name, text "is not in the type environment: are you sure it exists?"]
 
 throwCmdLineErrorS :: DynFlags -> SDoc -> IO a
 throwCmdLineErrorS dflags = throwCmdLineError . showSDoc dflags

@@ -32,9 +32,7 @@ hadrian/build.bat -j
 ```
 
 Here flag `-j` enables parallelism and is optional. We will further refer to the
-build script simply as `build`. Note that Hadrian can also run the `boot` and
-`configure` scripts automatically for you if you pass the flag `--configure`,
-or simply `-c`. See the overview of command line flags below.
+build script simply as `build`.
 
 Notes:
 
@@ -78,16 +76,6 @@ for GHC developers who want to build GHC in different ways or at different
 commits, from the same source directory, and have the build products sit in
 different, isolated folders.
 
-* `--configure` or `-c`: use this flag to run the `boot` and `configure` scripts
-automatically, so that you don't have to remember to run them manually as you
-normally do when using Make (typically only in the first build):
-    ```bash
-    ./boot
-    ./configure # On Windows run ./configure --enable-tarballs-autodownload
-    ```
-    Beware that with this flag Hadrian may do network I/O on Windows to download
-    necessary tarballs, which may sometimes be undesirable.
-
 * `--flavour=FLAVOUR`: choose a build flavour. The following settings are
 currently supported: `default`, `quick`, `quickest`, `perf`, `prof`, `devel1`
 and `devel2`. As an example, the `quickest` flavour adds `-O0` flag to all GHC
@@ -106,8 +94,7 @@ Stage2 GHC.
 
 * `--skip-depends`: skips rebuilding Haskell module dependency files.
 
-* `--integer-simple`: build GHC using the `integer-simple` integer library
-(instead of `integer-gmp`).
+* `--bignum={native,gmp,check-gmp,ffi}`: choose which bignum implementation to use. The default is `gmp`.
 
 * `--color` and `--no-color`: choose whether to use colors when printing build
 progress info. By default, Hadrian tries to determine if the terminal supports
@@ -118,8 +105,11 @@ four settings: `none`, `brief` (one line per build command; this is the default
 setting), `normal` (typically a box per build command), and `unicorn` (when
 `normal` just won't do).
 
-* `--verbose`: run Hadrian in verbose mode. In particular this prints diagnostic
-messages by Shake oracles.
+* `-V`/`--verbose`: run Hadrian in verbose mode. This makes commands print their stdout
+  and produces slightly more output on a failure (including hadrian call stacks).
+
+* `-VV`: run hadrian in diagnostics mode: In particular this prints diagnostic
+messages by Shake oracles and full command lines for all commands.
 
 * `--lint`: run [Shake Lint](https://shakebuild.com/manual#lint) during the
 build to check that the build system is well formed. Note that the Lint check
@@ -206,9 +196,26 @@ system offers.
 `build selftest` runs tests of the build system. The current test coverage
 is close to zero (see [#197][test-issue]).
 
+#### Running linters
+
+There are two targets which runs the lint commands used by CI:
+
+* `lint:base`, runs hlint on the `base` library.
+* `lint:compiler`, runs hlint on the `ghc` library.
+
+It's useful to know that you can combine multiple targets in build command. For example,
+you can tell hadrian to build the compiler and also run the linters:
+
+```
+./hadrian/build stage2:exe:ghc-bin lint:compiler
+```
+
 #### Clean and full rebuild
 
 * `build clean` removes all build artefacts.
+
+* `build distclean` additionally remove the mingw tarballs and fs* files created
+  by `configure`.
 
 * `build -B` forces Shake to rerun all rules, even if the previous build results
 are still up-to-date.
@@ -241,9 +248,34 @@ These stages can be summarized graphically:
 
 #### Documentation
 
-To build GHC documentation, run `build docs`. Note that finer-grain
-documentation targets (e.g. building only HTML documentation or only the GHC
-User's Guide) are currently not supported.
+To build all GHC documentation, run `build docs`. This includes
+
+* Haddock documentation for all libraries
+* The user guide (PDF and HTML)
+* The man page
+
+In order to only build haddock document there is the `build docs-haddock` target.
+
+In order to build the haddock documentation for just one package use the `docs:<pkg>` command,
+for example `docs:base` will just build the documentation for `base`.
+
+Alternatively,
+you can use the `--docs` CLI flag to selectively disable some or
+all of the documentation targets:
+
+- `--docs=none`: don't build any docs
+- `--docs=no-haddocks`: don't build haddocks
+- `--docs=no-sphinx`: don't build any user manual or manpage
+- `--docs=no-sphinx-html`: don't build HTML versions of manuals
+- `--docs=no-sphinx-pdfs`: don't build PDF versions of manuals
+- `--docs=no-sphinx-man`: don't build the manpage
+
+You can pass several `--docs=...` flags, Hadrian will combine
+their effects.
+
+To build haddock documentation for upload to hackage you need to pass the `--haddock-base-url` flag,
+by default this will choose a url suitable for uploading to hackage but you might also want to pass something like
+`http://127.0.0.1:8080/package/%pkg%/docs` for testing upload locally on a local hackage server.
 
 #### Source distribution
 
@@ -301,15 +333,6 @@ Troubleshooting
 ---------------
 
 Here are a few simple suggestions that might help you fix the build:
-
-* If Hadrian fails with the message
-  `Configuration file hadrian/cfg/system.config is missing`, you have probably
-  forgotten to pass the `--configure` flag during the first build.
-
-* With the `--configure` (`-c`) flag, Hadrian sometimes fetches a wrong
-  Happy saying something like: `HappyTemplate-arrays-coerce: openFile: does not exist`
-  (as mentioned [here](https://github.com/haskell/cabal/issues/5867)), in
-  which case you might be better off running `./configure` manually before Hadrian.
 
 * The call to `build test` sometimes fails with
   `libCffi_p.a: copyFile: does not exist` (as noticed

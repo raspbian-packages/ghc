@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP #-}
+
 module GHC.CmmToAsm.X86.RegInfo (
         mkVirtualReg,
         regDotColor
@@ -6,14 +6,13 @@ module GHC.CmmToAsm.X86.RegInfo (
 
 where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
 import GHC.CmmToAsm.Format
 import GHC.Platform.Reg
 
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
 import GHC.Platform
 import GHC.Types.Unique
 

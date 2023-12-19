@@ -1,4 +1,3 @@
-{-# LANGUAGE MagicHash, BangPatterns #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
@@ -30,14 +29,11 @@ import qualified Data.Set as Set
 
 import GHC.Data.FastString (unpackFS)
 import GHC.Core.Class
-import GHC.Driver.Session
 import GHC.Core (isOrphan)
-import GHC.Utils.Error
 import GHC.Core.FamInstEnv
 import GHC
 import GHC.Core.InstEnv
 import GHC.Unit.Module.Env ( ModuleSet, moduleSetElts )
-import GHC.Utils.Monad (liftIO)
 import GHC.Types.Name
 import GHC.Types.Name.Env
 import GHC.Utils.Outputable (text, sep, (<+>))
@@ -104,7 +100,7 @@ attachToExportItem index expInfo getInstDoc getFixity export =
             fam_instances = maybeToList mb_instances >>= snd
             fam_insts = [ ( synFamInst
                           , getInstDoc n
-                          , spanNameE n synFamInst (L eSpan (tcdName d))
+                          , spanNameE n synFamInst (L (locA eSpan) (tcdName d))
                           , nameModule_maybe n
                           )
                         | i <- sortBy (comparing instFam) fam_instances
@@ -116,7 +112,7 @@ attachToExportItem index expInfo getInstDoc getFixity export =
                         ]
             cls_insts = [ ( synClsInst
                           , getInstDoc n
-                          , spanName n synClsInst (L eSpan (tcdName d))
+                          , spanName n synClsInst (L (locA eSpan) (tcdName d))
                           , nameModule_maybe n
                           )
                         | let is = [ (instanceSig i, getName i) | i <- cls_instances ]
@@ -128,9 +124,8 @@ attachToExportItem index expInfo getInstDoc getFixity export =
             cleanFamInsts = [ (fi, n, L l r, m) | (Right fi, n, L l (Right r), m) <- fam_insts ]
             famInstErrs = [ errm | (Left errm, _, _, _) <- fam_insts ]
         in do
-          dfs <- getDynFlags
           let mkBug = (text "haddock-bug:" <+>) . text
-          liftIO $ putMsg dfs (sep $ map mkBug famInstErrs)
+          putMsgM (sep $ map mkBug famInstErrs)
           return $ cls_insts ++ cleanFamInsts
       return $ e { expItemInstances = insts }
     e -> return e
@@ -140,12 +135,12 @@ attachToExportItem index expInfo getInstDoc getFixity export =
                                , expItemSubDocs = subDocs
                                } = e { expItemFixities =
       nubByName fst $ expItemFixities e ++
-      [ (n',f) | n <- getMainDeclBinder d
+      [ (n',f) | n <- getMainDeclBinder emptyOccEnv d
                , n' <- n : (map fst subDocs ++ patsyn_names)
                , f <- maybeToList (getFixity n')
       ] }
       where
-        patsyn_names = concatMap (getMainDeclBinder . fst) patsyns
+        patsyn_names = concatMap (getMainDeclBinder emptyOccEnv . fst) patsyns
 
     attachFixities e = e
     -- spanName: attach the location to the name that is the same file as the instance location
@@ -197,6 +192,7 @@ instance Ord SName where
 data SimpleType = SimpleType SName [SimpleType]
                 | SimpleIntTyLit Integer
                 | SimpleStringTyLit String
+                | SimpleCharTyLit Char
                   deriving (Eq,Ord)
 
 
@@ -222,6 +218,7 @@ simplify (TyConApp tc ts) = SimpleType (SName (tyConName tc))
                                        (mapMaybe simplify_maybe ts)
 simplify (LitTy (NumTyLit n)) = SimpleIntTyLit n
 simplify (LitTy (StrTyLit s)) = SimpleStringTyLit (unpackFS s)
+simplify (LitTy (CharTyLit c)) = SimpleCharTyLit c
 simplify (CastTy ty _) = simplify ty
 simplify (CoercionTy _) = error "simplify:Coercion"
 

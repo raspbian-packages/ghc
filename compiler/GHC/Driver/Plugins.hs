@@ -1,5 +1,5 @@
 {-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE CPP #-}
+
 
 -- | Definitions for writing /plugins/ for GHC. Plugins can hook into
 -- several areas of the compiler. See the 'Plugin' type. These plugins
@@ -7,9 +7,13 @@
 
 module GHC.Driver.Plugins (
       -- * Plugins
-      Plugin(..)
+      Plugins (..)
+    , emptyPlugins
+    , Plugin(..)
     , defaultPlugin
     , CommandLineOption
+    , PsMessages(..)
+    , ParsedResult(..)
       -- ** Recompilation checking
     , purePlugin, impurePlugin, flagRecompile
     , PluginRecompile(..)
@@ -35,13 +39,17 @@ module GHC.Driver.Plugins (
       -- - access to loaded interface files with 'interfaceLoadAction'
       --
     , keepRenamedSource
+      -- ** Defaulting plugins
+      -- | Defaulting plugins can add candidate types to the defaulting
+      -- mechanism.
+    , DefaultingPlugin
       -- ** Hole fit plugins
       -- | hole fit plugins allow plugins to change the behavior of valid hole
       -- fit suggestions
     , HoleFitPluginR
 
       -- * Internal
-    , PluginWithArgs(..), plugins, pluginRecompile'
+    , PluginWithArgs(..), pluginsWithArgs, pluginRecompile'
     , LoadedPlugin(..), lpModuleName
     , StaticPlugin(..)
     , mapPlugins, withPlugins, withPlugins_
@@ -49,29 +57,52 @@ module GHC.Driver.Plugins (
 
 import GHC.Prelude
 
-import GHC.Core.Opt.Monad ( CoreToDo, CoreM )
+import GHC.Driver.Env
+import GHC.Driver.Monad
+import GHC.Driver.Phases
+
+import GHC.Unit.Module
+import GHC.Unit.Module.ModIface
+import GHC.Unit.Module.ModSummary
+
+import GHC.Parser.Errors.Types (PsWarning, PsError)
+
 import qualified GHC.Tc.Types
 import GHC.Tc.Types ( TcGblEnv, IfM, TcM, tcg_rn_decls, tcg_rn_exports  )
 import GHC.Tc.Errors.Hole.FitTypes ( HoleFitPluginR )
+
+import GHC.Core.Opt.Monad ( CoreToDo, CoreM )
 import GHC.Hs
-import GHC.Driver.Session
-import GHC.Driver.Types
-import GHC.Driver.Monad
-import GHC.Driver.Phases
-import GHC.Unit.Module
+import GHC.Types.Error (Messages)
 import GHC.Utils.Fingerprint
-import Data.List (sort)
 import GHC.Utils.Outputable (Outputable(..), text, (<+>))
+
+import Data.List (sort)
 
 --Qualified import so we can define a Semigroup instance
 -- but it doesn't clash with Outputable.<>
 import qualified Data.Semigroup
 
 import Control.Monad
+import GHC.Linker.Types
+import GHC.Types.Unique.DFM
 
 -- | Command line options gathered from the -PModule.Name:stuff syntax
 -- are given to you as this type
 type CommandLineOption = String
+
+-- | Errors and warnings produced by the parser
+data PsMessages = PsMessages { psWarnings :: Messages PsWarning
+                             , psErrors   :: Messages PsError
+                             }
+
+-- | Result of running the parser and the parser plugin
+data ParsedResult = ParsedResult
+  { -- | Parsed module, potentially modified by a plugin
+    parsedResultModule :: HsParsedModule
+  , -- | Warnings and errors from parser, potentially modified by a plugin
+    parsedResultMessages :: PsMessages
+  }
 
 -- | 'Plugin' is the compiler plugin data type. Try to avoid
 -- constructing one of these directly, and just modify some fields of
@@ -89,22 +120,29 @@ data Plugin = Plugin {
   , tcPlugin :: TcPlugin
     -- ^ An optional typechecker plugin, which may modify the
     -- behaviour of the constraint solver.
+  , defaultingPlugin :: DefaultingPlugin
+    -- ^ An optional defaulting plugin, which may specify the
+    -- additional type-defaulting rules.
   , holeFitPlugin :: HoleFitPlugin
     -- ^ An optional plugin to handle hole fits, which may re-order
     --   or change the list of valid hole fits and refinement hole fits.
-  , dynflagsPlugin :: [CommandLineOption] -> DynFlags -> IO DynFlags
-    -- ^ An optional plugin to update 'DynFlags', right after
-    --   plugin loading. This can be used to register hooks
-    --   or tweak any field of 'DynFlags' before doing
-    --   actual work on a module.
+
+  , driverPlugin :: [CommandLineOption] -> HscEnv -> IO HscEnv
+    -- ^ An optional plugin to update 'HscEnv', right after plugin loading. This
+    -- can be used to register hooks or tweak any field of 'DynFlags' before
+    -- doing actual work on a module.
     --
     --   @since 8.10.1
+
   , pluginRecompile :: [CommandLineOption] -> IO PluginRecompile
     -- ^ Specify how the plugin should affect recompilation.
-  , parsedResultAction :: [CommandLineOption] -> ModSummary -> HsParsedModule
-                            -> Hsc HsParsedModule
+  , parsedResultAction :: [CommandLineOption] -> ModSummary
+                       -> ParsedResult -> Hsc ParsedResult
     -- ^ Modify the module when it is parsed. This is called by
-    -- "GHC.Driver.Main" when the parsing is successful.
+    -- "GHC.Driver.Main" when the parser has produced no or only non-fatal
+    -- errors.
+    -- Compilation will fail if the messages produced by this function contain
+    -- any errors.
   , renamedResultAction :: [CommandLineOption] -> TcGblEnv
                                 -> HsGroup GhcRn -> TcM (TcGblEnv, HsGroup GhcRn)
     -- ^ Modify each group after it is renamed. This is called after each
@@ -189,6 +227,7 @@ instance Monoid PluginRecompile where
 
 type CorePlugin = [CommandLineOption] -> [CoreToDo] -> CoreM [CoreToDo]
 type TcPlugin = [CommandLineOption] -> Maybe GHC.Tc.Types.TcPlugin
+type DefaultingPlugin = [CommandLineOption] -> Maybe GHC.Tc.Types.DefaultingPlugin
 type HoleFitPlugin = [CommandLineOption] -> Maybe HoleFitPluginR
 
 purePlugin, impurePlugin, flagRecompile :: [CommandLineOption] -> IO PluginRecompile
@@ -207,8 +246,9 @@ defaultPlugin :: Plugin
 defaultPlugin = Plugin {
         installCoreToDos      = const return
       , tcPlugin              = const Nothing
+      , defaultingPlugin      = const Nothing
       , holeFitPlugin         = const Nothing
-      , dynflagsPlugin        = const return
+      , driverPlugin          = const return
       , pluginRecompile       = impurePlugin
       , renamedResultAction   = \_ env grp -> return (env, grp)
       , parsedResultAction    = \_ _ -> return
@@ -236,25 +276,50 @@ keepRenamedSource _ gbl_env group =
 type PluginOperation m a = Plugin -> [CommandLineOption] -> a -> m a
 type ConstPluginOperation m a = Plugin -> [CommandLineOption] -> a -> m ()
 
-plugins :: DynFlags -> [PluginWithArgs]
-plugins df =
-  map lpPlugin (cachedPlugins df) ++
-  map spPlugin (staticPlugins df)
+data Plugins = Plugins
+  { staticPlugins :: ![StaticPlugin]
+      -- ^ Static plugins which do not need dynamic loading. These plugins are
+      -- intended to be added by GHC API users directly to this list.
+      --
+      -- To add dynamically loaded plugins through the GHC API see
+      -- 'addPluginModuleName' instead.
+
+  , loadedPlugins :: ![LoadedPlugin]
+      -- ^ Plugins dynamically loaded after processing arguments. What
+      -- will be loaded here is directed by DynFlags.pluginModNames.
+      -- Arguments are loaded from DynFlags.pluginModNameOpts.
+      --
+      -- The purpose of this field is to cache the plugins so they
+      -- don't have to be loaded each time they are needed.  See
+      -- 'GHC.Runtime.Loader.initializePlugins'.
+  , loadedPluginDeps :: !([Linkable], PkgsLoaded)
+  -- ^ The object files required by the loaded plugins
+  -- See Note [Plugin dependencies]
+  }
+
+emptyPlugins :: Plugins
+emptyPlugins = Plugins [] [] ([], emptyUDFM)
+
+
+pluginsWithArgs :: Plugins -> [PluginWithArgs]
+pluginsWithArgs plugins =
+  map lpPlugin (loadedPlugins plugins) ++
+  map spPlugin (staticPlugins plugins)
 
 -- | Perform an operation by using all of the plugins in turn.
-withPlugins :: Monad m => DynFlags -> PluginOperation m a -> a -> m a
-withPlugins df transformation input = foldM go input (plugins df)
+withPlugins :: Monad m => Plugins -> PluginOperation m a -> a -> m a
+withPlugins plugins transformation input = foldM go input (pluginsWithArgs plugins)
   where
     go arg (PluginWithArgs p opts) = transformation p opts arg
 
-mapPlugins :: DynFlags -> (Plugin -> [CommandLineOption] -> a) -> [a]
-mapPlugins df f = map (\(PluginWithArgs p opts) -> f p opts) (plugins df)
+mapPlugins :: Plugins -> (Plugin -> [CommandLineOption] -> a) -> [a]
+mapPlugins plugins f = map (\(PluginWithArgs p opts) -> f p opts) (pluginsWithArgs plugins)
 
 -- | Perform a constant operation by using all of the plugins in turn.
-withPlugins_ :: Monad m => DynFlags -> ConstPluginOperation m a -> a -> m ()
-withPlugins_ df transformation input
+withPlugins_ :: Monad m => Plugins -> ConstPluginOperation m a -> a -> m ()
+withPlugins_ plugins transformation input
   = mapM_ (\(PluginWithArgs p opts) -> transformation p opts input)
-          (plugins df)
+          (pluginsWithArgs plugins)
 
 type FrontendPluginAction = [String] -> [(String, Maybe Phase)] -> Ghc ()
 data FrontendPlugin = FrontendPlugin {

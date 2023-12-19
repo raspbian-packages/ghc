@@ -35,8 +35,10 @@ data Flavour = Flavour {
     ghciWithDebugger :: Bool,
     -- | Build profiled GHC.
     ghcProfiled :: Bool,
-    -- | Build GHC with debug information.
-    ghcDebugged :: Bool
+    -- | Build GHC with the debug RTS.
+    ghcDebugged :: Bool,
+    -- | Build GHC with debug assertions.
+    ghcDebugAssertions :: Bool,
     -- | Build the GHC executable against the threaded runtime system.
     ghcThreaded :: Bool,
     -- | Whether to build docs and which ones
@@ -114,12 +116,12 @@ prefixes, and `*` matches an entire path component, excluding any separators.
 #### Enabling -Werror
 
 It is useful to enable `-Werror` when building GHC as this setting is
-used in the CI to ensure a warning free build. The `werror` function can be
-used to easily modify a flavour to turn this setting on.
+used in the CI to ensure a warning-free build. The `+werror`
+[flavour transformer](flavours.md#flavour-transformers)
+can be used to easily modify a flavour to turn this setting on:
 
 ```
-devel2WerrorFlavour :: Flavour
-devel2WerrorFlavour = werror (developmentFlavour Stage2)
+hadrian/build --flavour=validate+werror
 ```
 
 #### Linking GHC against the debugged RTS
@@ -218,41 +220,6 @@ noDynamicFlavour :: Flavour
 noDynamicFlavour = defaultFlavour
     { name = "no-dynamic"
     , libraryWays = remove [dynamic] defaultLibraryWays }
-```
-
-### Verbose command lines
-
-By default Hadrian does not print full command lines during the build process
-and instead prints short human readable digests for each executed command. You
-can suppress this behaviour completely or partially using `verboseCommand` setting:
-```haskell
--- | Set to 'True' to print full command lines during the build process. Note:
--- this is a 'Predicate', hence you can enable verbose output only for certain
--- targets, e.g.: @verboseCommand = package ghcPrim@.
-verboseCommand :: Predicate
-verboseCommand = do
-    verbosity <- expr getVerbosity
-    return $ verbosity >= Loud
-```
-For example, to print the full command lines used to compile GHC executables,
-set `verboseCommands` to:
-```haskell
-verboseCommand :: Predicate
-verboseCommand = input "ghc/Main.hs"
-```
-Below are a few other examples:
-```haskell
--- Print command lines for all Ghc Link invocations:
-verboseCommand = builder (Ghc Link)
-
--- Print command lines when compiling files in package compiler using Gcc:
-verboseCommand = builder (Gcc Compile) &&^ package compiler
-
--- Use patterns when matching files:
-verboseCommand = output "**/rts/sm/*" &&^ way threaded
-
--- Print all commands:
-verboseCommand = return True
 ```
 
 ### Documentation
@@ -357,15 +324,14 @@ One can alternatively supply settings from the command line or a
 For example, putting the following in a file at `_build/hadrian.settings`:
 
 ``` make
-stage1.ghc-bin.ghc.link.opts += -eventlog
+stage1.ghc-bin.ghc.link.opts += -debug
 *.base.ghc.*.opts += -v3
 ```
 
 and running hadrian with the default build root (`_build`), would respectively
-link the stage 2 GHC executable (using the stage 1 GHC) with the `-eventlog`
-flag, so that stage 2 GHC supports producing eventlogs with `+RTS -l`, and use
-`-v3` on all GHC commands used to build anything related to `base`, whatever
-the stage.
+link the stage 2 GHC executable (using the stage 1 GHC) with the `-debug`
+flag and use `-v3` on all GHC commands used to build anything related to
+`base`, whatever the stage.
 
 We could equivalently specify those settings on the command-line:
 
@@ -382,7 +348,8 @@ the right names for them:
 - the stage slot, which comes first, can be filled with any of `stage0`,
   `stage1`, `stage2`, `stage3` or `*`; any value but `*` will restrict the
   setting update to targets built during the given stage, while `*` is taken
-  to mean "for any stage".
+  to mean "for any stage". For instance, the above example will affect
+  the linking of the `_build/stage1/bin/ghc` executable.
 - the package slot, which comes second, can be filled with any package name
   that Hadrian knows about (all packages that are part of a GHC checkout),
   or `*`, to respectively mean that the builder options are going to be updated
@@ -402,6 +369,7 @@ the right names for them:
 	    argument for `hadrian/ghci` to work
 
   * `cc` refers to C compiler commands
+  * `cxx` refers to C++ compiler commands
 
     * `c.opts` for commands that call the C compiler on some C files
 	  * `deps.opts` for commands that call the C compiler for figuring out
@@ -409,6 +377,9 @@ the right names for them:
 
   * `cabal.configure.opts` refers to Cabal configure command line. Note that
     package flags can be given by adding `--flags=...` arguments.
+
+  * `runtest.opts` defines extra arguments passed to `runtest.py` when
+    invoked via the `hadrian test` target.
 
 - using a wildcard (`*`) ranges over all possible values for a given "slot";
 - `=` entirely overrides the arguments for a given builder in a given context,

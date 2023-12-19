@@ -1,5 +1,3 @@
-{-# LANGUAGE CPP #-}
-
 -----------------------------------------------------------------------------
 --
 -- GHC Driver
@@ -9,11 +7,13 @@
 -----------------------------------------------------------------------------
 
 module GHC.Driver.Phases (
-   HscSource(..), isHsBootOrSig, isHsigFile, hscSourceString,
    Phase(..),
-   happensBefore, eqPhase, anyHsc, isStopLn,
+   happensBefore, eqPhase, isStopLn,
    startPhase,
    phaseInputExt,
+
+   StopPhase(..),
+   stopPhaseToPhase,
 
    isHaskellishSuffix,
    isHaskellSrcSuffix,
@@ -34,18 +34,24 @@ module GHC.Driver.Phases (
    isCishFilename,
    isDynLibFilename,
    isHaskellUserSrcFilename,
-   isSourceFilename
- ) where
+   isSourceFilename,
 
-#include "HsVersions.h"
+   phaseForeignLanguage
+ ) where
 
 import GHC.Prelude
 
-import GHC.Utils.Outputable
 import GHC.Platform
-import System.FilePath
-import GHC.Utils.Binary
+
+import GHC.ForeignSrcLang
+
+import GHC.Types.SourceFile
+
+import GHC.Utils.Outputable
+import GHC.Utils.Panic
 import GHC.Utils.Misc
+
+import System.FilePath
 
 -----------------------------------------------------------------------------
 -- Phases
@@ -60,72 +66,22 @@ import GHC.Utils.Misc
    C compiler (opt.)      | .hc or .c     | -S            | .s
    assembler              | .s  or .S     | -c            | .o
    linker                 | other         | -             | a.out
+   linker (merge objects) | other         | -             | .o
 -}
 
--- Note [HscSource types]
--- ~~~~~~~~~~~~~~~~~~~~~~
--- There are three types of source file for Haskell code:
---
---      * HsSrcFile is an ordinary hs file which contains code,
---
---      * HsBootFile is an hs-boot file, which is used to break
---        recursive module imports (there will always be an
---        HsSrcFile associated with it), and
---
---      * HsigFile is an hsig file, which contains only type
---        signatures and is used to specify signatures for
---        modules.
---
--- Syntactically, hs-boot files and hsig files are quite similar: they
--- only include type signatures and must be associated with an
--- actual HsSrcFile.  isHsBootOrSig allows us to abstract over code
--- which is indifferent to which.  However, there are some important
--- differences, mostly owing to the fact that hsigs are proper
--- modules (you `import Sig` directly) whereas HsBootFiles are
--- temporary placeholders (you `import {-# SOURCE #-} Mod).
--- When we finish compiling the true implementation of an hs-boot,
--- we replace the HomeModInfo with the real HsSrcFile.  An HsigFile, on the
--- other hand, is never replaced (in particular, we *cannot* use the
--- HomeModInfo of the original HsSrcFile backing the signature, since it
--- will export too many symbols.)
---
--- Additionally, while HsSrcFile is the only Haskell file
--- which has *code*, we do generate .o files for HsigFile, because
--- this is how the recompilation checker figures out if a file
--- needs to be recompiled.  These are fake object files which
--- should NOT be linked against.
+-- Phases we can actually stop after
+data StopPhase = StopPreprocess -- ^ @-E@
+               | StopC          -- ^ @-C@
+               | StopAs         -- ^ @-S@
+               | NoStop         -- ^ @-c@
 
-data HscSource
-   = HsSrcFile | HsBootFile | HsigFile
-     deriving( Eq, Ord, Show )
-        -- Ord needed for the finite maps we build in CompManager
+stopPhaseToPhase :: StopPhase -> Phase
+stopPhaseToPhase StopPreprocess = anyHsc
+stopPhaseToPhase StopC          = HCc
+stopPhaseToPhase StopAs         = As False
+stopPhaseToPhase NoStop         = StopLn
 
-instance Binary HscSource where
-    put_ bh HsSrcFile = putByte bh 0
-    put_ bh HsBootFile = putByte bh 1
-    put_ bh HsigFile = putByte bh 2
-    get bh = do
-        h <- getByte bh
-        case h of
-            0 -> return HsSrcFile
-            1 -> return HsBootFile
-            _ -> return HsigFile
-
-hscSourceString :: HscSource -> String
-hscSourceString HsSrcFile   = ""
-hscSourceString HsBootFile  = "[boot]"
-hscSourceString HsigFile    = "[sig]"
-
--- See Note [isHsBootOrSig]
-isHsBootOrSig :: HscSource -> Bool
-isHsBootOrSig HsBootFile = True
-isHsBootOrSig HsigFile   = True
-isHsBootOrSig _          = False
-
-isHsigFile :: HscSource -> Bool
-isHsigFile HsigFile = True
-isHsigFile _        = False
-
+-- | Untyped Phase description
 data Phase
         = Unlit HscSource
         | Cpp   HscSource
@@ -145,7 +101,6 @@ data Phase
         | MergeForeign  -- merge in the foreign object files
 
         -- The final phase is a pseudo-phase that tells the pipeline to stop.
-        -- There is no runPhase case for it.
         | StopLn        -- Stop, but linking will follow, so generate .o file
   deriving (Eq, Show)
 
@@ -181,22 +136,8 @@ eqPhase Ccxx        Ccxx       = True
 eqPhase Cobjcxx     Cobjcxx    = True
 eqPhase _           _          = False
 
-{- Note [Partial ordering on phases]
-
-We want to know which phases will occur before which others. This is used for
-sanity checking, to ensure that the pipeline will stop at some point (see
-GHC.Driver.Pipeline.runPipeline).
-
-A < B iff A occurs before B in a normal compilation pipeline.
-
-There is explicitly not a total ordering on phases, because in registerised
-builds, the phase `HsC` doesn't happen before nor after any other phase.
-
-Although we check that a normal user doesn't set the stop_phase to HsC through
-use of -C with registerised builds (in Main.checkOptions), it is still
-possible for a ghc-api user to do so. So be careful when using the function
-happensBefore, and don't think that `not (a <= b)` implies `b < a`.
--}
+-- MP: happensBefore is only used in preprocessPipeline, that usage should
+-- be refactored and this usage removed.
 happensBefore :: Platform -> Phase -> Phase -> Bool
 happensBefore platform p1 p2 = p1 `happensBefore'` p2
     where StopLn `happensBefore'` _ = False
@@ -270,7 +211,7 @@ phaseInputExt (Cpp   _)           = "lpp"       -- intermediate only
 phaseInputExt (HsPp  _)           = "hscpp"     -- intermediate only
 phaseInputExt (Hsc   _)           = "hspp"      -- intermediate only
         -- NB: as things stand, phaseInputExt (Hsc x) must not evaluate x
-        --     because runPipeline uses the StopBefore phase to pick the
+        --     because runPhase uses the StopBefore phase to pick the
         --     output filename.  That could be fixed, but watch out.
 phaseInputExt HCc                 = "hc"
 phaseInputExt Ccxx                = "cpp"
@@ -367,3 +308,16 @@ isHaskellSigFilename     f = isHaskellSigSuffix     (drop 1 $ takeExtension f)
 isObjectFilename, isDynLibFilename :: Platform -> FilePath -> Bool
 isObjectFilename platform f = isObjectSuffix platform (drop 1 $ takeExtension f)
 isDynLibFilename platform f = isDynLibSuffix platform (drop 1 $ takeExtension f)
+
+-- | Foreign language of the phase if the phase deals with a foreign code
+phaseForeignLanguage :: Phase -> Maybe ForeignSrcLang
+phaseForeignLanguage phase = case phase of
+  Cc           -> Just LangC
+  Ccxx         -> Just LangCxx
+  Cobjc        -> Just LangObjc
+  Cobjcxx      -> Just LangObjcxx
+  HCc          -> Just LangC
+  As _         -> Just LangAsm
+  MergeForeign -> Just RawObject
+  _            -> Nothing
+

@@ -8,58 +8,72 @@
 
 module GHC.Core.Opt.Pipeline ( core2core, simplifyExpr ) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
 import GHC.Driver.Session
+import GHC.Driver.Plugins ( withPlugins, installCoreToDos )
+import GHC.Driver.Env
+import GHC.Platform.Ways  ( hasWay, Way(WayProf) )
+
 import GHC.Core
-import GHC.Driver.Types
 import GHC.Core.Opt.CSE  ( cseProgram )
-import GHC.Core.Rules   ( mkRuleBase, unionRuleBase,
+import GHC.Core.Rules   ( mkRuleBase,
                           extendRuleBaseList, ruleCheckProgram, addRuleInfo,
                           getRules, initRuleOpts )
 import GHC.Core.Ppr     ( pprCoreBindings, pprCoreExpr )
 import GHC.Core.Opt.OccurAnal ( occurAnalysePgm, occurAnalyseExpr )
-import GHC.Types.Id.Info
 import GHC.Core.Stats   ( coreBindsSize, coreBindsStats, exprSize )
-import GHC.Core.Utils   ( mkTicks, stripTicksTop )
+import GHC.Core.Utils   ( mkTicks, stripTicksTop, dumpIdInfoOfProgram )
 import GHC.Core.Lint    ( endPass, lintPassResult, dumpPassResult,
                           lintAnnots )
-import GHC.Core.Opt.Simplify       ( simplTopBinds, simplExpr, simplRules )
+import GHC.Core.Opt.Simplify       ( simplTopBinds, simplExpr, simplImpRules )
 import GHC.Core.Opt.Simplify.Utils ( simplEnvForGHCi, activeRule, activeUnfolding )
 import GHC.Core.Opt.Simplify.Env
 import GHC.Core.Opt.Simplify.Monad
 import GHC.Core.Opt.Monad
-import qualified GHC.Utils.Error as Err
-import GHC.Core.Opt.FloatIn  ( floatInwards )
-import GHC.Core.Opt.FloatOut ( floatOutwards )
-import GHC.Core.FamInstEnv
-import GHC.Types.Id
-import GHC.Utils.Error  ( withTiming, withTimingD, DumpFormat (..) )
-import GHC.Types.Basic
-import GHC.Types.Var.Set
-import GHC.Types.Var.Env
+import GHC.Core.Opt.FloatIn      ( floatInwards )
+import GHC.Core.Opt.FloatOut     ( floatOutwards )
 import GHC.Core.Opt.LiberateCase ( liberateCase )
 import GHC.Core.Opt.StaticArgs   ( doStaticArgs )
 import GHC.Core.Opt.Specialise   ( specProgram)
 import GHC.Core.Opt.SpecConstr   ( specConstrProgram)
-import GHC.Core.Opt.DmdAnal      ( dmdAnalProgram )
+import GHC.Core.Opt.DmdAnal
 import GHC.Core.Opt.CprAnal      ( cprAnalProgram )
 import GHC.Core.Opt.CallArity    ( callArityAnalProgram )
 import GHC.Core.Opt.Exitify      ( exitifyProgram )
 import GHC.Core.Opt.WorkWrap     ( wwTopBinds )
-import GHC.Types.SrcLoc
-import GHC.Utils.Misc
-import GHC.Unit.Module.Env
-import GHC.Driver.Plugins ( withPlugins, installCoreToDos )
-import GHC.Runtime.Loader -- ( initializePlugins )
+import GHC.Core.Opt.CallerCC     ( addCallerCostCentres )
+import GHC.Core.LateCC           (addLateCostCentresMG)
+import GHC.Core.Seq (seqBinds)
+import GHC.Core.FamInstEnv
 
-import GHC.Types.Unique.Supply ( UniqSupply, mkSplitUniqSupply, splitUniqSupply )
-import GHC.Types.Unique.FM
+import GHC.Utils.Error  ( withTiming )
+import GHC.Utils.Logger as Logger
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
+import GHC.Utils.Constants (debugIsOn)
+import GHC.Utils.Trace
+
+import GHC.Unit.External
+import GHC.Unit.Module.Env
+import GHC.Unit.Module.ModGuts
+import GHC.Unit.Module.Deps
+
+import GHC.Runtime.Context
+
+import GHC.Types.Id
+import GHC.Types.Id.Info
+import GHC.Types.Basic
+import GHC.Types.Demand ( zapDmdEnvSig )
+import GHC.Types.Var.Set
+import GHC.Types.Var.Env
+import GHC.Types.Tickish
+import GHC.Types.Unique.FM
+import GHC.Types.Name.Ppr
+
 import Control.Monad
 import qualified GHC.LanguageExtensions as LangExt
+import GHC.Unit.Module
 {-
 ************************************************************************
 *                                                                      *
@@ -73,33 +87,31 @@ core2core hsc_env guts@(ModGuts { mg_module  = mod
                                 , mg_loc     = loc
                                 , mg_deps    = deps
                                 , mg_rdr_env = rdr_env })
-  = do { -- make sure all plugins are loaded
-
-       ; let builtin_passes = getCoreToDo dflags
+  = do { let builtin_passes = getCoreToDo logger dflags
              orph_mods = mkModuleSet (mod : dep_orphs deps)
              uniq_mask = 's'
        ;
        ; (guts2, stats) <- runCoreM hsc_env hpt_rule_base uniq_mask mod
                                     orph_mods print_unqual loc $
                            do { hsc_env' <- getHscEnv
-                              ; dflags' <- liftIO $ initializePlugins hsc_env'
-                                                      (hsc_dflags hsc_env')
-                              ; all_passes <- withPlugins dflags'
+                              ; all_passes <- withPlugins (hsc_plugins hsc_env')
                                                 installCoreToDos
                                                 builtin_passes
                               ; runCorePasses all_passes guts }
 
-       ; Err.dumpIfSet_dyn dflags Opt_D_dump_simpl_stats
+       ; Logger.putDumpFileMaybe logger Opt_D_dump_simpl_stats
              "Grand total simplifier statistics"
              FormatText
              (pprSimplCount stats)
 
        ; return guts2 }
   where
+    logger         = hsc_logger hsc_env
     dflags         = hsc_dflags hsc_env
-    home_pkg_rules = hptRules hsc_env (dep_mods deps)
+    home_pkg_rules = hptRules hsc_env (moduleUnitId mod) (GWIB { gwib_mod = moduleName mod
+                                                               , gwib_isBoot = NotBoot })
     hpt_rule_base  = mkRuleBase home_pkg_rules
-    print_unqual   = mkPrintUnqualified dflags rdr_env
+    print_unqual   = mkPrintUnqualified (hsc_unit_env hsc_env) rdr_env
     -- mod: get the module out of the current HscEnv so we can retrieve it from the monad.
     -- This is very convienent for the users of the monad (e.g. plugins do not have to
     -- consume the ModGuts to find the module) but somewhat ugly because mg_module may
@@ -114,14 +126,14 @@ core2core hsc_env guts@(ModGuts { mg_module  = mod
 ************************************************************************
 -}
 
-getCoreToDo :: DynFlags -> [CoreToDo]
-getCoreToDo dflags
+getCoreToDo :: Logger -> DynFlags -> [CoreToDo]
+getCoreToDo logger dflags
   = flatten_todos core_todo
   where
-    opt_level     = optLevel           dflags
     phases        = simplPhases        dflags
     max_iter      = maxSimplIterations dflags
     rule_check    = ruleCheck          dflags
+    const_fold    = gopt Opt_CoreConstantFolding          dflags
     call_arity    = gopt Opt_CallArity                    dflags
     exitification = gopt Opt_Exitification                dflags
     strictness    = gopt Opt_Strictness                   dflags
@@ -136,8 +148,13 @@ getCoreToDo dflags
     static_args   = gopt Opt_StaticArgumentTransformation dflags
     rules_on      = gopt Opt_EnableRewriteRules           dflags
     eta_expand_on = gopt Opt_DoLambdaEtaExpansion         dflags
+    pre_inline_on = gopt Opt_SimplPreInlining             dflags
     ww_on         = gopt Opt_WorkerWrapper                dflags
     static_ptrs   = xopt LangExt.StaticPointers           dflags
+    profiling     = ways dflags `hasWay` WayProf
+
+    do_presimplify = do_specialise -- TODO: any other optimizations benefit from pre-simplification?
+    do_simpl3      = const_fold || rules_on -- TODO: any other optimizations benefit from three-phase simplification?
 
     maybe_rule_check phase = runMaybe rule_check (CoreDoRuleCheck phase)
 
@@ -146,13 +163,18 @@ getCoreToDo dflags
     maybe_strictness_before _
       = CoreDoNothing
 
-    base_mode = SimplMode { sm_phase      = panic "base_mode"
-                          , sm_names      = []
-                          , sm_dflags     = dflags
-                          , sm_rules      = rules_on
-                          , sm_eta_expand = eta_expand_on
-                          , sm_inline     = True
-                          , sm_case_case  = True }
+    base_mode = SimplMode { sm_phase        = panic "base_mode"
+                          , sm_names        = []
+                          , sm_dflags       = dflags
+                          , sm_logger       = logger
+                          , sm_uf_opts      = unfoldingOpts dflags
+                          , sm_rules        = rules_on
+                          , sm_eta_expand   = eta_expand_on
+                          , sm_cast_swizzle = True
+                          , sm_inline       = True
+                          , sm_case_case    = True
+                          , sm_pre_inline   = pre_inline_on
+                          }
 
     simpl_phase phase name iter
       = CoreDoPasses
@@ -201,16 +223,14 @@ getCoreToDo dflags
           }
         ]
 
+    add_caller_ccs =
+        runWhen (profiling && not (null $ callerCcFilters dflags)) CoreAddCallerCcs
+
+    add_late_ccs =
+        runWhen (profiling && gopt Opt_ProfLateInlineCcs dflags) $ CoreAddLateCcs
+
     core_todo =
-     if opt_level == 0 then
-       [ static_ptrs_float_outwards,
-         CoreDoSimplify max_iter
-             (base_mode { sm_phase = FinalPhase
-                        , sm_names = ["Non-opt simplification"] })
-       ]
-
-     else {- opt_level >= 1 -} [
-
+     [
     -- We want to do the static argument transform before full laziness as it
     -- may expose extra opportunities to float things outwards. However, to fix
     -- up the output of the transformation we need at do at least one simplify
@@ -218,7 +238,7 @@ getCoreToDo dflags
         runWhen static_args (CoreDoPasses [ simpl_gently, CoreDoStaticArgs ]),
 
         -- initial simplify: mk specialiser happy: minimum effort please
-        simpl_gently,
+        runWhen do_presimplify simpl_gently,
 
         -- Specialisation is best done before full laziness
         -- so that overloaded functions have all their dictionary lambdas manifest
@@ -254,9 +274,10 @@ getCoreToDo dflags
            static_ptrs_float_outwards,
 
         -- Run the simplier phases 2,1,0 to allow rewrite rules to fire
-        CoreDoPasses [ simpl_phase (Phase phase) "main" max_iter
-                     | phase <- [phases, phases-1 .. 1] ],
-        simpl_phase (Phase 0) "main" (max max_iter 3),
+        runWhen do_simpl3
+            (CoreDoPasses $ [ simpl_phase (Phase phase) "main" max_iter
+                            | phase <- [phases, phases-1 .. 1] ] ++
+                            [ simpl_phase (Phase 0) "main" (max max_iter 3) ]),
                 -- Phase 0: allow all Ids to be inlined now
                 -- This gets foldr inlined before strictness analysis
 
@@ -284,7 +305,7 @@ getCoreToDo dflags
         runWhen strictness demand_analyser,
 
         runWhen exitification CoreDoExitify,
-            -- See note [Placement of the exitification pass]
+            -- See Note [Placement of the exitification pass]
 
         runWhen full_laziness $
            CoreDoFloatOutwards FloatOutSwitches {
@@ -306,33 +327,38 @@ getCoreToDo dflags
 
         runWhen do_float_in CoreDoFloatInwards,
 
+        simplify "final",  -- Final tidy-up
+
         maybe_rule_check FinalPhase,
+
+        --------  After this we have -O2 passes -----------------
+        -- None of them run with -O
 
                 -- Case-liberation for -O2.  This should be after
                 -- strictness analysis and the simplification which follows it.
-        runWhen liberate_case (CoreDoPasses [
-            CoreLiberateCase,
-            simplify "post-liberate-case"
-            ]),         -- Run the simplifier after LiberateCase to vastly
-                        -- reduce the possibility of shadowing
-                        -- Reason: see Note [Shadowing] in GHC.Core.Opt.SpecConstr
+        runWhen liberate_case $ CoreDoPasses
+           [ CoreLiberateCase, simplify "post-liberate-case" ],
+           -- Run the simplifier after LiberateCase to vastly
+           -- reduce the possibility of shadowing
+           -- Reason: see Note [Shadowing] in GHC.Core.Opt.SpecConstr
 
-        runWhen spec_constr CoreDoSpecConstr,
+        runWhen spec_constr $ CoreDoPasses
+           [ CoreDoSpecConstr, simplify "post-spec-constr"],
+           -- See Note [Simplify after SpecConstr]
 
         maybe_rule_check FinalPhase,
 
-        runWhen late_specialise
-          (CoreDoPasses [ CoreDoSpecialising
-                        , simplify "post-late-spec"]),
+        runWhen late_specialise $ CoreDoPasses
+           [ CoreDoSpecialising, simplify "post-late-spec"],
 
         -- LiberateCase can yield new CSE opportunities because it peels
         -- off one layer of a recursive function (concretely, I saw this
         -- in wheel-sieve1), and I'm guessing that SpecConstr can too
         -- And CSE is a very cheap pass. So it seems worth doing here.
-        runWhen ((liberate_case || spec_constr) && cse) CoreCSE,
+        runWhen ((liberate_case || spec_constr) && cse) $ CoreDoPasses
+           [ CoreCSE, simplify "post-final-cse" ],
 
-        -- Final clean-up simplification:
-        simplify "final",
+        ---------  End of -O2 passes --------------
 
         runWhen late_dmd_anal $ CoreDoPasses (
             dmd_cpr_ww ++ [simplify "post-late-ww"]
@@ -345,7 +371,10 @@ getCoreToDo dflags
         -- can become /exponentially/ more expensive. See #11731, #12996.
         runWhen (strictness || late_dmd_anal) CoreDoDemand,
 
-        maybe_rule_check FinalPhase
+        maybe_rule_check FinalPhase,
+
+        add_caller_ccs,
+        add_late_ccs
      ]
 
     -- Remove 'CoreDoNothing' and flatten 'CoreDoPasses' for clarity.
@@ -401,6 +430,27 @@ or with -O0.  Two reasons:
 But watch out: list fusion can prevent floating.  So use phase control
 to switch off those rules until after floating.
 
+Note [Simplify after SpecConstr]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We want to run the simplifier after SpecConstr, and before late-Specialise,
+for two reasons, both shown up in test perf/compiler/T16473,
+with -O2 -flate-specialise
+
+1.  I found that running late-Specialise after SpecConstr, with no
+    simplification in between meant that the carefullly constructed
+    SpecConstr rule never got to fire.  (It was something like
+          lvl = f a   -- Arity 1
+          ....g lvl....
+    SpecConstr specialised g for argument lvl; but Specialise then
+    specialised lvl = f a to lvl = $sf, and inlined. Or something like
+    that.)
+
+2.  Specialise relies on unfoldings being available for top-level dictionary
+    bindings; but SpecConstr kills them all!  The Simplifer restores them.
+
+This extra run of the simplifier has a cost, but this is only with -O2.
+
+
 ************************************************************************
 *                                                                      *
                   The CoreToDo interpreter
@@ -415,66 +465,87 @@ runCorePasses passes guts
     do_pass guts CoreDoNothing = return guts
     do_pass guts (CoreDoPasses ps) = runCorePasses ps guts
     do_pass guts pass = do
-       withTimingD (ppr pass <+> brackets (ppr mod))
+      logger <- getLogger
+      withTiming logger (ppr pass <+> brackets (ppr mod))
                    (const ()) $ do
-            { guts' <- lintAnnots (ppr pass) (doCorePass pass) guts
-            ; endPass pass (mg_binds guts') (mg_rules guts')
-            ; return guts' }
+            guts' <- lintAnnots (ppr pass) (doCorePass pass) guts
+            endPass pass (mg_binds guts') (mg_rules guts')
+            return guts'
 
     mod = mg_module guts
 
 doCorePass :: CoreToDo -> ModGuts -> CoreM ModGuts
-doCorePass pass@(CoreDoSimplify {})  = {-# SCC "Simplify" #-}
-                                       simplifyPgm pass
+doCorePass pass guts = do
+  logger    <- getLogger
+  dflags    <- getDynFlags
+  us        <- getUniqueSupplyM
+  p_fam_env <- getPackageFamInstEnv
+  let platform = targetPlatform dflags
+  let fam_envs = (p_fam_env, mg_fam_inst_env guts)
+  let updateBinds  f = return $ guts { mg_binds = f (mg_binds guts) }
+  let updateBindsM f = f (mg_binds guts) >>= \b' -> return $ guts { mg_binds = b' }
 
-doCorePass CoreCSE                   = {-# SCC "CommonSubExpr" #-}
-                                       doPass cseProgram
+  case pass of
+    CoreDoSimplify {}         -> {-# SCC "Simplify" #-}
+                                 simplifyPgm pass guts
 
-doCorePass CoreLiberateCase          = {-# SCC "LiberateCase" #-}
-                                       doPassD liberateCase
+    CoreCSE                   -> {-# SCC "CommonSubExpr" #-}
+                                 updateBinds cseProgram
 
-doCorePass CoreDoFloatInwards        = {-# SCC "FloatInwards" #-}
-                                       floatInwards
+    CoreLiberateCase          -> {-# SCC "LiberateCase" #-}
+                                 updateBinds (liberateCase dflags)
 
-doCorePass (CoreDoFloatOutwards f)   = {-# SCC "FloatOutwards" #-}
-                                       doPassDUM (floatOutwards f)
+    CoreDoFloatInwards        -> {-# SCC "FloatInwards" #-}
+                                 updateBinds (floatInwards platform)
 
-doCorePass CoreDoStaticArgs          = {-# SCC "StaticArgs" #-}
-                                       doPassU doStaticArgs
+    CoreDoFloatOutwards f     -> {-# SCC "FloatOutwards" #-}
+                                 updateBindsM (liftIO . floatOutwards logger f us)
 
-doCorePass CoreDoCallArity           = {-# SCC "CallArity" #-}
-                                       doPassD callArityAnalProgram
+    CoreDoStaticArgs          -> {-# SCC "StaticArgs" #-}
+                                 updateBinds (doStaticArgs us)
 
-doCorePass CoreDoExitify             = {-# SCC "Exitify" #-}
-                                       doPass exitifyProgram
+    CoreDoCallArity           -> {-# SCC "CallArity" #-}
+                                 updateBinds callArityAnalProgram
 
-doCorePass CoreDoDemand              = {-# SCC "DmdAnal" #-}
-                                       doPassDFM dmdAnalProgram
+    CoreDoExitify             -> {-# SCC "Exitify" #-}
+                                 updateBinds exitifyProgram
 
-doCorePass CoreDoCpr                 = {-# SCC "CprAnal" #-}
-                                       doPassDFM cprAnalProgram
+    CoreDoDemand              -> {-# SCC "DmdAnal" #-}
+                                 updateBindsM (liftIO . dmdAnal logger dflags fam_envs (mg_rules guts))
 
-doCorePass CoreDoWorkerWrapper       = {-# SCC "WorkWrap" #-}
-                                       doPassDFU wwTopBinds
+    CoreDoCpr                 -> {-# SCC "CprAnal" #-}
+                                 updateBindsM (liftIO . cprAnalProgram logger fam_envs)
 
-doCorePass CoreDoSpecialising        = {-# SCC "Specialise" #-}
-                                       specProgram
+    CoreDoWorkerWrapper       -> {-# SCC "WorkWrap" #-}
+                                 updateBinds (wwTopBinds (mg_module guts) dflags fam_envs us)
 
-doCorePass CoreDoSpecConstr          = {-# SCC "SpecConstr" #-}
-                                       specConstrProgram
+    CoreDoSpecialising        -> {-# SCC "Specialise" #-}
+                                 specProgram guts
 
-doCorePass CoreDoPrintCore              = observe   printCore
-doCorePass (CoreDoRuleCheck phase pat)  = ruleCheckPass phase pat
-doCorePass CoreDoNothing                = return
-doCorePass (CoreDoPasses passes)        = runCorePasses passes
+    CoreDoSpecConstr          -> {-# SCC "SpecConstr" #-}
+                                 specConstrProgram guts
 
-doCorePass (CoreDoPluginPass _ pass) = {-# SCC "Plugin" #-} pass
+    CoreAddCallerCcs          -> {-# SCC "AddCallerCcs" #-}
+                                 addCallerCostCentres guts
 
-doCorePass pass@CoreDesugar          = pprPanic "doCorePass" (ppr pass)
-doCorePass pass@CoreDesugarOpt       = pprPanic "doCorePass" (ppr pass)
-doCorePass pass@CoreTidy             = pprPanic "doCorePass" (ppr pass)
-doCorePass pass@CorePrep             = pprPanic "doCorePass" (ppr pass)
-doCorePass pass@CoreOccurAnal        = pprPanic "doCorePass" (ppr pass)
+    CoreAddLateCcs            -> {-# SCC "AddLateCcs" #-}
+                                 addLateCostCentresMG guts
+
+    CoreDoPrintCore           -> {-# SCC "PrintCore" #-}
+                                 liftIO $ printCore logger (mg_binds guts) >> return guts
+
+    CoreDoRuleCheck phase pat -> {-# SCC "RuleCheck" #-}
+                                 ruleCheckPass phase pat guts
+    CoreDoNothing             -> return guts
+    CoreDoPasses passes       -> runCorePasses passes guts
+
+    CoreDoPluginPass _ p      -> {-# SCC "Plugin" #-} p guts
+
+    CoreDesugar               -> pprPanic "doCorePass" (ppr pass)
+    CoreDesugarOpt            -> pprPanic "doCorePass" (ppr pass)
+    CoreTidy                  -> pprPanic "doCorePass" (ppr pass)
+    CorePrep                  -> pprPanic "doCorePass" (ppr pass)
+    CoreOccurAnal             -> pprPanic "doCorePass" (ppr pass)
 
 {-
 ************************************************************************
@@ -484,75 +555,25 @@ doCorePass pass@CoreOccurAnal        = pprPanic "doCorePass" (ppr pass)
 ************************************************************************
 -}
 
-printCore :: DynFlags -> CoreProgram -> IO ()
-printCore dflags binds
-    = Err.dumpIfSet dflags True "Print Core" (pprCoreBindings binds)
+printCore :: Logger -> CoreProgram -> IO ()
+printCore logger binds
+    = Logger.logDumpMsg logger "Print Core" (pprCoreBindings binds)
 
 ruleCheckPass :: CompilerPhase -> String -> ModGuts -> CoreM ModGuts
-ruleCheckPass current_phase pat guts =
-    withTimingD (text "RuleCheck"<+>brackets (ppr $ mg_module guts))
+ruleCheckPass current_phase pat guts = do
+    dflags <- getDynFlags
+    logger <- getLogger
+    withTiming logger (text "RuleCheck"<+>brackets (ppr $ mg_module guts))
                 (const ()) $ do
-    { rb <- getRuleBase
-    ; dflags <- getDynFlags
-    ; vis_orphs <- getVisibleOrphanMods
-    ; let rule_fn fn = getRules (RuleEnv rb vis_orphs) fn
-                        ++ (mg_rules guts)
-    ; let ropts = initRuleOpts dflags
-    ; liftIO $ putLogMsg dflags NoReason Err.SevDump noSrcSpan
-                   $ withPprStyle defaultDumpStyle
-                   (ruleCheckProgram ropts current_phase pat
-                      rule_fn (mg_binds guts))
-    ; return guts }
-
-doPassDUM :: (DynFlags -> UniqSupply -> CoreProgram -> IO CoreProgram) -> ModGuts -> CoreM ModGuts
-doPassDUM do_pass = doPassM $ \binds -> do
-    dflags <- getDynFlags
-    us     <- getUniqueSupplyM
-    liftIO $ do_pass dflags us binds
-
-doPassDM :: (DynFlags -> CoreProgram -> IO CoreProgram) -> ModGuts -> CoreM ModGuts
-doPassDM do_pass = doPassDUM (\dflags -> const (do_pass dflags))
-
-doPassD :: (DynFlags -> CoreProgram -> CoreProgram) -> ModGuts -> CoreM ModGuts
-doPassD do_pass = doPassDM (\dflags -> return . do_pass dflags)
-
-doPassDU :: (DynFlags -> UniqSupply -> CoreProgram -> CoreProgram) -> ModGuts -> CoreM ModGuts
-doPassDU do_pass = doPassDUM (\dflags us -> return . do_pass dflags us)
-
-doPassU :: (UniqSupply -> CoreProgram -> CoreProgram) -> ModGuts -> CoreM ModGuts
-doPassU do_pass = doPassDU (const do_pass)
-
-doPassDFM :: (DynFlags -> FamInstEnvs -> CoreProgram -> IO CoreProgram) -> ModGuts -> CoreM ModGuts
-doPassDFM do_pass guts = do
-    dflags <- getDynFlags
-    p_fam_env <- getPackageFamInstEnv
-    let fam_envs = (p_fam_env, mg_fam_inst_env guts)
-    doPassM (liftIO . do_pass dflags fam_envs) guts
-
-doPassDFU :: (DynFlags -> FamInstEnvs -> UniqSupply -> CoreProgram -> CoreProgram) -> ModGuts -> CoreM ModGuts
-doPassDFU do_pass guts = do
-    dflags <- getDynFlags
-    us     <- getUniqueSupplyM
-    p_fam_env <- getPackageFamInstEnv
-    let fam_envs = (p_fam_env, mg_fam_inst_env guts)
-    doPass (do_pass dflags fam_envs us) guts
-
--- Most passes return no stats and don't change rules: these combinators
--- let us lift them to the full blown ModGuts+CoreM world
-doPassM :: Monad m => (CoreProgram -> m CoreProgram) -> ModGuts -> m ModGuts
-doPassM bind_f guts = do
-    binds' <- bind_f (mg_binds guts)
-    return (guts { mg_binds = binds' })
-
-doPass :: (CoreProgram -> CoreProgram) -> ModGuts -> CoreM ModGuts
-doPass bind_f guts = return $ guts { mg_binds = bind_f (mg_binds guts) }
-
--- Observer passes just peek; don't modify the bindings at all
-observe :: (DynFlags -> CoreProgram -> IO a) -> ModGuts -> CoreM ModGuts
-observe do_pass = doPassM $ \binds -> do
-    dflags <- getDynFlags
-    _ <- liftIO $ do_pass dflags binds
-    return binds
+        rb <- getRuleBase
+        vis_orphs <- getVisibleOrphanMods
+        let rule_fn fn = getRules (RuleEnv [rb] vis_orphs) fn
+                          ++ (mg_rules guts)
+        let ropts = initRuleOpts dflags
+        liftIO $ logDumpMsg logger "Rule check"
+                     (ruleCheckProgram ropts current_phase pat
+                        rule_fn (mg_binds guts))
+        return guts
 
 {-
 ************************************************************************
@@ -568,24 +589,22 @@ simplifyExpr :: HscEnv -- includes spec of what core-to-core passes to do
 -- simplifyExpr is called by the driver to simplify an
 -- expression typed in at the interactive prompt
 simplifyExpr hsc_env expr
-  = withTiming dflags (text "Simplify [expr]") (const ()) $
+  = withTiming logger (text "Simplify [expr]") (const ()) $
     do  { eps <- hscEPS hsc_env ;
-        ; let rule_env  = mkRuleEnv (eps_rule_base eps) []
-              fi_env    = ( eps_fam_inst_env eps
+        ; let fi_env    = ( eps_fam_inst_env eps
                           , extendFamInstEnvList emptyFamInstEnv $
                             snd $ ic_instances $ hsc_IC hsc_env )
-              simpl_env = simplEnvForGHCi dflags
+              simpl_env = simplEnvForGHCi logger dflags
 
-        ; us <-  mkSplitUniqSupply 's'
         ; let sz = exprSize expr
 
-        ; (expr', counts) <- initSmpl dflags rule_env fi_env us sz $
+        ; (expr', counts) <- initSmpl logger dflags (eps_rule_base <$> hscEPS hsc_env) emptyRuleEnv fi_env sz $
                              simplExprGently simpl_env expr
 
-        ; Err.dumpIfSet dflags (dopt Opt_D_dump_simpl_stats dflags)
-                  "Simplifier statistics" (pprSimplCount counts)
+        ; Logger.putDumpFileMaybe logger Opt_D_dump_simpl_stats
+                  "Simplifier statistics" FormatText (pprSimplCount counts)
 
-        ; Err.dumpIfSet_dyn dflags Opt_D_dump_simpl "Simplified expression"
+        ; Logger.putDumpFileMaybe logger Opt_D_dump_simpl "Simplified expression"
                         FormatCore
                         (pprCoreExpr expr')
 
@@ -593,6 +612,7 @@ simplifyExpr hsc_env expr
         }
   where
     dflags = hsc_dflags hsc_env
+    logger = hsc_logger hsc_env
 
 simplExprGently :: SimplEnv -> CoreExpr -> SimplM CoreExpr
 -- Simplifies an expression
@@ -608,7 +628,7 @@ simplExprGently :: SimplEnv -> CoreExpr -> SimplM CoreExpr
 -- enforce that; it just simplifies the expression twice
 
 -- It's important that simplExprGently does eta reduction; see
--- Note [Simplifying the left-hand side of a RULE] above.  The
+-- Note [Simplify rule LHS] above.  The
 -- simplifier does indeed do eta reduction (it's in GHC.Core.Opt.Simplify.completeLam)
 -- but only if -O is on.
 
@@ -627,30 +647,29 @@ simplExprGently env expr = do
 simplifyPgm :: CoreToDo -> ModGuts -> CoreM ModGuts
 simplifyPgm pass guts
   = do { hsc_env <- getHscEnv
-       ; us <- getUniqueSupplyM
        ; rb <- getRuleBase
        ; liftIOWithCount $
-         simplifyPgmIO pass hsc_env us rb guts }
+         simplifyPgmIO pass hsc_env rb guts }
 
 simplifyPgmIO :: CoreToDo
               -> HscEnv
-              -> UniqSupply
               -> RuleBase
               -> ModGuts
               -> IO (SimplCount, ModGuts)  -- New bindings
 
 simplifyPgmIO pass@(CoreDoSimplify max_iterations mode)
-              hsc_env us hpt_rule_base
+              hsc_env hpt_rule_base
               guts@(ModGuts { mg_module = this_mod
                             , mg_rdr_env = rdr_env
                             , mg_deps = deps
                             , mg_binds = binds, mg_rules = rules
                             , mg_fam_inst_env = fam_inst_env })
   = do { (termination_msg, it_count, counts_out, guts')
-           <- do_iteration us 1 [] binds rules
+           <- do_iteration 1 [] binds rules
 
-        ; Err.dumpIfSet dflags (dopt Opt_D_verbose_core2core dflags &&
-                                dopt Opt_D_dump_simpl_stats  dflags)
+        ; when (logHasDumpFlag logger Opt_D_verbose_core2core
+                && logHasDumpFlag logger Opt_D_dump_simpl_stats) $
+          logDumpMsg logger
                   "Simplifier statistics for following pass"
                   (vcat [text termination_msg <+> text "after" <+> ppr it_count
                                               <+> text "iterations",
@@ -661,28 +680,30 @@ simplifyPgmIO pass@(CoreDoSimplify max_iterations mode)
     }
   where
     dflags       = hsc_dflags hsc_env
-    print_unqual = mkPrintUnqualified dflags rdr_env
+    logger       = hsc_logger hsc_env
+    print_unqual = mkPrintUnqualified (hsc_unit_env hsc_env) rdr_env
     simpl_env    = mkSimplEnv mode
     active_rule  = activeRule mode
     active_unf   = activeUnfolding mode
 
-    do_iteration :: UniqSupply
-                 -> Int          -- Counts iterations
+    do_iteration :: Int --UniqSupply
+                --  -> Int          -- Counts iterations
                  -> [SimplCount] -- Counts from earlier iterations, reversed
                  -> CoreProgram  -- Bindings in
                  -> [CoreRule]   -- and orphan rules
                  -> IO (String, Int, SimplCount, ModGuts)
 
-    do_iteration us iteration_no counts_so_far binds rules
+    do_iteration iteration_no counts_so_far binds rules
         -- iteration_no is the number of the iteration we are
         -- about to begin, with '1' for the first
       | iteration_no > max_iterations   -- Stop if we've run out of iterations
-      = WARN( debugIsOn && (max_iterations > 2)
-            , hang (text "Simplifier bailing out after" <+> int max_iterations
-                    <+> text "iterations"
+      = warnPprTrace (debugIsOn && (max_iterations > 2))
+            "Simplifier bailing out"
+            ( hang (ppr this_mod <> text ", after"
+                    <+> int max_iterations <+> text "iterations"
                     <+> (brackets $ hsep $ punctuate comma $
                          map (int . simplCountN) (reverse counts_so_far)))
-                 2 (text "Size =" <+> ppr (coreBindsStats binds)))
+                 2 (text "Size =" <+> ppr (coreBindsStats binds))) $
 
                 -- Subtract 1 from iteration_no to get the
                 -- number of iterations we actually completed
@@ -700,25 +721,27 @@ simplifyPgmIO pass@(CoreDoSimplify max_iterations mode)
                      occurAnalysePgm this_mod active_unf active_rule rules
                                      binds
                } ;
-           Err.dumpIfSet_dyn dflags Opt_D_dump_occur_anal "Occurrence analysis"
+           Logger.putDumpFileMaybe logger Opt_D_dump_occur_anal "Occurrence analysis"
                      FormatCore
                      (pprCoreBindings tagged_binds);
 
-                -- Get any new rules, and extend the rule base
-                -- See Note [Overall plumbing for rules] in GHC.Core.Rules
-                -- We need to do this regularly, because simplification can
+                -- read_eps_rules:
+                -- We need to read rules from the EPS regularly because simplification can
                 -- poke on IdInfo thunks, which in turn brings in new rules
                 -- behind the scenes.  Otherwise there's a danger we'll simply
                 -- miss the rules for Ids hidden inside imported inlinings
+                -- Hence just before attempting to match rules we read on the EPS
+                -- value and then combine it when the existing rule base.
+                -- See `GHC.Core.Opt.Simplify.Monad.getSimplRules`.
            eps <- hscEPS hsc_env ;
-           let  { rule_base1 = unionRuleBase hpt_rule_base (eps_rule_base eps)
-                ; rule_base2 = extendRuleBaseList rule_base1 rules
+           let  { read_eps_rules = eps_rule_base <$> hscEPS hsc_env
+                ; rule_base = extendRuleBaseList hpt_rule_base rules
                 ; fam_envs = (eps_fam_inst_env eps, fam_inst_env)
                 ; vis_orphs = this_mod : dep_orphs deps } ;
 
                 -- Simplify the program
            ((binds1, rules1), counts1) <-
-             initSmpl dflags (mkRuleEnv rule_base2 vis_orphs) fam_envs us1 sz $
+             initSmpl logger dflags read_eps_rules (mkRuleEnv rule_base vis_orphs) fam_envs sz $
                do { (floats, env1) <- {-# SCC "SimplTopBinds" #-}
                                       simplTopBinds simpl_env tagged_binds
 
@@ -726,7 +749,7 @@ simplifyPgmIO pass@(CoreDoSimplify max_iterations mode)
                       -- for imported Ids.  Eg  RULE map my_f = blah
                       -- If we have a substitution my_f :-> other_f, we'd better
                       -- apply it to the rule to, or it'll never match
-                  ; rules1 <- simplRules env1 Nothing rules Nothing
+                  ; rules1 <- simplImpRules env1 rules
 
                   ; return (getTopFloatBinds floats, rules1) } ;
 
@@ -748,39 +771,38 @@ simplifyPgmIO pass@(CoreDoSimplify max_iterations mode)
            let { binds2 = {-# SCC "ZapInd" #-} shortOutIndirections binds1 } ;
 
                 -- Dump the result of this iteration
-           dump_end_iteration dflags print_unqual iteration_no counts1 binds2 rules1 ;
+           let { dump_core_sizes = not (gopt Opt_SuppressCoreSizes dflags) } ;
+           dump_end_iteration logger dump_core_sizes print_unqual iteration_no counts1 binds2 rules1 ;
            lintPassResult hsc_env pass binds2 ;
 
                 -- Loop
-           do_iteration us2 (iteration_no + 1) (counts1:counts_so_far) binds2 rules1
+           do_iteration (iteration_no + 1) (counts1:counts_so_far) binds2 rules1
            } }
 #if __GLASGOW_HASKELL__ <= 810
       | otherwise = panic "do_iteration"
 #endif
       where
-        (us1, us2) = splitUniqSupply us
-
         -- Remember the counts_so_far are reversed
         totalise :: [SimplCount] -> SimplCount
         totalise = foldr (\c acc -> acc `plusSimplCount` c)
                          (zeroSimplCount dflags)
 
-simplifyPgmIO _ _ _ _ _ = panic "simplifyPgmIO"
+simplifyPgmIO _ _ _ _ = panic "simplifyPgmIO"
 
 -------------------
-dump_end_iteration :: DynFlags -> PrintUnqualified -> Int
+dump_end_iteration :: Logger -> Bool -> PrintUnqualified -> Int
                    -> SimplCount -> CoreProgram -> [CoreRule] -> IO ()
-dump_end_iteration dflags print_unqual iteration_no counts binds rules
-  = dumpPassResult dflags print_unqual mb_flag hdr pp_counts binds rules
+dump_end_iteration logger dump_core_sizes print_unqual iteration_no counts binds rules
+  = dumpPassResult logger dump_core_sizes print_unqual mb_flag hdr pp_counts binds rules
   where
-    mb_flag | dopt Opt_D_dump_simpl_iterations dflags = Just Opt_D_dump_simpl_iterations
-            | otherwise                               = Nothing
+    mb_flag | logHasDumpFlag logger Opt_D_dump_simpl_iterations = Just Opt_D_dump_simpl_iterations
+            | otherwise                                         = Nothing
             -- Show details if Opt_D_dump_simpl_iterations is on
 
-    hdr = text "Simplifier iteration=" <> int iteration_no
-    pp_counts = vcat [ text "---- Simplifier counts for" <+> hdr
+    hdr = "Simplifier iteration=" ++ show iteration_no
+    pp_counts = vcat [ text "---- Simplifier counts for" <+> text hdr
                      , pprSimplCount counts
-                     , text "---- End of simplifier counts for" <+> hdr ]
+                     , text "---- End of simplifier counts for" <+> text hdr ]
 
 {-
 ************************************************************************
@@ -848,7 +870,7 @@ Old "solution":
         of iterateList in the first place
 
 But in principle the user *might* want rules that only apply to the Id
-he says.  And inline pragmas are similar
+they say.  And inline pragmas are similar
    {-# NOINLINE f #-}
    f = local
    local = <stuff>
@@ -916,12 +938,12 @@ ticks. More often than not, other references will be unfoldings of
 x_exported, and therefore carry the tick anyway.
 -}
 
-type IndEnv = IdEnv (Id, [Tickish Var]) -- Maps local_id -> exported_id, ticks
+type IndEnv = IdEnv (Id, [CoreTickish]) -- Maps local_id -> exported_id, ticks
 
 shortOutIndirections :: CoreProgram -> CoreProgram
 shortOutIndirections binds
   | isEmptyVarEnv ind_env = binds
-  | no_need_to_flatten    = binds'                      -- See Note [Rules and indirect-zapping]
+  | no_need_to_flatten    = binds'                      -- See Note [Rules and indirection-zapping]
   | otherwise             = [Rec (flattenBinds binds')] -- for this no_need_to_flatten stuff
   where
     ind_env            = makeIndEnv binds
@@ -983,9 +1005,8 @@ shortMeOut ind_env exported_id local_id
        not (local_id `elemVarEnv` ind_env)      -- Only if not already substituted for
     then
         if hasShortableIdInfo exported_id
-        then True       -- See Note [Messing up the exported Id's IdInfo]
-        else WARN( True, text "Not shorting out:" <+> ppr exported_id )
-             False
+        then True       -- See Note [Messing up the exported Id's RULES]
+        else warnPprTrace True "Not shorting out" (ppr exported_id) False
     else
         False
 
@@ -993,11 +1014,11 @@ shortMeOut ind_env exported_id local_id
 hasShortableIdInfo :: Id -> Bool
 -- True if there is no user-attached IdInfo on exported_id,
 -- so we can safely discard it
--- See Note [Messing up the exported Id's IdInfo]
+-- See Note [Messing up the exported Id's RULES]
 hasShortableIdInfo id
   =  isEmptyRuleInfo (ruleInfo info)
   && isDefaultInlinePragma (inlinePragInfo info)
-  && not (isStableUnfolding (unfoldingInfo info))
+  && not (isStableUnfolding (realUnfoldingInfo info))
   where
      info = idInfo id
 
@@ -1018,24 +1039,47 @@ Instead, transfer IdInfo from lcl_id to exp_id, specifically
 
 Overwriting, rather than merging, seems to work ok.
 
-We also zap the InlinePragma on the lcl_id. It might originally
-have had a NOINLINE, which we have now transferred; and we really
-want the lcl_id to inline now that its RHS is trivial!
+For the lcl_id we
+
+* Zap the InlinePragma. It might originally have had a NOINLINE, which
+  we have now transferred; and we really want the lcl_id to inline now
+  that its RHS is trivial!
+
+* Zap any Stable unfolding.  agian, we want lcl_id = gbl_id to inline,
+  replacing lcl_id by gbl_id. That won't happen if lcl_id has its original
+  great big Stable unfolding
 -}
 
 transferIdInfo :: Id -> Id -> (Id, Id)
 -- See Note [Transferring IdInfo]
 transferIdInfo exported_id local_id
   = ( modifyIdInfo transfer exported_id
-    , local_id `setInlinePragma` defaultInlinePragma )
+    , modifyIdInfo zap_info local_id )
   where
     local_info = idInfo local_id
-    transfer exp_info = exp_info `setStrictnessInfo`    strictnessInfo local_info
-                                 `setCprInfo`           cprInfo local_info
-                                 `setUnfoldingInfo`     unfoldingInfo local_info
-                                 `setInlinePragInfo`    inlinePragInfo local_info
-                                 `setRuleInfo`          addRuleInfo (ruleInfo exp_info) new_info
+    transfer exp_info = exp_info `setDmdSigInfo`     dmdSigInfo local_info
+                                 `setCprSigInfo`     cprSigInfo local_info
+                                 `setUnfoldingInfo`  realUnfoldingInfo local_info
+                                 `setInlinePragInfo` inlinePragInfo local_info
+                                 `setRuleInfo`       addRuleInfo (ruleInfo exp_info) new_info
     new_info = setRuleInfoHead (idName exported_id)
                                (ruleInfo local_info)
         -- Remember to set the function-name field of the
         -- rules as we transfer them from one function to another
+
+    zap_info lcl_info = lcl_info `setInlinePragInfo` defaultInlinePragma
+                                 `setUnfoldingInfo`  noUnfolding
+
+
+dmdAnal :: Logger -> DynFlags -> FamInstEnvs -> [CoreRule] -> CoreProgram -> IO CoreProgram
+dmdAnal logger dflags fam_envs rules binds = do
+  let !opts = DmdAnalOpts
+               { dmd_strict_dicts    = gopt Opt_DictsStrict dflags
+               , dmd_unbox_width     = dmdUnboxWidth dflags
+               , dmd_max_worker_args = maxWorkerArgs dflags
+               }
+      binds_plus_dmds = dmdAnalProgram opts fam_envs rules binds
+  Logger.putDumpFileMaybe logger Opt_D_dump_str_signatures "Strictness signatures" FormatText $
+    dumpIdInfoOfProgram (hasPprDebug dflags) (ppr . zapDmdEnvSig . dmdSigInfo) binds_plus_dmds
+  -- See Note [Stamp out space leaks in demand analysis] in GHC.Core.Opt.DmdAnal
+  seqBinds binds_plus_dmds `seq` return binds_plus_dmds

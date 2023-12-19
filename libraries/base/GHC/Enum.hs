@@ -36,6 +36,7 @@ import GHC.Char
 import GHC.Num.Integer
 import GHC.Num
 import GHC.Show
+import GHC.Tuple (Solo (..))
 default ()              -- Double isn't available yet
 
 -- | The 'Bounded' class is used to name the upper and lower limits of a
@@ -178,7 +179,6 @@ boundedEnumFromThen n1 n2
 {-
 Note [Stable Unfolding for list producers]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 The INLINABLE/INLINE pragmas ensure that we export stable (unoptimised)
 unfoldings in the interface file so we can do list fusion at usage sites.
 -}
@@ -234,6 +234,22 @@ instance Enum () where
     enumFromTo () ()    = [()]
     enumFromThenTo () () () = let many = ():many in many
 
+instance Enum a => Enum (Solo a) where
+    succ (Solo a) = Solo (succ a)
+    pred (Solo a) = Solo (pred a)
+
+    toEnum x = Solo (toEnum x)
+
+    fromEnum (Solo x) = fromEnum x
+    enumFrom (Solo x) = [Solo a | a <- enumFrom x]
+    enumFromThen (Solo x) (Solo y) =
+      [Solo a | a <- enumFromThen x y]
+    enumFromTo (Solo x) (Solo y) =
+      [Solo a | a <- enumFromTo x y]
+    enumFromThenTo (Solo x) (Solo y) (Solo z) =
+      [Solo a | a <- enumFromThenTo x y z]
+
+deriving instance Bounded a => Bounded (Solo a)
 -- Report requires instances up to 15
 -- | @since 2.01
 deriving instance (Bounded a, Bounded b)
@@ -405,7 +421,7 @@ eftCharFB c n x0 y = go x0
                     go x | isTrue# (x ># y) = n
                          | otherwise        = C# (chr# x) `c` go (x +# 1#)
 
-{-# NOINLINE [1] eftChar #-}
+{-# NOINLINE [1] eftChar #-} -- Inline after rule "eftChar" is inactive
 eftChar :: Int# -> Int# -> String
 eftChar x y | isTrue# (x ># y ) = []
             | otherwise         = C# (chr# x) : eftChar (x +# 1#) y
@@ -420,7 +436,7 @@ efdCharFB c n x1 x2
   where
     !delta = x2 -# x1
 
-{-# NOINLINE [1] efdChar #-}
+{-# NOINLINE [1] efdChar #-} -- Inline after rule "efdChar" is inactive
 efdChar :: Int# -> Int# -> String
 efdChar x1 x2
   | isTrue# (delta >=# 0#) = go_up_char_list x1 delta 0x10FFFF#
@@ -436,7 +452,7 @@ efdtCharFB c n x1 x2 lim
   where
     !delta = x2 -# x1
 
-{-# NOINLINE [1] efdtChar #-}
+{-# NOINLINE [1] efdtChar #-} -- Inline after rule "efdtChar" is inactive
 efdtChar :: Int# -> Int# -> Int# -> String
 efdtChar x1 x2 lim
   | isTrue# (delta >=# 0#) = go_up_char_list x1 delta lim
@@ -875,6 +891,7 @@ instance  Enum Integer  where
  #-}
 
 {- Note [Enum Integer rules for literal 1]
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 The "1" rules above specialise for the common case where delta = 1,
 so that we can avoid the delta>=0 test in enumDeltaToIntegerFB.
 Then enumDeltaToInteger1FB is nice and small and can be inlined,
@@ -893,7 +910,7 @@ enumDeltaIntegerFB :: (Integer -> b -> b) -> Integer -> Integer -> b
 enumDeltaIntegerFB c x0 d = go x0
   where go x = x `seq` (x `c` go (x+d))
 
-{-# NOINLINE [1] enumDeltaInteger #-}
+{-# NOINLINE [1] enumDeltaInteger #-} -- Inline after rule "enumDeltaInteger" is inactive
 enumDeltaInteger :: Integer -> Integer -> [Integer]
 enumDeltaInteger x d = x `seq` (x : enumDeltaInteger (x+d) d)
 -- strict accumulator, so
@@ -919,13 +936,13 @@ enumDeltaToInteger1FB c n x0 lim = go (x0 :: Integer)
                         go x | x > lim   = n
                              | otherwise = x `c` go (x+1)
 
-{-# NOINLINE [1] enumDeltaToInteger #-}
+{-# NOINLINE [1] enumDeltaToInteger #-} -- Inline after rule "efdtInteger" is inactive
 enumDeltaToInteger :: Integer -> Integer -> Integer -> [Integer]
 enumDeltaToInteger x delta lim
   | delta >= 0 = up_list x delta lim
   | otherwise  = dn_list x delta lim
 
-{-# NOINLINE [1] enumDeltaToInteger1 #-}
+{-# NOINLINE [1] enumDeltaToInteger1 #-} -- Inline after rule "efdtInteger1" is inactive
 enumDeltaToInteger1 :: Integer -> Integer -> [Integer]
 -- Special case for Delta = 1
 enumDeltaToInteger1 x0 lim = go (x0 :: Integer)
@@ -967,19 +984,27 @@ instance Enum Natural where
       | i >= 0    = naturalFromWord# (int2Word# i#)
       | otherwise = errorWithoutStackTrace "toEnum: unexpected negative Int"
 
-    fromEnum (NS w)
-      | i >= 0    = i
-      | otherwise = errorWithoutStackTrace "fromEnum: out of Int range"
+    fromEnum (NS w) | i >= 0 = i
       where
         i = I# (word2Int# w)
-    fromEnum n = fromEnum (integerFromNatural n)
+    fromEnum _ = errorWithoutStackTrace "fromEnum: out of Int range"
 
+    -- See Note [Stable Unfolding for list producers]
+    {-# INLINE enumFrom #-}
     enumFrom x        = enumDeltaNatural      x 1
+
+    -- See Note [Stable Unfolding for list producers]
+    {-# INLINE enumFromThen #-}
     enumFromThen x y
       | x <= y        = enumDeltaNatural      x (y-x)
       | otherwise     = enumNegDeltaToNatural x (x-y) 0
 
+    -- See Note [Stable Unfolding for list producers]
+    {-# INLINE enumFromTo #-}
     enumFromTo x lim  = enumDeltaToNatural    x 1 lim
+
+    -- See Note [Stable Unfolding for list producers]
+    {-# INLINE enumFromThenTo #-}
     enumFromThenTo x y lim
       | x <= y        = enumDeltaToNatural    x (y-x) lim
       | otherwise     = enumNegDeltaToNatural x (x-y) lim
@@ -989,12 +1014,16 @@ instance Enum Natural where
 enumDeltaNatural :: Natural -> Natural -> [Natural]
 enumDeltaNatural !x d = x : enumDeltaNatural (x+d) d
 
+-- Inline to specialize
+{-# INLINE enumDeltaToNatural #-}
 enumDeltaToNatural :: Natural -> Natural -> Natural -> [Natural]
 enumDeltaToNatural x0 delta lim = go x0
   where
     go x | x > lim   = []
          | otherwise = x : go (x+delta)
 
+-- Inline to specialize
+{-# INLINE enumNegDeltaToNatural #-}
 enumNegDeltaToNatural :: Natural -> Natural -> Natural -> [Natural]
 enumNegDeltaToNatural x0 ndelta lim = go x0
   where
@@ -1004,6 +1033,11 @@ enumNegDeltaToNatural x0 ndelta lim = go x0
 
 
 -- Instances from GHC.Types
+
+-- | @since 4.16.0.0
+deriving instance Bounded Levity
+-- | @since 4.16.0.0
+deriving instance Enum Levity
 
 -- | @since 4.10.0.0
 deriving instance Bounded VecCount

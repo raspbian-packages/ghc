@@ -295,6 +295,7 @@ bifoldr' f g z0 xs = bifoldl f' g' id xs z0 where
 --
 -- >>> bifoldr1 (+) (BiList [] [])
 -- *** Exception: bifoldr1: empty structure
+-- ...
 --
 -- @since 4.10.0.0
 bifoldr1 :: Bifoldable t => (a -> a -> a) -> t a a -> a
@@ -356,6 +357,7 @@ bifoldl' f g z0 xs = bifoldr f' g' id xs z0 where
 --
 -- >>> bifoldl1 (+) (BiList [] [])
 -- *** Exception: bifoldl1: empty structure
+-- ...
 --
 -- @since 4.10.0.0
 bifoldl1 :: Bifoldable t => (a -> a -> a) -> t a a -> a
@@ -640,6 +642,7 @@ biconcat = bifold
 --
 -- >>> bimaximum (BiList [] [])
 -- *** Exception: bimaximum: empty structure
+-- ...
 --
 -- @since 4.10.0.0
 bimaximum :: forall t a. (Bifoldable t, Ord a) => t a a -> a
@@ -669,6 +672,7 @@ bimaximum = fromMaybe (error "bimaximum: empty structure") .
 --
 -- >>> biminimum (BiList [] [])
 -- *** Exception: biminimum: empty structure
+-- ...
 --
 -- @since 4.10.0.0
 biminimum :: forall t a. (Bifoldable t, Ord a) => t a a -> a
@@ -922,6 +926,7 @@ biall p q = getAll #. bifoldMap (All . p) (All . q)
 --
 -- >>> bimaximumBy compare (BiList [] [])
 -- *** Exception: bifoldr1: empty structure
+-- ...
 --
 -- @since 4.10.0.0
 bimaximumBy :: Bifoldable t => (a -> a -> Ordering) -> t a a -> a
@@ -950,6 +955,7 @@ bimaximumBy cmp = bifoldr1 max'
 --
 -- >>> biminimumBy compare (BiList [] [])
 -- *** Exception: bifoldr1: empty structure
+-- ...
 --
 -- @since 4.10.0.0
 biminimumBy :: Bifoldable t => (a -> a -> Ordering) -> t a a -> a

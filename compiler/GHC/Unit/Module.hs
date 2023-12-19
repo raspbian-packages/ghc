@@ -1,3 +1,8 @@
+{-# LANGUAGE ExplicitNamespaces #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE RecordWildCards #-}
+
 {-
 (c) The University of Glasgow, 2004-2006
 
@@ -8,14 +13,6 @@ Simply the name of a module, represented as a FastString.
 These are Uniquable, hence we can build Maps with Modules as
 the keys.
 -}
-
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE DeriveFunctor #-}
-{-# LANGUAGE ExplicitNamespaces #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE TypeSynonymInstances #-}
 
 module GHC.Unit.Module
     ( module GHC.Unit.Types
@@ -43,7 +40,6 @@ module GHC.Unit.Module
     , moduleIsDefinite
     , HasModule(..)
     , ContainsModule(..)
-    , unitIdEq
     , installedModuleEq
     ) where
 
@@ -89,10 +85,6 @@ installedModuleEq :: InstalledModule -> Module -> Bool
 installedModuleEq imod mod =
     fst (getModuleInstantiation mod) == imod
 
--- | Test if a 'Unit' corresponds to a given 'UnitId',
--- modulo instantiation.
-unitIdEq :: UnitId -> Unit -> Bool
-unitIdEq iuid uid = toUnitId uid == iuid
 
 {-
 ************************************************************************
@@ -114,9 +106,9 @@ getModuleInstantiation m =
 
 -- | Return the unit-id this unit is an instance of and the module instantiations (if any).
 getUnitInstantiations :: Unit -> (UnitId, Maybe InstantiatedUnit)
-getUnitInstantiations (VirtUnit iuid)           = (indefUnit (instUnitInstanceOf iuid), Just iuid)
+getUnitInstantiations (VirtUnit iuid)           = (instUnitInstanceOf iuid, Just iuid)
 getUnitInstantiations (RealUnit (Definite uid)) = (uid, Nothing)
-getUnitInstantiations HoleUnit                  = error "Hole unit"
+getUnitInstantiations (HoleUnit {})             = error "Hole unit"
 
 -- | Remove instantiations of the given instantiated unit
 uninstantiateInstantiatedUnit :: InstantiatedUnit -> InstantiatedUnit

@@ -3,7 +3,7 @@
 
 -}
 
-{-# LANGUAGE CPP #-}
+
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE FlexibleContexts #-}
@@ -22,19 +22,17 @@ module GHC.Tc.Deriv.Functor
    )
 where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
 import GHC.Data.Bag
 import GHC.Core.DataCon
 import GHC.Data.FastString
 import GHC.Hs
-import GHC.Utils.Outputable
+import GHC.Utils.Panic
 import GHC.Builtin.Names
 import GHC.Types.Name.Reader
 import GHC.Types.SrcLoc
-import GHC.Utils.Monad.State
+import GHC.Utils.Monad.State.Strict
 import GHC.Tc.Deriv.Generate
 import GHC.Tc.Utils.TcType
 import GHC.Core.TyCon
@@ -151,25 +149,26 @@ is a similar algorithm for generating `p <$ x` (for some constant `p`):
   $(coreplace 'a '(tb -> tc) x) = \(y:tb[b/a]) -> $(coreplace 'a' 'tc' (x $(replace 'a 'tb y)))
 -}
 
-gen_Functor_binds :: SrcSpan -> TyCon -> (LHsBinds GhcPs, BagDerivStuff)
+gen_Functor_binds :: SrcSpan -> DerivInstTys -> (LHsBinds GhcPs, Bag AuxBindSpec)
 -- When the argument is phantom, we can use  fmap _ = coerce
 -- See Note [Phantom types with Functor, Foldable, and Traversable]
-gen_Functor_binds loc tycon
+gen_Functor_binds loc (DerivInstTys{dit_rep_tc = tycon})
   | Phantom <- last (tyConRoles tycon)
   = (unitBag fmap_bind, emptyBag)
   where
-    fmap_name = L loc fmap_RDR
+    fmap_name = L (noAnnSrcSpan loc) fmap_RDR
     fmap_bind = mkRdrFunBind fmap_name fmap_eqns
     fmap_eqns = [mkSimpleMatch fmap_match_ctxt
                                [nlWildPat]
                                coerce_Expr]
     fmap_match_ctxt = mkPrefixFunRhs fmap_name
 
-gen_Functor_binds loc tycon
+gen_Functor_binds loc dit@(DerivInstTys{ dit_rep_tc = tycon
+                                       , dit_rep_tc_args = tycon_args })
   = (listToBag [fmap_bind, replace_bind], emptyBag)
   where
-    data_cons = tyConDataCons tycon
-    fmap_name = L loc fmap_RDR
+    data_cons = getPossibleDataCons tycon tycon_args
+    fmap_name = L (noAnnSrcSpan loc) fmap_RDR
 
     -- See Note [EmptyDataDecls with Functor, Foldable, and Traversable]
     fmap_bind = mkRdrFunBindEC 2 id fmap_name fmap_eqns
@@ -178,7 +177,7 @@ gen_Functor_binds loc tycon
     fmap_eqn con = flip evalState bs_RDRs $
                      match_for_con fmap_match_ctxt [f_Pat] con parts
       where
-        parts = foldDataConArgs ft_fmap con
+        parts = foldDataConArgs ft_fmap con dit
 
     fmap_eqns = map fmap_eqn data_cons
 
@@ -208,7 +207,7 @@ gen_Functor_binds loc tycon
                  , ft_co_var = panic "contravariant in ft_fmap" }
 
     -- See Note [Deriving <$]
-    replace_name = L loc replace_RDR
+    replace_name = L (noAnnSrcSpan loc) replace_RDR
 
     -- See Note [EmptyDataDecls with Functor, Foldable, and Traversable]
     replace_bind = mkRdrFunBindEC 2 id replace_name replace_eqns
@@ -217,7 +216,7 @@ gen_Functor_binds loc tycon
     replace_eqn con = flip evalState bs_RDRs $
         match_for_con replace_match_ctxt [z_Pat] con parts
       where
-        parts = foldDataConArgs ft_replace con
+        parts = foldDataConArgs ft_replace con dit
 
     replace_eqns = map replace_eqn data_cons
 
@@ -539,8 +538,36 @@ functorLikeTraverse var (FT { ft_triv = caseTrivial,     ft_var = caseVar
 
     go _ _ = (caseTrivial,False)
 
--- Return all syntactic subterms of ty that contain var somewhere
--- These are the things that should appear in instance constraints
+-- | Return all syntactic subterms of a 'Type' that are applied to the 'TyVar'
+-- argument. This determines what constraints should be inferred for derived
+-- 'Functor', 'Foldable', and 'Traversable' instances in "GHC.Tc.Deriv.Infer".
+-- For instance, if we have:
+--
+-- @
+-- data Foo a = MkFoo Int a (Maybe a) (Either Int (Maybe a))
+-- @
+--
+-- Then the following would hold:
+--
+-- * @'deepSubtypesContaining' a Int@ would return @[]@, since @Int@ does not
+--   contain the type variable @a@ at all.
+--
+-- * @'deepSubtypesContaining' a a@ would return @[]@. Although the type @a@
+--   contains the type variable @a@, it is not /applied/ to @a@, which is the
+--   criterion that 'deepSubtypesContaining' checks for.
+--
+-- * @'deepSubtypesContaining' a (Maybe a)@ would return @[Maybe]@, as @Maybe@
+--   is applied to @a@.
+--
+-- * @'deepSubtypesContaining' a (Either Int (Maybe a))@ would return
+--   @[Either Int, Maybe]@. Both of these types are applied to @a@ through
+--   composition.
+--
+-- As used in "GHC.Tc.Deriv.Infer", the 'Type' argument will always come from
+-- 'derivDataConInstArgTys', so it is important that the 'TyVar' comes from
+-- 'dataConUnivTyVars' to match. Make sure /not/ to take the 'TyVar' from
+-- 'tyConTyVars', as these differ from the 'dataConUnivTyVars' when the data
+-- type is a GADT. (See #22167 for what goes wrong if 'tyConTyVars' is used.)
 deepSubtypesContaining :: TyVar -> Type -> [TcType]
 deepSubtypesContaining tv
   = functorLikeTraverse tv
@@ -554,10 +581,10 @@ deepSubtypesContaining tv
             , ft_forall = \v xs -> filterOut ((v `elemVarSet`) . tyCoVarsOfType) xs })
 
 
-foldDataConArgs :: FFoldType a -> DataCon -> [a]
+foldDataConArgs :: FFoldType a -> DataCon -> DerivInstTys -> [a]
 -- Fold over the arguments of the datacon
-foldDataConArgs ft con
-  = map foldArg (map scaledThing $ dataConOrigArgTys con)
+foldDataConArgs ft con dit
+  = map foldArg (derivDataConInstArgTys con dit)
   where
     foldArg
       = case getTyVar_maybe (last (tyConAppArgs (dataConOrigResTy con))) of
@@ -617,8 +644,7 @@ mkSimpleConMatch ctxt fold extra_pats con insides = do
           else nlParPat bare_pat
     rhs <- fold con_name
                 (zipWith (\i v -> i $ nlHsVar v) insides vars_needed)
-    return $ mkMatch ctxt (extra_pats ++ [pat]) rhs
-                     (noLoc emptyLocalBinds)
+    return $ mkMatch ctxt (extra_pats ++ [pat]) rhs emptyLocalBinds
 
 -- "Con a1 a2 a3 -> fmap (\b2 -> Con a1 b2 a3) (traverse f a2)"
 --
@@ -668,8 +694,7 @@ mkSimpleConMatch2 ctxt fold extra_pats con insides = do
               in mkHsLam (map nlVarPat bs) (nlHsApps con_name vars)
 
     rhs <- fold con_expr exps
-    return $ mkMatch ctxt (extra_pats ++ [pat]) rhs
-                     (noLoc emptyLocalBinds)
+    return $ mkMatch ctxt (extra_pats ++ [pat]) rhs emptyLocalBinds
 
 -- "case x of (a1,a2,a3) -> fold [x1 a1, x2 a2, x3 a3]"
 mkSimpleTupleCase :: Monad m => ([LPat GhcPs] -> DataCon -> [a]
@@ -787,21 +812,22 @@ could surprise users if they switch to other types, but Ryan Scott seems to
 think it's okay to do it for now.
 -}
 
-gen_Foldable_binds :: SrcSpan -> TyCon -> (LHsBinds GhcPs, BagDerivStuff)
+gen_Foldable_binds :: SrcSpan -> DerivInstTys -> (LHsBinds GhcPs, Bag AuxBindSpec)
 -- When the parameter is phantom, we can use foldMap _ _ = mempty
 -- See Note [Phantom types with Functor, Foldable, and Traversable]
-gen_Foldable_binds loc tycon
+gen_Foldable_binds loc (DerivInstTys{dit_rep_tc = tycon})
   | Phantom <- last (tyConRoles tycon)
   = (unitBag foldMap_bind, emptyBag)
   where
-    foldMap_name = L loc foldMap_RDR
+    foldMap_name = L (noAnnSrcSpan loc) foldMap_RDR
     foldMap_bind = mkRdrFunBind foldMap_name foldMap_eqns
     foldMap_eqns = [mkSimpleMatch foldMap_match_ctxt
                                   [nlWildPat, nlWildPat]
                                   mempty_Expr]
     foldMap_match_ctxt = mkPrefixFunRhs foldMap_name
 
-gen_Foldable_binds loc tycon
+gen_Foldable_binds loc dit@(DerivInstTys{ dit_rep_tc = tycon
+                                        , dit_rep_tc_args = tycon_args })
   | null data_cons  -- There's no real point producing anything but
                     -- foldMap for a type with no constructors.
   = (unitBag foldMap_bind, emptyBag)
@@ -809,16 +835,19 @@ gen_Foldable_binds loc tycon
   | otherwise
   = (listToBag [foldr_bind, foldMap_bind, null_bind], emptyBag)
   where
-    data_cons = tyConDataCons tycon
+    data_cons = getPossibleDataCons tycon tycon_args
 
-    foldr_bind = mkRdrFunBind (L loc foldable_foldr_RDR) eqns
+    foldr_name = L (noAnnSrcSpan loc) foldable_foldr_RDR
+
+    foldr_bind = mkRdrFunBind (L (noAnnSrcSpan loc) foldable_foldr_RDR) eqns
     eqns = map foldr_eqn data_cons
     foldr_eqn con
       = evalState (match_foldr z_Expr [f_Pat,z_Pat] con =<< parts) bs_RDRs
       where
-        parts = sequence $ foldDataConArgs ft_foldr con
+        parts = sequence $ foldDataConArgs ft_foldr con dit
+    foldr_match_ctxt = mkPrefixFunRhs foldr_name
 
-    foldMap_name = L loc foldMap_RDR
+    foldMap_name = L (noAnnSrcSpan loc) foldMap_RDR
 
     -- See Note [EmptyDataDecls with Functor, Foldable, and Traversable]
     foldMap_bind = mkRdrFunBindEC 2 (const mempty_Expr)
@@ -829,7 +858,8 @@ gen_Foldable_binds loc tycon
     foldMap_eqn con
       = evalState (match_foldMap [f_Pat] con =<< parts) bs_RDRs
       where
-        parts = sequence $ foldDataConArgs ft_foldMap con
+        parts = sequence $ foldDataConArgs ft_foldMap con dit
+    foldMap_match_ctxt = mkPrefixFunRhs foldMap_name
 
     -- Given a list of NullM results, produce Nothing if any of
     -- them is NotNull, and otherwise produce a list of Maybes
@@ -841,17 +871,17 @@ gen_Foldable_binds loc tycon
       go NotNull = Nothing
       go (NullM a) = Just (Just a)
 
-    null_name = L loc null_RDR
+    null_name = L (noAnnSrcSpan loc) null_RDR
     null_match_ctxt = mkPrefixFunRhs null_name
     null_bind = mkRdrFunBind null_name null_eqns
     null_eqns = map null_eqn data_cons
     null_eqn con
       = flip evalState bs_RDRs $ do
-          parts <- sequence $ foldDataConArgs ft_null con
+          parts <- sequence $ foldDataConArgs ft_null con dit
           case convert parts of
             Nothing -> return $
               mkMatch null_match_ctxt [nlParPat (nlWildConPat con)]
-                false_Expr (noLoc emptyLocalBinds)
+                false_Expr emptyLocalBinds
             Just cp -> match_null [] con cp
 
     -- Yields 'Just' an expression if we're folding over a type that mentions
@@ -885,7 +915,7 @@ gen_Foldable_binds loc tycon
                 -> DataCon
                 -> [Maybe (LHsExpr GhcPs)]
                 -> m (LMatch GhcPs (LHsExpr GhcPs))
-    match_foldr z = mkSimpleConMatch2 LambdaExpr $ \_ xs -> return (mkFoldr xs)
+    match_foldr z = mkSimpleConMatch2 foldr_match_ctxt $ \_ xs -> return (mkFoldr xs)
       where
         -- g1 v1 (g2 v2 (.. z))
         mkFoldr :: [LHsExpr GhcPs] -> LHsExpr GhcPs
@@ -915,7 +945,7 @@ gen_Foldable_binds loc tycon
                   -> DataCon
                   -> [Maybe (LHsExpr GhcPs)]
                   -> m (LMatch GhcPs (LHsExpr GhcPs))
-    match_foldMap = mkSimpleConMatch2 CaseAlt $ \_ xs -> return (mkFoldMap xs)
+    match_foldMap = mkSimpleConMatch2 foldMap_match_ctxt $ \_ xs -> return (mkFoldMap xs)
       where
         -- mappend v1 (mappend v2 ..)
         mkFoldMap :: [LHsExpr GhcPs] -> LHsExpr GhcPs
@@ -1016,14 +1046,14 @@ removes all such types from consideration.
 See Note [Generated code for DeriveFoldable and DeriveTraversable].
 -}
 
-gen_Traversable_binds :: SrcSpan -> TyCon -> (LHsBinds GhcPs, BagDerivStuff)
+gen_Traversable_binds :: SrcSpan -> DerivInstTys -> (LHsBinds GhcPs, Bag AuxBindSpec)
 -- When the argument is phantom, we can use traverse = pure . coerce
 -- See Note [Phantom types with Functor, Foldable, and Traversable]
-gen_Traversable_binds loc tycon
+gen_Traversable_binds loc (DerivInstTys{dit_rep_tc = tycon})
   | Phantom <- last (tyConRoles tycon)
   = (unitBag traverse_bind, emptyBag)
   where
-    traverse_name = L loc traverse_RDR
+    traverse_name = L (noAnnSrcSpan loc) traverse_RDR
     traverse_bind = mkRdrFunBind traverse_name traverse_eqns
     traverse_eqns =
         [mkSimpleMatch traverse_match_ctxt
@@ -1031,12 +1061,13 @@ gen_Traversable_binds loc tycon
                        (nlHsApps pure_RDR [nlHsApp coerce_Expr z_Expr])]
     traverse_match_ctxt = mkPrefixFunRhs traverse_name
 
-gen_Traversable_binds loc tycon
+gen_Traversable_binds loc dit@(DerivInstTys{ dit_rep_tc = tycon
+                                           , dit_rep_tc_args = tycon_args })
   = (unitBag traverse_bind, emptyBag)
   where
-    data_cons = tyConDataCons tycon
+    data_cons = getPossibleDataCons tycon tycon_args
 
-    traverse_name = L loc traverse_RDR
+    traverse_name = L (noAnnSrcSpan loc) traverse_RDR
 
     -- See Note [EmptyDataDecls with Functor, Foldable, and Traversable]
     traverse_bind = mkRdrFunBindEC 2 (nlHsApp pure_Expr)
@@ -1045,7 +1076,8 @@ gen_Traversable_binds loc tycon
     traverse_eqn con
       = evalState (match_for_con [f_Pat] con =<< parts) bs_RDRs
       where
-        parts = sequence $ foldDataConArgs ft_trav con
+        parts = sequence $ foldDataConArgs ft_trav con dit
+    traverse_match_ctxt = mkPrefixFunRhs traverse_name
 
     -- Yields 'Just' an expression if we're folding over a type that mentions
     -- the last type parameter of the datatype. Otherwise, yields 'Nothing'.
@@ -1076,7 +1108,7 @@ gen_Traversable_binds loc tycon
                   -> DataCon
                   -> [Maybe (LHsExpr GhcPs)]
                   -> m (LMatch GhcPs (LHsExpr GhcPs))
-    match_for_con = mkSimpleConMatch2 CaseAlt $
+    match_for_con = mkSimpleConMatch2 traverse_match_ctxt $
                                              \con xs -> return (mkApCon con xs)
       where
         -- liftA2 (\b1 b2 ... -> Con b1 b2 ...) x1 x2 <*> ..

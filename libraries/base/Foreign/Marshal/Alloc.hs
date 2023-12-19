@@ -1,6 +1,6 @@
 {-# LANGUAGE Trustworthy #-}
 {-# LANGUAGE NoImplicitPrelude, MagicHash, UnboxedTuples,
-             ScopedTypeVariables #-}
+             ScopedTypeVariables, BangPatterns #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -37,6 +37,11 @@
 -- aligned for that type. Array allocation routines need to obey the same
 -- alignment constraints for each array element.
 --
+-- The underlying implementation is wrapping the @<stdlib.h>@
+-- @malloc@, @realloc@, and @free@.
+-- In other words it should be safe to allocate using C-@malloc@,
+-- and free memory with 'free' from this module.
+--
 -----------------------------------------------------------------------------
 
 module Foreign.Marshal.Alloc (
@@ -60,12 +65,15 @@ module Foreign.Marshal.Alloc (
   finalizerFree
 ) where
 
+import Data.Bits                ( Bits, (.&.) )
 import Data.Maybe
 import Foreign.C.Types          ( CSize(..) )
 import Foreign.Storable         ( Storable(sizeOf,alignment) )
 import Foreign.ForeignPtr       ( FinalizerPtr )
 import GHC.IO.Exception
+import GHC.Num
 import GHC.Real
+import GHC.Show
 import GHC.Ptr
 import GHC.Base
 
@@ -99,7 +107,7 @@ calloc = callocBytes (sizeOf (undefined :: a))
 mallocBytes      :: Int -> IO (Ptr a)
 mallocBytes size  = failWhenNULL "malloc" (_malloc (fromIntegral size))
 
--- |Llike 'mallocBytes' but memory is filled with bytes of value zero.
+-- |Like 'mallocBytes', but memory is filled with bytes of value zero.
 --
 callocBytes :: Int -> IO (Ptr a)
 callocBytes size = failWhenNULL "calloc" $ _calloc 1 (fromIntegral size)
@@ -133,8 +141,31 @@ allocaBytes (I# size) action = IO $ \ s0 ->
      keepAlive# barr# s2 action'
   }}}
 
+-- |@'allocaBytesAligned' size align f@ executes the computation @f@,
+-- passing as argument a pointer to a temporarily allocated block of memory
+-- of @size@ bytes and aligned to @align@ bytes. The value of @align@ must
+-- be a power of two.
+--
+-- The memory is freed when @f@ terminates (either normally or via an
+-- exception), so the pointer passed to @f@ must /not/ be used after this.
+--
 allocaBytesAligned :: Int -> Int -> (Ptr a -> IO b) -> IO b
-allocaBytesAligned (I# size) (I# align) action = IO $ \ s0 ->
+allocaBytesAligned !_size !align !_action
+    | not $ isPowerOfTwo align =
+      ioError $
+        IOError Nothing InvalidArgument
+          "allocaBytesAligned"
+          ("alignment (="++show align++") must be a power of two!")
+          Nothing Nothing
+  where
+    isPowerOfTwo :: (Bits i, Integral i) => i -> Bool
+    isPowerOfTwo x = x .&. (x-1) == 0
+allocaBytesAligned !size !align !action =
+    allocaBytesAlignedAndUnchecked size align action
+{-# INLINABLE allocaBytesAligned #-}
+
+allocaBytesAlignedAndUnchecked :: Int -> Int -> (Ptr a -> IO b) -> IO b
+allocaBytesAlignedAndUnchecked (I# size) (I# align) action = IO $ \ s0 ->
      case newAlignedPinnedByteArray# size align s0 of { (# s1, mbarr# #) ->
      case unsafeFreezeByteArray# mbarr# s1 of { (# s2, barr#  #) ->
      let addr = Ptr (byteArrayContents# barr#) in

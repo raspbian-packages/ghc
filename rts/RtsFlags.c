@@ -7,7 +7,7 @@
  *
  * ---------------------------------------------------------------------------*/
 
-#include "PosixSource.h"
+#include "rts/PosixSource.h"
 #include "Rts.h"
 
 #include "RtsUtils.h"
@@ -153,16 +153,18 @@ void initRtsFlagsDefaults(void)
     RtsFlags.GcFlags.stkChunkSize       = (32 * 1024) / sizeof(W_);
     RtsFlags.GcFlags.stkChunkBufferSize = (1 * 1024) / sizeof(W_);
 
-    RtsFlags.GcFlags.minAllocAreaSize   = (1024 * 1024)       / BLOCK_SIZE;
+    /* -A default. See #16499 for a discussion about the tradeoffs */
+    RtsFlags.GcFlags.minAllocAreaSize   = (4 * 1024 * 1024)       / BLOCK_SIZE;
     RtsFlags.GcFlags.largeAllocLim      = 0; /* defaults to minAllocAreasize */
     RtsFlags.GcFlags.nurseryChunkSize   = 0;
-    RtsFlags.GcFlags.minOldGenSize      = (1024 * 1024)       / BLOCK_SIZE;
+    RtsFlags.GcFlags.minOldGenSize      = (1024 * 1024)       / BLOCK_SIZE; /* -O default */
     RtsFlags.GcFlags.maxHeapSize        = 0;    /* off by default */
     RtsFlags.GcFlags.heapLimitGrace     = (1024 * 1024);
     RtsFlags.GcFlags.heapSizeSuggestion = 0;    /* none */
     RtsFlags.GcFlags.heapSizeSuggestionAuto = false;
     RtsFlags.GcFlags.pcFreeHeap         = 3;    /* 3% */
     RtsFlags.GcFlags.oldGenFactor       = 2;
+    RtsFlags.GcFlags.returnDecayFactor  = 4;
     RtsFlags.GcFlags.useNonmoving       = false;
     RtsFlags.GcFlags.generations        = 2;
     RtsFlags.GcFlags.squeezeUpdFrames   = true;
@@ -197,6 +199,7 @@ void initRtsFlagsDefaults(void)
     RtsFlags.DebugFlags.prof            = false;
     RtsFlags.DebugFlags.apply           = false;
     RtsFlags.DebugFlags.linker          = false;
+    RtsFlags.DebugFlags.linker_verbose  = false;
     RtsFlags.DebugFlags.squeeze         = false;
     RtsFlags.DebugFlags.hpc             = false;
     RtsFlags.DebugFlags.sparks          = false;
@@ -210,9 +213,9 @@ void initRtsFlagsDefaults(void)
 
     RtsFlags.ProfFlags.doHeapProfile      = false;
     RtsFlags.ProfFlags.heapProfileInterval = USToTime(100000); // 100ms
+    RtsFlags.ProfFlags.startHeapProfileAtStartup = true;
 
 #if defined(PROFILING)
-    RtsFlags.ProfFlags.includeTSOs        = false;
     RtsFlags.ProfFlags.showCCSOnException = false;
     RtsFlags.ProfFlags.maxRetainerSetSize = 8;
     RtsFlags.ProfFlags.ccsLength          = 25;
@@ -234,7 +237,10 @@ void initRtsFlagsDefaults(void)
     RtsFlags.TraceFlags.sparks_sampled= false;
     RtsFlags.TraceFlags.sparks_full   = false;
     RtsFlags.TraceFlags.user          = false;
+    RtsFlags.TraceFlags.ticky         = false;
     RtsFlags.TraceFlags.trace_output  = NULL;
+    RtsFlags.TraceFlags.eventlogFlushTime = 0;
+    RtsFlags.TraceFlags.nullWriter = false;
 #endif
 
 #if defined(PROFILING)
@@ -292,15 +298,17 @@ usage_text[] = {
 "",
 "Usage: <prog> <args> [+RTS <rtsopts> | -RTS <args>] ... --RTS <args>",
 "",
-"   +RTS    Indicates run time system options follow",
-"   -RTS    Indicates program arguments follow",
-"  --RTS    Indicates that ALL subsequent arguments will be given to the",
-"           program (including any of these RTS flags)",
+"   +RTS     Indicates run time system options follow",
+"   -RTS     Indicates program arguments follow",
+"  --RTS     Indicates that ALL subsequent arguments will be given to the",
+"            program (including any of these RTS flags)",
 "",
-"The following run time system options are available:",
+"The following run time system options may be available (note that some",
+"of these may not be usable unless this program was linked with the -rtsopts",
+"flag):",
 "",
-"  -?       Prints this message and exits; the program is not executed",
-"  --info   Print information about the RTS used by this program",
+"  -?        Prints this message and exits; the program is not executed",
+"  --info    Print information about the RTS used by this program",
 "",
 "  --nonmoving-gc",
 "            Selects the non-moving mark-and-sweep garbage collector to",
@@ -309,21 +317,27 @@ usage_text[] = {
 "            Selects the copying garbage collector to manage all generations.",
 "",
 "  -K<size>  Sets the maximum stack size (default: 80% of the heap)",
-"            Egs: -K32k -K512k -K8M",
-"  -ki<size> Sets the initial thread stack size (default 1k)  Egs: -ki4k -ki2m",
+"            e.g.: -K32k -K512k -K8M",
+"  -ki<size> Sets the initial thread stack size (default 1k)  e.g.: -ki4k -ki2m",
 "  -kc<size> Sets the stack chunk size (default 32k)",
 "  -kb<size> Sets the stack chunk buffer size (default 1k)",
 "",
-"  -A<size>  Sets the minimum allocation area size (default 1m) Egs: -A20m -A10k",
+"  -A<size>  Sets the minimum allocation area size (default 4m) e.g.: -A20m -A10k",
 "  -AL<size> Sets the amount of large-object memory that can be allocated",
 "            before a GC is triggered (default: the value of -A)",
 "  -F<n>     Sets the collecting threshold for old generations as a factor of",
 "            the live data in that generation the last time it was collected",
 "            (default: 2.0)",
+"  -Fd<n>    Sets the inverse rate which memory is returned to the OS after being",
+"            optimistically retained after being allocated. Subsequent major",
+"            collections not caused by heap overflow will return an amount of",
+"            memory controlled by this factor (higher is slower). Setting the factor",
+"            to 0 means memory is not returned.",
+"            (default 4.0)",
 "  -n<size>  Allocation area chunk size (0 = disabled, default: 0)",
 "  -O<size>  Sets the minimum size of the old generation (default 1M)",
-"  -M<size>  Sets the maximum heap size (default unlimited)  Egs: -M256k -M1G",
-"  -H<size>  Sets the minimum heap size (default 0M)   Egs: -H24m  -H1G",
+"  -M<size>  Sets the maximum heap size (default unlimited)  e.g.: -M256k -M1G",
+"  -H<size>  Sets the minimum heap size (default 0M)   e.g.: -H24m  -H1G",
 "  -xb<addr> Sets the address from which a suitable start for the heap memory",
 "            will be searched from. This is useful if the default address",
 "            clashes with some third-party library.",
@@ -331,13 +345,13 @@ usage_text[] = {
 "  -m<n>     Minimum % of heap which must be available (default 3%)",
 "  -G<n>     Number of generations (default: 2)",
 "  -c<n>     Use in-place compaction instead of copying in the oldest generation",
-"           when live data is at least <n>% of the maximum heap size set with",
-"           -M (default: 30%)",
-"  -c       Use in-place compaction for all oldest generation collections",
-"           (the default is to use copying)",
-"  -w       Use mark-region for the oldest generation (experimental)",
+"            when live data is at least <n>% of the maximum heap size set with",
+"            -M (default: 30%)",
+"  -c        Use in-place compaction for all oldest generation collections",
+"            (the default is to use copying)",
+"  -w        Use mark-region for the oldest generation (experimental)",
 #if defined(THREADED_RTS)
-"  -I<sec>  Perform full GC after <sec> idle time (default: 0.3, 0 == off)",
+"  -I<sec>   Perform full GC after <sec> idle time (default: 0.3, 0 == off)",
 #endif
 "",
 "  -T         Collect GC statistics (useful for in-program statistics access)",
@@ -386,7 +400,14 @@ usage_text[] = {
 #else /* PROFILING */
 "  -h       Heap residency profile (output file <program>.hp)",
 "  -hT      Produce a heap profile grouped by closure type",
+"  -po<file>  Override profiling output file name prefix (program name by default)",
 #endif /* PROFILING */
+
+"  -i<sec>  Time between heap profile samples (seconds, default: 0.1)",
+"  --no-automatic-heap-samples",
+"           Do not start the heap profile interval timer on start-up,",
+"           Rather, the application will be responsible for triggering",
+"           heap profiler samples."
 
 #if defined(TRACING)
 "",
@@ -402,15 +423,19 @@ usage_text[] = {
 "                p    par spark events (sampled)",
 "                f    par spark events (full detail)",
 "                u    user events (emitted from Haskell code)",
+#if defined(TICKY_TICKY)
+"                T    ticky-ticky counter samples",
+#endif
 "                a    all event classes above",
 #  if defined(DEBUG)
 "                t    add time stamps (only useful with -v)",
 #  endif
 "               -x    disable an event class, for any flag above",
 "             the initial enabled event classes are 'sgpu'",
+" --eventlog-flush-interval=<secs>",
+"             Periodically flush the eventlog at the specified interval.",
 #endif
 
-"  -i<sec>  Time between heap profile samples (seconds, default: 0.1)",
 "",
 #if defined(TICKY_TICKY)
 "  -r<file>  Produce ticky-ticky statistics (with -rstderr for stderr)",
@@ -442,6 +467,7 @@ usage_text[] = {
 "  -Dp  DEBUG: prof",
 "  -Da  DEBUG: apply",
 "  -Dl  DEBUG: linker",
+"  -DL  DEBUG: linker (verbose)",
 "  -Dm  DEBUG: stm",
 "  -Dz  DEBUG: stack squeezing",
 "  -Dc  DEBUG: program coverage",
@@ -456,66 +482,66 @@ usage_text[] = {
 "  -N[<n>]    Use <n> processors (default: 1, -N alone determines",
 "             the number of processors to use automatically)",
 "  -maxN[<n>] Use up to <n> processors automatically",
-"  -qg[<n>]  Use parallel GC only for generations >= <n>",
-"            (default: 0, -qg alone turns off parallel GC)",
-"  -qb[<n>]  Use load-balancing in the parallel GC only for generations >= <n>",
-"            (default: 1 for -A < 32M, 0 otherwise;",
-"             -qb alone turns off load-balancing)",
-"  -qn<n>    Use <n> threads for parallel GC (defaults to value of -N)",
-"  -qa       Use the OS to set thread affinity (experimental)",
-"  -qm       Don't automatically migrate threads between CPUs",
-"  -qi<n>    If a processor has been idle for the last <n> GCs, do not",
-"            wake it up for a non-load-balancing parallel GC.",
-"            (0 disables,  default: 0)",
+"  -qg[<n>]   Use parallel GC only for generations >= <n>",
+"             (default: 0, -qg alone turns off parallel GC)",
+"  -qb[<n>]   Use load-balancing in the parallel GC only for generations >= <n>",
+"             (default: 1 for -A < 32M, 0 otherwise;",
+"              -qb alone turns off load-balancing)",
+"  -qn<n>     Use <n> threads for parallel GC (defaults to value of -N)",
+"  -qa        Use the OS to set thread affinity (experimental)",
+"  -qm        Don't automatically migrate threads between CPUs",
+"  -qi<n>     If a processor has been idle for the last <n> GCs, do not",
+"             wake it up for a non-load-balancing parallel GC.",
+"             (0 disables,  default: 0)",
 "  --numa[=<node_mask>]",
-"            Use NUMA, nodes given by <node_mask> (default: off)",
+"             Use NUMA, nodes given by <node_mask> (default: off)",
 #if defined(DEBUG)
 "  --debug-numa[=<num_nodes>]",
-"            Pretend NUMA: like --numa, but without the system calls.",
-"            Can be used on non-NUMA systems for debugging.",
+"             Pretend NUMA: like --numa, but without the system calls.",
+"             Can be used on non-NUMA systems for debugging.",
 "",
 #endif
 #endif
 "  --install-signal-handlers=<yes|no>",
-"            Install signal handlers (default: yes)",
+"             Install signal handlers (default: yes)",
 #if defined(mingw32_HOST_OS)
 "  --install-seh-handlers=<yes|no>",
-"            Install exception handlers (default: yes)",
+"             Install exception handlers (default: yes)",
 "  --generate-crash-dumps",
-"            Generate Windows crash dumps, requires exception handlers",
-"            to be installed. Implies --install-signal-handlers=yes.",
-"            (default: no)",
+"             Generate Windows crash dumps, requires exception handlers",
+"             to be installed. Implies --install-signal-handlers=yes.",
+"             (default: no)",
 "  --generate-stack-traces=<yes|no>",
-"            Generate a stack trace when your application encounters a",
-"            fatal error. When symbols are available an attempt will be",
-"            made to resolve addresses to names. (default: yes)",
+"             Generate a stack trace when your application encounters a",
+"             fatal error. When symbols are available an attempt will be",
+"             made to resolve addresses to names. (default: yes)",
 #endif
 "  --io-manager=<native|posix>",
-"            The I/O manager subsystem to use. (default: posix)",
+"             The I/O manager subsystem to use. (default: posix)",
 #if defined(THREADED_RTS)
 #if defined(mingw32_HOST_OS)
 "  --io-manager-threads=<num>",
-"            The number of worker threads to use in the native I/O manager to",
-"            handle completion events. (defualt: num cores)",
+"             The number of worker threads to use in the native I/O manager to",
+"             handle completion events. (default: num cores)",
 #endif
-"  -e<n>     Maximum number of outstanding local sparks (default: 4096)",
+"  -e<n>      Maximum number of outstanding local sparks (default: 4096)",
 #endif
 #if defined(x86_64_HOST_ARCH)
 #if !DEFAULT_LINKER_ALWAYS_PIC
-"  -xp       Assume that all object files were compiled with -fPIC",
-"            -fexternal-dynamic-refs and load them anywhere in the address",
-"            space",
+"  -xp        Assume that all object files were compiled with -fPIC",
+"             -fexternal-dynamic-refs and load them anywhere in the address",
+"             space",
 #endif
-"  -xm       Base address to mmap memory in the GHCi linker",
-"            (hex; must be <80000000)",
+"  -xm        Base address to mmap memory in the GHCi linker",
+"             (hex; must be <80000000)",
 #endif
-"  -xq       The allocation limit given to a thread after it receives",
-"            an AllocationLimitExceeded exception. (default: 100k)",
+"  -xq        The allocation limit given to a thread after it receives",
+"             an AllocationLimitExceeded exception. (default: 100k)",
 "",
 "  -Mgrace=<n>",
-"            The amount of allocation after the program receives a",
-"            HeapOverflow exception before the exception is thrown again, if",
-"            the program is still exceeding the heap limit.",
+"             The amount of allocation after the program receives a",
+"             HeapOverflow exception before the exception is thrown again, if",
+"             the program is still exceeding the heap limit.",
 "",
 "RTS options may also be specified using the GHCRTS environment variable.",
 "",
@@ -527,7 +553,7 @@ usage_text[] = {
 
 /**
 Note [Windows Unicode Arguments]
-~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 On Windows argv is usually encoded in the current Codepage which might not
 support unicode.
 
@@ -941,6 +967,11 @@ error = true;
                       OPTION_UNSAFE;
                       RtsFlags.MiscFlags.generate_dump_file = true;
                   }
+                  else if (strequal("null-eventlog-writer",
+                               &rts_argv[arg][2])) {
+                      OPTION_UNSAFE;
+                      RtsFlags.TraceFlags.nullWriter = true;
+                  }
                   else if (strequal("machine-readable",
                                &rts_argv[arg][2])) {
                       OPTION_UNSAFE;
@@ -971,6 +1002,16 @@ error = true;
                       OPTION_SAFE;
                       printRtsInfo(rtsConfig);
                       stg_exit(0);
+                  }
+                  else if (!strncmp("eventlog-flush-interval=",
+                               &rts_argv[arg][2], 24)) {
+                      OPTION_SAFE;
+                      double intervalSeconds = parseDouble(rts_argv[arg]+26, &error);
+                      if (error) {
+                          errorBelch("bad value for --eventlog-flush-interval");
+                      }
+                      RtsFlags.TraceFlags.eventlogFlushTime =
+                          fsecondsToTime(intervalSeconds);
                   }
                   else if (strequal("copying-gc",
                                &rts_argv[arg][2])) {
@@ -1075,6 +1116,12 @@ error = true;
                       }
                       break;
                   }
+                  else if (strequal("no-automatic-heap-samples",
+                               &rts_argv[arg][2])) {
+                      OPTION_SAFE;
+                      RtsFlags.ProfFlags.startHeapProfileAtStartup = false;
+                      break;
+                  }
                   else {
                       OPTION_SAFE;
                       errorBelch("unknown RTS option: %s",rts_argv[arg]);
@@ -1126,10 +1173,19 @@ error = true;
 
               case 'F':
                 OPTION_UNSAFE;
-                RtsFlags.GcFlags.oldGenFactor = atof(rts_argv[arg]+2);
+                switch(rts_argv[arg][2]) {
+                case 'd':
+                  RtsFlags.GcFlags.returnDecayFactor = atof(rts_argv[arg]+3);
+                  if (RtsFlags.GcFlags.returnDecayFactor < 0)
+                    bad_option( rts_argv[arg] );
+                  break;
+                default:
+                  RtsFlags.GcFlags.oldGenFactor = atof(rts_argv[arg]+2);
 
-                if (RtsFlags.GcFlags.oldGenFactor < 0)
-                  bad_option( rts_argv[arg] );
+                  if (RtsFlags.GcFlags.oldGenFactor < 0)
+                    bad_option( rts_argv[arg] );
+                  break;
+                };
                 break;
 
               case 'D':
@@ -1322,6 +1378,21 @@ error = true;
               case 'P': /* detailed cost centre profiling (time/alloc) */
               case 'p': /* cost centre profiling (time/alloc) */
                 OPTION_SAFE;
+#if !defined(PROFILING)
+                switch (rts_argv[arg][2]) {
+                  case 'o':
+                      if (rts_argv[arg][3] == '\0') {
+                        errorBelch("flag -po expects an argument");
+                        error = true;
+                        break;
+                      }
+                      RtsFlags.CcFlags.outputFileNameStem = rts_argv[arg]+3;
+                      break;
+                  default:
+                      PROFILING_BUILD_ONLY();
+
+                } break;
+#else
                 PROFILING_BUILD_ONLY(
                 switch (rts_argv[arg][2]) {
                   case 'a':
@@ -1356,6 +1427,7 @@ error = true;
                     goto check_rest;
                 }
                 ) break;
+#endif /* PROFILING */
 
               case 'R':
                   OPTION_SAFE;
@@ -1375,9 +1447,16 @@ error = true;
 #if !defined(PROFILING)
                 switch (rts_argv[arg][2]) {
                   case '\0':
+                    errorBelch("-h is deprecated, use -hT instead.");
+
+                    FALLTHROUGH;
                   case 'T':
                     OPTION_UNSAFE;
                     RtsFlags.ProfFlags.doHeapProfile = HEAP_BY_CLOSURE_TYPE;
+                    break;
+                  case 'i':
+                    OPTION_UNSAFE;
+                    RtsFlags.ProfFlags.doHeapProfile = HEAP_BY_INFO_TABLE;
                     break;
                   default:
                     OPTION_SAFE;
@@ -1673,11 +1752,9 @@ error = true;
 
                 case 't':  /* Include memory used by TSOs in a heap profile */
                     OPTION_SAFE;
-                    PROFILING_BUILD_ONLY(
-                        RtsFlags.ProfFlags.includeTSOs = true;
-                        );
-                    unchecked_arg_start++;
-                    goto check_rest;
+                    errorBelch("The -xt option has been removed (#16795)");
+                    error = true;
+                    break;
 
                   /*
                    * The option prefix '-xx' is reserved for future
@@ -1790,6 +1867,14 @@ static void normaliseRtsOpts (void)
         RtsFlags.ProfFlags.heapProfileIntervalTicks = 0;
     }
 
+    if (RtsFlags.TraceFlags.eventlogFlushTime > 0) {
+        RtsFlags.TraceFlags.eventlogFlushTicks =
+            RtsFlags.TraceFlags.eventlogFlushTime /
+            RtsFlags.MiscFlags.tickInterval;
+    } else {
+        RtsFlags.TraceFlags.eventlogFlushTicks = 0;
+    }
+
     if (RtsFlags.GcFlags.stkChunkBufferSize >
         RtsFlags.GcFlags.stkChunkSize / 2) {
         errorBelch("stack chunk buffer size (-kb) must be less than 50%%\n"
@@ -1840,6 +1925,16 @@ static void normaliseRtsOpts (void)
         barf("The non-moving collector doesn't support -G1");
     }
 
+#if !defined(PROFILING) && !defined(DEBUG)
+    // The mark-region collector is incompatible with heap census unless
+    // we zero slop of blackhole'd thunks, which doesn't happen in the
+    // vanilla way. See #9666.
+    if (RtsFlags.ProfFlags.doHeapProfile && RtsFlags.GcFlags.sweep) {
+        barf("The mark-region collector can only be used with profiling\n"
+             "when linked against the profiled RTS.");
+    }
+#endif
+
     if (RtsFlags.ProfFlags.doHeapProfile != NO_HEAP_PROFILING &&
             RtsFlags.GcFlags.useNonmoving) {
         barf("The non-moving collector doesn't support profiling");
@@ -1849,6 +1944,11 @@ static void normaliseRtsOpts (void)
         errorBelch("The non-moving collector cannot be used in conjunction with\n"
                    "the compacting collector.");
         errorUsage();
+    }
+
+    if (RtsFlags.TraceFlags.ticky && RtsFlags.TickyFlags.showTickyStats) {
+        barf("The ticky-ticky eventlog output cannot be used in conjunction with\n"
+             "+RTS -r<file>.");
     }
 }
 
@@ -2065,6 +2165,10 @@ static void read_debug_flags(const char* arg)
         case 'l':
             RtsFlags.DebugFlags.linker = true;
             break;
+        case 'L':
+            RtsFlags.DebugFlags.linker_verbose = true;
+            RtsFlags.DebugFlags.linker = true;
+            break;
         case 'a':
             RtsFlags.DebugFlags.apply = true;
             break;
@@ -2108,6 +2212,8 @@ static bool read_heap_profiling_flag(const char *arg)
     bool error = false;
     switch (arg[2]) {
     case '\0':
+      errorBelch("-h is deprecated, use -hc instead.");
+      FALLTHROUGH;
     case 'C':
     case 'c':
     case 'M':
@@ -2116,6 +2222,7 @@ static bool read_heap_profiling_flag(const char *arg)
     case 'd':
     case 'Y':
     case 'y':
+    case 'i':
     case 'R':
     case 'r':
     case 'B':
@@ -2166,7 +2273,7 @@ static bool read_heap_profiling_flag(const char *arg)
                     RtsFlags.ProfFlags.bioSelector = selector;
                     break;
                 default:
-                    free(selector);
+                    stgFree(selector);
                 }
             }
             break;
@@ -2195,6 +2302,9 @@ static bool read_heap_profiling_flag(const char *arg)
         case 'Y':
         case 'y':
             RtsFlags.ProfFlags.doHeapProfile = HEAP_BY_TYPE;
+            break;
+        case 'i':
+            RtsFlags.ProfFlags.doHeapProfile = HEAP_BY_INFO_TABLE;
             break;
         case 'R':
         case 'r':
@@ -2292,6 +2402,15 @@ static void read_trace_flags(const char *arg)
             RtsFlags.TraceFlags.user      = enabled;
             enabled = true;
             break;
+        case 'T':
+#if defined(TICKY_TICKY)
+            RtsFlags.TraceFlags.ticky     = enabled;
+            enabled = true;
+            break;
+#else
+            errorBelch("Program not compiled with ticky-ticky support");
+            break;
+#endif
         default:
             errorBelch("unknown trace option: %c",*c);
             break;
@@ -2485,7 +2604,7 @@ void freeRtsArgs(void)
 
 /*
 Note [OPTION_SAFE vs OPTION_UNSAFE]
-
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Ticket #3910 originally pointed out that the RTS options are a potential
 security problem. For example the -t -s or -S flags can be used to
 overwrite files. This would be bad in the context of CGI scripts or

@@ -1,14 +1,19 @@
-{-# LANGUAGE BangPatterns, CPP, MagicHash, Rank2Types, UnboxedTuples, TypeFamilies #-}
+{-# LANGUAGE BangPatterns, CPP, MagicHash, RankNTypes, UnboxedTuples, TypeFamilies #-}
 {-# LANGUAGE TemplateHaskellQuotes #-}
 {-# LANGUAGE Trustworthy #-}
+{-# LANGUAGE UnliftedFFITypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE PartialTypeSignatures #-}
 
 {-# OPTIONS_GHC -fno-warn-orphans #-}
+{-# OPTIONS_GHC -Wno-partial-type-signatures #-}
 
 -- |
 -- Module      : Data.Text
 -- Copyright   : (c) 2009, 2010, 2011, 2012 Bryan O'Sullivan,
 --               (c) 2009 Duncan Coutts,
 --               (c) 2008, 2009 Tom Harper
+--               (c) 2021 Andrew Lelechenko
 --
 -- License     : BSD-style
 -- Maintainer  : bos@serpentine.com
@@ -95,6 +100,7 @@ module Data.Text
     , foldl1
     , foldl1'
     , foldr
+    , foldr'
     , foldr1
 
     -- ** Special folds
@@ -104,6 +110,7 @@ module Data.Text
     , all
     , maximum
     , minimum
+    , isAscii
 
     -- * Construction
 
@@ -142,6 +149,8 @@ module Data.Text
     , breakOnEnd
     , break
     , span
+    , spanM
+    , spanEndM
     , group
     , groupBy
     , inits
@@ -195,56 +204,70 @@ module Data.Text
     -- * Low level operations
     , copy
     , unpackCString#
+    , unpackCStringAscii#
+
+    , measureOff
     ) where
 
 import Prelude (Char, Bool(..), Int, Maybe(..), String,
-                Eq(..), Ord(..), Ordering(..), (++),
-                Read(..),
+                Eq, (==), (/=), Ord(..), Ordering(..), (++),
+                Monad(..), pure, Read(..),
                 (&&), (||), (+), (-), (.), ($), ($!), (>>),
-                not, return, otherwise, quot)
+                not, return, otherwise, quot, IO)
 import Control.DeepSeq (NFData(rnf))
 #if defined(ASSERTS)
 import Control.Exception (assert)
-import GHC.Stack (HasCallStack)
 #endif
-import Data.Char (isSpace)
+import Data.Bits ((.&.), shiftR, shiftL)
+import qualified Data.Char as Char
 import Data.Data (Data(gfoldl, toConstr, gunfold, dataTypeOf), constrIndex,
                   Constr, mkConstr, DataType, mkDataType, Fixity(Prefix))
 import Control.Monad (foldM)
-import Control.Monad.ST (ST)
+import Control.Monad.ST (ST, runST)
+import Control.Monad.ST.Unsafe (unsafeIOToST)
 import qualified Data.Text.Array as A
-import qualified Data.List as L
+import qualified Data.List as L hiding (head, tail)
 import Data.Binary (Binary(get, put))
 import Data.Monoid (Monoid(..))
 import Data.Semigroup (Semigroup(..))
 import Data.String (IsString(..))
+import Data.Text.Internal.Encoding.Utf8 (utf8Length, utf8LengthByLeader, chr2, chr3, chr4, ord2, ord3, ord4)
 import qualified Data.Text.Internal.Fusion as S
+import Data.Text.Internal.Fusion.CaseMapping (foldMapping, lowerMapping, upperMapping)
 import qualified Data.Text.Internal.Fusion.Common as S
 import Data.Text.Encoding (decodeUtf8', encodeUtf8)
 import Data.Text.Internal.Fusion (stream, reverseStream, unstream)
 import Data.Text.Internal.Private (span_)
-import Data.Text.Internal (Text(..), empty, firstf, mul, safe, text)
-import Data.Text.Show (singleton, unpack, unpackCString#)
+import Data.Text.Internal (Text(..), empty, firstf, mul, safe, text, append, pack)
+import Data.Text.Internal.Unsafe.Char (unsafeWrite, unsafeChr8)
+import Data.Text.Show (singleton, unpack, unpackCString#, unpackCStringAscii#)
 import qualified Prelude as P
-import Data.Text.Unsafe (Iter(..), iter, iter_, lengthWord16, reverseIter,
-                         reverseIter_, unsafeHead, unsafeTail)
-import Data.Text.Internal.Unsafe.Char (unsafeChr)
-import qualified Data.Text.Internal.Functions as F
-import qualified Data.Text.Internal.Encoding.Utf16 as U16
+import Data.Text.Unsafe (Iter(..), iter, iter_, lengthWord8, reverseIter,
+                         reverseIter_, unsafeHead, unsafeTail, iterArray, reverseIterArray)
 import Data.Text.Internal.Search (indices)
-import Data.Text.Internal.Unsafe.Shift (UnsafeShift(..))
 #if defined(__HADDOCK__)
 import Data.ByteString (ByteString)
 import qualified Data.Text.Lazy as L
-import Data.Int (Int64)
 #endif
-import GHC.Base (eqInt, neInt, gtInt, geInt, ltInt, leInt)
+import Data.Word (Word8)
+import Foreign.C.Types
+import GHC.Base (eqInt, neInt, gtInt, geInt, ltInt, leInt, ByteArray#)
 import qualified GHC.Exts as Exts
+import GHC.Int (Int8, Int64(..))
+import GHC.Stack (HasCallStack)
 import qualified Language.Haskell.TH.Lib as TH
 import qualified Language.Haskell.TH.Syntax as TH
 import Text.Printf (PrintfArg, formatArg, formatString)
+import System.Posix.Types (CSsize(..))
+
+#if MIN_VERSION_template_haskell(2,16,0)
+import Data.Text.Foreign (asForeignPtr)
+import System.IO.Unsafe (unsafePerformIO)
+#endif
 
 -- $setup
+-- >>> :set -package transformers
+-- >>> import Control.Monad.Trans.State
 -- >>> import Data.Text
 -- >>> import qualified Data.Text as T
 -- >>> :seti -XOverloadedStrings
@@ -292,7 +315,8 @@ import Text.Printf (PrintfArg, formatArg, formatString)
 -- points
 -- (<http://www.unicode.org/versions/Unicode5.2.0/ch03.pdf#page=13 §3.4, definition D10 >)
 -- as 'Char' values, including code points from this invalid range.
--- This means that there are some 'Char' values that are not valid
+-- This means that there are some 'Char' values
+-- (corresponding to 'Data.Char.Surrogate' category) that are not valid
 -- Unicode scalar values, and the functions in this module must handle
 -- those cases.
 --
@@ -301,40 +325,18 @@ import Text.Printf (PrintfArg, formatArg, formatString)
 -- that are not valid Unicode scalar values with the replacement
 -- character \"&#xfffd;\" (U+FFFD).  Functions that perform this
 -- inspection and replacement are documented with the phrase
--- \"Performs replacement on invalid scalar values\".
---
--- (One reason for this policy of replacement is that internally, a
--- 'Text' value is represented as packed UTF-16 data. Values in the
--- range U+D800 through U+DFFF are used by UTF-16 to denote surrogate
--- code points, and so cannot be represented. The functions replace
+-- \"Performs replacement on invalid scalar values\". The functions replace
 -- invalid scalar values, instead of dropping them, as a security
 -- measure. For details, see
 -- <http://unicode.org/reports/tr36/#Deletion_of_Noncharacters Unicode Technical Report 36, §3.5 >.)
 
 -- $fusion
 --
--- Most of the functions in this module are subject to /fusion/,
--- meaning that a pipeline of such functions will usually allocate at
--- most one 'Text' value.
---
--- As an example, consider the following pipeline:
---
--- > import Data.Text as T
--- > import Data.Text.Encoding as E
--- > import Data.ByteString (ByteString)
--- >
--- > countChars :: ByteString -> Int
--- > countChars = T.length . T.toUpper . E.decodeUtf8
---
--- From the type signatures involved, this looks like it should
--- allocate one 'Data.ByteString.ByteString' value, and two 'Text'
--- values. However, when a module is compiled with optimisation
--- enabled under GHC, the two intermediate 'Text' values will be
--- optimised away, and the function will be compiled down to a single
--- loop over the source 'Data.ByteString.ByteString'.
---
--- Functions that can be fused by the compiler are documented with the
--- phrase \"Subject to fusion\".
+-- Starting from @text-1.3@ fusion is no longer implicit,
+-- and pipelines of transformations usually allocate intermediate 'Text' values.
+-- Users, who observe significant changes to performances,
+-- are encouraged to use fusion framework explicitly, employing
+-- "Data.Text.Internal.Fusion" and "Data.Text.Internal.Fusion.Common".
 
 instance Eq Text where
     Text arrA offA lenA == Text arrB offB lenB
@@ -357,10 +359,21 @@ instance Monoid Text where
     mappend = (<>)
     mconcat = concat
 
+-- | Performs replacement on invalid scalar values:
+--
+-- >>> :set -XOverloadedStrings
+-- >>> "\55555" :: Text
+-- "\65533"
 instance IsString Text where
     fromString = pack
 
--- | @since 1.2.0.0
+-- | Performs replacement on invalid scalar values:
+--
+-- >>> :set -XOverloadedLists
+-- >>> ['\55555'] :: Text
+-- "\65533"
+--
+-- @since 1.2.0.0
 instance Exts.IsList Text where
     type Item Text = Char
     fromList       = pack
@@ -390,7 +403,7 @@ instance Binary Text where
 --
 -- The followup discussion that changed the behavior of 'Data.Set.Set'
 -- and 'Data.Map.Map' is archived here:
--- <http://markmail.org/message/trovdc6zkphyi3cr#query:+page:1+mid:a46der3iacwjcf6n+state:results Proposal: Allow gunfold for Data.Map, ... >
+-- <https://mail.haskell.org/pipermail/libraries/2012-August/018366.html Proposal: Allow gunfold for Data.Map, ... >
 
 instance Data Text where
   gfoldl f z txt = z pack `f` (unpack txt)
@@ -400,16 +413,31 @@ instance Data Text where
     _ -> P.error "gunfold"
   dataTypeOf _ = textDataType
 
--- | This instance has similar considerations to the 'Data' instance:
--- it preserves abstraction at the cost of inefficiency.
---
--- @since 1.2.4.0
+-- | @since 1.2.4.0
 instance TH.Lift Text where
+#if MIN_VERSION_template_haskell(2,16,0)
+  lift txt = do
+    let (ptr, len) = unsafePerformIO $ asForeignPtr txt
+    let lenInt = P.fromIntegral len
+    TH.appE (TH.appE (TH.varE 'unpackCStringLen#) (TH.litE . TH.bytesPrimL $ TH.mkBytes ptr 0 lenInt)) (TH.lift lenInt)
+#else
   lift = TH.appE (TH.varE 'pack) . TH.stringE . unpack
+#endif
 #if MIN_VERSION_template_haskell(2,17,0)
   liftTyped = TH.unsafeCodeCoerce . TH.lift
 #elif MIN_VERSION_template_haskell(2,16,0)
   liftTyped = TH.unsafeTExpCoerce . TH.lift
+#endif
+
+#if MIN_VERSION_template_haskell(2,16,0)
+unpackCStringLen# :: Exts.Addr# -> Int -> Text
+unpackCStringLen# addr# l = Text ba 0 l
+  where
+    ba = runST $ do
+      marr <- A.new l
+      A.copyFromPointer marr 0 (Exts.Ptr addr#) l
+      A.unsafeFreeze marr
+{-# NOINLINE unpackCStringLen# #-} -- set as NOINLINE to avoid generated code bloat
 #endif
 
 -- | @since 1.2.2.0
@@ -424,80 +452,40 @@ textDataType = mkDataType "Data.Text.Text" [packConstr]
 
 -- | /O(n)/ Compare two 'Text' values lexicographically.
 compareText :: Text -> Text -> Ordering
-compareText ta@(Text _arrA _offA lenA) tb@(Text _arrB _offB lenB)
-    | lenA == 0 && lenB == 0 = EQ
-    | otherwise              = go 0 0
-  where
-    go !i !j
-        | i >= lenA || j >= lenB = compare lenA lenB
-        | a < b                  = LT
-        | a > b                  = GT
-        | otherwise              = go (i+di) (j+dj)
-      where Iter a di = iter ta i
-            Iter b dj = iter tb j
-
--- -----------------------------------------------------------------------------
--- * Conversion to/from 'Text'
-
--- | /O(n)/ Convert a 'String' into a 'Text'.  Subject to
--- fusion.  Performs replacement on invalid scalar values.
-pack :: String -> Text
-pack = unstream . S.map safe . S.streamList
-{-# INLINE [1] pack #-}
+compareText (Text arrA offA lenA) (Text arrB offB lenB) =
+    A.compare arrA offA arrB offB (min lenA lenB) <> compare lenA lenB
+-- This is not a mistake: on contrary to UTF-16 (https://github.com/haskell/text/pull/208),
+-- lexicographic ordering of UTF-8 encoded strings matches lexicographic ordering
+-- of underlying bytearrays, no decoding is needed.
 
 -- -----------------------------------------------------------------------------
 -- * Basic functions
 
 -- | /O(n)/ Adds a character to the front of a 'Text'.  This function
 -- is more costly than its 'List' counterpart because it requires
--- copying a new array.  Subject to fusion.  Performs replacement on
+-- copying a new array.  Performs replacement on
 -- invalid scalar values.
 cons :: Char -> Text -> Text
-cons c t = unstream (S.cons (safe c) (stream t))
-{-# INLINE cons #-}
+cons c = unstream . S.cons (safe c) . stream
+{-# INLINE [1] cons #-}
 
 infixr 5 `cons`
 
 -- | /O(n)/ Adds a character to the end of a 'Text'.  This copies the
--- entire array in the process, unless fused.  Subject to fusion.
+-- entire array in the process.
 -- Performs replacement on invalid scalar values.
 snoc :: Text -> Char -> Text
 snoc t c = unstream (S.snoc (stream t) (safe c))
 {-# INLINE snoc #-}
 
--- | /O(n)/ Appends one 'Text' to the other by copying both of them
--- into a new 'Text'.  Subject to fusion.
-append :: Text -> Text -> Text
-append a@(Text arr1 off1 len1) b@(Text arr2 off2 len2)
-    | len1 == 0 = b
-    | len2 == 0 = a
-    | len > 0   = Text (A.run x) 0 len
-    | otherwise = overflowError "append"
-    where
-      len = len1+len2
-      x :: ST s (A.MArray s)
-      x = do
-        arr <- A.new len
-        A.copyI arr 0 arr1 off1 len1
-        A.copyI arr len1 arr2 off2 len
-        return arr
-{-# NOINLINE append #-}
-
-{-# RULES
-"TEXT append -> fused" [~1] forall t1 t2.
-    append t1 t2 = unstream (S.append (stream t1) (stream t2))
-"TEXT append -> unfused" [1] forall t1 t2.
-    unstream (S.append (stream t1) (stream t2)) = append t1 t2
- #-}
-
 -- | /O(1)/ Returns the first character of a 'Text', which must be
--- non-empty.  Subject to fusion.
-head :: Text -> Char
+-- non-empty. This is a partial function, consider using 'uncons' instead.
+head :: HasCallStack => Text -> Char
 head t = S.head (stream t)
 {-# INLINE head #-}
 
 -- | /O(1)/ Returns the first character and rest of a 'Text', or
--- 'Nothing' if empty. Subject to fusion.
+-- 'Nothing' if empty.
 uncons :: Text -> Maybe (Char, Text)
 uncons t@(Text arr off len)
     | len <= 0  = Nothing
@@ -505,76 +493,44 @@ uncons t@(Text arr off len)
                          in (c, text arr (off+d) (len-d))
 {-# INLINE [1] uncons #-}
 
--- | Lifted from Control.Arrow and specialized.
-second :: (b -> c) -> (a,b) -> (a,c)
-second f (a, b) = (a, f b)
-
 -- | /O(1)/ Returns the last character of a 'Text', which must be
--- non-empty.  Subject to fusion.
-last :: Text -> Char
-last (Text arr off len)
-    | len <= 0                 = emptyError "last"
-    | n < 0xDC00 || n > 0xDFFF = unsafeChr n
-    | otherwise                = U16.chr2 n0 n
-    where n  = A.unsafeIndex arr (off+len-1)
-          n0 = A.unsafeIndex arr (off+len-2)
+-- non-empty. This is a partial function, consider using 'unsnoc' instead.
+last :: HasCallStack => Text -> Char
+last t@(Text _ _ len)
+    | len <= 0  = emptyError "last"
+    | otherwise = let Iter c _ = reverseIter t (len - 1) in c
 {-# INLINE [1] last #-}
 
-{-# RULES
-"TEXT last -> fused" [~1] forall t.
-    last t = S.last (stream t)
-"TEXT last -> unfused" [1] forall t.
-    S.last (stream t) = last t
-  #-}
-
 -- | /O(1)/ Returns all characters after the head of a 'Text', which
--- must be non-empty.  Subject to fusion.
-tail :: Text -> Text
+-- must be non-empty. This is a partial function, consider using 'uncons' instead.
+tail :: HasCallStack => Text -> Text
 tail t@(Text arr off len)
     | len <= 0  = emptyError "tail"
     | otherwise = text arr (off+d) (len-d)
     where d = iter_ t 0
 {-# INLINE [1] tail #-}
 
-{-# RULES
-"TEXT tail -> fused" [~1] forall t.
-    tail t = unstream (S.tail (stream t))
-"TEXT tail -> unfused" [1] forall t.
-    unstream (S.tail (stream t)) = tail t
- #-}
-
 -- | /O(1)/ Returns all but the last character of a 'Text', which must
--- be non-empty.  Subject to fusion.
-init :: Text -> Text
-init (Text arr off len) | len <= 0                   = emptyError "init"
-                        | n >= 0xDC00 && n <= 0xDFFF = text arr off (len-2)
-                        | otherwise                  = text arr off (len-1)
-    where
-      n = A.unsafeIndex arr (off+len-1)
+-- be non-empty. This is a partial function, consider using 'unsnoc' instead.
+init :: HasCallStack => Text -> Text
+init t@(Text arr off len)
+    | len <= 0  = emptyError "init"
+    | otherwise = text arr off (len + reverseIter_ t (len - 1))
 {-# INLINE [1] init #-}
-
-{-# RULES
-"TEXT init -> fused" [~1] forall t.
-    init t = unstream (S.init (stream t))
-"TEXT init -> unfused" [1] forall t.
-    unstream (S.init (stream t)) = init t
- #-}
 
 -- | /O(1)/ Returns all but the last character and the last character of a
 -- 'Text', or 'Nothing' if empty.
 --
 -- @since 1.2.3.0
 unsnoc :: Text -> Maybe (Text, Char)
-unsnoc (Text arr off len)
-    | len <= 0                 = Nothing
-    | n < 0xDC00 || n > 0xDFFF = Just (text arr off (len-1), unsafeChr n)
-    | otherwise                = Just (text arr off (len-2), U16.chr2 n0 n)
-    where n  = A.unsafeIndex arr (off+len-1)
-          n0 = A.unsafeIndex arr (off+len-2)
+unsnoc t@(Text arr off len)
+    | len <= 0  = Nothing
+    | otherwise = Just (text arr off (len + d), c)
+        where
+            Iter c d = reverseIter t (len - 1)
 {-# INLINE [1] unsnoc #-}
 
--- | /O(1)/ Tests whether a 'Text' is empty or not.  Subject to
--- fusion.
+-- | /O(1)/ Tests whether a 'Text' is empty or not.
 null :: Text -> Bool
 null (Text _arr _off len) =
 #if defined(ASSERTS)
@@ -583,39 +539,54 @@ null (Text _arr _off len) =
     len <= 0
 {-# INLINE [1] null #-}
 
-{-# RULES
-"TEXT null -> fused" [~1] forall t.
-    null t = S.null (stream t)
-"TEXT null -> unfused" [1] forall t.
-    S.null (stream t) = null t
- #-}
-
 -- | /O(1)/ Tests whether a 'Text' contains exactly one character.
--- Subject to fusion.
 isSingleton :: Text -> Bool
 isSingleton = S.isSingleton . stream
 {-# INLINE isSingleton #-}
 
 -- | /O(n)/ Returns the number of characters in a 'Text'.
--- Subject to fusion.
 length ::
 #if defined(ASSERTS)
   HasCallStack =>
 #endif
   Text -> Int
-length t = S.length (stream t)
+length = P.negate . measureOff P.maxBound
 {-# INLINE [1] length #-}
 -- length needs to be phased after the compareN/length rules otherwise
 -- it may inline before the rules have an opportunity to fire.
 
--- | /O(n)/ Compare the count of characters in a 'Text' to a number.
--- Subject to fusion.
+{-# RULES
+"TEXT length/filter -> S.length/S.filter" forall p t.
+    length (filter p t) = S.length (S.filter p (stream t))
+"TEXT length/unstream -> S.length" forall t.
+    length (unstream t) = S.length t
+"TEXT length/pack -> P.length" forall t.
+    length (pack t) = P.length t
+"TEXT length/map -> length" forall f t.
+    length (map f t) = length t
+"TEXT length/zipWith -> length" forall f t1 t2.
+    length (zipWith f t1 t2) = min (length t1) (length t2)
+"TEXT length/replicate -> n" forall n t.
+    length (replicate n t) = mul (max 0 n) (length t)
+"TEXT length/cons -> length+1" forall c t.
+    length (cons c t) = 1 + length t
+"TEXT length/intersperse -> 2*length-1" forall c t.
+    length (intersperse c t) = max 0 (mul 2 (length t) - 1)
+"TEXT length/intercalate -> n*length" forall s ts.
+    length (intercalate s ts) = let lenS = length s in max 0 (P.sum (P.map (\t -> length t + lenS) ts) - lenS)
+  #-}
+
+-- | /O(min(n,c))/ Compare the count of characters in a 'Text' to a number.
+--
+-- @
+-- 'compareLength' t c = 'P.compare' ('length' t) c
+-- @
 --
 -- This function gives the same answer as comparing against the result
 -- of 'length', but can short circuit if the count of characters is
 -- greater than the number, and hence be more efficient.
 compareLength :: Text -> Int -> Ordering
-compareLength t n = S.compareLengthI (stream t) n
+compareLength t c = S.compareLengthI (stream t) c
 {-# INLINE [1] compareLength #-}
 
 {-# RULES
@@ -664,10 +635,36 @@ compareLength t n = S.compareLengthI (stream t) n
 -- >>> T.map (\c -> if c == '.' then '!' else c) message
 -- "I am not angry! Not at all!"
 --
--- Subject to fusion.  Performs replacement on invalid scalar values.
+-- Performs replacement on invalid scalar values.
 map :: (Char -> Char) -> Text -> Text
-map f t = unstream (S.map (safe . f) (stream t))
+map f = go
+  where
+    go (Text src o l) = runST $ do
+      marr <- A.new (l + 4)
+      outer marr (l + 4) o 0
+      where
+        outer :: forall s. A.MArray s -> Int -> Int -> Int -> ST s Text
+        outer !dst !dstLen = inner
+          where
+            inner !srcOff !dstOff
+              | srcOff >= l + o = do
+                A.shrinkM dst dstOff
+                arr <- A.unsafeFreeze dst
+                return (Text arr 0 dstOff)
+              | dstOff + 4 > dstLen = do
+                let !dstLen' = dstLen + (l + o) - srcOff + 4
+                dst' <- A.resizeM dst dstLen'
+                outer dst' dstLen' srcOff dstOff
+              | otherwise = do
+                let !(Iter c d) = iterArray src srcOff
+                d' <- unsafeWrite dst dstOff (safe (f c))
+                inner (srcOff + d) (dstOff + d')
 {-# INLINE [1] map #-}
+
+{-# RULES
+"TEXT map/map -> map" forall f g t.
+    map f (map g t) = map (f . safe . g) t
+#-}
 
 -- | /O(n)/ The 'intercalate' function takes a 'Text' and a list of
 -- 'Text's and concatenates the list after interspersing the first
@@ -678,8 +675,8 @@ map f t = unstream (S.map (safe . f) (stream t))
 -- >>> T.intercalate "NI!" ["We", "seek", "the", "Holy", "Grail"]
 -- "WeNI!seekNI!theNI!HolyNI!Grail"
 intercalate :: Text -> [Text] -> Text
-intercalate t = concat . (F.intersperse t)
-{-# INLINE intercalate #-}
+intercalate t = concat . L.intersperse t
+{-# INLINE [1] intercalate #-}
 
 -- | /O(n)/ The 'intersperse' function takes a character and places it
 -- between the characters of a 'Text'.
@@ -689,10 +686,63 @@ intercalate t = concat . (F.intersperse t)
 -- >>> T.intersperse '.' "SHIELD"
 -- "S.H.I.E.L.D"
 --
--- Subject to fusion.  Performs replacement on invalid scalar values.
-intersperse     :: Char -> Text -> Text
-intersperse c t = unstream (S.intersperse (safe c) (stream t))
-{-# INLINE intersperse #-}
+-- Performs replacement on invalid scalar values.
+intersperse :: Char -> Text -> Text
+intersperse c t@(Text src o l) = if l == 0 then mempty else runST $ do
+    let !cLen = utf8Length c
+        dstLen = l + length t P.* cLen
+
+    dst <- A.new dstLen
+
+    let writeSep = case cLen of
+          1 -> \dstOff ->
+            A.unsafeWrite dst dstOff (ord8 c)
+          2 -> let (c0, c1) = ord2 c in \dstOff -> do
+            A.unsafeWrite dst dstOff c0
+            A.unsafeWrite dst (dstOff + 1) c1
+          3 -> let (c0, c1, c2) = ord3 c in \dstOff -> do
+            A.unsafeWrite dst dstOff c0
+            A.unsafeWrite dst (dstOff + 1) c1
+            A.unsafeWrite dst (dstOff + 2) c2
+          _ -> let (c0, c1, c2, c3) = ord4 c in \dstOff -> do
+            A.unsafeWrite dst dstOff c0
+            A.unsafeWrite dst (dstOff + 1) c1
+            A.unsafeWrite dst (dstOff + 2) c2
+            A.unsafeWrite dst (dstOff + 3) c3
+    let go !srcOff !dstOff = if srcOff >= o + l then return () else do
+          let m0 = A.unsafeIndex src srcOff
+              m1 = A.unsafeIndex src (srcOff + 1)
+              m2 = A.unsafeIndex src (srcOff + 2)
+              m3 = A.unsafeIndex src (srcOff + 3)
+              !d = utf8LengthByLeader m0
+          case d of
+            1 -> do
+              A.unsafeWrite dst dstOff m0
+              writeSep (dstOff + 1)
+              go (srcOff + 1) (dstOff + 1 + cLen)
+            2 -> do
+              A.unsafeWrite dst dstOff m0
+              A.unsafeWrite dst (dstOff + 1) m1
+              writeSep (dstOff + 2)
+              go (srcOff + 2) (dstOff + 2 + cLen)
+            3 -> do
+              A.unsafeWrite dst dstOff m0
+              A.unsafeWrite dst (dstOff + 1) m1
+              A.unsafeWrite dst (dstOff + 2) m2
+              writeSep (dstOff + 3)
+              go (srcOff + 3) (dstOff + 3 + cLen)
+            _ -> do
+              A.unsafeWrite dst dstOff m0
+              A.unsafeWrite dst (dstOff + 1) m1
+              A.unsafeWrite dst (dstOff + 2) m2
+              A.unsafeWrite dst (dstOff + 3) m3
+              writeSep (dstOff + 4)
+              go (srcOff + 4) (dstOff + 4 + cLen)
+
+    go o 0
+    arr <- A.unsafeFreeze dst
+    return (Text arr 0 (dstLen - cLen))
+{-# INLINE [1] intersperse #-}
 
 -- | /O(n)/ Reverse the characters of a string.
 --
@@ -700,15 +750,22 @@ intersperse c t = unstream (S.intersperse (safe c) (stream t))
 --
 -- >>> T.reverse "desrever"
 -- "reversed"
---
--- Subject to fusion (fuses with its argument).
 reverse ::
 #if defined(ASSERTS)
   HasCallStack =>
 #endif
   Text -> Text
-reverse t = S.reverse (stream t)
+reverse (Text (A.ByteArray ba) off len) = runST $ do
+    marr@(A.MutableByteArray mba) <- A.new len
+    unsafeIOToST $ c_reverse mba ba (intToCSize off) (intToCSize len)
+    brr <- A.unsafeFreeze marr
+    return $ Text brr 0 len
 {-# INLINE reverse #-}
+
+-- | The input buffer (src :: ByteArray#, off :: CSize, len :: CSize)
+-- must specify a valid UTF-8 sequence, this condition is not checked.
+foreign import ccall unsafe "_hs_text_reverse" c_reverse
+    :: Exts.MutableByteArray# s -> ByteArray# -> CSize -> CSize -> IO ()
 
 -- | /O(m+n)/ Replace every non-overlapping occurrence of @needle@ in
 -- @haystack@ with @replacement@.
@@ -735,7 +792,8 @@ reverse t = S.reverse (stream t)
 --
 -- In (unlikely) bad cases, this function's time complexity degrades
 -- towards /O(n*m)/.
-replace :: Text
+replace :: HasCallStack
+        => Text
         -- ^ @needle@ to search for.  If this string is empty, an
         -- error will occur.
         -> Text
@@ -759,10 +817,10 @@ replace needle@(Text _      _      neeLen)
       let loop (i:is) o d = do
             let d0 = d + i - o
                 d1 = d0 + repLen
-            A.copyI marr d  hayArr (hayOff+o) d0
-            A.copyI marr d0 repArr repOff d1
+            A.copyI (i - o) marr d  hayArr (hayOff+o)
+            A.copyI repLen  marr d0 repArr repOff
             loop is (i + neeLen) d1
-          loop []     o d = A.copyI marr d hayArr (hayOff+o) len
+          loop []     o d = A.copyI (len - d) marr d hayArr (hayOff+o)
       loop ixs 0 0
       return marr
 
@@ -786,7 +844,85 @@ replace needle@(Text _      _      neeLen)
 -- sensitivity should use appropriate versions of the
 -- <http://hackage.haskell.org/package/text-icu-0.6.3.7/docs/Data-Text-ICU.html#g:4 case mapping functions from the text-icu package >.
 
--- | /O(n)/ Convert a string to folded case.  Subject to fusion.
+caseConvert :: (Word8 -> Word8) -> (Exts.Char# -> _ {- unboxed Int64 -}) -> Text -> Text
+caseConvert ascii remap (Text src o l) = runST $ do
+  -- Case conversion a single code point may produce up to 3 code-points,
+  -- each up to 4 bytes, so 12 in total.
+  dst <- A.new (l + 12)
+  outer dst l o 0
+  where
+    outer :: forall s. A.MArray s -> Int -> Int -> Int -> ST s Text
+    outer !dst !dstLen = inner
+      where
+        inner !srcOff !dstOff
+          | srcOff >= o + l = do
+            A.shrinkM dst dstOff
+            arr <- A.unsafeFreeze dst
+            return (Text arr 0 dstOff)
+          | dstOff + 12 > dstLen = do
+            -- Ensure to extend the buffer by at least 12 bytes.
+            let !dstLen' = dstLen + max 12 (l + o - srcOff)
+            dst' <- A.resizeM dst dstLen'
+            outer dst' dstLen' srcOff dstOff
+          -- If a character is to remain unchanged, no need to decode Char back into UTF8,
+          -- just copy bytes from input.
+          | otherwise = do
+            let m0 = A.unsafeIndex src srcOff
+                m1 = A.unsafeIndex src (srcOff + 1)
+                m2 = A.unsafeIndex src (srcOff + 2)
+                m3 = A.unsafeIndex src (srcOff + 3)
+                !d = utf8LengthByLeader m0
+            case d of
+              1 -> do
+                A.unsafeWrite dst dstOff (ascii m0)
+                inner (srcOff + 1) (dstOff + 1)
+              2 -> do
+                let !(Exts.C# c) = chr2 m0 m1
+                dstOff' <- case I64# (remap c) of
+                  0 -> do
+                    A.unsafeWrite dst dstOff m0
+                    A.unsafeWrite dst (dstOff + 1) m1
+                    pure $ dstOff + 2
+                  i -> writeMapping i dstOff
+                inner (srcOff + 2) dstOff'
+              3 -> do
+                let !(Exts.C# c) = chr3 m0 m1 m2
+                dstOff' <- case I64# (remap c) of
+                  0 -> do
+                    A.unsafeWrite dst dstOff m0
+                    A.unsafeWrite dst (dstOff + 1) m1
+                    A.unsafeWrite dst (dstOff + 2) m2
+                    pure $ dstOff + 3
+                  i -> writeMapping i dstOff
+                inner (srcOff + 3) dstOff'
+              _ -> do
+                let !(Exts.C# c) = chr4 m0 m1 m2 m3
+                dstOff' <- case I64# (remap c) of
+                  0 -> do
+                    A.unsafeWrite dst dstOff m0
+                    A.unsafeWrite dst (dstOff + 1) m1
+                    A.unsafeWrite dst (dstOff + 2) m2
+                    A.unsafeWrite dst (dstOff + 3) m3
+                    pure $ dstOff + 4
+                  i -> writeMapping i dstOff
+                inner (srcOff + 4) dstOff'
+
+        writeMapping :: Int64 -> Int -> ST s Int
+        writeMapping 0 dstOff = pure dstOff
+        writeMapping i dstOff = do
+          let (ch, j) = chopOffChar i
+          d <- unsafeWrite dst dstOff ch
+          writeMapping j (dstOff + d)
+
+        chopOffChar :: Int64 -> (Char, Int64)
+        chopOffChar ab = (chr a, ab `shiftR` 21)
+          where
+            chr (Exts.I# n) = Exts.C# (Exts.chr# n)
+            mask = (1 `shiftL` 21) - 1
+            a = P.fromIntegral $ ab .&. mask
+{-# INLINE caseConvert #-}
+
+-- | /O(n)/ Convert a string to folded case.
 --
 -- This function is mainly useful for performing caseless (also known
 -- as case insensitive) string comparisons.
@@ -803,37 +939,46 @@ replace needle@(Text _      _      neeLen)
 -- U+00B5) is case folded to \"&#x3bc;\" (small letter mu, U+03BC)
 -- instead of itself.
 toCaseFold :: Text -> Text
-toCaseFold t = unstream (S.toCaseFold (stream t))
+toCaseFold = \xs -> caseConvert (\w -> if w - 65 <= 25 then w + 32 else w) foldMapping xs
 {-# INLINE toCaseFold #-}
 
 -- | /O(n)/ Convert a string to lower case, using simple case
--- conversion.  Subject to fusion.
+-- conversion.
 --
 -- The result string may be longer than the input string.  For
 -- instance, \"&#x130;\" (Latin capital letter I with dot above,
 -- U+0130) maps to the sequence \"i\" (Latin small letter i, U+0069)
 -- followed by \" &#x307;\" (combining dot above, U+0307).
 toLower :: Text -> Text
-toLower t = unstream (S.toLower (stream t))
+toLower = \xs -> caseConvert (\w -> if w - 65 <= 25 then w + 32 else w) lowerMapping xs
 {-# INLINE toLower #-}
 
 -- | /O(n)/ Convert a string to upper case, using simple case
--- conversion.  Subject to fusion.
+-- conversion.
 --
 -- The result string may be longer than the input string.  For
 -- instance, the German \"&#xdf;\" (eszett, U+00DF) maps to the
 -- two-letter sequence \"SS\".
 toUpper :: Text -> Text
-toUpper t = unstream (S.toUpper (stream t))
+toUpper = \xs -> caseConvert (\w -> if w - 97 <= 25 then w - 32 else w) upperMapping xs
 {-# INLINE toUpper #-}
 
 -- | /O(n)/ Convert a string to title case, using simple case
--- conversion. Subject to fusion.
+-- conversion.
 --
--- The first letter of the input is converted to title case, as is
+-- The first letter (as determined by 'Data.Char.isLetter')
+-- of the input is converted to title case, as is
 -- every subsequent letter that immediately follows a non-letter.
 -- Every letter that immediately follows another letter is converted
 -- to lower case.
+--
+-- This function is not idempotent.
+-- Consider lower-case letter @ŉ@ (U+0149 LATIN SMALL LETTER N PRECEDED BY APOSTROPHE).
+-- Then 'T.toTitle' @"ŉ"@ = @"ʼN"@: the first (and the only) letter of the input
+-- is converted to title case, becoming two letters.
+-- Now @ʼ@ (U+02BC MODIFIER LETTER APOSTROPHE) is a modifier letter
+-- and as such is recognised as a letter by 'Data.Char.isLetter',
+-- so 'T.toTitle' @"ʼN"@ = @"'n"@.
 --
 -- The result string may be longer than the input string. For example,
 -- the Latin small ligature &#xfb02; (U+FB02) is converted to the
@@ -852,7 +997,7 @@ toTitle t = unstream (S.toTitle (stream t))
 {-# INLINE toTitle #-}
 
 -- | /O(n)/ Left-justify a string to the given length, using the
--- specified fill character on the right. Subject to fusion.
+-- specified fill character on the right.
 -- Performs replacement on invalid scalar values.
 --
 -- Examples:
@@ -868,13 +1013,6 @@ justifyLeft k c t
     | otherwise = t `append` replicateChar (k-len) c
   where len = length t
 {-# INLINE [1] justifyLeft #-}
-
-{-# RULES
-"TEXT justifyLeft -> fused" [~1] forall k c t.
-    justifyLeft k c t = unstream (S.justifyLeftI k c (stream t))
-"TEXT justifyLeft -> unfused" [1] forall k c t.
-    unstream (S.justifyLeftI k c (stream t)) = justifyLeft k c t
-  #-}
 
 -- | /O(n)/ Right-justify a string to the given length, using the
 -- specified fill character on the left.  Performs replacement on
@@ -933,41 +1071,63 @@ transpose ts = P.map pack (L.transpose (P.map unpack ts))
 -- | /O(n)/ 'foldl', applied to a binary operator, a starting value
 -- (typically the left-identity of the operator), and a 'Text',
 -- reduces the 'Text' using the binary operator, from left to right.
--- Subject to fusion.
 foldl :: (a -> Char -> a) -> a -> Text -> a
 foldl f z t = S.foldl f z (stream t)
 {-# INLINE foldl #-}
 
--- | /O(n)/ A strict version of 'foldl'.  Subject to fusion.
+-- | /O(n)/ A strict version of 'foldl'.
 foldl' :: (a -> Char -> a) -> a -> Text -> a
 foldl' f z t = S.foldl' f z (stream t)
 {-# INLINE foldl' #-}
 
 -- | /O(n)/ A variant of 'foldl' that has no starting value argument,
--- and thus must be applied to a non-empty 'Text'.  Subject to fusion.
-foldl1 :: (Char -> Char -> Char) -> Text -> Char
+-- and thus must be applied to a non-empty 'Text'.
+foldl1 :: HasCallStack => (Char -> Char -> Char) -> Text -> Char
 foldl1 f t = S.foldl1 f (stream t)
 {-# INLINE foldl1 #-}
 
--- | /O(n)/ A strict version of 'foldl1'.  Subject to fusion.
-foldl1' :: (Char -> Char -> Char) -> Text -> Char
+-- | /O(n)/ A strict version of 'foldl1'.
+foldl1' :: HasCallStack => (Char -> Char -> Char) -> Text -> Char
 foldl1' f t = S.foldl1' f (stream t)
 {-# INLINE foldl1' #-}
 
 -- | /O(n)/ 'foldr', applied to a binary operator, a starting value
 -- (typically the right-identity of the operator), and a 'Text',
 -- reduces the 'Text' using the binary operator, from right to left.
--- Subject to fusion.
+--
+-- If the binary operator is strict in its second argument, use 'foldr''
+-- instead.
+--
+-- 'foldr' is lazy like 'Data.List.foldr' for lists: evaluation actually
+-- traverses the 'Text' from left to right, only as far as it needs to.
+--
+-- For example, 'head' can be defined with /O(1)/ complexity using 'foldr':
+--
+-- @
+-- head :: Text -> Char
+-- head = foldr const (error "head empty")
+-- @
+--
+-- Searches from left to right with short-circuiting behavior can
+-- also be defined using 'foldr' (/e.g./, 'any', 'all', 'find', 'elem').
 foldr :: (Char -> a -> a) -> a -> Text -> a
 foldr f z t = S.foldr f z (stream t)
 {-# INLINE foldr #-}
 
 -- | /O(n)/ A variant of 'foldr' that has no starting value argument,
--- and thus must be applied to a non-empty 'Text'.  Subject to
--- fusion.
-foldr1 :: (Char -> Char -> Char) -> Text -> Char
+-- and thus must be applied to a non-empty 'Text'.
+foldr1 :: HasCallStack => (Char -> Char -> Char) -> Text -> Char
 foldr1 f t = S.foldr1 f (stream t)
 {-# INLINE foldr1 #-}
+
+-- | /O(n)/ A strict version of 'foldr'.
+--
+-- 'foldr'' evaluates as a right-to-left traversal using constant stack space.
+--
+-- @since 2.0.1
+foldr' :: (Char -> a -> a) -> a -> Text -> a
+foldr' f z t = S.foldl' (P.flip f) z (reverseStream t)
+{-# INLINE foldr' #-}
 
 -- -----------------------------------------------------------------------------
 -- ** Special folds
@@ -980,12 +1140,11 @@ concat ts = case ts' of
               _ -> Text (A.run go) 0 len
   where
     ts' = L.filter (not . null) ts
-    len = sumP "concat" $ L.map lengthWord16 ts'
+    len = sumP "concat" $ L.map lengthWord8 ts'
     go :: ST s (A.MArray s)
     go = do
       arr <- A.new len
-      let step i (Text a o l) =
-            let !j = i + l in A.copyI arr i a o j >> return j
+      let step i (Text a o l) = A.copyI l arr i a o >> return (i + l)
       foldM step 0 ts' >> return arr
 
 -- | /O(n)/ Map a function over a 'Text' that results in a 'Text', and
@@ -995,41 +1154,71 @@ concatMap f = concat . foldr ((:) . f) []
 {-# INLINE concatMap #-}
 
 -- | /O(n)/ 'any' @p@ @t@ determines whether any character in the
--- 'Text' @t@ satisfies the predicate @p@. Subject to fusion.
+-- 'Text' @t@ satisfies the predicate @p@.
 any :: (Char -> Bool) -> Text -> Bool
 any p t = S.any p (stream t)
 {-# INLINE any #-}
 
 -- | /O(n)/ 'all' @p@ @t@ determines whether all characters in the
--- 'Text' @t@ satisfy the predicate @p@. Subject to fusion.
+-- 'Text' @t@ satisfy the predicate @p@.
 all :: (Char -> Bool) -> Text -> Bool
 all p t = S.all p (stream t)
 {-# INLINE all #-}
 
 -- | /O(n)/ 'maximum' returns the maximum value from a 'Text', which
--- must be non-empty. Subject to fusion.
-maximum :: Text -> Char
+-- must be non-empty.
+maximum :: HasCallStack => Text -> Char
 maximum t = S.maximum (stream t)
 {-# INLINE maximum #-}
 
 -- | /O(n)/ 'minimum' returns the minimum value from a 'Text', which
--- must be non-empty. Subject to fusion.
-minimum :: Text -> Char
+-- must be non-empty.
+minimum :: HasCallStack => Text -> Char
 minimum t = S.minimum (stream t)
 {-# INLINE minimum #-}
 
+-- | \O(n)\ Test whether 'Text' contains only ASCII code-points (i.e. only
+--   U+0000 through U+007F).
+--
+-- This is a more efficient version of @'all' 'Data.Char.isAscii'@.
+--
+-- >>> isAscii ""
+-- True
+--
+-- >>> isAscii "abc\NUL"
+-- True
+--
+-- >>> isAscii "abcd€"
+-- False
+--
+-- prop> isAscii t == all (< '\x80') t
+--
+-- @since 2.0.2
+isAscii :: Text -> Bool
+isAscii (Text (A.ByteArray arr) off len) =
+    cSizeToInt (c_is_ascii_offset arr (intToCSize off) (intToCSize len)) == len
+{-# INLINE isAscii #-}
+
+cSizeToInt :: CSize -> Int
+cSizeToInt = P.fromIntegral
+{-# INLINE cSizeToInt #-}
+
+foreign import ccall unsafe "_hs_text_is_ascii_offset" c_is_ascii_offset
+    :: ByteArray# -> CSize -> CSize -> CSize
+
 -- -----------------------------------------------------------------------------
 -- * Building 'Text's
-
 -- | /O(n)/ 'scanl' is similar to 'foldl', but returns a list of
--- successive reduced values from the left. Subject to fusion.
+-- successive reduced values from the left.
 -- Performs replacement on invalid scalar values.
 --
 -- > scanl f z [x1, x2, ...] == [z, z `f` x1, (z `f` x1) `f` x2, ...]
 --
--- Note that
+-- __Properties__
 --
--- > last (scanl f z xs) == foldl f z xs.
+-- @'head' ('scanl' f z xs) = z@
+--
+-- @'last' ('scanl' f z xs) = 'foldl' f z xs@
 scanl :: (Char -> Char -> Char) -> Char -> Text -> Text
 scanl f z t = unstream (S.scanl g z (stream t))
     where g a b = safe (f a b)
@@ -1064,9 +1253,30 @@ scanr1 f t | null t    = empty
 -- function to each element of a 'Text', passing an accumulating
 -- parameter from left to right, and returns a final 'Text'.  Performs
 -- replacement on invalid scalar values.
-mapAccumL :: (a -> Char -> (a,Char)) -> a -> Text -> (a, Text)
-mapAccumL f z0 = S.mapAccumL g z0 . stream
-    where g a b = second safe (f a b)
+mapAccumL :: forall a. (a -> Char -> (a, Char)) -> a -> Text -> (a, Text)
+mapAccumL f z0 = go
+  where
+    go (Text src o l) = runST $ do
+      marr <- A.new (l + 4)
+      outer marr (l + 4) o 0 z0
+      where
+        outer :: forall s. A.MArray s -> Int -> Int -> Int -> a -> ST s (a, Text)
+        outer !dst !dstLen = inner
+          where
+            inner !srcOff !dstOff !z
+              | srcOff >= l + o = do
+                A.shrinkM dst dstOff
+                arr <- A.unsafeFreeze dst
+                return (z, Text arr 0 dstOff)
+              | dstOff + 4 > dstLen = do
+                let !dstLen' = dstLen + (l + o) - srcOff + 4
+                dst' <- A.resizeM dst dstLen'
+                outer dst' dstLen' srcOff dstOff z
+              | otherwise = do
+                let !(Iter c d) = iterArray src srcOff
+                    (z', c') = f z c
+                d' <- unsafeWrite dst dstOff (safe c')
+                inner (srcOff + d) (dstOff + d') z'
 {-# INLINE mapAccumL #-}
 
 -- | The 'mapAccumR' function behaves like a combination of 'map' and
@@ -1075,9 +1285,35 @@ mapAccumL f z0 = S.mapAccumL g z0 . stream
 -- returning a final value of this accumulator together with the new
 -- 'Text'.
 -- Performs replacement on invalid scalar values.
-mapAccumR :: (a -> Char -> (a,Char)) -> a -> Text -> (a, Text)
-mapAccumR f z0 = second reverse . S.mapAccumL g z0 . reverseStream
-    where g a b = second safe (f a b)
+mapAccumR :: forall a. (a -> Char -> (a, Char)) -> a -> Text -> (a, Text)
+mapAccumR f z0 = go
+  where
+    go (Text src o l) = runST $ do
+      marr <- A.new (l + 4)
+      outer marr (l + o - 1) (l + 4 - 1) z0
+      where
+        outer :: forall s. A.MArray s -> Int -> Int -> a -> ST s (a, Text)
+        outer !dst = inner
+          where
+            inner !srcOff !dstOff !z
+              | srcOff < o = do
+                dstLen <- A.getSizeofMArray dst
+                arr <- A.unsafeFreeze dst
+                return (z, Text arr (dstOff + 1) (dstLen - dstOff - 1))
+              | dstOff < 3 = do
+                dstLen <- A.getSizeofMArray dst
+                let !dstLen' = dstLen + (srcOff - o) + 4
+                dst' <- A.new dstLen'
+                A.copyM dst' (dstLen' - dstLen) dst 0 dstLen
+                outer dst' srcOff (dstOff + dstLen' - dstLen) z
+              | otherwise = do
+                let !(Iter c d) = reverseIterArray src (srcOff)
+                    (z', c') = f z c
+                    c'' = safe c'
+                    !d' = utf8Length c''
+                    dstOff' = dstOff - d'
+                _ <- unsafeWrite dst (dstOff' + 1) c''
+                inner (srcOff + d) dstOff' z'
 {-# INLINE mapAccumR #-}
 
 -- -----------------------------------------------------------------------------
@@ -1090,20 +1326,14 @@ replicate n t@(Text a o l)
     | n <= 0 || l <= 0       = empty
     | n == 1                 = t
     | isSingleton t          = replicateChar n (unsafeHead t)
-    | otherwise              = Text (A.run x) 0 len
-  where
-    len = l `mul` n -- TODO: detect overflows
-    x :: ST s (A.MArray s)
-    x = do
-      arr <- A.new len
-      A.copyI arr 0 a o l
-      let loop !l1 =
-            let rest = len - l1 in
-            if rest <= l1 then A.copyM arr l1 arr 0 rest >> return arr
-            else A.copyM arr l1 arr 0 l1 >> loop (l1 `shiftL` 1)
-      loop l
+    | otherwise              = runST $ do
+        let totalLen = n `mul` l
+        marr <- A.new totalLen
+        A.copyI l marr 0 a o
+        A.tile marr l
+        arr  <- A.unsafeFreeze marr
+        return $ Text arr 0 totalLen
 {-# INLINE [1] replicate #-}
-
 
 {-# RULES
 "TEXT replicate/singleton -> replicateChar" [~1] forall n c.
@@ -1111,9 +1341,24 @@ replicate n t@(Text a o l)
   #-}
 
 -- | /O(n)/ 'replicateChar' @n@ @c@ is a 'Text' of length @n@ with @c@ the
--- value of every element. Subject to fusion.
+-- value of every element.
 replicateChar :: Int -> Char -> Text
-replicateChar n c = unstream (S.replicateCharI n (safe c))
+replicateChar !len !c'
+  | len <= 0  = empty
+  | Char.isAscii c = runST $ do
+    marr <- A.newFilled len (Char.ord c)
+    arr  <- A.unsafeFreeze marr
+    return $ Text arr 0 len
+  | otherwise = runST $ do
+    let cLen = utf8Length c
+        totalLen = cLen P.* len
+    marr <- A.new totalLen
+    _ <- unsafeWrite marr 0 c
+    A.tile marr cLen
+    arr  <- A.unsafeFreeze marr
+    return $ Text arr 0 totalLen
+  where
+    c = safe c'
 {-# INLINE replicateChar #-}
 
 -- | /O(n)/, where @n@ is the length of the result. The 'unfoldr'
@@ -1121,8 +1366,8 @@ replicateChar n c = unstream (S.replicateCharI n (safe c))
 -- 'Text' from a seed value. The function takes the element and
 -- returns 'Nothing' if it is done producing the 'Text', otherwise
 -- 'Just' @(a,b)@.  In this case, @a@ is the next 'Char' in the
--- string, and @b@ is the seed value for further production. Subject
--- to fusion.  Performs replacement on invalid scalar values.
+-- string, and @b@ is the seed value for further production.
+-- Performs replacement on invalid scalar values.
 unfoldr     :: (a -> Maybe (Char,a)) -> a -> Text
 unfoldr f s = unstream (S.unfoldr (firstf safe . f) s)
 {-# INLINE unfoldr #-}
@@ -1131,8 +1376,8 @@ unfoldr f s = unstream (S.unfoldr (firstf safe . f) s)
 -- value. However, the length of the result should be limited by the
 -- first argument to 'unfoldrN'. This function is more efficient than
 -- 'unfoldr' when the maximum length of the result is known and
--- correct, otherwise its performance is similar to 'unfoldr'. Subject
--- to fusion.  Performs replacement on invalid scalar values.
+-- correct, otherwise its performance is similar to 'unfoldr'.
+-- Performs replacement on invalid scalar values.
 unfoldrN     :: Int -> (a -> Maybe (Char,a)) -> a -> Text
 unfoldrN n f s = unstream (S.unfoldrN n (firstf safe . f) s)
 {-# INLINE unfoldrN #-}
@@ -1142,27 +1387,32 @@ unfoldrN n f s = unstream (S.unfoldrN n (firstf safe . f) s)
 
 -- | /O(n)/ 'take' @n@, applied to a 'Text', returns the prefix of the
 -- 'Text' of length @n@, or the 'Text' itself if @n@ is greater than
--- the length of the Text. Subject to fusion.
+-- the length of the Text.
 take :: Int -> Text -> Text
 take n t@(Text arr off len)
     | n <= 0    = empty
     | n >= len  = t
-    | otherwise = text arr off (iterN n t)
+    | otherwise = let m = measureOff n t in if m >= 0 then text arr off m else t
 {-# INLINE [1] take #-}
 
-iterN :: Int -> Text -> Int
-iterN n t@(Text _arr _off len) = loop 0 0
-  where loop !i !cnt
-            | i >= len || cnt >= n = i
-            | otherwise            = loop (i+d) (cnt+1)
-          where d = iter_ t i
+-- | /O(n)/ If @t@ is long enough to contain @n@ characters, 'measureOff' @n@ @t@
+-- returns a non-negative number, measuring their size in 'Word8'. Otherwise,
+-- if @t@ is shorter, return a non-positive number, which is a negated total count
+-- of 'Char' available in @t@. If @t@ is empty or @n = 0@, return 0.
+--
+-- This function is used to implement 'take', 'drop', 'splitAt' and 'length'
+-- and is useful on its own in streaming and parsing libraries.
+--
+-- @since 2.0
+measureOff :: Int -> Text -> Int
+measureOff !n (Text (A.ByteArray arr) off len) = if len == 0 then 0 else
+  cSsizeToInt $
+    c_measure_off arr (intToCSize off) (intToCSize len) (intToCSize n)
 
-{-# RULES
-"TEXT take -> fused" [~1] forall n t.
-    take n t = unstream (S.take n (stream t))
-"TEXT take -> unfused" [1] forall n t.
-    unstream (S.take n (stream t)) = take n t
-  #-}
+-- | The input buffer (arr :: ByteArray#, off :: CSize, len :: CSize)
+-- must specify a valid UTF-8 sequence, this condition is not checked.
+foreign import ccall unsafe "_hs_text_measure_off" c_measure_off
+    :: ByteArray# -> CSize -> CSize -> CSize -> CSsize
 
 -- | /O(n)/ 'takeEnd' @n@ @t@ returns the suffix remaining after
 -- taking @n@ characters from the end of @t@.
@@ -1190,23 +1440,14 @@ iterNEnd n t@(Text _arr _off len) = loop (len-1) n
 
 -- | /O(n)/ 'drop' @n@, applied to a 'Text', returns the suffix of the
 -- 'Text' after the first @n@ characters, or the empty 'Text' if @n@
--- is greater than the length of the 'Text'. Subject to fusion.
+-- is greater than the length of the 'Text'.
 drop :: Int -> Text -> Text
 drop n t@(Text arr off len)
     | n <= 0    = t
     | n >= len  = empty
-    | otherwise = text arr (off+i) (len-i)
-  where i = iterN n t
+    | otherwise = if m >= 0 then text arr (off+m) (len-m) else mempty
+  where m = measureOff n t
 {-# INLINE [1] drop #-}
-
-{-# RULES
-"TEXT drop -> fused" [~1] forall n t.
-    drop n t = unstream (S.drop n (stream t))
-"TEXT drop -> unfused" [1] forall n t.
-    unstream (S.drop n (stream t)) = drop n t
-"TEXT take . drop -> unfused" [1] forall len off t.
-    unstream (S.take len (S.drop off (stream t))) = take len (drop off t)
-  #-}
 
 -- | /O(n)/ 'dropEnd' @n@ @t@ returns the prefix remaining after
 -- dropping @n@ characters from the end of @t@.
@@ -1225,7 +1466,7 @@ dropEnd n t@(Text arr off len)
 
 -- | /O(n)/ 'takeWhile', applied to a predicate @p@ and a 'Text',
 -- returns the longest prefix (possibly empty) of elements that
--- satisfy @p@.  Subject to fusion.
+-- satisfy @p@.
 takeWhile :: (Char -> Bool) -> Text -> Text
 takeWhile p t@(Text arr off len) = loop 0
   where loop !i | i >= len    = t
@@ -1233,13 +1474,6 @@ takeWhile p t@(Text arr off len) = loop 0
                 | otherwise   = text arr off i
             where Iter c d    = iter t i
 {-# INLINE [1] takeWhile #-}
-
-{-# RULES
-"TEXT takeWhile -> fused" [~1] forall p t.
-    takeWhile p t = unstream (S.takeWhile p (stream t))
-"TEXT takeWhile -> unfused" [1] forall p t.
-    unstream (S.takeWhile p (stream t)) = takeWhile p t
-  #-}
 
 -- | /O(n)/ 'takeWhileEnd', applied to a predicate @p@ and a 'Text',
 -- returns the longest suffix (possibly empty) of elements that
@@ -1255,11 +1489,11 @@ takeWhileEnd p t@(Text arr off len) = loop (len-1) len
   where loop !i !l | l <= 0    = t
                    | p c       = loop (i+d) (l+d)
                    | otherwise = text arr (off+l) (len-l)
-            where (c,d)        = reverseIter t i
+            where Iter c d     = reverseIter t i
 {-# INLINE [1] takeWhileEnd #-}
 
 -- | /O(n)/ 'dropWhile' @p@ @t@ returns the suffix remaining after
--- 'takeWhile' @p@ @t@. Subject to fusion.
+-- 'takeWhile' @p@ @t@.
 dropWhile :: (Char -> Bool) -> Text -> Text
 dropWhile p t@(Text arr off len) = loop 0 0
   where loop !i !l | l >= len  = empty
@@ -1267,13 +1501,6 @@ dropWhile p t@(Text arr off len) = loop 0 0
                    | otherwise = Text arr (off+i) (len-l)
             where Iter c d     = iter t i
 {-# INLINE [1] dropWhile #-}
-
-{-# RULES
-"TEXT dropWhile -> fused" [~1] forall p t.
-    dropWhile p t = unstream (S.dropWhile p (stream t))
-"TEXT dropWhile -> unfused" [1] forall p t.
-    unstream (S.dropWhile p (stream t)) = dropWhile p t
-  #-}
 
 -- | /O(n)/ 'dropWhileEnd' @p@ @t@ returns the prefix remaining after
 -- dropping characters that satisfy the predicate @p@ from the end of
@@ -1288,12 +1515,12 @@ dropWhileEnd p t@(Text arr off len) = loop (len-1) len
   where loop !i !l | l <= 0    = empty
                    | p c       = loop (i+d) (l+d)
                    | otherwise = Text arr off l
-            where (c,d)        = reverseIter t i
+            where Iter c d     = reverseIter t i
 {-# INLINE [1] dropWhileEnd #-}
 
 -- | /O(n)/ 'dropAround' @p@ @t@ returns the substring remaining after
 -- dropping characters that satisfy the predicate @p@ from both the
--- beginning and end of @t@.  Subject to fusion.
+-- beginning and end of @t@.
 dropAround :: (Char -> Bool) -> Text -> Text
 dropAround p = dropWhile p . dropWhileEnd p
 {-# INLINE [1] dropAround #-}
@@ -1302,14 +1529,14 @@ dropAround p = dropWhile p . dropWhileEnd p
 --
 -- > dropWhile isSpace
 stripStart :: Text -> Text
-stripStart = dropWhile isSpace
+stripStart = dropWhile Char.isSpace
 {-# INLINE stripStart #-}
 
 -- | /O(n)/ Remove trailing white space from a string.  Equivalent to:
 --
 -- > dropWhileEnd isSpace
 stripEnd :: Text -> Text
-stripEnd = dropWhileEnd isSpace
+stripEnd = dropWhileEnd Char.isSpace
 {-# INLINE [1] stripEnd #-}
 
 -- | /O(n)/ Remove leading and trailing white space from a string.
@@ -1317,7 +1544,7 @@ stripEnd = dropWhileEnd isSpace
 --
 -- > dropAround isSpace
 strip :: Text -> Text
-strip = dropAround isSpace
+strip = dropAround Char.isSpace
 {-# INLINE [1] strip #-}
 
 -- | /O(n)/ 'splitAt' @n t@ returns a pair whose first element is a
@@ -1327,13 +1554,13 @@ splitAt :: Int -> Text -> (Text, Text)
 splitAt n t@(Text arr off len)
     | n <= 0    = (empty, t)
     | n >= len  = (t, empty)
-    | otherwise = let k = iterN n t
-                  in (text arr off k, text arr (off+k) (len-k))
+    | otherwise = let m = measureOff n t in
+    if m >= 0 then (text arr off m, text arr (off+m) (len-m)) else (t, mempty)
 
 -- | /O(n)/ 'span', applied to a predicate @p@ and text @t@, returns
 -- a pair whose first element is the longest prefix (possibly empty)
 -- of @t@ of elements that satisfy @p@, and whose second is the
--- remainder of the list.
+-- remainder of the text.
 --
 -- >>> T.span (=='0') "000AB"
 -- ("000","AB")
@@ -1351,6 +1578,55 @@ break :: (Char -> Bool) -> Text -> (Text, Text)
 break p = span (not . p)
 {-# INLINE break #-}
 
+-- | /O(length of prefix)/ 'spanM', applied to a monadic predicate @p@,
+-- a text @t@, returns a pair @(t1, t2)@ where @t1@ is the longest prefix of
+-- @t@ whose elements satisfy @p@, and @t2@ is the remainder of the text.
+--
+-- >>> T.spanM (\c -> state $ \i -> (fromEnum c == i, i+1)) "abcefg" `runState` 97
+-- (("abc","efg"),101)
+--
+-- 'span' is 'spanM' specialized to 'Data.Functor.Identity.Identity':
+--
+-- @
+-- -- for all p :: Char -> Bool
+-- 'span' p = 'Data.Functor.Identity.runIdentity' . 'spanM' ('pure' . p)
+-- @
+--
+-- @since 2.0.1
+spanM :: Monad m => (Char -> m Bool) -> Text -> m (Text, Text)
+spanM p t@(Text arr off len) = go 0
+  where
+    go !i | i < len = case iterArray arr (off+i) of
+        Iter c l -> do
+            continue <- p c
+            if continue then go (i+l)
+            else pure (text arr off i, text arr (off+i) (len-i))
+    go _ = pure (t, empty)
+{-# INLINE spanM #-}
+
+-- | /O(length of suffix)/ 'spanEndM', applied to a monadic predicate @p@,
+-- a text @t@, returns a pair @(t1, t2)@ where @t2@ is the longest suffix of
+-- @t@ whose elements satisfy @p@, and @t1@ is the remainder of the text.
+--
+-- >>> T.spanEndM (\c -> state $ \i -> (fromEnum c == i, i-1)) "tuvxyz" `runState` 122
+-- (("tuv","xyz"),118)
+--
+-- @
+-- 'spanEndM' p . 'reverse' = fmap ('Data.Bifunctor.bimap' 'reverse' 'reverse') . 'spanM' p
+-- @
+--
+-- @since 2.0.1
+spanEndM :: Monad m => (Char -> m Bool) -> Text -> m (Text, Text)
+spanEndM p t@(Text arr off len) = go (len-1)
+  where
+    go !i | 0 <= i = case reverseIterArray arr (off+i) of
+        Iter c l -> do
+            continue <- p c
+            if continue then go (i+l)
+            else pure (text arr off (i+1), text arr (off+i+1) (len-i-1))
+    go _ = pure (empty, t)
+{-# INLINE spanEndM #-}
+
 -- | /O(n)/ Group characters in a string according to a predicate.
 groupBy :: (Char -> Char -> Bool) -> Text -> [Text]
 groupBy p = loop
@@ -1361,7 +1637,7 @@ groupBy p = loop
         where Iter c d = iter t 0
               n     = d + findAIndexOrEnd (not . p c) (Text arr (off+d) (len-d))
 
--- | Returns the /array/ index (in units of 'Word16') at which a
+-- | Returns the /array/ index (in units of 'Word8') at which a
 -- character may be found.  This is /not/ the same as the logical
 -- index returned by e.g. 'findIndex'.
 findAIndexOrEnd :: (Char -> Bool) -> Text -> Int
@@ -1417,7 +1693,8 @@ tails t | null t    = [empty]
 --
 -- In (unlikely) bad cases, this function's time complexity degrades
 -- towards /O(n*m)/.
-splitOn :: Text
+splitOn :: HasCallStack
+        => Text
         -- ^ String to split on. If this string is empty, an error
         -- will occur.
         -> Text
@@ -1487,7 +1764,7 @@ elem c t = S.any (== c) (stream t)
 
 -- | /O(n)/ The 'find' function takes a predicate and a 'Text', and
 -- returns the first element matching the predicate, or 'Nothing' if
--- there is no such element. Subject to fusion.
+-- there is no such element.
 find :: (Char -> Bool) -> Text -> Maybe Char
 find p t = S.findBy p (stream t)
 {-# INLINE find #-}
@@ -1505,8 +1782,73 @@ partition p t = (filter p t, filter (not . p) t)
 -- returns a 'Text' containing those characters that satisfy the
 -- predicate.
 filter :: (Char -> Bool) -> Text -> Text
-filter p t = unstream (S.filter p (stream t))
-{-# INLINE filter #-}
+filter p = go
+  where
+    go (Text src o l) = runST $ do
+      -- It's tempting to allocate l elements at once and avoid resizing.
+      -- However, this can be unacceptable in scenarios where a huge array
+      -- is filtered with a rare predicate, resulting in a much shorter buffer.
+      let !dstLen = min l 64
+      dst <- A.new dstLen
+      outer dst dstLen o 0
+      where
+        outer :: forall s. A.MArray s -> Int -> Int -> Int -> ST s Text
+        outer !dst !dstLen = inner
+          where
+            inner !srcOff !dstOff
+              | srcOff >= o + l = do
+                A.shrinkM dst dstOff
+                arr <- A.unsafeFreeze dst
+                return (Text arr 0 dstOff)
+              | dstOff + 4 > dstLen = do
+                -- Double size of the buffer, unless it becomes longer than
+                -- source string. Ensure to extend it by least 4 bytes.
+                let !dstLen' = dstLen + max 4 (min (l + o - srcOff) dstLen)
+                dst' <- A.resizeM dst dstLen'
+                outer dst' dstLen' srcOff dstOff
+              -- In case of success, filter writes exactly the same character
+              -- it just read (this is not a case for map, for example).
+              -- We leverage this fact below: no need to decode Char back into UTF8,
+              -- just copy bytes from input.
+              | otherwise = do
+                let m0 = A.unsafeIndex src srcOff
+                    m1 = A.unsafeIndex src (srcOff + 1)
+                    m2 = A.unsafeIndex src (srcOff + 2)
+                    m3 = A.unsafeIndex src (srcOff + 3)
+                    !d = utf8LengthByLeader m0
+                case d of
+                  1 -> do
+                    let !c = unsafeChr8 m0
+                    if not (p c) then inner (srcOff + 1) dstOff else do
+                      A.unsafeWrite dst dstOff m0
+                      inner (srcOff + 1) (dstOff + 1)
+                  2 -> do
+                    let !c = chr2 m0 m1
+                    if not (p c) then inner (srcOff + 2) dstOff else do
+                      A.unsafeWrite dst dstOff m0
+                      A.unsafeWrite dst (dstOff + 1) m1
+                      inner (srcOff + 2) (dstOff + 2)
+                  3 -> do
+                    let !c = chr3 m0 m1 m2
+                    if not (p c) then inner (srcOff + 3) dstOff else do
+                      A.unsafeWrite dst dstOff m0
+                      A.unsafeWrite dst (dstOff + 1) m1
+                      A.unsafeWrite dst (dstOff + 2) m2
+                      inner (srcOff + 3) (dstOff + 3)
+                  _ -> do
+                    let !c = chr4 m0 m1 m2 m3
+                    if not (p c) then inner (srcOff + 4) dstOff else do
+                      A.unsafeWrite dst dstOff m0
+                      A.unsafeWrite dst (dstOff + 1) m1
+                      A.unsafeWrite dst (dstOff + 2) m2
+                      A.unsafeWrite dst (dstOff + 3) m3
+                      inner (srcOff + 4) (dstOff + 4)
+{-# INLINE [1] filter #-}
+
+{-# RULES
+"TEXT filter/filter -> filter" forall p q t.
+    filter p (filter q t) = filter (\c -> p c && q c) t
+#-}
 
 -- | /O(n+m)/ Find the first instance of @needle@ (which must be
 -- non-'null') in @haystack@.  The first element of the returned tuple
@@ -1532,7 +1874,7 @@ filter p t = unstream (S.filter p (stream t))
 --
 -- In (unlikely) bad cases, this function's time complexity degrades
 -- towards /O(n*m)/.
-breakOn :: Text -> Text -> (Text, Text)
+breakOn :: HasCallStack => Text -> Text -> (Text, Text)
 breakOn pat src@(Text arr off len)
     | null pat  = emptyError "breakOn"
     | otherwise = case indices pat src of
@@ -1549,7 +1891,7 @@ breakOn pat src@(Text arr off len)
 --
 -- >>> breakOnEnd "::" "a::b::c"
 -- ("a::b::","c")
-breakOnEnd :: Text -> Text -> (Text, Text)
+breakOnEnd :: HasCallStack => Text -> Text -> (Text, Text)
 breakOnEnd pat src = (reverse b, reverse a)
     where (a,b) = breakOn (reverse pat) (reverse src)
 {-# INLINE breakOnEnd #-}
@@ -1573,7 +1915,8 @@ breakOnEnd pat src = (reverse b, reverse a)
 -- towards /O(n*m)/.
 --
 -- The @needle@ parameter may not be empty.
-breakOnAll :: Text              -- ^ @needle@ to search for
+breakOnAll :: HasCallStack
+           => Text              -- ^ @needle@ to search for
            -> Text              -- ^ @haystack@ in which to search
            -> [(Text, Text)]
 breakOnAll pat src@(Text arr off slen)
@@ -1603,14 +1946,14 @@ breakOnAll pat src@(Text arr off slen)
 -- searching for the index of @\"::\"@ and taking the substrings
 -- before and after that index, you would instead use @breakOnAll \"::\"@.
 
--- | /O(n)/ 'Text' index (subscript) operator, starting from 0. Subject to fusion.
-index :: Text -> Int -> Char
+-- | /O(n)/ 'Text' index (subscript) operator, starting from 0.
+index :: HasCallStack => Text -> Int -> Char
 index t n = S.index (stream t) n
 {-# INLINE index #-}
 
 -- | /O(n)/ The 'findIndex' function takes a predicate and a 'Text'
 -- and returns the index of the first element in the 'Text' satisfying
--- the predicate. Subject to fusion.
+-- the predicate.
 findIndex :: (Char -> Bool) -> Text -> Maybe Int
 findIndex p t = S.findIndex p (stream t)
 {-# INLINE findIndex #-}
@@ -1621,11 +1964,11 @@ findIndex p t = S.findIndex p (stream t)
 --
 -- In (unlikely) bad cases, this function's time complexity degrades
 -- towards /O(n*m)/.
-count :: Text -> Text -> Int
-count pat src
+count :: HasCallStack => Text -> Text -> Int
+count pat
     | null pat        = emptyError "count"
-    | isSingleton pat = countChar (unsafeHead pat) src
-    | otherwise       = L.length (indices pat src)
+    | isSingleton pat = countChar (unsafeHead pat)
+    | otherwise       = L.length . indices pat
 {-# INLINE [1] count #-}
 
 {-# RULES
@@ -1634,7 +1977,7 @@ count pat src
   #-}
 
 -- | /O(n)/ The 'countChar' function returns the number of times the
--- query element appears in the given 'Text'. Subject to fusion.
+-- query element appears in the given 'Text'.
 countChar :: Char -> Text -> Int
 countChar c t = S.countChar c (stream t)
 {-# INLINE countChar #-}
@@ -1656,61 +1999,71 @@ zip a b = S.unstreamList $ S.zipWith (,) (stream a) (stream b)
 zipWith :: (Char -> Char -> Char) -> Text -> Text -> Text
 zipWith f t1 t2 = unstream (S.zipWith g (stream t1) (stream t2))
     where g a b = safe (f a b)
-{-# INLINE zipWith #-}
+{-# INLINE [1] zipWith #-}
 
 -- | /O(n)/ Breaks a 'Text' up into a list of words, delimited by 'Char's
 -- representing white space.
 words :: Text -> [Text]
-words t@(Text arr off len) = loop 0 0
+words (Text arr off len) = loop 0 0
   where
     loop !start !n
         | n >= len = if start == n
                      then []
-                     else [Text arr (start+off) (n-start)]
-        | isSpace c =
+                     else [Text arr (start + off) (n - start)]
+        -- Spaces in UTF-8 take either 1 byte for 0x09..0x0D + 0x20
+        | isAsciiSpace w0 =
             if start == n
-            then loop (start+1) (start+1)
-            else Text arr (start+off) (n-start) : loop (n+d) (n+d)
-        | otherwise = loop start (n+d)
-        where Iter c d = iter t n
+            then loop (n + 1) (n + 1)
+            else Text arr (start + off) (n - start) : loop (n + 1) (n + 1)
+        | w0 < 0x80 = loop start (n + 1)
+        -- or 2 bytes for 0xA0
+        | w0 == 0xC2, w1 == 0xA0 =
+            if start == n
+            then loop (n + 2) (n + 2)
+            else Text arr (start + off) (n - start) : loop (n + 2) (n + 2)
+        | w0 < 0xE0 = loop start (n + 2)
+        -- or 3 bytes for 0x1680 + 0x2000..0x200A + 0x2028..0x2029 + 0x202F + 0x205F + 0x3000
+        |  w0 == 0xE1 && w1 == 0x9A && w2 == 0x80
+        || w0 == 0xE2 && (w1 == 0x80 && Char.isSpace (chr3 w0 w1 w2) || w1 == 0x81 && w2 == 0x9F)
+        || w0 == 0xE3 && w1 == 0x80 && w2 == 0x80 =
+            if start == n
+            then loop (n + 3) (n + 3)
+            else Text arr (start + off) (n - start) : loop (n + 3) (n + 3)
+        | otherwise = loop start (n + utf8LengthByLeader w0)
+        where
+            w0 = A.unsafeIndex arr (off + n)
+            w1 = A.unsafeIndex arr (off + n + 1)
+            w2 = A.unsafeIndex arr (off + n + 2)
 {-# INLINE words #-}
 
--- | /O(n)/ Breaks a 'Text' up into a list of 'Text's at
--- newline 'Char's. The resulting strings do not contain newlines.
+-- Adapted from Data.ByteString.Internal.isSpaceWord8
+isAsciiSpace :: Word8 -> Bool
+isAsciiSpace w = w .&. 0x50 == 0 && w < 0x80 && (w == 0x20 || w - 0x09 < 5)
+{-# INLINE isAsciiSpace #-}
+
+-- | /O(n)/ Breaks a 'Text' up into a list of 'Text's at newline characters
+-- @'\\n'@ (LF, line feed). The resulting strings do not contain newlines.
+--
+-- 'lines' __does not__ treat @'\\r'@ (CR, carriage return) as a newline character.
 lines :: Text -> [Text]
-lines ps | null ps   = []
-         | otherwise = h : if null t
-                           then []
-                           else lines (unsafeTail t)
-    where (# h,t #) = span_ (/= '\n') ps
+lines (Text arr@(A.ByteArray arr#) off len) = go off
+  where
+    go !n
+      | n >= len + off = []
+      | delta < 0 = [Text arr n (len + off - n)]
+      | otherwise = Text arr n delta : go (n + delta + 1)
+      where
+        delta = cSsizeToInt $
+          memchr arr# (intToCSize n) (intToCSize (len + off - n)) 0x0A
 {-# INLINE lines #-}
 
-{-
--- | /O(n)/ Portably breaks a 'Text' up into a list of 'Text's at line
--- boundaries.
---
--- A line boundary is considered to be either a line feed, a carriage
--- return immediately followed by a line feed, or a carriage return.
--- This accounts for both Unix and Windows line ending conventions,
--- and for the old convention used on Mac OS 9 and earlier.
-lines' :: Text -> [Text]
-lines' ps | null ps   = []
-          | otherwise = h : case uncons t of
-                              Nothing -> []
-                              Just (c,t')
-                                  | c == '\n' -> lines t'
-                                  | c == '\r' -> case uncons t' of
-                                                   Just ('\n',t'') -> lines t''
-                                                   _               -> lines t'
-    where (h,t)    = span notEOL ps
-          notEOL c = c /= '\n' && c /= '\r'
-{-# INLINE lines' #-}
--}
+foreign import ccall unsafe "_hs_text_memchr" memchr
+    :: ByteArray# -> CSize -> CSize -> Word8 -> CSsize
 
 -- | /O(n)/ Joins lines, after appending a terminating newline to
 -- each.
 unlines :: [Text] -> Text
-unlines = concat . L.map (`snoc` '\n')
+unlines = concat . L.foldr (\t acc -> t : singleton '\n' : acc) []
 {-# INLINE unlines #-}
 
 -- | /O(n)/ Joins words using single space characters.
@@ -1719,19 +2072,14 @@ unwords = intercalate (singleton ' ')
 {-# INLINE unwords #-}
 
 -- | /O(n)/ The 'isPrefixOf' function takes two 'Text's and returns
--- 'True' iff the first is a prefix of the second.  Subject to fusion.
+-- 'True' if and only if the first is a prefix of the second.
 isPrefixOf :: Text -> Text -> Bool
 isPrefixOf a@(Text _ _ alen) b@(Text _ _ blen) =
     alen <= blen && S.isPrefixOf (stream a) (stream b)
 {-# INLINE [1] isPrefixOf #-}
 
-{-# RULES
-"TEXT isPrefixOf -> fused" [~1] forall s t.
-    isPrefixOf s t = S.isPrefixOf (stream s) (stream t)
-  #-}
-
 -- | /O(n)/ The 'isSuffixOf' function takes two 'Text's and returns
--- 'True' iff the first is a suffix of the second.
+-- 'True' if and only if the first is a suffix of the second.
 isSuffixOf :: Text -> Text -> Bool
 isSuffixOf a@(Text _aarr _aoff alen) b@(Text barr boff blen) =
     d >= 0 && a == b'
@@ -1741,7 +2089,7 @@ isSuffixOf a@(Text _aarr _aoff alen) b@(Text barr boff blen) =
 {-# INLINE isSuffixOf #-}
 
 -- | /O(n+m)/ The 'isInfixOf' function takes two 'Text's and returns
--- 'True' iff the first is contained, wholly and intact, anywhere
+-- 'True' if and only if the first is contained, wholly and intact, anywhere
 -- within the second.
 --
 -- In (unlikely) bad cases, this function's time complexity degrades
@@ -1756,11 +2104,6 @@ isInfixOf needle haystack
     | isSingleton needle = S.elem (unsafeHead needle) . S.stream $ haystack
     | otherwise          = not . L.null . indices needle $ haystack
 {-# INLINE [1] isInfixOf #-}
-
-{-# RULES
-"TEXT isInfixOf/singleton -> S.elem/S.stream" [~1] forall n h.
-    isInfixOf (singleton n) h = S.elem n (S.stream h)
-  #-}
 
 -------------------------------------------------------------------------------
 -- * View patterns
@@ -1810,16 +2153,26 @@ stripPrefix p@(Text _arr _off plen) t@(Text arr off len)
 --
 -- >>> commonPrefixes "" "baz"
 -- Nothing
-commonPrefixes :: Text -> Text -> Maybe (Text,Text,Text)
-commonPrefixes t0@(Text arr0 off0 len0) t1@(Text arr1 off1 len1) = go 0 0
+commonPrefixes :: Text -> Text -> Maybe (Text, Text, Text)
+commonPrefixes !t0@(Text arr0 off0 len0) !t1@(Text arr1 off1 len1)
+  | len0 == 0 = Nothing
+  | len1 == 0 = Nothing
+  | otherwise = go 0 0
   where
-    go !i !j | i < len0 && j < len1 && a == b = go (i+d0) (j+d1)
-             | i > 0     = Just (Text arr0 off0 i,
-                                 text arr0 (off0+i) (len0-i),
-                                 text arr1 (off1+j) (len1-j))
-             | otherwise = Nothing
-      where Iter a d0 = iter t0 i
-            Iter b d1 = iter t1 j
+    go !i !j
+      | i == len0 = Just (t0, empty, text arr1 (off1 + i) (len1 - i))
+      | i == len1 = Just (t1, text arr0 (off0 + i) (len0 - i), empty)
+      | a == b = go (i + 1) k
+      | k > 0 = Just (Text arr0 off0 k,
+                      Text arr0 (off0 + k) (len0 - k),
+                      Text arr1 (off1 + k) (len1 - k))
+      | otherwise = Nothing
+      where
+        a = A.unsafeIndex arr0 (off0 + i)
+        b = A.unsafeIndex arr1 (off1 + i)
+        isLeader = word8ToInt8 a >= -64
+        k = if isLeader then i else j
+{-# INLINE commonPrefixes #-}
 
 -- | /O(n)/ Return the prefix of the second string if its suffix
 -- matches the entire first string.
@@ -1858,10 +2211,10 @@ sumP fun = go 0
           where ax = a + x
         go a  _         = a
 
-emptyError :: String -> a
+emptyError :: HasCallStack => String -> a
 emptyError fun = P.error $ "Data.Text." ++ fun ++ ": empty input"
 
-overflowError :: String -> a
+overflowError :: HasCallStack => String -> a
 overflowError fun = P.error $ "Data.Text." ++ fun ++ ": size overflow"
 
 -- | /O(n)/ Make a distinct copy of the given string, sharing no
@@ -1878,9 +2231,20 @@ copy (Text arr off len) = Text (A.run go) 0 len
     go :: ST s (A.MArray s)
     go = do
       marr <- A.new len
-      A.copyI marr 0 arr off len
+      A.copyI len marr 0 arr off
       return marr
 
+ord8 :: Char -> Word8
+ord8 = P.fromIntegral . Char.ord
+
+intToCSize :: Int -> CSize
+intToCSize = P.fromIntegral
+
+cSsizeToInt :: CSsize -> Int
+cSsizeToInt = P.fromIntegral
+
+word8ToInt8 :: Word8 -> Int8
+word8ToInt8 = P.fromIntegral
 
 -------------------------------------------------
 -- NOTE: the named chunk below used by doctest;

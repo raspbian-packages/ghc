@@ -1,5 +1,4 @@
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE LambdaCase #-}
+
 
 {-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 
@@ -15,44 +14,47 @@ module GHC.Iface.Rename (
     tcRnModExports,
     ) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
-import GHC.Types.SrcLoc
-import GHC.Utils.Outputable
-import GHC.Driver.Types
+import GHC.Driver.Env
+
+import GHC.Tc.Utils.Monad
+
+import GHC.Iface.Syntax
+import GHC.Iface.Env
+import {-# SOURCE #-} GHC.Iface.Load -- a bit vexing
+
 import GHC.Unit
+import GHC.Unit.Module.ModIface
+import GHC.Unit.Module.Deps
+
+import GHC.Tc.Errors.Types
+import GHC.Types.SrcLoc
 import GHC.Types.Unique.FM
 import GHC.Types.Avail
-import GHC.Iface.Syntax
+import GHC.Types.Error
 import GHC.Types.FieldLabel
 import GHC.Types.Var
-import GHC.Utils.Error
-
-import GHC.Types.Name
-import GHC.Tc.Utils.Monad
-import GHC.Utils.Misc
-import GHC.Utils.Fingerprint
 import GHC.Types.Basic
+import GHC.Types.Name
+import GHC.Types.Name.Shape
 
--- a bit vexing
-import {-# SOURCE #-} GHC.Iface.Load
-import GHC.Driver.Session
+import GHC.Utils.Outputable
+import GHC.Utils.Misc
+import GHC.Utils.Error
+import GHC.Utils.Fingerprint
+import GHC.Utils.Panic
 
 import qualified Data.Traversable as T
 
-import GHC.Data.Bag
 import Data.IORef
-import GHC.Types.Name.Shape
-import GHC.Iface.Env
 
-tcRnMsgMaybe :: IO (Either ErrorMessages a) -> TcM a
+tcRnMsgMaybe :: IO (Either (Messages TcRnMessage) a) -> TcM a
 tcRnMsgMaybe do_this = do
     r <- liftIO $ do_this
     case r of
-        Left errs -> do
-            addMessages (emptyBag, errs)
+        Left msgs -> do
+            addMessages msgs
             failM
         Right x -> return x
 
@@ -66,13 +68,13 @@ tcRnModExports x y = do
     hsc_env <- getTopEnv
     tcRnMsgMaybe $ rnModExports hsc_env x y
 
-failWithRn :: SDoc -> ShIfM a
-failWithRn doc = do
+failWithRn :: TcRnMessage -> ShIfM a
+failWithRn tcRnMessage = do
     errs_var <- fmap sh_if_errs getGblEnv
-    dflags <- getDynFlags
     errs <- readTcRef errs_var
     -- TODO: maybe associate this with a source location?
-    writeTcRef errs_var (errs `snocBag` mkPlainErrMsg dflags noSrcSpan doc)
+    let msg = mkPlainErrorMsgEnvelope noSrcSpan tcRnMessage
+    writeTcRef errs_var (msg `addMessage` errs)
     failM
 
 -- | What we have is a generalized ModIface, which corresponds to
@@ -96,8 +98,8 @@ failWithRn doc = do
 -- should be Foo.T; then we'll also rename this (this is used
 -- when loading an interface to merge it into a requirement.)
 rnModIface :: HscEnv -> [(ModuleName, Module)] -> Maybe NameShape
-           -> ModIface -> IO (Either ErrorMessages ModIface)
-rnModIface hsc_env insts nsubst iface = do
+           -> ModIface -> IO (Either (Messages TcRnMessage) ModIface)
+rnModIface hsc_env insts nsubst iface =
     initRnIface hsc_env iface insts nsubst $ do
         mod <- rnModule (mi_module iface)
         sig_of <- case mi_sig_of iface of
@@ -120,26 +122,24 @@ rnModIface hsc_env insts nsubst iface = do
 
 -- | Rename just the exports of a 'ModIface'.  Useful when we're doing
 -- shaping prior to signature merging.
-rnModExports :: HscEnv -> [(ModuleName, Module)] -> ModIface -> IO (Either ErrorMessages [AvailInfo])
+rnModExports :: HscEnv -> [(ModuleName, Module)] -> ModIface -> IO (Either (Messages TcRnMessage) [AvailInfo])
 rnModExports hsc_env insts iface
     = initRnIface hsc_env iface insts Nothing
     $ mapM rnAvailInfo (mi_exports iface)
 
 rnDependencies :: Rename Dependencies
-rnDependencies deps = do
-    orphs  <- rnDepModules dep_orphs deps
-    finsts <- rnDepModules dep_finsts deps
-    return deps { dep_orphs = orphs, dep_finsts = finsts }
+rnDependencies deps0 = do
+    deps1  <- dep_orphs_update deps0 (rnDepModules dep_orphs)
+    dep_finsts_update deps1 (rnDepModules dep_finsts)
 
-rnDepModules :: (Dependencies -> [Module]) -> Dependencies -> ShIfM [Module]
-rnDepModules sel deps = do
+rnDepModules :: (Dependencies -> [Module]) -> [Module] -> ShIfM [Module]
+rnDepModules sel mods = do
     hsc_env <- getTopEnv
     hmap <- getHoleSubst
     -- NB: It's not necessary to test if we're doing signature renaming,
     -- because ModIface will never contain module reference for itself
     -- in these dependencies.
-    fmap (nubSort . concat) . T.forM (sel deps) $ \mod -> do
-        dflags <- getDynFlags
+    fmap (nubSort . concat) . T.forM mods $ \mod -> do
         -- For holes, its necessary to "see through" the instantiation
         -- of the hole to get accurate family instance dependencies.
         -- For example, if B imports <A>, and <A> is instantiated with
@@ -164,7 +164,7 @@ rnDepModules sel deps = do
         -- not to do it in this case either...)
         --
         -- This mistake was bug #15594.
-        let mod' = renameHoleModule (unitState dflags) hmap mod
+        let mod' = renameHoleModule (hsc_units hsc_env) hmap mod
         if isHoleModule mod
           then do iface <- liftIO . initIfaceCheck (text "rnDepModule") hsc_env
                                   $ loadSysInterface (text "rnDepModule") mod'
@@ -181,12 +181,11 @@ rnDepModules sel deps = do
 
 -- | Run a computation in the 'ShIfM' monad.
 initRnIface :: HscEnv -> ModIface -> [(ModuleName, Module)] -> Maybe NameShape
-            -> ShIfM a -> IO (Either ErrorMessages a)
+            -> ShIfM a -> IO (Either (Messages TcRnMessage) a)
 initRnIface hsc_env iface insts nsubst do_this = do
-    errs_var <- newIORef emptyBag
-    let dflags = hsc_dflags hsc_env
-        hsubst = listToUFM insts
-        rn_mod = renameHoleModule (unitState dflags) hsubst
+    errs_var <- newIORef emptyMessages
+    let hsubst = listToUFM insts
+        rn_mod = renameHoleModule (hsc_units hsc_env) hsubst
         env = ShIfEnv {
             sh_if_module = rn_mod (mi_module iface),
             sh_if_semantic_module = rn_mod (mi_semantic_module iface),
@@ -198,9 +197,9 @@ initRnIface hsc_env iface insts nsubst do_this = do
     res <- initTcRnIf 'c' hsc_env env () $ tryM do_this
     msgs <- readIORef errs_var
     case res of
-        Left _                          -> return (Left msgs)
-        Right r | not (isEmptyBag msgs) -> return (Left msgs)
-                | otherwise             -> return (Right r)
+        Left _                               -> return (Left msgs)
+        Right r | not (isEmptyMessages msgs) -> return (Left msgs)
+                | otherwise                  -> return (Right r)
 
 -- | Environment for 'ShIfM' monads.
 data ShIfEnv = ShIfEnv {
@@ -218,8 +217,8 @@ data ShIfEnv = ShIfEnv {
         -- we just load the target interface and look at the export
         -- list to determine the renaming.
         sh_if_shape :: Maybe NameShape,
-        -- Mutable reference to keep track of errors (similar to 'tcl_errs')
-        sh_if_errs :: IORef ErrorMessages
+        -- Mutable reference to keep track of diagnostics (similar to 'tcl_errs')
+        sh_if_errs :: IORef (Messages TcRnMessage)
     }
 
 getHoleSubst :: ShIfM ShHoleSubst
@@ -232,29 +231,35 @@ type Rename a = a -> ShIfM a
 rnModule :: Rename Module
 rnModule mod = do
     hmap <- getHoleSubst
-    dflags <- getDynFlags
-    return (renameHoleModule (unitState dflags) hmap mod)
+    unit_state <- hsc_units <$> getTopEnv
+    return (renameHoleModule unit_state hmap mod)
 
 rnAvailInfo :: Rename AvailInfo
-rnAvailInfo (Avail n) = Avail <$> rnIfaceGlobal n
-rnAvailInfo (AvailTC n ns fs) = do
+rnAvailInfo (Avail c) = Avail <$> rnGreName c
+rnAvailInfo (AvailTC n ns) = do
     -- Why don't we rnIfaceGlobal the availName itself?  It may not
     -- actually be exported by the module it putatively is from, in
     -- which case we won't be able to tell what the name actually
     -- is.  But for the availNames they MUST be exported, so they
     -- will rename fine.
-    ns' <- mapM rnIfaceGlobal ns
-    fs' <- mapM rnFieldLabel fs
-    case ns' ++ map flSelector fs' of
+    ns' <- mapM rnGreName ns
+    case ns' of
         [] -> panic "rnAvailInfoEmpty AvailInfo"
-        (rep:rest) -> ASSERT2( all ((== nameModule rep) . nameModule) rest, ppr rep $$ hcat (map ppr rest) ) do
-                         n' <- setNameModule (Just (nameModule rep)) n
-                         return (AvailTC n' ns' fs')
+        (rep:rest) -> assertPpr (all ((== childModule rep) . childModule) rest)
+                                (ppr rep $$ hcat (map ppr rest)) $ do
+                         n' <- setNameModule (Just (childModule rep)) n
+                         return (AvailTC n' ns')
+  where
+    childModule = nameModule . greNameMangledName
+
+rnGreName :: Rename GreName
+rnGreName (NormalGreName n) = NormalGreName <$> rnIfaceGlobal n
+rnGreName (FieldGreName fl) = FieldGreName  <$> rnFieldLabel fl
 
 rnFieldLabel :: Rename FieldLabel
-rnFieldLabel (FieldLabel l b sel) = do
-    sel' <- rnIfaceGlobal sel
-    return (FieldLabel l b sel')
+rnFieldLabel fl = do
+    sel' <- rnIfaceGlobal (flSelector fl)
+    return (fl { flSelector = sel' })
 
 
 
@@ -297,12 +302,13 @@ rnFieldLabel (FieldLabel l b sel) = do
 rnIfaceGlobal :: Name -> ShIfM Name
 rnIfaceGlobal n = do
     hsc_env <- getTopEnv
-    let dflags = hsc_dflags hsc_env
+    let unit_state = hsc_units hsc_env
+        home_unit  = hsc_home_unit hsc_env
     iface_semantic_mod <- fmap sh_if_semantic_module getGblEnv
     mb_nsubst <- fmap sh_if_shape getGblEnv
     hmap <- getHoleSubst
     let m = nameModule n
-        m' = renameHoleModule (unitState dflags) hmap m
+        m' = renameHoleModule unit_state hmap m
     case () of
        -- Did we encounter {A.T} while renaming p[A=<B>]:A? If so,
        -- do NOT assume B.hi is available.
@@ -320,11 +326,8 @@ rnIfaceGlobal n = do
                         -- TODO: This will give an unpleasant message if n'
                         -- is a constructor; then we'll suggest adding T
                         -- but it won't work.
-                        Nothing -> failWithRn $ vcat [
-                            text "The identifier" <+> ppr (occName n') <+>
-                                text "does not exist in the local signature.",
-                            parens (text "Try adding it to the export list of the hsig file.")
-                            ]
+                        Nothing ->
+                          failWithRn $ TcRnIdNotExportedFromLocalSig n'
                         Just n'' -> return n''
        -- Fastpath: we are renaming p[H=<H>]:A.T, in which case the
        -- export list is irrelevant.
@@ -341,18 +344,14 @@ rnIfaceGlobal n = do
             -- went from <A> to <B>.
             let m'' = if isHoleModule m'
                         -- Pull out the local guy!!
-                        then mkHomeModule dflags (moduleName m')
+                        then mkHomeModule home_unit (moduleName m')
                         else m'
             iface <- liftIO . initIfaceCheck (text "rnIfaceGlobal") hsc_env
                             $ loadSysInterface (text "rnIfaceGlobal") m''
             let nsubst = mkNameShape (moduleName m) (mi_exports iface)
             case maybeSubstNameShape nsubst n of
-                Nothing -> failWithRn $ vcat [
-                    text "The identifier" <+> ppr (occName n) <+>
-                        -- NB: report m' because it's more user-friendly
-                        text "does not exist in the signature for" <+> ppr m',
-                    parens (text "Try adding it to the export list in that hsig file.")
-                    ]
+                -- NB: report m' because it's more user-friendly
+                Nothing -> failWithRn $ TcRnIdNotExportedFromModuleSig n m'
                 Just n' -> return n'
 
 -- | Rename an implicit name, e.g., a DFun or coercion axiom.
@@ -361,11 +360,11 @@ rnIfaceGlobal n = do
 rnIfaceNeverExported :: Name -> ShIfM Name
 rnIfaceNeverExported name = do
     hmap <- getHoleSubst
-    dflags <- getDynFlags
+    unit_state <- hsc_units <$> getTopEnv
     iface_semantic_mod <- fmap sh_if_semantic_module getGblEnv
-    let m = renameHoleModule (unitState dflags) hmap $ nameModule name
+    let m = renameHoleModule unit_state hmap $ nameModule name
     -- Doublecheck that this DFun/coercion axiom was, indeed, locally defined.
-    MASSERT2( iface_semantic_mod == m, ppr iface_semantic_mod <+> ppr m )
+    massertPpr (iface_semantic_mod == m) (ppr iface_semantic_mod <+> ppr m)
     setNameModule (Just m) name
 
 -- Note [rnIfaceNeverExported]
@@ -406,7 +405,7 @@ rnIfaceNeverExported name = do
 rnIfaceClsInst :: Rename IfaceClsInst
 rnIfaceClsInst cls_inst = do
     n <- rnIfaceGlobal (ifInstCls cls_inst)
-    tys <- mapM rnMaybeIfaceTyCon (ifInstTys cls_inst)
+    tys <- mapM rnRoughMatchTyCon (ifInstTys cls_inst)
 
     dfun <- rnIfaceNeverExported (ifDFun cls_inst)
     return cls_inst { ifInstCls = n
@@ -414,14 +413,14 @@ rnIfaceClsInst cls_inst = do
                     , ifDFun = dfun
                     }
 
-rnMaybeIfaceTyCon :: Rename (Maybe IfaceTyCon)
-rnMaybeIfaceTyCon Nothing = return Nothing
-rnMaybeIfaceTyCon (Just tc) = Just <$> rnIfaceTyCon tc
+rnRoughMatchTyCon :: Rename (Maybe IfaceTyCon)
+rnRoughMatchTyCon Nothing = return Nothing
+rnRoughMatchTyCon (Just tc) = Just <$> rnIfaceTyCon tc
 
 rnIfaceFamInst :: Rename IfaceFamInst
 rnIfaceFamInst d = do
     fam <- rnIfaceGlobal (ifFamInstFam d)
-    tys <- mapM rnMaybeIfaceTyCon (ifFamInstTys d)
+    tys <- mapM rnRoughMatchTyCon (ifFamInstTys d)
     axiom <- rnIfaceGlobal (ifFamInstAxiom d)
     return d { ifFamInstFam = fam, ifFamInstTys = tys, ifFamInstAxiom = axiom }
 
@@ -601,8 +600,8 @@ rnIfaceInfoItem i
     = pure i
 
 rnIfaceUnfolding :: Rename IfaceUnfolding
-rnIfaceUnfolding (IfCoreUnfold stable if_expr)
-    = IfCoreUnfold stable <$> rnIfaceExpr if_expr
+rnIfaceUnfolding (IfCoreUnfold stable cache if_expr)
+    = IfCoreUnfold stable cache <$> rnIfaceExpr if_expr
 rnIfaceUnfolding (IfCompulsory if_expr)
     = IfCompulsory <$> rnIfaceExpr if_expr
 rnIfaceUnfolding (IfInlineRule arity unsat_ok boring_ok if_expr)
@@ -636,8 +635,9 @@ rnIfaceExpr (IfaceLet (IfaceRec pairs) body)
                <*> rnIfaceExpr body
 rnIfaceExpr (IfaceCast expr co)
     = IfaceCast <$> rnIfaceExpr expr <*> rnIfaceCo co
-rnIfaceExpr (IfaceLit lit) = pure (IfaceLit lit)
-rnIfaceExpr (IfaceFCall cc ty) = IfaceFCall cc <$> rnIfaceType ty
+rnIfaceExpr (IfaceLit lit)           = pure (IfaceLit lit)
+rnIfaceExpr (IfaceLitRubbish rep)    = IfaceLitRubbish <$> rnIfaceType rep
+rnIfaceExpr (IfaceFCall cc ty)       = IfaceFCall cc <$> rnIfaceType ty
 rnIfaceExpr (IfaceTick tickish expr) = IfaceTick tickish <$> rnIfaceExpr expr
 
 rnIfaceBndrs :: Rename [IfaceBndr]
@@ -654,8 +654,8 @@ rnIfaceTyConBinder :: Rename IfaceTyConBinder
 rnIfaceTyConBinder (Bndr tv vis) = Bndr <$> rnIfaceBndr tv <*> pure vis
 
 rnIfaceAlt :: Rename IfaceAlt
-rnIfaceAlt (conalt, names, rhs)
-     = (,,) <$> rnIfaceConAlt conalt <*> pure names <*> rnIfaceExpr rhs
+rnIfaceAlt (IfaceAlt conalt names rhs)
+     = IfaceAlt <$> rnIfaceConAlt conalt <*> pure names <*> rnIfaceExpr rhs
 
 rnIfaceConAlt :: Rename IfaceConAlt
 rnIfaceConAlt (IfaceDataAlt data_occ) = IfaceDataAlt <$> rnIfaceGlobal data_occ

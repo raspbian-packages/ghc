@@ -1,11 +1,10 @@
+{-# LANGUAGE TypeFamilies #-}
+
 {-
 (c) The University of Glasgow 2006
 (c) The AQUA Project, Glasgow University, 1993-1998
 
 -}
-
-{-# LANGUAGE ViewPatterns #-}
-{-# LANGUAGE TypeFamilies #-}
 
 -- | Typechecking rewrite rules
 module GHC.Tc.Gen.Rule ( tcRules ) where
@@ -16,6 +15,7 @@ import GHC.Hs
 import GHC.Tc.Types
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Solver
+import GHC.Tc.Solver.Monad ( runTcS )
 import GHC.Tc.Types.Constraint
 import GHC.Core.Predicate
 import GHC.Tc.Types.Origin
@@ -29,11 +29,12 @@ import GHC.Tc.Types.Evidence( mkTcCoVarCo )
 import GHC.Core.Type
 import GHC.Core.TyCon( isTypeFamilyTyCon )
 import GHC.Types.Id
-import GHC.Types.Var( EvVar )
+import GHC.Types.Var( EvVar, tyVarName )
 import GHC.Types.Var.Set
-import GHC.Types.Basic ( RuleName )
+import GHC.Types.Basic ( RuleName, NonStandardDefaultingStrategy(..) )
 import GHC.Types.SrcLoc
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
 import GHC.Data.FastString
 import GHC.Data.Bag
 
@@ -99,12 +100,12 @@ equation.
 -}
 
 tcRules :: [LRuleDecls GhcRn] -> TcM [LRuleDecls GhcTc]
-tcRules decls = mapM (wrapLocM tcRuleDecls) decls
+tcRules decls = mapM (wrapLocMA tcRuleDecls) decls
 
 tcRuleDecls :: RuleDecls GhcRn -> TcM (RuleDecls GhcTc)
 tcRuleDecls (HsRules { rds_src = src
                      , rds_rules = decls })
-   = do { tc_decls <- mapM (wrapLocM tcRule) decls
+   = do { tc_decls <- mapM (wrapLocMA tcRule) decls
         ; return $ HsRules { rds_ext   = noExtField
                            , rds_src   = src
                            , rds_rules = tc_decls } }
@@ -119,10 +120,10 @@ tcRule (HsRule { rd_ext  = ext
                , rd_rhs  = rhs })
   = addErrCtxt (ruleCtxt name)  $
     do { traceTc "---- Rule ------" (pprFullRuleName rname)
-
+       ; skol_info <- mkSkolemInfo (RuleSkol name)
         -- Note [Typechecking rules]
        ; (tc_lvl, stuff) <- pushTcLevelM $
-                            generateRuleConstraints ty_bndrs tm_bndrs lhs rhs
+                            generateRuleConstraints name ty_bndrs tm_bndrs lhs rhs
 
        ; let (id_bndrs, lhs', lhs_wanted
                       , rhs', rhs_wanted, rule_ty) = stuff
@@ -134,7 +135,7 @@ tcRule (HsRule { rd_ext  = ext
        ; (lhs_evs, residual_lhs_wanted)
             <- simplifyRule name tc_lvl lhs_wanted rhs_wanted
 
-       -- SimplfyRule Plan, step 4
+       -- SimplifyRule Plan, step 4
        -- Now figure out what to quantify over
        -- c.f. GHC.Tc.Solver.simplifyInfer
        -- We quantify over any tyvars free in *either* the rule
@@ -151,11 +152,20 @@ tcRule (HsRule { rd_ext  = ext
 
        -- See Note [Re-quantify type variables in rules]
        ; forall_tkvs <- candidateQTyVarsOfTypes (rule_ty : map idType tpl_ids)
-       ; qtkvs <- quantifyTyVars forall_tkvs
+       ; let don't_default = nonDefaultableTyVarsOfWC residual_lhs_wanted
+       ; let weed_out = (`dVarSetMinusVarSet` don't_default)
+             quant_cands = forall_tkvs { dv_kvs = weed_out (dv_kvs forall_tkvs)
+                                       , dv_tvs = weed_out (dv_tvs forall_tkvs) }
+       ; qtkvs <- quantifyTyVars skol_info DefaultNonStandardTyVars quant_cands
        ; traceTc "tcRule" (vcat [ pprFullRuleName rname
-                                , ppr forall_tkvs
-                                , ppr qtkvs
-                                , ppr rule_ty
+                                , text "forall_tkvs:" <+> ppr forall_tkvs
+                                , text "quant_cands:" <+> ppr quant_cands
+                                , text "don't_default:" <+> ppr don't_default
+                                , text "residual_lhs_wanted:" <+> ppr residual_lhs_wanted
+                                , text "qtkvs:" <+> ppr qtkvs
+                                , text "rule_ty:" <+> ppr rule_ty
+                                , text "ty_bndrs:" <+> ppr ty_bndrs
+                                , text "qtkvs ++ tpl_ids:" <+> ppr (qtkvs ++ tpl_ids)
                                 , vcat [ ppr id <+> dcolon <+> ppr (idType id) | id <- tpl_ids ]
                   ])
 
@@ -164,37 +174,35 @@ tcRule (HsRule { rd_ext  = ext
        -- For the LHS constraints we must solve the remaining constraints
        -- (a) so that we report insoluble ones
        -- (b) so that we bind any soluble ones
-       ; let skol_info = RuleSkol name
-       ; (lhs_implic, lhs_binds) <- buildImplicationFor tc_lvl skol_info qtkvs
+       ; (lhs_implic, lhs_binds) <- buildImplicationFor tc_lvl (getSkolemInfo skol_info) qtkvs
                                          lhs_evs residual_lhs_wanted
-       ; (rhs_implic, rhs_binds) <- buildImplicationFor tc_lvl skol_info qtkvs
+       ; (rhs_implic, rhs_binds) <- buildImplicationFor tc_lvl (getSkolemInfo skol_info) qtkvs
                                          lhs_evs rhs_wanted
-
        ; emitImplications (lhs_implic `unionBags` rhs_implic)
        ; return $ HsRule { rd_ext = ext
                          , rd_name = rname
                          , rd_act = act
                          , rd_tyvs = ty_bndrs -- preserved for ppr-ing
-                         , rd_tmvs = map (noLoc . RuleBndr noExtField . noLoc)
+                         , rd_tmvs = map (noLocA . RuleBndr noAnn . noLocA)
                                          (qtkvs ++ tpl_ids)
                          , rd_lhs  = mkHsDictLet lhs_binds lhs'
                          , rd_rhs  = mkHsDictLet rhs_binds rhs' } }
 
-generateRuleConstraints :: Maybe [LHsTyVarBndr () GhcRn] -> [LRuleBndr GhcRn]
+generateRuleConstraints :: FastString
+                        -> Maybe [LHsTyVarBndr () GhcRn] -> [LRuleBndr GhcRn]
                         -> LHsExpr GhcRn -> LHsExpr GhcRn
                         -> TcM ( [TcId]
                                , LHsExpr GhcTc, WantedConstraints
                                , LHsExpr GhcTc, WantedConstraints
                                , TcType )
-generateRuleConstraints ty_bndrs tm_bndrs lhs rhs
+generateRuleConstraints rule_name ty_bndrs tm_bndrs lhs rhs
   = do { ((tv_bndrs, id_bndrs), bndr_wanted) <- captureConstraints $
-                                                tcRuleBndrs ty_bndrs tm_bndrs
+                                                tcRuleBndrs rule_name ty_bndrs tm_bndrs
               -- bndr_wanted constraints can include wildcard hole
               -- constraints, which we should not forget about.
               -- It may mention the skolem type variables bound by
               -- the RULE.  c.f. #10072
-
-       ; tcExtendTyVarEnv tv_bndrs $
+       ; tcExtendNameTyVarEnv [(tyVarName tv, tv) | tv <- tv_bndrs] $
          tcExtendIdEnv    id_bndrs $
     do { -- See Note [Solve order for RULES]
          ((lhs', rule_ty), lhs_wanted) <- captureConstraints (tcInferRho lhs)
@@ -204,38 +212,39 @@ generateRuleConstraints ty_bndrs tm_bndrs lhs rhs
        ; return (id_bndrs, lhs', all_lhs_wanted, rhs', rhs_wanted, rule_ty) } }
 
 -- See Note [TcLevel in type checking rules]
-tcRuleBndrs :: Maybe [LHsTyVarBndr () GhcRn] -> [LRuleBndr GhcRn]
+tcRuleBndrs :: FastString -> Maybe [LHsTyVarBndr () GhcRn] -> [LRuleBndr GhcRn]
             -> TcM ([TcTyVar], [Id])
-tcRuleBndrs (Just bndrs) xs
-  = do { (tybndrs1,(tys2,tms)) <- bindExplicitTKBndrs_Skol bndrs $
-                                  tcRuleTmBndrs xs
+tcRuleBndrs rule_name (Just bndrs) xs
+  = do { skol_info <- mkSkolemInfo (RuleSkol rule_name)
+       ; (tybndrs1,(tys2,tms)) <- bindExplicitTKBndrs_Skol skol_info bndrs $
+                                  tcRuleTmBndrs rule_name xs
        ; let tys1 = binderVars tybndrs1
        ; return (tys1 ++ tys2, tms) }
 
-tcRuleBndrs Nothing xs
-  = tcRuleTmBndrs xs
+tcRuleBndrs rule_name Nothing xs
+  = tcRuleTmBndrs rule_name xs
 
 -- See Note [TcLevel in type checking rules]
-tcRuleTmBndrs :: [LRuleBndr GhcRn] -> TcM ([TcTyVar],[Id])
-tcRuleTmBndrs [] = return ([],[])
-tcRuleTmBndrs (L _ (RuleBndr _ (L _ name)) : rule_bndrs)
+tcRuleTmBndrs :: FastString -> [LRuleBndr GhcRn] -> TcM ([TcTyVar],[Id])
+tcRuleTmBndrs _ [] = return ([],[])
+tcRuleTmBndrs rule_name (L _ (RuleBndr _ (L _ name)) : rule_bndrs)
   = do  { ty <- newOpenFlexiTyVarTy
-        ; (tyvars, tmvars) <- tcRuleTmBndrs rule_bndrs
+        ; (tyvars, tmvars) <- tcRuleTmBndrs rule_name rule_bndrs
         ; return (tyvars, mkLocalId name Many ty : tmvars) }
-tcRuleTmBndrs (L _ (RuleBndrSig _ (L _ name) rn_ty) : rule_bndrs)
+tcRuleTmBndrs rule_name (L _ (RuleBndrSig _ (L _ name) rn_ty) : rule_bndrs)
 --  e.g         x :: a->a
 --  The tyvar 'a' is brought into scope first, just as if you'd written
 --              a::*, x :: a->a
 --  If there's an explicit forall, the renamer would have already reported an
 --   error for each out-of-scope type variable used
-  = do  { let ctxt = RuleSigCtxt name
-        ; (_ , tvs, id_ty) <- tcHsPatSigType ctxt rn_ty
+  = do  { let ctxt = RuleSigCtxt rule_name name
+        ; (_ , tvs, id_ty) <- tcHsPatSigType ctxt HM_Sig rn_ty OpenKind
         ; let id  = mkLocalId name Many id_ty
                     -- See Note [Typechecking pattern signature binders] in GHC.Tc.Gen.HsType
 
               -- The type variables scope over subsequent bindings; yuk
         ; (tyvars, tmvars) <- tcExtendNameTyVarEnv tvs $
-                                   tcRuleTmBndrs rule_bndrs
+                                   tcRuleTmBndrs rule_name rule_bndrs
         ; return (map snd tvs ++ tyvars, id : tmvars) }
 
 ruleCtxt :: FastString -> SDoc
@@ -306,8 +315,9 @@ revert to SimplCheck when going under an implication.
 
 * Step 0: typecheck the LHS and RHS to get constraints from each
 
-* Step 1: Simplify the LHS and RHS constraints all together in one bag
-          We do this to discover all unification equalities
+* Step 1: Simplify the LHS and RHS constraints all together in one bag,
+          but /discarding/ the simplified constraints. We do this only
+          to discover all unification equalities.
 
 * Step 2: Zonk the ORIGINAL (unsimplified) LHS constraints, to take
           advantage of those unifications
@@ -402,7 +412,8 @@ simplifyRule name tc_lvl lhs_wanted rhs_wanted
        ; lhs_clone <- cloneWC lhs_wanted
        ; rhs_clone <- cloneWC rhs_wanted
        ; setTcLevel tc_lvl $
-         runTcSDeriveds    $
+         discardResult     $
+         runTcS            $
          do { _ <- solveWanteds lhs_clone
             ; _ <- solveWanteds rhs_clone
                   -- Why do them separately?
@@ -461,9 +472,9 @@ getRuleQuantCts wc
   = float_wc emptyVarSet wc
   where
     float_wc :: TcTyCoVarSet -> WantedConstraints -> (Cts, WantedConstraints)
-    float_wc skol_tvs (WC { wc_simple = simples, wc_impl = implics, wc_holes = holes })
+    float_wc skol_tvs (WC { wc_simple = simples, wc_impl = implics, wc_errors = errs })
       = ( simple_yes `andCts` implic_yes
-        , emptyWC { wc_simple = simple_no, wc_impl = implics_no, wc_holes = holes })
+        , emptyWC { wc_simple = simple_no, wc_impl = implics_no, wc_errors = errs })
      where
         (simple_yes, simple_no) = partitionBag (rule_quant_ct skol_tvs) simples
         (implic_yes, implics_no) = mapAccumBagL (float_implic skol_tvs)
@@ -477,12 +488,11 @@ getRuleQuantCts wc
         new_skol_tvs = skol_tvs `extendVarSetList` ic_skols imp
 
     rule_quant_ct :: TcTyCoVarSet -> Ct -> Bool
-    rule_quant_ct skol_tvs ct
-      | EqPred _ t1 t2 <- classifyPredType (ctPred ct)
-      , not (ok_eq t1 t2)
-       = False        -- Note [RULE quantification over equalities]
-      | otherwise
-      = tyCoVarsOfCt ct `disjointVarSet` skol_tvs
+    rule_quant_ct skol_tvs ct = case classifyPredType (ctPred ct) of
+      EqPred _ t1 t2
+        | not (ok_eq t1 t2)
+        -> False        -- Note [RULE quantification over equalities]
+      _ -> tyCoVarsOfCt ct `disjointVarSet` skol_tvs
 
     ok_eq t1 t2
        | t1 `tcEqType` t2 = False

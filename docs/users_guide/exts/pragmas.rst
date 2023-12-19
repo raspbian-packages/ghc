@@ -14,9 +14,7 @@ Pragmas all take the form ``{-# word ... #-}`` where ⟨word⟩ indicates
 the type of pragma, and is followed optionally by information specific
 to that type of pragma. Case is ignored in ⟨word⟩. The various values
 for ⟨word⟩ that GHC understands are described in the following sections;
-any pragma encountered with an unrecognised ⟨word⟩ is ignored. The
-layout rule applies in pragmas, so the closing ``#-}`` should start in a
-column to the right of the opening ``{-#``.
+any pragma encountered with an unrecognised ⟨word⟩ is ignored.
 
 Certain pragmas are *file-header pragmas*:
 
@@ -218,7 +216,7 @@ These pragmas control the inlining of function definitions.
 
 .. pragma:: INLINE ⟨name⟩
 
-    :where: top-level
+    :where: any function definition
 
     Force GHC to inline a value.
 
@@ -303,15 +301,12 @@ has a number of other effects:
 GHC ensures that inlining cannot go on forever: every mutually-recursive
 group is cut by one or more *loop breakers* that is never inlined (see
 `Secrets of the GHC inliner, JFP 12(4) July
-2002 <http://research.microsoft.com/%7Esimonpj/Papers/inlining/index.htm>`__).
+2002 <https://research.microsoft.com/%7Esimonpj/Papers/inlining/index.htm>`__).
 GHC tries not to select a function with an ``INLINE`` pragma as a loop
 breaker, but when there is no choice even an INLINE function can be
 selected, in which case the ``INLINE`` pragma is ignored. For example, for a
 self-recursive function, the loop breaker can only be the function
 itself, so an ``INLINE`` pragma is always ignored.
-
-Syntactically, an ``INLINE`` pragma for a function can be put anywhere
-its type signature could be put.
 
 ``INLINE`` pragmas are a particularly good idea for the
 ``then``/``return`` (or ``bind``/``unit``) functions in a monad. For
@@ -323,6 +318,44 @@ example, in GHC's own ``UniqueSupply`` monad code, we have: ::
 See also the ``NOINLINE`` (:ref:`noinline-pragma`) and ``INLINABLE``
 (:ref:`inlinable-pragma`) pragmas.
 
+``INLINE`` pragma effects on various locations
+++++++++++++++++++++++++++++++++++++++++++++++
+
+Syntactically, an ``INLINE`` pragma for a function can be put anywhere
+its type signature could be put. This means a ``INLINE`` pragma can really
+be put on any definition site for a binding.
+This includes top-level, ``let`` and ``where`` bindings as well as default
+class methods and instance declarations.
+
+The pragma itself will only have an effect when the RHS of the binding it's applied
+to is used. For regular bindings this is straight forward but for class methods and
+instance definitions this can have surprising ramifications.
+
+If we consider a class definition with two instances like this: ::
+
+    class C a where
+        op1 :: a -> a
+
+        op2 :: [a] -> [a]
+        op2 xs = reverse (xs ++ xs)
+        {-# INLINE op2 #-}
+
+    instance C T1 where
+        op1 x = ...blah...
+
+    instance C T2 where
+        {-# INLINE op1 #-}
+        op1 x = ...blah...
+        op2 xs = ...blah...
+
+Then ``op2`` for the T1 instance will get an implicit ``INLINE`` pragma. This is because
+the RHS of the default method is used for ``op2`` which retains it's ``INLINE`` pragma.
+
+In the T2 instance ``op1`` gets an ``INLINE`` pragma and behaves accordingly. However ``op2`` for T2
+is **not** implemented by the default method. This means the pragma in the class definition doesn't apply
+to this instance. With no pragma being explicitly applied GHC will then decide on a proper inlining behaviour
+for ``T2``\s ``op2`` method on it's own.
+
 .. _inlinable-pragma:
 
 ``INLINABLE`` pragma
@@ -330,7 +363,7 @@ See also the ``NOINLINE`` (:ref:`noinline-pragma`) and ``INLINABLE``
 
 .. pragma:: INLINABLE ⟨name⟩
 
-    :where: top-level
+    :where: any function definition
 
     Suggest that the compiler always consider inlining ``name``.
 
@@ -377,7 +410,7 @@ The alternative spelling ``INLINEABLE`` is also accepted by GHC.
 
 .. pragma:: NOINLINE ⟨name⟩
 
-    :where: top-level
+    :where: any function definition
 
     Instructs the compiler not to inline a value.
 
@@ -455,6 +488,30 @@ arguments etc). Another way to understand the semantics is this:
 
 The same phase-numbering control is available for :pragma:`RULE <RULES>`\s
 (:ref:`rewrite-rules`).
+
+.. _opaque-pragma:
+
+``OPAQUE`` pragma
+-----------------
+
+.. pragma:: OPAQUE ⟨name⟩
+
+    :where: top-level
+
+    Instructs the compiler to ensure that every call of ``name`` remains a
+    call of ``name``, and not some name-mangled variant.
+
+The :pragma:`OPAQUE` pragma is an even stronger variant of the :pragma:`NOINLINE`
+pragma. Like the :pragma:`NOINLINE`, named functions annotated with a
+:pragma:`OPAQUE` pragma are not inlined, nor will they be be specialized.
+Unlike the :pragma:`NOINLINE`, named functions annotated with a
+:pragma:`OPAQUE` pragma are left untouched by the Worker/Wrapper transformation.
+Unlike :pragma:`NOINLINE`, :pragma:`OPAQUE` has no phase control.
+
+In effect, every call of a named function annotated with an :pragma:`OPAQUE`
+pragma remains a call of that named function, not some name-mangled variant.
+You shouldn't ever need to use the :pragma:`OPAQUE` pragma, unless you have a
+reason to care about name-mangling.
 
 .. _line-pragma:
 
@@ -887,28 +944,58 @@ modules. ``COMPLETE`` pragmas should be thought of as asserting a
 universal truth about a set of patterns and as a result, should not be
 used to silence context specific incomplete match warnings.
 
-When specifying a ``COMPLETE`` pragma, the result types of all patterns must
-be consistent with each other. This is a sanity check as it would be impossible
-to match on all the patterns if the types were inconsistent.
+It is also possible to restrict the types to which a ``COMPLETE`` pragma applies
+by putting a double colon ``::`` after the list of constructors, followed by a
+result type constructor, which will be used to restrict the cases in which the
+pragma applies. GHC will compare the annotated result type constructor with the
+type constructor in the head of the scrutinee type in a pattern match to see if
+the ``COMPLETE`` pragma is meant to apply to it.
 
-The result type must also be unambiguous. Usually this can be inferred but
-when all the pattern synonyms in a group are polymorphic in the constructor
-the user must provide a type signature. ::
+This is especially useful in cases that the constructors specified are
+polymorphic, e.g.::
 
-    class LL f where
-      go :: f a -> ()
+    data Proxy a = Proxy
 
-    instance LL [] where
-      go _ = ()
+    class IsEmpty a where
+      isEmpty :: a -> Bool
 
-    pattern T :: LL f => f a
-    pattern T <- (go -> ())
+    class IsCons a where
+      type Elt a
+      isCons :: a -> Maybe (Elt a, a)
 
-    {-# COMPLETE T :: [] #-}
+    pattern Empty :: IsEmpty a => a
+    pattern Empty <- (isEmpty -> True)
 
-    -- No warning
-    foo :: [a] -> Int
-    foo T = 5
+    pattern Cons :: IsCons a => Elt a -> a -> a
+    pattern Cons x xs <- (isCons -> Just (x,xs))
+
+    instance IsEmpty (Proxy a) where
+      isEmpty Proxy = True
+
+    instance IsEmpty [a] where
+      isEmpty = null
+
+    instance IsCons [a] where
+      type Elt [a] = a
+      isCons [] = Nothing
+      isCons (x:xs) = Just (x,xs)
+
+    {-# COMPLETE Empty :: Proxy #-}
+    {-# COMPLETE Empty, Cons :: [] #-}
+
+    foo :: Proxy a -> Int
+    foo Empty = 0
+
+    bar :: [a] -> Int
+    bar Empty = 0
+    bar (Cons _ _) = 1
+
+    baz :: [a] -> Int
+    baz Empty = 0
+
+In this example, ``foo`` and ``bar`` will not be warned about, as their
+pattern matches are covered by the two ``COMPLETE`` pragmas above, but
+``baz`` will be warned about as incomplete.
 
 .. _overlap-pragma:
 

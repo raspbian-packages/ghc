@@ -31,7 +31,6 @@ ghcWarningsArgs = do
         , package bytestring   ? pure [ "-Wno-inline-rule-shadowing" ]
         , package compiler     ? pure [ "-Wcpp-undef" ]
         , package directory    ? pure [ "-Wno-unused-imports" ]
-        , package deepseq      ? pure [ "-Wno-deprecations" ]
         , package ghc          ? pure [ "-Wcpp-undef"
                                       , "-Wincomplete-uni-patterns"
                                       , "-Wincomplete-record-updates"
@@ -47,10 +46,12 @@ ghcWarningsArgs = do
         , package primitive    ? pure [ "-Wno-unused-imports"
                                       , "-Wno-deprecations" ]
         , package rts          ? pure [ "-Wcpp-undef" ]
+        , package text         ? pure [ "-Wno-deprecations" ]
         , package terminfo     ? pure [ "-Wno-unused-imports" ]
         , package transformers ? pure [ "-Wno-unused-matches"
                                       , "-Wno-unused-imports"
                                       , "-Wno-redundant-constraints"
                                       , "-Wno-orphans" ]
+        , package unix         ? pure [ "-Wno-deprecations" ]
         , package win32        ? pure [ "-Wno-trustworthy-safe" ]
         , package xhtml        ? pure [ "-Wno-unused-imports" ] ] ]

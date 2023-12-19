@@ -44,40 +44,55 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE UnboxedTuples #-}
+{-# LANGUAGE UnboxedSums #-}
+{-# LANGUAGE UnliftedNewtypes #-}
+{-# LANGUAGE PatternSynonyms #-}
+
 
 {-# OPTIONS_GHC -funbox-strict-fields #-}
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 
 module GHC.Parser.Lexer (
-   Token(..), lexer, lexerDbg, pragState, mkPState, mkPStatePure, PState(..),
-   P(..), ParseResult(..), mkParserFlags, mkParserFlags', ParserFlags(..),
-   appendWarning,
-   appendError,
-   allocateComments,
+   Token(..), lexer, lexerDbg,
+   ParserOpts(..), mkParserOpts,
+   PState (..), initParserState, initPragState,
+   P(..), ParseResult(POk, PFailed),
+   allocateComments, allocatePriorComments, allocateFinalComments,
    MonadP(..),
-   getRealSrcLoc, getPState, withHomeUnitId,
+   getRealSrcLoc, getPState,
    failMsgP, failLocMsgP, srcParseFail,
-   getErrorMessages, getMessages,
+   getPsErrorMessages, getPsMessages,
    popContext, pushModuleContext, setLastToken, setSrcLoc,
    activeContext, nextIsEOF,
    getLexState, popLexState, pushLexState,
    ExtBits(..),
-   xtest,
+   xtest, xunset, xset,
+   disableHaddock,
    lexTokenStream,
-   addAnnsAt,
+   mkParensEpAnn,
+   getCommentsFor, getPriorCommentsFor, getFinalCommentsFor,
+   getEofPos,
    commentToAnnotation,
    HdkComment(..),
+   warnopt,
+   adjustChar,
+   addPsMessage
   ) where
 
 import GHC.Prelude
+import qualified GHC.Data.Strict as Strict
 
 -- base
 import Control.Monad
-import Data.Bits
+import Control.Applicative
 import Data.Char
-import Data.List
+import Data.List (stripPrefix, isInfixOf, partition)
+import Data.List.NonEmpty ( NonEmpty(..) )
+import qualified Data.List.NonEmpty as NE
 import Data.Maybe
 import Data.Word
+import Debug.Trace (trace)
 
 import GHC.Data.EnumSet as EnumSet
 
@@ -91,32 +106,30 @@ import Data.ByteString (ByteString)
 import Data.Map (Map)
 import qualified Data.Map as Map
 
--- compiler/utils
-import GHC.Data.Bag
+-- compiler
+import GHC.Utils.Error
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
 import GHC.Data.StringBuffer
 import GHC.Data.FastString
+import GHC.Types.Error
 import GHC.Types.Unique.FM
 import GHC.Data.Maybe
 import GHC.Data.OrdList
-import GHC.Utils.Misc ( readRational, readHexRational )
+import GHC.Utils.Misc ( readSignificandExponentPair, readHexSignificandExponentPair )
 
--- compiler/main
-import GHC.Utils.Error
-import GHC.Driver.Session as DynFlags
-
--- compiler/basicTypes
 import GHC.Types.SrcLoc
-import GHC.Unit
-import GHC.Types.Basic ( InlineSpec(..), RuleMatchInfo(..),
-                         IntegralLit(..), FractionalLit(..),
-                         SourceText(..) )
+import GHC.Types.SourceText
+import GHC.Types.Basic ( InlineSpec(..), RuleMatchInfo(..))
 import GHC.Hs.Doc
 
--- compiler/parser
 import GHC.Parser.CharClass
 
 import GHC.Parser.Annotation
+import GHC.Driver.Flags
+import GHC.Parser.Errors.Basic
+import GHC.Parser.Errors.Types
+import GHC.Parser.Errors.Ppr ()
 }
 
 -- -----------------------------------------------------------------------------
@@ -124,41 +137,41 @@ import GHC.Parser.Annotation
 
 -- NB: The logic behind these definitions is also reflected in "GHC.Utils.Lexeme"
 -- Any changes here should likely be reflected there.
-$unispace    = \x05 -- Trick Alex into handling Unicode. See [Unicode in Alex].
+$unispace    = \x05 -- Trick Alex into handling Unicode. See Note [Unicode in Alex].
 $nl          = [\n\r\f]
 $whitechar   = [$nl\v\ $unispace]
 $white_no_nl = $whitechar # \n -- TODO #8424
 $tab         = \t
 
 $ascdigit  = 0-9
-$unidigit  = \x03 -- Trick Alex into handling Unicode. See [Unicode in Alex].
-$decdigit  = $ascdigit -- for now, should really be $digit (ToDo)
+$unidigit  = \x03 -- Trick Alex into handling Unicode. See Note [Unicode in Alex].
+$decdigit  = $ascdigit -- exactly $ascdigit, no more no less.
 $digit     = [$ascdigit $unidigit]
 
 $special   = [\(\)\,\;\[\]\`\{\}]
 $ascsymbol = [\!\#\$\%\&\*\+\.\/\<\=\>\?\@\\\^\|\-\~\:]
-$unisymbol = \x04 -- Trick Alex into handling Unicode. See [Unicode in Alex].
+$unisymbol = \x04 -- Trick Alex into handling Unicode. See Note [Unicode in Alex].
 $symbol    = [$ascsymbol $unisymbol] # [$special \_\"\']
 
-$unilarge  = \x01 -- Trick Alex into handling Unicode. See [Unicode in Alex].
+$unilarge  = \x01 -- Trick Alex into handling Unicode. See Note [Unicode in Alex].
 $asclarge  = [A-Z]
 $large     = [$asclarge $unilarge]
 
-$unismall  = \x02 -- Trick Alex into handling Unicode. See [Unicode in Alex].
+$unismall  = \x02 -- Trick Alex into handling Unicode. See Note [Unicode in Alex].
 $ascsmall  = [a-z]
 $small     = [$ascsmall $unismall \_]
 
-$unigraphic = \x06 -- Trick Alex into handling Unicode. See [Unicode in Alex].
-$graphic   = [$small $large $symbol $digit $special $unigraphic \"\']
+$uniidchar = \x07 -- Trick Alex into handling Unicode. See Note [Unicode in Alex].
+$idchar    = [$small $large $digit $uniidchar \']
+
+$unigraphic = \x06 -- Trick Alex into handling Unicode. See Note [Unicode in Alex].
+$graphic   = [$small $large $symbol $digit $idchar $special $unigraphic \"\']
 
 $binit     = 0-1
 $octit     = 0-7
 $hexit     = [$decdigit A-F a-f]
 
-$uniidchar = \x07 -- Trick Alex into handling Unicode. See [Unicode in Alex].
-$idchar    = [$small $large $digit $uniidchar \']
-
-$pragmachar = [$small $large $digit]
+$pragmachar = [$small $large $digit $uniidchar ]
 
 $docsym    = [\| \^ \* \$]
 
@@ -220,7 +233,7 @@ $tab          { warnTab }
 -- are). We also rule out nested Haddock comments, if the -haddock flag is
 -- set.
 
-"{-" / { isNormalComment } { nested_comment lexToken }
+"{-" / { isNormalComment } { nested_comment }
 
 -- Single-line comments are a bit tricky.  Haskell 98 says that two or
 -- more dashes followed by a symbol should be parsed as a varsym, so we
@@ -274,7 +287,8 @@ $tab          { warnTab }
   ^\# line                              { begin line_prag1 }
   ^\# / { followedByDigit }             { begin line_prag1 }
   ^\# pragma .* \n                      ; -- GCC 3.3 CPP generated, apparently
-  ^\# \! .* \n                          ; -- #!, for scripts
+  ^\# \! .* \n                          ; -- #!, for scripts  -- gcc
+  ^\  \# \! .* \n                       ; --  #!, for scripts -- clang; See #6132
   ()                                    { do_bol }
 }
 
@@ -353,12 +367,12 @@ $tab          { warnTab }
 <0> {
   -- In the "0" mode we ignore these pragmas
   "{-#"  $whitechar* $pragmachar+ / { known_pragma fileHeaderPrags }
-                     { nested_comment lexToken }
+                     { nested_comment }
 }
 
 <0,option_prags> {
-  "{-#"  { warnThen Opt_WarnUnrecognisedPragmas (text "Unrecognised pragma")
-                    (nested_comment lexToken) }
+  "{-#"  { warnThen PsWarnUnrecognisedPragma
+                    (nested_comment ) }
 }
 
 -- '0' state: ordinary lexemes
@@ -433,11 +447,9 @@ $tab          { warnTab }
 }
 
 <0> {
-  "(#" / { ifExtension UnboxedTuplesBit `alexOrPred`
-           ifExtension UnboxedSumsBit }
+  "(#" / { ifExtension UnboxedParensBit }
          { token IToubxparen }
-  "#)" / { ifExtension UnboxedTuplesBit `alexOrPred`
-           ifExtension UnboxedSumsBit }
+  "#)" / { ifExtension UnboxedParensBit }
          { token ITcubxparen }
 }
 
@@ -620,6 +632,19 @@ $tab          { warnTab }
 --            |               |   ordinary operator or type operator,
 --            |               |   e.g.  xs ~ 3, (~ x), Int ~ Bool
 --  ----------+---------------+------------------------------------------
+--    .       |  prefix       | ITproj True
+--            |               |   field projection,
+--            |               |   e.g.  .x
+--            |  tight infix  | ITproj False
+--            |               |   field projection,
+--            |               |   e.g. r.x
+--            |  suffix       | ITdot
+--            |               |   function composition,
+--            |               |   e.g. f. g
+--            |  loose infix  | ITdot
+--            |               |   function composition,
+--            |               |   e.g.  f . g
+--  ----------+---------------+------------------------------------------
 --    $  $$   |  prefix       | ITdollar, ITdollardollar
 --            |               |   untyped or typed Template Haskell splice,
 --            |               |   e.g.  $(f x), $$(f x), $$"str"
@@ -734,8 +759,9 @@ data Token
   | ITdependency
   | ITrequires
 
-  -- Pragmas, see  note [Pragma source text] in "GHC.Types.Basic"
+  -- Pragmas, see  Note [Pragma source text] in "GHC.Types.Basic"
   | ITinline_prag       SourceText InlineSpec RuleMatchInfo
+  | ITopaque_prag       SourceText
   | ITspec_prag         SourceText                -- SPECIALISE
   | ITspec_inline_prag  SourceText Bool    -- SPECIALISE INLINE (or NOINLINE)
   | ITsource_prag       SourceText
@@ -745,7 +771,6 @@ data Token
   | ITline_prag         SourceText  -- not usually produced, see 'UsePosPragsBit'
   | ITcolumn_prag       SourceText  -- not usually produced, see 'UsePosPragsBit'
   | ITscc_prag          SourceText
-  | ITgenerated_prag    SourceText
   | ITunpack_prag       SourceText
   | ITnounpack_prag     SourceText
   | ITann_prag          SourceText
@@ -768,6 +793,7 @@ data Token
   | ITequal
   | ITlam
   | ITlcase
+  | ITlcases
   | ITvbar
   | ITlarrow            IsUnicodeSyntax
   | ITrarrow            IsUnicodeSyntax
@@ -782,6 +808,7 @@ data Token
   | ITpercent  -- Prefix (%) only, e.g. a %1 -> b
   | ITstar              IsUnicodeSyntax
   | ITdot
+  | ITproj Bool -- Extension: OverloadedRecordDotBit
 
   | ITbiglam                    -- GHC-extension symbols
 
@@ -860,20 +887,35 @@ data Token
   | ITunknown String             -- ^ Used when the lexer can't make sense of it
   | ITeof                        -- ^ end of file token
 
-  -- Documentation annotations
-  | ITdocCommentNext  String     -- ^ something beginning @-- |@
-  | ITdocCommentPrev  String     -- ^ something beginning @-- ^@
-  | ITdocCommentNamed String     -- ^ something beginning @-- $@
-  | ITdocSection      Int String -- ^ a section heading
-  | ITdocOptions      String     -- ^ doc options (prune, ignore-exports, etc)
-  | ITlineComment     String     -- ^ comment starting by "--"
-  | ITblockComment    String     -- ^ comment in {- -}
+  -- Documentation annotations. See Note [PsSpan in Comments]
+  | ITdocComment   HsDocString PsSpan -- ^ The HsDocString contains more details about what
+                                      -- this is and how to pretty print it
+  | ITdocOptions   String      PsSpan -- ^ doc options (prune, ignore-exports, etc)
+  | ITlineComment  String      PsSpan -- ^ comment starting by "--"
+  | ITblockComment String      PsSpan -- ^ comment in {- -}
 
   deriving Show
 
 instance Outputable Token where
   ppr x = text (show x)
 
+{- Note [PsSpan in Comments]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When using the Api Annotations to exact print a modified AST, managing
+the space before a comment is important.  The PsSpan in the comment
+token allows this to happen.
+
+We also need to track the space before the end of file. The normal
+mechanism of using the previous token does not work, as the ITeof is
+synthesised to come at the same location of the last token, and the
+normal previous token updating has by then updated the required
+location.
+
+We track this using a 2-back location, prev_loc2. This adds extra
+processing to every single token, which is a performance hit for
+something needed only at the end of the file. This needs
+improving. Perhaps a backward scan on eof?
+-}
 
 {- Note [Minus tokens]
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -920,6 +962,7 @@ reservedWordsFM = listToUFM $
         [( "_",              ITunderscore,    0 ),
          ( "as",             ITas,            0 ),
          ( "case",           ITcase,          0 ),
+         ( "cases",          ITlcases,        xbit LambdaCaseBit ),
          ( "class",          ITclass,         0 ),
          ( "data",           ITdata,          0 ),
          ( "default",        ITdefault,       0 ),
@@ -1087,7 +1130,7 @@ failLinePrag1 :: Action
 failLinePrag1 span _buf _len = do
   b <- getBit InNestedCommentBit
   if b then return (L span ITcomment_line_prag)
-       else lexError "lexical error in pragma"
+       else lexError LexErrorInPragma
 
 -- See Note [Nested comment line pragmas]
 popLinePrag1 :: Action
@@ -1108,7 +1151,8 @@ hopefully_open_brace span buf len
                  Layout prev_off _ : _ -> prev_off < offset
                  _                     -> True
       if isOK then pop_and open_brace span buf len
-              else addFatalError (mkSrcSpanPs span) (text "Missing block")
+              else addFatalError $
+                     mkPlainErrorMsgEnvelope (mkSrcSpanPs span) PsErrMissingBlock
 
 pop_and :: Action -> Action
 pop_and act span buf len = do _ <- popLexState
@@ -1240,16 +1284,23 @@ alexOrPred p1 p2 userState in1 len in2
   = p1 userState in1 len in2 || p2 userState in1 len in2
 
 multiline_doc_comment :: Action
-multiline_doc_comment span buf _len = withLexedDocType (worker "")
+multiline_doc_comment span buf _len = {-# SCC "multiline_doc_comment" #-} withLexedDocType worker
   where
-    worker commentAcc input docType checkNextLine = case alexGetChar' input of
-      Just ('\n', input')
-        | checkNextLine -> case checkIfCommentLine input' of
-          Just input -> worker ('\n':commentAcc) input docType checkNextLine
-          Nothing -> docCommentEnd input commentAcc docType buf span
-        | otherwise -> docCommentEnd input commentAcc docType buf span
-      Just (c, input) -> worker (c:commentAcc) input docType checkNextLine
-      Nothing -> docCommentEnd input commentAcc docType buf span
+    worker input@(AI start_loc _) docType checkNextLine = go start_loc "" [] input
+      where
+        go start_loc curLine prevLines input@(AI end_loc _) = case alexGetChar' input of
+            Just ('\n', input')
+              | checkNextLine -> case checkIfCommentLine input' of
+                Just input@(AI next_start _) ->  go next_start "" (locatedLine : prevLines) input -- Start a new line
+                Nothing -> endComment
+              | otherwise -> endComment
+            Just (c, input) -> go start_loc (c:curLine) prevLines input
+            Nothing -> endComment
+          where
+            lineSpan = mkSrcSpanPs $ mkPsSpan start_loc end_loc
+            locatedLine = L lineSpan (mkHsDocStringChunk $ reverse curLine)
+            commentLines = NE.reverse $ locatedLine :| prevLines
+            endComment = docCommentEnd input (docType (\dec -> MultiLineDocString dec commentLines)) buf span
 
     -- Check if the next line of input belongs to this doc comment as well.
     -- A doc comment continues onto the next line when the following
@@ -1281,20 +1332,53 @@ multiline_doc_comment span buf _len = withLexedDocType (worker "")
 lineCommentToken :: Action
 lineCommentToken span buf len = do
   b <- getBit RawTokenStreamBit
-  if b then strtoken ITlineComment span buf len else lexToken
+  if b then do
+         lt <- getLastLocComment
+         strtoken (\s -> ITlineComment s lt) span buf len
+       else lexToken
+
 
 {-
   nested comments require traversing by hand, they can't be parsed
   using regular expressions.
 -}
-nested_comment :: P (PsLocated Token) -> Action
-nested_comment cont span buf len = do
+nested_comment :: Action
+nested_comment span buf len = {-# SCC "nested_comment" #-} do
+  l <- getLastLocComment
+  let endComment input (L _ comment) = commentEnd lexToken input (Nothing, ITblockComment comment l) buf span
   input <- getInput
-  go (reverse $ lexemeToString buf len) (1::Int) input
+  -- Include decorator in comment
+  let start_decorator = reverse $ lexemeToString buf len
+  nested_comment_logic endComment start_decorator input span
+
+nested_doc_comment :: Action
+nested_doc_comment span buf _len = {-# SCC "nested_doc_comment" #-} withLexedDocType worker
   where
-    go commentAcc 0 input = do
-      let finalizeComment str = (Nothing, ITblockComment str)
-      commentEnd cont input commentAcc finalizeComment buf span
+    worker input docType _checkNextLine = nested_comment_logic endComment "" input span
+      where
+        endComment input lcomment
+          = docCommentEnd input (docType (\d -> NestedDocString d (mkHsDocStringChunk . dropTrailingDec <$> lcomment))) buf span
+
+        dropTrailingDec [] = []
+        dropTrailingDec "-}" = ""
+        dropTrailingDec (x:xs) = x:dropTrailingDec xs
+
+{-# INLINE nested_comment_logic #-}
+-- | Includes the trailing '-}' decorators
+-- drop the last two elements with the callback if you don't want them to be included
+nested_comment_logic
+  :: (AlexInput -> Located String -> P (PsLocated Token))  -- ^ Continuation that gets the rest of the input and the lexed comment
+  -> String -- ^ starting value for accumulator (reversed) - When we want to include a decorator '{-' in the comment
+  -> AlexInput
+  -> PsSpan
+  -> P (PsLocated Token)
+nested_comment_logic endComment commentAcc input span = go commentAcc (1::Int) input
+  where
+    go commentAcc 0 input@(AI end_loc _) = do
+      let comment = reverse commentAcc
+          cspan = mkSrcSpanPs $ mkPsSpan (psSpanStart span) end_loc
+          lcomment = L cspan comment
+      endComment input lcomment
     go commentAcc n input = case alexGetChar' input of
       Nothing -> errBrace input (psRealSpan span)
       Just ('-',input) -> case alexGetChar' input of
@@ -1312,31 +1396,6 @@ nested_comment cont span buf len = do
                            go (parsedAcc ++ '\n':commentAcc) n input
         Just (_,_)   -> go ('\n':commentAcc) n input
       Just (c,input) -> go (c:commentAcc) n input
-
-nested_doc_comment :: Action
-nested_doc_comment span buf _len = withLexedDocType (go "")
-  where
-    go commentAcc input docType _ = case alexGetChar' input of
-      Nothing -> errBrace input (psRealSpan span)
-      Just ('-',input) -> case alexGetChar' input of
-        Nothing -> errBrace input (psRealSpan span)
-        Just ('\125',input) ->
-          docCommentEnd input commentAcc docType buf span
-        Just (_,_) -> go ('-':commentAcc) input docType False
-      Just ('\123', input) -> case alexGetChar' input of
-        Nothing  -> errBrace input (psRealSpan span)
-        Just ('-',input) -> do
-          setInput input
-          let cont = do input <- getInput; go commentAcc input docType False
-          nested_comment cont span buf _len
-        Just (_,_) -> go ('\123':commentAcc) input docType False
-      -- See Note [Nested comment line pragmas]
-      Just ('\n',input) -> case alexGetChar' input of
-        Nothing  -> errBrace input (psRealSpan span)
-        Just ('#',_) -> do (parsedAcc,input) <- parseNestedPragma input
-                           go (parsedAcc ++ '\n':commentAcc) input docType False
-        Just (_,_)   -> go ('\n':commentAcc) input docType False
-      Just (c,input) -> go (c:commentAcc) input docType False
 
 -- See Note [Nested comment line pragmas]
 parseNestedPragma :: AlexInput -> P (String,AlexInput)
@@ -1384,36 +1443,50 @@ return control to parseNestedPragma by returning the ITcomment_line_prag token.
 See #314 for more background on the bug this fixes.
 -}
 
-withLexedDocType :: (AlexInput -> (String -> (HdkComment, Token)) -> Bool -> P (PsLocated Token))
+{-# INLINE withLexedDocType #-}
+withLexedDocType :: (AlexInput -> ((HsDocStringDecorator -> HsDocString) -> (HdkComment, Token)) -> Bool -> P (PsLocated Token))
                  -> P (PsLocated Token)
 withLexedDocType lexDocComment = do
   input@(AI _ buf) <- getInput
+  l <- getLastLocComment
   case prevChar buf ' ' of
     -- The `Bool` argument to lexDocComment signals whether or not the next
     -- line of input might also belong to this doc comment.
-    '|' -> lexDocComment input mkHdkCommentNext True
-    '^' -> lexDocComment input mkHdkCommentPrev True
-    '$' -> lexDocComment input mkHdkCommentNamed True
-    '*' -> lexDocSection 1 input
+    '|' -> lexDocComment input (mkHdkCommentNext l) True
+    '^' -> lexDocComment input (mkHdkCommentPrev l) True
+    '$' -> case lexDocName input of
+       Nothing -> do setInput input; lexToken -- eof reached, lex it normally
+       Just (name, input) -> lexDocComment input (mkHdkCommentNamed l name) True
+    '*' -> lexDocSection l 1 input
     _ -> panic "withLexedDocType: Bad doc type"
  where
-    lexDocSection n input = case alexGetChar' input of
-      Just ('*', input) -> lexDocSection (n+1) input
-      Just (_,   _)     -> lexDocComment input (mkHdkCommentSection n) False
+    lexDocSection l n input = case alexGetChar' input of
+      Just ('*', input) -> lexDocSection l (n+1) input
+      Just (_,   _)     -> lexDocComment input (mkHdkCommentSection l n) False
       Nothing -> do setInput input; lexToken -- eof reached, lex it normally
 
-mkHdkCommentNext, mkHdkCommentPrev :: String -> (HdkComment, Token)
-mkHdkCommentNext str = (HdkCommentNext (mkHsDocString str), ITdocCommentNext str)
-mkHdkCommentPrev str = (HdkCommentPrev (mkHsDocString str), ITdocCommentPrev str)
+    lexDocName :: AlexInput -> Maybe (String, AlexInput)
+    lexDocName = go ""
+      where
+        go acc input = case alexGetChar' input of
+          Just (c, input')
+            | isSpace c -> Just (reverse acc, input)
+            | otherwise -> go (c:acc) input'
+          Nothing -> Nothing
 
-mkHdkCommentNamed :: String -> (HdkComment, Token)
-mkHdkCommentNamed str =
-  let (name, rest) = break isSpace str
-  in (HdkCommentNamed name (mkHsDocString rest), ITdocCommentNamed str)
+mkHdkCommentNext, mkHdkCommentPrev  :: PsSpan -> (HsDocStringDecorator -> HsDocString) -> (HdkComment, Token)
+mkHdkCommentNext loc mkDS =  (HdkCommentNext ds,ITdocComment ds loc)
+  where ds = mkDS HsDocStringNext
+mkHdkCommentPrev loc mkDS =  (HdkCommentPrev ds,ITdocComment ds loc)
+  where ds = mkDS HsDocStringPrevious
 
-mkHdkCommentSection :: Int -> String -> (HdkComment, Token)
-mkHdkCommentSection n str =
-  (HdkCommentSection n (mkHsDocString str), ITdocSection n str)
+mkHdkCommentNamed :: PsSpan -> String -> (HsDocStringDecorator -> HsDocString) -> (HdkComment, Token)
+mkHdkCommentNamed loc name mkDS = (HdkCommentNamed name ds, ITdocComment ds loc)
+  where ds = mkDS (HsDocStringNamed name)
+
+mkHdkCommentSection :: PsSpan -> Int -> (HsDocStringDecorator -> HsDocString) -> (HdkComment, Token)
+mkHdkCommentSection loc n mkDS = (HdkCommentSection n ds, ITdocComment ds loc)
+  where ds = mkDS (HsDocStringGroup n)
 
 -- RULES pragmas turn on the forall and '.' keywords, and we turn them
 -- off again at the end of the pragma.
@@ -1457,37 +1530,36 @@ endPrag span _buf _len = do
 -- it writes the wrong token length to the parser state. This function is
 -- called afterwards, so it can just update the state.
 
+{-# INLINE commentEnd #-}
 commentEnd :: P (PsLocated Token)
            -> AlexInput
-           -> String
-           -> (String -> (Maybe HdkComment, Token))
+           -> (Maybe HdkComment, Token)
            -> StringBuffer
            -> PsSpan
            -> P (PsLocated Token)
-commentEnd cont input commentAcc finalizeComment buf span = do
+commentEnd cont input (m_hdk_comment, hdk_token) buf span = do
   setInput input
   let (AI loc nextBuf) = input
-      comment = reverse commentAcc
       span' = mkPsSpan (psSpanStart span) loc
       last_len = byteDiff buf nextBuf
   span `seq` setLastToken span' last_len
-  let (m_hdk_comment, hdk_token) = finalizeComment comment
   whenIsJust m_hdk_comment $ \hdk_comment ->
     P $ \s -> POk (s {hdk_comments = hdk_comments s `snocOL` L span' hdk_comment}) ()
   b <- getBit RawTokenStreamBit
   if b then return (L span' hdk_token)
        else cont
 
-docCommentEnd :: AlexInput -> String -> (String -> (HdkComment, Token)) -> StringBuffer ->
+{-# INLINE docCommentEnd #-}
+docCommentEnd :: AlexInput -> (HdkComment, Token) -> StringBuffer ->
                  PsSpan -> P (PsLocated Token)
-docCommentEnd input commentAcc docType buf span = do
-  let finalizeComment str =
-        let (hdk_comment, token) = docType str
-        in (Just hdk_comment, token)
-  commentEnd lexToken input commentAcc finalizeComment buf span
+docCommentEnd input (hdk_comment, tok) buf span
+  = commentEnd lexToken input (Just hdk_comment, tok) buf span
 
 errBrace :: AlexInput -> RealSrcSpan -> P a
-errBrace (AI end _) span = failLocMsgP (realSrcSpanStart span) (psRealLoc end) "unterminated `{-'"
+errBrace (AI end _) span =
+  failLocMsgP (realSrcSpanStart span)
+              (psRealLoc end)
+              (\srcLoc -> mkPlainErrorMsgEnvelope srcLoc (PsErrLexer LexUnterminatedComment LexErrKind_EOF))
 
 open_brace, close_brace :: Action
 open_brace span _str _len = do
@@ -1542,16 +1614,23 @@ varid span buf len =
     Just (ITcase, _) -> do
       lastTk <- getLastTk
       keyword <- case lastTk of
-        Just ITlam -> do
+        Strict.Just (L _ ITlam) -> do
           lambdaCase <- getBit LambdaCaseBit
           unless lambdaCase $ do
             pState <- getPState
-            addError (mkSrcSpanPs (last_loc pState)) $ text
-                     "Illegal lambda-case (use LambdaCase)"
+            addError $ mkPlainErrorMsgEnvelope (mkSrcSpanPs (last_loc pState)) PsErrLambdaCase
           return ITlcase
         _ -> return ITcase
       maybe_layout keyword
       return $ L span keyword
+    Just (ITlcases, _) -> do
+      lastTk <- getLastTk
+      lambdaCase <- getBit LambdaCaseBit
+      token <- case lastTk of
+        Strict.Just (L _ ITlam) | lambdaCase -> return ITlcases
+        _ -> return $ ITvarid fs
+      maybe_layout token
+      return $ L span token
     Just (keyword, 0) -> do
       maybe_layout keyword
       return $ L span keyword
@@ -1577,65 +1656,101 @@ qconsym buf len = ITqconsym $! splitQualName buf len False
 
 -- See Note [Whitespace-sensitive operator parsing]
 varsym_prefix :: Action
-varsym_prefix = sym $ \exts s ->
-  if | s == fsLit "@"  -- regardless of TypeApplications for better error messages
-     -> return ITtypeApp
-     | LinearTypesBit `xtest` exts, s == fsLit "%"
-     -> return ITpercent
-     | ThQuotesBit `xtest` exts, s == fsLit "$"
-     -> return ITdollar
-     | ThQuotesBit `xtest` exts, s == fsLit "$$"
-     -> return ITdollardollar
-     | s == fsLit "-"   -- Only when LexicalNegation is on, otherwise we get ITminus and
-                        -- don't hit this code path. See Note [Minus tokens]
-     -> return ITprefixminus
+varsym_prefix = sym $ \span exts s ->
+  let warnExtConflict errtok =
+        do { addPsMessage (mkSrcSpanPs span) (PsWarnOperatorWhitespaceExtConflict errtok)
+           ; return (ITvarsym s) }
+  in
+  if | s == fsLit "@" ->
+         return ITtypeApp  -- regardless of TypeApplications for better error messages
+     | s == fsLit "%" ->
+         if xtest LinearTypesBit exts
+         then return ITpercent
+         else warnExtConflict OperatorWhitespaceSymbol_PrefixPercent
+     | s == fsLit "$" ->
+         if xtest ThQuotesBit exts
+         then return ITdollar
+         else warnExtConflict OperatorWhitespaceSymbol_PrefixDollar
+     | s == fsLit "$$" ->
+         if xtest ThQuotesBit exts
+         then return ITdollardollar
+         else warnExtConflict OperatorWhitespaceSymbol_PrefixDollarDollar
+     | s == fsLit "-" ->
+         return ITprefixminus -- Only when LexicalNegation is on, otherwise we get ITminus
+                              -- and don't hit this code path. See Note [Minus tokens]
+     | s == fsLit ".", OverloadedRecordDotBit `xtest` exts ->
+         return (ITproj True) -- e.g. '(.x)'
+     | s == fsLit "." -> return ITdot
      | s == fsLit "!" -> return ITbang
      | s == fsLit "~" -> return ITtilde
-     | otherwise -> return (ITvarsym s)
+     | otherwise ->
+         do { addPsMessage
+                (mkSrcSpanPs span)
+                (PsWarnOperatorWhitespace s OperatorWhitespaceOccurrence_Prefix)
+            ; return (ITvarsym s) }
 
 -- See Note [Whitespace-sensitive operator parsing]
 varsym_suffix :: Action
-varsym_suffix = sym $ \_ s ->
-  if | s == fsLit "@"
-     -> failMsgP "Suffix occurrence of @. For an as-pattern, remove the leading whitespace."
-     | otherwise -> return (ITvarsym s)
+varsym_suffix = sym $ \span _ s ->
+  if | s == fsLit "@" -> failMsgP (\srcLoc -> mkPlainErrorMsgEnvelope srcLoc $ PsErrSuffixAT)
+     | s == fsLit "." -> return ITdot
+     | otherwise ->
+         do { addPsMessage
+                (mkSrcSpanPs span)
+                (PsWarnOperatorWhitespace s OperatorWhitespaceOccurrence_Suffix)
+            ; return (ITvarsym s) }
 
 -- See Note [Whitespace-sensitive operator parsing]
 varsym_tight_infix :: Action
-varsym_tight_infix = sym $ \_ s ->
+varsym_tight_infix = sym $ \span exts s ->
   if | s == fsLit "@" -> return ITat
-     | otherwise -> return (ITvarsym s)
+     | s == fsLit ".", OverloadedRecordDotBit `xtest` exts  -> return (ITproj False)
+     | s == fsLit "." -> return ITdot
+     | otherwise ->
+         do { addPsMessage
+                (mkSrcSpanPs span)
+                (PsWarnOperatorWhitespace s (OperatorWhitespaceOccurrence_TightInfix))
+            ;  return (ITvarsym s) }
 
 -- See Note [Whitespace-sensitive operator parsing]
 varsym_loose_infix :: Action
-varsym_loose_infix = sym (\_ s -> return $ ITvarsym s)
+varsym_loose_infix = sym $ \_ _ s ->
+  if | s == fsLit "."
+     -> return ITdot
+     | otherwise
+     -> return $ ITvarsym s
 
 consym :: Action
-consym = sym (\_exts s -> return $ ITconsym s)
+consym = sym (\_span _exts s -> return $ ITconsym s)
 
-sym :: (ExtsBitmap -> FastString -> P Token) -> Action
+sym :: (PsSpan -> ExtsBitmap -> FastString -> P Token) -> Action
 sym con span buf len =
   case lookupUFM reservedSymsFM fs of
-    Just (keyword, NormalSyntax, 0) ->
-      return $ L span keyword
+    Just (keyword, NormalSyntax, 0) -> do
+      exts <- getExts
+      if fs == fsLit "." &&
+         exts .&. (xbit OverloadedRecordDotBit) /= 0 &&
+         xtest OverloadedRecordDotBit exts
+      then L span <$!> con span exts fs  -- Process by varsym_*.
+      else return $ L span keyword
     Just (keyword, NormalSyntax, i) -> do
       exts <- getExts
       if exts .&. i /= 0
         then return $ L span keyword
-        else L span <$!> con exts fs
+        else L span <$!> con span exts fs
     Just (keyword, UnicodeSyntax, 0) -> do
       exts <- getExts
       if xtest UnicodeSyntaxBit exts
         then return $ L span keyword
-        else L span <$!> con exts fs
+        else L span <$!> con span exts fs
     Just (keyword, UnicodeSyntax, i) -> do
       exts <- getExts
       if exts .&. i /= 0 && xtest UnicodeSyntaxBit exts
         then return $ L span keyword
-        else L span <$!> con exts fs
+        else L span <$!> con span exts fs
     Nothing -> do
       exts <- getExts
-      L span <$!> con exts fs
+      L span <$!> con span exts fs
   where
     !fs = lexemeToFastString buf len
 
@@ -1650,8 +1765,8 @@ tok_integral itint transint transbuf translen (radix,char_to_int) span buf len =
   let src = lexemeToString buf len
   when ((not numericUnderscores) && ('_' `elem` src)) $ do
     pState <- getPState
-    addError (mkSrcSpanPs (last_loc pState)) $ text
-             "Use NumericUnderscores to allow underscores in integer literals"
+    let msg = PsErrNumUnderscores NumUnderscore_Integral
+    addError $ mkPlainErrorMsgEnvelope (mkSrcSpanPs (last_loc pState)) msg
   return $ L span $ itint (SourceText src)
        $! transint $ parseUnsignedInteger
        (offsetBytes transbuf buf) (subtract translen len) radix char_to_int
@@ -1685,15 +1800,15 @@ binary = (2,octDecDigit)
 octal = (8,octDecDigit)
 hexadecimal = (16,hexDigit)
 
--- readRational can understand negative rationals, exponents, everything.
+-- readSignificandExponentPair can understand negative rationals, exponents, everything.
 tok_frac :: Int -> (String -> Token) -> Action
 tok_frac drop f span buf len = do
   numericUnderscores <- getBit NumericUnderscoresBit  -- #14473
   let src = lexemeToString buf (len-drop)
   when ((not numericUnderscores) && ('_' `elem` src)) $ do
     pState <- getPState
-    addError (mkSrcSpanPs (last_loc pState)) $ text
-             "Use NumericUnderscores to allow underscores in floating literals"
+    let msg = PsErrNumUnderscores NumUnderscore_Float
+    addError $ mkPlainErrorMsgEnvelope (mkSrcSpanPs (last_loc pState)) msg
   return (L span $! (f $! src))
 
 tok_float, tok_primfloat, tok_primdouble :: String -> Token
@@ -1702,18 +1817,20 @@ tok_hex_float    str = ITrational   $! readHexFractionalLit str
 tok_primfloat    str = ITprimfloat  $! readFractionalLit str
 tok_primdouble   str = ITprimdouble $! readFractionalLit str
 
-readFractionalLit :: String -> FractionalLit
-readFractionalLit str = ((FL $! (SourceText str)) $! is_neg) $! readRational str
-                        where is_neg = case str of ('-':_) -> True
-                                                   _       -> False
-readHexFractionalLit :: String -> FractionalLit
-readHexFractionalLit str =
-  FL { fl_text  = SourceText str
-     , fl_neg   = case str of
+readFractionalLit, readHexFractionalLit :: String -> FractionalLit
+readHexFractionalLit = readFractionalLitX readHexSignificandExponentPair Base2
+readFractionalLit = readFractionalLitX readSignificandExponentPair Base10
+
+readFractionalLitX :: (String -> (Integer, Integer))
+                   -> FractionalExponentBase
+                   -> String -> FractionalLit
+readFractionalLitX readStr b str =
+  mkSourceFractionalLit str is_neg i e b
+  where
+    is_neg = case str of
                     '-' : _ -> True
-                    _       -> False
-     , fl_value = readHexRational str
-     }
+                    _      -> False
+    (i, e) = readStr str
 
 -- -----------------------------------------------------------------------------
 -- Layout processing
@@ -1755,6 +1872,7 @@ maybe_layout t = do -- If the alternative layout rule is enabled then
           f (ITmdo _)   = pushLexState layout_do
           f ITof        = pushLexState layout
           f ITlcase     = pushLexState layout
+          f ITlcases    = pushLexState layout
           f ITlet       = pushLexState layout
           f ITwhere     = pushLexState layout
           f ITrec       = pushLexState layout
@@ -1844,27 +1962,35 @@ alrInitialLoc file = mkRealSrcSpan loc loc
 -- -----------------------------------------------------------------------------
 -- Options, includes and language pragmas.
 
+
 lex_string_prag :: (String -> Token) -> Action
-lex_string_prag mkTok span _buf _len
+lex_string_prag mkTok = lex_string_prag_comment mkTok'
+  where
+    mkTok' s _ = mkTok s
+
+lex_string_prag_comment :: (String -> PsSpan -> Token) -> Action
+lex_string_prag_comment mkTok span _buf _len
     = do input <- getInput
          start <- getParsedLoc
-         tok <- go [] input
+         l <- getLastLocComment
+         tok <- go l [] input
          end <- getParsedLoc
          return (L (mkPsSpan start end) tok)
-    where go acc input
+    where go l acc input
               = if isString input "#-}"
                    then do setInput input
-                           return (mkTok (reverse acc))
+                           return (mkTok (reverse acc) l)
                    else case alexGetChar input of
-                          Just (c,i) -> go (c:acc) i
+                          Just (c,i) -> go l (c:acc) i
                           Nothing -> err input
           isString _ [] = True
           isString i (x:xs)
               = case alexGetChar i of
                   Just (c,i') | c == x    -> isString i' xs
                   _other -> False
-          err (AI end _) = failLocMsgP (realSrcSpanStart (psRealSpan span)) (psRealLoc end) "unterminated options pragma"
-
+          err (AI end _) = failLocMsgP (realSrcSpanStart (psRealSpan span))
+                                       (psRealLoc end)
+                                       (\srcLoc -> mkPlainErrorMsgEnvelope srcLoc $ PsErrLexer LexUnterminatedOptions LexErrKind_EOF)
 
 -- -----------------------------------------------------------------------------
 -- Strings & Chars
@@ -1901,8 +2027,9 @@ lex_string s = do
                 setInput i
                 when (any (> '\xFF') s') $ do
                   pState <- getPState
-                  addError (mkSrcSpanPs (last_loc pState)) $ text
-                     "primitive string literal must contain only characters <= \'\\xFF\'"
+                  let msg = PsErrPrimStringInvalidChar
+                  let err = mkPlainErrorMsgEnvelope (mkSrcSpanPs (last_loc pState)) msg
+                  addError err
                 return (ITprimstring (SourceText s') (unsafeMkByteString s'))
               _other ->
                 return (ITstring (SourceText s') (mkFastString s'))
@@ -2058,7 +2185,7 @@ readNum2 is_digit base conv i = do
             Just (c,input') | is_digit c -> do
                let i' = i*base + conv c
                if i' > 0x10ffff
-                  then setInput input >> lexError "numeric escape sequence out of range"
+                  then setInput input >> lexError LexNumEscapeRange
                   else read i' input'
             _other -> do
               setInput input; return (chr i)
@@ -2107,12 +2234,12 @@ silly_escape_chars = [
 -- a correct location to the user, but also so we can detect UTF-8 decoding
 -- errors if they occur.
 lit_error :: AlexInput -> P a
-lit_error i = do setInput i; lexError "lexical error in string/character literal"
+lit_error i = do setInput i; lexError LexStringCharLit
 
 getCharOrFail :: AlexInput -> P Char
 getCharOrFail i =  do
   case alexGetChar' i of
-        Nothing -> lexError "unexpected end-of-file in string/character literal"
+        Nothing -> lexError LexStringCharLitEOF
         Just (c,i)  -> do setInput i; return c
 
 -- -----------------------------------------------------------------------------
@@ -2163,7 +2290,8 @@ lex_quasiquote start s = do
 quasiquote_error :: RealSrcLoc -> P a
 quasiquote_error start = do
   (AI end buf) <- getInput
-  reportLexError start (psRealLoc end) buf "unterminated quasiquotation"
+  reportLexError start (psRealLoc end) buf
+    (\k srcLoc -> mkPlainErrorMsgEnvelope srcLoc (PsErrLexer LexUnterminatedQQ k))
 
 -- -----------------------------------------------------------------------------
 -- Warnings
@@ -2173,9 +2301,9 @@ warnTab srcspan _buf _len = do
     addTabWarning (psRealSpan srcspan)
     lexToken
 
-warnThen :: WarningFlag -> SDoc -> Action -> Action
-warnThen option warning action srcspan buf len = do
-    addWarning option (RealSrcSpan (psRealSpan srcspan) Nothing) warning
+warnThen :: PsMessage -> Action -> Action
+warnThen warning action srcspan buf len = do
+    addPsMessage (RealSrcSpan (psRealSpan srcspan) Strict.Nothing) warning
     action srcspan buf len
 
 -- -----------------------------------------------------------------------------
@@ -2197,32 +2325,48 @@ data LayoutContext
   deriving Show
 
 -- | The result of running a parser.
-data ParseResult a
-  = POk      -- ^ The parser has consumed a (possibly empty) prefix
-             --   of the input and produced a result. Use 'getMessages'
-             --   to check for accumulated warnings and non-fatal errors.
-      PState -- ^ The resulting parsing state. Can be used to resume parsing.
-      a      -- ^ The resulting value.
-  | PFailed  -- ^ The parser has consumed a (possibly empty) prefix
-             --   of the input and failed.
-      PState -- ^ The parsing state right before failure, including the fatal
-             --   parse error. 'getMessages' and 'getErrorMessages' must return
-             --   a non-empty bag of errors.
+newtype ParseResult a = PR (# (# PState, a #) | PState #)
+
+-- | The parser has consumed a (possibly empty) prefix of the input and produced
+-- a result. Use 'getPsMessages' to check for accumulated warnings and non-fatal
+-- errors.
+--
+-- The carried parsing state can be used to resume parsing.
+pattern POk :: PState -> a -> ParseResult a
+pattern POk s a = PR (# (# s , a #) | #)
+
+-- | The parser has consumed a (possibly empty) prefix of the input and failed.
+--
+-- The carried parsing state can be used to resume parsing. It is the state
+-- right before failure, including the fatal parse error. 'getPsMessages' and
+-- 'getPsErrorMessages' must return a non-empty bag of errors.
+pattern PFailed :: PState -> ParseResult a
+pattern PFailed s = PR (# | s #)
+
+{-# COMPLETE POk, PFailed #-}
 
 -- | Test whether a 'WarningFlag' is set
-warnopt :: WarningFlag -> ParserFlags -> Bool
+warnopt :: WarningFlag -> ParserOpts -> Bool
 warnopt f options = f `EnumSet.member` pWarningFlags options
 
--- | The subset of the 'DynFlags' used by the parser.
--- See 'mkParserFlags' or 'mkParserFlags'' for ways to construct this.
-data ParserFlags = ParserFlags {
-    pWarningFlags   :: EnumSet WarningFlag
-  , pHomeUnitId     :: UnitId      -- ^ unit currently being compiled
-  , pExtsBitmap     :: !ExtsBitmap -- ^ bitmap of permitted extensions
+-- | Parser options.
+--
+-- See 'mkParserOpts' to construct this.
+data ParserOpts = ParserOpts
+  { pExtsBitmap     :: !ExtsBitmap -- ^ bitmap of permitted extensions
+  , pDiagOpts       :: !DiagOpts
+    -- ^ Options to construct diagnostic messages.
+  , pSupportedExts  :: [String]
+    -- ^ supported extensions (only used for suggestions in error messages)
   }
 
--- | Haddock comment as produced by the lexer. These are accumulated in
--- 'PState' and then processed in "GHC.Parser.PostProcess.Haddock".
+pWarningFlags :: ParserOpts -> EnumSet WarningFlag
+pWarningFlags opts = diag_warning_flags (pDiagOpts opts)
+
+-- | Haddock comment as produced by the lexer. These are accumulated in 'PState'
+-- and then processed in "GHC.Parser.PostProcess.Haddock". The location of the
+-- 'HsDocString's spans over the contents of the docstring - i.e. it does not
+-- include the decorator ("-- |", "{-|" etc.)
 data HdkComment
   = HdkCommentNext HsDocString
   | HdkCommentPrev HsDocString
@@ -2232,15 +2376,17 @@ data HdkComment
 
 data PState = PState {
         buffer     :: StringBuffer,
-        options    :: ParserFlags,
-        -- This needs to take DynFlags as an argument until
-        -- we have a fix for #10143
-        messages   :: DynFlags -> Messages,
-        tab_first  :: Maybe RealSrcSpan, -- pos of first tab warning in the file
-        tab_count  :: !Int,              -- number of tab warnings in the file
-        last_tk    :: Maybe Token,
-        last_loc   :: PsSpan,      -- pos of previous token
-        last_len   :: !Int,        -- len of previous token
+        options    :: ParserOpts,
+        warnings   :: Messages PsMessage,
+        errors     :: Messages PsMessage,
+        tab_first  :: Strict.Maybe RealSrcSpan, -- pos of first tab warning in the file
+        tab_count  :: !Word,             -- number of tab warnings in the file
+        last_tk    :: Strict.Maybe (PsLocated Token), -- last non-comment token
+        prev_loc   :: PsSpan,      -- pos of previous token, including comments,
+        prev_loc2  :: PsSpan,      -- pos of two back token, including comments,
+                                   -- see Note [PsSpan in Comments]
+        last_loc   :: PsSpan,      -- pos of current token
+        last_len   :: !Int,        -- len of current token
         loc        :: PsLoc,       -- current loc (end of prev token + 1)
         context    :: [LayoutContext],
         lex_state  :: [Int],
@@ -2267,11 +2413,10 @@ data PState = PState {
         -- The next three are used to implement Annotations giving the
         -- locations of 'noise' tokens in the source, so that users of
         -- the GHC API can do source to source conversions.
-        -- See note [Api annotations] in GHC.Parser.Annotation
-        annotations :: [(ApiAnnKey,[RealSrcSpan])],
-        eof_pos :: Maybe RealSrcSpan,
-        comment_q :: [RealLocated AnnotationComment],
-        annotations_comments :: [(RealSrcSpan,[RealLocated AnnotationComment])],
+        -- See Note [exact print annotations] in GHC.Parser.Annotation
+        eof_pos :: Strict.Maybe (Strict.Pair RealSrcSpan RealSrcSpan), -- pos, gap to prior token
+        header_comments :: Strict.Maybe [LEpaComment],
+        comment_q :: [LEpaComment],
 
         -- Haddock comments accumulated in ascending order of their location
         -- (BufPos). We use OrdList to get O(1) snoc.
@@ -2284,6 +2429,12 @@ data PState = PState {
         -- current token to happyError, we could at least get rid of last_len.
         -- Getting rid of last_loc would require finding another way to
         -- implement pushCurrentContext (which is only called from one place).
+
+        -- AZ question: setLastToken which sets last_loc and last_len
+        -- is called whan processing AlexToken, immediately prior to
+        -- calling the action in the token.  So from the perspective
+        -- of the action, it is the *current* token.  Do I understand
+        -- correctly?
 
 data ALRContext = ALRNoLayout Bool{- does it contain commas? -}
                               Bool{- is it a 'let' block? -}
@@ -2315,20 +2466,17 @@ thenP :: P a -> (a -> P b) -> P b
                 POk s1 a         -> (unP (k a)) s1
                 PFailed s1 -> PFailed s1
 
-failMsgP :: String -> P a
-failMsgP msg = do
+failMsgP :: (SrcSpan -> MsgEnvelope PsMessage) -> P a
+failMsgP f = do
   pState <- getPState
-  addFatalError (mkSrcSpanPs (last_loc pState)) (text msg)
+  addFatalError (f (mkSrcSpanPs (last_loc pState)))
 
-failLocMsgP :: RealSrcLoc -> RealSrcLoc -> String -> P a
-failLocMsgP loc1 loc2 str =
-  addFatalError (RealSrcSpan (mkRealSrcSpan loc1 loc2) Nothing) (text str)
+failLocMsgP :: RealSrcLoc -> RealSrcLoc -> (SrcSpan -> MsgEnvelope PsMessage) -> P a
+failLocMsgP loc1 loc2 f =
+  addFatalError (f (RealSrcSpan (mkRealSrcSpan loc1 loc2) Strict.Nothing))
 
 getPState :: P PState
 getPState = P $ \s -> POk s s
-
-withHomeUnitId :: (UnitId -> a) -> P a
-withHomeUnitId f = P $ \s@(PState{options = o}) -> POk s (f (pHomeUnitId o))
 
 getExts :: P ExtsBitmap
 getExts = P $ \s -> POk s (pExtsBitmap . options $ s)
@@ -2354,8 +2502,8 @@ getParsedLoc  = P $ \s@(PState{ loc=loc }) -> POk s loc
 addSrcFile :: FastString -> P ()
 addSrcFile f = P $ \s -> POk s{ srcfiles = f : srcfiles s } ()
 
-setEofPos :: RealSrcSpan -> P ()
-setEofPos span = P $ \s -> POk s{ eof_pos = Just span } ()
+setEofPos :: RealSrcSpan -> RealSrcSpan -> P ()
+setEofPos span gap = P $ \s -> POk s{ eof_pos = Strict.Just (span `Strict.And` gap) } ()
 
 setLastToken :: PsSpan -> Int -> P ()
 setLastToken loc len = P $ \s -> POk s {
@@ -2363,13 +2511,30 @@ setLastToken loc len = P $ \s -> POk s {
   last_len=len
   } ()
 
-setLastTk :: Token -> P ()
-setLastTk tk = P $ \s -> POk s { last_tk = Just tk } ()
+setLastTk :: PsLocated Token -> P ()
+setLastTk tk@(L l _) = P $ \s -> POk s { last_tk = Strict.Just tk
+                                       , prev_loc = l
+                                       , prev_loc2 = prev_loc s} ()
 
-getLastTk :: P (Maybe Token)
+setLastComment :: PsLocated Token -> P ()
+setLastComment (L l _) = P $ \s -> POk s { prev_loc = l
+                                         , prev_loc2 = prev_loc s} ()
+
+getLastTk :: P (Strict.Maybe (PsLocated Token))
 getLastTk = P $ \s@(PState { last_tk = last_tk }) -> POk s last_tk
 
-data AlexInput = AI PsLoc StringBuffer
+-- see Note [PsSpan in Comments]
+getLastLocComment :: P PsSpan
+getLastLocComment = P $ \s@(PState { prev_loc = prev_loc }) -> POk s prev_loc
+
+-- see Note [PsSpan in Comments]
+getLastLocEof :: P PsSpan
+getLastLocEof = P $ \s@(PState { prev_loc2 = prev_loc2 }) -> POk s prev_loc2
+
+getLastLoc :: P PsSpan
+getLastLoc = P $ \s@(PState { last_loc = last_loc }) -> POk s last_loc
+
+data AlexInput = AI !PsLoc !StringBuffer
 
 {-
 Note [Unicode in Alex]
@@ -2423,7 +2588,7 @@ adjustChar c = fromIntegral $ ord adj_c
                   SpacingCombiningMark  -> other_graphic
                   EnclosingMark         -> other_graphic
                   DecimalNumber         -> digit
-                  LetterNumber          -> other_graphic
+                  LetterNumber          -> digit
                   OtherNumber           -> digit -- see #4373
                   ConnectorPunctuation  -> symbol
                   DashPunctuation       -> symbol
@@ -2465,6 +2630,7 @@ alexGetByte (AI loc s)
         loc'   = advancePsLoc loc c
         byte   = adjustChar c
 
+{-# INLINE alexGetChar' #-}
 -- This version does not squash unicode characters, it is used when
 -- lexing strings.
 alexGetChar' :: AlexInput -> Maybe (Char,AlexInput)
@@ -2572,6 +2738,12 @@ xbit = bit . fromEnum
 xtest :: ExtBits -> ExtsBitmap -> Bool
 xtest ext xmap = testBit xmap (fromEnum ext)
 
+xset :: ExtBits -> ExtsBitmap -> ExtsBitmap
+xset ext xmap = setBit xmap (fromEnum ext)
+
+xunset :: ExtBits -> ExtsBitmap -> ExtsBitmap
+xunset ext xmap = clearBit xmap (fromEnum ext)
+
 -- | Various boolean flags, mostly language extensions, that impact lexing and
 -- parsing. Note that a handful of these can change during lexing/parsing.
 data ExtBits
@@ -2593,8 +2765,7 @@ data ExtBits
   | RecursiveDoBit -- mdo
   | QualifiedDoBit -- .do and .mdo
   | UnicodeSyntaxBit -- the forall symbol, arrow symbols, etc
-  | UnboxedTuplesBit -- (# and #)
-  | UnboxedSumsBit -- (# and #)
+  | UnboxedParensBit -- (# and #)
   | DatatypeContextsBit
   | MonadComprehensionsBit
   | TransformComprehensionsBit
@@ -2622,6 +2793,8 @@ data ExtBits
   | ImportQualifiedPostBit
   | LinearTypesBit
   | NoLexicalNegationBit   -- See Note [Why not LexicalNegationBit]
+  | OverloadedRecordDotBit
+  | OverloadedRecordUpdateBit
 
   -- Flags that are updated once parsing starts
   | InRulePragBit
@@ -2632,22 +2805,11 @@ data ExtBits
     -- tokens of their own.
   deriving Enum
 
-
-
-
-
--- PState for parsing options pragmas
---
-pragState :: DynFlags -> StringBuffer -> RealSrcLoc -> PState
-pragState dynflags buf loc = (mkPState dynflags buf loc) {
-                                 lex_state = [bol, option_prags, 0]
-                             }
-
-{-# INLINE mkParserFlags' #-}
-mkParserFlags'
-  :: EnumSet WarningFlag        -- ^ warnings flags enabled
-  -> EnumSet LangExt.Extension  -- ^ permitted language extensions enabled
-  -> UnitId                     -- ^ id of the unit currently being compiled
+{-# INLINE mkParserOpts #-}
+mkParserOpts
+  :: EnumSet LangExt.Extension  -- ^ permitted language extensions enabled
+  -> DiagOpts                   -- ^ diagnostic options
+  -> [String]                   -- ^ Supported Languages and Extensions
   -> Bool                       -- ^ are safe imports on?
   -> Bool                       -- ^ keeping Haddock comment tokens
   -> Bool                       -- ^ keep regular comment tokens
@@ -2657,14 +2819,14 @@ mkParserFlags'
   -- the internal position kept by the parser. Otherwise, those pragmas are
   -- lexed as 'ITline_prag' and 'ITcolumn_prag' tokens.
 
-  -> ParserFlags
--- ^ Given exactly the information needed, set up the 'ParserFlags'
-mkParserFlags' warningFlags extensionFlags homeUnitId
+  -> ParserOpts
+-- ^ Given exactly the information needed, set up the 'ParserOpts'
+mkParserOpts extensionFlags diag_opts supported
   safeImports isHaddock rawTokStream usePosPrags =
-    ParserFlags {
-      pWarningFlags = warningFlags
-    , pHomeUnitId   = homeUnitId
-    , pExtsBitmap   = safeHaskellBit .|. langExtBits .|. optBits
+    ParserOpts {
+      pDiagOpts      = diag_opts
+    , pExtsBitmap    = safeHaskellBit .|. langExtBits .|. optBits
+    , pSupportedExts = supported
     }
   where
     safeHaskellBit = SafeHaskellBit `setBitIf` safeImports
@@ -2684,8 +2846,7 @@ mkParserFlags' warningFlags extensionFlags homeUnitId
       .|. RecursiveDoBit              `xoptBit` LangExt.RecursiveDo
       .|. QualifiedDoBit              `xoptBit` LangExt.QualifiedDo
       .|. UnicodeSyntaxBit            `xoptBit` LangExt.UnicodeSyntax
-      .|. UnboxedTuplesBit            `xoptBit` LangExt.UnboxedTuples
-      .|. UnboxedSumsBit              `xoptBit` LangExt.UnboxedSums
+      .|. UnboxedParensBit            `orXoptsBit` [LangExt.UnboxedTuples, LangExt.UnboxedSums]
       .|. DatatypeContextsBit         `xoptBit` LangExt.DatatypeContexts
       .|. TransformComprehensionsBit  `xoptBit` LangExt.TransformListComp
       .|. MonadComprehensionsBit      `xoptBit` LangExt.MonadComprehensions
@@ -2710,7 +2871,9 @@ mkParserFlags' warningFlags extensionFlags homeUnitId
       .|. GadtSyntaxBit               `xoptBit` LangExt.GADTSyntax
       .|. ImportQualifiedPostBit      `xoptBit` LangExt.ImportQualifiedPost
       .|. LinearTypesBit              `xoptBit` LangExt.LinearTypes
-      .|. NoLexicalNegationBit     `xoptNotBit` LangExt.LexicalNegation -- See Note [Why not LexicalNegationBit]
+      .|. NoLexicalNegationBit        `xoptNotBit` LangExt.LexicalNegation -- See Note [Why not LexicalNegationBit]
+      .|. OverloadedRecordDotBit      `xoptBit` LangExt.OverloadedRecordDot
+      .|. OverloadedRecordUpdateBit   `xoptBit` LangExt.OverloadedRecordUpdate  -- Enable testing via 'getBit OverloadedRecordUpdateBit' in the parser (RecordDotSyntax parsing uses that information).
     optBits =
           HaddockBit        `setBitIf` isHaddock
       .|. RawTokenStreamBit `setBitIf` rawTokStream
@@ -2719,36 +2882,37 @@ mkParserFlags' warningFlags extensionFlags homeUnitId
     xoptBit bit ext = bit `setBitIf` EnumSet.member ext extensionFlags
     xoptNotBit bit ext = bit `setBitIf` not (EnumSet.member ext extensionFlags)
 
+    orXoptsBit bit exts = bit `setBitIf` any (`EnumSet.member` extensionFlags) exts
+
     setBitIf :: ExtBits -> Bool -> ExtsBitmap
     b `setBitIf` cond | cond      = xbit b
                       | otherwise = 0
 
--- | Extracts the flag information needed for parsing
-mkParserFlags :: DynFlags -> ParserFlags
-mkParserFlags =
-  mkParserFlags'
-    <$> DynFlags.warningFlags
-    <*> DynFlags.extensionFlags
-    <*> DynFlags.homeUnitId
-    <*> safeImportsOn
-    <*> gopt Opt_Haddock
-    <*> gopt Opt_KeepRawTokenStream
-    <*> const True
+disableHaddock :: ParserOpts -> ParserOpts
+disableHaddock opts = upd_bitmap (xunset HaddockBit)
+  where
+    upd_bitmap f = opts { pExtsBitmap = f (pExtsBitmap opts) }
 
--- | Creates a parse state from a 'DynFlags' value
-mkPState :: DynFlags -> StringBuffer -> RealSrcLoc -> PState
-mkPState flags = mkPStatePure (mkParserFlags flags)
 
--- | Creates a parse state from a 'ParserFlags' value
-mkPStatePure :: ParserFlags -> StringBuffer -> RealSrcLoc -> PState
-mkPStatePure options buf loc =
+-- | Set parser options for parsing OPTIONS pragmas
+initPragState :: ParserOpts -> StringBuffer -> RealSrcLoc -> PState
+initPragState options buf loc = (initParserState options buf loc)
+   { lex_state = [bol, option_prags, 0]
+   }
+
+-- | Creates a parse state from a 'ParserOpts' value
+initParserState :: ParserOpts -> StringBuffer -> RealSrcLoc -> PState
+initParserState options buf loc =
   PState {
       buffer        = buf,
       options       = options,
-      messages      = const emptyMessages,
-      tab_first     = Nothing,
+      errors        = emptyMessages,
+      warnings      = emptyMessages,
+      tab_first     = Strict.Nothing,
       tab_count     = 0,
-      last_tk       = Nothing,
+      last_tk       = Strict.Nothing,
+      prev_loc      = mkPsSpan init_loc init_loc,
+      prev_loc2     = mkPsSpan init_loc init_loc,
       last_loc      = mkPsSpan init_loc init_loc,
       last_len      = 0,
       loc           = init_loc,
@@ -2761,10 +2925,9 @@ mkPStatePure options buf loc =
       alr_context = [],
       alr_expecting_ocurly = Nothing,
       alr_justClosedExplicitLetBlock = False,
-      annotations = [],
-      eof_pos = Nothing,
+      eof_pos = Strict.Nothing,
+      header_comments = Strict.Nothing,
       comment_q = [],
-      annotations_comments = [],
       hdk_comments = nilOL
     }
   where init_loc = PsLoc loc (BufPos 0)
@@ -2791,103 +2954,114 @@ class Monad m => MonadP m where
   --   to the accumulator and parsing continues. This allows GHC to report
   --   more than one parse error per file.
   --
-  addError :: SrcSpan -> SDoc -> m ()
+  addError :: MsgEnvelope PsMessage -> m ()
+
   -- | Add a warning to the accumulator.
-  --   Use 'getMessages' to get the accumulated warnings.
-  addWarning :: WarningFlag -> SrcSpan -> SDoc -> m ()
+  --   Use 'getPsMessages' to get the accumulated warnings.
+  addWarning :: MsgEnvelope PsMessage -> m ()
+
   -- | Add a fatal error. This will be the last error reported by the parser, and
   --   the parser will not produce any result, ending in a 'PFailed' state.
-  addFatalError :: SrcSpan -> SDoc -> m a
+  addFatalError :: MsgEnvelope PsMessage -> m a
+
   -- | Check if a given flag is currently set in the bitmap.
   getBit :: ExtBits -> m Bool
-  -- | Given a location and a list of AddAnn, apply them all to the location.
-  addAnnotation :: SrcSpan          -- SrcSpan of enclosing AST construct
-                -> AnnKeywordId     -- The first two parameters are the key
-                -> SrcSpan          -- The location of the keyword itself
-                -> m ()
-
-appendError
-  :: SrcSpan
-  -> SDoc
-  -> (DynFlags -> Messages)
-  -> (DynFlags -> Messages)
-appendError srcspan msg m =
-  \d ->
-    let (ws, es) = m d
-        errormsg = mkErrMsg d srcspan alwaysQualify msg
-        es' = es `snocBag` errormsg
-    in (ws, es')
-
-appendWarning
-  :: ParserFlags
-  -> WarningFlag
-  -> SrcSpan
-  -> SDoc
-  -> (DynFlags -> Messages)
-  -> (DynFlags -> Messages)
-appendWarning o option srcspan warning m =
-  \d ->
-    let (ws, es) = m d
-        warning' = makeIntoWarning (Reason option) $
-           mkWarnMsg d srcspan alwaysQualify warning
-        ws' = if warnopt option o then ws `snocBag` warning' else ws
-    in (ws', es)
+  -- | Go through the @comment_q@ in @PState@ and remove all comments
+  -- that belong within the given span
+  allocateCommentsP :: RealSrcSpan -> m EpAnnComments
+  -- | Go through the @comment_q@ in @PState@ and remove all comments
+  -- that come before or within the given span
+  allocatePriorCommentsP :: RealSrcSpan -> m EpAnnComments
+  -- | Go through the @comment_q@ in @PState@ and remove all comments
+  -- that come after the given span
+  allocateFinalCommentsP :: RealSrcSpan -> m EpAnnComments
 
 instance MonadP P where
-  addError srcspan msg
-   = P $ \s@PState{messages=m} ->
-             POk s{messages=appendError srcspan msg m} ()
-  addWarning option srcspan warning
-   = P $ \s@PState{messages=m, options=o} ->
-             POk s{messages=appendWarning o option srcspan warning m} ()
-  addFatalError span msg =
-    addError span msg >> P PFailed
+  addError err
+   = P $ \s -> POk s { errors = err `addMessage` errors s} ()
+
+  -- If the warning is meant to be suppressed, GHC will assign
+  -- a `SevIgnore` severity and the message will be discarded,
+  -- so we can simply add it no matter what.
+  addWarning w
+   = P $ \s -> POk (s { warnings = w `addMessage` warnings s }) ()
+
+  addFatalError err =
+    addError err >> P PFailed
+
   getBit ext = P $ \s -> let b =  ext `xtest` pExtsBitmap (options s)
                          in b `seq` POk s b
-  addAnnotation (RealSrcSpan l _) a (RealSrcSpan v _) = do
-    addAnnotationOnly l a v
-    allocateCommentsP l
-  addAnnotation _ _ _ = return ()
+  allocateCommentsP ss = P $ \s ->
+    let (comment_q', newAnns) = allocateComments ss (comment_q s) in
+      POk s {
+         comment_q = comment_q'
+       } (EpaComments newAnns)
+  allocatePriorCommentsP ss = P $ \s ->
+    let (header_comments', comment_q', newAnns)
+             = allocatePriorComments ss (comment_q s) (header_comments s) in
+      POk s {
+         header_comments = header_comments',
+         comment_q = comment_q'
+       } (EpaComments newAnns)
+  allocateFinalCommentsP ss = P $ \s ->
+    let (header_comments', comment_q', newAnns)
+             = allocateFinalComments ss (comment_q s) (header_comments s) in
+      POk s {
+         header_comments = header_comments',
+         comment_q = comment_q'
+       } (EpaCommentsBalanced (Strict.fromMaybe [] header_comments') newAnns)
 
-addAnnsAt :: MonadP m => SrcSpan -> [AddAnn] -> m ()
-addAnnsAt l = mapM_ (\(AddAnn a v) -> addAnnotation l a v)
+getCommentsFor :: (MonadP m) => SrcSpan -> m EpAnnComments
+getCommentsFor (RealSrcSpan l _) = allocateCommentsP l
+getCommentsFor _ = return emptyComments
+
+getPriorCommentsFor :: (MonadP m) => SrcSpan -> m EpAnnComments
+getPriorCommentsFor (RealSrcSpan l _) = allocatePriorCommentsP l
+getPriorCommentsFor _ = return emptyComments
+
+getFinalCommentsFor :: (MonadP m) => SrcSpan -> m EpAnnComments
+getFinalCommentsFor (RealSrcSpan l _) = allocateFinalCommentsP l
+getFinalCommentsFor _ = return emptyComments
+
+getEofPos :: P (Strict.Maybe (Strict.Pair RealSrcSpan RealSrcSpan))
+getEofPos = P $ \s@(PState { eof_pos = pos }) -> POk s pos
+
+addPsMessage :: SrcSpan -> PsMessage -> P ()
+addPsMessage srcspan msg = do
+  diag_opts <- (pDiagOpts . options) <$> getPState
+  addWarning (mkPlainMsgEnvelope diag_opts srcspan msg)
 
 addTabWarning :: RealSrcSpan -> P ()
 addTabWarning srcspan
  = P $ \s@PState{tab_first=tf, tab_count=tc, options=o} ->
-       let tf' = if isJust tf then tf else Just srcspan
+       let tf' = tf <|> Strict.Just srcspan
            tc' = tc + 1
            s' = if warnopt Opt_WarnTabs o
                 then s{tab_first = tf', tab_count = tc'}
                 else s
        in POk s' ()
 
-mkTabWarning :: PState -> DynFlags -> Maybe ErrMsg
-mkTabWarning PState{tab_first=tf, tab_count=tc} d =
-  let middle = if tc == 1
-        then text ""
-        else text ", and in" <+> speakNOf (tc - 1) (text "further location")
-      message = text "Tab character found here"
-                <> middle
-                <> text "."
-                $+$ text "Please use spaces instead."
-  in fmap (\s -> makeIntoWarning (Reason Opt_WarnTabs) $
-                 mkWarnMsg d (RealSrcSpan s Nothing) alwaysQualify message) tf
-
 -- | Get a bag of the errors that have been accumulated so far.
 --   Does not take -Werror into account.
-getErrorMessages :: PState -> DynFlags -> ErrorMessages
-getErrorMessages PState{messages=m} d =
-  let (_, es) = m d in es
+getPsErrorMessages :: PState -> Messages PsMessage
+getPsErrorMessages p = errors p
 
 -- | Get the warnings and errors accumulated so far.
 --   Does not take -Werror into account.
-getMessages :: PState -> DynFlags -> Messages
-getMessages p@PState{messages=m} d =
-  let (ws, es) = m d
-      tabwarning = mkTabWarning p d
-      ws' = maybe ws (`consBag` ws) tabwarning
-  in (ws', es)
+getPsMessages :: PState -> (Messages PsMessage, Messages PsMessage)
+getPsMessages p =
+  let ws = warnings p
+      diag_opts = pDiagOpts (options p)
+      -- we add the tabulation warning on the fly because
+      -- we count the number of occurrences of tab characters
+      ws' = case tab_first p of
+        Strict.Nothing -> ws
+        Strict.Just tf ->
+          let msg = mkPlainMsgEnvelope diag_opts
+                          (RealSrcSpan tf Strict.Nothing)
+                          (PsWarnTab (tab_count p))
+          in msg `addMessage` ws
+  in (ws', errors p)
 
 getContext :: P [LayoutContext]
 getContext = P $ \s@PState{context=ctx} -> POk s ctx
@@ -2902,7 +3076,7 @@ popContext = P $ \ s@(PState{ buffer = buf, options = o, context = ctx,
         (_:tl) ->
           POk s{ context = tl } ()
         []     ->
-          unP (addFatalError (mkSrcSpanPs last_loc) (srcParseErr o buf len)) s
+          unP (addFatalError $ srcParseErr o buf len (mkSrcSpanPs last_loc)) s
 
 -- Push a new layout context at the indentation of the last token read.
 pushCurrentContext :: GenSemic -> P ()
@@ -2929,32 +3103,27 @@ getOffside = P $ \s@PState{last_loc=loc, context=stk} ->
 -- Construct a parse error
 
 srcParseErr
-  :: ParserFlags
+  :: ParserOpts
   -> StringBuffer       -- current buffer (placed just after the last token)
   -> Int                -- length of the previous token
-  -> MsgDoc
-srcParseErr options buf len
-  = if null token
-         then text "parse error (possibly incorrect indentation or mismatched brackets)"
-         else text "parse error on input" <+> quotes (text token)
-              $$ ppWhen (not th_enabled && token == "$") -- #7396
-                        (text "Perhaps you intended to use TemplateHaskell")
-              $$ ppWhen (token == "<-")
-                        (if mdoInLast100
-                           then text "Perhaps you intended to use RecursiveDo"
-                           else text "Perhaps this statement should be within a 'do' block?")
-              $$ ppWhen (token == "=" && doInLast100) -- #15849
-                        (text "Perhaps you need a 'let' in a 'do' block?"
-                         $$ text "e.g. 'let x = 5' instead of 'x = 5'")
-              $$ ppWhen (not ps_enabled && pattern == "pattern ") -- #12429
-                        (text "Perhaps you intended to use PatternSynonyms")
-  where token = lexemeToString (offsetBytes (-len) buf) len
-        pattern = decodePrevNChars 8 buf
-        last100 = decodePrevNChars 100 buf
-        doInLast100 = "do" `isInfixOf` last100
-        mdoInLast100 = "mdo" `isInfixOf` last100
-        th_enabled = ThQuotesBit `xtest` pExtsBitmap options
-        ps_enabled = PatternSynonymsBit `xtest` pExtsBitmap options
+  -> SrcSpan
+  -> MsgEnvelope PsMessage
+srcParseErr options buf len loc = mkPlainErrorMsgEnvelope loc (PsErrParse token details)
+  where
+   token = lexemeToString (offsetBytes (-len) buf) len
+   pattern_ = decodePrevNChars 8 buf
+   last100 = decodePrevNChars 100 buf
+   doInLast100 = "do" `isInfixOf` last100
+   mdoInLast100 = "mdo" `isInfixOf` last100
+   th_enabled = ThQuotesBit `xtest` pExtsBitmap options
+   ps_enabled = PatternSynonymsBit `xtest` pExtsBitmap options
+   details = PsErrParseDetails {
+       ped_th_enabled      = th_enabled
+     , ped_do_in_last_100  = doInLast100
+     , ped_mdo_in_last_100 = mdoInLast100
+     , ped_pat_syn_enabled = ps_enabled
+     , ped_pattern_parsed  = pattern_ == "pattern "
+     }
 
 -- Report a parse failure, giving the span of the previous token as
 -- the location of the error.  This is the entry point for errors
@@ -2962,15 +3131,16 @@ srcParseErr options buf len
 srcParseFail :: P a
 srcParseFail = P $ \s@PState{ buffer = buf, options = o, last_len = len,
                             last_loc = last_loc } ->
-    unP (addFatalError (mkSrcSpanPs last_loc) (srcParseErr o buf len)) s
+    unP (addFatalError $ srcParseErr o buf len (mkSrcSpanPs last_loc)) s
 
 -- A lexical error is reported at a particular position in the source file,
 -- not over a token range.
-lexError :: String -> P a
-lexError str = do
+lexError :: LexErr -> P a
+lexError e = do
   loc <- getRealSrcLoc
   (AI end buf) <- getInput
-  reportLexError loc (psRealLoc end) buf str
+  reportLexError loc (psRealLoc end) buf
+    (\k srcLoc -> mkPlainErrorMsgEnvelope srcLoc $ PsErrLexer e k)
 
 -- -----------------------------------------------------------------------------
 -- This is the top-level function: called from the parser each time a
@@ -3010,6 +3180,7 @@ lexTokenAlr = do mPending <- popPendingImplicitToken
                      ITlet    -> setAlrExpectingOCurly (Just ALRLayoutLet)
                      ITof     -> setAlrExpectingOCurly (Just ALRLayoutOf)
                      ITlcase  -> setAlrExpectingOCurly (Just ALRLayoutOf)
+                     ITlcases -> setAlrExpectingOCurly (Just ALRLayoutOf)
                      ITdo  _  -> setAlrExpectingOCurly (Just ALRLayoutDo)
                      ITmdo _  -> setAlrExpectingOCurly (Just ALRLayoutDo)
                      ITrec    -> setAlrExpectingOCurly (Just ALRLayoutDo)
@@ -3085,10 +3256,9 @@ alternativeLayoutRuleToken t
              -- This next case is to handle a transitional issue:
              (ITwhere, ALRLayout _ col : ls, _)
               | newLine && thisCol == col && transitional ->
-                 do addWarning Opt_WarnAlternativeLayoutRuleTransitional
-                               (mkSrcSpanPs thisLoc)
-                               (transitionalAlternativeLayoutWarning
-                                    "`where' clause at the same depth as implicit layout block")
+                 do addPsMessage
+                      (mkSrcSpanPs thisLoc)
+                      (PsWarnTransitionalLayout TransLayout_Where)
                     setALRContext ls
                     setNextToken t
                     -- Note that we use lastLoc, as we may need to close
@@ -3097,10 +3267,9 @@ alternativeLayoutRuleToken t
              -- This next case is to handle a transitional issue:
              (ITvbar, ALRLayout _ col : ls, _)
               | newLine && thisCol == col && transitional ->
-                 do addWarning Opt_WarnAlternativeLayoutRuleTransitional
-                               (mkSrcSpanPs thisLoc)
-                               (transitionalAlternativeLayoutWarning
-                                    "`|' at the same depth as implicit layout block")
+                 do addPsMessage
+                      (mkSrcSpanPs thisLoc)
+                      (PsWarnTransitionalLayout TransLayout_Pipe)
                     setALRContext ls
                     setNextToken t
                     -- Note that we use lastLoc, as we may need to close
@@ -3167,11 +3336,6 @@ alternativeLayoutRuleToken t
              -- the other ITwhere case omitted; general case below covers it
              (_, _, _) -> return t
 
-transitionalAlternativeLayoutWarning :: String -> SDoc
-transitionalAlternativeLayoutWarning msg
-    = text "transitional layout will not be accepted in the future:"
-   $$ text msg
-
 isALRopen :: Token -> Bool
 isALRopen ITcase          = True
 isALRopen ITif            = True
@@ -3222,11 +3386,13 @@ lexToken = do
   case alexScanUser exts inp sc of
     AlexEOF -> do
         let span = mkPsSpan loc1 loc1
-        setEofPos (psRealSpan span)
+        lt <- getLastLocEof
+        setEofPos (psRealSpan span) (psRealSpan lt)
         setLastToken span 0
         return (L span ITeof)
     AlexError (AI loc2 buf) ->
-        reportLexError (psRealLoc loc1) (psRealLoc loc2) buf "lexical error"
+        reportLexError (psRealLoc loc1) (psRealLoc loc2) buf
+          (\k srcLoc -> mkPlainErrorMsgEnvelope srcLoc $ PsErrLexer LexError k)
     AlexSkip inp2 _ -> do
         setInput inp2
         lexToken
@@ -3237,39 +3403,46 @@ lexToken = do
         span `seq` setLastToken span bytes
         lt <- t span buf bytes
         let lt' = unLoc lt
-        unless (isComment lt') (setLastTk lt')
+        if (isComment lt') then setLastComment lt else setLastTk lt
         return lt
 
-reportLexError :: RealSrcLoc -> RealSrcLoc -> StringBuffer -> [Char] -> P a
-reportLexError loc1 loc2 buf str
-  | atEnd buf = failLocMsgP loc1 loc2 (str ++ " at end of input")
+reportLexError :: RealSrcLoc
+               -> RealSrcLoc
+               -> StringBuffer
+               -> (LexErrKind -> SrcSpan -> MsgEnvelope PsMessage)
+               -> P a
+reportLexError loc1 loc2 buf f
+  | atEnd buf = failLocMsgP loc1 loc2 (f LexErrKind_EOF)
   | otherwise =
   let c = fst (nextChar buf)
   in if c == '\0' -- decoding errors are mapped to '\0', see utf8DecodeChar#
-     then failLocMsgP loc2 loc2 (str ++ " (UTF-8 decoding error)")
-     else failLocMsgP loc1 loc2 (str ++ " at character " ++ show c)
+     then failLocMsgP loc2 loc2 (f LexErrKind_UTF8)
+     else failLocMsgP loc1 loc2 (f (LexErrKind_Char c))
 
-lexTokenStream :: StringBuffer -> RealSrcLoc -> DynFlags -> ParseResult [Located Token]
-lexTokenStream buf loc dflags = unP go initState{ options = opts' }
-    where dflags' = gopt_set (gopt_unset dflags Opt_Haddock) Opt_KeepRawTokenStream
-          initState@PState{ options = opts } = mkPState dflags' buf loc
-          opts' = opts{ pExtsBitmap = complement (xbit UsePosPragsBit) .&. pExtsBitmap opts }
-          go = do
-            ltok <- lexer False return
-            case ltok of
-              L _ ITeof -> return []
-              _ -> liftM (ltok:) go
+lexTokenStream :: ParserOpts -> StringBuffer -> RealSrcLoc -> ParseResult [Located Token]
+lexTokenStream opts buf loc = unP go initState{ options = opts' }
+    where
+    new_exts  =   xunset UsePosPragsBit  -- parse LINE/COLUMN pragmas as tokens
+                $ xset RawTokenStreamBit -- include comments
+                $ pExtsBitmap opts
+    opts'     = opts { pExtsBitmap = new_exts }
+    initState = initParserState opts' buf loc
+    go = do
+      ltok <- lexer False return
+      case ltok of
+        L _ ITeof -> return []
+        _ -> liftM (ltok:) go
 
 linePrags = Map.singleton "line" linePrag
 
 fileHeaderPrags = Map.fromList([("options", lex_string_prag IToptions_prag),
                                  ("options_ghc", lex_string_prag IToptions_prag),
-                                 ("options_haddock", lex_string_prag ITdocOptions),
+                                 ("options_haddock", lex_string_prag_comment ITdocOptions),
                                  ("language", token ITlanguage_prag),
                                  ("include", lex_string_prag ITinclude_prag)])
 
 ignoredPrags = Map.fromList (map ignored pragmas)
-               where ignored opt = (opt, nested_comment lexToken)
+               where ignored opt = (opt, nested_comment)
                      impls = ["hugs", "nhc98", "jhc", "yhc", "catch", "derive"]
                      options_pragmas = map ("options_" ++) impls
                      -- CFILES is a hugs-only thing.
@@ -3278,20 +3451,20 @@ ignoredPrags = Map.fromList (map ignored pragmas)
 oneWordPrags = Map.fromList [
      ("rules", rulePrag),
      ("inline",
-         strtoken (\s -> (ITinline_prag (SourceText s) Inline FunLike))),
+         strtoken (\s -> (ITinline_prag (SourceText s) (Inline (SourceText s)) FunLike))),
      ("inlinable",
-         strtoken (\s -> (ITinline_prag (SourceText s) Inlinable FunLike))),
+         strtoken (\s -> (ITinline_prag (SourceText s) (Inlinable (SourceText s)) FunLike))),
      ("inlineable",
-         strtoken (\s -> (ITinline_prag (SourceText s) Inlinable FunLike))),
+         strtoken (\s -> (ITinline_prag (SourceText s) (Inlinable (SourceText s)) FunLike))),
                                     -- Spelling variant
      ("notinline",
-         strtoken (\s -> (ITinline_prag (SourceText s) NoInline FunLike))),
+         strtoken (\s -> (ITinline_prag (SourceText s) (NoInline (SourceText s)) FunLike))),
+     ("opaque", strtoken (\s -> ITopaque_prag (SourceText s))),
      ("specialize", strtoken (\s -> ITspec_prag (SourceText s))),
      ("source", strtoken (\s -> ITsource_prag (SourceText s))),
      ("warning", strtoken (\s -> ITwarning_prag (SourceText s))),
      ("deprecated", strtoken (\s -> ITdeprecated_prag (SourceText s))),
      ("scc", strtoken (\s -> ITscc_prag (SourceText s))),
-     ("generated", strtoken (\s -> ITgenerated_prag (SourceText s))),
      ("unpack", strtoken (\s -> ITunpack_prag (SourceText s))),
      ("nounpack", strtoken (\s -> ITnounpack_prag (SourceText s))),
      ("ann", strtoken (\s -> ITann_prag (SourceText s))),
@@ -3307,9 +3480,9 @@ oneWordPrags = Map.fromList [
 
 twoWordPrags = Map.fromList [
      ("inline conlike",
-         strtoken (\s -> (ITinline_prag (SourceText s) Inline ConLike))),
+         strtoken (\s -> (ITinline_prag (SourceText s) (Inline (SourceText s)) ConLike))),
      ("notinline conlike",
-         strtoken (\s -> (ITinline_prag (SourceText s) NoInline ConLike))),
+         strtoken (\s -> (ITinline_prag (SourceText s) (NoInline (SourceText s)) ConLike))),
      ("specialize inline",
          strtoken (\s -> (ITspec_inline_prag (SourceText s) True))),
      ("specialize notinline",
@@ -3319,7 +3492,7 @@ twoWordPrags = Map.fromList [
 dispatch_pragmas :: Map String Action -> Action
 dispatch_pragmas prags span buf len = case Map.lookup (clean_pragma (lexemeToString buf len)) prags of
                                        Just found -> found span buf len
-                                       Nothing -> lexError "unknown pragma"
+                                       Nothing -> lexError LexUnknownPragma
 
 known_pragma :: Map String Action -> AlexAccPred ExtsBitmap
 known_pragma prags _ (AI _ startbuf) _ (AI _ curbuf)
@@ -3351,61 +3524,83 @@ clean_pragma prag = canon_ws (map toLower (unprefix prag))
 -}
 
 
-addAnnotationOnly :: RealSrcSpan -> AnnKeywordId -> RealSrcSpan -> P ()
-addAnnotationOnly l a v = P $ \s -> POk s {
-  annotations = ((l,a), [v]) : annotations s
-  } ()
-
+-- |Given a 'RealSrcSpan' that surrounds a 'HsPar' or 'HsParTy', generate
+-- 'AddEpAnn' values for the opening and closing bordering on the start
+-- and end of the span
+mkParensEpAnn :: RealSrcSpan -> (AddEpAnn, AddEpAnn)
+mkParensEpAnn ss = (AddEpAnn AnnOpenP (EpaSpan lo),AddEpAnn AnnCloseP (EpaSpan lc))
+  where
+    f = srcSpanFile ss
+    sl = srcSpanStartLine ss
+    sc = srcSpanStartCol ss
+    el = srcSpanEndLine ss
+    ec = srcSpanEndCol ss
+    lo = mkRealSrcSpan (realSrcSpanStart ss)        (mkRealSrcLoc f sl (sc+1))
+    lc = mkRealSrcSpan (mkRealSrcLoc f el (ec - 1)) (realSrcSpanEnd ss)
 
 queueComment :: RealLocated Token -> P()
 queueComment c = P $ \s -> POk s {
   comment_q = commentToAnnotation c : comment_q s
   } ()
 
--- | Go through the @comment_q@ in @PState@ and remove all comments
--- that belong within the given span
-allocateCommentsP :: RealSrcSpan -> P ()
-allocateCommentsP ss = P $ \s ->
-  let (comment_q', newAnns) = allocateComments ss (comment_q s) in
-    POk s {
-       comment_q = comment_q'
-     , annotations_comments = newAnns ++ (annotations_comments s)
-     } ()
-
 allocateComments
   :: RealSrcSpan
-  -> [RealLocated AnnotationComment]
-  -> ([RealLocated AnnotationComment], [(RealSrcSpan,[RealLocated AnnotationComment])])
+  -> [LEpaComment]
+  -> ([LEpaComment], [LEpaComment])
 allocateComments ss comment_q =
   let
-    (before,rest)  = break (\(L l _) -> isRealSubspanOf l ss) comment_q
-    (middle,after) = break (\(L l _) -> not (isRealSubspanOf l ss)) rest
+    (before,rest)  = break (\(L l _) -> isRealSubspanOf (anchor l) ss) comment_q
+    (middle,after) = break (\(L l _) -> not (isRealSubspanOf (anchor l) ss)) rest
     comment_q' = before ++ after
-    newAnns = if null middle then []
-                             else [(ss,middle)]
+    newAnns = middle
   in
-    (comment_q', newAnns)
+    (comment_q', reverse newAnns)
 
+allocatePriorComments
+  :: RealSrcSpan
+  -> [LEpaComment]
+  -> Strict.Maybe [LEpaComment]
+  -> (Strict.Maybe [LEpaComment], [LEpaComment], [LEpaComment])
+allocatePriorComments ss comment_q mheader_comments =
+  let
+    cmp (L l _) = anchor l <= ss
+    (before,after) = partition cmp comment_q
+    newAnns = before
+    comment_q'= after
+  in
+    case mheader_comments of
+      Strict.Nothing -> (Strict.Just (reverse newAnns), comment_q', [])
+      Strict.Just _ -> (mheader_comments, comment_q', reverse newAnns)
 
-commentToAnnotation :: RealLocated Token -> RealLocated AnnotationComment
-commentToAnnotation (L l (ITdocCommentNext s))  = L l (AnnDocCommentNext s)
-commentToAnnotation (L l (ITdocCommentPrev s))  = L l (AnnDocCommentPrev s)
-commentToAnnotation (L l (ITdocCommentNamed s)) = L l (AnnDocCommentNamed s)
-commentToAnnotation (L l (ITdocSection n s))    = L l (AnnDocSection n s)
-commentToAnnotation (L l (ITdocOptions s))      = L l (AnnDocOptions s)
-commentToAnnotation (L l (ITlineComment s))     = L l (AnnLineComment s)
-commentToAnnotation (L l (ITblockComment s))    = L l (AnnBlockComment s)
+allocateFinalComments
+  :: RealSrcSpan
+  -> [LEpaComment]
+  -> Strict.Maybe [LEpaComment]
+  -> (Strict.Maybe [LEpaComment], [LEpaComment], [LEpaComment])
+allocateFinalComments _ss comment_q mheader_comments =
+  -- We ignore the RealSrcSpan as the parser currently provides a
+  -- point span at (1,1).
+  case mheader_comments of
+    Strict.Nothing -> (Strict.Just (reverse comment_q), [], [])
+    Strict.Just _ -> (mheader_comments, [], reverse comment_q)
+
+commentToAnnotation :: RealLocated Token -> LEpaComment
+commentToAnnotation (L l (ITdocComment s ll))   = mkLEpaComment l ll (EpaDocComment s)
+commentToAnnotation (L l (ITdocOptions s ll))   = mkLEpaComment l ll (EpaDocOptions s)
+commentToAnnotation (L l (ITlineComment s ll))  = mkLEpaComment l ll (EpaLineComment s)
+commentToAnnotation (L l (ITblockComment s ll)) = mkLEpaComment l ll (EpaBlockComment s)
 commentToAnnotation _                           = panic "commentToAnnotation"
+
+-- see Note [PsSpan in Comments]
+mkLEpaComment :: RealSrcSpan -> PsSpan -> EpaCommentTok -> LEpaComment
+mkLEpaComment l ll tok = L (realSpanAsAnchor l) (EpaComment tok (psRealSpan ll))
 
 -- ---------------------------------------------------------------------
 
 isComment :: Token -> Bool
-isComment (ITlineComment     _)   = True
-isComment (ITblockComment    _)   = True
-isComment (ITdocCommentNext  _)   = True
-isComment (ITdocCommentPrev  _)   = True
-isComment (ITdocCommentNamed _)   = True
-isComment (ITdocSection      _ _) = True
-isComment (ITdocOptions      _)   = True
-isComment _ = False
+isComment (ITlineComment  _ _) = True
+isComment (ITblockComment _ _) = True
+isComment (ITdocComment   _ _) = True
+isComment (ITdocOptions   _ _) = True
+isComment _                    = False
 }

@@ -1,3 +1,15 @@
+{-# LANGUAGE LambdaCase #-}
+
+{-
+   these are needed for the Outputable instance for GenTickish,
+   since we need XTickishId to be Outputable. This should immediately
+   resolve to something like Id.
+ -}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE UndecidableInstances #-}
+
+{-# OPTIONS_GHC -fno-warn-orphans #-}
+
 {-
 (c) The University of Glasgow 2006
 (c) The AQUA Project, Glasgow University, 1996-1998
@@ -6,21 +18,20 @@
 Printing of Core syntax
 -}
 
-{-# LANGUAGE MultiWayIf #-}
-{-# LANGUAGE LambdaCase #-}
-{-# OPTIONS_GHC -fno-warn-orphans #-}
-
 module GHC.Core.Ppr (
         pprCoreExpr, pprParendExpr,
         pprCoreBinding, pprCoreBindings, pprCoreAlt,
         pprCoreBindingWithSize, pprCoreBindingsWithSize,
-        pprRules, pprOptCo
+        pprCoreBinder, pprCoreBinders, pprId, pprIds,
+        pprRule, pprRules, pprOptCo,
+        pprOcc, pprOccWithTick
     ) where
 
 import GHC.Prelude
 
 import GHC.Core
 import GHC.Core.Stats (exprStats)
+import GHC.Types.Fixity (LexicalFixity(..))
 import GHC.Types.Literal( pprLiteral )
 import GHC.Types.Name( pprInfixName, pprPrefixName )
 import GHC.Types.Var
@@ -36,8 +47,8 @@ import GHC.Types.Basic
 import GHC.Data.Maybe
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
-import GHC.Data.FastString
 import GHC.Types.SrcLoc ( pprUserRealSpan )
+import GHC.Types.Tickish
 
 {-
 ************************************************************************
@@ -68,6 +79,9 @@ instance OutputableBndr b => Outputable (Bind b) where
 
 instance OutputableBndr b => Outputable (Expr b) where
     ppr expr = pprCoreExpr expr
+
+instance OutputableBndr b => Outputable (Alt b) where
+    ppr expr = pprCoreAlt expr
 
 {-
 ************************************************************************
@@ -158,18 +172,27 @@ noParens pp = pp
 pprOptCo :: Coercion -> SDoc
 -- Print a coercion optionally; i.e. honouring -dsuppress-coercions
 pprOptCo co = sdocOption sdocSuppressCoercions $ \case
-              True  -> angleBrackets (text "Co:" <> int (coercionSize co))
-              False -> parens $ sep [ppr co, dcolon <+> ppr (coercionType co)]
+              True  -> angleBrackets (text "Co:" <> int (coercionSize co)) <+> dcolon <+> co_type
+              False -> parens $ sep [ppr co, dcolon <+> co_type]
+    where
+      co_type = sdocOption sdocSuppressCoercionTypes $ \case
+          True -> text "..."
+          False -> ppr (coercionType co)
+
+ppr_id_occ :: (SDoc -> SDoc) -> Id -> SDoc
+ppr_id_occ add_par id
+  | isJoinId id = add_par ((text "jump") <+> pp_id)
+  | otherwise   = pp_id
+  where
+    pp_id = ppr id  -- We could use pprPrefixOcc to print (+) etc, but this is
+                    -- Core where we don't print things infix anyway, so doing
+                    -- so just adds extra redundant parens
 
 ppr_expr :: OutputableBndr b => (SDoc -> SDoc) -> Expr b -> SDoc
         -- The function adds parens in context that need
         -- an atomic value (e.g. function args)
 
-ppr_expr add_par (Var name)
- | isJoinId name               = add_par ((text "jump") <+> pp_name)
- | otherwise                   = pp_name
- where
-   pp_name = pprPrefixOcc name
+ppr_expr add_par (Var id)      = ppr_id_occ add_par id
 ppr_expr add_par (Type ty)     = add_par (text "TYPE:" <+> ppr ty)       -- Weird
 ppr_expr add_par (Coercion co) = add_par (text "CO:" <+> ppr co)
 ppr_expr add_par (Lit lit)     = pprLiteral add_par lit
@@ -212,13 +235,12 @@ ppr_expr add_par expr@(App {})
 
                    _ -> parens (hang fun_doc 2 pp_args)
                    where
-                     fun_doc | isJoinId f = text "jump" <+> ppr f
-                             | otherwise  = ppr f
+                     fun_doc = ppr_id_occ noParens f
 
         _ -> parens (hang (pprParendExpr fun) 2 pp_args)
     }
 
-ppr_expr add_par (Case expr var ty [(con,args,rhs)])
+ppr_expr add_par (Case expr var ty [Alt con args rhs])
   = sdocOption sdocPrintCaseAsLet $ \case
       True -> add_par $  -- See Note [Print case as let]
                sep [ sep [ text "let! {"
@@ -296,8 +318,8 @@ ppr_expr add_par (Tick tickish expr)
       True  -> ppr_expr add_par expr
       False -> add_par (sep [ppr tickish, pprCoreExpr expr])
 
-pprCoreAlt :: OutputableBndr a => (AltCon, [a] , Expr a) -> SDoc
-pprCoreAlt (con, args, rhs)
+pprCoreAlt :: OutputableBndr a => Alt a -> SDoc
+pprCoreAlt (Alt con args rhs)
   = hang (ppr_case_pat con args <+> arrow) 2 (pprCoreExpr rhs)
 
 ppr_case_pat :: OutputableBndr a => AltCon -> [a] -> SDoc
@@ -340,7 +362,6 @@ and @pprCoreExpr@ functions.
 
 Note [Binding-site specific printing]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 pprCoreBinder and pprTypedLamBinder receive a BindingSite argument to adjust
 the information printed.
 
@@ -367,6 +388,17 @@ instance Outputable b => OutputableBndr (TaggedBndr b) where
   pprPrefixOcc b = ppr b
   bndrIsJoin_maybe (TB b _) = isJoinId_maybe b
 
+pprOcc :: OutputableBndr a => LexicalFixity -> a -> SDoc
+pprOcc Infix  = pprInfixOcc
+pprOcc Prefix = pprPrefixOcc
+
+pprOccWithTick :: OutputableBndr a => LexicalFixity -> PromotionFlag -> a -> SDoc
+pprOccWithTick fixity prom op
+  | isPromoted prom
+  = quote (pprOcc fixity op)
+  | otherwise
+  = pprOcc fixity op
+
 pprCoreBinder :: BindingSite -> Var -> SDoc
 pprCoreBinder LetBind binder
   | isTyVar binder = pprKindedTyVarBndr binder
@@ -377,6 +409,10 @@ pprCoreBinder LetBind binder
 pprCoreBinder bind_site bndr
   = getPprDebug $ \debug ->
     pprTypedLamBinder bind_site debug bndr
+
+pprCoreBinders :: [Var] -> SDoc
+-- Print as lambda-binders, i.e. with their type
+pprCoreBinders vs = sep (map (pprCoreBinder LambdaBind) vs)
 
 pprUntypedBinder :: Var -> SDoc
 pprUntypedBinder binder
@@ -411,7 +447,7 @@ pprTypedLamBinder bind_site debug_on var
                                    2 (vcat [ dcolon <+> pprType (idType var)
                                            , pp_unf]))
   where
-    unf_info = unfoldingInfo (idInfo var)
+    unf_info = realUnfoldingInfo (idInfo var)
     pp_unf | hasSomeUnfolding unf_info = text "Unf=" <> ppr unf_info
            | otherwise                 = empty
 
@@ -429,6 +465,13 @@ pprKindedTyVarBndr :: TyVar -> SDoc
 -- Print a type variable binder with its kind (but not if *)
 pprKindedTyVarBndr tyvar
   = text "@" <> pprTyVar tyvar
+
+-- pprId x prints x :: ty
+pprId :: Id -> SDoc
+pprId x = ppr x <+> dcolon <+> ppr (idType x)
+
+pprIds :: [Id] -> SDoc
+pprIds xs = sep (map pprId xs)
 
 -- pprIdBndr does *not* print the type
 -- When printing any Id binder in debug mode, we print its inline pragma and one-shot-ness
@@ -492,10 +535,10 @@ instance Outputable IdInfo where
       caf_info = cafInfo info
       has_caf_info = not (mayHaveCafRefs caf_info)
 
-      str_info = strictnessInfo info
-      has_str_info = not (isTopSig str_info)
+      str_info = dmdSigInfo info
+      has_str_info = not (isNopSig str_info)
 
-      unf_info = unfoldingInfo info
+      unf_info = realUnfoldingInfo info
       has_unf = hasSomeUnfolding unf_info
 
       rules = ruleInfoRules (ruleInfo info)
@@ -536,13 +579,13 @@ ppIdInfo id info
     caf_info = cafInfo info
     has_caf_info = not (mayHaveCafRefs caf_info)
 
-    str_info = strictnessInfo info
-    has_str_info = not (isTopSig str_info)
+    str_info = dmdSigInfo info
+    has_str_info = not (isNopSig str_info)
 
-    cpr_info = cprInfo info
+    cpr_info = cprSigInfo info
     has_cpr_info = cpr_info /= topCprSig
 
-    unf_info = unfoldingInfo info
+    unf_info = realUnfoldingInfo info
     has_unf = hasSomeUnfolding unf_info
 
     rules = ruleInfoRules (ruleInfo info)
@@ -583,22 +626,18 @@ instance Outputable Unfolding where
   ppr BootUnfolding              = text "No unfolding (from boot)"
   ppr (OtherCon cs)              = text "OtherCon" <+> ppr cs
   ppr (DFunUnfolding { df_bndrs = bndrs, df_con = con, df_args = args })
-       = hang (text "DFun:" <+> ptext (sLit "\\")
+       = hang (text "DFun:" <+> char '\\'
                 <+> sep (map (pprBndr LambdaBind) bndrs) <+> arrow)
             2 (ppr con <+> sep (map ppr args))
   ppr (CoreUnfolding { uf_src = src
-                     , uf_tmpl=rhs, uf_is_top=top, uf_is_value=hnf
-                     , uf_is_conlike=conlike, uf_is_work_free=wf
-                     , uf_expandable=exp, uf_guidance=g })
+                     , uf_tmpl=rhs, uf_is_top=top
+                     , uf_cache=cache, uf_guidance=g })
         = text "Unf" <> braces (pp_info $$ pp_rhs)
     where
       pp_info = fsep $ punctuate comma
                 [ text "Src="        <> ppr src
                 , text "TopLvl="     <> ppr top
-                , text "Value="      <> ppr hnf
-                , text "ConLike="    <> ppr conlike
-                , text "WorkFree="   <> ppr wf
-                , text "Expandable=" <> ppr exp
+                , ppr cache
                 , text "Guidance="   <> ppr g ]
       pp_tmpl = ppUnlessOption sdocSuppressUnfoldings
                   (text "Tmpl=" <+> ppr rhs)
@@ -606,6 +645,15 @@ instance Outputable Unfolding where
              | otherwise          = empty
             -- Don't print the RHS or we get a quadratic
             -- blowup in the size of the printout!
+
+instance Outputable UnfoldingCache where
+    ppr (UnfoldingCache { uf_is_value = hnf, uf_is_conlike = conlike
+                        , uf_is_work_free = wf, uf_expandable = exp })
+        = fsep $ punctuate comma
+          [ text "Value="      <> ppr hnf
+          , text "ConLike="    <> ppr conlike
+          , text "WorkFree="   <> ppr wf
+          , text "Expandable=" <> ppr exp ]
 
 {-
 -----------------------------------------------------
@@ -627,8 +675,7 @@ pprRule (Rule { ru_name = name, ru_act = act, ru_fn = fn,
                 ru_bndrs = tpl_vars, ru_args = tpl_args,
                 ru_rhs = rhs })
   = hang (doubleQuotes (ftext name) <+> ppr act)
-       4 (sep [text "forall" <+>
-                  sep (map (pprCoreBinder LambdaBind) tpl_vars) <> dot,
+       4 (sep [text "forall" <+> pprCoreBinders tpl_vars <> dot,
                nest 2 (ppr fn <+> sep (map pprArg tpl_args)),
                nest 2 (text "=" <+> pprCoreExpr rhs)
             ])
@@ -639,13 +686,13 @@ pprRule (Rule { ru_name = name, ru_act = act, ru_fn = fn,
 -----------------------------------------------------
 -}
 
-instance Outputable id => Outputable (Tickish id) where
+instance Outputable (XTickishId pass) => Outputable (GenTickish pass) where
   ppr (HpcTick modl ix) =
       hcat [text "hpc<",
             ppr modl, comma,
             ppr ix,
             text ">"]
-  ppr (Breakpoint ix vars) =
+  ppr (Breakpoint _ext ix vars) =
       hcat [text "break<",
             ppr ix,
             text ">",

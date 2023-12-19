@@ -11,8 +11,8 @@ their types differ.
 This was originally reported as #9291.
 
 There are two types of common code occurrences that we aim for, see
-note [Case 1: CSEing allocated closures] and
-note [Case 2: CSEing case binders] below.
+Note [Case 1: CSEing allocated closures] and
+Note [Case 2: CSEing case binders] below.
 
 
 Note [Case 1: CSEing allocated closures]
@@ -95,13 +95,13 @@ import GHC.Prelude
 import GHC.Core.DataCon
 import GHC.Types.Id
 import GHC.Stg.Syntax
-import GHC.Utils.Outputable
 import GHC.Types.Basic (isWeakLoopBreaker)
 import GHC.Types.Var.Env
 import GHC.Core (AltCon(..))
 import Data.List (mapAccumL)
 import Data.Maybe (fromMaybe)
-import GHC.Core.Map
+import GHC.Core.Map.Expr
+import GHC.Data.TrieMap
 import GHC.Types.Name.Env
 import Control.Monad( (>=>) )
 
@@ -128,6 +128,8 @@ instance TrieMap StgArgMap where
     foldTM k m = foldTM k (sam_var m) . foldTM k (sam_lit m)
     mapTM f (SAM {sam_var = varm, sam_lit = litm}) =
         SAM { sam_var = mapTM f varm, sam_lit = mapTM f litm }
+    filterTM f (SAM {sam_var = varm, sam_lit = litm}) =
+        SAM { sam_var = filterTM f varm, sam_lit = filterTM f litm }
 
 newtype ConAppMap a = CAM { un_cam :: DNameEnv (ListMap StgArgMap a) }
 
@@ -139,12 +141,13 @@ instance TrieMap ConAppMap where
         m { un_cam = un_cam m |> xtDNamed dataCon |>> alterTM args f }
     foldTM k = un_cam >.> foldTM (foldTM k)
     mapTM f  = un_cam >.> mapTM (mapTM f) >.> CAM
+    filterTM f = un_cam >.> mapTM (filterTM f) >.> CAM
 
 -----------------
 -- The CSE Env --
 -----------------
 
--- | The CSE environment. See note [CseEnv Example]
+-- | The CSE environment. See Note [CseEnv Example]
 data CseEnv = CseEnv
     { ce_conAppMap :: ConAppMap OutId
         -- ^ The main component of the environment is the trie that maps
@@ -200,30 +203,53 @@ initEnv in_scope = CseEnv
     , ce_in_scope  = in_scope
     }
 
+-------------------
+normaliseConArgs :: CseEnv -> [OutStgArg] -> [OutStgArg]
+-- See Note [Trivial case scrutinee]
+normaliseConArgs env args
+  = map go args
+  where
+    bndr_map = ce_bndrMap env
+    go (StgVarArg v  ) = StgVarArg (normaliseId bndr_map v)
+    go (StgLitArg lit) = StgLitArg lit
+
+normaliseId :: IdEnv OutId -> OutId -> OutId
+normaliseId bndr_map v = case lookupVarEnv bndr_map v of
+                           Just v' -> v'
+                           Nothing -> v
+
+addTrivCaseBndr :: OutId -> OutId -> CseEnv -> CseEnv
+-- See Note [Trivial case scrutinee]
+addTrivCaseBndr from to env
+    = env { ce_bndrMap = extendVarEnv bndr_map from norm_to }
+    where
+      bndr_map = ce_bndrMap env
+      norm_to = normaliseId bndr_map to
+
 envLookup :: DataCon -> [OutStgArg] -> CseEnv -> Maybe OutId
-envLookup dataCon args env = lookupTM (dataCon, args') (ce_conAppMap env)
-  where args' = map go args -- See Note [Trivial case scrutinee]
-        go (StgVarArg v  ) = StgVarArg (fromMaybe v $ lookupVarEnv (ce_bndrMap env) v)
-        go (StgLitArg lit) = StgLitArg lit
+envLookup dataCon args env
+  = lookupTM (dataCon, normaliseConArgs env args)
+             (ce_conAppMap env)
+    -- normaliseConArgs: See Note [Trivial case scrutinee]
 
 addDataCon :: OutId -> DataCon -> [OutStgArg] -> CseEnv -> CseEnv
--- do not bother with nullary data constructors, they are static anyways
+-- Do not bother with nullary data constructors; they are static anyway
 addDataCon _ _ [] env = env
-addDataCon bndr dataCon args env = env { ce_conAppMap = new_env }
+addDataCon bndr dataCon args env
+  = env { ce_conAppMap = new_env }
   where
-    new_env = insertTM (dataCon, args) bndr (ce_conAppMap env)
+    new_env = insertTM (dataCon, normaliseConArgs env args)
+                       bndr (ce_conAppMap env)
+    -- normaliseConArgs: See Note [Trivial case scrutinee]
 
+-------------------
 forgetCse :: CseEnv -> CseEnv
 forgetCse env = env { ce_conAppMap = emptyTM }
-    -- See note [Free variables of an StgClosure]
+    -- See Note [Free variables of an StgClosure]
 
 addSubst :: OutId -> OutId -> CseEnv -> CseEnv
 addSubst from to env
     = env { ce_subst = extendVarEnv (ce_subst env) from to }
-
-addTrivCaseBndr :: OutId -> OutId -> CseEnv -> CseEnv
-addTrivCaseBndr from to env
-    = env { ce_bndrMap = extendVarEnv (ce_bndrMap env) from to }
 
 substArgs :: CseEnv -> [InStgArg] -> [OutStgArg]
 substArgs env = map (substArg env)
@@ -289,8 +315,8 @@ stgCseTopLvlRhs :: InScopeSet -> InStgRhs -> OutStgRhs
 stgCseTopLvlRhs in_scope (StgRhsClosure ext ccs upd args body)
     = let body' = stgCseExpr (initEnv in_scope) body
       in  StgRhsClosure ext ccs upd args body'
-stgCseTopLvlRhs _ (StgRhsCon ccs dataCon args)
-    = StgRhsCon ccs dataCon args
+stgCseTopLvlRhs _ (StgRhsCon ccs dataCon mu ticks args)
+    = StgRhsCon ccs dataCon mu ticks args
 
 ------------------------------
 -- The actual AST traversal --
@@ -307,8 +333,6 @@ stgCseExpr _ (StgLit lit)
 stgCseExpr env (StgOpApp op args tys)
     = StgOpApp op args' tys
   where args' = substArgs env args
-stgCseExpr _ (StgLam _ _)
-    = pprPanic "stgCseExp" (text "StgLam")
 stgCseExpr env (StgTick tick body)
     = let body' = stgCseExpr env body
       in StgTick tick body'
@@ -317,19 +341,21 @@ stgCseExpr env (StgCase scrut bndr ty alts)
   where
     scrut' = stgCseExpr env scrut
     (env1, bndr') = substBndr env bndr
-    env2 | StgApp trivial_scrut [] <- scrut' = addTrivCaseBndr bndr trivial_scrut env1
+    env2 | StgApp trivial_scrut [] <- scrut'
+         = addTrivCaseBndr bndr trivial_scrut env1
                  -- See Note [Trivial case scrutinee]
-         | otherwise                         = env1
+         | otherwise
+         = env1
     alts' = map (stgCseAlt env2 ty bndr') alts
 
 
 -- A constructor application.
 -- To be removed by a variable use when found in the CSE environment
-stgCseExpr env (StgConApp dataCon args tys)
+stgCseExpr env (StgConApp dataCon n args tys)
     | Just bndr' <- envLookup dataCon args' env
     = StgApp bndr' []
     | otherwise
-    = StgConApp dataCon args' tys
+    = StgConApp dataCon n args' tys
   where args' = substArgs env args
 
 -- Let bindings
@@ -348,7 +374,7 @@ stgCseExpr env (StgLetNoEscape ext binds body)
 -- Case alternatives
 -- Extend the CSE environment
 stgCseAlt :: CseEnv -> AltType -> OutId -> InStgAlt -> OutStgAlt
-stgCseAlt env ty case_bndr (DataAlt dataCon, args, rhs)
+stgCseAlt env ty case_bndr GenStgAlt{alt_con=DataAlt dataCon, alt_bndrs=args, alt_rhs=rhs}
     = let (env1, args') = substBndrs env args
           env2
             -- To avoid dealing with unboxed sums StgCse runs after unarise and
@@ -361,13 +387,13 @@ stgCseAlt env ty case_bndr (DataAlt dataCon, args, rhs)
             = addDataCon case_bndr dataCon (map StgVarArg args') env1
             | otherwise
             = env1
-            -- see note [Case 2: CSEing case binders]
+            -- see Note [Case 2: CSEing case binders]
           rhs' = stgCseExpr env2 rhs
-      in (DataAlt dataCon, args', rhs')
-stgCseAlt env _ _ (altCon, args, rhs)
+      in GenStgAlt (DataAlt dataCon) args' rhs'
+stgCseAlt env _ _ g@GenStgAlt{alt_con=_, alt_bndrs=args, alt_rhs=rhs}
     = let (env1, args') = substBndrs env args
           rhs' = stgCseExpr env1 rhs
-      in (altCon, args', rhs')
+      in g {alt_bndrs=args', alt_rhs=rhs'}
 
 -- Bindings
 stgCseBind :: CseEnv -> InStgBinding -> (Maybe OutStgBinding, CseEnv)
@@ -394,21 +420,21 @@ stgCsePairs env0 ((b,e):pairs)
 -- The RHS of a binding.
 -- If it is a constructor application, either short-cut it or extend the environment
 stgCseRhs :: CseEnv -> OutId -> InStgRhs -> (Maybe (OutId, OutStgRhs), CseEnv)
-stgCseRhs env bndr (StgRhsCon ccs dataCon args)
+stgCseRhs env bndr (StgRhsCon ccs dataCon mu ticks args)
     | Just other_bndr <- envLookup dataCon args' env
     , not (isWeakLoopBreaker (idOccInfo bndr)) -- See Note [Care with loop breakers]
     = let env' = addSubst bndr other_bndr env
       in (Nothing, env')
     | otherwise
     = let env' = addDataCon bndr dataCon args' env
-            -- see note [Case 1: CSEing allocated closures]
-          pair = (bndr, StgRhsCon ccs dataCon args')
+            -- see Note [Case 1: CSEing allocated closures]
+          pair = (bndr, StgRhsCon ccs dataCon mu ticks args')
       in (Just pair, env')
   where args' = substArgs env args
 
 stgCseRhs env bndr (StgRhsClosure ext ccs upd args body)
     = let (env1, args') = substBndrs env args
-          env2 = forgetCse env1 -- See note [Free variables of an StgClosure]
+          env2 = forgetCse env1 -- See Note [Free variables of an StgClosure]
           body' = stgCseExpr env2 body
       in (Just (substVar env bndr, StgRhsClosure ext ccs upd args' body'), env)
 
@@ -419,8 +445,8 @@ mkStgCase scrut bndr ty alts | all isBndr alts = scrut
 
   where
     -- see Note [All alternatives are the binder]
-    isBndr (_, _, StgApp f []) = f == bndr
-    isBndr _                   = False
+    isBndr GenStgAlt{alt_con=_,alt_bndrs=_,alt_rhs=StgApp f []} = f == bndr
+    isBndr _                                                    = False
 
 
 {- Note [Care with loop breakers]
@@ -467,25 +493,70 @@ we can.
 
 Note [Trivial case scrutinee]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-We want to be able to handle nested reconstruction of constructors as in
+We want to be able to CSE nested reconstruction of constructors as in
 
     nested :: Either Int (Either Int a) -> Either Bool (Either Bool a)
     nested (Right (Right v)) = Right (Right v)
-    nested _ = Left True
+    nested _                 = Left True
 
-So if we come across
-
+We want the RHS of the first branch to be just the original argument.
+The RHS of 'nested' will look like
     case x of r1
       Right a -> case a of r2
               Right b -> let v = Right b
                          in Right v
+Then:
+* We create the ce_conAppMap [Right a :-> r1, Right b :-> r2].
+* When we encounter v = Right b, we'll drop the binding and extend
+  the substitution with [v :-> r2]
+* But now when we see (Right v), we'll substitute to get (Right r2)...and
+  fail to find that in the ce_conAppMap!
 
-we first replace v with r2. Next we want to replace Right r2 with r1. But the
-ce_conAppMap contains Right a!
+Solution:
 
-Therefore, we add r1 ↦ x to ce_bndrMap when analysing the outer case, and use
-this substitution before looking Right r2 up in ce_conAppMap, and everything
-works out.
+* When passing (case x of bndr { alts }), where 'x' is a variable, we
+  add [bndr :-> x] to the ce_bndrMap.  In our example the ce_bndrMap will
+  be [r1 :-> x, r2 :-> a]. This is done in addTrivCaseBndr.
+
+* Before doing the /lookup/ in ce_conAppMap, we "normalise" the
+  arguments with the ce_bndrMap.  In our example, we normalise
+  (Right r2) to (Right a), and then find it in the map.  Normalisation
+  is done by normaliseConArgs.
+
+* Similarly before /inserting/ in ce_conAppMap, we normalise the arguments.
+  This is a bit more subtle. Suppose we have
+       case x of y
+         DEFAULT -> let a = Just y
+                    let b = Just y
+                    in ...
+  We'll have [y :-> x] in the ce_bndrMap.  When looking up (Just y) in
+  the map, we'll normalise it to (Just x).  So we'd better normalise
+  the (Just y) in the defn of 'a', before inserting it!
+
+* When inserting into cs_bndrMap, we must normalise that too!
+      case x of y
+        DEFAULT -> case y of z
+                      DEFAULT -> ...
+  We want the cs_bndrMap to be [y :-> x, z :-> x]!
+  Hence the call to normaliseId in addTrivCaseBinder.
+
+All this is a bit tricky.  Why does it not occur for the Core version
+of CSE?  See Note [CSE for bindings] in GHC.Core.Opt.CSE.  The reason
+is this: in Core CSE we augment the /main substitution/ with [y :-> x]
+etc, so as a side consequence we transform
+    case x of y       ===>    case x of y
+      pat -> ...y...             pat -> ...x...
+That is, the /exact reverse/ of the binder-swap transformation done by
+the occurrence analyser.  However, it's easy for CSE to do on-the-fly,
+and it completely solves the above tricky problem, using only two maps:
+the main reverse-map, and the substitution.  The occurrence analyser
+puts it back the way it should be, the next time it runs.
+
+However in STG there is no occurrence analyser, and we don't want to
+require another pass.  So the ce_bndrMap is a little swizzle that we
+apply just when manipulating the ce_conAppMap, but that does not
+affect the output program.
+
 
 Note [Free variables of an StgClosure]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

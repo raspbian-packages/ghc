@@ -1,6 +1,6 @@
 module Settings.Default (
     -- * Packages that are build by default and for the testsuite
-    defaultPackages, testsuitePackages,
+    defaultPackages, testsuitePackages, stage0Packages,
 
     -- * Default build ways
     defaultLibraryWays, defaultRtsWays,
@@ -13,15 +13,15 @@ module Settings.Default (
     defaultFlavour, defaultBignumBackend
     ) where
 
-import qualified Hadrian.Builder.Ar
 import qualified Hadrian.Builder.Sphinx
 import qualified Hadrian.Builder.Tar
 import Hadrian.Haskell.Cabal.Type
 
 import CommandLine
 import Expression
-import Flavour
+import Flavour.Type
 import Oracles.Flag
+import Oracles.Setting
 import Packages
 import Settings.Builders.Alex
 import Settings.Builders.DeriveConstants
@@ -35,6 +35,7 @@ import Settings.Builders.Haddock
 import Settings.Builders.Happy
 import Settings.Builders.Hsc2Hs
 import Settings.Builders.HsCpp
+import Settings.Builders.Ar
 import Settings.Builders.Ld
 import Settings.Builders.Make
 import Settings.Builders.MergeObjects
@@ -42,10 +43,13 @@ import Settings.Builders.RunTest
 import Settings.Builders.Xelatex
 import Settings.Packages
 import Settings.Warnings
+import qualified Hadrian.Builder.Git
+import Settings.Builders.Win32Tarballs
 
 -- | Packages that are built by default. You can change this in "UserSettings".
 defaultPackages :: Stage -> Action [Package]
-defaultPackages Stage0 = stage0Packages
+defaultPackages (Stage0 GlobalLibs) = stageBootPackages
+defaultPackages (Stage0 InTreeLibs) = stage0Packages
 defaultPackages Stage1 = stage1Packages
 defaultPackages Stage2 = stage2Packages
 defaultPackages Stage3 = return []
@@ -54,19 +58,28 @@ defaultPackages Stage3 = return []
 defaultBignumBackend :: String
 defaultBignumBackend = "gmp"
 
+-- These packages are things needed to do the build.. so they are only built by
+-- boot compiler, with global package database. By default we will only build these
+-- packages in StageBoot so if you also need to distribute anything here then add
+-- it to `stage0packages` or `stage1packages` as appropiate.
+stageBootPackages :: Action [Package]
+stageBootPackages = return [lintersCommon, lintCommitMsg, lintSubmoduleRefs, lintWhitespace, lintNotes, hsc2hs, compareSizes, deriveConstants, genapply, genprimopcode, unlit ]
+
 -- | Packages built in 'Stage0' by default. You can change this in "UserSettings".
 stage0Packages :: Action [Package]
 stage0Packages = do
     cross <- flag CrossCompiling
     return $ [ binary
+             , bytestring
+             , cabalSyntax
              , cabal
-             , compareSizes
              , compiler
-             , deriveConstants
+             , containers
+             , directory
+             , process
              , exceptions
-             , genapply
-             , genprimopcode
              , ghc
+             , runGhc
              , ghcBoot
              , ghcBootTh
              , ghcHeap
@@ -75,12 +88,15 @@ stage0Packages = do
              , haddock
              , hsc2hs
              , hpc
+             , hpcBin
              , mtl
              , parsec
+             , time
              , templateHaskell
              , text
              , transformers
              , unlit
+             , if windowsHost then win32 else unix
              ]
           ++ [ terminfo | not windowsHost, not cross ]
           ++ [ timeout  | windowsHost                ]
@@ -90,44 +106,57 @@ stage0Packages = do
 -- | Packages built in 'Stage1' by default. You can change this in "UserSettings".
 stage1Packages :: Action [Package]
 stage1Packages = do
-    libraries0 <- filter isLibrary <$> stage0Packages
+    let good_stage0_package p
+          -- we only keep libraries for some reason
+          | not (isLibrary p) = False
+          -- but not win32/unix because it depends on cross-compilation target
+          | p == win32        = False
+          | p == unix         = False
+          | otherwise         = True
+
+    libraries0 <- filter good_stage0_package <$> stage0Packages
     cross      <- flag CrossCompiling
-    return $ libraries0 -- Build all Stage0 libraries in Stage1
-          ++ [ array
-             , base
-             , bytestring
-             , containers
-             , deepseq
-             , directory
-             , exceptions
-             , filepath
-             , ghc
-             , ghcBignum
-             , ghcCompact
-             , ghcPkg
-             , ghcPrim
-             , haskeline
-             , hp2ps
-             , hsc2hs
-             , integerGmp
-             , pretty
-             , process
-             , rts
-             , stm
-             , time
-             , unlit
-             , xhtml
-             ]
-          ++ [ haddock  | not cross                  ]
-          ++ [ hpcBin   | not cross                  ]
-          ++ [ iserv    | not cross ]
-          ++ [ libiserv | not cross ]
-          ++ [ runGhc   | not cross                  ]
-          ++ [ touchy   | windowsHost                ]
-             -- See Note [Hadrian's ghci-wrapper package]
-          ++ [ ghciWrapper | windowsHost             ]
-          ++ [ unix     | not windowsHost            ]
-          ++ [ win32    | windowsHost                ]
+    winTarget  <- isWinTarget
+
+    let when c xs = if c then xs else mempty
+
+    return $ mconcat
+      [ libraries0 -- Build all Stage0 libraries in Stage1
+      , [ array
+        , base
+        , containers
+        , deepseq
+        , exceptions
+        , filepath
+        , ghc
+        , ghcBignum
+        , ghcCompact
+        , ghcPkg
+        , ghcPrim
+        , haskeline
+        , hp2ps
+        , hsc2hs
+        , integerGmp
+        , pretty
+        , rts
+        , stm
+        , unlit
+        , xhtml
+        , if winTarget then win32 else unix
+        ]
+      , when (not cross)
+        [ haddock
+        , hpcBin
+        , iserv
+        , libiserv
+        , runGhc
+        ]
+      , when (winTarget && not cross)
+        [ touchy
+         -- See Note [Hadrian's ghci-wrapper package]
+        , ghciWrapper
+        ]
+      ]
 
 -- | Packages built in 'Stage2' by default. You can change this in "UserSettings".
 stage2Packages :: Action [Package]
@@ -135,7 +164,7 @@ stage2Packages = stage1Packages
 
 -- | Packages that are built only for the testsuite.
 testsuitePackages :: Action [Package]
-testsuitePackages = return ([ timeout | windowsHost ] ++ [ checkPpr, checkApiAnnotations ])
+testsuitePackages = return ([ timeout | windowsHost ] ++ [ checkPpr, checkExact, countDeps, ghcConfig ])
 
 -- | Default build ways for library packages:
 -- * We always build 'vanilla' way.
@@ -154,12 +183,10 @@ defaultRtsWays = mconcat
   [ pure [vanilla, threaded]
   , notStage0 ? pure
       [ profiling, threadedProfiling, debugProfiling, threadedDebugProfiling
-      , logging, threadedLogging
       , debug, threadedDebug
       ]
   , notStage0 ? platformSupportsSharedLibs ? pure
-      [ dynamic, threadedDynamic, debugDynamic, loggingDynamic
-      , threadedDebugDynamic, threadedLoggingDynamic
+      [ dynamic, threadedDynamic, debugDynamic, threadedDebugDynamic
       ]
   ]
 
@@ -216,6 +243,7 @@ defaultFlavour = Flavour
     , ghciWithDebugger   = False
     , ghcProfiled        = False
     , ghcDebugged        = False
+    , ghcDebugAssertions = False
     , ghcThreaded        = True
     , ghcDocs            = cmdDocsArgs }
 
@@ -246,20 +274,22 @@ defaultBuilderArgs = mconcat
     , hsc2hsBuilderArgs
     , hsCppBuilderArgs
     , ldBuilderArgs
+    , arBuilderArgs
     , makeBuilderArgs
     , mergeObjectsBuilderArgs
     , runTestBuilderArgs
     , validateBuilderArgs
     , xelatexBuilderArgs
+    , win32TarballsArgs
     -- Generic builders from the Hadrian library:
-    , builder (Ar Pack         ) ? Hadrian.Builder.Ar.args Pack
-    , builder (Ar Unpack       ) ? Hadrian.Builder.Ar.args Unpack
     , builder (Sphinx HtmlMode ) ? Hadrian.Builder.Sphinx.args HtmlMode
     , builder (Sphinx LatexMode) ? Hadrian.Builder.Sphinx.args LatexMode
     , builder (Sphinx ManMode  ) ? Hadrian.Builder.Sphinx.args ManMode
     , builder (Sphinx InfoMode ) ? Hadrian.Builder.Sphinx.args InfoMode
     , builder (Tar Create      ) ? Hadrian.Builder.Tar.args Create
-    , builder (Tar Extract     ) ? Hadrian.Builder.Tar.args Extract ]
+    , builder (Tar Extract     ) ? Hadrian.Builder.Tar.args Extract
+    , Hadrian.Builder.Git.gitArgs
+    ]
 
 -- | All 'Package'-dependent command line arguments.
 defaultPackageArgs :: Args

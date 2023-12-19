@@ -9,7 +9,7 @@
 
 #if defined(PROFILING)
 
-#include "PosixSource.h"
+#include "rts/PosixSource.h"
 #include "Rts.h"
 
 #include "RetainerProfile.h"
@@ -49,7 +49,7 @@ information about the retainers is still applicable.
 
 /*
   Note: what to change in order to plug-in a new retainer profiling scheme?
-    (1) type retainer in ../includes/StgRetainerProf.h
+    (1) type retainer in include/StgRetainerProf.h
     (2) retainer function R(), i.e., getRetainerFrom()
     (3) the two hashing functions, hashKeySingleton() and hashKeyAddElement(),
         in RetainerSet.h, if needed.
@@ -251,13 +251,26 @@ associate( StgClosure *c, RetainerSet *s )
 {
     // StgWord has the same size as pointers, so the following type
     // casting is okay.
-    RSET(c) = (RetainerSet *)((StgWord)s | flip);
+    setTravData(&g_retainerTraverseState, c, (StgWord)s);
+}
+
+bool isRetainerSetValid( const StgClosure *c )
+{
+    return isTravDataValid(&g_retainerTraverseState, c);
+}
+
+inline RetainerSet*
+retainerSetOf( const StgClosure *c )
+{
+    ASSERT(isRetainerSetValid(c));
+    return (RetainerSet*)getTravData(c);
 }
 
 static bool
-retainVisitClosure( StgClosure *c, const StgClosure *cp, const stackData data, const bool first_visit, stackData *out_data )
+retainVisitClosure( StgClosure *c, const StgClosure *cp, const stackData data, const bool first_visit, stackAccum *acc, stackData *out_data )
 {
     (void) first_visit;
+    (void) acc;
 
     retainer r = data.c_child_r;
     RetainerSet *s, *retainerSetOfc;
@@ -347,11 +360,11 @@ retainRoot(void *user, StgClosure **tl)
     // be a root.
 
     c = UNTAG_CLOSURE(*tl);
-    traverseMaybeInitClosureData(c);
+    traverseMaybeInitClosureData(&g_retainerTraverseState, c);
     if (c != &stg_END_TSO_QUEUE_closure && isRetainer(c)) {
-        traversePushClosure(ts, c, c, (stackData)getRetainerFrom(c));
+        traversePushRoot(ts, c, c, (stackData)getRetainerFrom(c));
     } else {
-        traversePushClosure(ts, c, c, (stackData)CCS_SYSTEM);
+        traversePushRoot(ts, c, c, (stackData)CCS_SYSTEM);
     }
 
     // NOT TRUE: ASSERT(isMember(getRetainerFrom(*tl), retainerSetOf(*tl)));
@@ -368,6 +381,8 @@ computeRetainerSet( traverseState *ts )
     StgWeak *weak;
     uint32_t g, n;
 
+    traverseInvalidateClosureData(ts);
+
     markCapabilities(retainRoot, (void*)ts); // for scheduler roots
 
     // This function is called after a major GC, when key, value, and finalizer
@@ -375,11 +390,11 @@ computeRetainerSet( traverseState *ts )
     //
     // The following code assumes that WEAK objects are considered to be roots
     // for retainer profiling.
-    for (n = 0; n < n_capabilities; n++) {
+    for (n = 0; n < getNumCapabilities(); n++) {
         // NB: after a GC, all nursery weak_ptr_lists have been migrated
         // to the global lists living in the generations
-        ASSERT(capabilities[n]->weak_ptr_list_hd == NULL);
-        ASSERT(capabilities[n]->weak_ptr_list_tl == NULL);
+        ASSERT(getCapability(n)->weak_ptr_list_hd == NULL);
+        ASSERT(getCapability(n)->weak_ptr_list_tl == NULL);
     }
     for (g = 0; g < RtsFlags.GcFlags.generations; g++) {
         for (weak = generations[g].weak_ptr_list; weak != NULL; weak = weak->link) {

@@ -1,5 +1,3 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-
 -- | Free regs map for PowerPC
 module GHC.CmmToAsm.Reg.Linear.PPC where
 
@@ -13,7 +11,6 @@ import GHC.Utils.Outputable
 import GHC.Platform
 
 import Data.Word
-import Data.Bits
 
 -- The PowerPC has 32 integer and 32 floating point registers.
 -- This is 32bit PowerPC, so Word64 is inefficient - two Word32s are much
@@ -40,17 +37,14 @@ releaseReg (RealRegSingle r) (FreeRegs g f)
     | r > 31    = FreeRegs g (f .|. (1 `shiftL` (r - 32)))
     | otherwise = FreeRegs (g .|. (1 `shiftL` r)) f
 
-releaseReg _ _
-        = panic "RegAlloc.Linear.PPC.releaseReg: bad reg"
-
 initFreeRegs :: Platform -> FreeRegs
 initFreeRegs platform = foldl' (flip releaseReg) noFreeRegs (allocatableRegs platform)
 
 getFreeRegs :: RegClass -> FreeRegs -> [RealReg]        -- lazily
 getFreeRegs cls (FreeRegs g f)
+    | RcFloat <- cls = [] -- no float regs on PowerPC, use double
     | RcDouble <- cls = go f (0x80000000) 63
     | RcInteger <- cls = go g (0x80000000) 31
-    | otherwise = pprPanic "RegAllocLinear.getFreeRegs: Bad register class" (ppr cls)
     where
         go _ 0 _ = []
         go x m i | x .&. m /= 0 = RealRegSingle i : (go x (m `shiftR` 1) $! i-1)
@@ -61,5 +55,3 @@ allocateReg (RealRegSingle r) (FreeRegs g f)
     | r > 31    = FreeRegs g (f .&. complement (1 `shiftL` (r - 32)))
     | otherwise = FreeRegs (g .&. complement (1 `shiftL` r)) f
 
-allocateReg _ _
-        = panic "RegAlloc.Linear.PPC.allocateReg: bad reg"

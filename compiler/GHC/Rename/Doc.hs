@@ -1,25 +1,46 @@
-{-# LANGUAGE ViewPatterns #-}
-
-module GHC.Rename.Doc ( rnHsDoc, rnLHsDoc, rnMbLHsDoc ) where
+module GHC.Rename.Doc ( rnHsDoc, rnLHsDoc, rnLDocDecl, rnDocDecl ) where
 
 import GHC.Prelude
 
 import GHC.Tc.Types
 import GHC.Hs
+import GHC.Types.Name.Reader
+import GHC.Types.Name
 import GHC.Types.SrcLoc
+import GHC.Tc.Utils.Monad (getGblEnv)
+import GHC.Types.Avail
+import GHC.Rename.Env
 
+rnLHsDoc :: LHsDoc GhcPs -> RnM (LHsDoc GhcRn)
+rnLHsDoc = traverse rnHsDoc
 
-rnMbLHsDoc :: Maybe LHsDocString -> RnM (Maybe LHsDocString)
-rnMbLHsDoc mb_doc = case mb_doc of
-  Just doc -> do
-    doc' <- rnLHsDoc doc
-    return (Just doc')
-  Nothing -> return Nothing
+rnLDocDecl :: LDocDecl GhcPs -> RnM (LDocDecl GhcRn)
+rnLDocDecl = traverse rnDocDecl
 
-rnLHsDoc :: LHsDocString -> RnM LHsDocString
-rnLHsDoc (L pos doc) = do
-  doc' <- rnHsDoc doc
-  return (L pos doc')
+rnDocDecl :: DocDecl GhcPs -> RnM (DocDecl GhcRn)
+rnDocDecl (DocCommentNext doc) = do
+  doc' <- rnLHsDoc doc
+  pure $ (DocCommentNext doc')
+rnDocDecl (DocCommentPrev doc) = do
+  doc' <- rnLHsDoc doc
+  pure $ (DocCommentPrev doc')
+rnDocDecl (DocCommentNamed n doc) = do
+  doc' <- rnLHsDoc doc
+  pure $ (DocCommentNamed n doc')
+rnDocDecl (DocGroup i doc) = do
+  doc' <- rnLHsDoc doc
+  pure $ (DocGroup i doc')
 
-rnHsDoc :: HsDocString -> RnM HsDocString
-rnHsDoc = pure
+rnHsDoc :: WithHsDocIdentifiers a GhcPs -> RnM (WithHsDocIdentifiers a GhcRn)
+rnHsDoc (WithHsDocIdentifiers s ids) = do
+  gre <- tcg_rdr_env <$> getGblEnv
+  pure (WithHsDocIdentifiers s (rnHsDocIdentifiers gre ids))
+
+rnHsDocIdentifiers :: GlobalRdrEnv
+                  -> [Located RdrName]
+                  -> [Located Name]
+rnHsDocIdentifiers gre ns = concat
+  [ map (L l . greNamePrintableName . gre_name) (lookupGRE_RdrName c gre)
+  | L l rdr_name <- ns
+  , c <- dataTcOccs rdr_name
+  ]

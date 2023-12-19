@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP #-}
 {-# LANGUAGE TypeFamilies #-}
 
 module GHC.Tc.Gen.Splice where
@@ -9,25 +8,25 @@ import GHC.Hs.Expr ( PendingRnSplice, DelayedSplice )
 import GHC.Tc.Types( TcM , SpliceType )
 import GHC.Tc.Utils.TcType   ( ExpRhoType )
 import GHC.Types.Annotations ( Annotation, CoreAnnTarget )
-import GHC.Hs.Extension      ( GhcRn, GhcPs, GhcTc )
+import GHC.Hs.Extension ( GhcRn, GhcPs, GhcTc )
 
-import GHC.Hs     ( HsSplice, HsBracket, HsExpr, LHsExpr, LHsType, LPat,
-                    LHsDecl, ThModFinalizers )
+import GHC.Hs     ( HsSplice, HsQuote, HsExpr, LHsExpr, LHsType,
+                    LPat, LHsDecl, ThModFinalizers )
 import qualified Language.Haskell.TH as TH
 
 tcSpliceExpr :: HsSplice GhcRn
              -> ExpRhoType
              -> TcM (HsExpr GhcTc)
 
+tcTypedBracket :: HsExpr GhcRn
+               -> LHsExpr GhcRn
+               -> ExpRhoType
+               -> TcM (HsExpr GhcTc)
 tcUntypedBracket :: HsExpr GhcRn
-                 -> HsBracket GhcRn
+                 -> HsQuote GhcRn
                  -> [PendingRnSplice]
                  -> ExpRhoType
                  -> TcM (HsExpr GhcTc)
-tcTypedBracket :: HsExpr GhcRn
-               -> HsBracket GhcRn
-               -> ExpRhoType
-               -> TcM (HsExpr GhcTc)
 
 runTopSplice :: DelayedSplice -> TcM (HsExpr GhcTc)
 

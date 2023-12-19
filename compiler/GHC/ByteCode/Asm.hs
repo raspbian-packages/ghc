@@ -1,4 +1,6 @@
-{-# LANGUAGE BangPatterns, CPP, DeriveFunctor, MagicHash, RecordWildCards #-}
+{-# LANGUAGE CPP             #-}
+{-# LANGUAGE DeriveFunctor   #-}
+{-# LANGUAGE RecordWildCards #-}
 {-# OPTIONS_GHC -optc-DNON_POSIX_SOURCE #-}
 --
 --  (c) The University of Glasgow 2002-2006
@@ -7,13 +9,11 @@
 -- | Bytecode assembler and linker
 module GHC.ByteCode.Asm (
         assembleBCOs, assembleOneBCO,
-
         bcoFreeNames,
         SizedSeq, sizeSS, ssElts,
-        iNTERP_STACK_CHECK_THRESH
+        iNTERP_STACK_CHECK_THRESH,
+        mkNativeCallInfoLit
   ) where
-
-#include "HsVersions.h"
 
 import GHC.Prelude
 
@@ -22,24 +22,26 @@ import GHC.ByteCode.InfoTable
 import GHC.ByteCode.Types
 import GHCi.RemoteTypes
 import GHC.Runtime.Interpreter
+import GHC.Runtime.Heap.Layout hiding ( WordOff )
 
-import GHC.Driver.Types
 import GHC.Types.Name
 import GHC.Types.Name.Set
 import GHC.Types.Literal
-import GHC.Core.TyCon
-import GHC.Data.FastString
-import GHC.StgToCmm.Layout     ( ArgRep(..) )
-import GHC.Runtime.Heap.Layout
-import GHC.Driver.Session
-import GHC.Utils.Outputable
-import GHC.Platform
-import GHC.Utils.Misc
 import GHC.Types.Unique
 import GHC.Types.Unique.DSet
 
--- From iserv
-import SizedSeq
+import GHC.Utils.Outputable
+import GHC.Utils.Panic
+
+import GHC.Core.TyCon
+import GHC.Data.FastString
+import GHC.Data.SizedSeq
+
+import GHC.StgToCmm.Layout     ( ArgRep(..) )
+import GHC.Cmm.Expr
+import GHC.Cmm.CallConv        ( allArgRegsCover )
+import GHC.Platform
+import GHC.Platform.Profile
 
 import Control.Monad
 import Control.Monad.ST ( runST )
@@ -53,12 +55,12 @@ import Data.Array.Base  ( UArray(..) )
 
 import Data.Array.Unsafe( castSTUArray )
 
-import Foreign
+import Foreign hiding (shiftL, shiftR)
 import Data.Char        ( ord )
 import Data.List        ( genericLength )
-import Data.Map (Map)
+import Data.Map.Strict (Map)
 import Data.Maybe (fromMaybe)
-import qualified Data.Map as Map
+import qualified Data.Map.Strict as Map
 
 -- -----------------------------------------------------------------------------
 -- Unlinked BCOs
@@ -91,33 +93,52 @@ bcoFreeNames bco
 
 -- Top level assembler fn.
 assembleBCOs
-  :: HscEnv -> [ProtoBCO Name] -> [TyCon] -> [RemotePtr ()]
+  :: Interp
+  -> Profile
+  -> [ProtoBCO Name]
+  -> [TyCon]
+  -> AddrEnv
   -> Maybe ModBreaks
   -> IO CompiledByteCode
-assembleBCOs hsc_env proto_bcos tycons top_strs modbreaks = do
-  itblenv <- mkITbls hsc_env tycons
-  bcos    <- mapM (assembleBCO (targetPlatform (hsc_dflags hsc_env))) proto_bcos
-  (bcos',ptrs) <- mallocStrings hsc_env bcos
+assembleBCOs interp profile proto_bcos tycons top_strs modbreaks = do
+  -- TODO: the profile should be bundled with the interpreter: the rts ways are
+  -- fixed for an interpreter
+  itblenv <- mkITbls interp profile tycons
+  bcos    <- mapM (assembleBCO (profilePlatform profile)) proto_bcos
+  bcos'   <- mallocStrings interp bcos
   return CompiledByteCode
     { bc_bcos = bcos'
     , bc_itbls =  itblenv
     , bc_ffis = concatMap protoBCOFFIs proto_bcos
-    , bc_strs = top_strs ++ ptrs
+    , bc_strs = top_strs
     , bc_breaks = modbreaks
     }
 
--- Find all the literal strings and malloc them together.  We want to
--- do this because:
+-- Note [Allocating string literals]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- Our strategy for handling top-level string literal bindings is described in
+-- Note [Generating code for top-level string literal bindings] in GHC.StgToByteCode,
+-- but not all Addr# literals in a program are guaranteed to be lifted to the
+-- top level. Our strategy for handling local Addr# literals is somewhat simpler:
+-- after assembling, we find all the BCONPtrStr arguments in the program, malloc
+-- memory for them, and bake the resulting addresses into the instruction stream
+-- in the form of BCONPtrWord arguments.
 --
---  a) It should be done when we compile the module, not each time we relink it
---  b) For -fexternal-interpreter It's more efficient to malloc the strings
---     as a single batch message, especially when compiling in parallel.
+-- Since we do this when assembling, we only allocate the memory when we compile
+-- the module, not each time we relink it. However, we do want to take care to
+-- malloc the memory all in one go, since that is more efficient with
+-- -fexternal-interpreter, especially when compiling in parallel.
 --
-mallocStrings :: HscEnv -> [UnlinkedBCO] -> IO ([UnlinkedBCO], [RemotePtr ()])
-mallocStrings hsc_env ulbcos = do
+-- Note that, as with top-level string literal bindings, this memory is never
+-- freed, so it just leaks if the BCO is unloaded. See Note [Generating code for
+-- top-level string literal bindings] in GHC.StgToByteCode for some discussion
+-- about why.
+--
+mallocStrings :: Interp -> [UnlinkedBCO] -> IO [UnlinkedBCO]
+mallocStrings interp ulbcos = do
   let bytestrings = reverse (execState (mapM_ collect ulbcos) [])
-  ptrs <- iservCmd hsc_env (MallocStrings bytestrings)
-  return (evalState (mapM splice ulbcos) ptrs, ptrs)
+  ptrs <- interpCmd interp (MallocStrings bytestrings)
+  return (evalState (mapM splice ulbcos) ptrs)
  where
   splice bco@UnlinkedBCO{..} = do
     lits <- mapM spliceLit unlinkedBCOLits
@@ -149,10 +170,12 @@ mallocStrings hsc_env ulbcos = do
   collectPtr _ = return ()
 
 
-assembleOneBCO :: HscEnv -> ProtoBCO Name -> IO UnlinkedBCO
-assembleOneBCO hsc_env pbco = do
-  ubco <- assembleBCO (targetPlatform (hsc_dflags hsc_env)) pbco
-  ([ubco'], _ptrs) <- mallocStrings hsc_env [ubco]
+assembleOneBCO :: Interp -> Profile -> ProtoBCO Name -> IO UnlinkedBCO
+assembleOneBCO interp profile pbco = do
+  -- TODO: the profile should be bundled with the interpreter: the rts ways are
+  -- fixed for an interpreter
+  ubco <- assembleBCO (profilePlatform profile) pbco
+  [ubco'] <- mallocStrings interp [ubco]
   return ubco'
 
 assembleBCO :: Platform -> ProtoBCO Name -> IO UnlinkedBCO
@@ -176,10 +199,12 @@ assembleBCO platform (ProtoBCO { protoBCOName       = nm
       -- this BCO to be long.
       (n_insns0, lbl_map0) = inspectAsm platform False initial_offset asm
       ((n_insns, lbl_map), long_jumps)
-        | isLarge n_insns0 = (inspectAsm platform True initial_offset asm, True)
+        | isLarge (fromIntegral $ Map.size lbl_map0)
+          || isLarge n_insns0
+                    = (inspectAsm platform True initial_offset asm, True)
         | otherwise = ((n_insns0, lbl_map0), False)
 
-      env :: Word16 -> Word
+      env :: LocalLabel -> Word
       env lbl = fromMaybe
         (pprPanic "assembleBCO.findLabel" (ppr lbl))
         (Map.lookup lbl lbl_map)
@@ -189,7 +214,8 @@ assembleBCO platform (ProtoBCO { protoBCOName       = nm
   (final_insns, final_lits, final_ptrs) <- flip execStateT initial_state $ runAsm platform long_jumps env asm
 
   -- precomputed size should be equal to final size
-  ASSERT(n_insns == sizeSS final_insns) return ()
+  massertPpr (n_insns == sizeSS final_insns)
+             (text "bytecode instruction count mismatch")
 
   let asm_insns = ssElts final_insns
       insns_arr = Array.listArray (0, fromIntegral n_insns - 1) asm_insns
@@ -219,13 +245,13 @@ type AsmState = (SizedSeq Word16,
 data Operand
   = Op Word
   | SmallOp Word16
-  | LabelOp Word16
+  | LabelOp LocalLabel
 -- (unused)  | LargeOp Word
 
 data Assembler a
   = AllocPtr (IO BCOPtr) (Word -> Assembler a)
   | AllocLit [BCONPtr] (Word -> Assembler a)
-  | AllocLabel Word16 (Assembler a)
+  | AllocLabel LocalLabel (Assembler a)
   | Emit Word16 [Operand] (Assembler a)
   | NullAsm a
   deriving (Functor)
@@ -250,13 +276,13 @@ ptr = ioptr . return
 lit :: [BCONPtr] -> Assembler Word
 lit l = AllocLit l return
 
-label :: Word16 -> Assembler ()
+label :: LocalLabel -> Assembler ()
 label w = AllocLabel w (return ())
 
 emit :: Word16 -> [Operand] -> Assembler ()
 emit w ops = Emit w ops (return ())
 
-type LabelEnv = Word16 -> Word
+type LabelEnv = LocalLabel -> Word
 
 largeOp :: Bool -> Operand -> Bool
 largeOp long_jumps op = case op of
@@ -296,7 +322,7 @@ runAsm platform long_jumps e = go
         in ((), (st_i1,st_l0,st_p0))
       go k
 
-type LabelEnvMap = Map Word16 Word
+type LabelEnvMap = Map LocalLabel Word
 
 data InspectState = InspectState
   { instrCount :: !Word
@@ -327,7 +353,7 @@ inspectAsm platform long_jumps initial_offset
 --      count (LargeOp _) = largeArg16s platform
 
 -- Bring in all the bci_ bytecode constants.
-#include "rts/Bytecodes.h"
+#include "Bytecodes.h"
 
 largeArgInstr :: Word16 -> Word16
 largeArgInstr bci = bci_FLAG_LARGE_ARGS .|. bci
@@ -338,7 +364,9 @@ largeArg platform w = case platformWordSize platform of
            fromIntegral (w `shiftR` 32),
            fromIntegral (w `shiftR` 16),
            fromIntegral w]
-   PW4 -> [fromIntegral (w `shiftR` 16),
+   PW4 -> assertPpr (w < fromIntegral (maxBound :: Word32))
+                    (text "largeArg too big:" <+> ppr w) $
+          [fromIntegral (w `shiftR` 16),
            fromIntegral w]
 
 largeArg16s :: Platform -> Word
@@ -367,13 +395,20 @@ assembleI platform i = case i of
   PUSH_BCO proto           -> do let ul_bco = assembleBCO platform proto
                                  p <- ioptr (liftM BCOPtrBCO ul_bco)
                                  emit bci_PUSH_G [Op p]
-  PUSH_ALTS proto          -> do let ul_bco = assembleBCO platform proto
-                                 p <- ioptr (liftM BCOPtrBCO ul_bco)
-                                 emit bci_PUSH_ALTS [Op p]
-  PUSH_ALTS_UNLIFTED proto pk
+  PUSH_ALTS proto pk
                            -> do let ul_bco = assembleBCO platform proto
                                  p <- ioptr (liftM BCOPtrBCO ul_bco)
                                  emit (push_alts pk) [Op p]
+  PUSH_ALTS_TUPLE proto call_info tuple_proto
+                           -> do let ul_bco = assembleBCO platform proto
+                                     ul_tuple_bco = assembleBCO platform
+                                                                tuple_proto
+                                 p <- ioptr (liftM BCOPtrBCO ul_bco)
+                                 p_tup <- ioptr (liftM BCOPtrBCO ul_tuple_bco)
+                                 info <- int (fromIntegral $
+                                              mkNativeCallInfoSig platform call_info)
+                                 emit bci_PUSH_ALTS_T
+                                      [Op p, Op info, Op p_tup]
   PUSH_PAD8                -> emit bci_PUSH_PAD8 []
   PUSH_PAD16               -> emit bci_PUSH_PAD16 []
   PUSH_PAD32               -> emit bci_PUSH_PAD32 []
@@ -385,6 +420,10 @@ assembleI platform i = case i of
                                  emit bci_PUSH_UBX32 [Op np]
   PUSH_UBX lit nws         -> do np <- literal lit
                                  emit bci_PUSH_UBX [Op np, SmallOp nws]
+
+  -- see Note [Generating code for top-level string literal bindings] in GHC.StgToByteCode
+  PUSH_ADDR nm             -> do np <- lit [BCONPtrAddr nm]
+                                 emit bci_PUSH_UBX [Op np, SmallOp 1]
 
   PUSH_APPLY_N             -> emit bci_PUSH_APPLY_N []
   PUSH_APPLY_V             -> emit bci_PUSH_APPLY_V []
@@ -416,6 +455,38 @@ assembleI platform i = case i of
                                  emit bci_TESTLT_W [Op np, LabelOp l]
   TESTEQ_W  w l            -> do np <- word w
                                  emit bci_TESTEQ_W [Op np, LabelOp l]
+  TESTLT_I64  i l          -> do np <- int64 i
+                                 emit bci_TESTLT_I64 [Op np, LabelOp l]
+  TESTEQ_I64  i l          -> do np <- int64 i
+                                 emit bci_TESTEQ_I64 [Op np, LabelOp l]
+  TESTLT_I32  i l          -> do np <- int (fromIntegral i)
+                                 emit bci_TESTLT_I32 [Op np, LabelOp l]
+  TESTEQ_I32 i l           -> do np <- int (fromIntegral i)
+                                 emit bci_TESTEQ_I32 [Op np, LabelOp l]
+  TESTLT_I16  i l          -> do np <- int (fromIntegral i)
+                                 emit bci_TESTLT_I16 [Op np, LabelOp l]
+  TESTEQ_I16 i l           -> do np <- int (fromIntegral i)
+                                 emit bci_TESTEQ_I16 [Op np, LabelOp l]
+  TESTLT_I8  i l           -> do np <- int (fromIntegral i)
+                                 emit bci_TESTLT_I8 [Op np, LabelOp l]
+  TESTEQ_I8 i l            -> do np <- int (fromIntegral i)
+                                 emit bci_TESTEQ_I8 [Op np, LabelOp l]
+  TESTLT_W64  w l          -> do np <- word64 w
+                                 emit bci_TESTLT_W64 [Op np, LabelOp l]
+  TESTEQ_W64  w l          -> do np <- word64 w
+                                 emit bci_TESTEQ_W64 [Op np, LabelOp l]
+  TESTLT_W32  w l          -> do np <- word (fromIntegral w)
+                                 emit bci_TESTLT_W32 [Op np, LabelOp l]
+  TESTEQ_W32  w l          -> do np <- word (fromIntegral w)
+                                 emit bci_TESTEQ_W32 [Op np, LabelOp l]
+  TESTLT_W16  w l          -> do np <- word (fromIntegral w)
+                                 emit bci_TESTLT_W16 [Op np, LabelOp l]
+  TESTEQ_W16  w l          -> do np <- word (fromIntegral w)
+                                 emit bci_TESTEQ_W16 [Op np, LabelOp l]
+  TESTLT_W8  w l           -> do np <- word (fromIntegral w)
+                                 emit bci_TESTLT_W8 [Op np, LabelOp l]
+  TESTEQ_W8  w l           -> do np <- word (fromIntegral w)
+                                 emit bci_TESTEQ_W8 [Op np, LabelOp l]
   TESTLT_F  f l            -> do np <- float f
                                  emit bci_TESTLT_F [Op np, LabelOp l]
   TESTEQ_F  f l            -> do np <- float f
@@ -430,10 +501,11 @@ assembleI platform i = case i of
   SWIZZLE   stkoff n       -> emit bci_SWIZZLE [SmallOp stkoff, SmallOp n]
   JMP       l              -> emit bci_JMP [LabelOp l]
   ENTER                    -> emit bci_ENTER []
-  RETURN                   -> emit bci_RETURN []
-  RETURN_UBX rep           -> emit (return_ubx rep) []
+  RETURN rep               -> emit (return_non_tuple rep) []
+  RETURN_TUPLE             -> emit bci_RETURN_T []
   CCALL off m_addr i       -> do np <- addr m_addr
                                  emit bci_CCALL [SmallOp off, Op np, SmallOp i]
+  PRIMCALL                 -> emit bci_PRIMCALL []
   BRK_FUN index uniq cc    -> do p1 <- ptr BCOPtrBreakArray
                                  q <- int (getKey uniq)
                                  np <- addr cc
@@ -456,21 +528,31 @@ assembleI platform i = case i of
     literal (LitNumber nt i) = case nt of
       LitNumInt     -> int (fromIntegral i)
       LitNumWord    -> int (fromIntegral i)
+      LitNumInt8    -> int8 (fromIntegral i)
+      LitNumWord8   -> int8 (fromIntegral i)
+      LitNumInt16   -> int16 (fromIntegral i)
+      LitNumWord16  -> int16 (fromIntegral i)
+      LitNumInt32   -> int32 (fromIntegral i)
+      LitNumWord32  -> int32 (fromIntegral i)
       LitNumInt64   -> int64 (fromIntegral i)
       LitNumWord64  -> int64 (fromIntegral i)
-      LitNumInteger -> panic "GHC.ByteCode.Asm.literal: LitNumInteger"
-      LitNumNatural -> panic "GHC.ByteCode.Asm.literal: LitNumNatural"
+      LitNumBigNat  -> panic "GHC.ByteCode.Asm.literal: LitNumBigNat"
+
     -- We can lower 'LitRubbish' to an arbitrary constant, but @NULL@ is most
     -- likely to elicit a crash (rather than corrupt memory) in case absence
     -- analysis messed up.
-    literal LitRubbish         = int 0
+    literal (LitRubbish {}) = int 0
 
     litlabel fs = lit [BCONPtrLbl fs]
     addr (RemotePtr a) = words [fromIntegral a]
-    float = words . mkLitF
+    float = words . mkLitF platform
     double = words . mkLitD platform
     int = words . mkLitI
+    int8 = words . mkLitI64 platform
+    int16 = words . mkLitI64 platform
+    int32 = words . mkLitI64 platform
     int64 = words . mkLitI64 platform
+    word64 = words . mkLitW64 platform
     words ws = lit (map BCONPtrWord ws)
     word w = words [w]
 
@@ -488,33 +570,97 @@ push_alts V16 = error "push_alts: vector"
 push_alts V32 = error "push_alts: vector"
 push_alts V64 = error "push_alts: vector"
 
-return_ubx :: ArgRep -> Word16
-return_ubx V   = bci_RETURN_V
-return_ubx P   = bci_RETURN_P
-return_ubx N   = bci_RETURN_N
-return_ubx L   = bci_RETURN_L
-return_ubx F   = bci_RETURN_F
-return_ubx D   = bci_RETURN_D
-return_ubx V16 = error "return_ubx: vector"
-return_ubx V32 = error "return_ubx: vector"
-return_ubx V64 = error "return_ubx: vector"
+return_non_tuple :: ArgRep -> Word16
+return_non_tuple V   = bci_RETURN_V
+return_non_tuple P   = bci_RETURN_P
+return_non_tuple N   = bci_RETURN_N
+return_non_tuple L   = bci_RETURN_L
+return_non_tuple F   = bci_RETURN_F
+return_non_tuple D   = bci_RETURN_D
+return_non_tuple V16 = error "return_non_tuple: vector"
+return_non_tuple V32 = error "return_non_tuple: vector"
+return_non_tuple V64 = error "return_non_tuple: vector"
+
+{-
+  we can only handle up to a fixed number of words on the stack,
+  because we need a stg_ctoi_tN stack frame for each size N. See
+  Note [unboxed tuple bytecodes and tuple_BCO].
+
+  If needed, you can support larger tuples by adding more in
+  StgMiscClosures.cmm, Interpreter.c and MiscClosures.h and
+  raising this limit.
+
+  Note that the limit is the number of words passed on the stack.
+  If the calling convention passes part of the tuple in registers, the
+  maximum number of tuple elements may be larger. Elements can also
+  take multiple words on the stack (for example Double# on a 32 bit
+  platform).
+ -}
+maxTupleReturnNativeStackSize :: WordOff
+maxTupleReturnNativeStackSize = 62
+
+{-
+  Construct the call_info word that stg_ctoi_t, stg_ret_t and stg_primcall
+  use to convert arguments between the native calling convention and the
+  interpreter.
+
+  See Note [GHCi and native call registers] for more information.
+ -}
+mkNativeCallInfoSig :: Platform -> NativeCallInfo -> Word32
+mkNativeCallInfoSig platform NativeCallInfo{..}
+  | nativeCallType == NativeTupleReturn && nativeCallStackSpillSize > maxTupleReturnNativeStackSize
+  = pprPanic "mkNativeCallInfoSig: tuple too big for the bytecode compiler"
+             (ppr nativeCallStackSpillSize <+> text "stack words." <+>
+              text "Use -fobject-code to get around this limit"
+             )
+  | otherwise
+  = assertPpr (length regs <= 24) (text "too many registers for bitmap:" <+> ppr (length regs)) {- 24 bits for register bitmap -}
+    assertPpr (cont_offset < 255) (text "continuation offset too large:" <+> ppr cont_offset) {- 8 bits for continuation offset (only for NativeTupleReturn) -}
+    assertPpr (all (`elem` regs) (regSetToList nativeCallRegs)) (text "not all registers accounted for") {- all regs accounted for -}
+    foldl' reg_bit 0 (zip regs [0..]) .|. (cont_offset `shiftL` 24)
+  where
+    cont_offset :: Word32
+    cont_offset
+      | nativeCallType == NativeTupleReturn = fromIntegral nativeCallStackSpillSize
+      | otherwise                           = 0 -- there is no continuation for primcalls
+
+    reg_bit :: Word32 -> (GlobalReg, Int) -> Word32
+    reg_bit x (r, n)
+      | r `elemRegSet` nativeCallRegs = x .|. 1 `shiftL` n
+      | otherwise                     = x
+    regs = allArgRegsCover platform
+
+mkNativeCallInfoLit :: Platform -> NativeCallInfo -> Literal
+mkNativeCallInfoLit platform call_info =
+  mkLitWord platform . fromIntegral $ mkNativeCallInfoSig platform call_info
 
 -- Make lists of host-sized words for literals, so that when the
 -- words are placed in memory at increasing addresses, the
 -- bit pattern is correct for the host's word size and endianness.
 mkLitI   ::             Int    -> [Word]
-mkLitF   ::             Float  -> [Word]
+mkLitF   :: Platform -> Float  -> [Word]
 mkLitD   :: Platform -> Double -> [Word]
 mkLitI64 :: Platform -> Int64  -> [Word]
+mkLitW64 :: Platform -> Word64 -> [Word]
 
-mkLitF f
-   = runST (do
+mkLitF platform f = case platformWordSize platform of
+  PW4 -> runST $ do
         arr <- newArray_ ((0::Int),0)
         writeArray arr 0 f
         f_arr <- castSTUArray arr
         w0 <- readArray f_arr 0
         return [w0 :: Word]
-     )
+
+  PW8 -> runST $ do
+        arr <- newArray_ ((0::Int),1)
+        writeArray arr 0 f
+        -- on 64-bit architectures we read two (32-bit) Float cells when we read
+        -- a (64-bit) Word: so we write a dummy value in the second cell to
+        -- avoid an out-of-bound read.
+        writeArray arr 1 0.0
+        f_arr <- castSTUArray arr
+        w0 <- readArray f_arr 0
+        return [w0 :: Word]
 
 mkLitD platform d = case platformWordSize platform of
    PW4 -> runST (do
@@ -542,13 +688,18 @@ mkLitI64 platform ii = case platformWordSize platform of
         w1 <- readArray d_arr 1
         return [w0 :: Word,w1]
      )
-   PW8 -> runST (do
-        arr <- newArray_ ((0::Int),0)
-        writeArray arr 0 ii
+   PW8 -> [fromIntegral ii :: Word]
+
+mkLitW64 platform ww = case platformWordSize platform of
+   PW4 -> runST (do
+        arr <- newArray_ ((0::Word),1)
+        writeArray arr 0 ww
         d_arr <- castSTUArray arr
         w0 <- readArray d_arr 0
-        return [w0 :: Word]
+        w1 <- readArray d_arr 1
+        return [w0 :: Word,w1]
      )
+   PW8 -> [fromIntegral ww :: Word]
 
 mkLitI i = [fromIntegral i :: Word]
 

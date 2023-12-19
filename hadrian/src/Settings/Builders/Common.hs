@@ -5,8 +5,9 @@ module Settings.Builders.Common (
     module Oracles.Setting,
     module Settings,
     module UserSettings,
-    cIncludeArgs, ldArgs, cArgs, cWarnings,
-    packageDatabaseArgs, bootPackageDatabaseArgs
+    cIncludeArgs, ldArgs, cArgs, cppArgs, cWarnings,
+    packageDatabaseArgs, bootPackageDatabaseArgs,
+    wayCcArgs,
     ) where
 
 import Hadrian.Haskell.Cabal.Type
@@ -15,7 +16,6 @@ import Base
 import Expression
 import Oracles.Flag
 import Oracles.Setting
-import Packages
 import Settings
 import UserSettings
 
@@ -25,18 +25,8 @@ cIncludeArgs = do
     path    <- getBuildPath
     incDirs <- getContextData includeDirs
     depDirs <- getContextData depIncludeDirs
-    stage <- getStage
-    iconvIncludeDir <- getSetting IconvIncludeDir
-    gmpIncludeDir   <- getSetting GmpIncludeDir
-    ffiIncludeDir   <- getSetting FfiIncludeDir
-    libdwIncludeDir   <- getSetting FfiIncludeDir
-    libPath <- expr $ stageLibPath stage
-    mconcat [ notStage0 ||^ package compiler ? arg "-Iincludes"
-            , arg $ "-I" ++ libPath
+    mconcat [ notStage0 ? arg "-Irts/include"
             , arg $ "-I" ++ path
-            , pure . map ("-I"++) . filter (/= "") $ [iconvIncludeDir, gmpIncludeDir]
-            , flag UseSystemFfi ? arg ("-I" ++ ffiIncludeDir)
-            , flag WithLibdw ? if not (null libdwIncludeDir) then arg ("-I" ++ libdwIncludeDir) else mempty
             -- Add @incDirs@ in the build directory, since some files generated
             -- with @autoconf@ may end up in the build directory.
             , pure [ "-I" ++ path        -/- dir | dir <- incDirs ]
@@ -50,6 +40,9 @@ ldArgs = mempty
 
 cArgs :: Args
 cArgs = mempty
+
+cppArgs :: Args
+cppArgs = mempty
 
 -- TODO: should be in a different file
 cWarnings :: Args
@@ -73,3 +66,11 @@ bootPackageDatabaseArgs = do
     dbPath <- expr $ packageDbPath stage
     expr $ need [dbPath -/- packageDbStamp]
     stage0 ? packageDatabaseArgs
+
+wayCcArgs :: Args
+wayCcArgs = do
+    way <- getWay
+    mconcat [ (Threaded  `wayUnit` way) ? arg "-DTHREADED_RTS"
+            , (Debug     `wayUnit` way) ? arg "-DDEBUG"
+            , (way == debug || way == debugDynamic) ? arg "-DTICKY_TICKY"
+            ]

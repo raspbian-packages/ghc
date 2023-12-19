@@ -1,10 +1,9 @@
 {-# LANGUAGE TypeFamilies #-}
 module Hadrian.Oracles.Path (
-    lookupInPath, bashPath, fixAbsolutePathOnWindows, pathOracle
+    lookupInPath, fixAbsolutePathOnWindows, pathOracle
     ) where
 
 import Control.Monad
-import Data.Maybe
 import Data.Char
 import Data.List.Extra
 import Development.Shake
@@ -20,10 +19,6 @@ lookupInPath :: FilePath -> Action FilePath
 lookupInPath name
     | name == takeFileName name = askOracle $ LookupInPath name
     | otherwise                 = return name
-
--- | Lookup the path to the @bash@ interpreter.
-bashPath :: Action FilePath
-bashPath = lookupInPath "bash"
 
 -- | Fix an absolute path on Windows:
 -- * "/c/" => "C:/"
@@ -52,11 +47,14 @@ pathOracle = do
     void $ addOracleCache $ \(WindowsPath path) -> do
         Stdout out <- quietly $ cmd ["cygpath", "-m", path]
         let windowsPath = unifyPath $ dropWhileEnd isSpace out
-        putLoud $ "| Windows path mapping: " ++ path ++ " => " ++ windowsPath
+        putVerbose $ "| Windows path mapping: " ++ path ++ " => " ++ windowsPath
         return windowsPath
 
     void $ addOracleCache $ \(LookupInPath name) -> do
-        let unpack = fromMaybe . error $ "Cannot find executable " ++ quote name
-        path <- unifyPath . unpack <$> liftIO (findExecutable name)
-        putLoud $ "| Executable found: " ++ name ++ " => " ++ path
-        return path
+        path <- liftIO getSearchPath
+        exes <- liftIO (findExecutablesInDirectories path name)
+        exe <- case exes of
+          []      -> error $ "Cannot find executable " ++ quote name
+          (exe:_) -> pure $ unifyPath exe
+        putVerbose $ "| Executable found: " ++ name ++ " => " ++ exe
+        return exe

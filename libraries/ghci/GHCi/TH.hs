@@ -13,7 +13,7 @@ module GHCi.TH
   ) where
 
 {- Note [Remote Template Haskell]
-
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Here is an overview of how TH works with -fexternal-interpreter.
 
 Initialisation
@@ -194,6 +194,7 @@ instance TH.Quasi GHCiQ where
   qReifyModule m = ghcCmd (ReifyModule m)
   qReifyConStrictness name = ghcCmd (ReifyConStrictness name)
   qLocation = fromMaybe noLoc . qsLocation <$> getState
+  qGetPackageRoot        = ghcCmd GetPackageRoot
   qAddDependentFile file = ghcCmd (AddDependentFile file)
   qAddTempFile suffix = ghcCmd (AddTempFile suffix)
   qAddTopDecls decls = ghcCmd (AddTopDecls decls)
@@ -209,6 +210,8 @@ instance TH.Quasi GHCiQ where
     return ((), s { qsMap = M.insert (typeOf k) (toDyn k) (qsMap s) })
   qIsExtEnabled x = ghcCmd (IsExtEnabled x)
   qExtsEnabled = ghcCmd ExtsEnabled
+  qPutDoc l s = ghcCmd (PutDoc l s)
+  qGetDoc l = ghcCmd (GetDoc l)
 
 -- | The implementation of the 'StartTH' message: create
 -- a new IORef QState, and return a RemoteRef to it.

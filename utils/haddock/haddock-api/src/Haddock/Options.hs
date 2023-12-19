@@ -15,6 +15,7 @@
 module Haddock.Options (
   parseHaddockOpts,
   Flag(..),
+  Visibility(..),
   getUsage,
   optTitle,
   outputDir,
@@ -47,9 +48,8 @@ import qualified Data.Char as Char
 import           Data.Version
 import           Control.Applicative
 import           GHC.Data.FastString
-import           GHC ( DynFlags, Module, moduleUnit, unitState )
-import           GHC.Unit.Info ( PackageName(..), unitPackageName, unitPackageVersion )
-import           GHC.Unit.State ( lookupUnit  )
+import           GHC ( Module, moduleUnit )
+import           GHC.Unit.State
 import           Haddock.Types
 import           Haddock.Utils
 import           System.Console.GetOpt
@@ -362,18 +362,31 @@ ghcFlags flags = [ option | Flag_OptGhc option <- flags ]
 reexportFlags :: [Flag] -> [String]
 reexportFlags flags = [ option | Flag_Reexport option <- flags ]
 
+data Visibility = Visible | Hidden
+  deriving (Eq, Show)
 
-readIfaceArgs :: [Flag] -> [(DocPaths, FilePath)]
+readIfaceArgs :: [Flag] -> [(DocPaths, Visibility, FilePath)]
 readIfaceArgs flags = [ parseIfaceOption s | Flag_ReadInterface s <- flags ]
   where
-    parseIfaceOption :: String -> (DocPaths, FilePath)
+    parseIfaceOption :: String -> (DocPaths, Visibility, FilePath)
     parseIfaceOption str =
       case break (==',') str of
         (fpath, ',':rest) ->
           case break (==',') rest of
-            (src, ',':file) -> ((fpath, Just src), file)
-            (file, _) -> ((fpath, Nothing), file)
-        (file, _) -> (("", Nothing), file)
+            (src, ',':rest') ->
+              let src' = case src of
+                    "" -> Nothing
+                    _  -> Just src
+              in
+              case break (==',') rest' of
+                (visibility, ',':file) | visibility == "hidden" ->
+                  ((fpath, src'), Hidden, file)
+                                       | otherwise ->
+                  ((fpath, src'), Visible, file)
+                (file, _) ->
+                  ((fpath, src'), Visible, file)
+            (file, _) -> ((fpath, Nothing), Visible, file)
+        (file, _) -> (("", Nothing), Visible, file)
 
 
 -- | Like 'listToMaybe' but returns the last element instead of the first.
@@ -388,16 +401,16 @@ optLast xs = Just (last xs)
 --
 -- The @--package-name@ and @--package-version@ Haddock flags allow the user to
 -- specify this information manually and it is returned here if present.
-modulePackageInfo :: DynFlags
+modulePackageInfo :: UnitState
                   -> [Flag] -- ^ Haddock flags are checked as they may contain
                             -- the package name or version provided by the user
                             -- which we prioritise
                   -> Maybe Module
                   -> (Maybe PackageName, Maybe Data.Version.Version)
-modulePackageInfo _dflags _flags Nothing = (Nothing, Nothing)
-modulePackageInfo dflags flags (Just modu) =
+modulePackageInfo _unit_state _flags Nothing = (Nothing, Nothing)
+modulePackageInfo unit_state flags (Just modu) =
   ( optPackageName flags    <|> fmap unitPackageName pkgDb
   , optPackageVersion flags <|> fmap unitPackageVersion pkgDb
   )
   where
-    pkgDb = lookupUnit (unitState dflags) (moduleUnit modu)
+    pkgDb = lookupUnit unit_state (moduleUnit modu)

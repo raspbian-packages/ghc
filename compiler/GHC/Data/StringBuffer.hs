@@ -6,7 +6,11 @@
 Buffers for scanning string input stored in external arrays.
 -}
 
-{-# LANGUAGE BangPatterns, CPP, MagicHash, UnboxedTuples #-}
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE UnboxedTuples #-}
+
 {-# OPTIONS_GHC -O2 #-}
 -- We always optimise this, otherwise performance of a non-optimised
 -- compiler is severely affected
@@ -22,12 +26,14 @@ module GHC.Data.StringBuffer
         hPutStringBuffer,
         appendStringBuffers,
         stringToStringBuffer,
+        stringBufferFromByteString,
 
         -- * Inspection
         nextChar,
         currentChar,
         prevChar,
         atEnd,
+        fingerprintStringBuffer,
 
         -- * Moving and comparison
         stepOn,
@@ -48,22 +54,24 @@ module GHC.Data.StringBuffer
         bidirectionalFormatChars
         ) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
-import GHC.Utils.Encoding
 import GHC.Data.FastString
+import GHC.Utils.Encoding
 import GHC.Utils.IO.Unsafe
 import GHC.Utils.Panic.Plain
-import GHC.Utils.Misc
+import GHC.Utils.Exception      ( bracket_ )
+import GHC.Fingerprint
 
 import Data.Maybe
-import Control.Exception
 import System.IO
 import System.IO.Unsafe         ( unsafePerformIO )
 import GHC.IO.Encoding.UTF8     ( mkUTF8 )
 import GHC.IO.Encoding.Failure  ( CodingFailureMode(IgnoreCodingFailure) )
+
+import qualified Data.ByteString.Internal as BS
+import qualified Data.ByteString as BS
+import Data.ByteString ( ByteString )
 
 import GHC.Exts
 
@@ -150,7 +158,7 @@ skipBOM h size offset =
   if size > 0 && offset == 0
     then do
       -- Validate assumption that handle is in binary mode.
-      ASSERTM( hGetEncoding h >>= return . isNothing )
+      assertM (hGetEncoding h >>= return . isNothing)
       -- Temporarily select utf8 encoding with error ignoring,
       -- to make `hLookAhead` and `hGetChar` return full Unicode characters.
       bracket_ (hSetEncoding h safeEncoding) (hSetBinaryMode h True) $ do
@@ -191,10 +199,19 @@ stringToStringBuffer str =
   let size = utf8EncodedLength str
   buf <- mallocForeignPtrArray (size+3)
   unsafeWithForeignPtr buf $ \ptr -> do
-    utf8EncodeString ptr str
+    utf8EncodeStringPtr ptr str
     pokeArray (ptr `plusPtr` size :: Ptr Word8) [0,0,0]
     -- sentinels for UTF-8 decoding
   return (StringBuffer buf size 0)
+
+-- | Convert a UTF-8 encoded 'ByteString' into a 'StringBuffer. This really
+-- relies on the internals of both 'ByteString' and 'StringBuffer'.
+--
+-- /O(n)/ (but optimized into a @memcpy@ by @bytestring@ under the hood)
+stringBufferFromByteString :: ByteString -> StringBuffer
+stringBufferFromByteString bs =
+  let BS.PS fp off len = BS.append bs (BS.pack [0,0,0])
+  in StringBuffer { buf = fp, len = len - 3, cur = off }
 
 -- -----------------------------------------------------------------------------
 -- Grab a character
@@ -310,6 +327,13 @@ byteDiff s1 s2 = cur s2 - cur s1
 -- | Check whether a 'StringBuffer' is empty (analogous to 'Data.List.null').
 atEnd :: StringBuffer -> Bool
 atEnd (StringBuffer _ l c) = l == c
+
+-- | Computes a hash of the contents of a 'StringBuffer'.
+fingerprintStringBuffer :: StringBuffer -> Fingerprint
+fingerprintStringBuffer (StringBuffer buf len cur) =
+  unsafePerformIO $
+    withForeignPtr buf $ \ptr ->
+      fingerprintData (ptr `plusPtr` cur) len
 
 -- | Computes a 'StringBuffer' which points to the first character of the
 -- wanted line. Lines begin at 1.

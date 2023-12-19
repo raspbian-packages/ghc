@@ -11,7 +11,6 @@ test('IOError002',      normal, compile_and_run, [''])
 test('finalization001', normal, compile_and_run, [''])
 test('hClose001', [], compile_and_run, [''])
 test('hClose002', [normalise_win32_io_errors], compile_and_run, [''])
-test('hClose003',       reqlib('unix'), compile_and_run, ['-package unix'])
 test('hFileSize001',    normal, compile_and_run, [''])
 test('hFileSize002', [omit_ways(['ghci'])], compile_and_run, [''])
 test('hFlush001', [], compile_and_run, [''])
@@ -67,7 +66,7 @@ test('openFile004', [], compile_and_run, [''])
 test('openFile005', [], compile_and_run, [''])
 test('openFile006', [], compile_and_run, [''])
 test('openFile007', [], compile_and_run, [''])
-test('openFile008', cmd_prefix('ulimit -n 2048; '), compile_and_run, [''])
+test('openFile008', cmd_prefix('ulimit -n 1024; '), compile_and_run, [''])
 test('openFile009', [], compile_and_run, [''])
 
 test('putStr001',    normal, compile_and_run, [''])
@@ -86,8 +85,7 @@ test('hGetBuf001',
       expect_fail_if_windows],
      compile_and_run, ['-package unix'])
 
-# As discussed in #16819, this test is racy in a threaded environment.
-test('hDuplicateTo001', [omit_ways(concurrent_ways),
+test('hDuplicateTo001', [fragile_for(16819, concurrent_ways),
                          when(opsys('mingw32'), skip)], compile_and_run, [''])
 
 test('countReaders001', [], compile_and_run, [''])
@@ -96,8 +94,6 @@ test('concio001', [normal, multi_cpu_race],
      makefile_test, ['test.concio001'])
 test('concio001.thr', [extra_files(['concio001.hs']), multi_cpu_race],
      makefile_test, ['test.concio001.thr'])
-
-test('concio002', reqlib('process'), compile_and_run, [''])
 
 test('T2122', [], compile_and_run, [''])
 test('T3307', [], makefile_test, ['T3307-test'])
@@ -150,3 +146,5 @@ test('T17414',
      compile_and_run, [''])
 test('T17510', expect_broken(17510), compile_and_run, [''])
 test('bytestringread001', extra_run_opts('test.data'), compile_and_run, [''])
+test('T17912', [only_ways(['threaded1']), when(opsys('mingw32'),expect_broken(1))], compile_and_run, [''])
+test('T18832', only_ways(['threaded1']), compile_and_run, [''])

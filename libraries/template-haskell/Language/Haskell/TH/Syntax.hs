@@ -2,8 +2,8 @@
              DeriveGeneric, FlexibleInstances, DefaultSignatures,
              RankNTypes, RoleAnnotations, ScopedTypeVariables,
              MagicHash, KindSignatures, PolyKinds, TypeApplications, DataKinds,
-             GADTs, UnboxedTuples, UnboxedSums, TypeInType,
-             Trustworthy, DeriveFunctor #-}
+             GADTs, UnboxedTuples, UnboxedSums, TypeInType, TypeOperators,
+             Trustworthy, DeriveFunctor, BangPatterns, RecordWildCards, ImplicitParams #-}
 
 {-# OPTIONS_GHC -fno-warn-inline-rule-shadowing #-}
 
@@ -31,6 +31,7 @@ module Language.Haskell.TH.Syntax
 import Data.Data hiding (Fixity(..))
 import Data.IORef
 import System.IO.Unsafe ( unsafePerformIO )
+import System.FilePath
 import GHC.IO.Unsafe    ( unsafeDupableInterleaveIO )
 import Control.Monad (liftM)
 import Control.Monad.IO.Class (MonadIO (..))
@@ -60,6 +61,21 @@ import Prelude
 import Foreign.ForeignPtr
 import Foreign.C.String
 import Foreign.C.Types
+import GHC.Stack
+
+#if __GLASGOW_HASKELL__ >= 901
+import GHC.Types ( Levity(..) )
+#endif
+
+#if __GLASGOW_HASKELL__ >= 903
+import Data.Array.Byte (ByteArray(..))
+import GHC.Exts
+  ( ByteArray#, unsafeFreezeByteArray#, copyAddrToByteArray#, newByteArray#
+  , isByteArrayPinned#, isTrue#, sizeofByteArray#, unsafeCoerce#, byteArrayContents#
+  , copyByteArray#, newPinnedByteArray#)
+import GHC.ForeignPtr (ForeignPtr(..), ForeignPtrContents(..))
+import GHC.ST (ST(..), runST)
+#endif
 
 -----------------------------------------------------
 --
@@ -99,6 +115,7 @@ class (MonadIO m, MonadFail m) => Quasi m where
   qRunIO :: IO a -> m a
   qRunIO = liftIO
   -- ^ Input/output (dangerous)
+  qGetPackageRoot :: m FilePath
 
   qAddDependentFile :: FilePath -> m ()
 
@@ -118,6 +135,9 @@ class (MonadIO m, MonadFail m) => Quasi m where
 
   qIsExtEnabled :: Extension -> m Bool
   qExtsEnabled :: m [Extension]
+
+  qPutDoc :: DocLoc -> String -> m ()
+  qGetDoc :: DocLoc -> m (Maybe String)
 
 -----------------------------------------------------
 --      The IO instance of Quasi
@@ -147,6 +167,7 @@ instance Quasi IO where
   qReifyConStrictness _ = badIO "reifyConStrictness"
   qLocation             = badIO "currentLocation"
   qRecover _ _          = badIO "recover" -- Maybe we could fix this?
+  qGetPackageRoot       = badIO "getProjectRoot"
   qAddDependentFile _   = badIO "addDependentFile"
   qAddTempFile _        = badIO "addTempFile"
   qAddTopDecls _        = badIO "addTopDecls"
@@ -157,6 +178,8 @@ instance Quasi IO where
   qPutQ _               = badIO "putQ"
   qIsExtEnabled _       = badIO "isExtEnabled"
   qExtsEnabled          = badIO "extsEnabled"
+  qPutDoc _ _           = badIO "putDoc"
+  qGetDoc _             = badIO "getDoc"
 
 instance Quote IO where
   newName = newNameIO
@@ -342,12 +365,12 @@ newtype TExp (a :: TYPE (r :: RuntimeRep)) = TExp
 --       In the expression: [|| "foo" ||]
 --       In the Template Haskell splice $$([|| "foo" ||])
 --
--- Levity-polymorphic since /template-haskell-2.16.0.0/.
+-- Representation-polymorphic since /template-haskell-2.16.0.0/.
 
 -- | Discard the type annotation and produce a plain Template Haskell
 -- expression
 --
--- Levity-polymorphic since /template-haskell-2.16.0.0/.
+-- Representation-polymorphic since /template-haskell-2.16.0.0/.
 unTypeQ :: forall (r :: RuntimeRep) (a :: TYPE r) m . Quote m => m (TExp a) -> m Exp
 unTypeQ m = do { TExp e <- m
                ; return e }
@@ -357,7 +380,7 @@ unTypeQ m = do { TExp e <- m
 -- This is unsafe because GHC cannot check for you that the expression
 -- really does have the type you claim it has.
 --
--- Levity-polymorphic since /template-haskell-2.16.0.0/.
+-- Representation-polymorphic since /template-haskell-2.16.0.0/.
 unsafeTExpCoerce :: forall (r :: RuntimeRep) (a :: TYPE r) m .
                       Quote m => m Exp -> m (TExp a)
 unsafeTExpCoerce m = do { e <- m
@@ -523,7 +546,10 @@ Qualified names are also supported, like so:
 -}
 
 
-{- | 'reify' looks up information about the 'Name'.
+{- | 'reify' looks up information about the 'Name'. It will fail with
+a compile error if the 'Name' is not visible. A 'Name' is visible if it is
+imported or defined in a prior top-level declaration group. See the
+documentation for 'newDeclarationGroup' for more details.
 
 It is sometimes useful to construct the argument name using 'lookupTypeName' or 'lookupValueName'
 to ensure that we are reifying from the right namespace. For instance, in this context:
@@ -559,6 +585,60 @@ This works even if there's no explicit signature and the type or kind is inferre
 reifyType :: Name -> Q Type
 reifyType nm = Q (qReifyType nm)
 
+{- | Template Haskell is capable of reifying information about types and
+terms defined in previous declaration groups. Top-level declaration splices break up
+declaration groups.
+
+For an example, consider this  code block. We define a datatype @X@ and
+then try to call 'reify' on the datatype.
+
+@
+module Check where
+
+data X = X
+    deriving Eq
+
+$(do
+    info <- reify ''X
+    runIO $ print info
+ )
+@
+
+This code fails to compile, noting that @X@ is not available for reification at the site of 'reify'. We can fix this by creating a new declaration group using an empty top-level splice:
+
+@
+data X = X
+    deriving Eq
+
+$(pure [])
+
+$(do
+    info <- reify ''X
+    runIO $ print info
+ )
+@
+
+We provide 'newDeclarationGroup' as a means of documenting this behavior
+and providing a name for the pattern.
+
+Since top level splices infer the presence of the @$( ... )@ brackets, we can also write:
+
+@
+data X = X
+    deriving Eq
+
+newDeclarationGroup
+
+$(do
+    info <- reify ''X
+    runIO $ print info
+ )
+@
+
+-}
+newDeclarationGroup :: Q [Dec]
+newDeclarationGroup = pure []
+
 {- | @reifyInstances nm tys@ returns a list of visible instances of @nm tys@. That is,
 if @nm@ is the name of a type class, then all instances of this class at the types @tys@
 are returned. Alternatively, if @nm@ is the name of a data family or type family,
@@ -576,13 +656,29 @@ instance heads which unify with @nm tys@, they need not actually be satisfiable.
 
 There is one edge case: @reifyInstances ''Typeable tys@ currently always
 produces an empty list (no matter what @tys@ are given).
+
+An instance is visible if it is imported or defined in a prior top-level
+declaration group. See the documentation for 'newDeclarationGroup' for more details.
+
 -}
 reifyInstances :: Name -> [Type] -> Q [InstanceDec]
 reifyInstances cls tys = Q (qReifyInstances cls tys)
 
-{- | @reifyRoles nm@ returns the list of roles associated with the parameters of
+{- | @reifyRoles nm@ returns the list of roles associated with the parameters
+(both visible and invisible) of
 the tycon @nm@. Fails if @nm@ cannot be found or is not a tycon.
 The returned list should never contain 'InferR'.
+
+An invisible parameter to a tycon is often a kind parameter. For example, if
+we have
+
+@
+type Proxy :: forall k. k -> Type
+data Proxy a = MkProxy
+@
+
+and @reifyRoles Proxy@, we will get @['NominalR', 'PhantomR']@. The 'NominalR' is
+the role of the invisible @k@ parameter. Kind parameters are always nominal.
 -}
 reifyRoles :: Name -> Q [Role]
 reifyRoles nm = Q (qReifyRoles nm)
@@ -616,6 +712,10 @@ reifyConStrictness :: Name -> Q [DecidedStrictness]
 reifyConStrictness n = Q (qReifyConStrictness n)
 
 -- | Is the list of instances returned by 'reifyInstances' nonempty?
+--
+-- If you're confused by an instance not being visible despite being
+-- defined in the same module and above the splice in question, see the
+-- docs for 'newDeclarationGroup' for a possible explanation.
 isInstance :: Name -> [Type] -> Q Bool
 isInstance nm tys = do { decs <- reifyInstances nm tys
                        ; return (not (null decs)) }
@@ -633,6 +733,27 @@ location = Q qLocation
 -- flush them yourself.
 runIO :: IO a -> Q a
 runIO m = Q (qRunIO m)
+
+-- | Get the package root for the current package which is being compiled.
+-- This can be set explicitly with the -package-root flag but is normally
+-- just the current working directory.
+--
+-- The motivation for this flag is to provide a principled means to remove the
+-- assumption from splices that they will be executed in the directory where the
+-- cabal file resides. Projects such as haskell-language-server can't and don't
+-- change directory when compiling files but instead set the -package-root flag
+-- appropiately.
+getPackageRoot :: Q FilePath
+getPackageRoot = Q qGetPackageRoot
+
+-- | The input is a filepath, which if relative is offset by the package root.
+makeRelativeToProject :: FilePath -> Q FilePath
+makeRelativeToProject fp | isRelative fp = do
+  root <- getPackageRoot
+  return (root </> fp)
+makeRelativeToProject fp = return fp
+
+
 
 -- | Record external files that runIO is using (dependent upon).
 -- The compiler can then recognize that it should re-compile the Haskell file
@@ -741,6 +862,32 @@ isExtEnabled ext = Q (qIsExtEnabled ext)
 extsEnabled :: Q [Extension]
 extsEnabled = Q qExtsEnabled
 
+-- | Add Haddock documentation to the specified location. This will overwrite
+-- any documentation at the location if it already exists. This will reify the
+-- specified name, so it must be in scope when you call it. If you want to add
+-- documentation to something that you are currently splicing, you can use
+-- 'addModFinalizer' e.g.
+--
+-- > do
+-- >   let nm = mkName "x"
+-- >   addModFinalizer $ putDoc (DeclDoc nm) "Hello"
+-- >   [d| $(varP nm) = 42 |]
+--
+-- The helper functions 'withDecDoc' and 'withDecsDoc' will do this for you, as
+-- will the 'funD_doc' and other @_doc@ combinators.
+-- You most likely want to have the @-haddock@ flag turned on when using this.
+-- Adding documentation to anything outside of the current module will cause an
+-- error.
+putDoc :: DocLoc -> String -> Q ()
+putDoc t s = Q (qPutDoc t s)
+
+-- | Retreives the Haddock documentation at the specified location, if one
+-- exists.
+-- It can be used to read documentation on things defined outside of the current
+-- module, provided that those modules were compiled with the @-haddock@ flag.
+getDoc :: DocLoc -> Q (Maybe String)
+getDoc n = Q (qGetDoc n)
+
 instance MonadIO Q where
   liftIO = runIO
 
@@ -758,6 +905,7 @@ instance Quasi Q where
   qReifyConStrictness = reifyConStrictness
   qLookupName         = lookupName
   qLocation           = location
+  qGetPackageRoot     = getPackageRoot
   qAddDependentFile   = addDependentFile
   qAddTempFile        = addTempFile
   qAddTopDecls        = addTopDecls
@@ -768,6 +916,8 @@ instance Quasi Q where
   qPutQ               = putQ
   qIsExtEnabled       = isExtEnabled
   qExtsEnabled        = extsEnabled
+  qPutDoc             = putDoc
+  qGetDoc             = getDoc
 
 
 ----------------------------------------------------
@@ -811,12 +961,16 @@ sequenceQ = sequence
 -- > data Bar a = Bar1 a (Bar a) | Bar2 String
 -- >   deriving Lift
 --
--- Levity-polymorphic since /template-haskell-2.16.0.0/.
+-- Representation-polymorphic since /template-haskell-2.16.0.0/.
 class Lift (t :: TYPE r) where
   -- | Turn a value into a Template Haskell expression, suitable for use in
   -- a splice.
   lift :: Quote m => t -> m Exp
+#if __GLASGOW_HASKELL__ >= 901
+  default lift :: (r ~ ('BoxedRep 'Lifted), Quote m) => t -> m Exp
+#else
   default lift :: (r ~ 'LiftedRep, Quote m) => t -> m Exp
+#endif
   lift = unTypeCode . liftTyped
 
   -- | Turn a value into a Template Haskell typed expression, suitable for use
@@ -930,6 +1084,51 @@ instance Lift Addr# where
   liftTyped x = unsafeCodeCoerce (lift x)
   lift x
     = return (LitE (StringPrimL (map (fromIntegral . ord) (unpackCString# x))))
+
+#if __GLASGOW_HASKELL__ >= 903
+
+-- |
+-- @since 2.19.0.0
+instance Lift ByteArray where
+  liftTyped x = unsafeCodeCoerce (lift x)
+  lift (ByteArray b) = return
+    (AppE (AppE (VarE addrToByteArrayName) (LitE (IntegerL (fromIntegral len))))
+      (LitE (BytesPrimL (Bytes ptr 0 (fromIntegral len)))))
+    where
+      len# = sizeofByteArray# b
+      len = I# len#
+      pb :: ByteArray#
+      !(ByteArray pb)
+        | isTrue# (isByteArrayPinned# b) = ByteArray b
+        | otherwise = runST $ ST $
+          \s -> case newPinnedByteArray# len# s of
+            (# s', mb #) -> case copyByteArray# b 0# mb 0# len# s' of
+              s'' -> case unsafeFreezeByteArray# mb s'' of
+                (# s''', ret #) -> (# s''', ByteArray ret #)
+      ptr :: ForeignPtr Word8
+      ptr = ForeignPtr (byteArrayContents# pb) (PlainPtr (unsafeCoerce# pb))
+
+
+-- We can't use a TH quote in this module because we're in the template-haskell
+-- package, so we conconct this quite defensive solution to make the correct name
+-- which will work if the package name or module name changes in future.
+addrToByteArrayName :: Name
+addrToByteArrayName = helper
+  where
+    helper :: HasCallStack => Name
+    helper =
+      case head (getCallStack ?callStack) of
+        (_, SrcLoc{..}) -> mkNameG_v srcLocPackage srcLocModule "addrToByteArray"
+
+
+addrToByteArray :: Int -> Addr# -> ByteArray
+addrToByteArray (I# len) addr = runST $ ST $
+  \s -> case newByteArray# len s of
+    (# s', mb #) -> case copyAddrToByteArray# addr mb 0# len s' of
+      s'' -> case unsafeFreezeByteArray# mb s'' of
+        (# s''', ret #) -> (# s''', ByteArray ret #)
+
+#endif
 
 instance Lift a => Lift (Maybe a) where
   liftTyped x = unsafeCodeCoerce (lift x)
@@ -1296,7 +1495,7 @@ dataToPatQ = dataToQa id litP conP
             case nameSpace n of
                 Just DataName -> do
                     ps' <- sequence ps
-                    return (ConP n ps')
+                    return (ConP n [] ps')
                 _ -> error $ "Can't construct a pattern from name "
                           ++ showName n
 
@@ -1880,9 +2079,10 @@ But how should we parse @a + b * c@? If we don't know the fixities of
 @+@ and @*@, we don't know whether to parse it as @a + (b * c)@ or @(a
 + b) * c@.
 
-In cases like this, use 'UInfixE', 'UInfixP', or 'UInfixT', which stand for
-\"unresolved infix expression/pattern/type\", respectively. When the compiler
-is given a splice containing a tree of @UInfixE@ applications such as
+In cases like this, use 'UInfixE', 'UInfixP', 'UInfixT', or 'PromotedUInfixT',
+which stand for \"unresolved infix expression/pattern/type/promoted
+constructor\", respectively. When the compiler is given a splice containing a
+tree of @UInfixE@ applications such as
 
 > UInfixE
 >   (UInfixE e1 op1 e2)
@@ -1897,7 +2097,8 @@ reassociate the tree as necessary.
 
     > (a + b * c) + d * e
 
-  * 'InfixE', 'InfixP', and 'InfixT' expressions are never reassociated.
+  * 'InfixE', 'InfixP', 'InfixT', and 'PromotedInfixT' expressions are never
+    reassociated.
 
   * The 'UInfixE' constructor doesn't support sections. Sections
     such as @(a *)@ have no ambiguity, so 'InfixE' suffices. For longer
@@ -1924,8 +2125,8 @@ reassociate the tree as necessary.
     > [p| a : b : c |] :: Q Pat
     > [t| T + T |] :: Q Type
 
-    will never contain 'UInfixE', 'UInfixP', 'UInfixT', 'InfixT', 'ParensE',
-    'ParensP', or 'ParensT' constructors.
+    will never contain 'UInfixE', 'UInfixP', 'UInfixT', 'PromotedUInfixT',
+    'InfixT', 'PromotedInfixT, 'ParensE', 'ParensP', or 'ParensT' constructors.
 
 -}
 
@@ -1963,6 +2164,7 @@ data Bytes = Bytes
    { bytesPtr    :: ForeignPtr Word8 -- ^ Pointer to the data
    , bytesOffset :: Word             -- ^ Offset from the pointer
    , bytesSize   :: Word             -- ^ Number of bytes
+
    -- Maybe someday:
    -- , bytesAlignement  :: Word -- ^ Alignement constraint
    -- , bytesReadOnly    :: Bool -- ^ Shall we embed into a read-only
@@ -2018,7 +2220,7 @@ data Pat
   | TupP [Pat]                      -- ^ @{ (p1,p2) }@
   | UnboxedTupP [Pat]               -- ^ @{ (\# p1,p2 \#) }@
   | UnboxedSumP Pat SumAlt SumArity -- ^ @{ (\#|p|\#) }@
-  | ConP Name [Pat]                 -- ^ @data T1 = C1 t1 t2; {C1 p1 p1} = e@
+  | ConP Name [Type] [Pat]          -- ^ @data T1 = C1 t1 t2; {C1 \@ty1 p1 p2} = e@
   | InfixP Pat Name Pat             -- ^ @foo ({x :+ y}) = e@
   | UInfixP Pat Name Pat            -- ^ @foo ({x :+ y}) = e@
                                     --
@@ -2040,6 +2242,7 @@ type FieldPat = (Name,Pat)
 
 data Match = Match Pat Body [Dec] -- ^ @case e of { pat -> body where decs }@
     deriving( Show, Eq, Ord, Data, Generic )
+
 data Clause = Clause [Pat] Body [Dec]
                                   -- ^ @f { p1 p2 = body where decs }@
     deriving( Show, Eq, Ord, Data, Generic )
@@ -2071,6 +2274,7 @@ data Exp
                                        -- See "Language.Haskell.TH.Syntax#infix"
   | LamE [Pat] Exp                     -- ^ @{ \\ p1 p2 -> e }@
   | LamCaseE [Match]                   -- ^ @{ \\case m1; m2 }@
+  | LamCasesE [Clause]                 -- ^ @{ \\cases m1; m2 }@
   | TupE [Maybe Exp]                   -- ^ @{ (e1,e2) }  @
                                        --
                                        -- The 'Maybe' is necessary for handling
@@ -2127,6 +2331,8 @@ data Exp
                                        -- or constructor name.
   | LabelE String                      -- ^ @{ #x }@ ( Overloaded label )
   | ImplicitParamVarE String           -- ^ @{ ?x }@ ( Implicit parameter )
+  | GetFieldE Exp String               -- ^ @{ exp.field }@ ( Overloaded Record Dot )
+  | ProjectionE (NonEmpty String)      -- ^ @(.x)@ or @(.x.y)@ (Record projections)
   deriving( Show, Eq, Ord, Data, Generic )
 
 type FieldExp = (Name,Exp)
@@ -2183,6 +2389,7 @@ data Dec
                                   --{ foreign export ... }@
 
   | InfixD Fixity Name            -- ^ @{ infix 3 foo }@
+  | DefaultD [Type]               -- ^ @{ default (Integer, Double) }@
 
   -- | pragmas
   | PragmaD Pragma                -- ^ @{ {\-\# INLINE [1] foo \#-\} }@
@@ -2242,7 +2449,7 @@ data Dec
 data Overlap = Overlappable   -- ^ May be overlapped by more specific instances
              | Overlapping    -- ^ May overlap a more general instance
              | Overlaps       -- ^ Both 'Overlapping' and 'Overlappable'
-             | Incoherent     -- ^ Both 'Overlappable' and 'Overlappable', and
+             | Incoherent     -- ^ Both 'Overlapping' and 'Overlappable', and
                               -- pick an arbitrary one if multiple choices are
                               -- available.
   deriving( Show, Eq, Ord, Data, Generic )
@@ -2350,6 +2557,7 @@ data Safety = Unsafe | Safe | Interruptible
         deriving( Show, Eq, Ord, Data, Generic )
 
 data Pragma = InlineP         Name Inline RuleMatch Phases
+            | OpaqueP         Name
             | SpecialiseP     Name Type (Maybe Inline) Phases
             | SpecialiseInstP Type
             | RuleP           String (Maybe [TyVarBndr ()]) [RuleBndr] Exp Exp Phases
@@ -2438,6 +2646,10 @@ data DecidedStrictness = DecidedLazy
 --   @
 --
 --   In @MkBar@, 'ForallC' will quantify @a@, @b@, and @c@.
+--
+-- Multiplicity annotations for data types are currently not supported
+-- in Template Haskell (i.e. all fields represented by Template Haskell
+-- will be linear).
 data Con = NormalC Name [BangType]       -- ^ @C Int a@
          | RecC Name [VarBangType]       -- ^ @C { v :: Int, w :: a }@
          | InfixC BangType Name BangType -- ^ @Int :+ a@
@@ -2452,7 +2664,6 @@ data Con = NormalC Name [BangType]       -- ^ @C Int a@
 
 -- Note [GADT return type]
 -- ~~~~~~~~~~~~~~~~~~~~~~~
---
 -- The return type of a GADT constructor does not necessarily match the name of
 -- the data type:
 --
@@ -2511,35 +2722,41 @@ data PatSynArgs
   deriving( Show, Eq, Ord, Data, Generic )
 
 data Type = ForallT [TyVarBndr Specificity] Cxt Type -- ^ @forall \<vars\>. \<ctxt\> => \<type\>@
-          | ForallVisT [TyVarBndr ()] Type  -- ^ @forall \<vars\> -> \<type\>@
-          | AppT Type Type                -- ^ @T a b@
-          | AppKindT Type Kind            -- ^ @T \@k t@
-          | SigT Type Kind                -- ^ @t :: k@
-          | VarT Name                     -- ^ @a@
-          | ConT Name                     -- ^ @T@
-          | PromotedT Name                -- ^ @'T@
-          | InfixT Type Name Type         -- ^ @T + T@
-          | UInfixT Type Name Type        -- ^ @T + T@
-                                          --
-                                          -- See "Language.Haskell.TH.Syntax#infix"
-          | ParensT Type                  -- ^ @(T)@
+          | ForallVisT [TyVarBndr ()] Type -- ^ @forall \<vars\> -> \<type\>@
+          | AppT Type Type                 -- ^ @T a b@
+          | AppKindT Type Kind             -- ^ @T \@k t@
+          | SigT Type Kind                 -- ^ @t :: k@
+          | VarT Name                      -- ^ @a@
+          | ConT Name                      -- ^ @T@
+          | PromotedT Name                 -- ^ @'T@
+          | InfixT Type Name Type          -- ^ @T + T@
+          | UInfixT Type Name Type         -- ^ @T + T@
+                                           --
+                                           -- See "Language.Haskell.TH.Syntax#infix"
+          | PromotedInfixT Type Name Type  -- ^ @T :+: T@
+          | PromotedUInfixT Type Name Type -- ^ @T :+: T@
+                                           --
+                                           -- See "Language.Haskell.TH.Syntax#infix"
+          | ParensT Type                   -- ^ @(T)@
 
           -- See Note [Representing concrete syntax in types]
-          | TupleT Int                    -- ^ @(,), (,,), etc.@
-          | UnboxedTupleT Int             -- ^ @(\#,\#), (\#,,\#), etc.@
-          | UnboxedSumT SumArity          -- ^ @(\#|\#), (\#||\#), etc.@
-          | ArrowT                        -- ^ @->@
-          | MulArrowT                     -- ^ @FUN@
-          | EqualityT                     -- ^ @~@
-          | ListT                         -- ^ @[]@
-          | PromotedTupleT Int            -- ^ @'(), '(,), '(,,), etc.@
-          | PromotedNilT                  -- ^ @'[]@
-          | PromotedConsT                 -- ^ @(':)@
-          | StarT                         -- ^ @*@
-          | ConstraintT                   -- ^ @Constraint@
-          | LitT TyLit                    -- ^ @0,1,2, etc.@
-          | WildCardT                     -- ^ @_@
-          | ImplicitParamT String Type    -- ^ @?x :: t@
+          | TupleT Int                     -- ^ @(,), (,,), etc.@
+          | UnboxedTupleT Int              -- ^ @(\#,\#), (\#,,\#), etc.@
+          | UnboxedSumT SumArity           -- ^ @(\#|\#), (\#||\#), etc.@
+          | ArrowT                         -- ^ @->@
+          | MulArrowT                      -- ^ @%n ->@
+                                           --
+                                           -- Generalised arrow type with multiplicity argument
+          | EqualityT                      -- ^ @~@
+          | ListT                          -- ^ @[]@
+          | PromotedTupleT Int             -- ^ @'(), '(,), '(,,), etc.@
+          | PromotedNilT                   -- ^ @'[]@
+          | PromotedConsT                  -- ^ @(':)@
+          | StarT                          -- ^ @*@
+          | ConstraintT                    -- ^ @Constraint@
+          | LitT TyLit                     -- ^ @0,1,2, etc.@
+          | WildCardT                      -- ^ @_@
+          | ImplicitParamT String Type     -- ^ @?x :: t@
       deriving( Show, Eq, Ord, Data, Generic )
 
 data Specificity = SpecifiedSpec          -- ^ @a@
@@ -2562,6 +2779,7 @@ data InjectivityAnn = InjectivityAnn Name [Name]
 
 data TyLit = NumTyLit Integer             -- ^ @2@
            | StrTyLit String              -- ^ @\"Hello\"@
+           | CharTyLit Char               -- ^ @\'C\'@, @since 4.16.0.0
   deriving ( Show, Eq, Ord, Data, Generic )
 
 -- | Role annotations
@@ -2615,6 +2833,17 @@ constructors):
   '[ Maybe, IO ]    PromotedConsT `AppT` Maybe `AppT`
                     (PromotedConsT  `AppT` IO `AppT` PromotedNilT)
 -}
+
+-- | A location at which to attach Haddock documentation.
+-- Note that adding documentation to a 'Name' defined oustide of the current
+-- module will cause an error.
+data DocLoc
+  = ModuleDoc         -- ^ At the current module's header.
+  | DeclDoc Name      -- ^ At a declaration, not necessarily top level.
+  | ArgDoc Name Int   -- ^ At a specific argument of a function, indexed by its
+                      -- position.
+  | InstDoc Type      -- ^ At a class or family instance.
+  deriving ( Show, Eq, Ord, Data, Generic )
 
 -----------------------------------------------------
 --              Internal helper functions

@@ -1,22 +1,24 @@
+{-# LANGUAGE DeriveDataTypeable         #-}
+{-# LANGUAGE DeriveTraversable          #-}
+{-# LANGUAGE FlexibleInstances          #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE OverloadedStrings          #-}
+{-# LANGUAGE PatternSynonyms            #-}
+{-# LANGUAGE ScopedTypeVariables        #-}
+
 {-
 Types for the .hie file format are defined here.
 
 For more information see https://gitlab.haskell.org/ghc/ghc/wikis/hie-files
 -}
-{-# LANGUAGE DeriveTraversable #-}
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE TypeSynonymInstances #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE OverloadedStrings #-}
+
 module GHC.Iface.Ext.Types where
 
 import GHC.Prelude
 
 import GHC.Settings.Config
 import GHC.Utils.Binary
-import GHC.Data.FastString        ( FastString )
+import GHC.Data.FastString
 import GHC.Builtin.Utils
 import GHC.Iface.Type
 import GHC.Unit.Module            ( ModuleName, Module )
@@ -27,6 +29,7 @@ import GHC.Types.Avail
 import GHC.Types.Unique
 import qualified GHC.Utils.Outputable as O ( (<>) )
 import GHC.Utils.Misc
+import GHC.Utils.Panic
 
 import qualified Data.Array as A
 import qualified Data.Map as M
@@ -152,6 +155,7 @@ type HieTypeFlat = HieType TypeIndex
 
 -- | Roughly isomorphic to the original core 'Type'.
 newtype HieTypeFix = Roll (HieType (HieTypeFix))
+  deriving Eq
 
 instance Binary (HieType TypeIndex) where
   put_ bh (HTyVarTy n) = do
@@ -210,9 +214,18 @@ instance Binary (HieArgs TypeIndex) where
   put_ bh (HieArgs xs) = put_ bh xs
   get bh = HieArgs <$> get bh
 
--- | Mapping from filepaths (represented using 'FastString') to the
--- corresponding AST
-newtype HieASTs a = HieASTs { getAsts :: (M.Map FastString (HieAST a)) }
+
+-- A HiePath is just a lexical FastString. We use a lexical FastString to avoid
+-- non-determinism when printing or storing HieASTs which are sorted by their
+-- HiePath.
+type HiePath = LexicalFastString
+
+{-# COMPLETE HiePath #-}
+pattern HiePath :: FastString -> HiePath
+pattern HiePath fs = LexicalFastString fs
+
+-- | Mapping from filepaths to the corresponding AST
+newtype HieASTs a = HieASTs { getAsts :: M.Map HiePath (HieAST a) }
   deriving (Functor, Foldable, Traversable)
 
 instance Binary (HieASTs TypeIndex) where
@@ -284,13 +297,35 @@ instance Binary NodeOrigin where
   put_ bh b = putByte bh (fromIntegral (fromEnum b))
   get bh = do x <- getByte bh; pure $! (toEnum (fromIntegral x))
 
+-- | A node annotation
+data NodeAnnotation = NodeAnnotation
+   { nodeAnnotConstr :: !FastString -- ^ name of the AST node constructor
+   , nodeAnnotType   :: !FastString -- ^ name of the AST node Type
+   }
+   deriving (Eq)
+
+instance Ord NodeAnnotation where
+   compare (NodeAnnotation c0 t0) (NodeAnnotation c1 t1)
+      = mconcat [lexicalCompareFS c0 c1, lexicalCompareFS t0 t1]
+
+instance Outputable NodeAnnotation where
+   ppr (NodeAnnotation c t) = ppr (c,t)
+
+instance Binary NodeAnnotation where
+  put_ bh (NodeAnnotation c t) = do
+    put_ bh c
+    put_ bh t
+  get bh = NodeAnnotation
+    <$> get bh
+    <*> get bh
+
 -- | The information stored in one AST node.
 --
 -- The type parameter exists to provide flexibility in representation of types
 -- (see Note [Efficient serialization of redundant type info]).
 data NodeInfo a = NodeInfo
-    { nodeAnnotations :: S.Set (FastString,FastString)
-    -- ^ (name of the AST node constructor, name of the AST node Type)
+    { nodeAnnotations :: S.Set NodeAnnotation
+    -- ^ Annotations
 
     , nodeType :: [a]
     -- ^ The Haskell types of this node, if any.

@@ -2,7 +2,7 @@
  * (c)2006 Galois Connections, Inc.
  */
 
-#include "PosixSource.h"
+#include "rts/PosixSource.h"
 #include "Rts.h"
 
 #include "Trace.h"
@@ -137,7 +137,7 @@ readTix(void) {
     tmpModule -> hashNo = (unsigned int)expectWord64();
     ws();
     tmpModule -> tickCount = (int)expectWord64();
-    tmpModule -> tixArr = (StgWord64 *)calloc(tmpModule->tickCount,sizeof(StgWord64));
+    tmpModule -> tixArr = (StgWord64 *)stgCallocBytes(tmpModule->tickCount,sizeof(StgWord64), "readTix");
     ws();
     expect('[');
     ws();
@@ -241,8 +241,8 @@ startupHpc(void)
 
 /*
  * Called on a per-module basis, by a constructor function compiled
- * with each module (see Coverage.hpcInitCode), declaring where the
- * tix boxes are stored in memory.  This memory can be uninitized,
+ * with each module (see GHC.HsToCore.Coverage.hpcInitCode), declaring
+ * where the tix boxes are stored in memory. This memory can be uninitized,
  * because we will initialize it with either the contents of the tix
  * file, or all zeros.
  *

@@ -7,7 +7,7 @@
  *
  * ---------------------------------------------------------------------------*/
 
-#include "PosixSource.h"
+#include "rts/PosixSource.h"
 #include "ghcconfig.h"
 
 #include "Rts.h"
@@ -476,7 +476,8 @@ printSmallBitmap( StgPtr spBottom, StgPtr payload, StgWord bitmap,
         debugBelch("   stk[%ld] (%p) = ", (long)(spBottom-(payload+i)), payload+i);
         if ((bitmap & 1) == 0) {
             printPtr((P_)payload[i]);
-            debugBelch("\n");
+            debugBelch(" -- ");
+            printObj((StgClosure*) payload[i]);
         } else {
             debugBelch("Word# %" FMT_Word "\n", (W_)payload[i]);
         }
@@ -498,7 +499,8 @@ printLargeBitmap( StgPtr spBottom, StgPtr payload, StgLargeBitmap* large_bitmap,
             debugBelch("   stk[%" FMT_Word "] (%p) = ", (W_)(spBottom-(payload+i)), payload+i);
             if ((bitmap & 1) == 0) {
                 printPtr((P_)payload[i]);
-                debugBelch("\n");
+                debugBelch(" -- ");
+                printObj((StgClosure*) payload[i]);
             } else {
                 debugBelch("Word# %" FMT_Word "\n", (W_)payload[i]);
             }
@@ -509,7 +511,6 @@ printLargeBitmap( StgPtr spBottom, StgPtr payload, StgLargeBitmap* large_bitmap,
 void
 printStackChunk( StgPtr sp, StgPtr spBottom )
 {
-    StgWord bitmap;
     const StgInfoTable *info;
 
     ASSERT(sp <= spBottom);
@@ -528,17 +529,7 @@ printStackChunk( StgPtr sp, StgPtr spBottom )
 
         case RET_SMALL: {
             StgWord c = *sp;
-            if (c == (StgWord)&stg_ctoi_R1p_info) {
-                debugBelch("tstg_ctoi_ret_R1p_info\n" );
-            } else if (c == (StgWord)&stg_ctoi_R1n_info) {
-                debugBelch("stg_ctoi_ret_R1n_info\n" );
-            } else if (c == (StgWord)&stg_ctoi_F1_info) {
-                debugBelch("stg_ctoi_ret_F1_info\n" );
-            } else if (c == (StgWord)&stg_ctoi_D1_info) {
-                debugBelch("stg_ctoi_ret_D1_info\n" );
-            } else if (c == (StgWord)&stg_ctoi_V_info) {
-                debugBelch("stg_ctoi_ret_V_info\n" );
-            } else if (c == (StgWord)&stg_ap_v_info) {
+            if (c == (StgWord)&stg_ap_v_info) {
                 debugBelch("stg_ap_v_info\n" );
             } else if (c == (StgWord)&stg_ap_f_info) {
                 debugBelch("stg_ap_f_info\n" );
@@ -587,26 +578,69 @@ printStackChunk( StgPtr sp, StgPtr spBottom )
             } else {
                 debugBelch("RET_SMALL (%p)\n", info);
             }
-            bitmap = info->layout.bitmap;
+            StgWord bitmap = info->layout.bitmap;
             printSmallBitmap(spBottom, sp+1,
                              BITMAP_BITS(bitmap), BITMAP_SIZE(bitmap));
             continue;
         }
 
         case RET_BCO: {
-            StgBCO *bco;
+            StgWord c = *sp;
+            StgBCO *bco = ((StgBCO *)sp[1]);
 
-            bco = ((StgBCO *)sp[1]);
-
-            debugBelch("RET_BCO (%p)\n", sp);
+            if (c == (StgWord)&stg_ctoi_R1p_info) {
+                debugBelch("stg_ctoi_R1p_info" );
+            } else if (c == (StgWord)&stg_ctoi_R1n_info) {
+                debugBelch("stg_ctoi_R1n_info" );
+            } else if (c == (StgWord)&stg_ctoi_F1_info) {
+                debugBelch("stg_ctoi_F1_info" );
+            } else if (c == (StgWord)&stg_ctoi_D1_info) {
+                debugBelch("stg_ctoi_D1_info" );
+            } else if (c == (StgWord)&stg_ctoi_V_info) {
+                debugBelch("stg_ctoi_V_info" );
+            } else if (c == (StgWord)&stg_BCO_info) {
+                debugBelch("stg_BCO_info" );
+            } else if (c == (StgWord)&stg_apply_interp_info) {
+                debugBelch("stg_apply_interp_info" );
+            } else if (c == (StgWord)&stg_ret_t_info) {
+                debugBelch("stg_ret_t_info" );
+            } else if (c == (StgWord)&stg_ctoi_t0_info) {
+                debugBelch("stg_ctoi_t0_info" );
+            } else if (c == (StgWord)&stg_ctoi_t1_info) {
+                debugBelch("stg_ctoi_t1_info" );
+            } else if (c == (StgWord)&stg_ctoi_t2_info) {
+                debugBelch("stg_ctoi_t2_info" );
+            } else if (c == (StgWord)&stg_ctoi_t3_info) {
+                debugBelch("stg_ctoi_t3_info" );
+            } else if (c == (StgWord)&stg_ctoi_t4_info) {
+                debugBelch("stg_ctoi_t4_info" );
+            } else if (c == (StgWord)&stg_ctoi_t5_info) {
+                debugBelch("stg_ctoi_t5_info" );
+            } else if (c == (StgWord)&stg_ctoi_t6_info) {
+                debugBelch("stg_ctoi_t6_info" );
+            } else if (c == (StgWord)&stg_ctoi_t7_info) {
+                debugBelch("stg_ctoi_t7_info" );
+            } else if (c == (StgWord)&stg_ctoi_t8_info) {
+                debugBelch("stg_ctoi_t8_info" );
+            /* there are more stg_ctoi_tN_info frames,
+               but we don't print them all */
+            } else {
+                debugBelch("RET_BCO");
+            }
+            debugBelch(" (%p)\n", sp);
             printLargeBitmap(spBottom, sp+2,
                              BCO_BITMAP(bco), BCO_BITMAP_SIZE(bco));
             continue;
         }
 
         case RET_BIG:
-            barf("todo");
-
+            debugBelch("RET_BIG (%p)\n", sp);
+            StgLargeBitmap* bitmap = GET_LARGE_BITMAP(info);
+            printLargeBitmap(spBottom,
+                            (StgPtr)((StgClosure *) sp)->payload,
+                            bitmap,
+                            bitmap->size);
+            continue;
         case RET_FUN:
         {
             const StgFunInfoTable *fun_info;
@@ -642,7 +676,7 @@ printStackChunk( StgPtr sp, StgPtr spBottom )
     }
 }
 
-static void printStack( StgStack *stack )
+void printStack( StgStack *stack )
 {
     printStackChunk( stack->sp, stack->stack + stack->stack_size );
 }
@@ -663,13 +697,13 @@ void printStaticObjects( StgClosure *p )
     }
 }
 
-void printWeakLists()
+void printWeakLists(void)
 {
     debugBelch("======= WEAK LISTS =======\n");
 
-    for (uint32_t cap_idx = 0; cap_idx < n_capabilities; ++cap_idx) {
+    for (uint32_t cap_idx = 0; cap_idx < getNumCapabilities(); ++cap_idx) {
         debugBelch("Capability %d:\n", cap_idx);
-        Capability *cap = capabilities[cap_idx];
+        Capability *cap = getCapability(cap_idx);
         for (StgWeak *weak = cap->weak_ptr_list_hd; weak; weak = weak->link) {
             printClosure((StgClosure*)weak);
         }
@@ -690,14 +724,14 @@ void printWeakLists()
     debugBelch("=========================\n");
 }
 
-void printLargeAndPinnedObjects()
+void printLargeAndPinnedObjects(void)
 {
     debugBelch("====== PINNED OBJECTS ======\n");
 
-    for (uint32_t cap_idx = 0; cap_idx < n_capabilities; ++cap_idx) {
-        Capability *cap = capabilities[cap_idx];
+    for (uint32_t cap_idx = 0; cap_idx < getNumCapabilities(); ++cap_idx) {
+        Capability *cap = getCapability(cap_idx);
 
-        debugBelch("Capability %d: Current pinned object block: %p\n", 
+        debugBelch("Capability %d: Current pinned object block: %p\n",
                    cap_idx, (void*)cap->pinned_object_block);
         for (bdescr *bd = cap->pinned_object_blocks; bd; bd = bd->link) {
             debugBelch("%p\n", (void*)bd);
@@ -907,7 +941,7 @@ findPtr(P_ p, int follow)
   // We can't search the nursery, because we don't know which blocks contain
   // valid data, because the bd->free pointers in the nursery are only reset
   // just before a block is used.
-  for (n = 0; n < n_capabilities; n++) {
+  for (n = 0; n < getNumCapabilities(); n++) {
       bd = nurseries[i].blocks;
       i = findPtrBlocks(p,bd,arr,arr_size,i);
       if (i >= arr_size) return;
@@ -920,7 +954,7 @@ findPtr(P_ p, int follow)
       bd = generations[g].large_objects;
       i = findPtrBlocks(p,bd,arr,arr_size,i);
       if (i >= arr_size) return;
-      for (n = 0; n < n_capabilities; n++) {
+      for (n = 0; n < getNumCapabilities(); n++) {
           i = findPtrBlocks(p, gc_threads[n]->gens[g].part_list,
                             arr, arr_size, i);
           i = findPtrBlocks(p, gc_threads[n]->gens[g].todo_bd,
@@ -960,7 +994,7 @@ void printObj( StgClosure *obj )
    Closure types
 
    NOTE: must be kept in sync with the closure types in
-   includes/rts/storage/ClosureTypes.h
+   rts/include/rts/storage/ClosureTypes.h
    -------------------------------------------------------------------------- */
 
 const char *closure_type_names[] = {

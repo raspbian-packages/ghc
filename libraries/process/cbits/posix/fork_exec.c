@@ -1,4 +1,9 @@
+/* ensure that execvpe is provided if possible */
+#define _GNU_SOURCE 1
+
 #include "common.h"
+
+#if defined(HAVE_FORK)
 
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -66,8 +71,13 @@ setup_std_handle_fork(int fd,
         return 0;
 
     case STD_HANDLE_USE_FD:
-        if (dup2(b->use_fd,  fd) == -1) {
-            child_failed(pipe, "dup2");
+        // N.B. POSIX specifies that dup2(x,x) should be a no-op, but
+        // naturally Apple ignores this and rather fails in posix_spawn on Big
+        // Sur.
+        if (b->use_fd != fd) {
+            if (dup2(b->use_fd,  fd) == -1) {
+                child_failed(pipe, "dup2");
+            }
         }
         return 0;
 
@@ -125,10 +135,15 @@ do_spawn_fork (char *const args[],
     // we emulate this using fork and exec. However, to safely do so
     // we need to perform all allocations *prior* to forking. Consequently, we
     // need to find_executable before forking.
-#if !defined(HAVE_execvpe)
+#if !defined(HAVE_EXECVPE)
     char *exec_path;
     if (environment) {
-        exec_path = find_executable(args[0]);
+        exec_path = find_executable(workingDirectory, args[0]);
+        if (exec_path == NULL) {
+            errno = -ENOENT;
+            *failed_doing = "find_executable";
+            return -1;
+        }
     }
 #endif
 
@@ -234,7 +249,7 @@ do_spawn_fork (char *const args[],
 
         /* the child */
         if (environment) {
-#if defined(HAVE_execvpe)
+#if defined(HAVE_EXECVPE)
             // XXX Check result
             execvpe(args[0], args, environment);
 #else
@@ -314,3 +329,5 @@ do_spawn_fork (char *const args[],
 
     return pid;
 }
+
+#endif // HAVE_FORK

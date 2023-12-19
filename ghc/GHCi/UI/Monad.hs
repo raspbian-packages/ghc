@@ -1,5 +1,6 @@
-{-# LANGUAGE CPP, FlexibleInstances, DeriveFunctor, DerivingVia #-}
+{-# LANGUAGE FlexibleInstances, DeriveFunctor, DerivingVia #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
+{-# OPTIONS -fno-warn-name-shadowing #-}
 
 -----------------------------------------------------------------------------
 --
@@ -14,11 +15,12 @@ module GHCi.UI.Monad (
         GHCiState(..), GhciMonad(..),
         GHCiOption(..), isOptionSet, setOption, unsetOption,
         Command(..), CommandResult(..), cmdSuccess,
+        CmdExecOutcome(..),
         LocalConfigBehaviour(..),
         PromptFunction,
         BreakLocation(..),
         TickArray,
-        getDynFlags,
+        extractDynFlags, getDynFlags,
 
         runStmt, runDecls, runDecls', resume, recordBreak, revertCAFs,
         ActionStats(..), runAndPrintStats, runWithStats, printStats,
@@ -30,29 +32,32 @@ module GHCi.UI.Monad (
         initInterpBuffering,
         turnOffBuffering, turnOffBuffering_,
         flushInterpBuffers,
+        runInternal,
         mkEvalWrapper
     ) where
-
-#include "HsVersions.h"
 
 import GHCi.UI.Info (ModInfo)
 import qualified GHC
 import GHC.Driver.Monad hiding (liftIO)
-import GHC.Utils.Outputable       hiding (printForUser)
-import qualified GHC.Utils.Outputable as Outputable
+import GHC.Utils.Outputable
+import qualified GHC.Driver.Ppr as Ppr
 import GHC.Types.Name.Occurrence
 import GHC.Driver.Session
 import GHC.Data.FastString
-import GHC.Driver.Types
+import GHC.Driver.Env
 import GHC.Types.SrcLoc
+import GHC.Types.SafeHaskell
+import GHC.Driver.Make (ModIfaceCache(..))
 import GHC.Unit
 import GHC.Types.Name.Reader as RdrName (mkOrig)
 import GHC.Builtin.Names (gHC_GHCI_HELPERS)
 import GHC.Runtime.Interpreter
+import GHC.Runtime.Context
 import GHCi.RemoteTypes
 import GHC.Hs (ImportDecl, GhcPs, GhciLStmt, LHsDecl)
 import GHC.Hs.Utils
 import GHC.Utils.Misc
+import GHC.Utils.Logger
 
 import GHC.Utils.Exception hiding (uninterruptibleMask, mask, catch)
 import Numeric
@@ -71,6 +76,7 @@ import Control.Monad.Trans.Reader
 import Control.Monad.IO.Class
 import Data.Map.Strict (Map)
 import qualified Data.IntMap.Strict as IntMap
+import qualified GHC.Data.EnumSet as EnumSet
 import qualified GHC.LanguageExtensions as LangExt
 
 -----------------------------------------------------------------------------
@@ -85,6 +91,7 @@ data GHCiState = GHCiState
         prompt_cont    :: PromptFunction,
         editor         :: String,
         stop           :: String,
+        multiMode      :: Bool,
         localConfig    :: LocalConfigBehaviour,
         options        :: [GHCiOption],
         line_number    :: !Int,         -- ^ input line
@@ -155,8 +162,9 @@ data GHCiState = GHCiState
 
         flushStdHandles :: ForeignHValue,
             -- ^ @hFlush stdout; hFlush stderr@ in the interpreter
-        noBuffering :: ForeignHValue
+        noBuffering :: ForeignHValue,
             -- ^ @hSetBuffering NoBuffering@ for stdin/stdout/stderr
+        ifaceCache :: ModIfaceCache
      }
 
 type TickArray = Array Int [(GHC.BreakIndex,RealSrcSpan)]
@@ -166,8 +174,8 @@ data Command
    = Command
    { cmdName           :: String
      -- ^ Name of GHCi command (e.g. "exit")
-   , cmdAction         :: String -> InputT GHCi Bool
-     -- ^ The 'Bool' value denotes whether to exit GHCi
+   , cmdAction         :: String -> InputT GHCi CmdExecOutcome
+     -- ^ The 'CmdExecOutcome' value denotes whether to exit GHCi cleanly or error out
    , cmdHidden         :: Bool
      -- ^ Commands which are excluded from default completion
      -- and @:help@ summary. This is usually set for commands not
@@ -175,6 +183,20 @@ data Command
    , cmdCompletionFunc :: CompletionFunc GHCi
      -- ^ 'CompletionFunc' for arguments
    }
+
+-- | Used to denote GHCi command execution result. Specifically, used to
+-- distinguish between two ghci execution modes - "REPL" and "Expression
+-- evaluation mode (ghc -e)". When in "REPL" mode, we don't want to exit
+-- GHCi session when error occurs, (which is when we use "CmdSuccess").
+-- Otherwise, when in expression evaluation mode, all command failures
+-- should lead to GHCi session termination (with ExitFailure 1) which is
+-- when "CmdFailure" is used(this is useful when executing scripts).
+-- "CleanExit" is used to signal end of GHCi session (for example, when
+-- ":quit" command is called).
+data CmdExecOutcome
+  = CleanExit
+  | CmdSuccess
+  | CmdFailure
 
 data CommandResult
    = CommandComplete
@@ -235,7 +257,7 @@ prettyLocations  locs =
 instance Outputable BreakLocation where
    ppr loc = (ppr $ breakModule loc) <+> ppr (breakLoc loc) <+> pprEnaDisa <+>
                 if null (onBreakCmd loc)
-                   then Outputable.empty
+                   then empty
                    else doubleQuotes (text (onBreakCmd loc))
       where pprEnaDisa = case breakEnabled loc of
                 True  -> text "enabled"
@@ -284,7 +306,7 @@ class GhcMonad m => GhciMonad m where
 instance GhciMonad GHCi where
   getGHCiState      = GHCi $ \r -> liftIO $ readIORef r
   setGHCiState s    = GHCi $ \r -> liftIO $ writeIORef r s
-  modifyGHCiState f = GHCi $ \r -> liftIO $ modifyIORef r f
+  modifyGHCiState f = GHCi $ \r -> liftIO $ modifyIORef' r f
   reifyGHCi f       = GHCi $ \r -> reifyGhc $ \s -> f (s, r)
 
 instance GhciMonad (InputT GHCi) where
@@ -302,12 +324,19 @@ instance MonadIO GHCi where
 instance HasDynFlags GHCi where
   getDynFlags = getSessionDynFlags
 
+instance HasLogger GHCi where
+  getLogger = hsc_logger <$> getSession
+
 instance GhcMonad GHCi where
   setSession s' = liftGhc $ setSession s'
   getSession    = liftGhc $ getSession
 
+
 instance HasDynFlags (InputT GHCi) where
   getDynFlags = lift getDynFlags
+
+instance HasLogger (InputT GHCi) where
+  getLogger = lift getLogger
 
 instance GhcMonad (InputT GHCi) where
   setSession = lift . setSession
@@ -316,7 +345,7 @@ instance GhcMonad (InputT GHCi) where
 isOptionSet :: GhciMonad m => GHCiOption -> m Bool
 isOptionSet opt
  = do st <- getGHCiState
-      return (opt `elem` options st)
+      return $! (opt `elem` options st)
 
 setOption :: GhciMonad m => GHCiOption -> m ()
 setOption opt
@@ -330,27 +359,27 @@ unsetOption opt
 
 printForUserNeverQualify :: GhcMonad m => SDoc -> m ()
 printForUserNeverQualify doc = do
-  dflags <- getDynFlags
-  liftIO $ Outputable.printForUser dflags stdout neverQualify AllTheWay doc
+  dflags <- GHC.getInteractiveDynFlags
+  liftIO $ Ppr.printForUser dflags stdout neverQualify AllTheWay doc
 
 printForUserModInfo :: GhcMonad m => GHC.ModuleInfo -> SDoc -> m ()
 printForUserModInfo info doc = do
-  dflags <- getDynFlags
+  dflags <- GHC.getInteractiveDynFlags
   mUnqual <- GHC.mkPrintUnqualifiedForModule info
   unqual <- maybe GHC.getPrintUnqual return mUnqual
-  liftIO $ Outputable.printForUser dflags stdout unqual AllTheWay doc
+  liftIO $ Ppr.printForUser dflags stdout unqual AllTheWay doc
 
 printForUser :: GhcMonad m => SDoc -> m ()
 printForUser doc = do
   unqual <- GHC.getPrintUnqual
-  dflags <- getDynFlags
-  liftIO $ Outputable.printForUser dflags stdout unqual AllTheWay doc
+  dflags <- GHC.getInteractiveDynFlags
+  liftIO $ Ppr.printForUser dflags stdout unqual AllTheWay doc
 
 printForUserPartWay :: GhcMonad m => SDoc -> m ()
 printForUserPartWay doc = do
   unqual <- GHC.getPrintUnqual
-  dflags <- getDynFlags
-  liftIO $ Outputable.printForUser dflags stdout unqual Outputable.DefaultDepth doc
+  dflags <- GHC.getInteractiveDynFlags
+  liftIO $ Ppr.printForUser dflags stdout unqual DefaultDepth doc
 
 -- | Run a single Haskell expression
 runStmt
@@ -391,14 +420,14 @@ runDecls' decls = do
                   return Nothing)
         (Just <$> GHC.runParsedDecls decls)
 
-resume :: GhciMonad m => (SrcSpan -> Bool) -> GHC.SingleStep -> m GHC.ExecResult
-resume canLogSpan step = do
+resume :: GhciMonad m => (SrcSpan -> Bool) -> GHC.SingleStep -> Maybe Int -> m GHC.ExecResult
+resume canLogSpan step mbIgnoreCnt = do
   st <- getGHCiState
   reifyGHCi $ \x ->
     withProgName (progname st) $
     withArgs (args st) $
       reflectGHCi x $ do
-        GHC.resumeExec canLogSpan step
+        GHC.resumeExec canLogSpan step mbIgnoreCnt
 
 -- --------------------------------------------------------------------------
 -- timing & statistics
@@ -438,7 +467,7 @@ runWithStats getAllocs action = do
 printStats :: DynFlags -> ActionStats -> IO ()
 printStats dflags ActionStats{actionAllocs = mallocs, actionElapsedTime = secs}
    = do let secs_str = showFFloat (Just 2) secs
-        putStrLn (showSDoc dflags (
+        putStrLn (Ppr.showSDoc dflags (
                  parens (text (secs_str "") <+> text "secs" <> comma <+>
                          case mallocs of
                            Nothing -> empty
@@ -455,8 +484,8 @@ printStats dflags ActionStats{actionAllocs = mallocs, actionElapsedTime = secs}
 
 revertCAFs :: GhciMonad m => m ()
 revertCAFs = do
-  hsc_env <- GHC.getSession
-  liftIO $ iservCmd hsc_env RtsRevertCAFs
+  interp <- hscInterp <$> GHC.getSession
+  liftIO $ interpCmd interp RtsRevertCAFs
   s <- getGHCiState
   when (not (ghc_e s)) turnOffBuffering
      -- Have to turn off buffering again, because we just
@@ -482,8 +511,8 @@ initInterpBuffering = do
 flushInterpBuffers :: GhciMonad m => m ()
 flushInterpBuffers = do
   st <- getGHCiState
-  hsc_env <- GHC.getSession
-  liftIO $ evalIO hsc_env (flushStdHandles st)
+  interp <- hscInterp <$> GHC.getSession
+  liftIO $ evalIO interp (flushStdHandles st)
 
 -- | Turn off buffering for stdin, stdout, and stderr in the interpreter
 turnOffBuffering :: GhciMonad m => m ()
@@ -493,8 +522,8 @@ turnOffBuffering = do
 
 turnOffBuffering_ :: GhcMonad m => ForeignHValue -> m ()
 turnOffBuffering_ fhv = do
-  hsc_env <- getSession
-  liftIO $ evalIO hsc_env fhv
+  interp <- hscInterp <$> getSession
+  liftIO $ evalIO interp fhv
 
 mkEvalWrapper :: GhcMonad m => String -> [String] ->  m ForeignHValue
 mkEvalWrapper progname args =
@@ -511,12 +540,14 @@ runInternal :: GhcMonad m => m a -> m a
 runInternal =
     withTempSession mkTempSession
   where
-    mkTempSession hsc_env = hsc_env
-      { hsc_dflags = (hsc_dflags hsc_env) {
-        -- Running GHCi's internal expression is incompatible with -XSafe.
+    mkTempSession = hscUpdateFlags (\dflags -> dflags
+      { -- Running GHCi's internal expression is incompatible with -XSafe.
           -- We temporarily disable any Safe Haskell settings while running
           -- GHCi internal expressions. (see #12509)
-        safeHaskell = Sf_None
+        safeHaskell = Sf_None,
+          -- Disable dumping of any data during evaluation of GHCi's internal
+          -- expressions. (#17500)
+        dumpFlags = EnumSet.empty
       }
         -- RebindableSyntax can wreak havoc with GHCi in several ways
           -- (see #13385 and #14342 for examples), so we temporarily
@@ -525,7 +556,7 @@ runInternal =
           -- We heavily depend on -fimplicit-import-qualified to compile expr
           -- with fully qualified names without imports.
           `gopt_set` Opt_ImplicitImportQualified
-      }
+      )
 
 compileGHCiExpr :: GhcMonad m => String -> m ForeignHValue
 compileGHCiExpr expr = runInternal $ GHC.compileExprRemote expr

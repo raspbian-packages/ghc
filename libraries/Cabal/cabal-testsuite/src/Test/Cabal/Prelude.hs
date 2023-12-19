@@ -24,6 +24,7 @@ import Test.Cabal.Plan
 
 import Distribution.Compat.Time (calibrateMtimeChangeDelay)
 import Distribution.Simple.Compiler (PackageDBStack, PackageDB(..))
+import Distribution.Simple.PackageDescription (readGenericPackageDescription)
 import Distribution.Simple.Program.Types
 import Distribution.Simple.Program.Db
 import Distribution.Simple.Program
@@ -34,10 +35,10 @@ import Distribution.Simple.Configure
     ( getPersistBuildConfig )
 import Distribution.Version
 import Distribution.Package
+import Distribution.Parsec (eitherParsec)
 import Distribution.Types.UnqualComponentName
 import Distribution.Types.LocalBuildInfo
 import Distribution.PackageDescription
-import Distribution.PackageDescription.Parsec
 import Distribution.Verbosity (normal)
 
 import Distribution.Compat.Stack
@@ -50,6 +51,8 @@ import qualified Data.ByteString.Lazy as BSL
 import Control.Monad (unless, when, void, forM_, liftM2, liftM4)
 import Control.Monad.Trans.Reader (withReaderT, runReaderT)
 import Control.Monad.IO.Class (MonadIO (..))
+import qualified Crypto.Hash.SHA256 as SHA256
+import qualified Data.ByteString.Base16 as Base16
 import qualified Data.ByteString.Char8 as C
 import Data.List (isInfixOf, stripPrefix, isPrefixOf, intercalate)
 import Data.List.NonEmpty (NonEmpty (..))
@@ -59,10 +62,13 @@ import System.Exit (ExitCode (..))
 import System.FilePath ((</>), takeExtensions, takeDrive, takeDirectory, normalise, splitPath, joinPath, splitFileName, (<.>), dropTrailingPathSeparator)
 import Control.Concurrent (threadDelay)
 import qualified Data.Char as Char
-import System.Directory (getTemporaryDirectory, getCurrentDirectory, copyFile, removeFile, copyFile, doesFileExist, createDirectoryIfMissing, getDirectoryContents)
+import System.Directory (getTemporaryDirectory, getCurrentDirectory, canonicalizePath, copyFile, copyFile, doesDirectoryExist, doesFileExist, createDirectoryIfMissing, getDirectoryContents)
+import Control.Retry (exponentialBackoff, limitRetriesByCumulativeDelay)
+import Network.Wait (waitTcpVerbose)
 
 #ifndef mingw32_HOST_OS
 import Control.Monad.Catch ( bracket_ )
+import System.Directory    ( removeFile )
 import System.Posix.Files  ( createSymbolicLink )
 import System.Posix.Resource
 #endif
@@ -274,12 +280,26 @@ cabalGArgs global_args cmd args input = do
     -- overwritable
     when (cmd == "v1-freeze") requireHasSourceCopy
     let extra_args
-          | cmd `elem` ["v1-update", "outdated", "user-config", "man", "v1-freeze", "check"]
+          | cmd `elem`
+              [ "v1-update"
+              , "outdated"
+              , "user-config"
+              , "man"
+              , "v1-freeze"
+              , "check"
+              , "get", "unpack"
+              , "info"
+              , "init"
+              ]
           = [ ]
 
           -- new-build commands are affected by testCabalProjectFile
           | cmd == "v2-sdist"
           = [ "--project-file", testCabalProjectFile env ]
+
+          | cmd == "v2-clean"
+          = [ "--builddir", testDistDir env
+            , "--project-file", testCabalProjectFile env ]
 
           | "v2-" `isPrefixOf` cmd
           = [ "--builddir", testDistDir env
@@ -333,11 +353,14 @@ runPlanExe' :: String {- package name -} -> String {- component name -}
             -> [String] -> TestM Result
 runPlanExe' pkg_name cname args = do
     Just plan <- testPlan `fmap` getTestEnv
-    let dist_dir = planDistDir plan (mkPackageName pkg_name)
-                        (CExeName (mkUnqualComponentName cname))
+    let distDirOrBinFile = planDistDir plan (mkPackageName pkg_name)
+                               (CExeName (mkUnqualComponentName cname))
+        exePath = case distDirOrBinFile of
+          DistDir dist_dir -> dist_dir </> "build" </> cname </> cname
+          BinFile bin_file -> bin_file
     defaultRecordMode RecordAll $ do
     recordHeader [pkg_name, cname]
-    runM (dist_dir </> "build" </> cname </> cname) args Nothing
+    runM exePath args Nothing
 
 ------------------------------------------------------------------------
 -- * Running ghc-pkg
@@ -492,59 +515,135 @@ infixr 4 `archiveTo`
 -- external repository corresponding to all of these packages
 withRepo :: FilePath -> TestM a -> TestM a
 withRepo repo_dir m = do
+    -- https://github.com/haskell/cabal/issues/7065
+    -- you don't simply put a windows path into URL...
+    skipIfWindows
+
     env <- getTestEnv
 
-    -- Check if hackage-repo-tool is available, and skip if not
-    skipUnless =<< isAvailableProgram hackageRepoToolProgram
-
-    -- 1. Generate keys
-    hackageRepoTool "create-keys" ["--keys", testKeysDir env]
-    -- 2. Initialize repo directory
-    let package_dir = testRepoDir env </> "package"
-    liftIO $ createDirectoryIfMissing True (testRepoDir env </> "index")
+    -- 1. Initialize repo directory
+    let package_dir = testRepoDir env
     liftIO $ createDirectoryIfMissing True package_dir
-    -- 3. Create tarballs
+
+    -- 2. Create tarballs
     pkgs <- liftIO $ getDirectoryContents (testCurrentDir env </> repo_dir)
     forM_ pkgs $ \pkg -> do
+        let srcPath = testCurrentDir env </> repo_dir </> pkg
+        let destPath = package_dir </> pkg
+        isPreferredVersionsFile <- liftIO $
+            -- validate this is the "magic" 'preferred-versions' file
+            -- and perform a sanity-check whether this is actually a file
+            -- and not a package that happens to have the same name.
+            if pkg == "preferred-versions"
+                then doesFileExist srcPath
+                else return False
         case pkg of
             '.':_ -> return ()
-            _     -> testCurrentDir env </> repo_dir </> pkg
-                        `archiveTo`
-                            package_dir </> pkg <.> "tar.gz"
-    -- 4. Initialize repository
-    hackageRepoTool "bootstrap" ["--keys", testKeysDir env, "--repo", testRepoDir env]
-    -- 5. Wire it up in .cabal/config
+            _
+                | isPreferredVersionsFile ->
+                    liftIO $ copyFile srcPath destPath
+                | otherwise -> archiveTo
+                    srcPath
+                    (destPath <.> "tar.gz")
+
+    -- 3. Wire it up in .cabal/config
     -- TODO: libify this
     let package_cache = testCabalDir env </> "packages"
     liftIO $ appendFile (testUserCabalConfigFile env)
            $ unlines [ "repository test-local-repo"
                      , "  url: " ++ repoUri env
-                     , "  secure: True"
-                     -- TODO: Hypothetically, we could stick in the
-                     -- correct key here
-                     , "  root-keys: "
-                     , "  key-threshold: 0"
                      , "remote-repo-cache: " ++ package_cache ]
-    -- 6. Create local directories (TODO: this is a bug #4136, once you
-    -- fix that this can be removed)
-    liftIO $ createDirectoryIfMissing True (package_cache </> "test-local-repo")
-    -- 7. Update our local index
-    cabal "v1-update" []
-    -- 8. Profit
+    liftIO $ print $ testUserCabalConfigFile env
+    liftIO $ print =<< readFile (testUserCabalConfigFile env)
+
+    -- 4. Update our local index
+    -- Note: this doesn't do anything for file+noindex repositories.
+    cabal "v2-update" ["-z"]
+
+    -- 5. Profit
     withReaderT (\env' -> env' { testHaveRepo = True }) m
     -- TODO: Arguably should undo everything when we're done...
   where
-    -- Work around issue #5218 (incorrect conversions between Windows paths and
-    -- file URIs) by using a relative path on Windows.
-    repoUri env =
-      if buildOS == Windows
-      then let relPath = definitelyMakeRelative (testCurrentDir env)
-                                                (testRepoDir env)
-               convertSeparators = intercalate "/"
-                                 . map dropTrailingPathSeparator
-                                 . splitPath
-           in "file:" ++ convertSeparators relPath
-      else "file:" ++ testRepoDir env
+    repoUri env ="file+noindex://" ++ testRepoDir env
+
+-- | Given a directory (relative to the 'testCurrentDir') containing
+-- a series of directories representing packages, generate an
+-- remote repository corresponding to all of these packages
+withRemoteRepo :: FilePath -> TestM a -> TestM a
+withRemoteRepo repoDir m = do
+    -- https://github.com/haskell/cabal/issues/7065
+    -- you don't simply put a windows path into URL...
+    skipIfWindows
+
+    -- we rely on the presence of python3 for a simple http server
+    skipUnless "no python3" =<< isAvailableProgram python3Program
+    -- we rely on hackage-repo-tool to set up the secure repository
+    skipUnless "no hackage-repo-tool" =<< isAvailableProgram hackageRepoToolProgram
+
+    env <- getTestEnv
+
+    let workDir = testRepoDir env
+
+    -- 1. Initialize repo and repo_keys directory
+    let keysDir = workDir </> "keys"
+    let packageDir = workDir </> "package"
+
+    liftIO $ createDirectoryIfMissing True packageDir
+    liftIO $ createDirectoryIfMissing True keysDir
+
+    -- 2. Create tarballs
+    entries <- liftIO $ getDirectoryContents (testCurrentDir env </> repoDir)
+    forM_ entries $ \entry -> do
+        let srcPath = testCurrentDir env </> repoDir </> entry
+        let destPath = packageDir </> entry
+        isPreferredVersionsFile <- liftIO $
+            -- validate this is the "magic" 'preferred-versions' file
+            -- and perform a sanity-check whether this is actually a file
+            -- and not a package that happens to have the same name.
+            if entry == "preferred-versions"
+                then doesFileExist srcPath
+                else return False
+        case entry of
+            '.' : _ -> return ()
+            _
+                | isPreferredVersionsFile ->
+                      liftIO $ copyFile srcPath destPath
+                | otherwise ->
+                  archiveTo srcPath (destPath <.> "tar.gz")
+
+    -- 3. Create keys and bootstrap repository
+    hackageRepoTool "create-keys" $ ["--keys", keysDir ]
+    hackageRepoTool "bootstrap" $ ["--keys", keysDir, "--repo", workDir]
+
+    -- 4. Wire it up in .cabal/config
+    let package_cache = testCabalDir env </> "packages"
+    -- In the following we launch a python http server to serve the remote
+    -- repository. When the http server is ready we proceed with the tests.
+    -- NOTE 1: it's important that both the http server and cabal use the
+    -- same hostname ("localhost"), otherwise there could be a mismatch
+    -- (depending on the details of the host networking settings).
+    -- NOTE 2: here we use a fixed port (8000). This can cause problems in
+    -- case multiple tests are running concurrently or other another
+    -- process on the developer machine is using the same port.
+    liftIO $ do
+        appendFile (testUserCabalConfigFile env) $
+            unlines [ "repository repository.localhost"
+                    , "  url: http://localhost:8000/"
+                    , "  secure: True"
+                    , "  root-keys:"
+                    , "  key-threshold: 0"
+                    , "remote-repo-cache: " ++ package_cache ]
+        putStrLn $ testUserCabalConfigFile env
+        putStrLn =<< readFile (testUserCabalConfigFile env)
+
+        withAsync
+          (flip runReaderT env $ python3 ["-m", "http.server", "-d", workDir, "--bind", "localhost", "8000"])
+          (\_ -> do
+            -- wait for the python webserver to come up with a exponential
+            -- backoff starting from 50ms, up to a maximum wait of 60s
+            waitTcpVerbose putStrLn (limitRetriesByCumulativeDelay 60000000 $ exponentialBackoff 50000) "localhost" "8000"
+            runReaderT m (env { testHaveRepo = True }))
+
 
 ------------------------------------------------------------------------
 -- * Subprocess run results
@@ -655,6 +754,16 @@ shouldNotExist path =
     withFrozenCallStack $
     liftIO $ doesFileExist path >>= assertBool (path ++ " should exist") . not
 
+shouldDirectoryExist :: MonadIO m => WithCallStack (FilePath -> m ())
+shouldDirectoryExist path =
+    withFrozenCallStack $
+    liftIO $ doesDirectoryExist path >>= assertBool (path ++ " should exist")
+
+shouldDirectoryNotExist :: MonadIO m => WithCallStack (FilePath -> m ())
+shouldDirectoryNotExist path =
+    withFrozenCallStack $
+    liftIO $ doesDirectoryExist path >>= assertBool (path ++ " should exist") . not
+
 assertRegex :: MonadIO m => String -> String -> Result -> m ()
 assertRegex msg regex r =
     withFrozenCallStack $
@@ -724,12 +833,20 @@ assertFileDoesNotContain path needle =
 concatOutput :: String -> String
 concatOutput = unwords . lines . filter ((/=) '\r')
 
+-- | The directory where script build artifacts are expected to be cached
+getScriptCacheDirectory :: FilePath -> TestM FilePath
+getScriptCacheDirectory script = do
+    cabalDir <- testCabalDir `fmap` getTestEnv
+    hashinput <- liftIO $ canonicalizePath script
+    let hash = C.unpack . Base16.encode . SHA256.hash . C.pack $ hashinput
+    return $ cabalDir </> "script-builds" </> hash
+
 ------------------------------------------------------------------------
 -- * Skipping tests
 
 hasSharedLibraries  :: TestM Bool
 hasSharedLibraries = do
-    shared_libs_were_removed <- ghcVersionIs (>= mkVersion [7,8])
+    shared_libs_were_removed <- isGhcVersion ">= 7.8"
     return (not (buildOS == Windows && shared_libs_were_removed))
 
 hasProfiledLibraries :: TestM Bool
@@ -753,13 +870,23 @@ hasCabalShared = do
   env <- getTestEnv
   return (testHaveCabalShared env)
 
-ghcVersionIs :: WithCallStack ((Version -> Bool) -> TestM Bool)
-ghcVersionIs f = do
+isGhcVersion :: WithCallStack (String -> TestM Bool)
+isGhcVersion range = do
     ghc_program <- requireProgramM ghcProgram
-    case programVersion ghc_program of
-        Nothing -> error $ "ghcVersionIs: no ghc version for "
+    v <- case programVersion ghc_program of
+        Nothing -> error $ "isGhcVersion: no ghc version for "
                         ++ show (programLocation ghc_program)
-        Just v -> return (f v)
+        Just v -> return v
+    vr <- case eitherParsec range of
+        Left err -> fail err
+        Right vr -> return vr
+    return (v `withinRange` vr)
+
+skipUnlessGhcVersion :: String -> TestM ()
+skipUnlessGhcVersion range = skipUnless ("needs ghc " ++ range) =<< isGhcVersion range
+
+skipIfGhcVersion :: String -> TestM ()
+skipIfGhcVersion range = skipUnless ("incompatible with ghc " ++ range) =<< isGhcVersion range
 
 isWindows :: TestM Bool
 isWindows = return (buildOS == Windows)
@@ -769,6 +896,9 @@ isOSX = return (buildOS == OSX)
 
 isLinux :: TestM Bool
 isLinux = return (buildOS == Linux)
+
+skipIfWindows :: TestM ()
+skipIfWindows = skipIf "Windows" =<< isWindows
 
 getOpenFilesLimit :: TestM (Maybe Integer)
 #ifdef mingw32_HOST_OS
@@ -810,7 +940,7 @@ hasCabalForGhc = do
 -- You'll want to exclude them in that case.
 --
 hasNewBuildCompatBootCabal :: TestM Bool
-hasNewBuildCompatBootCabal = ghcVersionIs (>= mkVersion [7,9])
+hasNewBuildCompatBootCabal = isGhcVersion ">= 7.9"
 
 ------------------------------------------------------------------------
 -- * Broken tests
@@ -861,6 +991,14 @@ ghc' :: [String] -> TestM Result
 ghc' args = do
     recordHeader ["ghc"]
     runProgramM ghcProgram args Nothing
+
+python3 :: [String] -> TestM ()
+python3 args = void $ python3' args
+
+python3' :: [String] -> TestM Result
+python3' args = do
+    recordHeader ["python3"]
+    runProgramM python3Program args Nothing
 
 -- | If a test needs to modify or write out source files, it's
 -- necessary to make a hermetic copy of the source files to operate
@@ -914,7 +1052,7 @@ getIPID pn = do
 delay :: TestM ()
 delay = do
     env <- getTestEnv
-    is_old_ghc <- ghcVersionIs (< mkVersion [7,7])
+    is_old_ghc <- isGhcVersion "< 7.7"
     -- For old versions of GHC, we only had second-level precision,
     -- so we need to sleep a full second.  Newer versions use
     -- millisecond level precision, so we only have to wait

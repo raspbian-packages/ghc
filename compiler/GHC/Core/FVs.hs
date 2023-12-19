@@ -5,21 +5,17 @@
 Taken quite directly from the Peyton Jones/Lester paper.
 -}
 
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE TypeFamilies #-}
 
 -- | A module concerned with finding the free variables of an expression.
 module GHC.Core.FVs (
         -- * Free variables of expressions and binding groups
-        exprFreeVars,
+        exprFreeVars,     exprsFreeVars,
         exprFreeVarsDSet,
-        exprFreeVarsList,
-        exprFreeIds,
-        exprFreeIdsDSet,
-        exprFreeIdsList,
-        exprsFreeIdsDSet,
-        exprsFreeIdsList,
-        exprsFreeVars,
-        exprsFreeVarsList,
+        exprFreeVarsList, exprsFreeVarsList,
+        exprFreeIds,      exprsFreeIds,
+        exprFreeIdsDSet,  exprsFreeIdsDSet,
+        exprFreeIdsList,  exprsFreeIdsList,
         bindFreeVars,
 
         -- * Selective free variables of expressions
@@ -32,12 +28,13 @@ module GHC.Core.FVs (
         varTypeTyCoFVs,
         idUnfoldingVars, idFreeVars, dIdFreeVars,
         bndrRuleAndUnfoldingVarsDSet,
+        bndrRuleAndUnfoldingIds,
         idFVs,
-        idRuleVars, idRuleRhsVars, stableUnfoldingVars,
+        idRuleVars, stableUnfoldingVars,
         ruleFreeVars, rulesFreeVars,
         rulesFreeVarsDSet, mkRuleInfo,
         ruleLhsFreeIds, ruleLhsFreeIdsList,
-        ruleRhsFreeVars, ruleRhsFreeIds,
+        ruleRhsFreeVars, rulesRhsFreeIds,
 
         expr_fvs,
 
@@ -58,17 +55,14 @@ module GHC.Core.FVs (
         freeVarsOfAnn
     ) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
 import GHC.Core
 import GHC.Types.Id
 import GHC.Types.Id.Info
 import GHC.Types.Name.Set
-import GHC.Types.Unique.Set
-import GHC.Types.Unique (Uniquable (..))
 import GHC.Types.Name
+import GHC.Types.Tickish
 import GHC.Types.Var.Set
 import GHC.Types.Var
 import GHC.Core.Type
@@ -80,10 +74,10 @@ import GHC.Core.FamInstEnv
 import GHC.Builtin.Types( unrestrictedFunTyConName )
 import GHC.Builtin.Types.Prim( funTyConName )
 import GHC.Data.Maybe( orElse )
-import GHC.Utils.Misc
-import GHC.Types.Basic( Activation )
-import GHC.Utils.Outputable
+
 import GHC.Utils.FV as FV
+import GHC.Utils.Misc
+import GHC.Utils.Panic.Plain
 
 {-
 ************************************************************************
@@ -125,6 +119,9 @@ exprFreeVarsList = fvVarList . exprFVs
 -- | Find all locally-defined free Ids in an expression
 exprFreeIds :: CoreExpr -> IdSet        -- Find all locally-defined free Ids
 exprFreeIds = exprSomeFreeVars isLocalId
+
+exprsFreeIds :: [CoreExpr] -> IdSet        -- Find all locally-defined free Ids
+exprsFreeIds = exprsSomeFreeVars isLocalId
 
 -- | Find all locally-defined free Ids in an expression
 -- returning a deterministic set.
@@ -270,7 +267,7 @@ expr_fvs (Case scrut bndr ty alts) fv_cand in_scope acc
   = (expr_fvs scrut `unionFV` tyCoFVsOfType ty `unionFV` addBndr bndr
       (mapUnionFV alt_fvs alts)) fv_cand in_scope acc
   where
-    alt_fvs (_, bndrs, rhs) = addBndrs bndrs (expr_fvs rhs)
+    alt_fvs (Alt _ bndrs rhs) = addBndrs bndrs (expr_fvs rhs)
 
 expr_fvs (Let (NonRec bndr rhs) body) fv_cand in_scope acc
   = (rhs_fvs (bndr, rhs) `unionFV` addBndr bndr (expr_fvs body))
@@ -291,8 +288,8 @@ rhs_fvs (bndr, rhs) = expr_fvs rhs `unionFV`
 exprs_fvs :: [CoreExpr] -> FV
 exprs_fvs exprs = mapUnionFV expr_fvs exprs
 
-tickish_fvs :: Tickish Id -> FV
-tickish_fvs (Breakpoint _ ids) = FV.mkFVs ids
+tickish_fvs :: CoreTickish -> FV
+tickish_fvs (Breakpoint _ _ ids) = FV.mkFVs ids
 tickish_fvs _ = emptyFV
 
 {-
@@ -328,7 +325,7 @@ exprOrphNames e
     go (Case e _ ty as)     = go e `unionNameSet` orphNamesOfType ty
                               `unionNameSet` unionNameSets (map go_alt as)
 
-    go_alt (_,_,r) = go r
+    go_alt (Alt _ _ r)      = go r
 
 -- | Finds the free /external/ names of several expressions: see 'exprOrphNames' for details
 exprsOrphNames :: [CoreExpr] -> NameSet
@@ -404,7 +401,7 @@ orphNamesOfProv :: UnivCoProvenance -> NameSet
 orphNamesOfProv (PhantomProv co)    = orphNamesOfCo co
 orphNamesOfProv (ProofIrrelProv co) = orphNamesOfCo co
 orphNamesOfProv (PluginProv _)      = emptyNameSet
-orphNamesOfProv CorePrepProv        = emptyNameSet
+orphNamesOfProv (CorePrepProv _)    = emptyNameSet
 
 orphNamesOfCos :: [Coercion] -> NameSet
 orphNamesOfCos = orphNamesOfThings orphNamesOfCo
@@ -451,87 +448,70 @@ orph_names_of_fun_ty_con _ = emptyNameSet
 ************************************************************************
 -}
 
+data RuleFVsFrom
+  = LhsOnly
+  | RhsOnly
+  | BothSides
+
+-- | Those locally-defined variables free in the left and/or right hand sides
+-- of the rule, depending on the first argument. Returns an 'FV' computation.
+ruleFVs :: RuleFVsFrom -> CoreRule -> FV
+ruleFVs !_   (BuiltinRule {}) = emptyFV
+ruleFVs from (Rule { ru_fn = _do_not_include
+                     -- See Note [Rule free var hack]
+                   , ru_bndrs = bndrs
+                   , ru_rhs = rhs, ru_args = args })
+  = filterFV isLocalVar $ addBndrs bndrs (exprs_fvs exprs)
+  where
+    exprs = case from of
+      LhsOnly   -> args
+      RhsOnly   -> [rhs]
+      BothSides -> rhs:args
+
+-- | Those locally-defined variables free in the left and/or right hand sides
+-- from several rules, depending on the first argument.
+-- Returns an 'FV' computation.
+rulesFVs :: RuleFVsFrom -> [CoreRule] -> FV
+rulesFVs from = mapUnionFV (ruleFVs from)
+
 -- | Those variables free in the right hand side of a rule returned as a
 -- non-deterministic set
 ruleRhsFreeVars :: CoreRule -> VarSet
-ruleRhsFreeVars (BuiltinRule {}) = noFVs
-ruleRhsFreeVars (Rule { ru_fn = _, ru_bndrs = bndrs, ru_rhs = rhs })
-  = fvVarSet $ filterFV isLocalVar $ addBndrs bndrs (expr_fvs rhs)
-      -- See Note [Rule free var hack]
+ruleRhsFreeVars = fvVarSet . ruleFVs RhsOnly
+
+-- | Those locally-defined free 'Id's in the right hand side of several rules
+-- returned as a non-deterministic set
+rulesRhsFreeIds :: [CoreRule] -> VarSet
+rulesRhsFreeIds = fvVarSet . filterFV isLocalId . rulesFVs RhsOnly
+
+ruleLhsFreeIds :: CoreRule -> VarSet
+-- ^ This finds all locally-defined free Ids on the left hand side of a rule
+-- and returns them as a non-deterministic set
+ruleLhsFreeIds = fvVarSet . filterFV isLocalId . ruleFVs LhsOnly
+
+ruleLhsFreeIdsList :: CoreRule -> [Var]
+-- ^ This finds all locally-defined free Ids on the left hand side of a rule
+-- and returns them as a deterministically ordered list
+ruleLhsFreeIdsList = fvVarList . filterFV isLocalId . ruleFVs LhsOnly
 
 -- | Those variables free in the both the left right hand sides of a rule
 -- returned as a non-deterministic set
 ruleFreeVars :: CoreRule -> VarSet
-ruleFreeVars = fvVarSet . ruleFVs
-
--- | Those variables free in the both the left right hand sides of a rule
--- returned as FV computation
-ruleFVs :: CoreRule -> FV
-ruleFVs (BuiltinRule {}) = emptyFV
-ruleFVs (Rule { ru_fn = _do_not_include
-                  -- See Note [Rule free var hack]
-              , ru_bndrs = bndrs
-              , ru_rhs = rhs, ru_args = args })
-  = filterFV isLocalVar $ addBndrs bndrs (exprs_fvs (rhs:args))
-
--- | Those variables free in the both the left right hand sides of rules
--- returned as FV computation
-rulesFVs :: [CoreRule] -> FV
-rulesFVs = mapUnionFV ruleFVs
+ruleFreeVars = fvVarSet . ruleFVs BothSides
 
 -- | Those variables free in the both the left right hand sides of rules
 -- returned as a deterministic set
 rulesFreeVarsDSet :: [CoreRule] -> DVarSet
-rulesFreeVarsDSet rules = fvDVarSet $ rulesFVs rules
+rulesFreeVarsDSet rules = fvDVarSet $ rulesFVs BothSides rules
+
+-- | Those variables free in both the left right hand sides of several rules
+rulesFreeVars :: [CoreRule] -> VarSet
+rulesFreeVars rules = fvVarSet $ rulesFVs BothSides rules
 
 -- | Make a 'RuleInfo' containing a number of 'CoreRule's, suitable
 -- for putting into an 'IdInfo'
 mkRuleInfo :: [CoreRule] -> RuleInfo
 mkRuleInfo rules = RuleInfo rules (rulesFreeVarsDSet rules)
-
-idRuleRhsVars :: (Activation -> Bool) -> Id -> VarSet
--- Just the variables free on the *rhs* of a rule
-idRuleRhsVars is_active id
-  = mapUnionVarSet get_fvs (idCoreRules id)
-  where
-    get_fvs (Rule { ru_fn = fn, ru_bndrs = bndrs
-                  , ru_rhs = rhs, ru_act = act })
-      | is_active act
-            -- See Note [Finding rule RHS free vars] in "GHC.Core.Opt.OccurAnal"
-      = delOneFromUniqSet_Directly fvs (getUnique fn)
-            -- Note [Rule free var hack]
-      where
-        fvs = fvVarSet $ filterFV isLocalVar $ addBndrs bndrs (expr_fvs rhs)
-    get_fvs _ = noFVs
-
--- | Those variables free in the right hand side of several rules
-rulesFreeVars :: [CoreRule] -> VarSet
-rulesFreeVars rules = mapUnionVarSet ruleFreeVars rules
-
-ruleLhsFreeIds :: CoreRule -> VarSet
--- ^ This finds all locally-defined free Ids on the left hand side of a rule
--- and returns them as a non-deterministic set
-ruleLhsFreeIds = fvVarSet . ruleLhsFVIds
-
-ruleLhsFreeIdsList :: CoreRule -> [Var]
--- ^ This finds all locally-defined free Ids on the left hand side of a rule
--- and returns them as a deterministically ordered list
-ruleLhsFreeIdsList = fvVarList . ruleLhsFVIds
-
-ruleLhsFVIds :: CoreRule -> FV
--- ^ This finds all locally-defined free Ids on the left hand side of a rule
--- and returns an FV computation
-ruleLhsFVIds (BuiltinRule {}) = emptyFV
-ruleLhsFVIds (Rule { ru_bndrs = bndrs, ru_args = args })
-  = filterFV isLocalId $ addBndrs bndrs (exprs_fvs args)
-
-ruleRhsFreeIds :: CoreRule -> VarSet
--- ^ This finds all locally-defined free Ids on the left hand side of a rule
--- and returns them as a non-deterministic set
-ruleRhsFreeIds (BuiltinRule {}) = emptyVarSet
-ruleRhsFreeIds (Rule { ru_bndrs = bndrs, ru_args = args })
-  = fvVarSet $ filterFV isLocalId $
-     addBndrs bndrs $ exprs_fvs args
 
 {-
 Note [Rule free var hack]  (Not a hack any more)
@@ -588,9 +568,6 @@ freeVarsOf (fvs, _) = fvs
 freeVarsOfAnn :: FVAnn -> DIdSet
 freeVarsOfAnn fvs = fvs
 
-noFVs :: VarSet
-noFVs = emptyVarSet
-
 aFreeVar :: Var -> DVarSet
 aFreeVar = unitDVarSet
 
@@ -645,22 +622,32 @@ dVarTypeTyCoVars :: Var -> DTyCoVarSet
 dVarTypeTyCoVars var = fvDVarSet $ varTypeTyCoFVs var
 
 varTypeTyCoFVs :: Var -> FV
-varTypeTyCoFVs var = tyCoFVsOfType (varType var)
+-- Find the free variables of a binder.
+-- In the case of ids, don't forget the multiplicity field!
+varTypeTyCoFVs var
+  = tyCoFVsOfType (varType var) `unionFV` mult_fvs
+  where
+    mult_fvs = case varMultMaybe var of
+                 Just mult -> tyCoFVsOfType mult
+                 Nothing   -> emptyFV
 
 idFreeVars :: Id -> VarSet
-idFreeVars id = ASSERT( isId id) fvVarSet $ idFVs id
+idFreeVars id = assert (isId id) $ fvVarSet $ idFVs id
 
 dIdFreeVars :: Id -> DVarSet
 dIdFreeVars id = fvDVarSet $ idFVs id
 
 idFVs :: Id -> FV
 -- Type variables, rule variables, and inline variables
-idFVs id = ASSERT( isId id)
+idFVs id = assert (isId id) $
            varTypeTyCoFVs id `unionFV`
            bndrRuleAndUnfoldingFVs id
 
 bndrRuleAndUnfoldingVarsDSet :: Id -> DVarSet
 bndrRuleAndUnfoldingVarsDSet id = fvDVarSet $ bndrRuleAndUnfoldingFVs id
+
+bndrRuleAndUnfoldingIds :: Id -> IdSet
+bndrRuleAndUnfoldingIds id = fvVarSet $ filterFV isId $ bndrRuleAndUnfoldingFVs id
 
 bndrRuleAndUnfoldingFVs :: Id -> FV
 bndrRuleAndUnfoldingFVs id
@@ -671,7 +658,7 @@ idRuleVars ::Id -> VarSet  -- Does *not* include CoreUnfolding vars
 idRuleVars id = fvVarSet $ idRuleFVs id
 
 idRuleFVs :: Id -> FV
-idRuleFVs id = ASSERT( isId id)
+idRuleFVs id = assert (isId id) $
   FV.mkFVs (dVarSetElems $ ruleInfoFreeVars (idSpecialisation id))
 
 idUnfoldingVars :: Id -> VarSet
@@ -776,8 +763,8 @@ freeVars = go
         (alts_fvs_s, alts2) = mapAndUnzip fv_alt alts
         alts_fvs            = unionFVss alts_fvs_s
 
-        fv_alt (con,args,rhs) = (delBindersFV args (freeVarsOf rhs2),
-                                 (con, args, rhs2))
+        fv_alt (Alt con args rhs) = (delBindersFV args (freeVarsOf rhs2),
+                                     (AnnAlt con args rhs2))
                               where
                                  rhs2 = go rhs
 
@@ -799,8 +786,8 @@ freeVars = go
         , AnnTick tickish expr2 )
       where
         expr2 = go expr
-        tickishFVs (Breakpoint _ ids) = mkDVarSet ids
-        tickishFVs _                  = emptyDVarSet
+        tickishFVs (Breakpoint _ _ ids) = mkDVarSet ids
+        tickishFVs _                    = emptyDVarSet
 
     go (Type ty)     = (tyCoVarsOfTypeDSet ty, AnnType ty)
     go (Coercion co) = (tyCoVarsOfCoDSet co, AnnCoercion co)

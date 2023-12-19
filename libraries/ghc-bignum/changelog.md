@@ -1,5 +1,14 @@
 # Changelog for `ghc-bignum` package
 
+## 1.3
+
+- Expose backendName
+- Add `naturalSetBit[#]` (#21173), `naturalClearBit[#]` (#21175), `naturalComplementBit[#]` (#21181)
+
+## 1.2
+
+- Moved naturalToDouble# and naturalToFloat# to `base` package
+
 ## 1.1
 
 - Moved integerToDouble# and integerToFloat# to `base` package with fixed

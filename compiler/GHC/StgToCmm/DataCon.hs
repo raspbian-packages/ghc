@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP #-}
+
 
 -----------------------------------------------------------------------------
 --
@@ -15,9 +15,9 @@ module GHC.StgToCmm.DataCon (
         cgTopRhsCon, buildDynCon, bindConArgs
     ) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
+
+import GHC.Platform
 
 import GHC.Stg.Syntax
 import GHC.Core  ( AltCon(..) )
@@ -37,7 +37,6 @@ import GHC.Runtime.Heap.Layout
 import GHC.Types.CostCentre
 import GHC.Unit
 import GHC.Core.DataCon
-import GHC.Driver.Session
 import GHC.Data.FastString
 import GHC.Types.Id
 import GHC.Types.Id.Info( CafInfo( NoCafRefs ) )
@@ -45,25 +44,29 @@ import GHC.Types.Name (isInternalName)
 import GHC.Types.RepType (countConRepArgs)
 import GHC.Types.Literal
 import GHC.Builtin.Utils
-import GHC.Utils.Outputable
-import GHC.Platform
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
 import GHC.Utils.Misc
 import GHC.Utils.Monad (mapMaybeM)
 
 import Control.Monad
 import Data.Char
+import GHC.StgToCmm.Config (stgToCmmPlatform)
+import GHC.StgToCmm.TagCheck (checkConArgsStatic, checkConArgsDyn)
+import GHC.Utils.Outputable
 
 ---------------------------------------------------------------
 --      Top-level constructors
 ---------------------------------------------------------------
 
-cgTopRhsCon :: DynFlags
+cgTopRhsCon :: StgToCmmConfig
             -> Id               -- Name of thing bound to this RHS
             -> DataCon          -- Id
+            -> ConstructorNumber
             -> [NonVoid StgArg] -- Args
             -> (CgIdInfo, FCode ())
-cgTopRhsCon dflags id con args
-  | Just static_info <- precomputedStaticConInfo_maybe dflags id con args
+cgTopRhsCon cfg id con mn args
+  | Just static_info <- precomputedStaticConInfo_maybe cfg id con args
   , let static_code | isInternalName name = pure ()
                     | otherwise           = gen_code
   = -- There is a pre-allocated static closure available; use it
@@ -79,24 +82,41 @@ cgTopRhsCon dflags id con args
   = (id_Info, gen_code)
 
   where
-   id_Info       = litIdInfo dflags id (mkConLFInfo con) (CmmLabel closure_label)
+   platform      = stgToCmmPlatform cfg
+   id_Info       = litIdInfo platform id (mkConLFInfo con) (CmmLabel closure_label)
    name          = idName id
    caffy         = idCafInfo id -- any stgArgHasCafRefs args
    closure_label = mkClosureLabel name caffy
 
    gen_code =
-     do { this_mod <- getModuleName
-        ; when (platformOS (targetPlatform dflags) == OSMinGW32) $
+     do { profile <- getProfile
+        ; this_mod <- getModuleName
+        ; when (platformOS platform == OSMinGW32) $
               -- Windows DLLs have a problem with static cross-DLL refs.
-              MASSERT( not (isDllConApp dflags this_mod con (map fromNonVoid args)) )
-        ; ASSERT( args `lengthIs` countConRepArgs con ) return ()
-
+              massert (not (isDllConApp platform (stgToCmmExtDynRefs cfg) this_mod con (map fromNonVoid args)))
+        ; assert (args `lengthIs` countConRepArgs con ) return ()
+        ; checkConArgsStatic (text "TagCheck failed - Top level con") con (map fromNonVoid args)
         -- LAY IT OUT
         ; let
             (tot_wds, --  #ptr_wds + #nonptr_wds
              ptr_wds, --  #ptr_wds
              nv_args_w_offsets) =
-                 mkVirtHeapOffsetsWithPadding dflags StdHeader (addArgReps args)
+                 mkVirtHeapOffsetsWithPadding profile StdHeader (addArgReps args)
+
+        ; let
+            -- Decompose padding into units of length 8, 4, 2, or 1 bytes to
+            -- allow the implementation of mk_payload to use widthFromBytes,
+            -- which only handles these cases.
+            fix_padding (x@(Padding n off) : rest)
+              | n == 0                 = fix_padding rest
+              | n `elem` [1,2,4,8]     = x : fix_padding rest
+              | n > 8                  = add_pad 8
+              | n > 4                  = add_pad 4
+              | n > 2                  = add_pad 2
+              | otherwise              = add_pad 1
+              where add_pad m = Padding m off : fix_padding (Padding (n-m) (off+m) : rest)
+            fix_padding (x : rest)     = x : fix_padding rest
+            fix_padding []             = []
 
             mk_payload (Padding len _) = return (CmmInt 0 (widthFromBytes len))
             mk_payload (FieldOff arg _) = do
@@ -110,17 +130,26 @@ cgTopRhsCon dflags id con args
              -- we're not really going to emit an info table, so having
              -- to make a CmmInfoTable is a bit overkill, but mkStaticClosureFields
              -- needs to poke around inside it.
-            info_tbl = mkDataConInfoTable dflags con True ptr_wds nonptr_wds
+            info_tbl = mkDataConInfoTable profile con (addModuleLoc this_mod mn) True ptr_wds nonptr_wds
 
 
-        ; payload <- mapM mk_payload nv_args_w_offsets
+        ; payload <- mapM mk_payload (fix_padding nv_args_w_offsets)
                 -- NB1: nv_args_w_offsets is sorted into ptrs then non-ptrs
                 -- NB2: all the amodes should be Lits!
                 --      TODO (osa): Why?
 
                 -- BUILD THE OBJECT
+                --
+            -- We're generating info tables, so we don't know and care about
+            -- what the actual arguments are. Using () here as the place holder.
+
         ; emitDataCon closure_label info_tbl dontCareCCS payload }
 
+addModuleLoc :: Module -> ConstructorNumber -> ConInfoTableLocation
+addModuleLoc this_mod mn = do
+  case mn of
+    NoNumber -> DefinitionSite
+    Numbered n -> UsageSite this_mod n
 
 ---------------------------------------------------------------
 --      Lay out and allocate non-top-level constructors
@@ -128,6 +157,7 @@ cgTopRhsCon dflags id con args
 
 buildDynCon :: Id                 -- Name of the thing to which this constr will
                                   -- be bound
+            -> ConstructorNumber
             -> Bool               -- is it genuinely bound to that name, or just
                                   -- for profiling?
             -> CostCentreStack    -- Where to grab cost centre from;
@@ -136,18 +166,21 @@ buildDynCon :: Id                 -- Name of the thing to which this constr will
             -> [NonVoid StgArg]   -- Its args
             -> FCode (CgIdInfo, FCode CmmAGraph)
                -- Return details about how to find it and initialization code
-buildDynCon binder actually_bound cc con args
-    = do dflags <- getDynFlags
-         buildDynCon' dflags binder actually_bound cc con args
+buildDynCon binder mn actually_bound cc con args
+    = do cfg <- getStgToCmmConfig
+         --   pprTrace "noCodeLocal:" (ppr (binder,con,args,cgInfo)) True
+         case precomputedStaticConInfo_maybe cfg binder con args of
+           Just cgInfo -> return (cgInfo, return mkNop)
+           Nothing     -> buildDynCon' binder mn actually_bound cc con args
 
 
-buildDynCon' :: DynFlags
-             -> Id -> Bool
+buildDynCon' :: Id
+             -> ConstructorNumber
+             -> Bool
              -> CostCentreStack
              -> DataCon
              -> [NonVoid StgArg]
              -> FCode (CgIdInfo, FCode CmmAGraph)
-
 {- We used to pass a boolean indicating whether all the
 args were of size zero, so we could use a static
 constructor; but I concluded that it just isn't worth it.
@@ -158,14 +191,8 @@ The reason for having a separate argument, rather than looking at
 the addr modes of the args is that we may be in a "knot", and
 premature looking at the args will cause the compiler to black-hole!
 -}
-
-buildDynCon' dflags binder _ _cc con args
-  | Just cgInfo <- precomputedStaticConInfo_maybe dflags binder con args
-  -- , pprTrace "noCodeLocal:" (ppr (binder,con,args,cgInfo)) True
-  = return (cgInfo, return mkNop)
-
 -------- buildDynCon': the general case -----------
-buildDynCon' dflags binder actually_bound ccs con args
+buildDynCon' binder mn actually_bound ccs con args
   = do  { (id_info, reg) <- rhsIdInfo binder lf_info
         ; return (id_info, gen_code reg)
         }
@@ -173,17 +200,23 @@ buildDynCon' dflags binder actually_bound ccs con args
   lf_info = mkConLFInfo con
 
   gen_code reg
-    = do  { let (tot_wds, ptr_wds, args_w_offsets)
-                  = mkVirtConstrOffsets dflags (addArgReps args)
+    = do  { modu <- getModuleName
+          ; cfg  <- getStgToCmmConfig
+          ; let platform = stgToCmmPlatform cfg
+                profile  = stgToCmmProfile  cfg
+                (tot_wds, ptr_wds, args_w_offsets)
+                   = mkVirtConstrOffsets profile (addArgReps args)
                 nonptr_wds = tot_wds - ptr_wds
-                info_tbl = mkDataConInfoTable dflags con False
+                info_tbl = mkDataConInfoTable profile con (addModuleLoc modu mn) False
                                 ptr_wds nonptr_wds
           ; let ticky_name | actually_bound = Just binder
                            | otherwise = Nothing
 
+          ; checkConArgsDyn (hang (text "TagCheck failed on constructor application.") 4 $
+                                   text "On binder:" <> ppr binder $$ text "Constructor:" <> ppr con) con (map fromNonVoid args)
           ; hp_plus_n <- allocDynClosure ticky_name info_tbl lf_info
                                           use_cc blame_cc args_w_offsets
-          ; return (mkRhsInit dflags reg lf_info hp_plus_n) }
+          ; return (mkRhsInit platform reg lf_info hp_plus_n) }
     where
       use_cc      -- cost-centre to stick in the object
         | isCurrentCCS ccs = cccsExpr
@@ -191,13 +224,14 @@ buildDynCon' dflags binder actually_bound ccs con args
 
       blame_cc = use_cc -- cost-centre on which to blame the alloc (same)
 
+
 {- Note [Precomputed static closures]
    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 For Char/Int closures there are some value closures
 built into the RTS. This is the case for all values in
 the range mINT_INTLIKE .. mAX_INTLIKE (or CHARLIKE).
-See Note [CHARLIKE and INTLIKE closures.] in the RTS code.
+See Note [CHARLIKE and INTLIKE closures] in the RTS code.
 
 Similarly zero-arity constructors have a closure
 in their defining Module we can use.
@@ -284,49 +318,52 @@ We don't support this optimization when compiling into Windows DLLs yet
 because they don't support cross package data references well.
 -}
 
--- (precomputedStaticConInfo_maybe dflags id con args)
+-- (precomputedStaticConInfo_maybe cfg id con args)
 --     returns (Just cg_id_info)
 -- if there is a precomputed static closure for (con args).
 -- In that case, cg_id_info addresses it.
 -- See Note [Precomputed static closures]
-precomputedStaticConInfo_maybe :: DynFlags -> Id -> DataCon -> [NonVoid StgArg] -> Maybe CgIdInfo
-precomputedStaticConInfo_maybe dflags binder con []
+precomputedStaticConInfo_maybe :: StgToCmmConfig -> Id -> DataCon -> [NonVoid StgArg] -> Maybe CgIdInfo
+precomputedStaticConInfo_maybe cfg binder con []
 -- Nullary constructors
   | isNullaryRepDataCon con
-  = Just $ litIdInfo dflags binder (mkConLFInfo con)
+  = Just $ litIdInfo (stgToCmmPlatform cfg) binder (mkConLFInfo con)
                 (CmmLabel (mkClosureLabel (dataConName con) NoCafRefs))
-precomputedStaticConInfo_maybe dflags binder con [arg]
+precomputedStaticConInfo_maybe cfg binder con [arg]
   -- Int/Char values with existing closures in the RTS
   | intClosure || charClosure
-  , platformOS platform /= OSMinGW32 || not (positionIndependent dflags)
+  , platformOS platform /= OSMinGW32 || not (stgToCmmPIE cfg || stgToCmmPIC cfg)
   , Just val <- getClosurePayload arg
   , inRange val
   = let intlike_lbl   = mkCmmClosureLabel rtsUnitId (fsLit label)
         val_int = fromIntegral val :: Int
-        offsetW = (val_int - (fromIntegral min_static_range)) * (fixedHdrSizeW dflags + 1)
+        offsetW = (val_int - fromIntegral min_static_range) * (fixedHdrSizeW profile + 1)
                 -- INTLIKE/CHARLIKE closures consist of a header and one word payload
         static_amode = cmmLabelOffW platform intlike_lbl offsetW
-    in Just $ litIdInfo dflags binder (mkConLFInfo con) static_amode
+    in Just $ litIdInfo platform binder (mkConLFInfo con) static_amode
   where
-    platform = targetPlatform dflags
-    intClosure = maybeIntLikeCon con
+    profile     = stgToCmmProfile  cfg
+    platform    = stgToCmmPlatform cfg
+    intClosure  = maybeIntLikeCon  con
     charClosure = maybeCharLikeCon con
     getClosurePayload (NonVoid (StgLitArg (LitNumber LitNumInt val))) = Just val
-    getClosurePayload (NonVoid (StgLitArg (LitChar val))) = Just $ (fromIntegral . ord $ val)
+    getClosurePayload (NonVoid (StgLitArg (LitChar val))) = Just (fromIntegral . ord $ val)
     getClosurePayload _ = Nothing
     -- Avoid over/underflow by comparisons at type Integer!
     inRange :: Integer -> Bool
     inRange val
       = val >= min_static_range && val <= max_static_range
 
+    constants = platformConstants platform
+
     min_static_range :: Integer
     min_static_range
-      | intClosure = fromIntegral (mIN_INTLIKE dflags)
-      | charClosure = fromIntegral (mIN_CHARLIKE dflags)
+      | intClosure = fromIntegral (pc_MIN_INTLIKE constants)
+      | charClosure = fromIntegral (pc_MIN_CHARLIKE constants)
       | otherwise = panic "precomputedStaticConInfo_maybe: Unknown closure type"
     max_static_range
-      | intClosure = fromIntegral (mAX_INTLIKE dflags)
-      | charClosure = fromIntegral (mAX_CHARLIKE dflags)
+      | intClosure = fromIntegral (pc_MAX_INTLIKE constants)
+      | charClosure = fromIntegral (pc_MAX_CHARLIKE constants)
       | otherwise = panic "precomputedStaticConInfo_maybe: Unknown closure type"
     label
       | intClosure = "stg_INTLIKE"
@@ -345,11 +382,11 @@ bindConArgs :: AltCon -> LocalReg -> [NonVoid Id] -> FCode [LocalReg]
 -- binders args, assuming that we have just returned from a 'case' which
 -- found a con
 bindConArgs (DataAlt con) base args
-  = ASSERT(not (isUnboxedTupleCon con))
-    do dflags <- getDynFlags
+  = assert (not (isUnboxedTupleDataCon con)) $
+    do profile <- getProfile
        platform <- getPlatform
-       let (_, _, args_w_offsets) = mkVirtConstrOffsets dflags (addIdReps args)
-           tag = tagForCon dflags con
+       let (_, _, args_w_offsets) = mkVirtConstrOffsets profile (addIdReps args)
+           tag = tagForCon platform con
 
            -- The binding below forces the masking out of the tag bits
            -- when accessing the constructor field.
@@ -365,4 +402,4 @@ bindConArgs (DataAlt con) base args
        mapMaybeM bind_arg args_w_offsets
 
 bindConArgs _other_con _base args
-  = ASSERT( null args ) return []
+  = assert (null args ) return []

@@ -62,19 +62,17 @@ GHC.Float       Classes: Floating, RealFloat
 Other Prelude modules are much easier with fewer complex dependencies.
 -}
 
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE NoImplicitPrelude #-}
+{-# LANGUAGE PolyKinds #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE UnboxedTuples #-}
 {-# LANGUAGE Unsafe #-}
-{-# LANGUAGE CPP
-           , NoImplicitPrelude
-           , BangPatterns
-           , ExplicitForAll
-           , MagicHash
-           , UnboxedTuples
-           , ExistentialQuantification
-           , RankNTypes
-           , KindSignatures
-           , PolyKinds
-           , DataKinds
-  #-}
+
 -- -Wno-orphans is needed for things like:
 -- Orphan rule: "x# -# x#" ALWAYS forall x# :: Int# -# x# x# = 0
 {-# OPTIONS_GHC -Wno-orphans #-}
@@ -102,10 +100,12 @@ module GHC.Base
         module GHC.Classes,
         module GHC.CString,
         module GHC.Magic,
+        module GHC.Magic.Dict,
         module GHC.Types,
-        module GHC.Prim,        -- Re-export GHC.Prim and [boot] GHC.Err,
-        module GHC.Prim.Ext,    -- to avoid lots of people having to
-        module GHC.Err,         -- import it explicitly
+        module GHC.Prim,        -- Re-export GHC.Prim, GHC.Prim.Ext,
+        module GHC.Prim.Ext,    -- GHC.Prim.PtrEq and [boot] GHC.Err
+        module GHC.Prim.PtrEq,  -- to avoid lots of people having to
+        module GHC.Err,         -- import these modules explicitly
         module GHC.Maybe
   )
         where
@@ -114,8 +114,10 @@ import GHC.Types
 import GHC.Classes
 import GHC.CString
 import GHC.Magic
+import GHC.Magic.Dict
 import GHC.Prim
 import GHC.Prim.Ext
+import GHC.Prim.PtrEq
 import GHC.Err
 import GHC.Maybe
 import {-# SOURCE #-} GHC.IO (mkUserError, mplusIO)
@@ -148,36 +150,37 @@ default ()              -- Double isn't available yet
 {-
 Note [Depend on GHC.Num.Integer]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The Integer type is special because GHC.CoreToStg.Prep.mkConvertNumLiteral
+lookups names in ghc-bignum interfaces to construct Integer literal values.
+Currently it reads the interface file whether or not the current module *has*
+any Integer literals, so it's important that GHC.Num.Integer is compiled before
+any other module.
 
-The Integer type is special because GHC.Iface.Tidy uses constructors in
-GHC.Num.Integer to construct Integer literal values. Currently it reads the
-interface file whether or not the current module *has* any Integer literals, so
-it's important that GHC.Num.Integer is compiled before any other module.
-
-(There's a hack in GHC to disable this for packages ghc-prim and ghc-bignum
-which aren't allowed to contain any Integer literals.)
-
-Likewise we implicitly need Integer when deriving things like Eq instances.
-
-The danger is that if the build system doesn't know about the dependency
-on Integer, it'll compile some base module before GHC.Num.Integer,
+The danger is that if the build system doesn't know about the implicit
+dependency on Integer, it'll compile some base module before GHC.Num.Integer,
 resulting in:
   Failed to load interface for ‘GHC.Num.Integer’
     There are files missing in the ‘ghc-bignum’ package,
 
-Bottom line: we make GHC.Base depend on GHC.Num.Integer; and everything
-else either depends on GHC.Base, or does not have NoImplicitPrelude
-(and hence depends on Prelude).
-
-Note: this is only a problem with the make-based build system. Hadrian doesn't
-seem to interleave compilation of modules from separate packages and respects
+Note that this is only a problem with the make-based build system. Hadrian
+doesn't interleave compilation of modules from separate packages and respects
 the dependency between `base` and `ghc-bignum`.
+
+To ensure that GHC.Num.Integer is there, we must ensure that there is a visible
+dependency on GHC.Num.Integer from every module in base.  We make GHC.Base
+depend on GHC.Num.Integer; and everything else either depends on GHC.Base,
+directly on GHC.Num.Integer, or does not have NoImplicitPrelude (and hence
+depends on Prelude).
+
+The lookup is only disabled for packages ghc-prim and ghc-bignum, which aren't
+allowed to contain any Integer literal.
+
 
 Note [Depend on GHC.Tuple]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 Similarly, tuple syntax (or ()) creates an implicit dependency on
 GHC.Tuple, so we use the same rule as for Integer --- see Note [Depend on
-GHC.Integer] --- to explain this to the build system.  We make GHC.Base
+GHC.Num.Integer] --- to explain this to the build system.  We make GHC.Base
 depend on GHC.Tuple, and everything else depends on GHC.Base or Prelude.
 
 -}
@@ -340,6 +343,11 @@ instance Semigroup b => Semigroup (a -> b) where
 -- | @since 2.01
 instance Monoid b => Monoid (a -> b) where
         mempty _ = mempty
+        -- If `b` has a specialised mconcat, use that, rather than the default
+        -- mconcat, which can be much less efficient.  Inline in the hope that
+        -- it may result in list fusion.
+        mconcat = \fs x -> mconcat $ map (\f -> f x) fs
+        {-# INLINE mconcat #-}
 
 -- | @since 4.9.0.0
 instance Semigroup () where
@@ -514,6 +522,9 @@ structure of @f@. Furthermore @f@ needs to adhere to the following:
 
 Note, that the second law follows from the free theorem of the type 'fmap' and
 the first law, so you need only check that the former condition holds.
+See <https://www.schoolofhaskell.com/user/edwardk/snippets/fmap> or
+<https://github.com/quchen/articles/blob/master/second_functor_law.md>
+for an explanation.
 -}
 
 class Functor f where
@@ -524,6 +535,7 @@ class Functor f where
     --
     -- Some type constructors with two parameters or more have a @'Data.Bifunctor'@ instance that allows
     -- both the last and the penultimate parameters to be mapped over.
+    --
     -- ==== __Examples__
     --
     -- Convert from a @'Data.Maybe.Maybe' Int@ to a @Maybe String@
@@ -555,11 +567,11 @@ class Functor f where
     -- It may seem surprising that the function is only applied to the last element of the tuple
     -- compared to the list example above which applies it to every element in the list.
     -- To understand, remember that tuples are type constructors with multiple type parameters:
-    -- a tuple of 3 elements `(a,b,c)` can also be written `(,,) a b c` and its `Functor` instance
-    -- is defined for `Functor ((,,) a b)` (i.e., only the third parameter is free to be mapped over
-    -- with `fmap`).
+    -- a tuple of 3 elements @(a,b,c)@ can also be written @(,,) a b c@ and its @Functor@ instance
+    -- is defined for @Functor ((,,) a b)@ (i.e., only the third parameter is free to be mapped over
+    -- with @fmap@).
     --
-    -- It explains why `fmap` can be used with tuples containing values of different types as in the
+    -- It explains why @fmap@ can be used with tuples containing values of different types as in the
     -- following example:
     --
     -- >>> fmap even ("hello", 1.0, 4)
@@ -632,7 +644,7 @@ class Functor f where
 --
 --   * @'pure' = 'return'@
 --
---   * @m1 '<*>' m2 = m1 '>>=' (\x1 -> m2 '>>=' (\x2 -> 'return' (x1 x2)))@
+--   * @m1 '<*>' m2 = m1 '>>=' (\\x1 -> m2 '>>=' (\\x2 -> 'return' (x1 x2)))@
 --
 --   * @('*>') = ('>>')@
 --
@@ -819,7 +831,7 @@ Instances of 'Monad' should satisfy the following:
 Furthermore, the 'Monad' and 'Applicative' operations should relate as follows:
 
 * @'pure' = 'return'@
-* @m1 '<*>' m2 = m1 '>>=' (\x1 -> m2 '>>=' (\x2 -> 'return' (x1 x2)))@
+* @m1 '<*>' m2 = m1 '>>=' (\\x1 -> m2 '>>=' (\\x2 -> 'return' (x1 x2)))@
 
 The above laws imply:
 
@@ -1354,7 +1366,7 @@ The rules for map work like this.
 --   http://research.microsoft.com/en-us/um/people/simonpj/papers/ext-f/coercible.pdf
 
 {-# RULES "map/coerce" [1] map coerce = coerce #-}
--- See Note [Getting the map/coerce RULE to work] in CoreOpt
+-- See Note [Getting the map/coerce RULE to work] in GHC.Core.SimpleOpt
 
 ----------------------------------------------
 --              append
@@ -1366,13 +1378,21 @@ The rules for map work like this.
 -- > [x1, ..., xm] ++ [y1, ...] == [x1, ..., xm, y1, ...]
 --
 -- If the first list is not finite, the result is the first list.
+--
+-- WARNING: This function takes linear time in the number of elements of the
+-- first list.
 
 (++) :: [a] -> [a] -> [a]
-{-# NOINLINE [1] (++) #-}    -- We want the RULE to fire first.
-                             -- It's recursive, so won't inline anyway,
-                             -- but saying so is more explicit
+{-# NOINLINE [2] (++) #-}
+  -- Give time for the RULEs for (++) to fire in InitialPhase
+  -- It's recursive, so won't inline anyway,
+  -- but saying so is more explicit
 (++) []     ys = ys
 (++) (x:xs) ys = x : xs ++ ys
+
+{-# RULES
+"++/literal"      forall x. (++) (unpackCString# x)     = unpackAppendCString# x
+"++/literal_utf8" forall x. (++) (unpackCStringUtf8# x) = unpackAppendCStringUtf8# x #-}
 
 {-# RULES
 "++"    [~1] forall xs ys. xs ++ ys = augment (\c n -> foldr c n xs) ys
@@ -1472,7 +1492,7 @@ breakpointCond :: Bool -> a -> a
 breakpointCond _ r = r
 
 data Opaque = forall a. O a
--- | @const x@ is a unary function which evaluates to @x@ for all inputs.
+-- | @const x y@ always evaluates to @x@, ignoring its second argument.
 --
 -- >>> const 42 "hello"
 -- 42
@@ -1506,7 +1526,7 @@ flip f x y              =  f y x
 -- It is also useful in higher-order situations, such as @'map' ('$' 0) xs@,
 -- or @'Data.List.zipWith' ('$') fs xs@.
 --
--- Note that @('$')@ is levity-polymorphic in its result type, so that
+-- Note that @('$')@ is representation-polymorphic in its result type, so that
 -- @foo '$' True@ where @foo :: Bool -> Int#@ is well-typed.
 {-# INLINE ($) #-}
 ($) :: forall r a (b :: TYPE r). (a -> b) -> a -> b
@@ -1517,6 +1537,7 @@ f $ x =  f x
 -- the function with that value.
 
 ($!) :: forall r a (b :: TYPE r). (a -> b) -> a -> b
+{-# INLINE ($!) #-}
 f $! x = let !vx = x in f vx  -- see #2273
 
 -- | @'until' p f@ yields the result of applying @f@ until @p@ holds.
@@ -1599,34 +1620,105 @@ getTag x = dataToTag# x
 -- Definitions of the boxed PrimOps; these will be
 -- used in the case of partial applications, etc.
 
+-- See Note [INLINE division wrappers]
 {-# INLINE quotInt #-}
 {-# INLINE remInt #-}
+{-# INLINE divInt #-}
+{-# INLINE modInt #-}
+{-# INLINE quotRemInt #-}
+{-# INLINE divModInt #-}
 
-quotInt, remInt, divInt, modInt :: Int -> Int -> Int
+-- | Used to implement `quot` for the `Integral` typeclass.
+--   This performs integer division on its two parameters, truncated towards zero.
+--
+-- ==== __Example__
+-- >>> quotInt 10 2
+-- 5
+--
+-- >>> quot 10 2
+-- 5
+quotInt :: Int -> Int -> Int
 (I# x) `quotInt`  (I# y) = I# (x `quotInt#` y)
+-- | Used to implement `rem` for the `Integral` typeclass.
+--   This gives the remainder after integer division of its two parameters, satisfying
+--
+-- > ((x `quot` y) * y) + (x `rem` y) == x
+--
+-- ==== __Example__
+-- >>> remInt 3 2
+-- 1
+--
+-- >>> rem 3 2
+-- 1
+remInt  :: Int -> Int -> Int
 (I# x) `remInt`   (I# y) = I# (x `remInt#`  y)
+-- | Used to implement `div` for the `Integral` typeclass.
+--   This performs integer division on its two parameters, truncated towards negative infinity.
+--
+-- ==== __Example__
+-- >>> 10 `divInt` 2
+-- 5
+--
+-- >>> 10 `div` 2
+-- 5
+divInt  :: Int -> Int -> Int
 (I# x) `divInt`   (I# y) = I# (x `divInt#`  y)
+-- | Used to implement `mod` for the `Integral` typeclass.
+--   This performs the modulo operation, satisfying
+--
+-- > ((x `div` y) * y) + (x `mod` y) == x
+--
+-- ==== __Example__
+-- >>> 7 `modInt` 3
+-- 1
+--
+-- >>> 7 `mod` 3
+-- 1
+modInt  :: Int -> Int -> Int
 (I# x) `modInt`   (I# y) = I# (x `modInt#`  y)
 
+
+-- | Used to implement `quotRem` for the `Integral` typeclass.
+--   This gives a tuple equivalent to
+--
+-- > (quot x y, mod x y)
+--
+-- ==== __Example__
+-- >>> quotRemInt 10 2
+-- (5,0)
+--
+-- >>> quotRem 10 2
+-- (5,0)
 quotRemInt :: Int -> Int -> (Int, Int)
 (I# x) `quotRemInt` (I# y) = case x `quotRemInt#` y of
                              (# q, r #) ->
                                  (I# q, I# r)
 
+-- | Used to implement `divMod` for the `Integral` typeclass.
+--   This gives a tuple equivalent to
+--
+-- > (div x y, mod x y)
+--
+-- ==== __Example__
+-- >>> divModInt 10 2
+-- (5,0)
+--
+-- >>> divMod 10 2
+-- (5,0)
 divModInt :: Int -> Int -> (Int, Int)
 (I# x) `divModInt` (I# y) = case x `divModInt#` y of
                             (# q, r #) -> (I# q, I# r)
 
-divModInt# :: Int# -> Int# -> (# Int#, Int# #)
-x# `divModInt#` y#
- | isTrue# (x# ># 0#) && isTrue# (y# <# 0#) =
-                                    case (x# -# 1#) `quotRemInt#` y# of
-                                      (# q, r #) -> (# q -# 1#, r +# y# +# 1# #)
- | isTrue# (x# <# 0#) && isTrue# (y# ># 0#) =
-                                    case (x# +# 1#) `quotRemInt#` y# of
-                                      (# q, r #) -> (# q -# 1#, r +# y# -# 1# #)
- | otherwise                                =
-                                    x# `quotRemInt#` y#
+{- Note [INLINE division wrappers]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The Int division functions such as 'quotRemInt' and 'divModInt' have
+been manually worker/wrappered, presumably because they construct
+*nested* products.
+We intend to preserve the exact worker/wrapper split, hence we mark
+the wrappers INLINE (#19267). That makes sure the optimiser doesn't
+accidentally inline the worker into the wrapper, undoing the manual
+split again.
+-}
 
 -- Wrappers for the shift operations.  The uncheckedShift# family are
 -- undefined when the amount being shifted by is greater than the size
@@ -1636,51 +1728,60 @@ x# `divModInt#` y#
 -- Note that these wrappers still produce undefined results when the
 -- second argument (the shift amount) is negative.
 
+-- | This function is used to implement branchless shifts. If the number of bits
+-- to shift is greater than or equal to the type size in bits, then the shift
+-- must return 0.  Instead of doing a test, we use a mask obtained via this
+-- function which is branchless too.
+--
+--    shift_mask m b
+--      | b < m     = 0xFF..FF
+--      | otherwise = 0
+--
+shift_mask :: Int# -> Int# -> Int#
+{-# INLINE shift_mask #-}
+shift_mask m b = negateInt# (b <# m)
+
 -- | Shift the argument left by the specified number of bits
 -- (which must be non-negative).
 shiftL# :: Word# -> Int# -> Word#
-a `shiftL#` b   | isTrue# (b >=# WORD_SIZE_IN_BITS#) = 0##
-                | otherwise                          = a `uncheckedShiftL#` b
+a `shiftL#` b = (a `uncheckedShiftL#` b) `and#` int2Word# (shift_mask WORD_SIZE_IN_BITS# b)
 
 -- | Shift the argument right by the specified number of bits
 -- (which must be non-negative).
 -- The "RL" means "right, logical" (as opposed to RA for arithmetic)
 -- (although an arithmetic right shift wouldn't make sense for Word#)
 shiftRL# :: Word# -> Int# -> Word#
-a `shiftRL#` b  | isTrue# (b >=# WORD_SIZE_IN_BITS#) = 0##
-                | otherwise                          = a `uncheckedShiftRL#` b
+a `shiftRL#` b = (a `uncheckedShiftRL#` b) `and#` int2Word# (shift_mask WORD_SIZE_IN_BITS# b)
 
 -- | Shift the argument left by the specified number of bits
 -- (which must be non-negative).
 iShiftL# :: Int# -> Int# -> Int#
-a `iShiftL#` b  | isTrue# (b >=# WORD_SIZE_IN_BITS#) = 0#
-                | otherwise                          = a `uncheckedIShiftL#` b
+a `iShiftL#` b = (a `uncheckedIShiftL#` b) `andI#` shift_mask WORD_SIZE_IN_BITS# b
 
 -- | Shift the argument right (signed) by the specified number of bits
 -- (which must be non-negative).
 -- The "RA" means "right, arithmetic" (as opposed to RL for logical)
 iShiftRA# :: Int# -> Int# -> Int#
-a `iShiftRA#` b | isTrue# (b >=# WORD_SIZE_IN_BITS#) = if isTrue# (a <# 0#)
-                                                          then (-1#)
-                                                          else 0#
+a `iShiftRA#` b | isTrue# (b >=# WORD_SIZE_IN_BITS#) = negateInt# (a <# 0#)
                 | otherwise                          = a `uncheckedIShiftRA#` b
 
 -- | Shift the argument right (unsigned) by the specified number of bits
 -- (which must be non-negative).
 -- The "RL" means "right, logical" (as opposed to RA for arithmetic)
 iShiftRL# :: Int# -> Int# -> Int#
-a `iShiftRL#` b | isTrue# (b >=# WORD_SIZE_IN_BITS#) = 0#
-                | otherwise                          = a `uncheckedIShiftRL#` b
+a `iShiftRL#` b = (a `uncheckedIShiftRL#` b) `andI#` shift_mask WORD_SIZE_IN_BITS# b
 
 -- Rules for C strings (the functions themselves are now in GHC.CString)
 {-# RULES
 "unpack"       [~1] forall a   . unpackCString# a             = build (unpackFoldrCString# a)
 "unpack-list"  [1]  forall a   . unpackFoldrCString# a (:) [] = unpackCString# a
 "unpack-append"     forall a n . unpackFoldrCString# a (:) n  = unpackAppendCString# a n
+"unpack-append-nil" forall a   . unpackAppendCString# a []    = unpackCString# a
 
 "unpack-utf8"       [~1] forall a   . unpackCStringUtf8# a             = build (unpackFoldrCStringUtf8# a)
 "unpack-list-utf8"  [1]  forall a   . unpackFoldrCStringUtf8# a (:) [] = unpackCStringUtf8# a
 "unpack-append-utf8"     forall a n . unpackFoldrCStringUtf8# a (:) n  = unpackAppendCStringUtf8# a n
+"unpack-append-nil-utf8" forall a   . unpackAppendCStringUtf8# a []    = unpackCStringUtf8# a
 
 -- There's a built-in rule (in GHC.Core.Op.ConstantFold) for
 --      unpackFoldr "foo" c (unpackFoldr "baz" c n)  =  unpackFoldr "foobaz" c n

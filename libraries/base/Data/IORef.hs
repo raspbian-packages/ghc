@@ -1,7 +1,7 @@
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE Trustworthy #-}
-{-# LANGUAGE NoImplicitPrelude, MagicHash, UnboxedTuples #-}
-{-# LANGUAGE BangPatterns #-}
-
+{-# LANGUAGE UnboxedTuples #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Data.IORef
@@ -9,7 +9,7 @@
 -- License     :  BSD-style (see the file libraries/base/LICENSE)
 -- 
 -- Maintainer  :  libraries@haskell.org
--- Stability   :  experimental
+-- Stability   :  stable
 -- Portability :  portable
 --
 -- Mutable references in the IO monad.
@@ -17,7 +17,7 @@
 -----------------------------------------------------------------------------
 
 module Data.IORef
-  ( 
+  (
         -- * IORefs
         IORef,                -- abstract, instance of: Eq, Typeable
         newIORef,

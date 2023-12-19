@@ -6,14 +6,16 @@ import Oracles.Setting
 import Oracles.Flag
 import Packages
 import Settings
+import Settings.Builders.Common (wayCcArgs)
 
 -- | Package-specific command-line arguments.
 packageArgs :: Args
 packageArgs = do
     stage        <- getStage
-    rtsWays      <- getRtsWays
     path         <- getBuildPath
+    root         <- getBuildRoot
     compilerPath <- expr $ buildPath (vanillaContext stage compiler)
+
     let -- Do not bind the result to a Boolean: this forces the configure rule
         -- immediately and may lead to cyclic dependencies.
         -- See: https://gitlab.haskell.org/ghc/ghc/issues/16809.
@@ -21,12 +23,18 @@ packageArgs = do
 
         -- Check if the bootstrap compiler has the same version as the one we
         -- are building. This is used to build cross-compilers
-        bootCross = (==) <$> ghcVersionStage Stage0 <*> ghcVersionStage Stage1
+        bootCross = (==) <$> ghcVersionStage (stage0InTree) <*> ghcVersionStage Stage1
+
+    cursesIncludeDir <- getSetting CursesIncludeDir
+    cursesLibraryDir <- getSetting CursesLibDir
+    ffiIncludeDir  <- getSetting FfiIncludeDir
+    ffiLibraryDir  <- getSetting FfiLibDir
+    debugAssertions  <- ghcDebugAssertions <$> expr flavour
 
     mconcat
         --------------------------------- base ---------------------------------
         [ package base ? mconcat
-          [ builder (Cabal Flags) ? notStage0 ? arg (pkgName ghcBignum)
+          [ builder (Cabal Flags) ? notStage0 `cabalFlag` (pkgName ghcBignum)
 
           -- This fixes the 'unknown symbol stat' issue.
           -- See: https://github.com/snowleopard/hadrian/issues/259.
@@ -44,9 +52,14 @@ packageArgs = do
           [ builder Alex ? arg "--latin1"
 
           , builder (Ghc CompileHs) ? mconcat
-            [ inputs ["**/GHC.hs", "**/GHC/Driver/Make.hs"] ? arg "-fprof-auto"
+            [ debugAssertions ? notStage0 ? arg "-DDEBUG"
+
+            , inputs ["**/GHC.hs", "**/GHC/Driver/Make.hs"] ? arg "-fprof-auto"
             , input "**/Parser.hs" ?
               pure ["-fno-ignore-interface-pragmas", "-fcmm-sink"]
+            -- Enable -haddock and -Winvalid-haddock for the compiler
+            , arg "-haddock"
+            , notStage0 ? arg "-Winvalid-haddock"
             -- These files take a very long time to compile with -O1,
             -- so we use -O0 for them just in Stage0 to speed up the
             -- build but not affect Stage1+ executables
@@ -56,44 +69,26 @@ packageArgs = do
           , builder (Cabal Setup) ? mconcat
             [ arg "--disable-library-for-ghci"
             , anyTargetOs ["openbsd"] ? arg "--ld-options=-E"
-            , flag GhcUnregisterised ? arg "--ghc-option=-DNO_REGS"
-            , notM targetSupportsSMP ? arg "--ghc-option=-DNOSMP"
-            , notM targetSupportsSMP ? arg "--ghc-option=-optc-DNOSMP"
-            -- When building stage 1 or later, use thread-safe RTS functions if
-            -- the configuration calls for a threaded GHC.
-            , (any (wayUnit Threaded) rtsWays) ?
-              notStage0 ? arg "--ghc-option=-optc-DTHREADED_RTS"
-            -- When building stage 1, use thread-safe RTS functions if the
-            -- bootstrapping (stage 0) compiler provides a threaded RTS way.
-            , stage0 ? threadedBootstrapper ? arg "--ghc-option=-optc-DTHREADED_RTS"
-            , ghcWithInterpreter ?
-              ghciWithDebugger <$> flavour ?
-              notStage0 ? arg "--ghc-option=-DDEBUGGER"
             , ghcProfiled <$> flavour ?
               notStage0 ? arg "--ghc-pkg-option=--force" ]
 
           , builder (Cabal Flags) ? mconcat
-            [ andM [expr ghcWithInterpreter, notStage0] `cabalFlag` "ghci"
+            [ andM [expr ghcWithInterpreter, notStage0] `cabalFlag` "internal-interpreter"
             , notM cross `cabalFlag` "terminfo"
+            , arg "-build-tool-depends"
             ]
 
           , builder (Haddock BuildPackage) ? arg ("--optghc=-I" ++ path) ]
 
         ---------------------------------- ghc ---------------------------------
         , package ghc ? mconcat
-          [ builder Ghc ? arg ("-I" ++ compilerPath)
+          [ builder Ghc ? mconcat
+             [ arg ("-I" ++ compilerPath)
+             , debugAssertions ? notStage0 ? arg "-DDEBUG" ]
 
           , builder (Cabal Flags) ? mconcat
-            [ andM [expr ghcWithInterpreter, notStage0] `cabalFlag` "ghci"
+            [ andM [expr ghcWithInterpreter, notStage0] `cabalFlag` "internal-interpreter"
             , notM cross `cabalFlag` "terminfo"
-            -- Note [Linking ghc-bin against threaded stage0 RTS]
-            -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            -- We must maintain the invariant that GHCs linked with '-threaded'
-            -- are built with '-optc=-DTHREADED_RTS', otherwise we'll end up
-            -- with a GHC that can use the threaded runtime, but contains some
-            -- non-thread-safe functions. See
-            -- https://gitlab.haskell.org/ghc/ghc/issues/18024 for an example of
-            -- the sort of issues this can cause.
             , ifM stage0
                   -- We build a threaded stage 1 if the bootstrapping compiler
                   -- supports it.
@@ -117,33 +112,40 @@ packageArgs = do
             input "**/cbits/atomic.c"  ? arg "-Wno-sync-nand" ]
 
         --------------------------------- ghci ---------------------------------
-        , package ghci ? builder (Cabal Flags) ? ifM stage0
-            -- The use case here is that we want to build @ghc-proxy@ for the
-            -- cross compiler. That one needs to be compiled by the bootstrap
-            -- compiler as it needs to run on the host. Hence @libiserv@ needs
-            -- @GHCi.TH@, @GHCi.Message@ and @GHCi.Run@ from @ghci@. And those are
-            -- behind the @-fghci@ flag.
-            --
-            -- But it may not build if we have made some changes to ghci's
-            -- dependencies (see #16051).
-            --
-            -- To fix this properly Hadrian would need to:
-            --   * first build a compiler for the build platform (stage1 is enough)
-            --   * use it as a bootstrap compiler to build the stage1 cross-compiler
-            --
-            -- The issue is that "configure" would have to be executed twice (for
-            -- the build platform and for the cross-platform) and Hadrian would
-            -- need to be fixed to support two different stage1 compilers.
-            --
-            -- The workaround we use is to check if the bootstrap compiler has
-            -- the same version as the one we are building. In this case we can
-            -- avoid the first step above and directly build with `-fghci`.
-            --
-            -- TODO: Note that in that case we also do not need to build most of
-            -- the Stage1 libraries, as we already know that the bootstrap
-            -- compiler comes with the same versions as the one we are building.
-            (andM [expr cross, expr bootCross] `cabalFlag` "ghci")
-            (arg "ghci")
+        , package ghci ? mconcat
+          [
+          -- The use case here is that we want to build @iserv-proxy@ for the
+          -- cross compiler. That one needs to be compiled by the bootstrap
+          -- compiler as it needs to run on the host. Hence @libiserv@ needs
+          -- @GHCi.TH@, @GHCi.Message@ and @GHCi.Run@ from @ghci@. And those are
+          -- behind the @-finternal-interpreter@ flag.
+          --
+          -- But it may not build if we have made some changes to ghci's
+          -- dependencies (see #16051).
+          --
+          -- To fix this properly Hadrian would need to:
+          --   * first build a compiler for the build platform (stage1 is enough)
+          --   * use it as a bootstrap compiler to build the stage1 cross-compiler
+          --
+          -- The issue is that "configure" would have to be executed twice (for
+          -- the build platform and for the cross-platform) and Hadrian would
+          -- need to be fixed to support two different stage1 compilers.
+          --
+          -- The workaround we use is to check if the bootstrap compiler has
+          -- the same version as the one we are building. In this case we can
+          -- avoid the first step above and directly build with
+          -- `-finternal-interpreter`.
+          --
+          -- TODO: Note that in that case we also do not need to build most of
+          -- the Stage1 libraries, as we already know that the bootstrap
+          -- compiler comes with the same versions as the one we are building.
+          --
+            builder (Cabal Setup) ? cabalExtraDirs ffiIncludeDir ffiLibraryDir
+          , builder (Cabal Flags) ? ifM stage0
+              (andM [cross, bootCross] `cabalFlag` "internal-interpreter")
+              (arg "internal-interpreter")
+
+          ]
 
         --------------------------------- iserv --------------------------------
         -- Add -Wl,--export-dynamic enables GHCi to load dynamic objects that
@@ -162,6 +164,14 @@ packageArgs = do
         , package haddock ?
           builder (Cabal Flags) ? arg "in-ghc-tree"
 
+        ---------------------------------- text --------------------------------
+        , package text ? mconcat
+          -- Disable SIMDUTF by default due to packaging difficulties
+          -- described in #20724.
+          [ builder (Cabal Flags) ? arg "-simdutf"
+          -- https://github.com/haskell/text/issues/415
+          , builder Ghc ? input "**/Data/Text/Encoding.hs"  ? arg "-Wno-unused-imports" ]
+
         ------------------------------- haskeline ------------------------------
         -- Hadrian doesn't currently support packages containing both libraries
         -- and executables. This flag disables the latter.
@@ -173,9 +183,17 @@ packageArgs = do
         , package haskeline ?
           builder (Cabal Flags) ? notM cross `cabalFlag` "terminfo"
 
+        -------------------------------- terminfo ------------------------------
+        , package terminfo ?
+          builder (Cabal Setup) ? cabalExtraDirs cursesIncludeDir cursesLibraryDir
+
         -------------------------------- hsc2hs --------------------------------
         , package hsc2hs ?
           builder (Cabal Flags) ? arg "in-ghc-tree"
+
+        -------------------------------- genapply --------------------------------
+        -- TODO: The logic here needs to come first, so it's hacked into
+        -- Settings.Builder.Ghc instead.
 
         ------------------------------ ghc-bignum ------------------------------
         , ghcBignumArgs
@@ -187,6 +205,20 @@ packageArgs = do
         , package runGhc ?
           builder Ghc ? input "**/Main.hs" ?
           (\version -> ["-cpp", "-DVERSION=" ++ show version]) <$> getSetting ProjectVersion
+
+        --------------------------------- genprimopcode ------------------------
+        , package genprimopcode
+          ? builder (Cabal Flags) ? arg "-build-tool-depends"
+
+        --------------------------------- hpcBin ----------------------------------
+        , package hpcBin
+          ? builder (Cabal Flags) ? arg "-build-tool-depends"
+
+        --------------------------------- template-haskell ----------------------------------
+
+        , package templateHaskell
+            ? mconcat [ builder (Cabal Flags) ? notStage0 ? arg "+vendor-filepath"
+                      , builder Ghc ? notStage0 ? arg ("-i" <> (root </> pkgPath filepath)) ]
         ]
 
 ghcBignumArgs :: Args
@@ -224,10 +256,7 @@ ghcBignumArgs = package ghcBignum ? do
 
                        -- Ensure that the ghc-bignum package registration includes
                        -- knowledge of the system gmp's library and include directories.
-                     , notM (flag GmpInTree) ? mconcat
-                       [ if not (null librariesGmp) then arg ("--extra-lib-dirs=" ++ librariesGmp) else mempty
-                       , if not (null includesGmp) then arg ("--extra-include-dirs=" ++ includesGmp) else mempty
-                       ]
+                     , notM (flag GmpInTree) ? cabalExtraDirs includesGmp librariesGmp
                      ]
                   ]
                _ -> mempty
@@ -256,7 +285,6 @@ rtsPackageArgs = package rts ? do
     path           <- getBuildPath
     top            <- expr topDirectory
     useSystemFfi   <- expr $ flag UseSystemFfi
-    libffiName     <- expr libffiLibraryName
     ffiIncludeDir  <- getSetting FfiIncludeDir
     ffiLibraryDir  <- getSetting FfiLibDir
     libdwIncludeDir   <- getSetting LibdwIncludeDir
@@ -272,18 +300,16 @@ rtsPackageArgs = package rts ? do
           -- Set the namespace for the rts fs functions
           , arg $ "-DFS_NAMESPACE=rts"
           , arg $ "-DCOMPILING_RTS"
-          , notM targetSupportsSMP           ? arg "-DNOSMP"
-          , way `elem` [debug, debugDynamic] ? arg "-DTICKY_TICKY"
+          , way `elem` [debug, debugDynamic] ? pure [ "-DTICKY_TICKY"
+                                                    , "-optc-DTICKY_TICKY"]
           , Profiling `wayUnit` way          ? arg "-DPROFILING"
           , Threaded  `wayUnit` way          ? arg "-DTHREADED_RTS"
-          , notM targetSupportsSMP           ? pure [ "-DNOSMP"
-                                                    , "-optc-DNOSMP" ]
+          , notM targetSupportsSMP           ? arg "-optc-DNOSMP"
           ]
 
     let cArgs = mconcat
           [ rtsWarnings
-          , flag UseSystemFfi ? not (null ffiIncludeDir) ? arg ("-I" ++ ffiIncludeDir)
-          , flag WithLibdw ? not (null libdwIncludeDir) ? arg ("-I" ++ libdwIncludeDir)
+          , wayCcArgs
           , arg "-fomit-frame-pointer"
           -- RTS *must* be compiled with optimisations. The INLINE_HEADER macro
           -- requires that functions are inlined to work as expected. Inlining
@@ -296,6 +322,8 @@ rtsPackageArgs = package rts ? do
 
           , arg "-Irts"
           , arg $ "-I" ++ path
+
+          , notM targetSupportsSMP           ? arg "-DNOSMP"
 
           , Debug     `wayUnit` way          ? pure [ "-DDEBUG"
                                                     , "-fno-omit-frame-pointer"
@@ -357,42 +385,33 @@ rtsPackageArgs = package rts ? do
 
             , input "**/RetainerProfile.c" ? flag CcLlvmBackend ?
               arg "-Wno-incompatible-pointer-types"
-
-            -- libffi's ffi.h triggers various warnings
-            , inputs [ "**/Interpreter.c", "**/Storage.c", "**/Adjustor.c" ] ?
-              arg "-Wno-strict-prototypes"
-            , inputs ["**/Interpreter.c", "**/Adjustor.c", "**/sm/Storage.c"] ?
-              anyTargetArch ["powerpc"] ? arg "-Wno-undef" ]
+            ]
 
     mconcat
         [ builder (Cabal Flags) ? mconcat
           [ any (wayUnit Profiling) rtsWays `cabalFlag` "profiling"
           , any (wayUnit Debug) rtsWays     `cabalFlag` "debug"
-          , any (wayUnit Logging) rtsWays   `cabalFlag` "logging"
           , any (wayUnit Dynamic) rtsWays   `cabalFlag` "dynamic"
           , useSystemFfi                    `cabalFlag` "use-system-libffi"
           , useLibffiForAdjustors           `cabalFlag` "libffi-adjustors"
           , Debug `wayUnit` way             `cabalFlag` "find-ptr"
           ]
         , builder (Cabal Setup) ? mconcat
-          [ if not (null libdwLibraryDir) then arg ("--extra-lib-dirs="++libdwLibraryDir) else mempty
-          , if not (null libdwIncludeDir) then arg ("--extra-include-dirs="++libdwIncludeDir) else mempty
-          , if not (null libnumaLibraryDir) then arg ("--extra-lib-dirs="++libnumaLibraryDir) else mempty
-          , if not (null libnumaIncludeDir) then arg ("--extra-include-dirs="++libnumaIncludeDir) else mempty
-          ]
-        , builder (Cc FindCDependencies) ? cArgs
+              [ cabalExtraDirs libdwIncludeDir libdwLibraryDir
+              , cabalExtraDirs libnumaIncludeDir libnumaLibraryDir
+              , useSystemFfi ? cabalExtraDirs ffiIncludeDir ffiLibraryDir
+              ]
+        , builder (Cc (FindCDependencies CDep)) ? cArgs
+        , builder (Cc (FindCDependencies  CxxDep)) ? cArgs
         , builder (Ghc CompileCWithGhc) ? map ("-optc" ++) <$> cArgs
+        , builder (Ghc CompileCppWithGhc) ? map ("-optcxx" ++) <$> cArgs
         , builder Ghc ? ghcArgs
 
         , builder HsCpp ? pure
-          [ "-DTOP="             ++ show top
-          , "-DFFI_INCLUDE_DIR=" ++ show ffiIncludeDir
-          , "-DFFI_LIB_DIR="     ++ show ffiLibraryDir
-          , "-DFFI_LIB="         ++ show libffiName
-          , "-DLIBDW_LIB_DIR="   ++ show libdwLibraryDir ]
+          [ "-DTOP="             ++ show top ]
 
         , builder HsCpp ? flag WithLibdw ? arg "-DUSE_LIBDW"
-        , builder HsCpp ? flag HaveLibMingwEx ? arg "-DHAVE_LIBMINGWEX" ]
+        ]
 
 -- Compile various performance-critical pieces *without* -fPIC -dynamic
 -- even when building a shared library.  If we don't do this, then the
@@ -409,7 +428,7 @@ rtsPackageArgs = package rts ? do
 -- On Darwin we get errors of the form
 --
 --  ld: absolute addressing (perhaps -mdynamic-no-pic) used in _stg_ap_0_fast
---      from rts/dist/build/Apply.dyn_o not allowed in slidable image
+--      from rts/dist-install/build/Apply.dyn_o not allowed in slidable image
 --
 -- and lots of these warnings:
 --
@@ -420,7 +439,7 @@ rtsPackageArgs = package rts ? do
 --
 -- Text relocation remains                         referenced
 --     against symbol                  offset      in file
--- .rodata (section)                   0x11        rts/dist/build/Apply.dyn_o
+-- .rodata (section)                   0x11        rts/dist-install/build/Apply.dyn_o
 --   ...
 -- ld: fatal: relocations remain against allocatable but non-writable sections
 -- collect2: ld returned 1 exit status
@@ -445,3 +464,18 @@ rtsWarnings = mconcat
     , arg "-Wredundant-decls"
     , arg "-Wundef"
     , arg "-fno-strict-aliasing" ]
+
+-- | Expands to Cabal `--extra-lib-dirs` and `--extra-include-dirs` flags if
+-- the respective paths are not null.
+cabalExtraDirs :: FilePath   -- ^ include path
+          -> FilePath   -- ^ libraries path
+          -> Args
+cabalExtraDirs include lib = mconcat
+    [ extraDirFlag "--extra-lib-dirs" lib
+    , extraDirFlag "--extra-include-dirs" include
+    ]
+  where
+    extraDirFlag :: String -> FilePath -> Args
+    extraDirFlag flag dir
+      | null dir  = mempty
+      | otherwise = arg (flag++"="++dir)

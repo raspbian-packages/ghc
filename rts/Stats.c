@@ -6,7 +6,7 @@
  *
  * ---------------------------------------------------------------------------*/
 
-#include "PosixSource.h"
+#include "rts/PosixSource.h"
 #include "Rts.h"
 
 #include "RtsFlags.h"
@@ -69,7 +69,7 @@ static Time *GC_coll_cpu = NULL;
 static Time *GC_coll_elapsed = NULL;
 static Time *GC_coll_max_pause = NULL;
 
-static void statsPrintf( char *s, ... ) GNUC3_ATTRIBUTE(format (PRINTF, 1, 2));
+static int statsPrintf( char *s, ... ) STG_PRINTF_ATTR(1, 2);
 static void statsFlush( void );
 static void statsClose( void );
 
@@ -154,13 +154,9 @@ initStats0(void)
         .par_copied_bytes = 0,
         .cumulative_par_max_copied_bytes = 0,
         .cumulative_par_balanced_copied_bytes = 0,
-        .gc_spin_spin = 0,
-        .gc_spin_yield = 0,
-        .mut_spin_spin = 0,
-        .mut_spin_yield = 0,
         .any_work = 0,
-        .no_work = 0,
         .scav_find_work = 0,
+        .max_n_todo_overflow = 0,
         .init_cpu_ns = 0,
         .init_elapsed_ns = 0,
         .mutator_cpu_ns = 0,
@@ -225,7 +221,7 @@ initStats1 (void)
 }
 
 void
-initGenerationStats()
+initGenerationStats(void)
 {
     for (uint32_t i = 0; i < RtsFlags.GcFlags.generations; i++) {
         GC_coll_cpu[i] = 0;
@@ -238,7 +234,7 @@ initGenerationStats()
    Reset stats of child process after fork()
    ------------------------------------------------------------------------ */
 
-void resetChildProcessStats()
+void resetChildProcessStats(void)
 {
     initStats0();
     initGenerationStats();
@@ -298,19 +294,19 @@ stat_startGCSync (gc_thread *gct)
 }
 
 void
-stat_startNonmovingGc ()
+stat_startNonmovingGc (void)
 {
     ACQUIRE_LOCK(&stats_mutex);
     start_nonmoving_gc_cpu = getCurrentThreadCPUTime();
-    start_nonmoving_gc_elapsed = getProcessCPUTime();
+    start_nonmoving_gc_elapsed = getProcessElapsedTime();
     RELEASE_LOCK(&stats_mutex);
 }
 
 void
-stat_endNonmovingGc ()
+stat_endNonmovingGc (void)
 {
     Time cpu = getCurrentThreadCPUTime();
-    Time elapsed = getProcessCPUTime();
+    Time elapsed = getProcessElapsedTime();
 
     ACQUIRE_LOCK(&stats_mutex);
     stats.gc.nonmoving_gc_elapsed_ns = elapsed - start_nonmoving_gc_elapsed;
@@ -326,7 +322,7 @@ stat_endNonmovingGc ()
 }
 
 void
-stat_startNonmovingGcSync ()
+stat_startNonmovingGcSync (void)
 {
     ACQUIRE_LOCK(&stats_mutex);
     start_nonmoving_gc_sync_elapsed = getProcessElapsedTime();
@@ -335,7 +331,7 @@ stat_startNonmovingGcSync ()
 }
 
 void
-stat_endNonmovingGcSync ()
+stat_endNonmovingGcSync (void)
 {
     Time end_elapsed = getProcessElapsedTime();
     ACQUIRE_LOCK(&stats_mutex);
@@ -460,9 +456,8 @@ stat_startGC (Capability *cap, gc_thread *gct)
 void
 stat_endGC (Capability *cap, gc_thread *initiating_gct, W_ live, W_ copied, W_ slop,
             uint32_t gen, uint32_t par_n_threads, gc_thread **gc_threads,
-            W_ par_max_copied, W_ par_balanced_copied, W_ gc_spin_spin, W_ gc_spin_yield,
-            W_ mut_spin_spin, W_ mut_spin_yield, W_ any_work, W_ no_work,
-            W_ scav_find_work)
+            W_ par_max_copied, W_ par_balanced_copied, W_ any_work,
+            W_ scav_find_work, W_ max_n_todo_overflow)
 {
     ACQUIRE_LOCK(&stats_mutex);
 
@@ -510,15 +505,17 @@ stat_endGC (Capability *cap, gc_thread *initiating_gct, W_ live, W_ copied, W_ s
         // see Note [n_gc_threads]
         // par_n_threads is set to n_gc_threads at the single callsite of this
         // function
-        if (par_n_threads == 1) {
-            ASSERT(initiating_gct->gc_end_cpu >= initiating_gct->gc_start_cpu);
-            stats.gc.cpu_ns += initiating_gct->gc_end_cpu - initiating_gct->gc_start_cpu;
-        } else {
-            for (unsigned int i=0; i < par_n_threads; i++) {
-                gc_thread *gct = gc_threads[i];
-                ASSERT(gct->gc_end_cpu >= gct->gc_start_cpu);
-                stats.gc.cpu_ns += gct->gc_end_cpu - gct->gc_start_cpu;
-            }
+        for (unsigned int i=0; i < par_n_threads; i++) {
+            gc_thread *gct = gc_threads[i];
+            ASSERT(gct->gc_end_cpu >= gct->gc_start_cpu);
+            stats.gc.cpu_ns += gct->gc_end_cpu - gct->gc_start_cpu;
+            // Reset the start/end times to zero after the difference has been
+            // added to the global total (see #21082)
+            // Resetting the values here is the most direct way to avoid double counting
+            // because the gc_end_cpu and gc_start_cpu is not reset to zero as
+            // stat_startGC is only called on active (not idle threads).
+            gct->gc_end_cpu = 0;
+            gct->gc_start_cpu = 0;
         }
     }
     // -------------------------------------------------
@@ -542,12 +539,8 @@ stat_endGC (Capability *cap, gc_thread *initiating_gct, W_ live, W_ copied, W_ s
         stats.cumulative_par_balanced_copied_bytes +=
             stats.gc.par_balanced_copied_bytes;
         stats.any_work += any_work;
-        stats.no_work += no_work;
         stats.scav_find_work += scav_find_work;
-        stats.gc_spin_spin += gc_spin_spin;
-        stats.gc_spin_yield += gc_spin_yield;
-        stats.mut_spin_spin += mut_spin_spin;
-        stats.mut_spin_yield += mut_spin_yield;
+        stats.max_n_todo_overflow += stg_max(max_n_todo_overflow, stats.max_n_todo_overflow);
     }
     stats.gc_cpu_ns += stats.gc.cpu_ns;
     stats.gc_elapsed_ns += stats.gc.elapsed_ns;
@@ -578,7 +571,7 @@ stat_endGC (Capability *cap, gc_thread *initiating_gct, W_ live, W_ copied, W_ s
         // Emit events to the event log
 
         // Has to be emitted while all caps stopped for GC, but before GC_END.
-        // See trac.haskell.org/ThreadScope/wiki/RTSsummaryEvents
+        // See https://gitlab.haskell.org/ghc/ghc/-/wikis/RTSsummaryEvents
         // for a detailed design rationale of the current setup
         // of GC eventlog events.
         traceEventGcGlobalSync(cap);
@@ -642,6 +635,9 @@ stat_endGC (Capability *cap, gc_thread *initiating_gct, W_ live, W_ copied, W_ s
         traceEventHeapSize(cap,
                            CAPSET_HEAP_DEFAULT,
                            mblocks_allocated * MBLOCK_SIZE);
+        traceEventBlocksSize(cap,
+                           CAPSET_HEAP_DEFAULT,
+                           n_alloc_blocks * BLOCK_SIZE);
     }
     RELEASE_LOCK(&stats_mutex);
 }
@@ -770,8 +766,7 @@ StgInt TOTAL_CALLS=1;
 
 /*
 Note [RTS Stats Reporting]
-==========================
-
+~~~~~~~~~~~~~~~~~~~~~~~~~~
 There are currently three reporting functions:
   * report_summary:
       Responsible for producing '+RTS -s' output.
@@ -865,15 +860,18 @@ static void report_summary(const RTSSummaryStats* sum)
                     TimeToSecondsDbl(gen_stats->max_pause_ns));
     }
     if (RtsFlags.GcFlags.useNonmoving) {
-        const int n_major_colls = sum->gc_summary_stats[RtsFlags.GcFlags.generations-1].collections;
-        statsPrintf("  Gen  1     %5d syncs"
+        const uint32_t nonmoving_gen = RtsFlags.GcFlags.generations-1;
+        const int n_major_colls = sum->gc_summary_stats[nonmoving_gen].collections;
+        statsPrintf("  Gen %2d     %5d syncs"
                     ",                      %6.3fs     %3.4fs    %3.4fs\n",
+                    nonmoving_gen,
                     n_major_colls,
                     TimeToSecondsDbl(stats.nonmoving_gc_sync_elapsed_ns),
                     TimeToSecondsDbl(stats.nonmoving_gc_sync_elapsed_ns) / n_major_colls,
                     TimeToSecondsDbl(stats.nonmoving_gc_sync_max_elapsed_ns));
-        statsPrintf("  Gen  1      concurrent"
+        statsPrintf("  Gen %2d      concurrent"
                     ",             %6.3fs  %6.3fs     %3.4fs    %3.4fs\n",
+                    nonmoving_gen,
                     TimeToSecondsDbl(stats.nonmoving_gc_cpu_ns),
                     TimeToSecondsDbl(stats.nonmoving_gc_elapsed_ns),
                     TimeToSecondsDbl(stats.nonmoving_gc_elapsed_ns) / n_major_colls,
@@ -894,7 +892,7 @@ static void report_summary(const RTSSummaryStats* sum)
                 "(%d bound, %d peak workers (%d total), using -N%d)\n\n",
                 taskCount, sum->bound_task_count,
                 peakWorkerCount, workerCount,
-                n_capabilities);
+                getNumCapabilities());
 
     statsPrintf("  SPARKS: %" FMT_Word64
                 " (%" FMT_Word " converted, %" FMT_Word " overflowed, %"
@@ -951,7 +949,7 @@ static void report_summary(const RTSSummaryStats* sum)
                 sum->productivity_cpu_percent * 100,
                 sum->productivity_elapsed_percent * 100);
 
-    // See Note [Internal Counter Stats] for a description of the
+    // See Note [Internal Counters Stats] for a description of the
     // following counters. If you add a counter here, please remember
     // to update the Note.
     if (RtsFlags.MiscFlags.internalCounters) {
@@ -968,16 +966,6 @@ static void report_summary(const RTSSummaryStats* sum)
                     , col_width[1], "gc_alloc_block_sync"
                     , col_width[2], gc_alloc_block_sync.spin
                     , col_width[3], gc_alloc_block_sync.yield);
-        statsPrintf("%*s" "%*s" "%*" FMT_Word64 "%*" FMT_Word64 "\n"
-                    , col_width[0], ""
-                    , col_width[1], "gc_spin"
-                    , col_width[2], stats.gc_spin_spin
-                    , col_width[3], stats.gc_spin_yield);
-        statsPrintf("%*s" "%*s" "%*" FMT_Word64 "%*" FMT_Word64 "\n"
-                    , col_width[0], ""
-                    , col_width[1], "mut_spin"
-                    , col_width[2], stats.mut_spin_spin
-                    , col_width[3], stats.mut_spin_yield);
         statsPrintf("%*s" "%*s" "%*" FMT_Word64 "%*s\n"
                     , col_width[0], ""
                     , col_width[1], "whitehole_gc"
@@ -1008,8 +996,10 @@ static void report_summary(const RTSSummaryStats* sum)
 
         for (g = 0; g < RtsFlags.GcFlags.generations; g++) {
             int prefix_length = 0;
-            statsPrintf("%*s" "gen[%" FMT_Word32 "%n",
-                        col_width[0], "", g, &prefix_length);
+            prefix_length = statsPrintf("%*s" "gen[%" FMT_Word32,
+                        col_width[0], "", g);
+            if (prefix_length < 0)
+                prefix_length = 0;
             prefix_length -= col_width[0];
             int suffix_length = col_width[1] + prefix_length;
             suffix_length =
@@ -1027,12 +1017,12 @@ static void report_summary(const RTSSummaryStats* sum)
                     , col_width[2], stats.any_work);
         statsPrintf("%*s" "%*s" "%*" FMT_Word64 "\n"
                     , col_width[0], ""
-                    , col_width[1], "no_work"
-                    , col_width[2], stats.no_work);
-        statsPrintf("%*s" "%*s" "%*" FMT_Word64 "\n"
-                    , col_width[0], ""
                     , col_width[1], "scav_find_work"
                     , col_width[2], stats.scav_find_work);
+        statsPrintf("%*s" "%*s" "%*" FMT_Word64 "\n"
+                    , col_width[0], ""
+                    , col_width[1], "max_n_todo_overflow"
+                    , col_width[2], stats.max_n_todo_overflow);
 #elif defined(THREADED_RTS) // THREADED_RTS && PROF_SPIN
         statsPrintf("Internal Counters require the RTS to be built "
                 "with PROF_SPIN"); // PROF_SPIN is not #defined here
@@ -1143,7 +1133,7 @@ static void report_machine_readable (const RTSSummaryStats * sum)
     MR_STAT("work_balance", "f", sum->work_balance);
 
     // next, globals (other than internal counters)
-    MR_STAT("n_capabilities", FMT_Word32, n_capabilities);
+    MR_STAT("n_capabilities", FMT_Word32, getNumCapabilities());
     MR_STAT("task_count", FMT_Word32, taskCount);
     MR_STAT("peak_worker_count", FMT_Word32, peakWorkerCount);
     MR_STAT("worker_count", FMT_Word32, workerCount);
@@ -1154,10 +1144,6 @@ static void report_machine_readable (const RTSSummaryStats * sum)
     MR_STAT("gc_alloc_block_sync_yield", FMT_Word64,
             gc_alloc_block_sync.yield);
     MR_STAT("gc_alloc_block_sync_spin", FMT_Word64, gc_alloc_block_sync.spin);
-    MR_STAT("gc_spin_spin", FMT_Word64, stats.gc_spin_spin);
-    MR_STAT("gc_spin_yield", FMT_Word64, stats.gc_spin_yield);
-    MR_STAT("mut_spin_spin", FMT_Word64, stats.mut_spin_spin);
-    MR_STAT("mut_spin_yield", FMT_Word64, stats.mut_spin_yield);
     MR_STAT("waitForGcThreads_spin", FMT_Word64, waitForGcThreads_spin);
     MR_STAT("waitForGcThreads_yield", FMT_Word64,
             waitForGcThreads_yield);
@@ -1172,10 +1158,10 @@ static void report_machine_readable (const RTSSummaryStats * sum)
             whitehole_threadPaused_spin);
     MR_STAT("any_work", FMT_Word64,
             stats.any_work);
-    MR_STAT("no_work", FMT_Word64,
-            stats.no_work);
     MR_STAT("scav_find_work", FMT_Word64,
             stats.scav_find_work);
+    MR_STAT("max_n_todo_overflow", FMT_Word64,
+            stats.max_n_todo_overflow);
 #endif // PROF_SPIN
 #endif // THREADED_RTS
 
@@ -1290,7 +1276,7 @@ stat_exitReport (void)
             Time exit_gc_cpu     = stats.gc_cpu_ns - start_exit_gc_cpu;
             Time exit_gc_elapsed = stats.gc_elapsed_ns - start_exit_gc_elapsed;
 
-            ASSERT(exit_gc_elapsed > 0);
+            WARN(exit_gc_elapsed > 0);
 
             sum.exit_cpu_ns     = end_exit_cpu
                                       - start_exit_cpu
@@ -1299,7 +1285,7 @@ stat_exitReport (void)
                                        - start_exit_elapsed
                                        - exit_gc_elapsed;
 
-            ASSERT(sum.exit_elapsed_ns >= 0);
+            WARN(sum.exit_elapsed_ns >= 0);
 
             stats.mutator_cpu_ns     = start_exit_cpu
                                  - end_init_cpu
@@ -1309,7 +1295,7 @@ stat_exitReport (void)
                                  - end_init_elapsed
                                  - (stats.gc_elapsed_ns - exit_gc_elapsed);
 
-            ASSERT(stats.mutator_elapsed_ns >= 0);
+            WARN(stats.mutator_elapsed_ns >= 0);
 
             if (stats.mutator_cpu_ns < 0) { stats.mutator_cpu_ns = 0; }
 
@@ -1317,7 +1303,7 @@ stat_exitReport (void)
             // and subtracting, so the parts should add up to the total exactly.
             // Note that stats->total_ns is captured a tiny bit later than
             // end_exit_elapsed, so we don't use it here.
-            ASSERT(stats.init_elapsed_ns // INIT
+            WARN(stats.init_elapsed_ns // INIT
                    + stats.mutator_elapsed_ns // MUT
                    + stats.gc_elapsed_ns // GC
                    + sum.exit_elapsed_ns // EXIT
@@ -1334,7 +1320,7 @@ stat_exitReport (void)
 
             // This assertion is probably not necessary; make sure the
             // subdivision with PROF also makes sense
-            ASSERT(stats.init_elapsed_ns // INIT
+            WARN(stats.init_elapsed_ns // INIT
                    + stats.mutator_elapsed_ns // MUT
                    + stats.gc_elapsed_ns // GC
                    + sum.exit_elapsed_ns // EXIT
@@ -1362,15 +1348,15 @@ stat_exitReport (void)
     #if defined(THREADED_RTS)
             sum.bound_task_count = taskCount - workerCount;
 
-            for (uint32_t i = 0; i < n_capabilities; i++) {
-                sum.sparks.created   += capabilities[i]->spark_stats.created;
-                sum.sparks.dud       += capabilities[i]->spark_stats.dud;
+            for (uint32_t i = 0; i < getNumCapabilities(); i++) {
+                sum.sparks.created   += getCapability(i)->spark_stats.created;
+                sum.sparks.dud       += getCapability(i)->spark_stats.dud;
                 sum.sparks.overflowed+=
-                  capabilities[i]->spark_stats.overflowed;
+                  getCapability(i)->spark_stats.overflowed;
                 sum.sparks.converted +=
-                  capabilities[i]->spark_stats.converted;
-                sum.sparks.gcd       += capabilities[i]->spark_stats.gcd;
-                sum.sparks.fizzled   += capabilities[i]->spark_stats.fizzled;
+                  getCapability(i)->spark_stats.converted;
+                sum.sparks.gcd       += getCapability(i)->spark_stats.gcd;
+                sum.sparks.fizzled   += getCapability(i)->spark_stats.fizzled;
             }
 
             sum.sparks_count = sum.sparks.created
@@ -1416,7 +1402,7 @@ stat_exitReport (void)
                                 - sum.exit_cpu_ns)
                 / TimeToSecondsDbl(stats.cpu_ns);
 
-            ASSERT(sum.productivity_cpu_percent >= 0);
+            WARN(sum.productivity_cpu_percent >= 0);
 
             sum.productivity_elapsed_percent =
                 TimeToSecondsDbl(stats.elapsed_ns
@@ -1425,7 +1411,7 @@ stat_exitReport (void)
                                 - sum.exit_elapsed_ns)
                 / TimeToSecondsDbl(stats.elapsed_ns);
 
-            ASSERT(sum.productivity_elapsed_percent >= 0);
+            WARN(sum.productivity_elapsed_percent >= 0);
 
             for(uint32_t g = 0; g < RtsFlags.GcFlags.generations; ++g) {
                 const generation* gen = &generations[g];
@@ -1481,7 +1467,7 @@ stat_exitReport (void)
     RELEASE_LOCK(&all_tasks_mutex);
 }
 
-void stat_exit()
+void stat_exit(void)
 {
 #if defined(THREADED_RTS)
         closeMutex(&stats_mutex);
@@ -1489,7 +1475,7 @@ void stat_exit()
 }
 
 /* Note [Work Balance]
-----------------------
+~~~~~~~~~~~~~~~~~~~~~~
 Work balance is a measure of how evenly the work done during parallel garbage
 collection is spread across threads. To compute work balance we must take care
 to account for the number of GC threads changing between GCs. The statistics we
@@ -1567,8 +1553,8 @@ See #13830
 */
 
 /*
-Note [Internal Counter Stats]
------------------------------
+Note [Internal Counters Stats]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 What do the counts at the end of a '+RTS -s --internal-counters' report mean?
 They are detailed below. Most of these counters are used by multiple threads
 with no attempt at synchronisation. This means that reported values  may be
@@ -1587,9 +1573,6 @@ Actual SpinLocks:
 * gc_alloc_block:
     This SpinLock protects the block allocator and free list manager. See
     BlockAlloc.c.
-* gc_spin and mut_spin:
-    These SpinLocks are used to herd gc worker threads during parallel garbage
-    collection. See gcWorkerThread, wakeup_gc_threads and releaseGCThreads.
 * gen[g].sync:
     These SpinLocks, one per generation, protect the generations[g] data
     structure during garbage collection.
@@ -1605,7 +1588,6 @@ don't. We count these white-hole spins and include them in the SpinLocks table.
 If a particular loop does not yield, we put "n/a" in the table. They are named
 for the function that has the spinning loop except that several loops in the
 garbage collector accumulate into whitehole_gc.
-TODO: Should these counters be more or less granular?
 
 white-hole spin counters:
 * whitehole_gc
@@ -1613,19 +1595,17 @@ white-hole spin counters:
 * whitehole_executeMessage
 * whitehole_threadPaused
 
-
-We count the number of calls of several functions in the parallel garbage
-collector.
+We have several stats allowing us to observe the internals of the parallel
+garbage collector:
 
 Parallel garbage collector counters:
 * any_work:
-    A cheap function called whenever a gc_thread is ready for work. Does
-    not do any work.
-* no_work:
-    Incremented whenever any_work finds no work.
+    Incremented whenever a parallel GC looks for work to steal.
 * scav_find_work:
-    Called to do work when any_work return true.
-
+    Counts iterations of scavenge loop
+* max_n_todo_overflow:
+    Tracks the maximum length of todo_overflow lists in the gc_thread structure.
+    See comment in grab_local_todo_block.
 */
 
 /* -----------------------------------------------------------------------------
@@ -1667,11 +1647,11 @@ statDescribeGens(void)
       gen_blocks = genLiveBlocks(gen);
 
       mut = 0;
-      for (i = 0; i < n_capabilities; i++) {
-          mut += countOccupied(capabilities[i]->mut_lists[g]);
+      for (i = 0; i < getNumCapabilities(); i++) {
+          mut += countOccupied(getCapability(i)->mut_lists[g]);
 
           // Add the pinned object block.
-          bd = capabilities[i]->pinned_object_block;
+          bd = getCapability(i)->pinned_object_block;
           if (bd != NULL) {
               gen_live   += bd->free - bd->start;
               gen_blocks += bd->blocks;
@@ -1739,19 +1719,21 @@ void getRTSStats( RTSStats *s )
    Dumping stuff in the stats file, or via the debug message interface
    -------------------------------------------------------------------------- */
 
-void
+int
 statsPrintf( char *s, ... )
 {
+    int ret = 0;
     FILE *sf = RtsFlags.GcFlags.statsFile;
     va_list ap;
 
     va_start(ap,s);
     if (sf == NULL) {
-        vdebugBelch(s,ap);
+        ret = vdebugBelch(s,ap);
     } else {
-        vfprintf(sf, s, ap);
+        ret = vfprintf(sf, s, ap);
     }
     va_end(ap);
+    return ret;
 }
 
 static void

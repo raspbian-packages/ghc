@@ -2,13 +2,17 @@
 (c) The University of Glasgow 2006
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
 
-
-Loading interface files
 -}
 
-{-# LANGUAGE CPP, BangPatterns, RecordWildCards, NondecreasingIndentation #-}
+{-# LANGUAGE BangPatterns, NondecreasingIndentation #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE FlexibleContexts #-}
+
 {-# OPTIONS_GHC -fno-warn-orphans #-}
+{-# LANGUAGE ViewPatterns #-}
+
+-- | Loading interface files
 module GHC.Iface.Load (
         -- Importing one thing
         tcLookupImported_maybe, importDecl,
@@ -17,77 +21,102 @@ module GHC.Iface.Load (
         -- RnM/TcM functions
         loadModuleInterface, loadModuleInterfaces,
         loadSrcInterface, loadSrcInterface_maybe,
-        loadInterfaceForName, loadInterfaceForNameMaybe, loadInterfaceForModule,
+        loadInterfaceForName, loadInterfaceForModule,
 
         -- IfM functions
         loadInterface,
         loadSysInterface, loadUserInterface, loadPluginInterface,
         findAndReadIface, readIface, writeIface,
-        loadDecls,      -- Should move to GHC.IfaceToCore and be renamed
-        initExternalPackageState,
         moduleFreeHolesPrecise,
         needWiredInHomeIface, loadWiredInHomeIface,
 
         pprModIfaceSimple,
-        ifaceStats, pprModIface, showIface
-   ) where
+        ifaceStats, pprModIface, showIface,
 
-#include "HsVersions.h"
+        module Iface_Errors -- avoids boot files in Ppr modules
+   ) where
 
 import GHC.Prelude
 
-import {-# SOURCE #-} GHC.IfaceToCore
-   ( tcIfaceDecl, tcIfaceRules, tcIfaceInst, tcIfaceFamInst
-   , tcIfaceAnnotations, tcIfaceCompleteSigs )
+import GHC.Platform.Profile
 
+import {-# SOURCE #-} GHC.IfaceToCore
+   ( tcIfaceDecls, tcIfaceRules, tcIfaceInst, tcIfaceFamInst
+   , tcIfaceAnnotations, tcIfaceCompleteMatches )
+
+import GHC.Driver.Config.Finder
+import GHC.Driver.Env
+import GHC.Driver.Errors.Types
 import GHC.Driver.Session
 import GHC.Driver.Hooks
 import GHC.Driver.Plugins
 
 import GHC.Iface.Syntax
+import GHC.Iface.Ext.Fields
+import GHC.Iface.Binary
+import GHC.Iface.Rename
 import GHC.Iface.Env
-import GHC.Driver.Types
+import GHC.Iface.Errors as Iface_Errors
 
-import GHC.Types.Basic hiding (SuccessFlag(..))
+import GHC.Tc.Errors.Types
 import GHC.Tc.Utils.Monad
 
 import GHC.Utils.Binary   ( BinData(..) )
+import GHC.Utils.Error
+import GHC.Utils.Outputable as Outputable
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
+import GHC.Utils.Constants (debugIsOn)
+import GHC.Utils.Logger
+import GHC.Utils.Trace
+
 import GHC.Settings.Constants
+
 import GHC.Builtin.Names
 import GHC.Builtin.Utils
 import GHC.Builtin.PrimOps    ( allThePrimOps, primOpFixity, primOpOcc )
-import GHC.Types.Id.Make      ( seqId, EnableBignumRules(..) )
+
 import GHC.Core.Rules
 import GHC.Core.TyCon
-import GHC.Types.Annotations
 import GHC.Core.InstEnv
 import GHC.Core.FamInstEnv
+
+import GHC.Types.Id.Make      ( seqId )
+import GHC.Types.Annotations
 import GHC.Types.Name
+import GHC.Types.Name.Cache
 import GHC.Types.Name.Env
 import GHC.Types.Avail
-import GHC.Unit.Module
-import GHC.Unit.State
-import GHC.Data.Maybe
-import GHC.Utils.Error
-import GHC.Driver.Finder
-import GHC.Types.Unique.FM
-import GHC.Types.SrcLoc
-import GHC.Utils.Outputable as Outputable
-import GHC.Iface.Binary
-import GHC.Utils.Panic
-import GHC.Utils.Misc
-import GHC.Data.FastString
-import GHC.Utils.Fingerprint
-import GHC.Types.FieldLabel
-import GHC.Iface.Rename
+import GHC.Types.Fixity
+import GHC.Types.Fixity.Env
+import GHC.Types.SourceError
+import GHC.Types.SourceText
+import GHC.Types.SourceFile
+import GHC.Types.SafeHaskell
+import GHC.Types.TypeEnv
 import GHC.Types.Unique.DSet
+import GHC.Types.SrcLoc
+import GHC.Types.TyThing
+import GHC.Types.PkgQual
+
+import GHC.Unit.External
+import GHC.Unit.Module
+import GHC.Unit.Module.Warnings
+import GHC.Unit.Module.ModIface
+import GHC.Unit.Module.Deps
+import GHC.Unit.State
+import GHC.Unit.Home
+import GHC.Unit.Home.ModInfo
+import GHC.Unit.Finder
+import GHC.Unit.Env
+
+import GHC.Data.Maybe
 
 import Control.Monad
-import Control.Exception
-import Data.IORef
 import Data.Map ( toList )
 import System.FilePath
 import System.Directory
+import GHC.Driver.Env.KnotVars
 
 {-
 ************************************************************************
@@ -115,16 +144,16 @@ where the code that e1 expands to might import some defns that
 also turn out to be needed by the code that e2 expands to.
 -}
 
-tcLookupImported_maybe :: Name -> TcM (MaybeErr MsgDoc TyThing)
+tcLookupImported_maybe :: Name -> TcM (MaybeErr SDoc TyThing)
 -- Returns (Failed err) if we can't find the interface file for the thing
 tcLookupImported_maybe name
   = do  { hsc_env <- getTopEnv
-        ; mb_thing <- liftIO (lookupTypeHscEnv hsc_env name)
+        ; mb_thing <- liftIO (lookupType hsc_env name)
         ; case mb_thing of
             Just thing -> return (Succeeded thing)
             Nothing    -> tcImportDecl_maybe name }
 
-tcImportDecl_maybe :: Name -> TcM (MaybeErr MsgDoc TyThing)
+tcImportDecl_maybe :: Name -> TcM (MaybeErr SDoc TyThing)
 -- Entry point for *source-code* uses of importDecl
 tcImportDecl_maybe name
   | Just thing <- wiredInNameTyThing_maybe name
@@ -135,15 +164,16 @@ tcImportDecl_maybe name
   | otherwise
   = initIfaceTcRn (importDecl name)
 
-importDecl :: Name -> IfM lcl (MaybeErr MsgDoc TyThing)
+importDecl :: Name -> IfM lcl (MaybeErr SDoc TyThing)
 -- Get the TyThing for this Name from an interface file
 -- It's not a wired-in thing -- the caller caught that
 importDecl name
-  = ASSERT( not (isWiredInName name) )
-    do  { traceIf nd_doc
+  = assert (not (isWiredInName name)) $
+    do  { logger <- getLogger
+        ; liftIO $ trace_if logger nd_doc
 
         -- Load the interface, which should populate the PTE
-        ; mb_iface <- ASSERT2( isExternalName name, ppr name )
+        ; mb_iface <- assertPpr (isExternalName name) (ppr name) $
                       loadInterface nd_doc (nameModule name) ImportBySystem
         ; case mb_iface of {
                 Failed err_msg  -> return (Failed err_msg) ;
@@ -165,7 +195,7 @@ importDecl name
                                 text "Use -ddump-if-trace to get an idea of which file caused the error"])
     found_things_msg eps =
         hang (text "Found the following declarations in" <+> ppr (nameModule name) <> colon)
-           2 (vcat (map ppr $ filter is_interesting $ nameEnvElts $ eps_PTE eps))
+           2 (vcat (map ppr $ filter is_interesting $ nonDetNameEnvElts $ eps_PTE eps))
       where
         is_interesting thing = nameModule name == nameModule (getName thing)
 
@@ -214,8 +244,9 @@ checkWiredInTyCon tc
   = return ()
   | otherwise
   = do  { mod <- getModule
-        ; traceIf (text "checkWiredInTyCon" <+> ppr tc_name $$ ppr mod)
-        ; ASSERT( isExternalName tc_name )
+        ; logger <- getLogger
+        ; liftIO $ trace_if logger (text "checkWiredInTyCon" <+> ppr tc_name $$ ppr mod)
+        ; assert (isExternalName tc_name )
           when (mod /= nameModule tc_name)
                (initIfaceTcRn (loadWiredInHomeIface tc_name))
                 -- Don't look for (non-existent) Float.hi when
@@ -238,7 +269,7 @@ ifCheckWiredInThing thing
                 -- the HPT, so without the test we'll demand-load it into the PIT!
                 -- C.f. the same test in checkWiredInTyCon above
         ; let name = getName thing
-        ; ASSERT2( isExternalName name, ppr name )
+        ; assertPpr (isExternalName name) (ppr name) $
           when (needWiredInHomeIface thing && mod /= nameModule name)
                (loadWiredInHomeIface name) }
 
@@ -263,21 +294,21 @@ needWiredInHomeIface _           = False
 loadSrcInterface :: SDoc
                  -> ModuleName
                  -> IsBootInterface     -- {-# SOURCE #-} ?
-                 -> Maybe FastString    -- "package", if any
+                 -> PkgQual             -- "package", if any
                  -> RnM ModIface
 
 loadSrcInterface doc mod want_boot maybe_pkg
   = do { res <- loadSrcInterface_maybe doc mod want_boot maybe_pkg
        ; case res of
-           Failed err      -> failWithTc err
+           Failed err      -> failWithTc (TcRnUnknownMessage $ mkPlainError noHints err)
            Succeeded iface -> return iface }
 
 -- | Like 'loadSrcInterface', but returns a 'MaybeErr'.
 loadSrcInterface_maybe :: SDoc
                        -> ModuleName
                        -> IsBootInterface     -- {-# SOURCE #-} ?
-                       -> Maybe FastString    -- "package", if any
-                       -> RnM (MaybeErr MsgDoc ModIface)
+                       -> PkgQual             -- "package", if any
+                       -> RnM (MaybeErr SDoc ModIface)
 
 loadSrcInterface_maybe doc mod want_boot maybe_pkg
   -- We must first find which Module this import refers to.  This involves
@@ -285,12 +316,12 @@ loadSrcInterface_maybe doc mod want_boot maybe_pkg
   -- and create a ModLocation.  If successful, loadIface will read the
   -- interface; it will call the Finder again, but the ModLocation will be
   -- cached from the first search.
-  = do { hsc_env <- getTopEnv
-       ; res <- liftIO $ findImportedModule hsc_env mod maybe_pkg
-       ; case res of
+  = do hsc_env <- getTopEnv
+       res <- liftIO $ findImportedModule hsc_env mod maybe_pkg
+       case res of
            Found _ mod -> initIfaceTcRn $ loadInterface doc mod (ImportByUser want_boot)
            -- TODO: Make sure this error message is good
-           err         -> return (Failed (cannotFindModule (hsc_dflags hsc_env) mod err)) }
+           err         -> return (Failed (cannotFindModule hsc_env mod err))
 
 -- | Load interface directly for a fully qualified 'Module'.  (This is a fairly
 -- rare operation, but in particular it is used to load orphan modules
@@ -314,18 +345,9 @@ loadInterfaceForName :: SDoc -> Name -> TcRn ModIface
 loadInterfaceForName doc name
   = do { when debugIsOn $  -- Check pre-condition
          do { this_mod <- getModule
-            ; MASSERT2( not (nameIsLocalOrFrom this_mod name), ppr name <+> parens doc ) }
-      ; ASSERT2( isExternalName name, ppr name )
+            ; massertPpr (not (nameIsLocalOrFrom this_mod name)) (ppr name <+> parens doc) }
+      ; assertPpr (isExternalName name) (ppr name) $
         initIfaceTcRn $ loadSysInterface doc (nameModule name) }
-
--- | Only loads the interface for external non-local names.
-loadInterfaceForNameMaybe :: SDoc -> Name -> TcRn (Maybe ModIface)
-loadInterfaceForNameMaybe doc name
-  = do { this_mod <- getModule
-       ; if nameIsLocalOrFrom this_mod name || not (isExternalName name)
-         then return Nothing
-         else Just <$> (initIfaceTcRn $ loadSysInterface doc (nameModule name))
-       }
 
 -- | Loads the interface for a given Module.
 loadInterfaceForModule :: SDoc -> Module -> TcRn ModIface
@@ -334,7 +356,7 @@ loadInterfaceForModule doc m
     -- Should not be called with this module
     when debugIsOn $ do
       this_mod <- getModule
-      MASSERT2( this_mod /= m, ppr m <+> parens doc )
+      massertPpr (this_mod /= m) (ppr m <+> parens doc)
     initIfaceTcRn $ loadSysInterface doc m
 
 {-
@@ -354,7 +376,7 @@ loadInterfaceForModule doc m
 -- See Note [Loading instances for wired-in things]
 loadWiredInHomeIface :: Name -> IfM lcl ()
 loadWiredInHomeIface name
-  = ASSERT( isWiredInName name )
+  = assert (isWiredInName name) $
     do _ <- loadSysInterface doc (nameModule name); return ()
   where
     doc = text "Need home interface for wired-in thing" <+> ppr name
@@ -379,11 +401,14 @@ loadPluginInterface doc mod_name
 -- | A wrapper for 'loadInterface' that throws an exception if it fails
 loadInterfaceWithException :: SDoc -> Module -> WhereFrom -> IfM lcl ModIface
 loadInterfaceWithException doc mod_name where_from
-  = withException (loadInterface doc mod_name where_from)
+  = do
+    dflags <- getDynFlags
+    let ctx = initSDocContext dflags defaultUserStyle
+    withException ctx (loadInterface doc mod_name where_from)
 
 ------------------
 loadInterface :: SDoc -> Module -> WhereFrom
-              -> IfM lcl (MaybeErr MsgDoc ModIface)
+              -> IfM lcl (MaybeErr SDoc ModIface)
 
 -- loadInterface looks in both the HPT and PIT for the required interface
 -- If not found, it loads it, and puts it in the PIT (always).
@@ -400,20 +425,24 @@ loadInterface :: SDoc -> Module -> WhereFrom
 loadInterface doc_str mod from
   | isHoleModule mod
   -- Hole modules get special treatment
-  = do dflags <- getDynFlags
+  = do hsc_env <- getTopEnv
+       let home_unit = hsc_home_unit hsc_env
        -- Redo search for our local hole module
-       loadInterface doc_str (mkHomeModule dflags (moduleName mod)) from
+       loadInterface doc_str (mkHomeModule home_unit (moduleName mod)) from
   | otherwise
-  = withTimingSilentD (text "loading interface") (pure ()) $
-    do  {       -- Read the state
-          (eps,hpt) <- getEpsAndHpt
+  = do
+    logger <- getLogger
+    withTimingSilent logger (text "loading interface") (pure ()) $ do
+        {       -- Read the state
+          (eps,hug) <- getEpsAndHug
         ; gbl_env <- getGblEnv
 
-        ; traceIf (text "Considering whether to load" <+> ppr mod <+> ppr from)
+        ; liftIO $ trace_if logger (text "Considering whether to load" <+> ppr mod <+> ppr from)
 
                 -- Check whether we have the interface already
-        ; dflags <- getDynFlags
-        ; case lookupIfaceByModule hpt (eps_PIT eps) mod of {
+        ; hsc_env <- getTopEnv
+        ; let mhome_unit = ue_homeUnit (hsc_unit_env hsc_env)
+        ; case lookupIfaceByModule hug (eps_PIT eps) mod of {
             Just iface
                 -> return (Succeeded iface) ;   -- Already loaded
                         -- The (src_imp == mi_boot iface) test checks that the already-loaded
@@ -422,9 +451,11 @@ loadInterface doc_str mod from
             _ -> do {
 
         -- READ THE MODULE IN
-        ; read_result <- case (wantHiBootFile dflags eps mod from) of
+        ; read_result <- case wantHiBootFile mhome_unit eps mod from of
                            Failed err             -> return (Failed err)
-                           Succeeded hi_boot_file -> computeInterface doc_str hi_boot_file mod
+                           Succeeded hi_boot_file -> do
+                             hsc_env <- getTopEnv
+                             liftIO $ computeInterface hsc_env doc_str hi_boot_file mod
         ; case read_result of {
             Failed err -> do
                 { let fake_iface = emptyFullModIface mod
@@ -449,9 +480,9 @@ loadInterface doc_str mod from
         let
             loc_doc = text loc
         in
-        initIfaceLcl (mi_semantic_module iface) loc_doc (mi_boot iface) $ do
+        initIfaceLcl (mi_semantic_module iface) loc_doc (mi_boot iface) $
 
-        dontLeakTheHPT $ do
+        dontLeakTheHUG $ do
 
         --      Load the new ModIface into the External Package State
         -- Even home-package interfaces loaded by loadInterface
@@ -464,18 +495,26 @@ loadInterface doc_str mod from
         --      IfaceDecls, IfaceClsInst, IfaceFamInst, IfaceRules,
         -- out of the ModIface and put them into the big EPS pools
 
-        -- NB: *first* we do loadDecl, so that the provenance of all the locally-defined
+        -- NB: *first* we do tcIfaceDecls, so that the provenance of all the locally-defined
         ---    names is done correctly (notably, whether this is an .hi file or .hi-boot file).
         --     If we do loadExport first the wrong info gets into the cache (unless we
         --      explicitly tag each export which seems a bit of a bore)
 
+        -- Crucial assertion that checks if you are trying to load a HPT module into the EPS.
+        -- If you start loading HPT modules into the EPS then you get strange errors about
+        -- overlapping instances.
+        ; massertPpr
+              ((isOneShot (ghcMode (hsc_dflags hsc_env)))
+                || moduleUnitId mod `notElem` hsc_all_home_unit_ids hsc_env
+                || mod == gHC_PRIM)
+                (text "Attempting to load home package interface into the EPS" $$ ppr hug $$ doc_str $$ ppr mod $$ ppr (moduleUnitId mod))
         ; ignore_prags      <- goptM Opt_IgnoreInterfacePragmas
-        ; new_eps_decls     <- loadDecls ignore_prags (mi_decls iface)
+        ; new_eps_decls     <- tcIfaceDecls ignore_prags (mi_decls iface)
         ; new_eps_insts     <- mapM tcIfaceInst (mi_insts iface)
         ; new_eps_fam_insts <- mapM tcIfaceFamInst (mi_fam_insts iface)
         ; new_eps_rules     <- tcIfaceRules ignore_prags (mi_rules iface)
         ; new_eps_anns      <- tcIfaceAnnotations (mi_anns iface)
-        ; new_eps_complete_sigs <- tcIfaceCompleteSigs (mi_complete_sigs iface)
+        ; new_eps_complete_matches <- tcIfaceCompleteMatches (mi_complete_matches iface)
 
         ; let { final_iface = iface {
                                 mi_decls     = panic "No mi_decls in PIT",
@@ -486,14 +525,15 @@ loadInterface doc_str mod from
                               }
                }
 
-        ; let bad_boot = mi_boot iface == IsBoot && fmap fst (if_rec_types gbl_env) == Just mod
+        ; let bad_boot = mi_boot iface == IsBoot
+                          && isJust (lookupKnotVars (if_rec_types gbl_env) mod)
                             -- Warn against an EPS-updating import
                             -- of one's own boot file! (one-shot only)
                             -- See Note [Loading your own hi-boot file]
 
-        ; WARN( bad_boot, ppr mod )
+        ; warnPprTrace bad_boot "loadInterface" (ppr mod) $
           updateEps_  $ \ eps ->
-           if elemModuleEnv mod (eps_PIT eps) || is_external_sig dflags iface
+           if elemModuleEnv mod (eps_PIT eps) || is_external_sig mhome_unit iface
                 then eps
            else if bad_boot
                 -- See Note [Loading your own hi-boot file]
@@ -505,9 +545,7 @@ loadInterface doc_str mod from
                   eps_rule_base    = extendRuleBaseList (eps_rule_base eps)
                                                         new_eps_rules,
                   eps_complete_matches
-                                   = extendCompleteMatchMap
-                                         (eps_complete_matches eps)
-                                         new_eps_complete_sigs,
+                                   = eps_complete_matches eps ++ new_eps_complete_matches,
                   eps_inst_env     = extendInstEnvList (eps_inst_env eps)
                                                        new_eps_insts,
                   eps_fam_inst_env = extendFamInstEnvList (eps_fam_inst_env eps)
@@ -530,7 +568,7 @@ loadInterface doc_str mod from
 
         ; -- invoke plugins with *full* interface, not final_iface, to ensure
           -- that plugins have access to declarations, etc.
-          res <- withPlugins dflags (\p -> interfaceLoadAction p) iface
+          res <- withPlugins (hsc_plugins hsc_env) (\p -> interfaceLoadAction p) iface
         ; return (Succeeded res)
     }}}}
 
@@ -584,11 +622,21 @@ We know that none of the interfaces below here can refer to
 home-package modules however, so it's safe for the HPT to be empty.
 -}
 
-dontLeakTheHPT :: IfL a -> IfL a
-dontLeakTheHPT thing_inside = do
+-- Note [GHC Heap Invariants]
+dontLeakTheHUG :: IfL a -> IfL a
+dontLeakTheHUG thing_inside = do
+  env <- getTopEnv
   let
-    cleanTopEnv HscEnv{..} =
+    inOneShot =
+      isOneShot (ghcMode (hsc_dflags env))
+    cleanGblEnv gbl_env
+      | inOneShot = gbl_env
+      | otherwise = gbl_env { if_rec_types = emptyKnotVars }
+    cleanTopEnv hsc_env =
+
        let
+         !maybe_type_vars | inOneShot = Just (hsc_type_env_vars env)
+                          | otherwise = Nothing
          -- wrinkle: when we're typechecking in --backpack mode, the
          -- instantiation of a signature might reside in the HPT, so
          -- this case breaks the assumption that EPS interfaces only
@@ -597,32 +645,41 @@ dontLeakTheHPT thing_inside = do
          -- contains any hole modules.
          -- Quite a few tests in testsuite/tests/backpack break without this
          -- tweak.
+         old_unit_env = hsc_unit_env hsc_env
          keepFor20509 hmi
           | isHoleModule (mi_semantic_module (hm_iface hmi)) = True
           | otherwise = False
-         !hpt | anyHpt keepFor20509 hsc_HPT  = hsc_HPT
-              | otherwise = emptyHomePackageTable
+         pruneHomeUnitEnv hme = hme { homeUnitEnv_hpt = emptyHomePackageTable }
+         !unit_env
+          = old_unit_env
+             { ue_home_unit_graph = if anyHpt keepFor20509 (ue_hpt old_unit_env) then ue_home_unit_graph old_unit_env
+                                                                                 else unitEnv_map pruneHomeUnitEnv (ue_home_unit_graph old_unit_env)
+             }
        in
-       HscEnv {  hsc_targets      = panic "cleanTopEnv: hsc_targets"
-              ,  hsc_mod_graph    = panic "cleanTopEnv: hsc_mod_graph"
-              ,  hsc_IC           = panic "cleanTopEnv: hsc_IC"
-              ,  hsc_HPT          = hpt
-              , .. }
+       hsc_env {  hsc_targets      = panic "cleanTopEnv: hsc_targets"
+               ,  hsc_mod_graph    = panic "cleanTopEnv: hsc_mod_graph"
+               ,  hsc_IC           = panic "cleanTopEnv: hsc_IC"
+               ,  hsc_type_env_vars = case maybe_type_vars of
+                                          Just vars -> vars
+                                          Nothing -> panic "cleanTopEnv: hsc_type_env_vars"
+               ,  hsc_unit_env     = unit_env
+               }
 
-  updTopEnv cleanTopEnv $ do
+  updTopEnv cleanTopEnv $ updGblEnv cleanGblEnv $ do
   !_ <- getTopEnv        -- force the updTopEnv
+  !_ <- getGblEnv
   thing_inside
 
 
 -- | Returns @True@ if a 'ModIface' comes from an external package.
 -- In this case, we should NOT load it into the EPS; the entities
 -- should instead come from the local merged signature interface.
-is_external_sig :: DynFlags -> ModIface -> Bool
-is_external_sig dflags iface =
+is_external_sig :: Maybe HomeUnit -> ModIface -> Bool
+is_external_sig mhome_unit iface =
     -- It's a signature iface...
     mi_semantic_module iface /= mi_module iface &&
     -- and it's not from the local package
-    moduleUnit (mi_module iface) /= homeUnit dflags
+    notHomeModuleMaybe mhome_unit (mi_module iface)
 
 -- | This is an improved version of 'findAndReadIface' which can also
 -- handle the case when a user requests @p[A=<B>]:M@ but we only
@@ -638,27 +695,28 @@ is_external_sig dflags iface =
 -- apply to the requirement itself; e.g., @p[A=<A>]:A@ does not require
 -- A.hi to be up-to-date (and indeed, we MUST NOT attempt to read A.hi, unless
 -- we are actually typechecking p.)
-computeInterface ::
-       SDoc -> IsBootInterface -> Module
-    -> TcRnIf gbl lcl (MaybeErr MsgDoc (ModIface, FilePath))
-computeInterface doc_str hi_boot_file mod0 = do
-    MASSERT( not (isHoleModule mod0) )
-    dflags <- getDynFlags
-    case getModuleInstantiation mod0 of
-        (imod, Just indef) | homeUnitIsIndefinite dflags -> do
-            r <- findAndReadIface doc_str imod mod0 hi_boot_file
-            case r of
-                Succeeded (iface0, path) -> do
-                    hsc_env <- getTopEnv
-                    r <- liftIO $
-                        rnModIface hsc_env (instUnitInsts (moduleUnit indef))
-                                   Nothing iface0
-                    case r of
-                        Right x -> return (Succeeded (x, path))
-                        Left errs -> liftIO . throwIO . mkSrcErr $ errs
-                Failed err -> return (Failed err)
-        (mod, _) ->
-            findAndReadIface doc_str mod mod0 hi_boot_file
+computeInterface
+  :: HscEnv
+  -> SDoc
+  -> IsBootInterface
+  -> Module
+  -> IO (MaybeErr SDoc (ModIface, FilePath))
+computeInterface hsc_env doc_str hi_boot_file mod0 = do
+  massert (not (isHoleModule mod0))
+  let mhome_unit  = hsc_home_unit_maybe hsc_env
+  let find_iface m = findAndReadIface hsc_env doc_str
+                                      m mod0 hi_boot_file
+  case getModuleInstantiation mod0 of
+      (imod, Just indef)
+        | Just home_unit <- mhome_unit
+        , isHomeUnitIndefinite home_unit ->
+          find_iface imod >>= \case
+            Succeeded (iface0, path) ->
+              rnModIface hsc_env (instUnitInsts (moduleUnit indef)) Nothing iface0 >>= \case
+                Right x   -> return (Succeeded (x, path))
+                Left errs -> throwErrors (GhcTcRnMessage <$> errs)
+            Failed err -> return (Failed err)
+      (mod, _) -> find_iface mod
 
 -- | Compute the signatures which must be compiled in order to
 -- load the interface for a 'Module'.  The output of this function
@@ -671,16 +729,17 @@ computeInterface doc_str hi_boot_file mod0 = do
 -- @p[A=\<A>,B=\<B>]:B@ never includes B.
 moduleFreeHolesPrecise
     :: SDoc -> Module
-    -> TcRnIf gbl lcl (MaybeErr MsgDoc (UniqDSet ModuleName))
+    -> TcRnIf gbl lcl (MaybeErr SDoc (UniqDSet ModuleName))
 moduleFreeHolesPrecise doc_str mod
  | moduleIsDefinite mod = return (Succeeded emptyUniqDSet)
  | otherwise =
    case getModuleInstantiation mod of
     (imod, Just indef) -> do
+        logger <- getLogger
         let insts = instUnitInsts (moduleUnit indef)
-        traceIf (text "Considering whether to load" <+> ppr mod <+>
+        liftIO $ trace_if logger (text "Considering whether to load" <+> ppr mod <+>
                  text "to compute precise free module holes")
-        (eps, hpt) <- getEpsAndHpt
+        (eps, hpt) <- getEpsAndHug
         case tryEpsAndHpt eps hpt `firstJust` tryDepsCache eps imod insts of
             Just r -> return (Succeeded r)
             Nothing -> readAndCache imod insts
@@ -693,7 +752,10 @@ moduleFreeHolesPrecise doc_str mod
             Just ifhs  -> Just (renameFreeHoles ifhs insts)
             _otherwise -> Nothing
     readAndCache imod insts = do
-        mb_iface <- findAndReadIface (text "moduleFreeHolesPrecise" <+> doc_str) imod mod NotBoot
+        hsc_env <- getTopEnv
+        mb_iface <- liftIO $ findAndReadIface hsc_env
+                                              (text "moduleFreeHolesPrecise" <+> doc_str)
+                                              imod mod NotBoot
         case mb_iface of
             Succeeded (iface, _) -> do
                 let ifhs = mi_free_holes iface
@@ -703,13 +765,13 @@ moduleFreeHolesPrecise doc_str mod
                 return (Succeeded (renameFreeHoles ifhs insts))
             Failed err -> return (Failed err)
 
-wantHiBootFile :: DynFlags -> ExternalPackageState -> Module -> WhereFrom
-               -> MaybeErr MsgDoc IsBootInterface
+wantHiBootFile :: Maybe HomeUnit -> ExternalPackageState -> Module -> WhereFrom
+               -> MaybeErr SDoc IsBootInterface
 -- Figure out whether we want Foo.hi or Foo.hi-boot
-wantHiBootFile dflags eps mod from
+wantHiBootFile mhome_unit eps mod from
   = case from of
        ImportByUser usr_boot
-          | usr_boot == IsBoot && not this_package
+          | usr_boot == IsBoot && notHomeModuleMaybe mhome_unit mod
           -> Failed (badSourceImport mod)
           | otherwise -> Succeeded usr_boot
 
@@ -717,26 +779,26 @@ wantHiBootFile dflags eps mod from
           -> Succeeded NotBoot
 
        ImportBySystem
-          | not this_package   -- If the module to be imported is not from this package
-          -> Succeeded NotBoot -- don't look it up in eps_is_boot, because that is keyed
-                               -- on the ModuleName of *home-package* modules only.
-                               -- We never import boot modules from other packages!
+          | notHomeModuleMaybe mhome_unit mod
+          -> Succeeded NotBoot
+             -- If the module to be imported is not from this package
+             -- don't look it up in eps_is_boot, because that is keyed
+             -- on the ModuleName of *home-package* modules only.
+             -- We never import boot modules from other packages!
 
           | otherwise
-          -> case lookupUFM (eps_is_boot eps) (moduleName mod) of
+          -> case lookupInstalledModuleEnv (eps_is_boot eps) (toUnitId <$> mod) of
                 Just (GWIB { gwib_isBoot = is_boot }) ->
                   Succeeded is_boot
                 Nothing ->
                   Succeeded NotBoot
                      -- The boot-ness of the requested interface,
                      -- based on the dependencies in directly-imported modules
-  where
-    this_package = homeUnit dflags == moduleUnit mod
 
 badSourceImport :: Module -> SDoc
 badSourceImport mod
   = hang (text "You cannot {-# SOURCE #-} import a module from another package")
-       2 (text "but" <+> quotes (ppr mod) <+> ptext (sLit "is from package")
+       2 (text "but" <+> quotes (ppr mod) <+> text "is from package"
           <+> quotes (ppr (moduleUnit mod)))
 
 -----------------------------------------------------
@@ -755,110 +817,6 @@ badSourceImport mod
 addDeclsToPTE :: PackageTypeEnv -> [(Name,TyThing)] -> PackageTypeEnv
 addDeclsToPTE pte things = extendNameEnvList pte things
 
-loadDecls :: Bool
-          -> [(Fingerprint, IfaceDecl)]
-          -> IfL [(Name,TyThing)]
-loadDecls ignore_prags ver_decls
-   = concatMapM (loadDecl ignore_prags) ver_decls
-
-loadDecl :: Bool                    -- Don't load pragmas into the decl pool
-          -> (Fingerprint, IfaceDecl)
-          -> IfL [(Name,TyThing)]   -- The list can be poked eagerly, but the
-                                    -- TyThings are forkM'd thunks
-loadDecl ignore_prags (_version, decl)
-  = do  {       -- Populate the name cache with final versions of all
-                -- the names associated with the decl
-          let main_name = ifName decl
-
-        -- Typecheck the thing, lazily
-        -- NB. Firstly, the laziness is there in case we never need the
-        -- declaration (in one-shot mode), and secondly it is there so that
-        -- we don't look up the occurrence of a name before calling mk_new_bndr
-        -- on the binder.  This is important because we must get the right name
-        -- which includes its nameParent.
-
-        ; thing <- forkM doc $ do { bumpDeclStats main_name
-                                  ; tcIfaceDecl ignore_prags decl }
-
-        -- Populate the type environment with the implicitTyThings too.
-        --
-        -- Note [Tricky iface loop]
-        -- ~~~~~~~~~~~~~~~~~~~~~~~~
-        -- Summary: The delicate point here is that 'mini-env' must be
-        -- buildable from 'thing' without demanding any of the things
-        -- 'forkM'd by tcIfaceDecl.
-        --
-        -- In more detail: Consider the example
-        --      data T a = MkT { x :: T a }
-        -- The implicitTyThings of T are:  [ <datacon MkT>, <selector x>]
-        -- (plus their workers, wrappers, coercions etc etc)
-        --
-        -- We want to return an environment
-        --      [ "MkT" -> <datacon MkT>, "x" -> <selector x>, ... ]
-        -- (where the "MkT" is the *Name* associated with MkT, etc.)
-        --
-        -- We do this by mapping the implicit_names to the associated
-        -- TyThings.  By the invariant on ifaceDeclImplicitBndrs and
-        -- implicitTyThings, we can use getOccName on the implicit
-        -- TyThings to make this association: each Name's OccName should
-        -- be the OccName of exactly one implicitTyThing.  So the key is
-        -- to define a "mini-env"
-        --
-        -- [ 'MkT' -> <datacon MkT>, 'x' -> <selector x>, ... ]
-        -- where the 'MkT' here is the *OccName* associated with MkT.
-        --
-        -- However, there is a subtlety: due to how type checking needs
-        -- to be staged, we can't poke on the forkM'd thunks inside the
-        -- implicitTyThings while building this mini-env.
-        -- If we poke these thunks too early, two problems could happen:
-        --    (1) When processing mutually recursive modules across
-        --        hs-boot boundaries, poking too early will do the
-        --        type-checking before the recursive knot has been tied,
-        --        so things will be type-checked in the wrong
-        --        environment, and necessary variables won't be in
-        --        scope.
-        --
-        --    (2) Looking up one OccName in the mini_env will cause
-        --        others to be looked up, which might cause that
-        --        original one to be looked up again, and hence loop.
-        --
-        -- The code below works because of the following invariant:
-        -- getOccName on a TyThing does not force the suspended type
-        -- checks in order to extract the name. For example, we don't
-        -- poke on the "T a" type of <selector x> on the way to
-        -- extracting <selector x>'s OccName. Of course, there is no
-        -- reason in principle why getting the OccName should force the
-        -- thunks, but this means we need to be careful in
-        -- implicitTyThings and its helper functions.
-        --
-        -- All a bit too finely-balanced for my liking.
-
-        -- This mini-env and lookup function mediates between the
-        --'Name's n and the map from 'OccName's to the implicit TyThings
-        ; let mini_env = mkOccEnv [(getOccName t, t) | t <- implicitTyThings thing]
-              lookup n = case lookupOccEnv mini_env (getOccName n) of
-                           Just thing -> thing
-                           Nothing    ->
-                             pprPanic "loadDecl" (ppr main_name <+> ppr n $$ ppr (decl))
-
-        ; implicit_names <- mapM lookupIfaceTop (ifaceDeclImplicitBndrs decl)
-
---         ; traceIf (text "Loading decl for " <> ppr main_name $$ ppr implicit_names)
-        ; return $ (main_name, thing) :
-                      -- uses the invariant that implicit_names and
-                      -- implicitTyThings are bijective
-                      [(n, lookup n) | n <- implicit_names]
-        }
-  where
-    doc = text "Declaration for" <+> ppr (ifName decl)
-
-bumpDeclStats :: Name -> IfL ()         -- Record that one more declaration has actually been used
-bumpDeclStats name
-  = do  { traceIf (text "Loading decl for" <+> ppr name)
-        ; updateEps_ (\eps -> let stats = eps_stats eps
-                              in eps { eps_stats = stats { n_decls_out = n_decls_out stats + 1 } })
-        }
-
 {-
 *********************************************************
 *                                                      *
@@ -871,7 +829,7 @@ Note [Home module load error]
 If the sought-for interface is in the current package (as determined
 by -package-name flag) then it jolly well should already be in the HPT
 because we process home-package modules in dependency order.  (Except
-in one-shot mode; see notes with hsc_HPT decl in GHC.Driver.Types).
+in one-shot mode; see notes with hsc_HPT decl in GHC.Driver.Env).
 
 It is possible (though hard) to get this error through user behaviour.
   * Suppose package P (modules P1, P2) depends on package Q (modules Q1,
@@ -886,24 +844,29 @@ This actually happened with P=base, Q=ghc-prim, via the AMP warnings.
 See #8320.
 -}
 
-findAndReadIface :: SDoc
-                 -- The unique identifier of the on-disk module we're
-                 -- looking for
-                 -> InstalledModule
-                 -- The *actual* module we're looking for.  We use
-                 -- this to check the consistency of the requirements
-                 -- of the module we read out.
-                 -> Module
-                 -> IsBootInterface     -- True  <=> Look for a .hi-boot file
-                                        -- False <=> Look for .hi file
-                 -> TcRnIf gbl lcl (MaybeErr MsgDoc (ModIface, FilePath))
-        -- Nothing <=> file not found, or unreadable, or illegible
-        -- Just x  <=> successfully found and parsed
+findAndReadIface
+  :: HscEnv
+  -> SDoc            -- ^ Reason for loading the iface (used for tracing)
+  -> InstalledModule -- ^ The unique identifier of the on-disk module we're looking for
+  -> Module          -- ^ The *actual* module we're looking for.  We use
+                     -- this to check the consistency of the requirements of the
+                     -- module we read out.
+  -> IsBootInterface -- ^ Looking for .hi-boot or .hi file
+  -> IO (MaybeErr SDoc (ModIface, FilePath))
+findAndReadIface hsc_env doc_str mod wanted_mod hi_boot_file = do
 
-        -- It *doesn't* add an error to the monad, because
-        -- sometimes it's ok to fail... see notes with loadInterface
-findAndReadIface doc_str mod wanted_mod_with_insts hi_boot_file
-  = do traceIf (sep [hsep [text "Reading",
+  let profile = targetProfile dflags
+      unit_state = hsc_units hsc_env
+      fc         = hsc_FC hsc_env
+      name_cache = hsc_NC hsc_env
+      mhome_unit  = hsc_home_unit_maybe hsc_env
+      dflags     = hsc_dflags hsc_env
+      logger     = hsc_logger hsc_env
+      hooks      = hsc_hooks hsc_env
+      other_fopts = initFinderOpts . homeUnitEnv_dflags <$> (hsc_HUG hsc_env)
+
+
+  trace_if logger (sep [hsep [text "Reading",
                            if hi_boot_file == IsBoot
                              then text "[boot]"
                              else Outputable.empty,
@@ -911,139 +874,131 @@ findAndReadIface doc_str mod wanted_mod_with_insts hi_boot_file
                            ppr mod <> semi],
                      nest 4 (text "reason:" <+> doc_str)])
 
-       -- Check for GHC.Prim, and return its static interface
-       -- TODO: make this check a function
-       if mod `installedModuleEq` gHC_PRIM
-           then do
-               iface <- getHooked ghcPrimIfaceHook ghcPrimIface
-               return (Succeeded (iface,
-                                   "<built in interface for GHC.Prim>"))
-           else do
-               dflags <- getDynFlags
-               -- Look for the file
-               hsc_env <- getTopEnv
-               mb_found <- liftIO (findExactModule hsc_env mod)
-               case mb_found of
-                   InstalledFound loc mod -> do
-                       -- Found file, so read it
-                       let file_path = addBootSuffix_maybe hi_boot_file
-                                                           (ml_hi_file loc)
+  -- Check for GHC.Prim, and return its static interface
+  -- See Note [GHC.Prim] in primops.txt.pp.
+  -- TODO: make this check a function
+  if mod `installedModuleEq` gHC_PRIM
+      then do
+          let iface = case ghcPrimIfaceHook hooks of
+                       Nothing -> ghcPrimIface
+                       Just h  -> h
+          return (Succeeded (iface, "<built in interface for GHC.Prim>"))
+      else do
+          let fopts = initFinderOpts dflags
+          -- Look for the file
+          mb_found <- liftIO (findExactModule fc fopts other_fopts unit_state mhome_unit mod)
+          case mb_found of
+              InstalledFound (addBootSuffixLocn_maybe hi_boot_file -> loc) mod -> do
+                  -- See Note [Home module load error]
+                  case mhome_unit of
+                    Just home_unit
+                      | isHomeInstalledModule home_unit mod
+                      , not (isOneShot (ghcMode dflags))
+                      -> return (Failed (homeModError mod loc))
+                    _ -> do
+                        r <- read_file logger name_cache unit_state dflags wanted_mod (ml_hi_file loc)
+                        case r of
+                          Failed _
+                            -> return r
+                          Succeeded (iface,_fp)
+                            -> do
+                                r2 <- load_dynamic_too_maybe logger name_cache unit_state
+                                                         (setDynamicNow dflags) wanted_mod
+                                                         iface loc
+                                case r2 of
+                                  Failed sdoc -> return (Failed sdoc)
+                                  Succeeded {} -> return r
+              err -> do
+                  trace_if logger (text "...not found")
+                  return $ Failed $ cannotFindInterface
+                                      unit_state
+                                      mhome_unit
+                                      profile
+                                      (Iface_Errors.mayShowLocations dflags)
+                                      (moduleName mod)
+                                      err
 
-                       -- See Note [Home module load error]
-                       if moduleUnit mod `unitIdEq` homeUnit dflags &&
-                          not (isOneShot (ghcMode dflags))
-                           then return (Failed (homeModError mod loc))
-                           else do r <- read_file file_path
-                                   checkBuildDynamicToo r
-                                   return r
-                   err -> do
-                       traceIf (text "...not found")
-                       dflags <- getDynFlags
-                       return (Failed (cannotFindInterface dflags
-                                           (moduleName mod) err))
-    where read_file file_path = do
-              traceIf (text "readIFace" <+> text file_path)
-              -- Figure out what is recorded in mi_module.  If this is
-              -- a fully definite interface, it'll match exactly, but
-              -- if it's indefinite, the inside will be uninstantiated!
-              dflags <- getDynFlags
-              let wanted_mod =
-                    case getModuleInstantiation wanted_mod_with_insts of
-                        (_, Nothing) -> wanted_mod_with_insts
-                        (_, Just indef_mod) ->
-                          instModuleToModule (unitState dflags)
-                            (uninstantiateInstantiatedModule indef_mod)
-              read_result <- readIface wanted_mod file_path
-              case read_result of
-                Failed err -> return (Failed (badIfaceFile file_path err))
-                Succeeded iface -> return (Succeeded (iface, file_path))
-                            -- Don't forget to fill in the package name...
-          checkBuildDynamicToo (Succeeded (iface, filePath)) = do
-              dflags <- getDynFlags
-              -- Indefinite interfaces are ALWAYS non-dynamic, and
-              -- that's OK.
-              let is_definite_iface = moduleIsDefinite (mi_module iface)
-              when is_definite_iface $
-                whenGeneratingDynamicToo dflags $ withDoDynamicToo $ do
-                  let ref = canGenerateDynamicToo dflags
-                      dynFilePath = addBootSuffix_maybe hi_boot_file
-                                  $ replaceExtension filePath (dynHiSuf dflags)
-                  r <- read_file dynFilePath
-                  case r of
-                      Succeeded (dynIface, _)
-                       | mi_mod_hash (mi_final_exts iface) == mi_mod_hash (mi_final_exts dynIface) ->
-                          return ()
-                       | otherwise ->
-                          do traceIf (text "Dynamic hash doesn't match")
-                             liftIO $ writeIORef ref False
-                      Failed err ->
-                          do traceIf (text "Failed to load dynamic interface file:" $$ err)
-                             liftIO $ writeIORef ref False
-          checkBuildDynamicToo _ = return ()
+-- | Check if we need to try the dynamic interface for -dynamic-too
+load_dynamic_too_maybe :: Logger -> NameCache -> UnitState -> DynFlags -> Module -> ModIface -> ModLocation -> IO (MaybeErr SDoc ())
+load_dynamic_too_maybe logger name_cache unit_state dflags wanted_mod iface loc
+  -- Indefinite interfaces are ALWAYS non-dynamic.
+  | not (moduleIsDefinite (mi_module iface)) = return (Succeeded ())
+  | gopt Opt_BuildDynamicToo dflags = load_dynamic_too logger name_cache unit_state dflags wanted_mod iface loc
+  | otherwise = return (Succeeded ())
+
+load_dynamic_too :: Logger -> NameCache -> UnitState -> DynFlags -> Module -> ModIface -> ModLocation -> IO (MaybeErr SDoc ())
+load_dynamic_too logger name_cache unit_state dflags wanted_mod iface loc = do
+  read_file logger name_cache unit_state dflags wanted_mod (ml_dyn_hi_file loc) >>= \case
+    Succeeded (dynIface, _)
+     | mi_mod_hash (mi_final_exts iface) == mi_mod_hash (mi_final_exts dynIface)
+     -> return (Succeeded ())
+     | otherwise ->
+        do return $ (Failed $ dynamicHashMismatchError wanted_mod loc)
+    Failed err ->
+        do return $ (Failed $ ((text "Failed to load dynamic interface file for" <+> ppr wanted_mod <> colon) $$ err))
+
+
+dynamicHashMismatchError :: Module -> ModLocation -> SDoc
+dynamicHashMismatchError wanted_mod loc  =
+  vcat [ text "Dynamic hash doesn't match for" <+> quotes (ppr wanted_mod)
+       , text "Normal interface file from"  <+> text (ml_hi_file loc)
+       , text "Dynamic interface file from" <+> text (ml_dyn_hi_file loc)
+       , text "You probably need to recompile" <+> quotes (ppr wanted_mod) ]
+
+
+read_file :: Logger -> NameCache -> UnitState -> DynFlags -> Module -> FilePath -> IO (MaybeErr SDoc (ModIface, FilePath))
+read_file logger name_cache unit_state dflags wanted_mod file_path = do
+  trace_if logger (text "readIFace" <+> text file_path)
+
+  -- Figure out what is recorded in mi_module.  If this is
+  -- a fully definite interface, it'll match exactly, but
+  -- if it's indefinite, the inside will be uninstantiated!
+  let wanted_mod' =
+        case getModuleInstantiation wanted_mod of
+            (_, Nothing) -> wanted_mod
+            (_, Just indef_mod) ->
+              instModuleToModule unit_state
+                (uninstantiateInstantiatedModule indef_mod)
+  read_result <- readIface dflags name_cache wanted_mod' file_path
+  case read_result of
+    Failed err -> return (Failed (badIfaceFile file_path err))
+    Succeeded iface -> return (Succeeded (iface, file_path))
+                -- Don't forget to fill in the package name...
+
 
 -- | Write interface file
-writeIface :: DynFlags -> FilePath -> ModIface -> IO ()
-writeIface dflags hi_file_path new_iface
+writeIface :: Logger -> Profile -> FilePath -> ModIface -> IO ()
+writeIface logger profile hi_file_path new_iface
     = do createDirectoryIfMissing True (takeDirectory hi_file_path)
-         writeBinIface dflags hi_file_path new_iface
+         let printer = TraceBinIFace (debugTraceMsg logger 3)
+         writeBinIface profile printer hi_file_path new_iface
 
--- @readIface@ tries just the one file.
-readIface :: Module -> FilePath
-          -> TcRnIf gbl lcl (MaybeErr MsgDoc ModIface)
-        -- Failed err    <=> file not found, or unreadable, or illegible
-        -- Succeeded iface <=> successfully found and parsed
+-- | @readIface@ tries just the one file.
+--
+-- Failed err    <=> file not found, or unreadable, or illegible
+-- Succeeded iface <=> successfully found and parsed
+readIface
+  :: DynFlags
+  -> NameCache
+  -> Module
+  -> FilePath
+  -> IO (MaybeErr SDoc ModIface)
+readIface dflags name_cache wanted_mod file_path = do
+  let profile = targetProfile dflags
+  res <- tryMost $ readBinIface profile name_cache CheckHiWay QuietBinIFace file_path
+  case res of
+    Right iface
+        -- NB: This check is NOT just a sanity check, it is
+        -- critical for correctness of recompilation checking
+        -- (it lets us tell when -this-unit-id has changed.)
+        | wanted_mod == actual_mod
+                        -> return (Succeeded iface)
+        | otherwise     -> return (Failed err)
+        where
+          actual_mod = mi_module iface
+          err = hiModuleNameMismatchWarn wanted_mod actual_mod
 
-readIface wanted_mod file_path
-  = do  { res <- tryMostM $
-                 readBinIface CheckHiWay QuietBinIFaceReading file_path
-        ; case res of
-            Right iface
-                -- NB: This check is NOT just a sanity check, it is
-                -- critical for correctness of recompilation checking
-                -- (it lets us tell when -this-unit-id has changed.)
-                | wanted_mod == actual_mod
-                                -> return (Succeeded iface)
-                | otherwise     -> return (Failed err)
-                where
-                  actual_mod = mi_module iface
-                  err = hiModuleNameMismatchWarn wanted_mod actual_mod
-
-            Left exn    -> return (Failed (text (showException exn)))
-    }
-
-{-
-*********************************************************
-*                                                       *
-        Wired-in interface for GHC.Prim
-*                                                       *
-*********************************************************
--}
-
-initExternalPackageState :: DynFlags -> ExternalPackageState
-initExternalPackageState dflags
-  = EPS {
-      eps_is_boot          = emptyUFM,
-      eps_PIT              = emptyPackageIfaceTable,
-      eps_free_holes       = emptyInstalledModuleEnv,
-      eps_PTE              = emptyTypeEnv,
-      eps_inst_env         = emptyInstEnv,
-      eps_fam_inst_env     = emptyFamInstEnv,
-      eps_rule_base        = mkRuleBase builtinRules',
-        -- Initialise the EPS rule pool with the built-in rules
-      eps_mod_fam_inst_env
-                           = emptyModuleEnv,
-      eps_complete_matches = emptyUFM,
-      eps_ann_env          = emptyAnnEnv,
-      eps_stats = EpsStats { n_ifaces_in = 0, n_decls_in = 0, n_decls_out = 0
-                           , n_insts_in = 0, n_insts_out = 0
-                           , n_rules_in = length builtinRules', n_rules_out = 0 }
-    }
-    where
-      enableBignumRules
-         | homeUnitId dflags == primUnitId   = EnableBignumRules False
-         | homeUnitId dflags == bignumUnitId = EnableBignumRules False
-         | otherwise                         = EnableBignumRules True
-      builtinRules' = builtinRules enableBignumRules
+    Left exn    -> return (Failed (text (showException exn)))
 
 {-
 *********************************************************
@@ -1053,6 +1008,7 @@ initExternalPackageState dflags
 *********************************************************
 -}
 
+-- See Note [GHC.Prim] in primops.txt.pp.
 ghcPrimIface :: ModIface
 ghcPrimIface
   = empty_iface {
@@ -1060,12 +1016,12 @@ ghcPrimIface
         mi_decls    = [],
         mi_fixities = fixities,
         mi_final_exts = (mi_final_exts empty_iface){ mi_fix_fn = mkIfaceFixCache fixities },
-        mi_decl_docs = ghcPrimDeclDocs -- See Note [GHC.Prim Docs]
+        mi_docs = Just ghcPrimDeclDocs -- See Note [GHC.Prim Docs]
         }
   where
     empty_iface = emptyFullModIface gHC_PRIM
 
-    -- The fixities listed here for @`seq`@ or @->@ should match
+    -- The fixity listed here for @`seq`@ should match
     -- those in primops.txt.pp (from which Haddock docs are generated).
     fixities = (getOccName seqId, Fixity NoSourceText 0 InfixR)
              : mapMaybe mkFixity allThePrimOps
@@ -1112,31 +1068,39 @@ For some background on this choice see trac #15269.
 -}
 
 -- | Read binary interface, and print it out
-showIface :: HscEnv -> FilePath -> IO ()
-showIface hsc_env filename = do
+showIface :: Logger -> DynFlags -> UnitState -> NameCache -> FilePath -> IO ()
+showIface logger dflags unit_state name_cache filename = do
+   let profile = targetProfile dflags
+       printer = logMsg logger MCOutput noSrcSpan . withPprStyle defaultDumpStyle
+
    -- skip the hi way check; we don't want to worry about profiled vs.
    -- non-profiled interfaces, for example.
-   iface <- initTcRnIf 's' hsc_env () () $
-       readBinIface IgnoreHiWay TraceBinIFaceReading filename
-   let dflags = hsc_dflags hsc_env
-       -- See Note [Name qualification with --show-iface]
+   iface <- readBinIface profile name_cache IgnoreHiWay (TraceBinIFace printer) filename
+
+   let -- See Note [Name qualification with --show-iface]
        qualifyImportedNames mod _
            | mod == mi_module iface = NameUnqual
            | otherwise              = NameNotInScope1
        print_unqual = QueryQualify qualifyImportedNames
                                    neverQualifyModules
                                    neverQualifyPackages
-   putLogMsg dflags NoReason SevDump noSrcSpan
-      $ withPprStyle (mkDumpStyle print_unqual) (pprModIface iface)
+   logMsg logger MCDump noSrcSpan
+      $ withPprStyle (mkDumpStyle print_unqual)
+      $ pprModIface unit_state iface
 
--- Show a ModIface but don't display details; suitable for ModIfaces stored in
+-- | Show a ModIface but don't display details; suitable for ModIfaces stored in
 -- the EPT.
-pprModIfaceSimple :: ModIface -> SDoc
-pprModIfaceSimple iface = ppr (mi_module iface) $$ pprDeps (mi_deps iface) $$ nest 2 (vcat (map pprExport (mi_exports iface)))
+pprModIfaceSimple :: UnitState -> ModIface -> SDoc
+pprModIfaceSimple unit_state iface =
+    ppr (mi_module iface)
+    $$ pprDeps unit_state (mi_deps iface)
+    $$ nest 2 (vcat (map pprExport (mi_exports iface)))
 
-pprModIface :: ModIface -> SDoc
--- Show a ModIface
-pprModIface iface@ModIface{ mi_final_exts = exts }
+-- | Show a ModIface
+--
+-- The UnitState is used to pretty-print units
+pprModIface :: UnitState -> ModIface -> SDoc
+pprModIface unit_state iface@ModIface{ mi_final_exts = exts }
  = vcat [ text "interface"
                 <+> ppr (mi_module iface) <+> pp_hsc_src (mi_hsc_src iface)
                 <+> (if mi_orphan exts then text "[orphan module]" else Outputable.empty)
@@ -1151,12 +1115,13 @@ pprModIface iface@ModIface{ mi_final_exts = exts }
         , nest 2 (text "opt_hash:" <+> ppr (mi_opt_hash exts))
         , nest 2 (text "hpc_hash:" <+> ppr (mi_hpc_hash exts))
         , nest 2 (text "plugin_hash:" <+> ppr (mi_plugin_hash exts))
+        , nest 2 (text "src_hash:" <+> ppr (mi_src_hash iface))
         , nest 2 (text "sig of:" <+> ppr (mi_sig_of iface))
         , nest 2 (text "used TH splices:" <+> ppr (mi_used_th iface))
         , nest 2 (text "where")
         , text "exports:"
         , nest 2 (vcat (map pprExport (mi_exports iface)))
-        , pprDeps (mi_deps iface)
+        , pprDeps unit_state (mi_deps iface)
         , vcat (map pprUsage (mi_usages iface))
         , vcat (map pprIfaceAnnotation (mi_anns iface))
         , pprFixities (mi_fixities iface)
@@ -1167,10 +1132,8 @@ pprModIface iface@ModIface{ mi_final_exts = exts }
         , ppr (mi_warns iface)
         , pprTrustInfo (mi_trust iface)
         , pprTrustPkg (mi_trust_pkg iface)
-        , vcat (map ppr (mi_complete_sigs iface))
-        , text "module header:" $$ nest 2 (ppr (mi_doc_hdr iface))
-        , text "declaration docs:" $$ nest 2 (ppr (mi_decl_docs iface))
-        , text "arg docs:" $$ nest 2 (ppr (mi_arg_docs iface))
+        , vcat (map ppr (mi_complete_matches iface))
+        , text "docs:" $$ nest 2 (ppr (mi_docs iface))
         , text "extensible fields:" $$ nest 2 (pprExtensibleFields (mi_ext_fields iface))
         ]
   where
@@ -1186,21 +1149,22 @@ When printing export lists, we print like this:
 -}
 
 pprExport :: IfaceExport -> SDoc
-pprExport (Avail n)         = ppr n
-pprExport (AvailTC _ [] []) = Outputable.empty
-pprExport (AvailTC n ns0 fs)
-  = case ns0 of
-      (n':ns) | n==n' -> ppr n <> pp_export ns fs
-      _               -> ppr n <> vbar <> pp_export ns0 fs
+pprExport (Avail n)      = ppr n
+pprExport (AvailTC _ []) = Outputable.empty
+pprExport avail@(AvailTC n _) =
+    ppr n <> mark <> pp_export (availSubordinateGreNames avail)
   where
-    pp_export []    [] = Outputable.empty
-    pp_export names fs = braces (hsep (map ppr names ++ map (ppr . flLabel) fs))
+    mark | availExportsDecl avail = Outputable.empty
+         | otherwise              = vbar
+
+    pp_export []    = Outputable.empty
+    pp_export names = braces (hsep (map ppr names))
 
 pprUsage :: Usage -> SDoc
 pprUsage usage@UsagePackageModule{}
   = pprUsageImport usage usg_mod
 pprUsage usage@UsageHomeModule{}
-  = pprUsageImport usage usg_mod_name $$
+  = pprUsageImport usage (\u -> mkModule (usg_unit_id u) (usg_mod_name u)) $$
     nest 2 (
         maybe Outputable.empty (\v -> text "exports: " <> ppr v) (usg_exports usage) $$
         vcat [ ppr n <+> ppr v | (n,v) <- usg_entities usage ]
@@ -1211,6 +1175,10 @@ pprUsage usage@UsageFile{}
           ppr (usg_file_hash usage)]
 pprUsage usage@UsageMergedRequirement{}
   = hsep [text "merged", ppr (usg_mod usage), ppr (usg_mod_hash usage)]
+pprUsage usage@UsageHomeModuleInterface{}
+  = hsep [text "implementation", ppr (usg_mod_name usage)
+                               , ppr (usg_unit_id usage)
+                               , ppr (usg_iface_hash usage)]
 
 pprUsageImport :: Outputable a => Usage -> (Usage -> a) -> SDoc
 pprUsageImport usage usg_mod'
@@ -1219,21 +1187,6 @@ pprUsageImport usage usg_mod'
     where
         safe | usg_safe usage = text "safe"
              | otherwise      = text " -/ "
-
-pprDeps :: Dependencies -> SDoc
-pprDeps (Deps { dep_mods = mods, dep_pkgs = pkgs, dep_orphs = orphs,
-                dep_finsts = finsts })
-  = vcat [text "module dependencies:" <+> fsep (map ppr_mod mods),
-          text "package dependencies:" <+> fsep (map ppr_pkg pkgs),
-          text "orphans:" <+> fsep (map ppr orphs),
-          text "family instance modules:" <+> fsep (map ppr finsts)
-        ]
-  where
-    ppr_mod (GWIB { gwib_mod = mod_name, gwib_isBoot = boot }) = ppr mod_name <+> ppr_boot boot
-    ppr_pkg (pkg,trust_req)  = ppr pkg <>
-                               (if trust_req then text "*" else Outputable.empty)
-    ppr_boot IsBoot  = text "[boot]"
-    ppr_boot NotBoot = Outputable.empty
 
 pprFixities :: [(OccName, Fixity)] -> SDoc
 pprFixities []    = Outputable.empty
@@ -1247,13 +1200,13 @@ pprTrustInfo trust = text "trusted:" <+> ppr trust
 pprTrustPkg :: Bool -> SDoc
 pprTrustPkg tpkg = text "require own pkg trusted:" <+> ppr tpkg
 
-instance Outputable Warnings where
+instance Outputable (Warnings pass) where
     ppr = pprWarns
 
-pprWarns :: Warnings -> SDoc
+pprWarns :: Warnings pass -> SDoc
 pprWarns NoWarnings         = Outputable.empty
 pprWarns (WarnAll txt)  = text "Warn all" <+> ppr txt
-pprWarns (WarnSome prs) = text "Warnings"
+pprWarns (WarnSome prs) = text "Warnings:"
                         <+> vcat (map pprWarning prs)
     where pprWarning (name, txt) = ppr name <+> ppr txt
 
@@ -1265,47 +1218,3 @@ pprExtensibleFields :: ExtensibleFields -> SDoc
 pprExtensibleFields (ExtensibleFields fs) = vcat . map pprField $ toList fs
   where
     pprField (name, (BinData size _data)) = text name <+> text "-" <+> ppr size <+> text "bytes"
-
-{-
-*********************************************************
-*                                                       *
-\subsection{Errors}
-*                                                       *
-*********************************************************
--}
-
-badIfaceFile :: String -> SDoc -> SDoc
-badIfaceFile file err
-  = vcat [text "Bad interface file:" <+> text file,
-          nest 4 err]
-
-hiModuleNameMismatchWarn :: Module -> Module -> MsgDoc
-hiModuleNameMismatchWarn requested_mod read_mod
- | moduleUnit requested_mod == moduleUnit read_mod =
-    sep [text "Interface file contains module" <+> quotes (ppr read_mod) <> comma,
-         text "but we were expecting module" <+> quotes (ppr requested_mod),
-         sep [text "Probable cause: the source code which generated interface file",
-             text "has an incompatible module name"
-            ]
-        ]
- | otherwise =
-  -- ToDo: This will fail to have enough qualification when the package IDs
-  -- are the same
-  withPprStyle (mkUserStyle alwaysQualify AllTheWay) $
-    -- we want the Modules below to be qualified with package names,
-    -- so reset the PrintUnqualified setting.
-    hsep [ text "Something is amiss; requested module "
-         , ppr requested_mod
-         , text "differs from name found in the interface file"
-         , ppr read_mod
-         , parens (text "if these names look the same, try again with -dppr-debug")
-         ]
-
-homeModError :: InstalledModule -> ModLocation -> SDoc
--- See Note [Home module load error]
-homeModError mod location
-  = text "attempting to use module " <> quotes (ppr mod)
-    <> (case ml_hs_file location of
-           Just file -> space <> parens (text file)
-           Nothing   -> Outputable.empty)
-    <+> text "which is not loaded"

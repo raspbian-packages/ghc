@@ -15,8 +15,10 @@ is not deterministic.
 -}
 
 {-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE DeriveTraversable #-}
+{-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
 {-# OPTIONS_GHC -Wall #-}
 
@@ -38,6 +40,7 @@ module GHC.Types.Unique.DFM (
         adjustUDFM_Directly,
         alterUDFM,
         mapUDFM,
+        mapMaybeUDFM,
         plusUDFM,
         plusUDFM_C,
         lookupUDFM, lookupUDFM_Directly,
@@ -54,6 +57,7 @@ module GHC.Types.Unique.DFM (
         listToUDFM, listToUDFM_Directly,
         udfmMinusUFM, ufmMinusUDFM,
         partitionUDFM,
+        udfmRestrictKeys,
         anyUDFM, allUDFM,
         pprUniqDFM, pprUDFM,
 
@@ -69,12 +73,12 @@ import GHC.Prelude
 import GHC.Types.Unique ( Uniquable(..), Unique, getKey )
 import GHC.Utils.Outputable
 
+import qualified Data.IntMap.Strict as MS
 import qualified Data.IntMap as M
 import Data.Data
 import Data.Functor.Classes (Eq1 (..))
 import Data.List (sortBy)
 import Data.Function (on)
-import qualified Data.Semigroup as Semi
 import GHC.Types.Unique.FM (UniqFM, nonDetUFMToList, ufmToIntMap, unsafeIntMapToUFM)
 import Unsafe.Coerce
 
@@ -119,9 +123,9 @@ import Unsafe.Coerce
 -- | A type of values tagged with insertion time
 data TaggedVal val =
   TaggedVal
-    val
+    !val
     {-# UNPACK #-} !Int -- ^ insertion time
-  deriving (Data, Functor)
+  deriving stock (Data, Functor, Foldable, Traversable)
 
 taggedFst :: TaggedVal val -> val
 taggedFst (TaggedVal v _) = v
@@ -172,12 +176,16 @@ addToUDFM m k v = addToUDFM_Directly m (getUnique k) v
 -- The new binding always goes to the right of existing ones
 addToUDFM_Directly :: UniqDFM key elt -> Unique -> elt -> UniqDFM key elt
 addToUDFM_Directly (UDFM m i) u v
-  = UDFM (M.insertWith tf (getKey u) (TaggedVal v i) m) (i + 1)
+  = UDFM (MS.insertWith tf (getKey u) (TaggedVal v i) m) (i + 1)
   where
     tf (TaggedVal new_v _) (TaggedVal _ old_i) = TaggedVal new_v old_i
       -- Keep the old tag, but insert the new value
       -- This means that udfmToList typically returns elements
       -- in the order of insertion, rather than the reverse
+
+      -- It is quite critical that the strict insertWith is used as otherwise
+      -- the combination function 'tf' is not forced and both old values are retained
+      -- in the map.
 
 addToUDFM_C_Directly
   :: (elt -> elt -> elt)   -- old -> new -> result
@@ -185,7 +193,7 @@ addToUDFM_C_Directly
   -> Unique -> elt
   -> UniqDFM key elt
 addToUDFM_C_Directly f (UDFM m i) u v
-  = UDFM (M.insertWith tf (getKey u) (TaggedVal v i) m) (i + 1)
+  = UDFM (MS.insertWith tf (getKey u) (TaggedVal v i) m) (i + 1)
     where
       tf (TaggedVal new_v _) (TaggedVal old_v old_i)
          = TaggedVal (f old_v new_v) old_i
@@ -303,6 +311,9 @@ filterUDFM_Directly p (UDFM m i) = UDFM (M.filterWithKey p' m) i
   where
   p' k (TaggedVal v _) = p (getUnique k) v
 
+udfmRestrictKeys :: UniqDFM key elt -> UniqDFM key elt2 -> UniqDFM key elt
+udfmRestrictKeys (UDFM a i) (UDFM b _) = UDFM (M.restrictKeys a (M.keysSet b)) i
+
 -- | Converts `UniqDFM` to a list, with elements in deterministic order.
 -- It's O(n log n) while the corresponding function on `UniqFM` is O(n).
 udfmToList :: UniqDFM key elt -> [(Unique, elt)]
@@ -397,20 +408,20 @@ alterUDFM f (UDFM m i) k =
 
 -- | Map a function over every value in a UniqDFM
 mapUDFM :: (elt1 -> elt2) -> UniqDFM key elt1 -> UniqDFM key elt2
-mapUDFM f (UDFM m i) = UDFM (M.map (fmap f) m) i
+mapUDFM f (UDFM m i) = UDFM (MS.map (fmap f) m) i
+-- Critical this is strict map, otherwise you get a big space leak when reloading
+-- in GHCi because all old ModDetails are retained (see pruneHomePackageTable).
+-- Modify with care.
+
+mapMaybeUDFM :: forall elt1 elt2 key.
+                (elt1 -> Maybe elt2) -> UniqDFM key elt1 -> UniqDFM key elt2
+mapMaybeUDFM f (UDFM m i) = UDFM (M.mapMaybe (traverse f) m) i
 
 anyUDFM :: (elt -> Bool) -> UniqDFM key elt -> Bool
 anyUDFM p (UDFM m _i) = M.foldr ((||) . p . taggedFst) False m
 
 allUDFM :: (elt -> Bool) -> UniqDFM key elt -> Bool
 allUDFM p (UDFM m _i) = M.foldr ((&&) . p . taggedFst) True m
-
-instance Semi.Semigroup (UniqDFM key a) where
-  (<>) = plusUDFM
-
-instance Monoid (UniqDFM key a) where
-  mempty = emptyUDFM
-  mappend = (Semi.<>)
 
 -- This should not be used in committed code, provided for convenience to
 -- make ad-hoc conversions when developing

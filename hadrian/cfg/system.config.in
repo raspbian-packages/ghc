@@ -15,6 +15,7 @@ ld             = @LdCmd@
 make           = @MakeCmd@
 nm             = @NmCmd@
 merge-objects  = @MergeObjsCmd@
+system-merge-objects = @LD_STAGE0@
 objdump        = @ObjdumpCmd@
 ranlib         = @REAL_RANLIB_CMD@
 sphinx-build   = @SPHINXBUILD@
@@ -27,6 +28,9 @@ patch          = @PatchCmd@
 xelatex        = @XELATEX@
 makeindex      = @MAKEINDEX@
 makeinfo       = @MAKEINFO@
+bourne-shell   = @SH@
+git            = @GIT@
+cabal          = @CABAL@
 
 # Python 3 is required to run test driver.
 # See: https://github.com/ghc/ghc/blob/master/testsuite/mk/boilerplate.mk#L220
@@ -35,9 +39,12 @@ python         = @PythonCmd@
 # Information about builders:
 #============================
 
-ar-supports-at-file = @ArSupportsAtFile@
-cc-llvm-backend     = @CcLlvmBackend@
-hs-cpp-args         = @HaskellCPPArgs@
+ar-supports-at-file       = @ArSupportsAtFile@
+system-ar-supports-at-file = @ArSupportsAtFile_STAGE0@
+ar-supports-dash-l        = @ArSupportsDashL@
+system-ar-supports-dash-l = @ArSupportsDashL_STAGE0@
+cc-llvm-backend           = @CcLlvmBackend@
+hs-cpp-args               = @HaskellCPPArgs@
 
 # Build options:
 #===============
@@ -84,8 +91,6 @@ ghc-patch-level       = @GhcPatchLevel@
 
 bootstrap-threaded-rts      = @GhcThreadedRts@
 
-supports-this-unit-id = @SUPPORTS_THIS_UNIT_ID@
-
 project-name          = @ProjectName@
 project-version       = @ProjectVersion@
 project-version-int   = @ProjectVersionInt@
@@ -93,8 +98,6 @@ project-patch-level   = @ProjectPatchLevel@
 project-patch-level1  = @ProjectPatchLevel1@
 project-patch-level2  = @ProjectPatchLevel2@
 project-git-commit-id = @ProjectGitCommitId@
-
-system-use-distro-mingw  = @SettingsUseDistroMINGW@
 
 # Compilation and linking flags:
 #===============================
@@ -141,6 +144,7 @@ ld-is-gnu-ld = @LdIsGNULd@
 ar-args = @ArArgs@
 
 settings-c-compiler-command = @SettingsCCompilerCommand@
+settings-cxx-compiler-command = @SettingsCxxCompilerCommand@
 settings-haskell-cpp-command = @SettingsHaskellCPPCommand@
 settings-haskell-cpp-flags = @SettingsHaskellCPPFlags@
 settings-c-compiler-flags = @SettingsCCompilerFlags@
@@ -162,6 +166,7 @@ settings-touch-command = @SettingsTouchCommand@
 settings-clang-command = @SettingsClangCommand@
 settings-llc-command = @SettingsLlcCommand@
 settings-opt-command = @SettingsOptCommand@
+settings-use-distro-mingw = @SettingsUseDistroMINGW@
 
 target-word-size = @TargetWordSize@
 target-word-big-endian = @TargetWordBigEndian@
@@ -169,12 +174,14 @@ target-has-gnu-nonexec-stack = @TargetHasGnuNonexecStack@
 target-has-ident-directive = @TargetHasIdentDirective@
 target-has-subsections-via-symbols = @TargetHasSubsectionsViaSymbols@
 target-has-rts-linker = @TargetHasRTSLinker@
+target-has-libm = @TargetHasLibm@
 target-arm-version    = @ARM_ISA@
 
 # Include and library directories:
 #=================================
 
-curses-lib-dir    = @CURSES_LIB_DIRS@
+curses-lib-dir     = @CURSES_LIB_DIRS@
+curses-include-dir = @CURSES_INCLUDE_DIRS@
 
 iconv-include-dir = @ICONV_INCLUDE_DIRS@
 iconv-lib-dir     = @ICONV_LIB_DIRS@
@@ -199,4 +206,3 @@ libnuma-lib-dir       = @LibNumaLibDir@
 
 with-libdw = @UseLibdw@
 with-libnuma = @UseLibNuma@
-have-lib-mingw-ex = @HaveLibMingwEx@

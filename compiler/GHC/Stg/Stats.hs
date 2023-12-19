@@ -21,18 +21,15 @@ The program gather statistics about
 \end{enumerate}
 -}
 
-{-# LANGUAGE CPP #-}
+
 
 module GHC.Stg.Stats ( showStgStats ) where
-
-#include "HsVersions.h"
 
 import GHC.Prelude
 
 import GHC.Stg.Syntax
 
 import GHC.Types.Id (Id)
-import GHC.Utils.Panic
 
 import Data.Map (Map)
 import qualified Data.Map as Map
@@ -125,7 +122,7 @@ statBinding top (StgRec pairs)
 
 statRhs :: Bool -> (Id, StgRhs) -> StatEnv
 
-statRhs top (_, StgRhsCon _ _ _)
+statRhs top (_, StgRhsCon _ _ _ _ _)
   = countOne (ConstructorBinds top)
 
 statRhs top (_, StgRhsClosure _ _ u _ body)
@@ -149,7 +146,7 @@ statExpr :: StgExpr -> StatEnv
 
 statExpr (StgApp _ _)     = countOne Applications
 statExpr (StgLit _)       = countOne Literals
-statExpr (StgConApp _ _ _)= countOne ConstructorApps
+statExpr (StgConApp {})   = countOne ConstructorApps
 statExpr (StgOpApp _ _ _) = countOne PrimitiveApps
 statExpr (StgTick _ e)    = statExpr e
 
@@ -167,7 +164,4 @@ statExpr (StgCase expr _ _ alts)
     stat_alts alts      `combineSE`
     countOne StgCases
   where
-    stat_alts alts
-        = combineSEs (map statExpr [ e | (_,_,e) <- alts ])
-
-statExpr (StgLam {}) = panic "statExpr StgLam"
+    stat_alts = combineSEs . fmap (statExpr . alt_rhs)

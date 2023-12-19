@@ -139,6 +139,11 @@ restrictions:
   Since the runtime has no facilities for tracking mutation of a
   ``MutableByteArray#``, these can be safely mutated in any foreign
   function.
+* Note that ``safe`` FFI calls don't take any measures to keep their
+  arguments alive while the called C function runs. For arguments
+  who's live time doesn't extend past the FFI call ``keepAlive#`` or a
+  ``StablePtr`` should be used to ensure the argument isn't garbage
+  collected before the call finishes.
 
 None of these restrictions are enforced at compile time. Failure
 to heed these restrictions will lead to runtime errors that can be
@@ -330,9 +335,10 @@ be annotated with ``interruptible`` instead of ``safe`` or ``unsafe``: ::
        "sleep" sleepBlock :: CUint -> IO CUint
 
 ``interruptible`` behaves exactly as ``safe``, except that when a
-``throwTo`` is directed at a thread in an interruptible foreign call, an
-OS-specific mechanism will be used to attempt to cause the foreign call
-to return:
+``throwTo`` is directed at a thread in an interruptible foreign call,
+irrespective of the masking state, the exception is added to the blocked
+exceptions queue of the target thread and an OS-specific mechanism will be
+used to attempt to cause the foreign call to return:
 
 Unix systems
     The thread making the foreign call is sent a ``SIGPIPE`` signal
@@ -348,7 +354,9 @@ Windows systems
 
 Once the system call is successfully interrupted, the surrounding
 code must return control out of the ``foreign import``, back into Haskell code,
-so that the ``throwTo`` Haskell exception can be raised there.
+so that any blocked exception can be raised if the masking state
+of the thread allows it. Being under mask gives the Haskell code an opportunity
+to detect and react to the interrupt error code from the c call.
 
 If the foreign code simply retries the system call directly without returning
 back to Haskell, then the intended effect of `interruptible` disappears
@@ -357,7 +365,7 @@ and functions like :base-ref:`System.Timeout.timeout` will not work.
 Finally, after the ``interruptible`` foreign call returns into Haskell, the
 Haskell code should allow exceptions to be raised
 (``Control.Exception``'s ``allowInterrupt``, or ``interruptible yield``
-for non-``-threaded``, see https://gitlab.haskell.org/ghc/ghc/issues/8684),
+for non-``-threaded``, see :ghc-ticket:`8684`),
 and implement the ``EINTR``-retrying in Haskell
 (e.g. using e.g. :base-ref:`Foreign.C.Error.throwErrnoIfMinus1Retry`).
 
@@ -387,7 +395,7 @@ The CAPI calling convention
 .. extension:: CApiFFI
     :shortdesc: Enable the CAPI calling convention.
 
-    :since: 7.10.1
+    :since: 7.6.1
 
 The ``CApiFFI`` extension allows a calling convention of ``capi`` to be
 used in foreign declarations, e.g. ::
@@ -694,8 +702,8 @@ C++. For example:
     #include "HsFFI.h"
 
     HsBool mylib_init(void){
-      int argc = 2;
-      char *argv[] = { "+RTS", "-A32m", NULL };
+      int argc = 3;
+      char *argv[] = { "mylib", "+RTS", "-A32m", NULL };
       char **pargv = argv;
 
       // Initialize Haskell runtime
@@ -800,15 +808,33 @@ Foreign imports and multi-threading
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 When you call a ``foreign import``\ ed function that is annotated as
-``safe`` (the default), and the program was linked using :ghc-flag:`-threaded`,
-then the call will run concurrently with other running Haskell threads.
-If the program was linked without :ghc-flag:`-threaded`, then the other Haskell
-threads will be blocked until the call returns.
+``safe`` (the default) in a single-threaded runtime (the program was linked
+without using :ghc-flag:`-threaded`), then other Haskell threads will be blocked
+until the call returns.
+
+In the multi-threaded runtime (the program was linked using :ghc-flag:`-threaded`),
+``foreign import``\ ed functions run concurrently (both ``safe`` and ``unsafe``),
+but a similar effect can happen when you call an ``unsafe`` function, and a global
+garbage collection is triggered in another thread. In this situation, the garbage
+collector cannot proceed, and this can lead to performance issues that often
+appear under high load, as other threads are more active and thus more prone
+to trigger global garbage collection.
 
 This means that if you need to make a foreign call to a function that
-takes a long time or blocks indefinitely, then you should mark it
+takes a long time or potentially blocks, then you should mark it
 ``safe`` and use :ghc-flag:`-threaded`. Some library functions make such calls
 internally; their documentation should indicate when this is the case.
+
+On the other hand, a foreign call to a function that is guaranteed to take a short
+time, and does not call back into Haskell can be marked ``unsafe``.  This works
+both for the single-threaded and the multi-threaded runtime. When considering
+what "a short time" is, a foreign function that does comparable work to what
+Haskell code does between each heap allocation (not very much), is a good
+candidate.
+
+Outside these two clear cases for ``safe`` and ``unsafe`` foreign functions,
+there is a trade-off between whole-program throughput and efficiency of the
+individual foreign function call.
 
 If you are making foreign calls from multiple Haskell threads and using
 :ghc-flag:`-threaded`, make sure that the foreign code you are calling is
@@ -1073,8 +1099,10 @@ Pinned Byte Arrays
 
 A pinned byte array is one that the garbage collector is not allowed
 to move. Consequently, it has a stable address that can be safely
-requested with ``byteArrayContents#``. There are a handful of
-primitive functions in :ghc-prim-ref:`GHC.Prim.`
+requested with ``byteArrayContents#``. Not that being pinned doesn't
+prevent the byteArray from being gc'ed in the same fashion a regular
+byte array would be.
+There are a handful of primitive functions in :base-ref:`GHC.Exts.`
 used to enforce or check for pinnedness: ``isByteArrayPinned#``,
 ``isMutableByteArrayPinned#``, and ``newPinnedByteArray#``. A
 byte array can be pinned as a result of three possible causes:

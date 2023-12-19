@@ -11,7 +11,7 @@
 # -----------------------------------------------------------------------------
 
 
-define hs-suffix-way-rules  # args: $1 = dir,  $2 = distdir, $3 = way, $4 = stage
+define hs-suffix-way-rules  # args: $1 = dir,  $2 = distdir, $3 = way
 
 ifeq "$3 $$($1_$2_DYNAMIC_TOO)" "dyn YES"
 # We only want this rule to be used for Haskell sources, not for
@@ -30,10 +30,10 @@ $1/$2/build/%.$$(dyn_osuf)-boot: $1/$2/build/%.$$(v_hisuf)-boot
 else
 
 # Note [Implicit rule search algorithm]
-#
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # The order in which implicit rules are defined can influence a build.
 #
-# Case study: genprimpos/Lexer.hs
+# Case study: genprimops/Lexer.hs
 #
 # We have two implicit rules for creating .o files, which after instantiating
 # with a specific directory ($1=utils/genprimops) and distdir ($2=dist) look
@@ -106,7 +106,7 @@ else
 # [1] https://www.gnu.org/software/make/manual/make.html#Implicit-Rule-Search
 
 $$(foreach dir,$$($1_$2_HS_SRC_DIRS),\
-  $$(eval $$(call hs-suffix-way-rules-srcdir,$1,$2,$3,$$(dir),$4)))
+  $$(eval $$(call hs-suffix-way-rules-srcdir,$1,$2,$3,$$(dir))))
 
 
 ifneq "$$(BINDIST)" "YES"

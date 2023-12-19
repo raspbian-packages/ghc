@@ -3,6 +3,10 @@
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE ExplicitNamespaces #-}
+{-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE FlexibleInstances #-}
+
 
 module GHC.Cmm (
      -- * Cmm top-level datatypes
@@ -96,6 +100,8 @@ data GenCmmDecl d h g
         Section
         d
 
+  deriving (Functor)
+
 type CmmDecl     = GenCmmDecl CmmStatics    CmmTopInfo CmmGraph
 type CmmDeclSRTs = GenCmmDecl RawCmmStatics CmmTopInfo CmmGraph
 
@@ -161,12 +167,12 @@ data CmmInfoTable
         -- place to convey this information from the code generator to
         -- where we build the static closures in
         -- GHC.Cmm.Info.Build.doSRTs.
-    }
+    } deriving Eq
 
 data ProfilingInfo
   = NoProfilingInfo
   | ProfilingInfo ByteString ByteString -- closure_type, closure_desc
-
+  deriving Eq
 -----------------------------------------------------------------------------
 --              Static Data
 -----------------------------------------------------------------------------
@@ -178,6 +184,9 @@ data SectionType
   | RelocatableReadOnlyData
   | UninitialisedData
   | ReadOnlyData16      -- .rodata.cst16 on x86_64, 16-byte aligned
+    -- See Note [Initializers and finalizers in Cmm] in GHC.Cmm.InitFini
+  | InitArray           -- .init_array on ELF, .ctor on Windows
+  | FiniArray           -- .fini_array on ELF, .dtor on Windows
   | CString
   | OtherSection String
   deriving (Show)
@@ -195,6 +204,8 @@ sectionProtection (Section t _) = case t of
     ReadOnlyData            -> ReadOnlySection
     RelocatableReadOnlyData -> WriteProtectedSection
     ReadOnlyData16          -> ReadOnlySection
+    InitArray               -> ReadOnlySection
+    FiniArray               -> ReadOnlySection
     CString                 -> ReadOnlySection
     Data                    -> ReadWriteSection
     UninitialisedData       -> ReadWriteSection
@@ -222,6 +233,12 @@ data CmmStatic
   | CmmFileEmbed FilePath
         -- ^ an embedded binary file
 
+instance Outputable CmmStatic where
+  ppr (CmmStaticLit lit) = text "CmmStaticLit" <+> ppr lit
+  ppr (CmmUninitialised n) = text "CmmUninitialised" <+> ppr n
+  ppr (CmmString _) = text "CmmString"
+  ppr (CmmFileEmbed fp) = text "CmmFileEmbed" <+> text fp
+
 -- Static data before SRT generation
 data GenCmmStatics (rawOnly :: Bool) where
     CmmStatics
@@ -246,22 +263,33 @@ type RawCmmStatics = GenCmmStatics 'True
 -- These are used by the LLVM and NCG backends, when populating Cmm
 -- with lists of instructions.
 
-data GenBasicBlock i = BasicBlock BlockId [i]
+data GenBasicBlock i
+   = BasicBlock BlockId [i]
+   deriving (Functor)
+
 
 -- | The branch block id is that of the first block in
 -- the branch, which is that branch's entry point
 blockId :: GenBasicBlock i -> BlockId
 blockId (BasicBlock blk_id _ ) = blk_id
 
-newtype ListGraph i = ListGraph [GenBasicBlock i]
+newtype ListGraph i
+   = ListGraph [GenBasicBlock i]
+   deriving (Functor)
 
 instance Outputable instr => Outputable (ListGraph instr) where
     ppr (ListGraph blocks) = vcat (map ppr blocks)
 
+instance OutputableP env instr => OutputableP env (ListGraph instr) where
+    pdoc env g = ppr (fmap (pdoc env) g)
+
+
 instance Outputable instr => Outputable (GenBasicBlock instr) where
     ppr = pprBBlock
+
+instance OutputableP env instr => OutputableP env (GenBasicBlock instr) where
+    pdoc env block = ppr (fmap (pdoc env) block)
 
 pprBBlock :: Outputable stmt => GenBasicBlock stmt -> SDoc
 pprBBlock (BasicBlock ident stmts) =
     hang (ppr ident <> colon) 4 (vcat (map ppr stmts))
-

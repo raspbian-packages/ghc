@@ -1,3 +1,8 @@
+
+{-# LANGUAGE TypeFamilies #-}
+
+{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
+
 {-
 (c) The University of Glasgow 2006
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
@@ -6,71 +11,86 @@
 The Desugarer: turning HsSyn into Core.
 -}
 
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE ViewPatterns #-}
-{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
-
 module GHC.HsToCore (
     -- * Desugaring operations
     deSugar, deSugarExpr
     ) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
-import GHC.HsToCore.Usage
 import GHC.Driver.Session
-import GHC.Driver.Types
+import GHC.Driver.Config
+import GHC.Driver.Env
+import GHC.Driver.Backend
+import GHC.Driver.Plugins
+
 import GHC.Hs
+
+import GHC.HsToCore.Usage
+import GHC.HsToCore.Monad
+import GHC.HsToCore.Errors.Types
+import GHC.HsToCore.Expr
+import GHC.HsToCore.Binds
+import GHC.HsToCore.Foreign.Decl
+import GHC.HsToCore.Coverage
+import GHC.HsToCore.Docs
+
 import GHC.Tc.Types
 import GHC.Tc.Utils.Monad  ( finalSafeMode, fixSafeInstances )
 import GHC.Tc.Module ( runTcInteractive )
-import GHC.Types.Id
-import GHC.Types.Id.Info
-import GHC.Types.Name
+
 import GHC.Core.Type
 import GHC.Core.TyCon     ( tyConDataCons )
-import GHC.Types.Avail
 import GHC.Core
 import GHC.Core.FVs       ( exprsSomeFreeVarsList )
 import GHC.Core.SimpleOpt ( simpleOptPgm, simpleOptExpr )
 import GHC.Core.Utils
-import GHC.Core.Unfold
-import GHC.Core.Ppr
-import GHC.HsToCore.Monad
-import GHC.HsToCore.Expr
-import GHC.HsToCore.Binds
-import GHC.HsToCore.Foreign.Decl
-import GHC.Builtin.Names
-import GHC.Builtin.Types.Prim
+import GHC.Core.Unfold.Make
 import GHC.Core.Coercion
-import GHC.Builtin.Types
 import GHC.Core.DataCon ( dataConWrapId )
 import GHC.Core.Make
-import GHC.Unit.Module
-import GHC.Types.Name.Set
-import GHC.Types.Name.Env
 import GHC.Core.Rules
-import GHC.Types.Basic
 import GHC.Core.Opt.Monad ( CoreToDo(..) )
 import GHC.Core.Lint     ( endPassIO )
-import GHC.Types.Var.Set
+import GHC.Core.Ppr
+
+import GHC.Builtin.Names
+import GHC.Builtin.Types.Prim
+import GHC.Builtin.Types
+
 import GHC.Data.FastString
+import GHC.Data.Maybe    ( expectJust )
+import GHC.Data.OrdList
+
 import GHC.Utils.Error
 import GHC.Utils.Outputable
-import GHC.Types.SrcLoc
-import GHC.HsToCore.Coverage
+import GHC.Utils.Panic.Plain
 import GHC.Utils.Misc
 import GHC.Utils.Monad
-import GHC.Data.OrdList
-import GHC.HsToCore.Docs
+import GHC.Utils.Logger
 
-import Data.List
+import GHC.Types.Id
+import GHC.Types.Id.Info
+import GHC.Types.ForeignStubs
+import GHC.Types.Avail
+import GHC.Types.Basic
+import GHC.Types.Var.Set
+import GHC.Types.SrcLoc
+import GHC.Types.SourceFile
+import GHC.Types.TypeEnv
+import GHC.Types.Name
+import GHC.Types.Name.Set
+import GHC.Types.Name.Env
+import GHC.Types.Name.Ppr
+import GHC.Types.HpcInfo
+
+import GHC.Unit
+import GHC.Unit.Module.ModGuts
+import GHC.Unit.Module.ModIface
+import GHC.Unit.Module.Deps
+
+import Data.List (partition)
 import Data.IORef
-import Control.Monad( when )
-import GHC.Driver.Plugins ( LoadedPlugin(..) )
 
 {-
 ************************************************************************
@@ -81,7 +101,7 @@ import GHC.Driver.Plugins ( LoadedPlugin(..) )
 -}
 
 -- | Main entry point to the desugarer.
-deSugar :: HscEnv -> ModLocation -> TcGblEnv -> IO (Messages, Maybe ModGuts)
+deSugar :: HscEnv -> ModLocation -> TcGblEnv -> IO (Messages DsMessage, Maybe ModGuts)
 -- Can modify PCS by faulting in more declarations
 
 deSugar hsc_env
@@ -113,22 +133,30 @@ deSugar hsc_env
                             tcg_insts        = insts,
                             tcg_fam_insts    = fam_insts,
                             tcg_hpc          = other_hpc_info,
-                            tcg_complete_matches = complete_matches
+                            tcg_complete_matches = complete_matches,
+                            tcg_self_boot    = self_boot
                             })
 
   = do { let dflags = hsc_dflags hsc_env
-             print_unqual = mkPrintUnqualified dflags rdr_env
-        ; withTiming dflags
+             logger = hsc_logger hsc_env
+             print_unqual = mkPrintUnqualified (hsc_unit_env hsc_env) rdr_env
+        ; withTiming logger
                      (text "Desugar"<+>brackets (ppr mod))
                      (const ()) $
      do { -- Desugar the program
         ; let export_set = availsToNameSet exports
-              target     = hscTarget dflags
+              bcknd      = backend dflags
               hpcInfo    = emptyHpcInfo other_hpc_info
 
         ; (binds_cvr, ds_hpc_info, modBreaks)
                          <- if not (isHsBootOrSig hsc_src)
-                              then addTicksToBinds hsc_env mod mod_loc
+                              then addTicksToBinds
+                                       (CoverageConfig
+                                        { coverageConfig_logger = hsc_logger hsc_env
+                                        , coverageConfig_dynFlags = hsc_dflags hsc_env
+                                        , coverageConfig_mInterp = hsc_interp hsc_env
+                                        })
+                                       mod mod_loc
                                        export_set (typeEnvTyCons type_env) binds
                               else return (binds, hpcInfo, Nothing)
         ; (msgs, mb_res) <- initDs hsc_env tcg_env $
@@ -139,8 +167,8 @@ deSugar hsc_env
                           ; (ds_fords, foreign_prs) <- dsForeigns fords
                           ; ds_rules <- mapMaybeM dsRule rules
                           ; let hpc_init
-                                  | gopt Opt_Hpc dflags = hpcInitCode mod ds_hpc_info
-                                  | otherwise = empty
+                                  | gopt Opt_Hpc dflags = hpcInitCode (targetPlatform $ hsc_dflags hsc_env) mod ds_hpc_info
+                                  | otherwise = mempty
                           ; return ( ds_ev_binds
                                    , foreign_prs `appOL` core_prs `appOL` spec_prs
                                    , spec_rules ++ ds_rules
@@ -153,7 +181,7 @@ deSugar hsc_env
      do {       -- Add export flags to bindings
           keep_alive <- readIORef keep_var
         ; let (rules_for_locals, rules_for_imps) = partition isLocalRule all_rules
-              final_prs = addExportFlagsAndRules target export_set keep_alive
+              final_prs = addExportFlagsAndRules bcknd export_set keep_alive
                                                  rules_for_locals (fromOL all_prs)
 
               final_pgm = combineEvBinds ds_ev_binds final_prs
@@ -164,33 +192,40 @@ deSugar hsc_env
         -- things into the in-scope set before simplifying; so we get no unfolding for F#!
 
         ; endPassIO hsc_env print_unqual CoreDesugar final_pgm rules_for_imps
-        ; (ds_binds, ds_rules_for_imps)
-            <- simpleOptPgm dflags mod final_pgm rules_for_imps
+        ; let simpl_opts = initSimpleOpts dflags
+        ; let (ds_binds, ds_rules_for_imps, occ_anald_binds)
+                = simpleOptPgm simpl_opts mod final_pgm rules_for_imps
                          -- The simpleOptPgm gets rid of type
                          -- bindings plus any stupid dead code
+        ; putDumpFileMaybe logger Opt_D_dump_occur_anal "Occurrence analysis"
+            FormatCore (pprCoreBindings occ_anald_binds $$ pprRules ds_rules_for_imps )
 
         ; endPassIO hsc_env print_unqual CoreDesugarOpt ds_binds ds_rules_for_imps
 
         ; let used_names = mkUsedNames tcg_env
-              pluginModules =
-                map lpModule (cachedPlugins (hsc_dflags hsc_env))
-        ; deps <- mkDependencies (homeUnitId (hsc_dflags hsc_env))
-                                 (map mi_module pluginModules) tcg_env
+              pluginModules = map lpModule (loadedPlugins (hsc_plugins hsc_env))
+              home_unit = hsc_home_unit hsc_env
+        ; let deps = mkDependencies home_unit
+                                    (tcg_mod tcg_env)
+                                    (tcg_imports tcg_env)
+                                    (map mi_module pluginModules)
 
         ; used_th <- readIORef tc_splice_used
         ; dep_files <- readIORef dependent_files
         ; safe_mode <- finalSafeMode dflags tcg_env
+        ; (needed_mods, needed_pkgs) <- readIORef (tcg_th_needed_deps tcg_env)
+
         ; usages <- mkUsageInfo hsc_env mod (imp_mods imports) used_names
-                      dep_files merged pluginModules
+                      dep_files merged needed_mods needed_pkgs
         -- id_mod /= mod when we are processing an hsig, but hsigs
         -- never desugared and compiled (there's no code!)
         -- Consequently, this should hold for any ModGuts that make
         -- past desugaring. See Note [Identity versus semantic module].
-        ; MASSERT( id_mod == mod )
+        ; massert (id_mod == mod)
 
         ; foreign_files <- readIORef th_foreign_files_var
 
-        ; let (doc_hdr, decl_docs, arg_docs) = extractDocs tcg_env
+        ; docs <- extractDocs dflags tcg_env
 
         ; let mod_guts = ModGuts {
                 mg_module       = mod,
@@ -209,6 +244,7 @@ deSugar hsc_env
                 mg_fam_insts    = fam_insts,
                 mg_inst_env     = inst_env,
                 mg_fam_inst_env = fam_inst_env,
+                mg_boot_exports = bootExports self_boot,
                 mg_patsyns      = patsyns,
                 mg_rules        = ds_rules_for_imps,
                 mg_binds        = ds_binds,
@@ -218,10 +254,8 @@ deSugar hsc_env
                 mg_modBreaks    = modBreaks,
                 mg_safe_haskell = safe_mode,
                 mg_trust_pkg    = imp_trust_own_pkg imports,
-                mg_complete_sigs = complete_matches,
-                mg_doc_hdr      = doc_hdr,
-                mg_decl_docs    = decl_docs,
-                mg_arg_docs     = arg_docs
+                mg_complete_matches = complete_matches,
+                mg_docs         = docs
               }
         ; return (msgs, Just mod_guts)
         }}}}
@@ -261,23 +295,34 @@ So we pull out the type/coercion variables (which are in dependency order),
 and Rec the rest.
 -}
 
-deSugarExpr :: HscEnv -> LHsExpr GhcTc -> IO (Messages, Maybe CoreExpr)
+deSugarExpr :: HscEnv -> LHsExpr GhcTc -> IO (Messages DsMessage, Maybe CoreExpr)
+deSugarExpr hsc_env tc_expr = do
+    let logger = hsc_logger hsc_env
 
-deSugarExpr hsc_env tc_expr = do {
-         let dflags = hsc_dflags hsc_env
+    showPass logger "Desugar"
 
-       ; showPass dflags "Desugar"
+    -- Do desugaring
+    (tc_msgs, mb_result) <- runTcInteractive hsc_env $
+                            initDsTc $
+                            dsLExpr tc_expr
 
-         -- Do desugaring
-       ; (msgs, mb_core_expr) <- runTcInteractive hsc_env $ initDsTc $
-                                 dsLExpr tc_expr
+    massert (isEmptyMessages tc_msgs)  -- the type-checker isn't doing anything here
 
-       ; case mb_core_expr of
-            Nothing   -> return ()
-            Just expr -> dumpIfSet_dyn dflags Opt_D_dump_ds "Desugared"
-                         FormatCore (pprCoreExpr expr)
+      -- mb_result is Nothing only when a failure happens in the type-checker,
+      -- but mb_core_expr is Nothing when a failure happens in the desugarer
+    let (ds_msgs, mb_core_expr) = expectJust "deSugarExpr" mb_result
 
-       ; return (msgs, mb_core_expr) }
+    case mb_core_expr of
+       Nothing   -> return ()
+       Just expr -> putDumpFileMaybe logger Opt_D_dump_ds "Desugared"
+                    FormatCore (pprCoreExpr expr)
+
+      -- callers (i.e. ioMsgMaybe) expect that no expression is returned if
+      -- there are errors
+    let final_res | errorsFound ds_msgs = Nothing
+                  | otherwise           = mb_core_expr
+
+    return (ds_msgs, final_res)
 
 {-
 ************************************************************************
@@ -288,9 +333,9 @@ deSugarExpr hsc_env tc_expr = do {
 -}
 
 addExportFlagsAndRules
-    :: HscTarget -> NameSet -> NameSet -> [CoreRule]
+    :: Backend -> NameSet -> NameSet -> [CoreRule]
     -> [(Id, t)] -> [(Id, t)]
-addExportFlagsAndRules target exports keep_alive rules prs
+addExportFlagsAndRules bcknd exports keep_alive rules prs
   = mapFst add_one prs
   where
     add_one bndr = add_rules name (add_export name bndr)
@@ -326,7 +371,7 @@ addExportFlagsAndRules target exports keep_alive rules prs
         -- isExternalName separates the user-defined top-level names from those
         -- introduced by the type checker.
     is_exported :: Name -> Bool
-    is_exported | targetRetainsAllBindings target = isExternalName
+    is_exported | backendRetainsAllBindings bcknd = isExternalName
                 | otherwise                       = (`elemNameSet` exports)
 
 {-
@@ -379,7 +424,7 @@ dsRule (L loc (HsRule { rd_name = name
                       , rd_tmvs = vars
                       , rd_lhs  = lhs
                       , rd_rhs  = rhs }))
-  = putSrcSpanDs loc $
+  = putSrcSpanDs (locA loc) $
     do  { let bndrs' = [var | L _ (RuleBndr _ (L _ var)) <- vars]
 
         ; lhs' <- unsetGOptM Opt_EnableRewriteRules $
@@ -395,7 +440,7 @@ dsRule (L loc (HsRule { rd_name = name
         -- and take the body apart into a (f args) form
         ; dflags <- getDynFlags
         ; case decomposeRuleLhs dflags bndrs'' lhs'' of {
-                Left msg -> do { warnDs NoReason msg; return Nothing } ;
+                Left msg -> do { diagnosticDs msg; return Nothing } ;
                 Right (final_bndrs, fn_id, args) -> do
 
         { let is_local = isLocalId fn_id
@@ -403,7 +448,8 @@ dsRule (L loc (HsRule { rd_name = name
                 -- we don't want to attach rules to the bindings of implicit Ids,
                 -- because they don't show up in the bindings until just before code gen
               fn_name   = idName fn_id
-              final_rhs = simpleOptExpr dflags rhs''    -- De-crap it
+              simpl_opts = initSimpleOpts dflags
+              final_rhs = simpleOptExpr simpl_opts rhs''    -- De-crap it
               rule_name = snd (unLoc name)
               final_bndrs_set = mkVarSet final_bndrs
               arg_ids = filterOut (`elemVarSet` final_bndrs_set) $
@@ -412,8 +458,7 @@ dsRule (L loc (HsRule { rd_name = name
         ; rule <- dsMkUserRule this_mod is_local
                          rule_name rule_act fn_name final_bndrs args
                          final_rhs
-        ; when (wopt Opt_WarnInlineRuleShadowing dflags) $
-          warnRuleShadowing rule_name rule_act fn_id arg_ids
+        ; warnRuleShadowing rule_name rule_act fn_id arg_ids
 
         ; return (Just rule)
         } } }
@@ -430,26 +475,10 @@ warnRuleShadowing rule_name rule_act fn_id arg_ids
       | isLocalId lhs_id || canUnfold (idUnfolding lhs_id)
                        -- If imported with no unfolding, no worries
       , idInlineActivation lhs_id `competesWith` rule_act
-      = warnDs (Reason Opt_WarnInlineRuleShadowing)
-               (vcat [ hang (text "Rule" <+> pprRuleName rule_name
-                               <+> text "may never fire")
-                            2 (text "because" <+> quotes (ppr lhs_id)
-                               <+> text "might inline first")
-                     , text "Probable fix: add an INLINE[n] or NOINLINE[n] pragma for"
-                       <+> quotes (ppr lhs_id)
-                     , whenPprDebug (ppr (idInlineActivation lhs_id) $$ ppr rule_act) ])
-
+      = diagnosticDs (DsRuleMightInlineFirst rule_name lhs_id rule_act)
       | check_rules_too
       , bad_rule : _ <- get_bad_rules lhs_id
-      = warnDs (Reason Opt_WarnInlineRuleShadowing)
-               (vcat [ hang (text "Rule" <+> pprRuleName rule_name
-                               <+> text "may never fire")
-                            2 (text "because rule" <+> pprRuleName (ruleName bad_rule)
-                               <+> text "for"<+> quotes (ppr lhs_id)
-                               <+> text "might fire first")
-                      , text "Probable fix: add phase [n] or [~n] to the competing rule"
-                      , whenPprDebug (ppr bad_rule) ])
-
+      = diagnosticDs (DsAnotherRuleMightFireFirst rule_name (ruleName bad_rule) lhs_id)
       | otherwise
       = return ()
 
@@ -626,9 +655,9 @@ or (Core)
             (x |> (GRefl :: a ~# (a |> TYPE co1)) ; co2)
 
 It looks like we can write this in Haskell directly, but we can't:
-the levity polymorphism checks defeat us. Note that `x` is a levity-
-polymorphic variable. So we must wire it in with a compulsory
-unfolding, like other levity-polymorphic primops.
+the representation polymorphism checks defeat us. Note that `x` is a
+representation-polymorphic variable. So we must wire it in with a
+compulsory unfolding, like other representation-polymorphic primops.
 
 The challenge is that UnsafeEquality is a GADT, and wiring in a GADT
 is *hard*: it has a worker separate from its wrapper, with all manner
@@ -661,8 +690,8 @@ patchMagicDefn orig_pair@(orig_id, orig_rhs)
   = do { magic_pair@(magic_id, _) <- mk_magic_pair orig_id orig_rhs
 
        -- Patching should not change the Name or the type of the Id
-       ; MASSERT( getUnique magic_id == getUnique orig_id )
-       ; MASSERT( varType magic_id `eqType` varType orig_id )
+       ; massert (getUnique magic_id == getUnique orig_id)
+       ; massert (varType magic_id `eqType` varType orig_id)
 
        ; return magic_pair }
   | otherwise
@@ -718,7 +747,7 @@ mkUnsafeCoercePrimPair _old_id old_expr
              (scrut1, scrut1_ty, rr_cv_ty) = unsafe_equality runtimeRepTy
                                                              runtimeRep1Ty
                                                              runtimeRep2Ty
-             (scrut2, scrut2_ty, ab_cv_ty) = unsafe_equality (tYPE runtimeRep2Ty)
+             (scrut2, scrut2_ty, ab_cv_ty) = unsafe_equality (mkTYPEapp runtimeRep2Ty)
                                                              (openAlphaTy `mkCastTy` alpha_co)
                                                              openBetaTy
 
@@ -732,13 +761,14 @@ mkUnsafeCoercePrimPair _old_id old_expr
 
 
              info = noCafIdInfo `setInlinePragInfo` alwaysInlinePragma
-                                `setUnfoldingInfo` mkCompulsoryUnfolding rhs
+                                `setUnfoldingInfo` mkCompulsoryUnfolding' rhs
+                                `setArityInfo`     arity
 
              ty = mkSpecForAllTys [ runtimeRep1TyVar, runtimeRep2TyVar
                                   , openAlphaTyVar, openBetaTyVar ] $
                   mkVisFunTyMany openAlphaTy openBetaTy
 
+             arity = 1
+
              id   = mkExportedVanillaId unsafeCoercePrimName ty `setIdInfo` info
        ; return (id, old_expr) }
-
-  where

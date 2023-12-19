@@ -6,16 +6,16 @@
  */
 
 #include "Rts.h"
-#include "LinkerInternals.h"
 #include "sm/OSMem.h"
+#include "linker/MMap.h"
 
-ExecPage *allocateExecPage() {
+ExecPage *allocateExecPage(void) {
     ExecPage *page = (ExecPage *) mmapAnonForLinker(getPageSize());
     return page;
 }
 
 void freezeExecPage(ExecPage *page) {
-    mmapForLinkerMarkExecutable(page, getPageSize());
+    mprotectForLinker(page, getPageSize(), MEM_READ_EXECUTE);
     flushExec(getPageSize(), page);
 }
 

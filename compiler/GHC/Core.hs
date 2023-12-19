@@ -3,17 +3,17 @@
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
 -}
 
-{-# LANGUAGE CPP, DeriveDataTypeable, FlexibleContexts #-}
+{-# LANGUAGE DeriveDataTypeable, FlexibleContexts #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE BangPatterns #-}
+
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns   #-}
 {-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 
 -- | GHC.Core holds all the main data types for use by for the Glasgow Haskell Compiler midsection
 module GHC.Core (
         -- * Main data types
-        Expr(..), Alt, Bind(..), AltCon(..), Arg,
-        Tickish(..), TickishScoping(..), TickishPlacement(..),
+        Expr(..), Alt(..), Bind(..), AltCon(..), Arg,
         CoreProgram, CoreExpr, CoreAlt, CoreBind, CoreArg, CoreBndr,
         TaggedExpr, TaggedAlt, TaggedBind, TaggedArg, TaggedBndr(..), deTagExpr,
 
@@ -29,6 +29,7 @@ module GHC.Core (
 
         mkIntLit, mkIntLitWrap,
         mkWordLit, mkWordLitWrap,
+        mkWord8Lit,
         mkWord64LitWord64, mkInt64LitInt64,
         mkCharLit, mkStringLit,
         mkFloatLit, mkFloatLitFloat,
@@ -45,20 +46,14 @@ module GHC.Core (
         collectNBinders,
         collectArgs, stripNArgs, collectArgsTicks, flattenBinds,
 
-        exprToType, exprToCoercion_maybe,
-        applyTypeToArg,
+        exprToType,
+        wrapLamBody,
 
         isValArg, isTypeArg, isCoArg, isTyCoArg, valArgCount, valBndrCount,
         isRuntimeArg, isRuntimeVar,
 
-        -- * Tick-related functions
-        tickishCounts, tickishScoped, tickishScopesLike, tickishFloatable,
-        tickishCanSplit, mkNoCount, mkNoScope,
-        tickishIsCode, tickishPlace,
-        tickishContains,
-
         -- * Unfolding data types
-        Unfolding(..),  UnfoldingGuidance(..), UnfoldingSource(..),
+        Unfolding(..),  UnfoldingCache(..), UnfoldingGuidance(..), UnfoldingSource(..),
 
         -- ** Constructing 'Unfolding's
         noUnfolding, bootUnfolding, evaldUnfolding, mkOtherCon,
@@ -69,12 +64,12 @@ module GHC.Core (
         maybeUnfoldingTemplate, otherCons,
         isValueUnfolding, isEvaldUnfolding, isCheapUnfolding,
         isExpandableUnfolding, isConLikeUnfolding, isCompulsoryUnfolding,
-        isStableUnfolding, hasCoreUnfolding, hasSomeUnfolding,
-        isBootUnfolding,
+        isStableUnfolding, isInlineUnfolding, isBootUnfolding,
+        hasCoreUnfolding, hasSomeUnfolding,
         canUnfold, neverUnfoldGuidance, isStableSource,
 
         -- * Annotated expression data types
-        AnnExpr, AnnExpr'(..), AnnBind(..), AnnAlt,
+        AnnExpr, AnnExpr'(..), AnnBind(..), AnnAlt(..),
 
         -- ** Operations on annotated expressions
         collectAnnArgs, collectAnnArgsTicks,
@@ -97,28 +92,28 @@ module GHC.Core (
         isBuiltinRule, isLocalRule, isAutoRule,
     ) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 import GHC.Platform
 
-import GHC.Types.CostCentre
 import GHC.Types.Var.Env( InScopeSet )
 import GHC.Types.Var
 import GHC.Core.Type
 import GHC.Core.Coercion
 import GHC.Types.Name
 import GHC.Types.Name.Set
-import GHC.Types.Name.Env( NameEnv, emptyNameEnv )
+import GHC.Types.Name.Env( NameEnv )
 import GHC.Types.Literal
+import GHC.Types.Tickish
 import GHC.Core.DataCon
 import GHC.Unit.Module
 import GHC.Types.Basic
-import GHC.Utils.Outputable
-import GHC.Utils.Misc
 import GHC.Types.Unique.Set
-import GHC.Types.SrcLoc ( RealSrcSpan, containsSpan )
+
 import GHC.Utils.Binary
+import GHC.Utils.Misc
+import GHC.Utils.Outputable
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
 
 import Data.Data hiding (TyCon)
 import Data.Int
@@ -181,10 +176,10 @@ These data types are the heart of the compiler
 --
 -- *  Applications: note that the argument may be a 'Type'.
 --    See Note [Core let/app invariant]
---    See Note [Levity polymorphism invariants]
+--    See Note [Representation polymorphism invariants]
 --
 -- *  Lambda abstraction
---    See Note [Levity polymorphism invariants]
+--    See Note [Representation polymorphism invariants]
 --
 -- *  Recursive and non recursive @let@s. Operationally
 --    this corresponds to allocating a thunk for the things
@@ -192,7 +187,7 @@ These data types are the heart of the compiler
 --
 --    See Note [Core letrec invariant]
 --    See Note [Core let/app invariant]
---    See Note [Levity polymorphism invariants]
+--    See Note [Representation polymorphism invariants]
 --    See Note [Core type and coercion invariant]
 --
 -- *  Case expression. Operationally this corresponds to evaluating
@@ -262,7 +257,7 @@ data Expr b
   | Case  (Expr b) b Type [Alt b]   -- See Note [Case expression invariants]
                                     -- and Note [Why does Case have a 'Type' field?]
   | Cast  (Expr b) CoercionR        -- The Coercion has Representational role
-  | Tick  (Tickish Id) (Expr b)
+  | Tick  CoreTickish (Expr b)
   | Type  Type
   | Coercion Coercion
   deriving Data
@@ -277,7 +272,9 @@ type Arg b = Expr b
 
 -- If you edit this type, you may need to update the GHC formalism
 -- See Note [GHC Formalism] in GHC.Core.Lint
-type Alt b = (AltCon, [b], Expr b)
+data Alt b
+    = Alt AltCon [b] (Expr b)
+    deriving (Data)
 
 -- | A case alternative constructor (i.e. pattern match)
 
@@ -300,7 +297,7 @@ data AltCon
 -- The instance adheres to the order described in [Core case invariants]
 instance Ord AltCon where
   compare (DataAlt con1) (DataAlt con2) =
-    ASSERT( dataConTyCon con1 == dataConTyCon con2 )
+    assert (dataConTyCon con1 == dataConTyCon con2) $
     compare (dataConTag con1) (dataConTag con2)
   compare (DataAlt _) _ = GT
   compare _ (DataAlt _) = LT
@@ -371,13 +368,69 @@ a Coercion, (sym c).
 
 Note [Core letrec invariant]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The right hand sides of all top-level and recursive @let@s
-/must/ be of lifted type (see "Type#type_classification" for
-the meaning of /lifted/ vs. /unlifted/).
+The Core letrec invariant:
 
-There is one exception to this rule, top-level @let@s are
-allowed to bind primitive string literals: see
-Note [Core top-level string literals].
+    The right hand sides of all
+      /top-level/ or /recursive/
+    bindings must be of lifted type
+
+    There is one exception to this rule, top-level @let@s are
+    allowed to bind primitive string literals: see
+    Note [Core top-level string literals].
+
+See "Type#type_classification" in GHC.Core.Type
+for the meaning of "lifted" vs. "unlifted").
+
+For the non-top-level, non-recursive case see Note [Core let-can-float invariant].
+
+Note [Core let-can-float invariant]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The let-can-float invariant:
+
+    The right hand side of a /non-top-level/, /non-recursive/ binding
+    may be of unlifted type, but only if
+    the expression is ok-for-speculation
+    or the 'Let' is for a join point.
+
+    (For top-level or recursive lets see Note [Core letrec invariant].)
+
+This means that the let can be floated around
+without difficulty. For example, this is OK:
+
+   y::Int# = x +# 1#
+
+But this is not, as it may affect termination if the
+expression is floated out:
+
+   y::Int# = fac 4#
+
+In this situation you should use @case@ rather than a @let@. The function
+'GHC.Core.Utils.needsCaseBinding' can help you determine which to generate, or
+alternatively use 'GHC.Core.Make.mkCoreLet' rather than this constructor directly,
+which will generate a @case@ if necessary
+
+The let-can-float invariant is initially enforced by mkCoreLet in GHC.Core.Make.
+
+For discussion of some implications of the let-can-float invariant primops see
+Note [Checking versus non-checking primops] in GHC.Builtin.PrimOps.
+
+Historical Note [The let/app invariant]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Before 2022 GHC used the "let/app invariant", which applied the let-can-float rules
+to the argument of an application, as well as to the RHS of a let.  This made some
+kind of sense, because 'let' can always be encoded as application:
+   let x=rhs in b   =    (\x.b) rhs
+
+But the let/app invariant got in the way of RULES; see #19313.  For example
+  up :: Int# -> Int#
+  {-# RULES "up/down" forall x. up (down x) = x #-}
+The LHS of this rule doesn't satisfy the let/app invariant.
+
+Indeed RULES is a big reason that GHC doesn't use ANF, where the argument of an
+application is always a variable or a constant.  To allow RULES to work nicely
+we need to allow lots of things in the arguments of a call.
+
+TL;DR: we relaxed the let/app invariant to become the let-can-float invariant.
 
 Note [Core top-level string literals]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -417,6 +470,8 @@ parts of the compilation pipeline.
   Note [Core top-level string literals]. Core-to-core passes may introduce
   new top-level string literals.
 
+  See GHC.Core.Utils.exprIsTopLevelBindable, and exprIsTickedString
+
 * In STG, top-level string literals are explicitly represented in the syntax
   tree.
 
@@ -424,14 +479,9 @@ parts of the compilation pipeline.
   in the object file, the content of the exported literal is given a label with
   the _bytes suffix.
 
-Note [Core let/app invariant]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The let/app invariant
-     the right hand side of a non-recursive 'Let', and
-     the argument of an 'App',
-    /may/ be of unlifted type, but only if
-    the expression is ok-for-speculation
-    or the 'Let' is for a join point.
+Note [NON-BOTTOM-DICTS invariant]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+It is a global invariant (not checkable by Lint) that
 
 This means that the let can be floated around
 without difficulty. For example, this is OK:
@@ -451,8 +501,24 @@ which will generate a @case@ if necessary
 The let/app invariant is initially enforced by mkCoreLet and mkCoreApp in
 GHC.Core.Make.
 
-For discussion of some implications of the let/app invariant primops see
-Note [Checking versus non-checking primops] in GHC.Builtin.PrimOps.
+* A superclass selection from some other dictionary. This is harder to guarantee:
+  see Note [Recursive superclasses] and Note [Solving superclass constraints]
+  in GHC.Tc.TyCl.Instance.
+
+A bad Core-to-Core pass could invalidate this reasoning, but that's too bad.
+It's still an invariant of Core programs generated by GHC from Haskell, and
+Core-to-Core passes maintain it.
+
+Why is it useful to know that dictionaries are non-bottom?
+
+1. It justifies the use of `-XDictsStrict`;
+   see `GHC.Core.Types.Demand.strictifyDictDmd`
+
+2. It means that (eq_sel d) is ok-for-speculation and thus
+     case (eq_sel d) of _ -> blah
+   can be discarded by the Simplifier.  See these Notes:
+   Note [exprOkForSpeculation and type classes] in GHC.Core.Utils
+   Note[Speculative evaluation] in GHC.CoreToStg.Prep
 
 Note [Case expression invariants]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -510,7 +576,7 @@ checked by Core Lint.
 5. Floating-point values must not be scrutinised against literals.
    See #9238 and Note [Rules for floating-point comparisons]
    in GHC.Core.Opt.ConstantFold for rationale.  Checked in lintCaseExpr;
-   see the call to isFloatingTy.
+   see the call to isFloatingPrimTy.
 
 6. The 'ty' field of (Case scrut bndr ty alts) is the type of the
    /entire/ case expression.  Checked in lintAltExpr.
@@ -548,25 +614,72 @@ Note [Core case invariants]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 See Note [Case expression invariants]
 
-Note [Levity polymorphism invariants]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The levity-polymorphism invariants are these (as per "Levity Polymorphism",
-PLDI '17):
+Note [Representation polymorphism invariants]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+GHC allows us to abstract over calling conventions using **representation polymorphism**.
+For example, we have:
 
-* The type of a term-binder must not be levity-polymorphic,
-  unless it is a let(rec)-bound join point
-     (see Note [Invariants on join points])
+  ($) :: forall (r :: RuntimeRep) (a :: Type) (b :: TYPE r). a -> b -> b
 
-* The type of the argument of an App must not be levity-polymorphic.
+In this example, the type `b` is representation-polymorphic: it has kind `TYPE r`,
+where the type variable `r :: RuntimeRep` abstracts over the runtime representation
+of values of type `b`.
 
-A type (t::TYPE r) is "levity polymorphic" if 'r' has any free variables.
+To ensure that programs containing representation-polymorphism remain compilable,
+we enforce the following representation-polymorphism invariants:
 
-For example
+The paper "Levity Polymorphism" [PLDI'17] states the first two invariants:
+
+  I1. The type of a bound variable must have a fixed runtime representation
+      (except for join points: See Note [Invariants on join points])
+  I2. The type of a function argument must have a fixed runtime representation.
+
+On top of these two invariants, GHC's internal eta-expansion mechanism also requires:
+
+  I3. In any partial application `f e_1 .. e_n`, where `f` is `hasNoBinding`,
+      it must be the case that the application can be eta-expanded to match
+      the arity of `f`.
+      See Note [checkCanEtaExpand] in GHC.Core.Lint for more details.
+
+Example of I1:
+
   \(r::RuntimeRep). \(a::TYPE r). \(x::a). e
-is illegal because x's type has kind (TYPE r), which has 'r' free.
 
-See Note [Levity polymorphism checking] in GHC.HsToCore.Monad to see where these
-invariants are established for user-written code.
+    This contravenes I1 because x's type has kind (TYPE r), which has 'r' free.
+    We thus wouldn't know how to compile this lambda abstraction.
+
+Example of I2:
+
+  f (undefined :: (a :: TYPE r))
+
+    This contravenes I2: we are applying the function `f` to a value
+    with an unknown runtime representation.
+
+Examples of I3:
+
+  myUnsafeCoerce# :: forall {r1} (a :: TYPE r1) {r2} (b :: TYPE r2). a -> b
+  myUnsafeCoerce# = unsafeCoerce#
+
+    This contravenes I3: we are instantiating `unsafeCoerce#` without any
+    value arguments, and with a remaining argument type, `a`, which does not
+    have a fixed runtime representation.
+    But `unsafeCorce#` has no binding (see Note [Wiring in unsafeCoerce#]
+    in GHC.HsToCore).  So before code-generation we must saturate it
+    by eta-expansion (see GHC.CoreToStg.Prep.maybeSaturate), thus
+       myUnsafeCoerce# = \x. unsafeCoerce# x
+    But we can't do that because now the \x binding would violate I1.
+
+  bar :: forall (a :: TYPE) r (b :: TYPE r). a -> b
+  bar = unsafeCoerce#
+
+    OK: eta expand to `\ (x :: Type) -> unsafeCoerce# x`,
+    and `x` has a fixed RuntimeRep.
+
+Note that we currently require something slightly stronger than a fixed runtime
+representation: we check whether bound variables and function arguments have a
+/fixed RuntimeRep/ in the sense of Note [Fixed RuntimeRep] in GHC.Tc.Utils.Concrete.
+See Note [Representation polymorphism checking] in GHC.Tc.Utils.Concrete
+for an overview of how we enforce these invariants in the typechecker.
 
 Note [Core let goal]
 ~~~~~~~~~~~~~~~~~~~~
@@ -695,6 +808,7 @@ Join points must follow these invariants:
 
          The arity of a join point isn't very important; but short of setting
          it to zero, it is helpful to have an invariant.  E.g. #17294.
+         See also Note [Do not eta-expand join points] in GHC.Core.Opt.Simplify.Utils.
 
   3. If the binding is recursive, then all other bindings in the recursive group
      must also be join points.
@@ -708,7 +822,7 @@ However, join points have simpler invariants in other ways
      ok-for-speculation (i.e. drop the let/app invariant)
      e.g.  let j :: Int# = factorial x in ...
 
-  6. A join point can have a levity-polymorphic RHS
+  6. The RHS of join point is not required to have a fixed runtime representation,
      e.g.  let j :: r :: TYPE l = fail void# in ...
      This happened in an intermediate program #13394
 
@@ -925,279 +1039,6 @@ type OutArg      = CoreArg
 type MOutCoercion = MCoercion
 
 
-{- *********************************************************************
-*                                                                      *
-              Ticks
-*                                                                      *
-************************************************************************
--}
-
--- | Allows attaching extra information to points in expressions
-
--- If you edit this type, you may need to update the GHC formalism
--- See Note [GHC Formalism] in GHC.Core.Lint
-data Tickish id =
-    -- | An @{-# SCC #-}@ profiling annotation, either automatically
-    -- added by the desugarer as a result of -auto-all, or added by
-    -- the user.
-    ProfNote {
-      profNoteCC    :: CostCentre, -- ^ the cost centre
-      profNoteCount :: !Bool,      -- ^ bump the entry count?
-      profNoteScope :: !Bool       -- ^ scopes over the enclosed expression
-                                   -- (i.e. not just a tick)
-    }
-
-  -- | A "tick" used by HPC to track the execution of each
-  -- subexpression in the original source code.
-  | HpcTick {
-      tickModule :: Module,
-      tickId     :: !Int
-    }
-
-  -- | A breakpoint for the GHCi debugger.  This behaves like an HPC
-  -- tick, but has a list of free variables which will be available
-  -- for inspection in GHCi when the program stops at the breakpoint.
-  --
-  -- NB. we must take account of these Ids when (a) counting free variables,
-  -- and (b) substituting (don't substitute for them)
-  | Breakpoint
-    { breakpointId     :: !Int
-    , breakpointFVs    :: [id]  -- ^ the order of this list is important:
-                                -- it matches the order of the lists in the
-                                -- appropriate entry in 'GHC.Driver.Types.ModBreaks'.
-                                --
-                                -- Careful about substitution!  See
-                                -- Note [substTickish] in "GHC.Core.Subst".
-    }
-
-  -- | A source note.
-  --
-  -- Source notes are pure annotations: Their presence should neither
-  -- influence compilation nor execution. The semantics are given by
-  -- causality: The presence of a source note means that a local
-  -- change in the referenced source code span will possibly provoke
-  -- the generated code to change. On the flip-side, the functionality
-  -- of annotated code *must* be invariant against changes to all
-  -- source code *except* the spans referenced in the source notes
-  -- (see "Causality of optimized Haskell" paper for details).
-  --
-  -- Therefore extending the scope of any given source note is always
-  -- valid. Note that it is still undesirable though, as this reduces
-  -- their usefulness for debugging and profiling. Therefore we will
-  -- generally try only to make use of this property where it is
-  -- necessary to enable optimizations.
-  | SourceNote
-    { sourceSpan :: RealSrcSpan -- ^ Source covered
-    , sourceName :: String      -- ^ Name for source location
-                                --   (uses same names as CCs)
-    }
-
-  deriving (Eq, Ord, Data)
-
--- | A "counting tick" (where tickishCounts is True) is one that
--- counts evaluations in some way.  We cannot discard a counting tick,
--- and the compiler should preserve the number of counting ticks as
--- far as possible.
---
--- However, we still allow the simplifier to increase or decrease
--- sharing, so in practice the actual number of ticks may vary, except
--- that we never change the value from zero to non-zero or vice versa.
-tickishCounts :: Tickish id -> Bool
-tickishCounts n@ProfNote{} = profNoteCount n
-tickishCounts HpcTick{}    = True
-tickishCounts Breakpoint{} = True
-tickishCounts _            = False
-
-
--- | Specifies the scoping behaviour of ticks. This governs the
--- behaviour of ticks that care about the covered code and the cost
--- associated with it. Important for ticks relating to profiling.
-data TickishScoping =
-    -- | No scoping: The tick does not care about what code it
-    -- covers. Transformations can freely move code inside as well as
-    -- outside without any additional annotation obligations
-    NoScope
-
-    -- | Soft scoping: We want all code that is covered to stay
-    -- covered.  Note that this scope type does not forbid
-    -- transformations from happening, as long as all results of
-    -- the transformations are still covered by this tick or a copy of
-    -- it. For example
-    --
-    --   let x = tick<...> (let y = foo in bar) in baz
-    --     ===>
-    --   let x = tick<...> bar; y = tick<...> foo in baz
-    --
-    -- Is a valid transformation as far as "bar" and "foo" is
-    -- concerned, because both still are scoped over by the tick.
-    --
-    -- Note though that one might object to the "let" not being
-    -- covered by the tick any more. However, we are generally lax
-    -- with this - constant costs don't matter too much, and given
-    -- that the "let" was effectively merged we can view it as having
-    -- lost its identity anyway.
-    --
-    -- Also note that this scoping behaviour allows floating a tick
-    -- "upwards" in pretty much any situation. For example:
-    --
-    --   case foo of x -> tick<...> bar
-    --     ==>
-    --   tick<...> case foo of x -> bar
-    --
-    -- While this is always legal, we want to make a best effort to
-    -- only make us of this where it exposes transformation
-    -- opportunities.
-  | SoftScope
-
-    -- | Cost centre scoping: We don't want any costs to move to other
-    -- cost-centre stacks. This means we not only want no code or cost
-    -- to get moved out of their cost centres, but we also object to
-    -- code getting associated with new cost-centre ticks - or
-    -- changing the order in which they get applied.
-    --
-    -- A rule of thumb is that we don't want any code to gain new
-    -- annotations. However, there are notable exceptions, for
-    -- example:
-    --
-    --   let f = \y -> foo in tick<...> ... (f x) ...
-    --     ==>
-    --   tick<...> ... foo[x/y] ...
-    --
-    -- In-lining lambdas like this is always legal, because inlining a
-    -- function does not change the cost-centre stack when the
-    -- function is called.
-  | CostCentreScope
-
-  deriving (Eq)
-
--- | Returns the intended scoping rule for a Tickish
-tickishScoped :: Tickish id -> TickishScoping
-tickishScoped n@ProfNote{}
-  | profNoteScope n        = CostCentreScope
-  | otherwise              = NoScope
-tickishScoped HpcTick{}    = NoScope
-tickishScoped Breakpoint{} = CostCentreScope
-   -- Breakpoints are scoped: eventually we're going to do call
-   -- stacks, but also this helps prevent the simplifier from moving
-   -- breakpoints around and changing their result type (see #1531).
-tickishScoped SourceNote{} = SoftScope
-
--- | Returns whether the tick scoping rule is at least as permissive
--- as the given scoping rule.
-tickishScopesLike :: Tickish id -> TickishScoping -> Bool
-tickishScopesLike t scope = tickishScoped t `like` scope
-  where NoScope         `like` _               = True
-        _               `like` NoScope         = False
-        SoftScope       `like` _               = True
-        _               `like` SoftScope       = False
-        CostCentreScope `like` _               = True
-
--- | Returns @True@ for ticks that can be floated upwards easily even
--- where it might change execution counts, such as:
---
---   Just (tick<...> foo)
---     ==>
---   tick<...> (Just foo)
---
--- This is a combination of @tickishSoftScope@ and
--- @tickishCounts@. Note that in principle splittable ticks can become
--- floatable using @mkNoTick@ -- even though there's currently no
--- tickish for which that is the case.
-tickishFloatable :: Tickish id -> Bool
-tickishFloatable t = t `tickishScopesLike` SoftScope && not (tickishCounts t)
-
--- | Returns @True@ for a tick that is both counting /and/ scoping and
--- can be split into its (tick, scope) parts using 'mkNoScope' and
--- 'mkNoTick' respectively.
-tickishCanSplit :: Tickish id -> Bool
-tickishCanSplit ProfNote{profNoteScope = True, profNoteCount = True}
-                   = True
-tickishCanSplit _  = False
-
-mkNoCount :: Tickish id -> Tickish id
-mkNoCount n | not (tickishCounts n)   = n
-            | not (tickishCanSplit n) = panic "mkNoCount: Cannot split!"
-mkNoCount n@ProfNote{}                = n {profNoteCount = False}
-mkNoCount _                           = panic "mkNoCount: Undefined split!"
-
-mkNoScope :: Tickish id -> Tickish id
-mkNoScope n | tickishScoped n == NoScope  = n
-            | not (tickishCanSplit n)     = panic "mkNoScope: Cannot split!"
-mkNoScope n@ProfNote{}                    = n {profNoteScope = False}
-mkNoScope _                               = panic "mkNoScope: Undefined split!"
-
--- | Return @True@ if this source annotation compiles to some backend
--- code. Without this flag, the tickish is seen as a simple annotation
--- that does not have any associated evaluation code.
---
--- What this means that we are allowed to disregard the tick if doing
--- so means that we can skip generating any code in the first place. A
--- typical example is top-level bindings:
---
---   foo = tick<...> \y -> ...
---     ==>
---   foo = \y -> tick<...> ...
---
--- Here there is just no operational difference between the first and
--- the second version. Therefore code generation should simply
--- translate the code as if it found the latter.
-tickishIsCode :: Tickish id -> Bool
-tickishIsCode SourceNote{} = False
-tickishIsCode _tickish     = True  -- all the rest for now
-
-
--- | Governs the kind of expression that the tick gets placed on when
--- annotating for example using @mkTick@. If we find that we want to
--- put a tickish on an expression ruled out here, we try to float it
--- inwards until we find a suitable expression.
-data TickishPlacement =
-
-    -- | Place ticks exactly on run-time expressions. We can still
-    -- move the tick through pure compile-time constructs such as
-    -- other ticks, casts or type lambdas. This is the most
-    -- restrictive placement rule for ticks, as all tickishs have in
-    -- common that they want to track runtime processes. The only
-    -- legal placement rule for counting ticks.
-    PlaceRuntime
-
-    -- | As @PlaceRuntime@, but we float the tick through all
-    -- lambdas. This makes sense where there is little difference
-    -- between annotating the lambda and annotating the lambda's code.
-  | PlaceNonLam
-
-    -- | In addition to floating through lambdas, cost-centre style
-    -- tickishs can also be moved from constructors, non-function
-    -- variables and literals. For example:
-    --
-    --   let x = scc<...> C (scc<...> y) (scc<...> 3) in ...
-    --
-    -- Neither the constructor application, the variable or the
-    -- literal are likely to have any cost worth mentioning. And even
-    -- if y names a thunk, the call would not care about the
-    -- evaluation context. Therefore removing all annotations in the
-    -- above example is safe.
-  | PlaceCostCentre
-
-  deriving (Eq)
-
--- | Placement behaviour we want for the ticks
-tickishPlace :: Tickish id -> TickishPlacement
-tickishPlace n@ProfNote{}
-  | profNoteCount n        = PlaceRuntime
-  | otherwise              = PlaceCostCentre
-tickishPlace HpcTick{}     = PlaceRuntime
-tickishPlace Breakpoint{}  = PlaceRuntime
-tickishPlace SourceNote{}  = PlaceNonLam
-
--- | Returns whether one tick "contains" the other one, therefore
--- making the second tick redundant.
-tickishContains :: Eq b => Tickish b -> Tickish b -> Bool
-tickishContains (SourceNote sp1 n1) (SourceNote sp2 n2)
-  = containsSpan sp1 sp2 && n1 == n2
-    -- compare the String last
-tickishContains t1 t2
-  = t1 == t2
-
 {-
 ************************************************************************
 *                                                                      *
@@ -1211,7 +1052,7 @@ tickishContains t1 t2
 -- See Note [Orphans]
 data IsOrphan
   = IsOrphan
-  | NotOrphan OccName -- The OccName 'n' witnesses the instance's non-orphanhood
+  | NotOrphan !OccName -- The OccName 'n' witnesses the instance's non-orphanhood
                       -- In that case, the instance is fingerprinted as part
                       -- of the definition of 'n's definition
     deriving Data
@@ -1313,15 +1154,40 @@ type RuleBase = NameEnv [CoreRule]
 -- but it also includes the set of visible orphans we use to filter out orphan
 -- rules which are not visible (even though we can see them...)
 data RuleEnv
-    = RuleEnv { re_base          :: RuleBase
+    = RuleEnv { re_base          :: [RuleBase] -- See Note [Why re_base is a list]
               , re_visible_orphs :: ModuleSet
               }
 
 mkRuleEnv :: RuleBase -> [Module] -> RuleEnv
-mkRuleEnv rules vis_orphs = RuleEnv rules (mkModuleSet vis_orphs)
+mkRuleEnv rules vis_orphs = RuleEnv [rules] (mkModuleSet vis_orphs)
 
 emptyRuleEnv :: RuleEnv
-emptyRuleEnv = RuleEnv emptyNameEnv emptyModuleSet
+emptyRuleEnv = RuleEnv [] emptyModuleSet
+
+{-
+Note [Why re_base is a list]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+In Note [Overall plumbing for rules], it is explained that the final
+RuleBase which we must consider is combined from 4 different sources.
+
+During simplifier runs, the fourth source of rules is constantly being updated
+as new interfaces are loaded into the EPS. Therefore just before we check to see
+if any rules match we get the EPS RuleBase and combine it with the existing RuleBase
+and then perform exactly 1 lookup into the new map.
+
+It is more efficient to avoid combining the environments and store the uncombined
+environments as we can instead perform 1 lookup into each environment and then combine
+the results.
+
+Essentially we use the identity:
+
+> lookupNameEnv n (plusNameEnv_C (++) rb1 rb2)
+>   = lookupNameEnv n rb1 ++ lookupNameEnv n rb2
+
+The latter being more efficient as we don't construct an intermediate
+map.
+-}
 
 -- | A 'CoreRule' is:
 --
@@ -1386,15 +1252,18 @@ data CoreRule
                 -- arguments, it simply discards them; the returned 'CoreExpr'
                 -- is just the rewrite of 'ru_fn' applied to the first 'ru_nargs' args
     }
-                -- See Note [Extra args in rule matching] in GHC.Core.Rules
+                -- See Note [Extra args in the target] in GHC.Core.Rules
 
 -- | Rule options
 data RuleOpts = RuleOpts
    { roPlatform                :: !Platform -- ^ Target platform
    , roNumConstantFolding      :: !Bool     -- ^ Enable more advanced numeric constant folding
    , roExcessRationalPrecision :: !Bool     -- ^ Cut down precision of Rational values to that of Float/Double if disabled
+   , roBignumRules             :: !Bool     -- ^ Enable rules for bignums
    }
 
+-- | The 'InScopeSet' in the 'InScopeEnv' is a /superset/ of variables that are
+-- currently in scope. See Note [The InScopeSet invariant].
 type RuleFun = RuleOpts -> InScopeEnv -> Id -> [CoreExpr] -> Maybe CoreExpr
 type InScopeEnv = (InScopeSet, IdUnfoldingFun)
 
@@ -1447,6 +1316,17 @@ setRuleIdName nm ru = ru { ru_fn = nm }
 ************************************************************************
 
 The @Unfolding@ type is declared here to avoid numerous loops
+
+Note [Never put `OtherCon` unfoldings on lambda binders]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Based on #21496 we never attach unfoldings of any kind to lambda binders.
+It's just too easy for the call site to change and invalidate the unfolding.
+E.g. the caller of the lambda drops a seq (e.g. because the lambda is strict in it's binder)
+which in turn makes the OtherCon[] unfolding a lie.
+So unfoldings on lambda binders can never really be trusted when on lambda binders if there
+is the chance of the call site to change. So it's easiest to just never attach any
+to lambda binders to begin with, as well as stripping them off if we e.g. float out
+and expression while abstracting over some arguments.
 -}
 
 -- | Records the /unfolding/ of an identifier, which is approximately the form the
@@ -1488,15 +1368,8 @@ data Unfolding
         uf_tmpl       :: CoreExpr,        -- Template; occurrence info is correct
         uf_src        :: UnfoldingSource, -- Where the unfolding came from
         uf_is_top     :: Bool,          -- True <=> top level binding
-        uf_is_value   :: Bool,          -- exprIsHNF template (cached); it is ok to discard
-                                        --      a `seq` on this variable
-        uf_is_conlike :: Bool,          -- True <=> applicn of constructor or CONLIKE function
-                                        --      Cached version of exprIsConLike
-        uf_is_work_free :: Bool,                -- True <=> doesn't waste (much) work to expand
-                                        --          inside an inlining
-                                        --      Cached version of exprIsCheap
-        uf_expandable :: Bool,          -- True <=> can expand in RULE matching
-                                        --      Cached version of exprIsExpandable
+        uf_cache      :: UnfoldingCache,        -- Cache of flags computable from the expr
+                                                -- See Note [Tying the 'CoreUnfolding' knot]
         uf_guidance   :: UnfoldingGuidance      -- Tells about the *size* of the template.
     }
   -- ^ An unfolding with redundant cached information. Parameters:
@@ -1546,6 +1419,21 @@ data UnfoldingSource
                        -- Inline absolutely always, however boring the context.
 
 
+-- | Properties of a 'CoreUnfolding' that could be computed on-demand from its template.
+-- See Note [UnfoldingCache]
+data UnfoldingCache
+  = UnfoldingCache {
+        uf_is_value   :: !Bool,         -- exprIsHNF template (cached); it is ok to discard
+                                        --      a `seq` on this variable
+        uf_is_conlike :: !Bool,         -- True <=> applicn of constructor or CONLIKE function
+                                        --      Cached version of exprIsConLike
+        uf_is_work_free :: !Bool,       -- True <=> doesn't waste (much) work to expand
+                                        --          inside an inlining
+                                        --      Cached version of exprIsCheap
+        uf_expandable :: !Bool          -- True <=> can expand in RULE matching
+                                        --      Cached version of exprIsExpandable
+    }
+  deriving (Eq)
 
 -- | 'UnfoldingGuidance' says when unfolding should take place
 data UnfoldingGuidance
@@ -1576,7 +1464,23 @@ data UnfoldingGuidance
   | UnfNever        -- The RHS is big, so don't inline it
   deriving (Eq)
 
-{-
+{- Note [UnfoldingCache]
+~~~~~~~~~~~~~~~~~~~~~~~~
+The UnfoldingCache field of an Unfolding holds four (strict) booleans,
+all derived from the uf_tmpl field of the unfolding.
+
+* We serialise the UnfoldingCache to and from interface files, for
+  reasons described in  Note [Tying the 'CoreUnfolding' knot] in
+  GHC.IfaceToCore
+
+* Because it is a strict data type, we must be careful not to
+  pattern-match on it until we actually want its values.  E.g
+  GHC.Core.Unfold.callSiteInline/tryUnfolding are careful not to force
+  it unnecessarily.  Just saves a bit of work.
+
+* When `seq`ing Core to eliminate space leaks, to suffices to `seq` on
+  the cache, but not its fields, because it is strict in all fields.
+
 Note [Historical note: unfoldings for wrappers]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 We used to have a nice clever scheme in interface files for
@@ -1683,8 +1587,8 @@ otherCons _               = []
 -- yield a value (something in HNF): returns @False@ if unsure
 isValueUnfolding :: Unfolding -> Bool
         -- Returns False for OtherCon
-isValueUnfolding (CoreUnfolding { uf_is_value = is_evald }) = is_evald
-isValueUnfolding _                                          = False
+isValueUnfolding (CoreUnfolding { uf_cache = cache }) = uf_is_value cache
+isValueUnfolding _                                    = False
 
 -- | Determines if it possibly the case that the unfolding will
 -- yield a value. Unlike 'isValueUnfolding' it returns @True@
@@ -1692,31 +1596,33 @@ isValueUnfolding _                                          = False
 isEvaldUnfolding :: Unfolding -> Bool
         -- Returns True for OtherCon
 isEvaldUnfolding (OtherCon _)                               = True
-isEvaldUnfolding (CoreUnfolding { uf_is_value = is_evald }) = is_evald
+isEvaldUnfolding (CoreUnfolding { uf_cache = cache }) = uf_is_value cache
 isEvaldUnfolding _                                          = False
 
 -- | @True@ if the unfolding is a constructor application, the application
 -- of a CONLIKE function or 'OtherCon'
 isConLikeUnfolding :: Unfolding -> Bool
-isConLikeUnfolding (OtherCon _)                             = True
-isConLikeUnfolding (CoreUnfolding { uf_is_conlike = con })  = con
-isConLikeUnfolding _                                        = False
+isConLikeUnfolding (OtherCon _)                         = True
+isConLikeUnfolding (CoreUnfolding { uf_cache = cache }) = uf_is_conlike cache
+isConLikeUnfolding _                                    = False
 
 -- | Is the thing we will unfold into certainly cheap?
 isCheapUnfolding :: Unfolding -> Bool
-isCheapUnfolding (CoreUnfolding { uf_is_work_free = is_wf }) = is_wf
-isCheapUnfolding _                                           = False
+isCheapUnfolding (CoreUnfolding { uf_cache = cache }) = uf_is_work_free cache
+isCheapUnfolding _                                    = False
 
 isExpandableUnfolding :: Unfolding -> Bool
-isExpandableUnfolding (CoreUnfolding { uf_expandable = is_expable }) = is_expable
-isExpandableUnfolding _                                              = False
+isExpandableUnfolding (CoreUnfolding { uf_cache = cache }) = uf_expandable cache
+isExpandableUnfolding _                                    = False
 
 expandUnfolding_maybe :: Unfolding -> Maybe CoreExpr
 -- Expand an expandable unfolding; this is used in rule matching
 --   See Note [Expanding variables] in GHC.Core.Rules
 -- The key point here is that CONLIKE things can be expanded
-expandUnfolding_maybe (CoreUnfolding { uf_expandable = True, uf_tmpl = rhs }) = Just rhs
-expandUnfolding_maybe _                                                       = Nothing
+expandUnfolding_maybe (CoreUnfolding { uf_cache = cache, uf_tmpl = rhs })
+  | uf_expandable cache
+    = Just rhs
+expandUnfolding_maybe _ = Nothing
 
 isCompulsoryUnfolding :: Unfolding -> Bool
 isCompulsoryUnfolding (CoreUnfolding { uf_src = InlineCompulsory }) = True
@@ -1728,6 +1634,22 @@ isStableUnfolding :: Unfolding -> Bool
 isStableUnfolding (CoreUnfolding { uf_src = src }) = isStableSource src
 isStableUnfolding (DFunUnfolding {})               = True
 isStableUnfolding _                                = False
+
+isInlineUnfolding :: Unfolding -> Bool
+-- ^ True of a /stable/ unfolding that is
+--   (a) always inlined; that is, with an `UnfWhen` guidance, or
+--   (b) a DFunUnfolding which never needs to be inlined
+isInlineUnfolding (CoreUnfolding { uf_src = src, uf_guidance = guidance })
+  | isStableSource src
+  , UnfWhen {} <- guidance
+  = True
+
+isInlineUnfolding (DFunUnfolding {})
+  = True
+
+-- Default case
+isInlineUnfolding _ = False
+
 
 -- | Only returns False if there is no unfolding information available at all
 hasSomeUnfolding :: Unfolding -> Bool
@@ -1829,10 +1751,10 @@ instance Outputable AltCon where
   ppr (LitAlt lit) = ppr lit
   ppr DEFAULT      = text "__DEFAULT"
 
-cmpAlt :: (AltCon, a, b) -> (AltCon, a, b) -> Ordering
-cmpAlt (con1, _, _) (con2, _, _) = con1 `cmpAltCon` con2
+cmpAlt :: Alt a -> Alt a -> Ordering
+cmpAlt (Alt con1 _ _) (Alt con2 _ _) = con1 `cmpAltCon` con2
 
-ltAlt :: (AltCon, a, b) -> (AltCon, a, b) -> Bool
+ltAlt :: Alt a -> Alt a -> Bool
 ltAlt a1 a2 = (a1 `cmpAlt` a2) == LT
 
 cmpAltCon :: AltCon -> AltCon -> Ordering
@@ -1847,9 +1769,7 @@ cmpAltCon (DataAlt _)  DEFAULT      = GT
 cmpAltCon (LitAlt  l1) (LitAlt  l2) = l1 `compare` l2
 cmpAltCon (LitAlt _)   DEFAULT      = GT
 
-cmpAltCon con1 con2 = WARN( True, text "Comparing incomparable AltCons" <+>
-                                  ppr con1 <+> ppr con2 )
-                      LT
+cmpAltCon con1 con2 = pprPanic "cmpAltCon" (ppr con1 $$ ppr con2)
 
 {-
 ************************************************************************
@@ -1931,7 +1851,7 @@ deTagBind (NonRec (TB b _) rhs) = NonRec b (deTagExpr rhs)
 deTagBind (Rec prs)             = Rec [(b, deTagExpr rhs) | (TB b _, rhs) <- prs]
 
 deTagAlt :: TaggedAlt t -> CoreAlt
-deTagAlt (con, bndrs, rhs) = (con, [b | TB b _ <- bndrs], deTagExpr rhs)
+deTagAlt (Alt con bndrs rhs) = Alt con [b | TB b _ <- bndrs] (deTagExpr rhs)
 
 {-
 ************************************************************************
@@ -1992,6 +1912,9 @@ mkWordLit platform w = Lit (mkLitWord platform w)
 -- If you want an expression of type @Word@ use 'GHC.Core.Make.mkWordExpr'
 mkWordLitWrap :: Platform -> Integer -> Expr b
 mkWordLitWrap platform w = Lit (mkLitWordWrap platform w)
+
+mkWord8Lit :: Integer -> Expr b
+mkWord8Lit    w = Lit (mkLitWord8 w)
 
 mkWord64LitWord64 :: Word64 -> Expr b
 mkWord64LitWord64 w = Lit (mkLitWord64 (toInteger w))
@@ -2072,7 +1995,7 @@ mkCoBind cv co      = NonRec cv (Coercion co)
 varToCoreExpr :: CoreBndr -> Expr b
 varToCoreExpr v | isTyVar v = Type (mkTyVarTy v)
                 | isCoVar v = Coercion (mkCoVarCo v)
-                | otherwise = ASSERT( isId v ) Var v
+                | otherwise = assert (isId v) $ Var v
 
 varsToCoreExprs :: [CoreBndr] -> [Expr b]
 varsToCoreExprs vs = map varToCoreExpr vs
@@ -2088,21 +2011,11 @@ These are defined here to avoid a module loop between GHC.Core.Utils and GHC.Cor
 
 -}
 
-applyTypeToArg :: Type -> CoreExpr -> Type
--- ^ Determines the type resulting from applying an expression with given type
--- to a given argument expression
-applyTypeToArg fun_ty arg = piResultTy fun_ty (exprToType arg)
-
 -- | If the expression is a 'Type', converts. Otherwise,
 -- panics. NB: This does /not/ convert 'Coercion' to 'CoercionTy'.
 exprToType :: CoreExpr -> Type
 exprToType (Type ty)     = ty
 exprToType _bad          = pprPanic "exprToType" empty
-
--- | If the expression is a 'Coercion', converts.
-exprToCoercion_maybe :: CoreExpr -> Maybe Coercion
-exprToCoercion_maybe (Coercion co) = Just co
-exprToCoercion_maybe _             = Nothing
 
 {-
 ************************************************************************
@@ -2128,7 +2041,7 @@ rhssOfBind (NonRec _ rhs) = [rhs]
 rhssOfBind (Rec pairs)    = [rhs | (_,rhs) <- pairs]
 
 rhssOfAlts :: [Alt b] -> [Expr b]
-rhssOfAlts alts = [e | (_,_,e) <- alts]
+rhssOfAlts alts = [e | Alt _ _ e <- alts]
 
 -- | Collapse all the bindings in the supplied groups into a single
 -- list of lhs\/rhs pairs suitable for binding in a 'Rec' binding group
@@ -2188,6 +2101,14 @@ collectArgs expr
     go (App f a) as = go f (a:as)
     go e         as = (e, as)
 
+-- | fmap on the body of a lambda.
+--   wrapLamBody f (\x -> body) == (\x -> f body)
+wrapLamBody :: (CoreExpr -> CoreExpr) -> CoreExpr -> CoreExpr
+wrapLamBody f expr = go expr
+  where
+  go (Lam v body) = Lam v $ go body
+  go expr = f expr
+
 -- | Attempt to remove the last N arguments of a function call.
 -- Strip off any ticks or coercions encountered along the way and any
 -- at the end.
@@ -2200,8 +2121,8 @@ stripNArgs _ _ = Nothing
 
 -- | Like @collectArgs@, but also collects looks through floatable
 -- ticks if it means that we can find more arguments.
-collectArgsTicks :: (Tickish Id -> Bool) -> Expr b
-                 -> (Expr b, [Arg b], [Tickish Id])
+collectArgsTicks :: (CoreTickish -> Bool) -> Expr b
+                 -> (Expr b, [Arg b], [CoreTickish])
 collectArgsTicks skipTick expr
   = go expr [] []
   where
@@ -2286,12 +2207,12 @@ data AnnExpr' bndr annot
   | AnnLet      (AnnBind bndr annot) (AnnExpr bndr annot)
   | AnnCast     (AnnExpr bndr annot) (annot, Coercion)
                    -- Put an annotation on the (root of) the coercion
-  | AnnTick     (Tickish Id) (AnnExpr bndr annot)
+  | AnnTick     CoreTickish (AnnExpr bndr annot)
   | AnnType     Type
   | AnnCoercion Coercion
 
 -- | A clone of the 'Alt' type but allowing annotation at every tree node
-type AnnAlt bndr annot = (AltCon, [bndr], AnnExpr bndr annot)
+data AnnAlt bndr annot = AnnAlt AltCon [bndr] (AnnExpr bndr annot)
 
 -- | A clone of the 'Bind' type but allowing annotation at every tree node
 data AnnBind bndr annot
@@ -2307,8 +2228,8 @@ collectAnnArgs expr
     go (_, AnnApp f a) as = go f (a:as)
     go e               as = (e, as)
 
-collectAnnArgsTicks :: (Tickish Var -> Bool) -> AnnExpr b a
-                       -> (AnnExpr b a, [AnnExpr b a], [Tickish Var])
+collectAnnArgsTicks :: (CoreTickish -> Bool) -> AnnExpr b a
+                       -> (AnnExpr b a, [AnnExpr b a], [CoreTickish])
 collectAnnArgsTicks tickishOk expr
   = go expr [] []
   where
@@ -2336,7 +2257,7 @@ deAnnotate' (AnnCase scrut v t alts)
   = Case (deAnnotate scrut) v t (map deAnnAlt alts)
 
 deAnnAlt :: AnnAlt bndr annot -> Alt bndr
-deAnnAlt (con,args,rhs) = (con,args,deAnnotate rhs)
+deAnnAlt (AnnAlt con args rhs) = Alt con args (deAnnotate rhs)
 
 deAnnBind  :: AnnBind b annot -> Bind b
 deAnnBind (AnnNonRec var rhs) = NonRec var (deAnnotate rhs)

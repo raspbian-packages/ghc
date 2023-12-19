@@ -1,13 +1,14 @@
+{-# LANGUAGE RankNTypes     #-}
+{-# LANGUAGE TypeFamilies   #-}
+{-# LANGUAGE BlockArguments #-}
+
+{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
+
 {-
 (c) The University of Glasgow 2006
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
 
 -}
-
-{-# LANGUAGE RankNTypes, TupleSections #-}
-{-# LANGUAGE TypeFamilies #-}
-
-{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 
 -- | Typecheck arrow notation
 module GHC.Tc.Gen.Arrow ( tcProc ) where
@@ -15,11 +16,13 @@ module GHC.Tc.Gen.Arrow ( tcProc ) where
 import GHC.Prelude
 
 import {-# SOURCE #-}   GHC.Tc.Gen.Expr( tcCheckMonoExpr, tcInferRho, tcSyntaxOp
-                                       , tcCheckId, tcCheckPolyExpr )
+                                       , tcCheckPolyExpr )
 
 import GHC.Hs
+import GHC.Tc.Errors.Types
 import GHC.Tc.Gen.Match
-import GHC.Tc.Utils.Zonk( hsLPatType )
+import GHC.Tc.Gen.Head( tcCheckId )
+import GHC.Tc.Utils.Concrete ( hasFixedRuntimeRep_syntactic )
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Utils.TcMType
 import GHC.Tc.Gen.Bind
@@ -36,8 +39,10 @@ import GHC.Builtin.Types
 import GHC.Types.Var.Set
 import GHC.Builtin.Types.Prim
 import GHC.Types.Basic( Arity )
+import GHC.Types.Error
 import GHC.Types.SrcLoc
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
 import GHC.Utils.Misc
 
 import Control.Monad
@@ -87,14 +92,18 @@ tcProc :: LPat GhcRn -> LHsCmdTop GhcRn         -- proc pat -> expr
        -> ExpRhoType                            -- Expected type of whole proc expression
        -> TcM (LPat GhcTc, LHsCmdTop GhcTc, TcCoercion)
 
-tcProc pat cmd exp_ty
-  = newArrowScope $
-    do  { exp_ty <- expTypeToType exp_ty  -- no higher-rank stuff with arrows
+tcProc pat cmd@(L loc (HsCmdTop names _)) exp_ty
+  = do  { exp_ty <- expTypeToType exp_ty  -- no higher-rank stuff with arrows
         ; (co, (exp_ty1, res_ty)) <- matchExpectedAppTy exp_ty
         ; (co1, (arr_ty, arg_ty)) <- matchExpectedAppTy exp_ty1
+        -- start with the names as they are used to desugar the proc itself
+        -- See #17423
+        ; names' <- setSrcSpanA loc $
+            mapM (tcSyntaxName ProcOrigin arr_ty) names
         ; let cmd_env = CmdEnv { cmd_arr = arr_ty }
-        ; (pat', cmd') <- tcCheckPat ProcExpr pat (unrestricted arg_ty) $
-                          tcCmdTop cmd_env cmd (unitTy, res_ty)
+        ; (pat', cmd') <- newArrowScope
+                          $ tcCheckPat (ArrowMatchCtxt ProcExpr) pat (unrestricted arg_ty)
+                          $ tcCmdTop cmd_env names' cmd (unitTy, res_ty)
         ; let res_co = mkTcTransCo co
                          (mkTcAppCo co1 (mkTcNomReflCo res_ty))
         ; return (pat', cmd', res_co) }
@@ -113,7 +122,7 @@ type CmdArgType = TcTauType                  -- carg_type, a nested tuple
 
 data CmdEnv
   = CmdEnv {
-        cmd_arr :: TcType -- arrow type constructor, of kind *->*->*
+        cmd_arr :: TcType -- ^ Arrow type constructor, of kind *->*->*
     }
 
 mkCmdArrTy :: CmdEnv -> TcTauType -> TcTauType -> TcTauType
@@ -121,46 +130,52 @@ mkCmdArrTy env t1 t2 = mkAppTys (cmd_arr env) [t1, t2]
 
 ---------------------------------------
 tcCmdTop :: CmdEnv
+         -> CmdSyntaxTable GhcTc -- ^ Type-checked Arrow class methods (arr, (>>>), ...)
          -> LHsCmdTop GhcRn
          -> CmdType
          -> TcM (LHsCmdTop GhcTc)
 
-tcCmdTop env (L loc (HsCmdTop names cmd)) cmd_ty@(cmd_stk, res_ty)
-  = setSrcSpan loc $
-    do  { cmd'   <- tcCmd env cmd cmd_ty
-        ; names' <- mapM (tcSyntaxName ProcOrigin (cmd_arr env)) names
-        ; return (L loc $ HsCmdTop (CmdTopTc cmd_stk res_ty names') cmd') }
+tcCmdTop env names (L loc (HsCmdTop _names cmd)) cmd_ty@(cmd_stk, res_ty)
+  = setSrcSpanA loc $
+    do  { cmd' <- tcCmd env cmd cmd_ty
+        ; return (L loc $ HsCmdTop (CmdTopTc cmd_stk res_ty names) cmd') }
 
 ----------------------------------------
 tcCmd  :: CmdEnv -> LHsCmd GhcRn -> CmdType -> TcM (LHsCmd GhcTc)
         -- The main recursive function
-tcCmd env (L loc cmd) res_ty
-  = setSrcSpan loc $ do
-        { cmd' <- tc_cmd env cmd res_ty
+tcCmd env (L loc cmd) cmd_ty@(_, res_ty)
+  = setSrcSpan (locA loc) $ do
+        { cmd' <- tc_cmd env cmd cmd_ty
+        ; hasFixedRuntimeRep_syntactic (FRRArrow $ ArrowCmdResTy cmd) res_ty
         ; return (L loc cmd') }
 
 tc_cmd :: CmdEnv -> HsCmd GhcRn  -> CmdType -> TcM (HsCmd GhcTc)
-tc_cmd env (HsCmdPar x cmd) res_ty
+tc_cmd env (HsCmdPar x lpar cmd rpar) res_ty
   = do  { cmd' <- tcCmd env cmd res_ty
-        ; return (HsCmdPar x cmd') }
+        ; return (HsCmdPar x lpar cmd' rpar) }
 
-tc_cmd env (HsCmdLet x (L l binds) (L body_loc body)) res_ty
+tc_cmd env (HsCmdLet x tkLet binds tkIn (L body_loc body)) res_ty
   = do  { (binds', body') <- tcLocalBinds binds         $
-                             setSrcSpan body_loc        $
+                             setSrcSpan (locA body_loc) $
                              tc_cmd env body res_ty
-        ; return (HsCmdLet x (L l binds') (L body_loc body')) }
+        ; return (HsCmdLet x tkLet binds' tkIn (L body_loc body')) }
 
 tc_cmd env in_cmd@(HsCmdCase x scrut matches) (stk, res_ty)
   = addErrCtxt (cmdCtxt in_cmd) $ do
       (scrut', scrut_ty) <- tcInferRho scrut
+      hasFixedRuntimeRep_syntactic
+        (FRRArrow $ ArrowCmdCase)
+        scrut_ty
       matches' <- tcCmdMatches env scrut_ty matches (stk, res_ty)
       return (HsCmdCase x scrut' matches')
 
-tc_cmd env in_cmd@(HsCmdLamCase x matches) (stk, res_ty)
-  = addErrCtxt (cmdCtxt in_cmd) $ do
-      (co, [scrut_ty], stk') <- matchExpectedCmdArgs 1 stk
-      matches' <- tcCmdMatches env scrut_ty matches (stk', res_ty)
-      return (mkHsCmdWrap (mkWpCastN co) (HsCmdLamCase x matches'))
+tc_cmd env cmd@(HsCmdLamCase x lc_variant match) cmd_ty
+  = addErrCtxt (cmdCtxt cmd)
+      do { let match_ctxt = ArrowLamCaseAlt lc_variant
+         ; checkArgCounts (ArrowMatchCtxt match_ctxt) match
+         ; (wrap, match') <-
+             tcCmdMatchLambda env match_ctxt match cmd_ty
+         ; return (mkHsCmdWrap wrap (HsCmdLamCase x lc_variant match')) }
 
 tc_cmd env (HsCmdIf x NoSyntaxExprRn pred b1 b2) res_ty    -- Ordinary 'if'
   = do  { pred' <- tcCheckMonoExpr pred boolTy
@@ -174,14 +189,15 @@ tc_cmd env (HsCmdIf x fun@(SyntaxExprRn {}) pred b1 b2) res_ty -- Rebindable syn
         -- For arrows, need ifThenElse :: forall r. T -> r -> r -> r
         -- because we're going to apply it to the environment, not
         -- the return value.
-        ; (_, [r_tv]) <- tcInstSkolTyVars [alphaTyVar]
+        ; skol_info <- mkSkolemInfo ArrowReboundIfSkol
+        ; (_, [r_tv]) <- tcInstSkolTyVars skol_info [alphaTyVar]
         ; let r_ty = mkTyVarTy r_tv
         ; checkTc (not (r_tv `elemVarSet` tyCoVarsOfType pred_ty))
-                  (text "Predicate type of `ifThenElse' depends on result type")
-        ; (pred', fun')
-            <- tcSyntaxOp IfOrigin fun (map synKnownType [pred_ty, r_ty, r_ty])
-                                       (mkCheckExpType r_ty) $ \ _ _ ->
-               tcCheckMonoExpr pred pred_ty
+                  TcRnArrowIfThenElsePredDependsOnResultTy
+        ; (pred', fun') <- tcSyntaxOp IfThenElseOrigin fun
+                              (map synKnownType [pred_ty, r_ty, r_ty])
+                              (mkCheckExpType r_ty) $ \ _ _ ->
+                           tcCheckMonoExpr pred pred_ty
 
         ; b1'   <- tcCmd env b1 res_ty
         ; b2'   <- tcCmd env b2 res_ty
@@ -212,6 +228,10 @@ tc_cmd env cmd@(HsCmdArrApp _ fun arg ho_app lr) (_, res_ty)
 
         ; arg' <- tcCheckMonoExpr arg arg_ty
 
+        ; hasFixedRuntimeRep_syntactic
+            (FRRArrow $ ArrowCmdArrApp (unLoc fun) (unLoc arg) ho_app)
+            fun_ty
+
         ; return (HsCmdArrApp fun_ty fun' arg' ho_app lr) }
   where
        -- Before type-checking f, use the environment of the enclosing
@@ -236,6 +256,9 @@ tc_cmd env cmd@(HsCmdApp x fun arg) (cmd_stk, res_ty)
     do  { arg_ty <- newOpenFlexiTyVarTy
         ; fun'   <- tcCmd env fun (mkPairTy arg_ty cmd_stk, res_ty)
         ; arg'   <- tcCheckMonoExpr arg arg_ty
+        ; hasFixedRuntimeRep_syntactic
+            (FRRArrow $ ArrowCmdApp (unLoc fun) (unLoc arg))
+            arg_ty
         ; return (HsCmdApp x fun' arg') }
 
 -------------------------------------------
@@ -245,42 +268,9 @@ tc_cmd env cmd@(HsCmdApp x fun arg) (cmd_stk, res_ty)
 -- ------------------------------
 -- D;G |-a (\x.cmd) : (t,stk) --> res
 
-tc_cmd env
-       (HsCmdLam x (MG { mg_alts = L l [L mtch_loc
-                                   (match@(Match { m_pats = pats, m_grhss = grhss }))],
-                         mg_origin = origin }))
-       (cmd_stk, res_ty)
-  = addErrCtxt (pprMatchInCtxt match)        $
-    do  { (co, arg_tys, cmd_stk') <- matchExpectedCmdArgs n_pats cmd_stk
-
-                -- Check the patterns, and the GRHSs inside
-        ; (pats', grhss') <- setSrcSpan mtch_loc                                 $
-                             tcPats LambdaExpr pats (map (unrestricted . mkCheckExpType) arg_tys) $
-                             tc_grhss grhss cmd_stk' (mkCheckExpType res_ty)
-
-        ; let match' = L mtch_loc (Match { m_ext = noExtField
-                                         , m_ctxt = LambdaExpr, m_pats = pats'
-                                         , m_grhss = grhss' })
-              arg_tys = map (unrestricted . hsLPatType) pats'
-              cmd' = HsCmdLam x (MG { mg_alts = L l [match']
-                                    , mg_ext = MatchGroupTc arg_tys res_ty
-                                    , mg_origin = origin })
-        ; return (mkHsCmdWrap (mkWpCastN co) cmd') }
-  where
-    n_pats     = length pats
-    match_ctxt = (LambdaExpr :: HsMatchContext GhcRn)    -- Maybe KappaExpr?
-    pg_ctxt    = PatGuard match_ctxt
-
-    tc_grhss (GRHSs x grhss (L l binds)) stk_ty res_ty
-        = do { (binds', grhss') <- tcLocalBinds binds $
-                                   mapM (wrapLocM (tc_grhs stk_ty res_ty)) grhss
-             ; return (GRHSs x grhss' (L l binds')) }
-
-    tc_grhs stk_ty res_ty (GRHS x guards body)
-        = do { (guards', rhs') <- tcStmtsAndThen pg_ctxt tcGuardStmt guards res_ty $
-                                  \ res_ty -> tcCmd env body
-                                                (stk_ty, checkingExpType "tc_grhs" res_ty)
-             ; return (GRHS x guards' rhs') }
+tc_cmd env (HsCmdLam x match) cmd_ty
+  = do { (wrap, match') <- tcCmdMatchLambda env KappaExpr match cmd_ty
+       ; return (mkHsCmdWrap wrap (HsCmdLam x match')) }
 
 -------------------------------------------
 --              Do notation
@@ -306,7 +296,7 @@ tc_cmd env (HsCmdDo _ (L l stmts) ) (cmd_stk, res_ty)
 --      D; G |-a  (| e c1 ... cn |)  :  stk --> t
 
 tc_cmd env cmd@(HsCmdArrForm x expr f fixity cmd_args) (cmd_stk, res_ty)
-  = addErrCtxt (cmdCtxt cmd)    $
+  = addErrCtxt (cmdCtxt cmd)
     do  { (cmd_args', cmd_tys) <- mapAndUnzipM tc_cmd_arg cmd_args
                               -- We use alphaTyVar for 'w'
         ; let e_ty = mkInfForAllTy alphaTyVar $
@@ -317,38 +307,81 @@ tc_cmd env cmd@(HsCmdArrForm x expr f fixity cmd_args) (cmd_stk, res_ty)
 
   where
     tc_cmd_arg :: LHsCmdTop GhcRn -> TcM (LHsCmdTop GhcTc, TcType)
-    tc_cmd_arg cmd
+    tc_cmd_arg cmd@(L loc (HsCmdTop names _))
        = do { arr_ty <- newFlexiTyVarTy arrowTyConKind
             ; stk_ty <- newFlexiTyVarTy liftedTypeKind
             ; res_ty <- newFlexiTyVarTy liftedTypeKind
+            ; names' <- setSrcSpanA loc $
+                mapM (tcSyntaxName ArrowCmdOrigin arr_ty) names
             ; let env' = env { cmd_arr = arr_ty }
-            ; cmd' <- tcCmdTop env' cmd (stk_ty, res_ty)
+            ; cmd' <- tcCmdTop env' names' cmd (stk_ty, res_ty)
             ; return (cmd',  mkCmdArrTy env' (mkPairTy alphaTy stk_ty) res_ty) }
 
------------------------------------------------------------------
---              Base case for illegal commands
--- This is where expressions that aren't commands get rejected
-
-tc_cmd _ cmd _
-  = failWithTc (vcat [text "The expression", nest 2 (ppr cmd),
-                      text "was found where an arrow command was expected"])
-
--- | Typechecking for case command alternatives. Used for both
--- 'HsCmdCase' and 'HsCmdLamCase'.
+-- | Typechecking for case command alternatives. Used for 'HsCmdCase'.
 tcCmdMatches :: CmdEnv
-             -> TcType                           -- ^ type of the scrutinee
+             -> TcTypeFRR -- ^ Type of the scrutinee.
              -> MatchGroup GhcRn (LHsCmd GhcRn)  -- ^ case alternatives
              -> CmdType
              -> TcM (MatchGroup GhcTc (LHsCmd GhcTc))
 tcCmdMatches env scrut_ty matches (stk, res_ty)
   = tcMatchesCase match_ctxt (unrestricted scrut_ty) matches (mkCheckExpType res_ty)
   where
-    match_ctxt = MC { mc_what = CaseAlt,
+    match_ctxt = MC { mc_what = ArrowMatchCtxt ArrowCaseAlt,
                       mc_body = mc_body }
     mc_body body res_ty' = do { res_ty' <- expTypeToType res_ty'
                               ; tcCmd env body (stk, res_ty') }
 
-matchExpectedCmdArgs :: Arity -> TcType -> TcM (TcCoercionN, [TcType], TcType)
+-- | Typechecking for 'HsCmdLam' and 'HsCmdLamCase'.
+tcCmdMatchLambda :: CmdEnv
+                 -> HsArrowMatchContext
+                 -> MatchGroup GhcRn (LHsCmd GhcRn)
+                 -> CmdType
+                 -> TcM (HsWrapper, MatchGroup GhcTc (LHsCmd GhcTc))
+tcCmdMatchLambda env
+                 ctxt
+                 mg@MG { mg_alts = L l matches }
+                 (cmd_stk, res_ty)
+  = do { (co, arg_tys, cmd_stk') <- matchExpectedCmdArgs n_pats cmd_stk
+
+       ; let check_arg_tys = map (unrestricted . mkCheckExpType) arg_tys
+       ; matches' <- forM matches $
+           addErrCtxt . pprMatchInCtxt . unLoc <*> tc_match check_arg_tys cmd_stk'
+
+       ; let arg_tys' = map unrestricted arg_tys
+             mg' = mg { mg_alts = L l matches'
+                      , mg_ext = MatchGroupTc arg_tys' res_ty }
+
+       ; return (mkWpCastN co, mg') }
+  where
+    n_pats | isEmptyMatchGroup mg = 1   -- must be lambda-case
+           | otherwise            = matchGroupArity mg
+
+    -- Check the patterns, and the GRHSs inside
+    tc_match arg_tys cmd_stk' (L mtch_loc (Match { m_pats = pats, m_grhss = grhss }))
+      = do { (pats', grhss') <- setSrcSpanA mtch_loc           $
+                                tcPats match_ctxt pats arg_tys $
+                                tc_grhss grhss cmd_stk' (mkCheckExpType res_ty)
+
+           ; return $ L mtch_loc (Match { m_ext = noAnn
+                                        , m_ctxt = match_ctxt
+                                        , m_pats = pats'
+                                        , m_grhss = grhss' }) }
+
+    match_ctxt = ArrowMatchCtxt ctxt
+    pg_ctxt    = PatGuard match_ctxt
+
+    tc_grhss (GRHSs x grhss binds) stk_ty res_ty
+        = do { (binds', grhss') <- tcLocalBinds binds $
+                                   mapM (wrapLocMA (tc_grhs stk_ty res_ty)) grhss
+             ; return (GRHSs x grhss' binds') }
+
+    tc_grhs stk_ty res_ty (GRHS x guards body)
+        = do { (guards', rhs') <- tcStmtsAndThen pg_ctxt tcGuardStmt guards res_ty $
+                                  \ res_ty -> tcCmd env body
+                                                (stk_ty, checkingExpType "tc_grhs" res_ty)
+             ; return (GRHS x guards' rhs') }
+
+matchExpectedCmdArgs :: Arity -> TcType -> TcM (TcCoercionN, [TcTypeFRR], TcType)
 matchExpectedCmdArgs 0 ty
   = return (mkTcNomReflCo ty, [], ty)
 matchExpectedCmdArgs n ty
@@ -387,7 +420,7 @@ tcArrDoStmt env ctxt (BindStmt _ pat rhs) res_ty thing_inside
                             thing_inside res_ty
         ; return (mkTcBindStmt pat' rhs', thing) }
 
-tcArrDoStmt env ctxt (RecStmt { recS_stmts = stmts, recS_later_ids = later_names
+tcArrDoStmt env ctxt (RecStmt { recS_stmts = L l stmts, recS_later_ids = later_names
                             , recS_rec_ids = rec_names }) res_ty thing_inside
   = do  { let tup_names = rec_names ++ filterOut (`elem` rec_names) later_names
         ; tup_elt_tys <- newFlexiTyVarTys (length tup_names) liftedTypeKind
@@ -402,7 +435,7 @@ tcArrDoStmt env ctxt (RecStmt { recS_stmts = stmts, recS_later_ids = later_names
                 -- NB:  The rec_ids for the recursive things
                 --      already scope over this part. This binding may shadow
                 --      some of them with polymorphic things with the same Name
-                --      (see note [RecStmt] in GHC.Hs.Expr)
+                --      (see Note [RecStmt] in GHC.Hs.Expr)
 
         ; let rec_ids = takeList rec_names tup_ids
         ; later_ids <- tcLookupLocalIds later_names
@@ -411,13 +444,18 @@ tcArrDoStmt env ctxt (RecStmt { recS_stmts = stmts, recS_later_ids = later_names
         ; let ret_table = zip tup_ids tup_rets
         ; let later_rets = [r | i <- later_ids, (j, r) <- ret_table, i == j]
 
-        ; return (emptyRecStmtId { recS_stmts = stmts'
+        ; let
+            stmt :: Stmt GhcTc (LocatedA (HsCmd GhcTc))
+            stmt = emptyRecStmtId
+                                 { recS_stmts = L l stmts'
+                                 -- { recS_stmts = _ stmts'
                                  , recS_later_ids = later_ids
                                  , recS_rec_ids = rec_ids
                                  , recS_ext = unitRecStmtTc
                                      { recS_later_rets = later_rets
                                      , recS_rec_rets = rec_rets
-                                     , recS_ret_ty = res_ty} }, thing)
+                                     , recS_ret_ty = res_ty} }
+        ; return (stmt, thing)
         }}
 
 tcArrDoStmt _ _ stmt _ _

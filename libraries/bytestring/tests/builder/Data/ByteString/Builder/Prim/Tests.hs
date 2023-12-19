@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, ScopedTypeVariables #-}
+{-# LANGUAGE MagicHash #-}
 
 -- |
 -- Copyright   : (c) 2011 Simon Meier
@@ -14,21 +14,27 @@ module Data.ByteString.Builder.Prim.Tests (tests) where
 
 import           Data.Char  (ord)
 import qualified Data.ByteString.Lazy                  as L
+import qualified Data.ByteString.Lazy.Char8            as LC
 import           Data.ByteString.Builder
 import qualified Data.ByteString.Builder.Prim          as BP
 import           Data.ByteString.Builder.Prim.TestUtils
 
-#if defined(HAVE_TEST_FRAMEWORK)
 import           Test.Tasty
-#else
-import           TestFramework
-#endif
-
+import           Test.Tasty.QuickCheck
 
 tests :: [TestTree]
 tests = concat [ testsBinary, testsASCII, testsChar8, testsUtf8
-               , testsCombinatorsB ]
+               , testsCombinatorsB, [testCString, testCStringUtf8] ]
 
+testCString :: TestTree
+testCString = testProperty "cstring" $
+    toLazyByteString (BP.cstring "hello world!"#) ==
+      LC.pack "hello" `L.append` L.singleton 0x20 `L.append` LC.pack "world!"
+
+testCStringUtf8 :: TestTree
+testCStringUtf8 = testProperty "cstringUtf8" $
+    toLazyByteString (BP.cstringUtf8 "hello\xc0\x80world!"#) ==
+      LC.pack "hello" `L.append` L.singleton 0x00 `L.append` LC.pack "world!"
 
 ------------------------------------------------------------------------------
 -- Binary

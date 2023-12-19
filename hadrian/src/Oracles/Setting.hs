@@ -7,11 +7,11 @@ module Oracles.Setting (
 
     -- * Helpers
     ghcCanonVersion, cmdLineLengthLimit, hostSupportsRPaths, topDirectory,
-    libsuf, ghcVersionStage,
+    libsuf, ghcVersionStage, bashPath,
 
     -- ** Target platform things
     anyTargetPlatform, anyTargetOs, anyTargetArch, anyHostOs,
-    isElfTarget,
+    isElfTarget, isOsxTarget, isWinTarget,
     ArmVersion(..),
     targetArmVersion,
     ghcWithInterpreter
@@ -36,6 +36,7 @@ data Setting = BuildArch
              | BuildOs
              | BuildPlatform
              | BuildVendor
+             | CursesIncludeDir
              | CursesLibDir
              | DynamicExtension
              | FfiIncludeDir
@@ -76,6 +77,9 @@ data Setting = BuildArch
              | TargetArchHaskell
              | TargetOsHaskell
              | TargetArmVersion
+             | TargetWordSize
+             | TargetHasRtsLinker
+             | BourneShell
 
 -- TODO: Reduce the variety of similar flags (e.g. CPP and non-CPP versions).
 -- | Each 'SettingList' comes from the file @hadrian/cfg/system.config@,
@@ -102,6 +106,7 @@ data SettingList = ConfCcArgs Stage
 -- Eventually much of that local can probably be computed just in Hadrian.
 data SettingsFileSetting
     = SettingsFileSetting_CCompilerCommand
+    | SettingsFileSetting_CxxCompilerCommand
     | SettingsFileSetting_HaskellCPPCommand
     | SettingsFileSetting_HaskellCPPFlags
     | SettingsFileSetting_CCompilerFlags
@@ -123,15 +128,17 @@ data SettingsFileSetting
     | SettingsFileSetting_ClangCommand
     | SettingsFileSetting_LlcCommand
     | SettingsFileSetting_OptCommand
+    | SettingsFileSetting_DistroMinGW
 
 -- | Look up the value of a 'Setting' in @cfg/system.config@, tracking the
 -- result.
 setting :: Setting -> Action String
-setting key = lookupValueOrError configFile $ case key of
+setting key = lookupSystemConfig $ case key of
     BuildArch          -> "build-arch"
     BuildOs            -> "build-os"
     BuildPlatform      -> "build-platform"
     BuildVendor        -> "build-vendor"
+    CursesIncludeDir   -> "curses-include-dir"
     CursesLibDir       -> "curses-lib-dir"
     DynamicExtension   -> "dynamic-extension"
     FfiIncludeDir      -> "ffi-include-dir"
@@ -172,24 +179,32 @@ setting key = lookupValueOrError configFile $ case key of
     TargetVendor       -> "target-vendor"
     TargetArchHaskell  -> "target-arch-haskell"
     TargetOsHaskell    -> "target-os-haskell"
+    TargetWordSize     -> "target-word-size"
+    TargetHasRtsLinker -> "target-has-rts-linker"
+    BourneShell        -> "bourne-shell"
+
+bootIsStage0 :: Stage -> Stage
+bootIsStage0 (Stage0 {}) = Stage0 InTreeLibs
+bootIsStage0 s = s
 
 -- | Look up the value of a 'SettingList' in @cfg/system.config@, tracking the
 -- result.
 settingList :: SettingList -> Action [String]
-settingList key = fmap words $ lookupValueOrError configFile $ case key of
-    ConfCcArgs        stage -> "conf-cc-args-"         ++ stageString stage
-    ConfCppArgs       stage -> "conf-cpp-args-"        ++ stageString stage
-    ConfGccLinkerArgs stage -> "conf-gcc-linker-args-" ++ stageString stage
-    ConfLdLinkerArgs  stage -> "conf-ld-linker-args-"  ++ stageString stage
-    ConfMergeObjectsArgs stage -> "conf-merge-objects-args-"  ++ stageString stage
+settingList key = fmap words $ lookupSystemConfig $ case key of
+    ConfCcArgs        stage -> "conf-cc-args-"         ++ stageString (bootIsStage0 stage)
+    ConfCppArgs       stage -> "conf-cpp-args-"        ++ stageString (bootIsStage0 stage)
+    ConfGccLinkerArgs stage -> "conf-gcc-linker-args-" ++ stageString (bootIsStage0 stage)
+    ConfLdLinkerArgs  stage -> "conf-ld-linker-args-"  ++ stageString (bootIsStage0 stage)
+    ConfMergeObjectsArgs stage -> "conf-merge-objects-args-"  ++ stageString (bootIsStage0 stage)
     HsCppArgs               -> "hs-cpp-args"
 
 -- | Look up the value of a 'SettingList' in @cfg/system.config@, tracking the
 -- result.
 -- See Note [tooldir: How GHC finds mingw on Windows]
 settingsFileSetting :: SettingsFileSetting -> Action String
-settingsFileSetting key = lookupValueOrError configFile $ case key of
+settingsFileSetting key = lookupSystemConfig $ case key of
     SettingsFileSetting_CCompilerCommand -> "settings-c-compiler-command"
+    SettingsFileSetting_CxxCompilerCommand -> "settings-cxx-compiler-command"
     SettingsFileSetting_HaskellCPPCommand -> "settings-haskell-cpp-command"
     SettingsFileSetting_HaskellCPPFlags -> "settings-haskell-cpp-flags"
     SettingsFileSetting_CCompilerFlags -> "settings-c-compiler-flags"
@@ -211,11 +226,16 @@ settingsFileSetting key = lookupValueOrError configFile $ case key of
     SettingsFileSetting_ClangCommand -> "settings-clang-command"
     SettingsFileSetting_LlcCommand -> "settings-llc-command"
     SettingsFileSetting_OptCommand -> "settings-opt-command"
+    SettingsFileSetting_DistroMinGW -> "settings-use-distro-mingw"
 
 -- | An expression that looks up the value of a 'Setting' in @cfg/system.config@,
 -- tracking the result.
 getSetting :: Setting -> Expr c b String
 getSetting = expr . setting
+
+-- | The path to a Bourne shell interpreter.
+bashPath :: Action FilePath
+bashPath = setting BourneShell
 
 -- | An expression that looks up the value of a 'SettingList' in
 -- @cfg/system.config@, tracking the result.
@@ -233,6 +253,12 @@ anyTargetPlatform = matchSetting TargetPlatformFull
 -- | Check whether the target OS setting matches one of the given strings.
 anyTargetOs :: [String] -> Action Bool
 anyTargetOs = matchSetting TargetOs
+
+isWinTarget :: Action Bool
+isWinTarget = anyTargetOs ["mingw32"]
+
+isOsxTarget :: Action Bool
+isOsxTarget = anyTargetOs ["darwin"]
 
 -- | Check whether the target architecture setting matches one of the given
 -- strings.
@@ -261,12 +287,8 @@ hostSupportsRPaths = anyHostOs ["linux", "darwin", "freebsd"]
 -- | Check whether the target supports GHCi.
 ghcWithInterpreter :: Action Bool
 ghcWithInterpreter = do
-    goodOs <- anyTargetOs [ "mingw32", "cygwin32", "linux", "solaris2"
-                          , "freebsd", "dragonfly", "netbsd", "openbsd"
-                          , "darwin", "kfreebsdgnu" ]
-    goodArch <- anyTargetArch [ "i386", "x86_64", "powerpc", "sparc"
-                              , "sparc64", "arm", "aarch64", "s390x" ]
-    return $ goodOs && goodArch
+    -- Enable GHCi on all platforms for Debian
+    return True
 
 -- | Variants of the ARM architecture.
 data ArmVersion = ARMv5 | ARMv6 | ARMv7
@@ -295,12 +317,12 @@ topDirectory :: Action FilePath
 topDirectory = fixAbsolutePathOnWindows =<< setting GhcSourcePath
 
 ghcVersionStage :: Stage -> Action String
-ghcVersionStage Stage0 = setting GhcVersion
+ghcVersionStage (Stage0 {}) = setting GhcVersion
 ghcVersionStage _      = setting ProjectVersion
 
 -- | The file suffix used for libraries of a given build 'Way'. For example,
 -- @_p.a@ corresponds to a static profiled library, and @-ghc7.11.20141222.so@
--- is a dynamic vanilly library. Why do we need GHC version number in the
+-- is a dynamic vanilla library. Why do we need GHC version number in the
 -- dynamic suffix? Here is a possible reason: dynamic libraries are placed in a
 -- single giant directory in the load path of the dynamic linker, and hence we
 -- must distinguish different versions of GHC. In contrast, static libraries

@@ -13,7 +13,7 @@
  *
  * ---------------------------------------------------------------------------*/
 
-#include "PosixSource.h"
+#include "rts/PosixSource.h"
 #include "Rts.h"
 
 #if defined(DEBUG)                                                   /* whole file */
@@ -44,6 +44,8 @@ static void  checkLargeBitmap    ( StgPtr payload, StgLargeBitmap*, uint32_t );
 static void  checkClosureShallow ( const StgClosure * );
 static void  checkSTACK          (StgStack *stack);
 
+static void  checkCompactObjects (bdescr *bd);
+
 static W_    countNonMovingSegments ( struct NonmovingSegment *segs );
 static W_    countNonMovingHeap     ( struct NonmovingHeap *heap );
 
@@ -53,6 +55,11 @@ static W_    countNonMovingHeap     ( struct NonmovingHeap *heap );
 
 // the HEAP_ALLOCED macro in function form. Useful for use in GDB or similar.
 int isHeapAlloced    ( StgPtr p) { return HEAP_ALLOCED(p); }
+
+static bool isNonmovingGen(generation *gen)
+{
+    return RtsFlags.GcFlags.useNonmoving && gen == oldest_gen;
+}
 
 /* -----------------------------------------------------------------------------
    Check stack sanity
@@ -233,6 +240,111 @@ checkClosureProfSanity(const StgClosure *p)
 }
 #endif
 
+/* Note [Racing weak pointer evacuation]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * While debugging a GC crash (#18919) I noticed a spurious crash due to the
+ * end-of-GC sanity check stumbling across a weak pointer with unevacuated key.
+ * This can happen when two GC threads race to evacuate a weak pointer.
+ * Specifically, we start out with a heap with a weak pointer reachable
+ * from both a generation's weak pointer list and some other root-reachable
+ * closure (e.g. a Just constructor):
+ *
+ *            O                      W
+ *            ┌──────────┐           ┌──────────┐
+ * Root ────→ │ Just     │     ╭───→ │ Weak#    │ ←─────── weak_ptr_list
+ * Set        ├──────────┤     │     ├──────────┤
+ *            │          │ ────╯     │ value    │ ─→ ...
+ *            └──────────┘           │ key      │ ───╮    K
+ *                                   │ ...      │    │    ┌──────────┐
+ *                                   └──────────┘    ╰──→ │ ...      │
+ *                                                        ├──────────┤
+ *
+ * The situation proceeds as follows:
+ *
+ * 1. Thread A initiates a GC, wakes up the GC worker threads, and starts
+ *    evacuating roots.
+ * 2. Thread A evacuates a weak pointer object O to location O'.
+ * 3. Thread A fills the block where O' lives and pushes it to its
+ *    work-stealing queue.
+ * 4. Thread B steals the O' block and starts scavenging it.
+ * 5. Thread A enters markWeakPtrList.
+ * 6. Thread A starts evacuating W, resulting in Wb'.
+ * 7. Thread B scavenges O', evacuating W', resulting in Wa'.
+ * 8. Thread A and B are now racing to evacuate W. Only one will win the race
+ *    (due to the CAS in copy_tag). Let the winning copy be called W'.
+ * 9. W will be replaced by a forwarding pointer to the winning copy, W'.
+ * 10. Whichever thread loses the race will retry evacuation, see
+ *     that W has already been evacuated, and proceed as usual.
+ * 10. W' will get added to weak_ptr_list by markWeakPtrList.
+ * 11. Eventually W' will be scavenged.
+ * 12. traverseWeakPtrList will see that W' has been scavenged and evacuate the
+ *     its key.
+ * 13. However, the copy that lost the race is not on `weak_ptr_list`
+ *     and will therefore never get its `key` field scavenged (since
+ *     `traverseWeakPtrList` will never see it).
+ *
+ * Now the heap looks like:
+ *
+ *            O'                     W (from-space)
+ *            ┌──────────┐           ┌──────────┐
+ * Root ────→ │ Just     │           │ Fwd-ptr  │ ───────────╮
+ * Set        ├──────────┤           ├──────────┤            │
+ *            │          │ ────╮     │ value    │ ─→ ...     │
+ *            └──────────┘     │     │ key      │ ────────────────────────╮
+ *                             │     │ ...      │            │            │
+ *                             │     └──────────┘            │            │
+ *                             │                             │            │
+ *                             │     Wa'                     │            │
+ *                             │     ┌──────────┐       ╭────╯            │
+ *                             ╰───→ │ Weak#    │ ←─────┤                 │
+ *                                   ├──────────┤       ╰─ weak_ptr_list  │
+ *                                   │ value    │ ─→ ...                  │
+ *                                   │ key      │ ───╮    K'              │
+ *                                   │ ...      │    │    ┌──────────┐    │
+ *                                   └──────────┘    ╰──→ │ ...      │    │
+ *                                                        ├──────────┤    │
+ *                                   Wb'                                  │
+ *                                   ┌──────────┐                         │
+ *                                   │ Weak#    │                         │
+ *                                   ├──────────┤                         │
+ *                                   │ value    │ ─→ ...                  │
+ *                                   │ key      │ ───╮    K (from-space)  │
+ *                                   │ ...      │    │    ┌──────────┐    │
+ *                                   └──────────┘    ╰──→ │ 0xaaaaa  │ ←──╯
+ *                                                        ├──────────┤
+ *
+ *
+ * Without sanity checking this is fine; we have introduced a spurious copy of
+ * W, Wb' into the heap but it is unreachable and therefore won't cause any
+ * trouble. However, with sanity checking we may encounter this spurious copy
+ * when walking the heap. Moreover, this copy was never added to weak_ptr_list,
+ * meaning that its key field (along with the other fields mark as
+ * non-pointers) will not get scavenged and will therefore point into
+ * from-space.
+ *
+ * To avoid this checkClosure skips over the key field when it sees a weak
+ * pointer. Note that all fields of Wb' *other* than the key field should be
+ * valid, so we don't skip the closure entirely.
+ *
+ * We then do additional checking of all closures on the weak_ptr_lists, where
+ * we *do* check `key`.
+ */
+
+// Check validity of objects on weak_ptr_list.
+// See Note [Racing weak pointer evacuation].
+static void
+checkGenWeakPtrList( uint32_t g )
+{
+  for (StgWeak *w = generations[g].weak_ptr_list; w != NULL; w = w->link) {
+    ASSERT(LOOKS_LIKE_CLOSURE_PTR(w));
+    ASSERT(w->header.info == &stg_WEAK_info || w->header.info == &stg_DEAD_WEAK_info);
+    ASSERT(LOOKS_LIKE_CLOSURE_PTR(w->key));
+    ASSERT(LOOKS_LIKE_CLOSURE_PTR(w->value));
+    ASSERT(LOOKS_LIKE_CLOSURE_PTR(w->finalizer));
+    ASSERT(LOOKS_LIKE_CLOSURE_PTR(w->cfinalizers));
+  }
+}
+
 // Returns closure size in words
 StgOffset
 checkClosure( const StgClosure* p )
@@ -352,12 +464,9 @@ checkClosure( const StgClosure* p )
        * representative of the actual layout.
        */
       { StgWeak *w = (StgWeak *)p;
-        ASSERT(LOOKS_LIKE_CLOSURE_PTR(w->key));
-        ASSERT(LOOKS_LIKE_CLOSURE_PTR(w->value));
-        ASSERT(LOOKS_LIKE_CLOSURE_PTR(w->finalizer));
-        if (w->link) {
-          ASSERT(LOOKS_LIKE_CLOSURE_PTR(w->link));
-        }
+        // N.B. Checking most of the fields here is not safe.
+        // See Note [Racing weak pointer evacuation] for why.
+        ASSERT(LOOKS_LIKE_CLOSURE_PTR(w->cfinalizers));
         return sizeW_fromITBL(info);
       }
 
@@ -516,12 +625,17 @@ static void checkNonmovingSegments (struct NonmovingSegment *seg)
 
 void checkNonmovingHeap (const struct NonmovingHeap *heap)
 {
+    checkLargeObjects(nonmoving_large_objects);
+    checkLargeObjects(nonmoving_marked_large_objects);
+    checkCompactObjects(nonmoving_compact_objects);
     for (unsigned int i=0; i < NONMOVING_ALLOCA_CNT; i++) {
-        const struct NonmovingAllocator *alloc = heap->allocators[i];
+        const struct NonmovingAllocator *alloc = &heap->allocators[i];
         checkNonmovingSegments(alloc->filled);
+        checkNonmovingSegments(alloc->saved_filled);
         checkNonmovingSegments(alloc->active);
-        for (unsigned int cap=0; cap < n_capabilities; cap++) {
-            checkNonmovingSegments(alloc->current[cap]);
+        for (unsigned int cap_n=0; cap_n < getNumCapabilities(); cap_n++) {
+            Capability *cap = getCapability(cap_n);
+            checkNonmovingSegments(cap->current_segments[i]);
         }
     }
 }
@@ -627,7 +741,6 @@ checkTSO(StgTSO *tso)
         || tso->why_blocked == BlockedOnMVarRead
         || tso->why_blocked == BlockedOnBlackHole
         || tso->why_blocked == BlockedOnMsgThrowTo
-        || tso->why_blocked == BlockedOnIOCompletion
         || tso->why_blocked == NotBlocked
         ) {
         ASSERT(LOOKS_LIKE_CLOSURE_PTR(tso->block_info.closure));
@@ -717,7 +830,7 @@ checkLocalMutableLists (uint32_t cap_no)
 {
     uint32_t g;
     for (g = 1; g < RtsFlags.GcFlags.generations; g++) {
-        checkMutableList(capabilities[cap_no]->mut_lists[g], g);
+        checkMutableList(getCapability(cap_no)->mut_lists[g], g);
     }
 }
 
@@ -725,7 +838,7 @@ static void
 checkMutableLists (void)
 {
     uint32_t i;
-    for (i = 0; i < n_capabilities; i++) {
+    for (i = 0; i < getNumCapabilities(); i++) {
         checkLocalMutableLists(i);
     }
 }
@@ -802,13 +915,17 @@ static void checkGeneration (generation *gen,
     uint32_t n;
     gen_workspace *ws;
 
-    //ASSERT(countBlocks(gen->blocks) == gen->n_blocks);
+    // N.B. the nonmoving collector's block list does not live on
+    // oldest_gen->blocks. See Note [Live data accounting in nonmoving
+    // collector]..
+    if (!isNonmovingGen(gen)) {
+        ASSERT(countBlocks(gen->blocks) == gen->n_blocks);
+    }
     ASSERT(countBlocks(gen->large_objects) == gen->n_large_blocks);
 
 #if defined(THREADED_RTS)
     // Note [heap sanity checking with SMP]
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    //
     // heap sanity checking doesn't work with SMP for two reasons:
     //
     //   * We can't zero the slop. However, we can sanity-check the heap after a
@@ -820,7 +937,7 @@ static void checkGeneration (generation *gen,
     if (!after_major_gc) return;
 #endif
 
-    if (RtsFlags.GcFlags.useNonmoving && gen == oldest_gen) {
+    if (isNonmovingGen(gen)) {
         ASSERT(countNonMovingSegments(nonmovingHeap.free) == (W_) nonmovingHeap.n_free * NONMOVING_SEGMENT_BLOCKS);
         ASSERT(countBlocks(nonmoving_large_objects) == n_nonmoving_large_blocks);
         ASSERT(countBlocks(nonmoving_marked_large_objects) == n_nonmoving_marked_large_blocks);
@@ -845,11 +962,17 @@ static void checkGeneration (generation *gen,
 
     checkHeapChain(gen->blocks);
 
-    for (n = 0; n < n_capabilities; n++) {
+    for (n = 0; n < getNumCapabilities(); n++) {
         ws = &gc_threads[n]->gens[gen->no];
         checkHeapChain(ws->todo_bd);
         checkHeapChain(ws->part_list);
         checkHeapChain(ws->scavd_list);
+    }
+
+    // Check weak pointer lists
+    // See Note [Racing weak pointer evacuation].
+    for (uint32_t g = 0; g < RtsFlags.GcFlags.generations; g++) {
+      checkGenWeakPtrList(g);
     }
 
     checkLargeObjects(gen->large_objects);
@@ -864,7 +987,7 @@ static void checkFullHeap (bool after_major_gc)
     for (g = 0; g < RtsFlags.GcFlags.generations; g++) {
         checkGeneration(&generations[g], after_major_gc);
     }
-    for (n = 0; n < n_capabilities; n++) {
+    for (n = 0; n < getNumCapabilities(); n++) {
         checkNurserySanity(&nurseries[n]);
     }
 }
@@ -912,8 +1035,8 @@ findMemoryLeak (void)
 {
     uint32_t g, i, j;
     for (g = 0; g < RtsFlags.GcFlags.generations; g++) {
-        for (i = 0; i < n_capabilities; i++) {
-            markBlocks(capabilities[i]->mut_lists[g]);
+        for (i = 0; i < getNumCapabilities(); i++) {
+            markBlocks(getCapability(i)->mut_lists[g]);
             markBlocks(gc_threads[i]->gens[g].part_list);
             markBlocks(gc_threads[i]->gens[g].scavd_list);
             markBlocks(gc_threads[i]->gens[g].todo_bd);
@@ -927,10 +1050,11 @@ findMemoryLeak (void)
         markBlocks(nurseries[i].blocks);
     }
 
-    for (i = 0; i < n_capabilities; i++) {
+    for (i = 0; i < getNumCapabilities(); i++) {
         markBlocks(gc_threads[i]->free_blocks);
-        markBlocks(capabilities[i]->pinned_object_block);
-        markBlocks(capabilities[i]->upd_rem_set.queue.blocks);
+        markBlocks(getCapability(i)->pinned_object_block);
+        markBlocks(getCapability(i)->pinned_object_blocks);
+        markBlocks(getCapability(i)->upd_rem_set.queue.blocks);
     }
 
     if (RtsFlags.GcFlags.useNonmoving) {
@@ -940,11 +1064,13 @@ findMemoryLeak (void)
         markBlocks(nonmoving_compact_objects);
         markBlocks(nonmoving_marked_compact_objects);
         for (i = 0; i < NONMOVING_ALLOCA_CNT; i++) {
-            struct NonmovingAllocator *alloc = nonmovingHeap.allocators[i];
+            struct NonmovingAllocator *alloc = &nonmovingHeap.allocators[i];
             markNonMovingSegments(alloc->filled);
+            markNonMovingSegments(alloc->saved_filled);
             markNonMovingSegments(alloc->active);
-            for (j = 0; j < n_capabilities; j++) {
-                markNonMovingSegments(alloc->current[j]);
+            for (j = 0; j < getNumCapabilities(); j++) {
+                Capability *cap = getCapability(j);
+                markNonMovingSegments(cap->current_segments[i]);
             }
         }
         markNonMovingSegments(nonmovingHeap.sweep_list);
@@ -1012,7 +1138,7 @@ static W_
 genBlocks (generation *gen)
 {
     W_ ret = 0;
-    if (RtsFlags.GcFlags.useNonmoving && gen == oldest_gen) {
+    if (isNonmovingGen(gen)) {
         // See Note [Live data accounting in nonmoving collector].
         ASSERT(countNonMovingHeap(&nonmovingHeap) == gen->n_blocks);
         ret += countAllocdBlocks(nonmoving_large_objects);
@@ -1050,22 +1176,18 @@ countNonMovingSegments(struct NonmovingSegment *segs)
 }
 
 static W_
-countNonMovingAllocator(struct NonmovingAllocator *alloc)
-{
-    W_ ret = countNonMovingSegments(alloc->filled)
-           + countNonMovingSegments(alloc->active);
-    for (uint32_t i = 0; i < n_capabilities; ++i) {
-        ret += countNonMovingSegments(alloc->current[i]);
-    }
-    return ret;
-}
-
-static W_
 countNonMovingHeap(struct NonmovingHeap *heap)
 {
     W_ ret = 0;
     for (int alloc_idx = 0; alloc_idx < NONMOVING_ALLOCA_CNT; alloc_idx++) {
-        ret += countNonMovingAllocator(heap->allocators[alloc_idx]);
+        struct NonmovingAllocator *alloc = &heap->allocators[alloc_idx];
+        ret += countNonMovingSegments(alloc->filled);
+        ret += countNonMovingSegments(alloc->saved_filled);
+        ret += countNonMovingSegments(alloc->active);
+        for (uint32_t c = 0; c < getNumCapabilities(); ++c) {
+            Capability *cap = getCapability(c);
+            ret += countNonMovingSegments(cap->current_segments[alloc_idx]);
+        }
     }
     ret += countNonMovingSegments(heap->sweep_list);
     ret += countNonMovingSegments(heap->free);
@@ -1077,26 +1199,27 @@ memInventory (bool show)
 {
   uint32_t g, i;
   W_ gen_blocks[RtsFlags.GcFlags.generations];
-  W_ nursery_blocks = 0, retainer_blocks = 0,
+  W_ nursery_blocks = 0, free_pinned_blocks = 0, retainer_blocks = 0,
       arena_blocks = 0, exec_blocks = 0, gc_free_blocks = 0,
       upd_rem_set_blocks = 0;
   W_ live_blocks = 0, free_blocks = 0;
   bool leak;
 
 #if defined(THREADED_RTS)
-  // Can't easily do a memory inventory: We might race with the nonmoving
-  // collector. In principle we could try to take nonmoving_collection_mutex
-  // and do an inventory if we have it but we don't currently implement this.
-  if (RtsFlags.GcFlags.useNonmoving)
-    return;
+  // We need to be careful not to race with the nonmoving collector.
+  // If a nonmoving collection is on-going we simply abort the inventory.
+  if (RtsFlags.GcFlags.useNonmoving){
+    if(TRY_ACQUIRE_LOCK(&nonmoving_collection_mutex))
+      return;
+  }
 #endif
 
   // count the blocks we current have
 
   for (g = 0; g < RtsFlags.GcFlags.generations; g++) {
       gen_blocks[g] = 0;
-      for (i = 0; i < n_capabilities; i++) {
-          gen_blocks[g] += countBlocks(capabilities[i]->mut_lists[g]);
+      for (i = 0; i < getNumCapabilities(); i++) {
+          gen_blocks[g] += countBlocks(getCapability(i)->mut_lists[g]);
           gen_blocks[g] += countBlocks(gc_threads[i]->gens[g].part_list);
           gen_blocks[g] += countBlocks(gc_threads[i]->gens[g].scavd_list);
           gen_blocks[g] += countBlocks(gc_threads[i]->gens[g].todo_bd);
@@ -1108,13 +1231,14 @@ memInventory (bool show)
       ASSERT(countBlocks(nurseries[i].blocks) == nurseries[i].n_blocks);
       nursery_blocks += nurseries[i].n_blocks;
   }
-  for (i = 0; i < n_capabilities; i++) {
+  for (i = 0; i < getNumCapabilities(); i++) {
       W_ n = countBlocks(gc_threads[i]->free_blocks);
       gc_free_blocks += n;
-      if (capabilities[i]->pinned_object_block != NULL) {
-          nursery_blocks += capabilities[i]->pinned_object_block->blocks;
+      if (getCapability(i)->pinned_object_block != NULL) {
+          nursery_blocks += getCapability(i)->pinned_object_block->blocks;
       }
-      nursery_blocks += countBlocks(capabilities[i]->pinned_object_blocks);
+      nursery_blocks += countBlocks(getCapability(i)->pinned_object_blocks);
+      free_pinned_blocks += countBlocks(getCapability(i)->pinned_object_empty);
   }
 
 #if defined(PROFILING)
@@ -1133,8 +1257,8 @@ memInventory (bool show)
   free_blocks = countFreeList();
 
   // count UpdRemSet blocks
-  for (i = 0; i < n_capabilities; ++i) {
-      upd_rem_set_blocks += countBlocks(capabilities[i]->upd_rem_set.queue.blocks);
+  for (i = 0; i < getNumCapabilities(); ++i) {
+      upd_rem_set_blocks += countBlocks(getCapability(i)->upd_rem_set.queue.blocks);
   }
   upd_rem_set_blocks += countBlocks(upd_rem_set_block_list);
 
@@ -1144,7 +1268,7 @@ memInventory (bool show)
   }
   live_blocks += nursery_blocks +
                + retainer_blocks + arena_blocks + exec_blocks + gc_free_blocks
-               + upd_rem_set_blocks;
+               + upd_rem_set_blocks + free_pinned_blocks;
 
 #define MB(n) (((double)(n) * BLOCK_SIZE_W) / ((1024*1024)/sizeof(W_)))
 
@@ -1163,6 +1287,8 @@ memInventory (bool show)
       }
       debugBelch("  nursery      : %5" FMT_Word " blocks (%6.1lf MB)\n",
                  nursery_blocks, MB(nursery_blocks));
+      debugBelch("  empty pinned : %5" FMT_Word " blocks (%6.1lf MB)\n",
+                 free_pinned_blocks, MB(free_pinned_blocks));
       debugBelch("  retainer     : %5" FMT_Word " blocks (%6.1lf MB)\n",
                  retainer_blocks, MB(retainer_blocks));
       debugBelch("  arena blocks : %5" FMT_Word " blocks (%6.1lf MB)\n",
@@ -1189,6 +1315,13 @@ memInventory (bool show)
   }
   ASSERT(n_alloc_blocks == live_blocks);
   ASSERT(!leak);
+
+#if defined(THREADED_RTS)
+  if (RtsFlags.GcFlags.useNonmoving){
+    RELEASE_LOCK(&nonmoving_collection_mutex);
+  }
+#endif
+
 }
 
 

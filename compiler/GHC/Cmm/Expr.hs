@@ -9,6 +9,7 @@ module GHC.Cmm.Expr
     ( CmmExpr(..), cmmExprType, cmmExprWidth, cmmExprAlignment, maybeInvertCmmExpr
     , CmmReg(..), cmmRegType, cmmRegWidth
     , CmmLit(..), cmmLitType
+    , AlignmentSpec(..)
     , LocalReg(..), localRegType
     , GlobalReg(..), isArgReg, globalRegType
     , spReg, hpReg, spLimReg, hpLimReg, nodeReg
@@ -38,8 +39,8 @@ import GHC.Cmm.BlockId
 import GHC.Cmm.CLabel
 import GHC.Cmm.MachOp
 import GHC.Cmm.Type
-import GHC.Driver.Session
-import GHC.Utils.Outputable (panic)
+import GHC.Utils.Panic (panic)
+import GHC.Utils.Outputable
 import GHC.Types.Unique
 
 import Data.Set (Set)
@@ -53,40 +54,45 @@ import GHC.Types.Basic (Alignment, mkAlignment, alignmentOf)
 -----------------------------------------------------------------------------
 
 data CmmExpr
-  = CmmLit CmmLit               -- Literal
-  | CmmLoad !CmmExpr !CmmType   -- Read memory location
+  = CmmLit !CmmLit              -- Literal
+  | CmmLoad !CmmExpr !CmmType !AlignmentSpec
+                                -- Read memory location
   | CmmReg !CmmReg              -- Contents of register
   | CmmMachOp MachOp [CmmExpr]  -- Machine operation (+, -, *, etc.)
   | CmmStackSlot Area {-# UNPACK #-} !Int
-                                -- addressing expression of a stack slot
+                                -- Addressing expression of a stack slot
                                 -- See Note [CmmStackSlot aliasing]
-  | CmmRegOff !CmmReg Int
+  | CmmRegOff !CmmReg !Int
         -- CmmRegOff reg i
         --        ** is shorthand only, meaning **
         -- CmmMachOp (MO_Add rep) [x, CmmLit (CmmInt (fromIntegral i) rep)]
         --      where rep = typeWidth (cmmRegType reg)
+  deriving Show
 
 instance Eq CmmExpr where       -- Equality ignores the types
   CmmLit l1          == CmmLit l2          = l1==l2
-  CmmLoad e1 _       == CmmLoad e2 _       = e1==e2
+  CmmLoad e1 _ _     == CmmLoad e2 _ _     = e1==e2
   CmmReg r1          == CmmReg r2          = r1==r2
   CmmRegOff r1 i1    == CmmRegOff r2 i2    = r1==r2 && i1==i2
   CmmMachOp op1 es1  == CmmMachOp op2 es2  = op1==op2 && es1==es2
   CmmStackSlot a1 i1 == CmmStackSlot a2 i2 = a1==a2 && i1==i2
   _e1                == _e2                = False
 
+data AlignmentSpec = NaturallyAligned | Unaligned
+  deriving (Eq, Ord, Show)
+
 data CmmReg
   = CmmLocal  {-# UNPACK #-} !LocalReg
   | CmmGlobal GlobalReg
-  deriving( Eq, Ord )
+  deriving( Eq, Ord, Show )
 
 -- | A stack area is either the stack slot where a variable is spilled
 -- or the stack space where function arguments and results are passed.
 data Area
   = Old            -- See Note [Old Area]
   | Young {-# UNPACK #-} !BlockId  -- Invariant: must be a continuation BlockId
-                   -- See Note [Continuation BlockId] in GHC.Cmm.Node.
-  deriving (Eq, Ord)
+                   -- See Note [Continuation BlockIds] in GHC.Cmm.Node.
+  deriving (Eq, Ord, Show)
 
 {- Note [Old Area]
 ~~~~~~~~~~~~~~~~~~
@@ -173,16 +179,16 @@ Now, the assignments of y go away,
 -}
 
 data CmmLit
-  = CmmInt !Integer  Width
+  = CmmInt !Integer  !Width
         -- Interpretation: the 2's complement representation of the value
         -- is truncated to the specified size.  This is easier than trying
         -- to keep the value within range, because we don't know whether
         -- it will be used as a signed or unsigned value (the CmmType doesn't
         -- distinguish between signed & unsigned).
-  | CmmFloat  Rational Width
+  | CmmFloat  Rational !Width
   | CmmVec [CmmLit]                     -- Vector literal
   | CmmLabel    CLabel                  -- Address of label
-  | CmmLabelOff CLabel Int              -- Address of label + byte offset
+  | CmmLabelOff CLabel !Int              -- Address of label + byte offset
 
         -- Due to limitations in the C backend, the following
         -- MUST ONLY be used inside the info table indicated by label2
@@ -191,7 +197,7 @@ data CmmLit
         -- Don't use it at all unless tablesNextToCode.
         -- It is also used inside the NCG during when generating
         -- position-independent code.
-  | CmmLabelDiffOff CLabel CLabel Int Width -- label1 - label2 + offset
+  | CmmLabelDiffOff CLabel CLabel !Int !Width -- label1 - label2 + offset
         -- In an expression, the width just has the effect of MO_SS_Conv
         -- from wordWidth to the desired width.
         --
@@ -202,19 +208,29 @@ data CmmLit
 
   | CmmBlock {-# UNPACK #-} !BlockId     -- Code label
         -- Invariant: must be a continuation BlockId
-        -- See Note [Continuation BlockId] in GHC.Cmm.Node.
+        -- See Note [Continuation BlockIds] in GHC.Cmm.Node.
 
   | CmmHighStackMark -- A late-bound constant that stands for the max
                      -- #bytes of stack space used during a procedure.
                      -- During the stack-layout pass, CmmHighStackMark
                      -- is replaced by a CmmInt for the actual number
                      -- of bytes used
-  deriving Eq
+  deriving (Eq, Show)
+
+instance Outputable CmmLit where
+  ppr (CmmInt n w) = text "CmmInt" <+> ppr n <+> ppr w
+  ppr (CmmFloat n w) = text "CmmFloat" <+> text (show n) <+> ppr w
+  ppr (CmmVec xs) = text "CmmVec" <+> ppr xs
+  ppr (CmmLabel _) = text "CmmLabel"
+  ppr (CmmLabelOff _ _) = text "CmmLabelOff"
+  ppr (CmmLabelDiffOff _ _ _ _) = text "CmmLabelDiffOff"
+  ppr (CmmBlock blk) = text "CmmBlock" <+> ppr blk
+  ppr CmmHighStackMark = text "CmmHighStackMark"
 
 cmmExprType :: Platform -> CmmExpr -> CmmType
 cmmExprType platform = \case
    (CmmLit lit)        -> cmmLitType platform lit
-   (CmmLoad _ rep)     -> rep
+   (CmmLoad _ rep _)   -> rep
    (CmmReg reg)        -> cmmRegType platform reg
    (CmmMachOp op args) -> machOpResultType platform op (map (cmmExprType platform) args)
    (CmmRegOff reg _)   -> cmmRegType platform reg
@@ -265,10 +281,11 @@ maybeInvertCmmExpr _ = Nothing
 -----------------------------------------------------------------------------
 
 data LocalReg
-  = LocalReg {-# UNPACK #-} !Unique CmmType
+  = LocalReg {-# UNPACK #-} !Unique !CmmType
     -- ^ Parameters:
     --   1. Identifier
     --   2. Type
+  deriving Show
 
 instance Eq LocalReg where
   (LocalReg u1 _) == (LocalReg u2 _) = u1 == u2
@@ -331,17 +348,17 @@ sizeRegSet       = Set.size
 regSetToList     = Set.toList
 
 class Ord r => UserOfRegs r a where
-  foldRegsUsed :: DynFlags -> (b -> r -> b) -> b -> a -> b
+  foldRegsUsed :: Platform -> (b -> r -> b) -> b -> a -> b
 
 foldLocalRegsUsed :: UserOfRegs LocalReg a
-                  => DynFlags -> (b -> LocalReg -> b) -> b -> a -> b
+                  => Platform -> (b -> LocalReg -> b) -> b -> a -> b
 foldLocalRegsUsed = foldRegsUsed
 
 class Ord r => DefinerOfRegs r a where
-  foldRegsDefd :: DynFlags -> (b -> r -> b) -> b -> a -> b
+  foldRegsDefd :: Platform -> (b -> r -> b) -> b -> a -> b
 
 foldLocalRegsDefd :: DefinerOfRegs LocalReg a
-                  => DynFlags -> (b -> LocalReg -> b) -> b -> a -> b
+                  => Platform -> (b -> LocalReg -> b) -> b -> a -> b
 foldLocalRegsDefd = foldRegsDefd
 
 instance UserOfRegs LocalReg CmmReg where
@@ -353,6 +370,7 @@ instance DefinerOfRegs LocalReg CmmReg where
     foldRegsDefd _ _ z (CmmGlobal _)  = z
 
 instance UserOfRegs GlobalReg CmmReg where
+    {-# INLINEABLE foldRegsUsed #-}
     foldRegsUsed _ _ z (CmmLocal _)    = z
     foldRegsUsed _ f z (CmmGlobal reg) = f z reg
 
@@ -369,20 +387,21 @@ instance Ord r => DefinerOfRegs r r where
 instance (Ord r, UserOfRegs r CmmReg) => UserOfRegs r CmmExpr where
   -- The (Ord r) in the context is necessary here
   -- See Note [Recursive superclasses] in GHC.Tc.TyCl.Instance
-  foldRegsUsed dflags f !z e = expr z e
+  {-# INLINEABLE foldRegsUsed #-}
+  foldRegsUsed platform f !z e = expr z e
     where expr z (CmmLit _)          = z
-          expr z (CmmLoad addr _)    = foldRegsUsed dflags f z addr
-          expr z (CmmReg r)          = foldRegsUsed dflags f z r
-          expr z (CmmMachOp _ exprs) = foldRegsUsed dflags f z exprs
-          expr z (CmmRegOff r _)     = foldRegsUsed dflags f z r
+          expr z (CmmLoad addr _ _)  = foldRegsUsed platform f z addr
+          expr z (CmmReg r)          = foldRegsUsed platform f z r
+          expr z (CmmMachOp _ exprs) = foldRegsUsed platform f z exprs
+          expr z (CmmRegOff r _)     = foldRegsUsed platform f z r
           expr z (CmmStackSlot _ _)  = z
 
 instance UserOfRegs r a => UserOfRegs r [a] where
-  foldRegsUsed dflags f set as = foldl' (foldRegsUsed dflags f) set as
+  foldRegsUsed platform f set as = foldl' (foldRegsUsed platform f) set as
   {-# INLINABLE foldRegsUsed #-}
 
 instance DefinerOfRegs r a => DefinerOfRegs r [a] where
-  foldRegsDefd dflags f set as = foldl' (foldRegsDefd dflags f) set as
+  foldRegsDefd platform f set as = foldl' (foldRegsDefd platform f) set as
   {-# INLINABLE foldRegsDefd #-}
 
 -----------------------------------------------------------------------------
@@ -396,7 +415,7 @@ data VGcPtr = VGcPtr | VNonGcPtr deriving( Eq, Show )
 -----------------------------------------------------------------------------
 {-
 Note [Overlapping global registers]
-
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 The backend might not faithfully implement the abstraction of the STG
 machine with independent registers for different values of type
 GlobalReg. Specifically, certain pairs of registers (r1, r2) may
@@ -510,6 +529,8 @@ instance Eq GlobalReg where
    PicBaseReg == PicBaseReg = True
    _r1 == _r2 = False
 
+-- NOTE: this Ord instance affects the tuple layout in GHCi, see
+--       Note [GHCi tuple layout]
 instance Ord GlobalReg where
    compare (VanillaReg i _) (VanillaReg j _) = compare i j
      -- Ignore type when seeking clashes

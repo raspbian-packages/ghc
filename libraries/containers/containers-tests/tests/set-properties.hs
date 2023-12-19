@@ -6,25 +6,24 @@ import Data.Monoid (mempty)
 import Data.Maybe
 import Data.Set
 import Prelude hiding (lookup, null, map, filter, foldr, foldl, all, take, drop, splitAt)
-import Test.Framework
-import Test.Framework.Providers.HUnit
-import Test.Framework.Providers.QuickCheck2
-import Test.HUnit hiding (Test, Testable)
-import Test.QuickCheck
-import Test.QuickCheck.Function
-import Test.QuickCheck.Poly
+import Test.Tasty
+import Test.Tasty.HUnit
+import Test.Tasty.QuickCheck
+import Test.QuickCheck.Function (apply)
 import Control.Monad.Trans.State.Strict
 import Control.Monad.Trans.Class
 import Control.Monad (liftM, liftM3)
 import Data.Functor.Identity
 import Data.Foldable (all)
-#if !MIN_VERSION_base(4,8,0)
-import Control.Applicative (Applicative (..), (<$>))
-#endif
 import Control.Applicative (liftA2)
 
+#if __GLASGOW_HASKELL__ >= 806
+import Utils.NoThunks (whnfHasNoThunks)
+#endif
+
 main :: IO ()
-main = defaultMain [ testCase "lookupLT" test_lookupLT
+main = defaultMain $ testGroup "set-properties"
+                   [ testCase "lookupLT" test_lookupLT
                    , testCase "lookupGT" test_lookupGT
                    , testCase "lookupLE" test_lookupLE
                    , testCase "lookupGE" test_lookupGE
@@ -104,6 +103,10 @@ main = defaultMain [ testCase "lookupLT" test_lookupLT
                    , testProperty "powerSet"             prop_powerSet
                    , testProperty "cartesianProduct"     prop_cartesianProduct
                    , testProperty "disjointUnion"        prop_disjointUnion
+#if __GLASGOW_HASKELL__ >= 806
+                   , testProperty "strict foldr"         prop_strictFoldr'
+                   , testProperty "strict foldl"         prop_strictFoldl'
+#endif
                    ]
 
 -- A type with a peculiar Eq instance designed to make sure keys
@@ -666,16 +669,16 @@ prop_spanAntitone xs' = valid tw .&&. valid dw
     xs = fromList xs'
     (tw, dw) = spanAntitone isLeft xs
 
-prop_powerSet :: Set Int -> Property
-prop_powerSet xs = valid ps .&&. ps === ps'
-  where
-    xs' = take 10 xs
-
-    ps = powerSet xs'
-    ps' = fromList . fmap fromList $ lps (toList xs')
-
-    lps [] = [[]]
-    lps (y : ys) = fmap (y:) (lps ys) ++ lps ys
+prop_powerSet :: Property
+prop_powerSet = forAll (resize 10 arbitrary :: Gen (Set Int)) $ \xs ->
+   -- We don't actually have to check on the values directly, because the power
+   -- set is the *only* one that can be produced by a function with the type of
+   -- `powerSet` and satisfy the criteria below. In particular, the `valid ps`
+   -- test ensures that we haven't duplicated any subsets, while the size test
+   -- ensures that we haven't omitted any. Parametricity ensures that we
+   -- haven't produced any elements out of thin air.
+   let ps = powerSet xs
+   in valid ps .&&. all valid ps .&&. size ps === 2^size xs
 
 prop_cartesianProduct :: Set Int -> Set Int -> Property
 prop_cartesianProduct xs ys =
@@ -690,3 +693,13 @@ prop_disjointUnion xs ys =
 isLeft :: Either a b -> Bool
 isLeft (Left _) = True
 isLeft _ = False
+
+#if __GLASGOW_HASKELL__ >= 806
+prop_strictFoldr' :: Set Int -> Property
+prop_strictFoldr' m = whnfHasNoThunks (foldr' (:) [] m)
+#endif
+
+#if __GLASGOW_HASKELL__ >= 806
+prop_strictFoldl' :: Set Int -> Property
+prop_strictFoldl' m = whnfHasNoThunks (foldl' (flip (:)) [] m)
+#endif

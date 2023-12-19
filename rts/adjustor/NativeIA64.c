@@ -2,7 +2,7 @@
  * IA64 architecture adjustor thunk logic.
  * ---------------------------------------------------------------------------*/
 
-#include "PosixSource.h"
+#include "rts/PosixSource.h"
 #include "Rts.h"
 
 #include "RtsUtils.h"
@@ -34,6 +34,8 @@ stgAllocStable(size_t size_in_bytes, StgStablePtr *stable)
     /* and return a ptr to the goods inside the array */
     return(&(arr->payload));
 }
+
+void initAdjustors(void) { }
 
 void*
 createAdjustor(int cconv, StgStablePtr hptr,

@@ -6,7 +6,6 @@
 module GHC.Platform.Reg (
         RegNo,
         Reg(..),
-        regPair,
         regSingle,
         realRegSingle,
         isRealReg,      takeRealReg,
@@ -30,9 +29,10 @@ where
 import GHC.Prelude
 
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
 import GHC.Types.Unique
+import GHC.Builtin.Uniques
 import GHC.Platform.Reg.Class
-import Data.List (intersect)
 
 -- | An identifier for a primitive real machine register.
 type RegNo
@@ -142,53 +142,47 @@ getHiVRegFromLo reg
 --      the usual way.  We know what class they are, because that's part of
 --      the processor's architecture.
 --
---      RealRegPairs are pairs of real registers that are allocated together
---      to hold a larger value, such as with Double regs on SPARC.
---
-data RealReg
-        = RealRegSingle {-# UNPACK #-} !RegNo
-        | RealRegPair   {-# UNPACK #-} !RegNo {-# UNPACK #-} !RegNo
+newtype RealReg
+        = RealRegSingle RegNo
         deriving (Eq, Show, Ord)
 
 instance Uniquable RealReg where
         getUnique reg
          = case reg of
                 RealRegSingle i         -> mkRegSingleUnique i
-                RealRegPair r1 r2       -> mkRegPairUnique (r1 * 65536 + r2)
 
 instance Outputable RealReg where
         ppr reg
          = case reg of
                 RealRegSingle i         -> text "%r"  <> int i
-                RealRegPair r1 r2       -> text "%r(" <> int r1
-                                           <> vbar <> int r2 <> text ")"
 
 regNosOfRealReg :: RealReg -> [RegNo]
 regNosOfRealReg rr
  = case rr of
         RealRegSingle r1        -> [r1]
-        RealRegPair   r1 r2     -> [r1, r2]
 
 
 realRegsAlias :: RealReg -> RealReg -> Bool
-realRegsAlias rr1 rr2
-        = not $ null $ intersect (regNosOfRealReg rr1) (regNosOfRealReg rr2)
+realRegsAlias rr1 rr2 =
+    -- used to be `not $ null $ intersect (regNosOfRealReg rr1) (regNosOfRealReg rr2)`
+    -- but that resulted in some gnarly, gnarly, allocating code. So we manually
+    -- write out all the cases which gives us nice non-allocating code.
+    case rr1 of
+        RealRegSingle r1 ->
+            case rr2 of RealRegSingle r2 -> r1 == r2
 
 --------------------------------------------------------------------------------
 -- | A register, either virtual or real
 data Reg
         = RegVirtual !VirtualReg
         | RegReal    !RealReg
-        deriving (Eq, Ord)
+        deriving (Eq, Ord, Show)
 
 regSingle :: RegNo -> Reg
 regSingle regNo = RegReal (realRegSingle regNo)
 
 realRegSingle :: RegNo -> RealReg
 realRegSingle regNo = RealRegSingle regNo
-
-regPair :: RegNo -> RegNo -> Reg
-regPair regNo1 regNo2   = RegReal $ RealRegPair regNo1 regNo2
 
 
 -- We like to have Uniques for Reg so that we can make UniqFM and UniqSets

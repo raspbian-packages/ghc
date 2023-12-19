@@ -5,10 +5,11 @@
 \section[ConLike]{@ConLike@: Constructor-like things}
 -}
 
-{-# LANGUAGE CPP #-}
+
 
 module GHC.Core.ConLike (
           ConLike(..)
+        , isVanillaConLike
         , conLikeArity
         , conLikeFieldLabels
         , conLikeInstOrigArgTys
@@ -16,16 +17,14 @@ module GHC.Core.ConLike (
         , conLikeExTyCoVars
         , conLikeName
         , conLikeStupidTheta
-        , conLikeWrapId_maybe
         , conLikeImplBangs
         , conLikeFullSig
         , conLikeResTy
         , conLikeFieldType
         , conLikesWithFields
         , conLikeIsInfix
+        , conLikeHasBuilder
     ) where
-
-#include "HsVersions.h"
 
 import GHC.Prelude
 
@@ -41,6 +40,7 @@ import GHC.Types.Var
 import GHC.Core.Type(mkTyConApp)
 import GHC.Core.Multiplicity
 
+import Data.Maybe( isJust )
 import qualified Data.Data as Data
 
 {-
@@ -54,6 +54,12 @@ import qualified Data.Data as Data
 -- | A constructor-like thing
 data ConLike = RealDataCon DataCon
              | PatSynCon PatSyn
+
+-- | Is this a \'vanilla\' constructor-like thing
+-- (no existentials, no provided constraints)?
+isVanillaConLike :: ConLike -> Bool
+isVanillaConLike (RealDataCon con) = isVanillaDataCon con
+isVanillaConLike (PatSynCon   ps ) = isVanillaPatSyn  ps
 
 {-
 ************************************************************************
@@ -140,16 +146,16 @@ conLikeName (PatSynCon pat_syn)    = patSynName pat_syn
 --
 -- > data Eq a => T a = ...
 -- It is empty for `PatSynCon` as they do not allow such contexts.
+-- See @Note [The stupid context]@ in "GHC.Core.DataCon".
 conLikeStupidTheta :: ConLike -> ThetaType
 conLikeStupidTheta (RealDataCon data_con) = dataConStupidTheta data_con
 conLikeStupidTheta (PatSynCon {})         = []
 
--- | Returns the `Id` of the wrapper. This is also known as the builder in
--- some contexts. The value is Nothing only in the case of unidirectional
--- pattern synonyms.
-conLikeWrapId_maybe :: ConLike -> Maybe Id
-conLikeWrapId_maybe (RealDataCon data_con) = Just $ dataConWrapId data_con
-conLikeWrapId_maybe (PatSynCon pat_syn)    = fst <$> patSynBuilder pat_syn
+-- | 'conLikeHasBuilder' returns True except for
+-- uni-directional pattern synonyms, which have no builder
+conLikeHasBuilder :: ConLike -> Bool
+conLikeHasBuilder (RealDataCon {})    = True
+conLikeHasBuilder (PatSynCon pat_syn) = isJust (patSynBuilder pat_syn)
 
 -- | Returns the strictness information for each constructor
 conLikeImplBangs :: ConLike -> [HsImplBang]

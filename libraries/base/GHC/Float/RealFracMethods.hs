@@ -56,16 +56,16 @@ module GHC.Float.RealFracMethods
 
 import GHC.Num.Integer
 
-import GHC.Base
+import GHC.Base hiding (uncheckedIShiftRA64#, uncheckedIShiftL64#)
 import GHC.Num ()
 
 #if WORD_SIZE_IN_BITS < 64
 
-import GHC.IntWord64
+import GHC.Base (uncheckedIShiftRA64#, uncheckedIShiftL64#)
 
 #define TO64 integerToInt64#
 #define FROM64 integerFromInt64#
-#define MINUS64 minusInt64#
+#define MINUS64 subInt64#
 #define NEGATE64 negateInt64#
 
 #else

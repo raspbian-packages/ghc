@@ -534,7 +534,7 @@ not to replace module loading but to make definitions in .ghci-files
 Any exceptions raised during the evaluation or execution of the
 statement are caught and printed by the GHCi command line interface (for
 more information on exceptions, see the module :base-ref:`Control.Exception.` in
-the libraries documentation.
+the libraries documentation.)
 
 Every new binding shadows any existing bindings of the same name,
 including entities that are in scope in the current module context.
@@ -873,13 +873,18 @@ done with ordinary ``import`` declarations:
 Qualified names
 ^^^^^^^^^^^^^^^
 
+.. ghc-flag:: -fimplicit-import-qualified
+    :shortdesc: Put in scope qualified identifiers for every loaded module
+    :type: dynamic
+    :reverse: -fno-implicit-import-qualified
+    :category:
+
+    :default: on
+
 To make life slightly easier, the GHCi prompt also behaves as if there
 is an implicit ``import qualified`` declaration for every module in
 every package, and every module currently loaded into GHCi. This
 behaviour can be disabled with the ``-fno-implicit-import-qualified`` flag.
-
-.. index::
-   single: -fno-implicit-import-qualified
 
 ``:module`` and ``:load``
 ^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -905,49 +910,45 @@ GHCi knows about. Using :ghci-cmd:`:module` or ``import`` to try bring into
 scope a non-loaded module may result in the message
 ``module M is not loaded``.
 
-The ``:main`` and ``:run`` commands
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Shadowing and the ``Ghci1`` module name
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-When a program is compiled and executed, it can use the ``getArgs``
-function to access the command-line arguments. However, we cannot simply
-pass the arguments to the ``main`` function while we are testing in
-ghci, as the ``main`` function doesn't take its directly.
-
-Instead, we can use the :ghci-cmd:`:main` command. This runs whatever ``main``
-is in scope, with any arguments being treated the same as command-line
-arguments, e.g.:
+Bindings on the prompt can shadow earlier bindings:
 
 .. code-block:: none
 
-    ghci> main = System.Environment.getArgs >>= print
-    ghci> :main foo bar
-    ["foo","bar"]
+    ghci> let foo = True
+    ghci> let foo = False
+    ghci> :show bindings
+    foo :: Bool = False
 
-We can also quote arguments which contains characters like spaces, and
-they are treated like Haskell strings, or we can just use Haskell list
-syntax:
-
-.. code-block:: none
-
-    ghci> :main foo "bar baz"
-    ["foo","bar baz"]
-    ghci> :main ["foo", "bar baz"]
-    ["foo","bar baz"]
-
-Finally, other functions can be called, either with the ``-main-is``
-flag or the :ghci-cmd:`:run` command:
+But the shadowed thing still exists, and may show up again later, for example
+in a type signature:
 
 .. code-block:: none
 
-    ghci> foo = putStrLn "foo" >> System.Environment.getArgs >>= print
-    ghci> bar = putStrLn "bar" >> System.Environment.getArgs >>= print
-    ghci> :set -main-is foo
-    ghci> :main foo "bar baz"
-    foo
-    ["foo","bar baz"]
-    ghci> :run bar ["foo", "bar baz"]
-    bar
-    ["foo","bar baz"]
+    ghci> data T = A | B deriving Eq
+    ghci> let a = A
+    ghci> data T = ANewType
+    ghci> :t a
+    a :: Ghci1.T
+
+Now the type of ``a`` is printed using the fully qualified name of ``T``, using
+the module name ``Ghci1`` (and ``Ghci2`` for the next set of bindings, and so
+on). You can use these qualified names as well:
+
+.. code-block:: none
+
+    ghci> a == Ghci1.A
+    True
+    ghci> let a = False -- shadowing a
+    ghci> Ghci2.a == Ghci1.A
+    True
+
+The command ``:show bindings`` only shows bindings that are not shadowed.
+Bindings that define multiple names, such as a type constructor and its data
+constructors, are shown if *any* defined name is still available without the
+need for qualification.
 
 The ``it`` variable
 ~~~~~~~~~~~~~~~~~~~
@@ -2063,7 +2064,7 @@ mostly obvious.
     :reverse: -fno-local-ghci-history
     :category:
 
-    By default, GHCi keeps global history in ``~/.ghc/ghci_history`` or
+    By default, GHCi keeps global history in ``$XDG_DATA_HOME/ghc/ghci_history`` or
     ``%APPDATA%/<app>/ghci_history``, but you can use current directory, e.g.:
 
     .. code-block:: none
@@ -2347,9 +2348,13 @@ commonly used commands.
         ghci> :complete repl 5-10 "map"
         0 3 ""
 
-.. ghci-cmd:: :continue
+.. ghci-cmd:: :continue; [⟨ignoreCount⟩]
 
     Continue the current evaluation, when stopped at a breakpoint.
+
+    If an ``⟨ignoreCount⟩`` is specified, the program will ignore
+    the current breakpoint for the next ``⟨ignoreCount⟩`` iterations.
+    See command :ghci-cmd:`:ignore`.
 
 .. ghci-cmd:: :ctags; [⟨filename⟩]
 
@@ -2443,15 +2448,24 @@ commonly used commands.
     Opens an editor to edit the file ⟨file⟩, or the most recently loaded
     module if ⟨file⟩ is omitted. If there were errors during the last
     loading, the cursor will be positioned at the line of the first
-    error. The editor to invoke is taken from the :envvar:`EDITOR` environment
-    variable, or a default editor on your system if :envvar:`EDITOR` is not
-    set. You can change the editor using :ghci-cmd:`:set editor`.
+    error. The editor to invoke is taken from the :envvar:`VISUAL` or
+    :envvar:`EDITOR` environment variables, or a default editor on your system
+    if neither is not set. You can change the editor using :ghci-cmd:`:set
+    editor`.
+
+.. envvar:: VISUAL
+
+    :hidden:
+
+    .. This declaration simply avoids undefined reference warnings as Sphinx
+       doesn't know about VISUAL
 
 .. ghci-cmd:: :enable; * | ⟨num⟩ ...
 
     Enable one or more disabled breakpoints by number (use :ghci-cmd:`:show breaks` to
     see the number and state of each breakpoint). The ``*`` form enables all the
-    disabled breakpoints.
+    disabled breakpoints. Enabling a break point will reset its ``ignore count``
+    to 0. (See :ghci-cmd:`:ignore`)
 
 .. ghci-cmd:: :etags
 
@@ -2569,6 +2583,20 @@ commonly used commands.
     current module if omitted). This includes the trust type of the
     module and its containing package.
 
+.. ghci-cmd:: :ignore; ⟨break⟩ ⟨ignoreCount⟩
+
+    Set the ignore count of the breakpoint with number ``⟨break⟩`` to
+    ``⟨ignoreCount⟩``.
+
+    The next ``⟨ignoreCount⟩`` times the program hits the breakpoint
+    ``⟨break⟩``, this breakpoint is ignored and the program doesn't
+    stop. Every time the breakpoint is ignored, the ``ignore count``
+    is decremented by 1. When the ``ignore count`` is zero, the program
+    again stops at the break point.
+
+    You can also specify an ``⟨ignoreCount⟩`` on a :ghci-cmd:`:continue`
+    command when you resume execution of your program.
+
 .. ghci-cmd:: :kind;[!] ⟨type⟩
 
     Infers and prints the kind of ⟨type⟩. The latter can be an arbitrary
@@ -2623,7 +2651,7 @@ commonly used commands.
     Adding the optional "``!``" turns type errors into warnings while
     loading. This allows to use the portions of the module that are
     correct, even if there are type errors in some definitions.
-    Effectively, the "-fdefer-type-errors" flag is set before loading
+    Effectively, the :ghc-flag:`-fdefer-type-errors` flag is set before loading
     and unset after loading if the flag has not already been set before.
     See :ref:`defer-type-errors` for further motivation and details.
 
@@ -2654,10 +2682,9 @@ commonly used commands.
 .. ghci-cmd:: :main; ⟨arg1⟩ ... ⟨argn⟩
 
     When a program is compiled and executed, it can use the ``getArgs``
-    function to access the command-line arguments. However, we cannot
-    simply pass the arguments to the ``main`` function while we are
-    testing in ghci, as the ``main`` function doesn't take its arguments
-    directly.
+    IO action to access the command-line arguments. However, we cannot
+    simply pass the arguments to ``main`` while we are testing in ghci,
+    as ``main`` doesn't take its arguments directly.
 
     Instead, we can use the :ghci-cmd:`:main` command. This runs whatever
     ``main`` is in scope, with any arguments being treated the same as
@@ -2680,7 +2707,7 @@ commonly used commands.
         ghci> :main ["foo", "bar baz"]
         ["foo","bar baz"]
 
-    Finally, other functions can be called, either with the ``-main-is``
+    Finally, other IO actions can be called, either with the ``-main-is``
     flag or the :ghci-cmd:`:run` command:
 
     .. code-block:: none
@@ -2730,7 +2757,7 @@ commonly used commands.
     Adding the optional "``!``" turns type errors into warnings while
     loading. This allows to use the portions of the module that are
     correct, even if there are type errors in some definitions.
-    Effectively, the "-fdefer-type-errors" flag is set before loading
+    Effectively, the :ghc-flag:`-fdefer-type-errors` flag is set before loading
     and unset after loading if the flag has not already been set before.
     See :ref:`defer-type-errors` for further motivation and details.
 
@@ -2760,7 +2787,7 @@ commonly used commands.
        single: getArgs, behavior in GHCi
 
     Sets the list of arguments which are returned when the program calls
-    ``System.getArgs``.
+    ``System.Environment.getArgs``.
 
 .. ghci-cmd:: :set editor; ⟨cmd⟩
 
@@ -2783,7 +2810,7 @@ commonly used commands.
        single: getProgName, behavior in GHCi
 
     Sets the string to be returned when the program calls
-    ``System.getProgName``.
+    ``System.Environment.getProgName``.
 
 .. ghci-cmd:: :set prompt; ⟨prompt⟩
 
@@ -2858,8 +2885,9 @@ commonly used commands.
         *ghci> :def cond \expr -> return (":cmd if (" ++ expr ++ ") then return \"\" else return \":continue\"")
         *ghci> :set stop 0 :cond (x < 3)
 
-    Ignoring breakpoints for a specified number of iterations is also
-    possible using similar techniques.
+    To ignore breakpoints for a specified number of iterations use
+    the :ghci-cmd:`:ignore` or the ``⟨ignoreCount⟩`` parameter of the
+    :ghci-cmd:`:continue` command.
 
 .. ghci-cmd:: :seti; [⟨option⟩ ...]
 
@@ -2951,37 +2979,26 @@ commonly used commands.
 
 .. ghci-cmd:: :type; ⟨expression⟩
 
-    Infers and prints the type of ⟨expression⟩, including explicit
-    forall quantifiers for polymorphic types.
-    The type reported is the type that would be inferred
-    for a variable assigned to the expression, but without the
-    monomorphism restriction applied.
+    Infers and prints the type of ⟨expression⟩, solving constraints and
+    reducing type families as much as possible.
+    For polymorphic types, it does not instantiate any forall quantified
+    variables.
 
     .. code-block:: none
 
 	*X> :type length
 	length :: Foldable t => t a -> Int
 
-.. ghci-cmd:: :type +v; ⟨expression⟩
-
-    Infers and prints the type of ⟨expression⟩, but without fiddling
-    with type variables or class constraints. This is useful when you
-    are using :extension:`TypeApplications` and care about the distinction
-    between specified type variables (available for type application)
-    and inferred type variables (not available). This mode sometimes prints
-    constraints (such as ``Show Int``) that could readily be solved, but
-    solving these constraints may affect the type variables, so GHC refrains.
-
-    .. code-block:: none
-
-	*X> :set -fprint-explicit-foralls
-	*X> :type +v length
-	length :: forall (t :: * -> *). Foldable t => forall a. t a -> Int
+    Type family reduction is skipped if the function is not fully instantiated,
+    as this has been observed to give more intuitive results.
+    You may want to use :ghci-cmd:`:info` if you are not applying any arguments,
+    as that will return the original type of the function.
 
 .. ghci-cmd:: :type +d; ⟨expression⟩
 
-    Infers and prints the type of ⟨expression⟩, defaulting type variables
-    if possible. In this mode, if the inferred type is constrained by
+    Infers and prints the type of ⟨expression⟩, instantiating *all* the forall
+    quantifiers, solving constraints, defaulting, and generalising.
+    In this mode, if the inferred type is constrained by
     any interactive class (``Num``, ``Show``, ``Eq``, ``Ord``, ``Foldable``,
     or ``Traversable``), the constrained type variable(s) are defaulted
     according to the rules described under :extension:`ExtendedDefaultRules`.
@@ -3208,14 +3225,15 @@ clean GHCi session we might see something like this:
 .. code-block:: none
 
     ghci> :seti
-    base language is: Haskell2010
+    base language is: GHC2021
     with the following modifiers:
-      -XNoMonomorphismRestriction
-      -XNoDatatypeContexts
-      -XNondecreasingIndentation
       -XExtendedDefaultRules
+      -XNoMonomorphismRestriction
     GHCi-specific dynamic flag settings:
     other dynamic, non-language, flag settings:
+      -fexternal-dynamic-refs
+      -fignore-optim-changes
+      -fignore-hpc-changes
       -fimplicit-import-qualified
     warning settings:
 
@@ -3252,7 +3270,7 @@ they exist:
    Unix or :file:`C:/Documents and Settings/user/Application
    Data/ghc` on Windows.
 
-2. :file:`$HOME/.ghci`
+2. :file:`$XDG_CONFIG_HOME/.ghci`
 
 3. :file:`./.ghci`
 
@@ -3296,7 +3314,7 @@ running GHCi session while debugging it
 With this macro defined in your ``.ghci`` file, you can use
 ``:source file`` to read GHCi commands from ``file``. You can find (and
 contribute!-) other suggestions for ``.ghci`` files on this Haskell wiki
-page: `GHC/GHCi <http://haskell.org/haskellwiki/GHC/GHCi>`__
+page: `GHC/GHCi <https://haskell.org/haskellwiki/GHC/GHCi>`__
 
 Additionally, any files specified with :ghc-flag:`-ghci-script` flags will be
 read after the standard files, allowing the use of custom .ghci files.
@@ -3307,6 +3325,7 @@ read:
 .. ghc-flag:: -ignore-dot-ghci
     :shortdesc: Disable reading of ``.ghci`` files
     :type: dynamic
+    :reverse: -no-ignore-dot-ghci
     :category:
 
     Don't read either :file:`./.ghci` or the other startup files when
@@ -3474,6 +3493,21 @@ There are some limitations when using this. File and process IO
 will be executed on the target. As such packages like ``git-embed``,
 ``file-embed`` and others might not behave as expected if the target
 and host do not share the same filesystem.
+
+.. _building-ghci-libraries:
+
+Building GHCi libraries
+-----------------------
+
+When invoked in the static way, GHCi will use the GHC RTS's static runtime
+linker to load object files for imported modules when available. However, when
+these modules are built with :ghc-flag:`-split-sections` this linking can be
+quite expensive. To reduce this cost, package managers and build systems may
+opt to produce a pre-linked *GHCi object* using the :ghc-flag:`--merge-objs`
+mode. This merges the per-module objects into a single object, collapsing
+function sections into a single text section which can be efficiently loaded by
+the runtime linker.
+
 
 .. _ghci-faq:
 

@@ -1,18 +1,21 @@
 {-# OPTIONS_GHC -fno-warn-missing-signatures #-}
 module Packages (
     -- * GHC packages
-    array, base, binary, bytestring, cabal, checkApiAnnotations, checkPpr,
+    array, base, binary, bytestring, cabal, cabalSyntax, checkPpr,
+    checkExact, countDeps,
     compareSizes, compiler, containers, deepseq, deriveConstants, directory,
     exceptions, filepath, genapply, genprimopcode, ghc, ghcBignum, ghcBoot, ghcBootTh,
-    ghcCompact, ghcHeap, ghci, ghciWrapper, ghcPkg, ghcPrim, haddock, haskeline,
+    ghcCompact, ghcConfig, ghcHeap, ghci, ghciWrapper, ghcPkg, ghcPrim, haddock, haskeline,
     hsc2hs, hp2ps, hpc, hpcBin, integerGmp, integerSimple, iserv, iservProxy,
     libffi, libiserv, mtl, parsec, pretty, primitive, process, remoteIserv, rts,
     runGhc, stm, templateHaskell, terminfo, text, time, timeout, touchy,
-    transformers, unlit, unix, win32, xhtml, ghcPackages, isGhcPackage,
+    transformers, unlit, unix, win32, xhtml,
+    lintersCommon, lintNotes, lintCommitMsg, lintSubmoduleRefs, lintWhitespace,
+    ghcPackages, isGhcPackage,
 
     -- * Package information
     programName, nonHsMainPackage, autogenPath, programPath, timeoutPath,
-    rtsContext, rtsBuildPath, libffiBuildPath, libffiLibraryName,
+    rtsContext, rtsBuildPath, libffiBuildPath,
     ensureConfigured
     ) where
 
@@ -31,27 +34,41 @@ import Oracles.Setting
 -- packages and modify build default build conditions in "UserSettings".
 ghcPackages :: [Package]
 ghcPackages =
-    [ array, base, binary, bytestring, cabal, checkPpr, checkApiAnnotations
+    [ array, base, binary, bytestring, cabalSyntax, cabal, checkPpr, checkExact, countDeps
     , compareSizes, compiler, containers, deepseq, deriveConstants, directory
     , exceptions, filepath, genapply, genprimopcode, ghc, ghcBignum, ghcBoot, ghcBootTh
-    , ghcCompact, ghcHeap, ghci, ghciWrapper, ghcPkg, ghcPrim, haddock, haskeline, hsc2hs
+    , ghcCompact, ghcConfig, ghcHeap, ghci, ghciWrapper, ghcPkg, ghcPrim, haddock, haskeline, hsc2hs
     , hp2ps, hpc, hpcBin, integerGmp, integerSimple, iserv, libffi, libiserv, mtl
     , parsec, pretty, process, rts, runGhc, stm, templateHaskell
     , terminfo, text, time, touchy, transformers, unlit, unix, win32, xhtml
-    , timeout ]
+    , timeout
+    , lintersCommon
+    , lintNotes, lintCommitMsg, lintSubmoduleRefs, lintWhitespace ]
 
 -- TODO: Optimise by switching to sets of packages.
 isGhcPackage :: Package -> Bool
 isGhcPackage = (`elem` ghcPackages)
 
 -- | Package definitions, see 'Package'.
+array, base, binary, bytestring, cabalSyntax, cabal, checkPpr, checkExact, countDeps,
+  compareSizes, compiler, containers, deepseq, deriveConstants, directory,
+  exceptions, filepath, genapply, genprimopcode, ghc, ghcBignum, ghcBoot, ghcBootTh,
+  ghcCompact, ghcConfig, ghcHeap, ghci, ghciWrapper, ghcPkg, ghcPrim, haddock, haskeline, hsc2hs,
+  hp2ps, hpc, hpcBin, integerGmp, integerSimple, iserv, iservProxy, remoteIserv, libffi, libiserv, mtl,
+  parsec, pretty, primitive, process, rts, runGhc, stm, templateHaskell,
+  terminfo, text, time, touchy, transformers, unlit, unix, win32, xhtml,
+  timeout,
+  lintersCommon, lintNotes, lintCommitMsg, lintSubmoduleRefs, lintWhitespace
+    :: Package
 array               = lib  "array"
 base                = lib  "base"
 binary              = lib  "binary"
 bytestring          = lib  "bytestring"
+cabalSyntax         = lib  "Cabal-syntax"    `setPath` "libraries/Cabal/Cabal-syntax"
 cabal               = lib  "Cabal"           `setPath` "libraries/Cabal/Cabal"
-checkApiAnnotations = util "check-api-annotations"
 checkPpr            = util "check-ppr"
+checkExact          = util "check-exact"
+countDeps           = util "count-deps"
 compareSizes        = util "compareSizes"    `setPath` "utils/compare_sizes"
 compiler            = top  "ghc"             `setPath` "compiler"
 containers          = lib  "containers"      `setPath` "libraries/containers/containers"
@@ -67,6 +84,7 @@ ghcBignum           = lib  "ghc-bignum"
 ghcBoot             = lib  "ghc-boot"
 ghcBootTh           = lib  "ghc-boot-th"
 ghcCompact          = lib  "ghc-compact"
+ghcConfig           = prg  "ghc-config"      `setPath` "testsuite/ghc-config"
 ghcHeap             = lib  "ghc-heap"
 ghci                = lib  "ghci"
 ghciWrapper         = prg  "ghci-wrapper"    `setPath` "driver/ghci"
@@ -106,6 +124,12 @@ unix                = lib  "unix"
 win32               = lib  "Win32"
 xhtml               = lib  "xhtml"
 
+lintersCommon       = lib     "linters-common"      `setPath` "linters/linters-common"
+lintNotes           = linter  "lint-notes"
+lintCommitMsg       = linter  "lint-commit-msg"
+lintSubmoduleRefs   = linter  "lint-submodule-refs"
+lintWhitespace      = linter  "lint-whitespace"
+
 -- | Construct a library package, e.g. @array@.
 lib :: PackageName -> Package
 lib name = library name ("libraries" -/- name)
@@ -121,6 +145,10 @@ prg name = program name name
 -- | Construct a utility package, e.g. @haddock@.
 util :: PackageName -> Package
 util name = program name ("utils" -/- name)
+
+-- | Construct a linter executable program (lives in the \"linters\" subdirectory).
+linter :: PackageName -> Package
+linter name = program name ("linters" -/- name)
 
 -- | Amend a package path if it doesn't conform to a typical pattern.
 setPath :: Package -> FilePath -> Package
@@ -164,7 +192,7 @@ programPath context@Context {..} = do
     -- See: https://github.com/snowleopard/hadrian/issues/570
     -- Likewise for @iserv@ and @unlit@.
     name <- programName context
-    path <- if package `elem` [iserv, touchy, unlit]
+    path <- if package `elem` [touchy, unlit]
               then stageLibPath stage <&> (-/- "bin")
               else stageBinPath stage
     return $ path -/- name <.> exe
@@ -177,7 +205,7 @@ timeoutPath = "testsuite/timeout/install-inplace/bin/timeout" <.> exe
 -- TODO: Can we extract this information from Cabal files?
 -- | Some program packages should not be linked with Haskell main function.
 nonHsMainPackage :: Package -> Bool
-nonHsMainPackage = (`elem` [ghc, hp2ps, iserv, touchy, unlit, ghciWrapper])
+nonHsMainPackage = (`elem` [hp2ps, iserv, touchy, unlit, ghciWrapper])
 
 -- TODO: Combine this with 'programName'.
 -- | Path to the @autogen@ directory generated by 'buildAutogenFiles'.
@@ -216,16 +244,6 @@ libffiBuildPath stage = buildPath $ Context
     stage
     libffi
     (error "libffiBuildPath: way not set.")
-
--- | Name of the 'libffi' library.
-libffiLibraryName :: Action FilePath
-libffiLibraryName = do
-    useSystemFfi <- flag UseSystemFfi
-    return $ case (useSystemFfi, windowsHost) of
-        (True , False) -> "ffi"
-        (False, False) -> "Cffi"
-        (_    , True ) -> "Cffi-6"
-
 
 {-
 Note [Hadrian's ghci-wrapper package]

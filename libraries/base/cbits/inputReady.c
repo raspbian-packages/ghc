@@ -21,8 +21,8 @@
 #endif
 
 /* select and supporting types is not Posix */
-/* #include "PosixSource.h" */
-#include "Rts.h"
+/* #include <rts/PosixSource.h> */
+#include <Rts.h>
 #include <limits.h>
 #include <stdbool.h>
 #include "HsBase.h"
@@ -168,7 +168,7 @@ fdReady(int fd, bool write, int64_t msecs, bool isSock)
     Time remaining = MSToTime(msecs);
 
     // Note [Guaranteed syscall time spent]
-    //
+    // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     // The implementation ensures that if fdReady() is called with N `msecs`,
     // it will not return before an FD-polling syscall *returns*
     // with `endTime` having passed.

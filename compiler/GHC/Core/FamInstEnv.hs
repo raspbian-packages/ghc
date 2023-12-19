@@ -1,11 +1,12 @@
+{-# LANGUAGE DeriveFunctor       #-}
+{-# LANGUAGE GADTs               #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TupleSections       #-}
+
+{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 -- (c) The University of Glasgow 2006
 --
 -- FamInstEnv: Type checked family instance declarations
-
-{-# LANGUAGE CPP, GADTs, ScopedTypeVariables, BangPatterns, TupleSections,
-    DeriveFunctor #-}
-
-{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 
 module GHC.Core.FamInstEnv (
         FamInst(..), FamFlavor(..), famInstAxiom, famInstTyCon, famInstRHS,
@@ -14,8 +15,8 @@ module GHC.Core.FamInstEnv (
         mkImportedFamInst,
 
         FamInstEnvs, FamInstEnv, emptyFamInstEnv, emptyFamInstEnvs,
-        extendFamInstEnv, extendFamInstEnvList,
-        famInstEnvElts, famInstEnvSize, familyInstances,
+        unionFamInstEnv, extendFamInstEnv, extendFamInstEnvList,
+        famInstEnvElts, famInstEnvSize, familyInstances, familyNameInstances,
 
         -- * CoAxioms
         mkCoAxBranch, mkBranchedCoAxiom, mkUnbranchedCoAxiom, mkSingleCoAxiom,
@@ -24,7 +25,7 @@ module GHC.Core.FamInstEnv (
         FamInstMatch(..),
         lookupFamInstEnv, lookupFamInstEnvConflicts, lookupFamInstEnvByTyCon,
 
-        isDominatedBy, apartnessCheck,
+        isDominatedBy, apartnessCheck, compatibleBranches,
 
         -- Injectivity
         InjectivityCheckResult(..),
@@ -33,13 +34,8 @@ module GHC.Core.FamInstEnv (
         -- Normalisation
         topNormaliseType, topNormaliseType_maybe,
         normaliseType, normaliseTcApp,
-        topReduceTyFamApp_maybe, reduceTyFamApp_maybe,
-
-        -- Flattening
-        flattenTys
+        topReduceTyFamApp_maybe, reduceTyFamApp_maybe
     ) where
-
-#include "HsVersions.h"
 
 import GHC.Prelude
 
@@ -49,21 +45,23 @@ import GHC.Core.TyCo.Rep
 import GHC.Core.TyCon
 import GHC.Core.Coercion
 import GHC.Core.Coercion.Axiom
+import GHC.Core.Reduction
+import GHC.Core.RoughMap
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
 import GHC.Types.Name
-import GHC.Types.Unique.DFM
-import GHC.Utils.Outputable
 import GHC.Data.Maybe
-import GHC.Core.Map
-import GHC.Types.Unique
-import GHC.Utils.Misc
 import GHC.Types.Var
 import GHC.Types.SrcLoc
-import GHC.Data.FastString
 import Control.Monad
 import Data.List( mapAccumL )
 import Data.Array( Array, assocs )
+
+import GHC.Utils.Misc
+import GHC.Utils.Outputable
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
+import GHC.Data.Bag
 
 {-
 ************************************************************************
@@ -106,8 +104,9 @@ data FamInst  -- See Note [FamInsts and CoAxioms]
             , fi_fam   :: Name          -- Family name
 
                 -- Used for "rough matching"; same idea as for class instances
-                -- See Note [Rough-match field] in GHC.Core.InstEnv
-            , fi_tcs   :: [Maybe Name]  -- Top of type args
+                -- See Note [Rough matching in class and family instances]
+                -- in GHC.Core.Unify
+            , fi_tcs   :: [RoughMatchTc]  -- Top of type args
                 -- INVARIANT: fi_tcs = roughMatchTcs fi_tys
 
             -- Used for "proper matching"; ditto
@@ -222,7 +221,7 @@ instance Outputable FamInst where
 pprFamInst :: FamInst -> SDoc
 -- Prints the FamInst as a family instance declaration
 -- NB: This function, FamInstEnv.pprFamInst, is used only for internal,
---     debug printing. See GHC.Core.Ppr.TyThing.pprFamInst for printing for the user
+--     debug printing. See GHC.Types.TyThing.Ppr.pprFamInst for printing for the user
 pprFamInst (FamInst { fi_flavor = flavor, fi_axiom = ax
                     , fi_tvs = tvs, fi_tys = tys, fi_rhs = rhs })
   = hang (ppr_tc_sort <+> text "instance"
@@ -266,7 +265,7 @@ also.
 -- interface file.  In particular, we get the rough match info from the iface
 -- (instead of computing it here).
 mkImportedFamInst :: Name               -- Name of the family
-                  -> [Maybe Name]       -- Rough match info
+                  -> [RoughMatchTc]     -- Rough match info
                   -> CoAxiom Unbranched -- Axiom introduced
                   -> FamInst            -- Resulting family instance
 mkImportedFamInst fam mb_tcs axiom
@@ -304,7 +303,17 @@ mkImportedFamInst fam mb_tcs axiom
 
 Note [FamInstEnv]
 ~~~~~~~~~~~~~~~~~
-A FamInstEnv maps a family name to the list of known instances for that family.
+A FamInstEnv is a RoughMap of instance heads. Specifically, the keys are formed
+by the family name and the instance arguments. That is, an instance:
+
+    type instance Fam (Maybe Int) a
+
+would insert into the instance environment an instance with a key of the form
+
+  [RM_KnownTc Fam, RM_KnownTc Maybe, RM_WildCard]
+
+See Note [RoughMap] in GHC.Core.RoughMap.
+
 
 The same FamInstEnv includes both 'data family' and 'type family' instances.
 Type families are reduced during type inference, but not data families;
@@ -352,30 +361,24 @@ UniqFM and UniqDFM.
 See Note [Deterministic UniqFM].
 -}
 
--- Internally we sometimes index by Name instead of TyCon despite
--- of what the type says. This is safe since
--- getUnique (tyCon) == getUniqe (tcName tyCon)
-type FamInstEnv = UniqDFM TyCon FamilyInstEnv  -- Maps a family to its instances
-     -- See Note [FamInstEnv]
-     -- See Note [FamInstEnv determinism]
-
 type FamInstEnvs = (FamInstEnv, FamInstEnv)
      -- External package inst-env, Home-package inst-env
 
-newtype FamilyInstEnv
-  = FamIE [FamInst]     -- The instances for a particular family, in any order
+data FamInstEnv
+  = FamIE !Int -- The number of instances, used to choose the smaller environment
+               -- when checking type family consistnecy of home modules.
+          !(RoughMap FamInst)
+     -- See Note [FamInstEnv]
+     -- See Note [FamInstEnv determinism]
 
-instance Outputable FamilyInstEnv where
-  ppr (FamIE fs) = text "FamIE" <+> vcat (map ppr fs)
 
--- | Index a FamInstEnv by the tyCons name.
-toNameInstEnv :: FamInstEnv -> UniqDFM Name FamilyInstEnv
-toNameInstEnv = unsafeCastUDFMKey
+instance Outputable FamInstEnv where
+  ppr (FamIE _ fs) = text "FamIE" <+> vcat (map ppr $ elemsRM fs)
 
--- | Create a FamInstEnv from Name indices.
-fromNameInstEnv :: UniqDFM Name FamilyInstEnv -> FamInstEnv
-fromNameInstEnv = unsafeCastUDFMKey
+famInstEnvSize :: FamInstEnv -> Int
+famInstEnvSize (FamIE sz _) = sz
 
+-- | Create a 'FamInstEnv' from 'Name' indices.
 -- INVARIANTS:
 --  * The fs_tvs are distinct in each FamInst
 --      of a range value of the map (so we can safely unify them)
@@ -384,34 +387,40 @@ emptyFamInstEnvs :: (FamInstEnv, FamInstEnv)
 emptyFamInstEnvs = (emptyFamInstEnv, emptyFamInstEnv)
 
 emptyFamInstEnv :: FamInstEnv
-emptyFamInstEnv = emptyUDFM
+emptyFamInstEnv = FamIE 0 emptyRM
 
 famInstEnvElts :: FamInstEnv -> [FamInst]
-famInstEnvElts fi = [elt | FamIE elts <- eltsUDFM fi, elt <- elts]
+famInstEnvElts (FamIE _ rm) = elemsRM rm
   -- See Note [FamInstEnv determinism]
 
-famInstEnvSize :: FamInstEnv -> Int
-famInstEnvSize = nonDetStrictFoldUDFM (\(FamIE elt) sum -> sum + length elt) 0
   -- It's OK to use nonDetStrictFoldUDFM here since we're just computing the
   -- size.
 
 familyInstances :: (FamInstEnv, FamInstEnv) -> TyCon -> [FamInst]
-familyInstances (pkg_fie, home_fie) fam
+familyInstances envs tc
+  = familyNameInstances envs (tyConName tc)
+
+familyNameInstances :: (FamInstEnv, FamInstEnv) -> Name -> [FamInst]
+familyNameInstances (pkg_fie, home_fie) fam
   = get home_fie ++ get pkg_fie
   where
-    get env = case lookupUDFM env fam of
-                Just (FamIE insts) -> insts
-                Nothing                      -> []
+    get :: FamInstEnv -> [FamInst]
+    get (FamIE _ env) = lookupRM [RML_KnownTc fam] env
+
+
+-- | Makes no particular effort to detect conflicts.
+unionFamInstEnv :: FamInstEnv -> FamInstEnv -> FamInstEnv
+unionFamInstEnv (FamIE sa a) (FamIE sb b) = FamIE (sa + sb) (a `unionRM` b)
 
 extendFamInstEnvList :: FamInstEnv -> [FamInst] -> FamInstEnv
 extendFamInstEnvList inst_env fis = foldl' extendFamInstEnv inst_env fis
 
 extendFamInstEnv :: FamInstEnv -> FamInst -> FamInstEnv
-extendFamInstEnv inst_env
+extendFamInstEnv (FamIE s inst_env)
                  ins_item@(FamInst {fi_fam = cls_nm})
-  = fromNameInstEnv $ addToUDFM_C add (toNameInstEnv inst_env) cls_nm (FamIE [ins_item])
+  = FamIE (s+1) $ insertRM rough_tmpl ins_item inst_env
   where
-    add (FamIE items) _ = FamIE (ins_item:items)
+    rough_tmpl = RM_KnownTc cls_nm : fi_tcs ins_item
 
 {-
 ************************************************************************
@@ -430,7 +439,8 @@ Here is how we do it:
 apart(target, pattern) = not (unify(flatten(target), pattern))
 
 where flatten (implemented in flattenTys, below) converts all type-family
-applications into fresh variables. (See Note [Flattening].)
+applications into fresh variables. (See
+Note [Flattening type-family applications when matching instances] in GHC.Core.Unify.)
 
 Note [Compatibility]
 ~~~~~~~~~~~~~~~~~~~~
@@ -521,15 +531,16 @@ fails anyway.
 compatibleBranches :: CoAxBranch -> CoAxBranch -> Bool
 compatibleBranches (CoAxBranch { cab_lhs = lhs1, cab_rhs = rhs1 })
                    (CoAxBranch { cab_lhs = lhs2, cab_rhs = rhs2 })
-  = let (commonlhs1, commonlhs2) = zipAndUnzip lhs1 lhs2
-             -- See Note [Compatibility of eta-reduced axioms]
-    in case tcUnifyTysFG (const BindMe) commonlhs1 commonlhs2 of
-      SurelyApart -> True
-      Unifiable subst
-        | Type.substTyAddInScope subst rhs1 `eqType`
-          Type.substTyAddInScope subst rhs2
-        -> True
-      _ -> False
+  = case tcUnifyTysFG alwaysBindFun commonlhs1 commonlhs2 of
+      -- Here we need the cab_tvs of the two branches to be disinct.
+      -- See Note [CoAxBranch type variables] in GHC.Core.Coercion.Axiom.
+      SurelyApart     -> True
+      MaybeApart {}   -> False
+      Unifiable subst -> Type.substTyAddInScope subst rhs1 `eqType`
+                         Type.substTyAddInScope subst rhs2
+  where
+     (commonlhs1, commonlhs2) = zipAndUnzip lhs1 lhs2
+     -- See Note [Compatibility of eta-reduced axioms]
 
 -- | Result of testing two type family equations for injectiviy.
 data InjectivityCheckResult
@@ -580,7 +591,7 @@ computeAxiomIncomps branches
   where
     go :: [CoAxBranch] -> CoAxBranch -> ([CoAxBranch], CoAxBranch)
     go prev_brs cur_br
-       = (cur_br : prev_brs, new_br)
+       = (new_br : prev_brs, new_br)
        where
          new_br = cur_br { cab_incomps = mk_incomps prev_brs cur_br }
 
@@ -775,9 +786,7 @@ lookupFamInstEnvByTyCon :: FamInstEnvs -> TyCon -> [FamInst]
 lookupFamInstEnvByTyCon (pkg_ie, home_ie) fam_tc
   = get pkg_ie ++ get home_ie
   where
-    get ie = case lookupUDFM ie fam_tc of
-               Nothing          -> []
-               Just (FamIE fis) -> fis
+    get (FamIE _ rm) = lookupRM [RML_KnownTc (tyConName fam_tc)] rm
 
 lookupFamInstEnv
     :: FamInstEnvs
@@ -786,14 +795,12 @@ lookupFamInstEnv
 -- Precondition: the tycon is saturated (or over-saturated)
 
 lookupFamInstEnv
-   = lookup_fam_inst_env match
-   where
-     match _ _ tpl_tys tys = tcMatchTys tpl_tys tys
+   = lookup_fam_inst_env WantMatches
 
 lookupFamInstEnvConflicts
     :: FamInstEnvs
     -> FamInst          -- Putative new instance
-    -> [FamInstMatch]   -- Conflicting matches (don't look at the fim_tys field)
+    -> [FamInst]   -- Conflicting matches (don't look at the fim_tys field)
 -- E.g. when we are about to add
 --    f : type instance F [a] = a->a
 -- we do (lookupFamInstConflicts f [b])
@@ -801,25 +808,10 @@ lookupFamInstEnvConflicts
 --
 -- Precondition: the tycon is saturated (or over-saturated)
 
-lookupFamInstEnvConflicts envs fam_inst@(FamInst { fi_axiom = new_axiom })
-  = lookup_fam_inst_env my_unify envs fam tys
+lookupFamInstEnvConflicts envs fam_inst
+  = lookup_fam_inst_env (WantConflicts fam_inst) envs fam tys
   where
     (fam, tys) = famInstSplitLHS fam_inst
-        -- In example above,   fam tys' = F [b]
-
-    my_unify (FamInst { fi_axiom = old_axiom }) tpl_tvs tpl_tys _
-       = ASSERT2( tyCoVarsOfTypes tys `disjointVarSet` tpl_tvs,
-                  (ppr fam <+> ppr tys) $$
-                  (ppr tpl_tvs <+> ppr tpl_tys) )
-                -- Unification will break badly if the variables overlap
-                -- They shouldn't because we allocate separate uniques for them
-         if compatibleBranches (coAxiomSingleBranch old_axiom) new_branch
-           then Nothing
-           else Just noSubst
-      -- Note [Family instance overlap conflicts]
-
-    noSubst = panic "lookupFamInstEnvConflicts noSubst"
-    new_branch = coAxiomSingleBranch new_axiom
 
 --------------------------------------------------------------------------------
 --                 Type family injectivity checking bits                      --
@@ -827,7 +819,6 @@ lookupFamInstEnvConflicts envs fam_inst@(FamInst { fi_axiom = new_axiom })
 
 {- Note [Verifying injectivity annotation]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 Injectivity means that the RHS of a type family uniquely determines the LHS (see
 Note [Type inference for type families with injectivity]).  The user informs us about
 injectivity using an injectivity annotation and it is GHC's task to verify that
@@ -929,11 +920,17 @@ lookupFamInstEnvInjectivityConflicts
     ->  FamInstEnvs   -- all type instances seens so far
     ->  FamInst       -- new type instance that we're checking
     -> [CoAxBranch]   -- conflicting instance declarations
-lookupFamInstEnvInjectivityConflicts injList (pkg_ie, home_ie)
+lookupFamInstEnvInjectivityConflicts injList fam_inst_envs
                              fam_inst@(FamInst { fi_axiom = new_axiom })
+  | not $ isOpenFamilyTyCon fam
+  = []
+
+  | otherwise
   -- See Note [Verifying injectivity annotation]. This function implements
   -- check (1.B1) for open type families described there.
-  = lookup_inj_fam_conflicts home_ie ++ lookup_inj_fam_conflicts pkg_ie
+  = map (coAxiomSingleBranch . fi_axiom) $
+    filter isInjConflict $
+    familyInstances fam_inst_envs fam
     where
       fam        = famInstTyCon fam_inst
       new_branch = coAxiomSingleBranch new_axiom
@@ -945,12 +942,6 @@ lookupFamInstEnvInjectivityConflicts injList (pkg_ie, home_ie)
             injectiveBranches injList (coAxiomSingleBranch old_axiom) new_branch
           = False -- no conflict
           | otherwise = True
-
-      lookup_inj_fam_conflicts ie
-          | isOpenFamilyTyCon fam, Just (FamIE insts) <- lookupUDFM ie fam
-          = map (coAxiomSingleBranch . fi_axiom) $
-            filter isInjConflict insts
-          | otherwise = []
 
 
 --------------------------------------------------------------------------------
@@ -975,46 +966,61 @@ Note [Family instance overlap conflicts]
 
 ------------------------------------------------------------
 -- Might be a one-way match or a unifier
-type MatchFun =  FamInst                -- The FamInst template
-              -> TyVarSet -> [Type]     --   fi_tvs, fi_tys of that FamInst
-              -> [Type]                 -- Target to match against
-              -> Maybe TCvSubst
+data FamInstLookupMode a where
+  -- The FamInst we are trying to find conflicts against
+  WantConflicts :: FamInst -> FamInstLookupMode FamInst
+  WantMatches  :: FamInstLookupMode FamInstMatch
 
 lookup_fam_inst_env'          -- The worker, local to this module
-    :: MatchFun
+    :: forall a . FamInstLookupMode a
     -> FamInstEnv
     -> TyCon -> [Type]        -- What we are looking for
-    -> [FamInstMatch]
-lookup_fam_inst_env' match_fun ie fam match_tys
+    -> [a]
+lookup_fam_inst_env' lookup_mode (FamIE _ ie) fam match_tys
   | isOpenFamilyTyCon fam
-  , Just (FamIE insts) <- lookupUDFM ie fam
-  = find insts    -- The common case
+  , let xs = rm_fun (lookupRM' rough_tmpl ie)   -- The common case
+    -- Avoid doing any of the allocation below if there are no instances to look at.
+  , not $ null xs
+  = mapMaybe' check_fun xs
   | otherwise = []
   where
+    rough_tmpl :: [RoughMatchLookupTc]
+    rough_tmpl = RML_KnownTc (tyConName fam) : map typeToRoughMatchLookupTc match_tys
 
-    find [] = []
-    find (item@(FamInst { fi_tcs = mb_tcs, fi_tvs = tpl_tvs, fi_cvs = tpl_cvs
-                        , fi_tys = tpl_tys }) : rest)
-        -- Fast check for no match, uses the "rough match" fields
-      | instanceCantMatch rough_tcs mb_tcs
-      = find rest
+    rm_fun :: (Bag FamInst, [FamInst]) -> [FamInst]
+    (rm_fun, check_fun) = case lookup_mode of
+                            WantConflicts fam_inst -> (snd, unify_fun fam_inst)
+                            WantMatches -> (bagToList . fst, match_fun)
 
-        -- Proper check
-      | Just subst <- match_fun item (mkVarSet tpl_tvs) tpl_tys match_tys1
-      = (FamInstMatch { fim_instance = item
-                      , fim_tys      = substTyVars subst tpl_tvs `chkAppend` match_tys2
-                      , fim_cos      = ASSERT( all (isJust . lookupCoVar subst) tpl_cvs )
-                                       substCoVars subst tpl_cvs
-                      })
-        : find rest
+    -- Function used for finding unifiers
+    unify_fun orig_fam_inst item@(FamInst { fi_axiom = old_axiom, fi_tys = tpl_tys, fi_tvs = tpl_tvs })
 
-        -- No match => try next
-      | otherwise
-      = find rest
+       = assertPpr (tyCoVarsOfTypes tys `disjointVarSet` mkVarSet tpl_tvs)
+                   ((ppr fam <+> ppr tys) $$
+                    (ppr tpl_tvs <+> ppr tpl_tys)) $
+                -- Unification will break badly if the variables overlap
+                -- They shouldn't because we allocate separate uniques for them
+         if compatibleBranches (coAxiomSingleBranch old_axiom) new_branch
+           then Nothing
+           else Just item
+      -- See Note [Family instance overlap conflicts]
       where
-        (rough_tcs, match_tys1, match_tys2) = split_tys tpl_tys
+        new_branch = coAxiomSingleBranch (famInstAxiom orig_fam_inst)
+        (fam, tys) = famInstSplitLHS orig_fam_inst
 
-      -- Precondition: the tycon is saturated (or over-saturated)
+    -- Function used for checking matches
+    match_fun item@(FamInst { fi_tvs = tpl_tvs, fi_cvs = tpl_cvs
+                            , fi_tys = tpl_tys }) =  do
+      subst <- tcMatchTys tpl_tys match_tys1
+      return (FamInstMatch { fim_instance = item
+                             , fim_tys      = substTyVars subst tpl_tvs `chkAppend` match_tys2
+                             , fim_cos      = assert (all (isJust . lookupCoVar subst) tpl_cvs) $
+                                               substCoVars subst tpl_cvs
+                             })
+        where
+          (match_tys1, match_tys2) = split_tys tpl_tys
+
+    -- Precondition: the tycon is saturated (or over-saturated)
 
     -- Deal with over-saturation
     -- See Note [Over-saturated matches]
@@ -1024,18 +1030,17 @@ lookup_fam_inst_env' match_fun ie fam match_tys
 
       | otherwise
       = let (match_tys1, match_tys2) = splitAtList tpl_tys match_tys
-            rough_tcs = roughMatchTcs match_tys1
-        in (rough_tcs, match_tys1, match_tys2)
+        in (match_tys1, match_tys2)
 
     (pre_match_tys1, pre_match_tys2) = splitAt (tyConArity fam) match_tys
     pre_rough_split_tys
-      = (roughMatchTcs pre_match_tys1, pre_match_tys1, pre_match_tys2)
+      = (pre_match_tys1, pre_match_tys2)
 
 lookup_fam_inst_env           -- The worker, local to this module
-    :: MatchFun
+    :: FamInstLookupMode a
     -> FamInstEnvs
     -> TyCon -> [Type]        -- What we are looking for
-    -> [FamInstMatch]         -- Successful matches
+    -> [a]         -- Successful matches
 
 -- Precondition: the tycon is saturated (or over-saturated)
 
@@ -1101,7 +1106,7 @@ but we also need to handle closed ones when normalising a type:
 reduceTyFamApp_maybe :: FamInstEnvs
                      -> Role              -- Desired role of result coercion
                      -> TyCon -> [Type]
-                     -> Maybe (Coercion, Type)
+                     -> Maybe Reduction
 -- Attempt to do a *one-step* reduction of a type-family application
 --    but *not* newtypes
 -- Works on type-synonym families always; data-families only if
@@ -1132,19 +1137,18 @@ reduceTyFamApp_maybe envs role tc tys
       -- NB: Allow multiple matches because of compatible overlap
 
   = let co = mkUnbranchedAxInstCo role ax inst_tys inst_cos
-        ty = coercionRKind co
-    in Just (co, ty)
+    in Just $ coercionRedn co
 
   | Just ax <- isClosedSynFamilyTyConWithAxiom_maybe tc
   , Just (ind, inst_tys, inst_cos) <- chooseBranch ax tys
   = let co = mkAxInstCo role ax ind inst_tys inst_cos
-        ty = coercionRKind co
-    in Just (co, ty)
+    in Just $ coercionRedn co
 
   | Just ax           <- isBuiltInSynFamTyCon_maybe tc
   , Just (coax,ts,ty) <- sfMatchFam ax tys
+  , role == coaxrRole coax
   = let co = mkAxiomRuleCo coax (zipWith mkReflCo (coaxrAsmpRoles coax) ts)
-    in Just (co, ty)
+    in Just $ mkReduction co ty
 
   | otherwise
   = Nothing
@@ -1177,14 +1181,15 @@ findBranch branches target_tys
                         , cab_incomps = incomps }) = branch
             in_scope = mkInScopeSet (unionVarSets $
                             map (tyCoVarsOfTypes . coAxBranchLHS) incomps)
-            -- See Note [Flattening] below
+            -- See Note [Flattening type-family applications when matching instances]
+            -- in GHC.Core.Unify
             flattened_target = flattenTys in_scope target_tys
         in case tcMatchTys tpl_lhs target_tys of
         Just subst -- matching worked. now, check for apartness.
           |  apartnessCheck flattened_target branch
           -> -- matching worked & we're apart from all incompatible branches.
              -- success
-             ASSERT( all (isJust . lookupCoVar subst) tpl_cvs )
+             assert (all (isJust . lookupCoVar subst) tpl_cvs) $
              Just (index, substTyVars subst tpl_tvs, substCoVars subst tpl_cvs)
 
         -- failure. keep looking
@@ -1194,16 +1199,16 @@ findBranch branches target_tys
 -- (POPL '14). This should be used when determining if an equation
 -- ('CoAxBranch') of a closed type family can be used to reduce a certain target
 -- type family application.
-apartnessCheck :: [Type]     -- ^ /flattened/ target arguments. Make sure
-                             -- they're flattened! See Note [Flattening].
-                             -- (NB: This "flat" is a different
-                             -- "flat" than is used in GHC.Tc.Solver.Flatten.)
+apartnessCheck :: [Type]
+  -- ^ /flattened/ target arguments. Make sure they're flattened! See
+  -- Note [Flattening type-family applications when matching instances]
+  -- in GHC.Core.Unify.
                -> CoAxBranch -- ^ the candidate equation we wish to use
                              -- Precondition: this matches the target
                -> Bool       -- ^ True <=> equation can fire
 apartnessCheck flattened_target (CoAxBranch { cab_incomps = incomps })
   = all (isSurelyApart
-         . tcUnifyTysFG (const BindMe) flattened_target
+         . tcUnifyTysFG alwaysBindFun flattened_target
          . coAxBranchLHS) incomps
   where
     isSurelyApart SurelyApart = True
@@ -1274,11 +1279,12 @@ case by that route too, but it hasn't happened in practice yet!
 -}
 
 topNormaliseType :: FamInstEnvs -> Type -> Type
-topNormaliseType env ty = case topNormaliseType_maybe env ty of
-                            Just (_co, ty') -> ty'
-                            Nothing         -> ty
+topNormaliseType env ty
+  = case topNormaliseType_maybe env ty of
+      Just redn -> reductionReducedType redn
+      Nothing   -> ty
 
-topNormaliseType_maybe :: FamInstEnvs -> Type -> Maybe (Coercion, Type)
+topNormaliseType_maybe :: FamInstEnvs -> Type -> Maybe Reduction
 
 -- ^ Get rid of *outermost* (or toplevel)
 --      * type function redex
@@ -1297,12 +1303,8 @@ topNormaliseType_maybe :: FamInstEnvs -> Type -> Maybe (Coercion, Type)
 -- original type, and the returned coercion is always homogeneous.
 topNormaliseType_maybe env ty
   = do { ((co, mkind_co), nty) <- topNormaliseTypeX stepper combine ty
-       ; return $ case mkind_co of
-           MRefl       -> (co, nty)
-           MCo kind_co -> let nty_casted = nty `mkCastTy` mkSymCo kind_co
-                              final_co   = mkCoherenceRightCo Representational nty
-                                                              (mkSymCo kind_co) co
-                          in (final_co, nty_casted) }
+       ; let hredn = mkHetReduction (mkReduction co nty) mkind_co
+       ; return $ homogeniseHetRedn Representational hredn }
   where
     stepper = unwrapNewTypeStepper' `composeSteppers` tyFamStepper
 
@@ -1317,18 +1319,19 @@ topNormaliseType_maybe env ty
     tyFamStepper :: NormaliseStepper (Coercion, MCoercionN)
     tyFamStepper rec_nts tc tys  -- Try to step a type/data family
       = case topReduceTyFamApp_maybe env tc tys of
-          Just (co, rhs, res_co) -> NS_Step rec_nts rhs (co, MCo res_co)
-          _                      -> NS_Done
+          Just (HetReduction (Reduction co rhs) res_co)
+            -> NS_Step rec_nts rhs (co, res_co)
+          _ -> NS_Done
 
 ---------------
-normaliseTcApp :: FamInstEnvs -> Role -> TyCon -> [Type] -> (Coercion, Type)
+normaliseTcApp :: FamInstEnvs -> Role -> TyCon -> [Type] -> Reduction
 -- See comments on normaliseType for the arguments of this function
 normaliseTcApp env role tc tys
   = initNormM env role (tyCoVarsOfTypes tys) $
     normalise_tc_app tc tys
 
 -- See Note [Normalising types] about the LiftingContext
-normalise_tc_app :: TyCon -> [Type] -> NormM (Coercion, Type)
+normalise_tc_app :: TyCon -> [Type] -> NormM Reduction
 normalise_tc_app tc tys
   | Just (tenv, rhs, tys') <- expandSynTyCon_maybe tc tys
   , not (isFamFreeTyCon tc)  -- Expand and try again
@@ -1341,76 +1344,70 @@ normalise_tc_app tc tys
   = -- A type-family application
     do { env <- getEnv
        ; role <- getRole
-       ; (args_co, ntys, res_co) <- normalise_tc_args tc tys
+       ; ArgsReductions redns@(Reductions args_cos ntys) res_co <- normalise_tc_args tc tys
        ; case reduceTyFamApp_maybe env role tc ntys of
-           Just (first_co, ty')
-             -> do { (rest_co,nty) <- normalise_type ty'
-                   ; return (assemble_result role nty
-                                             (args_co `mkTransCo` first_co `mkTransCo` rest_co)
-                                             res_co) }
+           Just redn1
+             -> do { redn2 <- normalise_reduction redn1
+                   ; let redn3 = mkTyConAppCo role tc args_cos `mkTransRedn` redn2
+                   ; return $ assemble_result role redn3 res_co }
            _ -> -- No unique matching family instance exists;
                 -- we do not do anything
-                return (assemble_result role (mkTyConApp tc ntys) args_co res_co) }
+                return $
+                  assemble_result role (mkTyConAppRedn role tc redns) res_co }
 
   | otherwise
   = -- A synonym with no type families in the RHS; or data type etc
     -- Just normalise the arguments and rebuild
-    do { (args_co, ntys, res_co) <- normalise_tc_args tc tys
+    do { ArgsReductions redns res_co <- normalise_tc_args tc tys
        ; role <- getRole
-       ; return (assemble_result role (mkTyConApp tc ntys) args_co res_co) }
+       ; return $
+            assemble_result role (mkTyConAppRedn role tc redns) res_co }
 
   where
     assemble_result :: Role       -- r, ambient role in NormM monad
-                    -> Type       -- nty, result type, possibly of changed kind
-                    -> Coercion   -- orig_ty ~r nty, possibly heterogeneous
-                    -> CoercionN  -- typeKind(orig_ty) ~N typeKind(nty)
-                    -> (Coercion, Type)   -- (co :: orig_ty ~r nty_casted, nty_casted)
-                                          -- where nty_casted has same kind as orig_ty
-    assemble_result r nty orig_to_nty kind_co
-      = ( final_co, nty_old_kind )
-      where
-        nty_old_kind = nty `mkCastTy` mkSymCo kind_co
-        final_co     = mkCoherenceRightCo r nty (mkSymCo kind_co) orig_to_nty
+                    -> Reduction  -- orig_ty ~r nty, possibly heterogeneous (nty possibly of changed kind)
+                    -> MCoercionN -- typeKind(orig_ty) ~N typeKind(nty)
+                    -> Reduction  -- orig_ty ~r nty_casted
+                                  -- where nty_casted has same kind as orig_ty
+    assemble_result r redn kind_co
+      = mkCoherenceRightMRedn r redn (mkSymMCo kind_co)
 
 ---------------
 -- | Try to simplify a type-family application, by *one* step
--- If topReduceTyFamApp_maybe env r F tys = Just (co, rhs, res_co)
+-- If topReduceTyFamApp_maybe env r F tys = Just (HetReduction (Reduction co rhs) res_co)
 -- then    co     :: F tys ~R# rhs
 --         res_co :: typeKind(F tys) ~ typeKind(rhs)
 -- Type families and data families; always Representational role
 topReduceTyFamApp_maybe :: FamInstEnvs -> TyCon -> [Type]
-                        -> Maybe (Coercion, Type, Coercion)
+                        -> Maybe HetReduction
 topReduceTyFamApp_maybe envs fam_tc arg_tys
   | isFamilyTyCon fam_tc   -- type families and data families
-  , Just (co, rhs) <- reduceTyFamApp_maybe envs role fam_tc ntys
-  = Just (args_co `mkTransCo` co, rhs, res_co)
+  , Just redn <- reduceTyFamApp_maybe envs role fam_tc ntys
+  = Just $
+      mkHetReduction
+        (mkTyConAppCo role fam_tc args_cos `mkTransRedn` redn)
+        res_co
   | otherwise
   = Nothing
   where
     role = Representational
-    (args_co, ntys, res_co) = initNormM envs role (tyCoVarsOfTypes arg_tys) $
-                              normalise_tc_args fam_tc arg_tys
+    ArgsReductions (Reductions args_cos ntys) res_co
+      = initNormM envs role (tyCoVarsOfTypes arg_tys)
+      $ normalise_tc_args fam_tc arg_tys
 
-normalise_tc_args :: TyCon -> [Type]             -- tc tys
-                  -> NormM (Coercion, [Type], CoercionN)
-                  -- (co, new_tys), where
-                  -- co :: tc tys ~ tc new_tys; might not be homogeneous
-                  -- res_co :: typeKind(tc tys) ~N typeKind(tc new_tys)
+normalise_tc_args :: TyCon -> [Type] -> NormM ArgsReductions
 normalise_tc_args tc tys
   = do { role <- getRole
-       ; (args_cos, nargs, res_co) <- normalise_args (tyConKind tc) (tyConRolesX role tc) tys
-       ; return (mkTyConAppCo role tc args_cos, nargs, res_co) }
+       ; normalise_args (tyConKind tc) (tyConRolesX role tc) tys }
 
 ---------------
 normaliseType :: FamInstEnvs
               -> Role  -- desired role of coercion
-              -> Type -> (Coercion, Type)
+              -> Type -> Reduction
 normaliseType env role ty
   = initNormM env role (tyCoVarsOfType ty) $ normalise_type ty
 
-normalise_type :: Type                     -- old type
-               -> NormM (Coercion, Type)   -- (coercion, new type), where
-                                           -- co :: old-type ~ new_type
+normalise_type :: Type -> NormM Reduction
 -- Normalise the input type, by eliminating *all* type-function redexes
 -- but *not* newtypes (which are visible to the programmer)
 -- Returns with Refl if nothing happens
@@ -1422,106 +1419,105 @@ normalise_type :: Type                     -- old type
 normalise_type ty
   = go ty
   where
+    go :: Type -> NormM Reduction
     go (TyConApp tc tys) = normalise_tc_app tc tys
-    go ty@(LitTy {})     = do { r <- getRole
-                              ; return (mkReflCo r ty, ty) }
+    go ty@(LitTy {})
+      = do { r <- getRole
+           ; return $ mkReflRedn r ty }
     go (AppTy ty1 ty2) = go_app_tys ty1 [ty2]
 
-    go ty@(FunTy { ft_mult = w, ft_arg = ty1, ft_res = ty2 })
-      = do { (co1, nty1) <- go ty1
-           ; (co2, nty2) <- go ty2
-           ; (wco, wty) <- withRole Nominal $ go w
+    go (FunTy { ft_af = vis, ft_mult = w, ft_arg = ty1, ft_res = ty2 })
+      = do { arg_redn <- go ty1
+           ; res_redn <- go ty2
+           ; w_redn <- withRole Nominal $ go w
            ; r <- getRole
-           ; return (mkFunCo r wco co1 co2, ty { ft_mult = wty, ft_arg = nty1, ft_res = nty2 }) }
+           ; return $ mkFunRedn r vis w_redn arg_redn res_redn }
     go (ForAllTy (Bndr tcvar vis) ty)
-      = do { (lc', tv', h, ki') <- normalise_var_bndr tcvar
-           ; (co, nty)          <- withLC lc' $ normalise_type ty
-           ; let tv2 = setTyVarKind tv' ki'
-           ; return (mkForAllCo tv' h co, ForAllTy (Bndr tv2 vis) nty) }
+      = do { (lc', tv', k_redn) <- normalise_var_bndr tcvar
+           ; redn <- withLC lc' $ normalise_type ty
+           ; return $ mkForAllRedn vis tv' k_redn redn }
     go (TyVarTy tv)    = normalise_tyvar tv
     go (CastTy ty co)
-      = do { (nco, nty) <- go ty
+      = do { redn <- go ty
            ; lc <- getLC
            ; let co' = substRightCo lc co
-           ; return (castCoercionKind2 nco Nominal ty nty co co'
-                    , mkCastTy nty co') }
+           ; return $ mkCastRedn2 Nominal ty co redn co'
+             --       ^^^^^^^^^^^ uses castCoercionKind2
+           }
     go (CoercionTy co)
       = do { lc <- getLC
            ; r <- getRole
-           ; let right_co = substRightCo lc co
-           ; return ( mkProofIrrelCo r
-                         (liftCoSubst Nominal lc (coercionType co))
-                         co right_co
-                    , mkCoercionTy right_co ) }
+           ; let kco = liftCoSubst Nominal lc (coercionType co)
+                 co' = substRightCo lc co
+           ; return $ mkProofIrrelRedn r kco co co' }
 
     go_app_tys :: Type   -- function
                -> [Type] -- args
-               -> NormM (Coercion, Type)
-    -- cf. GHC.Tc.Solver.Flatten.flatten_app_ty_args
+               -> NormM Reduction
+    -- cf. GHC.Tc.Solver.Rewrite.rewrite_app_ty_args
     go_app_tys (AppTy ty1 ty2) tys = go_app_tys ty1 (ty2 : tys)
     go_app_tys fun_ty arg_tys
-      = do { (fun_co, nfun) <- go fun_ty
+      = do { fun_redn@(Reduction fun_co nfun) <- go fun_ty
            ; case tcSplitTyConApp_maybe nfun of
                Just (tc, xis) ->
-                 do { (second_co, nty) <- go (mkTyConApp tc (xis ++ arg_tys))
-                   -- flatten_app_ty_args avoids redundantly processing the xis,
+                 do { redn <- go (mkTyConApp tc (xis ++ arg_tys))
+                   -- rewrite_app_ty_args avoids redundantly processing the xis,
                    -- but that's a much more performance-sensitive function.
                    -- This type normalisation is not called in a loop.
-                    ; return (mkAppCos fun_co (map mkNomReflCo arg_tys) `mkTransCo` second_co, nty) }
+                    ; return $
+                        mkAppCos fun_co (map mkNomReflCo arg_tys) `mkTransRedn` redn }
                Nothing ->
-                 do { (args_cos, nargs, res_co) <- normalise_args (typeKind nfun)
-                                                                  (repeat Nominal)
-                                                                  arg_tys
+                 do { ArgsReductions redns res_co
+                        <- normalise_args (typeKind nfun)
+                                          (repeat Nominal)
+                                          arg_tys
                     ; role <- getRole
-                    ; let nty = mkAppTys nfun nargs
-                          nco = mkAppCos fun_co args_cos
-                          nty_casted = nty `mkCastTy` mkSymCo res_co
-                          final_co = mkCoherenceRightCo role nty (mkSymCo res_co) nco
-                    ; return (final_co, nty_casted) } }
+                    ; return $
+                        mkCoherenceRightMRedn role
+                          (mkAppRedns fun_redn redns)
+                          (mkSymMCo res_co) } }
 
 normalise_args :: Kind    -- of the function
                -> [Role]  -- roles at which to normalise args
                -> [Type]  -- args
-               -> NormM ([Coercion], [Type], Coercion)
--- returns (cos, xis, res_co), where each xi is the normalised
--- version of the corresponding type, each co is orig_arg ~ xi,
--- and the res_co :: kind(f orig_args) ~ kind(f xis)
+               -> NormM ArgsReductions
+-- returns ArgsReductions (Reductions cos xis) res_co,
+-- where each xi is the normalised version of the corresponding type,
+-- each co is orig_arg ~ xi, and res_co :: kind(f orig_args) ~ kind(f xis).
 -- NB: The xis might *not* have the same kinds as the input types,
 -- but the resulting application *will* be well-kinded
--- cf. GHC.Tc.Solver.Flatten.flatten_args_slow
+-- cf. GHC.Tc.Solver.Rewrite.rewrite_args_slow
 normalise_args fun_ki roles args
   = do { normed_args <- zipWithM normalise1 roles args
-       ; let (xis, cos, res_co) = simplifyArgsWorker ki_binders inner_ki fvs roles normed_args
-       ; return (map mkSymCo cos, xis, mkSymCo res_co) }
+       ; return $ simplifyArgsWorker ki_binders inner_ki fvs roles normed_args }
   where
     (ki_binders, inner_ki) = splitPiTys fun_ki
     fvs = tyCoVarsOfTypes args
 
-    -- flattener conventions are different from ours
-    impedance_match :: NormM (Coercion, Type) -> NormM (Type, Coercion)
-    impedance_match action = do { (co, ty) <- action
-                                ; return (ty, mkSymCo co) }
-
     normalise1 role ty
-      = impedance_match $ withRole role $ normalise_type ty
+      = withRole role $ normalise_type ty
 
-normalise_tyvar :: TyVar -> NormM (Coercion, Type)
+normalise_tyvar :: TyVar -> NormM Reduction
 normalise_tyvar tv
-  = ASSERT( isTyVar tv )
+  = assert (isTyVar tv) $
     do { lc <- getLC
        ; r  <- getRole
        ; return $ case liftCoSubstTyVar lc r tv of
-           Just co -> (co, coercionRKind co)
-           Nothing -> (mkReflCo r ty, ty) }
-  where ty = mkTyVarTy tv
+           Just co -> coercionRedn co
+           Nothing -> mkReflRedn r (mkTyVarTy tv) }
 
-normalise_var_bndr :: TyCoVar -> NormM (LiftingContext, TyCoVar, Coercion, Kind)
+normalise_reduction :: Reduction -> NormM Reduction
+normalise_reduction (Reduction co ty)
+  = do { redn' <- normalise_type ty
+       ; return $ co `mkTransRedn` redn' }
+
+normalise_var_bndr :: TyCoVar -> NormM (LiftingContext, TyCoVar, Reduction)
 normalise_var_bndr tcvar
   -- works for both tvar and covar
   = do { lc1 <- getLC
        ; env <- getEnv
        ; let callback lc ki = runNormM (normalise_type ki) env lc Nominal
-       ; return $ liftCoSubstVarBndrUsing callback lc1 tcvar }
+       ; return $ liftCoSubstVarBndrUsing reductionCoercion callback lc1 tcvar }
 
 -- | a monad for the normalisation functions, reading 'FamInstEnvs',
 -- a 'LiftingContext', and a 'Role'.
@@ -1561,292 +1557,3 @@ instance Monad NormM where
 instance Applicative NormM where
   pure x = NormM $ \ _ _ _ -> x
   (<*>)  = ap
-
-{-
-************************************************************************
-*                                                                      *
-              Flattening
-*                                                                      *
-************************************************************************
-
-Note [Flattening]
-~~~~~~~~~~~~~~~~~
-As described in "Closed type families with overlapping equations"
-http://research.microsoft.com/en-us/um/people/simonpj/papers/ext-f/axioms-extended.pdf
-we need to flatten core types before unifying them, when checking for "surely-apart"
-against earlier equations of a closed type family.
-Flattening means replacing all top-level uses of type functions with
-fresh variables, *taking care to preserve sharing*. That is, the type
-(Either (F a b) (F a b)) should flatten to (Either c c), never (Either
-c d).
-
-Here is a nice example of why it's all necessary:
-
-  type family F a b where
-    F Int Bool = Char
-    F a   b    = Double
-  type family G a         -- open, no instances
-
-How do we reduce (F (G Float) (G Float))? The first equation clearly doesn't match,
-while the second equation does. But, before reducing, we must make sure that the
-target can never become (F Int Bool). Well, no matter what G Float becomes, it
-certainly won't become *both* Int and Bool, so indeed we're safe reducing
-(F (G Float) (G Float)) to Double.
-
-This is necessary not only to get more reductions (which we might be
-willing to give up on), but for substitutivity. If we have (F x x), we
-can see that (F x x) can reduce to Double. So, it had better be the
-case that (F blah blah) can reduce to Double, no matter what (blah)
-is!  Flattening as done below ensures this.
-
-The algorithm works by building up a TypeMap TyVar, mapping
-type family applications to fresh variables. This mapping must
-be threaded through all the function calls, as any entry in
-the mapping must be propagated to all future nodes in the tree.
-
-The algorithm also must track the set of in-scope variables, in
-order to make fresh variables as it flattens. (We are far from a
-source of fresh Uniques.) See Wrinkle 2, below.
-
-There are wrinkles, of course:
-
-1. The flattening algorithm must account for the possibility
-   of inner `forall`s. (A `forall` seen here can happen only
-   because of impredicativity. However, the flattening operation
-   is an algorithm in Core, which is impredicative.)
-   Suppose we have (forall b. F b) -> (forall b. F b). Of course,
-   those two bs are entirely unrelated, and so we should certainly
-   not flatten the two calls F b to the same variable. Instead, they
-   must be treated separately. We thus carry a substitution that
-   freshens variables; we must apply this substitution (in
-   `coreFlattenTyFamApp`) before looking up an application in the environment.
-   Note that the range of the substitution contains only TyVars, never anything
-   else.
-
-   For the sake of efficiency, we only apply this substitution when absolutely
-   necessary. Namely:
-
-   * We do not perform the substitution at all if it is empty.
-   * We only need to worry about the arguments of a type family that are within
-     the arity of said type family, so we can get away with not applying the
-     substitution to any oversaturated type family arguments.
-   * Importantly, we do /not/ achieve this substitution by recursively
-     flattening the arguments, as this would be wrong. Consider `F (G a)`,
-     where F and G are type families. We might decide that `F (G a)` flattens
-     to `beta`. Later, the substitution is non-empty (but does not map `a`) and
-     so we flatten `G a` to `gamma` and try to flatten `F gamma`. Of course,
-     `F gamma` is unknown, and so we flatten it to `delta`, but it really
-     should have been `beta`! Argh!
-
-     Moral of the story: instead of flattening the arguments, just substitute
-     them directly.
-
-2. There are two different reasons we might add a variable
-   to the in-scope set as we work:
-
-     A. We have just invented a new flattening variable.
-     B. We have entered a `forall`.
-
-   Annoying here is that in-scope variable source (A) must be
-   threaded through the calls. For example, consider (F b -> forall c. F c).
-   Suppose that, when flattening F b, we invent a fresh variable c.
-   Now, when we encounter (forall c. F c), we need to know c is already in
-   scope so that we locally rename c to c'. However, if we don't thread through
-   the in-scope set from one argument of (->) to the other, we won't know this
-   and might get very confused.
-
-   In contrast, source (B) increases only as we go deeper, as in-scope sets
-   normally do. However, even here we must be careful. The TypeMap TyVar that
-   contains mappings from type family applications to freshened variables will
-   be threaded through both sides of (forall b. F b) -> (forall b. F b). We
-   thus must make sure that the two `b`s don't get renamed to the same b1. (If
-   they did, then looking up `F b1` would yield the same flatten var for
-   each.) So, even though `forall`-bound variables should really be in the
-   in-scope set only when they are in scope, we retain these variables even
-   outside of their scope. This ensures that, if we encounter a fresh
-   `forall`-bound b, we will rename it to b2, not b1. Note that keeping a
-   larger in-scope set than strictly necessary is always OK, as in-scope sets
-   are only ever used to avoid collisions.
-
-   Sadly, the freshening substitution described in (1) really mustn't bind
-   variables outside of their scope: note that its domain is the *unrenamed*
-   variables. This means that the substitution gets "pushed down" (like a
-   reader monad) while the in-scope set gets threaded (like a state monad).
-   Because a TCvSubst contains its own in-scope set, we don't carry a TCvSubst;
-   instead, we just carry a TvSubstEnv down, tying it to the InScopeSet
-   traveling separately as necessary.
-
-3. Consider `F ty_1 ... ty_n`, where F is a type family with arity k:
-
-     type family F ty_1 ... ty_k :: res_k
-
-   It's tempting to just flatten `F ty_1 ... ty_n` to `alpha`, where alpha is a
-   flattening skolem. But we must instead flatten it to
-   `alpha ty_(k+1) ... ty_n`—that is, by only flattening up to the arity of the
-   type family.
-
-   Why is this better? Consider the following concrete example from #16995:
-
-     type family Param :: Type -> Type
-
-     type family LookupParam (a :: Type) :: Type where
-       LookupParam (f Char) = Bool
-       LookupParam x        = Int
-
-     foo :: LookupParam (Param ())
-     foo = 42
-
-   In order for `foo` to typecheck, `LookupParam (Param ())` must reduce to
-   `Int`. But if we flatten `Param ()` to `alpha`, then GHC can't be sure if
-   `alpha` is apart from `f Char`, so it won't fall through to the second
-   equation. But since the `Param` type family has arity 0, we can instead
-   flatten `Param ()` to `alpha ()`, about which GHC knows with confidence is
-   apart from `f Char`, permitting the second equation to be reached.
-
-   Not only does this allow more programs to be accepted, it's also important
-   for correctness. Not doing this was the root cause of the Core Lint error
-   in #16995.
-
-flattenTys is defined here because of module dependencies.
--}
-
-data FlattenEnv
-  = FlattenEnv { fe_type_map :: TypeMap TyVar
-                 -- domain: exactly-saturated type family applications
-                 -- range: fresh variables
-               , fe_in_scope :: InScopeSet }
-                 -- See Note [Flattening]
-
-emptyFlattenEnv :: InScopeSet -> FlattenEnv
-emptyFlattenEnv in_scope
-  = FlattenEnv { fe_type_map = emptyTypeMap
-               , fe_in_scope = in_scope }
-
-updateInScopeSet :: FlattenEnv -> (InScopeSet -> InScopeSet) -> FlattenEnv
-updateInScopeSet env upd = env { fe_in_scope = upd (fe_in_scope env) }
-
-flattenTys :: InScopeSet -> [Type] -> [Type]
--- See Note [Flattening]
--- NB: the returned types may mention fresh type variables,
---     arising from the flattening.  We don't return the
---     mapping from those fresh vars to the ty-fam
---     applications they stand for (we could, but no need)
-flattenTys in_scope tys
-  = snd $ coreFlattenTys emptyTvSubstEnv (emptyFlattenEnv in_scope) tys
-
-coreFlattenTys :: TvSubstEnv -> FlattenEnv
-               -> [Type] -> (FlattenEnv, [Type])
-coreFlattenTys subst = mapAccumL (coreFlattenTy subst)
-
-coreFlattenTy :: TvSubstEnv -> FlattenEnv
-              -> Type -> (FlattenEnv, Type)
-coreFlattenTy subst = go
-  where
-    go env ty | Just ty' <- coreView ty = go env ty'
-
-    go env (TyVarTy tv)
-      | Just ty <- lookupVarEnv subst tv = (env, ty)
-      | otherwise                        = let (env', ki) = go env (tyVarKind tv) in
-                                           (env', mkTyVarTy $ setTyVarKind tv ki)
-    go env (AppTy ty1 ty2) = let (env1, ty1') = go env  ty1
-                                 (env2, ty2') = go env1 ty2 in
-                             (env2, AppTy ty1' ty2')
-    go env (TyConApp tc tys)
-         -- NB: Don't just check if isFamilyTyCon: this catches *data* families,
-         -- which are generative and thus can be preserved during flattening
-      | not (isGenerativeTyCon tc Nominal)
-      = coreFlattenTyFamApp subst env tc tys
-
-      | otherwise
-      = let (env', tys') = coreFlattenTys subst env tys in
-        (env', mkTyConApp tc tys')
-
-    go env ty@(FunTy { ft_mult = mult, ft_arg = ty1, ft_res = ty2 })
-      = let (env1, ty1') = go env  ty1
-            (env2, ty2') = go env1 ty2
-            (env3, mult') = go env2 mult in
-        (env3, ty { ft_mult = mult', ft_arg = ty1', ft_res = ty2' })
-
-    go env (ForAllTy (Bndr tv vis) ty)
-      = let (env1, subst', tv') = coreFlattenVarBndr subst env tv
-            (env2, ty') = coreFlattenTy subst' env1 ty in
-        (env2, ForAllTy (Bndr tv' vis) ty')
-
-    go env ty@(LitTy {}) = (env, ty)
-
-    go env (CastTy ty co)
-      = let (env1, ty') = go env ty
-            (env2, co') = coreFlattenCo subst env1 co in
-        (env2, CastTy ty' co')
-
-    go env (CoercionTy co)
-      = let (env', co') = coreFlattenCo subst env co in
-        (env', CoercionTy co')
-
-
--- when flattening, we don't care about the contents of coercions.
--- so, just return a fresh variable of the right (flattened) type
-coreFlattenCo :: TvSubstEnv -> FlattenEnv
-              -> Coercion -> (FlattenEnv, Coercion)
-coreFlattenCo subst env co
-  = (env2, mkCoVarCo covar)
-  where
-    (env1, kind') = coreFlattenTy subst env (coercionType co)
-    covar         = mkFlattenFreshCoVar (fe_in_scope env1) kind'
-    -- Add the covar to the FlattenEnv's in-scope set.
-    -- See Note [Flattening], wrinkle 2A.
-    env2          = updateInScopeSet env1 (flip extendInScopeSet covar)
-
-coreFlattenVarBndr :: TvSubstEnv -> FlattenEnv
-                   -> TyCoVar -> (FlattenEnv, TvSubstEnv, TyVar)
-coreFlattenVarBndr subst env tv
-  = (env2, subst', tv')
-  where
-    -- See Note [Flattening], wrinkle 2B.
-    kind          = varType tv
-    (env1, kind') = coreFlattenTy subst env kind
-    tv'           = uniqAway (fe_in_scope env1) (setVarType tv kind')
-    subst'        = extendVarEnv subst tv (mkTyVarTy tv')
-    env2          = updateInScopeSet env1 (flip extendInScopeSet tv')
-
-coreFlattenTyFamApp :: TvSubstEnv -> FlattenEnv
-                    -> TyCon         -- type family tycon
-                    -> [Type]        -- args, already flattened
-                    -> (FlattenEnv, Type)
-coreFlattenTyFamApp tv_subst env fam_tc fam_args
-  = case lookupTypeMap type_map fam_ty of
-      Just tv -> (env', mkAppTys (mkTyVarTy tv) leftover_args')
-      Nothing -> let tyvar_name = mkFlattenFreshTyName fam_tc
-                     tv         = uniqAway in_scope $
-                                  mkTyVar tyvar_name (typeKind fam_ty)
-
-                     ty'   = mkAppTys (mkTyVarTy tv) leftover_args'
-                     env'' = env' { fe_type_map = extendTypeMap type_map fam_ty tv
-                                  , fe_in_scope = extendInScopeSet in_scope tv }
-                 in (env'', ty')
-  where
-    arity = tyConArity fam_tc
-    tcv_subst = TCvSubst (fe_in_scope env) tv_subst emptyVarEnv
-    (sat_fam_args, leftover_args) = ASSERT( arity <= length fam_args )
-                                    splitAt arity fam_args
-    -- Apply the substitution before looking up an application in the
-    -- environment. See Note [Flattening], wrinkle 1.
-    -- NB: substTys short-cuts the common case when the substitution is empty.
-    sat_fam_args' = substTys tcv_subst sat_fam_args
-    (env', leftover_args') = coreFlattenTys tv_subst env leftover_args
-    -- `fam_tc` may be over-applied to `fam_args` (see Note [Flattening],
-    -- wrinkle 3), so we split it into the arguments needed to saturate it
-    -- (sat_fam_args') and the rest (leftover_args')
-    fam_ty = mkTyConApp fam_tc sat_fam_args'
-    FlattenEnv { fe_type_map = type_map
-               , fe_in_scope = in_scope } = env'
-
-mkFlattenFreshTyName :: Uniquable a => a -> Name
-mkFlattenFreshTyName unq
-  = mkSysTvName (getUnique unq) (fsLit "flt")
-
-mkFlattenFreshCoVar :: InScopeSet -> Kind -> CoVar
-mkFlattenFreshCoVar in_scope kind
-  = let uniq = unsafeGetFreshLocalUnique in_scope
-        name = mkSystemVarName uniq (fsLit "flc")
-    in mkCoVar name kind

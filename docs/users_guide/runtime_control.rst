@@ -1,7 +1,7 @@
 .. _runtime-control:
 
-Running a compiled program
-==========================
+Runtime system (RTS) options
+============================
 
 .. index::
    single: runtime control of Haskell programs
@@ -9,7 +9,7 @@ Running a compiled program
    single: RTS options
 
 To make an executable program, the GHC system compiles your code and
-then links it with a non-trivial runtime system (RTS), which handles
+then links it with a non-trivial runtime system, which handles
 storage management, thread scheduling, profiling, and so on.
 
 The RTS has a lot of options to control its behaviour. For example, you
@@ -81,8 +81,8 @@ command line to go to the program (and not the RTS), use a
 the program, while ``--`` will.
 
 As always, for RTS options that take ⟨size⟩s: If the last character of
-⟨size⟩ is a K or k, multiply by 1000; if an M or m, by 1,000,000; if a G
-or G, by 1,000,000,000. (And any wraparound in the counters is *your*
+⟨size⟩ is a K or k, multiply by 1024; if an M or m, by 1024*1024; if a G
+or G, by 1024^3. (And any wraparound in the counters is *your*
 fault!)
 
 Giving a ``+RTS -?`` RTS option will print out the RTS
@@ -183,9 +183,12 @@ Event log output
 Furthermore GHC lets you specify the way event log data (see :rts-flag:`-l
 ⟨flags⟩`) is written through a custom :c:type:`EventLogWriter`:
 
+.. The size_t declaration below is simply to ensure that the build doesn't fail with an
+   undefined reference target warning as Sphinx doesn't know about size_t.
+
 .. c:type:: size_t
 
-    :hidden:
+   :hidden:
 
 .. c:type:: EventLogWriter
 
@@ -226,7 +229,7 @@ To use an :c:type:`EventLogWriter` the RTS API provides the following functions:
 .. c:function:: bool startEventLogging(const EventLogWriter *writer)
 
    Start logging events to the given :c:type:`EventLogWriter`. Returns true on
-   success or false is another writer has already been configured.
+   success or false if another writer has already been configured.
 
 .. c:function:: void endEventLogging()
 
@@ -408,6 +411,17 @@ performance.
     Note that :rts-flag:`--nonmoving-gc` cannot be used with ``-G1``,
     :rts-flag:`profiling <-hc>` nor :rts-flag:`-c`.
 
+.. rts-flag:: -w
+
+    :default: off
+    :since: a long time ago
+    :reverse: none
+
+    Uses a mark-region garbage collection strategy for the oldest-generation heap.
+    Note that this cannot be used in conjunction with heap profiling
+    (:rts-flag:`-hT`) unless linked against the profiling runtime system with
+    :ghc-flag:`-prof`.
+
 .. rts-flag:: -xn
 
     :default: off
@@ -417,7 +431,7 @@ performance.
 
 .. rts-flag:: -A ⟨size⟩
 
-    :default: 1MB
+    :default: 4MB
 
     .. index::
        single: allocation area, size
@@ -426,14 +440,21 @@ performance.
     collector. The allocation area (actually generation 0 step 0) is
     fixed and is never resized (unless you use :rts-flag:`-H [⟨size⟩]`, below).
 
-    Increasing the allocation area size may or may not give better
-    performance (a bigger allocation area means worse cache behaviour
-    but fewer garbage collections and less promotion).
+    Optimal settings depend on the actual machine, program, and other RTS options.
+    Increasing the allocation area size means worse cache behaviour
+    but fewer garbage collections and less promotion.
+
+    In general settings >= 4MB can reduce performance in some cases, in particular for single
+    threaded operation. However in a parallel setting increasing the allocation area
+    to ``16MB``, or even ``64MB`` can increase gc throughput significantly.
 
     With only 1 generation (e.g. ``-G1``, see :rts-flag:`-G ⟨generations⟩`) the
     ``-A`` option specifies the minimum allocation area, since the actual size
     of the allocation area will be resized according to the amount of data in
     the heap (see :rts-flag:`-F ⟨factor⟩`, below).
+
+    When heap profiling using a smaller allocation area can increase accuracy as more frequent
+    major garbage collections also results in more frequent heap snapshots
 
 .. rts-flag:: -AL ⟨size⟩
 
@@ -471,10 +492,11 @@ performance.
     .. index::
        single: old generation, size
 
-    Set the minimum size of the old generation. The old generation is collected
-    whenever it grows to this size or the value of the :rts-flag:`-F ⟨factor⟩`
-    option multiplied by the size of the live data at the previous major
-    collection, whichever is larger.
+    Set the minimum size of the old generation.
+
+    The old generation is collected whenever it grows to this size or the value
+    of the :rts-flag:`-F ⟨factor⟩` option multiplied by the size of the live
+    data at the previous major collection, whichever is larger.
 
 .. rts-flag:: -n ⟨size⟩
 
@@ -482,6 +504,9 @@ performance.
 
     .. index::
        single: allocation area, chunk size
+
+    Set the allocation area chunksize. Setting ``-n0`` means the allocation
+    area is not divided into chunks.
 
     [Example: ``-n4m`` ] When set to a non-zero value, this
     option divides the allocation area (``-A`` value) into chunks of the
@@ -556,6 +581,25 @@ performance.
     The :rts-flag:`-F ⟨factor⟩` setting will be automatically reduced by the garbage
     collector when the maximum heap size (the :rts-flag:`-M ⟨size⟩` setting) is approaching.
 
+.. rts-flag:: -Fd ⟨factor⟩
+
+    :default: 4
+
+    .. index::
+       single: heap size, factor
+
+    The inverse rate at which unused memory is returned to the OS when it is no longer
+    needed. After a large amount of allocation the RTS will start by retaining
+    a lot of allocated blocks in case it will need them again shortly but then
+    it will gradually release them based on the :rts-flag:`-Fd ⟨factor⟩`. On
+    each subsequent major collection which is not caused by a heap overflow a little
+    more memory will attempt to be returned until the amount retained is similar to
+    the amount of live bytes.
+
+    Increasing this factor will make the rate memory is returned slower, decreasing
+    it will make memory be returned more eagerly. Setting it to 0 will disable the
+    memory return (which will emulate the behaviour in releases prior to 9.2).
+
 .. rts-flag:: -G ⟨generations⟩
 
     :default: 2
@@ -621,6 +665,8 @@ performance.
     .. index::
        single: GC threads, setting the number of
 
+    Set the number of threads to use for the parallel GC.
+
     By default, all of the capabilities participate in parallel
     garbage collection.  If we want to use a very large ``-N`` value,
     however, this can reduce the performance of the GC.  For this
@@ -666,12 +712,13 @@ performance.
     .. index::
        single: idle GC
 
-    In the threaded and SMP versions of the RTS (see
-    :ghc-flag:`-threaded`, :ref:`options-linker`), a major GC is automatically
-    performed if the runtime has been idle (no Haskell computation has
-    been running) for a period of time. The amount of idle time which
-    must pass before a GC is performed is set by the ``-I ⟨seconds⟩``
-    option. Specifying ``-I0`` disables the idle GC.
+    Set the amount of idle time which must pass before a idle GC is
+    performed. Setting ``-I0`` disables the idle GC.
+
+    In the threaded and SMP versions of the RTS (see :ghc-flag:`-threaded`,
+    :ref:`options-linker`), a major GC is automatically performed if the
+    runtime has been idle (no Haskell computation has been running) for a
+    period of time.
 
     For an interactive application, it is probably a good idea to use
     the idle GC, because this will allow finalizers to run and
@@ -683,6 +730,11 @@ performance.
     and too small an interval could adversely affect interactive
     responsiveness.
 
+    The idle period timer only resets after some activity
+    by a Haskell thread. If your program is doing literally nothing then
+    after the first idle collection is triggered then no more future collections
+    will be scheduled until more work is performed.
+
     This is an experimental feature, please let us know if it causes
     problems and/or could benefit from further tuning.
 
@@ -692,6 +744,8 @@ performance.
 
     .. index::
        single: idle GC
+
+    Set the minimum wait time between runs of the idle GC.
 
     By default, if idle GC is enabled in the threaded runtime, a major
     GC will be performed every time the process goes idle for a
@@ -911,6 +965,8 @@ performance.
     The GC sync time, along with other GC stats, are available by
     calling the ``getRTSStats()`` function from C, or
     ``GHC.Stats.getRTSStats`` from Haskell.
+
+
 
 .. _rts-options-statistics:
 
@@ -1155,7 +1211,7 @@ When the program is linked with the :ghc-flag:`-eventlog` option
 
 -  In binary format to a file for later analysis by a variety of tools.
    One such tool is
-   `ThreadScope <http://www.haskell.org/haskellwiki/ThreadScope>`__,
+   `ThreadScope <https://www.haskell.org/haskellwiki/ThreadScope>`__,
    which interprets the event log to produce a visual parallel execution
    profile of the program.
 
@@ -1191,6 +1247,10 @@ When the program is linked with the :ghc-flag:`-eventlog` option
 
     - ``f`` — parallel sparks (fully accurate). Disabled by default.
 
+    - ``T`` — :ghc-flag:`ticky-ticky profiler <-ticky>` events
+      (see :ref:`ticky-event-format` for details). Disabled by
+      default.
+
     - ``u`` — user events. These are events emitted from Haskell code using
       functions such as ``Debug.Trace.traceEvent``. Enabled by default.
 
@@ -1214,23 +1274,32 @@ When the program is linked with the :ghc-flag:`-eventlog` option
 
     The format of the log file is described in this users guide in
     :ref:`eventlog-encodings` It can be parsed in Haskell using the
-    `ghc-events <http://hackage.haskell.org/package/ghc-events>`__
+    `ghc-events <https://hackage.haskell.org/package/ghc-events>`__
     library. To dump the contents of a ``.eventlog`` file as text, use
     the tool ``ghc-events show`` that comes with the
-    `ghc-events <http://hackage.haskell.org/package/ghc-events>`__
+    `ghc-events <https://hackage.haskell.org/package/ghc-events>`__
     package.
 
     Each event is associated with a timestamp which is the number of
     nanoseconds since the start of executation of the running program.
     This is the elapsed time, not the CPU time.
 
-.. rts-flag:: -ol ⟨filename⟩
+.. rts-flag:: -ol⟨filename⟩
 
-    :default: :file:`<program>.eventlog`
+    :default: :file:`⟨program⟩.eventlog`
     :since: 8.8
 
     Sets the destination for the eventlog produced with the
     :rts-flag:`-l ⟨flags⟩` flag.
+
+.. rts-flag:: --eventlog-flush-interval=⟨seconds⟩
+
+    :default: disabled
+    :since: 9.2
+
+    When enabled, the eventlog will be flushed periodically every
+    ⟨seconds⟩. This can be useful in live-monitoring situations where the
+    eventlog is consumed in real-time by another process.
 
 .. rts-flag:: -v [⟨flags⟩]
 
@@ -1259,7 +1328,7 @@ recommended for everyday use!
 
 .. rts-flag:: -B
 
-    Sound the bell at the start of each (major) garbage collection.
+    Sound the bell at the start of each garbage collection.
 
     Oddly enough, people really do use this option! Our pal in Durham
     (England), Paul Callaghan, writes: “Some people here use it for a
@@ -1292,6 +1361,7 @@ recommended for everyday use!
 .. rts-flag::  -Dp  DEBUG: prof
 .. rts-flag::  -Da  DEBUG: apply
 .. rts-flag::  -Dl  DEBUG: linker
+.. rts-flag::  -DL  DEBUG: linker (verbose); implies :rts-flag:`-Dl`
 .. rts-flag::  -Dm  DEBUG: stm
 .. rts-flag::  -Dz  DEBUG: stack squeezing
 .. rts-flag::  -Dc  DEBUG: program coverage

@@ -231,7 +231,16 @@ lessSafeIndex :: Ix i => (i, i) -> Int -> i -> Int
 lessSafeIndex (l,u) _ i = index (l,u) i
 
 -- Don't inline this long error message everywhere!!
-badSafeIndex :: Int -> Int -> Int
+-- | Used to throw exceptions in array bounds-checking functions.
+--
+--   ⚠ This function throws 'SomeException' in all cases.
+--
+-- ==== __Examples__
+-- >>> badSafeIndex 2 5
+-- *** Exception: Error in array index; 2 not in range [0..5)
+badSafeIndex :: Int -- ^ Index searched for.
+             -> Int -- ^ Max bound of the array.
+             -> Int -- ^ This isn't an Int. It's an exception.
 badSafeIndex i' n = errorWithoutStackTrace ("Error in array index; " ++ show i' ++
                         " not in range [0.." ++ show n ++ ")")
 
@@ -497,7 +506,8 @@ eqArray arr1@(Array l1 u1 n1 _) arr2@(Array l2 u2 n2 _) =
     l1 == l2 && u1 == u2 &&
     and [unsafeAt arr1 i == unsafeAt arr2 i | i <- [0 .. n1 - 1]]
 
-{-# INLINE [1] cmpArray #-}
+{-# INLINE [2] cmpArray #-}
+-- See Note [Allow time for type-specialisation rules to fire] in GHC.Real
 cmpArray :: (Ix i, Ord e) => Array i e -> Array i e -> Ordering
 cmpArray arr1 arr2 = compare (assocs arr1) (assocs arr2)
 

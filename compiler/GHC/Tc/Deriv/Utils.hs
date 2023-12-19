@@ -4,20 +4,22 @@
 
 -}
 
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE TypeFamilies #-}
 
 -- | Error-checking and other utilities for @deriving@ clauses or declarations.
 module GHC.Tc.Deriv.Utils (
         DerivM, DerivEnv(..),
-        DerivSpec(..), pprDerivSpec, DerivInstTys(..),
+        DerivSpec(..), pprDerivSpec, setDerivSpecTheta, zonkDerivSpec,
         DerivSpecMechanism(..), derivSpecMechanismToStrategy, isDerivSpecStock,
-        isDerivSpecNewtype, isDerivSpecAnyClass, isDerivSpecVia,
-        DerivContext(..), OriginativeDerivStatus(..),
-        isStandaloneDeriv, isStandaloneWildcardDeriv, mkDerivOrigin,
-        PredOrigin(..), ThetaOrigin(..), mkPredOrigin,
-        mkThetaOrigin, mkThetaOriginFromPreds, substPredOrigin,
+        isDerivSpecNewtype, isDerivSpecAnyClass,
+        isDerivSpecVia, zonkDerivSpecMechanism,
+        DerivContext(..), OriginativeDerivStatus(..), StockGenFns(..),
+        isStandaloneDeriv, isStandaloneWildcardDeriv,
+        askDerivUserTypeCtxt, mkDerivOrigin,
+        PredSpec(..), ThetaSpec,
+        mkDirectThetaSpec, substPredSpec, captureThetaSpecConstraints,
         checkOriginativeSideConditions, hasStockDeriving,
-        canDeriveAnyClass,
         std_class_via_coercible, non_coercible_class,
         newDerivClsInst, extendLocalInstEnv
     ) where
@@ -28,33 +30,39 @@ import GHC.Data.Bag
 import GHC.Types.Basic
 import GHC.Core.Class
 import GHC.Core.DataCon
+import GHC.Core.FamInstEnv
 import GHC.Driver.Session
 import GHC.Utils.Error
-import GHC.Driver.Types (lookupFixity, mi_fix)
+import GHC.Types.Fixity.Env (lookupFixity)
 import GHC.Hs
 import GHC.Tc.Utils.Instantiate
 import GHC.Core.InstEnv
 import GHC.Iface.Load   (loadInterfaceForName)
 import GHC.Unit.Module (getModule)
+import GHC.Unit.Module.ModIface (mi_fix)
 import GHC.Types.Name
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
 import GHC.Builtin.Names
 import GHC.Types.SrcLoc
 import GHC.Tc.Deriv.Generate
 import GHC.Tc.Deriv.Functor
 import GHC.Tc.Deriv.Generics
+import GHC.Tc.Errors.Types
+import GHC.Tc.Types.Constraint (WantedConstraints, mkNonCanonical)
 import GHC.Tc.Types.Origin
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Utils.TcType
+import GHC.Tc.Utils.Unify (tcSubTypeSigma)
+import GHC.Tc.Utils.Zonk
 import GHC.Builtin.Names.TH (liftClassKey)
 import GHC.Core.TyCon
-import GHC.Core.Multiplicity
-import GHC.Core.TyCo.Ppr (pprSourceTyCon)
 import GHC.Core.Type
 import GHC.Utils.Misc
 import GHC.Types.Var.Set
 
 import Control.Monad.Trans.Reader
+import Data.Foldable (traverse_)
 import Data.Maybe
 import qualified GHC.LanguageExtensions as LangExt
 import GHC.Data.List.SetOps (assocMaybe)
@@ -82,6 +90,16 @@ isStandaloneWildcardDeriv = asks (go . denv_ctxt)
     go (InferContext wildcard) = isJust wildcard
     go (SupplyContext {})      = False
 
+-- | Return 'InstDeclCtxt' if processing with a standalone @deriving@
+-- declaration or 'DerivClauseCtxt' if processing a @deriving@ clause.
+askDerivUserTypeCtxt :: DerivM UserTypeCtxt
+askDerivUserTypeCtxt = asks (go . denv_ctxt)
+  where
+    go :: DerivContext -> UserTypeCtxt
+    go (SupplyContext {})     = InstDeclCtxt True
+    go (InferContext Just{})  = InstDeclCtxt True
+    go (InferContext Nothing) = DerivClauseCtxt
+
 -- | @'mkDerivOrigin' wc@ returns 'StandAloneDerivOrigin' if @wc@ is 'True',
 -- and 'DerivClauseOrigin' if @wc@ is 'False'. Useful for error-reporting.
 mkDerivOrigin :: Bool -> CtOrigin
@@ -96,7 +114,13 @@ data DerivEnv = DerivEnv
   { denv_overlap_mode :: Maybe OverlapMode
     -- ^ Is this an overlapping instance?
   , denv_tvs          :: [TyVar]
-    -- ^ Universally quantified type variables in the instance
+    -- ^ Universally quantified type variables in the instance. If the
+    --   @denv_ctxt@ is 'InferContext', these will be 'TcTyVar' skolems.
+    --   If the @denv_ctxt@ is 'SupplyContext', these will be ordinary 'TyVar's.
+    --   See @Note [Overlap and deriving]@ in "GHC.Tc.Deriv.Infer".
+    --
+    --   All type variables that appear in the 'denv_inst_tys', 'denv_ctxt',
+    --   'denv_skol_info', and 'denv_strat' should come from 'denv_tvs'.
   , denv_cls          :: Class
     -- ^ Class for which we need to derive an instance
   , denv_inst_tys     :: [Type]
@@ -107,6 +131,9 @@ data DerivEnv = DerivEnv
     --   'InferContext' for @deriving@ clauses, or for standalone deriving that
     --   uses a wildcard constraint.
     --   See @Note [Inferring the instance context]@.
+  , denv_skol_info    :: SkolemInfo
+    -- ^ The 'SkolemInfo' used to skolemise the @denv_tvs@ in the case where
+    --   the 'denv_ctxt' is 'InferContext'.
   , denv_strat        :: Maybe (DerivStrategy GhcTc)
     -- ^ 'Just' if user requests a particular deriving strategy.
     --   Otherwise, 'Nothing'.
@@ -118,6 +145,7 @@ instance Outputable DerivEnv where
                 , denv_cls          = cls
                 , denv_inst_tys     = inst_tys
                 , denv_ctxt         = ctxt
+                , denv_skol_info    = skol_info
                 , denv_strat        = mb_strat })
     = hang (text "DerivEnv")
          2 (vcat [ text "denv_overlap_mode" <+> ppr overlap_mode
@@ -125,6 +153,7 @@ instance Outputable DerivEnv where
                  , text "denv_cls"          <+> ppr cls
                  , text "denv_inst_tys"     <+> ppr inst_tys
                  , text "denv_ctxt"         <+> ppr ctxt
+                 , text "denv_skol_info"    <+> ppr skol_info
                  , text "denv_strat"        <+> ppr mb_strat ])
 
 data DerivSpec theta = DS { ds_loc                 :: SrcSpan
@@ -133,6 +162,8 @@ data DerivSpec theta = DS { ds_loc                 :: SrcSpan
                           , ds_theta               :: theta
                           , ds_cls                 :: Class
                           , ds_tys                 :: [Type]
+                          , ds_skol_info           :: SkolemInfo
+                          , ds_user_ctxt           :: UserTypeCtxt
                           , ds_overlap             :: Maybe OverlapMode
                           , ds_standalone_wildcard :: Maybe SrcSpan
                               -- See Note [Inferring the instance context]
@@ -141,10 +172,19 @@ data DerivSpec theta = DS { ds_loc                 :: SrcSpan
         -- This spec implies a dfun declaration of the form
         --       df :: forall tvs. theta => C tys
         -- The Name is the name for the DFun we'll build
-        -- The tyvars bind all the variables in the theta
+        -- The tyvars bind all the variables in the rest of the DerivSpec.
+        -- If we are inferring an instance context, the tyvars will be TcTyVar
+        -- skolems. After the instance context inference is over, the tyvars
+        -- will be zonked to TyVars. See
+        -- Note [Overlap and deriving] in GHC.Tc.Deriv.Infer.
 
         -- the theta is either the given and final theta, in standalone deriving,
         -- or the not-yet-simplified list of constraints together with their origin
+
+        -- The ds_skol_info is the SkolemInfo that was used to skolemise the
+        -- TcTyVars (if we are inferring an instance context). The ds_user_ctxt
+        -- is the UserTypeCtxt that allows error messages to know if we are in
+        -- a deriving clause or a standalone deriving declaration.
 
         -- ds_mechanism specifies the means by which GHC derives the instance.
         -- See Note [Deriving strategies] in GHC.Tc.Deriv
@@ -163,7 +203,7 @@ Example:
 
 pprDerivSpec :: Outputable theta => DerivSpec theta -> SDoc
 pprDerivSpec (DS { ds_loc = l, ds_name = n, ds_tvs = tvs, ds_cls = c,
-                   ds_tys = tys, ds_theta = rhs,
+                   ds_tys = tys, ds_theta = rhs, ds_skol_info = skol_info,
                    ds_standalone_wildcard = wildcard, ds_mechanism = mech })
   = hang (text "DerivSpec")
        2 (vcat [ text "ds_loc                  =" <+> ppr l
@@ -172,40 +212,34 @@ pprDerivSpec (DS { ds_loc = l, ds_name = n, ds_tvs = tvs, ds_cls = c,
                , text "ds_cls                  =" <+> ppr c
                , text "ds_tys                  =" <+> ppr tys
                , text "ds_theta                =" <+> ppr rhs
+               , text "ds_skol_info            =" <+> ppr skol_info
                , text "ds_standalone_wildcard  =" <+> ppr wildcard
                , text "ds_mechanism            =" <+> ppr mech ])
 
 instance Outputable theta => Outputable (DerivSpec theta) where
   ppr = pprDerivSpec
 
--- | Information about the arguments to the class in a stock- or
--- newtype-derived instance.
--- See @Note [DerivEnv and DerivSpecMechanism]@.
-data DerivInstTys = DerivInstTys
-  { dit_cls_tys     :: [Type]
-    -- ^ Other arguments to the class except the last
-  , dit_tc          :: TyCon
-    -- ^ Type constructor for which the instance is requested
-    --   (last arguments to the type class)
-  , dit_tc_args     :: [Type]
-    -- ^ Arguments to the type constructor
-  , dit_rep_tc      :: TyCon
-    -- ^ The representation tycon for 'dit_tc'
-    --   (for data family instances). Otherwise the same as 'dit_tc'.
-  , dit_rep_tc_args :: [Type]
-    -- ^ The representation types for 'dit_tc_args'
-    --   (for data family instances). Otherwise the same as 'dit_tc_args'.
-  }
+-- | Set the 'ds_theta' in a 'DerivSpec'.
+setDerivSpecTheta :: theta' -> DerivSpec theta -> DerivSpec theta'
+setDerivSpecTheta theta ds = ds{ds_theta = theta}
 
-instance Outputable DerivInstTys where
-  ppr (DerivInstTys { dit_cls_tys = cls_tys, dit_tc = tc, dit_tc_args = tc_args
-                    , dit_rep_tc = rep_tc, dit_rep_tc_args = rep_tc_args })
-    = hang (text "DITTyConHead")
-         2 (vcat [ text "dit_cls_tys"     <+> ppr cls_tys
-                 , text "dit_tc"          <+> ppr tc
-                 , text "dit_tc_args"     <+> ppr tc_args
-                 , text "dit_rep_tc"      <+> ppr rep_tc
-                 , text "dit_rep_tc_args" <+> ppr rep_tc_args ])
+-- | Zonk the 'TcTyVar's in a 'DerivSpec' to 'TyVar's.
+-- See @Note [What is zonking?]@ in "GHC.Tc.Utils.TcMType".
+--
+-- This is only used in the final zonking step when inferring
+-- the context for a derived instance.
+-- See @Note [Overlap and deriving]@ in "GHC.Tc.Deriv.Infer".
+zonkDerivSpec :: DerivSpec ThetaType -> TcM (DerivSpec ThetaType)
+zonkDerivSpec ds@(DS { ds_tvs = tvs, ds_theta = theta
+                     , ds_tys = tys, ds_mechanism = mechanism
+                     }) = do
+  (ze, tvs') <- zonkTyBndrs tvs
+  theta'     <- zonkTcTypesToTypesX ze theta
+  tys'       <- zonkTcTypesToTypesX ze tys
+  mechanism' <- zonkDerivSpecMechanism ze mechanism
+  pure ds{ ds_tvs = tvs', ds_theta = theta'
+         , ds_tys = tys', ds_mechanism = mechanism'
+         }
 
 -- | What action to take in order to derive a class instance.
 -- See @Note [DerivEnv and DerivSpecMechanism]@, as well as
@@ -217,25 +251,9 @@ data DerivSpecMechanism
       -- ^ Information about the arguments to the class in the derived
       -- instance, including what type constructor the last argument is
       -- headed by. See @Note [DerivEnv and DerivSpecMechanism]@.
-    , dsm_stock_gen_fn ::
-        SrcSpan -> TyCon
-                -> [Type]
-                -> TcM (LHsBinds GhcPs, BagDerivStuff, [Name])
-      -- ^ This function returns three things:
-      --
-      -- 1. @LHsBinds GhcPs@: The derived instance's function bindings
-      --    (e.g., @compare (T x) (T y) = compare x y@)
-      --
-      -- 2. @BagDerivStuff@: Auxiliary bindings needed to support the derived
-      --    instance. As examples, derived 'Generic' instances require
-      --    associated type family instances, and derived 'Eq' and 'Ord'
-      --    instances require top-level @con2tag@ functions.
-      --    See @Note [Auxiliary binders]@ in "GHC.Tc.Deriv.Generate".
-      --
-      -- 3. @[Name]@: A list of Names for which @-Wunused-binds@ should be
-      --    suppressed. This is used to suppress unused warnings for record
-      --    selectors when deriving 'Read', 'Show', or 'Generic'.
-      --    See @Note [Deriving and unused record selectors]@.
+    , dsm_stock_gen_fns :: StockGenFns
+      -- ^ How to generate the instance bindings and associated type family
+      -- instances.
     }
 
     -- | @GeneralizedNewtypeDeriving@
@@ -263,9 +281,9 @@ data DerivSpecMechanism
 
 -- | Convert a 'DerivSpecMechanism' to its corresponding 'DerivStrategy'.
 derivSpecMechanismToStrategy :: DerivSpecMechanism -> DerivStrategy GhcTc
-derivSpecMechanismToStrategy DerivSpecStock{}               = StockStrategy
-derivSpecMechanismToStrategy DerivSpecNewtype{}             = NewtypeStrategy
-derivSpecMechanismToStrategy DerivSpecAnyClass              = AnyclassStrategy
+derivSpecMechanismToStrategy DerivSpecStock{}      = StockStrategy noExtField
+derivSpecMechanismToStrategy DerivSpecNewtype{}    = NewtypeStrategy noExtField
+derivSpecMechanismToStrategy DerivSpecAnyClass     = AnyclassStrategy noExtField
 derivSpecMechanismToStrategy (DerivSpecVia{dsm_via_ty = t}) = ViaStrategy t
 
 isDerivSpecStock, isDerivSpecNewtype, isDerivSpecAnyClass, isDerivSpecVia
@@ -281,6 +299,44 @@ isDerivSpecAnyClass _                 = False
 
 isDerivSpecVia (DerivSpecVia{}) = True
 isDerivSpecVia _                = False
+
+-- | Zonk the 'TcTyVar's in a 'DerivSpecMechanism' to 'TyVar's.
+-- See @Note [What is zonking?]@ in "GHC.Tc.Utils.TcMType".
+--
+-- This is only used in the final zonking step when inferring
+-- the context for a derived instance.
+-- See @Note [Overlap and deriving]@ in "GHC.Tc.Deriv.Infer".
+zonkDerivSpecMechanism :: ZonkEnv -> DerivSpecMechanism -> TcM DerivSpecMechanism
+zonkDerivSpecMechanism ze mechanism =
+  case mechanism of
+    DerivSpecStock { dsm_stock_dit     = dit
+                   , dsm_stock_gen_fns = gen_fns
+                   } -> do
+      dit' <- zonkDerivInstTys ze dit
+      pure $ DerivSpecStock { dsm_stock_dit     = dit'
+                            , dsm_stock_gen_fns = gen_fns
+                            }
+    DerivSpecNewtype { dsm_newtype_dit    = dit
+                     , dsm_newtype_rep_ty = rep_ty
+                     } -> do
+      dit'    <- zonkDerivInstTys ze dit
+      rep_ty' <- zonkTcTypeToTypeX ze rep_ty
+      pure $ DerivSpecNewtype { dsm_newtype_dit    = dit'
+                              , dsm_newtype_rep_ty = rep_ty'
+                              }
+    DerivSpecAnyClass ->
+      pure DerivSpecAnyClass
+    DerivSpecVia { dsm_via_cls_tys = cls_tys
+                 , dsm_via_inst_ty = inst_ty
+                 , dsm_via_ty      = via_ty
+                 } -> do
+      cls_tys' <- zonkTcTypesToTypesX ze cls_tys
+      inst_ty' <- zonkTcTypeToTypeX ze inst_ty
+      via_ty'  <- zonkTcTypeToTypeX ze via_ty
+      pure $ DerivSpecVia { dsm_via_cls_tys = cls_tys'
+                          , dsm_via_inst_ty = inst_ty'
+                          , dsm_via_ty      = via_ty'
+                          }
 
 instance Outputable DerivSpecMechanism where
   ppr (DerivSpecStock{dsm_stock_dit = dit})
@@ -328,12 +384,15 @@ Each deriving strategy imposes restrictions on arg_1 through arg_n as follows:
 
   This extra structure is witnessed by the DerivInstTys data type, which stores
   arg_1 through arg_(n-1) (dit_cls_tys), the algebraic type constructor
-  (dit_tc), and its arguments (dit_tc_args). If dit_tc is an ordinary data type
-  constructor, then dit_rep_tc/dit_rep_tc_args are the same as
-  dit_tc/dit_tc_args. If dit_tc is a data family type constructor, then
-  dit_rep_tc is the representation type constructor for the data family
-  instance, and dit_rep_tc_args are the arguments to the representation type
-  constructor in the corresponding instance.
+  (dit_tc), and its arguments (dit_tc_args). A DerivInstTys value can be seen
+  as a more structured representation of the denv_inst_tys field of DerivEnv.
+
+  If dit_tc is an ordinary data type constructor, then
+  dit_rep_tc/dit_rep_tc_args are the same as dit_tc/dit_tc_args. If dit_tc is a
+  data family type constructor, then dit_rep_tc is the representation type
+  constructor for the data family instance, and dit_rep_tc_args are the
+  arguments to the representation type constructor in the corresponding
+  instance.
 
 * newtype (DerivSpecNewtype):
 
@@ -423,45 +482,102 @@ instance Outputable DerivContext where
 --
 -- See @Note [Deriving strategies]@ in "GHC.Tc.Deriv".
 data OriginativeDerivStatus
-  = CanDeriveStock            -- Stock class, can derive
-      (SrcSpan -> TyCon -> [Type]
-               -> TcM (LHsBinds GhcPs, BagDerivStuff, [Name]))
-  | StockClassError SDoc      -- Stock class, but can't do it
+  = CanDeriveStock StockGenFns -- Stock class, can derive
+  | StockClassError !DeriveInstanceErrReason -- Stock class, but can't do it
   | CanDeriveAnyClass         -- See Note [Deriving any class]
-  | NonDerivableClass SDoc    -- Cannot derive with either stock or anyclass
+  | NonDerivableClass -- Cannot derive with either stock or anyclass
+
+-- | Describes how to generate instance bindings ('stock_gen_binds') and
+-- associated type family instances ('stock_gen_fam_insts') for a particular
+-- stock-derived instance.
+data StockGenFns = StockGenFns
+  { stock_gen_binds ::
+         SrcSpan -> DerivInstTys
+      -> TcM (LHsBinds GhcPs, [LSig GhcPs], Bag AuxBindSpec, [Name])
+    -- ^ Describes how to generate instance bindings for a stock-derived
+    -- instance.
+    --
+    -- This function takes two arguments:
+    --
+    -- 1. 'SrcSpan': the source location where the instance is being derived.
+    --    This will eventually be instantiated with the 'ds_loc' field of a
+    --    'DerivSpec'.
+    --
+    -- 2. 'DerivInstTys': information about the argument types to which a
+    --    class is applied in a derived instance. This will eventually be
+    --    instantiated with the 'dsm_stock_dit' field of a
+    --    'DerivSpecMechanism'.
+    --
+    -- This function returns four things:
+    --
+    -- 1. @'LHsBinds' 'GhcPs'@: The derived instance's function bindings
+    --    (e.g., @compare (T x) (T y) = compare x y@)
+    --
+    -- 2. @['LSig' 'GhcPs']@: A list of instance specific signatures/pragmas.
+    --    Most likely @INLINE@ pragmas for class methods.
+    --
+    -- 3. @'Bag' 'AuxBindSpec'@: Auxiliary bindings needed to support the
+    --    derived instance. As examples, derived 'Eq' and 'Ord' instances
+    --    sometimes require top-level @con2tag@ functions.
+    --    See @Note [Auxiliary binders]@ in "GHC.Tc.Deriv.Generate".
+    --
+    -- 4. @['Name']@: A list of Names for which @-Wunused-binds@ should be
+    --    suppressed. This is used to suppress unused warnings for record
+    --    selectors when deriving 'Read', 'Show', or 'Generic'.
+    --    See @Note [Deriving and unused record selectors]@.
+  , stock_gen_fam_insts ::
+         SrcSpan -> DerivInstTys
+      -> TcM [FamInst]
+    -- ^ Describes how to generate associated type family instances for a
+    -- stock-derived instance. This function takes the same arguments as the
+    -- 'stock_gen_binds' function but returns a list of 'FamInst's instead.
+    -- Generating type family instances is done separately from
+    -- 'stock_gen_binds' since the type family instances must be generated
+    -- before the instance bindings can be typechecked. See
+    -- @Note [Staging of tcDeriving]@ in "GHC.Tc.Deriv".
+  }
 
 -- A stock class is one either defined in the Haskell report or for which GHC
 -- otherwise knows how to generate code for (possibly requiring the use of a
 -- language extension), such as Eq, Ord, Ix, Data, Generic, etc.)
 
--- | A 'PredType' annotated with the origin of the constraint 'CtOrigin',
--- and whether or the constraint deals in types or kinds.
-data PredOrigin = PredOrigin PredType CtOrigin TypeOrKind
+-- | A 'PredSpec' specifies a constraint to emitted when inferring the
+-- instance context for a derived instance in 'GHC.Tc.Deriv.simplifyInfer'.
+data PredSpec
+  = -- | An ordinary 'PredSpec' that directly stores a 'PredType', which
+    -- will be emitted as a wanted constraint in the constraint solving
+    -- machinery. This is the simple case, as there are no skolems,
+    -- metavariables, or given constraints involved.
+    SimplePredSpec
+      { sps_pred :: TcPredType
+        -- ^ The constraint to emit as a wanted
+      , sps_origin :: CtOrigin
+        -- ^ The origin of the constraint
+      , sps_type_or_kind :: TypeOrKind
+        -- ^ Whether the constraint is a type or kind
+      }
+  | -- | A special 'PredSpec' that is only used by @DeriveAnyClass@. This
+    -- will check if @stps_ty_actual@ is a subtype of (i.e., more polymorphic
+    -- than) @stps_ty_expected@ in the constraint solving machinery, emitting an
+    -- implication constraint as a side effect. For more details on how this
+    -- works, see @Note [Gathering and simplifying constraints for DeriveAnyClass]@
+    -- in "GHC.Tc.Deriv.Infer".
+    SubTypePredSpec
+      { stps_ty_actual :: TcSigmaType
+        -- ^ The actual type. In the context of @DeriveAnyClass@, this is the
+        -- default method type signature.
+      , stps_ty_expected :: TcSigmaType
+        -- ^ The expected type. In the context of @DeriveAnyClass@, this is the
+        -- original method type signature.
+      , stps_origin :: CtOrigin
+        -- ^ The origin of the constraint
+      }
 
--- | A list of wanted 'PredOrigin' constraints ('to_wanted_origins') to
--- simplify when inferring a derived instance's context. These are used in all
--- deriving strategies, but in the particular case of @DeriveAnyClass@, we
--- need extra information. In particular, we need:
---
--- * 'to_anyclass_skols', the list of type variables bound by a class method's
---   regular type signature, which should be rigid.
---
--- * 'to_anyclass_metas', the list of type variables bound by a class method's
---   default type signature. These can be unified as necessary.
---
--- * 'to_anyclass_givens', the list of constraints from a class method's
---   regular type signature, which can be used to help solve constraints
---   in the 'to_wanted_origins'.
---
--- (Note that 'to_wanted_origins' will likely contain type variables from the
--- derived type class or data type, neither of which will appear in
--- 'to_anyclass_skols' or 'to_anyclass_metas'.)
---
--- For all other deriving strategies, it is always the case that
--- 'to_anyclass_skols', 'to_anyclass_metas', and 'to_anyclass_givens' are
--- empty.
---
--- Here is an example to illustrate this:
+-- | A list of 'PredSpec' constraints to simplify when inferring a
+-- derived instance's context. For the @stock@, @newtype@, and @via@ deriving
+-- strategies, these will consist of 'SimplePredSpec's, and for
+-- @DeriveAnyClass@, these will consist of 'SubTypePredSpec's. Here is an
+-- example to illustrate the latter:
 --
 -- @
 -- class Foo a where
@@ -476,70 +592,119 @@ data PredOrigin = PredOrigin PredType CtOrigin TypeOrKind
 -- data Quux q = Quux deriving anyclass Foo
 -- @
 --
--- Then it would generate two 'ThetaOrigin's, one for each method:
+-- Then it would generate two 'SubTypePredSpec's, one for each method:
 --
 -- @
--- [ ThetaOrigin { to_anyclass_skols  = [b]
---               , to_anyclass_metas  = [y]
---               , to_anyclass_givens = [Ix b]
---               , to_wanted_origins  = [ Show (Quux q), Ix y
---                                      , (Quux q -> b -> String) ~
---                                        (Quux q -> y -> String)
---                                      ] }
--- , ThetaOrigin { to_anyclass_skols  = []
---               , to_anyclass_metas  = []
---               , to_anyclass_givens = [Eq (Quux q)]
---               , to_wanted_origins  = [ Ord (Quux q)
---                                      , (Quux q -> Quux q -> Bool) ~
---                                        (Quux q -> Quux q -> Bool)
---                                      ] }
+-- [ SubTypePredSpec
+--     { stps_ty_actual   = forall y. (Show (Quux q), Ix y) => Quux q -> y -> String
+--     , stps_ty_expected = forall b.                (Ix b) => Quux q -> b -> String
+--     , stps_ty_origin   = DerivClauseCtxt
+--     }
+-- , SubTypePredSpec
+--     { stps_ty_actual   = Ord (Quux q) => Quux q -> Quux q -> Bool
+--     , stps_ty_expected = Eq  (Quux q) => Quux q -> Quux q -> Bool
+--     , stps_ty_origin   = DerivClauseCtxt
+--     }
 -- ]
 -- @
 --
 -- (Note that the type variable @q@ is bound by the data type @Quux@, and thus
--- it appears in neither 'to_anyclass_skols' nor 'to_anyclass_metas'.)
+-- appears free in the 'stps_ty_actual's and 'stps_ty_expected's.)
 --
 -- See @Note [Gathering and simplifying constraints for DeriveAnyClass]@
--- in "GHC.Tc.Deriv.Infer" for an explanation of how 'to_wanted_origins' are
--- determined in @DeriveAnyClass@, as well as how 'to_anyclass_skols',
--- 'to_anyclass_metas', and 'to_anyclass_givens' are used.
-data ThetaOrigin
-  = ThetaOrigin { to_anyclass_skols  :: [TyVar]
-                , to_anyclass_metas  :: [TyVar]
-                , to_anyclass_givens :: ThetaType
-                , to_wanted_origins  :: [PredOrigin] }
+-- in "GHC.Tc.Deriv.Infer" for an explanation of how these 'SubTypePredSpec's
+-- are used to compute implication constraints.
+type ThetaSpec = [PredSpec]
 
-instance Outputable PredOrigin where
-  ppr (PredOrigin ty _ _) = ppr ty -- The origin is not so interesting when debugging
+instance Outputable PredSpec where
+  ppr (SimplePredSpec{sps_pred = ty}) =
+    hang (text "SimplePredSpec")
+       2 (vcat [ text "sps_pred" <+> ppr ty ])
+  ppr (SubTypePredSpec { stps_ty_actual = ty_actual
+                       , stps_ty_expected = ty_expected }) =
+    hang (text "SubTypePredSpec")
+       2 (vcat [ text "stps_ty_actual"   <+> ppr ty_actual
+               , text "stps_ty_expected" <+> ppr ty_expected
+               ])
 
-instance Outputable ThetaOrigin where
-  ppr (ThetaOrigin { to_anyclass_skols  = ac_skols
-                   , to_anyclass_metas  = ac_metas
-                   , to_anyclass_givens = ac_givens
-                   , to_wanted_origins  = wanted_origins })
-    = hang (text "ThetaOrigin")
-         2 (vcat [ text "to_anyclass_skols  =" <+> ppr ac_skols
-                 , text "to_anyclass_metas  =" <+> ppr ac_metas
-                 , text "to_anyclass_givens =" <+> ppr ac_givens
-                 , text "to_wanted_origins  =" <+> ppr wanted_origins ])
+-- | Build a list of 'SimplePredSpec's, using the supplied 'CtOrigin' and
+-- 'TypeOrKind' values for each 'PredType'.
+mkDirectThetaSpec :: CtOrigin -> TypeOrKind -> ThetaType -> ThetaSpec
+mkDirectThetaSpec origin t_or_k =
+  map (\p -> SimplePredSpec
+               { sps_pred = p
+               , sps_origin = origin
+               , sps_type_or_kind = t_or_k
+               })
 
-mkPredOrigin :: CtOrigin -> TypeOrKind -> PredType -> PredOrigin
-mkPredOrigin origin t_or_k pred = PredOrigin pred origin t_or_k
+substPredSpec :: HasCallStack => TCvSubst -> PredSpec -> PredSpec
+substPredSpec subst ps =
+  case ps of
+    SimplePredSpec { sps_pred = pred
+                   , sps_origin = origin
+                   , sps_type_or_kind = t_or_k
+                   }
+      -> SimplePredSpec { sps_pred = substTy subst pred
+                        , sps_origin = origin
+                        , sps_type_or_kind = t_or_k
+                        }
 
-mkThetaOrigin :: CtOrigin -> TypeOrKind
-              -> [TyVar] -> [TyVar] -> ThetaType -> ThetaType
-              -> ThetaOrigin
-mkThetaOrigin origin t_or_k skols metas givens
-  = ThetaOrigin skols metas givens . map (mkPredOrigin origin t_or_k)
+    SubTypePredSpec { stps_ty_actual = ty_actual
+                    , stps_ty_expected = ty_expected
+                    , stps_origin = origin
+                    }
+      -> SubTypePredSpec { stps_ty_actual = substTy subst ty_actual
+                         , stps_ty_expected = substTy subst ty_expected
+                         , stps_origin = origin
+                         }
 
--- A common case where the ThetaOrigin only contains wanted constraints, with
--- no givens or locally scoped type variables.
-mkThetaOriginFromPreds :: [PredOrigin] -> ThetaOrigin
-mkThetaOriginFromPreds = ThetaOrigin [] [] []
+-- | Capture wanted constraints from a 'ThetaSpec'.
+captureThetaSpecConstraints ::
+     UserTypeCtxt -- ^ Used to inform error messages as to whether
+                  -- we are in a @deriving@ clause or a standalone
+                  -- @deriving@ declaration
+  -> ThetaSpec    -- ^ The specs from which constraints will be created
+  -> TcM (TcLevel, WantedConstraints)
+captureThetaSpecConstraints user_ctxt theta =
+  pushTcLevelM $ mk_wanteds theta
+  where
+    -- Create the constraints we need to solve. For stock and newtype
+    -- deriving, these constraints will be simple wanted constraints
+    -- like (C a, Ord b).
+    -- But with DeriveAnyClass, we make an implication constraint.
+    -- See Note [Gathering and simplifying constraints for DeriveAnyClass]
+    -- in GHC.Tc.Deriv.Infer.
+    mk_wanteds :: ThetaSpec -> TcM WantedConstraints
+    mk_wanteds preds
+      = do { (_, wanteds) <- captureConstraints $
+                             traverse_ emit_constraints preds
+           ; pure wanteds }
 
-substPredOrigin :: HasCallStack => TCvSubst -> PredOrigin -> PredOrigin
-substPredOrigin subst (PredOrigin pred origin t_or_k)
-  = PredOrigin (substTy subst pred) origin t_or_k
+    -- Emit the appropriate constraints depending on what sort of
+    -- PredSpec we are dealing with.
+    emit_constraints :: PredSpec -> TcM ()
+    emit_constraints ps =
+      case ps of
+        -- For constraints like (C a, Ord b), emit the
+        -- constraints directly as simple wanted constraints.
+        SimplePredSpec { sps_pred = wanted
+                       , sps_origin = orig
+                       , sps_type_or_kind = t_or_k
+                       } -> do
+          ev <- newWanted orig (Just t_or_k) wanted
+          emitSimple (mkNonCanonical ev)
+
+        -- For DeriveAnyClass, check if ty_actual is a subtype of
+        -- ty_expected, which emits an implication constraint as a
+        -- side effect. See
+        -- Note [Gathering and simplifying constraints for DeriveAnyClass].
+        -- in GHC.Tc.Deriv.Infer.
+        SubTypePredSpec { stps_ty_actual   = ty_actual
+                        , stps_ty_expected = ty_expected
+                        , stps_origin      = orig
+                        } -> do
+          _ <- tcSubTypeSigma orig user_ctxt ty_actual ty_expected
+          return ()
 
 {-
 ************************************************************************
@@ -555,60 +720,69 @@ function determines the criteria that needs to be met in order for a particular
 stock class to be able to be derived successfully.
 
 A class might be able to be used in a deriving clause if -XDeriveAnyClass
-is willing to support it. The canDeriveAnyClass function checks if this is the
-case.
+is willing to support it.
 -}
 
 hasStockDeriving
-  :: Class -> Maybe (SrcSpan
-                     -> TyCon
-                     -> [Type]
-                     -> TcM (LHsBinds GhcPs, BagDerivStuff, [Name]))
+  :: Class -> Maybe StockGenFns
 hasStockDeriving clas
   = assocMaybe gen_list (getUnique clas)
   where
-    gen_list
-      :: [(Unique, SrcSpan
-                   -> TyCon
-                   -> [Type]
-                   -> TcM (LHsBinds GhcPs, BagDerivStuff, [Name]))]
-    gen_list = [ (eqClassKey,          simpleM gen_Eq_binds)
-               , (ordClassKey,         simpleM gen_Ord_binds)
-               , (enumClassKey,        simpleM gen_Enum_binds)
-               , (boundedClassKey,     simple gen_Bounded_binds)
-               , (ixClassKey,          simpleM gen_Ix_binds)
-               , (showClassKey,        read_or_show gen_Show_binds)
-               , (readClassKey,        read_or_show gen_Read_binds)
-               , (dataClassKey,        simpleM gen_Data_binds)
-               , (functorClassKey,     simple gen_Functor_binds)
-               , (foldableClassKey,    simple gen_Foldable_binds)
-               , (traversableClassKey, simple gen_Traversable_binds)
-               , (liftClassKey,        simple gen_Lift_binds)
-               , (genClassKey,         generic (gen_Generic_binds Gen0))
-               , (gen1ClassKey,        generic (gen_Generic_binds Gen1)) ]
+    gen_list :: [(Unique, StockGenFns)]
+    gen_list =
+      [ (eqClassKey,          mk (simple_bindsM gen_Eq_binds) no_fam_insts)
+      , (ordClassKey,         mk (simple_bindsM gen_Ord_binds) no_fam_insts)
+      , (enumClassKey,        mk (simple_bindsM gen_Enum_binds) no_fam_insts)
+      , (boundedClassKey,     mk (simple_binds gen_Bounded_binds) no_fam_insts)
+      , (ixClassKey,          mk (simple_bindsM gen_Ix_binds) no_fam_insts)
+      , (showClassKey,        mk (read_or_show_binds gen_Show_binds) no_fam_insts)
+      , (readClassKey,        mk (read_or_show_binds gen_Read_binds) no_fam_insts)
+      , (dataClassKey,        mk (simple_bindsM gen_Data_binds) no_fam_insts)
+      , (functorClassKey,     mk (simple_binds gen_Functor_binds) no_fam_insts)
+      , (foldableClassKey,    mk (simple_binds gen_Foldable_binds) no_fam_insts)
+      , (traversableClassKey, mk (simple_binds gen_Traversable_binds) no_fam_insts)
+      , (liftClassKey,        mk (simple_binds gen_Lift_binds) no_fam_insts)
+      , (genClassKey,         mk (generic_binds Gen0) (generic_fam_inst Gen0))
+      , (gen1ClassKey,        mk (generic_binds Gen1) (generic_fam_inst Gen1))
+      ]
 
-    simple gen_fn loc tc _
-      = let (binds, deriv_stuff) = gen_fn loc tc
-        in return (binds, deriv_stuff, [])
+    mk gen_binds_fn gen_fam_insts_fn = StockGenFns
+      { stock_gen_binds     = gen_binds_fn
+      , stock_gen_fam_insts = gen_fam_insts_fn
+      }
+
+    simple_binds gen_fn loc dit
+      = let (binds, aux_specs) = gen_fn loc dit
+        in return (binds, [], aux_specs, [])
 
     -- Like `simple`, but monadic. The only monadic thing that these functions
     -- do is allocate new Uniques, which are used for generating the names of
     -- auxiliary bindings.
     -- See Note [Auxiliary binders] in GHC.Tc.Deriv.Generate.
-    simpleM gen_fn loc tc _
-      = do { (binds, deriv_stuff) <- gen_fn loc tc
-           ; return (binds, deriv_stuff, []) }
+    simple_bindsM gen_fn loc dit
+      = do { (binds, aux_specs) <- gen_fn loc dit
+           ; return (binds, [], aux_specs, []) }
 
-    read_or_show gen_fn loc tc _
-      = do { fix_env <- getDataConFixityFun tc
-           ; let (binds, deriv_stuff) = gen_fn fix_env loc tc
-                 field_names          = all_field_names tc
-           ; return (binds, deriv_stuff, field_names) }
+    read_or_show_binds gen_fn loc dit
+      = do { let tc = dit_rep_tc dit
+           ; fix_env <- getDataConFixityFun tc
+           ; let (binds, aux_specs) = gen_fn fix_env loc dit
+                 field_names        = all_field_names tc
+           ; return (binds, [], aux_specs, field_names) }
 
-    generic gen_fn _ tc inst_tys
-      = do { (binds, faminst) <- gen_fn tc inst_tys
+    generic_binds gk loc dit
+      = do { let tc = dit_rep_tc dit
+           ; (binds, sigs) <- gen_Generic_binds gk loc dit
            ; let field_names = all_field_names tc
-           ; return (binds, unitBag (DerivFamInst faminst), field_names) }
+           ; return (binds, sigs, emptyBag, field_names) }
+
+    generic_fam_inst gk loc dit
+      = do { let tc = dit_rep_tc dit
+           ; fix_env <- getDataConFixityFun tc
+           ; faminst <- gen_Generic_fam_inst gk fix_env loc dit
+           ; return [faminst] }
+
+    no_fam_insts _ _ = pure []
 
     -- See Note [Deriving and unused record selectors]
     all_field_names = map flSelector . concatMap dataConFieldLabels
@@ -640,7 +814,7 @@ Currently, the only three stock derived classes that require this are Read,
 Show, and Generic, as their derived code all depend on the record selectors
 of the derived data type's constructors.
 
-See also Note [Newtype deriving and unused constructors] in GHC.Tc.Deriv for
+See also Note [Unused constructors and deriving clauses] in GHC.Tc.Deriv for
 another example of a similar trick.
 -}
 
@@ -648,7 +822,7 @@ getDataConFixityFun :: TyCon -> TcM (Name -> Fixity)
 -- If the TyCon is locally defined, we want the local fixity env;
 -- but if it is imported (which happens for standalone deriving)
 -- we need to get the fixity env from the interface file
--- c.f. GHC.Rename.Env.lookupFixity, and #9830
+-- c.f. GHC.Rename.Env.lookupFixity, #9830, and #20994
 getDataConFixityFun tc
   = do { this_mod <- getModule
        ; if nameIsLocalOrFrom this_mod name
@@ -673,35 +847,38 @@ getDataConFixityFun tc
 -- the data constructors - but we need to be careful to fall back to the
 -- family tycon (with indexes) in error messages.
 
-checkOriginativeSideConditions
-  :: DynFlags -> DerivContext -> Class -> [TcType]
-  -> TyCon -> TyCon
-  -> OriginativeDerivStatus
-checkOriginativeSideConditions dflags deriv_ctxt cls cls_tys tc rep_tc
-    -- First, check if stock deriving is possible...
-  | Just cond <- stockSideConditions deriv_ctxt cls
-  = case (cond dflags tc rep_tc) of
-        NotValid err -> StockClassError err  -- Class-specific error
-        IsValid  | null (filterOutInvisibleTypes (classTyCon cls) cls_tys)
-                   -- All stock derivable classes are unary in the sense that
-                   -- there should be not types in cls_tys (i.e., no type args
-                   -- other than last). Note that cls_types can contain
-                   -- invisible types as well (e.g., for Generic1, which is
-                   -- poly-kinded), so make sure those are not counted.
-                 , Just gen_fn <- hasStockDeriving cls
-                   -> CanDeriveStock gen_fn
-                 | otherwise -> StockClassError (classArgsErr cls cls_tys)
-                   -- e.g. deriving( Eq s )
+checkOriginativeSideConditions :: DerivInstTys -> DerivM OriginativeDerivStatus
+checkOriginativeSideConditions dit@(DerivInstTys{dit_cls_tys = cls_tys}) =
+  do DerivEnv { denv_cls  = cls
+              , denv_ctxt = deriv_ctxt } <- ask
+     dflags <- getDynFlags
 
-    -- ...if not, try falling back on DeriveAnyClass.
-  | NotValid err <- canDeriveAnyClass dflags
-  = NonDerivableClass err  -- Neither anyclass nor stock work
+     if    -- First, check if stock deriving is possible...
+        |  Just cond <- stockSideConditions deriv_ctxt cls
+        -> case cond dflags dit of
+             NotValid err -> pure $ StockClassError err  -- Class-specific error
+             IsValid  |  null (filterOutInvisibleTypes (classTyCon cls) cls_tys)
+                         -- All stock derivable classes are unary in the sense that
+                         -- there should be not types in cls_tys (i.e., no type args
+                         -- other than last). Note that cls_types can contain
+                         -- invisible types as well (e.g., for Generic1, which is
+                         -- poly-kinded), so make sure those are not counted.
+                      ,  Just gen_fn <- hasStockDeriving cls
+                      -> pure $ CanDeriveStock gen_fn
+                      |  otherwise
+                      -> pure $ StockClassError $ classArgsErr cls cls_tys
+                        -- e.g. deriving( Eq s )
 
-  | otherwise
-  = CanDeriveAnyClass   -- DeriveAnyClass should work
+           -- ...if not, try falling back on DeriveAnyClass.
+        |  xopt LangExt.DeriveAnyClass dflags
+        -> pure CanDeriveAnyClass   -- DeriveAnyClass should work
 
-classArgsErr :: Class -> [Type] -> SDoc
-classArgsErr cls cls_tys = quotes (ppr (mkClassPred cls cls_tys)) <+> text "is not a class"
+        |  otherwise
+        -> pure NonDerivableClass -- Neither anyclass nor stock work
+
+
+classArgsErr :: Class -> [Type] -> DeriveInstanceErrReason
+classArgsErr cls cls_tys = DerivErrNotAClass (mkClassPred cls cls_tys)
 
 -- Side conditions (whether the datatype must have at least one constructor,
 -- required language extensions, etc.) for using GHC's stock deriving
@@ -748,39 +925,19 @@ stockSideConditions deriv_ctxt cls
     cond_vanilla = cond_stdOK deriv_ctxt True
       -- Vanilla data constructors but allow no data cons or polytype arguments
 
-canDeriveAnyClass :: DynFlags -> Validity
--- IsValid: we can (try to) derive it via an empty instance declaration
--- NotValid s:  we can't, reason s
-canDeriveAnyClass dflags
-  | not (xopt LangExt.DeriveAnyClass dflags)
-  = NotValid (text "Try enabling DeriveAnyClass")
-  | otherwise
-  = IsValid   -- OK!
-
 type Condition
    = DynFlags
 
-  -> TyCon    -- ^ The data type's 'TyCon'. For data families, this is the
-              -- family 'TyCon'.
+  -> DerivInstTys -- ^ Information about the type arguments to the class.
 
-  -> TyCon    -- ^ For data families, this is the representation 'TyCon'.
-              -- Otherwise, this is the same as the other 'TyCon' argument.
-
-  -> Validity -- ^ 'IsValid' if deriving an instance for this 'TyCon' is
-              -- possible. Otherwise, it's @'NotValid' err@, where @err@
-              -- explains what went wrong.
-
-orCond :: Condition -> Condition -> Condition
-orCond c1 c2 dflags tc rep_tc
-  = case (c1 dflags tc rep_tc, c2 dflags tc rep_tc) of
-     (IsValid,    _)          -> IsValid    -- c1 succeeds
-     (_,          IsValid)    -> IsValid    -- c21 succeeds
-     (NotValid x, NotValid y) -> NotValid (x $$ text "  or" $$ y)
-                                            -- Both fail
+  -> Validity' DeriveInstanceErrReason
+     -- ^ 'IsValid' if deriving an instance for this type is
+     -- possible. Otherwise, it's @'NotValid' err@, where @err@
+     -- explains what went wrong.
 
 andCond :: Condition -> Condition -> Condition
-andCond c1 c2 dflags tc rep_tc
-  = c1 dflags tc rep_tc `andValid` c2 dflags tc rep_tc
+andCond c1 c2 dflags dit
+  = c1 dflags dit `andValid` c2 dflags dit
 
 -- | Some common validity checks shared among stock derivable classes. One
 -- check that absolutely must hold is that if an instance @C (T a)@ is being
@@ -810,18 +967,18 @@ cond_stdOK
                   -- the -XEmptyDataDeriving extension.
 
   -> Condition
-cond_stdOK deriv_ctxt permissive dflags tc rep_tc
+cond_stdOK deriv_ctxt permissive dflags
+           dit@(DerivInstTys{dit_tc = tc, dit_rep_tc = rep_tc})
   = valid_ADT `andValid` valid_misc
   where
-    valid_ADT, valid_misc :: Validity
+    valid_ADT, valid_misc :: Validity' DeriveInstanceErrReason
     valid_ADT
       | isAlgTyCon tc || isDataFamilyTyCon tc
       = IsValid
       | otherwise
         -- Complain about functions, primitive types, and other tycons that
         -- stock deriving can't handle.
-      = NotValid $ text "The last argument of the instance must be a"
-               <+> text "data or newtype application"
+      = NotValid DerivErrLastArgMustBeApp
 
     valid_misc
       = case deriv_ctxt of
@@ -832,68 +989,77 @@ cond_stdOK deriv_ctxt permissive dflags tc rep_tc
          InferContext wildcard
            | null data_cons -- 1.
            , not permissive
-           -> checkFlag LangExt.EmptyDataDeriving dflags tc rep_tc `orValid`
-              NotValid (no_cons_why rep_tc $$ empty_data_suggestion)
+           , not (xopt LangExt.EmptyDataDeriving dflags)
+           -> NotValid (no_cons_why rep_tc)
            | not (null con_whys)
-           -> NotValid (vcat con_whys $$ possible_fix_suggestion wildcard)
+           -> NotValid $ DerivErrBadConstructor (Just $ has_wildcard wildcard) con_whys
            | otherwise
            -> IsValid
 
-    empty_data_suggestion =
-      text "Use EmptyDataDeriving to enable deriving for empty data types"
-    possible_fix_suggestion wildcard
+    has_wildcard wildcard
       = case wildcard of
-          Just _ ->
-            text "Possible fix: fill in the wildcard constraint yourself"
-          Nothing ->
-            text "Possible fix: use a standalone deriving declaration instead"
+          Just _  -> YesHasWildcard
+          Nothing -> NoHasWildcard
     data_cons  = tyConDataCons rep_tc
     con_whys   = getInvalids (map check_con data_cons)
 
-    check_con :: DataCon -> Validity
+    check_con :: DataCon -> Validity' DeriveInstanceBadConstructor
     check_con con
       | not (null eq_spec) -- 2.
-      = bad "is a GADT"
+      = bad DerivErrBadConIsGADT
       | not (null ex_tvs) -- 3.
-      = bad "has existential type variables in its type"
+      = bad DerivErrBadConHasExistentials
       | not (null theta) -- 4.
-      = bad "has constraints in its type"
-      | not (permissive || all isTauTy (map scaledThing $ dataConOrigArgTys con)) -- 5.
-      = bad "has a higher-rank type"
+      = bad DerivErrBadConHasConstraints
+      | not (permissive || all isTauTy (derivDataConInstArgTys con dit)) -- 5.
+      = bad DerivErrBadConHasHigherRankType
       | otherwise
       = IsValid
       where
         (_, ex_tvs, eq_spec, theta, _, _) = dataConFullSig con
-        bad msg = NotValid (badCon con (text msg))
+        bad mkErr = NotValid $ mkErr con
 
-no_cons_why :: TyCon -> SDoc
-no_cons_why rep_tc = quotes (pprSourceTyCon rep_tc) <+>
-                     text "must have at least one data constructor"
+no_cons_why :: TyCon -> DeriveInstanceErrReason
+no_cons_why = DerivErrNoConstructors
 
 cond_RepresentableOk :: Condition
-cond_RepresentableOk _ _ rep_tc = canDoGenerics rep_tc
+cond_RepresentableOk _ dit =
+  case canDoGenerics dit of
+    IsValid -> IsValid
+    NotValid generic_errs -> NotValid $ DerivErrGenerics generic_errs
 
 cond_Representable1Ok :: Condition
-cond_Representable1Ok _ _ rep_tc = canDoGenerics1 rep_tc
+cond_Representable1Ok _ dit =
+  case canDoGenerics1 dit of
+    IsValid -> IsValid
+    NotValid generic_errs -> NotValid $ DerivErrGenerics generic_errs
 
 cond_enumOrProduct :: Class -> Condition
 cond_enumOrProduct cls = cond_isEnumeration `orCond`
                          (cond_isProduct `andCond` cond_args cls)
+  where
+    orCond :: Condition -> Condition -> Condition
+    orCond c1 c2 dflags dit
+      = case (c1 dflags dit, c2 dflags dit) of
+         (IsValid,    _)          -> IsValid    -- c1 succeeds
+         (_,          IsValid)    -> IsValid    -- c21 succeeds
+         (NotValid x, NotValid y) -> NotValid $ DerivErrEnumOrProduct x y
+                                                -- Both fail
+
 
 cond_args :: Class -> Condition
 -- ^ For some classes (eg 'Eq', 'Ord') we allow unlifted arg types
 -- by generating specialised code.  For others (eg 'Data') we don't.
 -- For even others (eg 'Lift'), unlifted types aren't even a special
 -- consideration!
-cond_args cls _ _ rep_tc
+cond_args cls _ dit@(DerivInstTys{dit_rep_tc = rep_tc})
   = case bad_args of
       []     -> IsValid
-      (ty:_) -> NotValid (hang (text "Don't know how to derive" <+> quotes (ppr cls))
-                             2 (text "for type" <+> quotes (ppr ty)))
+      (ty:_) -> NotValid $ DerivErrDunnoHowToDeriveForType ty
   where
     bad_args = [ arg_ty | con <- tyConDataCons rep_tc
-                        , Scaled _ arg_ty <- dataConOrigArgTys con
-                        , isLiftedType_maybe arg_ty /= Just True
+                        , arg_ty <- derivDataConInstArgTys con dit
+                        , mightBeUnliftedType arg_ty
                         , not (ok_ty arg_ty) ]
 
     cls_key = classKey cls
@@ -901,7 +1067,7 @@ cond_args cls _ _ rep_tc
      | cls_key == eqClassKey   = check_in arg_ty ordOpTbl
      | cls_key == ordClassKey  = check_in arg_ty ordOpTbl
      | cls_key == showClassKey = check_in arg_ty boxConTbl
-     | cls_key == liftClassKey = True     -- Lift is levity-polymorphic
+     | cls_key == liftClassKey = True     -- Lift is representation-polymorphic
      | otherwise               = False    -- Read, Ix etc
 
     check_in :: Type -> [(Type,a)] -> Bool
@@ -909,22 +1075,16 @@ cond_args cls _ _ rep_tc
 
 
 cond_isEnumeration :: Condition
-cond_isEnumeration _ _ rep_tc
+cond_isEnumeration _ (DerivInstTys{dit_rep_tc = rep_tc})
   | isEnumerationTyCon rep_tc = IsValid
-  | otherwise                 = NotValid why
-  where
-    why = sep [ quotes (pprSourceTyCon rep_tc) <+>
-                  text "must be an enumeration type"
-              , text "(an enumeration consists of one or more nullary, non-GADT constructors)" ]
-                  -- See Note [Enumeration types] in GHC.Core.TyCon
+  | otherwise                 = NotValid $ DerivErrMustBeEnumType rep_tc
 
 cond_isProduct :: Condition
-cond_isProduct _ _ rep_tc
-  | isProductTyCon rep_tc = IsValid
-  | otherwise             = NotValid why
-  where
-    why = quotes (pprSourceTyCon rep_tc) <+>
-          text "must have precisely one constructor"
+cond_isProduct _ (DerivInstTys{dit_rep_tc = rep_tc})
+  | Just _ <- tyConSingleDataCon_maybe rep_tc
+  = IsValid
+  | otherwise
+  = NotValid $ DerivErrMustHaveExactlyOneConstructor rep_tc
 
 cond_functorOK :: Bool -> Bool -> Condition
 -- OK for Functor/Foldable/Traversable class
@@ -933,14 +1093,16 @@ cond_functorOK :: Bool -> Bool -> Condition
 --            (c) don't use argument in the wrong place, e.g. data T a = T (X a a)
 --            (d) optionally: don't use function types
 --            (e) no "stupid context" on data type
-cond_functorOK allowFunctions allowExQuantifiedLastTyVar _ _ rep_tc
+cond_functorOK allowFunctions allowExQuantifiedLastTyVar _
+               dit@(DerivInstTys{dit_rep_tc = rep_tc})
   | null tc_tvs
-  = NotValid (text "Data type" <+> quotes (ppr rep_tc)
-              <+> text "must have some type parameters")
+  = NotValid $ DerivErrMustHaveSomeParameters rep_tc
 
+    -- We can't handle stupid contexts that mention the last type argument,
+    -- so error out if we encounter one.
+    -- See Note [The stupid context] in GHC.Core.DataCon.
   | not (null bad_stupid_theta)
-  = NotValid (text "Data type" <+> quotes (ppr rep_tc)
-              <+> text "must not have a class context:" <+> pprTheta bad_stupid_theta)
+  = NotValid $ DerivErrMustNotHaveClassContext rep_tc bad_stupid_theta
 
   | otherwise
   = allValid (map check_con data_cons)
@@ -952,9 +1114,9 @@ cond_functorOK allowFunctions allowExQuantifiedLastTyVar _ _ rep_tc
       -- See Note [Check that the type variable is truly universal]
 
     data_cons = tyConDataCons rep_tc
-    check_con con = allValid (check_universal con : foldDataConArgs (ft_check con) con)
+    check_con con = allValid (check_universal con : foldDataConArgs (ft_check con) con dit)
 
-    check_universal :: DataCon -> Validity
+    check_universal :: DataCon -> Validity' DeriveInstanceErrReason
     check_universal con
       | allowExQuantifiedLastTyVar
       = IsValid -- See Note [DeriveFoldable with ExistentialQuantification]
@@ -964,31 +1126,26 @@ cond_functorOK allowFunctions allowExQuantifiedLastTyVar _ _ rep_tc
       , not (tv `elemVarSet` exactTyCoVarsOfTypes (dataConTheta con))
       = IsValid   -- See Note [Check that the type variable is truly universal]
       | otherwise
-      = NotValid (badCon con existential)
+      = NotValid $ DerivErrBadConstructor Nothing [DerivErrBadConExistential con]
 
-    ft_check :: DataCon -> FFoldType Validity
+    ft_check :: DataCon -> FFoldType (Validity' DeriveInstanceErrReason)
     ft_check con = FT { ft_triv = IsValid, ft_var = IsValid
-                      , ft_co_var = NotValid (badCon con covariant)
+                      , ft_co_var = NotValid $ DerivErrBadConstructor Nothing [DerivErrBadConCovariant con]
                       , ft_fun = \x y -> if allowFunctions then x `andValid` y
-                                                           else NotValid (badCon con functions)
+                                                           else NotValid $ DerivErrBadConstructor Nothing [DerivErrBadConFunTypes con]
                       , ft_tup = \_ xs  -> allValid xs
                       , ft_ty_app = \_ _ x -> x
-                      , ft_bad_app = NotValid (badCon con wrong_arg)
+                      , ft_bad_app = NotValid $ DerivErrBadConstructor Nothing [DerivErrBadConWrongArg con]
                       , ft_forall = \_ x   -> x }
 
-    existential = text "must be truly polymorphic in the last argument of the data type"
-    covariant   = text "must not use the type variable in a function argument"
-    functions   = text "must not contain function types"
-    wrong_arg   = text "must use the type variable only as the last argument of a data type"
 
 checkFlag :: LangExt.Extension -> Condition
-checkFlag flag dflags _ _
+checkFlag flag dflags _
   | xopt flag dflags = IsValid
   | otherwise        = NotValid why
   where
-    why = text "You need " <> text flag_str
-          <+> text "to derive an instance for this class"
-    flag_str = case [ flagSpecName f | f <- xFlags , flagSpecFlag f == flag ] of
+    why = DerivErrLangExtRequired the_flag
+    the_flag = case [ flagSpecFlag f | f <- xFlags , flagSpecFlag f == flag ] of
                  [s]   -> s
                  other -> pprPanic "checkFlag" (ppr other)
 
@@ -1013,14 +1170,12 @@ non_coercible_class cls
                          , genClassKey, gen1ClassKey, typeableClassKey
                          , traversableClassKey, liftClassKey ])
 
-badCon :: DataCon -> SDoc -> SDoc
-badCon con msg = text "Constructor" <+> quotes (ppr con) <+> msg
-
 ------------------------------------------------------------------
 
-newDerivClsInst :: ThetaType -> DerivSpec theta -> TcM ClsInst
-newDerivClsInst theta (DS { ds_name = dfun_name, ds_overlap = overlap_mode
-                          , ds_tvs = tvs, ds_cls = clas, ds_tys = tys })
+newDerivClsInst :: DerivSpec ThetaType -> TcM ClsInst
+newDerivClsInst (DS { ds_name = dfun_name, ds_overlap = overlap_mode
+                    , ds_tvs = tvs, ds_theta = theta
+                    , ds_cls = clas, ds_tys = tys })
   = newClsInst overlap_mode dfun_name tvs theta clas tys
 
 extendLocalInstEnv :: [ClsInst] -> TcM a -> TcM a
@@ -1109,8 +1264,7 @@ example of this is:
     data T a b = C (Show a) b => MkT b
 
 Here, the existential context (C (Show a) b) does technically mention the last
-type variable b. But this is OK, because expanding the type synonym C would
-give us the context (Show a), which doesn't mention b. Therefore, we must make
-sure to expand type synonyms before performing this check. Not doing so led to
-#13813.
+type variable b. But this is OK, because expanding the type synonym C would give
+us the context (Show a), which doesn't mention b. Therefore, we must make sure
+to expand type synonyms before performing this check. Not doing so led to #13813.
 -}

@@ -1,5 +1,5 @@
 name:          process
-version:       1.6.13.2
+version:       1.6.17.0
 -- NOTE: Don't forget to update ./changelog.md
 license:       BSD3
 license-file:  LICENSE
@@ -58,7 +58,7 @@ library
         c-sources:
             cbits/win32/runProcess.c
         other-modules: System.Process.Windows
-        build-depends: Win32 >=2.2 && < 2.13
+        build-depends: Win32 >=2.4 && < 2.14
         -- ole32 and rpcrt4 are needed to create GUIDs for unique named pipes
         -- for process.
         extra-libraries: kernel32, ole32, rpcrt4
@@ -70,7 +70,7 @@ library
             cbits/posix/posix_spawn.c
             cbits/posix/find_executable.c
         other-modules: System.Process.Posix
-        build-depends: unix >= 2.5 && < 2.8
+        build-depends: unix >= 2.5 && < 2.9
 
     include-dirs: include
     includes:
@@ -81,7 +81,7 @@ library
 
     ghc-options: -Wall
 
-    build-depends: base      >= 4.10 && < 4.17,
+    build-depends: base      >= 4.10 && < 4.19,
                    directory >= 1.1 && < 1.4,
                    filepath  >= 1.2 && < 1.5,
                    deepseq   >= 1.1 && < 1.5

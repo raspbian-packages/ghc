@@ -31,14 +31,13 @@
 module Main (main) where
 
 import qualified GHC.Unit.Database as GhcPkg
-import GHC.Unit.Database
+import GHC.Unit.Database hiding (mkMungePathUrl)
 import GHC.HandleEncoding
 import GHC.BaseDir (getBaseDir)
-import GHC.Settings.Platform (getTargetPlatform)
-import GHC.Settings.Utils (maybeReadFuzzy)
-import GHC.Platform (platformMini)
-import GHC.Platform.Host (cHostPlatformMini)
+import GHC.Settings.Utils (getTargetArchOS, maybeReadFuzzy)
+import GHC.Platform.Host (hostPlatformArchOS)
 import GHC.UniqueSubdir (uniqueSubdir)
+import qualified GHC.Data.ShortText as ST
 import GHC.Version ( cProjectVersion )
 import qualified Distribution.Simple.PackageIndex as PackageIndex
 import qualified Data.Graph as Graph
@@ -58,8 +57,9 @@ import Distribution.Types.MungedPackageId
 import Distribution.Simple.Utils (toUTF8BS, writeUTF8File, readUTF8File)
 import qualified Data.Version as Version
 import System.FilePath as FilePath
-import System.Directory ( getAppUserDataDirectory, createDirectoryIfMissing,
-                          getModificationTime )
+import qualified System.FilePath.Posix as FilePath.Posix
+import System.Directory ( getXdgDirectory, createDirectoryIfMissing, getAppUserDataDirectory,
+                          getModificationTime, XdgDirectory ( XdgData ) )
 import Text.Printf
 
 import Prelude
@@ -78,8 +78,11 @@ import System.Exit ( exitWith, ExitCode(..) )
 import System.Environment ( getArgs, getProgName, getEnv )
 import System.IO
 import System.IO.Error
+import GHC.IO           ( catchException )
 import GHC.IO.Exception (IOErrorType(InappropriateType))
-import Data.List
+import Data.List ( group, sort, sortBy, nub, partition, find
+                 , intercalate, intersperse, foldl', unfoldr
+                 , isInfixOf, isSuffixOf, isPrefixOf, stripPrefix )
 import Control.Concurrent
 import qualified Data.Foldable as F
 import qualified Data.Traversable as F
@@ -632,39 +635,57 @@ getPkgDatabases verbosity mode use_user use_cache expand_vars my_flags = do
   let no_user_db = FlagNoUserDb `elem` my_flags
 
   -- get the location of the user package database, and create it if necessary
-  -- getAppUserDataDirectory can fail (e.g. if $HOME isn't set)
-  e_appdir <- tryIO $ getAppUserDataDirectory "ghc"
+  -- getXdgDirectory can fail (e.g. if $HOME isn't set)
 
   mb_user_conf <-
     case [ f | FlagUserConfig f <- my_flags ] of
       _ | no_user_db -> return Nothing
-      [] -> case e_appdir of
-        Left _    -> return Nothing
-        Right appdir -> do
-          -- See Note [Settings File] about this file, and why we need GHC to share it with us.
-          let settingsFile = top_dir </> "settings"
-          exists_settings_file <- doesFileExist settingsFile
-          targetPlatformMini <- case exists_settings_file of
-            False -> do
-              warn $ "WARNING: settings file doesn't exist " ++ show settingsFile
-              warn "cannot know target platform so guessing target == host (native compiler)."
-              pure cHostPlatformMini
-            True -> do
-              settingsStr <- readFile settingsFile
-              mySettings <- case maybeReadFuzzy settingsStr of
-                Just s -> pure $ Map.fromList s
-                -- It's excusable to not have a settings file (for now at
-                -- least) but completely inexcusable to have a malformed one.
-                Nothing -> die $ "Can't parse settings file " ++ show settingsFile
-              case getTargetPlatform settingsFile mySettings of
-                Right platform -> pure $ platformMini platform
-                Left e -> die e
-          let subdir = uniqueSubdir targetPlatformMini
-              dir = appdir </> subdir
-          r <- lookForPackageDBIn dir
-          case r of
-            Nothing -> return (Just (dir </> "package.conf.d", False))
-            Just f  -> return (Just (f, True))
+      [] -> do
+        -- See Note [Settings file] about this file, and why we need GHC to share it with us.
+        let settingsFile = top_dir </> "settings"
+        exists_settings_file <- doesFileExist settingsFile
+        targetArchOS <- case exists_settings_file of
+          False -> do
+            warn $ "WARNING: settings file doesn't exist " ++ show settingsFile
+            warn "cannot know target platform so guessing target == host (native compiler)."
+            pure hostPlatformArchOS
+          True -> do
+            settingsStr <- readFile settingsFile
+            mySettings <- case maybeReadFuzzy settingsStr of
+              Just s -> pure $ Map.fromList s
+              -- It's excusable to not have a settings file (for now at
+              -- least) but completely inexcusable to have a malformed one.
+              Nothing -> die $ "Can't parse settings file " ++ show settingsFile
+            case getTargetArchOS settingsFile mySettings of
+              Right archOS -> pure archOS
+              Left e -> die e
+        let subdir = uniqueSubdir targetArchOS
+
+            getFirstSuccess :: [IO a] -> IO (Maybe a)
+            getFirstSuccess [] = pure Nothing
+            getFirstSuccess (a:as) = tryIO a >>= \case
+              Left _ -> getFirstSuccess as
+              Right d -> pure (Just d)
+        -- The appdir used to be in ~/.ghc but to respect the XDG specification
+        -- we want to move it under $XDG_DATA_HOME/
+        -- However, old tooling (like cabal) might still write package environments
+        -- to the old directory, so we prefer that if a subdirectory of ~/.ghc
+        -- with the correct target and GHC version exists.
+        --
+        -- i.e. if ~/.ghc/$UNIQUE_SUBDIR exists we prefer that
+        -- otherwise we use $XDG_DATA_HOME/$UNIQUE_SUBDIR
+        --
+        -- UNIQUE_SUBDIR is typically a combination of the target platform and GHC version
+        m_appdir <- getFirstSuccess $ map (fmap (</> subdir))
+          [ getAppUserDataDirectory "ghc"  -- this is ~/.ghc/
+          , getXdgDirectory XdgData "ghc"  -- this is $XDG_DATA_HOME/
+          ]
+        case m_appdir of
+          Nothing -> return Nothing
+          Just dir -> do
+            lookForPackageDBIn dir >>= \case
+              Nothing -> return (Just (dir </> "package.conf.d", False))
+              Just f  -> return (Just (f, True))
       fs -> return (Just (last fs, True))
 
   -- If the user database exists, and for "use_user" commands (which includes
@@ -748,7 +769,7 @@ getPkgDatabases verbosity mode use_user use_cache expand_vars my_flags = do
                 else do
                   db <- readParseDatabase verbosity mb_user_conf
                                           mode use_cache db_path
-                    `Exception.catch` couldntOpenDbForModification db_path
+                    `catchException` couldntOpenDbForModification db_path
                   let ro_db = db { packageDbLock = GhcPkg.DbOpenReadOnly }
                   return (ro_db, Just db)
           | db_path <- final_stack ]
@@ -991,6 +1012,35 @@ mungePackagePaths top_dir pkgroot pkg =
     munge_paths = map munge_path
     munge_urls  = map munge_url
     (munge_path,munge_url) = mkMungePathUrl top_dir pkgroot
+
+mkMungePathUrl :: FilePath -> FilePath -> (FilePath -> FilePath, FilePath -> FilePath)
+mkMungePathUrl top_dir pkgroot = (munge_path, munge_url)
+   where
+    munge_path p
+      | Just p' <- stripVarPrefix "${pkgroot}" p = pkgroot ++ p'
+      | Just p' <- stripVarPrefix "$topdir"    p = top_dir ++ p'
+      | otherwise                                = p
+
+    munge_url p
+      | Just p' <- stripVarPrefix "${pkgrooturl}" p = toUrlPath pkgroot p'
+      | Just p' <- stripVarPrefix "$httptopdir"   p = toUrlPath top_dir p'
+      | otherwise                                   = p
+
+    toUrlPath r p = "file:///"
+                 -- URLs always use posix style '/' separators:
+                 ++ FilePath.Posix.joinPath
+                        (r : -- We need to drop a leading "/" or "\\"
+                             -- if there is one:
+                             dropWhile (all isPathSeparator)
+                                       (FilePath.splitDirectories p))
+
+    -- We could drop the separator here, and then use </> above. However,
+    -- by leaving it in and using ++ we keep the same path separator
+    -- rather than letting FilePath change it to use \ as the separator
+    stripVarPrefix var path = case stripPrefix var path of
+                              Just [] -> Just []
+                              Just cs@(c : _) | isPathSeparator c -> Just cs
+                              _ -> Nothing
 
 -- -----------------------------------------------------------------------------
 -- Workaround for old single-file style package dbs
@@ -1242,7 +1292,7 @@ updateDBCache verbosity db db_stack = do
       hasAnyAbiDepends x = length (abiDepends x) > 0
 
   -- warn when we find any (possibly-)bogus abi-depends fields;
-  -- Note [Recompute abi-depends]
+  -- See Note [Recompute abi-depends]
   when (verbosity >= Normal) $ do
     let definitelyBrokenPackages =
           nub
@@ -1283,7 +1333,6 @@ updateDBCache verbosity db db_stack = do
     GhcPkg.DbOpenReadWrite lock -> GhcPkg.unlockPackageDb lock
 
 type PackageCacheFormat = GhcPkg.GenericUnitInfo
-                            ComponentId
                             PackageIdentifier
                             PackageName
                             UnitId
@@ -1292,7 +1341,6 @@ type PackageCacheFormat = GhcPkg.GenericUnitInfo
 
 {- Note [Recompute abi-depends]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 Like most fields, `ghc-pkg` relies on who-ever is performing package
 registration to fill in fields; this includes the `abi-depends` field present
 for the package.
@@ -1333,7 +1381,7 @@ recomputeValidAbiDeps db pkg =
     newAbiDeps =
       catMaybes . flip map (GhcPkg.unitAbiDepends pkg) $ \(k, _) ->
         case filter (\d -> installedUnitId d == k) db of
-          [x] -> Just (k, unAbiHash (abiHash x))
+          [x] -> Just (k, ST.pack $ unAbiHash (abiHash x))
           _   -> Nothing
     abiDepsUpdated =
       GhcPkg.unitAbiDepends pkg /= newAbiDeps
@@ -1343,7 +1391,7 @@ recomputeValidAbiDeps db pkg =
 -- Ghc.PackageDb to store into the database)
 fromPackageCacheFormat :: PackageCacheFormat -> GhcPkg.DbUnitInfo
 fromPackageCacheFormat = GhcPkg.mapGenericUnitInfo
-     mkUnitId' mkComponentId' mkPackageIdentifier' mkPackageName' mkModuleName' mkModule'
+     mkUnitId' mkPackageIdentifier' mkPackageName' mkModuleName' mkModule'
    where
      displayBS :: Pretty a => a -> BS.ByteString
      displayBS            = toUTF8BS . display
@@ -1364,7 +1412,7 @@ convertPackageInfoToCacheFormat :: InstalledPackageInfo -> PackageCacheFormat
 convertPackageInfoToCacheFormat pkg =
     GhcPkg.GenericUnitInfo {
        GhcPkg.unitId             = installedUnitId pkg,
-       GhcPkg.unitInstanceOf     = installedComponentId pkg,
+       GhcPkg.unitInstanceOf     = mkUnitId (unComponentId (installedComponentId pkg)),
        GhcPkg.unitInstantiations = instantiatedWith pkg,
        GhcPkg.unitPackageId      = sourcePackageId pkg,
        GhcPkg.unitPackageName    = packageName pkg,
@@ -1372,22 +1420,22 @@ convertPackageInfoToCacheFormat pkg =
        GhcPkg.unitComponentName  =
          fmap (mkPackageName . unUnqualComponentName) (libraryNameString $ sourceLibName pkg),
        GhcPkg.unitDepends        = depends pkg,
-       GhcPkg.unitAbiDepends     = map (\(AbiDependency k v) -> (k,unAbiHash v)) (abiDepends pkg),
-       GhcPkg.unitAbiHash        = unAbiHash (abiHash pkg),
-       GhcPkg.unitImportDirs     = importDirs pkg,
-       GhcPkg.unitLibraries      = hsLibraries pkg,
-       GhcPkg.unitExtDepLibsSys  = extraLibraries pkg,
-       GhcPkg.unitExtDepLibsGhc  = extraGHCiLibraries pkg,
-       GhcPkg.unitLibraryDirs    = libraryDirs pkg,
-       GhcPkg.unitLibraryDynDirs = libraryDynDirs pkg,
-       GhcPkg.unitExtDepFrameworks = frameworks pkg,
-       GhcPkg.unitExtDepFrameworkDirs = frameworkDirs pkg,
-       GhcPkg.unitLinkerOptions  = ldOptions pkg,
-       GhcPkg.unitCcOptions      = ccOptions pkg,
-       GhcPkg.unitIncludes       = includes pkg,
-       GhcPkg.unitIncludeDirs    = includeDirs pkg,
-       GhcPkg.unitHaddockInterfaces = haddockInterfaces pkg,
-       GhcPkg.unitHaddockHTMLs   = haddockHTMLs pkg,
+       GhcPkg.unitAbiDepends     = map (\(AbiDependency k v) -> (k,ST.pack $ unAbiHash v)) (abiDepends pkg),
+       GhcPkg.unitAbiHash        = ST.pack $ unAbiHash (abiHash pkg),
+       GhcPkg.unitImportDirs     = map ST.pack $ importDirs pkg,
+       GhcPkg.unitLibraries      = map ST.pack $ hsLibraries pkg,
+       GhcPkg.unitExtDepLibsSys  = map ST.pack $ extraLibraries pkg,
+       GhcPkg.unitExtDepLibsGhc  = map ST.pack $ extraGHCiLibraries pkg,
+       GhcPkg.unitLibraryDirs    = map ST.pack $ libraryDirs pkg,
+       GhcPkg.unitLibraryDynDirs = map ST.pack $ libraryDynDirs pkg,
+       GhcPkg.unitExtDepFrameworks = map ST.pack $ frameworks pkg,
+       GhcPkg.unitExtDepFrameworkDirs = map ST.pack $ frameworkDirs pkg,
+       GhcPkg.unitLinkerOptions  = map ST.pack $ ldOptions pkg,
+       GhcPkg.unitCcOptions      = map ST.pack $ ccOptions pkg,
+       GhcPkg.unitIncludes       = map ST.pack $ includes pkg,
+       GhcPkg.unitIncludeDirs    = map ST.pack $ includeDirs pkg,
+       GhcPkg.unitHaddockInterfaces = map ST.pack $ haddockInterfaces pkg,
+       GhcPkg.unitHaddockHTMLs   = map ST.pack $ haddockHTMLs pkg,
        GhcPkg.unitExposedModules = map convertExposed (exposedModules pkg),
        GhcPkg.unitHiddenModules  = hiddenModules pkg,
        GhcPkg.unitIsIndefinite   = indefinite pkg,
@@ -2207,7 +2255,7 @@ installSignalHandlers = do
 #endif
 
 catchIO :: IO a -> (Exception.IOException -> IO a) -> IO a
-catchIO = Exception.catch
+catchIO = catchException
 
 tryIO :: IO a -> IO (Either Exception.IOException a)
 tryIO = Exception.try

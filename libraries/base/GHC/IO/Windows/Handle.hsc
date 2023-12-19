@@ -36,6 +36,7 @@ module GHC.IO.Windows.Handle
    toHANDLE,
    fromHANDLE,
    handleToMode,
+   isAsynchronous,
    optimizeFileAccess,
 
    -- * Standard Handles
@@ -77,7 +78,7 @@ import GHC.IO.Windows.Encoding (withGhcInternalToUTF16, withUTF16ToGhcInternal)
 import GHC.IO.Windows.Paths (getDevicePath)
 import GHC.IO.Handle.Internals (debugIO)
 import GHC.IORef
-import GHC.Event.Windows (LPOVERLAPPED, withOverlapped, IOResult(..))
+import GHC.Event.Windows (LPOVERLAPPED, withOverlappedEx, IOResult(..))
 import Foreign.Ptr
 import Foreign.C
 import Foreign.Marshal.Array (pokeArray)
@@ -103,7 +104,12 @@ data ConsoleHandle
 --   We can't store it separately because we don't know when the handle will
 --   be destroyed or invalidated.
 data IoHandle a where
-  NativeHandle  :: { getNativeHandle  :: HANDLE } -> IoHandle NativeHandle
+  NativeHandle  :: { getNativeHandle  :: HANDLE
+                   -- In certain cases we have inherited a handle and the
+                   -- handle and it may not have been created for async
+                   -- access.  In those case we can't issue a completion
+                   -- request as it would never finish and we'd deadlock.
+                   , isAsynchronous :: Bool } -> IoHandle NativeHandle
   ConsoleHandle :: { getConsoleHandle :: HANDLE
                    , cookedHandle :: IORef Bool
                    } -> IoHandle ConsoleHandle
@@ -112,8 +118,10 @@ type Io a = IoHandle a
 
 -- | Convert a ConsoleHandle into a general FileHandle
 --   This will change which DeviceIO is used.
-convertHandle :: Io ConsoleHandle -> Io NativeHandle
-convertHandle = fromHANDLE . toHANDLE
+convertHandle :: Io ConsoleHandle -> Bool -> Io NativeHandle
+convertHandle io async
+  = let !hwnd = getConsoleHandle io
+    in NativeHandle hwnd async
 
 -- | @since 4.11.0.0
 instance Show (Io NativeHandle) where
@@ -132,7 +140,7 @@ instance GHC.IO.Device.RawIO (Io NativeHandle) where
 
 -- | @since 4.11.0.0
 instance GHC.IO.Device.RawIO (Io ConsoleHandle) where
-  read             = consoleRead
+  read             = consoleRead True
   readNonBlocking  = consoleReadNonBlocking
   write            = consoleWrite
   writeNonBlocking = consoleWriteNonBlocking
@@ -148,7 +156,9 @@ class (GHC.IO.Device.RawIO a, IODevice a, BufferedIO a, Typeable a)
 
 instance RawHandle (Io NativeHandle) where
   toHANDLE     = getNativeHandle
-  fromHANDLE   = NativeHandle
+  -- In order to convert to a native handle we have to check to see
+  -- is the handle can be used async or not.
+  fromHANDLE   = flip NativeHandle True
   isLockable _ = True
   setCooked    = const . return
   isCooked   _ = return False
@@ -184,7 +194,7 @@ instance GHC.IO.Device.IODevice (Io NativeHandle) where
 -- | @since 4.11.0.0
 instance GHC.IO.Device.IODevice (Io ConsoleHandle) where
   ready      = handle_ready
-  close      = handle_close . convertHandle
+  close      = handle_close . flip convertHandle False
   isTerminal = handle_is_console
   isSeekable = handle_is_seekable
   seek       = handle_console_seek
@@ -410,6 +420,9 @@ foreign import WINDOWS_CCONV safe "windows.h WriteConsoleW"
 foreign import WINDOWS_CCONV safe "windows.h ReadConsoleInputW"
   c_read_console_input :: HANDLE -> PINPUT_RECORD -> DWORD -> LPDWORD -> IO BOOL
 
+foreign import WINDOWS_CCONV safe "windows.h GetNumberOfConsoleInputEvents"
+  c_get_num_console_inputs :: HANDLE -> LPDWORD -> IO BOOL
+
 type LPSECURITY_ATTRIBUTES = LPVOID
 
 -- -----------------------------------------------------------------------------
@@ -420,9 +433,11 @@ type LPSECURITY_ATTRIBUTES = LPVOID
 -- am choosing never to let this block. But this can be easily accomplished by
 -- a getOverlappedResult call with True
 hwndRead :: Io NativeHandle -> Ptr Word8 -> Word64 -> Int -> IO Int
-hwndRead hwnd ptr offset bytes
-  = fmap fromIntegral $ Mgr.withException "hwndRead" $
-      withOverlapped "hwndRead" (toHANDLE hwnd) offset (startCB ptr) completionCB
+hwndRead hwnd ptr offset bytes = do
+  mngr <- Mgr.getSystemManager
+  fmap fromIntegral $ Mgr.withException "hwndRead" $
+     withOverlappedEx mngr "hwndRead" (toHANDLE hwnd) (isAsynchronous hwnd)
+                      offset (startCB ptr) completionCB
   where
     startCB outBuf lpOverlapped = do
       debugIO ":: hwndRead"
@@ -448,8 +463,10 @@ hwndRead hwnd ptr offset bytes
 hwndReadNonBlocking :: Io NativeHandle -> Ptr Word8 -> Word64 -> Int
                     -> IO (Maybe Int)
 hwndReadNonBlocking hwnd ptr offset bytes
-  = do val <- withOverlapped "hwndReadNonBlocking" (toHANDLE hwnd) offset
-                              (startCB ptr) completionCB
+  = do mngr <- Mgr.getSystemManager
+       val <- withOverlappedEx mngr "hwndReadNonBlocking" (toHANDLE hwnd)
+                               (isAsynchronous hwnd) offset (startCB ptr)
+                               completionCB
        return $ ioValue val
   where
     startCB inputBuf lpOverlapped = do
@@ -471,9 +488,11 @@ hwndReadNonBlocking hwnd ptr offset bytes
 
 hwndWrite :: Io NativeHandle -> Ptr Word8 -> Word64 -> Int -> IO ()
 hwndWrite hwnd ptr offset bytes
-  = do _ <- Mgr.withException "hwndWrite" $
-          withOverlapped "hwndWrite" (toHANDLE hwnd) offset (startCB ptr)
-                         completionCB
+  = do mngr <- Mgr.getSystemManager
+       _ <- Mgr.withException "hwndWrite" $
+          withOverlappedEx mngr "hwndWrite" (toHANDLE hwnd)
+                           (isAsynchronous hwnd) offset (startCB ptr)
+                           completionCB
        return ()
   where
     startCB outBuf lpOverlapped = do
@@ -490,8 +509,10 @@ hwndWrite hwnd ptr offset bytes
 
 hwndWriteNonBlocking :: Io NativeHandle -> Ptr Word8 -> Word64 -> Int -> IO Int
 hwndWriteNonBlocking hwnd ptr offset bytes
-  = do val <- withOverlapped "hwndReadNonBlocking" (toHANDLE hwnd) offset
-                             (startCB ptr) completionCB
+  = do mngr <- Mgr.getSystemManager
+       val <- withOverlappedEx mngr "hwndReadNonBlocking" (toHANDLE hwnd)
+                               (isAsynchronous hwnd) offset (startCB ptr)
+                               completionCB
        return $ fromIntegral $ ioValue val
   where
     startCB :: Ptr a -> LPOVERLAPPED -> IO (Mgr.CbResult a1)
@@ -508,6 +529,7 @@ hwndWriteNonBlocking hwnd ptr offset bytes
         | otherwise                        = Mgr.ioFailed err
 
 -- Note [ReadFile/WriteFile]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~
 -- The results of these functions are somewhat different when working in an
 -- asynchronous manner. The returning bool has two meaning.
 --
@@ -552,26 +574,25 @@ consoleWriteNonBlocking hwnd ptr _offset bytes
          val <- fromIntegral <$> peek res
          return val
 
-consoleRead :: Io ConsoleHandle -> Ptr Word8 -> Word64 -> Int -> IO Int
-consoleRead hwnd ptr _offset bytes
-  = withUTF16ToGhcInternal ptr bytes $ \reqBytes w_ptr ->
-      alloca $ \res -> do
-       cooked <- isCooked hwnd
-       -- Cooked input must be handled differently when the STD handles are
-       -- attached to a real console handle.  For File based handles we can't do
-       -- proper cooked inputs, but since the actions are async you would get
-       -- results as soon as available.
-       --
-       -- For console handles We have to use a lower level API then ReadConsole,
-       -- namely we must use ReadConsoleInput which requires us to process
-       -- all console message manually.
-       --
-       -- Do note that MSYS2 shells such as bash don't attach to a real handle,
-       -- and instead have by default a pipe/file based std handles.  Which
-       -- means the cooked behaviour is best when used in a native Windows
-       -- terminal such as cmd, powershell or ConEmu.
-       case cooked of
-        False -> do
+consoleRead :: Bool -> Io ConsoleHandle -> Ptr Word8 -> Word64 -> Int -> IO Int
+consoleRead blocking hwnd ptr _offset bytes
+  = alloca $ \res -> do
+      cooked <- isCooked hwnd
+      -- Cooked input must be handled differently when the STD handles are
+      -- attached to a real console handle.  For File based handles we can't do
+      -- proper cooked inputs, but since the actions are async you would get
+      -- results as soon as available.
+      --
+      -- For console handles We have to use a lower level API then ReadConsole,
+      -- namely we must use ReadConsoleInput which requires us to process
+      -- all console message manually.
+      --
+      -- Do note that MSYS2 shells such as bash don't attach to a real handle,
+      -- and instead have by default a pipe/file based std handles.  Which
+      -- means the cooked behaviour is best when used in a native Windows
+      -- terminal such as cmd, powershell or ConEmu.
+      case cooked || not blocking of
+        False -> withUTF16ToGhcInternal ptr bytes $ \reqBytes w_ptr ->  do
           debugIO "consoleRead :: un-cooked I/O read."
           -- eotControl allows us to handle control characters like EOL
           -- without needing a newline, which would sort of defeat the point
@@ -606,26 +627,45 @@ consoleRead hwnd ptr _offset bytes
           -- characters as they are.  Technically this function can handle any
           -- console event.  Including mouse, window and virtual key events
           -- but for now I'm only interested in key presses.
-          let entries = fromIntegral $ reqBytes `div` (#size INPUT_RECORD)
+          let entries = fromIntegral $ bytes `div` (#size INPUT_RECORD)
           allocaBytes entries $ \p_inputs ->
-            readEvent p_inputs entries res w_ptr
+            maybeReadEvent p_inputs entries res ptr
 
-    where readEvent p_inputs entries res w_ptr = do
+          -- Check to see if we have been explicitly asked to do a non-blocking
+          -- I/O, and if we were, make sure that if we didn't have any console
+          -- events that we don't block.
+    where maybeReadEvent p_inputs entries res w_ptr =
+            case (not blocking) of
+              True -> do
+                avail <- with (0 :: DWORD) $ \num_events_ptr -> do
+                  failIfFalse_ "GHC.IO.Handle.consoleRead [non-blocking]" $
+                    c_get_num_console_inputs (toHANDLE hwnd) num_events_ptr
+                  peek num_events_ptr
+                debugIO $ "consoleRead [avail] :: " ++ show avail
+                if avail > 0
+                  then readEvent p_inputs entries res w_ptr
+                  else return 0
+              False -> readEvent p_inputs entries res w_ptr
+
+          -- Unconditionally issue the first read, but conditionally
+          -- do the recursion.
+          readEvent p_inputs entries res w_ptr = do
             failIfFalse_ "GHC.IO.Handle.consoleRead" $
               c_read_console_input (toHANDLE hwnd) p_inputs
                                    (fromIntegral entries) res
 
             b_read <- fromIntegral <$> peek res
             read <- cobble b_read w_ptr p_inputs
+            debugIO $ "readEvent: =" ++ show read
             if read > 0
                then return $ fromIntegral read
-               else readEvent p_inputs entries res w_ptr
+               else maybeReadEvent p_inputs entries res w_ptr
 
           -- Dereference and read console input records.  We only read the bare
           -- minimum required to know which key/sequences were pressed.  To do
           -- this and prevent having to fully port the PINPUT_RECORD structure
           -- in Haskell we use some GCC builtins to find the correct offsets.
-          cobble :: Int -> Ptr Word16 -> PINPUT_RECORD -> IO Int
+          cobble :: Int -> Ptr Word8 -> PINPUT_RECORD -> IO Int
           cobble 0 _ _ = do debugIO "cobble: done."
                             return 0
           cobble n w_ptr p_inputs =
@@ -650,8 +690,18 @@ consoleRead hwnd ptr _offset bytes
                           debugIO $ "cobble: offset - " ++ show char_offset
                           debugIO $ "cobble: show > " ++ show char
                           debugIO $ "cobble: repeat: " ++ show repeated
+                          -- The documentation here is rather subtle, but
+                          -- according to MSDN the uWChar being provided here
+                          -- has been "translated".  What this actually means
+                          -- is that the surrogate pairs have already been
+                          -- translated into byte sequences.  That is, despite
+                          -- the Word16 storage type, it's actually a byte
+                          -- stream.  This means we shouldn't try to decode
+                          -- to UTF-8 again since we'd end up incorrectly
+                          -- interpreting two bytes as an extended unicode
+                          -- character.
                           pokeArray w_ptr $ replicate repeated char
-                          (+1) <$> cobble n' w_ptr' p_inputs'
+                          (+repeated) <$> cobble n' w_ptr' p_inputs'
                   else do debugIO $ "cobble: skip event."
                           cobble n' w_ptr p_inputs'
 
@@ -659,7 +709,7 @@ consoleRead hwnd ptr _offset bytes
 consoleReadNonBlocking :: Io ConsoleHandle -> Ptr Word8 -> Word64 -> Int
                        -> IO (Maybe Int)
 consoleReadNonBlocking hwnd ptr offset bytes
-  = Just <$> consoleRead hwnd ptr offset bytes
+  = Just <$> consoleRead False hwnd ptr offset bytes
 
 -- -----------------------------------------------------------------------------
 -- Operations on file handles
@@ -884,7 +934,7 @@ openFile' filepath iomode non_blocking tmp_opts =
                -- on the Haskell side by using existing mechanisms such as MVar
                -- or IOPorts.
                then #{const FILE_FLAG_OVERLAPPED}
-                    -- I beleive most haskell programs do sequential scans, so
+                    -- I believe most haskell programs do sequential scans, so
                     -- optimize for the common case.  Though ideally, this would
                     -- be parameterized by openFile.  This will absolutely trash
                     -- the cache on reverse scans.

@@ -17,35 +17,41 @@ module GHC.Builtin.PrimOps (
         primOpOutOfLine, primOpCodeSize,
         primOpOkForSpeculation, primOpOkForSideEffects,
         primOpIsCheap, primOpFixity, primOpDocs,
+        primOpIsDiv,
 
         getPrimOpResultInfo,  isComparisonPrimOp, PrimOpResultInfo(..),
 
         PrimCall(..)
     ) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
 import GHC.Builtin.Types.Prim
 import GHC.Builtin.Types
-
-import GHC.Cmm.Type
-import GHC.Types.Demand
-import GHC.Types.Id      ( Id, mkVanillaGlobalWithInfo )
-import GHC.Types.Id.Info ( vanillaIdInfo, setCafInfo, CafInfo(NoCafRefs) )
-import GHC.Types.Name
+import GHC.Builtin.Uniques (mkPrimOpIdUnique, mkPrimOpWrapperUnique )
 import GHC.Builtin.Names ( gHC_PRIMOPWRAPPERS )
+
 import GHC.Core.TyCon    ( TyCon, isPrimTyCon, PrimRep(..) )
 import GHC.Core.Type
-import GHC.Types.RepType ( typePrimRep1, tyConPrimRep1 )
-import GHC.Types.Basic   ( Arity, Fixity(..), FixityDirection(..), Boxity(..),
-                           SourceText(..) )
+
+import GHC.Cmm.Type
+
+import GHC.Types.Demand
+import GHC.Types.Id
+import GHC.Types.Id.Info
+import GHC.Types.Name
+import GHC.Types.RepType ( tyConPrimRep1 )
+import GHC.Types.Basic
+import GHC.Types.Fixity  ( Fixity(..), FixityDirection(..) )
 import GHC.Types.SrcLoc  ( wiredInSrcSpan )
 import GHC.Types.ForeignCall ( CLabelString )
-import GHC.Types.Unique  ( Unique, mkPrimOpIdUnique, mkPrimOpWrapperUnique )
-import GHC.Unit          ( Unit )
+import GHC.Types.SourceText  ( SourceText(..) )
+import GHC.Types.Unique  ( Unique)
+
+import GHC.Unit.Types    ( Unit )
+
 import GHC.Utils.Outputable
+
 import GHC.Data.FastString
 
 {-
@@ -102,36 +108,20 @@ tagToEnumKey = mkPrimOpIdUnique (primOpTag TagToEnumOp)
 \subsection[PrimOp-info]{The essential info about each @PrimOp@}
 *                                                                      *
 ************************************************************************
-
-The @String@ in the @PrimOpInfos@ is the ``base name'' by which the user may
-refer to the primitive operation.  The conventional \tr{#}-for-
-unboxed ops is added on later.
-
-The reason for the funny characters in the names is so we do not
-interfere with the programmer's Haskell name spaces.
-
-We use @PrimKinds@ for the ``type'' information, because they're
-(slightly) more convenient to use than @TyCons@.
 -}
 
 data PrimOpInfo
-  = Dyadic      OccName         -- string :: T -> T -> T
-                Type
-  | Monadic     OccName         -- string :: T -> T
-                Type
-  | Compare     OccName         -- string :: T -> T -> Int#
+  = Compare     OccName         -- string :: T -> T -> Int#
                 Type
   | GenPrimOp   OccName         -- string :: \/a1..an . T1 -> .. -> Tk -> T
-                [TyVar]
+                [TyVarBinder]
                 [Type]
                 Type
 
-mkDyadic, mkMonadic, mkCompare :: FastString -> Type -> PrimOpInfo
-mkDyadic str  ty = Dyadic  (mkVarOccFS str) ty
-mkMonadic str ty = Monadic (mkVarOccFS str) ty
+mkCompare :: FastString -> Type -> PrimOpInfo
 mkCompare str ty = Compare (mkVarOccFS str) ty
 
-mkGenPrimOp :: FastString -> [TyVar] -> [Type] -> Type -> PrimOpInfo
+mkGenPrimOp :: FastString -> [TyVarBinder] -> [Type] -> Type -> PrimOpInfo
 mkGenPrimOp str tvs tys ty = GenPrimOp (mkVarOccFS str) tvs tys ty
 
 {-
@@ -144,8 +134,8 @@ mkGenPrimOp str tvs tys ty = GenPrimOp (mkVarOccFS str) tvs tys ty
 Not all primops are strict!
 -}
 
-primOpStrictness :: PrimOp -> Arity -> StrictSig
-        -- See Demand.StrictnessInfo for discussion of what the results
+primOpStrictness :: PrimOp -> Arity -> DmdSig
+        -- See Demand.DmdSig for discussion of what the results
         -- The arity should be the arity of the primop; that's why
         -- this function isn't exported.
 #include "primop-strictness.hs-incl"
@@ -346,16 +336,18 @@ Both can_fail and has_side_effects mean that the primop has
 some effect that is not captured entirely by its result value.
 
 ----------  has_side_effects ---------------------
-A primop "has_side_effects" if it has some *write* effect, visible
-elsewhere
-    - writing to the world (I/O)
-    - writing to a mutable data structure (writeIORef)
+A primop "has_side_effects" if it has some side effect, visible
+elsewhere, apart from the result it returns
+    - reading or writing to the world (I/O)
+    - reading or writing to a mutable data structure (writeIORef)
     - throwing a synchronous Haskell exception
 
 Often such primops have a type like
    State -> input -> (State, output)
-so the state token guarantees ordering.  In general we rely *only* on
-data dependencies of the state token to enforce write-effect ordering
+so the state token guarantees ordering.  In general we rely on
+data dependencies of the state token to enforce write-effect ordering,
+but as the notes below make clear, the matter is a bit more complicated
+than that.
 
  * NB1: if you inline unsafePerformIO, you may end up with
    side-effecting ops whose 'state' output is discarded.
@@ -368,10 +360,20 @@ data dependencies of the state token to enforce write-effect ordering
    "can_fail".  We must be careful about not discarding such things;
    see the paper "A semantics for imprecise exceptions".
 
- * NB3: *Read* effects (like reading an IORef) don't count here,
-   because it doesn't matter if we don't do them, or do them more than
-   once.  *Sequencing* is maintained by the data dependency of the state
-   token.
+ * NB3: *Read* effects on *mutable* cells (like reading an IORef or a
+   MutableArray#) /are/ included.  You may find this surprising because it
+   doesn't matter if we don't do them, or do them more than once.  *Sequencing*
+   is maintained by the data dependency of the state token.  But see
+   "Duplication" below under
+   Note [Transformations affected by can_fail and has_side_effects]
+
+   Note that read operations on *immutable* values (like indexArray#) do not
+   have has_side_effects.   (They might be marked can_fail, however, because
+   you might index out of bounds.)
+
+   Using has_side_effects in this way is a bit of a blunt instrument.  We could
+   be more refined by splitting read and write effects (see comments with #3207
+   and #20195)
 
 ----------  can_fail ----------------------------
 A primop "can_fail" if it can fail with an *unchecked* exception on
@@ -470,7 +472,7 @@ Note [Implementation: how can_fail/has_side_effects affect transformations]
 How do we ensure that floating/duplication/discarding are done right
 in the simplifier?
 
-Two main predicates on primpops test these flags:
+Two main predicates on primops test these flags:
   primOpOkForSideEffects <=> not has_side_effects
   primOpOkForSpeculation <=> not (has_side_effects || can_fail)
 
@@ -539,6 +541,51 @@ primOpIsCheap op = primOpOkForSpeculation op
 -- that (it's exprIsDupable that does) so the problem doesn't occur
 -- even if primOpIsCheap sometimes says 'True'.
 
+
+-- | True of dyadic operators that can fail only if the second arg is zero!
+--
+-- This function probably belongs in an automagically generated file.. but it's
+-- such a special case I thought I'd leave it here for now.
+primOpIsDiv :: PrimOp -> Bool
+primOpIsDiv op = case op of
+
+  -- TODO: quotRemWord2, Int64, Word64
+  IntQuotOp       -> True
+  Int8QuotOp      -> True
+  Int16QuotOp     -> True
+  Int32QuotOp     -> True
+
+  IntRemOp        -> True
+  Int8RemOp       -> True
+  Int16RemOp      -> True
+  Int32RemOp      -> True
+
+  IntQuotRemOp    -> True
+  Int8QuotRemOp   -> True
+  Int16QuotRemOp  -> True
+  Int32QuotRemOp  -> True
+
+  WordQuotOp      -> True
+  Word8QuotOp     -> True
+  Word16QuotOp    -> True
+  Word32QuotOp    -> True
+
+  WordRemOp       -> True
+  Word8RemOp      -> True
+  Word16RemOp     -> True
+  Word32RemOp     -> True
+
+  WordQuotRemOp   -> True
+  Word8QuotRemOp  -> True
+  Word16QuotRemOp -> True
+  Word32QuotRemOp -> True
+
+  FloatDivOp      -> True
+  DoubleDivOp     -> True
+  _               -> False
+
+
+
 {-
 ************************************************************************
 *                                                                      *
@@ -574,25 +621,19 @@ primOpCodeSizeForeignCall = 4
 primOpType :: PrimOp -> Type  -- you may want to use primOpSig instead
 primOpType op
   = case primOpInfo op of
-    Dyadic  _occ ty -> dyadic_fun_ty ty
-    Monadic _occ ty -> monadic_fun_ty ty
     Compare _occ ty -> compare_fun_ty ty
 
     GenPrimOp _occ tyvars arg_tys res_ty ->
-        mkSpecForAllTys tyvars (mkVisFunTysMany arg_tys res_ty)
+        mkForAllTys tyvars (mkVisFunTysMany arg_tys res_ty)
 
 primOpResultType :: PrimOp -> Type
 primOpResultType op
   = case primOpInfo op of
-    Dyadic  _occ ty  -> ty
-    Monadic _occ ty  -> ty
     Compare _occ _ty -> intPrimTy
     GenPrimOp _occ _tyvars _arg_tys res_ty -> res_ty
 
 primOpOcc :: PrimOp -> OccName
 primOpOcc op = case primOpInfo op of
-               Dyadic    occ _     -> occ
-               Monadic   occ _     -> occ
                Compare   occ _     -> occ
                GenPrimOp occ _ _ _ -> occ
 
@@ -612,14 +653,13 @@ have:
     plusInt# a b = P.plusInt# a b
 
 The Id for the wrapper of a primop can be found using
-'GHC.Builtin.PrimOp.primOpWrapperId'. However, GHCi does not use this mechanism
+'GHC.Builtin.PrimOps.primOpWrapperId'. However, GHCi does not use this mechanism
 to link primops; it rather does a rather hacky symbol lookup (see
 GHC.ByteCode.Linker.primopToCLabel). TODO: Perhaps this should be changed?
 
-Note that these wrappers aren't *quite*
-as expressive as their unwrapped breathern in that they may exhibit less levity
-polymorphism. For instance, consider the case of mkWeakNoFinalizer# which has
-type:
+Note that these wrappers aren't *quite* as expressive as their unwrapped
+breathren, in that they may exhibit less representation polymorphism.
+For instance, consider the case of mkWeakNoFinalizer#, which has type:
 
     mkWeakNoFinalizer# :: forall (r :: RuntimeRep) (k :: TYPE r) (v :: Type).
                           k -> v
@@ -631,10 +671,10 @@ Naively we could generate a wrapper of the form,
 
     mkWeakNoFinalizer# k v s = GHC.Prim.mkWeakNoFinalizer# k v s
 
-However, this would require that 'k' bind the levity-polymorphic key,
-which is disallowed by our levity polymorphism validity checks (see Note
-[Levity polymorphism invariants] in GHC.Core). Consequently, we give the
-wrapper the simpler, less polymorphic type
+However, this would require that 'k' bind the representation-polymorphic key,
+which is disallowed by our representation polymorphism validity checks
+(see Note [Representation polymorphism invariants] in GHC.Core).
+Consequently, we give the wrapper the simpler, less polymorphic type
 
     mkWeakNoFinalizer# :: forall (k :: Type) (v :: Type).
                           k -> v
@@ -642,8 +682,8 @@ wrapper the simpler, less polymorphic type
                        -> (# State# RealWorld, Weak# v #)
 
 This simplification tends to be good enough for GHCi uses given that there are
-few levity polymorphic primops and we do little simplification on interpreted
-code anyways.
+few representation-polymorphic primops, and we do little simplification
+on interpreted code anyways.
 
 TODO: This behavior is actually wrong; a program becomes ill-typed upon
 replacing a real primop occurrence with one of its wrapper due to the fact that
@@ -654,9 +694,10 @@ Note [Eta expanding primops]
 
 STG requires that primop applications be saturated. This makes code generation
 significantly simpler since otherwise we would need to define a calling
-convention for curried applications that can accomodate levity polymorphism.
+convention for curried applications that can accommodate representation
+polymorphism.
 
-To ensure saturation, CorePrep eta expands expand all primop applications as
+To ensure saturation, CorePrep eta expands all primop applications as
 described in Note [Eta expansion of hasNoBinding things in CorePrep] in
 GHC.Core.Prep.
 
@@ -691,22 +732,20 @@ primOpWrapperId op = mkVanillaGlobalWithInfo name ty info
 
 isComparisonPrimOp :: PrimOp -> Bool
 isComparisonPrimOp op = case primOpInfo op of
-                          Compare {} -> True
-                          _          -> False
+                          Compare {}   -> True
+                          GenPrimOp {} -> False
 
 -- primOpSig is like primOpType but gives the result split apart:
 -- (type variables, argument types, result type)
 -- It also gives arity, strictness info
 
-primOpSig :: PrimOp -> ([TyVar], [Type], Type, Arity, StrictSig)
+primOpSig :: PrimOp -> ([TyVarBinder], [Type], Type, Arity, DmdSig)
 primOpSig op
   = (tyvars, arg_tys, res_ty, arity, primOpStrictness op arity)
   where
     arity = length arg_tys
     (tyvars, arg_tys, res_ty)
       = case (primOpInfo op) of
-        Monadic   _occ ty                    -> ([],     [ty],    ty       )
-        Dyadic    _occ ty                    -> ([],     [ty,ty], ty       )
         Compare   _occ ty                    -> ([],     [ty,ty], intPrimTy)
         GenPrimOp _occ tyvars arg_tys res_ty -> (tyvars, arg_tys, res_ty   )
 
@@ -721,8 +760,6 @@ data PrimOpResultInfo
 getPrimOpResultInfo :: PrimOp -> PrimOpResultInfo
 getPrimOpResultInfo op
   = case (primOpInfo op) of
-      Dyadic  _ ty                        -> ReturnsPrim (typePrimRep1 ty)
-      Monadic _ ty                        -> ReturnsPrim (typePrimRep1 ty)
       Compare _ _                         -> ReturnsPrim (tyConPrimRep1 intPrimTyCon)
       GenPrimOp _ _ _ ty | isPrimTyCon tc -> ReturnsPrim (tyConPrimRep1 tc)
                          | otherwise      -> ReturnsAlg tc
@@ -746,9 +783,7 @@ commutableOp :: PrimOp -> Bool
 
 -- Utils:
 
-dyadic_fun_ty, monadic_fun_ty, compare_fun_ty :: Type -> Type
-dyadic_fun_ty  ty = mkVisFunTysMany [ty, ty] ty
-monadic_fun_ty ty = mkVisFunTyMany  ty ty
+compare_fun_ty :: Type -> Type
 compare_fun_ty ty = mkVisFunTysMany [ty, ty] intPrimTy
 
 -- Output stuff:

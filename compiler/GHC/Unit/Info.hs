@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, RecordWildCards, FlexibleInstances, MultiParamTypeClasses #-}
+{-# LANGUAGE RecordWildCards, FlexibleInstances, MultiParamTypeClasses #-}
 
 -- | Info about installed units (compiled libraries)
 module GHC.Unit.Info
@@ -19,22 +19,38 @@ module GHC.Unit.Info
    , unitPackageNameString
    , unitPackageIdString
    , pprUnitInfo
+
+   , collectIncludeDirs
+   , collectExtraCcOpts
+   , collectLibraryDirs
+   , collectFrameworks
+   , collectFrameworksDirs
+   , unitHsLibs
    )
 where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
+import GHC.Platform.Ways
 
-import GHC.Unit.Database
-import Data.Version
-import Data.Bifunctor
+import GHC.Utils.Misc
+import GHC.Utils.Outputable
+import GHC.Utils.Panic
+
+import GHC.Types.Unique
 
 import GHC.Data.FastString
-import GHC.Utils.Outputable
+import qualified GHC.Data.ShortText as ST
+
 import GHC.Unit.Module as Module
-import GHC.Types.Unique
 import GHC.Unit.Ppr
+import GHC.Unit.Database
+
+import GHC.Settings
+
+import Data.Version
+import Data.Bifunctor
+import Data.List (isPrefixOf, stripPrefix)
+
 
 -- | Information about an installed unit
 --
@@ -43,14 +59,8 @@ import GHC.Unit.Ppr
 --    * UnitId: identifier used to generate code (cf 'UnitInfo')
 --
 -- These two identifiers are different for wired-in packages. See Note [About
--- Units] in "GHC.Unit"
-type GenUnitInfo unit = GenericUnitInfo (Indefinite unit) PackageId PackageName unit ModuleName (GenModule (GenUnit unit))
-
--- | A unit key in the database
-newtype UnitKey = UnitKey FastString
-
-unitKeyFS :: UnitKey -> FastString
-unitKeyFS (UnitKey fs) = fs
+-- units] in "GHC.Unit"
+type GenUnitInfo unit = GenericUnitInfo PackageId PackageName unit ModuleName (GenModule (GenUnit unit))
 
 -- | Information about an installed unit (units are identified by their database
 -- UnitKey)
@@ -64,7 +74,6 @@ type UnitInfo    = GenUnitInfo UnitId
 mkUnitKeyInfo :: DbUnitInfo -> UnitKeyInfo
 mkUnitKeyInfo = mapGenericUnitInfo
    mkUnitKey'
-   mkIndefUnitKey'
    mkPackageIdentifier'
    mkPackageName'
    mkModuleName'
@@ -74,33 +83,27 @@ mkUnitKeyInfo = mapGenericUnitInfo
      mkPackageName'       = PackageName    . mkFastStringByteString
      mkUnitKey'           = UnitKey        . mkFastStringByteString
      mkModuleName'        = mkModuleNameFS . mkFastStringByteString
-     mkIndefUnitKey' cid  = Indefinite (mkUnitKey' cid) Nothing
      mkVirtUnitKey' i = case i of
-      DbInstUnitId cid insts -> mkGenVirtUnit unitKeyFS (mkIndefUnitKey' cid) (fmap (bimap mkModuleName' mkModule') insts)
+      DbInstUnitId cid insts -> mkVirtUnit (mkUnitKey' cid) (fmap (bimap mkModuleName' mkModule') insts)
       DbUnitId uid           -> RealUnit (Definite (mkUnitKey' uid))
      mkModule' m = case m of
        DbModule uid n -> mkModule (mkVirtUnitKey' uid) (mkModuleName' n)
        DbModuleVar  n -> mkHoleModule (mkModuleName' n)
 
 -- | Map over the unit parameter
-mapUnitInfo :: (u -> v) -> (v -> FastString) -> GenUnitInfo u -> GenUnitInfo v
-mapUnitInfo f gunitFS = mapGenericUnitInfo
+mapUnitInfo :: IsUnitId v => (u -> v) -> GenUnitInfo u -> GenUnitInfo v
+mapUnitInfo f = mapGenericUnitInfo
    f         -- unit identifier
-   (fmap f)  -- indefinite unit identifier
    id        -- package identifier
    id        -- package name
    id        -- module name
-   (fmap (mapGenUnit f gunitFS)) -- instantiating modules
+   (fmap (mapGenUnit f)) -- instantiating modules
 
--- TODO: there's no need for these to be FastString, as we don't need the uniq
---       feature, but ghc doesn't currently have convenient support for any
---       other compact string types, e.g. plain ByteString or Text.
-
-newtype PackageId   = PackageId    FastString deriving (Eq, Ord)
+newtype PackageId   = PackageId    FastString deriving (Eq)
 newtype PackageName = PackageName
    { unPackageName :: FastString
    }
-   deriving (Eq, Ord)
+   deriving (Eq)
 
 instance Uniquable PackageId where
   getUnique (PackageId n) = getUnique n
@@ -134,21 +137,21 @@ pprUnitInfo GenericUnitInfo {..} =
       field "exposed-modules"      (ppr unitExposedModules),
       field "hidden-modules"       (fsep (map ppr unitHiddenModules)),
       field "trusted"              (ppr unitIsTrusted),
-      field "import-dirs"          (fsep (map text unitImportDirs)),
-      field "library-dirs"         (fsep (map text unitLibraryDirs)),
-      field "dynamic-library-dirs" (fsep (map text unitLibraryDynDirs)),
-      field "hs-libraries"         (fsep (map text unitLibraries)),
-      field "extra-libraries"      (fsep (map text unitExtDepLibsSys)),
-      field "extra-ghci-libraries" (fsep (map text unitExtDepLibsGhc)),
-      field "include-dirs"         (fsep (map text unitIncludeDirs)),
-      field "includes"             (fsep (map text unitIncludes)),
+      field "import-dirs"          (fsep (map (text . ST.unpack) unitImportDirs)),
+      field "library-dirs"         (fsep (map (text . ST.unpack) unitLibraryDirs)),
+      field "dynamic-library-dirs" (fsep (map (text . ST.unpack) unitLibraryDynDirs)),
+      field "hs-libraries"         (fsep (map (text . ST.unpack) unitLibraries)),
+      field "extra-libraries"      (fsep (map (text . ST.unpack) unitExtDepLibsSys)),
+      field "extra-ghci-libraries" (fsep (map (text . ST.unpack) unitExtDepLibsGhc)),
+      field "include-dirs"         (fsep (map (text . ST.unpack) unitIncludeDirs)),
+      field "includes"             (fsep (map (text . ST.unpack) unitIncludes)),
       field "depends"              (fsep (map ppr  unitDepends)),
-      field "cc-options"           (fsep (map text unitCcOptions)),
-      field "ld-options"           (fsep (map text unitLinkerOptions)),
-      field "framework-dirs"       (fsep (map text unitExtDepFrameworkDirs)),
-      field "frameworks"           (fsep (map text unitExtDepFrameworks)),
-      field "haddock-interfaces"   (fsep (map text unitHaddockInterfaces)),
-      field "haddock-html"         (fsep (map text unitHaddockHTMLs))
+      field "cc-options"           (fsep (map (text . ST.unpack) unitCcOptions)),
+      field "ld-options"           (fsep (map (text . ST.unpack) unitLinkerOptions)),
+      field "framework-dirs"       (fsep (map (text . ST.unpack) unitExtDepFrameworkDirs)),
+      field "frameworks"           (fsep (map (text . ST.unpack) unitExtDepFrameworks)),
+      field "haddock-interfaces"   (fsep (map (text . ST.unpack) unitHaddockInterfaces)),
+      field "haddock-html"         (fsep (map (text . ST.unpack) unitHaddockHTMLs))
     ]
   where
     field name body = text name <> colon <+> nest 4 body
@@ -168,8 +171,74 @@ mkUnit p
    | otherwise          = RealUnit (Definite (unitId p))
 
 -- | Create a UnitPprInfo from a UnitInfo
-mkUnitPprInfo :: GenUnitInfo u -> UnitPprInfo
-mkUnitPprInfo i = UnitPprInfo
+mkUnitPprInfo :: (u -> FastString) -> GenUnitInfo u -> UnitPprInfo
+mkUnitPprInfo ufs i = UnitPprInfo
+   (ufs (unitId i))
    (unitPackageNameString i)
    (unitPackageVersion i)
    ((unpackFS . unPackageName) <$> unitComponentName i)
+
+-- | Find all the include directories in the given units
+collectIncludeDirs :: [UnitInfo] -> [FilePath]
+collectIncludeDirs ps = map ST.unpack $ ordNub (filter (not . ST.null) (concatMap unitIncludeDirs ps))
+
+-- | Find all the C-compiler options in the given units
+collectExtraCcOpts :: [UnitInfo] -> [String]
+collectExtraCcOpts ps = map ST.unpack (concatMap unitCcOptions ps)
+
+-- | Find all the library directories in the given units for the given ways
+collectLibraryDirs :: Ways -> [UnitInfo] -> [FilePath]
+collectLibraryDirs ws = ordNub . filter notNull . concatMap (libraryDirsForWay ws)
+
+-- | Find all the frameworks in the given units
+collectFrameworks :: [UnitInfo] -> [String]
+collectFrameworks ps = map ST.unpack (concatMap unitExtDepFrameworks ps)
+
+-- | Find all the package framework paths in these and the preload packages
+collectFrameworksDirs :: [UnitInfo] -> [String]
+collectFrameworksDirs ps = map ST.unpack (ordNub (filter (not . ST.null) (concatMap unitExtDepFrameworkDirs ps)))
+
+-- | Either the 'unitLibraryDirs' or 'unitLibraryDynDirs' as appropriate for the way.
+libraryDirsForWay :: Ways -> UnitInfo -> [String]
+libraryDirsForWay ws
+  | hasWay ws WayDyn = map ST.unpack . unitLibraryDynDirs
+  | otherwise        = map ST.unpack . unitLibraryDirs
+
+unitHsLibs :: GhcNameVersion -> Ways -> UnitInfo -> [String]
+unitHsLibs namever ways0 p = map (mkDynName . addSuffix . ST.unpack) (unitLibraries p)
+  where
+        ways1 = removeWay WayDyn ways0
+        -- the name of a shared library is libHSfoo-ghc<version>.so
+        -- we leave out the _dyn, because it is superfluous
+
+        tag     = waysTag (fullWays ways1)
+        rts_tag = waysTag ways1
+
+        mkDynName x
+         | not (ways0 `hasWay` WayDyn) = x
+         | "HS" `isPrefixOf` x         = x ++ dynLibSuffix namever
+           -- For non-Haskell libraries, we use the name "Cfoo". The .a
+           -- file is libCfoo.a, and the .so is libfoo.so. That way the
+           -- linker knows what we mean for the vanilla (-lCfoo) and dyn
+           -- (-lfoo) ways. We therefore need to strip the 'C' off here.
+         | Just x' <- stripPrefix "C" x = x'
+         | otherwise
+            = panic ("Don't understand library name " ++ x)
+
+        -- Add _thr and other rts suffixes to packages named
+        -- `rts` or `rts-1.0`. Why both?  Traditionally the rts
+        -- package is called `rts` only.  However the tooling
+        -- usually expects a package name to have a version.
+        -- As such we will gradually move towards the `rts-1.0`
+        -- package name, at which point the `rts` package name
+        -- will eventually be unused.
+        --
+        -- This change elevates the need to add custom hooks
+        -- and handling specifically for the `rts` package for
+        -- example in ghc-cabal.
+        addSuffix rts@"HSrts"       = rts       ++ (expandTag rts_tag)
+        addSuffix rts@"HSrts-1.0.2" = rts       ++ (expandTag rts_tag)
+        addSuffix other_lib         = other_lib ++ (expandTag tag)
+
+        expandTag t | null t = ""
+                    | otherwise = '_':t

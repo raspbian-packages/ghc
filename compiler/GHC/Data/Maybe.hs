@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP #-}
+
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE KindSignatures #-}
@@ -16,7 +16,7 @@ module GHC.Data.Maybe (
         failME, isSuccess,
 
         orElse,
-        firstJust, firstJusts,
+        firstJust, firstJusts, firstJustsM,
         whenIsJust,
         expectJust,
         rightToMaybe,
@@ -26,12 +26,15 @@ module GHC.Data.Maybe (
     ) where
 
 import GHC.Prelude
+import GHC.IO (catchException)
 
 import Control.Monad
 import Control.Monad.Trans.Maybe
-import Control.Exception (catch, SomeException(..))
+import Control.Exception (SomeException(..))
 import Data.Maybe
+import Data.Foldable ( foldlM )
 import GHC.Utils.Misc (HasCallStack)
+import Data.List.NonEmpty ( NonEmpty )
 
 infixr 4 `orElse`
 
@@ -48,8 +51,19 @@ firstJust a b = firstJusts [a, b]
 
 -- | Takes a list of @Maybes@ and returns the first @Just@ if there is one, or
 -- @Nothing@ otherwise.
-firstJusts :: [Maybe a] -> Maybe a
+firstJusts :: Foldable f => f (Maybe a) -> Maybe a
 firstJusts = msum
+{-# SPECIALISE firstJusts :: [Maybe a] -> Maybe a #-}
+{-# SPECIALISE firstJusts :: NonEmpty (Maybe a) -> Maybe a #-}
+
+-- | Takes computations returnings @Maybes@; tries each one in order.
+-- The first one to return a @Just@ wins. Returns @Nothing@ if all computations
+-- return @Nothing@.
+firstJustsM :: (Monad m, Foldable f) => f (m (Maybe a)) -> m (Maybe a)
+firstJustsM = foldlM go Nothing where
+  go :: Monad m => Maybe a -> m (Maybe a) -> m (Maybe a)
+  go Nothing         action  = action
+  go result@(Just _) _action = return result
 
 expectJust :: HasCallStack => String -> Maybe a -> a
 {-# INLINE expectJust #-}
@@ -83,7 +97,7 @@ liftMaybeT act = MaybeT $ Just `liftM` act
 
 -- | Try performing an 'IO' action, failing on error.
 tryMaybeT :: IO a -> MaybeT IO a
-tryMaybeT action = MaybeT $ catch (Just `fmap` action) handler
+tryMaybeT action = MaybeT $ catchException (Just `fmap` action) handler
   where
     handler (SomeException _) = return Nothing
 

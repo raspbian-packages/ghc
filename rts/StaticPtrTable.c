@@ -8,8 +8,8 @@
  *
  */
 
-#include "StaticPtrTable.h"
 #include "Rts.h"
+#include "StaticPtrTable.h"
 #include "RtsUtils.h"
 #include "Hash.h"
 #include "StablePtr.h"
@@ -99,11 +99,11 @@ int hs_spt_keys(StgPtr keys[], int szKeys) {
     return 0;
 }
 
-int hs_spt_key_count() {
+int hs_spt_key_count(void) {
   return spt ? keyCountHashTable(spt) : 0;
 }
 
-void exitStaticPtrTable() {
+void exitStaticPtrTable(void) {
   if (spt) {
     freeHashTable(spt, freeSptEntry);
     spt = NULL;

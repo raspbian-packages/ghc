@@ -18,12 +18,15 @@ import GHC.CmmToAsm.Reg.Linear.FreeRegs
 import GHC.CmmToAsm.Reg.Liveness
 import GHC.CmmToAsm.Instr
 import GHC.CmmToAsm.Config
+import GHC.CmmToAsm.Types
+
 import GHC.Platform.Reg
 
 import GHC.Cmm.BlockId
 import GHC.Cmm.Dataflow.Collections
 import GHC.Data.Graph.Directed
-import GHC.Utils.Outputable
+import GHC.Utils.Panic
+import GHC.Utils.Monad (concatMapM)
 import GHC.Types.Unique
 import GHC.Types.Unique.FM
 import GHC.Types.Unique.Set
@@ -32,7 +35,7 @@ import GHC.Types.Unique.Set
 --      vregs are in the correct regs for its destination.
 --
 joinToTargets
-        :: (FR freeRegs, Instruction instr, Outputable instr)
+        :: (FR freeRegs, Instruction instr)
         => BlockMap RegSet              -- ^ maps the unique of the blockid to the set of vregs
                                         --      that are known to be live on the entry to each block.
 
@@ -56,7 +59,7 @@ joinToTargets block_live id instr
 
 -----
 joinToTargets'
-        :: (FR freeRegs, Instruction instr, Outputable instr)
+        :: (FR freeRegs, Instruction instr)
         => BlockMap RegSet              -- ^ maps the unique of the blockid to the set of vregs
                                         --      that are known to be live on the entry to each block.
 
@@ -110,7 +113,7 @@ joinToTargets' block_live new_blocks block_id instr (dest:dests)
 
 
 -- this is the first time we jumped to this block.
-joinToTargets_first :: (FR freeRegs, Instruction instr, Outputable instr)
+joinToTargets_first :: (FR freeRegs, Instruction instr)
                     => BlockMap RegSet
                     -> [NatBasicBlock instr]
                     -> BlockId
@@ -139,7 +142,7 @@ joinToTargets_first block_live new_blocks block_id instr dest dests
 
 
 -- we've jumped to this block before
-joinToTargets_again :: (Instruction instr, FR freeRegs, Outputable instr)
+joinToTargets_again :: (Instruction instr, FR freeRegs)
                     => BlockMap RegSet
                     -> [NatBasicBlock instr]
                     -> BlockId
@@ -304,7 +307,7 @@ handleComponent
 --      go via a spill slot.
 --
 handleComponent delta _  (AcyclicSCC (DigraphNode vreg src dsts))
-        = mapM (makeMove delta vreg src) dsts
+        = concatMapM (makeMove delta vreg src) dsts
 
 
 -- Handle some cyclic moves.
@@ -338,7 +341,7 @@ handleComponent delta instr
 
         -- make sure to do all the reloads after all the spills,
         --      so we don't end up clobbering the source values.
-        return ([instrSpill] ++ concat remainingFixUps ++ [instrLoad])
+        return (instrSpill ++ concat remainingFixUps ++ instrLoad)
 
 handleComponent _ _ (CyclicSCC _)
  = panic "Register Allocator: handleComponent cyclic"
@@ -352,7 +355,7 @@ makeMove
     -> Unique   -- ^ unique of the vreg that we're moving.
     -> Loc      -- ^ source location.
     -> Loc      -- ^ destination location.
-    -> RegM freeRegs instr  -- ^ move instruction.
+    -> RegM freeRegs [instr]  -- ^ move instruction.
 
 makeMove delta vreg src dst
  = do config <- getConfig
@@ -361,7 +364,7 @@ makeMove delta vreg src dst
       case (src, dst) of
           (InReg s, InReg d) ->
               do recordSpill (SpillJoinRR vreg)
-                 return $ mkRegRegMoveInstr platform (RegReal s) (RegReal d)
+                 return $ [mkRegRegMoveInstr platform (RegReal s) (RegReal d)]
           (InMem s, InReg d) ->
               do recordSpill (SpillJoinRM vreg)
                  return $ mkLoadInstr config (RegReal d) delta s
@@ -375,4 +378,3 @@ makeMove delta vreg src dst
               panic ("makeMove " ++ show vreg ++ " (" ++ show src ++ ") ("
                   ++ show dst ++ ")"
                   ++ " we don't handle mem->mem moves.")
-

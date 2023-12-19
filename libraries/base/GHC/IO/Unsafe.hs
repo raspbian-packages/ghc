@@ -27,8 +27,9 @@ module GHC.IO.Unsafe (
 
 import GHC.Base
 
-{- Note [unsafePerformIO and strictness]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+{-
+Note [unsafePerformIO and strictness]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Consider this sub-expression (from tests/lib/should_run/memo002)
 
  unsafePerformIO (do { lockMemoTable
@@ -40,7 +41,7 @@ Consider this sub-expression (from tests/lib/should_run/memo002)
 It's super-important that the `let r = f x` is lazy. If the demand
 analyser sees that `r` is sure to be demanded, it'll use call-by-value
 for (f x), that will try to lock the already-locked table => deadlock.
-See #19181.
+See #19181 and #19413.
 
 Now `r` doesn't look strict, because it's wrapped in a `return`.
 But if we were to define unsafePerformIO like this
@@ -117,6 +118,10 @@ monadic use of references.  There is no easy way to make it impossible
 once you use 'unsafePerformIO'.  Indeed, it is
 possible to write @coerce :: a -> b@ with the
 help of 'unsafePerformIO'.  So be careful!
+
+WARNING: If you're looking for "a way to get a 'String' from an 'IO String'",
+then 'unsafePerformIO' is not the way to go.  Learn about do-notation and the
+@<-@ syntax element before you proceed.
 -}
 unsafePerformIO :: IO a -> a
 unsafePerformIO m = unsafeDupablePerformIO (noDuplicate >> m)

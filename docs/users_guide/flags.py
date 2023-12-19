@@ -50,8 +50,8 @@ import sphinx
 from sphinx import addnodes
 from sphinx.domains.std import GenericObject
 from sphinx.errors import SphinxError
-from distutils.version import LooseVersion
-from utils import build_table_from_list
+
+from utils import build_table_from_list, parse_version
 
 import os.path
 
@@ -64,6 +64,7 @@ categories = {
     'coverage': 'Program coverage',
     'cpp': 'C pre-processor',
     'debugging': 'Debugging the compiler',
+    'extended-interface-files': 'Extended interface files',
     'interactive': 'Interactive mode',
     'interface-files': 'Interface files',
     'keep-intermediates': 'Keeping intermediate files',
@@ -256,7 +257,7 @@ class LanguageExtension(GenericFlag):
     @staticmethod
     def _noname(name):
         # We check isupper() so that NondecreasingIndentation
-        # is not counted as "No-decreasingIndentation"
+        # is not counted as "No-ndecreasingIndentation"
         if name[:2] == "No" and name[2].isupper():
           return name[2:]
         else:
@@ -627,8 +628,8 @@ def purge_flags(app, env, docname):
 
 def setup(app):
     # The override argument to add_directive_to_domain is only supported by >= 1.8
-    sphinx_version = LooseVersion(sphinx.__version__)
-    override_arg = {'override': True} if sphinx_version >= LooseVersion('1.8') else {}
+    sphinx_version = parse_version(sphinx.__version__)
+    override_arg = {'override': True} if sphinx_version >= parse_version('1.8') else {}
 
     # Add ghc-flag directive, and override the class with our own
     app.add_object_type('ghc-flag', 'ghc-flag')

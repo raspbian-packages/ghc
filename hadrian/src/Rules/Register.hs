@@ -9,6 +9,7 @@ import Expression ( getContextData )
 import Hadrian.BuildPath
 import Hadrian.Expression
 import Hadrian.Haskell.Cabal
+import Oracles.Flag (platformSupportsGhciObjects)
 import Packages
 import Rules.Rts
 import {-# SOURCE #-} Rules.Library (needLibrary)
@@ -90,7 +91,12 @@ registerPackageRules rs stage = do
     root <- buildRootRules
 
     -- Initialise the package database.
-    root -/- relativePackageDbPath stage -/- packageDbStamp %> \stamp ->
+    root -/- relativePackageDbPath stage -/- packageDbStamp %> \stamp -> do
+        -- This command initialises the package.cache file to avoid a race where
+        -- a package gets registered but there's not a package.cache file (which
+        -- leads to errors in GHC).
+        buildWithResources rs $
+            target (Context stage compiler vanilla) (GhcPkg Init stage) [] []
         writeFileLines stamp []
 
     -- Register a package.
@@ -102,11 +108,12 @@ registerPackageRules rs stage = do
 
         when (pkg == compiler) $ need =<< ghcLibDeps stage
 
-        isBoot <- (pkg `notElem`) <$> stagePackages Stage0
+        -- Only used in guard when Stage0 {} but can be GlobalLibs or InTreeLibs
+        isBoot <- (pkg `notElem`) <$> stagePackages stage
 
         let ctx = Context stage pkg vanilla
         case stage of
-            Stage0 | isBoot -> copyConf  rs ctx conf
+            Stage0 _ | isBoot -> copyConf  rs ctx conf
             _               -> buildConf rs ctx conf
 
 buildConf :: [(Resource, Int)] -> Context -> FilePath -> Action ()
@@ -125,10 +132,12 @@ buildConf _ context@Context {..} _conf = do
     when (package == rts) $
         -- If Cabal knew about "generated-headers", we could read them from the
         -- 'configuredCabal' information, and just "need" them here.
-        need [ path -/- "DerivedConstants.h"
-             , path -/- "ghcautoconf.h"
-             , path -/- "ghcplatform.h"
-             , path -/- "ghcversion.h" ]
+        need [ path -/- "include/DerivedConstants.h"
+             , path -/- "include/ghcautoconf.h"
+             , path -/- "include/ghcplatform.h"
+             , path -/- "include/rts/EventLogConstants.h"
+             , path -/- "include/rts/EventTypes.h"
+             ]
 
     -- we need to generate this file for GMP
     when (package == ghcBignum) $ do
@@ -199,12 +208,14 @@ extraTargets context
 -- | Given a library 'Package' this action computes all of its targets. Needing
 -- all the targets should build the library such that it is ready to be
 -- registered into the package database.
--- See 'packageTargets' for the explanation of the @includeGhciLib@ parameter.
+-- See 'Rules.packageTargets' for the explanation of the @includeGhciLib@
+-- parameter.
 libraryTargets :: Bool -> Context -> Action [FilePath]
 libraryTargets includeGhciLib context@Context {..} = do
     libFile  <- pkgLibraryFile     context
     ghciLib  <- pkgGhciLibraryFile context
-    ghci     <- if includeGhciLib && not (wayUnit Dynamic way)
+    ghciObjsSupported <- platformSupportsGhciObjects
+    ghci     <- if ghciObjsSupported && includeGhciLib && not (wayUnit Dynamic way)
                 then interpretInContext context $ getContextData buildGhciLib
                 else return False
     extra    <- extraTargets context

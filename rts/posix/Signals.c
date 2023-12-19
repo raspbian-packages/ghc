@@ -6,12 +6,13 @@
  *
  * ---------------------------------------------------------------------------*/
 
-#include "PosixSource.h"
+#include "rts/PosixSource.h"
 #include "Rts.h"
 
 #include "Schedule.h"
 #include "RtsSignals.h"
 #include "Signals.h"
+#include "IOManager.h"
 #include "RtsUtils.h"
 #include "Prelude.h"
 #include "Ticker.h"
@@ -201,12 +202,12 @@ ioManagerDie (void)
 
     {
         // Shut down IO managers
-        for (i=0; i < n_capabilities; i++) {
-            const int fd = RELAXED_LOAD(&capabilities[i]->io_manager_control_wr_fd);
+        for (i=0; i < getNumCapabilities(); i++) {
+            const int fd = RELAXED_LOAD(&getCapability(i)->io_manager_control_wr_fd);
             if (0 <= fd) {
                 r = write(fd, &byte, 1);
                 if (r == -1) { sysErrorBelch("ioManagerDie: write"); }
-                RELAXED_STORE(&capabilities[i]->io_manager_control_wr_fd, -1);
+                RELAXED_STORE(&getCapability(i)->io_manager_control_wr_fd, -1);
             }
         }
     }
@@ -349,7 +350,7 @@ anyUserHandlers(void)
 void
 awaitUserSignals(void)
 {
-    while (!signals_pending() && sched_state == SCHED_RUNNING) {
+    while (!signals_pending() && getSchedState() == SCHED_RUNNING) {
         pause();
     }
 }
@@ -520,7 +521,7 @@ shutdown_handler(int sig STG_UNUSED)
     // If we're already trying to interrupt the RTS, terminate with
     // extreme prejudice.  So the first ^C tries to exit the program
     // cleanly, and the second one just kills it.
-    if (sched_state >= SCHED_INTERRUPTING) {
+    if (getSchedState() >= SCHED_INTERRUPTING) {
         stg_exit(EXIT_INTERRUPTED);
     } else {
         interruptStgRts();
@@ -680,14 +681,10 @@ initDefaultHandlers(void)
     // install the SIGINT handler
     action.sa_handler = shutdown_handler;
     sigemptyset(&action.sa_mask);
-    action.sa_flags = 0;
+    action.sa_flags = 0; // disable SA_RESTART
     if (sigaction(SIGINT, &action, &oact) != 0) {
         sysErrorBelch("warning: failed to install SIGINT handler");
     }
-
-#if defined(HAVE_SIGINTERRUPT)
-    siginterrupt(SIGINT, 1);    // isn't this the default? --SDM
-#endif
 
     // install the SIGFPE handler
 

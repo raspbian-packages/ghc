@@ -17,7 +17,6 @@ static ObjectCode *loading_obj = NULL;
 /*
  * Note [Tracking foreign exports]
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
- *
  * Foreign exports are garbage collection roots. That is, things (e.g. CAFs)
  * depended upon by a module's `foreign export`s need to be kept alive for as
  * long an module is loaded. To ensure this we create a stable pointer to each
@@ -84,7 +83,7 @@ void foreignExportsLoadingObject(ObjectCode *oc)
     loading_obj = oc;
 }
 
-void foreignExportsFinishedLoadingObject()
+void foreignExportsFinishedLoadingObject(void)
 {
     ASSERT(loading_obj != NULL);
     loading_obj = NULL;
@@ -93,7 +92,7 @@ void foreignExportsFinishedLoadingObject()
 
 /* Caller must own linker_mutex so that we can safely modify
  * oc->stable_ptrs. */
-void processForeignExports()
+void processForeignExports(void)
 {
     while (pending) {
         struct ForeignExportsList *cur = pending;

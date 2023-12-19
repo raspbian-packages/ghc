@@ -1,7 +1,9 @@
-{-# LANGUAGE NondecreasingIndentation #-}
-{-# LANGUAGE TypeSynonymInstances #-}
+
 {-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE NondecreasingIndentation #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TypeFamilies #-}
+
 
 -- | This is the driver for the 'ghc --backpack' mode, which
 -- is a reimplementation of the "package manager" bits of
@@ -16,44 +18,66 @@
 
 module GHC.Driver.Backpack (doBackpack) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
 -- In a separate module because it hooks into the parser.
 import GHC.Driver.Backpack.Syntax
-
-import GHC.Parser.Annotation
-import GHC hiding (Failed, Succeeded)
-import GHC.Parser
-import GHC.Parser.Lexer
+import GHC.Driver.Config.Finder (initFinderOpts)
+import GHC.Driver.Config.Parser (initParserOpts)
+import GHC.Driver.Config.Diagnostic
 import GHC.Driver.Monad
 import GHC.Driver.Session
-import GHC.Tc.Utils.Monad
-import GHC.Tc.Module
-import GHC.Unit
-import GHC.Driver.Types
-import GHC.Data.StringBuffer
-import GHC.Data.FastString
-import GHC.Utils.Error
-import GHC.Types.SrcLoc
+import GHC.Driver.Ppr
 import GHC.Driver.Main
+import GHC.Driver.Make
+import GHC.Driver.Env
+import GHC.Driver.Errors
+import GHC.Driver.Errors.Types
+
+import GHC.Parser
+import GHC.Parser.Header
+import GHC.Parser.Lexer
+import GHC.Parser.Annotation
+
+import GHC.Rename.Names
+
+import GHC hiding (Failed, Succeeded)
+import GHC.Tc.Utils.Monad
+import GHC.Iface.Recomp
+import GHC.Builtin.Names
+
+import GHC.Types.SrcLoc
+import GHC.Types.SourceError
+import GHC.Types.SourceFile
 import GHC.Types.Unique.FM
 import GHC.Types.Unique.DFM
-import GHC.Utils.Outputable
-import GHC.Data.Maybe
-import GHC.Parser.Header
-import GHC.Iface.Recomp
-import GHC.Driver.Make
 import GHC.Types.Unique.DSet
-import GHC.Builtin.Names
-import GHC.Types.Basic hiding (SuccessFlag(..))
-import GHC.Driver.Finder
+
+import GHC.Utils.Outputable
+import GHC.Utils.Fingerprint
 import GHC.Utils.Misc
+import GHC.Utils.Panic
+import GHC.Utils.Error
+import GHC.Utils.Logger
+
+import GHC.Unit
+import GHC.Unit.Env
+import GHC.Unit.External
+import GHC.Unit.Finder
+import GHC.Unit.Module.Graph
+import GHC.Unit.Module.ModSummary
+import GHC.Unit.Home.ModInfo
+
+import GHC.Linker.Types
 
 import qualified GHC.LanguageExtensions as LangExt
 
-import GHC.Utils.Panic
+import GHC.Data.Maybe
+import GHC.Data.StringBuffer
+import GHC.Data.FastString
+import qualified GHC.Data.EnumSet as EnumSet
+import qualified GHC.Data.ShortText as ST
+
 import Data.List ( partition )
 import System.Exit
 import Control.Monad
@@ -64,6 +88,7 @@ import Data.Version
 import Data.IORef
 import Data.Map (Map)
 import qualified Data.Map as Map
+import qualified Data.Set as Set
 
 -- | Entry point to compile a Backpack file.
 doBackpack :: [FilePath] -> Ghc ()
@@ -71,23 +96,28 @@ doBackpack [src_filename] = do
     -- Apply options from file to dflags
     dflags0 <- getDynFlags
     let dflags1 = dflags0
-    src_opts <- liftIO $ getOptionsFromFile dflags1 src_filename
+    let parser_opts1 = initParserOpts dflags1
+    (p_warns, src_opts) <- liftIO $ getOptionsFromFile parser_opts1 src_filename
     (dflags, unhandled_flags, warns) <- liftIO $ parseDynamicFilePragma dflags1 src_opts
-    modifySession (\hsc_env -> hsc_env {hsc_dflags = dflags})
+    modifySession (hscSetFlags dflags)
+    logger <- getLogger -- Get the logger after having set the session flags,
+                        -- so that logger options are correctly set.
+                        -- Not doing so caused #20396.
     -- Cribbed from: preprocessFile / GHC.Driver.Pipeline
-    liftIO $ checkProcessArgsResult dflags unhandled_flags
-    liftIO $ handleFlagWarnings dflags warns
+    liftIO $ checkProcessArgsResult unhandled_flags
+    liftIO $ printOrThrowDiagnostics logger (initDiagOpts dflags) (GhcPsMessage <$> p_warns)
+    liftIO $ handleFlagWarnings logger (initDiagOpts dflags) warns
     -- TODO: Preprocessing not implemented
 
     buf <- liftIO $ hGetStringBuffer src_filename
     let loc = mkRealSrcLoc (mkFastString src_filename) 1 1 -- TODO: not great
-    case unP parseBackpack (mkPState dflags buf loc) of
-        PFailed pst -> throwErrors (getErrorMessages pst dflags)
+    case unP parseBackpack (initParserState (initParserOpts dflags) buf loc) of
+        PFailed pst -> throwErrors (GhcPsMessage <$> getPsErrorMessages pst)
         POk _ pkgname_bkp -> do
             -- OK, so we have an LHsUnit PackageName, but we want an
             -- LHsUnit HsComponentId.  So let's rename it.
-            let pkgstate = unitState dflags
-            let bkp = renameHsUnits pkgstate (bkpPackageNameMap pkgstate pkgname_bkp) pkgname_bkp
+            hsc_env <- getSession
+            let bkp = renameHsUnits (hsc_units hsc_env) (bkpPackageNameMap pkgname_bkp) pkgname_bkp
             initBkpM src_filename bkp $
                 forM_ (zip [1..] bkp) $ \(i, lunit) -> do
                     let comp_name = unLoc (hsunitName (unLoc lunit))
@@ -95,14 +125,14 @@ doBackpack [src_filename] = do
                     innerBkpM $ do
                         let (cid, insts) = computeUnitId lunit
                         if null insts
-                            then if cid == Indefinite (UnitId (fsLit "main")) Nothing
+                            then if cid == UnitId (fsLit "main")
                                     then compileExe lunit
                                     else compileUnit cid []
                             else typecheckUnit cid insts
 doBackpack _ =
     throwGhcException (CmdLineError "--backpack can only process a single file")
 
-computeUnitId :: LHsUnit HsComponentId -> (IndefUnitId, [(ModuleName, Module)])
+computeUnitId :: LHsUnit HsComponentId -> (UnitId, [(ModuleName, Module)])
 computeUnitId (L _ unit) = (cid, [ (r, mkHoleModule r) | r <- reqs ])
   where
     cid = hsComponentId (unLoc (hsunitName unit))
@@ -128,7 +158,7 @@ data SessionType
 
 -- | Create a temporary Session to do some sort of type checking or
 -- compilation.
-withBkpSession :: IndefUnitId
+withBkpSession :: UnitId
                -> [(ModuleName, Module)]
                -> [(Unit, ModRenaming)]
                -> SessionType   -- what kind of session are we doing
@@ -136,7 +166,7 @@ withBkpSession :: IndefUnitId
                -> BkpM a
 withBkpSession cid insts deps session_type do_this = do
     dflags <- getDynFlags
-    let cid_fs = unitIdFS (indefUnit cid)
+    let cid_fs = unitFS cid
         is_primary = False
         uid_str = unpackFS (mkInstantiatedUnitHash cid insts)
         cid_str = unpackFS cid_fs
@@ -153,76 +183,87 @@ withBkpSession cid insts deps session_type do_this = do
                  -- Special case when package is definite
                  , not (null insts) = sub_comp (key_base p) </> uid_str
                  | otherwise = sub_comp (key_base p)
-    withTempSession (overHscDynFlags (\dflags ->
-      -- If we're type-checking an indefinite package, we want to
-      -- turn on interface writing.  However, if the user also
-      -- explicitly passed in `-fno-code`, we DON'T want to write
-      -- interfaces unless the user also asked for `-fwrite-interface`.
-      -- See Note [-fno-code mode]
-      (case session_type of
-        -- Make sure to write interfaces when we are type-checking
-        -- indefinite packages.
-        TcSession | hscTarget dflags /= HscNothing
-                  -> flip gopt_set Opt_WriteInterface
-                  | otherwise -> id
-        CompSession -> id
-        ExeSession -> id) $
-      dflags {
-        hscTarget   = case session_type of
-                        TcSession -> HscNothing
-                        _ -> hscTarget dflags,
-        homeUnitInstantiations = insts,
-                                 -- if we don't have any instantiation, don't
-                                 -- fill `homeUnitInstanceOfId` as it makes no
-                                 -- sense (we're not instantiating anything)
-        homeUnitInstanceOfId   = if null insts then Nothing else Just cid,
-        homeUnitId =
-            case session_type of
+
+        mk_temp_env hsc_env =
+          hscUpdateFlags (\dflags -> mk_temp_dflags (hsc_units hsc_env) dflags) hsc_env
+        mk_temp_dflags unit_state dflags = dflags
+            { backend = case session_type of
+                            TcSession -> NoBackend
+                            _         -> backend dflags
+            , ghcLink = case session_type of
+                            TcSession -> NoLink
+                            _         -> ghcLink dflags
+            , homeUnitInstantiations_ = insts
+                                     -- if we don't have any instantiation, don't
+                                     -- fill `homeUnitInstanceOfId` as it makes no
+                                     -- sense (we're not instantiating anything)
+            , homeUnitInstanceOf_   = if null insts then Nothing else Just cid
+            , homeUnitId_ = case session_type of
                 TcSession -> newUnitId cid Nothing
                 -- No hash passed if no instances
                 _ | null insts -> newUnitId cid Nothing
-                  | otherwise  -> newUnitId cid (Just (mkInstantiatedUnitHash cid insts)),
-        -- Setup all of the output directories according to our hierarchy
-        objectDir   = Just (outdir objectDir),
-        hiDir       = Just (outdir hiDir),
-        stubDir     = Just (outdir stubDir),
-        -- Unset output-file for non exe builds
-        outputFile  = if session_type == ExeSession
-                        then outputFile dflags
-                        else Nothing,
-        -- Clear the import path so we don't accidentally grab anything
-        importPaths = [],
-        -- Synthesized the flags
-        packageFlags = packageFlags dflags ++ map (\(uid0, rn) ->
-          let state = unitState dflags
-              uid = unwireUnit state (improveUnit state $ renameHoleUnit state (listToUFM insts) uid0)
-          in ExposePackage
-            (showSDoc dflags
-                (text "-unit-id" <+> ppr uid <+> ppr rn))
-            (UnitIdArg uid) rn) deps
-      } )) $ do
-        dflags <- getSessionDynFlags
-        -- pprTrace "flags" (ppr insts <> ppr deps) $ return ()
-        setSessionDynFlags dflags -- calls initUnits
-        do_this
+                  | otherwise  -> newUnitId cid (Just (mkInstantiatedUnitHash cid insts))
+
+
+            -- If we're type-checking an indefinite package, we want to
+            -- turn on interface writing.  However, if the user also
+            -- explicitly passed in `-fno-code`, we DON'T want to write
+            -- interfaces unless the user also asked for `-fwrite-interface`.
+            -- See Note [-fno-code mode]
+            , generalFlags = case session_type of
+                -- Make sure to write interfaces when we are type-checking
+                -- indefinite packages.
+                TcSession
+                  | backend dflags /= NoBackend
+                  -> EnumSet.insert Opt_WriteInterface (generalFlags dflags)
+                _ -> generalFlags dflags
+
+            -- Setup all of the output directories according to our hierarchy
+            , objectDir   = Just (outdir objectDir)
+            , hiDir       = Just (outdir hiDir)
+            , stubDir     = Just (outdir stubDir)
+            -- Unset output-file for non exe builds
+            , outputFile_ = case session_type of
+                ExeSession -> outputFile_ dflags
+                _          -> Nothing
+            , dynOutputFile_ = case session_type of
+                ExeSession -> dynOutputFile_ dflags
+                _          -> Nothing
+            -- Clear the import path so we don't accidentally grab anything
+            , importPaths = []
+            -- Synthesize the flags
+            , packageFlags = packageFlags dflags ++ map (\(uid0, rn) ->
+              let uid = unwireUnit unit_state
+                        $ improveUnit unit_state
+                        $ renameHoleUnit unit_state (listToUFM insts) uid0
+              in ExposePackage
+                (showSDoc dflags
+                    (text "-unit-id" <+> ppr uid <+> ppr rn))
+                (UnitIdArg uid) rn) deps
+            }
+    withTempSession mk_temp_env $ do
+      dflags <- getSessionDynFlags
+      -- pprTrace "flags" (ppr insts <> ppr deps) $ return ()
+      setSessionDynFlags dflags -- calls initUnits
+      do_this
 
 withBkpExeSession :: [(Unit, ModRenaming)] -> BkpM a -> BkpM a
-withBkpExeSession deps do_this = do
-    withBkpSession (Indefinite (UnitId (fsLit "main")) Nothing) [] deps ExeSession do_this
+withBkpExeSession deps do_this =
+    withBkpSession (UnitId (fsLit "main")) [] deps ExeSession do_this
 
-getSource :: IndefUnitId -> BkpM (LHsUnit HsComponentId)
+getSource :: UnitId -> BkpM (LHsUnit HsComponentId)
 getSource cid = do
     bkp_env <- getBkpEnv
     case Map.lookup cid (bkp_table bkp_env) of
         Nothing -> pprPanic "missing needed dependency" (ppr cid)
         Just lunit -> return lunit
 
-typecheckUnit :: IndefUnitId -> [(ModuleName, Module)] -> BkpM ()
+typecheckUnit :: UnitId -> [(ModuleName, Module)] -> BkpM ()
 typecheckUnit cid insts = do
     lunit <- getSource cid
     buildUnit TcSession cid insts lunit
 
-compileUnit :: IndefUnitId -> [(ModuleName, Module)] -> BkpM ()
+compileUnit :: UnitId -> [(ModuleName, Module)] -> BkpM ()
 compileUnit cid insts = do
     -- Let everyone know we're building this unit
     msgUnitId (mkVirtUnit cid insts)
@@ -250,7 +291,7 @@ hsunitDeps include_sigs unit = concatMap get_dep (hsunitBody unit)
             convRn (L _ (Renaming (L _ from) (Just (L _ to)))) = (from, to)
     get_dep _ = []
 
-buildUnit :: SessionType -> IndefUnitId -> [(ModuleName, Module)] -> LHsUnit HsComponentId -> BkpM ()
+buildUnit :: SessionType -> UnitId -> [(ModuleName, Module)] -> LHsUnit HsComponentId -> BkpM ()
 buildUnit session cid insts lunit = do
     -- NB: include signature dependencies ONLY when typechecking.
     -- If we're compiling, it's not necessary to recursively
@@ -258,11 +299,11 @@ buildUnit session cid insts lunit = do
     -- any object files.
     let deps_w_rns = hsunitDeps (session == TcSession) (unLoc lunit)
         raw_deps = map fst deps_w_rns
-    dflags <- getDynFlags
+    hsc_env <- getSession
     -- The compilation dependencies are just the appropriately filled
     -- in unit IDs which must be compiled before we can compile.
     let hsubst = listToUFM insts
-        deps0 = map (renameHoleUnit (unitState dflags) hsubst) raw_deps
+        deps0 = map (renameHoleUnit (hsc_units hsc_env) hsubst) raw_deps
 
     -- Build dependencies OR make sure they make sense. BUT NOTE,
     -- we can only check the ones that are fully filled; the rest
@@ -273,9 +314,8 @@ buildUnit session cid insts lunit = do
             TcSession -> return ()
             _ -> compileInclude (length deps0) (i, dep)
 
-    dflags <- getDynFlags
     -- IMPROVE IT
-    let deps = map (improveUnit (unitState dflags)) deps0
+    let deps = map (improveUnit (hsc_units hsc_env)) deps0
 
     mb_old_eps <- case session of
                     TcSession -> fmap Just getEpsGhc
@@ -284,11 +324,10 @@ buildUnit session cid insts lunit = do
     conf <- withBkpSession cid insts deps_w_rns session $ do
 
         dflags <- getDynFlags
-        mod_graph <- hsunitModuleGraph dflags (unLoc lunit)
-        -- pprTrace "mod_graph" (ppr mod_graph) $ return ()
+        mod_graph <- hsunitModuleGraph False (unLoc lunit)
 
         msg <- mkBackpackMsg
-        ok <- load' LoadAllTargets (Just msg) mod_graph
+        ok <- load' noIfaceCache LoadAllTargets (Just msg) mod_graph
         when (failed ok) (liftIO $ exitWith (ExitFailure 1))
 
         let hi_dir = expectJust (panic "hiDir Backpack") $ hiDir dflags
@@ -303,12 +342,13 @@ buildUnit session cid insts lunit = do
             linkables = map (expectJust "bkp link" . hm_linkable)
                       . filter ((==HsSrcFile) . mi_hsc_src . hm_iface)
                       $ home_mod_infos
-            getOfiles (LM _ _ us) = map nameOfObject (filter isObject us)
+            getOfiles LM{ linkableUnlinked = us } = map nameOfObject (filter isObject us)
             obj_files = concatMap getOfiles linkables
-            state     = unitState (hsc_dflags hsc_env)
+            state     = hsc_units hsc_env
 
-        let compat_fs = unitIdFS (indefUnit cid)
+        let compat_fs = unitIdFS cid
             compat_pn = PackageName compat_fs
+            unit_id   = homeUnitId (hsc_home_unit hsc_env)
 
         return GenericUnitInfo {
             -- Stub data
@@ -316,7 +356,7 @@ buildUnit session cid insts lunit = do
             unitPackageId = PackageId compat_fs,
             unitPackageName = compat_pn,
             unitPackageVersion = makeVersion [],
-            unitId = toUnitId (homeUnit dflags),
+            unitId = unit_id,
             unitComponentName = Nothing,
             unitInstanceOf = cid,
             unitInstantiations = insts,
@@ -337,8 +377,8 @@ buildUnit session cid insts lunit = do
             unitAbiDepends = [],
             unitLinkerOptions = case session of
                                  TcSession -> []
-                                 _ -> obj_files,
-            unitImportDirs = [ hi_dir ],
+                                 _ -> map ST.pack $ obj_files,
+            unitImportDirs = [ ST.pack $ hi_dir ],
             unitIsExposed = False,
             unitIsIndefinite = case session of
                                  TcSession -> True
@@ -360,7 +400,7 @@ buildUnit session cid insts lunit = do
             }
 
 
-    addPackage conf
+    addUnit conf
     case mb_old_eps of
         Just old_eps -> updateEpsGhc_ (const old_eps)
         _ -> return ()
@@ -374,29 +414,48 @@ compileExe lunit = do
     forM_ (zip [1..] deps) $ \(i, dep) ->
         compileInclude (length deps) (i, dep)
     withBkpExeSession deps_w_rns $ do
-        dflags <- getDynFlags
-        mod_graph <- hsunitModuleGraph dflags (unLoc lunit)
+        mod_graph <- hsunitModuleGraph True (unLoc lunit)
         msg <- mkBackpackMsg
-        ok <- load' LoadAllTargets (Just msg) mod_graph
+        ok <- load' noIfaceCache LoadAllTargets (Just msg) mod_graph
         when (failed ok) (liftIO $ exitWith (ExitFailure 1))
 
 -- | Register a new virtual unit database containing a single unit
-addPackage :: GhcMonad m => UnitInfo -> m ()
-addPackage pkg = do
-    dflags <- GHC.getSessionDynFlags
-    case unitDatabases dflags of
-        Nothing -> panic "addPackage: called too early"
-        Just dbs -> do
+addUnit :: GhcMonad m => UnitInfo -> m ()
+addUnit u = do
+    hsc_env <- getSession
+    logger <- getLogger
+    let dflags0 = hsc_dflags hsc_env
+    let old_unit_env = hsc_unit_env hsc_env
+    newdbs <- case ue_unit_dbs old_unit_env of
+        Nothing  -> panic "addUnit: called too early"
+        Just dbs ->
          let newdb = UnitDatabase
-               { unitDatabasePath  = "(in memory " ++ showSDoc dflags (ppr (unitId pkg)) ++ ")"
-               , unitDatabaseUnits = [pkg]
+               { unitDatabasePath  = "(in memory " ++ showSDoc dflags0 (ppr (unitId u)) ++ ")"
+               , unitDatabaseUnits = [u]
                }
-         GHC.setSessionDynFlags (dflags { unitDatabases = Just (dbs ++ [newdb]) })
+         in return (dbs ++ [newdb]) -- added at the end because ordering matters
+    (dbs,unit_state,home_unit,mconstants) <- liftIO $ initUnits logger dflags0 (Just newdbs) (hsc_all_home_unit_ids hsc_env)
+
+    -- update platform constants
+    dflags <- liftIO $ updatePlatformConstants dflags0 mconstants
+
+    let unit_env = ue_setUnits unit_state $ ue_setUnitDbs (Just dbs) $ UnitEnv
+          { ue_platform  = targetPlatform dflags
+          , ue_namever   = ghcNameVersion dflags
+          , ue_current_unit = homeUnitId home_unit
+
+          , ue_home_unit_graph =
+                unitEnv_singleton
+                    (homeUnitId home_unit)
+                    (mkHomeUnitEnv dflags (ue_hpt old_unit_env) (Just home_unit))
+          , ue_eps       = ue_eps old_unit_env
+          }
+    setSession $ hscSetFlags dflags $ hsc_env { hsc_unit_env = unit_env }
 
 compileInclude :: Int -> (Int, Unit) -> BkpM ()
 compileInclude n (i, uid) = do
     hsc_env <- getSession
-    let pkgs = unitState (hsc_dflags hsc_env)
+    let pkgs = hsc_units hsc_env
     msgInclude (i, n) uid
     -- Check if we've compiled it already
     case uid of
@@ -422,7 +481,7 @@ data BkpEnv
         -- | The filename of the bkp file we're compiling
         bkp_filename :: FilePath,
         -- | Table of source units which we know how to compile
-        bkp_table :: Map IndefUnitId (LHsUnit HsComponentId),
+        bkp_table :: Map UnitId (LHsUnit HsComponentId),
         -- | When a package we are compiling includes another package
         -- which has not been compiled, we bump the level and compile
         -- that.
@@ -433,6 +492,9 @@ data BkpEnv
 -- TODO: just make a proper new monad for BkpM, rather than use IOEnv
 instance {-# OVERLAPPING #-} HasDynFlags BkpM where
     getDynFlags = fmap hsc_dflags getSession
+instance {-# OVERLAPPING #-} HasLogger BkpM where
+    getLogger = fmap hsc_logger getSession
+
 
 instance GhcMonad BkpM where
     getSession = do
@@ -450,13 +512,9 @@ getBkpEnv = getEnv
 getBkpLevel :: BkpM Int
 getBkpLevel = bkp_level `fmap` getBkpEnv
 
--- | Apply a function on 'DynFlags' on an 'HscEnv'
-overHscDynFlags :: (DynFlags -> DynFlags) -> HscEnv -> HscEnv
-overHscDynFlags f hsc_env = hsc_env { hsc_dflags = f (hsc_dflags hsc_env) }
-
 -- | Run a 'BkpM' computation, with the nesting level bumped one.
 innerBkpM :: BkpM a -> BkpM a
-innerBkpM do_this = do
+innerBkpM do_this =
     -- NB: withTempSession mutates, so we don't have to worry
     -- about bkp_session being stale.
     updEnv (\env -> env { bkp_level = bkp_level env + 1 }) do_this
@@ -465,24 +523,24 @@ innerBkpM do_this = do
 updateEpsGhc_ :: GhcMonad m => (ExternalPackageState -> ExternalPackageState) -> m ()
 updateEpsGhc_ f = do
     hsc_env <- getSession
-    liftIO $ atomicModifyIORef' (hsc_EPS hsc_env) (\x -> (f x, ()))
+    liftIO $ atomicModifyIORef' (euc_eps (ue_eps (hsc_unit_env hsc_env))) (\x -> (f x, ()))
 
 -- | Get the EPS from a 'GhcMonad'.
 getEpsGhc :: GhcMonad m => m ExternalPackageState
 getEpsGhc = do
     hsc_env <- getSession
-    liftIO $ readIORef (hsc_EPS hsc_env)
+    liftIO $ hscEPS hsc_env
 
 -- | Run 'BkpM' in 'Ghc'.
 initBkpM :: FilePath -> [LHsUnit HsComponentId] -> BkpM a -> Ghc a
-initBkpM file bkp m = do
-    reifyGhc $ \session -> do
+initBkpM file bkp m =
+  reifyGhc $ \session -> do
     let env = BkpEnv {
-                    bkp_session = session,
-                    bkp_table = Map.fromList [(hsComponentId (unLoc (hsunitName (unLoc u))), u) | u <- bkp],
-                    bkp_filename = file,
-                    bkp_level = 0
-                }
+        bkp_session = session,
+        bkp_table = Map.fromList [(hsComponentId (unLoc (hsunitName (unLoc u))), u) | u <- bkp],
+        bkp_filename = file,
+        bkp_level = 0
+      }
     runIOEnv env m
 
 -- ----------------------------------------------------------------------------
@@ -490,9 +548,10 @@ initBkpM file bkp m = do
 
 -- | Print a compilation progress message, but with indentation according
 -- to @level@ (for nested compilation).
-backpackProgressMsg :: Int -> DynFlags -> String -> IO ()
-backpackProgressMsg level dflags msg =
-    compilationProgressMsg dflags $ replicate (level * 2) ' ' ++ msg
+backpackProgressMsg :: Int -> Logger -> SDoc -> IO ()
+backpackProgressMsg level logger msg =
+    compilationProgressMsg logger $ text (replicate (level * 2) ' ') -- TODO: use GHC.Utils.Ppr.RStr
+                                    <> msg
 
 -- | Creates a 'Messager' for Backpack compilation; this is basically
 -- a carbon copy of 'batchMsg' but calling 'backpackProgressMsg', which
@@ -500,20 +559,33 @@ backpackProgressMsg level dflags msg =
 mkBackpackMsg :: BkpM Messager
 mkBackpackMsg = do
     level <- getBkpLevel
-    return $ \hsc_env mod_index recomp mod_summary ->
+    return $ \hsc_env mod_index recomp node ->
       let dflags = hsc_dflags hsc_env
+          logger = hsc_logger hsc_env
+          state = hsc_units hsc_env
           showMsg msg reason =
-            backpackProgressMsg level dflags $
-                showModuleIndex mod_index ++
-                msg ++ showModMsg dflags (hscTarget dflags)
-                                  (recompileRequired recomp) mod_summary
-                    ++ reason
-      in case recomp of
-            MustCompile -> showMsg "Compiling " ""
+            backpackProgressMsg level logger $ pprWithUnitState state $
+                showModuleIndex mod_index <>
+                msg <> showModMsg dflags (recompileRequired recomp) node
+                    <> reason
+      in case node of
+        InstantiationNode _ _ ->
+          case recomp of
             UpToDate
-                | verbosity (hsc_dflags hsc_env) >= 2 -> showMsg "Skipping  " ""
-                | otherwise -> return ()
-            RecompBecause reason -> showMsg "Compiling " (" [" ++ reason ++ "]")
+              | verbosity (hsc_dflags hsc_env) >= 2 -> showMsg (text "Skipping  ") empty
+              | otherwise -> return ()
+            NeedsRecompile reason0 -> showMsg (text "Instantiating ") $ case reason0 of
+              MustCompile -> empty
+              RecompBecause reason -> text " [" <> pprWithUnitState state (ppr reason) <> text "]"
+        ModuleNode _ _ ->
+          case recomp of
+            UpToDate
+              | verbosity (hsc_dflags hsc_env) >= 2 -> showMsg (text "Skipping  ") empty
+              | otherwise -> return ()
+            NeedsRecompile reason0 -> showMsg (text "Compiling ") $ case reason0 of
+              MustCompile -> empty
+              RecompBecause reason -> text " [" <> pprWithUnitState state (ppr reason) <> text "]"
+        LinkNode _ _ -> showMsg (text "Linking ")  empty
 
 -- | 'PprStyle' for Backpack messages; here we usually want the module to
 -- be qualified (so we can tell how it was instantiated.) But we try not
@@ -528,44 +600,48 @@ backpackStyle =
 -- | Message when we initially process a Backpack unit.
 msgTopPackage :: (Int,Int) -> HsComponentId -> BkpM ()
 msgTopPackage (i,n) (HsComponentId (PackageName fs_pn) _) = do
-    dflags <- getDynFlags
+    logger <- getLogger
     level <- getBkpLevel
-    liftIO . backpackProgressMsg level dflags
-        $ showModuleIndex (i, n) ++ "Processing " ++ unpackFS fs_pn
+    liftIO . backpackProgressMsg level logger
+        $ showModuleIndex (i, n) <> text "Processing " <> ftext fs_pn
 
 -- | Message when we instantiate a Backpack unit.
 msgUnitId :: Unit -> BkpM ()
 msgUnitId pk = do
-    dflags <- getDynFlags
+    logger <- getLogger
+    hsc_env <- getSession
     level <- getBkpLevel
-    liftIO . backpackProgressMsg level dflags
-        $ "Instantiating " ++ renderWithStyle
-                                (initSDocContext dflags backpackStyle)
-                                (ppr pk)
+    let state = hsc_units hsc_env
+    liftIO . backpackProgressMsg level logger
+        $ pprWithUnitState state
+        $ text "Instantiating "
+           <> withPprStyle backpackStyle (ppr pk)
 
 -- | Message when we include a Backpack unit.
 msgInclude :: (Int,Int) -> Unit -> BkpM ()
 msgInclude (i,n) uid = do
-    dflags <- getDynFlags
+    logger <- getLogger
+    hsc_env <- getSession
     level <- getBkpLevel
-    liftIO . backpackProgressMsg level dflags
-        $ showModuleIndex (i, n) ++ "Including " ++
-          renderWithStyle (initSDocContext dflags backpackStyle)
-            (ppr uid)
+    let state = hsc_units hsc_env
+    liftIO . backpackProgressMsg level logger
+        $ pprWithUnitState state
+        $ showModuleIndex (i, n) <> text "Including "
+            <> withPprStyle backpackStyle (ppr uid)
 
 -- ----------------------------------------------------------------------------
 -- Conversion from PackageName to HsComponentId
 
-type PackageNameMap a = Map PackageName a
+type PackageNameMap a = UniqFM PackageName a
 
 -- For now, something really simple, since we're not actually going
 -- to use this for anything
-unitDefines :: UnitState -> LHsUnit PackageName -> (PackageName, HsComponentId)
-unitDefines pkgstate (L _ HsUnit{ hsunitName = L _ pn@(PackageName fs) })
-    = (pn, HsComponentId pn (mkIndefUnitId pkgstate fs))
+unitDefines :: LHsUnit PackageName -> (PackageName, HsComponentId)
+unitDefines (L _ HsUnit{ hsunitName = L _ pn@(PackageName fs) })
+    = (pn, HsComponentId pn (UnitId fs))
 
-bkpPackageNameMap :: UnitState -> [LHsUnit PackageName] -> PackageNameMap HsComponentId
-bkpPackageNameMap pkgstate units = Map.fromList (map (unitDefines pkgstate) units)
+bkpPackageNameMap :: [LHsUnit PackageName] -> PackageNameMap HsComponentId
+bkpPackageNameMap units = listToUFM (map unitDefines units)
 
 renameHsUnits :: UnitState -> PackageNameMap HsComponentId -> [LHsUnit PackageName] -> [LHsUnit HsComponentId]
 renameHsUnits pkgstate m units = map (fmap renameHsUnit) units
@@ -573,7 +649,7 @@ renameHsUnits pkgstate m units = map (fmap renameHsUnit) units
 
     renamePackageName :: PackageName -> HsComponentId
     renamePackageName pn =
-        case Map.lookup pn m of
+        case lookupUFM m pn of
             Nothing ->
                 case lookupPackageName pkgstate pn of
                     Nothing -> error "no package name"
@@ -638,112 +714,124 @@ convertHsModuleId (HsModuleId (L _ hsuid) (L _ modname)) = mkModule (convertHsCo
 --
 -- We don't bother trying to support GHC.Driver.Make for now, it's more trouble
 -- than it's worth for inline modules.
-hsunitModuleGraph :: DynFlags -> HsUnit HsComponentId -> BkpM ModuleGraph
-hsunitModuleGraph dflags unit = do
+hsunitModuleGraph :: Bool -> HsUnit HsComponentId -> BkpM ModuleGraph
+hsunitModuleGraph do_link unit = do
+    hsc_env <- getSession
+
     let decls = hsunitBody unit
         pn = hsPackageName (unLoc (hsunitName unit))
+        home_unit = hsc_home_unit hsc_env
+
+        sig_keys = flip map (homeUnitInstantiations home_unit) $ \(mod_name, _) -> NodeKey_Module (ModNodeKeyWithUid (GWIB mod_name NotBoot) (homeUnitId home_unit))
+        keys = [NodeKey_Module (ModNodeKeyWithUid gwib (homeUnitId home_unit)) | (DeclD hsc_src lmodname _) <- map unLoc decls, let gwib = GWIB (unLoc lmodname) (hscSourceToIsBoot hsc_src) ]
 
     --  1. Create a HsSrcFile/HsigFile summary for every
     --  explicitly mentioned module/signature.
-    let get_decl (L _ (DeclD hsc_src lmodname mb_hsmod)) = do
-          Just `fmap` summariseDecl pn hsc_src lmodname mb_hsmod
+    let get_decl (L _ (DeclD hsc_src lmodname hsmod)) =
+          Just <$> summariseDecl pn hsc_src lmodname hsmod (keys ++ sig_keys)
         get_decl _ = return Nothing
-    nodes <- catMaybes `fmap` mapM get_decl decls
+    nodes <- mapMaybeM get_decl decls
 
     --  2. For each hole which does not already have an hsig file,
     --  create an "empty" hsig file to induce compilation for the
     --  requirement.
-    let node_map = Map.fromList [ ((ms_mod_name n, ms_hsc_src n == HsigFile), n)
-                                | n <- nodes ]
-    req_nodes <- fmap catMaybes . forM (homeUnitInstantiations dflags) $ \(mod_name, _) ->
-        let has_local = Map.member (mod_name, True) node_map
-        in if has_local
+    let hsig_set = Set.fromList
+          [ ms_mod_name ms
+          | ModuleNode _ ms <- nodes
+          , ms_hsc_src ms == HsigFile
+          ]
+    req_nodes <- fmap catMaybes . forM (homeUnitInstantiations home_unit) $ \(mod_name, _) ->
+        if Set.member mod_name hsig_set
             then return Nothing
             else fmap Just $ summariseRequirement pn mod_name
 
-    -- 3. Return the kaboodle
-    return $ mkModuleGraph $ nodes ++ req_nodes
+    let graph_nodes = nodes ++ req_nodes ++ (instantiationNodes (homeUnitId $ hsc_home_unit hsc_env) (hsc_units hsc_env))
+        key_nodes = map mkNodeKey graph_nodes
+        all_nodes = graph_nodes ++ [LinkNode key_nodes (homeUnitId $ hsc_home_unit hsc_env) | do_link]
+    -- This error message is not very good but .bkp mode is just for testing so
+    -- better to be direct rather than pretty.
+    when
+      (length key_nodes /= length (ordNub key_nodes))
+      (pprPanic "Duplicate nodes keys in backpack file" (ppr key_nodes))
 
-summariseRequirement :: PackageName -> ModuleName -> BkpM ModSummary
+    -- 3. Return the kaboodle
+    return $ mkModuleGraph $ all_nodes
+
+
+summariseRequirement :: PackageName -> ModuleName -> BkpM ModuleGraphNode
 summariseRequirement pn mod_name = do
     hsc_env <- getSession
     let dflags = hsc_dflags hsc_env
+    let home_unit = hsc_home_unit hsc_env
+    let fopts = initFinderOpts dflags
 
     let PackageName pn_fs = pn
-    location <- liftIO $ mkHomeModLocation2 dflags mod_name
-                 (unpackFS pn_fs </> moduleNameSlashes mod_name) "hsig"
+    let location = mkHomeModLocation2 fopts mod_name
+                    (unpackFS pn_fs </> moduleNameSlashes mod_name) "hsig"
 
     env <- getBkpEnv
-    time <- liftIO $ getModificationUTCTime (bkp_filename env)
+    src_hash <- liftIO $ getFileHash (bkp_filename env)
     hi_timestamp <- liftIO $ modificationTimeIfExists (ml_hi_file location)
     hie_timestamp <- liftIO $ modificationTimeIfExists (ml_hie_file location)
     let loc = srcLocSpan (mkSrcLoc (mkFastString (bkp_filename env)) 1 1)
 
-    mod <- liftIO $ addHomeModuleToFinder hsc_env mod_name location
+    let fc = hsc_FC hsc_env
+    mod <- liftIO $ addHomeModuleToFinder fc home_unit mod_name location
 
     extra_sig_imports <- liftIO $ findExtraSigImports hsc_env HsigFile mod_name
 
-    return ModSummary {
+    let ms = ModSummary {
         ms_mod = mod,
         ms_hsc_src = HsigFile,
         ms_location = location,
-        ms_hs_date = time,
+        ms_hs_hash = src_hash,
         ms_obj_date = Nothing,
+        ms_dyn_obj_date = Nothing,
         ms_iface_date = hi_timestamp,
         ms_hie_date = hie_timestamp,
         ms_srcimps = [],
-        ms_textual_imps = extra_sig_imports,
+        ms_textual_imps = ((,) NoPkgQual . noLoc) <$> extra_sig_imports,
+        ms_ghc_prim_import = False,
         ms_parsed_mod = Just (HsParsedModule {
                 hpm_module = L loc (HsModule {
+                        hsmodAnn = noAnn,
                         hsmodLayout = NoLayoutInfo,
-                        hsmodName = Just (L loc mod_name),
+                        hsmodName = Just (L (noAnnSrcSpan loc) mod_name),
                         hsmodExports = Nothing,
                         hsmodImports = [],
                         hsmodDecls = [],
                         hsmodDeprecMessage = Nothing,
                         hsmodHaddockModHeader = Nothing
                     }),
-                hpm_src_files = [],
-                hpm_annotations = ApiAnns Map.empty Nothing Map.empty []
+                hpm_src_files = []
             }),
         ms_hspp_file = "", -- none, it came inline
         ms_hspp_opts = dflags,
         ms_hspp_buf = Nothing
         }
+    let nodes = [NodeKey_Module (ModNodeKeyWithUid (GWIB mn NotBoot) (homeUnitId home_unit)) | mn <- extra_sig_imports ]
+    return (ModuleNode nodes ms)
 
 summariseDecl :: PackageName
               -> HscSource
               -> Located ModuleName
-              -> Maybe (Located HsModule)
-              -> BkpM ModSummary
-summariseDecl pn hsc_src (L _ modname) (Just hsmod) = hsModuleToModSummary pn hsc_src modname hsmod
-summariseDecl _pn hsc_src lmodname@(L loc modname) Nothing
-    = do hsc_env <- getSession
-         let dflags = hsc_dflags hsc_env
-         -- TODO: this looks for modules in the wrong place
-         r <- liftIO $ summariseModule hsc_env
-                         Map.empty -- GHC API recomp not supported
-                         (hscSourceToIsBoot hsc_src)
-                         lmodname
-                         True -- Target lets you disallow, but not here
-                         Nothing -- GHC API buffer support not supported
-                         [] -- No exclusions
-         case r of
-            Nothing -> throwOneError (mkPlainErrMsg dflags loc (text "module" <+> ppr modname <+> text "was not found"))
-            Just (Left err) -> throwErrors err
-            Just (Right summary) -> return summary
+              -> Located HsModule
+              -> [NodeKey]
+              -> BkpM ModuleGraphNode
+summariseDecl pn hsc_src (L _ modname) hsmod home_keys = hsModuleToModSummary home_keys pn hsc_src modname hsmod
 
 -- | Up until now, GHC has assumed a single compilation target per source file.
 -- Backpack files with inline modules break this model, since a single file
 -- may generate multiple output files.  How do we decide to name these files?
 -- Should there only be one output file? This function our current heuristic,
 -- which is we make a "fake" module and use that.
-hsModuleToModSummary :: PackageName
+hsModuleToModSummary :: [NodeKey]
+                     -> PackageName
                      -> HscSource
                      -> ModuleName
                      -> Located HsModule
-                     -> BkpM ModSummary
-hsModuleToModSummary pn hsc_src modname
+                     -> BkpM ModuleGraphNode
+hsModuleToModSummary home_keys pn hsc_src modname
                      hsmod = do
     let imps = hsmodImports (unLoc hsmod)
         loc  = getLoc hsmod
@@ -752,13 +840,14 @@ hsModuleToModSummary pn hsc_src modname
     -- Use the PACKAGE NAME to find the location
     let PackageName unit_fs = pn
         dflags = hsc_dflags hsc_env
+        fopts = initFinderOpts dflags
     -- Unfortunately, we have to define a "fake" location in
     -- order to appease the various code which uses the file
     -- name to figure out where to put, e.g. object files.
     -- To add insult to injury, we don't even actually use
     -- these filenames to figure out where the hi files go.
     -- A travesty!
-    location0 <- liftIO $ mkHomeModLocation2 dflags modname
+    let location0 = mkHomeModLocation2 fopts modname
                              (unpackFS unit_fs </>
                               moduleNameSlashes modname)
                               (case hsc_src of
@@ -770,8 +859,6 @@ hsModuleToModSummary pn hsc_src modname
                         HsBootFile -> addBootSuffixLocnOut location0
                         _ -> location0
     -- This duplicates a pile of logic in GHC.Driver.Make
-    env <- getBkpEnv
-    time <- liftIO $ getModificationUTCTime (bkp_filename env)
     hi_timestamp <- liftIO $ modificationTimeIfExists (ml_hi_file location)
     hie_timestamp <- liftIO $ modificationTimeIfExists (ml_hie_file location)
 
@@ -779,22 +866,28 @@ hsModuleToModSummary pn hsc_src modname
     let (src_idecls, ord_idecls) = partition ((== IsBoot) . ideclSource . unLoc) imps
 
              -- GHC.Prim doesn't exist physically, so don't go looking for it.
-        ordinary_imps = filter ((/= moduleName gHC_PRIM) . unLoc . ideclName . unLoc)
-                               ord_idecls
+        (ordinary_imps, ghc_prim_import)
+          = partition ((/= moduleName gHC_PRIM) . unLoc . ideclName . unLoc)
+              ord_idecls
 
         implicit_prelude = xopt LangExt.ImplicitPrelude dflags
         implicit_imports = mkPrelImports modname loc
                                          implicit_prelude imps
-        convImport (L _ i) = (fmap sl_fs (ideclPkgQual i), ideclName i)
+
+        rn_pkg_qual = renameRawPkgQual (hsc_unit_env hsc_env) modname
+        convImport (L _ i) = (rn_pkg_qual (ideclPkgQual i), reLoc $ ideclName i)
 
     extra_sig_imports <- liftIO $ findExtraSigImports hsc_env hsc_src modname
 
     let normal_imports = map convImport (implicit_imports ++ ordinary_imps)
-    required_by_imports <- liftIO $ implicitRequirements hsc_env normal_imports
+    (implicit_sigs, inst_deps) <- liftIO $ implicitRequirementsShallow hsc_env normal_imports
 
     -- So that Finder can find it, even though it doesn't exist...
-    this_mod <- liftIO $ addHomeModuleToFinder hsc_env modname location
-    return ModSummary {
+    this_mod <- liftIO $ do
+      let home_unit = hsc_home_unit hsc_env
+      let fc        = hsc_FC hsc_env
+      addHomeModuleToFinder fc home_unit modname location
+    let ms = ModSummary {
             ms_mod = this_mod,
             ms_hsc_src = hsc_src,
             ms_location = location,
@@ -804,27 +897,42 @@ hsModuleToModSummary pn hsc_src modname
             ms_hspp_opts = dflags,
             ms_hspp_buf = Nothing,
             ms_srcimps = map convImport src_idecls,
+            ms_ghc_prim_import = not (null ghc_prim_import),
             ms_textual_imps = normal_imports
                            -- We have to do something special here:
                            -- due to merging, requirements may end up with
                            -- extra imports
-                           ++ extra_sig_imports
-                           ++ required_by_imports,
+                           ++ ((,) NoPkgQual . noLoc <$> extra_sig_imports)
+                           ++ ((,) NoPkgQual . noLoc <$> implicit_sigs),
             -- This is our hack to get the parse tree to the right spot
             ms_parsed_mod = Just (HsParsedModule {
                     hpm_module = hsmod,
-                    hpm_src_files = [], -- TODO if we preprocessed it
-                    hpm_annotations = ApiAnns Map.empty Nothing Map.empty [] -- BOGUS
+                    hpm_src_files = [] -- TODO if we preprocessed it
                 }),
-            ms_hs_date = time,
+            -- Source hash = fingerprint0, so the recompilation tests do not recompile
+            -- too much. In future, if necessary then could get the hash by just hashing the
+            -- relevant part of the .bkp file.
+            ms_hs_hash = fingerprint0,
             ms_obj_date = Nothing, -- TODO do this, but problem: hi_timestamp is BOGUS
+            ms_dyn_obj_date = Nothing, -- TODO do this, but problem: hi_timestamp is BOGUS
             ms_iface_date = hi_timestamp,
             ms_hie_date = hie_timestamp
-        }
+          }
+
+    -- Now, what are the dependencies.
+    let inst_nodes = map NodeKey_Unit inst_deps
+        mod_nodes  =
+          -- hs-boot edge
+          [k | k <- [NodeKey_Module (ModNodeKeyWithUid (GWIB (ms_mod_name ms) IsBoot)  (moduleUnitId this_mod))], NotBoot == isBootSummary ms,  k `elem` home_keys ] ++
+          -- Normal edges
+          [k | (_, mnwib) <- msDeps ms, let k = NodeKey_Module (ModNodeKeyWithUid (fmap unLoc mnwib) (moduleUnitId this_mod)), k `elem` home_keys]
+
+
+    return (ModuleNode (mod_nodes ++ inst_nodes) ms)
 
 -- | Create a new, externally provided hashed unit id from
 -- a hash.
-newUnitId :: IndefUnitId -> Maybe FastString -> UnitId
+newUnitId :: UnitId -> Maybe FastString -> UnitId
 newUnitId uid mhash = case mhash of
-   Nothing   -> indefUnit uid
-   Just hash -> UnitId (unitIdFS (indefUnit uid) `appendFS` mkFastString "+" `appendFS` hash)
+   Nothing   -> uid
+   Just hash -> UnitId (unitIdFS uid `appendFS` mkFastString "+" `appendFS` hash)

@@ -3,9 +3,13 @@
 
 #include <unistd.h>
 #include <errno.h>
-#include <signal.h>
 
-#if !defined(HAVE_POSIX_SPAWNP)
+#if defined(HAVE_SIGNAL_H)
+#include <signal.h>
+#include <fcntl.h>
+#endif
+
+#if !defined(USE_POSIX_SPAWN)
 ProcHandle
 do_spawn_posix (char *const args[],
                 char *workingDirectory, char **environment,
@@ -35,6 +39,14 @@ setup_std_handle_spawn (int fd,
 {
     switch (hdl->behavior) {
     case STD_HANDLE_CLOSE:
+        // N.B. POSIX specifies that addclose() may result in spawnp() failing
+        // if the fd to-be-closed is already closed. Consequently, we must
+        // first open a file (e.g. /dev/null) and before attempting to close
+        // the fd. Fixes #251.
+        if (posix_spawn_file_actions_addopen(fa, fd, "/dev/null", O_RDONLY, 0) != 0) {
+            *failed_doing = "posix_spawn_file_actions_addopen";
+            return -1;
+        }
         if (posix_spawn_file_actions_addclose(fa, fd) != 0) {
             *failed_doing = "posix_spawn_file_actions_addclose";
             return -1;
@@ -159,7 +171,7 @@ do_spawn_posix (char *const args[],
 #if defined(HAVE_POSIX_SPAWN_SETPGROUP)
         spawn_flags |= POSIX_SPAWN_SETPGROUP;
 #else
-	goto not_supported;
+        goto not_supported;
 #endif
     }
 
@@ -201,6 +213,7 @@ do_spawn_posix (char *const args[],
 
     r = posix_spawnp(&pid, args[0], &fa, &sa, args, environment ? environment : environ);
     if (r != 0) {
+        errno = r; // posix_spawn doesn't necessarily set errno; see #227.
         *failed_doing = "posix_spawnp";
         goto fail;
     } else {

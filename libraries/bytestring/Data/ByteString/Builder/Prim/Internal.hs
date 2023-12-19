@@ -1,7 +1,5 @@
-{-# LANGUAGE ScopedTypeVariables, CPP, BangPatterns #-}
-#if __GLASGOW_HASKELL__ >= 703
+{-# LANGUAGE ScopedTypeVariables, CPP #-}
 {-# LANGUAGE Unsafe #-}
-#endif
 {-# OPTIONS_HADDOCK not-home #-}
 -- |
 -- Copyright   : 2010-2011 Simon Meier, 2010 Jasper van der Jeugt
@@ -64,6 +62,9 @@ module Data.ByteString.Builder.Prim.Internal (
   , (>$<)
   , (>*<)
 
+  -- * Helpers
+  , caseWordSize_32_64
+
   -- * Deprecated
   , boudedPrim
   ) where
@@ -71,10 +72,7 @@ module Data.ByteString.Builder.Prim.Internal (
 import Foreign
 import Prelude hiding (maxBound)
 
-#if !(__GLASGOW_HASKELL__ >= 612)
--- ghc-6.10 and older do not support {-# INLINE CONLIKE #-}
-#define CONLIKE
-#endif
+#include "MachDeps.h"
 
 ------------------------------------------------------------------------------
 -- Supporting infrastructure
@@ -187,7 +185,7 @@ pairF (FP l1 io1) (FP l2 io2) =
 -- >contramapF f . contramapF g = contramapF (g . f)
 {-# INLINE CONLIKE contramapF #-}
 contramapF :: (b -> a) -> FixedPrim a -> FixedPrim b
-contramapF f (FP l io) = FP l (\x op -> io (f x) op)
+contramapF f (FP l io) = FP l (io . f)
 
 -- | Convert a 'FixedPrim' to a 'BoundedPrim'.
 {-# INLINE CONLIKE toB #-}
@@ -211,7 +209,7 @@ storableToF :: forall a. Storable a => FixedPrim a
 storableToF = FP (sizeOf (undefined :: a)) (\x op -> poke (castPtr op) x)
 #else
 storableToF = FP (sizeOf (undefined :: a)) $ \x op ->
-    if (ptrToWordPtr op) `mod` (fromIntegral (alignment (undefined :: a))) == 0 then poke (castPtr op) x
+    if ptrToWordPtr op `mod` fromIntegral (alignment (undefined :: a)) == 0 then poke (castPtr op) x
     else with x $ \tp -> copyBytes op (castPtr tp) (sizeOf (undefined :: a))
 #endif
 
@@ -257,7 +255,7 @@ runB (BP _ io) = io
 -- >contramapB f . contramapB g = contramapB (g . f)
 {-# INLINE CONLIKE contramapB #-}
 contramapB :: (b -> a) -> BoundedPrim a -> BoundedPrim b
-contramapB f (BP b io) = BP b (\x op -> io (f x) op)
+contramapB f (BP b io) = BP b (io . f)
 
 -- | The 'BoundedPrim' that always results in the zero-length sequence.
 {-# INLINE CONLIKE emptyB #-}
@@ -298,3 +296,17 @@ eitherB (BP b1 io1) (BP b2 io2) =
 condB :: (a -> Bool) -> BoundedPrim a -> BoundedPrim a -> BoundedPrim a
 condB p be1 be2 =
     contramapB (\x -> if p x then Left x else Right x) (eitherB be1 be2)
+
+-- | Select an implementation depending on bitness.
+-- Throw a compile time error if bitness is neither 32 nor 64.
+{-# INLINE caseWordSize_32_64 #-}
+caseWordSize_32_64
+  :: a -- Value for 32-bit architecture
+  -> a -- Value for 64-bit architecture
+  -> a
+#if WORD_SIZE_IN_BITS == 32
+caseWordSize_32_64 = const
+#endif
+#if WORD_SIZE_IN_BITS == 64
+caseWordSize_32_64 = const id
+#endif

@@ -22,9 +22,6 @@ module GHC.Core.TyCo.Ppr
         pprCo, pprParendCo,
 
         debugPprType,
-
-        -- * Pretty-printing 'TyThing's
-        pprTyThingCategory, pprShortTyThing,
   ) where
 
 import GHC.Prelude
@@ -34,10 +31,10 @@ import {-# SOURCE #-} GHC.CoreToIface
    , toIfaceTyCon, toIfaceTcArgs, toIfaceCoercionX )
 
 import {-# SOURCE #-} GHC.Core.DataCon
-   ( dataConFullSig , dataConUserTyVarBinders
-   , DataCon )
+   ( dataConFullSig , dataConUserTyVarBinders, DataCon )
 
-import GHC.Core.Type ( isLiftedTypeKind, pattern One, pattern Many )
+import GHC.Core.Type ( pickyIsLiftedTypeKind, pattern One, pattern Many,
+                       splitForAllReqTVBinders, splitForAllInvisTVBinders )
 
 import GHC.Core.TyCon
 import GHC.Core.TyCo.Rep
@@ -52,6 +49,7 @@ import GHC.Types.Var.Set
 import GHC.Types.Var.Env
 
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
 import GHC.Types.Basic ( PprPrec(..), topPrec, sigPrec, opPrec
                        , funPrec, appPrec, maybeParen )
 
@@ -78,7 +76,7 @@ See Note [Precedence in types] in GHC.Types.Basic.
 --------------------------------------------------------
 -- When pretty-printing types, we convert to IfaceType,
 --   and pretty-print that.
--- See Note [Pretty printing via Iface syntax] in GHC.Core.Ppr.TyThing
+-- See Note [Pretty printing via Iface syntax] in GHC.Types.TyThing.Ppr
 --------------------------------------------------------
 
 pprType, pprParendType, pprTidiedType :: Type -> SDoc
@@ -192,10 +190,34 @@ pprTyVar :: TyVar -> SDoc
 -- pprIfaceTvBndr is minimal, and the loss of uniques etc in
 -- debug printing is disastrous
 pprTyVar tv
-  | isLiftedTypeKind kind = ppr tv
-  | otherwise             = parens (ppr tv <+> dcolon <+> ppr kind)
+  | pickyIsLiftedTypeKind kind = ppr tv  -- See Note [Suppressing * kinds]
+  | otherwise                  = parens (ppr tv <+> dcolon <+> ppr kind)
   where
     kind = tyVarKind tv
+
+{- Note [Suppressing * kinds]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Generally we want to print
+      forall a. a->a
+not   forall (a::*). a->a
+or    forall (a::Type). a->a
+That is, for brevity we suppress a kind ascription of '*' (or Type).
+
+But what if the kind is (Const Type x)?
+   type Const p q = p
+
+Then (Const Type x) is just a long way of saying Type.  But it may be
+jolly confusing to suppress the 'x'.  Suppose we have (polykinds/T18451a)
+   foo :: forall a b (c :: Const Type b). Proxy '[a, c]
+
+Then this error message
+    • These kind and type variables: a b (c :: Const Type b)
+      are out of dependency order. Perhaps try this ordering:
+        (b :: k) (a :: Const (*) b) (c :: Const (*) b)
+would be much less helpful if we suppressed the kind ascription on 'a'.
+
+Hence the use of pickyIsLiftedTypeKind.
+-}
 
 -----------------
 debugPprType :: Type -> SDoc
@@ -245,19 +267,34 @@ debug_ppr_ty prec (CastTy ty co)
 debug_ppr_ty _ (CoercionTy co)
   = parens (text "CO" <+> ppr co)
 
-debug_ppr_ty prec ty@(ForAllTy {})
-  | (tvs, body) <- split ty
+-- Invisible forall:  forall {k} (a :: k). t
+debug_ppr_ty prec t
+  | (bndrs, body) <- splitForAllInvisTVBinders t
+  , not (null bndrs)
   = maybeParen prec funPrec $
-    hang (text "forall" <+> fsep (map ppr tvs) <> dot)
-         -- The (map ppr tvs) will print kind-annotated
-         -- tvs, because we are (usually) in debug-style
-       2 (ppr body)
+    sep [ text "forall" <+> fsep (map ppr_bndr bndrs) <> dot,
+          ppr body ]
   where
-    split ty | ForAllTy tv ty' <- ty
-             , (tvs, body) <- split ty'
-             = (tv:tvs, body)
-             | otherwise
-             = ([], ty)
+    -- (ppr tv) will print the binder kind-annotated
+    -- when in debug-style
+    ppr_bndr (Bndr tv InferredSpec)  = braces (ppr tv)
+    ppr_bndr (Bndr tv SpecifiedSpec) = ppr tv
+
+-- Visible forall:  forall x y -> t
+debug_ppr_ty prec t
+  | (bndrs, body) <- splitForAllReqTVBinders t
+  , not (null bndrs)
+  = maybeParen prec funPrec $
+    sep [ text "forall" <+> fsep (map ppr_bndr bndrs) <+> arrow,
+          ppr body ]
+  where
+    -- (ppr tv) will print the binder kind-annotated
+    -- when in debug-style
+    ppr_bndr (Bndr tv ()) = ppr tv
+
+-- Impossible case: neither visible nor invisible forall.
+debug_ppr_ty _ ForAllTy{}
+  = panic "debug_ppr_ty: neither splitForAllInvisTVBinders nor splitForAllReqTVBinders returned any binders"
 
 {-
 Note [Infix type variables]

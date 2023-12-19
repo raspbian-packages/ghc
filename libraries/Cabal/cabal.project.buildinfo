@@ -1,5 +1,6 @@
+packages: Cabal-syntax/
 packages: Cabal/
-packages: Cabal/Cabal-described
+packages: Cabal-described
 packages: buildinfo-reference-generator/
 tests: False
 optimization: False

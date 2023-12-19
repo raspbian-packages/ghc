@@ -1,13 +1,12 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE ExplicitForAll #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE UndecidableInstances #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns   #-}
@@ -31,12 +30,11 @@ import GHC.Prelude hiding (succ)
 import GHC.Platform.Regs
 import GHC.Cmm.Expr
 import GHC.Cmm.Switch
-import GHC.Driver.Session
 import GHC.Data.FastString
 import GHC.Types.ForeignCall
 import GHC.Utils.Outputable
 import GHC.Runtime.Heap.Layout
-import GHC.Core (Tickish)
+import GHC.Types.Tickish (CmmTickish)
 import qualified GHC.Types.Unique as U
 
 import GHC.Cmm.Dataflow.Block
@@ -76,7 +74,7 @@ data CmmNode e x where
   CmmAssign :: !CmmReg -> !CmmExpr -> CmmNode O O
     -- Assign to register
 
-  CmmStore :: !CmmExpr -> !CmmExpr -> CmmNode O O
+  CmmStore :: !CmmExpr -> !CmmExpr -> !AlignmentSpec -> CmmNode O O
     -- Assign to memory location.  Size is
     -- given by cmmExprType of the rhs.
 
@@ -107,7 +105,7 @@ data CmmNode e x where
 
   CmmSwitch
     :: CmmExpr       -- Scrutinee, of some integral type
-    -> SwitchTargets -- Cases. See [Note SwitchTargets]
+    -> SwitchTargets -- Cases. See Note [SwitchTargets]
     -> CmmNode O C
 
   CmmCall :: {                -- A native call or tail call
@@ -116,7 +114,9 @@ data CmmNode e x where
       cml_cont :: Maybe Label,
           -- Label of continuation (Nothing for return or tail call)
           --
-          -- Note [Continuation BlockIds]: these BlockIds are called
+          -- Note [Continuation BlockIds]
+          -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+          -- These BlockIds are called
           -- Continuation BlockIds, and are the only BlockIds that can
           -- occur in CmmExprs, namely as (CmmLit (CmmBlock b)) or
           -- (CmmStackSlot (Young b) _).
@@ -198,7 +198,6 @@ sequence.
 
 {- Note [Unsafe foreign calls clobber caller-save registers]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 A foreign call is defined to clobber any GlobalRegs that are mapped to
 caller-saves machine registers (according to the prevailing C ABI).
 GHC.StgToCmm.Utils.callerSaves tells you which GlobalRegs are caller-saves.
@@ -320,9 +319,10 @@ foreignTargetHints target
 -- Instances of register and slot users / definers
 
 instance UserOfRegs LocalReg (CmmNode e x) where
-  foldRegsUsed dflags f !z n = case n of
+  {-# INLINEABLE foldRegsUsed #-}
+  foldRegsUsed platform f !z n = case n of
     CmmAssign _ expr -> fold f z expr
-    CmmStore addr rval -> fold f (fold f z addr) rval
+    CmmStore addr rval _ -> fold f (fold f z addr) rval
     CmmUnsafeForeignCall t _ args -> fold f (fold f z t) args
     CmmCondBranch expr _ _ _ -> fold f z expr
     CmmSwitch expr _ -> fold f z expr
@@ -331,12 +331,13 @@ instance UserOfRegs LocalReg (CmmNode e x) where
     _ -> z
     where fold :: forall a b. UserOfRegs LocalReg a
                => (b -> LocalReg -> b) -> b -> a -> b
-          fold f z n = foldRegsUsed dflags f z n
+          fold f z n = foldRegsUsed platform f z n
 
 instance UserOfRegs GlobalReg (CmmNode e x) where
-  foldRegsUsed dflags f !z n = case n of
+  {-# INLINEABLE foldRegsUsed #-}
+  foldRegsUsed platform f !z n = case n of
     CmmAssign _ expr -> fold f z expr
-    CmmStore addr rval -> fold f (fold f z addr) rval
+    CmmStore addr rval _ -> fold f (fold f z addr) rval
     CmmUnsafeForeignCall t _ args -> fold f (fold f z t) args
     CmmCondBranch expr _ _ _ -> fold f z expr
     CmmSwitch expr _ -> fold f z expr
@@ -345,26 +346,29 @@ instance UserOfRegs GlobalReg (CmmNode e x) where
     _ -> z
     where fold :: forall a b.  UserOfRegs GlobalReg a
                => (b -> GlobalReg -> b) -> b -> a -> b
-          fold f z n = foldRegsUsed dflags f z n
+          fold f z n = foldRegsUsed platform f z n
 
 instance (Ord r, UserOfRegs r CmmReg) => UserOfRegs r ForeignTarget where
   -- The (Ord r) in the context is necessary here
   -- See Note [Recursive superclasses] in GHC.Tc.TyCl.Instance
-  foldRegsUsed _      _ !z (PrimTarget _)      = z
-  foldRegsUsed dflags f !z (ForeignTarget e _) = foldRegsUsed dflags f z e
+  {-# INLINEABLE foldRegsUsed #-}
+  foldRegsUsed _        _ !z (PrimTarget _)      = z
+  foldRegsUsed platform f !z (ForeignTarget e _) = foldRegsUsed platform f z e
 
 instance DefinerOfRegs LocalReg (CmmNode e x) where
-  foldRegsDefd dflags f !z n = case n of
+  {-# INLINEABLE foldRegsDefd #-}
+  foldRegsDefd platform f !z n = case n of
     CmmAssign lhs _ -> fold f z lhs
     CmmUnsafeForeignCall _ fs _ -> fold f z fs
     CmmForeignCall {res=res} -> fold f z res
     _ -> z
     where fold :: forall a b. DefinerOfRegs LocalReg a
                => (b -> LocalReg -> b) -> b -> a -> b
-          fold f z n = foldRegsDefd dflags f z n
+          fold f z n = foldRegsDefd platform f z n
 
 instance DefinerOfRegs GlobalReg (CmmNode e x) where
-  foldRegsDefd dflags f !z n = case n of
+  {-# INLINEABLE foldRegsDefd #-}
+  foldRegsDefd platform f !z n = case n of
     CmmAssign lhs _ -> fold f z lhs
     CmmUnsafeForeignCall tgt _ _  -> fold f z (foreignTargetRegs tgt)
     CmmCall        {} -> fold f z activeRegs
@@ -373,9 +377,8 @@ instance DefinerOfRegs GlobalReg (CmmNode e x) where
     _ -> z
     where fold :: forall a b. DefinerOfRegs GlobalReg a
                => (b -> GlobalReg -> b) -> b -> a -> b
-          fold f z n = foldRegsDefd dflags f z n
+          fold f z n = foldRegsDefd platform f z n
 
-          platform = targetPlatform dflags
           activeRegs = activeStgRegs platform
           activeCallerSavesRegs = filter (callerSaves platform) activeRegs
 
@@ -384,7 +387,6 @@ instance DefinerOfRegs GlobalReg (CmmNode e x) where
 
 -- Note [Safe foreign calls clobber STG registers]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
---
 -- During stack layout phase every safe foreign call is expanded into a block
 -- that contains unsafe foreign call (instead of safe foreign call) and ends
 -- with a normal call (See Note [Foreign calls]). This means that we must
@@ -462,9 +464,9 @@ wrapRecExp :: (CmmExpr -> CmmExpr) -> CmmExpr -> CmmExpr
 -- Take a transformer on expressions and apply it recursively.
 -- (wrapRecExp f e) first recursively applies itself to sub-expressions of e
 --                  then  uses f to rewrite the resulting expression
-wrapRecExp f (CmmMachOp op es)    = f (CmmMachOp op $ map (wrapRecExp f) es)
-wrapRecExp f (CmmLoad addr ty)    = f (CmmLoad (wrapRecExp f addr) ty)
-wrapRecExp f e                    = f e
+wrapRecExp f (CmmMachOp op es)       = f (CmmMachOp op $ map (wrapRecExp f) es)
+wrapRecExp f (CmmLoad addr ty align) = f (CmmLoad (wrapRecExp f addr) ty align)
+wrapRecExp f e                       = f e
 
 mapExp :: (CmmExpr -> CmmExpr) -> CmmNode e x -> CmmNode e x
 mapExp _ f@(CmmEntry{})                          = f
@@ -472,7 +474,7 @@ mapExp _ m@(CmmComment _)                        = m
 mapExp _ m@(CmmTick _)                           = m
 mapExp f   (CmmUnwind regs)                      = CmmUnwind (map (fmap (fmap f)) regs)
 mapExp f   (CmmAssign r e)                       = CmmAssign r (f e)
-mapExp f   (CmmStore addr e)                     = CmmStore (f addr) (f e)
+mapExp f   (CmmStore addr e align)               = CmmStore (f addr) (f e) align
 mapExp f   (CmmUnsafeForeignCall tgt fs as)      = CmmUnsafeForeignCall (mapForeignTarget f tgt) fs (map f as)
 mapExp _ l@(CmmBranch _)                         = l
 mapExp f   (CmmCondBranch e ti fi l)             = CmmCondBranch (f e) ti fi l
@@ -493,9 +495,9 @@ mapForeignTargetM _ (PrimTarget _)      = Nothing
 wrapRecExpM :: (CmmExpr -> Maybe CmmExpr) -> (CmmExpr -> Maybe CmmExpr)
 -- (wrapRecExpM f e) first recursively applies itself to sub-expressions of e
 --                   then  gives f a chance to rewrite the resulting expression
-wrapRecExpM f n@(CmmMachOp op es)  = maybe (f n) (f . CmmMachOp op)    (mapListM (wrapRecExpM f) es)
-wrapRecExpM f n@(CmmLoad addr ty)  = maybe (f n) (f . flip CmmLoad ty) (wrapRecExpM f addr)
-wrapRecExpM f e                    = f e
+wrapRecExpM f n@(CmmMachOp op es)       = maybe (f n) (f . CmmMachOp op)    (mapListM (wrapRecExpM f) es)
+wrapRecExpM f n@(CmmLoad addr ty align) = maybe (f n) (\addr' -> f $ CmmLoad addr' ty align) (wrapRecExpM f addr)
+wrapRecExpM f e                         = f e
 
 mapExpM :: (CmmExpr -> Maybe CmmExpr) -> CmmNode e x -> Maybe (CmmNode e x)
 mapExpM _ (CmmEntry{})              = Nothing
@@ -503,7 +505,7 @@ mapExpM _ (CmmComment _)            = Nothing
 mapExpM _ (CmmTick _)               = Nothing
 mapExpM f (CmmUnwind regs)          = CmmUnwind `fmap` mapM (\(r,e) -> mapM f e >>= \e' -> pure (r,e')) regs
 mapExpM f (CmmAssign r e)           = CmmAssign r `fmap` f e
-mapExpM f (CmmStore addr e)         = (\[addr', e'] -> CmmStore addr' e') `fmap` mapListM f [addr, e]
+mapExpM f (CmmStore addr e align)   = (\[addr', e'] -> CmmStore addr' e' align) `fmap` mapListM f [addr, e]
 mapExpM _ (CmmBranch _)             = Nothing
 mapExpM f (CmmCondBranch e ti fi l) = (\x -> CmmCondBranch x ti fi l) `fmap` f e
 mapExpM f (CmmSwitch e tbl)         = (\x -> CmmSwitch x tbl)       `fmap` f e
@@ -546,9 +548,9 @@ foldExpForeignTarget _   (PrimTarget _)      z = z
 -- Specifically (wrapRecExpf f e z) deals with CmmMachOp and CmmLoad
 -- itself, delegating all the other CmmExpr forms to 'f'.
 wrapRecExpf :: (CmmExpr -> z -> z) -> CmmExpr -> z -> z
-wrapRecExpf f e@(CmmMachOp _ es) z = foldr (wrapRecExpf f) (f e z) es
-wrapRecExpf f e@(CmmLoad addr _) z = wrapRecExpf f addr (f e z)
-wrapRecExpf f e                  z = f e z
+wrapRecExpf f e@(CmmMachOp _ es)   z = foldr (wrapRecExpf f) (f e z) es
+wrapRecExpf f e@(CmmLoad addr _ _) z = wrapRecExpf f addr (f e z)
+wrapRecExpf f e                    z = f e z
 
 foldExp :: (CmmExpr -> z -> z) -> CmmNode e x -> z -> z
 foldExp _ (CmmEntry {}) z                         = z
@@ -556,7 +558,7 @@ foldExp _ (CmmComment {}) z                       = z
 foldExp _ (CmmTick {}) z                          = z
 foldExp f (CmmUnwind xs) z                        = foldr (maybe id f) z (map snd xs)
 foldExp f (CmmAssign _ e) z                       = f e z
-foldExp f (CmmStore addr e) z                     = f addr $ f e z
+foldExp f (CmmStore addr e _) z                   = f addr $ f e z
 foldExp f (CmmUnsafeForeignCall t _ as) z         = foldr f (foldExpForeignTarget f t z) as
 foldExp _ (CmmBranch _) z                         = z
 foldExp f (CmmCondBranch e _ _ _) z               = f e z
@@ -594,9 +596,6 @@ mapCollectSuccessors f (CmmSwitch e ids)
 mapCollectSuccessors _ n = (n, [])
 
 -- -----------------------------------------------------------------------------
-
--- | Tickish in Cmm context (annotations only)
-type CmmTickish = Tickish ()
 
 -- | Tick scope identifier, allowing us to reason about what
 -- annotations in a Cmm block should scope over. We especially take
@@ -643,8 +642,8 @@ data CmmTickScope
     -- the new block could have a combined tick scope a/c+b/d, which
     -- both tick<2> and tick<3> apply to.
 
--- Note [CmmTick scoping details]:
---
+-- Note [CmmTick scoping details]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 -- The scope of a @CmmTick@ is given by the @CmmEntry@ node of the
 -- same block. Note that as a result of this, optimisations making
 -- tick scopes more specific can *reduce* the amount of code a tick

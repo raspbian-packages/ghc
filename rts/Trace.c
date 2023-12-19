@@ -29,28 +29,32 @@
 #endif
 
 // events
-int TRACE_sched;
-int TRACE_gc;
-int TRACE_nonmoving_gc;
-int TRACE_spark_sampled;
-int TRACE_spark_full;
-int TRACE_user;
-int TRACE_cap;
+uint8_t TRACE_sched;
+uint8_t TRACE_gc;
+uint8_t TRACE_nonmoving_gc;
+uint8_t TRACE_spark_sampled;
+uint8_t TRACE_spark_full;
+uint8_t TRACE_user;
+uint8_t TRACE_cap;
 
 #if defined(THREADED_RTS)
 static Mutex trace_utx;
+#endif
+
+#if defined(DEBUG)
+static void traceCap_stderr(Capability *cap, char *msg, ...);
 #endif
 
 /* ---------------------------------------------------------------------------
    Starting up / shutting down the tracing facilities
  --------------------------------------------------------------------------- */
 
-void initTracing (void)
+/*
+ * Update the TRACE_* globals. Must be called whenever RtsFlags.TraceFlags is
+ * modified.
+ */
+static void updateTraceFlagCache (void)
 {
-#if defined(THREADED_RTS)
-    initMutex(&trace_utx);
-#endif
-
     // -Ds turns on scheduler tracing too
     TRACE_sched =
         RtsFlags.TraceFlags.scheduler ||
@@ -61,9 +65,6 @@ void initTracing (void)
         RtsFlags.TraceFlags.gc ||
         RtsFlags.DebugFlags.gc ||
         RtsFlags.DebugFlags.scheduler;
-    if (TRACE_gc && RtsFlags.GcFlags.giveStats == NO_GC_STATS) {
-        RtsFlags.GcFlags.giveStats = COLLECT_GC_STATS;
-    }
 
     TRACE_nonmoving_gc =
         RtsFlags.TraceFlags.nonmoving_gc;
@@ -86,6 +87,19 @@ void initTracing (void)
         TRACE_spark_sampled ||
         TRACE_spark_full ||
         TRACE_user;
+}
+
+void initTracing (void)
+{
+#if defined(THREADED_RTS)
+    initMutex(&trace_utx);
+#endif
+
+    updateTraceFlagCache();
+
+    if (TRACE_gc && RtsFlags.GcFlags.giveStats == NO_GC_STATS) {
+        RtsFlags.GcFlags.giveStats = COLLECT_GC_STATS;
+    }
 
     /* Note: we can have any of the TRACE_* flags turned on even when
        eventlog_enabled is off. In the DEBUG way we may be tracing to stderr.
@@ -93,6 +107,10 @@ void initTracing (void)
     initEventLogging();
 
     if (RtsFlags.TraceFlags.tracing == TRACE_EVENTLOG
+            && RtsFlags.TraceFlags.nullWriter) {
+        startEventLogging(&NullEventLogWriter);
+    }
+    else if (RtsFlags.TraceFlags.tracing == TRACE_EVENTLOG
             && rtsConfig.eventlog_writer != NULL) {
         startEventLogging(rtsConfig.eventlog_writer);
     }
@@ -121,7 +139,7 @@ void resetTracing (void)
 void flushTrace (void)
 {
     if (eventlog_enabled) {
-        flushEventLog();
+        flushEventLog(NULL);
     }
 }
 
@@ -165,12 +183,12 @@ static char *thread_stop_reasons[] = {
     [6 + BlockedOnSTM]          = "blocked on STM",
     [6 + BlockedOnDoProc]       = "blocked on asyncDoProc",
     [6 + BlockedOnCCall]        = "blocked on a foreign call",
-    [6 + BlockedOnIOCompletion] = "blocked on I/O Completion port",
     [6 + BlockedOnCCall_Interruptible] = "blocked on a foreign call (interruptible)",
     [6 + BlockedOnMsgThrowTo]   =  "blocked on throwTo",
     [6 + ThreadMigrating]       =  "migrating"
 };
 #endif
+
 
 #if defined(DEBUG)
 static void traceSchedEvent_stderr (Capability *cap, EventTypeNum tag,
@@ -213,7 +231,7 @@ static void traceSchedEvent_stderr (Capability *cap, EventTypeNum tag,
             debugBelch("cap %d: thread %" FMT_Word "[\"%s\"]" " stopped (blocked on black hole owned by thread %lu)\n",
                        cap->no, (W_)tso->id, threadLabel, (long)info2);
         } else if (info1 == StackOverflow) {
-            debugBelch("cap %d: thead %" FMT_Word "[\"%s\"]"
+            debugBelch("cap %d: thread %" FMT_Word "[\"%s\"]"
                        " stopped (stack overflow, size %lu)\n",
                       cap->no, (W_)tso->id, threadLabel, (long)info2);
 
@@ -366,6 +384,23 @@ void traceEventGcStats_  (Capability *cap,
                          copied, slop, fragmentation,
                          par_n_threads, par_max_copied,
                          par_tot_copied, par_balanced_copied);
+    }
+}
+
+void traceEventMemReturn_ (Capability *cap,
+                          uint32_t    current_mblocks,
+                          uint32_t    needed_mblocks,
+                          uint32_t    returned_mblocks)
+{
+#if defined(DEBUG)
+    if (RtsFlags.TraceFlags.tracing == TRACE_STDERR) {
+        traceCap_stderr(cap, "Memory Return (Current: %u) (Needed: %u) (Returned: %u)"
+                       , current_mblocks, needed_mblocks, returned_mblocks);
+    } else
+#endif
+    {
+        postEventMemReturn( cap, CAPSET_HEAP_DEFAULT
+                          , current_mblocks, needed_mblocks, returned_mblocks);
     }
 }
 
@@ -638,6 +673,25 @@ void traceHeapProfSampleString(StgWord8 profile_id,
     }
 }
 
+void traceIPE(const InfoProvEnt *ipe)
+{
+#if defined(DEBUG)
+    if (RtsFlags.TraceFlags.tracing == TRACE_STDERR) {
+        ACQUIRE_LOCK(&trace_utx);
+
+        tracePreface();
+        debugBelch("IPE: table_name %s, closure_desc %s, ty_desc %s, label %s, module %s, srcloc %s\n",
+                   ipe->prov.table_name, ipe->prov.closure_desc, ipe->prov.ty_desc,
+                   ipe->prov.label, ipe->prov.module, ipe->prov.srcloc);
+
+        RELEASE_LOCK(&trace_utx);
+    } else
+#endif
+    if (eventlog_enabled) {
+        postIPE(ipe);
+    }
+}
+
 #if defined(PROFILING)
 void traceHeapProfCostCentre(StgWord32 ccID,
                              const char *label,
@@ -812,7 +866,7 @@ void traceThreadLabel_(Capability *cap,
     }
 }
 
-void traceConcMarkBegin()
+void traceConcMarkBegin(void)
 {
     if (eventlog_enabled)
         postEventNoCap(EVENT_CONC_MARK_BEGIN);
@@ -824,25 +878,25 @@ void traceConcMarkEnd(StgWord32 marked_obj_count)
         postConcMarkEnd(marked_obj_count);
 }
 
-void traceConcSyncBegin()
+void traceConcSyncBegin(void)
 {
     if (eventlog_enabled)
         postEventNoCap(EVENT_CONC_SYNC_BEGIN);
 }
 
-void traceConcSyncEnd()
+void traceConcSyncEnd(void)
 {
     if (eventlog_enabled)
         postEventNoCap(EVENT_CONC_SYNC_END);
 }
 
-void traceConcSweepBegin()
+void traceConcSweepBegin(void)
 {
     if (eventlog_enabled)
         postEventNoCap(EVENT_CONC_SWEEP_BEGIN);
 }
 
-void traceConcSweepEnd()
+void traceConcSweepEnd(void)
 {
     if (eventlog_enabled)
         postEventNoCap(EVENT_CONC_SWEEP_END);

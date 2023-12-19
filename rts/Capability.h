@@ -27,6 +27,15 @@
 
 #include "BeginPrivate.h"
 
+// We never want a Capability to overlap a cache line with
+// anything else, so round it up to a cache line size:
+#if defined(s390x_HOST_ARCH)
+#define CAPABILITY_ALIGNMENT 256
+#else
+#define CAPABILITY_ALIGNMENT 64
+#endif
+
+/* N.B. This must be consistent with CapabilityPublic in RtsAPI.h */
 struct Capability_ {
     // State required by the STG virtual machine when running Haskell
     // code.  During STG execution, the BaseReg register always points
@@ -87,11 +96,16 @@ struct Capability_ {
 
     // The update remembered set for the non-moving collector
     UpdRemSet upd_rem_set;
+    // Array of current segments for the non-moving collector.
+    // Of length NONMOVING_ALLOCA_CNT.
+    struct NonmovingSegment **current_segments;
 
     // block for allocating pinned objects into
     bdescr *pinned_object_block;
     // full pinned object blocks allocated since the last GC
     bdescr *pinned_object_blocks;
+    // empty pinned object blocks, to be allocated into
+    bdescr *pinned_object_empty;
 
     // per-capability weak pointer list associated with nursery (older
     // lists stored in generation object)
@@ -166,14 +180,12 @@ struct Capability_ {
     StgTRecHeader *free_trec_headers;
     uint32_t transaction_tokens;
 } // typedef Capability is defined in RtsAPI.h
-  // We never want a Capability to overlap a cache line with anything
-  // else, so round it up to a cache line size:
-#if defined(s390x_HOST_ARCH)
-  ATTRIBUTE_ALIGNED(256)
-#elif !defined(mingw32_HOST_OS)
-  ATTRIBUTE_ALIGNED(64)
-#endif
-  ;
+  ATTRIBUTE_ALIGNED(CAPABILITY_ALIGNMENT)
+;
+
+// We allocate arrays of Capabilities therefore we must ensure that the size is
+// a multiple of the claimed alignment
+GHC_STATIC_ASSERT(sizeof(struct Capability_) % CAPABILITY_ALIGNMENT == 0, "Capability size does not match cache size");
 
 #if defined(THREADED_RTS)
 #define ASSERT_TASK_ID(task) ASSERT(task->id == osThreadId())
@@ -250,15 +262,20 @@ INLINE_HEADER void releaseCapability_ (Capability* cap STG_UNUSED,
                                        bool always_wakeup STG_UNUSED) {};
 #endif
 
-// declared in includes/rts/Threads.h:
+// declared in rts/include/rts/Threads.h:
 // extern Capability MainCapability;
 
-// declared in includes/rts/Threads.h:
+// declared in rts/include/rts/Threads.h:
 // extern uint32_t n_capabilities;
 // extern uint32_t enabled_capabilities;
 
 // Array of all the capabilities
 extern Capability **capabilities;
+
+INLINE_HEADER Capability *getCapability(uint32_t i)
+{
+    return RELAXED_LOAD(&capabilities)[i];
+}
 
 //
 // Types of global synchronisation
@@ -267,7 +284,8 @@ typedef enum {
     SYNC_OTHER,
     SYNC_GC_SEQ,
     SYNC_GC_PAR,
-    SYNC_FLUSH_UPD_REM_SET
+    SYNC_FLUSH_UPD_REM_SET,
+    SYNC_FLUSH_EVENT_LOG
 } SyncType;
 
 //
@@ -462,22 +480,21 @@ stopCapability (Capability *cap)
     // It may not work - the thread might be updating HpLim itself
     // at the same time - so we also have the context_switch/interrupted
     // flags as a sticky way to tell the thread to stop.
-    TSAN_ANNOTATE_BENIGN_RACE(&cap->r.rHpLim, "stopCapability");
-    SEQ_CST_STORE(&cap->r.rHpLim, NULL);
+    RELAXED_STORE_ALWAYS(&cap->r.rHpLim, NULL);
 }
 
 INLINE_HEADER void
 interruptCapability (Capability *cap)
 {
     stopCapability(cap);
-    SEQ_CST_STORE(&cap->interrupt, true);
+    RELAXED_STORE_ALWAYS(&cap->interrupt, true);
 }
 
 INLINE_HEADER void
 contextSwitchCapability (Capability *cap)
 {
     stopCapability(cap);
-    SEQ_CST_STORE(&cap->context_switch, true);
+    RELAXED_STORE_ALWAYS(&cap->context_switch, true);
 }
 
 #if defined(THREADED_RTS)

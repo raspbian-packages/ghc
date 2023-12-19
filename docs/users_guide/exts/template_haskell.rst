@@ -6,10 +6,10 @@ Template Haskell
 Template Haskell allows you to do compile-time meta-programming in
 Haskell. The background to the main technical innovations is discussed
 in "`Template Meta-programming for
-Haskell <http://research.microsoft.com/~simonpj/papers/meta-haskell/>`__"
+Haskell <https://research.microsoft.com/~simonpj/papers/meta-haskell/>`__"
 (Proc Haskell Workshop 2002).
 
-The `Template Haskell <http://www.haskell.org/haskellwiki/Template_Haskell>`__
+The `Template Haskell <https://www.haskell.org/haskellwiki/Template_Haskell>`__
 page on the GHC Wiki has a wealth of information. You may also consult the
 Haddock reference documentation :th-ref:`Language.Haskell.TH.`.
 Many changes to the original
@@ -22,7 +22,7 @@ as a worked example to help get you started.
 
 The documentation here describes the realisation of Template Haskell in
 GHC. It is not detailed enough to understand Template Haskell; see the
-`Wiki page <http://haskell.org/haskellwiki/Template_Haskell>`__.
+`Wiki page <https://haskell.org/haskellwiki/Template_Haskell>`__.
 
 .. _th-syntax:
 
@@ -133,6 +133,9 @@ The :extension:`TemplateHaskellQuotes` extension is considered safe under
 
    A top-level typed expression splice can occur in place of an expression; the
    spliced expression must have type ``Code Q a``
+
+   **NOTE**: Currently typed splices may inhibit the unused identifier warning for
+   identifiers in scope. See `#16524 <https://gitlab.haskell.org/ghc/ghc/-/issues/16524>`
 
 -  A *typed* expression quotation is written as ``[|| ... ||]``, or
    ``[e|| ... ||]``, where the "..." is an expression; if the "..."
@@ -386,7 +389,7 @@ splices and quotations are supported.)
 .. ghc-flag:: -fenable-th-splice-warnings
     :shortdesc: Generate warnings for Template Haskell splices
     :type: dynamic
-    :reverse: -fno-enable-th-splices
+    :reverse: -fno-enable-th-splice-warnings
     :category: warnings
 
     Template Haskell splices won't be checked for warnings, because the code
@@ -627,7 +630,7 @@ Quasi-quotation allows patterns and expressions to be written using
 programmer-defined concrete syntax; the motivation behind the extension
 and several examples are documented in "`Why It's Nice to be Quoted:
 Quasiquoting for
-Haskell <http://www.cs.tufts.edu/comp/150FP/archive/geoff-mainland/quasiquoting.pdf>`__"
+Haskell <https://www.cs.tufts.edu/comp/150FP/archive/geoff-mainland/quasiquoting.pdf>`__"
 (Proc Haskell Workshop 2007). The example below shows how to write a
 quasiquoter for a simple expression language.
 

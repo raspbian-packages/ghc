@@ -22,6 +22,7 @@ module Language.Haskell.TH(
         -- *** Reify
         reify,            -- :: Name -> Q Info
         reifyModule,
+        newDeclarationGroup,
         Info(..), ModuleInfo(..),
         InstanceDec,
         ParentName,
@@ -89,6 +90,9 @@ module Language.Haskell.TH(
         Type(..), TyVarBndr(..), TyLit(..), Kind, Cxt, Pred, Syntax.Role(..),
         Syntax.Specificity(..),
         FamilyResultSig(..), Syntax.InjectivityAnn(..), PatSynType, BangType, VarBangType,
+
+    -- ** Documentation
+        putDoc, getDoc, DocLoc(..),
 
     -- * Library functions
     module Language.Haskell.TH.Lib,

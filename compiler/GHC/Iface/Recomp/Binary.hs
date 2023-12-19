@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP #-}
+
 
 -- | Computing fingerprints of values serializeable with GHC's \"Binary\" module.
 module GHC.Iface.Recomp.Binary
@@ -8,15 +8,12 @@ module GHC.Iface.Recomp.Binary
   , putNameLiterally
   ) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
 import GHC.Utils.Fingerprint
 import GHC.Utils.Binary
 import GHC.Types.Name
 import GHC.Utils.Panic.Plain
-import GHC.Utils.Misc
 
 fingerprintBinMem :: BinHandle -> IO Fingerprint
 fingerprintBinMem bh = withBinBuffer bh f
@@ -35,8 +32,7 @@ computeFingerprint :: (Binary a)
 computeFingerprint put_nonbinding_name a = do
     bh <- fmap set_user_data $ openBinMem (3*1024) -- just less than a block
     put_ bh a
-    fp <- fingerprintBinMem bh
-    return fp
+    fingerprintBinMem bh
   where
     set_user_data bh =
       setUserData bh $ newWriteState put_nonbinding_name putNameLiterally putFS
@@ -44,6 +40,6 @@ computeFingerprint put_nonbinding_name a = do
 -- | Used when we want to fingerprint a structure without depending on the
 -- fingerprints of external Names that it refers to.
 putNameLiterally :: BinHandle -> Name -> IO ()
-putNameLiterally bh name = ASSERT( isExternalName name ) do
+putNameLiterally bh name = assert (isExternalName name) $ do
     put_ bh $! nameModule name
     put_ bh $! nameOccName name

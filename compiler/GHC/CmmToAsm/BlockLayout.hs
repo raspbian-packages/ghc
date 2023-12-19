@@ -1,48 +1,48 @@
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeFamilies #-}
+
 --
 -- Copyright (c) 2018 Andreas Klebinger
 --
-
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE FlexibleContexts #-}
 
 module GHC.CmmToAsm.BlockLayout
     ( sequenceTop, backendMaintainsCfg)
 where
 
-#include "HsVersions.h"
 import GHC.Prelude
+
+import GHC.Platform
 
 import GHC.CmmToAsm.Instr
 import GHC.CmmToAsm.Monad
 import GHC.CmmToAsm.CFG
+import GHC.CmmToAsm.Types
+import GHC.CmmToAsm.Config
 
-import GHC.Cmm.BlockId
 import GHC.Cmm
+import GHC.Cmm.BlockId
 import GHC.Cmm.Dataflow.Collections
 import GHC.Cmm.Dataflow.Label
 
-import GHC.Platform
-import GHC.Driver.Session (gopt, GeneralFlag(..), DynFlags, targetPlatform)
 import GHC.Types.Unique.FM
-import GHC.Utils.Misc
 
 import GHC.Data.Graph.Directed
-import GHC.Utils.Outputable
 import GHC.Data.Maybe
-
--- DEBUGGING ONLY
---import GHC.Cmm.DebugBlock
---import Debug.Trace
 import GHC.Data.List.SetOps (removeDups)
-
 import GHC.Data.OrdList
+
+import GHC.Utils.Trace
+import GHC.Utils.Outputable
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
+import GHC.Utils.Misc
+
 import Data.List (sortOn, sortBy, nub)
 import Data.Foldable (toList)
-
 import qualified Data.Set as Set
 import Data.STRef
 import Control.Monad.ST.Strict
@@ -67,10 +67,9 @@ import GHC.Data.UnionFind
   * Feed this CFG into the block layout code (`sequenceTop`) in this
     module. Which will then produce a code layout based on the input weights.
 
-  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  ~~~ Note [Chain based CFG serialization]
-  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+  Note [Chain based CFG serialization]
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   For additional information also look at
   https://gitlab.haskell.org/ghc/ghc/wikis/commentary/compiler/code-layout
 
@@ -189,10 +188,9 @@ import GHC.Data.UnionFind
   While E does not follow X it's still beneficial to place them near each other.
   This can be advantageous if eg C,X,E will end up in the same cache line.
 
-  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  ~~~ Note [Triangle Control Flow]
-  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+  Note [Triangle Control Flow]
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   Checking if an argument is already evaluated leads to a somewhat
   special case  which looks like this:
 
@@ -240,10 +238,9 @@ import GHC.Data.UnionFind
   Assuming that Lwork is large the chance that the "call" ends up
   in the same cache line is also fairly small.
 
-  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  ~~~ Note [Layout relevant edge weights]
-  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+  Note [Layout relevant edge weights]
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   The input to the chain based code layout algorithm is a CFG
   with edges annotated with their frequency. The frequency
   of traversal corresponds quite well to the cost of not placing
@@ -309,7 +306,7 @@ instance Eq BlockChain where
 -- in the chain.
 instance Ord (BlockChain) where
    (BlockChain lbls1) `compare` (BlockChain lbls2)
-       = ASSERT(toList lbls1 /= toList lbls2 || lbls1 `strictlyEqOL` lbls2)
+       = assert (toList lbls1 /= toList lbls2 || lbls1 `strictlyEqOL` lbls2) $
          strictlyOrdOL lbls1 lbls2
 
 instance Outputable (BlockChain) where
@@ -373,9 +370,9 @@ takeL :: Int -> BlockChain -> [BlockId]
 takeL n (BlockChain blks) =
     take n . fromOL $ blks
 
+
 -- Note [Combining neighborhood chains]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 -- See also Note [Chain based CFG serialization]
 -- We have the chains (A-B-C-D) and (E-F) and an Edge C->E.
 --
@@ -472,7 +469,6 @@ combineNeighbourhood edges chains
                  applyEdges edges newEnds newFronts (Set.insert (from,to) combined)
             | otherwise
             = applyEdges edges chainEnds chainFronts combined
-         where
 
         getFronts chain = takeL neighbourOverlapp chain
         getEnds chain = takeR neighbourOverlapp chain
@@ -526,7 +522,7 @@ mergeChains edges chains
 -- An Edge is irrelevant if the ends are part of the same chain.
 -- We say these edges are already linked
 buildChains :: [CfgEdge] -> [BlockId]
-            -> ( LabelMap BlockChain  -- Resulting chains, indexd by end if chain.
+            -> ( LabelMap BlockChain  -- Resulting chains, indexed by end if chain.
                , Set.Set (BlockId, BlockId)) --List of fused edges.
 buildChains edges blocks
   = runST $ buildNext setEmpty mapEmpty mapEmpty edges Set.empty
@@ -574,19 +570,14 @@ buildChains edges blocks
         , Just predChain <- mapLookup from chainEnds
         , Just succChain <- mapLookup to chainStarts
         , predChain /= succChain -- Otherwise we try to create a cycle.
-        = do
-            -- pprTraceM "Fusing edge" (ppr edge)
-            fuseChain predChain succChain
+          = fuseChain predChain succChain
 
         | (alreadyPlaced from) &&
           (alreadyPlaced to)
-        =   --pprTraceM "Skipping:" (ppr edge) >>
-            buildNext placed chainStarts chainEnds todo linked
+          = buildNext placed chainStarts chainEnds todo linked
 
         | otherwise
-        = do -- pprTraceM "Finding chain for:" (ppr edge $$
-             --         text "placed" <+> ppr placed)
-             findChain
+          = findChain
       where
         from = edgeFrom edge
         to   = edgeTo   edge
@@ -655,7 +646,7 @@ buildChains edges blocks
 
 -- | Place basic blocks based on the given CFG.
 -- See Note [Chain based CFG serialization]
-sequenceChain :: forall a i. (Instruction i, Outputable i)
+sequenceChain :: forall a i. Instruction i
               => LabelMap a -- ^ Keys indicate an info table on the block.
               -> CFG -- ^ Control flow graph and some meta data.
               -> [GenBasicBlock i] -- ^ List of basic blocks to be placed.
@@ -711,7 +702,7 @@ sequenceChain  info weights     blocks@((BasicBlock entry _):_) =
             directEdges
 
         (neighbourChains, combined)
-            = ASSERT(noDups $ mapElems builtChains)
+            = assert (noDups $ mapElems builtChains) $
               {-# SCC "groupNeighbourChains" #-}
             --   pprTraceIt "NeighbourChains" $
               combineNeighbourhood rankedEdges (mapElems builtChains)
@@ -751,7 +742,7 @@ sequenceChain  info weights     blocks@((BasicBlock entry _):_) =
 #endif
 
         blockList
-            = ASSERT(noDups [masterChain])
+            = assert (noDups [masterChain])
               (concatMap fromOL $ map chainBlocks prepedChains)
 
         --chainPlaced = setFromList $ map blockId blockList :: LabelSet
@@ -765,14 +756,14 @@ sequenceChain  info weights     blocks@((BasicBlock entry _):_) =
             -- We want debug builds to catch this as it's a good indicator for
             -- issues with CFG invariants. But we don't want to blow up production
             -- builds if something slips through.
-            ASSERT(null unplaced)
+            assert (null unplaced) $
             --pprTraceIt "placedBlocks" $
             -- ++ [] is stil kinda expensive
             if null unplaced then blockList else blockList ++ unplaced
         getBlock bid = expectJust "Block placement" $ mapLookup bid blockMap
     in
         --Assert we placed all blocks given as input
-        ASSERT(all (\bid -> mapMember bid blockMap) placedBlocks)
+        assert (all (\bid -> mapMember bid blockMap) placedBlocks) $
         dropJumps info $ map getBlock placedBlocks
 
 {-# SCC dropJumps #-}
@@ -802,31 +793,33 @@ dropJumps info ((BasicBlock lbl ins):todo)
 -- fallthroughs.
 
 sequenceTop
-    :: (Instruction instr, Outputable instr)
-    => DynFlags -- Determine which layout algo to use
-    -> NcgImpl statics instr jumpDest
+    :: Instruction instr
+    => NcgImpl statics instr jumpDest
     -> Maybe CFG -- ^ CFG if we have one.
     -> NatCmmDecl statics instr -- ^ Function to serialize
     -> NatCmmDecl statics instr
 
-sequenceTop _     _       _           top@(CmmData _ _) = top
-sequenceTop dflags ncgImpl edgeWeights
-            (CmmProc info lbl live (ListGraph blocks))
-  | (gopt Opt_CfgBlocklayout dflags) && backendMaintainsCfg (targetPlatform dflags)
-  --Use chain based algorithm
-  , Just cfg <- edgeWeights
-  = CmmProc info lbl live ( ListGraph $ ncgMakeFarBranches ncgImpl info $
-                            {-# SCC layoutBlocks #-}
-                            sequenceChain info cfg blocks )
-  | otherwise
-  --Use old algorithm
-  = let cfg = if dontUseCfg then Nothing else edgeWeights
-    in  CmmProc info lbl live ( ListGraph $ ncgMakeFarBranches ncgImpl info $
-                                {-# SCC layoutBlocks #-}
-                                sequenceBlocks cfg info blocks)
-  where
-    dontUseCfg = gopt Opt_WeightlessBlocklayout dflags ||
-                 (not $ backendMaintainsCfg (targetPlatform dflags))
+sequenceTop _       _           top@(CmmData _ _) = top
+sequenceTop ncgImpl edgeWeights (CmmProc info lbl live (ListGraph blocks))
+  = let
+      config     = ncgConfig ncgImpl
+      platform   = ncgPlatform config
+
+    in CmmProc info lbl live $ ListGraph $ ncgMakeFarBranches ncgImpl info $
+         if -- Chain based algorithm
+            | ncgCfgBlockLayout config
+            , backendMaintainsCfg platform
+            , Just cfg <- edgeWeights
+            -> {-# SCC layoutBlocks #-} sequenceChain info cfg blocks
+
+            -- Old algorithm without edge weights
+            | ncgCfgWeightlessLayout config
+               || not (backendMaintainsCfg platform)
+            -> {-# SCC layoutBlocks #-} sequenceBlocks Nothing info blocks
+
+            -- Old algorithm with edge weights (if any)
+            | otherwise
+            -> {-# SCC layoutBlocks #-} sequenceBlocks edgeWeights info blocks
 
 -- The old algorithm:
 -- It is very simple (and stupid): We make a graph out of

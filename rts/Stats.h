@@ -14,15 +14,6 @@
 
 #include "BeginPrivate.h"
 
-#if defined(mingw32_HOST_OS)
-/* On Win64, if we say "printf" then gcc thinks we are going to use
-   MS format specifiers like %I64d rather than %llu */
-#define PRINTF gnu_printf
-#else
-/* However, on OS X, "gnu_printf" isn't recognised */
-#define PRINTF printf
-#endif
-
 struct gc_thread_;
 
 void      stat_startInit(void);
@@ -36,9 +27,7 @@ void      stat_endGC  (Capability *cap, struct gc_thread_ *initiating_gct, W_ li
                        W_ copied, W_ slop, uint32_t gen,
                        uint32_t n_gc_threads, struct gc_thread_ **gc_threads,
                        W_ par_max_copied, W_ par_balanced_copied,
-                       W_ gc_spin_spin, W_ gc_spin_yield, W_ mut_spin_spin,
-                       W_ mut_spin_yield, W_ any_work, W_ no_work,
-                       W_ scav_find_work);
+                       W_ any_work, W_ scav_find_work, W_ max_n_todo_overflow);
 
 void      stat_startNonmovingGcSync(void);
 void      stat_endNonmovingGcSync(void);

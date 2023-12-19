@@ -1,4 +1,3 @@
-{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
@@ -19,7 +18,7 @@
 -- License     :  BSD-style (see the file libraries/base/LICENSE)
 --
 -- Maintainer  :  libraries@haskell.org
--- Stability   :  experimental
+-- Stability   :  stable
 -- Portability :  non-portable (local universal quantification)
 --
 -- \"Scrap your boilerplate\" --- Generic programming in Haskell.  See
@@ -86,6 +85,7 @@ module Data.Data (
         Fixity(..),
         -- ** Constructors
         mkConstr,
+        mkConstrTag,
         mkIntegralConstr,
         mkRealConstr,
         mkCharConstr,
@@ -121,6 +121,7 @@ import Data.Eq
 import Data.Maybe
 import Data.Monoid
 import Data.Ord
+import Data.List (findIndex)
 import Data.Typeable
 import Data.Version( Version(..) )
 import GHC.Base hiding (Any, IntRep, FloatRep)
@@ -630,10 +631,9 @@ mkDataType str cs = DataType
                         , datarep = AlgRep cs
                         }
 
-
 -- | Constructs a constructor
-mkConstr :: DataType -> String -> [String] -> Fixity -> Constr
-mkConstr dt str fields fix =
+mkConstrTag :: DataType -> String -> Int -> [String] -> Fixity -> Constr
+mkConstrTag dt str idx fields fix =
         Constr
                 { conrep    = AlgConstr idx
                 , constring = str
@@ -641,9 +641,15 @@ mkConstr dt str fields fix =
                 , confixity = fix
                 , datatype  = dt
                 }
+
+-- | Constructs a constructor
+mkConstr :: DataType -> String -> [String] -> Fixity -> Constr
+mkConstr dt str fields fix = mkConstrTag dt str idx fields fix
   where
-    idx = head [ i | (c,i) <- dataTypeConstrs dt `zip` [1..],
-                     showConstr c == str ]
+    idx = case findIndex (\c -> showConstr c == str) (dataTypeConstrs dt) of
+            Just i  -> i+1 -- ConTag starts at 1
+            Nothing -> errorWithoutStackTrace $
+                        "Data.Data.mkConstr: couldn't find constructor " ++ str
 
 
 -- | Gets the constructors of an algebraic datatype

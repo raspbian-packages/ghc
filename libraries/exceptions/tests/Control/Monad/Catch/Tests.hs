@@ -4,13 +4,19 @@
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE CPP #-}
 
+#if !(MIN_VERSION_transformers(0,6,0))
+{-# OPTIONS_GHC -fno-warn-deprecations #-}
+#endif
+
 module Control.Monad.Catch.Tests (tests) where
 
 #if defined(__GLASGOW_HASKELL__) && (__GLASGOW_HASKELL__ < 706)
 import Prelude hiding (catch)
 #endif
 
+#if !(MIN_VERSION_base(4,8,0))
 import Control.Applicative ((<*>))
+#endif
 import Control.Monad (unless)
 import Data.Data (Data, Typeable)
 import Data.IORef (newIORef, writeIORef, readIORef)
@@ -18,24 +24,25 @@ import Data.IORef (newIORef, writeIORef, readIORef)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Identity (IdentityT(..))
 import Control.Monad.Reader (ReaderT(..))
-import Control.Monad.List (ListT(..))
 import Control.Monad.Trans.Maybe (MaybeT(..))
-import Control.Monad.Error (ErrorT(..))
 import Control.Monad.Trans.Except (ExceptT(..), runExceptT)
 import Control.Monad.STM (STM, atomically)
 --import Control.Monad.Cont (ContT(..))
 import Test.Framework (Test, testGroup)
 import Test.Framework.Providers.HUnit (testCase)
 import Test.Framework.Providers.QuickCheck2 (testProperty)
-import Test.QuickCheck (Property, once)
+import Test.QuickCheck (Property, ioProperty, once)
 import Test.QuickCheck.Monadic (monadic, run, assert)
-import Test.QuickCheck.Property (morallyDubiousIOProperty)
 import qualified Control.Monad.State.Lazy as LazyState
 import qualified Control.Monad.State.Strict as StrictState
 import qualified Control.Monad.Writer.Lazy as LazyWriter
 import qualified Control.Monad.Writer.Strict as StrictWriter
 import qualified Control.Monad.RWS.Lazy as LazyRWS
 import qualified Control.Monad.RWS.Strict as StrictRWS
+#if !(MIN_VERSION_transformers(0,6,0))
+import Control.Monad.Error (ErrorT(..))
+import Control.Monad.List (ListT(..))
+#endif
 
 import Control.Monad.Catch
 import Control.Monad.Catch.Pure
@@ -85,7 +92,7 @@ testDetectableEffect (SomeDetectableEffect (DetectableEffect mspec effectDetecto
     monadic (mspecRunner mspec) $ do
         effectWasPerformed <- run $ do
           (effect, detector) <- effectDetector
-          runExceptT $ ExceptT (return $ Left ()) `finally` lift effect
+          _ <- runExceptT $ ExceptT (return $ Left ()) `finally` lift effect
           detector
         assert effectWasPerformed
 
@@ -111,9 +118,11 @@ tests = testGroup "Control.Monad.Catch.Tests" $
         , SomeMSpec mspecLazyRWSTIO
         , SomeMSpec mspecStrictRWSTIO
 
-        , SomeMSpec mspecListTIO
         , SomeMSpec mspecMaybeTIO
+#if !(MIN_VERSION_transformers(0,6,0))
         , SomeMSpec mspecErrorTIO
+        , SomeMSpec mspecListTIO
+#endif
         , SomeMSpec mspecSTM
         --, SomeMSpec mspecContTIO
 
@@ -148,14 +157,16 @@ tests = testGroup "Control.Monad.Catch.Tests" $
     mspecStrictRWSTIO :: MSpec (StrictRWS.RWST () () Bool IO)
     mspecStrictRWSTIO = MSpec "StrictRWS.RWST IO" $ \m -> io $ fmap tfst $ StrictRWS.evalRWST m () False
 
-    mspecListTIO :: MSpec (ListT IO)
-    mspecListTIO = MSpec "ListT IO" $ \m -> io $ fmap (foldr const undefined) (runListT m)
-
     mspecMaybeTIO :: MSpec (MaybeT IO)
     mspecMaybeTIO = MSpec "MaybeT IO" $ \m -> io $ fmap (maybe undefined id) (runMaybeT m)
 
+#if !(MIN_VERSION_transformers(0,6,0))
     mspecErrorTIO :: MSpec (ErrorT String IO)
     mspecErrorTIO = MSpec "ErrorT IO" $ \m -> io $ fmap (either error id) (runErrorT m)
+
+    mspecListTIO :: MSpec (ListT IO)
+    mspecListTIO = MSpec "ListT IO" $ \m -> io $ fmap (foldr const undefined) (runListT m)
+#endif
 
     mspecSTM :: MSpec STM
     mspecSTM = MSpec "STM" $ io . atomically
@@ -172,7 +183,7 @@ tests = testGroup "Control.Monad.Catch.Tests" $
     tfst :: (Property, ()) -> Property = fst
     fromRight (Left _) = error "fromRight"
     fromRight (Right a) = a
-    io = morallyDubiousIOProperty
+    io = ioProperty
 
     detectableEffects =
         [ SomeDetectableEffect $ detectableEffectIO
@@ -183,29 +194,44 @@ tests = testGroup "Control.Monad.Catch.Tests" $
         ]
 
     detectableEffectIO :: DetectableEffect IO
-    detectableEffectIO = DetectableEffect mspecIO $ do
-      ref <- newIORef False
-      return (writeIORef ref True, readIORef ref)
+    detectableEffectIO = DetectableEffect
+      { detectableEffectMSpec = mspecIO
+      , detectableEffectEffectDetector = do
+          ref <- newIORef False
+          return (writeIORef ref True, readIORef ref)
+      }
 
     detectableEffectLazyStateTIO :: DetectableEffect (LazyState.StateT Bool IO)
-    detectableEffectLazyStateTIO = DetectableEffect mspecLazyStateTIO $ do
-      LazyState.put False
-      return (LazyState.put True, LazyState.get)
+    detectableEffectLazyStateTIO = DetectableEffect
+      { detectableEffectMSpec = mspecLazyStateTIO
+      , detectableEffectEffectDetector = do
+          LazyState.put False
+          return (LazyState.put True, LazyState.get)
+      }
 
     detectableEffectStrictStateTIO :: DetectableEffect (StrictState.StateT Bool IO)
-    detectableEffectStrictStateTIO = DetectableEffect mspecStrictStateTIO $ do
-      StrictState.put False
-      return (StrictState.put True, StrictState.get)
+    detectableEffectStrictStateTIO = DetectableEffect
+      { detectableEffectMSpec = mspecStrictStateTIO
+      , detectableEffectEffectDetector = do
+          StrictState.put False
+          return (StrictState.put True, StrictState.get)
+      }
 
     detectableEffectLazyRWSTIO :: DetectableEffect (LazyRWS.RWST () () Bool IO)
-    detectableEffectLazyRWSTIO = DetectableEffect mspecLazyRWSTIO $ do
-      LazyRWS.put False
-      return (LazyRWS.put True, LazyRWS.get)
+    detectableEffectLazyRWSTIO = DetectableEffect
+      { detectableEffectMSpec = mspecLazyRWSTIO
+      , detectableEffectEffectDetector = do
+          LazyRWS.put False
+          return (LazyRWS.put True, LazyRWS.get)
+      }
 
     detectableEffectStrictRWSTIO :: DetectableEffect (StrictRWS.RWST () () Bool IO)
-    detectableEffectStrictRWSTIO = DetectableEffect mspecStrictRWSTIO $ do
-      StrictRWS.put False
-      return (StrictRWS.put True, StrictRWS.get)
+    detectableEffectStrictRWSTIO = DetectableEffect
+      { detectableEffectMSpec = mspecStrictRWSTIO
+      , detectableEffectEffectDetector = do
+          StrictRWS.put False
+          return (StrictRWS.put True, StrictRWS.get)
+      }
 
     mkMonadCatch = mkMSpecTest "MonadCatch" testMonadCatch
     mkCatchJust = mkMSpecTest "catchJust" testCatchJust

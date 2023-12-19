@@ -40,7 +40,7 @@ ProjectGitCommitId = @ProjectGitCommitId@
 ################################################################################
 
 # A "platform" is the GNU cpu-type/manufacturer/operating-system target machine
-# specifier.  E.g. sparc-sun-solaris2
+# specifier.  E.g. x86_64-apple-darwin
 #
 # Build  platform: the platform on which we are doing this build
 # Host   platform: the platform on which these binaries will run
@@ -127,7 +127,6 @@ BuildVendor_CPP         = @BuildVendor_CPP@
 # Valid options: YES/NO
 #
 LeadingUnderscore=@LeadingUnderscore@
-SettingsUseDistroMINGW=@SettingsUseDistroMINGW@
 
 # Pin a suffix on executables? If so, what (Windows only).
 exeext0=@exeext_host@

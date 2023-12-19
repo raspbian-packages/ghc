@@ -17,19 +17,33 @@
 
 #if defined(TRACING)
 
-/*
- * Descriptions of EventTags for events.
- */
-extern char *EventTagDesc[];
-
 extern bool eventlog_enabled;
 
 void initEventLogging(void);
 void restartEventLogging(void);
+void finishCapEventLogging(void);
 void freeEventLogging(void);
 void abortEventLogging(void); // #4512 - after fork child needs to abort
-void flushEventLog(void);     // event log inherited from parent
 void moreCapEventBufs (uint32_t from, uint32_t to);
+void flushLocalEventsBuf(Capability *cap);
+void flushAllCapsEventsBufs(void);
+void flushAllEventsBufs(Capability *cap);
+
+typedef void (*EventlogInitPost)(void);
+
+// Events which are emitted during program start-up should be wrapped with
+// postInitEvent so that when the eventlog is restarted (possibly by an external
+// writer) then these events appear again at the start of the log.
+void postInitEvent(EventlogInitPost post_init);
+
+// Clear the init events buffer on program exit
+void resetInitEvents(void);
+
+typedef struct eventlog_init_func {
+    EventlogInitPost init_func;
+    struct eventlog_init_func * next;
+} eventlog_init_func_t;
+
 
 /*
  * Post a scheduler event to the capability's event buffer (an event
@@ -131,6 +145,13 @@ void postEventGcStats  (Capability    *cap,
                         W_           par_tot_copied,
                         W_           par_balanced_copied);
 
+void postEventMemReturn (Capability *cap,
+                        EventCapsetID  heap_capset,
+                         uint32_t current_mblocks,
+                         uint32_t needed_mblocks,
+                         uint32_t returned_mblocks
+                        );
+
 void postTaskCreateEvent (EventTaskId taskId,
                           EventCapNo cap,
                           EventKernelThreadId tid);
@@ -168,12 +189,24 @@ void postProfSampleCostCentre(Capability *cap,
 void postProfBegin(void);
 #endif /* PROFILING */
 
+void postIPE(const InfoProvEnt *ipe);
+
 void postConcUpdRemSetFlush(Capability *cap);
 void postConcMarkEnd(StgWord32 marked_obj_count);
 void postNonmovingHeapCensus(int log_blk_size,
                              const struct NonmovingAllocCensus *census);
 
+#if defined(TICKY_TICKY)
+void postTickyCounterDefs(StgEntCounter *p);
+void postTickyCounterSamples(StgEntCounter *p);
+#endif /* TICKY_TICKY */
+
 #else /* !TRACING */
+
+INLINE_HEADER void finishCapEventLogging(void) {}
+
+INLINE_HEADER void flushLocalEventsBuf(Capability *cap STG_UNUSED)
+{ /* nothing */ }
 
 INLINE_HEADER void postSchedEvent (Capability *cap  STG_UNUSED,
                                    EventTypeNum tag STG_UNUSED,
@@ -185,6 +218,13 @@ INLINE_HEADER void postSchedEvent (Capability *cap  STG_UNUSED,
 INLINE_HEADER void postEvent (Capability *cap  STG_UNUSED,
                               EventTypeNum tag STG_UNUSED)
 { /* nothing */ }
+
+typedef void (*EventlogInitPost)(void);
+
+INLINE_HEADER void postInitEvent(EventlogInitPost f STG_UNUSED)
+{ /* nothing */ } ;
+
+
 
 INLINE_HEADER void postEventNoCap (EventTypeNum tag STG_UNUSED)
 { /* nothing */ }

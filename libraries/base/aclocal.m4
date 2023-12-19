@@ -141,20 +141,20 @@ AC_DEFUN([FPTOOLS_CHECK_HTYPE_ELSE],[
         if test "$HTYPE_IS_INTEGRAL" -eq 0
         then
             dnl If the C type isn't an integer, we check if it's a pointer type
-            dnl by trying to dereference one of its values. If that fails to
+            dnl by trying to call memset() on it. If that fails to
             dnl compile, it's not a pointer, so we check to see if it's a
             dnl floating-point type.
             AC_COMPILE_IFELSE(
                 [AC_LANG_PROGRAM(
                     [FPTOOLS_HTYPE_INCLUDES],
-                    [$1 val; *val;]
+                    [$1 val; memset(val, 0, 0);]
                 )],
                 [HTYPE_IS_POINTER=yes],
                 [HTYPE_IS_POINTER=no])
 
             if test "$HTYPE_IS_POINTER" = yes
             then
-                AC_CV_NAME="Ptr ()"
+                AC_CV_NAME="CUIntPtr"
             else
                 FP_COMPUTE_INT([HTYPE_IS_FLOAT],[sizeof($1) == sizeof(float)],
                                [FPTOOLS_HTYPE_INCLUDES],
@@ -252,4 +252,20 @@ AS_IF([test "$ac_res" != no],
   $5],
       [$6])dnl
 AS_VAR_POPDEF([ac_Search])dnl
+])
+
+AC_DEFUN([FP_CHECK_ENVIRON],
+[
+  dnl--------------------------------------------------------------------
+  dnl * Check whether the libc headers provide a declaration for the
+  dnl environ symbol. If not then we will provide one in RtsSymbols.c.
+  dnl See #20512, #20577, #20861.
+  dnl
+  dnl N.B. Windows declares environ in <stdlib.h>; most others declare it
+  dnl in <unistd.h>.
+  dnl--------------------------------------------------------------------
+  AC_CHECK_DECLS([environ], [], [], [
+    #include <stdlib.h>
+    #include <unistd.h>
+  ])
 ])

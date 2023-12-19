@@ -1,4 +1,6 @@
-{-# LANGUAGE CPP, MagicHash #-}
+
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE LambdaCase #-}
 {-# OPTIONS_GHC -funbox-strict-fields #-}
 --
 --  (c) The University of Glasgow 2002-2006
@@ -6,10 +8,8 @@
 
 -- | Bytecode instruction definitions
 module GHC.ByteCode.Instr (
-        BCInstr(..), ProtoBCO(..), bciStackUse,
+        BCInstr(..), ProtoBCO(..), bciStackUse, LocalLabel(..)
   ) where
-
-#include "HsVersions.h"
 
 import GHC.Prelude
 
@@ -17,21 +17,20 @@ import GHC.ByteCode.Types
 import GHCi.RemoteTypes
 import GHCi.FFI (C_ffi_cif)
 import GHC.StgToCmm.Layout     ( ArgRep(..) )
-import GHC.Core.Ppr
 import GHC.Utils.Outputable
-import GHC.Data.FastString
 import GHC.Types.Name
 import GHC.Types.Unique
-import GHC.Types.Id
-import GHC.Core
 import GHC.Types.Literal
 import GHC.Core.DataCon
-import GHC.Types.Var.Set
 import GHC.Builtin.PrimOps
 import GHC.Runtime.Heap.Layout
 
+import Data.Int
 import Data.Word
+
 import GHC.Stack.CCS (CostCentre)
+
+import GHC.Stg.Syntax
 
 -- ----------------------------------------------------------------------------
 -- Bytecode instructions
@@ -45,12 +44,17 @@ data ProtoBCO a
         protoBCOBitmapSize :: Word16,
         protoBCOArity      :: Int,
         -- what the BCO came from, for debugging only
-        protoBCOExpr       :: Either  [AnnAlt Id DVarSet] (AnnExpr Id DVarSet),
+        protoBCOExpr       :: Either [CgStgAlt] CgStgRhs,
         -- malloc'd pointers
         protoBCOFFIs       :: [FFIInfo]
    }
 
-type LocalLabel = Word16
+-- | A local block label (e.g. identifying a case alternative).
+newtype LocalLabel = LocalLabel { getLocalLabel :: Word32 }
+  deriving (Eq, Ord)
+
+instance Outputable LocalLabel where
+  ppr (LocalLabel lbl) = text "lbl:" <> ppr lbl
 
 data BCInstr
    -- Messing with the stack
@@ -84,8 +88,10 @@ data BCInstr
    | PUSH_BCO     (ProtoBCO Name)
 
    -- Push an alt continuation
-   | PUSH_ALTS          (ProtoBCO Name)
-   | PUSH_ALTS_UNLIFTED (ProtoBCO Name) ArgRep
+   | PUSH_ALTS          (ProtoBCO Name) ArgRep
+   | PUSH_ALTS_TUPLE    (ProtoBCO Name) -- continuation
+                        !NativeCallInfo
+                        (ProtoBCO Name) -- tuple return BCO
 
    -- Pushing 8, 16 and 32 bits of padding (for constructors).
    | PUSH_PAD8
@@ -105,6 +111,10 @@ data BCInstr
         -- quite impossible to convert an Addr to any other integral
         -- type, and it appears impossible to get hold of the bits of
         -- an addr, even though we need to assemble BCOs.
+
+   -- Push a top-level Addr#. This is a pseudo-instruction assembled to PUSH_UBX,
+   -- see Note [Generating code for top-level string literal bindings] in GHC.StgToByteCode.
+   | PUSH_ADDR Name
 
    -- various kinds of application
    | PUSH_APPLY_N
@@ -137,6 +147,22 @@ data BCInstr
    | TESTEQ_I  Int    LocalLabel
    | TESTLT_W  Word   LocalLabel
    | TESTEQ_W  Word   LocalLabel
+   | TESTLT_I64 Int64 LocalLabel
+   | TESTEQ_I64 Int64 LocalLabel
+   | TESTLT_I32 Int32 LocalLabel
+   | TESTEQ_I32 Int32 LocalLabel
+   | TESTLT_I16 Int16 LocalLabel
+   | TESTEQ_I16 Int16 LocalLabel
+   | TESTLT_I8 Int8   LocalLabel
+   | TESTEQ_I8 Int16  LocalLabel
+   | TESTLT_W64 Word64 LocalLabel
+   | TESTEQ_W64 Word64 LocalLabel
+   | TESTLT_W32 Word32 LocalLabel
+   | TESTEQ_W32 Word32 LocalLabel
+   | TESTLT_W16 Word16 LocalLabel
+   | TESTEQ_W16 Word16 LocalLabel
+   | TESTLT_W8 Word8 LocalLabel
+   | TESTEQ_W8 Word8 LocalLabel
    | TESTLT_F  Float  LocalLabel
    | TESTEQ_F  Float  LocalLabel
    | TESTLT_D  Double LocalLabel
@@ -162,14 +188,18 @@ data BCInstr
                                 -- (XXX: inefficient, but I don't know
                                 -- what the alignment constraints are.)
 
+   | PRIMCALL
+
    -- For doing magic ByteArray passing to foreign calls
    | SWIZZLE          Word16 -- to the ptr N words down the stack,
                       Word16 -- add M (interpreted as a signed 16-bit entity)
 
    -- To Infinity And Beyond
    | ENTER
-   | RETURN             -- return a lifted value
-   | RETURN_UBX ArgRep -- return an unlifted value, here's its rep
+   | RETURN ArgRep -- return a non-tuple value, here's its rep; see
+                   -- Note [Return convention for non-tuple values] in GHC.StgToByteCode
+   | RETURN_TUPLE  -- return an unboxed tuple (info already on stack); see
+                   -- Note [unboxed tuple bytecodes and tuple_BCO] in GHC.StgToByteCode
 
    -- Breakpoints
    | BRK_FUN          Word16 Unique (RemotePtr CostCentre)
@@ -188,36 +218,45 @@ instance Outputable a => Outputable (ProtoBCO a) where
       = (text "ProtoBCO" <+> ppr name <> char '#' <> int arity
                 <+> text (show ffis) <> colon)
         $$ nest 3 (case origin of
-                      Left alts -> vcat (zipWith (<+>) (char '{' : repeat (char ';'))
-                                                       (map (pprCoreAltShort.deAnnAlt) alts)) <+> char '}'
-                      Right rhs -> pprCoreExprShort (deAnnotate rhs))
+                      Left alts ->
+                        vcat (zipWith (<+>) (char '{' : repeat (char ';'))
+                             (map (pprStgAltShort shortStgPprOpts) alts))
+                      Right rhs ->
+                        pprStgRhsShort shortStgPprOpts rhs
+                  )
         $$ nest 3 (text "bitmap: " <+> text (show bsize) <+> ppr bitmap)
         $$ nest 3 (vcat (map ppr instrs))
 
--- Print enough of the Core expression to enable the reader to find
--- the expression in the -ddump-prep output.  That is, we need to
+-- Print enough of the STG expression to enable the reader to find
+-- the expression in the -ddump-stg output.  That is, we need to
 -- include at least a binder.
 
-pprCoreExprShort :: CoreExpr -> SDoc
-pprCoreExprShort expr@(Lam _ _)
-  = let
-        (bndrs, _) = collectBinders expr
-    in
-    char '\\' <+> sep (map (pprBndr LambdaBind) bndrs) <+> arrow <+> text "..."
+pprStgExprShort :: OutputablePass pass => StgPprOpts -> GenStgExpr pass -> SDoc
+pprStgExprShort _ (StgCase _expr var _ty _alts) =
+  text "case of" <+> ppr var
+pprStgExprShort _ (StgLet _ bnd _) =
+  text "let" <+> pprStgBindShort bnd <+> text "in ..."
+pprStgExprShort _ (StgLetNoEscape _ bnd _) =
+  text "let-no-escape" <+> pprStgBindShort bnd <+> text "in ..."
+pprStgExprShort opts (StgTick t e) = ppr t <+> pprStgExprShort opts e
+pprStgExprShort opts e = pprStgExpr opts e
 
-pprCoreExprShort (Case _expr var _ty _alts)
- = text "case of" <+> ppr var
+pprStgBindShort :: OutputablePass pass => GenStgBinding pass -> SDoc
+pprStgBindShort (StgNonRec x _) =
+  ppr x <+> text "= ..."
+pprStgBindShort (StgRec bs) =
+  char '{' <+> ppr (fst (head bs)) <+> text "= ...; ... }"
 
-pprCoreExprShort (Let (NonRec x _) _) = text "let" <+> ppr x <+> ptext (sLit ("= ... in ..."))
-pprCoreExprShort (Let (Rec bs) _) = text "let {" <+> ppr (fst (head bs)) <+> ptext (sLit ("= ...; ... } in ..."))
+pprStgAltShort :: OutputablePass pass => StgPprOpts -> GenStgAlt pass -> SDoc
+pprStgAltShort opts GenStgAlt{alt_con=con, alt_bndrs=args, alt_rhs=expr} =
+  ppr con <+> sep (map ppr args) <+> text "->" <+> pprStgExprShort opts expr
 
-pprCoreExprShort (Tick t e) = ppr t <+> pprCoreExprShort e
-pprCoreExprShort (Cast e _) = pprCoreExprShort e <+> text "`cast` T"
+pprStgRhsShort :: OutputablePass pass => StgPprOpts -> GenStgRhs pass -> SDoc
+pprStgRhsShort opts (StgRhsClosure _ext _cc upd_flag args body) =
+  hang (hsep [ char '\\' <> ppr upd_flag, brackets (interppSP args) ])
+       4 (pprStgExprShort opts body)
+pprStgRhsShort opts rhs = pprStgRhs opts rhs
 
-pprCoreExprShort e = pprCoreExpr e
-
-pprCoreAltShort :: CoreAlt -> SDoc
-pprCoreAltShort (con, args, expr) = ppr con <+> sep (map ppr args) <+> text "->" <+> pprCoreExprShort expr
 
 instance Outputable BCInstr where
    ppr (STKCHECK n)          = text "STKCHECK" <+> ppr n
@@ -234,8 +273,12 @@ instance Outputable BCInstr where
    ppr (PUSH_PRIMOP op)      = text "PUSH_G  " <+> text "GHC.PrimopWrappers."
                                                <> ppr op
    ppr (PUSH_BCO bco)        = hang (text "PUSH_BCO") 2 (ppr bco)
-   ppr (PUSH_ALTS bco)       = hang (text "PUSH_ALTS") 2 (ppr bco)
-   ppr (PUSH_ALTS_UNLIFTED bco pk) = hang (text "PUSH_ALTS_UNLIFTED" <+> ppr pk) 2 (ppr bco)
+
+   ppr (PUSH_ALTS bco pk)    = hang (text "PUSH_ALTS" <+> ppr pk) 2 (ppr bco)
+   ppr (PUSH_ALTS_TUPLE bco call_info tuple_bco) =
+                               hang (text "PUSH_ALTS_TUPLE" <+> ppr call_info)
+                                    2
+                                    (ppr tuple_bco $+$ ppr bco)
 
    ppr PUSH_PAD8             = text "PUSH_PAD8"
    ppr PUSH_PAD16            = text "PUSH_PAD16"
@@ -245,6 +288,7 @@ instance Outputable BCInstr where
    ppr (PUSH_UBX16 lit)      = text "PUSH_UBX16" <+> ppr lit
    ppr (PUSH_UBX32 lit)      = text "PUSH_UBX32" <+> ppr lit
    ppr (PUSH_UBX lit nw)     = text "PUSH_UBX" <+> parens (ppr nw) <+> ppr lit
+   ppr (PUSH_ADDR nm)        = text "PUSH_ADDR" <+> ppr nm
    ppr PUSH_APPLY_N          = text "PUSH_APPLY_N"
    ppr PUSH_APPLY_V          = text "PUSH_APPLY_V"
    ppr PUSH_APPLY_F          = text "PUSH_APPLY_F"
@@ -272,6 +316,22 @@ instance Outputable BCInstr where
    ppr (TESTEQ_I  i lab)     = text "TESTEQ_I" <+> int i <+> text "__" <> ppr lab
    ppr (TESTLT_W  i lab)     = text "TESTLT_W" <+> int (fromIntegral i) <+> text "__" <> ppr lab
    ppr (TESTEQ_W  i lab)     = text "TESTEQ_W" <+> int (fromIntegral i) <+> text "__" <> ppr lab
+   ppr (TESTLT_I64  i lab)   = text "TESTLT_I64" <+> ppr i <+> text "__" <> ppr lab
+   ppr (TESTEQ_I64  i lab)   = text "TESTEQ_I64" <+> ppr i <+> text "__" <> ppr lab
+   ppr (TESTLT_I32  i lab)   = text "TESTLT_I32" <+> ppr i <+> text "__" <> ppr lab
+   ppr (TESTEQ_I32  i lab)   = text "TESTEQ_I32" <+> ppr i <+> text "__" <> ppr lab
+   ppr (TESTLT_I16  i lab)   = text "TESTLT_I16" <+> ppr i <+> text "__" <> ppr lab
+   ppr (TESTEQ_I16  i lab)   = text "TESTEQ_I16" <+> ppr i <+> text "__" <> ppr lab
+   ppr (TESTLT_I8  i lab)    = text "TESTLT_I8" <+> ppr i <+> text "__" <> ppr lab
+   ppr (TESTEQ_I8  i lab)    = text "TESTEQ_I8" <+> ppr i <+> text "__" <> ppr lab
+   ppr (TESTLT_W64  i lab)   = text "TESTLT_W64" <+> ppr i <+> text "__" <> ppr lab
+   ppr (TESTEQ_W64  i lab)   = text "TESTEQ_W64" <+> ppr i <+> text "__" <> ppr lab
+   ppr (TESTLT_W32  i lab)   = text "TESTLT_W32" <+> ppr i <+> text "__" <> ppr lab
+   ppr (TESTEQ_W32  i lab)   = text "TESTEQ_W32" <+> ppr i <+> text "__" <> ppr lab
+   ppr (TESTLT_W16  i lab)   = text "TESTLT_W16" <+> ppr i <+> text "__" <> ppr lab
+   ppr (TESTEQ_W16  i lab)   = text "TESTEQ_W16" <+> ppr i <+> text "__" <> ppr lab
+   ppr (TESTLT_W8  i lab)    = text "TESTLT_W8" <+> ppr i <+> text "__" <> ppr lab
+   ppr (TESTEQ_W8  i lab)    = text "TESTEQ_W8" <+> ppr i <+> text "__" <> ppr lab
    ppr (TESTLT_F  f lab)     = text "TESTLT_F" <+> float f <+> text "__" <> ppr lab
    ppr (TESTEQ_F  f lab)     = text "TESTEQ_F" <+> float f <+> text "__" <> ppr lab
    ppr (TESTLT_D  d lab)     = text "TESTLT_D" <+> double d <+> text "__" <> ppr lab
@@ -287,12 +347,18 @@ instance Outputable BCInstr where
                                                       0x1 -> text "(interruptible)"
                                                       0x2 -> text "(unsafe)"
                                                       _   -> empty)
+   ppr PRIMCALL              = text "PRIMCALL"
    ppr (SWIZZLE stkoff n)    = text "SWIZZLE " <+> text "stkoff" <+> ppr stkoff
                                                <+> text "by" <+> ppr n
    ppr ENTER                 = text "ENTER"
-   ppr RETURN                = text "RETURN"
-   ppr (RETURN_UBX pk)       = text "RETURN_UBX  " <+> ppr pk
-   ppr (BRK_FUN index uniq _cc) = text "BRK_FUN" <+> ppr index <+> ppr uniq <+> text "<cc>"
+   ppr (RETURN pk)           = text "RETURN  " <+> ppr pk
+   ppr (RETURN_TUPLE)        = text "RETURN_TUPLE"
+   ppr (BRK_FUN index uniq _cc) = text "BRK_FUN" <+> ppr index <+> mb_uniq <+> text "<cc>"
+     where mb_uniq = sdocOption sdocSuppressUniques $ \case
+             True  -> text "<uniq>"
+             False -> ppr uniq
+
+
 
 -- -----------------------------------------------------------------------------
 -- The stack use, in words, of each bytecode insn.  These _must_ be
@@ -321,8 +387,14 @@ bciStackUse PUSH32_W{}            = 1  -- takes exactly 1 word
 bciStackUse PUSH_G{}              = 1
 bciStackUse PUSH_PRIMOP{}         = 1
 bciStackUse PUSH_BCO{}            = 1
-bciStackUse (PUSH_ALTS bco)       = 2 + protoBCOStackUse bco
-bciStackUse (PUSH_ALTS_UNLIFTED bco _) = 2 + protoBCOStackUse bco
+bciStackUse (PUSH_ALTS bco _)     = 2 {- profiling only, restore CCCS -} +
+                                    3 + protoBCOStackUse bco
+bciStackUse (PUSH_ALTS_TUPLE bco info _) =
+   -- (tuple_bco, call_info word, cont_bco, stg_ctoi_t)
+   -- tuple
+   -- (call_info, tuple_bco, stg_ret_t)
+   1 {- profiling only -} +
+   7 + fromIntegral (nativeCallSize info) + protoBCOStackUse bco
 bciStackUse (PUSH_PAD8)           = 1  -- overapproximation
 bciStackUse (PUSH_PAD16)          = 1  -- overapproximation
 bciStackUse (PUSH_PAD32)          = 1  -- overapproximation on 64bit arch
@@ -330,6 +402,7 @@ bciStackUse (PUSH_UBX8 _)         = 1  -- overapproximation
 bciStackUse (PUSH_UBX16 _)        = 1  -- overapproximation
 bciStackUse (PUSH_UBX32 _)        = 1  -- overapproximation on 64bit arch
 bciStackUse (PUSH_UBX _ nw)       = fromIntegral nw
+bciStackUse PUSH_ADDR{}           = 1
 bciStackUse PUSH_APPLY_N{}        = 1
 bciStackUse PUSH_APPLY_V{}        = 1
 bciStackUse PUSH_APPLY_F{}        = 1
@@ -350,6 +423,22 @@ bciStackUse TESTLT_I{}            = 0
 bciStackUse TESTEQ_I{}            = 0
 bciStackUse TESTLT_W{}            = 0
 bciStackUse TESTEQ_W{}            = 0
+bciStackUse TESTLT_I64{}          = 0
+bciStackUse TESTEQ_I64{}          = 0
+bciStackUse TESTLT_I32{}          = 0
+bciStackUse TESTEQ_I32{}          = 0
+bciStackUse TESTLT_I16{}          = 0
+bciStackUse TESTEQ_I16{}          = 0
+bciStackUse TESTLT_I8{}           = 0
+bciStackUse TESTEQ_I8{}           = 0
+bciStackUse TESTLT_W64{}          = 0
+bciStackUse TESTEQ_W64{}          = 0
+bciStackUse TESTLT_W32{}          = 0
+bciStackUse TESTEQ_W32{}          = 0
+bciStackUse TESTLT_W16{}          = 0
+bciStackUse TESTEQ_W16{}          = 0
+bciStackUse TESTLT_W8{}           = 0
+bciStackUse TESTEQ_W8{}           = 0
 bciStackUse TESTLT_F{}            = 0
 bciStackUse TESTEQ_F{}            = 0
 bciStackUse TESTLT_D{}            = 0
@@ -359,9 +448,10 @@ bciStackUse TESTEQ_P{}            = 0
 bciStackUse CASEFAIL{}            = 0
 bciStackUse JMP{}                 = 0
 bciStackUse ENTER{}               = 0
-bciStackUse RETURN{}              = 0
-bciStackUse RETURN_UBX{}          = 1
+bciStackUse RETURN{}              = 1 -- pushes stg_ret_X for some X
+bciStackUse RETURN_TUPLE{}        = 1 -- pushes stg_ret_t header
 bciStackUse CCALL{}               = 0
+bciStackUse PRIMCALL{}            = 1 -- pushes stg_primcall
 bciStackUse SWIZZLE{}             = 0
 bciStackUse BRK_FUN{}             = 0
 

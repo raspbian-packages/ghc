@@ -198,9 +198,9 @@ constructor can be used.
 Usage                                     Example
 =======================================   ==================================
 As a constructor                          ``zero = Point 0 0``
-As a constructor with record syntax       ``zero = Point { x = 0, y = 0}``
+As a constructor with record syntax       ``zero = Point { x = 0, y = 0 }``
 In a pattern context                      ``isZero (Point 0 0) = True``
-In a pattern context with record syntax   ``isZero (Point { x = 0, y = 0 }``
+In a pattern context with record syntax   ``isZero (Point { x = 0, y = 0 }) = True``
 In a pattern context with field puns      ``getX (Point {x}) = x``
 In a record update                        ``(0, 0) { x = 1 } == (1,0)``
 Using record selectors                    ``x (0,0) == 0``
@@ -418,7 +418,7 @@ Note also the following points
          pattern P x y v <- MkT True x y (v::a)
 
    Here the universal type variable `a` scopes over the definition of `P`,
-   but the existential `b` does not.  (c.f. discussion on #14998.)
+   but the existential `b` does not.  (c.f. discussion on :ghc-ticket:`14998`.)
 
 -  For a bidirectional pattern synonym, a use of the pattern synonym as
    an expression has the type
@@ -520,4 +520,38 @@ below:
     *Main> g (False:undefined)
     False
 
+Pragmas for pattern synonyms
+----------------------------
 
+The :ref:`inlinable-pragma`, :ref:`inline-pragma` and :ref:`noinline-pragma` are supported for pattern
+synonyms. For example: ::
+
+    patternInlinablePattern x = [x]
+    {-# INLINABLE InlinablePattern #-}
+    pattern InlinedPattern x = [x]
+    {-# INLINE InlinedPattern #-}
+    pattern NonInlinedPattern x = [x]
+    {-# NOINLINE NonInlinedPattern #-}
+
+As with other ``INLINABLE``, ``INLINE`` and ``NOINLINE`` pragmas, it's possible to specify
+to which phase the pragma applies: ::
+
+    pattern Q x = [x]
+    {-# NOINLINE[1] Q #-}
+
+The pragmas are applied both when the pattern is used as a matcher, and as a
+data constructor. For explicitly bidirectional pattern synonyms, the pragma
+must be at top level, not nested in the where clause. For example, this won't compile: ::
+
+    pattern HeadC x <- x:xs where
+      HeadC x = [x]
+      {-# INLINE HeadC #-}
+
+but this will: ::
+
+    pattern HeadC x <- x:xs where
+      HeadC x = [x]
+    {-# INLINE HeadC #-}
+
+When no pragma is provided for a pattern, the inlining decision is made by
+GHC's own inlining heuristics.

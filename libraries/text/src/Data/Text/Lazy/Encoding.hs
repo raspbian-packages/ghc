@@ -1,5 +1,7 @@
 {-# LANGUAGE BangPatterns,CPP #-}
 {-# LANGUAGE Trustworthy #-}
+{-# LANGUAGE ViewPatterns #-}
+
 -- |
 -- Module      : Data.Text.Lazy.Encoding
 -- Copyright   : (c) 2009, 2010 Bryan O'Sullivan
@@ -18,23 +20,29 @@ module Data.Text.Lazy.Encoding
     (
     -- * Decoding ByteStrings to Text
     -- $strict
-      decodeASCII
-    , decodeLatin1
-    , decodeUtf8
-    , decodeUtf16LE
-    , decodeUtf16BE
-    , decodeUtf32LE
-    , decodeUtf32BE
 
-    -- ** Catchable failure
+    -- ** Total Functions #total#
+    -- $total
+      decodeLatin1
+
+    -- *** Catchable failure
     , decodeUtf8'
 
-    -- ** Controllable error handling
+    -- *** Controllable error handling
     , decodeUtf8With
     , decodeUtf16LEWith
     , decodeUtf16BEWith
     , decodeUtf32LEWith
     , decodeUtf32BEWith
+
+    -- ** Partial Functions
+    -- $partial
+    , decodeASCII
+    , decodeUtf8
+    , decodeUtf16LE
+    , decodeUtf16BE
+    , decodeUtf32LE
+    , decodeUtf32BE
 
     -- * Encoding Text to ByteStrings
     , encodeUtf8
@@ -53,16 +61,15 @@ import Data.Monoid (Monoid(..))
 import Data.Text.Encoding.Error (OnDecodeError, UnicodeException, strictDecode)
 import Data.Text.Internal.Lazy (Text(..), chunk, empty, foldrChunks)
 import Data.Word (Word8)
-import qualified Data.ByteString as S
 import qualified Data.ByteString.Builder as B
-import qualified Data.ByteString.Builder.Extra as B (safeStrategy, toLazyByteStringWith)
 import qualified Data.ByteString.Builder.Prim as BP
 import qualified Data.ByteString.Lazy as B
 import qualified Data.ByteString.Lazy.Internal as B
-import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import qualified Data.Text.Internal.Encoding as TE
 import qualified Data.Text.Internal.Lazy.Encoding.Fusion as E
 import qualified Data.Text.Internal.Lazy.Fusion as F
+import qualified Data.Text.Internal.StrictBuilder as SB
 import Data.Text.Unsafe (unsafeDupablePerformIO)
 
 -- $strict
@@ -78,11 +85,21 @@ import Data.Text.Unsafe (unsafeDupablePerformIO)
 -- 'decodeUtf8With' allows the programmer to determine what to do on a
 -- decoding error.
 
--- | /Deprecated/.  Decode a 'ByteString' containing 7-bit ASCII
+-- $total
+--
+-- These functions facilitate total decoding and should be preferred
+-- over their partial counterparts.
+
+-- $partial
+--
+-- These functions are partial and should only be used with great caution
+-- (preferably not at all). See "Data.Text.Lazy.Encoding#g:total" for better
+-- solutions.
+
+-- | Decode a 'ByteString' containing 7-bit ASCII
 -- encoded text.
 decodeASCII :: B.ByteString -> Text
-decodeASCII = decodeUtf8
-{-# DEPRECATED decodeASCII "Use decodeUtf8 instead" #-}
+decodeASCII = foldr (chunk . TE.decodeASCII) empty . B.toChunks
 
 -- | Decode a 'ByteString' containing Latin-1 (aka ISO-8859-1) encoded text.
 decodeLatin1 :: B.ByteString -> Text
@@ -90,24 +107,14 @@ decodeLatin1 = foldr (chunk . TE.decodeLatin1) empty . B.toChunks
 
 -- | Decode a 'ByteString' containing UTF-8 encoded text.
 decodeUtf8With :: OnDecodeError -> B.ByteString -> Text
-decodeUtf8With onErr (B.Chunk b0 bs0) =
-    case TE.streamDecodeUtf8With onErr b0 of
-      TE.Some t l f -> chunk t (go f l bs0)
+decodeUtf8With onErr = loop TE.startUtf8State
   where
-    go f0 _ (B.Chunk b bs) =
-      case f0 b of
-        TE.Some t l f -> chunk t (go f l bs)
-    go _ l _
-      | S.null l  = empty
-      | otherwise =
-        let !t = T.pack (skipBytes l)
-            skipBytes = S.foldr (\x s' ->
-                  case onErr desc (Just x) of
-                    Just c -> c : s'
-                    Nothing -> s') [] in
-        Chunk t Empty
-    desc = "Data.Text.Lazy.Encoding.decodeUtf8With: Invalid UTF-8 stream"
-decodeUtf8With _ _ = empty
+    chunkb builder t | SB.sbLength builder == 0 = t
+                    | otherwise = Chunk (TE.strictBuilderToText builder) t
+    loop s (B.Chunk b bs) = case TE.decodeUtf8With2 onErr msg s b of
+      (builder, _, s') -> chunkb builder (loop s' bs)
+    loop s B.Empty = chunkb (TE.skipIncomplete onErr msg s) Empty
+    msg = "Data.Text.Internal.Encoding: Invalid UTF-8 stream"
 
 -- | Decode a 'ByteString' containing UTF-8 encoded text that is known
 -- to be valid.
@@ -119,10 +126,6 @@ decodeUtf8With _ _ = empty
 decodeUtf8 :: B.ByteString -> Text
 decodeUtf8 = decodeUtf8With strictDecode
 {-# INLINE[0] decodeUtf8 #-}
-
--- This rule seems to cause performance loss.
-{- RULES "LAZY STREAM stream/decodeUtf8' fusion" [1]
-   forall bs. F.stream (decodeUtf8' bs) = E.streamUtf8 strictDecode bs #-}
 
 -- | Decode a 'ByteString' containing UTF-8 encoded text..
 --
@@ -143,17 +146,7 @@ decodeUtf8' bs = unsafeDupablePerformIO $ do
 
 -- | Encode text using UTF-8 encoding.
 encodeUtf8 :: Text -> B.ByteString
-encodeUtf8    Empty       = B.empty
-encodeUtf8 lt@(Chunk t _) =
-    B.toLazyByteStringWith strategy B.empty $ encodeUtf8Builder lt
-  where
-    -- To improve our small string performance, we use a strategy that
-    -- allocates a buffer that is guaranteed to be large enough for the
-    -- encoding of the first chunk, but not larger than the default
-    -- B.smallChunkSize. We clamp the firstChunkSize to ensure that we don't
-    -- generate too large buffers which hamper streaming.
-    firstChunkSize  = min B.smallChunkSize (4 * (T.length t + 1))
-    strategy        = B.safeStrategy firstChunkSize B.defaultChunkSize
+encodeUtf8 = foldrChunks (B.Chunk . TE.encodeUtf8) B.Empty
 
 -- | Encode text to a ByteString 'B.Builder' using UTF-8 encoding.
 --

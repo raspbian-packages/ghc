@@ -16,12 +16,13 @@
 
 module Text.Parsec.Char where
 
-import Data.Char
-import Text.Parsec.Pos
-import Text.Parsec.Prim
+import Data.Char (isSpace, isUpper, isLower, isAlphaNum, isAlpha, isDigit, isHexDigit, isOctDigit)
 #if !(MIN_VERSION_base(4,8,0))
 import Control.Applicative ((*>))
 #endif
+
+import Text.Parsec.Pos
+import Text.Parsec.Prim
 
 -- | @oneOf cs@ succeeds if the current character is in the supplied
 -- list of characters @cs@. Returns the parsed character. See also
@@ -166,12 +167,26 @@ satisfy f           = tokenPrim (\c -> show [c])
                                 (\pos c _cs -> updatePosChar pos c)
                                 (\c -> if f c then Just c else Nothing)
 
--- | @string s@ parses a sequence of characters given by @s@. Returns
+-- | @'string' s@ parses a sequence of characters given by @s@. Returns
 -- the parsed string (i.e. @s@).
 --
 -- >  divOrMod    =   string "div"
 -- >              <|> string "mod"
+--
+-- Consider using 'string''.
 
 string :: (Stream s m Char) => String -> ParsecT s u m String
 {-# INLINABLE string #-}
 string s            = tokens show updatePosString s
+
+-- | @'string'' s@ parses a sequence of characters given by @s@.
+-- Doesn't consume matching prefix.
+--
+-- >  carOrCdr    =   string' "car"
+-- >              <|> string' "cdr"
+--
+-- @since 3.1.16.0
+
+string' :: (Stream s m Char) => String -> ParsecT s u m String
+{-# INLINABLE string' #-}
+string' s            = tokens' show updatePosString s

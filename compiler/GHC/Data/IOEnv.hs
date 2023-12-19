@@ -1,7 +1,6 @@
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE DeriveFunctor #-}
-{-# LANGUAGE DerivingVia #-}
 
+{-# LANGUAGE DerivingVia #-}
+{-# LANGUAGE PatternSynonyms #-}
 --
 -- (c) The University of Glasgow 2002-2006
 --
@@ -29,13 +28,15 @@ module GHC.Data.IOEnv (
         tryM, tryAllM, tryMostM, fixM,
 
         -- I/O operations
-        IORef, newMutVar, readMutVar, writeMutVar, updMutVar,
+        IORef, newMutVar, readMutVar, writeMutVar, updMutVar, updMutVarM,
         atomicUpdMutVar, atomicUpdMutVar'
   ) where
 
 import GHC.Prelude
 
 import GHC.Driver.Session
+import {-# SOURCE #-} GHC.Driver.Hooks
+import GHC.IO (catchException)
 import GHC.Utils.Exception
 import GHC.Unit.Module
 import GHC.Utils.Panic
@@ -48,7 +49,9 @@ import Control.Monad
 import Control.Monad.Trans.Reader
 import Control.Monad.Catch (MonadCatch, MonadMask, MonadThrow)
 import GHC.Utils.Monad
+import GHC.Utils.Logger
 import Control.Applicative (Alternative(..))
+import GHC.Exts( oneShot )
 import Control.Concurrent.MVar (newEmptyMVar, readMVar, putMVar)
 import Control.Concurrent (forkIO, killThread)
 
@@ -57,9 +60,24 @@ import Control.Concurrent (forkIO, killThread)
 ----------------------------------------------------------------------
 
 
-newtype IOEnv env a = IOEnv (env -> IO a)
-  deriving (Functor)
-  deriving (MonadThrow, MonadCatch, MonadMask, MonadIO) via (ReaderT env IO)
+newtype IOEnv env a = IOEnv' (env -> IO a)
+  deriving (MonadThrow, MonadCatch, MonadMask, MonadFix) via (ReaderT env IO)
+
+
+-- See Note [The one-shot state monad trick] in GHC.Utils.Monad
+instance Functor (IOEnv env) where
+   fmap f (IOEnv g) = IOEnv $ \env -> fmap f (g env)
+   a <$ IOEnv g     = IOEnv $ \env -> g env >> pure a
+
+instance MonadIO (IOEnv env) where
+   liftIO f = IOEnv (\_ -> f)
+
+pattern IOEnv :: forall env a. (env -> IO a) -> IOEnv env a
+pattern IOEnv m <- IOEnv' m
+  where
+    IOEnv m = IOEnv' (oneShot m)
+
+{-# COMPLETE IOEnv #-}
 
 unIOEnv :: IOEnv env a -> (env -> IO a)
 unIOEnv (IOEnv m) = m
@@ -102,6 +120,15 @@ instance Exception IOEnvFailure
 instance ContainsDynFlags env => HasDynFlags (IOEnv env) where
     getDynFlags = do env <- getEnv
                      return $! extractDynFlags env
+
+instance ContainsHooks env => HasHooks (IOEnv env) where
+    getHooks = do env <- getEnv
+                  return $! extractHooks env
+
+instance ContainsLogger env => HasLogger (IOEnv env) where
+    getLogger = do env <- getEnv
+                   return $! extractLogger env
+
 
 instance ContainsModule env => HasModule (IOEnv env) where
     getModule = do env <- getEnv
@@ -158,7 +185,7 @@ safeTry act = do
     -- Fork, so that 'act' is safe from all asynchronous exceptions other than the ones we send it
     t <- forkIO $ try (restore act) >>= putMVar var
     restore (readMVar var)
-      `catch` \(e :: SomeException) -> do
+      `catchException` \(e :: SomeException) -> do
         -- Control reaches this point only if the parent thread was sent an async exception
         -- In that case, kill the 'act' thread and re-raise the exception
         killThread t
@@ -199,6 +226,12 @@ readMutVar var = liftIO (readIORef var)
 
 updMutVar :: IORef a -> (a -> a) -> IOEnv env ()
 updMutVar var upd = liftIO (modifyIORef var upd)
+
+updMutVarM :: IORef a -> (a -> IOEnv env a) -> IOEnv env ()
+updMutVarM ref upd
+  = do { contents     <- liftIO $ readIORef ref
+       ; new_contents <- upd contents
+       ; liftIO $ writeIORef ref new_contents }
 
 -- | Atomically update the reference.  Does not force the evaluation of the
 -- new variable contents.  For strict update, use 'atomicUpdMutVar''.

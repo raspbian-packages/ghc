@@ -44,12 +44,14 @@ import GHC.Cmm
 import GHC.Types.Unique.Set
 import GHC.Types.Unique.FM
 import GHC.Types.Unique
-import GHC.Utils.Monad.State
+import GHC.Builtin.Uniques
+import GHC.Utils.Monad.State.Strict
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
 import GHC.Platform
 import GHC.Cmm.Dataflow.Collections
 
-import Data.List
+import Data.List (nub, foldl1', find)
 import Data.Maybe
 import Data.IntSet              (IntSet)
 import qualified Data.IntSet    as IntSet
@@ -513,9 +515,6 @@ instance Uniquable Store where
     getUnique (SReg  r)
         | RegReal (RealRegSingle i)     <- r
         = mkRegSingleUnique i
-
-        | RegReal (RealRegPair r1 r2)   <- r
-        = mkRegPairUnique (r1 * 65535 + r2)
 
         | otherwise
         = error $ "RegSpillClean.getUnique: found virtual reg during spill clean,"

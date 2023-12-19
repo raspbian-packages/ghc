@@ -60,7 +60,6 @@ import GHC.Ptr
 import GHC.Real (div, fromIntegral)
 import GHC.Word (Word32, Word64)
 import GHC.Windows
-import Unsafe.Coerce ( unsafeCoerceUnlifted )
 
 -- ----------------------------------------------------------------------------
 -- Thread waiting
@@ -92,11 +91,11 @@ asyncDoProc (FunPtr proc) (Ptr param) =
 -- this better be a pinned byte array!
 asyncReadBA :: Int -> Int -> Int -> Int -> MutableByteArray# RealWorld -> IO (Int,Int)
 asyncReadBA fd isSock len off bufB =
-  asyncRead fd isSock len ((Ptr (byteArrayContents# (unsafeCoerceUnlifted bufB))) `plusPtr` off)
+  asyncRead fd isSock len ((Ptr (mutableByteArrayContents# bufB)) `plusPtr` off)
 
 asyncWriteBA :: Int -> Int -> Int -> Int -> MutableByteArray# RealWorld -> IO (Int,Int)
 asyncWriteBA fd isSock len off bufB =
-  asyncWrite fd isSock len ((Ptr (byteArrayContents# (unsafeCoerceUnlifted bufB))) `plusPtr` off)
+  asyncWrite fd isSock len ((Ptr (mutableByteArrayContents# bufB)) `plusPtr` off)
 
 -- ----------------------------------------------------------------------------
 -- Threaded RTS implementation of threadDelay
@@ -179,7 +178,7 @@ interruptIOManager :: IO ()
 interruptIOManager = return ()
 
 startIOManagerThread :: IO ()
-startIOManagerThread = do
+startIOManagerThread =
   modifyMVar_ ioManagerThread $ \old -> do
     let create = do t <- forkIO ioManager;
                     labelThread t "IOManagerThread";
@@ -251,7 +250,7 @@ service_loop wakeup old_delays = do
 
   r <- c_WaitForSingleObject wakeup timeout
   case r of
-    0xffffffff -> do throwGetLastError "service_loop"
+    0xffffffff -> throwGetLastError "service_loop"
     0 -> do
         r2 <- c_readIOManagerEvent
         exit <-

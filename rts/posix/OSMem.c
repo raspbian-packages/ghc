@@ -7,7 +7,7 @@
  * ---------------------------------------------------------------------------*/
 
 // This is non-posix compliant.
-// #include "PosixSource.h"
+// #include "rts/PosixSource.h"
 
 #include "Rts.h"
 
@@ -364,7 +364,7 @@ void osBindMBlocksToNode(
 {
 #if HAVE_LIBNUMA
     int ret;
-    StgWord mask = 0;
+    unsigned long mask = 0;
     mask |= 1 << node;
     if (RtsFlags.GcFlags.numa) {
         ret = mbind(addr, (unsigned long)size,
@@ -588,7 +588,7 @@ void *osReserveHeapMemory(void *startAddressPtr, W_ *len)
 
         /* Make sure we leave enough vmem for at least three threads.
            This number was found through trial and error. We're at least launching
-           that many threads (e.g., itimer). We can't know for sure how much we need,
+           that many threads (e.g., itimer/ticker). We can't know for sure how much we need,
            but at least we can fail early and give a useful error message in this case. */
         if (((W_) (asLimit.rlim_cur - *len )) < ((W_) (stacksz * 3))) {
             // Three stacks is 1/3 of needed, then convert to Megabyte
@@ -645,12 +645,14 @@ void osCommitMemory(void *at, W_ size)
 {
     void *r = my_mmap(at, size, MEM_COMMIT);
     if (r == NULL) {
-        barf("Unable to commit %" FMT_Word " bytes of memory", size);
+        errorBelch("Unable to commit %" FMT_Word " bytes of memory", size);
+        errorBelch("Exiting. The system might be out of memory.");
+        stg_exit(EXIT_FAILURE);
     }
 }
 
 /* Note [MADV_FREE and MADV_DONTNEED]
- *
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  * madvise() provides flags with which one can release no longer needed pages
  * back to the kernel without having to munmap() (which is expensive).
  *

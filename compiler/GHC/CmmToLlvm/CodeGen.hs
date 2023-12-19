@@ -1,21 +1,22 @@
-{-# LANGUAGE CPP, GADTs, MultiWayIf #-}
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE GADTs, MultiWayIf #-}
 {-# OPTIONS_GHC -fno-warn-type-defaults #-}
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
--- ----------------------------------------------------------------------------
--- | Handle conversion of CmmProc to LLVM code.
---
-module GHC.CmmToLlvm.CodeGen ( genLlvmProc ) where
 
-#include "HsVersions.h"
+-- | Handle conversion of CmmProc to LLVM code.
+module GHC.CmmToLlvm.CodeGen ( genLlvmProc ) where
 
 import GHC.Prelude
 
+import GHC.Platform
+import GHC.Platform.Regs ( activeStgRegs )
+
 import GHC.Llvm
 import GHC.CmmToLlvm.Base
+import GHC.CmmToLlvm.Config
 import GHC.CmmToLlvm.Regs
 
 import GHC.Cmm.BlockId
-import GHC.Platform.Regs ( activeStgRegs )
 import GHC.Cmm.CLabel
 import GHC.Cmm
 import GHC.Cmm.Ppr as PprCmm
@@ -25,15 +26,16 @@ import GHC.Cmm.Dataflow.Block
 import GHC.Cmm.Dataflow.Graph
 import GHC.Cmm.Dataflow.Collections
 
-import GHC.Driver.Session
 import GHC.Data.FastString
-import GHC.Types.ForeignCall
-import GHC.Utils.Outputable hiding (panic, pprPanic)
-import qualified GHC.Utils.Outputable as Outputable
-import GHC.Platform
 import GHC.Data.OrdList
+
+import GHC.Types.ForeignCall
 import GHC.Types.Unique.Supply
 import GHC.Types.Unique
+
+import GHC.Utils.Outputable
+import GHC.Utils.Panic.Plain (massert)
+import qualified GHC.Utils.Panic as Panic
 import GHC.Utils.Misc
 
 import Control.Monad.Trans.Class
@@ -44,7 +46,7 @@ import qualified Data.Semigroup as Semigroup
 import Data.List ( nub )
 import Data.Maybe ( catMaybes )
 
-type Atomic = Bool
+type Atomic = Maybe MemoryOrdering
 type LlvmStatements = OrdList LlvmStatement
 
 data Signage = Signed | Unsigned deriving (Eq, Show)
@@ -124,7 +126,8 @@ stmtToInstrs stmt = case stmt of
     CmmUnwind  {}        -> return (nilOL, [])
 
     CmmAssign reg src    -> genAssign reg src
-    CmmStore addr src    -> genStore addr src
+    CmmStore addr src align
+                         -> genStore addr src align
 
     CmmBranch id         -> genBranch id
     CmmCondBranch arg true false likely
@@ -185,18 +188,18 @@ barrierUnless exs = do
         else barrier
 
 -- | Foreign Calls
-genCall :: ForeignTarget -> [CmmFormal] -> [CmmActual]
-              -> LlvmM StmtData
+genCall :: ForeignTarget -> [CmmFormal] -> [CmmActual] -> LlvmM StmtData
 
 -- Barriers need to be handled specially as they are implemented as LLVM
 -- intrinsic functions.
 genCall (PrimTarget MO_ReadBarrier) _ _ =
-    barrierUnless [ArchX86, ArchX86_64, ArchSPARC]
-genCall (PrimTarget MO_WriteBarrier) _ _ = do
-    barrierUnless [ArchX86, ArchX86_64, ArchSPARC]
+    barrierUnless [ArchX86, ArchX86_64]
 
-genCall (PrimTarget MO_Touch) _ _
- = return (nilOL, [])
+genCall (PrimTarget MO_WriteBarrier) _ _ =
+    barrierUnless [ArchX86, ArchX86_64]
+
+genCall (PrimTarget MO_Touch) _ _ =
+    return (nilOL, [])
 
 genCall (PrimTarget (MO_UF_Conv w)) [dst] [e] = runStmtsDecls $ do
     dstV <- getCmmRegW (CmmLocal dst)
@@ -205,7 +208,7 @@ genCall (PrimTarget (MO_UF_Conv w)) [dst] [e] = runStmtsDecls $ do
     castV <- lift $ mkLocalVar ty
     ve <- exprToVarW e
     statement $ Assignment castV $ Cast LM_Uitofp ve width
-    statement $ Store castV dstV
+    statement $ Store castV dstV Nothing
 
 genCall (PrimTarget (MO_UF_Conv _)) [_] args =
     panic $ "genCall: Too many arguments to MO_UF_Conv. " ++
@@ -261,12 +264,12 @@ genCall (PrimTarget (MO_AtomicRMW width amop)) [dst] [addr, n] = runStmtsDecls $
                AMO_Or   -> LAO_Or
                AMO_Xor  -> LAO_Xor
     retVar <- doExprW targetTy $ AtomicRMW op ptrVar nVar SyncSeqCst
-    statement $ Store retVar dstVar
+    statement $ Store retVar dstVar Nothing
 
-genCall (PrimTarget (MO_AtomicRead _)) [dst] [addr] = runStmtsDecls $ do
+genCall (PrimTarget (MO_AtomicRead _ mem_ord)) [dst] [addr] = runStmtsDecls $ do
     dstV <- getCmmRegW (CmmLocal dst)
-    v1 <- genLoadW True addr (localRegType dst)
-    statement $ Store v1 dstV
+    v1 <- genLoadW (Just mem_ord) addr (localRegType dst) NaturallyAligned
+    statement $ Store v1 dstV Nothing
 
 genCall (PrimTarget (MO_Cmpxchg _width))
         [dst] [addr, old, new] = runStmtsDecls $ do
@@ -280,7 +283,7 @@ genCall (PrimTarget (MO_Cmpxchg _width))
     retVar <- doExprW (LMStructU [targetTy,i1])
               $ CmpXChg ptrVar oldVar newVar SyncSeqCst SyncSeqCst
     retVar' <- doExprW targetTy $ ExtractV retVar 0
-    statement $ Store retVar' dstVar
+    statement $ Store retVar' dstVar Nothing
 
 genCall (PrimTarget (MO_Xchg _width)) [dst] [addr, val] = runStmtsDecls $ do
     dstV <- getCmmRegW (CmmLocal dst) :: WriterT LlvmAccum LlvmM LlvmVar
@@ -290,15 +293,16 @@ genCall (PrimTarget (MO_Xchg _width)) [dst] [addr, val] = runStmtsDecls $ do
         ptrExpr = Cast LM_Inttoptr addrVar ptrTy
     ptrVar <- doExprW ptrTy ptrExpr
     resVar <- doExprW (getVarType valVar) (AtomicRMW LAO_Xchg ptrVar valVar SyncSeqCst)
-    statement $ Store resVar dstV
+    statement $ Store resVar dstV Nothing
 
-genCall (PrimTarget (MO_AtomicWrite _width)) [] [addr, val] = runStmtsDecls $ do
+genCall (PrimTarget (MO_AtomicWrite _width mem_ord)) [] [addr, val] = runStmtsDecls $ do
     addrVar <- exprToVarW addr
     valVar <- exprToVarW val
     let ptrTy = pLift $ getVarType valVar
         ptrExpr = Cast LM_Inttoptr addrVar ptrTy
     ptrVar <- doExprW ptrTy ptrExpr
-    statement $ Expr $ AtomicRMW LAO_Xchg ptrVar valVar SyncSeqCst
+    let ordering = convertMemoryOrdering mem_ord
+    statement $ Expr $ AtomicRMW LAO_Xchg ptrVar valVar ordering
 
 -- Handle memcpy function specifically since llvm's intrinsic version takes
 -- some extra parameters.
@@ -350,8 +354,8 @@ genCall (PrimTarget (MO_U_Mul2 w)) [dstH, dstL] [lhs, rhs] = runStmtsDecls $ do
     retH <- doExprW width $ Cast LM_Trunc retShifted width
     dstRegL <- getCmmRegW (CmmLocal dstL)
     dstRegH <- getCmmRegW (CmmLocal dstH)
-    statement $ Store retL dstRegL
-    statement $ Store retH dstRegH
+    statement $ Store retL dstRegL Nothing
+    statement $ Store retH dstRegH Nothing
 
 genCall (PrimTarget (MO_S_Mul2 w)) [dstC, dstH, dstL] [lhs, rhs] = runStmtsDecls $ do
     let width = widthToLlvmInt w
@@ -382,9 +386,9 @@ genCall (PrimTarget (MO_S_Mul2 w)) [dstC, dstH, dstL] [lhs, rhs] = runStmtsDecls
     dstRegL <- getCmmRegW (CmmLocal dstL)
     dstRegH <- getCmmRegW (CmmLocal dstH)
     dstRegC <- getCmmRegW (CmmLocal dstC)
-    statement $ Store retL dstRegL
-    statement $ Store retH dstRegH
-    statement $ Store retC dstRegC
+    statement $ Store retL dstRegL Nothing
+    statement $ Store retH dstRegH Nothing
+    statement $ Store retC dstRegC Nothing
 
 -- MO_U_QuotRem2 is another case we handle by widening the registers to double
 -- the width and use normal LLVM instructions (similarly to the MO_U_Mul2). The
@@ -418,8 +422,8 @@ genCall (PrimTarget (MO_U_QuotRem2 w))
     retRem <- narrow retExtRem
     dstRegQ <- lift $ getCmmReg (CmmLocal dstQ)
     dstRegR <- lift $ getCmmReg (CmmLocal dstR)
-    statement $ Store retDiv dstRegQ
-    statement $ Store retRem dstRegR
+    statement $ Store retDiv dstRegQ Nothing
+    statement $ Store retRem dstRegR Nothing
 
 -- Handle the MO_{Add,Sub}IntC separately. LLVM versions return a record from
 -- which we need to extract the actual values.
@@ -514,9 +518,8 @@ genCall target res args = do
 
     -- make the actual call
     case retTy of
-        LMVoid -> do
+        LMVoid ->
             statement $ Expr $ Call ccTy fptr argVars fnAttrs
-
         _ -> do
             v1 <- doExprW retTy $ Call ccTy fptr argVars fnAttrs
             -- get the return register
@@ -527,7 +530,7 @@ genCall target res args = do
             vreg <- getCmmRegW (CmmLocal creg)
             if retTy == pLower (getVarType vreg)
                 then do
-                    statement $ Store v1 vreg
+                    statement $ Store v1 vreg Nothing
                     doReturn
                 else do
                     let ty = pLower $ getVarType vreg
@@ -539,7 +542,7 @@ genCall target res args = do
                                         ++ " returned type!"
 
                     v2 <- doExprW ty $ Cast op v1 ty
-                    statement $ Store v2 vreg
+                    statement $ Store v2 vreg Nothing
                     doReturn
 
 -- | Generate a call to an LLVM intrinsic that performs arithmetic operation
@@ -557,7 +560,7 @@ genCallWithOverflow t@(PrimTarget op) w [dstV, dstO] [lhs, rhs] = do
                             , MO_AddWordC w
                             , MO_SubWordC w
                             ]
-    MASSERT(valid)
+    massert valid
     let width = widthToLlvmInt w
     -- This will do most of the work of generating the call to the intrinsic and
     -- extracting the values from the struct.
@@ -568,8 +571,8 @@ genCallWithOverflow t@(PrimTarget op) w [dstV, dstO] [lhs, rhs] = do
     (overflow, zext) <- doExpr width $ Cast LM_Zext overflowBit width
     dstRegV <- getCmmReg (CmmLocal dstV)
     dstRegO <- getCmmReg (CmmLocal dstO)
-    let storeV = Store value dstRegV
-        storeO = Store overflow dstRegO
+    let storeV = Store value dstRegV Nothing
+        storeO = Store overflow dstRegO Nothing
     return (stmts `snocOL` zext `snocOL` storeV `snocOL` storeO, top)
 genCallWithOverflow _ _ _ _ =
     panic "genCallExtract: wrong ForeignTarget or number of arguments"
@@ -634,7 +637,7 @@ genCallSimpleCast w t@(PrimTarget op) [dst] args = do
     (retV, s1)                  <- doExpr width $ Call StdCall fptr argsV' []
     (retVs', stmts5)            <- castVars (cmmPrimOpRetValSignage op) [(retV,dstTy)]
     let retV'                    = singletonPanic "genCallSimpleCast" retVs'
-    let s2                       = Store retV' dstV
+    let s2                       = Store retV' dstV Nothing
 
     let stmts = stmts2 `appOL` stmts4 `snocOL`
                 s1 `appOL` stmts5 `snocOL` s2
@@ -666,7 +669,7 @@ genCallSimpleCast2 w t@(PrimTarget op) [dst] args = do
     (retV, s1)                  <- doExpr width $ Call StdCall fptr argsV' []
     (retVs', stmts5)             <- castVars (cmmPrimOpRetValSignage op) [(retV,dstTy)]
     let retV'                    = singletonPanic "genCallSimpleCast2" retVs'
-    let s2                       = Store retV' dstV
+    let s2                       = Store retV' dstV Nothing
 
     let stmts = stmts2 `appOL` stmts4 `snocOL`
                 s1 `appOL` stmts5 `snocOL` s2
@@ -689,14 +692,13 @@ getFunPtr funTy targ = case targ of
 
     ForeignTarget expr _ -> do
         (v1, stmts, top) <- exprToVar expr
-        dflags <- getDynFlags
         let fty = funTy $ fsLit "dynamic"
             cast = case getVarType v1 of
                 ty | isPointer ty -> LM_Bitcast
                 ty | isInt ty     -> LM_Inttoptr
 
-                ty -> panic $ "genCall: Expr is of bad type for function"
-                              ++ " call! (" ++ showSDoc dflags (ppr ty) ++ ")"
+                ty -> pprPanic "genCall: Expr is of bad type for function" $
+                  text " call! " <> lparen <> ppr ty <> rparen
 
         (v2,s1) <- doExpr (pLift fty) $ Cast cast v1 (pLift fty)
         return (v2, stmts `snocOL` s1, top)
@@ -725,13 +727,12 @@ arg_vars [] (vars, stmts, tops)
 
 arg_vars ((e, AddrHint):rest) (vars, stmts, tops)
   = do (v1, stmts', top') <- exprToVar e
-       dflags <- getDynFlags
        let op = case getVarType v1 of
                ty | isPointer ty -> LM_Bitcast
                ty | isInt ty     -> LM_Inttoptr
 
-               a  -> panic $ "genCall: Can't cast llvmType to i8*! ("
-                           ++ showSDoc dflags (ppr a) ++ ")"
+               a  -> pprPanic "genCall: Can't cast llvmType to i8*! " $
+                lparen <>  ppr a <> rparen
 
        (v2, s1) <- doExpr i8Ptr $ Cast op v1 i8Ptr
        arg_vars rest (vars ++ [v2], stmts `appOL` stmts' `snocOL` s1,
@@ -765,8 +766,7 @@ castVar signage v t | getVarType v == t
             = return (v, Nop)
 
             | otherwise
-            = do dflags <- getDynFlags
-                 platform <- getPlatform
+            = do platform <- getPlatform
                  let op = case (getVarType v, t) of
                       (LMInt n, LMInt m)
                           -> if n < m then extend else LM_Trunc
@@ -780,8 +780,11 @@ castVar signage v t | getVarType v == t
                       (vt, _) | isPointer vt && isPointer t -> LM_Bitcast
                       (vt, _) | isVector vt && isVector t   -> LM_Bitcast
 
-                      (vt, _) -> panic $ "castVars: Can't cast this type ("
-                                  ++ showSDoc dflags (ppr vt) ++ ") to (" ++ showSDoc dflags (ppr t) ++ ")"
+                      (vt, _) -> pprPanic "castVars: Can't cast this type " $
+                                lparen <> ppr vt <> rparen
+                                <> text " to " <>
+                                lparen <> ppr t <> rparen
+
                  doExpr t $ Cast op v t
     where extend = case signage of
             Signed      -> LM_Sext
@@ -797,13 +800,14 @@ cmmPrimOpRetValSignage mop = case mop of
 -- | Decide what C function to use to implement a CallishMachOp
 cmmPrimOpFunctions :: CallishMachOp -> LlvmM LMString
 cmmPrimOpFunctions mop = do
-
-  dflags <- getDynFlags
+  cfg      <- getConfig
   platform <- getPlatform
-  let intrinTy1 = "p0i8.p0i8." ++ showSDoc dflags (ppr $ llvmWord platform)
-      intrinTy2 = "p0i8." ++ showSDoc dflags (ppr $ llvmWord platform)
+  let !isBmi2Enabled = llvmCgBmiVersion cfg >= Just BMI2
+      !is32bit       = platformWordSize platform == PW4
       unsupported = panic ("cmmPrimOpFunctions: " ++ show mop
                         ++ " not supported here")
+      dontReach64 = panic ("cmmPrimOpFunctions: " ++ show mop
+                        ++ " should be not be encountered because the regular primop for this 64-bit operation is used instead.")
 
   return $ case mop of
     MO_F32_Exp    -> fsLit "expf"
@@ -854,38 +858,149 @@ cmmPrimOpFunctions mop = do
     MO_F64_Acosh  -> fsLit "acosh"
     MO_F64_Atanh  -> fsLit "atanh"
 
-    MO_Memcpy _   -> fsLit $ "llvm.memcpy."  ++ intrinTy1
-    MO_Memmove _  -> fsLit $ "llvm.memmove." ++ intrinTy1
-    MO_Memset _   -> fsLit $ "llvm.memset."  ++ intrinTy2
-    MO_Memcmp _   -> fsLit $ "memcmp"
+    -- In the following ops, it looks like we could factorize the concatenation
+    -- of the bit size, and indeed it was like this before, e.g.
+    --
+    --     MO_PopCnt w -> fsLit $ "llvm.ctpop.i" ++ wbits w
+    -- or
+    --     MO_Memcpy _ -> fsLit $ "llvm.memcpy."  ++ intrinTy1
+    --
+    -- however it meant that FastStrings were not built from constant string
+    -- literals, hence they weren't matching the "fslit" rewrite rule in
+    -- GHC.Data.FastString that computes the string size at compilation time.
 
-    (MO_PopCnt w) -> fsLit $ "llvm.ctpop."      ++ showSDoc dflags (ppr $ widthToLlvmInt w)
-    (MO_BSwap w)  -> fsLit $ "llvm.bswap."      ++ showSDoc dflags (ppr $ widthToLlvmInt w)
-    (MO_BRev w)   -> fsLit $ "llvm.bitreverse." ++ showSDoc dflags (ppr $ widthToLlvmInt w)
-    (MO_Clz w)    -> fsLit $ "llvm.ctlz."       ++ showSDoc dflags (ppr $ widthToLlvmInt w)
-    (MO_Ctz w)    -> fsLit $ "llvm.cttz."       ++ showSDoc dflags (ppr $ widthToLlvmInt w)
+    MO_Memcpy _
+      | is32bit   -> fsLit "llvm.memcpy.p0i8.p0i8.i32"
+      | otherwise -> fsLit "llvm.memcpy.p0i8.p0i8.i64"
+    MO_Memmove _
+      | is32bit   -> fsLit "llvm.memmove.p0i8.p0i8.i32"
+      | otherwise -> fsLit "llvm.memmove.p0i8.p0i8.i64"
+    MO_Memset _
+       | is32bit   -> fsLit "llvm.memset.p0i8.i32"
+       | otherwise -> fsLit "llvm.memset.p0i8.i64"
+    MO_Memcmp _   -> fsLit "memcmp"
 
-    (MO_Pdep w)   ->  let w' = showSDoc dflags (ppr $ widthInBits w)
-                      in  if isBmi2Enabled dflags
-                            then fsLit $ "llvm.x86.bmi.pdep."   ++ w'
-                            else fsLit $ "hs_pdep"              ++ w'
-    (MO_Pext w)   ->  let w' = showSDoc dflags (ppr $ widthInBits w)
-                      in  if isBmi2Enabled dflags
-                            then fsLit $ "llvm.x86.bmi.pext."   ++ w'
-                            else fsLit $ "hs_pext"              ++ w'
+    MO_SuspendThread -> fsLit "suspendThread"
+    MO_ResumeThread  -> fsLit "resumeThread"
 
-    (MO_Prefetch_Data _ )-> fsLit "llvm.prefetch"
+    MO_PopCnt w -> case w of
+      W8   -> fsLit "llvm.ctpop.i8"
+      W16  -> fsLit "llvm.ctpop.i16"
+      W32  -> fsLit "llvm.ctpop.i32"
+      W64  -> fsLit "llvm.ctpop.i64"
+      W128 -> fsLit "llvm.ctpop.i128"
+      W256 -> fsLit "llvm.ctpop.i256"
+      W512 -> fsLit "llvm.ctpop.i512"
+    MO_BSwap w  -> case w of
+      W8   -> fsLit "llvm.bswap.i8"
+      W16  -> fsLit "llvm.bswap.i16"
+      W32  -> fsLit "llvm.bswap.i32"
+      W64  -> fsLit "llvm.bswap.i64"
+      W128 -> fsLit "llvm.bswap.i128"
+      W256 -> fsLit "llvm.bswap.i256"
+      W512 -> fsLit "llvm.bswap.i512"
+    MO_BRev w   -> case w of
+      W8   -> fsLit "llvm.bitreverse.i8"
+      W16  -> fsLit "llvm.bitreverse.i16"
+      W32  -> fsLit "llvm.bitreverse.i32"
+      W64  -> fsLit "llvm.bitreverse.i64"
+      W128 -> fsLit "llvm.bitreverse.i128"
+      W256 -> fsLit "llvm.bitreverse.i256"
+      W512 -> fsLit "llvm.bitreverse.i512"
+    MO_Clz w    -> case w of
+      W8   -> fsLit "llvm.ctlz.i8"
+      W16  -> fsLit "llvm.ctlz.i16"
+      W32  -> fsLit "llvm.ctlz.i32"
+      W64  -> fsLit "llvm.ctlz.i64"
+      W128 -> fsLit "llvm.ctlz.i128"
+      W256 -> fsLit "llvm.ctlz.i256"
+      W512 -> fsLit "llvm.ctlz.i512"
+    MO_Ctz w    -> case w of
+      W8   -> fsLit "llvm.cttz.i8"
+      W16  -> fsLit "llvm.cttz.i16"
+      W32  -> fsLit "llvm.cttz.i32"
+      W64  -> fsLit "llvm.cttz.i64"
+      W128 -> fsLit "llvm.cttz.i128"
+      W256 -> fsLit "llvm.cttz.i256"
+      W512 -> fsLit "llvm.cttz.i512"
+    MO_Pdep w
+      | isBmi2Enabled -> case w of
+          W8   -> fsLit "llvm.x86.bmi.pdep.8"
+          W16  -> fsLit "llvm.x86.bmi.pdep.16"
+          W32  -> fsLit "llvm.x86.bmi.pdep.32"
+          W64  -> fsLit "llvm.x86.bmi.pdep.64"
+          W128 -> fsLit "llvm.x86.bmi.pdep.128"
+          W256 -> fsLit "llvm.x86.bmi.pdep.256"
+          W512 -> fsLit "llvm.x86.bmi.pdep.512"
+      | otherwise -> case w of
+          W8   -> fsLit "hs_pdep8"
+          W16  -> fsLit "hs_pdep16"
+          W32  -> fsLit "hs_pdep32"
+          W64  -> fsLit "hs_pdep64"
+          W128 -> fsLit "hs_pdep128"
+          W256 -> fsLit "hs_pdep256"
+          W512 -> fsLit "hs_pdep512"
+    MO_Pext w
+      | isBmi2Enabled -> case w of
+          W8   -> fsLit "llvm.x86.bmi.pext.8"
+          W16  -> fsLit "llvm.x86.bmi.pext.16"
+          W32  -> fsLit "llvm.x86.bmi.pext.32"
+          W64  -> fsLit "llvm.x86.bmi.pext.64"
+          W128 -> fsLit "llvm.x86.bmi.pext.128"
+          W256 -> fsLit "llvm.x86.bmi.pext.256"
+          W512 -> fsLit "llvm.x86.bmi.pext.512"
+      | otherwise -> case w of
+          W8   -> fsLit "hs_pext8"
+          W16  -> fsLit "hs_pext16"
+          W32  -> fsLit "hs_pext32"
+          W64  -> fsLit "hs_pext64"
+          W128 -> fsLit "hs_pext128"
+          W256 -> fsLit "hs_pext256"
+          W512 -> fsLit "hs_pext512"
 
-    MO_AddIntC w    -> fsLit $ "llvm.sadd.with.overflow."
-                             ++ showSDoc dflags (ppr $ widthToLlvmInt w)
-    MO_SubIntC w    -> fsLit $ "llvm.ssub.with.overflow."
-                             ++ showSDoc dflags (ppr $ widthToLlvmInt w)
-    MO_Add2 w       -> fsLit $ "llvm.uadd.with.overflow."
-                             ++ showSDoc dflags (ppr $ widthToLlvmInt w)
-    MO_AddWordC w   -> fsLit $ "llvm.uadd.with.overflow."
-                             ++ showSDoc dflags (ppr $ widthToLlvmInt w)
-    MO_SubWordC w   -> fsLit $ "llvm.usub.with.overflow."
-                             ++ showSDoc dflags (ppr $ widthToLlvmInt w)
+    MO_AddIntC w    -> case w of
+      W8   -> fsLit "llvm.sadd.with.overflow.i8"
+      W16  -> fsLit "llvm.sadd.with.overflow.i16"
+      W32  -> fsLit "llvm.sadd.with.overflow.i32"
+      W64  -> fsLit "llvm.sadd.with.overflow.i64"
+      W128 -> fsLit "llvm.sadd.with.overflow.i128"
+      W256 -> fsLit "llvm.sadd.with.overflow.i256"
+      W512 -> fsLit "llvm.sadd.with.overflow.i512"
+    MO_SubIntC w    -> case w of
+      W8   -> fsLit "llvm.ssub.with.overflow.i8"
+      W16  -> fsLit "llvm.ssub.with.overflow.i16"
+      W32  -> fsLit "llvm.ssub.with.overflow.i32"
+      W64  -> fsLit "llvm.ssub.with.overflow.i64"
+      W128 -> fsLit "llvm.ssub.with.overflow.i128"
+      W256 -> fsLit "llvm.ssub.with.overflow.i256"
+      W512 -> fsLit "llvm.ssub.with.overflow.i512"
+    MO_Add2 w       -> case w of
+      W8   -> fsLit "llvm.uadd.with.overflow.i8"
+      W16  -> fsLit "llvm.uadd.with.overflow.i16"
+      W32  -> fsLit "llvm.uadd.with.overflow.i32"
+      W64  -> fsLit "llvm.uadd.with.overflow.i64"
+      W128 -> fsLit "llvm.uadd.with.overflow.i128"
+      W256 -> fsLit "llvm.uadd.with.overflow.i256"
+      W512 -> fsLit "llvm.uadd.with.overflow.i512"
+    MO_AddWordC w   -> case w of
+      W8   -> fsLit "llvm.uadd.with.overflow.i8"
+      W16  -> fsLit "llvm.uadd.with.overflow.i16"
+      W32  -> fsLit "llvm.uadd.with.overflow.i32"
+      W64  -> fsLit "llvm.uadd.with.overflow.i64"
+      W128 -> fsLit "llvm.uadd.with.overflow.i128"
+      W256 -> fsLit "llvm.uadd.with.overflow.i256"
+      W512 -> fsLit "llvm.uadd.with.overflow.i512"
+    MO_SubWordC w   -> case w of
+      W8   -> fsLit "llvm.usub.with.overflow.i8"
+      W16  -> fsLit "llvm.usub.with.overflow.i16"
+      W32  -> fsLit "llvm.usub.with.overflow.i32"
+      W64  -> fsLit "llvm.usub.with.overflow.i64"
+      W128 -> fsLit "llvm.usub.with.overflow.i128"
+      W256 -> fsLit "llvm.usub.with.overflow.i256"
+      W512 -> fsLit "llvm.usub.with.overflow.i512"
+
+
+    MO_Prefetch_Data _ -> fsLit "llvm.prefetch"
 
     MO_S_Mul2    {}  -> unsupported
     MO_S_QuotRem {}  -> unsupported
@@ -899,11 +1014,42 @@ cmmPrimOpFunctions mop = do
     MO_Touch         -> unsupported
     MO_UF_Conv _     -> unsupported
 
-    MO_AtomicRead _  -> unsupported
-    MO_AtomicRMW _ _ -> unsupported
-    MO_AtomicWrite _ -> unsupported
-    MO_Cmpxchg _     -> unsupported
-    MO_Xchg _        -> unsupported
+    MO_AtomicRead _ _  -> unsupported
+    MO_AtomicRMW _ _   -> unsupported
+    MO_AtomicWrite _ _ -> unsupported
+    MO_Cmpxchg _       -> unsupported
+    MO_Xchg _          -> unsupported
+
+    MO_I64_ToI       -> dontReach64
+    MO_I64_FromI     -> dontReach64
+    MO_W64_ToW       -> dontReach64
+    MO_W64_FromW     -> dontReach64
+    MO_x64_Neg       -> dontReach64
+    MO_x64_Add       -> dontReach64
+    MO_x64_Sub       -> dontReach64
+    MO_x64_Mul       -> dontReach64
+    MO_I64_Quot      -> dontReach64
+    MO_I64_Rem       -> dontReach64
+    MO_W64_Quot      -> dontReach64
+    MO_W64_Rem       -> dontReach64
+    MO_x64_And       -> dontReach64
+    MO_x64_Or        -> dontReach64
+    MO_x64_Xor       -> dontReach64
+    MO_x64_Not       -> dontReach64
+    MO_x64_Shl       -> dontReach64
+    MO_I64_Shr       -> dontReach64
+    MO_W64_Shr       -> dontReach64
+    MO_x64_Eq        -> dontReach64
+    MO_x64_Ne        -> dontReach64
+    MO_I64_Ge        -> dontReach64
+    MO_I64_Gt        -> dontReach64
+    MO_I64_Le        -> dontReach64
+    MO_I64_Lt        -> dontReach64
+    MO_W64_Ge        -> dontReach64
+    MO_W64_Gt        -> dontReach64
+    MO_W64_Le        -> dontReach64
+    MO_W64_Lt        -> dontReach64
+
 
 -- | Tail function calls
 genJump :: CmmExpr -> [GlobalReg] -> LlvmM StmtData
@@ -921,14 +1067,13 @@ genJump (CmmLit (CmmLabel lbl)) live = do
 genJump expr live = do
     fty <- llvmFunTy live
     (vf, stmts, top) <- exprToVar expr
-    dflags <- getDynFlags
 
     let cast = case getVarType vf of
          ty | isPointer ty -> LM_Bitcast
          ty | isInt ty     -> LM_Inttoptr
 
-         ty -> panic $ "genJump: Expr is of bad type for function call! ("
-                     ++ showSDoc dflags (ppr ty) ++ ")"
+         ty -> pprPanic "genJump: Expr is of bad type for function call! "
+                $ lparen <> ppr ty <> rparen
 
     (v1, s1) <- doExpr (pLift fty) $ Cast cast vf (pLift fty)
     (stgRegs, stgStmts) <- funEpilogue live
@@ -954,54 +1099,54 @@ genAssign reg val = do
       -- Some registers are pointer types, so need to cast value to pointer
       LMPointer _ | getVarType vval == llvmWord platform -> do
           (v, s1) <- doExpr ty $ Cast LM_Inttoptr vval ty
-          let s2 = Store v vreg
+          let s2 = Store v vreg Nothing
           return (stmts `snocOL` s1 `snocOL` s2, top2)
 
       LMVector _ _ -> do
           (v, s1) <- doExpr ty $ Cast LM_Bitcast vval ty
-          let s2 = Store v vreg
+          let s2 = mkStore v vreg NaturallyAligned
           return (stmts `snocOL` s1 `snocOL` s2, top2)
 
       _ -> do
-          let s1 = Store vval vreg
+          let s1 = Store vval vreg Nothing
           return (stmts `snocOL` s1, top2)
 
 
 -- | CmmStore operation
-genStore :: CmmExpr -> CmmExpr -> LlvmM StmtData
+genStore :: CmmExpr -> CmmExpr -> AlignmentSpec -> LlvmM StmtData
 
 -- First we try to detect a few common cases and produce better code for
 -- these then the default case. We are mostly trying to detect Cmm code
 -- like I32[Sp + n] and use 'getelementptr' operations instead of the
 -- generic case that uses casts and pointer arithmetic
-genStore addr@(CmmReg (CmmGlobal r)) val
-    = genStore_fast addr r 0 val
+genStore addr@(CmmReg (CmmGlobal r)) val alignment
+    = genStore_fast addr r 0 val alignment
 
-genStore addr@(CmmRegOff (CmmGlobal r) n) val
-    = genStore_fast addr r n val
+genStore addr@(CmmRegOff (CmmGlobal r) n) val alignment
+    = genStore_fast addr r n val alignment
 
 genStore addr@(CmmMachOp (MO_Add _) [
                             (CmmReg (CmmGlobal r)),
                             (CmmLit (CmmInt n _))])
-                val
-    = genStore_fast addr r (fromInteger n) val
+                val alignment
+    = genStore_fast addr r (fromInteger n) val alignment
 
 genStore addr@(CmmMachOp (MO_Sub _) [
                             (CmmReg (CmmGlobal r)),
                             (CmmLit (CmmInt n _))])
-                val
-    = genStore_fast addr r (negate $ fromInteger n) val
+                val alignment
+    = genStore_fast addr r (negate $ fromInteger n) val alignment
 
 -- generic case
-genStore addr val
-    = getTBAAMeta topN >>= genStore_slow addr val
+genStore addr val alignment
+    = getTBAAMeta topN >>= genStore_slow addr val alignment
 
 -- | CmmStore operation
 -- This is a special case for storing to a global register pointer
 -- offset such as I32[Sp+8].
-genStore_fast :: CmmExpr -> GlobalReg -> Int -> CmmExpr
+genStore_fast :: CmmExpr -> GlobalReg -> Int -> CmmExpr -> AlignmentSpec
               -> LlvmM StmtData
-genStore_fast addr r n val
+genStore_fast addr r n val alignment
   = do platform <- getPlatform
        (gv, grt, s1) <- getCmmRegVal (CmmGlobal r)
        meta          <- getTBAARegMeta r
@@ -1014,7 +1159,7 @@ genStore_fast addr r n val
                 case pLower grt == getVarType vval of
                      -- were fine
                      True  -> do
-                         let s3 = MetaStmt meta $ Store vval ptr
+                         let s3 = MetaStmt meta $ mkStore vval ptr alignment
                          return (stmts `appOL` s1 `snocOL` s2
                                  `snocOL` s3, top)
 
@@ -1022,50 +1167,59 @@ genStore_fast addr r n val
                      False -> do
                          let ty = (pLift . getVarType) vval
                          (ptr', s3) <- doExpr ty $ Cast LM_Bitcast ptr ty
-                         let s4 = MetaStmt meta $ Store vval ptr'
+                         let s4 = MetaStmt meta $ mkStore vval ptr' alignment
                          return (stmts `appOL` s1 `snocOL` s2
                                  `snocOL` s3 `snocOL` s4, top)
 
             -- If its a bit type then we use the slow method since
             -- we can't avoid casting anyway.
-            False -> genStore_slow addr val meta
+            False -> genStore_slow addr val alignment meta
 
 
 -- | CmmStore operation
 -- Generic case. Uses casts and pointer arithmetic if needed.
-genStore_slow :: CmmExpr -> CmmExpr -> [MetaAnnot] -> LlvmM StmtData
-genStore_slow addr val meta = do
+genStore_slow :: CmmExpr -> CmmExpr -> AlignmentSpec -> [MetaAnnot] -> LlvmM StmtData
+genStore_slow addr val alignment meta = do
     (vaddr, stmts1, top1) <- exprToVar addr
     (vval,  stmts2, top2) <- exprToVar val
 
     let stmts = stmts1 `appOL` stmts2
-    dflags <- getDynFlags
     platform <- getPlatform
-    opts <- getLlvmOpts
+    cfg      <- getConfig
     case getVarType vaddr of
         -- sometimes we need to cast an int to a pointer before storing
         LMPointer ty@(LMPointer _) | getVarType vval == llvmWord platform -> do
             (v, s1) <- doExpr ty $ Cast LM_Inttoptr vval ty
-            let s2 = MetaStmt meta $ Store v vaddr
+            let s2 = MetaStmt meta $ mkStore v vaddr alignment
             return (stmts `snocOL` s1 `snocOL` s2, top1 ++ top2)
 
         LMPointer _ -> do
-            let s1 = MetaStmt meta $ Store vval vaddr
+            let s1 = MetaStmt meta $ mkStore vval vaddr alignment
             return (stmts `snocOL` s1, top1 ++ top2)
 
         i@(LMInt _) | i == llvmWord platform -> do
             let vty = pLift $ getVarType vval
             (vptr, s1) <- doExpr vty $ Cast LM_Inttoptr vaddr vty
-            let s2 = MetaStmt meta $ Store vval vptr
+            let s2 = MetaStmt meta $ mkStore vval vptr alignment
             return (stmts `snocOL` s1 `snocOL` s2, top1 ++ top2)
 
         other ->
             pprPanic "genStore: ptr not right type!"
                     (PprCmm.pprExpr platform addr <+> text (
-                        "Size of Ptr: " ++ show (llvmPtrBits platform) ++
+                        "Size of Ptr: "   ++ show (llvmPtrBits platform) ++
                         ", Size of var: " ++ show (llvmWidthInBits platform other) ++
-                        ", Var: " ++ showSDoc dflags (ppVar opts vaddr)))
+                        ", Var: "         ++ renderWithContext (llvmCgContext cfg) (ppVar cfg vaddr)))
 
+mkStore :: LlvmVar -> LlvmVar -> AlignmentSpec -> LlvmStatement
+mkStore vval vptr alignment =
+    Store vval vptr align
+  where
+    ty = pLower (getVarType vptr)
+    align = case alignment of
+              -- See Note [Alignment of vector-typed values]
+              _ | isVector ty  -> Just 1
+              Unaligned        -> Just 1
+              NaturallyAligned -> Nothing
 
 -- | Unconditional branch
 genBranch :: BlockId -> LlvmM StmtData
@@ -1089,22 +1243,22 @@ genCondBranch cond idT idF likely = do
             let s1 = BranchIf vc' labelT labelF
             return (stmts1 `appOL` stmts2 `snocOL` s1, top1 ++ top2)
         else do
-            dflags <- getDynFlags
-            opts <- getLlvmOpts
-            panic $ "genCondBranch: Cond expr not bool! (" ++ showSDoc dflags (ppVar opts vc) ++ ")"
+            cfg <- getConfig
+            pprPanic "genCondBranch: Cond expr not bool! " $
+              lparen <> ppVar cfg vc <> rparen
 
 
 -- | Generate call to llvm.expect.x intrinsic. Assigning result to a new var.
 genExpectLit :: Integer -> LlvmType -> LlvmVar -> LlvmM (LlvmVar, StmtData)
 genExpectLit expLit expTy var = do
-  dflags <- getDynFlags
+  cfg <- getConfig
 
   let
     lit = LMLitVar $ LMIntLit expLit expTy
 
     llvmExpectName
-      | isInt expTy = fsLit $ "llvm.expect." ++ showSDoc dflags (ppr expTy)
-      | otherwise   = panic $ "genExpectedLit: Type not an int!"
+      | isInt expTy = fsLit $ "llvm.expect." ++ renderWithContext (llvmCgContext cfg) (ppr expTy)
+      | otherwise   = panic "genExpectedLit: Type not an int!"
 
   (llvmExpect, stmts, top) <-
     getInstrinct llvmExpectName expTy [expTy, expTy]
@@ -1113,7 +1267,6 @@ genExpectLit expLit expTy var = do
 
 {- Note [Literals and branch conditions]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 It is important that whenever we generate branch conditions for
 literals like '1', they are properly narrowed to an LLVM expression of
 type 'i1' (for bools.) Otherwise, nobody is happy. So when we convert
@@ -1216,8 +1369,8 @@ exprToVarOpt opt e = case e of
     CmmLit lit
         -> genLit opt lit
 
-    CmmLoad e' ty
-        -> genLoad False e' ty
+    CmmLoad e' ty align
+        -> genLoad Nothing e' ty align
 
     -- Cmmreg in expression is the value, so must load. If you want actual
     -- reg pointer, call getCmmReg directly.
@@ -1507,9 +1660,9 @@ genMachOp_slow opt op [x, y] = case op of
     MO_And _   -> genBinMach LM_MO_And
     MO_Or  _   -> genBinMach LM_MO_Or
     MO_Xor _   -> genBinMach LM_MO_Xor
-    MO_Shl _   -> genBinMach LM_MO_Shl
-    MO_U_Shr _ -> genBinMach LM_MO_LShr
-    MO_S_Shr _ -> genBinMach LM_MO_AShr
+    MO_Shl _   -> genBinCastYMach LM_MO_Shl
+    MO_U_Shr _ -> genBinCastYMach LM_MO_LShr
+    MO_S_Shr _ -> genBinCastYMach LM_MO_AShr
 
     MO_V_Add l w   -> genCastBinMach (LMVector l (widthToLlvmInt w)) LM_MO_Add
     MO_V_Sub l w   -> genCastBinMach (LMVector l (widthToLlvmInt w)) LM_MO_Sub
@@ -1553,21 +1706,27 @@ genMachOp_slow opt op [x, y] = case op of
 #endif
 
     where
-        binLlvmOp ty binOp = do
+        binLlvmOp ty binOp allow_y_cast = do
+          cfg      <- getConfig
           platform <- getPlatform
           runExprData $ do
             vx <- exprToVarW x
             vy <- exprToVarW y
-            if getVarType vx == getVarType vy
-                then do
-                    doExprW (ty vx) $ binOp vx vy
 
-                else do
+            if | getVarType vx == getVarType vy
+               -> doExprW (ty vx) $ binOp vx vy
+
+               | allow_y_cast
+               -> do
+                    vy' <- singletonPanic "binLlvmOp cast"<$>
+                            castVarsW Signed [(vy, (ty vx))]
+                    doExprW (ty vx) $ binOp vx vy'
+
+               | otherwise
+               -> do
                     -- Error. Continue anyway so we can debug the generated ll file.
-                    dflags <- getDynFlags
-                    let style = mkCodeStyle CStyle
-                        toString doc = renderWithStyle (initSDocContext dflags style) doc
-                        cmmToStr = (lines . toString . PprCmm.pprExpr platform)
+                    let render   = renderWithContext (llvmCgContext cfg)
+                        cmmToStr = (lines . render . PprCmm.pprExpr platform)
                     statement $ Comment $ map fsLit $ cmmToStr x
                     statement $ Comment $ map fsLit $ cmmToStr y
                     doExprW (ty vx) $ binOp vx vy
@@ -1580,12 +1739,11 @@ genMachOp_slow opt op [x, y] = case op of
               [vx',vy'] -> doExprW ty $ binOp vx' vy'
               _         -> panic "genMachOp_slow: binCastLlvmOp"
 
-        -- | Need to use EOption here as Cmm expects word size results from
+        -- Need to use EOption here as Cmm expects word size results from
         -- comparisons while LLVM return i1. Need to extend to llvmWord type
         -- if expected. See Note [Literals and branch conditions].
         genBinComp opt cmp = do
-            ed@(v1, stmts, top) <- binLlvmOp (\_ -> i1) (Compare cmp)
-            dflags <- getDynFlags
+            ed@(v1, stmts, top) <- binLlvmOp (const i1) (Compare cmp) False
             platform <- getPlatform
             if getVarType v1 == i1
                 then case i1Expected opt of
@@ -1595,27 +1753,28 @@ genMachOp_slow opt op [x, y] = case op of
                         (v2, s1) <- doExpr w_ $ Cast LM_Zext v1 w_
                         return (v2, stmts `snocOL` s1, top)
                 else
-                    panic $ "genBinComp: Compare returned type other then i1! "
-                        ++ (showSDoc dflags $ ppr $ getVarType v1)
+                    pprPanic "genBinComp: Compare returned type other then i1! "
+                               (ppr $ getVarType v1)
 
-        genBinMach op = binLlvmOp getVarType (LlvmOp op)
+        genBinMach op = binLlvmOp getVarType (LlvmOp op) False
+
+        genBinCastYMach op = binLlvmOp getVarType (LlvmOp op) True
 
         genCastBinMach ty op = binCastLlvmOp ty (LlvmOp op)
 
-        -- | Detect if overflow will occur in signed multiply of the two
+        -- Detect if overflow will occur in signed multiply of the two
         -- CmmExpr's. This is the LLVM assembly equivalent of the NCG
         -- implementation. Its much longer due to type information/safety.
         -- This should actually compile to only about 3 asm instructions.
         isSMulOK :: Width -> CmmExpr -> CmmExpr -> LlvmM ExprData
         isSMulOK _ x y = do
           platform <- getPlatform
-          dflags <- getDynFlags
           runExprData $ do
             vx <- exprToVarW x
             vy <- exprToVarW y
 
             let word  = getVarType vx
-            let word2 = LMInt $ 2 * (llvmWidthInBits platform $ getVarType vx)
+            let word2 = LMInt $ 2 * llvmWidthInBits platform (getVarType vx)
             let shift = llvmWidthInBits platform word
             let shift1 = toIWord platform (shift - 1)
             let shift2 = toIWord platform shift
@@ -1632,7 +1791,8 @@ genMachOp_slow opt op [x, y] = case op of
                     doExprW word $ LlvmOp LM_MO_Sub rlow2 rhigh2
 
                 else
-                    panic $ "isSMulOK: Not bit type! (" ++ showSDoc dflags (ppr word) ++ ")"
+                    pprPanic "isSMulOK: Not bit type! " $
+                        lparen <> ppr word <> rparen
 
         panicOp = panic $ "LLVM.CodeGen.genMachOp_slow: unary op encountered"
                        ++ "with two arguments! (" ++ show op ++ ")"
@@ -1642,40 +1802,40 @@ genMachOp_slow _ _ _ = panic "genMachOp: More than 2 expressions in MachOp!"
 
 
 -- | Handle CmmLoad expression.
-genLoad :: Atomic -> CmmExpr -> CmmType -> LlvmM ExprData
+genLoad :: Atomic -> CmmExpr -> CmmType -> AlignmentSpec -> LlvmM ExprData
 
 -- First we try to detect a few common cases and produce better code for
 -- these then the default case. We are mostly trying to detect Cmm code
 -- like I32[Sp + n] and use 'getelementptr' operations instead of the
 -- generic case that uses casts and pointer arithmetic
-genLoad atomic e@(CmmReg (CmmGlobal r)) ty
-    = genLoad_fast atomic e r 0 ty
+genLoad atomic e@(CmmReg (CmmGlobal r)) ty align
+    = genLoad_fast atomic e r 0 ty align
 
-genLoad atomic e@(CmmRegOff (CmmGlobal r) n) ty
-    = genLoad_fast atomic e r n ty
+genLoad atomic e@(CmmRegOff (CmmGlobal r) n) ty align
+    = genLoad_fast atomic e r n ty align
 
 genLoad atomic e@(CmmMachOp (MO_Add _) [
                             (CmmReg (CmmGlobal r)),
                             (CmmLit (CmmInt n _))])
-                ty
-    = genLoad_fast atomic e r (fromInteger n) ty
+                ty align
+    = genLoad_fast atomic e r (fromInteger n) ty align
 
 genLoad atomic e@(CmmMachOp (MO_Sub _) [
                             (CmmReg (CmmGlobal r)),
                             (CmmLit (CmmInt n _))])
-                ty
-    = genLoad_fast atomic e r (negate $ fromInteger n) ty
+                ty align
+    = genLoad_fast atomic e r (negate $ fromInteger n) ty align
 
 -- generic case
-genLoad atomic e ty
-    = getTBAAMeta topN >>= genLoad_slow atomic e ty
+genLoad atomic e ty align
+    = getTBAAMeta topN >>= genLoad_slow atomic e ty align
 
 -- | Handle CmmLoad expression.
 -- This is a special case for loading from a global register pointer
 -- offset such as I32[Sp+8].
 genLoad_fast :: Atomic -> CmmExpr -> GlobalReg -> Int -> CmmType
-             -> LlvmM ExprData
-genLoad_fast atomic e r n ty = do
+             -> AlignmentSpec -> LlvmM ExprData
+genLoad_fast atomic e r n ty align = do
     platform <- getPlatform
     (gv, grt, s1) <- getCmmRegVal (CmmGlobal r)
     meta          <- getTBAARegMeta r
@@ -1688,7 +1848,7 @@ genLoad_fast atomic e r n ty = do
                 case grt == ty' of
                      -- were fine
                      True -> do
-                         (var, s3) <- doExpr ty' (MExpr meta $ loadInstr ptr)
+                         (var, s3) <- doExpr ty' (MExpr meta $ mkLoad atomic ptr align)
                          return (var, s1 `snocOL` s2 `snocOL` s3,
                                      [])
 
@@ -1696,44 +1856,62 @@ genLoad_fast atomic e r n ty = do
                      False -> do
                          let pty = pLift ty'
                          (ptr', s3) <- doExpr pty $ Cast LM_Bitcast ptr pty
-                         (var, s4) <- doExpr ty' (MExpr meta $ loadInstr ptr')
+                         (var, s4) <- doExpr ty' (MExpr meta $ mkLoad atomic ptr' align)
                          return (var, s1 `snocOL` s2 `snocOL` s3
                                     `snocOL` s4, [])
 
             -- If its a bit type then we use the slow method since
             -- we can't avoid casting anyway.
-            False -> genLoad_slow atomic  e ty meta
-  where
-    loadInstr ptr | atomic    = ALoad SyncSeqCst False ptr
-                  | otherwise = Load ptr
+            False -> genLoad_slow atomic  e ty align meta
 
 -- | Handle Cmm load expression.
 -- Generic case. Uses casts and pointer arithmetic if needed.
-genLoad_slow :: Atomic -> CmmExpr -> CmmType -> [MetaAnnot] -> LlvmM ExprData
-genLoad_slow atomic e ty meta = do
+genLoad_slow :: Atomic -> CmmExpr -> CmmType -> AlignmentSpec -> [MetaAnnot]
+             -> LlvmM ExprData
+genLoad_slow atomic e ty align meta = do
   platform <- getPlatform
-  dflags <- getDynFlags
-  opts <- getLlvmOpts
+  cfg      <- getConfig
   runExprData $ do
     iptr <- exprToVarW e
     case getVarType iptr of
-         LMPointer _ -> do
-                    doExprW (cmmToLlvmType ty) (MExpr meta $ loadInstr iptr)
+        LMPointer _ ->
+                    doExprW (cmmToLlvmType ty) (MExpr meta $ mkLoad atomic iptr align)
 
-         i@(LMInt _) | i == llvmWord platform -> do
+        i@(LMInt _) | i == llvmWord platform -> do
                     let pty = LMPointer $ cmmToLlvmType ty
                     ptr <- doExprW pty $ Cast LM_Inttoptr iptr pty
-                    doExprW (cmmToLlvmType ty) (MExpr meta $ loadInstr ptr)
+                    doExprW (cmmToLlvmType ty) (MExpr meta $ mkLoad atomic ptr align)
 
-         other -> do pprPanic "exprToVar: CmmLoad expression is not right type!"
-                        (PprCmm.pprExpr platform e <+> text (
-                            "Size of Ptr: " ++ show (llvmPtrBits platform) ++
-                            ", Size of var: " ++ show (llvmWidthInBits platform other) ++
-                            ", Var: " ++ showSDoc dflags (ppVar opts iptr)))
+        other -> pprPanic "exprToVar: CmmLoad expression is not right type!"
+                     (PprCmm.pprExpr platform e <+> text (
+                         "Size of Ptr: "   ++ show (llvmPtrBits platform) ++
+                         ", Size of var: " ++ show (llvmWidthInBits platform other) ++
+                         ", Var: " ++ renderWithContext (llvmCgContext cfg) (ppVar cfg iptr)))
+
+{-
+Note [Alignment of vector-typed values]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+On x86, vector types need to be 16-byte aligned for aligned
+access, but we have no way of guaranteeing that this is true with GHC
+(we would need to modify the layout of the stack and closures, change
+the storage manager, etc.). So, we blindly tell LLVM that *any* vector
+store or load could be unaligned. In the future we may be able to
+guarantee that certain vector access patterns are aligned, in which
+case we will need a more granular way of specifying alignment.
+-}
+
+mkLoad :: Atomic -> LlvmVar -> AlignmentSpec -> LlvmExpression
+mkLoad atomic vptr alignment
+  | Just mem_ord <- atomic
+                = ALoad (convertMemoryOrdering mem_ord) False vptr
+  | otherwise   = Load vptr align
   where
-    loadInstr ptr | atomic    = ALoad SyncSeqCst False ptr
-                  | otherwise = Load ptr
-
+    ty = pLower (getVarType vptr)
+    align = case alignment of
+              -- See Note [Alignment of vector-typed values]
+              _ | isVector ty  -> Just 1
+              Unaligned        -> Just 1
+              NaturallyAligned -> Nothing
 
 -- | Handle CmmReg expression. This will return a pointer to the stack
 -- location of the register. Throws an error if it isn't allocated on
@@ -1741,21 +1919,21 @@ genLoad_slow atomic e ty meta = do
 getCmmReg :: CmmReg -> LlvmM LlvmVar
 getCmmReg (CmmLocal (LocalReg un _))
   = do exists <- varLookup un
-       dflags <- getDynFlags
        case exists of
          Just ety -> return (LMLocalVar un $ pLift ety)
-         Nothing  -> panic $ "getCmmReg: Cmm register " ++ showSDoc dflags (ppr un) ++ " was not allocated!"
+         Nothing  -> pprPanic "getCmmReg: Cmm register " $
+                        ppr un <> text " was not allocated!"
            -- This should never happen, as every local variable should
            -- have been assigned a value at some point, triggering
            -- "funPrologue" to allocate it on the stack.
 
 getCmmReg (CmmGlobal g)
-  = do onStack <- checkStackReg g
-       dflags <- getDynFlags
+  = do onStack  <- checkStackReg g
        platform <- getPlatform
        if onStack
          then return (lmGlobalRegVar platform g)
-         else panic $ "getCmmReg: Cmm register " ++ showSDoc dflags (ppr g) ++ " not stack-allocated!"
+         else pprPanic "getCmmReg: Cmm register " $
+                ppr g <> text " not stack-allocated!"
 
 -- | Return the value of a given register, as well as its type. Might
 -- need to be load from stack.
@@ -1772,7 +1950,7 @@ getCmmRegVal reg =
  where loadFromStack = do
          ptr <- getCmmReg reg
          let ty = pLower $ getVarType ptr
-         (v, s) <- doExpr ty (Load ptr)
+         (v, s) <- doExpr ty (Load ptr Nothing)
          return (v, ty, unitOL s)
 
 -- | Allocate a local CmmReg on the stack
@@ -1862,6 +2040,12 @@ genLit _ CmmHighStackMark
 -- * Misc
 --
 
+convertMemoryOrdering :: MemoryOrdering -> LlvmSyncOrdering
+convertMemoryOrdering MemOrderRelaxed = SyncMonotonic
+convertMemoryOrdering MemOrderAcquire = SyncAcquire
+convertMemoryOrdering MemOrderRelease = SyncRelease
+convertMemoryOrdering MemOrderSeqCst  = SyncSeqCst
+
 -- | Find CmmRegs that get assigned and allocate them on the stack
 --
 -- Any register that gets written needs to be allocated on the
@@ -1899,7 +2083,7 @@ funPrologue live cmmBlocks = do
             rval  = if isLive r then arg else trash
             alloc = Assignment reg $ Alloca (pLower $ getVarType reg) 1
         markStackReg r
-        return $ toOL [alloc, Store rval reg]
+        return $ toOL [alloc, Store rval reg Nothing]
 
   return (concatOL stmtss `snocOL` jumpToEntry, [])
   where
@@ -2004,10 +2188,10 @@ toIWord platform = mkIntLit (llvmWord platform)
 
 -- | Error functions
 panic :: HasCallStack => String -> a
-panic s = Outputable.panic $ "GHC.CmmToLlvm.CodeGen." ++ s
+panic s = Panic.panic $ "GHC.CmmToLlvm.CodeGen." ++ s
 
 pprPanic :: HasCallStack => String -> SDoc -> a
-pprPanic s d = Outputable.pprPanic ("GHC.CmmToLlvm.CodeGen." ++ s) d
+pprPanic s d = Panic.pprPanic ("GHC.CmmToLlvm.CodeGen." ++ s) d
 
 
 -- | Returns TBAA meta data by unique
@@ -2063,8 +2247,8 @@ runStmtsDecls action = do
 getCmmRegW :: CmmReg -> WriterT LlvmAccum LlvmM LlvmVar
 getCmmRegW = lift . getCmmReg
 
-genLoadW :: Atomic -> CmmExpr -> CmmType -> WriterT LlvmAccum LlvmM LlvmVar
-genLoadW atomic e ty = liftExprData $ genLoad atomic e ty
+genLoadW :: Atomic -> CmmExpr -> CmmType -> AlignmentSpec -> WriterT LlvmAccum LlvmM LlvmVar
+genLoadW atomic e ty alignment = liftExprData $ genLoad atomic e ty alignment
 
 -- | Return element of single-element list; 'panic' if list is not a single-element list
 singletonPanic :: String -> [a] -> a

@@ -163,7 +163,7 @@ Compiling it results in:
 
 For more information on using the API, as well as more samples and
 references, please see `this Haskell.org wiki
-page <http://haskell.org/haskellwiki/GHC/As_a_library>`__.
+page <https://haskell.org/haskellwiki/GHC/As_a_library>`__.
 
 .. _compiler-plugins:
 
@@ -172,7 +172,7 @@ Compiler Plugins
 
 GHC has the ability to load compiler plugins at compile time. The
 feature is similar to the one provided by
-`GCC <http://gcc.gnu.org/wiki/plugins>`__, and allows users to write
+`GCC <https://gcc.gnu.org/wiki/plugins>`__, and allows users to write
 plugins that can adjust the behaviour of the constraint solver, inspect
 and modify the compilation pipeline, as well as transform and inspect
 GHC's intermediate language, Core. Plugins are suitable for experimental
@@ -195,9 +195,11 @@ Using compiler plugins
 
 Plugins can be added on the command line with the :ghc-flag:`-fplugin=⟨module⟩`
 option where ⟨module⟩ is a module in a registered package that exports the
-plugin. Arguments can be passed to the plugins with the
-:ghc-flag:`-fplugin-opt=⟨module⟩:⟨args⟩` option. The list of enabled plugins can
-be reset with the :ghc-flag:`-fclear-plugins` option.
+plugin. Plugins are loaded in order, with command-line and Cabal flags preceding
+those in OPTIONS pragmas which are processed in file order. Arguments can be
+passed to the plugins with the :ghc-flag:`-fplugin-opt=⟨module⟩:⟨args⟩`
+option. The list of enabled plugins can be reset with the
+:ghc-flag:`-fclear-plugins` option.
 
 .. ghc-flag:: -fplugin=⟨module⟩
     :shortdesc: Load a plugin exported by a given module
@@ -214,7 +216,36 @@ be reset with the :ghc-flag:`-fclear-plugins` option.
     :category: plugins
 
     Give arguments to a plugin module; module must be specified with
-    :ghc-flag:`-fplugin=⟨module⟩`.
+    :ghc-flag:`-fplugin=⟨module⟩`. The order of plugin pragmas matter but the
+    order of arg pragmas does not. The same set of arguments go to all plugins
+    from the same module.
+
+    ::
+
+      -- Two Echo plugins will both get args A and B.
+      {-# OPTIONS -fplugin Echo -fplugin-opt Echo:A #-}
+      {-# OPTIONS -fplugin Echo -fplugin-opt Echo:B #-}
+
+      -- While order of the plugins matters, arg order does not.
+      {-# OPTIONS -fplugin-opt Echo2:B #-}
+
+      {-# OPTIONS -fplugin Echo1 #-}
+      {-# OPTIONS -fplugin-opt Echo1:A #-}
+
+      {-# OPTIONS -fplugin Echo2 #-}
+
+    If you want to use the same plugin with different arguments then rexport the
+    same plugin from different lightweight modules.
+
+    ::
+
+      -- Echo1 and Echo2 as lightweight modules re-exporting Echo.plugin.
+      module Echo1 (plugin) where import Echo (plugin)
+      module Echo2 (plugin) where import Echo (plugin)
+
+      -- Echo1 gets arg A while Echo2 gets arg B.
+      {-# OPTIONS -fplugin Echo1 -fplugin-opt Echo1:A #-}
+      {-# OPTIONS -fplugin Echo2 -fplugin-opt Echo2:B #-}
 
 .. ghc-flag:: -fplugin-trustworthy
     :shortdesc: Trust the used plugins and no longer mark the compiled module
@@ -520,8 +551,8 @@ will print out the name of any top-level non-recursive binding with the
 
     annotationsOn :: Data a => ModGuts -> CoreBndr -> CoreM [a]
     annotationsOn guts bndr = do
-      anns <- getAnnotations deserializeWithData guts
-      return $ lookupWithDefaultUFM anns [] (varUnique bndr)
+      (_, anns) <- getAnnotations deserializeWithData guts
+      return $ lookupWithDefaultUFM_Directly anns [] (varUnique bndr)
 
 Please see the GHC API documentation for more about how to use internal
 APIs, etc.
@@ -545,14 +576,29 @@ is defined thus:
 ::
 
     data TcPlugin = forall s . TcPlugin
-      { tcPluginInit  :: TcPluginM s
-      , tcPluginSolve :: s -> TcPluginSolver
-      , tcPluginStop  :: s -> TcPluginM ()
+      { tcPluginInit    :: TcPluginM s
+      , tcPluginSolve   :: s -> TcPluginSolver
+      , tcPluginRewrite :: s -> UniqFM TyCon TcPluginRewriter
+      , tcPluginStop    :: s -> TcPluginM ()
       }
 
-    type TcPluginSolver = [Ct] -> [Ct] -> [Ct] -> TcPluginM TcPluginResult
+    type TcPluginSolver = EvBindsVar -> [Ct] -> [Ct] -> [Ct] -> TcPluginM TcPluginSolveResult
 
-    data TcPluginResult = TcPluginContradiction [Ct] | TcPluginOk [(EvTerm,Ct)] [Ct]
+    type TcPluginRewriter = RewriteEnv -> [Ct] -> [Type] -> TcPluginM TcPluginRewriteResult
+
+  data TcPluginSolveResult
+    = TcPluginSolveResult
+        { tcPluginInsolubleCts :: [Ct]
+        , tcPluginSolvedCts    :: [(EvTerm, Ct)]
+        , tcPluginNewCts       :: [Ct]
+        }
+
+    data TcPluginRewriteResult
+      = TcPluginNoRewrite
+      | TcPluginRewriteTo
+          { tcPluginRewriteTo    :: Reduction
+          , tcRewriterNewWanteds :: [Ct]
+          }
 
 (The details of this representation are subject to change as we gain
 more experience writing typechecker plugins. It should not be assumed to
@@ -565,14 +611,21 @@ The basic idea is as follows:
    in the context, initialise mutable state or open a connection to an
    external process (e.g. an external SMT solver). The plugin can return
    a result of any type it likes, and the result will be passed to the
-   other two fields.
+   other fields of the ``TcPlugin`` record.
 
 -  During constraint solving, GHC repeatedly calls ``tcPluginSolve``.
    This function is provided with the current set of constraints, and
-   should return a ``TcPluginResult`` that indicates whether a
+   should return a ``TcPluginSolveResult`` that indicates whether a
    contradiction was found or progress was made. If the plugin solver
    makes progress, GHC will re-start the constraint solving pipeline,
    looping until a fixed point is reached.
+
+-  When rewriting type family applications, GHC calls ``tcPluginRewriter``.
+   The plugin supplies a collection of type families which it is interested
+   in rewriting. For each of those, the rewriter is provided with the
+   the arguments to that type family, as well as the current collection of
+   Given constraints. The plugin can then specify a rewriting for this
+   type family application, if desired.
 
 -  Finally, GHC calls ``tcPluginStop`` after constraint solving is
    finished, allowing the plugin to dispose of any resources it has
@@ -599,26 +652,35 @@ The key component of a typechecker plugin is a function of type
 
 ::
 
-    solve :: [Ct] -> [Ct] -> [Ct] -> TcPluginM TcPluginResult
-    solve givens deriveds wanteds = ...
+    solve :: EvBindsVar -> [Ct] -> [Ct] -> TcPluginM TcPluginResult
+    solve binds givens wanteds = ...
 
-This function will be invoked at two points in the constraint solving
-process: after simplification of given constraints, and after
-unflattening of wanted constraints. The two phases can be distinguished
-because the deriveds and wanteds will be empty in the first case. In
-each case, the plugin should either
+This function will be invoked in two different ways:
 
--  return ``TcPluginContradiction`` with a list of impossible
-   constraints (which must be a subset of those passed in), so they can
-   be turned into errors; or
+1. after simplification of Given constraints, where the plugin gets the
+   opportunity to rewrite givens,
 
--  return ``TcPluginOk`` with lists of solved and new constraints (the
-   former must be a subset of those passed in and must be supplied with
-   corresponding evidence terms).
+2. after GHC has attempted to solve Wanted constraints.
+
+The two ways can be distinguished by checking the Wanted constraints: in the
+first case (and the first case only), the plugin will be passed an empty list
+of Wanted constraints.
+
+The plugin can then respond with:
+
+* solved constraints, which will be removed from the inert set,
+
+* new constraints, which will be added to the work list,
+
+* insoluble constraints, which will be reported as errors.
+
+The plugin must respond with constraints of the same flavour,
+i.e. in (1) it should return only Givens, and for (2) it should return only
+Wanteds; all other constraints will be ignored.
 
 If the plugin cannot make any progress, it should return
-``TcPluginOk [] []``. Otherwise, if there were any new constraints, the
-main constraint solver will be re-invoked to simplify them, then the
+``TcPluginSolveResult [] [] []``. Otherwise, if there were any new constraints,
+the main constraint solver will be re-invoked to simplify them, then the
 plugin will be invoked again. The plugin is responsible for making sure
 that this process eventually terminates.
 
@@ -630,14 +692,66 @@ by solving or contradicting them).
 
 Constraints that have been solved by the plugin must be provided with
 evidence in the form of an ``EvTerm`` of the type of the constraint.
-This evidence is ignored for given and derived constraints, which GHC
+This evidence is ignored for Given constraints, which GHC
 "solves" simply by discarding them; typically this is used when they are
-uninformative (e.g. reflexive equations). For wanted constraints, the
+uninformative (e.g. reflexive equations). For Wanted constraints, the
 evidence will form part of the Core term that is generated after
 typechecking, and can be checked by ``-dcore-lint``. It is possible for
 the plugin to create equality axioms for use in evidence terms, but GHC
 does not check their consistency, and inconsistent axiom sets may lead
 to segfaults or other runtime misbehaviour.
+
+Evidence is required also when creating new Given constraints, which are
+usually implied by old ones. It is not uncommon that the evidence of a new
+Given constraint contains a removed constraint: the new one has replaced the
+removed one.
+
+.. _type-family-rewriting-with-plugins:
+
+Type family rewriting with plugins
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Typechecker plugins can also directly rewrite type family applications,
+by supplying the ``tcPluginRewrite`` field of the ``TcPlugin`` record.
+
+::
+
+    tcPluginRewrite :: s -> UniqFM TyCon TcPluginRewriter
+
+That is, the plugin registers a map, from a type family's ``TyCon`` to its
+associated rewriting function: ::
+
+    type TcPluginRewriter = [Ct] -> [Type] -> TcPluginM TcPluginRewriteResult
+
+This rewriting function is supplied with the Given constraints from the current
+context, and the type family arguments.
+Note that the type family application is guaranteed to be exactly saturated.
+This function should then return a possible rewriting of the type family
+application, by means of the following datatype: ::
+
+    data TcPluginRewriteResult
+      = TcPluginNoRewrite
+      | TcPluginRewriteTo
+          { tcPluginRewriteTo    :: Reduction
+          , tcRewriterNewWanteds :: [Ct]
+          }
+
+That is, the rewriter can specify a rewriting of the type family application --
+in which case it can also emit new Wanted constraints -- or it can do nothing.
+
+To specify a rewriting, the plugin must provide a ``Reduction``, which is
+defined as follows: ::
+
+    data Reduction = Reduction Coercion !Type
+
+That is, on top of specifying what type the type-family application rewrites to,
+the plugin must also supply a coercion which witnesses this rewriting: ::
+
+  co :: F orig_arg_1 ... orig_arg_n ~ rewritten_ty
+
+Note in particular that the LHS type of the coercion should be the original
+type-family application, while its RHS type is the type that the plugin wants
+to rewrite the type-family application to.
 
 .. _source-plugins:
 
@@ -674,14 +788,24 @@ in the source code as well as the original syntax tree of the compiled module.
 
 ::
 
-    parsed :: [CommandLineOption] -> ModSummary -> HsParsedModule
-                -> Hsc HsParsedModule
+    parsed :: [CommandLineOption] -> ModSummary
+                -> ParsedResult -> Hsc ParsedResult
 
 The ``ModSummary`` contains useful
-meta-information about the compiled module. The ``HsParsedModule`` contains the
-lexical and syntactical information we mentioned before. The result that you
-return will change the result of the parsing. If you don't want to change the
-result, just return the ``HsParsedModule`` that you received as the argument.
+meta-information about the compiled module. The ``ParsedResult`` contains a
+``HsParsedModule``, which contains the lexical and syntactical information we
+mentioned before. The result that you return will change the result of the
+parsing. If you don't want to change the result, just return the
+``ParsedResult`` that you received as the argument.
+
+If the parser encounters any errors that prevent an AST from being constructed,
+the plugin will not be run, but other kinds of errors, as well as warnings,
+will be given to the plugin via the ``PsMessages`` value of the
+``ParsedResult``. This allows you to modify, remove, and add warnings or errors
+before they are displayed to the user, although in most cases, you will likely
+want to return the messages unmodified. The parsing pass will fail if the
+``Messages PsError`` collection inside the return ``ParsedResult`` is not empty
+after all parsing plugins have been run.
 
 Type checked representation
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -794,15 +918,16 @@ displayed.
     import Control.Monad.IO.Class
     import GHC.Driver.Session (getDynFlags)
     import GHC.Driver.Plugins
-    import GHC.Driver.Types
+    import GHC.Plugins
     import GHC.Tc.Types
-    import GHC.Hs.Extension
+    import Language.Haskell.Syntax.Extension
     import GHC.Hs.Decls
     import GHC.Hs.Expr
     import GHC.Hs.ImpExp
     import GHC.Types.Avail
     import GHC.Utils.Outputable
     import GHC.Hs.Doc
+    import GHC
 
     plugin :: Plugin
     plugin = defaultPlugin
@@ -813,11 +938,14 @@ displayed.
       , interfaceLoadAction = interfaceLoadPlugin
       }
 
-    parsedPlugin :: [CommandLineOption] -> ModSummary -> HsParsedModule -> Hsc HsParsedModule
-    parsedPlugin _ _ pm
-      = do dflags <- getDynFlags
-           liftIO $ putStrLn $ "parsePlugin: \n" ++ (showSDoc dflags $ ppr $ hpm_module pm)
-           return pm
+    parsedPlugin :: [CommandLineOption] -> ModSummary
+                 -> ParsedResult -> Hsc ParsedResult
+    parsedPlugin _ _ parsed@(ParsedResult pm msgs)
+         = do dflags <- getDynFlags
+              liftIO $ putStrLn $ "parsePlugin: \n" ++ (showSDoc dflags $ ppr $ hpm_module pm)
+              liftIO $ putStrLn $ "parsePlugin warnings: \n" ++ (showSDoc dflags $ ppr $ psWarnings msgs)
+              liftIO $ putStrLn $ "parsePlugin errors: \n" ++ (showSDoc dflags $ ppr $ psErrors msgs)
+              return parsed
 
     renamedAction :: [CommandLineOption] -> TcGblEnv -> HsGroup GhcRn -> TcM (TcGblEnv, HsGroup GhcRn)
     renamedAction _ tc gr = do
@@ -865,6 +993,10 @@ output:
     module A where
     a = ()
     $(return [])
+    parsePlugin warnings:
+
+    parsePlugin errors:
+
     typeCheckPlugin (rn): a = ()
     interface loaded: Language.Haskell.TH.Lib.Internal
     meta: return []
@@ -1197,6 +1329,64 @@ The output is as follows:
       |     ^^^^^^^^^^^^^
 
 
+.. _defaulting-plugins:
+
+Defaulting plugins
+~~~~~~~~~~~~~~~~~~
+
+Defaulting plugins are called when ambiguous variables might otherwise cause
+errors, in the same way as the built-in defaulting mechanism.
+
+A defaulting plugin can propose potential ways to fill an ambiguous variable
+according to whatever criteria you would like. GHC will verify that those
+proposals will not lead to type errors in a context that you declare.
+
+Defaulting plugins have a single access point in the `GHC.Tc.Types` module
+
+::
+
+    -- | A collection of candidate default types for a type variable.
+    data DefaultingProposal
+      = DefaultingProposal
+        { deProposalTyVar :: TcTyVar
+          -- ^ The type variable to default.
+        , deProposalCandidates :: [Type]
+          -- ^ Candidate types to default the type variable to.
+        , deProposalCts :: [Ct]
+          -- ^ The constraints against which defaults are checked.
+        }
+
+    type DefaultingPluginResult = [DefaultingProposal]
+    type FillDefaulting = WantedConstraints -> TcPluginM DefaultingPluginResult
+
+    -- | A plugin for controlling defaulting.
+    data DefaultingPlugin = forall s. DefaultingPlugin
+      { dePluginInit :: TcPluginM s
+        -- ^ Initialize plugin, when entering type-checker.
+      , dePluginRun :: s -> FillDefaulting
+        -- ^ Default some types
+      , dePluginStop :: s -> TcPluginM ()
+       -- ^ Clean up after the plugin, when exiting the type-checker.
+      }
+
+
+The plugin gets a combination of wanted constraints which can be most easily
+broken down into simple wanted constraints with ``approximateWC``. The result of
+running the plugin should be a ``DefaultingPluginResult``, a list of types that
+should be attempted for a given type variable that is ambiguous in a given
+context. GHC will check if one of the proposals is acceptable in the given
+context and then default to it. The most robust context to provide is the list
+of all wanted constraints that mention the variable you are defaulting. If you
+leave out a constraint, the default will be accepted, and then potentially
+result in a type checker error if it is incompatible with one of the constraints
+you left out. This can be a useful way of forcing a default and reporting errors
+to the user.
+
+There is an example of defaulting lifted types in the GHC test suite. In the
+`testsuite/tests/plugins/` directory see `defaulting-plugin/` for the
+implementation, `test-defaulting-plugin.hs` for an example of when defaulting
+happens, and `test-defaulting-plugin-fail.hs` for an example of when defaults
+don't fit and aren't applied.
 
 .. _plugin_recompilation:
 
@@ -1335,19 +1525,20 @@ this idea can be seen below:
     import BasicTypes
     import GHC.Plugins
     import GHC.Hs.Expr
-    import GHC.Hs.Extension
+    import Language.Haskell.Syntax.Extension
     import GHC.Hs.Lit
     import Hooks
     import GHC.Tc.Utils.Monad
 
     plugin :: Plugin
-    plugin = defaultPlugin { dynflagsPlugin = hooksP }
+    plugin = driverPlugin { driverPlugin = hooksP }
 
-    hooksP :: [CommandLineOption] -> DynFlags -> IO DynFlags
-    hooksP opts dflags = return $ dflags
-      { hooks = (hooks dflags)
-        { runMetaHook = Just (fakeRunMeta opts) }
-      }
+    hooksP :: [CommandLineOption] -> HscEnv -> IO HscEnv
+    hooksP opts hsc_env = do
+        let hooks'   = (hsc_hooks hsc_env)
+                        { runMetaHook = Just (fakeRunMeta opts) }
+            hsc_env' = hsc_env { hsc_hooks = hooks' }
+        return hsc_env'
 
     -- This meta hook doesn't actually care running code in splices,
     -- it just replaces any expression splice with the "0"

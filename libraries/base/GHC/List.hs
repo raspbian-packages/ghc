@@ -1,5 +1,5 @@
 {-# LANGUAGE Trustworthy #-}
-{-# LANGUAGE CPP, NoImplicitPrelude, ScopedTypeVariables, MagicHash #-}
+{-# LANGUAGE CPP, NoImplicitPrelude, ScopedTypeVariables #-}
 {-# LANGUAGE BangPatterns #-}
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 
@@ -20,16 +20,24 @@
 module GHC.List (
    -- [] (..),          -- built-in syntax; can't be used in export list
 
-   map, (++), filter, concat,
-   head, last, tail, init, uncons, null, length, (!!),
-   foldl, foldl', foldl1, foldl1', scanl, scanl1, scanl', foldr, foldr1,
-   scanr, scanr1, iterate, iterate', repeat, replicate, cycle,
-   take, drop, sum, product, maximum, minimum, splitAt, takeWhile, dropWhile,
-   span, break, reverse, and, or,
-   any, all, elem, notElem, lookup,
-   concatMap,
+   -- List-monomorphic Foldable methods and misc functions
+   foldr, foldr', foldr1,
+   foldl, foldl', foldl1,
+   null, length, elem, notElem,
+   maximum, minimum, sum, product, and, or, any, all,
+
+   -- Other functions
+   foldl1', concat, concatMap,
+   map, (++), filter, lookup,
+   head, last, tail, init, uncons, (!!),
+   scanl, scanl1, scanl', scanr, scanr1,
+   iterate, iterate', repeat, replicate, cycle,
+   take, drop, splitAt, takeWhile, dropWhile, span, break, reverse,
    zip, zip3, zipWith, zipWith3, unzip, unzip3,
    errorEmptyList,
+
+   -- * GHC List fusion
+   augment, build,
 
  ) where
 
@@ -37,6 +45,7 @@ import Data.Maybe
 import GHC.Base
 import GHC.Num (Num(..))
 import GHC.Num.Integer (Integer)
+import GHC.Stack.Types (HasCallStack)
 
 infixl 9  !!
 infix  4 `elem`, `notElem`
@@ -63,13 +72,16 @@ infix  4 `elem`, `notElem`
 -- >>> head [1..]
 -- 1
 -- >>> head []
--- Exception: Prelude.head: empty list
-head                    :: [a] -> a
+-- *** Exception: Prelude.head: empty list
+--
+-- WARNING: This function is partial. You can use case-matching, 'uncons' or
+-- 'listToMaybe' instead.
+head                    :: HasCallStack => [a] -> a
 head (x:_)              =  x
 head []                 =  badHead
 {-# NOINLINE [1] head #-}
 
-badHead :: a
+badHead :: HasCallStack => a
 badHead = errorEmptyList "head"
 
 -- This rule is useful in cases like
@@ -107,8 +119,11 @@ uncons (x:xs)           = Just (x, xs)
 -- >>> tail [1]
 -- []
 -- >>> tail []
--- Exception: Prelude.tail: empty list
-tail                    :: [a] -> [a]
+-- *** Exception: Prelude.tail: empty list
+--
+-- WARNING: This function is partial. You can use case-matching or 'uncons'
+-- instead.
+tail                    :: HasCallStack => [a] -> [a]
 tail (_:xs)             =  xs
 tail []                 =  errorEmptyList "tail"
 
@@ -120,8 +135,11 @@ tail []                 =  errorEmptyList "tail"
 -- >>> last [1..]
 -- * Hangs forever *
 -- >>> last []
--- Exception: Prelude.last: empty list
-last                    :: [a] -> a
+-- *** Exception: Prelude.last: empty list
+--
+-- WARNING: This function is partial. You can use 'reverse' with case-matching,
+-- 'uncons' or 'listToMaybe' instead.
+last                    :: HasCallStack => [a] -> a
 #if defined(USE_REPORT_PRELUDE)
 last [x]                =  x
 last (_:xs)             =  last xs
@@ -134,7 +152,7 @@ last xs = foldl (\_ x -> x) lastError xs
 {-# INLINE last #-}
 -- The inline pragma is required to make GHC remember the implementation via
 -- foldl.
-lastError :: a
+lastError :: HasCallStack => a
 lastError = errorEmptyList "last"
 #endif
 
@@ -146,8 +164,11 @@ lastError = errorEmptyList "last"
 -- >>> init [1]
 -- []
 -- >>> init []
--- Exception: Prelude.init: empty list
-init                    :: [a] -> [a]
+-- *** Exception: Prelude.init: empty list
+--
+-- WARNING: This function is partial. You can use 'reverse' with case-matching
+-- or 'uncons' instead.
+init                    :: HasCallStack => [a] -> [a]
 #if defined(USE_REPORT_PRELUDE)
 init [x]                =  []
 init (x:xs)             =  x : init xs
@@ -266,7 +287,7 @@ foldl k z0 xs =
 
 {-
 Note [Left folds via right fold]
-
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Implementing foldl et. al. via foldr is only a good idea if the compiler can
 optimize the resulting code (eta-expand the recursive "go"). See #7994.
 We hope that one of the two measure kick in:
@@ -291,7 +312,7 @@ inline FB functions because:
 * They are higher-order functions and therefore benefit from inlining.
 
 * When the final consumer is a left fold, inlining the FB functions is the only
-  way to make arity expansion happen. See Note [Left fold via right fold].
+  way to make arity expansion happen. See Note [Left folds via right fold].
 
 For this reason we mark all FB functions INLINE [0]. The [0] phase-specifier
 ensures that calls to FB functions can be written back to the original form
@@ -304,11 +325,51 @@ allocation-free. Also see #13001.
 -- ----------------------------------------------------------------------------
 
 -- | A strict version of 'foldl'.
-foldl'           :: forall a b . (b -> a -> b) -> b -> [a] -> b
+foldl' :: forall a b . (b -> a -> b) -> b -> [a] -> b
 {-# INLINE foldl' #-}
-foldl' k z0 xs =
+foldl' k z0 = \xs ->
   foldr (\(v::a) (fn::b->b) -> oneShot (\(z::b) -> z `seq` fn (k z v))) (id :: b -> b) xs z0
-  -- See Note [Left folds via right fold]
+{-
+Note [Definition of foldl']
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We want foldl' to be a good consumer, so:
+
+* We define it (rather cunningly) with `foldr`.  That way, the `fold/build`
+  rule might fire.  See Note [Left folds via right fold]
+
+* We give it an INLINE pragma, so that it'll inline at its call sites, again
+  giving the `fold/build` rule a chance to fire.
+
+* We eta-reduce it so that it has arity 2, not 3.  Reason: consider
+
+     sumlen :: [Float] -> (Float, Int)
+     sumlen = foldl' f (0, 0)
+        where
+          f (!s, !n) !x = (s + x, n + 1)
+
+The RHS of `sumlen` is a partial application of foldl', and is not
+eta-expanded (and it isn't, because we don't eta-expand PAPs.  See Note
+[Do not eta-expand PAPs] in GHC.Core.Opt.Simplify.Utils)
+
+So foldl' is partially applied to two arguments, /and it won't inline/
+if its defn is:
+
+      {-# INLINE foldl' #-}
+      foldl' k z xs = ...
+
+because INLINE functions only inline when saturated.
+
+Conclusion: move the `xs` parameter to the RHS, and define it thus
+
+  fold' k z = \xs -> ...
+
+See !5259 for additional discussion.  This may result in partial applications
+of 'foldl'' inlining in some functions where they previously did not.  Absent
+an INLINE pragam for the calling function, it may become too expensive to
+automatically inline, resulting in a loss of previously accidental list
+fusion.  Such call sites may now need explicit INLINE or INLINABLE pragmas
+to make the desired list fusion robust.
+-}
 
 -- | 'foldl1' is a variant of 'foldl' that has no starting value argument,
 -- and thus must be applied to non-empty lists. Note that unlike 'foldl', the accumulated value must be of the same type as the list elements.
@@ -316,7 +377,7 @@ foldl' k z0 xs =
 -- >>> foldl1 (+) [1..4]
 -- 10
 -- >>> foldl1 (+) []
--- Exception: Prelude.foldl1: empty list
+-- *** Exception: Prelude.foldl1: empty list
 -- >>> foldl1 (-) [1..4]
 -- -8
 -- >>> foldl1 (&&) [True, False, True, True]
@@ -325,12 +386,12 @@ foldl' k z0 xs =
 -- True
 -- >>> foldl1 (+) [1..]
 -- * Hangs forever *
-foldl1                  :: (a -> a -> a) -> [a] -> a
+foldl1                  :: HasCallStack => (a -> a -> a) -> [a] -> a
 foldl1 f (x:xs)         =  foldl f x xs
 foldl1 _ []             =  errorEmptyList "foldl1"
 
 -- | A strict version of 'foldl1'.
-foldl1'                  :: (a -> a -> a) -> [a] -> a
+foldl1'                  :: HasCallStack => (a -> a -> a) -> [a] -> a
 foldl1' f (x:xs)         =  foldl' f x xs
 foldl1' _ []             =  errorEmptyList "foldl1'"
 
@@ -351,7 +412,7 @@ foldl1' _ []             =  errorEmptyList "foldl1'"
 -- * Hangs forever *
 sum                     :: (Num a) => [a] -> a
 {-# INLINE sum #-}
-sum                     =  foldl (+) 0
+sum                     =  foldl' (+) 0
 
 -- | The 'product' function computes the product of a finite list of numbers.
 --
@@ -367,7 +428,7 @@ sum                     =  foldl (+) 0
 -- * Hangs forever *
 product                 :: (Num a) => [a] -> a
 {-# INLINE product #-}
-product                 =  foldl (*) 1
+product                 =  foldl' (*) 1
 
 -- | \(\mathcal{O}(n)\). 'scanl' is similar to 'foldl', but returns a list of
 -- successive reduced values from the left:
@@ -400,7 +461,7 @@ scanl                   = scanlGo
                                []   -> []
                                x:xs -> scanlGo f (f q x) xs)
 
--- Note [scanl rewrite rules]
+-- See Note [scanl rewrite rules]
 {-# RULES
 "scanl"  [~1] forall f a bs . scanl f a bs =
   build (\c n -> a `c` foldr (scanlFB f c) (constScanl n) bs a)
@@ -451,7 +512,7 @@ scanl' = scanlGo'
                             []   -> []
                             x:xs -> scanlGo' f (f q x) xs)
 
--- Note [scanl rewrite rules]
+-- See Note [scanl rewrite rules]
 {-# RULES
 "scanl'"  [~1] forall f a bs . scanl' f a bs =
   build (\c n -> a `c` foldr (scanlFB' f c) (flipSeqScanl' n) bs a)
@@ -471,7 +532,6 @@ flipSeqScanl' a !_b = a
 {-
 Note [scanl rewrite rules]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 In most cases, when we rewrite a form to one that can fuse, we try to rewrite it
 back to the original form if it does not fuse. For scanl, we do something a
 little different. In particular, we rewrite
@@ -498,8 +558,36 @@ Based on nofib benchmarks, this is bad for performance. Therefore, we instead
 match on everything past the :, which is just the tail of scanl.
 -}
 
--- foldr, foldr1, scanr, and scanr1 are the right-to-left duals of the
+-- foldr, foldr', foldr1, scanr, and scanr1 are the right-to-left duals of the
 -- above functions.
+
+-- | 'foldr'' is a variant of 'foldr' that begins list reduction from the last
+-- element and evaluates the accumulator strictly as it unwinds the stack back
+-- to the beginning of the list.  The input list /must/ be finite, otherwise
+-- 'foldr'' runs out of space (/diverges/).
+--
+-- Note that if the function that combines the accumulated value with each
+-- element is strict in the accumulator, other than a possible improvement
+-- in the constant factor, you get the same \(\mathcal{O}(n)\) space cost
+-- as with just 'foldr'.
+--
+-- If you want a strict right fold in constant space, you need a structure
+-- that supports faster than \(\mathcal{O}(n)\) access to the right-most
+-- element, such as @Seq@ from the @containers@ package.
+--
+-- Use of this function is a hint that the @[]@ structure may be a poor fit
+-- for the task at hand.  If the order in which the elements are combined is
+-- not important, use 'foldl'' instead.
+--
+-- >>> foldr' (+) [1..4]  -- Use foldl' instead!
+-- 10
+-- >>> foldr' (&&) [True, False, True, True] -- Use foldr instead!
+-- False
+-- >>> foldr' (||) [False, False, True, True] -- Use foldr instead!
+-- True
+foldr' :: (a -> b -> b) -> b -> [a] -> b
+foldr' f z0 xs = foldl f' id xs z0
+  where f' k x z = k $! f x z
 
 -- | 'foldr1' is a variant of 'foldr' that has no starting value argument,
 -- and thus must be applied to non-empty lists. Note that unlike 'foldr', the accumulated value must be of the same type as the list elements.
@@ -507,7 +595,7 @@ match on everything past the :, which is just the tail of scanl.
 -- >>> foldr1 (+) [1..4]
 -- 10
 -- >>> foldr1 (+) []
--- Exception: Prelude.foldr1: empty list
+-- *** Exception: Prelude.foldr1: empty list
 -- >>> foldr1 (-) [1..4]
 -- -2
 -- >>> foldr1 (&&) [True, False, True, True]
@@ -516,7 +604,7 @@ match on everything past the :, which is just the tail of scanl.
 -- True
 -- >>> force $ foldr1 (+) [1..]
 -- *** Exception: stack overflow
-foldr1                  :: (a -> a -> a) -> [a] -> a
+foldr1                  :: HasCallStack => (a -> a -> a) -> [a] -> a
 foldr1 f = go
   where go [x]            =  x
         go (x:xs)         =  f x (go xs)
@@ -565,7 +653,9 @@ scanrFB f c = \x ~(r, est) -> (f x r, r `c` est)
                  scanr f q0 ls
  #-}
 
-{- Note [scanrFB and evaluation]
+{-
+Note [scanrFB and evaluation]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 In a previous Version, the pattern match on the tuple in scanrFB used to be
 strict. If scanr is called with a build expression, the following would happen:
 The rule "scanr" would fire, and we obtain
@@ -615,17 +705,17 @@ scanr1 f (x:xs)         =  f x q : qs
 -- programmer to supply their own comparison function.
 --
 -- >>> maximum []
--- Exception: Prelude.maximum: empty list
+-- *** Exception: Prelude.maximum: empty list
 -- >>> maximum [42]
 -- 42
 -- >>> maximum [55, -12, 7, 0, -89]
 -- 55
 -- >>> maximum [1..]
 -- * Hangs forever *
-maximum                 :: (Ord a) => [a] -> a
+maximum                 :: (Ord a, HasCallStack) => [a] -> a
 {-# INLINABLE maximum #-}
 maximum []              =  errorEmptyList "maximum"
-maximum xs              =  foldl1 max xs
+maximum xs              =  foldl1' max xs
 
 -- We want this to be specialized so that with a strict max function, GHC
 -- produces good code. Note that to see if this is happending, one has to
@@ -639,17 +729,17 @@ maximum xs              =  foldl1 max xs
 -- programmer to supply their own comparison function.
 --
 -- >>> minimum []
--- Exception: Prelude.minimum: empty list
+-- *** Exception: Prelude.minimum: empty list
 -- >>> minimum [42]
 -- 42
 -- >>> minimum [55, -12, 7, 0, -89]
 -- -89
 -- >>> minimum [1..]
 -- * Hangs forever *
-minimum                 :: (Ord a) => [a] -> a
+minimum                 :: (Ord a, HasCallStack) => [a] -> a
 {-# INLINABLE minimum #-}
 minimum []              =  errorEmptyList "minimum"
-minimum xs              =  foldl1 min xs
+minimum xs              =  foldl1' min xs
 
 {-# SPECIALIZE  minimum :: [Int] -> Int #-}
 {-# SPECIALIZE  minimum :: [Integer] -> Integer #-}
@@ -751,7 +841,7 @@ replicate n x           =  take n (repeat x)
 -- [42,42,42,42,42,42,42,42,42,42...
 -- >>> take 20 $ cycle [2, 5, 7]
 -- [2,5,7,2,5,7,2,5,7,2,5,7...
-cycle                   :: [a] -> [a]
+cycle                   :: HasCallStack => [a] -> [a]
 cycle []                = errorEmptyList "cycle"
 cycle xs                = xs' where xs' = xs ++ xs'
 
@@ -1253,26 +1343,32 @@ concat = foldr (++) []
 -- >>> ['a', 'b', 'c'] !! 2
 -- 'c'
 -- >>> ['a', 'b', 'c'] !! 3
--- Exception: Prelude.!!: index too large
+-- *** Exception: Prelude.!!: index too large
 -- >>> ['a', 'b', 'c'] !! (-1)
--- Exception: Prelude.!!: negative index
-(!!)                    :: [a] -> Int -> a
+-- *** Exception: Prelude.!!: negative index
+--
+-- WARNING: This function is partial. You can use <'atMay'
+-- https://hackage.haskell.org/package/safe-0.3.19/docs/Safe.html#v:atMay>
+-- instead.
 #if defined(USE_REPORT_PRELUDE)
+(!!)                    :: [a] -> Int -> a
 xs     !! n | n < 0 =  errorWithoutStackTrace "Prelude.!!: negative index"
 []     !! _         =  errorWithoutStackTrace "Prelude.!!: index too large"
 (x:_)  !! 0         =  x
 (_:xs) !! n         =  xs !! (n-1)
+-- Prelude version is without HasCallStack to avoid building linear one
 #else
+(!!)                    :: HasCallStack => [a] -> Int -> a
 
 -- We don't really want the errors to inline with (!!).
 -- We may want to fuss around a bit with NOINLINE, and
 -- if so we should be careful not to trip up known-bottom
 -- optimizations.
-tooLarge :: Int -> a
-tooLarge _ = errorWithoutStackTrace (prel_list_str ++ "!!: index too large")
+tooLarge :: HasCallStack => Int -> a
+tooLarge _ = error (prel_list_str ++ "!!: index too large")
 
-negIndex :: a
-negIndex = errorWithoutStackTrace $ prel_list_str ++ "!!: negative index"
+negIndex :: HasCallStack => a
+negIndex = error $ prel_list_str ++ "!!: negative index"
 
 {-# INLINABLE (!!) #-}
 xs !! n
@@ -1325,8 +1421,9 @@ foldr3_left _  z _ _  _      _     = z
                   foldr3 k z (build g) = g (foldr3_left k z) (\_ _ -> z)
  #-}
 
-{- Note [Fusion for foldrN]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
+{-
+Note [Fusion for foldrN]
+~~~~~~~~~~~~~~~~~~~~~~~~
 We arrange that foldr2, foldr3, etc is a good consumer for its first
 (left) list argument. Here's how. See below for the second, third
 etc list arguments
@@ -1352,7 +1449,7 @@ Note [Fusion for zipN/zipWithN]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 We arrange that zip, zip3, etc, and zipWith, zipWit3 etc, are all
 good consumers for their first (left) argument, and good producers.
-Here's how.  See Note [Fusion for foldr2] for why it can't fuse its
+Here's how.  See Note [Fusion for foldrN] for why it can't fuse its
 second (right) list argument.
 
 NB: Zips for larger tuples are in the List module.
@@ -1366,7 +1463,7 @@ NB: Zips for larger tuples are in the List module.
 * To give this rule a chance to fire, we give zip a NOLINLINE[1]
   pragma (although since zip is recursive it might not need it)
 
-* Now the rules for foldr2 (see Note [Fusion for foldr2]) may fire,
+* Now the rules for foldr2 (see Note [Fusion for foldrN]) may fire,
   or rules that fuse the build-produced output of zip.
 
 * If none of these fire, rule "zipList" (active only in phase 1)
@@ -1383,15 +1480,15 @@ NB: Zips for larger tuples are in the List module.
 -- corresponding pairs.
 --
 -- >>> zip [1, 2] ['a', 'b']
--- [(1, 'a'), (2, 'b')]
+-- [(1,'a'),(2,'b')]
 --
 -- If one input list is shorter than the other, excess elements of the longer
 -- list are discarded, even if one of the lists is infinite:
 --
 -- >>> zip [1] ['a', 'b']
--- [(1, 'a')]
+-- [(1,'a')]
 -- >>> zip [1, 2] ['a']
--- [(1, 'a')]
+-- [(1,'a')]
 -- >>> zip [] [1..]
 -- []
 -- >>> zip [1..] []
@@ -1399,10 +1496,11 @@ NB: Zips for larger tuples are in the List module.
 --
 -- 'zip' is right-lazy:
 --
--- >>> zip [] _|_
+-- >>> zip [] undefined
 -- []
--- >>> zip _|_ []
--- _|_
+-- >>> zip undefined []
+-- *** Exception: Prelude.undefined
+-- ...
 --
 -- 'zip' is capable of list fusion, but it is restricted to its
 -- first list argument and its resulting list.
@@ -1460,7 +1558,8 @@ zip3FB cons = \a b c r -> (a,b,c) `cons` r
 --
 -- 'zipWith' is right-lazy:
 --
--- >>> zipWith f [] _|_
+-- >>> let f = undefined
+-- >>> zipWith f [] undefined
 -- []
 --
 -- 'zipWith' is capable of list fusion, but it is restricted to its
@@ -1542,9 +1641,9 @@ unzip3   =  foldr (\(a,b,c) ~(as,bs,cs) -> (a:as,b:bs,c:cs))
 -- Common up near identical calls to `error' to reduce the number
 -- constant strings created when compiled:
 
-errorEmptyList :: String -> a
+errorEmptyList :: HasCallStack => String -> a
 errorEmptyList fun =
-  errorWithoutStackTrace (prel_list_str ++ fun ++ ": empty list")
+  error (prel_list_str ++ fun ++ ": empty list")
 
 prel_list_str :: String
 prel_list_str = "Prelude."

@@ -9,8 +9,9 @@
  * ---------------------------------------------------------------------------*/
 
 #include "Rts.h"
-#include "IOManager.h"
-#include "rts\OSThreads.h"
+#include "ThrIOManager.h"
+#include "MIOManager.h"
+#include "rts/OSThreads.h"
 #include "Prelude.h"
 #include <windows.h>
 
@@ -78,7 +79,9 @@ readIOManagerEvent (void)
             }
         }
     } else {
-        res = 0;
+        // Making it here after getIOManagerEvent has been called means that we
+        // have hit ioManagerDie, which closed our event object.
+        res = IO_MANAGER_DIE;
     }
 
     OS_RELEASE_LOCK(&event_buf_mutex);
@@ -159,4 +162,14 @@ ioManagerStart (void)
         rts_evalIO(&cap, ensureIOManagerIsRunning_closure, NULL);
         rts_unlock(cap);
     }
+}
+
+/*
+ * Called to close the io_manager_event handle when the IO manager thread is
+ * terminating.
+ */
+void
+ioManagerFinished(void)
+{
+    CloseHandle(io_manager_event);
 }

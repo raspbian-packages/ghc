@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, GeneralizedNewtypeDeriving #-}
+
 {-# LANGUAGE LambdaCase #-}
 
 --------------------------------------------------------------------------------
@@ -7,17 +7,15 @@
 
 module GHC.Llvm.Types where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
 import Data.Char
 import Numeric
 
 import GHC.Platform
-import GHC.Driver.Session
 import GHC.Data.FastString
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
 import GHC.Types.Unique
 
 -- from NCG
@@ -87,12 +85,12 @@ ppType t = case t of
 ppParams :: LlvmParameterListType -> [LlvmParameter] -> SDoc
 ppParams varg p
   = let varg' = case varg of
-          VarArgs | null args -> sLit "..."
-                  | otherwise -> sLit ", ..."
-          _otherwise          -> sLit ""
+          VarArgs | null args -> text "..."
+                  | otherwise -> text ", ..."
+          _otherwise          -> text ""
         -- by default we don't print param attributes
         args = map fst p
-    in ppCommaJoin args <> ptext varg'
+    in ppCommaJoin args <> varg'
 
 -- | An LLVM section definition. If Nothing then let LLVM decide the section
 type LMSection = Maybe LMString
@@ -142,6 +140,7 @@ data LlvmStatic
   | LMStaticStr LMString LlvmType       -- ^ Defines a static 'LMString'
   | LMStaticArray [LlvmStatic] LlvmType -- ^ A static array
   | LMStaticStruc [LlvmStatic] LlvmType -- ^ A static structure type
+  | LMStaticStrucU [LlvmStatic] LlvmType -- ^ A static structure type
   | LMStaticPointer LlvmVar             -- ^ A pointer to other data
 
   -- static expressions, could split out but leave
@@ -156,21 +155,6 @@ data LlvmStatic
 -- -----------------------------------------------------------------------------
 -- ** Operations on LLVM Basic Types and Variables
 --
-
--- | LLVM code generator options
-data LlvmOpts = LlvmOpts
-   { llvmOptsPlatform             :: !Platform -- ^ Target platform
-   , llvmOptsFillUndefWithGarbage :: !Bool     -- ^ Fill undefined literals with garbage values
-   , llvmOptsSplitSections        :: !Bool     -- ^ Split sections
-   }
-
--- | Get LlvmOptions from DynFlags
-initLlvmOpts :: DynFlags -> LlvmOpts
-initLlvmOpts dflags = LlvmOpts
-   { llvmOptsPlatform             = targetPlatform dflags
-   , llvmOptsFillUndefWithGarbage = gopt Opt_LlvmFillUndefWithGarbage dflags
-   , llvmOptsSplitSections        = gopt Opt_SplitSections dflags
-   }
 
 garbageLit :: LlvmType -> Maybe LlvmLit
 garbageLit t@(LMInt w)     = Just (LMIntLit (0xbbbbbbbbbbbbbbb0 `mod` (2^w)) t)
@@ -208,6 +192,7 @@ getStatType (LMUninitType    t) = t
 getStatType (LMStaticStr   _ t) = t
 getStatType (LMStaticArray _ t) = t
 getStatType (LMStaticStruc _ t) = t
+getStatType (LMStaticStrucU _ t) = t
 getStatType (LMStaticPointer v) = getVarType v
 getStatType (LMTrunc       _ t) = t
 getStatType (LMBitc        _ t) = t

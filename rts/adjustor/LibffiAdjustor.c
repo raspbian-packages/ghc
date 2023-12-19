@@ -2,19 +2,24 @@
  * libffi-based adjustor thunk logic.
  * ---------------------------------------------------------------------------*/
 
-#include "PosixSource.h"
+#include "rts/PosixSource.h"
 #include "Rts.h"
 
 #include "RtsUtils.h"
 #include "StablePtr.h"
 #include "sm/Storage.h"
 #include "Hash.h"
+#include "Adjustor.h"
 
-#include "ffi.h"
+#include "rts/ghc_ffi.h"
 #include <string.h>
 
 /* Maps AdjustorExecutable* to AdjustorWritable*. */
 static HashTable* allocatedExecs;
+
+void initAdjustors(void) {
+    allocatedExecs = allocHashTable();
+}
 
 static AdjustorWritable allocate_adjustor(AdjustorExecutable *exec_ret)
 {
@@ -24,9 +29,6 @@ static AdjustorWritable allocate_adjustor(AdjustorExecutable *exec_ret)
     ACQUIRE_SM_LOCK;
     cl = writ = ffi_closure_alloc(sizeof(ffi_closure), exec_ret);
     if (cl != NULL) {
-        if (allocatedExecs == NULL) {
-            allocatedExecs = allocHashTable();
-        }
         insertHashTable(allocatedExecs, (StgWord)*exec_ret, writ);
     }
     RELEASE_SM_LOCK;
@@ -37,8 +39,7 @@ static AdjustorWritable exec_to_writable(AdjustorExecutable exec)
 {
     AdjustorWritable writ;
     ACQUIRE_SM_LOCK;
-    if (allocatedExecs == NULL ||
-        (writ = lookupHashTable(allocatedExecs, (StgWord)exec)) == NULL) {
+    if ((writ = lookupHashTable(allocatedExecs, (StgWord)exec)) == NULL) {
         RELEASE_SM_LOCK;
         barf("exec_to_writable: not found");
     }

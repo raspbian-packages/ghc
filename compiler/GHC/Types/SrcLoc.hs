@@ -1,17 +1,11 @@
--- (c) The University of Glasgow, 1992-2006
-
 {-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE StandaloneDeriving #-}
-{-# LANGUAGE DeriveFunctor      #-}
-{-# LANGUAGE DeriveFoldable     #-}
 {-# LANGUAGE DeriveTraversable  #-}
+{-# LANGUAGE FlexibleContexts   #-}
 {-# LANGUAGE FlexibleInstances  #-}
 {-# LANGUAGE RecordWildCards    #-}
 {-# LANGUAGE TypeFamilies       #-}
-{-# LANGUAGE ViewPatterns       #-}
-{-# LANGUAGE FlexibleContexts   #-}
-{-# LANGUAGE PatternSynonyms    #-}
 
+-- (c) The University of Glasgow, 1992-2006
 
 -- | This module contains types that relate to the positions of things
 -- in source files, and allow tagging of those things with locations
@@ -55,7 +49,9 @@ module GHC.Types.SrcLoc (
         realSrcSpanStart, realSrcSpanEnd,
         srcSpanFileName_maybe,
         pprUserRealSpan, pprUnhelpfulSpanReason,
+        pprUserSpan,
         unhelpfulSpanFS,
+        srcSpanToRealSrcSpan,
 
         -- ** Unsafely deconstructing SrcSpan
         -- These are dubious exports, because they crash on some inputs
@@ -64,7 +60,7 @@ module GHC.Types.SrcLoc (
         srcSpanStartCol, srcSpanEndCol,
 
         -- ** Predicates on SrcSpan
-        isGoodSrcSpan, isOneLineSpan,
+        isGoodSrcSpan, isOneLineSpan, isZeroWidthSpan,
         containsSpan,
 
         -- * StringBuffer locations
@@ -86,6 +82,8 @@ module GHC.Types.SrcLoc (
         -- ** Deconstructing Located
         getLoc, unLoc,
         unRealSrcSpan, getRealSrcSpan,
+        pprLocated,
+        pprLocatedAlways,
 
         -- ** Modifying Located
         mapLoc,
@@ -109,6 +107,8 @@ module GHC.Types.SrcLoc (
         psSpanStart,
         psSpanEnd,
         mkSrcSpanPs,
+        combineRealSrcSpans,
+        psLocatedToLocated,
 
         -- * Layout information
         LayoutInfo(..),
@@ -121,11 +121,12 @@ import GHC.Prelude
 import GHC.Utils.Misc
 import GHC.Utils.Json
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
 import GHC.Data.FastString
+import qualified GHC.Data.Strict as Strict
 
 import Control.DeepSeq
 import Control.Applicative (liftA2)
-import Data.Bits
 import Data.Data
 import Data.List (sortBy, intercalate)
 import Data.Function (on)
@@ -147,7 +148,7 @@ this is the obvious stuff:
 --
 -- Represents a single point within a file
 data RealSrcLoc
-  = SrcLoc      FastString              -- A precise location (file name)
+  = SrcLoc      LexicalFastString       -- A precise location (file name)
                 {-# UNPACK #-} !Int     -- line number, begins at 1
                 {-# UNPACK #-} !Int     -- column number, begins at 1
   deriving (Eq, Ord)
@@ -224,12 +225,12 @@ data RealSrcLoc
 -- We use 'BufPos' in in GHC.Parser.PostProcess.Haddock to associate Haddock
 -- comments with parts of the AST using location information (#17544).
 newtype BufPos = BufPos { bufPos :: Int }
-  deriving (Eq, Ord, Show)
+  deriving (Eq, Ord, Show, Data)
 
 -- | Source Location
 data SrcLoc
-  = RealSrcLoc !RealSrcLoc !(Maybe BufPos)  -- See Note [Why Maybe BufPos]
-  | UnhelpfulLoc FastString     -- Just a general indication
+  = RealSrcLoc !RealSrcLoc !(Strict.Maybe BufPos)  -- See Note [Why Maybe BufPos]
+  | UnhelpfulLoc !FastString     -- Just a general indication
   deriving (Eq, Show)
 
 {-
@@ -241,14 +242,14 @@ data SrcLoc
 -}
 
 mkSrcLoc :: FastString -> Int -> Int -> SrcLoc
-mkSrcLoc x line col = RealSrcLoc (mkRealSrcLoc x line col) Nothing
+mkSrcLoc x line col = RealSrcLoc (mkRealSrcLoc x line col) Strict.Nothing
 
 mkRealSrcLoc :: FastString -> Int -> Int -> RealSrcLoc
-mkRealSrcLoc x line col = SrcLoc x line col
+mkRealSrcLoc x line col = SrcLoc (LexicalFastString x) line col
 
-getBufPos :: SrcLoc -> Maybe BufPos
+getBufPos :: SrcLoc -> Strict.Maybe BufPos
 getBufPos (RealSrcLoc _ mbpos) = mbpos
-getBufPos (UnhelpfulLoc _) = Nothing
+getBufPos (UnhelpfulLoc _) = Strict.Nothing
 
 -- | Built-in "bad" 'SrcLoc' values for particular locations
 noSrcLoc, generatedSrcLoc, interactiveSrcLoc :: SrcLoc
@@ -262,7 +263,7 @@ mkGeneralSrcLoc = UnhelpfulLoc
 
 -- | Gives the filename of the 'RealSrcLoc'
 srcLocFile :: RealSrcLoc -> FastString
-srcLocFile (SrcLoc fname _ _) = fname
+srcLocFile (SrcLoc (LexicalFastString fname) _ _) = fname
 
 -- | Raises an error when used on a "bad" 'SrcLoc'
 srcLocLine :: RealSrcLoc -> Int
@@ -309,7 +310,7 @@ lookupSrcSpan (RealSrcSpan l _) = Map.lookup l
 lookupSrcSpan (UnhelpfulSpan _) = const Nothing
 
 instance Outputable RealSrcLoc where
-    ppr (SrcLoc src_path src_line src_col)
+    ppr (SrcLoc (LexicalFastString src_path) src_line src_col)
       = hcat [ pprFastFilePath src_path <> colon
              , int src_line <> colon
              , int src_col ]
@@ -373,7 +374,7 @@ data RealSrcSpan
 -- | StringBuffer Source Span
 data BufSpan =
   BufSpan { bufSpanStart, bufSpanEnd :: {-# UNPACK #-} !BufPos }
-  deriving (Eq, Ord, Show)
+  deriving (Eq, Ord, Show, Data)
 
 instance Semigroup BufSpan where
   BufSpan start1 end1 <> BufSpan start2 end2 =
@@ -384,7 +385,7 @@ instance Semigroup BufSpan where
 -- A 'SrcSpan' identifies either a specific portion of a text file
 -- or a human-readable description of a location.
 data SrcSpan =
-    RealSrcSpan !RealSrcSpan !(Maybe BufSpan)  -- See Note [Why Maybe BufPos]
+    RealSrcSpan !RealSrcSpan !(Strict.Maybe BufSpan)  -- See Note [Why Maybe BufPos]
   | UnhelpfulSpan !UnhelpfulSpanReason
 
   deriving (Eq, Show) -- Show is used by GHC.Parser.Lexer, because we
@@ -399,7 +400,7 @@ data UnhelpfulSpanReason
   deriving (Eq, Show)
 
 removeBufSpan :: SrcSpan -> SrcSpan
-removeBufSpan (RealSrcSpan s _) = RealSrcSpan s Nothing
+removeBufSpan (RealSrcSpan s _) = RealSrcSpan s Strict.Nothing
 removeBufSpan s = s
 
 {- Note [Why Maybe BufPos]
@@ -437,9 +438,9 @@ instance ToJson RealSrcSpan where
 instance NFData SrcSpan where
   rnf x = x `seq` ()
 
-getBufSpan :: SrcSpan -> Maybe BufSpan
+getBufSpan :: SrcSpan -> Strict.Maybe BufSpan
 getBufSpan (RealSrcSpan _ mbspan) = mbspan
-getBufSpan (UnhelpfulSpan _) = Nothing
+getBufSpan (UnhelpfulSpan _) = Strict.Nothing
 
 -- | Built-in "bad" 'SrcSpan's for common sources of location uncertainty
 noSrcSpan, generatedSrcSpan, wiredInSrcSpan, interactiveSrcSpan :: SrcSpan
@@ -462,7 +463,7 @@ srcLocSpan (UnhelpfulLoc str) = UnhelpfulSpan (UnhelpfulOther str)
 srcLocSpan (RealSrcLoc l mb) = RealSrcSpan (realSrcLocSpan l) (fmap (\b -> BufSpan b b) mb)
 
 realSrcLocSpan :: RealSrcLoc -> RealSrcSpan
-realSrcLocSpan (SrcLoc file line col) = RealSrcSpan' file line col line col
+realSrcLocSpan (SrcLoc (LexicalFastString file) line col) = RealSrcSpan' file line col line col
 
 -- | Create a 'SrcSpan' between two points in a file
 mkRealSrcSpan :: RealSrcLoc -> RealSrcLoc -> RealSrcSpan
@@ -553,6 +554,14 @@ isOneLineSpan :: SrcSpan -> Bool
 isOneLineSpan (RealSrcSpan s _) = srcSpanStartLine s == srcSpanEndLine s
 isOneLineSpan (UnhelpfulSpan _) = False
 
+isZeroWidthSpan :: SrcSpan -> Bool
+-- ^ True if the span has a width of zero, as returned for "virtual"
+-- semicolons in the lexer.
+-- For "bad" 'SrcSpan', it returns False
+isZeroWidthSpan (RealSrcSpan s _) = srcSpanStartLine s == srcSpanEndLine s
+                                 && srcSpanStartCol s == srcSpanEndCol s
+isZeroWidthSpan (UnhelpfulSpan _) = False
+
 -- | Tests whether the first span "contains" the other span, meaning
 -- that it covers at least as much source code. True where spans are equal.
 containsSpan :: RealSrcSpan -> RealSrcSpan -> Bool
@@ -614,6 +623,10 @@ realSrcSpanEnd s = mkRealSrcLoc (srcSpanFile s)
 srcSpanFileName_maybe :: SrcSpan -> Maybe FastString
 srcSpanFileName_maybe (RealSrcSpan s _) = Just (srcSpanFile s)
 srcSpanFileName_maybe (UnhelpfulSpan _) = Nothing
+
+srcSpanToRealSrcSpan :: SrcSpan -> Maybe RealSrcSpan
+srcSpanToRealSrcSpan (RealSrcSpan ss _) = Just ss
+srcSpanToRealSrcSpan _ = Nothing
 
 {-
 ************************************************************************
@@ -724,7 +737,7 @@ pprUserRealSpan show_path (RealSrcSpan' src_path sline scol eline ecol)
 
 -- | We attach SrcSpans to lots of things, so let's have a datatype for it.
 data GenLocated l e = L l e
-  deriving (Eq, Ord, Data, Functor, Foldable, Traversable)
+  deriving (Eq, Ord, Show, Data, Functor, Foldable, Traversable)
 
 type Located = GenLocated SrcSpan
 type RealLocated = GenLocated RealSrcSpan
@@ -768,19 +781,35 @@ cmpLocated a b = unLoc a `compare` unLoc b
 -- Precondition: both operands have an associated 'BufSpan'.
 cmpBufSpan :: HasDebugCallStack => Located a -> Located a -> Ordering
 cmpBufSpan (L l1 _) (L l2  _)
-  | Just a <- getBufSpan l1
-  , Just b <- getBufSpan l2
+  | Strict.Just a <- getBufSpan l1
+  , Strict.Just b <- getBufSpan l2
   = compare a b
 
   | otherwise = panic "cmpBufSpan: no BufSpan"
 
-instance (Outputable l, Outputable e) => Outputable (GenLocated l e) where
-  ppr (L l e) = -- TODO: We can't do this since Located was refactored into
-                -- GenLocated:
+instance (Outputable e) => Outputable (Located e) where
+  ppr (L l e) = -- GenLocated:
                 -- Print spans without the file name etc
-                -- ifPprDebug (braces (pprUserSpan False l))
+                whenPprDebug (braces (pprUserSpan False l))
+             $$ ppr e
+instance (Outputable e) => Outputable (GenLocated RealSrcSpan e) where
+  ppr (L l e) = -- GenLocated:
+                -- Print spans without the file name etc
+                whenPprDebug (braces (pprUserSpan False (RealSrcSpan l Strict.Nothing)))
+             $$ ppr e
+
+
+pprLocated :: (Outputable l, Outputable e) => GenLocated l e -> SDoc
+pprLocated (L l e) =
+                -- Print spans without the file name etc
                 whenPprDebug (braces (ppr l))
              $$ ppr e
+
+-- | Always prints the location, even without -dppr-debug
+pprLocatedAlways :: (Outputable l, Outputable e) => GenLocated l e -> SDoc
+pprLocatedAlways (L l e) =
+     braces (ppr l)
+  $$ ppr e
 
 {-
 ************************************************************************
@@ -849,9 +878,12 @@ data PsLoc
 
 data PsSpan
   = PsSpan { psRealSpan :: !RealSrcSpan, psBufSpan :: !BufSpan }
-  deriving (Eq, Ord, Show)
+  deriving (Eq, Ord, Show, Data)
 
 type PsLocated = GenLocated PsSpan
+
+psLocatedToLocated :: PsLocated a -> Located a
+psLocatedToLocated (L sp a) = L (mkSrcSpanPs sp) a
 
 advancePsLoc :: PsLoc -> Char -> PsLoc
 advancePsLoc (PsLoc real_loc buf_loc) c =
@@ -867,7 +899,7 @@ psSpanEnd :: PsSpan -> PsLoc
 psSpanEnd (PsSpan r b) = PsLoc (realSrcSpanEnd r) (bufSpanEnd b)
 
 mkSrcSpanPs :: PsSpan -> SrcSpan
-mkSrcSpanPs (PsSpan r b) = RealSrcSpan r (Just b)
+mkSrcSpanPs (PsSpan r b) = RealSrcSpan r (Strict.Just b)
 
 -- | Layout information for declarations.
 data LayoutInfo =

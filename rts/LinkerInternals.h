@@ -13,17 +13,10 @@
 #include "linker/M32Alloc.h"
 
 #if RTS_LINKER_USE_MMAP
-#if defined(ios_HOST_OS) || defined(darwin_HOST_OS)
-/* Inclusion of system headers usually requires _DARWIN_C_SOURCE on Mac OS X
- * because of some specific defines like MMAP_ANON, MMAP_ANONYMOUS. */
-#define _DARWIN_C_SOURCE 1
-#endif
 #include <sys/mman.h>
 #endif
 
 void printLoadedObjects(void);
-
-#include "BeginPrivate.h"
 
 /* Which object file format are we targeting? */
 #if defined(linux_HOST_OS) || defined(solaris2_HOST_OS) \
@@ -43,6 +36,35 @@ typedef char SymbolName;
 typedef struct _ObjectCode ObjectCode;
 typedef struct _Section    Section;
 
+/*
+ * Note [Processing overflowed relocations]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * When processing relocations whose targets exceed the relocation's maximum
+ * displacement, we can take advantage of knowledge of the symbol type to avoid
+ * linker failures. In particular, if we know that a symbol is a code symbol
+ * then we can handle the relocation by creating a "jump island", a small bit
+ * of code which immediately jumps (with an instruction sequence capable of
+ * larger displacement) to the target.
+ *
+ * This is not possible for data symbols (or, for that matter, Haskell symbols
+ * when TNTC is in use). In these cases we have to rather fail and ask the user
+ * to recompile their program as position-independent.
+ */
+
+/* What kind of thing a symbol identifies. We need to know this to determine how
+ * to process overflowing relocations. See Note [Processing overflowed relocations].
+ * This is bitfield however only the option SYM_TYPE_DUP_DISCARD can be combined
+ * with the other values. */
+typedef enum _SymType {
+    SYM_TYPE_CODE = 1 << 0, /* the symbol is a function and can be relocated via a jump island */
+    SYM_TYPE_DATA = 1 << 1, /* the symbol is data */
+    SYM_TYPE_INDIRECT_DATA = 1 << 2, /* see Note [_iob_func symbol] */
+    SYM_TYPE_DUP_DISCARD = 1 << 3, /* the symbol is a symbol in a BFD import library
+                                      however if a duplicate is found with a mismatching
+                                      SymType then discard this one.  */
+} SymType;
+
+
 #if defined(OBJFORMAT_ELF)
 #  include "linker/ElfTypes.h"
 #elif defined(OBJFORMAT_PEi386)
@@ -60,6 +82,7 @@ typedef struct _Symbol
 {
     SymbolName *name;
     SymbolAddr *addr;
+    SymType type;
 } Symbol_t;
 
 typedef struct NativeCodeRange_ {
@@ -82,16 +105,26 @@ typedef
           /* Static initializer section. e.g. .ctors.  */
           SECTIONKIND_INIT_ARRAY,
           /* Static finalizer section. e.g. .dtors.  */
-          SECTIONKIND_FINIT_ARRAY,
+          SECTIONKIND_FINI_ARRAY,
           /* We don't know what the section is and don't care.  */
           SECTIONKIND_OTHER,
+
+          /*
+           * Windows-specific section kinds
+           */
+
           /* Section contains debug information. e.g. .debug$.  */
           SECTIONKIND_DEBUG,
+          /* Section contains exception table. e.g. .pdata.  */
+          SECTIONKIND_EXCEPTION_TABLE,
+          /* Section contains unwind info. e.g. .xdata.  */
+          SECTIONKIND_EXCEPTION_UNWIND,
           /* Section belongs to an import section group. e.g. .idata$.  */
           SECTIONKIND_IMPORT,
+          /* Section defines the head section of a BFD-style import library, e.g. idata$7.  */
+          SECTIONKIND_BFD_IMPORT_LIBRARY_HEAD,
           /* Section defines an import library entry, e.g. idata$7.  */
-          SECTIONKIND_IMPORT_LIBRARY,
-          SECTIONKIND_NOINFOAVAIL
+          SECTIONKIND_BFD_IMPORT_LIBRARY,
         }
    SectionKind;
 
@@ -123,6 +156,7 @@ typedef enum {
 
 /*
  * Note [No typedefs for customizable types]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  * Some pointer-to-struct types are defined opaquely
  * first, and customized later to architecture/ABI-specific
  * instantiations. Having the usual
@@ -174,6 +208,14 @@ typedef struct _Segment {
 #define NEED_SYMBOL_EXTRAS 1
 #endif
 
+/*
+ * We use the m32 allocator for symbol extras on Windows and other mmap-using
+ * platforms.
+ */
+#if RTS_LINKER_USE_MMAP || defined(mingw32_HOST_ARCH)
+#define NEED_M32 1
+#endif
+
 /* Jump Islands are sniplets of machine code required for relative
  * address relocations on the PowerPC, x86_64 and ARM.
  */
@@ -187,7 +229,8 @@ typedef struct {
     } jumpIsland;
 #elif defined(x86_64_HOST_ARCH)
     uint64_t    addr;
-    uint8_t     jumpIsland[6];
+    // See Note [TLSGD relocation] in elf_tlsgd.c
+    uint8_t     jumpIsland[8];
 #elif defined(arm_HOST_ARCH)
     uint8_t     jumpIsland[16];
 #endif
@@ -200,6 +243,8 @@ typedef enum {
     /* Objects that were loaded by dlopen */
     DYNAMIC_OBJECT,
 } ObjectType;
+
+typedef void (*cxa_finalize_fn)(void *);
 
 /* Top-level structure for an object module.  One of these is allocated
  * for each object file in use.
@@ -237,6 +282,11 @@ struct _ObjectCode {
     /* record by how much image has been deliberately misaligned
        after allocation, so that we can use realloc */
     int        misalignment;
+
+    /* The address of __cxa_finalize; set when at least one finalizer was
+     * register and therefore we must call __cxa_finalize before unloading.
+     * See Note [Resolving __dso_handle]. */
+    cxa_finalize_fn cxa_finalize;
 
     /* The section-kind entries for this object module. An array. */
     int n_sections;
@@ -282,12 +332,6 @@ struct _ObjectCode {
        outside one of these is an error in the linker. */
     ProddableBlock* proddables;
 
-#if defined(ia64_HOST_ARCH)
-    /* Procedure Linkage Table for this object */
-    void *plt;
-    unsigned int pltIndex;
-#endif
-
 #if defined(NEED_SYMBOL_EXTRAS)
     SymbolExtra    *symbol_extras;
     unsigned long   first_symbol_extra;
@@ -305,7 +349,7 @@ struct _ObjectCode {
        require extra information.*/
     StrHashTable *extraInfos;
 
-#if RTS_LINKER_USE_MMAP == 1
+#if defined(NEED_M32)
     /* The m32 allocators used for allocating small sections and symbol extras
      * during loading. We have two: one for (writeable) data and one for
      * (read-only/executable) code. */
@@ -329,6 +373,12 @@ struct _ObjectCode {
       (OC)->fileName                            \
     )
 
+#define ocDebugBelch(oc, s, ...) \
+    debugBelch("%s(%" PATH_FMT ": " s, \
+               __func__, \
+               OC_INFORMATIVE_FILENAME(oc), \
+               ##__VA_ARGS__)
+
 
 #if defined(THREADED_RTS)
 extern Mutex linker_mutex;
@@ -336,10 +386,19 @@ extern Mutex linker_mutex;
 #if defined(OBJFORMAT_ELF) || defined(OBJFORMAT_MACHO)
 extern Mutex dl_mutex;
 #endif
-#endif
+#endif /* THREADED_RTS */
 
-/* Type of the initializer */
+/* Type of an initializer */
 typedef void (*init_t) (int argc, char **argv, char **env);
+
+/* Type of a finalizer */
+typedef void (*fini_t) (void);
+
+typedef enum _SymStrength {
+    STRENGTH_NORMAL,
+    STRENGTH_WEAK,
+    STRENGTH_STRONG,
+} SymStrength;
 
 /* SymbolInfo tracks a symbol's address, the object code from which
    it originated, and whether or not it's weak.
@@ -356,18 +415,16 @@ typedef void (*init_t) (int argc, char **argv, char **env);
 typedef struct _RtsSymbolInfo {
     SymbolAddr* value;
     ObjectCode *owner;
-    HsBool weak;
+    SymStrength strength;
+    SymType type;
 } RtsSymbolInfo;
+
+#include "BeginPrivate.h"
 
 void exitLinker( void );
 
 void freeObjectCode (ObjectCode *oc);
 SymbolAddr* loadSymbol(SymbolName *lbl, RtsSymbolInfo *pinfo);
-
-void *mmapAnonForLinker (size_t bytes);
-void *mmapForLinker (size_t bytes, uint32_t prot, uint32_t flags, int fd, int offset);
-void mmapForLinkerMarkExecutable (void *start, size_t len);
-void munmapForLinker (void *addr, size_t bytes, const char *caller);
 
 void addProddableBlock ( ObjectCode* oc, void* start, int size );
 void checkProddableBlock (ObjectCode *oc, void *addr, size_t size );
@@ -385,18 +442,27 @@ int ghciInsertSymbolTable(
     StrHashTable *table,
     const SymbolName* key,
     SymbolAddr* data,
-    HsBool weak,
+    SymStrength weak,
+    SymType type,
     ObjectCode *owner);
 
 /* Lock-free version of lookupSymbol. When 'dependent' is not NULL, adds it as a
- * dependent to the owner of the symbol. */
-SymbolAddr* lookupDependentSymbol (SymbolName* lbl, ObjectCode *dependent);
+ * dependent to the owner of the symbol. The type of the symbol is stored in 'type'. */
+SymbolAddr* lookupDependentSymbol (SymbolName* lbl, ObjectCode *dependent, SymType *type);
+
+/* Perform TLSGD symbol lookup returning the address of the resulting GOT entry,
+ * which in this case holds the module id and the symbol offset. */
+StgInt64 lookupTlsgdSymbol(const char *, unsigned long, ObjectCode *);
 
 extern StrHashTable *symhash;
 
 pathchar*
 resolveSymbolAddr (pathchar* buffer, int size,
                    SymbolAddr* symbol, uintptr_t* top);
+
+/* defined in LoadArchive.c */
+bool isArchive (pathchar *path);
+HsInt loadArchive_ (pathchar *path);
 
 /*************************************************
  * Various bits of configuration
@@ -419,6 +485,7 @@ resolveSymbolAddr (pathchar* buffer, int size,
 #define USE_CONTIGUOUS_MMAP 0
 #endif
 
+
 HsInt isAlreadyLoaded( pathchar *path );
 OStatus getObjectLoadStatus_ (pathchar *path);
 HsInt loadOc( ObjectCode* oc );
@@ -429,21 +496,5 @@ ObjectCode* mkOc( ObjectType type, pathchar *path, char *image, int imageSize,
 
 void initSegment(Segment *s, void *start, size_t size, SegmentProt prot, int n_sections);
 void freeSegments(ObjectCode *oc);
-
-/* MAP_ANONYMOUS is MAP_ANON on some systems,
-   e.g. OS X (before Sierra), OpenBSD etc */
-#if !defined(MAP_ANONYMOUS) && defined(MAP_ANON)
-#define MAP_ANONYMOUS MAP_ANON
-#endif
-
-/* In order to simplify control flow a bit, some references to mmap-related
-   definitions are blocked off by a C-level if statement rather than a CPP-level
-   #if statement. Since those are dead branches when !RTS_LINKER_USE_MMAP, we
-   just stub out the relevant symbols here
-*/
-#if !RTS_LINKER_USE_MMAP
-#define munmap(x,y) /* nothing */
-#define MAP_ANONYMOUS 0
-#endif
 
 #include "EndPrivate.h"

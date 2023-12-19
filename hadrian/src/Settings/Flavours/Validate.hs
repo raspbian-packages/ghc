@@ -1,4 +1,5 @@
-module Settings.Flavours.Validate (validateFlavour, slowValidateFlavour) where
+module Settings.Flavours.Validate (validateFlavour, slowValidateFlavour,
+                                    quickValidateFlavour) where
 
 import Expression
 import Flavour
@@ -13,10 +14,9 @@ validateFlavour = werror $ defaultFlavour
     , libraryWays = mconcat [ pure [vanilla]
                             , notStage0 ? platformSupportsSharedLibs ? pure [dynamic]
                             ]
-    , rtsWays = mconcat [ pure [vanilla, threaded, debug, logging, threadedDebug, threadedLogging]
+    , rtsWays = mconcat [ pure [vanilla, threaded, debug, threadedDebug]
                         , notStage0 ? platformSupportsSharedLibs ? pure
                             [ dynamic, threadedDynamic, debugDynamic, threadedDebugDynamic
-                            , loggingDynamic, threadedLoggingDynamic
                             ]
                         ]
     }
@@ -36,11 +36,19 @@ validateArgs = sourceArgs SourceArgs
 slowValidateFlavour :: Flavour
 slowValidateFlavour = werror $ validateFlavour
     { name = "slow-validate"
-    , args = defaultBuilderArgs <> slowValidateArgs <> defaultPackageArgs
+    , args = defaultBuilderArgs <> validateArgs <> defaultPackageArgs
+    , ghcDebugAssertions = True
     }
 
-slowValidateArgs :: Args
-slowValidateArgs =
-  mconcat [ validateArgs
-          , notStage0 ? arg "-DDEBUG"
-          ]
+quickValidateArgs :: Args
+quickValidateArgs = sourceArgs SourceArgs
+    { hsDefault  = mempty
+    , hsLibrary  = pure [ "-O" ]
+    , hsCompiler = mconcat [ stage0 ? arg "-O2", notStage0 ? arg "-O"]
+    , hsGhc      = pure [ "-O", "-hide-all-packages" ]
+    }
+
+quickValidateFlavour :: Flavour
+quickValidateFlavour = werror $ validateFlavour
+    { name               = "quick-validate"
+    , args               = defaultBuilderArgs <> quickValidateArgs <> defaultPackageArgs }

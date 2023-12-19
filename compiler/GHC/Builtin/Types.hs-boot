@@ -2,30 +2,41 @@ module GHC.Builtin.Types where
 
 import {-# SOURCE #-} GHC.Core.TyCon    ( TyCon )
 import {-# SOURCE #-} GHC.Core.TyCo.Rep (Type, Kind)
+import {-# SOURCE #-} GHC.Core.DataCon  ( DataCon )
 
-import GHC.Types.Basic (Arity, TupleSort)
-import GHC.Types.Name (Name)
+import GHC.Types.Basic (Arity, TupleSort, Boxity, ConTag)
+import {-# SOURCE #-} GHC.Types.Name (Name)
 
 listTyCon :: TyCon
-typeNatKind, typeSymbolKind :: Type
+typeSymbolKind :: Type
+charTy :: Type
 mkBoxedTupleTy :: [Type] -> Type
 
 coercibleTyCon, heqTyCon :: TyCon
 
 unitTy :: Type
 
-liftedTypeKind :: Kind
-liftedTypeKindTyCon :: TyCon
+
+liftedTypeKindTyConName :: Name
+
+liftedTypeKind, unliftedTypeKind, zeroBitTypeKind :: Kind
+
+liftedTypeKindTyCon, unliftedTypeKindTyCon :: TyCon
+
+liftedRepTyCon, unliftedRepTyCon :: TyCon
 
 constraintKind :: Kind
 
-runtimeRepTyCon, vecCountTyCon, vecElemTyCon :: TyCon
-runtimeRepTy :: Type
+runtimeRepTyCon, levityTyCon, vecCountTyCon, vecElemTyCon :: TyCon
+runtimeRepTy, levityTy :: Type
 
-liftedRepDataConTyCon, vecRepDataConTyCon, tupleRepDataConTyCon :: TyCon
+boxedRepDataConTyCon, liftedDataConTyCon :: TyCon
+vecRepDataConTyCon, tupleRepDataConTyCon :: TyCon
 
-liftedRepDataConTy, unliftedRepDataConTy,
-  intRepDataConTy,
+liftedRepTy, unliftedRepTy, zeroBitRepTy :: Type
+liftedDataConTy, unliftedDataConTy :: Type
+
+intRepDataConTy,
   int8RepDataConTy, int16RepDataConTy, int32RepDataConTy, int64RepDataConTy,
   wordRepDataConTy,
   word8RepDataConTy, word16RepDataConTy, word32RepDataConTy, word64RepDataConTy,
@@ -42,7 +53,6 @@ int8ElemRepDataConTy, int16ElemRepDataConTy, int32ElemRepDataConTy,
 
 anyTypeOfKind :: Kind -> Type
 unboxedTupleKind :: [Type] -> Type
-mkPromotedListTy :: Type -> [Type] -> Type
 
 multiplicityTyCon :: TyCon
 multiplicityTy :: Type
@@ -55,4 +65,18 @@ multMulTyCon :: TyCon
 
 tupleTyConName :: TupleSort -> Arity -> Name
 
+
 integerTy, naturalTy :: Type
+
+promotedTupleDataCon :: Boxity -> Arity -> TyCon
+
+tupleDataCon :: Boxity -> Arity -> DataCon
+tupleTyCon   :: Boxity -> Arity -> TyCon
+
+cTupleDataCon :: Arity -> DataCon
+cTupleDataConName :: Arity -> Name
+cTupleTyConName :: Arity -> Name
+cTupleSelIdName :: ConTag -> Arity -> Name
+
+sumDataCon :: ConTag -> Arity -> DataCon
+sumTyCon :: Arity -> TyCon

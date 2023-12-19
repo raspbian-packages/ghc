@@ -3,7 +3,7 @@
 
 -}
 
-{-# LANGUAGE CPP #-}
+
 {-# LANGUAGE DeriveFunctor #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
@@ -42,33 +42,41 @@ module GHC.Core.Opt.Monad (
     getAnnotations, getFirstAnnotations,
 
     -- ** Screen output
-    putMsg, putMsgS, errorMsg, errorMsgS, warnMsg,
+    putMsg, putMsgS, errorMsg, errorMsgS, msg,
     fatalErrorMsg, fatalErrorMsgS,
     debugTraceMsg, debugTraceMsgS,
-    dumpIfSet_dyn
   ) where
 
 import GHC.Prelude hiding ( read )
 
-import GHC.Core
-import GHC.Driver.Types
-import GHC.Unit.Module
 import GHC.Driver.Session
+import GHC.Driver.Env
+
+import GHC.Core
+import GHC.Core.Unfold
+
 import GHC.Types.Basic  ( CompilerPhase(..) )
 import GHC.Types.Annotations
-
-import GHC.Data.IOEnv hiding     ( liftIO, failM, failWithM )
-import qualified GHC.Data.IOEnv  as IOEnv
 import GHC.Types.Var
-import GHC.Utils.Outputable as Outputable
-import GHC.Data.FastString
-import GHC.Utils.Error( Severity(..), DumpFormat (..), dumpOptionsFromFlag )
 import GHC.Types.Unique.Supply
-import GHC.Utils.Monad
 import GHC.Types.Name.Env
 import GHC.Types.SrcLoc
+import GHC.Types.Error
+
+import GHC.Utils.Error ( errorDiagnostic )
+import GHC.Utils.Outputable as Outputable
+import GHC.Utils.Logger
+import GHC.Utils.Monad
+
+import GHC.Data.FastString
+import GHC.Data.IOEnv hiding     ( liftIO, failM, failWithM )
+import qualified GHC.Data.IOEnv  as IOEnv
+
+import GHC.Unit.Module
+import GHC.Unit.Module.ModGuts
+import GHC.Unit.External
+
 import Data.Bifunctor ( bimap )
-import GHC.Utils.Error (dumpAction)
 import Data.List (intersperse, groupBy, sortBy)
 import Data.Ord
 import Data.Dynamic
@@ -78,7 +86,7 @@ import qualified Data.Map.Strict as MapStrict
 import Data.Word
 import Control.Monad
 import Control.Applicative ( Alternative(..) )
-import GHC.Utils.Panic (throwGhcException, GhcException(..))
+import GHC.Utils.Panic (throwGhcException, GhcException(..), panic)
 
 {-
 ************************************************************************
@@ -121,6 +129,8 @@ data CoreToDo           -- These are diff core-to-core passes,
 
   | CoreTidy
   | CorePrep
+  | CoreAddCallerCcs
+  | CoreAddLateCcs
   | CoreOccurAnal
 
 instance Outputable CoreToDo where
@@ -141,6 +151,8 @@ instance Outputable CoreToDo where
   ppr CoreDesugar              = text "Desugar (before optimization)"
   ppr CoreDesugarOpt           = text "Desugar (after optimization)"
   ppr CoreTidy                 = text "Tidy Core"
+  ppr CoreAddCallerCcs         = text "Add caller cost-centres"
+  ppr CoreAddLateCcs           = text "Add late core cost-centres"
   ppr CorePrep                 = text "CorePrep"
   ppr CoreOccurAnal            = text "Occurrence analysis"
   ppr CoreDoPrintCore          = text "Print core"
@@ -155,29 +167,41 @@ pprPassDetails _ = Outputable.empty
 
 data SimplMode             -- See comments in GHC.Core.Opt.Simplify.Monad
   = SimplMode
-        { sm_names      :: [String] -- Name(s) of the phase
-        , sm_phase      :: CompilerPhase
-        , sm_dflags     :: DynFlags -- Just for convenient non-monadic
-                                    -- access; we don't override these
-        , sm_rules      :: Bool     -- Whether RULES are enabled
-        , sm_inline     :: Bool     -- Whether inlining is enabled
-        , sm_case_case  :: Bool     -- Whether case-of-case is enabled
-        , sm_eta_expand :: Bool     -- Whether eta-expansion is enabled
+        { sm_names        :: [String]       -- ^ Name(s) of the phase
+        , sm_phase        :: CompilerPhase
+        , sm_uf_opts      :: !UnfoldingOpts -- ^ Unfolding options
+        , sm_rules        :: !Bool          -- ^ Whether RULES are enabled
+        , sm_inline       :: !Bool          -- ^ Whether inlining is enabled
+        , sm_case_case    :: !Bool          -- ^ Whether case-of-case is enabled
+        , sm_eta_expand   :: !Bool          -- ^ Whether eta-expansion is enabled
+        , sm_cast_swizzle :: !Bool          -- ^ Do we swizzle casts past lambdas?
+        , sm_pre_inline   :: !Bool          -- ^ Whether pre-inlining is enabled
+        , sm_logger       :: !Logger
+        , sm_dflags       :: DynFlags
+            -- Just for convenient non-monadic access; we don't override these.
+            --
+            -- Used for:
+            --    - target platform (for `exprIsDupable` and `mkDupableAlt`)
+            --    - Opt_DictsCheap and Opt_PedanticBottoms general flags
+            --    - rules options (initRuleOpts)
+            --    - inlineCheck
         }
 
 instance Outputable SimplMode where
     ppr (SimplMode { sm_phase = p, sm_names = ss
                    , sm_rules = r, sm_inline = i
+                   , sm_cast_swizzle = cs
                    , sm_eta_expand = eta, sm_case_case = cc })
        = text "SimplMode" <+> braces (
          sep [ text "Phase =" <+> ppr p <+>
                brackets (text (concat $ intersperse "," ss)) <> comma
-             , pp_flag i   (sLit "inline") <> comma
-             , pp_flag r   (sLit "rules") <> comma
-             , pp_flag eta (sLit "eta-expand") <> comma
-             , pp_flag cc  (sLit "case-of-case") ])
+             , pp_flag i   (text "inline") <> comma
+             , pp_flag r   (text "rules") <> comma
+             , pp_flag eta (text "eta-expand") <> comma
+             , pp_flag cs (text "cast-swizzle") <> comma
+             , pp_flag cc  (text "case-of-case") ])
          where
-           pp_flag f s = ppUnless f (text "no") <+> ptext s
+           pp_flag f s = ppUnless f (text "no") <+> s
 
 data FloatOutSwitches = FloatOutSwitches {
   floatOutLambdas   :: Maybe Int,  -- ^ Just n <=> float lambdas to top level, if
@@ -527,7 +551,7 @@ cmpEqTick :: Tick -> Tick -> Ordering
 cmpEqTick (PreInlineUnconditionally a)  (PreInlineUnconditionally b)    = a `compare` b
 cmpEqTick (PostInlineUnconditionally a) (PostInlineUnconditionally b)   = a `compare` b
 cmpEqTick (UnfoldingDone a)             (UnfoldingDone b)               = a `compare` b
-cmpEqTick (RuleFired a)                 (RuleFired b)                   = a `compare` b
+cmpEqTick (RuleFired a)                 (RuleFired b)                   = a `uniqCompareFS` b
 cmpEqTick (EtaExpansion a)              (EtaExpansion b)                = a `compare` b
 cmpEqTick (EtaReduction a)              (EtaReduction b)                = a `compare` b
 cmpEqTick (BetaReduction a)             (BetaReduction b)               = a `compare` b
@@ -703,6 +727,9 @@ getUniqMask = read cr_uniq_mask
 instance HasDynFlags CoreM where
     getDynFlags = fmap hsc_dflags getHscEnv
 
+instance HasLogger CoreM where
+    getLogger = fmap hsc_logger getHscEnv
+
 instance HasModule CoreM where
     getModule = read cr_module
 
@@ -768,20 +795,19 @@ we aren't using annotations heavily.
 ************************************************************************
 -}
 
-msg :: Severity -> WarnReason -> SDoc -> CoreM ()
-msg sev reason doc
-  = do { dflags <- getDynFlags
-       ; loc    <- getSrcSpanM
-       ; unqual <- getPrintUnqualified
-       ; let sty = case sev of
-                     SevError   -> err_sty
-                     SevWarning -> err_sty
-                     SevDump    -> dump_sty
-                     _          -> user_sty
-             err_sty  = mkErrStyle unqual
-             user_sty = mkUserStyle unqual AllTheWay
-             dump_sty = mkDumpStyle unqual
-       ; liftIO $ putLogMsg dflags reason sev loc (withPprStyle sty doc) }
+msg :: MessageClass -> SDoc -> CoreM ()
+msg msg_class doc = do
+    logger <- getLogger
+    loc    <- getSrcSpanM
+    unqual <- getPrintUnqualified
+    let sty = case msg_class of
+                MCDiagnostic _ _ -> err_sty
+                MCDump           -> dump_sty
+                _                -> user_sty
+        err_sty  = mkErrStyle unqual
+        user_sty = mkUserStyle unqual AllTheWay
+        dump_sty = mkDumpStyle unqual
+    liftIO $ logMsg logger msg_class loc (withPprStyle sty doc)
 
 -- | Output a String message to the screen
 putMsgS :: String -> CoreM ()
@@ -789,7 +815,7 @@ putMsgS = putMsg . text
 
 -- | Output a message to the screen
 putMsg :: SDoc -> CoreM ()
-putMsg = msg SevInfo NoReason
+putMsg = msg MCInfo
 
 -- | Output an error to the screen. Does not cause the compiler to die.
 errorMsgS :: String -> CoreM ()
@@ -797,10 +823,7 @@ errorMsgS = errorMsg . text
 
 -- | Output an error to the screen. Does not cause the compiler to die.
 errorMsg :: SDoc -> CoreM ()
-errorMsg = msg SevError NoReason
-
-warnMsg :: WarnReason -> SDoc -> CoreM ()
-warnMsg = msg SevWarning
+errorMsg doc = msg errorDiagnostic doc
 
 -- | Output a fatal error to the screen. Does not cause the compiler to die.
 fatalErrorMsgS :: String -> CoreM ()
@@ -808,7 +831,7 @@ fatalErrorMsgS = fatalErrorMsg . text
 
 -- | Output a fatal error to the screen. Does not cause the compiler to die.
 fatalErrorMsg :: SDoc -> CoreM ()
-fatalErrorMsg = msg SevFatal NoReason
+fatalErrorMsg = msg MCFatal
 
 -- | Output a string debugging message at verbosity level of @-v@ or higher
 debugTraceMsgS :: String -> CoreM ()
@@ -816,13 +839,4 @@ debugTraceMsgS = debugTraceMsg . text
 
 -- | Outputs a debugging message at verbosity level of @-v@ or higher
 debugTraceMsg :: SDoc -> CoreM ()
-debugTraceMsg = msg SevDump NoReason
-
--- | Show some labelled 'SDoc' if a particular flag is set or at a verbosity level of @-v -ddump-most@ or higher
-dumpIfSet_dyn :: DumpFlag -> String -> DumpFormat -> SDoc -> CoreM ()
-dumpIfSet_dyn flag str fmt doc
-  = do { dflags <- getDynFlags
-       ; unqual <- getPrintUnqualified
-       ; when (dopt flag dflags) $ liftIO $ do
-         let sty = mkDumpStyle unqual
-         dumpAction dflags sty (dumpOptionsFromFlag flag) str fmt doc }
+debugTraceMsg = msg MCDump

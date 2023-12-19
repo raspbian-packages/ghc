@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, ScopedTypeVariables, LambdaCase #-}
+{-# LANGUAGE ScopedTypeVariables, LambdaCase #-}
 
 -- | Defines a simple exception type and utilities to throw it. The
 -- 'PlainGhcException' type is a subset of the 'GHC.Utils.Panic.GhcException'
@@ -21,17 +21,14 @@ module GHC.Utils.Panic.Plain
   , panic, sorry, pgmError
   , cmdLineError, cmdLineErrorIO
   , assertPanic
-
-  , progName
+  , assert, assertM, massert
   ) where
 
-#include "HsVersions.h"
-
 import GHC.Settings.Config
+import GHC.Utils.Constants
 import GHC.Utils.Exception as Exception
 import GHC.Stack
 import GHC.Prelude
-import System.Environment
 import System.IO.Unsafe
 
 -- | This type is very similar to 'GHC.Utils.Panic.GhcException', but it omits
@@ -69,14 +66,7 @@ data PlainGhcException
 instance Exception PlainGhcException
 
 instance Show PlainGhcException where
-  showsPrec _ e@(PlainProgramError _) = showPlainGhcException e
-  showsPrec _ e@(PlainCmdLineError _) = showString "<command line>: " . showPlainGhcException e
-  showsPrec _ e = showString progName . showString ": " . showPlainGhcException e
-
--- | The name of this GHC.
-progName :: String
-progName = unsafePerformIO (getProgName)
-{-# NOINLINE progName #-}
+  showsPrec _ e = showPlainGhcException e
 
 -- | Short usage information to display when we are given the wrong cmd line arguments.
 short_usage :: String
@@ -97,13 +87,13 @@ showPlainGhcException =
     sorryMsg :: ShowS -> ShowS
     sorryMsg s =
         showString "sorry! (unimplemented feature or known bug)\n"
-      . showString ("  (GHC version " ++ cProjectVersion ++ ":\n\t")
+      . showString ("  GHC version " ++ cProjectVersion ++ ":\n\t")
       . s . showString "\n"
 
     panicMsg :: ShowS -> ShowS
     panicMsg s =
         showString "panic! (the 'impossible' happened)\n"
-      . showString ("  (GHC version " ++ cProjectVersion ++ ":\n\t")
+      . showString ("  GHC version " ++ cProjectVersion ++ ":\n\t")
       . s . showString "\n\n"
       . showString "Please report this as a GHC bug:  https://www.haskell.org/ghc/reportabug\n"
 
@@ -136,3 +126,27 @@ assertPanic :: String -> Int -> a
 assertPanic file line =
   Exception.throw (Exception.AssertionFailed
            ("ASSERT failed! file " ++ file ++ ", line " ++ show line))
+
+
+assertPanic' :: HasCallStack => a
+assertPanic' =
+  let doc = unlines $ fmap ("  "++) $ lines (prettyCallStack callStack)
+  in
+  Exception.throw (Exception.AssertionFailed
+           ("ASSERT failed!\n"
+            ++ withFrozenCallStack doc))
+
+assert :: HasCallStack => Bool -> a -> a
+{-# INLINE assert #-}
+assert cond a =
+  if debugIsOn && not cond
+    then withFrozenCallStack assertPanic'
+    else a
+
+massert :: (HasCallStack, Applicative m) => Bool -> m ()
+{-# INLINE massert #-}
+massert cond = withFrozenCallStack (assert cond (pure ()))
+
+assertM :: (HasCallStack, Monad m) => m Bool -> m ()
+{-# INLINE assertM #-}
+assertM mcond = withFrozenCallStack (mcond >>= massert)

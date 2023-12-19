@@ -1,5 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE PatternSynonyms, ViewPatterns #-}
+{-# LANGUAGE PatternSynonyms    #-}
 
 {-|
 This module defines the semi-ring of multiplicities, and associated functions.
@@ -146,7 +145,7 @@ can contain 0, and multiplicities can't.
 Why do we need a 0 usage? A function which doesn't use its argument will be
 required to annotate it with `Many`:
 
-    \(x # Many) -> 0
+    \(x % Many) -> 0
 
 However, we cannot replace absence with Many when computing usages
 compositionally: in
@@ -220,7 +219,7 @@ We have
 
 The goal is to maximise reuse of types between linear code and traditional
 code. This is argued at length in the proposal and the article (links in Note
-[Linear Types]).
+[Linear types]).
 
 Note [Polymorphisation of linear fields]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -238,9 +237,7 @@ Types don't match, we should get a type error. But this is legal Haskell 98
 code! Bad! Bad! Bad!
 
 It could be solved with subtyping, but subtyping doesn't combine well with
-polymorphism.
-
-Instead, we generalise the type of Just, when used as term:
+polymorphism. Instead, we generalise the type of Just, when used as term:
 
    Just :: forall {p}. a %p-> Just a
 
@@ -255,7 +252,8 @@ We only generalise linear fields this way: fields with multiplicity Many, or
 other multiplicity expressions are exclusive to -XLinearTypes, hence don't have
 backward compatibility implications.
 
-The implementation is described in Note [Linear fields generalization].
+The implementation is described in Note [Typechecking data constructors]
+in GHC.Tc.Gen.Head.
 
 More details in the proposal.
 -}
@@ -291,7 +289,7 @@ In future work, instead of approximating we might add type families
 and allow users to write types involving operations on multiplicities.
 In this case, we could enforce more invariants in Mult, for example,
 enforce that it is in the form of a sum of products, and even
-that the sumands and factors are ordered somehow, to have more equalities.
+that the summands and factors are ordered somehow, to have more equalities.
 -}
 
 -- With only two multiplicities One and Many, we can always replace

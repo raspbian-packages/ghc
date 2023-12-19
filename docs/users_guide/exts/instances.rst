@@ -106,7 +106,9 @@ Formal syntax for instance declaration types
 
 The top of an instance declaration only permits very specific forms of types.
 To make more precise what forms of types are or are not permitted, we provide a
-BNF-style grammar for the tops of instance declarations below: ::
+BNF-style grammar for the tops of instance declarations below.
+
+.. code-block:: none
 
   inst_top ::= 'instance' opt_forall opt_ctxt inst_head opt_where
 
@@ -141,22 +143,22 @@ Where:
 
 - ``btype`` is a type that is not allowed to have an outermost
   ``forall``/``=>`` unless it is surrounded by parentheses. For example,
-  ``forall a. a`` and ``Eq a => a`` are not legal ``btype``s, but
+  ``forall a. a`` and ``Eq a => a`` are not legal ``btype``\s, but
   ``(forall a. a)`` and ``(Eq a => a)`` are legal.
 - ``ctype`` is a ``btype`` that has no restrictions on an outermost
-  ``forall``/``=>``, so ``forall a. a`` and ``Eq a => a`` are legal ``ctype``s.
-- ``arg_type`` is a type that is not allowed to have ``forall``s or ``=>``s
+  ``forall``/``=>``, so ``forall a. a`` and ``Eq a => a`` are legal ``ctype``\s.
+- ``arg_type`` is a type that is not allowed to have ``forall``\s or ``=>``\s
 - ``prefix_cls_tycon`` is a class type constructor written prefix (e.g.,
   ``Show`` or ``(&&&)``), while ``infix_cls_tycon`` is a class type constructor
-  written infix (e.g., ```Show``` or ``&&&``).
+  written infix (e.g., ``\`Show\``` or ``&&&``).
 
 This is a simplified grammar that does not fully delve into all of the
 implementation details of GHC's parser (such as the placement of Haddock
 comments), but it is sufficient to attain an understanding of what is
 syntactically allowed. Some further various observations about this grammar:
 
-- Instance declarations are not allowed to be declared with nested ``forall``s
-  or ``=>``s. For example, this would be rejected: ::
+- Instance declarations are not allowed to be declared with nested ``forall``\s
+  or ``=>``\s. For example, this would be rejected: ::
 
     instance forall a. forall b. C (Either a b) where ...
 
@@ -171,27 +173,8 @@ syntactically allowed. Some further various observations about this grammar:
   instance, ``instance (C a)`` is accepted, as is ``instance forall a. (C a)``.
 
 .. _instance-rules:
-
-Relaxed rules for instance contexts
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-In Haskell 98, the class constraints in the context of the instance
-declaration must be of the form ``C a`` where ``a`` is a type variable
-that occurs in the head.
-
-The :extension:`FlexibleContexts` extension relaxes this rule, as well as relaxing
-the corresponding rule for type signatures (see
-:ref:`flexible-contexts`). Specifically, :extension:`FlexibleContexts`, allows
-(well-kinded) class constraints of form ``(C t1 ... tn)`` in the context
-of an instance declaration.
-
-Notice that the extension does not affect equality constraints in an instance
-context; they are permitted by :extension:`TypeFamilies` or :extension:`GADTs`.
-
-However, the instance declaration must still conform to the rules for
-instance termination: see :ref:`instance-termination`.
-
 .. _instance-termination:
+.. _undecidable-instances:
 
 Instance termination rules
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -282,60 +265,6 @@ because the derived instance
 
 conforms to the above rules.
 
-A useful idiom permitted by the above rules is as follows. If one allows
-overlapping instance declarations then it's quite convenient to have a
-"default instance" declaration that applies if something more specific
-does not:
-
-::
-
-      instance C a where
-        op = ... -- Default
-
-.. _undecidable-instances:
-
-Undecidable instances
-~~~~~~~~~~~~~~~~~~~~~
-
-.. index::
-   single: -XUndecidableInstances
-
-Sometimes even the termination rules of :ref:`instance-termination` are
-too onerous. So GHC allows you to experiment with more liberal rules: if
-you use the experimental extension :extension:`UndecidableInstances`, both the Paterson
-Conditions and the Coverage
-Condition (described in :ref:`instance-termination`) are lifted.
-Termination is still ensured by having a fixed-depth recursion stack. If
-you exceed the stack depth you get a sort of backtrace, and the
-opportunity to increase the stack depth with
-``-freduction-depth=⟨n⟩``. However, if you should exceed the default
-reduction depth limit, it is probably best just to disable depth
-checking, with ``-freduction-depth=0``. The exact depth your program
-requires depends on minutiae of your code, and it may change between
-minor GHC releases. The safest bet for released code -- if you're sure
-that it should compile in finite time -- is just to disable the check.
-
-For example, sometimes you might want to use the following to get the
-effect of a "class synonym":
-
-::
-
-      class (C1 a, C2 a, C3 a) => C a where { }
-
-      instance (C1 a, C2 a, C3 a) => C a where { }
-
-This allows you to write shorter signatures:
-
-::
-
-      f :: C a => ...
-
-instead of
-
-::
-
-      f :: (C1 a, C2 a, C3 a) => ...
-
 The restrictions on functional dependencies
 (:ref:`functional-dependencies`) are particularly troublesome. It is
 tempting to introduce type variables in the context that do not appear
@@ -394,6 +323,8 @@ Overlapping instances
 
 .. extension:: OverlappingInstances
     :shortdesc: Enable overlapping instances.
+
+    :since: 6.8.1
 
     Deprecated extension to weaken checks intended to ensure instance resolution
     termination.
@@ -507,6 +438,7 @@ As a more substantial example of the rules in action, consider ::
       instance {-# OVERLAPPABLE #-} context3 => C a   [b]   where ...  -- (C)
       instance {-# OVERLAPPING  #-} context4 => C Int [Int] where ...  -- (D)
 
+(These all need :extension:`FlexibleInstances`.)
 Now suppose that the type inference engine needs to solve the constraint
 ``C Int [Int]``. This constraint matches instances (A), (C) and (D), but
 the last is more specific, and hence is chosen.
@@ -519,7 +451,7 @@ accepted and (A) or (C) would be chosen arbitrarily.
 An instance declaration is *more specific* than another iff the head of
 former is a substitution instance of the latter. For example (D) is
 "more specific" than (C) because you can get from (C) to (D) by
-substituting ``a := Int``.
+substituting ``a := Int`` and ``b := Int``.
 
 The final bullet (about unifying instances)
 makes GHC conservative about committing to an
@@ -547,8 +479,8 @@ the type ::
       f :: C b [b] => [b] -> [b]
 
 That postpones the question of which instance to pick to the call site
-for ``f`` by which time more is known about the type ``b``. You can
-write this type signature yourself if you use the
+for ``f`` by which time more is known about the type ``b``. You
+will need the
 :extension:`FlexibleContexts` extension.
 
 Exactly the same situation can arise in instance declarations
@@ -569,7 +501,7 @@ declaration, thus: ::
       instance C Int [b] => Foo [b] where
          f x = ...
 
-(You need :extension:`FlexibleInstances` to do this.)
+(You need :extension:`FlexibleContexts` to do this.)
 
 In the unification check in the final bullet, GHC also uses the
 "in-scope given constraints".  Consider for example ::

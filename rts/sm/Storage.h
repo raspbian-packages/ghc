@@ -43,6 +43,15 @@ extern Mutex sm_mutex;
 #define ASSERT_SM_LOCK()
 #endif
 
+#if defined(THREADED_RTS)
+// needed for HEAP_ALLOCED below
+extern SpinLock gc_alloc_block_sync;
+#endif
+
+#define ACQUIRE_ALLOC_BLOCK_SPIN_LOCK() ACQUIRE_SPIN_LOCK(&gc_alloc_block_sync)
+#define RELEASE_ALLOC_BLOCK_SPIN_LOCK() RELEASE_SPIN_LOCK(&gc_alloc_block_sync)
+
+
 /* -----------------------------------------------------------------------------
    The write barrier for MVARs and TVARs
    -------------------------------------------------------------------------- */
@@ -82,7 +91,7 @@ bool doYouWantToGC(Capability *cap)
 /* -----------------------------------------------------------------------------
    Allocation accounting
 
-   See [Note allocation accounting] in Storage.c
+   See Note [allocation accounting] in Storage.c
    -------------------------------------------------------------------------- */
 
 //
@@ -116,6 +125,8 @@ StgWord genLiveBlocks (generation *gen);
 StgWord calcTotalLargeObjectsW (void);
 StgWord calcTotalCompactW (void);
 
+void accountAllocation(Capability *cap, W_ n);
+
 /* ----------------------------------------------------------------------------
    Storage manager internal APIs and globals
    ------------------------------------------------------------------------- */
@@ -126,7 +137,7 @@ void move_STACK (StgStack *src, StgStack *dest);
 
 /* -----------------------------------------------------------------------------
    Note [STATIC_LINK fields]
-
+   ~~~~~~~~~~~~~~~~~~~~~~~~~
    The low 2 bits of the static link field have the following meaning:
 
    00     we haven't seen this static object before
@@ -146,6 +157,12 @@ void move_STACK (StgStack *src, StgStack *dest);
 
   bits = link_field & 3;
   if ((bits | prev_static_flag) != 3) { ... }
+
+  However, this mechanism for tracking liveness has an important implication:
+  once a static object becomes unreachable it must never become reachable again.
+  One would think that this can by definition never happen but in the past SRT
+  generation bugs have caused precisely this behavior with disasterous results.
+  See Note [No static object resurrection] in GHC.Cmm.Info.Build for details.
 
   -------------------------------------------------------------------------- */
 
@@ -175,7 +192,7 @@ extern uint32_t prev_static_flag, static_flag;
 
 /* -----------------------------------------------------------------------------
    Note [CAF lists]
-
+   ~~~~~~~~~~~~~~~~
    dyn_caf_list  (CAFs chained through static_link)
       This is a chain of all CAFs in the program, used for
       dynamically-linked GHCi.

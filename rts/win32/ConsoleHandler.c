@@ -57,7 +57,7 @@ freeSignalHandlers(void) {
     /* Do nothing */
 }
 
-/* Seems to be a bit of an orphan...where used? */
+/* Called in hs_exit to clean up resources.  */
 void
 finiUserSignals(void)
 {
@@ -91,7 +91,7 @@ static BOOL WINAPI shutdown_handler(DWORD dwCtrlType)
         // If we're already trying to interrupt the RTS, terminate with
         // extreme prejudice.  So the first ^C tries to exit the program
         // cleanly, and the second one just kills it.
-        if (sched_state >= SCHED_INTERRUPTING) {
+        if (getSchedState() >= SCHED_INTERRUPTING) {
             stg_exit(EXIT_INTERRUPTED);
         } else {
             interruptStgRts();
@@ -332,7 +332,7 @@ rts_ConsoleHandlerDone (int ev USED_IF_NOT_THREADS)
  * up as part Ctrl-C delivery.
  */
 int
-rts_waitConsoleHandlerCompletion()
+rts_waitConsoleHandlerCompletion(void)
 {
     /* As long as the worker doesn't need to do a multiple wait,
      * let's keep this HANDLE private to this 'module'.

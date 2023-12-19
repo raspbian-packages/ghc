@@ -13,7 +13,7 @@
 -- License     :  BSD-style (see the LICENSE file in the distribution)
 --
 -- Maintainer  :  libraries@haskell.org
--- Stability   :  experimental
+-- Stability   :  stable
 -- Portability :  portable
 --
 -- Class of data structures that can be folded to a summary value.
@@ -189,6 +189,7 @@ class Foldable t where
     -- 2666668666666
     --
     fold :: Monoid m => t m -> m
+    {-# INLINE fold #-}
     fold = foldMap id
 
     -- | Map each element of the structure into a monoid, and combine the
@@ -316,13 +317,28 @@ class Foldable t where
     foldr :: (a -> b -> b) -> b -> t a -> b
     foldr f z t = appEndo (foldMap (Endo #. f) t) z
 
-    -- | Right-associative fold of a structure, strict in the accumulator.
-    -- This is rarely what you want.
+    -- | 'foldr'' is a variant of 'foldr' that performs strict reduction from
+    -- right to left, i.e. starting with the right-most element.  The input
+    -- structure /must/ be finite, otherwise 'foldr'' runs out of space
+    -- (/diverges/).
+    --
+    -- If you want a strict right fold in constant space, you need a structure
+    -- that supports faster than /O(n)/ access to the right-most element, such
+    -- as @Seq@ from the @containers@ package.
+    --
+    -- This method does not run in constant space for structures such as lists
+    -- that don't support efficient right-to-left iteration and so require
+    -- /O(n)/ space to perform right-to-left reduction.  Use of this method
+    -- with such a structure is a hint that the chosen structure may be a poor
+    -- fit for the task at hand.  If the order in which the elements are
+    -- combined is not important, use 'foldl'' instead.
     --
     -- @since 4.6.0.0
     foldr' :: (a -> b -> b) -> b -> t a -> b
-    foldr' f z0 xs = foldl f' id xs z0
-      where f' k x z = k $! f x z
+    foldr' f z0 = \ xs ->
+        foldl (\ (k::b->b) (x::a) -> oneShot (\ (z::b) -> z `seq` k (f x z)))
+              (id::b->b) xs z0
+    -- Mirror image of 'foldl''.
 
     -- | Left-associative fold of a structure, lazy in the accumulator.  This
     -- is rarely what you want, but can work well for structures with efficient
@@ -343,8 +359,8 @@ class Foldable t where
     -- 'foldl'' instead of 'foldl'.  The reason for this is that the latter
     -- does not force the /inner/ results (e.g. @z \`f\` x1@ in the above
     -- example) before applying them to the operator (e.g. to @(\`f\` x2)@).
-    -- This results in a thunk chain \(\mathcal{O}(n)\) elements long, which
-    -- then must be evaluated from the outside-in.
+    -- This results in a thunk chain /O(n)/ elements long, which then must be
+    -- evaluated from the outside-in.
     --
     -- For a general 'Foldable' structure this should be semantically identical
     -- to:
@@ -373,6 +389,7 @@ class Foldable t where
     -- >>> foldl (\a _ -> a) 0 $ repeat 1
     -- * Hangs forever *
     --
+    -- WARNING: When it comes to lists, you always want to use either 'foldl'' or 'foldr' instead.
     foldl :: (b -> a -> b) -> b -> t a -> b
     foldl f z t = appEndo (getDual (foldMap (Dual . Endo . flip f) t)) z
     -- There's no point mucking around with coercions here,
@@ -393,8 +410,16 @@ class Foldable t where
     --
     -- @since 4.6.0.0
     foldl' :: (b -> a -> b) -> b -> t a -> b
-    foldl' f z0 xs = foldr f' id xs z0
-      where f' x k z = k $! f z x
+    {-# INLINE foldl' #-}
+    foldl' f z0 = \ xs ->
+        foldr (\ (x::a) (k::b->b) -> oneShot (\ (z::b) -> z `seq` k (f z x)))
+              (id::b->b) xs z0
+    --
+    -- We now force the accumulator `z` rather than the value computed by the
+    -- operator `k`, this matches the documented strictness.
+    --
+    -- For the rationale for the arity reduction from 3 to 2, inlining, etc.
+    -- see Note [Definition of foldl'] in GHC.List.
 
     -- | A variant of 'foldr' that has no base case,
     -- and thus may only be applied to non-empty structures.
@@ -604,6 +629,8 @@ class Foldable t where
     -- >>> maximum Nothing
     -- *** Exception: maximum: empty structure
     --
+    -- WARNING: This function is partial for possibly-empty structures like lists.
+    --
     -- @since 4.8.0.0
     maximum :: forall a . Ord a => t a -> a
     maximum = fromMaybe (errorWithoutStackTrace "maximum: empty structure") .
@@ -629,6 +656,8 @@ class Foldable t where
     --
     -- >>> minimum Nothing
     -- *** Exception: minimum: empty structure
+    --
+    -- WARNING: This function is partial for possibly-empty structures like lists.
     --
     -- @since 4.8.0.0
     minimum :: forall a . Ord a => t a -> a
@@ -708,7 +737,10 @@ instance Foldable [] where
     foldl'  = List.foldl'
     foldl1  = List.foldl1
     foldr   = List.foldr
+    foldr'  = List.foldr'
     foldr1  = List.foldr1
+    foldMap = (mconcat .) . map -- See Note [Monoidal list folds]
+    fold    = mconcat           -- See Note [Monoidal list folds]
     length  = List.length
     maximum = List.maximum
     minimum = List.minimum
@@ -1179,7 +1211,6 @@ msum = asum
 --
 -- >>> concat [[1, 2, 3], [4, 5], [6], []]
 -- [1,2,3,4,5,6]
---
 concat :: Foldable t => t [a] -> [a]
 concat xs = build (\c n -> foldr (\x y -> foldr c y x) n xs)
 {-# INLINE concat #-}
@@ -1313,6 +1344,8 @@ all p = getAll #. foldMap (All #. p)
 --
 -- >>> maximumBy (compare `on` length) ["Hello", "World", "!", "Longest", "bar"]
 -- "Longest"
+--
+-- WARNING: This function is partial for possibly-empty structures like lists.
 
 -- See Note [maximumBy/minimumBy space usage]
 maximumBy :: Foldable t => (a -> a -> Ordering) -> t a -> a
@@ -1335,6 +1368,8 @@ maximumBy cmp = fromMaybe (errorWithoutStackTrace "maximumBy: empty structure")
 --
 -- >>> minimumBy (compare `on` length) ["Hello", "World", "!", "Longest", "bar"]
 -- "!"
+--
+-- WARNING: This function is partial for possibly-empty structures like lists.
 
 -- See Note [maximumBy/minimumBy space usage]
 minimumBy :: Foldable t => (a -> a -> Ordering) -> t a -> a
@@ -1486,12 +1521,25 @@ switched to employing foldl' over foldl1, not relying on GHC's optimiser.  See
 https://gitlab.haskell.org/ghc/ghc/-/issues/17867 for more context.
 -}
 
+{-
+Note [Monoidal list folds]
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+Folds of lists of monoid elements should generally use 'mconcat', rather than
+@foldr mappend mempty@.  This allows specialized mconcat implementations an
+opportunity to combine elements efficiently.  For example, `mappend` of strict
+`Text` and `ByteString` values typically needs to reallocate and copy the
+existing data, making incremental construction expensive (likely quadratic in
+the number of elements combined).  The `mconcat` implementations for `Text` and
+`ByteString` preallocate the required storage, and then combine all the list
+elements in a single pass.
+-}
+
 --------------
 
 -- $overview
 --
 -- #overview#
--- The Foldabla class generalises some common "Data.List" functions to
+-- The Foldable class generalises some common "Data.List" functions to
 -- structures that can be reduced to a summary value one element at a time.
 --
 -- == Left and right folds
@@ -1645,8 +1693,9 @@ https://gitlab.haskell.org/ghc/ghc/-/issues/17867 for more context.
 --
 -- > myconcat xs = foldr (\a b -> a ++ b) [] xs
 --
--- is subtantially cheaper (linear in the length of the consumed portion of the
--- final list, thus e.g. constant time/space for just the first element) than:
+-- is substantially cheaper (linear in the length of the consumed portion of
+-- the final list, thus e.g. constant time/space for just the first element)
+-- than:
 --
 -- > revconcat xs = foldr (\a b -> b ++ a) [] xs
 --
@@ -1837,7 +1886,7 @@ https://gitlab.haskell.org/ghc/ghc/-/issues/17867 for more context.
 -- $shortcircuit
 --
 -- #short#
--- Examples of short-cicuit reduction include various boolean predicates that
+-- Examples of short-circuit reduction include various boolean predicates that
 -- test whether some or all the elements of a structure satisfy a given
 -- condition.  Because these don't necessarily consume the entire list, they
 -- typically employ `foldr` with an operator that is conditionally strict in
@@ -1872,7 +1921,7 @@ https://gitlab.haskell.org/ghc/ghc/-/issues/17867 for more context.
 -- * Boolean predicate folds.
 --   These functions examine elements strictly until a condition is met,
 --   but then return a result ignoring the rest (lazy in the tail).  These
---   may loop forever given an unbounded input where no elements satisy the
+--   may loop forever given an unbounded input where no elements satisfy the
 --   termination condition.
 --
 --     @
@@ -1903,8 +1952,8 @@ https://gitlab.haskell.org/ghc/ghc/-/issues/17867 for more context.
 --   in some monads are conditionally lazy and can /short-circuit/ a chain of
 --   computations.  The below folds will terminate as early as possible, but
 --   even infinite loops can be productive here, when evaluated solely for
---   their stream of IO side-effects.  See "Data.Traversable#validation"
---   for some additional discussion.
+--   their stream of IO side-effects.  See "Data.Traversable#effectful"
+--   for discussion of related functions.
 --
 --     @
 --     `traverse_`  :: (Foldable t, Applicative f) => (a -> f b) -> t a -> f ()
@@ -2319,11 +2368,11 @@ https://gitlab.haskell.org/ghc/ghc/-/issues/17867 for more context.
 -- >      in s / fromIntegral l
 --
 -- The above example is somewhat contrived, some structures keep track of their
--- length internally, and can return it in \(\mathcal{O}(1)\) time, so this
--- particular recipe for averages is not always the most efficient.  In
--- general, composite aggregate functions of large structures benefit from
--- single-pass reduction.  This is especially the case when reuse of a list and
--- memoisation of its elements is thereby avoided,
+-- length internally, and can return it in /O(1)/ time, so this particular
+-- recipe for averages is not always the most efficient.  In general, composite
+-- aggregate functions of large structures benefit from single-pass reduction.
+-- This is especially the case when reuse of a list and memoisation of its
+-- elements is thereby avoided.
 
 --------------
 
@@ -2331,7 +2380,7 @@ https://gitlab.haskell.org/ghc/ghc/-/issues/17867 for more context.
 -- #laws#
 --
 -- The type constructor 'Endo' from "Data.Monoid", associates with each type
--- __@b@__ the __@newtype@__-encapulated type of functions mapping __@b@__ to
+-- __@b@__ the __@newtype@__-encapsulated type of functions mapping __@b@__ to
 -- itself.  Functions from a type to itself are called /endomorphisms/, hence
 -- the name /Endo/.  The type __@Endo b@__ is a 'Monoid' under function
 -- composition:
@@ -2368,7 +2417,7 @@ https://gitlab.haskell.org/ghc/ghc/-/issues/17867 for more context.
 -- > foldl f z t = appEndo (getDual (foldMap (Dual . Endo . flip f) t)) z
 --
 -- When the elements of the structure are taken from a 'Monoid', the
--- defintion of 'fold' must agree with __@foldMap id@__:
+-- definition of 'fold' must agree with __@foldMap id@__:
 --
 -- > fold = foldMap id
 --
@@ -2418,7 +2467,9 @@ https://gitlab.haskell.org/ghc/ghc/-/issues/17867 for more context.
 -- The more general methods of the 'Foldable' class are now exported by the
 -- "Prelude" in place of the original List-specific methods (see the
 -- [FTP Proposal](https://wiki.haskell.org/Foldable_Traversable_In_Prelude)).
--- The List-specific variants are still available in "Data.List".
+-- The List-specific variants are for now still available in "GHC.OldList", but
+-- that module is intended only as a transitional aid, and may be removed in
+-- the future.
 --
 -- Surprises can arise from the @Foldable@ instance of the 2-tuple @(a,)@ which
 -- now behaves as a 1-element @Foldable@ container in its second slot.  In
@@ -2445,12 +2496,12 @@ https://gitlab.haskell.org/ghc/ghc/-/issues/17867 for more context.
 -- $linear
 --
 -- It is perhaps worth noting that since the __`elem`__ function in the
--- Foldable class carries only an __`Eq`__ constraint on the element type,
+-- 'Foldable' class carries only an __`Eq`__ constraint on the element type,
 -- search for the presence or absence of an element in the structure generally
--- takes \(\mathcal{O}(n)\) time, even for ordered structures like __@Set@__
--- that are potentially capable of performing the search faster.  (The @member@
--- function of the @Set@ module carries an `Ord` constraint, and can perform
--- the search in \(\mathcal{O}(log\ n)\) time).
+-- takes /O(n)/ time, even for ordered structures like __@Set@__ that are
+-- potentially capable of performing the search faster.  (The @member@ function
+-- of the @Set@ module carries an `Ord` constraint, and can perform the search
+-- in /O(log n)/ time).
 --
 -- An alternative to Foldable's __`elem`__ method is required in order to
 -- abstract potentially faster than linear search over general container

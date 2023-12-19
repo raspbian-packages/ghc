@@ -8,7 +8,7 @@
 Haskell. [WDP 94/11])
 -}
 
-{-# LANGUAGE CPP #-}
+
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE BinaryLiterals #-}
 
@@ -32,7 +32,7 @@ module GHC.Types.Id.Info (
         -- ** Zapping various forms of Info
         zapLamInfo, zapFragileInfo,
         zapDemandInfo, zapUsageInfo, zapUsageEnvInfo, zapUsedOnceInfo,
-        zapTailCallInfo, zapCallArityInfo, zapUnfolding,
+        zapTailCallInfo, zapCallArityInfo, trimUnfolding,
 
         -- ** The ArityInfo type
         ArityInfo,
@@ -42,12 +42,12 @@ module GHC.Types.Id.Info (
         callArityInfo, setCallArityInfo,
 
         -- ** Demand and strictness Info
-        strictnessInfo, setStrictnessInfo,
-        cprInfo, setCprInfo,
+        dmdSigInfo, setDmdSigInfo,
+        cprSigInfo, setCprSigInfo,
         demandInfo, setDemandInfo, pprStrictness,
 
         -- ** Unfolding Info
-        unfoldingInfo, setUnfoldingInfo,
+        realUnfoldingInfo, unfoldingInfo, setUnfoldingInfo, hasInlineUnfolding,
 
         -- ** The InlinePragInfo type
         InlinePragInfo,
@@ -68,7 +68,7 @@ module GHC.Types.Id.Info (
         emptyRuleInfo,
         isEmptyRuleInfo, ruleInfoFreeVars,
         ruleInfoRules, setRuleInfoHead,
-        ruleInfo, setRuleInfo,
+        ruleInfo, setRuleInfo, tagSigInfo,
 
         -- ** The CAFInfo type
         CafInfo(..),
@@ -76,24 +76,22 @@ module GHC.Types.Id.Info (
         cafInfo, setCafInfo,
 
         -- ** The LambdaFormInfo type
-        LambdaFormInfo(..),
-        lfInfo, setLFInfo,
+        LambdaFormInfo,
+        lfInfo, setLFInfo, setTagSig,
+
+        tagSig,
 
         -- ** Tick-box Info
         TickBoxOp(..), TickBoxId,
 
         -- ** Levity info
-        LevityInfo, levityInfo, setNeverLevPoly, setLevityInfoWithType,
-        isNeverLevPolyIdInfo
+        LevityInfo, levityInfo, setNeverRepPoly, setLevityInfoWithType,
+        isNeverRepPolyIdInfo
     ) where
-
-#include "HsVersions.h"
 
 import GHC.Prelude
 
-import GHC.Core hiding( hasCoreUnfolding )
-import GHC.Core( hasCoreUnfolding )
-
+import GHC.Core
 import GHC.Core.Class
 import {-# SOURCE #-} GHC.Builtin.PrimOps (PrimOp)
 import GHC.Types.Name
@@ -104,16 +102,19 @@ import GHC.Core.TyCon
 import GHC.Core.PatSyn
 import GHC.Core.Type
 import GHC.Types.ForeignCall
-import GHC.Utils.Outputable
 import GHC.Unit.Module
 import GHC.Types.Demand
 import GHC.Types.Cpr
+
 import GHC.Utils.Misc
+import GHC.Utils.Outputable
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
+import GHC.Stg.InferTags.TagSig
 
 import Data.Word
-import Data.Bits
 
-import GHC.StgToCmm.Types (LambdaFormInfo (..))
+import GHC.StgToCmm.Types (LambdaFormInfo)
 
 -- infixl so you can say (id `set` a `set` b)
 infixl  1 `setRuleInfo`,
@@ -123,12 +124,11 @@ infixl  1 `setRuleInfo`,
           `setOneShotInfo`,
           `setOccInfo`,
           `setCafInfo`,
-          `setStrictnessInfo`,
-          `setCprInfo`,
+          `setDmdSigInfo`,
+          `setCprSigInfo`,
           `setDemandInfo`,
-          `setNeverLevPoly`,
+          `setNeverRepPoly`,
           `setLevityInfoWithType`
-
 {-
 ************************************************************************
 *                                                                      *
@@ -175,8 +175,102 @@ data IdDetails
   | CoVarId    -- ^ A coercion variable
                -- This only covers /un-lifted/ coercions, of type
                -- (t1 ~# t2) or (t1 ~R# t2), not their lifted variants
-  | JoinId JoinArity           -- ^ An 'Id' for a join point taking n arguments
-       -- Note [Join points] in "GHC.Core"
+  | JoinId JoinArity (Maybe [CbvMark])
+        -- ^ An 'Id' for a join point taking n arguments
+        -- Note [Join points] in "GHC.Core"
+        -- Can also work as a WorkerLikeId if given `CbvMark`s.
+        -- See Note [CBV Function Ids]
+        -- The [CbvMark] is always empty (and ignored) until after Tidy.
+  | WorkerLikeId [CbvMark]
+        -- ^ An 'Id' for a worker like function, which might expect some arguments to be
+        -- passed both evaluated and tagged.
+        -- Worker like functions are create by W/W and SpecConstr and we can expect that they
+        -- aren't used unapplied.
+        -- See Note [CBV Function Ids]
+        -- See Note [Tag Inference]
+        -- The [CbvMark] is always empty (and ignored) until after Tidy for ids from the current
+        -- module.
+
+{- Note [CBV Function Ids]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A WorkerLikeId essentially allows us to constrain the calling convention
+for the given Id. Each such Id carries with it a list of CbvMarks
+with each element representing a value argument. Arguments who have
+a matching `MarkedCbv` entry in the list need to be passed evaluated+*properly tagged*.
+
+CallByValueFunIds give us additional expressiveness which we use to improve
+runtime. This is all part of the TagInference work. See also Note [Tag Inference].
+
+They allows us to express the fact that an argument is not only evaluated to WHNF once we
+entered it's RHS but also that an lifted argument is already *properly tagged* once we jump
+into the RHS.
+This means when e.g. branching on such an argument the RHS doesn't needed to perform
+an eval check to ensure the argument isn't an indirection. All seqs on such an argument in
+the functions body become no-ops as well.
+
+The invariants around the arguments of call by value function like Ids are then:
+
+* In any call `(f e1 .. en)`, if `f`'s i'th argument is marked `MarkedCbv`,
+  then the caller must ensure that the i'th argument
+  * points directly to the value (and hence is certainly evaluated before the call)
+  * is a properly tagged pointer to that value
+
+* The following functions (and only these functions) have `CbvMarks`:
+  * Any `WorkerLikeId`
+  * Some `JoinId` bindings.
+
+This works analogous to the Strict Field Invariant. See also Note [Strict Field Invariant].
+
+To make this work what we do is:
+* During W/W and SpecConstr any worker/specialized binding we introduce
+  is marked as a worker binding by `asWorkerLikeId`.
+* W/W and SpecConstr further set OtherCon[] unfoldings on arguments which
+  represent contents of a strict fields.
+* During Tidy we look at all bindings.
+  For any callByValueLike Id and join point we mark arguments as cbv if they
+  Are strict. We don't do so for regular bindings.
+  See Note [Use CBV semantics only for join points and workers] for why.
+  We might have made some ids rhs *more* strict in order to make their arguments
+  be passed CBV. See Note [Call-by-value for worker args] for why.
+* During CorePrep calls to CallByValueFunIds are eta expanded.
+* During Stg CodeGen:
+  * When we see a call to a callByValueLike Id:
+    * We check if all arguments marked to be passed unlifted are already tagged.
+    * If they aren't we will wrap the call in case expressions which will evaluate+tag
+      these arguments before jumping to the function.
+* During Cmm codeGen:
+  * When generating code for the RHS of a StrictWorker binding
+    we omit tag checks when using arguments marked as tagged.
+
+We only use this for workers and specialized versions of SpecConstr
+But we also check other functions during tidy and potentially turn some of them into
+call by value functions and mark some of their arguments as call-by-value by looking at
+argument unfoldings.
+
+NB: I choose to put the information into a new Id constructor since these are loaded
+at all optimization levels. This makes it trivial to ensure the additional
+calling convention demands are available at all call sites. Putting it into
+IdInfo would require us at the very least to always decode the IdInfo
+just to decide if we need to throw it away or not after.
+
+Note [Use CBV semantics only for join points and workers]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A function with cbv-semantics requires arguments to be visible
+and if no arguments are visible requires us to eta-expand it's
+call site. That is for a binding with three cbv arguments like
+`w[WorkerLikeId[!,!,!]]` we would need to eta expand undersaturated
+occurences like `map w xs` into `map (\x1 x2 x3 -> w x1 x2 x3) xs.
+
+In experiments it turned out that the code size increase of doing so
+can outweigh the performance benefits of doing so.
+So we only do this for join points, workers and
+specialized functions (from SpecConstr).
+Join points are naturally always called saturated so
+this problem can't occur for them.
+For workers and specialized functions there are also always at least
+some applied arguments as we won't inline the wrapper/apply their rule
+if there are unapplied occurances like `map f xs`.
+-}
 
 -- | Recursive Selector Parent
 data RecSelParent = RecSelData TyCon | RecSelPatSyn PatSyn deriving Eq
@@ -200,8 +294,8 @@ isCoVarDetails :: IdDetails -> Bool
 isCoVarDetails CoVarId = True
 isCoVarDetails _       = False
 
-isJoinIdDetails_maybe :: IdDetails -> Maybe JoinArity
-isJoinIdDetails_maybe (JoinId join_arity) = Just join_arity
+isJoinIdDetails_maybe :: IdDetails -> Maybe (JoinArity, (Maybe [CbvMark]))
+isJoinIdDetails_maybe (JoinId join_arity marks) = Just (join_arity, marks)
 isJoinIdDetails_maybe _                   = Nothing
 
 instance Outputable IdDetails where
@@ -212,6 +306,7 @@ pprIdDetails VanillaId = empty
 pprIdDetails other     = brackets (pp other)
  where
    pp VanillaId               = panic "pprIdDetails"
+   pp (WorkerLikeId dmds)   = text "StrictWorker" <> parens (ppr dmds)
    pp (DataConWorkId _)       = text "DataCon"
    pp (DataConWrapId _)       = text "DataConWrapper"
    pp (ClassOpId {})          = text "ClassOp"
@@ -223,7 +318,7 @@ pprIdDetails other     = brackets (pp other)
                               = brackets $ text "RecSel" <>
                                            ppWhen is_naughty (text "(naughty)")
    pp CoVarId                 = text "CoVarId"
-   pp (JoinId arity)          = text "JoinId" <> parens (int arity)
+   pp (JoinId arity marks)    = text "JoinId" <> parens (int arity) <> parens (ppr marks)
 
 {-
 ************************************************************************
@@ -255,16 +350,16 @@ data IdInfo
         ruleInfo        :: RuleInfo,
         -- ^ Specialisations of the 'Id's function which exist.
         -- See Note [Specialisations and RULES in IdInfo]
-        unfoldingInfo   :: Unfolding,
+        realUnfoldingInfo   :: Unfolding,
         -- ^ The 'Id's unfolding
         inlinePragInfo  :: InlinePragma,
         -- ^ Any inline pragma attached to the 'Id'
         occInfo         :: OccInfo,
         -- ^ How the 'Id' occurs in the program
-        strictnessInfo  :: StrictSig,
+        dmdSigInfo      :: DmdSig,
         -- ^ A strictness signature. Digests how a function uses its arguments
         -- if applied to at least 'arityInfo' arguments.
-        cprInfo         :: CprSig,
+        cprSigInfo      :: CprSig,
         -- ^ Information on whether the function will ultimately return a
         -- freshly allocated constructor.
         demandInfo      :: Demand,
@@ -276,7 +371,11 @@ data IdInfo
         -- 4% in some programs. See #17497 and associated MR.
         --
         -- See documentation of the getters for what these packed fields mean.
-        lfInfo          :: !(Maybe LambdaFormInfo)
+        lfInfo          :: !(Maybe LambdaFormInfo),
+        -- ^ See Note [The LFInfo of Imported Ids] in GHC.StgToCmm.Closure
+
+        -- See documentation of the getters for what these packed fields mean.
+        tagSig          :: !(Maybe TagSig)
     }
 
 -- | Encodes arities, OneShotInfo, CafInfo and LevityInfo.
@@ -333,18 +432,18 @@ bitfieldSetLevityInfo info (BitField bits) =
 
 bitfieldSetCallArityInfo :: ArityInfo -> BitField -> BitField
 bitfieldSetCallArityInfo info bf@(BitField bits) =
-    ASSERT(info < 2^(30 :: Int) - 1)
+    assert (info < 2^(30 :: Int) - 1) $
     bitfieldSetArityInfo (bitfieldGetArityInfo bf) $
     BitField ((fromIntegral info `shiftL` 3) .|. (bits .&. 0b111))
 
 bitfieldSetArityInfo :: ArityInfo -> BitField -> BitField
 bitfieldSetArityInfo info (BitField bits) =
-    ASSERT(info < 2^(30 :: Int) - 1)
+    assert (info < 2^(30 :: Int) - 1) $
     BitField ((fromIntegral info `shiftL` 33) .|. (bits .&. ((1 `shiftL` 33) - 1)))
 
 -- Getters
 
--- | When applied, will this Id ever have a levity-polymorphic type?
+-- | When applied, will this Id ever have a representation-polymorphic type?
 levityInfo :: IdInfo -> LevityInfo
 levityInfo = bitfieldGetLevityInfo . bitfield
 
@@ -353,7 +452,7 @@ oneShotInfo :: IdInfo -> OneShotInfo
 oneShotInfo = bitfieldGetOneShotInfo . bitfield
 
 -- | 'Id' arity, as computed by "GHC.Core.Opt.Arity". Specifies how many arguments
--- this 'Id' has to be applied to before it doesn any meaningful work.
+-- this 'Id' has to be applied to before it does any meaningful work.
 arityInfo :: IdInfo -> ArityInfo
 arityInfo = bitfieldGetArityInfo . bitfield
 
@@ -367,6 +466,9 @@ cafInfo = bitfieldGetCafInfo . bitfield
 callArityInfo :: IdInfo -> ArityInfo
 callArityInfo = bitfieldGetCallArityInfo . bitfield
 
+tagSigInfo :: IdInfo -> Maybe TagSig
+tagSigInfo = tagSig
+
 -- Setters
 
 setRuleInfo :: IdInfo -> RuleInfo -> IdInfo
@@ -377,13 +479,29 @@ setOccInfo :: IdInfo -> OccInfo -> IdInfo
 setOccInfo        info oc = oc `seq` info { occInfo = oc }
         -- Try to avoid space leaks by seq'ing
 
+-- | Essentially returns the 'realUnfoldingInfo' field, but does not expose the
+-- unfolding of a strong loop breaker.
+--
+-- This is the right thing to call if you plan to decide whether an unfolding
+-- will inline.
+unfoldingInfo :: IdInfo -> Unfolding
+unfoldingInfo info
+  | isStrongLoopBreaker (occInfo info) = trimUnfolding $ realUnfoldingInfo info
+  | otherwise                          =                realUnfoldingInfo info
+
 setUnfoldingInfo :: IdInfo -> Unfolding -> IdInfo
 setUnfoldingInfo info uf
   = -- We don't seq the unfolding, as we generate intermediate
     -- unfoldings which are just thrown away, so evaluating them is a
     -- waste of time.
     -- seqUnfolding uf `seq`
-    info { unfoldingInfo = uf }
+    info { realUnfoldingInfo = uf }
+
+hasInlineUnfolding :: IdInfo -> Bool
+-- ^ True of a /non-loop-breaker/ Id that has a /stable/ unfolding that is
+--   (a) always inlined; that is, with an `UnfWhen` guidance, or
+--   (b) a DFunUnfolding which never needs to be inlined
+hasInlineUnfolding info = isInlineUnfolding (unfoldingInfo info)
 
 setArityInfo :: IdInfo -> ArityInfo -> IdInfo
 setArityInfo info ar =
@@ -400,6 +518,9 @@ setCafInfo info caf =
 setLFInfo :: IdInfo -> LambdaFormInfo -> IdInfo
 setLFInfo info lf = info { lfInfo = Just lf }
 
+setTagSig :: IdInfo -> TagSig -> IdInfo
+setTagSig info sig = info { tagSig = Just sig }
+
 setOneShotInfo :: IdInfo -> OneShotInfo -> IdInfo
 setOneShotInfo info lb =
     info { bitfield = bitfieldSetOneShotInfo lb (bitfield info) }
@@ -407,30 +528,31 @@ setOneShotInfo info lb =
 setDemandInfo :: IdInfo -> Demand -> IdInfo
 setDemandInfo info dd = dd `seq` info { demandInfo = dd }
 
-setStrictnessInfo :: IdInfo -> StrictSig -> IdInfo
-setStrictnessInfo info dd = dd `seq` info { strictnessInfo = dd }
+setDmdSigInfo :: IdInfo -> DmdSig -> IdInfo
+setDmdSigInfo info dd = dd `seq` info { dmdSigInfo = dd }
 
-setCprInfo :: IdInfo -> CprSig -> IdInfo
-setCprInfo info cpr = cpr `seq` info { cprInfo = cpr }
+setCprSigInfo :: IdInfo -> CprSig -> IdInfo
+setCprSigInfo info cpr = cpr `seq` info { cprSigInfo = cpr }
 
 -- | Basic 'IdInfo' that carries no useful information whatsoever
 vanillaIdInfo :: IdInfo
 vanillaIdInfo
   = IdInfo {
-            ruleInfo            = emptyRuleInfo,
-            unfoldingInfo       = noUnfolding,
-            inlinePragInfo      = defaultInlinePragma,
-            occInfo             = noOccInfo,
-            demandInfo          = topDmd,
-            strictnessInfo      = nopSig,
-            cprInfo             = topCprSig,
-            bitfield            = bitfieldSetCafInfo vanillaCafInfo $
-                                  bitfieldSetArityInfo unknownArity $
-                                  bitfieldSetCallArityInfo unknownArity $
-                                  bitfieldSetOneShotInfo NoOneShotInfo $
-                                  bitfieldSetLevityInfo NoLevityInfo $
-                                  emptyBitField,
-            lfInfo              = Nothing
+            ruleInfo       = emptyRuleInfo,
+            realUnfoldingInfo  = noUnfolding,
+            inlinePragInfo = defaultInlinePragma,
+            occInfo        = noOccInfo,
+            demandInfo     = topDmd,
+            dmdSigInfo     = nopSig,
+            cprSigInfo     = topCprSig,
+            bitfield       = bitfieldSetCafInfo vanillaCafInfo $
+                             bitfieldSetArityInfo unknownArity $
+                             bitfieldSetCallArityInfo unknownArity $
+                             bitfieldSetOneShotInfo NoOneShotInfo $
+                             bitfieldSetLevityInfo NoLevityInfo $
+                             emptyBitField,
+            lfInfo         = Nothing,
+            tagSig         = Nothing
            }
 
 -- | More informative 'IdInfo' we can use when we know the 'Id' has no CAF references
@@ -448,7 +570,35 @@ noCafIdInfo  = vanillaIdInfo `setCafInfo`    NoCafRefs
 For locally-defined Ids, the code generator maintains its own notion
 of their arities; so it should not be asking...  (but other things
 besides the code-generator need arity info!)
+
+Note [Arity and function types]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The arity of an 'Id' must never exceed the number of arguments that
+can be read off from the 'Id's type, possibly after expanding newtypes.
+
+Examples:
+
+  f1 :: forall a. a -> a
+
+    idArity f1 <= 1: only one value argument, of type 'a'
+
+  f2 :: forall a. Show a => Int -> a
+
+    idArity f2 <= 2: two value arguments, of types 'Show a' and 'Int'.
+
+
+  newtype Id a = MkId a
+  f3 :: forall b. Id (Int -> b)
+
+    idArity f3 <= 1: there is one value argument, of type 'Int', hidden under the newtype.
+
+  newtype RecFun = MkRecFun (Int -> RecFun)
+  f4 :: RecFun
+
+    no constraint on the arity of f4: we can unwrap as many layers of the newtype as we want,
+    to get arbitrarily many arguments of type 'Int'.
 -}
+
 
 -- | Arity Information
 --
@@ -460,6 +610,10 @@ besides the code-generator need arity info!)
 --
 -- The arity might increase later in the compilation process, if
 -- an extra lambda floats up to the binding site.
+--
+-- /Invariant:/ the 'Arity' of an 'Id' must never exceed the number of
+-- value arguments that appear in the type of the 'Id'.
+-- See Note [Arity and function types].
 type ArityInfo = Arity
 
 -- | It is always safe to assume that an 'Id' has an arity of 0
@@ -499,7 +653,7 @@ type InlinePragInfo = InlinePragma
 ************************************************************************
 -}
 
-pprStrictness :: StrictSig -> SDoc
+pprStrictness :: DmdSig -> SDoc
 pprStrictness sig = ppr sig
 
 {-
@@ -634,7 +788,7 @@ zapLamInfo info@(IdInfo {occInfo = occ, demandInfo = demand})
                           -> occ { occ_tail   = NoTailCallInfo }
                  _other   -> occ
 
-    is_safe_dmd dmd = not (isStrictDmd dmd)
+    is_safe_dmd dmd = not (isStrUsedDmd dmd)
 
 -- | Remove all demand info on the 'IdInfo'
 zapDemandInfo :: IdInfo -> Maybe IdInfo
@@ -647,19 +801,19 @@ zapUsageInfo info = Just (info {demandInfo = zapUsageDemand (demandInfo info)})
 -- | Remove usage environment info from the strictness signature on the 'IdInfo'
 zapUsageEnvInfo :: IdInfo -> Maybe IdInfo
 zapUsageEnvInfo info
-    | hasDemandEnvSig (strictnessInfo info)
-    = Just (info {strictnessInfo = zapUsageEnvSig (strictnessInfo info)})
+    | hasDemandEnvSig (dmdSigInfo info)
+    = Just (info {dmdSigInfo = zapDmdEnvSig (dmdSigInfo info)})
     | otherwise
     = Nothing
 
 zapUsedOnceInfo :: IdInfo -> Maybe IdInfo
 zapUsedOnceInfo info
-    = Just $ info { strictnessInfo = zapUsedOnceSig    (strictnessInfo info)
+    = Just $ info { dmdSigInfo = zapUsedOnceSig    (dmdSigInfo info)
                   , demandInfo     = zapUsedOnceDemand (demandInfo     info) }
 
 zapFragileInfo :: IdInfo -> Maybe IdInfo
 -- ^ Zap info that depends on free variables
-zapFragileInfo info@(IdInfo { occInfo = occ, unfoldingInfo = unf })
+zapFragileInfo info@(IdInfo { occInfo = occ, realUnfoldingInfo = unf })
   = new_unf `seq`  -- The unfolding field is not (currently) strict, so we
                    -- force it here to avoid a (zapFragileUnfolding unf) thunk
                    -- which might leak space
@@ -670,14 +824,18 @@ zapFragileInfo info@(IdInfo { occInfo = occ, unfoldingInfo = unf })
     new_unf = zapFragileUnfolding unf
 
 zapFragileUnfolding :: Unfolding -> Unfolding
+-- ^ Zaps any core unfolding, but /preserves/ evaluated-ness,
+-- i.e. an unfolding of OtherCon
 zapFragileUnfolding unf
- | hasCoreUnfolding unf = noUnfolding
- | otherwise            = unf
+ -- N.B. isEvaldUnfolding catches *both* OtherCon [] *and* core unfoldings
+ -- representing values.
+ | isEvaldUnfolding unf = evaldUnfolding
+ | otherwise            = noUnfolding
 
-zapUnfolding :: Unfolding -> Unfolding
+trimUnfolding :: Unfolding -> Unfolding
 -- Squash all unfolding info, preserving only evaluated-ness
-zapUnfolding unf | isEvaldUnfolding unf = evaldUnfolding
-                 | otherwise            = noUnfolding
+trimUnfolding unf | isEvaldUnfolding unf = evaldUnfolding
+                  | otherwise            = noUnfolding
 
 zapTailCallInfo :: IdInfo -> Maybe IdInfo
 zapTailCallInfo info
@@ -717,13 +875,17 @@ instance Outputable TickBoxOp where
 Note [Levity info]
 ~~~~~~~~~~~~~~~~~~
 
-Ids store whether or not they can be levity-polymorphic at any amount
-of saturation. This is helpful in optimizing the levity-polymorphism check
-done in the desugarer, where we can usually learn that something is not
-levity-polymorphic without actually figuring out its type. See
-isExprLevPoly in GHC.Core.Utils for where this info is used. Storing
-this is required to prevent perf/compiler/T5631 from blowing up.
+Ids store whether or not they can be representation-polymorphic at any amount
+of saturation. This is helpful in optimizing representation polymorphism checks,
+allowing us to learn that something is not representation-polymorphic without
+actually figuring out its type.
+See exprHasFixedRuntimeRep in GHC.Core.Utils for where this info is used.
 
+Historical note: this was very important when representation polymorphism
+was checked in the desugarer (it was needed to prevent T5631 from blowing up).
+It's less important now that the checks happen in the typechecker, but remains useful.
+Refer to Note [The Concrete mechanism] in GHC.Tc.Utils.Concrete for details
+about the new approach being used.
 -}
 
 -- See Note [Levity info]
@@ -735,22 +897,22 @@ instance Outputable LevityInfo where
   ppr NoLevityInfo           = text "NoLevityInfo"
   ppr NeverLevityPolymorphic = text "NeverLevityPolymorphic"
 
--- | Marks an IdInfo describing an Id that is never levity polymorphic (even when
--- applied). The Type is only there for checking that it's really never levity
--- polymorphic
-setNeverLevPoly :: HasDebugCallStack => IdInfo -> Type -> IdInfo
-setNeverLevPoly info ty
-  = ASSERT2( not (resultIsLevPoly ty), ppr ty )
+-- | Marks an IdInfo describing an Id that is never representation-polymorphic
+-- (even when applied). The Type is only there for checking that it's really
+-- never representation-polymorphic.
+setNeverRepPoly :: HasDebugCallStack => IdInfo -> Type -> IdInfo
+setNeverRepPoly info ty
+  = assertPpr (resultHasFixedRuntimeRep ty) (ppr ty) $
     info { bitfield = bitfieldSetLevityInfo NeverLevityPolymorphic (bitfield info) }
 
 setLevityInfoWithType :: IdInfo -> Type -> IdInfo
 setLevityInfoWithType info ty
-  | not (resultIsLevPoly ty)
+  | resultHasFixedRuntimeRep ty
   = info { bitfield = bitfieldSetLevityInfo NeverLevityPolymorphic (bitfield info) }
   | otherwise
   = info
 
-isNeverLevPolyIdInfo :: IdInfo -> Bool
-isNeverLevPolyIdInfo info
+isNeverRepPolyIdInfo :: IdInfo -> Bool
+isNeverRepPolyIdInfo info
   | NeverLevityPolymorphic <- levityInfo info = True
   | otherwise                                 = False

@@ -1,3 +1,5 @@
+
+
 {-
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
 
@@ -48,7 +50,6 @@ The previous patch, to fix polymorphic floatout demand signatures, is
 essential to make this work well!
 -}
 
-{-# LANGUAGE CPP, PatternSynonyms #-}
 module GHC.Core.Opt.StaticArgs ( doStaticArgs ) where
 
 import GHC.Prelude
@@ -68,11 +69,10 @@ import GHC.Types.Var.Set
 import GHC.Types.Unique
 import GHC.Types.Unique.Set
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
 
 import Data.List (mapAccumL)
 import GHC.Data.FastString
-
-#include "HsVersions.h"
 
 doStaticArgs :: UniqSupply -> CoreProgram -> CoreProgram
 doStaticArgs us binds = snd $ mapAccumL sat_bind_threaded_us us binds
@@ -187,7 +187,7 @@ satExpr var@(Var v) interesting_ids = do
                    else Nothing
     return (var, emptyIdSATInfo, app_info)
 
-satExpr lit@(Lit _) _ = do
+satExpr lit@(Lit _) _ =
     return (lit, emptyIdSATInfo, Nothing)
 
 satExpr (Lam binders body) interesting_ids = do
@@ -223,9 +223,9 @@ satExpr (Case expr bndr ty alts) interesting_ids = do
     let (alts', sat_infos_alts) = unzip zipped_alts'
     return (Case expr' bndr ty alts', mergeIdSATInfo sat_info_expr' (mergeIdSATInfos sat_infos_alts), Nothing)
   where
-    satAlt (con, bndrs, expr) = do
+    satAlt (Alt con bndrs expr) = do
         (expr', sat_info_expr) <- satTopLevelExpr expr interesting_ids
-        return ((con, bndrs, expr'), sat_info_expr)
+        return (Alt con bndrs expr', sat_info_expr)
 
 satExpr (Let bind body) interesting_ids = do
     (body', sat_info_body, body_app) <- satExpr body interesting_ids
@@ -236,10 +236,10 @@ satExpr (Tick tickish expr) interesting_ids = do
     (expr', sat_info_expr, expr_app) <- satExpr expr interesting_ids
     return (Tick tickish expr', sat_info_expr, expr_app)
 
-satExpr ty@(Type _) _ = do
+satExpr ty@(Type _) _ =
     return (ty, emptyIdSATInfo, Nothing)
 
-satExpr co@(Coercion _) _ = do
+satExpr co@(Coercion _) _ =
     return (co, emptyIdSATInfo, Nothing)
 
 satExpr (Cast expr coercion) interesting_ids = do

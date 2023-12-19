@@ -52,6 +52,7 @@ data ArgRep = P   -- GC Ptr
             | V16 -- 16-byte (128-bit) vectors of Float/Double/Int8/Word32/etc.
             | V32 -- 32-byte (256-bit) vectors of Float/Double/Int8/Word32/etc.
             | V64 -- 64-byte (512-bit) vectors of Float/Double/Int8/Word32/etc.
+            deriving Eq
 instance Outputable ArgRep where ppr = text . argRepString
 
 argRepString :: ArgRep -> String
@@ -65,28 +66,33 @@ argRepString V16 = "V16"
 argRepString V32 = "V32"
 argRepString V64 = "V64"
 
-toArgRep :: PrimRep -> ArgRep
-toArgRep VoidRep           = V
-toArgRep LiftedRep         = P
-toArgRep UnliftedRep       = P
-toArgRep IntRep            = N
-toArgRep WordRep           = N
-toArgRep Int8Rep           = N  -- Gets widened to native word width for calls
-toArgRep Word8Rep          = N  -- Gets widened to native word width for calls
-toArgRep Int16Rep          = N  -- Gets widened to native word width for calls
-toArgRep Word16Rep         = N  -- Gets widened to native word width for calls
-toArgRep Int32Rep          = N  -- Gets widened to native word width for calls
-toArgRep Word32Rep         = N  -- Gets widened to native word width for calls
-toArgRep AddrRep           = N
-toArgRep Int64Rep          = L
-toArgRep Word64Rep         = L
-toArgRep FloatRep          = F
-toArgRep DoubleRep         = D
-toArgRep (VecRep len elem) = case len*primElemRepSizeB elem of
-                               16 -> V16
-                               32 -> V32
-                               64 -> V64
-                               _  -> error "toArgRep: bad vector primrep"
+toArgRep :: Platform -> PrimRep -> ArgRep
+toArgRep platform rep = case rep of
+   VoidRep           -> V
+   LiftedRep         -> P
+   UnliftedRep       -> P
+   IntRep            -> N
+   WordRep           -> N
+   Int8Rep           -> N  -- Gets widened to native word width for calls
+   Word8Rep          -> N  -- Gets widened to native word width for calls
+   Int16Rep          -> N  -- Gets widened to native word width for calls
+   Word16Rep         -> N  -- Gets widened to native word width for calls
+   Int32Rep          -> N  -- Gets widened to native word width for calls
+   Word32Rep         -> N  -- Gets widened to native word width for calls
+   AddrRep           -> N
+   Int64Rep          -> case platformWordSize platform of
+                           PW4 -> L
+                           PW8 -> N
+   Word64Rep         -> case platformWordSize platform of
+                           PW4 -> L
+                           PW8 -> N
+   FloatRep          -> F
+   DoubleRep         -> D
+   (VecRep len elem) -> case len*primElemRepSizeB platform elem of
+                           16 -> V16
+                           32 -> V32
+                           64 -> V64
+                           _  -> error "toArgRep: bad vector primrep"
 
 isNonV :: ArgRep -> Bool
 isNonV V = False
@@ -106,8 +112,8 @@ argRepSizeW platform = \case
   where
    ws       = platformWordSizeInBytes platform
 
-idArgRep :: Id -> ArgRep
-idArgRep = toArgRep . idPrimRep
+idArgRep :: Platform -> Id -> ArgRep
+idArgRep platform = toArgRep platform . idPrimRep
 
 -- This list of argument patterns should be kept in sync with at least
 -- the following:
@@ -115,11 +121,11 @@ idArgRep = toArgRep . idPrimRep
 --  * GHC.StgToCmm.Layout.stdPattern maybe to some degree?
 --
 --  * the RTS_RET(stg_ap_*) and RTS_FUN_DECL(stg_ap_*_fast)
---  declarations in includes/stg/MiscClosures.h
+--  declarations in rts/include/stg/MiscClosures.h
 --
---  * the SLOW_CALL_*_ctr declarations in includes/stg/Ticky.h,
+--  * the SLOW_CALL_*_ctr declarations in rts/include/stg/Ticky.h,
 --
---  * the TICK_SLOW_CALL_*() #defines in includes/Cmm.h,
+--  * the TICK_SLOW_CALL_*() #defines in rts/include/Cmm.h,
 --
 --  * the PR_CTR(SLOW_CALL_*_ctr) calls in rts/Ticky.c,
 --

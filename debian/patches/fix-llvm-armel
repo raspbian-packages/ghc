@@ -14,15 +14,15 @@ Description: Fix LLVM error on armel
  thie error.
 Author: Ilias Tsitsimpis <iliastsi@debian.org>
 Bug: https://gitlab.haskell.org/ghc/ghc/-/issues/20285
-Index: b/includes/CodeGen.Platform.hs
+Index: b/compiler/CodeGen.Platform.h
 ===================================================================
---- a/includes/CodeGen.Platform.hs
-+++ b/includes/CodeGen.Platform.hs
+--- a/compiler/CodeGen.Platform.h
++++ b/compiler/CodeGen.Platform.h
 @@ -6,6 +6,7 @@ import GHC.Utils.Panic.Plain
  #endif
  import GHC.Platform.Reg
  
 +#include "ghcautoconf.h"
- #include "stg/MachRegs.h"
+ #include "MachRegs.h"
  
  #if defined(MACHREGS_i386) || defined(MACHREGS_x86_64)

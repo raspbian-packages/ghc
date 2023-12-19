@@ -547,13 +547,57 @@ intercalate xs xss = concat (intersperse xs xss)
 --
 -- >>> transpose [[10,11],[20],[],[30,31,32]]
 -- [[10,20,30],[11,31],[32]]
-transpose               :: [[a]] -> [[a]]
-transpose []             = []
-transpose ([]   : xss)   = transpose xss
-transpose ((x:xs) : xss) = (x : [h | (h:_) <- xss]) : transpose (xs : [ t | (_:t) <- xss])
+transpose :: [[a]] -> [[a]]
+transpose [] = []
+transpose ([] : xss) = transpose xss
+transpose ((x : xs) : xss) = combine x hds xs tls
+  where
+    -- We tie the calculations of heads and tails together
+    -- to prevent heads from leaking into tails and vice versa.
+    -- unzip makes the selector thunk arrangements we need to
+    -- ensure everything gets cleaned up properly.
+    (hds, tls) = unzip [(hd, tl) | hd : tl <- xss]
+    combine y h ys t = (y:h) : transpose (ys:t)
+    {-# NOINLINE combine #-}
+  {- Implementation note:
+  If the bottom part of the function was written as such:
+
+  ```
+  transpose ((x : xs) : xss) = (x:hds) : transpose (xs:tls)
+  where
+    (hds,tls) = hdstls
+    hdstls = unzip [(hd, tl) | hd : tl <- xss]
+    {-# NOINLINE hdstls #-}
+  ```
+  Here are the steps that would take place:
+
+  1. We allocate a thunk, `hdstls`, representing the result of unzipping.
+  2. We allocate selector thunks, `hds` and `tls`, that deconstruct `hdstls`.
+  3. Install `hds` as the tail of the result head and pass `xs:tls` to
+     the recursive call in the result tail.
+
+  Once optimised, this code would amount to:
+
+  ```
+  transpose ((x : xs) : xss) = (x:hds) : (let tls = snd hdstls in transpose (xs:tls))
+  where
+    hds = fst hdstls
+    hdstls = unzip [(hd, tl) | hd : tl <- xss]
+    {-# NOINLINE hdstls #-}
+  ```
+
+  In particular, GHC does not produce the `tls` selector thunk immediately;
+  rather, it waits to do so until the tail of the result is actually demanded.
+  So when `hds` is demanded, that does not resolve `snd hdstls`; the tail of the
+  result keeps `hdstls` alive.
+
+  By writing `combine` and making it NOINLINE, we prevent GHC from delaying
+  the selector thunk allocation, requiring that `hds` and `tls` are actually
+  allocated to be passed to `combine`.
+  -}
 
 
--- | The 'partition' function takes a predicate a list and returns
+-- | The 'partition' function takes a predicate and a list, and returns
 -- the pair of lists of elements which do and do not satisfy the
 -- predicate, respectively; i.e.,
 --
@@ -678,8 +722,20 @@ minimumBy cmp xs        =  foldl1 minBy xs
 -- 3
 -- >>> genericLength [1, 2, 3] :: Float
 -- 3.0
+--
+-- Users should take care to pick a return type that is wide enough to contain
+-- the full length of the list. If the width is insufficient, the overflow
+-- behaviour will depend on the @(+)@ implementation in the selected 'Num'
+-- instance. The following example overflows because the actual list length
+-- of 200 lies outside of the 'Int8' range of @-128..127@.
+--
+-- >>> genericLength [1..200] :: Int8
+-- -56
 genericLength           :: (Num i) => [a] -> i
-{-# NOINLINE [1] genericLength #-}
+{-# NOINLINE [2] genericLength #-}
+    -- Give time for the RULEs for (++) to fire in InitialPhase
+    -- It's recursive, so won't inline anyway,
+    -- but saying so is more explicit
 genericLength []        =  0
 genericLength (_:l)     =  1 + genericLength l
 
@@ -1305,6 +1361,7 @@ singleton x = [x]
 --
 
 -- Note [INLINE unfoldr]
+-- ~~~~~~~~~~~~~~~~~~~~~
 -- We treat unfoldr a little differently from some other forms for list fusion
 -- for two reasons:
 --
@@ -1339,35 +1396,40 @@ unfoldr f b0 = build (\c n ->
 -- -----------------------------------------------------------------------------
 -- Functions on strings
 
--- | 'lines' breaks a string up into a list of strings at newline
--- characters.  The resulting strings do not contain newlines.
+-- | Splits the argument into a list of /lines/ stripped of their terminating
+-- @\n@ characters.  The @\n@ terminator is optional in a final non-empty
+-- line of the argument string.
 --
--- Note that after splitting the string at newline characters, the
--- last part of the string is considered a line even if it doesn't end
--- with a newline. For example,
+-- For example:
 --
--- >>> lines ""
+-- >>> lines ""           -- empty input contains no lines
 -- []
 --
--- >>> lines "\n"
+-- >>> lines "\n"         -- single empty line
 -- [""]
 --
--- >>> lines "one"
+-- >>> lines "one"        -- single unterminated line
 -- ["one"]
 --
--- >>> lines "one\n"
+-- >>> lines "one\n"      -- single non-empty line
 -- ["one"]
 --
--- >>> lines "one\n\n"
+-- >>> lines "one\n\n"    -- second line is empty
 -- ["one",""]
 --
--- >>> lines "one\ntwo"
+-- >>> lines "one\ntwo"   -- second line is unterminated
 -- ["one","two"]
 --
--- >>> lines "one\ntwo\n"
+-- >>> lines "one\ntwo\n" -- two non-empty lines
 -- ["one","two"]
 --
--- Thus @'lines' s@ contains at least as many elements as newlines in @s@.
+-- When the argument string is empty, or ends in a @\n@ character, it can be
+-- recovered by passing the result of 'lines' to the 'unlines' function.
+-- Otherwise, 'unlines' appends the missing terminating @\n@.  This makes
+-- @unlines . lines@ /idempotent/:
+--
+-- > (unlines . lines) . (unlines . lines) = (unlines . lines)
+--
 lines                   :: String -> [String]
 lines ""                =  []
 -- Somehow GHC doesn't detect the selector thunks in the below code,
@@ -1381,11 +1443,18 @@ lines s                 =  cons (case break (== '\n') s of
   where
     cons ~(h, t)        =  h : t
 
--- | 'unlines' is an inverse operation to 'lines'.
--- It joins lines, after appending a terminating newline to each.
+-- | Appends a @\n@ character to each input string, then concatenates the
+-- results. Equivalent to @'foldMap' (\s -> s '++' "\n")@.
 --
 -- >>> unlines ["Hello", "World", "!"]
 -- "Hello\nWorld\n!\n"
+--
+-- = Note
+--
+-- @'unlines' '.' 'lines' '/=' 'id'@ when the input is not @\n@-terminated:
+--
+-- >>> unlines . lines $ "foo\nbar"
+-- "foo\nbar\n"
 unlines                 :: [String] -> String
 #if defined(USE_REPORT_PRELUDE)
 unlines                 =  concatMap (++ "\n")

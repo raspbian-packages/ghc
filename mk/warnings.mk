@@ -80,8 +80,6 @@ libraries/haskeline_dist-install_EXTRA_HC_OPTS += -Wno-unused-imports
 libraries/haskeline_dist-install_EXTRA_HC_OPTS += -Wno-redundant-constraints
 libraries/haskeline_dist-install_EXTRA_HC_OPTS += -Wno-simplifiable-class-constraints
 
-# temporarily turn off deprecations in deepseq due to NFData Option instance.
-libraries/deepseq_dist-install_EXTRA_HC_OPTS += -Wno-deprecations
 
 # temporarily turn off unused-imports warnings for pretty
 libraries/pretty_dist-install_EXTRA_HC_OPTS += -Wno-unused-imports
@@ -135,7 +133,7 @@ GhcLibExtraHcOpts += -Wno-deprecated-flags
 GhcBootLibExtraHcOpts += -fno-warn-deprecated-flags
 
 # Note [Order of warning flags]
-#
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # In distdir-way-opts, build flags are added in the following order (this
 # list is not exhaustive):
 #

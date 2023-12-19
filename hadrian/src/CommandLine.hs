@@ -1,8 +1,8 @@
 module CommandLine (
     optDescrs, cmdLineArgsMap, cmdFlavour, lookupFreeze1, lookupFreeze2, lookupSkipDepends,
-    cmdBignum, cmdBignumCheck, cmdProgressInfo, cmdConfigure, cmdCompleteSetting,
+    cmdBignum, cmdBignumCheck, cmdProgressInfo, cmdCompleteSetting,
     cmdDocsArgs, lookupBuildRoot, TestArgs(..), TestSpeed(..), defaultTestArgs,
-    cmdPrefix
+    cmdPrefix, DocArgs(..), defaultDocArgs
     ) where
 
 import Data.Either
@@ -17,6 +17,7 @@ import System.Environment
 import qualified System.Directory as Directory
 
 import qualified Data.Set as Set
+import Data.Maybe
 
 data TestSpeed = TestSlow | TestNormal | TestFast deriving (Show, Eq)
 
@@ -32,6 +33,7 @@ data CommandLineArgs = CommandLineArgs
     , progressInfo   :: ProgressInfo
     , buildRoot      :: BuildRoot
     , testArgs       :: TestArgs
+    , docsArgs       :: DocArgs
     , docTargets     :: DocTargets
     , prefix         :: Maybe FilePath
     , completeStg    :: Maybe String }
@@ -50,6 +52,7 @@ defaultCommandLineArgs = CommandLineArgs
     , progressInfo   = Brief
     , buildRoot      = BuildRoot "_build"
     , testArgs       = defaultTestArgs
+    , docsArgs       = defaultDocArgs
     , docTargets     = Set.fromList [minBound..maxBound]
     , prefix         = Nothing
     , completeStg    = Nothing }
@@ -71,7 +74,15 @@ data TestArgs = TestArgs
     , testVerbosity  :: Maybe String
     , testWays       :: [String]
     , brokenTests    :: [String]
-    , testAccept     :: Bool}
+    , testAccept     :: Bool
+    , testHasInTreeFiles :: Bool
+      -- ^ This is used to signal that we have access to in-tree files like
+      -- the rts sources and the haddock stats directory even if the test
+      -- compiler is not in-tree
+      -- If this flag is set, then those tests will also be run.
+      -- This is useful when we want to test the bindist, but we still
+      -- have access to the build directory
+    }
     deriving (Eq, Show)
 
 -- | Default value for `TestArgs`.
@@ -92,10 +103,19 @@ defaultTestArgs = TestArgs
     , testVerbosity  = Nothing
     , testWays       = []
     , brokenTests    = []
-    , testAccept     = False }
+    , testAccept     = False
+    , testHasInTreeFiles = False
+    }
+
+data DocArgs = DocArgs
+  { docsBaseUrl :: String
+  } deriving (Eq, Show)
+
+defaultDocArgs :: DocArgs
+defaultDocArgs = DocArgs { docsBaseUrl = "../%pkg%" }
 
 readConfigure :: Either String (CommandLineArgs -> CommandLineArgs)
-readConfigure = Right $ \flags -> flags { configure = True }
+readConfigure = Left "hadrian --configure has been deprecated (see #20167). Please run ./boot; ./configure manually"
 
 readFlavour :: Maybe String -> Either String (CommandLineArgs -> CommandLineArgs)
 readFlavour ms = Right $ \flags -> flags { flavour = lower <$> ms }
@@ -140,6 +160,9 @@ readTestKeepFiles = Right $ \flags -> flags { testArgs = (testArgs flags) { test
 readTestAccept :: Either String (CommandLineArgs -> CommandLineArgs)
 readTestAccept = Right $ \flags -> flags { testArgs = (testArgs flags) { testAccept = True } }
 
+readTestHasInTreeFiles :: Either String (CommandLineArgs -> CommandLineArgs)
+readTestHasInTreeFiles = Right $ \flags -> flags { testArgs = (testArgs flags) { testHasInTreeFiles = True } }
+
 readTestCompiler :: Maybe String -> Either String (CommandLineArgs -> CommandLineArgs)
 readTestCompiler compiler = maybe (Left "Cannot parse compiler") (Right . set) compiler
   where
@@ -177,6 +200,13 @@ readTestOnlyPerf = Right $ \flags -> flags { testArgs = (testArgs flags) { testO
 
 readTestSkipPerf :: Either String (CommandLineArgs -> CommandLineArgs)
 readTestSkipPerf = Right $ \flags -> flags { testArgs = (testArgs flags) { testSkipPerf = True } }
+
+readHaddockBaseUrl :: Maybe String -> Either String (CommandLineArgs -> CommandLineArgs)
+readHaddockBaseUrl base_url = Right $ \flags ->
+  flags { docsArgs = (docsArgs flags) { docsBaseUrl = base_url' } }
+
+  where base_url' = fromMaybe "https://hackage.haskell.org/package/%pkg%/docs" base_url
+
 
 readTestRootDirs :: Maybe String -> Either String (CommandLineArgs -> CommandLineArgs)
 readTestRootDirs rootdirs = Right $ \flags ->
@@ -250,7 +280,7 @@ readDocsArg ms = maybe (Left "Cannot parse docs argument") (Right . set) (go =<<
 optDescrs :: [OptDescr (Either String (CommandLineArgs -> CommandLineArgs))]
 optDescrs =
     [ Option ['c'] ["configure"] (NoArg readConfigure)
-      "Run the boot and configure scripts (if you do not want to run them manually)."
+      "Deprecated: Run the boot and configure scripts."
     , Option ['o'] ["build-root"] (OptArg readBuildRoot "BUILD_ROOT")
       "Where to store build artifacts. (Default _build)."
     , Option [] ["flavour"] (OptArg readFlavour "FLAVOUR")
@@ -298,10 +328,13 @@ optDescrs =
     , Option [] ["broken-test"] (OptArg readBrokenTests "TEST_NAME")
       "consider these tests to be broken"
     , Option ['a'] ["test-accept"] (NoArg readTestAccept) "Accept new output of tests"
+    , Option [] ["test-have-intree-files"] (NoArg readTestHasInTreeFiles) "Run the in-tree tests even with an out of tree compiler"
     , Option [] ["prefix"] (OptArg readPrefix "PATH")
         "Destination path for the bindist 'install' rule"
     , Option [] ["complete-setting"] (OptArg readCompleteStg "SETTING")
         "Setting key to autocomplete, for the 'autocomplete' target."
+    , Option [] ["haddock-base-url"] (OptArg readHaddockBaseUrl "BASE_URL")
+        "Generate documentation suitable for upload to hackage or for another base URL (for example a local hackage server)."
     ]
 
 -- | A type-indexed map containing Hadrian command line arguments to be passed
@@ -339,14 +372,12 @@ cmdLineArgsMap = do
     return $ insertExtra (progressInfo   args) -- Accessed by Hadrian.Utilities
            $ insertExtra (buildRoot      args) -- Accessed by Hadrian.Utilities
            $ insertExtra (testArgs       args) -- Accessed by Settings.Builders.RunTest
+           $ insertExtra (docsArgs       args) -- Accessed by Rules.Documentation
            $ insertExtra allSettings           -- Accessed by Settings
            $ insertExtra args Map.empty
 
 cmdLineArgs :: Action CommandLineArgs
 cmdLineArgs = userSetting defaultCommandLineArgs
-
-cmdConfigure :: Action Bool
-cmdConfigure = configure <$> cmdLineArgs
 
 cmdFlavour :: Action (Maybe String)
 cmdFlavour = flavour <$> cmdLineArgs

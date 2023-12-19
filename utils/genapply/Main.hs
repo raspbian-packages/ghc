@@ -15,16 +15,16 @@ module Main(main) where
 -- Note [Genapply target as host for RTS macros]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 -- We improperly include *HOST* macros for our target...
-#include "../../includes/ghcconfig.h"
+#include "../../rts/include/ghcconfig.h"
 
 -- ...so that this header defines the right stuff.  It is the RTS's host, but
 -- our target, as we are generating code that uses that RTS.
-#include "../../includes/stg/MachRegsForHost.h"
+#include "../../rts/include/stg/MachRegsForHost.h"
 
-#include "../../includes/rts/Constants.h"
+#include "../../rts/include/rts/Constants.h"
 
 -- Needed for TAG_BITS
-#include "../../includes/MachDeps.h"
+#include "../../rts/include/MachDeps.h"
 
 import Prelude hiding ((<>))
 
@@ -509,8 +509,8 @@ genMkPAP regstatus macro jump live ticker disamb
 
 
 -- Note [jump_SAVE_CCCS]
-
--- when profiling, if we have some extra arguments to apply that we
+-- ~~~~~~~~~~~~~~~~~~~~~
+-- When profiling, if we have some extra arguments to apply that we
 -- save to the stack, we must also save the current cost centre stack
 -- and restore it when applying the extra arguments.  This is all
 -- handled by the macro jump_SAVE_CCCS(target), defined in
@@ -1002,7 +1002,7 @@ applyTypes = [
 -- changes, so we could share the apply/save code between lots of cases.
 --
 --  NOTE: other places to change if you change stackApplyTypes:
---       - includes/rts/storage/FunTypes.h
+--       - rts/include/rts/storage/FunTypes.h
 --       - GHC.StgToCmm.Layout: stdPattern
 stackApplyTypes = [
         [],

@@ -31,6 +31,7 @@ enum SweepResult {
 GNUC_ATTR_HOT static enum SweepResult
 nonmovingSweepSegment(struct NonmovingSegment *seg)
 {
+    ASSERT_SEGMENT_STATE(seg, FILLED_SWEEPING);
     const nonmoving_block_idx blk_cnt = nonmovingSegmentBlockCount(seg);
     bool found_free = false;
     bool found_live = false;
@@ -39,20 +40,20 @@ nonmovingSweepSegment(struct NonmovingSegment *seg)
     {
         if (seg->bitmap[i] == nonmovingMarkEpoch) {
             found_live = true;
-        } else if (!found_free) {
-            // This is the first free block we've found; set next_free,
-            // next_free_snap, and the scan pointer.
-            found_free = true;
-            seg->next_free = i;
-            nonmovingSegmentInfo(seg)->next_free_snap = i;
-            Bdescr((P_)seg)->u.scan = (P_)nonmovingSegmentGetBlock(seg, i);
-            seg->bitmap[i] = 0;
         } else {
             seg->bitmap[i] = 0;
+            if (!found_free) {
+                // This is the first free block we've found; set next_free,
+                // next_free_snap, and the scan pointer.
+                found_free = true;
+                seg->next_free = i;
+                nonmovingSegmentInfo(seg)->next_free_snap = i;
+                Bdescr((P_)seg)->u.scan = (P_)nonmovingSegmentGetBlock(seg, i);
+            }
         }
 
         if (found_free && found_live) {
-            // zero the remaining dead object's mark bits
+            // zero the remaining dead objects' mark bits
             for (; i < nonmovingSegmentBlockCount(seg); ++i) {
                 if (seg->bitmap[i] != nonmovingMarkEpoch) {
                     seg->bitmap[i] = 0;
@@ -73,7 +74,7 @@ nonmovingSweepSegment(struct NonmovingSegment *seg)
 
 #if defined(DEBUG)
 
-void nonmovingGcCafs()
+void nonmovingGcCafs(void)
 {
     uint32_t i = 0;
     StgIndStatic *next;
@@ -118,7 +119,8 @@ clear_segment_free_blocks(struct NonmovingSegment* seg)
 {
     unsigned int block_size = nonmovingSegmentBlockSize(seg);
     for (unsigned int p_idx = 0; p_idx < nonmovingSegmentBlockCount(seg); ++p_idx) {
-        // after mark, so bit not set == dead
+        // N.B. nonmovingSweepSegment helpfully clears the bitmap entries of
+        // dead blocks
         if (nonmovingGetMark(seg, p_idx) == 0) {
             memset(nonmovingSegmentGetBlock(seg, p_idx), 0, block_size);
         }
@@ -277,15 +279,16 @@ dirty_BLOCKING_QUEUE:
 }
 
 /* N.B. This happens during the pause so we own all capabilities. */
-void nonmovingSweepMutLists()
+void nonmovingSweepMutLists(void)
 {
-    for (uint32_t n = 0; n < n_capabilities; n++) {
-        Capability *cap = capabilities[n];
+    for (uint32_t n = 0; n < getNumCapabilities(); n++) {
+        Capability *cap = getCapability(n);
         bdescr *old_mut_list = cap->mut_lists[oldest_gen->no];
         cap->mut_lists[oldest_gen->no] = allocBlockOnNode_lock(cap->node);
         for (bdescr *bd = old_mut_list; bd; bd = bd->link) {
             for (StgPtr p = bd->start; p < bd->free; p++) {
                 StgClosure **q = (StgClosure**)p;
+                ASSERT(Bdescr((StgPtr) *q)->gen == oldest_gen);
                 if (nonmovingIsAlive(*q) && !is_closure_clean(*q)) {
                     recordMutableCap(*q, cap, oldest_gen->no);
                 }
@@ -321,7 +324,7 @@ static void freeChain_lock_max(bdescr *bd, int max_dur)
   RELEASE_SM_LOCK;
 }
 
-void nonmovingSweepLargeObjects()
+void nonmovingSweepLargeObjects(void)
 {
     freeChain_lock_max(nonmoving_large_objects, 10000);
     nonmoving_large_objects = nonmoving_marked_large_objects;
@@ -330,7 +333,7 @@ void nonmovingSweepLargeObjects()
     n_nonmoving_marked_large_blocks = 0;
 }
 
-void nonmovingSweepCompactObjects()
+void nonmovingSweepCompactObjects(void)
 {
     bdescr *next;
     ACQUIRE_SM_LOCK;
@@ -364,13 +367,12 @@ static bool is_alive(StgClosure *p)
     }
 }
 
-void nonmovingSweepStableNameTable()
+void nonmovingSweepStableNameTable(void)
 {
     // See comments in gcStableTables
 
     /* Note [Sweeping stable names in the concurrent collector]
      * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-     *
      * When collecting concurrently we need to take care to avoid freeing
      * stable names the we didn't sweep this collection cycle. For instance,
      * consider the following situation:

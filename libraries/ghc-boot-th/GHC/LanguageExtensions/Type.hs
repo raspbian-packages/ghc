@@ -29,8 +29,8 @@ data Extension
    | IncoherentInstances
    | UndecidableSuperClasses
    | MonomorphismRestriction
-   | MonoPatBinds
    | MonoLocalBinds
+   | DeepSubsumption
    | RelaxedPolyRec           -- Deprecated
    | ExtendedDefaultRules     -- Use GHC's extended rules for defaulting
    | ForeignFunctionInterface
@@ -52,6 +52,7 @@ data Extension
    | UnboxedTuples
    | UnboxedSums
    | UnliftedNewtypes
+   | UnliftedDatatypes
    | BangPatterns
    | TypeFamilies
    | TypeFamilyDependencies
@@ -61,7 +62,7 @@ data Extension
    | NumDecimals
    | DisambiguateRecordFields
    | RecordWildCards
-   | RecordPuns
+   | NamedFieldPuns
    | ViewPatterns
    | GADTs
    | GADTSyntax
@@ -138,7 +139,6 @@ data Extension
    | TypeApplications
    | Strict
    | StrictData
-   | MonadFailDesugaring
    | EmptyDataDeriving
    | NumericUnderscores
    | QuantifiedConstraints
@@ -147,6 +147,9 @@ data Extension
    | CUSKs
    | StandaloneKindSignatures
    | LexicalNegation
+   | FieldSelectors
+   | OverloadedRecordDot
+   | OverloadedRecordUpdate
    deriving (Eq, Enum, Show, Generic, Bounded)
 -- 'Ord' and 'Bounded' are provided for GHC API users (see discussions
 -- in https://gitlab.haskell.org/ghc/ghc/merge_requests/2707 and

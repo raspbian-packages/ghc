@@ -6,7 +6,7 @@
  *
  -------------------------------------------------------------------------*/
 
-#include "PosixSource.h"
+#include "rts/PosixSource.h"
 #include "Rts.h"
 
 #include "Schedule.h"
@@ -79,6 +79,34 @@ newSpark (StgRegTable *reg, StgClosure *p)
     return 1;
 }
 
+/* Note [Pruning the spark pool]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+pruneSparkQueue checks if closures have been evacuated to know weither or
+not a spark can be GCed. If it was evacuated it's live and we keep the spark
+alive. If it hasn't been evacuated at the end of GC we can assume it's dead and
+remove the spark from the pool.
+
+To make this sound we must ensure GC has finished evacuating live objects before
+we prune the spark pool. Otherwise we might GC a spark before it has been evaluated.
+
+* If we run sequential GC then the GC Lead simply prunes after
+everything has been evacuated.
+
+* If we run parallel gc without work stealing then GC workers are not synchronized
+at any point before the worker returns. So we leave it to the GC Lead to prune
+sparks once evacuation has been finished and all workers returned.
+
+* If work stealing is enabled all GC threads will be running
+scavenge_until_all_done until regular heap marking is done. After which
+all workers will converge on a synchronization point. This means
+we can perform spark pruning inside the GC workers at this point.
+The only wart is that if we prune sparks locally we might
+miss sparks reachable via weak pointers as these are marked in the main
+thread concurrently to the calls to pruneSparkQueue. To fix this problem would
+require a GC barrier but that seems to high a price to pay.
+*/
+
+
 /* --------------------------------------------------------------------------
  * Remove all sparks from the spark queues which should not spark any
  * more.  Called after GC. We assume exclusive access to the structure
@@ -91,11 +119,10 @@ pruneSparkQueue (bool nonmovingMarkFinished, Capability *cap)
 {
     SparkPool *pool;
     StgClosurePtr spark, tmp, *elements;
-    uint32_t n, pruned_sparks; // stats only
+    uint32_t pruned_sparks; // stats only
     StgInt botInd,oldBotInd,currInd; // indices in array (always < size)
     const StgInfoTable *info;
 
-    n = 0;
     pruned_sparks = 0;
 
     pool = cap->sparks;
@@ -181,7 +208,7 @@ pruneSparkQueue (bool nonmovingMarkFinished, Capability *cap)
           cap->spark_stats.fizzled++;
           traceEventSparkFizzle(cap);
       } else {
-          info = spark->header.info;
+          info = RELAXED_LOAD(&spark->header.info);
           load_load_barrier();
           if (IS_FORWARDING_PTR(info)) {
               tmp = (StgClosure*)UN_FORWARDING_PTR(info);
@@ -189,7 +216,6 @@ pruneSparkQueue (bool nonmovingMarkFinished, Capability *cap)
               if (closure_SHOULD_SPARK(tmp)) {
                   elements[botInd] = tmp; // keep entry (new address)
                   botInd++;
-                  n++;
               } else {
                   pruned_sparks++; // discard spark
                   cap->spark_stats.fizzled++;
@@ -219,7 +245,6 @@ pruneSparkQueue (bool nonmovingMarkFinished, Capability *cap)
                   if (closure_SHOULD_SPARK(spark)) {
                       elements[botInd] = spark; // keep entry (new address)
                       botInd++;
-                      n++;
                   } else {
                       pruned_sparks++; // discard spark
                       cap->spark_stats.fizzled++;
@@ -237,7 +262,6 @@ pruneSparkQueue (bool nonmovingMarkFinished, Capability *cap)
                   // isAlive() also ignores static closures (see GCAux.c)
                   elements[botInd] = spark; // keep entry (new address)
                   botInd++;
-                  n++;
               } else {
                   pruned_sparks++; // discard spark
                   cap->spark_stats.fizzled++;

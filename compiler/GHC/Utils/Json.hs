@@ -1,4 +1,5 @@
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE FlexibleInstances #-}
 module GHC.Utils.Json where
 
 import GHC.Prelude
@@ -29,7 +30,7 @@ renderJSON d =
     JSObject fs -> braces $ pprList renderField fs
   where
     renderField :: (String, JsonDoc) -> SDoc
-    renderField (s, j) = doubleQuotes (text s) <>  colon <+> renderJSON j
+    renderField (s, j) = doubleQuotes (text s) <>  colon <> renderJSON j
 
     pprList pp xs = hcat (punctuate comma (map pp xs))
 
@@ -54,3 +55,9 @@ escapeJsonString = concatMap escapeChar
 
 class ToJson a where
   json :: a -> JsonDoc
+
+instance ToJson String where
+  json = JSString . escapeJsonString
+
+instance ToJson Int where
+  json = JSInt

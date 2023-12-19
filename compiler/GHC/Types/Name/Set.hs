@@ -3,7 +3,7 @@
 (c) The GRASP/AQUA Project, Glasgow University, 1998
 -}
 
-{-# LANGUAGE CPP #-}
+
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 module GHC.Types.Name.Set (
         -- * Names set type
@@ -34,8 +34,6 @@ module GHC.Types.Name.Set (
         -- * Non-CAFfy names
         NonCaffySet(..)
     ) where
-
-#include "HsVersions.h"
 
 import GHC.Prelude
 
@@ -222,5 +220,5 @@ findUses dus uses
 
 -- | 'Id's which have no CAF references. This is a result of analysis of C--.
 -- It is always safe to use an empty 'NonCaffySet'. TODO Refer to Note.
-newtype NonCaffySet = NonCaffySet NameSet
+newtype NonCaffySet = NonCaffySet { ncs_nameSet :: NameSet }
   deriving (Semigroup, Monoid)

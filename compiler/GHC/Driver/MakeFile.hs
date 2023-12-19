@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP #-}
+
 
 -----------------------------------------------------------------------------
 --
@@ -13,28 +13,36 @@ module GHC.Driver.MakeFile
    )
 where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
 import qualified GHC
 import GHC.Driver.Monad
 import GHC.Driver.Session
+import GHC.Driver.Ppr
 import GHC.Utils.Misc
-import GHC.Driver.Types
+import GHC.Driver.Env
+import GHC.Driver.Errors.Types
 import qualified GHC.SysTools as SysTools
-import GHC.Unit.Module
 import GHC.Data.Graph.Directed ( SCC(..) )
-import GHC.Driver.Finder
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
+import GHC.Types.SourceError
 import GHC.Types.SrcLoc
-import Data.List
-import GHC.Data.FastString
-import GHC.SysTools.FileCleanup
+import GHC.Types.PkgQual
+import Data.List (partition)
+import GHC.Utils.TmpFs
+
+import GHC.Iface.Load (cannotFindModule)
+
+import GHC.Unit.Module
+import GHC.Unit.Module.ModSummary
+import GHC.Unit.Module.Graph
+import GHC.Unit.Finder
 
 import GHC.Utils.Exception
 import GHC.Utils.Error
+import GHC.Utils.Logger
 
 import System.Directory
 import System.FilePath
@@ -53,6 +61,8 @@ import qualified Data.Set as Set
 
 doMkDependHS :: GhcMonad m => [FilePath] -> m ()
 doMkDependHS srcs = do
+    logger <- getLogger
+
     -- Initialisation
     dflags0 <- GHC.getSessionDynFlags
 
@@ -62,20 +72,23 @@ doMkDependHS srcs = do
     -- We therefore do the initial dependency generation with an empty
     -- way and .o/.hi extensions, regardless of any flags that might
     -- be specified.
-    let dflags = dflags0 {
-                     ways = Set.empty,
-                     hiSuf = "hi",
-                     objectSuf = "o"
-                 }
-    GHC.setSessionDynFlags dflags
+    let dflags1 = dflags0
+            { targetWays_ = Set.empty
+            , hiSuf_      = "hi"
+            , objectSuf_  = "o"
+            }
+    GHC.setSessionDynFlags dflags1
 
-    when (null (depSuffixes dflags)) $ liftIO $
-        throwGhcExceptionIO (ProgramError "You must specify at least one -dep-suffix")
+    -- If no suffix is provided, use the default -- the empty one
+    let dflags = if null (depSuffixes dflags1)
+                 then dflags1 { depSuffixes = [""] }
+                 else dflags1
 
-    files <- liftIO $ beginMkDependHS dflags
+    tmpfs <- hsc_tmpfs <$> getSession
+    files <- liftIO $ beginMkDependHS logger tmpfs dflags
 
     -- Do the downsweep to find all the modules
-    targets <- mapM (\s -> GHC.guessTarget s Nothing) srcs
+    targets <- mapM (\s -> GHC.guessTarget s Nothing Nothing) srcs
     GHC.setTargets targets
     let excl_mods = depExcludeMods dflags
     module_graph <- GHC.depanal excl_mods True {- Allow dup roots -}
@@ -85,7 +98,7 @@ doMkDependHS srcs = do
     let sorted = GHC.topSortModuleGraph False module_graph Nothing
 
     -- Print out the dependencies if wanted
-    liftIO $ debugTraceMsg dflags 2 (text "Module dependencies" $$ ppr sorted)
+    liftIO $ debugTraceMsg logger 2 (text "Module dependencies" $$ ppr sorted)
 
     -- Process them one by one, dumping results into makefile
     -- and complaining about cycles
@@ -94,10 +107,10 @@ doMkDependHS srcs = do
     mapM_ (liftIO . processDeps dflags hsc_env excl_mods root (mkd_tmp_hdl files)) sorted
 
     -- If -ddump-mod-cycles, show cycles in the module graph
-    liftIO $ dumpModCycles dflags module_graph
+    liftIO $ dumpModCycles logger module_graph
 
     -- Tidy up
-    liftIO $ endMkDependHS dflags files
+    liftIO $ endMkDependHS logger files
 
     -- Unconditional exiting is a bad idea.  If an error occurs we'll get an
     --exception; if that is not caught it's fine, but at least we have a
@@ -121,11 +134,11 @@ data MkDepFiles
             mkd_tmp_file  :: FilePath,          -- Name of the temporary file
             mkd_tmp_hdl   :: Handle }           -- Handle of the open temporary file
 
-beginMkDependHS :: DynFlags -> IO MkDepFiles
-beginMkDependHS dflags = do
+beginMkDependHS :: Logger -> TmpFs -> DynFlags -> IO MkDepFiles
+beginMkDependHS logger tmpfs dflags = do
         -- open a new temp file in which to stuff the dependency info
         -- as we go along.
-  tmp_file <- newTempName dflags TFL_CurrentModule "dep"
+  tmp_file <- newTempName logger tmpfs (tmpDir dflags) TFL_CurrentModule "dep"
   tmp_hdl <- openFile tmp_file WriteMode
 
         -- open the makefile
@@ -179,7 +192,7 @@ processDeps :: DynFlags
             -> [ModuleName]
             -> FilePath
             -> Handle           -- Write dependencies to here
-            -> SCC ModSummary
+            -> SCC ModuleGraphNode
             -> IO ()
 -- Write suitable dependencies to handle
 -- Always:
@@ -198,9 +211,18 @@ processDeps :: DynFlags
 
 processDeps dflags _ _ _ _ (CyclicSCC nodes)
   =     -- There shouldn't be any cycles; report them
-    throwGhcExceptionIO (ProgramError (showSDoc dflags $ GHC.cyclicModuleErr nodes))
+    throwGhcExceptionIO $ ProgramError $
+      showSDoc dflags $ GHC.cyclicModuleErr nodes
 
-processDeps dflags hsc_env excl_mods root hdl (AcyclicSCC node)
+processDeps dflags _ _ _ _ (AcyclicSCC (InstantiationNode _uid node))
+  =     -- There shouldn't be any backpack instantiations; report them as well
+    throwGhcExceptionIO $ ProgramError $
+      showSDoc dflags $
+        vcat [ text "Unexpected backpack instantiation in dependency graph while constructing Makefile:"
+             , nest 2 $ ppr node ]
+processDeps _dflags _ _ _ _ (AcyclicSCC (LinkNode {})) = return ()
+
+processDeps dflags hsc_env excl_mods root hdl (AcyclicSCC (ModuleNode _ node))
   = do  { let extra_suffixes = depSuffixes dflags
               include_pkg_deps = depIncludePkgDeps dflags
               src_file  = msHsFilePath node
@@ -262,30 +284,30 @@ processDeps dflags hsc_env excl_mods root hdl (AcyclicSCC node)
 
 findDependency  :: HscEnv
                 -> SrcSpan
-                -> Maybe FastString     -- package qualifier, if any
+                -> PkgQual              -- package qualifier, if any
                 -> ModuleName           -- Imported module
                 -> IsBootInterface      -- Source import
                 -> Bool                 -- Record dependency on package modules
                 -> IO (Maybe FilePath)  -- Interface file
-findDependency hsc_env srcloc pkg imp is_boot include_pkg_deps
-  = do  {       -- Find the module; this will be fast because
-                -- we've done it once during downsweep
-          r <- findImportedModule hsc_env imp pkg
-        ; case r of
-            Found loc _
-                -- Home package: just depend on the .hi or hi-boot file
-                | isJust (ml_hs_file loc) || include_pkg_deps
-                -> return (Just (addBootSuffix_maybe is_boot (ml_hi_file loc)))
+findDependency hsc_env srcloc pkg imp is_boot include_pkg_deps = do
+  -- Find the module; this will be fast because
+  -- we've done it once during downsweep
+  r <- findImportedModule hsc_env imp pkg
+  case r of
+    Found loc _
+        -- Home package: just depend on the .hi or hi-boot file
+        | isJust (ml_hs_file loc) || include_pkg_deps
+        -> return (Just (addBootSuffix_maybe is_boot (ml_hi_file loc)))
 
-                -- Not in this package: we don't need a dependency
-                | otherwise
-                -> return Nothing
+        -- Not in this package: we don't need a dependency
+        | otherwise
+        -> return Nothing
 
-            fail ->
-                let dflags = hsc_dflags hsc_env
-                in throwOneError $ mkPlainErrMsg dflags srcloc $
-                        cannotFindModule dflags imp fail
-        }
+    fail ->
+        throwOneError $
+          mkPlainErrorMsgEnvelope srcloc $
+          GhcDriverMessage $ DriverUnknownMessage $ mkPlainError noHints $
+             cannotFindModule hsc_env imp fail
 
 -----------------------------
 writeDependency :: FilePath -> Handle -> [FilePath] -> FilePath -> IO ()
@@ -324,9 +346,9 @@ insertSuffixes file_name extras
 --
 -----------------------------------------------------------------
 
-endMkDependHS :: DynFlags -> MkDepFiles -> IO ()
+endMkDependHS :: Logger -> MkDepFiles -> IO ()
 
-endMkDependHS dflags
+endMkDependHS logger
    (MkDep { mkd_make_file = makefile, mkd_make_hdl =  makefile_hdl,
             mkd_tmp_file  = tmp_file, mkd_tmp_hdl  =  tmp_hdl })
   = do
@@ -336,74 +358,71 @@ endMkDependHS dflags
   case makefile_hdl of
      Nothing  -> return ()
      Just hdl -> do
-
-          -- slurp the rest of the original makefile and copy it into the output
-        let slurp = do
-                l <- hGetLine hdl
-                hPutStrLn tmp_hdl l
-                slurp
-
-        catchIO slurp
-                (\e -> if isEOFError e then return () else ioError e)
-
+        -- slurp the rest of the original makefile and copy it into the output
+        SysTools.copyHandle hdl tmp_hdl
         hClose hdl
 
   hClose tmp_hdl  -- make sure it's flushed
 
         -- Create a backup of the original makefile
-  when (isJust makefile_hdl)
-       (SysTools.copy dflags ("Backing up " ++ makefile)
-          makefile (makefile++".bak"))
+  when (isJust makefile_hdl) $ do
+    showPass logger ("Backing up " ++ makefile)
+    SysTools.copyFile makefile (makefile++".bak")
 
         -- Copy the new makefile in place
-  SysTools.copy dflags "Installing new makefile" tmp_file makefile
+  showPass logger "Installing new makefile"
+  SysTools.copyFile tmp_file makefile
 
 
 -----------------------------------------------------------------
 --              Module cycles
 -----------------------------------------------------------------
 
-dumpModCycles :: DynFlags -> ModuleGraph -> IO ()
-dumpModCycles dflags module_graph
-  | not (dopt Opt_D_dump_mod_cycles dflags)
+dumpModCycles :: Logger -> ModuleGraph -> IO ()
+dumpModCycles logger module_graph
+  | not (logHasDumpFlag logger Opt_D_dump_mod_cycles)
   = return ()
 
   | null cycles
-  = putMsg dflags (text "No module cycles")
+  = putMsg logger (text "No module cycles")
 
   | otherwise
-  = putMsg dflags (hang (text "Module cycles found:") 2 pp_cycles)
+  = putMsg logger (hang (text "Module cycles found:") 2 pp_cycles)
   where
+    topoSort = GHC.topSortModuleGraph True module_graph Nothing
 
-    cycles :: [[ModSummary]]
+    cycles :: [[ModuleGraphNode]]
     cycles =
-      [ c | CyclicSCC c <- GHC.topSortModuleGraph True module_graph Nothing ]
+      [ c | CyclicSCC c <- topoSort ]
 
-    pp_cycles = vcat [ (text "---------- Cycle" <+> int n <+> ptext (sLit "----------"))
+    pp_cycles = vcat [ (text "---------- Cycle" <+> int n <+> text "----------")
                         $$ pprCycle c $$ blankLine
                      | (n,c) <- [1..] `zip` cycles ]
 
-pprCycle :: [ModSummary] -> SDoc
+pprCycle :: [ModuleGraphNode] -> SDoc
 -- Print a cycle, but show only the imports within the cycle
 pprCycle summaries = pp_group (CyclicSCC summaries)
   where
     cycle_mods :: [ModuleName]  -- The modules in this cycle
-    cycle_mods = map (moduleName . ms_mod) summaries
+    cycle_mods = map (moduleName . ms_mod) [ms | ModuleNode _ ms <- summaries]
 
-    pp_group (AcyclicSCC ms) = pp_ms ms
+    pp_group :: SCC ModuleGraphNode -> SDoc
+    pp_group (AcyclicSCC (ModuleNode _ ms)) = pp_ms ms
+    pp_group (AcyclicSCC _) = empty
     pp_group (CyclicSCC mss)
-        = ASSERT( not (null boot_only) )
+        = assert (not (null boot_only)) $
                 -- The boot-only list must be non-empty, else there would
                 -- be an infinite chain of non-boot imports, and we've
                 -- already checked for that in processModDeps
           pp_ms loop_breaker $$ vcat (map pp_group groups)
         where
           (boot_only, others) = partition is_boot_only mss
-          is_boot_only ms = not (any in_group (map snd (ms_imps ms)))
+          is_boot_only (ModuleNode _ ms) = not (any in_group (map snd (ms_imps ms)))
+          is_boot_only  _ = False
           in_group (L _ m) = m `elem` group_mods
-          group_mods = map (moduleName . ms_mod) mss
+          group_mods = map (moduleName . ms_mod) [ms | ModuleNode _ ms <- mss]
 
-          loop_breaker = head boot_only
+          loop_breaker = head ([ms | ModuleNode _ ms  <- boot_only])
           all_others   = tail boot_only ++ others
           groups =
             GHC.topSortModuleGraph True (mkModuleGraph all_others) Nothing
@@ -431,4 +450,3 @@ pprCycle summaries = pp_group (CyclicSCC summaries)
 depStartMarker, depEndMarker :: String
 depStartMarker = "# DO NOT DELETE: Beginning of Haskell dependencies"
 depEndMarker   = "# DO NOT DELETE: End of Haskell dependencies"
-

@@ -1,14 +1,16 @@
+{-# LANGUAGE CPP #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
 module Main (main) where
 
 import Test.ChasingBottoms.IsBottom
-import Test.Framework (Test, TestName, defaultMain, testGroup)
-import Test.Framework.Providers.QuickCheck2 (testProperty)
-import Test.QuickCheck (Arbitrary(arbitrary))
-import Test.QuickCheck.Function (Fun(..), apply)
-import Test.Framework.Providers.HUnit
-import Test.HUnit hiding (Test)
+import Test.Tasty (TestTree, TestName, defaultMain, testGroup)
+import Test.Tasty.HUnit
+import Test.Tasty.QuickCheck (testProperty, Arbitrary(arbitrary), Fun)
+#if __GLASGOW_HASKELL__ >= 806
+import Test.Tasty.QuickCheck (Property)
+#endif
+import Test.QuickCheck.Function (apply)
 
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as M
@@ -16,6 +18,9 @@ import qualified Data.IntMap as L
 import Data.Containers.ListUtils
 
 import Utils.IsUnit
+#if __GLASGOW_HASKELL__ >= 806
+import Utils.NoThunks
+#endif
 
 instance Arbitrary v => Arbitrary (IntMap v) where
     arbitrary = M.fromList `fmap` arbitrary
@@ -90,7 +95,7 @@ pInsertLookupWithKeyValueStrict f k v m
 -- also https://github.com/haskell/containers/issues/473
 
 pFromAscListLazy :: [Int] -> Bool
-pFromAscListLazy ks = not . isBottom $ M.fromAscList elems
+pFromAscListLazy ks = not . isBottom $ L.fromAscList elems
   where
     elems = [(k, v) | k <- nubInt ks, v <- [undefined, ()]]
 
@@ -101,6 +106,16 @@ pFromAscListStrict ks
   where
     elems = [(k, v) | k <- nubInt ks, v <- [undefined, undefined, ()]]
 
+#if __GLASGOW_HASKELL__ >= 806
+pStrictFoldr' :: IntMap Int -> Property
+pStrictFoldr' m = whnfHasNoThunks (M.foldr' (:) [] m)
+#endif
+
+#if __GLASGOW_HASKELL__ >= 806
+pStrictFoldl' :: IntMap Int -> Property
+pStrictFoldl' m = whnfHasNoThunks (M.foldl' (flip (:)) [] m)
+#endif
+
 ------------------------------------------------------------------------
 -- check for extra thunks
 --
@@ -109,7 +124,7 @@ pFromAscListStrict ks
 -- in most cases. An exception is `L.fromListWith const`, which cannot
 -- evaluate the `const` calls.
 
-tExtraThunksM :: Test
+tExtraThunksM :: TestTree
 tExtraThunksM = testGroup "IntMap.Strict - extra thunks" $
     if not isUnitSupported then [] else
     -- for strict maps, all the values should be evaluated to ()
@@ -124,15 +139,15 @@ tExtraThunksM = testGroup "IntMap.Strict - extra thunks" $
     ]
   where
     m0 = M.singleton 42 ()
-    check :: TestName -> IntMap () -> Test
+    check :: TestName -> IntMap () -> TestTree
     check n m = testCase n $ case M.lookup 42 m of
         Just v -> assertBool msg (isUnit v)
-        _      -> assertString "key not found"
+        _      -> assertBool "key not found" False
       where
         msg = "too lazy -- expected fully evaluated ()"
 
-tExtraThunksL :: Test
-tExtraThunksL = testGroup "IntMap.Strict - extra thunks" $
+tExtraThunksL :: TestTree
+tExtraThunksL = testGroup "IntMap.Lazy - extra thunks" $
     if not isUnitSupported then [] else
     -- for lazy maps, the *With functions should leave `const () ()` thunks,
     -- but the other functions should produce fully evaluated ().
@@ -147,10 +162,10 @@ tExtraThunksL = testGroup "IntMap.Strict - extra thunks" $
     ]
   where
     m0 = L.singleton 42 ()
-    check :: TestName -> Bool -> IntMap () -> Test
+    check :: TestName -> Bool -> L.IntMap () -> TestTree
     check n e m = testCase n $ case L.lookup 42 m of
         Just v -> assertBool msg (e == isUnit v)
-        _      -> assertString "key not found"
+        _      -> assertBool "key not found" False
       where
         msg | e         = "too lazy -- expected fully evaluated ()"
             | otherwise = "too strict -- expected a thunk"
@@ -158,7 +173,7 @@ tExtraThunksL = testGroup "IntMap.Strict - extra thunks" $
 ------------------------------------------------------------------------
 -- * Test list
 
-tests :: [Test]
+tests :: [TestTree]
 tests =
     [
     -- Basic interface
@@ -184,6 +199,10 @@ tests =
         pInsertLookupWithKeyValueStrict
       , testProperty "fromAscList is somewhat value-lazy" pFromAscListLazy
       , testProperty "fromAscList is somewhat value-strict" pFromAscListStrict
+#if __GLASGOW_HASKELL__ >= 806
+      , testProperty "strict foldr'" pStrictFoldr'
+      , testProperty "strict foldl'" pStrictFoldl'
+#endif
       ]
       , tExtraThunksM
       , tExtraThunksL
@@ -193,7 +212,7 @@ tests =
 -- * Test harness
 
 main :: IO ()
-main = defaultMain tests
+main = defaultMain $ testGroup "intmap-strictness" tests
 
 ------------------------------------------------------------------------
 -- * Utilities

@@ -49,7 +49,7 @@
 --
 -- == Detailed performance information
 --
--- The amortized running time is given for each operation, with /n/ referring to
+-- The amortized running time is given for each operation, with \(n\) referring to
 -- the number of entries in the map.
 --
 -- Benchmarks comparing "Data.Map.Lazy" with other dictionary implementations
@@ -92,6 +92,7 @@ module Data.Map.Lazy (
     , empty
     , singleton
     , fromSet
+    , fromArgSet
 
     -- ** From Unordered Lists
     , fromList
@@ -207,6 +208,7 @@ module Data.Map.Lazy (
     , keys
     , assocs
     , keysSet
+    , argSet
 
     -- ** Lists
     , toList

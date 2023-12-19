@@ -1,6 +1,7 @@
-{-# LANGUAGE CPP, BangPatterns #-}
-
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE TypeFamilies #-}
 
 -----------------------------------------------------------------------------
 --
@@ -10,9 +11,7 @@
 --
 -----------------------------------------------------------------------------
 
-module GHC.StgToCmm.Expr ( cgExpr ) where
-
-#include "HsVersions.h"
+module GHC.StgToCmm.Expr ( cgExpr, cgLit ) where
 
 import GHC.Prelude hiding ((<*>))
 
@@ -24,8 +23,10 @@ import GHC.StgToCmm.Env
 import GHC.StgToCmm.DataCon
 import GHC.StgToCmm.Prof (saveCurrentCostCentre, restoreCurrentCostCentre, emitSetCCC)
 import GHC.StgToCmm.Layout
+import GHC.StgToCmm.Lit
 import GHC.StgToCmm.Prim
 import GHC.StgToCmm.Hpc
+import GHC.StgToCmm.TagCheck
 import GHC.StgToCmm.Ticky
 import GHC.StgToCmm.Utils
 import GHC.StgToCmm.Closure
@@ -36,24 +37,30 @@ import GHC.Cmm.Graph
 import GHC.Cmm.BlockId
 import GHC.Cmm hiding ( succ )
 import GHC.Cmm.Info
+import GHC.Cmm.Utils ( zeroExpr, cmmTagMask, mkWordCLit, mAX_PTR_TAG )
+import GHC.Cmm.Ppr
 import GHC.Core
 import GHC.Core.DataCon
-import GHC.Driver.Session ( mAX_PTR_TAG )
 import GHC.Types.ForeignCall
 import GHC.Types.Id
 import GHC.Builtin.PrimOps
 import GHC.Core.TyCon
 import GHC.Core.Type        ( isUnliftedType )
-import GHC.Types.RepType    ( isVoidTy, countConRepArgs )
+import GHC.Types.RepType    ( isZeroBitTy, countConRepArgs, mightBeFunTy )
 import GHC.Types.CostCentre ( CostCentreStack, currentCCS )
+import GHC.Types.Tickish
 import GHC.Data.Maybe
 import GHC.Utils.Misc
 import GHC.Data.FastString
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
 
 import Control.Monad ( unless, void )
 import Control.Arrow ( first )
 import Data.List     ( partition )
+import GHC.Stg.InferTags.TagSig (isTaggedSig)
+import GHC.Platform.Profile (profileIsProfiling)
 
 ------------------------------------------------------------------------
 --              cgExpr: the main function
@@ -69,21 +76,54 @@ cgExpr (StgOpApp (StgPrimOp SeqOp) [StgVarArg a, _] _res_ty) =
   cgIdApp a []
 
 -- dataToTag# :: a -> Int#
--- See Note [dataToTag#] in primops.txt.pp
+-- See Note [dataToTag# magic] in GHC.Core.Opt.ConstantFold
 cgExpr (StgOpApp (StgPrimOp DataToTagOp) [StgVarArg a] _res_ty) = do
-  dflags <- getDynFlags
   platform <- getPlatform
   emitComment (mkFastString "dataToTag#")
-  tmp <- newTemp (bWord platform)
-  _ <- withSequel (AssignTo [tmp] False) (cgIdApp a [])
-  -- TODO: For small types look at the tag bits instead of reading info table
-  emitReturn [getConstrTag dflags (cmmUntag dflags (CmmReg (CmmLocal tmp)))]
+  info <- getCgIdInfo a
+  let amode = idInfoToAmode info
+  tag_reg <- assignTemp $ cmmConstrTag1 platform amode
+  result_reg <- newTemp (bWord platform)
+  let tag = CmmReg $ CmmLocal tag_reg
+      is_tagged = cmmNeWord platform tag (zeroExpr platform)
+      is_too_big_tag = cmmEqWord platform tag (cmmTagMask platform)
+  -- Here we will first check the tag bits of the pointer we were given;
+  -- if this doesn't work then enter the closure and use the info table
+  -- to determine the constructor. Note that all tag bits set means that
+  -- the constructor index is too large to fit in the pointer and therefore
+  -- we must look in the info table. See Note [Tagging big families].
+
+  slow_path <- getCode $ do
+      tmp <- newTemp (bWord platform)
+      _ <- withSequel (AssignTo [tmp] False) (cgIdApp a [])
+      profile     <- getProfile
+      align_check <- stgToCmmAlignCheck <$> getStgToCmmConfig
+      emitAssign (CmmLocal result_reg)
+        $ getConstrTag profile align_check (cmmUntag platform (CmmReg (CmmLocal tmp)))
+
+  fast_path <- getCode $ do
+      -- Return the constructor index from the pointer tag
+      return_ptr_tag <- getCode $ do
+          emitAssign (CmmLocal result_reg)
+            $ cmmSubWord platform tag (CmmLit $ mkWordCLit platform 1)
+      -- Return the constructor index recorded in the info table
+      return_info_tag <- getCode $ do
+          profile     <- getProfile
+          align_check <- stgToCmmAlignCheck <$> getStgToCmmConfig
+          emitAssign (CmmLocal result_reg)
+            $ getConstrTag profile align_check (cmmUntag platform amode)
+
+      emit =<< mkCmmIfThenElse' is_too_big_tag return_info_tag return_ptr_tag (Just False)
+
+  emit =<< mkCmmIfThenElse' is_tagged fast_path slow_path (Just True)
+  emitReturn [CmmReg $ CmmLocal result_reg]
+
 
 cgExpr (StgOpApp op args ty) = cgOpApp op args ty
-cgExpr (StgConApp con args _)= cgConApp con args
+cgExpr (StgConApp con mn args _) = cgConApp con mn args
 cgExpr (StgTick t e)         = cgTick t >> cgExpr e
-cgExpr (StgLit lit)       = do cmm_lit <- cgLit lit
-                               emitReturn [CmmLit cmm_lit]
+cgExpr (StgLit lit)          = do cmm_expr <- cgLit lit
+                                  emitReturn [cmm_expr]
 
 cgExpr (StgLet _ binds expr) = do { cgBind binds;     cgExpr expr }
 cgExpr (StgLetNoEscape _ binds expr) =
@@ -96,8 +136,6 @@ cgExpr (StgLetNoEscape _ binds expr) =
 
 cgExpr (StgCase expr bndr alt_type alts) =
   cgCase expr bndr alt_type alts
-
-cgExpr (StgLam {}) = panic "cgExpr: StgLam"
 
 ------------------------------------------------------------------------
 --              Let no escape
@@ -157,9 +195,9 @@ cgLetNoEscapeRhsBody
     -> FCode (CgIdInfo, FCode ())
 cgLetNoEscapeRhsBody local_cc bndr (StgRhsClosure _ cc _upd args body)
   = cgLetNoEscapeClosure bndr local_cc cc (nonVoidIds args) body
-cgLetNoEscapeRhsBody local_cc bndr (StgRhsCon cc con args)
+cgLetNoEscapeRhsBody local_cc bndr (StgRhsCon cc con mn _ts args)
   = cgLetNoEscapeClosure bndr local_cc cc []
-      (StgConApp con args (pprPanic "cgLetNoEscapeRhsBody" $
+      (StgConApp con mn args (pprPanic "cgLetNoEscapeRhsBody" $
                            text "StgRhsCon doesn't have type args"))
         -- For a constructor RHS we want to generate a single chunk of
         -- code which can be jumped to from many places, which will
@@ -177,12 +215,10 @@ cgLetNoEscapeClosure
 
 cgLetNoEscapeClosure bndr cc_slot _unused_cc args body
   = do platform <- getPlatform
-       return ( lneIdInfo platform bndr args
-              , code )
+       return ( lneIdInfo platform bndr args, code )
   where
-   code = forkLneBody $ do {
-            ; withNewTickyCounterLNE (idName bndr) args $ do
-            ; restoreCurrentCostCentre cc_slot
+   code = forkLneBody $ withNewTickyCounterLNE bndr args $ do
+            { restoreCurrentCostCentre cc_slot
             ; arg_regs <- bindArgsToRegs args
             ; void $ noEscapeHeapCheck arg_regs (tickyEnterLNE >> cgExpr body) }
 
@@ -260,7 +296,7 @@ We adopt (b) because that is more likely to put the heap check at the
 entry to a function, when not many things are live.  After a bunch of
 single-branch cases, we may have lots of things live
 
-Hence: two basic plans for
+Hence: Two basic plans for
 
         case e of r { alts }
 
@@ -274,6 +310,13 @@ Hence: two basic plans for
         ...restore current cost centre...
         ...code for alts...
         ...alts do their own heap checks
+
+   When using GcInAlts the return point for heap checks and evaluating
+   the scrutinee is shared. This does mean we might execute the actual
+   branching code twice but it's rare enough to not matter.
+   The huge advantage of this pattern is that we do not require multiple
+   info tables for returning from gc as they can be shared between all
+   cases. Reducing code size nicely.
 
 ------ Plan B: special case when ---------
   (i)  e does not allocate or call GC
@@ -289,6 +332,80 @@ Hence: two basic plans for
 
         ...code for alts...
         ...no heap check...
+
+   There is a variant B.2 which we use if:
+
+  (i)   e is already evaluated+tagged
+  (ii)  We have multiple alternatives
+  (iii) and there is no upstream allocation.
+
+  Here we also place one heap check before the `case` which
+  branches on `e`. Hopefully to be absorbed by an already existing
+  heap check further up. However the big difference in this case is that
+  there is no code for e. So we are not guaranteed that the heap
+  checks of the alts will be combined with an heap check further up.
+
+  Very common example: Casing on strict fields.
+
+        ...heap check...
+        ...assign bindings...
+
+        ...code for alts...
+        ...no heap check...
+
+  -- Reasoning for Plan B.2:
+   Since the scrutinee is already evaluated there is no evaluation
+   call which would force a info table that we can use as a shared
+   return point.
+   This means currently if we were to do GcInAlts like in Plan A then
+   we would end up with one info table per alternative.
+
+   To avoid this we unconditionally do gc outside of the alts with all
+   the pros and cons described in Note [Compiling case expressions].
+   Rewriting the logic to generate a shared return point before the case
+   expression while keeping the heap checks in the alternatives would be
+   possible. But it's unclear to me that this would actually be an improvement.
+
+   This means if we have code along these lines:
+
+      g x y = case x of
+         True -> Left $ (y + 1,y,y-1)
+         False -> Right $! y - (2 :: Int)
+
+   We get these potential heap check placements:
+
+   f = ...
+      !max(L,R)!; -- Might be absorbed upstream.
+      case x of
+         True  -> !L!; ...L...
+         False -> !R!; ...R...
+
+   And we place a heap check at !max(L,R)!
+
+   The downsides of using !max(L,R)! are:
+
+   * If f is recursive, and the hot loop wouldn't allocate, but the exit branch does then we do
+   a redundant heap check.
+   * We use one more instruction to de-allocate the unused heap in the branch using less heap. (Neglible)
+   * A small risk of running gc slightly more often than needed especially if one branch allocates a lot.
+
+   The upsides are:
+   * May save a heap overflow test if there is an upstream check already.
+   * If the heap check is absorbed upstream we can also eliminate its info table.
+   * We generate at most one heap check (versus one per alt otherwise).
+   * No need to save volatile vars etc across heap checks in !L!, !R!
+   * We can use relative addressing from a single Hp to get at all the closures so allocated. (seems neglible)
+   * It fits neatly in the logic we already have for handling A/B
+
+   For containers:Data/Sequence/Internal/Sorting.o the difference is
+   about 10% in terms of code size compared to using Plan A for this case.
+   The main downside is we might put heap checks into loops, even if we
+   could avoid it (See Note [Compiling case expressions]).
+
+   Potential improvement: Investigate if heap checks in alts would be an
+   improvement if we generate and use a shared return point that is placed
+   in the common path for all alts.
+
 -}
 
 
@@ -343,7 +460,7 @@ job we deleted the hacks.
 
 cgCase (StgApp v []) _ (PrimAlt _) alts
   | isVoidRep (idPrimRep v)  -- See Note [Scrutinising VoidRep]
-  , [(DEFAULT, _, rhs)] <- alts
+  , [GenStgAlt{alt_con=DEFAULT, alt_bndrs=_, alt_rhs=rhs}] <- alts
   = cgExpr rhs
 
 {- Note [Dodgy unsafeCoerce 1]
@@ -430,6 +547,7 @@ cgCase scrut bndr alt_type alts
        ; up_hp_usg <- getVirtHp        -- Upstream heap usage
        ; let ret_bndrs = chooseReturnBndrs bndr alt_type alts
              alt_regs  = map (idToReg platform) ret_bndrs
+
        ; simple_scrut <- isSimpleScrut scrut alt_type
        ; let do_gc  | is_cmp_op scrut  = False  -- See Note [GC for conditionals]
                     | not simple_scrut = True
@@ -450,6 +568,7 @@ cgCase scrut bndr alt_type alts
   where
     is_cmp_op (StgOpApp (StgPrimOp op) _ _) = isComparisonPrimOp op
     is_cmp_op _                             = False
+
 
 {- Note [GC for conditionals]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -499,21 +618,28 @@ isSimpleScrut :: CgStgExpr -> AltType -> FCode Bool
 -- heap usage from alternatives into the stuff before the case
 -- NB: if you get this wrong, and claim that the expression doesn't allocate
 --     when it does, you'll deeply mess up allocation
-isSimpleScrut (StgOpApp op args _) _       = isSimpleOp op args
-isSimpleScrut (StgLit _)       _           = return True       -- case 1# of { 0# -> ..; ... }
-isSimpleScrut (StgApp _ [])    (PrimAlt _) = return True       -- case x# of { 0# -> ..; ... }
-isSimpleScrut _                _           = return False
+isSimpleScrut (StgOpApp op args _) _         = isSimpleOp op args
+isSimpleScrut (StgLit _)           _         = return True       -- case 1# of { 0# -> ..; ... }
+isSimpleScrut (StgApp _ [])    (PrimAlt _)   = return True       -- case x# of { 0# -> ..; ... }
+isSimpleScrut (StgApp f [])   _
+  | Just sig <- idTagSig_maybe f
+  , isTaggedSig sig  -- case !x of { ... }
+  = if mightBeFunTy (idType f)
+      -- See Note [Evaluating functions with profiling] in rts/Apply.cmm
+      then not . profileIsProfiling <$> getProfile
+      else pure True
+isSimpleScrut _                    _         = return False
 
 isSimpleOp :: StgOp -> [StgArg] -> FCode Bool
 -- True iff the op cannot block or allocate
 isSimpleOp (StgFCallOp (CCall (CCallSpec _ _ safe)) _) _ = return $! not (playSafe safe)
--- dataToTag# evaluates its argument, see Note [dataToTag#] in primops.txt.pp
+-- dataToTag# evaluates its argument, see Note [dataToTag# magic] in GHC.Core.Opt.ConstantFold
 isSimpleOp (StgPrimOp DataToTagOp) _ = return False
 isSimpleOp (StgPrimOp op) stg_args                  = do
     arg_exprs <- getNonVoidArgAmodes stg_args
-    dflags <- getDynFlags
+    cfg       <- getStgToCmmConfig
     -- See Note [Inlining out-of-line primops and heap checks]
-    return $! shouldInlinePrimOp dflags op arg_exprs
+    return $! shouldInlinePrimOp cfg op arg_exprs
 isSimpleOp (StgPrimCallOp _) _                           = return False
 
 -----------------
@@ -524,9 +650,10 @@ chooseReturnBndrs :: Id -> AltType -> [CgStgAlt] -> [NonVoid Id]
 chooseReturnBndrs bndr (PrimAlt _) _alts
   = assertNonVoidIds [bndr]
 
-chooseReturnBndrs _bndr (MultiValAlt n) [(_, ids, _)]
-  = ASSERT2(ids `lengthIs` n, ppr n $$ ppr ids $$ ppr _bndr)
+chooseReturnBndrs _bndr (MultiValAlt n) [alt]
+  = assertPpr (ids `lengthIs` n) (ppr n $$ ppr ids $$ ppr _bndr) $
     assertNonVoidIds ids     -- 'bndr' is not assigned!
+    where ids = alt_bndrs alt
 
 chooseReturnBndrs bndr (AlgAlt _) _alts
   = assertNonVoidIds [bndr]  -- Only 'bndr' is assigned
@@ -541,11 +668,11 @@ chooseReturnBndrs _ _ _ = panic "chooseReturnBndrs"
 cgAlts :: (GcPlan,ReturnKind) -> NonVoid Id -> AltType -> [CgStgAlt]
        -> FCode ReturnKind
 -- At this point the result of the case are in the binders
-cgAlts gc_plan _bndr PolyAlt [(_, _, rhs)]
-  = maybeAltHeapCheck gc_plan (cgExpr rhs)
+cgAlts gc_plan _bndr PolyAlt [alt]
+  = maybeAltHeapCheck gc_plan (cgExpr $ alt_rhs alt)
 
-cgAlts gc_plan _bndr (MultiValAlt _) [(_, _, rhs)]
-  = maybeAltHeapCheck gc_plan (cgExpr rhs)
+cgAlts gc_plan _bndr (MultiValAlt _) [alt]
+  = maybeAltHeapCheck gc_plan (cgExpr $ alt_rhs alt)
         -- Here bndrs are *already* in scope, so don't rebind them
 
 cgAlts gc_plan bndr (PrimAlt _) alts
@@ -564,18 +691,17 @@ cgAlts gc_plan bndr (PrimAlt _) alts
         ; return AssignedDirectly }
 
 cgAlts gc_plan bndr (AlgAlt tycon) alts
-  = do  { dflags <- getDynFlags
-        ; platform <- getPlatform
+  = do  { platform <- getPlatform
 
         ; (mb_deflt, branches) <- cgAlgAltRhss gc_plan bndr alts
 
         ; let !fam_sz   = tyConFamilySize tycon
               !bndr_reg = CmmLocal (idToReg platform bndr)
-              !ptag_expr = cmmConstrTag1 dflags (CmmReg bndr_reg)
+              !ptag_expr = cmmConstrTag1 platform (CmmReg bndr_reg)
               !branches' = first succ <$> branches
-              !maxpt = mAX_PTR_TAG dflags
+              !maxpt = mAX_PTR_TAG platform
               (!via_ptr, !via_info) = partition ((< maxpt) . fst) branches'
-              !small = isSmallFamily dflags fam_sz
+              !small = isSmallFamily platform fam_sz
 
                 -- Is the constructor tag in the node reg?
                 -- See Note [Tagging big families]
@@ -587,8 +713,10 @@ cgAlts gc_plan bndr (AlgAlt tycon) alts
            else -- No, the get exact tag from info table when mAX_PTR_TAG
                 -- See Note [Double switching for big families]
               do
-                let !untagged_ptr = cmmUntag dflags (CmmReg bndr_reg)
-                    !itag_expr = getConstrTag dflags untagged_ptr
+                profile     <- getProfile
+                align_check <- stgToCmmAlignCheck <$> getStgToCmmConfig
+                let !untagged_ptr = cmmUntag platform (CmmReg bndr_reg)
+                    !itag_expr = getConstrTag profile align_check untagged_ptr
                     !info0 = first pred <$> via_info
                 if null via_ptr then
                   emitSwitch itag_expr info0 mb_deflt 0 (fam_sz - 1)
@@ -778,10 +906,10 @@ cgAlts _ _ _ _ = panic "cgAlts"
 -- tricky part is that the default case needs (logical) duplication.
 -- To do this we emit an extra label for it and branch to that from
 -- the second switch. This avoids duplicated codegen. See Trac #14373.
--- See note [Double switching for big families] for the mechanics
+-- See Note [Double switching for big families] for the mechanics
 -- involved.
 --
--- Also see note [Data constructor dynamic tags]
+-- Also see Note [Data constructor dynamic tags]
 -- and the wiki https://gitlab.haskell.org/ghc/ghc/wikis/commentary/rts/haskell-execution/pointer-tagging
 --
 
@@ -813,7 +941,7 @@ cgAltRhss gc_plan bndr alts = do
   let
     base_reg = idToReg platform bndr
     cg_alt :: CgStgAlt -> FCode (AltCon, CmmAGraphScoped)
-    cg_alt (con, bndrs, rhs)
+    cg_alt GenStgAlt{alt_con=con, alt_bndrs=bndrs, alt_rhs=rhs}
       = getCodeScoped             $
         maybeAltHeapCheck gc_plan $
         do { _ <- bindConArgs con base_reg (assertNonVoidIds bndrs)
@@ -834,16 +962,17 @@ maybeAltHeapCheck (GcInAlts regs, ReturnedTo lret off) code =
 --      Tail calls
 -----------------------------------------------------------------------------
 
-cgConApp :: DataCon -> [StgArg] -> FCode ReturnKind
-cgConApp con stg_args
-  | isUnboxedTupleCon con       -- Unboxed tuple: assign and return
+cgConApp :: DataCon -> ConstructorNumber -> [StgArg] -> FCode ReturnKind
+cgConApp con mn stg_args
+  | isUnboxedTupleDataCon con       -- Unboxed tuple: assign and return
   = do { arg_exprs <- getNonVoidArgAmodes stg_args
        ; tickyUnboxedTupleReturn (length arg_exprs)
        ; emitReturn arg_exprs }
 
   | otherwise   --  Boxed constructors; allocate and return
-  = ASSERT2( stg_args `lengthIs` countConRepArgs con, ppr con <> parens (ppr (countConRepArgs con)) <+> ppr stg_args )
-    do  { (idinfo, fcode_init) <- buildDynCon (dataConWorkId con) False
+  = assertPpr (stg_args `lengthIs` countConRepArgs con)
+              (ppr con <> parens (ppr (countConRepArgs con)) <+> ppr stg_args) $
+    do  { (idinfo, fcode_init) <- buildDynCon (dataConWorkId con) mn False
                                      currentCCS con (assertNonVoidStgArgs stg_args)
                                      -- con args are always non-void,
                                      -- see Note [Post-unarisation invariants] in GHC.Stg.Unarise
@@ -857,24 +986,43 @@ cgConApp con stg_args
 
 cgIdApp :: Id -> [StgArg] -> FCode ReturnKind
 cgIdApp fun_id args = do
-    dflags         <- getDynFlags
+    platform       <- getPlatform
     fun_info       <- getCgIdInfo fun_id
-    self_loop_info <- getSelfLoop
-    let fun_arg     = StgVarArg fun_id
-        fun_name    = idName    fun_id
-        fun         = idInfoToAmode fun_info
-        lf_info     = cg_lf         fun_info
-        n_args      = length args
-        v_args      = length $ filter (isVoidTy . stgArgType) args
-        node_points dflags = nodeMustPointToIt dflags lf_info
-    case getCallMethod dflags fun_name fun_id lf_info n_args v_args (cg_loc fun_info) self_loop_info of
+    cfg            <- getStgToCmmConfig
+    self_loop      <- getSelfLoop
+    let profile        = stgToCmmProfile  cfg
+        fun_arg        = StgVarArg fun_id
+        fun_name       = idName    fun_id
+        fun            = idInfoToAmode fun_info
+        lf_info        = cg_lf         fun_info
+        n_args         = length args
+        v_args         = length $ filter (isZeroBitTy . stgArgType) args
+    case getCallMethod cfg fun_name fun_id lf_info n_args v_args (cg_loc fun_info) self_loop of
             -- A value in WHNF, so we can just return it.
         ReturnIt
-          | isVoidTy (idType fun_id) -> emitReturn []
+          | isZeroBitTy (idType fun_id) -> emitReturn []
           | otherwise                -> emitReturn [fun]
-          -- ToDo: does ReturnIt guarantee tagged?
 
-        EnterIt -> ASSERT( null args )  -- Discarding arguments
+        -- A value infered to be in WHNF, so we can just return it.
+        InferedReturnIt
+          | isZeroBitTy (idType fun_id) -> trace >> emitReturn []
+          | otherwise                   -> trace >> assertTag >>
+                                                    emitReturn [fun]
+            where
+              trace = do
+                tickyTagged
+                use_id <- newUnique
+                _lbl <- emitTickyCounterTag use_id (NonVoid fun_id)
+                tickyTagSkip use_id fun_id
+
+                -- pprTraceM "WHNF:" (ppr fun_id <+> ppr args )
+              assertTag = whenCheckTags $ do
+                  mod <- getModuleName
+                  emitTagAssertion (showPprUnsafe
+                      (text "TagCheck failed on entry in" <+> ppr mod <+> text "- value:" <> ppr fun_id <+> pprExpr platform fun))
+                      fun
+
+        EnterIt -> assert (null args) $  -- Discarding arguments
                    emitEnter fun
 
         SlowCall -> do      -- A slow function call via the RTS apply routines
@@ -885,7 +1033,7 @@ cgIdApp fun_id args = do
         -- A direct function call (possibly with some left-over arguments)
         DirectEntry lbl arity -> do
                 { tickyDirectCall arity args
-                ; if node_points dflags
+                ; if nodeMustPointToIt profile lf_info
                      then directCall NativeNodeCall   lbl arity (fun_arg:args)
                      else directCall NativeDirectCall lbl arity args }
 
@@ -945,7 +1093,7 @@ cgIdApp fun_id args = do
 -- Implementation is spread across a couple of places in the code:
 --
 --   * FCode monad stores additional information in its reader environment
---     (cgd_self_loop field). This information tells us which function can
+--     (stgToCmmSelfLoop field). This information tells us which function can
 --     tail call itself in an optimized way (it is the function currently
 --     being compiled), what is the label of a loop header (L1 in example above)
 --     and information about local registers in which we should arguments
@@ -978,7 +1126,7 @@ cgIdApp fun_id args = do
 --     command-line option.
 --
 --   * Command line option to turn loopification on and off is implemented in
---     DynFlags.
+--     DynFlags, then passed to StgToCmmConfig for this phase.
 --
 --
 -- Note [Void arguments in self-recursive tail calls]
@@ -1006,11 +1154,12 @@ cgIdApp fun_id args = do
 
 emitEnter :: CmmExpr -> FCode ReturnKind
 emitEnter fun = do
-  { dflags <- getDynFlags
-  ; platform <- getPlatform
+  { platform <- getPlatform
+  ; profile  <- getProfile
   ; adjustHpBackwards
-  ; sequel <- getSequel
-  ; updfr_off <- getUpdFrameOff
+  ; sequel      <- getSequel
+  ; updfr_off   <- getUpdFrameOff
+  ; align_check <- stgToCmmAlignCheck <$> getStgToCmmConfig
   ; case sequel of
       -- For a return, we have the option of generating a tag-test or
       -- not.  If the value is tagged, we can return directly, which
@@ -1021,9 +1170,11 @@ emitEnter fun = do
       -- Right now, we do what the old codegen did, and omit the tag
       -- test, just generating an enter.
       Return -> do
-        { let entry = entryCode platform $ closureInfoPtr dflags $ CmmReg nodeReg
-        ; emit $ mkJump dflags NativeNodeCall entry
-                        [cmmUntag dflags fun] updfr_off
+        { let entry = entryCode platform
+                $ closureInfoPtr platform align_check
+                $ CmmReg nodeReg
+        ; emit $ mkJump profile NativeNodeCall entry
+                        [cmmUntag platform fun] updfr_off
         ; return AssignedDirectly
         }
 
@@ -1053,22 +1204,23 @@ emitEnter fun = do
       -- code in the enclosing case expression.
       --
       AssignTo res_regs _ -> do
-       { lret <- newBlockId
-       ; let (off, _, copyin) = copyInOflow dflags NativeReturn (Young lret) res_regs []
+       { lret  <- newBlockId
        ; lcall <- newBlockId
-       ; updfr_off <- getUpdFrameOff
+       ; updfr_off   <- getUpdFrameOff
+       ; align_check <- stgToCmmAlignCheck <$> getStgToCmmConfig
+       ; let (off, _, copyin) = copyInOflow profile NativeReturn (Young lret) res_regs []
        ; let area = Young lret
-       ; let (outArgs, regs, copyout) = copyOutOflow dflags NativeNodeCall Call area
+       ; let (outArgs, regs, copyout) = copyOutOflow profile NativeNodeCall Call area
                                           [fun] updfr_off []
          -- refer to fun via nodeReg after the copyout, to avoid having
          -- both live simultaneously; this sometimes enables fun to be
          -- inlined in the RHS of the R1 assignment.
-       ; let entry = entryCode platform (closureInfoPtr dflags (CmmReg nodeReg))
+       ; let entry = entryCode platform (closureInfoPtr platform align_check (CmmReg nodeReg))
              the_call = toCall entry (Just lret) updfr_off off outArgs regs
        ; tscope <- getTickScope
        ; emit $
            copyout <*>
-           mkCbranch (cmmIsTagged dflags (CmmReg nodeReg))
+           mkCbranch (cmmIsTagged platform (CmmReg nodeReg))
                      lret lcall Nothing <*>
            outOfLine lcall (the_call,tscope) <*>
            mkLabel lret tscope <*>
@@ -1084,7 +1236,7 @@ emitEnter fun = do
 -- | Generate Cmm code for a tick. Depending on the type of Tickish,
 -- this will either generate actual Cmm instrumentation code, or
 -- simply pass on the annotation as a @CmmTickish@.
-cgTick :: Tickish Id -> FCode ()
+cgTick :: StgTickish -> FCode ()
 cgTick tick
   = do { platform <- getPlatform
        ; case tick of

@@ -38,6 +38,13 @@ given compilation phase:
 
     Use ⟨cmd⟩ as the C compiler.
 
+.. ghc-flag:: -pgmcxx ⟨cmd⟩
+    :shortdesc: Use ⟨cmd⟩ as the C++ compiler
+    :type: dynamic
+    :category: phase-programs
+
+    Use ⟨cmd⟩ as the C++ compiler.
+
 .. ghc-flag:: -pgmlo ⟨cmd⟩
     :shortdesc: Use ⟨cmd⟩ as the LLVM optimiser
     :type: dynamic
@@ -181,16 +188,26 @@ the following flags:
     Pass ⟨option⟩ to the C compiler.
 
 .. ghc-flag:: -pgmc-supports-no-pie
-    :shortdesc: Indicate that the C compiler supports ``-no-pie``
+    :shortdesc: *(deprecated)*
+        Indicate that the linker supports ``-no-pie``
     :type: dynamic
     :category: phase-options
 
-    When ``-pgmc`` is used, GHC by default will never pass the ``-no-pie``
-    command line flag. The rationale is that it is not known whether the
-    specified compiler will support it. This flag can be used to indicate
-    that ``-no-pie`` is supported. It has to be passed after ``-pgmc``.
+    Does the same thing as ``-pgml-supports-no-pie``, which replaced it.
 
-    This flag is not neccessary when ``-pgmc`` is not used, since GHC
+.. ghc-flag:: -pgml-supports-no-pie
+    :shortdesc: Indicate that the linker supports ``-no-pie``
+    :type: dynamic
+    :category: phase-options
+
+    When ``-pgml`` is used, GHC by default will never pass the ``-no-pie``
+    command line flag. The rationale is that it is not known whether the
+    specified compiler used for linking (recall we use a C compiler to
+    invoke the linker on our behalf) will support it. This flag can be
+    used to indicate that ``-no-pie`` is supported. It has to be passed
+    after ``-pgml``.
+
+    This flag is not necessary when ``-pgmc`` is not used, since GHC
     remembers whether the default C compiler supports ``-no-pie`` in
     an internal settings file.
 
@@ -457,7 +474,7 @@ defined by your local GHC installation, the following trick is useful:
     .. index::
        single: __GLASGOW_HASKELL_LLVM__
 
-    Only defined when ``-fllvm`` is specified. When GHC is using version
+    Only defined when `:ghc-flag:`-fllvm` is specified. When GHC is using version
     ``x.y.z`` of LLVM, the value of ``__GLASGOW_HASKELL_LLVM__`` is the
     integer ⟨xyy⟩ (if ⟨y⟩ is a single digit, then a leading zero
     is added, so for example when using version 3.7 of LLVM,
@@ -604,8 +621,8 @@ Options affecting code generation
 
     .. note::
 
-        Note that this GHC release expects an LLVM version in the |llvm-version|
-        release series.
+        Note that this GHC release expects an LLVM version between |llvm-version-min|
+        and |llvm-version-max|.
 
 .. ghc-flag:: -fno-code
     :shortdesc: Omit code generation
@@ -707,6 +724,35 @@ Options affecting code generation
     and ``-dynhisuf`` are the counterparts of ``-o``, ``-osuf``, and
     ``-hisuf`` respectively, but applying to the dynamic compilation.
 
+    ``-dynamic-too`` is ignored if :ghc-flag:`-dynamic` is also specified.
+
+.. ghc-flag:: -split-objs
+    :shortdesc: Split generated object files into smaller files
+    :type: dynamic
+    :category: codegen
+
+    When using this option, the object file is split into many smaller objects.
+    This feature is used when building libraries, so that a program statically
+    linked against the library will pull in less of the library.
+
+    Since this uses platform specific techniques, it may not be available on
+    all target platforms. See the :ghc-flag:`--print-object-splitting-supported`
+    flag to check whether your GHC supports object splitting.
+
+.. ghc-flag:: -fexpose-internal-symbols
+    :shortdesc: Produce symbols for all functions, including internal functions.
+    :type: dynamic
+    :category: codegen
+
+    Request that GHC emits verbose symbol tables which include local symbols
+    for module-internal functions. These can be useful for tools like
+    `perf <https://perf.wiki.kernel.org/>`__ but increase object file sizes.
+    This is implied by :ghc-flag:`-g2 <-g>` and above.
+
+    :ghc-flag:`-fno-expose-internal-symbols <-fexpose-internal-symbols>`
+    suppresses all non-global symbol table entries, resulting in smaller object
+    file sizes at the expense of debuggability.
+
 .. _options-linker:
 
 Options affecting linking
@@ -741,6 +787,13 @@ for example).
 
     You can use an external main function if you initialize the RTS manually
     and pass ``-no-hs-main``. See also :ref:`using-own-main`.
+
+.. ghc-flag:: -no-link
+    :shortdesc: Stop after generating object (``.o``) file
+    :type: mode
+    :category: linking
+
+    Omits the link step.
 
 .. ghc-flag:: -c
     :shortdesc: Stop after generating object (``.o``) file
@@ -801,7 +854,6 @@ for example).
     :shortdesc: Set the rpath based on -L flags
     :type: dynamic
     :category: linking
-    :reverse: -fno-use-rpaths
 
     This flag is enabled by default and will set the rpath of the linked
     object to the library directories of dependent packages.
@@ -850,8 +902,8 @@ for example).
 
     This flag tells GHC to link against shared Haskell libraries. This
     flag only affects the selection of dependent libraries, not the form
-    of the current target (see -shared). See :ref:`using-shared-libs` on
-    how to create them.
+    of the current target (see :ghc-flag:`-shared`).
+    See :ref:`using-shared-libs` on how to create them.
 
     Note that this option also has an effect on code generation (see
     above).
@@ -1015,14 +1067,16 @@ for example).
     :type: dynamic
     :category: linking
 
+    :since: Unconditionally enabled with 9.4 and later
+
     Link the program with the "eventlog" version of the runtime system.
     A program linked in this way can generate a runtime trace of events
     (such as thread start/stop) to a binary file :file:`{program}.eventlog`,
     which can then be interpreted later by various tools. See
     :ref:`rts-eventlog` for more information.
 
-    :ghc-flag:`-eventlog` can be used with :ghc-flag:`-threaded`. It is implied by
-    :ghc-flag:`-debug`.
+    Note that as of GHC 9.4 and later eventlog support is included in
+    the RTS by default and the :ghc-flag:`-eventlog` is deprecated.
 
 .. ghc-flag:: -rtsopts[=⟨none|some|all|ignore|ignoreAll⟩]
     :shortdesc: Control whether the RTS behaviour can be tweaked via command-line
@@ -1042,7 +1096,7 @@ for example).
 
     This option affects the processing of RTS control options given
     either on the command line or via the :envvar:`GHCRTS` environment
-    variable. There are three possibilities:
+    variable. There are five possibilities:
 
     ``-rtsopts=none``
         Disable all processing of RTS options. If ``+RTS`` appears
@@ -1240,6 +1294,7 @@ for example).
 .. ghc-flag:: -pie
     :shortdesc: Instruct the linker to produce a position-independent executable.
     :type: dynamic
+    :reverse: -no-pie
     :category: linking
 
     :since: 8.2.2
@@ -1261,6 +1316,15 @@ for example).
     Also, you may need to use the :ghc-flag:`-rdynamic` flag to ensure that
     that symbols are not dropped from your PIE objects.
 
+.. ghc-flag:: -no-pie
+    :shortdesc: Don't instruct the linker to produce a position-independent executable.
+    :type: dynamic
+    :reverse: -pie
+    :category: linking
+
+    If required, the C compiler will still produce a PIE. Otherwise, this is the default.
+    Refer to -pie for more information about PIEs.
+
 .. ghc-flag:: -fkeep-cafs
     :shortdesc: Do not garbage-collect CAFs (top-level expressions) at runtime
     :type: dynamic
@@ -1274,3 +1338,19 @@ for example).
     that do runtime dynamic linking, where code dynamically linked in
     the future might require the value of a CAF that would otherwise
     be garbage-collected.
+
+.. ghc-flag:: -fcompact-unwind
+    :shortdesc: Instruct the linker to produce a `__compact_unwind` section.
+    :type: dynamic
+    :category: linking
+
+    :default: on
+
+    :since: 9.4.1
+
+    This instructs the linker to produce an executable that supports Apple's
+    compact unwinding sections. These are used by C++ and Objective-C code
+    to unwind the stack when an exception occurs.
+
+    In theory, the older `__eh_frame` section should also be usable for this
+    purpose, but this does not always work.

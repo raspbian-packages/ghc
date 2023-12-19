@@ -42,8 +42,9 @@ module Language.Haskell.TH.Lib (
     -- *** Expressions
         dyn, varE, unboundVarE, labelE, implicitParamVarE, conE, litE, staticE,
         appE, appTypeE, uInfixE, parensE, infixE, infixApp, sectionL, sectionR,
-        lamE, lam1E, lamCaseE, tupE, unboxedTupE, unboxedSumE, condE, multiIfE,
-        letE, caseE, appsE, listE, sigE, recConE, recUpdE, stringE, fieldExp,
+        lamE, lam1E, lamCaseE, lamCasesE, tupE, unboxedTupE, unboxedSumE, condE,
+        multiIfE, letE, caseE, appsE, listE, sigE, recConE, recUpdE, stringE,
+        fieldExp, getFieldE, projectionE,
     -- **** Ranges
     fromE, fromThenE, fromToE, fromThenToE,
 
@@ -55,13 +56,13 @@ module Language.Haskell.TH.Lib (
     bindS, letS, noBindS, parS, recS,
 
     -- *** Types
-        forallT, forallVisT, varT, conT, appT, appKindT, arrowT, infixT,
-        mulArrowT,
-        uInfixT, parensT, equalityT, listT, tupleT, unboxedTupleT, unboxedSumT,
+        forallT, forallVisT, varT, conT, appT, appKindT, arrowT, mulArrowT,
+        infixT, uInfixT, promotedInfixT, promotedUInfixT,
+        parensT, equalityT, listT, tupleT, unboxedTupleT, unboxedSumT,
         sigT, litT, wildCardT, promotedT, promotedTupleT, promotedNilT,
         promotedConsT, implicitParamT,
     -- **** Type literals
-    numTyLit, strTyLit,
+    numTyLit, strTyLit, charTyLit,
     -- **** Strictness
     noSourceUnpackedness, sourceNoUnpack, sourceUnpack,
     noSourceStrictness, sourceLazy, sourceStrict,
@@ -103,6 +104,9 @@ module Language.Haskell.TH.Lib (
     -- **** Fixity
     infixLD, infixRD, infixND,
 
+    -- **** Default declaration
+    defaultD,
+
     -- **** Foreign Function Interface (FFI)
     cCall, stdCall, cApi, prim, javaScript,
     unsafe, safe, interruptible, forImpD,
@@ -124,7 +128,11 @@ module Language.Haskell.TH.Lib (
     implicitParamBindD,
 
     -- ** Reify
-    thisModule
+    thisModule,
+
+    -- ** Documentation
+    withDecDoc, withDecsDoc, funD_doc, dataD_doc, newtypeD_doc, dataInstD_doc,
+    newtypeInstD_doc, patSynD_doc
 
    ) where
 
@@ -161,6 +169,8 @@ import Language.Haskell.TH.Lib.Internal hiding
   , mdoE
   , tupE
   , unboxedTupE
+
+  , conP
 
   , Role
   , InjectivityAnn
@@ -349,3 +359,9 @@ doE = Internal.doE Nothing
 
 mdoE :: Quote m => [m Stmt] -> m Exp
 mdoE = Internal.mdoE Nothing
+
+-------------------------------------------------------------------------------
+-- * Patterns
+
+conP :: Quote m => Name -> [m Pat] -> m Pat
+conP n xs = Internal.conP n [] xs

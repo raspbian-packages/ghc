@@ -1,3 +1,5 @@
+{-# LANGUAGE DerivingStrategies #-}
+
 {-
 
 Describes predicates as they are considered by the solver.
@@ -24,9 +26,12 @@ module GHC.Core.Predicate (
 
   -- Implicit parameters
   isIPLikePred, hasIPSuperClasses, isIPTyCon, isIPClass,
+  isCallStackTy, isCallStackPred, isCallStackPredTy,
+  isIPPred_maybe,
 
   -- Evidence variables
   DictId, isEvVar, isDictId
+
   ) where
 
 import GHC.Prelude
@@ -34,24 +39,38 @@ import GHC.Prelude
 import GHC.Core.Type
 import GHC.Core.Class
 import GHC.Core.TyCon
+import GHC.Core.TyCon.RecWalk
 import GHC.Types.Var
 import GHC.Core.Coercion
+import GHC.Core.Multiplicity ( scaledThing )
 
 import GHC.Builtin.Names
 
 import GHC.Utils.Outputable
 import GHC.Utils.Misc
-import GHC.Core.Multiplicity ( scaledThing )
+import GHC.Utils.Panic
+import GHC.Data.FastString
 
+import Control.Monad ( guard )
 
 -- | A predicate in the solver. The solver tries to prove Wanted predicates
 -- from Given ones.
 data Pred
+
+  -- | A typeclass predicate.
   = ClassPred Class [Type]
+
+  -- | A type equality predicate.
   | EqPred EqRel Type Type
+
+  -- | An irreducible predicate.
   | IrredPred PredType
+
+  -- | A quantified predicate.
+  --
+  -- See Note [Quantified constraints] in GHC.Tc.Solver.Canonical
   | ForAllPred [TyVar] [PredType] PredType
-     -- ForAllPred: see Note [Quantified constraints] in GHC.Tc.Solver.Canonical
+
   -- NB: There is no TuplePred case
   --     Tuple predicates like (Eq a, Ord b) are just treated
   --     as ClassPred, as if we had a tuple class with two superclasses
@@ -67,7 +86,7 @@ classifyPredType ev_ty = case splitTyConApp_maybe ev_ty of
       | Just clas <- tyConClass_maybe tc
       -> ClassPred clas tys
 
-    _ | (tvs, rho) <- splitForAllTys ev_ty
+    _ | (tvs, rho) <- splitForAllTyCoVars ev_ty
       , (theta, pred) <- splitFunTys rho
       , not (null tvs && null theta)
       -> ForAllPred tvs (map scaledThing theta) pred
@@ -255,6 +274,48 @@ has_ip_super_classes rec_clss cls tys
 initIPRecTc :: RecTcChecker
 initIPRecTc = setRecTcMaxBound 1 initRecTc
 
+-- --------------------- CallStack predicates ---------------------------------
+
+isCallStackPredTy :: Type -> Bool
+-- True of HasCallStack, or IP "blah" CallStack
+isCallStackPredTy ty
+  | Just (tc, tys) <- splitTyConApp_maybe ty
+  , Just cls <- tyConClass_maybe tc
+  , Just {} <- isCallStackPred cls tys
+  = True
+  | otherwise
+  = False
+
+-- | Is a 'PredType' a 'CallStack' implicit parameter?
+--
+-- If so, return the name of the parameter.
+isCallStackPred :: Class -> [Type] -> Maybe FastString
+isCallStackPred cls tys
+  | [ty1, ty2] <- tys
+  , isIPClass cls
+  , isCallStackTy ty2
+  = isStrLitTy ty1
+  | otherwise
+  = Nothing
+
+-- | Is a type a 'CallStack'?
+isCallStackTy :: Type -> Bool
+isCallStackTy ty
+  | Just tc <- tyConAppTyCon_maybe ty
+  = tc `hasKey` callStackTyConKey
+  | otherwise
+  = False
+
+
+-- | Decomposes a predicate if it is an implicit parameter. Does not look in
+-- superclasses. See also [Local implicit parameters].
+isIPPred_maybe :: Type -> Maybe (FastString, Type)
+isIPPred_maybe ty =
+  do (tc,[t1,t2]) <- splitTyConApp_maybe ty
+     guard (isIPTyCon tc)
+     x <- isStrLitTy t1
+     return (x,t2)
+
 {- Note [Local implicit parameters]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 The function isIPLikePred tells if this predicate, or any of its
@@ -284,7 +345,7 @@ Several wrinkles
   instantiate and check each superclass, one by one, in
   hasIPSuperClasses.
 
-* With -XRecursiveSuperClasses, the superclass hunt can go on forever,
+* With -XUndecidableSuperClasses, the superclass hunt can go on forever,
   so we need a RecTcChecker to cut it off.
 
 * Another apparent additional complexity involves type families. For

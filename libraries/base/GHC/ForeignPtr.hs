@@ -1,11 +1,10 @@
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE NoImplicitPrelude #-}
+{-# LANGUAGE UnboxedTuples #-}
 {-# LANGUAGE Unsafe #-}
-{-# LANGUAGE NoImplicitPrelude
-           , BangPatterns
-           , MagicHash
-           , UnboxedTuples
-  #-}
+
 {-# OPTIONS_HADDOCK not-home #-}
-{-# LANGUAGE StandaloneDeriving #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -65,7 +64,7 @@ import GHC.IORef
 import GHC.STRef        ( STRef(..) )
 import GHC.Ptr          ( Ptr(..), FunPtr(..) )
 
-import Unsafe.Coerce    ( unsafeCoerce, unsafeCoerceUnlifted )
+import Unsafe.Coerce    ( unsafeCoerce )
 
 -- |The type 'ForeignPtr' represents references to objects that are
 -- maintained in a foreign language, i.e., that are not part of the
@@ -138,7 +137,7 @@ data ForeignPtrContents
     -- reachable (by GC) whenever the 'ForeignPtr' is reachable. When the
     -- 'ForeignPtr' becomes unreachable, the runtime\'s normal GC recovers
     -- the memory backing it. Here, the finalizer function intended to be used
-    -- to @free()@ any ancilliary *unmanaged* memory pointed to by the
+    -- to @free()@ any ancillary *unmanaged* memory pointed to by the
     -- 'MutableByteArray#'. See the @zlib@ library for an example of this use.
     --
     -- 1. Invariant: The 'Addr#' in the parent 'ForeignPtr' is an interior
@@ -166,7 +165,7 @@ data ForeignPtrContents
     -- The invariants that apply to 'MallocPtr' apply to 'PlainPtr' as well.
 
 -- Note [Why FinalPtr]
---
+-- ~~~~~~~~~~~~~~~~~~~
 -- FinalPtr exists as an optimization for foreign pointers created
 -- from Addr# literals. Most commonly, this happens in the bytestring
 -- library, where the combination of OverloadedStrings and a rewrite
@@ -283,7 +282,7 @@ mallocForeignPtr = doMalloc undefined
           r <- newIORef NoFinalizers
           IO $ \s ->
             case newAlignedPinnedByteArray# size align s of { (# s', mbarr# #) ->
-             (# s', ForeignPtr (byteArrayContents# (unsafeCoerceUnlifted mbarr#))
+             (# s', ForeignPtr (mutableByteArrayContents# mbarr#)
                                (MallocPtr mbarr# r) #)
             }
             where !(I# size)  = sizeOf a
@@ -298,7 +297,7 @@ mallocForeignPtrBytes (I# size) = do
   r <- newIORef NoFinalizers
   IO $ \s ->
      case newPinnedByteArray# size s      of { (# s', mbarr# #) ->
-       (# s', ForeignPtr (byteArrayContents# (unsafeCoerceUnlifted mbarr#))
+       (# s', ForeignPtr (mutableByteArrayContents# mbarr#)
                          (MallocPtr mbarr# r) #)
      }
 
@@ -312,7 +311,7 @@ mallocForeignPtrAlignedBytes (I# size) (I# align) = do
   r <- newIORef NoFinalizers
   IO $ \s ->
      case newAlignedPinnedByteArray# size align s of { (# s', mbarr# #) ->
-       (# s', ForeignPtr (byteArrayContents# (unsafeCoerceUnlifted mbarr#))
+       (# s', ForeignPtr (mutableByteArrayContents# mbarr#)
                          (MallocPtr mbarr# r) #)
      }
 
@@ -336,7 +335,7 @@ mallocPlainForeignPtr = doMalloc undefined
           | I# size < 0 = errorWithoutStackTrace "mallocForeignPtr: size must be >= 0"
           | otherwise = IO $ \s ->
             case newAlignedPinnedByteArray# size align s of { (# s', mbarr# #) ->
-             (# s', ForeignPtr (byteArrayContents# (unsafeCoerceUnlifted mbarr#))
+             (# s', ForeignPtr (mutableByteArrayContents# mbarr#)
                                (PlainPtr mbarr#) #)
             }
             where !(I# size)  = sizeOf a
@@ -351,7 +350,7 @@ mallocPlainForeignPtrBytes size | size < 0 =
   errorWithoutStackTrace "mallocPlainForeignPtrBytes: size must be >= 0"
 mallocPlainForeignPtrBytes (I# size) = IO $ \s ->
     case newPinnedByteArray# size s      of { (# s', mbarr# #) ->
-       (# s', ForeignPtr (byteArrayContents# (unsafeCoerceUnlifted mbarr#))
+       (# s', ForeignPtr (mutableByteArrayContents# mbarr#)
                          (PlainPtr mbarr#) #)
      }
 
@@ -364,7 +363,7 @@ mallocPlainForeignPtrAlignedBytes size _align | size < 0 =
   errorWithoutStackTrace "mallocPlainForeignPtrAlignedBytes: size must be >= 0"
 mallocPlainForeignPtrAlignedBytes (I# size) (I# align) = IO $ \s ->
     case newAlignedPinnedByteArray# size align s of { (# s', mbarr# #) ->
-       (# s', ForeignPtr (byteArrayContents# (unsafeCoerceUnlifted mbarr#))
+       (# s', ForeignPtr (mutableByteArrayContents# mbarr#)
                          (PlainPtr mbarr#) #)
      }
 
@@ -377,7 +376,9 @@ addForeignPtrFinalizer (FunPtr fp) (ForeignPtr p c) = case c of
   MallocPtr     _ r -> insertCFinalizer r fp 0# nullAddr# p c
   _ -> errorWithoutStackTrace "GHC.ForeignPtr: attempt to add a finalizer to a plain pointer or a final pointer"
 
--- Note [MallocPtr finalizers] (#10904)
+-- Note [MallocPtr finalizers]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- Ticket: #10904
 --
 -- When we have C finalizers for a MallocPtr, the memory is
 -- heap-resident and would normally be recovered by the GC before the

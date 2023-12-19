@@ -3,11 +3,11 @@
 Type-Level Literals
 ===================
 
-GHC supports numeric and string literals at the type level, giving
+GHC supports numeric, string, and character literals at the type level, giving
 convenient access to a large number of predefined type-level constants.
-Numeric literals are of kind ``Nat``, while string literals are of kind
-``Symbol``. This feature is enabled by the :extension:`DataKinds` language
-extension.
+Numeric literals are of kind ``Natural``, string literals are of kind ``Symbol``,
+and character literals are of kind ``Char``.
+This feature is enabled by the :extension:`DataKinds` language extension.
 
 The kinds of the literals and all other low-level operations for this
 feature are defined in modules ``GHC.TypeLits`` and ``GHC.TypeNats``.
@@ -23,10 +23,16 @@ safe interface to a low-level function: ::
     import Data.Word
     import Foreign
 
-    newtype ArrPtr (n :: Nat) a = ArrPtr (Ptr a)
+    newtype ArrPtr (n :: Natural) a = ArrPtr (Ptr a)
 
     clearPage :: ArrPtr 4096 Word8 -> IO ()
     clearPage (ArrPtr p) = ...
+
+Also type-level naturals could be promoted from the ``Natural`` data type
+using `DataKinds`, for example: ::
+
+    data Point = MkPoint Natural Natural
+    type MyCoordinates = MkPoint 95 101
 
 Here is an example of using type-level string literals to simulate
 simple record operations: ::
@@ -121,5 +127,3 @@ the type level:
 
     GHC.TypeLits> natVal (lg (Proxy :: Proxy 2) (Proxy :: Proxy 8))
     3
-
-

@@ -18,6 +18,11 @@ import ghczmprim_GHCziTypes_Izh_info;
 import AcquireSRWLockExclusive;
 import ReleaseSRWLockExclusive;
 
+#if defined(PROF_SPIN)
+import whitehole_lockClosure_spin;
+import whitehole_lockClosure_yield;
+#endif
+
 /* ----------------------------------------------------------------------------
    Stack underflow
    ------------------------------------------------------------------------- */
@@ -54,6 +59,10 @@ INFO_TABLE_RET (stg_restore_cccs, RET_SMALL, W_ info_ptr, W_ cccs)
     CCCS = Sp(1);
 #endif
     Sp_adj(2);
+
+    IF_DEBUG(sanity,
+      ccall checkStackFrame(Sp "ptr"));
+
     jump %ENTRY_CODE(Sp(0)) [*]; // NB. all registers live!
 }
 
@@ -110,24 +119,9 @@ stg_interp_constr7_entry (P_ ret) { return (ret + 7); }
 
    which is just what we want -- the "standard" return layout for the
    interpreter.  Hurrah!
-
-   Don't ask me how unboxed tuple returns are supposed to work.  We
-   haven't got a good story about that yet.
 */
 
 INFO_TABLE_RET( stg_ctoi_R1p, RET_BCO)
-    /* explicit stack */
-{
-    Sp_adj(-2);
-    Sp(1) = R1;
-    Sp(0) = stg_enter_info;
-    jump stg_yield_to_interpreter [];
-}
-
-/*
- * When the returned value is a pointer, but unlifted, in R1 ...
- */
-INFO_TABLE_RET( stg_ctoi_R1unpt, RET_BCO )
     /* explicit stack */
 {
     Sp_adj(-2);
@@ -193,6 +187,245 @@ INFO_TABLE_RET( stg_ctoi_V, RET_BCO )
     Sp_adj(-1);
     Sp(0) = stg_ret_v_info;
     jump stg_yield_to_interpreter [];
+}
+
+/*   Note [GHCi unboxed tuples stack spills]
+     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   In the calling convention for compiled code, a tuple is returned
+   in registers, with everything that doesn't fit spilled onto the STG
+   stack.
+
+   At the time the continuation is called, Sp points to the highest word
+   used on the stack:
+
+       ...
+       stg_ctoi_t  (next stack frame, continuation)
+       spilled_1
+       spilled_2
+       spilled_3   <- Sp
+
+   This makes it difficult to write a procedure that can handle tuples of
+   any size.
+
+   To get around this, we use a Cmm procedure that adjusts the stack pointer
+   to skip over the tuple:
+
+       ...
+       stg_ctoi_t3  (advances Sp by 3 words, then calls stg_ctoi_t)
+       spilled_1
+       spilled_2
+       spilled_3    <- Sp
+
+   When stg_ctoi_t is called, the stack looks like:
+
+       ...
+       tuple_BCO
+       tuple_info
+       cont_BCO     (continuation in bytecode)
+       stg_ctoi_t3  <- Sp
+       spilled_1
+       spilled_2
+       spilled_3
+
+   stg_ctoi_t then reads the tuple_info word to determine the registers
+   to save onto the stack and construct a call to tuple_BCO. Afterwards the
+   stack looks as follows:
+
+       ...
+       tuple_BCO
+       tuple_info
+       cont_BCO
+       stg_ctoi_t3
+       spilled_1
+       spilled_2
+       spilled_3
+       saved_R2
+       saved_R1
+       saved_D3
+       ...
+       tuple_BCO
+       stg_apply_interp <- Sp
+
+
+   tuple_BCO contains the bytecode instructions to return the tuple to
+   cont_BCO. The bitmap in tuple_BCO describes the contents of
+   the tuple to the storage manager.
+
+   At this point we can safely jump to the interpreter.
+
+ */
+
+#define MK_STG_CTOI_T(N) INFO_TABLE_RET( \
+  stg_ctoi_t ## N, RET_BCO ) \
+  { Sp_adj(N); jump stg_ctoi_t [*]; }
+
+MK_STG_CTOI_T(0)
+MK_STG_CTOI_T(1)
+MK_STG_CTOI_T(2)
+MK_STG_CTOI_T(3)
+MK_STG_CTOI_T(4)
+MK_STG_CTOI_T(5)
+MK_STG_CTOI_T(6)
+MK_STG_CTOI_T(7)
+MK_STG_CTOI_T(8)
+MK_STG_CTOI_T(9)
+
+MK_STG_CTOI_T(10)
+MK_STG_CTOI_T(11)
+MK_STG_CTOI_T(12)
+MK_STG_CTOI_T(13)
+MK_STG_CTOI_T(14)
+MK_STG_CTOI_T(15)
+MK_STG_CTOI_T(16)
+MK_STG_CTOI_T(17)
+MK_STG_CTOI_T(18)
+MK_STG_CTOI_T(19)
+
+MK_STG_CTOI_T(20)
+MK_STG_CTOI_T(21)
+MK_STG_CTOI_T(22)
+MK_STG_CTOI_T(23)
+MK_STG_CTOI_T(24)
+MK_STG_CTOI_T(25)
+MK_STG_CTOI_T(26)
+MK_STG_CTOI_T(27)
+MK_STG_CTOI_T(28)
+MK_STG_CTOI_T(29)
+
+MK_STG_CTOI_T(30)
+MK_STG_CTOI_T(31)
+MK_STG_CTOI_T(32)
+MK_STG_CTOI_T(33)
+MK_STG_CTOI_T(34)
+MK_STG_CTOI_T(35)
+MK_STG_CTOI_T(36)
+MK_STG_CTOI_T(37)
+MK_STG_CTOI_T(38)
+MK_STG_CTOI_T(39)
+
+MK_STG_CTOI_T(40)
+MK_STG_CTOI_T(41)
+MK_STG_CTOI_T(42)
+MK_STG_CTOI_T(43)
+MK_STG_CTOI_T(44)
+MK_STG_CTOI_T(45)
+MK_STG_CTOI_T(46)
+MK_STG_CTOI_T(47)
+MK_STG_CTOI_T(48)
+MK_STG_CTOI_T(49)
+
+MK_STG_CTOI_T(50)
+MK_STG_CTOI_T(51)
+MK_STG_CTOI_T(52)
+MK_STG_CTOI_T(53)
+MK_STG_CTOI_T(54)
+MK_STG_CTOI_T(55)
+MK_STG_CTOI_T(56)
+MK_STG_CTOI_T(57)
+MK_STG_CTOI_T(58)
+MK_STG_CTOI_T(59)
+
+MK_STG_CTOI_T(60)
+MK_STG_CTOI_T(61)
+MK_STG_CTOI_T(62)
+
+/*
+  Convert a tuple return value to be used in bytecode.
+
+  See Note [GHCi and native call registers] for information on how
+  values are moved between the stack and registers.
+ */
+
+stg_ctoi_t
+    /* explicit stack */
+{
+
+    W_ tuple_info, tuple_stack;
+    P_ tuple_BCO;
+
+    tuple_info = Sp(2); /* tuple information word */
+    tuple_BCO  = Sp(3); /* bytecode object that returns the tuple in
+                           the interpreter */
+
+#if defined(PROFILING)
+    CCCS = Sp(4);
+#endif
+
+    /* number of words spilled on stack */
+    tuple_stack  = (tuple_info >> 24) & 0xff;
+
+    Sp = Sp - WDS(tuple_stack);
+
+    PUSH_ARG_REGS(tuple_info);
+
+    /* jump to the BCO that will finish the return of the tuple */
+    Sp_adj(-3);
+    Sp(2) = tuple_info;
+    Sp(1) = tuple_BCO;
+    Sp(0) = stg_ret_t_info;
+
+    jump stg_yield_to_interpreter [];
+}
+
+INFO_TABLE_RET( stg_ret_t, RET_BCO )
+{
+    W_ tuple_info, tuple_stack;
+
+    tuple_info = Sp(2);
+    Sp_adj(3);
+
+    /* number of words spilled on stack */
+    tuple_stack  = (tuple_info >> 24) & 0xff;
+
+    POP_ARG_REGS(tuple_info);
+
+    /* Sp points to the topmost argument now */
+    jump %ENTRY_CODE(Sp(tuple_stack)) [*]; // NB. all registers live!
+}
+
+
+ /*
+
+    The stg_primcall frame is used by the bytecode interpreter to call
+    a Cmm function. The frame contains a call_info word that contains
+    a bitmap describing the register arguments.
+
+    When the target function is called, Sp points to the topmost stack
+    argument.
+
+       ...
+       next_stack_frame
+       arg_1
+       arg_2
+       ...
+       arg_n
+       target_funptr       (pointer to the function we're calling)
+       call_info           (describes the registers containing the arguments)
+       primcall_BCO        (contains bitmap describing pointers in args)
+       stg_primcall_info   <- Sp
+
+    See Note [GHCi and native call registers] for information on the call_info
+    word and how registers are moved between the stack and registers.
+
+ */
+
+INFO_TABLE_RET ( stg_primcall, RET_BCO )
+{
+    W_ args_info, prim_fun;
+
+    /* Sp(1) would be the BCO containing the stack description bitmap */
+    args_info = Sp(2);
+    prim_fun = Sp(3);
+
+    Sp_adj(4);
+
+    /* Sp points to the top of the register arguments now,
+       load them into actual registers */
+    POP_ARG_REGS(args_info);
+
+    /* Sp points to the topmost stack argument now */
+
+    jump prim_fun [*]; // NB. all registers live!
 }
 
 /*
@@ -573,6 +806,9 @@ INFO_TABLE_CONSTR(stg_MSG_BLACKHOLE,3,0,0,PRIM,"MSG_BLACKHOLE","MSG_BLACKHOLE")
 INFO_TABLE_CONSTR(stg_MSG_NULL,1,0,0,PRIM,"MSG_NULL","MSG_NULL")
 { foreign "C" barf("MSG_NULL object (%p) entered!", R1) never returns; }
 
+INFO_TABLE_CONSTR(stg_MSG_CLONE_STACK,3,0,0,PRIM,"MSG_CLONE_STACK","MSG_CLONE_STACK")
+{ foreign "C" barf("stg_MSG_CLONE_STACK object (%p) entered!", R1) never returns; }
+
 /* ----------------------------------------------------------------------------
    END_TSO_QUEUE
 
@@ -695,8 +931,8 @@ INFO_TABLE( stg_COMPACT_NFDATA_DIRTY, 0, 9, COMPACT_NFDATA, "COMPACT_NFDATA", "C
 { foreign "C" barf("COMPACT_NFDATA_DIRTY object (%p) entered!", R1) never returns; }
 
 /* ----------------------------------------------------------------------------
-   Note [CHARLIKE and INTLIKE closures.]
-
+   Note [CHARLIKE and INTLIKE closures]
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
    These are static representations of Chars and small Ints, so that
    we can remove dynamic Chars and Ints during garbage collection and
    replace them with references to the static objects.

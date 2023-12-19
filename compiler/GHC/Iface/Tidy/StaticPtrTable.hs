@@ -1,3 +1,5 @@
+{-# LANGUAGE ViewPatterns #-}
+
 -- | Code generation for the Static Pointer Table
 --
 -- (c) 2014 I/O Tweag
@@ -45,11 +47,12 @@
 -- > }
 --
 
-{-# LANGUAGE ViewPatterns, TupleSections #-}
 module GHC.Iface.Tidy.StaticPtrTable
-    ( sptCreateStaticBinds
-    , sptModuleInitCode
-    ) where
+  ( sptCreateStaticBinds
+  , sptModuleInitCode
+  , StaticPtrOpts (..)
+  )
+where
 
 {- Note [Grand plan for static forms]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -123,29 +126,36 @@ Here is a running example:
 -}
 
 import GHC.Prelude
+import GHC.Platform
 
-import GHC.Cmm.CLabel
 import GHC.Core
 import GHC.Core.Utils (collectMakeStaticArgs)
 import GHC.Core.DataCon
-import GHC.Driver.Session
-import GHC.Driver.Types
-import GHC.Types.Id
-import GHC.Core.Make (mkStringExprFSWith)
-import GHC.Unit.Module
-import GHC.Types.Name
-import GHC.Utils.Outputable as Outputable
-import GHC.Platform
-import GHC.Builtin.Names
-import GHC.Tc.Utils.Env (lookupGlobal)
+import GHC.Core.Make (mkStringExprFSWith,MkStringIds(..))
 import GHC.Core.Type
 
-import Control.Monad.Trans.Class (lift)
-import Control.Monad.Trans.State
-import Data.List
-import Data.Maybe
+import GHC.Cmm.CLabel
+
+import GHC.Unit.Module
+import GHC.Utils.Outputable as Outputable
+
+import GHC.Linker.Types
+
+import GHC.Types.Id
+import GHC.Types.ForeignStubs
+import GHC.Data.Maybe
+
+import Control.Monad.Trans.State.Strict
+import Data.List (intercalate)
 import GHC.Fingerprint
-import qualified GHC.LanguageExtensions as LangExt
+
+data StaticPtrOpts = StaticPtrOpts
+  { opt_platform                :: !Platform    -- ^ Target platform
+  , opt_gen_cstub               :: !Bool        -- ^ Generate CStub or not
+  , opt_mk_string               :: !MkStringIds -- ^ Ids for `unpackCString[Utf8]#`
+  , opt_static_ptr_info_datacon :: !DataCon          -- ^ `StaticPtrInfo` datacon
+  , opt_static_ptr_datacon      :: !DataCon          -- ^ `StaticPtr` datacon
+  }
 
 -- | Replaces all bindings of the form
 --
@@ -160,25 +170,19 @@ import qualified GHC.LanguageExtensions as LangExt
 --
 -- It also yields the C stub that inserts these bindings into the static
 -- pointer table.
-sptCreateStaticBinds :: HscEnv -> Module -> CoreProgram
-                     -> IO ([SptEntry], CoreProgram)
-sptCreateStaticBinds hsc_env this_mod binds
-    | not (xopt LangExt.StaticPointers dflags) =
-      return ([], binds)
-    | otherwise = do
-      -- Make sure the required interface files are loaded.
-      _ <- lookupGlobal hsc_env unpackCStringName
+sptCreateStaticBinds :: StaticPtrOpts -> Module -> CoreProgram -> IO ([SptEntry], Maybe CStub, CoreProgram)
+sptCreateStaticBinds opts this_mod binds = do
       (fps, binds') <- evalStateT (go [] [] binds) 0
-      return (fps, binds')
+      let cstub
+            | opt_gen_cstub opts = Just (sptModuleInitCode (opt_platform opts) this_mod fps)
+            | otherwise          = Nothing
+      return (fps, cstub, binds')
   where
     go fps bs xs = case xs of
       []        -> return (reverse fps, reverse bs)
       bnd : xs' -> do
         (fps', bnd') <- replaceStaticBind bnd
         go (reverse fps' ++ fps) (bnd' : bs) xs'
-
-    dflags = hsc_dflags hsc_env
-    platform = targetPlatform dflags
 
     -- Generates keys and replaces 'makeStatic' with 'StaticPtr'.
     --
@@ -205,23 +209,20 @@ sptCreateStaticBinds hsc_env this_mod binds
     mkStaticBind t srcLoc e = do
       i <- get
       put (i + 1)
-      staticPtrInfoDataCon <-
-        lift $ lookupDataConHscEnv staticPtrInfoDataConName
+      let staticPtrInfoDataCon = opt_static_ptr_info_datacon opts
       let fp@(Fingerprint w0 w1) = mkStaticPtrFingerprint i
-      info <- mkConApp staticPtrInfoDataCon <$>
-            (++[srcLoc]) <$>
-            mapM (mkStringExprFSWith (lift . lookupIdHscEnv))
-                 [ unitFS $ moduleUnit this_mod
-                 , moduleNameFS $ moduleName this_mod
-                 ]
+      let mk_string_fs = mkStringExprFSWith (opt_mk_string opts)
+      let info = mkConApp staticPtrInfoDataCon
+                  [ mk_string_fs $ unitFS $ moduleUnit this_mod
+                  , mk_string_fs $ moduleNameFS $ moduleName this_mod
+                  , srcLoc
+                  ]
 
-      -- The module interface of GHC.StaticPtr should be loaded at least
-      -- when looking up 'fromStatic' during type-checking.
-      staticPtrDataCon <- lift $ lookupDataConHscEnv staticPtrDataConName
+      let staticPtrDataCon = opt_static_ptr_datacon opts
       return (fp, mkConApp staticPtrDataCon
                                [ Type t
-                               , mkWord64LitWordRep platform w0
-                               , mkWord64LitWordRep platform w1
+                               , mkWord64LitWord64 w0
+                               , mkWord64LitWord64 w1
                                , info
                                , e ])
 
@@ -232,60 +233,41 @@ sptCreateStaticBinds hsc_env this_mod binds
         , show n
         ]
 
-    -- Choose either 'Word64#' or 'Word#' to represent the arguments of the
-    -- 'Fingerprint' data constructor.
-    mkWord64LitWordRep platform =
-      case platformWordSize platform of
-        PW4 -> mkWord64LitWord64
-        PW8 -> mkWordLit platform . toInteger
-
-    lookupIdHscEnv :: Name -> IO Id
-    lookupIdHscEnv n = lookupTypeHscEnv hsc_env n >>=
-                         maybe (getError n) (return . tyThingId)
-
-    lookupDataConHscEnv :: Name -> IO DataCon
-    lookupDataConHscEnv n = lookupTypeHscEnv hsc_env n >>=
-                              maybe (getError n) (return . tyThingDataCon)
-
-    getError n = pprPanic "sptCreateStaticBinds.get: not found" $
-      text "Couldn't find" <+> ppr n
-
 -- | @sptModuleInitCode module fps@ is a C stub to insert the static entries
 -- of @module@ into the static pointer table.
 --
 -- @fps@ is a list associating each binding corresponding to a static entry with
 -- its fingerprint.
-sptModuleInitCode :: Module -> [SptEntry] -> SDoc
-sptModuleInitCode _ [] = Outputable.empty
-sptModuleInitCode this_mod entries = vcat
-    [ text "static void hs_spt_init_" <> ppr this_mod
-           <> text "(void) __attribute__((constructor));"
-    , text "static void hs_spt_init_" <> ppr this_mod <> text "(void)"
-    , braces $ vcat $
+sptModuleInitCode :: Platform -> Module -> [SptEntry] -> CStub
+sptModuleInitCode _        _        [] = mempty
+sptModuleInitCode platform this_mod entries =
+    initializerCStub platform init_fn_nm empty init_fn_body `mappend`
+    finalizerCStub platform fini_fn_nm empty fini_fn_body
+  where
+    init_fn_nm = mkInitializerStubLabel this_mod "spt"
+    init_fn_body = vcat
         [  text "static StgWord64 k" <> int i <> text "[2] = "
            <> pprFingerprint fp <> semi
         $$ text "extern StgPtr "
-           <> (ppr $ mkClosureLabel (idName n) (idCafInfo n)) <> semi
+           <> (pdoc platform $ mkClosureLabel (idName n) (idCafInfo n)) <> semi
         $$ text "hs_spt_insert" <> parens
              (hcat $ punctuate comma
                 [ char 'k' <> int i
-                , char '&' <> ppr (mkClosureLabel (idName n) (idCafInfo n))
+                , char '&' <> pdoc platform (mkClosureLabel (idName n) (idCafInfo n))
                 ]
              )
         <> semi
         |  (i, SptEntry n fp) <- zip [0..] entries
         ]
-    , text "static void hs_spt_fini_" <> ppr this_mod
-           <> text "(void) __attribute__((destructor));"
-    , text "static void hs_spt_fini_" <> ppr this_mod <> text "(void)"
-    , braces $ vcat $
+
+    fini_fn_nm = mkFinalizerStubLabel this_mod "spt"
+    fini_fn_body = vcat
         [  text "StgWord64 k" <> int i <> text "[2] = "
            <> pprFingerprint fp <> semi
         $$ text "hs_spt_remove" <> parens (char 'k' <> int i) <> semi
         | (i, (SptEntry _ fp)) <- zip [0..] entries
         ]
-    ]
-  where
+
     pprFingerprint :: Fingerprint -> SDoc
     pprFingerprint (Fingerprint w1 w2) =
       braces $ hcat $ punctuate comma

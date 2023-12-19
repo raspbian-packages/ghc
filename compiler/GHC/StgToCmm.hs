@@ -1,6 +1,7 @@
-{-# LANGUAGE CPP #-}
+
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE LambdaCase #-}
 
 -----------------------------------------------------------------------------
 --
@@ -12,8 +13,6 @@
 
 module GHC.StgToCmm ( codeGen ) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude as Prelude
 
 import GHC.StgToCmm.Prof (initCostCentres, ldvEnter)
@@ -24,6 +23,7 @@ import GHC.StgToCmm.DataCon
 import GHC.StgToCmm.Layout
 import GHC.StgToCmm.Utils
 import GHC.StgToCmm.Closure
+import GHC.StgToCmm.Config
 import GHC.StgToCmm.Hpc
 import GHC.StgToCmm.Ticky
 import GHC.StgToCmm.Types (ModuleLFInfos)
@@ -31,74 +31,85 @@ import GHC.StgToCmm.Types (ModuleLFInfos)
 import GHC.Cmm
 import GHC.Cmm.Utils
 import GHC.Cmm.CLabel
+import GHC.Cmm.Graph
 
 import GHC.Stg.Syntax
-import GHC.Driver.Session
-import GHC.Utils.Error
 
-import GHC.Driver.Types
 import GHC.Types.CostCentre
+import GHC.Types.IPE
+import GHC.Types.HpcInfo
 import GHC.Types.Id
 import GHC.Types.Id.Info
 import GHC.Types.RepType
-import GHC.Core.DataCon
-import GHC.Core.TyCon
-import GHC.Core.Multiplicity
-import GHC.Unit.Module
-import GHC.Utils.Outputable
-import GHC.Data.Stream
 import GHC.Types.Basic
 import GHC.Types.Var.Set ( isEmptyDVarSet )
-import GHC.SysTools.FileCleanup
 import GHC.Types.Unique.FM
 import GHC.Types.Name.Env
 
-import GHC.Data.OrdList
-import GHC.Cmm.Graph
+import GHC.Core.DataCon
+import GHC.Core.TyCon
+import GHC.Core.Multiplicity
 
-import Data.IORef
-import Control.Monad (when,void)
+import GHC.Unit.Module
+
+import GHC.Utils.Error
+import GHC.Utils.Outputable
+import GHC.Utils.Panic.Plain
+import GHC.Utils.Logger
+
+import GHC.Utils.TmpFs
+
+import GHC.Data.Stream
+import GHC.Data.OrdList
+import GHC.Types.Unique.Map
+
+import Control.Monad (when,void, forM_)
 import GHC.Utils.Misc
 import System.IO.Unsafe
 import qualified Data.ByteString as BS
+import Data.IORef
+import GHC.Utils.Panic (assertPpr)
 
-codeGen :: DynFlags
-        -> Module
+codeGen :: Logger
+        -> TmpFs
+        -> StgToCmmConfig
+        -> InfoTableProvMap
         -> [TyCon]
         -> CollectedCCs                -- (Local/global) cost-centres needing declaring/registering.
         -> [CgStgTopBinding]           -- Bindings to convert
         -> HpcInfo
-        -> Stream IO CmmGroup ModuleLFInfos
-                                       -- Output as a stream, so codegen can
+        -> Stream IO CmmGroup ModuleLFInfos       -- Output as a stream, so codegen can
                                        -- be interleaved with output
 
-codeGen dflags this_mod data_tycons
+codeGen logger tmpfs cfg (InfoTableProvMap (UniqMap denv) _ _) data_tycons
         cost_centre_info stg_binds hpc_info
   = do  {     -- cg: run the code generator, and yield the resulting CmmGroup
               -- Using an IORef to store the state is a bit crude, but otherwise
-              -- we would need to add a state monad layer.
-        ; cgref <- liftIO $ newIORef =<< initC
-        ; let cg :: FCode () -> Stream IO CmmGroup ()
+              -- we would need to add a state monad layer which regresses
+              -- allocations by 0.5-2%.
+        ; cgref <- liftIO $ initC >>= \s -> newIORef s
+        ; let cg :: FCode a -> Stream IO CmmGroup a
               cg fcode = do
-                cmm <- liftIO . withTimingSilent dflags (text "STG -> Cmm") (`seq` ()) $ do
+                (a, cmm) <- liftIO . withTimingSilent logger (text "STG -> Cmm") (`seq` ()) $ do
                          st <- readIORef cgref
-                         let (a,st') = runC dflags this_mod st (getCmm fcode)
+                         let fstate = initFCodeState $ stgToCmmPlatform cfg
+                         let (a,st') = runC cfg fstate st (getCmm fcode)
 
                          -- NB. stub-out cgs_tops and cgs_stmts.  This fixes
                          -- a big space leak.  DO NOT REMOVE!
-                         writeIORef cgref $! st'{ cgs_tops = nilOL,
-                                                  cgs_stmts = mkNop }
+                         -- This is observed by the #3294 test
+                         writeIORef cgref $! (st'{ cgs_tops = nilOL, cgs_stmts = mkNop })
                          return a
                 yield cmm
+                return a
 
                -- Note [codegen-split-init] the cmm_init block must come
                -- FIRST.  This is because when -split-objs is on we need to
                -- combine this block with its initialisation routines; see
                -- Note [pipeline-split-init].
-        ; cg (mkModuleInit cost_centre_info this_mod hpc_info)
+        ; cg (mkModuleInit cost_centre_info (stgToCmmThisModule cfg) hpc_info)
 
-        ; mapM_ (cg . cgTopBinding dflags) stg_binds
-
+        ; mapM_ (cg . cgTopBinding logger tmpfs cfg) stg_binds
                 -- Put datatype_stuff after code_stuff, because the
                 -- datatype closure table (for enumeration types) to
                 -- (say) PrelBase_True_closure, which is defined in
@@ -108,11 +119,17 @@ codeGen dflags this_mod data_tycons
                 -- enumeration type Note that the closure pointers are
                 -- tagged.
                  when (isEnumerationTyCon tycon) $ cg (cgEnumerationTyCon tycon)
-                 mapM_ (cg . cgDataCon) (tyConDataCons tycon)
+                 -- Emit normal info_tables, for data constructors defined in this module.
+                 mapM_ (cg . cgDataCon DefinitionSite) (tyConDataCons tycon)
 
         ; mapM_ do_tycon data_tycons
 
-        ; cg_id_infos <- cgs_binds <$> liftIO (readIORef cgref)
+        -- Emit special info tables for everything used in this module
+        -- This will only do something if  `-fdistinct-info-tables` is turned on.
+        ; mapM_ (\(dc, ns) -> forM_ ns $ \(k, _ss) -> cg (cgDataCon (UsageSite (stgToCmmThisModule cfg) k) dc)) (nonDetEltsUFM denv)
+
+        ; final_state <- liftIO (readIORef cgref)
+        ; let cg_id_infos = cgs_binds final_state
 
           -- See Note [Conveying CAF-info and LFInfo between modules] in
           -- GHC.StgToCmm.Types
@@ -122,10 +139,10 @@ codeGen dflags this_mod data_tycons
                   !lf = cg_lf info
 
               !generatedInfo
-                | gopt Opt_OmitInterfacePragmas dflags
+                | stgToCmmOmitIfPragmas cfg
                 = emptyNameEnv
                 | otherwise
-                = mkNameEnv (Prelude.map extractInfo (eltsUFM cg_id_infos))
+                = mkNameEnv (Prelude.map extractInfo (nonDetEltsUFM cg_id_infos))
 
         ; return generatedInfo
         }
@@ -144,52 +161,51 @@ This is so that we can write the top level processing in a compositional
 style, with the increasing static environment being plumbed as a state
 variable. -}
 
-cgTopBinding :: DynFlags -> CgStgTopBinding -> FCode ()
-cgTopBinding dflags (StgTopLifted (StgNonRec id rhs))
-  = do  { let (info, fcode) = cgTopRhs dflags NonRecursive id rhs
-        ; fcode
-        ; addBindC info
-        }
+cgTopBinding :: Logger -> TmpFs -> StgToCmmConfig -> CgStgTopBinding -> FCode ()
+cgTopBinding logger tmpfs cfg = \case
+    StgTopLifted (StgNonRec id rhs) -> do
+        let (info, fcode) = cgTopRhs cfg NonRecursive id rhs
+        fcode
+        addBindC info
 
-cgTopBinding dflags (StgTopLifted (StgRec pairs))
-  = do  { let (bndrs, rhss) = unzip pairs
-        ; let pairs' = zip bndrs rhss
-              r = unzipWith (cgTopRhs dflags Recursive) pairs'
-              (infos, fcodes) = unzip r
-        ; addBindsC infos
-        ; sequence_ fcodes
-        }
+    StgTopLifted (StgRec pairs) -> do
+        let (bndrs, rhss) = unzip pairs
+        let pairs' = zip bndrs rhss
+            r = unzipWith (cgTopRhs cfg Recursive) pairs'
+            (infos, fcodes) = unzip r
+        addBindsC infos
+        sequence_ fcodes
 
-cgTopBinding dflags (StgTopStringLit id str) = do
-  let label = mkBytesLabel (idName id)
-  -- emit either a CmmString literal or dump the string in a file and emit a
-  -- CmmFileEmbed literal.
-  -- See Note [Embedding large binary blobs] in GHC.CmmToAsm.Ppr
-  let isNCG    = hscTarget dflags == HscAsm
-      isSmall  = fromIntegral (BS.length str) <= binBlobThreshold dflags
-      asString = binBlobThreshold dflags == 0 || isSmall
+    StgTopStringLit id str -> do
+        let label = mkBytesLabel (idName id)
+        -- emit either a CmmString literal or dump the string in a file and emit a
+        -- CmmFileEmbed literal.
+        -- See Note [Embedding large binary blobs] in GHC.CmmToAsm.Ppr
+        let asString = case stgToCmmBinBlobThresh cfg of
+              Just bin_blob_threshold -> fromIntegral (BS.length str) <= bin_blob_threshold
+              Nothing                -> True
 
-      (lit,decl) = if not isNCG || asString
-        then mkByteStringCLit label str
-        else mkFileEmbedLit label $ unsafePerformIO $ do
-               bFile <- newTempName dflags TFL_CurrentModule ".dat"
-               BS.writeFile bFile str
-               return bFile
-  emitDecl decl
-  addBindC (litIdInfo dflags id mkLFStringLit lit)
+            (lit,decl) = if asString
+              then mkByteStringCLit label str
+              else mkFileEmbedLit label $ unsafePerformIO $ do
+                     bFile <- newTempName logger tmpfs (stgToCmmTmpDir cfg) TFL_CurrentModule ".dat"
+                     BS.writeFile bFile str
+                     return bFile
+        emitDecl decl
+        addBindC (litIdInfo (stgToCmmPlatform cfg) id mkLFStringLit lit)
 
 
-cgTopRhs :: DynFlags -> RecFlag -> Id -> CgStgRhs -> (CgIdInfo, FCode ())
+cgTopRhs :: StgToCmmConfig -> RecFlag -> Id -> CgStgRhs -> (CgIdInfo, FCode ())
         -- The Id is passed along for setting up a binding...
 
-cgTopRhs dflags _rec bndr (StgRhsCon _cc con args)
-  = cgTopRhsCon dflags bndr con (assertNonVoidStgArgs args)
+cgTopRhs cfg _rec bndr (StgRhsCon _cc con mn _ts args)
+  = cgTopRhsCon cfg bndr con mn (assertNonVoidStgArgs args)
       -- con args are always non-void,
       -- see Note [Post-unarisation invariants] in GHC.Stg.Unarise
 
-cgTopRhs dflags rec bndr (StgRhsClosure fvs cc upd_flag args body)
-  = ASSERT(isEmptyDVarSet fvs)    -- There should be no free variables
-    cgTopRhsClosure dflags rec bndr cc upd_flag args body
+cgTopRhs cfg rec bndr (StgRhsClosure fvs cc upd_flag args body)
+  = assertPpr (isEmptyDVarSet fvs) (text "fvs:" <> ppr fvs) $   -- There should be no free variables
+    cgTopRhsClosure (stgToCmmPlatform cfg) rec bndr cc upd_flag args body
 
 
 ---------------------------------------------------------------
@@ -215,28 +231,29 @@ mkModuleInit cost_centre_info this_mod hpc_info
 
 cgEnumerationTyCon :: TyCon -> FCode ()
 cgEnumerationTyCon tycon
-  = do dflags <- getDynFlags
-       emitRODataLits (mkLocalClosureTableLabel (tyConName tycon) NoCafRefs)
-             [ CmmLabelOff (mkLocalClosureLabel (dataConName con) NoCafRefs)
-                           (tagForCon dflags con)
+  = do platform <- getPlatform
+       emitRODataLits (mkClosureTableLabel (tyConName tycon) NoCafRefs)
+             [ CmmLabelOff (mkClosureLabel (dataConName con) NoCafRefs)
+                           (tagForCon platform con)
              | con <- tyConDataCons tycon]
 
 
-cgDataCon :: DataCon -> FCode ()
+cgDataCon :: ConInfoTableLocation -> DataCon -> FCode ()
 -- Generate the entry code, info tables, and (for niladic constructor)
 -- the static closure, for a constructor.
-cgDataCon data_con
-  = do  { dflags <- getDynFlags
+cgDataCon mn data_con
+  = do  { massert (not (isUnboxedTupleDataCon data_con || isUnboxedSumDataCon data_con))
+        ; profile <- getProfile
         ; platform <- getPlatform
         ; let
             (tot_wds, --  #ptr_wds + #nonptr_wds
              ptr_wds) --  #ptr_wds
-              = mkVirtConstrSizes dflags arg_reps
+              = mkVirtConstrSizes profile arg_reps
 
             nonptr_wds   = tot_wds - ptr_wds
 
             dyn_info_tbl =
-              mkDataConInfoTable dflags data_con False ptr_wds nonptr_wds
+              mkDataConInfoTable profile data_con mn False ptr_wds nonptr_wds
 
             -- We're generating info tables, so we don't know and care about
             -- what the actual arguments are. Using () here as the place holder.
@@ -246,7 +263,7 @@ cgDataCon data_con
                        , rep_ty <- typePrimRep (scaledThing ty)
                        , not (isVoidRep rep_ty) ]
 
-        ; emitClosureAndInfoTable dyn_info_tbl NativeDirectCall [] $
+        ; emitClosureAndInfoTable platform dyn_info_tbl NativeDirectCall [] $
             -- NB: the closure pointer is assumed *untagged* on
             -- entry to a constructor.  If the pointer is tagged,
             -- then we should not be entering it.  This assumption
@@ -256,7 +273,7 @@ cgDataCon data_con
             do { tickyEnterDynCon
                ; ldvEnter (CmmReg nodeReg)
                ; tickyReturnOldCon (length arg_reps)
-               ; void $ emitReturn [cmmOffsetB platform (CmmReg nodeReg) (tagForCon dflags data_con)]
+               ; void $ emitReturn [cmmOffsetB platform (CmmReg nodeReg) (tagForCon platform data_con)]
                }
                     -- The case continuation code expects a tagged pointer
         }

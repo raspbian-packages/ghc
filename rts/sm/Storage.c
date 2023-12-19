@@ -15,15 +15,15 @@
 #if RTS_LINKER_USE_MMAP
 /*
  * On FreeBSD and Darwin, when _XOPEN_SOURCE is defined, MAP_ANONYMOUS is not
- * exposed from <sys/mman.h>.  Include <sys/mman.h> before "PosixSource.h".
+ * exposed from <sys/mman.h>.  Include <sys/mman.h> before "rts/PosixSource.h".
  *
- * Alternatively, we could drop "PosixSource.h" from this file, but for just
+ * Alternatively, we could drop "rts/PosixSource.h" from this file, but for just
  * one non-POSIX macro, that seems a needless price to pay.
  */
 #include <sys/mman.h>
 #endif
 
-#include "PosixSource.h"
+#include "rts/PosixSource.h"
 #include "Rts.h"
 
 #include "Storage.h"
@@ -41,7 +41,8 @@
 #include "Trace.h"
 #include "GC.h"
 #include "Evac.h"
-#include "NonMoving.h"
+#include "NonMovingAllocate.h"
+#include "sm/NonMovingMark.h"
 #if defined(ios_HOST_OS) || defined(darwin_HOST_OS)
 #include "Hash.h"
 #endif
@@ -52,7 +53,7 @@
 
 #include <string.h>
 
-#include "ffi.h"
+#include "rts/ghc_ffi.h"
 
 /*
  * All these globals require sm_mutex to access in THREADED_RTS mode.
@@ -83,6 +84,16 @@ generation *oldest_gen  = NULL; /* oldest generation, for convenience */
 nursery *nurseries = NULL;
 uint32_t n_nurseries;
 
+/* Pinned Nursery Size, the number of blocks that we reserve for
+ * pinned data. The number chosen here decides whether pinned objects
+ * are allocated from the free_list (if n < BLOCKS_PER_MBLOCK) or whether
+ * a fresh mblock is allocated each time.
+ * See Note [Sources of Block Level Fragmentation]
+ * */
+
+#define PINNED_EMPTY_SIZE BLOCKS_PER_MBLOCK
+
+
 /*
  * When we are using nursery chunks, we need a separate next_nursery
  * pointer for each NUMA node.
@@ -99,6 +110,7 @@ Mutex sm_mutex;
 
 static void allocNurseries (uint32_t from, uint32_t to);
 static void assignNurseriesToCapabilities (uint32_t from, uint32_t to);
+static StgInd * lockCAF (StgRegTable *reg, StgIndStatic *caf);
 
 void
 initGeneration (generation *gen, int g)
@@ -140,6 +152,22 @@ initGeneration (generation *gen, int g)
     gen->old_weak_ptr_list = NULL;
 }
 
+
+#if defined(TRACING)
+// Defined as it's own top-level function so it can be passed to traceInitEvent
+static void
+traceHeapInfo (void){
+  traceEventHeapInfo(CAPSET_HEAP_DEFAULT,
+                     RtsFlags.GcFlags.generations,
+                     RtsFlags.GcFlags.maxHeapSize * BLOCK_SIZE,
+                     RtsFlags.GcFlags.minAllocAreaSize * BLOCK_SIZE,
+                     MBLOCK_SIZE,
+                     BLOCK_SIZE);
+}
+#else
+#define traceHeapInfo
+#endif
+
 void
 initStorage (void)
 {
@@ -166,14 +194,13 @@ initStorage (void)
   initMutex(&sm_mutex);
 #endif
 
-  ACQUIRE_SM_LOCK;
-
   /* allocate generation info array */
   generations = (generation *)stgMallocBytes(RtsFlags.GcFlags.generations
                                              * sizeof(struct generation_),
                                              "initStorage: gens");
 
   /* Initialise all generations */
+  ACQUIRE_SM_LOCK;
   for(g = 0; g < RtsFlags.GcFlags.generations; g++) {
       initGeneration(&generations[g], g);
   }
@@ -188,17 +215,14 @@ initStorage (void)
   }
   oldest_gen->to = oldest_gen;
 
-  // Nonmoving heap uses oldest_gen so initialize it after initializing oldest_gen
-  nonmovingInit();
-
 #if defined(THREADED_RTS)
   // nonmovingAddCapabilities allocates segments, which requires taking the gc
   // sync lock, so initialize it before nonmovingAddCapabilities
   initSpinLock(&gc_alloc_block_sync);
 #endif
 
-  if (RtsFlags.GcFlags.useNonmoving)
-      nonmovingAddCapabilities(n_capabilities);
+  // Nonmoving heap uses oldest_gen so initialize it after initializing oldest_gen
+  nonmovingInit();
 
   /* The oldest generation has one step. */
   if (RtsFlags.GcFlags.compact || RtsFlags.GcFlags.sweep) {
@@ -230,20 +254,16 @@ initStorage (void)
   for (n = 0; n < n_numa_nodes; n++) {
       next_nursery[n] = n;
   }
-  storageAddCapabilities(0, n_capabilities);
+  storageAddCapabilities(0, getNumCapabilities());
 
   IF_DEBUG(gc, statDescribeGens());
 
   RELEASE_SM_LOCK;
 
-  traceEventHeapInfo(CAPSET_HEAP_DEFAULT,
-                     RtsFlags.GcFlags.generations,
-                     RtsFlags.GcFlags.maxHeapSize * BLOCK_SIZE,
-                     RtsFlags.GcFlags.minAllocAreaSize * BLOCK_SIZE,
-                     MBLOCK_SIZE,
-                     BLOCK_SIZE);
+  traceInitEvent(traceHeapInfo);
 }
 
+// Caller must hold SM_LOCK.
 void storageAddCapabilities (uint32_t from, uint32_t to)
 {
     uint32_t n, g, i, new_n_nurseries;
@@ -270,8 +290,8 @@ void storageAddCapabilities (uint32_t from, uint32_t to)
     // we've moved the nurseries, so we have to update the rNursery
     // pointers from the Capabilities.
     for (i = 0; i < from; i++) {
-        uint32_t index = capabilities[i]->r.rNursery - old_nurseries;
-        capabilities[i]->r.rNursery = &nurseries[index];
+        uint32_t index = getCapability(i)->r.rNursery - old_nurseries;
+        getCapability(i)->r.rNursery = &nurseries[index];
     }
 
     /* The allocation area.  Policy: keep the allocation area
@@ -293,16 +313,15 @@ void storageAddCapabilities (uint32_t from, uint32_t to)
     // allocate a block for each mut list
     for (n = from; n < to; n++) {
         for (g = 1; g < RtsFlags.GcFlags.generations; g++) {
-            capabilities[n]->mut_lists[g] =
+            getCapability(n)->mut_lists[g] =
                 allocBlockOnNode(capNoToNumaNode(n));
         }
     }
 
-    // Initialize NonmovingAllocators and UpdRemSets
+    // Initialize non-moving collector
     if (RtsFlags.GcFlags.useNonmoving) {
-        nonmovingAddCapabilities(to);
-        for (i = 0; i < to; ++i) {
-            init_upd_rem_set(&capabilities[i]->upd_rem_set);
+        for (i = from; i < to; i++) {
+            nonmovingInitCapability(getCapability(i));
         }
     }
 
@@ -337,10 +356,46 @@ freeStorage (bool free_heap)
     freeGcThreads();
 }
 
+static void
+listGenBlocks (ListBlocksCb cb, void *user, generation* gen)
+{
+    cb(user, gen->blocks);
+    cb(user, gen->large_objects);
+    cb(user, gen->compact_objects);
+    cb(user, gen->compact_blocks_in_import);
+}
+
+// Traverse all the different places that the rts stores blocks
+// and call a callback on each of them.
+void listAllBlocks (ListBlocksCb cb, void *user)
+{
+  uint32_t g, i;
+  for (g = 0; g < RtsFlags.GcFlags.generations; g++) {
+      for (i = 0; i < getNumCapabilities(); i++) {
+          cb(user, getCapability(i)->mut_lists[g]);
+          cb(user, gc_threads[i]->gens[g].part_list);
+          cb(user, gc_threads[i]->gens[g].scavd_list);
+          cb(user, gc_threads[i]->gens[g].todo_bd);
+      }
+      listGenBlocks(cb, user, &generations[g]);
+  }
+
+  for (i = 0; i < n_nurseries; i++) {
+      cb(user, nurseries[i].blocks);
+  }
+  for (i = 0; i < getNumCapabilities(); i++) {
+      if (getCapability(i)->pinned_object_block != NULL) {
+          cb(user, getCapability(i)->pinned_object_block);
+      }
+      cb(user, getCapability(i)->pinned_object_blocks);
+      cb(user, getCapability(i)->pinned_object_empty);
+  }
+}
+
+
 /* -----------------------------------------------------------------------------
    Note [CAF management]
    ~~~~~~~~~~~~~~~~~~~~~
-
    The entry code for every CAF does the following:
 
       - calls newCAF, which builds a CAF_BLACKHOLE on the heap and atomically
@@ -375,7 +430,6 @@ freeStorage (bool free_heap)
    ------------------
    Note [atomic CAF entry]
    ~~~~~~~~~~~~~~~~~~~~~~~
-
    With THREADED_RTS, newCAF() is required to be atomic (see
    #5558). This is because if two threads happened to enter the same
    CAF simultaneously, they would create two distinct CAF_BLACKHOLEs,
@@ -389,7 +443,6 @@ freeStorage (bool free_heap)
    ------------------
    Note [GHCi CAFs]
    ~~~~~~~~~~~~~~~~
-
    For GHCI, we have additional requirements when dealing with CAFs:
 
       - we must *retain* all dynamically-loaded CAFs ever entered,
@@ -411,7 +464,6 @@ freeStorage (bool free_heap)
    ------------------
    Note [Static objects under the nonmoving collector]
    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
    Static object management is a bit tricky under the nonmoving collector as we
    need to maintain a bit more state than in the moving collector. In
    particular, the moving collector uses the low bits of the STATIC_LINK field
@@ -455,7 +507,7 @@ freeStorage (bool free_heap)
 
    -------------------------------------------------------------------------- */
 
-STATIC_INLINE StgInd *
+static StgInd *
 lockCAF (StgRegTable *reg, StgIndStatic *caf)
 {
     const StgInfoTable *orig_info;
@@ -508,9 +560,7 @@ lockCAF (StgRegTable *reg, StgIndStatic *caf)
     // Allocate the blackhole indirection closure
     if (RtsFlags.GcFlags.useNonmoving) {
         // See Note [Static objects under the nonmoving collector].
-        ACQUIRE_SM_LOCK;
         bh = (StgInd *)nonmovingAllocate(cap, sizeofW(*bh));
-        RELEASE_SM_LOCK;
         recordMutableCap((StgClosure*)bh,
                          regTableToCapability(reg), oldest_gen->no);
     } else {
@@ -538,6 +588,7 @@ newCAF(StgRegTable *reg, StgIndStatic *caf)
     if(keepCAFs && !(highMemDynamic && (void*) caf > (void*) 0x80000000))
     {
         // Note [dyn_caf_list]
+        // ~~~~~~~~~~~~~~~~~~~
         // If we are in GHCi _and_ we are using dynamic libraries,
         // then we can't redirect newCAF calls to newRetainedCAF (see below),
         // so we make newCAF behave almost like newRetainedCAF.
@@ -727,8 +778,8 @@ assignNurseriesToCapabilities (uint32_t from, uint32_t to)
     uint32_t i, node;
 
     for (i = from; i < to; i++) {
-        node = capabilities[i]->node;
-        assignNurseryToCapability(capabilities[i], next_nursery[node]);
+        node = getCapability(i)->node;
+        assignNurseryToCapability(getCapability(i), next_nursery[node]);
         next_nursery[node] += n_numa_nodes;
     }
 }
@@ -759,7 +810,7 @@ resetNurseries (void)
     for (n = 0; n < n_numa_nodes; n++) {
         next_nursery[n] = n;
     }
-    assignNurseriesToCapabilities(0, n_capabilities);
+    assignNurseriesToCapabilities(0, getNumCapabilities());
 
 #if defined(DEBUG)
     bdescr *bd;
@@ -915,7 +966,7 @@ move_STACK (StgStack *src, StgStack *dest)
     dest->sp = (StgPtr)dest->sp + diff;
 }
 
-STATIC_INLINE void
+void
 accountAllocation(Capability *cap, W_ n)
 {
     TICK_ALLOC_HEAP_NOCTR(WDS(n));
@@ -931,7 +982,6 @@ accountAllocation(Capability *cap, W_ n)
 
 /* Note [slop on the heap]
  * ~~~~~~~~~~~~~~~~~~~~~~~
- *
  * We use the term "slop" to refer to allocated memory on the heap which isn't
  * occupied by any closure. Usually closures are packet tightly into the heap
  * blocks, storage for one immediately following another. However there are
@@ -968,9 +1018,19 @@ accountAllocation(Capability *cap, W_ n)
  * of closures. This trick is used by the sanity checking code and the heap
  * profiler, see Note [skipping slop in the heap profiler].
  *
- * When profiling we zero:
- *  - Pinned object alignment slop, see MEMSET_IF_PROFILING_W in allocatePinned.
+ * In general we zero:
+ *
+ *  - Pinned object alignment slop, see MEMSET_SLOP_W in allocatePinned.
+ *  - Large object alignment slop, see MEMSET_SLOP_W in allocatePinned.
  *  - Shrunk array slop, see OVERWRITING_CLOSURE_MUTABLE.
+ *
+ * Note that this is necessary even in the vanilla (e.g. non-profiling) RTS
+ * since the user may trigger a heap census via +RTS -hT, which can be used
+ * even when not linking against the profiled RTS. Failing to zero slop
+ * due to array shrinking has resulted in a few nasty bugs (#17572, #9666).
+ * However, since array shrink may result in large amounts of slop (unlike
+ * alignment), we take care to only zero such slop when heap profiling or DEBUG
+ * are enabled.
  *
  * When performing LDV profiling or using a (single threaded) debug RTS we zero
  * slop even when overwriting immutable closures, see Note [zeroing slop when
@@ -1142,12 +1202,75 @@ allocateMightFail (Capability *cap, W_ n)
  *
  * See Note [skipping slop in the heap profiler]
  */
-#if defined(PROFILING)
-#define MEMSET_IF_PROFILING_W(p, val, len_w) memset(p, val, (len_w) * sizeof(W_))
-#else
-#define MEMSET_IF_PROFILING_W(p, val, len_w) \
-    do { (void)(p); (void)(val); (void)(len_w); } while(0)
-#endif
+#define MEMSET_SLOP_W(p, val, len_w) memset(p, val, (len_w) * sizeof(W_))
+
+/**
+ * Finish the capability's current pinned object accumulator block
+ * (cap->pinned_object_block), if any, and start a new one.
+ */
+static bdescr *
+start_new_pinned_block(Capability *cap)
+{
+    bdescr *bd = cap->pinned_object_block;
+
+    // stash the old block on cap->pinned_object_blocks.  On the
+    // next GC cycle these objects will be moved to
+    // g0->large_objects.
+    if (bd != NULL) {
+        // add it to the allocation stats when the block is full
+        finishedNurseryBlock(cap, bd);
+        dbl_link_onto(bd, &cap->pinned_object_blocks);
+    }
+
+    // We need to find another block.  We could just allocate one,
+    // but that means taking a global lock and we really want to
+    // avoid that (benchmarks that allocate a lot of pinned
+    // objects scale really badly if we do this).
+    //
+    // See Note [Sources of Block Level Fragmentation]
+    // for a more complete history of this section.
+    bd = cap->pinned_object_empty;
+    if (bd == NULL) {
+        // The pinned block list is empty: allocate a fresh block (we can't fail
+        // here).
+        ACQUIRE_SM_LOCK;
+        bd = allocNursery(cap->node, NULL, PINNED_EMPTY_SIZE);
+        RELEASE_SM_LOCK;
+    }
+
+    // Bump up the nursery pointer to avoid the pathological situation
+    // where a program is *only* allocating pinned objects.
+    // T4018 fails without this safety.
+    // This has the effect of counting a full pinned block in the same way
+    // as a full nursery block, so GCs will be triggered at the same interval
+    // if you are only allocating pinned data compared to normal allocations
+    // via allocate().
+    bdescr *nbd = cap->r.rCurrentNursery->link;
+    if (nbd != NULL){
+      newNurseryBlock(nbd);
+      cap->r.rCurrentNursery->link = nbd->link;
+      if (nbd->link != NULL) {
+          nbd->link->u.back = cap->r.rCurrentNursery;
+        }
+      dbl_link_onto(nbd, &cap->r.rNursery->blocks);
+      // Important for accounting purposes
+      if (cap->r.rCurrentAlloc){
+        finishedNurseryBlock(cap, cap->r.rCurrentAlloc);
+      }
+      cap->r.rCurrentAlloc = nbd;
+    }
+
+    cap->pinned_object_empty = bd->link;
+    newNurseryBlock(bd);
+    if (bd->link != NULL) {
+      bd->link->u.back = cap->pinned_object_empty;
+    }
+    initBdescr(bd, g0, g0);
+
+    cap->pinned_object_block = bd;
+    bd->flags  = BF_PINNED | BF_LARGE | BF_EVACUATED;
+    return bd;
+}
 
 /* ---------------------------------------------------------------------------
    Allocate a fixed/pinned object.
@@ -1176,113 +1299,76 @@ allocateMightFail (Capability *cap, W_ n)
 StgPtr
 allocatePinned (Capability *cap, W_ n /*words*/, W_ alignment /*bytes*/, W_ align_off /*bytes*/)
 {
-    StgPtr p;
-    bdescr *bd;
-
     // Alignment and offset have to be a power of two
-    ASSERT(alignment && !(alignment & (alignment - 1)));
-    ASSERT(alignment >= sizeof(W_));
+    CHECK(alignment && !(alignment & (alignment - 1)));
+    CHECK(!(align_off & (align_off - 1)));
+    // We don't support sub-word alignments
+    CHECK(alignment >= sizeof(W_));
 
-    ASSERT(!(align_off & (align_off - 1)));
+    bdescr *bd = cap->pinned_object_block;
+    if (bd == NULL) {
+        bd = start_new_pinned_block(cap);
+    }
 
     const StgWord alignment_w = alignment / sizeof(W_);
+    W_ off_w = ALIGN_WITH_OFF_W(bd->free, alignment, align_off);
 
-    // If the request is for a large object, then allocate()
-    // will give us a pinned object anyway.
-    if (n >= LARGE_OBJECT_THRESHOLD/sizeof(W_)) {
-        // For large objects we don't bother optimizing the number of words
-        // allocated for alignment reasons. Here we just allocate the maximum
-        // number of extra words we could possibly need to satisfy the alignment
-        // constraint.
-        p = allocateMightFail(cap, n + alignment_w - 1);
-        if (p == NULL) {
-            return NULL;
-        } else {
-            Bdescr(p)->flags |= BF_PINNED;
-            W_ off_w = ALIGN_WITH_OFF_W(p, alignment, align_off);
-            MEMSET_IF_PROFILING_W(p, 0, off_w);
+    // If the request is is smaller than LARGE_OBJECT_THRESHOLD then
+    // allocate into the pinned object accumulator.
+    if (n + off_w < LARGE_OBJECT_THRESHOLD/sizeof(W_)) {
+        // If the current pinned object block isn't large enough to hold the new
+        // object, get a new one.
+        if ((bd->free + off_w + n) > (bd->start + BLOCK_SIZE_W)) {
+            bd = start_new_pinned_block(cap);
+
+            // The pinned_object_block remains attached to the capability
+            // until it is full, even if a GC occurs.  We want this
+            // behaviour because otherwise the unallocated portion of the
+            // block would be forever slop, and under certain workloads
+            // (allocating a few ByteStrings per GC) we accumulate a lot
+            // of slop.
+            //
+            // So, the pinned_object_block is initially marked
+            // BF_EVACUATED so the GC won't touch it.  When it is full,
+            // we place it on the large_objects list, and at the start of
+            // the next GC the BF_EVACUATED flag will be cleared, and the
+            // block will be promoted as usual (if anything in it is
+            // live).
+
+            off_w = ALIGN_WITH_OFF_W(bd->free, alignment, align_off);
+        }
+
+        // N.B. it is important that we account for the alignment padding
+        // when determining large-object-ness, lest we may over-fill the
+        // block. See #23400.
+        if (n + off_w < LARGE_OBJECT_THRESHOLD/sizeof(W_)) {
+            StgPtr p = bd->free;
+            MEMSET_SLOP_W(p, 0, off_w);
+            n += off_w;
             p += off_w;
-            MEMSET_IF_PROFILING_W(p + n, 0, alignment_w - off_w - 1);
+            bd->free += n;
+            ASSERT(bd->free <= bd->start + bd->blocks * BLOCK_SIZE_W);
+            accountAllocation(cap, n);
             return p;
         }
     }
 
-    bd = cap->pinned_object_block;
-
-    W_ off_w = 0;
-
-    if(bd)
-        off_w = ALIGN_WITH_OFF_W(bd->free, alignment, align_off);
-
-    // If we don't have a block of pinned objects yet, or the current
-    // one isn't large enough to hold the new object, get a new one.
-    if (bd == NULL || (bd->free + off_w + n) > (bd->start + BLOCK_SIZE_W)) {
-
-        // stash the old block on cap->pinned_object_blocks.  On the
-        // next GC cycle these objects will be moved to
-        // g0->large_objects.
-        if (bd != NULL) {
-            // add it to the allocation stats when the block is full
-            finishedNurseryBlock(cap, bd);
-            dbl_link_onto(bd, &cap->pinned_object_blocks);
-        }
-
-        // We need to find another block.  We could just allocate one,
-        // but that means taking a global lock and we really want to
-        // avoid that (benchmarks that allocate a lot of pinned
-        // objects scale really badly if we do this).
-        //
-        // So first, we try taking the next block from the nursery, in
-        // the same way as allocate().
-        bd = cap->r.rCurrentNursery->link;
-        if (bd == NULL) {
-            // The nursery is empty: allocate a fresh block (we can't fail
-            // here).
-            ACQUIRE_SM_LOCK;
-            bd = allocBlockOnNode(cap->node);
-            RELEASE_SM_LOCK;
-            initBdescr(bd, g0, g0);
-        } else {
-            newNurseryBlock(bd);
-            // we have a block in the nursery: steal it
-            cap->r.rCurrentNursery->link = bd->link;
-            if (bd->link != NULL) {
-                bd->link->u.back = cap->r.rCurrentNursery;
-            }
-            cap->r.rNursery->n_blocks -= bd->blocks;
-        }
-
-        cap->pinned_object_block = bd;
-        bd->flags  = BF_PINNED | BF_LARGE | BF_EVACUATED;
-
-        // The pinned_object_block remains attached to the capability
-        // until it is full, even if a GC occurs.  We want this
-        // behaviour because otherwise the unallocated portion of the
-        // block would be forever slop, and under certain workloads
-        // (allocating a few ByteStrings per GC) we accumulate a lot
-        // of slop.
-        //
-        // So, the pinned_object_block is initially marked
-        // BF_EVACUATED so the GC won't touch it.  When it is full,
-        // we place it on the large_objects list, and at the start of
-        // the next GC the BF_EVACUATED flag will be cleared, and the
-        // block will be promoted as usual (if anything in it is
-        // live).
-
-        off_w = ALIGN_WITH_OFF_W(bd->free, alignment, align_off);
+    // Otherwise handle the request as a large object
+    // For large objects we don't bother optimizing the number of words
+    // allocated for alignment reasons. Here we just allocate the maximum
+    // number of extra words we could possibly need to satisfy the alignment
+    // constraint.
+    StgPtr p = allocateMightFail(cap, n + alignment_w - 1);
+    if (p == NULL) {
+        return NULL;
+    } else {
+        Bdescr(p)->flags |= BF_PINNED;
+        off_w = ALIGN_WITH_OFF_W(p, alignment, align_off);
+        MEMSET_SLOP_W(p, 0, off_w);
+        p += off_w;
+        MEMSET_SLOP_W(p + n, 0, alignment_w - off_w - 1);
+        return p;
     }
-
-    p = bd->free;
-
-    MEMSET_IF_PROFILING_W(p, 0, off_w);
-
-    n += off_w;
-    p += off_w;
-    bd->free += n;
-
-    accountAllocation(cap, n);
-
-    return p;
 }
 
 /* -----------------------------------------------------------------------------
@@ -1315,20 +1401,25 @@ allocatePinned (Capability *cap, W_ n /*words*/, W_ alignment /*bytes*/, W_ alig
    MUT_VAR_CLEAN object is not on the mutable list; a MUT_VAR_DIRTY
    is.  When written to, a MUT_VAR_CLEAN turns into a MUT_VAR_DIRTY
    and is put on the mutable list.
+   Note that it is responsibility of the caller to do the
+   stg_MUT_VAR_CLEAN comparison.
 */
 void
 dirty_MUT_VAR(StgRegTable *reg, StgMutVar *mvar, StgClosure *old)
 {
+#if defined(THREADED_RTS)
+    // This doesn't hold in the threaded RTS as we may race with another thread.
+    ASSERT(RELAXED_LOAD(&mvar->header.info) == &stg_MUT_VAR_CLEAN_info);
+#endif
+
     Capability *cap = regTableToCapability(reg);
     // No barrier required here as no other heap object fields are read. See
     // note [Heap memory barriers] in SMP.h.
-    if (RELAXED_LOAD(&mvar->header.info) == &stg_MUT_VAR_CLEAN_info) {
-        SET_INFO((StgClosure*) mvar, &stg_MUT_VAR_DIRTY_info);
-        recordClosureMutated(cap, (StgClosure *) mvar);
-        IF_NONMOVING_WRITE_BARRIER_ENABLED {
-            // See Note [Dirty flags in the non-moving collector] in NonMoving.c
-            updateRemembSetPushClosure_(reg, old);
-        }
+    SET_INFO((StgClosure*) mvar, &stg_MUT_VAR_DIRTY_info);
+    recordClosureMutated(cap, (StgClosure *) mvar);
+    IF_NONMOVING_WRITE_BARRIER_ENABLED {
+        // See Note [Dirty flags in the non-moving collector] in NonMoving.c
+        updateRemembSetPushClosure_(reg, old);
     }
 }
 
@@ -1461,7 +1552,7 @@ dirty_MVAR(StgRegTable *reg, StgClosure *p, StgClosure *old_val)
 
 /* -----------------------------------------------------------------------------
  * Note [allocation accounting]
- *
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  *   - When cap->r.rCurrentNusery moves to a new block in the nursery,
  *     we add the size of the used portion of the previous block to
  *     cap->total_allocated. (see finishedNurseryBlock())
@@ -1483,12 +1574,12 @@ calcTotalAllocated (void)
     uint64_t tot_alloc = 0;
     W_ n;
 
-    for (n = 0; n < n_capabilities; n++) {
-        tot_alloc += capabilities[n]->total_allocated;
+    for (n = 0; n < getNumCapabilities(); n++) {
+        tot_alloc += getCapability(n)->total_allocated;
 
-        traceEventHeapAllocated(capabilities[n],
+        traceEventHeapAllocated(getCapability(n),
                                 CAPSET_HEAP_DEFAULT,
-                                capabilities[n]->total_allocated * sizeof(W_));
+                                getCapability(n)->total_allocated * sizeof(W_));
     }
 
     return tot_alloc;
@@ -1504,13 +1595,13 @@ updateNurseriesStats (void)
     uint32_t i;
     bdescr *bd;
 
-    for (i = 0; i < n_capabilities; i++) {
+    for (i = 0; i < getNumCapabilities(); i++) {
         // The current nursery block and the current allocate block have not
         // yet been accounted for in cap->total_allocated, so we add them here.
-        bd = capabilities[i]->r.rCurrentNursery;
-        if (bd) finishedNurseryBlock(capabilities[i], bd);
-        bd = capabilities[i]->r.rCurrentAlloc;
-        if (bd) finishedNurseryBlock(capabilities[i], bd);
+        bd = getCapability(i)->r.rCurrentNursery;
+        if (bd) finishedNurseryBlock(getCapability(i), bd);
+        bd = getCapability(i)->r.rCurrentAlloc;
+        if (bd) finishedNurseryBlock(getCapability(i), bd);
     }
 }
 
@@ -1534,7 +1625,12 @@ W_ genLiveWords (generation *gen)
 
 W_ genLiveBlocks (generation *gen)
 {
-    return gen->n_blocks + gen->n_large_blocks + gen->n_compact_blocks;
+  W_ nonmoving_blocks = 0;
+  // The nonmoving heap contains some blocks that live outside the regular generation structure.
+  if (gen == oldest_gen && RtsFlags.GcFlags.useNonmoving){
+    nonmoving_blocks = n_nonmoving_large_blocks + n_nonmoving_marked_large_blocks + n_nonmoving_compact_blocks + n_nonmoving_marked_compact_blocks;
+  }
+  return gen->n_blocks + gen->n_large_blocks + gen->n_compact_blocks + nonmoving_blocks;
 }
 
 W_ gcThreadLiveWords (uint32_t i, uint32_t g)
@@ -1630,6 +1726,9 @@ StgWord calcTotalLargeObjectsW (void)
     for (g = 0; g < RtsFlags.GcFlags.generations; g++) {
         totalW += generations[g].n_large_words;
     }
+
+    totalW += nonmoving_large_words;
+
     return totalW;
 }
 
@@ -1641,6 +1740,9 @@ StgWord calcTotalCompactW (void)
     for (g = 0; g < RtsFlags.GcFlags.generations; g++) {
         totalW += generations[g].n_compact_blocks * BLOCK_SIZE_W;
     }
+
+    totalW += nonmoving_compact_words;
+
     return totalW;
 }
 
@@ -1733,3 +1835,105 @@ _bdescr (StgPtr p)
 }
 
 #endif
+
+/*
+Note [Sources of Block Level Fragmentation]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Block level fragmentation is when there is unused space in megablocks.
+The amount of fragmentation can be calculated as the difference between the
+total size of allocated blocks and the total size of allocated megablocks.
+
+The act of the copying collection naturally reduces fragmentation by moving
+data between megablocks. Over time, the effect is that most megablocks end up quite full because
+data will be copied out of fragmented megablocks. The new block is chosen from
+the free list where the aim is to choose a gap of approximately the right size for
+the copied block so the data will end up in a probably less fragmented block.
+There are two situations where we end up with block fragmentation.
+
+1. Fragmentation from pinned data
+2. Fragmentation from nursery allocated blocks
+
+# Pinned Data Fragmentation
+
+There are two sources of
+pinned data, large objects and pinned bytearrays. After one of these object
+types is allocated, it is never moved by the collector
+and therefore if all the other blocks are collected around it then you can end
+up with a megablock with one pinned block and no other blocks. No special
+effort is taken in the compiler
+to ensure that this kind of fragmentation doesn't happen in the first place and
+once the heap is fragmented in this way, there's nothing you can do about it
+beyond hoping that the pinned data is eventually freed.
+
+# Nursery Fragmentation
+
+The other reason that a block may not ever be moved or emptied is if it forms
+part of the nursery.  When the nursery is first allocated then it is made up of
+megablock sized chunks, so if the nursery is 4 megabytes then it will consist of
+blocks from about 4 megablocks.
+
+Over time, the nursery is resized (by resizeNurseries) under various conditions.
+It gets bigger when
+we are allocating more and then smaller when we are allocating less.
+When the nursery is resized
+blocks are added or removed to it at potentially smaller sizes than a complete
+megablock. For example, if the nursery size needs to increase by 1, then
+the free list is consulted for a block of size 1 (from a random block)
+and that's added to the nursery.
+
+Over time the make-up of the nursery changes from 4
+contiguous megablocks to a hodge-podge of blocks from different megablocks. In
+some programs (see #19481), the fragmentation is so bad that a program with
+only 4 MB of live data can retain over 500 megablocks because each of these
+megablocks contributed a small number of blocks to the nursery.
+
+In particular, and confusingly, this second form of fragmentation was caused
+by the act of allocating pinned objects. `allocPinned` was the primary
+reason that the nursery size decreases by small amounts.  When `allocPinned`
+needed a block then it took a block permanently out of
+the nursery which shrunk the size of the nursery by 1 block. Then next time the size
+of the nursery was checked, the `alloc_nurseries` found that the existing
+nursery was smaller than the desired size and a new blocked needed
+to be added. This allocation was serviced from an arbitrary megablock
+which had some free space. The effect over time as more allocation happened
+was the nursery became made up of blocks from many different megablocks.
+
+Instead now we maintain a separate small list of blocks in `pinned_object_empty`
+which fresh blocks are taken from when we need a new one for a pinned block rather
+than threatening the continuity of the nursery. The size of this list is controlled
+by the PINNED_EMPTY_SIZE macro.
+
+In theory, this kind of fragmentation due to the nursery could still happen
+but in practice removing the primary cause (allocatePinned) was sufficient to
+greatly improve the situation. Another way to "fix" fragmentation of the nursery
+would be to periodically reallocate it when it was fragmented across many megablocks.
+
+Ticket: #19481
+
+# When can fragmentation be observed?
+
+Fragmentation is observed when the live data in a program is low compared to
+the overall resident size of the heap. The block allocator can reuse unused
+space within a megablock and therefore as residency
+increases again, the fragmented blocks will get filled up. Having a block-level
+fragmented heap means your program will never go below a certain memory
+threshold but it doesn't "use" more memory during periods of high residency.
+To clarify, say you observe 100 MB of fragmentation when your live data is
+4 MB, if your live data rise to 200MB then you probably will not still observe 100 MB
+of fragmentation as the block allocate will use the space in fragmented megablocks.
+
+# How to observe fragmentation
+
+Your heap is probably fragmented when
+
+* Live bytes is low
+* Memory in use (number of megablocks) is comparatively high
+* The size of the free list dominates residency (this can be observed using the
+  debug RTS and the memory inventory produced by -Dg).
+
+# Compacting Collector
+
+The compacting collector does nothing to improve megablock
+level fragmentation. The role of the compacting GC is to remove object level
+fragmentation and to use less memory when collecting. - see #19248
+*/

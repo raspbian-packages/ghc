@@ -7,6 +7,7 @@
 #include "LinkerInternals.h"
 #include "CheckUnload.h" // loaded_objects, insertOCSectionIndices
 #include "linker/M32Alloc.h"
+#include "linker/MMap.h"
 
 /* Platform specific headers */
 #if defined(OBJFORMAT_PEi386)
@@ -240,11 +241,12 @@ lookupGNUArchiveIndex(int gnuFileIndexSize, char **fileName_,
     return true;
 }
 
-static HsInt loadArchive_ (pathchar *path)
+HsInt loadArchive_ (pathchar *path)
 {
     char *image = NULL;
     HsInt retcode = 0;
     int memberSize;
+    int memberIdx = 0;
     FILE *f = NULL;
     int n;
     size_t thisFileNameSize = (size_t)-1; /* shut up bogus GCC warning */
@@ -468,6 +470,7 @@ static HsInt loadArchive_ (pathchar *path)
 #if defined(OBJFORMAT_PEi386)
         /*
         * Note [MSVC import files (ext .lib)]
+        * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         * MSVC compilers store the object files in
         * the import libraries with extension .dll
         * so on Windows we should look for those too.
@@ -515,11 +518,14 @@ static HsInt loadArchive_ (pathchar *path)
                 }
             }
 
-            int size = pathlen(path) + thisFileNameSize + 3;
-            archiveMemberName = stgMallocBytes(size * pathsize,
-                                               "loadArchive(file)");
-            pathprintf(archiveMemberName, size, WSTR("%" PATH_FMT "(%.*s)"),
-                       path, (int)thisFileNameSize, fileName);
+            int size = pathprintf(NULL, 0, WSTR("%" PATH_FMT "(#%d:%.*s)"),
+                                  path, memberIdx, (int)thisFileNameSize, fileName);
+            // I don't understand why this extra +1 is needed here; pathprintf
+            // should have given us the correct length but in practice it seems
+            // to be one byte short on Win32.
+            archiveMemberName = stgMallocBytes((size+1+1) * sizeof(pathchar), "loadArchive(file)");
+            pathprintf(archiveMemberName, size+1, WSTR("%" PATH_FMT "(#%d:%.*s)"),
+                       path, memberIdx, (int)thisFileNameSize, fileName);
 
             ObjectCode *oc = mkOc(STATIC_OBJECT, path, image, memberSize, false, archiveMemberName,
                                   misalignment);
@@ -602,6 +608,7 @@ while reading filename from `%" PATH_FMT "'", path);
             }
             DEBUG_LOG("successfully read one pad byte\n");
         }
+        memberIdx ++;
         DEBUG_LOG("reached end of archive loading while loop\n");
     }
     retcode = 1;
@@ -630,3 +637,21 @@ HsInt loadArchive (pathchar *path)
    RELEASE_LOCK(&linker_mutex);
    return r;
 }
+
+bool isArchive (pathchar *path)
+{
+    static const char ARCHIVE_HEADER[] = "!<arch>\n";
+    char buffer[10];
+    FILE *f = pathopen(path, WSTR("rb"));
+    if (f == NULL) {
+        return false;
+    }
+
+    size_t ret = fread(buffer, 1, sizeof(buffer), f);
+    fclose(f);
+    if (ret < sizeof(buffer)) {
+        return false;
+    }
+    return strncmp(ARCHIVE_HEADER, buffer, sizeof(ARCHIVE_HEADER)-1) == 0;
+}
+

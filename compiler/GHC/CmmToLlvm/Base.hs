@@ -15,19 +15,19 @@ module GHC.CmmToLlvm.Base (
         LiveGlobalRegs,
         LlvmUnresData, LlvmData, UnresLabel, UnresStatic,
 
-        LlvmVersion, llvmVersionSupported, parseLlvmVersion,
-        supportedLlvmVersionLowerBound, supportedLlvmVersionUpperBound,
+        LlvmVersion, supportedLlvmVersionLowerBound, supportedLlvmVersionUpperBound,
+        llvmVersionSupported, parseLlvmVersion,
         llvmVersionStr, llvmVersionList,
 
         LlvmM,
-        runLlvm, liftStream, withClearVars, varLookup, varInsert,
+        runLlvm, withClearVars, varLookup, varInsert,
         markStackReg, checkStackReg,
-        funLookup, funInsert, getLlvmVer, getDynFlags,
+        funLookup, funInsert, getLlvmVer,
         dumpIfSetLlvm, renderLlvm, markUsedVar, getUsedVars,
-        ghcInternalFunctions, getPlatform, getLlvmOpts,
+        ghcInternalFunctions, getPlatform, getConfig,
 
         getMetaUniqueId,
-        setUniqMeta, getUniqMeta,
+        setUniqMeta, getUniqMeta, liftIO,
 
         cmmToLlvmType, widthToLlvmFloat, widthToLlvmInt, llvmFunTy,
         llvmFunSig, llvmFunArgs, llvmStdFunAttrs, llvmFunAlign, llvmInfAlign,
@@ -39,14 +39,14 @@ module GHC.CmmToLlvm.Base (
         aliasify, llvmDefLabel
     ) where
 
-#include "HsVersions.h"
-#include "ghcautoconf.h"
+#include "ghc-llvm-version.h"
 
 import GHC.Prelude
 import GHC.Utils.Panic
 
 import GHC.Llvm
 import GHC.CmmToLlvm.Regs
+import GHC.CmmToLlvm.Config
 
 import GHC.Cmm.CLabel
 import GHC.Cmm.Ppr.Expr ()
@@ -62,13 +62,12 @@ import GHC.Types.Unique
 import GHC.Utils.BufHandle   ( BufHandle )
 import GHC.Types.Unique.Set
 import GHC.Types.Unique.Supply
-import GHC.Utils.Error
-import qualified GHC.Data.Stream as Stream
+import GHC.Utils.Logger
 
 import Data.Maybe (fromJust)
 import Control.Monad (ap)
 import Data.Char (isDigit)
-import Data.List (sortBy, groupBy, intercalate)
+import Data.List (sortBy, groupBy, intercalate, isPrefixOf)
 import Data.Ord (comparing)
 import qualified Data.List.NonEmpty as NE
 
@@ -151,10 +150,10 @@ llvmInfAlign :: Platform -> LMAlign
 llvmInfAlign platform = Just (platformWordSizeInBytes platform)
 
 -- | Section to use for a function
-llvmFunSection :: LlvmOpts -> LMString -> LMSection
+llvmFunSection :: LlvmCgConfig -> LMString -> LMSection
 llvmFunSection opts lbl
-    | llvmOptsSplitSections opts = Just (concatFS [fsLit ".text.", lbl])
-    | otherwise                  = Nothing
+    | llvmCgSplitSection opts = Just (concatFS [fsLit ".text.", lbl])
+    | otherwise               = Nothing
 
 -- | A Function's arguments
 llvmFunArgs :: Platform -> LiveGlobalRegs -> [LlvmVar]
@@ -265,9 +264,6 @@ llvmPtrBits platform = widthInBits $ typeWidth $ gcWord platform
 -- * Llvm Version
 --
 
-newtype LlvmVersion = LlvmVersion { llvmVersionNE :: NE.NonEmpty Int }
-  deriving (Eq, Ord)
-
 parseLlvmVersion :: String -> Maybe LlvmVersion
 parseLlvmVersion =
     fmap LlvmVersion . NE.nonEmpty . go [] . dropWhile (not . isDigit)
@@ -305,20 +301,20 @@ llvmVersionList = NE.toList . llvmVersionNE
 --
 
 data LlvmEnv = LlvmEnv
-  { envVersion :: LlvmVersion      -- ^ LLVM version
-  , envOpts    :: LlvmOpts         -- ^ LLVM backend options
-  , envDynFlags :: DynFlags        -- ^ Dynamic flags
-  , envOutput :: BufHandle         -- ^ Output buffer
-  , envMask :: !Char               -- ^ Mask for creating unique values
-  , envFreshMeta :: MetaId         -- ^ Supply of fresh metadata IDs
-  , envUniqMeta :: UniqFM Unique MetaId   -- ^ Global metadata nodes
-  , envFunMap :: LlvmEnvMap        -- ^ Global functions so far, with type
-  , envAliases :: UniqSet LMString -- ^ Globals that we had to alias, see [Llvm Forward References]
-  , envUsedVars :: [LlvmVar]       -- ^ Pointers to be added to llvm.used (see @cmmUsedLlvmGens@)
+  { envVersion   :: LlvmVersion      -- ^ LLVM version
+  , envConfig    :: !LlvmCgConfig    -- ^ Configuration for LLVM code gen
+  , envLogger    :: !Logger          -- ^ Logger
+  , envOutput    :: BufHandle        -- ^ Output buffer
+  , envMask      :: !Char            -- ^ Mask for creating unique values
+  , envFreshMeta :: MetaId           -- ^ Supply of fresh metadata IDs
+  , envUniqMeta  :: UniqFM Unique MetaId   -- ^ Global metadata nodes
+  , envFunMap    :: LlvmEnvMap       -- ^ Global functions so far, with type
+  , envAliases   :: UniqSet LMString -- ^ Globals that we had to alias, see [Llvm Forward References]
+  , envUsedVars  :: [LlvmVar]        -- ^ Pointers to be added to llvm.used (see @cmmUsedLlvmGens@)
 
     -- the following get cleared for every function (see @withClearVars@)
-  , envVarMap :: LlvmEnvMap        -- ^ Local variables so far, with type
-  , envStackRegs :: [GlobalReg]    -- ^ Non-constant registers (alloca'd in the function prelude)
+  , envVarMap    :: LlvmEnvMap       -- ^ Local variables so far, with type
+  , envStackRegs :: [GlobalReg]      -- ^ Non-constant registers (alloca'd in the function prelude)
   }
 
 type LlvmEnvMap = UniqFM Unique LlvmType
@@ -335,16 +331,16 @@ instance Monad LlvmM where
     m >>= f  = LlvmM $ \env -> do (x, env') <- runLlvmM m env
                                   runLlvmM (f x) env'
 
-instance HasDynFlags LlvmM where
-    getDynFlags = LlvmM $ \env -> return (envDynFlags env, env)
+instance HasLogger LlvmM where
+    getLogger = LlvmM $ \env -> return (envLogger env, env)
+
 
 -- | Get target platform
 getPlatform :: LlvmM Platform
-getPlatform = llvmOptsPlatform <$> getLlvmOpts
+getPlatform = llvmCgPlatform <$> getConfig
 
--- | Get LLVM options
-getLlvmOpts :: LlvmM LlvmOpts
-getLlvmOpts = LlvmM $ \env -> return (envOpts env, env)
+getConfig :: LlvmM LlvmCgConfig
+getConfig = LlvmM $ \env -> return (envConfig env, env)
 
 instance MonadUnique LlvmM where
     getUniqueSupplyM = do
@@ -361,22 +357,22 @@ liftIO m = LlvmM $ \env -> do x <- m
                               return (x, env)
 
 -- | Get initial Llvm environment.
-runLlvm :: DynFlags -> LlvmVersion -> BufHandle -> LlvmM a -> IO a
-runLlvm dflags ver out m = do
+runLlvm :: Logger -> LlvmCgConfig -> LlvmVersion -> BufHandle -> LlvmM a -> IO a
+runLlvm logger cfg ver out m = do
     (a, _) <- runLlvmM m env
     return a
-  where env = LlvmEnv { envFunMap = emptyUFM
-                      , envVarMap = emptyUFM
+  where env = LlvmEnv { envFunMap    = emptyUFM
+                      , envVarMap    = emptyUFM
                       , envStackRegs = []
-                      , envUsedVars = []
-                      , envAliases = emptyUniqSet
-                      , envVersion = ver
-                      , envOpts = initLlvmOpts dflags
-                      , envDynFlags = dflags
-                      , envOutput = out
-                      , envMask = 'n'
+                      , envUsedVars  = []
+                      , envAliases   = emptyUniqSet
+                      , envVersion   = ver
+                      , envConfig    = cfg
+                      , envLogger    = logger
+                      , envOutput    = out
+                      , envMask      = 'n'
                       , envFreshMeta = MetaId 0
-                      , envUniqMeta = emptyUFM
+                      , envUniqMeta  = emptyUFM
                       }
 
 -- | Get environment (internal)
@@ -386,14 +382,6 @@ getEnv f = LlvmM (\env -> return (f env, env))
 -- | Modify environment (internal)
 modifyEnv :: (LlvmEnv -> LlvmEnv) -> LlvmM ()
 modifyEnv f = LlvmM (\env -> return ((), f env))
-
--- | Lift a stream into the LlvmM monad
-liftStream :: Stream.Stream IO a x -> Stream.Stream LlvmM a x
-liftStream s = Stream.Stream $ do
-  r <- liftIO $ Stream.runStream s
-  case r of
-    Left b        -> return (Left b)
-    Right (a, r2) -> return (Right (a, liftStream r2))
 
 -- | Clear variables from the environment for a subcomputation
 withClearVars :: LlvmM a -> LlvmM a
@@ -431,17 +419,16 @@ getLlvmVer = getEnv envVersion
 -- | Dumps the document if the corresponding flag has been set by the user
 dumpIfSetLlvm :: DumpFlag -> String -> DumpFormat -> Outp.SDoc -> LlvmM ()
 dumpIfSetLlvm flag hdr fmt doc = do
-  dflags <- getDynFlags
-  liftIO $ dumpIfSet_dyn dflags flag hdr fmt doc
+  logger <- getLogger
+  liftIO $ putDumpFileMaybe logger flag hdr fmt doc
 
 -- | Prints the given contents to the output handle
 renderLlvm :: Outp.SDoc -> LlvmM ()
 renderLlvm sdoc = do
 
     -- Write to output
-    dflags <- getDynFlags
+    ctx <- llvmCgContext <$> getConfig
     out <- getEnv envOutput
-    let ctx = initSDocContext dflags (Outp.mkCodeStyle Outp.CStyle)
     liftIO $ Outp.bufLeftRenderSDoc ctx out sdoc
 
     -- Dump, if requested
@@ -481,9 +468,8 @@ getUniqMeta s = getEnv (flip lookupUFM s . envUniqMeta)
 ghcInternalFunctions :: LlvmM ()
 ghcInternalFunctions = do
     platform <- getPlatform
-    dflags <- getDynFlags
     let w = llvmWord platform
-        cint = LMInt $ widthInBits $ cIntWidth dflags
+        cint = LMInt $ widthInBits $ cIntWidth platform
     mk "memcmp" cint [i8Ptr, i8Ptr, w]
     mk "memcpy" i8Ptr [i8Ptr, i8Ptr, w]
     mk "memmove" i8Ptr [i8Ptr, i8Ptr, w]
@@ -504,11 +490,10 @@ ghcInternalFunctions = do
 -- | Pretty print a 'CLabel'.
 strCLabel_llvm :: CLabel -> LlvmM LMString
 strCLabel_llvm lbl = do
-    dflags <- getDynFlags
-    let sdoc = pprCLabel dflags lbl
-        str = Outp.renderWithStyle
-                  (initSDocContext dflags (Outp.mkCodeStyle Outp.CStyle))
-                  sdoc
+    ctx <- llvmCgContext <$> getConfig
+    platform <- getPlatform
+    let sdoc = pprCLabel platform CStyle lbl
+        str = Outp.renderWithContext ctx sdoc
     return (fsLit str)
 
 -- ----------------------------------------------------------------------------
@@ -565,15 +550,22 @@ generateExternDecls = do
   modifyEnv $ \env -> env { envAliases = emptyUniqSet }
   return (concat defss, [])
 
+-- | Is a variable one of the special @$llvm@ globals?
+isBuiltinLlvmVar :: LlvmVar -> Bool
+isBuiltinLlvmVar (LMGlobalVar lbl _ _ _ _ _) =
+    "$llvm" `isPrefixOf` unpackFS lbl
+isBuiltinLlvmVar _ = False
+
 -- | Here we take a global variable definition, rename it with a
 -- @$def@ suffix, and generate the appropriate alias.
 aliasify :: LMGlobal -> LlvmM [LMGlobal]
--- See note [emit-time elimination of static indirections] in "GHC.Cmm.CLabel".
+-- See Note [emit-time elimination of static indirections] in "GHC.Cmm.CLabel".
 -- Here we obtain the indirectee's precise type and introduce
 -- fresh aliases to both the precise typed label (lbl$def) and the i8*
 -- typed (regular) label of it with the matching new names.
-aliasify (LMGlobal (LMGlobalVar lbl ty@LMAlias{} link sect align Alias)
-                   (Just orig)) = do
+aliasify (LMGlobal var@(LMGlobalVar lbl ty@LMAlias{} link sect align Alias)
+                   (Just orig))
+  | not $ isBuiltinLlvmVar var = do
     let defLbl = llvmDefLabel lbl
         LMStaticPointer (LMGlobalVar origLbl _ oLnk Nothing Nothing Alias) = orig
         defOrigLbl = llvmDefLabel origLbl
@@ -586,7 +578,8 @@ aliasify (LMGlobal (LMGlobalVar lbl ty@LMAlias{} link sect align Alias)
     pure [ LMGlobal (LMGlobalVar defLbl ty link sect align Alias) (Just defOrig)
          , LMGlobal (LMGlobalVar lbl i8Ptr link sect align Alias) (Just orig')
          ]
-aliasify (LMGlobal var val) = do
+aliasify (LMGlobal var val)
+  | not $ isBuiltinLlvmVar var = do
     let LMGlobalVar lbl ty link sect align const = var
 
         defLbl = llvmDefLabel lbl
@@ -604,9 +597,10 @@ aliasify (LMGlobal var val) = do
     return [ LMGlobal defVar val
            , LMGlobal aliasVar (Just aliasVal)
            ]
+aliasify global = pure [global]
 
 -- Note [Llvm Forward References]
---
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 -- The issue here is that LLVM insists on being strongly typed at
 -- every corner, so the first time we mention something, we have to
 -- settle what type we assign to it. That makes things awkward, as Cmm
@@ -662,3 +656,6 @@ aliasify (LMGlobal var val) = do
 -- away with casting the alias to the desired type in @getSymbolPtr@
 -- and instead just emit a reference to the definition symbol directly.
 -- This is the @Just@ case in @getSymbolPtr@.
+--
+-- Note that we must take care not to turn LLVM's builtin variables into
+-- aliases (e.g. $llvm.global_ctors) since this confuses LLVM.

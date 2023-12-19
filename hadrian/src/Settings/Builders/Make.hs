@@ -12,7 +12,7 @@ makeBuilderArgs = do
     threads    <- shakeThreads <$> expr getShakeOptions
     stage      <- getStage
     gmpPath    <- expr (gmpBuildPath stage)
-    libffiPaths <- forM [Stage1 ..] $ \s -> expr (libffiBuildPath s)
+    libffiPaths <- forM [Stage1, Stage2, Stage3 ] $ \s -> expr (libffiBuildPath s)
     let t = show $ max 4 (threads - 2) -- Don't use all Shake's threads
     mconcat $
         (builder (Make gmpPath   ) ? pure ["MAKEFLAGS=-j" ++ t]) :
@@ -25,13 +25,15 @@ validateBuilderArgs = builder (Make "testsuite/tests") ? do
     top                 <- expr topDirectory
     compiler            <- expr $ fullpath ghc
     checkPpr            <- expr $ fullpath checkPpr
-    checkApiAnnotations <- expr $ fullpath checkApiAnnotations
+    checkExact          <- expr $ fullpath checkExact
+    countDeps          <- expr $ fullpath countDeps
     args                <- expr $ userSetting defaultTestArgs
     return [ setTestSpeed $ testSpeed args
            , "THREADS=" ++ show threads
            , "TEST_HC=" ++ (top -/- compiler)
            , "CHECK_PPR=" ++ (top -/- checkPpr)
-           , "CHECK_API_ANNOTATIONS=" ++ (top -/- checkApiAnnotations)
+           , "CHECK_EXACT=" ++ (top -/- checkExact)
+           , "COUNT_DEPS=" ++ (top -/- countDeps)
            ]
   where
     fullpath :: Package -> Action FilePath

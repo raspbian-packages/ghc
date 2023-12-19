@@ -1,12 +1,7 @@
-{-# LANGUAGE CPP, BangPatterns, ScopedTypeVariables #-}
+{-# LANGUAGE BangPatterns, ScopedTypeVariables #-}
+{-# LANGUAGE MagicHash, UnboxedTuples, PatternGuards #-}
 {-# OPTIONS_GHC -fno-warn-unused-imports #-}
-#if __GLASGOW_HASKELL__ == 700
--- This is needed as a workaround for an old bug in GHC 7.0.1 (Trac #4498)
-{-# LANGUAGE MonoPatBinds #-}
-#endif
-#if __GLASGOW_HASKELL__ >= 701
 {-# LANGUAGE Trustworthy #-}
-#endif
 {- | Copyright : (c) 2010-2011 Simon Meier
                  (c) 2010      Jasper van der Jeugt
 License        : BSD3-style (see LICENSE)
@@ -438,10 +433,13 @@ module Data.ByteString.Builder.Prim (
   -- a decimal number with UTF-8 encoded characters.
   , charUtf8
 
+  , cstring
+  , cstringUtf8
+
 {-
   -- * Testing support
   -- | The following four functions are intended for testing use
-  -- only. They are /not/ efficient. Basic encodings are efficently executed by
+  -- only. They are /not/ efficient. Basic encodings are efficiently executed by
   -- creating 'Builder's from them using the @encodeXXX@ functions explained at
   -- the top of this module.
 
@@ -454,14 +452,12 @@ module Data.ByteString.Builder.Prim (
   ) where
 
 import           Data.ByteString.Builder.Internal
-import           Data.ByteString.Builder.Prim.Internal.UncheckedShifts
 
 import qualified Data.ByteString               as S
 import qualified Data.ByteString.Internal      as S
 import qualified Data.ByteString.Lazy.Internal as L
 
 import           Data.Monoid
-import           Data.List (unfoldr)  -- HADDOCK ONLY
 import           Data.Char (chr, ord)
 import           Control.Monad ((<=<), unless)
 
@@ -470,16 +466,12 @@ import qualified Data.ByteString.Builder.Prim.Internal as I (size, sizeBound)
 import           Data.ByteString.Builder.Prim.Binary
 import           Data.ByteString.Builder.Prim.ASCII
 
-#if MIN_VERSION_base(4,4,0)
-#if MIN_VERSION_base(4,7,0)
 import           Foreign
-#else
-import           Foreign hiding (unsafeForeignPtrToPtr)
-#endif
+import           Foreign.C.Types
 import           Foreign.ForeignPtr.Unsafe (unsafeForeignPtrToPtr)
-#else
-import           Foreign
-#endif
+import           GHC.Word (Word8 (..))
+import           GHC.Exts
+import           GHC.IO
 
 ------------------------------------------------------------------------------
 -- Creating Builders from bounded primitives
@@ -495,7 +487,7 @@ primFixed = primBounded . toB
 primMapListFixed :: FixedPrim a -> ([a] -> Builder)
 primMapListFixed = primMapListBounded . toB
 
--- | Encode a list of values represented as an 'unfoldr' with a 'FixedPrim'.
+-- | Encode a list of values represented as an 'Data.List.unfoldr' with a 'FixedPrim'.
 {-# INLINE primUnfoldrFixed #-}
 primUnfoldrFixed :: FixedPrim b -> (a -> Maybe (b, a)) -> a -> Builder
 primUnfoldrFixed = primUnfoldrBounded . toB
@@ -540,9 +532,9 @@ primMapLazyByteStringFixed = primMapLazyByteStringBounded . toB
 -- influences the boundaries of the generated chunks. However, for a user of
 -- this library it is observationally equivalent, as chunk boundaries of a lazy
 -- 'L.ByteString' can only be observed through the internal interface.
--- Morevoer, we expect that all primitives write much fewer than 4kb (the
+-- Moreover, we expect that all primitives write much fewer than 4kb (the
 -- default short buffer size). Hence, it is safe to ignore the additional
--- memory spilled due to the more agressive buffer wrapping introduced by this
+-- memory spilled due to the more aggressive buffer wrapping introduced by this
 -- optimization.
 --
 {-# INLINE[1] primBounded #-}
@@ -611,12 +603,11 @@ primUnfoldrBounded :: BoundedPrim b -> (a -> Maybe (b, a)) -> a -> Builder
 primUnfoldrBounded w f x0 =
     builder $ fillWith x0
   where
-    fillWith x k !(BufferRange op0 ope0) =
+    fillWith x k (BufferRange op0 ope0) =
         go (f x) op0
       where
-        go !Nothing        !op         = do let !br' = BufferRange op ope0
-                                            k br'
-        go !(Just (y, x')) !op
+        go Nothing        !op         = k (BufferRange op ope0)
+        go (Just (y, x')) !op
           | op `plusPtr` bound <= ope0 = runB w y op >>= go (f x')
           | otherwise                  = return $ bufferFull bound op $
               \(BufferRange opNew opeNew) -> do
@@ -638,11 +629,11 @@ primMapByteStringBounded w =
     \bs -> builder $ step bs
   where
     bound = I.sizeBound w
-    step (S.PS ifp ioff isize) !k =
-        goBS (unsafeForeignPtrToPtr ifp `plusPtr` ioff)
+    step (S.BS ifp isize) !k =
+        goBS (unsafeForeignPtrToPtr ifp)
       where
-        !ipe = unsafeForeignPtrToPtr ifp `plusPtr` (ioff + isize)
-        goBS !ip0 !br@(BufferRange op0 ope)
+        !ipe = unsafeForeignPtrToPtr ifp `plusPtr` isize
+        goBS !ip0 br@(BufferRange op0 ope)
           | ip0 >= ipe = do
               touchForeignPtr ifp -- input buffer consumed
               k br
@@ -673,6 +664,60 @@ primMapLazyByteStringBounded w =
 
 
 ------------------------------------------------------------------------------
+-- Raw CString encoding
+------------------------------------------------------------------------------
+
+-- | A null-terminated ASCII encoded 'Foreign.C.String.CString'.
+-- Null characters are not representable.
+--
+-- @since 0.11.0.0
+cstring :: Addr# -> Builder
+cstring =
+    \addr0 -> builder $ step addr0
+  where
+    step :: Addr# -> BuildStep r -> BuildStep r
+    step !addr !k br@(BufferRange op0@(Ptr op0#) ope)
+      | W8# ch == 0 = k br
+      | op0 == ope =
+          return $ bufferFull 1 op0 (step addr k)
+      | otherwise = do
+          IO $ \s -> case writeWord8OffAddr# op0# 0# ch s of
+                       s' -> (# s', () #)
+          let br' = BufferRange (op0 `plusPtr` 1) ope
+          step (addr `plusAddr#` 1#) k br'
+      where
+        !ch = indexWord8OffAddr# addr 0#
+
+-- | A null-terminated UTF-8 encoded 'Foreign.C.String.CString'.
+-- Null characters can be encoded as @0xc0 0x80@.
+--
+-- @since 0.11.0.0
+cstringUtf8 :: Addr# -> Builder
+cstringUtf8 =
+    \addr0 -> builder $ step addr0
+  where
+    step :: Addr# -> BuildStep r -> BuildStep r
+    step !addr !k br@(BufferRange op0@(Ptr op0#) ope)
+      | W8# ch == 0 = k br
+      | op0 == ope =
+          return $ bufferFull 1 op0 (step addr k)
+        -- NULL is encoded as 0xc0 0x80
+      | W8# ch == 0xc0
+      , W8# (indexWord8OffAddr# addr 1#) == 0x80 = do
+          let !(W8# nullByte#) = 0
+          IO $ \s -> case writeWord8OffAddr# op0# 0# nullByte# s of
+                       s' -> (# s', () #)
+          let br' = BufferRange (op0 `plusPtr` 1) ope
+          step (addr `plusAddr#` 2#) k br'
+      | otherwise = do
+          IO $ \s -> case writeWord8OffAddr# op0# 0# ch s of
+                       s' -> (# s', () #)
+          let br' = BufferRange (op0 `plusPtr` 1) ope
+          step (addr `plusAddr#` 1#) k br'
+      where
+        !ch = indexWord8OffAddr# addr 0#
+
+------------------------------------------------------------------------------
 -- Char8 encoding
 ------------------------------------------------------------------------------
 
@@ -693,7 +738,7 @@ charUtf8 = boundedPrim 4 (encodeCharUtf8 f1 f2 f3 f4)
   where
     pokeN n io op  = io op >> return (op `plusPtr` n)
 
-    f1 x1          = pokeN 1 $ \op -> do pokeByteOff op 0 x1
+    f1 x1          = pokeN 1 $ \op ->    pokeByteOff op 0 x1
 
     f2 x1 x2       = pokeN 2 $ \op -> do pokeByteOff op 0 x1
                                          pokeByteOff op 1 x2
@@ -736,4 +781,3 @@ encodeCharUtf8 f1 f2 f3 f4 c = case ord c of
                x3 = fromIntegral $ ((x `shiftR` 6) .&. 0x3F) + 0x80
                x4 = fromIntegral $ (x .&. 0x3F) + 0x80
            in f4 x1 x2 x3 x4
-

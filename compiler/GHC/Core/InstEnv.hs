@@ -7,51 +7,55 @@
 The bits common to GHC.Tc.TyCl.Instance and GHC.Tc.Deriv.
 -}
 
-{-# LANGUAGE CPP, DeriveDataTypeable #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 
 module GHC.Core.InstEnv (
         DFunId, InstMatch, ClsInstLookupResult,
+        PotentialUnifiers(..), getPotentialUnifiers, nullUnifiers,
         OverlapFlag(..), OverlapMode(..), setOverlapModeMaybe,
         ClsInst(..), DFunInstType, pprInstance, pprInstanceHdr, pprInstances,
         instanceHead, instanceSig, mkLocalInstance, mkImportedInstance,
-        instanceDFunId, updateClsInstDFun, instanceRoughTcs,
+        instanceDFunId, updateClsInstDFuns, updateClsInstDFun,
         fuzzyClsInstCmp, orphNamesOfClsInst,
 
         InstEnvs(..), VisibleOrphanModules, InstEnv,
-        emptyInstEnv, extendInstEnv,
-        deleteFromInstEnv, deleteDFunFromInstEnv,
+        mkInstEnv, emptyInstEnv, unionInstEnv, extendInstEnv,
+        filterInstEnv, deleteFromInstEnv, deleteDFunFromInstEnv,
+        anyInstEnv,
         identicalClsInstHead,
-        extendInstEnvList, lookupUniqueInstEnv, lookupInstEnv, instEnvElts, instEnvClasses,
+        extendInstEnvList, lookupUniqueInstEnv, lookupInstEnv, instEnvElts, instEnvClasses, mapInstEnv,
         memberInstEnv,
         instIsVisible,
         classInstances, instanceBindFun,
+        classNameInstances,
         instanceCantMatch, roughMatchTcs,
         isOverlappable, isOverlapping, isIncoherent
     ) where
-
-#include "HsVersions.h"
 
 import GHC.Prelude
 
 import GHC.Tc.Utils.TcType -- InstEnv is really part of the type checker,
               -- and depends on TcType in many ways
 import GHC.Core ( IsOrphan(..), isOrphan, chooseOrphanAnchor )
-import GHC.Unit
+import GHC.Core.RoughMap
+import GHC.Unit.Module.Env
+import GHC.Unit.Types
 import GHC.Core.Class
 import GHC.Types.Var
+import GHC.Types.Unique.DSet
 import GHC.Types.Var.Set
 import GHC.Types.Name
 import GHC.Types.Name.Set
-import GHC.Types.Unique (getUnique)
 import GHC.Core.Unify
-import GHC.Utils.Outputable
-import GHC.Utils.Error
 import GHC.Types.Basic
-import GHC.Types.Unique.DFM
-import GHC.Utils.Misc
 import GHC.Types.Id
 import Data.Data        ( Data )
-import Data.Maybe       ( isJust, isNothing )
+import Data.Maybe       ( isJust )
+
+import GHC.Utils.Outputable
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
+import Data.Semigroup
 
 {-
 ************************************************************************
@@ -67,9 +71,12 @@ import Data.Maybe       ( isJust, isNothing )
 data ClsInst
   = ClsInst {   -- Used for "rough matching"; see
                 -- Note [ClsInst laziness and the rough-match fields]
-                -- INVARIANT: is_tcs = roughMatchTcs is_tys
-               is_cls_nm :: Name        -- ^ Class name
-             , is_tcs  :: [Maybe Name]  -- ^ Top of type args
+                -- INVARIANT: is_tcs = KnownTc is_cls_nm : roughMatchTcs is_tys
+               is_cls_nm :: Name          -- ^ Class name
+
+             , is_tcs  :: [RoughMatchTc]  -- ^ Top of type args
+                          -- The class itself is always
+                          -- the first element of this list
 
                -- | @is_dfun_name = idName . is_dfun@.
                --
@@ -102,13 +109,12 @@ data ClsInst
 -- instances before displaying them to the user.
 fuzzyClsInstCmp :: ClsInst -> ClsInst -> Ordering
 fuzzyClsInstCmp x y =
-    stableNameCmp (is_cls_nm x) (is_cls_nm y) `mappend`
-    mconcat (map cmp (zip (is_tcs x) (is_tcs y)))
+    foldMap cmp (zip (is_tcs x) (is_tcs y))
   where
-    cmp (Nothing, Nothing) = EQ
-    cmp (Nothing, Just _) = LT
-    cmp (Just _, Nothing) = GT
-    cmp (Just x, Just y) = stableNameCmp x y
+    cmp (RM_WildCard,  RM_WildCard)   = EQ
+    cmp (RM_WildCard,  RM_KnownTc _) = LT
+    cmp (RM_KnownTc _, RM_WildCard)   = GT
+    cmp (RM_KnownTc x, RM_KnownTc y) = stableNameCmp x y
 
 isOverlappable, isOverlapping, isIncoherent :: ClsInst -> Bool
 isOverlappable i = hasOverlappableFlag (overlapMode (is_flag i))
@@ -133,25 +139,16 @@ We avoid this as follows:
   pull in interfaces that it refers to. See Note [Proper-match fields].
 
 * Rough-match fields. During instance lookup, we use the is_cls_nm :: Name and
-  is_tcs :: [Maybe Name] fields to perform a "rough match", *without* poking
+  is_tcs :: [RoughMatchTc] fields to perform a "rough match", *without* poking
   inside the DFunId. The rough-match fields allow us to say "definitely does not
-  match", based only on Names.
+  match", based only on Names.  See GHC.Core.Unify
+  Note [Rough matching in class and family instances]
 
   This laziness is very important; see #12367. Try hard to avoid pulling on
   the structured fields unless you really need the instance.
 
 * Another place to watch is InstEnv.instIsVisible, which needs the module to
   which the ClsInst belongs. We can get this from is_dfun_name.
-
-* In is_tcs,
-    Nothing  means that this type arg is a type variable
-
-    (Just n) means that this type arg is a
-                TyConApp with a type constructor of n.
-                This is always a real tycon, never a synonym!
-                (Two different synonyms might match, but two
-                different real tycons can't.)
-                NB: newtypes are not transparent, though!
 -}
 
 {-
@@ -204,9 +201,9 @@ updateClsInstDFun :: (DFunId -> DFunId) -> ClsInst -> ClsInst
 updateClsInstDFun tidy_dfun ispec
   = ispec { is_dfun = tidy_dfun (is_dfun ispec) }
 
-instanceRoughTcs :: ClsInst -> [Maybe Name]
-instanceRoughTcs = is_tcs
-
+updateClsInstDFuns :: (DFunId -> DFunId) -> InstEnv -> InstEnv
+updateClsInstDFuns tidy_dfun (InstEnv rm)
+  = InstEnv $ fmap (updateClsInstDFun tidy_dfun) rm
 
 instance NamedThing ClsInst where
    getName ispec = getName (is_dfun ispec)
@@ -231,7 +228,7 @@ pprInstances :: [ClsInst] -> SDoc
 pprInstances ispecs = vcat (map pprInstance ispecs)
 
 instanceHead :: ClsInst -> ([TyVar], Class, [Type])
--- Returns the head, using the fresh tyavs from the ClsInst
+-- Returns the head, using the fresh tyvars from the ClsInst
 instanceHead (ClsInst { is_tvs = tvs, is_tys = tys, is_dfun = dfun })
    = (tvs, cls, tys)
    where
@@ -268,13 +265,13 @@ mkLocalInstance dfun oflag tvs cls tys
             , is_tvs = tvs
             , is_dfun_name = dfun_name
             , is_cls = cls, is_cls_nm = cls_name
-            , is_tys = tys, is_tcs = roughMatchTcs tys
+            , is_tys = tys, is_tcs = RM_KnownTc cls_name : roughMatchTcs tys
             , is_orphan = orph
             }
   where
     cls_name = className cls
     dfun_name = idName dfun
-    this_mod = ASSERT( isExternalName dfun_name ) nameModule dfun_name
+    this_mod = assert (isExternalName dfun_name) $ nameModule dfun_name
     is_local name = nameIsLocalOrFrom this_mod name
 
         -- Compute orphanhood.  See Note [Orphans] in GHC.Core.InstEnv
@@ -282,9 +279,9 @@ mkLocalInstance dfun oflag tvs cls tys
     arg_names = [filterNameSet is_local (orphNamesOfType ty) | ty <- tys]
 
     -- See Note [When exactly is an instance decl an orphan?]
-    orph | is_local cls_name = NotOrphan (nameOccName cls_name)
-         | all notOrphan mb_ns  = ASSERT( not (null mb_ns) ) head mb_ns
-         | otherwise         = IsOrphan
+    orph | is_local cls_name   = NotOrphan (nameOccName cls_name)
+         | all notOrphan mb_ns = assert (not (null mb_ns)) $ head mb_ns
+         | otherwise           = IsOrphan
 
     notOrphan NotOrphan{} = True
     notOrphan _ = False
@@ -298,12 +295,12 @@ mkLocalInstance dfun oflag tvs cls tys
 
     choose_one nss = chooseOrphanAnchor (unionNameSets nss)
 
-mkImportedInstance :: Name         -- ^ the name of the class
-                   -> [Maybe Name] -- ^ the types which the class was applied to
-                   -> Name         -- ^ the 'Name' of the dictionary binding
-                   -> DFunId       -- ^ the 'Id' of the dictionary.
-                   -> OverlapFlag  -- ^ may this instance overlap?
-                   -> IsOrphan     -- ^ is this instance an orphan?
+mkImportedInstance :: Name           -- ^ the name of the class
+                   -> [RoughMatchTc] -- ^ the rough match signature of the instance
+                   -> Name           -- ^ the 'Name' of the dictionary binding
+                   -> DFunId         -- ^ the 'Id' of the dictionary.
+                   -> OverlapFlag    -- ^ may this instance overlap?
+                   -> IsOrphan       -- ^ is this instance an orphan?
                    -> ClsInst
 -- Used for imported instances, where we get the rough-match stuff
 -- from the interface file
@@ -313,7 +310,8 @@ mkImportedInstance cls_nm mb_tcs dfun_name dfun oflag orphan
   = ClsInst { is_flag = oflag, is_dfun = dfun
             , is_tvs = tvs, is_tys = tys
             , is_dfun_name = dfun_name
-            , is_cls_nm = cls_nm, is_cls = cls, is_tcs = mb_tcs
+            , is_cls_nm = cls_nm, is_cls = cls
+            , is_tcs = RM_KnownTc cls_nm : mb_tcs
             , is_orphan = orphan }
   where
     (tvs, _, cls, tys) = tcSplitDFunTy (idType dfun)
@@ -395,8 +393,11 @@ UniqDFM. See also Note [Deterministic UniqFM]
 -- We still use Class as key type as it's both the common case
 -- and conveys the meaning better. But the implementation of
 --InstEnv is a bit more lax internally.
-type InstEnv = UniqDFM Class ClsInstEnv      -- Maps Class to instances for that class
+newtype InstEnv = InstEnv (RoughMap ClsInst)      -- Maps Class to instances for that class
   -- See Note [InstEnv determinism]
+
+instance Outputable InstEnv where
+  ppr (InstEnv rm) = pprInstances $ elemsRM rm
 
 -- | 'InstEnvs' represents the combination of the global type class instance
 -- environment, the local type class instance environment, and the set of
@@ -415,30 +416,32 @@ data InstEnvs = InstEnvs {
 -- transitively reachable orphan modules (modules that define orphan instances).
 type VisibleOrphanModules = ModuleSet
 
-newtype ClsInstEnv
-  = ClsIE [ClsInst]    -- The instances for a particular class, in any order
-
-instance Outputable ClsInstEnv where
-  ppr (ClsIE is) = pprInstances is
 
 -- INVARIANTS:
 --  * The is_tvs are distinct in each ClsInst
 --      of a ClsInstEnv (so we can safely unify them)
 
--- Thus, the @ClassInstEnv@ for @Eq@ might contain the following entry:
+-- Thus, the @ClsInstEnv@ for @Eq@ might contain the following entry:
 --      [a] ===> dfun_Eq_List :: forall a. Eq a => Eq [a]
 -- The "a" in the pattern must be one of the forall'd variables in
 -- the dfun type.
 
 emptyInstEnv :: InstEnv
-emptyInstEnv = emptyUDFM
+emptyInstEnv = InstEnv emptyRM
+
+mkInstEnv :: [ClsInst] -> InstEnv
+mkInstEnv = extendInstEnvList emptyInstEnv
 
 instEnvElts :: InstEnv -> [ClsInst]
-instEnvElts ie = [elt | ClsIE elts <- eltsUDFM ie, elt <- elts]
+instEnvElts (InstEnv rm) = elemsRM rm
   -- See Note [InstEnv determinism]
 
-instEnvClasses :: InstEnv -> [Class]
-instEnvClasses ie = [is_cls e | ClsIE (e : _) <- eltsUDFM ie]
+instEnvEltsForClass :: InstEnv -> Name -> [ClsInst]
+instEnvEltsForClass (InstEnv rm) cls_nm = lookupRM [RML_KnownTc cls_nm] rm
+
+-- N.B. this is not particularly efficient but used only by GHCi.
+instEnvClasses :: InstEnv -> UniqDSet Class
+instEnvClasses ie = mkUniqDSet $ map is_cls (instEnvElts ie)
 
 -- | Test if an instance is visible, by checking that its origin module
 -- is in 'VisibleOrphanModules'.
@@ -455,45 +458,56 @@ instIsVisible vis_mods ispec
                | otherwise                   -> True
 
 classInstances :: InstEnvs -> Class -> [ClsInst]
-classInstances (InstEnvs { ie_global = pkg_ie, ie_local = home_ie, ie_visible = vis_mods }) cls
+classInstances envs cls = classNameInstances envs (className cls)
+
+classNameInstances :: InstEnvs -> Name -> [ClsInst]
+classNameInstances (InstEnvs { ie_global = pkg_ie, ie_local = home_ie, ie_visible = vis_mods }) cls
   = get home_ie ++ get pkg_ie
   where
-    get env = case lookupUDFM env cls of
-                Just (ClsIE insts) -> filter (instIsVisible vis_mods) insts
-                Nothing            -> []
+    get :: InstEnv -> [ClsInst]
+    get ie = filter (instIsVisible vis_mods) (instEnvEltsForClass ie cls)
 
 -- | Checks for an exact match of ClsInst in the instance environment.
 -- We use this when we do signature checking in "GHC.Tc.Module"
 memberInstEnv :: InstEnv -> ClsInst -> Bool
-memberInstEnv inst_env ins_item@(ClsInst { is_cls_nm = cls_nm } ) =
-    maybe False (\(ClsIE items) -> any (identicalDFunType ins_item) items)
-          (lookupUDFM_Directly inst_env (getUnique cls_nm))
+memberInstEnv (InstEnv rm) ins_item@(ClsInst { is_tcs = tcs } ) =
+    any (identicalDFunType ins_item) (fst $ lookupRM' (map roughMatchTcToLookup tcs) rm)
  where
   identicalDFunType cls1 cls2 =
     eqType (varType (is_dfun cls1)) (varType (is_dfun cls2))
+
+-- | Makes no particular effort to detect conflicts.
+unionInstEnv :: InstEnv -> InstEnv -> InstEnv
+unionInstEnv (InstEnv a) (InstEnv b) = InstEnv (a `unionRM` b)
 
 extendInstEnvList :: InstEnv -> [ClsInst] -> InstEnv
 extendInstEnvList inst_env ispecs = foldl' extendInstEnv inst_env ispecs
 
 extendInstEnv :: InstEnv -> ClsInst -> InstEnv
-extendInstEnv inst_env ins_item@(ClsInst { is_cls_nm = cls_nm })
-  = addToUDFM_C_Directly add inst_env (getUnique cls_nm) (ClsIE [ins_item])
-  where
-    add (ClsIE cur_insts) _ = ClsIE (ins_item : cur_insts)
+extendInstEnv (InstEnv rm) ins_item@(ClsInst { is_tcs = tcs })
+  = InstEnv $ insertRM tcs ins_item rm
+
+filterInstEnv :: (ClsInst -> Bool) -> InstEnv -> InstEnv
+filterInstEnv pred (InstEnv rm)
+  = InstEnv $ filterRM pred rm
+
+anyInstEnv :: (ClsInst -> Bool) -> InstEnv -> Bool
+anyInstEnv pred (InstEnv rm)
+  = foldRM (\x rest -> pred x || rest) False rm
+
+mapInstEnv :: (ClsInst -> ClsInst) -> InstEnv -> InstEnv
+mapInstEnv f (InstEnv rm) = InstEnv (f <$> rm)
 
 deleteFromInstEnv :: InstEnv -> ClsInst -> InstEnv
-deleteFromInstEnv inst_env ins_item@(ClsInst { is_cls_nm = cls_nm })
-  = adjustUDFM_Directly adjust inst_env (getUnique cls_nm)
-  where
-    adjust (ClsIE items) = ClsIE (filterOut (identicalClsInstHead ins_item) items)
+deleteFromInstEnv (InstEnv rm) ins_item@(ClsInst { is_tcs = tcs })
+  = InstEnv $ filterMatchingRM (not . identicalClsInstHead ins_item) tcs rm
 
 deleteDFunFromInstEnv :: InstEnv -> DFunId -> InstEnv
 -- Delete a specific instance fron an InstEnv
-deleteDFunFromInstEnv inst_env dfun
-  = adjustUDFM adjust inst_env cls
+deleteDFunFromInstEnv (InstEnv rm) dfun
+  = InstEnv $ filterMatchingRM (not . same_dfun) [RM_KnownTc (className cls)] rm
   where
     (_, _, cls, _) = tcSplitDFunTy (idType dfun)
-    adjust (ClsIE items) = ClsIE (filterOut same_dfun items)
     same_dfun (ClsInst { is_dfun = dfun' }) = dfun == dfun'
 
 identicalClsInstHead :: ClsInst -> ClsInst -> Bool
@@ -501,10 +515,10 @@ identicalClsInstHead :: ClsInst -> ClsInst -> Bool
 -- e.g.  both are   Eq [(a,b)]
 -- Used for overriding in GHCi
 -- Obviously should be insensitive to alpha-renaming
-identicalClsInstHead (ClsInst { is_cls_nm = cls_nm1, is_tcs = rough1, is_tys = tys1 })
-                     (ClsInst { is_cls_nm = cls_nm2, is_tcs = rough2, is_tys = tys2 })
-  =  cls_nm1 == cls_nm2
-  && not (instanceCantMatch rough1 rough2)  -- Fast check for no match, uses the "rough match" fields
+identicalClsInstHead (ClsInst { is_tcs = rough1, is_tys = tys1 })
+                     (ClsInst { is_tcs = rough2, is_tys = tys2 })
+  =  not (instanceCantMatch rough1 rough2)  -- Fast check for no match, uses the "rough match" fields;
+                                            -- also accounts for class name.
   && isJust (tcMatchTys tys1 tys2)
   && isJust (tcMatchTys tys2 tys1)
 
@@ -739,7 +753,7 @@ type InstMatch = (ClsInst, [DFunInstType])
 
 type ClsInstLookupResult
      = ( [InstMatch]     -- Successful matches
-       , [ClsInst]       -- These don't match but do unify
+       , PotentialUnifiers  -- These don't match but do unify
        , [InstMatch] )   -- Unsafe overlapped instances under Safe Haskell
                          -- (see Note [Safe Haskell Overlapping Instances] in
                          -- GHC.Tc.Solver).
@@ -757,6 +771,49 @@ When we match this against D [ty], we return the instantiating types
 where the 'Nothing' indicates that 'b' can be freely instantiated.
 (The caller instantiates it to a flexi type variable, which will
  presumably later become fixed via functional dependencies.)
+
+Note [Infinitary substitution in lookup]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider
+
+  class C a b
+  instance C c c
+  instance C d (Maybe d)
+  [W] C e (Maybe e)
+
+You would think we could just use the second instance, because the first doesn't
+unify. But that's just ever so slightly wrong. The reason we check for unifiers
+along with matchers is that we don't want the possibility that a type variable
+instantiation could cause an instance choice to change. Yet if we have
+  type family M = Maybe M
+and choose (e |-> M), then both instances match. This is absurd, but we cannot
+rule it out. Yet, worrying about this case is awfully inconvenient to users,
+and so we pretend the problem doesn't exist, by considering a lookup that runs into
+this occurs-check issue to indicate that an instance surely does not apply (i.e.
+is like the SurelyApart case). In the brief time that we didn't treat infinitary
+substitutions specially, two tickets were filed: #19044 and #19052, both trying
+to do Real Work.
+
+Why don't we just exclude any instances that are MaybeApart? Because we might
+have a [W] C e (F e), where F is a type family. The second instance above does
+not match, but it should be included as a future possibility. Unification will
+return MaybeApart MARTypeFamily in this case.
+
+What can go wrong with this design choice? We might get incoherence -- but not
+loss of type safety. In particular, if we have [W] C M M (for the M type family
+above), then GHC might arbitrarily choose either instance, depending on how
+M reduces (or doesn't).
+
+For type families, we can't just ignore the problem (as we essentially do here),
+because doing so would give us a hole in the type safety proof (as explored in
+Section 6 of "Closed Type Families with Overlapping Equations", POPL'14). This
+possibility of an infinitary substitution manifests as closed type families that
+look like they should reduce, but don't. Users complain: #9082 and #17311. For
+open type families, we actually can have unsoundness if we don't take infinitary
+substitutions into account: #8162. But, luckily, for class instances, we just
+risk coherence -- not great, but it seems better to give users what they likely
+want. (Also, note that this problem existed for the entire decade of 201x without
+anyone noticing, so it's manifestly not ruining anyone's day.)
 -}
 
 -- |Look up an instance in the given instance environment. The given class application must match exactly
@@ -764,7 +821,7 @@ where the 'Nothing' indicates that 'b' can be freely instantiated.
 -- yield 'Left errorMessage'.
 lookupUniqueInstEnv :: InstEnvs
                     -> Class -> [Type]
-                    -> Either MsgDoc (ClsInst, [Type])
+                    -> Either SDoc (ClsInst, [Type])
 lookupUniqueInstEnv instEnv cls tys
   = case lookupInstEnv False instEnv cls tys of
       ([(inst, inst_tys)], _, _)
@@ -777,11 +834,38 @@ lookupUniqueInstEnv instEnv cls tys
       _other -> Left $ text "instance not found" <+>
                        (ppr $ mkTyConApp (classTyCon cls) tys)
 
+data PotentialUnifiers = NoUnifiers
+                       | OneOrMoreUnifiers [ClsInst]
+                       -- This list is lazy as we only look at all the unifiers when
+                       -- printing an error message. It can be expensive to compute all
+                       -- the unifiers because if you are matching something like C a[sk] then
+                       -- all instances will unify.
+
+instance Outputable PotentialUnifiers where
+  ppr NoUnifiers = text "NoUnifiers"
+  ppr xs = ppr (getPotentialUnifiers xs)
+
+instance Semigroup PotentialUnifiers where
+  NoUnifiers <> u = u
+  u <> NoUnifiers = u
+  u1 <> u2 = OneOrMoreUnifiers (getPotentialUnifiers u1 ++ getPotentialUnifiers u2)
+
+instance Monoid PotentialUnifiers where
+  mempty = NoUnifiers
+
+getPotentialUnifiers :: PotentialUnifiers -> [ClsInst]
+getPotentialUnifiers NoUnifiers = []
+getPotentialUnifiers (OneOrMoreUnifiers cls) = cls
+
+nullUnifiers :: PotentialUnifiers -> Bool
+nullUnifiers NoUnifiers = True
+nullUnifiers _ = False
+
 lookupInstEnv' :: InstEnv          -- InstEnv to look in
                -> VisibleOrphanModules   -- But filter against this
                -> Class -> [Type]  -- What we are looking for
                -> ([InstMatch],    -- Successful matches
-                   [ClsInst])      -- These don't match but do unify
+                   PotentialUnifiers)      -- These don't match but do unify
                                    -- (no incoherent ones in here)
 -- The second component of the result pair happens when we look up
 --      Foo [a]
@@ -793,50 +877,56 @@ lookupInstEnv' :: InstEnv          -- InstEnv to look in
 -- but Foo [Int] is a unifier.  This gives the caller a better chance of
 -- giving a suitable error message
 
-lookupInstEnv' ie vis_mods cls tys
-  = lookup ie
+lookupInstEnv' (InstEnv rm) vis_mods cls tys
+  = (foldr check_match [] rough_matches, check_unifier rough_unifiers)
   where
-    rough_tcs  = roughMatchTcs tys
-    all_tvs    = all isNothing rough_tcs
+    (rough_matches, rough_unifiers) = lookupRM' rough_tcs rm
+    rough_tcs  = RML_KnownTc (className cls) : roughMatchTcsLookup tys
 
     --------------
-    lookup env = case lookupUDFM env cls of
-                   Nothing -> ([],[])   -- No instances for this class
-                   Just (ClsIE insts) -> find [] [] insts
-
-    --------------
-    find ms us [] = (ms, us)
-    find ms us (item@(ClsInst { is_tcs = mb_tcs, is_tvs = tpl_tvs
-                              , is_tys = tpl_tys }) : rest)
+    check_match :: ClsInst -> [InstMatch] -> [InstMatch]
+    check_match item@(ClsInst { is_tvs = tpl_tvs, is_tys = tpl_tys }) acc
       | not (instIsVisible vis_mods item)
-      = find ms us rest  -- See Note [Instance lookup and orphan instances]
-
-        -- Fast check for no match, uses the "rough match" fields
-      | instanceCantMatch rough_tcs mb_tcs
-      = find ms us rest
+      = acc  -- See Note [Instance lookup and orphan instances]
 
       | Just subst <- tcMatchTys tpl_tys tys
-      = find ((item, map (lookupTyVar subst) tpl_tvs) : ms) us rest
+      = ((item, map (lookupTyVar subst) tpl_tvs) : acc)
+      | otherwise
+      = acc
 
+
+    check_unifier :: [ClsInst] -> PotentialUnifiers
+    check_unifier [] = NoUnifiers
+    check_unifier (item@ClsInst { is_tvs = tpl_tvs, is_tys = tpl_tys }:items)
+      | not (instIsVisible vis_mods item)
+      = check_unifier items  -- See Note [Instance lookup and orphan instances]
+      | Just {} <- tcMatchTys tpl_tys tys = check_unifier items
         -- Does not match, so next check whether the things unify
         -- See Note [Overlapping instances]
         -- Ignore ones that are incoherent: Note [Incoherent instances]
       | isIncoherent item
-      = find ms us rest
+      = check_unifier items
 
       | otherwise
-      = ASSERT2( tyCoVarsOfTypes tys `disjointVarSet` tpl_tv_set,
-                 (ppr cls <+> ppr tys <+> ppr all_tvs) $$
-                 (ppr tpl_tvs <+> ppr tpl_tys)
-                )
+      = assertPpr (tys_tv_set `disjointVarSet` tpl_tv_set)
+                  ((ppr cls <+> ppr tys) $$
+                   (ppr tpl_tvs <+> ppr tpl_tys)) $
                 -- Unification will break badly if the variables overlap
                 -- They shouldn't because we allocate separate uniques for them
                 -- See Note [Template tyvars are fresh]
-        case tcUnifyTys instanceBindFun tpl_tys tys of
-            Just _   -> find ms (item:us) rest
-            Nothing  -> find ms us        rest
+        case tcUnifyTysFG instanceBindFun tpl_tys tys of
+          -- We consider MaybeApart to be a case where the instance might
+          -- apply in the future. This covers an instance like C Int and
+          -- a target like [W] C (F a), where F is a type family.
+            SurelyApart              -> check_unifier items
+              -- See Note [Infinitary substitution in lookup]
+            MaybeApart MARInfinite _ -> check_unifier items
+            _                        ->
+              OneOrMoreUnifiers (item: getPotentialUnifiers (check_unifier items))
+
       where
         tpl_tv_set = mkVarSet tpl_tvs
+        tys_tv_set = tyCoVarsOfTypes tys
 
 ---------------
 -- This is the common way to call this function.
@@ -853,14 +943,13 @@ lookupInstEnv check_overlap_safe
                         , ie_visible = vis_mods })
               cls
               tys
-  = -- pprTrace "lookupInstEnv" (ppr cls <+> ppr tys $$ ppr home_ie) $
-    (final_matches, final_unifs, unsafe_overlapped)
+  = (final_matches, final_unifs, unsafe_overlapped)
   where
     (home_matches, home_unifs) = lookupInstEnv' home_ie vis_mods cls tys
     (pkg_matches,  pkg_unifs)  = lookupInstEnv' pkg_ie  vis_mods cls tys
     all_matches = home_matches ++ pkg_matches
-    all_unifs   = home_unifs   ++ pkg_unifs
-    final_matches = foldr insert_overlapping [] all_matches
+    all_unifs   = home_unifs   `mappend` pkg_unifs
+    final_matches = pruneOverlappedMatches all_matches
         -- Even if the unifs is non-empty (an error situation)
         -- we still prune the matches, so that the error message isn't
         -- misleading (complaining of multiple matches when some should be
@@ -873,7 +962,7 @@ lookupInstEnv check_overlap_safe
 
     -- If the selected match is incoherent, discard all unifiers
     final_unifs = case final_matches of
-                    (m:_) | isIncoherent (fst m) -> []
+                    (m:_) | isIncoherent (fst m) -> NoUnifiers
                     _                            -> all_unifs
 
     -- NOTE [Safe Haskell isSafeOverlap]
@@ -913,47 +1002,252 @@ lookupInstEnv check_overlap_safe
         (isOrphan (is_orphan inst) || classArity (is_cls inst) > 1)
 
 ---------------
-insert_overlapping :: InstMatch -> [InstMatch] -> [InstMatch]
--- ^ Add a new solution, knocking out strictly less specific ones
--- See Note [Rules for instance lookup]
-insert_overlapping new_item [] = [new_item]
-insert_overlapping new_item@(new_inst,_) (old_item@(old_inst,_) : old_items)
-  | new_beats_old        -- New strictly overrides old
-  , not old_beats_new
-  , new_inst `can_override` old_inst
-  = insert_overlapping new_item old_items
 
-  | old_beats_new        -- Old strictly overrides new
-  , not new_beats_old
-  , old_inst `can_override` new_inst
-  = old_item : old_items
 
-  -- Discard incoherent instances; see Note [Incoherent instances]
-  | isIncoherent old_inst      -- Old is incoherent; discard it
-  = insert_overlapping new_item old_items
-  | isIncoherent new_inst      -- New is incoherent; discard it
-  = old_item : old_items
+{- Note [Instance overlap and guards]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The first step is to find all instances that /match/ the constraint
+we are trying to solve.  Next, using pruneOverlapped Matches, we eliminate
+from that list of instances any instances that are overlapped.  For example:
 
-  -- Equal or incomparable, and neither is incoherent; keep both
-  | otherwise
-  = old_item : insert_overlapping new_item old_items
-  where
+(A)   instance                      C [a] where ...
+(B)   instance {-# OVERLAPPING #-} C [[a] where ...
+(C)   instance C (Maybe a) where
 
-    new_beats_old = new_inst `more_specific_than` old_inst
-    old_beats_new = old_inst `more_specific_than` new_inst
+Suppose we are trying to solve C [[Bool]]. The lookup will return a list [A,B]
+of the first two instances, since both match.  (The Maybe instance doesn't match,
+so the lookup won't return (C).)  Then pruneOverlappedMatches removes (A),
+since (B) is more specific.  So we end up with just one match, (B).
 
-    -- `instB` can be instantiated to match `instA`
-    -- or the two are equal
-    instA `more_specific_than` instB
-      = isJust (tcMatchTys (is_tys instB) (is_tys instA))
+However pruneOverlappedMatches is a bit more subtle than you might think (#20946).
+Recall how we go about eliminating redundant instances, as described in
+Note [Rules for instance lookup].
 
-    instA `can_override` instB
-       = isOverlapping instA || isOverlappable instB
+  - When instance I1 is more specific than instance I2,
+  - and either I1 is overlapping or I2 is overlappable,
+
+then we can discard I2 in favour of I1. Note however that, as part of the instance
+resolution process, we don't want to immediately discard I2, as it can still be useful.
+For example, suppose we are trying to solve C [[Int]], and have instances:
+
+  I1: instance                  C [[Int]]
+  I2: instance {-# OVERLAPS #-} C [[a]]
+
+Both instances match. I2 is both overlappable and overlapping (that's what `OVERLAPS`
+means). Now I1 is more specific than I2, and I2 is overlappable, so we can discard I2.
+However, we should still keep I2 around when looking up instances, because it is
+overlapping and `I1` isn't: this means it can be used to eliminate other instances
+that I1 can't, such as:
+
+  I3: instance C [a]
+
+I3 is more general than both I1 and I2, but it is not overlappable, and I1
+is not overlapping. This means that we must use I2 to discard I3.
+
+To do this, in 'insert_overlapping', on top of keeping track of matching
+instances, we also keep track of /guards/, which are instances like I2
+which we will discard in the end (because we have a more specific match
+that overrides it) but might still be useful for eliminating other instances
+(like I3 in this example).
+
+
+(A) Definition of guarding instances (guards).
+
+    To add a matching instance G as a guard, it must satisfy the following conditions:
+
+      A1. G is overlapped by a more specific match, M,
+      A2. M is not overlapping,
+      A3. G is overlapping.
+
+    This means that we eliminate G from the set of matches (it is overriden by M),
+    but we keep it around until we are done with instance resolution because
+    it might still be useful to eliminate other matches.
+
+(B) Guards eliminate matches.
+
+    There are two situations in which guards can eliminate a match:
+
+      B1. We want to add a new instance, but it is overriden by a guard.
+          We can immediately discard the instance.
+
+          Example for B1:
+
+            Suppose we want to solve C [[Int]], with instances:
+
+              J1: instance                  C [[Int]]
+              J2: instance {-# OVERLAPS #-} C [[a]]
+              J3: instance                  C [a]
+
+          Processing them in order: we add J1 as a match, then J2 as a guard.
+          Now, when we come across J3, we can immediately discard it because
+          it is overriden by the guard J2.
+
+      B2. We have found a new guard. We must use it to discard matches
+          we have already found. This is necessary because we must obtain
+          the same result whether we process the instance or the guard first.
+
+          Example for B2:
+
+            Suppose we want to solve C [[Int]], with instances:
+
+              K1: instance                  C [[Int]]
+              K2: instance                  C [a]
+              K3: instance {-# OVERLAPS #-} C [[a]]
+
+            We start by considering K1 and K2. Neither has any overlapping flag set,
+            so we end up with two matches, {K1, K2}.
+            Next we look at K3: it is overriden by K1, but as K1 is not
+            overlapping this means K3 should function as a guard.
+            We must then ensure we eliminate K2 from the list of matches,
+            as K3 guards against it.
+
+(C) Adding guards.
+
+    When we already have collected some guards, and have come across a new
+    guard, we can simply add it to the existing list of guards.
+    We don't need to keep the set of guards minimal, as they will simply
+    be thrown away at the end: we are only interested in the matches.
+    Not having a minimal set of guards does not harm us, but it makes
+    the code simpler.
+-}
+
+-- | Collect class instance matches, including matches that we know
+-- are overridden but might still be useful to override other instances
+-- (which we call "guards").
+--
+-- See Note [Instance overlap and guards].
+data InstMatches
+  = InstMatches
+  { -- | Minimal matches: we have knocked out all strictly more general
+    -- matches that are overlapped by a match in this list.
+    instMatches :: [InstMatch]
+
+    -- | Guards: matches that we know we won't pick in the end,
+    -- but might still be useful for ruling out other instances,
+    -- as per #20946. See Note [Instance overlap and guards], (A).
+  , instGuards  :: [ClsInst]
+  }
+
+instance Outputable InstMatches where
+  ppr (InstMatches { instMatches = matches, instGuards = guards })
+    = text "InstMatches" <+>
+      braces (vcat [ text "instMatches:" <+> ppr matches
+                   , text "instGuards:" <+> ppr guards ])
+
+noMatches :: InstMatches
+noMatches = InstMatches { instMatches = [], instGuards = [] }
+
+pruneOverlappedMatches :: [InstMatch] -> [InstMatch]
+-- ^ Remove from the argument list any InstMatches for which another
+-- element of the list is more specific, and overlaps it, using the
+-- rules of Nove [Rules for instance lookup]
+pruneOverlappedMatches all_matches =
+  instMatches $ foldr insert_overlapping noMatches all_matches
+
+-- | Computes whether the first class instance overrides the second,
+-- i.e. the first is more specific and can overlap the second.
+--
+-- More precisely, @instA `overrides` instB@ returns 'True' precisely when:
+--
+--   - @instA@ is more specific than @instB@,
+--   - @instB@ is not more specific than @instA@,
+--   - @instA@ is overlapping OR @instB@ is overlappable.
+overrides :: ClsInst -> ClsInst -> Bool
+new_inst `overrides` old_inst
+  =  (new_inst `more_specific_than` old_inst)
+  && (not $ old_inst `more_specific_than` new_inst)
+  && (isOverlapping new_inst || isOverlappable old_inst)
        -- Overlap permitted if either the more specific instance
        -- is marked as overlapping, or the more general one is
        -- marked as overlappable.
        -- Latest change described in: #9242.
        -- Previous change: #3877, Dec 10.
+  where
+    -- `instB` can be instantiated to match `instA`
+    -- or the two are equal
+    instA `more_specific_than` instB
+      = isJust (tcMatchTys (is_tys instB) (is_tys instA))
+
+insert_overlapping :: InstMatch -> InstMatches -> InstMatches
+-- ^ Add a new solution, knocking out strictly less specific ones
+-- See Note [Rules for instance lookup] and Note [Instance overlap and guards].
+--
+-- /Property/: the order of insertion doesn't matter, i.e.
+-- @insert_overlapping inst1 (insert_overlapping inst2 matches)@
+-- gives the same result as @insert_overlapping inst2 (insert_overlapping inst1 matches)@.
+insert_overlapping
+  new_item@(new_inst,_)
+  old@(InstMatches { instMatches = old_items, instGuards = guards })
+  -- If any of the "guarding" instances override this item, discard it.
+  -- See Note [Instance overlap and guards], (B1).
+  | any (`overrides` new_inst) guards
+  = old
+  | otherwise
+  = insert_overlapping_new_item old_items
+
+  where
+    insert_overlapping_new_item :: [InstMatch] -> InstMatches
+    insert_overlapping_new_item []
+      = InstMatches { instMatches = [new_item], instGuards = guards }
+    insert_overlapping_new_item all_old_items@(old_item@(old_inst,_) : old_items)
+
+      -- New strictly overrides old: throw out the old from the list of matches,
+      -- but potentially keep it around as a guard if it can still be used
+      -- to eliminate other instances.
+      | new_inst `overrides` old_inst
+      , InstMatches { instMatches = final_matches
+                    , instGuards  = prev_guards }
+                    <- insert_overlapping_new_item old_items
+      = if isOverlapping new_inst || not (isOverlapping old_inst)
+        -- We're adding "new_inst" as a match.
+        -- If "new_inst" is not overlapping but "old_inst" is, we should
+        -- keep "old_inst" around as a guard.
+        -- See Note [Instance overlap and guards], (A).
+        then InstMatches { instMatches = final_matches
+                         , instGuards  = prev_guards }
+        else InstMatches { instMatches = final_matches
+                         , instGuards  = old_inst : prev_guards }
+        --                               ^^^^^^^^^^^^^^^^^^^^^^
+        --                    See Note [Instance overlap and guards], (C).
+
+
+      -- Old strictly overrides new: throw it out from the list of matches,
+      -- but potentially keep it around as a guard if it can still be used
+      -- to eliminate other instances.
+      | old_inst `overrides` new_inst
+      = if isOverlapping old_inst || not (isOverlapping new_inst)
+        -- We're discarding "new_inst", as it is overridden by "old_inst".
+        -- However, it might still be useful as a guard if "old_inst" is not overlapping
+        -- but "new_inst" is.
+        -- See Note [Instance overlap and guards], (A).
+        then InstMatches { instMatches = all_old_items
+                         , instGuards  = guards }
+        else InstMatches
+                  -- We're adding "new_inst" as a guard, so we must prune out
+                  -- any matches it overrides.
+                  -- See Note [Instance overlap and guards], (B2)
+                { instMatches =
+                    filter
+                      (\(old_inst,_) -> not (new_inst `overrides` old_inst))
+                      all_old_items
+
+                -- See Note [Instance overlap and guards], (C)
+                , instGuards = new_inst : guards }
+
+      -- Discard incoherent instances; see Note [Incoherent instances]
+      | isIncoherent old_inst -- Old is incoherent; discard it
+      = insert_overlapping_new_item old_items
+      | isIncoherent new_inst -- New is incoherent; discard it
+      = InstMatches { instMatches = all_old_items
+                    , instGuards  = guards }
+
+      -- Equal or incomparable, and neither is incoherent; keep both
+      | otherwise
+      , InstMatches { instMatches = final_matches
+                    , instGuards  = final_guards }
+                    <- insert_overlapping_new_item old_items
+      = InstMatches { instMatches = old_item : final_matches
+                    , instGuards  = final_guards }
 
 {-
 Note [Incoherent instances]
@@ -975,7 +1269,7 @@ if you can use one, use it."
 Should this logic only work when *all* candidates have the incoherent flag, or
 even when all but one have it? The right choice is the latter, which can be
 justified by comparing the behaviour with how -XIncoherentInstances worked when
-it was only about the unify-check (note [Overlapping instances]):
+it was only about the unify-check (Note [Overlapping instances]):
 
 Example:
         class C a b c where foo :: (a,b,c)
@@ -1008,9 +1302,9 @@ incoherent instances as long as there are others.
 ************************************************************************
 -}
 
-instanceBindFun :: TyCoVar -> BindFlag
-instanceBindFun tv | isOverlappableTyVar tv = Skolem
-                   | otherwise              = BindMe
+instanceBindFun :: BindFun
+instanceBindFun tv _rhs_ty | isOverlappableTyVar tv = Apart
+                           | otherwise              = BindMe
    -- Note [Binding when looking up instances]
 
 {-
@@ -1020,20 +1314,28 @@ When looking up in the instance environment, or family-instance environment,
 we are careful about multiple matches, as described above in
 Note [Overlapping instances]
 
-The key_tys can contain skolem constants, and we can guarantee that those
+The target tys can contain skolem constants. For existentials and instance variables,
+we can guarantee that those
 are never going to be instantiated to anything, so we should not involve
-them in the unification test.  Example:
+them in the unification test. These are called "super skolems". Example:
         class Foo a where { op :: a -> Int }
         instance Foo a => Foo [a]       -- NB overlap
         instance Foo [Int]              -- NB overlap
         data T = forall a. Foo a => MkT a
         f :: T -> Int
         f (MkT x) = op [x,x]
-The op [x,x] means we need (Foo [a]).  Without the filterVarSet we'd
-complain, saying that the choice of instance depended on the instantiation
-of 'a'; but of course it isn't *going* to be instantiated.
+The op [x,x] means we need (Foo [a]). This `a` will never be instantiated, and
+so it is a super skolem. (See the use of tcInstSuperSkolTyVarsX in
+GHC.Tc.Gen.Pat.tcDataConPat.) Super skolems respond True to
+isOverlappableTyVar, and the use of Apart in instanceBindFun, above, means
+that these will be treated as fresh constants in the unification algorithm
+during instance lookup. Without this treatment, GHC would complain, saying
+that the choice of instance depended on the instantiation of 'a'; but of
+course it isn't *going* to be instantiated. Note that it is necessary that
+the unification algorithm returns SurelyApart for these super-skolems
+for GHC to be able to commit to another instance.
 
-We do this only for isOverlappableTyVar skolems.  For example we reject
+We do this only for super skolems.  For example we reject
         g :: forall a => [a] -> Int
         g x = op x
 on the grounds that the correct instance depends on the instantiation of 'a'

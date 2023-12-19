@@ -105,8 +105,13 @@ stg_gc_noregs
             CurrentNursery = bdescr_link(CurrentNursery);
             bdescr_free(CurrentNursery) = bdescr_start(CurrentNursery);
             OPEN_NURSERY();
-            if (Capability_context_switch(MyCapability()) != 0 :: CInt ||
-                Capability_interrupt(MyCapability())      != 0 :: CInt ||
+
+            CInt context_switch, interrupt;
+            context_switch = %relaxed Capability_context_switch(MyCapability());
+            interrupt = %relaxed Capability_interrupt(MyCapability());
+
+            if (context_switch != 0 :: CInt ||
+                interrupt != 0 :: CInt ||
                 (StgTSO_alloc_limit(CurrentTSO) `lt` (0::I64) &&
                  (TO_W_(StgTSO_flags(CurrentTSO)) & TSO_ALLOC_LIMIT) != 0)) {
                 ret = ThreadYielding;
@@ -518,13 +523,13 @@ stg_block_takemvar_finally
     W_ r1, r3;
     r1 = R1;
     r3 = R3;
-    unlockClosure(R3, stg_MVAR_DIRTY_info);
+    unlockClosure(r3, stg_MVAR_DIRTY_info);
     R1 = r1;
     R3 = r3;
     jump StgReturn [R1];
 }
 
-// Stack useage covered by RESERVED_STACK_WORDS
+// Stack usage covered by RESERVED_STACK_WORDS
 stg_block_takemvar /* mvar passed in R1 */
 {
     Sp_adj(-2);
@@ -546,7 +551,7 @@ stg_block_readmvar_finally
     W_ r1, r3;
     r1 = R1;
     r3 = R3;
-    unlockClosure(R3, stg_MVAR_DIRTY_info);
+    unlockClosure(r3, stg_MVAR_DIRTY_info);
     R1 = r1;
     R3 = r3;
     jump StgReturn [R1];
@@ -574,7 +579,7 @@ stg_block_putmvar_finally
     W_ r1, r3;
     r1 = R1;
     r3 = R3;
-    unlockClosure(R3, stg_MVAR_DIRTY_info);
+    unlockClosure(r3, stg_MVAR_DIRTY_info);
     R1 = r1;
     R3 = r3;
     jump StgReturn [R1];

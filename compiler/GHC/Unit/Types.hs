@@ -1,8 +1,9 @@
-{-# LANGUAGE TypeSynonymInstances #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveTraversable #-}
 {-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 
 -- | Unit & Module types
 --
@@ -13,28 +14,30 @@ module GHC.Unit.Types
      GenModule (..)
    , Module
    , InstalledModule
+   , HomeUnitModule
    , InstantiatedModule
    , mkModule
+   , moduleUnitId
    , pprModule
    , pprInstantiatedModule
    , moduleFreeHoles
 
      -- * Units
+   , IsUnitId
    , GenUnit (..)
    , Unit
    , UnitId (..)
+   , UnitKey (..)
    , GenInstantiatedUnit (..)
    , InstantiatedUnit
-   , IndefUnitId
    , DefUnitId
    , Instantiations
    , GenInstantiations
-   , mkGenInstantiatedUnit
    , mkInstantiatedUnit
    , mkInstantiatedUnitHash
-   , mkGenVirtUnit
    , mkVirtUnit
    , mapGenUnit
+   , mapInstantiations
    , unitFreeModuleHoles
    , fsToUnit
    , unitFS
@@ -44,6 +47,7 @@ module GHC.Unit.Types
    , stringToUnit
    , stableUnitCmp
    , unitIsDefinite
+   , isHoleUnit
 
      -- * Unit Ids
    , unitIdString
@@ -51,7 +55,6 @@ module GHC.Unit.Types
 
      -- * Utils
    , Definite (..)
-   , Indefinite (..)
 
      -- * Wired-in units
    , primUnitId
@@ -86,7 +89,6 @@ where
 import GHC.Prelude
 import GHC.Types.Unique
 import GHC.Types.Unique.DSet
-import GHC.Unit.Ppr
 import GHC.Unit.Module.Name
 import GHC.Utils.Binary
 import GHC.Utils.Outputable
@@ -103,9 +105,6 @@ import Data.Bifunctor
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS.Char8
 
-import {-# SOURCE #-} GHC.Unit.State (UnitState,displayUnitId)
-import {-# SOURCE #-} GHC.Driver.Session (unitState)
-
 ---------------------------------------------------------------------
 -- MODULES
 ---------------------------------------------------------------------
@@ -120,9 +119,16 @@ data GenModule unit = Module
 -- | A Module is a pair of a 'Unit' and a 'ModuleName'.
 type Module = GenModule Unit
 
+moduleUnitId :: Module -> UnitId
+moduleUnitId = toUnitId . moduleUnit
+
 -- | A 'InstalledModule' is a 'Module' whose unit is identified with an
 -- 'UnitId'.
 type InstalledModule = GenModule UnitId
+
+-- | A 'HomeUnitModule' is like an 'InstalledModule' but we expect to find it in
+-- one of the home units rather than the package database.
+type HomeUnitModule  = GenModule UnitId
 
 -- | An `InstantiatedModule` is a 'Module' whose unit is identified with an `InstantiatedUnit`.
 type InstantiatedModule = GenModule InstantiatedUnit
@@ -166,6 +172,24 @@ instance Outputable InstantiatedUnit where
       cid   = instUnitInstanceOf uid
       insts = instUnitInsts uid
 
+-- | Class for types that are used as unit identifiers (UnitKey, UnitId, Unit)
+--
+-- We need this class because we create new unit ids for virtual units (see
+-- VirtUnit) and they have to to be made from units with different kinds of
+-- identifiers.
+class IsUnitId u where
+   unitFS :: u -> FastString
+
+instance IsUnitId UnitKey where
+   unitFS (UnitKey fs) = fs
+
+instance IsUnitId UnitId where
+   unitFS (UnitId fs) = fs
+
+instance IsUnitId u => IsUnitId (GenUnit u) where
+   unitFS (VirtUnit x)            = instUnitFS x
+   unitFS (RealUnit (Definite x)) = unitFS x
+   unitFS HoleUnit                = holeFS
 
 pprModule :: Module -> SDoc
 pprModule mod@(Module p n)  = getPprStyle doc
@@ -191,6 +215,9 @@ pprInstantiatedModule (Module uid m) =
 ---------------------------------------------------------------------
 -- UNITS
 ---------------------------------------------------------------------
+
+-- | A unit key in the database
+newtype UnitKey = UnitKey FastString
 
 -- | A unit identifier identifies a (possibly partially) instantiated library.
 -- It is primarily used as part of 'Module', which in turn is used in 'Name',
@@ -228,7 +255,7 @@ data GenUnit uid
 -- see Note [VirtUnit to RealUnit improvement].
 --
 -- An indefinite unit identifier pretty-prints to something like
--- @p[H=<H>,A=aimpl:A>]@ (@p@ is the 'IndefUnitId', and the
+-- @p[H=<H>,A=aimpl:A>]@ (@p@ is the 'UnitId', and the
 -- brackets enclose the module substitution).
 data GenInstantiatedUnit unit
     = InstantiatedUnit {
@@ -238,8 +265,8 @@ data GenInstantiatedUnit unit
         instUnitFS :: !FastString,
         -- | Cached unique of 'unitFS'.
         instUnitKey :: !Unique,
-        -- | The indefinite unit being instantiated.
-        instUnitInstanceOf :: !(Indefinite unit),
+        -- | The (indefinite) unit being instantiated.
+        instUnitInstanceOf :: !unit,
         -- | The sorted (by 'ModuleName') instantiations of this unit.
         instUnitInsts :: !(GenInstantiations unit),
         -- | A cache of the free module holes of 'instUnitInsts'.
@@ -261,12 +288,16 @@ holeUnique = getUnique holeFS
 holeFS :: FastString
 holeFS = fsLit "<hole>"
 
+isHoleUnit :: GenUnit u -> Bool
+isHoleUnit HoleUnit = True
+isHoleUnit _        = False
+
 
 instance Eq (GenInstantiatedUnit unit) where
   u1 == u2 = instUnitKey u1 == instUnitKey u2
 
 instance Ord (GenInstantiatedUnit unit) where
-  u1 `compare` u2 = instUnitFS u1 `compare` instUnitFS u2
+  u1 `compare` u2 = instUnitFS u1 `lexicalCompareFS` instUnitFS u2
 
 instance Binary InstantiatedUnit where
   put_ bh indef = do
@@ -284,10 +315,10 @@ instance Binary InstantiatedUnit where
             instUnitKey = getUnique fs
            }
 
-instance Eq Unit where
+instance IsUnitId u => Eq (GenUnit u) where
   uid1 == uid2 = unitUnique uid1 == unitUnique uid2
 
-instance Uniquable Unit where
+instance IsUnitId u => Uniquable (GenUnit u) where
   getUnique = unitUnique
 
 instance Ord Unit where
@@ -304,7 +335,7 @@ instance NFData Unit where
 
 -- | Compares unit ids lexically, rather than by their 'Unique's
 stableUnitCmp :: Unit -> Unit -> Ordering
-stableUnitCmp p1 p2 = unitFS p1 `compare` unitFS p2
+stableUnitCmp p1 p2 = unitFS p1 `lexicalCompareFS` unitFS p2
 
 instance Outputable Unit where
    ppr pk = pprUnit pk
@@ -325,19 +356,13 @@ instance Binary Unit where
   put_ bh (VirtUnit indef_uid) = do
     putByte bh 1
     put_ bh indef_uid
-  put_ bh HoleUnit = do
+  put_ bh HoleUnit =
     putByte bh 2
   get bh = do b <- getByte bh
               case b of
                 0 -> fmap RealUnit (get bh)
                 1 -> fmap VirtUnit (get bh)
                 _ -> pure HoleUnit
-
-instance Binary unit => Binary (Indefinite unit) where
-  put_ bh (Indefinite fs _) = put_ bh fs
-  get bh = do { fs <- get bh; return (Indefinite fs Nothing) }
-
-
 
 -- | Retrieve the set of free module holes of a 'Unit'.
 unitFreeModuleHoles :: GenUnit u -> UniqDSet ModuleName
@@ -357,8 +382,8 @@ moduleFreeHoles (Module u        _   ) = unitFreeModuleHoles u
 
 
 -- | Create a new 'GenInstantiatedUnit' given an explicit module substitution.
-mkGenInstantiatedUnit :: (unit -> FastString) -> Indefinite unit -> GenInstantiations unit -> GenInstantiatedUnit unit
-mkGenInstantiatedUnit gunitFS cid insts =
+mkInstantiatedUnit :: IsUnitId u => u -> GenInstantiations u -> GenInstantiatedUnit u
+mkInstantiatedUnit cid insts =
     InstantiatedUnit {
         instUnitInstanceOf = cid,
         instUnitInsts = sorted_insts,
@@ -367,22 +392,14 @@ mkGenInstantiatedUnit gunitFS cid insts =
         instUnitKey = getUnique fs
     }
   where
-     fs = mkGenInstantiatedUnitHash gunitFS cid sorted_insts
+     fs           = mkInstantiatedUnitHash cid sorted_insts
      sorted_insts = sortBy (stableModuleNameCmp `on` fst) insts
-
--- | Create a new 'InstantiatedUnit' given an explicit module substitution.
-mkInstantiatedUnit :: IndefUnitId -> Instantiations -> InstantiatedUnit
-mkInstantiatedUnit = mkGenInstantiatedUnit unitIdFS
 
 
 -- | Smart constructor for instantiated GenUnit
-mkGenVirtUnit :: (unit -> FastString) -> Indefinite unit -> [(ModuleName, GenModule (GenUnit unit))] -> GenUnit unit
-mkGenVirtUnit _gunitFS uid []    = RealUnit $ Definite (indefUnit uid) -- huh? indefinite unit without any instantiation/hole?
-mkGenVirtUnit gunitFS  uid insts = VirtUnit $ mkGenInstantiatedUnit gunitFS uid insts
-
--- | Smart constructor for VirtUnit
-mkVirtUnit :: IndefUnitId -> Instantiations -> Unit
-mkVirtUnit = mkGenVirtUnit unitIdFS
+mkVirtUnit :: IsUnitId u => u -> [(ModuleName, GenModule (GenUnit u))] -> GenUnit u
+mkVirtUnit uid []    = RealUnit $ Definite uid
+mkVirtUnit uid insts = VirtUnit $ mkInstantiatedUnit uid insts
 
 -- | Generate a uniquely identifying hash (internal unit-id) for an instantiated
 -- unit.
@@ -392,24 +409,21 @@ mkVirtUnit = mkGenVirtUnit unitIdFS
 -- This hash is completely internal to GHC and is not used for symbol names or
 -- file paths. It is different from the hash Cabal would produce for the same
 -- instantiated unit.
-mkGenInstantiatedUnitHash :: (unit -> FastString) -> Indefinite unit -> [(ModuleName, GenModule (GenUnit unit))] -> FastString
-mkGenInstantiatedUnitHash gunitFS cid sorted_holes =
+mkInstantiatedUnitHash :: IsUnitId u => u -> [(ModuleName, GenModule (GenUnit u))] -> FastString
+mkInstantiatedUnitHash cid sorted_holes =
     mkFastStringByteString
-  . fingerprintUnitId (bytesFS (gunitFS (indefUnit cid)))
-  $ hashInstantiations gunitFS sorted_holes
-
-mkInstantiatedUnitHash :: IndefUnitId -> Instantiations -> FastString
-mkInstantiatedUnitHash = mkGenInstantiatedUnitHash unitIdFS
+  . fingerprintUnitId (bytesFS (unitFS cid))
+  $ hashInstantiations sorted_holes
 
 -- | Generate a hash for a sorted module instantiation.
-hashInstantiations :: (unit -> FastString) -> [(ModuleName, GenModule (GenUnit unit))] -> Fingerprint
-hashInstantiations gunitFS sorted_holes =
+hashInstantiations :: IsUnitId u => [(ModuleName, GenModule (GenUnit u))] -> Fingerprint
+hashInstantiations sorted_holes =
     fingerprintByteString
   . BS.concat $ do
         (m, b) <- sorted_holes
-        [ bytesFS (moduleNameFS m),                   BS.Char8.singleton ' ',
-          bytesFS (genUnitFS gunitFS (moduleUnit b)), BS.Char8.singleton ':',
-          bytesFS (moduleNameFS (moduleName b)),      BS.Char8.singleton '\n']
+        [ bytesFS (moduleNameFS m),              BS.Char8.singleton ' ',
+          bytesFS (unitFS (moduleUnit b)),       BS.Char8.singleton ':',
+          bytesFS (moduleNameFS (moduleName b)), BS.Char8.singleton '\n']
 
 fingerprintUnitId :: BS.ByteString -> Fingerprint -> BS.ByteString
 fingerprintUnitId prefix (Fingerprint a b)
@@ -419,48 +433,43 @@ fingerprintUnitId prefix (Fingerprint a b)
       , BS.Char8.pack (toBase62Padded a)
       , BS.Char8.pack (toBase62Padded b) ]
 
-unitUnique :: Unit -> Unique
+unitUnique :: IsUnitId u => GenUnit u -> Unique
 unitUnique (VirtUnit x)            = instUnitKey x
-unitUnique (RealUnit (Definite x)) = getUnique x
+unitUnique (RealUnit (Definite x)) = getUnique (unitFS x)
 unitUnique HoleUnit                = holeUnique
-
-unitFS :: Unit -> FastString
-unitFS = genUnitFS unitIdFS
-
-genUnitFS :: (unit -> FastString) -> GenUnit unit -> FastString
-genUnitFS _gunitFS (VirtUnit x)            = instUnitFS x
-genUnitFS gunitFS  (RealUnit (Definite x)) = gunitFS x
-genUnitFS _gunitFS HoleUnit                = holeFS
 
 -- | Create a new simple unit identifier from a 'FastString'.  Internally,
 -- this is primarily used to specify wired-in unit identifiers.
 fsToUnit :: FastString -> Unit
 fsToUnit = RealUnit . Definite . UnitId
 
-unitString :: Unit -> String
+unitString :: IsUnitId u => u  -> String
 unitString = unpackFS . unitFS
 
 stringToUnit :: String -> Unit
 stringToUnit = fsToUnit . mkFastString
 
 -- | Map over the unit type of a 'GenUnit'
-mapGenUnit :: (u -> v) -> (v -> FastString) -> GenUnit u -> GenUnit v
-mapGenUnit f gunitFS = go
+mapGenUnit :: IsUnitId v => (u -> v) -> GenUnit u -> GenUnit v
+mapGenUnit f = go
    where
       go gu = case gu of
                HoleUnit   -> HoleUnit
                RealUnit d -> RealUnit (fmap f d)
                VirtUnit i ->
-                  VirtUnit $ mkGenInstantiatedUnit gunitFS
-                     (fmap f (instUnitInstanceOf i))
+                  VirtUnit $ mkInstantiatedUnit
+                     (f (instUnitInstanceOf i))
                      (fmap (second (fmap go)) (instUnitInsts i))
 
+-- | Map over the unit identifier of unit instantiations.
+mapInstantiations :: IsUnitId v => (u -> v) -> GenInstantiations u -> GenInstantiations v
+mapInstantiations f = map (second (fmap (mapGenUnit f)))
 
 -- | Return the UnitId of the Unit. For on-the-fly instantiated units, return
 -- the UnitId of the indefinite unit this unit is an instance of.
 toUnitId :: Unit -> UnitId
 toUnitId (RealUnit (Definite iuid)) = iuid
-toUnitId (VirtUnit indef)           = indefUnit (instUnitInstanceOf indef)
+toUnitId (VirtUnit indef)           = instUnitInstanceOf indef
 toUnitId HoleUnit                   = error "Hole unit"
 
 -- | Return the virtual UnitId of an on-the-fly instantiated unit.
@@ -487,12 +496,12 @@ unitIsDefinite = isEmptyUniqDSet . unitFreeModuleHoles
 -- libraries as we can cheaply instantiate them on-the-fly, cf VirtUnit).  Put
 -- another way, an installed unit id is either fully instantiated, or not
 -- instantiated at all.
-newtype UnitId =
-    UnitId {
-      -- | The full hashed unit identifier, including the component id
+newtype UnitId = UnitId
+  { unitIdFS :: FastString
+      -- ^ The full hashed unit identifier, including the component id
       -- and the hash.
-      unitIdFS :: FastString
-    }
+  }
+  deriving (Data)
 
 instance Binary UnitId where
   put_ bh (UnitId fs) = put_ bh fs
@@ -502,25 +511,16 @@ instance Eq UnitId where
     uid1 == uid2 = getUnique uid1 == getUnique uid2
 
 instance Ord UnitId where
-    u1 `compare` u2 = unitIdFS u1 `compare` unitIdFS u2
+    -- we compare lexically to avoid non-deterministic output when sets of
+    -- unit-ids are printed (dependencies, etc.)
+    u1 `compare` u2 = unitIdFS u1 `lexicalCompareFS` unitIdFS u2
 
 instance Uniquable UnitId where
     getUnique = getUnique . unitIdFS
 
 instance Outputable UnitId where
-    ppr uid = sdocWithDynFlags $ \dflags -> pprUnitId (unitState dflags) uid
-
--- | Pretty-print a UnitId
---
--- In non-debug mode, query the given database to try to print
--- "package-version:component" instead of the raw UnitId
-pprUnitId :: UnitState -> UnitId -> SDoc
-pprUnitId state uid@(UnitId fs) = getPprDebug $ \debug ->
-   if debug
-      then ftext fs
-      else case displayUnitId state uid of
-            Just str -> text str
-            _        -> ftext fs
+    ppr (UnitId fs) = sdocOption sdocUnitIdForUser ($ fs) -- see Note [Pretty-printing UnitId]
+                                                          -- in "GHC.Unit"
 
 -- | A 'DefUnitId' is an 'UnitId' with the invariant that
 -- it only refers to a definite library; i.e., one we have generated
@@ -539,44 +539,8 @@ stringToUnitId = UnitId . mkFastString
 
 -- | A definite unit (i.e. without any free module hole)
 newtype Definite unit = Definite { unDefinite :: unit }
-    deriving (Eq, Ord, Functor)
-
-instance Outputable unit => Outputable (Definite unit) where
-    ppr (Definite uid) = ppr uid
-
-instance Binary unit => Binary (Definite unit) where
-    put_ bh (Definite uid) = put_ bh uid
-    get bh = do uid <- get bh; return (Definite uid)
-
-
--- | An 'IndefUnitId' is an 'UnitId' with the invariant that it only
--- refers to an indefinite library; i.e., one that can be instantiated.
-type IndefUnitId = Indefinite UnitId
-
-data Indefinite unit = Indefinite
-   { indefUnit        :: !unit             -- ^ Unit identifier
-   , indefUnitPprInfo :: Maybe UnitPprInfo -- ^ Cache for some unit info retrieved from the DB
-   }
    deriving (Functor)
-
-instance Eq unit => Eq (Indefinite unit) where
-   a == b = indefUnit a == indefUnit b
-
-instance Ord unit => Ord (Indefinite unit) where
-   compare a b = compare (indefUnit a) (indefUnit b)
-
-
-instance Uniquable unit => Uniquable (Indefinite unit) where
-  getUnique (Indefinite n _) = getUnique n
-
-instance Outputable unit => Outputable (Indefinite unit) where
-  ppr (Indefinite uid Nothing)        = ppr uid
-  ppr (Indefinite uid (Just pprinfo)) =
-    getPprDebug $ \debug ->
-      if debug
-         then ppr uid
-         else ppr pprinfo
-
+   deriving newtype (Eq, Ord, Outputable, Binary, Uniquable, IsUnitId)
 
 ---------------------------------------------------------------------
 -- WIRED-IN UNITS
@@ -695,6 +659,9 @@ data GenWithIsBoot mod = GWIB
   } deriving ( Eq, Ord, Show
              , Functor, Foldable, Traversable
              )
+  -- the Ord instance must ensure that we first sort by Module and then by
+  -- IsBootInterface: this is assumed to perform filtering of non-boot modules,
+  -- e.g. in GHC.Driver.Env.hptModulesBelow
 
 type ModuleNameWithIsBoot = GenWithIsBoot ModuleName
 
@@ -711,5 +678,5 @@ instance Binary a => Binary (GenWithIsBoot a) where
 
 instance Outputable a => Outputable (GenWithIsBoot a) where
   ppr (GWIB  { gwib_mod, gwib_isBoot }) = hsep $ ppr gwib_mod : case gwib_isBoot of
-    IsBoot -> []
-    NotBoot -> [text "{-# SOURCE #-}"]
+    IsBoot -> [ text "{-# SOURCE #-}" ]
+    NotBoot -> []

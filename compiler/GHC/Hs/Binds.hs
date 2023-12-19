@@ -1,3 +1,17 @@
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE UndecidableInstances #-} -- Wrinkle in Note [Trees That Grow]
+                                      -- in module Language.Haskell.Syntax.Extension
+
+{-# OPTIONS_GHC -Wno-orphans #-} -- Outputable
+
 {-
 (c) The University of Glasgow 2006
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
@@ -7,46 +21,40 @@
 Datatype for: @BindGroup@, @Bind@, @Sig@, @Bind@.
 -}
 
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE DeriveFunctor #-}
-{-# LANGUAGE StandaloneDeriving #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE UndecidableInstances #-} -- Wrinkle in Note [Trees That Grow]
-                                      -- in module GHC.Hs.Extension
-{-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications #-}
-{-# LANGUAGE LambdaCase #-}
-
-module GHC.Hs.Binds where
+module GHC.Hs.Binds
+  ( module Language.Haskell.Syntax.Binds
+  , module GHC.Hs.Binds
+  ) where
 
 import GHC.Prelude
 
-import {-# SOURCE #-} GHC.Hs.Expr ( pprExpr, LHsExpr,
-                                    MatchGroup, pprFunBind,
-                                    GRHSs, pprPatBind )
-import {-# SOURCE #-} GHC.Hs.Pat  ( LPat )
+import Language.Haskell.Syntax.Binds
 
+import {-# SOURCE #-} GHC.Hs.Expr ( pprExpr, pprFunBind, pprPatBind )
+import {-# SOURCE #-} GHC.Hs.Pat  (pprLPat )
+
+import Language.Haskell.Syntax.Extension
 import GHC.Hs.Extension
+import GHC.Parser.Annotation
 import GHC.Hs.Type
-import GHC.Core
 import GHC.Tc.Types.Evidence
 import GHC.Core.Type
 import GHC.Types.Name.Set
 import GHC.Types.Basic
-import GHC.Utils.Outputable
+import GHC.Types.SourceText
 import GHC.Types.SrcLoc as SrcLoc
 import GHC.Types.Var
 import GHC.Data.Bag
-import GHC.Data.FastString
 import GHC.Data.BooleanFormula (LBooleanFormula)
+import GHC.Types.Name.Reader
+import GHC.Types.Name
 
-import Data.Data hiding ( Fixity )
-import Data.List hiding ( foldr )
+import GHC.Utils.Outputable
+import GHC.Utils.Panic
+
 import Data.Function
+import Data.List (sortBy)
+import Data.Data (Data)
 
 {-
 ************************************************************************
@@ -58,75 +66,13 @@ import Data.Function
 Global bindings (where clauses)
 -}
 
--- During renaming, we need bindings where the left-hand sides
--- have been renamed but the right-hand sides have not.
 -- the ...LR datatypes are parametrized by two id types,
 -- one for the left and one for the right.
--- Other than during renaming, these will be the same.
 
--- | Haskell Local Bindings
-type HsLocalBinds id = HsLocalBindsLR id id
-
--- | Located Haskell local bindings
-type LHsLocalBinds id = Located (HsLocalBinds id)
-
--- | Haskell Local Bindings with separate Left and Right identifier types
---
--- Bindings in a 'let' expression
--- or a 'where' clause
-data HsLocalBindsLR idL idR
-  = HsValBinds
-        (XHsValBinds idL idR)
-        (HsValBindsLR idL idR)
-      -- ^ Haskell Value Bindings
-
-         -- There should be no pattern synonyms in the HsValBindsLR
-         -- These are *local* (not top level) bindings
-         -- The parser accepts them, however, leaving the
-         -- renamer to report them
-
-  | HsIPBinds
-        (XHsIPBinds idL idR)
-        (HsIPBinds idR)
-      -- ^ Haskell Implicit Parameter Bindings
-
-  | EmptyLocalBinds (XEmptyLocalBinds idL idR)
-      -- ^ Empty Local Bindings
-
-  | XHsLocalBindsLR
-        !(XXHsLocalBindsLR idL idR)
-
-type instance XHsValBinds      (GhcPass pL) (GhcPass pR) = NoExtField
-type instance XHsIPBinds       (GhcPass pL) (GhcPass pR) = NoExtField
+type instance XHsValBinds      (GhcPass pL) (GhcPass pR) = EpAnn AnnList
+type instance XHsIPBinds       (GhcPass pL) (GhcPass pR) = EpAnn AnnList
 type instance XEmptyLocalBinds (GhcPass pL) (GhcPass pR) = NoExtField
-type instance XXHsLocalBindsLR (GhcPass pL) (GhcPass pR) = NoExtCon
-
-type LHsLocalBindsLR idL idR = Located (HsLocalBindsLR idL idR)
-
-
--- | Haskell Value Bindings
-type HsValBinds id = HsValBindsLR id id
-
--- | Haskell Value bindings with separate Left and Right identifier types
--- (not implicit parameters)
--- Used for both top level and nested bindings
--- May contain pattern synonym bindings
-data HsValBindsLR idL idR
-  = -- | Value Bindings In
-    --
-    -- Before renaming RHS; idR is always RdrName
-    -- Not dependency analysed
-    -- Recursive by default
-    ValBinds
-        (XValBinds idL idR)
-        (LHsBindsLR idL idR) [LSig idR]
-
-    -- | Value Bindings Out
-    --
-    -- After renaming RHS; idR can be Name or Id Dependency analysed,
-    -- later bindings in the list may depend on earlier ones.
-  | XValBindsLR
-      !(XXValBindsLR idL idR)
+type instance XXHsLocalBindsLR (GhcPass pL) (GhcPass pR) = DataConCantHappen
 
 -- ---------------------------------------------------------------------
 -- Deal with ValBindsOut
@@ -137,200 +83,74 @@ data NHsValBindsLR idL
       [(RecFlag, LHsBinds idL)]
       [LSig GhcRn]
 
-type instance XValBinds    (GhcPass pL) (GhcPass pR) = NoExtField
-type instance XXValBindsLR (GhcPass pL) (GhcPass pR)
+type instance XValBinds    (GhcPass pL) (GhcPass pR) = AnnSortKey
+type instance XXValBindsLR (GhcPass pL) pR
             = NHsValBindsLR (GhcPass pL)
 
 -- ---------------------------------------------------------------------
 
--- | Located Haskell Binding
-type LHsBind  id = LHsBindLR  id id
-
--- | Located Haskell Bindings
-type LHsBinds id = LHsBindsLR id id
-
--- | Haskell Binding
-type HsBind   id = HsBindLR   id id
-
--- | Located Haskell Bindings with separate Left and Right identifier types
-type LHsBindsLR idL idR = Bag (LHsBindLR idL idR)
-
--- | Located Haskell Binding with separate Left and Right identifier types
-type LHsBindLR  idL idR = Located (HsBindLR idL idR)
-
-{- Note [FunBind vs PatBind]
-   ~~~~~~~~~~~~~~~~~~~~~~~~~
-The distinction between FunBind and PatBind is a bit subtle. FunBind covers
-patterns which resemble function bindings and simple variable bindings.
-
-    f x = e
-    f !x = e
-    f = e
-    !x = e          -- FunRhs has SrcStrict
-    x `f` y = e     -- FunRhs has Infix
-
-The actual patterns and RHSs of a FunBind are encoding in fun_matches.
-The m_ctxt field of each Match in fun_matches will be FunRhs and carries
-two bits of information about the match,
-
-  * The mc_fixity field on each Match describes the fixity of the
-    function binder in that match.  E.g. this is legal:
-         f True False  = e1
-         True `f` True = e2
-
-  * The mc_strictness field is used /only/ for nullary FunBinds: ones
-    with one Match, which has no pats. For these, it describes whether
-    the match is decorated with a bang (e.g. `!x = e`).
-
-By contrast, PatBind represents data constructor patterns, as well as a few
-other interesting cases. Namely,
-
-    Just x = e
-    (x) = e
-    x :: Ty = e
--}
-
--- | Haskell Binding with separate Left and Right id's
-data HsBindLR idL idR
-  = -- | Function-like Binding
-    --
-    -- FunBind is used for both functions     @f x = e@
-    -- and variables                          @f = \x -> e@
-    -- and strict variables                   @!x = x + 1@
-    --
-    -- Reason 1: Special case for type inference: see 'GHC.Tc.Gen.Bind.tcMonoBinds'.
-    --
-    -- Reason 2: Instance decls can only have FunBinds, which is convenient.
-    --           If you change this, you'll need to change e.g. rnMethodBinds
-    --
-    -- But note that the form                 @f :: a->a = ...@
-    -- parses as a pattern binding, just like
-    --                                        @(f :: a -> a) = ... @
-    --
-    -- Strict bindings have their strictness recorded in the 'SrcStrictness' of their
-    -- 'MatchContext'. See Note [FunBind vs PatBind] for
-    -- details about the relationship between FunBind and PatBind.
-    --
-    --  'GHC.Parser.Annotation.AnnKeywordId's
-    --
-    --  - 'GHC.Parser.Annotation.AnnFunId', attached to each element of fun_matches
-    --
-    --  - 'GHC.Parser.Annotation.AnnEqual','GHC.Parser.Annotation.AnnWhere',
-    --    'GHC.Parser.Annotation.AnnOpen','GHC.Parser.Annotation.AnnClose',
-
-    -- For details on above see note [Api annotations] in GHC.Parser.Annotation
-    FunBind {
-
-        fun_ext :: XFunBind idL idR,
-
-          -- ^ After the renamer (but before the type-checker), this contains the
-          -- locally-bound free variables of this defn. See Note [Bind free vars]
-          --
-          -- After the type-checker, this contains a coercion from the type of
-          -- the MatchGroup to the type of the Id. Example:
-          --
-          -- @
-          --      f :: Int -> forall a. a -> a
-          --      f x y = y
-          -- @
-          --
-          -- Then the MatchGroup will have type (Int -> a' -> a')
-          -- (with a free type variable a').  The coercion will take
-          -- a CoreExpr of this type and convert it to a CoreExpr of
-          -- type         Int -> forall a'. a' -> a'
-          -- Notice that the coercion captures the free a'.
-
-        fun_id :: Located (IdP idL), -- Note [fun_id in Match] in GHC.Hs.Expr
-
-        fun_matches :: MatchGroup idR (LHsExpr idR),  -- ^ The payload
-
-        fun_tick :: [Tickish Id] -- ^ Ticks to put on the rhs, if any
-    }
-
-  -- | Pattern Binding
-  --
-  -- The pattern is never a simple variable;
-  -- That case is done by FunBind.
-  -- See Note [FunBind vs PatBind] for details about the
-  -- relationship between FunBind and PatBind.
-
-  --
-  --  - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnBang',
-  --       'GHC.Parser.Annotation.AnnEqual','GHC.Parser.Annotation.AnnWhere',
-  --       'GHC.Parser.Annotation.AnnOpen','GHC.Parser.Annotation.AnnClose',
-
-  -- For details on above see note [Api annotations] in GHC.Parser.Annotation
-  | PatBind {
-        pat_ext    :: XPatBind idL idR, -- ^ See Note [Bind free vars]
-        pat_lhs    :: LPat idL,
-        pat_rhs    :: GRHSs idR (LHsExpr idR),
-        pat_ticks  :: ([Tickish Id], [[Tickish Id]])
-               -- ^ Ticks to put on the rhs, if any, and ticks to put on
-               -- the bound variables.
-    }
-
-  -- | Variable Binding
-  --
-  -- Dictionary binding and suchlike.
-  -- All VarBinds are introduced by the type checker
-  | VarBind {
-        var_ext    :: XVarBind idL idR,
-        var_id     :: IdP idL,
-        var_rhs    :: LHsExpr idR    -- ^ Located only for consistency
-    }
-
-  -- | Abstraction Bindings
-  | AbsBinds {                      -- Binds abstraction; TRANSLATION
-        abs_ext     :: XAbsBinds idL idR,
-        abs_tvs     :: [TyVar],
-        abs_ev_vars :: [EvVar],  -- ^ Includes equality constraints
-
-       -- | AbsBinds only gets used when idL = idR after renaming,
-       -- but these need to be idL's for the collect... code in HsUtil
-       -- to have the right type
-        abs_exports :: [ABExport idL],
-
-        -- | Evidence bindings
-        -- Why a list? See "GHC.Tc.TyCl.Instance"
-        -- Note [Typechecking plan for instance declarations]
-        abs_ev_binds :: [TcEvBinds],
-
-        -- | Typechecked user bindings
-        abs_binds    :: LHsBinds idL,
-
-        abs_sig :: Bool  -- See Note [The abs_sig field of AbsBinds]
-    }
-
-  -- | Patterns Synonym Binding
-  | PatSynBind
-        (XPatSynBind idL idR)
-        (PatSynBind idL idR)
-        -- ^ - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnPattern',
-        --          'GHC.Parser.Annotation.AnnLarrow','GHC.Parser.Annotation.AnnEqual',
-        --          'GHC.Parser.Annotation.AnnWhere'
-        --          'GHC.Parser.Annotation.AnnOpen' @'{'@,'GHC.Parser.Annotation.AnnClose' @'}'@
-
-        -- For details on above see note [Api annotations] in GHC.Parser.Annotation
-
-  | XHsBindsLR !(XXHsBindsLR idL idR)
-
-data NPatBindTc = NPatBindTc {
-     pat_fvs :: NameSet, -- ^ Free variables
-     pat_rhs_ty :: Type  -- ^ Type of the GRHSs
-     } deriving Data
-
 type instance XFunBind    (GhcPass pL) GhcPs = NoExtField
-type instance XFunBind    (GhcPass pL) GhcRn = NameSet    -- Free variables
-type instance XFunBind    (GhcPass pL) GhcTc = HsWrapper  -- See comments on FunBind.fun_ext
+type instance XFunBind    (GhcPass pL) GhcRn = NameSet
+-- ^ After the renamer (but before the type-checker), the FunBind
+-- extension field contains the locally-bound free variables of this
+-- defn. See Note [Bind free vars]
 
-type instance XPatBind    GhcPs (GhcPass pR) = NoExtField
-type instance XPatBind    GhcRn (GhcPass pR) = NameSet -- Free variables
-type instance XPatBind    GhcTc (GhcPass pR) = NPatBindTc
+type instance XFunBind    (GhcPass pL) GhcTc = HsWrapper
+-- ^ After the type-checker, the FunBind extension field contains a
+-- coercion from the type of the MatchGroup to the type of the Id.
+-- Example:
+--
+-- @
+--      f :: Int -> forall a. a -> a
+--      f x y = y
+-- @
+--
+-- Then the MatchGroup will have type (Int -> a' -> a')
+-- (with a free type variable a').  The coercion will take
+-- a CoreExpr of this type and convert it to a CoreExpr of
+-- type         Int -> forall a'. a' -> a'
+-- Notice that the coercion captures the free a'.
+
+type instance XPatBind    GhcPs (GhcPass pR) = EpAnn [AddEpAnn]
+type instance XPatBind    GhcRn (GhcPass pR) = NameSet -- See Note [Bind free vars]
+type instance XPatBind    GhcTc (GhcPass pR) = Type    -- Type of the GRHSs
 
 type instance XVarBind    (GhcPass pL) (GhcPass pR) = NoExtField
-type instance XAbsBinds   (GhcPass pL) (GhcPass pR) = NoExtField
 type instance XPatSynBind (GhcPass pL) (GhcPass pR) = NoExtField
-type instance XXHsBindsLR (GhcPass pL) (GhcPass pR) = NoExtCon
+
+type instance XXHsBindsLR GhcPs pR = DataConCantHappen
+type instance XXHsBindsLR GhcRn pR = DataConCantHappen
+type instance XXHsBindsLR GhcTc pR = AbsBinds
+
+type instance XPSB         (GhcPass idL) GhcPs = EpAnn [AddEpAnn]
+type instance XPSB         (GhcPass idL) GhcRn = NameSet -- Post renaming, FVs. See Note [Bind free vars]
+type instance XPSB         (GhcPass idL) GhcTc = NameSet
+
+type instance XXPatSynBind (GhcPass idL) (GhcPass idR) = DataConCantHappen
+
+-- ---------------------------------------------------------------------
+
+-- | Typechecked, generalised bindings, used in the output to the type checker.
+-- See Note [AbsBinds].
+data AbsBinds = AbsBinds {
+      abs_tvs     :: [TyVar],
+      abs_ev_vars :: [EvVar],  -- ^ Includes equality constraints
+
+     -- | AbsBinds only gets used when idL = idR after renaming,
+     -- but these need to be idL's for the collect... code in HsUtil
+     -- to have the right type
+      abs_exports :: [ABExport],
+
+      -- | Evidence bindings
+      -- Why a list? See "GHC.Tc.TyCl.Instance"
+      -- Note [Typechecking plan for instance declarations]
+      abs_ev_binds :: [TcEvBinds],
+
+      -- | Typechecked user bindings
+      abs_binds    :: LHsBinds GhcTc,
+
+      abs_sig :: Bool  -- See Note [The abs_sig field of AbsBinds]
+  }
 
 
         -- Consider (AbsBinds tvs ds [(ftvs, poly_f, mono_f) binds]
@@ -346,44 +166,13 @@ type instance XXHsBindsLR (GhcPass pL) (GhcPass pR) = NoExtCon
         -- See Note [AbsBinds]
 
 -- | Abstraction Bindings Export
-data ABExport p
-  = ABE { abe_ext       :: XABE p
-        , abe_poly      :: IdP p -- ^ Any INLINE pragma is attached to this Id
-        , abe_mono      :: IdP p
+data ABExport
+  = ABE { abe_poly      :: Id           -- ^ Any INLINE pragma is attached to this Id
+        , abe_mono      :: Id
         , abe_wrap      :: HsWrapper    -- ^ See Note [ABExport wrapper]
              -- Shape: (forall abs_tvs. abs_ev_vars => abe_mono) ~ abe_poly
         , abe_prags     :: TcSpecPrags  -- ^ SPECIALISE pragmas
         }
-   | XABExport !(XXABExport p)
-
-type instance XABE       (GhcPass p) = NoExtField
-type instance XXABExport (GhcPass p) = NoExtCon
-
-
--- | - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnPattern',
---             'GHC.Parser.Annotation.AnnEqual','GHC.Parser.Annotation.AnnLarrow',
---             'GHC.Parser.Annotation.AnnWhere','GHC.Parser.Annotation.AnnOpen' @'{'@,
---             'GHC.Parser.Annotation.AnnClose' @'}'@,
-
--- For details on above see note [Api annotations] in GHC.Parser.Annotation
-
--- | Pattern Synonym binding
-data PatSynBind idL idR
-  = PSB { psb_ext  :: XPSB idL idR,            -- ^ Post renaming, FVs.
-                                               -- See Note [Bind free vars]
-          psb_id   :: Located (IdP idL),       -- ^ Name of the pattern synonym
-          psb_args :: HsPatSynDetails (Located (IdP idR)),
-                                               -- ^ Formal parameter names
-          psb_def  :: LPat idR,                -- ^ Right-hand side
-          psb_dir  :: HsPatSynDir idR          -- ^ Directionality
-     }
-   | XPatSynBind !(XXPatSynBind idL idR)
-
-type instance XPSB         (GhcPass idL) GhcPs = NoExtField
-type instance XPSB         (GhcPass idL) GhcRn = NameSet
-type instance XPSB         (GhcPass idL) GhcTc = NameSet
-
-type instance XXPatSynBind (GhcPass idL) (GhcPass idR) = NoExtCon
 
 {-
 Note [AbsBinds]
@@ -594,8 +383,8 @@ variables.  The action happens in GHC.Tc.Gen.Bind.mkExport.
 
 Note [Bind free vars]
 ~~~~~~~~~~~~~~~~~~~~~
-The bind_fvs field of FunBind and PatBind records the free variables
-of the definition.  It is used for the following purposes
+The extension fields of FunBind, PatBind and PatSynBind at GhcRn records the free
+variables of the definition.  It is used for the following purposes:
 
 a) Dependency analysis prior to type checking
     (see GHC.Tc.Gen.Bind.tc_group)
@@ -609,10 +398,10 @@ c) Deciding whether the binding can be used in static forms
 
 Specifically,
 
-  * bind_fvs includes all free vars that are defined in this module
+  * it includes all free vars that are defined in this module
     (including top-level things and lexically scoped type variables)
 
-  * bind_fvs excludes imported vars; this is just to keep the set smaller
+  * it excludes imported vars; this is just to keep the set smaller
 
   * Before renaming, and after typechecking, the field is unused;
     it's just an error thunk
@@ -660,8 +449,8 @@ pprLHsBindsForUser binds sigs
   where
 
     decls :: [(SrcSpan, SDoc)]
-    decls = [(loc, ppr sig)  | L loc sig <- sigs] ++
-            [(loc, ppr bind) | L loc bind <- bagToList binds]
+    decls = [(locA loc, ppr sig)  | L loc sig <- sigs] ++
+            [(locA loc, ppr bind) | L loc bind <- bagToList binds]
 
     sort_by_loc decls = sortBy (SrcLoc.leftmost_smallest `on` fst) decls
 
@@ -689,20 +478,20 @@ isEmptyValBinds (ValBinds _ ds sigs)  = isEmptyLHsBinds ds && null sigs
 isEmptyValBinds (XValBindsLR (NValBinds ds sigs)) = null ds && null sigs
 
 emptyValBindsIn, emptyValBindsOut :: HsValBindsLR (GhcPass a) (GhcPass b)
-emptyValBindsIn  = ValBinds noExtField emptyBag []
+emptyValBindsIn  = ValBinds NoAnnSortKey emptyBag []
 emptyValBindsOut = XValBindsLR (NValBinds [] [])
 
-emptyLHsBinds :: LHsBindsLR idL idR
+emptyLHsBinds :: LHsBindsLR (GhcPass idL) idR
 emptyLHsBinds = emptyBag
 
-isEmptyLHsBinds :: LHsBindsLR idL idR -> Bool
+isEmptyLHsBinds :: LHsBindsLR (GhcPass idL) idR -> Bool
 isEmptyLHsBinds = isEmptyBag
 
 ------------
 plusHsValBinds :: HsValBinds (GhcPass a) -> HsValBinds (GhcPass a)
                -> HsValBinds(GhcPass a)
 plusHsValBinds (ValBinds _ ds1 sigs1) (ValBinds _ ds2 sigs2)
-  = ValBinds noExtField (ds1 `unionBags` ds2) (sigs1 ++ sigs2)
+  = ValBinds NoAnnSortKey (ds1 `unionBags` ds2) (sigs1 ++ sigs2)
 plusHsValBinds (XValBindsLR (NValBinds ds1 sigs1))
                (XValBindsLR (NValBinds ds2 sigs2))
   = XValBindsLR (NValBinds (ds1 ++ ds2) (sigs1 ++ sigs2))
@@ -732,50 +521,71 @@ ppr_monobind (FunBind { fun_id = fun,
     $$  whenPprDebug (pprIfTc @idR $ ppr wrap)
 
 ppr_monobind (PatSynBind _ psb) = ppr psb
-ppr_monobind (AbsBinds { abs_tvs = tyvars, abs_ev_vars = dictvars
-                       , abs_exports = exports, abs_binds = val_binds
-                       , abs_ev_binds = ev_binds })
-  = sdocOption sdocPrintTypecheckerElaboration $ \case
-      False -> pprLHsBinds val_binds
-      True  -> -- Show extra information (bug number: #10662)
-               hang (text "AbsBinds"
-                     <+> sep [ brackets (interpp'SP tyvars)
-                             , brackets (interpp'SP dictvars) ])
-                  2 $ braces $ vcat
-               [ text "Exports:" <+>
-                   brackets (sep (punctuate comma (map ppr exports)))
-               , text "Exported types:" <+>
-                   vcat [pprBndr LetBind (abe_poly ex) | ex <- exports]
-               , text "Binds:" <+> pprLHsBinds val_binds
-               , pprIfTc @idR (text "Evidence:" <+> ppr ev_binds)
-               ]
+ppr_monobind (XHsBindsLR b) = case ghcPass @idL of
+#if __GLASGOW_HASKELL__ <= 900
+  GhcPs -> dataConCantHappen b
+  GhcRn -> dataConCantHappen b
+#endif
+  GhcTc -> ppr_absbinds b
+    where
+      ppr_absbinds (AbsBinds { abs_tvs = tyvars, abs_ev_vars = dictvars
+                             , abs_exports = exports, abs_binds = val_binds
+                             , abs_ev_binds = ev_binds })
+        = sdocOption sdocPrintTypecheckerElaboration $ \case
+          False -> pprLHsBinds val_binds
+          True  -> -- Show extra information (bug number: #10662)
+                   hang (text "AbsBinds"
+                         <+> sep [ brackets (interpp'SP tyvars)
+                                 , brackets (interpp'SP dictvars) ])
+                      2 $ braces $ vcat
+                   [ text "Exports:" <+>
+                       brackets (sep (punctuate comma (map ppr exports)))
+                   , text "Exported types:" <+>
+                       vcat [pprBndr LetBind (abe_poly ex) | ex <- exports]
+                   , text "Binds:" <+> pprLHsBinds val_binds
+                   , pprIfTc @idR (text "Evidence:" <+> ppr ev_binds)
+                   ]
 
-instance OutputableBndrId p => Outputable (ABExport (GhcPass p)) where
+instance Outputable ABExport where
   ppr (ABE { abe_wrap = wrap, abe_poly = gbl, abe_mono = lcl, abe_prags = prags })
     = vcat [ sep [ ppr gbl, nest 2 (text "<=" <+> ppr lcl) ]
            , nest 2 (pprTcSpecPrags prags)
-           , pprIfTc @p $ nest 2 (text "wrap:" <+> ppr wrap) ]
+           , ppr $ nest 2 (text "wrap:" <+> ppr wrap) ]
 
-instance (OutputableBndrId l, OutputableBndrId r,
-         Outputable (XXPatSynBind (GhcPass l) (GhcPass r)))
+instance (OutputableBndrId l, OutputableBndrId r)
           => Outputable (PatSynBind (GhcPass l) (GhcPass r)) where
   ppr (PSB{ psb_id = (L _ psyn), psb_args = details, psb_def = pat,
             psb_dir = dir })
       = ppr_lhs <+> ppr_rhs
     where
       ppr_lhs = text "pattern" <+> ppr_details
-      ppr_simple syntax = syntax <+> ppr pat
+      ppr_simple syntax = syntax <+> pprLPat pat
 
       ppr_details = case details of
-          InfixCon v1 v2 -> hsep [ppr v1, pprInfixOcc psyn, ppr v2]
-          PrefixCon vs   -> hsep (pprPrefixOcc psyn : map ppr vs)
+          InfixCon v1 v2 -> hsep [ppr_v v1, pprInfixOcc psyn, ppr_v  v2]
+            where
+                ppr_v v = case ghcPass @r of
+                    GhcPs -> ppr v
+                    GhcRn -> ppr v
+                    GhcTc -> ppr v
+          PrefixCon _ vs -> hsep (pprPrefixOcc psyn : map ppr_v vs)
+            where
+                ppr_v v = case ghcPass @r of
+                    GhcPs -> ppr v
+                    GhcRn -> ppr v
+                    GhcTc -> ppr v
           RecCon vs      -> pprPrefixOcc psyn
-                            <> braces (sep (punctuate comma (map ppr vs)))
+                            <> braces (sep (punctuate comma (map ppr_v vs)))
+            where
+                ppr_v v = case ghcPass @r of
+                    GhcPs -> ppr v
+                    GhcRn -> ppr v
+                    GhcTc -> ppr v
 
       ppr_rhs = case dir of
           Unidirectional           -> ppr_simple (text "<-")
           ImplicitBidirectional    -> ppr_simple equals
-          ExplicitBidirectional mg -> ppr_simple (text "<-") <+> ptext (sLit "where") $$
+          ExplicitBidirectional mg -> ppr_simple (text "<-") <+> text "where" $$
                                       (nest 2 $ pprFunBind mg)
 
 pprTicks :: SDoc -> SDoc -> SDoc
@@ -798,22 +608,13 @@ pprTicks pp_no_debug pp_when_debug
 ************************************************************************
 -}
 
--- | Haskell Implicit Parameter Bindings
-data HsIPBinds id
-  = IPBinds
-        (XIPBinds id)
-        [LIPBind id]
-        -- TcEvBinds       -- Only in typechecker output; binds
-        --                 -- uses of the implicit parameters
-  | XHsIPBinds !(XXHsIPBinds id)
-
 type instance XIPBinds       GhcPs = NoExtField
 type instance XIPBinds       GhcRn = NoExtField
 type instance XIPBinds       GhcTc = TcEvBinds -- binds uses of the
                                                -- implicit parameters
 
 
-type instance XXHsIPBinds    (GhcPass p) = NoExtCon
+type instance XXHsIPBinds    (GhcPass p) = DataConCantHappen
 
 isEmptyIPBindsPR :: HsIPBinds (GhcPass p) -> Bool
 isEmptyIPBindsPR (IPBinds _ is) = null is
@@ -821,32 +622,11 @@ isEmptyIPBindsPR (IPBinds _ is) = null is
 isEmptyIPBindsTc :: HsIPBinds GhcTc -> Bool
 isEmptyIPBindsTc (IPBinds ds is) = null is && isEmptyTcEvBinds ds
 
--- | Located Implicit Parameter Binding
-type LIPBind id = Located (IPBind id)
--- ^ May have 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnSemi' when in a
---   list
-
--- For details on above see note [Api annotations] in GHC.Parser.Annotation
-
--- | Implicit parameter bindings.
---
--- These bindings start off as (Left "x") in the parser and stay
--- that way until after type-checking when they are replaced with
--- (Right d), where "d" is the name of the dictionary holding the
--- evidence for the implicit parameter.
---
--- - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnEqual'
-
--- For details on above see note [Api annotations] in GHC.Parser.Annotation
-data IPBind id
-  = IPBind
-        (XCIPBind id)
-        (Either (Located HsIPName) (IdP id))
-        (LHsExpr id)
-  | XIPBind !(XXIPBind id)
-
-type instance XCIPBind    (GhcPass p) = NoExtField
-type instance XXIPBind    (GhcPass p) = NoExtCon
+-- EPA annotations in GhcPs, dictionary Id in GhcTc
+type instance XCIPBind GhcPs = EpAnn [AddEpAnn]
+type instance XCIPBind GhcRn = NoExtField
+type instance XCIPBind GhcTc = Id
+type instance XXIPBind    (GhcPass p) = DataConCantHappen
 
 instance OutputableBndrId p
        => Outputable (HsIPBinds (GhcPass p)) where
@@ -854,10 +634,11 @@ instance OutputableBndrId p
                         $$ whenPprDebug (pprIfTc @p $ ppr ds)
 
 instance OutputableBndrId p => Outputable (IPBind (GhcPass p)) where
-  ppr (IPBind _ lr rhs) = name <+> equals <+> pprExpr (unLoc rhs)
-    where name = case lr of
-                   Left (L _ ip) -> pprBndr LetBind ip
-                   Right     id  -> pprBndr LetBind id
+  ppr (IPBind x (L _ ip) rhs) = name <+> equals <+> pprExpr (unLoc rhs)
+    where name = case ghcPass @p of
+            GhcPs -> pprBndr LetBind ip
+            GhcRn -> pprBndr LetBind ip
+            GhcTc -> pprBndr LetBind x
 
 {-
 ************************************************************************
@@ -865,189 +646,31 @@ instance OutputableBndrId p => Outputable (IPBind (GhcPass p)) where
 \subsection{@Sig@: type signatures and value-modifying user pragmas}
 *                                                                      *
 ************************************************************************
-
-It is convenient to lump ``value-modifying'' user-pragmas (e.g.,
-``specialise this function to these four types...'') in with type
-signatures.  Then all the machinery to move them into place, etc.,
-serves for both.
 -}
 
--- | Located Signature
-type LSig pass = Located (Sig pass)
+type instance XTypeSig          (GhcPass p) = EpAnn AnnSig
+type instance XPatSynSig        (GhcPass p) = EpAnn AnnSig
+type instance XClassOpSig       (GhcPass p) = EpAnn AnnSig
+type instance XIdSig            (GhcPass p) = NoExtField -- No anns, generated
+type instance XFixSig           (GhcPass p) = EpAnn [AddEpAnn]
+type instance XInlineSig        (GhcPass p) = EpAnn [AddEpAnn]
+type instance XSpecSig          (GhcPass p) = EpAnn [AddEpAnn]
+type instance XSpecInstSig      (GhcPass p) = EpAnn [AddEpAnn]
+type instance XMinimalSig       (GhcPass p) = EpAnn [AddEpAnn]
+type instance XSCCFunSig        (GhcPass p) = EpAnn [AddEpAnn]
+type instance XCompleteMatchSig (GhcPass p) = EpAnn [AddEpAnn]
 
--- | Signatures and pragmas
-data Sig pass
-  =   -- | An ordinary type signature
-      --
-      -- > f :: Num a => a -> a
-      --
-      -- After renaming, this list of Names contains the named
-      -- wildcards brought into scope by this signature. For a signature
-      -- @_ -> _a -> Bool@, the renamer will leave the unnamed wildcard @_@
-      -- untouched, and the named wildcard @_a@ is then replaced with
-      -- fresh meta vars in the type. Their names are stored in the type
-      -- signature that brought them into scope, in this third field to be
-      -- more specific.
-      --
-      --  - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnDcolon',
-      --          'GHC.Parser.Annotation.AnnComma'
-
-      -- For details on above see note [Api annotations] in GHC.Parser.Annotation
-    TypeSig
-       (XTypeSig pass)
-       [Located (IdP pass)]  -- LHS of the signature; e.g.  f,g,h :: blah
-       (LHsSigWcType pass)   -- RHS of the signature; can have wildcards
-
-      -- | A pattern synonym type signature
-      --
-      -- > pattern Single :: () => (Show a) => a -> [a]
-      --
-      --  - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnPattern',
-      --           'GHC.Parser.Annotation.AnnDcolon','GHC.Parser.Annotation.AnnForall'
-      --           'GHC.Parser.Annotation.AnnDot','GHC.Parser.Annotation.AnnDarrow'
-
-      -- For details on above see note [Api annotations] in GHC.Parser.Annotation
-  | PatSynSig (XPatSynSig pass) [Located (IdP pass)] (LHsSigType pass)
-      -- P :: forall a b. Req => Prov => ty
-
-      -- | A signature for a class method
-      --   False: ordinary class-method signature
-      --   True:  generic-default class method signature
-      -- e.g.   class C a where
-      --          op :: a -> a                   -- Ordinary
-      --          default op :: Eq a => a -> a   -- Generic default
-      -- No wildcards allowed here
-      --
-      --  - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnDefault',
-      --           'GHC.Parser.Annotation.AnnDcolon'
-  | ClassOpSig (XClassOpSig pass) Bool [Located (IdP pass)] (LHsSigType pass)
-
-        -- | A type signature in generated code, notably the code
-        -- generated for record selectors.  We simply record
-        -- the desired Id itself, replete with its name, type
-        -- and IdDetails.  Otherwise it's just like a type
-        -- signature: there should be an accompanying binding
-  | IdSig (XIdSig pass) Id
-
-        -- | An ordinary fixity declaration
-        --
-        -- >     infixl 8 ***
-        --
-        --
-        --  - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnInfix',
-        --           'GHC.Parser.Annotation.AnnVal'
-
-        -- For details on above see note [Api annotations] in GHC.Parser.Annotation
-  | FixSig (XFixSig pass) (FixitySig pass)
-
-        -- | An inline pragma
-        --
-        -- > {#- INLINE f #-}
-        --
-        --  - 'GHC.Parser.Annotation.AnnKeywordId' :
-        --       'GHC.Parser.Annotation.AnnOpen' @'{-\# INLINE'@ and @'['@,
-        --       'GHC.Parser.Annotation.AnnClose','GHC.Parser.Annotation.AnnOpen',
-        --       'GHC.Parser.Annotation.AnnVal','GHC.Parser.Annotation.AnnTilde',
-        --       'GHC.Parser.Annotation.AnnClose'
-
-        -- For details on above see note [Api annotations] in GHC.Parser.Annotation
-  | InlineSig   (XInlineSig pass)
-                (Located (IdP pass)) -- Function name
-                InlinePragma         -- Never defaultInlinePragma
-
-        -- | A specialisation pragma
-        --
-        -- > {-# SPECIALISE f :: Int -> Int #-}
-        --
-        --  - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnOpen',
-        --      'GHC.Parser.Annotation.AnnOpen' @'{-\# SPECIALISE'@ and @'['@,
-        --      'GHC.Parser.Annotation.AnnTilde',
-        --      'GHC.Parser.Annotation.AnnVal',
-        --      'GHC.Parser.Annotation.AnnClose' @']'@ and @'\#-}'@,
-        --      'GHC.Parser.Annotation.AnnDcolon'
-
-        -- For details on above see note [Api annotations] in GHC.Parser.Annotation
-  | SpecSig     (XSpecSig pass)
-                (Located (IdP pass)) -- Specialise a function or datatype  ...
-                [LHsSigType pass]  -- ... to these types
-                InlinePragma       -- The pragma on SPECIALISE_INLINE form.
-                                   -- If it's just defaultInlinePragma, then we said
-                                   --    SPECIALISE, not SPECIALISE_INLINE
-
-        -- | A specialisation pragma for instance declarations only
-        --
-        -- > {-# SPECIALISE instance Eq [Int] #-}
-        --
-        -- (Class tys); should be a specialisation of the
-        -- current instance declaration
-        --
-        --  - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnOpen',
-        --      'GHC.Parser.Annotation.AnnInstance','GHC.Parser.Annotation.AnnClose'
-
-        -- For details on above see note [Api annotations] in GHC.Parser.Annotation
-  | SpecInstSig (XSpecInstSig pass) SourceText (LHsSigType pass)
-                  -- Note [Pragma source text] in GHC.Types.Basic
-
-        -- | A minimal complete definition pragma
-        --
-        -- > {-# MINIMAL a | (b, c | (d | e)) #-}
-        --
-        --  - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnOpen',
-        --      'GHC.Parser.Annotation.AnnVbar','GHC.Parser.Annotation.AnnComma',
-        --      'GHC.Parser.Annotation.AnnClose'
-
-        -- For details on above see note [Api annotations] in GHC.Parser.Annotation
-  | MinimalSig (XMinimalSig pass)
-               SourceText (LBooleanFormula (Located (IdP pass)))
-               -- Note [Pragma source text] in GHC.Types.Basic
-
-        -- | A "set cost centre" pragma for declarations
-        --
-        -- > {-# SCC funName #-}
-        --
-        -- or
-        --
-        -- > {-# SCC funName "cost_centre_name" #-}
-
-  | SCCFunSig  (XSCCFunSig pass)
-               SourceText      -- Note [Pragma source text] in GHC.Types.Basic
-               (Located (IdP pass))  -- Function name
-               (Maybe (Located StringLiteral))
-       -- | A complete match pragma
-       --
-       -- > {-# COMPLETE C, D [:: T] #-}
-       --
-       -- Used to inform the pattern match checker about additional
-       -- complete matchings which, for example, arise from pattern
-       -- synonym definitions.
-  | CompleteMatchSig (XCompleteMatchSig pass)
-                     SourceText
-                     (Located [Located (IdP pass)])
-                     (Maybe (Located (IdP pass)))
-  | XSig !(XXSig pass)
-
-type instance XTypeSig          (GhcPass p) = NoExtField
-type instance XPatSynSig        (GhcPass p) = NoExtField
-type instance XClassOpSig       (GhcPass p) = NoExtField
-type instance XIdSig            (GhcPass p) = NoExtField
-type instance XFixSig           (GhcPass p) = NoExtField
-type instance XInlineSig        (GhcPass p) = NoExtField
-type instance XSpecSig          (GhcPass p) = NoExtField
-type instance XSpecInstSig      (GhcPass p) = NoExtField
-type instance XMinimalSig       (GhcPass p) = NoExtField
-type instance XSCCFunSig        (GhcPass p) = NoExtField
-type instance XCompleteMatchSig (GhcPass p) = NoExtField
-type instance XXSig             (GhcPass p) = NoExtCon
-
--- | Located Fixity Signature
-type LFixitySig pass = Located (FixitySig pass)
-
--- | Fixity Signature
-data FixitySig pass = FixitySig (XFixitySig pass) [Located (IdP pass)] Fixity
-                    | XFixitySig !(XXFixitySig pass)
+type instance XXSig             (GhcPass p) = DataConCantHappen
 
 type instance XFixitySig  (GhcPass p) = NoExtField
-type instance XXFixitySig (GhcPass p) = NoExtCon
+type instance XXFixitySig (GhcPass p) = DataConCantHappen
+
+data AnnSig
+  = AnnSig {
+      asDcolon :: AddEpAnn, -- Not an EpaAnchor to capture unicode option
+      asRest   :: [AddEpAnn]
+      } deriving Data
+
 
 -- | Type checker Specialisation Pragmas
 --
@@ -1082,78 +705,11 @@ isDefaultMethod :: TcSpecPrags -> Bool
 isDefaultMethod IsDefaultMethod = True
 isDefaultMethod (SpecPrags {})  = False
 
-
-isFixityLSig :: LSig name -> Bool
-isFixityLSig (L _ (FixSig {})) = True
-isFixityLSig _                 = False
-
-isTypeLSig :: LSig name -> Bool  -- Type signatures
-isTypeLSig (L _(TypeSig {}))    = True
-isTypeLSig (L _(ClassOpSig {})) = True
-isTypeLSig (L _(IdSig {}))      = True
-isTypeLSig _                    = False
-
-isSpecLSig :: LSig name -> Bool
-isSpecLSig (L _(SpecSig {})) = True
-isSpecLSig _                 = False
-
-isSpecInstLSig :: LSig name -> Bool
-isSpecInstLSig (L _ (SpecInstSig {})) = True
-isSpecInstLSig _                      = False
-
-isPragLSig :: LSig name -> Bool
--- Identifies pragmas
-isPragLSig (L _ (SpecSig {}))   = True
-isPragLSig (L _ (InlineSig {})) = True
-isPragLSig (L _ (SCCFunSig {})) = True
-isPragLSig (L _ (CompleteMatchSig {})) = True
-isPragLSig _                    = False
-
-isInlineLSig :: LSig name -> Bool
--- Identifies inline pragmas
-isInlineLSig (L _ (InlineSig {})) = True
-isInlineLSig _                    = False
-
-isMinimalLSig :: LSig name -> Bool
-isMinimalLSig (L _ (MinimalSig {})) = True
-isMinimalLSig _                     = False
-
-isSCCFunSig :: LSig name -> Bool
-isSCCFunSig (L _ (SCCFunSig {})) = True
-isSCCFunSig _                    = False
-
-isCompleteMatchSig :: LSig name -> Bool
-isCompleteMatchSig (L _ (CompleteMatchSig {} )) = True
-isCompleteMatchSig _                            = False
-
-hsSigDoc :: Sig name -> SDoc
-hsSigDoc (TypeSig {})           = text "type signature"
-hsSigDoc (PatSynSig {})         = text "pattern synonym signature"
-hsSigDoc (ClassOpSig _ is_deflt _ _)
- | is_deflt                     = text "default type signature"
- | otherwise                    = text "class method signature"
-hsSigDoc (IdSig {})             = text "id signature"
-hsSigDoc (SpecSig _ _ _ inl)
-                                = ppr inl <+> text "pragma"
-hsSigDoc (InlineSig _ _ prag)   = ppr (inlinePragmaSpec prag) <+> text "pragma"
-hsSigDoc (SpecInstSig _ src _)
-                                = pprWithSourceText src empty <+> text "instance pragma"
-hsSigDoc (FixSig {})            = text "fixity declaration"
-hsSigDoc (MinimalSig {})        = text "MINIMAL pragma"
-hsSigDoc (SCCFunSig {})         = text "SCC pragma"
-hsSigDoc (CompleteMatchSig {})  = text "COMPLETE pragma"
-hsSigDoc (XSig {})              = text "XSIG TTG extension"
-
-{-
-Check if signatures overlap; this is used when checking for duplicate
-signatures. Since some of the signatures contain a list of names, testing for
-equality is not enough -- we have to check if they overlap.
--}
-
 instance OutputableBndrId p => Outputable (Sig (GhcPass p)) where
     ppr sig = ppr_sig sig
 
-ppr_sig :: (OutputableBndrId p) => Sig (GhcPass p) -> SDoc
+ppr_sig :: forall p. OutputableBndrId p
+        => Sig (GhcPass p) -> SDoc
 ppr_sig (TypeSig _ vars ty)  = pprVarSig (map unLoc vars) (ppr ty)
 ppr_sig (ClassOpSig _ is_deflt vars ty)
   | is_deflt                 = text "default" <+> pprVarSig (map unLoc vars) (ppr ty)
@@ -1161,14 +717,14 @@ ppr_sig (ClassOpSig _ is_deflt vars ty)
 ppr_sig (IdSig _ id)         = pprVarSig [id] (ppr (varType id))
 ppr_sig (FixSig _ fix_sig)   = ppr fix_sig
 ppr_sig (SpecSig _ var ty inl@(InlinePragma { inl_inline = spec }))
-  = pragSrcBrackets (inl_src inl) pragmaSrc (pprSpec (unLoc var)
+  = pragSrcBrackets (inlinePragmaSource inl) pragmaSrc (pprSpec (unLoc var)
                                              (interpp'SP ty) inl)
     where
       pragmaSrc = case spec of
-        NoUserInline -> "{-# SPECIALISE"
-        _            -> "{-# SPECIALISE_INLINE"
+        NoUserInlinePrag -> "{-# " ++ extractSpecPragName (inl_src inl)
+        _                -> "{-# " ++ extractSpecPragName (inl_src inl)  ++ "_INLINE"
 ppr_sig (InlineSig _ var inl)
-  = pragSrcBrackets (inl_src inl) "{-# INLINE"  (pprInline inl
+  = pragSrcBrackets (inlinePragmaSource inl) "{-# INLINE"  (pprInline inl
                                    <+> pprPrefixOcc (unLoc var))
 ppr_sig (SpecInstSig _ src ty)
   = pragSrcBrackets src "{-# pragma" (text "instance" <+> ppr ty)
@@ -1177,13 +733,22 @@ ppr_sig (MinimalSig _ src bf)
 ppr_sig (PatSynSig _ names sig_ty)
   = text "pattern" <+> pprVarSig (map unLoc names) (ppr sig_ty)
 ppr_sig (SCCFunSig _ src fn mlabel)
-  = pragSrcBrackets src "{-# SCC" (ppr fn <+> maybe empty ppr mlabel )
+  = pragSrcBrackets src "{-# SCC" (ppr_fn <+> maybe empty ppr mlabel )
+      where
+        ppr_fn = case ghcPass @p of
+          GhcPs -> ppr fn
+          GhcRn -> ppr fn
+          GhcTc -> ppr fn
 ppr_sig (CompleteMatchSig _ src cs mty)
   = pragSrcBrackets src "{-# COMPLETE"
-      ((hsep (punctuate comma (map ppr (unLoc cs))))
+      ((hsep (punctuate comma (map ppr_n (unLoc cs))))
         <+> opt_sig)
   where
     opt_sig = maybe empty ((\t -> dcolon <+> ppr t) . unLoc) mty
+    ppr_n n = case ghcPass @p of
+        GhcPs -> ppr n
+        GhcRn -> ppr n
+        GhcTc -> ppr n
 
 instance OutputableBndrId p
        => Outputable (FixitySig (GhcPass p)) where
@@ -1217,74 +782,32 @@ pprTcSpecPrags (SpecPrags ps)  = vcat (map (ppr . unLoc) ps)
 
 instance Outputable TcSpecPrag where
   ppr (SpecPrag var _ inl)
-    = text "SPECIALIZE" <+> pprSpec var (text "<type>") inl
+    = ppr (extractSpecPragName $ inl_src inl) <+> pprSpec var (text "<type>") inl
 
 pprMinimalSig :: (OutputableBndr name)
-              => LBooleanFormula (Located name) -> SDoc
+              => LBooleanFormula (GenLocated l name) -> SDoc
 pprMinimalSig (L _ bf) = ppr (fmap unLoc bf)
 
 {-
 ************************************************************************
 *                                                                      *
-\subsection[PatSynBind]{A pattern synonym definition}
+\subsection{Anno instances}
 *                                                                      *
 ************************************************************************
 -}
 
--- | Haskell Pattern Synonym Details
-type HsPatSynDetails arg = HsConDetails arg [RecordPatSynField arg]
+type instance Anno (HsBindLR (GhcPass idL) (GhcPass idR)) = SrcSpanAnnA
+type instance Anno (IPBind (GhcPass p)) = SrcSpanAnnA
+type instance Anno (Sig (GhcPass p)) = SrcSpanAnnA
 
--- See Note [Record PatSyn Fields]
--- | Record Pattern Synonym Field
-data RecordPatSynField a
-  = RecordPatSynField {
-      recordPatSynSelectorId :: a  -- Selector name visible in rest of the file
-      , recordPatSynPatVar :: a
-      -- Filled in by renamer, the name used internally
-      -- by the pattern
-      } deriving (Data, Functor)
+-- For CompleteMatchSig
+type instance Anno [LocatedN RdrName] = SrcSpan
+type instance Anno [LocatedN Name]    = SrcSpan
+type instance Anno [LocatedN Id]      = SrcSpan
 
+type instance Anno (FixitySig (GhcPass p)) = SrcSpanAnnA
 
-
-{-
-Note [Record PatSyn Fields]
-
-Consider the following two pattern synonyms.
-
-pattern P x y = ([x,True], [y,'v'])
-pattern Q{ x, y } =([x,True], [y,'v'])
-
-In P, we just have two local binders, x and y.
-
-In Q, we have local binders but also top-level record selectors
-x :: ([Bool], [Char]) -> Bool and similarly for y.
-
-It would make sense to support record-like syntax
-
-pattern Q{ x=x1, y=y1 } = ([x1,True], [y1,'v'])
-
-when we have a different name for the local and top-level binder
-the distinction between the two names clear
-
--}
-instance Outputable a => Outputable (RecordPatSynField a) where
-    ppr (RecordPatSynField { recordPatSynSelectorId = v }) = ppr v
-
-instance Foldable RecordPatSynField  where
-    foldMap f (RecordPatSynField { recordPatSynSelectorId = visible
-                                 , recordPatSynPatVar = hidden })
-      = f visible `mappend` f hidden
-
-instance Traversable RecordPatSynField where
-    traverse f (RecordPatSynField { recordPatSynSelectorId =visible
-                                  , recordPatSynPatVar = hidden })
-      = (\ sel_id pat_var -> RecordPatSynField { recordPatSynSelectorId = sel_id
-                                               , recordPatSynPatVar = pat_var })
-          <$> f visible <*> f hidden
-
-
--- | Haskell Pattern Synonym Direction
-data HsPatSynDir id
-  = Unidirectional
-  | ImplicitBidirectional
-  | ExplicitBidirectional (MatchGroup id (LHsExpr id))
+type instance Anno StringLiteral = SrcAnn NoEpAnns
+type instance Anno (LocatedN RdrName) = SrcSpan
+type instance Anno (LocatedN Name) = SrcSpan
+type instance Anno (LocatedN Id) = SrcSpan

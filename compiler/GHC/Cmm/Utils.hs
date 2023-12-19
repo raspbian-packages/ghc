@@ -14,7 +14,7 @@
 
 module GHC.Cmm.Utils(
         -- CmmType
-        primRepCmmType, slotCmmType, slotForeignHint,
+        primRepCmmType, slotCmmType,
         typeCmmType, typeForeignHint, primRepForeignHint,
 
         -- CmmLit
@@ -31,6 +31,7 @@ module GHC.Cmm.Utils(
         cmmRegOffB, cmmOffsetB, cmmLabelOffB, cmmOffsetLitB, cmmOffsetExprB,
         cmmRegOffW, cmmOffsetW, cmmLabelOffW, cmmOffsetLitW, cmmOffsetExprW,
         cmmIndex, cmmIndexExpr, cmmLoadIndex, cmmLoadIndexW,
+        cmmLoadBWord, cmmLoadGCWord,
         cmmNegate,
         cmmULtWord, cmmUGeWord, cmmUGtWord, cmmUShrWord,
         cmmSLtWord,
@@ -47,8 +48,8 @@ module GHC.Cmm.Utils(
         currentTSOExpr, currentNurseryExpr, cccsExpr,
 
         -- Tagging
-        cmmTagMask, cmmPointerMask, cmmUntag, cmmIsTagged,
-        cmmConstrTag1,
+        cmmTagMask, cmmPointerMask, cmmUntag, cmmIsTagged, cmmIsNotTagged,
+        cmmConstrTag1, mAX_PTR_TAG, tAG_MASK,
 
         -- Overlap and usage
         regsOverlap, regUsedIn,
@@ -79,13 +80,12 @@ import GHC.Cmm
 import GHC.Cmm.BlockId
 import GHC.Cmm.CLabel
 import GHC.Utils.Outputable
-import GHC.Driver.Session
+import GHC.Utils.Panic
 import GHC.Types.Unique
 import GHC.Platform.Regs
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import Data.Bits
 import GHC.Cmm.Dataflow.Graph
 import GHC.Cmm.Dataflow.Label
 import GHC.Cmm.Dataflow.Block
@@ -115,7 +115,7 @@ primRepCmmType platform = \case
    AddrRep          -> bWord platform
    FloatRep         -> f32
    DoubleRep        -> f64
-   (VecRep len rep) -> vec len (primElemRepCmmType rep)
+   VecRep len rep   -> vec len (primElemRepCmmType rep)
 
 slotCmmType :: Platform -> SlotTy -> CmmType
 slotCmmType platform = \case
@@ -125,6 +125,7 @@ slotCmmType platform = \case
    Word64Slot      -> b64
    FloatSlot       -> f32
    DoubleSlot      -> f64
+   VecSlot l e     -> vec l (primElemRepCmmType e)
 
 primElemRepCmmType :: PrimElemRep -> CmmType
 primElemRepCmmType Int8ElemRep   = b8
@@ -159,14 +160,6 @@ primRepForeignHint AddrRep      = AddrHint -- NB! AddrHint, but NonPtrArg
 primRepForeignHint FloatRep     = NoHint
 primRepForeignHint DoubleRep    = NoHint
 primRepForeignHint (VecRep {})  = NoHint
-
-slotForeignHint :: SlotTy -> ForeignHint
-slotForeignHint PtrLiftedSlot   = AddrHint
-slotForeignHint PtrUnliftedSlot = AddrHint
-slotForeignHint WordSlot        = NoHint
-slotForeignHint Word64Slot      = NoHint
-slotForeignHint FloatSlot       = NoHint
-slotForeignHint DoubleSlot      = NoHint
 
 typeForeignHint :: UnaryType -> ForeignHint
 typeForeignHint = primRepForeignHint . typePrimRep1
@@ -266,9 +259,11 @@ cmmOffset platform  e byte_off = case e of
    CmmStackSlot area off -> CmmStackSlot area (off - byte_off)
   -- note stack area offsets increase towards lower addresses
    CmmMachOp (MO_Add rep) [expr, CmmLit (CmmInt byte_off1 _rep)]
-      -> CmmMachOp (MO_Add rep) [expr, CmmLit (CmmInt (byte_off1 + toInteger byte_off) rep)]
-   _ -> CmmMachOp (MO_Add width) [e, CmmLit (CmmInt (toInteger byte_off) width)]
-         where width = cmmExprWidth platform e
+      -> let !lit_off = (byte_off1 + toInteger byte_off)
+         in CmmMachOp (MO_Add rep) [expr, CmmLit (CmmInt lit_off rep)]
+   _ -> let !width = cmmExprWidth platform e
+        in
+        CmmMachOp (MO_Add width) [e, CmmLit (CmmInt (toInteger byte_off) width)]
 
 -- Smart constructor for CmmRegOff.  Same caveats as cmmOffset above.
 cmmRegOff :: CmmReg -> Int -> CmmExpr
@@ -311,7 +306,16 @@ cmmIndexExpr platform width base idx =
     byte_off = CmmMachOp (MO_Shl idx_w) [idx, mkIntExpr platform (widthInLog width)]
 
 cmmLoadIndex :: Platform -> CmmType -> CmmExpr -> Int -> CmmExpr
-cmmLoadIndex platform ty expr ix = CmmLoad (cmmIndex platform (typeWidth ty) expr ix) ty
+cmmLoadIndex platform ty expr ix =
+    CmmLoad (cmmIndex platform (typeWidth ty) expr ix) ty NaturallyAligned -- TODO: Audit uses
+
+-- | Load a naturally-aligned non-pointer word.
+cmmLoadBWord :: Platform -> CmmExpr -> CmmExpr
+cmmLoadBWord platform ptr = CmmLoad ptr (bWord platform) NaturallyAligned
+
+-- | Load a naturally-aligned GC pointer.
+cmmLoadGCWord :: Platform -> CmmExpr -> CmmExpr
+cmmLoadGCWord platform ptr = CmmLoad ptr (gcWord platform) NaturallyAligned
 
 -- The "B" variants take byte offsets
 cmmRegOffB :: CmmReg -> ByteOff -> CmmExpr
@@ -350,7 +354,8 @@ cmmLabelOffW :: Platform -> CLabel -> WordOff -> CmmLit
 cmmLabelOffW platform lbl wd_off = cmmLabelOffB lbl (wordsToBytes platform wd_off)
 
 cmmLoadIndexW :: Platform -> CmmExpr -> Int -> CmmType -> CmmExpr
-cmmLoadIndexW platform base off ty = CmmLoad (cmmOffsetW platform base off) ty
+cmmLoadIndexW platform base off ty =
+    CmmLoad (cmmOffsetW platform base off) ty NaturallyAligned -- TODO: Audit ses
 
 -----------------------
 cmmULtWord, cmmUGeWord, cmmUGtWord, cmmUShrWord,
@@ -401,7 +406,7 @@ cmmMkAssign platform expr uq =
 ---------------------------------------------------
 
 isTrivialCmmExpr :: CmmExpr -> Bool
-isTrivialCmmExpr (CmmLoad _ _)      = False
+isTrivialCmmExpr (CmmLoad _ _ _)    = False
 isTrivialCmmExpr (CmmMachOp _ _)    = False
 isTrivialCmmExpr (CmmLit _)         = True
 isTrivialCmmExpr (CmmReg _)         = True
@@ -409,7 +414,7 @@ isTrivialCmmExpr (CmmRegOff _ _)    = True
 isTrivialCmmExpr (CmmStackSlot _ _) = panic "isTrivialCmmExpr CmmStackSlot"
 
 hasNoGlobalRegs :: CmmExpr -> Bool
-hasNoGlobalRegs (CmmLoad e _)              = hasNoGlobalRegs e
+hasNoGlobalRegs (CmmLoad e _ _)            = hasNoGlobalRegs e
 hasNoGlobalRegs (CmmMachOp _ es)           = all hasNoGlobalRegs es
 hasNoGlobalRegs (CmmLit _)                 = True
 hasNoGlobalRegs (CmmReg (CmmLocal _))      = True
@@ -430,26 +435,30 @@ isComparisonExpr _                  = False
 --
 ---------------------------------------------------
 
+tAG_MASK :: Platform -> Int
+tAG_MASK platform = (1 `shiftL` pc_TAG_BITS (platformConstants platform)) - 1
+
+mAX_PTR_TAG :: Platform -> Int
+mAX_PTR_TAG = tAG_MASK
+
 -- Tag bits mask
-cmmTagMask, cmmPointerMask :: DynFlags -> CmmExpr
-cmmTagMask dflags = mkIntExpr (targetPlatform dflags) (tAG_MASK dflags)
-cmmPointerMask dflags = mkIntExpr (targetPlatform dflags) (complement (tAG_MASK dflags))
+cmmTagMask, cmmPointerMask :: Platform -> CmmExpr
+cmmTagMask platform = mkIntExpr platform (tAG_MASK platform)
+cmmPointerMask platform = mkIntExpr platform (complement (tAG_MASK platform))
 
 -- Used to untag a possibly tagged pointer
 -- A static label need not be untagged
-cmmUntag, cmmIsTagged, cmmConstrTag1 :: DynFlags -> CmmExpr -> CmmExpr
+cmmUntag, cmmIsTagged, cmmIsNotTagged, cmmConstrTag1 :: Platform -> CmmExpr -> CmmExpr
 cmmUntag _ e@(CmmLit (CmmLabel _)) = e
 -- Default case
-cmmUntag dflags e = cmmAndWord platform e (cmmPointerMask dflags)
-   where platform = targetPlatform dflags
+cmmUntag platform e = cmmAndWord platform e (cmmPointerMask platform)
 
--- Test if a closure pointer is untagged
-cmmIsTagged dflags e = cmmNeWord platform (cmmAndWord platform e (cmmTagMask dflags)) (zeroExpr platform)
-   where platform = targetPlatform dflags
+-- Test if a closure pointer is untagged/tagged.
+cmmIsTagged platform e = cmmNeWord platform (cmmAndWord platform e (cmmTagMask platform)) (zeroExpr platform)
+cmmIsNotTagged platform e = cmmEqWord platform (cmmAndWord platform e (cmmTagMask platform)) (zeroExpr platform)
 
 -- Get constructor tag, but one based.
-cmmConstrTag1 dflags e = cmmAndWord platform e (cmmTagMask dflags)
-   where platform = targetPlatform dflags
+cmmConstrTag1 platform e = cmmAndWord platform e (cmmTagMask platform)
 
 
 -----------------------------------------------------------------------------
@@ -478,7 +487,7 @@ regsOverlap _ reg reg' = reg == reg'
 regUsedIn :: Platform -> CmmReg -> CmmExpr -> Bool
 regUsedIn platform = regUsedIn_ where
   _   `regUsedIn_` CmmLit _         = False
-  reg `regUsedIn_` CmmLoad e  _     = reg `regUsedIn_` e
+  reg `regUsedIn_` CmmLoad e _ _    = reg `regUsedIn_` e
   reg `regUsedIn_` CmmReg reg'      = regsOverlap platform reg reg'
   reg `regUsedIn_` CmmRegOff reg' _ = regsOverlap platform reg reg'
   reg `regUsedIn_` CmmMachOp _ es   = any (reg `regUsedIn_`) es

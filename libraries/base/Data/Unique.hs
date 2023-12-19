@@ -1,5 +1,4 @@
 {-# LANGUAGE Trustworthy #-}
-{-# LANGUAGE MagicHash #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -8,7 +7,7 @@
 -- License     :  BSD-style (see the file libraries/base/LICENSE)
 --
 -- Maintainer  :  libraries@haskell.org
--- Stability   :  experimental
+-- Stability   :  stable
 -- Portability :  non-portable
 --
 -- An abstract interface to a unique symbol generator.
@@ -26,6 +25,9 @@ import System.IO.Unsafe (unsafePerformIO)
 
 import GHC.Num
 import Data.IORef
+
+-- $setup
+-- >>> import Prelude
 
 -- | An abstract unique object.  Objects of type 'Unique' may be
 -- compared for equality and ordering and hashed into 'Int'.

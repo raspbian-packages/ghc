@@ -1,7 +1,4 @@
-benchmarks: >=7.6
-doctest: <9.0
-doctest-options: -fobject-code -DINTEGER_GMP
-branches: master
-
-installed: +all -text -parsec
-install-dependencies: False
+ghcup-jobs: >=8.2
+docspec: True
+docspec-options: --timeout 2
+haddock: >=8.6

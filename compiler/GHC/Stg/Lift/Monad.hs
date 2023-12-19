@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP #-}
+
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE TypeFamilies #-}
 
@@ -12,6 +12,8 @@ module GHC.Stg.Lift.Monad (
     FloatLang (..), collectFloats, -- Exported just for the docs
     -- * Transformation monad
     LiftM, runLiftM,
+    -- ** Get config
+    getConfig,
     -- ** Adding bindings
     startBindingGroup, endBindingGroup, addTopStringLit, addLiftedBinding,
     -- ** Substitution and binders
@@ -20,23 +22,24 @@ module GHC.Stg.Lift.Monad (
     substOcc, isLifted, formerFreeVars, liftedIdsExpander
   ) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
 import GHC.Types.Basic
 import GHC.Types.CostCentre ( isCurrentCCS, dontCareCCS )
-import GHC.Driver.Session
 import GHC.Data.FastString
 import GHC.Types.Id
 import GHC.Types.Name
 import GHC.Utils.Outputable
 import GHC.Data.OrdList
+
+import GHC.Stg.Lift.Config
 import GHC.Stg.Subst
 import GHC.Stg.Syntax
+
 import GHC.Core.Utils
 import GHC.Types.Unique.Supply
-import GHC.Utils.Misc
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 import GHC.Core.Multiplicity
@@ -60,7 +63,7 @@ mkStgBinding NonRecursive = uncurry StgNonRec . head
 -- | Environment threaded around in a scoped, @Reader@-like fashion.
 data Env
   = Env
-  { e_dflags     :: !DynFlags
+  { e_config     :: StgLiftConfig
   -- ^ Read-only.
   , e_subst      :: !Subst
   -- ^ We need to track the renamings of local 'InId's to their lifted 'OutId',
@@ -83,8 +86,12 @@ data Env
   -- Invariant: 'Id's not present in this map won't be substituted.
   }
 
-emptyEnv :: DynFlags -> Env
-emptyEnv dflags = Env dflags emptySubst emptyVarEnv
+emptyEnv :: StgLiftConfig -> Env
+emptyEnv cfg = Env
+  { e_config = cfg
+  , e_subst = emptySubst
+  , e_expansions = emptyVarEnv
+  }
 
 
 -- Note [Handling floats]
@@ -182,7 +189,7 @@ collectFloats = go (0 :: Int) []
 
     map_rhss f = uncurry mkStgBinding . second (map (second f)) . decomposeStgBinding
     rm_cccs = map_rhss removeRhsCCCS
-    merge_binds binds = ASSERT( any is_rec binds )
+    merge_binds binds = assert (any is_rec binds) $
                         StgRec (concatMap (snd . decomposeStgBinding . rm_cccs) binds)
     is_rec StgRec{} = True
     is_rec _ = False
@@ -193,16 +200,16 @@ removeRhsCCCS :: GenStgRhs pass -> GenStgRhs pass
 removeRhsCCCS (StgRhsClosure ext ccs upd bndrs body)
   | isCurrentCCS ccs
   = StgRhsClosure ext dontCareCCS upd bndrs body
-removeRhsCCCS (StgRhsCon ccs con args)
+removeRhsCCCS (StgRhsCon ccs con mu ts args)
   | isCurrentCCS ccs
-  = StgRhsCon dontCareCCS con args
+  = StgRhsCon dontCareCCS con mu ts args
 removeRhsCCCS rhs = rhs
 
 -- | The analysis monad consists of the following 'RWST' components:
 --
 --     * 'Env': Reader-like context. Contains a substitution, info about how
---       how lifted identifiers are to be expanded into applications and details
---       such as 'DynFlags'.
+--       how lifted identifiers are to be expanded into applications and
+--       configuration options.
 --
 --     * @'OrdList' 'FloatLang'@: Writer output for the resulting STG program.
 --
@@ -215,18 +222,18 @@ newtype LiftM a
   = LiftM { unwrapLiftM :: RWST Env (OrdList FloatLang) () UniqSM a }
   deriving (Functor, Applicative, Monad)
 
-instance HasDynFlags LiftM where
-  getDynFlags = LiftM (RWS.asks e_dflags)
-
 instance MonadUnique LiftM where
   getUniqueSupplyM = LiftM (lift getUniqueSupplyM)
   getUniqueM = LiftM (lift getUniqueM)
   getUniquesM = LiftM (lift getUniquesM)
 
-runLiftM :: DynFlags -> UniqSupply -> LiftM () -> [OutStgTopBinding]
-runLiftM dflags us (LiftM m) = collectFloats (fromOL floats)
+runLiftM :: StgLiftConfig -> UniqSupply -> LiftM () -> [OutStgTopBinding]
+runLiftM cfg us (LiftM m) = collectFloats (fromOL floats)
   where
-    (_, _, floats) = initUs_ us (runRWST m (emptyEnv dflags) ())
+    (_, _, floats) = initUs_ us (runRWST m (emptyEnv cfg) ())
+
+getConfig :: LiftM StgLiftConfig
+getConfig = LiftM $ e_config <$> RWS.ask
 
 -- | Writes a plain 'StgTopStringLit' to the output.
 addTopStringLit :: OutId -> ByteString -> LiftM ()

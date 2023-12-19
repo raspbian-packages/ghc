@@ -10,15 +10,21 @@ import Data.List           ( isPrefixOf, isSuffixOf )
 
 import qualified Data.ByteString as BS
 
-import GHC.Types.Basic     ( IntegralLit(..) )
+import GHC.Platform
+import GHC.Types.SourceText
 import GHC.Driver.Session
-import GHC.Utils.Error     ( pprLocErrMsg )
+import GHC.Driver.Config.Diagnostic
+import GHC.Utils.Error     ( pprLocMsgEnvelope )
 import GHC.Data.FastString ( mkFastString )
+import GHC.Parser.Errors.Ppr ()
+import qualified GHC.Types.Error as E
 import GHC.Parser.Lexer    as Lexer
                            ( P(..), ParseResult(..), PState(..), Token(..)
-                           , mkPStatePure, lexer, mkParserFlags', getErrorMessages)
+                           , initParserState, lexer, mkParserOpts, getPsErrorMessages)
 import GHC.Data.Bag         ( bagToList )
-import GHC.Utils.Outputable ( showSDoc, panic, text, ($$) )
+import GHC.Utils.Outputable ( text, ($$) )
+import GHC.Utils.Panic      ( panic )
+import GHC.Driver.Ppr       ( showSDoc )
 import GHC.Types.SrcLoc
 import GHC.Data.StringBuffer ( StringBuffer, atEnd )
 
@@ -37,17 +43,18 @@ parse
 parse dflags fpath bs = case unP (go False []) initState of
     POk _ toks -> reverse toks
     PFailed pst ->
-      let err:_ = bagToList (getErrorMessages pst dflags) in
+      let err:_ = bagToList (E.getMessages $ getPsErrorMessages pst) in
       panic $ showSDoc dflags $
-        text "Hyperlinker parse error:" $$ pprLocErrMsg err
+        text "Hyperlinker parse error:" $$ pprLocMsgEnvelope err
   where
 
-    initState = mkPStatePure pflags buf start
+    initState = initParserState pflags buf start
     buf = stringBufferFromByteString bs
     start = mkRealSrcLoc (mkFastString fpath) 1 1
-    pflags = mkParserFlags' (warningFlags dflags)
-                            (extensionFlags dflags)
-                            (homeUnitId dflags)
+    arch_os = platformArchOS (targetPlatform dflags)
+    pflags = mkParserOpts   (extensionFlags dflags)
+                            (initDiagOpts dflags)
+                            (supportedLanguagesAndExtensions arch_os)
                             (safeImportsOn dflags)
                             False -- lex Haddocks as comment tokens
                             True  -- produce comment tokens
@@ -231,6 +238,7 @@ classify tok =
     ITrequires             -> TkKeyword
 
     ITinline_prag       {} -> TkPragma
+    ITopaque_prag       {} -> TkPragma
     ITspec_prag         {} -> TkPragma
     ITspec_inline_prag  {} -> TkPragma
     ITsource_prag       {} -> TkPragma
@@ -240,7 +248,6 @@ classify tok =
     ITline_prag         {} -> TkPragma
     ITcolumn_prag       {} -> TkPragma
     ITscc_prag          {} -> TkPragma
-    ITgenerated_prag    {} -> TkPragma
     ITunpack_prag       {} -> TkPragma
     ITnounpack_prag     {} -> TkPragma
     ITann_prag          {} -> TkPragma
@@ -262,6 +269,7 @@ classify tok =
     ITequal                -> TkGlyph
     ITlam                  -> TkGlyph
     ITlcase                -> TkGlyph
+    ITlcases               -> TkGlyph
     ITvbar                 -> TkGlyph
     ITlarrow            {} -> TkGlyph
     ITrarrow            {} -> TkGlyph
@@ -273,6 +281,7 @@ classify tok =
     ITprefixminus          -> TkGlyph
     ITbang                 -> TkGlyph
     ITdot                  -> TkOperator
+    ITproj              {} -> TkOperator
     ITstar              {} -> TkOperator
     ITtypeApp              -> TkGlyph
     ITpercent              -> TkGlyph
@@ -348,17 +357,14 @@ classify tok =
     ITeof                  -> TkUnknown
 
     ITlineComment       {} -> TkComment
-    ITdocCommentNext    {} -> TkComment
-    ITdocCommentPrev    {} -> TkComment
-    ITdocCommentNamed   {} -> TkComment
-    ITdocSection        {} -> TkComment
+    ITdocComment        {} -> TkComment
     ITdocOptions        {} -> TkComment
 
     -- The lexer considers top-level pragmas as comments (see `pragState` in
     -- the GHC lexer for more), so we have to manually reverse this. The
     -- following is a hammer: it smashes _all_ pragma-like block comments into
     -- pragmas.
-    ITblockComment c
+    ITblockComment c _
       | isPrefixOf "{-#" c
       , isSuffixOf "#-}" c -> TkPragma
       | otherwise          -> TkComment
@@ -372,6 +378,7 @@ inPragma True _ = True
 inPragma False tok =
   case tok of
     ITinline_prag       {} -> True
+    ITopaque_prag       {} -> True
     ITspec_prag         {} -> True
     ITspec_inline_prag  {} -> True
     ITsource_prag       {} -> True
@@ -381,7 +388,6 @@ inPragma False tok =
     ITline_prag         {} -> True
     ITcolumn_prag       {} -> True
     ITscc_prag          {} -> True
-    ITgenerated_prag    {} -> True
     ITunpack_prag       {} -> True
     ITnounpack_prag     {} -> True
     ITann_prag          {} -> True

@@ -10,7 +10,7 @@
 
 #define _GNU_SOURCE
 
-#include "PosixSource.h"
+#include "rts/PosixSource.h"
 #include "Rts.h"
 #include "RtsUtils.h"
 
@@ -36,7 +36,6 @@
 /*
   Note [Compact Normal Forms]
   ~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
   A compact normal form (CNF) is a region of memory containing one or more
   Haskell data structures.  The goals are:
 
@@ -227,9 +226,8 @@ compactAllocateBlockInternal(Capability            *cap,
         break;
 
     default:
-#if defined(DEBUG)
         ASSERT(!"code should not be reached");
-#else
+#if !defined(DEBUG)
         RTS_UNREACHABLE;
 #endif
     }
@@ -489,17 +487,6 @@ allocateForCompact (Capability *cap,
 
     bd = Bdescr((P_)str->nursery);
     bd->free = str->hp;
-
-    // We know it doesn't fit in the nursery
-    // if it is a large object, allocate a new block
-    if (sizeW > LARGE_OBJECT_THRESHOLD/sizeof(W_)) {
-        next_size = BLOCK_ROUND_UP(sizeW*sizeof(W_) + sizeof(StgCompactNFDataBlock));
-        block = compactAppendBlock(cap, str, next_size);
-        bd = Bdescr((P_)block);
-        to = bd->free;
-        bd->free += sizeW;
-        return to;
-    }
 
     // move the nursery past full blocks
     if (block_is_full (str->nursery)) {

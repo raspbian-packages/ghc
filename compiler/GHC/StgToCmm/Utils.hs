@@ -1,5 +1,4 @@
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE LambdaCase #-}
+
 
 -----------------------------------------------------------------------------
 --
@@ -10,10 +9,10 @@
 -----------------------------------------------------------------------------
 
 module GHC.StgToCmm.Utils (
-        cgLit, mkSimpleLit,
         emitDataLits, emitRODataLits,
         emitDataCon,
         emitRtsCall, emitRtsCallWithResult, emitRtsCallGen,
+        emitBarf,
         assignTemp, newTemp,
 
         newUnboxedTupleRegs,
@@ -38,21 +37,21 @@ module GHC.StgToCmm.Utils (
         cmmUntag, cmmIsTagged,
 
         addToMem, addToMemE, addToMemLblE, addToMemLbl,
-        newStringCLit, newByteStringCLit,
 
         -- * Update remembered set operations
         whenUpdRemSetEnabled,
         emitUpdRemSetPush,
         emitUpdRemSetPushThunk,
-  ) where
 
-#include "HsVersions.h"
+        convertInfoProvMap, cmmInfoTableToInfoProvEnt
+  ) where
 
 import GHC.Prelude
 
 import GHC.Platform
 import GHC.StgToCmm.Monad
 import GHC.StgToCmm.Closure
+import GHC.StgToCmm.Lit (mkSimpleLit, newStringCLit)
 import GHC.Cmm
 import GHC.Cmm.BlockId
 import GHC.Cmm.Graph as CmmGraph
@@ -72,50 +71,25 @@ import GHC.Types.Literal
 import GHC.Data.Graph.Directed
 import GHC.Utils.Misc
 import GHC.Types.Unique
-import GHC.Types.Unique.Supply (MonadUnique(..))
-import GHC.Driver.Session
 import GHC.Data.FastString
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
 import GHC.Types.RepType
 import GHC.Types.CostCentre
+import GHC.Types.IPE
 
-import Data.ByteString (ByteString)
-import qualified Data.ByteString.Char8 as BS8
 import qualified Data.Map as M
-import Data.Char
-import Data.List
+import Data.List (sortBy)
 import Data.Ord
-
-
--------------------------------------------------------------------------
---
---      Literals
---
--------------------------------------------------------------------------
-
-cgLit :: Literal -> FCode CmmLit
-cgLit (LitString s) = newByteStringCLit s
- -- not unpackFS; we want the UTF-8 byte stream.
-cgLit other_lit     = do platform <- getPlatform
-                         return (mkSimpleLit platform other_lit)
-
-mkSimpleLit :: Platform -> Literal -> CmmLit
-mkSimpleLit platform = \case
-   (LitChar   c)                -> CmmInt (fromIntegral (ord c))
-                                          (wordWidth platform)
-   LitNullAddr                  -> zeroCLit platform
-   (LitNumber LitNumInt i)      -> CmmInt i (wordWidth platform)
-   (LitNumber LitNumInt64 i)    -> CmmInt i W64
-   (LitNumber LitNumWord i)     -> CmmInt i (wordWidth platform)
-   (LitNumber LitNumWord64 i)   -> CmmInt i W64
-   (LitFloat r)                 -> CmmFloat r W32
-   (LitDouble r)                -> CmmFloat r W64
-   (LitLabel fs ms fod)
-     -> let -- TODO: Literal labels might not actually be in the current package...
-            labelSrc = ForeignLabelInThisPackage
-        in CmmLabel (mkForeignLabel fs ms labelSrc fod)
-   -- NB: LitRubbish should have been lowered in "CoreToStg"
-   other -> pprPanic "mkSimpleLit" (ppr other)
+import GHC.Types.Unique.Map
+import Data.Maybe
+import qualified Data.List.NonEmpty as NE
+import GHC.Core.DataCon
+import GHC.Types.Unique.FM
+import GHC.Data.Maybe
+import Control.Monad
+import qualified Data.Map.Strict as Map
 
 --------------------------------------------------------------------------
 --
@@ -124,23 +98,25 @@ mkSimpleLit platform = \case
 --------------------------------------------------------------------------
 
 addToMemLbl :: CmmType -> CLabel -> Int -> CmmAGraph
-addToMemLbl rep lbl n = addToMem rep (CmmLit (CmmLabel lbl)) n
+addToMemLbl rep lbl = addToMem rep (CmmLit (CmmLabel lbl))
 
 addToMemLblE :: CmmType -> CLabel -> CmmExpr -> CmmAGraph
 addToMemLblE rep lbl = addToMemE rep (CmmLit (CmmLabel lbl))
 
+-- | @addToMem rep ptr n@ adds @n@ to the integer pointed-to by @ptr@.
 addToMem :: CmmType     -- rep of the counter
-         -> CmmExpr     -- Address
+         -> CmmExpr     -- Naturally-aligned address
          -> Int         -- What to add (a word)
          -> CmmAGraph
 addToMem rep ptr n = addToMemE rep ptr (CmmLit (CmmInt (toInteger n) (typeWidth rep)))
 
+-- | @addToMemE rep ptr n@ adds @n@ to the integer pointed-to by @ptr@.
 addToMemE :: CmmType    -- rep of the counter
-          -> CmmExpr    -- Address
+          -> CmmExpr    -- Naturally-aligned address
           -> CmmExpr    -- What to add (a word-typed expression)
           -> CmmAGraph
 addToMemE rep ptr n
-  = mkStore ptr (CmmMachOp (MO_Add (typeWidth rep)) [CmmLoad ptr rep, n])
+  = mkStore ptr (CmmMachOp (MO_Add (typeWidth rep)) [CmmLoad ptr rep NaturallyAligned, n])
 
 
 -------------------------------------------------------------------------
@@ -160,7 +136,8 @@ mkTaggedObjectLoad platform reg base offset tag
              (CmmLoad (cmmOffsetB platform
                                   (CmmReg (CmmLocal base))
                                   (offset - tag))
-                      (localRegType reg))
+                      (localRegType reg)
+                      NaturallyAligned)
 
 -------------------------------------------------------------------------
 --
@@ -171,7 +148,7 @@ mkTaggedObjectLoad platform reg base offset tag
 
 tagToClosure :: Platform -> TyCon -> CmmExpr -> CmmExpr
 tagToClosure platform tycon tag
-  = CmmLoad (cmmOffsetExprW platform closure_tbl tag) (bWord platform)
+  = cmmLoadBWord platform (cmmOffsetExprW platform closure_tbl tag)
   where closure_tbl = CmmLit (CmmLabel lbl)
         lbl = mkClosureTableLabel (tyConName tycon) NoCafRefs
 
@@ -181,13 +158,17 @@ tagToClosure platform tycon tag
 --
 -------------------------------------------------------------------------
 
+emitBarf :: String -> FCode ()
+emitBarf msg = do
+  strLbl <- newStringCLit msg
+  emitRtsCall rtsUnitId (fsLit "barf") [(CmmLit strLbl,AddrHint)] False
+
 emitRtsCall :: UnitId -> FastString -> [(CmmExpr,ForeignHint)] -> Bool -> FCode ()
-emitRtsCall pkg fun args safe = emitRtsCallGen [] (mkCmmCodeLabel pkg fun) args safe
+emitRtsCall pkg fun = emitRtsCallGen [] (mkCmmCodeLabel pkg fun)
 
 emitRtsCallWithResult :: LocalReg -> ForeignHint -> UnitId -> FastString
         -> [(CmmExpr,ForeignHint)] -> Bool -> FCode ()
-emitRtsCallWithResult res hint pkg fun args safe
-   = emitRtsCallGen [(res,hint)] (mkCmmCodeLabel pkg fun) args safe
+emitRtsCallWithResult res hint pkg = emitRtsCallGen [(res,hint)] . mkCmmCodeLabel pkg
 
 -- Make a call to an RTS C procedure
 emitRtsCallGen
@@ -197,9 +178,9 @@ emitRtsCallGen
    -> Bool -- True <=> CmmSafe call
    -> FCode ()
 emitRtsCallGen res lbl args safe
-  = do { dflags <- getDynFlags
+  = do { platform <- getPlatform
        ; updfr_off <- getUpdFrameOff
-       ; let (caller_save, caller_load) = callerSaveVolatileRegs dflags
+       ; let (caller_save, caller_load) = callerSaveVolatileRegs platform
        ; emit caller_save
        ; call updfr_off
        ; emit caller_load }
@@ -224,7 +205,7 @@ emitRtsCallGen res lbl args safe
 -- Here we generate the sequence of saves/restores required around a
 -- foreign call instruction.
 
--- TODO: reconcile with includes/Regs.h
+-- TODO: reconcile with rts/include/Regs.h
 --  * Regs.h claims that BaseReg should be saved last and loaded first
 --    * This might not have been tickled before since BaseReg is callee save
 --  * Regs.h saves SparkHd, ParkT1, SparkBase and SparkLim
@@ -232,7 +213,7 @@ emitRtsCallGen res lbl args safe
 -- This code isn't actually used right now, because callerSaves
 -- only ever returns true in the current universe for registers NOT in
 -- system_regs (just do a grep for CALLER_SAVES in
--- includes/stg/MachRegs.h).  It's all one giant no-op, and for
+-- rts/include/stg/MachRegs.h).  It's all one giant no-op, and for
 -- good reason: having to save system registers on every foreign call
 -- would be very expensive, so we avoid assigning them to those
 -- registers when we add support for an architecture.
@@ -245,13 +226,11 @@ emitRtsCallGen res lbl args safe
 -- "GHC.Cmm.Node".  Right now the workaround is to avoid inlining across
 -- unsafe foreign calls in GHC.Cmm.Sink, but this is strictly
 -- temporary.
-callerSaveVolatileRegs :: DynFlags -> (CmmAGraph, CmmAGraph)
-callerSaveVolatileRegs dflags = (caller_save, caller_load)
+callerSaveVolatileRegs :: Platform -> (CmmAGraph, CmmAGraph)
+callerSaveVolatileRegs platform = (caller_save, caller_load)
   where
-    platform = targetPlatform dflags
-
-    caller_save = catAGraphs (map (callerSaveGlobalReg    dflags) regs_to_save)
-    caller_load = catAGraphs (map (callerRestoreGlobalReg dflags) regs_to_save)
+    caller_save = catAGraphs (map (callerSaveGlobalReg    platform) regs_to_save)
+    caller_load = catAGraphs (map (callerRestoreGlobalReg platform) regs_to_save)
 
     system_regs = [ Sp,SpLim,Hp,HpLim,CCCS,CurrentTSO,CurrentNursery
                     {- ,SparkHd,SparkTl,SparkBase,SparkLim -}
@@ -259,14 +238,16 @@ callerSaveVolatileRegs dflags = (caller_save, caller_load)
 
     regs_to_save = filter (callerSaves platform) system_regs
 
-callerSaveGlobalReg :: DynFlags -> GlobalReg -> CmmAGraph
-callerSaveGlobalReg dflags reg
-    = mkStore (get_GlobalReg_addr dflags reg) (CmmReg (CmmGlobal reg))
+callerSaveGlobalReg :: Platform -> GlobalReg -> CmmAGraph
+callerSaveGlobalReg platform reg
+    = mkStore (get_GlobalReg_addr platform reg) (CmmReg (CmmGlobal reg))
 
-callerRestoreGlobalReg :: DynFlags -> GlobalReg -> CmmAGraph
-callerRestoreGlobalReg dflags reg
+callerRestoreGlobalReg :: Platform -> GlobalReg -> CmmAGraph
+callerRestoreGlobalReg platform reg
     = mkAssign (CmmGlobal reg)
-               (CmmLoad (get_GlobalReg_addr dflags reg) (globalRegType (targetPlatform dflags) reg))
+               (CmmLoad (get_GlobalReg_addr platform reg)
+                        (globalRegType platform reg)
+                        NaturallyAligned)
 
 
 -------------------------------------------------------------------------
@@ -284,19 +265,8 @@ emitRODataLits :: CLabel -> [CmmLit] -> FCode ()
 emitRODataLits lbl lits = emitDecl (mkRODataLits lbl lits)
 
 emitDataCon :: CLabel -> CmmInfoTable -> CostCentreStack -> [CmmLit] -> FCode ()
-emitDataCon lbl itbl ccs payload = emitDecl (CmmData (Section Data lbl) (CmmStatics lbl itbl ccs payload))
-
-newStringCLit :: String -> FCode CmmLit
--- Make a global definition for the string,
--- and return its label
-newStringCLit str = newByteStringCLit (BS8.pack str)
-
-newByteStringCLit :: ByteString -> FCode CmmLit
-newByteStringCLit bytes
-  = do  { uniq <- newUnique
-        ; let (lit, decl) = mkByteStringCLit (mkStringLitLabel uniq) bytes
-        ; emitDecl decl
-        ; return lit }
+emitDataCon lbl itbl ccs payload =
+  emitDecl (CmmData (Section Data lbl) (CmmStatics lbl itbl ccs payload))
 
 -------------------------------------------------------------------------
 --
@@ -314,14 +284,9 @@ assignTemp :: CmmExpr -> FCode LocalReg
 -- the optimization pass doesn't have to do as much work)
 assignTemp (CmmReg (CmmLocal reg)) = return reg
 assignTemp e = do { platform <- getPlatform
-                  ; uniq <- newUnique
-                  ; let reg = LocalReg uniq (cmmExprType platform e)
+                  ; reg <- newTemp (cmmExprType platform e)
                   ; emitAssign (CmmLocal reg) e
                   ; return reg }
-
-newTemp :: MonadUnique m => CmmType -> m LocalReg
-newTemp rep = do { uniq <- getUniqueM
-                 ; return (LocalReg uniq rep) }
 
 newUnboxedTupleRegs :: Type -> FCode ([LocalReg], [ForeignHint])
 -- Choose suitable local regs to use for the components
@@ -329,18 +294,16 @@ newUnboxedTupleRegs :: Type -> FCode ([LocalReg], [ForeignHint])
 -- the Sequel.  If the Sequel is a join point, using the
 -- regs it wants will save later assignments.
 newUnboxedTupleRegs res_ty
-  = ASSERT( isUnboxedTupleType res_ty )
+  = assert (isUnboxedTupleType res_ty) $
     do  { platform <- getPlatform
         ; sequel <- getSequel
         ; regs <- choose_regs platform sequel
-        ; ASSERT( regs `equalLength` reps )
-          return (regs, map primRepForeignHint reps) }
+        ; massert (regs `equalLength` reps)
+        ; return (regs, map primRepForeignHint reps) }
   where
     reps = typePrimRep res_ty
     choose_regs _ (AssignTo regs _) = return regs
     choose_regs platform _          = mapM (newTemp . primRepCmmType platform) reps
-
-
 
 -------------------------------------------------------------------------
 --      emitMultiAssign
@@ -365,7 +328,7 @@ emitMultiAssign []    []    = return ()
 emitMultiAssign [reg] [rhs] = emitAssign (CmmLocal reg) rhs
 emitMultiAssign regs rhss   = do
   platform <- getPlatform
-  ASSERT2( equalLength regs rhss, ppr regs $$ ppr rhss )
+  assertPpr (equalLength regs rhss) (ppr regs $$ pdoc platform rhss) $
     unscramble platform ([1..] `zip` (regs `zip` rhss))
 
 unscramble :: Platform -> [Vrtx] -> FCode ()
@@ -453,7 +416,7 @@ mk_discrete_switch :: Bool -- ^ Use signed comparisons
 -- SINGLETON TAG RANGE: no case analysis to do
 mk_discrete_switch _ _tag_expr [(tag, lbl)] _ (lo_tag, hi_tag)
   | lo_tag == hi_tag
-  = ASSERT( tag == lo_tag )
+  = assert (tag == lo_tag) $
     mkBranch lbl
 
 -- SINGLETON BRANCH, NO DEFAULT: no case analysis to do
@@ -497,12 +460,19 @@ emitCmmLitSwitch scrut  branches deflt = do
         rep = typeWidth cmm_ty
 
     -- We find the necessary type information in the literals in the branches
-    let signed = case head branches of
-                    (LitNumber nt _, _) -> litNumIsSigned nt
-                    _ -> False
-
-    let range | signed    = (platformMinInt platform, platformMaxInt platform)
-              | otherwise = (0, platformMaxWord platform)
+    let (signed,range) = case head branches of
+          (LitNumber nt _, _) -> (signed,range)
+            where
+              signed = litNumIsSigned nt
+              range  = case litNumRange platform nt of
+                        (Just mi, Just ma) -> (mi,ma)
+                                              -- unbounded literals (Natural and
+                                              -- Integer) must have been
+                                              -- lowered at this point
+                        partial_bounds     -> pprPanic "Unexpected unbounded literal range"
+                                                       (ppr partial_bounds)
+               -- assuming native word range
+          _ -> (False, (0, platformMaxWord platform))
 
     if isFloatType cmm_ty
     then emit =<< mk_float_switch rep scrut' deflt_lbl noBound branches_lbls
@@ -589,7 +559,6 @@ assignTemp' e
        emitAssign reg e
        return (CmmReg reg)
 
-
 ---------------------------------------------------------------------------
 -- Pushing to the update remembered set
 ---------------------------------------------------------------------------
@@ -599,7 +568,7 @@ whenUpdRemSetEnabled code = do
     platform <- getPlatform
     do_it <- getCode code
     let
-      enabled = CmmLoad (CmmLit $ CmmLabel mkNonmovingWriteBarrierEnabledLabel) (bWord platform)
+      enabled = cmmLoadBWord platform (CmmLit $ CmmLabel mkNonmovingWriteBarrierEnabledLabel)
       zero = zeroExpr platform
       is_enabled = cmmNeWord platform enabled zero
     the_if <- mkCmmIfThenElse' is_enabled do_it mkNop (Just False)
@@ -609,7 +578,7 @@ whenUpdRemSetEnabled code = do
 -- remembered set.
 emitUpdRemSetPush :: CmmExpr   -- ^ value of pointer which was overwritten
                   -> FCode ()
-emitUpdRemSetPush ptr = do
+emitUpdRemSetPush ptr =
     emitRtsCall
       rtsUnitId
       (fsLit "updateRemembSetPushClosure_")
@@ -619,10 +588,54 @@ emitUpdRemSetPush ptr = do
 
 emitUpdRemSetPushThunk :: CmmExpr -- ^ the thunk
                        -> FCode ()
-emitUpdRemSetPushThunk ptr = do
+emitUpdRemSetPushThunk ptr =
     emitRtsCall
       rtsUnitId
       (fsLit "updateRemembSetPushThunk_")
       [(CmmReg (CmmGlobal BaseReg), AddrHint),
        (ptr, AddrHint)]
       False
+
+-- | A bare bones InfoProvEnt for things which don't have a good source location
+cmmInfoTableToInfoProvEnt :: Module -> CmmInfoTable -> InfoProvEnt
+cmmInfoTableToInfoProvEnt this_mod cmit =
+    let cl = cit_lbl cmit
+        cn  = rtsClosureType (cit_rep cmit)
+    in InfoProvEnt cl cn "" this_mod Nothing
+
+-- | Convert source information collected about identifiers in 'GHC.STG.Debug'
+-- to entries suitable for placing into the info table provenenance table.
+convertInfoProvMap :: [CmmInfoTable] -> Module -> InfoTableProvMap -> [InfoProvEnt]
+convertInfoProvMap defns this_mod (InfoTableProvMap (UniqMap dcenv) denv infoTableToSourceLocationMap) =
+  map (\cmit ->
+    let cl = cit_lbl cmit
+        cn  = rtsClosureType (cit_rep cmit)
+
+        tyString :: Outputable a => a -> String
+        tyString = renderWithContext defaultSDocContext . ppr
+
+        lookupClosureMap :: Maybe InfoProvEnt
+        lookupClosureMap = case hasHaskellName cl >>= lookupUniqMap denv of
+                                Just (ty, mbspan) -> Just (InfoProvEnt cl cn (tyString ty) this_mod mbspan)
+                                Nothing -> Nothing
+
+        lookupDataConMap = do
+            UsageSite _ n <- hasIdLabelInfo cl >>= getConInfoTableLocation
+            -- This is a bit grimy, relies on the DataCon and Name having the same Unique, which they do
+            (dc, ns) <- hasHaskellName cl >>= lookupUFM_Directly dcenv . getUnique
+            -- Lookup is linear but lists will be small (< 100)
+            return $ InfoProvEnt cl cn (tyString (dataConTyCon dc)) this_mod (join $ lookup n (NE.toList ns))
+
+        lookupInfoTableToSourceLocation = do
+            sourceNote <- Map.lookup (cit_lbl cmit) infoTableToSourceLocationMap
+            return $ InfoProvEnt cl cn "" this_mod sourceNote
+
+        -- This catches things like prim closure types and anything else which doesn't have a
+        -- source location
+        simpleFallback = cmmInfoTableToInfoProvEnt this_mod cmit
+
+  in
+    if (isStackRep . cit_rep) cmit then
+      fromMaybe simpleFallback lookupInfoTableToSourceLocation
+    else
+      fromMaybe simpleFallback (lookupDataConMap `firstJust` lookupClosureMap)) defns

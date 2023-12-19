@@ -3,7 +3,7 @@
 module Rules.Libffi (
     LibffiDynLibs(..),
     needLibffi, askLibffilDynLibs, libffiRules, libffiLibrary, libffiHeaderFiles,
-    libffiHeaders, libffiSystemHeaders, libffiName
+    libffiHeaderDir, libffiSystemHeaderDir, libffiName
     ) where
 
 import Hadrian.Utilities
@@ -14,7 +14,7 @@ import Target
 import Utilities
 
 {- Note [Libffi indicating inputs]
-
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 First see https://gitlab.haskell.org/ghc/ghc/wikis/Developing-Hadrian for an
 explanation of "indicating input". Part of the definition is copied here for
 your convenience:
@@ -81,32 +81,41 @@ libffiContext stage = do
         then dynamic
         else vanilla
 
--- | The name of the (locally built) library
+-- | The name of the library
 libffiName :: Expr String
 libffiName = do
-    way <- getWay
-    return $ libffiName' (Dynamic `wayUnit` way)
+    useSystemFfi <- expr (flag UseSystemFfi)
+    if useSystemFfi
+      then pure "ffi"
+      else libffiLocalName Nothing
 
 -- | The name of the (locally built) library
-libffiName' :: Bool -> String
-libffiName' dynamic = (if dynamic     then ""      else "C")
-                   ++ (if windowsHost then "ffi-6" else "ffi")
+libffiLocalName :: Maybe Bool -> Expr String
+libffiLocalName force_dynamic = do
+  way <- getWay
+  winTarget <- expr isWinTarget
+  let dynamic = fromMaybe (Dynamic `wayUnit` way) force_dynamic
+  pure $ mconcat
+      [ if dynamic   then ""      else "C"
+      , if winTarget then "ffi-6" else "ffi"
+      ]
 
 libffiLibrary :: FilePath
 libffiLibrary = "inst/lib/libffi.a"
 
+-- | These are the headers that we must package with GHC since foreign export
+-- adjustor code produced by GHC depends upon them.
+-- See Note [Packaging libffi headers] in GHC.Driver.CodeOutput.
 libffiHeaderFiles :: [FilePath]
 libffiHeaderFiles = ["ffi.h", "ffitarget.h"]
 
-libffiHeaders :: Stage -> Action [FilePath]
-libffiHeaders stage = do
+libffiHeaderDir :: Stage -> Action FilePath
+libffiHeaderDir stage = do
     path <- libffiBuildPath stage
-    return $ fmap ((path -/- "inst/include") -/-) libffiHeaderFiles
+    return $ path -/- "inst/include"
 
-libffiSystemHeaders :: Action [FilePath]
-libffiSystemHeaders = do
-    ffiIncludeDir <- setting FfiIncludeDir
-    return $ fmap (ffiIncludeDir -/-) libffiHeaderFiles
+libffiSystemHeaderDir :: Action FilePath
+libffiSystemHeaderDir = setting FfiIncludeDir
 
 fixLibffiMakefile :: FilePath -> String -> String
 fixLibffiMakefile top =
@@ -147,7 +156,7 @@ libffiRules :: Rules ()
 libffiRules = do
   _ <- addOracleCache $ \ (LibffiDynLibs stage)
                          -> readFileLines =<< dynLibManifest stage
-  forM_ [Stage1 ..] $ \stage -> do
+  forM_ [Stage1, Stage2, Stage3] $ \stage -> do
     root <- buildRootRules
     let path       = root -/- stageString stage
         libffiPath = path -/- pkgName libffi -/- "build"
@@ -164,21 +173,24 @@ libffiRules = do
 
         -- Note this build needs the Makefile, triggering the rules bellow.
         build $ target context (Make libffiPath) [] []
+        libffiName' <- interpretInContext context (libffiLocalName (Just True))
 
         -- Produces all install files.
         produces =<< (\\ topLevelTargets)
                  <$> liftIO (getDirectoryFilesIO "." [libffiPath -/- "inst//*"])
 
         -- Find dynamic libraries.
+        osxTarget <- isOsxTarget
+        winTarget <- isWinTarget
+
         dynLibFiles <- do
             let libfilesDir = libffiPath -/-
-                    (if windowsHost then "inst" -/- "bin" else "inst" -/- "lib")
-                libffiName'' = libffiName' True
+                    (if winTarget then "inst" -/- "bin" else "inst" -/- "lib")
                 dynlibext
-                    | windowsHost = "dll"
-                    | osxHost     = "dylib"
-                    | otherwise   = "so"
-                filepat = "lib" ++ libffiName'' ++ "." ++ dynlibext ++ "*"
+                    | winTarget = "dll"
+                    | osxTarget = "dylib"
+                    | otherwise = "so"
+                filepat = "lib" ++ libffiName' ++ "." ++ dynlibext ++ "*"
             liftIO $ getDirectoryFilesIO "." [libfilesDir -/- filepat]
 
         writeFileLines dynLibMan dynLibFiles
@@ -190,7 +202,7 @@ libffiRules = do
         removeDirectory libffiPath
         tarball <- needLibfffiArchive libffiPath
         -- Go from 'libffi-3.99999+git20171002+77e130c.tar.gz' to 'libffi-3.99999'
-        let libname = takeWhile (/= '+') $ takeFileName tarball
+        let libname = takeWhile (/= '+') $ fromJust $ stripExtension "tar.gz" $ takeFileName tarball
 
         -- Move extracted directory to libffiPath.
         root <- buildRoot

@@ -17,6 +17,7 @@ module GHC.Types.Var.Env (
         delVarEnvList, delVarEnv,
         minusVarEnv,
         lookupVarEnv, lookupVarEnv_NF, lookupWithDefaultVarEnv,
+        lookupVarEnv_Directly,
         mapVarEnv, zipVarEnv,
         modifyVarEnv, modifyVarEnv_Directly,
         isEmptyVarEnv,
@@ -64,7 +65,7 @@ module GHC.Types.Var.Env (
         rnOccL, rnOccR, inRnEnvL, inRnEnvR, rnOccL_maybe, rnOccR_maybe,
         rnBndrL, rnBndrR, nukeRnEnvL, nukeRnEnvR, rnSwap,
         delBndrL, delBndrR, delBndrsL, delBndrsR,
-        addRnInScopeSet,
+        extendRnInScopeSetList,
         rnEtaL, rnEtaR,
         rnInScope, rnInScopeSet, lookupRnInScope,
         rnEnvL, rnEnvR,
@@ -86,6 +87,7 @@ import GHC.Types.Unique.FM
 import GHC.Types.Unique.DFM
 import GHC.Types.Unique
 import GHC.Utils.Misc
+import GHC.Utils.Panic
 import GHC.Data.Maybe
 import GHC.Utils.Outputable
 
@@ -97,7 +99,11 @@ import GHC.Utils.Outputable
 ************************************************************************
 -}
 
--- | A set of variables that are in scope at some point
+-- | A set of variables that are in scope at some point.
+--
+-- Note that this is a /superset/ of the variables that are currently in scope.
+-- See Note [The InScopeSet invariant].
+--
 -- "Secrets of the Glasgow Haskell Compiler inliner" Section 3.2 provides
 -- the motivation for this abstraction.
 newtype InScopeSet = InScope VarSet
@@ -108,6 +114,21 @@ newtype InScopeSet = InScope VarSet
         -- version of the variable (e.g. with an informative unfolding), so this
         -- lookup is useful (see, for instance, Note [In-scope set as a
         -- substitution]).
+
+        -- Note [The InScopeSet invariant]
+        -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        -- The InScopeSet must include every in-scope variable, but it may also
+        -- include other variables.
+
+        -- Its principal purpose is to provide a set of variables to be avoided
+        -- when creating a fresh identifier (fresh in the sense that it does not
+        -- "shadow" any in-scope binding). To do this we simply have to find one that
+        -- does not appear in the InScopeSet. This is done by the key function
+        -- GHC.Types.Var.Env.uniqAway.
+
+        -- See "Secrets of the Glasgow Haskell Compiler inliner" Section 3.2
+        -- for more detailed motivation. #20419 has further discussion.
+
 
 instance Outputable InScopeSet where
   ppr (InScope s) =
@@ -181,7 +202,8 @@ since they are only locally unique. In particular, two successive calls to
  -}
 
 -- | @uniqAway in_scope v@ finds a unique that is not used in the
--- in-scope set, and gives that to v. See Note [Local uniques].
+-- in-scope set, and gives that to v. See Note [Local uniques] and
+-- Note [The InScopeSet invariant].
 uniqAway :: InScopeSet -> Var -> Var
 -- It starts with v's current unique, of course, in the hope that it won't
 -- have to change, and thereafter uses the successor to the last derived unique
@@ -259,10 +281,10 @@ mkRnEnv2 vars = RV2     { envL     = emptyVarEnv
                         , envR     = emptyVarEnv
                         , in_scope = vars }
 
-addRnInScopeSet :: RnEnv2 -> VarSet -> RnEnv2
-addRnInScopeSet env vs
-  | isEmptyVarSet vs = env
-  | otherwise        = env { in_scope = extendInScopeSetSet (in_scope env) vs }
+extendRnInScopeSetList :: RnEnv2 -> [Var] -> RnEnv2
+extendRnInScopeSetList env vs
+  | null vs   = env
+  | otherwise = env { in_scope = extendInScopeSetList (in_scope env) vs }
 
 rnInScope :: Var -> RnEnv2 -> Bool
 rnInScope x env = x `elemInScopeSet` in_scope env
@@ -303,6 +325,7 @@ rnBndr2_var (RV2 { envL = envL, envR = envR, in_scope = in_scope }) bL bR
           | otherwise                          = uniqAway' in_scope bL
 
         -- Note [Rebinding]
+        -- ~~~~~~~~~~~~~~~~
         -- If the new var is the same as the old one, note that
         -- the extendVarEnv *deletes* any current renaming
         -- E.g.   (\x. \x. ...)  ~  (\y. \z. ...)
@@ -434,7 +457,7 @@ delTidyEnvList (occ_env, var_env) vs = (occ_env', var_env')
 {-
 ************************************************************************
 *                                                                      *
-\subsection{@VarEnv@s}
+   VarEnv
 *                                                                      *
 ************************************************************************
 -}
@@ -484,6 +507,7 @@ modifyVarEnv      :: (a -> a) -> VarEnv a -> Var -> VarEnv a
 
 isEmptyVarEnv     :: VarEnv a -> Bool
 lookupVarEnv      :: VarEnv a -> Var -> Maybe a
+lookupVarEnv_Directly :: VarEnv a -> Unique -> Maybe a
 filterVarEnv      :: (a -> Bool) -> VarEnv a -> VarEnv a
 lookupVarEnv_NF   :: VarEnv a -> Var -> a
 lookupWithDefaultVarEnv :: VarEnv a -> a -> Var -> a
@@ -507,7 +531,13 @@ delVarEnv        = delFromUFM
 minusVarEnv      = minusUFM
 plusVarEnv       = plusUFM
 plusVarEnvList   = plusUFMList
+-- lookupVarEnv is very hot (in part due to being called by substTyVar),
+-- if it's not inlined than the mere allocation of the Just constructor causes
+-- perf benchmarks to regress by 2% in some cases. See #21159, !7638 and containers#821
+-- for some more explanation about what exactly went wrong.
+{-# INLINE lookupVarEnv #-}
 lookupVarEnv     = lookupUFM
+lookupVarEnv_Directly = lookupUFM_Directly
 filterVarEnv     = filterUFM
 lookupWithDefaultVarEnv = lookupWithDefaultUFM
 mapVarEnv        = mapUFM
@@ -543,7 +573,13 @@ modifyVarEnv_Directly mangle_fn env key
       Nothing -> env
       Just xx -> addToUFM_Directly env key (mangle_fn xx)
 
--- Deterministic VarEnv
+{-
+************************************************************************
+*                                                                      *
+   Deterministic VarEnv (DVarEnv)
+*                                                                      *
+************************************************************************
+-}
 -- See Note [Deterministic UniqFM] in GHC.Types.Unique.DFM for explanation why we need
 -- DVarEnv.
 

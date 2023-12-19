@@ -1,69 +1,79 @@
-{-
-(c) The GRASP/AQUA Project, Glasgow University, 1992-1998
 
-\section{Tidying up Core}
--}
-
-{-# LANGUAGE CPP, DeriveFunctor, ViewPatterns #-}
+{-# LANGUAGE DeriveFunctor #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
+{-# LANGUAGE NamedFieldPuns #-}
 
-module GHC.Iface.Tidy (
-       mkBootModDetailsTc, tidyProgram
-   ) where
+{-
+(c) The GRASP/AQUA Project, Glasgow University, 1992-1998
+-}
 
-#include "HsVersions.h"
+-- | Tidying up Core
+module GHC.Iface.Tidy
+  ( TidyOpts (..)
+  , UnfoldingExposure (..)
+  , tidyProgram
+  , mkBootModDetailsTc
+  )
+where
 
 import GHC.Prelude
 
 import GHC.Tc.Types
-import GHC.Driver.Session
+import GHC.Tc.Utils.Env
+
 import GHC.Core
 import GHC.Core.Unfold
 import GHC.Core.FVs
 import GHC.Core.Tidy
-import GHC.Core.Opt.Monad
-import GHC.Core.Stats   (coreBindsStats, CoreStats(..))
 import GHC.Core.Seq     (seqBinds)
-import GHC.Core.Lint
-import GHC.Core.Rules
-import GHC.Core.PatSyn
-import GHC.Core.ConLike
-import GHC.Core.Opt.Arity   ( exprArity, exprBotStrictness_maybe )
+import GHC.Core.Opt.Arity   ( exprArity, exprBotStrictness_maybe, typeArity )
+import GHC.Core.InstEnv
+import GHC.Core.Type     ( tidyTopType, Type )
+import GHC.Core.DataCon
+import GHC.Core.TyCon
+import GHC.Core.Class
+
 import GHC.Iface.Tidy.StaticPtrTable
+import GHC.Iface.Env
+
+import GHC.Utils.Outputable
+import GHC.Utils.Misc( filterOut )
+import GHC.Utils.Panic
+import GHC.Utils.Trace
+import GHC.Utils.Logger as Logger
+import qualified GHC.Utils.Error as Err
+
+import GHC.Types.ForeignStubs
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 import GHC.Types.Var
 import GHC.Types.Id
 import GHC.Types.Id.Make ( mkDictSelRhs )
 import GHC.Types.Id.Info
-import GHC.Core.InstEnv
-import GHC.Core.Type     ( tidyTopType )
-import GHC.Types.Demand  ( appIsDeadEnd, isTopSig, isDeadEndSig )
+import GHC.Types.Demand  ( isDeadEndAppSig, isNopSig, isDeadEndSig )
 import GHC.Types.Cpr     ( mkCprSig, botCpr )
 import GHC.Types.Basic
 import GHC.Types.Name hiding (varName)
 import GHC.Types.Name.Set
 import GHC.Types.Name.Cache
 import GHC.Types.Avail
-import GHC.Iface.Env
-import GHC.Tc.Utils.Env
-import GHC.Tc.Utils.Monad
-import GHC.Core.DataCon
-import GHC.Core.TyCon
-import GHC.Core.Class
+import GHC.Types.Tickish
+import GHC.Types.TypeEnv
+
 import GHC.Unit.Module
-import GHC.Driver.Types
+import GHC.Unit.Module.ModGuts
+import GHC.Unit.Module.ModDetails
+import GHC.Unit.Module.Deps
+
 import GHC.Data.Maybe
-import GHC.Types.Unique.Supply
-import GHC.Utils.Outputable
-import GHC.Utils.Misc( filterOut )
-import qualified GHC.Utils.Error as Err
 
 import Control.Monad
 import Data.Function
 import Data.List        ( sortBy, mapAccumL )
-import Data.IORef       ( atomicModifyIORef' )
+import qualified Data.Set as S
+import GHC.Types.CostCentre
+import GHC.Core.Opt.OccurAnal (occurAnalyseExpr)
 
 {-
 Constructing the TypeEnv, Instances, Rules from which the
@@ -131,33 +141,31 @@ Plan A: mkBootModDetails: omit pragmas, make interfaces small
 -- We don't look at the bindings at all -- there aren't any
 -- for hs-boot files
 
-mkBootModDetailsTc :: HscEnv -> TcGblEnv -> IO ModDetails
-mkBootModDetailsTc hsc_env
+mkBootModDetailsTc :: Logger -> TcGblEnv -> IO ModDetails
+mkBootModDetailsTc logger
         TcGblEnv{ tcg_exports          = exports,
                   tcg_type_env         = type_env, -- just for the Ids
                   tcg_tcs              = tcs,
                   tcg_patsyns          = pat_syns,
                   tcg_insts            = insts,
                   tcg_fam_insts        = fam_insts,
-                  tcg_complete_matches = complete_sigs,
+                  tcg_complete_matches = complete_matches,
                   tcg_mod              = this_mod
                 }
   = -- This timing isn't terribly useful since the result isn't forced, but
     -- the message is useful to locating oneself in the compilation process.
-    Err.withTiming dflags
+    Err.withTiming logger
                    (text "CoreTidy"<+>brackets (ppr this_mod))
                    (const ()) $
-    return (ModDetails { md_types         = type_env'
-                       , md_insts         = insts'
-                       , md_fam_insts     = fam_insts
-                       , md_rules         = []
-                       , md_anns          = []
-                       , md_exports       = exports
-                       , md_complete_sigs = complete_sigs
+    return (ModDetails { md_types            = type_env'
+                       , md_insts            = insts'
+                       , md_fam_insts        = fam_insts
+                       , md_rules            = []
+                       , md_anns             = []
+                       , md_exports          = exports
+                       , md_complete_matches = complete_matches
                        })
   where
-    dflags = hsc_dflags hsc_env
-
     -- Find the LocalIds in the type env that are exported
     -- Make them into GlobalIds, and tidy their types
     --
@@ -175,10 +183,8 @@ mkBootModDetailsTc hsc_env
 
     final_tcs  = filterOut isWiredIn tcs
                  -- See Note [Drop wired-in things]
-    type_env1  = typeEnvFromEntities final_ids final_tcs fam_insts
-    insts'     = mkFinalClsInsts type_env1 insts
-    pat_syns'  = mkFinalPatSyns  type_env1 pat_syns
-    type_env'  = extendTypeEnvWithPatSyns pat_syns' type_env1
+    type_env'  = typeEnvFromEntities final_ids final_tcs pat_syns fam_insts
+    insts'     = mkFinalClsInsts type_env' $ mkInstEnv insts
 
     -- Default methods have their export flag set (isExportedId),
     -- but everything else doesn't (yet), because this is
@@ -199,15 +205,8 @@ lookupFinalId type_env id
       Just (AnId id') -> id'
       _ -> pprPanic "lookup_final_id" (ppr id)
 
-mkFinalClsInsts :: TypeEnv -> [ClsInst] -> [ClsInst]
-mkFinalClsInsts env = map (updateClsInstDFun (lookupFinalId env))
-
-mkFinalPatSyns :: TypeEnv -> [PatSyn] -> [PatSyn]
-mkFinalPatSyns env = map (updatePatSynIds (lookupFinalId env))
-
-extendTypeEnvWithPatSyns :: [PatSyn] -> TypeEnv -> TypeEnv
-extendTypeEnvWithPatSyns tidy_patsyns type_env
-  = extendTypeEnvList type_env [AConLike (PatSynCon ps) | ps <- tidy_patsyns ]
+mkFinalClsInsts :: TypeEnv -> InstEnv -> InstEnv
+mkFinalClsInsts env = updateClsInstDFuns (lookupFinalId env)
 
 globaliseAndTidyBootId :: Id -> Id
 -- For a LocalId with an External Name,
@@ -296,8 +295,7 @@ binder
     [Even non-exported things need system-wide Uniques because the
     byte-code generator builds a single Name->BCO symbol table.]
 
-    We use the NameCache kept in the HscEnv as the
-    source of such system-wide uniques.
+    We use the given NameCache as the source of such system-wide uniques.
 
     For external Ids, use the original-name cache in the NameCache
     to ensure that the unique assigned is the same as the Id had
@@ -341,135 +339,171 @@ three places this is actioned:
   load a compulsory unfolding
 -}
 
-tidyProgram :: HscEnv -> ModGuts -> IO (CgGuts, ModDetails)
-tidyProgram hsc_env  (ModGuts { mg_module    = mod
-                              , mg_exports   = exports
-                              , mg_rdr_env   = rdr_env
-                              , mg_tcs       = tcs
-                              , mg_insts     = cls_insts
-                              , mg_fam_insts = fam_insts
-                              , mg_binds     = binds
-                              , mg_patsyns   = patsyns
-                              , mg_rules     = imp_rules
-                              , mg_anns      = anns
-                              , mg_complete_sigs = complete_sigs
-                              , mg_deps      = deps
-                              , mg_foreign   = foreign_stubs
-                              , mg_foreign_files = foreign_files
-                              , mg_hpc_info  = hpc_info
-                              , mg_modBreaks = modBreaks
-                              })
+data UnfoldingExposure
+  = ExposeNone -- ^ Don't expose unfoldings
+  | ExposeSome -- ^ Only expose required unfoldings
+  | ExposeAll  -- ^ Expose all unfoldings
+  deriving (Show,Eq,Ord)
 
-  = Err.withTiming dflags
-                   (text "CoreTidy"<+>brackets (ppr mod))
-                   (const ()) $
-    do  { let { omit_prags = gopt Opt_OmitInterfacePragmas dflags
-              ; expose_all = gopt Opt_ExposeAllUnfoldings  dflags
-              ; print_unqual = mkPrintUnqualified dflags rdr_env
-              ; implicit_binds = concatMap getImplicitBinds tcs
-              }
+data TidyOpts = TidyOpts
+  { opt_name_cache        :: !NameCache
+  , opt_collect_ccs       :: !Bool -- ^ Always true if we compile with -prof
+  , opt_unfolding_opts    :: !UnfoldingOpts
+  , opt_expose_unfoldings :: !UnfoldingExposure
+      -- ^ Which unfoldings to expose
+  , opt_trim_ids :: !Bool
+      -- ^ trim off the arity, one-shot-ness, strictness etc which were
+      -- retained for the benefit of the code generator
+  , opt_expose_rules :: !Bool
+      -- ^ Are rules exposed or not?
+  , opt_static_ptr_opts :: !(Maybe StaticPtrOpts)
+      -- ^ Options for generated static pointers, if enabled (/= Nothing).
+  }
 
-        ; (unfold_env, tidy_occ_env)
-              <- chooseExternalIds hsc_env mod omit_prags expose_all
-                                   binds implicit_binds imp_rules
-        ; let { (trimmed_binds, trimmed_rules)
-                    = findExternalRules omit_prags binds imp_rules unfold_env }
+tidyProgram :: TidyOpts -> ModGuts -> IO (CgGuts, ModDetails)
+tidyProgram opts (ModGuts { mg_module           = mod
+                          , mg_exports          = exports
+                          , mg_tcs              = tcs
+                          , mg_insts            = cls_insts
+                          , mg_fam_insts        = fam_insts
+                          , mg_binds            = binds
+                          , mg_patsyns          = patsyns
+                          , mg_rules            = imp_rules
+                          , mg_anns             = anns
+                          , mg_complete_matches = complete_matches
+                          , mg_deps             = deps
+                          , mg_foreign          = foreign_stubs
+                          , mg_foreign_files    = foreign_files
+                          , mg_hpc_info         = hpc_info
+                          , mg_modBreaks        = modBreaks
+                          , mg_boot_exports     = boot_exports
+                          }) = do
 
-        ; (tidy_env, tidy_binds)
-                 <- tidyTopBinds hsc_env unfold_env tidy_occ_env trimmed_binds
+  let implicit_binds = concatMap getImplicitBinds tcs
 
-          -- See Note [Grand plan for static forms] in GHC.Iface.Tidy.StaticPtrTable.
-        ; (spt_entries, tidy_binds') <-
-             sptCreateStaticBinds hsc_env mod tidy_binds
-        ; let { spt_init_code = sptModuleInitCode mod spt_entries
-              ; add_spt_init_code =
-                  case hscTarget dflags of
-                    -- If we are compiling for the interpreter we will insert
-                    -- any necessary SPT entries dynamically
-                    HscInterpreted -> id
-                    -- otherwise add a C stub to do so
-                    _              -> (`appendStubC` spt_init_code)
+  (unfold_env, tidy_occ_env) <- chooseExternalIds opts mod binds implicit_binds imp_rules
+  let (trimmed_binds, trimmed_rules) = findExternalRules opts binds imp_rules unfold_env
 
-              -- The completed type environment is gotten from
-              --      a) the types and classes defined here (plus implicit things)
-              --      b) adding Ids with correct IdInfo, including unfoldings,
-              --              gotten from the bindings
-              -- From (b) we keep only those Ids with External names;
-              --          the CoreTidy pass makes sure these are all and only
-              --          the externally-accessible ones
-              -- This truncates the type environment to include only the
-              -- exported Ids and things needed from them, which saves space
-              --
-              -- See Note [Don't attempt to trim data types]
-              ; final_ids  = [ trimId omit_prags id
-                             | id <- bindersOfBinds tidy_binds
-                             , isExternalName (idName id)
-                             , not (isWiredIn id)
-                             ]   -- See Note [Drop wired-in things]
+  (tidy_env, tidy_binds) <- tidyTopBinds unfold_env boot_exports tidy_occ_env trimmed_binds
 
-              ; final_tcs      = filterOut isWiredIn tcs
-                                 -- See Note [Drop wired-in things]
-              ; type_env       = typeEnvFromEntities final_ids final_tcs fam_insts
-              ; tidy_cls_insts = mkFinalClsInsts type_env cls_insts
-              ; tidy_patsyns   = mkFinalPatSyns  type_env patsyns
-              ; tidy_type_env  = extendTypeEnvWithPatSyns tidy_patsyns type_env
-              ; tidy_rules     = tidyRules tidy_env trimmed_rules
+  -- See Note [Grand plan for static forms] in GHC.Iface.Tidy.StaticPtrTable.
+  (spt_entries, mcstub, tidy_binds') <- case opt_static_ptr_opts opts of
+    Nothing    -> pure ([], Nothing, tidy_binds)
+    Just sopts -> sptCreateStaticBinds sopts mod tidy_binds
 
-              ; -- See Note [Injecting implicit bindings]
-                all_tidy_binds = implicit_binds ++ tidy_binds'
+  let all_foreign_stubs = case mcstub of
+        Nothing    -> foreign_stubs
+        Just cstub -> foreign_stubs `appendStubC` cstub
 
-              -- Get the TyCons to generate code for.  Careful!  We must use
-              -- the untidied TyCons here, because we need
-              --  (a) implicit TyCons arising from types and classes defined
-              --      in this module
-              --  (b) wired-in TyCons, which are normally removed from the
-              --      TypeEnv we put in the ModDetails
-              --  (c) Constructors even if they are not exported (the
-              --      tidied TypeEnv has trimmed these away)
-              ; alg_tycons = filter isAlgTyCon tcs
-              }
+      -- The completed type environment is gotten from
+      --      a) the types and classes defined here (plus implicit things)
+      --      b) adding Ids with correct IdInfo, including unfoldings,
+      --              gotten from the bindings
+      -- From (b) we keep only those Ids with External names;
+      --          the CoreTidy pass makes sure these are all and only
+      --          the externally-accessible ones
+      -- This truncates the type environment to include only the
+      -- exported Ids and things needed from them, which saves space
+      --
+      -- See Note [Don't attempt to trim data types]
+      final_ids  = [ trimId (opt_trim_ids opts) id
+                   | id <- bindersOfBinds tidy_binds
+                   , isExternalName (idName id)
+                   , not (isWiredIn id)
+                   ]   -- See Note [Drop wired-in things]
 
-        ; endPassIO hsc_env print_unqual CoreTidy all_tidy_binds tidy_rules
+      final_tcs      = filterOut isWiredIn tcs
+                       -- See Note [Drop wired-in things]
+      tidy_type_env  = typeEnvFromEntities final_ids final_tcs patsyns fam_insts
+      tidy_cls_insts = mkFinalClsInsts tidy_type_env $ mkInstEnv cls_insts
+      tidy_rules     = tidyRules tidy_env trimmed_rules
 
-          -- If the endPass didn't print the rules, but ddump-rules is
-          -- on, print now
-        ; unless (dopt Opt_D_dump_simpl dflags) $
-            Err.dumpIfSet_dyn dflags Opt_D_dump_rules
-              (showSDoc dflags (ppr CoreTidy <+> text "rules"))
-              Err.FormatText
-              (pprRulesForUser tidy_rules)
+      -- See Note [Injecting implicit bindings]
+      all_tidy_binds = implicit_binds ++ tidy_binds'
 
-          -- Print one-line size info
-        ; let cs = coreBindsStats tidy_binds
-        ; Err.dumpIfSet_dyn dflags Opt_D_dump_core_stats "Core Stats"
-            Err.FormatText
-            (text "Tidy size (terms,types,coercions)"
-             <+> ppr (moduleName mod) <> colon
-             <+> int (cs_tm cs)
-             <+> int (cs_ty cs)
-             <+> int (cs_co cs) )
+      -- Get the TyCons to generate code for.  Careful!  We must use
+      -- the untidied TyCons here, because we need
+      --  (a) implicit TyCons arising from types and classes defined
+      --      in this module
+      --  (b) wired-in TyCons, which are normally removed from the
+      --      TypeEnv we put in the ModDetails
+      --  (c) Constructors even if they are not exported (the
+      --      tidied TypeEnv has trimmed these away)
+      alg_tycons = filter isAlgTyCon tcs
 
-        ; return (CgGuts { cg_module   = mod,
-                           cg_tycons   = alg_tycons,
-                           cg_binds    = all_tidy_binds,
-                           cg_foreign  = add_spt_init_code foreign_stubs,
-                           cg_foreign_files = foreign_files,
-                           cg_dep_pkgs = map fst $ dep_pkgs deps,
-                           cg_hpc_info = hpc_info,
-                           cg_modBreaks = modBreaks,
-                           cg_spt_entries = spt_entries },
+      local_ccs
+        | opt_collect_ccs opts
+              = collectCostCentres mod all_tidy_binds tidy_rules
+        | otherwise
+              = S.empty
 
-                   ModDetails { md_types     = tidy_type_env,
-                                md_rules     = tidy_rules,
-                                md_insts     = tidy_cls_insts,
-                                md_fam_insts = fam_insts,
-                                md_exports   = exports,
-                                md_anns      = anns,      -- are already tidy
-                                md_complete_sigs = complete_sigs
-                              })
-        }
+  return (CgGuts { cg_module        = mod
+                 , cg_tycons        = alg_tycons
+                 , cg_binds         = all_tidy_binds
+                 , cg_ccs           = S.toList local_ccs
+                 , cg_foreign       = all_foreign_stubs
+                 , cg_foreign_files = foreign_files
+                 , cg_dep_pkgs      = dep_direct_pkgs deps
+                 , cg_hpc_info      = hpc_info
+                 , cg_modBreaks     = modBreaks
+                 , cg_spt_entries   = spt_entries
+                 }
+         , ModDetails { md_types            = tidy_type_env
+                      , md_rules            = tidy_rules
+                      , md_insts            = tidy_cls_insts
+                      , md_fam_insts        = fam_insts
+                      , md_exports          = exports
+                      , md_anns             = anns      -- are already tidy
+                      , md_complete_matches = complete_matches
+                      }
+         )
+
+
+------------------------------------------------------------------------------
+-- Collecting cost centres
+-- ---------------------------------------------------------------------------
+
+-- | Collect cost centres defined in the current module, including those in
+-- unfoldings.
+collectCostCentres :: Module -> CoreProgram -> [CoreRule] -> S.Set CostCentre
+collectCostCentres mod_name binds rules
+  = {-# SCC collectCostCentres #-} foldl' go_bind (go_rules S.empty) binds
   where
-    dflags = hsc_dflags hsc_env
+    go cs e = case e of
+      Var{} -> cs
+      Lit{} -> cs
+      App e1 e2 -> go (go cs e1) e2
+      Lam _ e -> go cs e
+      Let b e -> go (go_bind cs b) e
+      Case scrt _ _ alts -> go_alts (go cs scrt) alts
+      Cast e _ -> go cs e
+      Tick (ProfNote cc _ _) e ->
+        go (if ccFromThisModule cc mod_name then S.insert cc cs else cs) e
+      Tick _ e -> go cs e
+      Type{} -> cs
+      Coercion{} -> cs
+
+    go_alts = foldl' (\cs (Alt _con _bndrs e) -> go cs e)
+
+    go_bind :: S.Set CostCentre -> CoreBind -> S.Set CostCentre
+    go_bind cs (NonRec b e) =
+      go (do_binder cs b) e
+    go_bind cs (Rec bs) =
+      foldl' (\cs' (b, e) -> go (do_binder cs' b) e) cs bs
+
+    do_binder cs b = maybe cs (go cs) (get_unf b)
+
+
+    -- Unfoldings may have cost centres that in the original definion are
+    -- optimized away, see #5889.
+    get_unf = maybeUnfoldingTemplate . realIdUnfolding
+
+    -- Have to look at the RHS of rules as well, as these may contain ticks which
+    -- don't appear anywhere else. See #19894
+    go_rules cs = foldl' go cs (mapMaybe get_rhs rules)
+
+    get_rhs Rule { ru_rhs } = Just ru_rhs
+    get_rhs BuiltinRule {} = Nothing
 
 --------------------------
 trimId :: Bool -> Id -> Id
@@ -477,8 +511,8 @@ trimId :: Bool -> Id -> Id
 -- etc which tidyTopIdInfo retains for the benefit of the code generator
 -- but which we don't want in the interface file or ModIface for
 -- downstream compilations
-trimId omit_prags id
-  | omit_prags, not (isImplicitId id)
+trimId do_trim id
+  | do_trim, not (isImplicitId id)
   = id `setIdInfo`      vanillaIdInfo
        `setIdUnfolding` idUnfolding id
        -- We respect the final unfolding chosen by tidyTopIdInfo.
@@ -609,21 +643,20 @@ type UnfoldEnv  = IdEnv (Name{-new name-}, Bool {-show unfolding-})
   --
   -- Bool => expose unfolding or not.
 
-chooseExternalIds :: HscEnv
+chooseExternalIds :: TidyOpts
                   -> Module
-                  -> Bool -> Bool
                   -> [CoreBind]
                   -> [CoreBind]
                   -> [CoreRule]
                   -> IO (UnfoldEnv, TidyOccEnv)
                   -- Step 1 from the notes above
 
-chooseExternalIds hsc_env mod omit_prags expose_all binds implicit_binds imp_id_rules
+chooseExternalIds opts mod binds implicit_binds imp_id_rules
   = do { (unfold_env1,occ_env1) <- search init_work_list emptyVarEnv init_occ_env
        ; let internal_ids = filter (not . (`elemVarEnv` unfold_env1)) binders
        ; tidy_internal internal_ids unfold_env1 occ_env1 }
  where
-  nc_var = hsc_NC hsc_env
+  name_cache = opt_name_cache opts
 
   -- init_ext_ids is the initial list of Ids that should be
   -- externalised.  It serves as the starting point for finding a
@@ -637,11 +670,14 @@ chooseExternalIds hsc_env mod omit_prags expose_all binds implicit_binds imp_id_
   init_ext_ids   = sortBy (compare `on` getOccName) $ filter is_external binders
 
   -- An Id should be external if either (a) it is exported,
-  -- (b) it appears in the RHS of a local rule for an imported Id, or
-  -- See Note [Which rules to expose]
-  is_external id = isExportedId id || id `elemVarSet` rule_rhs_vars
+  -- (b) local rules are exposed and it appears in the RHS of a local rule for
+  -- an imported Id, or See Note [Which rules to expose]
+  is_external id
+    | isExportedId id       = True
+    | opt_expose_rules opts = id `elemVarSet` rule_rhs_vars
+    | otherwise             = False
 
-  rule_rhs_vars  = mapUnionVarSet ruleRhsFreeVars imp_id_rules
+  rule_rhs_vars = mapUnionVarSet ruleRhsFreeVars imp_id_rules
 
   binders          = map fst $ flattenBinds binds
   implicit_binders = bindersOfBinds implicit_binds
@@ -685,15 +721,15 @@ chooseExternalIds hsc_env mod omit_prags expose_all binds implicit_binds imp_id_
   search ((idocc,referrer) : rest) unfold_env occ_env
     | idocc `elemVarEnv` unfold_env = search rest unfold_env occ_env
     | otherwise = do
-      (occ_env', name') <- tidyTopName mod nc_var (Just referrer) occ_env idocc
+      (occ_env', name') <- tidyTopName mod name_cache (Just referrer) occ_env idocc
       let
-          (new_ids, show_unfold) = addExternal omit_prags expose_all refined_id
+          (new_ids, show_unfold) = addExternal opts refined_id
 
                 -- 'idocc' is an *occurrence*, but we need to see the
                 -- unfolding in the *definition*; so look up in binder_set
           refined_id = case lookupVarSet binder_set idocc of
                          Just id -> id
-                         Nothing -> WARN( True, ppr idocc ) idocc
+                         Nothing -> warnPprTrace True "chooseExternalIds" (ppr idocc) idocc
 
           unfold_env' = extendVarEnv unfold_env idocc (name',show_unfold)
           referrer' | isExportedId refined_id = refined_id
@@ -705,13 +741,13 @@ chooseExternalIds hsc_env mod omit_prags expose_all binds implicit_binds imp_id_
                 -> IO (UnfoldEnv, TidyOccEnv)
   tidy_internal []       unfold_env occ_env = return (unfold_env,occ_env)
   tidy_internal (id:ids) unfold_env occ_env = do
-      (occ_env', name') <- tidyTopName mod nc_var Nothing occ_env id
+      (occ_env', name') <- tidyTopName mod name_cache Nothing occ_env id
       let unfold_env' = extendVarEnv unfold_env id (name',False)
       tidy_internal ids unfold_env' occ_env'
 
-addExternal :: Bool -> Bool -> Id -> ([Id], Bool)
-addExternal omit_prags expose_all id
-  | omit_prags
+addExternal :: TidyOpts -> Id -> ([Id], Bool)
+addExternal opts id
+  | ExposeNone <- opt_expose_unfoldings opts
   , not (isCompulsoryUnfolding unfolding)
   = ([], False)  -- See Note [Always expose compulsory unfoldings]
                  -- in GHC.HsToCore
@@ -722,27 +758,38 @@ addExternal omit_prags expose_all id
   where
     new_needed_ids = bndrFvsInOrder show_unfold id
     idinfo         = idInfo id
-    unfolding      = unfoldingInfo idinfo
+    unfolding      = realUnfoldingInfo idinfo
     show_unfold    = show_unfolding unfolding
     never_active   = isNeverActive (inlinePragmaActivation (inlinePragInfo idinfo))
     loop_breaker   = isStrongLoopBreaker (occInfo idinfo)
-    bottoming_fn   = isDeadEndSig (strictnessInfo idinfo)
+    bottoming_fn   = isDeadEndSig (dmdSigInfo idinfo)
 
         -- Stuff to do with the Id's unfolding
         -- We leave the unfolding there even if there is a worker
         -- In GHCi the unfolding is used by importers
 
     show_unfolding (CoreUnfolding { uf_src = src, uf_guidance = guidance })
-       =  expose_all         -- 'expose_all' says to expose all
-                             -- unfoldings willy-nilly
+       = opt_expose_unfoldings opts == ExposeAll
+            -- 'ExposeAll' says to expose all
+            -- unfoldings willy-nilly
 
        || isStableSource src     -- Always expose things whose
                                  -- source is an inline rule
 
-       || not (bottoming_fn      -- No need to inline bottom functions
-           || never_active       -- Or ones that say not to
-           || loop_breaker       -- Or that are loop breakers
-           || neverUnfoldGuidance guidance)
+       || not dont_inline
+       where
+         dont_inline
+            | never_active = True   -- Will never inline
+            | loop_breaker = True   -- Ditto
+            | otherwise    = case guidance of
+                                UnfWhen {}       -> False
+                                UnfIfGoodArgs {} -> bottoming_fn
+                                UnfNever {}      -> True
+         -- bottoming_fn: don't inline bottoming functions, unless the
+         -- RHS is very small or trivial (UnfWhen), in which case we
+         -- may as well do so For example, a cast might cancel with
+         -- the call site.
+
     show_unfolding (DFunUnfolding {}) = True
     show_unfolding _                  = False
 
@@ -806,7 +853,7 @@ dffvExpr :: CoreExpr -> DFFV ()
 dffvExpr (Var v)              = insert v
 dffvExpr (App e1 e2)          = dffvExpr e1 >> dffvExpr e2
 dffvExpr (Lam v e)            = extendScope v (dffvExpr e)
-dffvExpr (Tick (Breakpoint _ ids) e) = mapM_ insert ids >> dffvExpr e
+dffvExpr (Tick (Breakpoint _ _ ids) e) = mapM_ insert ids >> dffvExpr e
 dffvExpr (Tick _other e)    = dffvExpr e
 dffvExpr (Cast e _)           = dffvExpr e
 dffvExpr (Let (NonRec x r) e) = dffvBind (x,r) >> extendScope x (dffvExpr e)
@@ -815,8 +862,8 @@ dffvExpr (Let (Rec prs) e)    = extendScopeList (map fst prs) $
 dffvExpr (Case e b _ as)      = dffvExpr e >> extendScope b (mapM_ dffvAlt as)
 dffvExpr _other               = return ()
 
-dffvAlt :: (t, [Var], CoreExpr) -> DFFV ()
-dffvAlt (_,xs,r) = extendScopeList xs (dffvExpr r)
+dffvAlt :: CoreAlt -> DFFV ()
+dffvAlt (Alt _ xs r) = extendScopeList xs (dffvExpr r)
 
 dffvBind :: (Id, CoreExpr) -> DFFV ()
 dffvBind(x,r)
@@ -836,7 +883,7 @@ dffvLetBndr :: Bool -> Id -> DFFV ()
 -- For top-level bindings (call from addExternal, via bndrFvsInOrder)
 --       we say "True" if we are exposing that unfolding
 dffvLetBndr vanilla_unfold id
-  = do { go_unf (unfoldingInfo idinfo)
+  = do { go_unf (realUnfoldingInfo idinfo)
        ; mapM_ go_rule (ruleInfoRules (ruleInfo idinfo)) }
   where
     idinfo = idInfo id
@@ -919,13 +966,13 @@ called in the final code), we keep the rule too.
 This stuff is the only reason for the ru_auto field in a Rule.
 -}
 
-findExternalRules :: Bool       -- Omit pragmas
+findExternalRules :: TidyOpts
                   -> [CoreBind]
                   -> [CoreRule] -- Local rules for imported fns
                   -> UnfoldEnv  -- Ids that are exported, so we need their rules
                   -> ([CoreBind], [CoreRule])
 -- See Note [Finding external rules]
-findExternalRules omit_prags binds imp_id_rules unfold_env
+findExternalRules opts binds imp_id_rules unfold_env
   = (trimmed_binds, filter keep_rule all_rules)
   where
     imp_rules         = filter expose_rule imp_id_rules
@@ -950,7 +997,7 @@ findExternalRules omit_prags binds imp_id_rules unfold_env
         --      been discarded; see Note [Trimming auto-rules]
 
     expose_rule rule
-        | omit_prags = False
+        | not (opt_expose_rules opts) = False
         | otherwise  = all is_external_id (ruleLhsFreeIdsList rule)
                 -- Don't expose a rule whose LHS mentions a locally-defined
                 -- Id that is completely internal (i.e. not visible to an
@@ -1012,9 +1059,9 @@ was previously local, we have to give it a unique occurrence name if
 we intend to externalise it.
 -}
 
-tidyTopName :: Module -> IORef NameCache -> Maybe Id -> TidyOccEnv
+tidyTopName :: Module -> NameCache -> Maybe Id -> TidyOccEnv
             -> Id -> IO (TidyOccEnv, Name)
-tidyTopName mod nc_var maybe_ref occ_env id
+tidyTopName mod name_cache maybe_ref occ_env id
   | global && internal = return (occ_env, localiseName name)
 
   | global && external = return (occ_env, name)
@@ -1025,16 +1072,24 @@ tidyTopName mod nc_var maybe_ref occ_env id
   -- Now we get to the real reason that all this is in the IO Monad:
   -- we have to update the name cache in a nice atomic fashion
 
-  | local  && internal = do { new_local_name <- atomicModifyIORef' nc_var mk_new_local
-                            ; return (occ_env', new_local_name) }
+  | local  && internal = do uniq <- takeUniqFromNameCache name_cache
+                            -- See #19619
+                            let new_local_name = occ' `seq` mkInternalName uniq occ' loc
+                            return (occ_env', new_local_name)
         -- Even local, internal names must get a unique occurrence, because
         -- if we do -split-objs we externalise the name later, in the code generator
         --
         -- Similarly, we must make sure it has a system-wide Unique, because
         -- the byte-code generator builds a system-wide Name->BCO symbol table
 
-  | local  && external = do { new_external_name <- atomicModifyIORef' nc_var mk_new_external
-                            ; return (occ_env', new_external_name) }
+  | local  && external = do new_external_name <- allocateGlobalBinder name_cache mod occ' loc
+                            return (occ_env', new_external_name)
+        -- If we want to externalise a currently-local name, check
+        -- whether we have already assigned a unique for it.
+        -- If so, use it; if not, extend the table.
+        -- All this is done by allocateGlobalBinder.
+        -- This is needed when *re*-compiling a module in GHCi; we must
+        -- use the same name for externally-visible things as we did before.
 
   | otherwise = panic "tidyTopName"
   where
@@ -1068,17 +1123,6 @@ tidyTopName mod nc_var maybe_ref occ_env id
 
     (occ_env', occ') = tidyOccName occ_env new_occ
 
-    mk_new_local nc = (nc { nsUniqs = us }, mkInternalName uniq occ' loc)
-                    where
-                      (uniq, us) = takeUniqFromSupply (nsUniqs nc)
-
-    mk_new_external nc = allocateGlobalBinder nc mod occ' loc
-        -- If we want to externalise a currently-local name, check
-        -- whether we have already assigned a unique for it.
-        -- If so, use it; if not, extend the table.
-        -- All this is done by allcoateGlobalBinder.
-        -- This is needed when *re*-compiling a module in GHCi; we must
-        -- use the same name for externally-visible things as we did before.
 
 {-
 ************************************************************************
@@ -1089,7 +1133,7 @@ tidyTopName mod nc_var maybe_ref occ_env id
 -}
 
 -- TopTidyEnv: when tidying we need to know
---   * nc_var: The NameCache, containing a unique supply and any pre-ordained Names.
+--   * name_cache: The NameCache, containing a unique supply and any pre-ordained Names.
 --        These may have arisen because the
 --        renamer read in an interface file mentioning M.$wf, say,
 --        and assigned it unique r77.  If, on this compilation, we've
@@ -1102,59 +1146,49 @@ tidyTopName mod nc_var maybe_ref occ_env id
 --
 --   * subst_env: A Var->Var mapping that substitutes the new Var for the old
 
-tidyTopBinds :: HscEnv
-             -> UnfoldEnv
+tidyTopBinds :: UnfoldEnv
+             -> NameSet
              -> TidyOccEnv
              -> CoreProgram
              -> IO (TidyEnv, CoreProgram)
 
-tidyTopBinds hsc_env unfold_env init_occ_env binds
+tidyTopBinds unfold_env boot_exports init_occ_env binds
   = do let result = tidy init_env binds
        seqBinds (snd result) `seq` return result
        -- This seqBinds avoids a spike in space usage (see #13564)
   where
-    dflags = hsc_dflags hsc_env
-
     init_env = (init_occ_env, emptyVarEnv)
 
-    tidy = mapAccumL (tidyTopBind dflags unfold_env)
+    tidy = mapAccumL (tidyTopBind unfold_env boot_exports)
 
 ------------------------
-tidyTopBind  :: DynFlags
-             -> UnfoldEnv
+tidyTopBind  :: UnfoldEnv
+             -> NameSet
              -> TidyEnv
              -> CoreBind
              -> (TidyEnv, CoreBind)
 
-tidyTopBind dflags unfold_env
+tidyTopBind unfold_env boot_exports
             (occ_env,subst1) (NonRec bndr rhs)
   = (tidy_env2,  NonRec bndr' rhs')
   where
-    Just (name',show_unfold) = lookupVarEnv unfold_env bndr
-    (bndr', rhs') = tidyTopPair dflags show_unfold tidy_env2 name' (bndr, rhs)
+    (bndr', rhs') = tidyTopPair unfold_env boot_exports tidy_env2 (bndr, rhs)
     subst2        = extendVarEnv subst1 bndr bndr'
     tidy_env2     = (occ_env, subst2)
 
-tidyTopBind dflags unfold_env (occ_env, subst1) (Rec prs)
+tidyTopBind unfold_env boot_exports (occ_env, subst1) (Rec prs)
   = (tidy_env2, Rec prs')
   where
-    prs' = [ tidyTopPair dflags show_unfold tidy_env2 name' (id,rhs)
-           | (id,rhs) <- prs,
-             let (name',show_unfold) =
-                    expectJust "tidyTopBind" $ lookupVarEnv unfold_env id
-           ]
-
-    subst2    = extendVarEnvList subst1 (bndrs `zip` map fst prs')
+    prs'      = map (tidyTopPair unfold_env boot_exports tidy_env2) prs
+    subst2    = extendVarEnvList subst1 (map fst prs `zip` map fst prs')
     tidy_env2 = (occ_env, subst2)
-
-    bndrs = map fst prs
+    -- This is where we "tie the knot": tidy_env2 is fed into tidyTopPair
 
 -----------------------------------------------------------
-tidyTopPair :: DynFlags
-            -> Bool  -- show unfolding
+tidyTopPair :: UnfoldEnv
+            -> NameSet
             -> TidyEnv  -- The TidyEnv is used to tidy the IdInfo
                         -- It is knot-tied: don't look at it!
-            -> Name             -- New name
             -> (Id, CoreExpr)   -- Binder and RHS before tidying
             -> (Id, CoreExpr)
         -- This function is the heart of Step 2
@@ -1163,15 +1197,19 @@ tidyTopPair :: DynFlags
         -- group, a variable late in the group might be mentioned
         -- in the IdInfo of one early in the group
 
-tidyTopPair dflags show_unfold rhs_tidy_env name' (bndr, rhs)
-  = (bndr1, rhs1)
+tidyTopPair unfold_env boot_exports rhs_tidy_env (bndr, rhs)
+  = -- pprTrace "tidyTop" (ppr name' <+> ppr details <+> ppr rhs) $
+    (bndr1, rhs1)
+
   where
+    Just (name',show_unfold) = lookupVarEnv unfold_env bndr
+    !cbv_bndr = tidyCbvInfoTop boot_exports bndr rhs
     bndr1    = mkGlobalId details name' ty' idinfo'
-    details  = idDetails bndr   -- Preserve the IdDetails
-    ty'      = tidyTopType (idType bndr)
+    details  = idDetails cbv_bndr -- Preserve the IdDetails
+    ty'      = tidyTopType (idType cbv_bndr)
     rhs1     = tidyExpr rhs_tidy_env rhs
-    idinfo'  = tidyTopIdInfo dflags rhs_tidy_env name' rhs rhs1 (idInfo bndr)
-                             show_unfold
+    idinfo'  = tidyTopIdInfo rhs_tidy_env name' ty'
+                             rhs rhs1 (idInfo cbv_bndr) show_unfold
 
 -- tidyTopIdInfo creates the final IdInfo for top-level
 -- binders.  The delicate piece:
@@ -1180,24 +1218,24 @@ tidyTopPair dflags show_unfold rhs_tidy_env name' (bndr, rhs)
 --      Indeed, CorePrep must eta expand where necessary to make
 --      the manifest arity equal to the claimed arity.
 --
-tidyTopIdInfo :: DynFlags -> TidyEnv -> Name -> CoreExpr -> CoreExpr
+tidyTopIdInfo :: TidyEnv -> Name -> Type -> CoreExpr -> CoreExpr
               -> IdInfo -> Bool -> IdInfo
-tidyTopIdInfo dflags rhs_tidy_env name orig_rhs tidy_rhs idinfo show_unfold
+tidyTopIdInfo rhs_tidy_env name rhs_ty orig_rhs tidy_rhs idinfo show_unfold
   | not is_external     -- For internal Ids (not externally visible)
   = vanillaIdInfo       -- we only need enough info for code generation
                         -- Arity and strictness info are enough;
                         --      c.f. GHC.Core.Tidy.tidyLetBndr
         `setArityInfo`      arity
-        `setStrictnessInfo` final_sig
-        `setCprInfo`        final_cpr
-        `setUnfoldingInfo`  minimal_unfold_info  -- See note [Preserve evaluatedness]
+        `setDmdSigInfo` final_sig
+        `setCprSigInfo`        final_cpr
+        `setUnfoldingInfo`  minimal_unfold_info  -- See Note [Preserve evaluatedness]
                                                  -- in GHC.Core.Tidy
 
   | otherwise           -- Externally-visible Ids get the whole lot
   = vanillaIdInfo
         `setArityInfo`         arity
-        `setStrictnessInfo`    final_sig
-        `setCprInfo`           final_cpr
+        `setDmdSigInfo`    final_sig
+        `setCprSigInfo`           final_cpr
         `setOccInfo`           robust_occ_info
         `setInlinePragInfo`    (inlinePragInfo idinfo)
         `setUnfoldingInfo`     unfold_info
@@ -1214,14 +1252,14 @@ tidyTopIdInfo dflags rhs_tidy_env name orig_rhs tidy_rhs idinfo show_unfold
     --------- Strictness ------------
     mb_bot_str = exprBotStrictness_maybe orig_rhs
 
-    sig = strictnessInfo idinfo
-    final_sig | not $ isTopSig sig
-              = WARN( _bottom_hidden sig , ppr name ) sig
+    sig = dmdSigInfo idinfo
+    final_sig | not $ isNopSig sig
+              = warnPprTrace (_bottom_hidden sig) "tidyTopIdInfo" (ppr name) sig
               -- try a cheap-and-cheerful bottom analyser
               | Just (_, nsig) <- mb_bot_str = nsig
               | otherwise                    = sig
 
-    cpr = cprInfo idinfo
+    cpr = cprSigInfo idinfo
     final_cpr | Just _ <- mb_bot_str
               = mkCprSig arity botCpr
               | otherwise
@@ -1229,17 +1267,21 @@ tidyTopIdInfo dflags rhs_tidy_env name orig_rhs tidy_rhs idinfo show_unfold
 
     _bottom_hidden id_sig = case mb_bot_str of
                                   Nothing         -> False
-                                  Just (arity, _) -> not (appIsDeadEnd id_sig arity)
+                                  Just (arity, _) -> not (isDeadEndAppSig id_sig arity)
 
     --------- Unfolding ------------
-    unf_info = unfoldingInfo idinfo
-    unfold_info
-      | isCompulsoryUnfolding unf_info || show_unfold
-      = tidyUnfolding rhs_tidy_env unf_info unf_from_rhs
-      | otherwise
-      = minimal_unfold_info
-    minimal_unfold_info = zapUnfolding unf_info
-    unf_from_rhs = mkFinalUnfolding dflags InlineRhs final_sig tidy_rhs
+    unf_info = realUnfoldingInfo idinfo
+    !minimal_unfold_info = trimUnfolding unf_info
+
+    !unfold_info | isCompulsoryUnfolding unf_info || show_unfold
+                 = tidyTopUnfolding rhs_tidy_env tidy_rhs unf_info
+                 | otherwise
+                 = minimal_unfold_info
+
+     -- NB: use `orig_rhs` not `tidy_rhs` in this call to mkFinalUnfolding
+     -- else you get a black hole (#22122). Reason: mkFinalUnfolding
+     -- looks at IdInfo, and that is knot-tied in tidyTopBind (the Rec case)
+
     -- NB: do *not* expose the worker if show_unfold is off,
     --     because that means this thing is a loop breaker or
     --     marked NOINLINE or something like that
@@ -1252,7 +1294,7 @@ tidyTopIdInfo dflags rhs_tidy_env name orig_rhs tidy_rhs idinfo show_unfold
     --    the function returns bottom
     -- In this case, show_unfold will be false (we don't expose unfoldings
     -- for bottoming functions), but we might still have a worker/wrapper
-    -- split (see Note [Worker-wrapper for bottoming functions] in
+    -- split (see Note [Worker/wrapper for bottoming functions] in
     -- GHC.Core.Opt.WorkWrap)
 
 
@@ -1263,107 +1305,54 @@ tidyTopIdInfo dflags rhs_tidy_env name orig_rhs tidy_rhs idinfo show_unfold
     -- did was to let-bind a non-atomic argument and then float
     -- it to the top level. So it seems more robust just to
     -- fix it here.
-    arity = exprArity orig_rhs
-
-{-
-************************************************************************
-*                                                                      *
-                  Old, dead, type-trimming code
-*                                                                      *
-************************************************************************
-
-We used to try to "trim off" the constructors of data types that are
-not exported, to reduce the size of interface files, at least without
--O.  But that is not always possible: see the old Note [When we can't
-trim types] below for exceptions.
-
-Then (#7445) I realised that the TH problem arises for any data type
-that we have deriving( Data ), because we can invoke
-   Language.Haskell.TH.Quote.dataToExpQ
-to get a TH Exp representation of a value built from that data type.
-You don't even need {-# LANGUAGE TemplateHaskell #-}.
-
-At this point I give up. The pain of trimming constructors just
-doesn't seem worth the gain.  So I've dumped all the code, and am just
-leaving it here at the end of the module in case something like this
-is ever resurrected.
+    arity = exprArity orig_rhs `min` (length $ typeArity rhs_ty)
 
 
-Note [When we can't trim types]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The basic idea of type trimming is to export algebraic data types
-abstractly (without their data constructors) when compiling without
--O, unless of course they are explicitly exported by the user.
+------------ Unfolding  --------------
+tidyTopUnfolding :: TidyEnv -> CoreExpr -> Unfolding -> Unfolding
+tidyTopUnfolding _ _ NoUnfolding   = NoUnfolding
+tidyTopUnfolding _ _ BootUnfolding = BootUnfolding
+tidyTopUnfolding _ _ (OtherCon {}) = evaldUnfolding
 
-We always export synonyms, because they can be mentioned in the type
-of an exported Id.  We could do a full dependency analysis starting
-from the explicit exports, but that's quite painful, and not done for
-now.
-
-But there are some times we can't do that, indicated by the 'no_trim_types' flag.
-
-First, Template Haskell.  Consider (#2386) this
-        module M(T, makeOne) where
-          data T = Yay String
-          makeOne = [| Yay "Yep" |]
-Notice that T is exported abstractly, but makeOne effectively exports it too!
-A module that splices in $(makeOne) will then look for a declaration of Yay,
-so it'd better be there.  Hence, brutally but simply, we switch off type
-constructor trimming if TH is enabled in this module.
-
-Second, data kinds.  Consider (#5912)
-     {-# LANGUAGE DataKinds #-}
-     module M() where
-     data UnaryTypeC a = UnaryDataC a
-     type Bug = 'UnaryDataC
-We always export synonyms, so Bug is exposed, and that means that
-UnaryTypeC must be too, even though it's not explicitly exported.  In
-effect, DataKinds means that we'd need to do a full dependency analysis
-to see what data constructors are mentioned.  But we don't do that yet.
-
-In these two cases we just switch off type trimming altogether.
-
-mustExposeTyCon :: Bool         -- Type-trimming flag
-                -> NameSet      -- Exports
-                -> TyCon        -- The tycon
-                -> Bool         -- Can its rep be hidden?
--- We are compiling without -O, and thus trying to write as little as
--- possible into the interface file.  But we must expose the details of
--- any data types whose constructors or fields are exported
-mustExposeTyCon no_trim_types exports tc
-  | no_trim_types               -- See Note [When we can't trim types]
-  = True
-
-  | not (isAlgTyCon tc)         -- Always expose synonyms (otherwise we'd have to
-                                -- figure out whether it was mentioned in the type
-                                -- of any other exported thing)
-  = True
-
-  | isEnumerationTyCon tc       -- For an enumeration, exposing the constructors
-  = True                        -- won't lead to the need for further exposure
-
-  | isFamilyTyCon tc            -- Open type family
-  = True
-
-  -- Below here we just have data/newtype decls or family instances
-
-  | null data_cons              -- Ditto if there are no data constructors
-  = True                        -- (NB: empty data types do not count as enumerations
-                                -- see Note [Enumeration types] in GHC.Core.TyCon
-
-  | any exported_con data_cons  -- Expose rep if any datacon or field is exported
-  = True
-
-  | isNewTyCon tc && isFFITy (snd (newTyConRhs tc))
-  = True   -- Expose the rep for newtypes if the rep is an FFI type.
-           -- For a very annoying reason.  'Foreign import' is meant to
-           -- be able to look through newtypes transparently, but it
-           -- can only do that if it can "see" the newtype representation
-
-  | otherwise
-  = False
+tidyTopUnfolding tidy_env _ df@(DFunUnfolding { df_bndrs = bndrs, df_args = args })
+  = df { df_bndrs = bndrs', df_args = map (tidyExpr tidy_env') args }
   where
-    data_cons = tyConDataCons tc
-    exported_con con = any (`elemNameSet` exports)
-                           (dataConName con : dataConFieldLabels con)
+    (tidy_env', bndrs') = tidyBndrs tidy_env bndrs
+
+tidyTopUnfolding tidy_env tidy_rhs
+     unf@(CoreUnfolding { uf_tmpl = unf_rhs, uf_src = src  })
+  = -- See Note [tidyTopUnfolding: avoiding black holes]
+    unf { uf_tmpl = tidy_unf_rhs }
+  where
+    tidy_unf_rhs | isStableSource src
+                 = tidyExpr tidy_env unf_rhs    -- Preserves OccInfo in unf_rhs
+                 | otherwise
+                 = occurAnalyseExpr tidy_rhs    -- Do occ-anal
+
+{- Note [tidyTopUnfolding: avoiding black holes]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When we are exposing all unfoldings we don't want to tidy the unfolding
+twice -- we just want to use the tidied RHS.  That tidied RHS itself
+contains fully-tidied Ids -- it is knot-tied.  So the uf_tmpl for the
+unfolding contains stuff we can't look at.  Now consider (#22112)
+   foo = foo
+If we freshly compute the uf_is_value field for foo's unfolding,
+we'll call `exprIsValue`, which will look at foo's unfolding!
+Whether or not the RHS is a value depends on whether foo is a value...
+black hole.
+
+In the Simplifier we deal with this by not giving `foo` an unfolding
+in its own RHS.  And we could do that here.  But it's qite nice
+to common everything up to a single Id for foo, used everywhere.
+
+And it's not too hard: simply leave the unfolding undisturbed, except
+tidy the uf_tmpl field. Hence tidyTopUnfolding does
+   unf { uf_tmpl = tidy_unf_rhs }
+
+Don't mess with uf_is_value, or guidance; in particular don't recompute
+them from tidy_unf_rhs.
+
+And (unlike tidyNestedUnfolding) don't deep-seq the new unfolding,
+because that'll cause a black hole (I /think/ because occurAnalyseExpr
+looks in IdInfo).
 -}

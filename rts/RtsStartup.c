@@ -24,6 +24,7 @@
 #include "Ticky.h"
 #include "StgRun.h"
 #include "Prelude.h"            /* fixupRTStoPreludeRefs */
+#include "Adjustor.h"           /* initAdjustors */
 #include "ThreadLabels.h"
 #include "sm/BlockAlloc.h"
 #include "Trace.h"
@@ -32,6 +33,7 @@
 #include "StaticPtrTable.h"
 #include "Hash.h"
 #include "Profiling.h"
+#include "IPE.h"
 #include "ProfHeap.h"
 #include "Timer.h"
 #include "Globals.h"
@@ -46,6 +48,7 @@
 # include "RetainerProfile.h"
 #endif
 
+#include "IOManager.h"
 #if defined(mingw32_HOST_OS) && !defined(THREADED_RTS)
 #include "win32/AsyncMIO.h"
 #include "win32/AsyncWinIO.h"
@@ -71,7 +74,7 @@ static bool rts_shutdown = false;
 
 #if defined(mingw32_HOST_OS)
 /* Indicates CodePage to set program to after exit.  */
-static int64_t __codePage = 0;
+static int64_t __codePage = -1;
 #endif
 
 static void flushStdHandles(void);
@@ -174,6 +177,55 @@ hs_restoreConsoleCP (void)
    Starting up the RTS
    -------------------------------------------------------------------------- */
 
+static void initBuiltinGcRoots(void)
+{
+    /* Add some GC roots for things in the base package that the RTS
+     * knows about.  We don't know whether these turn out to be CAFs
+     * or refer to CAFs, but we have to assume that they might.
+     *
+     * Because these stable pointers will retain any CAF references in
+     * these closures `Id`s of these can be safely marked as non-CAFFY
+     * in the compiler.
+     */
+    getStablePtr((StgPtr)runIO_closure);
+    getStablePtr((StgPtr)runNonIO_closure);
+    getStablePtr((StgPtr)flushStdHandles_closure);
+
+    getStablePtr((StgPtr)runFinalizerBatch_closure);
+
+    getStablePtr((StgPtr)stackOverflow_closure);
+    getStablePtr((StgPtr)heapOverflow_closure);
+    getStablePtr((StgPtr)unpackCString_closure);
+    getStablePtr((StgPtr)blockedIndefinitelyOnMVar_closure);
+    getStablePtr((StgPtr)nonTermination_closure);
+    getStablePtr((StgPtr)blockedIndefinitelyOnSTM_closure);
+    getStablePtr((StgPtr)allocationLimitExceeded_closure);
+    getStablePtr((StgPtr)cannotCompactFunction_closure);
+    getStablePtr((StgPtr)cannotCompactPinned_closure);
+    getStablePtr((StgPtr)cannotCompactMutable_closure);
+    getStablePtr((StgPtr)nestedAtomically_closure);
+    getStablePtr((StgPtr)runSparks_closure);
+    getStablePtr((StgPtr)ensureIOManagerIsRunning_closure);
+    getStablePtr((StgPtr)interruptIOManager_closure);
+    getStablePtr((StgPtr)ioManagerCapabilitiesChanged_closure);
+#if !defined(mingw32_HOST_OS)
+    getStablePtr((StgPtr)blockedOnBadFD_closure);
+    getStablePtr((StgPtr)runHandlersPtr_closure);
+#else
+    getStablePtr((StgPtr)processRemoteCompletion_closure);
+#endif
+
+    /*
+     * See Note [Wired-in exceptions are not CAFfy] in GHC.Core.Make.
+     * These are precisely the functions for which we construct `Id`s using
+     * GHC.Core.Make.mkExceptionId.
+     */
+    getStablePtr((StgPtr)absentSumFieldError_closure);
+    getStablePtr((StgPtr)raiseUnderflowException_closure);
+    getStablePtr((StgPtr)raiseOverflowException_closure);
+    getStablePtr((StgPtr)raiseDivZeroException_closure);
+}
+
 void
 hs_init(int *argc, char **argv[])
 {
@@ -274,6 +326,9 @@ hs_init_ghc(int *argc, char **argv[], RtsConfig rts_config)
       initConsoleCP();
 #endif
 
+    /* Initialise the adjustors subsystem */
+    initAdjustors();
+
     /* Initialise the stats department, phase 1 */
     initStats1();
 
@@ -298,8 +353,8 @@ hs_init_ghc(int *argc, char **argv[], RtsConfig rts_config)
     initScheduler();
 
     /* Trace some basic information about the process */
-    traceWallClockTime();
-    traceOSProcessInfo();
+    traceInitEvent(traceWallClockTime);
+    traceInitEvent(traceOSProcessInfo);
     flushTrace();
 
     /* initialize the storage manager */
@@ -311,41 +366,8 @@ hs_init_ghc(int *argc, char **argv[], RtsConfig rts_config)
     /* initialise the stable name table */
     initStableNameTable();
 
-    /* Add some GC roots for things in the base package that the RTS
-     * knows about.  We don't know whether these turn out to be CAFs
-     * or refer to CAFs, but we have to assume that they might.
-     *
-     * Because these stable pointers will retain any CAF references in
-     * these closures `Id`s of these can be safely marked as non-CAFFY
-     * in the compiler.
-     */
-    getStablePtr((StgPtr)runIO_closure);
-    getStablePtr((StgPtr)runNonIO_closure);
-    getStablePtr((StgPtr)flushStdHandles_closure);
-
-    getStablePtr((StgPtr)runFinalizerBatch_closure);
-
-    getStablePtr((StgPtr)stackOverflow_closure);
-    getStablePtr((StgPtr)heapOverflow_closure);
-    getStablePtr((StgPtr)unpackCString_closure);
-    getStablePtr((StgPtr)blockedIndefinitelyOnMVar_closure);
-    getStablePtr((StgPtr)nonTermination_closure);
-    getStablePtr((StgPtr)blockedIndefinitelyOnSTM_closure);
-    getStablePtr((StgPtr)allocationLimitExceeded_closure);
-    getStablePtr((StgPtr)cannotCompactFunction_closure);
-    getStablePtr((StgPtr)cannotCompactPinned_closure);
-    getStablePtr((StgPtr)cannotCompactMutable_closure);
-    getStablePtr((StgPtr)nestedAtomically_closure);
-    getStablePtr((StgPtr)runSparks_closure);
-    getStablePtr((StgPtr)ensureIOManagerIsRunning_closure);
-    getStablePtr((StgPtr)interruptIOManager_closure);
-    getStablePtr((StgPtr)ioManagerCapabilitiesChanged_closure);
-#if !defined(mingw32_HOST_OS)
-    getStablePtr((StgPtr)blockedOnBadFD_closure);
-    getStablePtr((StgPtr)runHandlersPtr_closure);
-#else
-    getStablePtr((StgPtr)processRemoteCompletion_closure);
-#endif
+    /* create StablePtrs for builtin GC roots*/
+    initBuiltinGcRoots();
 
     /*
      * process any foreign exports which were registered while loading the
@@ -362,14 +384,14 @@ hs_init_ghc(int *argc, char **argv[], RtsConfig rts_config)
     /* initialise file locking, if necessary */
     initFileLocking();
 
-#if defined(DEBUG)
     /* initialise thread label table (tso->char*) */
     initThreadLabelTable();
-#endif
 
 #if defined(PROFILING)
     initProfiling();
 #endif
+    initIpe();
+    traceInitEvent(dumpIPEToEventLog);
     initHeapProfiling();
 
     /* start the virtual timer 'subsystem'. */
@@ -384,21 +406,11 @@ hs_init_ghc(int *argc, char **argv[], RtsConfig rts_config)
     }
 #endif
 
-#if defined(mingw32_HOST_OS) && !defined(THREADED_RTS)
-   if (is_io_mng_native_p())
-      startupAsyncWinIO();
-    else
-      startupAsyncIO();
-#endif
+    initIOManager();
 
     x86_init_fpu();
 
     startupHpc();
-
-    // ditto.
-#if defined(THREADED_RTS)
-    ioManagerStart();
-#endif
 
     /* Record initialization times */
     stat_endInit();
@@ -456,21 +468,20 @@ hs_exit_(bool wait_foreign)
     checkFPUStack();
 #endif
 
-#if defined(THREADED_RTS)
-    ioManagerDie();
-#endif
+    stopIOManager();
 
     /* stop all running tasks. This is also where we stop concurrent non-moving
      * collection if it's running */
     exitScheduler(wait_foreign);
 
     /* run C finalizers for all active weak pointers */
-    for (i = 0; i < n_capabilities; i++) {
-        runAllCFinalizers(capabilities[i]->weak_ptr_list_hd);
+    for (i = 0; i < getNumCapabilities(); i++) {
+        runAllCFinalizers(getCapability(i)->weak_ptr_list_hd);
     }
     for (g = 0; g < RtsFlags.GcFlags.generations; g++) {
         runAllCFinalizers(generations[g].weak_ptr_list);
     }
+    runAllCFinalizers(nonmoving_weak_ptr_list);
 
 #if defined(RTS_USER_SIGNALS)
     if (RtsFlags.MiscFlags.install_signal_handlers) {
@@ -486,6 +497,17 @@ hs_exit_(bool wait_foreign)
      * already freed the capabilities.
      */
     exitTimer(true);
+
+    /*
+     * Dump the ticky counter definitions
+     * We do this at the end of execution since tickers are registered in the
+     * course of program execution.
+     */
+#if defined(TICKY_TICKY) && defined(TRACING)
+    if (RtsFlags.TraceFlags.ticky) {
+        emitTickyCounterDefs();
+    }
+#endif
 
     // set the terminal settings back to what they were
 #if !defined(mingw32_HOST_OS)
@@ -508,6 +530,10 @@ hs_exit_(bool wait_foreign)
     // clean up things from the storage manager's point of view.
     // also outputs the stats (+RTS -s) info.
     exitStorage();
+
+    /* flush and clean up capabilities' eventlog buffers before cleaning up
+     * scheduler */
+    finishCapEventLogging();
 
     /* free the tasks */
     freeScheduler();
@@ -533,10 +559,8 @@ hs_exit_(bool wait_foreign)
     /* free the stable name table */
     exitStableNameTable();
 
-#if defined(DEBUG)
     /* free the thread label table */
     freeThreadLabelTable();
-#endif
 
 #if defined(PROFILING)
     reportCCSProfiling();
@@ -569,17 +593,15 @@ hs_exit_(bool wait_foreign)
     if (tf != NULL) fclose(tf);
 #endif
 
-#if defined(mingw32_HOST_OS) && !defined(THREADED_RTS)
-    if (is_io_mng_native_p())
-      shutdownAsyncWinIO(wait_foreign);
-    else
-      shutdownAsyncIO(wait_foreign);
-#endif
+    exitIOManager(wait_foreign);
 
     /* Restore the console Codepage.  */
 #if defined(mingw32_HOST_OS)
    if (is_io_mng_native_p())
       hs_restoreConsoleCP();
+
+   /* Disable console signal handlers, we're going down!.  */
+   finiUserSignals ();
 #endif
 
     /* tear down statistics subsystem */
@@ -596,6 +618,8 @@ hs_exit_(bool wait_foreign)
 
     // Free threading resources
     freeThreadingResources();
+
+    exitIpe();
 }
 
 // Flush stdout and stderr.  We do this during shutdown so that it

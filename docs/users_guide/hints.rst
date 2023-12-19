@@ -236,7 +236,7 @@ Look at the Core syntax!
     their Core code. ``lets`` are bad, ``cases`` are good, dictionaries
     (``d.⟨Class⟩.⟨Unique⟩``) [or anything overloading-ish] are bad,
     nested lambdas are bad, explicit data constructors are good,
-    primitive operations (e.g., ``eqInt#``) are good, ...
+    primitive operations (e.g., ``==#``) are good, ...
 
 Use strictness annotations:
     Putting a strictness annotation (``!``) on a constructor field helps
@@ -362,3 +362,167 @@ discussed in the previous section. Strict functions get right down to
 business, rather than filling up the heap with closures (the system's
 notes to itself about how to evaluate something, should it eventually be
 required).
+
+.. _control-inlining:
+
+Controlling inlining via optimisation flags.
+--------------------------------------------
+
+.. index::
+    single: inlining, controlling
+    single: unfolding, controlling
+
+Inlining is one of the major optimizations GHC performs. Partially
+because inlining often allows other optimizations to be triggered.
+Sadly this is also a double edged sword. While inlining can often
+cut through runtime overheads this usually comes at the cost
+of not just program size, but also compiler performance. In
+extreme cases making it impossible to compile certain code.
+
+For this reason GHC offers various ways to tune inlining
+behaviour.
+
+Unfolding creation
+~~~~~~~~~~~~~~~~~~
+
+In order for a function from a different module to be inlined
+GHC requires the functions unfolding. The following flags can
+be used to control unfolding creation. Making their creation more
+or less likely:
+
+* :ghc-flag:`-fexpose-all-unfoldings`
+* :ghc-flag:`-funfolding-creation-threshold=⟨n⟩`
+
+Inlining decisions
+~~~~~~~~~~~~~~~~~~
+
+If a unfolding is available the following flags can impact GHC's
+decision about inlining a specific binding.
+
+* :ghc-flag:`-funfolding-use-threshold=⟨n⟩`
+* :ghc-flag:`-funfolding-case-threshold=⟨n⟩`
+* :ghc-flag:`-funfolding-case-scaling=⟨n⟩`
+* :ghc-flag:`-funfolding-dict-discount=⟨n⟩`
+* :ghc-flag:`-funfolding-fun-discount=⟨n⟩`
+
+Should the simplifier run out of ticks because of a inlining loop
+users are encouraged to try decreasing :ghc-flag:`-funfolding-case-threshold=⟨n⟩`
+or :ghc-flag:`-funfolding-case-scaling=⟨n⟩` to limit inlining into
+deeply nested expressions while allowing a higher tick factor.
+
+The defaults of these are tuned such that we don't expect regressions for most
+user programs. Using a :ghc-flag:`-funfolding-case-threshold=⟨n⟩` of 1-2 with a
+:ghc-flag:`-funfolding-case-scaling=⟨n⟩` of 15-25 can cause usually small runtime
+regressions but will prevent most inlining loops from getting out of control.
+
+In extreme cases lowering scaling and treshold further can be useful, but at that
+point it's very likely that beneficial inlining is prevented as well resulting
+in significant runtime regressions.
+
+In such cases it's recommended to move the problematic piece of code into it's own
+module and changing inline parameters for the offending module only.
+
+Inlining generics
+~~~~~~~~~~~~~~~~~
+
+There are also flags specific to the inlining of generics:
+
+* :ghc-flag:`-finline-generics`
+* :ghc-flag:`-finline-generics-aggressively`
+
+
+.. _hints-os-memory:
+
+Understanding how OS memory usage corresponds to live data
+----------------------------------------------------------
+
+A confusing aspect about the RTS is the sometimes big difference between
+OS reported memory usage and
+the amount of live data reported by heap profiling or ``GHC.Stats``.
+
+There are two main factors which determine OS memory usage.
+
+Firstly the collection strategy used by the oldest generation. By default a copying
+strategy is used which requires at least 2 times the amount of currently live
+data in order to perform a major collection. For example, if your program's live data
+is 1G then you would expect the OS to report at minimum 2G.
+
+If instead you are using the compacting (:rts-flag:`-c`) or nonmoving (:rts-flag:`-xn`) strategies
+for the
+oldest generation then less overhead is required as the strategy immediately
+reuses already allocated memory by overwriting. For a program with heap size
+1G then you might expect the OS to report at minimum a small percentage above 1G.
+
+Secondly, after doing some allocation GHC is quite reluctant to return
+the memory to the OS. This is because after performing a major collection the program might
+still be allocating a lot and it costs to have to request
+more memory. Therefore the RTS keeps an extra amount to reuse which
+depends on the :rts-flag:`-F ⟨factor⟩` option. By default
+the RTS will keep up to ``(2 + F) * live_bytes`` after performing a major collection due to
+exhausting the available heap. The default value is ``F = 2`` so you
+can see OS memory usage reported to be as high as 4 times the amount used by your
+program.
+
+Without further intervention, once your program has topped out at this high
+threshold, no more memory would be returned to the OS so memory usage would always remain
+at 4 times the live data. If you had a server with 1.5G live data, then if there was a memory
+spike up to 6G for a short period, then OS reported memory would never dip below 6G. This
+is what happened before GHC 9.2. In GHC 9.2 memory is gradually returned to the OS so OS memory
+usage returns closer to the theoretical minimums.
+
+The :rts-flag:`-Fd ⟨factor⟩` option controls the rate at which memory is returned to
+the OS. On consecutive major collections which are not triggered by heap overflows, a
+counter (``t``) is increased and the ``F`` factor is inversly scaled according to the
+value of ``t`` and ``Fd``. The factor is scaled by the equation:
+
+.. math::
+
+  \texttt{F}' = \texttt{F} \times {2 ^ \frac{- \texttt{t}}{\texttt{Fd}}}
+
+By default ``Fd = 4``, increasing ``Fd`` decreases the rate memory is returned.
+
+Major collections which are not triggered by heap overflows arise mainly in two ways.
+
+  1. Idle collections (controlled by :rts-flag:`-I  ⟨seconds⟩`)
+  2. Explicit trigger using ``performMajorGC``.
+
+For example, idle collections happen by default after 0.3 seconds of inactivity.
+If you are running your application and have also set ``-Iw30``, so that the minimum
+period between idle GCs is 30 seconds, then say you do a small amount of work every 5 seconds,
+there will be about 10 idle collections about 5 minutes. This number of consecutive
+idle collections will scale the ``F`` factor as follows:
+
+.. math::
+
+  \texttt{F}' = 2 \times {2^{\frac{-10}{4}}} \approx 0.35
+
+and hence we will only retain ``(0.35 + 2) * live_bytes``
+rather than the original 4 times. If you want less frequent idle collections then
+you should also decrease ``Fd`` so that more memory is returned each time
+a collection takes place.
+
+If you set ``-Fd0`` then GHC will not attempt to return memory, which corresponds
+with the behaviour from releases prior to 9.2. You probably don't want to do this as
+unless you have idle periods in your program the behaviour will be similar anyway.
+If you want to retain a specific amount of memory then it's better to set ``-H1G``
+in order to communicate that you are happy with a heap size of ``1G``. If you do this
+then OS reported memory will never decrease below this amount if it ever reaches this
+threshold.
+
+The collecting strategy also affects the fragmentation of the heap and hence how easy
+it is to return memory to a theoretical baseline. Memory is allocated firstly
+in the unit of megablocks which is then further divided into blocks. Block-level
+fragmentation is how much unused space within the allocated megablocks there is.
+In a fragmented heap there will be many megablocks which are only partially full.
+
+In theory the compacting
+strategy has a lower memory baseline but practically it can be hard to reach the
+baseline due to how compacting never defragments. On the other hand, the copying
+collecting has a higher theoretical baseline but we can often get very close to
+it because the act of copying leads to lower fragmentation.
+
+There are some other flags which affect the amount of retained memory as well.
+Setting the maximum heap size using :rts-flag:`-M ⟨size⟩` will make sure we don't try
+and retain more memory than the maximum size and explicitly setting :rts-flag:`-H [⟨size⟩]`
+will mean that we will always try and retain at least ``H`` bytes irrespective of
+the amount of live data.

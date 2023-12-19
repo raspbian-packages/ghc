@@ -6,7 +6,6 @@ module GHC.CmmToAsm.Dwarf.Constants where
 import GHC.Prelude
 
 import GHC.Utils.Asm
-import GHC.Data.FastString
 import GHC.Platform
 import GHC.Utils.Outputable
 
@@ -48,7 +47,7 @@ dW_TAG_ghc_src_note    = 0x5b00
 -- * Dwarf attributes
 dW_AT_name, dW_AT_stmt_list, dW_AT_low_pc, dW_AT_high_pc, dW_AT_language,
   dW_AT_comp_dir, dW_AT_producer, dW_AT_external, dW_AT_frame_base,
-  dW_AT_use_UTF8, dW_AT_MIPS_linkage_name :: Word
+  dW_AT_use_UTF8, dW_AT_linkage_name :: Word
 dW_AT_name              = 0x03
 dW_AT_stmt_list         = 0x10
 dW_AT_low_pc            = 0x11
@@ -59,7 +58,7 @@ dW_AT_producer          = 0x25
 dW_AT_external          = 0x3f
 dW_AT_frame_base        = 0x40
 dW_AT_use_UTF8          = 0x53
-dW_AT_MIPS_linkage_name = 0x2007
+dW_AT_linkage_name      = 0x6e
 
 -- * Custom DWARF attributes
 -- Chosen a more or less random section of the vendor-extensible region
@@ -165,11 +164,11 @@ dwarfSection platform name =
        -> text "\t.section .debug_" <> text name <> text ",\"dr\""
 
 -- * Dwarf section labels
-dwarfInfoLabel, dwarfAbbrevLabel, dwarfLineLabel, dwarfFrameLabel :: PtrString
-dwarfInfoLabel   = sLit ".Lsection_info"
-dwarfAbbrevLabel = sLit ".Lsection_abbrev"
-dwarfLineLabel   = sLit ".Lsection_line"
-dwarfFrameLabel  = sLit ".Lsection_frame"
+dwarfInfoLabel, dwarfAbbrevLabel, dwarfLineLabel, dwarfFrameLabel :: SDoc
+dwarfInfoLabel   = text ".Lsection_info"
+dwarfAbbrevLabel = text ".Lsection_abbrev"
+dwarfLineLabel   = text ".Lsection_line"
+dwarfFrameLabel  = text ".Lsection_frame"
 
 -- | Mapping of registers to DWARF register numbers
 dwarfRegNo :: Platform -> Reg -> Word8
@@ -217,6 +216,7 @@ dwarfRegNo p r = case platformArch p of
     | r == xmm14 -> 31
     | r == xmm15 -> 32
   ArchPPC_64 _ -> fromIntegral $ toRegNo r
+  ArchAArch64  -> fromIntegral $ toRegNo r
   _other -> error "dwarfRegNo: Unsupported platform or unknown register!"
 
 -- | Virtual register number to use for return address.
@@ -229,4 +229,5 @@ dwarfReturnRegNo p
     ArchX86    -> 8  -- eip
     ArchX86_64 -> 16 -- rip
     ArchPPC_64 ELF_V2 -> 65 -- lr (link register)
+    ArchAArch64-> 30
     _other     -> error "dwarfReturnRegNo: Unsupported platform!"

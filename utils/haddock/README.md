@@ -1,8 +1,8 @@
-# Haddock ![CI][CI] [![Hackage][Hackage badge]][Hackage page]
+# Haddock [![CI][CI badge]][CI page] [![Hackage][Hackage badge]][Hackage page]
 
 Haddock is the standard tool for generating documentation from Haskell code.
 Full documentation about Haddock itself can be found in the `doc/` subdirectory,
-in [reStructedText format][ReST] format.
+in [reStructuredText][reST] format.
 
 ## Project overview
 
@@ -25,9 +25,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) to see how to make contributions to the
 project.
 
 
-[CI]: https://github.com/haskell/haddock/workflows/CI/badge.svg?branch=ghc-9.0
+[CI page]: https://github.com/haskell/haddock/actions/workflows/ci.yml
+[CI badge]: https://github.com/haskell/haddock/actions/workflows/ci.yml/badge.svg
 [Hackage page]: https://hackage.haskell.org/package/haddock
 [Hackage badge]: https://img.shields.io/hackage/v/haddock.svg
-[ReST]: http://www.sphinx-doc.org/en/stable/rest.html
+[reST]: https://www.sphinx-doc.org/en/master/usage/restructuredtext/index.html
 [Documentation.Haddock]: http://hackage.haskell.org/package/haddock-api/docs/Documentation-Haddock.html
-[cabal v2]: http://cabal.readthedocs.io/en/latest/nix-local-build-overview.html
+[cabal v2]: https://cabal.readthedocs.io/en/latest/nix-local-build-overview.html

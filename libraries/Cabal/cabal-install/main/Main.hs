@@ -28,11 +28,9 @@ import Distribution.Client.Setup
          , FetchFlags(..), fetchCommand
          , FreezeFlags(..), freezeCommand
          , genBoundsCommand
-         , OutdatedFlags(..), outdatedCommand
          , GetFlags(..), getCommand, unpackCommand
          , checkCommand
          , formatCommand
-         , UpdateFlags(..), updateCommand
          , ListFlags(..), listCommand, listNeedsCompiler
          , InfoFlags(..), infoCommand
          , UploadFlags(..), uploadCommand
@@ -40,19 +38,16 @@ import Distribution.Client.Setup
          , runCommand
          , InitFlags(initVerbosity, initHcPath), initCommand
          , ActAsSetupFlags(..), actAsSetupCommand
-         , ExecFlags(..), execCommand
          , UserConfigFlags(..), userConfigCommand
          , reportCommand
          , manpageCommand
          , haddockCommand
          , cleanCommand
-         , doctestCommand
          , copyCommand
          , registerCommand
          )
 import Distribution.Simple.Setup
          ( HaddockTarget(..)
-         , DoctestFlags(..)
          , HaddockFlags(..), defaultHaddockFlags
          , HscolourFlags(..), hscolourCommand
          , ReplFlags(..)
@@ -65,7 +60,7 @@ import Distribution.Simple.Setup
          )
 
 import Prelude ()
-import Distribution.Solver.Compat.Prelude hiding (get)
+import Distribution.Client.Compat.Prelude hiding (get)
 
 import Distribution.Client.SetupWrapper
          ( setupWrapper, SetupScriptOptions(..), defaultSetupScriptOptions )
@@ -91,16 +86,14 @@ import qualified Distribution.Client.CmdExec      as CmdExec
 import qualified Distribution.Client.CmdClean     as CmdClean
 import qualified Distribution.Client.CmdSdist     as CmdSdist
 import qualified Distribution.Client.CmdListBin   as CmdListBin
+import qualified Distribution.Client.CmdOutdated  as CmdOutdated
 import           Distribution.Client.CmdLegacy
 
 import Distribution.Client.Install            (install)
 import Distribution.Client.Configure          (configure, writeConfigFlags)
-import Distribution.Client.Update             (update)
-import Distribution.Client.Exec               (exec)
 import Distribution.Client.Fetch              (fetch)
 import Distribution.Client.Freeze             (freeze)
 import Distribution.Client.GenBounds          (genBounds)
-import Distribution.Client.Outdated           (outdated)
 import Distribution.Client.Check as Check     (check)
 --import Distribution.Client.Clean            (clean)
 import qualified Distribution.Client.Upload as Upload
@@ -112,21 +105,20 @@ import Distribution.Client.Nix                (nixInstantiate
                                               )
 import Distribution.Client.Sandbox            (loadConfigOrSandboxConfig
                                               ,findSavedDistPref
-                                              ,updateInstallDirs
-                                              ,getPersistOrConfigCompiler)
+                                              ,updateInstallDirs)
 import Distribution.Client.Tar                (createTarGzFile)
 import Distribution.Client.Types.Credentials  (Password (..))
-import Distribution.Client.Init               (initCabal)
+import Distribution.Client.Init               (initCmd)
 import Distribution.Client.Manpage            (manpageCmd)
 import Distribution.Client.ManpageFlags       (ManpageFlags (..))
-import Distribution.Client.Utils              (determineNumJobs
-                                              ,relaxEncodingErrors
-                                              )
+import Distribution.Client.Utils
+         ( determineNumJobs, relaxEncodingErrors )
+import Distribution.Client.Version
+         ( cabalInstallVersion )
 
 import Distribution.Package (packageId)
 import Distribution.PackageDescription
          ( BuildType(..), Executable(..), buildable )
-import Distribution.PackageDescription.Parsec ( readGenericPackageDescription )
 
 import Distribution.PackageDescription.PrettyPrint
          ( writeGenericPackageDescription )
@@ -145,6 +137,7 @@ import Distribution.Simple.Configure
          , getPersistBuildConfig, interpretPackageDbFlags
          , tryGetPersistBuildConfig )
 import qualified Distribution.Simple.LocalBuildInfo as LBI
+import Distribution.Simple.PackageDescription ( readGenericPackageDescription )
 import Distribution.Simple.Program (defaultProgramDb
                                    ,configureAllKnownPrograms
                                    ,simpleProgramInvocation
@@ -153,14 +146,13 @@ import Distribution.Simple.Program.Db (reconfigurePrograms)
 import qualified Distribution.Simple.Setup as Cabal
 import Distribution.Simple.Utils
          ( cabalVersion, die', dieNoVerbosity, info, notice, topHandler
-         , findPackageDesc, tryFindPackageDesc )
+         , findPackageDesc, tryFindPackageDesc, createDirectoryIfMissingVerbose )
 import Distribution.Text
          ( display )
 import Distribution.Verbosity as Verbosity
-         ( Verbosity, normal )
+         ( normal )
 import Distribution.Version
          ( Version, mkVersion, orLaterVersion )
-import qualified Paths_cabal_install (version)
 
 import Distribution.Compat.ResponseFile
 import System.Environment       (getArgs, getProgName)
@@ -168,10 +160,11 @@ import System.FilePath          ( dropExtension, splitExtension
                                 , takeExtension, (</>), (<.>) )
 import System.IO                ( BufferMode(LineBuffering), hSetBuffering
                                 , stderr, stdout )
-import System.Directory         (doesFileExist, getCurrentDirectory)
+import System.Directory         ( doesFileExist, getCurrentDirectory
+                                , withCurrentDirectory)
 import Data.Monoid              (Any(..))
 import Control.Exception        (try)
-import Data.Version             (showVersion)
+
 
 -- | Entry point
 --
@@ -227,9 +220,9 @@ mainWorker args = do
                   ++ "defaults if you run 'cabal update'."
     printOptionsList = putStr . unlines
     printErrors errs = dieNoVerbosity $ intercalate "\n" errs
-    printNumericVersion = putStrLn $ showVersion Paths_cabal_install.version
+    printNumericVersion = putStrLn $ display cabalInstallVersion
     printVersion        = putStrLn $ "cabal-install version "
-                                  ++ showVersion Paths_cabal_install.version
+                                  ++ display cabalInstallVersion
                                   ++ "\ncompiled using version "
                                   ++ display cabalVersion
                                   ++ " of the Cabal library "
@@ -240,14 +233,14 @@ mainWorker args = do
       , regularCmd infoCommand infoAction
       , regularCmd fetchCommand fetchAction
       , regularCmd getCommand getAction
-      , hiddenCmd  unpackCommand unpackAction
+      , regularCmd unpackCommand unpackAction
       , regularCmd checkCommand checkAction
       , regularCmd uploadCommand uploadAction
       , regularCmd reportCommand reportAction
       , regularCmd initCommand initAction
       , regularCmd userConfigCommand userConfigAction
       , regularCmd genBoundsCommand genBoundsAction
-      , regularCmd outdatedCommand outdatedAction
+      , regularCmd CmdOutdated.outdatedCommand CmdOutdated.outdatedAction
       , wrapperCmd hscolourCommand hscolourVerbosity hscolourDistPref
       , hiddenCmd  formatCommand formatAction
       , hiddenCmd  actAsSetupCommand actAsSetupAction
@@ -270,7 +263,6 @@ mainWorker args = do
       , newCmd  CmdSdist.sdistCommand         CmdSdist.sdistAction
 
       , legacyCmd configureExCommand configureAction
-      , legacyCmd updateCommand updateAction
       , legacyCmd buildCommand buildAction
       , legacyCmd replCommand replAction
       , legacyCmd freezeCommand freezeAction
@@ -279,9 +271,7 @@ mainWorker args = do
       , legacyCmd runCommand runAction
       , legacyCmd testCommand testAction
       , legacyCmd benchmarkCommand benchmarkAction
-      , legacyCmd execCommand execAction
       , legacyCmd cleanCommand cleanAction
-      , legacyCmd doctestCommand doctestAction
       , legacyWrapperCmd copyCommand copyVerbosity copyDistPref
       , legacyWrapperCmd registerCommand regVerbosity regDistPref
       , legacyCmd reconfigureCommand reconfigureAction
@@ -678,13 +668,6 @@ haddockAction haddockFlags extraArgs globalFlags = do
       createTarGzFile dest docDir name
       notice verbosity $ "Documentation tarball created: " ++ dest
 
-doctestAction :: DoctestFlags -> [String] -> Action
-doctestAction doctestFlags extraArgs _globalFlags = do
-  let verbosity = fromFlag (doctestVerbosity doctestFlags)
-
-  setupWrapper verbosity defaultSetupScriptOptions Nothing
-    doctestCommand (const doctestFlags) (const extraArgs)
-
 cleanAction :: CleanFlags -> [String] -> Action
 cleanAction cleanFlags extraArgs globalFlags = do
   load <- try (loadConfigOrSandboxConfig verbosity globalFlags)
@@ -711,7 +694,7 @@ listAction listFlags extraArgs globalFlags = do
         , configHcPath     = listHcPath listFlags
         }
       globalFlags' = savedGlobalFlags    config `mappend` globalFlags
-  compProgdb <- if listNeedsCompiler listFlags 
+  compProgdb <- if listNeedsCompiler listFlags
       then do
           (comp, _, progdb) <- configCompilerAux' configFlags
           return (Just (comp, progdb))
@@ -745,16 +728,6 @@ infoAction infoFlags extraArgs globalFlags = do
        globalFlags'
        infoFlags
        targets
-
-updateAction :: UpdateFlags -> [String] -> Action
-updateAction updateFlags extraArgs globalFlags = do
-  let verbosity = fromFlag (updateVerbosity updateFlags)
-  unless (null extraArgs) $
-    die' verbosity $ "'update' doesn't take any extra arguments: " ++ unwords extraArgs
-  config <- loadConfigOrSandboxConfig verbosity globalFlags
-  let globalFlags' = savedGlobalFlags config `mappend` globalFlags
-  withRepoContext verbosity globalFlags' $ \repoContext ->
-    update verbosity updateFlags repoContext
 
 fetchAction :: FetchFlags -> [String] -> Action
 fetchAction fetchFlags extraArgs globalFlags = do
@@ -804,17 +777,6 @@ genBoundsAction freezeFlags _extraArgs globalFlags = do
                 repoContext
                 comp platform progdb
                 globalFlags' freezeFlags
-
-outdatedAction :: OutdatedFlags -> [String] -> GlobalFlags -> IO ()
-outdatedAction outdatedFlags _extraArgs globalFlags = do
-  let verbosity = fromFlag (outdatedVerbosity outdatedFlags)
-  config <- loadConfigOrSandboxConfig verbosity globalFlags
-  let configFlags  = savedConfigureFlags config
-      globalFlags' = savedGlobalFlags config `mappend` globalFlags
-  (comp, platform, _progdb) <- configCompilerAux' configFlags
-  withRepoContext verbosity globalFlags' $ \repoContext ->
-    outdated verbosity outdatedFlags repoContext
-             comp platform
 
 uploadAction :: UploadFlags -> [String] -> Action
 uploadAction uploadFlags extraArgs globalFlags = do
@@ -947,33 +909,32 @@ unpackAction getFlags extraArgs globalFlags = do
 
 initAction :: InitFlags -> [String] -> Action
 initAction initFlags extraArgs globalFlags = do
-  let verbosity = fromFlag (initVerbosity initFlags)
-  when (extraArgs /= []) $
-    die' verbosity $ "'init' doesn't take any extra arguments: " ++ unwords extraArgs
-  config <- loadConfigOrSandboxConfig verbosity globalFlags
-  let configFlags  = savedConfigureFlags config `mappend`
-                     -- override with `--with-compiler` from CLI if available
-                     mempty { configHcPath = initHcPath initFlags }
-  let initFlags'   = savedInitFlags      config `mappend` initFlags
-  let globalFlags' = savedGlobalFlags    config `mappend` globalFlags
-  (comp, _, progdb) <- configCompilerAux' configFlags
-  withRepoContext verbosity globalFlags' $ \repoContext ->
-    initCabal verbosity
-            (configPackageDB' configFlags)
-            repoContext
-            comp
-            progdb
-            initFlags'
+  -- it takes the first value within extraArgs (if there's one)
+  -- and uses it as the root directory for the new project
+  case extraArgs of
+    [] -> initAction'
+    [projectDir] -> do
+      createDirectoryIfMissingVerbose verbosity True projectDir
+      withCurrentDirectory projectDir initAction'
+    _ -> die' verbosity $
+      "'init' only takes a single, optional, extra " ++
+      "argument for the project root directory"
+  where
+    initAction' = do
+      confFlags <- loadConfigOrSandboxConfig verbosity globalFlags
+      -- override with `--with-compiler` from CLI if available
+      let confFlags' = savedConfigureFlags confFlags `mappend` compFlags
+          initFlags' = savedInitFlags confFlags `mappend` initFlags
+          globalFlags' = savedGlobalFlags confFlags `mappend` globalFlags
 
-execAction :: ExecFlags -> [String] -> Action
-execAction execFlags extraArgs globalFlags = do
-  let verbosity = fromFlag (execVerbosity execFlags)
-  config <- loadConfigOrSandboxConfig verbosity globalFlags
-  distPref <- findSavedDistPref config (execDistPref execFlags)
-  let configFlags = savedConfigureFlags config
-      configFlags' = configFlags { configDistPref = Flag distPref }
-  (comp, platform, progdb) <- getPersistOrConfigCompiler configFlags'
-  exec verbosity comp platform progdb extraArgs
+      (comp, _, progdb) <- configCompilerAux' confFlags'
+
+      withRepoContext verbosity globalFlags' $ \repoContext ->
+        initCmd verbosity (configPackageDB' confFlags')
+          repoContext comp progdb initFlags'
+
+    verbosity = fromFlag (initVerbosity initFlags)
+    compFlags = mempty { configHcPath = initHcPath initFlags }
 
 userConfigAction :: UserConfigFlags -> [String] -> Action
 userConfigAction ucflags extraArgs globalFlags = do
@@ -1011,7 +972,7 @@ manpageAction :: [CommandSpec action] -> ManpageFlags -> [String] -> Action
 manpageAction commands flags extraArgs _ = do
   let verbosity = fromFlag (manpageVerbosity flags)
   unless (null extraArgs) $
-    die' verbosity $ "'manpage' doesn't take any extra arguments: " ++ unwords extraArgs
+    die' verbosity $ "'man' doesn't take any extra arguments: " ++ unwords extraArgs
   pname <- getProgName
   let cabalCmd = if takeExtension pname == ".exe"
                  then dropExtension pname

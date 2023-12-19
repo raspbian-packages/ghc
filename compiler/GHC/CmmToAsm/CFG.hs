@@ -1,15 +1,13 @@
+{-# LANGUAGE DataKinds                  #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE Rank2Types                 #-}
+{-# LANGUAGE ScopedTypeVariables        #-}
+{-# LANGUAGE TypeFamilies               #-}
+{-# LANGUAGE FlexibleContexts           #-}
+{-# LANGUAGE TupleSections              #-}
 --
 -- Copyright (c) 2018 Andreas Klebinger
 --
-
-{-# LANGUAGE TypeFamilies, ScopedTypeVariables #-}
-{-# LANGUAGE TupleSections #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE Rank2Types #-}
-{-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE FlexibleContexts           #-}
 
 module GHC.CmmToAsm.CFG
     ( CFG, CfgEdge(..), EdgeInfo(..), EdgeWeight(..)
@@ -43,9 +41,8 @@ module GHC.CmmToAsm.CFG
      )
 where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
+import GHC.Platform
 
 import GHC.Cmm.BlockId
 import GHC.Cmm as Cmm
@@ -63,6 +60,7 @@ import GHC.Data.Maybe
 
 import GHC.Types.Unique
 import qualified GHC.CmmToAsm.CFG.Dominators as Dom
+import GHC.CmmToAsm.CFG.Weight
 import Data.IntMap.Strict (IntMap)
 import Data.IntSet (IntSet)
 
@@ -74,12 +72,13 @@ import Data.Tree
 import Data.Bifunctor
 
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
 -- DEBUGGING ONLY
 --import GHC.Cmm.DebugBlock
 --import GHC.Data.OrdList
 --import GHC.Cmm.DebugBlock.Trace
 import GHC.Cmm.Ppr () -- For Outputable instances
-import qualified GHC.Driver.Session as D
 
 import Data.List (sort, nub, partition)
 import Data.STRef.Strict
@@ -151,7 +150,7 @@ instance Outputable CfgEdge where
 -- or has it been introduced during assembly codegen. We use this to maintain
 -- some information which would otherwise be lost during the
 -- Cmm \<-> asm transition.
--- See also Note [Inverting Conditional Branches]
+-- See also Note [Inverting conditions]
 data TransitionSource
   = CmmSource { trans_cmmNode :: (CmmNode O C)
               , trans_info :: BranchInfo }
@@ -214,7 +213,7 @@ getCfgNodes m =
 hasNode :: CFG -> BlockId -> Bool
 hasNode m node =
   -- Check the invariant that each node must exist in the first map or not at all.
-  ASSERT( found || not (any (mapMember node) m))
+  assert (found || not (any (mapMember node) m))
   found
     where
       found = mapMember node m
@@ -239,7 +238,7 @@ sanityCheckCfg m blockSet msg
       diff = (setUnion cfgNodes blockSet) `setDifference` (setIntersection cfgNodes blockSet) :: LabelSet
 
 -- | Filter the CFG with a custom function f.
---   Paramaeters are `f from to edgeInfo`
+--   Parameters are `f from to edgeInfo`
 filterEdges :: (BlockId -> BlockId -> EdgeInfo -> Bool) -> CFG -> CFG
 filterEdges f cfg =
     mapMapWithKey filterSources cfg
@@ -249,7 +248,7 @@ filterEdges f cfg =
 
 
 {- Note [Updating the CFG during shortcutting]
-
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 See Note [What is shortcutting] in the control flow optimization
 code (GHC.Cmm.ContFlowOpt) for a slightly more in depth explanation on shortcutting.
 
@@ -353,12 +352,11 @@ shortcutWeightMap cuts cfg
 --             \                  \
 --              -> C    =>         -> C
 --
-addImmediateSuccessor :: D.DynFlags -> BlockId -> BlockId -> CFG -> CFG
-addImmediateSuccessor dflags node follower cfg
-    = updateEdges . addWeightEdge node follower uncondWeight $ cfg
+addImmediateSuccessor :: Weights -> BlockId -> BlockId -> CFG -> CFG
+addImmediateSuccessor weights node follower cfg
+    = updateEdges . addWeightEdge node follower weight $ cfg
     where
-        uncondWeight = fromIntegral . D.uncondWeight .
-                       D.cfgWeightInfo $ dflags
+        weight = fromIntegral (uncondWeight weights)
         targets = getSuccessorEdges cfg node
         successors = map fst targets :: [BlockId]
         updateEdges = addNewSuccs . remOldSuccs
@@ -529,13 +527,12 @@ mapWeights f cfg =
 -- these cases.
 -- We assign the old edge info to the edge A -> B and assign B -> C the
 -- weight of an unconditional jump.
-addNodesBetween :: D.DynFlags -> CFG -> [(BlockId,BlockId,BlockId)] -> CFG
-addNodesBetween dflags m updates =
+addNodesBetween :: Weights -> CFG -> [(BlockId,BlockId,BlockId)] -> CFG
+addNodesBetween weights m updates =
   foldl'  updateWeight m .
           weightUpdates $ updates
     where
-      weight = fromIntegral . D.uncondWeight .
-                D.cfgWeightInfo $ dflags
+      weight = fromIntegral (uncondWeight weights)
       -- We might add two blocks for different jumps along a single
       -- edge. So we end up with edges:   A -> B -> C   ,   A -> D -> C
       -- in this case after applying the first update the weight for A -> C
@@ -605,24 +602,24 @@ addNodesBetween dflags m updates =
 
 -}
 -- | Generate weights for a Cmm proc based on some simple heuristics.
-getCfgProc :: D.CfgWeights -> RawCmmDecl -> CFG
-getCfgProc _       (CmmData {}) = mapEmpty
-getCfgProc weights (CmmProc _info _lab _live graph) = getCfg weights graph
+getCfgProc :: Platform -> Weights -> RawCmmDecl -> CFG
+getCfgProc _        _       (CmmData {}) = mapEmpty
+getCfgProc platform weights (CmmProc _info _lab _live graph) = getCfg platform weights graph
 
-getCfg :: D.CfgWeights -> CmmGraph -> CFG
-getCfg weights graph =
+getCfg :: Platform -> Weights -> CmmGraph -> CFG
+getCfg platform weights graph =
   foldl' insertEdge edgelessCfg $ concatMap getBlockEdges blocks
   where
-    D.CFGWeights
-            { D.uncondWeight = uncondWeight
-            , D.condBranchWeight = condBranchWeight
-            , D.switchWeight = switchWeight
-            , D.callWeight = callWeight
-            , D.likelyCondWeight = likelyCondWeight
-            , D.unlikelyCondWeight = unlikelyCondWeight
+    Weights
+            { uncondWeight = uncondWeight
+            , condBranchWeight = condBranchWeight
+            , switchWeight = switchWeight
+            , callWeight = callWeight
+            , likelyCondWeight = likelyCondWeight
+            , unlikelyCondWeight = unlikelyCondWeight
             --  Last two are used in other places
-            --, D.infoTablePenalty = infoTablePenalty
-            --, D.backEdgeBonus = backEdgeBonus
+            --, infoTablePenalty = infoTablePenalty
+            --, backEdgeBonus = backEdgeBonus
             } = weights
     -- Explicitly add all nodes to the cfg to ensure they are part of the
     -- CFG.
@@ -651,7 +648,7 @@ getCfg weights graph =
             mkEdge target weight = ((bid,target), mkEdgeInfo weight)
             branchInfo =
               foldRegsUsed
-                (panic "foldRegsDynFlags")
+                (panic "GHC.CmmToAsm.CFG.getCfg: foldRegsUsed")
                 (\info r -> if r == SpLim || r == HpLim || r == BaseReg
                     then HeapStackCheck else info)
                 NoInfo cond
@@ -668,8 +665,8 @@ getCfg weights graph =
         (CmmCall { cml_cont = Nothing })   -> []
         other ->
             panic "Foo" $
-            ASSERT2(False, ppr "Unknown successor cause:" <>
-              (ppr branch <+> text "=>" <> ppr (G.successors other)))
+            assertPpr False (ppr "Unknown successor cause:" <>
+              (pdoc platform branch <+> text "=>" <> pdoc platform (G.successors other))) $
             map (\x -> ((bid,x),mkEdgeInfo 0)) $ G.successors other
       where
         bid = G.entryLabel block
@@ -691,7 +688,7 @@ findBackEdges root cfg =
     typedEdges =
       classifyEdges root getSuccs edges :: [((BlockId,BlockId),EdgeType)]
 
-optimizeCFG :: Bool -> D.CfgWeights -> RawCmmDecl -> CFG -> CFG
+optimizeCFG :: Bool -> Weights -> RawCmmDecl -> CFG -> CFG
 optimizeCFG _ _ (CmmData {}) cfg = cfg
 optimizeCFG doStaticPred weights proc@(CmmProc _info _lab _live graph) cfg =
   (if doStaticPred then staticPredCfg (g_entry graph) else id) $
@@ -702,7 +699,7 @@ optimizeCFG doStaticPred weights proc@(CmmProc _info _lab _live graph) cfg =
 -- performance.
 --
 -- Most importantly we penalize jumps across info tables.
-optHsPatterns :: D.CfgWeights -> RawCmmDecl -> CFG -> CFG
+optHsPatterns :: Weights -> RawCmmDecl -> CFG -> CFG
 optHsPatterns _ (CmmData {}) cfg = cfg
 optHsPatterns weights (CmmProc info _lab _live graph) cfg =
     {-# SCC optHsPatterns #-}
@@ -715,7 +712,7 @@ optHsPatterns weights (CmmProc info _lab _live graph) cfg =
     increaseBackEdgeWeight (g_entry graph) $ cfg
   where
 
-    -- | Increase the weight of all backedges in the CFG
+    -- Increase the weight of all backedges in the CFG
     -- this helps to make loop jumpbacks the heaviest edges
     increaseBackEdgeWeight :: BlockId -> CFG -> CFG
     increaseBackEdgeWeight root cfg =
@@ -724,11 +721,11 @@ optHsPatterns weights (CmmProc info _lab _live graph) cfg =
               --Keep irrelevant edges irrelevant
               | weight <= 0 = 0
               | otherwise
-              = weight + fromIntegral (D.backEdgeBonus weights)
+              = weight + fromIntegral (backEdgeBonus weights)
         in  foldl'  (\cfg edge -> updateEdgeWeight update edge cfg)
                     cfg backedges
 
-    -- | Since we cant fall through info tables we penalize these.
+    -- Since we cant fall through info tables we penalize these.
     penalizeInfoTables :: LabelMap a -> CFG -> CFG
     penalizeInfoTables info cfg =
         mapWeights fupdate cfg
@@ -736,10 +733,10 @@ optHsPatterns weights (CmmProc info _lab _live graph) cfg =
         fupdate :: BlockId -> BlockId -> EdgeWeight -> EdgeWeight
         fupdate _ to weight
           | mapMember to info
-          = weight - (fromIntegral $ D.infoTablePenalty weights)
+          = weight - (fromIntegral $ infoTablePenalty weights)
           | otherwise = weight
 
-    -- | If a block has two successors, favour the one with fewer
+    -- If a block has two successors, favour the one with fewer
     -- predecessors and/or the one allowing fall through.
     favourFewerPreds :: CFG -> CFG
     favourFewerPreds cfg =
@@ -1016,7 +1013,6 @@ mkGlobalWeights root localCfg
 
 {- Note [Static Branch Prediction]
    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 The work here has been based on the paper
 "Static Branch Prediction and Program Profile Analysis" by Y Wu, JR Larus.
 

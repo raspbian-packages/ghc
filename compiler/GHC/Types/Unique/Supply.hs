@@ -3,18 +3,11 @@
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
 -}
 
-{-# OPTIONS_GHC -fno-state-hack #-}
-    -- This -fno-state-hack is important
-    -- See Note [Optimising the unique supply]
-
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE DeriveFunctor #-}
-{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE BangPatterns #-}
-
-#if !defined(GHC_LOADED_INTO_GHCI)
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE UnboxedTuples #-}
-#endif
 
 module GHC.Types.Unique.Supply (
         -- * Main data type
@@ -40,15 +33,18 @@ module GHC.Types.Unique.Supply (
 import GHC.Prelude
 
 import GHC.Types.Unique
-import GHC.Utils.Panic.Plain (panic)
+import GHC.Utils.Panic.Plain
 
 import GHC.IO
 
 import GHC.Utils.Monad
 import Control.Monad
-import Data.Bits
 import Data.Char
-import GHC.Exts( inline )
+import GHC.Exts( Ptr(..), noDuplicate#, oneShot )
+#if MIN_VERSION_GLASGOW_HASKELL(9,1,0,0)
+import GHC.Exts( Int(..), word2Int#, fetchAddWordAddr#, plusWord#, readWordOffAddr# )
+#endif
+import Foreign.Storable
 
 #include "Unique.h"
 
@@ -81,9 +77,50 @@ lazily-evaluated infinite tree.
      * The fresh node
      * A thunk for each sub-tree
 
+Note [How unique supplies are used]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The general design (used throughout GHC) is to:
+
+* For creating new uniques either a UniqSupply is used and threaded through
+  or for monadic code a MonadUnique instance might conjure up uniques using
+  `uniqFromMask`.
+* Different parts of the compiler will use a UniqSupply or MonadUnique instance
+  with a specific mask. This way the different parts of the compiler will
+  generate uniques with different masks.
+
+If different code shares the same mask then care has to be taken that all uniques
+still get distinct numbers. Usually this is done by relying on genSym which
+has *one* counter per GHC invocation that is relied on by all calls to it.
+But using something like the address for pinned objects works as well and in fact is done
+for fast strings.
+
+This is important for example in the simplifier. Most passes of the simplifier use
+the same mask 's'. However in some places we create a unique supply using `mkSplitUniqSupply`
+and thread it through the code, while in GHC.Core.Opt.Simplify.Monad  we use the
+`instance MonadUnique SimplM`, which uses `mkSplitUniqSupply` in getUniqueSupplyM
+and `uniqFromMask` in getUniqeM.
+
+Ultimately all these boil down to each new unique consisting of the mask and the result from
+a call to `genSym`. The later producing a distinct number for each invocation ensuring
+uniques are distinct.
+
 Note [Optimising the unique supply]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 The inner loop of mkSplitUniqSupply is a function closure
+
+     mk_supply s0 =
+        case noDuplicate# s0 of { s1 ->
+        case unIO genSym s1 of { (# s2, u #) ->
+        case unIO (unsafeDupableInterleaveIO (IO mk_supply)) s2 of { (# s3, x #) ->
+        case unIO (unsafeDupableInterleaveIO (IO mk_supply)) s3 of { (# s4, y #) ->
+        (# s4, MkSplitUniqSupply (mask .|. u) x y #)
+        }}}}
+
+It's a classic example of an IO action that is captured and then called
+repeatedly (see #18238 for some discussion). It mustn't allocate!  The test
+perf/should_run/UniqLoop keeps track of this loop.  Watch it carefully.
+
+We used to write it as:
 
      mk_supply :: IO UniqSupply
      mk_supply = unsafeInterleaveIO $
@@ -92,100 +129,51 @@ The inner loop of mkSplitUniqSupply is a function closure
                  mk_supply   >>= \ s2 ->
                  return (MkSplitUniqSupply (mask .|. u) s1 s2)
 
-It's a classic example of an IO action that is captured
-and the called repeatedly (see #18238 for some discussion).
-It turns out that we can get something like
+and to rely on -fno-state-hack, full laziness and inlining to get the same
+result. It was very brittle and required enabling -fno-state-hack globally. So
+it has been rewritten using lower level constructs to explicitly state what we
+want.
 
-  $wmkSplitUniqSupply c# s
-    = letrec
-        mk_supply
-          = \s -> unsafeDupableInterleaveIO1
-                    (\s2 -> case noDuplicate# s2 of s3 ->
-                            ...
-                            case mk_supply s4 of (# s5, t1 #) ->
-                            ...
-                            (# s6, MkSplitUniqSupply ... #)
-      in mk_supply s
+Note [Optimising use of unique supplies]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When it comes to having a way to generate new Uniques
+there are generally three ways to deal with this:
 
-This is bad becuase we allocate that inner (\s2...) every time.
-Why doesn't full laziness float out the (\s2...)?  Because of
-the state hack (#18238).
+For pure code the only good approach is to take an UniqSupply
+as argument. Then  thread it through the code splitting it
+for sub-passes or when creating uniques.
+The code for this is about as optimized as it gets, but we can't
+get around the need to allocate one `UniqSupply` for each Unique
+we need.
 
-So for this module we switch the state hack off -- it's an example
-of when it makes things worse rather than better.  And we use
-multiShotIO (see Note [multiShotIO]) thus:
+For code in IO we can improve on this by threading only the *mask*
+we are going to use for Uniques. Using `uniqFromMask` to
+generate uniques as needed. This gets rid of the overhead of
+allocating a new UniqSupply for each unique generated. It also avoids
+frequent state updates when the Unique/Mask is part of the state in a
+state monad.
 
-     mk_supply = multiShotIO $
-                 unsafeInterleaveIO $
-                 genSym      >>= \ u ->
-                 ...
+For monadic code in IO which always uses the same mask we can go further
+and hardcode the mask into the MonadUnique instance. On top of all the
+benefits of threading the mask this *also* has the benefit of avoiding
+the mask getting captured in thunks, or being passed around at runtime.
+It does however come at the cost of having to use a fixed Mask for all
+code run in this Monad. But rememeber, the Mask is purely cosmetic:
+See Note [Uniques and masks].
 
-Now full laziness can float that lambda out, and we get
+NB: It's *not* an optimization to pass around the UniqSupply inside an
+IORef instead of the mask. While this would avoid frequent state updates
+it still requires allocating one UniqSupply per Unique. On top of some
+overhead for reading/writing to/from the IORef.
 
-  $wmkSplitUniqSupply c# s
-    = letrec
-        lvl = \s2 -> case noDuplicate# s2 of s3 ->
-                     ...
-                     case unsafeDupableInterleaveIO
-                              lvl s4 of (# s5, t1 #) ->
-                     ...
-                     (# s6, MkSplitUniqSupply ... #)
-      in unsafeDupableInterleaveIO1 lvl s
+All of this hinges on the assumption that UniqSupply and
+uniqFromMask use the same source of distinct numbers (`genSym`) which
+allows both to be used at the same time, with the same mask, while still
+ensuring distinct uniques.
+One might consider this fact to be an "accident". But GHC worked like this
+as far back as source control history goes. It also allows the later two
+optimizations to be used. So it seems safe to depend on this fact.
 
-This is all terribly delicate.  It just so happened that before I
-fixed #18078, and even with the state-hack still enabled, we were
-getting this:
-
-  $wmkSplitUniqSupply c# s
-    = letrec
-        mk_supply = \s2 -> case noDuplicate# s2 of s3 ->
-                           ...
-                           case mks_help s3 of (# s5,t1 #) ->
-                           ...
-                           (# s6, MkSplitUniqSupply ... #)
-        mks_help = unsafeDupableInterleaveIO mk_supply
-           -- mks_help marked as loop breaker
-      in mks_help s
-
-The fact that we didn't need full laziness was somewhat fortuitious.
-We got the right number of allocations. But the partial application of
-the arity-2 unsafeDupableInterleaveIO in mks_help makes it quite a
-bit slower.  (Test perf/should_run/UniqLoop had a 20% perf change.)
-
-Sigh.  The test perf/should_run/UniqLoop keeps track of this loop.
-Watch it carefully.
-
-Note [multiShotIO]
-~~~~~~~~~~~~~~~~~~
-The function multiShotIO :: IO a -> IO a
-says that the argument IO action may be invoked repeatedly (is
-multi-shot), and so there should be a multi-shot lambda around it.
-It's quite easy to define, in any module with `-fno-state-hack`:
-    multiShotIO :: IO a -> IO a
-    {-# INLINE multiShotIO #-}
-    multiShotIO (IO m) = IO (\s -> inline m s)
-
-Because of -fno-state-hack, that '\s' will be multi-shot. Now,
-ignoring the casts from IO:
-    multiShotIO (\ss{one-shot}. blah)
-    ==> let m = \ss{one-shot}. blah
-        in \s. inline m s
-    ==> \s. (\ss{one-shot}.blah) s
-    ==> \s. blah[s/ss]
-
-The magic `inline` function does two things
-* It prevents eta reduction.  If we wrote just
-      multiShotIO (IO m) = IO (\s -> m s)
-  the lamda would eta-reduce to 'm' and all would be lost.
-
-* It helps ensure that 'm' really does inline.
-
-Note that 'inline' evaporates in phase 0.  See Note [inlineIdMagic]
-in GHC.Core.Opt.ConstantFold.match_inline.
-
-The INLINE pragma on multiShotIO is very important, else the
-'inline' call will evaporate when compiling the module that
-defines 'multiShotIO', before it is ever exported.
 -}
 
 
@@ -201,35 +189,72 @@ data UniqSupply
                                 -- when split => these two supplies
 
 mkSplitUniqSupply :: Char -> IO UniqSupply
--- ^ Create a unique supply out of thin air. The character given must
--- be distinct from those of all calls to this function in the compiler
--- for the values generated to be truly unique.
+-- ^ Create a unique supply out of thin air.
+-- The "mask" (Char) supplied is purely cosmetic, making it easier
+-- to figure out where a Unique was born. See
+-- Note [Uniques and masks].
+--
+-- The payload part of the Uniques allocated from this UniqSupply are
+-- guaranteed distinct wrt all other supplies, regardless of their "mask".
+-- This is achieved by allocating the payload part from
+-- a single source of Uniques, namely `genSym`, shared across
+-- all UniqSupply's.
 
 -- See Note [How the unique supply works]
 -- See Note [Optimising the unique supply]
 mkSplitUniqSupply c
-  = mk_supply
+  = unsafeDupableInterleaveIO (IO mk_supply)
+
   where
-     !mask = ord c `shiftL` uNIQUE_BITS
+     !mask = ord c `unsafeShiftL` uNIQUE_BITS
 
         -- Here comes THE MAGIC: see Note [How the unique supply works]
         -- This is one of the most hammered bits in the whole compiler
         -- See Note [Optimising the unique supply]
-        -- NB: Use unsafeInterleaveIO for thread-safety.
-     mk_supply = multiShotIO $
-                 unsafeInterleaveIO $
-                 genSym      >>= \ u ->
-                 mk_supply   >>= \ s1 ->
-                 mk_supply   >>= \ s2 ->
-                 return (MkSplitUniqSupply (mask .|. u) s1 s2)
+        -- NB: Use noDuplicate# for thread-safety.
+     mk_supply s0 =
+        case noDuplicate# s0 of { s1 ->
+        case unIO genSym s1 of { (# s2, u #) ->
+        -- deferred IO computations
+        case unIO (unsafeDupableInterleaveIO (IO mk_supply)) s2 of { (# s3, x #) ->
+        case unIO (unsafeDupableInterleaveIO (IO mk_supply)) s3 of { (# s4, y #) ->
+        (# s4, MkSplitUniqSupply (mask .|. u) x y #)
+        }}}}
 
-multiShotIO :: IO a -> IO a
-{-# INLINE multiShotIO #-}
--- See Note [multiShotIO]
-multiShotIO (IO m) = IO (\s -> inline m s)
-
+#if !MIN_VERSION_GLASGOW_HASKELL(9,1,0,0)
 foreign import ccall unsafe "genSym" genSym :: IO Int
-foreign import ccall unsafe "initGenSym" initUniqSupply :: Int -> Int -> IO ()
+#else
+genSym :: IO Int
+genSym = do
+    let !mask = (1 `unsafeShiftL` uNIQUE_BITS) - 1
+    let !(Ptr counter) = ghc_unique_counter
+    let !(Ptr inc_ptr) = ghc_unique_inc
+    u <- IO $ \s0 -> case readWordOffAddr# inc_ptr 0# s0 of
+        (# s1, inc #) -> case fetchAddWordAddr# counter inc s1 of
+            (# s2, val #) ->
+                let !u = I# (word2Int# (val `plusWord#` inc)) .&. mask
+                in (# s2, u #)
+#if defined(DEBUG)
+    -- Uh oh! We will overflow next time a unique is requested.
+    -- (Note that if the increment isn't 1 we may miss this check)
+    massert (u /= mask)
+#endif
+    return u
+#endif
+
+foreign import ccall unsafe "&ghc_unique_counter" ghc_unique_counter :: Ptr Word
+foreign import ccall unsafe "&ghc_unique_inc"     ghc_unique_inc     :: Ptr Int
+
+initUniqSupply :: Word -> Int -> IO ()
+initUniqSupply counter inc = do
+    poke ghc_unique_counter counter
+    poke ghc_unique_inc     inc
+
+uniqFromMask :: Char -> IO Unique
+uniqFromMask !mask
+  = do { uqNum <- genSym
+       ; return $! mkUnique mask uqNum }
+{-# NOINLINE uniqFromMask #-} -- We'll unbox everything, but we don't want to inline it
 
 splitUniqSupply :: UniqSupply -> (UniqSupply, UniqSupply)
 -- ^ Build two 'UniqSupply' from a single one, each of which
@@ -250,12 +275,6 @@ uniqFromSupply  (MkSplitUniqSupply n _ _)  = mkUniqueGrimily n
 uniqsFromSupply (MkSplitUniqSupply n _ s2) = mkUniqueGrimily n : uniqsFromSupply s2
 takeUniqFromSupply (MkSplitUniqSupply n s1 _) = (mkUniqueGrimily n, s1)
 
-uniqFromMask :: Char -> IO Unique
-uniqFromMask mask
-  = do { uqNum <- genSym
-       ; return $! mkUnique mask uqNum }
-
-
 {-
 ************************************************************************
 *                                                                      *
@@ -264,25 +283,26 @@ uniqFromMask mask
 ************************************************************************
 -}
 
--- Avoids using unboxed tuples when loading into GHCi
-#if !defined(GHC_LOADED_INTO_GHCI)
-
 type UniqResult result = (# result, UniqSupply #)
 
 pattern UniqResult :: a -> b -> (# a, b #)
 pattern UniqResult x y = (# x, y #)
 {-# COMPLETE UniqResult #-}
 
-#else
-
-data UniqResult result = UniqResult !result {-# UNPACK #-} !UniqSupply
-  deriving (Functor)
-
-#endif
-
 -- | A monad which just gives the ability to obtain 'Unique's
 newtype UniqSM result = USM { unUSM :: UniqSupply -> UniqResult result }
-    deriving (Functor)
+
+-- See Note [The one-shot state monad trick] for why we don't derive this.
+instance Functor UniqSM where
+  fmap f (USM m) = mkUniqSM $ \us ->
+      case m us of
+        (# r, us' #) -> UniqResult (f r) us'
+
+-- | Smart constructor for 'UniqSM', as described in Note [The one-shot state
+-- monad trick].
+mkUniqSM :: (UniqSupply -> UniqResult a) -> UniqSM a
+mkUniqSM f = USM (oneShot f)
+{-# INLINE mkUniqSM #-}
 
 instance Monad UniqSM where
   (>>=) = thenUs
@@ -290,7 +310,7 @@ instance Monad UniqSM where
 
 instance Applicative UniqSM where
     pure = returnUs
-    (USM f) <*> (USM x) = USM $ \us0 -> case f us0 of
+    (USM f) <*> (USM x) = mkUniqSM $ \us0 -> case f us0 of
                             UniqResult ff us1 -> case x us1 of
                               UniqResult xx us2 -> UniqResult (ff xx) us2
     (*>) = thenUs_
@@ -317,22 +337,22 @@ liftUSM :: UniqSM a -> UniqSupply -> (a, UniqSupply)
 liftUSM (USM m) us0 = case m us0 of UniqResult a us1 -> (a, us1)
 
 instance MonadFix UniqSM where
-    mfix m = USM (\us0 -> let (r,us1) = liftUSM (m r) us0 in UniqResult r us1)
+    mfix m = mkUniqSM (\us0 -> let (r,us1) = liftUSM (m r) us0 in UniqResult r us1)
 
 thenUs :: UniqSM a -> (a -> UniqSM b) -> UniqSM b
 thenUs (USM expr) cont
-  = USM (\us0 -> case (expr us0) of
+  = mkUniqSM (\us0 -> case (expr us0) of
                    UniqResult result us1 -> unUSM (cont result) us1)
 
 thenUs_ :: UniqSM a -> UniqSM b -> UniqSM b
 thenUs_ (USM expr) (USM cont)
-  = USM (\us0 -> case (expr us0) of { UniqResult _ us1 -> cont us1 })
+  = mkUniqSM (\us0 -> case (expr us0) of { UniqResult _ us1 -> cont us1 })
 
 returnUs :: a -> UniqSM a
-returnUs result = USM (\us -> UniqResult result us)
+returnUs result = mkUniqSM (\us -> UniqResult result us)
 
 getUs :: UniqSM UniqSupply
-getUs = USM (\us0 -> case splitUniqSupply us0 of (us1,us2) -> UniqResult us1 us2)
+getUs = mkUniqSM (\us0 -> case splitUniqSupply us0 of (us1,us2) -> UniqResult us1 us2)
 
 -- | A monad for generating unique identifiers
 class Monad m => MonadUnique m where
@@ -356,9 +376,9 @@ instance MonadUnique UniqSM where
     getUniquesM = getUniquesUs
 
 getUniqueUs :: UniqSM Unique
-getUniqueUs = USM (\us0 -> case takeUniqFromSupply us0 of
+getUniqueUs = mkUniqSM (\us0 -> case takeUniqFromSupply us0 of
                            (u,us1) -> UniqResult u us1)
 
 getUniquesUs :: UniqSM [Unique]
-getUniquesUs = USM (\us0 -> case splitUniqSupply us0 of
+getUniquesUs = mkUniqSM (\us0 -> case splitUniqSupply us0 of
                             (us1,us2) -> UniqResult (uniqsFromSupply us1) us2)

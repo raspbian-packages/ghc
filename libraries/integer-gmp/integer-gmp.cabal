@@ -9,6 +9,10 @@ author:              Herbert Valerio Riedel
 maintainer:          hvr@gnu.org
 category:            Numeric, Algebra
 build-type:          Simple
+
+homepage:            https://www.haskell.org/ghc/
+bug-reports:         https://gitlab.haskell.org/ghc/ghc/issues/new
+
 description:
     This package used to provide an implementation of the standard 'Integer'
     type based on the
@@ -18,6 +22,11 @@ description:
     .
     Its purpose is to provide backward compatibility for codes directly
     depending on the `integer-gmp` package.
+
+source-repository head
+    type:     git
+    location: https://gitlab.haskell.org/ghc/ghc.git
+    subdir:   libraries/integer-gmp
 
 library
   default-language:    Haskell2010

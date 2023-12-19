@@ -11,7 +11,7 @@
 -- to read configuration or package metadata files and cache the parsing.
 -----------------------------------------------------------------------------
 module Hadrian.Oracles.TextFile (
-    lookupValue, lookupValueOrEmpty, lookupValueOrError, lookupValues,
+    lookupValue, lookupValueOrEmpty, lookupValueOrError, lookupSystemConfig, lookupValues,
     lookupValuesOrEmpty, lookupValuesOrError, lookupDependencies, textFileOracle
     ) where
 
@@ -22,8 +22,7 @@ import Data.List
 import Development.Shake
 import Development.Shake.Classes
 import Development.Shake.Config
-
-import Hadrian.Utilities
+import Base
 
 -- | Lookup a value in a text file, tracking the result. Each line of the file
 -- is expected to have @key = value@ format.
@@ -35,10 +34,16 @@ lookupValueOrEmpty :: FilePath -> String -> Action String
 lookupValueOrEmpty file key = fromMaybe "" <$> lookupValue file key
 
 -- | Like 'lookupValue' but raises an error if the key is not found.
-lookupValueOrError :: FilePath -> String -> Action String
-lookupValueOrError file key = fromMaybe (error msg) <$> lookupValue file key
+lookupValueOrError :: Maybe String -> FilePath -> String -> Action String
+lookupValueOrError helper file key = fromMaybe (error msg) <$> lookupValue file key
   where
-    msg = "Key " ++ quote key ++ " not found in file " ++ quote file
+    msg = unlines $ ["Key " ++ quote key ++ " not found in file " ++ quote file]
+                    ++ maybeToList helper
+
+lookupSystemConfig :: String -> Action String
+lookupSystemConfig = lookupValueOrError (Just configError) configFile
+  where
+    configError = "Perhaps you need to rerun ./configure"
 
 -- | Lookup a list of values in a text file, tracking the result. Each line of
 -- the file is expected to have @key value1 value2 ...@ format.
@@ -62,7 +67,7 @@ lookupValuesOrError file key = fromMaybe (error msg) <$> lookupValues file key
 lookupDependencies :: FilePath -> FilePath -> Action (FilePath, [FilePath])
 lookupDependencies depFile file = do
     let -- .hs needs to come before .hi-boot deps added to fix #14482.
-        -- This is still a bit fragile: we have no order guaranty from the input
+        -- This is still a bit fragile: we have no order guarantee from the input
         -- file. Let's hope we don't have two different .hs source files (e.g.
         -- one included into the other)...
         weigh p
@@ -96,13 +101,13 @@ textFileOracle :: Rules ()
 textFileOracle = do
     kv <- newCache $ \file -> do
         need [file]
-        putLoud $ "| KeyValue oracle: reading " ++ quote file ++ "..."
+        putVerbose $ "| KeyValue oracle: reading " ++ quote file ++ "..."
         liftIO $ readConfigFile file
     void $ addOracleCache $ \(KeyValue (file, key)) -> Map.lookup key <$> kv file
 
     kvs <- newCache $ \file -> do
         need [file]
-        putLoud $ "| KeyValues oracle: reading " ++ quote file ++ "..."
+        putVerbose $ "| KeyValues oracle: reading " ++ quote file ++ "..."
         contents <- map words <$> readFileLines file
         return $ Map.fromList [ (key, values) | (key:values) <- contents ]
     void $ addOracleCache $ \(KeyValues (file, key)) -> Map.lookup key <$> kvs file

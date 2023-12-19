@@ -41,8 +41,9 @@ nitpick_ignore = [
 ]
 
 rst_prolog = """
-.. |llvm-version| replace:: {llvm_version}
-""".format(llvm_version=ghc_config.llvm_version)
+.. |llvm-version-min| replace:: {llvm_version_min}
+.. |llvm-version-max| replace:: {llvm_version_max}
+""".format(llvm_version_min=ghc_config.llvm_version_min, llvm_version_max=ghc_config.llvm_version_max)
 
 # General information about the project.
 project = u'Glasgow Haskell Compiler'
@@ -73,7 +74,7 @@ html_use_smartypants = True
 html_use_opensearch = 'https://downloads.haskell.org/~ghc/master/users-guide'
 html_show_copyright = True
 
-# See GHC #15006
+# See GHC #15006, #19423
 mathjax_path = 'file:///usr/share/javascript/mathjax/MathJax.js'
 
 # If true, an OpenSearch description file will be output, and all pages will
@@ -100,6 +101,9 @@ latex_elements = {
 \setromanfont{DejaVu Serif}
 \setmonofont{DejaVu Sans Mono}
 \setlength{\tymin}{45pt}
+
+% Dynamic section number spacing. Fixes #18554
+\renewcommand{\numberline}[1]{#1~}
 
 % Avoid a torrent of over-full \hbox warnings
 \usepackage{microtype}

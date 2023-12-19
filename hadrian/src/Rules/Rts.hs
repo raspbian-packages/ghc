@@ -1,6 +1,6 @@
 module Rules.Rts (rtsRules, needRtsLibffiTargets, needRtsSymLinks) where
 
-import Packages (rts, rtsBuildPath, libffiBuildPath, libffiLibraryName, rtsContext)
+import Packages (rts, rtsBuildPath, libffiBuildPath, rtsContext)
 import Rules.Libffi
 import Hadrian.Utilities
 import Settings.Builders.Common
@@ -22,11 +22,13 @@ rtsRules = priority 3 $ do
             rtsLibFilePath'
 
     -- Libffi
-    forM_ [Stage1 ..] $ \ stage -> do
+    forM_ [Stage1, Stage2, Stage3 ] $ \ stage -> do
         let buildPath = root -/- buildDir (rtsContext stage)
 
         -- Header files
-        (fmap (buildPath -/-) libffiHeaderFiles) &%> const (copyLibffiHeaders stage)
+        -- See Note [Packaging libffi headers] in GHC.Driver.CodeOutput.
+        forM_ libffiHeaderFiles $ \header ->
+            buildPath -/- "include" -/- header %> copyLibffiHeader stage
 
         -- Static libraries.
         buildPath -/- "libCffi*.a"     %> copyLibffiStatic stage
@@ -41,18 +43,20 @@ withLibffi stage action = needLibffi stage
                         >> (join $ action <$> libffiBuildPath stage
                                           <*> rtsBuildPath    stage)
 
--- | Copy all header files wither from the system libffi or from the libffi
+-- | Copy a header files wither from the system libffi or from the libffi
 -- build dir to the rts build dir.
-copyLibffiHeaders :: Stage -> Action ()
-copyLibffiHeaders stage = do
-    rtsPath      <- rtsBuildPath stage
+--
+-- See Note [Packaging libffi headers] in GHC.Driver.CodeOutput.
+copyLibffiHeader :: Stage -> FilePath -> Action ()
+copyLibffiHeader stage header = do
     useSystemFfi <- flag UseSystemFfi
-    (fromStr, headers) <- if useSystemFfi
-        then ("system",) <$> libffiSystemHeaders
+    (fromStr, headerDir) <- if useSystemFfi
+        then ("system",) <$> libffiSystemHeaderDir
         else needLibffi stage
-          >> ("custom",) <$> libffiHeaders stage
-    forM_ headers $ \ header -> copyFile header
-                                         (rtsPath -/- takeFileName header)
+          >> ("custom",) <$> libffiHeaderDir stage
+    copyFile
+        (headerDir -/- takeFileName header)
+        header
     putSuccess $ "| Successfully copied " ++ fromStr ++ " FFI library header "
                 ++ "files to RTS build directory."
 
@@ -103,7 +107,7 @@ copyLibffiDynamicWin stage target = do
 
 rtsLibffiLibrary :: Stage -> Way -> Action FilePath
 rtsLibffiLibrary stage way = do
-    name    <- libffiLibraryName
+    name    <- interpretInContext (rtsContext stage) libffiName
     suf     <- libsuf stage way
     rtsPath <- rtsBuildPath stage
     return $ rtsPath -/- "lib" ++ name ++ suf
@@ -117,18 +121,15 @@ needRtsLibffiTargets stage = do
     useSystemFfi <- flag UseSystemFfi
 
     -- Header files (in the rts build dir).
-    let headers = fmap (rtsPath -/-) libffiHeaderFiles
+    let headers = fmap ((rtsPath -/- "include") -/-) libffiHeaderFiles
 
     if useSystemFfi
-    then return headers
+    then return []
     else do
         -- Need Libffi
         -- This returns the dynamic library files (in the Libffi build dir).
         needLibffi stage
         dynLibffSource <- askLibffilDynLibs stage
-
-        -- Header files (in the rts build dir).
-        let headers = fmap (rtsPath -/-) libffiHeaderFiles
 
         -- Dynamic library files (in the rts build dir).
         let dynLibffis = fmap (\ lib -> rtsPath -/- takeFileName lib)

@@ -31,8 +31,6 @@ quantification in types. For example, all the following types are legal: ::
 
         f3 :: ((forall a. a->a) -> Int) -> Bool -> Bool
 
-        f4 :: Int -> (forall a. a -> a)
-
 Here, ``f1`` and ``g1`` are rank-1 types, and can be written in standard
 Haskell (e.g. ``f1 :: a->b->a``). The ``forall`` makes explicit the
 universal quantification that is implicitly added by Haskell.
@@ -50,21 +48,15 @@ types. That is, you can nest ``forall``\ s arbitrarily deep in function
 arrows. For example, a forall-type (also called a "type scheme"),
 including a type-class context, is legal:
 
--  On the left or right (see ``f4``, for example) of a function arrow
+-  On the left or right of a function arrow.
 
 -  As the argument of a constructor, or type of a field, in a data type
    declaration. For example, any of the ``f1, f2, f3, g1, g2`` above would
    be valid field type signatures.
 
--  As the type of an implicit parameter
+-  As the type of an implicit parameter.
 
--  In a pattern type signature (see :ref:`scoped-type-variables`)
-
-The :extension:`RankNTypes` option is also required for any type with a
-``forall`` or context to the right of an arrow (e.g.
-``f :: Int -> forall a. a->a``, or ``g :: Int -> Ord a => a -> a``).
-Such types are technically rank 1, but are clearly not Haskell-98, and
-an extra extension did not seem worth the bother.
+-  In a pattern type signature (see :ref:`scoped-type-variables`).
 
 In particular, in ``data`` and ``newtype`` declarations the constructor
 arguments may be polymorphic types of any rank; see examples in
@@ -72,6 +64,24 @@ arguments may be polymorphic types of any rank; see examples in
 monomorphic. This is important because by default GHC will not
 instantiate type variables to a polymorphic type
 (:ref:`impredicative-polymorphism`).
+
+Note that the :extension:`RankNTypes` option is also required for any type
+with a ``forall`` or context to the right of an arrow. For example: ::
+
+        h1  :: Int -> (forall a. a -> a)
+        h1' :: forall a. Int -> (a -> a)
+
+        k1  :: Int -> Ord a => a -> a
+        k1' :: Ord a => Int -> a -> a
+
+The function ``h1`` has a rank-1 type; it has the same behaviour as ``h1'``,
+except with a different order of arguments. This matters if one were to specify
+the type explicitly using a visible type application (using :extension:`TypeApplications`):
+we would write ``h1 3 @Bool True`` but ``h1' @Bool 3 True``.
+Similarly, ``k1`` has a rank-1 type; it differs from ``k1'`` only in the order of
+arguments. As the types of ``h1`` and ``k1`` are not allowed in Haskell-98, we also
+require users to enable :extension:`RankNTypes` to write them (which seems more
+sensible than inventing a separate extension just for this case).
 
 The obsolete language option :extension:`Rank2Types` is a synonym for
 :extension:`RankNTypes`. They used to specify finer distinctions that GHC no
@@ -157,7 +167,7 @@ In the function ``h`` we use the record selectors ``return`` and
 ``MonadT`` data structure, rather than using pattern matching.
 
 
-.. _simple-subsumption:
+.. _subsumption:
 
 Subsumption
 -------------
@@ -195,13 +205,43 @@ Similarly ``f4 g4`` is not well typed, because the constraints appear in a diffe
 These examples can be made to typecheck by eta-expansion. For example ``f3 (\x -> g3b x)``
 is well typed, and similarly ``f3 (\x -> g3c x)`` and ``f4 (\x -> g4 x)``.
 
-Historical note.  Earlier versions of GHC allowed these now-rejected applications, by inserting
-automatic eta-expansions, as described in Section 4.6 of `Practical type inference for arbitrary-aank types <https://www.microsoft.com/en-us/research/publication/practical-type-inference-for-arbitrary-rank-types/>`__, where it is
-called "deep skolemisation".
-But these automatic eta-expansions may silently change the semantics of the user's program,
-and deep skolemisation was removed from the language by
-`GHC Proposal #287 <https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0287-simplify-subsumption.rst>`__.
-This proposal has many more examples.
+A similar phenomenon occurs for operator sections. For example,
+``(\`g3a\` "hello")`` is not well typed, but it can be made to typecheck by eta
+expanding it to ``\x -> x \`g3a\` "hello"``.
+
+.. extension:: DeepSubsumption
+    :shortdesc: Enable deep subsumption
+
+    :since: 9.2.4
+
+    Relax the simple subsumption rules, implicitly inserting eta-expansions
+    when matching up function types with different quantification structures.
+
+The :extension:`DeepSubsumption` extension relaxes the aforementioned requirement that
+foralls must appear in the same place. GHC will instead automatically rewrite expressions
+like ``f x`` of type ``ty1 -> ty2`` to become ``(\ (y :: ty1) -> f x y)``; this is called eta-expansion.
+See Section 4.6 of
+`Practical type inference for arbitrary-rank types <https://www.microsoft.com/en-us/research/publication/practical-type-inference-for-arbitrary-rank-types/>`__,
+where this process is called "deep skolemisation".
+
+Note that these eta-expansions may silently change the semantics of the user's program: ::
+
+  h1 :: Int -> forall a. a -> a
+  h1 = undefined
+  h2 :: forall b. Int -> b -> b
+  h2 = h1
+
+With :extension:`DeepSubsumption`, GHC will accept these definitions,
+inserting an implicit eta-expansion: ::
+
+  h2 = \ i -> h1 i
+
+This means that ``h2 `seq` ()`` will not crash, even though ``h1 `seq` ()`` does crash.
+
+Historical note: Deep skolemisation was initially removed from the language by
+`GHC Proposal #287 <https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0287-simplify-subsumption.rst>`__,
+but was re-introduced as part of the :extension:`DeepSubsumption` extension following
+`GHC Proposal #511 <https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0511-deep-subsumption.rst>`__.
 
 .. _higher-rank-type-inference:
 

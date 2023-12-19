@@ -7,9 +7,8 @@ import GHC.Prelude
 import GHC.Cmm.CLabel
 import GHC.Cmm.Expr        ( GlobalReg(..) )
 import GHC.Settings.Config ( cProjectName, cProjectVersion )
-import GHC.Core            ( Tickish(..) )
+import GHC.Types.Tickish   ( CmmTickish, GenTickish(..) )
 import GHC.Cmm.DebugBlock
-import GHC.Driver.Session
 import GHC.Unit.Module
 import GHC.Utils.Outputable
 import GHC.Platform
@@ -18,6 +17,7 @@ import GHC.Types.Unique.Supply
 
 import GHC.CmmToAsm.Dwarf.Constants
 import GHC.CmmToAsm.Dwarf.Types
+import GHC.CmmToAsm.Config
 
 import Control.Arrow    ( first )
 import Control.Monad    ( mfilter )
@@ -32,28 +32,27 @@ import qualified GHC.Cmm.Dataflow.Label as H
 import qualified GHC.Cmm.Dataflow.Collections as H
 
 -- | Generate DWARF/debug information
-dwarfGen :: DynFlags -> ModLocation -> UniqSupply -> [DebugBlock]
+dwarfGen :: NCGConfig -> ModLocation -> UniqSupply -> [DebugBlock]
             -> IO (SDoc, UniqSupply)
-dwarfGen _  _      us [] = return (empty, us)
-dwarfGen df modLoc us blocks = do
-  let platform = targetPlatform df
+dwarfGen _      _      us []     = return (empty, us)
+dwarfGen config modLoc us blocks = do
+  let platform = ncgPlatform config
 
   -- Convert debug data structures to DWARF info records
-  -- We strip out block information when running with -g0 or -g1.
   let procs = debugSplitProcs blocks
       stripBlocks dbg
-        | debugLevel df < 2 = dbg { dblBlocks = [] }
-        | otherwise         = dbg
+        | ncgDwarfStripBlockInfo config = dbg { dblBlocks = [] }
+        | otherwise                     = dbg
   compPath <- getCurrentDirectory
   let lowLabel = dblCLabel $ head procs
-      highLabel = mkAsmTempEndLabel $ dblCLabel $ last procs
+      highLabel = mkAsmTempProcEndLabel $ dblCLabel $ last procs
       dwarfUnit = DwarfCompileUnit
-        { dwChildren = map (procToDwarf df) (map stripBlocks procs)
+        { dwChildren = map (procToDwarf config) (map stripBlocks procs)
         , dwName = fromMaybe "" (ml_hs_file modLoc)
         , dwCompDir = addTrailingPathSeparator compPath
         , dwProducer = cProjectName ++ " " ++ cProjectVersion
-        , dwLowLabel = lowLabel
-        , dwHighLabel = highLabel
+        , dwLowLabel = pdoc platform lowLabel
+        , dwHighLabel = pdoc platform highLabel
         , dwLineLabel = dwarfLineLabel
         }
 
@@ -70,27 +69,27 @@ dwarfGen df modLoc us blocks = do
   -- .debug_info section: Information records on procedures and blocks
   let -- unique to identify start and end compilation unit .debug_inf
       (unitU, us') = takeUniqFromSupply us
-      infoSct = vcat [ ptext dwarfInfoLabel <> colon
+      infoSct = vcat [ dwarfInfoLabel <> colon
                      , dwarfInfoSection platform
                      , compileUnitHeader platform unitU
                      , pprDwarfInfo platform haveSrc dwarfUnit
-                     , compileUnitFooter unitU
+                     , compileUnitFooter platform unitU
                      ]
 
   -- .debug_line section: Generated mainly by the assembler, but we
   -- need to label it
   let lineSct = dwarfLineSection platform $$
-                ptext dwarfLineLabel <> colon
+                dwarfLineLabel <> colon
 
   -- .debug_frame section: Information about the layout of the GHC stack
   let (framesU, us'') = takeUniqFromSupply us'
       frameSct = dwarfFrameSection platform $$
-                 ptext dwarfFrameLabel <> colon $$
+                 dwarfFrameLabel <> colon $$
                  pprDwarfFrame platform (debugFrame framesU procs)
 
   -- .aranges section: Information about the bounds of compilation units
-  let aranges' | gopt Opt_SplitSections df = map mkDwarfARange procs
-               | otherwise                 = [DwarfARange lowLabel highLabel]
+  let aranges' | ncgSplitSections config = map mkDwarfARange procs
+               | otherwise               = [DwarfARange lowLabel highLabel]
   let aranges = dwarfARangesSection platform $$ pprDwarfARanges platform aranges' unitU
 
   return (infoSct $$ abbrevSct $$ lineSct $$ frameSct $$ aranges, us'')
@@ -100,31 +99,31 @@ dwarfGen df modLoc us blocks = do
 -- scattered in the final binary. Without split sections, we could make a
 -- single arange based on the first/last proc.
 mkDwarfARange :: DebugBlock -> DwarfARange
-mkDwarfARange proc = DwarfARange start end
+mkDwarfARange proc = DwarfARange lbl end
   where
-    start = dblCLabel proc
-    end = mkAsmTempEndLabel start
+    lbl = dblCLabel proc
+    end = mkAsmTempProcEndLabel lbl
 
 -- | Header for a compilation unit, establishing global format
 -- parameters
 compileUnitHeader :: Platform -> Unique -> SDoc
 compileUnitHeader platform unitU =
   let cuLabel = mkAsmTempLabel unitU  -- sits right before initialLength field
-      length = ppr (mkAsmTempEndLabel cuLabel) <> char '-' <> ppr cuLabel
+      length = pdoc platform (mkAsmTempEndLabel cuLabel) <> char '-' <> pdoc platform cuLabel
                <> text "-4"       -- length of initialLength field
-  in vcat [ ppr cuLabel <> colon
+  in vcat [ pdoc platform cuLabel <> colon
           , text "\t.long " <> length  -- compilation unit size
           , pprHalf 3                          -- DWARF version
-          , sectionOffset platform (ptext dwarfAbbrevLabel) (ptext dwarfAbbrevLabel)
+          , sectionOffset platform dwarfAbbrevLabel dwarfAbbrevLabel
                                                -- abbrevs offset
           , text "\t.byte " <> ppr (platformWordSizeInBytes platform) -- word size
           ]
 
 -- | Compilation unit footer, mainly establishing size of debug sections
-compileUnitFooter :: Unique -> SDoc
-compileUnitFooter unitU =
+compileUnitFooter :: Platform -> Unique -> SDoc
+compileUnitFooter platform unitU =
   let cuEndLabel = mkAsmTempEndLabel $ mkAsmTempLabel unitU
-  in ppr cuEndLabel <> colon
+  in pdoc platform cuEndLabel <> colon
 
 -- | Splits the blocks by procedures. In the result all nested blocks
 -- will come from the same procedure as the top-level block. See
@@ -149,7 +148,7 @@ debugSplitProcs b = concat $ H.mapElems $ mergeMaps $ map (split Nothing) b
 
 {-
 Note [Splitting DebugBlocks]
-
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 DWARF requires that we break up the nested DebugBlocks produced from
 the C-- AST. For instance, we begin with tick trees containing nested procs.
 For example,
@@ -175,12 +174,12 @@ parent, B.
 -}
 
 -- | Generate DWARF info for a procedure debug block
-procToDwarf :: DynFlags -> DebugBlock -> DwarfInfo
-procToDwarf df prc
-  = DwarfSubprogram { dwChildren = map blockToDwarf (dblBlocks prc)
+procToDwarf :: NCGConfig -> DebugBlock -> DwarfInfo
+procToDwarf config prc
+  = DwarfSubprogram { dwChildren = map (blockToDwarf config) (dblBlocks prc)
                     , dwName     = case dblSourceTick prc of
                          Just s@SourceNote{} -> sourceName s
-                         _otherwise -> showSDocDump df $ ppr $ dblLabel prc
+                         _otherwise -> show (dblLabel prc)
                     , dwLabel    = dblCLabel prc
                     , dwParent   = fmap mkAsmTempDieLabel
                                    $ mfilter goodParent
@@ -190,25 +189,28 @@ procToDwarf df prc
   goodParent a | a == dblCLabel prc = False
                -- Omit parent if it would be self-referential
   goodParent a | not (externallyVisibleCLabel a)
-               , debugLevel df < 2 = False
-               -- We strip block information when running -g0 or -g1, don't
-               -- refer to blocks in that case. Fixes #14894.
+               , ncgDwarfStripBlockInfo config = False
+               -- If we strip block information, don't refer to blocks.
+               -- Fixes #14894.
   goodParent _ = True
 
 -- | Generate DWARF info for a block
-blockToDwarf :: DebugBlock -> DwarfInfo
-blockToDwarf blk
-  = DwarfBlock { dwChildren = concatMap tickToDwarf (dblTicks blk)
-                              ++ map blockToDwarf (dblBlocks blk)
+blockToDwarf :: NCGConfig -> DebugBlock -> DwarfInfo
+blockToDwarf config blk
+  = DwarfBlock { dwChildren = map (blockToDwarf config) (dblBlocks blk) ++ srcNotes
                , dwLabel    = dblCLabel blk
                , dwMarker   = marker
                }
   where
+    srcNotes
+      | ncgDwarfSourceNotes config = concatMap tickToDwarf (dblTicks blk)
+      | otherwise                  = []
+
     marker
       | Just _ <- dblPosition blk = Just $ mkAsmTempLabel $ dblLabel blk
       | otherwise                 = Nothing   -- block was optimized out
 
-tickToDwarf :: Tickish () -> [DwarfInfo]
+tickToDwarf :: CmmTickish -> [DwarfInfo]
 tickToDwarf  (SourceNote ss _) = [DwarfSrcNote ss]
 tickToDwarf _ = []
 
@@ -243,7 +245,7 @@ procToFrame initUws blk
           where uws'   = addDefaultUnwindings initUws uws
                 nested = concatMap flatten blocks
 
-        -- | If the current procedure has an info table, then we also say that
+        -- If the current procedure has an info table, then we also say that
         -- its first block has one to ensure that it gets the necessary -1
         -- offset applied to its start address.
         -- See Note [Info Offset] in "GHC.CmmToAsm.Dwarf.Types".

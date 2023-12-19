@@ -1,5 +1,3 @@
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE TypeFamilies #-}
 
 -----------------------------------------------------------------------------
@@ -17,95 +15,106 @@ module GHC.Parser.Header
    , mkPrelImports -- used by the renamer too
    , getOptionsFromFile
    , getOptions
-   , optionsErrorMsgs
+   , toArgs
    , checkProcessArgsResult
    )
 where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
-import GHC.Platform
-import GHC.Driver.Types
+import GHC.Data.Bag
+
+import GHC.Driver.Errors.Types -- Unfortunate, needed due to the fact we throw exceptions!
+
+import GHC.Parser.Errors.Types
 import GHC.Parser           ( parseHeader )
 import GHC.Parser.Lexer
-import GHC.Data.FastString
+
 import GHC.Hs
 import GHC.Unit.Module
 import GHC.Builtin.Names
-import GHC.Data.StringBuffer
+
+import GHC.Types.Error
 import GHC.Types.SrcLoc
-import GHC.Driver.Session
-import GHC.Utils.Error
+import GHC.Types.SourceError
+import GHC.Types.SourceText
+import GHC.Types.PkgQual
+
 import GHC.Utils.Misc
-import GHC.Utils.Outputable as Outputable
-import GHC.Data.Maybe
-import GHC.Data.Bag         ( emptyBag, listToBag, unitBag )
+import GHC.Utils.Panic
 import GHC.Utils.Monad
+import GHC.Utils.Error
 import GHC.Utils.Exception as Exception
-import GHC.Types.Basic
-import qualified GHC.LanguageExtensions as LangExt
+
+import GHC.Data.StringBuffer
+import GHC.Data.Maybe
+import GHC.Data.FastString
+import qualified GHC.Data.Strict as Strict
 
 import Control.Monad
 import System.IO
 import System.IO.Unsafe
-import Data.List
+import Data.List (partition)
+import Data.Char (isSpace)
+import Text.ParserCombinators.ReadP (readP_to_S, gather)
+import Text.ParserCombinators.ReadPrec (readPrec_to_P)
+import Text.Read (readPrec)
 
 ------------------------------------------------------------------------------
 
 -- | Parse the imports of a source file.
 --
 -- Throws a 'SourceError' if parsing fails.
-getImports :: DynFlags
+getImports :: ParserOpts   -- ^ Parser options
+           -> Bool         -- ^ Implicit Prelude?
            -> StringBuffer -- ^ Parse this.
            -> FilePath     -- ^ Filename the buffer came from.  Used for
                            --   reporting parse error locations.
            -> FilePath     -- ^ The original source filename (used for locations
                            --   in the function result)
            -> IO (Either
-               ErrorMessages
-               ([(Maybe FastString, Located ModuleName)],
-                [(Maybe FastString, Located ModuleName)],
+               (Messages PsMessage)
+               ([(RawPkgQual, Located ModuleName)],
+                [(RawPkgQual, Located ModuleName)],
+                Bool, -- Is GHC.Prim imported or not
                 Located ModuleName))
               -- ^ The source imports and normal imports (with optional package
               -- names from -XPackageImports), and the module name.
-getImports dflags buf filename source_filename = do
+getImports popts implicit_prelude buf filename source_filename = do
   let loc  = mkRealSrcLoc (mkFastString filename) 1 1
-  case unP parseHeader (mkPState dflags buf loc) of
+  case unP parseHeader (initParserState popts buf loc) of
     PFailed pst ->
         -- assuming we're not logging warnings here as per below
-      return $ Left $ getErrorMessages pst dflags
+      return $ Left $ getPsErrorMessages pst
     POk pst rdr_module -> fmap Right $ do
-      let _ms@(_warns, errs) = getMessages pst dflags
+      let (_warns, errs) = getPsMessages pst
       -- don't log warnings: they'll be reported when we parse the file
       -- for real.  See #2500.
-          ms = (emptyBag, errs)
-      -- logWarnings warns
-      if errorsFound dflags ms
-        then throwIO $ mkSrcErr errs
+      if not (isEmptyMessages errs)
+        then throwErrors (GhcPsMessage <$> errs)
         else
           let   hsmod = unLoc rdr_module
                 mb_mod = hsmodName hsmod
                 imps = hsmodImports hsmod
                 main_loc = srcLocSpan (mkSrcLoc (mkFastString source_filename)
                                        1 1)
-                mod = mb_mod `orElse` L main_loc mAIN_NAME
+                mod = mb_mod `orElse` L (noAnnSrcSpan main_loc) mAIN_NAME
                 (src_idecls, ord_idecls) = partition ((== IsBoot) . ideclSource . unLoc) imps
 
                -- GHC.Prim doesn't exist physically, so don't go looking for it.
-                ordinary_imps = filter ((/= moduleName gHC_PRIM) . unLoc
-                                        . ideclName . unLoc)
-                                       ord_idecls
+                (ordinary_imps, ghc_prim_import)
+                  = partition ((/= moduleName gHC_PRIM) . unLoc
+                                  . ideclName . unLoc)
+                                 ord_idecls
 
-                implicit_prelude = xopt LangExt.ImplicitPrelude dflags
                 implicit_imports = mkPrelImports (unLoc mod) main_loc
                                                  implicit_prelude imps
-                convImport (L _ i) = (fmap sl_fs (ideclPkgQual i), ideclName i)
+                convImport (L _ i) = (ideclPkgQual i, reLoc $ ideclName i)
               in
-              return (map convImport src_idecls,
-                      map convImport (implicit_imports ++ ordinary_imps),
-                      mod)
+              return (map convImport src_idecls
+                     , map convImport (implicit_imports ++ ordinary_imps)
+                     , not (null ghc_prim_import)
+                     , reLoc mod)
 
 mkPrelImports :: ModuleName
               -> SrcSpan    -- Attribute the "import Prelude" to this location
@@ -123,24 +132,29 @@ mkPrelImports this_mod loc implicit_prelude import_decls
   = []
   | otherwise = [preludeImportDecl]
   where
-      explicit_prelude_import
-       = notNull [ () | L _ (ImportDecl { ideclName = mod
-                                        , ideclPkgQual = Nothing })
-                          <- import_decls
-                      , unLoc mod == pRELUDE_NAME ]
+      explicit_prelude_import = any is_prelude_import import_decls
 
+      is_prelude_import (L _ decl) =
+        unLoc (ideclName decl) == pRELUDE_NAME
+        -- allow explicit "base" package qualifier (#19082, #17045)
+        && case ideclPkgQual decl of
+            NoRawPkgQual -> True
+            RawPkgQual b -> sl_fs b == unitIdFS baseUnitId
+
+
+      loc' = noAnnSrcSpan loc
       preludeImportDecl :: LImportDecl GhcPs
       preludeImportDecl
-        = L loc $ ImportDecl { ideclExt       = noExtField,
-                               ideclSourceSrc = NoSourceText,
-                               ideclName      = L loc pRELUDE_NAME,
-                               ideclPkgQual   = Nothing,
-                               ideclSource    = NotBoot,
-                               ideclSafe      = False,  -- Not a safe import
-                               ideclQualified = NotQualified,
-                               ideclImplicit  = True,   -- Implicit!
-                               ideclAs        = Nothing,
-                               ideclHiding    = Nothing  }
+        = L loc' $ ImportDecl { ideclExt       = noAnn,
+                                ideclSourceSrc = NoSourceText,
+                                ideclName      = L loc' pRELUDE_NAME,
+                                ideclPkgQual   = NoRawPkgQual,
+                                ideclSource    = NotBoot,
+                                ideclSafe      = False,  -- Not a safe import
+                                ideclQualified = NotQualified,
+                                ideclImplicit  = True,   -- Implicit!
+                                ideclAs        = Nothing,
+                                ideclHiding    = Nothing  }
 
 --------------------------------------------------------------
 -- Get options
@@ -149,17 +163,19 @@ mkPrelImports this_mod loc implicit_prelude import_decls
 -- | Parse OPTIONS and LANGUAGE pragmas of the source file.
 --
 -- Throws a 'SourceError' if flag parsing fails (including unsupported flags.)
-getOptionsFromFile :: DynFlags
+getOptionsFromFile :: ParserOpts
                    -> FilePath            -- ^ Input file
-                   -> IO [Located String] -- ^ Parsed options, if any.
-getOptionsFromFile dflags filename
+                   -> IO (Messages PsMessage, [Located String]) -- ^ Parsed options, if any.
+getOptionsFromFile opts filename
     = Exception.bracket
               (openBinaryFile filename ReadMode)
               (hClose)
               (\handle -> do
-                  opts <- fmap (getOptions' dflags)
-                               (lazyGetToks dflags' filename handle)
-                  seqList opts $ return opts)
+                  (warns, opts) <- fmap (getOptions' opts)
+                               (lazyGetToks opts' filename handle)
+                  seqList opts
+                    $ seqList (bagToList $ getMessages warns)
+                    $ return (warns, opts))
     where -- We don't need to get haddock doc tokens when we're just
           -- getting the options from pragmas, and lazily lexing them
           -- correctly is a little tricky: If there is "\n" or "\n-"
@@ -168,21 +184,22 @@ getOptionsFromFile dflags filename
           -- we already have an apparently-complete token.
           -- We therefore just turn Opt_Haddock off when doing the lazy
           -- lex.
-          dflags' = gopt_unset dflags Opt_Haddock
+          opts' = disableHaddock opts
 
 blockSize :: Int
 -- blockSize = 17 -- for testing :-)
 blockSize = 1024
 
-lazyGetToks :: DynFlags -> FilePath -> Handle -> IO [Located Token]
-lazyGetToks dflags filename handle = do
+lazyGetToks :: ParserOpts -> FilePath -> Handle -> IO [Located Token]
+lazyGetToks popts filename handle = do
   buf <- hGetStringBufferBlock handle blockSize
-  unsafeInterleaveIO $ lazyLexBuf handle (pragState dflags buf loc) False blockSize
+  let prag_state = initPragState popts buf loc
+  unsafeInterleaveIO $ lazyLexBuf handle prag_state False blockSize
  where
   loc  = mkRealSrcLoc (mkFastString filename) 1 1
 
   lazyLexBuf :: Handle -> PState -> Bool -> Int -> IO [Located Token]
-  lazyLexBuf handle state eof size = do
+  lazyLexBuf handle state eof size =
     case unP (lexer False return) state of
       POk state' t -> do
         -- pprTrace "lazyLexBuf" (text (show (buffer state'))) (return ())
@@ -212,9 +229,10 @@ lazyGetToks dflags filename handle = do
        unsafeInterleaveIO $ lazyLexBuf handle state{buffer=newbuf} False new_size
 
 
-getToks :: DynFlags -> FilePath -> StringBuffer -> [Located Token]
-getToks dflags filename buf = lexAll (pragState dflags buf loc)
+getToks :: ParserOpts -> FilePath -> StringBuffer -> [Located Token]
+getToks popts filename buf = lexAll pstate
  where
+  pstate = initPragState popts buf loc
   loc  = mkRealSrcLoc (mkFastString filename) 1 1
 
   lexAll state = case unP (lexer False return) state of
@@ -226,69 +244,187 @@ getToks dflags filename buf = lexAll (pragState dflags buf loc)
 -- | Parse OPTIONS and LANGUAGE pragmas of the source file.
 --
 -- Throws a 'SourceError' if flag parsing fails (including unsupported flags.)
-getOptions :: DynFlags
+getOptions :: ParserOpts
            -> StringBuffer -- ^ Input Buffer
            -> FilePath     -- ^ Source filename.  Used for location info.
-           -> [Located String] -- ^ Parsed options.
-getOptions dflags buf filename
-    = getOptions' dflags (getToks dflags filename buf)
+           -> (Messages PsMessage,[Located String]) -- ^ warnings and parsed options.
+getOptions opts buf filename
+    = getOptions' opts (getToks opts filename buf)
 
 -- The token parser is written manually because Happy can't
 -- return a partial result when it encounters a lexer error.
 -- We want to extract options before the buffer is passed through
 -- CPP, so we can't use the same trick as 'getImports'.
-getOptions' :: DynFlags
+getOptions' :: ParserOpts
             -> [Located Token]      -- Input buffer
-            -> [Located String]     -- Options.
-getOptions' dflags toks
+            -> (Messages PsMessage,[Located String])     -- Options.
+getOptions' opts toks
     = parseToks toks
     where
           parseToks (open:close:xs)
               | IToptions_prag str <- unLoc open
               , ITclose_prag       <- unLoc close
-              = case toArgs str of
-                  Left _err -> optionsParseError str dflags $   -- #15053
+              = case toArgs starting_loc str of
+                  Left _err -> optionsParseError str $   -- #15053
                                  combineSrcSpans (getLoc open) (getLoc close)
-                  Right args -> map (L (getLoc open)) args ++ parseToks xs
+                  Right args -> fmap (args ++) (parseToks xs)
+            where
+              src_span      = getLoc open
+              real_src_span = expectJust "getOptions'" (srcSpanToRealSrcSpan src_span)
+              starting_loc  = realSrcSpanStart real_src_span
           parseToks (open:close:xs)
               | ITinclude_prag str <- unLoc open
               , ITclose_prag       <- unLoc close
-              = map (L (getLoc open)) ["-#include",removeSpaces str] ++
-                parseToks xs
+              = fmap (map (L (getLoc open)) ["-#include",removeSpaces str] ++)
+                     (parseToks xs)
           parseToks (open:close:xs)
-              | ITdocOptions str <- unLoc open
-              , ITclose_prag     <- unLoc close
-              = map (L (getLoc open)) ["-haddock-opts", removeSpaces str]
-                ++ parseToks xs
+              | ITdocOptions str _ <- unLoc open
+              , ITclose_prag       <- unLoc close
+              = fmap (map (L (getLoc open)) ["-haddock-opts", removeSpaces str] ++)
+                     (parseToks xs)
           parseToks (open:xs)
               | ITlanguage_prag <- unLoc open
               = parseLanguage xs
           parseToks (comment:xs) -- Skip over comments
               | isComment (unLoc comment)
               = parseToks xs
-          parseToks _ = []
+          -- At the end of the header, warn about all the misplaced pragmas
+          parseToks xs = (unionManyMessages $ mapMaybe mkMessage xs ,[])
+
           parseLanguage ((L loc (ITconid fs)):rest)
-              = checkExtension dflags (L loc fs) :
+              = fmap (checkExtension opts (L loc fs) :) $
                 case rest of
                   (L _loc ITcomma):more -> parseLanguage more
                   (L _loc ITclose_prag):more -> parseToks more
-                  (L loc _):_ -> languagePragParseError dflags loc
+                  (L loc _):_ -> languagePragParseError loc
                   [] -> panic "getOptions'.parseLanguage(1) went past eof token"
           parseLanguage (tok:_)
-              = languagePragParseError dflags (getLoc tok)
+              = languagePragParseError (getLoc tok)
           parseLanguage []
               = panic "getOptions'.parseLanguage(2) went past eof token"
+
+          -- Warn for all the misplaced pragmas
+          mkMessage :: Located Token -> Maybe (Messages PsMessage)
+          mkMessage (L loc token)
+            | IToptions_prag _ <- token
+            = Just (singleMessage $ mkPlainMsgEnvelope diag_opts loc (PsWarnMisplacedPragma OptionsPrag))
+            | ITinclude_prag _ <- token
+            = Just (singleMessage $ mkPlainMsgEnvelope diag_opts loc (PsWarnMisplacedPragma IncludePrag))
+            | ITdocOptions _ _ <- token
+            = Just (singleMessage $ mkPlainMsgEnvelope diag_opts loc (PsWarnMisplacedPragma DocOptionsPrag))
+            | ITlanguage_prag <- token
+            = Just (singleMessage $ mkPlainMsgEnvelope diag_opts loc (PsWarnMisplacedPragma LanguagePrag))
+            | otherwise = Nothing
+            where diag_opts = pDiagOpts opts
 
           isComment :: Token -> Bool
           isComment c =
             case c of
-              (ITlineComment {})     -> True
-              (ITblockComment {})    -> True
-              (ITdocCommentNext {})  -> True
-              (ITdocCommentPrev {})  -> True
-              (ITdocCommentNamed {}) -> True
-              (ITdocSection {})      -> True
-              _                      -> False
+              (ITlineComment {})  -> True
+              (ITblockComment {}) -> True
+              (ITdocComment {})   -> True
+              _                   -> False
+
+toArgs :: RealSrcLoc
+       -> String -> Either String   -- Error
+                           [Located String] -- Args
+toArgs starting_loc orig_str
+    = let (after_spaces_loc, after_spaces_str) = consume_spaces starting_loc orig_str in
+      case after_spaces_str of
+      '[':after_bracket ->
+        let after_bracket_loc = advanceSrcLoc after_spaces_loc '['
+            (after_bracket_spaces_loc, after_bracket_spaces_str)
+              = consume_spaces after_bracket_loc after_bracket in
+        case after_bracket_spaces_str of
+          ']':rest | all isSpace rest -> Right []
+          _ -> readAsList after_bracket_spaces_loc after_bracket_spaces_str
+
+      _ -> toArgs' after_spaces_loc after_spaces_str
+ where
+  consume_spaces :: RealSrcLoc -> String -> (RealSrcLoc, String)
+  consume_spaces loc [] = (loc, [])
+  consume_spaces loc (c:cs)
+    | isSpace c = consume_spaces (advanceSrcLoc loc c) cs
+    | otherwise = (loc, c:cs)
+
+  break_with_loc :: (Char -> Bool) -> RealSrcLoc -> String
+                 -> (String, RealSrcLoc, String)  -- location is start of second string
+  break_with_loc p = go []
+    where
+      go reversed_acc loc [] = (reverse reversed_acc, loc, [])
+      go reversed_acc loc (c:cs)
+        | p c       = (reverse reversed_acc, loc, c:cs)
+        | otherwise = go (c:reversed_acc) (advanceSrcLoc loc c) cs
+
+  advance_src_loc_many :: RealSrcLoc -> String -> RealSrcLoc
+  advance_src_loc_many = foldl' advanceSrcLoc
+
+  locate :: RealSrcLoc -> RealSrcLoc -> a -> Located a
+  locate begin end x = L (RealSrcSpan (mkRealSrcSpan begin end) Strict.Nothing) x
+
+  toArgs' :: RealSrcLoc -> String -> Either String [Located String]
+  -- Remove outer quotes:
+  -- > toArgs' "\"foo\" \"bar baz\""
+  -- Right ["foo", "bar baz"]
+  --
+  -- Keep inner quotes:
+  -- > toArgs' "-DFOO=\"bar baz\""
+  -- Right ["-DFOO=\"bar baz\""]
+  toArgs' loc s =
+    let (after_spaces_loc, after_spaces_str) = consume_spaces loc s in
+    case after_spaces_str of
+      [] -> Right []
+      '"' : _ -> do
+        -- readAsString removes outer quotes
+        (arg, new_loc, rest) <- readAsString after_spaces_loc after_spaces_str
+        check_for_space rest
+        (locate after_spaces_loc new_loc arg:)
+          `fmap` toArgs' new_loc rest
+      _ -> case break_with_loc (isSpace <||> (== '"')) after_spaces_loc after_spaces_str of
+            (argPart1, loc2, s''@('"':_)) -> do
+                (argPart2, loc3, rest) <- readAsString loc2 s''
+                check_for_space rest
+                -- show argPart2 to keep inner quotes
+                (locate after_spaces_loc loc3 (argPart1 ++ show argPart2):)
+                  `fmap` toArgs' loc3 rest
+            (arg, loc2, s'') -> (locate after_spaces_loc loc2 arg:)
+                                  `fmap` toArgs' loc2 s''
+
+  check_for_space :: String -> Either String ()
+  check_for_space [] = Right ()
+  check_for_space (c:_)
+    | isSpace c = Right ()
+    | otherwise = Left ("Whitespace expected after string in " ++ show orig_str)
+
+  reads_with_consumed :: Read a => String
+                      -> [((String, a), String)]
+                        -- ((consumed string, parsed result), remainder of input)
+  reads_with_consumed = readP_to_S (gather (readPrec_to_P readPrec 0))
+
+  readAsString :: RealSrcLoc
+               -> String
+               -> Either String (String, RealSrcLoc, String)
+  readAsString loc s = case reads_with_consumed s of
+                [((consumed, arg), rest)] ->
+                    Right (arg, advance_src_loc_many loc consumed, rest)
+                _ ->
+                    Left ("Couldn't read " ++ show s ++ " as String")
+
+   -- input has had the '[' stripped off
+  readAsList :: RealSrcLoc -> String -> Either String [Located String]
+  readAsList loc s = do
+    let (after_spaces_loc, after_spaces_str) = consume_spaces loc s
+    (arg, after_arg_loc, after_arg_str) <- readAsString after_spaces_loc after_spaces_str
+    let (after_arg_spaces_loc, after_arg_spaces_str)
+          = consume_spaces after_arg_loc after_arg_str
+    (locate after_spaces_loc after_arg_loc arg :) <$>
+      case after_arg_spaces_str of
+        ',':after_comma -> readAsList (advanceSrcLoc after_arg_spaces_loc ',') after_comma
+        ']':after_bracket
+          | all isSpace after_bracket
+          -> Right []
+        _ -> Left ("Couldn't read " ++ show ('[' : s) ++ " as [String]")
+             -- reinsert missing '[' for clarity.
 
 -----------------------------------------------------------------------------
 
@@ -296,66 +432,39 @@ getOptions' dflags toks
 --
 -- Throws a 'SourceError' if the input list is non-empty claiming that the
 -- input flags are unknown.
-checkProcessArgsResult :: MonadIO m => DynFlags -> [Located String] -> m ()
-checkProcessArgsResult dflags flags
+checkProcessArgsResult :: MonadIO m => [Located String] -> m ()
+checkProcessArgsResult flags
   = when (notNull flags) $
-      liftIO $ throwIO $ mkSrcErr $ listToBag $ map mkMsg flags
+      liftIO $ throwErrors $ foldMap (singleMessage . mkMsg) flags
     where mkMsg (L loc flag)
-              = mkPlainErrMsg dflags loc $
-                  (text "unknown flag in  {-# OPTIONS_GHC #-} pragma:" <+>
-                   text flag)
+              = mkPlainErrorMsgEnvelope loc $
+                GhcPsMessage $ PsHeaderMessage $ PsErrUnknownOptionsPragma flag
 
 -----------------------------------------------------------------------------
 
-checkExtension :: DynFlags -> Located FastString -> Located String
-checkExtension dflags (L l ext)
+checkExtension :: ParserOpts -> Located FastString -> Located String
+checkExtension opts (L l ext)
 -- Checks if a given extension is valid, and if so returns
 -- its corresponding flag. Otherwise it throws an exception.
-  = if ext' `elem` supported
+  = if ext' `elem` (pSupportedExts opts)
     then L l ("-X"++ext')
-    else unsupportedExtnError dflags l ext'
+    else unsupportedExtnError opts l ext'
   where
     ext' = unpackFS ext
-    supported = supportedLanguagesAndExtensions $ platformMini $ targetPlatform dflags
 
-languagePragParseError :: DynFlags -> SrcSpan -> a
-languagePragParseError dflags loc =
-    throwErr dflags loc $
-       vcat [ text "Cannot parse LANGUAGE pragma"
-            , text "Expecting comma-separated list of language options,"
-            , text "each starting with a capital letter"
-            , nest 2 (text "E.g. {-# LANGUAGE TemplateHaskell, GADTs #-}") ]
+languagePragParseError :: SrcSpan -> a
+languagePragParseError loc =
+    throwErr loc $ PsErrParseLanguagePragma
 
-unsupportedExtnError :: DynFlags -> SrcSpan -> String -> a
-unsupportedExtnError dflags loc unsup =
-    throwErr dflags loc $
-        text "Unsupported extension: " <> text unsup $$
-        if null suggestions then Outputable.empty else text "Perhaps you meant" <+> quotedListWithOr (map text suggestions)
-  where
-     supported = supportedLanguagesAndExtensions $ platformMini $ targetPlatform dflags
-     suggestions = fuzzyMatch unsup supported
+unsupportedExtnError :: ParserOpts -> SrcSpan -> String -> a
+unsupportedExtnError opts loc unsup =
+    throwErr loc $ PsErrUnsupportedExt unsup (pSupportedExts opts)
 
+optionsParseError :: String -> SrcSpan -> a     -- #15053
+optionsParseError str loc =
+  throwErr loc $ PsErrParseOptionsPragma str
 
-optionsErrorMsgs :: DynFlags -> [String] -> [Located String] -> FilePath -> Messages
-optionsErrorMsgs dflags unhandled_flags flags_lines _filename
-  = (emptyBag, listToBag (map mkMsg unhandled_flags_lines))
-  where unhandled_flags_lines :: [Located String]
-        unhandled_flags_lines = [ L l f
-                                | f <- unhandled_flags
-                                , L l f' <- flags_lines
-                                , f == f' ]
-        mkMsg (L flagSpan flag) =
-            GHC.Utils.Error.mkPlainErrMsg dflags flagSpan $
-                    text "unknown flag in  {-# OPTIONS_GHC #-} pragma:" <+> text flag
-
-optionsParseError :: String -> DynFlags -> SrcSpan -> a     -- #15053
-optionsParseError str dflags loc =
-  throwErr dflags loc $
-      vcat [ text "Error while parsing OPTIONS_GHC pragma."
-           , text "Expecting whitespace-separated list of GHC options."
-           , text "  E.g. {-# OPTIONS_GHC -Wall -O2 #-}"
-           , text ("Input was: " ++ show str) ]
-
-throwErr :: DynFlags -> SrcSpan -> SDoc -> a                -- #15053
-throwErr dflags loc doc =
-  throw $ mkSrcErr $ unitBag $ mkPlainErrMsg dflags loc doc
+throwErr :: SrcSpan -> PsHeaderMessage -> a                -- #15053
+throwErr loc ps_msg =
+  let msg = mkPlainErrorMsgEnvelope loc $ GhcPsMessage (PsHeaderMessage ps_msg)
+  in throw $ mkSrcErr $ singleMessage msg

@@ -5,7 +5,7 @@
 \section{@Vars@: Variables}
 -}
 
-{-# LANGUAGE CPP, FlexibleContexts, MultiWayIf, FlexibleInstances, DeriveDataTypeable,
+{-# LANGUAGE FlexibleContexts, MultiWayIf, FlexibleInstances, DeriveDataTypeable,
              PatternSynonyms, BangPatterns #-}
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns   #-}
 {-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
@@ -68,15 +68,17 @@ module GHC.Types.Var (
 
         -- * ArgFlags
         ArgFlag(Invisible,Required,Specified,Inferred),
-        isVisibleArgFlag, isInvisibleArgFlag, sameVis,
         AnonArgFlag(..), Specificity(..),
+        isVisibleArgFlag, isInvisibleArgFlag, isInferredArgFlag,
+        sameVis,
 
         -- * TyVar's
         VarBndr(..), TyCoVarBinder, TyVarBinder, InvisTVBinder, ReqTVBinder,
         binderVar, binderVars, binderArgFlag, binderType,
         mkTyCoVarBinder, mkTyCoVarBinders,
         mkTyVarBinder, mkTyVarBinders,
-        isTyVarBinder, tyVarSpecToBinder, tyVarSpecToBinders,
+        isTyVarBinder,
+        tyVarSpecToBinder, tyVarSpecToBinders, tyVarReqToBinder, tyVarReqToBinders,
         mapVarBndr, mapVarBndrs, lookupVarBndr,
 
         -- ** Constructing TyVar's
@@ -90,16 +92,13 @@ module GHC.Types.Var (
         updateTyVarKindM,
 
         nonDetCmpVar
-
-    ) where
-
-#include "HsVersions.h"
+        ) where
 
 import GHC.Prelude
 
 import {-# SOURCE #-}   GHC.Core.TyCo.Rep( Type, Kind, Mult )
 import {-# SOURCE #-}   GHC.Core.TyCo.Ppr( pprKind )
-import {-# SOURCE #-}   GHC.Tc.Utils.TcType( TcTyVarDetails, pprTcTyVarDetails, vanillaSkolemTv )
+import {-# SOURCE #-}   GHC.Tc.Utils.TcType( TcTyVarDetails, pprTcTyVarDetails, vanillaSkolemTvUnk )
 import {-# SOURCE #-}   GHC.Types.Id.Info( IdDetails, IdInfo, coVarDetails, isCoVarDetails,
                                            vanillaIdInfo, pprIdDetails )
 import {-# SOURCE #-}   GHC.Builtin.Types ( manyDataConTy )
@@ -109,6 +108,8 @@ import GHC.Types.Unique ( Uniquable, Unique, getKey, getUnique
 import GHC.Utils.Misc
 import GHC.Utils.Binary
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
 
 import Data.Data
 
@@ -406,13 +407,10 @@ setVarType id ty = id { varType = ty }
 -- abuse, ASSERTs that there is no multiplicity to update.
 updateVarType :: (Type -> Type) -> Var -> Var
 updateVarType upd var
-  | debugIsOn
   = case var of
-      Id { id_details = details } -> ASSERT( isCoVarDetails details )
+      Id { id_details = details } -> assert (isCoVarDetails details) $
                                      result
       _ -> result
-  | otherwise
-  = result
   where
     result = var { varType = upd (varType var) }
 
@@ -421,13 +419,10 @@ updateVarType upd var
 -- abuse, ASSERTs that there is no multiplicity to update.
 updateVarTypeM :: Monad m => (Type -> m Type) -> Var -> m Var
 updateVarTypeM upd var
-  | debugIsOn
   = case var of
-      Id { id_details = details } -> ASSERT( isCoVarDetails details )
+      Id { id_details = details } -> assert (isCoVarDetails details) $
                                      result
       _ -> result
-  | otherwise
-  = result
   where
     result = do { ty' <- upd (varType var)
                 ; return (var { varType = ty' }) }
@@ -466,12 +461,17 @@ pattern Specified = Invisible SpecifiedSpec
 
 -- | Does this 'ArgFlag' classify an argument that is written in Haskell?
 isVisibleArgFlag :: ArgFlag -> Bool
-isVisibleArgFlag Required = True
-isVisibleArgFlag _        = False
+isVisibleArgFlag af = not (isInvisibleArgFlag af)
 
 -- | Does this 'ArgFlag' classify an argument that is not written in Haskell?
 isInvisibleArgFlag :: ArgFlag -> Bool
-isInvisibleArgFlag = not . isVisibleArgFlag
+isInvisibleArgFlag (Invisible {}) = True
+isInvisibleArgFlag Required       = False
+
+isInferredArgFlag :: ArgFlag -> Bool
+-- More restrictive than isInvisibleArgFlag
+isInferredArgFlag (Invisible InferredSpec) = True
+isInferredArgFlag _                        = False
 
 -- | Do these denote the same level of visibility? 'Required'
 -- arguments are visible, others are not. So this function
@@ -595,20 +595,40 @@ Note [Types for coercions, predicates, and evidence]
 *                                                                      *
 ********************************************************************* -}
 
--- Variable Binder
---
--- VarBndr is polymorphic in both var and visibility fields.
--- Currently there are nine different uses of 'VarBndr':
---   * Var.TyVarBinder               = VarBndr TyVar ArgFlag
---   * Var.TyCoVarBinder             = VarBndr TyCoVar ArgFlag
---   * Var.InvisTVBinder             = VarBndr TyVar Specificity
---   * Var.ReqTVBinder               = VarBndr TyVar ()
---   * TyCon.TyConBinder             = VarBndr TyVar TyConBndrVis
---   * TyCon.TyConTyCoBinder         = VarBndr TyCoVar TyConBndrVis
---   * IfaceType.IfaceForAllBndr     = VarBndr IfaceBndr ArgFlag
---   * IfaceType.IfaceTyConBinder    = VarBndr IfaceBndr TyConBndrVis
---   * IfaceType.IfaceForAllSpecBndr = VarBndr IfaceBndr Specificity
+{- Note [The VarBndr type and its uses]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+VarBndr is polymorphic in both var and visibility fields.
+Currently there are nine different uses of 'VarBndr':
+
+* Var.TyCoVarBinder = VarBndr TyCoVar ArgFlag
+  Binder of a forall-type; see ForAllTy in GHC.Core.TyCo.Rep
+
+* Var.TyVarBinder = VarBndr TyVar ArgFlag
+  Subset of TyCoVarBinder when we are sure the binder is a TyVar
+
+* Var.InvisTVBinder = VarBndr TyVar Specificity
+  Specialised form of TyVarBinder, when ArgFlag = Invisible s
+  See GHC.Core.Type.splitForAllInvisTVBinders
+
+* Var.ReqTVBinder = VarBndr TyVar ()
+  Specialised form of TyVarBinder, when ArgFlag = Required
+  See GHC.Core.Type.splitForAllReqTVBinders
+  This one is barely used
+
+* TyCon.TyConBinder = VarBndr TyVar TyConBndrVis
+  Binders of a TyCon; see TyCon in GHC.Core.TyCon
+
+* TyCon.TyConTyCoBinder = VarBndr TyCoVar TyConBndrVis
+  Binders of a PromotedDataCon
+  See Note [Promoted GADT data constructors] in GHC.Core.TyCon
+
+* IfaceType.IfaceForAllBndr     = VarBndr IfaceBndr ArgFlag
+* IfaceType.IfaceForAllSpecBndr = VarBndr IfaceBndr Specificity
+* IfaceType.IfaceTyConBinder    = VarBndr IfaceBndr TyConBndrVis
+-}
+
 data VarBndr var argf = Bndr var argf
+  -- See Note [The VarBndr type and its uses]
   deriving( Data )
 
 -- | Variable Binder
@@ -626,8 +646,14 @@ type ReqTVBinder       = VarBndr TyVar   ()
 tyVarSpecToBinders :: [VarBndr a Specificity] -> [VarBndr a ArgFlag]
 tyVarSpecToBinders = map tyVarSpecToBinder
 
-tyVarSpecToBinder :: (VarBndr a Specificity) -> (VarBndr a ArgFlag)
+tyVarSpecToBinder :: VarBndr a Specificity -> VarBndr a ArgFlag
 tyVarSpecToBinder (Bndr tv vis) = Bndr tv (Invisible vis)
+
+tyVarReqToBinders :: [VarBndr a ()] -> [VarBndr a ArgFlag]
+tyVarReqToBinders = map tyVarReqToBinder
+
+tyVarReqToBinder :: VarBndr a () -> VarBndr a ArgFlag
+tyVarReqToBinder (Bndr tv _) = Bndr tv Required
 
 binderVar :: VarBndr tv argf -> tv
 binderVar (Bndr v _) = v
@@ -642,14 +668,14 @@ binderType :: VarBndr TyCoVar argf -> Type
 binderType (Bndr tv _) = varType tv
 
 -- | Make a named binder
-mkTyCoVarBinder :: vis -> TyCoVar -> (VarBndr TyCoVar vis)
+mkTyCoVarBinder :: vis -> TyCoVar -> VarBndr TyCoVar vis
 mkTyCoVarBinder vis var = Bndr var vis
 
 -- | Make a named binder
 -- 'var' should be a type variable
-mkTyVarBinder :: vis -> TyVar -> (VarBndr TyVar vis)
+mkTyVarBinder :: vis -> TyVar -> VarBndr TyVar vis
 mkTyVarBinder vis var
-  = ASSERT( isTyVar var )
+  = assert (isTyVar var) $
     Bndr var vis
 
 -- | Make many named binders
@@ -738,9 +764,10 @@ mkTcTyVar name kind details
         }
 
 tcTyVarDetails :: TyVar -> TcTyVarDetails
--- See Note [TcTyVars in the typechecker] in GHC.Tc.Utils.TcType
+-- See Note [TcTyVars and TyVars in the typechecker] in GHC.Tc.Utils.TcType
 tcTyVarDetails (TcTyVar { tc_tv_details = details }) = details
-tcTyVarDetails (TyVar {})                            = vanillaSkolemTv
+-- MP: This should never happen, but it does. Future work is to turn this into a panic.
+tcTyVarDetails (TyVar {})                            = vanillaSkolemTvUnk
 tcTyVarDetails var = pprPanic "tcTyVarDetails" (ppr var <+> dcolon <+> pprKind (tyVarKind var))
 
 setTcTyVarDetails :: TyVar -> TcTyVarDetails -> TyVar
@@ -814,7 +841,7 @@ setIdExported tv                               = pprPanic "setIdExported" (ppr t
 
 setIdNotExported :: Id -> Id
 -- ^ We can only do this to LocalIds
-setIdNotExported id = ASSERT( isLocalId id )
+setIdNotExported id = assert (isLocalId id) $
                       id { idScope = LocalId NotExported }
 
 -----------------------

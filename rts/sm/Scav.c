@@ -42,7 +42,7 @@
    - scavenge_one() scavenges only stack frame SRTs
    ------------------------------------------------------------------------- */
 
-#include "PosixSource.h"
+#include "rts/PosixSource.h"
 #include "Rts.h"
 
 #include "Storage.h"
@@ -103,7 +103,7 @@ scavengeTSO (StgTSO *tso)
 {
     bool saved_eager;
 
-    debugTrace(DEBUG_gc,"scavenging thread %d",(int)tso->id);
+    debugTrace(DEBUG_gc,"scavenging thread %" FMT_StgThreadID,tso->id);
 
     // update the pointer from the InCall.
     if (tso->bound != NULL) {
@@ -131,7 +131,6 @@ scavengeTSO (StgTSO *tso)
         || tso->why_blocked == BlockedOnMVarRead
         || tso->why_blocked == BlockedOnBlackHole
         || tso->why_blocked == BlockedOnMsgThrowTo
-        || tso->why_blocked == BlockedOnIOCompletion
         || tso->why_blocked == NotBlocked
         ) {
         evacuate(&tso->block_info.closure);
@@ -338,7 +337,8 @@ scavenge_PAP_payload (StgClosure *fun, StgClosure **payload, StgWord size)
     StgWord bitmap;
     const StgFunInfoTable *fun_info;
 
-    fun_info = get_fun_itbl(UNTAG_CONST_CLOSURE(fun));
+    fun = UNTAG_CLOSURE(fun);
+    fun_info = get_fun_itbl(fun);
     ASSERT(fun_info->i.type != PAP);
     p = (StgPtr)payload;
 
@@ -437,11 +437,11 @@ scavenge_block (bdescr *bd)
   saved_eager_promotion = gct->eager_promotion;
   gct->failed_to_evac = false;
 
-  ws = &gct->gens[bd->gen->no];
+  ws = &gct->gens[bd->gen_no];
 
   p = bd->u.scan;
 
-  // Sanity check: See Note [Deadlock detection under nonmoving collector].
+  // Sanity check: See Note [Deadlock detection under the nonmoving collector].
 #if defined(DEBUG)
   if (RtsFlags.GcFlags.useNonmoving && deadlock_detect_gc) {
       ASSERT(bd->gen == oldest_gen);
@@ -1859,7 +1859,7 @@ scavenge_stack(StgPtr p, StgPtr stack_end)
 
     case UPDATE_FRAME:
         // Note [upd-black-hole]
-        //
+        // ~~~~~~~~~~~~~~~~~~~~~
         // In SMP, we can get update frames that point to indirections
         // when two threads evaluate the same thunk.  We do attempt to
         // discover this situation in threadPaused(), but it's

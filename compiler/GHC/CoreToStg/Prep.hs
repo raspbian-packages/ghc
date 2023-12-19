@@ -1,13 +1,14 @@
+
+{-# LANGUAGE BangPatterns #-}
+
+{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
+
 {-
 (c) The University of Glasgow, 1994-2006
 
 
 Core pass to saturate constructors and PrimOps
 -}
-
-{-# LANGUAGE BangPatterns, CPP, MultiWayIf #-}
-
-{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 
 module GHC.CoreToStg.Prep
    ( corePrepPgm
@@ -16,18 +17,20 @@ module GHC.CoreToStg.Prep
    )
 where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
+
 import GHC.Platform
 
-import GHC.Core.Opt.OccurAnal
+import GHC.Driver.Session
+import GHC.Driver.Env
+import GHC.Driver.Ppr
 
-import GHC.Builtin.PrimOps
-import GHC.Builtin.Types.Prim ( realWorldStatePrimTy )
-import GHC.Types.Id.Make ( realWorldPrimId, mkPrimOpId )
-import GHC.Driver.Types
+import GHC.Tc.Utils.Env
+import GHC.Unit
+
 import GHC.Builtin.Names
+import GHC.Builtin.Types
+
 import GHC.Core.Utils
 import GHC.Core.Opt.Arity
 import GHC.Core.FVs
@@ -36,45 +39,49 @@ import GHC.Core.Lint    ( endPassIO )
 import GHC.Core
 import GHC.Core.Make hiding( FloatBind(..) )   -- We use our own FloatBind here
 import GHC.Core.Type
-import GHC.Types.Literal
 import GHC.Core.Coercion
-import GHC.Tc.Utils.Env
 import GHC.Core.TyCon
+import GHC.Core.DataCon
+import GHC.Core.Opt.OccurAnal
 import GHC.Core.TyCo.Rep( UnivCoProvenance(..) )
+
+import GHC.Data.Maybe
+import GHC.Data.OrdList
+import GHC.Data.FastString
+import GHC.Data.Pair
+import GHC.Data.Graph.UnVar
+
+import GHC.Utils.Error
+import GHC.Utils.Misc
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
+import GHC.Utils.Outputable
+import GHC.Utils.Monad  ( mapAccumLM )
+import GHC.Utils.Logger
+import GHC.Utils.Trace
+
 import GHC.Types.Demand
 import GHC.Types.Var
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
 import GHC.Types.Id
 import GHC.Types.Id.Info
-import GHC.Builtin.Types
-import GHC.Core.DataCon
+import GHC.Types.Id.Make ( realWorldPrimId )
 import GHC.Types.Basic
-import GHC.Unit.Module
-import GHC.Types.Unique.Supply
-import GHC.Data.Maybe
-import GHC.Data.OrdList
-import GHC.Utils.Error
-import GHC.Driver.Session
-import GHC.Driver.Ways
-import GHC.Utils.Misc
-import GHC.Utils.Outputable
-import GHC.Data.FastString
 import GHC.Types.Name   ( NamedThing(..), nameSrcSpan, isInternalName )
 import GHC.Types.SrcLoc ( SrcSpan(..), realSrcLocSpan, mkRealSrcLoc )
-import GHC.Data.Pair
-import Data.Bits
-import GHC.Utils.Monad  ( mapAccumLM )
+import GHC.Types.Literal
+import GHC.Types.Tickish
+import GHC.Types.TyThing
+import GHC.Types.Unique.Supply
+
 import Data.List        ( unfoldr )
 import Data.Functor.Identity
 import Control.Monad
-import GHC.Types.CostCentre ( CostCentre, ccFromThisModule )
-import qualified Data.Set as S
 
 {-
--- ---------------------------------------------------------------------------
--- Note [CorePrep Overview]
--- ---------------------------------------------------------------------------
+Note [CorePrep Overview]
+~~~~~~~~~~~~~~~~~~~~~~~~
 
 The goal of this pass is to prepare for code generation.
 
@@ -122,8 +129,7 @@ The goal of this pass is to prepare for code generation.
 9.  Replace (lazy e) by e.  See Note [lazyId magic] in GHC.Types.Id.Make
     Also replace (noinline e) by e.
 
-10. Convert bignum literals (LitNatural and LitInteger) into their
-    core representation.
+10. Convert bignum literals into their core representation.
 
 11. Uphold tick consistency while doing this: We move ticks out of
     (non-type) applications where we can, and make sure that we
@@ -131,7 +137,7 @@ The goal of this pass is to prepare for code generation.
 
 12. Collect cost centres (including cost centres in unfoldings) if we're in
     profiling mode. We have to do this here beucase we won't have unfoldings
-    after this pass (see `zapUnfolding` and Note [Drop unfoldings and rules].
+    after this pass (see `trimUnfolding` and Note [Drop unfoldings and rules].
 
 13. Eliminate case clutter in favour of unsafe coercions.
     See Note [Unsafe coercions]
@@ -151,32 +157,32 @@ Note [Unsafe coercions]
 ~~~~~~~~~~~~~~~~~~~~~~~
 CorePrep does these two transformations:
 
-* Convert empty case to cast with an unsafe coercion
+1. Convert empty case to cast with an unsafe coercion
           (case e of {}) ===>  e |> unsafe-co
-  See Note [Empty case alternatives] in GHC.Core: if the case
-  alternatives are empty, the scrutinee must diverge or raise an
-  exception, so we can just dive into it.
+   See Note [Empty case alternatives] in GHC.Core: if the case
+   alternatives are empty, the scrutinee must diverge or raise an
+   exception, so we can just dive into it.
 
-  Of course, if the scrutinee *does* return, we may get a seg-fault.
-  A belt-and-braces approach would be to persist empty-alternative
-  cases to code generator, and put a return point anyway that calls a
-  runtime system error function.
+   Of course, if the scrutinee *does* return, we may get a seg-fault.
+   A belt-and-braces approach would be to persist empty-alternative
+   cases to code generator, and put a return point anyway that calls a
+   runtime system error function.
 
-  Notice that eliminating empty case can lead to an ill-kinded coercion
-      case error @Int "foo" of {}  :: Int#
-      ===> error @Int "foo" |> unsafe-co
-      where unsafe-co :: Int ~ Int#
-  But that's fine because the expression diverges anyway. And it's
-  no different to what happened before.
+   Notice that eliminating empty case can lead to an ill-kinded coercion
+       case error @Int "foo" of {}  :: Int#
+       ===> error @Int "foo" |> unsafe-co
+       where unsafe-co :: Int ~ Int#
+   But that's fine because the expression diverges anyway. And it's
+   no different to what happened before.
 
-* Eliminate unsafeEqualityProof in favour of an unsafe coercion
-          case unsafeEqualityProof of UnsafeRefl g -> e
-          ===>  e[unsafe-co/g]
-  See (U2) in Note [Implementing unsafeCoerce] in base:Unsafe.Coerce
+2. Eliminate unsafeEqualityProof in favour of an unsafe coercion
+           case unsafeEqualityProof of UnsafeRefl g -> e
+           ===>  e[unsafe-co/g]
+   See (U2) in Note [Implementing unsafeCoerce] in base:Unsafe.Coerce
 
-  Note that this requiresuse ot substitute 'unsafe-co' for 'g', and
-  that is the main (current) reason for cpe_tyco_env in CorePrepEnv.
-  Tiresome, but not difficult.
+   Note that this requires us to substitute 'unsafe-co' for 'g', and
+   that is the main (current) reason for cpe_tyco_env in CorePrepEnv.
+   Tiresome, but not difficult.
 
 These transformations get rid of "case clutter", leaving only casts.
 We are doing no further significant tranformations, so the reasons
@@ -184,7 +190,10 @@ for the case forms have disappeared. And it is extremely helpful for
 the ANF-ery, CoreToStg, and backends, if trivial expressions really do
 look trivial. #19700 was an example.
 
-In both cases, the "unsafe-co" is just (UnivCo ty1 ty2 CorePrepProv).
+In both cases, the "unsafe-co" is just (UnivCo ty1 ty2 (CorePrepProv b)),
+The boolean 'b' says whether the unsafe coercion is supposed to be
+kind-homogeneous (yes for (2), no for (1).  This information is used
+/only/ by Lint.
 
 Note [CorePrep invariants]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -226,20 +235,15 @@ type CpeRhs  = CoreExpr    -- Non-terminal 'rhs'
 -}
 
 corePrepPgm :: HscEnv -> Module -> ModLocation -> CoreProgram -> [TyCon]
-            -> IO (CoreProgram, S.Set CostCentre)
+            -> IO CoreProgram
 corePrepPgm hsc_env this_mod mod_loc binds data_tycons =
-    withTiming dflags
+    withTiming logger
                (text "CorePrep"<+>brackets (ppr this_mod))
-               (const ()) $ do
+               (\a -> a `seqList` ()) $ do
     us <- mkSplitUniqSupply 's'
     initialCorePrepEnv <- mkInitialCorePrepEnv hsc_env
 
-    let cost_centres
-          | WayProf `S.member` ways dflags
-          = collectCostCentres this_mod binds
-          | otherwise
-          = S.empty
-
+    let
         implicit_binds = mkDataConWorkers dflags mod_loc data_tycons
             -- NB: we must feed mkImplicitBinds through corePrep too
             -- so that they are suitably cloned and eta-expanded
@@ -250,18 +254,19 @@ corePrepPgm hsc_env this_mod mod_loc binds data_tycons =
                       return (deFloatTop (floats1 `appendFloats` floats2))
 
     endPassIO hsc_env alwaysQualify CorePrep binds_out []
-    return (binds_out, cost_centres)
+    return binds_out
   where
     dflags = hsc_dflags hsc_env
+    logger = hsc_logger hsc_env
 
 corePrepExpr :: HscEnv -> CoreExpr -> IO CoreExpr
 corePrepExpr hsc_env expr = do
-    let dflags = hsc_dflags hsc_env
-    withTiming dflags (text "CorePrep [expr]") (const ()) $ do
+    let logger = hsc_logger hsc_env
+    withTiming logger (text "CorePrep [expr]") (\e -> e `seq` ()) $ do
       us <- mkSplitUniqSupply 's'
       initialCorePrepEnv <- mkInitialCorePrepEnv hsc_env
       let new_expr = initUs_ us (cpeBodyNF initialCorePrepEnv expr)
-      dumpIfSet_dyn dflags Opt_D_dump_prep "CorePrep" FormatCore (ppr new_expr)
+      putDumpFileMaybe logger Opt_D_dump_prep "CorePrep" FormatCore (ppr new_expr)
       return new_expr
 
 corePrepTopBinds :: CorePrepEnv -> [CoreBind] -> UniqSM Floats
@@ -272,7 +277,7 @@ corePrepTopBinds initialCorePrepEnv binds
     go _   []             = return emptyFloats
     go env (bind : binds) = do (env', floats, maybe_new_bind)
                                  <- cpeBind TopLevel env bind
-                               MASSERT(isNothing maybe_new_bind)
+                               massert (isNothing maybe_new_bind)
                                  -- Only join points get returned this way by
                                  -- cpeBind, and no join point may float to top
                                floatss <- go env' binds
@@ -292,7 +297,7 @@ mkDataConWorkers dflags mod_loc data_tycons
    -- If we want to generate debug info, we put a source note on the
    -- worker. This is useful, especially for heap profiling.
    tick_it name
-     | debugLevel dflags == 0                = id
+     | not (needSourceNotes dflags)           = id
      | RealSrcSpan span _ <- nameSrcSpan name = tick span
      | Just file <- ml_hs_file mod_loc       = tick (span1 file)
      | otherwise                             = tick (span1 "???")
@@ -590,12 +595,12 @@ cpeBind top_lvl env (NonRec bndr rhs)
                      | otherwise
                      = addFloat floats new_float
 
-             new_float = mkFloat dmd is_unlifted bndr1 rhs1
+             new_float = mkFloat env dmd is_unlifted bndr1 rhs1
 
        ; return (env2, floats1, Nothing) }
 
   | otherwise -- A join point; see Note [Join points and floating]
-  = ASSERT(not (isTopLevel top_lvl)) -- can't have top-level join point
+  = assert (not (isTopLevel top_lvl)) $ -- can't have top-level join point
     do { (_, bndr1) <- cpCloneBndr env bndr
        ; (bndr2, rhs1) <- cpeJoinPair env bndr1 rhs
        ; return (extendCorePrepEnv env bndr bndr2,
@@ -604,24 +609,27 @@ cpeBind top_lvl env (NonRec bndr rhs)
 
 cpeBind top_lvl env (Rec pairs)
   | not (isJoinId (head bndrs))
-  = do { (env', bndrs1) <- cpCloneBndrs env bndrs
+  = do { (env, bndrs1) <- cpCloneBndrs env bndrs
+       ; let env' = enterRecGroupRHSs env bndrs1
        ; stuff <- zipWithM (cpePair top_lvl Recursive topDmd False env')
                            bndrs1 rhss
 
        ; let (floats_s, rhss1) = unzip stuff
              all_pairs = foldrOL add_float (bndrs1 `zip` rhss1)
                                            (concatFloats floats_s)
-
+       -- use env below, so that we reset cpe_rec_ids
        ; return (extendCorePrepEnvList env (bndrs `zip` bndrs1),
                  unitFloat (FloatLet (Rec all_pairs)),
                  Nothing) }
 
   | otherwise -- See Note [Join points and floating]
-  = do { (env', bndrs1) <- cpCloneBndrs env bndrs
+  = do { (env, bndrs1) <- cpCloneBndrs env bndrs
+       ; let env' = enterRecGroupRHSs env bndrs1
        ; pairs1 <- zipWithM (cpeJoinPair env') bndrs1 rhss
 
        ; let bndrs2 = map fst pairs1
-       ; return (extendCorePrepEnvList env' (bndrs `zip` bndrs2),
+       -- use env below, so that we reset cpe_rec_ids
+       ; return (extendCorePrepEnvList env (bndrs `zip` bndrs2),
                  emptyFloats,
                  Just (Rec pairs1)) }
   where
@@ -640,7 +648,7 @@ cpePair :: TopLevelFlag -> RecFlag -> Demand -> Bool
 -- Used for all bindings
 -- The binder is already cloned, hence an OutId
 cpePair top_lvl is_rec dmd is_unlifted env bndr rhs
-  = ASSERT(not (isJoinId bndr)) -- those should use cpeJoinPair
+  = assert (not (isJoinId bndr)) $ -- those should use cpeJoinPair
     do { (floats1, rhs1) <- cpeRhsE env rhs
 
        -- See if we are allowed to float this stuff out of the RHS
@@ -650,10 +658,10 @@ cpePair top_lvl is_rec dmd is_unlifted env bndr rhs
        ; (floats3, rhs3)
             <- if manifestArity rhs1 <= arity
                then return (floats2, cpeEtaExpand arity rhs2)
-               else WARN(True, text "CorePrep: silly extra arguments:" <+> ppr bndr)
+               else warnPprTrace True "CorePrep: silly extra arguments:" (ppr bndr) $
                                -- Note [Silly extra arguments]
                     (do { v <- newVar (idType bndr)
-                        ; let float = mkFloat topDmd False v rhs2
+                        ; let float = mkFloat env topDmd False v rhs2
                         ; return ( addFloat floats2 float
                                  , cpeEtaExpand arity (Var v)) })
 
@@ -718,7 +726,7 @@ cpeJoinPair :: CorePrepEnv -> JoinId -> CoreExpr
 -- Used for all join bindings
 -- No eta-expansion: see Note [Do not eta-expand join points] in GHC.Core.Opt.Simplify.Utils
 cpeJoinPair env bndr rhs
-  = ASSERT(isJoinId bndr)
+  = assert (isJoinId bndr) $
     do { let Just join_arity = isJoinId_maybe bndr
              (bndrs, body)   = collectNBinders join_arity rhs
 
@@ -784,7 +792,8 @@ cpeRhsE env (Let bind body)
        ; return (bind_floats `appendFloats` body_floats, expr') }
 
 cpeRhsE env (Tick tickish expr)
-  | tickishPlace tickish == PlaceNonLam && tickish `tickishScopesLike` SoftScope
+  -- Pull out ticks if they are allowed to be floated.
+  | floatableTick tickish
   = do { (floats, body) <- cpeRhsE env expr
          -- See [Floating Ticks in CorePrep]
        ; return (unitFloat (FloatTick tickish) `appendFloats` floats, body) }
@@ -792,9 +801,9 @@ cpeRhsE env (Tick tickish expr)
   = do { body <- cpeBodyNF env expr
        ; return (emptyFloats, mkTick tickish' body) }
   where
-    tickish' | Breakpoint n fvs <- tickish
+    tickish' | Breakpoint ext n fvs <- tickish
              -- See also 'substTickish'
-             = Breakpoint n (map (getIdFromTrivialExpr . lookupCorePrepEnv env) fvs)
+             = Breakpoint ext n (map (getIdFromTrivialExpr . lookupCorePrepEnv env) fvs)
              | otherwise
              = tickish
 
@@ -812,8 +821,14 @@ cpeRhsE env expr@(Lam {})
 -- See Note [Unsafe coercions]
 cpeRhsE env (Case scrut _ ty [])
   = do { (floats, scrut') <- cpeRhsE env scrut
-       ; let ty' = cpSubstTy env ty
-             co' = mkUnsafeCo Representational (exprType scrut') ty'
+       ; let ty'       = cpSubstTy env ty
+             scrut_ty' = exprType scrut'
+             co'       = mkUnivCo prov Representational scrut_ty' ty'
+             prov      = CorePrepProv False
+               -- False says that the kinds of two types may differ
+               -- E.g. we might cast Int to Int#.  This is fine
+               -- because the scrutinee is guaranteed to diverge
+
        ; return (floats, Cast scrut' co') }
    -- This can give rise to
    --   Warning: Unsafe coercion: between unboxed and boxed value
@@ -825,9 +840,10 @@ cpeRhsE env (Case scrut bndr _ alts)
   | isUnsafeEqualityProof scrut
   , isDeadBinder bndr -- We can only discard the case if the case-binder
                       -- is dead.  It usually is, but see #18227
-  , [(_, [co_var], rhs)] <- alts
+  , [Alt _ [co_var] rhs] <- alts
   , let Pair ty1 ty2 = coVarTypes co_var
-        the_co = mkUnsafeCo Nominal (cpSubstTy env ty1) (cpSubstTy env ty2)
+        the_co = mkUnivCo prov Nominal (cpSubstTy env ty1) (cpSubstTy env ty2)
+        prov   = CorePrepProv True  -- True <=> kind homogeneous
         env'   = extendCoVarEnv env co_var the_co
   = cpeRhsE env' rhs
 
@@ -841,7 +857,7 @@ cpeRhsE env (Case scrut bndr ty alts)
                  -- enabled we instead produce an 'error' expression to catch
                  -- the case where a function we think should bottom
                  -- unexpectedly returns.
-               | gopt Opt_CatchBottoms (cpe_dynFlags env)
+               | gopt Opt_CatchNonexhaustiveCases (cpe_dynFlags env)
                , not (altsAreExhaustive alts)
                = addDefault alts (Just err)
                | otherwise = alts
@@ -851,10 +867,10 @@ cpeRhsE env (Case scrut bndr ty alts)
 
        ; return (floats, Case scrut' bndr2 ty alts'') }
   where
-    sat_alt env (con, bs, rhs)
+    sat_alt env (Alt con bs rhs)
        = do { (env2, bs') <- cpCloneBndrs env bs
             ; rhs' <- cpeBodyNF env2 rhs
-            ; return (con, bs', rhs') }
+            ; return (Alt con bs' rhs') }
 
 -- ---------------------------------------------------------------------------
 --              CpeBody: produces a result satisfying CpeBody
@@ -924,18 +940,58 @@ rhsToBody expr = return (emptyFloats, expr)
 
 data ArgInfo = CpeApp  CoreArg
              | CpeCast Coercion
-             | CpeTick (Tickish Id)
+             | CpeTick CoreTickish
 
 instance Outputable ArgInfo where
   ppr (CpeApp arg) = text "app" <+> ppr arg
   ppr (CpeCast co) = text "cast" <+> ppr co
   ppr (CpeTick tick) = text "tick" <+> ppr tick
 
+{- Note [Ticks and mandatory eta expansion]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Something like
+    `foo x = ({-# SCC foo #-} tagToEnum#) x :: Bool`
+caused a compiler panic in #20938. Why did this happen?
+The simplifier will eta-reduce the rhs giving us a partial
+application of tagToEnum#. The tick is then pushed inside the
+type argument. That is we get
+    `(Tick<foo> tagToEnum#) @Bool`
+CorePrep would go on to see a undersaturated tagToEnum# application
+and eta expand the expression under the tick. Giving us:
+    (Tick<scc> (\forall a. x -> tagToEnum# @a x) @Bool
+Suddenly tagToEnum# is applied to a polymorphic type and the code generator
+panics as it needs a concrete type to determine the representation.
+
+The problem in my eyes was that the tick covers a partial application
+of a primop. There is no clear semantic for such a construct as we can't
+partially apply a primop since they do not have bindings.
+We fix this by expanding the scope of such ticks slightly to cover the body
+of the eta-expanded expression.
+
+We do this by:
+* Checking if an application is headed by a primOpish thing.
+* If so we collect floatable ticks and usually but also profiling ticks
+  along with regular arguments.
+* When rebuilding the application we check if any profiling ticks appear
+  before the primop is fully saturated.
+* If the primop isn't fully satured we eta expand the primop application
+  and scope the tick to scope over the body of the saturated expression.
+
+Going back to #20938 this means starting with
+    `(Tick<foo> tagToEnum#) @Bool`
+we check if the function head is a primop (yes). This means we collect the
+profiling tick like if it was floatable. Giving us
+    (tagToEnum#, [CpeTick foo, CpeApp @Bool]).
+cpe_app filters out the tick as a underscoped tick on the expression
+`tagToEnum# @Bool`. During eta expansion we then put that tick back onto the
+body of the eta-expansion lambdas. Giving us `\x -> Tick<foo> (tagToEnum# @Bool x)`.
+-}
 cpeApp :: CorePrepEnv -> CoreExpr -> UniqSM (Floats, CpeRhs)
 -- May return a CpeRhs because of saturating primops
 cpeApp top_env expr
-  = do { let (terminal, args, depth) = collect_args expr
-       ; cpe_app top_env terminal args depth
+  = do { let (terminal, args) = collect_args expr
+      --  ; pprTraceM "cpeApp" $ (ppr expr)
+       ; cpe_app top_env terminal args
        }
 
   where
@@ -946,28 +1002,39 @@ cpeApp top_env expr
     -- record casts and ticks.  Depth counts the number
     -- of arguments that would consume strictness information
     -- (so, no type or coercion arguments.)
-    collect_args :: CoreExpr -> (CoreExpr, [ArgInfo], Int)
-    collect_args e = go e [] 0
+    collect_args :: CoreExpr -> (CoreExpr, [ArgInfo])
+    collect_args e = go e []
       where
-        go (App fun arg)      as !depth
+        go (App fun arg)      as
             = go fun (CpeApp arg : as)
-                (if isTyCoArg arg then depth else depth + 1)
-        go (Cast fun co)      as depth
-            = go fun (CpeCast co : as) depth
-        go (Tick tickish fun) as depth
-            | tickishPlace tickish == PlaceNonLam
-            && tickish `tickishScopesLike` SoftScope
-            = go fun (CpeTick tickish : as) depth
-        go terminal as depth = (terminal, as, depth)
+        go (Cast fun co)      as
+            = go fun (CpeCast co : as)
+        go (Tick tickish fun) as
+            -- Profiling ticks are slightly less strict so we expand their scope
+            -- if they cover partial applications of things like primOps.
+            -- See Note [Ticks and mandatory eta expansion]
+            | floatableTick tickish || isProfTick tickish
+            , Var vh <- head
+            , Var head' <- lookupCorePrepEnv top_env vh
+            , hasNoBinding head'
+            = (head,as')
+            where
+              (head,as') = go fun (CpeTick tickish : as)
+
+        -- Terminal could still be an app if it's wrapped by a tick.
+        -- E.g. Tick<foo> (f x) can give us (f x) as terminal.
+        go terminal as = (terminal, as)
 
     cpe_app :: CorePrepEnv
-            -> CoreExpr
+            -> CoreExpr -- The thing we are calling
             -> [ArgInfo]
-            -> Int
             -> UniqSM (Floats, CpeRhs)
-    cpe_app env (Var f) (CpeApp Type{} : CpeApp arg : args) depth
+    cpe_app env (Var f) (CpeApp Type{} : CpeApp arg : args)
         | f `hasKey` lazyIdKey          -- Replace (lazy a) with a, and
+            -- See Note [lazyId magic] in GHC.Types.Id.Make
        || f `hasKey` noinlineIdKey      -- Replace (noinline a) with a
+            -- See Note [noinlineId magic] in GHC.Types.Id.Make
+
         -- Consider the code:
         --
         --      lazy (f x) y
@@ -981,66 +1048,43 @@ cpeApp top_env expr
         --      }
         --
         -- rather than the far superior "f x y".  Test case is par01.
-        = let (terminal, args', depth') = collect_args arg
-          in cpe_app env terminal (args' ++ args) (depth + depth' - 1)
+        = let (terminal, args') = collect_args arg
+          in cpe_app env terminal (args' ++ args)
 
-    -- See Note [keepAlive# magic].
-    cpe_app env
-            (Var f)
-            args
-            n
-        | Just KeepAliveOp <- isPrimOpId_maybe f
-        , CpeApp (Type arg_rep)
-          : CpeApp (Type arg_ty)
-          : CpeApp (Type _result_rep)
-          : CpeApp (Type result_ty)
-          : CpeApp arg
-          : CpeApp s0
-          : CpeApp k
-          : rest <- args
-        = do { y  <- newVar (cpSubstTy env result_ty)
-             ; s2 <- newVar realWorldStatePrimTy
-             ; -- beta reduce if possible
-             ; (floats, k') <- case k of
-                  Lam s body -> cpe_app (extendCorePrepEnvExpr env s s0) body rest (n-2)
-                  _          -> cpe_app env k (CpeApp s0 : rest) (n-1)
-             ; let touchId = mkPrimOpId TouchOp
-                   expr = Case k' y result_ty [(DEFAULT, [], rhs)]
-                   rhs = let scrut = mkApps (Var touchId) [Type arg_rep, Type arg_ty, arg, Var realWorldPrimId]
-                         in Case scrut s2 result_ty [(DEFAULT, [], Var y)]
-             ; (floats', expr') <- cpeBody env expr
-             ; return (floats `appendFloats` floats', expr')
-             }
-        | Just KeepAliveOp <- isPrimOpId_maybe f
-        = panic "invalid keepAlive# application"
-
-    cpe_app env (Var f) (CpeApp _runtimeRep@Type{} : CpeApp _type@Type{} : CpeApp arg : rest) n
+    -- runRW# magic
+    cpe_app env (Var f) (CpeApp _runtimeRep@Type{} : CpeApp _type@Type{} : CpeApp arg : rest)
         | f `hasKey` runRWKey
         -- N.B. While it may appear that n == 1 in the case of runRW#
         -- applications, keep in mind that we may have applications that return
-        , n >= 1
+        , has_value_arg (CpeApp arg : rest)
         -- See Note [runRW magic]
         -- Replace (runRW# f) by (f realWorld#), beta reducing if possible (this
         -- is why we return a CorePrepEnv as well)
         = case arg of
-            Lam s body -> cpe_app (extendCorePrepEnv env s realWorldPrimId) body rest (n-2)
-            _          -> cpe_app env arg (CpeApp (Var realWorldPrimId) : rest) (n-1)
+            Lam s body -> cpe_app (extendCorePrepEnv env s realWorldPrimId) body rest
+            _          -> cpe_app env arg (CpeApp (Var realWorldPrimId) : rest)
              -- TODO: What about casts?
+        where
+          has_value_arg [] = False
+          has_value_arg (CpeApp arg:_rest)
+            | not (isTyCoArg arg) = True
+          has_value_arg (_:rest) = has_value_arg rest
 
-    cpe_app env (Var v) args depth
+    cpe_app env (Var v) args
       = do { v1 <- fiddleCCall v
            ; let e2 = lookupCorePrepEnv env v1
                  hd = getIdFromTrivialExpr_maybe e2
-           -- NB: depth from collect_args is right, because e2 is a trivial expression
-           -- and thus its embedded Id *must* be at the same depth as any
-           -- Apps it is under are type applications only (c.f.
-           -- exprIsTrivial).  But note that we need the type of the
-           -- expression, not the id.
-           ; (app, floats) <- rebuild_app env args e2 emptyFloats stricts
-           ; mb_saturate hd app floats depth }
+                 -- Determine number of required arguments. See Note [Ticks and mandatory eta expansion]
+                 min_arity = case hd of
+                   Just v_hd -> if hasNoBinding v_hd then Just $! (idArity v_hd) else Nothing
+                   Nothing -> Nothing
+          --  ; pprTraceM "cpe_app:stricts:" (ppr v <+> ppr args $$ ppr stricts $$ ppr (idCbvMarks_maybe v))
+           ; (app, floats, unsat_ticks) <- rebuild_app env args e2 emptyFloats stricts min_arity
+           ; mb_saturate hd app floats unsat_ticks depth }
         where
-          stricts = case idStrictness v of
-                            StrictSig (DmdType _ demands _)
+          depth = val_args args
+          stricts = case idDmdSig v of
+                            DmdSig (DmdType _ demands)
                               | listLengthCmp demands depth /= GT -> demands
                                     -- length demands <= depth
                               | otherwise                         -> []
@@ -1052,22 +1096,45 @@ cpeApp top_env expr
 
         -- We inlined into something that's not a var and has no args.
         -- Bounce it back up to cpeRhsE.
-    cpe_app env fun [] _ = cpeRhsE env fun
+    cpe_app env fun [] = cpeRhsE env fun
 
-        -- N-variable fun, better let-bind it
-    cpe_app env fun args depth
+    -- Here we get:
+    -- N-variable fun, better let-bind it
+    -- This case covers literals, apps, lams or let expressions applied to arguments.
+    -- Basically things we want to ANF before applying to arguments.
+    cpe_app env fun args
       = do { (fun_floats, fun') <- cpeArg env evalDmd fun
-                          -- The evalDmd says that it's sure to be evaluated,
-                          -- so we'll end up case-binding it
-           ; (app, floats) <- rebuild_app env args fun' fun_floats []
-           ; mb_saturate Nothing app floats depth }
+                          -- If evalDmd says that it's sure to be evaluated,
+                          -- we'll end up case-binding it
+           ; (app, floats,unsat_ticks) <- rebuild_app env args fun' fun_floats [] Nothing
+           ; mb_saturate Nothing app floats unsat_ticks (val_args args) }
+
+    -- Count the number of value arguments *and* coercions (since we don't eliminate the later in STG)
+    val_args :: [ArgInfo] -> Int
+    val_args args = go args 0
+      where
+        go [] !n = n
+        go (info:infos) n =
+          case info of
+            CpeCast {} -> go infos n
+            CpeTick tickish
+              | floatableTick tickish                 -> go infos n
+              -- If we can't guarantee a tick will be floated out of the application
+              -- we can't guarantee the value args following it will be applied.
+              | otherwise                             -> n
+            CpeApp e                                  -> go infos n'
+              where
+                !n'
+                  | isTypeArg e = n
+                  | otherwise   = n+1
 
     -- Saturate if necessary
-    mb_saturate head app floats depth =
+    mb_saturate head app floats unsat_ticks depth =
        case head of
-         Just fn_id -> do { sat_app <- maybeSaturate fn_id app depth
+         Just fn_id -> do { sat_app <- maybeSaturate fn_id app depth unsat_ticks
                           ; return (floats, sat_app) }
-         _other              -> return (floats, app)
+         _other     -> do { massert (null unsat_ticks)
+                          ; return (floats, app) }
 
     -- Deconstruct and rebuild the application, floating any non-atomic
     -- arguments to the outside.  We collect the type of the expression,
@@ -1077,25 +1144,51 @@ cpeApp top_env expr
     rebuild_app
         :: CorePrepEnv
         -> [ArgInfo]                  -- The arguments (inner to outer)
+        -> CpeApp                     -- The function
+        -> Floats
+        -> [Demand]
+        -> Maybe Arity
+        -> UniqSM (CpeApp
+                  ,Floats
+                  ,[CoreTickish] -- Underscoped ticks. See Note [Ticks and mandatory eta expansion]
+                  )
+    rebuild_app env args app floats ss req_depth =
+      rebuild_app' env args app floats ss [] (fromMaybe 0 req_depth)
+
+    rebuild_app'
+        :: CorePrepEnv
+        -> [ArgInfo] -- The arguments (inner to outer)
         -> CpeApp
         -> Floats
         -> [Demand]
-        -> UniqSM (CpeApp, Floats)
-    rebuild_app _ [] app floats ss
-      = ASSERT(null ss) -- make sure we used all the strictness info
-        return (app, floats)
+        -> [CoreTickish]
+        -> Int -- Number of arguments required to satisfy minimal tick scopes.
+        -> UniqSM (CpeApp, Floats, [CoreTickish])
+    rebuild_app' _ [] app floats ss rt_ticks !_req_depth
+      = assertPpr (null ss) (ppr ss)-- make sure we used all the strictness info
+        return (app, floats, rt_ticks)
 
-    rebuild_app env (a : as) fun' floats ss = case a of
+    rebuild_app' env (a : as) fun' floats ss rt_ticks req_depth = case a of
+      -- See Note [Ticks and mandatory eta expansion]
+      _
+        | not (null rt_ticks)
+        , req_depth <= 0
+        ->
+            let tick_fun = foldr mkTick fun' rt_ticks
+            in rebuild_app' env (a : as) tick_fun floats ss rt_ticks req_depth
 
       CpeApp (Type arg_ty)
-        -> rebuild_app env as (App fun' (Type arg_ty')) floats ss
+        -> rebuild_app' env as (App fun' (Type arg_ty')) floats ss rt_ticks req_depth
         where
           arg_ty' = cpSubstTy env arg_ty
 
       CpeApp (Coercion co)
-        -> rebuild_app env as (App fun' (Coercion co')) floats ss
+        -> rebuild_app' env as (App fun' (Coercion co')) floats ss' rt_ticks req_depth
         where
             co' = cpSubstCo env co
+            ss'
+              | null ss = []
+              | otherwise = tail ss
 
       CpeApp arg -> do
         let (ss1, ss_rest)  -- See Note [lazyId magic] in GHC.Types.Id.Make
@@ -1104,16 +1197,21 @@ cpeApp top_env expr
                    (ss1 : ss_rest, False) -> (ss1,    ss_rest)
                    ([],            _)     -> (topDmd, [])
         (fs, arg') <- cpeArg top_env ss1 arg
-        rebuild_app env as (App fun' arg') (fs `appendFloats` floats) ss_rest
+        rebuild_app' env as (App fun' arg') (fs `appendFloats` floats) ss_rest rt_ticks (req_depth-1)
 
       CpeCast co
-        -> rebuild_app env as (Cast fun' co') floats ss
+        -> rebuild_app' env as (Cast fun' co') floats ss rt_ticks req_depth
         where
            co' = cpSubstCo env co
-
+      -- See Note [Ticks and mandatory eta expansion]
       CpeTick tickish
+        | tickishPlace tickish == PlaceRuntime
+        , req_depth > 0
+        -> assert (isProfTick tickish) $
+           rebuild_app' env as fun' floats ss (tickish:rt_ticks) req_depth
+        | otherwise
         -- See [Floating Ticks in CorePrep]
-        -> rebuild_app env as fun' (addFloat floats (FloatTick tickish)) ss
+        -> rebuild_app' env as fun' (addFloat floats (FloatTick tickish)) ss rt_ticks req_depth
 
 isLazyExpr :: CoreExpr -> Bool
 -- See Note [lazyId magic] in GHC.Types.Id.Make
@@ -1159,7 +1257,7 @@ no further floating will occur. This allows us to safely inline things like
    GHC.Magic. This definition is used in cases where runRW is curried.
 
  * In addition to its normal Haskell definition in GHC.Magic, we give it
-   a special late inlining here in CorePrep and GHC.CoreToByteCode, avoiding
+   a special late inlining here in CorePrep and GHC.StgToByteCode, avoiding
    the incorrect sharing due to float-out noted above.
 
  * It is levity-polymorphic:
@@ -1201,7 +1299,7 @@ Consider the Core program (from #11291),
 
 The late inlining logic in cpe_app would transform this into:
 
-   (case bot of {}) realWorldPrimId#
+   (case bot of {}) realWorld#
 
 Which would rise to a panic in CoreToStg.myCollectArgs, which expects only
 variables in function position.
@@ -1260,7 +1358,7 @@ Performing the transform described above would result in:
 
 If runRW# were a "normal" function this call to join point j would not be
 allowed in its continuation argument. However, since runRW# is inlined (as
-described in Note [runRW magic] above), such join point occurences are
+described in Note [runRW magic] above), such join point occurrences are
 completely fine. Both occurrence analysis (see the runRW guard in occAnalApp)
 and Core Lint (see the App case of lintCoreExpr) have special treatment for
 runRW# applications. See Note [Linting of runRW#] for details on the latter.
@@ -1346,9 +1444,6 @@ However, until then we simply add a special case excluding literals from the
 floating done by cpeArg.
 -}
 
-mkUnsafeCo :: Role -> Type -> Type -> Coercion
-mkUnsafeCo role ty1 ty2 = mkUnivCo CorePrepProv role ty1 ty2
-
 -- | Is an argument okay to CPE?
 okCpeArg :: CoreExpr -> Bool
 -- Don't float literals. See Note [ANF-ising literal string arguments].
@@ -1373,7 +1468,7 @@ cpeArg env dmd arg
        ; if okCpeArg arg2
          then do { v <- newVar arg_ty
                  ; let arg3      = cpeEtaExpand (exprArity arg2) arg2
-                       arg_float = mkFloat dmd is_unlifted v arg3
+                       arg_float = mkFloat env dmd is_unlifted v arg3
                  ; return (addFloat floats2 arg_float, varToCoreExpr v) }
          else return (floats2, arg2)
        }
@@ -1400,8 +1495,9 @@ because that has different strictness.  Hence the use of 'allLazy'.
 Note [Eta expansion of hasNoBinding things in CorePrep]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 maybeSaturate deals with eta expanding to saturate things that can't deal with
-unsaturated applications (identified by 'hasNoBinding', currently just
-foreign calls and unboxed tuple/sum constructors).
+unsaturated applications (identified by 'hasNoBinding', currently
+foreign calls, unboxed tuple/sum constructors, and representation-polymorphic
+primitives such as 'coerce' and 'unsafeCoerce#').
 
 Historical Note: Note that eta expansion in CorePrep used to be very fragile
 due to the "prediction" of CAFfyness that we used to make during tidying.
@@ -1410,18 +1506,41 @@ applications here as well but due to this fragility (see #16846) we now deal
 with this another way, as described in Note [Primop wrappers] in GHC.Builtin.PrimOps.
 -}
 
-maybeSaturate :: Id -> CpeApp -> Int -> UniqSM CpeRhs
-maybeSaturate fn expr n_args
+maybeSaturate :: Id -> CpeApp -> Int -> [CoreTickish] -> UniqSM CpeRhs
+maybeSaturate fn expr n_args unsat_ticks
   | hasNoBinding fn        -- There's no binding
-  = return sat_expr
+  = return $ wrapLamBody (\body -> foldr mkTick body unsat_ticks) sat_expr
+
+  | mark_arity > 0 -- A call-by-value function. See Note [CBV Function Ids]
+  , not applied_marks
+  = assertPpr
+      ( not (isJoinId fn)) -- See Note [Do not eta-expand join points]
+      ( ppr fn $$ text "expr:" <+> ppr expr $$ text "n_args:" <+> ppr n_args $$
+          text "marks:" <+> ppr (idCbvMarks_maybe fn) $$
+          text "join_arity" <+> ppr (isJoinId_maybe fn) $$
+          text "fn_arity" <+> ppr fn_arity
+       ) $
+    -- pprTrace "maybeSat"
+    --   ( ppr fn $$ text "expr:" <+> ppr expr $$ text "n_args:" <+> ppr n_args $$
+    --       text "marks:" <+> ppr (idCbvMarks_maybe fn) $$
+    --       text "join_arity" <+> ppr (isJoinId_maybe fn) $$
+    --       text "fn_arity" <+> ppr fn_arity $$
+    --       text "excess_arity" <+> ppr excess_arity $$
+    --       text "mark_arity" <+> ppr mark_arity
+    --    ) $
+    return sat_expr
 
   | otherwise
-  = return expr
+  = assert (null unsat_ticks) $
+    return expr
   where
-    fn_arity     = idArity fn
-    excess_arity = fn_arity - n_args
-    sat_expr     = cpeEtaExpand excess_arity expr
-
+    mark_arity    = idCbvMarkArity fn
+    fn_arity      = idArity fn
+    excess_arity  = (max fn_arity mark_arity) - n_args
+    sat_expr      = cpeEtaExpand excess_arity expr
+    applied_marks = n_args >= (length . dropWhile (not . isMarkedCbv) . reverse . expectJust "maybeSaturate" $ (idCbvMarks_maybe fn))
+    -- For join points we never eta-expand (See Note [Do not eta-expand join points])
+    -- so we assert all arguments that need to be passed cbv are visible so that the backend can evalaute them if required..
 {-
 ************************************************************************
 *                                                                      *
@@ -1501,19 +1620,24 @@ tryEtaReducePrep bndrs expr@(App _ _)
   , not (any (`elemVarSet` fvs_remaining) bndrs)
   , exprIsHNF remaining_expr   -- Don't turn value into a non-value
                                -- else the behaviour with 'seq' changes
-  = Just remaining_expr
+  =
+    -- pprTrace "prep-reduce" (
+    --   text "reduced:" <> ppr remaining_expr $$
+    --   ppr (remaining_args)
+    --   ) $
+    Just remaining_expr
   where
     (f, args) = collectArgs expr
     remaining_expr = mkApps f remaining_args
     fvs_remaining = exprFreeVars remaining_expr
     (remaining_args, last_args) = splitAt n_remaining args
     n_remaining = length args - length bndrs
+    n_remaining_vals = length $ filter isRuntimeArg remaining_args
 
     ok bndr (Var arg) = bndr == arg
     ok _    _         = False
 
-    -- We can't eta reduce something which must be saturated.
-    ok_to_eta_reduce (Var f) = not (hasNoBinding f) && not (isLinearType (idType f))
+    ok_to_eta_reduce (Var f) = canEtaReduceToArity f n_remaining n_remaining_vals
     ok_to_eta_reduce _       = False -- Safe. ToDo: generalise
 
 
@@ -1533,6 +1657,86 @@ tryEtaReducePrep _ _ = Nothing
 Note [Pin demand info on floats]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 We pin demand info on floated lets, so that we can see the one-shot thunks.
+
+Note [Speculative evaluation]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Since call-by-value is much cheaper than call-by-need, we case-bind arguments
+that are either
+
+  1. Strictly evaluated anyway, according to the DmdSig of the callee, or
+  2. ok-for-spec, according to 'exprOkForSpeculation'
+
+While (1) is a no-brainer and always beneficial, (2) is a bit
+more subtle, as the careful haddock for 'exprOkForSpeculation'
+points out. Still, by case-binding the argument we don't need
+to allocate a thunk for it, whose closure must be retained as
+long as the callee might evaluate it. And if it is evaluated on
+most code paths anyway, we get to turn the unknown eval in the
+callee into a known call at the call site.
+
+However, we must be very careful not to speculate recursive calls!
+Doing so might well change termination behavior.
+
+That comes up in practice for DFuns, which are considered ok-for-spec,
+because they always immediately return a constructor.
+Not so if you speculate the recursive call, as #20836 shows:
+
+  class Foo m => Foo m where
+    runFoo :: m a -> m a
+  newtype Trans m a = Trans { runTrans :: m a }
+  instance Monad m => Foo (Trans m) where
+    runFoo = id
+
+(NB: class Foo m => Foo m` looks weird and needs -XUndecidableSuperClasses. The
+example in #20836 is more compelling, but boils down to the same thing.)
+This program compiles to the following DFun for the `Trans` instance:
+
+  Rec {
+  $fFooTrans
+    = \ @m $dMonad -> C:Foo ($fFooTrans $dMonad) (\ @a -> id)
+  end Rec }
+
+Note that the DFun immediately terminates and produces a dictionary, just
+like DFuns ought to, but it calls itself recursively to produce the `Foo m`
+dictionary. But alas, if we treat `$fFooTrans` as always-terminating, so
+that we can speculate its calls, and hence use call-by-value, we get:
+
+  $fFooTrans
+    = \ @m $dMonad -> case ($fFooTrans $dMonad) of sc ->
+                      C:Foo sc (\ @a -> id)
+
+and that's an infinite loop!
+Note that this bad-ness only happens in `$fFooTrans`'s own RHS. In the
+*body* of the letrec, it's absolutely fine to use call-by-value on
+`foo ($fFooTrans d)`.
+
+Our solution is this: we track in cpe_rec_ids the set of enclosing
+recursively-bound Ids, the RHSs of which we are currently transforming and then
+in 'exprOkForSpecEval' (a special entry point to 'exprOkForSpeculation',
+basically) we'll say that any binder in this set is not ok-for-spec.
+
+Note if we have a letrec group `Rec { f1 = rhs1; ...; fn = rhsn }`, and we
+prep up `rhs1`, we have to include not only `f1`, but all binders of the group
+`f1..fn` in this set, otherwise our fix is not robust wrt. mutual recursive
+DFuns.
+
+NB: If at some point we decide to have a termination analysis for general
+functions (#8655, !1866), we need to take similar precautions for (guarded)
+recursive functions:
+
+  repeat x = x : repeat x
+
+Same problem here: As written, repeat evaluates rapidly to WHNF. So `repeat x`
+is a cheap call that we are willing to speculate, but *not* in repeat's RHS.
+Fortunately, pce_rec_ids already has all the information we need in that case.
+
+The problem is very similar to Note [Eta reduction in recursive RHSs].
+Here as well as there it is *unsound* to change the termination properties
+of the very function whose termination properties we are exploiting.
+
+It is also similar to Note [Do not strictify a DFun's parameter dictionaries],
+where marking recursive DFuns (of undecidable *instances*) strict in dictionary
+*parameters* leads to quite the same change in termination as above.
 -}
 
 data FloatingBind
@@ -1548,7 +1752,7 @@ data FloatingBind
                       -- but lifted binding
 
  -- | See Note [Floating Ticks in CorePrep]
- | FloatTick (Tickish Id)
+ | FloatTick CoreTickish
 
 data Floats = Floats OkToSpec (OrdList FloatingBind)
 
@@ -1579,21 +1783,36 @@ data OkToSpec
                         -- ok-to-speculate unlifted bindings
    | NotOkToSpec        -- Some not-ok-to-speculate unlifted bindings
 
-mkFloat :: Demand -> Bool -> Id -> CpeRhs -> FloatingBind
-mkFloat dmd is_unlifted bndr rhs
-  | is_strict
-  , not is_hnf  = FloatCase rhs bndr DEFAULT [] (exprOkForSpeculation rhs)
+mkFloat :: CorePrepEnv -> Demand -> Bool -> Id -> CpeRhs -> FloatingBind
+mkFloat env dmd is_unlifted bndr rhs
+  | is_strict || ok_for_spec -- See Note [Speculative evaluation]
+  , not is_hnf  = FloatCase rhs bndr DEFAULT [] ok_for_spec
     -- Don't make a case for a HNF binding, even if it's strict
     -- Otherwise we get  case (\x -> e) of ...!
 
-  | is_unlifted = ASSERT2( exprOkForSpeculation rhs, ppr rhs )
-                  FloatCase rhs bndr DEFAULT [] True
-  | is_hnf    = FloatLet (NonRec bndr                       rhs)
-  | otherwise = FloatLet (NonRec (setIdDemandInfo bndr dmd) rhs)
+  | is_unlifted = FloatCase rhs bndr DEFAULT [] True
+      -- we used to assertPpr ok_for_spec (ppr rhs) here, but it is now disabled
+      -- because exprOkForSpeculation isn't stable under ANF-ing. See for
+      -- example #19489 where the following unlifted expression:
+      --
+      --    GHC.Prim.(#|_#) @LiftedRep @LiftedRep @[a_ax0] @[a_ax0]
+      --                    (GHC.Types.: @a_ax0 a2_agq a3_agl)
+      --
+      -- is ok-for-spec but is ANF-ised into:
+      --
+      --    let sat = GHC.Types.: @a_ax0 a2_agq a3_agl
+      --    in GHC.Prim.(#|_#) @LiftedRep @LiftedRep @[a_ax0] @[a_ax0] sat
+      --
+      -- which isn't ok-for-spec because of the let-expression.
+
+  | is_hnf      = FloatLet (NonRec bndr                       rhs)
+  | otherwise   = FloatLet (NonRec (setIdDemandInfo bndr dmd) rhs)
                    -- See Note [Pin demand info on floats]
   where
-    is_hnf    = exprIsHNF rhs
-    is_strict = isStrictDmd dmd
+    is_hnf      = exprIsHNF rhs
+    is_strict   = isStrUsedDmd dmd
+    ok_for_spec = exprOkForSpecEval (not . is_rec_call) rhs
+    is_rec_call = (`elemUnVarSet` cpe_rec_ids env)
 
 emptyFloats :: Floats
 emptyFloats = Floats OkToSpec nilOL
@@ -1605,7 +1824,7 @@ wrapBinds :: Floats -> CpeBody -> CpeBody
 wrapBinds (Floats _ binds) body
   = foldrOL mk_bind body binds
   where
-    mk_bind (FloatCase rhs bndr con bs _) body = Case rhs bndr (exprType body) [(con,bs,body)]
+    mk_bind (FloatCase rhs bndr con bs _) body = Case rhs bndr (exprType body) [Alt con bs body]
     mk_bind (FloatLet bind)               body = Let bind body
     mk_bind (FloatTick tickish)           body = mkTick tickish body
 
@@ -1680,7 +1899,7 @@ canFloat (Floats ok_to_spec fs) rhs
 wantFloatNested :: RecFlag -> Demand -> Bool -> Floats -> CpeRhs -> Bool
 wantFloatNested is_rec dmd is_unlifted floats rhs
   =  isEmptyFloats floats
-  || isStrictDmd dmd
+  || isStrUsedDmd dmd
   || is_unlifted
   || (allLazyNested is_rec floats && exprIsHNF rhs)
         -- Why the test for allLazyNested?
@@ -1791,16 +2010,18 @@ data CorePrepEnv
         , cpe_convertNumLit   :: LitNumType -> Integer -> Maybe CoreExpr
         -- ^ Convert some numeric literals (Integer, Natural) into their
         -- final Core form
+        , cpe_rec_ids         :: UnVarSet -- Faster OutIdSet; See Note [Speculative evaluation]
     }
 
 mkInitialCorePrepEnv :: HscEnv -> IO CorePrepEnv
 mkInitialCorePrepEnv hsc_env = do
    convertNumLit <- mkConvertNumLiteral hsc_env
    return $ CPE
-      { cpe_dynFlags = hsc_dflags hsc_env
-      , cpe_env = emptyVarEnv
-      , cpe_tyco_env = Nothing
+      { cpe_dynFlags      = hsc_dflags hsc_env
+      , cpe_env           = emptyVarEnv
+      , cpe_tyco_env      = Nothing
       , cpe_convertNumLit = convertNumLit
+      , cpe_rec_ids       = emptyUnVarSet
       }
 
 extendCorePrepEnv :: CorePrepEnv -> Id -> Id -> CorePrepEnv
@@ -1821,6 +2042,10 @@ lookupCorePrepEnv cpe id
   = case lookupVarEnv (cpe_env cpe) id of
         Nothing  -> Var id
         Just exp -> exp
+
+enterRecGroupRHSs :: CorePrepEnv -> [OutId] -> CorePrepEnv
+enterRecGroupRHSs env grp
+  = env { cpe_rec_ids = extendUnVarSetList grp (cpe_rec_ids env) }
 
 ------------------------------------------------------------------------------
 --           CpeTyCoEnv
@@ -1954,7 +2179,7 @@ cpCloneBndr env bndr
        -- Drop (now-useless) rules/unfoldings
        -- See Note [Drop unfoldings and rules]
        -- and Note [Preserve evaluatedness] in GHC.Core.Tidy
-       ; let unfolding' = zapUnfolding (realIdUnfolding bndr)
+       ; let unfolding' = trimUnfolding (realIdUnfolding bndr)
                           -- Simplifier will set the Id's unfolding
 
              bndr'' = bndr' `setIdUnfolding`      unfolding'
@@ -2017,7 +2242,7 @@ newVar ty
 -- ---------------------------------------------------------------------------
 --
 -- Note [Floating Ticks in CorePrep]
---
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 -- It might seem counter-intuitive to float ticks by default, given
 -- that we don't actually want to move them if we can help it. On the
 -- other hand, nothing gets very far in CorePrep anyway, and we want
@@ -2054,7 +2279,7 @@ wrapTicks (Floats flag floats0) expr =
         -- those early, as relying on mkTick to spot it after the fact
         -- can yield O(n^3) complexity [#11095]
         go (floats, ticks) (FloatTick t)
-          = ASSERT(tickishPlace t == PlaceNonLam)
+          = assert (tickishPlace t == PlaceNonLam)
             (floats, if any (flip tickishContains t) ticks
                      then ticks else t:ticks)
         go (floats, ticks) f
@@ -2067,42 +2292,10 @@ wrapTicks (Floats flag floats0) expr =
         wrapBind t (NonRec binder rhs) = NonRec binder (mkTick t rhs)
         wrapBind t (Rec pairs)         = Rec (mapSnd (mkTick t) pairs)
 
-------------------------------------------------------------------------------
--- Collecting cost centres
--- ---------------------------------------------------------------------------
-
--- | Collect cost centres defined in the current module, including those in
--- unfoldings.
-collectCostCentres :: Module -> CoreProgram -> S.Set CostCentre
-collectCostCentres mod_name
-  = foldl' go_bind S.empty
-  where
-    go cs e = case e of
-      Var{} -> cs
-      Lit{} -> cs
-      App e1 e2 -> go (go cs e1) e2
-      Lam _ e -> go cs e
-      Let b e -> go (go_bind cs b) e
-      Case scrt _ _ alts -> go_alts (go cs scrt) alts
-      Cast e _ -> go cs e
-      Tick (ProfNote cc _ _) e ->
-        go (if ccFromThisModule cc mod_name then S.insert cc cs else cs) e
-      Tick _ e -> go cs e
-      Type{} -> cs
-      Coercion{} -> cs
-
-    go_alts = foldl' (\cs (_con, _bndrs, e) -> go cs e)
-
-    go_bind :: S.Set CostCentre -> CoreBind -> S.Set CostCentre
-    go_bind cs (NonRec b e) =
-      go (maybe cs (go cs) (get_unf b)) e
-    go_bind cs (Rec bs) =
-      foldl' (\cs' (b, e) -> go (maybe cs' (go cs') (get_unf b)) e) cs bs
-
-    -- Unfoldings may have cost centres that in the original definion are
-    -- optimized away, see #5889.
-    get_unf = maybeUnfoldingTemplate . realIdUnfolding
-
+floatableTick :: GenTickish pass -> Bool
+floatableTick tickish =
+    tickishPlace tickish == PlaceNonLam &&
+    tickish `tickishScopesLike` SoftScope
 
 ------------------------------------------------------------------------------
 -- Numeric literals
@@ -2116,10 +2309,11 @@ mkConvertNumLiteral hsc_env = do
    let
       dflags   = hsc_dflags hsc_env
       platform = targetPlatform dflags
+      home_unit = hsc_home_unit hsc_env
       guardBignum act
-         | homeUnitId dflags == primUnitId
+         | isHomeUnitInstanceOf home_unit primUnitId
          = return $ panic "Bignum literals are not supported in ghc-prim"
-         | homeUnitId dflags == bignumUnitId
+         | isHomeUnitInstanceOf home_unit bignumUnitId
          = return $ panic "Bignum literals are not supported in ghc-bignum"
          | otherwise = act
 
@@ -2135,36 +2329,8 @@ mkConvertNumLiteral hsc_env = do
 
    let
       convertNumLit nt i = case nt of
-         LitNumInteger -> Just (convertInteger i)
-         LitNumNatural -> Just (convertNatural i)
+         LitNumBigNat  -> Just (convertBignatPrim i)
          _             -> Nothing
-
-      convertInteger i
-         | platformInIntRange platform i -- fit in a Int#
-         = mkConApp integerISDataCon [Lit (mkLitInt platform i)]
-
-         | otherwise -- build a BigNat and embed into IN or IP
-         = let con = if i > 0 then integerIPDataCon else integerINDataCon
-           in mkBigNum con (convertBignatPrim (abs i))
-
-      convertNatural i
-         | platformInWordRange platform i -- fit in a Word#
-         = mkConApp naturalNSDataCon [Lit (mkLitWord platform i)]
-
-         | otherwise --build a BigNat and embed into NB
-         = mkBigNum naturalNBDataCon (convertBignatPrim i)
-
-      -- we can't simply generate:
-      --
-      --    NB (bigNatFromWordList# [W# 10, W# 20])
-      --
-      -- using `mkConApp` because it isn't in ANF form. Instead we generate:
-      --
-      --    case bigNatFromWordList# [W# 10, W# 20] of ba { DEFAULT -> NB ba }
-      --
-      -- via `mkCoreApps`
-
-      mkBigNum con ba = mkCoreApps (Var (dataConWorkId con)) [ba]
 
       convertBignatPrim i =
          let

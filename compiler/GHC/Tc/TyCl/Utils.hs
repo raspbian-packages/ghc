@@ -1,15 +1,14 @@
+
+{-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE TypeFamilies #-}
+
+{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
+
 {-
 (c) The University of Glasgow 2006
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1999
 
 -}
-
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE DeriveFunctor #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE ViewPatterns #-}
-
-{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 
 -- | Analysis functions over data types. Specifically, detecting recursive types.
 --
@@ -28,45 +27,60 @@ module GHC.Tc.TyCl.Utils(
         tcRecSelBinds, mkRecSelBinds, mkOneRecordSelector
     ) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
+import GHC.Tc.Errors.Types
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Utils.Env
 import GHC.Tc.Gen.Bind( tcValBinds )
+import GHC.Tc.Utils.TcType
+
+import GHC.Builtin.Types( unitTy )
+import GHC.Builtin.Uniques ( mkBuiltinUnique )
+
+import GHC.Hs
+
 import GHC.Core.TyCo.Rep( Type(..), Coercion(..), MCoercion(..), UnivCoProvenance(..) )
 import GHC.Core.Multiplicity
-import GHC.Tc.Utils.TcType
 import GHC.Core.Predicate
-import GHC.Builtin.Types( unitTy )
 import GHC.Core.Make( rEC_SEL_ERROR_ID )
-import GHC.Hs
 import GHC.Core.Class
 import GHC.Core.Type
-import GHC.Driver.Types
 import GHC.Core.TyCon
 import GHC.Core.ConLike
 import GHC.Core.DataCon
+import GHC.Core.TyCon.Set
+import GHC.Core.Coercion ( ltRole )
+
+import GHC.Utils.Outputable
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
+import GHC.Utils.Misc
+import GHC.Utils.FV as FV
+
+import GHC.Data.Maybe
+import GHC.Data.Bag
+import GHC.Data.FastString
+
+import GHC.Unit.Module
+
+import GHC.Rename.Utils (wrapGenSpan)
+
+import GHC.Types.Basic
+import GHC.Types.Error
+import GHC.Types.FieldLabel
+import GHC.Types.SrcLoc
+import GHC.Types.SourceFile
+import GHC.Types.SourceText
 import GHC.Types.Name
 import GHC.Types.Name.Env
-import GHC.Types.Name.Set hiding (unitFV)
 import GHC.Types.Name.Reader ( mkVarUnqual )
 import GHC.Types.Id
 import GHC.Types.Id.Info
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
-import GHC.Core.Coercion ( ltRole )
-import GHC.Types.Basic
-import GHC.Types.SrcLoc
-import GHC.Types.Unique ( mkBuiltinUnique )
-import GHC.Utils.Outputable
-import GHC.Utils.Misc
-import GHC.Data.Maybe
-import GHC.Data.Bag
-import GHC.Data.FastString
-import GHC.Utils.FV as FV
-import GHC.Unit.Module
+import GHC.Types.Unique.Set
+import GHC.Types.TyThing
 import qualified GHC.LanguageExtensions as LangExt
 
 import Control.Monad
@@ -80,11 +94,11 @@ import Control.Monad
 -}
 
 synonymTyConsOfType :: Type -> [TyCon]
--- Does not look through type synonyms at all
--- Return a list of synonym tycons
+-- Does not look through type synonyms at all.
+-- Returns a list of synonym tycons in nondeterministic order.
 -- Keep this synchronized with 'expandTypeSynonyms'
 synonymTyConsOfType ty
-  = nameEnvElts (go ty)
+  = nonDetNameEnvElts (go ty)
   where
      go :: Type -> NameEnv TyCon  -- The NameEnv does duplicate elim
      go (TyConApp tc tys) = go_tc tc `plusNameEnv` go_s tys
@@ -142,7 +156,7 @@ synonymTyConsOfType ty
      go_prov (PhantomProv co)     = go_co co
      go_prov (ProofIrrelProv co)  = go_co co
      go_prov (PluginProv _)       = emptyNameEnv
-     go_prov CorePrepProv         = emptyNameEnv
+     go_prov (CorePrepProv _)     = emptyNameEnv
 
      go_tc tc | isTypeSynonymTyCon tc = unitNameEnv (tyConName tc) tc
               | otherwise             = emptyNameEnv
@@ -156,7 +170,11 @@ newtype SynCycleM a = SynCycleM {
     runSynCycleM :: SynCycleState -> Either (SrcSpan, SDoc) (a, SynCycleState) }
     deriving (Functor)
 
-type SynCycleState = NameSet
+-- TODO: TyConSet is implemented as IntMap over uniques.
+-- But we could get away with something based on IntSet
+-- since we only check membershib, but never extract the
+-- elements.
+type SynCycleState = TyConSet
 
 instance Applicative SynCycleM where
     pure x = SynCycleM $ \state -> Right (x, state)
@@ -174,12 +192,12 @@ failSynCycleM loc err = SynCycleM $ \_ -> Left (loc, err)
 
 -- | Test if a 'Name' is acyclic, short-circuiting if we've
 -- seen it already.
-checkNameIsAcyclic :: Name -> SynCycleM () -> SynCycleM ()
-checkNameIsAcyclic n m = SynCycleM $ \s ->
-    if n `elemNameSet` s
+checkTyConIsAcyclic :: TyCon -> SynCycleM () -> SynCycleM ()
+checkTyConIsAcyclic tc m = SynCycleM $ \s ->
+    if tc `elemTyConSet` s
         then Right ((), s) -- short circuit
         else case runSynCycleM m s of
-                Right ((), s') -> Right ((), extendNameSet s' n)
+                Right ((), s') -> Right ((), extendTyConSet s' tc)
                 Left err -> Left err
 
 -- | Checks if any of the passed in 'TyCon's have cycles.
@@ -188,9 +206,9 @@ checkNameIsAcyclic n m = SynCycleM $ \s ->
 -- the corresponding @LTyClDecl Name@ for each 'TyCon', so we
 -- can give better error messages.
 checkSynCycles :: Unit -> [TyCon] -> [LTyClDecl GhcRn] -> TcM ()
-checkSynCycles this_uid tcs tyclds = do
-    case runSynCycleM (mapM_ (go emptyNameSet []) tcs) emptyNameSet of
-        Left (loc, err) -> setSrcSpan loc $ failWithTc err
+checkSynCycles this_uid tcs tyclds =
+    case runSynCycleM (mapM_ (go emptyTyConSet []) tcs) emptyTyConSet of
+        Left (loc, err) -> setSrcSpan loc $ failWithTc (TcRnUnknownMessage $ mkPlainError noHints err)
         Right _  -> return ()
   where
     -- Try our best to print the LTyClDecl for locally defined things
@@ -198,15 +216,15 @@ checkSynCycles this_uid tcs tyclds = do
 
     -- Short circuit if we've already seen this Name and concluded
     -- it was acyclic.
-    go :: NameSet -> [TyCon] -> TyCon -> SynCycleM ()
+    go :: TyConSet -> [TyCon] -> TyCon -> SynCycleM ()
     go so_far seen_tcs tc =
-        checkNameIsAcyclic (tyConName tc) $ go' so_far seen_tcs tc
+        checkTyConIsAcyclic tc $ go' so_far seen_tcs tc
 
     -- Expand type synonyms, complaining if you find the same
     -- type synonym a second time.
-    go' :: NameSet -> [TyCon] -> TyCon -> SynCycleM ()
+    go' :: TyConSet -> [TyCon] -> TyCon -> SynCycleM ()
     go' so_far seen_tcs tc
-        | n `elemNameSet` so_far
+        | tc `elemTyConSet` so_far
             = failSynCycleM (getSrcSpan (head seen_tcs)) $
                   sep [ text "Cycle in type synonym declarations:"
                       , nest 2 (vcat (map ppr_decl seen_tcs)) ]
@@ -221,20 +239,20 @@ checkSynCycles this_uid tcs tyclds = do
                isInteractiveModule mod)
             = return ()
         | Just ty <- synTyConRhs_maybe tc =
-            go_ty (extendNameSet so_far (tyConName tc)) (tc:seen_tcs) ty
+            go_ty (extendTyConSet so_far tc) (tc:seen_tcs) ty
         | otherwise = return ()
       where
         n = tyConName tc
         mod = nameModule n
         ppr_decl tc =
           case lookupNameEnv lcl_decls n of
-            Just (L loc decl) -> ppr loc <> colon <+> ppr decl
+            Just (L loc decl) -> ppr (locA loc) <> colon <+> ppr decl
             Nothing -> ppr (getSrcSpan n) <> colon <+> ppr n
                        <+> text "from external module"
          where
           n = tyConName tc
 
-    go_ty :: NameSet -> [TyCon] -> Type -> SynCycleM ()
+    go_ty :: TyConSet -> [TyCon] -> Type -> SynCycleM ()
     go_ty so_far seen_tcs ty =
         mapM_ (go so_far seen_tcs) (synonymTyConsOfType ty)
 
@@ -284,11 +302,13 @@ and now expand superclasses for constraint (C Id):
 Each step expands superclasses one layer, and clearly does not terminate.
 -}
 
+type ClassSet = UniqSet Class
+
 checkClassCycles :: Class -> Maybe SDoc
 -- Nothing  <=> ok
 -- Just err <=> possible cycle error
 checkClassCycles cls
-  = do { (definite_cycle, err) <- go (unitNameSet (getName cls))
+  = do { (definite_cycle, err) <- go (unitUniqSet cls)
                                      cls (mkTyVarTys (classTyVars cls))
        ; let herald | definite_cycle = text "Superclass cycle for"
                     | otherwise      = text "Potential superclass cycle for"
@@ -304,12 +324,12 @@ checkClassCycles cls
     -- NB: this code duplicates TcType.transSuperClasses, but
     --     with more error message generation clobber
     -- Make sure the two stay in sync.
-    go :: NameSet -> Class -> [Type] -> Maybe (Bool, SDoc)
+    go :: ClassSet -> Class -> [Type] -> Maybe (Bool, SDoc)
     go so_far cls tys = firstJusts $
                         map (go_pred so_far) $
                         immSuperClasses cls tys
 
-    go_pred :: NameSet -> PredType -> Maybe (Bool, SDoc)
+    go_pred :: ClassSet -> PredType -> Maybe (Bool, SDoc)
        -- Nothing <=> ok
        -- Just (True, err)  <=> definite cycle
        -- Just (False, err) <=> possible cycle
@@ -322,7 +342,7 @@ checkClassCycles cls
        | otherwise
        = Nothing
 
-    go_tc :: NameSet -> PredType -> TyCon -> [Type] -> Maybe (Bool, SDoc)
+    go_tc :: ClassSet -> PredType -> TyCon -> [Type] -> Maybe (Bool, SDoc)
     go_tc so_far pred tc tys
       | isFamilyTyCon tc
       = Just (False, hang (text "one of whose superclass constraints is headed by a type family:")
@@ -332,18 +352,16 @@ checkClassCycles cls
       | otherwise   -- Equality predicate, for example
       = Nothing
 
-    go_cls :: NameSet -> Class -> [Type] -> Maybe (Bool, SDoc)
+    go_cls :: ClassSet -> Class -> [Type] -> Maybe (Bool, SDoc)
     go_cls so_far cls tys
-       | cls_nm `elemNameSet` so_far
+       | cls `elementOfUniqSet` so_far
        = Just (True, text "one of whose superclasses is" <+> quotes (ppr cls))
        | isCTupleClass cls
        = go so_far cls tys
        | otherwise
-       = do { (b,err) <- go  (so_far `extendNameSet` cls_nm) cls tys
+       = do { (b,err) <- go  (so_far `addOneToUniqSet` cls) cls tys
           ; return (b, text "one of whose superclasses is" <+> quotes (ppr cls)
                        $$ err) }
-       where
-         cls_nm = getName cls
 
 {-
 ************************************************************************
@@ -635,6 +653,8 @@ markNominal lcls ty = let nvars = fvVarList (FV.delFVs lcls $ get_ty_vars ty) in
      -- recurring into coercions. Recall: coercions are totally ignored during
      -- role inference. See [Coercions in role inference]
     get_ty_vars :: Type -> FV
+    get_ty_vars t                 | Just t' <- coreView t -- #20999
+                                  = get_ty_vars t'
     get_ty_vars (TyVarTy tv)      = unitFV tv
     get_ty_vars (AppTy t1 t2)     = get_ty_vars t1 `unionFV` get_ty_vars t2
     get_ty_vars (FunTy _ w t1 t2) = get_ty_vars w `unionFV` get_ty_vars t1 `unionFV` get_ty_vars t2
@@ -700,21 +720,21 @@ runRoleM env thing = (env', update)
 
 setRoleInferenceTc :: Name -> RoleM a -> RoleM a
 setRoleInferenceTc name thing = RM $ \m_name vps nvps state ->
-                                ASSERT( isNothing m_name )
-                                ASSERT( isEmptyVarEnv vps )
-                                ASSERT( nvps == 0 )
+                                assert (isNothing m_name) $
+                                assert (isEmptyVarEnv vps) $
+                                assert (nvps == 0) $
                                 unRM thing (Just name) vps nvps state
 
 addRoleInferenceVar :: TyVar -> RoleM a -> RoleM a
 addRoleInferenceVar tv thing
   = RM $ \m_name vps nvps state ->
-    ASSERT( isJust m_name )
+    assert (isJust m_name) $
     unRM thing m_name (extendVarEnv vps tv nvps) (nvps+1) state
 
 setRoleInferenceVars :: [TyVar] -> RoleM a -> RoleM a
 setRoleInferenceVars tvs thing
   = RM $ \m_name _vps _nvps state ->
-    ASSERT( isJust m_name )
+    assert (isJust m_name) $
     unRM thing m_name (mkVarEnv (zip tvs [0..])) (panic "setRoleInferenceVars")
          state
 
@@ -749,12 +769,14 @@ updateRoleEnv name n role
 *                                                                      *
 ********************************************************************* -}
 
-addTyConsToGblEnv :: [TyCon] -> TcM TcGblEnv
+addTyConsToGblEnv :: [TyCon] -> TcM (TcGblEnv, ThBindEnv)
 -- Given a [TyCon], add to the TcGblEnv
 --   * extend the TypeEnv with the tycons
 --   * extend the TypeEnv with their implicitTyThings
 --   * extend the TypeEnv with any default method Ids
 --   * add bindings for record selectors
+-- Return separately the TH levels of these bindings,
+-- to be added to a LclEnv later.
 addTyConsToGblEnv tyclss
   = tcExtendTyConEnv tyclss                    $
     tcExtendGlobalEnvImplicit implicit_things  $
@@ -763,7 +785,9 @@ addTyConsToGblEnv tyclss
             [ text "tycons" <+> ppr tyclss
             , text "implicits" <+> ppr implicit_things ]
        ; gbl_env <- tcRecSelBinds (mkRecSelBinds tyclss)
-       ; return gbl_env }
+       ; th_bndrs <- tcTyThBinders implicit_things
+       ; return (gbl_env, th_bndrs)
+       }
  where
    implicit_things = concatMap implicitTyConThings tyclss
    def_meth_ids    = mkDefaultMethodIds tyclss
@@ -838,7 +862,8 @@ tcRecSelBinds sel_bind_prs
                                      tcValBinds TopLevel binds sigs getGblEnv
        ; return (tcg_env `addTypecheckedBinds` map snd rec_sel_binds) }
   where
-    sigs = [ L loc (IdSig noExtField sel_id) | (sel_id, _) <- sel_bind_prs
+    sigs = [ L (noAnnSrcSpan loc) (IdSig noExtField sel_id)
+                                             | (sel_id, _) <- sel_bind_prs
                                              , let loc = getSrcSpan sel_id ]
     binds = [(NonRecursive, unitBag bind) | (_, bind) <- sel_bind_prs]
 
@@ -853,15 +878,19 @@ mkRecSelBinds tycons
 mkRecSelBind :: (TyCon, FieldLabel) -> (Id, LHsBind GhcRn)
 mkRecSelBind (tycon, fl)
   = mkOneRecordSelector all_cons (RecSelData tycon) fl
+        FieldSelectors  -- See Note [NoFieldSelectors and naughty record selectors]
   where
     all_cons = map RealDataCon (tyConDataCons tycon)
 
-mkOneRecordSelector :: [ConLike] -> RecSelParent -> FieldLabel
+mkOneRecordSelector :: [ConLike] -> RecSelParent -> FieldLabel -> FieldSelectors
                     -> (Id, LHsBind GhcRn)
-mkOneRecordSelector all_cons idDetails fl
-  = (sel_id, L loc sel_bind)
+mkOneRecordSelector all_cons idDetails fl has_sel
+  = (sel_id, L (noAnnSrcSpan loc) sel_bind)
   where
     loc      = getSrcSpan sel_name
+    loc'     = noAnnSrcSpan loc
+    locn     = noAnnSrcSpan loc
+    locc     = noAnnSrcSpan loc
     lbl      = flLabel fl
     sel_name = flSelector fl
 
@@ -870,7 +899,7 @@ mkOneRecordSelector all_cons idDetails fl
 
     -- Find a representative constructor, con1
     cons_w_field = conLikesWithFields all_cons [lbl]
-    con1 = ASSERT( not (null cons_w_field) ) head cons_w_field
+    con1 = assert (not (null cons_w_field)) $ head cons_w_field
 
     -- Selector type; Note [Polymorphic selectors]
     field_ty   = conLikeFieldType con1 lbl
@@ -878,9 +907,11 @@ mkOneRecordSelector all_cons idDetails fl
                  conLikeUserTyVarBinders con1
     data_tv_set= tyCoVarsOfTypes inst_tys
     is_naughty = not (tyCoVarsOfType field_ty `subVarSet` data_tv_set)
+                    || has_sel == NoFieldSelectors
     sel_ty | is_naughty = unitTy  -- See Note [Naughty record selectors]
            | otherwise  = mkForAllTys (tyVarSpecToBinders data_tvbs) $
-                          mkPhiTy (conLikeStupidTheta con1) $   -- Urgh!
+                          -- Urgh! See Note [The stupid context] in GHC.Core.DataCon
+                          mkPhiTy (conLikeStupidTheta con1) $
                           -- req_theta is empty for normal DataCon
                           mkPhiTy req_theta                 $
                           mkVisFunTyMany data_ty            $
@@ -898,18 +929,19 @@ mkOneRecordSelector all_cons idDetails fl
                                            [] unit_rhs]
              | otherwise =  map mk_match cons_w_field ++ deflt
     mk_match con = mkSimpleMatch (mkPrefixFunRhs sel_lname)
-                                 [L loc (mk_sel_pat con)]
-                                 (L loc (HsVar noExtField (L loc field_var)))
-    mk_sel_pat con = ConPat NoExtField (L loc (getName con)) (RecCon rec_fields)
+                                 [L loc' (mk_sel_pat con)]
+                                 (L loc' (HsVar noExtField (L locn field_var)))
+    mk_sel_pat con = ConPat NoExtField (L locn (getName con)) (RecCon rec_fields)
     rec_fields = HsRecFields { rec_flds = [rec_field], rec_dotdot = Nothing }
-    rec_field  = noLoc (HsRecField
-                        { hsRecFieldLbl
-                           = L loc (FieldOcc sel_name
-                                     (L loc $ mkVarUnqual lbl))
-                        , hsRecFieldArg
-                           = L loc (VarPat noExtField (L loc field_var))
-                        , hsRecPun = False })
-    sel_lname = L loc sel_name
+    rec_field  = noLocA (HsFieldBind
+                        { hfbAnn = noAnn
+                        , hfbLHS
+                           = L locc (FieldOcc sel_name
+                                      (L locn $ mkVarUnqual lbl))
+                        , hfbRHS
+                           = L loc' (VarPat noExtField (L locn field_var))
+                        , hfbPun = False })
+    sel_lname = L locn sel_name
     field_var = mkInternalName (mkBuiltinUnique 1) (getOccName sel_name) loc
 
     -- Add catch-all default case unless the case is exhaustive
@@ -917,10 +949,11 @@ mkOneRecordSelector all_cons idDetails fl
     -- mentions this particular record selector
     deflt | all dealt_with all_cons = []
           | otherwise = [mkSimpleMatch CaseAlt
-                            [L loc (WildPat noExtField)]
-                            (mkHsApp (L loc (HsVar noExtField
-                                         (L loc (getName rEC_SEL_ERROR_ID))))
-                                     (L loc (HsLit noExtField msg_lit)))]
+                            [wrapGenSpan (WildPat noExtField)]
+                            (wrapGenSpan
+                                (HsApp noComments
+                                    (wrapGenSpan (HsVar noExtField (wrapGenSpan (getName rEC_SEL_ERROR_ID))))
+                                    (wrapGenSpan (HsLit noComments msg_lit))))]
 
         -- Do not add a default case unless there are unmatched
         -- constructors.  We must take account of GADTs, else we
@@ -941,17 +974,17 @@ mkOneRecordSelector all_cons idDetails fl
     eq_subst = mkTvSubstPrs (map eqSpecPair eq_spec)
     -- inst_tys corresponds to one of the following:
     --
-    -- * The arguments to the user-written return type (for GADT constructors).
-    --   In this scenario, eq_subst provides a mapping from the universally
-    --   quantified type variables to the argument types. Note that eq_subst
-    --   does not need to be applied to any other part of the DataCon
-    --   (see Note [The dcEqSpec domain invariant] in GHC.Core.DataCon).
-    -- * The universally quantified type variables
-    --   (for Haskell98-style constructors and pattern synonyms). In these
-    --   scenarios, eq_subst is an empty substitution.
+    --  * The arguments to the user-written return type (for GADT constructors).
+    --    In this scenario, eq_subst provides a mapping from the universally
+    --    quantified type variables to the argument types. Note that eq_subst
+    --    does not need to be applied to any other part of the DataCon
+    --    (see Note [The dcEqSpec domain invariant] in GHC.Core.DataCon).
+    --  * The universally quantified type variables
+    --    (for Haskell98-style constructors and pattern synonyms). In these
+    --    scenarios, eq_subst is an empty substitution.
     inst_tys = substTyVars eq_subst univ_tvs
 
-    unit_rhs = mkLHsTupleExpr []
+    unit_rhs = mkLHsTupleExpr [] noExtField
     msg_lit = HsStringPrim NoSourceText (bytesFS lbl)
 
 {-
@@ -1019,6 +1052,26 @@ For naughty selectors we make a dummy binding
 so that the later type-check will add them to the environment, and they'll be
 exported.  The function is never called, because the typechecker spots the
 sel_naughty field.
+
+Note [NoFieldSelectors and naughty record selectors]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Under NoFieldSelectors (see Note [NoFieldSelectors] in GHC.Rename.Env), record
+selectors will not be in scope in the renamer.  However, for normal datatype
+declarations we still generate the underlying selector functions, so they can be
+used for constructing the dictionaries for HasField constraints (as described by
+Note [HasField instances] in GHC.Tc.Instance.Class).  Hence the call to
+mkOneRecordSelector in mkRecSelBind always uses FieldSelectors.
+
+However, record pattern synonyms are not used with HasField, so when
+NoFieldSelectors is used we do not need to generate selector functions.  Thus
+mkPatSynRecSelBinds passes the current state of the FieldSelectors extension to
+mkOneRecordSelector, and in the NoFieldSelectors case it will treat them as
+"naughty" fields (see Note [Naughty record selectors]).
+
+Why generate a naughty binding, rather than no binding at all? Because when
+type-checking a record update, we need to look up Ids for the fields. In
+particular, disambiguateRecordBinds calls lookupParents which needs to look up
+the RecSelIds to determine the sel_tycon.
 
 Note [GADT record selectors]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1093,11 +1146,6 @@ We want to generate HsBinds for unT that look something like this:
 Note that the type of recSelError is `forall r (a :: TYPE r). Addr# -> a`.
 Therefore, when used in the right-hand side of `unT`, GHC attempts to
 instantiate `a` with `(forall b. b -> b) -> Int`, which is impredicative.
-To make sure that GHC is OK with this, we enable ImpredicativeTypes interally
+To make sure that GHC is OK with this, we enable ImpredicativeTypes internally
 when typechecking these HsBinds so that the user does not have to.
-
-Although ImpredicativeTypes is somewhat fragile and unpredictable in GHC right
-now, it will become robust when Quick Look impredicativity is implemented. In
-the meantime, using ImpredicativeTypes to instantiate the `a` type variable in
-recSelError's type does actually work, so its use here is benign.
 -}

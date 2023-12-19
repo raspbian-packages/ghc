@@ -1,5 +1,8 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE CPP #-}
+
+#include <ghcplatform.h>
+
 module System.Process.Posix
     ( mkProcessHandle
     , translateInternal
@@ -42,6 +45,10 @@ import qualified System.Posix.IO as Posix
 import System.Posix.Process (getProcessGroupIDOf)
 
 import System.Process.Common hiding (mb_delegate_ctlc)
+
+#if defined(wasm32_HOST_ARCH)
+import System.IO.Error
+#endif
 
 #include "HsProcessConfig.h"
 #include "processFlags.h"
@@ -262,6 +269,27 @@ endDelegateControlC exitCode = do
       where
         sig = fromIntegral (-n)
 
+#if defined(wasm32_HOST_ARCH)
+
+c_runInteractiveProcess
+        ::  Ptr CString
+        -> CString
+        -> Ptr CString
+        -> FD
+        -> FD
+        -> FD
+        -> Ptr FD
+        -> Ptr FD
+        -> Ptr FD
+        -> Ptr CGid
+        -> Ptr CUid
+        -> CInt                         -- flags
+        -> Ptr CString
+        -> IO PHANDLE
+c_runInteractiveProcess _ _ _ _ _ _ _ _ _ _ _ _ _ = ioError (ioeSetLocation unsupportedOperation "runInteractiveProcess")
+
+#else
+
 foreign import ccall unsafe "runInteractiveProcess"
   c_runInteractiveProcess
         ::  Ptr CString
@@ -278,6 +306,8 @@ foreign import ccall unsafe "runInteractiveProcess"
         -> CInt                         -- flags
         -> Ptr CString
         -> IO PHANDLE
+
+#endif
 
 ignoreSignal, defaultSignal :: CLong
 ignoreSignal  = CONST_SIG_IGN

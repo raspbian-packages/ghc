@@ -8,14 +8,15 @@ module GHC.Cmm.Switch (
      switchTargetsToList, eqSwitchTargetWith,
 
      SwitchPlan(..),
-     targetSupportsSwitch,
+     backendSupportsSwitch,
      createSwitchPlan,
   ) where
 
 import GHC.Prelude
 
 import GHC.Utils.Outputable
-import GHC.Driver.Session
+import GHC.Driver.Backend
+import GHC.Utils.Panic
 import GHC.Cmm.Dataflow.Label (Label)
 
 import Data.Maybe
@@ -25,7 +26,6 @@ import qualified Data.Map as M
 
 -- Note [Cmm Switches, the general plan]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
---
 -- Compiling a high-level switch statement, as it comes out of a STG case
 -- expression, for example, allows for a surprising amount of design decisions.
 -- Therefore, we cleanly separated this from the Stg → Cmm transformation, as
@@ -50,10 +50,9 @@ import qualified Data.Map as M
 -- See Note [GHC.Cmm.Switch vs. GHC.Cmm.Switch.Implement] why the two module are
 -- separated.
 
------------------------------------------------------------------------------
+
 -- Note [Magic Constants in GHC.Cmm.Switch]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
---
 -- There are a lot of heuristics here that depend on magic values where it is
 -- hard to determine the "best" value (for whatever that means). These are the
 -- magic values:
@@ -82,7 +81,6 @@ minJumpTableOffset = 2
 
 -- Note [SwitchTargets]
 -- ~~~~~~~~~~~~~~~~~~~~
---
 -- The branches of a switch are stored in a SwitchTargets, which consists of an
 -- (optional) default jump target, and a map from values to jump targets.
 --
@@ -174,7 +172,6 @@ switchTargetsToTable (SwitchTargets _ (lo,hi) mbdef branches)
 
 -- Note [Jump Table Offset]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~
---
 -- Usually, the code for a jump table starting at x will first subtract x from
 -- the value, to avoid a large amount of empty entries. But if x is very small,
 -- the extra entries are no worse than the subtraction in terms of code size, and
@@ -238,7 +235,6 @@ data SwitchPlan
 --
 -- Note [createSwitchPlan]
 -- ~~~~~~~~~~~~~~~~~~~~~~~
---
 -- A SwitchPlan describes how a Switch statement is to be broken down into
 -- smaller pieces suitable for code generation.
 --
@@ -316,12 +312,12 @@ and slowed down all other cases making it not worthwhile.
 -}
 
 
--- | Does the target support switch out of the box? Then leave this to the
--- target!
-targetSupportsSwitch :: HscTarget -> Bool
-targetSupportsSwitch HscC = True
-targetSupportsSwitch HscLlvm = True
-targetSupportsSwitch _ = False
+-- | Does the backend support switch out of the box? Then leave this to the
+-- backend!
+backendSupportsSwitch :: Backend -> Bool
+backendSupportsSwitch ViaC = True
+backendSupportsSwitch LLVM = True
+backendSupportsSwitch _    = False
 
 -- | This function creates a SwitchPlan from a SwitchTargets value, breaking it
 -- down into smaller pieces suitable for code generation.

@@ -11,7 +11,7 @@ is enabled by default, so no special flags are required. The `Concurrent
 Haskell
 paper <https://www.haskell.org/ghc/docs/papers/concurrent-haskell.ps.gz>`__
 is still an excellent resource, as is `Tackling the awkward
-squad <http://research.microsoft.com/%7Esimonpj/papers/marktoberdorf/>`__.
+squad <https://www.microsoft.com/en-us/research/publication/tackling-awkward-squad-monadic-inputoutput-concurrency-exceptions-foreign-language-calls-haskell/>`__.
 
 To the programmer, Concurrent Haskell introduces no new language
 constructs; rather, it appears simply as a library,
@@ -24,7 +24,7 @@ constructs; rather, it appears simply as a library,
 -  Synchronised mutable variables, called ``MVars``
 
 -  Support for bound threads; see the paper `Extending the FFI with
-   concurrency <http://community.haskell.org/~simonmar/papers/conc-ffi.pdf>`__.
+   concurrency <https://simonmar.github.io/bib/papers/conc-ffi.pdf>`__.
 
 
 Parallel Haskell
@@ -51,7 +51,7 @@ way to do so is forking threads using Concurrent Haskell
 parallelism from pure code is to use the ``par`` combinator, which is
 closely related to (and often used with) ``seq``. Both of these are
 available from the
-`parallel library <http://hackage.haskell.org/package/parallel>`__:
+`parallel library <https://hackage.haskell.org/package/parallel>`__:
 
 ::
 
@@ -110,6 +110,6 @@ working from the runtime statistics; see :ref:`rts-options-gc`.
 
 More sophisticated combinators for expressing parallelism are available
 from the ``Control.Parallel.Strategies`` module in the `parallel
-package <http://hackage.haskell.org/package/parallel>`__. This module
+package <https://hackage.haskell.org/package/parallel>`__. This module
 builds functionality around ``par``, expressing more elaborate patterns
 of parallel computation, such as parallel ``map``.

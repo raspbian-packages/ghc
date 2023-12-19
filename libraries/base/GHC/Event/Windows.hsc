@@ -14,7 +14,7 @@
 -- License     :  BSD-style (see the file libraries/base/LICENSE)
 --
 -- Maintainer  :  libraries@haskell.org
--- Stability   :  experimental
+-- Stability   :  stable
 -- Portability :  non-portable
 --
 -- WinIO Windows event manager.
@@ -481,7 +481,7 @@ associateHandle' hwnd
 
 -- | A handle value representing an invalid handle.
 invalidHandle :: HANDLE
-invalidHandle = intPtrToPtr (#{const INVALID_HANDLE_VALUE})
+invalidHandle = iNVALID_HANDLE_VALUE
 
 -- | Associate a 'HANDLE' with the I/O manager's completion port.  This must be
 -- done before using the handle with 'withOverlapped'.
@@ -495,9 +495,8 @@ associateHandle Manager{..} h =
       FFI.associateHandleWithIOCP mgrIOCP h (fromIntegral $ ptrToWordPtr h)
 
 
-{- Note [Why use non-waiting getOverlappedResult requests.]
-   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
+{- Note [Why use non-waiting getOverlappedResult requests]
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   When waiting for a request that is bound to be done soon
   we spin inside waitForCompletion. There are multiple reasons
   for this.
@@ -529,30 +528,33 @@ withOverlappedEx :: forall a.
                     Manager
                  -> String -- ^ Handle name
                  -> HANDLE -- ^ Windows handle associated with the operation.
+                 -> Bool
                  -> Word64 -- ^ Value to use for the @OVERLAPPED@
                            --   structure's Offset/OffsetHigh members.
                  -> StartIOCallback Int
                  -> CompletionCallback (IOResult a)
                  -> IO (IOResult a)
-withOverlappedEx mgr fname h offset startCB completionCB = do
+withOverlappedEx mgr fname h async offset startCB completionCB = do
     signal <- newEmptyIOPort :: IO (IOPort (IOResult a))
     let signalReturn a = failIfFalse_ (dbgMsg "signalReturn") $
                             writeIOPort signal (IOSuccess a)
         signalThrow ex = failIfFalse_ (dbgMsg "signalThrow") $
                             writeIOPort signal (IOFailed ex)
     mask_ $ do
-      let completionCB' e b = completionCB e b >>= \result ->
-                                case result of
-                                  IOSuccess val -> signalReturn val
-                                  IOFailed  err -> signalThrow err
-      let callbackData = CompletionData h completionCB'
+      let completionCB' e b = do
+            result <- completionCB e b
+            case result of
+              IOSuccess val -> signalReturn val
+              IOFailed  err -> signalThrow err
+
       -- Note [Memory Management]
+      -- ~~~~~~~~~~~~~~~~~~~~~~~~
       -- These callback data and especially the overlapped structs have to keep
       -- alive throughout the entire lifetime of the requests.   Since this
       -- function will block until done so it can call completionCB at the end
       -- we can safely use dynamic memory management here and so reduce the
       -- possibility of memory errors.
-      withRequest offset callbackData $ \hs_lpol cdData -> do
+      withRequest async offset h completionCB' $ \hs_lpol cdData -> do
         let ptr_lpol = hs_lpol `plusPtr` cdOffset
         let lpol = castPtr hs_lpol
         -- We need to add the payload before calling startCBResult, the reason being
@@ -564,7 +566,7 @@ withOverlappedEx mgr fname h offset startCB completionCB = do
         -- relied on for non-file handles we need a way to prevent
         -- us from handling a request inline and handle a completion
         -- event handled without a queued I/O operation.  Which means we
-        -- can't solely rely on the number of oustanding requests but most
+        -- can't solely rely on the number of outstanding requests but most
         -- also check intermediate status.
         reqs <- addRequest
         debugIO $ "+1.. " ++ show reqs ++ " requests queued. | " ++ show lpol
@@ -625,11 +627,11 @@ withOverlappedEx mgr fname h offset startCB completionCB = do
               -- Normally we'd have to clear lpol with 0 before this call,
               -- however the statuses we're interested in would not get to here
               -- so we can save the memset call.
-              finished <- FFI.getOverlappedResult h lpol False
+              finished <- FFI.getOverlappedResult h lpol (not async)
+              lasterr <- getLastError
               debugIO $ "== " ++ show (finished)
               status <- FFI.overlappedIOStatus lpol
               debugIO $ "== >< " ++ show (status)
-              lasterr <- getLastError
               -- This status indicated that we have finished early and so we
               -- won't have a request enqueued.  Handle it inline.
               let done_early = status == #{const STATUS_SUCCESS}
@@ -748,7 +750,7 @@ withOverlappedEx mgr fname h offset startCB completionCB = do
               -- otherwise the RTS will lock up until we get a result back.
               -- In the threaded case it can be beneficial to spin on the haskell
               -- side versus
-              -- See also Note [Why use non-waiting getOverlappedResult requests.]
+              -- See also Note [Why use non-waiting getOverlappedResult requests]
               res <- FFI.getOverlappedResult fhndl lpol False
               status <- FFI.overlappedIOStatus lpol
               case res of
@@ -779,7 +781,8 @@ withOverlappedEx mgr fname h offset startCB completionCB = do
             unless :: Bool -> IO () -> IO ()
             unless p a = if p then a else return ()
 
--- Safe version of function
+-- Safe version of function of withOverlappedEx that assumes your handle is
+-- set up for asynchronous access.
 withOverlapped :: String
                -> HANDLE
                -> Word64 -- ^ Value to use for the @OVERLAPPED@
@@ -789,7 +792,7 @@ withOverlapped :: String
                -> IO (IOResult a)
 withOverlapped fname h offset startCB completionCB = do
   mngr <- getSystemManager
-  withOverlappedEx mngr fname h offset startCB completionCB
+  withOverlappedEx mngr fname h True offset startCB completionCB
 
 ------------------------------------------------------------------------
 -- Helper to check if an error code implies an operation has completed.
@@ -1064,7 +1067,7 @@ processCompletion Manager{..} n delay = do
           when (oldDataPtr /= nullPtr && oldDataPtr /= castPtr nullReq) $
             do debugIO $ "exchanged: " ++ show oldDataPtr
                payload <- peek oldDataPtr :: IO CompletionData
-               let !cb = cdCallback payload
+               cb <- deRefStablePtr (cdCallback payload)
                reqs <- removeRequest
                debugIO $ "-1.. " ++ show reqs ++ " requests queued."
                status <- FFI.overlappedIOStatus (lpOverlapped oe)
@@ -1160,7 +1163,7 @@ io_mngr_loop _event mgr = go False
              exit <-
                case event_id of
                  _ | event_id == io_MANAGER_WAKEUP -> return False
-                 _ | event_id == io_MANAGER_DIE    -> return True
+                 _ | event_id == io_MANAGER_DIE    -> c_ioManagerFinished >> return True
                  0 -> return False -- spurious wakeup
                  _ -> do debugIO $ "handling console event: " ++ show (event_id `shiftR` 1)
                          start_console_handler (event_id `shiftR` 1)
@@ -1200,6 +1203,9 @@ foreign import ccall unsafe "getIOManagerEvent" -- in the RTS (ThrIOManager.c)
 -- * Wakeup events, which are not used by WINIO and will be ignored
 foreign import ccall unsafe "readIOManagerEvent" -- in the RTS (ThrIOManager.c)
   c_readIOManagerEvent :: IO Word32
+
+foreign import ccall unsafe "ioManagerFinished" -- in the RTS (ThrIOManager.c)
+  c_ioManagerFinished :: IO ()
 
 foreign import ccall unsafe "rtsSupportsBoundThreads" threadedIOMgr :: Bool
 

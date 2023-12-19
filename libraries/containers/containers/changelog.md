@@ -1,6 +1,86 @@
 # Changelog for [`containers` package](http://github.com/haskell/containers)
 
-## [0.6.4.1]
+## 0.6.7
+
+### Additions
+
+* Add `takeWhileAntitone`, `dropWhileAntitone`, and `spanAntitone` for `IntMap`
+  and `IntSet`. (Soumik Sarkar)
+
+* Add a `Foldable1` instance for `Data.Tree`.
+
+### Improvements
+
+* Speed up splitting functions for `IntSet` and `IntMap`. (Soumik Sarkar)
+
+* Speed up `Foldable` methods for `Data.Tree`. (Soumik Sarkar)
+
+* Speed up `Data.Graph.dfs` (Soumik Sarkar)
+
+* Inline a few functions in `Data.Graph` to enable list fusion. This
+  immediately improves the performance of the `transposeG` and `scc` functions.
+  Mark several others `INLINABLE` to allow specialization.  (Soumik Sarkar)
+
+* Optimize `Data.Graph.bcc`, most notably replacing lists by difference lists
+  to avoid quadratic complexity. (Soumik Sarkar)
+
+### Documentation
+
+* Improve various documentation and documentation formatting (Joseph C. Sible,
+  konsumlamm, Soumik Sarkar, Alberto Fanton)
+
+* Add and correct time complexity documentation. (Soumik Sarkar)
+
+* Update `CONTRIBUTING.md` instructions for building with `stack` and `cabal`,
+  and add a note about how to avoid unnecessary recompilations. (Melanie
+  Phoenix)
+
+### Miscellaneous/internal
+
+* Remove now-redundant CPP. (Alexandre Esteves)
+* Avoid `head` and `tail`. (Bodigrim)
+* Fix build paths in `gitignore`. (Alexandre Esteves)
+* Add extra implicit dependencies for `DeriveLift`. (Matthew Pickering)
+* Work around `Prelude` changes for `liftA2`. (David Feuer)
+* Add several property tests and too many benchmarks to count. (Soumik Sarkar)
+* Add benchmarks for `Data.Set.powerSet`. (jwaldmann)
+* Improve `Data.Set.powerSet` property test. (David Feuer)
+* Fix test name. (Marcin Szamotulski)
+* Fix error messages in internal `Data.Set` functions. (Erik de Castro Lopo)
+
+## 0.6.6
+
+* Drop support for GHC versions before 8.0.2.
+
+* Bump Cabal version for tests, and use `common` clauses to reduce
+  duplication.
+
+### New instances
+
+* Add `Lift` instances for use with Template Haskell. Specifically:
+  `Seq`, `ViewL`, and `ViewR` (in `Data.Sequence`), `Map`, `Set`,
+  `IntMap`, `IntSet`, `Tree`, and `SCC` (in `Data.Graph`).
+
+## 0.6.5.1
+
+### Bug fixes
+
+* `foldr'` and `foldl'` for `Map` and `Set` are now strict everywhere they
+  should be, and we have detailed tests to make sure they stay that way.
+  (Thanks, coot.)
+
+* The `Ord IntSet` instance, which was broken in 0.6.3.1, has been
+  repaired.
+
+### New instance
+
+* We now have `Ord a => Ord (Tree a)` (Thanks, Ericson2314.)
+
+### Testing fixes
+
+* Thanks to konsumlamm and infinity0 for various bug fixes in the test suite.
+
+## 0.6.4.1
 
 ### Bug fixes
 

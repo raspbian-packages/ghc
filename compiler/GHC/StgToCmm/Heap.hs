@@ -32,7 +32,6 @@ import GHC.StgToCmm.Monad
 import GHC.StgToCmm.Prof (profDynAlloc, dynProfHdr, staticProfHdr)
 import GHC.StgToCmm.Ticky
 import GHC.StgToCmm.Closure
-import GHC.StgToCmm.Env
 
 import GHC.Cmm.Graph
 
@@ -45,8 +44,8 @@ import GHC.Types.CostCentre
 import GHC.Types.Id.Info( CafInfo(..), mayHaveCafRefs )
 import GHC.Types.Id ( Id )
 import GHC.Unit
-import GHC.Driver.Session
 import GHC.Platform
+import GHC.Platform.Profile
 import GHC.Data.FastString( mkFastString, fsLit )
 import GHC.Utils.Panic( sorry )
 
@@ -135,20 +134,19 @@ allocHeapClosure rep info_ptr use_cc payload = do
   hpStore base payload
 
   -- Bump the virtual heap pointer
-  dflags <- getDynFlags
-  setVirtHp (virt_hp + heapClosureSizeW dflags rep)
+  profile <- getProfile
+  setVirtHp (virt_hp + heapClosureSizeW profile rep)
 
   return base
 
 
 emitSetDynHdr :: CmmExpr -> CmmExpr -> CmmExpr -> FCode ()
 emitSetDynHdr base info_ptr ccs
-  = do dflags <- getDynFlags
-       let platform = targetPlatform dflags
-       hpStore base (zip (header dflags) [0, platformWordSizeInBytes platform ..])
+  = do profile <- getProfile
+       hpStore base (zip (header profile) [0, profileWordSizeInBytes profile ..])
   where
-    header :: DynFlags -> [CmmExpr]
-    header dflags = [info_ptr] ++ dynProfHdr dflags ccs
+    header :: Profile -> [CmmExpr]
+    header profile = [info_ptr] ++ dynProfHdr profile ccs
         -- ToDo: Parallel stuff
         -- No ticky header
 
@@ -167,17 +165,17 @@ hpStore base vals = do
 -- and adding a static link field if necessary.
 
 mkStaticClosureFields
-        :: DynFlags
+        :: Profile
         -> CmmInfoTable
         -> CostCentreStack
         -> CafInfo
         -> [CmmLit]             -- Payload
         -> [CmmLit]             -- The full closure
-mkStaticClosureFields dflags info_tbl ccs caf_refs payload
-  = mkStaticClosure dflags info_lbl ccs payload padding
+mkStaticClosureFields profile info_tbl ccs caf_refs payload
+  = mkStaticClosure profile info_lbl ccs payload padding
         static_link_field saved_info_field
   where
-    platform = targetPlatform dflags
+    platform = profilePlatform profile
     info_lbl = cit_lbl info_tbl
 
     -- CAFs must have consistent layout, regardless of whether they
@@ -219,11 +217,11 @@ mkStaticClosureFields dflags info_tbl ccs caf_refs payload
                                       -- See Note [STATIC_LINK fields]
                                       -- in rts/sm/Storage.h
 
-mkStaticClosure :: DynFlags -> CLabel -> CostCentreStack -> [CmmLit]
+mkStaticClosure :: Profile -> CLabel -> CostCentreStack -> [CmmLit]
   -> [CmmLit] -> [CmmLit] -> [CmmLit] -> [CmmLit]
-mkStaticClosure dflags info_lbl ccs payload padding static_link_field saved_info_field
+mkStaticClosure profile info_lbl ccs payload padding static_link_field saved_info_field
   =  [CmmLabel info_lbl]
-  ++ staticProfHdr dflags ccs
+  ++ staticProfHdr profile ccs
   ++ payload
   ++ padding
   ++ static_link_field
@@ -333,16 +331,18 @@ entryHeapCheck :: ClosureInfo
                -> FCode ()
                -> FCode ()
 
-entryHeapCheck cl_info nodeSet arity args code
-  = entryHeapCheck' is_fastf node arity args code
-  where
+entryHeapCheck cl_info nodeSet arity args code = do
+  platform <- getPlatform
+  let
     node = case nodeSet of
               Just r  -> CmmReg (CmmLocal r)
-              Nothing -> CmmLit (CmmLabel $ staticClosureLabel cl_info)
+              Nothing -> CmmLit (CmmLabel $ staticClosureLabel platform cl_info)
 
     is_fastf = case closureFunInfo cl_info of
                  Just (_, ArgGen _) -> False
                  _otherwise         -> True
+
+  entryHeapCheck' is_fastf node arity args code
 
 -- | lower-level version for "GHC.Cmm.Parser"
 entryHeapCheck' :: Bool           -- is a known function pattern
@@ -352,7 +352,7 @@ entryHeapCheck' :: Bool           -- is a known function pattern
                 -> FCode ()
                 -> FCode ()
 entryHeapCheck' is_fastf node arity args code
-  = do dflags <- getDynFlags
+  = do profile <- getProfile
        let is_thunk = arity == 0
 
            args' = map (CmmReg . CmmLocal) args
@@ -367,13 +367,13 @@ entryHeapCheck' is_fastf node arity args code
            -}
            gc_call upd
                | is_thunk
-                 = mkJump dflags NativeNodeCall stg_gc_enter1 [node] upd
+                 = mkJump profile NativeNodeCall stg_gc_enter1 [node] upd
 
                | is_fastf
-                 = mkJump dflags NativeNodeCall stg_gc_fun (node : args') upd
+                 = mkJump profile NativeNodeCall stg_gc_fun (node : args') upd
 
                | otherwise
-                 = mkJump dflags Slow stg_gc_fun (node : args') upd
+                 = mkJump profile Slow stg_gc_fun (node : args') upd
 
        updfr_sz <- getUpdFrameOff
 
@@ -404,13 +404,13 @@ altHeapCheck regs code = altOrNoEscapeHeapCheck False regs code
 
 altOrNoEscapeHeapCheck :: Bool -> [LocalReg] -> FCode a -> FCode a
 altOrNoEscapeHeapCheck checkYield regs code = do
-    dflags <- getDynFlags
+    profile <- getProfile
     platform <- getPlatform
     case cannedGCEntryPoint platform regs of
       Nothing -> genericGC checkYield code
       Just gc -> do
         lret <- newBlockId
-        let (off, _, copyin) = copyInOflow dflags NativeReturn (Young lret) regs []
+        let (off, _, copyin) = copyInOflow profile NativeReturn (Young lret) regs []
         lcont <- newBlockId
         tscope <- getTickScope
         emitOutOfLine lret (copyin <*> mkBranch lcont, tscope)
@@ -428,15 +428,15 @@ altHeapCheckReturnsTo regs lret off code
 -- is more efficient), but cannot be optimized away in the non-allocating
 -- case because it may occur in a loop
 noEscapeHeapCheck :: [LocalReg] -> FCode a -> FCode a
-noEscapeHeapCheck regs code = altOrNoEscapeHeapCheck True regs code
+noEscapeHeapCheck = altOrNoEscapeHeapCheck True
 
 cannedGCReturnsTo :: Bool -> Bool -> CmmExpr -> [LocalReg] -> Label -> ByteOff
                   -> FCode a
                   -> FCode a
 cannedGCReturnsTo checkYield cont_on_stack gc regs lret off code
-  = do dflags <- getDynFlags
+  = do profile <- getProfile
        updfr_sz <- getUpdFrameOff
-       heapCheck False checkYield (gc_call dflags gc updfr_sz) code
+       heapCheck False checkYield (gc_call profile gc updfr_sz) code
   where
     reg_exprs = map (CmmReg . CmmLocal) regs
       -- Note [stg_gc arguments]
@@ -445,11 +445,11 @@ cannedGCReturnsTo checkYield cont_on_stack gc regs lret off code
       -- to the canned heap-check routines, because we are in a case
       -- alternative and hence the [LocalReg] was passed to us in the
       -- NativeReturn convention.
-    gc_call dflags label sp
+    gc_call profile label sp
       | cont_on_stack
-      = mkJumpReturnsTo dflags label NativeReturn reg_exprs lret off sp
+      = mkJumpReturnsTo profile label NativeReturn reg_exprs lret off sp
       | otherwise
-      = mkCallReturnsTo dflags label NativeReturn reg_exprs lret off sp []
+      = mkCallReturnsTo profile label NativeReturn reg_exprs lret off sp []
 
 genericGC :: Bool -> FCode a -> FCode a
 genericGC checkYield code
@@ -490,6 +490,7 @@ cannedGCEntryPoint platform regs
       _otherwise -> Nothing
 
 -- Note [stg_gc arguments]
+-- ~~~~~~~~~~~~~~~~~~~~~~~
 -- It might seem that we could avoid passing the arguments to the
 -- stg_gc function, because they are already in the right registers.
 -- While this is usually the case, it isn't always.  Sometimes the
@@ -521,8 +522,7 @@ heapCheck checkStack checkYield do_gc code
   = getHeapUsage $ \ hpHw ->
     -- Emit heap checks, but be sure to do it lazily so
     -- that the conditionals on hpHw don't cause a black hole
-    do  { dflags <- getDynFlags
-        ; platform <- getPlatform
+    do  { platform <- getPlatform
         ; let mb_alloc_bytes
                  | hpHw > mBLOCK_SIZE = sorry $ unlines
                     [" Trying to allocate more than "++show mBLOCK_SIZE++" bytes.",
@@ -533,7 +533,10 @@ heapCheck checkStack checkYield do_gc code
                      "structures in code."]
                  | hpHw > 0  = Just (mkIntExpr platform (hpHw * (platformWordSizeInBytes platform)))
                  | otherwise = Nothing
-                 where mBLOCK_SIZE = bLOCKS_PER_MBLOCK dflags * bLOCK_SIZE_W dflags
+                 where
+                  constants = platformConstants platform
+                  bLOCK_SIZE_W = pc_BLOCK_SIZE (platformConstants platform) `quot` platformWordSizeInBytes platform
+                  mBLOCK_SIZE = pc_BLOCKS_PER_MBLOCK constants * bLOCK_SIZE_W
               stk_hwm | checkStack = Just (CmmLit CmmHighStackMark)
                       | otherwise  = Nothing
         ; codeOnly $ do_checks stk_hwm checkYield mb_alloc_bytes do_gc
@@ -602,9 +605,9 @@ do_checks :: Maybe CmmExpr    -- Should we check the stack?
           -> CmmAGraph        -- What to do on failure
           -> FCode ()
 do_checks mb_stk_hwm checkYield mb_alloc_lit do_gc = do
-  dflags <- getDynFlags
-  platform <- getPlatform
-  gc_id <- newBlockId
+  omit_yields <- stgToCmmOmitYields <$> getStgToCmmConfig
+  platform    <- getPlatform
+  gc_id       <- newBlockId
 
   let
     Just alloc_lit = mb_alloc_lit
@@ -641,13 +644,13 @@ do_checks mb_stk_hwm checkYield mb_alloc_lit do_gc = do
         | checkYield && isJust mb_stk_hwm -> emitLabel loop_header_id
     _otherwise -> return ()
 
-  if (isJust mb_alloc_lit)
+  if isJust mb_alloc_lit
     then do
      tickyHeapCheck
      emitAssign hpReg bump_hp
      emit =<< mkCmmIfThen' hp_oflo (alloc_n <*> mkBranch gc_id) (Just False)
-    else do
-      when (checkYield && not (gopt Opt_OmitYields dflags)) $ do
+    else
+      when (checkYield && not omit_yields) $ do
          -- Yielding if HpLim == 0
          let yielding = CmmMachOp (mo_wordEq platform)
                                   [CmmReg hpLimReg,
@@ -667,7 +670,6 @@ do_checks mb_stk_hwm checkYield mb_alloc_lit do_gc = do
 
 -- Note [Self-recursive loop header]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
---
 -- Self-recursive loop header is required by loopification optimization (See
 -- Note [Self-recursive tail calls] in GHC.StgToCmm.Expr). We emit it if:
 --

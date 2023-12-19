@@ -15,6 +15,10 @@ types that
 -}
 
 {-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleInstances #-}
+
 {-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 
 module GHC.Types.Basic (
@@ -23,20 +27,12 @@ module GHC.Types.Basic (
 
         ConTag, ConTagZ, fIRST_TAG,
 
-        Arity, RepArity, JoinArity,
+        Arity, RepArity, JoinArity, FullArgCount,
 
         Alignment, mkAlignment, alignmentOf, alignmentBytes,
 
         PromotionFlag(..), isPromoted,
         FunctionOrData(..),
-
-        WarningTxt(..), pprWarningTxtForMsg, StringLiteral(..),
-
-        Fixity(..), FixityDirection(..),
-        defaultFixity, maxPrecedence, minPrecedence,
-        negateFixity, funTyFixity,
-        compareFixity,
-        LexicalFixity(..),
 
         RecFlag(..), isRec, isNonRec, boolToRecFlag,
         Origin(..), isGenerated,
@@ -50,12 +46,15 @@ module GHC.Types.Basic (
 
         Boxity(..), isBoxed,
 
+        CbvMark(..), isMarkedCbv,
+
         PprPrec(..), topPrec, sigPrec, opPrec, funPrec, starPrec, appPrec,
         maybeParen,
 
         TupleSort(..), tupleSortBoxity, boxityTupleSort,
         tupleParens,
 
+        UnboxedTupleOrSum(..), unboxedTupleOrSumExtension,
         sumParens, pprAlternative,
 
         -- ** The OneShotInfo type
@@ -78,18 +77,21 @@ module GHC.Types.Basic (
         DefMethSpec(..),
         SwapFlag(..), flipSwap, unSwap, isSwapped,
 
-        CompilerPhase(..), PhaseNum,
+        CompilerPhase(..), PhaseNum, beginPhase, nextPhase, laterPhase,
 
         Activation(..), isActive, competesWith,
         isNeverActive, isAlwaysActive, activeInFinalPhase,
-        activateAfterInitial, activateDuringFinal,
+        activateAfterInitial, activateDuringFinal, activeAfter,
 
         RuleMatchInfo(..), isConLike, isFunLike,
         InlineSpec(..), noUserInlineSpec,
         InlinePragma(..), defaultInlinePragma, alwaysInlinePragma,
         neverInlinePragma, dfunInlinePragma,
         isDefaultInlinePragma,
-        isInlinePragma, isInlinablePragma, isAnyInlinePragma,
+        isInlinePragma, isInlinablePragma, isNoInlinePragma, isOpaquePragma,
+        isAnyInlinePragma, alwaysInlineConLikePragma,
+        inlinePragmaSource,
+        inlinePragmaName, inlineSpecSource,
         inlinePragmaSpec, inlinePragmaSat,
         inlinePragmaActivation, inlinePragmaRuleMatchInfo,
         setInlinePragmaActivation, setInlinePragmaRuleMatchInfo,
@@ -97,28 +99,32 @@ module GHC.Types.Basic (
 
         SuccessFlag(..), succeeded, failed, successIf,
 
-        IntegralLit(..), FractionalLit(..),
-        negateIntegralLit, negateFractionalLit,
-        mkIntegralLit, mkFractionalLit,
-        integralFractionalLit,
-
-        SourceText(..), pprWithSourceText,
-
-        IntWithInf, infinity, treatZeroAsInf, mkIntWithInf, intGtLimit,
+        IntWithInf, infinity, treatZeroAsInf, subWithInf, mkIntWithInf, intGtLimit,
 
         SpliceExplicitFlag(..),
 
-        TypeOrKind(..), isTypeLevel, isKindLevel
+        TypeOrKind(..), isTypeLevel, isKindLevel,
+
+        Levity(..), mightBeLifted, mightBeUnlifted,
+
+        ExprOrPat(..),
+
+        NonStandardDefaultingStrategy(..),
+        DefaultingStrategy(..), defaultNonStandardTyVars,
+
+        ForeignSrcLang (..)
    ) where
 
 import GHC.Prelude
 
+import GHC.ForeignSrcLang
 import GHC.Data.FastString
 import GHC.Utils.Outputable
-import GHC.Types.SrcLoc ( Located,unLoc )
-import Data.Data hiding (Fixity, Prefix, Infix)
-import Data.Function (on)
-import Data.Bits
+import GHC.Utils.Panic
+import GHC.Utils.Binary
+import GHC.Types.SourceText
+import qualified GHC.LanguageExtensions as LangExt
+import Data.Data
 import qualified Data.Semigroup as Semi
 
 {-
@@ -139,6 +145,16 @@ pickLR CRight (_,r) = r
 instance Outputable LeftOrRight where
   ppr CLeft    = text "Left"
   ppr CRight   = text "Right"
+
+instance Binary LeftOrRight where
+   put_ bh CLeft  = putByte bh 0
+   put_ bh CRight = putByte bh 1
+
+   get bh = do { h <- getByte bh
+               ; case h of
+                   0 -> return CLeft
+                   _ -> return CRight }
+
 
 {-
 ************************************************************************
@@ -170,6 +186,11 @@ type RepArity = Int
 -- are counted.
 type JoinArity = Int
 
+-- | FullArgCount is the number of type or value arguments in an application,
+-- or the number of type or value binders in a lambda.  Note: it includes
+-- both type and value arguments!
+type FullArgCount = Int
+
 {-
 ************************************************************************
 *                                                                      *
@@ -178,7 +199,7 @@ type JoinArity = Int
 ************************************************************************
 -}
 
--- | Constructor Tag
+-- | A *one-index* constructor tag
 --
 -- Type of the tags associated with each constructor possibility or superclass
 -- selector
@@ -233,6 +254,10 @@ alignmentOf x = case x .&. 7 of
 
 instance Outputable Alignment where
   ppr (Alignment m) = ppr m
+
+instance OutputableP env Alignment where
+  pdoc _ = ppr
+
 {-
 ************************************************************************
 *                                                                      *
@@ -394,6 +419,17 @@ instance Outputable PromotionFlag where
   ppr NotPromoted = text "NotPromoted"
   ppr IsPromoted  = text "IsPromoted"
 
+instance Binary PromotionFlag where
+   put_ bh NotPromoted = putByte bh 0
+   put_ bh IsPromoted  = putByte bh 1
+
+   get bh = do
+       n <- getByte bh
+       case n of
+         0 -> return NotPromoted
+         1 -> return IsPromoted
+         _ -> fail "Binary(IsPromoted): fail)"
+
 {-
 ************************************************************************
 *                                                                      *
@@ -409,62 +445,15 @@ instance Outputable FunctionOrData where
     ppr IsFunction = text "(function)"
     ppr IsData     = text "(data)"
 
-{-
-************************************************************************
-*                                                                      *
-                Deprecations
-*                                                                      *
-************************************************************************
--}
-
--- | A String Literal in the source, including its original raw format for use by
--- source to source manipulation tools.
-data StringLiteral = StringLiteral
-                       { sl_st :: SourceText, -- literal raw source.
-                                              -- See not [Literal source text]
-                         sl_fs :: FastString  -- literal string value
-                       } deriving Data
-
-instance Eq StringLiteral where
-  (StringLiteral _ a) == (StringLiteral _ b) = a == b
-
-instance Outputable StringLiteral where
-  ppr sl = pprWithSourceText (sl_st sl) (ftext $ sl_fs sl)
-
--- | Warning Text
---
--- reason/explanation from a WARNING or DEPRECATED pragma
-data WarningTxt = WarningTxt (Located SourceText)
-                             [Located StringLiteral]
-                | DeprecatedTxt (Located SourceText)
-                                [Located StringLiteral]
-    deriving (Eq, Data)
-
-instance Outputable WarningTxt where
-    ppr (WarningTxt    lsrc ws)
-      = case unLoc lsrc of
-          NoSourceText   -> pp_ws ws
-          SourceText src -> text src <+> pp_ws ws <+> text "#-}"
-
-    ppr (DeprecatedTxt lsrc  ds)
-      = case unLoc lsrc of
-          NoSourceText   -> pp_ws ds
-          SourceText src -> text src <+> pp_ws ds <+> text "#-}"
-
-pp_ws :: [Located StringLiteral] -> SDoc
-pp_ws [l] = ppr $ unLoc l
-pp_ws ws
-  = text "["
-    <+> vcat (punctuate comma (map (ppr . unLoc) ws))
-    <+> text "]"
-
-
-pprWarningTxtForMsg :: WarningTxt -> SDoc
-pprWarningTxtForMsg (WarningTxt    _ ws)
-                     = doubleQuotes (vcat (map (ftext . sl_fs . unLoc) ws))
-pprWarningTxtForMsg (DeprecatedTxt _ ds)
-                     = text "Deprecated:" <+>
-                       doubleQuotes (vcat (map (ftext . sl_fs . unLoc) ds))
+instance Binary FunctionOrData where
+    put_ bh IsFunction = putByte bh 0
+    put_ bh IsData     = putByte bh 1
+    get bh = do
+        h <- getByte bh
+        case h of
+          0 -> return IsFunction
+          1 -> return IsData
+          _ -> panic "Binary FunctionOrData"
 
 {-
 ************************************************************************
@@ -479,81 +468,6 @@ type RuleName = FastString
 pprRuleName :: RuleName -> SDoc
 pprRuleName rn = doubleQuotes (ftext rn)
 
-{-
-************************************************************************
-*                                                                      *
-\subsection[Fixity]{Fixity info}
-*                                                                      *
-************************************************************************
--}
-
-------------------------
-data Fixity = Fixity SourceText Int FixityDirection
-  -- Note [Pragma source text]
-  deriving Data
-
-instance Outputable Fixity where
-    ppr (Fixity _ prec dir) = hcat [ppr dir, space, int prec]
-
-instance Eq Fixity where -- Used to determine if two fixities conflict
-  (Fixity _ p1 dir1) == (Fixity _ p2 dir2) = p1==p2 && dir1 == dir2
-
-------------------------
-data FixityDirection = InfixL | InfixR | InfixN
-                     deriving (Eq, Data)
-
-instance Outputable FixityDirection where
-    ppr InfixL = text "infixl"
-    ppr InfixR = text "infixr"
-    ppr InfixN = text "infix"
-
-------------------------
-maxPrecedence, minPrecedence :: Int
-maxPrecedence = 9
-minPrecedence = 0
-
-defaultFixity :: Fixity
-defaultFixity = Fixity NoSourceText maxPrecedence InfixL
-
-negateFixity, funTyFixity :: Fixity
--- Wired-in fixities
-negateFixity = Fixity NoSourceText 6 InfixL  -- Fixity of unary negate
-funTyFixity  = Fixity NoSourceText (-1) InfixR  -- Fixity of '->', see #15235
-
-{-
-Consider
-
-\begin{verbatim}
-        a `op1` b `op2` c
-\end{verbatim}
-@(compareFixity op1 op2)@ tells which way to arrange application, or
-whether there's an error.
--}
-
-compareFixity :: Fixity -> Fixity
-              -> (Bool,         -- Error please
-                  Bool)         -- Associate to the right: a op1 (b op2 c)
-compareFixity (Fixity _ prec1 dir1) (Fixity _ prec2 dir2)
-  = case prec1 `compare` prec2 of
-        GT -> left
-        LT -> right
-        EQ -> case (dir1, dir2) of
-                        (InfixR, InfixR) -> right
-                        (InfixL, InfixL) -> left
-                        _                -> error_please
-  where
-    right        = (False, True)
-    left         = (False, False)
-    error_please = (True,  False)
-
--- |Captures the fixity of declarations as they are parsed. This is not
--- necessarily the same as the fixity declaration, as the normal fixity may be
--- overridden using parens or backticks.
-data LexicalFixity = Prefix | Infix deriving (Data,Eq)
-
-instance Outputable LexicalFixity where
-  ppr Prefix = text "Prefix"
-  ppr Infix  = text "Infix"
 
 {-
 ************************************************************************
@@ -566,6 +480,7 @@ instance Outputable LexicalFixity where
 data TopLevelFlag
   = TopLevel
   | NotTopLevel
+  deriving Data
 
 isTopLevel, isNotTopLevel :: TopLevelFlag -> Bool
 
@@ -600,6 +515,43 @@ instance Outputable Boxity where
   ppr Boxed   = text "Boxed"
   ppr Unboxed = text "Unboxed"
 
+instance Binary Boxity where -- implemented via isBoxed-isomorphism to Bool
+  put_ bh = put_ bh . isBoxed
+  get bh  = do
+    b <- get bh
+    pure $ if b then Boxed else Unboxed
+
+{-
+************************************************************************
+*                                                                      *
+                Call by value flag
+*                                                                      *
+************************************************************************
+-}
+
+-- | Should an argument be passed evaluated *and* tagged.
+data CbvMark = MarkedCbv | NotMarkedCbv
+    deriving Eq
+
+instance Outputable CbvMark where
+  ppr MarkedCbv    = text "!"
+  ppr NotMarkedCbv = text "~"
+
+instance Binary CbvMark where
+    put_ bh NotMarkedCbv = putByte bh 0
+    put_ bh MarkedCbv    = putByte bh 1
+    get bh =
+      do h <- getByte bh
+         case h of
+           0 -> return NotMarkedCbv
+           1 -> return MarkedCbv
+           _ -> panic "Invalid binary format"
+
+isMarkedCbv :: CbvMark -> Bool
+isMarkedCbv MarkedCbv = True
+isMarkedCbv NotMarkedCbv = False
+
+
 {-
 ************************************************************************
 *                                                                      *
@@ -628,6 +580,17 @@ boolToRecFlag False = NonRecursive
 instance Outputable RecFlag where
   ppr Recursive    = text "Recursive"
   ppr NonRecursive = text "NonRecursive"
+
+instance Binary RecFlag where
+    put_ bh Recursive =
+            putByte bh 0
+    put_ bh NonRecursive =
+            putByte bh 1
+    get bh = do
+            h <- getByte bh
+            case h of
+              0 -> return Recursive
+              _ -> return NonRecursive
 
 {-
 ************************************************************************
@@ -668,7 +631,7 @@ instance Outputable Origin where
 --                              @'\{-\# INCOHERENT'@,
 --      'GHC.Parser.Annotation.AnnClose' @`\#-\}`@,
 
--- For details on above see note [Api annotations] in "GHC.Parser.Annotation"
+-- For details on above see Note [exact print annotations] in "GHC.Parser.Annotation"
 data OverlapFlag = OverlapFlag
   { overlapMode   :: OverlapMode
   , isSafeOverlap :: Bool
@@ -752,7 +715,7 @@ data OverlapMode  -- See Note [Rules for instance lookup] in GHC.Core.InstEnv
     -- instance                   Foo [a]
     -- Without the Incoherent flag, we'd complain that
     -- instantiating 'b' would change which instance
-    -- was chosen. See also note [Incoherent instances] in "GHC.Core.InstEnv"
+    -- was chosen. See also Note [Incoherent instances] in "GHC.Core.InstEnv"
 
   deriving (Eq, Data)
 
@@ -766,6 +729,31 @@ instance Outputable OverlapMode where
    ppr (Overlapping  _) = text "[overlapping]"
    ppr (Overlaps     _) = text "[overlap ok]"
    ppr (Incoherent   _) = text "[incoherent]"
+
+instance Binary OverlapMode where
+    put_ bh (NoOverlap    s) = putByte bh 0 >> put_ bh s
+    put_ bh (Overlaps     s) = putByte bh 1 >> put_ bh s
+    put_ bh (Incoherent   s) = putByte bh 2 >> put_ bh s
+    put_ bh (Overlapping  s) = putByte bh 3 >> put_ bh s
+    put_ bh (Overlappable s) = putByte bh 4 >> put_ bh s
+    get bh = do
+        h <- getByte bh
+        case h of
+            0 -> (get bh) >>= \s -> return $ NoOverlap s
+            1 -> (get bh) >>= \s -> return $ Overlaps s
+            2 -> (get bh) >>= \s -> return $ Incoherent s
+            3 -> (get bh) >>= \s -> return $ Overlapping s
+            4 -> (get bh) >>= \s -> return $ Overlappable s
+            _ -> panic ("get OverlapMode" ++ show h)
+
+
+instance Binary OverlapFlag where
+    put_ bh flag = do put_ bh (overlapMode flag)
+                      put_ bh (isSafeOverlap flag)
+    get bh = do
+        h <- get bh
+        b <- get bh
+        return OverlapFlag { overlapMode = h, isSafeOverlap = b }
 
 pprSafeOverlap :: Bool -> SDoc
 pprSafeOverlap True  = text "[safe]"
@@ -881,6 +869,18 @@ instance Outputable TupleSort where
       UnboxedTuple    -> "UnboxedTuple"
       ConstraintTuple -> "ConstraintTuple"
 
+instance Binary TupleSort where
+    put_ bh BoxedTuple      = putByte bh 0
+    put_ bh UnboxedTuple    = putByte bh 1
+    put_ bh ConstraintTuple = putByte bh 2
+    get bh = do
+      h <- getByte bh
+      case h of
+        0 -> return BoxedTuple
+        1 -> return UnboxedTuple
+        _ -> return ConstraintTuple
+
+
 tupleSortBoxity :: TupleSort -> Boxity
 tupleSortBoxity BoxedTuple      = Boxed
 tupleSortBoxity UnboxedTuple    = Unboxed
@@ -892,9 +892,9 @@ boxityTupleSort Unboxed = UnboxedTuple
 
 tupleParens :: TupleSort -> SDoc -> SDoc
 tupleParens BoxedTuple      p = parens p
-tupleParens UnboxedTuple    p = text "(#" <+> p <+> ptext (sLit "#)")
+tupleParens UnboxedTuple    p = text "(#" <+> p <+> text "#)"
 tupleParens ConstraintTuple p   -- In debug-style write (% Eq a, Ord b %)
-  = ifPprDebug (text "(%" <+> p <+> ptext (sLit "%)"))
+  = ifPprDebug (text "(%" <+> p <+> text "%)")
                (parens p)
 
 {-
@@ -906,7 +906,7 @@ tupleParens ConstraintTuple p   -- In debug-style write (% Eq a, Ord b %)
 -}
 
 sumParens :: SDoc -> SDoc
-sumParens p = ptext (sLit "(#") <+> p <+> ptext (sLit "#)")
+sumParens p = text "(#" <+> p <+> text "#)"
 
 -- | Pretty print an alternative in an unboxed sum e.g. "| a | |".
 pprAlternative :: (a -> SDoc) -- ^ The pretty printing function to use
@@ -917,6 +917,22 @@ pprAlternative :: (a -> SDoc) -- ^ The pretty printing function to use
                               -- printed and finally packed into a paragraph.
 pprAlternative pp x alt arity =
     fsep (replicate (alt - 1) vbar ++ [pp x] ++ replicate (arity - alt) vbar)
+
+-- | Are we dealing with an unboxed tuple or an unboxed sum?
+--
+-- Used when validity checking, see 'check_ubx_tuple_or_sum'.
+data UnboxedTupleOrSum
+  = UnboxedTupleType
+  | UnboxedSumType
+  deriving Eq
+
+instance Outputable UnboxedTupleOrSum where
+  ppr UnboxedTupleType = text "UnboxedTupleType"
+  ppr UnboxedSumType   = text "UnboxedSumType"
+
+unboxedTupleOrSumExtension :: UnboxedTupleOrSum -> LangExt.Extension
+unboxedTupleOrSumExtension UnboxedTupleType = LangExt.UnboxedTuples
+unboxedTupleOrSumExtension UnboxedSumType   = LangExt.UnboxedSums
 
 {-
 ************************************************************************
@@ -995,7 +1011,7 @@ type RulesOnly = Bool
 type BranchCount = Int
   -- For OneOcc, the BranchCount says how many syntactic occurrences there are
   -- At the moment we really only check for 1 or >1, but in principle
-  --   we could pay attention to how *many* occurences there are
+  --   we could pay attention to how *many* occurrences there are
   --   (notably in postInlineUnconditionally).
   -- But meanwhile, Ints are very efficiently represented.
 
@@ -1200,6 +1216,12 @@ instance Outputable (DefMethSpec ty) where
 
 data SuccessFlag = Succeeded | Failed
 
+instance Semigroup SuccessFlag where
+  Failed <> _ = Failed
+  _ <> Failed = Failed
+  _ <> _      = Succeeded
+
+
 instance Outputable SuccessFlag where
     ppr Succeeded = text "Succeeded"
     ppr Failed    = text "Failed"
@@ -1214,83 +1236,6 @@ succeeded Failed    = False
 
 failed Succeeded = False
 failed Failed    = True
-
-{-
-************************************************************************
-*                                                                      *
-\subsection{Source Text}
-*                                                                      *
-************************************************************************
-Keeping Source Text for source to source conversions
-
-Note [Pragma source text]
-~~~~~~~~~~~~~~~~~~~~~~~~~
-The lexer does a case-insensitive match for pragmas, as well as
-accepting both UK and US spelling variants.
-
-So
-
-  {-# SPECIALISE #-}
-  {-# SPECIALIZE #-}
-  {-# Specialize #-}
-
-will all generate ITspec_prag token for the start of the pragma.
-
-In order to be able to do source to source conversions, the original
-source text for the token needs to be preserved, hence the
-`SourceText` field.
-
-So the lexer will then generate
-
-  ITspec_prag "{ -# SPECIALISE"
-  ITspec_prag "{ -# SPECIALIZE"
-  ITspec_prag "{ -# Specialize"
-
-for the cases above.
- [without the space between '{' and '-', otherwise this comment won't parse]
-
-
-Note [Literal source text]
-~~~~~~~~~~~~~~~~~~~~~~~~~~
-The lexer/parser converts literals from their original source text
-versions to an appropriate internal representation. This is a problem
-for tools doing source to source conversions, so the original source
-text is stored in literals where this can occur.
-
-Motivating examples for HsLit
-
-  HsChar          '\n'       == '\x20`
-  HsCharPrim      '\x41`#    == `A`
-  HsString        "\x20\x41" == " A"
-  HsStringPrim    "\x20"#    == " "#
-  HsInt           001        == 1
-  HsIntPrim       002#       == 2#
-  HsWordPrim      003##      == 3##
-  HsInt64Prim     004##      == 4##
-  HsWord64Prim    005##      == 5##
-  HsInteger       006        == 6
-
-For OverLitVal
-
-  HsIntegral      003      == 0x003
-  HsIsString      "\x41nd" == "And"
--}
-
- -- Note [Literal source text],[Pragma source text]
-data SourceText = SourceText String
-                | NoSourceText -- ^ For when code is generated, e.g. TH,
-                               -- deriving. The pretty printer will then make
-                               -- its own representation of the item.
-                deriving (Data, Show, Eq )
-
-instance Outputable SourceText where
-  ppr (SourceText s) = text "SourceText" <+> text s
-  ppr NoSourceText   = text "NoSourceText"
-
--- | Special combinator for showing string literals.
-pprWithSourceText :: SourceText -> SDoc -> SDoc
-pprWithSourceText NoSourceText     d = d
-pprWithSourceText (SourceText src) _ = text src
 
 {-
 ************************************************************************
@@ -1339,7 +1284,7 @@ instance Outputable CompilerPhase where
    ppr InitialPhase = text "InitialPhase"
    ppr FinalPhase   = text "FinalPhase"
 
--- See note [Pragma source text]
+-- See Note [Pragma source text]
 data Activation
   = AlwaysActive
   | ActiveBefore SourceText PhaseNum  -- Active only *strictly before* this phase
@@ -1349,12 +1294,43 @@ data Activation
   deriving( Eq, Data )
     -- Eq used in comparing rules in GHC.Hs.Decls
 
-activateAfterInitial :: Activation
--- Active in the first phase after the initial phase
+beginPhase :: Activation -> CompilerPhase
+-- First phase in which the Activation is active
+-- or FinalPhase if it is never active
+beginPhase AlwaysActive      = InitialPhase
+beginPhase (ActiveBefore {}) = InitialPhase
+beginPhase (ActiveAfter _ n) = Phase n
+beginPhase FinalActive       = FinalPhase
+beginPhase NeverActive       = FinalPhase
+
+activeAfter :: CompilerPhase -> Activation
+-- (activeAfter p) makes an Activation that is active in phase p and after
+-- Invariant: beginPhase (activeAfter p) = p
+activeAfter InitialPhase = AlwaysActive
+activeAfter (Phase n)    = ActiveAfter NoSourceText n
+activeAfter FinalPhase   = FinalActive
+
+nextPhase :: CompilerPhase -> CompilerPhase
+-- Tells you the next phase after this one
 -- Currently we have just phases [2,1,0,FinalPhase,FinalPhase,...]
 -- Where FinalPhase means GHC's internal simplification steps
 -- after all rules have run
-activateAfterInitial = ActiveAfter NoSourceText 2
+nextPhase InitialPhase = Phase 2
+nextPhase (Phase 0)    = FinalPhase
+nextPhase (Phase n)    = Phase (n-1)
+nextPhase FinalPhase   = FinalPhase
+
+laterPhase :: CompilerPhase -> CompilerPhase -> CompilerPhase
+-- Returns the later of two phases
+laterPhase (Phase n1)   (Phase n2)   = Phase (n1 `min` n2)
+laterPhase InitialPhase p2           = p2
+laterPhase FinalPhase   _            = FinalPhase
+laterPhase p1           InitialPhase = p1
+laterPhase _            FinalPhase   = FinalPhase
+
+activateAfterInitial :: Activation
+-- Active in the first phase after the initial phase
+activateAfterInitial = activeAfter (nextPhase InitialPhase)
 
 activateDuringFinal :: Activation
 -- Active in the final simplification phase (which is repeated)
@@ -1459,11 +1435,14 @@ data RuleMatchInfo = ConLike                    -- See Note [CONLIKE pragma]
 
 -- | Inline Specification
 data InlineSpec   -- What the user's INLINE pragma looked like
-  = Inline       -- User wrote INLINE
-  | Inlinable    -- User wrote INLINABLE
-  | NoInline     -- User wrote NOINLINE
-  | NoUserInline -- User did not write any of INLINE/INLINABLE/NOINLINE
-                 -- e.g. in `defaultInlinePragma` or when created by CSE
+  = Inline    SourceText       -- User wrote INLINE
+  | Inlinable SourceText       -- User wrote INLINABLE
+  | NoInline  SourceText       -- User wrote NOINLINE
+  | Opaque    SourceText       -- User wrote OPAQUE
+                               -- Each of the above keywords is accompanied with
+                               -- a string of type SourceText written by the user
+  | NoUserInlinePrag -- User did not write any of INLINE/INLINABLE/NOINLINE
+                     -- e.g. in `defaultInlinePragma` or when created by CSE
   deriving( Eq, Data, Show )
         -- Show needed for GHC.Parser.Lexer
 
@@ -1473,7 +1452,7 @@ This data type mirrors what you can write in an INLINE or NOINLINE pragma in
 the source program.
 
 If you write nothing at all, you get defaultInlinePragma:
-   inl_inline = NoUserInline
+   inl_inline = NoUserInlinePrag
    inl_act    = AlwaysActive
    inl_rule   = FunLike
 
@@ -1486,8 +1465,8 @@ If you want to know where InlinePragmas take effect: Look in GHC.HsToCore.Binds.
 
 Note [inl_inline and inl_act]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-* inl_inline says what the user wrote: did she say INLINE, NOINLINE,
-  INLINABLE, or nothing at all
+* inl_inline says what the user wrote: did they say INLINE, NOINLINE,
+  INLINABLE, OPAQUE, or nothing at all
 
 * inl_act says in what phases the unfolding is active or inactive
   E.g  If you write INLINE[1]    then inl_act will be set to ActiveAfter 1
@@ -1536,6 +1515,52 @@ The main effects of CONLIKE are:
 
     - The rule matcher consults this field.  See
       Note [Expanding variables] in GHC.Core.Rules.
+
+Note [OPAQUE pragma]
+~~~~~~~~~~~~~~~~~~~~
+Suppose a function `f` is marked {-# OPAQUE f #-}.  Then every call of `f`
+should remain a call of `f` throughout optimisation; it should not be turned
+into a call of a name-mangled variant of `f` (e.g by worker/wrapper).
+
+The motivation for the OPAQUE pragma is discussed in GHC proposal 0415:
+https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0415-opaque-pragma.rst
+Basically it boils down to the desire of GHC API users and GHC RULE writers for
+calls to certain binders to be left completely untouched by GHCs optimisations.
+
+What this entails at the time of writing, is that for every binder annotated
+with the OPAQUE pragma we:
+
+* Do not do worker/wrapper via cast W/W:
+  See the guard in GHC.Core.Opt.Simplify.tryCastWorkerWrapper
+
+* Do not any worker/wrapper after demand/CPR analysis. To that end add a guard
+  in GHC.Core.Opt.WorkWrap.tryWW to disable worker/wrapper
+
+* It is important that the demand signature and CPR signature do not lie, else
+  clients of the function will believe that it has the CPR property etc. But it
+  won't, because we've disabled worker/wrapper. To avoid the signatures lying:
+  * Strip boxity information from the demand signature
+    in GHC.Core.Opt.DmdAnal.finaliseArgBoxities
+    See Note [The OPAQUE pragma and avoiding the reboxing of arguments]
+  * Strip CPR information from the CPR signature
+    in GHC.Core.Opt.CprAnal.cprAnalBind
+    See Note [The OPAQUE pragma and avoiding the reboxing of results]
+
+* Do create specialised versions of the function in
+  * Specialise: see GHC.Core.Opt.Specialise.specCalls
+  * SpecConstr: see GHC.Core.Opt.SpecConstr.specialise
+  Both are accomplished easily: these passes already skip NOINLINE
+  functions with NeverActive activation, and an OPAQUE function is
+  also NeverActive.
+
+At the moment of writing, the major difference between the NOINLINE pragma and
+the OPAQUE pragma is that binders annoted with the NOINLINE pragma _are_ W/W
+transformed (see also Note [Worker/wrapper for NOINLINE functions]) where
+binders annoted with the OPAQUE pragma are _not_ W/W transformed.
+
+Future "name-mangling" optimisations should respect the OPAQUE pragma and
+update the list of moving parts referenced in this note.
+
 -}
 
 isConLike :: RuleMatchInfo -> Bool
@@ -1547,22 +1572,41 @@ isFunLike FunLike = True
 isFunLike _       = False
 
 noUserInlineSpec :: InlineSpec -> Bool
-noUserInlineSpec NoUserInline = True
-noUserInlineSpec _            = False
+noUserInlineSpec NoUserInlinePrag = True
+noUserInlineSpec _                = False
 
 defaultInlinePragma, alwaysInlinePragma, neverInlinePragma, dfunInlinePragma
   :: InlinePragma
 defaultInlinePragma = InlinePragma { inl_src = SourceText "{-# INLINE"
                                    , inl_act = AlwaysActive
                                    , inl_rule = FunLike
-                                   , inl_inline = NoUserInline
+                                   , inl_inline = NoUserInlinePrag
                                    , inl_sat = Nothing }
 
-alwaysInlinePragma = defaultInlinePragma { inl_inline = Inline }
+alwaysInlinePragma = defaultInlinePragma { inl_inline = Inline (inlinePragmaSource defaultInlinePragma) }
 neverInlinePragma  = defaultInlinePragma { inl_act    = NeverActive }
+
+alwaysInlineConLikePragma :: InlinePragma
+alwaysInlineConLikePragma = alwaysInlinePragma { inl_rule = ConLike }
 
 inlinePragmaSpec :: InlinePragma -> InlineSpec
 inlinePragmaSpec = inl_inline
+
+inlinePragmaSource :: InlinePragma -> SourceText
+inlinePragmaSource prag = case inl_inline prag of
+                            Inline    x      -> x
+                            Inlinable y      -> y
+                            NoInline  z      -> z
+                            Opaque    q      -> q
+                            NoUserInlinePrag -> NoSourceText
+
+inlineSpecSource :: InlineSpec -> SourceText
+inlineSpecSource spec = case spec of
+                            Inline    x      -> x
+                            Inlinable y      -> y
+                            NoInline  z      -> z
+                            Opaque    q      -> q
+                            NoUserInlinePrag -> NoSourceText
 
 -- A DFun has an always-active inline activation so that
 -- exprIsConApp_maybe can "see" its unfolding
@@ -1579,20 +1623,30 @@ isDefaultInlinePragma (InlinePragma { inl_act = activation
 
 isInlinePragma :: InlinePragma -> Bool
 isInlinePragma prag = case inl_inline prag of
-                        Inline -> True
-                        _      -> False
+                        Inline _  -> True
+                        _         -> False
 
 isInlinablePragma :: InlinePragma -> Bool
 isInlinablePragma prag = case inl_inline prag of
-                           Inlinable -> True
-                           _         -> False
+                           Inlinable _  -> True
+                           _            -> False
+
+isNoInlinePragma :: InlinePragma -> Bool
+isNoInlinePragma prag = case inl_inline prag of
+                          NoInline _   -> True
+                          _            -> False
 
 isAnyInlinePragma :: InlinePragma -> Bool
 -- INLINE or INLINABLE
 isAnyInlinePragma prag = case inl_inline prag of
-                        Inline    -> True
-                        Inlinable -> True
-                        _         -> False
+                        Inline    _   -> True
+                        Inlinable _   -> True
+                        _             -> False
+
+isOpaquePragma :: InlinePragma -> Bool
+isOpaquePragma prag = case inl_inline prag of
+                        Opaque _ -> True
+                        _        -> False
 
 inlinePragmaSat :: InlinePragma -> Maybe Arity
 inlinePragmaSat = inl_sat
@@ -1616,18 +1670,108 @@ instance Outputable Activation where
    ppr (ActiveAfter  _ n) = brackets (int n)
    ppr FinalActive        = text "[final]"
 
+instance Binary Activation where
+    put_ bh NeverActive =
+            putByte bh 0
+    put_ bh FinalActive =
+            putByte bh 1
+    put_ bh AlwaysActive =
+            putByte bh 2
+    put_ bh (ActiveBefore src aa) = do
+            putByte bh 3
+            put_ bh src
+            put_ bh aa
+    put_ bh (ActiveAfter src ab) = do
+            putByte bh 4
+            put_ bh src
+            put_ bh ab
+    get bh = do
+            h <- getByte bh
+            case h of
+              0 -> return NeverActive
+              1 -> return FinalActive
+              2 -> return AlwaysActive
+              3 -> do src <- get bh
+                      aa <- get bh
+                      return (ActiveBefore src aa)
+              _ -> do src <- get bh
+                      ab <- get bh
+                      return (ActiveAfter src ab)
+
 instance Outputable RuleMatchInfo where
    ppr ConLike = text "CONLIKE"
    ppr FunLike = text "FUNLIKE"
 
+instance Binary RuleMatchInfo where
+    put_ bh FunLike = putByte bh 0
+    put_ bh ConLike = putByte bh 1
+    get bh = do
+            h <- getByte bh
+            if h == 1 then return ConLike
+                      else return FunLike
+
 instance Outputable InlineSpec where
-   ppr Inline       = text "INLINE"
-   ppr NoInline     = text "NOINLINE"
-   ppr Inlinable    = text "INLINABLE"
-   ppr NoUserInline = text "NOUSERINLINE" -- what is better?
+    ppr (Inline          src)  = text "INLINE" <+> pprWithSourceText src empty
+    ppr (NoInline        src)  = text "NOINLINE" <+> pprWithSourceText src empty
+    ppr (Inlinable       src)  = text "INLINABLE" <+> pprWithSourceText src empty
+    ppr (Opaque          src)  = text "OPAQUE" <+> pprWithSourceText src empty
+    ppr NoUserInlinePrag       = empty
+
+instance Binary InlineSpec where
+    put_ bh NoUserInlinePrag = putByte bh 0
+    put_ bh (Inline s)       = do putByte bh 1
+                                  put_ bh s
+    put_ bh (Inlinable s)    = do putByte bh 2
+                                  put_ bh s
+    put_ bh (NoInline s)     = do putByte bh 3
+                                  put_ bh s
+    put_ bh (Opaque s)       = do putByte bh 4
+                                  put_ bh s
+
+    get bh = do h <- getByte bh
+                case h of
+                  0 -> return NoUserInlinePrag
+                  1 -> do
+                        s <- get bh
+                        return (Inline s)
+                  2 -> do
+                        s <- get bh
+                        return (Inlinable s)
+                  3 -> do
+                        s <- get bh
+                        return (NoInline s)
+                  _ -> do
+                        s <- get bh
+                        return (Opaque s)
 
 instance Outputable InlinePragma where
   ppr = pprInline
+
+instance Binary InlinePragma where
+    put_ bh (InlinePragma s a b c d) = do
+            put_ bh s
+            put_ bh a
+            put_ bh b
+            put_ bh c
+            put_ bh d
+
+    get bh = do
+           s <- get bh
+           a <- get bh
+           b <- get bh
+           c <- get bh
+           d <- get bh
+           return (InlinePragma s a b c d)
+
+-- | Outputs string for pragma name for any of INLINE/INLINABLE/NOINLINE. This
+-- differs from the Outputable instance for the InlineSpec type where the pragma
+-- name string as well as the accompanying SourceText (if any) is printed.
+inlinePragmaName :: InlineSpec -> SDoc
+inlinePragmaName (Inline            _)  = text "INLINE"
+inlinePragmaName (Inlinable         _)  = text "INLINABLE"
+inlinePragmaName (NoInline          _)  = text "NOINLINE"
+inlinePragmaName (Opaque            _)  = text "OPAQUE"
+inlinePragmaName NoUserInlinePrag       = empty
 
 pprInline :: InlinePragma -> SDoc
 pprInline = pprInline' True
@@ -1638,15 +1782,19 @@ pprInlineDebug = pprInline' False
 pprInline' :: Bool           -- True <=> do not display the inl_inline field
            -> InlinePragma
            -> SDoc
-pprInline' emptyInline (InlinePragma { inl_inline = inline, inl_act = activation
-                                    , inl_rule = info, inl_sat = mb_arity })
+pprInline' emptyInline (InlinePragma
+                        { inl_inline = inline,
+                          inl_act = activation,
+                          inl_rule = info,
+                          inl_sat = mb_arity })
     = pp_inl inline <> pp_act inline activation <+> pp_sat <+> pp_info
     where
-      pp_inl x = if emptyInline then empty else ppr x
+      pp_inl x = if emptyInline then empty else inlinePragmaName x
 
-      pp_act Inline   AlwaysActive = empty
-      pp_act NoInline NeverActive  = empty
-      pp_act _        act          = ppr act
+      pp_act Inline   {}  AlwaysActive = empty
+      pp_act NoInline {}  NeverActive  = empty
+      pp_act Opaque   {}  NeverActive  = empty
+      pp_act _            act          = ppr act
 
       pp_sat | Just ar <- mb_arity = parens (text "sat-args=" <> int ar)
              | otherwise           = empty
@@ -1654,99 +1802,6 @@ pprInline' emptyInline (InlinePragma { inl_inline = inline, inl_act = activation
               | otherwise      = ppr info
 
 
-
-{- *********************************************************************
-*                                                                      *
-                 Integer literals
-*                                                                      *
-********************************************************************* -}
-
--- | Integral Literal
---
--- Used (instead of Integer) to represent negative zegative zero which is
--- required for NegativeLiterals extension to correctly parse `-0::Double`
--- as negative zero. See also #13211.
-data IntegralLit
-  = IL { il_text :: SourceText
-       , il_neg :: Bool -- See Note [Negative zero]
-       , il_value :: Integer
-       }
-  deriving (Data, Show)
-
-mkIntegralLit :: Integral a => a -> IntegralLit
-mkIntegralLit i = IL { il_text = SourceText (show i_integer)
-                     , il_neg = i < 0
-                     , il_value = i_integer }
-  where
-    i_integer :: Integer
-    i_integer = toInteger i
-
-negateIntegralLit :: IntegralLit -> IntegralLit
-negateIntegralLit (IL text neg value)
-  = case text of
-      SourceText ('-':src) -> IL (SourceText src)       False    (negate value)
-      SourceText      src  -> IL (SourceText ('-':src)) True     (negate value)
-      NoSourceText         -> IL NoSourceText          (not neg) (negate value)
-
--- | Fractional Literal
---
--- Used (instead of Rational) to represent exactly the floating point literal that we
--- encountered in the user's source program. This allows us to pretty-print exactly what
--- the user wrote, which is important e.g. for floating point numbers that can't represented
--- as Doubles (we used to via Double for pretty-printing). See also #2245.
-data FractionalLit
-  = FL { fl_text :: SourceText     -- How the value was written in the source
-       , fl_neg :: Bool            -- See Note [Negative zero]
-       , fl_value :: Rational      -- Numeric value of the literal
-       }
-  deriving (Data, Show)
-  -- The Show instance is required for the derived GHC.Parser.Lexer.Token instance when DEBUG is on
-
-mkFractionalLit :: Real a => a -> FractionalLit
-mkFractionalLit r = FL { fl_text = SourceText (show (realToFrac r::Double))
-                           -- Converting to a Double here may technically lose
-                           -- precision (see #15502). We could alternatively
-                           -- convert to a Rational for the most accuracy, but
-                           -- it would cause Floats and Doubles to be displayed
-                           -- strangely, so we opt not to do this. (In contrast
-                           -- to mkIntegralLit, where we always convert to an
-                           -- Integer for the highest accuracy.)
-                       , fl_neg = r < 0
-                       , fl_value = toRational r }
-
-negateFractionalLit :: FractionalLit -> FractionalLit
-negateFractionalLit (FL text neg value)
-  = case text of
-      SourceText ('-':src) -> FL (SourceText src)     False value
-      SourceText      src  -> FL (SourceText ('-':src)) True  value
-      NoSourceText         -> FL NoSourceText (not neg) (negate value)
-
-integralFractionalLit :: Bool -> Integer -> FractionalLit
-integralFractionalLit neg i = FL { fl_text = SourceText (show i),
-                                   fl_neg = neg,
-                                   fl_value = fromInteger i }
-
--- Comparison operations are needed when grouping literals
--- for compiling pattern-matching (module GHC.HsToCore.Match.Literal)
-
-instance Eq IntegralLit where
-  (==) = (==) `on` il_value
-
-instance Ord IntegralLit where
-  compare = compare `on` il_value
-
-instance Outputable IntegralLit where
-  ppr (IL (SourceText src) _ _) = text src
-  ppr (IL NoSourceText _ value) = text (show value)
-
-instance Eq FractionalLit where
-  (==) = (==) `on` fl_value
-
-instance Ord FractionalLit where
-  compare = compare `on` fl_value
-
-instance Outputable FractionalLit where
-  ppr f = pprWithSourceText (fl_text f) (rational (fl_value f))
 
 {-
 ************************************************************************
@@ -1808,6 +1863,11 @@ mulWithInf Infinity _        = Infinity
 mulWithInf _        Infinity = Infinity
 mulWithInf (Int a)  (Int b)  = Int (a * b)
 
+-- | Subtract an 'Int' from an 'IntWithInf'
+subWithInf :: IntWithInf -> Int -> IntWithInf
+subWithInf Infinity _ = Infinity
+subWithInf (Int a)  b = Int (a - b)
+
 -- | Turn a positive number into an 'IntWithInf', where 0 represents infinity
 treatZeroAsInf :: Int -> IntWithInf
 treatZeroAsInf 0 = Infinity
@@ -1843,3 +1903,174 @@ isTypeLevel KindLevel = False
 isKindLevel :: TypeOrKind -> Bool
 isKindLevel TypeLevel = False
 isKindLevel KindLevel = True
+
+{- *********************************************************************
+*                                                                      *
+                     Levity information
+*                                                                      *
+********************************************************************* -}
+
+data Levity
+  = Lifted
+  | Unlifted
+  deriving Eq
+
+instance Outputable Levity where
+  ppr Lifted   = text "Lifted"
+  ppr Unlifted = text "Unlifted"
+
+mightBeLifted :: Maybe Levity -> Bool
+mightBeLifted (Just Unlifted) = False
+mightBeLifted _               = True
+
+mightBeUnlifted :: Maybe Levity -> Bool
+mightBeUnlifted (Just Lifted) = False
+mightBeUnlifted _             = True
+
+{- *********************************************************************
+*                                                                      *
+                     Expressions vs Patterns
+*                                                                      *
+********************************************************************* -}
+
+-- | Are we dealing with an expression or a pattern?
+--
+-- Used only for the textual output of certain error messages;
+-- see the 'FRRDataConArg' constructor of 'FixedRuntimeRepContext'.
+data ExprOrPat
+  = Expression
+  | Pattern
+  deriving Eq
+
+instance Outputable ExprOrPat where
+  ppr Expression = text "expression"
+  ppr Pattern    = text "pattern"
+
+{- *********************************************************************
+*                                                                      *
+                        Defaulting options
+*                                                                      *
+********************************************************************* -}
+
+{- Note [Type variable defaulting options]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Here is an overview of the current type variable defaulting mechanisms,
+in the order in which they happen.
+
+GHC.Tc.Utils.TcMType.defaultTyVar
+
+  This is a built-in defaulting mechanism for the following type variables:
+
+    (1) kind variables with -XNoPolyKinds,
+    (2) type variables of kind 'RuntimeRep' default to 'LiftedRep',
+        of kind 'Levity' to 'Lifted', and of kind 'Multiplicity' to 'Many'.
+
+  It is used in many situations:
+
+    - inferring a type (e.g. a declaration with no type signature or a
+      partial type signature), in 'GHC.Tc.Solver.simplifyInfer',
+    - simplifying top-level constraints in 'GHC.Tc.Solver.simplifyTop',
+    - kind checking a CUSK in 'GHC.Tc.Gen.kcCheckDeclHeader_cusk',
+    - 'GHC.Tc.TyCl.generaliseTcTyCon',
+    - type checking type family and data family instances,
+      in 'GHC.Tc.TyCl.tcTyFamInstEqnGuts' and 'GHC.Tc.TyCl.Instance.tcDataFamInstHeader'
+      respectively,
+    - type-checking rules in 'GHC.Tc.Gen.tcRule',
+    - kind generalisation in 'GHC.Tc.Gen.HsType.kindGeneralizeSome'
+      and 'GHC.Tc.Gen.HsType.kindGeneralizeAll'.
+
+  Different situations call for a different defaulting strategy,
+  so 'defaultTyVar' takes a strategy parameter which determines which
+  type variables to default.
+  Currently, this strategy is set as follows:
+
+    - Kind variables:
+      - with -XNoPolyKinds, these must be defaulted. This includes kind variables
+        of kind 'RuntimeRep', 'Levity' and 'Multiplicity'.
+        Test case: T20584.
+      - with -XPolyKinds, behave as if they were type variables (see below).
+    - Type variables of kind 'RuntimeRep', 'Levity' or 'Multiplicity'
+      - in type and data families instances, these are not defaulted.
+        Test case: T17536.
+      - otherwise: default variables of these three kinds. This ensures
+        that in a program such as
+
+          foo :: forall a. a -> a
+          foo x = x
+
+        we continue to infer `a :: Type`.
+
+  Note that the strategy is set in two steps: callers of 'defaultTyVars' only
+  specify whether to default type variables of "non-standard" kinds
+  (that is, of kinds 'RuntimeRep'/'Levity'/'Multiplicity'). Then 'defaultTyVars'
+  determines which variables are type variables and which are kind variables,
+  and if the user has asked for -XNoPolyKinds we default the kind variables.
+
+GHC.Tc.Solver.defaultTyVarTcS
+
+  This is a built-in defaulting mechanism that happens after
+  the constraint solver has run, in 'GHC.Tc.Solver.simplifyTopWanteds'.
+
+  It only defaults type (and kind) variables of kind 'RuntimeRep',
+  'Levity', 'Multiplicity'.
+
+  It is not configurable, neither by options nor by the user.
+
+GHC.Tc.Solver.applyDefaultingRules
+
+  This is typeclass defaulting, and includes defaulting plugins.
+  It happens right after 'defaultTyVarTcS' in 'GHC.Tc.Solver.simplifyTopWanteds'.
+  It is user configurable, using default declarations (/plugins).
+
+GHC.Iface.Type.defaultIfaceTyVarsOfKind
+
+  This is a built-in defaulting mechanism that only applies when pretty-printing.
+  It defaults 'RuntimeRep'/'Levity' variables unless -fprint-explicit-kinds is enabled,
+  and 'Multiplicity' variables unless -XLinearTypes is enabled.
+
+-}
+
+-- | Specify whether to default type variables of kind 'RuntimeRep'/'Levity'/'Multiplicity'.
+data NonStandardDefaultingStrategy
+  -- | Default type variables of the given kinds:
+  --
+  --   - default 'RuntimeRep' variables to 'LiftedRep'
+  --   - default 'Levity' variables to 'Lifted'
+  --   - default 'Multiplicity' variables to 'Many'
+  = DefaultNonStandardTyVars
+  -- | Try not to default type variables of the kinds 'RuntimeRep'/'Levity'/'Multiplicity'.
+  --
+  -- Note that these might get defaulted anyway, if they are kind variables
+  -- and `-XNoPolyKinds` is enabled.
+  | TryNotToDefaultNonStandardTyVars
+
+-- | Specify whether to default kind variables, and type variables
+-- of kind 'RuntimeRep'/'Levity'/'Multiplicity'.
+data DefaultingStrategy
+  -- | Default kind variables:
+  --
+  --   - default kind variables of kind 'Type' to 'Type',
+  --   - default 'RuntimeRep'/'Levity'/'Multiplicity' kind variables
+  --     to 'LiftedRep'/'Lifted'/'Many', respectively.
+  --
+  -- When this strategy is used, it means that we have determined that
+  -- the variables we are considering defaulting are all kind variables.
+  --
+  -- Usually, we pass this option when -XNoPolyKinds is enabled.
+  = DefaultKindVars
+  -- | Default (or don't default) non-standard variables, of kinds
+  -- 'RuntimeRep', 'Levity' and 'Multiplicity'.
+  | NonStandardDefaulting NonStandardDefaultingStrategy
+
+defaultNonStandardTyVars :: DefaultingStrategy -> Bool
+defaultNonStandardTyVars DefaultKindVars                                          = True
+defaultNonStandardTyVars (NonStandardDefaulting DefaultNonStandardTyVars)         = True
+defaultNonStandardTyVars (NonStandardDefaulting TryNotToDefaultNonStandardTyVars) = False
+
+instance Outputable NonStandardDefaultingStrategy where
+  ppr DefaultNonStandardTyVars         = text "DefaultOnlyNonStandardTyVars"
+  ppr TryNotToDefaultNonStandardTyVars = text "TryNotToDefaultNonStandardTyVars"
+
+instance Outputable DefaultingStrategy where
+  ppr DefaultKindVars            = text "DefaultKindVars"
+  ppr (NonStandardDefaulting ns) = text "NonStandardDefaulting" <+> ppr ns

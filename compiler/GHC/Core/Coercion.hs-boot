@@ -30,7 +30,7 @@ mkInstCo :: Coercion -> Coercion -> Coercion
 mkGReflCo :: Role -> Type -> MCoercionN -> Coercion
 mkNomReflCo :: Type -> Coercion
 mkKindCo :: Coercion -> Coercion
-mkSubCo :: Coercion -> Coercion
+mkSubCo :: HasDebugCallStack => Coercion -> Coercion
 mkProofIrrelCo :: Role -> Coercion -> Coercion -> Coercion -> Coercion
 mkAxiomRuleCo :: CoAxiomRule -> [Coercion] -> Coercion
 
@@ -51,3 +51,7 @@ coercionKind :: Coercion -> Pair Type
 coercionLKind :: Coercion -> Type
 coercionRKind :: Coercion -> Type
 coercionType :: Coercion -> Type
+
+topNormaliseNewType_maybe :: Type -> Maybe (Coercion, Type)
+  -- used to look through newtypes to the right of
+  -- function arrows, in 'GHC.Core.Type.getRuntimeArgTys'

@@ -1,5 +1,4 @@
 {-# LANGUAGE Trustworthy #-}
-{-# LANGUAGE BangPatterns #-}
 {-# OPTIONS_GHC -funbox-strict-fields #-}
 
 -----------------------------------------------------------------------------
@@ -9,7 +8,7 @@
 -- License     :  BSD-style (see the file libraries/base/LICENSE)
 -- 
 -- Maintainer  :  libraries@haskell.org
--- Stability   :  experimental
+-- Stability   :  stable
 -- Portability :  non-portable (concurrency)
 --
 -- Quantity semaphores in which each thread may wait for an arbitrary
@@ -94,7 +93,7 @@ waitQSemN qs@(QSemN m) sz = mask_ $ do
     JustMV b -> wait b
   where
     wait :: MVar () -> IO ()
-    wait b = do
+    wait b =
       takeMVar b `onException` do
         already_filled <- not <$> tryPutMVar b ()
         when already_filled $ signalQSemN qs sz

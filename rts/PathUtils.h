@@ -8,18 +8,19 @@
 
 #pragma once
 
-#include "BeginPrivate.h"
-
 // Use wchar_t for pathnames on Windows (#5697)
 #if defined(mingw32_HOST_OS)
+#include "fs_rts.h"
+
 #define pathcmp wcscmp
 #define pathlen wcslen
-#define pathopen __rts_fwopen
-#define pathstat _wstat
+// N.B. Use the Win32-based file routines from utils/fs.
+#define pathopen FS(fwopen)
+#define pathstat FS(_wstat)
 #define struct_stat struct _stat
 #define open wopen
 #define WSTR(s) L##s
-#define pathprintf swprintf
+#define pathprintf snwprintf
 #define pathcopy wcscpy
 #define pathsize sizeof(wchar_t)
 #else
@@ -33,6 +34,8 @@
 #define pathsize sizeof(char)
 #define pathcopy strcpy
 #endif
+
+#include "BeginPrivate.h"
 
 pathchar* pathdup(pathchar *path);
 pathchar* pathdir(pathchar *path);

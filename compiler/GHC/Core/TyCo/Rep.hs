@@ -1,3 +1,8 @@
+
+{-# LANGUAGE DeriveDataTypeable #-}
+
+{-# OPTIONS_HADDOCK not-home #-}
+
 {-
 (c) The University of Glasgow 2006
 (c) The GRASP/AQUA Project, Glasgow University, 1998
@@ -18,30 +23,27 @@ Note [The Type-related module hierarchy]
 -}
 
 -- We expose the relevant stuff from this module via the Type module
-{-# OPTIONS_HADDOCK not-home #-}
-{-# LANGUAGE CPP, MultiWayIf, PatternSynonyms, BangPatterns, DeriveDataTypeable #-}
-
 module GHC.Core.TyCo.Rep (
-        TyThing(..), tyThingCategory, pprTyThingCategory, pprShortTyThing,
 
         -- * Types
         Type(..),
 
         TyLit(..),
         KindOrType, Kind,
+        RuntimeRepType,
         KnotTied,
-        PredType, ThetaType,      -- Synonyms
+        PredType, ThetaType, FRRType,     -- Synonyms
         ArgFlag(..), AnonArgFlag(..),
 
         -- * Coercions
         Coercion(..),
         UnivCoProvenance(..),
-        CoercionHole(..), BlockSubstFlag(..), coHoleCoVar, setCoHoleCoVar,
+        CoercionHole(..), coHoleCoVar, setCoHoleCoVar,
         CoercionN, CoercionR, CoercionP, KindCoercion,
         MCoercion(..), MCoercionR, MCoercionN,
 
         -- * Functions over types
-        mkTyConTy, mkTyVarTy, mkTyVarTys,
+        mkNakedTyConTy, mkTyVarTy, mkTyVarTys,
         mkTyCoVarTy, mkTyCoVarTys,
         mkFunTy, mkVisFunTy, mkInvisFunTy, mkVisFunTys,
         mkForAllTy, mkForAllTys, mkInvisForAllTys,
@@ -50,7 +52,7 @@ module GHC.Core.TyCo.Rep (
         mkScaledFunTy,
         mkVisFunTyMany, mkVisFunTysMany,
         mkInvisFunTyMany, mkInvisFunTysMany,
-        mkTyConApp,
+        nonDetCmpTyLit, cmpTyLit,
 
         -- * Functions over binders
         TyCoBinder(..), TyCoVarBinder, TyBinder,
@@ -64,7 +66,7 @@ module GHC.Core.TyCo.Rep (
         pickLR,
 
         -- ** Analyzing types
-        TyCoFolder(..), foldTyCo,
+        TyCoFolder(..), foldTyCo, noView,
 
         -- * Sizes
         typeSize, coercionSize, provSize,
@@ -73,96 +75,30 @@ module GHC.Core.TyCo.Rep (
         Scaled(..), scaledMult, scaledThing, mapScaledType, Mult
     ) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
 import {-# SOURCE #-} GHC.Core.TyCo.Ppr ( pprType, pprCo, pprTyLit )
 
    -- Transitively pulls in a LOT of stuff, better to break the loop
 
-import {-# SOURCE #-} GHC.Core.ConLike ( ConLike(..), conLikeName )
-
 -- friends:
-import GHC.Iface.Type
 import GHC.Types.Var
 import GHC.Types.Var.Set
-import GHC.Types.Name hiding ( varName )
 import GHC.Core.TyCon
 import GHC.Core.Coercion.Axiom
 
 -- others
-import GHC.Builtin.Names ( liftedTypeKindTyConKey, manyDataConKey )
-import {-# SOURCE #-} GHC.Builtin.Types ( liftedTypeKindTyCon, manyDataConTy )
+import {-# SOURCE #-} GHC.Builtin.Types ( manyDataConTy )
 import GHC.Types.Basic ( LeftOrRight(..), pickLR )
-import GHC.Types.Unique ( hasKey )
+import GHC.Types.Unique ( Uniquable(..) )
 import GHC.Utils.Outputable
 import GHC.Data.FastString
 import GHC.Utils.Misc
+import GHC.Utils.Panic
 
 -- libraries
 import qualified Data.Data as Data hiding ( TyCon )
 import Data.IORef ( IORef )   -- for CoercionHole
-
-{-
-%************************************************************************
-%*                                                                      *
-                        TyThing
-%*                                                                      *
-%************************************************************************
-
-Despite the fact that DataCon has to be imported via a hi-boot route,
-this module seems the right place for TyThing, because it's needed for
-funTyCon and all the types in GHC.Builtin.Types.Prim.
-
-It is also SOURCE-imported into "GHC.Types.Name"
-
-
-Note [ATyCon for classes]
-~~~~~~~~~~~~~~~~~~~~~~~~~
-Both classes and type constructors are represented in the type environment
-as ATyCon.  You can tell the difference, and get to the class, with
-   isClassTyCon :: TyCon -> Bool
-   tyConClass_maybe :: TyCon -> Maybe Class
-The Class and its associated TyCon have the same Name.
--}
-
--- | A global typecheckable-thing, essentially anything that has a name.
--- Not to be confused with a 'TcTyThing', which is also a typecheckable
--- thing but in the *local* context.  See "GHC.Tc.Utils.Env" for how to retrieve
--- a 'TyThing' given a 'Name'.
-data TyThing
-  = AnId     Id
-  | AConLike ConLike
-  | ATyCon   TyCon       -- TyCons and classes; see Note [ATyCon for classes]
-  | ACoAxiom (CoAxiom Branched)
-
-instance Outputable TyThing where
-  ppr = pprShortTyThing
-
-instance NamedThing TyThing where       -- Can't put this with the type
-  getName (AnId id)     = getName id    -- decl, because the DataCon instance
-  getName (ATyCon tc)   = getName tc    -- isn't visible there
-  getName (ACoAxiom cc) = getName cc
-  getName (AConLike cl) = conLikeName cl
-
-pprShortTyThing :: TyThing -> SDoc
--- c.f. GHC.Core.Ppr.TyThing.pprTyThing, which prints all the details
-pprShortTyThing thing
-  = pprTyThingCategory thing <+> quotes (ppr (getName thing))
-
-pprTyThingCategory :: TyThing -> SDoc
-pprTyThingCategory = text . capitalise . tyThingCategory
-
-tyThingCategory :: TyThing -> String
-tyThingCategory (ATyCon tc)
-  | isClassTyCon tc = "class"
-  | otherwise       = "type constructor"
-tyThingCategory (ACoAxiom _) = "coercion axiom"
-tyThingCategory (AnId   _)   = "identifier"
-tyThingCategory (AConLike (RealDataCon _)) = "data constructor"
-tyThingCategory (AConLike (PatSynCon _))  = "pattern synonym"
-
 
 {- **********************************************************************
 *                                                                       *
@@ -176,6 +112,13 @@ type KindOrType = Type -- See Note [Arguments to type constructors]
 
 -- | The key type representing kinds in the compiler.
 type Kind = Type
+
+-- | Type synonym used for types of kind RuntimeRep.
+type RuntimeRepType = Type
+
+-- A type with a syntactically fixed RuntimeRep, in the sense
+-- of Note [Fixed RuntimeRep] in GHC.Tc.Utils.Concrete.
+type FRRType = Type
 
 -- If you edit this type, you may need to update the GHC formalism
 -- See Note [GHC Formalism] in GHC.Core.Lint
@@ -214,6 +157,7 @@ data Type
   | ForAllTy
         {-# UNPACK #-} !TyCoVarBinder
         Type            -- ^ A Π type.
+             -- Note [When we quantify over a coercion variable]
              -- INVARIANT: If the binder is a coercion variable, it must
              -- be mentioned in the Type. See
              -- Note [Unused coercion variable in ForAllTy]
@@ -230,10 +174,10 @@ data Type
   | CastTy
         Type
         KindCoercion  -- ^ A kind cast. The coercion is always nominal.
-                      -- INVARIANT: The cast is never reflexive
-                      -- INVARIANT: The Type is not a CastTy (use TransCo instead)
-                      -- INVARIANT: The Type is not a ForAllTy over a type variable
-                      -- See Note [Respecting definitional equality] \(EQ2), (EQ3), (EQ4)
+                      -- INVARIANT: The cast is never reflexive \(EQ2)
+                      -- INVARIANT: The Type is not a CastTy (use TransCo instead) \(EQ3)
+                      -- INVARIANT: The Type is not a ForAllTy over a tyvar \(EQ4)
+                      -- See Note [Respecting definitional equality]
 
   | CoercionTy
         Coercion    -- ^ Injection of a Coercion into a type
@@ -251,27 +195,65 @@ instance Outputable Type where
 data TyLit
   = NumTyLit Integer
   | StrTyLit FastString
-  deriving (Eq, Ord, Data.Data)
+  | CharTyLit Char
+  deriving (Eq, Data.Data)
+
+-- Non-determinism arises due to uniqCompareFS
+nonDetCmpTyLit :: TyLit -> TyLit -> Ordering
+nonDetCmpTyLit = cmpTyLitWith NonDetFastString
+
+-- Slower than nonDetCmpTyLit but deterministic
+cmpTyLit :: TyLit -> TyLit -> Ordering
+cmpTyLit = cmpTyLitWith LexicalFastString
+
+{-# INLINE cmpTyLitWith #-}
+cmpTyLitWith :: Ord r => (FastString -> r) -> TyLit -> TyLit -> Ordering
+cmpTyLitWith _ (NumTyLit  x) (NumTyLit  y) = compare x y
+cmpTyLitWith w (StrTyLit  x) (StrTyLit  y) = compare (w x) (w y)
+cmpTyLitWith _ (CharTyLit x) (CharTyLit y) = compare x y
+cmpTyLitWith _ a b = compare (tag a) (tag b)
+  where
+    tag :: TyLit -> Int
+    tag NumTyLit{}  = 0
+    tag StrTyLit{}  = 1
+    tag CharTyLit{} = 2
 
 instance Outputable TyLit where
    ppr = pprTyLit
 
 {- Note [Function types]
 ~~~~~~~~~~~~~~~~~~~~~~~~
-FFunTy is the constructor for a function type.  Lots of things to say
-about it!
+FunTy is the constructor for a function type.  Here are the details:
 
-* FFunTy is the data constructor, meaning "full function type".
-
-* The function type constructor (->) has kind
-     (->) :: forall {r1} {r2}. TYPE r1 -> TYPE r2 -> Type LiftedRep
-  mkTyConApp ensure that we convert a saturated application
-    TyConApp (->) [r1,r2,t1,t2] into FunTy t1 t2
+* The primitive function type constructor FUN has kind
+     FUN :: forall (m :: Multiplicity) ->
+            forall {r1 :: RuntimeRep} {r2 :: RuntimeRep}.
+            TYPE r1 ->
+            TYPE r2 ->
+            Type
+  mkTyConApp ensures that we convert a saturated application
+    TyConApp FUN [m,r1,r2,t1,t2] into FunTy VisArg m t1 t2
   dropping the 'r1' and 'r2' arguments; they are easily recovered
-  from 't1' and 't2'.
+  from 't1' and 't2'. The visibility is always VisArg, because
+  we build constraint arrows (=>) with e.g. mkPhiTy and friends,
+  never `mkTyConApp funTyCon args`.
 
 * For the time being its RuntimeRep quantifiers are left
   inferred. This is to allow for it to evolve.
+
+* Because the RuntimeRep args came first historically (that is,
+  the arrow type constructor gained these arguments before gaining
+  the Multiplicity argument), we wanted to be able to say
+    type (->) = FUN Many
+  which we do in library module GHC.Types. This means that the
+  Multiplicity argument must precede the RuntimeRep arguments --
+  and it means changing the name of the primitive constructor from
+  (->) to FUN.
+
+* The multiplicity argument is dependent, because Typeable does not
+  support a type such as `Multiplicity -> forall {r1 r2 :: RuntimeRep}. ...`.
+  There is a plan to change the argument order and make the
+  multiplicity argument nondependent in #20164.
 
 * The ft_af field says whether or not this is an invisible argument
      VisArg:   t1 -> t2    Ordinary function type
@@ -282,33 +264,8 @@ about it!
   This visibility info makes no difference in Core; it matters
   only when we regard the type as a Haskell source type.
 
-* FunTy is a (unidirectional) pattern synonym that allows
-  positional pattern matching (FunTy arg res), ignoring the
-  ArgFlag.
--}
-
-{- -----------------------
-      Commented out until the pattern match
-      checker can handle it; see #16185
-
-      For now we use the CPP macro #define FunTy FFunTy _
-      (see HsVersions.h) to allow pattern matching on a
-      (positional) FunTy constructor.
-
-{-# COMPLETE FunTy, TyVarTy, AppTy, TyConApp
-           , ForAllTy, LitTy, CastTy, CoercionTy :: Type #-}
-
--- | 'FunTy' is a (uni-directional) pattern synonym for the common
--- case where we want to match on the argument/result type, but
--- ignoring the AnonArgFlag
-pattern FunTy :: Type -> Type -> Type
-pattern FunTy arg res <- FFunTy { ft_arg = arg, ft_res = res }
-
-       End of commented out block
----------------------------------- -}
-
-{- Note [Types for coercions, predicates, and evidence]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Note [Types for coercions, predicates, and evidence]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 We treat differently:
 
   (a) Predicate types
@@ -344,6 +301,31 @@ When treated as a user type,
 
 In a FunTy { ft_af = InvisArg }, the argument type is always
 a Predicate type.
+
+Note [Weird typing rule for ForAllTy]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Here are the typing rules for ForAllTy:
+
+tyvar : Type
+inner : TYPE r
+tyvar does not occur in r
+------------------------------------
+ForAllTy (Bndr tyvar vis) inner : TYPE r
+
+inner : TYPE r
+------------------------------------
+ForAllTy (Bndr covar vis) inner : Type
+
+Note that the kind of the result depends on whether the binder is a
+tyvar or a covar. The kind of a forall-over-tyvar is the same as
+the kind of the inner type. This is because quantification over types
+is erased before runtime. By contrast, the kind of a forall-over-covar
+is always Type, because a forall-over-covar is compiled into a function
+taking a 0-bit-wide erased coercion argument.
+
+Because the tyvar form above includes r in its result, we must
+be careful not to let any variables escape -- thus the last premise
+of the rule above.
 
 Note [Constraints in kinds]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -495,7 +477,7 @@ casting. The same is true of expressions of type σ. So in some sense, τ and σ
 are interchangeable.
 
 But let's be more precise. If we examine the typing rules of FC (say, those in
-https://cs.brynmawr.edu/~rae/papers/2015/equalities/equalities.pdf)
+https://richarde.dev/papers/2015/equalities/equalities.pdf)
 there are several places where the same metavariable is used in two different
 premises to a rule. (For example, see Ty_App.) There is an implicit equality
 check here. What definition of equality should we use? By convention, we use
@@ -513,7 +495,7 @@ equality check, can use any homogeneous relation that is smaller than ~, as
 those rules must also be admissible.
 
 A more drawn out argument around all of this is presented in Section 7.2 of
-Richard E's thesis (http://cs.brynmawr.edu/~rae/papers/2016/thesis/eisenberg-thesis.pdf).
+Richard E's thesis (http://richarde.dev/papers/2016/thesis/eisenberg-thesis.pdf).
 
 What would go wrong if we insisted on the casts matching? See the beginning of
 Section 8 in the unpublished paper above. Theoretically, nothing at all goes
@@ -525,8 +507,8 @@ then we couldn't discard -- the output of kind-checking would be enormous,
 and we would need enormous casts with lots of CoherenceCo's to straighten
 them out.
 
-Would anything go wrong if eqType respected type families? No, not at all. But
-that makes eqType rather hard to implement.
+Would anything go wrong if eqType looked through type families? No, not at
+all. But that makes eqType rather hard to implement.
 
 Thus, the guideline for eqType is that it should be the largest
 easy-to-implement relation that is still smaller than ~ and homogeneous. The
@@ -539,6 +521,29 @@ Another helpful principle with eqType is this:
 
 This principle also tells us that eqType must relate only types with the
 same kinds.
+
+Interestingly, it must be the case that the free variables of t1 and t2
+might be different, even if t1 `eqType` t2. A simple example of this is
+if we have both cv1 :: k1 ~ k2 and cv2 :: k1 ~ k2 in the environment.
+Then t1 = t |> cv1 and t2 = t |> cv2 are eqType; yet cv1 is in the free
+vars of t1 and cv2 is in the free vars of t2. Unless we choose to implement
+eqType to be just α-equivalence, this wrinkle around free variables
+remains.
+
+Yet not all is lost: we can say that any two equal types share the same
+*relevant* free variables. Here, a relevant variable is a shallow
+free variable (see Note [Shallow and deep free variables] in GHC.Core.TyCo.FVs)
+that does not appear within a coercion. Note that type variables can
+appear within coercions (in, say, a Refl node), but that coercion variables
+cannot appear outside a coercion. We do not (yet) have a function to
+extract relevant free variables, but it would not be hard to write if
+the need arises.
+
+Besides eqType, another equality relation that upholds the (EQ) property above
+is /typechecker equality/, which is implemented as
+GHC.Tc.Utils.TcType.tcEqType. See
+Note [Typechecker equality vs definitional equality] in GHC.Tc.Utils.TcType for
+what the difference between eqType and tcEqType is.
 
 Note [Respecting definitional equality]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -562,7 +567,7 @@ to differ, leading to a contradiction. Thus, co is reflexive.
 
 Accordingly, by eliminating reflexive casts, splitTyConApp need not worry
 about outermost casts to uphold (EQ). Eliminating reflexive casts is done
-in mkCastTy.
+in mkCastTy. This is (EQ1) below.
 
 Unforunately, that's not the end of the story. Consider comparing
   (T a b c)      =?       (T a b |> (co -> <Type>)) (c |> co)
@@ -585,6 +590,7 @@ our (EQ) property.
 
 In order to detect reflexive casts reliably, we must make sure not
 to have nested casts: we update (t |> co1 |> co2) to (t |> (co1 `TransCo` co2)).
+This is (EQ2) below.
 
 One other troublesome case is ForAllTy. See Note [Weird typing rule for ForAllTy].
 The kind of the body is the same as the kind of the ForAllTy. Accordingly,
@@ -606,6 +612,54 @@ In sum, in order to uphold (EQ), we need the following invariants:
         See Note [Weird typing rule for ForAllTy]
 
 These invariants are all documented above, in the declaration for Type.
+
+Note [Equality on FunTys]
+~~~~~~~~~~~~~~~~~~~~~~~~~
+A (FunTy vis mult arg res) is just an abbreviation for a
+  TyConApp funTyCon [mult, arg_rep, res_rep, arg, res]
+where
+  arg :: TYPE arg_rep
+  res :: TYPE res_rep
+Note that the vis field of a FunTy appears nowhere in the
+equivalent TyConApp. In Core, this is OK, because we no longer
+care about the visibility of the argument in a FunTy
+(the vis distinguishes between arg -> res and arg => res).
+In the type-checker, we are careful not to decompose FunTys
+with an invisible argument. See also Note [Decomposing fat arrow c=>t]
+in GHC.Core.Type.
+
+In order to compare FunTys while respecting how they could
+expand into TyConApps, we must check
+the kinds of the arg and the res.
+
+Note [When we quantify over a coercion variable]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The TyCoVarBinder in a ForAllTy can be (most often) a TyVar or (rarely)
+a CoVar. We support quantifying over a CoVar here in order to support
+a homogeneous (~#) relation (someday -- not yet implemented). Here is
+the example:
+
+  type (:~~:) :: forall k1 k2. k1 -> k2 -> Type
+  data a :~~: b where
+    HRefl :: a :~~: a
+
+Assuming homogeneous equality (that is, with
+  (~#) :: forall k. k -> k -> TYPE (TupleRep '[])
+) after rejigging to make equalities explicit, we get a constructor that
+looks like
+
+  HRefl :: forall k1 k2 (a :: k1) (b :: k2).
+           forall (cv :: k1 ~# k2). (a |> cv) ~# b
+        => (:~~:) k1 k2 a b
+
+Note that we must cast `a` by a cv bound in the same type in order to
+make this work out.
+
+See also https://gitlab.haskell.org/ghc/ghc/-/wikis/dependent-haskell/phase2
+which gives a general road map that covers this space.
+
+Having this feature in Core does *not* mean we have it in source Haskell.
+See #15710 about that.
 
 Note [Unused coercion variable in ForAllTy]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -696,10 +750,8 @@ data TyCoBinder
 instance Outputable TyCoBinder where
   ppr (Anon af ty) = ppr af <+> ppr ty
   ppr (Named (Bndr v Required))  = ppr v
-  -- See Note [Explicit Case Statement for Specificity]
-  ppr (Named (Bndr v (Invisible spec))) = case spec of
-    SpecifiedSpec -> char '@' <> ppr v
-    InferredSpec  -> braces (ppr v)
+  ppr (Named (Bndr v Specified)) = char '@' <> ppr v
+  ppr (Named (Bndr v Inferred))  = braces (ppr v)
 
 
 -- | 'TyBinder' is like 'TyCoBinder', but there can only be 'TyVarBinder'
@@ -973,7 +1025,7 @@ which in turn is imported by Type
 -}
 
 mkTyVarTy  :: TyVar   -> Type
-mkTyVarTy v = ASSERT2( isTyVar v, ppr v <+> dcolon <+> ppr (tyVarKind v) )
+mkTyVarTy v = assertPpr (isTyVar v) (ppr v <+> dcolon <+> ppr (tyVarKind v)) $
               TyVarTy v
 
 mkTyVarTys :: [TyVar] -> [Type]
@@ -1036,7 +1088,7 @@ mkForAllTys tyvars ty = foldr ForAllTy ty tyvars
 
 -- | Wraps foralls over the type using the provided 'InvisTVBinder's from left to right
 mkInvisForAllTys :: [InvisTVBinder] -> Type -> Type
-mkInvisForAllTys tyvars ty = foldr ForAllTy ty $ tyVarSpecToBinders tyvars
+mkInvisForAllTys tyvars = mkForAllTys (tyVarSpecToBinders tyvars)
 
 mkPiTy :: TyCoBinder -> Type -> Type
 mkPiTy (Anon af ty1) ty2        = mkScaledFunTy af ty1 ty2
@@ -1045,61 +1097,13 @@ mkPiTy (Named (Bndr tv vis)) ty = mkForAllTy tv vis ty
 mkPiTys :: [TyCoBinder] -> Type -> Type
 mkPiTys tbs ty = foldr mkPiTy ty tbs
 
--- | Create the plain type constructor type which has been applied to no type arguments at all.
-mkTyConTy :: TyCon -> Type
-mkTyConTy tycon = TyConApp tycon []
-
--- | A key function: builds a 'TyConApp' or 'FunTy' as appropriate to
--- its arguments.  Applies its arguments to the constructor from left to right.
-mkTyConApp :: TyCon -> [Type] -> Type
-mkTyConApp tycon tys
-  | isFunTyCon tycon
-  , [w, _rep1,_rep2,ty1,ty2] <- tys
-  -- The FunTyCon (->) is always a visible one
-  = FunTy { ft_af = VisArg, ft_mult = w, ft_arg = ty1, ft_res = ty2 }
-
-  -- Note [mkTyConApp and Type]
-  | tycon `hasKey` liftedTypeKindTyConKey
-  = ASSERT2( null tys, ppr tycon $$ ppr tys )
-    liftedTypeKindTyConApp
-  | tycon `hasKey` manyDataConKey
-  -- There are a lot of occurrences of 'Many' so it's a small optimisation to
-  -- avoid reboxing every time `mkTyConApp` is called.
-  = ASSERT2( null tys, ppr tycon $$ ppr tys )
-    manyDataConTy
-  | otherwise
-  = TyConApp tycon tys
-
--- This is a single, global definition of the type `Type`
--- Defined here so it is only allocated once.
--- See Note [mkTyConApp and Type]
-liftedTypeKindTyConApp :: Type
-liftedTypeKindTyConApp = TyConApp liftedTypeKindTyCon []
-
-{-
-Note [mkTyConApp and Type]
-~~~~~~~~~~~~~~~~~~~~~~~~~~
-Whilst benchmarking it was observed in #17292 that GHC allocated a lot
-of `TyConApp` constructors. Upon further inspection a large number of these
-TyConApp constructors were all duplicates of `Type` applied to no arguments.
-
-```
-(From a sample of 100000 TyConApp closures)
-0x45f3523    - 28732 - `Type`
-0x420b840702 - 9629  - generic type constructors
-0x42055b7e46 - 9596
-0x420559b582 - 9511
-0x420bb15a1e - 9509
-0x420b86c6ba - 9501
-0x42055bac1e - 9496
-0x45e68fd    - 538 - `TYPE ...`
-```
-
-Therefore in `mkTyConApp` we have a special case for `Type` to ensure that
-only one `TyConApp 'Type []` closure is allocated during the course of
-compilation. In order to avoid a potentially expensive series of checks in
-`mkTyConApp` only this egregious case is special cased at the moment.
--}
+-- | 'mkNakedTyConTy' creates a nullary 'TyConApp'. In general you
+-- should rather use 'GHC.Core.Type.mkTyConTy', which picks the shared
+-- nullary TyConApp from inside the TyCon (via tyConNullaryTy.  But
+-- we have to build the TyConApp tc [] in that TyCon field; that's
+-- what 'mkNakedTyConTy' is for.
+mkNakedTyConTy :: TyCon -> Type
+mkNakedTyConTy tycon = TyConApp tycon []
 
 {-
 %************************************************************************
@@ -1625,7 +1629,9 @@ data UnivCoProvenance
   | PluginProv String  -- ^ From a plugin, which asserts that this coercion
                        --   is sound. The string is for the use of the plugin.
 
-  | CorePrepProv   -- See Note [Unsafe coercions] in GHC.Core.CoreToStg.Pprep
+  | CorePrepProv       -- See Note [Unsafe coercions] in GHC.Core.CoreToStg.Prep
+      Bool   -- True  <=> the UnivCo must be homogeneously kinded
+             -- False <=> allow hetero-kinded, e.g. Int ~ Int#
 
   deriving Data.Data
 
@@ -1633,21 +1639,15 @@ instance Outputable UnivCoProvenance where
   ppr (PhantomProv _)    = text "(phantom)"
   ppr (ProofIrrelProv _) = text "(proof irrel.)"
   ppr (PluginProv str)   = parens (text "plugin" <+> brackets (text str))
-  ppr CorePrepProv       = text "(CorePrep)"
+  ppr (CorePrepProv _)   = text "(CorePrep)"
 
 -- | A coercion to be filled in by the type-checker. See Note [Coercion holes]
 data CoercionHole
   = CoercionHole { ch_co_var  :: CoVar
                        -- See Note [CoercionHoles and coercion free variables]
 
-                 , ch_blocker :: BlockSubstFlag  -- should this hole block substitution?
-                                                 -- See (2a) in TcCanonical
-                                                 -- Note [Equalities with incompatible kinds]
                  , ch_ref     :: IORef (Maybe Coercion)
                  }
-
-data BlockSubstFlag = YesBlockSubst
-                    | NoBlockSubst
 
 coHoleCoVar :: CoercionHole -> CoVar
 coHoleCoVar = ch_co_var
@@ -1664,9 +1664,8 @@ instance Data.Data CoercionHole where
 instance Outputable CoercionHole where
   ppr (CoercionHole { ch_co_var = cv }) = braces (ppr cv)
 
-instance Outputable BlockSubstFlag where
-  ppr YesBlockSubst = text "YesBlockSubst"
-  ppr NoBlockSubst  = text "NoBlockSubst"
+instance Uniquable CoercionHole where
+  getUnique (CoercionHole { ch_co_var = cv }) = getUnique cv
 
 {- Note [Phantom coercions]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1872,7 +1871,7 @@ We were also worried about
                                      `extendVarSet` tv
 
 Here deep_fvs and deep_tcf are mutually recursive, unlike fvs and tcf.
-But, amazingly, we get good code here too. GHC is careful not to makr
+But, amazingly, we get good code here too. GHC is careful not to mark
 TyCoFolder data constructor for deep_tcf as a loop breaker, so the
 record selections still cancel.  And eta expansion still happens too.
 -}
@@ -1881,8 +1880,8 @@ data TyCoFolder env a
   = TyCoFolder
       { tcf_view  :: Type -> Maybe Type   -- Optional "view" function
                                           -- E.g. expand synonyms
-      , tcf_tyvar :: env -> TyVar -> a
-      , tcf_covar :: env -> CoVar -> a
+      , tcf_tyvar :: env -> TyVar -> a    -- Does not automatically recur
+      , tcf_covar :: env -> CoVar -> a    -- into kinds of variables
       , tcf_hole  :: env -> CoercionHole -> a
           -- ^ What to do with coercion holes.
           -- See Note [Coercion holes] in "GHC.Core.TyCo.Rep".
@@ -1913,7 +1912,7 @@ foldTyCo (TyCoFolder { tcf_view       = view
       = let !env' = tycobinder env tv vis  -- Avoid building a thunk here
         in go_ty env (varType tv) `mappend` go_ty env' inner
 
-    -- Explicit recursion becuase using foldr builds a local
+    -- Explicit recursion because using foldr builds a local
     -- loop (with env free) and I'm not confident it'll be
     -- lambda lifted in the end
     go_tys _   []     = mempty
@@ -1952,7 +1951,11 @@ foldTyCo (TyCoFolder { tcf_view       = view
     go_prov env (PhantomProv co)    = go_co env co
     go_prov env (ProofIrrelProv co) = go_co env co
     go_prov _   (PluginProv _)      = mempty
-    go_prov _   CorePrepProv        = mempty
+    go_prov _   (CorePrepProv _)    = mempty
+
+-- | A view function that looks through nothing.
+noView :: Type -> Maybe Type
+noView _ = Nothing
 
 {- *********************************************************************
 *                                                                      *
@@ -2009,7 +2012,7 @@ provSize :: UnivCoProvenance -> Int
 provSize (PhantomProv co)    = 1 + coercionSize co
 provSize (ProofIrrelProv co) = 1 + coercionSize co
 provSize (PluginProv _)      = 1
-provSize CorePrepProv        = 1
+provSize (CorePrepProv _)    = 1
 
 {-
 ************************************************************************
@@ -2024,13 +2027,16 @@ GHC.Core.Multiplicity above this module.
 -}
 
 -- | A shorthand for data with an attached 'Mult' element (the multiplicity).
-data Scaled a = Scaled Mult a
+data Scaled a = Scaled !Mult a
   deriving (Data.Data)
-  -- You might think that this would be a natural candiate for
+  -- You might think that this would be a natural candidate for
   -- Functor, Traversable but Krzysztof says (!3674) "it was too easy
   -- to accidentally lift functions (substitutions, zonking etc.) from
   -- Type -> Type to Scaled Type -> Scaled Type, ignoring
   -- multiplicities and causing bugs".  So we don't.
+  --
+  -- Being strict in a is worse for performance, so we are only strict on the
+  -- Mult part of scaled.
 
 
 instance (Outputable a) => Outputable (Scaled a) where

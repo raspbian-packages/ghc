@@ -9,8 +9,8 @@ module Expression (
 
     -- ** Predicates
     (?), stage, stage0, stage1, stage2, notStage0, threadedBootstrapper,
-     package, notPackage, packageOneOf, libraryPackage, builder, way, input,
-     inputs, output, outputs,
+     package, notPackage, packageOneOf,
+     libraryPackage, builder, way, input, inputs, output, outputs,
 
     -- ** Evaluation
     interpret, interpretInContext,
@@ -86,6 +86,13 @@ instance BuilderPredicate a => BuilderPredicate (FilePath -> a) where
             Configure path -> builder (f path)
             _              -> return False
 
+instance BuilderPredicate a => BuilderPredicate (TestMode -> a) where
+    builder f = do
+        b <- getBuilder
+        case b of
+            Testsuite mode -> builder (f mode)
+            _              -> return False
+
 -- | Is the current build 'Way' equal to a certain value?
 way :: Way -> Predicate
 way w = (w ==) <$> getWay
@@ -93,7 +100,6 @@ way w = (w ==) <$> getWay
 {-
 Note [Stage Names]
 ~~~~~~~~~~~~~~~~~~
-
 Code referring to specific stages can be a bit tricky. In Hadrian, the stages
 have the same names they carried in the autoconf build system, but they are
 often referred to by the stage used to construct them. For example, the stage 1
@@ -105,7 +111,10 @@ compiler.
 
 -- | Is the build currently in stage 0?
 stage0 :: Predicate
-stage0 = stage Stage0
+stage0 =  p <$> getStage
+  where
+    p (Stage0 {}) = True
+    p _ = False
 
 -- | Is the build currently in stage 1?
 stage1 :: Predicate
@@ -117,7 +126,8 @@ stage2 = stage Stage2
 
 -- | Is the build /not/ in stage 0 right now?
 notStage0 :: Predicate
-notStage0 = notM stage0
+notStage0 = notM Expression.stage0
+
 
 -- | Whether or not the bootstrapping compiler provides a threaded RTS. We need
 --   to know this when building stage 1, since stage 1 links against the

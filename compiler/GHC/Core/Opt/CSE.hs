@@ -4,25 +4,23 @@
 \section{Common subexpression}
 -}
 
-{-# LANGUAGE CPP #-}
+
 
 {-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns   #-}
 
 module GHC.Core.Opt.CSE (cseProgram, cseOneExpr) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
 import GHC.Core.Subst
 import GHC.Types.Var    ( Var )
 import GHC.Types.Var.Env ( mkInScopeSet )
-import GHC.Types.Id     ( Id, idType, idHasRules
+import GHC.Types.Id     ( Id, idType, idHasRules, zapStableUnfolding
                         , idInlineActivation, setInlineActivation
                         , zapIdOccInfo, zapIdUsageInfo, idInlinePragma
                         , isJoinId, isJoinId_maybe )
-import GHC.Core.Utils   ( mkAltExpr, eqExpr
+import GHC.Core.Utils   ( mkAltExpr
                         , exprIsTickedString
                         , stripTicksE, stripTicksT, mkTicks )
 import GHC.Core.FVs     ( exprFreeVars )
@@ -30,8 +28,10 @@ import GHC.Core.Type    ( tyConAppArgs )
 import GHC.Core
 import GHC.Utils.Outputable
 import GHC.Types.Basic
-import GHC.Core.Map
-import GHC.Utils.Misc   ( filterOut, equalLength, debugIsOn )
+import GHC.Types.Tickish
+import GHC.Core.Map.Expr
+import GHC.Utils.Misc   ( filterOut, equalLength )
+import GHC.Utils.Panic
 import Data.List        ( mapAccumL )
 
 {-
@@ -69,10 +69,28 @@ Here we must *not* do CSE on the inner x+x!  The simplifier used to guarantee no
 shadowing, but it doesn't any more (it proved too hard), so we clone as we go.
 We can simply add clones to the substitution already described.
 
+A similar tricky situation is this, with x_123 and y_123 sharing the same unique:
+
+    let x_123 = e1 in
+    let y_123 = e2 in
+    let foo = e1
+
+Naively applying e1 = x_123 during CSE we would get:
+
+    let x_123 = e1 in
+    let y_123 = e2 in
+    let foo = x_123
+
+But x_123 is shadowed by y_123 and things would go terribly wrong! One more reason
+why we have to substitute binders as we go so we will properly get:
+
+    let x1 = e1 in
+    let x2 = e2 in
+    let foo = x1
 
 Note [CSE for bindings]
 ~~~~~~~~~~~~~~~~~~~~~~~
-Let-bindings have two cases, implemented by addBinding.
+Let-bindings have two cases, implemented by extendCSEnvWithBinding.
 
 * SUBSTITUTE: applies when the RHS is a variable
 
@@ -95,7 +113,7 @@ Let-bindings have two cases, implemented by addBinding.
       Here we CSE y1's rhs to 'x1', and then we must add (y1->x1) to
       the substitution so that we can CSE the binding for y2.
 
-    - Second, we use addBinding for case expression scrutinees too;
+    - Second, we use extendCSEnvWithBinding for case expression scrutinees too;
       see Note [CSE for case expressions]
 
 * EXTEND THE REVERSE MAPPING: applies in all other cases
@@ -136,7 +154,7 @@ Consider
   case scrut_expr of x { ...alts... }
 This is very like a strict let-binding
   let !x = scrut_expr in ...
-So we use (addBinding x scrut_expr) to process scrut_expr and x, and as a
+So we use (extendCSEnvWithBinding x scrut_expr) to process scrut_expr and x, and as a
 result all the stuff under Note [CSE for bindings] applies directly.
 
 For example:
@@ -151,18 +169,18 @@ For example:
   want to keep it as (wild1:as), but for CSE purpose that's a bad
   idea.
 
-  By using addBinding we add the binding (wild1 -> a) to the substitution,
+  By using extendCSEnvWithBinding we add the binding (wild1 -> a) to the substitution,
   which does exactly the right thing.
 
   (Notice this is exactly backwards to what the simplifier does, which
   is to try to replaces uses of 'a' with uses of 'wild1'.)
 
-  This is the main reason that addBinding is called with a trivial rhs.
+  This is the main reason that extendCSEnvWithBinding is called with a trivial rhs.
 
 * Non-trivial scrutinee
      case (f x) of y { pat -> ...let z = f x in ... }
 
-  By using addBinding we'll add (f x :-> y) to the cs_map, and
+  By using extendCSEnvWithBinding we'll add (f x :-> y) to the cs_map, and
   thereby CSE the inner (f x) to y.
 
 Note [CSE for INLINE and NOINLINE]
@@ -235,8 +253,8 @@ because we promised to inline foo as what the user wrote.  See similar Note
 
 Nor do we want to change the reverse mapping. Suppose we have
 
-   {-# Unf = Stable (\pq. build blah) #-}
-   foo = <expr>
+   foo {-# Unf = Stable (\pq. build blah) #-}
+       = <expr>
    bar = <expr>
 
 There could conceivably be merit in rewriting the RHS of bar:
@@ -248,6 +266,23 @@ Stable unfoldings are also created during worker/wrapper when we decide
 that a function's definition is so small that it should always inline.
 In this case we still want to do CSE (#13340). Hence the use of
 isAnyInlinePragma rather than isStableUnfolding.
+
+Now consider
+   foo = <expr>
+   bar {-# Unf = Stable ... #-}
+      = <expr>
+
+where the unfolding was added by strictness analysis, say.  Then
+CSE goes ahead, so we get
+   bar = foo
+and probably use SUBSTITUTE that will make 'bar' dead.  But just
+possibly not -- see Note [Dealing with ticks].  In that case we might
+be left with
+   bar = tick t1 (tick t2 foo)
+in which case we would really like to get rid of the stable unfolding
+(generated by the strictness analyser, say).  Hence the zapStableUnfolding
+in cse_bind.  Not a big deal, and only makes a difference when ticks
+get into the picture.
 
 Note [Corner case for case expressions]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -319,6 +354,26 @@ with mutual recursion it's quite hard; but for self-recursive bindings
 We can't use cs_map for this, because the key isn't an expression of
 the program; it's a kind of synthetic key for recursive bindings.
 
+Note [Separate envs for let rhs and body]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Substituting occurances of the binder in the rhs with the
+ renamed binder is wrong for non-recursive bindings. Why?
+Consider this core.
+
+    let {x_123 = e} in
+    let {y_123 = \eta0 -> x_123} in ...
+
+In the second line the y_123 on the lhs and x_123 on the rhs refer to different binders
+even if they share the same unique.
+
+If we apply the substitution `123 => x2_124}` to both the lhs and rhs we  will transform
+`let y_123 = \eta0 -> x_123` into `let x2_124 = \eta0 -> x2_124`.
+However x2_124 on the rhs is not in scope and really shouldn't have been renamed at all.
+Because really this should still be x_123! In fact this exact thing happened in #21685.
+
+To fix this we pass two different cse envs to cse_bind. One we use the cse the rhs of the binding.
+And one we update with the result of cseing the rhs which we then use going forward for the
+body/rest of the module.
 
 ************************************************************************
 *                                                                      *
@@ -334,8 +389,9 @@ cseBind :: TopLevelFlag -> CSEnv -> CoreBind -> (CSEnv, CoreBind)
 cseBind toplevel env (NonRec b e)
   = (env2, NonRec b2 e2)
   where
+    -- See Note [Separate envs for let rhs and body]
     (env1, b1)       = addBinder env b
-    (env2, (b2, e2)) = cse_bind toplevel env1 (b,e) b1
+    (env2, (b2, e2)) = cse_bind toplevel env env1 (b,e) b1
 
 cseBind toplevel env (Rec [(in_id, rhs)])
   | noCSE in_id
@@ -365,32 +421,35 @@ cseBind toplevel env (Rec pairs)
     (env1, bndrs1) = addRecBinders env (map fst pairs)
     (env2, pairs') = mapAccumL do_one env1 (zip pairs bndrs1)
 
-    do_one env (pr, b1) = cse_bind toplevel env pr b1
+    do_one env (pr, b1) = cse_bind toplevel env env pr b1
 
 -- | Given a binding of @in_id@ to @in_rhs@, and a fresh name to refer
 -- to @in_id@ (@out_id@, created from addBinder or addRecBinders),
 -- first try to CSE @in_rhs@, and then add the resulting (possibly CSE'd)
 -- binding to the 'CSEnv', so that we attempt to CSE any expressions
 -- which are equal to @out_rhs@.
-cse_bind :: TopLevelFlag -> CSEnv -> (InId, InExpr) -> OutId -> (CSEnv, (OutId, OutExpr))
-cse_bind toplevel env (in_id, in_rhs) out_id
+-- We use a different env for cse on the rhs and for extendCSEnvWithBinding
+-- for reasons explain in See Note [Separate envs for let rhs and body]
+cse_bind :: TopLevelFlag -> CSEnv -> CSEnv -> (InId, InExpr) -> OutId -> (CSEnv, (OutId, OutExpr))
+cse_bind toplevel env_rhs env_body (in_id, in_rhs) out_id
   | isTopLevel toplevel, exprIsTickedString in_rhs
       -- See Note [Take care with literal strings]
-  = (env', (out_id', in_rhs))
+  = (env_body', (out_id', in_rhs))
 
-  | Just arity <- isJoinId_maybe in_id
+  | Just arity <- isJoinId_maybe out_id
       -- See Note [Look inside join-point binders]
   = let (params, in_body) = collectNBinders arity in_rhs
-        (env', params') = addBinders env params
+        (env', params') = addBinders env_rhs params
         out_body = tryForCSE env' in_body
-    in (env, (out_id, mkLams params' out_body))
+    in (env_body , (out_id, mkLams params' out_body))
 
   | otherwise
-  = (env', (out_id'', out_rhs))
+  = (env_body', (out_id'', out_rhs))
   where
-    (env', out_id') = addBinding env in_id out_id out_rhs
-    (cse_done, out_rhs) = try_for_cse env in_rhs
-    out_id'' | cse_done  = delayInlining toplevel out_id'
+    (env_body', out_id') = extendCSEnvWithBinding env_body  in_id out_id out_rhs cse_done
+    (cse_done, out_rhs)  = try_for_cse env_rhs in_rhs
+    out_id'' | cse_done  = zapStableUnfolding $
+                           delayInlining toplevel out_id'
              | otherwise = out_id'
 
 delayInlining :: TopLevelFlag -> Id -> Id
@@ -408,20 +467,26 @@ delayInlining top_lvl bndr
   | otherwise
   = bndr
 
-addBinding :: CSEnv                      -- Includes InId->OutId cloning
-           -> InVar                      -- Could be a let-bound type
-           -> OutId -> OutExpr           -- Processed binding
-           -> (CSEnv, OutId)             -- Final env, final bndr
+extendCSEnvWithBinding
+           :: CSEnv            -- Includes InId->OutId cloning
+           -> InVar            -- Could be a let-bound type
+           -> OutId -> OutExpr -- Processed binding
+           -> Bool             -- True <=> RHS was CSE'd and is a variable
+                               --          or maybe (Tick t variable)
+           -> (CSEnv, OutId)   -- Final env, final bndr
 -- Extend the CSE env with a mapping [rhs -> out-id]
 -- unless we can instead just substitute [in-id -> rhs]
 --
--- It's possible for the binder to be a type variable (see
--- Note [Type-let] in GHC.Core), in which case we can just substitute.
-addBinding env in_id out_id rhs'
-  | not (isId in_id) = (extendCSSubst env in_id rhs',     out_id)
-  | noCSE in_id      = (env,                              out_id)
-  | use_subst        = (extendCSSubst env in_id rhs',     out_id)
-  | otherwise        = (extendCSEnv env rhs' id_expr', zapped_id)
+-- It's possible for the binder to be a type variable,
+-- in which case we can just substitute.
+-- See Note [CSE for bindings]
+extendCSEnvWithBinding env in_id out_id rhs' cse_done
+  | not (isId out_id) = (extendCSSubst env in_id rhs',     out_id)
+  | noCSE out_id      = (env,                              out_id)
+  | use_subst         = (extendCSSubst env in_id rhs',     out_id)
+  | cse_done          = (env,                              out_id)
+                       -- See Note [Dealing with ticks]
+  | otherwise         = (extendCSEnv env rhs' id_expr', zapped_id)
   where
     id_expr'  = varToCoreExpr out_id
     zapped_id = zapIdUsageInfo out_id
@@ -437,9 +502,8 @@ addBinding env in_id out_id rhs'
 
     -- Should we use SUBSTITUTE or EXTEND?
     -- See Note [CSE for bindings]
-    use_subst = case rhs' of
-                   Var {} -> True
-                   _      -> False
+    use_subst | Var {} <- rhs' = True
+              | otherwise      = False
 
 -- | Given a binder `let x = e`, this function
 -- determines whether we should add `e -> x` to the cs_map
@@ -485,6 +549,55 @@ The net effect is that for the y-binding we want to
   - but leave the original binding for y undisturbed
 
 This is done by cse_bind.  I got it wrong the first time (#13367).
+
+Note [Dealing with ticks]
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Ticks complicate CSE a bit, as I discovered in the fallout from
+fixing #19360.
+
+* To get more CSE-ing, we strip all the tickishFloatable ticks from
+  an expression
+  - when inserting into the cs_map (see extendCSEnv)
+  - when looking up in the cs_map (see call to lookupCSEnv in try_for_cse)
+  Quite why only the tickishFloatable ticks, I'm not quite sure.
+
+  AK: I think we only do this for floatable ticks since generally we don't mind them
+  being less accurate as much. E.g. consider
+    case e of
+      C1 -> f (<tick1> e1)
+      C2 -> f (<tick2> e1)
+  If the ticks are (floatable) source notes nothing too bad happens if the debug info for
+  both branches says the code comes from the same source location. Even if it will be inaccurate
+  for one of the branches. We should probably still consider this worthwhile.
+  However if the ticks are cost centres we really don't want the cost of both branches to be
+  attributed to the same cost centre. Because a user might explicitly have inserted different
+  cost centres in order to distinguish between evaluations resulting from the two different branches.
+  e.g. something like this:
+    case e of
+      C1 -> f ({ SCC "evalAlt1"} e1)
+      C1 -> f ({ SCC "evalAlt2"} e1)
+  But it's still a bit suspicious.
+
+* If we get a hit in cs_map, we wrap the result in the ticks from the
+  thing we are looking up (see try_for_cse)
+
+Net result: if we get a hit, we might replace
+  let x = tick t1 (tick t2 e)
+with
+  let x = tick t1 (tick t2 y)
+where 'y' is the variable that 'e' maps to.  Now consider extendCSEnvWithBinding for
+the binding for 'x':
+
+* We can't use SUBSTITUTE because those ticks might not be trivial (we
+  use tickishIsCode in exprIsTrivial)
+
+* We should not use EXTEND, because we definitely don't want to
+  add  (tick t1 (tick t2 y)) :-> x
+  to the cs_map. Remember we strip off the ticks, so that would amount
+  to adding y :-> x, very silly.
+
+TL;DR: we do neither; hence the cse_done case in extendCSEnvWithBinding.
+
 
 Note [Delay inlining after CSE]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -599,18 +712,18 @@ cseExpr env (Case e bndr ty alts) = cseCase env e bndr ty alts
 cseCase :: CSEnv -> InExpr -> InId -> InType -> [InAlt] -> OutExpr
 cseCase env scrut bndr ty alts
   = Case scrut1 bndr3 ty' $
-    combineAlts alt_env (map cse_alt alts)
+    combineAlts (map cse_alt alts)
   where
     ty' = substTy (csEnvSubst env) ty
-    scrut1 = tryForCSE env scrut
+    (cse_done, scrut1) = try_for_cse env scrut
 
     bndr1 = zapIdOccInfo bndr
       -- Zapping the OccInfo is needed because the extendCSEnv
       -- in cse_alt may mean that a dead case binder
       -- becomes alive, and Lint rejects that
     (env1, bndr2)    = addBinder env bndr1
-    (alt_env, bndr3) = addBinding env1 bndr bndr2 scrut1
-         -- addBinding: see Note [CSE for case expressions]
+    (alt_env, bndr3) = extendCSEnvWithBinding env1 bndr bndr2 scrut1 cse_done
+         -- extendCSEnvWithBinding: see Note [CSE for case expressions]
 
     con_target :: OutExpr
     con_target = lookupSubst alt_env bndr
@@ -619,44 +732,43 @@ cseCase env scrut bndr ty alts
     arg_tys = tyConAppArgs (idType bndr3)
 
     -- See Note [CSE for case alternatives]
-    cse_alt (DataAlt con, args, rhs)
-        = (DataAlt con, args', tryForCSE new_env rhs)
+    cse_alt (Alt (DataAlt con) args rhs)
+        = Alt (DataAlt con) args' (tryForCSE new_env rhs)
         where
           (env', args') = addBinders alt_env args
           new_env       = extendCSEnv env' con_expr con_target
           con_expr      = mkAltExpr (DataAlt con) args' arg_tys
 
-    cse_alt (con, args, rhs)
-        = (con, args', tryForCSE env' rhs)
+    cse_alt (Alt con args rhs)
+        = Alt con args' (tryForCSE env' rhs)
         where
           (env', args') = addBinders alt_env args
 
-combineAlts :: CSEnv -> [OutAlt] -> [OutAlt]
+combineAlts :: [OutAlt] -> [OutAlt]
 -- See Note [Combine case alternatives]
-combineAlts env alts
+combineAlts alts
   | (Just alt1, rest_alts) <- find_bndr_free_alt alts
-  , (_,bndrs1,rhs1) <- alt1
+  , Alt _ bndrs1 rhs1 <- alt1
   , let filtered_alts = filterOut (identical_alt rhs1) rest_alts
   , not (equalLength rest_alts filtered_alts)
-  = ASSERT2( null bndrs1, ppr alts )
-    (DEFAULT, [], rhs1) : filtered_alts
+  = assertPpr (null bndrs1) (ppr alts) $
+    Alt DEFAULT [] rhs1 : filtered_alts
 
   | otherwise
   = alts
   where
-    in_scope = substInScope (csEnvSubst env)
 
     find_bndr_free_alt :: [CoreAlt] -> (Maybe CoreAlt, [CoreAlt])
        -- The (Just alt) is a binder-free alt
        -- See Note [Combine case alts: awkward corner]
     find_bndr_free_alt []
       = (Nothing, [])
-    find_bndr_free_alt (alt@(_,bndrs,_) : alts)
+    find_bndr_free_alt (alt@(Alt _ bndrs _) : alts)
       | null bndrs = (Just alt, alts)
       | otherwise  = case find_bndr_free_alt alts of
                        (mb_bf, alts) -> (mb_bf, alt:alts)
 
-    identical_alt rhs1 (_,_,rhs) = eqExpr in_scope rhs1 rhs
+    identical_alt rhs1 (Alt _ _ rhs) = eqCoreExpr rhs1 rhs
        -- Even if this alt has binders, they will have been cloned
        -- If any of these binders are mentioned in 'rhs', then
        -- 'rhs' won't compare equal to 'rhs1' (which is from an
@@ -739,9 +851,12 @@ data CSEnv
             -- The substitution variables to
             -- /trivial/ OutExprs, not arbitrary expressions
 
-       , cs_map   :: CoreMap OutExpr   -- The reverse mapping
+       , cs_map   :: CoreMap OutExpr
+            -- The "reverse" mapping.
             -- Maps a OutExpr to a /trivial/ OutExpr
             -- The key of cs_map is stripped of all Ticks
+            -- It maps arbitrary expressions to trivial expressions
+            -- representing the same value. E.g @C a b@ to @x1@.
 
        , cs_rec_map :: CoreMap OutExpr
             -- See Note [CSE for recursive bindings]
@@ -755,6 +870,7 @@ lookupCSEnv :: CSEnv -> OutExpr -> Maybe OutExpr
 lookupCSEnv (CS { cs_map = csmap }) expr
   = lookupCoreMap csmap expr
 
+-- | @extendCSEnv env e triv_expr@ will replace any occurrence of @e@ with @triv_expr@ going forward.
 extendCSEnv :: CSEnv -> OutExpr -> OutExpr -> CSEnv
 extendCSEnv cse expr triv_expr
   = cse { cs_map = extendCoreMap (cs_map cse) sexpr triv_expr }

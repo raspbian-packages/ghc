@@ -231,13 +231,13 @@ import Foreign.C.Error
 import Foreign.C.String
 import Foreign.Ptr
 import Foreign.Marshal.Alloc
+import Foreign.Marshal.Utils (with)
 import Foreign.Storable
 import GHC.IO.SubSystem
 import GHC.IO.Windows.Handle (openFileAsTemp)
 import GHC.IO.Handle.Windows (mkHandleFromHANDLE)
 import GHC.IO.Device as IODevice
 import GHC.Real (fromIntegral)
-import Foreign.Marshal.Utils (new)
 #endif
 import Foreign.C.Types
 import System.Posix.Internals
@@ -347,7 +347,9 @@ readFile name   =  openFile name ReadMode >>= hGetContents
 -- @since 4.15.0.0
 
 readFile'       :: FilePath -> IO String
-readFile' name  =  openFile name ReadMode >>= hGetContents'
+-- There's a bit of overkill here—both withFile and
+-- hGetContents' will close the file in the end.
+readFile' name  =  withFile name ReadMode hGetContents'
 
 -- | The computation 'writeFile' @file str@ function writes the string @str@,
 -- to the file @file@.
@@ -368,10 +370,8 @@ appendFile f txt = withFile f AppendMode (\ hdl -> hPutStr hdl txt)
 
 -- | The 'readLn' function combines 'getLine' and 'readIO'.
 
-readLn          :: Read a => IO a
-readLn          =  do l <- getLine
-                      r <- readIO l
-                      return r
+readLn :: Read a => IO a
+readLn = getLine >>= readIO
 
 -- | The 'readIO' function is similar to 'read' except that it signals
 -- parse failure to the 'IO' monad instead of terminating the program.
@@ -415,21 +415,6 @@ hReady h        =  hWaitForInput h 0
 hPrint          :: Show a => Handle -> a -> IO ()
 hPrint hdl      =  hPutStrLn hdl . show
 
--- | @'withFile' name mode act@ opens a file using 'openFile' and passes
--- the resulting handle to the computation @act@.  The handle will be
--- closed on exit from 'withFile', whether by normal termination or by
--- raising an exception.  If closing the handle raises an exception, then
--- this exception will be raised by 'withFile' rather than any exception
--- raised by @act@.
-withFile :: FilePath -> IOMode -> (Handle -> IO r) -> IO r
-withFile name mode = bracket (openFile name mode) hClose
-
--- | @'withBinaryFile' name mode act@ opens a file using 'openBinaryFile'
--- and passes the resulting handle to the computation @act@.  The handle
--- will be closed on exit from 'withBinaryFile', whether by normal
--- termination or by raising an exception.
-withBinaryFile :: FilePath -> IOMode -> (Handle -> IO r) -> IO r
-withBinaryFile name mode = bracket (openBinaryFile name mode) hClose
 
 -- ---------------------------------------------------------------------------
 -- fixIO
@@ -449,7 +434,6 @@ fixIO k = do
 
 -- Note [Blackholing in fixIO]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~
---
 -- We do our own explicit black holing here, because GHC's lazy
 -- blackholing isn't enough.  In an infinite loop, GHC may run the IO
 -- computation a few times before it notices the loop, which is wrong.
@@ -490,7 +474,9 @@ openTempFile :: FilePath   -- ^ Directory in which to create the file
              -> String     -- ^ File name template. If the template is \"foo.ext\" then
                            -- the created file will be \"fooXXX.ext\" where XXX is some
                            -- random number. Note that this should not contain any path
-                           -- separator characters.
+                           -- separator characters. On Windows, the template prefix may
+                           -- be truncated to 3 chars, e.g. \"foobar.ext\" will be
+                           -- \"fooXXX.ext\".
              -> IO (FilePath, Handle)
 openTempFile tmp_dir template
     = openTempFile' "openTempFile" tmp_dir template False 0o600
@@ -542,17 +528,17 @@ openTempFile' loc tmp_dir template binary mode
       let label = if null prefix then "ghc" else prefix
       withCWString tmp_dir $ \c_tmp_dir ->
         withCWString label $ \c_template ->
-          withCWString suffix $ \c_suffix -> do
-            c_ptr <- new nullPtr
-            res <- c_createUUIDTempFileErrNo c_tmp_dir c_template c_suffix
-                                             c_ptr
-            if not res
-               then do errno <- getErrno
-                       ioError (errnoToIOError loc errno Nothing (Just tmp_dir))
-               else do c_p <- peek c_ptr
-                       filename <- peekCWString c_p
-                       free c_p
-                       handleResultsWinIO filename ((fromIntegral mode .&. o_EXCL) == o_EXCL)
+          withCWString suffix $ \c_suffix ->
+            with nullPtr $ \c_ptr -> do
+              res <- c_createUUIDTempFileErrNo c_tmp_dir c_template c_suffix c_ptr
+              if not res
+                 then do errno <- getErrno
+                         ioError (errnoToIOError loc errno Nothing (Just tmp_dir))
+                 else do c_p <- peek c_ptr
+                         filename <- peekCWString c_p
+                         free c_p
+                         let flags = fromIntegral mode .&. o_EXCL
+                         handleResultsWinIO filename (flags == o_EXCL)
 
     findTempNamePosix = do
       let label = if null prefix then "ghc" else prefix

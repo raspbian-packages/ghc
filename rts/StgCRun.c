@@ -26,7 +26,7 @@
  *
  * -------------------------------------------------------------------------- */
 
-#include "PosixSource.h"
+#include "rts/PosixSource.h"
 #include "ghcconfig.h"
 
 // Enable DWARF Call-Frame Information (used for stack unwinding) on Linux.
@@ -36,7 +36,7 @@
 #define ENABLE_UNWINDING
 #endif
 
-#if defined(sparc_HOST_ARCH) || defined(USE_MINIINTERPRETER)
+#if defined(USE_MINIINTERPRETER)
 /* include Stg.h first because we want real machine regs in here: we
  * have to get the value of R1 back from Stg land to C land intact.
  */
@@ -96,25 +96,6 @@ StgFunPtr StgReturn(void)
 }
 
 #else /* !USE_MINIINTERPRETER */
-
-#if defined(mingw32_HOST_OS)
-/*
- * Note [Windows Stack allocations]
- *
- * On windows the stack has to be allocated 4k at a time, otherwise
- * we get a segfault.  The C compiler knows how to do this (it calls
- * _alloca()), so we make sure that we can allocate as much stack as
- * we need.  However since we are doing a local stack allocation and the value
- * isn't valid outside the frame, compilers are free to optimize this allocation
- * and the corresponding stack check away. So to prevent that we request that
- * this function never be optimized (See #14669).  */
-STG_NO_OPTIMIZE StgWord8 *win32AllocStack(void)
-{
-    StgWord8 stack[RESERVED_C_STACK_BYTES + 16 + 12];
-    return stack;
-}
-#endif
-
 /* -----------------------------------------------------------------------------
    x86 architecture
    -------------------------------------------------------------------------- */
@@ -132,11 +113,11 @@ STG_NO_OPTIMIZE StgWord8 *win32AllocStack(void)
 /*
  * Note [Stack Alignment on X86]
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
- *
  * On X86 (both 32bit and 64bit) we keep the stack aligned on function calls at
  * a 16-byte boundary. This is done because on a number of architectures the
- * ABI requires this (x64, Mac OSX 32bit/64bit) as well as interfacing with
- * other libraries through the FFI.
+ * ABI requires this (e.g. the System V AMD64 ABI, Mac OS X 32-bit/64-bit ABIs,
+ * and the Win64 ABI) as well as interfacing with * other libraries through the
+ * FFI.
  *
  * As part of this arrangement we must maintain the stack at a 16-byte boundary
  * - word_size-bytes (so 16n - 4 for i386 and 16n - 8 for x64) on entry to a
@@ -166,7 +147,21 @@ STG_NO_OPTIMIZE StgWord8 *win32AllocStack(void)
  *
  * If you edit the sequence below be sure to update the unwinding information
  * for stg_stop_thread in StgStartup.cmm.
- */
+ *
+ * Note [Windows Stack allocations]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * On windows the stack has to be allocated 4k at a time, otherwise
+ * we get a segfault.  This is done by using a helper ___chkstk_ms that is
+ * provided by libgcc.  The Haskell side already knows how to handle this
+(see GHC.CmmToAsm.X86.Instr.needs_probe_call)
+ * but we need to do the same from STG.  Previously we would drop the stack
+ * in StgRun but would only make it valid whenever the scheduler loop ran.
+ *
+ * This approach was fundamentally broken in that it falls apart when you
+ * take a signal from the OS (See #14669, #18601, #18548 and #18496).
+ * Concretely this means we must always keep the stack valid.
+ * */
+
 
 static void GNUC3_ATTRIBUTE(used)
 StgRunIsImplementedInAssembler(void)
@@ -186,7 +181,13 @@ StgRunIsImplementedInAssembler(void)
          * bytes from here - this is a requirement of the C ABI, so
          * that C code can assign SSE2 registers directly to/from
          * stack locations.
+         *
+         * See Note [Windows Stack allocations]
          */
+#if defined(mingw32_HOST_OS)
+        "movl %0, %%eax\n\t"
+        "call ___chkstk_ms\n\t"
+#endif
         "subl %0, %%esp\n\t"
 
         /*
@@ -383,6 +384,14 @@ StgRunIsImplementedInAssembler(void)
         STG_HIDDEN STG_RUN "\n"
 #endif
         STG_RUN ":\n\t"
+        /*
+         * See Note [Windows Stack allocations]
+         */
+#if defined(mingw32_HOST_OS)
+        "movq %1, %%rax\n\t"
+        "addq %0, %%rax\n\t"
+        "callq ___chkstk_ms\n\t"
+#endif
         "subq %1, %%rsp\n\t"
         "movq %%rsp, %%rax\n\t"
         "subq %0, %%rsp\n\t"
@@ -397,19 +406,27 @@ StgRunIsImplementedInAssembler(void)
          * Additional callee saved registers on Win64. This must match
          * callClobberedRegisters in compiler/GHC/CmmToAsm/X86/Regs.hs as
          * both represent the Win64 calling convention.
+         *
+         * Note that we must save the entire 128-bit width of the XMM
+         * registers, as noted in #21465. Moreover, note that, due to the
+         * presence of the return address on the stack, %rsp+8 is
+         * 16-byte aligned. Since MOVAPS requires memory operands to be aligned
+         * to 16-bytes, we must add a word of padding here.
          */
-        "movq %%rdi,48(%%rax)\n\t"
-        "movq %%rsi,56(%%rax)\n\t"
-        "movq %%xmm6,  64(%%rax)\n\t"
-        "movq %%xmm7,  72(%%rax)\n\t"
-        "movq %%xmm8,  80(%%rax)\n\t"
-        "movq %%xmm9,  88(%%rax)\n\t"
-        "movq %%xmm10, 96(%%rax)\n\t"
-        "movq %%xmm11,104(%%rax)\n\t"
-        "movq %%xmm12,112(%%rax)\n\t"
-        "movq %%xmm13,120(%%rax)\n\t"
-        "movq %%xmm14,128(%%rax)\n\t"
-        "movq %%xmm15,136(%%rax)\n\t"
+        "movq %%rdi,   48(%%rax)\n\t"
+        "movq %%rsi,   56(%%rax)\n\t"
+        /* 8 bytes of padding for alignment */
+        "movaps %%xmm6,  72(%%rax)\n\t"
+        "movaps %%xmm7,  88(%%rax)\n\t"
+        "movaps %%xmm8, 104(%%rax)\n\t"
+        "movaps %%xmm9, 120(%%rax)\n\t"
+        "movaps %%xmm10,136(%%rax)\n\t"
+        "movaps %%xmm11,152(%%rax)\n\t"
+        "movaps %%xmm12,168(%%rax)\n\t"
+        "movaps %%xmm13,184(%%rax)\n\t"
+        "movaps %%xmm14,200(%%rax)\n\t"
+        "movaps %%xmm15,216(%%rax)\n\t"
+        /* 8 bytes of padding for alignment */
 #endif
 
 #if defined(ENABLE_UNWINDING)
@@ -498,18 +515,20 @@ StgRunIsImplementedInAssembler(void)
         "movq 32(%%rsp),%%r14\n\t"
         "movq 40(%%rsp),%%r15\n\t"
 #if defined(mingw32_HOST_OS)
-        "movq  48(%%rsp),%%rdi\n\t"
-        "movq  56(%%rsp),%%rsi\n\t"
-        "movq  64(%%rsp),%%xmm6\n\t"
-        "movq  72(%%rsp),%%xmm7\n\t"
-        "movq  80(%%rsp),%%xmm8\n\t"
-        "movq  88(%%rsp),%%xmm9\n\t"
-        "movq  96(%%rsp),%%xmm10\n\t"
-        "movq 104(%%rsp),%%xmm11\n\t"
-        "movq 112(%%rsp),%%xmm12\n\t"
-        "movq 120(%%rsp),%%xmm13\n\t"
-        "movq 128(%%rsp),%%xmm14\n\t"
-        "movq 136(%%rsp),%%xmm15\n\t"
+        "movq 48(%%rsp),%%rdi\n\t"
+        "movq 56(%%rsp),%%rsi\n\t"
+        /* 8 bytes of padding for alignment */
+        "movaps  72(%%rsp),%%xmm6\n\t"
+        "movaps  88(%%rsp),%%xmm7\n\t"
+        "movaps 104(%%rsp),%%xmm8\n\t"
+        "movaps 120(%%rsp),%%xmm9\n\t"
+        "movaps 136(%%rsp),%%xmm10\n\t"
+        "movaps 152(%%rsp),%%xmm11\n\t"
+        "movaps 168(%%rsp),%%xmm12\n\t"
+        "movaps 184(%%rsp),%%xmm13\n\t"
+        "movaps 200(%%rsp),%%xmm14\n\t"
+        "movaps 216(%%rsp),%%xmm15\n\t"
+        /* 8 bytes of padding for alignment */
 #endif
         "addq %1, %%rsp\n\t"
         "retq"
@@ -555,79 +574,6 @@ StgRunIsImplementedInAssembler(void)
 
 #endif /* x86-64 */
 
-/* -----------------------------------------------------------------------------
-   Sparc architecture
-
-   --
-   OLD COMMENT from GHC-3.02:
-
-   We want tailjumps to be calls, because `call xxx' is the only Sparc
-   branch that allows an arbitrary label as a target.  (Gcc's ``goto
-   *target'' construct ends up loading the label into a register and
-   then jumping, at the cost of two extra instructions for the 32-bit
-   load.)
-
-   When entering the threaded world, we stash our return address in a
-   known location so that \tr{%i7} is available as an extra
-   callee-saves register.  Of course, we have to restore this when
-   coming out of the threaded world.
-
-   I hate this god-forsaken architecture.  Since the top of the
-   reserved stack space is used for globals and the bottom is reserved
-   for outgoing arguments, we have to stick our return address
-   somewhere in the middle.  Currently, I'm allowing 100 extra
-   outgoing arguments beyond the first 6.  --JSM
-
-   Updated info (GHC 4.06): we don't appear to use %i7 any more, so
-   I'm not sure whether we still need to save it.  Incedentally, what
-   does the last paragraph above mean when it says "the top of the
-   stack is used for globals"?  What globals?  --SDM
-
-   Updated info (GHC 4.08.2): not saving %i7 any more (see below).
-   -------------------------------------------------------------------------- */
-
-#if defined(sparc_HOST_ARCH)
-
-StgRegTable *
-StgRun(StgFunPtr f, StgRegTable *basereg) {
-
-    unsigned char space[RESERVED_C_STACK_BYTES];
-#if 0
-    register void *i7 __asm__("%i7");
-    ((void **)(space))[100] = i7;
-#endif
-    f();
-    __asm__ volatile (
-                 ".align 4\n"
-                 ".global " STG_RETURN "\n"
-                 STG_RETURN ":"
-                 : : "p" (space) : "l0","l1","l2","l3","l4","l5","l6","l7");
-    /* we tell the C compiler that l0-l7 are clobbered on return to
-     * StgReturn, otherwise it tries to use these to save eg. the
-     * address of space[100] across the call.  The correct thing
-     * to do would be to save all the callee-saves regs, but we
-     * can't be bothered to do that.
-     *
-     * We also explicitly mark space as used since gcc eliminates it
-     * otherwise.
-     *
-     * The code that gcc generates for this little fragment is now
-     * terrible.  We could do much better by coding it directly in
-     * assembler.
-     */
-#if 0
-    /* updated 4.08.2: we don't save %i7 in the middle of the reserved
-     * space any more, since gcc tries to save its address across the
-     * call to f(), this gets clobbered in STG land and we end up
-     * dereferencing a bogus pointer in StgReturn.
-     */
-    __asm__ volatile ("ld %1,%0"
-                                : "=r" (i7) : "m" (((void **)(space))[100]));
-#endif
-    return (StgRegTable *)R1.i;
-}
-
-#endif
 
 /* -----------------------------------------------------------------------------
    PowerPC architecture
@@ -871,7 +817,7 @@ StgRun(StgFunPtr f, StgRegTable *basereg) {
            those regs not used in Thumb mode. Hard to judge if this is
            needed, but certainly Haskell code is using them for
            placing GHC's virtual registers there. See
-           includes/stg/MachRegs.h Please note that Haskell code is
+           rts/include/stg/MachRegs.h Please note that Haskell code is
            compiled by GHC/LLVM into ARM code (not Thumb!), at least
            as of February 2012 */
       : "%r4", "%r5", "%r6", "%r8", "%r9", "%r10", "%11", "%ip", "%lr"

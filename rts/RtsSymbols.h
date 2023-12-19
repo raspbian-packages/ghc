@@ -21,7 +21,8 @@
 typedef struct _RtsSymbolVal {
     const SymbolName* lbl;
     SymbolAddr* addr;
-    bool weak;
+    SymStrength strength;
+    SymType type;
 } RtsSymbolVal;
 
 extern RtsSymbolVal rtsSyms[];

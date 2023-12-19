@@ -1,5 +1,7 @@
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE Trustworthy #-}
-{-# LANGUAGE CPP, NoImplicitPrelude, StandaloneDeriving #-}
+
 {-# OPTIONS_HADDOCK not-home #-}
 
 -----------------------------------------------------------------------------
@@ -42,6 +44,9 @@ import {-# SOURCE #-} Data.Version
 -- Data.Char.chr already imports this and we need to define a Show instance
 -- for GeneralCategory
 import GHC.Show ( Show )
+
+-- $setup
+-- >>> import Prelude
 
 #include "HsBaseConfig.h"
 #include "UnicodeVersion.h"

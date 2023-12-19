@@ -6,7 +6,7 @@
 Bag: an unordered collection with duplicates
 -}
 
-{-# LANGUAGE ScopedTypeVariables, CPP, DeriveFunctor #-}
+{-# LANGUAGE ScopedTypeVariables, DeriveFunctor, TypeFamilies #-}
 
 module GHC.Data.Bag (
         Bag, -- abstract type
@@ -17,7 +17,7 @@ module GHC.Data.Bag (
         filterBag, partitionBag, partitionBagWith,
         concatBag, catBagMaybes, foldBag,
         isEmptyBag, isSingletonBag, consBag, snocBag, anyBag, allBag,
-        listToBag, bagToList, mapAccumBagL,
+        listToBag, nonEmptyToBag, bagToList, headMaybe, mapAccumBagL,
         concatMapBag, concatMapBagPair, mapMaybeBag,
         mapBagM, mapBagM_,
         flatMapBagM, flatMapBagPairM,
@@ -27,15 +27,17 @@ module GHC.Data.Bag (
 
 import GHC.Prelude
 
+import GHC.Exts ( IsList(..) )
 import GHC.Utils.Outputable
 import GHC.Utils.Misc
-
 import GHC.Utils.Monad
 import Control.Monad
 import Data.Data
-import Data.Maybe( mapMaybe )
+import Data.Maybe( mapMaybe, listToMaybe )
 import Data.List ( partition, mapAccumL )
+import Data.List.NonEmpty ( NonEmpty(..) )
 import qualified Data.Foldable as Foldable
+import qualified Data.Semigroup ( (<>) )
 
 infixr 3 `consBag`
 infixl 3 `snocBag`
@@ -83,7 +85,7 @@ snocBag bag elt = bag `unionBags` (unitBag elt)
 
 isEmptyBag :: Bag a -> Bool
 isEmptyBag EmptyBag = True
-isEmptyBag _        = False -- NB invariants
+isEmptyBag _ = False
 
 isSingletonBag :: Bag a -> Bool
 isSingletonBag EmptyBag      = False
@@ -144,7 +146,7 @@ catBagMaybes bs = foldr add emptyBag bs
     add Nothing rs = rs
     add (Just x) rs = x `consBag` rs
 
-partitionBag :: (a -> Bool) -> Bag a -> (Bag a {- Satisfy predictate -},
+partitionBag :: (a -> Bool) -> Bag a -> (Bag a {- Satisfy predicate -},
                                          Bag a {- Don't -})
 partitionBag _    EmptyBag = (EmptyBag, EmptyBag)
 partitionBag pred b@(UnitBag val)
@@ -299,8 +301,18 @@ listToBag [] = EmptyBag
 listToBag [x] = UnitBag x
 listToBag vs = ListBag vs
 
+nonEmptyToBag :: NonEmpty a -> Bag a
+nonEmptyToBag (x :| []) = UnitBag x
+nonEmptyToBag (x :| xs) = ListBag (x : xs)
+
 bagToList :: Bag a -> [a]
 bagToList b = foldr (:) [] b
+
+headMaybe :: Bag a -> Maybe a
+headMaybe EmptyBag = Nothing
+headMaybe (UnitBag v) = Just v
+headMaybe (TwoBags b1 _) = headMaybe b1
+headMaybe (ListBag l) = listToMaybe l
 
 instance (Outputable a) => Outputable (Bag a) where
     ppr bag = braces (pprWithCommas ppr (bagToList bag))
@@ -333,3 +345,14 @@ instance Traversable Bag where
   traverse f (UnitBag x)     = UnitBag <$> f x
   traverse f (TwoBags b1 b2) = TwoBags <$> traverse f b1 <*> traverse f b2
   traverse f (ListBag xs)    = ListBag <$> traverse f xs
+
+instance IsList (Bag a) where
+  type Item (Bag a) = a
+  fromList = listToBag
+  toList   = bagToList
+
+instance Semigroup (Bag a) where
+  (<>) = unionBags
+
+instance Monoid (Bag a) where
+  mempty = emptyBag

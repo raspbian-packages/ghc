@@ -3,7 +3,7 @@
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
 -}
 
-{-# LANGUAGE CPP #-}
+
 
 module GHC.Types.Var.Set (
         -- * Var, Id and TyVar set types
@@ -45,8 +45,6 @@ module GHC.Types.Var.Set (
         partitionDVarSet,
         dVarSetToVarSet,
     ) where
-
-#include "HsVersions.h"
 
 import GHC.Prelude
 
@@ -197,7 +195,7 @@ transCloVarSet fn seeds
          new_vs = fn candidates `minusVarSet` acc
 
 seqVarSet :: VarSet -> ()
-seqVarSet s = sizeVarSet s `seq` ()
+seqVarSet s = s `seq` ()
 
 -- | Determines the pluralisation suffix appropriate for the length of a set
 -- in the same way that plural from Outputable does for lists.
@@ -325,7 +323,7 @@ delDVarSetList :: DVarSet -> [Var] -> DVarSet
 delDVarSetList = delListFromUniqDSet
 
 seqDVarSet :: DVarSet -> ()
-seqDVarSet s = sizeDVarSet s `seq` ()
+seqDVarSet s = s `seq` ()
 
 -- | Add a list of variables to DVarSet
 extendDVarSetList :: DVarSet -> [Var] -> DVarSet

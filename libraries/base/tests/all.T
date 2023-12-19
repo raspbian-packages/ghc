@@ -17,7 +17,10 @@ test('readFloat', exit_code(1), compile_and_run, [''])
 test('enumDouble', normal, compile_and_run, [''])
 test('enumRatio', normal, compile_and_run, [''])
 test('enumNumeric', normal, compile_and_run, [''])
-test('tempfiles', normal, compile_and_run, [''])
+# N.B. the tempfile format is slightly different than this test expects on
+# Windows *except* if using WinIO. The `when` clause below can be removed
+# after WinIO becomes the default.
+test('tempfiles', when(opsys('mingw32'), only_ways(['winio'])), compile_and_run, [''])
 test('fixed', normal, compile_and_run, [''])
 test('quotOverflow', normal, compile_and_run, [''])
 test('assert', exit_code(1), compile_and_run, ['-fno-ignore-asserts'])
@@ -80,7 +83,6 @@ test('length001',
 
 test('ratio001', 	normal, compile_and_run, [''])
 
-test('rand001',		reqlib('random'), compile_and_run, [''])
 test('reads001',		normal, compile_and_run, [''])
 test('show001',		normal, compile_and_run, [''])
 test('text001',		normal, compile_and_run, [''])
@@ -172,7 +174,8 @@ test('CatPairs', normal, compile, [''])
 test('CatEntail', normal, compile, [''])
 
 # When running with WAY=ghci and profiled ways, T7653 uses a lot of memory.
-test('T7653', omit_ways(prof_ways+['ghci']), compile_and_run, [''])
+test('T7653', [when(opsys('mingw32'), skip),
+               omit_ways(prof_ways+['ghci'])], compile_and_run, [''])
 test('T7787', normal, compile_and_run, [''])
 
 test('topHandler01', when(opsys('mingw32'), skip), compile_and_run, [''])
@@ -216,10 +219,8 @@ test('T9681', normal, compile_fail, [''])
 test('T8089',
      [exit_code(99), run_timeout_multiplier(0.01)],
      compile_and_run, [''])
-test('hWaitForInput-accurate-socket', reqlib('unix'), compile_and_run, [''])
 test('T8684', expect_broken(8684), compile_and_run, [''])
 test('hWaitForInput-accurate-stdin', [expect_broken_for(16535, threaded_ways), omit_ways(['ghci'])], compile_and_run, [''])
-test('hWaitForInput-accurate-pipe', reqlib('unix'), compile_and_run, [''])
 test('T9826',normal, compile_and_run,[''])
 test('T9848',
         [ collect_stats('bytes allocated')
@@ -256,5 +257,13 @@ test('T16943a', normal, compile_and_run, [''])
 test('T16943b', normal, compile_and_run, [''])
 test('T17499', [collect_stats('bytes allocated',5)], compile_and_run, ['-O -w'])
 test('T16643', normal, compile_and_run, [''])
+test('clamp', normal, compile_and_run, [''])
+test('T18642',
+     [extra_run_opts('+RTS -T -RTS'),
+      # The nonmoving GC's residency behavior is very conservative
+      omit_ways(['nonmoving', 'nonmoving_thr', 'nonmoving_thr_sanity'])],
+     compile_and_run, ['-O2'])
 test('T19288', exit_code(1), compile_and_run, [''])
+test('T19719', normal, compile_and_run, [''])
 test('T20107', extra_run_opts('+RTS -M50M'), compile_and_run, ['-package bytestring'])
+test('trace', normal, compile_and_run, [''])

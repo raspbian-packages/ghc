@@ -87,7 +87,7 @@ A *lexically scoped type variable* can be bound by:
 
 In Haskell, a programmer-written type signature is implicitly quantified
 over its free type variables (`Section
-4.1.2 <http://www.haskell.org/onlinereport/decls.html#sect4.1.2>`__ of
+4.1.2 <https://www.haskell.org/onlinereport/decls.html#sect4.1.2>`__ of
 the Haskell Report). Lexically scoped type variables affect this
 implicit quantification rules as follows: any type variable that is in
 scope is *not* universally quantified. For example, if type variable
@@ -263,7 +263,7 @@ Class and instance declarations
 
 :extension:`ScopedTypeVariables` allow the type variables bound by the top of a
 ``class`` or ``instance`` declaration to scope over the methods defined in the
-``where`` part. Unlike :ref`decl-type-sigs`, type variables from class and
+``where`` part. Unlike :ref:`decl-type-sigs`, type variables from class and
 instance declarations can be lexically scoped without an explicit ``forall``
 (although you are allowed an explicit ``forall`` in an ``instance``
 declaration; see :ref:`explicit-foralls`). For example: ::

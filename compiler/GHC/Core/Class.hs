@@ -3,7 +3,7 @@
 --
 -- The @Class@ datatype
 
-{-# LANGUAGE CPP #-}
+
 
 module GHC.Core.Class (
         Class,
@@ -21,8 +21,6 @@ module GHC.Core.Class (
         isAbstractClass,
     ) where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
 
 import {-# SOURCE #-} GHC.Core.TyCon    ( TyCon )
@@ -33,6 +31,8 @@ import GHC.Types.Name
 import GHC.Types.Basic
 import GHC.Types.Unique
 import GHC.Utils.Misc
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
 import GHC.Types.SrcLoc
 import GHC.Utils.Outputable
 import GHC.Data.BooleanFormula (BooleanFormula, mkTrue)
@@ -79,7 +79,7 @@ data Class
 --
 --  - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnRarrow'',
 
--- For details on above see note [Api annotations] in GHC.Parser.Annotation
+-- For details on above see Note [exact print annotations] in GHC.Parser.Annotation
 type FunDep a = ([a],[a])
 
 type ClassOpItem = (Id, DefMethInfo)
@@ -253,20 +253,20 @@ classAllSelIds :: Class -> [Id]
 -- Both superclass-dictionary and method selectors
 classAllSelIds c@(Class { classBody = ConcreteClass { cls_sc_sel_ids = sc_sels }})
   = sc_sels ++ classMethods c
-classAllSelIds c = ASSERT( null (classMethods c) ) []
+classAllSelIds c = assert (null (classMethods c) ) []
 
 classSCSelIds :: Class -> [Id]
 -- Both superclass-dictionary and method selectors
 classSCSelIds (Class { classBody = ConcreteClass { cls_sc_sel_ids = sc_sels }})
   = sc_sels
-classSCSelIds c = ASSERT( null (classMethods c) ) []
+classSCSelIds c = assert (null (classMethods c) ) []
 
 classSCSelId :: Class -> Int -> Id
 -- Get the n'th superclass selector Id
 -- where n is 0-indexed, and counts
 --    *all* superclasses including equalities
 classSCSelId (Class { classBody = ConcreteClass { cls_sc_sel_ids = sc_sels } }) n
-  = ASSERT( n >= 0 && lengthExceeds sc_sels n )
+  = assert (n >= 0 && lengthExceeds sc_sels n )
     sc_sels !! n
 classSCSelId c n = pprPanic "classSCSelId" (ppr c <+> ppr n)
 

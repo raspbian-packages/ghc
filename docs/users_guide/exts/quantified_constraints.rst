@@ -18,7 +18,7 @@ which give a new level of expressiveness in constraints. For example, consider :
  instance (Eq a, ???) => Eq (Rose f a)
    where
      (Branch x1 c1) == (Branch x2 c2)
-        = x1==x1 && c1==c2
+        = x1==x2 && c1==c2
 
 From the ``x1==x2`` we need ``Eq a``, which is fine.  From ``c1==c2`` we need ``Eq (f (Rose f a))`` which
 is *not* fine in Haskell today; we have no way to solve such a constraint.
@@ -29,7 +29,7 @@ is *not* fine in Haskell today; we have no way to solve such a constraint.
         => Eq (Rose f a)
    where
      (Branch x1 c1) == (Branch x2 c2)
-        = x1==x1 && c1==c2
+        = x1==x2 && c1==c2
 
 Here, the quantified constraint ``forall b. (Eq b) => Eq (f b)`` behaves
 a bit like a local instance declaration, and makes the instance typeable.
@@ -134,13 +134,13 @@ Notes:
 
   See `Iceland Jack's summary <https://gitlab.haskell.org/ghc/ghc/issues/14733#note_148352>`_.  The key point is that the bit to the right of the ``=>`` may be headed by a type *variable* (``c`` in this case), rather than a class.  It should not be one of the forall'd variables, though.
 
-  (NB: this goes beyond what is described in `the paper <http://i.cs.hku.hk/~bruno//papers/hs2017.pdf>`_, but does not seem to introduce any new technical difficulties.)
+  (NB: this goes beyond what is described in `the paper <https://i.cs.hku.hk/~bruno//papers/hs2017.pdf>`_, but does not seem to introduce any new technical difficulties.)
 
 
 Typing changes
 ----------------
 
-See `the paper <http://i.cs.hku.hk/~bruno//papers/hs2017.pdf>`_.
+See `the paper <https://i.cs.hku.hk/~bruno//papers/hs2017.pdf>`_.
 
 Superclasses
 ----------------
@@ -152,7 +152,7 @@ Suppose we have::
 
 From the ``x==x`` we need an ``Eq (m Int)`` constraint, but the context only gives us a way to figure out ``Ord (m a)`` constraints.  But from the given constraint ``forall a. Ord a => Ord (m a)`` we derive a second given constraint ``forall a. Ord a => Eq (m a)``, and from that we can readily solve ``Eq (m Int)``.  This process is very similar to the way that superclasses already work: given an ``Ord a`` constraint we derive a second given ``Eq a`` constraint.
 
-NB: This treatment of superclasses goes beyond `the paper <http://i.cs.hku.hk/~bruno//papers/hs2017.pdf>`_, but is specifically desired by users.
+NB: This treatment of superclasses goes beyond `the paper <https://i.cs.hku.hk/~bruno//papers/hs2017.pdf>`_, but is specifically desired by users.
 
 Overlap
 -------------

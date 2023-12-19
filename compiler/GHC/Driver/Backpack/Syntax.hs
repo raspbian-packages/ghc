@@ -18,11 +18,16 @@ module GHC.Driver.Backpack.Syntax (
 
 import GHC.Prelude
 
-import GHC.Driver.Phases
 import GHC.Hs
+
 import GHC.Types.SrcLoc
+import GHC.Types.SourceFile
+
+import GHC.Unit.Module.Name
+import GHC.Unit.Types
+import GHC.Unit.Info
+
 import GHC.Utils.Outputable
-import GHC.Unit
 
 {-
 ************************************************************************
@@ -34,7 +39,7 @@ import GHC.Unit
 
 data HsComponentId = HsComponentId {
     hsPackageName :: PackageName,
-    hsComponentId :: IndefUnitId
+    hsComponentId :: UnitId
     }
 
 instance Outputable HsComponentId where
@@ -60,7 +65,7 @@ type LHsUnit n = Located (HsUnit n)
 -- | A declaration in a package, e.g. a module or signature definition,
 -- or an include.
 data HsUnitDecl n
-    = DeclD   HscSource (Located ModuleName) (Maybe (Located HsModule))
+    = DeclD   HscSource (Located ModuleName) (Located HsModule)
     | IncludeD   (IncludeDecl n)
 type LHsUnitDecl n = Located (HsUnitDecl n)
 

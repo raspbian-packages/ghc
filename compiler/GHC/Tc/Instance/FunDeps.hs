@@ -5,7 +5,7 @@
 
 -}
 
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE DeriveFunctor #-}
 
 -- | Functional dependencies
 --
@@ -18,10 +18,9 @@ module GHC.Tc.Instance.FunDeps
    , checkInstCoverage
    , checkFunDeps
    , pprFundeps
+   , instFD, closeWrtFunDeps
    )
 where
-
-#include "HsVersions.h"
 
 import GHC.Prelude
 
@@ -38,11 +37,13 @@ import GHC.Types.Var.Set
 import GHC.Types.Var.Env
 import GHC.Core.TyCo.FVs
 import GHC.Core.TyCo.Ppr( pprWithExplicitKindsWhen )
-import GHC.Utils.FV
-import GHC.Utils.Outputable
-import GHC.Utils.Error( Validity(..), allValid )
 import GHC.Types.SrcLoc
+
+import GHC.Utils.Outputable
+import GHC.Utils.FV
+import GHC.Utils.Error( Validity'(..), Validity, allValid )
 import GHC.Utils.Misc
+import GHC.Utils.Panic
 
 import GHC.Data.Pair             ( Pair(..) )
 import Data.List        ( nubBy )
@@ -118,6 +119,7 @@ data FunDepEqn loc
           , fd_pred1 :: PredType   -- The FunDepEqn arose from
           , fd_pred2 :: PredType   --  combining these two constraints
           , fd_loc   :: loc  }
+    deriving Functor
 
 {-
 Given a bunch of predicates that must hold, such as
@@ -204,16 +206,11 @@ pprEquation (FDEqn { fd_qtvs = qtvs, fd_eqs = pairs })
 
 improveFromInstEnv :: InstEnvs
                    -> (PredType -> SrcSpan -> loc)
-                   -> PredType
+                   -> Class -> [Type]
                    -> [FunDepEqn loc] -- Needs to be a FunDepEqn because
                                       -- of quantified variables
 -- Post: Equations oriented from the template (matching instance) to the workitem!
-improveFromInstEnv inst_env mk_loc pred
-  | Just (cls, tys) <- ASSERT2( isClassPred pred, ppr pred )
-                       getClassPredTys_maybe pred
-  , let (cls_tvs, cls_fds) = classTvsFds cls
-        instances          = classInstances inst_env cls
-        rough_tcs          = roughMatchTcs tys
+improveFromInstEnv inst_env mk_loc cls tys
   = [ FDEqn { fd_qtvs = meta_tvs, fd_eqs = eqs
             , fd_pred1 = p_inst, fd_pred2 = pred
             , fd_loc = mk_loc p_inst (getSrcSpan (is_dfun ispec)) }
@@ -229,12 +226,18 @@ improveFromInstEnv inst_env mk_loc pred
                                       tys trimmed_tcs -- NB: orientation
     , let p_inst = mkClassPred cls (is_tys ispec)
     ]
-improveFromInstEnv _ _ _ = []
+  where
+    (cls_tvs, cls_fds) = classTvsFds cls
+    instances          = classInstances inst_env cls
+    rough_tcs          = RM_KnownTc (className cls) : roughMatchTcs tys
+    pred               = mkClassPred cls tys
+
+
 
 
 improveClsFD :: [TyVar] -> FunDep TyVar    -- One functional dependency from the class
              -> ClsInst                    -- An instance template
-             -> [Type] -> [Maybe Name]     -- Arguments of this (C tys) predicate
+             -> [Type] -> [RoughMatchTc]   -- Arguments of this (C tys) predicate
              -> [([TyCoVar], [TypeEqn])]   -- Empty or singleton
 
 improveClsFD clas_tvs fd
@@ -264,9 +267,9 @@ improveClsFD clas_tvs fd
   = []          -- Filter out ones that can't possibly match,
 
   | otherwise
-  = ASSERT2( equalLength tys_inst tys_actual &&
-             equalLength tys_inst clas_tvs
-            , ppr tys_inst <+> ppr tys_actual )
+  = assertPpr (equalLength tys_inst tys_actual &&
+               equalLength tys_inst clas_tvs)
+              (ppr tys_inst <+> ppr tys_actual) $
 
     case tcMatchTyKis ltys1 ltys2 of
         Nothing  -> []
@@ -349,7 +352,7 @@ Example
 
 For the coverage condition, we check
    (normal)    fv(t2) `subset` fv(t1)
-   (liberal)   fv(t2) `subset` oclose(fv(t1), theta)
+   (liberal)   fv(t2) `subset` closeWrtFunDeps(fv(t1), theta)
 
 The liberal version  ensures the self-consistency of the instance, but
 it does not guarantee termination. Example:
@@ -362,7 +365,7 @@ it does not guarantee termination. Example:
    instance Mul a b c => Mul a [b] [c] where x .*. v = map (x.*.) v
 
 In the third instance, it's not the case that fv([c]) `subset` fv(a,[b]).
-But it is the case that fv([c]) `subset` oclose( theta, fv(a,[b]) )
+But it is the case that fv([c]) `subset` closeWrtFunDeps( theta, fv(a,[b]) )
 
 But it is a mistake to accept the instance because then this defn:
         f = \ b x y -> if b then x .*. [y] else y
@@ -374,7 +377,7 @@ checkInstCoverage :: Bool   -- Be liberal
                   -> Class -> [PredType] -> [Type]
                   -> Validity
 -- "be_liberal" flag says whether to use "liberal" coverage of
---              See Note [Coverage Condition] below
+--              See Note [Coverage condition] below
 --
 -- Return values
 --    Nothing  => no problems
@@ -395,7 +398,7 @@ checkInstCoverage be_liberal clas theta inst_taus
          undetermined_tvs | be_liberal = liberal_undet_tvs
                           | otherwise  = conserv_undet_tvs
 
-         closed_ls_tvs = oclose theta ls_tvs
+         closed_ls_tvs = closeWrtFunDeps theta ls_tvs
          liberal_undet_tvs = (`minusVarSet` closed_ls_tvs) <$> rs_tvs
          conserv_undet_tvs = (`minusVarSet` ls_tvs)        <$> rs_tvs
 
@@ -406,7 +409,7 @@ checkInstCoverage be_liberal clas theta inst_taus
                vcat [ -- text "ls_tvs" <+> ppr ls_tvs
                       -- , text "closed ls_tvs" <+> ppr (closeOverKinds ls_tvs)
                       -- , text "theta" <+> ppr theta
-                      -- , text "oclose" <+> ppr (oclose theta (closeOverKinds ls_tvs))
+                      -- , text "closeWrtFunDeps" <+> ppr (closeWrtFunDeps theta (closeOverKinds ls_tvs))
                       -- , text "rs_tvs" <+> ppr rs_tvs
                       sep [ text "The"
                             <+> ppWhen be_liberal (text "liberal")
@@ -465,17 +468,17 @@ Is the instance OK? Does {l,r,xs} determine v?  Well:
     we get {l,k,xs} -> b
 
   * Note the 'k'!! We must call closeOverKinds on the seed set
-    ls_tvs = {l,r,xs}, BEFORE doing oclose, else the {l,k,xs}->b
+    ls_tvs = {l,r,xs}, BEFORE doing closeWrtFunDeps, else the {l,k,xs}->b
     fundep won't fire.  This was the reason for #10564.
 
-  * So starting from seeds {l,r,xs,k} we do oclose to get
+  * So starting from seeds {l,r,xs,k} we do closeWrtFunDeps to get
     first {l,r,xs,k,b}, via the HMemberM constraint, and then
     {l,r,xs,k,b,v}, via the HasFieldM1 constraint.
 
   * And that fixes v.
 
 However, we must closeOverKinds whenever augmenting the seed set
-in oclose!  Consider #10109:
+in closeWrtFunDeps!  Consider #10109:
 
   data Succ a   -- Succ :: forall k. k -> *
   class Add (a :: k1) (b :: k2) (ab :: k3) | a b -> ab
@@ -491,25 +494,27 @@ the variables free in (Succ {k3} ab).
 Bottom line:
   * closeOverKinds on initial seeds (done automatically
     by tyCoVarsOfTypes in checkInstCoverage)
-  * and closeOverKinds whenever extending those seeds (in oclose)
+  * and closeOverKinds whenever extending those seeds (in closeWrtFunDeps)
 
 Note [The liberal coverage condition]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-(oclose preds tvs) closes the set of type variables tvs,
+(closeWrtFunDeps preds tvs) closes the set of type variables tvs,
 wrt functional dependencies in preds.  The result is a superset
 of the argument set.  For example, if we have
         class C a b | a->b where ...
 then
-        oclose [C (x,y) z, C (x,p) q] {x,y} = {x,y,z}
+        closeWrtFunDeps [C (x,y) z, C (x,p) q] {x,y} = {x,y,z}
 because if we know x and y then that fixes z.
 
 We also use equality predicates in the predicates; if we have an
 assumption `t1 ~ t2`, then we use the fact that if we know `t1` we
 also know `t2` and the other way.
-  eg    oclose [C (x,y) z, a ~ x] {a,y} = {a,y,z,x}
+  eg    closeWrtFunDeps [C (x,y) z, a ~ x] {a,y} = {a,y,z,x}
 
-oclose is used (only) when checking the coverage condition for
-an instance declaration
+closeWrtFunDeps is used
+ - when checking the coverage condition for an instance declaration
+ - when determining which tyvars are unquantifiable during generalization, in
+   GHC.Tc.Solver.decideMonoTyVars.
 
 Note [Equality superclasses]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -520,10 +525,10 @@ Remember from Note [The equality types story] in GHC.Builtin.Types.Prim, that
   * (a ~~ b) is a superclass of (a ~ b)
   * (a ~# b) is a superclass of (a ~~ b)
 
-So when oclose expands superclasses we'll get a (a ~# [b]) superclass.
+So when closeWrtFunDeps expands superclasses we'll get a (a ~# [b]) superclass.
 But that's an EqPred not a ClassPred, and we jolly well do want to
 account for the mutual functional dependencies implied by (t1 ~# t2).
-Hence the EqPred handling in oclose.  See #10778.
+Hence the EqPred handling in closeWrtFunDeps.  See #10778.
 
 Note [Care with type functions]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -533,7 +538,7 @@ Consider (#12803)
   type family G c d = r | r -> d
 
 Now consider
-  oclose (C (F a b) (G c d)) {a,b}
+  closeWrtFunDeps (C (F a b) (G c d)) {a,b}
 
 Knowing {a,b} fixes (F a b) regardless of the injectivity of F.
 But knowing (G c d) fixes only {d}, because G is only injective
@@ -542,12 +547,17 @@ in its second parameter.
 Hence the tyCoVarsOfTypes/injTyVarsOfTypes dance in tv_fds.
 -}
 
-oclose :: [PredType] -> TyCoVarSet -> TyCoVarSet
+closeWrtFunDeps :: [PredType] -> TyCoVarSet -> TyCoVarSet
 -- See Note [The liberal coverage condition]
-oclose preds fixed_tvs
+closeWrtFunDeps preds fixed_tvs
   | null tv_fds = fixed_tvs -- Fast escape hatch for common case.
-  | otherwise   = fixVarSet extend fixed_tvs
+  | otherwise   = assertPpr (closeOverKinds fixed_tvs == fixed_tvs)
+                    (vcat [ text "closeWrtFunDeps: fixed_tvs is not closed over kinds"
+                          , text "fixed_tvs:" <+> ppr fixed_tvs
+                          , text "closure:" <+> ppr (closeOverKinds fixed_tvs) ])
+                $ fixVarSet extend fixed_tvs
   where
+
     extend fixed_tvs = foldl' add fixed_tvs tv_fds
        where
           add fixed_tvs (ls,rs)
@@ -654,9 +664,7 @@ checkFunDeps inst_envs (ClsInst { is_tvs = qtvs1, is_cls = cls
         (ltys1, rtys1) = instFD fd cls_tvs tys1
         (ltys2, rtys2) = instFD fd cls_tvs tys2
         qtv_set2       = mkVarSet qtvs2
-        bind_fn tv | tv `elemVarSet` qtv_set1 = BindMe
-                   | tv `elemVarSet` qtv_set2 = BindMe
-                   | otherwise                = Skolem
+        bind_fn        = matchBindFun (qtv_set1 `unionVarSet` qtv_set2)
 
     eq_inst i1 i2 = instanceDFunId i1 == instanceDFunId i2
         -- A single instance may appear twice in the un-nubbed conflict list
@@ -666,7 +674,7 @@ checkFunDeps inst_envs (ClsInst { is_tvs = qtvs1, is_cls = cls
         --      instance C Int Char Char
         -- The second instance conflicts with the first by *both* fundeps
 
-trimRoughMatchTcs :: [TyVar] -> FunDep TyVar -> [Maybe Name] -> [Maybe Name]
+trimRoughMatchTcs :: [TyVar] -> FunDep TyVar -> [RoughMatchTc] -> [RoughMatchTc]
 -- Computing rough_tcs for a particular fundep
 --     class C a b c | a -> b where ...
 -- For each instance .... => C ta tb tc
@@ -675,8 +683,9 @@ trimRoughMatchTcs :: [TyVar] -> FunDep TyVar -> [Maybe Name] -> [Maybe Name]
 -- Hence, we Nothing-ise the tb and tc types right here
 --
 -- Result list is same length as input list, just with more Nothings
-trimRoughMatchTcs clas_tvs (ltvs, _) mb_tcs
-  = zipWith select clas_tvs mb_tcs
+trimRoughMatchTcs _clas_tvs _ [] = panic "trimRoughMatchTcs: nullary [RoughMatchTc]"
+trimRoughMatchTcs clas_tvs (ltvs, _) (cls:mb_tcs)
+  = cls : zipWith select clas_tvs mb_tcs
   where
     select clas_tv mb_tc | clas_tv `elem` ltvs = mb_tc
-                         | otherwise           = Nothing
+                         | otherwise           = RM_WildCard

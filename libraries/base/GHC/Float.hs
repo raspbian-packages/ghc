@@ -1,5 +1,6 @@
 {-# LANGUAGE Trustworthy #-}
-{-# LANGUAGE CPP
+{-# LANGUAGE BangPatterns
+           , CPP
            , GHCForeignImportPrim
            , NoImplicitPrelude
            , MagicHash
@@ -55,8 +56,8 @@ module GHC.Float
 
 import Data.Maybe
 
-import Data.Bits
 import GHC.Base
+import GHC.Bits
 import GHC.List
 import GHC.Enum
 import GHC.Show
@@ -299,6 +300,22 @@ instance Num Float where
     {-# INLINE fromInteger #-}
     fromInteger i = F# (integerToFloat# i)
 
+-- | Convert an Integer to a Float#
+integerToFloat# :: Integer -> Float#
+{-# NOINLINE integerToFloat# #-}
+integerToFloat# (IS i)   = int2Float# i
+integerToFloat# i@(IP _) = case integerToBinaryFloat' i of
+                             F# x -> x
+integerToFloat# (IN bn)  = case integerToBinaryFloat' (IP bn) of
+                             F# x -> negateFloat# x
+
+-- | Convert a Natural to a Float#
+naturalToFloat# :: Natural -> Float#
+{-# NOINLINE naturalToFloat# #-}
+naturalToFloat# (NS w) = word2Float# w
+naturalToFloat# (NB b) = case integerToBinaryFloat' (IP b) of
+                           F# x -> x
+
 -- | @since 2.01
 instance  Real Float  where
     toRational (F# x#)  =
@@ -338,32 +355,66 @@ rationalToFloat n d
         minEx       = FLT_MIN_EXP
         mantDigs    = FLT_MANT_DIG
 
--- RULES for Integer and Int
-{-# RULES
-"properFraction/Float->Integer"     properFraction = properFractionFloatInteger
-"truncate/Float->Integer"           truncate = truncateFloatInteger
-"floor/Float->Integer"              floor = floorFloatInteger
-"ceiling/Float->Integer"            ceiling = ceilingFloatInteger
-"round/Float->Integer"              round = roundFloatInteger
-"properFraction/Float->Int"         properFraction = properFractionFloatInt
-"truncate/Float->Int"               truncate = float2Int
-"floor/Float->Int"                  floor = floorFloatInt
-"ceiling/Float->Int"                ceiling = ceilingFloatInt
-"round/Float->Int"                  round = roundFloatInt
-  #-}
 -- | @since 2.01
 instance  RealFrac Float  where
 
-        -- ceiling, floor, and truncate are all small
-    {-# INLINE [1] ceiling #-}
-    {-# INLINE [1] floor #-}
-    {-# INLINE [1] truncate #-}
+   properFraction = properFractionFloat
+   truncate       = truncateFloat
+   round          = roundFloat
+   floor          = floorFloat
+   ceiling        = ceilingFloat
+
+-- RULES for Integer and Int
+-- Note [Rules for overloaded class methods]
+{-# RULES
+"properFraction/Float->Integer"     properFractionFloat = properFractionFloatInteger
+"truncate/Float->Integer"           truncateFloat = truncateFloatInteger
+"floor/Float->Integer"              floorFloat = floorFloatInteger
+"ceiling/Float->Integer"            ceilingFloat = ceilingFloatInteger
+"round/Float->Integer"              roundFloat = roundFloatInteger
+"properFraction/Float->Int"         properFractionFloat = properFractionFloatInt
+"truncate/Float->Int"               truncateFloat = float2Int
+"floor/Float->Int"                  floorFloat = floorFloatInt
+"ceiling/Float->Int"                ceilingFloat = ceilingFloatInt
+"round/Float->Int"                  roundFloat = roundFloatInt
+  #-}
+
+
+floorFloat :: Integral b => Float -> b
+{-# INLINE [1] floorFloat #-}
+floorFloat x = case properFractionFloat x of
+                    (n,r) -> if r < 0.0 then n - 1 else n
+
+ceilingFloat :: Integral b => Float -> b
+{-# INLINE [1] ceilingFloat #-}
+ceilingFloat x = case properFraction x of
+                    (n,r) -> if r > 0.0 then n + 1 else n
+
+truncateFloat :: Integral b => Float -> b
+{-# INLINE [1] truncateFloat #-}
+truncateFloat x = case properFractionFloat x of
+                     (n,_) -> n
+
+roundFloat :: Integral b => Float -> b
+{-# NOINLINE [1] roundFloat #-}
+roundFloat x = case properFractionFloat x of
+                     (n,r) -> let
+                                m         = if r < 0.0 then n - 1 else n + 1
+                                half_down = abs r - 0.5
+                              in
+                              case (compare half_down 0.0) of
+                                LT -> n
+                                EQ -> if even n then n else m
+                                GT -> m
+
+properFractionFloat :: Integral b => Float -> (b,Float)
+{-# NOINLINE [1] properFractionFloat #-}
 
 -- We assume that FLT_RADIX is 2 so that we can use more efficient code
 #if FLT_RADIX != 2
 #error FLT_RADIX must be 2
 #endif
-    properFraction (F# x#)
+properFractionFloat (F# x#)
       = case decodeFloat_Int# x# of
         (# m#, n# #) ->
             let m = I# m#
@@ -376,24 +427,7 @@ instance  RealFrac Float  where
                      f = m - (i `shiftL` negate n)
                  in (fromIntegral i, encodeFloat (fromIntegral f) n)
 
-    truncate x  = case properFraction x of
-                     (n,_) -> n
 
-    round x     = case properFraction x of
-                     (n,r) -> let
-                                m         = if r < 0.0 then n - 1 else n + 1
-                                half_down = abs r - 0.5
-                              in
-                              case (compare half_down 0.0) of
-                                LT -> n
-                                EQ -> if even n then n else m
-                                GT -> m
-
-    ceiling x   = case properFraction x of
-                    (n,r) -> if r > 0.0 then n + 1 else n
-
-    floor x     = case properFraction x of
-                    (n,r) -> if r < 0.0 then n - 1 else n
 
 -- | @since 2.01
 instance  Floating Float  where
@@ -494,6 +528,22 @@ instance  Num Double  where
     {-# INLINE fromInteger #-}
     fromInteger i = D# (integerToDouble# i)
 
+-- | Convert an Integer to a Double#
+integerToDouble# :: Integer -> Double#
+{-# NOINLINE integerToDouble# #-}
+integerToDouble# (IS i)   = int2Double# i
+integerToDouble# i@(IP _) = case integerToBinaryFloat' i of
+                              D# x -> x
+integerToDouble# (IN bn)  = case integerToBinaryFloat' (IP bn) of
+                              D# x -> negateDouble# x
+
+-- | Encode a Natural (mantissa) into a Double#
+naturalToDouble# :: Natural -> Double#
+{-# NOINLINE naturalToDouble# #-}
+naturalToDouble# (NS w) = word2Double# w
+naturalToDouble# (NB b) = case integerToBinaryFloat' (IP b) of
+                            D# x -> x
+
 
 -- | @since 2.01
 instance  Real Double  where
@@ -567,55 +617,118 @@ instance  Floating Double  where
       | otherwise = a
     {-# INLINE log1pexp #-}
 
--- RULES for Integer and Int
-{-# RULES
-"properFraction/Double->Integer"    properFraction = properFractionDoubleInteger
-"truncate/Double->Integer"          truncate = truncateDoubleInteger
-"floor/Double->Integer"             floor = floorDoubleInteger
-"ceiling/Double->Integer"           ceiling = ceilingDoubleInteger
-"round/Double->Integer"             round = roundDoubleInteger
-"properFraction/Double->Int"        properFraction = properFractionDoubleInt
-"truncate/Double->Int"              truncate = double2Int
-"floor/Double->Int"                 floor = floorDoubleInt
-"ceiling/Double->Int"               ceiling = ceilingDoubleInt
-"round/Double->Int"                 round = roundDoubleInt
-  #-}
 -- | @since 2.01
 instance  RealFrac Double  where
+    properFraction = properFractionDouble
+    truncate       = truncateDouble
+    round          = roundDouble
+    ceiling        = ceilingDouble
+    floor          = floorDouble
 
-        -- ceiling, floor, and truncate are all small
-    {-# INLINE [1] ceiling #-}
-    {-# INLINE [1] floor #-}
-    {-# INLINE [1] truncate #-}
+-- RULES for Integer and Int
+-- Note [Rules for overloaded class methods]
+{-# RULES
+"properFraction/Double->Integer"    properFractionDouble = properFractionDoubleInteger
+"truncate/Double->Integer"          truncateDouble = truncateDoubleInteger
+"floor/Double->Integer"             floorDouble = floorDoubleInteger
+"ceiling/Double->Integer"           ceilingDouble = ceilingDoubleInteger
+"round/Double->Integer"             roundDouble = roundDoubleInteger
+"properFraction/Double->Int"        properFractionDouble = properFractionDoubleInt
+"truncate/Double->Int"              truncateDouble = double2Int
+"floor/Double->Int"                 floorDouble = floorDoubleInt
+"ceiling/Double->Int"               ceilingDouble = ceilingDoubleInt
+"round/Double->Int"                 roundDouble = roundDoubleInt
+  #-}
 
-    properFraction x
-      = case (decodeFloat x)      of { (m,n) ->
-        if n >= 0 then
-            (fromInteger m * 2 ^ n, 0.0)
-        else
-            case (quotRem m (2^(negate n))) of { (w,r) ->
-            (fromInteger w, encodeFloat r n)
-            }
-        }
+floorDouble :: Integral b => Double -> b
+{-# INLINE [1] floorDouble #-}
+floorDouble x = case properFractionDouble x of
+                    (n,r) -> if r < 0.0 then n - 1 else n
 
-    truncate x  = case properFraction x of
-                     (n,_) -> n
-
-    round x     = case properFraction x of
-                     (n,r) -> let
-                                m         = if r < 0.0 then n - 1 else n + 1
-                                half_down = abs r - 0.5
-                              in
-                              case (compare half_down 0.0) of
-                                LT -> n
-                                EQ -> if even n then n else m
-                                GT -> m
-
-    ceiling x   = case properFraction x of
+ceilingDouble :: Integral b => Double -> b
+{-# INLINE [1] ceilingDouble #-}
+ceilingDouble x = case properFractionDouble x of
                     (n,r) -> if r > 0.0 then n + 1 else n
 
-    floor x     = case properFraction x of
-                    (n,r) -> if r < 0.0 then n - 1 else n
+truncateDouble :: Integral b => Double -> b
+{-# INLINE [1] truncateDouble #-}
+truncateDouble x = case properFractionDouble x of
+                     (n,_) -> n
+
+roundDouble :: Integral b => Double -> b
+{-# NOINLINE [1] roundDouble #-}
+roundDouble x
+  = case properFractionDouble x of
+      (n,r) -> let
+                 m         = if r < 0.0 then n - 1 else n + 1
+                 half_down = abs r - 0.5
+               in
+               case (compare half_down 0.0) of
+                 LT -> n
+                 EQ -> if even n then n else m
+                 GT -> m
+
+properFractionDouble :: Integral b => Double -> (b,Double)
+{-# NOINLINE [1] properFractionDouble #-}
+properFractionDouble x
+  = case (decodeFloat x)      of { (m,n) ->
+    if n >= 0 then
+        (fromInteger m * 2 ^ n, 0.0)
+    else
+        case (quotRem m (2^(negate n))) of { (w,r) ->
+        (fromInteger w, encodeFloat r n)
+        }
+    }
+
+{- Note [Rules for overloaded class methods]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider a method like
+    class ... => RealFrac a where
+       floor :: Integral b => a -> b
+
+So floor :: forall a. RealFrac a => forall b. Integral b => a -> b
+
+Now suppose we want to hand-write specialised code for
+(floor @Double d1 @Int d2). We used to do this:
+   RULE "floor/Double->Int" floor = floorDoubleInt
+where GHC.Float.RealFracMethods defines
+   floorDoubleInt :: Double -> Int
+
+This RULE in full is
+   RULE "floor/Double->Int" forall d1 d2.
+         floor @Double d1 @Int d2 = floorDoubleInt
+
+But it's best not to write one rule for this entire step. I found cases
+(in nofib/real/gamteb/Utils.hs, function fiRem) where we floated
+out the (floor @Double d1) part, so the above two-argument rule didn't fire.
+Instead the class-op rule fired.  Boo!  See #19582.
+
+Best to define an instance
+   instance RealFrac Double where
+      floor = floorDouble
+
+   floorDouble :: Integral b => Double -> b
+   floorDouble = <code for floorDouble>
+   {-# RULE "floorDouble/Int" floorDouble @Int d = floorDoubleInt #-}
+
+Now we rewrite as follows
+   floor @Double d1 @Int d2
+   --> { ClassOp rule for floor }
+       floorDouble @Int d2
+   --> { Hand-written RULE "floorDouble/Int" }
+       floorDoubleInt
+
+More robust!  This pattern applies for any class method that
+has local overloading, in particular:
+  * properFraction
+  * truncate
+  * floor
+  * ceiling
+  * round
+
+All of this is really stated, in more general form, in the GHC
+user manual section "How rules interact with class methods".
+-}
 
 -- | @since 2.01
 instance  RealFloat Double  where
@@ -920,7 +1033,39 @@ floatToDigits base x =
  (map fromIntegral (reverse rds), k)
 
 ------------------------------------------------------------------------
--- Converting from a Rational to a RealFloa
+-- Converting from an Integer to a RealFloat
+------------------------------------------------------------------------
+
+{-# SPECIALISE integerToBinaryFloat' :: Integer -> Float,
+                                        Integer -> Double #-}
+-- | Converts a positive integer to a floating-point value.
+--
+-- The value nearest to the argument will be returned.
+-- If there are two such values, the one with an even significand will
+-- be returned (i.e. IEEE roundTiesToEven).
+--
+-- The argument must be strictly positive, and @floatRadix (undefined :: a)@ must be 2.
+integerToBinaryFloat' :: RealFloat a => Integer -> a
+integerToBinaryFloat' n = result
+  where
+    mantDigs = floatDigits result
+    k = I# (word2Int# (integerLog2# n))
+    result = if k < mantDigs then
+               encodeFloat n 0
+             else
+               let !e@(I# e#) = k - mantDigs + 1
+                   q = n `unsafeShiftR` e
+                   n' = case roundingMode# n (e# -# 1#) of
+                          0# -> q
+                          1# -> if integerToInt q .&. 1 == 0 then
+                                  q
+                                else
+                                  q + 1
+                          _ {- 2# -} -> q + 1
+               in encodeFloat n' e
+
+------------------------------------------------------------------------
+-- Converting from a Rational to a RealFloat
 ------------------------------------------------------------------------
 
 {-
@@ -980,7 +1125,8 @@ Now, here's Lennart's code (which works):
 "fromRat/Double"    fromRat = (fromRational :: Rational -> Double)
   #-}
 
-{-# NOINLINE [1] fromRat #-}
+{-# NOINLINE [2] fromRat #-}
+-- See Note [Allow time for type-specialisation rules to fire] in GHC.Real
 fromRat :: (RealFloat a) => Rational -> a
 
 -- Deal with special cases first, delegating the real work to fromRat'
@@ -1148,7 +1294,7 @@ roundingMode# (IS i#) t =
                  then 2#
                  else 1#
 
-roundingMode# (IN bn) t = roundingMode# (IP bn) t -- dummy
+roundingMode# (IN _)  _ = errorWithoutStackTrace "roundingMode#: IN" -- See the Assumption
 roundingMode# (IP bn) t =
    let
       j = word2Int# (int2Word# t `and#` MMASK##) -- index of relevant bit in word
@@ -1291,10 +1437,6 @@ word2Float :: Word -> Float
 word2Float (W# w) = F# (word2Float# w)
 
 {-# RULES
-"fromIntegral/Int->Float"   fromIntegral = int2Float
-"fromIntegral/Int->Double"  fromIntegral = int2Double
-"fromIntegral/Word->Float"  fromIntegral = word2Float
-"fromIntegral/Word->Double" fromIntegral = word2Double
 "realToFrac/Float->Float"   realToFrac   = id :: Float -> Float
 "realToFrac/Float->Double"  realToFrac   = float2Double
 "realToFrac/Double->Float"  realToFrac   = double2Float
@@ -1360,6 +1502,15 @@ called from scaleFloat, hence we clamp the scaling parameter.
 We must have a large enough range to cover the maximum difference of
 exponents returned by decodeFloat.
 -}
+
+-- | Used to prevent exponent over/underflow when encoding floating point numbers.
+--   This is also the same as
+--
+--   > \(x,y) -> max (-x) (min x y)
+--
+-- ==== __Example__
+-- >>> clamp (-10) 5
+-- 10
 clamp :: Int -> Int -> Int
 clamp bd k = max (-bd) (min bd k)
 
@@ -1380,8 +1531,8 @@ tries to operate on the resulting `Word32` the code generator will generate code
 that performs an integer/word operation on a floating-point register, which
 results in a compile error.
 
-The correct way of implementing `reinterpret_cast` to implement a primpop, but
-that requires a unique implementation for all supported archetectures. The next
+The correct way of implementing `reinterpret_cast` to implement a primop, but
+that requires a unique implementation for all supported architectures. The next
 best solution is to write the value from the source register to memory and then
 read it from memory into the destination register and the best way to do that
 is using CMM.
@@ -1390,59 +1541,75 @@ is using CMM.
 -- | @'castWord32ToFloat' w@ does a bit-for-bit copy from an integral value
 -- to a floating-point value.
 --
--- @since 4.10.0.0
+-- @since 4.11.0.0
 
 {-# INLINE castWord32ToFloat #-}
 castWord32ToFloat :: Word32 -> Float
 castWord32ToFloat (W32# w#) = F# (stgWord32ToFloat w#)
 
 foreign import prim "stg_word32ToFloatzh"
-    stgWord32ToFloat :: Word# -> Float#
+    stgWord32ToFloat :: Word32# -> Float#
 
 
 -- | @'castFloatToWord32' f@ does a bit-for-bit copy from a floating-point value
 -- to an integral value.
 --
--- @since 4.10.0.0
+-- @since 4.11.0.0
 
 {-# INLINE castFloatToWord32 #-}
 castFloatToWord32 :: Float -> Word32
 castFloatToWord32 (F# f#) = W32# (stgFloatToWord32 f#)
 
 foreign import prim "stg_floatToWord32zh"
-    stgFloatToWord32 :: Float# -> Word#
+    stgFloatToWord32 :: Float# -> Word32#
 
 
 
 -- | @'castWord64ToDouble' w@ does a bit-for-bit copy from an integral value
 -- to a floating-point value.
 --
--- @since 4.10.0.0
+-- @since 4.11.0.0
 
 {-# INLINE castWord64ToDouble #-}
 castWord64ToDouble :: Word64 -> Double
 castWord64ToDouble (W64# w) = D# (stgWord64ToDouble w)
 
 foreign import prim "stg_word64ToDoublezh"
-#if WORD_SIZE_IN_BITS == 64
-    stgWord64ToDouble :: Word# -> Double#
-#else
     stgWord64ToDouble :: Word64# -> Double#
-#endif
 
 
 -- | @'castFloatToWord64' f@ does a bit-for-bit copy from a floating-point value
 -- to an integral value.
 --
--- @since 4.10.0.0
+-- @since 4.11.0.0
 
 {-# INLINE castDoubleToWord64 #-}
 castDoubleToWord64 :: Double -> Word64
 castDoubleToWord64 (D# d#) = W64# (stgDoubleToWord64 d#)
 
 foreign import prim "stg_doubleToWord64zh"
-#if WORD_SIZE_IN_BITS == 64
-    stgDoubleToWord64 :: Double# -> Word#
-#else
     stgDoubleToWord64 :: Double# -> Word64#
-#endif
+
+
+
+-- See Note [Optimising conversions between numeric types]
+-- in GHC.Num.Integer
+{-# RULES
+
+"Int# -> Integer -> Float#"
+  forall x. integerToFloat# (IS x) = int2Float# x
+
+"Int# -> Integer -> Double#"
+  forall x. integerToDouble# (IS x) = int2Double# x
+
+"Word# -> Integer -> Float#"
+  forall x. integerToFloat# (integerFromWord# x) = word2Float# x
+
+"Word# -> Integer -> Double#"
+  forall x. integerToDouble# (integerFromWord# x) = word2Double# x
+
+"Word# -> Natural -> Float#"
+  forall x. naturalToFloat# (NS x) = word2Float# x
+
+"Word# -> Natural -> Double#"
+  forall x. naturalToDouble# (NS x) = word2Double# x #-}

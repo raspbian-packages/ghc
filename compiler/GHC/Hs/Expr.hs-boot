@@ -1,38 +1,27 @@
-{-# LANGUAGE CPP, KindSignatures #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE UndecidableInstances #-} -- Wrinkle in Note [Trees That Grow]
-                                      -- in module GHC.Hs.Extension
-{-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE RoleAnnotations #-}
-{-# LANGUAGE ExistentialQuantification #-}
-{-# LANGUAGE TypeFamilies #-}
+                                      -- in module Language.Haskell.Syntax.Extension
+
+{-# OPTIONS_GHC -Wno-orphans #-} -- Outputable
 
 module GHC.Hs.Expr where
 
-import GHC.Types.SrcLoc     ( Located )
 import GHC.Utils.Outputable ( SDoc, Outputable )
-import {-# SOURCE #-} GHC.Hs.Pat  ( LPat )
-import GHC.Types.Basic  ( SpliceExplicitFlag(..))
+import Language.Haskell.Syntax.Pat ( LPat )
+import {-# SOURCE #-} GHC.Hs.Pat () -- for Outputable
+import GHC.Types.Basic ( SpliceExplicitFlag(..))
+import Language.Haskell.Syntax.Expr
+  ( HsExpr, LHsExpr
+  , HsCmd
+  , MatchGroup
+  , GRHSs
+  , HsSplice
+  )
 import GHC.Hs.Extension ( OutputableBndrId, GhcPass )
-import Data.Kind  ( Type )
 
-type role HsExpr nominal
-type role HsCmd nominal
-type role MatchGroup nominal nominal
-type role GRHSs nominal nominal
-type role HsSplice nominal
-data HsExpr (i :: Type)
-data HsCmd  (i :: Type)
-data HsSplice (i :: Type)
-data MatchGroup (a :: Type) (body :: Type)
-data GRHSs (a :: Type) (body :: Type)
-type family SyntaxExpr (i :: Type)
-
-instance OutputableBndrId p => Outputable (HsExpr (GhcPass p))
-instance OutputableBndrId p => Outputable (HsCmd (GhcPass p))
-
-type LHsExpr a = Located (HsExpr a)
+instance (OutputableBndrId p) => Outputable (HsExpr (GhcPass p))
+instance (OutputableBndrId p) => Outputable (HsCmd (GhcPass p))
 
 pprLExpr :: (OutputableBndrId p) => LHsExpr (GhcPass p) -> SDoc
 
@@ -43,10 +32,9 @@ pprSplice :: (OutputableBndrId p) => HsSplice (GhcPass p) -> SDoc
 pprSpliceDecl ::  (OutputableBndrId p)
           => HsSplice (GhcPass p) -> SpliceExplicitFlag -> SDoc
 
-pprPatBind :: forall bndr p body. (OutputableBndrId bndr,
-                                   OutputableBndrId p,
-                                   Outputable body)
-           => LPat (GhcPass bndr) -> GRHSs (GhcPass p) body -> SDoc
+pprPatBind :: forall bndr p . (OutputableBndrId bndr,
+                               OutputableBndrId p)
+           => LPat (GhcPass bndr) -> GRHSs (GhcPass p) (LHsExpr (GhcPass p)) -> SDoc
 
-pprFunBind :: (OutputableBndrId idR, Outputable body)
-           => MatchGroup (GhcPass idR) body -> SDoc
+pprFunBind :: (OutputableBndrId idR)
+           => MatchGroup (GhcPass idR) (LHsExpr (GhcPass idR)) -> SDoc

@@ -1,7 +1,7 @@
 -- | Test instances
 
-{-# LANGUAGE CPP #-}
-{-# OPTIONS_GHC -fno-enable-rewrite-rules -fno-warn-missing-signatures #-}
+{-# LANGUAGE ViewPatterns #-}
+{-# OPTIONS_GHC -fno-warn-missing-signatures #-}
 module Tests.Properties.Instances
     ( testInstances
     ) where
@@ -11,7 +11,6 @@ import Test.QuickCheck
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.QuickCheck (testProperty)
 import Tests.QuickCheckUtils
-import Text.Show.Functions ()
 import qualified Data.List as L
 import qualified Data.Text as T
 import qualified Data.Text.Internal.Fusion.Common as S
@@ -19,14 +18,14 @@ import qualified Data.Text.Lazy as TL
 
 s_Eq s            = (s==)    `eq` ((S.streamList s==) . S.streamList)
     where _types = s :: String
-sf_Eq p s =
+sf_Eq (applyFun -> p) s =
     ((L.filter p s==) . L.filter p) `eq`
     (((S.filter p $ S.streamList s)==) . S.filter p . S.streamList)
 t_Eq s            = (s==)    `eq` ((T.pack s==) . T.pack)
 tl_Eq s           = (s==)    `eq` ((TL.pack s==) . TL.pack)
 s_Ord s           = (compare s) `eq` (compare (S.streamList s) . S.streamList)
     where _types = s :: String
-sf_Ord p s =
+sf_Ord (applyFun -> p) s =
     ((compare $ L.filter p s) . L.filter p) `eq`
     (compare (S.filter p $ S.streamList s) . S.filter p . S.streamList)
 t_Ord s           = (compare s) `eq` (compare (T.pack s) . T.pack)
@@ -37,10 +36,8 @@ t_Show            = show     `eq` (show . T.pack)
 tl_Show           = show     `eq` (show . TL.pack)
 t_mappend s       = mappend s`eqP` (unpackS . mappend (T.pack s))
 tl_mappend s      = mappend s`eqP` (unpackS . mappend (TL.pack s))
-t_mconcat         = unsquare $
-                    mconcat `eq` (unpackS . mconcat . L.map T.pack)
-tl_mconcat        = unsquare $
-                    mconcat `eq` (unpackS . mconcat . L.map TL.pack)
+t_mconcat         = (mconcat . unSqrt) `eq` (unpackS . mconcat . L.map T.pack . unSqrt)
+tl_mconcat        = (mconcat . unSqrt) `eq` (unpackS . mconcat . L.map TL.pack . unSqrt)
 t_mempty          = mempty === (unpackS (mempty :: T.Text))
 tl_mempty         = mempty === (unpackS (mempty :: TL.Text))
 t_IsString        = fromString  `eqP` (T.unpack . fromString)

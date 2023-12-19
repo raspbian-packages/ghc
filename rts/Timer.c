@@ -15,7 +15,7 @@
  *
  */
 
-#include "PosixSource.h"
+#include "rts/PosixSource.h"
 #include "Rts.h"
 
 #include "Timer.h"
@@ -24,6 +24,7 @@
 #include "Ticker.h"
 #include "Capability.h"
 #include "RtsSignals.h"
+#include "rts/EventLogWriter.h"
 
 // This global counter is used to allow multiple threads to stop the
 // timer temporarily with a stopTimer()/startTimer() pair.  If
@@ -37,11 +38,13 @@ static StgWord timer_disabled;
 /* ticks left before next pre-emptive context switch */
 static int ticks_to_ctxt_switch = 0;
 
+/* ticks left before next next forced eventlog flush */
+static int ticks_to_eventlog_flush = 0;
+
 
 /*
  Note [GC During Idle Time]
- --------------------------
-
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~
  In the threaded RTS, a major GC can be performed during idle time (i.e., when
  no Haskell computations are ready to run).  This can be beneficial for two
  reasons.  First, running the GC during idle time makes it less likely that a GC
@@ -102,12 +105,21 @@ handle_tick(int unused STG_UNUSED)
 {
   handleProfTick();
   if (RtsFlags.ConcFlags.ctxtSwitchTicks > 0
-      && SEQ_CST_LOAD(&timer_disabled) == 0)
+      && SEQ_CST_LOAD_ALWAYS(&timer_disabled) == 0)
   {
       ticks_to_ctxt_switch--;
       if (ticks_to_ctxt_switch <= 0) {
           ticks_to_ctxt_switch = RtsFlags.ConcFlags.ctxtSwitchTicks;
           contextSwitchAllCapabilities(); /* schedule a context switch */
+      }
+  }
+
+  if (eventLogStatus() == EVENTLOG_RUNNING
+      && RtsFlags.TraceFlags.eventlogFlushTicks > 0) {
+      ticks_to_eventlog_flush--;
+      if (ticks_to_eventlog_flush <= 0) {
+          ticks_to_eventlog_flush = RtsFlags.TraceFlags.eventlogFlushTicks;
+          flushEventLog(NULL);
       }
   }
 
@@ -117,16 +129,16 @@ handle_tick(int unused STG_UNUSED)
    * for threads that are deadlocked.  However, ensure we wait
    * at least interIdleGCWait (+RTS -Iw) between idle GCs.
    */
-  switch (SEQ_CST_LOAD(&recent_activity)) {
+  switch (getRecentActivity()) {
   case ACTIVITY_YES:
-      SEQ_CST_STORE(&recent_activity, ACTIVITY_MAYBE_NO);
+      setRecentActivity(ACTIVITY_MAYBE_NO);
       idle_ticks_to_gc = RtsFlags.GcFlags.idleGCDelayTime /
                          RtsFlags.MiscFlags.tickInterval;
       break;
   case ACTIVITY_MAYBE_NO:
       if (idle_ticks_to_gc == 0 && inter_gc_ticks_to_gc == 0) {
           if (RtsFlags.GcFlags.doIdleGC) {
-              SEQ_CST_STORE(&recent_activity, ACTIVITY_INACTIVE);
+              setRecentActivity(ACTIVITY_INACTIVE);
               inter_gc_ticks_to_gc = RtsFlags.GcFlags.interIdleGCWait /
                                      RtsFlags.MiscFlags.tickInterval;
 #if defined(THREADED_RTS)
@@ -135,7 +147,7 @@ handle_tick(int unused STG_UNUSED)
               // the GC.
 #endif
           } else {
-              SEQ_CST_STORE(&recent_activity, ACTIVITY_DONE_GC);
+              setRecentActivity(ACTIVITY_DONE_GC);
               // disable timer signals (see #1623, #5991, #9105)
               // but only if we're not profiling (e.g. passed -h or -p RTS
               // flags). If we are profiling we need to keep the timer active
@@ -166,13 +178,13 @@ initTimer(void)
     if (RtsFlags.MiscFlags.tickInterval != 0) {
         initTicker(RtsFlags.MiscFlags.tickInterval, handle_tick);
     }
-    SEQ_CST_STORE(&timer_disabled, 1);
+    SEQ_CST_STORE_ALWAYS(&timer_disabled, 1);
 }
 
 void
 startTimer(void)
 {
-    if (atomic_dec(&timer_disabled) == 0) {
+    if (SEQ_CST_SUB_ALWAYS(&timer_disabled, 1) == 0) {
         if (RtsFlags.MiscFlags.tickInterval != 0) {
             startTicker();
         }
@@ -182,7 +194,7 @@ startTimer(void)
 void
 stopTimer(void)
 {
-    if (atomic_inc(&timer_disabled, 1) == 1) {
+    if (SEQ_CST_ADD_ALWAYS(&timer_disabled, 1) == 1) {
         if (RtsFlags.MiscFlags.tickInterval != 0) {
             stopTicker();
         }

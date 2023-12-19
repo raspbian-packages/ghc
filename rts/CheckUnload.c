@@ -8,7 +8,7 @@
  *
  * --------------------------------------------------------------------------*/
 
-#include "PosixSource.h"
+#include "rts/PosixSource.h"
 #include "Rts.h"
 
 #include "RtsUtils.h"
@@ -51,7 +51,7 @@
 //
 // Note that, crucially, we don't unload an object code even if it's not
 // reachable from the heap, unless it's explicitly asked for unloading (via
-// `unloadObj`). This is a feature and not a but! Two use cases:
+// `unloadObj`). This is a feature and not a bug! Two use cases:
 //
 // - The user might request a symbol from a loaded object at any point with
 //   lookupSymbol (e.g. GHCi might do this).
@@ -182,16 +182,16 @@ static OCSectionIndices *createOCSectionIndices(void)
 
 static void freeOCSectionIndices(OCSectionIndices *s_indices)
 {
-    free(s_indices->indices);
-    free(s_indices);
+    stgFree(s_indices->indices);
+    stgFree(s_indices);
 }
 
-void initUnloadCheck()
+void initUnloadCheck(void)
 {
     global_s_indices = createOCSectionIndices();
 }
 
-void exitUnloadCheck()
+void exitUnloadCheck(void)
 {
     freeOCSectionIndices(global_s_indices);
     global_s_indices = NULL;
@@ -231,7 +231,7 @@ static void reserveOCSectionIndices(OCSectionIndices *s_indices, int len)
     s_indices->capacity = new_capacity;
     s_indices->indices = new_indices;
 
-    free(old_indices);
+    stgFree(old_indices);
 }
 
 // Insert object section indices of a single ObjectCode. Invalidates 'sorted'
@@ -436,7 +436,7 @@ void markObjectCode(const void *addr)
 
 // Returns whether or not the GC that follows needs to mark code for potential
 // unloading.
-bool prepareUnloadCheck()
+bool prepareUnloadCheck(void)
 {
     if (global_s_indices == NULL) {
         return false;
@@ -453,7 +453,7 @@ bool prepareUnloadCheck()
     return true;
 }
 
-void checkUnload()
+void checkUnload(void)
 {
     if (global_s_indices == NULL) {
         return;
@@ -484,7 +484,7 @@ void checkUnload()
         // NB (osa): If this assertion doesn't hold then freeObjectCode below
         // will corrupt symhash as keys of that table live in ObjectCodes. If
         // you see a segfault in a hash table operation in linker (in non-debug
-        // RTS) then it's probably becuse this assertion did not hold.
+        // RTS) then it's probably because this assertion did not hold.
         ASSERT(oc->symbols == NULL);
 
         freeObjectCode(oc);

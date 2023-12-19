@@ -1,4 +1,6 @@
 {-# LANGUAGE BangPatterns, ScopedTypeVariables #-}
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE UnliftedFFITypes #-}
 
 -- |
 -- Module      : Data.Text.Internal.Search
@@ -23,8 +25,8 @@
 -- * D. M. Sunday: A Very Fast Substring Search Algorithm.
 --   Communications of the ACM, 33, 8, 132-142 (1990)
 --
--- * F. Lundh: The Fast Search Algorithm.
---   <http://effbot.org/zone/stringlib.htm> (2006)
+-- * F. Lundh:
+--   <http://web.archive.org/web/20201107074620/http://effbot.org/zone/stringlib.htm The Fast Search Algorithm>. (2006)
 
 module Data.Text.Internal.Search
     (
@@ -32,64 +34,81 @@ module Data.Text.Internal.Search
     ) where
 
 import qualified Data.Text.Array as A
-import Data.Word (Word64, Word16)
+import Data.Word (Word64, Word8)
 import Data.Text.Internal (Text(..))
-import Data.Bits ((.|.), (.&.))
-import Data.Text.Internal.Unsafe.Shift (shiftL)
+import Data.Bits ((.|.), (.&.), unsafeShiftL)
+import Foreign.C.Types
+import GHC.Exts (ByteArray#)
+import System.Posix.Types (CSsize(..))
 
 data T = {-# UNPACK #-} !Word64 :* {-# UNPACK #-} !Int
 
 -- | /O(n+m)/ Find the offsets of all non-overlapping indices of
--- @needle@ within @haystack@.  The offsets returned represent
--- uncorrected indices in the low-level \"needle\" array, to which its
--- offset must be added.
+-- @needle@ within @haystack@.
 --
 -- In (unlikely) bad cases, this algorithm's complexity degrades
 -- towards /O(n*m)/.
 indices :: Text                -- ^ Substring to search for (@needle@)
         -> Text                -- ^ Text to search in (@haystack@)
         -> [Int]
-indices _needle@(Text narr noff nlen) _haystack@(Text harr hoff hlen)
-    | nlen == 1              = scanOne (nindex 0)
-    | nlen <= 0 || ldiff < 0 = []
-    | otherwise              = scan 0
+indices needle@(Text narr noff nlen)
+  | nlen == 1 = scanOne (A.unsafeIndex narr noff)
+  | nlen <= 0 = const []
+  | otherwise = indices' needle
+{-# INLINE indices #-}
+
+-- | nlen must be >= 2, otherwise nindex causes access violation
+indices' :: Text -> Text -> [Int]
+indices' (Text narr noff nlen) (Text harr@(A.ByteArray harr#) hoff hlen) = loop (hoff + nlen)
   where
-    ldiff    = hlen - nlen
     nlast    = nlen - 1
-    z        = nindex nlast
+    !z       = nindex nlast
     nindex k = A.unsafeIndex narr (noff+k)
-    hindex k = A.unsafeIndex harr (hoff+k)
-    hindex' k | k == hlen  = 0
-              | otherwise = A.unsafeIndex harr (hoff+k)
     buildTable !i !msk !skp
         | i >= nlast           = (msk .|. swizzle z) :* skp
         | otherwise            = buildTable (i+1) (msk .|. swizzle c) skp'
-        where c                = nindex i
+        where !c               = nindex i
               skp' | c == z    = nlen - i - 2
                    | otherwise = skp
+    !(mask :* skip) = buildTable 0 0 (nlen-2)
 
-    swizzle :: Word16 -> Word64
-    swizzle k = 1 `shiftL` (word16ToInt k .&. 0x3f)
+    swizzle :: Word8 -> Word64
+    swizzle !k = 1 `unsafeShiftL` (word8ToInt k .&. 0x3f)
 
-    scan !i
-        | i > ldiff                  = []
-        | c == z && candidateMatch 0 = i : scan (i + nlen)
-        | otherwise                  = scan (i + delta)
-        where c = hindex (i + nlast)
-              candidateMatch !j
-                    | j >= nlast               = True
-                    | hindex (i+j) /= nindex j = False
-                    | otherwise                = candidateMatch (j+1)
-              delta | nextInPattern = nlen + 1
-                    | c == z        = skip + 1
-                    | otherwise     = 1
-                where nextInPattern = mask .&. swizzle (hindex' (i+nlen)) == 0
-              !(mask :* skip)       = buildTable 0 0 (nlen-2)
-    scanOne c = loop 0
-        where loop !i | i >= hlen     = []
-                      | hindex i == c = i : loop (i+1)
-                      | otherwise     = loop (i+1)
-{-# INLINE indices #-}
+    loop !i
+      | i > hlen + hoff
+      = []
+      | A.unsafeIndex harr (i - 1) == z
+      = if A.equal narr noff harr (i - nlen) nlen
+        then i - nlen - hoff : loop (i + nlen)
+        else                   loop (i + skip + 1)
+      | i == hlen + hoff
+      = []
+      | mask .&. swizzle (A.unsafeIndex harr i) == 0
+      = loop (i + nlen + 1)
+      | otherwise
+      = case memchr harr# (intToCSize i) (intToCSize (hlen + hoff - i)) z of
+        -1 -> []
+        x  -> loop (i + cSsizeToInt x + 1)
+{-# INLINE indices' #-}
 
-word16ToInt :: Word16 -> Int
-word16ToInt = fromIntegral
+scanOne :: Word8 -> Text -> [Int]
+scanOne c (Text harr hoff hlen) = loop 0
+  where
+    loop !i
+      | i >= hlen                        = []
+      | A.unsafeIndex harr (hoff+i) == c = i : loop (i+1)
+      | otherwise                        = loop (i+1)
+{-# INLINE scanOne #-}
+
+word8ToInt :: Word8 -> Int
+word8ToInt = fromIntegral
+
+intToCSize :: Int -> CSize
+intToCSize = fromIntegral
+
+cSsizeToInt :: CSsize -> Int
+cSsizeToInt = fromIntegral
+
+foreign import ccall unsafe "_hs_text_memchr" memchr
+    :: ByteArray# -> CSize -> CSize -> Word8 -> CSsize

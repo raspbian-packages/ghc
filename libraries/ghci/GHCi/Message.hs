@@ -1,5 +1,6 @@
 {-# LANGUAGE GADTs, DeriveGeneric, StandaloneDeriving, ScopedTypeVariables,
-    GeneralizedNewtypeDeriving, ExistentialQuantification, RecordWildCards #-}
+    GeneralizedNewtypeDeriving, ExistentialQuantification, RecordWildCards,
+    CPP #-}
 {-# OPTIONS_GHC -fno-warn-name-shadowing -fno-warn-orphans #-}
 
 -- |
@@ -29,7 +30,7 @@ import GHCi.TH.Binary () -- For Binary instances
 import GHCi.BreakArray
 
 import GHC.LanguageExtensions
-import GHC.Exts.Heap
+import qualified GHC.Exts.Heap as Heap
 import GHC.ForeignSrcLang
 import GHC.Fingerprint
 import Control.Concurrent
@@ -110,7 +111,7 @@ data Message a where
    -> Int     -- constr tag
    -> Int     -- pointer tag
    -> ByteString -- constructor desccription
-   -> Message (RemotePtr StgInfoTable)
+   -> Message (RemotePtr Heap.StgInfoTable)
 
   -- | Evaluate a statement
   EvalStmt
@@ -161,11 +162,13 @@ data Message a where
    :: Int                               -- size
    -> Message (RemoteRef BreakArray)
 
-  -- | Enable a breakpoint
-  EnableBreakpoint
+  -- | Set how many times a breakpoint should be ignored
+  --   also used for enable/disable
+  SetupBreakpoint
    :: RemoteRef BreakArray
-   -> Int                               -- index
-   -> Bool                              -- on or off
+   -> Int                           -- breakpoint index
+   -> Int                           -- ignore count to be stored in the BreakArray
+                                    -- -1 disable; 0 enable; >= 1 enable, ignore count.
    -> Message ()
 
   -- | Query the status of a breakpoint (True <=> enabled)
@@ -211,7 +214,7 @@ data Message a where
   -- type reconstruction.
   GetClosure
     :: HValueRef
-    -> Message (GenClosure HValueRef)
+    -> Message (Heap.GenClosure HValueRef)
 
   -- | Evaluate something. This is used to support :force in GHCi.
   Seq
@@ -256,6 +259,7 @@ data THMessage a where
   ReifyModule :: TH.Module -> THMessage (THResult TH.ModuleInfo)
   ReifyConStrictness :: TH.Name -> THMessage (THResult [TH.DecidedStrictness])
 
+  GetPackageRoot :: THMessage (THResult FilePath)
   AddDependentFile :: FilePath -> THMessage (THResult ())
   AddTempFile :: String -> THMessage (THResult FilePath)
   AddModFinalizer :: RemoteRef (TH.Q ()) -> THMessage (THResult ())
@@ -264,6 +268,8 @@ data THMessage a where
   AddForeignFilePath :: ForeignSrcLang -> FilePath -> THMessage (THResult ())
   IsExtEnabled :: Extension -> THMessage (THResult Bool)
   ExtsEnabled :: THMessage (THResult [Extension])
+  PutDoc :: TH.DocLoc -> String -> THMessage (THResult ())
+  GetDoc :: TH.DocLoc -> THMessage (THResult (Maybe String))
 
   StartRecover :: THMessage ()
   EndRecover :: Bool -> THMessage ()
@@ -304,6 +310,9 @@ getTHMessage = do
     20 -> THMsg <$> (AddForeignFilePath <$> get <*> get)
     21 -> THMsg <$> AddCorePlugin <$> get
     22 -> THMsg <$> ReifyType <$> get
+    23 -> THMsg <$> (PutDoc <$> get <*> get)
+    24 -> THMsg <$> GetDoc <$> get
+    25 -> THMsg <$> return GetPackageRoot
     n -> error ("getTHMessage: unknown message " ++ show n)
 
 putTHMessage :: THMessage a -> Put
@@ -331,6 +340,9 @@ putTHMessage m = case m of
   AddForeignFilePath lang a   -> putWord8 20 >> put lang >> put a
   AddCorePlugin a             -> putWord8 21 >> put a
   ReifyType a                 -> putWord8 22 >> put a
+  PutDoc l s                  -> putWord8 23 >> put l >> put s
+  GetDoc l                    -> putWord8 24 >> put l
+  GetPackageRoot              -> putWord8 25
 
 
 data EvalOpts = EvalOpts
@@ -449,10 +461,20 @@ instance Binary (FunPtr a) where
   get = castPtrToFunPtr <$> get
 
 -- Binary instances to support the GetClosure message
-instance Binary StgInfoTable
-instance Binary ClosureType
-instance Binary PrimType
-instance Binary a => Binary (GenClosure a)
+#if MIN_VERSION_ghc_heap(8,11,0)
+instance Binary Heap.StgTSOProfInfo
+instance Binary Heap.CostCentreStack
+instance Binary Heap.CostCentre
+instance Binary Heap.IndexTable
+instance Binary Heap.WhatNext
+instance Binary Heap.WhyBlocked
+instance Binary Heap.TsoFlags
+#endif
+
+instance Binary Heap.StgInfoTable
+instance Binary Heap.ClosureType
+instance Binary Heap.PrimType
+instance Binary a => Binary (Heap.GenClosure a)
 
 data Msg = forall a . (Binary a, Show a) => Msg (Message a)
 
@@ -488,7 +510,7 @@ getMessage = do
       25 -> Msg <$> (MkCostCentres <$> get <*> get)
       26 -> Msg <$> (CostCentreStackInfo <$> get)
       27 -> Msg <$> (NewBreakArray <$> get)
-      28 -> Msg <$> (EnableBreakpoint <$> get <*> get <*> get)
+      28 -> Msg <$> (SetupBreakpoint <$> get <*> get <*> get)
       29 -> Msg <$> (BreakpointStatus <$> get <*> get)
       30 -> Msg <$> (GetBreakpointVar <$> get <*> get)
       31 -> Msg <$> return StartTH
@@ -531,7 +553,7 @@ putMessage m = case m of
   MkCostCentres mod ccs       -> putWord8 25 >> put mod >> put ccs
   CostCentreStackInfo ptr     -> putWord8 26 >> put ptr
   NewBreakArray sz            -> putWord8 27 >> put sz
-  EnableBreakpoint arr ix b   -> putWord8 28 >> put arr >> put ix >> put b
+  SetupBreakpoint arr ix cnt    -> putWord8 28 >> put arr >> put ix >> put cnt
   BreakpointStatus arr ix     -> putWord8 29 >> put arr >> put ix
   GetBreakpointVar a b        -> putWord8 30 >> put a >> put b
   StartTH                     -> putWord8 31

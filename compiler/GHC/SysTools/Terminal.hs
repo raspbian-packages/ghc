@@ -5,14 +5,15 @@ module GHC.SysTools.Terminal (stderrSupportsAnsiColors) where
 import GHC.Prelude
 
 #if defined(MIN_VERSION_terminfo)
-import Control.Exception (catch)
+import GHC.IO (catchException)
 import Data.Maybe (fromMaybe)
 import System.Console.Terminfo (SetupTermError, Terminal, getCapability,
                                 setupTermFromEnv, termColors)
 import System.Posix (queryTerminal, stdError)
 #elif defined(mingw32_HOST_OS)
-import Control.Exception (catch, try)
-import Data.Bits ((.|.), (.&.))
+import GHC.IO (catchException)
+import GHC.Utils.Exception (try)
+-- import Data.Bits ((.|.), (.&.))
 import Foreign (Ptr, peek, with)
 import qualified Graphics.Win32 as Win32
 import qualified System.Win32 as Win32
@@ -43,7 +44,7 @@ stderrSupportsAnsiColors' = do
     stderr_available <- queryTerminal stdError
     if stderr_available then
       fmap termSupportsColors setupTermFromEnv
-        `catch` \ (_ :: SetupTermError) -> pure False
+        `catchException` \ (_ :: SetupTermError) -> pure False
     else
       pure False
   where
@@ -52,7 +53,7 @@ stderrSupportsAnsiColors' = do
 
 #elif defined(mingw32_HOST_OS)
   h <- Win32.getStdHandle Win32.sTD_ERROR_HANDLE
-         `catch` \ (_ :: IOError) ->
+         `catchException` \ (_ :: IOError) ->
            pure Win32.nullHANDLE
   if h == Win32.nullHANDLE
     then pure False
@@ -72,7 +73,7 @@ stderrSupportsAnsiColors' = do
     enableVTP h mode = do
         setConsoleMode h (modeAddVTP mode)
         modeHasVTP <$> getConsoleMode h
-      `catch` \ (_ :: IOError) ->
+      `catchException` \ (_ :: IOError) ->
         pure False
 
     modeHasVTP :: Win32.DWORD -> Bool

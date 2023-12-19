@@ -14,8 +14,20 @@ import Rules.Libffi (libffiName)
 import System.Directory
 
 ghcBuilderArgs :: Args
-ghcBuilderArgs = mconcat [ compileAndLinkHs, compileC, findHsDependencies
-                         , toolArgs]
+ghcBuilderArgs = mconcat
+  [ package genapply ? do
+      -- TODO: this is here because this -I needs to come before the others.
+      -- Otherwise this would go in Settings.Packages.
+      --
+      -- genapply bakes in the next stage's headers to bake in the target
+      -- config at build time.
+      -- See Note [Genapply target as host for RTS macros].
+      stage <- getStage
+      nextStageRtsBuildDir <- expr $ rtsBuildPath $ succStage stage
+      let nextStageRtsBuildIncludeDir = nextStageRtsBuildDir </> "include"
+      builder Ghc ? arg ("-I" ++ nextStageRtsBuildIncludeDir)
+  , compileAndLinkHs, compileC, compileCxx, findHsDependencies
+  , toolArgs]
 
 toolArgs :: Args
 toolArgs = do
@@ -34,7 +46,11 @@ compileAndLinkHs = (builder (Ghc CompileHs) ||^ builder (Ghc LinkHs)) ? do
     let hasVanilla = elem vanilla ways
         hasDynamic = elem dynamic ways
     mconcat [ arg "-Wall"
+            , arg "-Wcompat"
             , not useColor ? builder (Ghc CompileHs) ?
+              -- N.B. Target.trackArgument ignores this argument from the
+              -- input hash to avoid superfluous recompilation, avoiding
+              -- #18672.
               arg "-fdiagnostics-color=never"
             , (hasVanilla && hasDynamic) ? builder (Ghc CompileHs) ?
               platformSupportsSharedLibs ? way vanilla ?
@@ -63,6 +79,23 @@ compileC = builder (Ghc CompileCWithGhc) ? do
             , arg "-o"
             , arg =<< getOutput ]
 
+compileCxx :: Args
+compileCxx = builder (Ghc CompileCppWithGhc) ? do
+    way <- getWay
+    let ccArgs = [ getContextData cxxOpts
+                 , getStagedSettingList ConfCcArgs
+                 , cIncludeArgs
+                 , Dynamic `wayUnit` way ? pure [ "-fPIC", "-DDYNAMIC" ] ]
+    mconcat [ arg "-Wall"
+            , ghcLinkArgs
+            , commonGhcArgs
+            , mconcat (map (map ("-optcxx" ++) <$>) ccArgs)
+            , defaultGhcWarningsArgs
+            , arg "-c"
+            , getInputs
+            , arg "-o"
+            , arg =<< getOutput ]
+
 ghcLinkArgs :: Args
 ghcLinkArgs = builder (Ghc LinkHs) ? do
     pkg     <- getPackage
@@ -83,6 +116,9 @@ ghcLinkArgs = builder (Ghc LinkHs) ? do
     libffiName' <- libffiName
     debugged <- ghcDebugged <$> expr flavour
 
+    osxTarget <- expr isOsxTarget
+    winTarget <- expr isWinTarget
+
     let
         dynamic = Dynamic `wayUnit` way
         distPath = libPath' -/- distDir
@@ -94,7 +130,7 @@ ghcLinkArgs = builder (Ghc LinkHs) ? do
             -- libraries will all end up in the lib dir, so just use $ORIGIN
             | otherwise     = metaOrigin
             where
-                metaOrigin | osxHost   = "@loader_path"
+                metaOrigin | osxTarget = "@loader_path"
                            | otherwise = "$ORIGIN"
 
         -- TODO: an alternative would be to generalize by linking with extra
@@ -123,8 +159,8 @@ ghcLinkArgs = builder (Ghc LinkHs) ? do
                 , hostSupportsRPaths ? mconcat
                       [ arg ("-optl-Wl,-rpath," ++ rpath)
                       , isProgram pkg ? arg ("-optl-Wl,-rpath," ++ bindistRpath)
-                      -- The darwin linker doesn't support/require the -zorigin option
-                      , not osxHost ? arg "-optl-Wl,-zorigin"
+                      -- The darwin and Windows linkers don't support/require the -zorigin option
+                      , not (osxTarget || winTarget) ? arg "-optl-Wl,-zorigin"
                       -- We set RPATH directly (relative to $ORIGIN). There's
                       -- no reason for GHC to inject further RPATH entries.
                       -- See #19485.
@@ -137,7 +173,7 @@ ghcLinkArgs = builder (Ghc LinkHs) ? do
             , pure [ "-l" ++ lib    | lib    <- libs    ]
             , pure [ "-L" ++ libDir | libDir <- libDirs ]
             , rtsFfiArg
-            , osxHost ? pure (concat [ ["-framework", fmwk] | fmwk <- fmwks ])
+            , osxTarget ? pure (concat [ ["-framework", fmwk] | fmwk <- fmwks ])
             , debugged ? packageOneOf [ghc, iservProxy, iserv, remoteIserv] ?
               arg "-debug"
 
@@ -146,16 +182,8 @@ ghcLinkArgs = builder (Ghc LinkHs) ? do
 findHsDependencies :: Args
 findHsDependencies = builder (Ghc FindHsDependencies) ? do
     ways <- getLibraryWays
-    stage <- getStage
-    ghcVersion :: [Int] <- fmap read . splitOn "." <$> expr (ghcVersionStage stage)
     mconcat [ arg "-M"
-
-            -- "-include-cpp-deps" is a new ish feature so is version gated.
-            -- Without this feature some dependencies will be missing in stage0.
-            -- TODO Remove version gate when minimum supported Stage0 compiler
-            -- is >= 8.9.0.
-            , ghcVersion > [8,9,0] ? arg "-include-cpp-deps"
-
+            , arg "-include-cpp-deps"
             , commonGhcArgs
             , defaultGhcWarningsArgs
             , arg "-include-pkg-deps"
@@ -174,8 +202,7 @@ commonGhcArgs :: Args
 commonGhcArgs = do
     way  <- getWay
     path <- getBuildPath
-    stage <- getStage
-    ghcVersion <- expr $ ghcVersionH stage
+    useColor <- shakeColor <$> expr getShakeOptions
     mconcat [ arg "-hisuf", arg $ hisuf way
             , arg "-osuf" , arg $  osuf way
             , arg "-hcsuf", arg $ hcsuf way
@@ -186,11 +213,21 @@ commonGhcArgs = do
             -- in the package database. We therefore explicitly supply the path
             -- to the @ghc-version@ file, to prevent GHC from trying to open the
             -- RTS package in the package database and failing.
-            , package rts ? notStage0 ? arg ("-ghcversion-file=" ++ ghcVersion)
+            , package rts ? notStage0 ? arg "-ghcversion-file=rts/include/ghcversion.h"
             , map ("-optc" ++) <$> getStagedSettingList ConfCcArgs
             , map ("-optP" ++) <$> getStagedSettingList ConfCppArgs
             , map ("-optP" ++) <$> getContextData cppOpts
-            , arg "-outputdir", arg path ]
+            , arg "-outputdir", arg path
+              -- we need to enable color explicitly because the output is
+              -- captured to be displayed after the failed command line in case
+              -- of error (#20490). GHC detects that it doesn't output to a
+              -- terminal and it disables colors if we don't do this.
+            , useColor ?
+              -- N.B. Target.trackArgument ignores this argument from the
+              -- input hash to avoid superfluous recompilation, avoiding
+              -- #18672.
+              arg "-fdiagnostics-color=always"
+            ]
 
 -- TODO: Do '-ticky' in all debug ways?
 wayGhcArgs :: Args
@@ -199,14 +236,14 @@ wayGhcArgs = do
     mconcat [ if Dynamic `wayUnit` way
                 then pure ["-fPIC", "-dynamic"]
                 else arg "-static"
-            , (Threaded  `wayUnit` way) ? arg "-optc-DTHREADED_RTS"
-            , (Debug     `wayUnit` way) ? arg "-optc-DDEBUG"
             , (Profiling `wayUnit` way) ? arg "-prof"
-            , supportsEventlog way ? arg "-eventlog"
-            , (way == debug || way == debugDynamic) ?
-              pure ["-ticky", "-DTICKY_TICKY"] ]
-
-  where supportsEventlog w = any (`wayUnit` w) [Logging, Profiling, Debug]
+            , (way == debug || way == debugDynamic) ? arg "-ticky"
+            , wayCcArgs
+              -- We must pass CPP flags via -optc as well to ensure that they
+              -- are passed to the preprocessor when, e.g., compiling Cmm
+              -- sources.
+            , map ("-optc"++) <$> wayCcArgs
+            ]
 
 packageGhcArgs :: Args
 packageGhcArgs = do
@@ -214,6 +251,7 @@ packageGhcArgs = do
     pkgId   <- expr $ pkgIdentifier package
     mconcat [ arg "-hide-all-packages"
             , arg "-no-user-package-db"
+            , arg "-package-env -"
             , packageDatabaseArgs
             , libraryPackage ? arg ("-this-unit-id " ++ pkgId)
             , map ("-package-id " ++) <$> getContextData depIds ]
@@ -227,8 +265,6 @@ includeGhcArgs = do
     abSrcDirs <- exprIO $ mapM makeAbsolute [ (pkgPath pkg -/- dir) | dir <- srcDirs ]
     autogen <- expr (autogenPath context)
     cautogen <-  exprIO (makeAbsolute autogen)
-    stage <- getStage
-    libPath <- expr (stageLibPath stage)
     let cabalMacros = autogen -/- "cabal_macros.h"
     expr $ need [cabalMacros]
     mconcat [ arg "-i"
@@ -236,6 +272,4 @@ includeGhcArgs = do
             , arg $ "-i" ++ cautogen
             , pure [ "-i" ++ d | d <- abSrcDirs ]
             , cIncludeArgs
-            , arg $      "-I" ++ libPath
-            , arg $ "-optc-I" ++ libPath
             , pure ["-optP-include", "-optP" ++ cabalMacros] ]

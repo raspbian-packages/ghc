@@ -29,10 +29,11 @@ module Data.Text.Internal.Fusion.Types
     ) where
 
 import Data.Text.Internal.Fusion.Size
+import Data.Int (Int64)
 import Data.Word (Word8)
 
 -- | Specialised tuple for case conversion.
-data CC s = CC !s {-# UNPACK #-} !Char {-# UNPACK #-} !Char
+data CC s = CC !s {-# UNPACK #-} !Int64
 
 -- | Restreaming state.
 data RS s
@@ -75,11 +76,13 @@ instance (Ord a) => Ord (Stream a) where
 -- unstreaming functions must be able to cope with the hint being too
 -- small or too large.
 --
--- The size hint tries to track the UTF-16 code units in a stream,
+-- The size hint tries to track the UTF-8 code units in a stream,
 -- but often counts the number of code points instead.  It can easily
 -- undercount if, for instance, a transformed stream contains astral
 -- plane code points (those above 0x10000).
 
+-- | A co-recursive type yielding a single element at a time depending
+-- on the internal state it carries.
 data Stream a =
     forall s. Stream
     (s -> Step s a)             -- stepper function

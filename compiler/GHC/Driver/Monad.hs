@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, DeriveFunctor, DerivingVia, RankNTypes #-}
+{-# LANGUAGE DeriveFunctor, DerivingVia, RankNTypes #-}
 {-# OPTIONS_GHC -funbox-strict-fields #-}
 -- -----------------------------------------------------------------------------
 --
@@ -16,20 +16,37 @@ module GHC.Driver.Monad (
         reflectGhc, reifyGhc,
         getSessionDynFlags,
         liftIO,
-        Session(..), withSession, modifySession, withTempSession,
+        Session(..), withSession, modifySession, modifySessionM,
+        withTempSession,
 
-        -- ** Warnings
-        logWarnings, printException,
+        -- * Logger
+        modifyLogger,
+        pushLogHookM,
+        popLogHookM,
+        putLogMsgM,
+        putMsgM,
+        withTimingM,
+
+        -- ** Diagnostics
+        logDiagnostics, printException,
         WarnErrLogger, defaultWarnErrLogger
   ) where
 
 import GHC.Prelude
 
-import GHC.Utils.Monad
-import GHC.Driver.Types
 import GHC.Driver.Session
+import GHC.Driver.Env
+import GHC.Driver.Errors ( printOrThrowDiagnostics, printMessages )
+import GHC.Driver.Errors.Types
+import GHC.Driver.Config.Diagnostic
+
+import GHC.Utils.Monad
 import GHC.Utils.Exception
 import GHC.Utils.Error
+import GHC.Utils.Logger
+
+import GHC.Types.SrcLoc
+import GHC.Types.SourceError
 
 import Control.Monad
 import Control.Monad.Catch as MC
@@ -52,7 +69,7 @@ import Data.IORef
 -- If you do not use 'Ghc' or 'GhcT', make sure to call 'GHC.initGhcMonad'
 -- before any call to the GHC API functions can occur.
 --
-class (Functor m, ExceptionMonad m, HasDynFlags m) => GhcMonad m where
+class (Functor m, ExceptionMonad m, HasDynFlags m, HasLogger m ) => GhcMonad m where
   getSession :: m HscEnv
   setSession :: HscEnv -> m ()
 
@@ -70,6 +87,13 @@ modifySession :: GhcMonad m => (HscEnv -> HscEnv) -> m ()
 modifySession f = do h <- getSession
                      setSession $! f h
 
+-- | Set the current session to the result of applying the current session to
+-- the argument.
+modifySessionM :: GhcMonad m => (HscEnv -> m HscEnv) -> m ()
+modifySessionM f = do h <- getSession
+                      h' <- f h
+                      setSession $! h'
+
 withSavedSession :: GhcMonad m => m a -> m a
 withSavedSession m = do
   saved_session <- getSession
@@ -80,13 +104,50 @@ withTempSession :: GhcMonad m => (HscEnv -> HscEnv) -> m a -> m a
 withTempSession f m =
   withSavedSession $ modifySession f >> m
 
--- -----------------------------------------------------------------------------
--- | A monad that allows logging of warnings.
+----------------------------------------
+-- Logging
+----------------------------------------
 
-logWarnings :: GhcMonad m => WarningMessages -> m ()
-logWarnings warns = do
+-- | Modify the logger
+modifyLogger :: GhcMonad m => (Logger -> Logger) -> m ()
+modifyLogger f = modifySession $ \hsc_env ->
+    hsc_env { hsc_logger = f (hsc_logger hsc_env) }
+
+-- | Push a log hook on the stack
+pushLogHookM :: GhcMonad m => (LogAction -> LogAction) -> m ()
+pushLogHookM = modifyLogger . pushLogHook
+
+-- | Pop a log hook from the stack
+popLogHookM :: GhcMonad m => m ()
+popLogHookM  = modifyLogger popLogHook
+
+-- | Put a log message
+putMsgM :: GhcMonad m => SDoc -> m ()
+putMsgM doc = do
+    logger <- getLogger
+    liftIO $ putMsg logger doc
+
+-- | Put a log message
+putLogMsgM :: GhcMonad m => MessageClass -> SrcSpan -> SDoc -> m ()
+putLogMsgM msg_class loc doc = do
+    logger <- getLogger
+    liftIO $ logMsg logger msg_class loc doc
+
+-- | Time an action
+withTimingM :: GhcMonad m => SDoc -> (b -> ()) -> m b -> m b
+withTimingM doc force action = do
+    logger <- getLogger
+    withTiming logger doc force action
+
+-- -----------------------------------------------------------------------------
+-- | A monad that allows logging of diagnostics.
+
+logDiagnostics :: GhcMonad m => Messages GhcMessage -> m ()
+logDiagnostics warns = do
   dflags <- getSessionDynFlags
-  liftIO $ printOrThrowWarnings dflags warns
+  logger <- getLogger
+  let !diag_opts = initDiagOpts dflags
+  liftIO $ printOrThrowDiagnostics logger diag_opts warns
 
 -- -----------------------------------------------------------------------------
 -- | A minimal implementation of a 'GhcMonad'.  If you need a custom monad,
@@ -117,6 +178,9 @@ instance MonadFix Ghc where
 
 instance HasDynFlags Ghc where
   getDynFlags = getSessionDynFlags
+
+instance HasLogger Ghc where
+  getLogger = hsc_logger <$> getSession
 
 instance GhcMonad Ghc where
   getSession = Ghc $ \(Session r) -> readIORef r
@@ -168,22 +232,26 @@ instance MonadIO m => MonadIO (GhcT m) where
 instance MonadIO m => HasDynFlags (GhcT m) where
   getDynFlags = GhcT $ \(Session r) -> liftM hsc_dflags (liftIO $ readIORef r)
 
+instance MonadIO m => HasLogger (GhcT m) where
+  getLogger = GhcT $ \(Session r) -> liftM hsc_logger (liftIO $ readIORef r)
+
 instance ExceptionMonad m => GhcMonad (GhcT m) where
   getSession = GhcT $ \(Session r) -> liftIO $ readIORef r
   setSession s' = GhcT $ \(Session r) -> liftIO $ writeIORef r s'
 
 
--- | Print the error message and all warnings.  Useful inside exception
---   handlers.  Clears warnings after printing.
-printException :: GhcMonad m => SourceError -> m ()
+-- | Print the all diagnostics in a 'SourceError'.  Useful inside exception
+--   handlers.
+printException :: (HasLogger m, MonadIO m, HasDynFlags m) => SourceError -> m ()
 printException err = do
-  dflags <- getSessionDynFlags
-  liftIO $ printBagOfErrors dflags (srcErrorMessages err)
+  dflags <- getDynFlags
+  logger <- getLogger
+  let !diag_opts = initDiagOpts dflags
+  liftIO $ printMessages logger diag_opts (srcErrorMessages err)
 
 -- | A function called to log warnings and errors.
-type WarnErrLogger = forall m. GhcMonad m => Maybe SourceError -> m ()
+type WarnErrLogger = forall m. (HasDynFlags m , MonadIO m, HasLogger m) => Maybe SourceError -> m ()
 
 defaultWarnErrLogger :: WarnErrLogger
 defaultWarnErrLogger Nothing  = return ()
 defaultWarnErrLogger (Just e) = printException e
-

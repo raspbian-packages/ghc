@@ -1,6 +1,9 @@
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE NoImplicitPrelude #-}
+{-# LANGUAGE NondecreasingIndentation #-}
 {-# LANGUAGE Trustworthy #-}
-{-# LANGUAGE CPP, BangPatterns, NoImplicitPrelude,
-             NondecreasingIndentation, MagicHash #-}
 
 module GHC.IO.Encoding.CodePage(
 #if defined(mingw32_HOST_OS)
@@ -167,7 +170,7 @@ lookupCompact maxVal indexes values x
 
 {-# INLINE indexInt #-}
 indexInt :: ConvArray Int -> Int -> Int
-indexInt (ConvArray p) (I# i) = I# (indexInt16OffAddr# p i)
+indexInt (ConvArray p) (I# i) = I# (int16ToInt# (indexInt16OffAddr# p i))
 
 {-# INLINE indexWord8 #-}
 indexWord8 :: ConvArray Word8 -> Int -> Word8
@@ -175,7 +178,7 @@ indexWord8 (ConvArray p) (I# i) = W8# (indexWord8OffAddr# p i)
 
 {-# INLINE indexChar #-}
 indexChar :: ConvArray Char -> Int -> Char
-indexChar (ConvArray p) (I# i) = C# (chr# (indexInt16OffAddr# p i))
+indexChar (ConvArray p) (I# i) = C# (chr# (int16ToInt# (indexInt16OffAddr# p i)))
 
 #endif
 

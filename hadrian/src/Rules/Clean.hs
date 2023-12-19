@@ -3,6 +3,13 @@ module Rules.Clean (clean, cleanSourceTree, cleanRules) where
 import qualified System.Directory as IO
 import Base
 
+distclean :: Action ()
+distclean = do
+    putBuild "| Removing mingw tarballs..."
+    cleanMingwTarballs
+    cleanFsUtils
+    clean
+
 clean :: Action ()
 clean = do
     putBuild "| Removing Hadrian files..."
@@ -15,9 +22,12 @@ clean = do
 cleanSourceTree :: Action ()
 cleanSourceTree = do
     path <- buildRoot
-    forM_ [Stage0 ..] $ removeDirectory . (path -/-) . stageString
+    forM_ allStages $ removeDirectory . (path -/-) . stageString
     removeDirectory "sdistprep"
-    cleanFsUtils
+
+cleanMingwTarballs :: Action ()
+cleanMingwTarballs = do
+    removeDirectory "ghc-tarballs"
 
 -- Clean all temporary fs files copied by configure into the source folder
 cleanFsUtils :: Action ()
@@ -31,4 +41,6 @@ cleanFsUtils = do
     liftIO $ forM_ dirs (flip removeFiles ["fs.*"])
 
 cleanRules :: Rules ()
-cleanRules = "clean" ~> clean
+cleanRules = do
+    "clean" ~> clean
+    "distclean" ~> distclean

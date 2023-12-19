@@ -16,7 +16,7 @@
 # Add missing targets to the list below to have them included in
 # llvm-targets file.
 #
-# See Note [LLVM Configuration] in SysTools for the whole story regarding LLVM
+# See Note [LLVM configuration] in GHC.SysTools for the whole story regarding LLVM
 # configuration data.
 
 # Target sets for which to generate the llvm-targets file
@@ -76,6 +76,9 @@ TARGETS=(
     "powerpc64le-unknown-linux"
     # Linux s390x
     "s390x-ibm-linux"
+    # Linux riscv64
+    "riscv64-unknown-linux-gnu"
+    "riscv64-unknown-linux"
 
     #########################
     # Darwin
@@ -96,13 +99,26 @@ TARGETS=(
     #########################
 
     # FreeBSD amd64
-    "amd64-portbld-freebsd"
+    "x86_64-portbld-freebsd"
     "x86_64-unknown-freebsd" # See #15718
 
     # FreeBSD ARM
     "aarch64-unknown-freebsd"
     "armv6-unknown-freebsd-gnueabihf"
     "armv7-unknown-freebsd-gnueabihf"
+
+    #########################
+    # NetBSD
+    #########################
+
+    "aarch64-unknown-netbsd"
+
+    #########################
+    # OpenBSD
+    #########################
+
+    "x86_64-unknown-openbsd"
+    "i386-unknown-openbsd"
 
     #########################
     # Other

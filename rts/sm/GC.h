@@ -13,14 +13,27 @@
 
 #pragma once
 
-#include "BeginPrivate.h"
-
 #include "HeapAlloc.h"
 
-void GarbageCollect (uint32_t collect_gen,
-                     bool do_heap_census,
-                     bool deadlock_detect,
-                     uint32_t gc_type,
+#include "BeginPrivate.h"
+
+struct GcConfig {
+    // which generation are we requesting be collected?
+    uint32_t collect_gen;
+    // is a heap census requested?
+    bool do_heap_census;
+    // is this GC triggered by a heap overflow?
+    bool overflow_gc;
+    // is this GC triggered by a deadlock?
+    bool deadlock_detect;
+    // should we force non-concurrent collection if the non-moving collector is
+    // being used?
+    bool nonconcurrent;
+    // should we use parallel scavenging?
+    bool parallel;
+};
+
+void GarbageCollect (struct GcConfig config,
                      Capability *cap,
                      bool idle_cap[]);
 
@@ -33,7 +46,7 @@ bool doIdleGCWork(Capability *cap, bool all);
 
 extern uint32_t N;
 extern bool major_gc;
-/* See Note [Deadlock detection under nonmoving collector]. */
+/* See Note [Deadlock detection under the nonmoving collector]. */
 extern bool deadlock_detect_gc;
 extern bool unload_mark_needed;
 
@@ -76,6 +89,7 @@ void freeGcThreads (void);
 void resizeGenerations (void);
 
 #if defined(THREADED_RTS)
+void notifyTodoBlock (void);
 void waitForGcThreads (Capability *cap, bool idle_cap[]);
 void releaseGCThreads (Capability *cap, bool idle_cap[]);
 #endif

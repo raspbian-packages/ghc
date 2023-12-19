@@ -98,7 +98,7 @@ minusNatural = N.naturalSubThrow
 -- @since 4.8.0.0
 minusNaturalMaybe :: Natural -> Natural -> Maybe Natural
 minusNaturalMaybe x y = case N.naturalSub x y of
-   (# _     |   #) -> Nothing
+   (# (# #) |   #) -> Nothing
    (#       | n #) -> Just n
 
 -- | 'Natural' multiplication

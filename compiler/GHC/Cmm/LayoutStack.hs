@@ -5,17 +5,19 @@ module GHC.Cmm.LayoutStack (
 
 import GHC.Prelude hiding ((<*>))
 
-import GHC.StgToCmm.Utils      ( callerSaveVolatileRegs, newTemp  ) -- XXX layering violation
+import GHC.Platform
+import GHC.Platform.Profile
+
+import GHC.StgToCmm.Monad      ( newTemp  ) -- XXX layering violation
+import GHC.StgToCmm.Utils      ( callerSaveVolatileRegs  ) -- XXX layering violation
 import GHC.StgToCmm.Foreign    ( saveThreadState, loadThreadState ) -- XXX layering violation
 
-import GHC.Types.Basic
 import GHC.Cmm
 import GHC.Cmm.Info
 import GHC.Cmm.BlockId
-import GHC.Cmm.CLabel
+import GHC.Cmm.Config
 import GHC.Cmm.Utils
 import GHC.Cmm.Graph
-import GHC.Types.ForeignCall
 import GHC.Cmm.Liveness
 import GHC.Cmm.ProcPoint
 import GHC.Runtime.Heap.Layout
@@ -29,18 +31,15 @@ import GHC.Data.Maybe
 import GHC.Types.Unique.FM
 import GHC.Utils.Misc
 
-import GHC.Platform
-import GHC.Driver.Session
-import GHC.Data.FastString
 import GHC.Utils.Outputable hiding ( isEmpty )
+import GHC.Utils.Panic
 import qualified Data.Set as Set
 import Control.Monad.Fix
 import Data.Array as Array
-import Data.Bits
 import Data.List (nub)
 
 {- Note [Stack Layout]
-
+   ~~~~~~~~~~~~~~~~~~~
 The job of this pass is to
 
  - replace references to abstract stack Areas with fixed offsets from Sp.
@@ -142,7 +141,7 @@ Pass 2:
 
 
 Note [Two pass approach]
-
+~~~~~~~~~~~~~~~~~~~~~~~~
 The main reason for Pass 2 is being able to insert only the reloads that are
 needed and the fact that the two passes need different liveness information.
 Let's consider an example:
@@ -236,31 +235,33 @@ instance Outputable StackMap where
      text "sm_regs = " <> pprUFM sm_regs ppr
 
 
-cmmLayoutStack :: DynFlags -> ProcPointSet -> ByteOff -> CmmGraph
+cmmLayoutStack :: CmmConfig -> ProcPointSet -> ByteOff -> CmmGraph
                -> UniqSM (CmmGraph, LabelMap StackMap)
-cmmLayoutStack dflags procpoints entry_args
+cmmLayoutStack cfg procpoints entry_args
                graph@(CmmGraph { g_entry = entry })
   = do
     -- We need liveness info. Dead assignments are removed later
     -- by the sinking pass.
-    let liveness = cmmLocalLiveness dflags graph
-        blocks = revPostorder graph
+    let liveness = cmmLocalLiveness platform graph
+        blocks   = revPostorder graph
+        profile  = cmmProfile   cfg
+        platform = profilePlatform profile
 
     (final_stackmaps, _final_high_sp, new_blocks) <-
           mfix $ \ ~(rec_stackmaps, rec_high_sp, _new_blocks) ->
-            layout dflags procpoints liveness entry entry_args
+            layout cfg procpoints liveness entry entry_args
                    rec_stackmaps rec_high_sp blocks
 
     blocks_with_reloads <-
-        insertReloadsAsNeeded dflags procpoints final_stackmaps entry new_blocks
-    new_blocks' <- mapM (lowerSafeForeignCall dflags) blocks_with_reloads
+        insertReloadsAsNeeded platform procpoints final_stackmaps entry new_blocks
+    new_blocks' <- mapM (lowerSafeForeignCall profile) blocks_with_reloads
     return (ofBlockList entry new_blocks', final_stackmaps)
 
 -- -----------------------------------------------------------------------------
 -- Pass 1
 -- -----------------------------------------------------------------------------
 
-layout :: DynFlags
+layout :: CmmConfig
        -> LabelSet                      -- proc points
        -> LabelMap CmmLocalLive         -- liveness
        -> BlockId                       -- entry
@@ -277,7 +278,7 @@ layout :: DynFlags
           , [CmmBlock]                  -- [out] new blocks
           )
 
-layout dflags procpoints liveness entry entry_args final_stackmaps final_sp_high blocks
+layout cfg procpoints liveness entry entry_args final_stackmaps final_sp_high blocks
   = go blocks init_stackmap entry_args []
   where
     (updfr, cont_info)  = collectContInfo blocks
@@ -310,7 +311,7 @@ layout dflags procpoints liveness entry entry_args final_stackmaps final_sp_high
        --     each of the successor blocks.  See handleLastNode for
        --     details.
        (middle1, sp_off, last1, fixup_blocks, out)
-           <- handleLastNode dflags procpoints liveness cont_info
+           <- handleLastNode cfg procpoints liveness cont_info
                              acc_stackmaps stack1 tscope middle0 last0
 
        -- (c) Manifest Sp: run over the nodes in the block and replace
@@ -325,7 +326,7 @@ layout dflags procpoints liveness entry entry_args final_stackmaps final_sp_high
        let middle_pre = blockToList $ foldl' blockSnoc middle0 middle1
 
        let final_blocks =
-               manifestSp dflags final_stackmaps stack0 sp0 final_sp_high
+               manifestSp cfg final_stackmaps stack0 sp0 final_sp_high
                           entry0 middle_pre sp_off last1 fixup_blocks
 
        let acc_stackmaps' = mapUnion acc_stackmaps out
@@ -396,7 +397,7 @@ collectContInfo blocks
 procMiddle :: LabelMap StackMap -> CmmNode e x -> StackMap -> StackMap
 procMiddle stackmaps node sm
   = case node of
-     CmmAssign (CmmLocal r) (CmmLoad (CmmStackSlot area off) _)
+     CmmAssign (CmmLocal r) (CmmLoad (CmmStackSlot area off) _ _)
        -> sm { sm_regs = addToUFM (sm_regs sm) r (r,loc) }
         where loc = getStackLoc area off stackmaps
      CmmAssign (CmmLocal r) _other
@@ -432,7 +433,7 @@ getStackLoc (Young l) n stackmaps =
 -- extra code that goes *after* the Sp adjustment.
 
 handleLastNode
-   :: DynFlags -> ProcPointSet -> LabelMap CmmLocalLive -> LabelMap ByteOff
+   :: CmmConfig -> ProcPointSet -> LabelMap CmmLocalLive -> LabelMap ByteOff
    -> LabelMap StackMap -> StackMap -> CmmTickScope
    -> Block CmmNode O O
    -> CmmNode O C
@@ -444,30 +445,29 @@ handleLastNode
       , LabelMap StackMap  -- stackmaps for the continuations
       )
 
-handleLastNode dflags procpoints liveness cont_info stackmaps
+handleLastNode cfg procpoints liveness cont_info stackmaps
                stack0@StackMap { sm_sp = sp0 } tscp middle last
- = case last of
-    --  At each return / tail call,
-    --  adjust Sp to point to the last argument pushed, which
-    --  is cml_args, after popping any other junk from the stack.
-    CmmCall{ cml_cont = Nothing, .. } -> do
-      let sp_off = sp0 - cml_args
-      return ([], sp_off, last, [], mapEmpty)
+  = case last of
+      --  At each return / tail call,
+      --  adjust Sp to point to the last argument pushed, which
+      --  is cml_args, after popping any other junk from the stack.
+      CmmCall{ cml_cont = Nothing, .. } -> do
+        let sp_off = sp0 - cml_args
+        return ([], sp_off, last, [], mapEmpty)
 
-    --  At each CmmCall with a continuation:
-    CmmCall{ cml_cont = Just cont_lbl, .. } ->
-       return $ lastCall cont_lbl cml_args cml_ret_args cml_ret_off
+      --  At each CmmCall with a continuation:
+      CmmCall{ cml_cont = Just cont_lbl, .. } ->
+        return $ lastCall cont_lbl cml_args cml_ret_args cml_ret_off
 
-    CmmForeignCall{ succ = cont_lbl, .. } -> do
-       return $ lastCall cont_lbl (platformWordSizeInBytes platform) ret_args ret_off
-            -- one word of args: the return address
+      CmmForeignCall{ succ = cont_lbl, .. } ->
+        return $ lastCall cont_lbl (platformWordSizeInBytes platform) ret_args ret_off
+              -- one word of args: the return address
 
-    CmmBranch {}     ->  handleBranches
-    CmmCondBranch {} ->  handleBranches
-    CmmSwitch {}     ->  handleBranches
-
+      CmmBranch {}     ->  handleBranches
+      CmmCondBranch {} ->  handleBranches
+      CmmSwitch {}     ->  handleBranches
   where
-     platform = targetPlatform dflags
+     platform = cmmPlatform cfg
      -- Calls and ForeignCalls are handled the same way:
      lastCall :: BlockId -> ByteOff -> ByteOff -> ByteOff
               -> ( [CmmNode O O]
@@ -510,7 +510,7 @@ handleLastNode dflags procpoints liveness cont_info stackmaps
                                 , LabelMap StackMap )
 
      handleBranches
-         -- Note [diamond proc point]
+         -- See Note [diamond proc point]
        | Just l <- futureContinuation middle
        , (nub $ filter (`setMember` procpoints) $ successors last) == [l]
        = do
@@ -544,7 +544,7 @@ handleLastNode dflags procpoints liveness cont_info stackmaps
         | Just stack2 <- mapLookup l stackmaps
         = do
              let assigs = fixupStack stack0 stack2
-             (tmp_lbl, block) <- makeFixupBlock dflags sp0 l stack2 tscp assigs
+             (tmp_lbl, block) <- makeFixupBlock cfg sp0 l stack2 tscp assigs
              return (l, tmp_lbl, stack2, block)
 
         --   (b) if the successor is a proc point, save everything
@@ -555,7 +555,7 @@ handleLastNode dflags procpoints liveness cont_info stackmaps
                  (stack2, assigs) =
                       setupStackFrame platform l liveness (sm_ret_off stack0)
                                                         cont_args stack0
-             (tmp_lbl, block) <- makeFixupBlock dflags sp0 l stack2 tscp assigs
+             (tmp_lbl, block) <- makeFixupBlock cfg sp0 l stack2 tscp assigs
              return (l, tmp_lbl, stack2, block)
 
         --   (c) otherwise, the current StackMap is the StackMap for
@@ -569,16 +569,16 @@ handleLastNode dflags procpoints liveness cont_info stackmaps
               is_live (r,_) = r `elemRegSet` live
 
 
-makeFixupBlock :: DynFlags -> ByteOff -> Label -> StackMap
+makeFixupBlock :: CmmConfig -> ByteOff -> Label -> StackMap
                -> CmmTickScope -> [CmmNode O O]
                -> UniqSM (Label, [CmmBlock])
-makeFixupBlock dflags sp0 l stack tscope assigs
+makeFixupBlock cfg sp0 l stack tscope assigs
   | null assigs && sp0 == sm_sp stack = return (l, [])
   | otherwise = do
     tmp_lbl <- newBlockId
     let sp_off = sp0 - sm_sp stack
         block = blockJoin (CmmEntry tmp_lbl tscope)
-                          ( maybeAddSpAdj dflags sp0 sp_off
+                          ( maybeAddSpAdj cfg sp0 sp_off
                            $ blockFromList assigs )
                           (CmmBranch l)
     return (tmp_lbl, [block])
@@ -605,7 +605,8 @@ fixupStack old_stack new_stack = concatMap move new_locs
      move (r,n)
        | Just (_,m) <- lookupUFM old_map r, n == m = []
        | otherwise = [CmmStore (CmmStackSlot Old n)
-                               (CmmReg (CmmLocal r))]
+                               (CmmReg (CmmLocal r))
+                               NaturallyAligned]
 
 
 
@@ -644,9 +645,8 @@ setupStackFrame platform lbl liveness updfr_off ret_args stack0
                          }
 
 
--- -----------------------------------------------------------------------------
 -- Note [diamond proc point]
---
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~
 -- This special case looks for the pattern we get from a typical
 -- tagged case expression:
 --
@@ -704,7 +704,7 @@ setupStackFrame platform lbl liveness updfr_off ret_args stack0
 futureContinuation :: Block CmmNode O O -> Maybe BlockId
 futureContinuation middle = foldBlockNodesB f middle Nothing
    where f :: CmmNode a b -> Maybe BlockId -> Maybe BlockId
-         f (CmmStore (CmmStackSlot (Young l) _) (CmmLit (CmmBlock _))) _
+         f (CmmStore (CmmStackSlot (Young l) _) (CmmLit (CmmBlock _)) _) _
                = Just l
          f _ r = r
 
@@ -753,6 +753,7 @@ allocate platform ret_off live stackmap@StackMap{ sm_sp = sp0
                        select_save to_save (slot:stack)
                  -> let assig = CmmStore (CmmStackSlot Old n')
                                          (CmmReg (CmmLocal r))
+                                         NaturallyAligned
                         n' = plusW platform n 1
                    in
                         (to_save', stack', n', assig : assigs, (r,(r,n')):regs)
@@ -787,6 +788,7 @@ allocate platform ret_off live stackmap@StackMap{ sm_sp = sp0
                   n' = n + localRegBytes platform r
                   assig = CmmStore (CmmStackSlot Old n')
                                    (CmmReg (CmmLocal r))
+                                   NaturallyAligned
 
        trim_sp
           | not (null push_regs) = push_sp
@@ -822,7 +824,7 @@ allocate platform ret_off live stackmap@StackMap{ sm_sp = sp0
 -- middle_post, because the Sp adjustment intervenes.
 --
 manifestSp
-   :: DynFlags
+   :: CmmConfig
    -> LabelMap StackMap  -- StackMaps for other blocks
    -> StackMap           -- StackMap for this block
    -> ByteOff            -- Sp on entry to the block
@@ -834,18 +836,18 @@ manifestSp
    -> [CmmBlock]         -- new blocks
    -> [CmmBlock]         -- final blocks with Sp manifest
 
-manifestSp dflags stackmaps stack0 sp0 sp_high
+manifestSp cfg stackmaps stack0 sp0 sp_high
            first middle_pre sp_off last fixup_blocks
   = final_block : fixup_blocks'
   where
     area_off = getAreaOff stackmaps
-    platform = targetPlatform dflags
+    platform = cmmPlatform cfg
 
     adj_pre_sp, adj_post_sp :: CmmNode e x -> CmmNode e x
     adj_pre_sp  = mapExpDeep (areaToSp platform sp0            sp_high area_off)
     adj_post_sp = mapExpDeep (areaToSp platform (sp0 - sp_off) sp_high area_off)
 
-    final_middle = maybeAddSpAdj dflags sp0 sp_off
+    final_middle = maybeAddSpAdj cfg sp0 sp_off
                  . blockFromList
                  . map adj_pre_sp
                  . elimStackStores stack0 stackmaps area_off
@@ -865,11 +867,12 @@ getAreaOff stackmaps (Young l) =
 
 
 maybeAddSpAdj
-  :: DynFlags -> ByteOff -> ByteOff -> Block CmmNode O O -> Block CmmNode O O
-maybeAddSpAdj dflags sp0 sp_off block =
+  :: CmmConfig -> ByteOff -> ByteOff -> Block CmmNode O O -> Block CmmNode O O
+maybeAddSpAdj cfg sp0 sp_off block =
   add_initial_unwind $ add_adj_unwind $ adj block
   where
-    platform = targetPlatform dflags
+    platform             = cmmPlatform            cfg
+    do_stk_unwinding_gen = cmmGenStackUnwindInstr cfg
     adj block
       | sp_off /= 0
       = block `blockSnoc` CmmAssign spReg (cmmOffset platform spExpr sp_off)
@@ -877,7 +880,7 @@ maybeAddSpAdj dflags sp0 sp_off block =
     -- Add unwind pseudo-instruction at the beginning of each block to
     -- document Sp level for debugging
     add_initial_unwind block
-      | debugLevel dflags > 0
+      | do_stk_unwinding_gen
       = CmmUnwind [(Sp, Just sp_unwind)] `blockCons` block
       | otherwise
       = block
@@ -886,7 +889,7 @@ maybeAddSpAdj dflags sp0 sp_off block =
     -- Add unwind pseudo-instruction right after the Sp adjustment
     -- if there is one.
     add_adj_unwind block
-      | debugLevel dflags > 0
+      | do_stk_unwinding_gen
       , sp_off /= 0
       = block `blockSnoc` CmmUnwind [(Sp, Just sp_unwind)]
       | otherwise
@@ -894,7 +897,7 @@ maybeAddSpAdj dflags sp0 sp_off block =
       where sp_unwind = CmmRegOff spReg (sp0 - platformWordSizeInBytes platform - sp_off)
 
 {- Note [SP old/young offsets]
-
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Sp(L) is the Sp offset on entry to block L relative to the base of the
 OLD area.
 
@@ -995,7 +998,7 @@ elimStackStores stackmap stackmaps area_off nodes
     go _stackmap [] = []
     go stackmap (n:ns)
      = case n of
-         CmmStore (CmmStackSlot area m) (CmmReg (CmmLocal r))
+         CmmStore (CmmStackSlot area m) (CmmReg (CmmLocal r)) _
             | Just (_,off) <- lookupUFM (sm_regs stackmap) r
             , area_off area + m == off
             -> go stackmap ns
@@ -1018,7 +1021,7 @@ setInfoTableStackMap platform stackmaps (CmmProc top_info@TopInfo{..} l v g)
     get_liveness :: BlockId -> Liveness
     get_liveness lbl
       = case mapLookup lbl stackmaps of
-          Nothing -> pprPanic "setInfoTableStackMap" (ppr lbl <+> ppr info_tbls)
+          Nothing -> pprPanic "setInfoTableStackMap" (ppr lbl <+> pdoc platform info_tbls)
           Just sm -> stackMapToLiveness platform sm
 
 setInfoTableStackMap _ _ d = d
@@ -1040,30 +1043,29 @@ stackMapToLiveness platform StackMap{..} =
 -- -----------------------------------------------------------------------------
 
 insertReloadsAsNeeded
-    :: DynFlags
+    :: Platform
     -> ProcPointSet
     -> LabelMap StackMap
     -> BlockId
     -> [CmmBlock]
     -> UniqSM [CmmBlock]
-insertReloadsAsNeeded dflags procpoints final_stackmaps entry blocks = do
+insertReloadsAsNeeded platform procpoints final_stackmaps entry blocks =
     toBlockList . fst <$>
         rewriteCmmBwd liveLattice rewriteCC (ofBlockList entry blocks) mapEmpty
   where
     rewriteCC :: RewriteFun CmmLocalLive
     rewriteCC (BlockCC e_node middle0 x_node) fact_base0 = do
         let entry_label = entryLabel e_node
-            platform = targetPlatform dflags
             stackmap = case mapLookup entry_label final_stackmaps of
                 Just sm -> sm
                 Nothing -> panic "insertReloadsAsNeeded: rewriteCC: stackmap"
 
             -- Merge the liveness from successor blocks and analyse the last
             -- node.
-            joined = gen_kill dflags x_node $!
+            joined = gen_kill platform x_node $!
                          joinOutFacts liveLattice x_node fact_base0
             -- What is live at the start of middle0.
-            live_at_middle0 = foldNodesBwdOO (gen_kill dflags) middle0 joined
+            live_at_middle0 = foldNodesBwdOO (gen_kill platform) middle0 joined
 
             -- If this is a procpoint we need to add the reloads, but only if
             -- they're actually live. Furthermore, nothing is live at the entry
@@ -1086,7 +1088,8 @@ insertReloads platform stackmap live =
                  -- This cmmOffset basically corresponds to manifesting
                  -- @CmmStackSlot Old sp_off@, see Note [SP old/young offsets]
                  (CmmLoad (cmmOffset platform spExpr (sp_off - reg_off))
-                          (localRegType reg))
+                          (localRegType reg)
+                          NaturallyAligned)
      | (reg, reg_off) <- stackSlotRegs stackmap
      , reg `elemRegSet` live
      ]
@@ -1098,7 +1101,7 @@ insertReloads platform stackmap live =
 
 {-
 Note [Lower safe foreign calls]
-
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 We start with
 
    Sp[young(L1)] = L1
@@ -1131,18 +1134,18 @@ expecting them (see Note [safe foreign call convention]). Note also
 that safe foreign call is replace by an unsafe one in the Cmm graph.
 -}
 
-lowerSafeForeignCall :: DynFlags -> CmmBlock -> UniqSM CmmBlock
-lowerSafeForeignCall dflags block
+lowerSafeForeignCall :: Profile -> CmmBlock -> UniqSM CmmBlock
+lowerSafeForeignCall profile block
   | (entry@(CmmEntry _ tscp), middle, CmmForeignCall { .. }) <- blockSplit block
   = do
-    let platform = targetPlatform dflags
+    let platform = profilePlatform profile
     -- Both 'id' and 'new_base' are KindNonPtr because they're
     -- RTS-only objects and are not subject to garbage collection
     id <- newTemp (bWord platform)
     new_base <- newTemp (cmmRegType platform baseReg)
-    let (caller_save, caller_load) = callerSaveVolatileRegs dflags
-    save_state_code <- saveThreadState dflags
-    load_state_code <- loadThreadState dflags
+    let (caller_save, caller_load) = callerSaveVolatileRegs platform
+    save_state_code <- saveThreadState profile
+    load_state_code <- loadThreadState profile
     let suspend = save_state_code  <*>
                   caller_save <*>
                   mkMiddle (callSuspendThread platform id intrbl)
@@ -1155,7 +1158,7 @@ lowerSafeForeignCall dflags block
                   load_state_code
 
         (_, regs, copyout) =
-             copyOutOflow dflags NativeReturn Jump (Young succ)
+             copyOutOflow profile NativeReturn Jump (Young succ)
                             (map (CmmReg . CmmLocal) res)
                             ret_off []
 
@@ -1165,7 +1168,7 @@ lowerSafeForeignCall dflags block
         -- different.  Hence we continue by jumping to the top stack frame,
         -- not by jumping to succ.
         jump = CmmCall { cml_target    = entryCode platform $
-                                         CmmLoad spExpr (bWord platform)
+                                         cmmLoadBWord platform spExpr
                        , cml_cont      = Just succ
                        , cml_args_regs = regs
                        , cml_args      = widthInBytes (wordWidth platform)
@@ -1187,21 +1190,14 @@ lowerSafeForeignCall dflags block
   | otherwise = return block
 
 
-foreignLbl :: FastString -> CmmExpr
-foreignLbl name = CmmLit (CmmLabel (mkForeignLabel name Nothing ForeignLabelInExternalPackage IsFunction))
-
 callSuspendThread :: Platform -> LocalReg -> Bool -> CmmNode O O
 callSuspendThread platform id intrbl =
-  CmmUnsafeForeignCall
-       (ForeignTarget (foreignLbl (fsLit "suspendThread"))
-        (ForeignConvention CCallConv [AddrHint, NoHint] [AddrHint] CmmMayReturn))
+  CmmUnsafeForeignCall (PrimTarget MO_SuspendThread)
        [id] [baseExpr, mkIntExpr platform (fromEnum intrbl)]
 
 callResumeThread :: LocalReg -> LocalReg -> CmmNode O O
 callResumeThread new_base id =
-  CmmUnsafeForeignCall
-       (ForeignTarget (foreignLbl (fsLit "resumeThread"))
-            (ForeignConvention CCallConv [AddrHint] [AddrHint] CmmMayReturn))
+  CmmUnsafeForeignCall (PrimTarget MO_ResumeThread)
        [new_base] [CmmReg (CmmLocal id)]
 
 -- -----------------------------------------------------------------------------

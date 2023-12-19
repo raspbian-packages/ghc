@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, GADTs, ViewPatterns #-}
+{-# LANGUAGE GADTs, ViewPatterns #-}
 
 -- | The @FamInst@ type: family instance heads
 module GHC.Tc.Instance.Family (
@@ -14,41 +14,54 @@ module GHC.Tc.Instance.Family (
 
 import GHC.Prelude
 
-import GHC.Driver.Types
+import GHC.Driver.Session
+import GHC.Driver.Env
+
 import GHC.Core.FamInstEnv
 import GHC.Core.InstEnv( roughMatchTcs )
 import GHC.Core.Coercion
-import GHC.Tc.Types.Evidence
-import GHC.Iface.Load
-import GHC.Tc.Utils.Monad
-import GHC.Tc.Utils.Instantiate( freshenTyVarBndrs, freshenCoVarBndrsX )
-import GHC.Types.SrcLoc as SrcLoc
 import GHC.Core.TyCon
-import GHC.Tc.Utils.TcType
 import GHC.Core.Coercion.Axiom
-import GHC.Driver.Session
-import GHC.Unit.Module
-import GHC.Utils.Outputable
-import GHC.Utils.Misc
-import GHC.Types.Name.Reader
 import GHC.Core.DataCon ( dataConName )
-import GHC.Data.Maybe
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCo.FVs
-import GHC.Core.TyCo.Ppr ( pprWithExplicitKindsWhen )
+
+import GHC.Iface.Load
+
+import GHC.Tc.Errors.Types
+import GHC.Tc.Types.Evidence
+import GHC.Tc.Utils.Monad
+import GHC.Tc.Utils.Instantiate( freshenTyVarBndrs, freshenCoVarBndrsX )
+import GHC.Tc.Utils.TcType
+
+import GHC.Unit.External
+import GHC.Unit.Module
+import GHC.Unit.Module.ModIface
+import GHC.Unit.Module.ModDetails
+import GHC.Unit.Module.Deps
+import GHC.Unit.Home.ModInfo
+
+import GHC.Types.SrcLoc as SrcLoc
+import GHC.Types.Name.Reader
 import GHC.Types.Name
-import GHC.Utils.Panic
 import GHC.Types.Var.Set
+
+import GHC.Utils.Outputable
+import GHC.Utils.Misc
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
 import GHC.Utils.FV
+
 import GHC.Data.Bag( Bag, unionBags, unitBag )
+import GHC.Data.Maybe
+
 import Control.Monad
-import Data.List ( sortBy )
 import Data.List.NonEmpty ( NonEmpty(..) )
+import qualified Data.List.NonEmpty as NE
 import Data.Function ( on )
 
 import qualified GHC.LanguageExtensions  as LangExt
-
-#include "HsVersions.h"
+import GHC.Unit.Env (unitEnv_hpts)
 
 {- Note [The type family instance consistency story]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -215,7 +228,7 @@ two modules are consistent--because we checked that when we compiled M.
 
 For every other pair of family instance modules we import (directly or
 indirectly), we check that they are consistent now. (So that we can be
-certain that the modules in our `GHC.Driver.Types.dep_finsts' are consistent.)
+certain that the modules in our `GHC.Driver.Env.dep_finsts' are consistent.)
 
 There is some fancy footwork regarding hs-boot module loops, see
 Note [Don't check hs-boot type family instances too early]
@@ -281,14 +294,14 @@ This is basically the idea from #13092, comment:14.
 -- See Note [The type family instance consistency story].
 checkFamInstConsistency :: [Module] -> TcM ()
 checkFamInstConsistency directlyImpMods
-  = do { (eps, hpt) <- getEpsAndHpt
+  = do { (eps, hug) <- getEpsAndHug
        ; traceTc "checkFamInstConsistency" (ppr directlyImpMods)
        ; let { -- Fetch the iface of a given module.  Must succeed as
                -- all directly imported modules must already have been loaded.
                modIface mod =
-                 case lookupIfaceByModule hpt (eps_PIT eps) mod of
+                 case lookupIfaceByModule hug (eps_PIT eps) mod of
                    Nothing    -> panicDoc "FamInst.checkFamInstConsistency"
-                                          (ppr mod $$ pprHPT hpt)
+                                          (ppr mod $$ ppr hug)
                    Just iface -> iface
 
                -- Which family instance modules were checked for consistency
@@ -306,7 +319,8 @@ checkFamInstConsistency directlyImpMods
              ; hmiFamInstEnv = extendFamInstEnvList emptyFamInstEnv
                                . md_fam_insts . hm_details
              ; hpt_fam_insts = mkModuleEnv [ (hmiModule hmi, hmiFamInstEnv hmi)
-                                           | hmi <- eltsHpt hpt]
+                                           | hpt <- unitEnv_hpts hug
+                                           , hmi <- eltsHpt hpt ]
 
              }
 
@@ -498,7 +512,7 @@ tcLookupDataFamInst_maybe fam_inst_envs tc tc_args
   , let rep_tc = dataFamInstRepTyCon rep_fam
         co     = mkUnbranchedAxInstCo Representational ax rep_args
                                       (mkCoVarCos cvs)
-  = ASSERT( null rep_cos ) -- See Note [Constrained family instances] in GHC.Core.FamInstEnv
+  = assert (null rep_cos) $ -- See Note [Constrained family instances] in GHC.Core.FamInstEnv
     Just (rep_tc, rep_args, co)
 
   | otherwise
@@ -510,7 +524,7 @@ tcLookupDataFamInst_maybe fam_inst_envs tc tc_args
 -- It is only used by the type inference engine (specifically, when
 -- solving representational equality), and hence it is careful to unwrap
 -- only if the relevant data constructor is in scope.  That's why
--- it get a GlobalRdrEnv argument.
+-- it gets a GlobalRdrEnv argument.
 --
 -- It is careful not to unwrap data/newtype instances if it can't
 -- continue unwrapping.  Such care is necessary for proper error
@@ -519,7 +533,7 @@ tcLookupDataFamInst_maybe fam_inst_envs tc tc_args
 -- It does not look through type families.
 -- It does not normalise arguments to a tycon.
 --
--- If the result is Just (rep_ty, (co, gres), rep_ty), then
+-- If the result is Just ((gres, co), rep_ty), then
 --    co : ty ~R rep_ty
 --    gres are the GREs for the data constructors that
 --                          had to be in scope
@@ -686,7 +700,7 @@ checkForConflicts :: FamInstEnvs -> FamInst -> TcM ()
 checkForConflicts inst_envs fam_inst
   = do { let conflicts = lookupFamInstEnvConflicts inst_envs fam_inst
        ; traceTc "checkForConflicts" $
-         vcat [ ppr (map fim_instance conflicts)
+         vcat [ ppr conflicts
               , ppr fam_inst
               -- , ppr inst_envs
          ]
@@ -739,7 +753,7 @@ reportInjectivityErrors
    -> [Bool]       -- ^ Injectivity annotation
    -> TcM ()
 reportInjectivityErrors dflags fi_ax axiom inj
-  = ASSERT2( any id inj, text "No injective type variables" )
+  = assertPpr (any id inj) (text "No injective type variables") $
     do let lhs             = coAxBranchLHS axiom
            rhs             = coAxBranchRHS axiom
            fam_tc          = coAxiomTyCon fi_ax
@@ -893,8 +907,8 @@ unusedInjTvsInRHS :: DynFlags
                   -> [Type] -- LHS arguments
                   -> Type   -- the RHS
                   -> ( TyVarSet
-                     , Bool   -- True <=> one or more variable is used invisibly
-                     , Bool ) -- True <=> suggest -XUndecidableInstances
+                     , HasKinds                     -- YesHasKinds <=> one or more variable is used invisibly
+                     , SuggestUndecidableInstances) -- YesSuggestUndecidableInstaces <=> suggest -XUndecidableInstances
 -- See Note [Verifying injectivity annotation] in GHC.Core.FamInstEnv.
 -- This function implements check (4) described there, further
 -- described in Note [Coverage condition for injective type families].
@@ -905,7 +919,7 @@ unusedInjTvsInRHS :: DynFlags
 -- precise names of variables that are not mentioned in the RHS.
 unusedInjTvsInRHS dflags tycon@(tyConInjectivityInfo -> Injective inj_list) lhs rhs =
   -- Note [Coverage condition for injective type families], step 5
-  (bad_vars, any_invisible, suggest_undec)
+  (bad_vars, hasKinds any_invisible, suggestUndecidableInstances suggest_undec)
     where
       undec_inst = xopt LangExt.UndecidableInstances dflags
 
@@ -926,7 +940,7 @@ unusedInjTvsInRHS dflags tycon@(tyConInjectivityInfo -> Injective inj_list) lhs 
                       (lhs_vars `subVarSet` fvVarSet (injectiveVarsOfType True rhs))
 
 -- When the type family is not injective in any arguments
-unusedInjTvsInRHS _ _ _ _ = (emptyVarSet, False, False)
+unusedInjTvsInRHS _ _ _ _ = (emptyVarSet, NoHasKinds, NoSuggestUndecidableInstaces)
 
 ---------------------------------------
 -- Producing injectivity error messages
@@ -937,90 +951,58 @@ unusedInjTvsInRHS _ _ _ _ = (emptyVarSet, False, False)
 reportConflictingInjectivityErrs :: TyCon -> [CoAxBranch] -> CoAxBranch -> TcM ()
 reportConflictingInjectivityErrs _ [] _ = return ()
 reportConflictingInjectivityErrs fam_tc (confEqn1:_) tyfamEqn
-  = addErrs [buildInjectivityError fam_tc herald (confEqn1 :| [tyfamEqn])]
-  where
-    herald = text "Type family equation right-hand sides overlap; this violates" $$
-             text "the family's injectivity annotation:"
-
--- | Injectivity error herald common to all injectivity errors.
-injectivityErrorHerald :: SDoc
-injectivityErrorHerald =
-  text "Type family equation violates the family's injectivity annotation."
-
+  = addErrs [buildInjectivityError (TcRnFamInstNotInjective InjErrRhsOverlap)
+                                   fam_tc
+                                   (confEqn1 :| [tyfamEqn])]
 
 -- | Report error message for equation with injective type variables unused in
 -- the RHS. Note [Coverage condition for injective type families], step 6
 reportUnusedInjectiveVarsErr :: TyCon
                              -> TyVarSet
-                             -> Bool   -- True <=> print invisible arguments
-                             -> Bool   -- True <=> suggest -XUndecidableInstances
+                             -> HasKinds                    -- YesHasKinds <=> print invisible arguments
+                             -> SuggestUndecidableInstances -- YesSuggestUndecidableInstaces <=> suggest -XUndecidableInstances
                              -> CoAxBranch
                              -> TcM ()
 reportUnusedInjectiveVarsErr fam_tc tvs has_kinds undec_inst tyfamEqn
-  = let (loc, doc) = buildInjectivityError fam_tc
-                                  (injectivityErrorHerald $$
-                                   herald $$
-                                   text "In the type family equation:")
-                                  (tyfamEqn :| [])
-    in addErrAt loc (pprWithExplicitKindsWhen has_kinds doc)
-    where
-      herald = sep [ what <+> text "variable" <>
-                  pluralVarSet tvs <+> pprVarSet tvs (pprQuotedList . scopedSort)
-                , text "cannot be inferred from the right-hand side." ]
-               $$ extra
-
-      what | has_kinds = text "Type/kind"
-           | otherwise = text "Type"
-
-      extra | undec_inst = text "Using UndecidableInstances might help"
-            | otherwise  = empty
+  = let reason     = InjErrCannotInferFromRhs tvs has_kinds undec_inst
+        (loc, dia) = buildInjectivityError (TcRnFamInstNotInjective reason) fam_tc (tyfamEqn :| [])
+    in addErrAt loc dia
 
 -- | Report error message for equation that has a type family call at the top
 -- level of RHS
 reportTfHeadedErr :: TyCon -> CoAxBranch -> TcM ()
 reportTfHeadedErr fam_tc branch
-  = addErrs [buildInjectivityError fam_tc
-               (injectivityErrorHerald $$
-                 text "RHS of injective type family equation cannot" <+>
-                 text "be a type family:")
-               (branch :| [])]
+  = addErrs [buildInjectivityError (TcRnFamInstNotInjective InjErrRhsCannotBeATypeFam)
+                                   fam_tc
+                                   (branch :| [])]
 
 -- | Report error message for equation that has a bare type variable in the RHS
 -- but LHS pattern is not a bare type variable.
 reportBareVariableInRHSErr :: TyCon -> [Type] -> CoAxBranch -> TcM ()
 reportBareVariableInRHSErr fam_tc tys branch
-  = addErrs [buildInjectivityError fam_tc
-                 (injectivityErrorHerald $$
-                  text "RHS of injective type family equation is a bare" <+>
-                  text "type variable" $$
-                  text "but these LHS type and kind patterns are not bare" <+>
-                  text "variables:" <+> pprQuotedList tys)
-                 (branch :| [])]
+  = addErrs [buildInjectivityError (TcRnFamInstNotInjective (InjErrRhsBareTyVar tys))
+                                   fam_tc
+                                   (branch :| [])]
 
-buildInjectivityError :: TyCon -> SDoc -> NonEmpty CoAxBranch -> (SrcSpan, SDoc)
-buildInjectivityError fam_tc herald (eqn1 :| rest_eqns)
-  = ( coAxBranchSpan eqn1
-    , hang herald
-         2 (vcat (map (pprCoAxBranchUser fam_tc) (eqn1 : rest_eqns))) )
+buildInjectivityError :: (TyCon -> NonEmpty CoAxBranch -> TcRnMessage)
+                      -> TyCon
+                      -> NonEmpty CoAxBranch
+                      -> (SrcSpan, TcRnMessage)
+buildInjectivityError mkErr fam_tc branches
+  = ( coAxBranchSpan (NE.head branches), mkErr fam_tc branches )
 
-reportConflictInstErr :: FamInst -> [FamInstMatch] -> TcRn ()
+reportConflictInstErr :: FamInst -> [FamInst] -> TcRn ()
 reportConflictInstErr _ []
   = return ()  -- No conflicts
-reportConflictInstErr fam_inst (match1 : _)
-  | FamInstMatch { fim_instance = conf_inst } <- match1
-  , let sorted  = sortBy (SrcLoc.leftmost_smallest `on` getSpan) [fam_inst, conf_inst]
-        fi1     = head sorted
-        span    = coAxBranchSpan (coAxiomSingleBranch (famInstAxiom fi1))
-  = setSrcSpan span $ addErr $
-    hang (text "Conflicting family instance declarations:")
-       2 (vcat [ pprCoAxBranchUser (coAxiomTyCon ax) (coAxiomSingleBranch ax)
-               | fi <- sorted
-               , let ax = famInstAxiom fi ])
- where
-   getSpan = getSrcSpan . famInstAxiom
+reportConflictInstErr fam_inst (conf_inst : _) =
    -- The sortBy just arranges that instances are displayed in order
    -- of source location, which reduced wobbling in error messages,
    -- and is better for users
+  let   sorted  = NE.sortBy (SrcLoc.leftmost_smallest `on` getSpan) (fam_inst NE.:| [conf_inst])
+        fi1     = NE.head sorted
+        span    = coAxBranchSpan (coAxiomSingleBranch (famInstAxiom fi1))
+        getSpan = getSrcSpan . famInstAxiom
+  in setSrcSpan span $ addErr $ TcRnConflictingFamInstDecls sorted
 
 tcGetFamInstEnvs :: TcM FamInstEnvs
 -- Gets both the external-package inst-env

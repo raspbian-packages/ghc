@@ -1,5 +1,42 @@
 # Changelog for [`template-haskell` package](http://hackage.haskell.org/package/template-haskell)
 
+## 2.19.0.0
+
+  * Add `DefaultD` constructor to support Haskell `default` declarations.
+
+  * Add support for Overloaded Record Dot.
+    Introduces `getFieldE :: Quote m => m Exp -> String -> m Exp` and
+    `projectionE :: Quote m => [String] -> m Exp`.
+  * Add `instance Lift ByteArray`.
+
+  * Add `PromotedInfixT` and `PromotedUInfixT`, which are analogs to `InfixT`
+    and `UInfixT` that ensure that if a dynamically bound name (i.e. a name
+    with `NameFlavour` `NameS` or `NameQ`; the flavours produced by `mkName`)
+    is used as operator, it will be bound to a promoted data constructor rather
+    than a type constructor, if both are in scope.
+
+  * Add a `vendor-filepath` Cabal flag to the `template-haskell` package. If
+    this flag is set then `template-haskell` will not depend on the `filepath`
+    package and will instead use  some modules from `filepath` that have been
+    copied into the  `template-haskell` source tree.
+
+## 2.18.0.0
+  * The types of `ConP` and `conP` have been changed to allow for an additional list
+    of type applications preceding the argument patterns.
+
+  * Add support for the `Char` kind (#11342): we extend the `TyLit` data type with
+    the constructor `CharTyLit` that reflects type-level characters.
+
+  * Add `putDoc` and `getDoc` which allow Haddock documentation to be attached
+    to module headers, declarations, function arguments and instances, as well
+    as queried. These are quite low level operations, so for convenience there
+    are several combinators that can be used with `Dec`s directly, including
+    `withDecDoc`/`withDecsDoc` as well as `_doc` counterparts to many of the
+    `Dec` helper functions.
+
+  * Add `newDeclarationGroup` to document the effect of visibility while
+    reifying types and instances.
+
 ## 2.17.0.0
   * Typed Quotations now return a value of type `Code m a` (GHC Proposal #195).
     The main motiviation is to make writing instances easier and make it easier to

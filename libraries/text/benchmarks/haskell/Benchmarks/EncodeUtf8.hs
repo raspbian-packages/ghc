@@ -10,8 +10,10 @@ module Benchmarks.EncodeUtf8
     ( benchmark
     ) where
 
-import Test.Tasty.Bench (Benchmark, bgroup, bench, whnf)
+import Test.Tasty.Bench (Benchmark, bgroup, bench, nf, whnf)
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Builder as B
+import qualified Data.ByteString.Builder.Prim as BP
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
@@ -20,9 +22,11 @@ import qualified Data.Text.Lazy.Encoding as TL
 
 benchmark :: String -> String -> Benchmark
 benchmark name string =
-    bgroup "EncodeUtf8"
-        [ bench ("Text (" ++ name ++ ")")     $ whnf (B.length . T.encodeUtf8)   text
-        , bench ("LazyText (" ++ name ++ ")") $ whnf (BL.length . TL.encodeUtf8) lazyText
+    bgroup name
+        [ bench "Text"     $ whnf (B.length . T.encodeUtf8)   text
+        , bench "LazyText" $ whnf (BL.length . TL.encodeUtf8) lazyText
+        , bench "Text/encodeUtf8Builder" $ nf (B.toLazyByteString . T.encodeUtf8Builder) text
+        , bench "Text/encodeUtf8BuilderEscaped" $ nf (B.toLazyByteString . T.encodeUtf8BuilderEscaped (BP.liftFixedToBounded BP.word8)) text
         ]
   where
     -- The string in different formats

@@ -5,7 +5,8 @@ module GHC.Cmm.Type
     , cmmBits, cmmFloat
     , typeWidth, cmmEqType, cmmEqType_ignoring_ptrhood
     , isFloatType, isGcPtrType, isBitsType
-    , isWord32, isWord64, isFloat64, isFloat32
+    , isWordAny, isWord32, isWord64
+    , isFloat64, isFloat32
 
     , Width(..)
     , widthInBits, widthInBytes, widthInLog, widthFromBytes
@@ -25,6 +26,8 @@ module GHC.Cmm.Type
     , cmmVec
     , vecLength, vecElemType
     , isVecType
+
+    , DoAlignSanitisation
    )
 where
 
@@ -32,9 +35,8 @@ where
 import GHC.Prelude
 
 import GHC.Platform
-import GHC.Driver.Session
-import GHC.Data.FastString
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
 
 import Data.Word
 import Data.Int
@@ -50,14 +52,15 @@ import Data.Int
   -- and is used extensively in pattern-matching
 
 data CmmType    -- The important one!
-  = CmmType CmmCat Width
+  = CmmType CmmCat !Width
+  deriving Show
 
 data CmmCat                -- "Category" (not exported)
    = GcPtrCat              -- GC pointer
    | BitsCat               -- Non-pointer
    | FloatCat              -- Float
    | VecCat Length CmmCat  -- Vector
-   deriving( Eq )
+   deriving( Eq, Show )
         -- See Note [Signed vs unsigned] at the end
 
 instance Outputable CmmType where
@@ -130,8 +133,8 @@ bHalfWord platform = cmmBits (halfWordWidth platform)
 gcWord :: Platform -> CmmType
 gcWord platform = CmmType GcPtrCat (wordWidth platform)
 
-cInt :: DynFlags -> CmmType
-cInt dflags = cmmBits (cIntWidth  dflags)
+cInt :: Platform -> CmmType
+cInt platform = cmmBits (cIntWidth platform)
 
 ------------ Predicates ----------------
 isFloatType, isGcPtrType, isBitsType :: CmmType -> Bool
@@ -144,9 +147,14 @@ isGcPtrType _other               = False
 isBitsType (CmmType BitsCat _) = True
 isBitsType _                   = False
 
-isWord32, isWord64, isFloat32, isFloat64 :: CmmType -> Bool
+isWordAny, isWord32, isWord64,
+  isFloat32, isFloat64 :: CmmType -> Bool
 -- isWord64 is true of 64-bit non-floats (both gc-ptrs and otherwise)
 -- isFloat32 and 64 are obvious
+
+isWordAny (CmmType BitsCat  _) = True
+isWordAny (CmmType GcPtrCat _) = True
+isWordAny _other               = False
 
 isWord64 (CmmType BitsCat  W64) = True
 isWord64 (CmmType GcPtrCat W64) = True
@@ -166,42 +174,47 @@ isFloat64 _other                 = False
 --              Width
 -----------------------------------------------------------------------------
 
-data Width   = W8 | W16 | W32 | W64
-             | W128
-             | W256
-             | W512
-             deriving (Eq, Ord, Show)
+data Width
+  = W8
+  | W16
+  | W32
+  | W64
+  | W128
+  | W256
+  | W512
+  deriving (Eq, Ord, Show)
 
 instance Outputable Width where
-   ppr rep = ptext (mrStr rep)
-
-mrStr :: Width -> PtrString
-mrStr = sLit . show
-
+   ppr rep = text (show rep)
 
 -------- Common Widths  ------------
+
+-- | The width of the current platform's word size.
 wordWidth :: Platform -> Width
 wordWidth platform = case platformWordSize platform of
  PW4 -> W32
  PW8 -> W64
 
+-- | The width of the current platform's half-word size.
 halfWordWidth :: Platform -> Width
 halfWordWidth platform = case platformWordSize platform of
  PW4 -> W16
  PW8 -> W32
 
+-- | A bit-mask for the lower half-word of current platform.
 halfWordMask :: Platform -> Integer
 halfWordMask platform = case platformWordSize platform of
  PW4 -> 0xFFFF
  PW8 -> 0xFFFFFFFF
 
 -- cIntRep is the Width for a C-language 'int'
-cIntWidth :: DynFlags -> Width
-cIntWidth dflags = case cINT_SIZE dflags of
+cIntWidth :: Platform -> Width
+cIntWidth platform = case pc_CINT_SIZE (platformConstants platform) of
                    4 -> W32
                    8 -> W64
                    s -> panic ("cIntWidth: Unknown cINT_SIZE: " ++ show s)
 
+-- | A width in bits.
 widthInBits :: Width -> Int
 widthInBits W8   = 8
 widthInBits W16  = 16
@@ -211,7 +224,9 @@ widthInBits W128 = 128
 widthInBits W256 = 256
 widthInBits W512 = 512
 
-
+-- | A width in bytes.
+--
+-- > widthFromBytes (widthInBytes w) === w
 widthInBytes :: Width -> Int
 widthInBytes W8   = 1
 widthInBytes W16  = 2
@@ -222,6 +237,7 @@ widthInBytes W256 = 32
 widthInBytes W512 = 64
 
 
+-- | *Partial* A width from the number of bytes.
 widthFromBytes :: Int -> Width
 widthFromBytes 1  = W8
 widthFromBytes 2  = W16
@@ -233,7 +249,7 @@ widthFromBytes 64 = W512
 
 widthFromBytes n  = pprPanic "no width for given number of bytes" (ppr n)
 
--- log_2 of the width in bytes, useful for generating shifts.
+-- | log_2 of the width in bytes, useful for generating shifts.
 widthInLog :: Width -> Int
 widthInLog W8   = 0
 widthInLog W16  = 1
@@ -246,6 +262,20 @@ widthInLog W512 = 6
 
 -- widening / narrowing
 
+-- | Narrow a signed or unsigned value to the given width. The result will
+-- reside in @[0, +2^width)@.
+--
+-- >>> narrowU W8 256    == 256
+-- >>> narrowU W8 255    == 255
+-- >>> narrowU W8 128    == 128
+-- >>> narrowU W8 127    == 127
+-- >>> narrowU W8 0      == 0
+-- >>> narrowU W8 (-127) == 129
+-- >>> narrowU W8 (-128) == 128
+-- >>> narrowU W8 (-129) == 127
+-- >>> narrowU W8 (-255) == 1
+-- >>> narrowU W8 (-256) == 0
+--
 narrowU :: Width -> Integer -> Integer
 narrowU W8  x = fromIntegral (fromIntegral x :: Word8)
 narrowU W16 x = fromIntegral (fromIntegral x :: Word16)
@@ -253,6 +283,20 @@ narrowU W32 x = fromIntegral (fromIntegral x :: Word32)
 narrowU W64 x = fromIntegral (fromIntegral x :: Word64)
 narrowU _ _ = panic "narrowTo"
 
+-- | Narrow a signed value to the given width. The result will reside
+-- in @[-2^(width-1), +2^(width-1))@.
+--
+-- >>> narrowS W8 256    == 0
+-- >>> narrowS W8 255    == -1
+-- >>> narrowS W8 128    == -128
+-- >>> narrowS W8 127    == 127
+-- >>> narrowS W8 0      == 0
+-- >>> narrowS W8 (-127) == -127
+-- >>> narrowS W8 (-128) == -128
+-- >>> narrowS W8 (-129) == 127
+-- >>> narrowS W8 (-255) == 1
+-- >>> narrowS W8 (-256) == 0
+--
 narrowS :: Width -> Integer -> Integer
 narrowS W8  x = fromIntegral (fromIntegral x :: Int8)
 narrowS W16 x = fromIntegral (fromIntegral x :: Int16)
@@ -311,6 +355,8 @@ isVecType _                       = False
 -- Hints are extra type information we attach to the arguments and
 -- results of a foreign call, where more type information is sometimes
 -- needed by the ABI to make the correct kind of call.
+--
+-- See Note [Signed vs unsigned] for one case where this is used.
 
 data ForeignHint
   = NoHint | AddrHint | SignedHint
@@ -323,25 +369,25 @@ data ForeignHint
 -- These don't really belong here, but I don't know where is best to
 -- put them.
 
-rEP_CostCentreStack_mem_alloc :: DynFlags -> CmmType
-rEP_CostCentreStack_mem_alloc dflags
+rEP_CostCentreStack_mem_alloc :: Platform -> CmmType
+rEP_CostCentreStack_mem_alloc platform
     = cmmBits (widthFromBytes (pc_REP_CostCentreStack_mem_alloc pc))
-    where pc = platformConstants dflags
+    where pc = platformConstants platform
 
-rEP_CostCentreStack_scc_count :: DynFlags -> CmmType
-rEP_CostCentreStack_scc_count dflags
+rEP_CostCentreStack_scc_count :: Platform -> CmmType
+rEP_CostCentreStack_scc_count platform
     = cmmBits (widthFromBytes (pc_REP_CostCentreStack_scc_count pc))
-    where pc = platformConstants dflags
+    where pc = platformConstants platform
 
-rEP_StgEntCounter_allocs :: DynFlags -> CmmType
-rEP_StgEntCounter_allocs dflags
+rEP_StgEntCounter_allocs :: Platform -> CmmType
+rEP_StgEntCounter_allocs platform
     = cmmBits (widthFromBytes (pc_REP_StgEntCounter_allocs pc))
-    where pc = platformConstants dflags
+    where pc = platformConstants platform
 
-rEP_StgEntCounter_allocd :: DynFlags -> CmmType
-rEP_StgEntCounter_allocd dflags
+rEP_StgEntCounter_allocd :: Platform -> CmmType
+rEP_StgEntCounter_allocd platform
     = cmmBits (widthFromBytes (pc_REP_StgEntCounter_allocd pc))
-    where pc = platformConstants dflags
+    where pc = platformConstants platform
 
 -------------------------------------------------------------------------
 {-      Note [Signed vs unsigned]
@@ -428,3 +474,5 @@ this, the cons outweigh the pros.
 
 -}
 
+-- | is @-falignment-sanitisation@ enabled?
+type DoAlignSanitisation = Bool

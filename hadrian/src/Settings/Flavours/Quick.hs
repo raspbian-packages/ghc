@@ -1,4 +1,8 @@
-module Settings.Flavours.Quick (quickFlavour) where
+module Settings.Flavours.Quick
+   ( quickFlavour
+   , quickDebugFlavour
+   )
+where
 
 import Expression
 import Flavour
@@ -15,18 +19,21 @@ quickFlavour = defaultFlavour
                     , notStage0 ? platformSupportsSharedLibs ? pure [dynamic] ]
     , rtsWays     = mconcat
                     [ pure
-                      [ vanilla, threaded, logging, debug
-                      , threadedDebug, threadedLogging, threaded ]
+                      [ vanilla, threaded, debug
+                      , threadedDebug, threaded ]
                     , notStage0 ? platformSupportsSharedLibs ? pure
-                      [ dynamic, debugDynamic, threadedDynamic, loggingDynamic
-                      , threadedDebugDynamic, threadedLoggingDynamic ]
+                      [ dynamic, debugDynamic, threadedDynamic, threadedDebugDynamic ]
                     ] }
 
 quickArgs :: Args
 quickArgs = sourceArgs SourceArgs
-    { hsDefault  = mconcat $
-        [ pure ["-O0", "-H64m"]
-        ]
+    { hsDefault  = mconcat [ pure ["-O0", "-H64m"] ]
     , hsLibrary  = notStage0 ? arg "-O"
-    , hsCompiler =    stage0 ? arg "-O2"
-    , hsGhc      =    stage0 ? arg "-O" }
+    , hsCompiler = stage0 ? arg "-O2"
+    , hsGhc      = stage0 ? arg "-O" }
+
+quickDebugFlavour :: Flavour
+quickDebugFlavour = quickFlavour
+    { name = "quick-debug"
+    , ghcDebugged = True
+    }

@@ -11,7 +11,7 @@
  *
  * ---------------------------------------------------------------------------*/
 
-#include "PosixSource.h"
+#include "rts/PosixSource.h"
 #include "Rts.h"
 
 #include "BlockAlloc.h"
@@ -30,22 +30,24 @@
 SpinLock gc_alloc_block_sync;
 #endif
 
+static void push_todo_block(bdescr *bd, gen_workspace *ws);
+
 bdescr* allocGroup_sync(uint32_t n)
 {
     bdescr *bd;
     uint32_t node = capNoToNumaNode(gct->thread_index);
-    ACQUIRE_SPIN_LOCK(&gc_alloc_block_sync);
+    ACQUIRE_ALLOC_BLOCK_SPIN_LOCK();
     bd = allocGroupOnNode(node,n);
-    RELEASE_SPIN_LOCK(&gc_alloc_block_sync);
+    RELEASE_ALLOC_BLOCK_SPIN_LOCK();
     return bd;
 }
 
 bdescr* allocGroupOnNode_sync(uint32_t node, uint32_t n)
 {
     bdescr *bd;
-    ACQUIRE_SPIN_LOCK(&gc_alloc_block_sync);
+    ACQUIRE_ALLOC_BLOCK_SPIN_LOCK();
     bd = allocGroupOnNode(node,n);
-    RELEASE_SPIN_LOCK(&gc_alloc_block_sync);
+    RELEASE_ALLOC_BLOCK_SPIN_LOCK();
     return bd;
 }
 
@@ -55,7 +57,7 @@ allocBlocks_sync(uint32_t n, bdescr **hd)
     bdescr *bd;
     uint32_t i;
     uint32_t node = capNoToNumaNode(gct->thread_index);
-    ACQUIRE_SPIN_LOCK(&gc_alloc_block_sync);
+    ACQUIRE_ALLOC_BLOCK_SPIN_LOCK();
     bd = allocLargeChunkOnNode(node,1,n);
     // NB. allocLargeChunk, rather than allocGroup(n), to allocate in a
     // fragmentation-friendly way.
@@ -68,7 +70,7 @@ allocBlocks_sync(uint32_t n, bdescr **hd)
     bd[n-1].link = NULL;
     // We have to hold the lock until we've finished fiddling with the metadata,
     // otherwise the block allocator can get confused.
-    RELEASE_SPIN_LOCK(&gc_alloc_block_sync);
+    RELEASE_ALLOC_BLOCK_SPIN_LOCK();
     *hd = bd;
     return n;
 }
@@ -76,17 +78,17 @@ allocBlocks_sync(uint32_t n, bdescr **hd)
 void
 freeChain_sync(bdescr *bd)
 {
-    ACQUIRE_SPIN_LOCK(&gc_alloc_block_sync);
+    ACQUIRE_ALLOC_BLOCK_SPIN_LOCK();
     freeChain(bd);
-    RELEASE_SPIN_LOCK(&gc_alloc_block_sync);
+    RELEASE_ALLOC_BLOCK_SPIN_LOCK();
 }
 
 void
 freeGroup_sync(bdescr *bd)
 {
-    ACQUIRE_SPIN_LOCK(&gc_alloc_block_sync);
+    ACQUIRE_ALLOC_BLOCK_SPIN_LOCK();
     freeGroup(bd);
-    RELEASE_SPIN_LOCK(&gc_alloc_block_sync);
+    RELEASE_ALLOC_BLOCK_SPIN_LOCK();
 }
 
 /* -----------------------------------------------------------------------------
@@ -168,8 +170,40 @@ push_scanned_block (bdescr *bd, gen_workspace *ws)
     }
 }
 
-/* Note [big objects]
+void
+push_todo_block(bdescr *bd, gen_workspace *ws)
+{
+    debugTrace(DEBUG_gc, "push todo block %p (%ld words), step %d, todo_q: %ld",
+            bd->start, (unsigned long)(bd->free - bd->u.scan),
+            ws->gen->no, dequeElements(ws->todo_q));
 
+    ASSERT(bd->link == NULL);
+
+    if(!pushWSDeque(ws->todo_q, bd)) {
+        bd->link = ws->todo_overflow;
+        ws->todo_overflow = bd;
+        ws->n_todo_overflow++;
+
+        // In theory, if a gc thread pushes more blocks to it's todo_q than it
+        // pops, the todo_overflow list will continue to grow. Other gc threads
+        // can't steal from the todo_overflwo list, so they may be idle as the
+        // first gc thread works diligently on it's todo_overflow list. In
+        // practice this has not been observed to occur.
+        //
+        // The max_n_todo_overflow counter will allow us to observe large
+        // todo_overflow lists if they ever arise. As of now I've not observed
+        // any nonzero max_n_todo_overflow samples.
+        gct->max_n_todo_overflow =
+            stg_max(gct->max_n_todo_overflow, ws->n_todo_overflow);
+    }
+
+#if defined(THREADED_RTS)
+    notifyTodoBlock();
+#endif
+}
+
+/* Note [big objects]
+   ~~~~~~~~~~~~~~~~~~
    We can get an ordinary object (CONSTR, FUN, THUNK etc.) that is
    larger than a block (see #7919).  Let's call these "big objects".
    These objects don't behave like large objects - they live in
@@ -277,17 +311,7 @@ todo_block_full (uint32_t size, gen_workspace *ws)
         // Otherwise, push this block out to the global list.
         else
         {
-            DEBUG_ONLY( generation *gen );
-            DEBUG_ONLY( gen = ws->gen );
-            debugTrace(DEBUG_gc, "push todo block %p (%ld words), step %d, todo_q: %ld",
-                  bd->start, (unsigned long)(bd->free - bd->u.scan),
-                  gen->no, dequeElements(ws->todo_q));
-
-            if (!pushWSDeque(ws->todo_q, bd)) {
-                bd->link = ws->todo_overflow;
-                ws->todo_overflow = bd;
-                ws->n_todo_overflow++;
-            }
+            push_todo_block(bd, ws);
         }
     }
 

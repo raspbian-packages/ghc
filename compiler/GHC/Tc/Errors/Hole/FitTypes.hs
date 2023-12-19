@@ -19,15 +19,17 @@ import GHC.Types.Id
 import GHC.Utils.Outputable
 import GHC.Types.Name
 
+import GHC.Data.Bag
+
 import Data.Function ( on )
 
-data TypedHole = TypedHole { th_relevant_cts :: Cts
+data TypedHole = TypedHole { th_relevant_cts :: Bag CtEvidence
                            -- ^ Any relevant Cts to the hole
                            , th_implics :: [Implication]
                            -- ^ The nested implications of the hole with the
                            --   innermost implication first.
                            , th_hole :: Maybe Hole
-                           -- ^ The hole itself, if available. Only for debugging.
+                           -- ^ The hole itself, if available.
                            }
 
 instance Outputable TypedHole where
@@ -42,7 +44,12 @@ instance Outputable TypedHole where
 data HoleFitCandidate = IdHFCand Id             -- An id, like locals.
                       | NameHFCand Name         -- A name, like built-in syntax.
                       | GreHFCand GlobalRdrElt  -- A global, like imported ids.
-                      deriving (Eq)
+
+instance Eq HoleFitCandidate where
+  IdHFCand i1 == IdHFCand i2 = i1 == i2
+  NameHFCand n1 == NameHFCand n2 = n1 == n2
+  GreHFCand gre1 == GreHFCand gre2 = gre_name gre1 == gre_name gre2
+  _ == _ = False
 
 instance Outputable HoleFitCandidate where
   ppr = pprHoleFitCand
@@ -56,11 +63,11 @@ instance NamedThing HoleFitCandidate where
   getName hfc = case hfc of
                      IdHFCand cid -> idName cid
                      NameHFCand cname -> cname
-                     GreHFCand cgre -> gre_name cgre
+                     GreHFCand cgre -> greMangledName cgre
   getOccName hfc = case hfc of
                      IdHFCand cid -> occName cid
                      NameHFCand cname -> occName cname
-                     GreHFCand cgre -> occName (gre_name cgre)
+                     GreHFCand cgre -> occName (greMangledName cgre)
 
 instance HasOccName HoleFitCandidate where
   occName = getOccName
@@ -80,7 +87,7 @@ data HoleFit =
           , hfWrap :: [TcType] -- ^ The wrapper for the match.
           , hfMatches :: [TcType]
           -- ^ What the refinement variables got matched with, if anything
-          , hfDoc :: Maybe HsDocString
+          , hfDoc :: Maybe [HsDocString]
           -- ^ Documentation of this HoleFit, if available.
           }
  | RawHoleFit SDoc

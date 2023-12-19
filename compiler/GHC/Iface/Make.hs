@@ -1,10 +1,10 @@
+
+{-# LANGUAGE NondecreasingIndentation #-}
+
 {-
 (c) The University of Glasgow 2006-2008
 (c) The GRASP/AQUA Project, Glasgow University, 1993-1998
 -}
-
-{-# LANGUAGE CPP, NondecreasingIndentation #-}
-{-# LANGUAGE MultiWayIf #-}
 
 -- | Module for constructing @ModIface@ values (interface files),
 -- writing them to disk and comparing two versions to see if
@@ -19,18 +19,23 @@ module GHC.Iface.Make
    )
 where
 
-#include "HsVersions.h"
-
 import GHC.Prelude
+
+import GHC.Hs
+
+import GHC.StgToCmm.Types (CmmCgInfos (..))
+
+import GHC.Tc.Utils.TcType
+import GHC.Tc.Utils.Monad
 
 import GHC.Iface.Syntax
 import GHC.Iface.Recomp
 import GHC.Iface.Load
+import GHC.Iface.Ext.Fields
+
 import GHC.CoreToIface
 
-import GHC.HsToCore.Usage ( mkUsageInfo, mkUsedNames, mkDependencies )
-import GHC.Types.Id
-import GHC.Types.Annotations
+import qualified GHC.LanguageExtensions as LangExt
 import GHC.Core
 import GHC.Core.Class
 import GHC.Core.TyCon
@@ -39,14 +44,20 @@ import GHC.Core.ConLike
 import GHC.Core.DataCon
 import GHC.Core.Type
 import GHC.Core.Multiplicity
-import GHC.StgToCmm.Types (CgInfos (..))
-import GHC.Tc.Utils.TcType
 import GHC.Core.InstEnv
 import GHC.Core.FamInstEnv
-import GHC.Tc.Utils.Monad
-import GHC.Hs
-import GHC.Driver.Types
+import GHC.Core.Ppr
+import GHC.Core.Unify( RoughMatchTc(..) )
+
+import GHC.Driver.Env
+import GHC.Driver.Backend
 import GHC.Driver.Session
+import GHC.Driver.Plugins
+
+import GHC.Types.Id
+import GHC.Types.Fixity.Env
+import GHC.Types.SafeHaskell
+import GHC.Types.Annotations
 import GHC.Types.Var.Env
 import GHC.Types.Var
 import GHC.Types.Name
@@ -54,20 +65,41 @@ import GHC.Types.Avail
 import GHC.Types.Name.Reader
 import GHC.Types.Name.Env
 import GHC.Types.Name.Set
-import GHC.Unit.Module
-import GHC.Utils.Error
-import GHC.Utils.Outputable
+import GHC.Types.Unique.DSet
 import GHC.Types.Basic hiding ( SuccessFlag(..) )
+import GHC.Types.TypeEnv
+import GHC.Types.SourceFile
+import GHC.Types.TyThing
+import GHC.Types.HpcInfo
+import GHC.Types.CompleteMatch
+
+import GHC.Utils.Outputable
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
 import GHC.Utils.Misc  hiding ( eqListBy )
+import GHC.Utils.Logger
+import GHC.Utils.Trace
+
 import GHC.Data.FastString
 import GHC.Data.Maybe
+
 import GHC.HsToCore.Docs
+import GHC.HsToCore.Usage ( mkUsageInfo, mkUsedNames )
+
+import GHC.Unit
+import GHC.Unit.Module.Warnings
+import GHC.Unit.Module.ModIface
+import GHC.Unit.Module.ModDetails
+import GHC.Unit.Module.ModGuts
+import GHC.Unit.Module.ModSummary
+import GHC.Unit.Module.Deps
 
 import Data.Function
 import Data.List ( findIndex, mapAccumL, sortBy )
 import Data.Ord
 import Data.IORef
-import GHC.Driver.Plugins (LoadedPlugin(..))
+import GHC.Stg.Pipeline (StgCgInfos)
+
 
 {-
 ************************************************************************
@@ -79,9 +111,10 @@ import GHC.Driver.Plugins (LoadedPlugin(..))
 
 mkPartialIface :: HscEnv
                -> ModDetails
+               -> ModSummary
                -> ModGuts
                -> PartialModIface
-mkPartialIface hsc_env mod_details
+mkPartialIface hsc_env mod_details mod_summary
   ModGuts{ mg_module       = this_mod
          , mg_hsc_src      = hsc_src
          , mg_usages       = usages
@@ -93,48 +126,56 @@ mkPartialIface hsc_env mod_details
          , mg_hpc_info     = hpc_info
          , mg_safe_haskell = safe_mode
          , mg_trust_pkg    = self_trust
-         , mg_doc_hdr      = doc_hdr
-         , mg_decl_docs    = decl_docs
-         , mg_arg_docs     = arg_docs
+         , mg_docs         = docs
          }
   = mkIface_ hsc_env this_mod hsc_src used_th deps rdr_env fix_env warns hpc_info self_trust
-             safe_mode usages doc_hdr decl_docs arg_docs mod_details
+             safe_mode usages docs mod_summary mod_details
 
 -- | Fully instantiate an interface. Adds fingerprints and potentially code
 -- generator produced information.
 --
--- CgInfos is not available when not generating code (-fno-code), or when not
+-- CmmCgInfos is not available when not generating code (-fno-code), or when not
 -- generating interface pragmas (-fomit-interface-pragmas). See also
 -- Note [Conveying CAF-info and LFInfo between modules] in GHC.StgToCmm.Types.
-mkFullIface :: HscEnv -> PartialModIface -> Maybe CgInfos -> IO ModIface
-mkFullIface hsc_env partial_iface mb_cg_infos = do
+mkFullIface :: HscEnv -> PartialModIface -> Maybe StgCgInfos -> Maybe CmmCgInfos -> IO ModIface
+mkFullIface hsc_env partial_iface mb_stg_infos mb_cmm_infos = do
     let decls
           | gopt Opt_OmitInterfacePragmas (hsc_dflags hsc_env)
           = mi_decls partial_iface
           | otherwise
-          = updateDecl (mi_decls partial_iface) mb_cg_infos
+          = updateDecl (mi_decls partial_iface) mb_stg_infos mb_cmm_infos
 
     full_iface <-
       {-# SCC "addFingerprints" #-}
       addFingerprints hsc_env partial_iface{ mi_decls = decls }
 
     -- Debug printing
-    dumpIfSet_dyn (hsc_dflags hsc_env) Opt_D_dump_hi "FINAL INTERFACE" FormatText (pprModIface full_iface)
+    let unit_state = hsc_units hsc_env
+    putDumpFileMaybe (hsc_logger hsc_env) Opt_D_dump_hi "FINAL INTERFACE" FormatText
+      (pprModIface unit_state full_iface)
 
     return full_iface
 
-updateDecl :: [IfaceDecl] -> Maybe CgInfos -> [IfaceDecl]
-updateDecl decls Nothing = decls
-updateDecl decls (Just CgInfos{ cgNonCafs = NonCaffySet non_cafs, cgLFInfos = lf_infos }) = map update_decl decls
+updateDecl :: [IfaceDecl] -> Maybe StgCgInfos -> Maybe CmmCgInfos -> [IfaceDecl]
+updateDecl decls Nothing Nothing = decls
+updateDecl decls m_stg_infos m_cmm_infos
+  = map update_decl decls
   where
+    (non_cafs,lf_infos) = maybe (mempty, mempty)
+                                (\cmm_info -> (ncs_nameSet (cgNonCafs cmm_info), cgLFInfos cmm_info))
+                                m_cmm_infos
+    tag_sigs = fromMaybe mempty m_stg_infos
+
     update_decl (IfaceId nm ty details infos)
       | let not_caffy = elemNameSet nm non_cafs
       , let mb_lf_info = lookupNameEnv lf_infos nm
-      , WARN( isNothing mb_lf_info, text "Name without LFInfo:" <+> ppr nm ) True
+      , let sig = lookupNameEnv tag_sigs nm
+      , warnPprTrace (isNothing mb_lf_info) "updateDecl" (text "Name without LFInfo:" <+> ppr nm) True
         -- Only allocate a new IfaceId if we're going to update the infos
-      , isJust mb_lf_info || not_caffy
+      , isJust mb_lf_info || not_caffy || isJust sig
       = IfaceId nm ty details $
-          (if not_caffy then (HsNoCafRefs :) else id)
+          (if not_caffy then (HsNoCafRefs :) else id) $
+          (if isJust sig then (HsTagSig (fromJust sig):) else id) $
           (case mb_lf_info of
              Nothing -> infos -- LFInfos not available when building .cmm files
              Just lf_info -> HsLFInfo (toIfaceLFInfo nm lf_info) : infos)
@@ -142,15 +183,19 @@ updateDecl decls (Just CgInfos{ cgNonCafs = NonCaffySet non_cafs, cgLFInfos = lf
     update_decl decl
       = decl
 
+
+
+
 -- | Make an interface from the results of typechecking only.  Useful
 -- for non-optimising compilation, or where we aren't generating any
--- object code at all ('HscNothing').
+-- object code at all ('NoBackend').
 mkIfaceTc :: HscEnv
           -> SafeHaskellMode    -- The safe haskell mode
           -> ModDetails         -- gotten from mkBootModDetails, probably
+          -> ModSummary
           -> TcGblEnv           -- Usages, deprecations, etc
           -> IO ModIface
-mkIfaceTc hsc_env safe_mode mod_details
+mkIfaceTc hsc_env safe_mode mod_details mod_summary
   tc_result@TcGblEnv{ tcg_mod = this_mod,
                       tcg_src = hsc_src,
                       tcg_imports = imports,
@@ -164,14 +209,16 @@ mkIfaceTc hsc_env safe_mode mod_details
                     }
   = do
           let used_names = mkUsedNames tc_result
-          let pluginModules =
-                map lpModule (cachedPlugins (hsc_dflags hsc_env))
-          deps <- mkDependencies
-                    (homeUnitId (hsc_dflags hsc_env))
-                    (map mi_module pluginModules) tc_result
+          let pluginModules = map lpModule (loadedPlugins (hsc_plugins hsc_env))
+          let home_unit = hsc_home_unit hsc_env
+          let deps = mkDependencies home_unit
+                                    (tcg_mod tc_result)
+                                    (tcg_imports tc_result)
+                                    (map mi_module pluginModules)
           let hpc_info = emptyHpcInfo other_hpc_info
           used_th <- readIORef tc_splice_used
           dep_files <- (readIORef dependent_files)
+          (needed_links, needed_pkgs) <- readIORef (tcg_th_needed_deps tc_result)
           -- Do NOT use semantic module here; this_mod in mkUsageInfo
           -- is used solely to decide if we should record a dependency
           -- or not.  When we instantiate a signature, the semantic
@@ -180,51 +227,52 @@ mkIfaceTc hsc_env safe_mode mod_details
           -- module and does not need to be recorded as a dependency.
           -- See Note [Identity versus semantic module]
           usages <- mkUsageInfo hsc_env this_mod (imp_mods imports) used_names
-                      dep_files merged pluginModules
+                      dep_files merged needed_links needed_pkgs
 
-          let (doc_hdr', doc_map, arg_map) = extractDocs tc_result
+          docs <- extractDocs (ms_hspp_opts mod_summary) tc_result
 
           let partial_iface = mkIface_ hsc_env
                    this_mod hsc_src
                    used_th deps rdr_env
                    fix_env warns hpc_info
                    (imp_trust_own_pkg imports) safe_mode usages
-                   doc_hdr' doc_map arg_map
+                   docs mod_summary
                    mod_details
 
-          mkFullIface hsc_env partial_iface Nothing
+          mkFullIface hsc_env partial_iface Nothing Nothing
 
 mkIface_ :: HscEnv -> Module -> HscSource
          -> Bool -> Dependencies -> GlobalRdrEnv
-         -> NameEnv FixItem -> Warnings -> HpcInfo
+         -> NameEnv FixItem -> Warnings GhcRn -> HpcInfo
          -> Bool
          -> SafeHaskellMode
          -> [Usage]
-         -> Maybe HsDocString
-         -> DeclDocMap
-         -> ArgDocMap
+         -> Maybe Docs
+         -> ModSummary
          -> ModDetails
          -> PartialModIface
 mkIface_ hsc_env
          this_mod hsc_src used_th deps rdr_env fix_env src_warns
          hpc_info pkg_trust_req safe_mode usages
-         doc_hdr decl_docs arg_docs
+         docs mod_summary
          ModDetails{  md_insts     = insts,
                       md_fam_insts = fam_insts,
                       md_rules     = rules,
                       md_anns      = anns,
                       md_types     = type_env,
                       md_exports   = exports,
-                      md_complete_sigs = complete_sigs }
+                      md_complete_matches = complete_matches }
 -- NB:  notice that mkIface does not look at the bindings
 --      only at the TypeEnv.  The previous Tidy phase has
 --      put exactly the info into the TypeEnv that we want
 --      to expose in the interface
 
   = do
-    let semantic_mod = canonicalizeHomeModule (hsc_dflags hsc_env) (moduleName this_mod)
+    let home_unit    = hsc_home_unit hsc_env
+        semantic_mod = homeModuleNameInstantiation home_unit (moduleName this_mod)
         entities = typeEnvElts type_env
-        decls  = [ tyThingToIfaceDecl (hsc_dflags hsc_env) entity
+        show_linear_types = xopt LangExt.LinearTypes (hsc_dflags hsc_env)
+        decls  = [ tyThingToIfaceDecl show_linear_types entity
                  | entity <- entities,
                    let name = getName entity,
                    not (isImplicitTyThing entity),
@@ -239,17 +287,17 @@ mkIface_ hsc_env
                       -- See Note [Identity versus semantic module]
 
         fixities    = sortBy (comparing fst)
-          [(occ,fix) | FixItem occ fix <- nameEnvElts fix_env]
-          -- The order of fixities returned from nameEnvElts is not
+          [(occ,fix) | FixItem occ fix <- nonDetNameEnvElts fix_env]
+          -- The order of fixities returned from nonDetNameEnvElts is not
           -- deterministic, so we sort by OccName to canonicalize it.
           -- See Note [Deterministic UniqFM] in GHC.Types.Unique.DFM for more details.
         warns       = src_warns
         iface_rules = map coreRuleToIfaceRule rules
-        iface_insts = map instanceToIfaceInst $ fixSafeInstances safe_mode insts
+        iface_insts = map instanceToIfaceInst $ fixSafeInstances safe_mode (instEnvElts insts)
         iface_fam_insts = map famInstToIfaceFamInst fam_insts
         trust_info  = setSafeMode safe_mode
         annotations = map mkIfaceAnnotation anns
-        icomplete_sigs = map mkIfaceCompleteSig complete_sigs
+        icomplete_matches = map mkIfaceCompleteMatch complete_matches
 
     ModIface {
           mi_module      = this_mod,
@@ -278,14 +326,14 @@ mkIface_ hsc_env
           mi_hpc         = isHpcUsed hpc_info,
           mi_trust       = trust_info,
           mi_trust_pkg   = pkg_trust_req,
-          mi_complete_sigs = icomplete_sigs,
-          mi_doc_hdr     = doc_hdr,
-          mi_decl_docs   = decl_docs,
-          mi_arg_docs    = arg_docs,
+          mi_complete_matches = icomplete_matches,
+          mi_docs        = docs,
           mi_final_exts  = (),
-          mi_ext_fields  = emptyExtensibleFields }
+          mi_ext_fields  = emptyExtensibleFields,
+          mi_src_hash = ms_hs_hash mod_summary
+          }
   where
-     cmp_rule     = comparing ifRuleName
+     cmp_rule     = lexicalCompareFS `on` ifRuleName
      -- Compare these lexicographically by OccName, *not* by unique,
      -- because the latter is not stable across compilations:
      cmp_inst     = comparing (nameOccName . ifDFun)
@@ -301,8 +349,8 @@ mkIface_ hsc_env
      -- scope available. (#5534)
      maybeGlobalRdrEnv :: GlobalRdrEnv -> Maybe GlobalRdrEnv
      maybeGlobalRdrEnv rdr_env
-         | targetRetainsAllBindings (hscTarget dflags) = Just rdr_env
-         | otherwise                                   = Nothing
+         | backendRetainsAllBindings (backend dflags) = Just rdr_env
+         | otherwise                                  = Nothing
 
      ifFamInstTcName = ifFamInstFam
 
@@ -315,8 +363,9 @@ mkIface_ hsc_env
 ************************************************************************
 -}
 
-mkIfaceCompleteSig :: CompleteMatch -> IfaceCompleteMatch
-mkIfaceCompleteSig (CompleteMatch cls tc) = IfaceCompleteMatch cls tc
+mkIfaceCompleteMatch :: CompleteMatch -> IfaceCompleteMatch
+mkIfaceCompleteMatch (CompleteMatch cls mtc) =
+  IfaceCompleteMatch (map conLikeName (uniqDSetToList cls)) (toIfaceTyCon <$> mtc)
 
 
 {-
@@ -341,13 +390,11 @@ mkIfaceExports exports
   where
     sort_subs :: AvailInfo -> AvailInfo
     sort_subs (Avail n) = Avail n
-    sort_subs (AvailTC n [] fs) = AvailTC n [] (sort_flds fs)
-    sort_subs (AvailTC n (m:ms) fs)
-       | n==m      = AvailTC n (m:sortBy stableNameCmp ms) (sort_flds fs)
-       | otherwise = AvailTC n (sortBy stableNameCmp (m:ms)) (sort_flds fs)
+    sort_subs (AvailTC n []) = AvailTC n []
+    sort_subs (AvailTC n (m:ms))
+       | NormalGreName n==m  = AvailTC n (m:sortBy stableGreNameCmp ms)
+       | otherwise = AvailTC n (sortBy stableGreNameCmp (m:ms))
        -- Maintain the AvailTC Invariant
-
-    sort_flds = sortBy (stableNameCmp `on` flSelector)
 
 {-
 Note [Original module]
@@ -375,12 +422,12 @@ so we may need to split up a single Avail into multiple ones.
 ************************************************************************
 -}
 
-tyThingToIfaceDecl :: DynFlags -> TyThing -> IfaceDecl
+tyThingToIfaceDecl :: Bool -> TyThing -> IfaceDecl
 tyThingToIfaceDecl _ (AnId id)      = idToIfaceDecl id
 tyThingToIfaceDecl _ (ATyCon tycon) = snd (tyConToIfaceDecl emptyTidyEnv tycon)
 tyThingToIfaceDecl _ (ACoAxiom ax)  = coAxiomToIfaceDecl ax
-tyThingToIfaceDecl dflags (AConLike cl)  = case cl of
-    RealDataCon dc -> dataConToIfaceDecl dflags dc -- for ppr purposes only
+tyThingToIfaceDecl show_linear_types (AConLike cl)  = case cl of
+    RealDataCon dc -> dataConToIfaceDecl show_linear_types dc -- for ppr purposes only
     PatSynCon ps   -> patSynToIfaceDecl ps
 
 --------------------------
@@ -396,10 +443,10 @@ idToIfaceDecl id
               ifIdInfo    = toIfaceIdInfo (idInfo id) }
 
 --------------------------
-dataConToIfaceDecl :: DynFlags -> DataCon -> IfaceDecl
-dataConToIfaceDecl dflags dataCon
+dataConToIfaceDecl :: Bool -> DataCon -> IfaceDecl
+dataConToIfaceDecl show_linear_types dataCon
   = IfaceId { ifName      = getName dataCon,
-              ifType      = toIfaceType (dataConDisplayType dflags dataCon),
+              ifType      = toIfaceType (dataConDisplayType show_linear_types dataCon),
               ifIdDetails = IfVanillaId,
               ifIdInfo    = [] }
 
@@ -615,7 +662,7 @@ classToIfaceDecl env clas
         (env2, if_decl) = tyConToIfaceDecl env1 tc
 
     toIfaceClassOp (sel_id, def_meth)
-        = ASSERT( sel_tyvars == binderVars tc_binders )
+        = assert (sel_tyvars == binderVars tc_binders) $
           IfaceClassOp (getName sel_id)
                        (tidyToIfaceType env1 op_ty)
                        (fmap toDmSpec def_meth)
@@ -625,7 +672,7 @@ classToIfaceDecl env clas
                 --                op :: (?x :: String) => a -> a
                 -- and          class Baz a where
                 --                op :: (Ord a) => a -> a
-          (sel_tyvars, rho_ty) = splitForAllTys (idType sel_id)
+          (sel_tyvars, rho_ty) = splitForAllTyCoVars (idType sel_id)
           op_ty                = funResultTy rho_ty
 
     toDmSpec :: (Name, DefMethSpec Type) -> DefMethSpec IfaceType
@@ -656,36 +703,29 @@ tidyTyVar (_, subst) tv = toIfaceTyVar (lookupVarEnv subst tv `orElse` tv)
 instanceToIfaceInst :: ClsInst -> IfaceClsInst
 instanceToIfaceInst (ClsInst { is_dfun = dfun_id, is_flag = oflag
                              , is_cls_nm = cls_name, is_cls = cls
-                             , is_tcs = mb_tcs
+                             , is_tcs = rough_tcs
                              , is_orphan = orph })
-  = ASSERT( cls_name == className cls )
-    IfaceClsInst { ifDFun    = dfun_name,
-                ifOFlag   = oflag,
-                ifInstCls = cls_name,
-                ifInstTys = map do_rough mb_tcs,
-                ifInstOrph = orph }
-  where
-    do_rough Nothing  = Nothing
-    do_rough (Just n) = Just (toIfaceTyCon_name n)
-
-    dfun_name = idName dfun_id
-
+  = assert (cls_name == className cls) $
+    IfaceClsInst { ifDFun     = idName dfun_id
+                 , ifOFlag    = oflag
+                 , ifInstCls  = cls_name
+                 , ifInstTys  = ifaceRoughMatchTcs $ tail rough_tcs
+                   -- N.B. Drop the class name from the rough match template
+                   --      It is put back by GHC.Core.InstEnv.mkImportedInstance
+                 , ifInstOrph = orph }
 
 --------------------------
 famInstToIfaceFamInst :: FamInst -> IfaceFamInst
 famInstToIfaceFamInst (FamInst { fi_axiom    = axiom,
                                  fi_fam      = fam,
-                                 fi_tcs      = roughs })
+                                 fi_tcs      = rough_tcs })
   = IfaceFamInst { ifFamInstAxiom    = coAxiomName axiom
                  , ifFamInstFam      = fam
-                 , ifFamInstTys      = map do_rough roughs
+                 , ifFamInstTys      = ifaceRoughMatchTcs rough_tcs
                  , ifFamInstOrph     = orph }
   where
-    do_rough Nothing  = Nothing
-    do_rough (Just n) = Just (toIfaceTyCon_name n)
-
     fam_decl = tyConName $ coAxiomTyCon axiom
-    mod = ASSERT( isExternalName (coAxiomName axiom) )
+    mod = assert (isExternalName (coAxiomName axiom)) $
           nameModule (coAxiomName axiom)
     is_local name = nameIsLocalOrFrom mod name
 
@@ -696,11 +736,20 @@ famInstToIfaceFamInst (FamInst { fi_axiom    = axiom,
          | otherwise
          = chooseOrphanAnchor lhs_names
 
+ifaceRoughMatchTcs :: [RoughMatchTc] -> [Maybe IfaceTyCon]
+ifaceRoughMatchTcs tcs = map do_rough tcs
+  where
+    do_rough RM_WildCard     = Nothing
+    do_rough (RM_KnownTc n) = Just (toIfaceTyCon_name n)
+
 --------------------------
 coreRuleToIfaceRule :: CoreRule -> IfaceRule
-coreRuleToIfaceRule (BuiltinRule { ru_fn = fn})
-  = pprTrace "toHsRule: builtin" (ppr fn) $
-    bogusIfaceRule fn
+-- A plugin that installs a BuiltinRule in a CoreDoPluginPass should
+-- ensure that there's another CoreDoPluginPass that removes the rule.
+-- Otherwise a module using the plugin and compiled with -fno-omit-interface-pragmas
+-- would cause panic when the rule is attempted to be written to the interface file.
+coreRuleToIfaceRule rule@(BuiltinRule {})
+  = pprPanic "toHsRule:" (pprRule rule)
 
 coreRuleToIfaceRule (Rule { ru_name = name, ru_fn = fn,
                             ru_act = act, ru_bndrs = bndrs,
@@ -721,10 +770,3 @@ coreRuleToIfaceRule (Rule { ru_name = name, ru_fn = fn,
     do_arg (Type ty)     = IfaceType (toIfaceType (deNoteType ty))
     do_arg (Coercion co) = IfaceCo   (toIfaceCoercion co)
     do_arg arg           = toIfaceExpr arg
-
-bogusIfaceRule :: Name -> IfaceRule
-bogusIfaceRule id_name
-  = IfaceRule { ifRuleName = fsLit "bogus", ifActivation = NeverActive,
-        ifRuleBndrs = [], ifRuleHead = id_name, ifRuleArgs = [],
-        ifRuleRhs = IfaceExt id_name, ifRuleOrph = IsOrphan,
-        ifRuleAuto = True }

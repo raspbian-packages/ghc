@@ -3,7 +3,6 @@
 {-# LANGUAGE EmptyCase #-}
 {-# LANGUAGE EmptyDataDeriving #-}
 {-# LANGUAGE Safe #-}
-{-# LANGUAGE StandaloneDeriving #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -30,6 +29,9 @@ import Data.Data
 import Data.Ix
 import GHC.Generics
 import Data.Semigroup (Semigroup(..), stimesIdempotent)
+
+-- $setup
+-- >>> import Prelude
 
 -- | Uninhabited data type
 --

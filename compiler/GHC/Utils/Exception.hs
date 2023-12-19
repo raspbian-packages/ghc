@@ -3,21 +3,21 @@
 
 module GHC.Utils.Exception
     (
-    module Control.Exception,
+    module CE,
     module GHC.Utils.Exception
     )
     where
 
 import GHC.Prelude
 
-import Control.Exception
-import Control.Exception as CE
+import GHC.IO (catchException)
+import Control.Exception as CE hiding (assert)
 import Control.Monad.IO.Class
 import Control.Monad.Catch
 
 -- Monomorphised versions of exception-handling utilities
 catchIO :: IO a -> (IOException -> IO a) -> IO a
-catchIO = CE.catch
+catchIO = catchException
 
 handleIO :: (IOException -> IO a) -> IO a -> IO a
 handleIO = flip catchIO

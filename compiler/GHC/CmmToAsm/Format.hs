@@ -12,6 +12,7 @@ module GHC.CmmToAsm.Format (
     Format(..),
     intFormat,
     floatFormat,
+    isIntFormat,
     isFloatFormat,
     cmmTypeFormat,
     formatToWidth,
@@ -24,6 +25,7 @@ import GHC.Prelude
 
 import GHC.Cmm
 import GHC.Utils.Outputable
+import GHC.Utils.Panic
 
 -- It looks very like the old MachRep, but it's now of purely local
 -- significance, here in the native code generator.  You can change it
@@ -72,6 +74,9 @@ floatFormat width
 
         other   -> pprPanic "Format.floatFormat" (ppr other)
 
+-- | Check if a format represent an integer value.
+isIntFormat :: Format -> Bool
+isIntFormat = not . isFloatFormat
 
 -- | Check if a format represents a floating point value.
 isFloatFormat :: Format -> Bool

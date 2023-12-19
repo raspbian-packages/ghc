@@ -15,332 +15,141 @@ literal'').  In the corner of a @CoreUnfolding@ unfolding, you will
 find, unsurprisingly, a Core expression.
 -}
 
-{-# LANGUAGE CPP #-}
 
-{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
+{-# LANGUAGE BangPatterns #-}
 
 module GHC.Core.Unfold (
         Unfolding, UnfoldingGuidance,   -- Abstract types
 
-        noUnfolding,
-        mkUnfolding, mkCoreUnfolding,
-        mkFinalUnfolding, mkSimpleUnfolding, mkWorkerUnfolding,
-        mkInlineUnfolding, mkInlineUnfoldingWithArity,
-        mkInlinableUnfolding, mkWwInlineRule,
-        mkCompulsoryUnfolding, mkDFunUnfolding,
-        specUnfolding,
+        UnfoldingOpts (..), defaultUnfoldingOpts,
+        updateCreationThreshold, updateUseThreshold,
+        updateFunAppDiscount, updateDictDiscount,
+        updateVeryAggressive, updateCaseScaling,
+        updateCaseThreshold, updateReportPrefix,
 
         ArgSummary(..),
 
         couldBeSmallEnoughToInline, inlineBoringOk,
-        certainlyWillInline, smallEnoughToInline,
+        smallEnoughToInline,
 
         callSiteInline, CallCtxt(..),
-
-        -- Reexport from GHC.Core.Subst (it only live there so it can be used
-        -- by the Very Simple Optimiser)
-        exprIsConApp_maybe, exprIsLiteral_maybe
+        calcUnfoldingGuidance
     ) where
-
-#include "HsVersions.h"
 
 import GHC.Prelude
 
-import GHC.Driver.Session
+import GHC.Driver.Flags
+
 import GHC.Core
-import GHC.Core.Opt.OccurAnal ( occurAnalyseExpr )
-import GHC.Core.SimpleOpt
-import GHC.Core.Opt.Arity   ( manifestArity )
 import GHC.Core.Utils
 import GHC.Types.Id
-import GHC.Types.Demand ( StrictSig, isDeadEndSig )
 import GHC.Core.DataCon
 import GHC.Types.Literal
 import GHC.Builtin.PrimOps
 import GHC.Types.Id.Info
-import GHC.Types.Basic  ( Arity, InlineSpec(..), inlinePragmaSpec )
+import GHC.Types.Basic  ( Arity )
 import GHC.Core.Type
 import GHC.Builtin.Names
 import GHC.Builtin.Types.Prim ( realWorldStatePrimTy )
 import GHC.Data.Bag
+import GHC.Utils.Logger
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Types.ForeignCall
 import GHC.Types.Name
-import GHC.Utils.Error
+import GHC.Types.Tickish
 
 import qualified Data.ByteString as BS
-import Data.List
-
-{-
-************************************************************************
-*                                                                      *
-\subsection{Making unfoldings}
-*                                                                      *
-************************************************************************
--}
-
-mkFinalUnfolding :: DynFlags -> UnfoldingSource -> StrictSig -> CoreExpr -> Unfolding
--- "Final" in the sense that this is a GlobalId that will not be further
--- simplified; so the unfolding should be occurrence-analysed
-mkFinalUnfolding dflags src strict_sig expr
-  = mkUnfolding dflags src
-                True {- Top level -}
-                (isDeadEndSig strict_sig)
-                expr
-
-mkCompulsoryUnfolding :: CoreExpr -> Unfolding
-mkCompulsoryUnfolding expr         -- Used for things that absolutely must be unfolded
-  = mkCoreUnfolding InlineCompulsory True
-                    (simpleOptExpr unsafeGlobalDynFlags expr)
-                    (UnfWhen { ug_arity = 0    -- Arity of unfolding doesn't matter
-                             , ug_unsat_ok = unSaturatedOk, ug_boring_ok = boringCxtOk })
+import Data.List (isPrefixOf)
 
 
--- Note [Top-level flag on inline rules]
--- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
--- Slight hack: note that mk_inline_rules conservatively sets the
--- top-level flag to True.  It gets set more accurately by the simplifier
--- Simplify.simplUnfolding.
+-- | Unfolding options
+data UnfoldingOpts = UnfoldingOpts
+   { unfoldingCreationThreshold :: !Int
+      -- ^ Threshold above which unfoldings are not *created*
 
-mkSimpleUnfolding :: DynFlags -> CoreExpr -> Unfolding
-mkSimpleUnfolding dflags rhs
-  = mkUnfolding dflags InlineRhs False False rhs
+   , unfoldingUseThreshold :: !Int
+      -- ^ Threshold above which unfoldings are not *inlined*
 
-mkDFunUnfolding :: [Var] -> DataCon -> [CoreExpr] -> Unfolding
-mkDFunUnfolding bndrs con ops
-  = DFunUnfolding { df_bndrs = bndrs
-                  , df_con = con
-                  , df_args = map occurAnalyseExpr ops }
-                  -- See Note [Occurrence analysis of unfoldings]
+   , unfoldingFunAppDiscount :: !Int
+      -- ^ Discount for lambdas that are used (applied)
 
-mkWwInlineRule :: DynFlags -> CoreExpr -> Arity -> Unfolding
-mkWwInlineRule dflags expr arity
-  = mkCoreUnfolding InlineStable True
-                   (simpleOptExpr dflags expr)
-                   (UnfWhen { ug_arity = arity, ug_unsat_ok = unSaturatedOk
-                            , ug_boring_ok = boringCxtNotOk })
+   , unfoldingDictDiscount :: !Int
+      -- ^ Discount for dictionaries
 
-mkWorkerUnfolding :: DynFlags -> (CoreExpr -> CoreExpr) -> Unfolding -> Unfolding
--- See Note [Worker-wrapper for INLINABLE functions] in GHC.Core.Opt.WorkWrap
-mkWorkerUnfolding dflags work_fn
-                  (CoreUnfolding { uf_src = src, uf_tmpl = tmpl
-                                 , uf_is_top = top_lvl })
-  | isStableSource src
-  = mkCoreUnfolding src top_lvl new_tmpl guidance
-  where
-    new_tmpl = simpleOptExpr dflags (work_fn tmpl)
-    guidance = calcUnfoldingGuidance dflags False new_tmpl
+   , unfoldingVeryAggressive :: !Bool
+      -- ^ Force inlining in many more cases
 
-mkWorkerUnfolding _ _ _ = noUnfolding
+   , unfoldingCaseThreshold :: !Int
+      -- ^ Don't consider depth up to x
 
--- | Make an unfolding that may be used unsaturated
--- (ug_unsat_ok = unSaturatedOk) and that is reported as having its
--- manifest arity (the number of outer lambdas applications will
--- resolve before doing any work).
-mkInlineUnfolding :: CoreExpr -> Unfolding
-mkInlineUnfolding expr
-  = mkCoreUnfolding InlineStable
-                    True         -- Note [Top-level flag on inline rules]
-                    expr' guide
-  where
-    expr' = simpleOptExpr unsafeGlobalDynFlags expr
-    guide = UnfWhen { ug_arity = manifestArity expr'
-                    , ug_unsat_ok = unSaturatedOk
-                    , ug_boring_ok = boring_ok }
-    boring_ok = inlineBoringOk expr'
+   , unfoldingCaseScaling :: !Int
+      -- ^ Penalize depth with 1/x
 
--- | Make an unfolding that will be used once the RHS has been saturated
--- to the given arity.
-mkInlineUnfoldingWithArity :: Arity -> CoreExpr -> Unfolding
-mkInlineUnfoldingWithArity arity expr
-  = mkCoreUnfolding InlineStable
-                    True         -- Note [Top-level flag on inline rules]
-                    expr' guide
-  where
-    expr' = simpleOptExpr unsafeGlobalDynFlags expr
-    guide = UnfWhen { ug_arity = arity
-                    , ug_unsat_ok = needSaturated
-                    , ug_boring_ok = boring_ok }
-    -- See Note [INLINE pragmas and boring contexts] as to why we need to look
-    -- at the arity here.
-    boring_ok | arity == 0 = True
-              | otherwise  = inlineBoringOk expr'
+   , unfoldingReportPrefix :: !(Maybe String)
+      -- ^ Only report inlining decisions for names with this prefix
+   }
 
-mkInlinableUnfolding :: DynFlags -> CoreExpr -> Unfolding
-mkInlinableUnfolding dflags expr
-  = mkUnfolding dflags InlineStable False False expr'
-  where
-    expr' = simpleOptExpr dflags expr
+defaultUnfoldingOpts :: UnfoldingOpts
+defaultUnfoldingOpts = UnfoldingOpts
+   { unfoldingCreationThreshold = 750
+      -- The unfoldingCreationThreshold threshold must be reasonably high
+      -- to take account of possible discounts.
+      -- E.g. 450 is not enough in 'fulsom' for Interval.sqr to
+      -- inline into Csg.calc (The unfolding for sqr never makes it
+      -- into the interface file.)
 
-specUnfolding :: DynFlags
-              -> [Var] -> (CoreExpr -> CoreExpr)
-              -> [CoreArg]   -- LHS arguments in the RULE
-              -> Unfolding -> Unfolding
--- See Note [Specialising unfoldings]
--- specUnfolding spec_bndrs spec_args unf
---   = \spec_bndrs. unf spec_args
---
-specUnfolding dflags spec_bndrs spec_app rule_lhs_args
-              df@(DFunUnfolding { df_bndrs = old_bndrs, df_con = con, df_args = args })
-  = ASSERT2( rule_lhs_args `equalLength` old_bndrs
-           , ppr df $$ ppr rule_lhs_args )
-           -- For this ASSERT see Note [DFunUnfoldings] in GHC.Core.Opt.Specialise
-    mkDFunUnfolding spec_bndrs con (map spec_arg args)
-      -- For DFunUnfoldings we transform
-      --       \obs. MkD <op1> ... <opn>
-      -- to
-      --       \sbs. MkD ((\obs. <op1>) spec_args) ... ditto <opn>
-  where
-    spec_arg arg = simpleOptExpr dflags $
-                   spec_app (mkLams old_bndrs arg)
-                   -- The beta-redexes created by spec_app will be
-                   -- simplified away by simplOptExpr
+   , unfoldingUseThreshold   = 90
+      -- Last adjusted upwards in #18282, when I reduced
+      -- the result discount for constructors.
 
-specUnfolding dflags spec_bndrs spec_app rule_lhs_args
-              (CoreUnfolding { uf_src = src, uf_tmpl = tmpl
-                             , uf_is_top = top_lvl
-                             , uf_guidance = old_guidance })
- | isStableSource src  -- See Note [Specialising unfoldings]
- , UnfWhen { ug_arity     = old_arity } <- old_guidance
- = mkCoreUnfolding src top_lvl new_tmpl
-                   (old_guidance { ug_arity = old_arity - arity_decrease })
- where
-   new_tmpl = simpleOptExpr dflags $
-              mkLams spec_bndrs    $
-              spec_app tmpl  -- The beta-redexes created by spec_app
-                             -- will besimplified away by simplOptExpr
-   arity_decrease = count isValArg rule_lhs_args - count isId spec_bndrs
+   , unfoldingFunAppDiscount = 60
+      -- Be fairly keen to inline a function if that means
+      -- we'll be able to pick the right method from a dictionary
+
+   , unfoldingDictDiscount   = 30
+      -- Be fairly keen to inline a function if that means
+      -- we'll be able to pick the right method from a dictionary
+
+   , unfoldingVeryAggressive = False
+
+      -- Only apply scaling once we are deeper than threshold cases
+      -- in an RHS.
+   , unfoldingCaseThreshold = 2
+
+      -- Penalize depth with (size*depth)/scaling
+   , unfoldingCaseScaling = 30
+
+      -- Don't filter inlining decision reports
+   , unfoldingReportPrefix = Nothing
+   }
+
+-- Helpers for "GHC.Driver.Session"
+
+updateCreationThreshold :: Int -> UnfoldingOpts -> UnfoldingOpts
+updateCreationThreshold n opts = opts { unfoldingCreationThreshold = n }
+
+updateUseThreshold :: Int -> UnfoldingOpts -> UnfoldingOpts
+updateUseThreshold n opts = opts { unfoldingUseThreshold = n }
+
+updateFunAppDiscount :: Int -> UnfoldingOpts -> UnfoldingOpts
+updateFunAppDiscount n opts = opts { unfoldingFunAppDiscount = n }
+
+updateDictDiscount :: Int -> UnfoldingOpts -> UnfoldingOpts
+updateDictDiscount n opts = opts { unfoldingDictDiscount = n }
+
+updateVeryAggressive :: Bool -> UnfoldingOpts -> UnfoldingOpts
+updateVeryAggressive n opts = opts { unfoldingVeryAggressive = n }
 
 
-specUnfolding _ _ _ _ _ = noUnfolding
+updateCaseThreshold :: Int -> UnfoldingOpts -> UnfoldingOpts
+updateCaseThreshold n opts = opts { unfoldingCaseThreshold = n }
 
-{- Note [Specialising unfoldings]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-When we specialise a function for some given type-class arguments, we use
-specUnfolding to specialise its unfolding.  Some important points:
+updateCaseScaling :: Int -> UnfoldingOpts -> UnfoldingOpts
+updateCaseScaling n opts = opts { unfoldingCaseScaling = n }
 
-* If the original function has a DFunUnfolding, the specialised one
-  must do so too!  Otherwise we lose the magic rules that make it
-  interact with ClassOps
-
-* There is a bit of hack for INLINABLE functions:
-     f :: Ord a => ....
-     f = <big-rhs>
-     {- INLINABLE f #-}
-  Now if we specialise f, should the specialised version still have
-  an INLINABLE pragma?  If it does, we'll capture a specialised copy
-  of <big-rhs> as its unfolding, and that probably won't inline.  But
-  if we don't, the specialised version of <big-rhs> might be small
-  enough to inline at a call site. This happens with Control.Monad.liftM3,
-  and can cause a lot more allocation as a result (nofib n-body shows this).
-
-  Moreover, keeping the INLINABLE thing isn't much help, because
-  the specialised function (probably) isn't overloaded any more.
-
-  Conclusion: drop the INLINEALE pragma.  In practice what this means is:
-     if a stable unfolding has UnfoldingGuidance of UnfWhen,
-        we keep it (so the specialised thing too will always inline)
-     if a stable unfolding has UnfoldingGuidance of UnfIfGoodArgs
-        (which arises from INLINABLE), we discard it
-
-Note [Honour INLINE on 0-ary bindings]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Consider
-
-   x = <expensive>
-   {-# INLINE x #-}
-
-   f y = ...x...
-
-The semantics of an INLINE pragma is
-
-  inline x at every call site, provided it is saturated;
-  that is, applied to at least as many arguments as appear
-  on the LHS of the Haskell source definition.
-
-(This source-code-derived arity is stored in the `ug_arity` field of
-the `UnfoldingGuidance`.)
-
-In the example, x's ug_arity is 0, so we should inline it at every use
-site.  It's rare to have such an INLINE pragma (usually INLINE Is on
-functions), but it's occasionally very important (#15578, #15519).
-In #15519 we had something like
-   x = case (g a b) of I# r -> T r
-   {-# INLINE x #-}
-   f y = ...(h x)....
-
-where h is strict.  So we got
-   f y = ...(case g a b of I# r -> h (T r))...
-
-and that in turn allowed SpecConstr to ramp up performance.
-
-How do we deliver on this?  By adjusting the ug_boring_ok
-flag in mkInlineUnfoldingWithArity; see
-Note [INLINE pragmas and boring contexts]
-
-NB: there is a real risk that full laziness will float it right back
-out again. Consider again
-  x = factorial 200
-  {-# INLINE x #-}
-  f y = ...x...
-
-After inlining we get
-  f y = ...(factorial 200)...
-
-but it's entirely possible that full laziness will do
-  lvl23 = factorial 200
-  f y = ...lvl23...
-
-That's a problem for another day.
-
-Note [INLINE pragmas and boring contexts]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-An INLINE pragma uses mkInlineUnfoldingWithArity to build the
-unfolding.  That sets the ug_boring_ok flag to False if the function
-is not tiny (inlineBoringOK), so that even INLINE functions are not
-inlined in an utterly boring context.  E.g.
-     \x y. Just (f y x)
-Nothing is gained by inlining f here, even if it has an INLINE
-pragma.
-
-But for 0-ary bindings, we want to inline regardless; see
-Note [Honour INLINE on 0-ary bindings].
-
-I'm a bit worried that it's possible for the same kind of problem
-to arise for non-0-ary functions too, but let's wait and see.
--}
-
-mkUnfolding :: DynFlags -> UnfoldingSource
-            -> Bool       -- Is top-level
-            -> Bool       -- Definitely a bottoming binding
-                          -- (only relevant for top-level bindings)
-            -> CoreExpr
-            -> Unfolding
--- Calculates unfolding guidance
--- Occurrence-analyses the expression before capturing it
-mkUnfolding dflags src top_lvl is_bottoming expr
-  = mkCoreUnfolding src top_lvl expr guidance
-  where
-    is_top_bottoming = top_lvl && is_bottoming
-    guidance         = calcUnfoldingGuidance dflags is_top_bottoming expr
-        -- NB: *not* (calcUnfoldingGuidance (occurAnalyseExpr expr))!
-        -- See Note [Calculate unfolding guidance on the non-occ-anal'd expression]
-
-mkCoreUnfolding :: UnfoldingSource -> Bool -> CoreExpr
-                -> UnfoldingGuidance -> Unfolding
--- Occurrence-analyses the expression before capturing it
-mkCoreUnfolding src top_lvl expr guidance
-  = CoreUnfolding { uf_tmpl         = occurAnalyseExpr expr,
-                      -- See Note [Occurrence analysis of unfoldings]
-                    uf_src          = src,
-                    uf_is_top       = top_lvl,
-                    uf_is_value     = exprIsHNF        expr,
-                    uf_is_conlike   = exprIsConLike    expr,
-                    uf_is_work_free = exprIsWorkFree   expr,
-                    uf_expandable   = exprIsExpandable expr,
-                    uf_guidance     = guidance }
-
+updateReportPrefix :: Maybe String -> UnfoldingOpts -> UnfoldingOpts
+updateReportPrefix n opts = opts { unfoldingReportPrefix = n }
 
 {-
 Note [Occurrence analysis of unfoldings]
@@ -412,21 +221,21 @@ inlineBoringOk e
                         , exprIsTrivial a  = go (credit-1) f
     go credit (Tick _ e)                   = go credit e -- dubious
     go credit (Cast e _)                   = go credit e
-    go credit (Case scrut _ _ [(_,_,rhs)]) -- See Note [Inline unsafeCoerce]
+    go credit (Case scrut _ _ [Alt _ _ rhs]) -- See Note [Inline unsafeCoerce]
       | isUnsafeEqualityProof scrut        = go credit rhs
     go _      (Var {})                     = boringCxtOk
     go _      _                            = boringCxtNotOk
 
 calcUnfoldingGuidance
-        :: DynFlags
+        :: UnfoldingOpts
         -> Bool          -- Definitely a top-level, bottoming binding
         -> CoreExpr      -- Expression to look at
         -> UnfoldingGuidance
-calcUnfoldingGuidance dflags is_top_bottoming (Tick t expr)
+calcUnfoldingGuidance opts is_top_bottoming (Tick t expr)
   | not (tickishIsCode t)  -- non-code ticks don't matter for unfolding
-  = calcUnfoldingGuidance dflags is_top_bottoming expr
-calcUnfoldingGuidance dflags is_top_bottoming expr
-  = case sizeExpr dflags bOMB_OUT_SIZE val_bndrs body of
+  = calcUnfoldingGuidance opts is_top_bottoming expr
+calcUnfoldingGuidance opts is_top_bottoming expr
+  = case sizeExpr opts bOMB_OUT_SIZE val_bndrs body of
       TooBig -> UnfNever
       SizeIs size cased_bndrs scrut_discount
         | uncondInline expr n_val_bndrs size
@@ -444,7 +253,7 @@ calcUnfoldingGuidance dflags is_top_bottoming expr
 
   where
     (bndrs, body) = collectBinders expr
-    bOMB_OUT_SIZE = ufCreationThreshold dflags
+    bOMB_OUT_SIZE = unfoldingCreationThreshold opts
            -- Bomb out if size gets bigger than this
     val_bndrs   = filter isId bndrs
     n_val_bndrs = length val_bndrs
@@ -603,7 +412,7 @@ uncondInline rhs arity size
   | arity > 0 = size <= 10 * (arity + 1) -- See Note [INLINE for small functions] (1)
   | otherwise = exprIsTrivial rhs        -- See Note [INLINE for small functions] (4)
 
-sizeExpr :: DynFlags
+sizeExpr :: UnfoldingOpts
          -> Int             -- Bomb out if it gets bigger than this
          -> [Id]            -- Arguments; we're interested in which of these
                             -- get case'd
@@ -612,7 +421,9 @@ sizeExpr :: DynFlags
 
 -- Note [Computing the size of an expression]
 
-sizeExpr dflags bOMB_OUT_SIZE top_args expr
+-- Forcing bOMB_OUT_SIZE early prevents repeated
+-- unboxing of the Int argument.
+sizeExpr opts !bOMB_OUT_SIZE top_args expr
   = size_up expr
   where
     size_up (Cast e _) = size_up e
@@ -631,7 +442,7 @@ sizeExpr dflags bOMB_OUT_SIZE top_args expr
                         size_up_app fun [arg] (if isRealWorldExpr arg then 1 else 0)
 
     size_up (Lam b e)
-      | isId b && not (isRealWorldId b) = lamScrutDiscount dflags (size_up e `addSizeN` 10)
+      | isId b && not (isRealWorldId b) = lamScrutDiscount opts (size_up e `addSizeN` 10)
       | otherwise = size_up e
 
     size_up (Let (NonRec binder rhs) body)
@@ -711,7 +522,9 @@ sizeExpr dflags bOMB_OUT_SIZE top_args expr
 
                 -- unboxed variables, inline primops and unsafe foreign calls
                 -- are all "inline" things:
-          is_inline_scrut (Var v) = isUnliftedType (idType v)
+          is_inline_scrut (Var v) =
+            isUnliftedType (idType v)
+              -- isUnliftedType is OK here: scrutinees have a fixed RuntimeRep (search for FRRCase)
           is_inline_scrut scrut
               | (Var f, _) <- collectArgs scrut
                 = case idDetails f of
@@ -752,11 +565,11 @@ sizeExpr dflags bOMB_OUT_SIZE top_args expr
            FCallId _        -> sizeN (callSize (length val_args) voids)
            DataConWorkId dc -> conSize    dc (length val_args)
            PrimOpId op      -> primOpSize op (length val_args)
-           ClassOpId _      -> classOpSize dflags top_args val_args
-           _                -> funSize dflags top_args fun (length val_args) voids
+           ClassOpId _      -> classOpSize opts top_args val_args
+           _                -> funSize opts top_args fun (length val_args) voids
 
     ------------
-    size_up_alt (_con, _bndrs, rhs) = size_up rhs `addSizeN` 10
+    size_up_alt (Alt _con _bndrs rhs) = size_up rhs `addSizeN` 10
         -- Don't charge for args, so that wrappers look cheap
         -- (See comments about wrappers with Case)
         --
@@ -770,6 +583,7 @@ sizeExpr dflags bOMB_OUT_SIZE top_args expr
       |  isTyVar bndr                 -- Doesn't exist at runtime
       || isJoinId bndr                -- Not allocated at all
       || isUnliftedType (idType bndr) -- Doesn't live in heap
+           -- OK to call isUnliftedType: binders have a fixed RuntimeRep (search for FRRBinder)
       = 0
       | otherwise
       = 10
@@ -807,8 +621,7 @@ sizeExpr dflags bOMB_OUT_SIZE top_args expr
 -- | Finds a nominal size of a string literal.
 litSize :: Literal -> Int
 -- Used by GHC.Core.Unfold.sizeExpr
-litSize (LitNumber LitNumInteger _) = 100   -- Note [Size of literal integers]
-litSize (LitNumber LitNumNatural _) = 100
+litSize (LitNumber LitNumBigNat _)  = 100
 litSize (LitString str) = 10 + 10 * ((BS.length str + 3) `div` 4)
         -- If size could be 0 then @f "x"@ might be too small
         -- [Sept03: make literal strings a bit bigger to avoid fruitless
@@ -817,11 +630,11 @@ litSize _other = 0    -- Must match size of nullary constructors
                       -- Key point: if  x |-> 4, then x must inline unconditionally
                       --            (eg via case binding)
 
-classOpSize :: DynFlags -> [Id] -> [CoreExpr] -> ExprSize
+classOpSize :: UnfoldingOpts -> [Id] -> [CoreExpr] -> ExprSize
 -- See Note [Conlike is interesting]
 classOpSize _ _ []
   = sizeZero
-classOpSize dflags top_args (arg1 : other_args)
+classOpSize opts top_args (arg1 : other_args)
   = SizeIs size arg_discount 0
   where
     size = 20 + (10 * length other_args)
@@ -830,7 +643,7 @@ classOpSize dflags top_args (arg1 : other_args)
     -- The actual discount is rather arbitrarily chosen
     arg_discount = case arg1 of
                      Var dict | dict `elem` top_args
-                              -> unitBag (dict, ufDictDiscount dflags)
+                              -> unitBag (dict, unfoldingDictDiscount opts)
                      _other   -> emptyBag
 
 -- | The size of a function call
@@ -854,10 +667,10 @@ jumpSize n_val_args voids = 2 * (1 + n_val_args - voids)
   -- spectral/puzzle. TODO Perhaps adjusting the default threshold would be a
   -- better solution?
 
-funSize :: DynFlags -> [Id] -> Id -> Int -> Int -> ExprSize
+funSize :: UnfoldingOpts -> [Id] -> Id -> Int -> Int -> ExprSize
 -- Size for functions that are not constructors or primops
 -- Note [Function applications]
-funSize dflags top_args fun n_val_args voids
+funSize opts top_args fun n_val_args voids
   | fun `hasKey` buildIdKey   = buildSize
   | fun `hasKey` augmentIdKey = augmentSize
   | otherwise = SizeIs size arg_discount res_discount
@@ -872,12 +685,12 @@ funSize dflags top_args fun n_val_args voids
         --                  DISCOUNTS
         --  See Note [Function and non-function discounts]
     arg_discount | some_val_args && fun `elem` top_args
-                 = unitBag (fun, ufFunAppDiscount dflags)
+                 = unitBag (fun, unfoldingFunAppDiscount opts)
                  | otherwise = emptyBag
         -- If the function is an argument and is applied
         -- to some values, give it an arg-discount
 
-    res_discount | idArity fun > n_val_args = ufFunAppDiscount dflags
+    res_discount | idArity fun > n_val_args = unfoldingFunAppDiscount opts
                  | otherwise                = 0
         -- If the function is partially applied, show a result discount
 -- XXX maybe behave like ConSize for eval'd variable
@@ -887,7 +700,7 @@ conSize dc n_val_args
   | n_val_args == 0 = SizeIs 0 emptyBag 10    -- Like variables
 
 -- See Note [Unboxed tuple size and result discount]
-  | isUnboxedTupleCon dc = SizeIs 0 emptyBag 10
+  | isUnboxedTupleDataCon dc = SizeIs 0 emptyBag 10
 
 -- See Note [Constructor size and result discount]
   | otherwise = SizeIs 10 emptyBag 10
@@ -928,8 +741,7 @@ Historical note 2: Much longer ago, Simon M tried a MUCH bigger
 discount: (10 * (10 + n_val_args)), and said it was an "unambiguous
 win", but its terribly dangerous because a function with many many
 case branches, each finishing with a constructor, can have an
-arbitrarily large discount.  This led to terrible code bloat: see
-#6099.
+arbitrarily large discount.  This led to terrible code bloat: see #6099.
 
 Note [Unboxed tuple size and result discount]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1009,8 +821,8 @@ augmentSize = SizeIs 0 emptyBag 40
         -- e plus ys. The -2 accounts for the \cn
 
 -- When we return a lambda, give a discount if it's used (applied)
-lamScrutDiscount :: DynFlags -> ExprSize -> ExprSize
-lamScrutDiscount dflags (SizeIs n vs _) = SizeIs n vs (ufFunAppDiscount dflags)
+lamScrutDiscount :: UnfoldingOpts -> ExprSize -> ExprSize
+lamScrutDiscount opts (SizeIs n vs _) = SizeIs n vs (unfoldingFunAppDiscount opts)
 lamScrutDiscount _      TooBig          = TooBig
 
 {-
@@ -1025,30 +837,27 @@ binary sizes shrink significantly either.
 
 Note [Discounts and thresholds]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Constants for discounts and thesholds are defined in "GHC.Driver.Session",
-all of form ufXxxx.   They are:
 
-ufCreationThreshold
+Constants for discounts and thresholds are defined in 'UnfoldingOpts'. They are:
+
+unfoldingCreationThreshold
      At a definition site, if the unfolding is bigger than this, we
      may discard it altogether
 
-ufUseThreshold
+unfoldingUseThreshold
      At a call site, if the unfolding, less discounts, is smaller than
      this, then it's small enough inline
 
-ufDictDiscount
+unfoldingDictDiscount
      The discount for each occurrence of a dictionary argument
      as an argument of a class method.  Should be pretty small
      else big functions may get inlined
 
-ufFunAppDiscount
+unfoldingFunAppDiscount
      Discount for a function argument that is applied.  Quite
      large, because if we inline we avoid the higher-order call.
 
-ufDearOp
-     The size of a foreign call or not-dupable PrimOp
-
-ufVeryAggressive
+unfoldingVeryAggressive
      If True, the compiler ignores all the thresholds and inlines very
      aggressively. It still adheres to arity, simplifier phase control and
      loop breakers.
@@ -1134,100 +943,25 @@ flaggery.  Just the same as smallEnoughToInline, except that it has no
 actual arguments.
 -}
 
-couldBeSmallEnoughToInline :: DynFlags -> Int -> CoreExpr -> Bool
-couldBeSmallEnoughToInline dflags threshold rhs
-  = case sizeExpr dflags threshold [] body of
+couldBeSmallEnoughToInline :: UnfoldingOpts -> Int -> CoreExpr -> Bool
+couldBeSmallEnoughToInline opts threshold rhs
+  = case sizeExpr opts threshold [] body of
        TooBig -> False
        _      -> True
   where
     (_, body) = collectBinders rhs
 
 ----------------
-smallEnoughToInline :: DynFlags -> Unfolding -> Bool
-smallEnoughToInline dflags (CoreUnfolding {uf_guidance = UnfIfGoodArgs {ug_size = size}})
-  = size <= ufUseThreshold dflags
+smallEnoughToInline :: UnfoldingOpts -> Unfolding -> Bool
+smallEnoughToInline opts (CoreUnfolding {uf_guidance = guidance})
+  = case guidance of
+       UnfIfGoodArgs {ug_size = size} -> size <= unfoldingUseThreshold opts
+       UnfWhen {} -> True
+       UnfNever   -> False
 smallEnoughToInline _ _
   = False
 
-----------------
-
-certainlyWillInline :: DynFlags -> IdInfo -> Maybe Unfolding
--- ^ Sees if the unfolding is pretty certain to inline.
--- If so, return a *stable* unfolding for it, that will always inline.
-certainlyWillInline dflags fn_info
-  = case unfoldingInfo fn_info of
-      CoreUnfolding { uf_tmpl = e, uf_guidance = g }
-        | loop_breaker -> Nothing      -- Won't inline, so try w/w
-        | noinline     -> Nothing      -- See Note [Worker-wrapper for NOINLINE functions]
-        | otherwise    -> do_cunf e g  -- Depends on size, so look at that
-
-      DFunUnfolding {} -> Just fn_unf  -- Don't w/w DFuns; it never makes sense
-                                       -- to do so, and even if it is currently a
-                                       -- loop breaker, it may not be later
-
-      _other_unf       -> Nothing
-
-  where
-    loop_breaker = isStrongLoopBreaker (occInfo fn_info)
-    noinline     = inlinePragmaSpec (inlinePragInfo fn_info) == NoInline
-    fn_unf       = unfoldingInfo fn_info
-
-    do_cunf :: CoreExpr -> UnfoldingGuidance -> Maybe Unfolding
-    do_cunf _ UnfNever     = Nothing
-    do_cunf _ (UnfWhen {}) = Just (fn_unf { uf_src = InlineStable })
-                             -- INLINE functions have UnfWhen
-
-        -- The UnfIfGoodArgs case seems important.  If we w/w small functions
-        -- binary sizes go up by 10%!  (This is with SplitObjs.)
-        -- I'm not totally sure why.
-        -- INLINABLE functions come via this path
-        --    See Note [certainlyWillInline: INLINABLE]
-    do_cunf expr (UnfIfGoodArgs { ug_size = size, ug_args = args })
-      | arityInfo fn_info > 0  -- See Note [certainlyWillInline: be careful of thunks]
-      , not (isDeadEndSig (strictnessInfo fn_info))
-              -- Do not unconditionally inline a bottoming functions even if
-              -- it seems smallish. We've carefully lifted it out to top level,
-              -- so we don't want to re-inline it.
-      , let unf_arity = length args
-      , size - (10 * (unf_arity + 1)) <= ufUseThreshold dflags
-      = Just (fn_unf { uf_src      = InlineStable
-                     , uf_guidance = UnfWhen { ug_arity     = unf_arity
-                                             , ug_unsat_ok  = unSaturatedOk
-                                             , ug_boring_ok = inlineBoringOk expr } })
-             -- Note the "unsaturatedOk". A function like  f = \ab. a
-             -- will certainly inline, even if partially applied (f e), so we'd
-             -- better make sure that the transformed inlining has the same property
-      | otherwise
-      = Nothing
-
-{- Note [certainlyWillInline: be careful of thunks]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Don't claim that thunks will certainly inline, because that risks work
-duplication.  Even if the work duplication is not great (eg is_cheap
-holds), it can make a big difference in an inner loop In #5623 we
-found that the WorkWrap phase thought that
-       y = case x of F# v -> F# (v +# v)
-was certainlyWillInline, so the addition got duplicated.
-
-Note that we check arityInfo instead of the arity of the unfolding to detect
-this case. This is so that we don't accidentally fail to inline small partial
-applications, like `f = g 42` (where `g` recurses into `f`) where g has arity 2
-(say). Here there is no risk of work duplication, and the RHS is tiny, so
-certainlyWillInline should return True. But `unf_arity` is zero! However f's
-arity, gotten from `arityInfo fn_info`, is 1.
-
-Failing to say that `f` will inline forces W/W to generate a potentially huge
-worker for f that will immediately cancel with `g`'s wrapper anyway, causing
-unnecessary churn in the Simplifier while arriving at the same result.
-
-Note [certainlyWillInline: INLINABLE]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-certainlyWillInline /must/ return Nothing for a large INLINABLE thing,
-even though we have a stable inlining, so that strictness w/w takes
-place.  It makes a big difference to efficiency, and the w/w pass knows
-how to transfer the INLINABLE info to the worker; see WorkWrap
-Note [Worker-wrapper for INLINABLE functions]
-
+{-
 ************************************************************************
 *                                                                      *
 \subsection{callSiteInline}
@@ -1250,14 +984,6 @@ It just makes the code bigger.  Tt turns out that the convenient way to prevent
 them inlining is to give them a NOINLINE pragma, which we do in
 StrictAnal.addStrictnessInfoToTopId
 -}
-
-callSiteInline :: DynFlags
-               -> Id                    -- The Id
-               -> Bool                  -- True <=> unfolding is active
-               -> Bool                  -- True if there are no arguments at all (incl type args)
-               -> [ArgSummary]          -- One for each value arg; True if it is interesting
-               -> CallCtxt              -- True <=> continuation is interesting
-               -> Maybe CoreExpr        -- Unfolding, if any
 
 data ArgSummary = TrivArg       -- Nothing interesting
                 | NonTrivArg    -- Arg has structure
@@ -1294,75 +1020,194 @@ instance Outputable CallCtxt where
   ppr DiscArgCtxt = text "DiscArgCtxt"
   ppr RuleArgCtxt = text "RuleArgCtxt"
 
-callSiteInline dflags id active_unfolding lone_variable arg_infos cont_info
+callSiteInline :: Logger
+               -> UnfoldingOpts
+               -> Int                   -- Case depth
+               -> Id                    -- The Id
+               -> Bool                  -- True <=> unfolding is active
+               -> Bool                  -- True if there are no arguments at all (incl type args)
+               -> [ArgSummary]          -- One for each value arg; True if it is interesting
+               -> CallCtxt              -- True <=> continuation is interesting
+               -> Maybe CoreExpr        -- Unfolding, if any
+callSiteInline logger opts !case_depth id active_unfolding lone_variable arg_infos cont_info
   = case idUnfolding id of
       -- idUnfolding checks for loop-breakers, returning NoUnfolding
       -- Things with an INLINE pragma may have an unfolding *and*
       -- be a loop breaker  (maybe the knot is not yet untied)
         CoreUnfolding { uf_tmpl = unf_template
-                      , uf_is_work_free = is_wf
-                      , uf_guidance = guidance, uf_expandable = is_exp }
-          | active_unfolding -> tryUnfolding dflags id lone_variable
+                      , uf_cache = unf_cache
+                      , uf_guidance = guidance }
+          | active_unfolding -> tryUnfolding logger opts case_depth id lone_variable
                                     arg_infos cont_info unf_template
-                                    is_wf is_exp guidance
-          | otherwise -> traceInline dflags id "Inactive unfolding:" (ppr id) Nothing
+                                    unf_cache guidance
+          | otherwise -> traceInline logger opts id "Inactive unfolding:" (ppr id) Nothing
         NoUnfolding      -> Nothing
         BootUnfolding    -> Nothing
         OtherCon {}      -> Nothing
         DFunUnfolding {} -> Nothing     -- Never unfold a DFun
 
 -- | Report the inlining of an identifier's RHS to the user, if requested.
-traceInline :: DynFlags -> Id -> String -> SDoc -> a -> a
-traceInline dflags inline_id str doc result
+traceInline :: Logger -> UnfoldingOpts -> Id -> String -> SDoc -> a -> a
+traceInline logger opts inline_id str doc result
   -- We take care to ensure that doc is used in only one branch, ensuring that
   -- the simplifier can push its allocation into the branch. See Note [INLINE
   -- conditional tracing utilities].
-  | enable    = traceAction dflags str doc result
+  | enable    = logTraceMsg logger str doc result
   | otherwise = result
   where
     enable
-      | dopt Opt_D_dump_verbose_inlinings dflags
+      | logHasDumpFlag logger Opt_D_dump_verbose_inlinings
       = True
-      | Just prefix <- inlineCheck dflags
+      | Just prefix <- unfoldingReportPrefix opts
       = prefix `isPrefixOf` occNameString (getOccName inline_id)
       | otherwise
       = False
 {-# INLINE traceInline #-} -- see Note [INLINE conditional tracing utilities]
 
-tryUnfolding :: DynFlags -> Id -> Bool -> [ArgSummary] -> CallCtxt
-             -> CoreExpr -> Bool -> Bool -> UnfoldingGuidance
+{- Note [Avoid inlining into deeply nested cases]
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Consider a function f like this:
+
+  f arg1 arg2 =
+    case ...
+      ... -> g arg1
+      ... -> g arg2
+
+This function is small. So should be safe to inline.
+However sometimes this doesn't quite work out like that.
+Consider this code:
+
+f1 arg1 arg2 ... = ...
+    case _foo of
+      alt1 -> ... f2 arg1 ...
+      alt2 -> ... f2 arg2 ...
+
+f2 arg1 arg2 ... = ...
+    case _foo of
+      alt1 -> ... f3 arg1 ...
+      alt2 -> ... f3 arg2 ...
+
+f3 arg1 arg2 ... = ...
+
+... repeats up to n times. And then f1 is
+applied to some arguments:
+
+foo = ... f1 <interestingArgs> ...
+
+Initially f2..fn are not interesting to inline so we don't.
+However we see that f1 is applied to interesting args.
+So it's an obvious choice to inline those:
+
+foo =
+    ...
+      case _foo of
+        alt1 -> ... f2 <interestingArg> ...
+        alt2 -> ... f2 <interestingArg> ...
+
+As a result we go and inline f2 both mentions of f2 in turn are now applied to interesting
+arguments and f2 is small:
+
+foo =
+    ...
+      case _foo of
+        alt1 -> ... case _foo of
+            alt1 -> ... f3 <interestingArg> ...
+            alt2 -> ... f3 <interestingArg> ...
+
+        alt2 -> ... case _foo of
+            alt1 -> ... f3 <interestingArg> ...
+            alt2 -> ... f3 <interestingArg> ...
+
+The same thing happens for each binding up to f_n, duplicating the amount of inlining
+done in each step. Until at some point we are either done or run out of simplifier
+ticks/RAM. This pattern happened #18730.
+
+To combat this we introduce one more heuristic when weighing inlining decision.
+We keep track of a "case-depth". Which increases each time we look inside a case
+expression with more than one alternative.
+
+We then apply a penalty to inlinings based on the case-depth at which they would
+be inlined. Bounding the number of inlinings in such a scenario.
+
+The heuristic can be tuned in two ways:
+
+* We can ignore the first n levels of case nestings for inlining decisions using
+  -funfolding-case-threshold.
+* The penalty grows linear with the depth. It's computed as size*(depth-threshold)/scaling.
+  Scaling can be set with -funfolding-case-scaling.
+
+Some guidance on setting these defaults:
+
+* A low treshold (<= 2) is needed to prevent exponential cases from spiraling out of
+  control. We picked 2 for no particular reason.
+* Scaling the penalty by any more than 30 means the reproducer from
+  T18730 won't compile even with reasonably small values of n. Instead
+  it will run out of runs/ticks. This means to positively affect the reproducer
+  a scaling <= 30 is required.
+* A scaling of >= 15 still causes a few very large regressions on some nofib benchmarks.
+  (+80% for gc/fulsom, +90% for real/ben-raytrace, +20% for spectral/fibheaps)
+* A scaling of >= 25 showed no regressions on nofib. However it showed a number of
+  (small) regression for compiler perf benchmarks.
+
+The end result is that we are settling for a scaling of 30, with a threshold of 2.
+This gives us minimal compiler perf regressions. No nofib runtime regressions and
+will still avoid this pattern sometimes. This is a "safe" default, where we err on
+the side of compiler blowup instead of risking runtime regressions.
+
+For cases where the default falls short the flag can be changed to allow more/less inlining as
+needed on a per-module basis.
+
+-}
+
+tryUnfolding :: Logger -> UnfoldingOpts -> Int -> Id -> Bool -> [ArgSummary] -> CallCtxt
+             -> CoreExpr -> UnfoldingCache -> UnfoldingGuidance
              -> Maybe CoreExpr
-tryUnfolding dflags id lone_variable
-             arg_infos cont_info unf_template
-             is_wf is_exp guidance
+tryUnfolding logger opts !case_depth id lone_variable arg_infos
+             cont_info unf_template unf_cache guidance
  = case guidance of
-     UnfNever -> traceInline dflags id str (text "UnfNever") Nothing
+     UnfNever -> traceInline logger opts id str (text "UnfNever") Nothing
 
      UnfWhen { ug_arity = uf_arity, ug_unsat_ok = unsat_ok, ug_boring_ok = boring_ok }
-        | enough_args && (boring_ok || some_benefit || ufVeryAggressive dflags)
+        | enough_args && (boring_ok || some_benefit || unfoldingVeryAggressive opts)
                 -- See Note [INLINE for small functions (3)]
-        -> traceInline dflags id str (mk_doc some_benefit empty True) (Just unf_template)
+        -> traceInline logger opts id str (mk_doc some_benefit empty True) (Just unf_template)
         | otherwise
-        -> traceInline dflags id str (mk_doc some_benefit empty False) Nothing
+        -> traceInline logger opts id str (mk_doc some_benefit empty False) Nothing
         where
           some_benefit = calc_some_benefit uf_arity
-          enough_args = (n_val_args >= uf_arity) || (unsat_ok && n_val_args > 0)
+          enough_args  = (n_val_args >= uf_arity) || (unsat_ok && n_val_args > 0)
 
      UnfIfGoodArgs { ug_args = arg_discounts, ug_res = res_discount, ug_size = size }
-        | ufVeryAggressive dflags
-        -> traceInline dflags id str (mk_doc some_benefit extra_doc True) (Just unf_template)
+        | unfoldingVeryAggressive opts
+        -> traceInline logger opts id str (mk_doc some_benefit extra_doc True) (Just unf_template)
         | is_wf && some_benefit && small_enough
-        -> traceInline dflags id str (mk_doc some_benefit extra_doc True) (Just unf_template)
+        -> traceInline logger opts id str (mk_doc some_benefit extra_doc True) (Just unf_template)
         | otherwise
-        -> traceInline dflags id str (mk_doc some_benefit extra_doc False) Nothing
+        -> traceInline logger opts id str (mk_doc some_benefit extra_doc False) Nothing
         where
           some_benefit = calc_some_benefit (length arg_discounts)
-          extra_doc = text "discounted size =" <+> int discounted_size
-          discounted_size = size - discount
-          small_enough = discounted_size <= ufUseThreshold dflags
+          -- See Note [Avoid inlining into deeply nested cases]
+          depth_treshold = unfoldingCaseThreshold opts
+          depth_scaling = unfoldingCaseScaling opts
+          depth_penalty | case_depth <= depth_treshold = 0
+                        | otherwise       = (size * (case_depth - depth_treshold)) `div` depth_scaling
+          adjusted_size = size + depth_penalty - discount
+          small_enough = adjusted_size <= unfoldingUseThreshold opts
           discount = computeDiscount arg_discounts res_discount arg_infos cont_info
 
+          extra_doc = vcat [ text "case depth =" <+> int case_depth
+                           , text "depth based penalty =" <+> int depth_penalty
+                           , text "discounted size =" <+> int adjusted_size ]
+
   where
+    -- Unpack the UnfoldingCache lazily because it may not be needed, and all
+    -- its fields are strict; so evaluating unf_cache at all forces all the
+    -- isWorkFree etc computations to take place.  That risks wasting effort for
+    -- Ids that are never going to inline anyway.
+    -- See Note [UnfoldingCache] in GHC.Core
+    UnfoldingCache{ uf_is_work_free = is_wf, uf_expandable = is_exp } = unf_cache
+
     mk_doc some_benefit extra_doc yes_or_no
       = vcat [ text "arg infos" <+> ppr arg_infos
              , text "interesting continuation" <+> ppr cont_info
@@ -1373,7 +1218,8 @@ tryUnfolding dflags id lone_variable
              , extra_doc
              , text "ANSWER =" <+> if yes_or_no then text "YES" else text "NO"]
 
-    str = "Considering inlining: " ++ showSDocDump dflags (ppr id)
+    ctx = log_default_dump_context (logFlags logger)
+    str = "Considering inlining: " ++ renderWithContext ctx (ppr id)
     n_val_args = length arg_infos
 
            -- some_benefit is used when the RHS is small enough
@@ -1410,8 +1256,12 @@ tryUnfolding dflags id lone_variable
 
 
 {-
-Note [Unfold into lazy contexts], Note [RHS of lets]
+Note [Unfold into lazy contexts]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Merged into Note [RHS of lets].
+
+Note [RHS of lets]
+~~~~~~~~~~~~~~~~~~
 When the call is the argument of a function with a RULE, or the RHS of a let,
 we are a little bit keener to inline.  For example
      f y = (y,y,y)

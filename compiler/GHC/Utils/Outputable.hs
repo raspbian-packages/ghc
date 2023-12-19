@@ -1,4 +1,10 @@
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 
 {-
 (c) The University of Glasgow 2006-2012
@@ -13,12 +19,12 @@
 -- and works over the 'SDoc' type.
 module GHC.Utils.Outputable (
         -- * Type classes
-        Outputable(..), OutputableBndr(..),
+        Outputable(..), OutputableBndr(..), OutputableP(..),
 
         -- * Pretty printing combinators
-        SDoc, runSDoc, initSDocContext,
+        SDoc, runSDoc, PDoc(..),
         docToSDoc,
-        interppSP, interpp'SP,
+        interppSP, interpp'SP, interpp'SP',
         pprQuotedList, pprWithCommas, quotedListWithOr, quotedListWithNor,
         pprWithBars,
         empty, isEmpty, nest,
@@ -29,6 +35,7 @@ module GHC.Utils.Outputable (
         doubleQuotes, angleBrackets,
         semi, comma, colon, dcolon, space, equals, dot, vbar,
         arrow, lollipop, larrow, darrow, arrowt, larrowt, arrowtt, larrowtt,
+        lambda,
         lparen, rparen, lbrack, rbrack, lbrace, rbrace, underscore, mulArrow,
         blankLine, forAllLit, bullet,
         (<>), (<+>), hcat, hsep,
@@ -37,43 +44,53 @@ module GHC.Utils.Outputable (
         fsep, fcat,
         hang, hangNotEmpty, punctuate, ppWhen, ppUnless,
         ppWhenOption, ppUnlessOption,
-        speakNth, speakN, speakNOf, plural, isOrAre, doOrDoes, itsOrTheir,
+        speakNth, speakN, speakNOf, plural, singular,
+        isOrAre, doOrDoes, itsOrTheir, thisOrThese, hasOrHave,
         unicodeSyntax,
 
         coloured, keyword,
 
         -- * Converting 'SDoc' into strings and outputting it
-        printSDoc, printSDocLn, printForUser,
-        printForC, bufLeftRenderSDoc,
-        pprCode, mkCodeStyle,
-        showSDoc, showSDocUnsafe, showSDocOneLine,
-        showSDocForUser, showSDocDebug, showSDocDump, showSDocDumpOneLine,
-        showSDocUnqual, showPpr,
-        renderWithStyle,
+        printSDoc, printSDocLn,
+        bufLeftRenderSDoc,
+        pprCode,
+        showSDocOneLine,
+        showSDocUnsafe,
+        showPprUnsafe,
+        renderWithContext,
+        pprDebugAndThen,
 
         pprInfixVar, pprPrefixVar,
         pprHsChar, pprHsString, pprHsBytes,
 
-        primFloatSuffix, primCharSuffix, primWordSuffix, primDoubleSuffix,
-        primInt64Suffix, primWord64Suffix, primIntSuffix,
+        primFloatSuffix, primCharSuffix, primDoubleSuffix,
+        primInt8Suffix, primWord8Suffix,
+        primInt16Suffix, primWord16Suffix,
+        primInt32Suffix, primWord32Suffix,
+        primInt64Suffix, primWord64Suffix,
+        primIntSuffix, primWordSuffix,
 
-        pprPrimChar, pprPrimInt, pprPrimWord, pprPrimInt64, pprPrimWord64,
+        pprPrimChar, pprPrimInt, pprPrimWord,
+        pprPrimInt8, pprPrimWord8,
+        pprPrimInt16, pprPrimWord16,
+        pprPrimInt32, pprPrimWord32,
+        pprPrimInt64, pprPrimWord64,
 
         pprFastFilePath, pprFilePathString,
 
         -- * Controlling the style in which output is printed
         BindingSite(..),
 
-        PprStyle(..), CodeStyle(..), PrintUnqualified(..),
+        PprStyle(..), LabelStyle(..), PrintUnqualified(..),
         QueryQualifyName, QueryQualifyModule, QueryQualifyPackage,
         reallyAlwaysQualify, reallyAlwaysQualifyNames,
         alwaysQualify, alwaysQualifyNames, alwaysQualifyModules,
         neverQualify, neverQualifyNames, neverQualifyModules,
         alwaysQualifyPackages, neverQualifyPackages,
         QualifyName(..), queryQual,
-        sdocWithDynFlags, sdocOption,
+        sdocOption,
         updSDocContext,
-        SDocContext (..), sdocWithContext,
+        SDocContext (..), sdocWithContext, defaultSDocContext,
         getPprStyle, withPprStyle, setStyleColoured,
         pprDeeper, pprDeeperList, pprSetDepth,
         codeStyle, userStyle, dumpStyle, asmStyle,
@@ -84,20 +101,10 @@ module GHC.Utils.Outputable (
 
         ifPprDebug, whenPprDebug, getPprDebug,
 
-        -- * Error handling and debugging utilities
-        pprPanic, pprSorry, assertPprPanic, pprPgmError,
-        pprTrace, pprTraceDebug, pprTraceWith, pprTraceIt, warnPprTrace,
-        pprSTrace, pprTraceException, pprTraceM, pprTraceWithFlags,
-        trace, pgmError, panic, sorry, assertPanic,
-        pprDebugAndThen, callStackDoc,
     ) where
 
 import GHC.Prelude
 
-import {-# SOURCE #-}   GHC.Driver.Session
-                           ( DynFlags, hasPprDebug, hasNoDebugOutput
-                           , unsafeGlobalDynFlags, initSDocContext
-                           )
 import {-# SOURCE #-}   GHC.Unit.Types ( Unit, Module, moduleName )
 import {-# SOURCE #-}   GHC.Unit.Module.Name( ModuleName )
 import {-# SOURCE #-}   GHC.Types.Name.Occurrence( OccName )
@@ -105,10 +112,8 @@ import {-# SOURCE #-}   GHC.Types.Name.Occurrence( OccName )
 import GHC.Utils.BufHandle (BufHandle)
 import GHC.Data.FastString
 import qualified GHC.Utils.Ppr as Pretty
-import GHC.Utils.Misc
 import qualified GHC.Utils.Ppr.Colour as Col
 import GHC.Utils.Ppr       ( Doc, Mode(..) )
-import GHC.Utils.Panic
 import GHC.Serialized
 import GHC.LanguageExtensions (Extension)
 
@@ -120,6 +125,7 @@ import Data.Int
 import qualified Data.IntMap as IM
 import Data.Set (Set)
 import qualified Data.Set as Set
+import qualified Data.IntSet as IntSet
 import Data.String
 import Data.Word
 import System.IO        ( Handle )
@@ -130,12 +136,13 @@ import Data.Graph (SCC(..))
 import Data.List (intersperse)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NEL
+import Data.Time
+import Data.Time.Format.ISO8601
 
 import GHC.Fingerprint
 import GHC.Show         ( showMultiLineString )
-import GHC.Stack        ( callStack, prettyCallStack )
-import Control.Monad.IO.Class
 import GHC.Utils.Exception
+import GHC.Exts (oneShot)
 
 {-
 ************************************************************************
@@ -158,11 +165,20 @@ data PprStyle
                 -- Does not assume tidied code: non-external names
                 -- are printed with uniques.
 
-  | PprCode CodeStyle
-                -- Print code; either C or assembler
+  | PprCode !LabelStyle -- ^ Print code; either C or assembler
 
-data CodeStyle = CStyle         -- The format of labels differs for C and assembler
-               | AsmStyle
+-- | Style of label pretty-printing.
+--
+-- When we produce C sources or headers, we have to take into account that C
+-- compilers transform C labels when they convert them into symbols. For
+-- example, they can add prefixes (e.g., "_" on Darwin) or suffixes (size for
+-- stdcalls on Windows). So we provide two ways to pretty-print CLabels: C style
+-- or Asm style.
+--
+data LabelStyle
+   = CStyle   -- ^ C label style (used by C and LLVM backends)
+   | AsmStyle -- ^ Asm label style (used by NCG backend)
+   deriving (Eq,Ord,Show)
 
 data Depth
    = AllTheWay
@@ -198,7 +214,7 @@ type QueryQualifyModule = Module -> Bool
 -- the component id to disambiguate it.
 type QueryQualifyPackage = Unit -> Bool
 
--- See Note [Printing original names] in GHC.Driver.Types
+-- See Note [Printing original names] in GHC.Types.Name.Ppr
 data QualifyName   -- Given P:M.T
   = NameUnqual           -- It's in scope unqualified as "T"
                          -- OR nothing called "T" is in scope
@@ -317,9 +333,19 @@ code (either C or assembly), or generating interface files.
 -- | Represents a pretty-printable document.
 --
 -- To display an 'SDoc', use 'printSDoc', 'printSDocLn', 'bufLeftRenderSDoc',
--- or 'renderWithStyle'.  Avoid calling 'runSDoc' directly as it breaks the
+-- or 'renderWithContext'.  Avoid calling 'runSDoc' directly as it breaks the
 -- abstraction layer.
-newtype SDoc = SDoc { runSDoc :: SDocContext -> Doc }
+newtype SDoc = SDoc' (SDocContext -> Doc)
+
+-- See Note [The one-shot state monad trick] in GHC.Utils.Monad
+{-# COMPLETE SDoc #-}
+pattern SDoc :: (SDocContext -> Doc) -> SDoc
+pattern SDoc m <- SDoc' m
+  where
+    SDoc m = SDoc' (oneShot m)
+
+runSDoc :: SDoc -> (SDocContext -> Doc)
+runSDoc (SDoc m) = m
 
 data SDocContext = SDC
   { sdocStyle                       :: !PprStyle
@@ -350,17 +376,31 @@ data SDocContext = SDC
   , sdocSuppressTypeApplications    :: !Bool
   , sdocSuppressIdInfo              :: !Bool
   , sdocSuppressCoercions           :: !Bool
+  , sdocSuppressCoercionTypes       :: !Bool
   , sdocSuppressUnfoldings          :: !Bool
   , sdocSuppressVarKinds            :: !Bool
   , sdocSuppressUniques             :: !Bool
   , sdocSuppressModulePrefixes      :: !Bool
   , sdocSuppressStgExts             :: !Bool
+  , sdocSuppressStgReps             :: !Bool
   , sdocErrorSpans                  :: !Bool
   , sdocStarIsType                  :: !Bool
   , sdocLinearTypes                 :: !Bool
   , sdocImpredicativeTypes          :: !Bool
   , sdocPrintTypeAbbreviations      :: !Bool
-  , sdocDynFlags                    :: DynFlags -- TODO: remove
+  , sdocUnitIdForUser               :: !(FastString -> SDoc)
+      -- ^ Used to map UnitIds to more friendly "package-version:component"
+      -- strings while pretty-printing.
+      --
+      -- Use `GHC.Unit.State.pprWithUnitState` to set it. Users should never
+      -- have to set it to pretty-print SDocs emitted by GHC, otherwise it's a
+      -- bug. It's an internal field used to thread the UnitState so that the
+      -- Outputable instance of UnitId can use it.
+      --
+      -- See Note [Pretty-printing UnitId] in "GHC.Unit" for more details.
+      --
+      -- Note that we use `FastString` instead of `UnitId` to avoid boring
+      -- module inter-dependency issues.
   }
 
 instance IsString SDoc where
@@ -370,8 +410,50 @@ instance IsString SDoc where
 instance Outputable SDoc where
   ppr = id
 
+-- | Default pretty-printing options
+defaultSDocContext :: SDocContext
+defaultSDocContext = SDC
+  { sdocStyle                       = defaultDumpStyle
+  , sdocColScheme                   = Col.defaultScheme
+  , sdocLastColour                  = Col.colReset
+  , sdocShouldUseColor              = False
+  , sdocDefaultDepth                = 5
+  , sdocLineLength                  = 100
+  , sdocCanUseUnicode               = False
+  , sdocHexWordLiterals             = False
+  , sdocPprDebug                    = False
+  , sdocPrintUnicodeSyntax          = False
+  , sdocPrintCaseAsLet              = False
+  , sdocPrintTypecheckerElaboration = False
+  , sdocPrintAxiomIncomps           = False
+  , sdocPrintExplicitKinds          = False
+  , sdocPrintExplicitCoercions      = False
+  , sdocPrintExplicitRuntimeReps    = False
+  , sdocPrintExplicitForalls        = False
+  , sdocPrintPotentialInstances     = False
+  , sdocPrintEqualityRelations      = False
+  , sdocSuppressTicks               = False
+  , sdocSuppressTypeSignatures      = False
+  , sdocSuppressTypeApplications    = False
+  , sdocSuppressIdInfo              = False
+  , sdocSuppressCoercions           = False
+  , sdocSuppressCoercionTypes       = False
+  , sdocSuppressUnfoldings          = False
+  , sdocSuppressVarKinds            = False
+  , sdocSuppressUniques             = False
+  , sdocSuppressModulePrefixes      = False
+  , sdocSuppressStgExts             = False
+  , sdocSuppressStgReps             = True
+  , sdocErrorSpans                  = False
+  , sdocStarIsType                  = False
+  , sdocImpredicativeTypes          = False
+  , sdocLinearTypes                 = False
+  , sdocPrintTypeAbbreviations      = True
+  , sdocUnitIdForUser               = ftext
+  }
 
 withPprStyle :: PprStyle -> SDoc -> SDoc
+{-# INLINE CONLIKE withPprStyle #-}
 withPprStyle sty d = SDoc $ \ctxt -> runSDoc d ctxt{sdocStyle=sty}
 
 pprDeeper :: SDoc -> SDoc
@@ -414,18 +496,19 @@ pprSetDepth depth doc = SDoc $ \ctx ->
             runSDoc doc ctx
 
 getPprStyle :: (PprStyle -> SDoc) -> SDoc
+{-# INLINE CONLIKE getPprStyle #-}
 getPprStyle df = SDoc $ \ctx -> runSDoc (df (sdocStyle ctx)) ctx
 
-sdocWithDynFlags :: (DynFlags -> SDoc) -> SDoc
-sdocWithDynFlags f = SDoc $ \ctx -> runSDoc (f (sdocDynFlags ctx)) ctx
-
 sdocWithContext :: (SDocContext -> SDoc) -> SDoc
+{-# INLINE CONLIKE sdocWithContext #-}
 sdocWithContext f = SDoc $ \ctx -> runSDoc (f ctx) ctx
 
 sdocOption :: (SDocContext -> a) -> (a -> SDoc) -> SDoc
+{-# INLINE CONLIKE sdocOption #-}
 sdocOption f g = sdocWithContext (g . f)
 
 updSDocContext :: (SDocContext -> SDocContext) -> SDoc -> SDoc
+{-# INLINE CONLIKE updSDocContext #-}
 updSDocContext upd doc
   = SDoc $ \ctx -> runSDoc doc (upd ctx)
 
@@ -467,14 +550,17 @@ userStyle _other       = False
 
 -- | Indicate if -dppr-debug mode is enabled
 getPprDebug :: (Bool -> SDoc) -> SDoc
+{-# INLINE CONLIKE getPprDebug #-}
 getPprDebug d = sdocWithContext $ \ctx -> d (sdocPprDebug ctx)
 
 -- | Says what to do with and without -dppr-debug
 ifPprDebug :: SDoc -> SDoc -> SDoc
+{-# INLINE CONLIKE ifPprDebug #-}
 ifPprDebug yes no = getPprDebug $ \dbg -> if dbg then yes else no
 
 -- | Says what to do with -dppr-debug; without, return empty
 whenPprDebug :: SDoc -> SDoc        -- Empty for non-debug style
+{-# INLINE CONLIKE whenPprDebug #-}
 whenPprDebug d = ifPprDebug d empty
 
 -- | The analog of 'Pretty.printDoc_' for 'SDoc', which tries to make sure the
@@ -494,66 +580,19 @@ printSDocLn :: SDocContext -> Mode -> Handle -> SDoc -> IO ()
 printSDocLn ctx mode handle doc =
   printSDoc ctx mode handle (doc $$ text "")
 
-printForUser :: DynFlags -> Handle -> PrintUnqualified -> Depth -> SDoc -> IO ()
-printForUser dflags handle unqual depth doc
-  = printSDocLn ctx PageMode handle doc
-    where ctx = initSDocContext dflags (mkUserStyle unqual depth)
-
--- | Like 'printSDocLn' but specialized with 'LeftMode' and
--- @'PprCode' 'CStyle'@.  This is typically used to output C-- code.
-printForC :: DynFlags -> Handle -> SDoc -> IO ()
-printForC dflags handle doc =
-  printSDocLn ctx LeftMode handle doc
-  where ctx = initSDocContext dflags (PprCode CStyle)
-
 -- | An efficient variant of 'printSDoc' specialized for 'LeftMode' that
 -- outputs to a 'BufHandle'.
 bufLeftRenderSDoc :: SDocContext -> BufHandle -> SDoc -> IO ()
 bufLeftRenderSDoc ctx bufHandle doc =
   Pretty.bufLeftRender bufHandle (runSDoc doc ctx)
 
-pprCode :: CodeStyle -> SDoc -> SDoc
+pprCode :: LabelStyle -> SDoc -> SDoc
+{-# INLINE CONLIKE pprCode #-}
 pprCode cs d = withPprStyle (PprCode cs) d
 
-mkCodeStyle :: CodeStyle -> PprStyle
-mkCodeStyle = PprCode
-
--- Can't make SDoc an instance of Show because SDoc is just a function type
--- However, Doc *is* an instance of Show
--- showSDoc just blasts it out as a string
-showSDoc :: DynFlags -> SDoc -> String
-showSDoc dflags sdoc = renderWithStyle (initSDocContext dflags defaultUserStyle) sdoc
-
--- showSDocUnsafe is unsafe, because `unsafeGlobalDynFlags` might not be
--- initialised yet.
-showSDocUnsafe :: SDoc -> String
-showSDocUnsafe sdoc = showSDoc unsafeGlobalDynFlags sdoc
-
-showPpr :: Outputable a => DynFlags -> a -> String
-showPpr dflags thing = showSDoc dflags (ppr thing)
-
-showSDocUnqual :: DynFlags -> SDoc -> String
--- Only used by Haddock
-showSDocUnqual dflags sdoc = showSDoc dflags sdoc
-
-showSDocForUser :: DynFlags -> PrintUnqualified -> SDoc -> String
--- Allows caller to specify the PrintUnqualified to use
-showSDocForUser dflags unqual doc
- = renderWithStyle (initSDocContext dflags (mkUserStyle unqual AllTheWay)) doc
-
-showSDocDump :: DynFlags -> SDoc -> String
-showSDocDump dflags d = renderWithStyle (initSDocContext dflags defaultDumpStyle) d
-
-showSDocDebug :: DynFlags -> SDoc -> String
-showSDocDebug dflags d = renderWithStyle ctx d
-   where
-      ctx = (initSDocContext dflags defaultDumpStyle)
-               { sdocPprDebug = True
-               }
-
-renderWithStyle :: SDocContext -> SDoc -> String
-renderWithStyle ctx sdoc
-  = let s = Pretty.style{ Pretty.mode       = PageMode,
+renderWithContext :: SDocContext -> SDoc -> String
+renderWithContext ctx sdoc
+  = let s = Pretty.style{ Pretty.mode       = PageMode False,
                           Pretty.lineLength = sdocLineLength ctx }
     in Pretty.renderStyle s $ runSDoc sdoc ctx
 
@@ -567,16 +606,19 @@ showSDocOneLine ctx d
    Pretty.renderStyle s $
       runSDoc d ctx
 
-showSDocDumpOneLine :: DynFlags -> SDoc -> String
-showSDocDumpOneLine dflags d
- = let s = Pretty.style{ Pretty.mode = OneLineMode,
-                         Pretty.lineLength = irrelevantNCols } in
-   Pretty.renderStyle s $
-      runSDoc d (initSDocContext dflags defaultDumpStyle)
+showSDocUnsafe :: SDoc -> String
+showSDocUnsafe sdoc = renderWithContext defaultSDocContext sdoc
 
-irrelevantNCols :: Int
--- Used for OneLineMode and LeftMode when number of cols isn't used
-irrelevantNCols = 1
+showPprUnsafe :: Outputable a => a -> String
+showPprUnsafe a = renderWithContext defaultSDocContext (ppr a)
+
+
+pprDebugAndThen :: SDocContext -> (String -> a) -> SDoc -> SDoc -> a
+pprDebugAndThen ctx cont heading pretty_msg
+ = cont (renderWithContext ctx doc)
+ where
+     doc = withPprStyle defaultDumpStyle (sep [heading, nest 2 pretty_msg])
+
 
 isEmpty :: SDocContext -> SDoc -> Bool
 isEmpty ctx sdoc = Pretty.isEmpty $ runSDoc sdoc (ctx {sdocPprDebug = True})
@@ -597,21 +639,32 @@ float    :: Float      -> SDoc
 double   :: Double     -> SDoc
 rational :: Rational   -> SDoc
 
+{-# INLINE CONLIKE empty #-}
 empty       = docToSDoc $ Pretty.empty
+{-# INLINE CONLIKE char #-}
 char c      = docToSDoc $ Pretty.char c
 
+{-# INLINE CONLIKE text #-}   -- Inline so that the RULE Pretty.text will fire
 text s      = docToSDoc $ Pretty.text s
-{-# INLINE text #-}   -- Inline so that the RULE Pretty.text will fire
 
+{-# INLINE CONLIKE ftext #-}
 ftext s     = docToSDoc $ Pretty.ftext s
+{-# INLINE CONLIKE ptext #-}
 ptext s     = docToSDoc $ Pretty.ptext s
+{-# INLINE CONLIKE ztext #-}
 ztext s     = docToSDoc $ Pretty.ztext s
+{-# INLINE CONLIKE int #-}
 int n       = docToSDoc $ Pretty.int n
+{-# INLINE CONLIKE integer #-}
 integer n   = docToSDoc $ Pretty.integer n
+{-# INLINE CONLIKE float #-}
 float n     = docToSDoc $ Pretty.float n
+{-# INLINE CONLIKE double #-}
 double n    = docToSDoc $ Pretty.double n
+{-# INLINE CONLIKE rational #-}
 rational n  = docToSDoc $ Pretty.rational n
               -- See Note [Print Hexadecimal Literals] in GHC.Utils.Ppr
+{-# INLINE CONLIKE word #-}
 word n      = sdocOption sdocHexWordLiterals $ \case
                True  -> docToSDoc $ Pretty.hex n
                False -> docToSDoc $ Pretty.integer n
@@ -624,14 +677,21 @@ doublePrec p n = text (showFFloat (Just p) n "")
 parens, braces, brackets, quotes, quote,
         doubleQuotes, angleBrackets :: SDoc -> SDoc
 
+{-# INLINE CONLIKE parens #-}
 parens d        = SDoc $ Pretty.parens . runSDoc d
+{-# INLINE CONLIKE braces #-}
 braces d        = SDoc $ Pretty.braces . runSDoc d
+{-# INLINE CONLIKE brackets #-}
 brackets d      = SDoc $ Pretty.brackets . runSDoc d
+{-# INLINE CONLIKE quote #-}
 quote d         = SDoc $ Pretty.quote . runSDoc d
+{-# INLINE CONLIKE doubleQuotes #-}
 doubleQuotes d  = SDoc $ Pretty.doubleQuotes . runSDoc d
+{-# INLINE CONLIKE angleBrackets #-}
 angleBrackets d = char '<' <> d <> char '>'
 
 cparen :: Bool -> SDoc -> SDoc
+{-# INLINE CONLIKE cparen #-}
 cparen b d = SDoc $ Pretty.maybeParens b . runSDoc d
 
 -- 'quotes' encloses something in single quotes...
@@ -642,16 +702,17 @@ quotes d = sdocOption sdocCanUseUnicode $ \case
    False -> SDoc $ \sty ->
       let pp_d = runSDoc d sty
           str  = show pp_d
-      in case (str, lastMaybe str) of
-        (_, Just '\'') -> pp_d
-        ('\'' : _, _)       -> pp_d
-        _other              -> Pretty.quotes pp_d
+      in case str of
+         []                   -> Pretty.quotes pp_d
+         '\'' : _             -> pp_d
+         _ | '\'' <- last str -> pp_d
+           | otherwise        -> Pretty.quotes pp_d
 
 semi, comma, colon, equals, space, dcolon, underscore, dot, vbar :: SDoc
-arrow, lollipop, larrow, darrow, arrowt, larrowt, arrowtt, larrowtt :: SDoc
+arrow, lollipop, larrow, darrow, arrowt, larrowt, arrowtt, larrowtt, lambda :: SDoc
 lparen, rparen, lbrack, rbrack, lbrace, rbrace, blankLine :: SDoc
 
-blankLine  = docToSDoc $ Pretty.text ""
+blankLine  = docToSDoc Pretty.emptyText
 dcolon     = unicodeSyntax (char '∷') (docToSDoc $ Pretty.text "::")
 arrow      = unicodeSyntax (char '→') (docToSDoc $ Pretty.text "->")
 lollipop   = unicodeSyntax (char '⊸') (docToSDoc $ Pretty.text "%1 ->")
@@ -661,6 +722,7 @@ arrowt     = unicodeSyntax (char '⤚') (docToSDoc $ Pretty.text ">-")
 larrowt    = unicodeSyntax (char '⤙') (docToSDoc $ Pretty.text "-<")
 arrowtt    = unicodeSyntax (char '⤜') (docToSDoc $ Pretty.text ">>-")
 larrowtt   = unicodeSyntax (char '⤛') (docToSDoc $ Pretty.text "-<<")
+lambda     = unicodeSyntax (char 'λ') (char '\\')
 semi       = docToSDoc $ Pretty.semi
 comma      = docToSDoc $ Pretty.comma
 colon      = docToSDoc $ Pretty.colon
@@ -711,11 +773,16 @@ nest :: Int -> SDoc -> SDoc
 ($+$) :: SDoc -> SDoc -> SDoc
 -- ^ Join two 'SDoc' together vertically
 
+{-# INLINE CONLIKE nest #-}
 nest n d    = SDoc $ Pretty.nest n . runSDoc d
-(<>) d1 d2  = SDoc $ \sty -> (Pretty.<>)  (runSDoc d1 sty) (runSDoc d2 sty)
-(<+>) d1 d2 = SDoc $ \sty -> (Pretty.<+>) (runSDoc d1 sty) (runSDoc d2 sty)
-($$) d1 d2  = SDoc $ \sty -> (Pretty.$$)  (runSDoc d1 sty) (runSDoc d2 sty)
-($+$) d1 d2 = SDoc $ \sty -> (Pretty.$+$) (runSDoc d1 sty) (runSDoc d2 sty)
+{-# INLINE CONLIKE (<>) #-}
+(<>) d1 d2  = SDoc $ \ctx -> (Pretty.<>)  (runSDoc d1 ctx) (runSDoc d2 ctx)
+{-# INLINE CONLIKE (<+>) #-}
+(<+>) d1 d2 = SDoc $ \ctx -> (Pretty.<+>) (runSDoc d1 ctx) (runSDoc d2 ctx)
+{-# INLINE CONLIKE ($$) #-}
+($$) d1 d2  = SDoc $ \ctx -> (Pretty.$$)  (runSDoc d1 ctx) (runSDoc d2 ctx)
+{-# INLINE CONLIKE ($+$) #-}
+($+$) d1 d2 = SDoc $ \ctx -> (Pretty.$+$) (runSDoc d1 ctx) (runSDoc d2 ctx)
 
 hcat :: [SDoc] -> SDoc
 -- ^ Concatenate 'SDoc' horizontally
@@ -734,25 +801,37 @@ fcat :: [SDoc] -> SDoc
 -- ^ This behaves like 'fsep', but it uses '<>' for horizontal conposition rather than '<+>'
 
 
-hcat ds = SDoc $ \sty -> Pretty.hcat [runSDoc d sty | d <- ds]
-hsep ds = SDoc $ \sty -> Pretty.hsep [runSDoc d sty | d <- ds]
-vcat ds = SDoc $ \sty -> Pretty.vcat [runSDoc d sty | d <- ds]
-sep ds  = SDoc $ \sty -> Pretty.sep  [runSDoc d sty | d <- ds]
-cat ds  = SDoc $ \sty -> Pretty.cat  [runSDoc d sty | d <- ds]
-fsep ds = SDoc $ \sty -> Pretty.fsep [runSDoc d sty | d <- ds]
-fcat ds = SDoc $ \sty -> Pretty.fcat [runSDoc d sty | d <- ds]
+-- Inline all those wrappers to help ensure we create lists of Doc, not of SDoc
+-- later applied to the same SDocContext. It helps the worker/wrapper
+-- transformation extracting only the required fields from the SDocContext.
+{-# INLINE CONLIKE hcat #-}
+hcat ds = SDoc $ \ctx -> Pretty.hcat [runSDoc d ctx | d <- ds]
+{-# INLINE CONLIKE hsep #-}
+hsep ds = SDoc $ \ctx -> Pretty.hsep [runSDoc d ctx | d <- ds]
+{-# INLINE CONLIKE vcat #-}
+vcat ds = SDoc $ \ctx -> Pretty.vcat [runSDoc d ctx | d <- ds]
+{-# INLINE CONLIKE sep #-}
+sep ds  = SDoc $ \ctx -> Pretty.sep  [runSDoc d ctx | d <- ds]
+{-# INLINE CONLIKE cat #-}
+cat ds  = SDoc $ \ctx -> Pretty.cat  [runSDoc d ctx | d <- ds]
+{-# INLINE CONLIKE fsep #-}
+fsep ds = SDoc $ \ctx -> Pretty.fsep [runSDoc d ctx | d <- ds]
+{-# INLINE CONLIKE fcat #-}
+fcat ds = SDoc $ \ctx -> Pretty.fcat [runSDoc d ctx | d <- ds]
 
 hang :: SDoc  -- ^ The header
       -> Int  -- ^ Amount to indent the hung body
       -> SDoc -- ^ The hung body, indented and placed below the header
       -> SDoc
+{-# INLINE CONLIKE hang #-}
 hang d1 n d2   = SDoc $ \sty -> Pretty.hang (runSDoc d1 sty) n (runSDoc d2 sty)
 
 -- | This behaves like 'hang', but does not indent the second document
 -- when the header is empty.
 hangNotEmpty :: SDoc -> Int -> SDoc -> SDoc
+{-# INLINE CONLIKE hangNotEmpty #-}
 hangNotEmpty d1 n d2 =
-    SDoc $ \sty -> Pretty.hangNotEmpty (runSDoc d1 sty) n (runSDoc d2 sty)
+    SDoc $ \ctx -> Pretty.hangNotEmpty (runSDoc d1 ctx) n (runSDoc d2 ctx)
 
 punctuate :: SDoc   -- ^ The punctuation
           -> [SDoc] -- ^ The list that will have punctuation added between every adjacent pair of elements
@@ -764,17 +843,21 @@ punctuate p (d:ds) = go d ds
                      go d (e:es) = (d <> p) : go e es
 
 ppWhen, ppUnless :: Bool -> SDoc -> SDoc
+{-# INLINE CONLIKE ppWhen #-}
 ppWhen True  doc = doc
 ppWhen False _   = empty
 
+{-# INLINE CONLIKE ppUnless #-}
 ppUnless True  _   = empty
 ppUnless False doc = doc
 
+{-# INLINE CONLIKE ppWhenOption #-}
 ppWhenOption :: (SDocContext -> Bool) -> SDoc -> SDoc
 ppWhenOption f doc = sdocOption f $ \case
    True  -> doc
    False -> empty
 
+{-# INLINE CONLIKE ppUnlessOption #-}
 ppUnlessOption :: (SDocContext -> Bool) -> SDoc -> SDoc
 ppUnlessOption f doc = sdocOption f $ \case
    True  -> empty
@@ -797,24 +880,13 @@ coloured col sdoc = sdocOption sdocShouldUseColor $ \case
 keyword :: SDoc -> SDoc
 keyword = coloured Col.colBold
 
-{-
-************************************************************************
-*                                                                      *
-\subsection[Outputable-class]{The @Outputable@ class}
-*                                                                      *
-************************************************************************
--}
+-----------------------------------------------------------------------
+-- The @Outputable@ class
+-----------------------------------------------------------------------
 
 -- | Class designating that some type has an 'SDoc' representation
 class Outputable a where
-        ppr :: a -> SDoc
-        pprPrec :: Rational -> a -> SDoc
-                -- 0 binds least tightly
-                -- We use Rational because there is always a
-                -- Rational between any other two Rationals
-
-        ppr = pprPrec 0
-        pprPrec _ = ppr
+    ppr :: a -> SDoc
 
 instance Outputable Char where
     ppr c = text [c]
@@ -828,6 +900,12 @@ instance Outputable Ordering where
     ppr EQ = text "EQ"
     ppr GT = text "GT"
 
+instance Outputable Int8 where
+   ppr n = integer $ fromIntegral n
+
+instance Outputable Int16 where
+   ppr n = integer $ fromIntegral n
+
 instance Outputable Int32 where
    ppr n = integer $ fromIntegral n
 
@@ -839,6 +917,9 @@ instance Outputable Int where
 
 instance Outputable Integer where
     ppr n = integer n
+
+instance Outputable Word8 where
+    ppr n = integer $ fromIntegral n
 
 instance Outputable Word16 where
     ppr n = integer $ fromIntegral n
@@ -861,6 +942,9 @@ instance Outputable Double where
 instance Outputable () where
     ppr _ = text "()"
 
+instance Outputable UTCTime where
+    ppr = text . formatShow iso8601Format
+
 instance (Outputable a) => Outputable [a] where
     ppr xs = brackets (fsep (punctuate comma (map ppr xs)))
 
@@ -869,6 +953,9 @@ instance (Outputable a) => Outputable (NonEmpty a) where
 
 instance (Outputable a) => Outputable (Set a) where
     ppr s = braces (fsep (punctuate comma (map ppr (Set.toList s))))
+
+instance Outputable IntSet.IntSet where
+    ppr s = braces (fsep (punctuate comma (map ppr (IntSet.toList s))))
 
 instance (Outputable a, Outputable b) => Outputable (a, b) where
     ppr (x,y) = parens (sep [ppr x <> comma, ppr y])
@@ -930,8 +1017,12 @@ instance Outputable FastString where
     ppr fs = ftext fs           -- Prints an unadorned string,
                                 -- no double quotes or anything
 
+deriving newtype instance Outputable NonDetFastString
+deriving newtype instance Outputable LexicalFastString
+
 instance (Outputable key, Outputable elt) => Outputable (M.Map key elt) where
     ppr m = ppr (M.toList m)
+
 instance (Outputable elt) => Outputable (IM.IntMap elt) where
     ppr m = ppr (IM.toList m)
 
@@ -947,6 +1038,144 @@ instance Outputable Serialized where
 
 instance Outputable Extension where
     ppr = text . show
+
+-----------------------------------------------------------------------
+-- The @OutputableP@ class
+-----------------------------------------------------------------------
+
+-- Note [The OutputableP class]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+--
+-- SDoc has become the common type to
+--    * display messages in the terminal
+--    * dump outputs (Cmm, Asm, C, etc.)
+--    * return messages to ghc-api clients
+--
+-- SDoc is a kind of state Monad: SDoc ~ State SDocContext Doc
+-- I.e. to render a SDoc, a SDocContext must be provided.
+--
+-- SDocContext contains legit rendering options (e.g., line length, color and
+-- unicode settings). Sadly SDocContext ended up also being used to thread
+-- values that were considered bothersome to thread otherwise:
+--    * current HomeModule: to decide if module names must be printed qualified
+--    * current UnitState: to print unit-ids as "packagename-version:component"
+--    * target platform: to render labels, instructions, etc.
+--    * selected backend: to display CLabel as C labels or Asm labels
+--
+-- In fact the whole compiler session state that is DynFlags was passed in
+-- SDocContext and these values were retrieved from it.
+--
+-- The Outputable class makes SDoc creation easy for many values by providing
+-- the ppr method:
+--
+--    class Outputable a where
+--       ppr :: a -> SDoc
+--
+-- Almost every type is Outputable in the compiler and it seems great because it
+-- is similar to the Show class. But it's a fallacious simplicity because `SDoc`
+-- needs a `SDocContext` to be transformed into a renderable `Doc`: who is going
+-- to provide the SDocContext with the correct values in it?
+--
+--    E.g. if a SDoc is returned in an exception, how could we know the home
+--    module at the time it was thrown?
+--
+-- A workaround is to pass dummy values (no home module, empty UnitState) at SDoc
+-- rendering time and to hope that the code that produced the SDoc has updated
+-- the SDocContext with meaningful values (e.g. using withPprStyle or
+-- pprWithUnitState). If the context isn't correctly updated, a dummy value is
+-- used and the printed result isn't what we expected. Note that the compiler
+-- doesn't help us finding spots where we need to update the SDocContext.
+--
+-- In some cases we can't pass a dummy value because we can't create one. For
+-- example, how can we create a dummy Platform value? In the old days, GHC only
+-- supported a single Platform set when it was built, so we could use it without
+-- any risk of mistake. But now GHC starts supporting several Platform in the
+-- same session so it becomes an issue. We could be tempted to use the
+-- workaround described above by using "undefined" as a dummy Platform value.
+-- However in this case, if we forget to update it we will get a runtime
+-- error/crash. We could use "Maybe Platform" and die with a better error
+-- message at places where we really really need to know if we are on Windows or
+-- not, or if we use 32- or 64-bit. Still the compiler would not help us in
+-- finding spots where to update the context with a valid Platform.
+--
+-- So finally here comes the OutputableP class:
+--
+--    class OutputableP env a where
+--       pdoc :: env -> a -> SDoc
+--
+-- OutputableP forces us to thread an environment necessary to print a value.
+-- For now we only use it to thread a Platform environment, so we have several
+-- "Outputable Platform XYZ" instances. In the future we could imagine using a
+-- Has class to retrieve a value from a generic environment to make the code
+-- more composable. E.g.:
+--
+--    instance Has Platform env => OutputableP env XYZ where
+--       pdoc env a = ... (getter env :: Platform)
+--
+-- A drawback of this approach over Outputable is that we have to thread an
+-- environment explicitly to use "pdoc" and it's more cumbersome. But it's the
+-- price to pay to have some help from the compiler to ensure that we... thread
+-- an environment down to the places where we need it, i.e. where SDoc are
+-- created (not rendered). On the other hand, it makes life easier for SDoc
+-- renderers as they only have to deal with pretty-printing related options in
+-- SDocContext.
+--
+-- TODO:
+--
+-- 1) we could use OutputableP to thread a UnitState and replace the Outputable
+-- instance of UnitId with:
+--
+--       instance OutputableP UnitState UnitId where ...
+--
+--    This would allow the removal of the `sdocUnitIdForUser` field.
+--
+--    Be warned: I've tried to do it, but there are A LOT of other Outputable
+--    instances depending on UnitId's one. In particular:
+--       UnitId <- Unit <- Module <- Name <- Var <- Core.{Type,Expr} <- ...
+--
+-- 2) Use it to pass the HomeModule (but I fear it will be as difficult as for
+-- UnitId).
+--
+--
+
+-- | Outputable class with an additional environment value
+--
+-- See Note [The OutputableP class]
+class OutputableP env a where
+   pdoc :: env -> a -> SDoc
+
+-- | Wrapper for types having a Outputable instance when an OutputableP instance
+-- is required.
+newtype PDoc a = PDoc a
+
+instance Outputable a => OutputableP env (PDoc a) where
+   pdoc _ (PDoc a) = ppr a
+
+instance OutputableP env a => OutputableP env [a] where
+   pdoc env xs = ppr (fmap (pdoc env) xs)
+
+instance OutputableP env a => OutputableP env (Maybe a) where
+   pdoc env xs = ppr (fmap (pdoc env) xs)
+
+instance (OutputableP env a, OutputableP env b) => OutputableP env (a, b) where
+    pdoc env (a,b) = ppr (pdoc env a, pdoc env b)
+
+instance (OutputableP env a, OutputableP env b, OutputableP env c) => OutputableP env (a, b, c) where
+    pdoc env (a,b,c) = ppr (pdoc env a, pdoc env b, pdoc env c)
+
+
+instance (OutputableP env key, OutputableP env elt) => OutputableP env (M.Map key elt) where
+    pdoc env m = ppr $ fmap (\(x,y) -> (pdoc env x, pdoc env y)) $ M.toList m
+
+instance OutputableP env a => OutputableP env (SCC a) where
+   pdoc env scc = ppr (fmap (pdoc env) scc)
+
+instance OutputableP env SDoc where
+   pdoc _ x = x
+
+instance (OutputableP env a) => OutputableP env (Set a) where
+    pdoc env s = braces (fsep (punctuate comma (map (pdoc env) (Set.toList s))))
+
 
 {-
 ************************************************************************
@@ -965,7 +1194,7 @@ data BindingSite
     | CaseBind    -- ^ The x in   case scrut of x { (y,z) -> ... }
     | CasePatBind -- ^ The y,z in case scrut of x { (y,z) -> ... }
     | LetBind     -- ^ The x in   (let x = rhs in e)
-
+    deriving Eq
 -- | When we print a binder, we often want to print its type too.
 -- The @OutputableBndr@ class encapsulates this idea.
 class Outputable a => OutputableBndr a where
@@ -1015,23 +1244,45 @@ pprHsBytes bs = let escaped = concatMap escape $ BS.unpack bs
 
 -- Postfix modifiers for unboxed literals.
 -- See Note [Printing of literals in Core] in "GHC.Types.Literal".
-primCharSuffix, primFloatSuffix, primIntSuffix :: SDoc
-primDoubleSuffix, primWordSuffix, primInt64Suffix, primWord64Suffix :: SDoc
+primCharSuffix, primFloatSuffix, primDoubleSuffix,
+  primIntSuffix, primWordSuffix,
+  primInt8Suffix, primWord8Suffix,
+  primInt16Suffix, primWord16Suffix,
+  primInt32Suffix, primWord32Suffix,
+  primInt64Suffix, primWord64Suffix
+  :: SDoc
 primCharSuffix   = char '#'
 primFloatSuffix  = char '#'
 primIntSuffix    = char '#'
 primDoubleSuffix = text "##"
 primWordSuffix   = text "##"
-primInt64Suffix  = text "L#"
-primWord64Suffix = text "L##"
+primInt8Suffix   = text "#8"
+primWord8Suffix  = text "##8"
+primInt16Suffix  = text "#16"
+primWord16Suffix = text "##16"
+primInt32Suffix  = text "#32"
+primWord32Suffix = text "##32"
+primInt64Suffix  = text "#64"
+primWord64Suffix = text "##64"
 
 -- | Special combinator for showing unboxed literals.
 pprPrimChar :: Char -> SDoc
-pprPrimInt, pprPrimWord, pprPrimInt64, pprPrimWord64 :: Integer -> SDoc
+pprPrimInt, pprPrimWord,
+  pprPrimInt8, pprPrimWord8,
+  pprPrimInt16, pprPrimWord16,
+  pprPrimInt32, pprPrimWord32,
+  pprPrimInt64, pprPrimWord64
+  :: Integer -> SDoc
 pprPrimChar c   = pprHsChar c <> primCharSuffix
 pprPrimInt i    = integer i   <> primIntSuffix
 pprPrimWord w   = word    w   <> primWordSuffix
+pprPrimInt8 i   = integer i   <> primInt8Suffix
+pprPrimInt16 i  = integer i   <> primInt16Suffix
+pprPrimInt32 i  = integer i   <> primInt32Suffix
 pprPrimInt64 i  = integer i   <> primInt64Suffix
+pprPrimWord8 w  = word    w   <> primWord8Suffix
+pprPrimWord16 w = word    w   <> primWord16Suffix
+pprPrimWord32 w = word    w   <> primWord32Suffix
 pprPrimWord64 w = word    w   <> primWord64Suffix
 
 ---------------------
@@ -1087,7 +1338,10 @@ interppSP  xs = sep (map ppr xs)
 
 -- | Returns the comma-separated concatenation of the pretty printed things.
 interpp'SP :: Outputable a => [a] -> SDoc
-interpp'SP xs = sep (punctuate comma (map ppr xs))
+interpp'SP xs = interpp'SP' ppr xs
+
+interpp'SP' :: (a -> SDoc) -> [a] -> SDoc
+interpp'SP' f xs = sep (punctuate comma (map f xs))
 
 -- | Returns the comma-separated concatenation of the quoted pretty printed things.
 --
@@ -1156,8 +1410,8 @@ speakNth n = hcat [ int n, text suffix ]
 -- > speakN 5 = text "five"
 -- > speakN 10 = text "10"
 speakN :: Int -> SDoc
-speakN 0 = text "none"  -- E.g.  "he has none"
-speakN 1 = text "one"   -- E.g.  "he has one"
+speakN 0 = text "none"  -- E.g.  "they have none"
+speakN 1 = text "one"   -- E.g.  "they have one"
 speakN 2 = text "two"
 speakN 3 = text "three"
 speakN 4 = text "four"
@@ -1184,6 +1438,15 @@ speakNOf n d = speakN n <+> d <> char 's'               -- E.g. "three arguments
 plural :: [a] -> SDoc
 plural [_] = empty  -- a bit frightening, but there you are
 plural _   = char 's'
+
+-- | Determines the singular verb suffix appropriate for the length of a list:
+--
+-- > singular [] = empty
+-- > singular["Hello"] = char 's'
+-- > singular ["Hello", "World"] = empty
+singular :: [a] -> SDoc
+singular [_] = char 's'
+singular _   = empty
 
 -- | Determines the form of to be appropriate for the length of a list:
 --
@@ -1212,95 +1475,17 @@ itsOrTheir :: [a] -> SDoc
 itsOrTheir [_] = text "its"
 itsOrTheir _   = text "their"
 
-{-
-************************************************************************
-*                                                                      *
-\subsection{Error handling}
-*                                                                      *
-************************************************************************
--}
 
-callStackDoc :: HasCallStack => SDoc
-callStackDoc =
-    hang (text "Call stack:")
-       4 (vcat $ map text $ lines (prettyCallStack callStack))
+-- | Determines the form of subject appropriate for the length of a list:
+--
+-- > thisOrThese [x]   = text "This"
+-- > thisOrThese [x,y] = text "These"
+-- > thisOrThese []    = text "These"  -- probably avoid this
+thisOrThese :: [a] -> SDoc
+thisOrThese [_] = text "This"
+thisOrThese _   = text "These"
 
-pprPanic :: HasCallStack => String -> SDoc -> a
--- ^ Throw an exception saying "bug in GHC"
-pprPanic s doc = panicDoc s (doc $$ callStackDoc)
-
-pprSorry :: String -> SDoc -> a
--- ^ Throw an exception saying "this isn't finished yet"
-pprSorry    = sorryDoc
-
-
-pprPgmError :: String -> SDoc -> a
--- ^ Throw an exception saying "bug in pgm being compiled" (used for unusual program errors)
-pprPgmError = pgmErrorDoc
-
-pprTraceDebug :: String -> SDoc -> a -> a
-pprTraceDebug str doc x
-   | debugIsOn && hasPprDebug unsafeGlobalDynFlags = pprTrace str doc x
-   | otherwise                                     = x
-
--- | If debug output is on, show some 'SDoc' on the screen
-pprTrace :: String -> SDoc -> a -> a
-pprTrace str doc x = pprTraceWithFlags unsafeGlobalDynFlags str doc x
-
--- | If debug output is on, show some 'SDoc' on the screen
-pprTraceWithFlags :: DynFlags -> String -> SDoc -> a -> a
-pprTraceWithFlags dflags str doc x
-  | hasNoDebugOutput dflags = x
-  | otherwise               = pprDebugAndThen dflags trace (text str) doc x
-
-pprTraceM :: Applicative f => String -> SDoc -> f ()
-pprTraceM str doc = pprTrace str doc (pure ())
-
--- | @pprTraceWith desc f x@ is equivalent to @pprTrace desc (f x) x@.
--- This allows you to print details from the returned value as well as from
--- ambient variables.
-pprTraceWith :: String -> (a -> SDoc) -> a -> a
-pprTraceWith desc f x = pprTrace desc (f x) x
-
--- | @pprTraceIt desc x@ is equivalent to @pprTrace desc (ppr x) x@
-pprTraceIt :: Outputable a => String -> a -> a
-pprTraceIt desc x = pprTraceWith desc ppr x
-
--- | @pprTraceException desc x action@ runs action, printing a message
--- if it throws an exception.
-pprTraceException :: ExceptionMonad m => String -> SDoc -> m a -> m a
-pprTraceException heading doc =
-    handleGhcException $ \exc -> liftIO $ do
-        putStrLn $ showSDocDump unsafeGlobalDynFlags (sep [text heading, nest 2 doc])
-        throwGhcExceptionIO exc
-
--- | If debug output is on, show some 'SDoc' on the screen along
--- with a call stack when available.
-pprSTrace :: HasCallStack => SDoc -> a -> a
-pprSTrace doc = pprTrace "" (doc $$ callStackDoc)
-
-warnPprTrace :: HasCallStack => Bool -> String -> Int -> SDoc -> a -> a
--- ^ Just warn about an assertion failure, recording the given file and line number.
--- Should typically be accessed with the WARN macros
-warnPprTrace _     _     _     _    x | not debugIsOn     = x
-warnPprTrace _     _file _line _msg x
-   | hasNoDebugOutput unsafeGlobalDynFlags = x
-warnPprTrace False _file _line _msg x = x
-warnPprTrace True   file  line  msg x
-  = pprDebugAndThen unsafeGlobalDynFlags trace heading
-                    (msg $$ callStackDoc )
-                    x
-  where
-    heading = hsep [text "WARNING: file", text file <> comma, text "line", int line]
-
--- | Panic with an assertion failure, recording the given file and
--- line number. Should typically be accessed with the ASSERT family of macros
-assertPprPanic :: HasCallStack => String -> Int -> SDoc -> a
-assertPprPanic _file _line msg
-  = pprPanic "ASSERT failed!" msg
-
-pprDebugAndThen :: DynFlags -> (String -> a) -> SDoc -> SDoc -> a
-pprDebugAndThen dflags cont heading pretty_msg
- = cont (showSDocDump dflags doc)
- where
-     doc = sep [heading, nest 2 pretty_msg]
+-- | @"has"@ or @"have"@ depending on the length of a list.
+hasOrHave :: [a] -> SDoc
+hasOrHave [_] = text "has"
+hasOrHave _   = text "have"

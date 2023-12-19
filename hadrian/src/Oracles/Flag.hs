@@ -1,8 +1,13 @@
 {-# LANGUAGE MultiWayIf #-}
 
 module Oracles.Flag (
-    Flag (..), flag, getFlag, platformSupportsSharedLibs,
-    targetSupportsSMP, useLibffiForAdjustors
+    Flag (..), flag, getFlag,
+    platformSupportsSharedLibs,
+    platformSupportsGhciObjects,
+    targetSupportsSMP,
+    useLibffiForAdjustors,
+    arSupportsDashL,
+    arSupportsAtFile
     ) where
 
 import Hadrian.Oracles.TextFile
@@ -12,6 +17,9 @@ import Base
 import Oracles.Setting
 
 data Flag = ArSupportsAtFile
+          | ArSupportsDashL
+          | SystemArSupportsAtFile
+          | SystemArSupportsDashL
           | CrossCompiling
           | CcLlvmBackend
           | GhcUnregisterised
@@ -22,10 +30,9 @@ data Flag = ArSupportsAtFile
           | SolarisBrokenShld
           | WithLibdw
           | WithLibnuma
-          | HaveLibMingwEx
           | UseSystemFfi
           | BootstrapThreadedRts
-          | SystemDistroMINGW
+          | BootstrapEventLoggingRts
           | UseLibffiForAdjustors
 
 -- Note, if a flag is set to empty string we treat it as set to NO. This seems
@@ -34,6 +41,9 @@ flag :: Flag -> Action Bool
 flag f = do
     let key = case f of
             ArSupportsAtFile     -> "ar-supports-at-file"
+            ArSupportsDashL      -> "ar-supports-dash-l"
+            SystemArSupportsAtFile-> "system-ar-supports-at-file"
+            SystemArSupportsDashL-> "system-ar-supports-dash-l"
             CrossCompiling       -> "cross-compiling"
             CcLlvmBackend        -> "cc-llvm-backend"
             GhcUnregisterised    -> "ghc-unregisterised"
@@ -44,12 +54,11 @@ flag f = do
             SolarisBrokenShld    -> "solaris-broken-shld"
             WithLibdw            -> "with-libdw"
             WithLibnuma          -> "with-libnuma"
-            HaveLibMingwEx       -> "have-lib-mingw-ex"
             UseSystemFfi         -> "use-system-ffi"
             BootstrapThreadedRts -> "bootstrap-threaded-rts"
-            SystemDistroMINGW    -> "system-use-distro-mingw"
+            BootstrapEventLoggingRts -> "bootstrap-event-logging-rts"
             UseLibffiForAdjustors -> "use-libffi-for-adjustors"
-    value <- lookupValueOrError configFile key
+    value <- lookupSystemConfig key
     when (value `notElem` ["YES", "NO", ""]) . error $ "Configuration flag "
         ++ quote (key ++ " = " ++ value) ++ " cannot be parsed."
     return $ value == "YES"
@@ -58,21 +67,42 @@ flag f = do
 getFlag :: Flag -> Expr c b Bool
 getFlag = expr . flag
 
+-- | Does the platform support object merging (and therefore we can build GHCi objects
+-- when appropriate).
+platformSupportsGhciObjects :: Action Bool
+platformSupportsGhciObjects =
+    not . null <$> settingsFileSetting SettingsFileSetting_MergeObjectsCommand
+
+arSupportsDashL :: Stage -> Action Bool
+arSupportsDashL (Stage0 {}) = flag SystemArSupportsDashL
+arSupportsDashL _           = flag ArSupportsDashL
+
+arSupportsAtFile :: Stage -> Action Bool
+arSupportsAtFile (Stage0 {}) = flag SystemArSupportsAtFile
+arSupportsAtFile _           = flag ArSupportsAtFile
+
 platformSupportsSharedLibs :: Action Bool
 platformSupportsSharedLibs = do
-    badPlatform   <- anyTargetPlatform [ "powerpc-unknown-linux"
-                                       , "x86_64-unknown-mingw32"
-                                       , "i386-unknown-mingw32" ]
+    windows       <- isWinTarget
+    ppc_linux     <- anyTargetPlatform [ "powerpc-unknown-linux" ]
     solaris       <- anyTargetPlatform [ "i386-unknown-solaris2" ]
     solarisBroken <- flag SolarisBrokenShld
-    return $ not (badPlatform || solaris && solarisBroken)
+    return $ not (windows || ppc_linux || solaris && solarisBroken)
 
 -- | Does the target support the threaded runtime system?
 targetSupportsSMP :: Action Bool
 targetSupportsSMP = do
   unreg <- flag GhcUnregisterised
   armVer <- targetArmVersion
-  goodArch <- anyTargetArch ["i386", "x86_64", "sparc", "powerpc", "arm", "aarch64", "s390x"]
+  goodArch <- anyTargetArch ["i386"
+                            , "x86_64"
+                            , "powerpc"
+                            , "powerpc64"
+                            , "powerpc64le"
+                            , "arm"
+                            , "aarch64"
+                            , "s390x"
+                            , "riscv64"]
   if   -- The THREADED_RTS requires `BaseReg` to be in a register and the
        -- Unregisterised mode doesn't allow that.
      | unreg                -> return False

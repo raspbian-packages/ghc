@@ -1,4 +1,6 @@
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+
 module GHC.Cmm.Sink (
      cmmSink
   ) where
@@ -8,6 +10,7 @@ import GHC.Prelude
 import GHC.Cmm
 import GHC.Cmm.Opt
 import GHC.Cmm.Liveness
+import GHC.Cmm.LRegSet
 import GHC.Cmm.Utils
 import GHC.Cmm.Dataflow.Block
 import GHC.Cmm.Dataflow.Label
@@ -16,30 +19,13 @@ import GHC.Cmm.Dataflow.Graph
 import GHC.Platform.Regs
 
 import GHC.Platform
-import GHC.Driver.Session
-import GHC.Types.Unique
 import GHC.Types.Unique.FM
 
 import qualified Data.IntSet as IntSet
 import Data.List (partition)
-import qualified Data.Set as Set
 import Data.Maybe
 
--- Compact sets for membership tests of local variables.
-
-type LRegSet = IntSet.IntSet
-
-emptyLRegSet :: LRegSet
-emptyLRegSet = IntSet.empty
-
-nullLRegSet :: LRegSet -> Bool
-nullLRegSet = IntSet.null
-
-insertLRegSet :: LocalReg -> LRegSet -> LRegSet
-insertLRegSet l = IntSet.insert (getKey (getUnique l))
-
-elemLRegSet :: LocalReg -> LRegSet -> Bool
-elemLRegSet l = IntSet.member (getKey (getUnique l))
+import GHC.Exts (inline)
 
 -- -----------------------------------------------------------------------------
 -- Sinking and inlining
@@ -165,11 +151,11 @@ type Assignments = [Assignment]
   --     y = e2
   --     x = e1
 
-cmmSink :: DynFlags -> CmmGraph -> CmmGraph
-cmmSink dflags graph = ofBlockList (g_entry graph) $ sink mapEmpty $ blocks
+cmmSink :: Platform -> CmmGraph -> CmmGraph
+cmmSink platform graph = ofBlockList (g_entry graph) $ sink mapEmpty $ blocks
   where
-  liveness = cmmLocalLiveness dflags graph
-  getLive l = mapFindWithDefault Set.empty l liveness
+  liveness = cmmLocalLivenessL platform graph
+  getLive l = mapFindWithDefault emptyLRegSet l liveness
 
   blocks = revPostorder graph
 
@@ -181,7 +167,6 @@ cmmSink dflags graph = ofBlockList (g_entry graph) $ sink mapEmpty $ blocks
     -- pprTrace "sink" (ppr lbl) $
     blockJoin first final_middle final_last : sink sunk' bs
     where
-      platform = targetPlatform dflags
       lbl = entryLabel b
       (first, middle, last) = blockSplit b
 
@@ -190,20 +175,20 @@ cmmSink dflags graph = ofBlockList (g_entry graph) $ sink mapEmpty $ blocks
       -- Annotate the middle nodes with the registers live *after*
       -- the node.  This will help us decide whether we can inline
       -- an assignment in the current node or not.
-      live = Set.unions (map getLive succs)
-      live_middle = gen_kill dflags last live
-      ann_middles = annotate dflags live_middle (blockToList middle)
+      live = IntSet.unions (map getLive succs)
+      live_middle = gen_killL platform last live
+      ann_middles = annotate platform live_middle (blockToList middle)
 
       -- Now sink and inline in this block
-      (middle', assigs) = walk dflags ann_middles (mapFindWithDefault [] lbl sunk)
+      (middle', assigs) = walk platform ann_middles (mapFindWithDefault [] lbl sunk)
       fold_last = constantFoldNode platform last
-      (final_last, assigs') = tryToInline dflags live fold_last assigs
+      (final_last, assigs') = tryToInline platform live fold_last assigs
 
       -- We cannot sink into join points (successors with more than
       -- one predecessor), so identify the join points and the set
       -- of registers live in them.
       (joins, nonjoins) = partition (`mapMember` join_pts) succs
-      live_in_joins = Set.unions (map getLive joins)
+      live_in_joins = IntSet.unions (map getLive joins)
 
       -- We do not want to sink an assignment into multiple branches,
       -- so identify the set of registers live in multiple successors.
@@ -212,31 +197,33 @@ cmmSink dflags graph = ofBlockList (g_entry graph) $ sink mapEmpty $ blocks
       -- now live in multiple branches.
       init_live_sets = map getLive nonjoins
       live_in_multi live_sets r =
-         case filter (Set.member r) live_sets of
+         case filter (elemLRegSet r) live_sets of
            (_one:_two:_) -> True
            _ -> False
 
       -- Now, drop any assignments that we will not sink any further.
-      (dropped_last, assigs'') = dropAssignments dflags drop_if init_live_sets assigs'
+      (dropped_last, assigs'') = dropAssignments platform drop_if init_live_sets assigs'
 
+      drop_if :: (LocalReg, CmmExpr, AbsMem)
+                      -> [LRegSet] -> (Bool, [LRegSet])
       drop_if a@(r,rhs,_) live_sets = (should_drop, live_sets')
           where
-            should_drop =  conflicts dflags a final_last
-                        || not (isTrivial dflags rhs) && live_in_multi live_sets r
-                        || r `Set.member` live_in_joins
+            should_drop =  conflicts platform a final_last
+                        || not (isTrivial platform rhs) && live_in_multi live_sets r
+                        || r `elemLRegSet` live_in_joins
 
             live_sets' | should_drop = live_sets
                        | otherwise   = map upd live_sets
 
-            upd set | r `Set.member` set = set `Set.union` live_rhs
+            upd set | r `elemLRegSet` set = set `IntSet.union` live_rhs
                     | otherwise          = set
 
-            live_rhs = foldRegsUsed dflags extendRegSet emptyRegSet rhs
+            live_rhs = foldRegsUsed platform (flip insertLRegSet) emptyLRegSet rhs
 
       final_middle = foldl' blockSnoc middle' dropped_last
 
       sunk' = mapUnion sunk $
-                 mapFromList [ (l, filterAssignments dflags (getLive l) assigs'')
+                 mapFromList [ (l, filterAssignments platform (getLive l) assigs'')
                              | l <- succs ]
 
 {- TODO: enable this later, when we have some good tests in place to
@@ -255,12 +242,12 @@ isSmall _ = False
 -- We allow duplication of trivial expressions: registers (both local and
 -- global) and literals.
 --
-isTrivial :: DynFlags -> CmmExpr -> Bool
+isTrivial :: Platform -> CmmExpr -> Bool
 isTrivial _ (CmmReg (CmmLocal _)) = True
-isTrivial dflags (CmmReg (CmmGlobal r)) = -- see Note [Inline GlobalRegs?]
-  if isARM (platformArch (targetPlatform dflags))
+isTrivial platform (CmmReg (CmmGlobal r)) = -- see Note [Inline GlobalRegs?]
+  if isARM (platformArch platform)
   then True -- CodeGen.Platform.ARM does not have globalRegMaybe
-  else isJust (globalRegMaybe (targetPlatform dflags) r)
+  else isJust (globalRegMaybe platform r)
   -- GlobalRegs that are loads from BaseReg are not trivial
 isTrivial _ (CmmLit _) = True
 isTrivial _ _          = False
@@ -268,9 +255,9 @@ isTrivial _ _          = False
 --
 -- annotate each node with the set of registers live *after* the node
 --
-annotate :: DynFlags -> LocalRegSet -> [CmmNode O O] -> [(LocalRegSet, CmmNode O O)]
-annotate dflags live nodes = snd $ foldr ann (live,[]) nodes
-  where ann n (live,nodes) = (gen_kill dflags n live, (live,n) : nodes)
+annotate :: Platform -> LRegSet -> [CmmNode O O] -> [(LRegSet, CmmNode O O)]
+annotate platform live nodes = snd $ foldr ann (live,[]) nodes
+  where ann n (live,nodes) = (gen_killL platform n live, (live,n) : nodes)
 
 --
 -- Find the blocks that have multiple successors (join points)
@@ -287,14 +274,14 @@ findJoinPoints blocks = mapFilter (>1) succ_counts
 -- filter the list of assignments to remove any assignments that
 -- are not live in a continuation.
 --
-filterAssignments :: DynFlags -> LocalRegSet -> Assignments -> Assignments
-filterAssignments dflags live assigs = reverse (go assigs [])
+filterAssignments :: Platform -> LRegSet -> Assignments -> Assignments
+filterAssignments platform live assigs = reverse (go assigs [])
   where go []             kept = kept
         go (a@(r,_,_):as) kept | needed    = go as (a:kept)
                                | otherwise = go as kept
            where
-              needed = r `Set.member` live
-                       || any (conflicts dflags a) (map toNode kept)
+              needed = r `elemLRegSet` live
+                       || any (conflicts platform a) (map toNode kept)
                        --  Note that we must keep assignments that are
                        -- referred to by other assignments we have
                        -- already kept.
@@ -313,8 +300,8 @@ filterAssignments dflags live assigs = reverse (go assigs [])
 --    * a list of assignments that will be placed *after* that block.
 --
 
-walk :: DynFlags
-     -> [(LocalRegSet, CmmNode O O)]    -- nodes of the block, annotated with
+walk :: Platform
+     -> [(LRegSet, CmmNode O O)]    -- nodes of the block, annotated with
                                         -- the set of registers live *after*
                                         -- this node.
 
@@ -327,25 +314,68 @@ walk :: DynFlags
         , Assignments                   -- Assignments to sink further
         )
 
-walk dflags nodes assigs = go nodes emptyBlock assigs
+walk platform nodes assigs = go nodes emptyBlock assigs
  where
    go []               block as = (block, as)
    go ((live,node):ns) block as
+    -- discard nodes representing dead assignment
     | shouldDiscard node live             = go ns block as
-       -- discard dead assignment
+    -- sometimes only after simplification we can tell we can discard the node.
+    -- See Note [Discard simplified nodes]
+    | noOpAssignment node2                = go ns block as
+    -- Pick up interesting assignments
     | Just a <- shouldSink platform node2 = go ns block (a : as1)
+    -- Try inlining, drop assignments and move on
     | otherwise                           = go ns block' as'
     where
-      platform = targetPlatform dflags
+      -- Simplify node
       node1 = constantFoldNode platform node
 
-      (node2, as1) = tryToInline dflags live node1 as
+      -- Inline assignments
+      (node2, as1) = tryToInline platform live node1 as
 
-      (dropped, as') = dropAssignmentsSimple dflags
-                          (\a -> conflicts dflags a node2) as1
+      -- Drop any earlier assignments conflicting with node2
+      (dropped, as') = dropAssignmentsSimple platform
+                          (\a -> conflicts platform a node2) as1
 
+      -- Walk over the rest of the block. Includes dropped assignments
       block' = foldl' blockSnoc block dropped `blockSnoc` node2
 
+{- Note [Discard simplified nodes]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider a sequence like this:
+
+      _c1::P64 = R1;
+      _c3::I64 = I64[_c1::P64 + 1];
+      R1 = _c1::P64;
+      P64[Sp - 72] = _c1::P64;
+      I64[Sp - 64] = _c3::I64;
+
+If we discard assignments *before* simplifying nodes when we get to `R1 = _c1`.
+This is then simplified into `R1 = `R1` and as a consequence prevents sinking of
+loads from R1. What happens is that we:
+    * Check if we can discard the node `R1 = _c1 (no)
+    * Simplify the node to R1 = R1
+    * We check all remaining assignments for conflicts.
+    * The assignment `_c3 = [R1 + 1]`; (R1 already inlined on pickup)
+      conflicts with R1 = R1, because it reads `R1` and the node writes
+      to R1
+    * This is clearly no-sensical because `R1 = R1` doesn't affect R1's value.
+
+The solutions is to check if we can discard nodes before and *after* simplifying
+them. We could only do it after as well, but I assume doing it early might save
+some work.
+
+That is if we process a assignment node we now:
+    * Check if it can be discarded (because it's dead or a no-op)
+    * Simplify the rhs of the assignment.
+    * New: Check again if it might be a no-op now.
+    * ...
+
+This can help with problems like the one reported in #20334. For a full example see the test
+cmm_sink_sp.
+
+-}
 
 --
 -- Heuristic to decide whether to pick up and sink an assignment
@@ -369,45 +399,56 @@ shouldSink _ _other = Nothing
 -- out of inlining, but the inliner will see that r is live
 -- after the instruction and choose not to inline r in the rhs.
 --
-shouldDiscard :: CmmNode e x -> LocalRegSet -> Bool
+shouldDiscard :: CmmNode e x -> LRegSet -> Bool
 shouldDiscard node live
    = case node of
+       -- r = r
        CmmAssign r (CmmReg r') | r == r' -> True
-       CmmAssign (CmmLocal r) _ -> not (r `Set.member` live)
+       -- r = e, r is dead after assignment
+       CmmAssign (CmmLocal r) _ -> not (r `elemLRegSet` live)
+       _otherwise -> False
+
+noOpAssignment :: CmmNode e x -> Bool
+noOpAssignment node
+   = case node of
+       -- r = r
+       CmmAssign r (CmmReg r') | r == r' -> True
        _otherwise -> False
 
 
 toNode :: Assignment -> CmmNode O O
 toNode (r,rhs,_) = CmmAssign (CmmLocal r) rhs
 
-dropAssignmentsSimple :: DynFlags -> (Assignment -> Bool) -> Assignments
+dropAssignmentsSimple :: Platform -> (Assignment -> Bool) -> Assignments
                       -> ([CmmNode O O], Assignments)
-dropAssignmentsSimple dflags f = dropAssignments dflags (\a _ -> (f a, ())) ()
+dropAssignmentsSimple platform f = dropAssignments platform (\a _ -> (f a, ())) ()
 
-dropAssignments :: DynFlags -> (Assignment -> s -> (Bool, s)) -> s -> Assignments
+dropAssignments :: Platform -> (Assignment -> s -> (Bool, s)) -> s -> Assignments
                 -> ([CmmNode O O], Assignments)
-dropAssignments dflags should_drop state assigs
+dropAssignments platform should_drop state assigs
  = (dropped, reverse kept)
  where
    (dropped,kept) = go state assigs [] []
 
    go _ []             dropped kept = (dropped, kept)
    go state (assig : rest) dropped kept
-      | conflict  = go state' rest (toNode assig : dropped) kept
+      | conflict  =
+          let !node = toNode assig
+          in  go state' rest (node : dropped) kept
       | otherwise = go state' rest dropped (assig:kept)
       where
         (dropit, state') = should_drop assig state
-        conflict = dropit || any (conflicts dflags assig) dropped
+        conflict = dropit || any (conflicts platform assig) dropped
 
 
 -- -----------------------------------------------------------------------------
 -- Try to inline assignments into a node.
--- This also does constant folding for primpops, since
+-- This also does constant folding for primops, since
 -- inlining opens up opportunities for doing so.
 
 tryToInline
-   :: DynFlags
-   -> LocalRegSet               -- set of registers live after this
+   :: forall x. Platform
+   -> LRegSet               -- set of registers live after this
                                 -- node.  We cannot inline anything
                                 -- that is live after the node, unless
                                 -- it is small enough to duplicate.
@@ -418,43 +459,50 @@ tryToInline
       , Assignments             -- Remaining assignments
       )
 
-tryToInline dflags live node assigs = go usages node emptyLRegSet assigs
+tryToInline platform liveAfter node assigs =
+  -- pprTrace "tryToInline assig length:" (ppr $ length assigs) $
+    go usages liveAfter node emptyLRegSet assigs
  where
   usages :: UniqFM LocalReg Int -- Maps each LocalReg to a count of how often it is used
-  usages = foldLocalRegsUsed dflags addUsage emptyUFM node
+  usages = foldLocalRegsUsed platform addUsage emptyUFM node
 
-  go _usages node _skipped [] = (node, [])
+  go :: UniqFM LocalReg Int -> LRegSet -> CmmNode O x -> LRegSet -> Assignments
+     -> (CmmNode O x, Assignments)
+  go _usages _live node _skipped [] = (node, [])
 
-  go usages node skipped (a@(l,rhs,_) : rest)
-   | cannot_inline           = dont_inline
-   | occurs_none             = discard  -- Note [discard during inlining]
-   | occurs_once             = inline_and_discard
-   | isTrivial dflags rhs    = inline_and_keep
-   | otherwise               = dont_inline
+  go usages live node skipped (a@(l,rhs,_) : rest)
+   | cannot_inline            = dont_inline
+   | occurs_none              = discard  -- See Note [discard during inlining]
+   | occurs_once              = inline_and_discard
+   | isTrivial platform rhs   = inline_and_keep
+   | otherwise                = dont_inline
    where
-        platform = targetPlatform dflags
-        inline_and_discard = go usages' inl_node skipped rest
-          where usages' = foldLocalRegsUsed dflags addUsage usages rhs
+        inline_and_discard = go usages' live inl_node skipped rest
+          where usages' = foldLocalRegsUsed platform addUsage usages rhs
 
-        discard = go usages node skipped rest
+        discard = go usages live node skipped rest
 
         dont_inline        = keep node  -- don't inline the assignment, keep it
         inline_and_keep    = keep inl_node -- inline the assignment, keep it
 
+        keep :: CmmNode O x -> (CmmNode O x, Assignments)
         keep node' = (final_node, a : rest')
-          where (final_node, rest') = go usages' node' (insertLRegSet l skipped) rest
-                usages' = foldLocalRegsUsed dflags (\m r -> addToUFM m r 2)
-                                            usages rhs
-                -- we must not inline anything that is mentioned in the RHS
-                -- of a binding that we have already skipped, so we set the
-                -- usages of the regs on the RHS to 2.
+          where (final_node, rest') = go usages live' node' (insertLRegSet l skipped) rest
 
-        cannot_inline = skipped `regsUsedIn` rhs -- Note [dependent assignments]
+                -- Avoid discarding of assignments to vars on the rhs.
+                -- See Note [Keeping assignemnts mentioned in skipped RHSs]
+                -- usages' = foldLocalRegsUsed platform (\m r -> addToUFM m r 2)
+                                            -- usages rhs
+                live' = inline foldLocalRegsUsed platform (\m r -> insertLRegSet r m)
+                                            live rhs
+
+        cannot_inline = skipped `regsUsedIn` rhs -- See Note [dependent assignments]
                         || l `elemLRegSet` skipped
-                        || not (okToInline dflags rhs node)
+                        || not (okToInline platform rhs node)
 
+        -- How often is l used in the current node.
         l_usages = lookupUFM usages l
-        l_live   = l `elemRegSet` live
+        l_live   = l `elemLRegSet` live
 
         occurs_once = not l_live && l_usages == Just 1
         occurs_none = not l_live && l_usages == Nothing
@@ -470,9 +518,29 @@ tryToInline dflags live node assigs = go usages node emptyLRegSet assigs
         inl_exp (CmmMachOp op args) = cmmMachOpFold platform op args
         inl_exp other = other
 
+{- Note [Keeping assignemnts mentioned in skipped RHSs]
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    If we have to assignments: [z = y, y = e1] and we skip
+    z we *must* retain the assignment y = e1. This is because
+    we might inline "z = y" into another node later on so we
+    must ensure y is still defined at this point.
+
+    If we dropped the assignment of "y = e1" then we would end up
+    referencing a variable which hasn't been mentioned after
+    inlining.
+
+    We use a hack to do this.
+
+    We pretend the regs from the rhs are live after the current
+    node. Since we only discard assignments to variables
+    which are dead after the current block this prevents discarding of the
+    assignment. It still allows inlining should e1 be a trivial rhs
+    however.
+
+-}
 
 {- Note [improveConditional]
-
+   ~~~~~~~~~~~~~~~~~~~~~~~~~
 cmmMachOpFold tries to simplify conditionals to turn things like
   (a == b) != 1
 into
@@ -510,7 +578,6 @@ improveConditional other = other
 
 -- Note [dependent assignments]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
---
 -- If our assignment list looks like
 --
 --    [ y = e,  x = ... y ... ]
@@ -558,10 +625,16 @@ addUsage m r = addToUFM_C (+) m r 1
 
 regsUsedIn :: LRegSet -> CmmExpr -> Bool
 regsUsedIn ls _ | nullLRegSet ls = False
-regsUsedIn ls e = wrapRecExpf f e False
-  where f (CmmReg (CmmLocal l))      _ | l `elemLRegSet` ls = True
-        f (CmmRegOff (CmmLocal l) _) _ | l `elemLRegSet` ls = True
-        f _ z = z
+regsUsedIn ls e = go ls e False
+  where use :: LRegSet -> CmmExpr -> Bool -> Bool
+        use ls (CmmReg (CmmLocal l))      _ | l `elemLRegSet` ls = True
+        use ls (CmmRegOff (CmmLocal l) _) _ | l `elemLRegSet` ls = True
+        use _ls _ z = z
+
+        go :: LRegSet -> CmmExpr -> Bool -> Bool
+        go ls (CmmMachOp _ es)   z = foldr (go ls) z es
+        go ls (CmmLoad addr _ _) z = go ls addr z
+        go ls e                  z = use ls e z
 
 -- we don't inline into CmmUnsafeForeignCall if the expression refers
 -- to global registers.  This is a HACK to avoid global registers
@@ -569,28 +642,28 @@ regsUsedIn ls e = wrapRecExpf f e False
 -- ought to be able to handle it properly, but currently neither PprC
 -- nor the NCG can do it.  See Note [Register parameter passing]
 -- See also GHC.StgToCmm.Foreign.load_args_into_temps.
-okToInline :: DynFlags -> CmmExpr -> CmmNode e x -> Bool
-okToInline dflags expr node@(CmmUnsafeForeignCall{}) =
-    not (globalRegistersConflict dflags expr node)
+okToInline :: Platform -> CmmExpr -> CmmNode e x -> Bool
+okToInline platform expr node@(CmmUnsafeForeignCall{}) =
+    not (globalRegistersConflict platform expr node)
 okToInline _ _ _ = True
 
 -- -----------------------------------------------------------------------------
 
 -- | @conflicts (r,e) node@ is @False@ if and only if the assignment
 -- @r = e@ can be safely commuted past statement @node@.
-conflicts :: DynFlags -> Assignment -> CmmNode O x -> Bool
-conflicts dflags (r, rhs, addr) node
+conflicts :: Platform -> Assignment -> CmmNode O x -> Bool
+conflicts platform (r, rhs, addr) node
 
   -- (1) node defines registers used by rhs of assignment. This catches
   -- assignments and all three kinds of calls. See Note [Sinking and calls]
-  | globalRegistersConflict dflags rhs node                       = True
-  | localRegistersConflict  dflags rhs node                       = True
+  | globalRegistersConflict platform rhs node                       = True
+  | localRegistersConflict  platform rhs node                       = True
 
   -- (2) node uses register defined by assignment
-  | foldRegsUsed dflags (\b r' -> r == r' || b) False node        = True
+  | foldRegsUsed platform (\b r' -> r == r' || b) False node        = True
 
   -- (3) a store to an address conflicts with a read of the same memory
-  | CmmStore addr' e <- node
+  | CmmStore addr' e _ <- node
   , memConflicts addr (loadAddr platform addr' (cmmExprWidth platform e)) = True
 
   -- (4) an assignment to Hp/Sp conflicts with a heap/stack read respectively
@@ -601,31 +674,49 @@ conflicts dflags (r, rhs, addr) node
   -- (5) foreign calls clobber heap: see Note [Foreign calls clobber heap]
   | CmmUnsafeForeignCall{} <- node, memConflicts addr AnyMem      = True
 
-  -- (6) native calls clobber any memory
+  -- (6) suspendThread clobbers every global register not backed by a real
+  -- register. It also clobbers heap and stack but this is handled by (5)
+  | CmmUnsafeForeignCall (PrimTarget MO_SuspendThread) _ _ <- node
+  , foldRegsUsed platform (\b g -> globalRegMaybe platform g == Nothing || b) False rhs
+  = True
+
+  -- (7) native calls clobber any memory
   | CmmCall{} <- node, memConflicts addr AnyMem                   = True
 
-  -- (7) otherwise, no conflict
+  -- (8) otherwise, no conflict
   | otherwise = False
-  where
-    platform = targetPlatform dflags
+
+{- Note [Inlining foldRegsDefd]
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   foldRegsDefd is, after optimization, *not* a small function so
+   it's only marked INLINEABLE, but not INLINE.
+
+   However in some specific cases we call it *very* often making it
+   important to avoid the overhead of allocating the folding function.
+
+   So we simply force inlining via the magic inline function.
+   For T3294 this improves allocation with -O by ~1%.
+
+-}
 
 -- Returns True if node defines any global registers that are used in the
 -- Cmm expression
-globalRegistersConflict :: DynFlags -> CmmExpr -> CmmNode e x -> Bool
-globalRegistersConflict dflags expr node =
-    foldRegsDefd dflags (\b r -> b || regUsedIn (targetPlatform dflags) (CmmGlobal r) expr)
+globalRegistersConflict :: Platform -> CmmExpr -> CmmNode e x -> Bool
+globalRegistersConflict platform expr node =
+    -- See Note [Inlining foldRegsDefd]
+    inline foldRegsDefd platform (\b r -> b || regUsedIn platform (CmmGlobal r) expr)
                  False node
 
 -- Returns True if node defines any local registers that are used in the
 -- Cmm expression
-localRegistersConflict :: DynFlags -> CmmExpr -> CmmNode e x -> Bool
-localRegistersConflict dflags expr node =
-    foldRegsDefd dflags (\b r -> b || regUsedIn (targetPlatform dflags) (CmmLocal  r) expr)
+localRegistersConflict :: Platform -> CmmExpr -> CmmNode e x -> Bool
+localRegistersConflict platform expr node =
+    -- See Note [Inlining foldRegsDefd]
+    inline foldRegsDefd platform (\b r -> b || regUsedIn platform (CmmLocal  r) expr)
                  False node
 
 -- Note [Sinking and calls]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~
---
 -- We have three kinds of calls: normal (CmmCall), safe foreign (CmmForeignCall)
 -- and unsafe foreign (CmmUnsafeForeignCall). We perform sinking pass after
 -- stack layout (see Note [Sinking after stack layout]) which leads to two
@@ -708,7 +799,6 @@ data AbsMem
 
 -- Note [Foreign calls clobber heap]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
---
 -- It is tempting to say that foreign calls clobber only
 -- non-heap/stack memory, but unfortunately we break this invariant in
 -- the RTS.  For example, in stg_catch_retry_frame we call
@@ -724,6 +814,10 @@ data AbsMem
 -- Some CallishMachOp imply a memory barrier e.g. AtomicRMW and
 -- therefore we should never float any memory operations across one of
 -- these calls.
+--
+-- `suspendThread` releases the capability used by the thread, hence we mustn't
+-- float accesses to heap, stack or virtual global registers stored in the
+-- capability (e.g. with unregisterised build, see #19237).
 
 
 bothMems :: AbsMem -> AbsMem -> AbsMem
@@ -751,9 +845,9 @@ memConflicts (SpMem o1 w1) (SpMem o2 w2)
 memConflicts _         _         = True
 
 exprMem :: Platform -> CmmExpr -> AbsMem
-exprMem platform (CmmLoad addr w)  = bothMems (loadAddr platform addr (typeWidth w)) (exprMem platform addr)
-exprMem platform (CmmMachOp _ es)  = foldr bothMems NoMem (map (exprMem platform) es)
-exprMem _        _                 = NoMem
+exprMem platform (CmmLoad addr w _)  = bothMems (loadAddr platform addr (typeWidth w)) (exprMem platform addr)
+exprMem platform (CmmMachOp _ es)    = foldr bothMems NoMem (map (exprMem platform) es)
+exprMem _        _                   = NoMem
 
 loadAddr :: Platform -> CmmExpr -> Width -> AbsMem
 loadAddr platform e w =

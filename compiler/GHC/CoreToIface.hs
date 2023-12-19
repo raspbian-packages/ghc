@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP #-}
+
 {-# LANGUAGE Strict #-} -- See Note [Avoiding space leaks in toIface*]
 
 -- | Functions for converting Core things to interface file things.
@@ -42,39 +42,52 @@ module GHC.CoreToIface
     , toIfaceVar
       -- * Other stuff
     , toIfaceLFInfo
+      -- * CgBreakInfo
+    , dehydrateCgBreakInfo
     ) where
-
-#include "HsVersions.h"
 
 import GHC.Prelude
 
-import GHC.Iface.Syntax
-import GHC.Core.DataCon
-import GHC.Types.Id
-import GHC.Types.Id.Info
+import Data.Word
+
 import GHC.StgToCmm.Types
+
+import GHC.ByteCode.Types
+
 import GHC.Core
 import GHC.Core.TyCon hiding ( pprPromotionQuote )
 import GHC.Core.Coercion.Axiom
-import GHC.Builtin.Types.Prim ( eqPrimTyCon, eqReprPrimTyCon )
-import GHC.Builtin.Types ( heqTyCon )
-import GHC.Types.Id.Make ( noinlineIdName )
-import GHC.Builtin.Names
-import GHC.Types.Name
-import GHC.Types.Basic
+import GHC.Core.DataCon
 import GHC.Core.Type
 import GHC.Core.Multiplicity
 import GHC.Core.PatSyn
-import GHC.Utils.Outputable
+import GHC.Core.TyCo.Rep
+import GHC.Core.TyCo.Tidy ( tidyCo )
+
+import GHC.Builtin.Types.Prim ( eqPrimTyCon, eqReprPrimTyCon )
+import GHC.Builtin.Types ( heqTyCon )
+import GHC.Builtin.Names
+
+import GHC.Iface.Syntax
 import GHC.Data.FastString
-import GHC.Utils.Misc
+
+import GHC.Types.Id
+import GHC.Types.Id.Info
+import GHC.Types.Id.Make ( noinlineIdName )
+import GHC.Types.Literal
+import GHC.Types.Name
+import GHC.Types.Basic
 import GHC.Types.Var
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
-import GHC.Core.TyCo.Rep
-import GHC.Core.TyCo.Tidy ( tidyCo )
-import GHC.Types.Demand ( isTopSig )
+import GHC.Types.Tickish
+import GHC.Types.Demand ( isNopSig )
 import GHC.Types.Cpr ( topCprSig )
+
+import GHC.Utils.Outputable
+import GHC.Utils.Panic
+import GHC.Utils.Misc
+import GHC.Utils.Trace
 
 import Data.Maybe ( catMaybes )
 
@@ -162,7 +175,7 @@ toIfaceTypeX :: VarSet -> Type -> IfaceType
 --    translates the tyvars in 'free' as IfaceFreeTyVars
 --
 -- Synonyms are retained in the interface type
-toIfaceTypeX fr (TyVarTy tv)   -- See Note [TcTyVars in IfaceType] in GHC.Iface.Type
+toIfaceTypeX fr (TyVarTy tv)   -- See Note [Free tyvars in IfaceType] in GHC.Iface.Type
   | tv `elemVarSet` fr         = IfaceFreeTyVar tv
   | otherwise                  = IfaceTyVar (toIfaceTyVar tv)
 toIfaceTypeX fr ty@(AppTy {})  =
@@ -186,13 +199,13 @@ toIfaceTypeX fr (TyConApp tc tys)
   = IfaceTupleTy sort NotPromoted (toIfaceTcArgsX fr tc tys)
 
   | Just dc <- isPromotedDataCon_maybe tc
-  , isTupleDataCon dc
+  , isBoxedTupleDataCon dc
   , n_tys == 2*arity
   = IfaceTupleTy BoxedTuple IsPromoted (toIfaceTcArgsX fr tc (drop arity tys))
 
   | tc `elem` [ eqPrimTyCon, eqReprPrimTyCon, heqTyCon ]
   , (k1:k2:_) <- tys
-  = let info = IfaceTyConInfo NotPromoted sort
+  = let info = mkIfaceTyConInfo NotPromoted sort
         sort | k1 `eqType` k2 = IfaceEqualityTyCon
              | otherwise      = IfaceNormalTyCon
     in IfaceTyConApp (IfaceTyCon (tyConName tc) info) (toIfaceTcArgsX fr tc tys)
@@ -222,7 +235,7 @@ toIfaceTyCon tc
   = IfaceTyCon tc_name info
   where
     tc_name = tyConName tc
-    info    = IfaceTyConInfo promoted sort
+    info    = mkIfaceTyConInfo promoted sort
     promoted | isPromotedDataCon tc = IsPromoted
              | otherwise            = NotPromoted
 
@@ -243,20 +256,21 @@ toIfaceTyCon tc
       , Just tsort <- tupleSort tc'          = tsort
 
       | isUnboxedSumTyCon tc
-      , Just cons <- isDataSumTyCon_maybe tc = IfaceSumTyCon (length cons)
+      , Just cons <- tyConDataCons_maybe tc  = IfaceSumTyCon (length cons)
 
       | otherwise                            = IfaceNormalTyCon
 
 
 toIfaceTyCon_name :: Name -> IfaceTyCon
 toIfaceTyCon_name n = IfaceTyCon n info
-  where info = IfaceTyConInfo NotPromoted IfaceNormalTyCon
+  where info = mkIfaceTyConInfo NotPromoted IfaceNormalTyCon
   -- Used for the "rough-match" tycon stuff,
   -- where pretty-printing is not an issue
 
 toIfaceTyLit :: TyLit -> IfaceTyLit
 toIfaceTyLit (NumTyLit x) = IfaceNumTyLit x
 toIfaceTyLit (StrTyLit x) = IfaceStrTyLit x
+toIfaceTyLit (CharTyLit x) = IfaceCharTyLit x
 
 ----------------
 toIfaceCoercion :: Coercion -> IfaceCoercion
@@ -274,7 +288,7 @@ toIfaceCoercionX fr co
     go (Refl ty)            = IfaceReflCo (toIfaceTypeX fr ty)
     go (GRefl r ty mco)     = IfaceGReflCo r (toIfaceTypeX fr ty) (go_mco mco)
     go (CoVarCo cv)
-      -- See [TcTyVars in IfaceType] in GHC.Iface.Type
+      -- See Note [Free tyvars in IfaceType] in GHC.Iface.Type
       | cv `elemVarSet` fr  = IfaceFreeCoVar cv
       | otherwise           = IfaceCoVarCo (toIfaceCoVar cv)
     go (HoleCo h)           = IfaceHoleCo  (coHoleCoVar h)
@@ -294,7 +308,7 @@ toIfaceCoercionX fr co
                                           (toIfaceTypeX fr t2)
     go (TyConAppCo r tc cos)
       | tc `hasKey` funTyConKey
-      , [_,_,_,_, _] <- cos         = pprPanic "toIfaceCoercion" empty
+      , [_,_,_,_, _] <- cos         = panic "toIfaceCoercion"
       | otherwise                =
         IfaceTyConAppCo r (toIfaceTyCon tc) (map go cos)
     go (FunCo r w co1 co2)   = IfaceFunCo r (go w) (go co1) (go co2)
@@ -309,8 +323,7 @@ toIfaceCoercionX fr co
     go_prov (PhantomProv co)    = IfacePhantomProv (go co)
     go_prov (ProofIrrelProv co) = IfaceProofIrrelProv (go co)
     go_prov (PluginProv str)    = IfacePluginProv str
-    go_prov CorePrepProv        = pprPanic "toIfaceCoercionX" empty
-         -- CorePrepProv only happens after the iface file is generated
+    go_prov (CorePrepProv b)    = IfaceCorePrepProv b
 
 toIfaceTcArgs :: TyCon -> [Type] -> IfaceAppArgs
 toIfaceTcArgs = toIfaceTcArgsX emptyVarSet
@@ -365,7 +378,7 @@ toIfaceAppArgsX fr kind ty_args
         -- This is probably a compiler bug, so we print a trace and
         -- carry on as if it were FunTy.  Without the test for
         -- isEmptyTCvSubst we'd get an infinite loop (#15473)
-        WARN( True, ppr kind $$ ppr ty_args )
+        warnPprTrace True "toIfaceAppArgsX" (ppr kind $$ ppr ty_args) $
         IA_Arg (toIfaceTypeX fr t1) Required (go env ty ts1)
 
 tidyToIfaceType :: TidyEnv -> Type -> IfaceType
@@ -405,7 +418,7 @@ patSynToIfaceDecl ps
     ex_bndrs   = patSynExTyVarBinders ps
     (env1, univ_bndrs') = tidyTyCoVarBinders emptyTidyEnv univ_bndrs
     (env2, ex_bndrs')   = tidyTyCoVarBinders env1 ex_bndrs
-    to_if_pr (id, needs_dummy) = (idName id, needs_dummy)
+    to_if_pr (name, _type, needs_dummy) = (name, needs_dummy)
 
 {-
 ************************************************************************
@@ -434,6 +447,7 @@ toIfaceLetBndr id  = IfLetBndr (occNameFS (getOccName id))
 
 toIfaceIdDetails :: IdDetails -> IfaceIdDetails
 toIfaceIdDetails VanillaId                      = IfVanillaId
+toIfaceIdDetails (WorkerLikeId dmds)          = IfWorkerLikeId dmds
 toIfaceIdDetails (DFunId {})                    = IfDFunId
 toIfaceIdDetails (RecSelId { sel_naughty = n
                            , sel_tycon = tc })  =
@@ -467,16 +481,16 @@ toIfaceIdInfo id_info
 
     ------------  Strictness  --------------
         -- No point in explicitly exporting TopSig
-    sig_info = strictnessInfo id_info
-    strict_hsinfo | not (isTopSig sig_info) = Just (HsStrictness sig_info)
+    sig_info = dmdSigInfo id_info
+    strict_hsinfo | not (isNopSig sig_info) = Just (HsDmdSig sig_info)
                   | otherwise               = Nothing
 
     ------------  CPR --------------
-    cpr_info = cprInfo id_info
-    cpr_hsinfo | cpr_info /= topCprSig = Just (HsCpr cpr_info)
+    cpr_info = cprSigInfo id_info
+    cpr_hsinfo | cpr_info /= topCprSig = Just (HsCprSig cpr_info)
                | otherwise             = Nothing
     ------------  Unfolding  --------------
-    unfold_hsinfo = toIfUnfolding loop_breaker (unfoldingInfo id_info)
+    unfold_hsinfo = toIfUnfolding loop_breaker (realUnfoldingInfo id_info)
     loop_breaker  = isStrongLoopBreaker (occInfo id_info)
 
     ------------  Inline prag  --------------
@@ -484,8 +498,8 @@ toIfaceIdInfo id_info
     inline_hsinfo | isDefaultInlinePragma inline_prag = Nothing
                   | otherwise = Just (HsInline inline_prag)
 
-    ------------  Levity polymorphism  ----------
-    levity_hsinfo | isNeverLevPolyIdInfo id_info = Just HsLevity
+    ------------  Representation polymorphism  ----------
+    levity_hsinfo | isNeverRepPolyIdInfo id_info = Just HsLevity
                   | otherwise                    = Nothing
 
 toIfaceJoinInfo :: Maybe JoinArity -> IfaceJoinInfo
@@ -496,6 +510,7 @@ toIfaceJoinInfo Nothing   = IfaceNotJoinPoint
 toIfUnfolding :: Bool -> Unfolding -> Maybe IfaceInfoItem
 toIfUnfolding lb (CoreUnfolding { uf_tmpl = rhs
                                 , uf_src = src
+                                , uf_cache = cache
                                 , uf_guidance = guidance })
   = Just $ HsUnfold lb $
     case src of
@@ -503,9 +518,9 @@ toIfUnfolding lb (CoreUnfolding { uf_tmpl = rhs
           -> case guidance of
                UnfWhen {ug_arity = arity, ug_unsat_ok = unsat_ok, ug_boring_ok =  boring_ok }
                       -> IfInlineRule arity unsat_ok boring_ok if_rhs
-               _other -> IfCoreUnfold True if_rhs
+               _other -> IfCoreUnfold True cache if_rhs
         InlineCompulsory -> IfCompulsory if_rhs
-        InlineRhs        -> IfCoreUnfold False if_rhs
+        InlineRhs        -> IfCoreUnfold False cache if_rhs
         -- Yes, even if guidance is UnfNever, expose the unfolding
         -- If we didn't want to expose the unfolding, GHC.Iface.Tidy would
         -- have stuck in NoUnfolding.  For supercompilation we want
@@ -520,7 +535,7 @@ toIfUnfolding lb (DFunUnfolding { df_bndrs = bndrs, df_args = args })
 
 toIfUnfolding _ (OtherCon {}) = Nothing
   -- The binding site of an Id doesn't have OtherCon, except perhaps
-  -- where we have called zapUnfolding; and that evald'ness info is
+  -- where we have called trimUnfolding; and that evald'ness info is
   -- not needed by importing modules
 
 toIfUnfolding _ BootUnfolding = Nothing
@@ -538,6 +553,7 @@ toIfUnfolding _ NoUnfolding = Nothing
 
 toIfaceExpr :: CoreExpr -> IfaceExpr
 toIfaceExpr (Var v)         = toIfaceVar v
+toIfaceExpr (Lit (LitRubbish r)) = IfaceLitRubbish (toIfaceType r)
 toIfaceExpr (Lit l)         = IfaceLit l
 toIfaceExpr (Type ty)       = IfaceType (toIfaceType ty)
 toIfaceExpr (Coercion co)   = IfaceCo   (toIfaceCoercion co)
@@ -560,7 +576,7 @@ toIfaceOneShot id | isId id
                   = IfaceNoOneShot
 
 ---------------------
-toIfaceTickish :: Tickish Id -> Maybe IfaceTickish
+toIfaceTickish :: CoreTickish -> Maybe IfaceTickish
 toIfaceTickish (ProfNote cc tick push) = Just (IfaceSCC cc tick push)
 toIfaceTickish (HpcTick modl ix)       = Just (IfaceHpcTick modl ix)
 toIfaceTickish (SourceNote src names)  = Just (IfaceSource src names)
@@ -574,14 +590,15 @@ toIfaceBind (NonRec b r) = IfaceNonRec (toIfaceLetBndr b) (toIfaceExpr r)
 toIfaceBind (Rec prs)    = IfaceRec [(toIfaceLetBndr b, toIfaceExpr r) | (b,r) <- prs]
 
 ---------------------
-toIfaceAlt :: (AltCon, [Var], CoreExpr)
-           -> (IfaceConAlt, [FastString], IfaceExpr)
-toIfaceAlt (c,bs,r) = (toIfaceCon c, map getOccFS bs, toIfaceExpr r)
+toIfaceAlt :: CoreAlt -> IfaceAlt
+toIfaceAlt (Alt c bs r) = IfaceAlt (toIfaceCon c) (map getOccFS bs) (toIfaceExpr r)
 
 ---------------------
 toIfaceCon :: AltCon -> IfaceConAlt
 toIfaceCon (DataAlt dc) = IfaceDataAlt (getName dc)
-toIfaceCon (LitAlt l)   = IfaceLitAlt l
+toIfaceCon (LitAlt l)   = assertPpr (not (isLitRubbish l)) (ppr l) $
+                          -- assert: see Note [Rubbish literals] wrinkle (b)
+                          IfaceLitAlt l
 toIfaceCon DEFAULT      = IfaceDefault
 
 ---------------------
@@ -629,15 +646,15 @@ toIfaceLFInfo nm lfi = case lfi of
     LFReEntrant top_lvl arity no_fvs _arg_descr ->
       -- Exported LFReEntrant closures are top level, and top-level closures
       -- don't have free variables
-      ASSERT2(isTopLevel top_lvl, ppr nm)
-      ASSERT2(no_fvs, ppr nm)
+      assertPpr (isTopLevel top_lvl) (ppr nm) $
+      assertPpr no_fvs (ppr nm) $
       IfLFReEntrant arity
     LFThunk top_lvl no_fvs updatable sfi mb_fun ->
       -- Exported LFThunk closures are top level (which don't have free
       -- variables) and non-standard (see cgTopRhsClosure)
-      ASSERT2(isTopLevel top_lvl, ppr nm)
-      ASSERT2(no_fvs, ppr nm)
-      ASSERT2(sfi == NonStandardThunk, ppr nm)
+      assertPpr (isTopLevel top_lvl) (ppr nm) $
+      assertPpr no_fvs (ppr nm) $
+      assertPpr (sfi == NonStandardThunk) (ppr nm) $
       IfLFThunk updatable mb_fun
     LFCon dc ->
       IfLFCon (dataConName dc)
@@ -647,6 +664,16 @@ toIfaceLFInfo nm lfi = case lfi of
       IfLFUnlifted
     LFLetNoEscape ->
       panic "toIfaceLFInfo: LFLetNoEscape"
+
+-- Dehydrating CgBreakInfo
+
+dehydrateCgBreakInfo :: [TyVar] -> [Maybe (Id, Word16)] -> Type -> CgBreakInfo
+dehydrateCgBreakInfo ty_vars idOffSets tick_ty =
+          CgBreakInfo
+            { cgb_tyvars = map toIfaceTvBndr ty_vars
+            , cgb_vars = map (fmap (\(i, offset) -> (toIfaceIdBndr i, offset))) idOffSets
+            , cgb_resty = toIfaceType tick_ty
+            }
 
 {- Note [Inlining and hs-boot files]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

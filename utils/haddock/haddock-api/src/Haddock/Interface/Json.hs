@@ -5,7 +5,7 @@ module Haddock.Interface.Json (
   , renderJson
   ) where
 
-import GHC.Types.Basic
+import GHC.Types.Fixity
 import GHC.Utils.Json
 import GHC.Unit.Module
 import GHC.Types.Name
@@ -130,8 +130,10 @@ jsonDoc (DocUnorderedList xs) = jsonObject
 
 jsonDoc (DocOrderedList xs) = jsonObject
     [ ("tag", jsonString "DocOrderedList")
-    , ("documents", jsonArray (fmap jsonDoc xs))
+    , ("items", jsonArray (fmap jsonItem xs))
     ]
+  where
+    jsonItem (index, a) = jsonObject [("document", jsonDoc a), ("seq", jsonInt index)]
 
 jsonDoc (DocDefList xys) = jsonObject
     [ ("tag", jsonString "DocDefList")

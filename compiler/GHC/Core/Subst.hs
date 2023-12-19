@@ -6,7 +6,7 @@
 Utility functions on @Core@ syntax
 -}
 
-{-# LANGUAGE CPP #-}
+
 {-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 module GHC.Core.Subst (
         -- * Main data types
@@ -14,17 +14,17 @@ module GHC.Core.Subst (
         TvSubstEnv, IdSubstEnv, InScopeSet,
 
         -- ** Substituting into expressions and related types
-        deShadowBinds, substSpec, substRulesForImportedIds,
+        deShadowBinds, substRuleInfo, substRulesForImportedIds,
         substTy, substCo, substExpr, substExprSC, substBind, substBindSC,
         substUnfolding, substUnfoldingSC,
-        lookupIdSubst, lookupTCvSubst, substIdType, substIdOcc,
+        lookupIdSubst, substIdType, substIdOcc,
         substTickish, substDVarSet, substIdInfo,
 
         -- ** Operations on substitutions
         emptySubst, mkEmptySubst, mkSubst, mkOpenSubst, substInScope, isEmptySubst,
         extendIdSubst, extendIdSubstList, extendTCvSubst, extendTvSubstList,
         extendSubst, extendSubstList, extendSubstWithVar, zapSubstEnv,
-        addInScopeSet, extendInScope, extendInScopeList, extendInScopeIds,
+        extendSubstInScope, extendSubstInScopeList, extendSubstInScopeSet,
         isInScope, setInScope, getTCvSubst, extendTvSubst, extendCvSubst,
         delBndr, delBndrs,
 
@@ -33,9 +33,6 @@ module GHC.Core.Subst (
         cloneBndr, cloneBndrs, cloneIdBndr, cloneIdBndrs, cloneRecIdBndrs,
 
     ) where
-
-#include "HsVersions.h"
-
 
 import GHC.Prelude
 
@@ -52,18 +49,24 @@ import GHC.Core.Type hiding
    , isInScope, substTyVarBndr, cloneTyVarBndr )
 import GHC.Core.Coercion hiding ( substCo, substCoVarBndr )
 
-import GHC.Builtin.Names
 import GHC.Types.Var.Set
-import GHC.Types.Var.Env
+import GHC.Types.Var.Env as InScopeSet
 import GHC.Types.Id
 import GHC.Types.Name     ( Name )
 import GHC.Types.Var
+import GHC.Types.Tickish
 import GHC.Types.Id.Info
 import GHC.Types.Unique.Supply
+
+import GHC.Builtin.Names
 import GHC.Data.Maybe
+
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
-import Data.List
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
+
+import Data.List (mapAccumL)
 
 
 
@@ -187,13 +190,13 @@ zapSubstEnv (Subst in_scope _ _ _) = Subst in_scope emptyVarEnv emptyVarEnv empt
 extendIdSubst :: Subst -> Id -> CoreExpr -> Subst
 -- ToDo: add an ASSERT that fvs(subst-result) is already in the in-scope set
 extendIdSubst (Subst in_scope ids tvs cvs) v r
-  = ASSERT2( isNonCoVarId v, ppr v $$ ppr r )
+  = assertPpr (isNonCoVarId v) (ppr v $$ ppr r) $
     Subst in_scope (extendVarEnv ids v r) tvs cvs
 
 -- | Adds multiple 'Id' substitutions to the 'Subst': see also 'extendIdSubst'
 extendIdSubstList :: Subst -> [(Id, CoreExpr)] -> Subst
 extendIdSubstList (Subst in_scope ids tvs cvs) prs
-  = ASSERT( all (isNonCoVarId . fst) prs )
+  = assert (all (isNonCoVarId . fst) prs) $
     Subst in_scope (extendVarEnvList ids prs) tvs cvs
 
 -- | Add a substitution for a 'TyVar' to the 'Subst'
@@ -203,7 +206,7 @@ extendIdSubstList (Subst in_scope ids tvs cvs) prs
 -- after extending the substitution like this.
 extendTvSubst :: Subst -> TyVar -> Type -> Subst
 extendTvSubst (Subst in_scope ids tvs cvs) tv ty
-  = ASSERT( isTyVar tv )
+  = assert (isTyVar tv) $
     Subst in_scope ids (extendVarEnv tvs tv ty) cvs
 
 -- | Adds multiple 'TyVar' substitutions to the 'Subst': see also 'extendTvSubst'
@@ -219,7 +222,7 @@ extendTvSubstList subst vrs
 -- after extending the substitution like this
 extendCvSubst :: Subst -> CoVar -> Coercion -> Subst
 extendCvSubst (Subst in_scope ids tvs cvs) v r
-  = ASSERT( isCoVar v )
+  = assert (isCoVar v) $
     Subst in_scope ids tvs (extendVarEnv cvs v r)
 
 -- | Add a substitution appropriate to the thing being substituted
@@ -228,15 +231,15 @@ extendCvSubst (Subst in_scope ids tvs cvs) v r
 extendSubst :: Subst -> Var -> CoreArg -> Subst
 extendSubst subst var arg
   = case arg of
-      Type ty     -> ASSERT( isTyVar var ) extendTvSubst subst var ty
-      Coercion co -> ASSERT( isCoVar var ) extendCvSubst subst var co
-      _           -> ASSERT( isId    var ) extendIdSubst subst var arg
+      Type ty     -> assert (isTyVar var) $ extendTvSubst subst var ty
+      Coercion co -> assert (isCoVar var) $ extendCvSubst subst var co
+      _           -> assert (isId    var) $ extendIdSubst subst var arg
 
 extendSubstWithVar :: Subst -> Var -> Var -> Subst
 extendSubstWithVar subst v1 v2
-  | isTyVar v1 = ASSERT( isTyVar v2 ) extendTvSubst subst v1 (mkTyVarTy v2)
-  | isCoVar v1 = ASSERT( isCoVar v2 ) extendCvSubst subst v1 (mkCoVarCo v2)
-  | otherwise  = ASSERT( isId    v2 ) extendIdSubst subst v1 (Var v2)
+  | isTyVar v1 = assert (isTyVar v2) $ extendTvSubst subst v1 (mkTyVarTy v2)
+  | isCoVar v1 = assert (isCoVar v2) $ extendCvSubst subst v1 (mkCoVarCo v2)
+  | otherwise  = assert (isId    v2) $ extendIdSubst subst v1 (Var v2)
 
 -- | Add a substitution as appropriate to each of the terms being
 --   substituted (whether expressions, types, or coercions). See also
@@ -252,17 +255,9 @@ lookupIdSubst (Subst in_scope ids _ _) v
   | Just e  <- lookupVarEnv ids       v = e
   | Just v' <- lookupInScope in_scope v = Var v'
         -- Vital! See Note [Extending the Subst]
-  | otherwise = WARN( True, text "GHC.Core.Subst.lookupIdSubst" <+> ppr v
-                            $$ ppr in_scope)
-                Var v
-
--- | Find the substitution for a 'TyVar' in the 'Subst'
-lookupTCvSubst :: Subst -> TyVar -> Type
-lookupTCvSubst (Subst _ _ tvs cvs) v
-  | isTyVar v
-  = lookupVarEnv tvs v `orElse` Type.mkTyVarTy v
-  | otherwise
-  = mkCoercionTy $ lookupVarEnv cvs v `orElse` mkCoVarCo v
+        -- If v isn't in the InScopeSet, we panic, because
+        -- it's a bad bug and we reallly want to know
+  | otherwise = pprPanic "lookupIdSubst" (ppr v $$ ppr in_scope)
 
 delBndr :: Subst -> Var -> Subst
 delBndr (Subst in_scope ids tvs cvs) v
@@ -289,31 +284,23 @@ mkOpenSubst in_scope pairs = Subst in_scope
 isInScope :: Var -> Subst -> Bool
 isInScope v (Subst in_scope _ _ _) = v `elemInScopeSet` in_scope
 
--- | Add the 'Var' to the in-scope set, but do not remove
--- any existing substitutions for it
-addInScopeSet :: Subst -> VarSet -> Subst
-addInScopeSet (Subst in_scope ids tvs cvs) vs
-  = Subst (in_scope `extendInScopeSetSet` vs) ids tvs cvs
-
--- | Add the 'Var' to the in-scope set: as a side effect,
--- and remove any existing substitutions for it
-extendInScope :: Subst -> Var -> Subst
-extendInScope (Subst in_scope ids tvs cvs) v
-  = Subst (in_scope `extendInScopeSet` v)
-          (ids `delVarEnv` v) (tvs `delVarEnv` v) (cvs `delVarEnv` v)
+-- | Add the 'Var' to the in-scope set
+extendSubstInScope :: Subst -> Var -> Subst
+extendSubstInScope (Subst in_scope ids tvs cvs) v
+  = Subst (in_scope `InScopeSet.extendInScopeSet` v)
+          ids tvs cvs
 
 -- | Add the 'Var's to the in-scope set: see also 'extendInScope'
-extendInScopeList :: Subst -> [Var] -> Subst
-extendInScopeList (Subst in_scope ids tvs cvs) vs
+extendSubstInScopeList :: Subst -> [Var] -> Subst
+extendSubstInScopeList (Subst in_scope ids tvs cvs) vs
   = Subst (in_scope `extendInScopeSetList` vs)
-          (ids `delVarEnvList` vs) (tvs `delVarEnvList` vs) (cvs `delVarEnvList` vs)
+          ids tvs cvs
 
--- | Optimized version of 'extendInScopeList' that can be used if you are certain
--- all the things being added are 'Id's and hence none are 'TyVar's or 'CoVar's
-extendInScopeIds :: Subst -> [Id] -> Subst
-extendInScopeIds (Subst in_scope ids tvs cvs) vs
-  = Subst (in_scope `extendInScopeSetList` vs)
-          (ids `delVarEnvList` vs) tvs cvs
+-- | Add the 'Var's to the in-scope set: see also 'extendInScope'
+extendSubstInScopeSet :: Subst -> VarSet -> Subst
+extendSubstInScopeSet (Subst in_scope ids tvs cvs) vs
+  = Subst (in_scope `extendInScopeSetSet` vs)
+          ids tvs cvs
 
 setInScope :: Subst -> InScopeSet -> Subst
 setInScope (Subst _ ids tvs cvs) in_scope = Subst in_scope ids tvs cvs
@@ -340,6 +327,8 @@ instance Outputable Subst where
 
 substExprSC :: HasDebugCallStack => Subst -> CoreExpr -> CoreExpr
 -- Just like substExpr, but a no-op if the substitution is empty
+-- Note that this does /not/ replace occurrences of free vars with
+-- their canonical representatives in the in-scope set
 substExprSC subst orig_expr
   | isEmptySubst subst = orig_expr
   | otherwise          = -- pprTrace "enter subst-expr" (doc $$ ppr orig_expr) $
@@ -381,7 +370,7 @@ substExpr subst expr
                                  where
                                  (subst', bndr') = substBndr subst bndr
 
-    go_alt subst (con, bndrs, rhs) = (con, bndrs', substExpr subst' rhs)
+    go_alt subst (Alt con bndrs rhs) = Alt con bndrs' (substExpr subst' rhs)
                                  where
                                    (subst', bndrs') = substBndrs subst bndrs
 
@@ -471,7 +460,7 @@ substIdBndr :: SDoc
 
 substIdBndr _doc rec_subst subst@(Subst in_scope env tvs cvs) old_id
   = -- pprTrace "substIdBndr" (doc $$ ppr old_id $$ ppr in_scope) $
-    (Subst (in_scope `extendInScopeSet` new_id) new_env tvs cvs, new_id)
+    (Subst (in_scope `InScopeSet.extendInScopeSet` new_id) new_env tvs cvs, new_id)
   where
     id1 = uniqAway in_scope old_id      -- id1 is cloned if necessary
     id2 | no_type_change = id1
@@ -541,7 +530,7 @@ clone_id    :: Subst                    -- Substitution for the IdInfo
             -> (Subst, Id)              -- Transformed pair
 
 clone_id rec_subst subst@(Subst in_scope idvs tvs cvs) (old_id, uniq)
-  = (Subst (in_scope `extendInScopeSet` new_id) new_idvs tvs new_cvs, new_id)
+  = (Subst (in_scope `InScopeSet.extendInScopeSet` new_id) new_idvs tvs new_cvs, new_id)
   where
     id1     = setVarUnique old_id uniq
     id2     = substIdType subst id1
@@ -579,7 +568,7 @@ substCoVarBndr (Subst in_scope id_env tv_env cv_env) cv
         (TCvSubst in_scope' tv_env' cv_env', cv')
            -> (Subst in_scope' id_env tv_env' cv_env', cv')
 
--- | See 'Type.substTy'
+-- | See 'GHC.Core.Type.substTy'.
 substTy :: Subst -> Type -> Type
 substTy subst ty = Type.substTyUnchecked (getTCvSubst subst) ty
 
@@ -616,15 +605,18 @@ substIdType subst@(Subst _ _ tv_env cv_env) id
 substIdInfo :: Subst -> Id -> IdInfo -> Maybe IdInfo
 substIdInfo subst new_id info
   | nothing_to_do = Nothing
-  | otherwise     = Just (info `setRuleInfo`      substSpec subst new_id old_rules
+  | otherwise     = Just (info `setRuleInfo`      substRuleInfo subst new_id old_rules
                                `setUnfoldingInfo` substUnfolding subst old_unf)
   where
     old_rules     = ruleInfo info
-    old_unf       = unfoldingInfo info
+    old_unf       = realUnfoldingInfo info
     nothing_to_do = isEmptyRuleInfo old_rules && not (hasCoreUnfolding old_unf)
 
 ------------------
 -- | Substitutes for the 'Id's within an unfolding
+-- NB: substUnfolding /discards/ any unfolding without
+--     without a Stable source.  This is usually what we want,
+--     but it may be a bit unexpected
 substUnfolding, substUnfoldingSC :: Subst -> Unfolding -> Unfolding
         -- Seq'ing on the returned Unfolding is enough to cause
         -- all the substitutions to happen completely
@@ -659,14 +651,13 @@ substIdOcc subst v = case lookupIdSubst subst v of
                         other  -> pprPanic "substIdOcc" (vcat [ppr v <+> ppr other, ppr subst])
 
 ------------------
--- | Substitutes for the 'Id's within the 'WorkerInfo' given the new function 'Id'
-substSpec :: Subst -> Id -> RuleInfo -> RuleInfo
-substSpec subst new_id (RuleInfo rules rhs_fvs)
-  = seqRuleInfo new_spec `seq` new_spec
+-- | Substitutes for the 'Id's within the 'RuleInfo' given the new function 'Id'
+substRuleInfo :: Subst -> Id -> RuleInfo -> RuleInfo
+substRuleInfo subst new_id (RuleInfo rules rhs_fvs)
+  = RuleInfo (map (substRule subst subst_ru_fn) rules)
+                  (substDVarSet subst rhs_fvs)
   where
     subst_ru_fn = const (idName new_id)
-    new_spec = RuleInfo (map (substRule subst subst_ru_fn) rules)
-                        (substDVarSet subst rhs_fvs)
 
 ------------------
 substRulesForImportedIds :: Subst -> [CoreRule] -> [CoreRule]
@@ -700,18 +691,26 @@ substRule subst subst_ru_fn rule@(Rule { ru_bndrs = bndrs, ru_args = args
     (subst', bndrs') = substBndrs subst bndrs
 
 ------------------
-substDVarSet :: Subst -> DVarSet -> DVarSet
-substDVarSet subst fvs
-  = mkDVarSet $ fst $ foldr (subst_fv subst) ([], emptyVarSet) $ dVarSetElems fvs
+substDVarSet :: HasDebugCallStack => Subst -> DVarSet -> DVarSet
+substDVarSet subst@(Subst _ _ tv_env cv_env) fvs
+  = mkDVarSet $ fst $ foldr subst_fv ([], emptyVarSet) $ dVarSetElems fvs
   where
-  subst_fv subst fv acc
-     | isId fv = expr_fvs (lookupIdSubst subst fv) isLocalVar emptyVarSet $! acc
-     | otherwise = tyCoFVsOfType (lookupTCvSubst subst fv) (const True) emptyVarSet $! acc
+  subst_fv :: Var -> ([Var], VarSet) -> ([Var], VarSet)
+  subst_fv fv acc
+     | isTyVar fv
+     , let fv_ty = lookupVarEnv tv_env fv `orElse` mkTyVarTy fv
+     = tyCoFVsOfType fv_ty (const True) emptyVarSet $! acc
+     | isCoVar fv
+     , let fv_co = lookupVarEnv cv_env fv `orElse` mkCoVarCo fv
+     = tyCoFVsOfCo fv_co (const True) emptyVarSet $! acc
+     | otherwise
+     , let fv_expr = lookupIdSubst subst fv
+     = expr_fvs fv_expr isLocalVar emptyVarSet $! acc
 
 ------------------
-substTickish :: Subst -> Tickish Id -> Tickish Id
-substTickish subst (Breakpoint n ids)
-   = Breakpoint n (map do_one ids)
+substTickish :: Subst -> CoreTickish -> CoreTickish
+substTickish subst (Breakpoint ext n ids)
+   = Breakpoint ext n (map do_one ids)
  where
     do_one = getIdFromTrivialExpr . lookupIdSubst subst
 substTickish _subst other = other
@@ -728,6 +727,30 @@ looked at the idInfo for 'f'; result <<loop>>.
 
 In any case we don't need to optimise the RHS of rules, or unfoldings,
 because the simplifier will do that.
+
+Another place this went wrong was in `substRuleInfo`, which would immediately force
+the lazy call to substExpr, which led to an infinite loop (as reported by #20112).
+
+This time the call stack looked something like:
+
+* `substRecBndrs`
+* `substIdBndr`
+* `substIdInfo`
+* `substRuleInfo`
+* `substRule`
+* `substExpr`
+* `mkTick`
+* `isSaturatedConApp`
+* Look at `IdInfo` for thing we are currently substituting because the rule is attached to `transpose` and mentions it in the `RHS` of the rule.
+
+and the rule was
+
+{-# RULES
+"transpose/overlays1" forall xs. transpose (overlays1 xs) = overlays1 (fmap transpose xs) #-}
+
+This rule was attached to `transpose`, but also mentions itself in the RHS so we have
+to be careful to not force the `IdInfo` for transpose when dealing with the RHS of the rule.
+
 
 
 Note [substTickish]

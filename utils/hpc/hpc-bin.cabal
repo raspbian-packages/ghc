@@ -10,7 +10,11 @@ Synopsis: XXX
 Description: XXX
 Category: Development
 build-type: Simple
-cabal-version: >=1.10
+cabal-version: 2.0
+
+Flag build-tool-depends
+    Description: Use build-tool-depends
+    Default: True
 
 Executable hpc
     Default-Language: Haskell2010
@@ -27,6 +31,8 @@ Executable hpc
                    HpcUtils
                    Paths_hpc_bin
 
+    autogen-modules: Paths_hpc_bin
+
     Build-Depends: base       >= 4   && < 5,
                    directory  >= 1   && < 1.4,
                    filepath   >= 1   && < 1.5,
@@ -34,3 +40,5 @@ Executable hpc
                    array      >= 0.1 && < 0.6,
                    hpc        >= 0.6.1 && < 0.7
 
+    if flag(build-tool-depends)
+      build-tool-depends: happy:happy >= 1.20.0
