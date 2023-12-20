@@ -9,7 +9,10 @@ ghc (9.4.7-2+rpi1) trixie-staging; urgency=medium
   [changes brought forward from 9.0.2-4+rpi3 by Peter Michael Green <plugwash@raspbian.org> at Wed, 05 Oct 2022 13:33:13 +0000]
   * Add build conflicts on libnuma1
 
- -- Raspbian forward porter <root@raspbian.org>  Tue, 19 Dec 2023 10:20:21 +0000
+  [changes introduced in 9.4.7-2+rpi1 by Peter Michael Green]
+  * replace dmb instruction with coprocessor barrier instruction.
+
+ -- Peter Michael Green <plugwash@raspbian.org>  Fri, 22 Dec 2023 05:25:33 +0000
 
 ghc (9.4.7-2) unstable; urgency=medium
 

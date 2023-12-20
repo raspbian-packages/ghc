@@ -409,7 +409,7 @@ write_barrier(void) {
 #elif defined(s390x_HOST_ARCH)
     __asm__ __volatile__ ("" : : : "memory");
 #elif defined(arm_HOST_ARCH) || defined(aarch64_HOST_ARCH)
-    __asm__ __volatile__ ("dmb  st" : : : "memory");
+    __asm__ __volatile__ ("mcr p15, #0, r0, c7, c10, #5" : : : "memory");
 #elif defined(riscv64_HOST_ARCH)
     __asm__ __volatile__ ("fence w,w" : : : "memory");
 #else
@@ -431,7 +431,7 @@ store_load_barrier(void) {
 #elif defined(s390x_HOST_ARCH)
     __asm__ __volatile__ ("bcr 14,0" : : : "memory");
 #elif defined(arm_HOST_ARCH)
-    __asm__ __volatile__ ("dmb" : : : "memory");
+    __asm__ __volatile__ ("mcr p15, #0, r0, c7, c10, #5" : : : "memory");
 #elif defined(aarch64_HOST_ARCH)
     __asm__ __volatile__ ("dmb sy" : : : "memory");
 #elif defined(riscv64_HOST_ARCH)
@@ -455,7 +455,7 @@ load_load_barrier(void) {
 #elif defined(s390x_HOST_ARCH)
     __asm__ __volatile__ ("" : : : "memory");
 #elif defined(arm_HOST_ARCH)
-    __asm__ __volatile__ ("dmb" : : : "memory");
+    __asm__ __volatile__ ("mcr p15, #0, r0, c7, c10, #5" : : : "memory");
 #elif defined(aarch64_HOST_ARCH)
     __asm__ __volatile__ ("dmb ld" : : : "memory");
 #elif defined(riscv64_HOST_ARCH)
