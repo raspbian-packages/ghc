@@ -22,3 +22,4 @@ hadrian-fix-dnosmp
 hadrian-enable-interpreter
 use-modern-atomics
 ppc64el-fix-clrri
+replace-dmb-instruction-with-coprocessor.patch

@@ -1,0 +1,39 @@
+From: Peter Michael Green <plugwash@raspbian.org>
+Date: Wed, 20 Dec 2023 21:29:26 +0000
+X-Dgit-Generated: 9.4.7-2+rpi1 1ce961d4ae4d23f33caae3141cb28811ce166b1d
+Subject: replace dmb instruction with coprocessor barrier instruction.
+
+
+---
+
+diff --git a/rts/include/stg/SMP.h b/rts/include/stg/SMP.h
+index 41cfc2c4..76ed1805 100644
+--- a/rts/include/stg/SMP.h
++++ b/rts/include/stg/SMP.h
+@@ -409,7 +409,7 @@ write_barrier(void) {
+ #elif defined(s390x_HOST_ARCH)
+     __asm__ __volatile__ ("" : : : "memory");
+ #elif defined(arm_HOST_ARCH) || defined(aarch64_HOST_ARCH)
+-    __asm__ __volatile__ ("dmb  st" : : : "memory");
++    __asm__ __volatile__ ("mcr p15, #0, r0, c7, c10, #5" : : : "memory");
+ #elif defined(riscv64_HOST_ARCH)
+     __asm__ __volatile__ ("fence w,w" : : : "memory");
+ #else
+@@ -431,7 +431,7 @@ store_load_barrier(void) {
+ #elif defined(s390x_HOST_ARCH)
+     __asm__ __volatile__ ("bcr 14,0" : : : "memory");
+ #elif defined(arm_HOST_ARCH)
+-    __asm__ __volatile__ ("dmb" : : : "memory");
++    __asm__ __volatile__ ("mcr p15, #0, r0, c7, c10, #5" : : : "memory");
+ #elif defined(aarch64_HOST_ARCH)
+     __asm__ __volatile__ ("dmb sy" : : : "memory");
+ #elif defined(riscv64_HOST_ARCH)
+@@ -455,7 +455,7 @@ load_load_barrier(void) {
+ #elif defined(s390x_HOST_ARCH)
+     __asm__ __volatile__ ("" : : : "memory");
+ #elif defined(arm_HOST_ARCH)
+-    __asm__ __volatile__ ("dmb" : : : "memory");
++    __asm__ __volatile__ ("mcr p15, #0, r0, c7, c10, #5" : : : "memory");
+ #elif defined(aarch64_HOST_ARCH)
+     __asm__ __volatile__ ("dmb ld" : : : "memory");
+ #elif defined(riscv64_HOST_ARCH)
