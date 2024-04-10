@@ -287,13 +287,8 @@ hostSupportsRPaths = anyHostOs ["linux", "darwin", "freebsd"]
 -- | Check whether the target supports GHCi.
 ghcWithInterpreter :: Action Bool
 ghcWithInterpreter = do
-    goodOs <- anyTargetOs [ "mingw32", "cygwin32", "linux", "solaris2"
-                          , "freebsd", "dragonfly", "netbsd", "openbsd"
-                          , "darwin", "kfreebsdgnu" ]
-    goodArch <- anyTargetArch [ "i386", "x86_64", "powerpc"
-                              , "arm", "aarch64", "s390x"
-                              , "powerpc64", "powerpc64le" ]
-    return $ goodOs && goodArch
+    -- Enable GHCi on all platforms for Debian
+    return True
 
 -- | Variants of the ARM architecture.
 data ArmVersion = ARMv5 | ARMv6 | ARMv7
