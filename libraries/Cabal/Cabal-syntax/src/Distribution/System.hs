@@ -158,19 +158,17 @@ buildOS = classifyOS Permissive System.Info.os
 -- ------------------------------------------------------------
 
 -- | These are the known Arches: I386, X86_64, PPC, PPC64, Sparc,
--- Arm, AArch64, Mips, SH, IA64, S390, S390X, Alpha, Hppa, Rs6000,
--- M68k, Vax, JavaScript and Wasm32.
---
+-- Sparc64, Arm, AArch64, Mips, SH, IA64, S390, S390X, Alpha, Hppa,
+-- Rs6000, M68k, Vax, JavaScript and Wasm32.
 -- The following aliases can also be used:
 --    * PPC alias: powerpc
 --    * PPC64 alias : powerpc64, powerpc64le
---    * Sparc aliases: sparc64, sun4
 --    * Mips aliases: mipsel, mipseb
 --    * Arm aliases: armeb, armel
 --    * AArch64 aliases: arm64
 --
 data Arch = I386  | X86_64  | PPC  | PPC64 | Sparc
-          | Arm   | AArch64 | Mips | SH
+          | Sparc64 | Arm   | AArch64 | Mips | SH
           | IA64  | S390    | S390X
           | Alpha | Hppa    | Rs6000
           | M68k  | Vax
@@ -185,7 +183,7 @@ instance NFData Arch where rnf = genericRnf
 
 knownArches :: [Arch]
 knownArches = [I386, X86_64, PPC, PPC64, Sparc
-              ,Arm, AArch64, Mips, SH
+              ,Sparc64 ,Arm, AArch64, Mips, SH
               ,IA64, S390, S390X
               ,Alpha, Hppa, Rs6000
               ,M68k, Vax
@@ -197,7 +195,6 @@ archAliases Strict _       = []
 archAliases Compat _       = []
 archAliases _      PPC     = ["powerpc"]
 archAliases _      PPC64   = ["powerpc64", "powerpc64le"]
-archAliases _      Sparc   = ["sparc64", "sun4"]
 archAliases _      Mips    = ["mipsel", "mipseb"]
 archAliases _      Arm     = ["armeb", "armel"]
 archAliases _      AArch64 = ["arm64"]
